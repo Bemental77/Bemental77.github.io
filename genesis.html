@@ -213,6 +213,8 @@
     <input id="fileInput" type="file" accept=".gen,.bin,.md,.smd,.sms,.gg,.sg" />
     <button id="btnSave" disabled>Save State</button>
     <button id="btnLoad" disabled>Load State</button>
+    <button id="btnExport" disabled>⬆ Export State</button>
+    <button id="btnImport" disabled>⬇ Import State</button>
     <button id="btnReset" disabled>Reset</button>
     <button id="btnMute" disabled>🔊 Mute</button>
     <button id="btnFull" disabled>⛶ Fullscreen</button>
@@ -259,6 +261,7 @@
     <div id="mobileMenuBox">
       <h6>Menu</h6>
       <button id="mSave" disabled>Save State</button><button id="mLoad" disabled>Load State</button>
+      <button id="mExport" disabled>Export State</button><button id="mImport" disabled>Import State</button>
       <button id="mReset" disabled>Reset</button>
       <button id="mMute" disabled>Mute</button><button id="mFull" disabled>Fullscreen</button>
       <button id="mClose">Close</button>
@@ -504,8 +507,8 @@
     // XBOX: stick drives the GAME from here, not Edge's cursor (lib/xboxinput.js).
     try { window.XboxInput && XboxInput.offerGameControls('genesis running'); } catch (e) {}
     setStatus('Running — ' + name);
-    [$('btnSave'), $('btnLoad'), $('btnReset'), $('btnMute'), $('btnFull'),
-     $('mSave'), $('mLoad'), $('mReset'), $('mMute'), $('mFull')].forEach(function (b) { if (b) b.disabled = false; });
+    [$('btnSave'), $('btnLoad'), $('btnExport'), $('btnImport'), $('btnReset'), $('btnMute'), $('btnFull'),
+     $('mSave'), $('mLoad'), $('mExport'), $('mImport'), $('mReset'), $('mMute'), $('mFull')].forEach(function (b) { if (b) b.disabled = false; });
     if (isMobile) { $('mobileSplash').style.display = 'none'; checkOrientation(); }
     return true;
   }
@@ -585,6 +588,85 @@
       toast(ok ? 'State restored' : 'State rejected (size mismatch)', !ok);
     } catch (e) { toast('Load failed: ' + (e.message || e), true); }
   }
+  // ── EXPORT / IMPORT A SAVE STATE ──────────────────────────────────────────
+  // A state that only lives in this browser's IndexedDB is one cleared-site-data
+  // away from gone, and cannot move to another device. gba.html / gamecube.html /
+  // dreamcast.html have had Export/Import for a while; this is the same capability
+  // for the Genesis.
+  //
+  // The exported file is EXACTLY the bytes stored under this page's OWN existing
+  // key (saveKey() = romName + '.genstate' in GENESISWASMDB) — no re-encoding step
+  // to get wrong, so an export re-imports byte-for-byte. It deliberately does NOT
+  // move to a new key scheme: a visitor's existing saves live at that key and a
+  // silent migration would orphan them.
+  // Does this gzip stream actually decompress? A magic-byte check passes a
+  // half-written download; only a real decompress catches one. The writer
+  // promises get their own .catch: an errored DecompressionStream rejects them
+  // too, and an unhandled rejection there surfaces as a page error even though
+  // the failure is already handled here.
+  async function gzipDecompresses(u8) {
+    if (typeof DecompressionStream !== 'function') return true;
+    try {
+      var ds = new DecompressionStream('gzip'), w = ds.writable.getWriter();
+      w.write(u8).catch(function () {}); w.close().catch(function () {});
+      await new Response(ds.readable).arrayBuffer();
+      return true;
+    } catch (e) { return false; }
+  }
+  function stateFileName() { return saveKey() + '.gz'; }
+  function downloadBytes(bytes, name) {
+    var url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    var a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
+  }
+  function fmtBytes(n) { return n >= 1048576 ? (n / 1048576).toFixed(2) + ' MB' : (n / 1024).toFixed(1) + ' KB'; }
+  // A write can fail for a reason the visitor can act on (a full console browser),
+  // so name it rather than saying a bare 'failed'.
+  function storageErr(e, verb) {
+    var nm = (e && (e.name || e.message)) || 'unknown error';
+    return nm === 'QuotaExceededError'
+      ? verb + ' failed — out of browser storage on this device.'
+      : verb + ' failed (' + nm + ').';
+  }
+  async function exportState() {
+    if (!romName) return toast('Load a ROM first.', true);
+    try {
+      var stored = await idbGet(saveKey());
+      if (!stored) return toast('No save state to export — press Save State first.', true);
+      var bytes = stored instanceof Uint8Array ? stored : new Uint8Array(stored);
+      if (!bytes.byteLength) return toast('Saved state is empty.', true);
+      downloadBytes(bytes, stateFileName());
+      toast('Exported ' + fmtBytes(bytes.byteLength));
+    } catch (e) { toast(storageErr(e, 'Export'), true); }
+  }
+  function importState() {
+    if (!romName) return toast('Load a ROM first, then import.', true);
+    var inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = '.gz,.genstate,application/octet-stream';
+    inp.addEventListener('change', async function () {
+      var f = inp.files && inp.files[0];
+      if (!f) return;
+      try {
+        var buf = new Uint8Array(await f.arrayBuffer());
+        // VALIDATE BEFORE STORING. Writing an unreadable blob over a good state
+        // would destroy the very thing the visitor was trying to protect, so a
+        // junk file is refused and the stored state is left untouched.
+        if (buf.length < 3 || buf[0] !== 0x1f || buf[1] !== 0x8b) {
+          return toast('That file is not a save state (no gzip header).', true);
+        }
+        if (!(await gzipDecompresses(buf))) {
+          return toast('That save state is corrupt (gzip will not decompress).', true);
+        }
+        await idbPut(saveKey(), buf);
+        toast('Imported ' + fmtBytes(buf.byteLength) + ' — press Load State to apply it.');
+      } catch (e) { toast(storageErr(e, 'Import'), true); }
+    });
+    inp.click();
+  }
+
   function resetGame() { if (running) { Module._gpx_reset(); toast('Reset'); } }
   function toggleMute() {
     muted = !muted;
@@ -603,6 +685,8 @@
   }
   $('btnSave').addEventListener('click', saveState);
   $('btnLoad').addEventListener('click', loadState);
+  $('btnExport').addEventListener('click', exportState);
+  $('btnImport').addEventListener('click', importState);
   $('btnReset').addEventListener('click', resetGame);
   $('btnMute').addEventListener('click', toggleMute);
   $('btnFull').addEventListener('click', toggleFullscreen);
@@ -711,6 +795,8 @@
   $('mClose').addEventListener('click', closeMenu);
   $('mSave').addEventListener('click', () => { saveState(); closeMenu(); });
   $('mLoad').addEventListener('click', () => { loadState(); closeMenu(); });
+  $('mExport').addEventListener('click', () => { exportState(); closeMenu(); });
+  $('mImport').addEventListener('click', () => { importState(); closeMenu(); });
   $('mReset').addEventListener('click', () => { resetGame(); closeMenu(); });
   $('mMute').addEventListener('click', () => { toggleMute(); closeMenu(); });
   $('mFull').addEventListener('click', () => { toggleFullscreen(); closeMenu(); });

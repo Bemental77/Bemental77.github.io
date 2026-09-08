@@ -167,6 +167,8 @@
     <button id="btnStart">Start</button>
     <button id="btnSave" disabled>Save State</button>
     <button id="btnLoad" disabled>Load State</button>
+    <button id="btnExport" disabled>⬆ Export State</button>
+    <button id="btnImport" disabled>⬇ Import State</button>
     <button id="btnMute" disabled>🔊 Mute</button>
     <button id="btnResetAudio" disabled>↻ Reset Audio</button>
     <button id="btnFull" disabled>⛶ Fullscreen</button>
@@ -215,6 +217,7 @@
     <div id="mobileMenuBox">
       <h6>Menu</h6>
       <button id="mSave" disabled>Save State</button><button id="mLoad" disabled>Load State</button>
+      <button id="mExport" disabled>Export State</button><button id="mImport" disabled>Import State</button>
       <button id="mMute" disabled>Mute</button><button id="mResetAudio" disabled>Reset Audio</button>
       <button id="mGhost">Transparent Controls: Off</button>
       <button id="mHide">Hide Controls: Off</button>
@@ -736,7 +739,7 @@
     setStatus('Booting emulator (lazy)…');
     pcsx_worker.postMessage({ cmd: 'romEnd' });
     setTimeout(pollController, 8);   // boot arm of the 8 ms input sampler — see pollController
-    [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
+    [$('btnSave'), $('btnLoad'), $('btnExport'), $('btnImport'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mExport'), $('mImport'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
   }
   async function fetchRomStreamAndBoot() {
     setStatus('Sizing ROM…');
@@ -794,7 +797,7 @@
     setStatus('Booting emulator…');
     pcsx_worker.postMessage({ cmd: 'romEnd' });
     setTimeout(pollController, 8);   // boot arm of the 8 ms input sampler — see pollController
-    [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
+    [$('btnSave'), $('btnLoad'), $('btnExport'), $('btnImport'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mExport'), $('mImport'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
   }
   async function fetchRomAndBoot() {
     if (new URLSearchParams(location.search).has('lazy')) {
@@ -812,10 +815,93 @@
   async function gunzip(u8) { var ds = new DecompressionStream('gzip'); var w = ds.writable.getWriter(); w.write(u8); w.close(); return new Uint8Array(await new Response(ds.readable).arrayBuffer()); }
   async function saveState() { if (!pcsx_worker) return toast('Emulator not ready', true); toast('Saving state…'); try { var heap = await new Promise(res => { pendingSaveResolve = res; pcsx_worker.postMessage({ cmd: 'saveState' }); }); var compressed = await gzip(heap); await idbPut(SAVE_KEY, compressed); toast('Saved (' + (compressed.byteLength / 1048576).toFixed(1) + ' MB)'); } catch (e) { toast('Save failed: ' + e.message, true); } }
   async function loadState() { if (!pcsx_worker) return toast('Emulator not ready', true); try { var stored = await idbGet(SAVE_KEY); if (!stored) return toast('No save state found', true); toast('Restoring…'); var heap = await gunzip(stored instanceof Uint8Array ? stored : new Uint8Array(stored)); var buf = heap.buffer; await new Promise(res => { pendingLoadResolve = res; pcsx_worker.postMessage({ cmd: 'loadState', heap: buf }, [buf]); }); toast('State restored'); } catch (e) { toast('Load failed: ' + (e.message || e), true); } }
+  // ── EXPORT / IMPORT A SAVE STATE ──────────────────────────────────────────
+  // A state that only lives in this browser's IndexedDB is one cleared-site-data
+  // away from gone, and cannot move to another device. gba.html / gamecube.html /
+  // dreamcast.html have had Export/Import for a while; this is the same capability
+  // for the PS1.
+  //
+  // The exported file is EXACTLY the bytes stored under this page's OWN existing
+  // key (SAVE_KEY = ROM_NAME + '.ps1state' in PS1WASMDB) — no re-encoding step to
+  // get wrong, so an export re-imports byte-for-byte. It deliberately does NOT move
+  // to a new key scheme: a visitor's existing saves live at that key and a silent
+  // migration would orphan them.
+  //
+  // ⚠ WHAT IS AND IS NOT IN A PS1 STATE: the stored blob is this page's gzip of
+  // PCSX's own gzipped savestate (libpcsxcore/misc.c:490 SaveState -> gzopen), so
+  // it holds CPU/GPU/SPU/RAM. It does NOT hold the memory cards: sioFreeze
+  // (libpcsxcore/sio.c) freezes the SIO registers but never Mcd1Data/Mcd2Data,
+  // which the core writes to /.pcsx/memcards/card1.mcd in MEMFS. Exporting the
+  // state moves your in-progress game to another device; it does not move a
+  // memory card.
+  // Does this gzip stream actually decompress? A magic-byte check passes a
+  // half-written download; only a real decompress catches one. The writer
+  // promises get their own .catch: an errored DecompressionStream rejects them
+  // too, and an unhandled rejection there surfaces as a page error even though
+  // the failure is already handled here.
+  async function gzipDecompresses(u8) {
+    if (typeof DecompressionStream !== 'function') return true;
+    try {
+      var ds = new DecompressionStream('gzip'), w = ds.writable.getWriter();
+      w.write(u8).catch(function () {}); w.close().catch(function () {});
+      await new Response(ds.readable).arrayBuffer();
+      return true;
+    } catch (e) { return false; }
+  }
+  function downloadBytes(bytes, name) {
+    var url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    var a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
+  }
+  function fmtBytes(n) { return n >= 1048576 ? (n / 1048576).toFixed(2) + ' MB' : (n / 1024).toFixed(1) + ' KB'; }
+  // A write can fail for a reason the visitor can act on (a full console browser),
+  // so name it rather than saying a bare 'failed'.
+  function storageErr(e, verb) {
+    var nm = (e && (e.name || e.message)) || 'unknown error';
+    return nm === 'QuotaExceededError'
+      ? verb + ' failed — out of browser storage on this device.'
+      : verb + ' failed (' + nm + ').';
+  }
+  async function exportState() {
+    try {
+      var stored = await idbGet(SAVE_KEY);
+      if (!stored) return toast('No save state to export — press Save State first.', true);
+      var bytes = stored instanceof Uint8Array ? stored : new Uint8Array(stored);
+      if (!bytes.byteLength) return toast('Saved state is empty.', true);
+      downloadBytes(bytes, SAVE_KEY + '.gz');
+      toast('Exported ' + fmtBytes(bytes.byteLength));
+    } catch (e) { toast(storageErr(e, 'Export'), true); }
+  }
+  function importState() {
+    var inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = '.gz,.ps1state,application/octet-stream';
+    inp.addEventListener('change', async function () {
+      var f = inp.files && inp.files[0];
+      if (!f) return;
+      try {
+        var buf = new Uint8Array(await f.arrayBuffer());
+        // VALIDATE BEFORE STORING. Writing an unreadable blob over a good state
+        // would destroy the very thing the visitor was trying to protect, so a
+        // junk file is refused and the stored state is left untouched.
+        if (buf.length < 3 || buf[0] !== 0x1f || buf[1] !== 0x8b) {
+          return toast('That file is not a save state (no gzip header).', true);
+        }
+        if (!(await gzipDecompresses(buf))) {
+          return toast('That save state is corrupt (gzip will not decompress).', true);
+        }
+        await idbPut(SAVE_KEY, buf);
+        toast('Imported ' + fmtBytes(buf.byteLength) + ' — press Load State to apply it.');
+      } catch (e) { toast(storageErr(e, 'Import'), true); }
+    });
+    inp.click();
+  }
   function toggleMute() { audioMuted = !audioMuted; var ctx = getAudioCtx(); if (ctx) { audioMuted ? ctx.suspend() : ctx.resume(); } $('btnMute').textContent = audioMuted ? '🔇 Unmute' : '🔊 Mute'; $('mMute').textContent = audioMuted ? 'Unmute' : 'Mute'; }
   async function resetAudio() { var ctx = getAudioCtx(); if (!ctx) { toast('Audio not ready', true); return; } if (audioDraining) return; audioDraining = true; toast('Resetting audio…'); try { await ctx.suspend(); } catch (e) {} await new Promise(r => setTimeout(r, 150)); if (window._soundScratchPtr) { try { Module._free(window._soundScratchPtr); } catch (e) {} window._soundScratchPtr = 0; window._soundScratchSize = 0; } if (!audioMuted) { try { await ctx.resume(); } catch (e) {} } audioDraining = false; toast('Audio reset'); }
   function toggleFullscreen() { var el = isMobile ? $('mobileShell') : $('canvasWrap'); if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } else { var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen; if (fn) fn.call(el).catch(() => {}); } }
-  $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnMute').addEventListener('click', toggleMute); $('btnResetAudio').addEventListener('click', resetAudio); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; });
+  $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnExport').addEventListener('click', exportState); $('btnImport').addEventListener('click', importState); $('btnMute').addEventListener('click', toggleMute); $('btnResetAudio').addEventListener('click', resetAudio); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; });
   function openMobileMenu() { $('mobileMenu').classList.add('open'); } function closeMobileMenu() { $('mobileMenu').classList.remove('open'); }
   function applyGhost(on) { $('mobileShell').classList.toggle('ghost', on); if ($('mGhost')) $('mGhost').textContent = 'Transparent Controls: ' + (on ? 'On' : 'Off'); }
   function toggleGhost() { var on = !$('mobileShell').classList.contains('ghost'); localStorage.setItem('ps1wasm_ghost', on ? '1' : '0'); applyGhost(on); }
@@ -823,7 +909,7 @@
   function applyHide(on) { $('mobileShell').classList.toggle('hide-controls', on); if ($('mHide')) $('mHide').textContent = 'Hide Controls: ' + (on ? 'On' : 'Off'); }
   function toggleHide() { var on = !$('mobileShell').classList.contains('hide-controls'); localStorage.setItem('ps1wasm_hide', on ? '1' : '0'); applyHide(on); }
   applyHide(localStorage.getItem('ps1wasm_hide') === '1');
-  $('mobileMenuBtn').addEventListener('click', openMobileMenu); $('mClose').addEventListener('click', closeMobileMenu); $('mSave').addEventListener('click', () => { saveState(); closeMobileMenu(); }); $('mLoad').addEventListener('click', () => { loadState(); closeMobileMenu(); }); $('mMute').addEventListener('click', () => { toggleMute(); closeMobileMenu(); }); $('mResetAudio').addEventListener('click', () => { resetAudio(); closeMobileMenu(); }); $('mGhost').addEventListener('click', toggleGhost); $('mHide').addEventListener('click', () => { toggleHide(); closeMobileMenu(); }); $('mFull').addEventListener('click', () => { toggleFullscreen(); closeMobileMenu(); });
+  $('mobileMenuBtn').addEventListener('click', openMobileMenu); $('mClose').addEventListener('click', closeMobileMenu); $('mSave').addEventListener('click', () => { saveState(); closeMobileMenu(); }); $('mLoad').addEventListener('click', () => { loadState(); closeMobileMenu(); }); $('mExport').addEventListener('click', () => { exportState(); closeMobileMenu(); }); $('mImport').addEventListener('click', () => { importState(); closeMobileMenu(); }); $('mMute').addEventListener('click', () => { toggleMute(); closeMobileMenu(); }); $('mResetAudio').addEventListener('click', () => { resetAudio(); closeMobileMenu(); }); $('mGhost').addEventListener('click', toggleGhost); $('mHide').addEventListener('click', () => { toggleHide(); closeMobileMenu(); }); $('mFull').addEventListener('click', () => { toggleFullscreen(); closeMobileMenu(); });
   $('mobileHideHint').addEventListener('click', () => { applyHide(false); localStorage.setItem('ps1wasm_hide', '0'); });
   // Xbox Edge: L3 (btn 10) triggers browser-back (popstate + BrowserBack key).
   // View (btn 8) triggers Edge's chrome fullscreen at the shell level — not

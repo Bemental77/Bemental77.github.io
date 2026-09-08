@@ -186,6 +186,8 @@
     <button id="btnStart">Start</button>
     <button id="btnSave" disabled>Save State</button>
     <button id="btnLoad" disabled>Load State</button>
+    <button id="btnExport" disabled>⬆ Export State</button>
+    <button id="btnImport" disabled>⬇ Import State</button>
     <button id="btnMute" disabled>🔊 Mute</button>
     <button id="btnReset" disabled>↻ Reset</button>
     <button id="btnFull" disabled>⛶ Fullscreen</button>
@@ -246,6 +248,7 @@
     <div id="mobileMenuBox">
       <h6>Menu</h6>
       <button id="mSave" disabled>Save State</button><button id="mLoad" disabled>Load State</button>
+      <button id="mExport" disabled>Export State</button><button id="mImport" disabled>Import State</button>
       <button id="mMute" disabled>Mute</button><button id="mReset" disabled>Reset</button>
       <button id="mGhost">Transparent Controls: Off</button>
       <button id="mHide">Hide Controls: Off</button>
@@ -2468,7 +2471,7 @@ N64Rate.selfTest = function (logFn) {
       window.myApp.rom_name = rom.file;
       await window.myApp.LoadEmulator(bytes);
       mark('LoadEmulator-returned');
-      [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnReset'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mReset'), $('mFull')].forEach(b => b && (b.disabled = false));
+      [$('btnSave'), $('btnLoad'), $('btnExport'), $('btnImport'), $('btnMute'), $('btnReset'), $('btnFull'), $('mSave'), $('mLoad'), $('mExport'), $('mImport'), $('mMute'), $('mReset'), $('mFull')].forEach(b => b && (b.disabled = false));
     } catch (e) {
       pageLog('[rom] load failed: ' + e);
       setStatus('Load failed: ' + (e.message || e));
@@ -2546,9 +2549,135 @@ N64Rate.selfTest = function (logFn) {
   }
   function saveState() { if (!running) return toast('Emulator not running', true); window.myApp.saveStateLocal(); toast('State saved'); }
   function loadState() { if (!running) return toast('Emulator not running', true); window.myApp.loadStateLocal(); toast('State loaded'); }
+  // ── EXPORT / IMPORT A SAVE STATE ──────────────────────────────────────────
+  // A state that only lives in this browser's IndexedDB is one cleared-site-data
+  // away from gone, and cannot move to another device. gba.html / gamecube.html /
+  // dreamcast.html have had Export/Import for a while; this is the same capability
+  // for the N64.
+  //
+  // It reuses script.js's OWN existing storage, unchanged: DB 'N64WASMDB', store
+  // 'N64WASMSTATES', key = myApp.rom_name for the save state (script.js:958
+  // saveToDatabase) and rom_name + '.sram' for the cartridge save memory
+  // (script.js:933 SaveSram). No new key scheme — a visitor's existing saves live
+  // at those keys and a silent migration would orphan them.
+  //
+  // TWO ARTIFACTS, because on the N64 they really are two. The savestate stores
+  // only the flashram MODE/STATUS (mupen64plus-core/src/main/savestates.c:466-470),
+  // not the cartridge's saved bytes; the eeprom + sram + 4 mempaks + flashram live
+  // in game.savememory, which libretronew.c:1462-1474 writes as a FIXED
+  // 0x800 + 0x8000 + 4*0x8000 + 0x20000 = 296,960 byte image. So a visitor moving
+  // to a new device needs BOTH files, and Export writes both when both exist.
+  // Each file is EXACTLY the bytes stored — no re-encoding step to get wrong.
+  const N64_DB = 'N64WASMDB', N64_STORE = 'N64WASMSTATES';
+  const SAVEMEM_BYTES = 0x800 + 0x8000 + 4 * 0x8000 + 0x20000;   // 296960
+  // Mirrors script.js:823-828 exactly (autoIncrement: true) so that whichever of
+  // the two opens the database first, the store is created the same way.
+  function n64OpenDB() {
+    return new Promise((res, rej) => {
+      var q = indexedDB.open(N64_DB);
+      q.onupgradeneeded = (e) => { var db = e.target.result; if (!db.objectStoreNames.contains(N64_STORE)) db.createObjectStore(N64_STORE, { autoIncrement: true }); };
+      q.onsuccess = (e) => res(e.target.result);
+      q.onerror = () => rej(q.error);
+    });
+  }
+  async function n64Get(k) { var db = await n64OpenDB(); return new Promise((res, rej) => { var t = db.transaction(N64_STORE, 'readonly').objectStore(N64_STORE).get(k); t.onsuccess = () => res(t.result); t.onerror = () => rej(t.error); }); }
+  async function n64Put(k, v) { var db = await n64OpenDB(); return new Promise((res, rej) => { var t = db.transaction(N64_STORE, 'readwrite').objectStore(N64_STORE).put(v, k); t.onsuccess = () => res(); t.onerror = () => rej(t.error); }); }
+  // Does this gzip stream actually decompress? The writer promises get their own
+  // .catch: an errored DecompressionStream rejects them too, and an unhandled
+  // rejection there surfaces as a page error even though the failure is handled.
+  async function gzipDecompresses(u8) {
+    if (typeof DecompressionStream !== 'function') return true;
+    try {
+      var ds = new DecompressionStream('gzip'), w = ds.writable.getWriter();
+      w.write(u8).catch(function () {}); w.close().catch(function () {});
+      await new Response(ds.readable).arrayBuffer();
+      return true;
+    } catch (e) { return false; }
+  }
+  function n64RomName() { return (window.myApp && window.myApp.rom_name) || ''; }
+  function downloadBytes(bytes, name) {
+    var url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    var a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
+  }
+  function fmtBytes(n) { return n >= 1048576 ? (n / 1048576).toFixed(2) + ' MB' : (n / 1024).toFixed(1) + ' KB'; }
+  // A write can fail for a reason the visitor can act on (a full console browser),
+  // so name it rather than saying a bare 'failed'.
+  function storageErr(e, verb) {
+    var nm = (e && (e.name || e.message)) || 'unknown error';
+    return nm === 'QuotaExceededError'
+      ? verb + ' failed — out of browser storage on this device.'
+      : verb + ' failed (' + nm + ').';
+  }
+  async function exportState() {
+    var rom = n64RomName();
+    if (!rom) return toast('Load a ROM first.', true);
+    try {
+      var st = await n64Get(rom);
+      var sram = await n64Get(rom + '.sram');
+      var wrote = [];
+      if (st) {
+        var b = st instanceof Uint8Array ? st : new Uint8Array(st);
+        if (b.byteLength) { downloadBytes(b, rom + '.n64state.gz'); wrote.push('state ' + fmtBytes(b.byteLength)); }
+      }
+      if (sram) {
+        var s2 = sram instanceof Uint8Array ? sram : new Uint8Array(sram);
+        if (s2.byteLength) { downloadBytes(s2, rom + '.sram'); wrote.push('save memory ' + fmtBytes(s2.byteLength)); }
+      }
+      if (!wrote.length) return toast('Nothing to export — press Save State first.', true);
+      toast('Exported ' + wrote.join(' + '));
+    } catch (e) { toast(storageErr(e, 'Export'), true); }
+  }
+  function importState() {
+    var rom = n64RomName();
+    if (!rom) return toast('Load a ROM first, then import.', true);
+    var inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = '.gz,.sram,.n64state,application/octet-stream';
+    inp.multiple = true;   // a visitor moving devices carries both files
+    inp.addEventListener('change', async function () {
+      var files = Array.prototype.slice.call(inp.files || []);
+      if (!files.length) return;
+      var done = [], refused = [];
+      for (var i = 0; i < files.length; i++) {
+        try {
+          var buf = new Uint8Array(await files[i].arrayBuffer());
+          // VALIDATE BEFORE STORING, and route by what the bytes ARE. Writing an
+          // unreadable blob over a good save would destroy the very thing the
+          // visitor was trying to protect, so anything that is neither a readable
+          // gzip stream nor a full-size save-memory image is refused outright and
+          // the stored saves are left untouched.
+          if (buf.length >= 3 && buf[0] === 0x1f && buf[1] === 0x8b) {
+            // A magic-byte check passes a half-written download; only a real
+            // decompress catches one.
+            if (!(await gzipDecompresses(buf))) {
+              refused.push('that save state is corrupt (gzip will not decompress)');
+              continue;
+            }
+            await n64Put(rom, buf);
+            done.push('state ' + fmtBytes(buf.byteLength));
+          } else if (buf.length === SAVEMEM_BYTES) {
+            await n64Put(rom + '.sram', buf);
+            done.push('save memory ' + fmtBytes(buf.byteLength));
+          } else {
+            refused.push('not an N64 save (no gzip header, and not a ' + SAVEMEM_BYTES + '-byte save memory image)');
+          }
+        } catch (e) { return toast(storageErr(e, 'Import'), true); }
+      }
+      // Say WHY, and name the file's own failure rather than a generic one — on a
+      // console browser a bare 'import failed' is a dead end.
+      if (!done.length) return toast('Import refused — ' + refused.join('; ') + '.', true);
+      toast('Imported ' + done.join(' + ') + (refused.length ? ' (' + refused.length + ' refused)' : '') +
+            ' — press Load State for the state; save memory applies next time this ROM loads.');
+    });
+    inp.click();
+  }
+
   function resetGame() { if (!running) return toast('Emulator not running', true); window.Module._neil_reset(); toast('Reset'); }
   function toggleFullscreen() { var el = isMobile ? $('mobileShell') : $('canvasDiv'); if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } else { var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen; if (fn) fn.call(el).catch(() => {}); } }
-  $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnMute').addEventListener('click', toggleMute); $('btnReset').addEventListener('click', resetGame); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; });
+  $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnExport').addEventListener('click', exportState); $('btnImport').addEventListener('click', importState); $('btnMute').addEventListener('click', toggleMute); $('btnReset').addEventListener('click', resetGame); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; });
 
   // ---- diagnostics wiring -----------------------------------------------------------------
   // Three entry points, because the report is worthless if it is only reachable from a state
@@ -2578,7 +2707,7 @@ N64Rate.selfTest = function (logFn) {
   function applyHide(on) { $('mobileShell').classList.toggle('hide-controls', on); if ($('mHide')) $('mHide').textContent = 'Hide Controls: ' + (on ? 'On' : 'Off'); }
   function toggleHide() { var on = !$('mobileShell').classList.contains('hide-controls'); localStorage.setItem('n64wasm_hide', on ? '1' : '0'); applyHide(on); }
   applyHide(localStorage.getItem('n64wasm_hide') === '1');
-  $('mobileMenuBtn').addEventListener('click', openMobileMenu); $('mClose').addEventListener('click', closeMobileMenu); $('mSave').addEventListener('click', () => { saveState(); closeMobileMenu(); }); $('mLoad').addEventListener('click', () => { loadState(); closeMobileMenu(); }); $('mMute').addEventListener('click', () => { toggleMute(); closeMobileMenu(); }); $('mReset').addEventListener('click', () => { resetGame(); closeMobileMenu(); }); $('mGhost').addEventListener('click', toggleGhost); $('mHide').addEventListener('click', () => { toggleHide(); closeMobileMenu(); }); $('mFull').addEventListener('click', () => { toggleFullscreen(); closeMobileMenu(); });
+  $('mobileMenuBtn').addEventListener('click', openMobileMenu); $('mClose').addEventListener('click', closeMobileMenu); $('mSave').addEventListener('click', () => { saveState(); closeMobileMenu(); }); $('mLoad').addEventListener('click', () => { loadState(); closeMobileMenu(); }); $('mExport').addEventListener('click', () => { exportState(); closeMobileMenu(); }); $('mImport').addEventListener('click', () => { importState(); closeMobileMenu(); }); $('mMute').addEventListener('click', () => { toggleMute(); closeMobileMenu(); }); $('mReset').addEventListener('click', () => { resetGame(); closeMobileMenu(); }); $('mGhost').addEventListener('click', toggleGhost); $('mHide').addEventListener('click', () => { toggleHide(); closeMobileMenu(); }); $('mFull').addEventListener('click', () => { toggleFullscreen(); closeMobileMenu(); });
   $('mobileHideHint').addEventListener('click', () => { applyHide(false); localStorage.setItem('n64wasm_hide', '0'); });
 
   // ---- Control remapping ----
