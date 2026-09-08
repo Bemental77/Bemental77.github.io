@@ -519,7 +519,13 @@
   <div id="mobileSplash">
     <h3>Dreamcast Wasm</h3>
     <label for="mobileRomSelect">Choose a game</label>
-    <select id="mobileRomSelect"><option value="pso2">Phantasy Star Online Ver. 2 (USA)</option></select>
+    <!-- POPULATED FROM #romSelect AT INIT — DO NOT HARDCODE <option>s HERE.
+         This was a hand-written single <option> while four more discs were added
+         to #romSelect above, so a phone could only ever launch PSO (user-reported
+         2026-09-08). It is now filled by mirrorRomSelectToMobile(), which runs
+         after markUnhostedDiscs() so the "— not deployed yet" labels come across
+         too, and tools/mobile_gamelist_test.mjs fails on any future divergence. -->
+    <select id="mobileRomSelect"></select>
     <button id="mobileSplashStart" type="button">Start</button>
     <p class="rotateTip">Rotate to landscape for the best view.</p>
     <!-- The splash covers #mobileBottom, so before Start the ≡ menu (and with
@@ -2020,6 +2026,39 @@
       const g = GAMES[opt.value];
       if (g && g.hosted === false) opt.textContent = g.name + ' — not deployed yet';
     }
+  })();
+
+  // The phone shell's picker is a MIRROR of #romSelect, never a second list.
+  // It shipped as one hand-written <option value="pso2">, and the four discs
+  // added to #romSelect later never reached it, so a phone could not launch
+  // four of the five games at all. Same shape as the netplay join pane's mirror
+  // (wireNetplay, below) and for the same second reason: it has to work while
+  // #romSelect sits inside a display:none #wrap on the phone shell, which
+  // reading the DOM — rather than the rendered UI — does.
+  //
+  // ORDER MATTERS: this runs AFTER markUnhostedDiscs() so the "— not deployed
+  // yet" labels are mirrored too, and the phone shows exactly what the desktop
+  // shows. tools/mobile_gamelist_test.mjs asserts the two value sets are equal.
+  (function mirrorRomSelectToMobile() {
+    const src = document.getElementById('romSelect');
+    const dst = document.getElementById('mobileRomSelect');
+    if (!src || !dst) return;
+    const want = dst.value;                    // preserve the current selection
+    dst.innerHTML = '';
+    Array.prototype.forEach.call(src.options, (o) => {
+      const opt = document.createElement('option');
+      opt.value = o.value; opt.textContent = o.textContent;
+      dst.appendChild(opt);
+    });
+    // Assigning a value that is not one of the options is a no-op in the DOM,
+    // so this lands on the desktop selection rather than on nothing.
+    dst.value = want;
+    if (!dst.value) dst.value = src.value;
+    // Keep them together for the rest of the session. The netplay ?game= path
+    // sets #romSelect and dispatches 'change' (see wireNetplay), and the phone
+    // splash's Start copies mobile -> desktop, so both directions are live.
+    src.addEventListener('change', () => { if (dst.value !== src.value) dst.value = src.value; });
+    dst.addEventListener('change', () => { if (src.value !== dst.value) src.value = dst.value; });
   })();
 
   const QS = new URLSearchParams(location.search);
