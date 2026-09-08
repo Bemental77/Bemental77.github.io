@@ -181,6 +181,12 @@ const COLDBOOT  = has('--coldboot');
 // reports guest cycles as well as the state hash, so "the two boots differ" can be
 // told apart from "the rig started them at different instants".
 const FRAME0    = has('--frame0');
+// --equalize: THE DISCRIMINATING EXPERIMENT. In a frame-0/cold arm the two
+// machines are not identical at the anchor (a host-clock byte survives). This
+// pulls instance A's anchor state and pushes it into BOTH for every run, so the
+// start is byte-identical BY CONSTRUCTION. Any divergence that remains therefore
+// cannot be the anchor residual propagating -- it is an independent second cause.
+const EQUALIZE  = has('--equalize');
 // --skew N: give instance B N EXTRA discarded frames of history before its
 // measured pass. THIS IS THE REALISTIC LOCKSTEP TEST. Two real peers never have
 // identical execution history — one sat in the menu longer, one joined late — and
@@ -683,7 +689,7 @@ try {
   report.load = uptime;
   say('load: ' + uptime);
   say(`config: ${TWOBROW ? 'TWO BROWSER PROCESSES' : 'TWO TABS IN ONE BROWSER'} | game=${GAME} frames=${FRAMES} every=${EVERY} runs=${RUNS} arms=${ARMS} input=${INPUT} warmup=${WARMUP} skew=${SKEW} ports=${NPORTS} freezetime=${FREEZE}`);
-  report.warmup = WARMUP; report.query = QUERY; report.diffatFrames = DIFFAT; report.skew = SKEW; report.ports = NPORTS; report.freezeTime = FREEZE; report.coldbootArm = COLDBOOT; report.frame0 = FRAME0;
+  report.warmup = WARMUP; report.query = QUERY; report.diffatFrames = DIFFAT; report.skew = SKEW; report.ports = NPORTS; report.freezeTime = FREEZE; report.coldbootArm = COLDBOOT; report.frame0 = FRAME0; report.equalize = EQUALIZE;
   if (QUERY) say(`query: ?${QUERY}`);
 
   const b1 = await puppeteer.launch({ ...LAUNCH, userDataDir: PROFILE });
@@ -757,12 +763,56 @@ try {
     report.stateBytes = stateBuf.length; report.stateSha = stateHash;
   }
   // One preparation seam for both arms, so nothing else in the rig changes shape.
+  let equalBuf = null;
   const prepare = async (inst) => {
+    if (equalBuf) return pushState(inst, equalBuf);   // --equalize: identical by construction
     if (FRAME0) return true;   // already at a common frame 0; resetting would undo it
     if (!COLDBOOT) return pushState(inst, stateBuf);
     const ok = await inst.worker.evaluate('(async()=>{ self.__det.reset(); return await self.__det.waitClean(); })()');
     return !!ok;
   };
+
+  let anchorDone = false;
+  const anchorGate = async () => {
+  // ANCHOR GATE (cold boot only). Two machines reset INDEPENDENTLY must be
+  // byte-identical BEFORE a single frame runs. If they are not, lockstep from
+  // frame 0 is impossible no matter what the per-frame numbers say, so this is
+  // checked first and reported loudly rather than being assumed.
+  if ((COLDBOOT || FRAME0) && !anchorDone) {
+    anchorDone = true;
+    if (!(await prepare(A)) || !(await prepare(B))) {
+      say('ABORT: retro_reset anchor failed — cannot establish a common frame 0.');
+      await finish(3);
+    }
+    const ha = await A.worker.evaluate(`self.__det.hashState(${CHUNK})`);
+    const hb = await B.worker.evaluate(`self.__det.hashState(${CHUNK})`);
+    if (!ha || !hb) { say('ABORT: could not serialize after reset'); await finish(3); }
+    const same = ha.total === hb.total && ha.size === hb.size;
+    let bad = [];
+    for (let c = 0; c < Math.min(ha.chunks.length, hb.chunks.length); c++)
+      if (ha.chunks[c] !== hb.chunks[c]) bad.push('0x' + (c * CHUNK).toString(16));
+    say(`ANCHOR after retro_reset: sizes ${ha.size}/${hb.size} identical=${same}` +
+        (same ? '' : ` — ${bad.length} differing chunks @ ${bad.slice(0, 12).join(',')}`));
+    report.anchor = { identical: same, sizeA: ha.size, sizeB: hb.size,
+                      differingChunks: bad.length, first: bad.slice(0, 24) };
+    if (!same) say('⚠ TWO INDEPENDENTLY RESET MACHINES ARE ALREADY DIFFERENT. ' +
+                   'Frame-0 lockstep cannot work without shipping a common state.');
+    if (EQUALIZE) {
+      equalBuf = await pullState(A);
+      if (!equalBuf) { say('ABORT: --equalize could not capture the anchor state'); await finish(3); }
+      const okA = await pushState(A, equalBuf), okB = await pushState(B, equalBuf);
+      const qa = await A.worker.evaluate(`self.__det.hashState(${CHUNK})`);
+      const qb = await B.worker.evaluate(`self.__det.hashState(${CHUNK})`);
+      const eq = qa && qb && qa.total === qb.total;
+      say(`EQUALIZED at frame 0: pushed A's ${equalBuf.length} B anchor state into BOTH ` +
+          `(loadA=${okA} loadB=${okB}) -> hashes identical=${eq}. ` +
+          'Any divergence from here is an INDEPENDENT SECOND CAUSE, not the anchor residual.');
+      report.equalized = { bytes: equalBuf.length, identical: !!eq };
+      if (!eq) { say('ABORT: equalize did not produce identical states — cannot discriminate.'); await finish(3); }
+    }
+  }
+  };
+
 
   const A = await bootPage(b1, 'A');
   let B;
@@ -781,6 +831,7 @@ try {
   // serialized states back and diffs them byte by byte, so the finding can name
   // a REGION rather than an offset.
   if (DIFFAT > 0) {
+    await anchorGate();
     const pass = async (inst) => {
       for (let w = 0; w < WARMUP; w++) {
         if (!(await prepare(inst))) throw new Error('warmup prepare FAILED');
@@ -850,29 +901,7 @@ try {
     return r;
   };
 
-  // ANCHOR GATE (cold boot only). Two machines reset INDEPENDENTLY must be
-  // byte-identical BEFORE a single frame runs. If they are not, lockstep from
-  // frame 0 is impossible no matter what the per-frame numbers say, so this is
-  // checked first and reported loudly rather than being assumed.
-  if (COLDBOOT || FRAME0) {
-    if (!(await prepare(A)) || !(await prepare(B))) {
-      say('ABORT: retro_reset anchor failed — cannot establish a common frame 0.');
-      await finish(3);
-    }
-    const ha = await A.worker.evaluate(`self.__det.hashState(${CHUNK})`);
-    const hb = await B.worker.evaluate(`self.__det.hashState(${CHUNK})`);
-    if (!ha || !hb) { say('ABORT: could not serialize after reset'); await finish(3); }
-    const same = ha.total === hb.total && ha.size === hb.size;
-    let bad = [];
-    for (let c = 0; c < Math.min(ha.chunks.length, hb.chunks.length); c++)
-      if (ha.chunks[c] !== hb.chunks[c]) bad.push('0x' + (c * CHUNK).toString(16));
-    say(`ANCHOR after retro_reset: sizes ${ha.size}/${hb.size} identical=${same}` +
-        (same ? '' : ` — ${bad.length} differing chunks @ ${bad.slice(0, 12).join(',')}`));
-    report.anchor = { identical: same, sizeA: ha.size, sizeB: hb.size,
-                      differingChunks: bad.length, first: bad.slice(0, 24) };
-    if (!same) say('⚠ TWO INDEPENDENTLY RESET MACHINES ARE ALREADY DIFFERENT. ' +
-                   'Frame-0 lockstep cannot work without shipping a common state.');
-  }
+  await anchorGate();
 
   for (let run = 1; run <= RUNS; run++) {
     const entry = { run, arms: {} };
