@@ -91,6 +91,7 @@ dreamcast/flycast-src/core/deps/DreamPicoPort-API/ext/
 !dreamcast/flycast-src/core/build.h
 !dreamcast/flycast-src/core/deps/DreamPicoPort-API/src/DppDeviceImp.hpp
 !dreamcast/flycast-src/core/emulator.cpp
+!dreamcast/flycast-src/core/hw/aica/aica_if.cpp
 !dreamcast/flycast-src/core/hw/aica/sgc_if.cpp
 !dreamcast/flycast-src/core/hw/arm7/arm7_rec.cpp
 !dreamcast/flycast-src/core/hw/flashrom/nvmem.cpp
