@@ -3,12 +3,50 @@
 Bridge layer between upstream Flycast (`dreamcast/flycast-src/`) and our
 Emscripten/WASM build with the `bementalJIT` SH4 dynarec.
 
-## Patch convention
+## ⚠ THE SOURCE OF TRUTH IS THE TRACKED TREE, NOT `patches/`
 
-`dreamcast/flycast-src/` is treated as upstream — **never edited in place**.
-All modifications live as numbered `.patch` files under `patches/` and are
-applied by `apply_patches.sh` before each `emcmake` configure. This way we
-can `git pull` flycast cleanly and re-apply our deltas.
+Read this before trusting anything below it.
+
+`dreamcast/flycast-src/` **is** edited in place, and always has been. The
+"never edited in place" convention this README used to claim was not the
+reality on disk: 33 files differ from upstream flycast `4be8a48` and the
+numbered patch series covers only 23 of them. Ten ported files
+(`gdromv3.cpp`, `holly_intc.cpp`, `maple_if.cpp`, `blockmanager.cpp`,
+`driver.cpp`, `sh4_interpreter.cpp`, `sh4_interrupts.cpp`, `sh4_sched.cpp`,
+`reios.cpp`, and one `#include` inside the `DreamPicoPort-API` submodule)
+have no patch at all.
+
+That gap had a cost. On 2026-09-07 eight ported files silently reverted to
+pristine upstream; the tree was gitignored wholesale, so nothing recorded the
+loss and no commit bisect could find it. Two of the lost edits killed the boot
+and one compiled out the entire ARM7 dynarec.
+Write-up: `dreamcast/docs/core-relink-broken/TASKS.md`.
+
+**Since then:**
+
+* The 34 ported files are **tracked in git in place**, via a `!`-negation
+  block in the repo-root `.gitignore`. A reversion is now an ordinary
+  `git diff`.
+* `dreamcast/tools/verify_core_tree.sh` audits the tree by comparing **blob
+  hashes** against the upstream commit the nested checkout sits on, and runs
+  automatically from `dreamcast/build_and_probe.sh` and
+  `flycast_worker_link.sh` — a drifted tree cannot produce a binary.
+  * `--restore` recovers a reverted file from the outer repo.
+  * `--sync-gitignore` re-records the port set after you add a new ported file.
+* **Do not verify this tree with `patch --dry-run`.** It lied in both
+  directions here: BSD `patch` silently skips already-applied hunks and still
+  exits 0, and fuzzy matching applied a `FEAT_AREC` hunk against the wrong one
+  of `build.h`'s four identical `#define FEAT_AREC DYNAREC_NONE` lines.
+
+`patches/` is kept as the **historical record** of how each change came about,
+and `0022` in particular documents the recovery. It is not a complete
+description of the tree and must not be used as one.
+
+## Patch convention (historical)
+
+The original intent: all modifications live as numbered `.patch` files under
+`patches/`, applied by `apply_patches.sh` before each `emcmake` configure, so
+flycast could be `git pull`ed cleanly and the deltas re-applied.
 
 The same shape as `gamecube/dolphin-bridge/` for the GameCube/Dolphin port.
 

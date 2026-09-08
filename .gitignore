@@ -80,6 +80,8 @@ dreamcast/flycast-src/**
 dreamcast/flycast-src/build-*/
 dreamcast/flycast-src/core/deps/*/
 !dreamcast/flycast-src/core/deps/DreamPicoPort-API/
+# …but not ITS submodule tree — nothing ported lives there.
+dreamcast/flycast-src/core/deps/DreamPicoPort-API/ext/
 # >>> flycast-src ported files — managed by dreamcast/tools/verify_core_tree.sh (do not hand-edit) >>>
 # Regenerate with: bash dreamcast/tools/verify_core_tree.sh --sync-gitignore
 # Every path below differs from upstream flycast and MUST stay in git —

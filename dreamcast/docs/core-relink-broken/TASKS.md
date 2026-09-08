@@ -20,9 +20,11 @@ before them held `presented=30/s duty=28% headroom=3.6x capacity≈107fps`.
 
 ## Root cause: `dreamcast/flycast-src/` is GITIGNORED and had silently drifted
 
-`.gitignore:60` ignores the whole tree — `git ls-files dreamcast/flycast-src`
-returns **0** of its 1,834 `.cpp` files. Nothing records its contents and nothing
-warns when it changes. Eight files had reverted to a pre-wasm-port state. Because
+`.gitignore:60` ignored the whole tree — `git ls-files dreamcast/flycast-src`
+returned **0** of its 1,834 `.cpp` files. Nothing recorded its contents and
+nothing warned when it changed. **[FIXED 2026-09-07 — the 34 ported files are
+now tracked in place and a gate blocks the build; see "How to check for this
+drift" below. The past tense in this section is the state at the time.]** Eight files had reverted to a pre-wasm-port state. Because
 the shipped `.wasm` predated the drift, the damage was invisible until a relink.
 
 Confirmed by diffing against the sibling checkout that commit `9441581f` says
@@ -73,23 +75,63 @@ throw "unwind"`. That unwound out of `retro_run` and the shim stopped the pump.
 | `core/rend/gles/{gles.cpp,gles.h,gltex.cpp}` | patch 0017 mobile precision / FBO diagnostics. |
 | `shell/libretro/libretro.cpp` | `flycast_set_fog` / `flycast_set_modvol`, defined in a **core** TU. |
 
-## How to check for this drift (do it before trusting any relink)
+## How to check for this drift — THERE IS NOW A GATE, AND IT IS AUTOMATIC
 
 ```bash
-diff -rq -x "build-*" -x .git -x .DS_Store \
-  dreamcast/flycast-src /Users/caseybement/Dev/dreamcastHtml/dreamcast/flycast-src
+bash dreamcast/tools/verify_core_tree.sh          # audit; exit 1 on drift
+bash dreamcast/tools/verify_core_tree.sh --restore        # put a reverted file back
+bash dreamcast/tools/verify_core_tree.sh --sync-gitignore # record a NEW ported file
 ```
 
-Anything but `core/version.h` is drift. **Sync the named files from the
-reference; do not replay patches.** `patch --dry-run` lied about this tree in
-both directions: BSD `patch` silently skips already-applied hunks and still
-exits 0, and fuzzy matching applied a `FEAT_AREC` hunk against the wrong one of
-`build.h`'s four identical `#define FEAT_AREC DYNAREC_NONE` lines. A
-content-level audit (grep each patch's added lines) is the only check that held.
+It runs on its own from `dreamcast/build_and_probe.sh` (before the archive
+build) and from `dreamcast/flycast-bridge/flycast_worker_link.sh` (before it
+writes anything), so **a drifted tree can no longer produce a binary**.
+`DC_CORE_AUDIT=off` skips it behind a loud banner; that is not a fix.
 
-`dreamcast/flycast-bridge/patches/0022-restore-lost-wasm-port-edits.patch`
-records this recovery for a tree in the same state, but the reference checkout
-is the authority.
+The structural half of the fix is that the tree is **no longer ignored
+wholesale**. `.gitignore` now carries a `!`-negation block naming the 34 files
+that differ from upstream, so a reversion shows up as a plain
+`git status` / `git diff` entry and `git checkout` gets it back.
+`git ls-files dreamcast/flycast-src | wc -l` returns **34**, not 0.
+
+What the audit checks — blob hashes against the upstream commit the nested
+checkout sits on, no patch tooling anywhere in the path:
+
+| check | meaning | verdict |
+|---|---|---|
+| C1 REVERTED | a tracked ported file is byte-identical to upstream — the edit is GONE | FAIL |
+| C2 MISSING | a tracked ported file is not on disk | FAIL |
+| C3 UNRECORDED | a file differs from upstream but the repo does not track it — the next silent-reversion victim | FAIL |
+| C4 | a tracked file differs from outer HEAD — ordinary in-progress work | reported, never fails |
+
+Demonstrated firing 2026-09-07: `git -C dreamcast/flycast-src checkout HEAD --
+core/emulator.cpp` (the exact shape of the incident) dropped
+`config::ThreadedRendering.override(false)`, and
+
+* `git status` showed ` M dreamcast/flycast-src/core/emulator.cpp`;
+* the audit printed **REVERTED TO UPSTREAM (1)** and exited 1;
+* `flycast_worker_link.sh` exited **1** without touching
+  `flycast_worker_emcc.wasm` (sha256 `14bddf42b8255a0c…`, mtime unchanged);
+* `build_and_probe.sh` exited **1** and never reached the archive build or the probe;
+* `--restore` returned the file byte-exactly (sha256
+  `ac0f6d8773b6530a56079eb7c8adf113cf972e3354a6de73251e696198d86c37`) and the
+  audit went back to PASS.
+
+C3 was demonstrated separately by appending a line to the untracked
+`core/hw/aica/aica.cpp`: **UNRECORDED PORT EDITS (1)**, exit 1.
+
+⚠ **`patch --dry-run` is still forbidden as a check**, for the reasons below,
+and the patch series is INCOMPLETE besides — it covers 23 of the 33 flycast
+files that differ from upstream. BSD `patch` silently skips already-applied
+hunks and still exits 0, and fuzzy matching applied a `FEAT_AREC` hunk against
+the wrong one of `build.h`'s four identical `#define FEAT_AREC DYNAREC_NONE`
+lines.
+
+The sibling checkout is no longer the authority — the repo is:
+
+```
+/Users/caseybement/Dev/dreamcastHtml/dreamcast/flycast-src   <-- second opinion only
+```
 
 ## The technique that found it, worth reusing
 
@@ -131,19 +173,21 @@ reproduced the identical crash (`sh4_pc=0x8c379a42 spc=0x8c378d72`):
 * **The VMU** — restoring it made `[maple]` match the shipped binary exactly and
   the crash was unchanged. It was lost work worth restoring, not the cause.
 
-## ⚠ Two landmines of the same class are still live
+## ⚠ Two landmines of the same class — BOTH CLOSED
 
-1. **`dreamcast/flycast-bridge/arm7_rec_wasm.cpp` is UNTRACKED** (`git log` on it
-   is empty). `flycast_worker_link.sh:314` compiles it by name, so if it is ever
-   lost the link fails outright. It is another agent's in-progress work, so it is
-   flagged here rather than swept into this commit — it should be committed by
-   its author.
-2. **HEAD does not compile on its own.** `bementalJIT/guests/sh4/wasm_emit.cpp`
-   calls `b.ifDepth()` 13 times (committed in `c7888a76`), but the definition in
-   `bementalJIT/include/bementalJIT/wasm_module_builder.h` was **never
-   committed** — `git log -S ifDepth` on that header returns nothing. A clean
-   checkout of HEAD cannot build the SH4 emitter. The verified binary in this
-   commit was built WITH those uncommitted working-tree edits.
+1. ~~`dreamcast/flycast-bridge/arm7_rec_wasm.cpp` is UNTRACKED~~ — **committed
+   in `b974360e`.** `flycast_worker_link.sh:314` compiles it by name; verified
+   tracked 2026-09-07.
+2. ~~HEAD does not compile on its own — `wasm_module_builder.h` was missing
+   `ifDepth()`~~ — **committed.** `git show HEAD:bementalJIT/include/bementalJIT/wasm_module_builder.h`
+   contains `u32 ifDepth() const { return _ifDepth; }` at :690.
+
+Audited 2026-09-07 against the link script's own file list
+(`flycast_worker_link.sh:311-314, 387-389`): every input it names by name —
+`EmscriptenWorker.cpp`, `flycast_stubs.cpp`, `rec_wasm.cpp`,
+`arm7_rec_wasm.cpp`, `webgl2-compat.js`, `gl_override.js`,
+`flycast_worker_funcs.js` — is tracked, and no source file under
+`bementalJIT/` is untracked or ignored.
 
 ## Tooling added
 
