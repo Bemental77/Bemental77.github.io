@@ -54,7 +54,7 @@ import puppeteer from 'puppeteer';
 import fs from 'fs';
 import path from 'path';
 
-process.setMaxListeners(0);   // one exit listener per guarded browser; 30 cells is normal here
+process.setMaxListeners(0);   // one exit listener per guarded browser; 28 cells is normal here
 
 const CHROME = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const ORIGIN = process.env.TARGET || 'http://localhost:8080';
