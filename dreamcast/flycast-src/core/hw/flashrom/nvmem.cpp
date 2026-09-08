@@ -200,7 +200,32 @@ static void fixUpDCFlash()
 			syscfg.mono = 0;
 			syscfg.autostart = 1;
 		}
-		u32 now = aica::GetRTC_now();
+		// [2026-09-08] LOCKSTEP DETERMINISM: this was aica::GetRTC_now(), i.e.
+		// host time(NULL) (aica_if.cpp:46-53), and it reaches GUEST STATE twice
+		// from here — syscfg.time_lo/hi just below, and srand(now) for the
+		// console ID at :218. Our flash is IN-MEMORY ONLY, so it is blank on
+		// EVERY boot and this whole path re-runs every time: two peers booting
+		// seconds apart get different console IDs, which land in guest RAM
+		// before either has executed a single guest instruction. Measured on a
+		// cold-boot (frame-0) two-instance arm: 96 differing bytes at the
+		// anchor, both instances at guest_cycles=0, with this function's exact
+		// fingerprint — the 6 ID bytes, their copy 0xA0 later, and the one-byte
+		// checksum.
+		//
+		// Pinned to the DC epoch (1/1/70 00:00:00), which is the same constant
+		// and the same reasoning upstream Flycast already uses for its own
+		// netplay path: aica_if.cpp:39-41, "rtc kept static for netplay when
+		// savestate is not loaded". Applied at the consumer rather than in
+		// GetRTC_now() because aica_if.cpp is NOT tracked by the flycast-src
+		// drift gate, and an edit there would be invisible to git and could
+		// silently revert; nvmem.cpp is tracked.
+		//
+		// COST, stated rather than hidden: the DC system-config clock now reads
+		// 1/1/70 instead of host local time. The console ID becoming constant is
+		// arguably a FIX rather than a cost — real hardware has a FIXED id in
+		// persistent flash, whereas an in-memory flash regenerated it at random
+		// on every boot.
+		u32 now = (20 * 365 + 5) * 24 * 60 * 60;
 		syscfg.time_lo = now & 0xffff;
 		syscfg.time_hi = now >> 16;
 		if (config::Language <= 5)
