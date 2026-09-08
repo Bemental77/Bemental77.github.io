@@ -165,6 +165,7 @@ const QUERY     = arg('--query', '');
 // serialized states back to Node and diff them BYTE BY BYTE. This is what turns
 // "chunk 0xa70000 differs" into "these bytes, this region, this device".
 const DIFFAT    = parseInt(arg('--diffat', '0'), 10);
+const DIFFAT_SET = argv.includes('--diffat');
 const NPORTS    = parseInt(arg('--ports', '2'), 10);
 // --freezetime: pin Date.now inside BOTH workers to this fixed epoch-ms for the
 // measured window, so every instance sees the same host instant. 0 = off.
@@ -192,6 +193,11 @@ const EQUALIZE  = has('--equalize');
 // things -- retro_unserialize (emu.stop/loadstate/emu.start) AND this flush -- so
 // --equalize cannot say which one produces its collapse. This isolates the flush.
 const LSRESET   = has('--lockstepreset');
+// --normalize: call _emscripten_lockstep_normalize() -- serialize this instance and
+// immediately load its OWN bytes back. The state is unchanged by construction; the
+// point is the emu.stop()/loadstate/emu.start() side effect. This isolates the
+// subsystem restart from the state transfer, which --equalize cannot do.
+const NORMALIZE = has('--normalize');
 // --skew N: give instance B N EXTRA discarded frames of history before its
 // measured pass. THIS IS THE REALISTIC LOCKSTEP TEST. Two real peers never have
 // identical execution history — one sat in the menu longer, one joined late — and
@@ -694,7 +700,7 @@ try {
   report.load = uptime;
   say('load: ' + uptime);
   say(`config: ${TWOBROW ? 'TWO BROWSER PROCESSES' : 'TWO TABS IN ONE BROWSER'} | game=${GAME} frames=${FRAMES} every=${EVERY} runs=${RUNS} arms=${ARMS} input=${INPUT} warmup=${WARMUP} skew=${SKEW} ports=${NPORTS} freezetime=${FREEZE}`);
-  report.warmup = WARMUP; report.query = QUERY; report.diffatFrames = DIFFAT; report.skew = SKEW; report.ports = NPORTS; report.freezeTime = FREEZE; report.coldbootArm = COLDBOOT; report.frame0 = FRAME0; report.equalize = EQUALIZE; report.lockstepresetArm = LSRESET;
+  report.warmup = WARMUP; report.query = QUERY; report.diffatFrames = DIFFAT; report.skew = SKEW; report.ports = NPORTS; report.freezeTime = FREEZE; report.coldbootArm = COLDBOOT; report.frame0 = FRAME0; report.equalize = EQUALIZE; report.lockstepresetArm = LSRESET; report.normalizeArm = NORMALIZE;
   if (QUERY) say(`query: ?${QUERY}`);
 
   const b1 = await puppeteer.launch({ ...LAUNCH, userDataDir: PROFILE });
@@ -770,10 +776,14 @@ try {
   // One preparation seam for both arms, so nothing else in the rig changes shape.
   let equalBuf = null;
   const prepare = async (inst) => {
-    if (LSRESET && !equalBuf) {
-      // Mirror what a call site at the end of load_disc would give a fresh boot:
-      // every measured pass begins with the flush, nothing else changed.
-      await inst.worker.evaluate('(async()=>{ await self.__det.waitClean(); self.Module._flycast_lockstep_reset(); return true; })()');
+    if ((NORMALIZE || LSRESET) && !equalBuf) {
+      // Applied TOGETHER when both flags are set. emscripten_load_state does the
+      // unserialize AND the flush; testing them only in isolation cannot see a
+      // combination effect, and each alone has already measured null.
+      if (NORMALIZE)
+        await inst.worker.evaluate('(async()=>{ await self.__det.waitClean(); self.Module._emscripten_lockstep_normalize(); await self.__det.waitClean(); return true; })()');
+      if (LSRESET)
+        await inst.worker.evaluate('(async()=>{ await self.__det.waitClean(); self.Module._flycast_lockstep_reset(); return true; })()');
       if (FRAME0) return true;
     }
     if (equalBuf) return pushState(inst, equalBuf);   // --equalize: identical by construction
@@ -810,6 +820,13 @@ try {
                       differingChunks: bad.length, first: bad.slice(0, 24) };
     if (!same) say('⚠ TWO INDEPENDENTLY RESET MACHINES ARE ALREADY DIFFERENT. ' +
                    'Frame-0 lockstep cannot work without shipping a common state.');
+    if (NORMALIZE) {
+      const na = await A.worker.evaluate('(async()=>{ await self.__det.waitClean(); self.Module._emscripten_lockstep_normalize(); await self.__det.waitClean(); return true; })()');
+      const nb = await B.worker.evaluate('(async()=>{ await self.__det.waitClean(); self.Module._emscripten_lockstep_normalize(); await self.__det.waitClean(); return true; })()');
+      say(`LOCKSTEP-NORMALIZE called at the anchor in BOTH instances (A=${na} B=${nb}); NO state pushed, ` +
+          'each loaded its OWN bytes. Isolates emu.stop()/start() from the state transfer.');
+      report.normalize = { A: !!na, B: !!nb };
+    }
     if (LSRESET) {
       const ra = await A.worker.evaluate('(async()=>{ await self.__det.waitClean(); self.Module._flycast_lockstep_reset(); return true; })()');
       const rb = await B.worker.evaluate('(async()=>{ await self.__det.waitClean(); self.Module._flycast_lockstep_reset(); return true; })()');
@@ -851,7 +868,7 @@ try {
   // This runs both instances exactly N frames from the shared state, pulls both
   // serialized states back and diffs them byte by byte, so the finding can name
   // a REGION rather than an offset.
-  if (DIFFAT > 0) {
+  if (DIFFAT_SET) {
     await anchorGate();
     const pass = async (inst) => {
       for (let w = 0; w < WARMUP; w++) {
@@ -928,7 +945,20 @@ try {
     const entry = { run, arms: {} };
     say(`--- run ${run}/${RUNS} ---`);
 
-    if (ARMS.includes('self')) {
+    // ⚠ THE SELF ARM IS MEANINGLESS WITHOUT A RESTORE. It runs two passes in ONE
+    // instance and compares them. That is only a replay comparison if each pass
+    // STARTS FROM THE SAME PLACE. In --frame0 without --equalize, prepare() is a
+    // no-op, so pass 2 begins where pass 1 ENDED: it compares guest frames
+    // 0..N against N..2N, which must differ, and reports firstDiverge at the very
+    // first sample every time. That artifact was briefly reported as evidence of
+    // nondeterminism. Refuse it rather than print it.
+    if (ARMS.includes('self') && FRAME0 && !equalBuf) {
+      say('SELF ARM SKIPPED: in --frame0 without --equalize nothing restores state ' +
+          'between the two passes, so pass 2 would start at frame ' + FRAMES + ' and the ' +
+          'comparison would be of two DIFFERENT time windows — a guaranteed, meaningless ' +
+          'divergence. Use --frame0 --equalize for a self arm, or read the cross arm.');
+      entry.arms.self = { skipped: 'frame0 without a restore — not a replay comparison' };
+    } else if (ARMS.includes('self')) {
       // CONTROL: one instance, same state, same inputs, twice. If this fails,
       // nothing cross-instance is interpretable.
       const r1 = await runOne(A, 'A#1', 0);
