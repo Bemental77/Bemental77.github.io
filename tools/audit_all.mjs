@@ -384,6 +384,51 @@ const HARNESSES = [
   // came back. The fix is flush -> serialize/unserialize round-trip -> flush at
   // room start, all three steps AND their order load-bearing, which is why
   // every single-variable isolation of it read null.
+  // The four harnesses below were flagged UNDECLARED by this runner's own audit:
+  // present on disk, in neither the run table nor NOT_RUN, therefore run by
+  // nobody. That is the exact shape of gap this file exists to close — a test
+  // that exists but is never invoked is indistinguishable from no test, and it
+  // is worse, because its presence implies coverage.
+  {
+    name: 'netplay-lockstep',
+    file: 'tools/netplay_lockstep_test.mjs',
+    cmd: ['node', 'tools/netplay_lockstep_test.mjs'],
+    desc: 'the lockstep PROTOCOL: frame-numbered input exchange, the stall path when a remote input is missing (it must STALL, never predict — a guess becomes a permanent silent desync), input delay, and the desync report naming frame, peer and field',
+    fast: true, ci: true,
+    server: true,
+    requires: ['lib/netplay.js'],
+    timeoutMs: 10 * MIN,
+  },
+  {
+    name: 'netplay-lockstep-pair',
+    file: 'tools/netplay_lockstep_pair_test.mjs',
+    cmd: ['node', 'tools/netplay_lockstep_pair_test.mjs'],
+    desc: 'two peers over a REAL RTCPeerConnection running the lockstep exchange: what the delay buys, and what a stall looks like when the link is slow',
+    fast: false, ci: true,
+    server: true,
+    requires: ['lib/netplay.js'],
+    timeoutMs: 15 * MIN,
+  },
+  {
+    name: 'netplay-room',
+    file: 'tools/netplay_room_test.mjs',
+    cmd: ['node', 'tools/netplay_room_test.mjs'],
+    desc: 'the ROOM seats up to the console port count over real WebRTC: agreed rosters on every machine, deterministic port assignment, a full room refusing the next caller, the start barrier, and a leaver not wedging the rest',
+    fast: false, ci: true,
+    server: true,
+    requires: ['lib/netplay.js'],
+    timeoutMs: 20 * MIN,
+  },
+  {
+    name: 'bgz',
+    file: 'tools/bgz.test.mjs',
+    cmd: ['node', 'tools/bgz.test.mjs'],
+    desc: 'the block-gzip container the big discs ship in: an index that maps a disc byte range onto compressed blocks, and rejection of a part whose recorded size disagrees with its block lengths — a wrong answer here silently corrupts a disc rather than failing',
+    fast: true, ci: true,
+    server: false,
+    requires: ['lib/bgz.js'],
+    timeoutMs: 5 * MIN,
+  },
   {
     name: 'dreamcast-determinism',
     file: 'dreamcast/tools/determinism_probe.mjs',
