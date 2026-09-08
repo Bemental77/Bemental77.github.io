@@ -669,9 +669,30 @@ struct maple_sega_vmu: maple_base
 					{
 						w32(MFID_3_Clock);
 
-						time_t now;
-						time(&now);
-						tm* timenow=localtime(&now);
+						// [2026-09-08] HOST WALL-CLOCK MUST NEVER REACH GUEST
+						// STATE. This wrote the host's year/month/day/hour/min/sec
+						// straight into the maple DMA output buffer on every poll,
+						// ungated — the one host-time -> guest-bytes channel that
+						// NO savestate can neutralise (unlike the AICA RTC, which
+						// is serialized at aica_if.cpp:542/584, and VMU flash at
+						// maple_devs.cpp:379-381). Two peers in a lockstep room
+						// are started seconds or minutes apart, so they read
+						// different bytes here and desync.
+						//
+						// localtime() was a SECOND host input on top of time():
+						// it resolves against the player's timezone, so even two
+						// peers with perfectly synchronised clocks diverge if they
+						// sit in different zones. gmtime() removes that.
+						//
+						// Pinned to a fixed instant, which is exactly what upstream
+						// Flycast already does for its own netplay path — see
+						// GetRTC_now() at hw/aica/aica_if.cpp:39-42, "rtc kept
+						// static for netplay when savestate is not loaded",
+						// returning the DC-epoch equivalent of 1/1/70 00:00:00.
+						// Cost: a game that displays a VMU save timestamp shows a
+						// constant date. That is the same cost upstream accepts.
+						time_t now = (time_t)0;   // 1970-01-01 00:00:00 UTC
+						tm* timenow=gmtime(&now);
 
 						u8* timebuf=dma_buffer_out;
 
