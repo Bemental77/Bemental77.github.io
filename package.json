@@ -3,6 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "test": "node tools/audit_all.mjs --fast",
+    "audit:all": "node tools/audit_all.mjs",
     "web": "python3 -m http.server 8080",
     "matrix": "node tools/device_matrix.mjs",
     "matrix:json": "node tools/device_matrix.mjs --json"

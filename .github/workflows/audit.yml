@@ -1,0 +1,135 @@
+name: Audit
+
+# THE STANDING TEST RUN.
+#
+# Until this file existed, `ls .github/workflows/` returned exactly one entry
+# (deploy.yml) and grepping every workflow for a test invocation returned one
+# line — `node tools/verify_deploy_assets.mjs`, which runs against the STAGED
+# ARTIFACT and only on a push to `prod`. The ~20 browser harnesses in tools/ ran
+# only when a human typed them, so "the tests passed" meant "the tests I
+# happened to remember". This runs them on every push instead.
+#
+# ⚠ CONCURRENCY GROUP. deploy.yml uses `group: pages` with
+# `cancel-in-progress: true`. This job MUST NOT join that group or a push would
+# cancel a running deploy. It has its own per-ref group below.
+
+on:
+  push:
+    branches: [dev, prod]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      # ------------------------------------------------------------------
+      # CHECKOUT — sparse, and the exclusions are the whole story.
+      #
+      # This repo tracks ~9.7 GB of runtime assets IN THE ORDINARY PACK
+      # (`git lfs ls-files` returns 0 — the .gitattributes LFS rules match
+      # nothing that is tracked today). A plain checkout is therefore ~9.7 GB
+      # on every push, which is neither fast nor necessary for these gates.
+      #
+      # Measured on the working tree, tracked bytes by path:
+      #   ps1/ps1Wasm    2776 MB   gamecube/roms     2769 MB
+      #   dreamcast/discs 2583 MB  n64/N64Wasm        870 MB
+      #   dreamcast/states 114 MB  gba/gbaWasm         89 MB
+      #   ps1/duckstation-master 65 MB
+      # Excluding those leaves a 384 MB tree (measured in a scratch clone with
+      # exactly these patterns).
+      #
+      # TWO FILES ARE DELIBERATELY RE-INCLUDED. tools/verify_deploy_assets.mjs
+      # asserts that split-ROM directories survived the deploy filter by probing
+      # the FIRST CHUNK of each, so it needs one file inside gamecube/roms and
+      # one inside ps1/ps1Wasm/roms. With just those two present it reports
+      # "60 present · 1 optional-missing · 0 MISSING" — verified against a tree
+      # built to this exact shape. Without them that gate, and preflight which
+      # contains it, would fail for a reason that is not a regression.
+      #
+      # Non-cone mode is required: cone mode cannot express a file-level
+      # re-include underneath an excluded directory.
+      - name: Checkout (sparse — no ROM/disc libraries)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/gamecube/roms/
+            /gamecube/roms/MarioParty4.bin.partaa.gz
+            !/dreamcast/discs/
+            !/dreamcast/states/
+            !/n64/N64Wasm/roms/
+            !/gba/gbaWasm/roms/
+            !/ps1/ps1Wasm/roms/
+            /ps1/ps1Wasm/roms/MonsterRancher2.bin.partaa.gz
+            !/ps1/duckstation-master/
+            !/ps1/ps1Wasm/pcsx-wasm-src/
+            !/ps1/ps1Wasm/wasmpsx-repo/
+            !/emsdk/
+            !/snes/emsdk/
+
+      - name: Checkout size (so a creeping tree is visible, not a surprise)
+        run: |
+          echo "worktree (excluding .git):"
+          du -sh --exclude=.git . || du -sh .
+          echo "tracked index entries: $(git ls-files | wc -l)"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Chrome. Every harness reads CHROME_PATH and falls back to the macOS
+      # bundle path, which does not exist here — so this is not optional.
+      - name: Install Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      # Ubuntu 24.04 runners restrict unprivileged user namespaces via AppArmor,
+      # which breaks Chrome's sandbox. Every harness in the CI set already passes
+      # --no-sandbox, so this is belt-and-braces and must never fail the job.
+      - name: Relax unprivileged userns restriction (best effort)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      # puppeteer is NOT in package.json — it resolves from the developer's home
+      # directory on the machine these harnesses were written on. Installed here
+      # without --save so package.json and the Lambda/serverless config are left
+      # exactly as they are. PUPPETEER_SKIP_DOWNLOAD is safe because every
+      # harness in the CI set passes an explicit executablePath.
+      - name: Install puppeteer (not saved to package.json)
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: '1'
+        run: npm install --no-save --no-audit --no-fund puppeteer puppeteer-core
+
+      # Print the full table BEFORE running, so the excluded harnesses and the
+      # reason for each are in the runner log whether the job passes or fails.
+      # A gap nobody can see is the thing this whole workflow exists to end.
+      - name: Declare the suite (what runs here, and what does not)
+        run: node tools/audit_all.mjs --list
+
+      - name: Audit
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          AUDIT_JSON: ${{ runner.temp }}/audit-all.json
+        run: node tools/audit_all.mjs --ci
+
+      - name: Upload audit JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-all-json
+          path: ${{ runner.temp }}/audit-all.json
+          if-no-files-found: warn
