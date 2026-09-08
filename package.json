@@ -5,9 +5,10 @@
   "scripts": {
     "test": "node tools/audit_all.mjs --fast",
     "audit:all": "node tools/audit_all.mjs",
-    "web": "python3 -m http.server 8080",
+    "web": "node tools/devserver.mjs",
     "matrix": "node tools/device_matrix.mjs",
-    "matrix:json": "node tools/device_matrix.mjs --json"
+    "matrix:json": "node tools/device_matrix.mjs --json",
+    "web:simple": "python3 -m http.server 8080"
   },
   "dependencies": {
     "@types/react": "18.0.38",
