@@ -198,6 +198,11 @@ const LSRESET   = has('--lockstepreset');
 // point is the emu.stop()/loadstate/emu.start() side effect. This isolates the
 // subsystem restart from the state transfer, which --equalize cannot do.
 const NORMALIZE = has('--normalize');
+// --normalizeone: normalize instance A ONLY, at an anchor where the two states are
+// already byte-identical. Whatever then differs IS the hidden derived state that
+// emu.start() rebuilds -- made visible by the very operation that fixes it. Pair
+// with --diffat 0 for a byte-level name.
+const NORMONE   = has('--normalizeone');
 // --skew N: give instance B N EXTRA discarded frames of history before its
 // measured pass. THIS IS THE REALISTIC LOCKSTEP TEST. Two real peers never have
 // identical execution history — one sat in the menu longer, one joined late — and
@@ -700,7 +705,7 @@ try {
   report.load = uptime;
   say('load: ' + uptime);
   say(`config: ${TWOBROW ? 'TWO BROWSER PROCESSES' : 'TWO TABS IN ONE BROWSER'} | game=${GAME} frames=${FRAMES} every=${EVERY} runs=${RUNS} arms=${ARMS} input=${INPUT} warmup=${WARMUP} skew=${SKEW} ports=${NPORTS} freezetime=${FREEZE}`);
-  report.warmup = WARMUP; report.query = QUERY; report.diffatFrames = DIFFAT; report.skew = SKEW; report.ports = NPORTS; report.freezeTime = FREEZE; report.coldbootArm = COLDBOOT; report.frame0 = FRAME0; report.equalize = EQUALIZE; report.lockstepresetArm = LSRESET; report.normalizeArm = NORMALIZE;
+  report.warmup = WARMUP; report.query = QUERY; report.diffatFrames = DIFFAT; report.skew = SKEW; report.ports = NPORTS; report.freezeTime = FREEZE; report.coldbootArm = COLDBOOT; report.frame0 = FRAME0; report.equalize = EQUALIZE; report.lockstepresetArm = LSRESET; report.normalizeArm = NORMALIZE; report.normalizeOneArm = NORMONE;
   if (QUERY) say(`query: ?${QUERY}`);
 
   const b1 = await puppeteer.launch({ ...LAUNCH, userDataDir: PROFILE });
@@ -820,6 +825,14 @@ try {
                       differingChunks: bad.length, first: bad.slice(0, 24) };
     if (!same) say('⚠ TWO INDEPENDENTLY RESET MACHINES ARE ALREADY DIFFERENT. ' +
                    'Frame-0 lockstep cannot work without shipping a common state.');
+    if (NORMONE) {
+      const before = (await A.worker.evaluate(`self.__det.hashState(${CHUNK})`)).total;
+      await A.worker.evaluate('(async()=>{ await self.__det.waitClean(); self.Module._emscripten_lockstep_normalize(); await self.__det.waitClean(); return true; })()');
+      const after = (await A.worker.evaluate(`self.__det.hashState(${CHUNK})`)).total;
+      say(`ONE-SIDED NORMALIZE on A only (B untouched). A state hash ${before} -> ${after} ` +
+          `(${before === after ? 'UNCHANGED — the round-trip is state-neutral, so the hidden state is NOT in the serialized set' : 'CHANGED — the delta below IS the hidden state'}).`);
+      report.normalizeOne = { before, after, changed: before !== after };
+    }
     if (NORMALIZE) {
       const na = await A.worker.evaluate('(async()=>{ await self.__det.waitClean(); self.Module._emscripten_lockstep_normalize(); await self.__det.waitClean(); return true; })()');
       const nb = await B.worker.evaluate('(async()=>{ await self.__det.waitClean(); self.Module._emscripten_lockstep_normalize(); await self.__det.waitClean(); return true; })()');
