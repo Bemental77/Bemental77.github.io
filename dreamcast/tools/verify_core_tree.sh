@@ -252,9 +252,34 @@ if [ -e "$SRC/.git" ]; then
   fi
 fi
 
+# ⚠ C4 IS A FAILURE, NOT A NOTE — this was the gate's blind spot and an audit
+# walked straight through it. C1 only catches a file reverted ENTIRELY to
+# upstream, so ANY DAMAGE SHORT OF A FULL REVERT passed. Demonstrated: deleting
+# just the `#if defined(__EMSCRIPTEN__)` hunk of core/build.h — the one holding
+# FEAT_SHREC/FEAT_AREC DYNAREC_JIT — left the gate printing
+#   "PASS — every tracked port edit is still applied"   exit 0
+# while `cc -E` showed both features drop 0x40000002 -> 0x40000001: THE SH4 JIT
+# AND THE ARM7 DYNAREC COMPILED OUT. A binary built from that tree would have
+# shipped. Both callers check only the exit code, so "informational" meant
+# "invisible".
+# The gate exists to stop a BINARY being produced from a tree that does not match
+# what is committed — which is precisely what C4 detects — so it now fails.
+# Deliberate in-progress core work sets DC_CORE_ALLOW_UNCOMMITTED=1, which is
+# loud and leaves a trace in the build log rather than being the silent default.
 if [ "$n_uncom" -gt 0 ]; then
-  echo "verify_core_tree: $n_uncom tracked file(s) differ from outer HEAD (in-progress work, not an error):"
-  printf '%s\n' "$UNCOMMITTED" | sed '/^$/d; s|^|                  |'
+  if [ "${DC_CORE_ALLOW_UNCOMMITTED:-}" = "1" ]; then
+    echo "verify_core_tree: $n_uncom tracked file(s) differ from outer HEAD —"
+    echo "                  ALLOWED by DC_CORE_ALLOW_UNCOMMITTED=1. The binary this"
+    echo "                  build produces is NOT reproducible from git."
+    printf '%s\n' "$UNCOMMITTED" | sed '/^$/d; s|^|                  |'
+  else
+    echo "verify_core_tree: $n_uncom tracked ported file(s) DIFFER FROM COMMITTED HEAD:"
+    printf '%s\n' "$UNCOMMITTED" | sed '/^$/d; s|^|                  |'
+    echo "                  A build from this tree is not reproducible, and a partial"
+    echo "                  revert here is invisible to every other check. Commit the"
+    echo "                  change, or set DC_CORE_ALLOW_UNCOMMITTED=1 deliberately."
+    fail=1
+  fi
 fi
 
 if [ "$fail" -eq 0 ]; then
