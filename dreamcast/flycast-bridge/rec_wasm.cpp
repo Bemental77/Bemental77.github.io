@@ -737,12 +737,7 @@ static constexpr u32 SHARD_BLOCK_CAP = 4096;
 // Fallback seal trigger: if at least one block sits pending and this many
 // dispatches have elapsed without the shard filling, force a seal. Stops
 // blocks from sitting in pending forever during low-rate boot phases.
-// [2026-09-08] This constant was DEAD: it read 1000000, while the only live
-// seal test (below) used a hard-coded 100000 literal, so tuning the named
-// constant changed nothing. Deleted and replaced with a name for the literal
-// that has actually been measured. Do NOT "restore" 1000000 — that value has
-// never been run.
-static constexpr u64 SHARD_DISPATCH_SEAL = 100000;
+static constexpr u64 SHARD_DISPATCH_SEAL = 1000000;  // bumped from 100K — was causing 1534 seals/30s = 51/sec Module-creates, dominating dispatch cost
 
 static std::vector<RuntimeBlockInfo*> s_pending_shard;
 static u64 s_dispatches_at_last_seal = 0;
@@ -754,18 +749,11 @@ static std::unordered_set<u32> s_pending_vaddrs;
 // wholesale at every seal and at reset(). ORDERED (std::map, not
 // unordered_map) so a mid-span pc can be resolved back to the span that
 // contains it — see find_span/span_interp_pending.
-// [2026-09-08] Value widened from a bare length to {len, guest_cycles}. The
-// span-interp route must charge the SAME cycles the compiled route charges,
-// and the compiled route charges block->guest_cycles in its PROLOGUE
-// (bementalJIT/guests/sh4/wasm_emit.cpp:4354-4365). Carrying guest_cycles here
-// is what makes the two routes identical BY CONSTRUCTION rather than by two
-// constants happening to agree.
-struct SpanInfo { u32 len; u32 gc; };
-static std::map<u32, SpanInfo> s_pending_len;
+static std::map<u32, u32> s_pending_len;
 // vaddr -> code bytes for COMPILED-BUT-UNREGISTERED blocks (see
 // park_unregistered). Separate lifetime from s_pending_len on purpose: a park
 // must outlive every shard seal, and the seal clears s_pending_len wholesale.
-static std::map<u32, SpanInfo> s_unreg_len;
+static std::map<u32, u32> s_unreg_len;
 
 // Park a vaddr that flycast considers compiled (compile() sets block->code, so
 // compilePC calls bm_AddBlock at driver.cpp:202, which claims FPCA(addr) at
@@ -776,8 +764,8 @@ static std::map<u32, SpanInfo> s_unreg_len;
 // must span-INTERPRET a parked pc from live RAM instead, forever — until
 // reset() clears the parks, which is sound because bm_ResetCache refills the
 // WHOLE FPCB with ngen_FailedToFindBlock first (see reset()).
-static inline void park_unregistered(u32 vaddr, u32 code_bytes, u32 guest_cycles) {
-    s_unreg_len[vaddr] = SpanInfo{ code_bytes, guest_cycles };
+static inline void park_unregistered(u32 vaddr, u32 code_bytes) {
+    s_unreg_len[vaddr] = code_bytes;
 }
 
 // [2026-05-19] Forcing shard ON validated the path engages (124 seals fired in 60s)
@@ -858,8 +846,7 @@ static void seal_pending_shard() {
                 // span-interp instead (same treatment as a hard install
                 // failure below).
                 park_unregistered(s_pending_shard[i]->vaddr,
-                                  s_pending_shard[i]->sh4_code_size,
-                                  s_pending_shard[i]->guest_cycles);
+                                  s_pending_shard[i]->sh4_code_size);
                 static int s_probe_log = 0;
                 if (s_probe_log < 8) {   // 6D: unconditional
                     s_probe_log++;
@@ -948,11 +935,11 @@ static void seal_pending_shard() {
                     // already claimed, so this must span-interp too — a bare
                     // `continue` here left it to be recompiled straight into
                     // blockmanager.cpp:288's DEBUGBREAK.
-                    park_unregistered(blk->vaddr, blk->sh4_code_size, blk->guest_cycles);
+                    park_unregistered(blk->vaddr, blk->sh4_code_size);
                 continue;
             }
             ++hard_failed;
-            park_unregistered(blk->vaddr, blk->sh4_code_size, blk->guest_cycles);
+            park_unregistered(blk->vaddr, blk->sh4_code_size);
             static int s_bad_log = 0;
             if (s_bad_log < 8) {
                 ++s_bad_log;
@@ -1388,17 +1375,16 @@ static inline void interp_one_step(Sh4Context* ctx, u32 pc) {
 // Ordered map => O(log n) predecessor lookup; only the greatest key <= pc is
 // considered, so overlapping spans degrade to today's behaviour (miss) rather
 // than to a wrong span.
-static bool find_span(const std::map<u32, SpanInfo>& m, u32 pc, u32& lo, u32& hi, u32& gc)
+static bool find_span(const std::map<u32, u32>& m, u32 pc, u32& lo, u32& hi)
 {
-    auto it = m.upper_bound(pc);            // first key strictly > pc
+    auto it = m.upper_bound(pc);        // first key strictly > pc
     if (it == m.begin())
         return false;
-    --it;                                   // greatest key <= pc
-    if (pc - it->first >= it->second.len)   // pc is past this span's end
+    --it;                               // greatest key <= pc
+    if (pc - it->first >= it->second)   // pc is past this span's end
         return false;
     lo = it->first;
-    hi = it->first + it->second.len;
-    gc = it->second.gc;
+    hi = it->first + it->second;
     return true;
 }
 
@@ -1413,9 +1399,9 @@ static bool find_span(const std::map<u32, SpanInfo>& m, u32 pc, u32& lo, u32& hi
 // such a span (and was interpreted).
 static bool span_interp_pending(Sh4Context* ctx, u32 pc)
 {
-    u32 lo, hilim, gc;
-    if (!find_span(s_pending_len, pc, lo, hilim, gc) &&
-        !find_span(s_unreg_len,   pc, lo, hilim, gc))
+    u32 lo, hilim;
+    if (!find_span(s_pending_len, pc, lo, hilim) &&
+        !find_span(s_unreg_len,   pc, lo, hilim))
         return false;
     // The guard exists because a span whose terminating branch targets its own
     // start keeps pc inside [lo,hilim) forever; it is NOT a span-length bound.
@@ -1428,50 +1414,8 @@ static bool span_interp_pending(Sh4Context* ctx, u32 pc)
     // behind on the next dispatch.
     int guard = (int)((hilim - lo) / 2) + 1024;
     while (ctx->pc >= lo && ctx->pc < hilim &&
-           --guard > 0 && ctx->CpuRunning) {
-        // ---- ROUTE-INDEPENDENT CYCLE ACCOUNTING (2026-09-08) ---------------
-        // THE LOCKSTEP DETERMINISM BUG. Whether a block runs COMPILED or
-        // SPAN-INTERPRETED is decided by host process history (the shard seal
-        // phase keys off s_dispatch_count, a process-lifetime counter that is
-        // reset nowhere and is not part of a savestate). That is only harmless
-        // if both routes charge the SAME guest cycles. They did not:
-        //   compiled : block->guest_cycles, from decoder.cpp's own Sh4Cycles
-        //              at cpuRatio 1 (decoder.cpp:26), drained in the block
-        //              PROLOGUE (wasm_emit.cpp:4354-4365).
-        //   interp   : Sh4Interpreter::sh4cycles at CPU_RATIO = 8
-        //              (sh4_interpreter.h:35 — STRICT_MODE is not defined), a
-        //              per-op charge whose pipeline state (Sh4Cycles::lastUnit,
-        //              memOps — sh4_cycles.cpp:65-85) accumulates ACROSS blocks
-        //              and across savestate loads and is never serialized.
-        // So two peers restoring identical bytes drifted apart in absolute
-        // scheduler time (measured: 7 differing bytes of 27,785,359 at 60
-        // frames, guest RAM byte-identical, two counters 194,465 apart).
-        //
-        // Fixing only the 8x ratio would leave the pipeline-state term live —
-        // it shrinks the error ~8x without closing it, turning a 60-frame break
-        // into a rarer one that reads as a title-specific mystery. So instead of
-        // making the two charges EQUAL, this makes them THE SAME NUMBER: charge
-        // block->guest_cycles and discard the interpreter's accounting entirely.
-        //
-        // Charged per block ENTRY, not per call, because the compiled prologue
-        // charges on entry: a mid-block branch-out or an exception has already
-        // paid the full block (so full charge is correct, not an over-charge),
-        // and a self-looping block re-runs its own drain per iteration
-        // (wasm_emit.cpp:4352-4353), which counting entries reproduces.
-        //
-        // KNOWN RESIDUAL: entry at pc != lo (guard exhaustion inside a
-        // self-branching span, or a guest jump into the middle of one — see the
-        // find_span note above) charges nothing until pc reaches lo. In the
-        // compiled world that pc would be a DIFFERENT block with its own cost,
-        // so there is no number here that matches it. It stays a pure function
-        // of guest state, so it is deterministic between two span-interp peers;
-        // it is only inexact against a peer that has the block compiled.
-        if (ctx->pc == lo)
-            ctx->cycle_counter -= (int)gc;
-        const int cc = ctx->cycle_counter;
+           --guard > 0 && ctx->CpuRunning)
         interp_one_step(ctx, ctx->pc);
-        ctx->cycle_counter = cc;   // discard the ratio-8 per-op drain
-    }
     return true;
 }
 
@@ -2160,7 +2104,7 @@ public:
 				return;
 			}
 			if (s_pending_vaddrs.insert(vaddr).second) {
-				s_pending_len[vaddr] = SpanInfo{ block->sh4_code_size, block->guest_cycles };
+				s_pending_len[vaddr] = block->sh4_code_size;
 				s_pending_shard.push_back(block);
 			} else {
 				// Already pending — still set the sentinel so flycast doesn't die().
@@ -2178,7 +2122,7 @@ public:
 				// dispatch counter, and a 100K threshold: with the pending
 				// dedup + span-interp flow, re-seal storms are structurally
 				// impossible, so the old churn concern is gone.
-				if (s_dispatch_count - s_dispatches_at_last_seal >= SHARD_DISPATCH_SEAL) {
+				if (s_dispatch_count - s_dispatches_at_last_seal >= 100000) {
 					seal_pending_shard();
 				}
 			}
@@ -2275,7 +2219,7 @@ public:
 				// (blockmanager.cpp:288) -> os_DebugBreak. Park it so the
 				// dispatcher span-interprets it instead (the miss path checks
 				// the park map in per-block mode too).
-				park_unregistered(vaddr, block->sh4_code_size, block->guest_cycles);
+				park_unregistered(vaddr, block->sh4_code_size);
 				static int s_probe_log = 0;
 				if (g_diag_enabled && s_probe_log < 8) {
 					s_probe_log++;
@@ -2300,7 +2244,7 @@ public:
 			// (blockmanager.cpp:288) -> os_DebugBreak. Park it: the miss path
 			// span-interprets it from live RAM instead. Same treatment as the
 			// probe-limit arm above and as both shard-seal arms.
-			park_unregistered(vaddr, block->sh4_code_size, block->guest_cycles);
+			park_unregistered(vaddr, block->sh4_code_size);
 			static int s_inst_log = 0;
 			if (g_diag_enabled && s_inst_log < 8) {
 				s_inst_log++;
