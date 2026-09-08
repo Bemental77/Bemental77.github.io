@@ -295,9 +295,28 @@ try {
     await sleep(1200);
   }
   const conn = await Promise.all(pages.map((pg) => until(pg, () => (window.__dcNet().state === 'connected') || null, PAIR_MS, 500)));
+  // ⚠ NAME THE KNOWN CAUSE RATHER THAN PRINTING A STATE LIST. Measured
+  // 2026-09-08 with --players 4: P2 connects, P3 dies with
+  // "signalling failed: unavailable-id", P4 never gets a chance. The reason is
+  // one line — lib/netplay.js:358 derives the broker id as
+  // `base + (opts.host ? '-h' : '-g')`, so EVERY joiner registers under the
+  // same '-g' id and the second one collides. A room therefore holds exactly
+  // ONE joiner today, independently of MAPLE_PORTS and independently of the
+  // bridge plugging only ports 0 and 1. Without this note the cell reads like a
+  // flaky broker and somebody re-runs it.
+  const failDetail = await Promise.all(pages.map((pg) => pg.evaluate(() => {
+    const sess = (window.Netplay && window.Netplay.sessions) || [];
+    const s2 = sess[sess.length - 1];
+    return { state: window.__dcNet().state, err: (s2 && s2.lastError) || null };
+  })));
+  const idClash = failDetail.some((d) => /unavailable-id/i.test(String(d.err || '')));
   cell(conn.every(Boolean), 'everyone-is-in-the-room',
     `all ${PLAYERS} sides report connected`,
-    `connected: ${J(conn)} — states ${J(await Promise.all(pages.map((pg) => pg.evaluate(() => window.__dcNet().state))))}`);
+    `connected: ${J(conn)} — per-side ${J(failDetail)}` + (idClash
+      ? '. ROOT CAUSE: "unavailable-id" — lib/netplay.js:358 gives every joiner the SAME broker id ' +
+        '(`base + (host ? "-h" : "-g")`), so a room can hold exactly ONE joiner. Players 3 and 4 cannot ' +
+        'join at all, and that is a signalling limit, not a port limit and not this machine.'
+      : ''));
 
   // ---- 3. ports assigned, visible, and DISTINCT ----------------------------
   say('\n== 3. ports are assigned, shown, and distinct ==');
