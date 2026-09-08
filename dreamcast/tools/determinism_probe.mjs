@@ -169,6 +169,18 @@ const NPORTS    = parseInt(arg('--ports', '2'), 10);
 // --freezetime: pin Date.now inside BOTH workers to this fixed epoch-ms for the
 // measured window, so every instance sees the same host instant. 0 = off.
 const FREEZE    = parseInt(arg('--freezetime', '0'), 10);
+// --coldboot: NO savestate. Both instances are anchored with retro_reset and then
+// driven frame-gated from frame 0 through the boot sequence. This is the scenario
+// the product is actually in -- lockstep peers start at frame 0 with no state file
+// -- and it is the one a savestate rig is structurally blind to.
+const COLDBOOT  = has('--coldboot');
+// --frame0: THE SHIPPING CONFIGURATION. No savestate and no reset: the driver is
+// installed as early as the worker exposes its exports, the shipped pump is held
+// OFF before it ever runs a frame, and both instances are then driven frame-gated
+// from frame 0 through the same boot. Alignment is not assumed -- the anchor gate
+// reports guest cycles as well as the state hash, so "the two boots differ" can be
+// told apart from "the rig started them at different instants".
+const FRAME0    = has('--frame0');
 // --skew N: give instance B N EXTRA discarded frames of history before its
 // measured pass. THIS IS THE REALISTIC LOCKSTEP TEST. Two real peers never have
 // identical execution history — one sat in the menu longer, one joined late — and
@@ -283,6 +295,7 @@ function installDriverSource() {
 
     self.__det = {
       active: false,
+      holdPump: false,
       watchdogFires: 0,
       suspended: () => M.HEAPU8[flagPtr] !== 0,
       sleep: (ms) => new Promise(r => setTimeout(r, ms)),
@@ -326,12 +339,25 @@ function installDriverSource() {
         if (D.active && (d.cmd === 'input' || d.cmd === 'runFrame' ||
                          d.cmd === 'saveState' || d.cmd === 'loadState' ||
                          d.cmd === 'reset' || d.cmd === 'freerun')) return;
+        // --frame0: the page sends a freerun-on command once the disc is ready.
+        // If that lands, the shipped wall-paced pump runs frames we did not drive
+        // and the two instances are no longer at a common frame 0.
+        if (D.holdPump && (d.cmd === 'freerun' || d.cmd === 'runFrame')) return;
         return prev.call(self, e);
       };
       D.msgWrapped = true;
     }
     // Stop the shipped wall-paced pump. Routed through the ORIGINAL handler so
     // the shim's own setFreerun bookkeeping (stats timer, pace rebase) runs.
+    // COLD-BOOT ANCHOR. The savestate arms answer "two peers handed the same
+    // bytes"; they CANNOT see anything about the boot phase, because a savestate
+    // lands past it. That blindness hid a real regression once already. retro_reset
+    // puts the machine back to a deterministic power-on state without any state
+    // file, so two instances reset independently should be byte-identical BEFORE a
+    // single frame runs -- and that equality is checked, not assumed.
+    D.reset = function() {
+      try { D.prevOnMessage.call(self, { data: { cmd: 'reset' } }); } catch (_) {}
+    };
     D.stopPump = function() {
       try { D.prevOnMessage.call(self, { data: { cmd:'freerun', on:false } }); } catch (_) {}
     };
@@ -494,6 +520,35 @@ async function bootPage(browser, tag) {
     document.getElementById('btnStart').click();
   }, GAME);
 
+  if (FRAME0) {
+    let w = null;
+    for (let i = 0; i < 900 && !w; i++) {
+      w = page.workers().find((x) => /flycast_worker/.test(x.url()));
+      if (!w) await sleep(100);
+    }
+    if (!w) throw new Error(tag + ': flycast worker never appeared');
+    let inst = null;
+    for (let i = 0; i < 2400; i++) {
+      try { inst = await w.evaluate(installDriverSource()); } catch (e) { inst = null; }
+      if (inst && inst.ok) break;
+      await sleep(50);
+    }
+    if (!inst || !inst.ok) throw new Error(tag + ': early driver install failed: ' + (inst && inst.err));
+    await w.evaluate('self.__det.holdPump = true; self.__det.stopPump(); true');
+    await w.evaluate(`self.__detPadFor = ${padScriptSource()}; true`);
+    // save_state returns 0 until g_loaded, so a non-zero size IS "the disc is in".
+    let size = 0;
+    for (let i = 0; i < 2400 && !size; i++) {
+      try { size = await w.evaluate('(async()=>{ const b = await self.__det.saveBytes(); return b ? b.length : 0; })()'); }
+      catch (e) { size = 0; }
+      if (!size) await sleep(250);
+    }
+    if (!size) throw new Error(tag + ': disc never loaded (save_state stayed 0)');
+    const cyc = await w.evaluate('self.Module._flycast_guest_cycles()');
+    say(`${tag} FRAME0: pump HELD OFF before any driven frame; state=${size} B guest_cycles=${cyc}`);
+    return { tag, page, worker: w };
+  }
+
   let lastPhase = '';
   const booted = await until(page, () => (window.__dcProbe && window.__dcProbe().booted) || false, BOOT_MS, 1000, async () => {
     const p = await page.evaluate(() => { const d = window.__dcProbe(); return d.phase + ' ' + Math.round(100 * d.discBytes / (d.discTotal || 1)) + '%'; }).catch(() => '');
@@ -628,7 +683,7 @@ try {
   report.load = uptime;
   say('load: ' + uptime);
   say(`config: ${TWOBROW ? 'TWO BROWSER PROCESSES' : 'TWO TABS IN ONE BROWSER'} | game=${GAME} frames=${FRAMES} every=${EVERY} runs=${RUNS} arms=${ARMS} input=${INPUT} warmup=${WARMUP} skew=${SKEW} ports=${NPORTS} freezetime=${FREEZE}`);
-  report.warmup = WARMUP; report.query = QUERY; report.diffatFrames = DIFFAT; report.skew = SKEW; report.ports = NPORTS; report.freezeTime = FREEZE;
+  report.warmup = WARMUP; report.query = QUERY; report.diffatFrames = DIFFAT; report.skew = SKEW; report.ports = NPORTS; report.freezeTime = FREEZE; report.coldbootArm = COLDBOOT; report.frame0 = FRAME0;
   if (QUERY) say(`query: ?${QUERY}`);
 
   const b1 = await puppeteer.launch({ ...LAUNCH, userDataDir: PROFILE });
@@ -683,14 +738,31 @@ try {
   }
 
   // ---- the measurement ----------------------------------------------------
-  if (!fs.existsSync(STATEPATH)) {
-    say(`ABORT: no savestate at ${STATEPATH}. Run with --makestate first.`);
-    await finish(2);
+  let stateBuf = null;
+  if (FRAME0) {
+    say('FRAME0 arm: no savestate, no reset — two instances driven from frame 0 through the SAME BOOT. ' +
+        'This is the configuration the product actually ships.');
+  } else if (COLDBOOT) {
+    say('COLD BOOT arm: no savestate. Both instances are anchored with retro_reset and driven ' +
+        'frame-gated from frame 0 through the BOOT SEQUENCE — the phase a savestate rig cannot see.');
+    report.coldboot = true;
+  } else {
+    if (!fs.existsSync(STATEPATH)) {
+      say(`ABORT: no savestate at ${STATEPATH}. Run with --makestate first.`);
+      await finish(2);
+    }
+    stateBuf = fs.readFileSync(STATEPATH);
+    const stateHash = crypto.createHash('sha256').update(stateBuf).digest('hex').slice(0, 16);
+    say(`savestate ${stateBuf.length} B sha256=${stateHash} — THE SAME BYTES go into both instances`);
+    report.stateBytes = stateBuf.length; report.stateSha = stateHash;
   }
-  const stateBuf = fs.readFileSync(STATEPATH);
-  const stateHash = crypto.createHash('sha256').update(stateBuf).digest('hex').slice(0, 16);
-  say(`savestate ${stateBuf.length} B sha256=${stateHash} — THE SAME BYTES go into both instances`);
-  report.stateBytes = stateBuf.length; report.stateSha = stateHash;
+  // One preparation seam for both arms, so nothing else in the rig changes shape.
+  const prepare = async (inst) => {
+    if (FRAME0) return true;   // already at a common frame 0; resetting would undo it
+    if (!COLDBOOT) return pushState(inst, stateBuf);
+    const ok = await inst.worker.evaluate('(async()=>{ self.__det.reset(); return await self.__det.waitClean(); })()');
+    return !!ok;
+  };
 
   const A = await bootPage(b1, 'A');
   let B;
@@ -711,11 +783,11 @@ try {
   if (DIFFAT > 0) {
     const pass = async (inst) => {
       for (let w = 0; w < WARMUP; w++) {
-        if (!(await pushState(inst, stateBuf))) throw new Error('warmup load_state FAILED');
+        if (!(await prepare(inst))) throw new Error('warmup prepare FAILED');
         const rw = await inst.worker.evaluate(`self.__det.run(${JSON.stringify({ frames: DIFFAT, every: DIFFAT + 1, chunk: CHUNK, input: INPUT, freezeTime: FREEZE })})`);
         if (!rw.ok) throw new Error('warmup: ' + rw.err);
       }
-      if (!(await pushState(inst, stateBuf))) throw new Error('load_state FAILED');
+      if (!(await prepare(inst))) throw new Error('prepare FAILED');
       const r = await inst.worker.evaluate(`self.__det.run(${JSON.stringify({ frames: DIFFAT, every: DIFFAT + 1, chunk: CHUNK, input: INPUT, freezeTime: FREEZE })})`);
       if (!r.ok) throw new Error(r.err);
       return { r, bytes: await pullState(inst) };
@@ -762,21 +834,45 @@ try {
       // Divergent HISTORY, not divergent state: run from the same bytes, then
       // throw the result away. What survives is exactly the host-side residue a
       // savestate does not carry.
-      if (!(await pushState(inst, stateBuf))) return { ok: false, err: 'skew load_state FAILED' };
+      if (!(await prepare(inst))) return { ok: false, err: 'skew prepare FAILED' };
       const rs = await inst.worker.evaluate(`self.__det.run(${JSON.stringify({ frames: skewFrames, every: skewFrames + 1, chunk: CHUNK, input: INPUT, freezeTime: FREEZE })})`);
       if (!rs.ok) return { ok: false, err: 'skew pass: ' + rs.err };
     }
     for (let w = 0; w < WARMUP; w++) {
-      if (!(await pushState(inst, stateBuf))) return { ok: false, err: 'warmup load_state FAILED' };
+      if (!(await prepare(inst))) return { ok: false, err: 'warmup prepare FAILED' };
       const rw = await inst.worker.evaluate(`self.__det.run(${JSON.stringify({ frames: FRAMES, every: FRAMES + 1, chunk: CHUNK, input: INPUT, freezeTime: FREEZE })})`);
       if (!rw.ok) return { ok: false, err: 'warmup pass ' + w + ': ' + rw.err };
     }
-    const ok = await pushState(inst, stateBuf);
-    if (!ok) return { ok: false, err: 'load_state FAILED — a failed restore SILENTLY leaves the previous state running (CLAUDE.md gate #10)' };
+    const ok = await prepare(inst);
+    if (!ok) return { ok: false, err: 'prepare FAILED — a failed restore SILENTLY leaves the previous state running (CLAUDE.md gate #10)' };
     const r = await inst.worker.evaluate(`self.__det.run(${JSON.stringify({ frames: FRAMES, every: EVERY, chunk: CHUNK, input: INPUT, freezeTime: FREEZE })})`);
     r.label = label;
     return r;
   };
+
+  // ANCHOR GATE (cold boot only). Two machines reset INDEPENDENTLY must be
+  // byte-identical BEFORE a single frame runs. If they are not, lockstep from
+  // frame 0 is impossible no matter what the per-frame numbers say, so this is
+  // checked first and reported loudly rather than being assumed.
+  if (COLDBOOT || FRAME0) {
+    if (!(await prepare(A)) || !(await prepare(B))) {
+      say('ABORT: retro_reset anchor failed — cannot establish a common frame 0.');
+      await finish(3);
+    }
+    const ha = await A.worker.evaluate(`self.__det.hashState(${CHUNK})`);
+    const hb = await B.worker.evaluate(`self.__det.hashState(${CHUNK})`);
+    if (!ha || !hb) { say('ABORT: could not serialize after reset'); await finish(3); }
+    const same = ha.total === hb.total && ha.size === hb.size;
+    let bad = [];
+    for (let c = 0; c < Math.min(ha.chunks.length, hb.chunks.length); c++)
+      if (ha.chunks[c] !== hb.chunks[c]) bad.push('0x' + (c * CHUNK).toString(16));
+    say(`ANCHOR after retro_reset: sizes ${ha.size}/${hb.size} identical=${same}` +
+        (same ? '' : ` — ${bad.length} differing chunks @ ${bad.slice(0, 12).join(',')}`));
+    report.anchor = { identical: same, sizeA: ha.size, sizeB: hb.size,
+                      differingChunks: bad.length, first: bad.slice(0, 24) };
+    if (!same) say('⚠ TWO INDEPENDENTLY RESET MACHINES ARE ALREADY DIFFERENT. ' +
+                   'Frame-0 lockstep cannot work without shipping a common state.');
+  }
 
   for (let run = 1; run <= RUNS; run++) {
     const entry = { run, arms: {} };
