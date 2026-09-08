@@ -192,13 +192,38 @@
     .sysBtn { height: 26px; padding: 0 14px; border-radius: 13px; background: linear-gradient(180deg, #555 0%, #333 100%); border: 1px solid #222; color: #ccc; font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
     .sysBtn.held { filter: brightness(0.6); }
     .menuBtn { width: 34px; height: 34px; border-radius: 17px; background: linear-gradient(180deg, #777 0%, #444 100%); border: 2px solid #222; color: #fff; font-size: 18px; font-weight: 700; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
-    #mobileMenu { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 2000; align-items: center; justify-content: center; }
+    /* SCROLLABLE, and centred with `margin: auto` rather than `align-items:
+       center`. The box holds eleven buttons (~560 px); a phone in LANDSCAPE is
+       ~390 px tall, and a centred flex item that overflows its container has its
+       TOP edge clipped and cannot be scrolled back to. Measured before this
+       change: one tap of the menu button in landscape put the follow-up click on
+       #mNet, i.e. the box already extended past the tap point. */
+    #mobileMenu { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 2000;
+      overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 10px; box-sizing: border-box; }
     #mobileMenu.open { display: flex; }
-    #mobileMenuBox { background: #222; color: #eee; border-radius: 10px; padding: 20px; min-width: 240px; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.7); }
+    #mobileMenuBox { margin: auto; background: #222; color: #eee; border-radius: 10px; padding: 20px; min-width: 240px; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.7); }
     #mobileMenuBox h6 { margin: 0 0 14px; font-size: 12px; text-transform: uppercase; letter-spacing: 2px; color: #888; }
     #mobileMenuBox button { display: block; width: 100%; margin-bottom: 8px; padding: 10px; border: 1px solid #444; background: #2c2c2c; color: #eee; border-radius: 6px; font-size: 14px; cursor: pointer; }
     #mobileMenuBox button:last-child { margin-bottom: 0; }
-    #rotateHint { display: none; position: fixed; inset: 0; background: #111; color: #eee; align-items: center; justify-content: center; font-size: 18px; text-align: center; z-index: 3000; padding: 40px; }
+    /* [portrait-gate FIX 2026-09-08] A HINT MUST NOT BE A GATE.
+       This was `position: fixed; inset: 0; background: #111; z-index: 3000` — an
+       OPAQUE FULL-SCREEN PANEL shown whenever `booted && !landscape`, i.e. the
+       whole phone shell in portrait. MEASURED at 390x844 with the emulator
+       running: document.elementFromPoint at the centre of #mobileMenuBtn
+       returned #rotateHint, and the hint itself measured rect=0,0,390x844 — so
+       the menu button, START, the d-pad, the face buttons and Play Online were
+       all unreachable in portrait. That is the user-reported "hamburger flashes
+       and disappears in portrait, Play Online only in landscape".
+       It is now a small pill that CANNOT intercept a touch (pointer-events:
+       none) and retires itself after a few seconds, so portrait is fully usable
+       and the advice is still given. Do not restore `inset: 0` here. */
+    #rotateHint { display: none; position: fixed; left: 50%; transform: translateX(-50%);
+      top: calc(env(safe-area-inset-top, 0px) + 8px);
+      max-width: min(84vw, 320px); box-sizing: border-box;
+      align-items: center; justify-content: center; text-align: center;
+      background: rgba(17,17,17,0.86); color: #eee; border: 1px solid #3a3a3a;
+      border-radius: 999px; font-size: 13px; line-height: 1.3; padding: 7px 16px;
+      z-index: 3000; pointer-events: none; }
     #mobileSplash { display: none; position: absolute; inset: 0; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 24px; z-index: 2000; color: #eee; background: linear-gradient(180deg, #1a1a1a 0%, #0a0a0a 100%); text-align: center; }
     #mobileSplash h3 { margin: 0 0 4px; font-size: 22px; }
     #mobileSplash label { font-size: 14px; opacity: 0.8; }
@@ -575,7 +600,7 @@
     </div>
   </div>
 </div>
-<div id="rotateHint">Rotate your device to landscape to play.</div>
+<div id="rotateHint">Landscape gives a bigger picture.</div>
 <!-- ---- Online play lobby ------------------------------------------------------
      Two doors and nothing else. HOST keeps the emulator it already has running
      and hands out a 5-character code; JOIN takes a code and gets a picture. The
@@ -3490,6 +3515,13 @@
     const el = document.getElementById('romSelect');
     return (el && el.value) || 'pso2';
   };
+  // Export filename, on the same per-game rule as the storage key above. Until
+  // 2026-09-08 Export wrote the literal 'dcx-pso2-state.bin' for ALL FIVE discs,
+  // so a Gauntlet Legends state arrived in the visitor's Downloads folder named
+  // as a PSO state — and a folder of them was indistinguishable. PSO keeps the
+  // exact name it has always exported under, so nothing a player already has on
+  // disk is renamed or orphaned.
+  const stateFileName = (g = currentGameKey()) => 'dcx-' + g + '-state.bin';
   let STATE_KEY = stateKeyFor(currentGameKey());
   function idbOpen() {
     return new Promise((res, rej) => {
@@ -3824,12 +3856,13 @@
       pageLog('[page] nothing to export — click Save State first');
       return;
     }
+    const name = stateFileName();
     const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
     const a = document.createElement('a');
-    a.href = url; a.download = 'dcx-pso2-state.bin';
+    a.href = url; a.download = name;
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
-    pageLog('[page] exported state ' + bytes.byteLength + ' B -> dcx-pso2-state.bin');
+    pageLog('[page] exported state ' + bytes.byteLength + ' B -> ' + name);
   });
   // Import: pick a state file; it becomes the pending state (and persists),
   // then the existing Load State button applies it.
@@ -4988,6 +5021,31 @@
   // touch + mouse triple binding (they need press/release, not a tap), so this
   // covers the ones that were single-bound. The 400 ms guard swallows the
   // synthetic click that follows a pointerdown.
+  // ⚠ A TAP HANDLED ON pointerdown IS STILL FOLLOWED BY A SYNTHETIC click, AND
+  // THAT CLICK IS HIT-TESTED AGAINST THE TREE AS IT IS *THEN* — not against the
+  // element that was tapped. So any tapBind handler that opens something over
+  // the finger hands the very next click to whatever it just opened.
+  // MEASURED 2026-09-08, one real touch tap of #mobileMenuBtn, Chrome, iPhone
+  // viewport, capture-phase trace of the whole sequence:
+  //   390x844  pointerdown -> #mobileMenuBtn menuOpen=false
+  //            touchstart  -> #mobileMenuBtn menuOpen=true
+  //            click       -> #mobileMenu    menuOpen=true    (the BACKDROP)
+  //            final: menuOpen=false                          -> menu FLASHES AND VANISHES
+  //   844x390  click       -> #mNet          menuOpen=true
+  //            final: menuOpen=false netOverlay=flex          -> PLAY ONLINE OPENS INSTEAD
+  // That is the user report verbatim: "hamburger flashes and disappears on
+  // portrait, and only shows the play online options when landscape". The two
+  // outcomes differ only because #mobileMenuBox is centred, so the tap point
+  // lands on the backdrop in portrait and inside the box in landscape.
+  // The fix belongs here rather than in any one handler: every tapBind caller
+  // (the ≡ menu, the splash's Start and Diagnostics, the show-controls hint)
+  // reveals or hides something under the finger.
+  function swallowGhostClick() {
+    const kill = (ev) => { ev.stopPropagation(); ev.preventDefault(); done(); };
+    const done = () => { window.removeEventListener('click', kill, true); clearTimeout(t); };
+    const t = setTimeout(done, 500);   // expire if no click follows (mouse, cancelled tap)
+    window.addEventListener('click', kill, true);
+  }
   function tapBind(el, fn) {
     if (!el) return;
     let last = 0;
@@ -4996,6 +5054,7 @@
       if (now - last < 400) return;
       last = now;
       if (e && e.preventDefault) e.preventDefault();
+      if (e && e.type !== 'click') swallowGhostClick();
       fn(e);
     };
     if (window.PointerEvent) el.addEventListener('pointerdown', h);
@@ -5039,13 +5098,28 @@
   //   3. make the hint DISMISSIBLE — a mis-detection must never be able to lock a user
   //      out of a running emulator. This is the load-bearing one: it converts a hard
   //      failure into a tap.
-  let _rotDismissed = false;
+  // [portrait-gate FIX 2026-09-08] The hint is now a NON-BLOCKING pill
+  // (pointer-events: none — see its CSS) that retires itself after
+  // ROTATE_HINT_MS. Tap-to-dismiss is gone with the full-screen panel: an
+  // overlay that cannot be touched cannot be tapped, and it no longer needs to
+  // be, because it never covers anything. Rotating back to landscape re-arms it
+  // for the next portrait, exactly as the dismiss flag used to.
+  const ROTATE_HINT_MS = 5000;
+  let _rotDismissed = false, _rotTimer = 0;
   function checkOrientation() {
     if (!isMobile) return;
     const landscape = window.innerWidth > window.innerHeight;
     if (landscape) _rotDismissed = false;   // re-arm once genuinely landscape again
     const show = booted && !landscape && !_rotDismissed;
     $('rotateHint').style.display = show ? 'flex' : 'none';
+    if (show && !_rotTimer) {
+      _rotTimer = setTimeout(function () {
+        _rotTimer = 0; _rotDismissed = true; checkOrientation();
+        pageLog('[mobile] rotate hint retired after ' + ROTATE_HINT_MS + ' ms');
+      }, ROTATE_HINT_MS);
+    } else if (!show && _rotTimer) {
+      clearTimeout(_rotTimer); _rotTimer = 0;
+    }
   }
   // iOS reports pre-rotation dimensions on the first tick, so sample again as it settles.
   function checkOrientationSoon() {
@@ -5144,14 +5218,10 @@
     document.addEventListener('visibilitychange', function () {
       if (!document.hidden) checkOrientationSoon();   // returning from lock/app-switch
     });
-    // The escape hatch. A stuck full-screen #111 overlay reads as "the emulator is black
-    // and frozen" even though it is running underneath, which is exactly the report we got.
-    // One tap always clears it.
-    $('rotateHint').addEventListener('click', function () {
-      _rotDismissed = true;
-      $('rotateHint').style.display = 'none';
-      pageLog('[mobile] rotate hint dismissed by tap (' + window.innerWidth + 'x' + window.innerHeight + ')');
-    });
+    // The old escape hatch (tap the full-screen #111 panel to clear it) is gone
+    // with the panel itself: #rotateHint is `pointer-events: none` now, so it
+    // cannot receive a tap AND cannot block one. checkOrientation retires it on
+    // a timer instead — see ROTATE_HINT_MS above.
     setStatus('Pick a game and tap Start.');
   }
 })();
