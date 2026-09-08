@@ -3,6 +3,12 @@
 <head>
   <script src="/lib/capability.js"></script>
   <script src="/lib/xboxinput.js"></script>
+  <!-- ONLINE CO-OP. Both are inert unless Netplay.supported(); netplay-host.js
+       additionally does nothing at all without ?np=<code> in the URL, which is
+       what snes_multiplayer.html hands over. The lobby is NOT here — see the
+       ONLINE CO-OP block near the end of this page. -->
+  <script src="/lib/netplay.js"></script>
+  <script src="/lib/netplay-host.js"></script>
   <meta charset="UTF-8" />
   <title>SNES Wasm</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -157,6 +163,9 @@
     <button id="btnImport" disabled>⬇ Import State</button>
     <button id="btnMute" disabled>🔊 Mute</button>
     <button id="btnFull" disabled>⛶ Fullscreen</button>
+    <!-- hidden until Netplay.supported() proves the browser can do it: a control
+         that does nothing when pressed reads as "the site is broken". -->
+    <button id="btnNet" type="button" hidden>👥 Play Online</button>
   </div>
   <div id="canvasWrap"><canvas id="canvas" width="256" height="224"></canvas></div>
   <div id="statusBar"><span id="status">Idle.</span><span id="fps"></span></div>
@@ -170,6 +179,7 @@
     <label for="mobileRomSelect">Choose a game</label>
     <select id="mobileRomSelect"></select>
     <button id="mobileSplashStart" type="button">Start</button>
+    <button id="mobileSplashNet" type="button" hidden style="min-width:0;padding:8px 14px;font-size:13px;background:#1d1d1d;border-color:#333;color:#aaa">👥 Play Online</button>
     <p class="rotateTip">Rotate to landscape for the best view.</p>
   </div>
   <div id="mobileScreen"></div>
@@ -322,13 +332,54 @@
   var frameCount = 0, presented = 0, lastFpsAt = 0, guestFrames = 0;
   window.__snesFrames = 0;     // read by tools/legacy_emu_page_test.mjs
 
+  // ── ONLINE CO-OP: THE REMOTE PLAYER SHARES CONTROLLER 1 ───────────────────
+  // ⚠ AND IT IS A SHARE, NOT A SECOND PAD. This build of snes9x_2005 exposes one
+  // controller and one only. Its own shim says so:
+  //
+  //     snes/snesWasm/source/exports.c:19      int joyPadInput = 0;
+  //     snes/snesWasm/source/exports.c:32-35   void setJoypadInput(int32_t input)
+  //                                            { joyPadInput = input; }
+  //     snes/snesWasm/source/exports.c:37-40   uint32_t S9xReadJoypad(int32_t port){
+  //                                              if(port == 0) return joyPadInput; //1Pのみ対応
+  //                                              return 0; }
+  //
+  // The comment is the author's and translates as "1P only supported", and the
+  // wasm agrees: the module's whole export list holds exactly one joypad symbol,
+  // taking one i32 and storing it to one address. Snes9x underneath is
+  // five-player capable (IPPU.Joypads[5]; ppu.c:1468 reads Joypads[1] for the
+  // $4017 serial port; ppu.c:2060-2062 already polls all five) — every port above
+  // 0 simply hits that `return 0`. Reaching it needs a few lines in exports.c and
+  // a REBUILD of snes9x_2005.wasm.
+  //
+  // So the remote player's buttons are OR'd into the SAME mask as the local
+  // player's. That is a real, useful thing — taking turns, or a second pair of
+  // hands on a hard section — and snes_multiplayer.html says exactly that in its
+  // lobby rather than promising a Player 2 this core does not have.
+  function netSharedMask(local) {
+    var host = window.NetplayHost;
+    if (!host) return local;
+    var rm = host.remoteMask();
+    return (rm === null) ? local : (local | (rm & 0xffff));
+  }
+
   function runFrame() {
-    Module._setJoypadInput(padMask());
+    var p1 = padMask();
+    var m = netSharedMask(p1);
+    Module._setJoypadInput(m);
+    // The literal mask the core was handed, kept so the netplay test can assert
+    // on THAT rather than on a session flag or a UI state. p2 is the remote
+    // player's contribution on its own; on this console it lands in p1's slot,
+    // which is the whole point of reporting both.
+    if (window.NetplayHost) NetplayHost.report(m, m & ~p1);
     Module._mainLoop();
     frameCount++; guestFrames++; window.__snesFrames++;
   }
 
   function draw() {
+    // No-ops unless netplay fell back to a mirror canvas (it does not here — the
+    // canvas is main-thread and captures directly — but the fallback must still
+    // be fed if it ever wins).
+    if (window.NetplayHost) NetplayHost.pumpMirror();
     var p = Module._getScreenBuffer();
     // ALLOW_MEMORY_GROWTH=1 (build.sh) means HEAPU8.buffer can be replaced on a
     // grow, which detaches any view we cached — so re-view it every frame.
@@ -747,6 +798,80 @@
     wireButton('mobileStart', 'start'); wireButton('mobileSelect', 'select');
     wireDpad();
   }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ONLINE CO-OP — THE HOST HALF, AND NOTHING ELSE.
+  //
+  // THE MODEL: ONE INSTANCE RUNS THE GAME. This page's emulator is the only
+  // emulator. It streams its picture and its sound over WebRTC and the remote
+  // player sends controller state back, which is OR'd into controller 1 above —
+  // see the note there for why it cannot be a second pad on this core.
+  //
+  // THE LOBBY IS NOT HERE. It is snes_multiplayer.html, because a GUEST needs no
+  // core and no ROM, and pairing on this page would mean both players load an
+  // emulator so that one of them can watch a video. The button below is a link
+  // to that page, not a lobby.
+  // ═══════════════════════════════════════════════════════════════════════════
+  (function wireNetplay() {
+    if (!window.NetplayHost || !NetplayHost.supported()) return;
+    var go = function () {
+      var sel = isMobile ? $('mobileRomSelect') : $('romSelect');
+      var pick = ROMS[+(sel && sel.value) || 0] || ROMS[0];
+      location.href = NetplayHost.lobbyUrl('/snes_multiplayer.html', pick.label);
+    };
+    ['btnNet', 'mobileSplashNet'].forEach(function (id) {
+      var b = $(id); if (!b) return;
+      b.hidden = false;
+      b.addEventListener('click', go);
+    });
+    NetplayHost.arm({
+      seam: '__snesNet',
+      players: 'shared',
+      log: function (m) { if (window.console) console.log(m); },
+      canvas: function () { return $('canvas'); },
+      // "Is there a game to stream?" answered by FRAMES, not by a start flag: a
+      // start flag is set the instant Start is pressed, long before the core
+      // exists, and capturing then would publish a black canvas.
+      live: function () { return window.__snesFrames > 0; },
+      coreUp: function () { return !!(window.Module && Module._setJoypadInput && wasmReady); },
+      // The game is named by its LABEL, never by its index into ROMS. CLAUDE.md
+      // records an index going stale exactly this way.
+      selectGame: function (label) {
+        for (var i = 0; i < ROMS.length; i++) {
+          if (ROMS[i].label !== label) continue;
+          ['romSelect', 'mobileRomSelect'].forEach(function (id) {
+            var sel = $(id); if (!sel) return;
+            sel.value = String(i);
+            sel.dispatchEvent(new Event('change'));
+          });
+          return label;
+        }
+        return null;
+      },
+      // ⚠ NEVER override a Start the capability layer is holding down: that
+      // button being disabled means the page has decided this device cannot run
+      // the emulator, and clicking past it is the exact bug the gate exists to
+      // stop. The core is not loaded yet when this runs, so it polls for
+      // wasmReady rather than assuming a duration, and gives up rather than
+      // spinning forever if the gate never releases.
+      pressStart: function () {
+        var tries = 0;
+        var attempt = function () {
+          if (!wasmReady) return false;
+          var b = isMobile ? $('mobileSplashStart') : $('btnStart');
+          if (!b || b.disabled || b.getAttribute('aria-disabled') === 'true') return false;
+          if (isMobile) $('mobileSplash').style.display = 'none';
+          startFromList();
+          return true;
+        };
+        if (attempt()) return;
+        var iv = setInterval(function () {
+          if (attempt() || ++tries > 480) clearInterval(iv);   // 480 x 250 ms = 2 min
+        }, 250);
+      },
+      onStatus: function (e) { if (e.state === 'connected') setStatus('A remote player joined — you share controller 1.'); },
+    });
+  })();
 
   // ── load the core ─────────────────────────────────────────────────────────
   initCanvas();

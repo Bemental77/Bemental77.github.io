@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>N64 — Play Online</title>
+<!--
+  n64_multiplayer.html — THE PARTY, AND THE REMOTE PLAYER'S WHOLE MACHINE.
+
+  ONE browser runs an emulator: the host boots the cartridge, captures its canvas
+  and audio and streams both over WebRTC; the remote player sends controller
+  state back. The guest needs no core, no ROM and no WebAssembly — a <video> and
+  a pad. n64.html's ROMs run to tens of megabytes each and the core is a full
+  mupen64plus in WebAssembly; a phone that only wants to join pays none of it.
+
+  ⚠ THE HONEST STATUS OF PLAYER 2 ON THIS CONSOLE, because it is neither a clean
+  yes nor a clean no.
+
+  THE CORE IS FOUR-CONTROLLER AND ALWAYS WAS. `struct NeilButtons neilbuttons[4]`
+  (n64/N64Wasm/code/mymain.cpp:98), `inputGetKeys_default(int Control, ...)`
+  indexes EVERY field by port (…/plugin/emulate_game_controller_via_libretro.c:
+  324-325, :355-361, :665-673), and all four ports report as plugged in —
+  `int pad_present[4] = { 1, 1, 1, 1 }` (…/src/libretro/libretronew.c:179). The
+  SDL joystick loop already fills `neilbuttons[i]` for four pads, with per-player
+  Y-invert for players 2-4 (mymain.cpp:1010-1082).
+
+  THE JAVASCRIPT BRIDGE IS NOT. `neil_send_mobile_controls` — the only exported
+  function that writes a button anywhere — writes `neilbuttons[0]` and nothing
+  else: all 21 of its assignments are the literal index 0 (mymain.cpp:1868-1889),
+  and it takes no player argument. The module's full export list confirms there is
+  no second writer.
+
+  SO THE HOST DOES THE ONE THING THAT NEEDS NO REBUILD: it presents this remote
+  player to the page as a SECOND GAMEPAD. The core opens gamepads in the order
+  the browser reports them (mymain.cpp:158-198, packing into sdlJoysticks[0..3]),
+  so if the host has a real controller plugged in, the remote player lands on
+  sdlJoysticks[1] and IS PLAYER 2 for real. If the host is on keyboard or touch
+  only, the remote player is the first pad and therefore SHARES player 1 with
+  them. The host page says which of the two happened and the test asserts it
+  rather than assuming — see tools/mp_page_test.mjs.
+
+  WHAT EACH SIDE DOES
+    HOST  picks a game, is given a code, and is handed to
+          /n64/?np=<code>&game=<label>, which selects the ROM, presses its own
+          Start, and hosts under THAT EXACT CODE.
+    GUEST stays here. lib/netplay.js's guest retries 'peer-unavailable' rather
+          than failing, so joining before the host has loaded is the normal case.
+
+  NO coi-serviceworker.js ON PURPOSE — n64/index.html itself deliberately loads
+  none (N64Wasm is single-threaded and never touches SharedArrayBuffer), and
+  tools/n64_page_test.mjs asserts that as a standing invariant.
+-->
+<script src="/lib/netplay.js"></script>
+<script src="/lib/netplay-ui.js"></script>
+<script src="/lib/netplay-guest.js"></script>
+<style>
+  /* Only this console's own controls — the shell's CSS is in lib/netplay-guest.js.
+     An N64 pad is A and B on the left of a C-button diamond, with Z and the
+     shoulders above. */
+  #face { width: 186px; height: 176px; }
+  #tA { left: 0;   top: 92px; width: 72px; height: 72px; font-size: 20px;
+        border-color: rgba(120,180,255,.55); background: rgba(80,130,220,.24); }
+  #tB { left: 34px; top: 24px; width: 56px; height: 56px;
+        border-color: rgba(120,230,150,.5); background: rgba(80,190,110,.2); }
+  #tCUp    { right: 44px; top: 0;    width: 48px; height: 48px; font-size: 13px; }
+  #tCLeft  { right: 88px; top: 46px; width: 48px; height: 48px; font-size: 13px; }
+  #tCRight { right: 0;    top: 46px; width: 48px; height: 48px; font-size: 13px; }
+  #tCDown  { right: 44px; top: 92px; width: 48px; height: 48px; font-size: 13px; }
+  #tL { position: absolute; left: max(14px, env(safe-area-inset-left)); bottom: 178px; width: 74px; height: 44px; }
+  #tZ { position: absolute; left: max(14px, env(safe-area-inset-left)); bottom: 226px; width: 74px; height: 44px; }
+  #tR { position: absolute; right: max(14px, env(safe-area-inset-right)); bottom: 178px; width: 74px; height: 44px; }
+  #tStart { position: absolute; left: 50%; margin-left: -46px; bottom: max(18px, env(safe-area-inset-bottom));
+            width: 92px; height: 40px; }
+</style>
+</head>
+<body>
+<script>
+'use strict';
+(function () {
+  // ===========================================================================
+  // THE REMOTE PLAYER'S CONTROLLER
+  //
+  // ⚠ WIRE FORMAT SHARED WITH n64/index.html — do not drift. lib/netplay.js's
+  // sendPad carries ONE int32:
+  //     bits  0..13  buttons, in the EXACT order neil_send_mobile_controls reads
+  //                  its 14-character control string (mymain.cpp:1868-1881):
+  //                  0 UP  1 DOWN  2 LEFT  3 RIGHT  4 A  5 B  6 START  7 Z
+  //                  8 L   9 R    10 C-UP 11 C-DOWN 12 C-LEFT 13 C-RIGHT
+  //     bits 16..23  analog stick X, signed byte  (+ = right)
+  //     bits 24..31  analog stick Y, signed byte  (+ = UP, matching the page's
+  //                  own stickVec convention, which the core then negates)
+  //
+  // ⚠ THE ANALOG AXES ARE NOT DECORATION. Almost nothing on this console walks
+  // on the d-pad — Mario, Banjo, Zelda and every kart are on the stick — so a
+  // digital-only remote player would look connected and be unable to take a
+  // step. 8 bits per axis is finer than the 0.3 deadzone either side applies.
+  // ===========================================================================
+  const N = { up: 0, down: 1, left: 2, right: 3, a: 4, b: 5, start: 6, z: 7,
+              l: 8, r: 9, cup: 10, cdown: 11, cleft: 12, cright: 13 };
+  // Keyboard, identical to n64/index.html's own #keyLegend line so muscle memory
+  // carries between the two pages: stick W/A/S/D, d-pad arrows, A m, B n,
+  // Start Enter, C i/j/k/l, Z z, L q, R e.
+  const KEYMAP = {
+    up: ['arrowup'], down: ['arrowdown'], left: ['arrowleft'], right: ['arrowright'],
+    a: ['m'], b: ['n'], start: ['enter'], z: ['z'], l: ['q'], r: ['e'],
+    cup: ['i'], cdown: ['k'], cleft: ['j'], cright: ['l'],
+  };
+  const ANALOG_KEYS = ['w', 'a', 's', 'd'];
+  const MAPPED = new Set(Object.values(KEYMAP).flat().concat(ANALOG_KEYS));
+  // Standard-mapping gamepad index -> N64 button.
+  const GP = ['a', 'b', 'b', 'a', 'l', 'r', 'z', 'z', null, 'start',
+              null, null, 'up', 'down', 'left', 'right'];
+
+  const held = new Set();
+  const touched = new Set();
+  const stick = { x: 0, y: 0 };
+  const norm = (e) => String(e.key || '').toLowerCase();
+
+  function packMask() {
+    let m = 0;
+    for (const name of Object.keys(KEYMAP)) {
+      if (KEYMAP[name].some((k) => held.has(k))) m |= (1 << N[name]);
+    }
+    touched.forEach((name) => { m |= (1 << N[name]); });
+
+    // Analog, in priority order: the on-screen disc, then a real gamepad, then
+    // W/A/S/D. Whichever is actually being used wins; they are never summed,
+    // because two sources at full deflection would still be one stick.
+    let ax = stick.x, ay = -stick.y;      // disc y is screen-down; the stick is up-positive
+    const pads = (navigator.getGamepads && navigator.getGamepads()) || [];
+    for (let p = 0; p < pads.length; p++) {
+      const gp = pads[p]; if (!gp) continue;
+      const btns = gp.buttons || [];
+      for (let i = 0; i < btns.length && i < GP.length; i++) {
+        if (btns[i] && btns[i].pressed && GP[i]) m |= (1 << N[GP[i]]);
+      }
+      const a = gp.axes || [], dz = 0.15;
+      if (!ax && !ay && a.length >= 2) {
+        if (Math.abs(a[0]) > dz) ax = a[0];
+        if (Math.abs(a[1]) > dz) ay = -a[1];
+      }
+      // The C-buttons are a real N64 control (camera in most games) and have
+      // ids of their own, so the right stick drives them directly.
+      if (a.length >= 4) {
+        if (a[2] < -0.4) m |= (1 << N.cleft);
+        if (a[2] > 0.4) m |= (1 << N.cright);
+        if (a[3] < -0.4) m |= (1 << N.cup);
+        if (a[3] > 0.4) m |= (1 << N.cdown);
+      }
+      break;      // one remote player, one stick
+    }
+    if (!ax && !ay) {
+      ax = (held.has('d') ? 1 : 0) - (held.has('a') ? 1 : 0);
+      ay = (held.has('w') ? 1 : 0) - (held.has('s') ? 1 : 0);
+      // The N64 stick reports a CIRCLE, so a diagonal is not 1,1.
+      if (ax && ay) { ax *= 0.7071; ay *= 0.7071; }
+    }
+    const q = (v) => Math.max(-127, Math.min(127, Math.round(v * 127))) & 0xff;
+    m |= (q(ax) << 16);
+    m |= (q(ay) << 24);
+    return m | 0;
+  }
+
+  // ---- the ROM list is a COPY, and the test is what keeps it honest ---------
+  // lib/netplay.js refuses a pairing whose game names differ, so both sides must
+  // name the same key, and the key is the ROM's LABEL STRING — never its index.
+  // CLAUDE.md records an index going stale exactly this way.
+  // tools/mp_page_test.mjs compares this list against n64/index.html's ROMS[] and
+  // FAILS on drift.
+  const GAMES = [
+    'Super Mario 64', 'Mario Kart 64', 'Zelda: Ocarina of Time', 'Paper Mario',
+    'Star Fox 64', 'Pokémon Snap', 'Donkey Kong 64', 'Banjo-Tooie',
+    "Conker's Bad Fur Day", 'Diddy Kong Racing', 'Star Wars Episode I: Racer',
+    "Cruis'n USA", 'NFL Blitz 2001', 'The New Tetris', 'Gauntlet Legends',
+    'ClayFighter 63⅓', 'Flying Dragon', 'Wheel of Fortune', 'Mario Party',
+    'Dinosaur Planet', 'Super Mario 64: Star Road', 'Zelda: The Missing Link',
+    'Banjo-Kazooie: Jiggies of Time', 'Banjo-Dreamie',
+    'Banjo-Kazooie: Christmas Edition', 'Star Fox: Survival',
+    'Super Mario Odyssey 64 (hack)',
+  ].map((s) => ({ value: s, label: s }));
+
+  NetplayGuest.mount({
+    seam: '__n64mp',
+    title: 'N64 — Play Online',
+    lede: 'One player loads the game; everyone else watches and plays. '
+        + 'You need no ROM and no download — pick <b>Join</b> on the device you want to play on.',
+    // Stated in the lobby, before anyone commits to a session, because the answer
+    // genuinely depends on the host's hardware and a page that promised "Player 2"
+    // unconditionally would be wrong half the time.
+    sharedNote: 'The N64 core has <b>four controller ports</b>, but its JavaScript bridge can only '
+              + 'write port 1, so the host joins you in as an extra <b>gamepad</b>. If the host has a '
+              + 'real controller plugged in you become <b>Player 2</b>; if they are on keyboard or '
+              + 'touch you <b>share Player 1</b> with them. The host\'s page reports which one '
+              + 'happened rather than guessing.',
+    games: GAMES,
+    defaultGame: 'Mario Kart 64',
+    hostPage: '/n64/',
+    aspect: '4 / 3',
+    players: 'p2-if-host-has-a-pad',
+    connectedMsg: 'Connected — your controller is on the host\'s N64.',
+    mapped: MAPPED,
+    packMask,
+    onKeyDown: (e) => held.add(norm(e)),
+    // Release is NEVER filtered: a key that went down while the lobby's code
+    // field had focus must still come up, or it stays held on the host's
+    // controller forever — a stuck button on somebody else's machine.
+    onKeyUp: (e) => held.delete(norm(e)),
+    onBlur: () => { held.clear(); touched.clear(); stick.x = stick.y = 0; },
+    padHtml:
+      '<div id="disc"><div id="nub"></div></div>' +
+      '<div id="face">' +
+        '<div class="tb" id="tA">A</div><div class="tb" id="tB">B</div>' +
+        '<div class="tb" id="tCUp">C&#9650;</div><div class="tb" id="tCLeft">C&#9664;</div>' +
+        '<div class="tb" id="tCRight">C&#9654;</div><div class="tb" id="tCDown">C&#9660;</div>' +
+      '</div>' +
+      '<div class="tb sq" id="tZ">Z</div><div class="tb sq" id="tL">L</div>' +
+      '<div class="tb sq" id="tR">R</div><div class="tb sq" id="tStart">Start</div>',
+    wirePad({ holdButton, wireDisc, $ }) {
+      const b = (id, name) => holdButton($(id), () => touched.add(name), () => touched.delete(name));
+      b('tA', 'a'); b('tB', 'b'); b('tZ', 'z'); b('tL', 'l'); b('tR', 'r'); b('tStart', 'start');
+      b('tCUp', 'cup'); b('tCDown', 'cdown'); b('tCLeft', 'cleft'); b('tCRight', 'cright');
+      wireDisc($('disc'), $('nub'), (x, y) => { stick.x = x; stick.y = y; });
+    },
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>SNES — Play Online</title>
+<!--
+  snes_multiplayer.html — THE PARTY, AND THE REMOTE PLAYER'S WHOLE MACHINE.
+
+  ONE browser runs an emulator: the host boots the cartridge, captures its canvas
+  and audio and streams both over WebRTC; the remote player sends controller
+  state back. The guest needs no core, no ROM and no WebAssembly — a <video> and
+  a pad.
+
+  ⚠ THIS CONSOLE SHIPS A ONE-CONTROLLER CORE, AND THIS PAGE SAYS SO RATHER THAN
+  PRETENDING. The measurement, so nobody has to re-derive it:
+
+      snes/snesWasm/source/exports.c:19        int joyPadInput = 0;      // ONE global
+      snes/snesWasm/source/exports.c:32-35     void setJoypadInput(int32_t input)
+                                               { joyPadInput = input; }  // no port arg
+      snes/snesWasm/source/exports.c:37-40     uint32_t S9xReadJoypad(int32_t port){
+                                                 if(port == 0) return joyPadInput; //1Pのみ対応
+                                                 return 0; }
+
+  That comment is the author's own, and it says "1P only supported". The wasm
+  agrees: the module's complete export list contains exactly one joypad symbol,
+  `_setJoypadInput`, and its body takes ONE i32 and stores it to one address.
+  There is no `_setJoypadInput2` and no port-taking variant, so there is nothing
+  a page can call to reach a second pad.
+
+  Snes9x ITSELF is five-player capable — IPPU.Joypads[5] exists, ppu.c:1468 reads
+  Joypads[1] for the $4017 serial port, and ppu.c:2060-2062 already polls all five
+  ports — but every port above 0 gets a hard `return 0` from the shim above. Wiring
+  it up is a few lines in exports.c plus a REBUILD of snes9x_2005.wasm, and this
+  work was explicitly not allowed to touch a .wasm. So:
+
+      WHAT THIS PAGE HONESTLY DOES: the remote player shares CONTROLLER 1 with the
+      host. Their buttons are OR'd into the same mask the host's own keyboard,
+      touch and gamepad produce (snes.html's padMask()), which is a pass-the-
+      controller / help-me-with-this-boss arrangement, plus a live view of the
+      game. It is NOT two independent players and is not described as one.
+
+  WHAT EACH SIDE DOES
+    HOST  picks a game, is given a code, and is handed to
+          snes.html?np=<code>&game=<label>, which selects the ROM, presses its own
+          Start, and hosts under THAT EXACT CODE.
+    GUEST stays here. lib/netplay.js's guest retries 'peer-unavailable' rather
+          than failing, so joining before the host has loaded is the normal case.
+
+  NO coi-serviceworker.js ON PURPOSE — snes.html itself deliberately loads none
+  (a single-threaded link that never touches SharedArrayBuffer), and this page
+  needs even less.
+-->
+<script src="/lib/netplay.js"></script>
+<script src="/lib/netplay-ui.js"></script>
+<script src="/lib/netplay-guest.js"></script>
+<style>
+  /* Only this console's own controls — the shell's CSS is in lib/netplay-guest.js.
+     A SNES face cluster is a diamond: X on top, Y left, A right, B bottom. */
+  #face { width: 172px; height: 172px; }
+  #tX { left: 56px; top: 0;    width: 60px; height: 60px; }
+  #tY { left: 0;    top: 56px; width: 60px; height: 60px; }
+  #tA { right: 0;   top: 56px; width: 60px; height: 60px; }
+  #tB { left: 56px; top: 112px; width: 60px; height: 60px; }
+  #tL { position: absolute; left: max(14px, env(safe-area-inset-left)); bottom: 178px; width: 74px; height: 44px; }
+  #tR { position: absolute; right: max(14px, env(safe-area-inset-right)); bottom: 178px; width: 74px; height: 44px; }
+  #tStart  { position: absolute; left: 50%; margin-left: 4px;   bottom: max(18px, env(safe-area-inset-bottom)); width: 86px; height: 40px; }
+  #tSelect { position: absolute; left: 50%; margin-left: -94px; bottom: max(18px, env(safe-area-inset-bottom)); width: 86px; height: 40px; }
+</style>
+</head>
+<body>
+<script>
+'use strict';
+(function () {
+  // ===========================================================================
+  // THE REMOTE PLAYER'S CONTROLLER
+  //
+  // ⚠ WIRE FORMAT SHARED WITH snes.html — do not drift. lib/netplay.js's sendPad
+  // carries ONE int32, and the bits below are the CORE'S OWN joypad layout,
+  // identical to snes.html's `BIT` table (snes.html:223) and to the SNES_*_MASK
+  // constants in snes/snesWasm/source/snes9x.h:51-62. So the host performs no
+  // translation at all: it ORs this mask straight into the value it hands
+  // Module._setJoypadInput.
+  // ===========================================================================
+  const BIT = { r: 4, l: 5, x: 6, a: 7, right: 8, left: 9, down: 10, up: 11,
+                start: 12, select: 13, y: 14, b: 15 };
+  // Keyboard, identical to snes.html's own KEYMAP (snes.html:563) so muscle
+  // memory carries between the two pages.
+  const KEYMAP = {
+    up: ['arrowup'], down: ['arrowdown'], left: ['arrowleft'], right: ['arrowright'],
+    a: ['a'], b: ['z'], x: ['x'], y: ['s'], l: ['d'], r: ['c'],
+    start: ['enter'], select: ['shift'],
+  };
+  const MAPPED = new Set(Object.values(KEYMAP).flat());
+  // Standard-mapping gamepad index -> SNES button, the same table snes.html's
+  // GP_BTN uses, so a physical pad behaves identically on both sides of the wire.
+  const GP = ['b', 'a', 'y', 'x', 'l', 'r', null, null, 'select', 'start',
+              null, null, 'up', 'down', 'left', 'right'];
+
+  const held = new Set();
+  const touched = new Set();
+  const stick = { x: 0, y: 0 };
+  const norm = (e) => String(e.key || '').toLowerCase();
+
+  function packMask() {
+    let m = 0;
+    for (const name of Object.keys(KEYMAP)) {
+      if (KEYMAP[name].some((k) => held.has(k))) m |= (1 << BIT[name]);
+    }
+    touched.forEach((name) => { m |= (1 << BIT[name]); });
+
+    // The disc is analog on THIS side because a threshold is what makes
+    // diagonals reachable with a thumb; it leaves as d-pad bits because that is
+    // all a SNES pad has.
+    let ax = stick.x, ay = stick.y;
+    const pads = (navigator.getGamepads && navigator.getGamepads()) || [];
+    for (let p = 0; p < pads.length; p++) {
+      const gp = pads[p]; if (!gp) continue;
+      const btns = gp.buttons || [];
+      for (let i = 0; i < btns.length && i < GP.length; i++) {
+        if (btns[i] && btns[i].pressed && GP[i]) m |= (1 << BIT[GP[i]]);
+      }
+      const a = gp.axes || [], dz = 0.3;
+      if (!ax && !ay && a.length >= 2) {
+        ax = Math.abs(a[0]) > dz ? a[0] : 0;
+        ay = Math.abs(a[1]) > dz ? a[1] : 0;
+      }
+      break;      // one remote player, one pad
+    }
+    if (ax > 0.4) m |= (1 << BIT.right);
+    if (ax < -0.4) m |= (1 << BIT.left);
+    if (ay > 0.4) m |= (1 << BIT.down);
+    if (ay < -0.4) m |= (1 << BIT.up);
+    // The core ORs 0xffff0000 in itself for any non-zero pad (ppu.c:2070-2073);
+    // nothing above bit 15 is ever meaningful here.
+    return m & 0xffff;
+  }
+
+  // ---- the ROM list is a COPY, and the test is what keeps it honest ---------
+  // lib/netplay.js refuses a pairing whose game names differ, so both sides must
+  // name the same key, and the key is the ROM's LABEL STRING — never its index.
+  // CLAUDE.md records an index going stale exactly this way.
+  // tools/mp_page_test.mjs compares this list against snes.html's ROMS[] and
+  // FAILS on drift.
+  const GAMES = [
+    { value: 'SimCity', label: 'SimCity' },
+  ];
+
+  NetplayGuest.mount({
+    seam: '__snesmp',
+    title: 'SNES — Play Online',
+    lede: 'One player loads the game; everyone else watches and joins in. '
+        + 'You need no ROM and no download — pick <b>Join</b> on the device you want to play on.',
+    // Said in the lobby, before anyone commits to a session. A page that implies
+    // two independent players when the core has one pad is exactly the failure
+    // this note exists to prevent.
+    sharedNote: '⚠ This SNES core has <b>one controller</b> — its own source says so '
+              + '(<code>S9xReadJoypad</code> answers port 0 and returns 0 for every other port). '
+              + 'So you and the host <b>share controller 1</b>: your buttons are added to theirs. '
+              + 'That works for taking turns and for helping past a hard bit — it is not two '
+              + 'separate players, and we would rather say so than let you find out mid-game.',
+    games: GAMES,
+    defaultGame: 'SimCity',
+    hostPage: '/snes.html',
+    aspect: '4 / 3',
+    players: 'shared',
+    connectedMsg: 'Connected — you share controller 1 with the host.',
+    mapped: MAPPED,
+    packMask,
+    onKeyDown: (e) => held.add(norm(e)),
+    // Release is NEVER filtered: a key that went down while the lobby's code
+    // field had focus must still come up, or it stays held on the host's
+    // controller forever — a stuck button on somebody else's machine.
+    onKeyUp: (e) => held.delete(norm(e)),
+    onBlur: () => { held.clear(); touched.clear(); stick.x = stick.y = 0; },
+    padHtml:
+      '<div id="disc"><div id="nub"></div></div>' +
+      '<div id="face">' +
+        '<div class="tb" id="tX">X</div><div class="tb" id="tY">Y</div>' +
+        '<div class="tb" id="tA">A</div><div class="tb" id="tB">B</div>' +
+      '</div>' +
+      '<div class="tb sq" id="tL">L</div><div class="tb sq" id="tR">R</div>' +
+      '<div class="tb sq" id="tSelect">Select</div><div class="tb sq" id="tStart">Start</div>',
+    wirePad({ holdButton, wireDisc, $ }) {
+      const b = (id, name) => holdButton($(id), () => touched.add(name), () => touched.delete(name));
+      b('tA', 'a'); b('tB', 'b'); b('tX', 'x'); b('tY', 'y');
+      b('tL', 'l'); b('tR', 'r'); b('tStart', 'start'); b('tSelect', 'select');
+      wireDisc($('disc'), $('nub'), (x, y) => { stick.x = x; stick.y = y; });
+    },
+  });
+})();
+</script>
+</body>
+</html>

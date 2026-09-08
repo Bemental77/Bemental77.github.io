@@ -4,6 +4,12 @@
 <head>
   <script src="/lib/capability.js"></script>
   <script src="/lib/xboxinput.js"></script>
+  <!-- ONLINE CO-OP. Both are inert unless Netplay.supported(); netplay-host.js
+       additionally does nothing at all without ?np=<code> in the URL, which is
+       what gba_multiplayer.html hands over. The lobby is NOT here — see the
+       ONLINE CO-OP block at the end of this page. -->
+  <script src="/lib/netplay.js"></script>
+  <script src="/lib/netplay-host.js"></script>
     <title>GBA Wasm</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="keywords" content="GBA Emulator, Game Boy Advance, WebAssembly, HTML5">
@@ -592,6 +598,10 @@
                     rv-if="data.hasRoms" rv-disabled="data.moduleInitializing">Play Game</button>
                 <button id="btnUploadRom" class="btn btn-primary mt-4" onclick="myApp.uploadBrowse()"
                     rv-disabled="data.moduleInitializing">Browse</button>
+                <!-- hidden until Netplay.supported() proves the browser can do it: a
+                     control that does nothing when pressed reads as "the site is
+                     broken". Wired in the ONLINE CO-OP block at the end of the page. -->
+                <button id="btnNet" type="button" class="btn btn-primary mt-4" hidden>&#128101; Play Online</button>
                 <button type="button" class="btn btn-primary mt-4" onclick="myApp.showRemapModal()">
                     Remap Buttons
                 </button>
@@ -721,6 +731,7 @@
                 id="spExportBtn">Export State</button>
             <button class="btn btn-primary" onclick="myApp.importStateLocal(); spCloseMenu();">Import State</button>
             <button class="btn btn-primary" id="spFullBtn" onclick="spToggleFullscreen(); spCloseMenu();">Fullscreen</button>
+            <button class="btn btn-primary" id="spNetBtn" hidden>&#128101; Play Online</button>
             <button class="btn btn-primary" onclick="spEnterEditMode(); spCloseMenu();">Move Controls</button>
             <button class="btn btn-secondary" onclick="myApp.newRom()">New Rom</button>
             <hr style="margin: 12px 0;">
@@ -1234,6 +1245,143 @@
     <script src="/gba/gbaWasm/dist/settings.js"></script>
     <script src="/gba/gbaWasm/dist/romlist.js"></script>
     <script src="/gba/gbaWasm/dist/script.js"></script>
+  <script>
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ONLINE CO-OP — THE HOST HALF, AND NOTHING ELSE.
+    //
+    // THE MODEL: ONE INSTANCE RUNS THE GAME. This page's emulator is the only
+    // emulator. It streams its picture and its sound over WebRTC and the remote
+    // player sends controller state back.
+    //
+    // ⚠ A GAME BOY ADVANCE HAS ONE CONTROLLER, so this is a SHARED pad and not a
+    // player 2. That is the machine, not the port: the console is a handheld and
+    // its KEYINPUT is one 10-bit word. Two GBAs play together over a LINK CABLE,
+    // which means two emulated machines and a serial transport — a different
+    // program from this one, and one this core has no hook for. Measured rather
+    // than assumed: the wasm's ENTIRE export table is 20 entries, of which eight
+    // are emulator-facing, `_emuRunFrame` has signature (i32) -> void with no
+    // player index and is the only input entry point, and the two wasm->JS
+    // callbacks are `writeAudio` and `wasmReady` — there is no SIO/link hook at
+    // all. So the remote player's buttons are OR'd into the same key mask the
+    // local player produces, and gba_multiplayer.html says exactly that in its
+    // lobby rather than promising a second player this machine never had.
+    //
+    // ⚠ THE WRAP, NOT AN EDIT TO THE VENDORED CORE. gba/gbaWasm/dist/script.js is
+    // generated output; its line `Module._emuRunFrame(this._getKeyMask())` does a
+    // FRESH property lookup on the global Module every frame, so wrapping the
+    // property here reaches the core without touching a dist file.
+    // tools/mobile_input_latency.mjs already wraps the same property for
+    // measurement, so the technique is not new here.
+    //
+    // THE LOBBY IS NOT HERE. It is gba_multiplayer.html, because a guest needs no
+    // core and no ROM. The buttons above are links to that page, not a lobby.
+    // ═══════════════════════════════════════════════════════════════════════════
+    (function wireNetplay() {
+      if (!window.NetplayHost || !NetplayHost.supported()) return;
+      var $ = function (id) { return document.getElementById(id); };
+      var titleOf = function () {
+        var sel = $('romselect');
+        var list = window.ROMLIST || [];
+        for (var i = 0; i < list.length; i++) if (list[i].url === (sel && sel.value)) return list[i].title;
+        return list.length ? list[0].title : '';
+      };
+      var go = function () { location.href = NetplayHost.lobbyUrl('/gba_multiplayer.html', titleOf()); };
+      // rivets renders #btnNet inside a `rv-if` block, so the element can be
+      // replaced after this runs. Delegate from the document instead of binding
+      // to a node that may not be the one the visitor eventually clicks.
+      document.addEventListener('click', function (e) {
+        var t = e.target && e.target.closest ? e.target.closest('#btnNet, #spNetBtn') : null;
+        if (t) { e.preventDefault(); go(); }
+      });
+      var unhide = function () {
+        ['btnNet', 'spNetBtn'].forEach(function (id) { var b = $(id); if (b) b.hidden = false; });
+      };
+      unhide();
+      setInterval(unhide, 1000);          // rivets re-renders; keep it visible
+
+      // The remote player's contribution, OR'd into the mask the core is handed.
+      //
+      // ⚠ THE WRAP HAS TO BE SELF-HEALING, AND A ONE-SHOT ONE SILENTLY DID NOTHING.
+      // MEASURED here 2026-09-08: the guest's 0x9 (A|START) crossed the wire and
+      // the host's own remotePad read 0x9, while the mask handed to the core
+      // stayed 0x0 for the whole session. The cause is Emscripten's LAZY BINDING —
+      // gba/gbaWasm/dist/44gba.js declares the export as
+      //     var _emuRunFrame = Module["_emuRunFrame"] =
+      //         a0 => (_emuRunFrame = Module["_emuRunFrame"] = wasmExports["p"])(a0);
+      // so the FIRST call replaces Module._emuRunFrame with the raw wasm export.
+      // A wrapper installed before that first call is therefore overwritten by the
+      // very act of calling through it: it runs exactly once (reporting a zero
+      // that looks like an idle pad) and is then gone, with nothing anywhere
+      // reporting a fault. Re-checking identity and re-installing costs one
+      // comparison per tick and cannot be fooled by a later reassignment either.
+      var netRemote = 0, netWraps = 0, netMine = null;
+      var wrap = function () {
+        if (!window.Module || typeof Module._emuRunFrame !== 'function') return;
+        if (Module._emuRunFrame === netMine) return;          // still ours
+        var orig = Module._emuRunFrame;
+        netWraps++;
+        netMine = function (mask) {
+          var rm = NetplayHost.remoteMask();
+          netRemote = (rm === null) ? 0 : (rm & 0x3ff);       // 10 real key bits
+          var m = (mask | netRemote) | 0;
+          // The literal mask the core was handed, kept so the netplay test can
+          // assert on THAT rather than on a session flag or a UI state.
+          NetplayHost.report(m, netRemote);
+          NetplayHost.pumpMirror();
+          return orig.call(Module, m);
+        };
+        Module._emuRunFrame = netMine;
+      };
+      setInterval(wrap, 200);
+      wrap();
+      window.__gbaNetWraps = function () { return { installs: netWraps, live: window.Module && Module._emuRunFrame === netMine }; };
+
+      NetplayHost.arm({
+        seam: '__gbaNet',
+        players: 'shared',
+        log: function (m) { if (window.console) console.log(m); },
+        canvas: function () { return $('canvas'); },
+        // "Is there a game to stream?" answered by FRAMES, not by a start flag.
+        live: function () { return !!(window.myApp && myApp.isRunning && myApp.frameCnt > 0); },
+        coreUp: function () { return !!(window.myApp && myApp.isRunning && window.Module && Module._emuRunFrame); },
+        // The game is named by its TITLE, never by its index into ROMLIST.
+        // CLAUDE.md records an index going stale exactly this way, and this list
+        // has a live example: tools/gba_mobile_controls_test.mjs:58 comments
+        // ROMLIST[4] as "Kirby" when index 4 is Super Bust-A-Move.
+        selectGame: function (title) {
+          var list = window.ROMLIST || [];
+          for (var i = 0; i < list.length; i++) {
+            if (list[i].title !== title) continue;
+            var sel = $('romselect');
+            if (sel) { sel.value = list[i].url; sel.dispatchEvent(new Event('change')); }
+            return title;
+          }
+          return null;
+        },
+        // ⚠ NEVER override a Start the capability layer is holding down: that
+        // button being disabled means the page has decided this device cannot run
+        // the emulator, and clicking past it is the exact bug the gate exists to
+        // stop. lib/capability.js decides AFTER this script runs, so this waits
+        // for Capability.ready rather than reading a decision not yet made.
+        pressStart: function () {
+          var tries = 0;
+          var attempt = function () {
+            if (!window.myApp || !myApp.isWasmReady) return false;
+            var b = $('btnPlayGame');
+            if (b && (b.disabled || b.getAttribute('aria-disabled') === 'true')) return false;
+            myClass.loadRom();
+            return true;
+          };
+          var run = function () {
+            if (attempt()) return;
+            var t = setInterval(function () { if (attempt() || ++tries > 480) clearInterval(t); }, 250);
+          };
+          if (window.Capability && Capability.ready && Capability.ready.then) Capability.ready.then(run, run);
+          else run();
+        },
+      });
+    })();
+  </script>
   <script>
     // [gate 2026-09-01] This page shipped with NO capability gate: a visitor
     // whose browser could not run it got a broken page and no explanation.

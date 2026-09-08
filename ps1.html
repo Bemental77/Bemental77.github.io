@@ -3,6 +3,12 @@
 <head>
   <script src="/lib/capability.js"></script>
   <script src="/lib/xboxinput.js"></script>
+  <!-- ONLINE CO-OP. Both are inert unless Netplay.supported(); netplay-host.js
+       additionally does nothing at all without ?np=<code> in the URL, which is
+       what ps1_multiplayer.html hands over. The lobby is NOT here — see the
+       ONLINE CO-OP block near the end of this page. -->
+  <script src="/lib/netplay.js"></script>
+  <script src="/lib/netplay-host.js"></script>
   <meta charset="UTF-8" />
   <title>PS1 Wasm — Monster Rancher 2</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -172,6 +178,9 @@
     <button id="btnMute" disabled>🔊 Mute</button>
     <button id="btnResetAudio" disabled>↻ Reset Audio</button>
     <button id="btnFull" disabled>⛶ Fullscreen</button>
+    <!-- hidden until Netplay.supported() proves the browser can do it: a control
+         that does nothing when pressed reads as "the site is broken". -->
+    <button id="btnNet" type="button" hidden>👥 Play Online</button>
     <button id="btnLog" type="button">Toggle Log</button>
   </div>
   <div id="canvasWrap"><canvas id="canvas" width="640" height="480"></canvas></div>
@@ -186,6 +195,7 @@
     <label for="mobileRomSelect">Choose a game</label>
     <select id="mobileRomSelect"></select>
     <button id="mobileSplashStart" type="button">Start</button>
+    <button id="mobileSplashNet" type="button" hidden style="min-width:0;padding:8px 14px;font-size:13px;background:#1d1d1d;border-color:#333;color:#aaa">👥 Play Online</button>
     <p class="rotateTip">Rotate to landscape for the best view.</p>
   </div>
   <div id="mobileScreen"></div>
@@ -369,6 +379,36 @@
     if (mobilePadState.triangle) b1 &= ~(1 << 4); if (mobilePadState.circle) b1 &= ~(1 << 5);
     if (mobilePadState.cross) b1 &= ~(1 << 6); if (mobilePadState.square) b1 &= ~(1 << 7);
     Module.HEAPU8[padStatus1 + 6] = b0; Module.HEAPU8[padStatus1 + 7] = b1;
+
+    // ── ONLINE CO-OP: CONTROLLER PORT 2 IS THE REMOTE PLAYER ────────────────
+    // This console really has two ports and the guest really is player 2.
+    // `padStatus2 = Module._get_ptr(2)` is &g.PadState[1] (gui/wwGUI.cc:81-90),
+    // and the 24-byte stride is MEASURED against the shipped binary rather than
+    // assumed: the var_ptrs triple in ps1/ps1Wasm/dist/pcsx_ww.wasm reads
+    // {0x00000f60, 0x0020111c, 0x00201134} and 0x201134 - 0x20111c = 0x18 = 24.
+    // pollController below already copies 48 bytes — BOTH PADSTATE entries — to
+    // the emulator worker every 8 ms, and the core already polls the port:
+    // PADstartPoll(2) sets CurPad = 1 and PADpoll reads g.PadState[1].KeyStatus
+    // (plugins/sdlinput/pad_worker.c:126-130, :213-217), with PADquery()
+    // returning PSE_PAD_USE_PORT1|PSE_PAD_USE_PORT2 (:63-65). Port 2's slot has
+    // been crossing the wire all along with nothing written into it.
+    //
+    // ⚠ KeyStatus IS ACTIVE-LOW — 0xFFFF at rest, and a press CLEARS a bit
+    // (plugins/sdlinput/xkb.c:43 `KeyStatus &= ~(1 << j)`). The wire mask is
+    // active-high, so the inversion happens HERE, in one place, next to the note
+    // that explains it. It is also written unconditionally: with nobody
+    // connected both bytes go back to 0xFF, so a guest who disconnects mid-jump
+    // cannot leave a button held on port 2.
+    if (padStatus2) {
+      var _host = window.NetplayHost;
+      var _rm = _host ? _host.remoteMask() : null;
+      var c0 = 0xFF, c1 = 0xFF;
+      if (_rm !== null) { c0 = (~_rm) & 0xFF; c1 = (~(_rm >> 8)) & 0xFF; }
+      Module.HEAPU8[padStatus2 + 6] = c0; Module.HEAPU8[padStatus2 + 7] = c1;
+      // The literal bytes the core was handed, kept so the netplay test can
+      // assert on THOSE rather than on a session flag or a UI state.
+      if (_host) _host.report([b0, b1], [c0, c1]);
+    }
   }
 
   var KEY_CODES = { 'ArrowUp': ['ArrowUp', 38], 'ArrowDown': ['ArrowDown', 40], 'ArrowLeft': ['ArrowLeft', 37], 'ArrowRight': ['ArrowRight', 39], 'z': ['KeyZ', 90], 'x': ['KeyX', 88], 's': ['KeyS', 83], 'd': ['KeyD', 68], 'w': ['KeyW', 87], 'r': ['KeyR', 82], 'e': ['KeyE', 69], 't': ['KeyT', 84], 'v': ['KeyV', 86], 'c': ['KeyC', 67] };
@@ -551,6 +591,10 @@
 
   function pollController() {
     if (!pcsx_worker) return;
+    // No-ops unless netplay fell back to a mirror canvas (it does not here — the
+    // canvas is main-thread and captures directly — but the fallback must still
+    // be fed if it ever wins).
+    if (window.NetplayHost) NetplayHost.pumpMirror();
     Module._CheckJoy(); Module._CheckKeyboard(); updatePadState();
     var src = Module.HEAPU8.subarray(padStatus1, padStatus1 + 48);
     var arr; while (states_arrs.length > 50) states_arrs.pop();
@@ -960,6 +1004,83 @@
   window.addEventListener('resize', checkOrientation); window.addEventListener('orientationchange', checkOrientation);
   if (isMobile) { $('desktop').style.display = 'none'; var c = $('canvas'); c.style.width = ''; c.style.height = ''; $('mobileScreen').appendChild(c); $('mobileShell').style.display = 'block'; $('mobileSplash').style.display = 'flex'; wireMobileControls(); checkOrientation(); $('mobileSplashStart').addEventListener('pointerdown', function (e) { e.preventDefault(); var mSel = $('mobileRomSelect'); var dSel = $('romSelect'); if (mSel && dSel) dSel.value = mSel.value; $('mobileSplash').style.display = 'none'; startEmulator(); checkOrientation(); }); setStatus('Pick a game and tap Start.'); }
   document.addEventListener('touchstart', function (e) { if (e.target.closest('.faceBtn, .shoulderBtn, .dpadV, .dpadH, .sysBtn, .menuBtn')) {} }, { passive: true });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ONLINE CO-OP — THE HOST HALF, AND NOTHING ELSE.
+  //
+  // THE MODEL: ONE INSTANCE RUNS THE GAME. This page's emulator is the only
+  // emulator. It streams its picture and its sound over WebRTC and the guest
+  // sends controller state back, which lands in port 2 (see updatePadState).
+  //
+  // THE LOBBY IS NOT HERE. It is ps1_multiplayer.html, because a GUEST needs no
+  // core and no disc — and the discs here are the largest on the site, up to
+  // 731,911,824 bytes in nine gzipped parts. Pairing on THIS page would make
+  // both players download one. So the party forms there and only the HOST is
+  // sent back carrying ?np=<code>&game=<label>. The button below is a link to
+  // that page, not a lobby.
+  // ═══════════════════════════════════════════════════════════════════════════
+  (function wireNetplay() {
+    if (!window.NetplayHost || !NetplayHost.supported()) return;
+    var go = function () {
+      var sel = isMobile ? $('mobileRomSelect') : $('romSelect');
+      var pick = ROMS[+(sel && sel.value) || 0] || ROMS[0];
+      location.href = NetplayHost.lobbyUrl('/ps1_multiplayer.html', pick.label);
+    };
+    ['btnNet', 'mobileSplashNet'].forEach(function (id) {
+      var b = $(id); if (!b) return;
+      b.hidden = false;
+      b.addEventListener('click', go);
+    });
+    NetplayHost.arm({
+      seam: '__ps1Net',
+      players: 'p2',
+      log: function (m) { pageLog(m); },
+      canvas: function () { return $('canvas'); },
+      // "Is there a game to stream?" answered by FRAMES, not by a start flag:
+      // `started` is set the instant Start is pressed, long before the runtime
+      // exists, and capturing then would publish a black canvas.
+      live: function () { return renderFrames > 0; },
+      // The CPU + pad wire, which is a DIFFERENT question and is the one player
+      // 2 actually depends on: padStatus1 means the pointer table has been read
+      // and pcsx_worker means the 48-byte pad message has somewhere to go.
+      coreUp: function () { return !!(padStatus1 && pcsx_worker); },
+      // The disc is named by its LABEL, never by its index into ROMS. CLAUDE.md
+      // records an index going stale exactly this way.
+      selectGame: function (label) {
+        for (var i = 0; i < ROMS.length; i++) {
+          if (ROMS[i].label !== label) continue;
+          ['romSelect', 'mobileRomSelect'].forEach(function (id) {
+            var sel = $(id); if (!sel) return;
+            sel.value = String(i);
+            sel.dispatchEvent(new Event('change'));
+          });
+          return label;
+        }
+        return null;
+      },
+      // ⚠ NEVER override a Start the capability layer is holding down: that
+      // button being disabled means the page has decided this device cannot run
+      // the emulator, and clicking past it is the exact bug the gate exists to
+      // stop. lib/capability.js decides AFTER this script runs, so this waits
+      // for Capability.ready rather than reading a decision that has not been
+      // made yet — a race that would let a handoff boot a gated device.
+      pressStart: function () {
+        var attempt = function () {
+          var b = $('btnStart');
+          if (!b || b.disabled || b.getAttribute('aria-disabled') === 'true') {
+            pageLog('[net] Start is held down — not overriding it');
+            return;
+          }
+          if (isMobile) { var sp = $('mobileSplash'); if (sp) sp.style.display = 'none'; }
+          startEmulator();
+        };
+        if (window.Capability && Capability.ready && Capability.ready.then) {
+          Capability.ready.then(function () { setTimeout(attempt, 0); }, function () { setTimeout(attempt, 0); });
+        } else setTimeout(attempt, 0);
+      },
+      onStatus: function (e) { if (e.state === 'connected') setStatus('Player 2 connected (controller port 2).'); },
+    });
+  })();
 })();
 </script>
   <script>

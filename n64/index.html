@@ -14,6 +14,12 @@
        so its own absolute paths are unambiguous. -->
   <script src="/lib/capability.js"></script>
   <script src="/lib/xboxinput.js"></script>
+  <!-- ONLINE CO-OP. Both are inert unless Netplay.supported(); netplay-host.js
+       additionally does nothing at all without ?np=<code> in the URL, which is
+       what n64_multiplayer.html hands over. The lobby is NOT here — see the
+       ONLINE CO-OP block near the end of this page. -->
+  <script src="/lib/netplay.js"></script>
+  <script src="/lib/netplay-host.js"></script>
   <script>
     // Same honest-failure contract as the sibling pages, with the spec that makes
     // this the PORTABILITY REFERENCE: Capability.SPECS.n64 requires only
@@ -194,6 +200,9 @@
     <button id="btnRemap" type="button">⌨ Remap</button>
     <button id="btnLog" type="button">Toggle Log</button>
     <button id="btnDiag" type="button">🩺 Diagnostics</button>
+    <!-- hidden until Netplay.supported() proves the browser can do it: a control
+         that does nothing when pressed reads as "the site is broken". -->
+    <button id="btnNet" type="button" hidden>👥 Play Online</button>
   </div>
   <div id="canvasDiv"><canvas id="canvas" width="640" height="480"></canvas></div>
   <div id="statusBar"><span id="status">Idle.</span><span id="fps"></span></div>
@@ -217,6 +226,7 @@
     <select id="mobileRomSelect"></select>
     <button id="mobileSplashStart" type="button">Start</button>
     <button id="mobileSplashDiag" type="button" style="min-width:0;padding:8px 14px;font-size:13px;background:#1d1d1d;border-color:#333;color:#aaa">🩺 Diagnostics</button>
+    <button id="mobileSplashNet" type="button" hidden style="min-width:0;padding:8px 14px;font-size:13px;background:#1d1d1d;border-color:#333;color:#aaa">👥 Play Online</button>
     <p class="rotateTip">Rotate to landscape for the best view.</p>
   </div>
   <div id="mobileScreen"></div>
@@ -2880,6 +2890,257 @@ N64Rate.selfTest = function (logFn) {
     }
     // ?ratetest=1 runs the model with NO emulator; autostart would defeat that.
     if (qs.has('autostart') && !RATETEST) { if (isMobile) $('mobileSplash').style.display = 'none'; startEmulator(); }
+  })();
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ONLINE CO-OP — THE HOST HALF, AND NOTHING ELSE.
+  //
+  // THE MODEL: ONE INSTANCE RUNS THE GAME. This page's emulator is the only
+  // emulator. It streams its picture and its sound over WebRTC and the remote
+  // player sends controller state back.
+  //
+  // ⚠ THE HONEST STATUS OF PLAYER 2 ON THIS CONSOLE, because it is neither a
+  // clean yes nor a clean no.
+  //
+  //   THE CORE IS FOUR-CONTROLLER AND ALWAYS WAS. `struct NeilButtons
+  //   neilbuttons[4]` (n64/N64Wasm/code/mymain.cpp:98); inputGetKeys_default
+  //   indexes EVERY field by port (…/plugin/emulate_game_controller_via_libretro.c
+  //   :324-325, :355-361, :665-673); all four report plugged in via
+  //   `int pad_present[4] = { 1, 1, 1, 1 }` (…/src/libretro/libretronew.c:179);
+  //   and the SDL loop already fills neilbuttons[i] for four pads with per-player
+  //   Y-invert for players 2-4 (mymain.cpp:1010-1082).
+  //
+  //   THE JAVASCRIPT BRIDGE IS NOT. `neil_send_mobile_controls` is the ONLY
+  //   exported function that writes a button, it takes no player argument, and
+  //   all 21 of its assignments are the literal index 0 (mymain.cpp:1868-1889).
+  //   Reaching port 2 through it would need a rebuilt .wasm.
+  //
+  // So there are two paths and the page installs BOTH, because which one is live
+  // depends on the host's own shell — and neither one is a guess about the other:
+  //
+  //   PATH A — the mobile-controls hook. mymain.cpp:1147 calls it ONLY under
+  //     `mobileMode && !sdlJoysticks[0].gamepadConnected`, so it is the phone and
+  //     tablet host's path. The remote buttons are merged into the string the
+  //     page was already sending, which is controller 1: a SHARED pad.
+  //   PATH B — present the remote player as a GAMEPAD. The SDL joystick loop at
+  //     mymain.cpp:1010 runs regardless of mobileMode, and connectGamepad packs
+  //     opened pads densely into sdlJoysticks[0..3] in enumeration order
+  //     (mymain.cpp:158-198). The synthetic pad is therefore APPENDED, never
+  //     prepended: with a real controller plugged into the host it lands on
+  //     sdlJoysticks[1] and IS PLAYER 2; with the host on keyboard only it is the
+  //     first pad and SHARES player 1. It is not installed on mobile, because a
+  //     connected pad 0 is exactly what switches PATH A off and would take the
+  //     host's own touch controls away.
+  //
+  // WHICH ONE ACTUALLY LANDED IS REPORTED, NOT ASSUMED: window.__n64Net().padPath
+  // says which hooks are installed, .gamepadServed counts the times the core
+  // really pulled the synthetic pad, and the core's own printf ("Connected
+  // Joystick …") lands in this page's log when SDL opens it.
+  //
+  // THE LOBBY IS NOT HERE. It is n64_multiplayer.html, because a guest needs no
+  // core and no ROM. The buttons above are links to that page, not a lobby.
+  // ═══════════════════════════════════════════════════════════════════════════
+  (function wireNetplay() {
+    if (!window.NetplayHost || !NetplayHost.supported()) return;
+    var go = function () {
+      var sel = isMobile ? $('mobileRomSelect') : $('romSelect');
+      var pick = ROMS[+(sel && sel.value) || 0] || ROMS[0];
+      location.href = NetplayHost.lobbyUrl('/n64_multiplayer.html', pick.label);
+    };
+    ['btnNet', 'mobileSplashNet'].forEach(function (id) {
+      var b = $(id); if (!b) return;
+      b.hidden = false;
+      b.addEventListener('click', go);
+    });
+
+    // ⚠ WIRE FORMAT SHARED WITH n64_multiplayer.html — do not drift.
+    //   bits  0..13  buttons, in the EXACT order neil_send_mobile_controls reads
+    //                its 14-character string (mymain.cpp:1868-1881)
+    //   bits 16..23  stick X, signed byte      bits 24..31  stick Y, signed byte
+    var NB = ['up', 'down', 'left', 'right', 'a', 'b', 'start', 'z',
+              'l', 'r', 'cup', 'cdown', 'cleft', 'cright'];
+    function netRemote() {
+      var rm = NetplayHost.remoteMask();
+      if (rm === null) return null;
+      // >> is arithmetic in JS, so these two shifts sign-extend the axis bytes.
+      return { bits: rm & 0x3fff, x: ((rm << 8) >> 24) / 127, y: (rm >> 24) / 127 };
+    }
+
+    // ---- PATH A ------------------------------------------------------------
+    var netSent = null, sendHooked = false;
+    function hookSend() {
+      var app = window.myApp;
+      if (sendHooked || !app || typeof app.sendMobileControls !== 'function') return false;
+      sendHooked = true;
+      var orig = app.sendMobileControls.bind(app);
+      app.sendMobileControls = function (str, x, y) {
+        var r = netRemote();
+        if (r) {
+          var out = '';
+          for (var i = 0; i < 14; i++) out += ((str.charAt(i) === '1') || (r.bits & (1 << i))) ? '1' : '0';
+          str = out;
+          // The two sticks are never summed — whichever is pushed further wins,
+          // because two sources at full deflection would still be one stick.
+          if (Math.abs(r.x) > Math.abs(+x || 0)) x = String(r.x);
+          if (Math.abs(r.y) > Math.abs(+y || 0)) y = String(r.y);
+        }
+        // The literal arguments the core was handed, kept so the netplay test can
+        // assert on THOSE rather than on a session flag or a UI state.
+        netSent = { controls: str, x: x, y: y };
+        NetplayHost.report(netSent, r ? { bits: r.bits, x: r.x, y: r.y } : null);
+        return orig(str, x, y);
+      };
+      return true;
+    }
+
+    // ---- PATH B ------------------------------------------------------------
+    var NET_PAD_ID = 'Bemental Netplay Remote Player (Vendor: 0000 Product: 0002)';
+    var gpServed = 0, gpInstalled = false, gpAnnounced = false, gpLast = null;
+    // Standard-mapping index -> N64 button, matching n64_multiplayer.html's GP.
+    var GP_MAP = ['a', 'b', 'b', 'a', 'l', 'r', 'z', 'z', null, 'start',
+                  null, null, 'up', 'down', 'left', 'right'];
+    function makePad(index, r) {
+      var btns = [];
+      for (var i = 0; i < 16; i++) {
+        var name = GP_MAP[i];
+        var down = !!(name && (r.bits & (1 << NB.indexOf(name))));
+        btns.push({ pressed: down, touched: down, value: down ? 1 : 0 });
+      }
+      // axes[1] is screen-down-positive in the Gamepad API; the wire's Y is
+      // up-positive, so it is negated exactly once, here.
+      return { id: NET_PAD_ID, index: index, connected: true, mapping: 'standard',
+               timestamp: performance.now(), axes: [r.x, -r.y, 0, 0], buttons: btns };
+    }
+    function installSyntheticPad() {
+      if (gpInstalled || isMobile) return;
+      gpInstalled = true;
+      var real = navigator.getGamepads ? navigator.getGamepads.bind(navigator) : function () { return []; };
+      navigator.getGamepads = function () {
+        var list = Array.prototype.slice.call(real() || []);
+        var r = netRemote();
+        if (!r) return list;
+        // ⚠ THE SLOT IS THE FIRST EMPTY ONE, NOT THE END OF THE ARRAY.
+        // navigator.getGamepads() returns a FIXED-LENGTH array padded with nulls
+        // — four of them in Chrome with nothing plugged in — so appending put the
+        // pad at index 4 while the 'gamepadconnected' event announced index 0.
+        // SDL then asked emscripten_get_gamepad_status(0), read a null slot, and
+        // saw a device with no buttons. MEASURED 2026-09-08: with the pad
+        // appended, the core opened it (its mobile-controls callback rate went
+        // 152/3s -> 0) and yet joy button 11 did not toggle the core's own
+        // overlay menu, while the keyboard's '`' did — a device that exists and
+        // reads as all-released, which looks exactly like a dead remote player.
+        // Taking the first empty slot ALSO keeps the intended ordering: a real
+        // controller occupies slot 0, so the remote player lands on slot 1 and is
+        // player 2.
+        var slot = list.indexOf(null);
+        if (slot < 0) slot = list.length;
+        var pad = makePad(slot, r);
+        list[slot] = pad;
+        gpServed++;
+        // What the CORE actually pulled, flattened so a test can assert on it.
+        // Not "what we intended to send" — this is read at the moment emscripten
+        // samples the Gamepad API on the core's behalf.
+        gpLast = { index: pad.index, axes: pad.axes.slice(0, 2),
+                   buttons: pad.buttons.reduce(function (acc, b, i) { return acc | (b.pressed ? (1 << i) : 0); }, 0) };
+        // SDL's emscripten joystick backend adds a device on the
+        // 'gamepadconnected' EVENT, not by noticing the array grew, so the
+        // arrival has to be announced once.
+        if (!gpAnnounced) {
+          gpAnnounced = true;
+          try {
+            var ev = new Event('gamepadconnected');
+            Object.defineProperty(ev, 'gamepad', { value: pad });
+            window.dispatchEvent(ev);
+          } catch (e) { pageLog('[net] could not announce the remote pad: ' + (e.message || e)); }
+        }
+        return list;
+      };
+    }
+
+    var hookIv = setInterval(function () { hookSend(); }, 250);
+    hookSend();
+
+    NetplayHost.arm({
+      seam: '__n64Net',
+      // Deliberately not 'p2': on this console the answer depends on the host's
+      // own hardware, and claiming a number the page cannot know is the failure
+      // this whole exercise exists to avoid.
+      players: 'p2-if-host-has-a-pad',
+      log: function (m) { pageLog(m); },
+      canvas: function () { return $('canvas'); },
+      // A real, persistent node this page owns and mutes through, so netplay does
+      // not need the interposer in lib/netplay-host.js here.
+      audioNode: function () { return (window.myApp && myApp.gainNode) || null; },
+      // "Is there a game to stream?" answered by FRAMES THE EMULATOR MADE.
+      // ⚠ NOT `shown`. MEASURED 2026-09-08: two seconds into a Mario Kart 64 boot
+      // __n64Rate read `made: 0, shown: 24` — `shown` is the PRESENTATION counter
+      // and it ticks while the GL canvas is still empty. Arming on it captured a
+      // canvas with nothing in it yet, and the capture probe then chose a
+      // fallback for the whole session on the strength of one early miss.
+      live: function () { return (window.__n64Rate || {}).made > 0; },
+      coreUp: function () {
+        return !!(window.myApp && myApp.rivetsData && myApp.rivetsData.beforeEmulatorStarted === false);
+      },
+      // The game is named by its LABEL, never by its index into ROMS. CLAUDE.md
+      // records an index going stale exactly this way. (?game= is ALSO read by
+      // applyUrlParams above, which matches on the ROM's FILE name — the two do
+      // not collide, and this runs after it so a label wins.)
+      selectGame: function (label) {
+        for (var i = 0; i < ROMS.length; i++) {
+          if (ROMS[i].label !== label && ROMS[i].file !== label) continue;
+          ['romSelect', 'mobileRomSelect'].forEach(function (id) {
+            var sel = $(id); if (!sel) return;
+            sel.value = String(i);
+            sel.dispatchEvent(new Event('change'));
+          });
+          return ROMS[i].label;
+        }
+        return null;
+      },
+      // ⚠ NEVER override a Start the capability layer is holding down — this page
+      // already has splashStartIsHeld for exactly that reason. lib/capability.js
+      // decides AFTER this script runs, so this waits for Capability.ready rather
+      // than reading a decision that has not been made yet.
+      pressStart: function () {
+        var tries = 0;
+        var attempt = function () {
+          var b = $('btnStart');
+          if (b && (b.disabled || b.getAttribute('aria-disabled') === 'true')) return false;
+          if (isMobile) { var sp = $('mobileSplash'); if (sp) sp.style.display = 'none'; }
+          startEmulator();
+          return true;
+        };
+        var run = function () {
+          if (attempt()) return;
+          var t = setInterval(function () { if (attempt() || ++tries > 480) clearInterval(t); }, 250);
+        };
+        if (window.Capability && Capability.ready && Capability.ready.then) Capability.ready.then(run, run);
+        else run();
+      },
+      onStatus: function (e) {
+        if (e.state !== 'connected') return;
+        hookSend();
+        installSyntheticPad();
+        setStatus(isMobile ? 'A remote player joined — you share controller 1.'
+                           : 'A remote player joined as an extra controller.');
+      },
+    });
+
+    // A SIBLING of window.__n64Rate / __n64Pace, not an extension of either —
+    // both already have consumers whose shape must not move.
+    window.__n64NetPad = function () {
+      return {
+        sendHooked: sendHooked,
+        gamepadInstalled: gpInstalled,
+        gamepadAnnounced: gpAnnounced,
+        gamepadServed: gpServed,      // times the CORE actually pulled the pad
+        gamepadLast: gpLast,          // the literal pad state the core last pulled
+        padPath: (gpInstalled ? 'gamepad' : '') + (sendHooked ? (gpInstalled ? '+' : '') + 'mobile-controls' : ''),
+        sent: netSent,                // literal args last handed to the core
+        mask: NetplayHost.remoteMask(),
+      };
+    };
+    void hookIv;
   })();
 
   // The capability facts go into the log on EVERY load, so they are in the tail as well as

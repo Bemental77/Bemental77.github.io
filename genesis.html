@@ -3,6 +3,12 @@
 <head>
   <script src="/lib/capability.js"></script>
   <script src="/lib/xboxinput.js"></script>
+  <!-- ONLINE CO-OP. Both are inert unless Netplay.supported(); netplay-host.js
+       additionally does nothing at all without ?np=<code> in the URL, which is
+       what genesis_multiplayer.html hands over. The lobby is NOT here — see the
+       ONLINE CO-OP block near the end of this page. -->
+  <script src="/lib/netplay.js"></script>
+  <script src="/lib/netplay-host.js"></script>
   <meta charset="UTF-8" />
   <title>Genesis Wasm</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -218,6 +224,9 @@
     <button id="btnReset" disabled>Reset</button>
     <button id="btnMute" disabled>🔊 Mute</button>
     <button id="btnFull" disabled>⛶ Fullscreen</button>
+    <!-- hidden until Netplay.supported() proves the browser can do it: a control
+         that does nothing when pressed reads as "the site is broken". -->
+    <button id="btnNet" type="button" hidden>👥 Play Online</button>
   </div>
   <div id="canvasWrap"><canvas id="canvas" width="320" height="224"></canvas></div>
   <div id="statusBar"><span id="status">Idle.</span><span id="fps"></span></div>
@@ -231,6 +240,7 @@
     <label for="mobileRomSelect">Choose a game</label>
     <select id="mobileRomSelect"></select>
     <button id="mobileSplashStart" type="button">Start</button>
+    <button id="mobileSplashNet" type="button" hidden style="min-width:0;padding:8px 14px;font-size:13px;background:#1d1d1d;border-color:#333;color:#aaa">👥 Play Online</button>
     <p class="rotateTip">Rotate to landscape for the best view.</p>
   </div>
   <div id="mobileScreen"></div>
@@ -401,13 +411,53 @@
   var presented = 0, lastFpsAt = 0, guestFrames = 0;
   window.__genFrames = 0;     // read by tools/genesis_page_test.mjs
 
+  // ── ONLINE CO-OP: CONTROLLER PORT B IS THE REMOTE PLAYER ──────────────────
+  // lib/netplay-host.js hands back ONE int32, or null when nobody is connected.
+  // Its bits are already this core's own libretro ids — the same `BIT` table
+  // padMask() uses for port 0 — so there is nothing to translate here.
+  //
+  // THIS IS A REAL SECOND CONTROLLER, not a shared one, and that is a property
+  // of the core rather than of this page: `gpx_set_pad(unsigned port, int mask)`
+  // keeps pad[8] and serves every port through input_state_cb
+  // (genesis/genesisWasm/source/gpgx_shim.c:58-59, :251-264, :369-374), and
+  // Genesis Plus GX's own config_default() leaves input.system[0] AND
+  // input.system[1] as SYSTEM_GAMEPAD. Port B has been sitting there wired up
+  // the whole time; this page just never wrote to it.
+  //
+  // ⚠ THE RELEASE HAS TO BE WRITTEN TOO. pad[1] is sticky — it holds whatever
+  // was last stored — so a guest who disconnects mid-jump would leave the button
+  // held on port B for the rest of the session. netP2Live remembers whether
+  // anything was ever put there so the zero is written exactly once, rather than
+  // 60 times a second forever after.
+  var netP2 = 0, netP2Live = false;
+  function netApplyRemote() {
+    var host = window.NetplayHost;
+    if (!host) return;
+    var rm = host.remoteMask();
+    if (rm === null) {
+      if (netP2Live) { Module._gpx_set_pad(1, 0); netP2 = 0; netP2Live = false; }
+      return;
+    }
+    netP2 = rm & 0xffff; netP2Live = true;
+    Module._gpx_set_pad(1, netP2);
+  }
+
   function runFrame() {
-    Module._gpx_set_pad(0, padMask());
+    var p1 = padMask();
+    Module._gpx_set_pad(0, p1);
+    netApplyRemote();
+    // The literal masks the core was handed, kept so the netplay test can assert
+    // on THOSE rather than on a session flag or a UI state.
+    if (window.NetplayHost) NetplayHost.report(p1, netP2);
     Module._gpx_run();
     guestFrames++; window.__genFrames++;
   }
 
   function draw() {
+    // No-ops unless netplay fell back to a mirror canvas (it does not here — the
+    // canvas is main-thread and captures directly — but the fallback must still
+    // be fed if it ever wins).
+    if (window.NetplayHost) NetplayHost.pumpMirror();
     var w = Module._gpx_width(), h = Module._gpx_height();
     if (!w || !h) return;
     resizeCanvas(w, h);
@@ -818,6 +868,80 @@
     $('mobileSplashStart').addEventListener('pointerdown', function (e) { e.preventDefault(); if (!wasmReady) return; startFromList(); });
     setStatus('Loading core…');
   }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ONLINE CO-OP — THE HOST HALF, AND NOTHING ELSE.
+  //
+  // THE MODEL: ONE INSTANCE RUNS THE GAME. This page's emulator is the only
+  // emulator. It streams its picture and its sound over WebRTC and the guest
+  // sends controller state back, which lands in port B above.
+  //
+  // THE LOBBY IS NOT HERE. It is genesis_multiplayer.html, because a GUEST needs
+  // no core and no ROM, and pairing on this page would mean both players load an
+  // emulator to have one of them watch a video. So the party forms there and
+  // only the HOST is sent back here carrying ?np=<code>&game=<label>. The button
+  // below is a link to that page, not a lobby.
+  // ═══════════════════════════════════════════════════════════════════════════
+  (function wireNetplay() {
+    if (!window.NetplayHost || !NetplayHost.supported()) return;
+    var go = function () {
+      var sel = isMobile ? $('mobileRomSelect') : $('romSelect');
+      var pick = ROMS[+(sel && sel.value) || 0] || ROMS[0];
+      location.href = NetplayHost.lobbyUrl('/genesis_multiplayer.html', pick.label);
+    };
+    ['btnNet', 'mobileSplashNet'].forEach(function (id) {
+      var b = $(id); if (!b) return;
+      b.hidden = false;
+      b.addEventListener('click', go);
+    });
+    NetplayHost.arm({
+      seam: '__genNet',
+      players: 'p2',
+      log: function (m) { if (window.console) console.log(m); },
+      canvas: function () { return $('canvas'); },
+      // "Is there a game to stream?" answered by FRAMES, not by a start flag: a
+      // start flag is set the instant Start is pressed, long before the core
+      // exists, and capturing then would publish a black canvas.
+      live: function () { return window.__genFrames > 0; },
+      coreUp: function () { return !!(window.Module && Module._gpx_set_pad && wasmReady); },
+      // The game is named by its LABEL, never by its index into ROMS. CLAUDE.md
+      // records an index going stale exactly this way.
+      selectGame: function (label) {
+        for (var i = 0; i < ROMS.length; i++) {
+          if (ROMS[i].label !== label) continue;
+          ['romSelect', 'mobileRomSelect'].forEach(function (id) {
+            var s = $(id); if (!s) return;
+            s.value = String(i);
+            s.dispatchEvent(new Event('change'));
+          });
+          return label;
+        }
+        return null;
+      },
+      // ⚠ NEVER override a Start the capability layer is holding down: that
+      // button being disabled means the page has decided this device cannot run
+      // the emulator, and clicking past it is the exact bug the gate exists to
+      // stop. The core is also not loaded yet when this runs, so it polls for
+      // wasmReady rather than assuming a duration — and gives up rather than
+      // spinning forever if the gate never releases.
+      pressStart: function () {
+        var tries = 0;
+        var attempt = function () {
+          if (!wasmReady) return false;
+          var b = isMobile ? $('mobileSplashStart') : $('btnStart');
+          if (!b || b.disabled || b.getAttribute('aria-disabled') === 'true') return false;
+          if (isMobile) $('mobileSplash').style.display = 'none';
+          startFromList();
+          return true;
+        };
+        if (attempt()) return;
+        var iv = setInterval(function () {
+          if (attempt() || ++tries > 480) clearInterval(iv);   // 480 x 250 ms = 2 min
+        }, 250);
+      },
+      onStatus: function (e) { if (e.state === 'connected') setStatus('Player 2 connected (controller port B).'); },
+    });
+  })();
 
   // ── load the core ─────────────────────────────────────────────────────────
   resizeCanvas(320, 224);

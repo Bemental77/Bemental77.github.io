@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>Genesis — Play Online</title>
+<!--
+  genesis_multiplayer.html — THE PARTY, AND PLAYER 2'S WHOLE MACHINE.
+
+  ONE browser runs an emulator: the host boots the cartridge, captures its canvas
+  and audio and streams both over WebRTC; the guest sends controller state back
+  and the host drops it into CONTROLLER PORT B. So the guest needs no core, no
+  ROM and no WebAssembly — a <video> and a pad.
+
+  ⚠ THIS IS A REAL SECOND CONTROLLER, and this console is the cleanest case on
+  the site. Genesis Plus GX is a two-port machine and the shim already exposes
+  every port: `void gpx_set_pad(unsigned port, int mask)` writes `pad[port]` for
+  port < GPX_PORTS (= 8) — genesis/genesisWasm/source/gpgx_shim.c:58-59, :369-374
+  — and serves those masks to the core through input_state_cb (gpgx_shim.c:
+  251-264). Genesis Plus GX's own config_default() sets input.system[0] and
+  input.system[1] to SYSTEM_GAMEPAD and the shim never calls
+  retro_set_controller_port_device, so BOTH Mega Drive ports are gamepads at boot
+  and `gpx_set_pad(1, mask)` IS player 2. genesis.html simply only ever wrote
+  port 0. Nothing was rebuilt to make this work.
+
+  WHAT EACH SIDE DOES
+    HOST  picks a game, is given a code, and is handed to
+          genesis.html?np=<code>&game=<label>, which selects the ROM, presses its
+          own Start, and hosts under THAT EXACT CODE. No session is opened here
+          for a host: navigating away would tear down the RTCPeerConnection and
+          leave a paired guest holding a code that leads nowhere.
+    GUEST stays here. lib/netplay.js's guest retries 'peer-unavailable' rather
+          than failing, so joining before the host has finished loading is the
+          normal case, not a race.
+
+  NO coi-serviceworker.js ON PURPOSE — genesis.html itself deliberately loads
+  none (it is a single-threaded link that never touches SharedArrayBuffer), and
+  this page needs even less.
+-->
+<script src="/lib/netplay.js"></script>
+<script src="/lib/netplay-ui.js"></script>
+<script src="/lib/netplay-guest.js"></script>
+<style>
+  /* Only this console's own controls — the shell's CSS is in lib/netplay-guest.js.
+     A six-button Genesis pad is two rows of three, which is what a real 6-button
+     controller looks like and what the muscle memory expects. */
+  #face { width: 210px; height: 128px; }
+  .tb.gen { width: 62px; height: 56px; font-size: 16px; border-radius: 28px / 26px; }
+  #tX { left: 0;   top: 0; }
+  #tY { left: 72px; top: 0; }
+  #tZ { left: 144px; top: 0; }
+  #tA { left: 0;   top: 68px; }
+  #tB { left: 72px; top: 68px; }
+  #tC { left: 144px; top: 68px; }
+  #tStart { position: absolute; left: 50%; margin-left: 4px;   bottom: max(18px, env(safe-area-inset-bottom)); width: 86px; height: 40px; }
+  #tMode  { position: absolute; left: 50%; margin-left: -94px; bottom: max(18px, env(safe-area-inset-bottom)); width: 86px; height: 40px; }
+</style>
+</head>
+<body>
+<script>
+'use strict';
+(function () {
+  // ===========================================================================
+  // PLAYER 2'S CONTROLLER
+  //
+  // ⚠ WIRE FORMAT SHARED WITH genesis.html — do not drift. lib/netplay.js's
+  // sendPad carries ONE int32, and the bits below are raw libretro
+  // RETRO_DEVICE_ID_JOYPAD ids — byte for byte the same table genesis.html's own
+  // `BIT` uses for port 0 (genesis.html:288-289), which is what
+  // `_gpx_set_pad(port, mask)` expects for ANY port. So the host does not
+  // translate: it forwards this mask to port 1.
+  //
+  // ⚠ THE A/B/C MAPPING IS NOT THE OBVIOUS ONE. Mega Drive A is RETRO_Y (bit 1),
+  // B is RETRO_B (bit 0) and C is RETRO_A (bit 8) — see Genesis Plus GX's
+  // osd_input_update_internal_bitmasks. Getting this "tidy" would silently swap
+  // two buttons on every game.
+  // ===========================================================================
+  const B = { b: 0, a: 1, mode: 2, start: 3, up: 4, down: 5, left: 6, right: 7,
+              c: 8, y: 9, x: 10, z: 11 };
+  // Keyboard, identical to genesis.html's own map (its #keyHelp line states it):
+  // d-pad on the arrows, a/s/d = A/B/C, q/w/e = X/Y/Z, Enter Start, Shift Mode.
+  const KEYMAP = {
+    [B.up]: ['arrowup'], [B.down]: ['arrowdown'], [B.left]: ['arrowleft'], [B.right]: ['arrowright'],
+    [B.a]: ['a'], [B.b]: ['s'], [B.c]: ['d'],
+    [B.x]: ['q'], [B.y]: ['w'], [B.z]: ['e'],
+    [B.start]: ['enter'], [B.mode]: ['shift'],
+  };
+  const MAPPED = new Set(Object.values(KEYMAP).flat());
+  // Standard-mapping gamepad index -> Genesis button, the same table
+  // genesis.html's GP_BTN uses, so a physical pad behaves identically on both
+  // sides of the wire.
+  const GP = [B.a, B.b, B.x, B.y, B.c, B.z, -1, -1, B.mode, B.start, -1, -1,
+              B.up, B.down, B.left, B.right];
+
+  const held = new Set();
+  const touched = new Set();
+  const stick = { x: 0, y: 0 };
+  const norm = (e) => String(e.key || '').toLowerCase();
+
+  function packMask() {
+    let m = 0;
+    for (const idStr of Object.keys(KEYMAP)) {
+      if (KEYMAP[idStr].some((k) => held.has(k))) m |= (1 << (+idStr));
+    }
+    touched.forEach((id) => { m |= (1 << id); });
+
+    // The disc is analog on THIS side because a threshold is what makes
+    // diagonals reachable with a thumb; it leaves as d-pad bits because that is
+    // all a Mega Drive pad has.
+    let ax = stick.x, ay = stick.y;
+    const pads = (navigator.getGamepads && navigator.getGamepads()) || [];
+    for (let p = 0; p < pads.length; p++) {
+      const gp = pads[p]; if (!gp) continue;
+      const btns = gp.buttons || [];
+      for (let i = 0; i < btns.length && i < GP.length; i++) {
+        if (btns[i] && btns[i].pressed && GP[i] >= 0) m |= (1 << GP[i]);
+      }
+      const a = gp.axes || [], dz = 0.3;
+      if (!ax && !ay && a.length >= 2) {
+        ax = Math.abs(a[0]) > dz ? a[0] : 0;
+        ay = Math.abs(a[1]) > dz ? a[1] : 0;
+      }
+      break;      // one remote player, one pad
+    }
+    if (ax > 0.4) m |= (1 << B.right);
+    if (ax < -0.4) m |= (1 << B.left);
+    if (ay > 0.4) m |= (1 << B.down);
+    if (ay < -0.4) m |= (1 << B.up);
+    // int16_t on the far side (gpgx_shim.c:371 casts the mask) — bits above 15
+    // would be truncated silently, so nothing above 11 is ever set.
+    return m & 0xffff;
+  }
+
+  // ---- the ROM list is a COPY, and the test is what keeps it honest ---------
+  // lib/netplay.js refuses a pairing whose game names differ, so both sides must
+  // name the same key, and the key is the ROM's LABEL STRING — never its index.
+  // CLAUDE.md records an index going stale exactly this way. Fetching
+  // genesis.html to read its ROMS[] would undo the point of this page, so the
+  // list is copied and tools/mp_page_test.mjs compares the two and FAILS on drift.
+  const GAMES = [
+    { value: 'Sonic the Hedgehog 3', label: 'Sonic the Hedgehog 3' },
+    { value: 'X-Men',                label: 'X-Men' },
+  ];
+
+  NetplayGuest.mount({
+    seam: '__genmp',
+    title: 'Genesis — Play Online',
+    lede: 'One player loads the game; everyone else just watches and plays. '
+        + 'Player 2 needs no ROM and no download — pick <b>Join</b> on the device you want to play on.',
+    games: GAMES,
+    defaultGame: 'Sonic the Hedgehog 3',
+    hostPage: '/genesis.html',
+    aspect: '4 / 3',
+    players: 'p2',
+    connectedMsg: 'Connected — you are Player 2 (controller port B).',
+    mapped: MAPPED,
+    packMask,
+    onKeyDown: (e) => held.add(norm(e)),
+    // Release is NEVER filtered: a key that went down while the lobby's code
+    // field had focus must still come up, or it stays held on the host's port B
+    // forever — a stuck button on somebody else's machine.
+    onKeyUp: (e) => held.delete(norm(e)),
+    onBlur: () => { held.clear(); touched.clear(); stick.x = stick.y = 0; },
+    padHtml:
+      '<div id="disc"><div id="nub"></div></div>' +
+      '<div id="face">' +
+        '<div class="tb gen" id="tX">X</div><div class="tb gen" id="tY">Y</div><div class="tb gen" id="tZ">Z</div>' +
+        '<div class="tb gen" id="tA">A</div><div class="tb gen" id="tB">B</div><div class="tb gen" id="tC">C</div>' +
+      '</div>' +
+      '<div class="tb sq" id="tMode">Mode</div><div class="tb sq" id="tStart">Start</div>',
+    wirePad({ holdButton, wireDisc, $ }) {
+      const b = (id, bit) => holdButton($(id), () => touched.add(bit), () => touched.delete(bit));
+      b('tA', B.a); b('tB', B.b); b('tC', B.c);
+      b('tX', B.x); b('tY', B.y); b('tZ', B.z);
+      b('tStart', B.start); b('tMode', B.mode);
+      wireDisc($('disc'), $('nub'), (x, y) => { stick.x = x; stick.y = y; });
+    },
+  });
+})();
+</script>
+</body>
+</html>
