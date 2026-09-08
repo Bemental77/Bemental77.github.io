@@ -142,6 +142,7 @@ case "${1:-audit}" in
   {
     echo "$BEGIN_MARK"
     echo "# Regenerate with: bash dreamcast/tools/verify_core_tree.sh --sync-gitignore"
+    echo "# upstream-base: $(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "# Every path below differs from upstream flycast and MUST stay in git —"
     echo "# see dreamcast/docs/core-relink-broken/TASKS.md for what happens when one doesn't."
     drift_set | sort -u | while read -r p; do echo "!$REL/$p"; done
@@ -231,6 +232,25 @@ else
 fi
 
 echo "verify_core_tree: $n_tracked tracked ported files under $REL"
+
+# C5: the upstream BASE must not have moved. C1 asks "is this file identical to
+# upstream?" — if someone `git pull`s flycast inside the nested checkout, that
+# question silently starts meaning something else, and a file could read as
+# still-ported while actually being upstream's newer version of itself.
+if [ -e "$SRC/.git" ]; then
+  base_live=$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo unknown)
+  base_rec=$(sed -n 's/^# upstream-base: //p' "$GITIGNORE" | head -1)
+  if [ -n "$base_rec" ] && [ "$base_rec" != "$base_live" ]; then
+    red ""
+    red " UPSTREAM BASE MOVED — recorded $base_rec, checkout is at $base_live."
+    red " Every C1 verdict above compares against the NEW upstream, so 'still"
+    red " ported' no longer means what it did. Re-verify the port set against"
+    red " the new base, then: bash dreamcast/tools/verify_core_tree.sh --sync-gitignore"
+    fail=1
+  else
+    echo "verify_core_tree: upstream base ${base_live} (recorded: ${base_rec:-none})"
+  fi
+fi
 
 if [ "$n_uncom" -gt 0 ]; then
   echo "verify_core_tree: $n_uncom tracked file(s) differ from outer HEAD (in-progress work, not an error):"

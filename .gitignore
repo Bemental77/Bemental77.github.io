@@ -84,6 +84,7 @@ dreamcast/flycast-src/core/deps/*/
 dreamcast/flycast-src/core/deps/DreamPicoPort-API/ext/
 # >>> flycast-src ported files — managed by dreamcast/tools/verify_core_tree.sh (do not hand-edit) >>>
 # Regenerate with: bash dreamcast/tools/verify_core_tree.sh --sync-gitignore
+# upstream-base: 4be8a484665fb5684ccb780ed2165018a679c622
 # Every path below differs from upstream flycast and MUST stay in git —
 # see dreamcast/docs/core-relink-broken/TASKS.md for what happens when one doesn't.
 !dreamcast/flycast-src/CMakeLists.txt

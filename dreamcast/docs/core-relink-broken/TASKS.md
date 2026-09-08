@@ -103,6 +103,7 @@ checkout sits on, no patch tooling anywhere in the path:
 | C2 MISSING | a tracked ported file is not on disk | FAIL |
 | C3 UNRECORDED | a file differs from upstream but the repo does not track it — the next silent-reversion victim | FAIL |
 | C4 | a tracked file differs from outer HEAD — ordinary in-progress work | reported, never fails |
+| C5 UPSTREAM BASE MOVED | the nested checkout is no longer on the commit the port set was recorded against, so every C1 verdict silently changed meaning | FAIL |
 
 Demonstrated firing 2026-09-07: `git -C dreamcast/flycast-src checkout HEAD --
 core/emulator.cpp` (the exact shape of the incident) dropped
@@ -118,7 +119,10 @@ core/emulator.cpp` (the exact shape of the incident) dropped
   audit went back to PASS.
 
 C3 was demonstrated separately by appending a line to the untracked
-`core/hw/aica/aica.cpp`: **UNRECORDED PORT EDITS (1)**, exit 1.
+`core/hw/aica/aica.cpp`: **UNRECORDED PORT EDITS (1)**, exit 1. C5 was
+demonstrated by falsifying the recorded base: **UPSTREAM BASE MOVED**, exit 1.
+The base is pinned in `.gitignore`'s managed block as
+`# upstream-base: 4be8a484665fb5684ccb780ed2165018a679c622`.
 
 ⚠ **`patch --dry-run` is still forbidden as a check**, for the reasons below,
 and the patch series is INCOMPLETE besides — it covers 23 of the 33 flycast
