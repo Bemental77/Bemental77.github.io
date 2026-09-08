@@ -31,6 +31,25 @@ if [ ! -f "$MAIN_AR" ]; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Drift gate. dreamcast/flycast-src is gitignored except its PORTED files, which
+# are tracked in place (.gitignore) and audited here. On 2026-09-07 eight of
+# them silently reverted to pristine upstream Flycast and every relink from then
+# on produced a worker that died at boot with a bare `CppException` — invisible
+# until someone relinked, and un-bisectable because the broken tree was not in
+# git. This script is one of the two places that can turn a drifted tree into a
+# shipped binary, so it refuses. dreamcast/docs/core-relink-broken/TASKS.md
+# ---------------------------------------------------------------------------
+if [ "${DC_CORE_AUDIT:-on}" = "off" ]; then
+  echo "############################################################################"
+  echo "### DC_CORE_AUDIT=off — flycast-src drift gate SKIPPED. The .wasm this   ###"
+  echo "### link produces is UNVERIFIED against the recorded port set.           ###"
+  echo "############################################################################"
+elif ! bash "$ROOT/dreamcast/tools/verify_core_tree.sh"; then
+  echo "ERROR: flycast-src has drifted — refusing to link. See the audit above." >&2
+  exit 1
+fi
+
 mkdir -p "$OUT"
 
 # ---------------------------------------------------------------------------

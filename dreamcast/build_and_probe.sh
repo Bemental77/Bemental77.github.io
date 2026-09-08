@@ -231,6 +231,31 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"  # repo root, derived — no hardcode
 LINK_SCRIPT=$ROOT/dreamcast/flycast-bridge/flycast_worker_link.sh
 PROBE_JS=$ROOT/dreamcast/tools/flycast_probe.js
 
+# ---- drift gate: dreamcast/flycast-src is ignored EXCEPT its ported files ----
+# 2026-09-07: eight ported core files silently reverted to pristine upstream
+# Flycast. The tree was gitignored wholesale, so nothing recorded the loss and
+# no commit bisect could find it — the broken tree was not in git. Every relink
+# after that produced a worker that died at boot with a bare `CppException`,
+# and the damage was invisible until someone relinked, because the shipped
+# .wasm predated the drift. dreamcast/docs/core-relink-broken/TASKS.md
+#
+# This runs BEFORE the archive build so a drifted tree cannot even compile,
+# let alone silently ship. It is a blob-hash comparison against the upstream
+# commit the nested flycast checkout sits on — NOT `patch --dry-run`, which
+# lied about this tree in both directions.
+if [ "${DC_CORE_AUDIT:-on}" = "off" ]; then
+  echo "############################################################################"
+  echo "### DC_CORE_AUDIT=off — flycast-src drift gate SKIPPED.                  ###"
+  echo "### A reverted core file will NOT be caught. Any binary produced by this ###"
+  echo "### run is unverified. Use --sync-gitignore instead; 'off' is not a fix. ###"
+  echo "############################################################################"
+else
+  if ! bash "$ROOT/dreamcast/tools/verify_core_tree.sh"; then
+    echo "FATAL: flycast-src drift gate FAILED — refusing to build/link a drifted core."
+    exit 1
+  fi
+fi
+
 # ---- rebuild the static archives the link consumes ----
 # The link script (flycast_worker_link.sh:218-221) only re-compiles the BRIDGE TUs
 # — EmscriptenWorker.cpp, flycast_stubs.cpp, rec_wasm.cpp, arm7_rec_wasm.cpp.

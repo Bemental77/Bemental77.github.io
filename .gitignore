@@ -56,8 +56,69 @@ dreamcast/bios/
 dreamcast/oracle/
 # Game images (.gdi/.cdi/.chd/.iso/.bin/.cue/.nrg)
 dreamcast/roms/
-# Flycast source tree (large internal build input — not deployed)
-dreamcast/flycast-src/
+# Flycast source tree (large internal build input — not deployed).
+#
+# ⚠ EXCEPTION, AND IT IS LOAD-BEARING. This tree used to be ignored WHOLESALE.
+# On 2026-09-07 eight files silently reverted to pristine upstream Flycast;
+# nothing recorded the loss and no commit bisect could find it, because the
+# broken tree was not in git. Recovery needed a sibling checkout on another
+# disk. Two of the lost edits killed the boot outright and one compiled out the
+# entire ARM7 dynarec. Write-up: dreamcast/docs/core-relink-broken/TASKS.md
+#
+# So: everything here stays ignored EXCEPT the files this project has actually
+# ported, which are tracked IN PLACE by the managed block below. A reversion is
+# now an ordinary `git diff`, and `dreamcast/tools/verify_core_tree.sh` refuses
+# to build or link a drifted tree.
+#
+# Regenerate the managed block after adding a ported file:
+#   bash dreamcast/tools/verify_core_tree.sh --sync-gitignore
+dreamcast/flycast-src/**
+!dreamcast/flycast-src/**/
+# …but do not WALK the parts that can never hold a ported file: the local CMake
+# build dirs and the 16,679-file third-party dependency tree. Only
+# DreamPicoPort-API is re-admitted — it carries one ported #include.
+dreamcast/flycast-src/build-*/
+dreamcast/flycast-src/core/deps/*/
+!dreamcast/flycast-src/core/deps/DreamPicoPort-API/
+# >>> flycast-src ported files — managed by dreamcast/tools/verify_core_tree.sh (do not hand-edit) >>>
+# Regenerate with: bash dreamcast/tools/verify_core_tree.sh --sync-gitignore
+# Every path below differs from upstream flycast and MUST stay in git —
+# see dreamcast/docs/core-relink-broken/TASKS.md for what happens when one doesn't.
+!dreamcast/flycast-src/CMakeLists.txt
+!dreamcast/flycast-src/core/build.h
+!dreamcast/flycast-src/core/deps/DreamPicoPort-API/src/DppDeviceImp.hpp
+!dreamcast/flycast-src/core/emulator.cpp
+!dreamcast/flycast-src/core/hw/aica/sgc_if.cpp
+!dreamcast/flycast-src/core/hw/arm7/arm7_rec.cpp
+!dreamcast/flycast-src/core/hw/flashrom/nvmem.cpp
+!dreamcast/flycast-src/core/hw/gdrom/gdromv3.cpp
+!dreamcast/flycast-src/core/hw/holly/holly_intc.cpp
+!dreamcast/flycast-src/core/hw/maple/maple_cfg.cpp
+!dreamcast/flycast-src/core/hw/maple/maple_devs.cpp
+!dreamcast/flycast-src/core/hw/maple/maple_if.cpp
+!dreamcast/flycast-src/core/hw/pvr/spg.cpp
+!dreamcast/flycast-src/core/hw/sh4/dyna/blockmanager.cpp
+!dreamcast/flycast-src/core/hw/sh4/dyna/driver.cpp
+!dreamcast/flycast-src/core/hw/sh4/dyna/shil_canonical.h
+!dreamcast/flycast-src/core/hw/sh4/dyna/ssa.cpp
+!dreamcast/flycast-src/core/hw/sh4/interpr/sh4_interpreter.cpp
+!dreamcast/flycast-src/core/hw/sh4/sh4_core_regs.cpp
+!dreamcast/flycast-src/core/hw/sh4/sh4_interrupts.cpp
+!dreamcast/flycast-src/core/hw/sh4/sh4_mem.cpp
+!dreamcast/flycast-src/core/hw/sh4/sh4_mmr.cpp
+!dreamcast/flycast-src/core/hw/sh4/sh4_sched.cpp
+!dreamcast/flycast-src/core/linux/context.cpp
+!dreamcast/flycast-src/core/linux/posix_vmem.cpp
+!dreamcast/flycast-src/core/oslib/virtmem.h
+!dreamcast/flycast-src/core/reios/reios.cpp
+!dreamcast/flycast-src/core/rend/gles/gles.cpp
+!dreamcast/flycast-src/core/rend/gles/gles.h
+!dreamcast/flycast-src/core/rend/gles/gltex.cpp
+!dreamcast/flycast-src/core/rend/TexCache.cpp
+!dreamcast/flycast-src/core/rend/TexCache.h
+!dreamcast/flycast-src/shell/cmake/DetectArchitecture.cmake
+!dreamcast/flycast-src/shell/libretro/libretro.cpp
+# <<< flycast-src ported files — managed block ends <<<
 # Flycast / sh4-worker local CMake build dirs (build-wasm/, build-host-test/, etc.)
 dreamcast/**/build-*/
 
