@@ -1693,6 +1693,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void sh4_import_fnptrs(uint32_t* out) {
 
 // Lever-4: full IC invalidate, defined in rec_wasm.cpp (no-op while disarmed).
 extern "C" void flycast_ic_invalidate(void);
+extern "C" void flycast_lockstep_reset(void);
 extern "C" void flycast_set_ic(int on);
 // Lever-5B sizing instrument (defined in rec_wasm.cpp; read via ctxsnap 81).
 extern "C" { extern volatile uint32_t g_syncsr_count; }
@@ -1834,6 +1835,14 @@ int emscripten_load_state(const uint8_t* buf, size_t size) {
     // inline-cache entry. The stale block-table sums are handled per-lookup
     // by ram_code_sum as before.
     flycast_ic_invalidate();
+    // LOCKSTEP DETERMINISM (2026-09-08): flush the JIT so every peer resumes
+    // from an IDENTICAL block table. retro_unserialize does not reset the
+    // cache, so an instance with history keeps compiled blocks a fresh one
+    // lacks and routes the same guest code down a different path (compiled vs
+    // span-interpreted) — and the two routes charge different guest cycles.
+    // flycast_ic_invalidate() above does NOT cover this: it is a no-op while
+    // g_ic_generation == 0, and it never touches the block table.
+    if (ok) flycast_lockstep_reset();
     return ok;
 }
 

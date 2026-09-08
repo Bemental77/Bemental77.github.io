@@ -801,6 +801,25 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_shard(int on) {
 }
 // Lever-11 v0: frame-wait-spin slice burn toggle (?idleskip=1).
 extern "C" { extern volatile uint32_t g_idleskip; }
+// ---- LOCKSTEP DETERMINISM: flush the JIT so peers start identical ---------
+// Routing (compiled vs span-interpreted) must be a pure function of GUEST
+// execution, but the block table and the seal phase are process-lifetime host
+// state that no savestate carries. retro_unserialize does NOT reset the cache
+// (it only does emu.stop/loadstate/start — libretro.cpp), so a peer that has
+// been running holds compiled blocks a fresh peer lacks, and routes the same
+// guest code differently. bm_ResetCache() drives our reset() override above,
+// which now clears the block shadow AND anchors the seal baseline.
+//
+// This changes NO cycle accounting, which is the whole point: the reverted
+// 5d81938a tried to make the two routes cost the same and paid for it out of
+// the interpreter's 8x underclock, which cost Gauntlet its cold boot
+// (0.99883x/1889 presents -> 0.21399x/0 presents). Making the ROUTE
+// deterministic instead has no guest-rate exposure by construction.
+void bm_ResetCache();
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_lockstep_reset(void) {
+    bm_ResetCache();
+}
+
 extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_idleskip(int on) {
     g_idleskip = !!on;
 }
@@ -2376,7 +2395,32 @@ public:
 		s_pending_vaddrs.clear();
 		s_pending_len.clear();
 		s_unreg_len.clear();
-		s_dispatches_at_last_seal = 0;
+		// ---- LOCKSTEP DETERMINISM (2026-09-08) ----------------------------
+		// WAS: s_dispatches_at_last_seal = 0. That is the seal-phase
+		// ASYMMETRY. s_dispatch_count (:691) is a process-lifetime counter
+		// reset NOWHERE, so zeroing only the baseline makes the fallback seal
+		// test at :2125
+		//     s_dispatch_count - s_dispatches_at_last_seal >= SHARD_DISPATCH_SEAL
+		// INSTANTLY TRUE in an instance with history (it seals a shard of one
+		// on the very next compiled block) and FALSE in a fresh one (which
+		// accumulates up to SHARD_BLOCK_CAP first). Two peers restoring
+		// identical bytes therefore route the same block down different paths
+		// — one compiled, one span-interpreted — and the two routes charge
+		// different guest cycles. Anchoring the baseline to the live counter
+		// makes the delta start at 0 in BOTH, so the seal schedule is a pure
+		// function of guest execution.
+		s_dispatches_at_last_seal = s_dispatch_count;
+		// And drop the block shadow, so a peer with history and a fresh peer
+		// begin with the SAME (empty) block table and compile in the same
+		// guest order. Safe here specifically because flycast's bm_reset ran
+		// immediately before us and set EVERY fpcb entry to
+		// ngen_FailedToFindBlock (addrspace.cpp:350-355 via the
+		// bm_vmem_pagefill branch — verified 2026-08-28 in the note above), so
+		// no address is claimed and a recompile of any vaddr now passes
+		// bm_AddBlock's verify. This is what makes ROUTING deterministic
+		// without repricing either route — no cycle accounting is touched, so
+		// unlike the reverted 5d81938a it carries no guest-rate risk.
+		jit_clear();
 		// Lever-4: the block table survives (above), but flycast just reset
 		// its code buffer — conservatively invalidate every IC entry; the
 		// C-probe path refills them against the relinked state.
