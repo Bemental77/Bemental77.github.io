@@ -77,8 +77,19 @@
 // `flycast_worker.js`, `dreamcast.html` and `lib/netplay.js` are untouched.
 //
 // USAGE
-//   node tools/browser_leak_guard.js reap && uptime    # gate, CLAUDE.md
-//   npm run web                                        # port 8080, gate #2
+//   npm run web                                        # port 8080, CLAUDE.md gate #2
+//
+//   THE STANDING GATE — run this after ANY change to Emulator::start(),
+//   retro_unserialize, or the lockstep-normalize path:
+//
+//       bash tools/probe_lock.sh run -- node dreamcast/tools/determinism_probe.mjs --gate
+//
+//   It prints one line: GATE: PASS or GATE: FAIL. It is the only instrument that
+//   can catch a regression in the state that carries lockstep divergence, because
+//   that state is NOT serialized — a one-sided normalize changes 0 of 27,785,287
+//   bytes, so no diff can see the cause. Behaviour is the only witness.
+//
+//   node tools/browser_leak_guard.js reap && uptime    # before any measured run
 //   node dreamcast/tools/determinism_probe.mjs --makestate --name mk   # once
 //   node dreamcast/tools/determinism_probe.mjs --state /tmp/dc-det/gauntlet.state \
 //        --frames 1800 --every 60 --runs 3 --name cross
@@ -141,19 +152,39 @@ const argv = process.argv.slice(2);
 const arg = (n, d) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : d; };
 const has = (n) => argv.includes(n);
 
+// ---------------------------------------------------------------------------
+// --gate : THE STANDING BEHAVIOURAL GATE. One command, no flags to remember.
+//
+//     node dreamcast/tools/determinism_probe.mjs --gate
+//
+// RUN THIS AFTER ANY CHANGE TO Emulator::start() / retro_unserialize / the
+// lockstep-normalize path. It is the ONLY thing that can catch a regression in
+// them, because the state that carries the divergence is NOT in the serialized
+// set: a one-sided normalize changes ZERO of 27,785,287 bytes, so no diff-based
+// instrument — this rig's included — can see the cause. Only behaviour shows it.
+//
+// It expands to --frame0 --normalize --arms cross --warmup 0 (the shipping
+// configuration: no savestate, no reset, pump held off before any frame), uses a
+// FRESH Chrome profile every time (a stale profile serves a torn wasm/js pair
+// after a relink and produces a 600 s boot timeout that looks like a core fault),
+// and prints one unambiguous GATE: PASS / GATE: FAIL line.
+// ---------------------------------------------------------------------------
+const GATE = has('--gate');
+
 const GAME      = arg('--game', 'gauntlet');
-const NAME      = arg('--name', 'det');
+const NAME      = arg('--name', GATE ? 'gate' : 'det');
 const URLBASE   = arg('--url', 'http://localhost:8080');
-const PROFILE   = arg('--profile', '/private/tmp/claude-501/dc-det-profile');
+const PROFILE   = arg('--profile', GATE ? '/private/tmp/claude-501/dc-det-gate-' + process.pid
+                                       : '/private/tmp/claude-501/dc-det-profile');
 const MAKESTATE = has('--makestate');
 const STATEPATH = arg('--state', '/tmp/dc-det/' + GAME + '.state');
 const FRAMES    = parseInt(arg('--frames', '1800'), 10);
 const EVERY     = parseInt(arg('--every', '60'), 10);
 const RUNS      = parseInt(arg('--runs', '3'), 10);
-const ARMS      = arg('--arms', 'self,cross').split(',').map((s) => s.trim()).filter(Boolean);
+const ARMS      = arg('--arms', GATE ? 'cross' : 'self,cross').split(',').map((s) => s.trim()).filter(Boolean);
 const INPUT     = arg('--input', 'scripted');
 const CHUNK     = parseInt(arg('--chunk', '65536'), 10);
-const WARMUP    = parseInt(arg('--warmup', '1'), 10);
+const WARMUP    = parseInt(arg('--warmup', GATE ? '0' : '1'), 10);
 const TWOBROW   = has('--twobrowsers');
 const HEADFUL   = has('--headful');
 const KEEP      = has('--keep');
@@ -181,7 +212,7 @@ const COLDBOOT  = has('--coldboot');
 // from frame 0 through the same boot. Alignment is not assumed -- the anchor gate
 // reports guest cycles as well as the state hash, so "the two boots differ" can be
 // told apart from "the rig started them at different instants".
-const FRAME0    = has('--frame0');
+const FRAME0    = has('--frame0') || GATE;
 // --equalize: THE DISCRIMINATING EXPERIMENT. In a frame-0/cold arm the two
 // machines are not identical at the anchor (a host-clock byte survives). This
 // pulls instance A's anchor state and pushes it into BOTH for every run, so the
@@ -197,7 +228,7 @@ const LSRESET   = has('--lockstepreset');
 // immediately load its OWN bytes back. The state is unchanged by construction; the
 // point is the emu.stop()/loadstate/emu.start() side effect. This isolates the
 // subsystem restart from the state transfer, which --equalize cannot do.
-const NORMALIZE = has('--normalize');
+const NORMALIZE = has('--normalize') || GATE;
 // --normalizeone: normalize instance A ONLY, at an anchor where the two states are
 // already byte-identical. Whatever then differs IS the hidden derived state that
 // emu.start() rebuilds -- made visible by the very operation that fixes it. Pair
@@ -222,6 +253,9 @@ const SKEW      = parseInt(arg('--skew', '0'), 10);
 // are plugged, and so a 2-vs-4 port comparison is one flag away.
 
 const OUT = '/tmp/dc-det';
+// A gate that fails for a stale-profile reason is worse than no gate: it cries
+// wolf and gets ignored. Always start it from a clean profile.
+if (GATE) { try { fs.rmSync(PROFILE, { recursive: true, force: true }); } catch (_) {} }
 fs.mkdirSync(OUT, { recursive: true });
 const LOG = path.join(OUT, NAME + '.log');
 const out = fs.createWriteStream(LOG, { flags: 'w' });
@@ -1029,6 +1063,20 @@ try {
     say(`VERDICT ${a}: ${t.identical}/${t.runs - t.rigFaults} runs byte-identical over ${FRAMES} frames` +
         (t.rigFaults ? ` (+${t.rigFaults} rig faults)` : '') +
         `; first-divergence frames: ${JSON.stringify(t.divergeFrames)}; watchdog fires: ${t.watchdogTotal}`);
+  }
+  if (GATE) {
+    const t = report.verdict.cross || { runs: 0, rigFaults: 0, identical: 0 };
+    const clean = report.wasmBefore === wasmHash();
+    const pass = t.identical === t.runs && t.runs > 0 && t.rigFaults === 0 && clean;
+    say('');
+    say(`GATE: ${pass ? 'PASS' : 'FAIL'} — cross ${t.identical}/${t.runs} runs byte-identical over ` +
+        `${FRAMES} frames from frame 0${clean ? '' : ' (⚠ WASM CHANGED MID-RUN — result is void, re-run)'}`);
+    if (!pass && clean)
+      say('GATE: a FAIL means two peers booting the same disc no longer stay in lockstep. ' +
+          'The likely cause is a change to Emulator::start(), retro_unserialize, or the ' +
+          'lockstep-normalize path. No state diff will localize it — the carrier is not in ' +
+          'the serialized set. Bisect by behaviour.');
+    report.gate = { pass, identical: t.identical, runs: t.runs, hashStable: clean };
   }
   await finish(0);
 } catch (err) {
