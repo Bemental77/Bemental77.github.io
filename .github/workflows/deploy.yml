@@ -40,7 +40,60 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # IS THERE ANYTHING TO DEPLOY? Measured on run 34241436456, one deploy of this
+  # repo costs: checkout 199 s, stage 74 s, upload 328 s, deploy 217 s = 821 s
+  # for a ~9.9 GB artifact. Two of the six commits before this change touched
+  # ONLY tools/, which has never been part of the artifact — those runs uploaded
+  # 9.9 GB to publish nothing, and cancelled each other on the way in (this
+  # workflow's concurrency group has cancel-in-progress).
+  #
+  # The check reads deploy.exclude — the SAME file rsync is handed below as
+  # --exclude-from — so the two can never disagree. A `paths-ignore:` list here
+  # would have been a second copy, and a drifted copy does not over-deploy, it
+  # SILENTLY SKIPS a deploy that was needed. `filter: blob:none` fetches history
+  # without file contents, so this job is cheap on a repo this size.
+  # ---------------------------------------------------------------------------
+  decide:
+    runs-on: ubuntu-latest
+    outputs:
+      deploy: ${{ steps.check.outputs.deploy }}
+    steps:
+      - name: Checkout (blobless, history only)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          lfs: false
+
+      - name: Does this push touch anything the site serves?
+        id: check
+        run: |
+          set -e
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "Not a push (${{ github.event_name }}) — deploying."
+            exit 0
+          fi
+          BEFORE="${{ github.event.before }}"
+          # A new branch, a force-push past what we have, or a first run: the
+          # honest answer is "we do not know what changed", and the safe answer
+          # is to deploy.
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "No usable previous commit ($BEFORE) — deploying."
+            exit 0
+          fi
+          git diff --name-only "$BEFORE" "${{ github.sha }}" > /tmp/changed.txt
+          echo "--- changed files ---"; cat /tmp/changed.txt
+          echo "---------------------"
+          node tools/deploy_should_run.mjs < /tmp/changed.txt | tee /tmp/decision.txt
+          grep -E '^deploy=(true|false)$' /tmp/decision.txt >> "$GITHUB_OUTPUT"
+
   deploy:
+    needs: decide
+    if: needs.decide.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -58,41 +111,12 @@ jobs:
           mkdir -p _deploy
           # Copy only files that need to be served at runtime. Big dev-only paths excluded.
           # Runtime files inside gamecube/dolphin-bridge/ etc. ARE kept (loaded by gamecube.html).
-          rsync -a --delete \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='.claude' \
-            --exclude='_deploy' \
-            --exclude='emsdk' \
-            --exclude='node_modules' \
-            --exclude='*.tsbuildinfo' \
-            --exclude='ps1/ps1Wasm/pcsx-wasm-src' \
-            --exclude='ps1/ps1Wasm/wasmpsx-repo' \
-            --exclude='/bementalJIT' \
-            --exclude='/gamecube/bementalJIT' \
-            --exclude='gamecube/dolphin-src' \
-            --exclude='gamecube/build-*' \
-            --exclude='gamecube/ppc-worker/build-*' \
-            --exclude='gamecube/tools' \
-            --exclude='dolphin_captures/*.log' \
-            --exclude='dolphin_captures/*.txt' \
-            --exclude='research_findings.md' \
-            --exclude='/tools' \
-            --exclude='/build-*' \
-            --exclude='*.iso' \
-            --exclude='*.bin.bak' \
-            --exclude='*.o' \
-            --exclude='*.a' \
-            --exclude='*.tsbuildinfo' \
-            --exclude='Makefile*' \
-            --exclude='handler.js' \
-            --exclude='serverless.yml' \
-            --exclude='send.email.js' \
-            --exclude='send.email.ts' \
-            --exclude='/dreamcast/states/pso2_pioneer2_*' \
-            --exclude='/ps1/duckstation-master' \
-            --exclude='/gamecube/docs' \
-            --exclude='/dreamcast/docs' \
+          # ⚠ ONE LIST, TWO READERS. deploy.exclude is also read by
+          # tools/deploy_should_run.mjs in the decide job above, so "what the
+          # site serves" is defined in exactly one place. Do not re-inline these
+          # patterns here.
+          rsync -a --delete --exclude-from=deploy.exclude \
+            --exclude='/deploy.exclude' \
             ./ _deploy/
           echo "::group::Deploy artifact size + top dirs"
           du -sh _deploy

@@ -1,0 +1,45 @@
+# THE SINGLE SOURCE OF TRUTH FOR "WHAT IS NOT ON THE SITE".
+#
+# rsync reads this with --exclude-from to build the deploy artifact, and
+# tools/deploy_should_run.mjs reads the SAME file to decide whether a push
+# changed anything the site actually serves. Keeping two hand-maintained copies
+# of this list is how a push gets skipped that should have deployed — the exact
+# two-sources-of-truth defect that shipped a phone game picker listing one disc
+# of five. One file, both readers.
+#
+# rsync semantics, unchanged from the inline list this replaces: a pattern with
+# a leading slash is anchored at the deploy root, one without matches ANY path
+# component at any depth.
+.git
+.github
+.claude
+_deploy
+emsdk
+node_modules
+*.tsbuildinfo
+ps1/ps1Wasm/pcsx-wasm-src
+ps1/ps1Wasm/wasmpsx-repo
+/bementalJIT
+/gamecube/bementalJIT
+gamecube/dolphin-src
+gamecube/build-*
+gamecube/ppc-worker/build-*
+gamecube/tools
+dolphin_captures/*.log
+dolphin_captures/*.txt
+research_findings.md
+/tools
+/build-*
+*.iso
+*.bin.bak
+*.o
+*.a
+Makefile*
+handler.js
+serverless.yml
+send.email.js
+send.email.ts
+/dreamcast/states/pso2_pioneer2_*
+/ps1/duckstation-master
+/gamecube/docs
+/dreamcast/docs
