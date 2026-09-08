@@ -101,8 +101,31 @@ jobs:
           # The github-pages environment records the commit that actually
           # deployed, so that is the baseline. It self-heals: a missed deploy is
           # simply still pending next time.
-          LIVE=$(GH_TOKEN="${{ github.token }}" gh api "repos/${{ github.repository }}/deployments?environment=github-pages&per_page=1" \
-                   --jq '.[0].sha' 2>/dev/null || true)
+          # ⚠ AND ONLY A *SUCCESSFUL* ONE. The deployments list records FAILED
+          # and CANCELLED attempts too, so `.[0].sha` is "what we last tried",
+          # not "what is serving" — which would have reintroduced this very bug
+          # silently. Measured on this repo at the time of writing:
+          #   644cb1ac state=in_progress
+          #   5f9feabf state=error
+          #   72ab3cf9 state=error
+          #   778fe23f state=error
+          #   762682c1 state=error      <- the mobile fix the user was waiting on
+          # Walk back until a deployment whose latest status is `success`.
+          LIVE=""
+          for D in $(GH_TOKEN="${{ github.token }}" gh api \
+                     "repos/${{ github.repository }}/deployments?environment=github-pages&per_page=20" \
+                     --jq '.[].id' 2>/dev/null); do
+            ST=$(GH_TOKEN="${{ github.token }}" gh api \
+                 "repos/${{ github.repository }}/deployments/$D/statuses?per_page=1" \
+                 --jq '.[0].state' 2>/dev/null)
+            if [ "$ST" = "success" ]; then
+              LIVE=$(GH_TOKEN="${{ github.token }}" gh api \
+                     "repos/${{ github.repository }}/deployments/$D" --jq '.sha' 2>/dev/null)
+              echo "Last SUCCESSFUL github-pages deployment: $LIVE (deployment $D)"
+              break
+            fi
+            echo "  deployment $D state=$ST — not it"
+          done
           if [ -n "$LIVE" ] && [ "$LIVE" != "null" ]; then
             git fetch --no-tags --filter=blob:none --depth=1 origin "$LIVE" 2>/dev/null || true
           fi
