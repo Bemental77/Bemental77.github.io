@@ -810,6 +810,44 @@
         if (lockstep && freerun && lsStallSince && f === lsFrame) pumpKick(0);
         break;
       }
+      // THE DETERMINISM HANDSHAKE, once per peer at ROOM START — after the disc
+      // has loaded and BEFORE the first lockstep frame. Without it two fresh
+      // boots reach a frame-0 anchor that is byte-identical across all
+      // 27,785,287 bytes and still diverge at 125-295 of 424 chunks: something
+      // the machine DERIVES AND CACHES rather than stores differs between two
+      // boots, and retro_serialize cannot see it.
+      // `emscripten_lockstep_normalize` (EmscriptenWorker.cpp) serializes this
+      // instance and loads its OWN bytes straight back — the state is unchanged
+      // by construction and the POINT is retro_unserialize's
+      // emu.stop()/loadstate/emu.start(), which rebuilds it — with the JIT
+      // flush on BOTH sides of the round trip. Measured on the frame-0 path:
+      // flush alone 0/3, round-trip alone 0/3, both 3/3 BYTE-IDENTICAL over
+      // 1800 frames (commit 9d16f261).
+      // ⚠ REFUSES mid-suspend rather than corrupting the frame, the same rule
+      // the deferred save follows.
+      case 'lsNormalize': {
+        if (typeof self.Module._emscripten_lockstep_normalize !== 'function') {
+          postMessage({ cmd: 'lsNormalize', ok: false,
+                        error: 'this build does not export _emscripten_lockstep_normalize — relink' });
+          break;
+        }
+        if (runIterSuspended()) {
+          postMessage({ cmd: 'lsNormalize', ok: false,
+                        error: 'a frame is asyncify-suspended — normalizing here would corrupt it' });
+          break;
+        }
+        try {
+          const t0 = performance.now();
+          const ok = self.Module._emscripten_lockstep_normalize() | 0;
+          const ms = Math.round(performance.now() - t0);
+          postMessage({ cmd: 'print', txt: '[lockstep] normalize ' + (ok ? 'OK' : 'FAILED') + ' in ' + ms + ' ms' });
+          postMessage({ cmd: 'lsNormalize', ok: !!ok, ms,
+                        error: ok ? null : 'emscripten_lockstep_normalize returned 0 (no disc loaded, or serialize failed)' });
+        } catch (err) {
+          postMessage({ cmd: 'lsNormalize', ok: false, error: (err && err.message) ? err.message : String(err) });
+        }
+        break;
+      }
       // The fingerprint, on demand — this is what proves the two machines start
       // identical (and, at the end, what a bug report should carry).
       // ⚠ REFUSES rather than reporting a stale reading mid-suspend.

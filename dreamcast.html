@@ -2770,6 +2770,49 @@
         pageLog('[page] state ' + (d.success ? 'loaded OK' : 'load FAILED'));
         break;
       }
+      // ---- LOCKSTEP: the worker's half of the frame gate --------------------
+      // 'lsFrame' is the frame CLOCK of the whole session — the core finished
+      // frame f, so the page may build f+1. Everything else here is truth for
+      // the panel; none of it is allowed to be inferred.
+      case 'lsFrame':
+        lsOnWorkerFrame(d.f);
+        break;
+      case 'lsHash':
+        lsOnWorkerHash(d);
+        break;
+      case 'lsStall':
+        // The CORE's own gate, one hop after the engine's: the pump has no
+        // input for the frame it is parked on. It is reported separately from
+        // the engine's stall because they answer different questions — the
+        // engine's names WHICH player, this one proves the core actually held.
+        LS.workerStall = !!d.on;
+        if (d.on) pageLog('[lockstep] core parked at frame ' + d.f + ' — no input yet');
+        else if (d.ms != null) pageLog('[lockstep] core resumed frame ' + d.f + ' after ' + d.ms + ' ms');
+        break;
+      case 'lsState':
+        LS.workerLockstep = !!d.on;
+        pageLog('[lockstep] worker reports lockstep ' + (d.on ? 'ON' : 'OFF') + ' at frame ' + d.f);
+        break;
+      case 'lsNormalize':
+        // The determinism handshake. A shim without the handler never answers,
+        // which lsArmBeforeFreerun() leaves as null and the panel reports as
+        // "not confirmed" — never as done.
+        LS.normalizeAck = { ok: !!d.ok, error: d.error || null, ms: d.ms == null ? null : (d.ms | 0) };
+        pageLog('[lockstep] determinism normalize ' + (d.ok ? 'OK' : 'FAILED') +
+                (d.ms != null ? ' in ' + d.ms + ' ms' : '') + (d.error ? ' — ' + d.error : ''));
+        break;
+      case 'players':
+        LS.playersAck = { ok: !!d.ok, n: d.n | 0, late: !!d.late, error: d.error || null };
+        pageLog('[lockstep] worker presented ' + (d.n | 0) + ' controller(s)' +
+                (d.late ? ' ⚠ TOO LATE — the disc was already loaded' : '') +
+                (d.error ? ' — ' + d.error : ''));
+        break;
+      case 'lsStats':
+        LS.workerStats = d;
+        break;
+      case 'lsFingerprint':
+        LS.fingerprint = d;
+        break;
       default:
         pageLog('[page] unknown worker cmd: ' + d.cmd);
     }
@@ -3683,6 +3726,11 @@
       setPhase('worker-wait');
       setStatus('Waiting for emulator runtime...');
       await workerReadyPromise;
+      // 2b. ONLINE ONLY: how many controllers this console presents. It has to
+      //     go in BEFORE discReady — the maple devices are created inside
+      //     retro_load_game — and it is a no-op with no room, so a solo boot is
+      //     byte-for-byte the boot it always was.
+      lsPlayersBeforeDisc();
       // 3. Tell the worker to load the disc and wait for ack.
       setPhase('disc-load');
       setStatus('Loading disc image...');
@@ -3726,6 +3774,13 @@
         if (qs.has('nomodvol')) worker.postMessage({ cmd: 'modvol', on: 0 });
       }
       setStatus('Running.');
+      // ⚠ ORDER IS LOAD-BEARING. The gate is armed BEFORE the pump is switched
+      // on, so this core has run ZERO frames when it starts gating and its
+      // "frame 0" is the room's frame 0. Arming after freerun would let each
+      // machine free-run for however long its own boot took, and two machines
+      // at different guest frames are already desynced before anybody presses
+      // anything. No-op with no room.
+      lsArmBeforeFreerun();
       worker.postMessage({ cmd: 'freerun', on: 1 });
       startInputPump();
       // A returning player always wins. If this browser already holds its own
@@ -4552,7 +4607,242 @@
     }
   }, true);
 
-  function packPad() {
+  // ===========================================================================
+  // THE LOCKSTEP FRAME DRIVER — the PAGE half of the frame gate.
+  //
+  // Everything under this page was already true before this block existed and
+  // none of it was reachable: the room seats four over real WebRTC with
+  // byte-identical rosters, the engine in lib/netplay.js exchanges pads and
+  // fingerprints and refuses to guess, and the worker's pump (flycast_worker.js
+  // "LOCKSTEP PUMP") will not start emulated frame N until it holds the maple
+  // image for N. What was missing is THIS: the page never called
+  // ls.beginFrame() and never sent one 'lsInput', so the shipping page applied
+  // ONE remote pad to port 1 through the old pre-lockstep relay and every core
+  // free-ran on its own clock. "Every core holds every player's input" was
+  // proven at the transport layer and FAILED through the product.
+  //
+  // THE LOOP, and why each piece is where it is:
+  //
+  //   beginFrame(myPads) -> { ready, frame, image } | { ready:false, waitingOn }
+  //     The engine answers with the WHOLE maple picture for one exact emulated
+  //     frame — every seated port's bytes — or it refuses. A refusal STALLS this
+  //     machine. It never predicts: a guessed pad forks the simulations
+  //     silently and permanently, and there is no rollback here to unfork them
+  //     (the state is 27,652,485 B).
+  //
+  //   postMessage({cmd:'lsInput', f, states:image})
+  //     The worker's pump eats exactly this and advances exactly one frame.
+  //
+  //   endFrame(null) + submitHash(f, h, w) when the worker reports it
+  //     ⚠ THE CORE IS IN A WORKER, SO THE FINGERPRINT IS LATE. endFrame() wants
+  //     the hash of the frame it is closing, but the frame has not run yet when
+  //     the page must already build the next image. So the clock is advanced
+  //     now and the hash is handed to the engine when it arrives, which is what
+  //     Lockstep.submitHash() is for. Skipping it would leave the cores
+  //     frame-gated with NOTHING comparing them — gated and silently diverging
+  //     is worse than not gated, because it looks right.
+  //
+  // ⚠ THE GUEST RATE IS NOT TOUCHED (CLAUDE.md gate #9). The worker's real-time
+  // governor still paces every frame to 1.000x; this gate can only make the
+  // guest run SLOWER (a stall), never faster. That is why the lookahead below
+  // is bounded — a deep worker queue is not a speed-up (the pump is idempotent
+  // and paced per frame) but it hides a stall from the player and grows without
+  // limit.
+  //
+  // ⚠ AND THE CORE MUST NOT RUN ONE FRAME BEFORE THE GATE IS ARMED. Two
+  // machines that free-ran for different numbers of frames before lockstep
+  // engaged are at different guest frames, which is a desync at "frame 0". So
+  // lsArmBeforeFreerun() runs BETWEEN the disc load and {cmd:'freerun',on:1}:
+  // the pump is switched on already gated, parks on an empty queue, and the
+  // first frame this core ever runs is the room's frame 0.
+  // ===========================================================================
+  const LS = {
+    armed: false,        // the worker has been put into lockstep mode
+    running: false,      // ...and the barrier released, so this page is feeding
+    workerFrame: 0,      // the frame the worker's pump is parked on
+    fedTo: 0,            // the first frame this page has NOT handed the worker
+    lastImage: null,     // the exact bytes last handed to the worker
+    framesRun: 0,        // frames the CORE reported completing
+    hashEvery: 60,
+    hashesFed: 0,        // fingerprints handed to the engine
+    hashSink: null,      // null = untested, true = submitHash exists, false = NOT COMPARING
+    bootPlayers: 0,      // controllers this machine created inside retro_load_game
+    playersAck: null,    // the worker's answer to {cmd:'players'}
+    normalizeAck: null,  // the determinism handshake's answer
+    stalling: false, waitingOn: [], stallReason: null,
+    workerStall: false,  // the CORE's own gate says it has no input for its frame
+    fault: null,         // why this machine is NOT frame-gated, in words
+    engagedAt: 0,
+  };
+
+  function lsEngine() {
+    const s = NET.session;
+    if (!s) return null;
+    try { return s.ls || null; } catch (e) { return null; }
+  }
+  // How many maple devices this room needs. Seats are handed out lowest-free
+  // first (lib/netplay.js seat()), so the occupied ports are 0..n-1 and a count
+  // is enough — but it is read from the ROSTER, never from a number written
+  // here, because the console's port count is the engine's answer.
+  function lsSeatedCount(ls) {
+    let n = 0;
+    try { for (const p of ls.roster) if (p != null) n++; } catch (e) {}
+    return Math.max(1, Math.min(4, n));
+  }
+
+  // THIS MACHINE'S OWN PADS, KEYED BY THE PORT THE ROOM GAVE IT.
+  // ⚠ THE KEYBOARD IS NOT PORT 0 ANY MORE. It is whichever port this player
+  // holds: a player told they are Player 3 has to drive Player 3's character,
+  // and packPad() writes the keyboard into bytes 0..63 unconditionally. The
+  // engine places these at port*padBytes in the image it builds, so the
+  // re-mapping happens in exactly one place.
+  // A machine holding SEVERAL seats (two controllers in one computer) gets its
+  // first seat from keyboard+gamepad0 — which is what a splitter would do — and
+  // each further seat from the next local gamepad.
+  function lsLocalPads() {
+    const raw = packPad({ localOnly: true });
+    const ls = lsEngine();
+    const ports = (ls && ls.localPorts && ls.localPorts.length) ? ls.localPorts : [0];
+    const out = {};
+    ports.forEach((port, k) => {
+      const b = new Uint8Array(64);
+      b.set(raw.subarray(k * 64, k * 64 + 64));
+      out[port] = b;
+    });
+    return out;
+  }
+
+  function lsFeed() {
+    const ls = lsEngine();
+    if (!LS.armed || !ls) return;
+    // The BARRIER decides when frame 0 runs, not this page. Until the engine
+    // says 'running' nothing is fed and the core sits on frame 0 — which is
+    // precisely what "everyone starts together" means, and why there is no
+    // savestate handoff to fail silently (CLAUDE.md gate #10).
+    if (ls.state !== 'running' && ls.state !== 'stalled') {
+      if (LS.running) { LS.running = false; pageLog('[lockstep] frame gate DISENGAGED — engine state ' + ls.state); }
+      return;
+    }
+    if (!LS.running) {
+      LS.running = true;
+      LS.engagedAt = _now();
+      LS.fedTo = ls.frame; LS.workerFrame = ls.frame;
+      LS.hashSink = (typeof ls.submitHash === 'function');
+      if (!LS.hashSink) {
+        LS.fault = 'this build of lib/netplay.js has no Lockstep.submitHash(), so the cores are frame-gated ' +
+                   'but NOTHING is comparing their fingerprints — a divergence would go undetected';
+        pageLog('[lockstep] ⚠ ' + LS.fault);
+      }
+      pageLog('[lockstep] FRAME GATE ENGAGED at frame ' + ls.frame + ' — this core advances only when every ' +
+              'seated port has an input for the frame. delay=' + ls.delay + ' frames (' +
+              Math.round(ls.delay * FRAME_MS) + ' ms), ports=' + JSON.stringify(ls.roster) +
+              ', mine=' + JSON.stringify(ls.localPorts));
+    }
+    // ⚠ BOUNDED LOOKAHEAD. The engine can never cover more than `delay` frames
+    // ahead of this core anyway (an input for frame F is scheduled by its
+    // owner's attempt at F-delay), so `delay` is the natural ceiling and a
+    // larger one would only queue memory and delay the moment a stall becomes
+    // visible.
+    const lookahead = Math.max(1, ls.delay | 0);
+    let fed = 0;
+    while ((LS.fedTo - LS.workerFrame) < lookahead) {
+      const r = ls.beginFrame(lsLocalPads());
+      if (!r || !r.ready) {
+        LS.stalling = !!(r && r.reason === 'stall');
+        LS.stallReason = r ? r.reason : 'the engine returned nothing';
+        LS.waitingOn = (r && r.waitingOn) ? r.waitingOn.slice() : [];
+        break;
+      }
+      LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
+      LS.lastImage = r.image;
+      // The old rig's port-1 witness, kept truthful under the new architecture:
+      // these are the bytes actually handed to the emulator for that port.
+      NET.sentP2 = Array.from(r.image.subarray(64, 76));
+      worker.postMessage({ cmd: 'lsInput', f: r.frame, states: r.image });
+      LS.fedTo = r.frame + 1;
+      const owed = (typeof ls.wantsHash === 'function') ? ls.wantsHash(r.frame) : false;
+      ls.endFrame(null);                 // advance the clock; the hash is late — see submitHash
+      if (owed) LS.hashOwed = r.frame;
+      // A runaway feed would be a bug in this loop, not a feature. The bound is
+      // never reached in practice (lookahead is `delay`), and reaching it is
+      // worth catching rather than sprinting the guest.
+      if (++fed > 240) { pageLog('[lockstep] ⚠ feed loop hit its 240-frame bound — not sprinting the guest'); break; }
+    }
+  }
+
+  // ---- what the worker tells us --------------------------------------------
+  function lsOnWorkerFrame(f) {
+    LS.workerFrame = (f | 0) + 1;
+    LS.framesRun++;
+    LS.workerStall = false;
+    lsFeed();
+  }
+  function lsOnWorkerHash(d) {
+    const ls = lsEngine();
+    if (!ls) return;
+    if (typeof ls.submitHash !== 'function') { LS.hashSink = false; return; }
+    LS.hashSink = true;
+    if (ls.submitHash(d.f | 0, d.h >>> 0, d.w || null)) LS.hashesFed++;
+  }
+
+  // ---- arming, in the two places the ORDER matters --------------------------
+  // (1) BEFORE THE DISC LOADS. The maple devices are created inside
+  // retro_load_game and this build does not hotplug (EmscriptenWorker.cpp's
+  // g_player_ports block), so the controller count is part of the starting
+  // state and has to be identical on every machine before any of them loads.
+  // ⚠ SOLO IS NOT TOUCHED. With no room this sends nothing at all and the
+  // build's own default stands — changing what a single player's console
+  // presents would be a regression dressed up as a netplay feature.
+  function lsPlayersBeforeDisc() {
+    const ls = lsEngine();
+    if (!NET.session || !ls) return;
+    const n = lsSeatedCount(ls);
+    LS.bootPlayers = n;
+    worker.postMessage({ cmd: 'players', n });
+    pageLog('[lockstep] presenting ' + n + ' controller(s) — one per seated player — sent BEFORE the disc ' +
+            'load, because the maple devices are created inside retro_load_game and this build cannot hotplug');
+  }
+  // (2) AFTER THE DISC LOADS AND BEFORE THE PUMP EVER RUNS A FRAME.
+  function lsArmBeforeFreerun() {
+    if (!NET.session || LS.armed) return false;
+    const ls = lsEngine();
+    if (!ls) {
+      LS.fault = 'the room published no lockstep engine, so this core cannot be frame-gated';
+      pageLog('[lockstep] ⚠ ' + LS.fault);
+      return false;
+    }
+    // ⚠ THE ROOM MUST NOT HAVE GROWN SINCE THE CONTROLLERS WERE MADE. If it
+    // did, this machine has a different number of maple devices from its peers
+    // and frame 0 is already a desync. Refusing loudly beats running and
+    // diverging: a desync 40 minutes in costs the whole session.
+    const seated = lsSeatedCount(ls);
+    if (LS.bootPlayers && seated !== LS.bootPlayers) {
+      LS.fault = 'this machine created ' + LS.bootPlayers + ' controller(s) before the disc loaded and the room ' +
+                 'now seats ' + seated + '. Maple devices are created inside retro_load_game and this build does ' +
+                 'not hotplug, so the machines would not agree on frame 0. Leave and rejoin.';
+      pageLog('[lockstep] ⚠ REFUSING TO GATE — ' + LS.fault);
+      return false;
+    }
+    // THE DETERMINISM HANDSHAKE, once per peer, after boot and before the first
+    // lockstep frame — which is exactly where EmscriptenWorker.cpp's
+    // emscripten_lockstep_normalize() says it must be invoked. Two fresh boots
+    // reach a frame-0 anchor that compares identical and still diverge; the
+    // round trip through retro_unserialize's emu.stop()/emu.start() plus the
+    // JIT flush is what makes them agree (measured 3/3 byte-identical over 1800
+    // frames, cross-instance, with no state transfer). A shim without the
+    // handler answers 'lsNormalize ok:false' and the fault is reported rather
+    // than assumed away.
+    worker.postMessage({ cmd: 'lsNormalize' });
+    LS.hashEvery = 60;
+    worker.postMessage({ cmd: 'lockstep', on: 1, frame: 0, hashEvery: LS.hashEvery });
+    LS.armed = true; LS.running = false; LS.workerFrame = 0; LS.fedTo = 0; LS.framesRun = 0;
+    LS.fault = null;
+    pageLog('[lockstep] ARMED before the first free-run frame — the pump will park on an empty queue at ' +
+            'frame 0 until the barrier releases, so no core runs a frame the others did not');
+    return true;
+  }
+
+  function packPad(opts) {
     const bytes = new Uint8Array(256);
     for (const [idStr, key] of Object.entries(KEYMAP)) {
       if (heldKeys.has(key)) {
@@ -4605,7 +4895,14 @@
     // the same Dreamcast controller, which is what a splitter would do anyway.
     // Port 0 is never touched: the host keeps its own controller no matter what
     // arrives over the wire.
-    {
+    // ⚠ AND IT IS THE PRE-LOCKSTEP RELAY ONLY. Once the frame gate is armed
+    // every port's bytes travel inside the engine's per-frame image instead, on
+    // ONE agreed clock; OR-ing a second copy of the remote pad in here would
+    // write port 1 twice from two different clocks, which is a desync with
+    // extra steps. `localOnly` is what the gate itself asks for: this machine's
+    // own controllers, unmixed, to be placed in whichever port the room gave
+    // this player.
+    if (!(opts && opts.localOnly)) {
       const rp = netRemotePad();
       if (rp !== null) netApplyPadMask(bytes, 64, rp);
     }
@@ -4663,7 +4960,14 @@
   // Chrome's user-activation gate on gamepad exposure, so this asserts the MAPPING only —
   // not that a real Xbox pad is handed to the page.  That residual needs hardware and is
   // uncovered, not implied covered.
-  window.__dcPad = () => Array.from(packPad());
+  // ⚠ UNDER LOCKSTEP THIS RETURNS THE FRAME IMAGE, NOT packPad(). The contract
+  // is "the exact 256-byte buffer the page posts to the worker", and once the
+  // gate is running that buffer is the engine's per-frame maple image — every
+  // seated port's bytes, on one agreed clock — while packPad() holds only this
+  // machine's own controllers. Returning packPad() here would make a rig
+  // reading port 2 conclude the remote player's input never arrived, when what
+  // actually happened is that it stopped travelling through packPad.
+  window.__dcPad = () => Array.from((LS.running && LS.lastImage) ? LS.lastImage : packPad());
 
   function frameStep() {
     // A GUEST never boots — it has no disc, no worker run loop and no picture of
@@ -4674,6 +4978,17 @@
     // halves of that are wrong — each player runs their own console and each
     // player's pad has to reach everybody else's.
     if (booted || NET.session) {
+      // ⚠ UNDER LOCKSTEP THE PAD DOES NOT TRAVEL THIS WAY, AND THAT IS THE
+      // WHOLE CHANGE. The frame gate owns pad delivery: every seated port's
+      // bytes for one exact emulated frame reach the core together, as one
+      // 'lsInput'. Posting the free-running {cmd:'input'} alongside it would
+      // let this machine's own controller reach its core on a DIFFERENT clock
+      // from everybody else's — the machines would then be running the same
+      // frames from different inputs, which is the desync this exists to
+      // prevent. rAF still drives the loop: it is what retries a stall and what
+      // kicks the very first frame, and the worker's own 'lsFrame' drives the
+      // rest.
+      if (LS.armed) { lsFeed(); return; }
       const pad = packPad();
       if (NET.session && NET.session.state === 'connected') NET.session.sendPad(netPadMask(pad, 0));
       if (booted) {
@@ -4795,6 +5110,12 @@
   // packPad(), so window.__dcPad() reflects the remote pad too and the existing
   // pad test seam covers player 2 as well as player 1.
   function netRemotePad() {
+    // ⚠ DEAD THE MOMENT THE FRAME GATE IS ARMED. This is the pre-lockstep
+    // relay: one remote pad, host-only, port 1 only, applied on whatever clock
+    // the rAF loop happened to be on. Under lockstep every seated port's bytes
+    // arrive together inside one frame's maple image and this path must not
+    // also write them.
+    if (LS.armed) return null;
     const s = NET.session;
     if (!s || NET.role !== 'host' || s.state !== 'connected') return null;
     return s.remotePad() | 0;
@@ -4963,6 +5284,23 @@
     remotePad: NET.session && NET.role === 'host' ? NET.session.remotePad() : null,
     sentP2: NET.sentP2,            // the bytes actually posted to the worker for port 1
     booted: booted,
+    // THE FRAME GATE, read straight off the driver rather than inferred. A rig
+    // asking "is this core actually gated" must not have to deduce it from a
+    // rendered string, and `armed && running` is a different question from
+    // "does an engine object exist" — which is the confusion that let a page
+    // claim lockstep while every core free-ran.
+    lockstep: {
+      armed: LS.armed, running: LS.running, workerLockstep: !!LS.workerLockstep,
+      engineFrame: (function () { const e = lsEngine(); return e ? e.frame : null; })(),
+      coreFrame: LS.framesRun, fedTo: LS.fedTo, workerFrame: LS.workerFrame,
+      delay: (function () { const e = lsEngine(); return e ? e.delay : null; })(),
+      localPorts: (function () { const e = lsEngine(); return e ? e.localPorts.slice() : null; })(),
+      stalling: LS.stalling, waitingOn: LS.waitingOn.slice(), stallReason: LS.stallReason,
+      workerStall: LS.workerStall,
+      hashesFed: LS.hashesFed, hashSink: LS.hashSink,
+      controllers: LS.playersAck, normalize: LS.normalizeAck,
+      fault: LS.fault,
+    },
   });
 
 
@@ -5053,6 +5391,25 @@
             ports: r.portCount,
             frame: r.frame,
             delayFrames: r.delay,
+            // ---- IS THIS MACHINE ACTUALLY FRAME-GATED? --------------------
+            // ⚠ THE ENGINE EXISTING IS NOT THE CLAIM. `ls.report()` answers as
+            // soon as a room forms, and for a long time this page rendered
+            // "LOCKSTEP" off exactly that while the core free-ran and one
+            // remote pad was relayed into port 1. The panel's whole purpose is
+            // that claim, so it is now read from the DRIVER: the worker was put
+            // in lockstep mode, the barrier released, and frames are being fed
+            // and acknowledged one at a time.
+            gated: !!(LS.armed && LS.running),
+            armed: !!LS.armed,
+            coreFrame: LS.framesRun,
+            fedTo: LS.fedTo,
+            controllers: LS.playersAck ? LS.playersAck.n : LS.bootPlayers || null,
+            // Frame-gated with nothing comparing the cores is WORSE than not
+            // gated, because it looks right. Say which it is.
+            detecting: !!(LS.hashSink && ls.hashEvery > 0),
+            hashesCompared: r.hashesCompared,
+            normalized: LS.normalizeAck ? !!LS.normalizeAck.ok : null,
+            gateFault: LS.fault,
             // 'running' is past the barrier; 'lobby'/'waiting' are before it.
             barrier: { started: r.state === 'running' || r.state === 'stalled', startFrame: 0 },
             you: mine == null ? null : {
@@ -5104,6 +5461,8 @@
         delayFrames: null, frame: null, waitingOn: null,
         stalled: false, stallMs: 0, stallTotalMs: 0,
         desync: false, desyncFrame: null, desyncPeers: [], desyncDetail: null,
+        gated: false, armed: false, coreFrame: null, fedTo: null, controllers: null,
+        detecting: false, hashesCompared: null, normalized: null, gateFault: null,
       };
     }
     const num = (v) => (typeof v === 'number' && isFinite(v)) ? v : null;
@@ -5137,6 +5496,14 @@
       desync: !!t.desync, desyncFrame: num(t.desyncFrame),
       desyncPeers: arr(t.desyncPeers) || [],
       desyncDetail: t.desyncDetail ? String(t.desyncDetail).slice(0, 300) : null,
+      // ⚠ THE GATE FIELDS ARE COPIED HERE OR THEY DO NOT EXIST. The note above
+      // `you` records the same lesson costing a progress bar; here it would
+      // cost the one claim this panel exists to make.
+      gated: !!t.gated, armed: !!t.armed,
+      coreFrame: num(t.coreFrame), fedTo: num(t.fedTo), controllers: num(t.controllers),
+      detecting: !!t.detecting, hashesCompared: num(t.hashesCompared),
+      normalized: (t.normalized == null) ? null : !!t.normalized,
+      gateFault: t.gateFault ? String(t.gateFault).slice(0, 300) : null,
     };
   }
 
@@ -5220,13 +5587,24 @@
     // cries wolf while you wait for your friends teaches people to ignore the
     // one banner that matters. Silence is a fault only once peers are
     // CONNECTED; an explicit non-lockstep mode is a fault immediately.
-    const notLockstepFault = (t.mode === 'lockstep') ? false
+    // ⚠ AND A ROOM THAT STARTED WITHOUT GATING THIS CORE IS THE SAME FAULT. It
+    // is not a degraded mode: every machine is running the game on its own
+    // clock from its own inputs, so the players are in separate universes that
+    // happen to look alike for a few seconds. That is exactly "what is on
+    // screen is not the shared game", which is what this banner is for.
+    const ungated = (t.mode === 'lockstep') && !!(t.barrier && t.barrier.started) && !t.gated;
+    const notLockstepFault = (t.mode === 'lockstep') ? ungated
       : (t.mode === 'none' ? connected : true);
     if (notLockstepFault && ban && !HUD.desyncLatched) {
-      ban.innerHTML = '<b>⚠ THIS SESSION IS NOT RUNNING LOCKSTEP</b>' +
-        esc(t.fault || 'the session reported no lockstep telemetry') +
-        '. Online play on this page is lockstep only — every machine runs the game. ' +
-        'Leave and rejoin; if it happens again the session is faulty, not slow.';
+      ban.innerHTML = ungated
+        ? '<b>⚠ THE ROOM STARTED BUT THIS CONSOLE IS NOT FRAME-GATED</b>' +
+          'Every machine is running the game on its own clock, so nothing anyone does is shared. ' +
+          esc(t.gateFault || 'the page is not feeding the core one agreed frame at a time') +
+          '<span class="detail">Leave and rejoin. Do not keep playing — the simulations are already apart.</span>'
+        : '<b>⚠ THIS SESSION IS NOT RUNNING LOCKSTEP</b>' +
+          esc(t.fault || 'the session reported no lockstep telemetry') +
+          '. Online play on this page is lockstep only — every machine runs the game. ' +
+          'Leave and rejoin; if it happens again the session is faulty, not slow.';
       ban.classList.add('on');
     } else if (!notLockstepFault && ban && !HUD.desyncLatched) {
       ban.classList.remove('on');
@@ -5264,20 +5642,68 @@
     }
 
     const d = t.delayFrames;
-    const modeWord = (t.mode === 'lockstep') ? 'LOCKSTEP'
+    // ---- THE HEADLINE IS A CLAIM, SO IT IS READ FROM THE GATE ---------------
+    // ⚠ "LOCKSTEP" HERE MEANS "THE CORES ARE FRAME-GATED", AND NOTHING ELSE
+    // MAY PRINT IT. An engine object exists as soon as a room forms; for a long
+    // while this panel said LOCKSTEP off exactly that, while every core
+    // free-ran and one remote pad was relayed into port 1 — i.e. it stated the
+    // one thing it exists to state, and was wrong. A previous agent deliberately
+    // stopped short of printing it rather than print it unearned, and that was
+    // right. It now comes from t.gated, which is the driver reporting that the
+    // worker is in lockstep mode, the barrier released, and frames are being
+    // fed and acknowledged one at a time.
+    // LOCKSTEP names the ARCHITECTURE — that is a fact about the session and it
+    // is true from the moment the room forms. What must never be printed
+    // unearned is the claim that THIS CORE IS FRAME-GATED, which is a fact
+    // about the emulator and gets its own row below, stated as yes/no. A room
+    // that has started and is NOT gated is a fault and takes the fault word,
+    // because there the architecture name would be a lie about what is running.
+    const gated = !!t.gated;
+    const started = !!(t.barrier && t.barrier.started);
+    const modeWord = (t.mode === 'lockstep')
+        ? ((started && !gated) ? 'NOT FRAME-GATED' : 'LOCKSTEP')
       : (t.mode === 'none' && !connected) ? 'ROOM OPEN' : 'NOT LOCKSTEP';
-    let html = '<span class="mode">' + modeWord + '</span> ' +
-      '<span class="k">' + (modeWord === 'ROOM OPEN'
+    const tagline = (modeWord === 'NOT FRAME-GATED')
+        ? 'the room started but THIS core is not gated — it is running on its own clock'
+      : (modeWord === 'LOCKSTEP' && !started)
         ? 'waiting for players — nothing starts until everyone is in'
-        : 'every machine runs the game · your pad drives your own console') + '</span>';
+      : (modeWord === 'LOCKSTEP')
+        ? 'every machine runs the game · your pad drives your own console · no core advances alone'
+      : (modeWord === 'ROOM OPEN')
+        ? 'waiting for players — nothing starts until everyone is in'
+        : 'every machine runs the game · your pad drives your own console';
+    let html = '<span class="mode">' + modeWord + '</span> <span class="k">' + tagline + '</span>';
     html += '<br><span class="k">input delay</span> ' +
       (d == null ? '—' : d + (d === 1 ? ' frame' : ' frames') + ' (' + Math.round(d * FRAME_MS) + ' ms)') +
       ' <span class="k">· frame</span> ' + (t.frame == null ? '—' : t.frame) +
+      (t.coreFrame != null ? ' <span class="k">· core ran</span> ' + t.coreFrame : '') +
       (t.stallTotalMs > 0 ? ' <span class="k">· stalled</span> ' + (t.stallTotalMs / 1000).toFixed(1) + ' s total' : '');
+    // WHICH PORT THIS PLAYER HOLDS, said in words as well as drawn as a chip —
+    // it is which character they get, and a player who has to decode a chip
+    // colour to find that out has not been told.
+    if (t.you && t.you.port != null) {
+      html += '<br><span class="k">you are</span> Player ' + (t.you.port + 1) +
+        ' <span class="k">(maple port ' + t.you.port + ')</span>' +
+        (t.controllers != null ? ' <span class="k">· ' + t.controllers + ' controller' +
+          (t.controllers === 1 ? '' : 's') + ' plugged in</span>' : '');
+    }
+    // Frame-gated, and whether anything is CHECKING. Gated-but-unchecked is
+    // worse than not gated, because it looks right until the evening is gone.
+    // ⚠ NOT SHOWN BEFORE THE ROOM STARTS. A player waiting for three friends to
+    // finish downloading does not need "frame-gated NO · desync check OFF"
+    // shouting at them about a game that has not begun — a panel that cries
+    // wolf while you wait teaches people to ignore the row that matters.
+    if (t.mode === 'lockstep' && (started || t.armed)) {
+      html += '<br><span class="k">frame-gated</span> ' + (gated ? 'YES' : 'NO') +
+        ' <span class="k">· desync check</span> ' +
+        (t.detecting ? ('on, ' + (t.hashesCompared || 0) + ' compared')
+                     : '<span class="warn">OFF — nothing is comparing the cores</span>');
+    }
+    if (t.gateFault) html += '<br><span class="warn">⚠ ' + esc(t.gateFault) + '</span>';
     html += roster;
     if (stalled) html += '<br><span class="stall">⏸ ' + stallWhy + '</span>';
 
-    el.className = 'on ' + (t.mode === 'lockstep' ? 'lockstep' : 'fault') + (stalled ? ' stalling' : '');
+    el.className = 'on ' + (modeWord === 'LOCKSTEP' ? 'lockstep' : 'fault') + (stalled ? ' stalling' : '');
     if (html !== HUD.text) { el.innerHTML = html; HUD.text = html; }
     HUD.stalled = stalled; HUD.stallWhy = stallWhy; HUD.waitingOn = waitNames;
   }
