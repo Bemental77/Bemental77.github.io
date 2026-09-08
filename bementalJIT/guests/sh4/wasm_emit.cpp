@@ -2462,6 +2462,69 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
         b.op_i32_const(0x38);
         b.op_i32_eq();
         b.op_if();
+        // -------------------------------------------------------------------
+        // LEVER-14 — NARROW the register synchronisation around the store-queue
+        // burst. This op is the TA VERTEX SUBMISSION path and it is the single
+        // count that scales with 3D load: measured on the shipped binary,
+        // PSO Pioneer 2 (heavy 3D) runs `[split] sq n=322,000-349,000/s
+        // ta=191,000-205,000/s` against 26,000-36,000 / 2,850-2,945 on a light
+        // scene (/tmp/probe-dcx-hv1-lobby-governed.log vs
+        // /tmp/probe-dcx-xboxfix.log) — an 11x / 66x step for the SAME 200 MHz
+        // of guest time.
+        //
+        // What the callee can actually observe: sh4_interp_shil_fb's shop_pref
+        // arm (EmscriptenWorker.cpp) reads exactly ONE guest register,
+        // `*op.rs1.reg_ptr(Sh4cntx)`, then calls Sh4Context::doSqWrite. All four
+        // implementations of that (storeq.cpp:25 sqWrite<mmu>, :55/:62 the
+        // area-3 RAM copies, :69 sqWriteTA) read ctx->sq_buffer and write guest
+        // RAM or the TA FIFO. NONE of them reads or writes ctx->r[] / fr[].
+        //
+        // So the old flushAll + invalidateAll pair was synchronising state the
+        // callee cannot see or change, on a path taken ~322K times/s. Worse
+        // than the spill stores themselves, invalidateAll() forces every later
+        // register use in the block back to a ctx load — and the guest's TA
+        // loop is `mov.l` stores into the queue followed by `pref`, so the
+        // invalidate landed in the middle of the hottest 3D loop in the game.
+        //
+        // LEVER14_PREF_NARROW_SYNC=0 restores the old behaviour byte-for-byte
+        // for a matched pair built from this same source generation.
+#ifndef LEVER14_PREF_NARROW_SYNC
+#define LEVER14_PREF_NARROW_SYNC 1
+#endif
+#if LEVER14_PREF_NARROW_SYNC
+        // Flush ONLY rs1, and only when it is a cached int register the callee
+        // will re-read out of ctx. `dirty` is deliberately NOT cleared: this
+        // store sits inside a conditional arm, and clearing it would let a
+        // later flushAll skip a register that is genuinely dirty on the
+        // fall-through path (the dirty-model note on RegCache in wasm_emit.h).
+        if (op.rs1.is_imm()) {
+            // Nothing to synchronise — the callee reads the immediate.
+        } else if (op.rs1.is_r32i()) {
+            const u32 sqoff = op.rs1.reg_offset();
+            auto it = cache.entries.find(sqoff);
+            if (it != cache.entries.end() && it->second.dirty) {
+                b.op_local_get(LOCAL_CTX);
+                b.op_local_get(it->second.wasmLocal);
+                if (it->second.isF32) b.op_f32_store(sqoff);
+                else                  b.op_i32_store(sqoff);
+            }
+        } else {
+            // Unexpected param shape — fall back to the conservative flush.
+            for (auto& kv : cache.entries) {
+                if (!kv.second.dirty) continue;
+                b.op_local_get(LOCAL_CTX);
+                b.op_local_get(kv.second.wasmLocal);
+                if (kv.second.isF32) b.op_f32_store(kv.first);
+                else                 b.op_i32_store(kv.first);
+            }
+        }
+        b.op_i32_const((s32)persist_shil_op(op));
+        b.op_i32_const((s32)opIndex);
+        b.op_call(WIMPORT_SHIL_FB);
+        // No invalidate and no reload: doSqWrite cannot have changed a cached
+        // register. (If that ever stops being true — a new doSqWrite variant
+        // that touches ctx registers — set LEVER14_PREF_NARROW_SYNC to 0.)
+#else
         for (auto& kv : cache.entries) {
             if (!kv.second.dirty) continue;
             b.op_local_get(LOCAL_CTX);
@@ -2491,6 +2554,7 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
                 b.op_local_set(kv.second.wasmLocal);
             }
         }
+#endif
         b.op_end();
         return true;
     }

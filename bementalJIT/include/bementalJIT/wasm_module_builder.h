@@ -673,11 +673,23 @@ public:
 	void op_select()     { emitByte(wop::select); }
 	void op_unreachable() { emitByte(wop::unreachable); }
 
-	void op_if(u8 blockType = 0x40) { emitByte(wop::if_); emitByte(blockType); }
+	// Lever-6A: conditional-arm depth tracking for lazy-RegCache coherence.
+	// A lazy load/store emitted INSIDE an if/else arm is only conditionally
+	// executed, so compile-time loaded/dirty bookkeeping there is unsound
+	// (the B11 class). Emit helpers consult ifDepth() and bypass the cache
+	// (direct ctx access, no bookkeeping) whenever it is nonzero. `block`
+	// and `loop` bodies execute unconditionally on entry, so they push 0.
+	void op_if(u8 blockType = 0x40) { emitByte(wop::if_); emitByte(blockType); _ctrl.push_back(1); ++_ifDepth; }
 	void op_else()       { emitByte(wop::else_); }
-	void op_end()        { emitByte(wop::end); }
-	void op_block(u8 blockType = 0x40) { emitByte(wop::block); emitByte(blockType); }
-	void op_loop(u8 blockType = 0x40) { emitByte(wop::loop_); emitByte(blockType); }
+	void op_end()        {
+		emitByte(wop::end);
+		if (!_ctrl.empty()) { if (_ctrl.back() == 1 && _ifDepth > 0) --_ifDepth; _ctrl.pop_back(); }
+	}
+	void op_block(u8 blockType = 0x40) { emitByte(wop::block); emitByte(blockType); _ctrl.push_back(0); }
+	void op_loop(u8 blockType = 0x40) { emitByte(wop::loop_); emitByte(blockType); _ctrl.push_back(0); }
+	u32 ifDepth() const { return _ifDepth; }
+	std::vector<u8> _ctrl;
+	u32 _ifDepth = 0;
 	void op_br(u32 depth) { emitByte(wop::br); emitLEB128(depth); }
 	void op_br_if(u32 depth) { emitByte(wop::br_if); emitLEB128(depth); }
 	// br_table: branch to one of the labels indexed by the i32 on stack.

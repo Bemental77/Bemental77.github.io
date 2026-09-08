@@ -401,6 +401,14 @@
     // nothing. Attach once.
     if (v.srcObject === ms) return;
     v.srcObject = ms;
+    // ⚠ CLEAR THE STICKY MUTE FIRST. The catch below sets v.muted = true on an
+    // autoplay refusal and nothing used to reset it, so ONE refusal muted every
+    // LATER session on this page — and invisibly, because a muted element's
+    // play() always resolves, so the catch never ran again to re-offer the
+    // sound. Same defect was found and fixed in dreamcast.html; it was copied
+    // here with the rest of the attach path.
+    v.muted = false;
+    $('btnSound').hidden = true;
     showPlay(true);
     startPump();
     try { await v.play(); $('btnSound').hidden = true; }
