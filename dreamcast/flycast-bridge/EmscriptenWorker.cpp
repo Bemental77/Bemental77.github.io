@@ -1894,11 +1894,30 @@ int emscripten_lockstep_normalize(void) {
     // the restart — the entire point — would be skipped. This must be invoked
     // once per peer at ROOM START, after boot and before the first lockstep
     // frame.
+    // [2026-09-08] BOTH INGREDIENTS, AND THE FLUSH ON BOTH SIDES. Measured on
+    // the frame-0 shipping path with no state pushed (cross arm; the self arm is
+    // void there — see below):
+    //     --frame0                              cross 0/3   125-295/424 chunks
+    //     --frame0 --lockstepreset (flush only) cross 0/3   261/424
+    //     --frame0 --normalize   (round-trip)   cross 0/3   261/424
+    //     --frame0 --normalize --lockstepreset  cross 3/3   BYTE-IDENTICAL, 30/30
+    // Neither ingredient is sufficient and both are necessary, which is exactly
+    // why two separate isolation attempts — hooking the flush into
+    // emscripten_reset(), and calling it directly on the frame-0 path — each
+    // measured a complete null. It also explains why --equalize was the only
+    // thing that ever helped: emscripten_load_state does BOTH.
+    //
+    // An earlier version of this function did the round-trip and flushed only
+    // AFTER, and that ordering measured null. The flush is therefore done on
+    // BOTH sides: before, so emu.start() rebuilds against a clean block table,
+    // and after, so anything start() repopulated is dropped again.
     if (!g_loaded) return 0;
     const size_t sz = retro_serialize_size();
     if (!sz) return 0;
     uint8_t* buf = (uint8_t*)std::malloc(sz);
     if (!buf) return 0;
+    flycast_ic_invalidate();
+    flycast_lockstep_reset();
     int ok = 0;
     if (retro_serialize(buf, sz))
         ok = retro_unserialize(buf, sz) ? 1 : 0;
