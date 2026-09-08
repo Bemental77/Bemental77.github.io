@@ -187,6 +187,11 @@ const FRAME0    = has('--frame0');
 // start is byte-identical BY CONSTRUCTION. Any divergence that remains therefore
 // cannot be the anchor residual propagating -- it is an independent second cause.
 const EQUALIZE  = has('--equalize');
+// --lockstepreset: call _flycast_lockstep_reset() (the JIT flush + seal-phase
+// anchor) in BOTH instances and push NO state. emscripten_load_state does two
+// things -- retro_unserialize (emu.stop/loadstate/emu.start) AND this flush -- so
+// --equalize cannot say which one produces its collapse. This isolates the flush.
+const LSRESET   = has('--lockstepreset');
 // --skew N: give instance B N EXTRA discarded frames of history before its
 // measured pass. THIS IS THE REALISTIC LOCKSTEP TEST. Two real peers never have
 // identical execution history — one sat in the menu longer, one joined late — and
@@ -689,7 +694,7 @@ try {
   report.load = uptime;
   say('load: ' + uptime);
   say(`config: ${TWOBROW ? 'TWO BROWSER PROCESSES' : 'TWO TABS IN ONE BROWSER'} | game=${GAME} frames=${FRAMES} every=${EVERY} runs=${RUNS} arms=${ARMS} input=${INPUT} warmup=${WARMUP} skew=${SKEW} ports=${NPORTS} freezetime=${FREEZE}`);
-  report.warmup = WARMUP; report.query = QUERY; report.diffatFrames = DIFFAT; report.skew = SKEW; report.ports = NPORTS; report.freezeTime = FREEZE; report.coldbootArm = COLDBOOT; report.frame0 = FRAME0; report.equalize = EQUALIZE;
+  report.warmup = WARMUP; report.query = QUERY; report.diffatFrames = DIFFAT; report.skew = SKEW; report.ports = NPORTS; report.freezeTime = FREEZE; report.coldbootArm = COLDBOOT; report.frame0 = FRAME0; report.equalize = EQUALIZE; report.lockstepresetArm = LSRESET;
   if (QUERY) say(`query: ?${QUERY}`);
 
   const b1 = await puppeteer.launch({ ...LAUNCH, userDataDir: PROFILE });
@@ -765,6 +770,12 @@ try {
   // One preparation seam for both arms, so nothing else in the rig changes shape.
   let equalBuf = null;
   const prepare = async (inst) => {
+    if (LSRESET && !equalBuf) {
+      // Mirror what a call site at the end of load_disc would give a fresh boot:
+      // every measured pass begins with the flush, nothing else changed.
+      await inst.worker.evaluate('(async()=>{ await self.__det.waitClean(); self.Module._flycast_lockstep_reset(); return true; })()');
+      if (FRAME0) return true;
+    }
     if (equalBuf) return pushState(inst, equalBuf);   // --equalize: identical by construction
     if (FRAME0) return true;   // already at a common frame 0; resetting would undo it
     if (!COLDBOOT) return pushState(inst, stateBuf);
@@ -791,12 +802,22 @@ try {
     let bad = [];
     for (let c = 0; c < Math.min(ha.chunks.length, hb.chunks.length); c++)
       if (ha.chunks[c] !== hb.chunks[c]) bad.push('0x' + (c * CHUNK).toString(16));
-    say(`ANCHOR after retro_reset: sizes ${ha.size}/${hb.size} identical=${same}` +
+    const how = FRAME0 ? 'frame0, NO reset — pump held off before any frame'
+                       : 'after retro_reset';
+    say(`ANCHOR (${how}): sizes ${ha.size}/${hb.size} identical=${same}` +
         (same ? '' : ` — ${bad.length} differing chunks @ ${bad.slice(0, 12).join(',')}`));
     report.anchor = { identical: same, sizeA: ha.size, sizeB: hb.size,
                       differingChunks: bad.length, first: bad.slice(0, 24) };
     if (!same) say('⚠ TWO INDEPENDENTLY RESET MACHINES ARE ALREADY DIFFERENT. ' +
                    'Frame-0 lockstep cannot work without shipping a common state.');
+    if (LSRESET) {
+      const ra = await A.worker.evaluate('(async()=>{ await self.__det.waitClean(); self.Module._flycast_lockstep_reset(); return true; })()');
+      const rb = await B.worker.evaluate('(async()=>{ await self.__det.waitClean(); self.Module._flycast_lockstep_reset(); return true; })()');
+      say(`LOCKSTEP-RESET called at the anchor in BOTH instances (A=${ra} B=${rb}); NO state pushed. ` +
+          'If 261 chunks collapse to ~2, the JIT flush is the ingredient; if it stays at 261, ' +
+          'the ingredient is retro_unserialize\'s emu.stop()/emu.start() subsystem restart.');
+      report.lockstepReset = { A: !!ra, B: !!rb };
+    }
     if (EQUALIZE) {
       equalBuf = await pullState(A);
       if (!equalBuf) { say('ABORT: --equalize could not capture the anchor state'); await finish(3); }
