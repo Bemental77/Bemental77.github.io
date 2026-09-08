@@ -82,7 +82,9 @@ const PUMP_MS   = parseInt(arg('pumpms', '4000'), 10);
 const PINGS     = parseInt(arg('pings', '25'), 10);
 const CHROME    = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 
-const OUT = '/tmp/dc-room';
+// Per-run scratch under the OS temp dir, so this runs on a CI runner as well as
+// on a laptop. Overridable for anyone who wants the artifacts kept somewhere.
+const OUT = process.env.ROOM_OUT || path.join(os.tmpdir(), 'dc-room');
 fs.mkdirSync(OUT, { recursive: true });
 const LOG = path.join(OUT, NAME + '.log');
 const logStream = fs.createWriteStream(LOG, { flags: 'w' });
@@ -116,7 +118,13 @@ say(`  uptime     ${RESULT.uptimeStart}`);
 
 const browsers = [], pages = [], sideErr = [];
 async function launch(i, tag) {
-  const dir = path.join('/private/tmp/claude-501/dc-room', 'p' + i);
+  // ⚠ NOT A HARDCODED PATH. This read
+  //     path.join('/private/tmp/claude-501/dc-room', 'p' + i)
+  // which exists only on the machine that wrote it, so in CI the whole harness
+  // died on `EACCES: permission denied, mkdir` and reported 0/1 — a red cell
+  // that said nothing about netplay. A rig that cannot run anywhere but one
+  // laptop is not a gate.
+  const dir = path.join(OUT, 'p' + i);
   fs.rmSync(dir, { recursive: true, force: true });
   fs.mkdirSync(dir, { recursive: true });
   const b = await puppeteer.launch({

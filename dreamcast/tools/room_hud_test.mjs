@@ -66,7 +66,10 @@ const ORIGIN = arg('url', 'http://localhost:8080');
 const HEADFUL = argv.includes('--headful');
 const KEEP = argv.includes('--keep');
 const CHROME = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-const OUT = '/tmp/dc-room';
+// Scratch under the OS temp dir so this runs on a CI runner, not only on the
+// machine that wrote it. See the profile path below — its hardcoded twin is
+// what made this harness red in CI and green locally.
+const OUT = process.env.ROOM_OUT || path.join(os.tmpdir(), 'dc-room');
 fs.mkdirSync(OUT, { recursive: true });
 
 const rec = [];
@@ -86,7 +89,10 @@ console.log(`  url      ${ORIGIN}/dreamcast.html?net=local`);
 // function" and throw its full-screen diagnostics over the panel this rig is
 // photographing. CLAUDE.md records that trap; nothing here needs a warm cache
 // (this test never fetches a disc), so the cheapest fix is to not have one.
-const profile = path.join('/private/tmp/claude-501', 'dc-room-profile');
+// ⚠ WAS path.join('/private/tmp/claude-501', 'dc-room-profile') — a directory
+// that exists on exactly one laptop. In CI Chrome could not create its profile
+// there, so the harness failed for a reason that had nothing to do with the HUD.
+const profile = path.join(OUT, 'profile');
 fs.rmSync(profile, { recursive: true, force: true });
 fs.mkdirSync(profile, { recursive: true });
 const browser = await puppeteer.launch({

@@ -121,7 +121,23 @@ const HARNESSES = [
     file: 'tools/verify_deploy_assets.mjs',
     cmd: ['node', 'tools/verify_deploy_assets.mjs', '.'],
     desc: 'every runtime asset the pages fetch survives the deploy rsync exclude list — the check that caught dolphin_captures/sab.map and n64/bementalJIT/mips_emit.js 404ing in production (also inside preflight)',
-    fast: true, ci: true, server: false, requires: [], timeoutMs: 5 * MIN,
+    // ⚠ ci:false, AND THAT IS A CONFESSION RATHER THAN A CONVENIENCE. It was
+    // ci:true with requires:[], so in CI it reported
+    //     MISSING /dreamcast/discs/{mvc2,pso2,sa2}/*.bgzi.json
+    //     [deploy-assets] FAIL — 6 runtime asset(s) referenced by shipped code are absent
+    // every single run — not because anything was wrong, but because the CI
+    // checkout deliberately omits dreamcast/discs (2.7 GB). A gate that is red
+    // for a reason unrelated to the change is worse than no gate: it trains
+    // everyone to scroll past it, and this one WAS scrolled past while four of
+    // five Dreamcast games were genuinely 404ing on production.
+    // `requires` now makes it SKIP with a stated reason when the discs are not
+    // checked out, instead of failing. The arm that actually catches a broken
+    // catalog is a post-deploy check against the live origin, because the fault
+    // is a URL the page NAMES that does not resolve — which no file-existence
+    // check on a partial checkout can ever see.
+    fast: true, ci: false,
+    ciWhy: 'it walks assets under dreamcast/discs and gamecube/roms, which the size-bounded CI checkout omits; running it there reports MISSING for files that exist and are deployed, which is a permanent false red',
+    server: false, requires: ['dreamcast/discs/gauntlet'], timeoutMs: 5 * MIN,
   },
   {
     name: 'dc-core-drift',
