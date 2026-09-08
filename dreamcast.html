@@ -2058,9 +2058,9 @@
         // set of parts that fetched HTTP-200-OK but were 133-byte Git-LFS
         // pointers, assembled into a wrong-size Track3, and only showed up as
         // an SH4 crash at boot. A length check turns that into a clear error.
-        { name: 'Track3.bin', bytes: 1185760800,
+        { name: 'Track3.bin', bytes: 1185760800, index: 'Track3.bin.bgzi.json',
           parts: ['aa','ab','ac','ad','ae','af','ag','ah','ai','aj','ak','al']
-                   .map(s => 'Track3.bin.part' + s + '.gz') },
+                   .map(s => 'Track3.bin.part' + s + '.bgz') },
         { name: 'PSO.cue' },
       ],
     },
@@ -2080,9 +2080,9 @@
       files: [
         { name: 'Track1.bin' },
         { name: 'Track2.bin' },
-        { name: 'Track3.bin', bytes: 1185760800,
+        { name: 'Track3.bin', bytes: 1185760800, index: 'Track3.bin.bgzi.json',
           parts: ['aa','ab','ac','ad','ae','af','ag','ah','ai','aj','ak','al']
-                   .map(s => 'Track3.bin.part' + s + '.gz') },
+                   .map(s => 'Track3.bin.part' + s + '.bgz') },
         { name: 'CannonSpike.cue' },
       ],
     },
@@ -2094,9 +2094,9 @@
       files: [
         { name: 'Track1.bin' },
         { name: 'Track2.bin' },
-        { name: 'Track3.bin', bytes: 1185760800,
+        { name: 'Track3.bin', bytes: 1185760800, index: 'Track3.bin.bgzi.json',
           parts: ['aa','ab','ac','ad','ae','af','ag','ah','ai','aj','ak','al']
-                   .map(s => 'Track3.bin.part' + s + '.gz') },
+                   .map(s => 'Track3.bin.part' + s + '.bgz') },
         { name: 'SonicAdventure2.cue' },
       ],
     },
@@ -2134,9 +2134,9 @@
       cue:  'MvC2.cdi',
       productId: 'T1212N',
       files: [
-        { name: 'MvC2.cdi', bytes: 799165154,
+        { name: 'MvC2.cdi', bytes: 799165154, index: 'MvC2.cdi.bgzi.json',
           parts: ['aa','ab','ac','ad','ae','af','ag','ah','ai']
-                   .map(s => 'MvC2.cdi.part' + s + '.gz') },
+                   .map(s => 'MvC2.cdi.part' + s + '.bgz') },
       ],
     },
   };
