@@ -74,6 +74,24 @@ const ALWAYS_REQUIRED = new Map([
    'gba script.js Module.locateFile = p => "/gba/gbaWasm/dist/" + p'],
   ['/snes/snesWasm/snes9x_2005.wasm',
    'snes.html Module.locateFile = p => "/snes/snesWasm/" + p'],
+  // Block-gzip disc reader, and the per-track block indexes. The reader is a
+  // literal <script src>, but the worker reaches it through importScripts and
+  // the indexes are only ever built as `base + file.index`, so nothing here is
+  // a literal URL the scanner could see.
+  //
+  // ⚠ LOSING AN INDEX DOES NOT DEGRADE GRACEFULLY IN THE WAY THAT MATTERS. The
+  // page refuses to stream without one and falls back to the EAGER path — which
+  // for these tracks means a phone downloading the whole disc again, i.e. the
+  // exact bug the format was built to remove, restored silently and only on
+  // production. That is the same shape as the sab.map and mips_emit.js losses
+  // this file already exists to catch.
+  ['/lib/bgz.js', 'dreamcast.html <script src>, and flycast_worker.js importScripts("/lib/bgz.js")'],
+  ['/dreamcast/discs/pso2/Track3.bin.bgzi.json', 'dreamcast.html GAMES.pso2 files[].index'],
+  ['/dreamcast/discs/cannonspike/Track3.bin.bgzi.json', 'dreamcast.html GAMES.cannonspike files[].index'],
+  ['/dreamcast/discs/sa2/Track3.bin.bgzi.json', 'dreamcast.html GAMES.sa2 files[].index'],
+  ['/dreamcast/discs/gauntlet/Track3.bin.bgzi.json', 'dreamcast.html GAMES.gauntlet files[].index'],
+  ['/dreamcast/discs/gauntlet/Track5.bin.bgzi.json', 'dreamcast.html GAMES.gauntlet files[].index'],
+  ['/dreamcast/discs/mvc2/MvC2.cdi.bgzi.json', 'dreamcast.html GAMES.mvc2 files[].index'],
   // Built-in ROMs: fetched from an array literal, not a literal URL argument.
   ['/snes/snesWasm/roms/simcity.smc', 'snes.html ROMS[0].url'],
   ['/genesis/genesisWasm/dist/genesis_plus_gx.wasm',

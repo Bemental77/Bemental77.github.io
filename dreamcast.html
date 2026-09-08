@@ -14,6 +14,10 @@
        [glinfo] pinning, which remain the authority on what the WORKER's context got. -->
   <script src="/lib/capability.js"></script>
   <script src="/lib/xboxinput.js"></script>
+  <!-- Block-gzip disc reader. Shared with the flycast worker shim, which
+       importScripts()es this same file, so the eager and lazy paths cannot
+       disagree about where a block lives. See tools/bgzip.mjs. -->
+  <script src="/lib/bgz.js"></script>
   <!-- Online co-op. ONE INSTANCE RUNS THE GAME: the host's emulator is the only
        emulator, it streams its picture and sound over WebRTC, and the person who
        joins sends controller state back which the host feeds in as PLAYER 2. The
@@ -2109,11 +2113,14 @@
       files: [
         { name: 'Track1.bin' },
         { name: 'Track2.bin' },
-        { name: 'Track3.bin', bytes: 487889472,
-          parts: ['aa','ab','ac','ad','ae'].map(s => 'Track3.bin.part' + s + '.gz') },
+        // .bgz + a block index: streamable over HTTP Range. This disc is the
+        // reason the format exists — 1,131 MB had to land before the first
+        // frame, and a phone photographed it stalled at "Track5.bin 59.3%".
+        { name: 'Track3.bin', bytes: 487889472, index: 'Track3.bin.bgzi.json',
+          parts: ['aa','ab','ac','ad','ae'].map(s => 'Track3.bin.part' + s + '.bgz') },
         { name: 'Track4.bin' },
-        { name: 'Track5.bin', bytes: 696634176,
-          parts: ['aa','ab','ac','ad','ae','af','ag'].map(s => 'Track5.bin.part' + s + '.gz') },
+        { name: 'Track5.bin', bytes: 696634176, index: 'Track5.bin.bgzi.json',
+          parts: ['aa','ab','ac','ad','ae','af','ag'].map(s => 'Track5.bin.part' + s + '.bgz') },
         { name: 'GauntletLegends.cue' },
       ],
     },
@@ -3211,6 +3218,94 @@
     }
     return n;
   }
+  // ── BLOCK-GZIP (.bgz) DISC PARTS ──────────────────────────────────────────
+  // WHY THIS FORMAT EXISTS. The single-member `.gz` parts above bought the
+  // artifact its place under the 10 GB Pages ceiling and, in the same stroke,
+  // took HTTP-Range streaming away — a gzipped part's bytes are not the disc's
+  // bytes, so the lazy path refused every big disc and a phone had to download
+  // all 1,131 MB of Gauntlet Legends before the first frame.
+  //
+  // A `.bgz` part is the same data compressed in INDEPENDENT gzip members of
+  // `block` uncompressed bytes each, with the member lengths in a sidecar
+  // `<name>.bgzi.json`. That restores random access — a read costs one Range
+  // fetch of one member — while measuring +1.03% against the shipped gzip -9
+  // parts (Gauntlet Track3.partaa: shipped 2,951,408 B, blocked at 256 KiB
+  // 2,981,745 B). tools/bgzip.mjs writes it, lib/bgz.js reads it, and
+  // tools/bgz.test.mjs holds them to byte-for-byte agreement.
+  //
+  // ⚠ DO NOT "SIMPLIFY" THIS BY STREAMING A WHOLE .bgz THROUGH
+  // DecompressionStream. Verified in Chrome 152 on 2026-09-08: a multi-member
+  // gzip stream fails outright with "TypeError: Failed to fetch", while one
+  // member sliced out by byte offset inflates to exactly its 65,536 B with a
+  // matching checksum. Node's zlib.gunzipSync DOES accept the concatenation, so
+  // a Node-only test passes on a file that no browser can read. Members are cut
+  // out by the length the index gives, one at a time.
+  //
+  // Fetching the index is also what ARMS lazy streaming for a file: no index,
+  // no streaming (the .gz refusal below still stands for the old format).
+  async function loadBgzIndex(file, base) {
+    if (file.__bgz) return file.__bgz;
+    if (!file.index) return null;
+    const r = await fetch(base + file.index);
+    if (!r.ok) throw new Error('bgz index ' + base + file.index + ' -> ' + r.status);
+    const raw = await r.json();
+    // BGZ.prepare re-derives every compressed offset from the block lengths and
+    // asserts they sum to the declared part size and disc size. A Git-LFS
+    // pointer, a truncated part, or an index built from different data is
+    // rejected HERE — before any disc byte is read — rather than surfacing as an
+    // SH4 crash the way the 2026-08-27 pointer deploy did.
+    file.__bgzRaw = raw;
+    file.__bgz = BGZ.prepare(raw, base);
+    return file.__bgz;
+  }
+
+  // Inflate one .bgz part straight into the preallocated disc buffer.
+  // Transient cost is ONE member (~256 KiB compressed), not the ~89 MB the
+  // whole-part gunzip fallback needed.
+  async function fetchBgzInto(url, part, out, off, limit) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('fetch ' + url + ' -> ' + r.status);
+    const clen = part.clen;
+    let w = off;
+    const emit = async (bytes) => {
+      const m = await BGZ.inflateMemberAsync(bytes);
+      if (w + m.length > limit) throw new Error(url + ' overruns the declared disc size at byte ' + w);
+      out.set(m, w); w += m.length;
+      progress(m.length);
+    };
+    if (!r.body || typeof r.body.getReader !== 'function') {
+      const all = new Uint8Array(await r.arrayBuffer());
+      let c = 0;
+      for (let i = 0; i < clen.length; i++) { await emit(all.subarray(c, c + clen[i])); c += clen[i]; }
+      return w - off;
+    }
+    const reader = r.body.getReader();
+    let bi = 0, have = 0;
+    let acc = new Uint8Array(clen[0] || 0);
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      let vo = 0;
+      while (vo < value.length) {
+        if (bi >= clen.length) throw new Error(url + ' is longer than its index describes');
+        const take = Math.min(clen[bi] - have, value.length - vo);
+        acc.set(value.subarray(vo, vo + take), have);
+        have += take; vo += take;
+        if (have === clen[bi]) {
+          await emit(acc);
+          bi++; have = 0;
+          if (bi < clen.length) acc = new Uint8Array(clen[bi]);
+        }
+      }
+    }
+    // A short part is the Git-LFS-pointer failure mode again. Name it.
+    if (bi !== clen.length || have !== 0) {
+      throw new Error(url + ' ended after ' + bi + ' of ' + clen.length +
+                      ' blocks — the part is truncated or the index is stale');
+    }
+    return w - off;
+  }
+
   // ---------------------------------------------------------------------------
   // Lazy disc (?lazydisc=1) — OPT-IN, eager stays the default.
   //
@@ -3268,16 +3363,29 @@
   // 16/16 MB downloaded instead of 1147, heap max=256MB, retro_load_game true,
   // SETTLED guest ratio 1.00000x.
   //
-  // WHERE THE "HTTP 200" SIGHTING COMES FROM: `npm run web` is
+  // WHERE THE "HTTP 200" SIGHTING COMES FROM: `npm run web` USED TO BE
   // `python3 -m http.server`, which has NO Range support and answers 200 with
   // the whole 99,614,720 B part. Preflight then correctly refuses and falls
   // back to eager — so ON THAT SERVER ONLY, the console/low-budget arm silently
   // becomes the eager path and looks like a shipping bug. It is a rig artifact.
+  // [2026-09-08] FIXED AT THE SOURCE: `npm run web` is now
+  // `node tools/devserver.mjs` (package.json:8, commit e362deb1), which
+  // implements 206, so this arm can finally be exercised locally. The python
+  // server survives as `npm run web:simple` — do not use it when Range matters.
+  // A SECOND "200" SIGHTING, worth naming because it wasted time here: `curl -I`
+  // sends a HEAD, and GitHub Pages answers HEAD with 200 even for a range it
+  // would honour on GET. Test Range with a GET, never with -I.
   // The canonical loop's own server implements 206 for exactly this reason
   // (dreamcast/tools/flycast_probe.js:396-420) — test this arm THERE, per
   // CLAUDE.md gate #1, never against a hand-started python server.
   // ---------------------------------------------------------------------------
-  async function preflightRanges(file, base) {
+  // `ix` is the prepared block index for a .bgz file, or null for raw parts.
+  // With an index the server's part size is the COMPRESSED size, so the sum
+  // cannot be compared against the disc size — it is compared against the
+  // index's own per-part csize instead, which is a strictly tighter check: it
+  // catches a part that is the wrong length by even one byte, and it catches an
+  // index built from different data than the parts that got deployed.
+  async function preflightRanges(file, base, ix) {
     const urls = file.parts.map((p) => base + p);
     const parts = [];
     let total = 0;
@@ -3291,15 +3399,24 @@
       const m = /^bytes\s+\d+-\d+\/(\d+)$/i.exec(cr.trim());
       if (!m) throw new Error(urls[i] + ' bad Content-Range: "' + cr + '"');
       const size = parseInt(m[1], 10);
-      // A Git-LFS pointer is 133 B and would sail through a naive size sum.
-      if (!isFinite(size) || size < 1048576) throw new Error(urls[i] + ' implausible size ' + size + ' B');
+      if (!isFinite(size)) throw new Error(urls[i] + ' implausible size ' + size + ' B');
+      if (ix) {
+        const want = ix.parts[i] && ix.parts[i].csize;
+        if (size !== want) {
+          throw new Error(urls[i] + ' is ' + size + ' B, but the block index says ' + want +
+                          ' B — the index and the deployed parts disagree');
+        }
+      } else if (size < 1048576) {
+        // A Git-LFS pointer is 133 B and would sail through a naive size sum.
+        throw new Error(urls[i] + ' implausible size ' + size + ' B');
+      }
       parts.push({ url: urls[i], size: size });
       total += size;
     }
-    if (file.bytes && total !== file.bytes) {
+    if (!ix && file.bytes && total !== file.bytes) {
       throw new Error('disc parts total ' + total + ' B, expected ' + file.bytes + ' B');
     }
-    return { parts: parts, total: total };
+    return { parts: parts, total: ix ? ix.bytes : total, compressed: ix ? total : 0 };
   }
 
   // Returns true if the file was handed to the worker lazily.
@@ -3315,9 +3432,25 @@
     // corrupt disc that still "loads". This must be refused, not attempted —
     // and refused HERE rather than downstream, because the arming reason is a
     // low-memory device, i.e. exactly the visitor least able to recover.
-    if (file.parts.some((n) => /\.gz$/.test(n))) {
+    // [bgz 2026-09-08] ...UNLESS THE PARTS CARRY A BLOCK INDEX. `.bgz` parts are
+    // compressed in independent gzip members with the member lengths in a
+    // sidecar, so a guest range maps onto a COMPRESSED range exactly and the
+    // objection above does not apply — that is the whole point of the format.
+    // The test is the presence of a usable index, not the file extension, so a
+    // missing or malformed sidecar degrades to eager instead of streaming
+    // garbage.
+    if (file.index) {
+      try {
+        await loadBgzIndex(file, base);
+      } catch (e) {
+        pageLog('[lazydisc] ' + file.name + ' has a block index but it could not be used (' +
+                (e && e.message ? e.message : String(e)) + ') — using the eager path');
+        return false;
+      }
+    } else if (file.parts.some((n) => /\.gz$/.test(n))) {
       pageLog('[lazydisc] not available for ' + file.name +
-              ' — its parts are gzipped, and range-mapping a compressed part would corrupt the disc');
+              ' — its parts are gzipped with no block index, and range-mapping a ' +
+              'whole-file-compressed part would corrupt the disc');
       return false;
     }
     // [device-budget 2026-09-04] A THIRD arming reason: the eager path does not
@@ -3355,7 +3488,7 @@
     }
     let pre;
     try {
-      pre = await preflightRanges(file, base);
+      pre = await preflightRanges(file, base, file.__bgz || null);
     } catch (e) {
       // Any doubt at all -> eager. A half-working lazy disc is worse than a
       // slow one: it boots and then corrupts.
@@ -3366,10 +3499,17 @@
     const cacheMB = clampMB(QS.get('disccache'), 16, 512, 96);
     const readahead = clampMB(QS.get('discreadahead'), 0, 32, 4);
     await workerReadyPromise;
+    // The RAW index goes over the wire, not the prepared one: the worker calls
+    // BGZ.prepare itself so its offsets are re-derived from the block lengths in
+    // its own realm. Shipping the prepared form would make the two sides agree
+    // by construction, which is exactly the agreement worth testing.
     worker.postMessage({ cmd: 'discLazy', name: file.name, parts: pre.parts,
+                         index: file.__bgzRaw || null,
                          cacheMB: cacheMB, readahead: readahead });
-    pageLog('[lazydisc] streaming ' + file.name + ' (' + pre.total + ' B over ' +
-            pre.parts.length + ' verified parts, ' + cacheMB + ' MB cache, readahead ' + readahead + ')');
+    pageLog('[lazydisc] streaming ' + file.name + ' (' + pre.total + ' B' +
+            (pre.compressed ? ' from ' + pre.compressed + ' B of block-compressed parts' : '') +
+            ' over ' + pre.parts.length + ' verified parts, ' + cacheMB +
+            ' MB cache, readahead ' + readahead + ')');
     // This file will NOT be downloaded up front, so it must leave the progress
     // denominator — otherwise a lazy boot reads "16/1147 MB" forever and looks
     // like a download that died at 1%.
@@ -3425,10 +3565,23 @@
             'The whole disc is loaded into memory by default; streaming needs the server ' +
             'to answer HTTP Range requests with 206.');
         }
+        // A .bgz part is a run of independent gzip members and must be inflated
+        // member-by-member through its index — see fetchBgzInto. Note the
+        // extension test in fetchDiscInto is /\.gz$/, which does NOT match
+        // ".bgz", so a missing index here would silently write COMPRESSED bytes
+        // into the disc buffer. Resolve the index before the loop and fail loudly
+        // if a .bgz file has none.
+        const eagerIx = file.index ? await loadBgzIndex(file, base) : null;
+        if (!eagerIx && file.parts.some((n) => /\.bgz$/.test(n))) {
+          throw new Error(file.name + ' has .bgz parts but no block index — refusing to ' +
+                          'load, because the compressed bytes would be written to the disc as-is');
+        }
         for (let i = 0; i < parts.length; i++) {
           PROG.discPart = i + 1; PROG.discParts = parts.length;
           setStatus(file.name + ' ' + progressText());
-          off += await fetchDiscInto(parts[i], out, off, file.bytes);
+          off += eagerIx
+            ? await fetchBgzInto(parts[i], eagerIx.parts[i], out, off, file.bytes)
+            : await fetchDiscInto(parts[i], out, off, file.bytes);
         }
       } else {
         const bufs = [];
