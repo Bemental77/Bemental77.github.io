@@ -1870,6 +1870,44 @@ int emscripten_load_state(const uint8_t* buf, size_t size) {
 }
 
 EMSCRIPTEN_KEEPALIVE
+int emscripten_lockstep_normalize(void) {
+    // NORMALIZE-BY-ROUND-TRIP. Serialize this instance and immediately load its
+    // OWN bytes back. The state is unchanged by construction; the POINT is the
+    // side effect — retro_unserialize does emu.stop() -> loadstate -> emu.start(),
+    // and emu.start() REBUILDS subsystems from the serialized data.
+    //
+    // WHY THIS SHAPE. Two fresh boots reach a frame-0 anchor that compares
+    // identical=true, and still diverge at 125-295 of 424 chunks. Pushing a
+    // state into both (--equalize) collapses that to 2/552. Two experiments,
+    // one in each of our hands, eliminated the JIT flush as the ingredient:
+    // hooking flycast_lockstep_reset() into emscripten_reset() moved nothing,
+    // and calling it directly on the frame-0 path moved nothing. What is left
+    // is the emu.stop()/emu.start() restart that retro_unserialize performs.
+    //
+    // The conclusion that follows is the one worth carrying: retro_serialize
+    // CANNOT SEE the difference, so an identical anchor is NECESSARY BUT NOT
+    // SUFFICIENT. Something the machine derives-and-caches rather than stores
+    // differs between two boots, and start() normalizes it.
+    //
+    // NOT called from load_disc_impl deliberately: retro_unserialize guards its
+    // restart with `if (!first_run)`, and at disc-load time no frame has run, so
+    // the restart — the entire point — would be skipped. This must be invoked
+    // once per peer at ROOM START, after boot and before the first lockstep
+    // frame.
+    if (!g_loaded) return 0;
+    const size_t sz = retro_serialize_size();
+    if (!sz) return 0;
+    uint8_t* buf = (uint8_t*)std::malloc(sz);
+    if (!buf) return 0;
+    int ok = 0;
+    if (retro_serialize(buf, sz))
+        ok = retro_unserialize(buf, sz) ? 1 : 0;
+    std::free(buf);
+    if (ok) { flycast_ic_invalidate(); flycast_lockstep_reset(); }
+    return ok;
+}
+
+EMSCRIPTEN_KEEPALIVE
 void emscripten_set_video_target(uint8_t* target_buf, int width, int height) {
     g_video_target   = target_buf;
     g_video_target_w = width;
