@@ -1605,8 +1605,31 @@ void emscripten_run_iter(void) {
 }
 
 EMSCRIPTEN_KEEPALIVE
+extern "C" void flycast_lockstep_reset(void);   // rec_wasm.cpp — see below
 void emscripten_reset(void) {
-    if (g_loaded) retro_reset();
+    if (!g_loaded) return;
+    retro_reset();
+    // LOCKSTEP DETERMINISM (2026-09-08): flush the JIT so every peer resumes
+    // from an IDENTICAL block table and seal phase.
+    //
+    // MEASURED, and this call site is the WHOLE difference. On one binary
+    // (87606c281e7c90d4), with the frame-0 anchor byte-identical either way:
+    //     --frame0             self 0/3  cross 0/3   125-295 / 424 chunks
+    //     --frame0 --equalize  self 2/3  cross 1/3       2 / 552 chunks
+    // Equal starting states cannot behave differently according to HOW they
+    // became equal, so the difference was not the state — it was that
+    // --equalize pushes through emscripten_load_state, which ALREADY calls
+    // flycast_lockstep_reset(), while the shipping frame-0 path loads no state
+    // and therefore never called it at all. The fix works; it was simply inert
+    // where it matters.
+    //
+    // retro_reset() does NOT do this itself: it resets the machine but does not
+    // drive bm_ResetCache, so our Sh4Dynarec::reset() override — which clears
+    // the block shadow and anchors s_dispatches_at_last_seal — never ran on this
+    // path. Note guest_cycles reads 0 after retro_reset even though blocks WERE
+    // compiled during the pre-reset boot, which is why the anchor could look
+    // identical while the two instances' JIT state differed underneath it.
+    flycast_lockstep_reset();
 }
 
 // ── flycast_set_fog / flycast_set_modvol live in shell/libretro/libretro.cpp ──
