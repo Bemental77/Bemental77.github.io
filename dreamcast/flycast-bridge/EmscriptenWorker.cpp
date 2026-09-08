@@ -111,6 +111,51 @@ u32 spg_frame_cycles();
 // (flycast_worker_funcs.js will document it). Defaults to all-released.
 static uint8_t g_maple_pad_state[256] = {0};
 
+// ---------------------------------------------------------------------------
+// HOW MANY CONTROLLERS THIS MACHINE PRESENTS.
+//
+// A real Dreamcast has four maple ports (MAPLE_PORTS, core/hw/maple/maple_devs.h:193)
+// and input_state_cb below already serves all four out of g_maple_pad_state.
+// What was missing is the PLUG: flycast only polls a port that has a Maple
+// device on it, and every port stays MDT_None unless something plugs one in.
+// The failure is SILENT — a player's bytes arrive at the worker and nothing on
+// screen moves — which is exactly how port 1 was once measured
+// ("port 1 = 0x81 lx=+32766 while no device existed to read them").
+//
+// ⚠ AND YET: DO NOT PLUG ALL FOUR UNCONDITIONALLY. On real hardware an empty
+// port reports no device, and games behave differently when they see four
+// controllers — "Player 2 press Start" prompts, character-select slots, co-op
+// auto-join. Plugging four for one player changes single-player behaviour.
+//
+// THE TWO CONSTRAINTS RESOLVE EACH OTHER, and that is WHY the netplay design
+// forms the room BEFORE the disc loads. Devices are created inside
+// mcfg_CreateDevices, which runs during retro_load_game, so the plug has to
+// happen before the game is loaded — and under join-before-boot the player
+// count is known at exactly that moment. Every machine plugs the same number of
+// ports in the same order, so the device set (which is part of the starting
+// state) is identical everywhere. Do not "simplify" this back to a constant.
+//
+// (Late plugging IS available — retro_set_controller_port_device sets
+// devices_need_refresh, and retro_run consumes it at libretro.cpp:1210 via
+// refresh_devices -> maple_ReconnectDevices. It is deliberately NOT used: a
+// hotplug is guest-visible, so under lockstep it would have to land on the
+// identical emulated frame on every machine or it is itself a desync.)
+//
+// DEFAULT 2, WHICH IS EXACTLY WHAT THIS FILE DID BEFORE. Ports 0 and 1 were
+// plugged unconditionally, so 2 is the no-change value and a solo player keeps
+// byte-identical behaviour until the page says otherwise. One port is arguably
+// more correct for solo play, but that is a BEHAVIOUR CHANGE and needs its own
+// measurement, not a silent flip inside a netplay commit.
+static constexpr int EMW_MAX_PORTS = 4;      // == MAPLE_PORTS
+static int g_player_ports = 2;
+
+// Proof that a port is READ, not merely written to. Bumped by input_state_cb,
+// which flycast only calls for a port that has a device on it — so a nonzero
+// count for port N is direct evidence the plug took. This is the check the
+// port-1 fix was originally validated by hand; here it is a number anyone can
+// read back.
+static uint32_t g_port_polls[EMW_MAX_PORTS] = {0, 0, 0, 0};
+
 // Optional SAB-backed framebuffer. JS calls emscripten_set_video_target once
 // with a SAB pointer + dimensions; video_cb memcpys into it. If unset
 // (target=nullptr), video_cb falls back to a Transferable postMessage.
@@ -1041,6 +1086,7 @@ static int16_t input_state_cb(unsigned port, unsigned device, unsigned index,
     // digital L2/R2 bit fallback. All-digital input left PSO unable to WALK
     // (gameplay movement is the analog stick) — 2026-08-27.
     if (port >= 4) return 0;
+    g_port_polls[port]++;
     const unsigned base = port * 64u;
     if (device == RETRO_DEVICE_ANALOG) {
         auto rd16 = [&](unsigned off) -> int16_t {
@@ -1259,19 +1305,25 @@ static int load_disc_impl(const char* path) {
     // MDT_None for every port. Plug a standard controller before device creation
     // (mcfg_CreateDevices runs inside retro_load_game). Native oracle runs the
     // same way (controller polling, SB_MDSTAR double-buffered) and never storms.
-    retro_set_controller_port_device(0, RETRO_DEVICE_JOYPAD);
-    // PORT 1 = ONLINE PLAYER 2. Without this the guest's input reaches the worker
-    // and is never read: input_state_cb already serves 4 ports out of
-    // g_maple_pad_state (64 bytes each) and dreamcast.html already writes port 1,
-    // but flycast only POLLS a port that has a Maple device on it, and per the
-    // comment above every port stays MDT_None unless something plugs one in.
-    // Measured before this line: the guest's bytes arrived at the worker —
-    // port 1 = 0x81 lx=+32766 — while no device existed to read them, so nothing
-    // moved on screen. Gauntlet Legends is 4-player co-op, so this is the whole
-    // point of the online mode.
-    // A second controller also gets its own VMU from createDreamcastDevices(),
-    // which is what lets each player keep their own memory card.
-    retro_set_controller_port_device(1, RETRO_DEVICE_JOYPAD);
+    //
+    // ONE CONTROLLER PER PLAYER IN THE ROOM — see the g_player_ports block near
+    // the top of this file for why the count is a variable and why it must be
+    // set before this point. Gauntlet Legends is FOUR-player co-op, which is
+    // the whole point of the online mode; two was never the right number.
+    // Every plugged controller also gets its own VMU: createDreamcastDevices()
+    // loops over MAPLE_PORTS and gives an expansion VMU to every bus whose main
+    // device is a controller (core/hw/maple/maple_cfg.cpp:401-405), so players
+    // 3 and 4 come away with their own memory cards exactly as 1 and 2 do.
+    {
+        int n = g_player_ports;
+        if (n < 1) n = 1;
+        if (n > EMW_MAX_PORTS) n = EMW_MAX_PORTS;
+        for (int p = 0; p < n; ++p)
+            retro_set_controller_port_device((unsigned)p, RETRO_DEVICE_JOYPAD);
+        MAIN_THREAD_EM_ASM({
+            postMessage({cmd: 'print', txt: '[flycast-worker] plugged ' + $0 + ' controller(s)'});
+        }, n);
+    }
 
     // NOTE: the VMU (memory card) is attached from CORE code — see
     // createDreamcastDevices() in core/hw/maple/maple_cfg.cpp (__EMSCRIPTEN__).
@@ -1569,6 +1621,26 @@ void emscripten_reset(void) {
 EMSCRIPTEN_KEEPALIVE
 uint8_t* emscripten_get_maple_ptr(void) {
     return g_maple_pad_state;
+}
+
+// ⚠ MUST BE CALLED BEFORE THE DISC IS LOADED. mcfg_CreateDevices runs inside
+// retro_load_game, so a port plugged after that point needs a hotplug, which
+// this build deliberately does not do (see the g_player_ports block above).
+EMSCRIPTEN_KEEPALIVE
+void emscripten_set_player_ports(int n) {
+    if (n < 1) n = 1;
+    if (n > EMW_MAX_PORTS) n = EMW_MAX_PORTS;
+    g_player_ports = n;
+}
+EMSCRIPTEN_KEEPALIVE
+int emscripten_get_player_ports(void) { return g_player_ports; }
+
+// The witness: how many times the core has POLLED each port. Nonzero means a
+// device exists there and the guest is reading it — the distinction that the
+// silent-failure mode turns on.
+EMSCRIPTEN_KEEPALIVE
+uint32_t emscripten_get_port_polls(unsigned port) {
+    return port < (unsigned)EMW_MAX_PORTS ? g_port_polls[port] : 0u;
 }
 
 EMSCRIPTEN_KEEPALIVE

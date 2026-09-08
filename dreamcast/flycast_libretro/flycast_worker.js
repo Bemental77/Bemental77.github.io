@@ -350,8 +350,97 @@
     // window too — a duty number straddling two arms describes neither.
     paceBusyMs = 0; pacePacedMs = 0; paceWindowStart = performance.now();
   }
+  // ---------------------------------------------------------------------------
+  // LOCKSTEP PUMP (2026-09-08). Online play used to mean ONE emulator: the host
+  // ran the game and shipped an encoded picture to player 2, whose every button
+  // cost a network round trip plus an encode plus a decode. Player 2 was
+  // watching. Under lockstep BOTH machines run a core and only pad bytes cross
+  // the wire, so each player's own input is local — which is what a console
+  // does.
+  //
+  // WHAT CHANGES HERE, AND WHAT MUST NOT. Exactly one thing changes: the pump
+  // will not start emulated frame N until it HOLDS the pad state for frame N,
+  // for both players. Everything else — the real-time governor, the asyncify
+  // boundary rules, the crash decode — is untouched, and with lockstep off
+  // (the default, and every single-player session) pumpTick runs the identical
+  // path it ran before.
+  //
+  // ⚠ THE GUEST RATE IS NOT A KNOB HERE. The governor still paces the core to
+  // 1.000x the real SH4 clock; lockstep can only make the guest run SLOWER than
+  // that (a stall), never faster. In particular a stall is NOT repaid: the
+  // governor is rebased while gated, so the core never sprints to catch up.
+  // Time lost to a stall stays lost, which is correct — both machines lost it.
+  //
+  // ⚠ AND IT NEVER GUESSES. A missing input stalls. Substituting a plausible
+  // pad value would fork the two machines silently and permanently.
+  // ---------------------------------------------------------------------------
+  let discLoadedOnce = false;   // so a late 'players' is REPORTED, not ignored
+  let lockstep = false;
+  let lsFrame = 0;                  // next emulated frame to run
+  let lsQueue = new Map();          // frame -> Uint8Array(256) maple image
+  let lsHashEvery = 60;
+  let lsPendingHash = -1;           // frame whose fingerprint is owed, -1 = none
+  let lsStallSince = 0, lsStallSpin = 0;
+  const lsStats = { frames: 0, stalls: 0, stallMs: 0, maxStallMs: 0, queued: 0, dropped: 0 };
+
+  // The fingerprint. Every word is a COMMITTED SH4/Holly field read through
+  // flycast_ctx_snapshot, which is already exported by the shipped binary
+  // (flycast_worker_link.sh:86) — this needs no core rebuild.
+  //   0 pc   1 sr   2 interrupt_pend   3 cycle_counter   4 sh4_sched_next
+  //   5 CpuRunning   6 vbr   7 SB_ISTNRM   8 SB_IML6NRM   9 spc  10 ssr  11 pr
+  // plus the 64-bit guest cycle counter, split.
+  // ⚠ ONLY VALID AT A CLEAN ASYNCIFY BOUNDARY. Read mid-suspend these are stale
+  // (the shim's own ?ctxsnap note says so), and a stale fingerprint compared
+  // against a committed one is a FALSE DESYNC. Every caller below checks
+  // runIterSuspended() first and REFUSES rather than returning a bad reading.
+  function lsWords() {
+    const M = self.Module;
+    const w = [];
+    if (typeof M._flycast_ctx_snapshot === 'function') {
+      for (let i = 0; i <= 11; i++) w.push(M._flycast_ctx_snapshot(i) >>> 0);
+    }
+    if (typeof M._flycast_guest_cycles === 'function') {
+      const c = M._flycast_guest_cycles();
+      w.push(c >>> 0, Math.floor(c / 4294967296) >>> 0);
+    }
+    return w;
+  }
+  function lsHash(words) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < words.length; i++) {
+      h = (h ^ (words[i] >>> 0)) >>> 0;
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h >>> 0;
+  }
+  // The maple image is 4 ports x 64 B = 256 B (EmscriptenWorker.cpp:112). A
+  // longer buffer would run off the end of it into whatever follows.
+  const MAPLE_BYTES = 256;
+  function lsWritePads(u8) {
+    const M = self.Module;
+    const ptr = M._emscripten_get_maple_ptr() >>> 0;
+    if (!ptr) return false;
+    M.HEAPU8.set(u8.length > MAPLE_BYTES ? u8.subarray(0, MAPLE_BYTES) : u8, ptr);
+    return true;
+  }
+
   const pumpChannel = new MessageChannel();
   pumpChannel.port1.onmessage = pumpTick;
+  // ⚠ AT MOST ONE PENDING TICK, EVER. Posting to port2 queues a macrotask that
+  // runs a frame; nothing used to stop several from being queued at once, and
+  // then the governor's setTimeout was scheduling one more tick BEHIND a stack
+  // of ticks that were already due. Measured: handing the lockstep queue 480
+  // frames at once made every one of them kick the pump, and the core ran the
+  // entire backlog in under 600 ms — >800 fps, a 13x guest speed-up, which is
+  // precisely the thing that must never happen (CLAUDE.md gate #9). The kick is
+  // now idempotent: a tick already on its way absorbs any further request.
+  let pumpQueued = false;
+  function pumpKick(ms) {
+    if (pumpQueued) return;
+    pumpQueued = true;
+    if (ms > 1) setTimeout(() => pumpChannel.port2.postMessage(0), ms);
+    else pumpChannel.port2.postMessage(0);
+  }
 
   // ---------------------------------------------------------------------------
   // C++ THROW DECODER.  A crash report that says
@@ -489,11 +578,12 @@
   }
 
   function pumpTick() {
+    pumpQueued = false;
     if (!freerun) return;
     const Module = self.Module;
     if (runIterSuspended()) {
       // Let the suspended frame's own timer rewind and finish; check back.
-      setTimeout(() => pumpChannel.port2.postMessage(0), 4);
+      pumpKick(4);
       return;
     }
     // Clean asyncify boundary (run_iter is NOT suspended): the only safe point to
@@ -501,10 +591,58 @@
     // corrupts the frame, so the next run_iter unwinds and the pump freezes — which
     // is what made Save State "break". Do the deferred save here instead.
     if (pendingSave) { pendingSave = false; doSaveState(); }
+    // ---- LOCKSTEP GATE ------------------------------------------------------
+    // We are at a clean asyncify boundary here, which is the only place the
+    // fingerprint of the frame we just finished can be read honestly.
+    if (lockstep) {
+      if (lsPendingHash >= 0) {
+        const f = lsPendingHash; lsPendingHash = -1;
+        const w = lsWords();
+        postMessage({ cmd: 'lsHash', f, h: lsHash(w), w });
+      }
+      const inp = lsQueue.get(lsFrame);
+      if (!inp) {
+        // STALL. The other player's input for this frame has not arrived, so
+        // this machine does not advance. The picture holds, the audio ring
+        // drains, and the page is told so it can say WHY rather than look hung.
+        if (!lsStallSince) {
+          lsStallSince = performance.now(); lsStallSpin = 0; lsStats.stalls++;
+          postMessage({ cmd: 'lsStall', f: lsFrame, on: 1 });
+        }
+        // The governor must not remember this gap: rebasing here is what stops
+        // the core sprinting through the backlog when input arrives.
+        paceBaseWall = 0; paceBaseCyc = 0;
+        // Re-check immediately for the first few tries — most stalls are a
+        // fraction of a frame and a 4 ms timer clamp would turn every one of
+        // them into 4 ms of added latency. Fall back to a timer after that so a
+        // long stall is not a hot spin.
+        pumpKick(lsStallSpin++ < 8 ? 0 : 1);
+        return;
+      }
+      if (lsStallSince) {
+        const d = performance.now() - lsStallSince;
+        lsStallSince = 0;
+        lsStats.stallMs += d;
+        if (d > lsStats.maxStallMs) lsStats.maxStallMs = d;
+        postMessage({ cmd: 'lsStall', f: lsFrame, on: 0, ms: Math.round(d) });
+      }
+      lsQueue.delete(lsFrame);
+      lsWritePads(inp);
+    }
     const t0 = performance.now();
     try {
       Module._emscripten_run_iter();
       freerunIters++;
+      if (lockstep) {
+        const f = lsFrame++;
+        lsStats.frames++;
+        // The page needs to know a frame completed so it can produce the input
+        // for f + delay. It is the frame clock for the whole session.
+        postMessage({ cmd: 'lsFrame', f });
+        // The fingerprint is deferred to the NEXT tick's clean boundary — see
+        // lsWords(). Reading it here can catch a suspended frame.
+        if (lsHashEvery > 0 && (f % lsHashEvery) === 0) lsPendingHash = f;
+      }
     } catch (err) {
       freerun = false;
       if (freerunStatsTimer) { clearInterval(freerunStatsTimer); freerunStatsTimer = 0; }
@@ -544,8 +682,8 @@
     }
     // Only the delay we ASKED for counts as given-back time. setTimeout
     // overshoot lands in the unattributed remainder, so headroom stays a floor.
-    if (delay > 1) { pacePacedMs += delay; setTimeout(() => pumpChannel.port2.postMessage(0), delay); }
-    else pumpChannel.port2.postMessage(0);
+    if (delay > 1) { pacePacedMs += delay; pumpKick(delay); }
+    else pumpKick(0);
   }
 
   // Serialize the full emulator state and hand the bytes to the page. MUST be
@@ -596,7 +734,7 @@
       }, 1000);
       postMessage({ cmd: 'print', txt: '[flycast-shim] freerun ON (worker-owned run loop, real-time governor ' +
                                        (uncap ? 'OFF — ?uncap arm, guest UNGOVERNED' : 'ON — guest paced to 1.000x') + ')' });
-      pumpChannel.port2.postMessage(0);
+      pumpKick(0);
     } else if (!on && freerun) {
       freerun = false;
       if (freerunStatsTimer) { clearInterval(freerunStatsTimer); freerunStatsTimer = 0; }
@@ -621,6 +759,113 @@
         postMessage({ cmd: 'print', txt: '[pump] uncap=' + (uncap ? 1 : 0) + ' (real-time governor ' +
                      (uncap ? 'OFF — MEASUREMENT ARM, guest is NOT at 1.000x' : 'ON — guest paced to 1.000x') + ')' });
         break;
+      // ---- LOCKSTEP ---------------------------------------------------------
+      // Turning it on does NOT start the game: the pump immediately gates on an
+      // empty queue and stalls until the page feeds frame 0. That is deliberate
+      // — a lockstep session must not run one frame before both machines have
+      // agreed on where they are starting from.
+      case 'lockstep': {
+        const on = !!data.on;
+        if (on === lockstep) { postMessage({ cmd: 'lsState', on: lockstep ? 1 : 0, f: lsFrame }); break; }
+        lockstep = on;
+        lsQueue.clear();
+        lsFrame = data.frame | 0;
+        lsPendingHash = -1;
+        lsStallSince = 0;
+        lsHashEvery = data.hashEvery == null ? 60 : (data.hashEvery | 0);
+        lsStats.frames = 0; lsStats.stalls = 0; lsStats.stallMs = 0;
+        lsStats.maxStallMs = 0; lsStats.queued = 0; lsStats.dropped = 0;
+        resetPace();
+        postMessage({ cmd: 'print', txt: '[lockstep] ' + (on
+          ? 'ON — the core advances one frame per delivered input pair, governor still 1.000x'
+          : 'OFF — free-run governor resumed') + ' frame=' + lsFrame + ' hashEvery=' + lsHashEvery });
+        postMessage({ cmd: 'lsState', on: lockstep ? 1 : 0, f: lsFrame });
+        // Kick the pump so an ON while already free-running takes effect at once.
+        if (freerun) pumpKick(0);
+        break;
+      }
+      // One frame's input: the full 256-byte maple image (4 ports x 64 B),
+      // exactly the layout case 'input' already uses. Both players' pads are in
+      // it, because under lockstep every machine writes every pad.
+      case 'lsInput': {
+        if (!data.states) break;
+        const f = data.f | 0;
+        if (f < lsFrame) { lsStats.dropped++; break; }   // already run; cannot un-run it
+        lsQueue.set(f, new Uint8Array(data.states));
+        lsStats.queued++;
+        // ⚠ ONLY the frame the pump is actually parked on may un-park it.
+        // Kicking on EVERY queued input is what let a 480-frame backlog queue
+        // 480 pump ticks and sprint the guest through all of them.
+        if (lockstep && freerun && lsStallSince && f === lsFrame) pumpKick(0);
+        break;
+      }
+      // The fingerprint, on demand — this is what proves the two machines start
+      // identical (and, at the end, what a bug report should carry).
+      // ⚠ REFUSES rather than reporting a stale reading mid-suspend.
+      case 'lsFingerprint': {
+        if (runIterSuspended()) {
+          postMessage({ cmd: 'lsFingerprint', ok: false, f: lsFrame,
+                        error: 'a frame is asyncify-suspended — the fingerprint would be stale' });
+          break;
+        }
+        try {
+          const w = lsWords();
+          postMessage({ cmd: 'lsFingerprint', ok: w.length > 0, f: lsFrame, w, h: lsHash(w),
+                        error: w.length ? null : 'flycast_ctx_snapshot is not exported by this build' });
+        } catch (err) {
+          postMessage({ cmd: 'lsFingerprint', ok: false, f: lsFrame,
+                        error: (err && err.message) ? err.message : String(err) });
+        }
+        break;
+      }
+      case 'lsStats': {
+        postMessage({ cmd: 'lsStats', on: lockstep ? 1 : 0, f: lsFrame,
+                      queued: lsQueue.size, frames: lsStats.frames, stalls: lsStats.stalls,
+                      stallMs: Math.round(lsStats.stallMs), maxStallMs: Math.round(lsStats.maxStallMs),
+                      accepted: lsStats.queued, dropped: lsStats.dropped });
+        break;
+      }
+      // HOW MANY CONTROLLERS TO PRESENT. One per player in the room.
+      // ⚠ MUST ARRIVE BEFORE 'discReady'/'discLazy' — the devices are created
+      // inside retro_load_game and this build does not hotplug (see the
+      // g_player_ports block in EmscriptenWorker.cpp for why). Sending it late
+      // is reported rather than silently ignored, because a room that quietly
+      // ran with the wrong number of pads is a desync between machines.
+      case 'players': {
+        const n = Math.max(1, Math.min(4, data.n | 0));
+        try {
+          if (typeof Module._emscripten_set_player_ports !== 'function') {
+            postMessage({ cmd: 'print', txt: '[players] REFUSED — this build has no _emscripten_set_player_ports; relink' });
+            postMessage({ cmd: 'players', ok: false, n: 0, late: false, error: 'export missing' });
+            break;
+          }
+          Module._emscripten_set_player_ports(n);
+          const got = Module._emscripten_get_player_ports() >>> 0;
+          const late = !!discLoadedOnce;
+          if (late) postMessage({ cmd: 'print', txt: '[players] ⚠ SET AFTER THE DISC LOADED — the controllers were already created; this will NOT take effect until the next load' });
+          postMessage({ cmd: 'print', txt: '[players] presenting ' + got + ' controller(s)' + (late ? ' (TOO LATE)' : '') });
+          postMessage({ cmd: 'players', ok: !late && got === n, n: got, late });
+        } catch (err) {
+          postMessage({ cmd: 'players', ok: false, n: 0, late: false, error: String(err) });
+        }
+        break;
+      }
+      // THE WITNESS: has the core actually POLLED each port? A plug that did not
+      // take is silent — the bytes arrive and nothing reads them — so this is
+      // the difference between "delivered" and "read".
+      case 'portPolls': {
+        const out = [];
+        try {
+          for (let p = 0; p < 4; p++) out.push(Module._emscripten_get_port_polls(p) >>> 0);
+        } catch (err) {
+          postMessage({ cmd: 'portPolls', ok: false, polls: [], error: String(err) });
+          break;
+        }
+        postMessage({ cmd: 'portPolls', ok: true, polls: out,
+                      players: (typeof Module._emscripten_get_player_ports === 'function')
+                               ? (Module._emscripten_get_player_ports() >>> 0) : -1 });
+        break;
+      }
       case 'mem-init':
         // Already bootstrapped — ignore late re-sends.
         return;
@@ -862,6 +1107,7 @@
         }
         try {
           const ret = Module.ccall('emscripten_load_disc', 'number', ['string'], [data.cuePath]);
+          discLoadedOnce = true;   // any later 'players' is too late to take effect
           postMessage({ cmd: 'discLoaded', cuePath: data.cuePath, success: !!ret });
         } catch (err) {
           postMessage({ cmd: 'print', txt: '[flycast-shim] load_disc threw: ' + (err && err.message ? err.message : String(err)) });
@@ -1015,7 +1261,14 @@
           Module._free(ptr);
           // A preceding Save typically stopped the pump (asyncify unwind). Resume
           // it from the restored state so Load actually continues the game.
-          if (ok && !freerun) { freerun = true; pumpChannel.port2.postMessage(0); }
+          if (ok && !freerun) { freerun = true; pumpKick(0); }
+          // A lockstep session restarts its frame numbering at the state it was
+          // handed; anything still queued belongs to the machine we just threw
+          // away. `frame` is optional so single-player Load State is unchanged.
+          if (lockstep) {
+            lsQueue.clear(); lsPendingHash = -1; lsStallSince = 0;
+            lsFrame = data.frame | 0;
+          }
           postMessage({ cmd: 'stateLoaded', success: !!ok });
         } catch (err) {
           postMessage({ cmd: 'print', txt: '[flycast-shim] loadState threw: ' + (err && err.message ? err.message : String(err)) });
@@ -1108,7 +1361,7 @@
           freerun = false;
           const finish = () => {
             freerun = wasFreerun;
-            if (freerun) pumpChannel.port2.postMessage(0);
+            if (freerun) pumpKick(0);
           };
           const isUnwind = (err) => err && (err === 'unwind' || err.message === 'unwind');
           const tick = () => {
