@@ -294,6 +294,22 @@ try {
     'neither browser has fetched a disc — this is the state a player opens a room from',
     `booted: ${J(booted0)}`);
 
+  // ⚠ PICK THE DISC BEFORE OPENING THE ROOM, and note that selecting is a
+  // DROPDOWN, not a download — nothing boots, which is the property under test.
+  // lib/netplay.js binds the game name into the pairing handshake and refuses a
+  // joiner who names a different one ("the other player is on pso2"), so a room
+  // opened while #romSelect still holds the page default rejects every joiner.
+  // The first version of this rewrite hit exactly that and sat through both
+  // 90 s pairing budgets before failing.
+  const openerPicked = await host.evaluate((g) => {
+    const el = document.querySelector('#romSelect');
+    if (!el) return null;
+    el.value = g; el.dispatchEvent(new Event('change')); return el.value;
+  }, GAME);
+  T.cell(openerPicked === GAME, 'opener-picks-the-disc-without-booting',
+    `#romSelect reads "${openerPicked}" and nothing has started`,
+    `set "${GAME}", #romSelect reads ${J(openerPicked)} — assigning an unmatched value to a <select> is a ` +
+    'SILENT no-op, and the room would then be opened for a different disc than everyone was told');
   T.info('open-panel', await click(host, '#btnNet'));
   const statusText = await host.evaluate(() => (document.getElementById('netStatus').textContent || '').trim());
   T.cell(!/press Start first|needs a running game/i.test(statusText), 'no-boot-first-gate',
