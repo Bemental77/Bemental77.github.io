@@ -107,8 +107,21 @@
   };
   const ANALOG_KEYS = ['w', 'a', 's', 'd'];
   const MAPPED = new Set(Object.values(KEYMAP).flat().concat(ANALOG_KEYS));
-  // Standard-mapping gamepad index -> N64 button.
-  const GP = ['a', 'b', 'b', 'a', 'l', 'r', 'z', 'z', null, 'start',
+  // Standard-mapping gamepad index -> N64 button. NOT chosen here: these are the
+  // Joy_Mapping_* defaults the vendored core ships
+  // (n64/N64Wasm/dist/input_controller.js:358-364), which n64/index.html:2738-2739
+  // copies verbatim and writes into the config.txt the core reads. A on 0, B on 2
+  // (N64's B sits LEFT of A, and index 2 is the left face button), Z on 4, R on 5,
+  // L on 6, Start on 9, d-pad on 12-15.
+  //
+  // ⚠ THIS HAD L AND Z SWAPPED until 2026-09-08 (4 -> L, 6 -> Z), plus three
+  // bindings the host has not got (1 -> B, 3 -> A, 7 -> Z), so player 2's trigger
+  // pulls landed on a different N64 button from player 1's. The core takes ONE
+  // index per action, so the host cannot mirror the extras and they are gone
+  // rather than duplicated. tools/control_map_drift_test.mjs now fails on any
+  // divergence. Index 11 is n64/index.html's Joy_Mapping_Menu — a page control,
+  // not an N64 button — so it is deliberately absent here.
+  const GP = ['a', null, 'b', null, 'z', 'r', 'l', null, null, 'start',
               null, null, 'up', 'down', 'left', 'right'];
 
   const held = new Set();

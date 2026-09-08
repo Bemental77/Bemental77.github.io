@@ -86,10 +86,21 @@
     [B.start]: ['enter'], [B.mode]: ['shift'],
   };
   const MAPPED = new Set(Object.values(KEYMAP).flat());
-  // Standard-mapping gamepad index -> Genesis button, the same table
-  // genesis.html's GP_BTN uses, so a physical pad behaves identically on both
-  // sides of the wire.
-  const GP = [B.a, B.b, B.x, B.y, B.c, B.z, -1, -1, B.mode, B.start, -1, -1,
+  // Standard-mapping gamepad index -> Genesis button. IT IS NOT THE PAD'S OWN
+  // LETTERS, and that is the whole trap. genesis.html:813's GP_BTN routes the
+  // faces the way RetroArch does — bottom -> RETRO_B, right -> RETRO_A,
+  // left -> RETRO_Y, top -> RETRO_X, L1 -> RETRO_L, R1 -> RETRO_R — and Genesis
+  // Plus GX then reads RETRO_B as MD B, RETRO_A as MD C, RETRO_Y as MD A,
+  // RETRO_X as MD Y, RETRO_L as MD X and RETRO_R as MD Z
+  // (libretro/libretro.c:2958-2963, the same table quoted above `B`). Composed:
+  // bottom = B, right = C, left = A, top = Y, L1 = X, R1 = Z.
+  //
+  // ⚠ THIS READ [a, b, x, y, c, z] UNTIL 2026-09-08 — the "tidy" order the
+  // comment above `B` warns against — under a claim that it was genesis.html's
+  // table. Four of the six face buttons therefore reached the game as a
+  // DIFFERENT BUTTON for player 2 than for player 1. tools/control_map_drift_test.mjs
+  // now compares the two tables and fails on any divergence.
+  const GP = [B.b, B.c, B.a, B.y, B.x, B.z, -1, -1, B.mode, B.start, -1, -1,
               B.up, B.down, B.left, B.right];
 
   const held = new Set();

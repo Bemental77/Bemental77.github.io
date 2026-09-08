@@ -232,10 +232,12 @@
     [B.cup]: ['p'], [B.cleft]: ['l'], [B.cdown]: [';'], [B.cright]: ["'"],
   };
   const MAPPED = new Set(Object.values(KEYMAP).flat());
-  // Standard-mapping gamepad index -> GC button. gamecube.html reads real pads
-  // through Module._CheckJoy inside the core and publishes no table to copy, so
-  // this one is THIS PAGE'S, chosen to put the GameCube face buttons where a
-  // modern pad's are: A on the bottom button, B to its left/right neighbour.
+  // Standard-mapping gamepad index -> GC button, and it MUST equal
+  // gamecube.html's GP_BUTTON_KEYS (gamecube.html:7261 — that page does publish
+  // a table; the claim here that it "reads real pads through Module._CheckJoy
+  // and publishes no table to copy" was wrong, and index 7 and 9 had drifted
+  // apart underneath it). Both triggers reach Z; GC's L/R are on the bumpers.
+  // tools/control_map_drift_test.mjs compares the two and fails on divergence.
   const GP = [B.a, B.b, B.x, B.y, B.l, B.r, B.z, B.z,
               B.select, B.start, -1, -1, B.up, B.down, B.left, B.right];
 

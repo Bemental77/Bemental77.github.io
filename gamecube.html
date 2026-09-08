@@ -7258,7 +7258,18 @@ window.GcRate = (function () {
   applyHide(localStorage.getItem('gcwasm_hide') === '1');
   $('mobileMenuBtn').addEventListener('click', openMobileMenu); $('mClose').addEventListener('click', closeMobileMenu); $('mSave').addEventListener('click', () => { saveState(); closeMobileMenu(); }); $('mLoad').addEventListener('click', () => { loadState(); closeMobileMenu(); }); $('mMute').addEventListener('click', () => { toggleMute(); closeMobileMenu(); }); $('mResetAudio').addEventListener('click', () => { resetAudio(); closeMobileMenu(); }); $('mGhost').addEventListener('click', toggleGhost); $('mHide').addEventListener('click', () => { toggleHide(); closeMobileMenu(); }); $('mFull').addEventListener('click', () => { toggleFullscreen(); closeMobileMenu(); });
   $('mobileHideHint').addEventListener('click', () => { applyHide(false); localStorage.setItem('gcwasm_hide', '0'); });
-  var GP_BUTTON_KEYS = { 0: KEYMAP.a, 1: KEYMAP.b, 2: KEYMAP.x, 3: KEYMAP.y, 4: KEYMAP.l, 5: KEYMAP.r, 6: KEYMAP.z, 7: KEYMAP.start, 8: KEYMAP.select, 12: KEYMAP.up, 13: KEYMAP.down, 14: KEYMAP.left, 15: KEYMAP.right }; var gpPressed = {}; var gpPolling = false; var GP_AXIS_DEAD = 0.35;
+  // Standard-mapping gamepad index -> a KEYMAP label, which dispatchKey's own
+  // keyToPad then turns into a pad button. ⚠ SHARED WITH gamecube_multiplayer.html:
+  // that page owns a copy of this table for player 2, and
+  // tools/control_map_drift_test.mjs fails if the two stop agreeing.
+  // 2026-09-08: Start was on index 7 — the RIGHT TRIGGER — while index 9, which
+  // the Standard Gamepad mapping defines as the pad's Start button, was unbound.
+  // Every other page here binds 9 to Start (ps1.html:975, snes.html:741,
+  // genesis.html:813, n64/index.html Joy_Mapping_Action_Start, dreamcast.html's
+  // GP_BTN_TO_RETRO), so 7 was the outlier: pulling RT opened the pause menu and
+  // the Start button did nothing. Start moved to 9; index 7 now reaches Z, which
+  // is what gamecube_multiplayer.html already had there.
+  var GP_BUTTON_KEYS = { 0: KEYMAP.a, 1: KEYMAP.b, 2: KEYMAP.x, 3: KEYMAP.y, 4: KEYMAP.l, 5: KEYMAP.r, 6: KEYMAP.z, 7: KEYMAP.z, 8: KEYMAP.select, 9: KEYMAP.start, 12: KEYMAP.up, 13: KEYMAP.down, 14: KEYMAP.left, 15: KEYMAP.right }; var gpPressed = {}; var gpPolling = false; var GP_AXIS_DEAD = 0.35;
   function gpEdge(id, keyLabel, pressed) { if (pressed && !gpPressed[id]) { dispatchKey('keydown', keyLabel); gpPressed[id] = true; } else if (!pressed && gpPressed[id]) { dispatchKey('keyup', keyLabel); gpPressed[id] = false; } }
   function pollGamepads() { var pads = (navigator.getGamepads && navigator.getGamepads()) || []; for (var i = 0; i < pads.length; i++) { var gp = pads[i]; if (!gp) continue; var btns = gp.buttons || []; for (var b in GP_BUTTON_KEYS) { var bi = +b, key = GP_BUTTON_KEYS[b]; gpEdge(i + ':b' + bi, key, !!(btns[bi] && btns[bi].pressed)); } var ax = gp.axes || []; var axX = ax[0] || 0, axY = ax[1] || 0; gpEdge(i + ':axL', KEYMAP.left, axX < -GP_AXIS_DEAD); gpEdge(i + ':axR', KEYMAP.right, axX > GP_AXIS_DEAD); gpEdge(i + ':axU', KEYMAP.up, axY < -GP_AXIS_DEAD); gpEdge(i + ':axD', KEYMAP.down, axY > GP_AXIS_DEAD); } requestAnimationFrame(pollGamepads); }
   window.addEventListener('gamepadconnected', function (e) { setStatus('Controller connected: ' + e.gamepad.id); if (!gpPolling) { gpPolling = true; requestAnimationFrame(pollGamepads); } }); window.addEventListener('gamepaddisconnected', function () { setStatus('Controller disconnected'); }); if (navigator.getGamepads) { gpPolling = true; requestAnimationFrame(pollGamepads); }

@@ -103,11 +103,21 @@
     [D.START]: ['v'], [D.SELECT]: ['c'],
   };
   const MAPPED = new Set(Object.values(KEYMAP).flat());
-  // Standard-mapping gamepad index -> DKEY. A guest on a console browser or a
-  // desktop with a pad is exactly the "as if player 2 was on the same couch"
-  // case, so a real controller has to work here too.
+  // Standard-mapping gamepad index -> DKEY, and it MUST equal ps1.html's own
+  // GP_BUTTON_KEYS (ps1.html:982-984, with Start/Select on 9/8 from
+  // GP_START_BTN/GP_SELECT_BTN). A guest on a console browser or a desktop with
+  // a pad is exactly the "as if player 2 was on the same couch" case, so a real
+  // controller has to work here too.
+  //
+  // ⚠ 10 and 11 ARE DELIBERATELY UNBOUND, matching ps1.html. They were L3/R3
+  // until 2026-09-08, which contradicted this page's own header twice over: a
+  // DIGITAL PlayStation pad (PadMode 0, PadID 0x41 — what both sides send) has
+  // no stick clicks to press, and on Xbox Edge those two buttons fire
+  // BrowserBack/BrowserForward, which ps1.html:960-967 answers with a history
+  // sentinel rather than a binding. tools/control_map_drift_test.mjs now fails
+  // on any divergence from ps1.html.
   const GP = [D.CROSS, D.CIRCLE, D.SQUARE, D.TRIANGLE, D.L1, D.R1, D.L2, D.R2,
-              D.SELECT, D.START, D.L3, D.R3, D.UP, D.DOWN, D.LEFT, D.RIGHT];
+              D.SELECT, D.START, -1, -1, D.UP, D.DOWN, D.LEFT, D.RIGHT];
 
   const held = new Set();
   const touched = new Set();
@@ -130,7 +140,10 @@
       const gp = pads[p]; if (!gp) continue;
       const btns = gp.buttons || [];
       for (let i = 0; i < btns.length && i < GP.length; i++) {
-        if (btns[i] && btns[i].pressed) m |= (1 << GP[i]);
+        // `>= 0`, not a truthiness test: D.SELECT is 0. An unbound slot is -1,
+        // and `1 << -1` is 0x80000000 — a bit no button owns, on a mask the far
+        // side reads as an int32.
+        if (btns[i] && btns[i].pressed && GP[i] >= 0) m |= (1 << GP[i]);
       }
       const a = gp.axes || [], dz = 0.3;
       if (!ax && !ay && a.length >= 2) {
