@@ -125,8 +125,10 @@ The base is pinned in `.gitignore`'s managed block as
 `# upstream-base: 4be8a484665fb5684ccb780ed2165018a679c622`.
 
 ⚠ **`patch --dry-run` is still forbidden as a check**, for the reasons below,
-and the patch series is INCOMPLETE besides — it covers 23 of the 33 flycast
-files that differ from upstream. BSD `patch` silently skips already-applied
+and the patch series is INCOMPLETE besides — it covers 24 of the 33 flycast
+files that differ from upstream (verified: `grep -h '^+++ b/' patches/*.patch |
+sort -u` = 24 paths, `comm` against the drift set leaves 9 uncovered, plus the
+DreamPicoPort-API one = 10 with no patch at all). BSD `patch` silently skips already-applied
 hunks and still exits 0, and fuzzy matching applied a `FEAT_AREC` hunk against
 the wrong one of `build.h`'s four identical `#define FEAT_AREC DYNAREC_NONE`
 lines.

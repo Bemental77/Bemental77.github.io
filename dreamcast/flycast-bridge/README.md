@@ -10,7 +10,7 @@ Read this before trusting anything below it.
 `dreamcast/flycast-src/` **is** edited in place, and always has been. The
 "never edited in place" convention this README used to claim was not the
 reality on disk: 33 files differ from upstream flycast `4be8a48` and the
-numbered patch series covers only 23 of them. Ten ported files
+numbered patch series covers only 24 of them. Ten ported files
 (`gdromv3.cpp`, `holly_intc.cpp`, `maple_if.cpp`, `blockmanager.cpp`,
 `driver.cpp`, `sh4_interpreter.cpp`, `sh4_interrupts.cpp`, `sh4_sched.cpp`,
 `reios.cpp`, and one `#include` inside the `DreamPicoPort-API` submodule)
