@@ -306,16 +306,6 @@ const HARNESSES = [
     timeoutMs: 30 * MIN,
   },
   {
-    name: 'dreamcast-netplay',
-    file: 'tools/dreamcast_netplay_test.mjs',
-    cmd: ['node', 'tools/dreamcast_netplay_test.mjs'],
-    desc: 'dreamcast.html streams a RUNNING game to a second tab off a canvas that was transferred to the worker, judged on pixels read from the guest’s own <video>, and the guest’s pad lands in the byte array the host hands the emulator worker',
-    fast: false, ci: false,
-    ciWhy: 'boots a 563 MB Dreamcast disc',
-    server: true, requires: ['dreamcast/discs', 'dreamcast/flycast_libretro/flycast_worker_emcc.wasm'],
-    timeoutMs: 30 * MIN,
-  },
-  {
     name: 'gamecube-mp-page',
     file: 'tools/gamecube_mp_page_test.mjs',
     cmd: ['node', 'tools/gamecube_mp_page_test.mjs'],
@@ -364,10 +354,18 @@ const HARNESSES = [
     server: true, requires: ['lib/netplay.js'], timeoutMs: 15 * MIN,
   },
   {
+    name: 'dreamcast-room-hud',
+    file: 'dreamcast/tools/room_hud_test.mjs',
+    cmd: ['node', 'dreamcast/tools/room_hud_test.mjs'],
+    desc: 'the room opens BEFORE the emulator (the boot-first gate is gone), the roster draws one seat per PORT from the engine’s own count, per-player disc progress is visible, and the session-truth panel names WHICH player it is stalling on and raises a latched, named DESYNC banner — asserted on layout geometry, not on a class name',
+    fast: true, ci: true,
+    server: true, requires: ['dreamcast.html'], timeoutMs: 6 * MIN,
+  },
+  {
     name: 'netplay-realui-pair',
     file: 'tools/netplay_realui_pair_test.mjs',
     cmd: ['node', 'tools/netplay_realui_pair_test.mjs'],
-    desc: 'the intersection nobody was standing on: the INLINE panel a person actually clicks, across TWO separate browser profiles, on the transport the page picks for itself',
+    desc: 'REWRITTEN 2026-09-08 for the lockstep room. The INLINE panel a person actually clicks, across TWO separate browser profiles, on the transport the page picks for itself — asserting the order the product HAS (join the room with nothing booted, ports assigned, a joiner who can start its OWN core) rather than the boot-first streaming order it used to assert while passing 27/27',
     fast: false, ci: false,
     ciWhy: 'same as audit-peerjs-crossdevice — it deliberately uses the real broker and real ICE, so it is network-dependent by design',
     server: true, requires: ['lib/netplay.js'], timeoutMs: 25 * MIN,
@@ -380,6 +378,8 @@ const HARNESSES = [
 // omission you can read is not the same thing as a silence.
 // ---------------------------------------------------------------------------
 const NOT_RUN = [
+  { file: 'tools/dreamcast_netplay_test.mjs',
+    why: '⚠ IT ASSERTS A CANCELLED ARCHITECTURE. It judges pixels read from the guest\u2019s own <video> and calls __dcNet().guestAudio / __dcNetStream() \u2014 but streaming was cancelled by user directive 2026-09-08 and dreamcast.html has none of those any more. It is named here rather than quietly deleted because an omission you can read is not a silence: it still holds the only ONE-BROWSER TWO-TAB arm (BroadcastChannel signalling in a single profile, no broker, fast) and should be REWRITTEN as the two-tab room test rather than dropped. Covering it today: dreamcast/tools/room_hud_test.mjs (flow + session honesty, one browser) and dreamcast/tools/netplay_room_e2e.mjs (N browsers, N cores)' },
   { file: 'tools/ps1_pad_test.mjs',
     why: 'superseded in coverage by tools/legacy_emu_page_test.mjs (ps1 arm) and it exits 0 on every path except "runtime never came up" — its own body prints diagnostics rather than asserting, so a green exit here would not mean much' },
   { file: 'tools/n64_jit_diff_test.mjs',

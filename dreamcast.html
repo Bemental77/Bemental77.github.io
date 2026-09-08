@@ -717,7 +717,7 @@
     <!-- THE ROOM. Hidden until there is a session; every row is one PORT of the
          console, filled from the engine's own port count. See netRoomRender(). -->
     <div id="netRoom" style="display:none">
-      <div class="netLabel">The room <span id="netRoomPorts"></span></div>
+      <div class="netLabel">The room <span id="netRoomGame"></span><span id="netRoomPorts"></span></div>
       <ul id="netRoster"></ul>
       <button id="netReady" type="button" style="display:none">I'm ready</button>
       <span id="netBarrier"></span>
@@ -4712,7 +4712,22 @@
     $('netJoinPane').style.display = 'none';
     const code = fixedCode || Netplay.makeCode(5);
     $('netCode').textContent = code;
-    netStatus('Room open. Share the code — everyone loads the game once you are all in.', 'busy');
+    // ⚠ SAY WHICH DISC THE ROOM IS FOR. lib/netplay.js still binds the game name
+    // into the pairing handshake and REFUSES a joiner who names a different one
+    // ("the other player is on <game>"), so a room opened while the picker
+    // happened to read the default silently rejects everyone who was told which
+    // game to pick. Nothing is booted here — this is a dropdown, not a download —
+    // but the opener has to be able to see what they published.
+    // TODO (engine): the disc agreement belongs in the ROOM and its mismatch
+    // guard belongs on the START BARRIER, where "everyone has the same disc
+    // loaded" can be checked against what each peer actually loaded rather than
+    // against what they typed before connecting.
+    const roomGame = $('romSelect').value;
+    const roomGameLabel = (function () {
+      const o = $('romSelect').options[$('romSelect').selectedIndex];
+      return o ? o.textContent.trim() : roomGame;
+    })();
+    netStatus('Room open for ' + roomGameLabel + '. Share the code — everyone loads the game once you are all in.', 'busy');
     NET.role = 'host';
     // ⚠ NOTHING IS CAPTURED HERE ANY MORE. This used to call
     // netCaptureSurface() and s.attachMedia(canvas, audioNode) — 1.8 s of
@@ -4721,14 +4736,14 @@
     // reason to make the person opening the room wait for a capture arm to be
     // chosen before they can read their own code.
     const s2 = new Netplay.Session({
-      game: $('romSelect').value, host: true, code, transport: netTransport(),
+      game: roomGame, host: true, code, transport: netTransport(),
     });
     NET.session = s2;
     s2.on('status', netOnStatus);
     // The room is drawn from the moment there IS one, not from `connected`: the
     // person who opened it needs to watch the seats fill.
     netHudClearDesync(); netRoomStart(); netHudStart();
-    pageLog('[net] room ' + code + ' open (' + netTransport() + '), game ' + $('romSelect').value);
+    pageLog('[net] room ' + code + ' open (' + netTransport() + ') for ' + roomGame);
     await s2.start();
   }
 
@@ -4863,6 +4878,58 @@
     let t = null;
     try { if (typeof s.netTelemetry === 'function') t = s.netTelemetry(); } catch (e) {}
     if (!t) { try { t = s.lockstep || null; } catch (e) {} }
+    // ---- the ADAPTER onto the shipped engine --------------------------------
+    // lib/netplay.js's Lockstep exposes report(), not the shape above:
+    //   { state, frame, delay, portCount, ports:[{port,peer,local,dropped}],
+    //     localPorts, desync, error, lastAgreedFrame, stalls, stallMs, ... }
+    // This maps it, READ-ONLY. It is here rather than in lib/netplay.js because
+    // that file is deliberately transport-free and browser-free so its protocol
+    // can be tested in Node; the panel's shape is a page concern.
+    // ⚠ Every field is defended: an engine that renames one costs the panel that
+    // one row, never the panel.
+    if (!t) {
+      try {
+        const ls = s.ls;
+        if (ls && typeof ls.report === 'function') {
+          const r = ls.report();
+          const seats = r.ports || [];
+          const mine = (r.localPorts && r.localPorts.length) ? r.localPorts[0] : null;
+          const d = r.desync || null;
+          t = {
+            mode: 'lockstep',
+            ports: r.portCount,
+            frame: r.frame,
+            delayFrames: r.delay,
+            // 'running' is past the barrier; 'lobby'/'waiting' are before it.
+            barrier: { started: r.state === 'running' || r.state === 'stalled', startFrame: 0 },
+            you: mine == null ? null : {
+              port: mine, name: 'you',
+              // The barrier's own readiness is what "ready" means here, not a
+              // local flag: a machine that has finished downloading but has not
+              // been admitted past the barrier is NOT ready.
+              ready: (r.state === 'running' || r.state === 'stalled'),
+              loadPct: netLocalLoad(),
+            },
+            peers: seats.filter((q) => q && q.peer && !q.local).map((q) => ({
+              id: q.peer, name: q.peer, port: q.port,
+              connected: !q.dropped,
+              ready: (r.state === 'running' || r.state === 'stalled'),
+              loadPct: null,
+              frame: r.frame, rttMs: null,
+              stalling: (r.state === 'stalled') && LSWAIT.ports.indexOf(q.port) >= 0,
+            })),
+            stalled: r.state === 'stalled',
+            stallMs: LSWAIT.since ? (Date.now() - LSWAIT.since) : 0,
+            stallTotalMs: r.stallMs,
+            waitingOn: LSWAIT.ports.slice(),
+            desync: !!d,
+            desyncFrame: d ? (d.frame != null ? d.frame : r.lastAgreedFrame) : null,
+            desyncPeers: d ? (Array.isArray(d.ports) ? d.ports : (d.port != null ? [d.port] : [])) : [],
+            desyncDetail: d ? (d.detail || d.field || d.why || JSON.stringify(d).slice(0, 200)) : null,
+          };
+        }
+      } catch (e) { /* the panel reports "no telemetry", which is the truth */ }
+    }
     // TEST SEAM, in the same family as __dcPad / __dcNet / __dcProbe. Reaching
     // it needs script execution in the page, so it is not a user-facing mode; it
     // exists so the stall line, the roster and the desync banner can be PROVEN
@@ -4921,6 +4988,27 @@
   }
 
   const HUD = { on: false, tickTimer: 0, desyncLatched: false, desyncAt: 0, text: '', mode: null, tel: null };
+  // WHICH PLAYERS THE SESSION IS WAITING ON exists only in the engine's `stall`
+  // EVENT — report() carries the state and the totals but not the port list, and
+  // "waiting..." in a room of four is not actionable. So the event is cached
+  // here and cleared on resume.
+  const LSWAIT = { ports: [], since: 0 };
+  function netWatchLockstep(sess) {
+    try {
+      const ls = sess && sess.ls;
+      // ⚠ IDEMPOTENT AND RETRIED. `session.ls` does not exist until
+      // startLockstep() runs, which is after the room forms, so this cannot be
+      // a one-shot at session creation — the HUD tick calls it every 400 ms and
+      // it latches on the first engine it sees.
+      if (!ls || typeof ls.on !== 'function' || ls.__dcWatched) return;
+      ls.__dcWatched = true;
+      ls.on('stall', (e) => {
+        if (e && e.on) { LSWAIT.ports = (e.waitingOn || []).slice(); if (!LSWAIT.since) LSWAIT.since = Date.now(); }
+        else { LSWAIT.ports = []; LSWAIT.since = 0; }
+      });
+      ls.on('resume', () => { LSWAIT.ports = []; LSWAIT.since = 0; });
+    } catch (e) {}
+  }
   const FRAME_MS = 1000 / 60;
   const esc = (v) => String(v == null ? '' : v).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
@@ -4945,6 +5033,7 @@
     // the SESSION does. It stops when there is no session at all.
     if (!s) { netHudStop(); return; }
     const connected = (s.state === 'connected');
+    netWatchLockstep(s);
     const t = netTelemetry() || { mode: 'none', fault: 'no session telemetry' };
     HUD.mode = t.mode; HUD.tel = t;
 
@@ -5135,6 +5224,16 @@
     }
 
     const taken = peers.filter((q) => q.port != null).length + (youPort != null ? 1 : 0);
+    const gEl = $('netRoomGame');
+    if (gEl) {
+      const g = (s.game && s.game !== 'unknown') ? s.game : null;
+      const label = g ? (function () {
+        const o = Array.prototype.find.call($('romSelect').options, (x) => x.value === g);
+        return o ? o.textContent.trim() : g;
+      })() : null;
+      const txt = label ? '· ' + label + ' ' : '';
+      if (gEl.textContent !== txt) gEl.textContent = txt;
+    }
     const portsTxt = '· ' + ports + (ports === 1 ? ' port' : ' ports') + ' · ' +
       Math.max(0, ports - taken) + ' free';
     if (portsTxt !== ROOM.lastPortsTxt) { $('netRoomPorts').textContent = portsTxt; ROOM.lastPortsTxt = portsTxt; }

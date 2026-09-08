@@ -204,7 +204,7 @@ async function installSampler(pg) {
             if (((y < H / 2 ? 0 : 3) + ((x * 3 / W) | 0)) !== b) continue;
             const k = (y * W + x) * 4; s += (d[k] + d[k + 1] + d[k + 2]) / 3; n++;
           }
-          sig += Math.round(s / Math.max(1, n) / 8) + '.';
+          sig += Math.round(s / Math.max(1, n)) + '.';   // NOT quantised: these are exact local pixels, not codec output
         }
         S.sigs.push({ t: Date.now(), sig, nb, mean: Math.round(acc / (W * H)) });
         if (S.sigs.length > 4000) S.sigs.shift();
@@ -262,6 +262,12 @@ try {
 
   // ---- 2. player 1 opens a room; everyone else joins -----------------------
   say('\n== 2. player 1 opens a ROOM with nothing booted; the rest join ==');
+  // ⚠ PICK THE DISC BEFORE OPENING THE ROOM. lib/netplay.js binds the game name
+  // into the pairing handshake and refuses a joiner who names a different one,
+  // so a room opened while #romSelect still reads the page default rejects every
+  // joiner with "the other player is on pso2". Selecting is a DROPDOWN, not a
+  // download — nothing boots here, which is the property under test.
+  await pages[0].evaluate((g) => { const el = document.querySelector('#romSelect'); if (el) { el.value = g; el.dispatchEvent(new Event('change')); } }, GAME);
   await click(pages[0], '#btnNet');
   await click(pages[0], '#netHostBtn');
   const code = await until(pages[0], () => {
@@ -363,7 +369,39 @@ try {
     `all ${PLAYERS} cores reached booted + frames flowing — ${PLAYERS} emulators, not one`,
     `booted: ${J(bootedAll.map((b) => !!b))}. A machine that never booted is a player watching nothing.`);
   for (const pg of pages) await installSampler(pg);
-  await sleep(4000);
+
+  // ⚠ LET THE RATE SETTLE BEFORE READING IT. The first version asserted gate #9
+  // four seconds after `booted` went true and read guestX 0.41 with fps 0 —
+  // which is the BOOT RAMP, not the guest rate. The same run's end-of-run read
+  // was 0.996 / 1.001. A rate sampled during the ramp is not a rate.
+  say('  ....  letting the guest rate settle before reading it');
+  await sleep(25000);
+
+  // ⚠ AND DRIVE THE GAME SOMEWHERE THAT MOVES. Gauntlet's copyright card is a
+  // STATIC IMAGE — a run that sampled it read 2 distinct picture signatures and
+  // the liveness cell failed on a core that was healthy at 30 fps. That is a
+  // false alarm from the instrument, and a liveness metric that cries wolf on a
+  // still title card is as useless as one that passes a wedge. The key taps are
+  // the sequence dreamcast/docs/gauntlet-two-players/TASKS.md documents for
+  // reaching the character screen; they are wall-clock taps against the attract
+  // loop, not a state machine, so they are best-effort and the cell below
+  // reports what the picture actually did either way.
+  say('  ....  driving each core past the title card');
+  const tap = async (pg, key) => {
+    await pg.evaluate((k) => { window.dispatchEvent(new KeyboardEvent('keydown', { key: k })); }, key);
+    await sleep(120);
+    await pg.evaluate((k) => { window.dispatchEvent(new KeyboardEvent('keyup', { key: k })); }, key);
+  };
+  // Gauntlet's copyright card ignores input for a while and the attract loop
+  // cycles, so a fixed three taps landed on nothing and every core sat on the
+  // still card (measured: 1 distinct signature over 240 frames at 30 fps — a
+  // healthy core photographed on a static image). Tap repeatedly instead.
+  for (let k = 0; k < 10; k++) {
+    for (const pg of pages) { await tap(pg, 'Enter'); }
+    await sleep(2000);
+  }
+  for (const pg of pages) { await tap(pg, 'm'); }
+  await sleep(5000);
 
   // ---- 5. the start barrier ------------------------------------------------
   say('\n== 5. the start barrier ==');
@@ -498,9 +536,13 @@ try {
   // what separates a moving game from a held one.
   const alive = RESULT.liveness.every((L) => L.distinctSignatures >= 8 && L.booted);
   cell(alive, 'every-screenshot-is-of-a-LIVE-core',
-    `distinct picture signatures per player: ${J(RESULT.liveness.map((L) => L.distinctSignatures))} — ` +
+    `distinct picture signatures per player: ${J(RESULT.liveness.map((L) => L.distinctSignatures))} across ` +
+    `${J(RESULT.liveness.map((L) => L.sampledFrames))} sampled frames at fps ${J(RESULT.liveness.map((L) => L.fps))} — ` +
     'a wedged core screenshots a live-looking stale frame, so the picture is only evidence beside this count',
-    `distinct signatures ${J(RESULT.liveness.map((L) => L.distinctSignatures))} — at least one player is showing a still image`);
+    `distinct signatures ${J(RESULT.liveness.map((L) => L.distinctSignatures))} at fps ` +
+    `${J(RESULT.liveness.map((L) => L.fps))}, framesEver ${J(RESULT.liveness.map((L) => L.framesEver))}. ` +
+    'EITHER a core is wedged OR the scene reached is a still image (Gauntlet\'s copyright card is one) — ' +
+    'read the fps and the screenshots together before calling it a wedge.');
 
   // ---- 10. no desync ------------------------------------------------------
   const desync = RESULT.liveness.map((L) => L.hud && L.hud.desyncLatched);
