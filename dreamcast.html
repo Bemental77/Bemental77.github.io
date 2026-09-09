@@ -5666,15 +5666,58 @@
       return;
     }
     NET.role = 'guest';
-    // lib/netplay.js refuses a pairing whose game names differ, and coerces a
-    // falsy name to 'unknown' — so the guest MUST name the same disc the host
-    // chose. That is why the join pane carries a game selector; a wrong pick
-    // fails with "the other player is on <game>" instead of connecting to
-    // nothing.
-    const game = $('netGame').value;
-    const s = new Netplay.Session({ game, host: false, code, transport: netTransport() });
+    // ⚠ THE JOINER DOES NOT PICK THE GAME. THE HOST ALREADY DID.
+    // This read `$('netGame').value` and handed it to the session, which refuses
+    // a pairing whose game names differ — so a player who guessed wrong, or
+    // whose dropdown held a stale value, was refused with "the other player is
+    // on gauntlet" WHILE BEING ON GAUNTLET. Asking two people to type the same
+    // string before they are allowed to talk is a guess dressed as a check.
+    //
+    // Joining with no game skips that handshake comparison (it is guarded on
+    // `m.game && this.game`), and the room then TELLS this machine which disc it
+    // is for via the host's roster broadcast — see the 'room-game' handler
+    // below. The real guard is unaffected and is the only one that could ever be
+    // trusted: the START BARRIER compares what each machine ACTUALLY LOADED, not
+    // what it intended, and refuses to start a room whose discs differ.
+    const s = new Netplay.Session({ host: false, code, transport: netTransport() });
     NET.session = s;
     s.on('status', netOnStatus);
+    s.on('room-game', (e) => {
+      const g = e && e.game;
+      if (!g || !GAMES[g]) return;
+      const rs = $('romSelect');
+      if (rs && rs.value !== g) {
+        rs.value = g;
+        rs.dispatchEvent(new Event('change'));
+      }
+      const ng = $('netGame'); if (ng && ng.value !== g) ng.value = g;
+      pageLog('[net] the room is playing ' + g + ' — selected it for you');
+      // ⚠ JOINING IS THE ACT THAT STARTS THE GAME. From a player's side this is
+      // "connect and play", the way plugging a second controller into a console
+      // is: you do not each boot your own machine and agree to press Start
+      // together. That every peer runs its own core is an implementation
+      // detail, and making the player perform it — pick the disc, press Start,
+      // wait — is the detail leaking into the product.
+      //
+      // Safe to auto-start ONLY because of the ordering the room already
+      // enforces: the seat count is fixed before retro_load_game, normalize and
+      // the frame gate are armed before free-run, and the barrier holds every
+      // core at frame 0 until all of them are loaded. So this starts a LOADING
+      // machine, not a RUNNING one — nobody gains frames on anybody by starting
+      // first, which is exactly what the barrier is for.
+      netStatus('This room is playing ' + ((GAMES[g] && GAMES[g].name) || g)
+                + ' — loading it now. The game begins once everyone is in.', 'busy');
+      if (!booted && !NET.autoStarted) {
+        NET.autoStarted = true;
+        const sp = $('mobileSplash'); if (sp) sp.style.display = 'none';
+        pageLog('[net] auto-starting ' + g + ' for this room — a joiner should not have to press Start');
+        try { $('btnStart').click(); } catch (e) {
+          pageLog('[net] auto-start failed: ' + (e && e.message) + ' — press Start');
+          netStatus('Could not start automatically — press Start to load '
+                    + ((GAMES[g] && GAMES[g].name) || g) + '.', 'bad');
+        }
+      }
+    });
     netAttachFaultHandlers(s);
     netHudClearDesync(); netRoomStart(); netHudStart();
     NET.guest = true;
