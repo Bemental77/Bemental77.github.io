@@ -34,6 +34,20 @@
 //   d. where the page has a Play Online control, it is visible and hit-testable
 //      (in the menu where the page puts it there, on the splash where it does not).
 //
+// AND ON THE SEVEN /*_multiplayer.html PAGES, in PORTRAIT and LANDSCAPE:
+//   e. every control the page actually has is reachable after scrolling to it and
+//      hit-tests to itself — the picker, Create a room, I have a code, and the
+//      link back to single player;
+//   f. on the two real lobbies (dreamcast, n64) the HANDOFF, end to end and in
+//      this orientation: Create mints a five-character code that is on screen,
+//      "Start my console" issues a navigation to the emulator page under that
+//      code as the host, and a code typed into the box sends Join to the same
+//      room carrying join=1. Reachable-but-inert is the failure this catches;
+//   g. on the four redirect pages the invitation survives — the scripted replace
+//      fires with ?np= intact and the visible fallback link agrees with it.
+// The per-page selector lists live in PAGES and are read out of the live files,
+// because these seven pages are NOT one shape any more — see the block there.
+//
 // ARM PROOF (CLAUDE.md "every arm carries an arm-difference proof"). An emulator
 // page that never starts cannot exhibit defect 2 at all — `started`/`running`/
 // `booted` gates the overlay — so a cell that never reaches its live witness is
@@ -124,9 +138,25 @@ const PAGES = [
     menuBtn: '#mobileMenuBtn', menu: '#mobileMenu', menuOpenClass: 'open',
     menuNet: null, splashNet: '#mobileSplashNet' },
 
+  // ⚠ n64's witness is NOT `__n64Net().live` any more, and asking for it VOIDed
+  // BOTH n64 cells while the page was booting perfectly. Commit f94d74d9
+  // (2026-09-08 20:05, "online play is DETERMINISTIC LOCKSTEP") replaced
+  // window.__n64Net wholesale with a lockstep seam; MEASURED on the live file,
+  // `grep -c '      live:' n64/index.html` is 0 at HEAD and in the working tree,
+  // so the field this row asked for does not exist and never becomes true. The
+  // run at 2026-09-09 00:24 read `live witness window.__n64Net().live = false
+  // after 240.4s` in both orientations — 8 minutes spent proving a typo.
+  // A SILENT HARNESS FAILURE IS NOT A PAGE FAILURE (CLAUDE.md records the same
+  // trap costing a whole n64 investigation via Module.calledRun).
+  // window.__n64Rate is repainted every second by paintRate (n64/index.html:2044)
+  // and its `made` is "distinct frames the game actually produced this second"
+  // (:704, from coreFps.gameFps) — a DRAWN count, which is the only thing
+  // CLAUDE.md accepts as proof of liveness, and strictly stronger than the
+  // boolean it replaces. #rotateHint's own gate is `started` (:2955), so a page
+  // producing frames has cleared that precondition by definition.
   { name: 'n64', url: '/n64/',
     shell: '#mobileShell', start: '#mobileSplashStart',
-    seam: '__n64Net', liveField: 'live', liveMs: 240000,
+    liveExpr: '!!(window.__n64Rate && window.__n64Rate.made > 0)', liveMs: 240000,
     menuBtn: '#mobileMenuBtn', menu: '#mobileMenu', menuOpenClass: 'open',
     menuNet: null, splashNet: '#mobileSplashNet' },
 
@@ -144,13 +174,62 @@ const PAGES = [
     // controller to give anybody and #spNetBtn was removed.
     menuNet: null, splashNet: null },
 
-  // The seven lobby pages. They have no emulator, no splash and no hamburger —
-  // their whole chrome is the lobby card lib/netplay-guest.js mounts. What can
-  // go wrong here is the same class: a control that a 390px-tall landscape
-  // viewport pushes off-screen or an overlay covers.
-  ...['dreamcast', 'gamecube', 'ps1', 'snes', 'genesis', 'gba', 'n64'].map((c) => ({
-    name: c + '_multiplayer', url: '/' + c + '_multiplayer.html',
-    lobbyOnly: true, chrome: ['#lobbyCard .np-row button', '#back'],
+  // ---- the seven /*_multiplayer.html pages --------------------------------
+  // They have no emulator, no splash and no hamburger, and what can go wrong is
+  // the same class as above: a control that a 390px-tall landscape viewport
+  // pushes off-screen, or one something covers.
+  //
+  // ⚠ THEY ARE NO LONGER ONE SHAPE, AND ONE BLANKET SELECTOR LIST IS WHAT WENT
+  // STALE HERE. This file used to ask all seven for `#lobbyCard .np-row button`
+  // + `#back` — the card lib/netplay-ui.js mounted inside a `.np-wrap` overlay —
+  // and the seven landscape FAILs recorded in /tmp/mobile-chrome.json at
+  // 2026-09-08 11:22 were that card's own `div.np-code` / `select.np-sel`
+  // hit-testing on top of the page's Back link. Commits f94d74d9..5af7d18e THE
+  // SAME EVENING (20:05-21:03) replaced streaming with deterministic lockstep
+  // and took the card out of every page with it. MEASURED on the live tree:
+  // `grep -c lobbyCard *_multiplayer.html` is 0 on all seven, `grep -rln
+  // 'np-wrap\|NetplayUI' *.html` is EMPTY, and no shipping page loads
+  // lib/netplay-ui.js at all. Asking for that card again reports NOT-PRESENT
+  // seven times and says nothing whatever about whether a landscape phone can
+  // use these pages — a red that cannot go green by fixing the product is not a
+  // gate, it is noise.
+  //
+  // So every page is asked for the chrome IT ACTUALLY HAS, and there are three
+  // kinds of page now. Each kind is checked to the END of what it promises,
+  // because "the button is visible" was never the requirement — leaving the
+  // lobby and getting into a room was:
+  //
+  //   lobby     dreamcast + n64. A real room: a disc/ROM picker, Create/Join, a
+  //             minted code, and a Back link. Checked through the HANDOFF —
+  //             Create really mints, and Start / Join really issue a navigation
+  //             to the emulator page carrying that exact code.
+  //   static    gamecube. It has NO room and says so out loud (its dual-core
+  //             path cannot advance exactly one emulated frame on demand), so
+  //             its chrome is its two links and there is no handoff to check.
+  //   redirect  ps1 / snes / genesis / gba. Online play moved onto the emulator
+  //             page itself; these only carry an invitation across. The contract
+  //             is that the redirect fires with ?np= intact AND that the visible
+  //             fallback link says the same thing, which is the half that has to
+  //             work when the scripted replace is slow or blocked.
+  { name: 'dreamcast_multiplayer', url: '/dreamcast_multiplayer.html',
+    lobby: { seam: '__dcmp', emu: '/dreamcast.html',
+             chrome: ['#game', '#btnHost', '#btnJoinPane', '#back'] } },
+  // ⚠ n64's Back link carries no id (dreamcast's is `#back`). Selected by href
+  // rather than adding one: n64_multiplayer.html is being edited by another
+  // agent in this same working tree, and CLAUDE.md's pathspec rule does NOT
+  // protect a file two agents share — `git commit -- <path>` commits the
+  // WORKING TREE, so a one-character id here would carry their unstaged hunks
+  // into this commit. A selector costs nothing and touches nothing.
+  { name: 'n64_multiplayer', url: '/n64_multiplayer.html',
+    lobby: { seam: '__n64mp', emu: '/n64/',
+             chrome: ['#game', '#btnHost', '#btnJoinPane', '#wrap > .hint > a[href="/n64/"]'] } },
+  { name: 'gamecube_multiplayer', url: '/gamecube_multiplayer.html',
+    staticChrome: ['a.cta', 'a[href="/gamecube.html"]'] },
+  ...[['ps1', '/ps1.html'], ['snes', '/snes.html'],
+      ['genesis', '/genesis.html'], ['gba', '/gba.html']].map(([c, to]) => ({
+    name: c + '_multiplayer', url: '/' + c + '_multiplayer.html?np=ABCDE',
+    selfPath: '/' + c + '_multiplayer.html',
+    redirect: { to, chrome: ['#go'] },
   })),
 ];
 
@@ -226,6 +305,60 @@ async function sampleStable(page, sel, ms, label, out, opts = {}) {
   return { ok: !bad, first: bad ? bad.s : last, samples: n };
 }
 
+// Sweep a list of controls, ANDing the verdicts. Every one is scrolled to first,
+// so "below the fold" is reachable and "no scroll reaches it / something covers
+// it" is not — which is the whole distinction on a 390px-tall viewport.
+async function chromeSweep(page, sels, label, out, rec) {
+  let ok = true;
+  for (const sel of sels) {
+    const r = await sampleStable(page, sel, SAMPLE_MS, label + ' ' + sel, out, { scroll: true });
+    rec.checks[label + ' ' + sel] = r.first;
+    ok = ok && r.ok;
+  }
+  return ok;
+}
+
+// ⚠ THE HANDOFF IS PROVED BY THE NAVIGATION THE BUTTON ACTUALLY ISSUES, not by
+// reading a URL back out of the page's own test seam. A seam that computes the
+// string correctly and a button that never fires it are indistinguishable from
+// the seam, and "the code was minted" was never the promise — "pressing Start
+// puts me in the room" was.
+//
+// The document request is captured and ABORTED rather than followed: following
+// it would boot a whole emulator page per cell (dreamcast.html loads a disc)
+// for no extra signal, and aborting leaves this page alive so the join half can
+// be driven straight afterwards. The click, the handler and the URL are all
+// real; only the download is refused.
+//
+// ⚠ THE ERROR CODE IS LOAD-BEARING: it MUST be 'aborted'. puppeteer's bare
+// request.abort() defaults to `failed` (net::ERR_FAILED), and a FAILED main-frame
+// navigation COMMITS CHROME'S ERROR PAGE — which replaces the document. Measured
+// here, first run of this code: the host handoff was captured correctly and then
+// `tap(#btnJoinPane) threw: No element found`, `#codeIn NOT-PRESENT` and
+// `EXCEPTION: Cannot set properties of null` on both lobbies, and `#go
+// NOT-PRESENT` on all four redirect pages — six red cells that were the harness
+// demolishing the page it was measuring. net::ERR_ABORTED is the code a
+// user-cancelled navigation uses and it leaves the current document untouched.
+async function armNavCapture(page, selfPath) {
+  const seen = [];
+  await page.setRequestInterception(true);
+  page.on('request', (req) => {
+    try {
+      if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
+        const u = new URL(req.url());
+        if (u.pathname !== selfPath) { seen.push(u.pathname + u.search); return req.abort('aborted'); }
+      }
+      req.continue();
+    } catch (_e) { try { req.continue(); } catch (_e2) {} }
+  });
+  return { seen, last: () => (seen.length ? seen[seen.length - 1] : null) };
+}
+
+async function tapSel(page, sel, out) {
+  try { await page.tap(sel); return true; }
+  catch (e) { out.push('    tap(' + sel + ') threw: ' + e.message); return false; }
+}
+
 async function launch(tag) {
   const profile = path.join(SCRATCH, 'prof-' + tag);
   fs.rmSync(profile, { recursive: true, force: true });
@@ -264,26 +397,140 @@ async function cell(spec, orient) {
     await page.setViewport(view);
     const errs = [];
     page.on('pageerror', (e) => errs.push(String(e.message).slice(0, 200)));
-    await page.goto(ORIGIN + spec.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+    // A redirect page leaves on its own, so the capture has to be armed BEFORE
+    // the navigation that triggers it.
+    let nav = null;
+    if (spec.redirect) nav = await armNavCapture(page, spec.selfPath);
+    await page.goto(ORIGIN + spec.url, { waitUntil: 'domcontentloaded', timeout: 60000 })
+      .catch((e) => out.push('    goto: ' + e.message));
     await sleep(3500);                     // coi-serviceworker's guaranteed first reload
     rec.pageErrors = errs.slice(0, 5);
 
-    // ---------------- lobby pages: chrome only ----------------
-    if (spec.lobbyOnly) {
-      let allOk = true;
-      // The lobby is an ordinary scrolling document, so "reachable" here means
-      // reachable AFTER scrolling to it — a landscape phone is 390 px tall and
-      // this card is taller than that. What must not happen is a control that no
-      // scroll brings into view, or one something covers. (Observed and left for
-      // the netplay owner: in landscape every lobby's Host/Join row and its
-      // "single player" link start BELOW the fold — reachable, but with no
-      // affordance saying so.)
-      for (const sel of spec.chrome) {
-        const r = await sampleStable(page, sel, SAMPLE_MS, 'chrome ' + sel, out, { scroll: true });
-        rec.checks[sel] = r.first;
-        allOk = allOk && r.ok;
+    // ---------------- redirect pages (ps1 / snes / genesis / gba) -----------
+    // Their whole job is to carry an invitation onto the emulator page. Two
+    // halves, and the second is the one a slow or blocked script exposes: the
+    // scripted replace must fire with ?np= intact, AND the visible fallback link
+    // must be reachable and point at the same place.
+    if (spec.redirect) {
+      const to = nav.last();
+      out.push(`    redirect ${spec.url} -> ${to || '(none fired)'}`);
+      rec.redirect = to;
+      let ok = !!to && to.split('?')[0] === spec.redirect.to && /(^|[?&])np=ABCDE(&|$)/.test(to);
+      if (!ok) out.push(`    FAIL: expected a navigation to ${spec.redirect.to}?np=ABCDE`);
+      const href = await page.evaluate(() => {
+        const a = document.getElementById('go'); return a ? a.getAttribute('href') : null;
+      });
+      out.push('    fallback link #go href=' + href);
+      rec.fallbackHref = href;
+      if (href !== spec.redirect.to + '?np=ABCDE') {
+        ok = false;
+        out.push(`    FAIL: the visible fallback disagrees with the redirect — expected ${spec.redirect.to}?np=ABCDE`);
       }
-      rec.verdict = allOk ? 'PASS' : 'FAIL';
+      ok = (await chromeSweep(page, spec.redirect.chrome, 'chrome', out, rec)) && ok;
+      rec.verdict = ok ? 'PASS' : 'FAIL';
+      return rec;
+    }
+
+    // ---------------- the static explainer page (gamecube) ------------------
+    if (spec.staticChrome) {
+      const ok = await chromeSweep(page, spec.staticChrome, 'chrome', out, rec);
+      rec.verdict = ok ? 'PASS' : 'FAIL';
+      return rec;
+    }
+
+    // ---------------- lobby pages (dreamcast / n64) -------------------------
+    // An ordinary scrolling document, so "reachable" means reachable AFTER
+    // scrolling to it — a landscape phone is 390px tall and the card is taller
+    // than that. What must not happen is a control no scroll brings into view,
+    // or one something covers. Then the handoff, end to end, in THIS
+    // orientation: a lobby whose Create button is reachable and whose Start
+    // button is under something is still a lobby nobody can leave.
+    if (spec.lobby) {
+      const L = spec.lobby;
+      const seam = await page.evaluate((s) => {
+        try { return window[s] ? window[s]() : null; } catch (_e) { return null; }
+      }, L.seam);
+      rec.seam = seam;
+      // ARM PROOF. A browser with no WebRTC gets the explanation, not the
+      // controls — that page is CORRECT and has no Create button, so demanding
+      // one would fail a page doing exactly the right thing.
+      if (!seam) {
+        out.push(`    VOID: window.${L.seam}() is not published — the lobby script did not run`);
+        rec.verdict = 'VOID'; return rec;
+      }
+      if (!seam.supported) {
+        out.push(`    VOID: the page reports online play unsupported (missing ${seam.missing}) —`);
+        out.push('          it is showing its explanation, so there is no lobby here to reach.');
+        rec.verdict = 'VOID'; return rec;
+      }
+
+      let ok = await chromeSweep(page, L.chrome, 'chrome', out, rec);
+
+      // HOST: press Create a room for real, then everything the code arrives with.
+      await tapSel(page, '#btnHost', out);
+      await sleep(500);
+      ok = (await chromeSweep(page, ['#code', '#btnCopy', '#btnGo'], 'host', out, rec)) && ok;
+      const hosted = await page.evaluate((s) => window[s](), L.seam);
+      const shown = await page.evaluate(() =>
+        (document.getElementById('code') || {}).textContent.trim());
+      out.push(`    host: code=${hosted.code} shown="${shown}" hostUrl=${hosted.hostUrl}`);
+      rec.host = { code: hosted.code, shown, hostUrl: hosted.hostUrl };
+      if (!/^[A-HJ-NP-Z2-9]{5}$/.test(String(hosted.code || '')) || shown !== hosted.code) {
+        ok = false;
+        out.push('    FAIL: Create a room did not put a readable five-character code on screen');
+      }
+
+      // The handoff itself. The navigation is captured and aborted; the tap, the
+      // handler and the URL are real.
+      nav = await armNavCapture(page, spec.url);
+      await tapSel(page, '#btnGo', out);
+      await sleep(1200);
+      const hostGo = nav.last();
+      out.push('    host handoff: #btnGo -> ' + (hostGo || '(no navigation)'));
+      rec.hostGo = hostGo;
+      if (!hostGo || hostGo.split('?')[0] !== L.emu ||
+          !new RegExp('(^|[?&])np=' + hosted.code + '(&|$)').test(hostGo) ||
+          /(^|[?&])join=1(&|$)/.test(hostGo)) {
+        ok = false;
+        out.push(`    FAIL: Start my console must open ${L.emu} under np=${hosted.code} as the HOST`);
+      }
+
+      // JOIN: the other side of the same room, driven the way a person does it.
+      await tapSel(page, '#btnJoinPane', out);
+      await sleep(500);
+      ok = (await chromeSweep(page, ['#codeIn', '#btnJoin'], 'join', out, rec)) && ok;
+      // Guarded: a cell that throws here reports EXCEPTION and loses every line
+      // it had already earned, which is how the abort-code bug above read as six
+      // unrelated failures instead of one.
+      await page.evaluate(() => { const i = document.getElementById('codeIn'); if (i) i.value = ''; });
+      await page.focus('#codeIn').catch((e) => out.push('    focus(#codeIn): ' + e.message));
+      await page.keyboard.type(hosted.code, { delay: 30 });
+      const typed = await page.evaluate(() => {
+        const i = document.getElementById('codeIn'); return i ? i.value : null;
+      });
+      out.push('    join: typed "' + typed + '" into #codeIn');
+      if (typed !== hosted.code) {
+        ok = false;
+        out.push('    FAIL: the code box did not accept the characters that were typed into it');
+      }
+      await tapSel(page, '#btnJoin', out);
+      await sleep(1200);
+      const joinGo = nav.last();
+      out.push('    join handoff: #btnJoin -> ' + (joinGo || '(no navigation)'));
+      rec.joinGo = joinGo;
+      if (!joinGo || joinGo === hostGo || joinGo.split('?')[0] !== L.emu ||
+          !new RegExp('(^|[?&])np=' + hosted.code + '(&|$)').test(joinGo) ||
+          !/(^|[?&])join=1(&|$)/.test(joinGo)) {
+        ok = false;
+        out.push(`    FAIL: Join must open ${L.emu} under np=${hosted.code} carrying join=1`);
+      }
+
+      rec.verdict = ok ? 'PASS' : 'FAIL';
+      if (!ok) {
+        const shot = path.join(SCRATCH, `fail-${spec.name}-${orient}.png`);
+        try { await page.screenshot({ path: shot }); out.push('    screenshot: ' + shot); } catch (_e) {}
+      }
       return rec;
     }
 
