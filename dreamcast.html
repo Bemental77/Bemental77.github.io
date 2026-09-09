@@ -5216,7 +5216,39 @@
   // (2) AFTER THE DISC LOADS AND BEFORE THE PUMP EVER RUNS A FRAME.
   function lsArmBeforeFreerun() {
     if (!NET.session || LS.armed) return false;
-    const ls = lsEngine();
+    // ⚠ CREATE THE ENGINE IF THE ROOM HAS NOT NEEDED ONE YET. lib/netplay.js
+    // builds `session.ls` LAZILY, from _ensureLockstep(), and its own comment
+    // says why: "The engine has to exist before the first peer can be SEATED,
+    // and seating happens when a game channel opens". So a HOST SITTING ALONE
+    // IN A ROOM IT JUST OPENED HAS NO ENGINE — nobody has connected, so nothing
+    // has seated, so nothing built one.
+    //
+    // That is not hypothetical. Measured on production, opening a room and
+    // pressing Start before the other player's channel opened:
+    //     fault  "the room published no lockstep engine, so this core cannot be frame-gated"
+    //     armed  false   role host   state signalling
+    //     heartbeat fps=60 ... guest=1.000x ... arms=none
+    // The disc loaded, the gate refused, and the core FREE-RAN UNGATED — the one
+    // outcome this whole architecture exists to prevent, reached by pressing the
+    // button the page itself tells the host to press. The status line even said
+    // "Loaded, but this console is NOT part of the room", on the machine that
+    // opened it.
+    //
+    // _ensureLockstep() is the engine's OWN affordance for exactly this and is
+    // documented as safe to call from the page: "A page that does call it still
+    // wins: this only ever fills in a missing engine." Parameters are not a
+    // risk either — the host's win and are pushed to guests in 'lsgo', so an
+    // engine built early is reconfigured by the room rather than fighting it.
+    let ls = lsEngine();
+    if (!ls && NET.session && typeof NET.session._ensureLockstep === 'function') {
+      try {
+        ls = NET.session._ensureLockstep();
+        if (ls) pageLog('[lockstep] the room had not built an engine yet (nobody has connected), so this ' +
+                        'console built it before arming — a core must never free-run while it is in a room');
+      } catch (e) {
+        pageLog('[lockstep] could not build the engine: ' + ((e && e.message) || e));
+      }
+    }
     if (!ls) {
       LS.fault = 'the room published no lockstep engine, so this core cannot be frame-gated';
       pageLog('[lockstep] ⚠ ' + LS.fault);
