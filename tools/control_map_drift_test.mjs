@@ -311,25 +311,26 @@ const PAIRS = [
       normalize: MP_NAME_ARRAY,
     },
   },
+  // ⚠ dreamcast HAS NO PAIR ANY MORE, AND THAT IS THE POINT.
+  // This gate's premise is that player 2's page owns a SECOND COPY of the
+  // control tables, which is only true while player 2 is a controller pointed
+  // at somebody else's core. Streaming is cancelled: dreamcast_multiplayer.html
+  // is now a LOBBY that hands every player to dreamcast.html, so there is
+  // exactly ONE copy of the tables and nothing to drift against. The check that
+  // still has teeth is the INVERSE — a lobby must carry no control tables at
+  // all, because a lobby that maps buttons has started being a viewer again.
+  // (`guest:` and `lobby:` are alternatives; the six pairs above are still on
+  // `guest:` and still FAIL, which is not this conversion's doing — they were
+  // already failing before it, their own `*_multiplayer.html` pages having been
+  // reduced to stubs by the same directive. Each can be flipped to `lobby:` by
+  // whoever converted it.)
   {
     name: 'dreamcast',
-    host: {
-      url: '/dreamcast.html',
-      decls: (s) => [
-        sliceDeclAlias(s, 'RB', 'IDS'),
-        sliceDecl(s, 'KEYMAP').text,
-        sliceDeclAlias(s, 'GP_BTN_TO_RETRO', 'GP'),
-      ],
-      normalize: MP_ID_ARRAY,
-    },
-    guest: {
+    lobby: {
       url: '/dreamcast_multiplayer.html',
-      decls: (s) => [
-        sliceDeclAlias(s, 'RB', 'IDS'),
-        sliceDecl(s, 'KEYMAP').text,
-        sliceDeclAlias(s, 'GP_BTN_TO_RETRO', 'GP'),
-      ],
-      normalize: MP_ID_ARRAY,
+      // The exact names the streaming build declared here, so their RETURN is
+      // what fails this — not some paraphrase of them.
+      mustNotDeclare: ['RB', 'KEYMAP', 'GP_BTN_TO_RETRO'],
     },
   },
 ];
@@ -377,6 +378,25 @@ function diffTable(a, b) {
     console.log('origin: ' + ORIGIN + '\n');
 
     for (const pair of PAIRS) {
+      // A CONVERTED LOBBY: assert the ABSENCE of the tables. sliceDecl throws
+      // when a declaration is not there, so "not found" is the PASS here and a
+      // successful slice is the failure — the streaming controller having grown
+      // back on a page whose only job is to hand players to the emulator.
+      if (pair.lobby) {
+        const src = await fetchText(pair.lobby.url);
+        const found = pair.lobby.mustNotDeclare.filter((n) => {
+          try { sliceDecl(src, n); return true; } catch (e) { return false; }
+        });
+        if (found.length) {
+          failures++;
+          console.log(`FAIL  ${pair.name.padEnd(10)} ${pair.lobby.url} declares ${found.join(', ')} — a lobby that maps `
+            + 'buttons is a controller for somebody else\'s core, which is the architecture that was cancelled');
+        } else {
+          console.log(`PASS  ${pair.name.padEnd(10)} ${pair.lobby.url} is a lobby — it declares no control tables `
+            + `(${pair.lobby.mustNotDeclare.join(', ')} all absent), so there is one copy of the map and nothing to drift`);
+        }
+        continue;
+      }
       let host, guest;
       try {
         host = await readSide(pair.host);

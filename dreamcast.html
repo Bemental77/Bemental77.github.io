@@ -6524,22 +6524,30 @@
     $('netLeave').addEventListener('click', netLeave);
     pageLog('[net] online play available (' + netTransport() + ' signalling)');
 
-    // ---- ?np=<code>&game=<key>: HANDED OVER FROM dreamcast_multiplayer.html ---
-    // The party forms on that page, not this one, because a GUEST needs no
-    // emulator and no disc — only a <video> and a pad — and this page downloads
-    // hundreds of megabytes before it can show anything. So the lobby lives
-    // there and sends only the HOST here, carrying the code it already published
-    // and the disc both players agreed on.
+    // ---- ?np=<code>&game=<key>[&join=1]: HANDED OVER FROM THE LOBBY ---------
+    // The party forms on dreamcast_multiplayer.html, not here, because a lobby
+    // has to be readable before anything downloads: the players need to say a
+    // code to each other while nothing is loading yet, and the seats have to be
+    // known before the cores start. That page therefore mints or collects the
+    // code and hands EVERYONE here — under lockstep a joiner runs their own
+    // core, so both sides need this page.
+    //
+    // ⚠ `join=1` IS THE WHOLE DIFFERENCE BETWEEN THE TWO SIDES, and before this
+    // it did not exist: every arrival was hosted. Two hosts under one code pair
+    // with nobody. (It used to be true that only a host could be sent here,
+    // because the guest stayed on the lobby page watching a <video> — that was
+    // the streaming architecture, and it is cancelled.)
     //
     // Two things are deliberately NOT done here. It does not open the overlay:
-    // the host already read the code on the lobby page, and a panel over a game
-    // that is about to start is something to dismiss, not something to read. And
-    // it does not touch #btnStart when the button is disabled — that is either a
-    // boot already in flight or lib/capability.js holding it down, and this page
-    // never re-enables a control the capability layer blocked.
+    // the player already read the code on the lobby page, and a panel over a
+    // game that is about to start is something to dismiss, not something to
+    // read. And it does not touch #btnStart when the button is disabled — that
+    // is either a boot already in flight or lib/capability.js holding it down,
+    // and this page never re-enables a control the capability layer blocked.
     {
       const npGame = QS.get('game');
       const npCode = (QS.get('np') || '').toUpperCase();
+      const npJoin = QS.get('join') === '1';
       if (npGame && GAMES[npGame]) {
         const rs = $('romSelect');
         rs.value = npGame;
@@ -6550,22 +6558,32 @@
         const ng = $('netGame'); if (ng) ng.value = npGame;
       }
       if (/^[A-HJ-NP-Z2-9]{5}$/.test(npCode)) {
-        pageLog('[net] handed a session by the lobby: hosting ' +
+        pageLog('[net] handed a session by the lobby: ' + (npJoin ? 'joining ' : 'hosting ') +
                 $('romSelect').value + ' as ' + npCode + ' via ' + netTransport());
         // The phone shell's splash waits for a Start that this player already
         // pressed — on the other page.
         const sp = $('mobileSplash'); if (sp) sp.style.display = 'none';
+        // ⚠ THE ROOM FIRST, THE DISC SECOND — the order the lobby's own controls
+        // already use (open a room, then press Start), and the order netStartHost
+        // documents in its body ("NO `if (!booted) return` HERE … a room is
+        // opened before any disc is fetched"). This receiver used to do the
+        // opposite: press Start, then poll `booted` and host only once the disc
+        // had loaded. On a cold cache that is minutes during which the published
+        // code answers nobody, and the person who was told to type it is staring
+        // at a room that does not exist yet.
+        if (npJoin) {
+          // netStartGuest() reads the code and the disc out of the join pane's
+          // own controls, which is what a person types into — so the hand-off
+          // fills those controls rather than growing a second code path that
+          // could drift from the one the UI uses.
+          const ci = $('netCodeIn'); if (ci) ci.value = npCode;
+          netStartGuest();
+        } else {
+          netStartHost(npCode);
+        }
         const st = $('btnStart');
         if (st && !st.disabled) st.click();
-        else pageLog('[net] Start is held down — not overriding it; hosting will arm if the game boots anyway');
-        // The disc load is minutes long on a cold cache and there is no boot
-        // event to hang this off, so it waits for `booted` rather than assuming
-        // a duration. netStartHost() itself refuses to run before that.
-        const iv = setInterval(() => {
-          if (!booted || NET.session) return;
-          clearInterval(iv);
-          netStartHost(npCode);
-        }, 250);
+        else pageLog('[net] Start is held down — not overriding it; the room is open either way');
       }
     }
   })();
