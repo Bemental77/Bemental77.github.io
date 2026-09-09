@@ -2886,6 +2886,36 @@
       case 'lsFingerprint':
         LS.fingerprint = d;
         break;
+      // ---- memory cards, one per player ------------------------------------
+      case 'vmuInfo': {
+        const fn = pendingVmuInfo.shift();
+        if (fn) fn(d);
+        break;
+      }
+      case 'vmuSeeded': {
+        const fn = pendingVmuSeed.get(d.port | 0);
+        if (fn) { pendingVmuSeed.delete(d.port | 0); fn(!!d.ok); }
+        break;
+      }
+      case 'vmuDump': {
+        const fn = pendingVmuDump.get(d.port | 0);
+        if (fn) { pendingVmuDump.delete(d.port | 0); fn(d); }
+        break;
+      }
+      case 'vmuChanged': {
+        // The guest wrote a card. Keep it, per port, under its own key.
+        // ⚠ Gated on ownership: in a room this console also runs the OTHER
+        // players' cards and must not write their bytes into its own storage.
+        const port = d.port | 0;
+        if (!vmuMayPersist(port)) break;
+        const bytes = new Uint8Array(d.data);
+        vmuPersisted[port] = (vmuPersisted[port] | 0) + 1;
+        vmuLastBytes[port] = bytes.byteLength;
+        idbPut(vmuKeyFor(port), bytes)
+          .then(() => pageLog('[vmu] Player ' + (port + 1) + ': card saved (' + bytes.byteLength + ' B) — it will be there next time'))
+          .catch((e) => pageLog('[vmu] ⚠ Player ' + (port + 1) + ': could not save the card: ' + ((e && e.message) || e)));
+        break;
+      }
       default:
         pageLog('[page] unknown worker cmd: ' + d.cmd);
     }
@@ -3883,6 +3913,11 @@
                         'discReady at all, so retro_load_game either never returned or the worker died');
       }
       if (!ok) throw new Error('disc load returned 0 — the core rejected the disc image');
+      // 3b. MEMORY CARDS. The cards are created INSIDE retro_load_game, so this
+      //     is the first moment they exist — and the pump is still off, so the
+      //     guest cannot read a card before it has been seeded. Both halves of
+      //     that sentence are load-bearing; see vmuSeedAndWatch().
+      await vmuSeedAndWatch();
       // 4. Audio + run loop. The WORKER owns the run loop (free-run pump,
       //    charter Phase 2.2) so guest progress is decoupled from page vsync
       //    and survives tab backgrounding; the rAF loop below only ships input.
@@ -4031,6 +4066,192 @@
     db.close();
     return v;
   }
+  // ---------------------------------------------------------------------------
+  // MEMORY CARDS — ONE PER PLAYER, PERSISTED SEPARATELY.
+  //
+  // A real Dreamcast has four maple ports and a VMU can sit in each one. This
+  // build creates exactly that: createDreamcastDevices() gives EVERY seated
+  // player's controller its own card (core/hw/maple/maple_cfg.cpp), so a
+  // two-player console has TWO memory cards in it and always did.
+  //
+  // What did NOT exist until 2026-09-09 was any way to see more than one of
+  // them, or to keep ANY of them. The core published a single g_vmu_flash_ptr
+  // that every card overwrote as it was created ("last attached device wins"),
+  // and nothing on the page ever sent vmuLoad or handled vmuChanged — the
+  // worker shim's whole VMU API was unreachable code. So player 2 saved, the
+  // guest wrote player 2's card, and the bytes were thrown away when the tab
+  // closed. Player 1's were too.
+  //
+  // The card is per PORT, not per game — that is what a memory card is. One
+  // IndexedDB key per port, in the store the savestates already use.
+  //
+  // ⚠ SEEDING IS SUPPRESSED IN A ROOM, ON PURPOSE. Netplay here has NO state
+  // handoff: every peer cold-boots the same disc and the machines stay
+  // identical by construction (see lsArmBeforeFreerun's normalize handshake,
+  // and dreamcast.html's "There is NO savestate handoff" note). A card is guest-
+  // visible memory. If this browser pushed ITS stored cards in and the peer
+  // pushed ITS OWN different ones, the two consoles would hold different bytes
+  // at frame 0 and desync the first time a game read the card — silently, and
+  // possibly an hour later. Blank-on-both is the only state both peers can be
+  // sure they share. Writes are still kept (see below), so a room session is
+  // not thrown away; it just cannot START from a local card yet. Carrying cards
+  // into a room needs them exchanged over the link before boot, which is a
+  // separate piece of work and is NOT claimed here.
+  // ---------------------------------------------------------------------------
+  const VMU_PORTS = 4;                       // == MAPLE_PORTS; the core is asked for the real count
+  const vmuKeyFor = (port) => 'vmu:p' + (port | 0);
+  let vmuSlots = [];                         // [{port,size,gen,present}] as the core reported them
+  let vmuArmed = false;                      // watch is on: vmuChanged snapshots are being kept
+  let vmuSeedSkipped = null;                 // why seeding was skipped, if it was
+  const vmuPersisted = [0, 0, 0, 0];         // snapshots written per port, for the test seam
+  const vmuLastBytes = [0, 0, 0, 0];         // size of the last snapshot written per port
+  let vmuOwnPorts = null;                    // in a room: the ports THIS console's player holds
+  const pendingVmuInfo = [];                 // resolvers for the vmuInfo round-trip
+  const pendingVmuSeed = new Map();          // port -> resolver for the vmuLoad ack
+  const pendingVmuDump = new Map();          // port -> resolver for the vmuDump round-trip
+
+  // Which ports this browser is allowed to WRITE to storage.
+  //
+  // Solo: all of them. Two people on one couch share this console, so both
+  // cards belong to this machine and both must be kept.
+  //
+  // In a room: only the seat(s) this console's player actually holds. Every
+  // peer runs the full four-port machine, so port 0's card on the joiner's
+  // phone is the HOST's card, byte for byte. Writing that into the phone's own
+  // 'vmu:p0' would overwrite that person's own player-1 card with somebody
+  // else's data. The engine's localPorts is the authority on which seat is
+  // ours (lib/netplay.js Lockstep._recount).
+  function vmuOwnedPorts() {
+    if (!NET.session) return null;   // null = every port is ours
+    try {
+      const ls = lsEngine();
+      if (ls && ls.localPorts && ls.localPorts.length) return ls.localPorts.slice();
+    } catch (e) {}
+    return [];   // in a room with no seat known: keep nothing rather than keep the wrong thing
+  }
+  function vmuMayPersist(port) {
+    if (vmuOwnPorts == null) return true;
+    return vmuOwnPorts.indexOf(port | 0) !== -1;
+  }
+
+  function vmuAskInfo(ms = 8000) {
+    return new Promise((resolve) => {
+      const t = setTimeout(() => {
+        const i = pendingVmuInfo.indexOf(fn); if (i >= 0) pendingVmuInfo.splice(i, 1);
+        resolve(null);
+      }, ms);
+      const fn = (v) => { clearTimeout(t); resolve(v); };
+      pendingVmuInfo.push(fn);
+      worker.postMessage({ cmd: 'vmuInfo' });
+    });
+  }
+  function vmuSeedPort(port, bytes, ms = 8000) {
+    return new Promise((resolve) => {
+      const t = setTimeout(() => { pendingVmuSeed.delete(port); resolve(false); }, ms);
+      pendingVmuSeed.set(port, (ok) => { clearTimeout(t); resolve(!!ok); });
+      const copy = new Uint8Array(bytes);   // transferred; keep the caller's buffer intact
+      worker.postMessage({ cmd: 'vmuLoad', port: port, data: copy.buffer }, [copy.buffer]);
+    });
+  }
+
+  // Called once, AFTER the disc has loaded (the cards are created inside
+  // retro_load_game) and BEFORE the pump is switched on, so nothing the guest
+  // does can race a seed.
+  async function vmuSeedAndWatch() {
+    vmuOwnPorts = vmuOwnedPorts();
+    let info = null;
+    try { info = await vmuAskInfo(); } catch (e) {}
+    if (!info || !info.ports) {
+      vmuSeedSkipped = 'this emulator build has no per-port memory-card accessors';
+      pageLog('[vmu] ⚠ no memory-card slots reported — ' + vmuSeedSkipped +
+              '. Cards will not be saved. (Relink the worker: dreamcast/flycast-bridge/flycast_worker_link.sh)');
+      return;
+    }
+    vmuSlots = info.slots || [];
+    const present = vmuSlots.filter((x) => x.present);
+    pageLog('[vmu] ' + present.length + ' memory card(s) in this console: ' +
+            (present.length ? present.map((x) => 'Player ' + (x.port + 1) + ' (' + x.size + ' B)').join(', ') : 'none'));
+
+    if (NET.session) {
+      vmuSeedSkipped = 'in a room every peer must hold identical bytes at frame 0 and there is no card exchange yet';
+      pageLog('[vmu] cards start BLANK in a room — ' + vmuSeedSkipped +
+              '. Anything saved during the session is still kept for the seat this console plays.');
+    } else {
+      for (const slot of present) {
+        let stored = null;
+        try { stored = await idbGet(vmuKeyFor(slot.port)); } catch (e) {}
+        if (!stored) { pageLog('[vmu] Player ' + (slot.port + 1) + ': no stored card — starting on a blank one'); continue; }
+        const bytes = new Uint8Array(stored);
+        if (bytes.byteLength !== slot.size) {
+          pageLog('[vmu] ⚠ Player ' + (slot.port + 1) + ': stored card is ' + bytes.byteLength +
+                  ' B, this console\'s card is ' + slot.size + ' B — NOT seeded, the stored one is left untouched');
+          continue;
+        }
+        const ok = await vmuSeedPort(slot.port, bytes);
+        pageLog('[vmu] Player ' + (slot.port + 1) + ': ' +
+                (ok ? 'restored ' + bytes.byteLength + ' B from this browser' : '⚠ the emulator REJECTED the stored card'));
+      }
+    }
+    // Watch LAST, and only now: arming it before the seeds would echo the
+    // blank power-on cards straight back into storage and destroy exactly the
+    // saves this whole path exists to keep.
+    worker.postMessage({ cmd: 'vmuWatch', on: 1 });
+    vmuArmed = true;
+  }
+
+  // Read-only test seam. The rig has to be able to prove "player 2's card came
+  // back and player 1's is unchanged" without reaching into the engine.
+  window.__dcVmu = function () {
+    return {
+      armed: vmuArmed,
+      seedSkipped: vmuSeedSkipped,
+      ownPorts: vmuOwnPorts == null ? 'all' : vmuOwnPorts.slice(),
+      slots: vmuSlots.map((x) => ({ port: x.port, size: x.size, present: !!x.present })),
+      persisted: vmuPersisted.slice(),
+      lastBytes: vmuLastBytes.slice(),
+      keys: [0, 1, 2, 3].map(vmuKeyFor),
+    };
+  };
+  // Read a card's LIVE bytes out of the core (test seam). This is the one that
+  // proves two seats are two BUFFERS: the old single-pointer build answered the
+  // same address for every port.
+  window.__dcVmuLive = function (port, ms = 8000) {
+    return new Promise((resolve) => {
+      const p = port | 0;
+      const t = setTimeout(() => { pendingVmuDump.delete(p); resolve(null); }, ms);
+      pendingVmuDump.set(p, (d) => { clearTimeout(t); resolve(d); });
+      worker.postMessage({ cmd: 'vmuDump', port: p });
+    });
+  };
+  // Read a stored card back out of IndexedDB (test seam; returns null if none).
+  window.__dcVmuStored = async function (port) {
+    try { const v = await idbGet(vmuKeyFor(port | 0)); return v ? new Uint8Array(v) : null; }
+    catch (e) { return null; }
+  };
+  // Write straight into a live card and let the core see it as a guest write.
+  // Used by the two-player card test to prove the ports are INDEPENDENT without
+  // needing a game that saves on cue.
+  window.__dcVmuPoke = async function (port, byteValue, count) {
+    const slot = vmuSlots.find((x) => (x.port | 0) === (port | 0) && x.present);
+    if (!slot) return { ok: false, why: 'no card on port ' + port };
+    const bytes = new Uint8Array(slot.size);
+    const stored = await window.__dcVmuStored(port);
+    if (stored && stored.byteLength === slot.size) bytes.set(stored);
+    const n = Math.min(count | 0 || 16, slot.size);
+    for (let i = 0; i < n; i++) bytes[i] = byteValue & 0xff;
+    const ok = await vmuSeedPort(port | 0, bytes);
+    if (!ok) return { ok: false, why: 'the emulator rejected the write' };
+    // Persist it the same way a guest write would be persisted, through the
+    // same ownership gate, so the test exercises the real storage path.
+    if (vmuMayPersist(port | 0)) {
+      vmuPersisted[port | 0] = (vmuPersisted[port | 0] | 0) + 1;
+      vmuLastBytes[port | 0] = bytes.byteLength;
+      await idbPut(vmuKeyFor(port | 0), bytes);
+      return { ok: true, persisted: true, size: bytes.byteLength };
+    }
+    return { ok: true, persisted: false, why: 'port ' + port + ' is not this console\'s seat' };
+  };
+
   // Restore any previously-persisted state so Load State works after a reload.
   // Kept as a promise: the boot seed must not race it (a returning player's
   // own state wins over the shipped one).

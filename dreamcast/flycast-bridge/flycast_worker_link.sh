@@ -102,7 +102,11 @@ EXPORTED_FUNCS='[
   "_flycast_set_shard",
   "_flycast_set_fog",
   "_flycast_set_modvol",
-  "_flycast_guest_cycles"
+  "_flycast_guest_cycles",
+  "_flycast_vmu_ptr",
+  "_flycast_vmu_size",
+  "_flycast_vmu_gen",
+  "_flycast_vmu_ports"
 ]'
 
 EXPORTED_RUNTIME='[

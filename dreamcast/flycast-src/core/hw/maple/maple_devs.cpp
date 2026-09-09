@@ -352,11 +352,22 @@ u8 vmu_default[] = {
 // __EMSCRIPTEN__ branch of OnSetup), so the card is blank on every load and
 // anything the guest saved is gone. Publish the live flash buffer so the
 // worker shim can seed it from a shipped default card and persist guest
-// writes to IndexedDB. Single card (slot A1): last attached device wins.
+// writes to IndexedDB.
+//
+// ⚠ ONE ENTRY PER MAPLE BUS, NOT ONE GLOBAL. Until 2026-09-09 these were three
+// scalars and the comment here read "Single card (slot A1): last attached
+// device wins" — which is exactly what happened: createDreamcastDevices() gives
+// EVERY seated player's controller its own VMU (maple_cfg.cpp, the
+// MAPLE_PORTS loop), each one ran this assignment, and the LAST bus to be set
+// up overwrote the pointer. The page could therefore only ever see and persist
+// one card, so player 2's memory card existed inside the core, took the guest's
+// writes, and was thrown away at reload. Indexed by bus_id, the page can seed
+// and snapshot all four independently.
 extern "C" {
-	u8 *g_vmu_flash_ptr = nullptr;
-	u32 g_vmu_flash_size = 0;
-	volatile u32 g_vmu_flash_gen = 0;   // bumped whenever flash_data changes
+	u8 *g_vmu_flash_ptr[MAPLE_PORTS] = { nullptr, nullptr, nullptr, nullptr };
+	u32 g_vmu_flash_size[MAPLE_PORTS] = { 0, 0, 0, 0 };
+	// bumped whenever that bus's flash_data changes
+	volatile u32 g_vmu_flash_gen[MAPLE_PORTS] = { 0, 0, 0, 0 };
 }
 #endif
 
@@ -394,6 +405,15 @@ struct maple_sega_vmu: maple_base
 				break;
 			}
 		fullSaveNeeded = true;
+#ifdef __EMSCRIPTEN__
+		// A savestate restore replaces flash_data wholesale. Bump the generation
+		// so the page snapshots the RESTORED card instead of silently keeping the
+		// pre-load bytes in IndexedDB. The in-place (rollback) deserialize path
+		// does not re-run OnSetup, so without this a Load State moves nothing the
+		// shim can see.
+		if (bus_port == 0 && bus_id < MAPLE_PORTS)
+			++g_vmu_flash_gen[bus_id];
+#endif
 	}
 
 	void updateMapleLinkScreen()
@@ -455,9 +475,17 @@ struct maple_sega_vmu: maple_base
 		file = nullptr;
 		initializeVmu();
 		fullSaveNeeded = false;
-		g_vmu_flash_ptr = flash_data;
-		g_vmu_flash_size = sizeof(flash_data);
-		++g_vmu_flash_gen;   // blank card ready; the shim may now seed it
+		// bus_id / bus_port are filled in by maple_device::Setup() BEFORE it calls
+		// OnSetup() (maple_devs.cpp, Setup()), so the slot is known here. Only the
+		// A1 expansion slot (bus_port 0) is published — that is the card the
+		// MAPLE_PORTS loop in createDreamcastDevices() attaches to each seated
+		// player's controller, and it is the one a game means by "memory card".
+		if (bus_port == 0 && bus_id < MAPLE_PORTS)
+		{
+			g_vmu_flash_ptr[bus_id] = flash_data;
+			g_vmu_flash_size[bus_id] = sizeof(flash_data);
+			++g_vmu_flash_gen[bus_id];   // blank card ready; the shim may now seed it
+		}
 		return;
 #endif
 
@@ -746,7 +774,9 @@ struct maple_sega_vmu: maple_base
 						}
 						rptr(&flash_data[write_adr],write_len);
 #ifdef __EMSCRIPTEN__
-						++g_vmu_flash_gen;   // guest wrote the card
+						// guest wrote THIS bus's card
+						if (bus_port == 0 && bus_id < MAPLE_PORTS)
+							++g_vmu_flash_gen[bus_id];
 #endif
 
 						if (file != nullptr)

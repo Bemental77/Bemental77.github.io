@@ -1539,10 +1539,18 @@ extern "C" { extern volatile uint32_t g_wd_iter_gen; }
 // it seeds the card from a shipped default before the guest reads it and
 // snapshots it back to IndexedDB whenever the generation moves. The shim
 // reads/writes the buffer directly through HEAPU8 — no copy helpers needed.
+//
+// ⚠ ONE CARD PER MAPLE BUS. These were three scalars until 2026-09-09, so the
+// page could only ever see ONE card no matter how many players were seated:
+// every controller gets its own VMU inside the core (see the MAPLE_PORTS loop
+// in createDreamcastDevices), each one overwrote the single pointer, and the
+// last bus won. Player 2's card therefore existed, took the guest's writes,
+// and was discarded on reload because nothing could read it out. Indexed by
+// bus id now, so the page can seed and persist each seat's card separately.
 extern "C" {
-    extern u8 *g_vmu_flash_ptr;
-    extern u32 g_vmu_flash_size;
-    extern volatile u32 g_vmu_flash_gen;
+    extern u8 *g_vmu_flash_ptr[MAPLE_PORTS];
+    extern u32 g_vmu_flash_size[MAPLE_PORTS];
+    extern volatile u32 g_vmu_flash_gen[MAPLE_PORTS];
 }
 // Console flash bridge (nvmem.cpp, patch 0015). PSO's Serial Number + Access
 // Key are console-scoped, so this is what has to carry a registration.
@@ -1557,9 +1565,27 @@ EMSCRIPTEN_KEEPALIVE uint32_t  flycast_flash_size() { return g_dcflash_size; }
 EMSCRIPTEN_KEEPALIVE uint32_t  flycast_flash_gen()  { return g_dcflash_gen; }
 }
 extern "C" {
-EMSCRIPTEN_KEEPALIVE uintptr_t flycast_vmu_ptr()  { return (uintptr_t)g_vmu_flash_ptr; }
-EMSCRIPTEN_KEEPALIVE uint32_t  flycast_vmu_size() { return g_vmu_flash_size; }
-EMSCRIPTEN_KEEPALIVE uint32_t  flycast_vmu_gen()  { return g_vmu_flash_gen; }
+// PER-PORT VMU ACCESSORS. `port` is the maple bus (0..3) == the player number
+// minus one, the same index EmscriptenWorker hands retro_set_controller_port_
+// device and the same one the netplay roster calls "Player N". An out-of-range
+// port answers 0/0/0 rather than reading past the array, so a shim built
+// against an older contract cannot corrupt anything — it just sees no card.
+//
+// A zero-argument JS call lands here as port 0, which is what the pre-2026-09-09
+// shim asked for, so an old shim against a new binary still gets player 1.
+EMSCRIPTEN_KEEPALIVE uintptr_t flycast_vmu_ptr(int port) {
+    return (port >= 0 && port < MAPLE_PORTS) ? (uintptr_t)g_vmu_flash_ptr[port] : 0;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t flycast_vmu_size(int port) {
+    return (port >= 0 && port < MAPLE_PORTS) ? g_vmu_flash_size[port] : 0u;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t flycast_vmu_gen(int port) {
+    return (port >= 0 && port < MAPLE_PORTS) ? g_vmu_flash_gen[port] : 0u;
+}
+// How many card slots this build actually has, so the shim never has to guess
+// (== MAPLE_PORTS == EMW_MAX_PORTS). A shim that reads this cannot drift from
+// the core if the port count ever changes.
+EMSCRIPTEN_KEEPALIVE int flycast_vmu_ports(void) { return MAPLE_PORTS; }
 }
 
 EMSCRIPTEN_KEEPALIVE

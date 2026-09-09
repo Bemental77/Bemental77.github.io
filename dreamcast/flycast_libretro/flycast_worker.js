@@ -307,19 +307,46 @@
   }
 
   // VMU change-watch (see the vmuLoad/vmuWatch handlers).
+  //
+  // ⚠ ONE CARD PER MAPLE PORT — 0..3, i.e. Player 1..4. This used to be a
+  // single scalar pair because the core only published one pointer, so a
+  // two-player console had two memory cards inside it and the page could see
+  // exactly one: player 2 saved, the guest wrote the card, and the bytes died
+  // with the tab. The core now publishes per bus (maple_devs.cpp) and these
+  // accessors take a port, so each seat is seeded and snapshotted on its own.
+  const VMU_PORTS_MAX = 4;   // == MAPLE_PORTS; the real count is read from the core
   let vmuWatch = false;
-  let vmuGenSeen = -1;
+  let vmuPortCount = 0;
+  const vmuGenSeen = [-1, -1, -1, -1];
+  function vmuPortsFromCore() {
+    const M = self.Module;
+    if (!M) return 0;
+    // Ask the binary rather than assume: a shim newer than its .wasm would
+    // otherwise index cards that build has no accessor for.
+    if (typeof M._flycast_vmu_ports === 'function') {
+      const n = M._flycast_vmu_ports() | 0;
+      return n > 0 && n <= VMU_PORTS_MAX ? n : 0;
+    }
+    return 0;
+  }
   function vmuPoll() {
     if (!vmuWatch) return;
     const M = self.Module;
     if (!M || typeof M._flycast_vmu_gen !== 'function') return;
-    const gen = M._flycast_vmu_gen() >>> 0;
-    if (gen === vmuGenSeen) return;
-    vmuGenSeen = gen;
-    const ptr = M._flycast_vmu_ptr() >>> 0, size = M._flycast_vmu_size() >>> 0;
-    if (!ptr || !size) return;
-    const copy = new Uint8Array(M.HEAPU8.subarray(ptr, ptr + size));  // detached copy
-    postMessage({ cmd: 'vmuChanged', data: copy, gen: gen }, [copy.buffer]);
+    if (!vmuPortCount) vmuPortCount = vmuPortsFromCore();
+    const n = vmuPortCount || 1;
+    for (let port = 0; port < n; port++) {
+      const gen = M._flycast_vmu_gen(port) >>> 0;
+      if (gen === vmuGenSeen[port]) continue;
+      const ptr = M._flycast_vmu_ptr(port) >>> 0, size = M._flycast_vmu_size(port) >>> 0;
+      // An empty slot (no controller on that bus) reports 0/0. Do NOT bank the
+      // generation in that case — the card may still be created later, and
+      // swallowing the bump would lose its first snapshot.
+      if (!ptr || !size) continue;
+      vmuGenSeen[port] = gen;
+      const copy = new Uint8Array(M.HEAPU8.subarray(ptr, ptr + size));  // detached copy
+      postMessage({ cmd: 'vmuChanged', port: port, data: copy, gen: gen }, [copy.buffer]);
+    }
   }
   let pendingSave = false;   // Save State, deferred to a clean asyncify boundary (pumpTick)
   const FRAME_MS = 1000 / 60;
@@ -1579,30 +1606,88 @@
       // what to seed, so a blank power-on card can never overwrite a good
       // stored one.
       case 'vmuLoad': {
+        // data.port selects the seat (0 == Player 1). An absent port means 0,
+        // which is what the single-card contract used to mean.
+        const port = (data.port | 0) >= 0 && (data.port | 0) < VMU_PORTS_MAX ? (data.port | 0) : 0;
         try {
           const M = self.Module;
-          const ptr = M._flycast_vmu_ptr() >>> 0, size = M._flycast_vmu_size() >>> 0;
+          const ptr = M._flycast_vmu_ptr(port) >>> 0, size = M._flycast_vmu_size(port) >>> 0;
           const src = new Uint8Array(data.data);
-          if (!ptr || !size) { postMessage({ cmd: 'print', txt: '[vmu] no card attached yet — seed skipped' }); break; }
-          if (src.length !== size) { postMessage({ cmd: 'print', txt: '[vmu] seed is ' + src.length + ' B, card is ' + size + ' B — seed skipped' }); break; }
+          if (!ptr || !size) {
+            postMessage({ cmd: 'print', txt: '[vmu] port ' + port + ': no card attached — seed skipped' });
+            postMessage({ cmd: 'vmuSeeded', port: port, ok: false, why: 'no card on that port' });
+            break;
+          }
+          if (src.length !== size) {
+            postMessage({ cmd: 'print', txt: '[vmu] port ' + port + ': seed is ' + src.length + ' B, card is ' + size + ' B — seed skipped' });
+            postMessage({ cmd: 'vmuSeeded', port: port, ok: false, why: 'size mismatch' });
+            break;
+          }
           M.HEAPU8.set(src, ptr);
-          vmuGenSeen = M._flycast_vmu_gen() >>> 0;   // don't echo our own write back
-          vmuWatch = true;
-          postMessage({ cmd: 'print', txt: '[vmu] seeded ' + size + ' B into the card' });
-          postMessage({ cmd: 'vmuSeeded', ok: true });
+          // don't echo our own write back out as a change
+          vmuGenSeen[port] = M._flycast_vmu_gen(port) >>> 0;
+          postMessage({ cmd: 'print', txt: '[vmu] port ' + port + ': seeded ' + size + ' B into the card' });
+          postMessage({ cmd: 'vmuSeeded', port: port, ok: true });
         } catch (err) {
-          postMessage({ cmd: 'print', txt: '[vmu] seed threw: ' + (err && err.message ? err.message : String(err)) });
-          postMessage({ cmd: 'vmuSeeded', ok: false });
+          postMessage({ cmd: 'print', txt: '[vmu] port ' + port + ': seed threw: ' + (err && err.message ? err.message : String(err)) });
+          postMessage({ cmd: 'vmuSeeded', port: port, ok: false, why: 'threw' });
         }
         break;
       }
       case 'vmuWatch': {
         try {
           const M = self.Module;
-          vmuGenSeen = M._flycast_vmu_gen ? (M._flycast_vmu_gen() >>> 0) : 0;
+          vmuPortCount = vmuPortsFromCore();
+          // Bank every port's CURRENT generation so arming the watch does not
+          // immediately re-emit cards nobody touched.
+          for (let p = 0; p < VMU_PORTS_MAX; p++)
+            vmuGenSeen[p] = (M && M._flycast_vmu_gen) ? (M._flycast_vmu_gen(p) >>> 0) : 0;
           vmuWatch = !!data.on;
-          postMessage({ cmd: 'print', txt: '[vmu] watch=' + (vmuWatch ? 1 : 0) });
+          postMessage({ cmd: 'print', txt: '[vmu] watch=' + (vmuWatch ? 1 : 0) + ' ports=' + vmuPortCount });
         } catch (_) {}
+        break;
+      }
+      // Read one card's LIVE bytes straight out of the core. Read-only, and the
+      // only way to prove from outside that two seats hold two DIFFERENT
+      // buffers — which is exactly what the single-pointer contract could not
+      // express and what the two-player card test asserts.
+      case 'vmuDump': {
+        const port = (data.port | 0) >= 0 && (data.port | 0) < VMU_PORTS_MAX ? (data.port | 0) : 0;
+        try {
+          const M = self.Module;
+          const ptr = M._flycast_vmu_ptr(port) >>> 0, size = M._flycast_vmu_size(port) >>> 0;
+          if (!ptr || !size) { postMessage({ cmd: 'vmuDump', port: port, data: null, ptr: 0, size: 0 }); break; }
+          const copy = new Uint8Array(M.HEAPU8.subarray(ptr, ptr + size));
+          postMessage({ cmd: 'vmuDump', port: port, data: copy, ptr: ptr, size: size,
+                        gen: M._flycast_vmu_gen(port) >>> 0 }, [copy.buffer]);
+        } catch (err) {
+          postMessage({ cmd: 'vmuDump', port: port, data: null, ptr: 0, size: 0,
+                        error: String(err && err.message || err) });
+        }
+        break;
+      }
+      // Card inventory, so the page can seed only the slots that exist and can
+      // report honestly when a seat has no card rather than inventing one.
+      case 'vmuInfo': {
+        try {
+          const M = self.Module;
+          vmuPortCount = vmuPortsFromCore();
+          const slots = [];
+          for (let p = 0; p < (vmuPortCount || 0); p++) {
+            slots.push({
+              port: p,
+              size: (M && M._flycast_vmu_size) ? (M._flycast_vmu_size(p) >>> 0) : 0,
+              gen:  (M && M._flycast_vmu_gen)  ? (M._flycast_vmu_gen(p)  >>> 0) : 0,
+              present: !!((M && M._flycast_vmu_ptr) ? (M._flycast_vmu_ptr(p) >>> 0) : 0),
+            });
+          }
+          postMessage({ cmd: 'vmuInfo', ports: vmuPortCount, slots: slots });
+          postMessage({ cmd: 'print', txt: '[vmu] slots: ' +
+            (slots.length ? slots.map((x) => 'p' + x.port + (x.present ? '=' + x.size + 'B' : '=none')).join(' ')
+                          : 'none — this binary has no per-port VMU accessors') });
+        } catch (err) {
+          postMessage({ cmd: 'vmuInfo', ports: 0, slots: [], error: String(err && err.message || err) });
+        }
         break;
       }
 
