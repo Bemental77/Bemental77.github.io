@@ -1,19 +1,21 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <script src="/lib/capability.js"></script>
+  <script src="/lib/capability.js?v=e25dca87"></script>
   <script src="/lib/xboxinput.js"></script>
-  <!-- ⚠ NO NETPLAY SCRIPTS ARE LOADED HERE, ON PURPOSE.
-       /lib/netplay-host.js is the host half of STREAMING — it captures this
-       canvas with captureStream(), interposes on the audio graph, and publishes
-       both over WebRTC. Streaming is cancelled by user directive 2026-09-08
-       ("WE WILL NOT USE STREAMING!").
-       /lib/netplay.js is the LOCKSTEP engine and is genuinely wanted — but this
-       page cannot use it, because the shipped snes9x_2005 core answers exactly
-       one controller and has no port index for a second player (see the note
-       above runFrame()). Loading the engine to open a room that could only ever
-       seat one person would be a control that lies. Both come back the moment
-       the core gains a second pad. -->
+  <!-- THE LOCKSTEP ENGINE, AND ONLY IT.
+       /lib/netplay-host.js and /lib/netplay-guest.js are the two halves of
+       STREAMING — one machine captures this canvas with captureStream() and
+       publishes it while the other watches a video and holds a pad. Streaming is
+       cancelled by user directive 2026-09-08 ("WE WILL NOT USE STREAMING!") and
+       neither file is loaded here.
+       /lib/netplay.js IS loaded: every player runs their own SNES and only pad
+       bytes cross the wire. This was blocked until 2026-09-09 because the
+       shipped snes9x_2005 answered exactly one controller — S9xReadJoypad
+       returned a hardcoded 0 for every port but 0 — so a room could only ever
+       have seated one person. The core now carries five ports and the second
+       one is proven live; see the note above runFrame(). -->
+  <script src="/lib/netplay.js?v=055f3e69"></script>
   <meta charset="UTF-8" />
   <title>SNES Wasm</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -168,6 +170,49 @@
       transform: translate(-50%, -50%);
       width: 100%; height: 100%; min-width: 44px; min-height: 44px;
     }
+
+    /* ── ONLINE PLAY (lockstep room). Shape lifted from genesis.html/ps1.html so
+       every console on this site presents the SAME control to a player. ── */
+    #netOverlay { position: fixed; inset: 0; z-index: 2147483000; display: none;
+      align-items: center; justify-content: center; background: rgba(0,0,0,.72); }
+    #netOverlay.on { display: flex; }
+    #netBox { background: #15171a; color: #e8e8e8; border: 1px solid #444; border-radius: 14px;
+      padding: 20px 22px; width: min(460px, 94vw); max-height: 88vh; overflow: auto;
+      box-shadow: 0 12px 48px rgba(0,0,0,.6); font: 14px/1.5 system-ui, sans-serif; }
+    #netBox h6 { margin: 0 0 6px; font-size: 18px; color: #fff; }
+    #netBox .lead { color: #9aa; margin: 0 0 14px; font-size: 13px; }
+    #netRow { display: flex; gap: 10px; margin-bottom: 12px; }
+    #netRow button, .netActions button { flex: 1; min-height: 44px; border-radius: 9px;
+      border: 1px solid #555; background: #2a2d31; color: #eee; font-size: 14px; cursor: pointer; }
+    #netRow button.on, #netBox button.primary { background: #2b7cd3; border-color: #2b7cd3; color: #fff; font-weight: 600; }
+    .netLabel { color: #9aa; font-size: 12px; margin: 10px 0 4px; text-transform: uppercase; letter-spacing: .06em; }
+    #netCode { font: 700 30px/1.1 ui-monospace, Menlo, monospace; letter-spacing: 5px; text-align: center;
+      background: #0e1013; border: 1px dashed #4a4; border-radius: 10px; padding: 13px; color: #9f9; user-select: all; }
+    #netCodeIn { width: 100%; box-sizing: border-box; min-height: 44px; font: 700 20px/1 ui-monospace, Menlo, monospace;
+      letter-spacing: 4px; text-align: center; text-transform: uppercase; background: #0e1013; color: #eee;
+      border: 1px solid #555; border-radius: 9px; padding: 11px; }
+    #netGame { width: 100%; box-sizing: border-box; min-height: 44px; background: #0e1013; color: #eee;
+      border: 1px solid #555; border-radius: 9px; padding: 10px 12px; font-size: 15px; }
+    .netActions { display: flex; gap: 10px; margin-top: 12px; }
+    #netRoster { list-style: none; margin: 6px 0 0; padding: 0; }
+    #netRoster li { display: flex; align-items: center; gap: 9px; padding: 5px 0; font-size: 13px; }
+    #netRoster .dot { width: 9px; height: 9px; border-radius: 50%; background: #666; flex: none; }
+    #netRoster .dot.on { background: #5c5; box-shadow: 0 0 8px #5c5; }
+    #netRoster .dot.me { background: #6af; box-shadow: 0 0 8px #6af; }
+    #netStatus { margin-top: 12px; font-size: 13px; color: #9aa; }
+    #netStatus.good { color: #7ee787; } #netStatus.bad { color: #ff7b72; } #netStatus.busy { color: #d8b44a; }
+    /* The live session readout, over the picture. Hidden with no session, so
+       single player is untouched. */
+    #netHud { position: absolute; left: 8px; top: 8px; z-index: 40; display: none;
+      font: 11px/1.45 ui-monospace, Menlo, monospace; color: #cfe; background: rgba(0,0,0,.55);
+      border: 1px solid #2a3a44; border-radius: 7px; padding: 6px 9px; pointer-events: none; max-width: 70%; }
+    #netHud.on { display: block; }
+    #netHud .mode { color: #7ee787; font-weight: 700; }
+    #netHud .warn { color: #d8b44a; }
+    #netDesync { position: absolute; left: 50%; top: 12px; transform: translateX(-50%); z-index: 41;
+      display: none; max-width: 90%; font: 12px/1.5 system-ui, sans-serif; color: #fff;
+      background: rgba(140,20,20,.94); border: 1px solid #f66; border-radius: 8px; padding: 8px 12px; }
+    #netDesync.on { display: block; }
 </style>
   <!-- THE FLOOR NO RUNTIME GATE CAN REACH.  This page had no <noscript> at all, so a
        visitor with JS disabled (blocked by an extension, or on a browser where the first
@@ -205,10 +250,15 @@
     <button id="btnFull" disabled>⛶ Fullscreen</button>
     <!-- hidden until Netplay.supported() proves the browser can do it: a control
          that does nothing when pressed reads as "the site is broken". -->
+    <button id="btnNet" type="button" hidden>👥 Play Online</button>
   </div>
   <div id="canvasWrap"><canvas id="canvas" width="256" height="224"></canvas></div>
   <div id="statusBar"><span id="status">Idle.</span><span id="fps"></span></div>
-  <div id="keyHelp">Keyboard — D-pad <b>arrows</b> · <b>a</b> A · <b>z</b> B · <b>x</b> X · <b>s</b> Y · <b>d</b> L · <b>c</b> R · <b>Enter</b> Start · <b>Shift</b> Select. A gamepad works too.</div>
+  <div id="keyHelp">
+    <b>Player 1</b> — D-pad <b>arrows</b> · <b>a</b> A · <b>z</b> B · <b>x</b> X · <b>s</b> Y · <b>d</b> L · <b>c</b> R · <b>Enter</b> Start · <b>Shift</b> Select.<br>
+    <b>Player 2</b> — D-pad <b>i j k l</b> · <b>f</b> A · <b>g</b> B · <b>t</b> X · <b>r</b> Y · <b>q</b> L · <b>e</b> R · <b>Tab</b> Start · <b>`</b> Select.<br>
+    Gamepads: the first pad found is Player 1, the second is Player 2. Or press <b>Play Online</b> and each of you brings your own machine.
+  </div>
 </div>
 
 <div id="mobileShell">
@@ -218,6 +268,7 @@
     <label for="mobileRomSelect">Choose a game</label>
     <select id="mobileRomSelect"></select>
     <button id="mobileSplashStart" type="button">Start</button>
+    <button id="mobileSplashNet" type="button" hidden style="min-width:0;padding:8px 14px;font-size:13px;background:#1d1d1d;border-color:#333;color:#aaa">👥 Play Online</button>
     <p class="rotateTip">Rotate to landscape for the best view.</p>
   </div>
   <div id="mobileScreen"></div>
@@ -254,8 +305,51 @@
     </div>
   </div>
   <div id="rotateHint">Landscape gives a bigger picture.</div>
+  <div id="netHud" aria-live="polite"></div>
+  <div id="netDesync" role="alert" aria-live="assertive"></div>
 </div>
 <div id="toast"></div>
+
+<div id="netOverlay">
+  <div id="netBox">
+    <h6>👥 Play Online</h6>
+    <p class="lead">Everyone runs the game on their own machine and plays together, exactly like
+      two controllers plugged into one SNES. <b>Join the room first</b> — you do not need a
+      game loaded yet. Once you are both in, you each press Start and the two consoles begin on
+      the same frame.</p>
+    <div id="netRow">
+      <button id="netHostBtn" class="primary" type="button">Open a room</button>
+      <button id="netJoinBtn" type="button">Join a room</button>
+    </div>
+    <div id="netHostPane" style="display:none">
+      <div class="netLabel">Share this code</div>
+      <div id="netCode">·····</div>
+      <div class="netActions"><button id="netCopy" type="button">Copy code</button></div>
+    </div>
+    <div id="netJoinPane" style="display:none">
+      <div class="netLabel">Game the room is playing</div>
+      <select id="netGame"></select>
+      <div class="netLabel">Their code</div>
+      <input id="netCodeIn" type="text" maxlength="5" autocomplete="off" autocapitalize="characters"
+             spellcheck="false" placeholder="ABC12" inputmode="latin">
+      <div class="netActions"><button id="netGo" class="primary" type="button">Join</button></div>
+    </div>
+    <!-- One row per CONTROLLER PORT of the console, filled from the engine's own
+         port count — never from a number written here. A SNES has two on the
+         front, and this room seats two: five is what the core's Joypads[] array
+         is wide, but ports 3-5 are a Super Multitap and nothing on this page
+         puts one in. -->
+    <div id="netRoom" style="display:none">
+      <div class="netLabel">The room <span id="netRoomPorts"></span></div>
+      <ul id="netRoster"></ul>
+    </div>
+    <div id="netStatus">Not connected.</div>
+    <div class="netActions">
+      <button id="netLeave" type="button" style="display:none">Leave</button>
+      <button id="netClose" type="button">Close</button>
+    </div>
+  </div>
+</div>
 
 <script>
 (function () {
@@ -333,8 +427,19 @@
   var wasmReady = false, running = false, romName = '', muted = false;
   var ctx2d = null, imgData = null;      // 512x448 — see getScreenBuffer() below
   var audioCtx = null, sndBlock = null, sndPos = 0;
-  var padState = { up: false, down: false, left: false, right: false, a: false, b: false, x: false, y: false, l: false, r: false, start: false, select: false };
-  var gpState = {};   // gamepad-only view, OR-ed in padMask()
+  // ── TWO LOCAL PLAYERS ──────────────────────────────────────────────────────
+  // padState[0] is Player 1 (keyboard set 1 + the touch shell), padState[1] is
+  // Player 2 (keyboard set 2). gpState is the gamepad-only view and is kept
+  // SEPARATE so a poll cannot clear what a key or a touch button just set;
+  // gpState[0] is the first pad the browser reports and gpState[1] the second.
+  // Nothing here is OR-ed across players: Player 2's buttons must not appear on
+  // Player 1's controller, which is exactly the bug the old single-mask page
+  // could not have because it only had one controller to put them on.
+  var padState = [
+    { up: false, down: false, left: false, right: false, a: false, b: false, x: false, y: false, l: false, r: false, start: false, select: false },
+    { up: false, down: false, left: false, right: false, a: false, b: false, x: false, y: false, l: false, r: false, start: false, select: false }
+  ];
+  var gpState = [{}, {}];
 
   window.Module = {
     locateFile: (p) => CORE_DIR + p,
@@ -361,105 +466,367 @@
     imgData = ctx2d.getImageData(0, 0, 512, 448);
   }
 
-  function padMask() {
-    var m = 0;
-    for (var k in BIT) { if (padState[k] || gpState[k]) m |= (1 << BIT[k]); }
+  // The local mask for ONE player. `who` is 0 or 1 — it is a LOCAL seat index,
+  // not a SNES port: which port these bytes end up on is the room's answer in a
+  // session and port `who` when playing on one machine.
+  function padMask(who) {
+    var i = who | 0, m = 0;
+    var ps = padState[i] || {}, gs = gpState[i] || {};
+    for (var k in BIT) { if (ps[k] || gs[k]) m |= (1 << BIT[k]); }
     return m;
   }
 
   var frameCount = 0, presented = 0, lastFpsAt = 0, guestFrames = 0;
   window.__snesFrames = 0;     // read by tools/legacy_emu_page_test.mjs
 
-  // ── ONLINE CO-OP IS NOT AVAILABLE ON THIS PAGE, AND THAT IS AN HONEST ─────
-  //    ANSWER RATHER THAN A MISSING FEATURE.
+  // A rolling log the page keeps for itself, so a test (and a person reading the
+  // console) can see WHY the frame gate did or did not engage.
+  var __snesLog = [];
+  function pageLog(msg) {
+    var line = String(msg);
+    __snesLog.push(line);
+    if (__snesLog.length > 200) __snesLog.shift();
+    try { console.log('[snes]', line); } catch (e) {}
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // TWO CONTROLLERS, AND THE LOCKSTEP FRAME DRIVER.
   //
-  // WHAT WAS HERE, AND WHY IT WENT. Until 2026-09-08 this page was the host half
-  // of a STREAMING session: it captured its own canvas and audio with
-  // captureStream(), published them over WebRTC, and OR'd a remote player's
-  // buttons into the SAME controller mask as the local player's. Two people
-  // shared one pad and only one of them ran an emulator. The user cancelled
-  // streaming outright ("WE WILL NOT USE STREAMING!") and specified deterministic
-  // lockstep instead: every player runs their own core and only pad bytes cross
-  // the wire.
+  // ── WHAT USED TO BE HERE, AND WHY IT IS GONE ───────────────────────────────
+  // Until 2026-09-09 this comment said online play could not be wired at all,
+  // because the shipped snes9x_2005 answered exactly ONE controller:
   //
-  // WHY LOCKSTEP CANNOT BE WIRED HERE YET — a CORE limitation, not a page one.
-  // This build of snes9x_2005 exposes ONE controller and one only. Its own shim
-  // says so, verbatim:
+  //     snes/snesWasm/source/exports.c   int joyPadInput = 0;
+  //                                      uint32_t S9xReadJoypad(int32_t port){
+  //                                        if(port == 0) return joyPadInput;
+  //                                        return 0; }
   //
-  //     snes/snesWasm/source/exports.c:19      int joyPadInput = 0;
-  //     snes/snesWasm/source/exports.c:32-35   void setJoypadInput(int32_t input)
-  //                                            { joyPadInput = input; }
-  //     snes/snesWasm/source/exports.c:37-40   uint32_t S9xReadJoypad(int32_t port){
-  //                                              if(port == 0) return joyPadInput; //1Pのみ対応
-  //                                              return 0; }
+  // That was true and it was verified in live wasm memory, not just read: after
+  // 200 frames with _setJoypadInput(0x0201), IPPU.Joypads[0..4] read
+  // 0xffff0201 0 0 0 0. The core has been rebuilt. `joyPadInput` is now
+  // `joyPadInput[5]`, `S9xReadJoypad(port)` returns `joyPadInput[port]`, and
+  // `setJoypadInputPort(port, mask)` is exported beside the original setter
+  // (which still means port 0, so nothing that used it broke).
   //
-  // The comment is the author's and translates as "1P only supported", and the
-  // wasm agrees: the module's whole export list holds exactly one joypad symbol,
-  // taking one i32 and storing it to one address. There is no port index to
-  // address a second player with, so a lockstep room here could only seat one
-  // person — which is not multiplayer, it is single player with extra latency.
+  // ── WHAT THE REBUILD COST, so the next person budgets it correctly ─────────
+  // Two changes to snes/snesWasm/build.sh, both forced by the toolchain and
+  // both the same class the N64 core took:
+  //   1. EXTRA_EXPORTED_RUNTIME_METHODS -> EXPORTED_RUNTIME_METHODS. The old
+  //      name is a HARD ERROR, so build.sh could not produce a binary at all.
+  //   2. The HEAP views had to be listed explicitly. Emscripten 6.0.2 attaches
+  //      a view to Module only when it is exported, and this page reads
+  //      Module.HEAPU8.buffer and Module.HEAPF32.buffer.
+  // ⚠ And the trap that makes a WORKING core look dead: Module.calledRun does
+  // NOT EXIST in this toolchain's output. A harness that waits on it reports a
+  // booting core as never launched, with empty errors. Wait on
+  // onRuntimeInitialized, and sample the canvas before believing any flag.
   //
-  // ⚠ THE FRAME SEAM ITSELF IS ALREADY FINE. `Module._mainLoop()` runs exactly
-  // one frame (S9xMainLoop returns at the SCAN_KEYS_FLAG break, cpuexec.c), and
-  // this page already drives it from a fixed-timestep accumulator. The ONLY
-  // missing piece is the second pad.
+  // ── WHAT WAS PROVEN, in live wasm memory and then in a real game ───────────
+  // NO MULTITAP IS INVOLVED — ignore any Super Multitap framing. At runtime
+  // IPPU.Controller == SNES_JOYPAD, and ppu.c:2098-2099 ALREADY writes
+  // IPPU.Joypads[1] into FillRAM[0x421a]/[0x421b], the standard auto-read
+  // registers for port 2, unconditionally. Only S9xReadJoypad was starving it.
+  // After the rebuild, with port 0 = A+Start and port 1 = B+Select:
+  //     IPPU.Joypads[0..4] = 0xffff1080 0xffffa000 0x0 0x0 0x0
+  //     FillRAM[0x4200] = 0x81  (auto-joypad-read ON), and FillRAM[0x4218..b]
+  //     carried p0 lo/hi then p1 lo/hi
+  // and the isolation holds both ways: moving port 1 left Joypads[0] untouched,
+  // moving port 0 left Joypads[1] untouched.
+  // Then in Tetris (2PLAYER GAME), three arms from ONE savestate, 100 frames:
+  //     port 0 holding LEFT  -> 512 px changed, bounding box x 16..71   (P1 well)
+  //     port 1 holding LEFT  -> 512 px changed, bounding box x 160..215 (P2 well)
+  //     control arm re-run reproduced EXACTLY
+  // Each port moves its own player's piece and nobody else's.
   //
-  // WHAT WOULD FIX IT, precisely, so this is a scoped job and not a wish:
-  // snes9x underneath is FIVE-player capable and already polls all five —
-  // ppu.h:59 `uint32_t Joypads[5]`, ppu.c:2056-2062 `for (i = 0; i < 5; i++)
-  // IPPU.Joypads[i] = S9xReadJoypad(i)`, and Super Multitap is implemented at
-  // ppu.c:1445/1451 with `Settings.MultiPlayer5 = true` already set in
-  // exports.c:136. Turning `joyPadInput` into `joyPadInput[5]`, adding
-  // `setJoypadInputPort(port, mask)` beside the existing setter, and returning
-  // `joyPadInput[port]` from S9xReadJoypad is a few lines — plus a REBUILD of
-  // snes9x_2005.wasm via snes/snesWasm/build.sh. Until that rebuild happens this
-  // page ships single player and says so, rather than presenting an online
-  // button that pairs two people onto one controller.
+  // ── LOCAL TWO-PLAYER IS NOT NETPLAY, AND BOTH EXIST ────────────────────────
+  // Two people at one keyboard, or two gamepads in one machine, need no room and
+  // no network — see KEYMAP2 and pollGamepads(). runFrame() writes BOTH ports
+  // every frame from the two local masks. That path is what a SNES actually was.
   //
-  // ── TWO MEASURED REFINEMENTS (2026-09-09), both of which SHRINK that job ────
-  // The paragraph above is confirmed — `S9xReadJoypad` really does return a
-  // hardcoded 0 for every port but 0, and it was checked in LIVE WASM MEMORY,
-  // not just read: after 200 frames with `_setJoypadInput(0x0201)`,
-  //     IPPU.Joypads[0..4] = 0xffff0201 0x0 0x0 0x0 0x0
-  // and `_setJoypadInput(0x5A5A5A5A)` changed exactly 4 bytes in the low 1 MB
-  // (one i32 at 0x17b10) — one slot, not an array of five. But two details are
-  // different from what is written above:
+  // ── THE ROOM: EVERY PLAYER RUNS THEIR OWN SNES ─────────────────────────────
+  // Only pad bytes cross the wire — two bytes per controller per emulated frame
+  // — and each machine applies every seated port's input to its own core on the
+  // SAME frame number. Streaming is cancelled (user directive 2026-09-08, "WE
+  // WILL NOT USE STREAMING!"): nothing here captures a canvas or an audio graph.
   //
-  //   1. ⚠ NO MULTITAP IS INVOLVED, so ignore the Super Multitap framing. At
-  //      runtime `IPPU.Controller == 1 == SNES_JOYPAD`, NOT SNES_MULTIPLAYER5:
-  //      exports.c:137 sets ControllerOption = SNES_JOYPAD, ppu.c:1780 derives
-  //      Controller = 1-1 = SNES_MULTIPLAYER5, and S9xNextController()
-  //      (ppu.c:1781, :1937-1939) immediately advances it to SNES_JOYPAD. A
-  //      plain second controller needs nothing enabled — ppu.c:2098-2099
-  //      ALREADY writes IPPU.Joypads[1] into FillRAM[0x421a]/[0x421b], the
-  //      standard auto-read registers for port 2, unconditionally. Only
-  //      S9xReadJoypad starves it.
+  //   ls.beginFrame(myPads) -> { ready, frame, image } | { ready:false, waitingOn }
+  //     The engine answers with the WHOLE controller picture for one exact
+  //     emulated frame — every seated port's bytes — or it refuses. A refusal
+  //     STALLS this machine. It never predicts: a guessed pad forks the two
+  //     simulations silently and permanently, and there is no rollback here to
+  //     unfork them.
   //
-  //   2. ⚠ build.sh DOES NOT RUN TODAY, so budget that before the C change.
-  //      It passes `-s EXTRA_EXPORTED_RUNTIME_METHODS='["cwrap"]'`, which is a
-  //      HARD ERROR on both installed toolchains — emsdk/upstream/emscripten/
-  //      tools/settings.py:251 lists it "No longer supported, use
-  //      EXPORTED_RUNTIME_METHODS" and the only accepted value is []. Same
-  //      one-word rename the N64 core already took (see CLAUDE.md). The C
-  //      itself is clean: all 40 source/*.c compile with 0 errors under emcc
-  //      4.0.10 (~/emsdk-upstream) and 6.0.2 (repo emsdk/) — verified
-  //      -fsyntax-only; a full LINK was NOT attempted, so that part is unproven.
+  //   _setJoypadInputPort(p, mask) for EVERY port, then ONE _mainLoop().
+  //     _mainLoop() is exactly one SNES frame (S9xMainLoop returns at the
+  //     SCAN_KEYS_FLAG break, cpuexec.c), and S9xUpdateJoypads() polls all five
+  //     ports through S9xReadJoypad once per frame, so the masks written here
+  //     are the masks that frame sees.
   //
-  // And the reason the rest of this is worth doing: the core is bit-
-  // deterministic where lockstep needs it to be. Two arms entered from a common
-  // _loadState, 120 frames, same input: 0 of 529,136 savestate bytes differed,
-  // and one _mainLoop() advances the frame counters by exactly +1. The frame
-  // seam and the fingerprint are both already sound; the second pad is the
-  // whole of what is missing.
+  //   ls.endFrame(hash) — IMMEDIATELY, because this core is SYNCHRONOUS.
+  //     _mainLoop() has RETURNED by the time the next line executes, so the
+  //     fingerprint for the frame just run is available at once. (Dreamcast's
+  //     core lives in a worker and needs Lockstep.submitHash() for a hash whose
+  //     frame has already gone by; this page does not.)
+  //
+  // ⚠ THE GUEST RATE IS NOT TOUCHED (CLAUDE.md gate #9). The accumulator in
+  // loop() still paces every frame to FRAME_MS = 1000 / SNES_HZ, i.e. 1.000x
+  // hardware. This gate can only make the guest run SLOWER (a stall), never
+  // faster: it decides WHETHER the frame the accumulator already asked for may
+  // run, never how many are asked for.
+  //
+  // ⚠ AND THE CORE MUST NOT RUN ONE FRAME BEFORE THE GATE IS ARMED. Two machines
+  // that free-ran for different numbers of frames are at different guest frames,
+  // which is a desync at "frame 0". lsArmBeforeFreerun() therefore runs inside
+  // bootRom() BETWEEN the _startWithRom() and `running = true`, with no yield in
+  // between, so the first frame this core ever runs is the room's frame 0.
+  //
+  // MEASURED, and it is why this design cold-boots both machines rather than
+  // copying one machine's state to the other: two arms entered from a common
+  // _loadState, 120 frames, same input — 0 of 529,136 savestate bytes differed,
+  // and one _mainLoop() advances the frame counters by exactly +1.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // A SNES has two controller ports on the front of the machine. The core's
+  // Joypads[] array is FIVE wide and this page can address all five, but ports
+  // 3-5 only exist behind a Super Multitap and nothing here puts one in — so the
+  // room seats two and says so, rather than seating five and dropping three
+  // players' inputs on the floor.
+  var SNES_PORTS = 2;
+
+  // A SNES pad is a 16-bit mask (bits 4..15 used — see BIT), so two bytes carry
+  // it exactly. Handed to the engine explicitly rather than left at
+  // lib/netplay.js's 64-byte Dreamcast default: the image is
+  // portCount * padBytes and every byte of it crosses the wire every frame.
+  var LS_PAD_BYTES = 2;
+
+  var LS = {
+    armed: false,        // the frame gate is engaged; runFrame() is gated
+    running: false,      // ...and the barrier released, so frames are flowing
+    frames: 0,           // gated frames this core has run
+    hashEvery: 60,
+    hashes: 0,
+    stalling: false, waitingOn: [], stallReason: null,
+    fault: null,         // why this machine is NOT frame-gated, in words
+  };
+
+  function lsEngine() {
+    var s = NET.session;
+    if (!s) return null;
+    try { return s.ls || null; } catch (e) { return null; }
+  }
+
+  // THIS MACHINE'S OWN PAD(S), KEYED BY THE PORT THE ROOM GAVE IT.
+  // ⚠ THE KEYBOARD IS NOT PORT 0 ANY MORE. It is whichever port this player
+  // holds: a player told they are Player 2 has to drive Player 2's character,
+  // and padMask() builds a local mask with no idea which port it is for. The
+  // engine places these bytes at port*padBytes in the image it builds, so the
+  // re-mapping happens in exactly one place.
+  function lsLocalPads() {
+    var ls = lsEngine();
+    // ⚠ NEVER FALL BACK TO PORT 0 INSIDE A ROOM. A console whose seat is not
+    // known yet would write its pad into PORT 0 — ANOTHER PLAYER'S controller.
+    // This shipped on Dreamcast and the user hit it immediately: "player 2 took
+    // over as player 1! wtf, it def should not do that."
+    //
+    // It is a reachable state, not a theoretical one — lib/netplay.js documents
+    // a path where `localPorts` stays EMPTY. Defaulting that to port 0 makes the
+    // failure mode of "I do not know which player I am" into "act as Player 1",
+    // which is the worst available guess: it fights the real Player 1 for their
+    // own character, on their own screen.
+    //
+    // In a room, no seat means NO PAD. A solo console (no session) still uses
+    // port 0, because there it is not a guess — it is the only port.
+    var inRoom = !!(typeof NET !== 'undefined' && NET && NET.session);
+    var known = (ls && ls.localPorts && ls.localPorts.length) ? ls.localPorts : null;
+    if (!known && inRoom) {
+      if (!lsLocalPads._warned) {
+        lsLocalPads._warned = true;
+        pageLog('[lockstep] this console has no seat yet, so it is sending NO pad rather than driving '
+          + 'port 0 — taking Player 1\'s controller because our own seat is unknown is worse than '
+          + 'sending nothing for a frame');
+      }
+      return {};
+    }
+    var ports = known || [0];
+    var out = {};
+    ports.forEach(function (port, k) {
+      // A machine holding SEVERAL seats drives them from its OWN two local
+      // players — seat 0 from keyboard set 1 / gamepad 1, seat 1 from keyboard
+      // set 2 / gamepad 2. That is exactly what two pads in one console do, so a
+      // pair sharing a machine can still join a room with a third person.
+      var m = (k < 2) ? padMask(k) : 0;
+      var b = new Uint8Array(LS_PAD_BYTES);
+      b[0] = m & 0xff; b[1] = (m >> 8) & 0xff;
+      out[port] = b;
+    });
+    return out;
+  }
+
+  // THE FINGERPRINT. The serialized state is what lockstep must keep identical,
+  // so that is what is hashed — not the framebuffer, which can agree while the
+  // machines have already diverged.
+  // ⚠ IT IS NOT FREE: the state is ~529 KB, so hashing every frame would cost
+  // more than the emulation. Once a second (hashEvery = 60) catches a divergence
+  // long before a human could act on it.
+  // ⚠ AND _saveState() MALLOCS A FRESH BUFFER EVERY CALL (exports.c) — unlike
+  // genesis.html's core, which fills a buffer the page owns. Every pointer here
+  // must be freed or this leaks ~529 KB a second.
+  function lsFingerprint() {
+    var size = Module._getStateSaveSize() >>> 0;
+    if (!size) return null;
+    var ptr = Module._saveState();
+    if (!ptr) return null;
+    var h = 0x811c9dc5;
+    try {
+      // ⚠ HASHED 32 BITS AT A TIME, AND THE REASON IS THE FRAME BUDGET. A
+      // byte-wise loop over ~529 KB is ~529,000 iterations INSIDE a 16.6 ms
+      // frame; a word-wise one is a quarter of that for identical coverage,
+      // because each 32-bit word carries four bytes. ALLOW_MEMORY_GROWTH=1 can
+      // replace HEAPU8.buffer, so the views are taken fresh here every call.
+      var words = 0;
+      if ((ptr & 3) === 0) {
+        words = size >>> 2;
+        var u32 = new Uint32Array(Module.HEAPU8.buffer, ptr, words);
+        for (var i = 0; i < words; i++) { h ^= u32[i]; h = Math.imul(h, 16777619) >>> 0; }
+      }
+      var u8 = new Uint8Array(Module.HEAPU8.buffer, ptr, size);
+      for (var b = words << 2; b < size; b++) { h ^= u8[b]; h = Math.imul(h, 16777619) >>> 0; }
+    } finally {
+      Module._my_free(ptr);
+    }
+    return h >>> 0;
+  }
+
+  // ---- releasing the gate, which is not optional ----------------------------
+  // ⚠ A GATED CORE WHOSE ROOM IS GONE IS A FROZEN CONSOLE. The gate holds the
+  // frame; if the session ends while it is armed, nothing ever releases it and
+  // the player is left staring at a still picture with no room and no
+  // explanation. Leaving a room (or the room closing under you) therefore hands
+  // the console back: the gate opens, the accumulator resumes at 1.000x, and the
+  // game carries on single-player from exactly the frame it was holding.
+  function lsDisarm(why) {
+    if (!LS.armed) return;
+    LS.armed = false; LS.running = false;
+    LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
+    // A leaver's pad must not stay held down on this machine's port 2.
+    try {
+      if (wasmReady) for (var p = 0; p < SNES_PORTS; p++) Module._setJoypadInputPort(p, 0);
+    } catch (e) {}
+    pageLog('[lockstep] frame gate RELEASED — ' + why + '. This console free-runs from here and is '
+      + 'no longer sharing frames with anybody.');
+  }
+
+  // ---- arming, AFTER the ROM is loaded and BEFORE the first frame ------------
+  function lsArmBeforeFreerun() {
+    if (!NET.session || LS.armed) return false;
+    var ls = lsEngine();
+    if (!ls) {
+      LS.fault = 'the room published no lockstep engine, so this core cannot be frame-gated';
+      pageLog('[lockstep] ⚠ ' + LS.fault);
+      return false;
+    }
+    LS.armed = true; LS.running = false; LS.frames = 0; LS.hashes = 0; LS.fault = null;
+    pageLog('[lockstep] ARMED before the first frame — this core advances only when every seated '
+      + 'port has an input for the frame, so no console runs a frame the others did not. '
+      + 'ports=' + JSON.stringify(ls.roster) + ' mine=' + JSON.stringify(ls.localPorts));
+    // "My core is booted and holding at frame 0, on this game." Nobody runs
+    // frame 0 until EVERY seated peer has said this, about the SAME game —
+    // the engine compares the string and refuses a room that does not agree.
+    try { NET.session.setReady(true, lsDisc()); } catch (e) {
+      pageLog('[lockstep] ⚠ start barrier refused: ' + ((e && e.message) || e));
+    }
+    return true;
+  }
+
+  // WHAT "THE SAME GAME" MEANS, COMPARED RATHER THAN TRUSTED. Two machines with
+  // the same ROM must produce the same string; the name alone would let a
+  // different dump of the same title through, and the two would desync on the
+  // first frame that reads a byte the dumps disagree about. This matters more
+  // here than on a fixed-catalogue page, because Browse… lets a visitor bring
+  // any .smc/.sfc from their own disk.
+  function lsDisc() { return romName + ':' + (romBytesLen | 0); }
+  var romBytesLen = 0;
+
+  // ---- THE GATED FRAME ------------------------------------------------------
+  // Returns true if a frame actually ran. A false return STALLS the guest: the
+  // accumulator keeps its credit and the console simply does not advance, which
+  // is what "wait for the other player" has to mean when nothing may be guessed.
+  function lsRunFrame() {
+    var ls = lsEngine();
+    if (!ls) { lsDisarm('the session went away'); return false; }
+    if (ls.state !== 'running' && ls.state !== 'stalled') {
+      // The BARRIER decides when frame 0 runs, not this page. Until the engine
+      // says 'running' nothing advances and the console sits on frame 0 — which
+      // is precisely what "everyone starts together" means.
+      if (LS.running) { LS.running = false; pageLog('[lockstep] frame gate DISENGAGED — engine state ' + ls.state); }
+      return false;
+    }
+    if (!LS.running) {
+      LS.running = true;
+      pageLog('[lockstep] FRAME GATE ENGAGED at frame ' + ls.frame + ' — delay=' + ls.delay
+        + ' frames (' + Math.round(ls.delay * FRAME_MS) + ' ms), ports=' + JSON.stringify(ls.roster));
+    }
+    var r = ls.beginFrame(lsLocalPads());
+    if (!r || !r.ready) {
+      LS.stalling = !!(r && r.reason === 'stall');
+      LS.stallReason = r ? r.reason : 'the engine returned nothing';
+      LS.waitingOn = (r && r.waitingOn) ? r.waitingOn.slice() : [];
+      return false;
+    }
+    LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
+
+    // EVERY SEATED PORT IS WRITTEN, EVERY FRAME, FROM THE ONE AGREED IMAGE.
+    // ⚠ Including this machine's own: the local pad goes round through the
+    // engine so that it lands on the SAME emulated frame on every machine. A
+    // local shortcut that applied our own pad directly would put it a different
+    // number of frames earlier here than there, which is a desync by
+    // construction — and it is exactly the shortcut the old streaming relay took.
+    var pb = ls.padBytes | 0;
+    var last = 0;
+    for (var p = 0; p < ls.portCount; p++) {
+      var m = (r.image[p * pb] | (r.image[p * pb + 1] << 8)) & 0xffff;
+      Module._setJoypadInputPort(p, m);
+      if (p === 0) last = m;
+    }
+    Module._mainLoop();
+    frameCount++; guestFrames++; window.__snesFrames++; LS.frames++;
+    window.__snesMask = last;
+
+    // The exact masks the core was handed for every port, for a test to assert
+    // on rather than on a session flag or a UI state.
+    window.__snesLsImage = Array.prototype.slice.call(r.image.subarray(0, ls.portCount * pb));
+
+    // ⚠ THE INTERVAL COMES FROM THE ENGINE, NOT FROM THIS PAGE'S COPY OF IT.
+    // The host's parameters win and are pushed to every guest in 'lsgo', so a
+    // page that hashed on its own LS.hashEvery would fingerprint DIFFERENT
+    // frames from its peers the moment the host chose another value — and two
+    // machines that never hash the same frame never compare anything. The
+    // desync detector would then be silently dead while everything looked fine,
+    // which is the worst failure this file can have.
+    var every = (ls.hashEvery == null) ? LS.hashEvery : (ls.hashEvery | 0);
+    var h = null;
+    if (every > 0 && (r.frame % every) === 0) { h = lsFingerprint(); if (h != null) LS.hashes++; }
+    ls.endFrame(h);
+    return true;
+  }
 
   function runFrame() {
-    var m = padMask();
+    // ⚠ WITH NO ROOM, BOTH PORTS ARE LOCAL. LS.armed is false and this is the
+    // two-people-on-one-couch path: Player 1's mask into port 0, Player 2's into
+    // port 1, one _mainLoop(). With nobody on the second pad padMask(1) is 0,
+    // which is byte-for-byte what an empty controller port does — so a solo
+    // player sees exactly what shipped before.
+    if (LS.armed) return lsRunFrame();
+    var m = padMask(0), m2 = padMask(1);
     Module._setJoypadInput(m);
-    // The literal mask the core was handed, kept so a test can assert on THAT
+    Module._setJoypadInputPort(1, m2);
+    // The literal masks the core was handed, kept so a test can assert on THOSE
     // rather than on a UI state.
     window.__snesMask = m;
+    window.__snesMask2 = m2;
     Module._mainLoop();
     frameCount++; guestFrames++; window.__snesFrames++;
+    return true;
   }
 
   function draw() {
@@ -484,7 +851,22 @@
     if (d > 100) d = 100;          // a long stall must not fast-forward the guest
     accum += d;
     var ran = 0;
-    while (accum >= FRAME_MS && ran < MAX_CATCHUP_FRAMES) { runFrame(); accum -= FRAME_MS; ran++; }
+    // ⚠ A STALLED FRAME MUST NOT SPEND ITS CREDIT. runFrame() returns false when
+    // the frame gate is holding this console because some seated port's input for
+    // the frame has not arrived. Draining `accum` anyway would bank the wait, and
+    // the guest would then SPRINT through the backlog the moment the input landed
+    // — the one thing CLAUDE.md gate #9 forbids. Breaking out instead leaves the
+    // credit untouched, so the console resumes at exactly 1.000x from where it
+    // stopped. The `d > 100` clamp above already stops a long wait from
+    // accumulating more than one tick's worth; the clamp below is the backstop
+    // for a stall that outlives several ticks.
+    var stalled = false;
+    while (accum >= FRAME_MS && ran < MAX_CATCHUP_FRAMES) {
+      if (!runFrame()) { stalled = true; break; }
+      accum -= FRAME_MS; ran++;
+    }
+    if (stalled && accum > FRAME_MS) accum = FRAME_MS;
+    if (NET.session) netHudTick(ts);
     if (ran) draw();
     if (!lastFpsAt) lastFpsAt = ts;
     if (ts - lastFpsAt >= 1000) {
@@ -534,6 +916,7 @@
   function bootRom(bytes, name) {
     if (!wasmReady) { toast('Core not ready yet', true); return; }
     romName = name;
+    romBytesLen = bytes.length;      // half of lsDisc() — see it for why
     initAudio();
     var ptr = Module._my_malloc(bytes.length);
     if (!ptr) { toast('Out of memory loading ROM', true); return; }
@@ -541,7 +924,15 @@
     Module._startWithRom(ptr, bytes.length, SND_RATE);
     Module._my_free(ptr);
     initCanvas();
-    lastTs = 0; accum = 0; running = true;
+    lastTs = 0; accum = 0;
+    // ⚠ ARM THE FRAME GATE HERE, AND ONLY HERE — AFTER the ROM is loaded and
+    // BEFORE `running = true`. There is no `await` between the _startWithRom()
+    // above and this line, so the rAF loop cannot interleave and this core
+    // cannot run a single free frame before the gate closes. A console that
+    // free-ran even one frame is at a different guest frame from its peers,
+    // which is a desync at "frame 0" — the one place it can never be repaired.
+    lsArmBeforeFreerun();
+    running = true;
     // XBOX: stick drives the GAME from here, not Edge's cursor (lib/xboxinput.js).
     try { window.XboxInput && XboxInput.offerGameControls('snes running'); } catch (e) {}
     setStatus('Running — ' + name);
@@ -713,6 +1104,13 @@
 
   // ── input ─────────────────────────────────────────────────────────────────
   const KEYMAP = { ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', a: 'a', z: 'b', x: 'x', s: 'y', d: 'l', c: 'r', Enter: 'start', Shift: 'select' };
+  // PLAYER 2 ON THE SAME KEYBOARD. Two people at one desk is the ordinary way a
+  // SNES got played and it needs no hardware, so it is wired before the gamepad
+  // path and before the room. The cluster is the left hand's home position with
+  // i/j/k/l as the d-pad, chosen so it shares NO key with set 1 — an overlap
+  // would have one keypress drive both players at once, which reads as the
+  // second controller not working.
+  const KEYMAP2 = { i: 'up', k: 'down', j: 'left', l: 'right', f: 'a', g: 'b', t: 'x', r: 'y', q: 'l', e: 'r', Tab: 'start', '`': 'select' };
   // ── MINIMUM PRESS DURATION ────────────────────────────────────────────────
   // padState is a plain boolean set, and the CORE only ever looks at it once
   // per emulated frame, in runFrame() -> Module._setJoypadInput(padMask()).
@@ -728,7 +1126,10 @@
   // human tap (60-100 ms) so on an ordinary press it never fires. A new press
   // cancels any pending deferred release, so holds are unaffected.
   var MIN_PRESS_MS = 50;
-  var _padPressAt = Object.create(null), _padRelTimer = Object.create(null);
+  // Per-player, because the floor is a per-BUTTON timer and Player 2's Left must
+  // not cancel Player 1's.
+  var _padPressAt = [Object.create(null), Object.create(null)];
+  var _padRelTimer = [Object.create(null), Object.create(null)];
   // up<->down and left<->right on the d-pad; C-pad directions too where the
   // page has them. Read by the hold function below.
   // D-PAD ONLY, and the omission is deliberate. This console has no C-buttons, so
@@ -739,8 +1140,10 @@
   // Only pair directions that are physically exclusive on the real hardware —
   // a d-pad axis, or an analog stick as on gamecube.html's synthesized C-stick.
   var PAD_OPPOSITE = { up: 'down', down: 'up', left: 'right', right: 'left' };
-  function padHold(btn, down) {
-    if (_padRelTimer[btn]) { clearTimeout(_padRelTimer[btn]); _padRelTimer[btn] = null; }
+  function padHold(btn, down, who) {
+    var i = who | 0;
+    var press = _padPressAt[i], rel = _padRelTimer[i], state = padState[i];
+    if (rel[btn]) { clearTimeout(rel[btn]); rel[btn] = null; }
     if (down) {
     // ⚠ OPPOSITE DIRECTIONS MUST NOT BOTH BE HELD. The deferred release above
     // can outlive the press that follows it: flick the d-pad from Left to Right
@@ -751,12 +1154,12 @@
     // opposite immediately, bypassing the floor. Non-directional buttons are
     // unaffected (they have no opposite).
       var opp = PAD_OPPOSITE[btn];
-      if (opp) { if (_padRelTimer[opp]) { clearTimeout(_padRelTimer[opp]); _padRelTimer[opp] = null; } padState[opp] = false; }
-      _padPressAt[btn] = performance.now(); padState[btn] = true; return;
+      if (opp) { if (rel[opp]) { clearTimeout(rel[opp]); rel[opp] = null; } state[opp] = false; }
+      press[btn] = performance.now(); state[btn] = true; return;
     }
-    var held = performance.now() - (_padPressAt[btn] || 0);
-    if (held >= MIN_PRESS_MS) { padState[btn] = false; return; }
-    _padRelTimer[btn] = setTimeout(function () { _padRelTimer[btn] = null; padState[btn] = false; }, MIN_PRESS_MS - held);
+    var held = performance.now() - (press[btn] || 0);
+    if (held >= MIN_PRESS_MS) { state[btn] = false; return; }
+    rel[btn] = setTimeout(function () { rel[btn] = null; state[btn] = false; }, MIN_PRESS_MS - held);
   }
 
   function onKey(e) {
@@ -765,17 +1168,27 @@
     if (t === 'INPUT' || t === 'SELECT' || t === 'TEXTAREA') return;
     var k = e.key;
     if (k && k.length === 1) k = k.toLowerCase();
+    // Set 1 first, then set 2. The maps share no key, so the order is only a
+    // tie-break that can never fire — but checking both and returning on the
+    // first hit is what keeps that true if someone edits a map later.
     var btn = KEYMAP[k];
+    if (btn) { padHold(btn, e.type === 'keydown', 0); return; }
+    btn = KEYMAP2[k];
     if (!btn) return;
-    padHold(btn, e.type === 'keydown');
+    // Tab would move focus off the canvas mid-game and ` is a browser shortcut
+    // on some layouts; a key that is Player 2's controller is not the browser's.
+    if (k === 'Tab' || k === '`') e.preventDefault();
+    padHold(btn, e.type === 'keydown', 1);
   }
   window.addEventListener('keydown', onKey, true);
   window.addEventListener('keyup', onKey, true);
 
+  // The touch shell is PLAYER 1's, and only Player 1's — a phone has one pair of
+  // thumbs. Player 2 on a touch device joins a room instead.
   function wireButton(id, btn) {
     var el = $(id); if (!el) return;
-    function press(e) { if (e && e.preventDefault) e.preventDefault(); padHold(btn, true); el.classList.add('held'); }
-    function release(e) { if (e && e.preventDefault) e.preventDefault(); padHold(btn, false); el.classList.remove('held'); }
+    function press(e) { if (e && e.preventDefault) e.preventDefault(); padHold(btn, true, 0); el.classList.add('held'); }
+    function release(e) { if (e && e.preventDefault) e.preventDefault(); padHold(btn, false, 0); el.classList.remove('held'); }
     if (window.PointerEvent) {
       el.addEventListener('pointerdown', function (e) { try { el.setPointerCapture(e.pointerId); } catch (_) {} press(e); });
       el.addEventListener('pointerup', release); el.addEventListener('pointercancel', release); el.addEventListener('pointerleave', release);
@@ -805,7 +1218,7 @@
     }
     function apply(next) {
       ['up', 'down', 'left', 'right'].forEach(function (d) {
-        if (next[d] !== active[d]) { padHold(d, next[d]); active[d] = next[d]; disc.classList.toggle('d-' + d, next[d]); }
+        if (next[d] !== active[d]) { padHold(d, next[d], 0); active[d] = next[d]; disc.classList.toggle('d-' + d, next[d]); }
       });
     }
     function reset() { apply({ up: false, down: false, left: false, right: false }); captureId = null; }
@@ -824,21 +1237,35 @@
   // Gamepad state is kept SEPARATE from padState and OR-ed in padMask(): a poll
   // that wrote straight into padState would clear whatever the keyboard or a
   // touch button had just set, every animation frame.
+  //
+  // ⚠ ONE PAD PER PLAYER, NOT EVERY PAD ONTO ONE PLAYER. This loop used to OR
+  // every connected gamepad into a single mask, which was the only thing it
+  // could do with a core that had one controller: plug in two pads and both
+  // people drove Player 1, fighting over the same character. Now the k-th pad
+  // the browser reports drives local player k.
+  //
+  // ⚠ AND IT INDEXES THE *PRESENT* PADS, NOT THE ARRAY SLOTS. navigator
+  // .getGamepads() returns a sparse array whose holes are real — unplugging pad
+  // 0 leaves [null, pad], and indexing by slot would silently move the only
+  // remaining player from 1 to... nobody, while slot 1 still answered. Compacting
+  // first means one pad is always Player 1 whichever USB port it is in.
   const GP_BTN = { 0: 'b', 1: 'a', 2: 'y', 3: 'x', 4: 'l', 5: 'r', 8: 'select', 9: 'start', 12: 'up', 13: 'down', 14: 'left', 15: 'right' };
   const GP_DEAD = 0.35;
   function pollGamepads() {
     requestAnimationFrame(pollGamepads);
-    var next = {};
     var pads = (navigator.getGamepads && navigator.getGamepads()) || [];
-    for (var i = 0; i < pads.length; i++) {
-      var gp = pads[i]; if (!gp) continue;
+    var live = [];
+    for (var i = 0; i < pads.length; i++) if (pads[i]) live.push(pads[i]);
+    var next = [{}, {}];
+    for (var k = 0; k < 2 && k < live.length; k++) {
+      var gp = live[k], out = next[k];
       var btns = gp.buttons || [];
-      for (var b in GP_BTN) { if (btns[+b] && btns[+b].pressed) next[GP_BTN[b]] = true; }
+      for (var b in GP_BTN) { if (btns[+b] && btns[+b].pressed) out[GP_BTN[b]] = true; }
       var ax = gp.axes || [];
-      if ((ax[0] || 0) < -GP_DEAD) next.left = true;
-      if ((ax[0] || 0) > GP_DEAD) next.right = true;
-      if ((ax[1] || 0) < -GP_DEAD) next.up = true;
-      if ((ax[1] || 0) > GP_DEAD) next.down = true;
+      if ((ax[0] || 0) < -GP_DEAD) out.left = true;
+      if ((ax[0] || 0) > GP_DEAD) out.right = true;
+      if ((ax[1] || 0) < -GP_DEAD) out.up = true;
+      if ((ax[1] || 0) > GP_DEAD) out.down = true;
     }
     gpState = next;
   }
@@ -898,48 +1325,424 @@
     wireDpad();
   }
 
-  // The page's liveness seam. It is NOT a netplay seam any more and it does not
-  // pretend to be one: `supported:false` with a reason in words is the honest
-  // answer for a core that cannot address a second player. `live` is kept
-  // because tools/mobile_chrome_test.mjs uses it as its "the emulator is
-  // actually running" witness, and that question is still meaningful here.
-  window.__snesNet = function () {
-    return {
-      supported: false,
-      reason: 'the shipped snes9x_2005 core answers one controller only '
-            + '(exports.c S9xReadJoypad returns 0 for every port but 0), so a lockstep '
-            + 'room could seat one person; it needs a few lines in exports.c and a wasm rebuild',
-      mode: 'none',
-      live: (window.__snesFrames | 0) > 0,
-      frames: window.__snesFrames | 0,
-      mask: window.__snesMask | 0,
-    };
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ONLINE CO-OP — LOCKSTEP, AND NOTHING ELSE.
+  //
+  // THE MODEL: EVERY PLAYER RUNS THEIR OWN SNES. Only pad bytes cross the wire —
+  // two bytes per controller per emulated frame — and each machine applies every
+  // seated port's input to its own core on the SAME frame number. It is as if
+  // both controllers were plugged into one console.
+  //
+  // WHAT THIS REPLACED. Until 2026-09-08 this page was the host half of a
+  // STREAMING session: it captured its own canvas and audio with captureStream()
+  // and published them over WebRTC, and it OR'd a remote player's buttons into
+  // the SAME controller mask as the local player's — two people sharing one pad,
+  // one of them not running an emulator at all. The user cancelled that outright
+  // ("WE WILL NOT USE STREAMING!"). Then lockstep was blocked for a day by the
+  // core answering one controller. Both are fixed; the room forms HERE.
+  //
+  // THE ORDER IS THE ARCHITECTURE, and it is backwards from the streaming one:
+  //   1. Everyone opens this page and joins the room. NOTHING IS LOADED YET —
+  //      under streaming the host had to be running a game before anyone could
+  //      join, because there was no canvas to capture until then. Making a
+  //      player load a ROM before they can find out whether they even got a port
+  //      is exactly the wrong way round.
+  //   2. The host seats each joiner in the lowest free controller port. The
+  //      roster is broadcast, so every machine maps the same person to the same
+  //      port — get this wrong and players drive each other's characters.
+  //   3. Everyone presses Start. Each machine loads the SAME ROM and arms the
+  //      frame gate before running a single frame (bootRom ->
+  //      lsArmBeforeFreerun), then tells the engine it is holding at frame 0.
+  //   4. The BARRIER releases when every seated peer has said that, about the
+  //      same ROM. Frame 0 then runs on every machine together.
+  //
+  // ⚠ WHY THERE IS NO CONTROLLER-COUNT MESSAGE BEFORE THE LOAD. Dreamcast has to
+  // send one: its Maple devices are created inside retro_load_game and it cannot
+  // hotplug, so the controller COUNT is part of the starting state. This core
+  // does not have that problem — S9xUpdateJoypads() polls all five ports through
+  // S9xReadJoypad every frame regardless (ppu.c:2056-2062), and ppu.c:2098-2099
+  // publishes port 2 to the auto-read registers unconditionally. Sending a count
+  // here would be cargo-culted ceremony. What DOES matter is that an unseated
+  // port is written all-zero, which is what a controller nobody is holding does,
+  // and is byte-for-byte what single player already did.
+  //
+  // ⚠ THE ROOM IS TWO PEOPLE, BECAUSE THE FRONT OF THE CONSOLE IS. Ports 3-5
+  // exist in the core (Joypads[5], and the Super Multitap read path is at
+  // ppu.c:1445/1451) but reaching them needs IPPU.Controller to be
+  // SNES_MULTIPLAYER5, and at runtime it is SNES_JOYPAD — exports.c sets
+  // ControllerOption = SNES_JOYPAD and S9xNextController() advances straight
+  // past MULTIPLAYER5. That is a core change, not a page change, so this room
+  // seats two and says so.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  var NET = {
+    session: null,     // the live Netplay.Session, or null
+    role: null,        // 'host' | 'guest'
+    leaving: false,    // WHO hung up, so the notice can say
   };
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // ONLINE PLAY IS NOT OFFERED ON THIS PAGE.
-  //
-  // Streaming was cancelled by user directive 2026-09-08 and lockstep cannot be
-  // wired against this core, because the shipped snes9x_2005 build answers ONE
-  // controller and has no port index to address a second player with — see the
-  // long note above runFrame() for the exact lines and for the scoped change
-  // (plus a wasm rebuild) that would lift it.
-  //
-  // ⚠ SO THERE IS NO BUTTON. #btnNet and #mobileSplashNet have been REMOVED from
-  // the markup, not merely hidden: a control that cannot work is worse than no
-  // control, because the visitor presses it and concludes the site is broken —
-  // and a hidden one is still dead weight that reads, to anyone grepping the
-  // page, as though online play exists here.
-  //
-  // WHEN THE CORE GAINS A SECOND PAD, copy genesis.html — it is the worked
-  // example on this site and the only place the shape should be written down:
-  // an in-page room overlay, seats assigned before anything boots, the frame
-  // gate armed inside bootRom between the load and `running = true`, every
-  // seated port written from one agreed image each frame, and a serialized-state
-  // fingerprint handed to the engine once a second so the two cores are COMPARED
-  // rather than merely gated. tools/genesis_netplay_test.mjs is the harness
-  // shape and tools/genesis_determinism_probe.mjs is the evidence it rests on.
-  // ═══════════════════════════════════════════════════════════════════════════
+  // ⚠ THE DEFAULT MUST BE 'peerjs', NOT lib/netplay.js's 'local'. `local`
+  // signalling pairs two tabs of the SAME browser and nothing else, so a page
+  // that took the default would look perfect in a test rig and pair with nobody
+  // on the internet. `?net=local` selects it deliberately, which is what the
+  // two-peer harness uses so it needs no broker.
+  function netTransport() {
+    var v = new URLSearchParams(location.search).get('net');
+    return v === 'local' ? 'local' : 'peerjs';
+  }
+  function netSupported() {
+    return !!(window.Netplay && Netplay.supported && Netplay.supported());
+  }
+  function netStatus(text, cls) {
+    var el = $('netStatus');
+    if (!el) return;
+    el.textContent = text;
+    el.className = cls || '';
+  }
+  function netOpen() {
+    $('netOverlay').classList.add('on');
+    // The game list on the JOIN side has to name what this player actually has
+    // selected now, not what was selected when the page loaded.
+    netSyncGameList();
+    if (!NET.session) netStatus('Not connected. Open a room or join one — you do not need a game running first.');
+  }
+  function netClose() { $('netOverlay').classList.remove('on'); }
+
+  function netSyncGameList() {
+    var sel = $('netGame');
+    if (!sel) return;
+    var want = (isMobile ? $('mobileRomSelect') : $('romSelect'));
+    var cur = sel.value;
+    sel.innerHTML = '';
+    ROMS.forEach(function (r, i) {
+      var o = document.createElement('option');
+      o.value = String(i); o.textContent = r.label;
+      sel.appendChild(o);
+    });
+    sel.value = cur || (want ? want.value : '0') || '0';
+  }
+
+  // lib/netplay.js binds the game name into the pairing handshake and REFUSES a
+  // joiner who names a different one, so both sides must agree on the label
+  // before they ever connect. The ROM itself is compared again, harder, at the
+  // start barrier (lsDisc(), which carries the byte length) — that second check
+  // is what catches two different dumps of the same title, and it is the one
+  // that matters here because Browse… lets a visitor bring their own file.
+  function netGameId() {
+    var sel = isMobile ? $('mobileRomSelect') : $('romSelect');
+    var i = +(sel && sel.value) || 0;
+    return (ROMS[i] || ROMS[0]).label;
+  }
+
+  function netOnStatus(e) {
+    var s = e.state;
+    if (s === 'signalling') {
+      netStatus(NET.role === 'host'
+        ? 'Waiting for someone to join with code ' + NET.session.code + '…'
+        : 'Looking for the host…', 'busy');
+    } else if (s === 'connected') {
+      // ⚠ NOT "you are Player 2". Which port a player holds is the ENGINE's
+      // answer — hardcoding it here is how a Player 2 ends up told they are
+      // Player 1 and reaches for the wrong character.
+      var ls = lsEngine();
+      var mine = (ls && ls.localPorts && ls.localPorts.length) ? ls.localPorts[0] : null;
+      netStatus(mine != null
+        ? 'In the room — you are Player ' + (mine + 1) + '. Press Start when you are both ready.'
+        : 'In the room. Press Start when you are both ready.', 'good');
+      $('netLeave').style.display = '';
+      netRoomRender();
+    } else if (s === 'closed') {
+      // The channel's onclose fires on BOTH sides and arrives after netLeave()
+      // has set its own text, so without the flag the person who pressed Leave
+      // is told the other player left.
+      netStatus(NET.leaving ? 'Left the room.' : 'The room closed.', 'busy');
+      lsDisarm(NET.leaving ? 'you left the room' : 'the room closed');
+      netRoomRender();
+      // The readout describes a session; with none, it must not keep describing
+      // the last one over a picture that is now single player.
+      $('netHud').classList.remove('on');
+    } else if (s === 'failed') {
+      netStatus('Could not connect' + (e.detail ? ': ' + e.detail : '.'), 'bad');
+    }
+    pageLog('[net] ' + (NET.role || 'session') + ' ' + s + (e.detail ? ' (' + e.detail + ')' : ''));
+  }
+
+  // ---- the room, one row per CONTROLLER PORT --------------------------------
+  function netRoomRender() {
+    var box = $('netRoom'), ul = $('netRoster');
+    if (!box || !ul) return;
+    var ls = lsEngine();
+    if (!NET.session || !ls) { box.style.display = 'none'; return; }
+    box.style.display = '';
+    $('netRoomPorts').textContent = ' — this console has ' + ls.portCount + ' controller ports';
+    ul.innerHTML = '';
+    var mine = ls.localPorts || [];
+    for (var p = 0; p < ls.portCount; p++) {
+      var peer = ls.roster[p];
+      var li = document.createElement('li');
+      var dot = document.createElement('span');
+      dot.className = 'dot' + (peer ? (mine.indexOf(p) >= 0 ? ' dot me on' : ' on') : '');
+      var t = document.createElement('span');
+      t.textContent = 'Player ' + (p + 1) + ' — '
+        + (peer ? (mine.indexOf(p) >= 0 ? 'you' : 'connected') : 'empty');
+      li.appendChild(dot); li.appendChild(t);
+      ul.appendChild(li);
+    }
+  }
+
+  // ---- the live readout, over the picture -----------------------------------
+  // ⚠ IT REPORTS WHAT IS TRUE, NOT WHAT WAS INTENDED. "Lockstep" here means the
+  // cores are frame-gated and nothing else; a session that is connected but not
+  // gating says so, because gated-and-silently-diverging is worse than not
+  // gated — it looks right.
+  var netHudAt = 0;
+  function netHudTick(ts) {
+    var hud = $('netHud');
+    if (!hud) return;
+    if (!NET.session) { hud.classList.remove('on'); return; }
+    if (ts - netHudAt < 250) return;
+    netHudAt = ts;
+    hud.classList.add('on');
+    var ls = lsEngine();
+    if (!ls) {
+      hud.innerHTML = '<span class="warn">⚠ connected, but no lockstep engine — this is NOT lockstep</span>';
+      return;
+    }
+    var rows = [];
+    if (!LS.armed) {
+      rows.push('<span class="warn">room open — press Start to load the game</span>');
+    } else {
+      rows.push('<span class="mode">LOCKSTEP</span> frame ' + ls.frame
+        + ' · delay ' + ls.delay + ' (' + Math.round(ls.delay * FRAME_MS) + ' ms)');
+      rows.push('ports ' + ls.portCount + ' · mine ' + JSON.stringify(ls.localPorts)
+        + ' · fingerprints ' + LS.hashes);
+      if (LS.stalling) {
+        rows.push('<span class="warn">waiting for Player '
+          + LS.waitingOn.map(function (p) { return p + 1; }).join(', ') + '…</span>');
+      }
+    }
+    hud.innerHTML = rows.join('<br>');
+  }
+
+  // A divergence is named and shown, never swallowed. The engine reports which
+  // frame and which peer; a session that has diverged is over, because every
+  // frame after it is a different game on each machine.
+  function netOnDesync(d) {
+    var el = $('netDesync');
+    pageLog('[lockstep] ⚠ DESYNC ' + JSON.stringify(d));
+    if (!el) return;
+    el.classList.add('on');
+    el.innerHTML = '<b>⚠ The two consoles stopped agreeing</b><br>'
+      + 'Frame ' + (d && d.frame != null ? d.frame : '?')
+      + (d && d.peer ? ' · ' + String(d.peer).slice(0, 8) : '')
+      + '. Online play has stopped; leave the room and start again.';
+    lsDisarm('the consoles diverged at frame ' + (d && d.frame != null ? d.frame : '?'));
+  }
+
+  function netWire(session) {
+    NET.session = session;
+    // A latched desync notice belongs to the room that produced it. Leaving it
+    // up over a fresh room would report a divergence that has not happened.
+    $('netDesync').classList.remove('on');
+    session.on('status', netOnStatus);
+    session.on('desync', netOnDesync);
+    session.on('lockstep', function () { netRoomRender(); });
+    session.on('room', function () { netRoomRender(); });
+    session.on('roster', function () { netRoomRender(); });
+    session.on('barrier', function () { netRoomRender(); });
+    // ⚠ THE ENGINE HAS TO EXIST BEFORE THE FIRST PEER IS SEATED, and it must be
+    // built with THIS console's numbers rather than lib/netplay.js's Dreamcast
+    // defaults (4 ports, 64-byte pads). A SNES pad is a 16-bit mask, so two
+    // bytes carry it exactly and the per-frame image is 4 bytes rather than 256.
+    try {
+      session.startLockstep({ portCount: SNES_PORTS, padBytes: LS_PAD_BYTES, hashEvery: LS.hashEvery });
+    } catch (e) {
+      pageLog('[lockstep] ⚠ startLockstep failed: ' + ((e && e.message) || e));
+    }
+    netRoomRender();
+  }
+
+  // ⚠ A ROOM MAY NOT BE OPENED ON A CONSOLE THAT IS ALREADY RUNNING, and this
+  // guard is not politeness — without it the page has a silent desync hole. The
+  // frame gate is armed inside bootRom(); a player who pressed Start first and
+  // opened a room second would never arm it, so they would free-run on their own
+  // clock while their peer sat waiting at the start barrier for a readiness
+  // message that never comes. One console runs, the other is frozen, and neither
+  // says why. Everyone joins BEFORE anything boots — that ordering IS the
+  // architecture, so the honest answer here is to say so out loud.
+  function netRefuseIfRunning() {
+    if (!running) return false;
+    netStatus('This console is already running a game. Online play has to be set up BEFORE the game '
+      + 'starts, so that every player begins on the same frame — reload the page, join the room, then '
+      + 'press Start together.', 'bad');
+    return true;
+  }
+
+  async function netStartHost() {
+    if (NET.session) return;
+    if (netRefuseIfRunning()) return;
+    // NO "you must boot first" GATE. That was a streaming requirement — there
+    // was nothing to capture until a game was running — and streaming is
+    // cancelled. A room opens before anything is fetched, which is what lets
+    // both players agree on a game and then load it at the same time.
+    $('netHostPane').style.display = '';
+    $('netJoinPane').style.display = 'none';
+    $('netHostBtn').classList.add('on'); $('netJoinBtn').classList.remove('on');
+    var code = Netplay.makeCode(5);
+    $('netCode').textContent = code;
+    var game = netGameId();
+    NET.role = 'host';
+    netStatus('Room open for ' + game + '. Share the code — you both load the game once you are in.', 'busy');
+    var s = new Netplay.Session({ game: game, host: true, code: code, portCount: SNES_PORTS, transport: netTransport() });
+    netWire(s);
+    pageLog('[net] room ' + code + ' open for ' + game);
+    await s.start();
+  }
+
+  async function netStartGuest() {
+    if (NET.session) return;
+    if (netRefuseIfRunning()) return;
+    var code = ($('netCodeIn').value || '').trim().toUpperCase();
+    if (!/^[A-HJ-NP-Z2-9]{5}$/.test(code)) {
+      netStatus('That does not look like a code — 5 characters, no I O 0 or 1.', 'bad');
+      return;
+    }
+    // lib/netplay.js refuses a pairing whose game names differ, so the joiner
+    // MUST name the same game the host chose — that is why the join pane carries
+    // a game selector. A wrong pick fails with "the other player is on <game>"
+    // instead of connecting to nothing.
+    var i = +($('netGame').value || 0) || 0;
+    var game = (ROMS[i] || ROMS[0]).label;
+    // Keep the page's own picker in step, so pressing Start loads what the room
+    // is playing rather than whatever was selected before.
+    ['romSelect', 'mobileRomSelect'].forEach(function (id) {
+      var sel = $(id); if (!sel) return;
+      sel.value = String(i);
+      sel.dispatchEvent(new Event('change'));
+    });
+    NET.role = 'guest';
+    var s = new Netplay.Session({ game: game, host: false, code: code, portCount: SNES_PORTS, transport: netTransport() });
+    netWire(s);
+    // ⚠ NO START LOCK. Under streaming a joiner had no emulator and must not
+    // launch one, so Start was disabled for a guest. Under lockstep a joiner
+    // runs their own console and MUST start it — that lock was the single line
+    // that made this two-machines-one-emulator.
+    pageLog('[net] joining room ' + code + ' (' + game + ')');
+    await s.start();
+  }
+
+  function netLeave() {
+    var s = NET.session;
+    NET.leaving = true;
+    if (s) { try { s.close(); } catch (e) {} }
+    NET.session = null; NET.role = null;
+    $('netLeave').style.display = 'none';
+    $('netHostPane').style.display = 'none';
+    $('netJoinPane').style.display = 'none';
+    lsDisarm('you left the room');
+    netRoomRender();
+    $('netHud').classList.remove('on');
+    netStatus('Left the room.');
+    pageLog('[net] session closed by this side');
+    setTimeout(function () { NET.leaving = false; }, 2000);
+  }
+
+  (function wireNetplay() {
+    // Refuse to render rather than present a dead control: a button that does
+    // nothing when pressed reads as "the site is broken".
+    if (!netSupported()) return;
+    ['btnNet', 'mobileSplashNet'].forEach(function (id) {
+      var b = $(id); if (!b) return;
+      b.hidden = false;
+      b.style.display = '';
+      b.addEventListener('click', netOpen);
+    });
+    $('netClose').addEventListener('click', netClose);
+    $('netLeave').addEventListener('click', netLeave);
+    $('netHostBtn').addEventListener('click', function () { netStartHost(); });
+    $('netJoinBtn').addEventListener('click', function () {
+      $('netJoinPane').style.display = '';
+      $('netHostPane').style.display = 'none';
+      $('netJoinBtn').classList.add('on'); $('netHostBtn').classList.remove('on');
+      netSyncGameList();
+    });
+    $('netGo').addEventListener('click', function () { netStartGuest(); });
+    $('netCopy').addEventListener('click', function () {
+      // ⚠ writeText REJECTS A PROMISE, it does not throw. A bare try/catch here
+      // would report "Code copied" on a browser that refused the clipboard, and
+      // the player would share nothing and wonder why nobody joined.
+      var code = $('netCode').textContent.trim();
+      try {
+        navigator.clipboard.writeText(code)
+          .then(function () { toast('Code copied'); })
+          .catch(function () { toast('Could not copy — read the code out instead', true); });
+      } catch (e) { toast('Could not copy — read the code out instead', true); }
+    });
+    $('netOverlay').addEventListener('click', function (e) { if (e.target === $('netOverlay')) netClose(); });
+    netSyncGameList();
+
+    // A room the visitor was invited into: snes.html?np=<code>. snes_multiplayer
+    // .html forwards ?np= here and there is no separate lobby page any more, so
+    // this is the whole handoff — it fills the code in and opens the panel on the
+    // JOIN side, and the visitor still presses Join themselves.
+    try {
+      var np = new URLSearchParams(location.search).get('np');
+      if (np && /^[A-HJ-NP-Z2-9]{5}$/i.test(np)) {
+        $('netCodeIn').value = np.toUpperCase();
+        $('netJoinBtn').click();
+        netOpen();
+      }
+    } catch (e) {}
+  })();
+
+  // The page's own test seam. It reports what is TRUE about the session rather
+  // than that one exists, so a test cannot pass on a page that opened a room and
+  // then free-ran.
+  window.__snesNet = function () {
+    var ls = lsEngine();
+    return {
+      supported: netSupported(),
+      session: !!NET.session,
+      role: NET.role,
+      mode: 'lockstep',            // there is no other mode on this page
+      // ⚠ `live` MEANS "THE EMULATOR IS ACTUALLY PRODUCING FRAMES", and it is
+      // not netplay state at all. tools/mobile_chrome_test.mjs uses it as the
+      // witness that arms its orientation cell — without it that cell VOIDs and
+      // stops being able to tell a fixed page from a broken one. Frames, never a
+      // start flag: a start flag is true the instant Start is pressed, long
+      // before a core exists.
+      live: (window.__snesFrames | 0) > 0,
+      frames: window.__snesFrames | 0,
+      // Both LOCAL masks, so a test can prove the two on-machine players are
+      // separate without a room at all.
+      mask: window.__snesMask | 0,
+      mask2: window.__snesMask2 | 0,
+      armed: LS.armed,
+      running: LS.running,
+      gatedFrames: LS.frames,
+      hashes: LS.hashes,
+      fault: LS.fault,
+      stalling: LS.stalling,
+      waitingOn: LS.waitingOn.slice(),
+      ports: ls ? ls.portCount : SNES_PORTS,
+      roster: ls ? ls.roster.slice() : null,
+      localPorts: ls ? ls.localPorts.slice() : null,
+      frame: ls ? ls.frame : 0,
+      state: ls ? ls.state : null,
+      // The literal bytes the core was handed for every port on the last gated
+      // frame — an assertion target that cannot be faked by a UI flag.
+      image: window.__snesLsImage || null,
+      log: __snesLog.slice(-40),
+      // ⚠ THE ENGINE'S OWN COUNTERS, and `hashesCompared` is the one that
+      // matters. `armed` only says this core is GATED; it says nothing about
+      // whether the two simulations are being CHECKED against each other, and a
+      // gated room with nothing comparing it diverges silently — which is worse
+      // than not gating at all, because it looks right. Without this field a rig
+      // can see fingerprints being PRODUCED (LS.hashes, above) and still have no
+      // way to tell whether any of them were ever COMPARED to the peer's.
+      engine: (function () { try { return ls && ls.report ? ls.report() : null; } catch (e) { return null; } })(),
+    };
+  };
 
   // ── load the core ─────────────────────────────────────────────────────────
   initCanvas();

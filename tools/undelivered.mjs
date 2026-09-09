@@ -48,19 +48,30 @@ const OPEN = [
     evidence: 'grep -c lockstep gamecube/dolphin_libretro/dolphin_worker.js -> 0',
     verify: () => !/lockstep/.test(read('gamecube/dolphin_libretro/dolphin_worker.js')),
   },
-  {
-    id: 'snes-needs-a-core-rebuild',
-    what: 'SNES cannot present a second controller.',
-    why: 'snes/snesWasm/source/exports.c returns a hardcoded 0 for every port but 0, confirmed in live wasm memory as IPPU.Joypads[0..4] = 0xffff0201 0 0 0 0.',
-    evidence: 'exports.c:37-40.',
-    verify: () => /if\s*\(\s*port\s*==\s*0\s*\)/.test(read('snes/snesWasm/source/exports.c')),
-  },
+  // ── CLOSED 2026-09-09: 'snes-needs-a-core-rebuild' ─────────────────────────
+  // It said "SNES cannot present a second controller", and it was true: the
+  // shipped snes9x_2005 answered a hardcoded 0 for every port but 0, verified in
+  // live wasm memory as IPPU.Joypads[0..4] = 0xffff0201 0 0 0 0. The core has
+  // been rebuilt (exports.c joyPadInput[5] + setJoypadInputPort; build.sh's
+  // EXTRA_EXPORTED_RUNTIME_METHODS -> EXPORTED_RUNTIME_METHODS and the HEAP
+  // exports), and both ports are proven: Joypads[0..4] now read
+  // 0xffff1080 0xffffa000 0 0 0, and in Tetris 2PLAYER GAME port 0 holding LEFT
+  // moved only the LEFT well (x 16..71) while port 1 holding LEFT moved only the
+  // RIGHT one (x 160..215).
+  //
+  // ⚠ ITS OLD verify() WAS ALREADY LYING BEFORE IT WAS REMOVED, which is worth
+  // recording because the same trap is available to every entry here. It was
+  //     /if\s*\(\s*port\s*==\s*0\s*\)/.test(read('.../exports.c'))
+  // and after the fix the ONLY thing left matching it was the header comment
+  // QUOTING the code that had just been deleted. It reported OPEN off a comment
+  // about the fix. A verify() must test an artifact or a live code shape, not a
+  // string that prose can satisfy.
   {
     id: 'eight-players-is-not-reachable',
     what: 'No console here reaches 8 players.',
-    why: 'Dreamcast MAPLE_PORTS is 4 and N64 exposes 4; PS1 tops out at 2 because "multitap" appears ZERO times in that core; Genesis is 2 without a multitap its shim never calls.',
-    evidence: 'grep -ric multitap ps1/ps1Wasm/pcsx-wasm-src -> 0 occurrences at the time of writing.',
-    verify: () => true,   // structural; closed only by adding multitap support somewhere
+    why: 'Dreamcast MAPLE_PORTS is 4 and N64 exposes 4; PS1 tops out at 2 because "multitap" appears ZERO times in that core; Genesis is 2 without a multitap its shim never calls. SNES is 2 of a possible 5: the core polls Joypads[0..4] and this page can now write all five, but ports 3-5 only answer when IPPU.Controller is SNES_MULTIPLAYER5, and exports.c sets ControllerOption = SNES_JOYPAD so S9xNextController() advances straight past it.',
+    evidence: 'grep -ric multitap ps1/ps1Wasm/pcsx-wasm-src -> 0 occurrences at the time of writing; snes exports.c init_sfc_setting sets Settings.ControllerOption = SNES_JOYPAD.',
+    verify: () => /ControllerOption\s*=\s*SNES_JOYPAD/.test(read('snes/snesWasm/source/exports.c')),
   },
 ];
 

@@ -16,7 +16,25 @@
 #include <stdio.h>
 #include <sys/time.h>
 
-int joyPadInput = 0;
+/* FIVE PADS, NOT ONE. This used to be a single `int joyPadInput` and
+ * S9xReadJoypad answered `if(port == 0) return joyPadInput; return 0;` — the
+ * author's own comment said "1Pのみ対応" (1P only supported), and it was
+ * confirmed in live wasm memory: after 200 frames with setJoypadInput(0x0201),
+ * IPPU.Joypads[0..4] read 0xffff0201 0 0 0 0.
+ *
+ * NOTHING ELSE IN THE CORE NEEDED CHANGING, and in particular NO MULTITAP is
+ * involved. snes9x already polls all five ports every frame
+ * (ppu.c:2056-2062 `for (i = 0; i < 5; i++) IPPU.Joypads[i] = S9xReadJoypad(i)`)
+ * and already publishes port 2 to the standard auto-read registers
+ * unconditionally (ppu.c:2098-2099 writes IPPU.Joypads[1] into
+ * Memory.FillRAM[0x421a]/[0x421b]). Only this function was starving them.
+ *
+ * Ports 2..4 exist because the array the core polls is five wide; they stay 0
+ * unless someone sets them, which is what a Super Multitap game would need
+ * (ppu.c:1445/1451). A plain two-player game needs port 1 and nothing more.
+ */
+#define JOYPAD_PORTS 5
+int joyPadInput[JOYPAD_PORTS] = { 0, 0, 0, 0, 0 };
 bool runGameFlag = false;
 unsigned char *rgba8ScreenBuffer = NULL;
 float *f32soundBuffer = NULL;
@@ -29,14 +47,38 @@ unsigned int outToExternalBufferSamplePos = 2048;
 unsigned int soundBufferOutPos = 0;
 unsigned int soundBufferStuckCount = 0;
 
+/* KEPT, and it still means port 0. Callers that predate the second pad — the
+ * upstream demo at doc/script.js, and any saved page — keep working unchanged. */
 EMSCRIPTEN_KEEPALIVE
 void setJoypadInput(int32_t input){
-    joyPadInput = input;
-} 
+    joyPadInput[0] = input;
+}
+
+/* THE SECOND PLAYER'S DOOR. port is 0..4; anything else is dropped rather than
+ * writing past the array, because this is reachable from JS and a bad index
+ * would corrupt whatever the linker put next to joyPadInput. */
+EMSCRIPTEN_KEEPALIVE
+void setJoypadInputPort(int32_t port, int32_t input){
+    if(port < 0 || port >= JOYPAD_PORTS)return;
+    joyPadInput[port] = input;
+}
+
+/* Read-back, so a test can assert on what the CORE holds rather than on what
+ * the page believes it sent. */
+EMSCRIPTEN_KEEPALIVE
+int32_t getJoypadInputPort(int32_t port){
+    if(port < 0 || port >= JOYPAD_PORTS)return 0;
+    return joyPadInput[port];
+}
+
+EMSCRIPTEN_KEEPALIVE
+int32_t getJoypadPortCount(void){
+    return JOYPAD_PORTS;
+}
 
 uint32_t S9xReadJoypad(int32_t port){
-    if(port == 0)return joyPadInput;//1Pのみ対応
-    return 0;
+    if(port < 0 || port >= JOYPAD_PORTS)return 0;
+    return (uint32_t)joyPadInput[port];
 }
 
 bool S9xReadMousePosition(int32_t which1, int32_t* x, int32_t* y, uint32_t* buttons)

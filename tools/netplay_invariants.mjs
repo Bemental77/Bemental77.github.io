@@ -43,7 +43,10 @@ if (!dc || !np) {
 // same way. A gate that only guards the page somebody happened to complain about
 // leaves the same defect live on every other console that shares the engine.
 {
-  const PAGES = ['dreamcast.html', 'ps1.html', 'n64/index.html', 'genesis.html'];
+  // snes.html joined 2026-09-09, the day it gained a second controller. A page
+  // is added HERE at the same time it gains a room — not after somebody reports
+  // the bug on it, which is the whole point of the paragraph above.
+  const PAGES = ['dreamcast.html', 'ps1.html', 'n64/index.html', 'genesis.html', 'snes.html'];
   for (const page of PAGES) {
     const src = read(page);
     if (!src) continue;

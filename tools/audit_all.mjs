@@ -588,6 +588,15 @@ const HARNESSES = [
     server: true, requires: ['genesis.html', 'genesis/genesisWasm'], timeoutMs: 25 * MIN,
   },
   {
+    name: 'snes-netplay',
+    file: 'tools/snes_netplay_test.mjs',
+    cmd: ['node', 'tools/snes_netplay_test.mjs'],
+    desc: 'snes.html plays two-player lockstep end to end — each machine running its own core, one agreed pad image per frame, fingerprints compared both ways, and a CPU-throttled peer proven to STALL the other console rather than predict its pad',
+    fast: false, ci: false,
+    ciWhy: 'it boots the SNES core against a snes/snesWasm ROM, which the size-bounded CI checkout omits',
+    server: true, requires: ['snes.html', 'snes/snesWasm/snes9x_2005.wasm'], timeoutMs: 25 * MIN,
+  },
+  {
     name: 'console-room-crossdevice',
     file: 'tools/console_room_crossdevice_test.mjs',
     cmd: ['node', 'tools/console_room_crossdevice_test.mjs'],
