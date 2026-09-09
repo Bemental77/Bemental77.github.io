@@ -51,6 +51,9 @@
 // "two real networks" gap, and nothing in this repo ever has:
 //   * every peer here is behind the same router, so ICE succeeds host-to-host
 //     or via a server-reflexive candidate that a symmetric NAT would break;
+//   * the `no-direct-path` arm narrows this but does not close it: it proves a
+//     pairing does not depend on a direct WebRTC path, and it still has no NAT
+//     variety, no packet loss, no carrier middlebox and no second ISP;
 //   * there is no working TURN relay. Measured (tools/audit_peerjs_crossdevice
 //     .mjs and the relay audit): every public relay tried returns 701/400 and
 //     peerjs's own two do not resolve. With no relay, symmetric-NAT peers
@@ -81,6 +84,16 @@
 //   mobile-joiner the joiner is a phone (iPhone viewport, touch, iOS UA), so
 //                 it drives the mobile splash controls rather than the desktop
 //                 toolbar — which is the pair the user actually had.
+//   no-direct-path THE CLOSEST THING TO TWO HOSTILE NETWORKS THAT RUNS ON ONE
+//                 BOX. Both pages get iceTransportPolicy:'relay' with NO relay
+//                 configured, so no RTCPeerConnection can ever form a candidate
+//                 pair. Suggested by the agent who found the real root cause:
+//                 signalling itself rode WebRTC (peerjs's DataConnection IS a
+//                 WebRTC connection), so pairing needed NAT traversal BEFORE
+//                 the game connection was attempted — which two profiles behind
+//                 one NAT can never expose. Pair this arm with
+//                 `--query signal=peerjs-only` to reproduce the old behaviour
+//                 on demand: an arm that cannot fail proves nothing.
 //   host-ignores  THE HOST NEVER ANSWERS THE PROMPT. A person walks away, or
 //                 does not notice a dialog on a second monitor, or the phone
 //                 knocked while they were reading the code out loud. Nothing
@@ -168,8 +181,11 @@ const LATE_MS  = parseInt(arg('latems', '90000'), 10);
 const REJOIN_MS = parseInt(arg('rejoinms', '20000'), 10);
 const PAIR_MS  = parseInt(arg('pairms', '90000'), 10);
 const BOOT_MS  = parseInt(arg('bootms', '900000'), 10);
+const QUERY    = (() => { const q = arg('query', ''); return q ? (q.startsWith('?') ? q : '?' + q) : ''; })();
 const PROFBASE = arg('profile-base', '/private/tmp/claude-501/dc-xdev');
 const CHROME   = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+
+const PAGE = ORIGIN + '/dreamcast.html' + QUERY;
 
 const PLAY_ARMS = PLAYARG === 'all' ? ARMS.slice() : PLAYARG === 'none' ? [] : PLAYARG.split(',').map((s) => s.trim()).filter(Boolean);
 
@@ -274,6 +290,31 @@ async function launch(role, mobile) {
     const t = m.text();
     if (/\[net\]|\[lockstep\]|DESYNC|join|approve|allow/i.test(t)) { nets.push(t.slice(0, 240)); say(`  [${role}] ${t.slice(0, 170)}`); }
   });
+  // ---- the `no-direct-path` arm: MAKE A DIRECT PEER PATH IMPOSSIBLE -------
+  // ⚠ THIS IS A SIMULATED NETWORK CONDITION, NOT A WAY OF DRIVING THE PAGE.
+  // The rule this rig lives by is that PAIRING ACTIONS must be human actions;
+  // the network is not an action, it is the environment, and every other rig
+  // here has silently run in the friendliest environment that exists (two
+  // profiles, one box, one NAT, a loopback-fast direct path always available).
+  // iceTransportPolicy:'relay' discards every host and server-reflexive
+  // candidate, and with no relay configured there is then NO candidate pair an
+  // RTCPeerConnection can ever form. That is the closest thing to "two networks
+  // that will not carry a direct path" that runs on one machine, and it is the
+  // condition under which a handshake that itself rides WebRTC cannot complete.
+  if (ARM === 'no-direct-path') {
+    await pg.evaluateOnNewDocument(() => {
+      const Real = window.RTCPeerConnection;
+      if (!Real) return;
+      const Wrapped = function (cfg) {
+        const c = Object.assign({}, cfg || {}, { iceTransportPolicy: 'relay', iceServers: [] });
+        window.__iceForced = { iceTransportPolicy: c.iceTransportPolicy, servers: 0, n: (window.__iceForced ? window.__iceForced.n : 0) + 1 };
+        return new Real(c);
+      };
+      Wrapped.prototype = Real.prototype;
+      window.RTCPeerConnection = Wrapped;
+      window.webkitRTCPeerConnection = Wrapped;
+    });
+  }
   if (mobile) { await pg.setUserAgent(IPHONE.ua); await pg.setViewport(IPHONE.viewport); }
   else await pg.setViewport({ width: 1280, height: 860 });
   // Without this a backgrounded window's rAF is throttled and the two sides
@@ -550,7 +591,7 @@ async function runArm(armName) {
   const pages = [host, join];
 
   try {
-    await Promise.all(pages.map((pg) => gotoSettled(pg, ORIGIN + '/dreamcast.html')));
+    await Promise.all(pages.map((pg) => gotoSettled(pg, PAGE)));
 
     // -- 0. the rig's own preconditions ------------------------------------
     const mounted = await Promise.all(pages.map((pg) => until(pg, () =>
@@ -717,7 +758,7 @@ async function runArm(armName) {
       const before = await readRoster(join);
       say(`  ....  before the reload the joiner said "${before.status}"`);
       D.rejoin = { beforeStatus: before.status };
-      await gotoSettled(join, ORIGIN + '/dreamcast.html');
+      await gotoSettled(join, PAGE);
       await joinerJoins('-again');
       const t2 = Date.now();
       let a2 = { hit: null, all: [] };
@@ -818,6 +859,28 @@ async function runArm(armName) {
       `the host is told port ${hPort} and the joiner port ${jPort} — two players on one port drive the same character`,
       `maple ports: host ${J(hPort)}, joiner ${J(jPort)} (read from each page's own HUD text)`);
 
+    // -- 4a. THE ARM-DIFFERENCE PROOF for `no-direct-path` ------------------
+    // A placebo arm reports nothing rather than a false pass (the rule
+    // tools/device_matrix.mjs learned the hard way when page-scoped throttling
+    // silently failed to reach a service worker). If no RTCPeerConnection was
+    // ever constructed under the wrapper, the hostile condition never applied
+    // and this arm's verdict is VOID, not green.
+    if (armName === 'no-direct-path') {
+      const forced = await Promise.all(pages.map((pg) => pg.evaluate(() => window.__iceForced || null)));
+      D.iceForced = forced;
+      say(`  ....  relay-only wrapper saw ${J(forced.map((f) => f && f.n))} RTCPeerConnection(s) per side`);
+      if (!forced.some(Boolean)) {
+        voidc('the-no-direct-path-arm-actually-applied',
+          'no RTCPeerConnection was constructed on either side, so forcing relay-only ICE changed nothing — ' +
+          'this arm proves nothing about a hostile network and its other cells must not be read as a pass');
+      } else {
+        ok('the-no-direct-path-arm-actually-applied',
+          `relay-only ICE with no relay was in force on ${forced.filter(Boolean).length} side(s) ` +
+          `(${J(forced.map((f) => f && f.n))} peer connections created under it) — no candidate pair can form, ` +
+          'so anything that paired here did NOT pair over a direct WebRTC path');
+      }
+    }
+
     // -- 4b. THE `host-reload` ARM ------------------------------------------
     // THE ONE ACTION THAT PRODUCES THE USER'S EXACT PAIR OF SCREENSHOTS.
     // A seated joiner cannot seat itself — the `host-ignores` arm proves an
@@ -832,7 +895,7 @@ async function runArm(armName) {
     // exists, with a port and a roster and no error, is the deadlock.
     if (armName === 'host-reload') {
       say('\n-- the HOST reloads its page. The room it was hosting is gone; what is the joiner told?');
-      await gotoSettled(host, ORIGIN + '/dreamcast.html');
+      await gotoSettled(host, PAGE);
       await sleep(15000);
       const [h2, j2] = await Promise.all([readRoster(host), readRoster(join)]);
       D.afterReload = { host: h2, join: j2 };
@@ -842,8 +905,18 @@ async function runArm(armName) {
       say(`  ....  joiner HUD "${(j2.hud || '').slice(0, 170)}"`);
       const jStill = occupied(j2).length, jPort2 = hudPort(j2);
       const told = /closed|left|lost|disconnect|could not|not connected/i.test(j2.status);
-      cell(told || jStill === 0, 'a-side-whose-peer-VANISHED-is-told-so',
-        `the joiner was told the room is gone: "${j2.status}" (${jStill} seat(s) still drawn)`,
+      // ⚠ BEING TOLD IS NOT ENOUGH IF THE ROOM IS STILL DRAWN. The first
+      // version of this cell passed on the status line alone and reported
+      // "2 seat(s) still drawn" inside a PASS, which reads as a defect that
+      // was waved through. The rows DO persist in the DOM after the room
+      // closes; what makes it correct is that netRoomStop() hides #netRoom, so
+      // nobody SEES them (measured: visible=false while overlayOpen=true).
+      // A visible roster of a dead room alongside a "closed" status is a mixed
+      // message and must fail, so both halves are required.
+      const staleShown = j2.visible && jStill > 0;
+      cell((told || jStill === 0) && !staleShown, 'a-side-whose-peer-VANISHED-is-told-so',
+        `the joiner was told the room is gone: "${j2.status}", and the roster of the dead room is no longer ` +
+        `shown (#netRoom visible=${j2.visible}; ${jStill} row(s) remain in the DOM behind it, which nobody sees)`,
         `THE JOINER IS STILL SITTING IN A ROOM THAT NO LONGER EXISTS. Its status reads "${j2.status}", it still ` +
         `draws ${jStill} occupied seat(s) ${J(occupied(j2).map((x) => x.port + ' ' + x.who))} and still claims ` +
         `maple port ${J(jPort2)}, while the host that was hosting it now shows ${J(h2.rows.map((r) => r.text))}. ` +
