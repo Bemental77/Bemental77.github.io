@@ -3784,6 +3784,40 @@
       }
     }
 
+    // ⚠ IN A ROOM, EVERYONE JOINS AND *THEN* IT LOADS — NOT THE OTHER WAY.
+    // The panel promises exactly this: "Join the room first - you do not need a
+    // disc loaded yet. Once everybody is in, you all load the same game and
+    // start together." The code did the opposite: pressing Start in a freshly
+    // opened room began streaming a 1.18 GB disc immediately, alone, so the host
+    // sat at "0% loaded" watching a download nobody else had started while the
+    // room was still empty. The user, watching that: "WE NEED TO JOIN AND THEN
+    // IT LOADS! NOT LOAD BEFORE IT".
+    //
+    // So a HOST in a room holds the load until somebody else is seated. It is
+    // not a refusal and nothing is lost: the press is REMEMBERED and fires the
+    // moment the room stops being empty, so the host never has to press twice.
+    // A solo console (no session) is untouched — Start still loads at once.
+    // The joiner is unaffected too: it is started by the room, which by
+    // definition cannot happen before it has joined.
+    if (NET.session && NET.role === 'host' && !NET.startArmed) {
+      const seatedNow = safe(() => {
+        const r = NET.session.ls && NET.session.ls.rosterReport();
+        return Array.isArray(r) ? r.filter((q) => q && q.peer && !q.local).length : 0;
+      }, 0);
+      if (seatedNow < 1) {
+        NET.startArmed = true;
+        $('btnStart').disabled = true;
+        setStatus('Waiting for players — the game loads once somebody joins.');
+        netStatus('Room open. Nothing downloads yet — share the code, and the game loads on every ' +
+                  'console together the moment somebody joins.', 'busy');
+        pageLog('[net] Start pressed in an EMPTY room — holding the disc load until a player is seated, ' +
+                'so both consoles download together rather than the host streaming 1.18 GB alone. ' +
+                'The press is remembered; nothing needs pressing again.');
+        return;
+      }
+    }
+    NET.startArmed = false;
+
     $('btnStart').disabled = true;
     setStatus('Loading ' + game.name + '...');
     mark('start-pressed');
@@ -7002,6 +7036,23 @@
     const ports = (t.ports != null) ? t.ports : null;
     const peers = t.peers || [];
     const youPort = t.you ? t.you.port : null;
+
+    // ⚠ THE REMEMBERED START. A host that pressed Start into an EMPTY room had
+    // the load held (see the btnStart handler) precisely so both consoles
+    // download together instead of the host streaming 1.18 GB by itself. This
+    // is where that press is honoured: the moment a real player is seated, the
+    // load begins on its own. The host pressed once and it happens — being made
+    // to press again after waiting would be its own small insult.
+    if (NET.startArmed && NET.role === 'host' && !safe(() => booted, false)) {
+      const others = peers.filter((q) => q && q.port != null).length;
+      if (others >= 1) {
+        NET.startArmed = false;
+        pageLog('[net] a player joined — honouring the Start that was pressed while the room was empty; ' +
+                'both consoles load from here');
+        const st = $('btnStart');
+        if (st) { st.disabled = false; try { st.click(); } catch (e) {} }
+      }
+    }
 
     // ⚠ NO INVENTED ROOM. Until the engine publishes a port count and a roster
     // there is nothing truthful to draw, and drawing a plausible two-seat room
