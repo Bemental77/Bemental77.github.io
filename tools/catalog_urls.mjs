@@ -153,9 +153,33 @@ function n64(text, base) {
   const s = slice(text, 'const ROMS = [', 'const ROMS = [', '\n  ];');
   if (!s) throw new CatalogError('n64/index.html: could not locate ROMS');
   const { ROMS } = evalSlice(s, ['ROMS'], base, 'n64/index.html ROMS');
-  const m = /await fetch\(window\.ASSET_BASE \+ '([^']+)' \+ rom\.file\)/.exec(text);
-  if (!m) throw new CatalogError('n64/index.html: could not read the ROM fetch prefix in loadRom()');
-  const prefix = base + m[1];
+  // TWO SHAPES ARE LEGAL, and this gate must read both or it blocks every deploy.
+  // The page has carried an ASSET_BASE-prefixed absolute fetch and a plain
+  // relative one at different times. Matching only the first is what wedged CI:
+  // the regex landed in a commit while the page edit it described stayed
+  // uncommitted in a working tree, so the committed extractor demanded a shape
+  // that no committed page had, and threw CatalogError on every push for three
+  // runs straight. A relative prefix is resolved against the page's own <base>
+  // (n64/index.html sets <base href="/n64/N64Wasm/dist/">, so '../roms/' means
+  // /n64/N64Wasm/roms/) rather than guessed — resolving it wrong would point
+  // this check at a directory that does not exist and report a false MISSING.
+  let prefix = null;
+  const abs = /await fetch\(window\.ASSET_BASE \+ '([^']+)' \+ rom\.file\)/.exec(text);
+  if (abs) {
+    prefix = base + abs[1];
+  } else {
+    const rel = /await fetch\('([^']+)' \+ rom\.file\)/.exec(text);
+    if (rel) {
+      const baseTag = /<base\s+href="([^"]+)"/.exec(text);
+      const root = 'http://x' + (baseTag ? baseTag[1] : '/n64/');
+      prefix = base + new URL(rel[1], root).pathname;
+    }
+  }
+  if (prefix === null) {
+    throw new CatalogError('n64/index.html: could not read the ROM fetch prefix in loadRom()' +
+      " — looked for both \"fetch(window.ASSET_BASE + '<prefix>' + rom.file)\" and" +
+      " \"fetch('<prefix>' + rom.file)\"");
+  }
   return ROMS.map((r) => [prefix + r.file, `n64/index.html ROMS[${r.label}]`]);
 }
 
