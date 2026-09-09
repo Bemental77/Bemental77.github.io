@@ -3987,6 +3987,15 @@
       // record that pushing a state into both instances was "the only thing
       // that ever helped".
       if (NET.session && seedPromise) await seedBeforeFrameZero();
+      // ⚠ AND THE MEMORY CARDS, HERE, FOR THE SAME REASONS IN THE SAME ORDER.
+      // After the seed (which replaces the VMU flash wholesale, so installing
+      // before it would have the seed eat the cards) and after the arm (so this
+      // console is already gated while it waits on other people's machines).
+      // Deliberately NOT awaited: it finishes when every seat has handed a card
+      // over, which is the wait the barrier already performs — and the Ready
+      // control stays down until it does, so frame 0 is unreachable until the
+      // set is installed. See the block above vmuRoomExchange().
+      if (NET.session) vmuRoomExchange();
       worker.postMessage({ cmd: 'freerun', on: 1 });
       startInputPump();
       // A returning player always wins. If this browser already holds its own
@@ -4085,18 +4094,24 @@
   // The card is per PORT, not per game — that is what a memory card is. One
   // IndexedDB key per port, in the store the savestates already use.
   //
-  // ⚠ SEEDING IS SUPPRESSED IN A ROOM, ON PURPOSE. Netplay here has NO state
+  // ⚠ A ROOM DOES NOT SEED LOCALLY — IT TRADES. Netplay here has NO state
   // handoff: every peer cold-boots the same disc and the machines stay
   // identical by construction (see lsArmBeforeFreerun's normalize handshake,
-  // and dreamcast.html's "There is NO savestate handoff" note). A card is guest-
-  // visible memory. If this browser pushed ITS stored cards in and the peer
-  // pushed ITS OWN different ones, the two consoles would hold different bytes
-  // at frame 0 and desync the first time a game read the card — silently, and
-  // possibly an hour later. Blank-on-both is the only state both peers can be
-  // sure they share. Writes are still kept (see below), so a room session is
-  // not thrown away; it just cannot START from a local card yet. Carrying cards
-  // into a room needs them exchanged over the link before boot, which is a
-  // separate piece of work and is NOT claimed here.
+  // and dreamcast.html's "There is NO savestate handoff" note). A card is
+  // guest-visible memory. If this browser pushed ITS stored cards in and the
+  // peer pushed ITS OWN different ones, the two consoles would hold different
+  // bytes at frame 0 and desync the first time a game read the card —
+  // silently, and possibly an hour later.
+  //
+  // That is why seeding used to be SUPPRESSED in a room, and blank-on-everybody
+  // was the only state two peers could be sure they shared. Blank-on-everybody
+  // is not the product: a player's save has to come with them. So the room now
+  // agrees a whole card SET before frame 0 — every console contributes the card
+  // for the seat it holds, the host assembles, and every console installs the
+  // SAME set for ALL ports (vmuRoomExchange() below, protocol in
+  // lib/netplay.js's card block). Every peer is then byte-identical AND each
+  // player is on their own real card, which are not in tension once the bytes
+  // travel instead of a promise about them.
   // ---------------------------------------------------------------------------
   const VMU_PORTS = 4;                       // == MAPLE_PORTS; the core is asked for the real count
   const vmuKeyFor = (port) => 'vmu:p' + (port | 0);
@@ -4130,8 +4145,261 @@
     return [];   // in a room with no seat known: keep nothing rather than keep the wrong thing
   }
   function vmuMayPersist(port) {
+    // ⚠ NOT WHILE THE ROOM'S CARDS ARE STILL UNSETTLED. Between the boot seed
+    // and the install this console is holding bytes that are nobody's real card
+    // — the shipped savestate's card, or a blank — and a vmuChanged snapshot
+    // taken in that window would write them straight over the player's own
+    // saved card. That is not hypothetical: emscripten_load_state replaces
+    // flash_data wholesale and maple_devs.cpp bumps the VMU generation for it
+    // (the `deser >> flash_data` path), so the seed alone fires a change.
+    // A 'failed' exchange holds too — a console that could not agree the set
+    // must not write anything back on the way out.
+    if (vmuRoomState === 'pending' || vmuRoomState === 'failed') return false;
     if (vmuOwnPorts == null) return true;
     return vmuOwnPorts.indexOf(port | 0) !== -1;
+  }
+
+  // ---------------------------------------------------------------------------
+  // IN A ROOM: THE CARDS ARE TRADED BEFORE FRAME 0.
+  //
+  // Shaped exactly like the boot seed beside it, and for the same reason: what
+  // this console is HOLDING at frame 0 is either settled or it is not, the
+  // player is owed the reason while it is not, and it is folded into the string
+  // the barrier compares so a mismatch is REFUSED BY NAME rather than allowed
+  // to fork. `seedRoomState` proved that shape; this is its sibling.
+  //
+  //   null      not in a room — solo seeding applies and nothing here runs
+  //   'pending' the room has not agreed a set yet; Ready is held down
+  //   'ok'      the agreed set is INSTALLED IN THIS CORE; its hash is in the tag
+  //   'failed'  this console cannot be part of the room, and why
+  //
+  // ⚠ WHY THIS RUNS AFTER lsArmBeforeFreerun() AND NOT BEFORE IT — the same
+  // argument seedBeforeFrameZero() makes, only stronger. The exchange waits on
+  // OTHER PEOPLE'S CONSOLES and is therefore unbounded in time; running it
+  // before the gate was armed would leave this console booted, ungated and
+  // about to free-run for however long the slowest peer takes, which is the
+  // exact "already past the point where the gate could be armed" state
+  // lsRestartIntoRoom() exists to avoid. Armed first, the pump parks on an
+  // empty lockstep queue and runs NOTHING: flycast_worker.js's pumpTick()
+  // returns at `const inp = lsQueue.get(lsFrame); if (!inp)` — above the
+  // Module._emscripten_run_iter() call, not below it — so the core executes
+  // zero guest instructions for the whole exchange. The barrier is then the
+  // synchronisation point that already exists: nobody declares ready until
+  // their own install is done, and nobody runs frame 0 until everybody has
+  // declared. No new ordering, and no new way to start un-agreed.
+  //
+  // ⚠ AND AFTER THE BOOT SEED, WHICH IS NOT AN ACCIDENT EITHER. The seed is a
+  // whole machine image and restoring it replaces the VMU flash. Installing the
+  // room's cards before it would have the seed overwrite them.
+  // ---------------------------------------------------------------------------
+  let vmuRoomState = null;                   // null | 'pending' | 'ok' | 'failed'
+  let vmuRoomWhy = null;                     // why it failed, in words
+  let vmuRoomHash = null;                    // the agreed set's fingerprint, once INSTALLED
+  let vmuRoomMine = null;                    // what this console contributed
+  const vmuRoomInstalled = {};               // port -> installed card fingerprint
+  let vmuRoomBeatTimer = 0;
+  let vmuRoomSubscribed = false;
+  let vmuRoomInstalling = false;
+
+  // Compression is the PAGE's business, not the engine's — which is why the
+  // fingerprint the barrier compares is over the RAW card. Two browsers' gzip
+  // output for identical input is not guaranteed to be identical, so hashing
+  // the compressed form would refuse rooms that agree.
+  const VMU_WIRE_ENC = (typeof CompressionStream === 'function') ? 'gzip' : 'raw';
+  async function vmuDeflate(u8) {
+    if (VMU_WIRE_ENC !== 'gzip') return u8;
+    try {
+      const cs = new CompressionStream('gzip');
+      const w = cs.writable.getWriter(); w.write(u8); w.close();
+      return new Uint8Array(await new Response(cs.readable).arrayBuffer());
+    } catch (e) { return u8; }   // uncompressed is slower, not wrong
+  }
+  async function vmuInflate(bytes, enc) {
+    if (enc !== 'gzip') return bytes;
+    const ds = new DecompressionStream('gzip');
+    const w = ds.writable.getWriter(); w.write(bytes); w.close();
+    return new Uint8Array(await new Response(ds.readable).arrayBuffer());
+  }
+
+  function vmuRoomStopBeat() { if (vmuRoomBeatTimer) { clearInterval(vmuRoomBeatTimer); vmuRoomBeatTimer = 0; } }
+  function vmuRoomFail(why) {
+    vmuRoomState = 'failed'; vmuRoomWhy = why; vmuRoomHash = null;
+    vmuRoomStopBeat();
+    pageLog('[vmu] ⚠ the room\'s memory cards could NOT be agreed — ' + why +
+            '. This console will not start a room it would diverge from.');
+  }
+  // Leaving a room (or the room closing under you) hands the console back —
+  // including the persistence hold. A 'pending' state left behind would stop a
+  // now-solo console ever saving its card again, silently.
+  function vmuRoomRelease() {
+    if (vmuRoomState == null) return;
+    const was = vmuRoomState;
+    vmuRoomState = null; vmuRoomWhy = null; vmuRoomHash = null; vmuRoomMine = null;
+    vmuRoomStopBeat();
+    if (was !== 'ok') pageLog('[vmu] the room is gone before the cards were agreed — this console keeps its own ' +
+                              'card again from here.');
+  }
+
+  // WHO THE ROOM IS STILL WAITING ON, in words. The host knows by port; a guest
+  // only knows that the host has not published a set, and says so rather than
+  // inventing a name.
+  function vmuRoomWaitText() {
+    if (vmuRoomState === 'ok') return 'the set is agreed and installed';
+    if (vmuRoomState === 'failed') return vmuRoomWhy || 'the set could not be agreed';
+    const ls = safe(() => lsEngine(), null);
+    if (!ls) return 'the room has not published an engine yet';
+    let missing = [];
+    try { missing = ls.cardsWaitingFor() || []; } catch (e) {}
+    if (!missing.length) return 'the set is being installed';
+    const named = missing.filter((m) => m && m.port != null).map((m) => 'Player ' + ((m.port | 0) + 1));
+    if (!named.length) return 'the host has not agreed the set yet';
+    return 'waiting for ' + named.join(' and ') + ' to hand over a card';
+  }
+
+  // WHAT THIS CONSOLE PUTS INTO THE ROOM: the card for the seat it holds. Its
+  // own stored card when it has one — and when it does not, THE ACTUAL BYTES of
+  // its own blank power-on card rather than a promise that everybody's blank is
+  // the same. maple_devs.cpp's blank IS deterministic (one baked-in
+  // `vmu_default`, uncompressed at attach), but that is a property of a build
+  // and a room can hold two builds; the bytes cost nothing extra to send.
+  async function vmuMyContribution() {
+    const ports = (vmuOwnPorts && vmuOwnPorts.length) ? vmuOwnPorts.slice() : [];
+    if (!ports.length) {
+      vmuRoomFail('this console holds no seat in the room, so it has no card to contribute');
+      return null;
+    }
+    const out = [];
+    for (const port of ports) {
+      const slot = vmuSlots.find((x) => (x.port | 0) === (port | 0) && x.present);
+      if (!slot) { vmuRoomFail('the core reports no memory card in this console\'s seat (port ' + port + ')'); return null; }
+      let raw = null, src = '';
+      let stored = null;
+      try { stored = await idbGet(vmuKeyFor(port)); } catch (e) {}
+      if (stored && stored.byteLength === slot.size) {
+        raw = new Uint8Array(stored); src = 'this browser\'s saved card';
+      } else {
+        if (stored) pageLog('[vmu] ⚠ Player ' + (port + 1) + ': the stored card is ' + stored.byteLength +
+                            ' B and this console\'s card is ' + slot.size + ' B — contributing the blank one, ' +
+                            'and the stored card is left untouched');
+        const live = await window.__dcVmuLive(port);
+        if (!live || !live.data) { vmuRoomFail('this console could not read its own card for port ' + port); return null; }
+        raw = new Uint8Array(live.data); src = 'this console\'s blank power-on card';
+      }
+      if (raw.byteLength !== slot.size) {
+        vmuRoomFail('this console\'s card for port ' + port + ' read ' + raw.byteLength + ' B and the core says ' +
+                    slot.size + ' B'); return null;
+      }
+      const hash = Netplay.Lockstep.cardHash(raw);
+      const bytes = await vmuDeflate(raw);
+      out.push({ port: port | 0, size: raw.byteLength, hash: hash,
+                 enc: (bytes === raw ? 'raw' : VMU_WIRE_ENC), bytes: bytes });
+      pageLog('[vmu] offering Player ' + (port + 1) + '\'s card to the room — ' + src + ', ' + raw.byteLength +
+              ' B (' + bytes.byteLength + ' B on the wire), fingerprint ' + hash);
+    }
+    return out;
+  }
+
+  // INSTALL THE AGREED SET — all of it, on every console, before this one is
+  // allowed to call itself ready.
+  async function vmuInstallRoomCards(set, hash) {
+    if (vmuRoomInstalling) return;
+    if (vmuRoomState === 'ok' && vmuRoomHash === hash) return;   // already holding exactly this
+    vmuRoomInstalling = true;
+    try {
+      const present = vmuSlots.filter((x) => x.present).map((x) => x.port | 0).sort((a, b) => a - b);
+      const setPorts = Object.keys(set).map((p) => p | 0).sort((a, b) => a - b);
+      // ⚠ THE SET MUST DESCRIBE THIS CONSOLE EXACTLY. A console with a different
+      // number of maple devices from its peers is already a desync at frame 0 —
+      // lsArmBeforeFreerun() refuses for the same reason — and installing a set
+      // that names ports this core does not have would hide that rather than
+      // report it.
+      if (present.join(',') !== setPorts.join(',')) {
+        vmuRoomFail('the room agreed cards for port(s) ' + (setPorts.join(', ') || 'none') +
+                    ' and this console has cards in port(s) ' + (present.join(', ') || 'none') +
+                    ' — the machines do not agree on how many controllers are plugged in, which is already a ' +
+                    'desync at frame 0. Leave and rejoin.');
+        return;
+      }
+      for (const p of setPorts) {
+        const e = set[p];
+        const wire = e.bytes instanceof Uint8Array ? e.bytes : new Uint8Array(e.bytes || 0);
+        let raw = null;
+        try { raw = await vmuInflate(wire, e.enc); }
+        catch (x) {
+          vmuRoomFail('Player ' + (p + 1) + '\'s card could not be decompressed here (' + e.enc + '): ' +
+                      ((x && x.message) || x)); return;
+        }
+        if (raw.byteLength !== (e.size | 0)) {
+          vmuRoomFail('Player ' + (p + 1) + '\'s card decoded to ' + raw.byteLength + ' B and the room said ' +
+                      e.size + ' B'); return;
+        }
+        // ⚠ VERIFIED AGAINST THE CONTRIBUTOR'S OWN FINGERPRINT, not against the
+        // fact that bytes arrived. A card that decoded to the wrong thing
+        // installs silently and forks this console an hour later.
+        const got = Netplay.Lockstep.cardHash(raw);
+        if (got !== e.hash) {
+          vmuRoomFail('Player ' + (p + 1) + '\'s card arrived fingerprinting ' + got + ' and the room said ' +
+                      e.hash + ' — it was corrupted in flight'); return;
+        }
+        const ok = await vmuSeedPort(p, raw);
+        if (!ok) { vmuRoomFail('the emulator refused the room\'s card for Player ' + (p + 1)); return; }
+        vmuRoomInstalled[p] = got;
+      }
+      vmuRoomHash = hash; vmuRoomState = 'ok'; vmuRoomWhy = null;
+      vmuRoomStopBeat();
+      pageLog('[vmu] the room agreed a card set (' + hash + ') and this console has INSTALLED it: ' +
+              setPorts.map((p) => 'Player ' + (p + 1) + ' ' + set[p].hash).join(', ') +
+              '. Every console in this room now holds these exact bytes at frame 0, and each player is on ' +
+              'their own card.');
+    } catch (e) {
+      vmuRoomFail('installing the room\'s cards threw: ' + ((e && e.message) || e));
+    } finally { vmuRoomInstalling = false; }
+  }
+
+  // Start the exchange. Not awaited by the boot: it completes when the OTHER
+  // consoles have contributed, which is the same wait the barrier already
+  // performs — and the Ready control is held down until it does, so there is
+  // no way to reach frame 0 without it.
+  function vmuRoomExchange() {
+    if (!NET.session) return;
+    const ls = lsEngine();
+    if (!ls) { vmuRoomFail('the room published no lockstep engine, so there is nobody to trade cards with'); return; }
+    vmuOwnPorts = vmuOwnedPorts();          // the seat may have been handed out since the disc load
+    vmuRoomState = 'pending'; vmuRoomWhy = null; vmuRoomHash = null;
+    if (!vmuRoomSubscribed) {
+      vmuRoomSubscribed = true;
+      ls.on('cards', (c) => {
+        if (!c) return;
+        if (c.error) { vmuRoomFail(c.error); return; }
+        if (c.set && c.hash) vmuInstallRoomCards(c.set, c.hash);
+      });
+    }
+    pageLog('[vmu] in a room — trading memory cards before frame 0 so every console holds the same ones. ' +
+            'Nothing runs until they agree.');
+    vmuMyContribution().then((entries) => {
+      if (!entries) return;                 // vmuRoomFail already said why
+      vmuRoomMine = entries;
+      // ⚠ THE SET MAY ALREADY BE HERE. The engine is built lazily and can have
+      // taken the host's broadcast before this page ever subscribed, in which
+      // case the event has already been emitted to nobody. Read the engine's
+      // own state rather than waiting for a message that has been and gone.
+      try { ls.contributeCards(entries); } catch (e) {}
+      if (ls.cards && ls.cardSetHash) vmuInstallRoomCards(ls.cards, ls.cardSetHash);
+      // ⚠ AND RE-OFFER WHILE IT IS UNSETTLED. A contribution sent before a link
+      // was carrying anything is simply gone — _send() drops it and returns
+      // false — and the room would then wait forever on a console that thinks
+      // it already spoke. Re-offering is idempotent (the host keys by peer and
+      // port) and stops the moment the set is installed.
+      vmuRoomStopBeat();
+      vmuRoomBeatTimer = setInterval(() => {
+        if (vmuRoomState !== 'pending' || !NET.session) { vmuRoomStopBeat(); return; }
+        const e = safe(() => lsEngine(), null);
+        if (!e) return;
+        if (e.cards && e.cardSetHash) { vmuInstallRoomCards(e.cards, e.cardSetHash); return; }
+        try { e.contributeCards(vmuRoomMine); } catch (x) {}
+        try { e.requestCards(); } catch (x) {}
+      }, 3000);
+    }).catch((e) => vmuRoomFail('this console could not read its own memory card: ' + ((e && e.message) || e)));
   }
 
   function vmuAskInfo(ms = 8000) {
@@ -4173,9 +4441,13 @@
             (present.length ? present.map((x) => 'Player ' + (x.port + 1) + ' (' + x.size + ' B)').join(', ') : 'none'));
 
     if (NET.session) {
-      vmuSeedSkipped = 'in a room every peer must hold identical bytes at frame 0 and there is no card exchange yet';
-      pageLog('[vmu] cards start BLANK in a room — ' + vmuSeedSkipped +
-              '. Anything saved during the session is still kept for the seat this console plays.');
+      // ⚠ NOT SEEDED LOCALLY, AND NOT LEFT BLANK EITHER. Pushing this browser's
+      // own cards in here would fork the room the first time a game read one.
+      // The cards are TRADED instead, once the gate is armed and while the core
+      // is parked at the start barrier — vmuRoomExchange(), below.
+      vmuSeedSkipped = 'in a room the cards are traded with the other consoles before frame 0, not seeded locally';
+      pageLog('[vmu] in a room — this console does not seed its own cards here. ' +
+              'Every console has to hold the SAME cards at frame 0, so the room agrees a set first.');
     } else {
       for (const slot of present) {
         let stored = null;
@@ -4210,6 +4482,10 @@
       persisted: vmuPersisted.slice(),
       lastBytes: vmuLastBytes.slice(),
       keys: [0, 1, 2, 3].map(vmuKeyFor),
+      // In a room: whether the traded card set is settled, and what it is.
+      room: { state: vmuRoomState, why: vmuRoomWhy, hash: vmuRoomHash,
+              installed: Object.assign({}, vmuRoomInstalled),
+              mine: (vmuRoomMine || []).map((e) => ({ port: e.port, size: e.size, hash: e.hash, enc: e.enc })) },
     };
   };
   // Read a card's LIVE bytes out of the core (test seam). This is the one that
@@ -4227,6 +4503,28 @@
   window.__dcVmuStored = async function (port) {
     try { const v = await idbGet(vmuKeyFor(port | 0)); return v ? new Uint8Array(v) : null; }
     catch (e) { return null; }
+  };
+  // PLANT a card in storage WITHOUT a running core — the write-side sibling of
+  // __dcVmuStored, and the only way a rig can set up "this browser already has
+  // a saved card" before a boot. __dcVmuPoke() cannot do it: it needs the core
+  // to have created the card first, and by then the room exchange has already
+  // read storage. Returns the fingerprint the room will carry for these bytes,
+  // so a test can assert WHOSE card ended up in which seat without pulling
+  // 128 KB through a debugger.
+  // ⚠ 131072 is the real VMU size (maple_devs.cpp `u8 flash_data[128_KB]`) and
+  // is only a fallback: when the core is up, its own answer wins, because a
+  // stored card whose length disagrees with the console's is refused by design.
+  window.__dcVmuPlant = async function (port, byteValue, count, size) {
+    const p = port | 0;
+    const slot = vmuSlots.find((x) => (x.port | 0) === p && x.present);
+    const n = (size | 0) || (slot ? slot.size : 131072);
+    const bytes = new Uint8Array(n);
+    const fill = Math.min(count | 0 || 16, n);
+    for (let i = 0; i < fill; i++) bytes[i] = byteValue & 0xff;
+    try { await idbPut(vmuKeyFor(p), bytes); }
+    catch (e) { return { ok: false, why: (e && e.message) || String(e) }; }
+    return { ok: true, size: n, key: vmuKeyFor(p),
+             hash: (window.Netplay && Netplay.Lockstep) ? Netplay.Lockstep.cardHash(bytes) : null };
   };
   // Write straight into a live card and let the core see it as a guest write.
   // Used by the two-player card test to prove the ports are INDEPENDENT without
@@ -4406,7 +4704,16 @@
   // changing it would orphan the savestate of every existing player.
   const roomDiscTag = () => {
     const g = currentGameKey();
-    return seedRoomState == null ? g : g + (seedRoomState === 'ok' ? '#seeded' : '#coldboot');
+    const seed = seedRoomState == null ? '' : (seedRoomState === 'ok' ? '#seeded' : '#coldboot');
+    // ⚠ AND THE MEMORY CARDS. A VMU is guest-visible memory, so two consoles
+    // holding different card sets are the SAME class of mismatch as two on
+    // different discs — same disc, different machine at frame 0 — and are
+    // refused by the same tested path, with the engine naming the odd one out
+    // on every peer's screen. Empty outside a room and empty until the set is
+    // installed, and the Ready control is held down for that whole window, so
+    // this is never a bare game key in a room that has agreed one.
+    const cards = vmuRoomHash ? '#cards:' + vmuRoomHash : '';
+    return g + seed + cards;
   };
 
   function seedAllowed() {
@@ -5480,6 +5787,11 @@
     LS.armed = false; LS.running = false; LS.lastImage = null;
     LS.stalling = false; LS.waitingOn = []; LS.stallReason = null; LS.workerStall = false;
     if (booted) worker.postMessage({ cmd: 'lockstep', on: 0 });
+    // ⚠ AND THE CARD HOLD, WHICH IS NOT COSMETIC. vmuMayPersist() refuses to
+    // write while a room's cards are unsettled, so a console handed back with
+    // that state still set would never save its memory card again — silently,
+    // for the rest of the session.
+    vmuRoomRelease();
     pageLog('[lockstep] frame gate RELEASED — ' + why + '. This console free-runs from here and is no longer ' +
             'sharing frames with anybody.');
   }
@@ -7412,6 +7724,18 @@
     } else if (seedRoomState === 'pending') {
       btxt = 'Preparing the game — this console is still being brought to the same starting point as everyone else.';
       bcls = 'hold';
+    } else if (vmuRoomState === 'failed') {
+      // Same shape and same reason as the seed's refusal above: a console that
+      // cannot hold the room's cards cannot be in the room, and the player is
+      // owed that where they are already reading the barrier.
+      btxt = 'This console cannot start in the room — ' + (vmuRoomWhy || 'the memory cards could not be agreed') +
+             '. A memory card is memory the game can read, so every console has to hold the same ones at frame 0. ' +
+             'Leave the room to play on your own card.';
+      bcls = 'hold';
+    } else if (vmuRoomState === 'pending') {
+      btxt = 'Trading memory cards — every player brings their own card and every console has to end up holding ' +
+             'all of them, identically, before anybody starts (' + vmuRoomWaitText() + ').';
+      bcls = 'hold';
     }
     if (btxt !== ROOM.lastBarrier) { bar.textContent = btxt; bar.className = bcls; ROOM.lastBarrier = btxt; }
 
@@ -7439,8 +7763,15 @@
       // be able to declare itself ready, and one that COULD NOT seed must never
       // be able to: it would start a room it is guaranteed to diverge from.
       const seedHold = (seedRoomState === 'pending' || seedRoomState === 'failed');
+      // ⚠ THE CARDS ARE PART OF BEING LOADED TOO. Declaring ready is this
+      // console saying what it is holding at frame 0, and roomDiscTag() carries
+      // the agreed set's fingerprint — so a console allowed to declare before
+      // the set is installed would declare a tag that does not describe it and
+      // either refuse the room at the barrier or, worse, start on cards nobody
+      // agreed. Held down for exactly the window in which that is possible.
+      const cardHold = (vmuRoomState === 'pending' || vmuRoomState === 'failed');
       const canReady = !b.started && youPort != null && t.you && !t.you.ready &&
-                       netLocalLoad() >= 1 && !seedHold;
+                       netLocalLoad() >= 1 && !seedHold && !cardHold;
       rdy.style.display = (!b.started && youPort != null) ? '' : 'none';
       rdy.disabled = !canReady;
       // ⚠ THE LABEL MUST NAME THE REASON THE BUTTON IS DEAD.
@@ -7456,6 +7787,8 @@
       rdy.textContent = (t.you && t.you.ready) ? "You're ready" :
         seedRoomState === 'failed'  ? 'Cannot start — see below' :
         seedRoomState === 'pending' ? 'Preparing the game…' :
+        vmuRoomState === 'failed'   ? 'Cannot start — see below' :
+        vmuRoomState === 'pending'  ? 'Trading memory cards…' :
         (netLocalLoad() < 1)        ? 'Loading the game…' :
         (youPort == null || !t.you) ? 'Waiting for a seat in the room…' :
         b.started                   ? 'The room already started' :
@@ -7492,6 +7825,14 @@
       // a message was posted. dreamcast/tools/room_crossdevice_test.mjs asserts
       // both peers reach 'ok' before either can press ready.
       seed: { state: seedRoomState, why: seedRoomWhy, disc: roomDiscTag() },
+      // The room's memory cards, the same shape and for the same reason: 'ok'
+      // means the agreed set is INSTALLED IN THIS CORE, not that a message was
+      // seen. `hash` is what roomDiscTag() puts in front of the barrier, so two
+      // peers reading the same hash is the rig's proof that they hold the same
+      // cards; `installed` is per-port so it can prove WHOSE card is in which
+      // seat without pulling 128 KB through CDP.
+      cards: { state: vmuRoomState, why: vmuRoomWhy, hash: vmuRoomHash,
+               installed: Object.assign({}, vmuRoomInstalled), waiting: vmuRoomWaitText() },
     };
   };
 

@@ -165,6 +165,7 @@
 //                  arm rather than silently on everywhere.
 //   --game G       #romSelect value, default gauntlet
 //   --name N       output basename under /tmp/dc-xdev
+//   --blank-joiner       the joiner brings NO saved card (the blank-contribution path)
 //   --fresh        wipe the two persistent Chrome profiles first (re-downloads
 //                  the disc; the profiles are per-ROLE and never shared,
 //                  because cross-origin isolation is origin-scoped and STICKY —
@@ -199,6 +200,12 @@ const PLAYARG  = arg('play', 'panel-open');
 // the opposite of --game automatically. The room is required to correct it.
 const JOINER_DISC = arg('joinerdisc', '');
 const FRESH    = has('fresh');
+// ⚠ THE BLANK-CARD ARM. A player with no saved card must contribute the BYTES
+// of their own blank power-on card, and every console must still end up
+// byte-identical — "everyone starts blank" is not agreement unless the bytes
+// travel, because it otherwise depends on each build producing an identical
+// blank. With this the joiner brings nothing and the room must still agree.
+const BLANK_JOINER = has('blank-joiner');
 const HEADFUL  = has('headful');
 const KEEP     = has('keep');
 const ADMIT_MS = parseInt(arg('admitms', '60000'), 10);
@@ -327,7 +334,11 @@ async function launch(role, mobile) {
     // not a cosmetic one — two peers that apply a 27 MB machine image at
     // different frames are forked. The filter used to drop every one of those
     // lines, which is why a room could seed itself apart with nothing in the log.
-    if (/\[net\]|\[lockstep\]|\[seed\]|state (loaded|load FAILED)|DESYNC|join|approve|allow/i.test(t)) {
+    // ⚠ AND [vmu]: the card exchange decides what guest-visible memory every
+    // console holds at frame 0, so a room that agreed the wrong set — or never
+    // agreed one — has to leave a trail in the same log as the seed and the
+    // gate, not only in a cell's detail string.
+    if (/\[net\]|\[lockstep\]|\[seed\]|\[vmu\]|state (loaded|load FAILED)|DESYNC|join|approve|allow/i.test(t)) {
       nets.push(t.slice(0, 240)); say(`  [${role}] ${t.slice(0, 170)}`);
     }
   });
@@ -796,6 +807,62 @@ async function runArm(armName) {
       `pages did not finish wiring: ${J(mounted)} — nothing below this line means anything`);
     if (!mounted.every(Boolean)) return;
 
+    // -- 0b. THE MEMORY CARD EACH PLAYER ALREADY OWNS -----------------------
+    // A VMU is guest-visible memory, so two consoles that begin a room with
+    // different card bytes are forked at frame 0. The room therefore trades a
+    // whole card SET before anybody starts: each seat contributes its own card,
+    // the host assembles, every console installs the same set for every port.
+    // Proving that carried anything needs each browser to hold a DIFFERENT card
+    // first.
+    //
+    // ⚠ PLANTED HERE, BEFORE THE ROOM EXISTS, AND THAT POSITION IS THE WHOLE
+    // MEASUREMENT. The exchange reads this browser's stored card once, at boot
+    // — and the room AUTO-STARTS A JOINER'S BOOT the moment it is admitted
+    // ("auto-starting <game> for this room — a joiner should not have to press
+    // Start"). Measured: planted after the join, the joiner's boot had already
+    // read storage 0.9 s earlier and contributed its BLANK card while its real
+    // one sat untouched in IndexedDB — every identity cell still passed, and
+    // the run proved nothing about carrying a save. A card written after the
+    // boot is a card the room never saw.
+    //
+    // ⚠ WHICH COSTS US THE SEAT NUMBER, and that is an accepted trade. Nobody
+    // is seated yet, so this assumes the documented lowest-free-first order
+    // (host P1, joiner P2) and 4b reconciles it against the seats the room
+    // actually handed out, voiding rather than guessing if they differ.
+    //
+    // Each side plants ONLY ITS OWN SEAT. The host's own vmu:p1 and the
+    // joiner's own vmu:p0 are left EMPTY on purpose — after the session they
+    // must STILL be empty, which is how the last two cells prove neither
+    // console wrote the other player's card into its own storage.
+    const P1_BYTE = 0xa1, P2_BYTE = 0xb2, PLANT_LEN = 256;
+    const PLANT_HOST_PORT = 0, PLANT_JOIN_PORT = 1;
+    let plantedHost = null, plantedJoin = null;
+    if (PLAY_ARMS.includes(armName)) {
+      const plant = (pg, port, byte) => pg.evaluate(async (p, b, n) => {
+        if (typeof window.__dcVmuPlant !== 'function') return { ok: false, why: 'this build has no __dcVmuPlant seam' };
+        return await window.__dcVmuPlant(p, b, n);
+      }, port, byte, PLANT_LEN);
+      plantedHost = await plant(host, PLANT_HOST_PORT, P1_BYTE);
+      plantedJoin = BLANK_JOINER
+        ? { ok: true, blank: true, size: 0, key: 'vmu:p' + PLANT_JOIN_PORT, hash: null }
+        : await plant(join, PLANT_JOIN_PORT, P2_BYTE);
+      if (BLANK_JOINER) say('  ....  --blank-joiner: the joiner brings NO saved card and must contribute its own ' +
+                            'blank power-on card, which every console still has to hold identically');
+      D.planted = { host: plantedHost, join: plantedJoin };
+      const noSeam = [plantedHost, plantedJoin].some((r) => r && /__dcVmuPlant/.test(r.why || ''));
+      cell(!!(plantedHost && plantedHost.ok && plantedJoin && plantedJoin.ok),
+        'each-player-has-their-own-saved-card-before-the-room-exists',
+        `host planted ${J(plantedHost)} · joiner planted ${J(plantedJoin)}`,
+        noSeam
+          ? 'THE BUILD UNDER TEST CANNOT CARRY A MEMORY CARD INTO A ROOM. The page has no card exchange at all, ' +
+            'so every player starts a room on a blank card and whatever they save is the only copy. This is not a ' +
+            'rig fault and not a flake: it is the shipped behaviour of whatever is being served at ' + ORIGIN + '. ' +
+            'The card cells below are skipped because there is nothing to measure.'
+          : `a card could not be planted: host ${J(plantedHost)} joiner ${J(plantedJoin)} — every card cell below ` +
+            'is measuring nothing without this');
+      if (!(plantedHost && plantedHost.ok && plantedJoin && plantedJoin.ok)) { plantedHost = null; plantedJoin = null; }
+    }
+
     // The entry point must be VISIBLE, not merely present: the page hides
     // #btnNet unless Netplay.supported(), and a hidden button is a product that
     // offers no online play at all on that device.
@@ -1166,6 +1233,29 @@ async function runArm(armName) {
       return;
     }
 
+    // -- 4b. THE SEATS THE CARDS WERE PLANTED FOR ---------------------------
+    // The plant happened before the room existed (see 0b) and had to assume the
+    // ordinary seat order. If the room handed them out differently, every card
+    // cell below would be measuring the wrong storage key — so this reconciles
+    // them and says so rather than reporting a confident wrong answer.
+    if (plantedHost && plantedJoin) {
+      const hp = hudPort(await readRoster(host));
+      const jp = hudPort(await readRoster(join));
+      D.cardSeats = { host: hp, join: jp };
+      say(`  ....  seats vs plant: host seat=${J(hp)} planted port ${PLANT_HOST_PORT} · ` +
+          `join seat=${J(jp)} planted port ${PLANT_JOIN_PORT}`);
+      if (hp !== PLANT_HOST_PORT || jp !== PLANT_JOIN_PORT) {
+        voidc('each-player-brings-their-own-card-into-the-room',
+          `not measurable: the cards were planted for ports ${PLANT_HOST_PORT}/${PLANT_JOIN_PORT} and the room ` +
+          `seated ${J(hp)}/${J(jp)} — the plant has to precede the join (the room auto-starts a joiner's boot) ` +
+          'and therefore has to assume lowest-free-first seating');
+        plantedHost = null; plantedJoin = null;
+      } else {
+        ok('each-player-brings-their-own-card-into-the-room',
+           `host is P${hp + 1} holding ${J(plantedHost.hash)} · joiner is P${jp + 1} holding ${J(plantedJoin.hash)}`);
+      }
+    }
+
     // -- 5. THE PLAY PHASE --------------------------------------------------
     if (!PLAY_ARMS.includes(armName)) {
       say(`\n-- play phase not requested for this arm (--play ${PLAYARG})`);
@@ -1487,6 +1577,115 @@ async function runArm(armName) {
       `the barrier never released: ${J(bars.map((b) => b.barrier))} — this is the "waiting for players" the user was ` +
       'left staring at');
 
+    // -- 5b. THE CARDS CARRIED INTO THE ROOM, AND ARE THE SAME ON BOTH -----
+    // The invariant is absolute: every peer holds BYTE-IDENTICAL guest-visible
+    // memory at frame 0. A memory card IS guest-visible memory, so this is not
+    // a nice-to-have beside the barrier — it is the same property the barrier
+    // exists to defend, measured where it can actually be seen.
+    if (plantedHost && plantedJoin) {
+      // What each page says it installed. `hash` is the whole set's
+      // fingerprint — the same string roomDiscTag() puts in front of the
+      // barrier — and `installed` is per port.
+      const cardsOf = (pg) => pg.evaluate(() => {
+        const r = (typeof window.__dcNetRoom === 'function') ? window.__dcNetRoom() : null;
+        const v = (typeof window.__dcVmu === 'function') ? window.__dcVmu() : null;
+        return { cards: r && r.cards ? r.cards : null, disc: r && r.seed ? r.seed.disc : null,
+                 slots: v ? v.slots : null, seedSkipped: v ? v.seedSkipped : null };
+      });
+      // ...and what the CORE actually holds, read back independently of the
+      // page's own bookkeeping. Digested INSIDE the page: a 128 KB Uint8Array
+      // crossing a debugger becomes a 131072-key object.
+      const liveCards = (pg) => pg.evaluate(async () => {
+        const v = (typeof window.__dcVmu === 'function') ? window.__dcVmu() : null;
+        const out = {};
+        for (const s of ((v && v.slots) || [])) {
+          if (!s.present) continue;
+          const d = await window.__dcVmuLive(s.port);
+          if (!d || !d.data) { out[s.port] = null; continue; }
+          const u = new Uint8Array(d.data);
+          let h = 0x811c9dc5;
+          for (let i = 0; i < u.length; i++) h = Math.imul((h ^ u[i]) >>> 0, 0x01000193) >>> 0;
+          out[s.port] = { size: u.length, ptr: d.ptr,
+                          head: Array.from(u.slice(0, 4)),
+                          sum: ('0000000' + (h >>> 0).toString(16)).slice(-8) };
+        }
+        return out;
+      });
+      const [hc, jc] = await Promise.all(pages.map(cardsOf));
+      const [hl, jl] = await Promise.all(pages.map(liveCards));
+      D.cards = { host: hc, join: jc, live: { host: hl, join: jl } };
+      say(`  ....  host cards ${J(hc.cards)}`);
+      say(`  ....  join cards ${J(jc.cards)}`);
+      say(`  ....  host live  ${J(hl)}`);
+      say(`  ....  join live  ${J(jl)}`);
+
+      // (1) BOTH PEERS SETTLED ON A SET AT ALL.
+      cell(hc.cards && jc.cards && hc.cards.state === 'ok' && jc.cards.state === 'ok',
+        'both-consoles-installed-the-rooms-card-set',
+        `host ${J(hc.cards && hc.cards.state)} · join ${J(jc.cards && jc.cards.state)}`,
+        `a console never settled its cards: host ${J(hc.cards)} join ${J(jc.cards)} — a room that starts ` +
+        'without this is starting on cards nobody agreed');
+
+      // (2) AND ON THE *SAME* SET. This is the whole invariant in one line.
+      cell(!!(hc.cards && jc.cards && hc.cards.hash && hc.cards.hash === jc.cards.hash),
+        'BOTH-PEERS-HOLD-THE-SAME-CARD-SET-AT-FRAME-0',
+        `both fingerprint ${J(hc.cards && hc.cards.hash)}`,
+        `the two consoles disagree: host ${J(hc.cards && hc.cards.hash)} join ${J(jc.cards && jc.cards.hash)} — ` +
+        'guest-visible memory differs at frame 0, which is a fork');
+
+      // (3) THE CORES AGREE TOO, not just the pages' bookkeeping. Every port
+      // present on either machine, digested over ALL 131072 bytes.
+      const ports = Array.from(new Set(Object.keys(hl).concat(Object.keys(jl)))).map((x) => x | 0).sort();
+      const differ = ports.filter((p) => !hl[p] || !jl[p] || hl[p].sum !== jl[p].sum);
+      cell(ports.length > 0 && differ.length === 0,
+        'every-port-reads-BYTE-IDENTICAL-out-of-both-cores',
+        `${ports.length} port(s) compared over all 131072 bytes each: ` +
+        J(ports.map((p) => p + '=' + (hl[p] && hl[p].sum))),
+        `port(s) ${J(differ)} differ between the two cores: host ${J(hl)} join ${J(jl)}`);
+
+      // (4) AND THEY ARE THE RIGHT CARDS — each player's own, in their own
+      // seat, on BOTH machines. Identical-but-blank would pass (2) and (3) and
+      // would be the old behaviour, so this is the cell that says the fix
+      // actually carried anything.
+      const hpSeat = D.cardSeats && D.cardSeats.host != null ? D.cardSeats.host : 0;
+      const jpSeat = D.cardSeats && D.cardSeats.join != null ? D.cardSeats.join : 1;
+      const headIs = (live, port, byte) => !!(live[port] && live[port].head && live[port].head[0] === byte);
+      if (BLANK_JOINER) {
+        // The joiner brought nothing, so port 1 must be ITS OWN blank card's
+        // bytes — present on both machines, identical, and NOT the host's card.
+        // Byte-identity is cell (3); what this adds is that the blank actually
+        // travelled rather than each side quietly making its own.
+        cell(!!(hl[jpSeat] && jl[jpSeat] && hl[jpSeat].sum === jl[jpSeat].sum &&
+                hl[jpSeat].sum !== hl[hpSeat].sum),
+          'A-PLAYER-WITH-NO-CARD-STILL-AGREES-ON-ONE',
+          `port ${jpSeat} carries the joiner's blank card, byte-identical on both machines ` +
+          `(${J(hl[jpSeat] && hl[jpSeat].sum)}) and distinct from player 1's (${J(hl[hpSeat] && hl[hpSeat].sum)})`,
+          `the blank card did not agree: host ${J(hl[jpSeat])} join ${J(jl[jpSeat])}`);
+      } else {
+        cell(headIs(hl, jpSeat, P2_BYTE) && headIs(jl, jpSeat, P2_BYTE),
+          'PLAYER-2s-OWN-CARD-IS-THE-ONE-IN-PLAYER-2s-SEAT',
+          `port ${jpSeat} reads 0x${P2_BYTE.toString(16)} on BOTH machines — the joiner's card travelled to the host`,
+          `port ${jpSeat} is not the joiner's card: host head ${J(hl[jpSeat] && hl[jpSeat].head)} ` +
+          `join head ${J(jl[jpSeat] && jl[jpSeat].head)} (wanted 0x${P2_BYTE.toString(16)} first)`);
+      }
+      cell(headIs(hl, hpSeat, P1_BYTE) && headIs(jl, hpSeat, P1_BYTE),
+        'PLAYER-1s-OWN-CARD-IS-THE-ONE-IN-PLAYER-1s-SEAT',
+        `port ${hpSeat} reads 0x${P1_BYTE.toString(16)} on BOTH machines`,
+        `port ${hpSeat} is not the host's card: host head ${J(hl[hpSeat] && hl[hpSeat].head)} ` +
+        `join head ${J(jl[hpSeat] && jl[hpSeat].head)} (wanted 0x${P1_BYTE.toString(16)} first)`);
+
+      // (5) THE BARRIER IS WHAT ENFORCES IT. The set's fingerprint is folded
+      // into the string the barrier compares, so a peer holding a different set
+      // is refused by name rather than allowed to diverge. If it is not in the
+      // declaration, cells (2)-(4) are true today and unprotected tomorrow.
+      const tagged = [hc.disc, jc.disc];
+      cell(tagged.every((d) => typeof d === 'string' && d.indexOf('#cards:') >= 0) && tagged[0] === tagged[1],
+        'the-card-set-is-part-of-what-the-barrier-COMPARES',
+        `both declare ${J(tagged[0])}`,
+        `the declarations do not carry the card set: ${J(tagged)} — a peer with different cards would be ` +
+        'admitted silently instead of refused');
+    }
+
     // -- 5c. core ran advances, sampled twice ------------------------------
     for (const pg of pages) { const r = await readRoster(pg); if (r.overlayOpen) await human(pg, '#netClose', 'Close'); }
     await sleep(3000);
@@ -1574,6 +1773,59 @@ async function runArm(armName) {
       voidc('each-sides-own-pad-reaches-its-OWN-core', `not measurable: ports ${J(ports)} / pad images ${J(during.map(Boolean))}`);
     }
     await shot(host, '7-play'); await shot(join, '7-play');
+
+    // -- 5e. AND AFTER PLAY, EACH PERSON STILL OWNS THEIR OWN CARD ----------
+    // Every console in a room runs the whole four-port machine, so the joiner's
+    // browser is holding the HOST's card in port 0 and the host's is holding
+    // the JOINER's in port 1. Writing either of those back would overwrite that
+    // person's own saved card with somebody else's data — which is why the page
+    // persists only the seat it plays, and why the two "still empty" cells
+    // below are the ones that would catch a regression: they are the storage
+    // keys neither machine is allowed to touch.
+    if (plantedHost && plantedJoin) {
+      const stored = (pg) => pg.evaluate(async () => {
+        const out = {};
+        for (const p of [0, 1, 2, 3]) {
+          const v = await window.__dcVmuStored(p);
+          out[p] = v ? { size: v.byteLength, head: Array.from(v.slice(0, 4)) } : null;
+        }
+        return out;
+      });
+      const [hs, js] = await Promise.all(pages.map(stored));
+      D.storedAfterPlay = { host: hs, join: js };
+      say(`  ....  host storage after play ${J(hs)}`);
+      say(`  ....  join storage after play ${J(js)}`);
+      const hpSeat = D.cardSeats && D.cardSeats.host != null ? D.cardSeats.host : 0;
+      const jpSeat = D.cardSeats && D.cardSeats.join != null ? D.cardSeats.join : 1;
+      const kept = (st, port, byte) => !!(st[port] && st[port].head && st[port].head[0] === byte);
+      if (BLANK_JOINER) {
+        // No card went in, so nothing can "survive" — but the seat DID play, so
+        // what the session leaves behind must be the joiner's own blank rather
+        // than the host's card wearing the joiner's key.
+        cell(js[jpSeat] == null || (js[jpSeat].head && js[jpSeat].head[0] !== P1_BYTE),
+          'a-blank-players-key-never-receives-SOMEBODY-ELSES-card',
+          `the joiner's own key holds ${J(js[jpSeat] && js[jpSeat].head)} — not player 1's card`,
+          `the joiner's own key was written with player 1's card: ${J(js[jpSeat])}`);
+      } else {
+        cell(kept(js, jpSeat, P2_BYTE),
+          'PLAYER-2s-CARD-SURVIVES-THE-SESSION-in-player-2s-browser',
+          `the joiner's own key still holds its own card (head ${J(js[jpSeat] && js[jpSeat].head)})`,
+          `the joiner's own card is gone or changed: ${J(js[jpSeat])} — playing online cost this player their save`);
+      }
+      cell(kept(hs, hpSeat, P1_BYTE),
+        'PLAYER-1s-CARD-IS-UNTOUCHED-in-player-1s-browser',
+        `the host's own key still holds its own card (head ${J(hs[hpSeat] && hs[hpSeat].head)})`,
+        `the host's own card changed: ${J(hs[hpSeat])}`);
+      cell(hs[jpSeat] == null,
+        'the-host-did-NOT-write-the-joiners-card-into-its-own-storage',
+        `the host's own key for port ${jpSeat} is still empty, as it was before the room`,
+        `the host stored something under its OWN player-${jpSeat + 1} key: ${J(hs[jpSeat])} — that is the joiner's ` +
+        `card landing in the host's browser, which would overwrite the host's real player-${jpSeat + 1} save`);
+      cell(js[hpSeat] == null,
+        'the-joiner-did-NOT-write-the-hosts-card-into-its-own-storage',
+        `the joiner's own key for port ${hpSeat} is still empty, as it was before the room`,
+        `the joiner stored something under its OWN player-${hpSeat + 1} key: ${J(js[hpSeat])}`);
+    }
   } finally {
     D.hostErrors = host.__errs.slice(0, 12);
     D.joinErrors = join.__errs.slice(0, 12);

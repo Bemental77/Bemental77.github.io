@@ -457,5 +457,168 @@ console.log('\n== a guest can tell when its picture of the room has stopped bein
   eq('reseating-reports-the-port-it-already-had', got, [1]);
 }
 
+console.log('\n== the memory cards are AGREED before frame 0, or nobody starts ==');
+{
+  // A card is guest-visible memory, so two consoles that begin with different
+  // card bytes are forked at frame 0. These prove the exchange that stops that:
+  // each seat contributes its OWN card, the host assembles the whole set, and
+  // every machine ends up holding the SAME set and the SAME fingerprint.
+  const card = (fill, n = 40 * 1024) => { const u = new Uint8Array(n); u.fill(fill); return u; };
+  const cardHash = (u8) => {           // stands in for the page's raw-card hash
+    let h = 0x811c9dc5;
+    for (let i = 0; i < u8.length; i++) h = Math.imul((h ^ u8[i]) >>> 0, 0x01000193) >>> 0;
+    return ('0000000' + (h >>> 0).toString(16)).slice(-8);
+  };
+  const entry = (port, u8) => ({ port, size: u8.length, hash: cardHash(u8), enc: 'raw', bytes: u8 });
+
+  const b = room([{ id: 'H', host: true }, { id: 'A' }]);
+  b.H.seat('H', 1); b.H.seat('A', 1);
+  const hostCard = card(0xa1), guestCard = card(0xb2);
+
+  // Nothing is agreed until BOTH seats have spoken.
+  b.H.contributeCards([entry(0, hostCard)]);
+  is('no-set-while-a-seat-is-silent', b.H.cardSetHash, null);
+  eq('the-room-names-the-seat-it-is-waiting-on', b.H.cardsWaitingFor(), [{ port: 1, peer: 'A' }]);
+  is('the-guest-has-nothing-yet', b.A.cardSetHash, null);
+
+  // ...and the moment it does, the host assembles and everybody has the set.
+  b.A.contributeCards([entry(1, guestCard)]);
+  eq('nothing-is-outstanding-once-both-contributed', b.H.cardsWaitingFor(), []);
+  is('the-host-agreed-a-set', typeof b.H.cardSetHash, 'string');
+  is('BOTH-MACHINES-HOLD-THE-SAME-SET-FINGERPRINT', b.A.cardSetHash, b.H.cardSetHash);
+  eq('the-set-covers-exactly-the-occupied-ports',
+     Object.keys(b.A.cards).map((x) => x | 0).sort(), [0, 1]);
+
+  // The bytes are the ones each SEAT contributed — not the host's for both.
+  // ⚠ COMPARED BY DIGEST, NOT BY PRINTING THEM. `is()` puts its values in the
+  // log; two 40 KB cards as hex is 160 KB of noise that buries every other row.
+  const same = (a, c) => a.length === c.length && cardHash(a) === cardHash(c);
+  is('port-0-carries-the-HOSTs-card',  same(b.A.cards[0].bytes, hostCard), true);
+  is('port-1-carries-the-GUESTs-card', same(b.A.cards[1].bytes, guestCard), true);
+  is('the-host-also-holds-the-guests-card', same(b.H.cards[1].bytes, guestCard), true);
+  is('a-card-survives-the-chunker-intact', b.A.cards[1].bytes.length, guestCard.length);
+  is('the-raw-fingerprint-travels-with-it', b.A.cards[1].hash, cardHash(guestCard));
+
+  // The fingerprint is a pure function of the SET, computed the same way on
+  // both sides — which is what makes it safe to fold into the barrier's
+  // declaration and refuse a mismatch by name.
+  is('the-fingerprint-is-recomputable', Lockstep.cardSetHash(b.A.cards), b.H.cardSetHash);
+  const forged = Object.assign({}, b.A.cards, { 1: Object.assign({}, b.A.cards[1], { hash: 'deadbeef' }) });
+  is('a-different-set-fingerprints-differently', Lockstep.cardSetHash(forged) !== b.H.cardSetHash, true);
+}
+{
+  // A PEER MAY ONLY SPEAK FOR ITS OWN SEAT. A card is guest-visible memory on
+  // EVERY machine, so a peer allowed to write another port's card could fork
+  // the whole room — the same rule as an input packet, for a worse reason.
+  const card = (fill) => { const u = new Uint8Array(1024); u.fill(fill); return u; };
+  const e = (port, u8) => ({ port, size: u8.length, hash: 'h' + port, enc: 'raw', bytes: u8 });
+  const b = room([{ id: 'H', host: true }, { id: 'A' }]);
+  b.H.seat('H', 1); b.H.seat('A', 1);
+  b.A.contributeCards([e(0, card(0xee))]);          // A claiming the HOST's port
+  eq('a-peer-cannot-contribute-to-a-seat-it-does-not-hold', b.H.cardsWaitingFor(),
+     [{ port: 0, peer: 'H' }, { port: 1, peer: 'A' }]);
+  // ...and a forged packet that skips contributeCards() is refused at receive.
+  b.H.receive({ t: 'lsvmu', peer: 'A', port: 0, size: 1024, hash: 'x', enc: 'raw',
+                len: 4, n: 1, i: 0, d: 'AAAA' });
+  eq('a-forged-contribution-for-another-port-is-dropped', b.H.cardsWaitingFor(),
+     [{ port: 0, peer: 'H' }, { port: 1, peer: 'A' }]);
+}
+{
+  // A TRUNCATED SET IS REFUSED, NOT INSTALLED. A short card installs as a
+  // corrupt card, which is the silent fork the exchange exists to prevent — so
+  // the guest reports it and holds itself out of the barrier instead.
+  const b = room([{ id: 'H', host: true }, { id: 'A' }]);
+  b.H.seat('H', 1); b.H.seat('A', 1);
+  let reported = null;
+  b.A.on('cards', (c) => { if (c && c.error) reported = c.error; });
+  b.A.receive({ t: 'lsvmuz', seq: 1, set: 'cafebabe',
+                ports: [{ port: 0, size: 8, hash: 'h0', enc: 'raw', len: 8 }] });
+  b.A.receive({ t: 'lsvmus', seq: 1, port: 0, size: 8, hash: 'h0', enc: 'raw',
+                len: 8, n: 2, i: 0, d: 'AAAA' });      // 3 of the 8 bytes
+  b.A.receive({ t: 'lsvmus', seq: 1, port: 0, size: 8, hash: 'h0', enc: 'raw',
+                len: 8, n: 2, i: 1, d: 'AAAA' });      // ...and 3 more: 6 != 8
+  is('a-short-set-is-NOT-installed', b.A.cardSetHash, null);
+  // And one whose pieces DO add up but whose fingerprint disagrees with the
+  // manifest is refused too — a crossed transfer looks whole.
+  b.A.receive({ t: 'lsvmuz', seq: 2, set: 'cafebabe',
+                ports: [{ port: 0, size: 3, hash: 'h0', enc: 'raw', len: 3 }] });
+  b.A.receive({ t: 'lsvmus', seq: 2, port: 0, size: 3, hash: 'h0', enc: 'raw',
+                len: 3, n: 1, i: 0, d: 'AAAA' });
+  is('a-set-that-does-not-match-the-announced-fingerprint-is-refused', b.A.cardSetHash, null);
+  is('and-the-refusal-carries-a-reason', /fingerprint/.test(reported || ''), true);
+}
+{
+  // THE ROOM CHANGING DROPS THE SET. A set covers exactly the occupied ports,
+  // so a seat handed out or vacated after one was agreed makes it wrong — and
+  // a console installing it would hold a blank where a player's card belongs.
+  const card = (fill) => { const u = new Uint8Array(2048); u.fill(fill); return u; };
+  const e = (port, u8, h) => ({ port, size: u8.length, hash: h, enc: 'raw', bytes: u8 });
+  const b = room([{ id: 'H', host: true }, { id: 'A' }, { id: 'B' }]);
+  b.H.seat('H', 1); b.H.seat('A', 1);
+  b.H.contributeCards([e(0, card(1), 'h0')]);
+  b.A.contributeCards([e(1, card(2), 'h1')]);
+  const two = b.H.cardSetHash;
+  is('a-two-seat-room-agrees-a-set', typeof two, 'string');
+  b.H.seat('B', 1);                                  // a third player sits down
+  is('a-NEW-SEAT-drops-the-agreed-set', b.H.cardSetHash, null);
+  eq('and-the-room-waits-on-the-newcomer', b.H.cardsWaitingFor(), [{ port: 2, peer: 'B' }]);
+  b.B.contributeCards([e(2, card(3), 'h2')]);
+  is('the-set-is-agreed-again-once-they-contribute', typeof b.H.cardSetHash, 'string');
+  is('and-it-is-NOT-the-two-seat-set', b.H.cardSetHash !== two, true);
+  is('every-machine-moved-to-the-new-set', b.A.cardSetHash, b.H.cardSetHash);
+  // ...and standing up again drops it and re-agrees the smaller one in the same
+  // breath, because the two remaining contributions are still on file. What
+  // must NOT survive is the leaver's card: a set that still names port 2 would
+  // have every console install a card for a seat nobody is playing.
+  b.H.unseat('B');
+  is('a-VACATED-SEAT-returns-the-room-to-the-two-seat-set', b.H.cardSetHash, two);
+  eq('and-the-leavers-port-is-gone-from-the-set',
+     Object.keys(b.H.cards).map((x) => x | 0).sort(), [0, 1]);
+  is('every-machine-followed-it-back', b.A.cardSetHash, two);
+}
+{
+  // ...AND THE BARRIER REFUSES A ROOM WHOSE CONSOLES HOLD DIFFERENT CARDS.
+  // dreamcast.html folds the agreed set's fingerprint into the string it
+  // declares, so this is the SAME tested path that refuses two different discs
+  // — which is the point of putting it there rather than inventing a second
+  // refusal. Without this the exchange would be a best effort: correct when it
+  // works and a silent fork when it does not.
+  const b = room([{ id: 'H', host: true }, { id: 'A' }]);
+  b.H.seat('H', 1); b.H.seat('A', 1);
+  let refused = null;
+  b.H.on('barrier-failed', (x) => { refused = x; });
+  b.H.declareReady('gauntlet#cards:542da858');
+  b.A.declareReady('gauntlet#cards:0badc0de');   // same disc, different card set
+  is('DIFFERENT-CARDS-REFUSE-THE-ROOM', !!refused, true);
+  is('nobody-started', b.H.state, 'failed');
+  is('and-the-refusal-NAMES-the-mismatch', /cards:/.test((b.H.error || '')), true);
+  // ...while the same set on both starts normally, so the tag is not simply
+  // breaking every room.
+  const c = room([{ id: 'H', host: true }, { id: 'A' }]);
+  c.H.seat('H', 1); c.H.seat('A', 1);
+  c.H.declareReady('gauntlet#cards:542da858');
+  c.A.declareReady('gauntlet#cards:542da858');
+  is('THE-SAME-CARD-SET-STARTS-THE-ROOM', c.H.state, 'running');
+}
+{
+  // A GUEST THAT MISSED THE BROADCAST CAN ASK FOR IT, the same way it can ask
+  // for the roster. Without this a lost manifest is a console that never
+  // starts and never says why.
+  const card = (fill) => { const u = new Uint8Array(4096); u.fill(fill); return u; };
+  const e = (port, u8, h) => ({ port, size: u8.length, hash: h, enc: 'raw', bytes: u8 });
+  const b = room([{ id: 'H', host: true }, { id: 'A' }]);
+  b.H.seat('H', 1); b.H.seat('A', 1);
+  b.bus = b;
+  b.H.contributeCards([e(0, card(7), 'h0')]);
+  // A's contribution reaches the host, but the host's broadcast is dropped.
+  b.drop = (from, m) => from === 'H' && (m.t === 'lsvmuz' || m.t === 'lsvmus');
+  b.A.contributeCards([e(1, card(9), 'h1')]);
+  is('the-host-agreed-it', typeof b.H.cardSetHash, 'string');
+  is('the-guest-never-heard-it', b.A.cardSetHash, null);
+  b.drop = null;
+  b.A.requestCards();
+  is('ASKING-RECOVERS-THE-SET', b.A.cardSetHash, b.H.cardSetHash);
+}
+
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'}  ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
