@@ -135,6 +135,7 @@ const boot = (p, isHost, code, transport) => p.evaluate(async (code, isHost, tra
 
 const read = (p) => p.evaluate(() => ({
   state: window.__s.state,
+  relay: window.__s.relay ? { active: !!window.__s.relay.active, oneWayMs: window.__s.relay.oneWayMs } : null,
   err: window.__s.lastError,
   kind: window.__s._sig && window.__s._sig.kind,
   url: window.__s._sig && window.__s._sig.url,
@@ -157,9 +158,12 @@ const waitPair = async (h, g, ms) => {
     a = await read(h); b = await read(g);
     if (reqMs === null && a.req) reqMs = Date.now() - t0;
     if (a.state === 'failed' || b.state === 'failed') break;
-    if (a.state === 'connected' && b.state === 'connected') break;
-    // In the broken-path arm the game link cannot open, so once the handshake
-    // has been carried there is nothing further to wait for.
+    // ⚠ NOT 'connected' ALONE. With the input fallback the broken-path arm also
+    // reaches 'connected', but only after ICE_CONNECT_MS expires and relay mode
+    // engages — so waiting for the relay to be measured is what makes the cell
+    // below able to tell the two apart.
+    if (a.state === 'connected' && b.state === 'connected'
+        && (!a.relay || a.relay.oneWayMs != null)) break;
     if (reqMs !== null && b.state === 'closed') break;
   }
   return { h: a, g: b, ms: Date.now() - t0, reqMs };
@@ -234,11 +238,18 @@ if (brokeIt === 'relay') {
   r2.h.req
     ? ok('PAIRING-SURVIVES-A-DEAD-DIRECT-PATH', `hello crossed and the host was asked ${r2.reqMs} ms after start() (sas=${r2.h.req.sas}) with WebRTC unable to connect AT ALL`)
     : bad('PAIRING-SURVIVES-A-DEAD-DIRECT-PATH', `no join request in ${r2.ms} ms — host=${JSON.stringify(r2.h.log)} guest=${JSON.stringify(r2.g.log)}`);
-  // And the GAME link must still fail here, because there is genuinely no path
-  // for it — a rig that reported success for both would be measuring nothing.
-  r2.h.state !== 'connected' && r2.g.state !== 'connected'
-    ? ok('game-link-correctly-cannot-open', `host=${r2.h.state} guest=${r2.g.state} — signalling is independent of the media path, as designed`)
-    : bad('game-link-correctly-cannot-open', 'the game link connected with relay-only ICE and no relay, so the arm is not doing what it claims');
+  // ⚠ THIS CELL CHANGED WHEN THE INPUT FALLBACK LANDED, AND IT GOT STRONGER.
+  // It used to assert the session must NOT reach 'connected' here, because no
+  // direct path can exist. That is still true of the DIRECT path — but the room
+  // now carries the pads over the relay instead of dying, so 'connected' is the
+  // correct outcome and the old assertion would have scored the fix as a bug.
+  // What must be proved is that the connection exists ONLY because of the
+  // fallback: connected AND relay.active. A direct link cannot satisfy that,
+  // so this cannot be passed by the thing the arm was built to rule out.
+  const relayed2 = !!(r2.h.relay && r2.h.relay.active) && !!(r2.g.relay && r2.g.relay.active);
+  (r2.h.state === 'connected' && relayed2)
+    ? ok('connected-ONLY-BECAUSE-IT-FELL-BACK-TO-THE-RELAY', `host=${r2.h.state} guest=${r2.g.state}, both with relay.active — no direct path exists, so this room is the fallback working`)
+    : bad('connected-ONLY-BECAUSE-IT-FELL-BACK-TO-THE-RELAY', `host=${r2.h.state} relay=${JSON.stringify(r2.h.relay)} · guest=${r2.g.state} relay=${JSON.stringify(r2.g.relay)}`);
 }
 await C.ctx.close(); await D.ctx.close();
 

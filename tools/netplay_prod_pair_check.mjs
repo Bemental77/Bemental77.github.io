@@ -207,13 +207,29 @@ async function pass(label, breakDirect) {
     });
     info('confirmation-code', String(sas) + '  (both sides derive it; a host reads it out)');
     await H.page.evaluate(() => document.getElementById('npApproveAllow').click());
-    const both = await until(H.page, "const s=(window.Netplay.sessions||[]).filter(x=>x.isHost).pop(); return s && s.state==='connected' ? true : null;", 45000, 500);
+    // Long enough for ICE_CONNECT_MS (25 s) to expire and relay mode to engage
+    // AND measure itself, because the broken-path cell below reads the measured
+    // relay rather than the bare state.
+    const both = await until(H.page,
+      "const s=(window.Netplay.sessions||[]).filter(x=>x.isHost).pop();"
+      + "return s && s.state==='connected' && (!s.relay || s.relay.oneWayMs!=null) ? true : null;", 60000, 500);
     if (breakDirect) {
-      // The GAME link genuinely cannot open here, and must not pretend to.
-      const gs = await G.page.evaluate(() => { const s = (window.Netplay.sessions || []).pop(); return s ? { state: s.state, err: s.lastError } : null; });
-      !both
-        ? ok(label + '/game-link-correctly-cannot-open', `pairing is independent of the media path, as designed — guest=${JSON.stringify(gs)}`)
-        : bad(label + '/game-link-correctly-cannot-open', 'the game link connected with relay-only ICE and no relay, so this arm is not doing what it claims');
+      // ⚠ STRENGTHENED WHEN THE INPUT FALLBACK LANDED. This used to require the
+      // session NOT to reach 'connected', because no direct path can exist
+      // here. The room now carries the pads over the relay rather than dying,
+      // so 'connected' is the right answer — and the old assertion would have
+      // scored the fix as a regression. What is asserted instead is that the
+      // room works ONLY via the fallback: connected AND relay.active. A direct
+      // link cannot satisfy that, so the arm still cannot be passed by the
+      // thing it exists to rule out.
+      const hs = await H.page.evaluate(() => {
+        const s = (window.Netplay.sessions || []).filter((x) => x.isHost).pop();
+        return s ? { state: s.state, relay: s.relay ? { active: !!s.relay.active, oneWayMs: s.relay.oneWayMs, delayFrames: s.relay.delayFrames } : null,
+                     notice: s.relayNotice ? s.relayNotice() : null } : null;
+      });
+      (hs && hs.relay && hs.relay.active)
+        ? ok(label + '/WORKS-ONLY-BECAUSE-OF-THE-RELAY-FALLBACK', `state=${hs.state}, relay.active — ${hs.notice}`)
+        : bad(label + '/WORKS-ONLY-BECAUSE-OF-THE-RELAY-FALLBACK', `connected=${!!both} but relay=${JSON.stringify(hs && hs.relay)} — either the fallback did not engage or a direct link opened, and both would make this arm meaningless`);
     } else {
       both ? ok(label + '/game-link-opened', 'host reached connected after the human allowed it')
            : bad(label + '/game-link-opened', 'approved, but the data channel never opened');
