@@ -14,12 +14,17 @@
        so its own absolute paths are unambiguous. -->
   <script src="/lib/capability.js"></script>
   <script src="/lib/xboxinput.js"></script>
-  <!-- ONLINE CO-OP. Both are inert unless Netplay.supported(); netplay-host.js
-       additionally does nothing at all without ?np=<code> in the URL, which is
-       what n64_multiplayer.html hands over. The lobby is NOT here — see the
-       ONLINE CO-OP block near the end of this page. -->
+  <!-- ONLINE PLAY — DETERMINISTIC LOCKSTEP. Inert unless Netplay.supported(),
+       and it does nothing at all without ?np=<code> in the URL, which is what
+       n64_multiplayer.html hands over. The lobby is NOT here — see the ONLINE
+       PLAY block near the end of this page.
+       ⚠ lib/netplay-host.js IS DELIBERATELY GONE. It is the STREAMING host half
+       (capture a surface, attachMedia it, expose a remote pad), and streaming is
+       cancelled: every machine now runs its own core and only pad bytes cross
+       the wire. The file still exists because sibling pages have not been
+       converted yet; loading it here would ship a second, contradictory online
+       architecture on a page that has one. -->
   <script src="/lib/netplay.js"></script>
-  <script src="/lib/netplay-host.js"></script>
   <script>
     // Same honest-failure contract as the sibling pages, with the spec that makes
     // this the PORTABILITY REFERENCE: Capability.SPECS.n64 requires only
@@ -199,7 +204,31 @@
     #diagActions button { flex: 1; padding: 10px; border: 1px solid #444; background: #2c2c2c; color: #eee; border-radius: 6px; font-size: 13px; cursor: pointer; }
     #diagActions #diagShare { background: #2a6b4a; border-color: #2a6b4a; }
     #n64Stubs { display: none !important; }
-  </style>
+  
+  /* ---- online room panel ---- */
+  #lsRoom { position: fixed; right: 12px; top: 12px; z-index: 60; width: 232px;
+            background: rgba(16,20,26,.94); border: 1px solid #2a3340; border-radius: 10px;
+            padding: 11px 12px; font: 12.5px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color: #dbe4ee; box-shadow: 0 6px 24px rgba(0,0,0,.45); }
+  #lsRoom[hidden] { display: none; }
+  #lsRoom .lsHead { color: #9fb2c6; margin-bottom: 7px; }
+  #lsRoom .lsHead b { color: #9fe0a0; font: 700 15px/1 ui-monospace, Menlo, monospace; letter-spacing: 2px; }
+  #lsRoom .lsSeats { display: flex; flex-direction: column; gap: 3px; margin-bottom: 7px; }
+  #lsRoom .seat { display: flex; justify-content: space-between; gap: 8px;
+                  padding: 3px 6px; border-radius: 5px; background: #131922; color: #a9b7c6; }
+  #lsRoom .seat.me { background: #17324b; color: #dbe9f7; }
+  #lsRoom .seat.empty { opacity: .45; }
+  #lsRoom .seat .st { color: #7f8d9d; }
+  #lsRoom .seat.rdy .st { color: #7ee787; }
+  #lsRoom .lsMsg { color: #93a2b3; margin-bottom: 9px; min-height: 2.6em; }
+  #lsRoom .lsMsg.bad { color: #ff9b9b; }
+  #lsRoom .lsMsg.ok { color: #7ee787; }
+  #lsRoom .lsBtns { display: flex; gap: 7px; }
+  #lsRoom button { flex: 1; min-height: 32px; border-radius: 7px; border: 1px solid #35506b;
+                   background: #17324b; color: #dbe9f7; font-size: 12.5px; cursor: pointer; }
+  #lsRoom button.sec { background: #1a1f27; border-color: #2a3340; color: #aab6c4; }
+  #lsRoom button:disabled { opacity: .45; cursor: default; }
+</style>
   <!-- JAVASCRIPT OFF. Measured 2026-09-01: none of the three emulator pages had a
        <noscript> at all, so a visitor with JS disabled (blocked by an extension, or on
        a browser where the first script threw) got the full page shell — including an
@@ -213,6 +242,30 @@
   </style></noscript>
 </head>
 <body>
+
+<!-- ═══ THE ROOM PANEL — ONLINE PLAY ═══════════════════════════════════════
+     Hidden unless a room actually exists (?np=<code>), so a single-player visit
+     never sees it and its DOM costs nothing.
+
+     ⚠ WHY THERE IS A READY BUTTON AND NOT AN AUTO-START. Only a human knows
+     whether the party is complete. An earlier cut declared Ready automatically
+     as soon as this core finished booting, and MEASURED the exact failure that
+     invites: whichever machine booted first passed the start barrier ALONE, with
+     `ports=[null,null,null,null], mine=[]` — an empty roster — and the engine
+     then refuses everyone else as a late joiner, because the device set is part
+     of the starting state. Waiting for a person to say "we are all here" is not
+     friction, it is the only correct trigger, and it is what makes "as many
+     players as the console can" work rather than just two.
+-->
+<div id="lsRoom" hidden>
+  <div class="lsHead">Online room <b id="lsCode">-----</b></div>
+  <div id="lsSeats" class="lsSeats"></div>
+  <div id="lsMsg" class="lsMsg">Waiting for players…</div>
+  <div class="lsBtns">
+    <button id="netReady" type="button">Ready</button>
+    <button id="netLeave" type="button" class="sec">Leave</button>
+  </div>
+</div>
 <!-- Shown ONLY by the <noscript> stylesheet in <head>; invisible whenever JS runs. -->
 <div id="nojs" style="display:none;max-width:640px;margin:14vh auto;padding:0 22px;font:15px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#ddd;">
   <h1 style="font-size:20px;margin:0 0 10px;color:#fff;">JavaScript is turned off</h1>
@@ -2938,219 +2991,591 @@ N64Rate.selfTest = function (logFn) {
     // ?ratetest=1 runs the model with NO emulator; autostart would defeat that.
     if (qs.has('autostart') && !RATETEST) { if (isMobile) $('mobileSplash').style.display = 'none'; startEmulator(); }
   })();
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ONLINE PLAY — DETERMINISTIC LOCKSTEP, AND NOTHING ELSE.
+  //
+  // ⚠ STREAMING IS CANCELLED (user directive 2026-09-08: "WE WILL NOT USE
+  // STREAMING", "IT WILL BE AS IF MULTIPLAYER ARE ON THE SAME CONSOLE"). What
+  // used to be here streamed this page's canvas over WebRTC and merged the
+  // remote player's buttons either into the HOST's own controller string or
+  // into a synthetic Gamepad that SDL might or might not enumerate as player 2.
+  // The remote player was watching a video of somebody else's N64, every button
+  // they pressed cost a network round trip plus an encode plus a decode, and
+  // whether they were even Player 2 depended on whether the host happened to
+  // have a controller plugged in. All of that is gone. It is not reachable from
+  // this page and there is no fallback to it: an online session that is not
+  // lockstep is a FAULT, and it is reported as one.
+  //
+  // THE MODEL. Every player runs their OWN core, on their own machine, from
+  // frame 0. The only thing that crosses the wire is pad bytes. Each player's
+  // own input is applied locally, so it is as immediate as a local console.
+  // lib/netplay.js owns the protocol — the room, the seating, the frame-numbered
+  // input exchange, the start barrier and the desync detector — and this file
+  // owns only the two things the engine cannot know: how to read this console's
+  // pads, and how to make this core run exactly one frame.
+  //
+  // WHY THIS NEEDED A CORE REBUILD, and what changed (see mymain.cpp's lockstep
+  // block for the full statement):
+  //   * `neil_send_mobile_controls` wrote neilbuttons[0] in all 21 of its
+  //     assignments, so ports 2-4 were UNREACHABLE from JS, not merely unwired.
+  //     `neil_ls_set_pad(port, mask, ax, ay)` addresses any of the four.
+  //   * That function was only CALLED under `mobileMode && !gamepadConnected`,
+  //     so on desktop there was no JS -> core input path at all.
+  //   * The core's frame was gated on TWO wall-clock conditions (IsFrameReady()
+  //     and the SDL audio-queue depth), so "frame N" meant a different amount of
+  //     emulated time on every machine. `neil_ls_run_frame()` lifts both for the
+  //     duration of one frame, so a lockstep frame is one VI field everywhere.
+  //
+  // ⚠ WHAT THIS CONSOLE DID *NOT* NEED, and it is worth saying because the two
+  // sibling pages do. Dreamcast and GameCube both have to tell the core how many
+  // controllers to present BEFORE the disc loads, because their devices are
+  // created at load time and neither build hotplugs. THIS CORE ALWAYS PRESENTS
+  // FOUR: `int pad_present[4] = { 1, 1, 1, 1 }` (src/libretro/libretronew.c:179),
+  // whose own comment says "all controllers need to be present from the
+  // beginning otherwise some games (F-zero) don't recognize the controllers".
+  // So there is no port-count handshake here and no room-grew-since-boot refusal
+  // — a four-player room and a solo boot present the identical device set, which
+  // is also why single player is completely untouched by any of this.
+  //
+  // ⚠ THE ORDERING THAT IS STILL LOAD-BEARING: ARM BEFORE THE CORE FREE-RUNS.
+  // main() starts emscripten_set_main_loop(mainLoop, 0, 0) whenever
+  // disableAudioSync is set, which this page forces true, and dist/script.js
+  // ALSO drives _runMainLoop from a ScriptProcessor in that same branch. A core
+  // that free-ran even one tick before the room's frame 0 is at a different
+  // guest position from its peers, and two peers at different positions are
+  // desynced before anybody has pressed anything. So lsArmBeforeBoot() runs
+  // inside myApp.beforeRun — which script.js calls BEFORE Module.callMain — and
+  // mainLoop() then returns immediately for the rest of the session. From that
+  // point neil_ls_run_frame() is the ONLY thing that advances this guest.
+  //
+  // ⚠ THE GUEST RUNS AT EXACTLY 1.000x, AND LOCKSTEP CAN ONLY SLOW IT
+  // (CLAUDE.md gate #9). This matters more here than on Dreamcast, because
+  // lifting the core's own IsFrameReady() gate for a lockstep frame removes the
+  // only thing that was pacing this core. So the feed below carries its own
+  // governor: frame N does not run until wall time has actually reached
+  // N / viHz, where viHz is read from the ROM HEADER (50 for PAL, 60 for NTSC)
+  // and never defaulted. A stall makes the guest run slower and is never repaid
+  // — there is no catch-up sprint, and adding one would manufacture speed out of
+  // a network hiccup. Running the room "as fast as inputs arrive" would be
+  // exactly the forbidden thing.
+  //
+  // ⚠ AND IT NEVER GUESSES. A missing input STALLS this machine. Predicting a
+  // pad would fork the simulations silently and permanently, and there is no
+  // rollback here to unfork them.
+  // ═══════════════════════════════════════════════════════════════════════════
+  var NET = { session: null, role: null, guest: false, leaving: false };
+  var LS = {
+    armed: false,       // the core has been put into lockstep mode
+    running: false,     // ...and the barrier released, so this page is feeding
+    frame: 0,           // frames this core has actually run under the gate
+    fed: 0,             // frames handed to the core (== frame; the core is synchronous)
+    hashes: 0,          // fingerprints handed to the engine
+    hashSink: null,     // null = untested, true = submitHash/endFrame took it
+    stalling: false, waitingOn: [], stallReason: null,
+    stalls: 0, stallMs: 0, stallSince: 0,
+    fault: null,        // why this machine is NOT frame-gated, in words
+    baseWall: 0, baseFrame: 0,   // the 1.000x governor's anchor
+    reanchors: 0,       // times debt was DISCARDED rather than sprinted through
+    viHz: 0,            // from the ROM header; 0 = unknown, and then we do not pace
+    lastFp: 0,
+  };
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // ONLINE CO-OP — THE HOST HALF, AND NOTHING ELSE.
+  function netSupported() { return !!(window.Netplay && Netplay.supported && Netplay.supported()); }
+  function netTransport() { return new URLSearchParams(location.search).get('net') === 'local' ? 'local' : 'peerjs'; }
+  function lsEngine() {
+    var s = NET.session; if (!s) return null;
+    try { return s.ls || null; } catch (e) { return null; }
+  }
+  // How many controllers this room seats. Read from the ROSTER, never from a 4
+  // written here: the console's port count is the engine's answer, and seats are
+  // handed out lowest-free-first so the occupied ports are 0..n-1.
+  function lsSeatedCount(ls) {
+    var n = 0;
+    try { for (var i = 0; i < ls.roster.length; i++) if (ls.roster[i] != null) n++; } catch (e) {}
+    return Math.max(1, Math.min(4, n));
+  }
+
+  // ---- this machine's OWN pad, in the room's wire format --------------------
+  // ⚠ THE WIRE FORMAT IS SHARED WITH n64_multiplayer.html — do not drift.
+  // 4 bytes per port:
+  //   byte 0   buttons  0..7   (0 UP 1 DOWN 2 LEFT 3 RIGHT 4 A 5 B 6 START 7 Z)
+  //   byte 1   buttons  8..13  (8 L 9 R 10 C-UP 11 C-DOWN 12 C-LEFT 13 C-RIGHT)
+  //   byte 2   stick X, signed  (+ = right)
+  //   byte 3   stick Y, signed  (+ = UP, the page's own stickVec convention;
+  //                              the core negates it, exactly as
+  //                              neil_send_mobile_controls does)
+  // The button order is neil_send_mobile_controls' 14-character control string
+  // order, so the page, the lobby and the core all agree by construction.
   //
-  // THE MODEL: ONE INSTANCE RUNS THE GAME. This page's emulator is the only
-  // emulator. It streams its picture and its sound over WebRTC and the remote
-  // player sends controller state back.
-  //
-  // ⚠ THE HONEST STATUS OF PLAYER 2 ON THIS CONSOLE, because it is neither a
-  // clean yes nor a clean no.
-  //
-  //   THE CORE IS FOUR-CONTROLLER AND ALWAYS WAS. `struct NeilButtons
-  //   neilbuttons[4]` (n64/N64Wasm/code/mymain.cpp:98); inputGetKeys_default
-  //   indexes EVERY field by port (…/plugin/emulate_game_controller_via_libretro.c
-  //   :324-325, :355-361, :665-673); all four report plugged in via
-  //   `int pad_present[4] = { 1, 1, 1, 1 }` (…/src/libretro/libretronew.c:179);
-  //   and the SDL loop already fills neilbuttons[i] for four pads with per-player
-  //   Y-invert for players 2-4 (mymain.cpp:1010-1082).
-  //
-  //   THE JAVASCRIPT BRIDGE IS NOT. `neil_send_mobile_controls` is the ONLY
-  //   exported function that writes a button, it takes no player argument, and
-  //   all 21 of its assignments are the literal index 0 (mymain.cpp:1868-1889).
-  //   Reaching port 2 through it would need a rebuilt .wasm.
-  //
-  // So there are two paths and the page installs BOTH, because which one is live
-  // depends on the host's own shell — and neither one is a guess about the other:
-  //
-  //   PATH A — the mobile-controls hook. mymain.cpp:1147 calls it ONLY under
-  //     `mobileMode && !sdlJoysticks[0].gamepadConnected`, so it is the phone and
-  //     tablet host's path. The remote buttons are merged into the string the
-  //     page was already sending, which is controller 1: a SHARED pad.
-  //   PATH B — present the remote player as a GAMEPAD. The SDL joystick loop at
-  //     mymain.cpp:1010 runs regardless of mobileMode, and connectGamepad packs
-  //     opened pads densely into sdlJoysticks[0..3] in enumeration order
-  //     (mymain.cpp:158-198). The synthetic pad is therefore APPENDED, never
-  //     prepended: with a real controller plugged into the host it lands on
-  //     sdlJoysticks[1] and IS PLAYER 2; with the host on keyboard only it is the
-  //     first pad and SHARES player 1. It is not installed on mobile, because a
-  //     connected pad 0 is exactly what switches PATH A off and would take the
-  //     host's own touch controls away.
-  //
-  // WHICH ONE ACTUALLY LANDED IS REPORTED, NOT ASSUMED: window.__n64Net().padPath
-  // says which hooks are installed, .gamepadServed counts the times the core
-  // really pulled the synthetic pad, and the core's own printf ("Connected
-  // Joystick …") lands in this page's log when SDL opens it.
-  //
-  // THE LOBBY IS NOT HERE. It is n64_multiplayer.html, because a guest needs no
-  // core and no ROM. The buttons above are links to that page, not a lobby.
-  // ═══════════════════════════════════════════════════════════════════════════
+  // ⚠ 8 BITS PER AXIS IS NOT A ROUNDING SHORTCUT. Almost nothing on this console
+  // walks on the d-pad — Mario, Banjo, Zelda and every kart are on the stick —
+  // so a digital-only pad would look connected and be unable to take a step.
+  var LS_PAD_BYTES = 4;
+  var LSN = { up: 0, down: 1, left: 2, right: 3, a: 4, b: 5, start: 6, z: 7,
+              l: 8, r: 9, cup: 10, cdown: 11, cleft: 12, cright: 13 };
+  // ⚠ DESKTOP KEYBOARD HAS TO BE READ *HERE* UNDER LOCKSTEP, AND IT WAS NOT
+  // BEFORE. Off lockstep the core reads the keyboard natively through SDL from
+  // the config.txt mappings and this page never sees it (see mobilePadState's
+  // comment). Under lockstep every local input must go ON THE WIRE before it
+  // reaches any core — including this player's own — so the page has to own it.
+  // These bindings are the page's own #keyLegend, unchanged, so muscle memory
+  // carries between offline and online play.
+  var LS_KEYMAP = {
+    up: ['arrowup'], down: ['arrowdown'], left: ['arrowleft'], right: ['arrowright'],
+    a: ['m'], b: ['n'], start: ['enter'], z: ['z'], l: ['q'], r: ['e'],
+    cup: ['i'], cdown: ['k'], cleft: ['j'], cright: ['l'],
+  };
+  var LS_ANALOG_KEYS = ['w', 'a', 's', 'd'];
+  // Standard-mapping gamepad index -> N64 button. NOT chosen here: these are the
+  // Joy_Mapping_* defaults the vendored core ships (dist/input_controller.js:358-364)
+  // which this page already writes into config.txt, so an online pad and an
+  // offline pad press the same N64 button. tools/control_map_drift_test.mjs
+  // fails on any divergence between this and n64_multiplayer.html's copy.
+  var LS_GP = ['a', null, 'b', null, 'z', 'r', 'l', null, null, 'start',
+               null, null, 'up', 'down', 'left', 'right'];
+  var lsHeld = new Set();
+  var lsKeysWired = false;
+  function lsNorm(e) { return String(e.key || '').toLowerCase(); }
+  function lsWireKeys() {
+    if (lsKeysWired) return;
+    lsKeysWired = true;
+    // Capture phase, and only ever ADDITIVE to lsHeld — this never calls
+    // preventDefault and never stops propagation, so nothing else on the page
+    // (the ROM picker, the menu, the code field) changes behaviour because
+    // online play happens to be armed.
+    window.addEventListener('keydown', function (e) { if (LS.armed) lsHeld.add(lsNorm(e)); }, true);
+    // Release is NEVER filtered. A key that went down before the gate armed must
+    // still come up, or it stays held on every machine in the room forever —
+    // a stuck button on somebody else's console.
+    window.addEventListener('keyup', function (e) { lsHeld.delete(lsNorm(e)); }, true);
+    window.addEventListener('blur', function () { lsHeld.clear(); });
+  }
+  // One local seat's pad. `k` is which of THIS machine's seats it is: the first
+  // gets keyboard + touch + gamepad 0 (what a splitter would do), each further
+  // seat gets the next local gamepad.
+  function lsPackLocal(k) {
+    var b = new Uint8Array(LS_PAD_BYTES);
+    var m = 0, name;
+    if (k === 0) {
+      for (name in LS_KEYMAP) {
+        if (LS_KEYMAP[name].some(function (kk) { return lsHeld.has(kk); })) m |= (1 << LSN[name]);
+      }
+      // The touch overlay writes mobilePadState; it is the same pad as the
+      // keyboard, merged, so a phone host and a desktop host behave the same.
+      var p = mobilePadState;
+      for (name in LSN) { if (p[name]) m |= (1 << LSN[name]); }
+    }
+    var ax = 0, ay = 0;
+    if (k === 0) { ax = stickVec.x; ay = stickVec.y; }
+    var pads = (navigator.getGamepads && navigator.getGamepads()) || [];
+    var seen = -1;
+    for (var gi = 0; gi < pads.length; gi++) {
+      var gp = pads[gi]; if (!gp) continue;
+      if (++seen !== k) continue;                 // this seat takes the k-th real pad
+      var btns = gp.buttons || [];
+      for (var i = 0; i < btns.length && i < LS_GP.length; i++) {
+        if (btns[i] && btns[i].pressed && LS_GP[i]) m |= (1 << LSN[LS_GP[i]]);
+      }
+      var a = gp.axes || [], dz = 0.15;
+      if (!ax && !ay && a.length >= 2) {
+        if (Math.abs(a[0]) > dz) ax = a[0];
+        if (Math.abs(a[1]) > dz) ay = -a[1];
+      }
+      if (a.length >= 4) {                        // right stick drives the C buttons
+        if (a[2] < -0.4) m |= (1 << LSN.cleft);
+        if (a[2] > 0.4)  m |= (1 << LSN.cright);
+        if (a[3] < -0.4) m |= (1 << LSN.cup);
+        if (a[3] > 0.4)  m |= (1 << LSN.cdown);
+      }
+      break;
+    }
+    if (k === 0 && !ax && !ay) {
+      ax = (lsHeld.has('d') ? 1 : 0) - (lsHeld.has('a') ? 1 : 0);
+      ay = (lsHeld.has('w') ? 1 : 0) - (lsHeld.has('s') ? 1 : 0);
+      if (ax && ay) { ax *= 0.7071; ay *= 0.7071; }   // the N64 stick reports a CIRCLE
+    }
+    var q = function (v) { return Math.max(-127, Math.min(127, Math.round(v * 127))) & 0xff; };
+    b[0] = m & 0xff;
+    b[1] = (m >> 8) & 0x3f;
+    b[2] = q(ax);
+    b[3] = q(ay);
+    return b;
+  }
+  // ⚠ THE KEYBOARD IS NOT PORT 0 ANY MORE. It is whichever port the ROOM gave
+  // this player: somebody told they are Player 3 has to drive Player 3's kart.
+  // The engine places these at port*padBytes in the image it builds, so the
+  // re-mapping happens in exactly one place.
+  function lsLocalPads() {
+    var ls = lsEngine();
+    var ports = (ls && ls.localPorts && ls.localPorts.length) ? ls.localPorts : [0];
+    var out = {};
+    ports.forEach(function (port, k) { out[port] = lsPackLocal(k); });
+    return out;
+  }
+
+  // ---- running exactly one agreed frame --------------------------------------
+  function lsApplyImage(img) {
+    var M = window.Module;
+    if (!M || !M._neil_ls_set_pad) return false;
+    var n = Math.floor(img.length / LS_PAD_BYTES);
+    for (var p = 0; p < n && p < 4; p++) {
+      var o = p * LS_PAD_BYTES;
+      var mask = img[o] | (img[o + 1] << 8);
+      // Signed bytes back out, then scaled into the core's own +/-32000 units —
+      // the same scale neil_send_mobile_controls uses, so the two input paths
+      // cannot disagree about deflection.
+      var sx = (img[o + 2] << 24) >> 24;
+      var sy = (img[o + 3] << 24) >> 24;
+      M._neil_ls_set_pad(p, mask, Math.round(sx / 127 * 32000), Math.round(sy / 127 * 32000));
+    }
+    return true;
+  }
+  // THE 1.000x GOVERNOR. See the gate #9 note in this block's header: lifting the
+  // core's own wall-clock frame gate for a lockstep frame removed the only thing
+  // pacing this guest, so the pacing lives here instead. viHz comes from the ROM
+  // header and is never defaulted — with an unreadable header this returns true
+  // and the room runs at whatever rate the feed achieves, which is stated in the
+  // report rather than hidden behind a guessed 60.
+  function lsDueNow() {
+    if (!(LS.viHz > 0)) return true;
+    var now = performance.now();
+    if (!LS.baseWall) { LS.baseWall = now; LS.baseFrame = LS.frame; return true; }
+    var period = 1000 / LS.viHz;
+    var due = LS.baseWall + ((LS.frame - LS.baseFrame) * period);
+    if (now < due) return false;
+    // ⚠ TIME LOST IS NEVER REPAID, AND THIS IS THE LINE THAT ENFORCES IT.
+    // Without it, a machine that fell behind (a stall, a slow frame, a
+    // backgrounded tab) would find `due` far in the past and this function
+    // would keep returning true, so the feed loop would run frame after frame
+    // back-to-back until it caught up — a CATCH-UP SPRINT, i.e. the guest
+    // running FASTER than 1.000x. That is precisely what CLAUDE.md gate #9
+    // forbids, and it is how a "120 fps" claim once got manufactured out of a
+    // 2x fast-forward. Debt older than a couple of frames is DISCARDED by
+    // re-anchoring: the guest resumes at exactly 1.000x from here, and the
+    // seconds lost stay lost — which is correct, because every machine in the
+    // room lost them.
+    if (now - due > period * 2) { LS.baseWall = now; LS.baseFrame = LS.frame; LS.reanchors++; }
+    return true;
+  }
+  function lsRunOneFrame(img) {
+    var M = window.Module;
+    if (!M || !M._neil_ls_run_frame) return false;
+    lsApplyImage(img);
+    M._neil_ls_run_frame();
+    LS.frame++;
+    try { LS.lastFp = M._neil_last_fp ? (M._neil_last_fp() >>> 0) : 0; } catch (e) { LS.lastFp = 0; }
+    return true;
+  }
+
+  function lsFeed() {
+    var ls = lsEngine();
+    if (!LS.armed || !ls) return;
+    // The BARRIER decides when frame 0 runs, not this page. Until the engine
+    // says running/stalled nothing is fed and this core sits at frame 0 — which
+    // is precisely what "everyone starts together" means.
+    if (ls.state !== 'running' && ls.state !== 'stalled') {
+      if (LS.running) { LS.running = false; pageLog('[lockstep] frame gate DISENGAGED — engine state ' + ls.state); }
+      return;
+    }
+    if (!LS.running) {
+      LS.running = true;
+      LS.baseWall = 0;                    // anchor the governor at the real start
+      LS.hashSink = (typeof ls.endFrame === 'function');
+      pageLog('[lockstep] FRAME GATE ENGAGED at frame ' + ls.frame + ' — this core advances only when every '
+            + 'seated port has an input for the frame. delay=' + ls.delay + ' frames, ports='
+            + JSON.stringify(ls.roster) + ', mine=' + JSON.stringify(ls.localPorts)
+            + ', pacing to ' + (LS.viHz > 0 ? LS.viHz + ' Hz from the ROM header' : 'UNPACED (ROM header unreadable)'));
+    }
+    // ⚠ BOUNDED, AND THE BOUND IS THE GOVERNOR. The engine can never cover more
+    // than `delay` frames ahead anyway, but the real limiter here is lsDueNow():
+    // this loop stops the moment the guest would get ahead of wall time, which
+    // is what keeps the guest at 1.000x rather than sprinting through a backlog.
+    var guard = 0;
+    while (lsDueNow()) {
+      var r = ls.beginFrame(lsLocalPads());
+      if (!r || !r.ready) {
+        if (!LS.stalling && r && r.reason === 'stall') { LS.stalls++; LS.stallSince = performance.now(); }
+        LS.stalling = !!(r && r.reason === 'stall');
+        LS.stallReason = r ? r.reason : 'the engine returned nothing';
+        LS.waitingOn = (r && r.waitingOn) ? r.waitingOn.slice() : [];
+        // A stall must not be repaid. Re-anchoring the governor here is what
+        // stops the core sprinting to "catch up" when the input finally lands —
+        // time lost to a stall stays lost, which is correct: everybody lost it.
+        LS.baseWall = 0;
+        break;
+      }
+      if (LS.stalling) {
+        LS.stallMs += performance.now() - LS.stallSince;
+        LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
+      }
+      if (!lsRunOneFrame(r.image)) {
+        LS.fault = 'this build of the core has no _neil_ls_run_frame — rebuild n64/N64Wasm/code';
+        pageLog('[lockstep] ⚠ ' + LS.fault);
+        break;
+      }
+      LS.fed++;
+      // ⚠ THE CORE IS IN THIS PAGE AND IS SYNCHRONOUS, so unlike dreamcast.html
+      // the fingerprint for the frame just run is available RIGHT NOW and goes
+      // straight into endFrame(). That is the shape lib/netplay.js's endFrame
+      // was written for; the submitHash() late-delivery path exists for cores in
+      // a worker and is not needed here.
+      //
+      // Frame-gated cores with NOTHING comparing them is worse than not gating
+      // at all, because it looks right — so the hash is fed on every frame the
+      // engine wants one for, and LS.hashSink records whether it was taken.
+      var wantHash = (typeof ls.wantsHash === 'function') ? ls.wantsHash() : true;
+      if (wantHash && LS.lastFp) { ls.endFrame(LS.lastFp, [LS.lastFp]); LS.hashes++; }
+      else ls.endFrame(null);
+      if (++guard > 240) { pageLog('[lockstep] ⚠ feed loop hit its 240-frame bound — not sprinting the guest'); break; }
+    }
+  }
+
+  // ---- arming, and the ONE place the order matters --------------------------
+  // Called from myApp.beforeRun, which dist/script.js:233 runs BEFORE
+  // Module.callMain — so this core is put into lockstep mode before main() has
+  // armed emscripten_set_main_loop and before a single frame could run.
+  // ⚠ SOLO IS NOT TOUCHED: with no room this returns immediately and the core
+  // boots exactly as it always did.
+  function lsArmBeforeBoot() {
+    if (!NET.session || LS.armed) return false;
+    var ls = lsEngine();
+    if (!ls) {
+      LS.fault = 'the room published no lockstep engine, so this core cannot be frame-gated';
+      pageLog('[lockstep] ⚠ ' + LS.fault);
+      return false;
+    }
+    var M = window.Module;
+    if (!M || !M._neil_ls_arm) {
+      LS.fault = 'this build of the core does not export _neil_ls_arm — it predates lockstep. '
+               + 'Rebuild n64/N64Wasm/code (make) so online play is deterministic instead of '
+               + 'silently running free.';
+      pageLog('[lockstep] ⚠ REFUSING TO GATE — ' + LS.fault);
+      return false;
+    }
+    M._neil_ls_arm(1);
+    // Fingerprint every frame from here. This is the ONLY thing comparing the
+    // two simulations; without it the cores would be gated and silently
+    // diverging, which looks correct and is the failure the whole engine exists
+    // to catch.
+    try { if (M._neil_fp_always) M._neil_fp_always(1); } catch (e) {}
+    LS.armed = true; LS.running = false; LS.frame = 0; LS.fed = 0; LS.hashes = 0;
+    LS.baseWall = 0; LS.baseFrame = 0; LS.fault = null;
+    lsWireKeys();
+    pageLog('[lockstep] ARMED before the core ever ran a frame — mainLoop() is now inert and '
+          + 'neil_ls_run_frame() is the only thing that advances this guest, so this core\'s '
+          + 'frame 0 IS the room\'s frame 0');
+    return true;
+  }
+  // ⚠ A GATED CORE WHOSE ROOM IS GONE IS A FROZEN CONSOLE. If the session ends
+  // while the gate is armed, nothing ever feeds it again and the player is left
+  // staring at a still picture with no room and no explanation. Leaving hands
+  // the console back: the core's own loop resumes and the game carries on
+  // single-player from exactly the frame it was holding.
+  function lsDisarm(why) {
+    if (!LS.armed) return;
+    LS.armed = false; LS.running = false;
+    LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
+    try { if (window.Module && Module._neil_ls_arm) Module._neil_ls_arm(0); } catch (e) {}
+    pageLog('[lockstep] frame gate RELEASED — ' + why + '. This console free-runs from here and is '
+          + 'no longer sharing frames with anybody.');
+  }
+
+  // ---- the room -------------------------------------------------------------
   (function wireNetplay() {
-    if (!window.NetplayHost || !NetplayHost.supported()) return;
-    var go = function () {
-      var sel = isMobile ? $('mobileRomSelect') : $('romSelect');
-      var pick = ROMS[+(sel && sel.value) || 0] || ROMS[0];
-      location.href = NetplayHost.lobbyUrl('/n64_multiplayer.html', pick.label);
+    if (!netSupported()) return;
+    // The ROM's region decides the pace, and it is read from the header by the
+    // same code the offline governor uses — no default, ever (?ratetest P12).
+    var syncViHz = function () {
+      try { LS.viHz = (pacer && pacer.viHz > 0) ? pacer.viHz : 0; } catch (e) { LS.viHz = 0; }
     };
+
+    // ⚠ THIS PAGE HAS NO #netMsg — the room UI lived on the lobby page, and under
+    // lockstep the player is HERE, in front of the emulator, for the whole
+    // session. So room state goes to this page's own status line and log, which
+    // is what the player is already looking at.
+    var netStatus = function (msg, kind) {
+      try { setStatus(msg); } catch (e) {}
+      pageLog('[net] ' + msg);
+    };
+
+    // Arm inside beforeRun — the one hook where Module exists and callMain has
+    // not run. Wrapping rather than replacing, so the vendored controller's own
+    // beforeRun keeps doing whatever it does.
+    var hookBeforeRun = function () {
+      var app = window.myApp;
+      if (!app || app.__lsBeforeRunHooked) return;
+      app.__lsBeforeRunHooked = true;
+      var prev = app.beforeRun ? app.beforeRun.bind(app) : function () {};
+      app.beforeRun = function () {
+        prev();
+        syncViHz();
+        try { lsArmBeforeBoot(); } catch (e) { pageLog('[lockstep] arm threw: ' + ((e && e.message) || e)); }
+      };
+    };
+    var hookIv = setInterval(hookBeforeRun, 100);
+    hookBeforeRun();
+
+    // ⚠ SAVE MEMORY IS A DETERMINISM LEAK AND IT IS CLOSED HERE, LOUDLY.
+    // dist/script.js's LoadSram() reads this browser's IndexedDB and writes it
+    // into the core's /game.savememory BEFORE callMain, so two peers with
+    // different save files boot into DIFFERENT guest state and diverge on frame
+    // 1 through no fault of the network. (n64/docs/jit/TASKS.md:51-52 records
+    // exactly this being hit and fixed for the harness by using a fresh browser
+    // context per run.) A room therefore boots with EMPTY save memory on every
+    // machine. That is a real, stated cost — an online session does not see your
+    // saved game — and it is the only option that is correct; the alternative is
+    // a silent desync a few seconds in.
+    var neuterSram = function () {
+      var app = window.myApp;
+      if (!app || app.__lsSramNeutered || !NET.session) return;
+      app.__lsSramNeutered = true;
+      var prev = app.LoadSram ? app.LoadSram.bind(app) : null;
+      app.LoadSram = async function () {
+        if (!NET.session) return prev ? prev() : undefined;
+        pageLog('[lockstep] saved game NOT loaded — every machine in a room must boot from the '
+              + 'same guest state, and this browser\'s save memory is its own. Your saves are '
+              + 'untouched on disk; they simply are not used online.');
+        return undefined;
+      };
+    };
+
+    var watchLockstep = function (sess) {
+      var ls = sess && sess.ls;
+      if (!ls || ls.__n64FeedKick) return;
+      ls.__n64FeedKick = true;
+      // ⚠ KICK THE FEED WHEN AN INPUT ACTUALLY LANDS. Otherwise lsFeed() runs
+      // only on rAF, so a machine stalled on a peer sits idle until the next
+      // animation frame even though the byte it was waiting for has already
+      // arrived — a whole frame of dead time given away per frame. This wraps
+      // the engine's own public receive() rather than reaching into it: the
+      // input is delivered exactly as before and the only addition is that the
+      // page tries to build the next frame immediately afterwards.
+      if (typeof ls.receive === 'function') {
+        var deliver = ls.receive.bind(ls);
+        ls.receive = function (m) {
+          var r = deliver(m);
+          if (m && m.t === 'ls' && LS.armed) { try { lsFeed(); } catch (e) {} }
+          return r;
+        };
+      }
+      try {
+        ls.on('desync', function (d) {
+          pageLog('[lockstep] ⚠ DESYNC at frame ' + (d && d.frame) + ' — the simulations no longer '
+                + 'agree. Last frame everyone agreed on: ' + (d && d.lastAgreedFrame));
+          netStatus('The games have gone out of sync — this room is over.', 'bad');
+        });
+      } catch (e) {}
+    };
+
+    var onStatus = function (e) {
+      if (e.state === 'connected') netStatus('Connected. Press Ready when everyone is in.', 'ok');
+      else if (e.state === 'closed' || e.state === 'failed') {
+        lsDisarm(NET.leaving ? 'you left the room' : 'the room closed');
+      }
+      pageLog('[net] ' + (NET.role || 'session') + ' ' + e.state + (e.detail ? ' (' + e.detail + ')' : ''));
+    };
+
+    // ⚠ NO START LOCK FOR A JOINER, and that single line is what used to make
+    // this page two-machines-one-emulator. Under streaming a guest had no
+    // emulator and must not launch one; under lockstep a joiner runs their OWN
+    // console and MUST start it.
+    var startSession = async function (asHost, code, game) {
+      if (NET.session) return;
+      NET.role = asHost ? 'host' : 'guest';
+      NET.guest = !asHost;
+      var s = new Netplay.Session({
+        game: game, host: asHost, code: code, transport: netTransport(),
+        // THE CONSOLE'S port count, handed to the engine rather than assumed by
+        // it: four SI channels, all of them permanently plugged
+        // (libretronew.c:179). padBytes is this page's own 4-byte pad above.
+        portCount: 4, padBytes: LS_PAD_BYTES,
+      });
+      NET.session = s;
+      // ⚠ BUILD THE ENGINE NOW, EXPLICITLY, AND DO NOT WAIT FOR _ensureLockstep.
+      // lib/netplay.js creates `session.ls` lazily — only when a peer is SEATED,
+      // i.e. when a game channel opens — and it builds it with `portCount` alone
+      // (netplay.js:2261), so a lazily-created engine would ALSO silently lose
+      // this console's padBytes and fall back to the 64-byte default, making
+      // every pad image the wrong size.
+      // MEASURED before this line existed: both sides connected and reached
+      // `[lockstep] ⚠ the room published no lockstep engine, so this core cannot
+      // be frame-gated`, because beforeRun fires while the peer is still
+      // connecting. Calling startLockstep here is explicitly supported ("A page
+      // that does call it still wins: this only ever fills in a missing engine",
+      // netplay.js:2257-2260) and it makes the engine exist from the moment the
+      // room does, which is before any core boots.
+      try {
+        if (typeof s.startLockstep === 'function') s.startLockstep({ portCount: 4, padBytes: LS_PAD_BYTES });
+      } catch (e) { pageLog('[lockstep] startLockstep threw: ' + ((e && e.message) || e)); }
+      s.on('status', onStatus);
+      try { s.on('lockstep', function () { watchLockstep(s); }); } catch (e) {}
+      watchLockstep(s);
+      neuterSram();
+      pageLog('[net] ' + (asHost ? 'room ' + code + ' open' : 'joining room ' + code)
+            + ' (' + game + ') via ' + netTransport());
+      // ⚠ DO NOT AWAIT start() BEFORE BOOTING. For a HOST, start() does not
+      // resolve until somebody actually asks to join — it sits in "waiting for
+      // someone to ask to join" — so awaiting it here meant the host's core
+      // never booted at all while the joiner's booted and sat at the barrier.
+      // MEASURED exactly that: the joiner reached `[lockstep] ARMED` and
+      // `Ready`, and the host produced no lockstep line whatsoever.
+      // The room forming and the core booting are INDEPENDENT, and running them
+      // in parallel is also the thing that lets everybody pay the ROM download
+      // at the same time instead of one at a time. The start BARRIER is what
+      // synchronises frame 0 — not the order of these two operations.
+      s.start().catch(function (err) {
+        netStatus('Could not open the room: ' + ((err && err.message) || err), 'bad');
+      });
+      watchLockstep(s);
+    };
+
+    // ---- ?np=<code>&game=<label>: HANDED OVER FROM n64_multiplayer.html -----
+    // Both sides come through here now, not just the host: under lockstep a
+    // joiner needs the emulator too, so the lobby sends everybody to this page.
+    // &join=1 marks the joiner.
+    var qs = new URLSearchParams(location.search);
+    var np = (qs.get('np') || '').toUpperCase();
+    var npGame = qs.get('game') || '';
+    var isJoin = qs.get('join') === '1';
     ['btnNet', 'mobileSplashNet'].forEach(function (id) {
       var b = $(id); if (!b) return;
       b.hidden = false;
-      b.addEventListener('click', go);
+      b.addEventListener('click', function () {
+        var sel = isMobile ? $('mobileRomSelect') : $('romSelect');
+        var pick = ROMS[+(sel && sel.value) || 0] || ROMS[0];
+        location.href = '/n64_multiplayer.html?game=' + encodeURIComponent(pick.label);
+      });
     });
 
-    // ⚠ WIRE FORMAT SHARED WITH n64_multiplayer.html — do not drift.
-    //   bits  0..13  buttons, in the EXACT order neil_send_mobile_controls reads
-    //                its 14-character string (mymain.cpp:1868-1881)
-    //   bits 16..23  stick X, signed byte      bits 24..31  stick Y, signed byte
-    var NB = ['up', 'down', 'left', 'right', 'a', 'b', 'start', 'z',
-              'l', 'r', 'cup', 'cdown', 'cleft', 'cright'];
-    function netRemote() {
-      var rm = NetplayHost.remoteMask();
-      if (rm === null) return null;
-      // >> is arithmetic in JS, so these two shifts sign-extend the axis bytes.
-      return { bits: rm & 0x3fff, x: ((rm << 8) >> 24) / 127, y: (rm >> 24) / 127 };
-    }
-
-    // ---- PATH A ------------------------------------------------------------
-    var netSent = null, sendHooked = false;
-    function hookSend() {
-      var app = window.myApp;
-      if (sendHooked || !app || typeof app.sendMobileControls !== 'function') return false;
-      sendHooked = true;
-      var orig = app.sendMobileControls.bind(app);
-      app.sendMobileControls = function (str, x, y) {
-        var r = netRemote();
-        if (r) {
-          var out = '';
-          for (var i = 0; i < 14; i++) out += ((str.charAt(i) === '1') || (r.bits & (1 << i))) ? '1' : '0';
-          str = out;
-          // The two sticks are never summed — whichever is pushed further wins,
-          // because two sources at full deflection would still be one stick.
-          if (Math.abs(r.x) > Math.abs(+x || 0)) x = String(r.x);
-          if (Math.abs(r.y) > Math.abs(+y || 0)) y = String(r.y);
-        }
-        // The literal arguments the core was handed, kept so the netplay test can
-        // assert on THOSE rather than on a session flag or a UI state.
-        netSent = { controls: str, x: x, y: y };
-        NetplayHost.report(netSent, r ? { bits: r.bits, x: r.x, y: r.y } : null);
-        return orig(str, x, y);
-      };
-      return true;
-    }
-
-    // ---- PATH B ------------------------------------------------------------
-    var NET_PAD_ID = 'Bemental Netplay Remote Player (Vendor: 0000 Product: 0002)';
-    var gpServed = 0, gpInstalled = false, gpAnnounced = false, gpLast = null;
-    // Standard-mapping index -> N64 button, matching n64_multiplayer.html's GP.
-    var GP_MAP = ['a', 'b', 'b', 'a', 'l', 'r', 'z', 'z', null, 'start',
-                  null, null, 'up', 'down', 'left', 'right'];
-    function makePad(index, r) {
-      var btns = [];
-      for (var i = 0; i < 16; i++) {
-        var name = GP_MAP[i];
-        var down = !!(name && (r.bits & (1 << NB.indexOf(name))));
-        btns.push({ pressed: down, touched: down, value: down ? 1 : 0 });
+    if (/^[A-HJ-NP-Z2-9]{5}$/.test(np)) {
+      // Recorded so the room panel below can show the code without re-parsing
+      // the URL, and so its very presence is the test for "is this a room".
+      NET.pendingCode = np;
+      // The game is named by its LABEL, never by its index into ROMS[].
+      // CLAUDE.md records an index going stale exactly this way.
+      var idx = -1, gi;
+      for (gi = 0; gi < ROMS.length; gi++) {
+        if (ROMS[gi].label === npGame || ROMS[gi].file === npGame) idx = gi;
       }
-      // axes[1] is screen-down-positive in the Gamepad API; the wire's Y is
-      // up-positive, so it is negated exactly once, here.
-      return { id: NET_PAD_ID, index: index, connected: true, mapping: 'standard',
-               timestamp: performance.now(), axes: [r.x, -r.y, 0, 0], buttons: btns };
-    }
-    function installSyntheticPad() {
-      if (gpInstalled || isMobile) return;
-      gpInstalled = true;
-      var real = navigator.getGamepads ? navigator.getGamepads.bind(navigator) : function () { return []; };
-      navigator.getGamepads = function () {
-        var list = Array.prototype.slice.call(real() || []);
-        var r = netRemote();
-        if (!r) return list;
-        // ⚠ THE SLOT IS THE FIRST EMPTY ONE, NOT THE END OF THE ARRAY.
-        // navigator.getGamepads() returns a FIXED-LENGTH array padded with nulls
-        // — four of them in Chrome with nothing plugged in — so appending put the
-        // pad at index 4 while the 'gamepadconnected' event announced index 0.
-        // SDL then asked emscripten_get_gamepad_status(0), read a null slot, and
-        // saw a device with no buttons. MEASURED 2026-09-08: with the pad
-        // appended, the core opened it (its mobile-controls callback rate went
-        // 152/3s -> 0) and yet joy button 11 did not toggle the core's own
-        // overlay menu, while the keyboard's '`' did — a device that exists and
-        // reads as all-released, which looks exactly like a dead remote player.
-        // Taking the first empty slot ALSO keeps the intended ordering: a real
-        // controller occupies slot 0, so the remote player lands on slot 1 and is
-        // player 2.
-        var slot = list.indexOf(null);
-        if (slot < 0) slot = list.length;
-        var pad = makePad(slot, r);
-        list[slot] = pad;
-        gpServed++;
-        // What the CORE actually pulled, flattened so a test can assert on it.
-        // Not "what we intended to send" — this is read at the moment emscripten
-        // samples the Gamepad API on the core's behalf.
-        gpLast = { index: pad.index, axes: pad.axes.slice(0, 2),
-                   buttons: pad.buttons.reduce(function (acc, b, i) { return acc | (b.pressed ? (1 << i) : 0); }, 0) };
-        // SDL's emscripten joystick backend adds a device on the
-        // 'gamepadconnected' EVENT, not by noticing the array grew, so the
-        // arrival has to be announced once.
-        if (!gpAnnounced) {
-          gpAnnounced = true;
-          try {
-            var ev = new Event('gamepadconnected');
-            Object.defineProperty(ev, 'gamepad', { value: pad });
-            window.dispatchEvent(ev);
-          } catch (e) { pageLog('[net] could not announce the remote pad: ' + (e.message || e)); }
-        }
-        return list;
-      };
-    }
-
-    var hookIv = setInterval(function () { hookSend(); }, 250);
-    hookSend();
-
-    NetplayHost.arm({
-      seam: '__n64Net',
-      // Deliberately not 'p2': on this console the answer depends on the host's
-      // own hardware, and claiming a number the page cannot know is the failure
-      // this whole exercise exists to avoid.
-      players: 'p2-if-host-has-a-pad',
-      log: function (m) { pageLog(m); },
-      canvas: function () { return $('canvas'); },
-      // A real, persistent node this page owns and mutes through, so netplay does
-      // not need the interposer in lib/netplay-host.js here.
-      audioNode: function () { return (window.myApp && myApp.gainNode) || null; },
-      // "Is there a game to stream?" answered by FRAMES THE EMULATOR MADE.
-      // ⚠ NOT `shown`. MEASURED 2026-09-08: two seconds into a Mario Kart 64 boot
-      // __n64Rate read `made: 0, shown: 24` — `shown` is the PRESENTATION counter
-      // and it ticks while the GL canvas is still empty. Arming on it captured a
-      // canvas with nothing in it yet, and the capture probe then chose a
-      // fallback for the whole session on the strength of one early miss.
-      live: function () { return (window.__n64Rate || {}).made > 0; },
-      coreUp: function () {
-        return !!(window.myApp && myApp.rivetsData && myApp.rivetsData.beforeEmulatorStarted === false);
-      },
-      // The game is named by its LABEL, never by its index into ROMS. CLAUDE.md
-      // records an index going stale exactly this way. (?game= is ALSO read by
-      // applyUrlParams above, which matches on the ROM's FILE name — the two do
-      // not collide, and this runs after it so a label wins.)
-      selectGame: function (label) {
-        for (var i = 0; i < ROMS.length; i++) {
-          if (ROMS[i].label !== label && ROMS[i].file !== label) continue;
-          ['romSelect', 'mobileRomSelect'].forEach(function (id) {
-            var sel = $(id); if (!sel) return;
-            sel.value = String(i);
-            sel.dispatchEvent(new Event('change'));
-          });
-          return ROMS[i].label;
-        }
-        return null;
-      },
-      // ⚠ NEVER override a Start the capability layer is holding down — this page
-      // already has splashStartIsHeld for exactly that reason. lib/capability.js
-      // decides AFTER this script runs, so this waits for Capability.ready rather
-      // than reading a decision that has not been made yet.
-      pressStart: function () {
-        var tries = 0;
-        var attempt = function () {
+      if (idx >= 0) {
+        ['romSelect', 'mobileRomSelect'].forEach(function (id) {
+          var sel = $(id); if (!sel) return;
+          sel.value = String(idx);
+          sel.dispatchEvent(new Event('change'));
+        });
+      }
+      var gameName = idx >= 0 ? ROMS[idx].label : npGame;
+      pageLog('[net] handed a session by the lobby: ' + (isJoin ? 'joining' : 'hosting')
+            + ' ' + gameName + ' as ' + np);
+      // ⚠ THE ROOM IS OPENED BEFORE THE CORE BOOTS, which is the whole ordering
+      // this architecture rests on: the seats have to be known before anything
+      // loads, and every machine has to reach frame 0 together rather than
+      // whenever its own download happened to finish.
+      startSession(!isJoin, np, gameName).then(function () {
+        // NEVER override a Start the capability layer is holding down — that
+        // button being disabled is the page saying this device cannot run the
+        // emulator at all.
+        var press = function () {
           var b = $('btnStart');
           if (b && (b.disabled || b.getAttribute('aria-disabled') === 'true')) return false;
           if (isMobile) { var sp = $('mobileSplash'); if (sp) sp.style.display = 'none'; }
@@ -3158,37 +3583,176 @@ N64Rate.selfTest = function (logFn) {
           return true;
         };
         var run = function () {
-          if (attempt()) return;
-          var t = setInterval(function () { if (attempt() || ++tries > 480) clearInterval(t); }, 250);
+          if (press()) return;
+          var tries = 0;
+          var t = setInterval(function () { if (press() || ++tries > 480) clearInterval(t); }, 250);
         };
         if (window.Capability && Capability.ready && Capability.ready.then) Capability.ready.then(run, run);
         else run();
-      },
-      onStatus: function (e) {
-        if (e.state !== 'connected') return;
-        hookSend();
-        installSyntheticPad();
-        setStatus(isMobile ? 'A remote player joined — you share controller 1.'
-                           : 'A remote player joined as an extra controller.');
-      },
+      }, function (err) {
+        netStatus('Could not open the room: ' + ((err && err.message) || err), 'bad');
+      });
+    }
+
+    // ---- THE START BARRIER, AND THE ROOM PANEL -----------------------------
+    // "My core is booted and holding at frame 0, on this ROM." Nobody advances
+    // frame 0 until EVERY seated peer has said this. It is what makes "all cores
+    // start together" true rather than hoped for: without it each machine would
+    // begin the moment its own download finished, and two machines that started
+    // at different times are at different guest positions — a desync before
+    // anybody has pressed anything.
+    //
+    // ⚠ A HUMAN PRESSES READY, AND THAT IS NOT LAZINESS. See the panel's comment
+    // in the markup: an auto-ready-on-boot cut MEASURED the failure it invites —
+    // the machine that booted first passed the barrier ALONE with an empty
+    // roster, and the engine then refuses everyone else as a late joiner. Only a
+    // person knows the party is complete.
+    var readyDeclared = false;
+    var roomEl = $('lsRoom');
+    if (roomEl && NET.pendingCode) {
+      roomEl.hidden = false;
+      var ce = $('lsCode'); if (ce) ce.textContent = NET.pendingCode;
+    }
+    var setMsg = function (t, cls) {
+      var m = $('lsMsg'); if (!m) return;
+      m.textContent = t; m.className = 'lsMsg' + (cls ? ' ' + cls : '');
+    };
+    // The panel is rendered from the ENGINE's own report, never from a count
+    // this file keeps: a seat list that disagrees with the engine is worse than
+    // no seat list, because a player has to know they are Player 3 BEFORE the
+    // game starts — that is which character they get.
+    var renderRoom = function () {
+      var ls = lsEngine();
+      var seats = $('lsSeats');
+      if (!seats) return;
+      var rep = null;
+      try { rep = ls && typeof ls.report === 'function' ? ls.report() : null; } catch (e) {}
+      var ports = (rep && rep.ports) || [];
+      if (!ports.length) { seats.innerHTML = '<div class="seat empty"><span>Connecting…</span></div>'; return; }
+      seats.innerHTML = ports.map(function (p) {
+        var who = p.peer ? (p.local ? 'You' : 'Player ' + (p.port + 1)) : 'Empty';
+        var cls = 'seat' + (p.local ? ' me' : '') + (p.peer ? '' : ' empty');
+        return '<div class="' + cls + '"><span>P' + (p.port + 1) + ' · ' + who + '</span>'
+             + '<span class="st">' + (p.peer ? (p.local && readyDeclared ? 'ready' : 'in') : '—') + '</span></div>';
+      }).join('');
+      if (LS.running) {
+        setMsg(LS.stalling
+          ? ('Waiting for ' + (LS.waitingOn.length ? 'player ' + LS.waitingOn.map(function (x) { return x + 1; }).join(', ') : 'a player') + '…')
+          : ('Playing together — frame ' + LS.frame + '.'), LS.stalling ? '' : 'ok');
+      } else if (readyDeclared) {
+        setMsg('Ready — waiting for the other players to finish loading.');
+      } else {
+        var n = ports.filter(function (p) { return p.peer; }).length;
+        setMsg(n > 1
+          ? (n + ' players in the room. Press Ready when everybody is here.')
+          : 'Share the code. Press Ready once everybody has joined.');
+      }
+    };
+    setInterval(renderRoom, 400);
+
+    var rdy = $('netReady');
+    if (rdy) rdy.addEventListener('click', function () {
+      var sess = NET.session;
+      if (!sess || readyDeclared) return;
+      readyDeclared = true;
+      rdy.disabled = true;
+      chooseDelayThenReady(sess);
     });
 
-    // A SIBLING of window.__n64Rate / __n64Pace, not an extension of either —
-    // both already have consumers whose shape must not move.
-    window.__n64NetPad = function () {
-      return {
-        sendHooked: sendHooked,
-        gamepadInstalled: gpInstalled,
-        gamepadAnnounced: gpAnnounced,
-        gamepadServed: gpServed,      // times the CORE actually pulled the pad
-        gamepadLast: gpLast,          // the literal pad state the core last pulled
-        padPath: (gpInstalled ? 'gamepad' : '') + (sendHooked ? (gpInstalled ? '+' : '') + 'mobile-controls' : ''),
-        sent: netSent,                // literal args last handed to the core
-        mask: NetplayHost.remoteMask(),
-      };
+    async function chooseDelayThenReady(sess) {
+      if (!sess) return;
+      // Choose the input delay from the MEASURED RTT, host-authoritative, before
+      // the barrier releases. The delay must be identical everywhere — two
+      // machines holding inputs for different numbers of frames desync by
+      // construction — so only the host sets it and 'lsgo' pushes it to everyone.
+      try {
+        var ls = sess.ls;
+        if (ls && ls.isHost && typeof sess.rttReport === 'function') {
+          var rep = await sess.rttReport(600);
+          var want = (rep && rep.recommendedDelay != null)
+            ? Math.max(1, Math.min(10, rep.recommendedDelay | 0)) : null;
+          if (want != null && want !== ls.delay) {
+            pageLog('[lockstep] input delay ' + ls.delay + ' -> ' + want + ' frames, chosen from the '
+                  + 'worst measured RTT ' + (rep.worstMs == null ? '?' : Math.round(rep.worstMs)) + ' ms');
+            ls.delay = want;
+          }
+        }
+      } catch (e) { pageLog('[lockstep] delay choice failed, keeping the default: ' + ((e && e.message) || e)); }
+      try {
+        if (typeof sess.setReady === 'function') sess.setReady(true);
+        else pageLog('[net] this build has no start barrier yet (session.setReady is missing)');
+      } catch (e) { pageLog('[net] setReady threw: ' + ((e && e.message) || e)); }
+      netStatus('Ready — waiting for the other players to finish loading.', 'busy');
+    }
+
+    var leave = $('netLeave');
+    if (leave) leave.addEventListener('click', function () {
+      var s = NET.session;
+      NET.leaving = true;
+      if (s) { try { s.close(); } catch (e) {} }
+      NET.session = null; NET.role = null; NET.guest = false;
+      lsDisarm('you left the room');
+      netStatus('Left the room.');
+      setTimeout(function () { NET.leaving = false; }, 2000);
+    });
+
+    // THE FEED ALSO RUNS ON rAF, so a room whose peers are all quiet still
+    // advances: beginFrame schedules and SENDS this machine's own input even on
+    // an attempt that then stalls, which is what stops a stalled machine
+    // starving its peers and deadlocking the whole room.
+    var tick = function () {
+      if (LS.armed) { try { lsFeed(); } catch (e) {} }
+      requestAnimationFrame(tick);
     };
+    requestAnimationFrame(tick);
     void hookIv;
+
+    pageLog('[net] online play available (' + netTransport() + ' signalling) — deterministic lockstep, '
+          + 'every machine runs the game');
   })();
+
+  // Test seam. A SIBLING of window.__n64Rate / __n64Pace, not an extension of
+  // either — both already have consumers whose shape must not move.
+  // ⚠ EVERY FIELD HERE IS THE RESULT OF DOING THE THING, never of reading an
+  // intention: `frame` is frames the CORE ran under the gate, `hashes` is
+  // fingerprints the ENGINE accepted, and `armed` is false unless the core
+  // actually took _neil_ls_arm.
+  window.__n64Net = function () {
+    var ls = lsEngine();
+    var rep = null;
+    try { rep = ls && typeof ls.report === 'function' ? ls.report() : null; } catch (e) {}
+    return {
+      supported: netSupported(),
+      transport: netTransport(),
+      architecture: 'lockstep',        // there is no other one on this page
+      role: NET.role,
+      state: NET.session ? NET.session.state : null,
+      code: NET.session ? NET.session.code : null,
+      armed: LS.armed,
+      running: LS.running,
+      coreArmed: (function () {
+        try { return !!(window.Module && Module._neil_ls_armed && Module._neil_ls_armed()); }
+        catch (e) { return null; }
+      })(),
+      frame: LS.frame,
+      fed: LS.fed,
+      hashes: LS.hashes,
+      hashSink: LS.hashSink,
+      lastFp: LS.lastFp,
+      viHz: LS.viHz,
+      stalling: LS.stalling,
+      waitingOn: LS.waitingOn.slice(),
+      stalls: LS.stalls,
+      stallMs: Math.round(LS.stallMs),
+      reanchors: LS.reanchors,
+      fault: LS.fault,
+      engine: rep,
+      viTotal: (function () {
+        try { return window.Module && Module._neil_vi_total ? Module._neil_vi_total() : null; }
+        catch (e) { return null; }
+      })(),
+    };
+  };
 
   // The capability facts go into the log on EVERY load, so they are in the tail as well as
   // pinned, and so a run that never gets far enough to fail still carries them.

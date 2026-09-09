@@ -208,7 +208,9 @@ n64wasm.js: $(FILES)
     '_neil_export_eep','_neil_export_sra','_neil_export_fla','_neil_reset','_toggleFPS', '_neil_send_mobile_controls', \
     '_neil_set_buffer_remaining','_neil_set_endframe_callback','_neil_set_double_speed','_neil_set_jit_bridge', \
     '_neil_diff_enable','_neil_diff_count','_neil_diff_get','_neil_vi_total', \
-    '_neil_frame_cost_ms','_neil_frame_cost_n','_neil_frame_cost_reset']" \
+    '_neil_frame_cost_ms','_neil_frame_cost_n','_neil_frame_cost_reset', \
+    '_neil_ls_arm','_neil_ls_armed','_neil_ls_set_pad','_neil_ls_run_frame', \
+    '_neil_fp_always','_neil_last_fp']" \
 	-s INVOKE_RUN=0 \
     && mv n64wasm.js ../dist/ \
     && mv n64wasm.wasm ../dist/

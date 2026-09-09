@@ -452,6 +452,27 @@ void neil_diff_enable(int v) { g_diff_enabled = v; g_diff_n = 0; }
 int neil_diff_count(void) { return g_diff_n; }
 unsigned int neil_vi_total(void) { return g_vi_total; }
 unsigned int neil_diff_get(int i) { return (i >= 0 && i < g_diff_n) ? g_diff_buf[i] : 0; }
+
+/* LOCKSTEP: the SAME architectural-state checksum, but readable for the frame
+ * that just ran, without the 8192-entry ring.
+ *
+ * The ring above is a capture rig — it stops recording at NEIL_DIFF_MAX, which
+ * is about two and a half minutes of play, and a lockstep session that silently
+ * stopped comparing fingerprints after two minutes would be exactly the failure
+ * lib/netplay.js's desync detector exists to catch: gated cores that look right
+ * while diverging. So the checksum is also kept in a single slot that is always
+ * current, and the ring append stays gated on the capture flag so ?difftrace
+ * behaves exactly as it did.
+ *
+ * ⚠ WHAT THIS COVERS, STATED SO NOBODY OVERCLAIMS IT: reg[0..31], hi, lo,
+ * g_cp0_regs[0..31], reg_cop1_fgr_64[0..31], FCR31 and PC — i.e. ARCHITECTURAL
+ * CPU STATE ONLY. It does not hash RDRAM, the RSP, or the RDP. A divergence
+ * that has not yet reached a register is invisible to it, so agreement here is
+ * necessary but not sufficient. */
+static uint32_t g_last_fp = 0;
+static int g_fp_always = 0;
+void neil_fp_always(int v) { g_fp_always = v ? 1 : 0; }
+unsigned int neil_last_fp(void) { return g_last_fp; }
 static void neil_diff_capture(void)
 {
     extern uint32_t g_cp0_regs[32];
@@ -467,7 +488,8 @@ static void neil_diff_capture(void)
     NEIL_MIX(FCR31);
     NEIL_MIX(PC->addr);
 #undef NEIL_MIX
-    if (g_diff_n < NEIL_DIFF_MAX) g_diff_buf[g_diff_n++] = h;
+    g_last_fp = h;
+    if (g_diff_enabled && g_diff_n < NEIL_DIFF_MAX) g_diff_buf[g_diff_n++] = h;
 }
 
 int retro_return(bool just_flipping)
@@ -478,7 +500,7 @@ int retro_return(bool just_flipping)
     if (!just_flipping)
     {
         g_vi_total++;
-        if (g_diff_enabled)
+        if (g_diff_enabled || g_fp_always)
             neil_diff_capture();
     }
 

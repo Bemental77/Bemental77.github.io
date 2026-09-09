@@ -98,6 +98,51 @@ extern "C" {
     struct NeilButtons neilbuttons[4];
     bool forceAngry = true;
 }
+
+// ===========================================================================
+// LOCKSTEP — DETERMINISTIC ONLINE PLAY (2026-09-08)
+//
+// Online play on this console used to mean ONE emulator: the host ran the game,
+// streamed its canvas over WebRTC, and the guest's buttons were merged into the
+// HOST's controller (n64/index.html's PATH A) or into a synthetic gamepad SDL
+// happened to enumerate (PATH B). Player 2 was watching a video of somebody
+// else's N64, and every button they pressed cost a network round trip plus an
+// encode plus a decode. That architecture is CANCELLED. Under lockstep every
+// machine runs its own core, only pad bytes cross the wire, and each player's
+// own input is applied locally — which is what a console does.
+//
+// WHY THIS NEEDED CORE CHANGES AT ALL, stated plainly, because the JS side
+// could not have done it:
+//   1. neil_send_mobile_controls (below) writes neilbuttons[0] in every one of
+//      its 21 assignments. There was NO way to address ports 2-4 from JS, so
+//      "four players" was not merely unwired, it was unreachable.
+//   2. It is only CALLED when `mobileMode && !sdlJoysticks[0].gamepadConnected`
+//      (mainLoopInner), so on desktop there was no JS -> core input path at all.
+//   3. mainLoopInner's frame is gated on TWO wall-clock conditions — IsFrameReady()
+//      (SDL_GetTicks budget) and the SDL audio-queue depth — so how far the guest
+//      advanced depended on how fast the host machine happened to be. Input keyed
+//      to wall time lands on a DIFFERENT emulated frame on each machine, which is
+//      a desync by construction.
+// The three entry points below fix exactly those three things and nothing else.
+//
+// ⚠ THE GUEST RATE IS NOT A KNOB HERE (CLAUDE.md gate #9). neil_ls_run_frame()
+// runs exactly ONE mainLoopInner per call and the page calls it once per agreed
+// frame. It cannot make the guest run faster than the room's slowest peer; the
+// only thing it can do is stall. There is no catch-up sprint, and adding one
+// would be the manufactured-speed failure gate #9 forbids.
+//
+// ⚠ AND IT NEVER GUESSES. A missing input stalls the PAGE's driver; nothing
+// here substitutes a plausible pad, because a guessed pad forks the two
+// simulations silently and permanently.
+struct NeilButtons g_ls_pads[NEILNUMCONTROLLERS];
+// 0 = the shipped free-running behaviour, byte for byte. Every single-player
+// session and every offline boot runs with this at 0 and reaches none of the
+// code below.
+int g_ls_on = 0;
+// Set only for the duration of one neil_ls_run_frame() call, to lift the two
+// wall-clock frame gates for that one frame. Outside a lockstep frame both
+// gates behave exactly as they always did.
+int g_ls_forcing = 0;
 bool loadEep = false;
 bool loadSra = false;
 bool loadFla = false;
@@ -893,6 +938,17 @@ void mainLoopInner();
 
 void mainLoop()
 {
+    // ⚠ WHILE THE FRAME GATE IS ARMED THE CORE'S OWN LOOP MUST NOT ADVANCE THE
+    // GUEST. This function is what emscripten_set_main_loop drives (armed
+    // whenever disableAudioSync is set, which n64/index.html forces true) and
+    // it is ALSO called from dist/script.js's ScriptProcessor onaudioprocess in
+    // that same branch. Under lockstep the room decides when a frame runs, so
+    // both of those drivers must become inert: a core that free-ran even one
+    // rAF tick before the room's frame 0 is at a different guest position from
+    // its peers, and two peers at different positions are desynced before
+    // anybody has pressed anything. neil_ls_run_frame() is the only thing that
+    // advances the guest from here on.
+    if (g_ls_on) return;
     mainLoopInner();
     if (doubleSpeed)
     {
@@ -911,7 +967,14 @@ static void timed_retro_run()
 void mainLoopInner()
 {
 	#ifdef __EMSCRIPTEN__
-	if (disableAudioSync && !doubleSpeed && !IsFrameReady())
+	// ⚠ GATE A IS A WALL-CLOCK GATE, AND WALL CLOCK IS EXACTLY WHAT LOCKSTEP
+	// MUST NOT DEPEND ON. IsFrameReady() is an SDL_GetTicks() budget, so on a
+	// slow machine this returns without advancing the guest at all — meaning
+	// "frame N" would be a different amount of emulated time on each peer. A
+	// lockstep frame is driven by the room, not by this host's clock, so the
+	// gate is lifted for the duration of that one frame and is otherwise
+	// untouched.
+	if (!g_ls_forcing && disableAudioSync && !doubleSpeed && !IsFrameReady())
 		return;
 	#endif
 
@@ -1155,6 +1218,24 @@ void mainLoopInner()
         processMenuItemButtons();
     }
 
+    // ---- LOCKSTEP: THE AGREED PAD IMAGE WINS, FOR EVERY SEATED PORT --------
+    // Placed AFTER every local input source above (keyboard, SDL joystick,
+    // mouse, mobile, and the overlay's own reset) because under lockstep the
+    // input for this emulated frame is not this machine's opinion — it is the
+    // room's, and it must be byte-identical on every peer. Anything that wrote
+    // neilbuttons earlier in this function is deliberately overwritten.
+    //
+    // ⚠ THIS INCLUDES THIS PLAYER'S OWN PAD. Their bytes reach here through the
+    // engine too, which is what keeps every machine computing the same frame
+    // from the same inputs. The immediacy a player feels comes from the page
+    // scheduling their own pad locally `delay` frames ahead, never from letting
+    // a local read bypass the agreed image.
+    if (g_ls_on)
+    {
+        for (int _p = 0; _p < NEILNUMCONTROLLERS; _p++)
+            neilbuttons[_p] = g_ls_pads[_p];
+    }
+
 
     if (SDL_PollEvent(&windowEvent) != 0)
     {
@@ -1174,8 +1255,13 @@ void mainLoopInner()
     {
         //allow audio buffer to shrink down
         //if emulator is too far ahead
+        // ⚠ GATE B SKIPS AN ENTIRE EMULATED FRAME based on how full the HOST's
+        // audio queue is. Under lockstep that is a desync source of exactly the
+        // same kind as Gate A above: one peer's audio backlog would silently
+        // advance its guest one frame less than everybody else's. A lockstep
+        // frame always runs its retro_run.
         audioBufferQueue = SDL_GetQueuedAudioSize(audioDeviceId);
-        if (audioBufferQueue < 20000 && fpsAudioRemaining < 5000)
+        if (g_ls_forcing || (audioBufferQueue < 20000 && fpsAudioRemaining < 5000))
             timed_retro_run();
         else
         {
@@ -1889,6 +1975,78 @@ extern "C" {
         neilbuttons[0].axis1 = -(int)((float)32000*axis1Float);
 
 	}
+
+    // ---- LOCKSTEP ENTRY POINTS ------------------------------------------
+    // See the block above neilbuttons[] for why these exist. All three are
+    // no-ops for a single player: nothing calls them unless a room formed.
+
+    // Arm or release the frame gate. While armed the CORE'S OWN main loop must
+    // not advance the guest — mainLoop() below returns immediately — because
+    // this build starts emscripten_set_main_loop(mainLoop, 0, 0) whenever
+    // disableAudioSync is set (which n64/index.html forces true), and a core
+    // that free-ran even one rAF tick before the room's frame 0 is already at a
+    // different guest position from its peers. Releasing hands the console back
+    // so a player whose room ended keeps playing single-player from exactly the
+    // frame they were holding, rather than being left staring at a still image.
+    void neil_ls_arm(int on)
+    {
+        g_ls_on = on ? 1 : 0;
+        for (int p = 0; p < NEILNUMCONTROLLERS; p++)
+        {
+            memset(&g_ls_pads[p], 0, sizeof(struct NeilButtons));
+        }
+    }
+
+    int neil_ls_armed(void) { return g_ls_on; }
+
+    // One seated port's pad for the frame that is about to run. `mask` is the
+    // SAME 14-bit order neil_send_mobile_controls reads its control string in
+    // (0 UP, 1 DOWN, 2 LEFT, 3 RIGHT, 4 A, 5 B, 6 START, 7 Z, 8 L, 9 R,
+    // 10 C-UP, 11 C-DOWN, 12 C-LEFT, 13 C-RIGHT), so the wire format the
+    // multiplayer page already speaks did not have to change.
+    //
+    // ⚠ THE ANALOG AXES ARE NOT DECORATION. Almost nothing on this console
+    // walks on the d-pad — Mario, Banjo, Zelda and every kart are on the stick —
+    // so a digital-only remote player would look connected and be unable to
+    // take a step. ax/ay arrive already scaled to +/-32000 in the core's own
+    // units, and ay is passed in the page's up-positive convention and negated
+    // here exactly as neil_send_mobile_controls does, so the two paths cannot
+    // disagree about which way is up.
+    void neil_ls_set_pad(int port, int mask, int ax, int ay)
+    {
+        if (port < 0 || port >= NEILNUMCONTROLLERS) return;
+        struct NeilButtons* b = &g_ls_pads[port];
+        memset(b, 0, sizeof(struct NeilButtons));
+        b->upKey     = (mask & (1 << 0))  ? 1 : 0;
+        b->downKey   = (mask & (1 << 1))  ? 1 : 0;
+        b->leftKey   = (mask & (1 << 2))  ? 1 : 0;
+        b->rightKey  = (mask & (1 << 3))  ? 1 : 0;
+        b->aKey      = (mask & (1 << 4))  ? 1 : 0;
+        b->bKey      = (mask & (1 << 5))  ? 1 : 0;
+        b->startKey  = (mask & (1 << 6))  ? 1 : 0;
+        b->zKey      = (mask & (1 << 7))  ? 1 : 0;
+        b->lKey      = (mask & (1 << 8))  ? 1 : 0;
+        b->rKey      = (mask & (1 << 9))  ? 1 : 0;
+        b->cbUp      = (mask & (1 << 10)) ? 1 : 0;
+        b->cbDown    = (mask & (1 << 11)) ? 1 : 0;
+        b->cbLeft    = (mask & (1 << 12)) ? 1 : 0;
+        b->cbRight   = (mask & (1 << 13)) ? 1 : 0;
+        b->axis0 = ax;
+        b->axis1 = -ay;
+    }
+
+    // Run EXACTLY ONE emulated frame, unconditionally. This is the lockstep
+    // quantum and it is a real one: with -DNO_LIBCO (Makefile:168) retro_run
+    // steps r4300 until getVI_Count() > 0 (r4300.c:175-195), i.e. exactly one
+    // VI field, so "frame N" means the same amount of emulated time on every
+    // machine regardless of how fast the host is. g_ls_forcing lifts the two
+    // wall-clock gates for this call only.
+    void neil_ls_run_frame(void)
+    {
+        g_ls_forcing = 1;
+        mainLoopInner();
+        g_ls_forcing = 0;
+    }
 
     void neil_set_buffer_remaining(int remaining)
 	{
