@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <script src="/lib/capability.js"></script>
+  <script src="/lib/capability.js?v=e25dca87"></script>
   <script src="/lib/xboxinput.js"></script>
   <!-- ONLINE CO-OP — LOCKSTEP, AND NOTHING ELSE. Inert unless
        Netplay.supported(). The room is formed ON THIS PAGE (see the ONLINE
@@ -16,7 +16,7 @@
        so the page that used to be player 2's whole machine is gone and this
        page is the only page. The file itself still exists because n64/index.html
        has not been converted yet; nothing here routes to it. -->
-  <script src="/lib/netplay.js"></script>
+  <script src="/lib/netplay.js?v=055f3e69"></script>
   <meta charset="UTF-8" />
   <title>Genesis Wasm</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -644,7 +644,24 @@
   // which is what a splitter would do.
   function lsLocalPads() {
     var ls = lsEngine();
-    var ports = (ls && ls.localPorts && ls.localPorts.length) ? ls.localPorts : [0];
+    // ⚠ NEVER FALL BACK TO PORT 0 INSIDE A ROOM. A console whose seat is not
+    // known yet would write its pad into PORT 0 — ANOTHER PLAYER'S controller.
+    // This shipped on Dreamcast and the user hit it immediately: "player 2 took
+    // over as player 1! wtf, it def should not do that." The same line was
+    // present here, on Genesis, unchanged.
+    //
+    // It is a reachable state, not a theoretical one — lib/netplay.js documents
+    // a path where `localPorts` stays EMPTY. Defaulting that to port 0 makes the
+    // failure mode of "I do not know which player I am" into "act as Player 1",
+    // which is the worst available guess: it fights the real Player 1 for their
+    // own character, on their own screen.
+    //
+    // In a room, no seat means NO PAD. A solo console (no session) still uses
+    // port 0, because there it is not a guess — it is the only port.
+    var inRoom = !!(typeof NET !== 'undefined' && NET && NET.session);
+    var known = (ls && ls.localPorts && ls.localPorts.length) ? ls.localPorts : null;
+    if (!known && inRoom) return {};
+    var ports = known || [0];
     var mask = padMask();
     var out = {};
     ports.forEach(function (port, k) {

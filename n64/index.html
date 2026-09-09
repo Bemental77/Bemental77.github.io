@@ -12,7 +12,7 @@
        Publishes window.__cap in the SAME shape on all three emulator pages, which is what
        lets tools/device_matrix.mjs ask every page the same questions. Loaded before <base>
        so its own absolute paths are unambiguous. -->
-  <script src="/lib/capability.js"></script>
+  <script src="/lib/capability.js?v=e25dca87"></script>
   <script src="/lib/xboxinput.js"></script>
   <!-- ONLINE PLAY — DETERMINISTIC LOCKSTEP. Inert unless Netplay.supported(),
        and it does nothing at all without ?np=<code> in the URL, which is what
@@ -24,7 +24,7 @@
        the wire. The file still exists because sibling pages have not been
        converted yet; loading it here would ship a second, contradictory online
        architecture on a page that has one. -->
-  <script src="/lib/netplay.js"></script>
+  <script src="/lib/netplay.js?v=055f3e69"></script>
   <script>
     // Same honest-failure contract as the sibling pages, with the spec that makes
     // this the PORTABILITY REFERENCE: Capability.SPECS.n64 requires only
@@ -49,7 +49,7 @@
   <base href="/n64/N64Wasm/dist/">
   <!-- The game library's origin. ONE constant for the whole site, so the split
        is revertible by editing a single line — see lib/asset_base.js. -->
-  <script src="/lib/asset_base.js"></script>
+  <script src="/lib/asset_base.js?v=27d8c0a4"></script>
   <script>if (new URLSearchParams(location.search).has('eruda')) { var s=document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/eruda'; s.onload=function(){eruda.init();}; document.head.appendChild(s); }</script>
   <!-- script.js hard-requires jQuery, rivets, toastr, FileSaver (see dist/n64.html head).
        Self-hosted in /n64/vendor/ so the page keeps working if a coi service worker from
@@ -3210,7 +3210,24 @@ N64Rate.selfTest = function (logFn) {
   // re-mapping happens in exactly one place.
   function lsLocalPads() {
     var ls = lsEngine();
-    var ports = (ls && ls.localPorts && ls.localPorts.length) ? ls.localPorts : [0];
+    // ⚠ NEVER FALL BACK TO PORT 0 INSIDE A ROOM. A console whose seat is not
+    // known yet would write its pad into PORT 0 — ANOTHER PLAYER'S controller.
+    // This shipped on Dreamcast and the user hit it immediately: "player 2 took
+    // over as player 1! wtf, it def should not do that." The same line was
+    // present here, on N64, unchanged.
+    //
+    // It is a reachable state, not a theoretical one — lib/netplay.js documents
+    // a path where `localPorts` stays EMPTY. Defaulting that to port 0 makes the
+    // failure mode of "I do not know which player I am" into "act as Player 1",
+    // which is the worst available guess: it fights the real Player 1 for their
+    // own character, on their own screen.
+    //
+    // In a room, no seat means NO PAD. A solo console (no session) still uses
+    // port 0, because there it is not a guess — it is the only port.
+    var inRoom = !!(typeof NET !== 'undefined' && NET && NET.session);
+    var known = (ls && ls.localPorts && ls.localPorts.length) ? ls.localPorts : null;
+    if (!known && inRoom) return {};
+    var ports = known || [0];
     var out = {};
     ports.forEach(function (port, k) { out[port] = lsPackLocal(k); });
     return out;

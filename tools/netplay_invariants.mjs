@@ -37,17 +37,26 @@ if (!dc || !np) {
 }
 
 // ---- 1. AN UNSEATED CONSOLE MUST NOT DRIVE PORT 0 -------------------------
+// ⚠ EVERY CONSOLE, NOT JUST THE ONE THE BUG WAS REPORTED ON. This checked only
+// dreamcast.html at first — and a sweep then found the IDENTICAL line in
+// ps1.html:1278, n64/index.html:3213 and genesis.html:647, all four written the
+// same way. A gate that only guards the page somebody happened to complain about
+// leaves the same defect live on every other console that shares the engine.
 {
-  const n = 'unseated-console-does-not-hijack-port-0';
-  // The dangerous shape is a bare `: [0]` fallback on the local-port lookup.
-  const bare = /localPorts[^\n]*\?[^\n]*:\s*\[0\]/.test(dc);
-  const guarded = /NEVER FALL BACK TO PORT 0/.test(dc) && /inRoom/.test(dc);
-  if (bare && !guarded) {
-    bad(n, 'dreamcast.html falls back to port 0 when localPorts is empty. In a room that means ' +
-           'writing this machine\'s pad into ANOTHER PLAYER\'S controller — the user hit this as ' +
-           '"player 2 took over as player 1". No seat must mean NO pad; only a solo console (no ' +
-           'session) may assume port 0.');
-  } else ok(n);
+  const PAGES = ['dreamcast.html', 'ps1.html', 'n64/index.html', 'genesis.html'];
+  for (const page of PAGES) {
+    const src = read(page);
+    if (!src) continue;
+    const n = 'unseated-console-does-not-hijack-port-0 [' + page + ']';
+    const bare = /localPorts[^\n]*\?[^\n]*:\s*\[0\]\s*;/.test(src);
+    const guarded = /NEVER FALL BACK TO PORT 0/.test(src) && /inRoom/.test(src);
+    if (bare && !guarded) {
+      bad(n, page + ' falls back to port 0 when localPorts is empty. In a room that means writing ' +
+             'this machine\'s pad into ANOTHER PLAYER\'S controller — the user hit this as "player 2 ' +
+             'took over as player 1". No seat must mean NO pad; only a solo console (no session) may ' +
+             'assume port 0.');
+    } else ok(n);
+  }
 }
 
 // ---- 2. THE READY LABEL MUST NOT CONTRADICT THE DISABLED STATE ------------
