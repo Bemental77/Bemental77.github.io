@@ -71,6 +71,12 @@
 //      cannot pass;
 //   6. each side's own pad reaches its OWN core, and (as a separate cell) the
 //      other side's core too.
+//   7. ON A SEEDED DISC (pso2), both consoles are SEEDED BEFORE either can
+//      declare itself ready, nothing applies a machine image after the room has
+//      started, and a console that could NOT seed is held out of the barrier
+//      rather than allowed to start a room it will silently diverge from.
+//   8. the desync check is ON and consuming fingerprints — `armed` alone says
+//      the cores are gated, not that anything is comparing them.
 //
 // ARMS — the third and fourth reproduce page states the passing rigs never had
 //   panel-open    baseline: the host leaves the lobby panel open and waits.
@@ -126,6 +132,12 @@
 //                 only Start control is #mobileSplashStart inside the splash
 //                 that the room hand-off hides; a restarted phone host must
 //                 still be able to start its own game.
+//   solo          ONE BROWSER, NO ROOM — the single-player regression guard for
+//                 the boot seed. It lives here rather than in a new file because
+//                 the thing it protects is the thing the room cells change: a
+//                 fix that makes a room seed correctly is worthless if it stops
+//                 a lone player getting past PSO's Serial Number / Access Key
+//                 screen, and a room-only rig cannot see that.
 //   rejoin        the joiner is left unadmitted, gives up, RELOADS THE PAGE and
 //                 tries the same code again. The host is then holding a stale
 //                 request from a peer that no longer exists while a second one
@@ -306,7 +318,15 @@ async function launch(role, mobile) {
   pg.on('pageerror', (e) => { const t = String((e && (e.message || e.type)) || e).slice(0, 240); errs.push(t); say(`  [${role}!] ${t.slice(0, 170)}`); });
   pg.on('console', (m) => {
     const t = m.text();
-    if (/\[net\]|\[lockstep\]|DESYNC|join|approve|allow/i.test(t)) { nets.push(t.slice(0, 240)); say(`  [${role}] ${t.slice(0, 170)}`); }
+    // ⚠ `[seed]` AND `state loaded|FAILED` ARE IN HERE ON PURPOSE. PSO Ver.2's
+    // Serial Number / Access Key exist ONLY inside the boot savestate, so on
+    // that disc "was this machine seeded, and WHEN" is a determinism question,
+    // not a cosmetic one — two peers that apply a 27 MB machine image at
+    // different frames are forked. The filter used to drop every one of those
+    // lines, which is why a room could seed itself apart with nothing in the log.
+    if (/\[net\]|\[lockstep\]|\[seed\]|state (loaded|load FAILED)|DESYNC|join|approve|allow/i.test(t)) {
+      nets.push(t.slice(0, 240)); say(`  [${role}] ${t.slice(0, 170)}`);
+    }
   });
   // ---- the `no-direct-path` arm: MAKE A DIRECT PEER PATH IMPOSSIBLE -------
   // ⚠ THIS IS A SIMULATED NETWORK CONDITION, NOT A WAY OF DRIVING THE PAGE.
@@ -507,13 +527,64 @@ const probe = (pg) => pg.evaluate(() => {
     guestX: p ? p.guestX : null, phase: p ? p.phase : null,
     discBytes: p ? p.discBytes : null, discTotal: p ? p.discTotal : null,
     netState: n ? n.state : null,
-    lockstep: n && n.lockstep ? { armed: n.lockstep.armed, running: n.lockstep.running, coreFrame: n.lockstep.coreFrame } : null,
+    // ⚠ hashSink / hashesFed ARE THE DESYNC CHECK ITSELF. `armed` only says the
+    // cores are frame-gated; a room can be perfectly gated with NOTHING
+    // comparing the two simulations, which is the "frame-gated NO · desync
+    // check OFF" state the user photographed. Read them here so a cell can
+    // assert the check is ON and actually consuming fingerprints.
+    lockstep: n && n.lockstep ? {
+      armed: n.lockstep.armed, running: n.lockstep.running, coreFrame: n.lockstep.coreFrame,
+      hashSink: n.lockstep.hashSink, hashesFed: n.lockstep.hashesFed,
+      normalize: n.lockstep.normalize, fault: n.lockstep.fault,
+    } : null,
     telPorts: h && h.telemetry ? h.telemetry.ports : null,
     telYou: h && h.telemetry ? h.telemetry.you : null,
     telPeers: h && h.telemetry ? h.telemetry.peers : null,
   };
 });
 const pad = (pg) => pg.evaluate(() => (typeof window.__dcPad === 'function' ? Array.from(window.__dcPad()) : null));
+
+// ---------------------------------------------------------------------------
+// WHAT THIS MACHINE DID WITH THE BOOT SEED — and WHEN.
+//
+// PSO Ver.2 demands a Serial Number + Access Key before a new game and keeps
+// them in main RAM ONLY, so the shipped boot savestate is the ONLY thing that
+// carries them: without it the disc boots to the credential screen and there is
+// no character, ever. That makes "was this console seeded" a REQUIREMENT cell
+// on that disc rather than a nicety.
+//
+// It also makes it a DETERMINISM cell. The seed is a whole 27 MB machine image;
+// two peers that apply one at different frames are forked by construction, and
+// the worker resets its lockstep frame counter to `data.frame|0` on every
+// loadState (flycast_worker.js:1444-1446) while dropping any input below it
+// (:804) — so a seed applied after the barrier does not merely desync a room,
+// it parks the core on an input that was already consumed.
+//
+// Read the way a person could read it: out of the page's own on-screen log
+// (#log, which pageLog writes to) plus the read-only room seam. `state` is
+// published only by a build that RESOLVES the seed before frame 0; on a build
+// that does not, it is null and the log lines are the whole story.
+// ---------------------------------------------------------------------------
+const SEEDED_DISCS = ['pso2'];
+const seedRead = (pg) => pg.evaluate(() => {
+  const log = ((document.getElementById('log') || {}).textContent || '');
+  let room = null;
+  try { room = (typeof window.__dcNetRoom === 'function') ? window.__dcNetRoom() : null; } catch (e) {}
+  return {
+    lines: log.split('\n').filter((l) => /\[seed\]|state (loaded|load FAILED)/i.test(l)).slice(-14),
+    fetched:  /\[seed\] ready \d+ B/.test(log),
+    applied:  /\[seed\] applying /.test(log),
+    loadedOK: /\[page\] state loaded OK/.test(log),
+    loadFailed: /\[page\] state load FAILED/.test(log) || /core rejected the state/.test(log),
+    skippedOwnState: /own saved state — seed skipped/.test(log),
+    state: room && room.seed ? room.seed.state : null,
+    why:   room && room.seed ? room.seed.why   : null,
+    readyShown:   room ? room.readyShown   : null,
+    readyEnabled: room ? room.readyEnabled : null,
+    barrier: room ? room.barrier : null,
+  };
+});
+const seedDisc = () => SEEDED_DISCS.includes(GAME);
 
 // OPEN "Play Online" THE WAY A PERSON DOES, FROM WHATEVER STATE THIS PAGE IS IN
 // RIGHT NOW. The entry scan at the top of an arm runs before anything is
@@ -1147,6 +1218,40 @@ async function runArm(armName) {
         'never arrive.');
     }
 
+    // -- 5a3. THE BOOT SEED IS APPLIED BEFORE THIS CONSOLE CLAIMS TO BE READY -
+    // On a seeded disc the seed is part of BEING LOADED, not part of running:
+    // the barrier's whole job is to hold every peer until all are loaded, so a
+    // console that declares itself ready while a 27 MB machine image is still
+    // to come has lied to the barrier about what it is holding at frame 0.
+    // Sampled BEFORE anybody presses ready, which is the only moment at which
+    // the distinction is observable.
+    let seedPre = null;
+    if (seedDisc()) {
+      seedPre = await Promise.all(pages.map(async (pg) => ({ role: pg.__role, ...(await seedRead(pg)) })));
+      D.seedBeforeReady = seedPre;
+      seedPre.forEach((s) => say(`  ....  seed[${s.role}] state=${s.state} applied=${s.applied} ` +
+                                 `loadedOK=${s.loadedOK} readyEnabled=${s.readyEnabled}`));
+      cell(seedPre.every((s) => s.loadedOK && !s.loadFailed),
+        'both-peers-are-SEEDED-before-either-can-declare-ready',
+        `both consoles applied the boot seed and the core ACCEPTED it before the barrier was touched: ` +
+        J(seedPre.map((s) => s.role + ' state=' + s.state + ' loadedOK=' + s.loadedOK)),
+        `a console reached the barrier UNSEEDED: ${J(seedPre.map((s) => s.role + ' fetched=' + s.fetched +
+          ' applied=' + s.applied + ' loadedOK=' + s.loadedOK + ' skippedOwnState=' + s.skippedOwnState))}. ` +
+        'PSO Ver.2 keeps its Serial Number / Access Key in RAM only, so an unseeded console stops dead on the ' +
+        'credential screen — and a console that seeds LATER replaces its whole machine mid-room, which forks it ' +
+        'from every peer that seeded at a different frame.');
+      // The honest-refusal half of the requirement: a console that could NOT
+      // seed must not be able to press ready. Only meaningful when one failed.
+      const stuck = seedPre.filter((s) => !s.loadedOK);
+      if (stuck.length) {
+        cell(stuck.every((s) => s.readyEnabled === false),
+          'an-unseeded-console-cannot-declare-itself-ready',
+          `the console(s) that could not seed are held out of the barrier: ${J(stuck.map((s) => s.role + ' readyEnabled=' + s.readyEnabled))}`,
+          `an UNSEEDED console can still press ready: ${J(stuck.map((s) => s.role + ' readyEnabled=' + s.readyEnabled))} — ` +
+          'it will start a room it is guaranteed to diverge from, silently');
+      }
+    }
+
     // -- 5b. READY, pressed as a button, on both ---------------------------
     say('\n-- both players press "I\'m ready" — the only control the barrier has');
     for (const pg of pages) {
@@ -1200,6 +1305,42 @@ async function runArm(armName) {
       `core ran ${J(ran1)} -> ${J(ran2)}. The user's two devices both read "frame 0 · core ran 0" forever; a counter ` +
       'that does not move is the deadlock, whatever else the panel says');
 
+    // -- 5c2. NOTHING SEEDED ITSELF AFTER THE ROOM STARTED ------------------
+    // The failure this cell exists for: the seed used to be armed on the first
+    // heartbeat that reported frames flowing, and in a room NO frame flows until
+    // the barrier releases — so the trigger landed AFTER the start, at whatever
+    // frame each peer's own heartbeat happened to hit. Compare the seed evidence
+    // taken before ready with the same evidence now.
+    if (seedDisc() && seedPre) {
+      const seedPost = await Promise.all(pages.map(async (pg) => ({ role: pg.__role, ...(await seedRead(pg)) })));
+      D.seedAfterStart = seedPost;
+      const lateApply = pages.map((pg, i) => seedPost[i].applied && !seedPre[i].applied);
+      cell(!lateApply.some(Boolean),
+        'no-console-applies-the-seed-AFTER-the-room-has-started',
+        'neither console restored a machine image once frames were running — whatever they are simulating, ' +
+        'they began it together',
+        `a console applied the 27 MB boot seed AFTER the barrier released: ${J(pages.map((pg, i) =>
+          pg.__role + ' before=' + seedPre[i].applied + ' after=' + seedPost[i].applied))}. Both peers then hold ` +
+        'machines that were replaced at different frames, and the worker resets its lockstep frame counter to 0 ' +
+        'on every loadState while dropping inputs below it — so this also parks the core on an input already spent.');
+    }
+
+    // -- 5c3. SOMETHING IS ACTUALLY COMPARING THE TWO SIMULATIONS -----------
+    // `armed` says the cores are gated. It does NOT say anything is checking
+    // that they agree, and a gated-but-uncompared room diverges silently — the
+    // worst outcome available. hashSink is the page's own answer to "is there a
+    // Lockstep.submitHash to feed", hashesFed is how many it actually fed.
+    {
+      const ck = await Promise.all(pages.map(async (pg) => ({ role: pg.__role, ls: (await probe(pg)).lockstep })));
+      D.desyncCheck = ck;
+      say(`  ....  desync check: ${J(ck.map((c) => c.role + ' sink=' + (c.ls && c.ls.hashSink) + ' fed=' + (c.ls && c.ls.hashesFed)))}`);
+      cell(ck.every((c) => c.ls && c.ls.hashSink === true && (c.ls.hashesFed | 0) > 0),
+        'the-desync-check-is-ON-and-comparing',
+        `both consoles are feeding fingerprints to the engine: ${J(ck.map((c) => c.role + ' fed=' + c.ls.hashesFed))}`,
+        `the desync check is not comparing anything: ${J(ck)} — this is the "frame-gated NO · desync check OFF" ` +
+        'state the user photographed, in which two forked simulations look identical from the panel');
+    }
+
     // -- 5d. each side's own pad reaches its OWN core ----------------------
     say('\n-- each player presses a key; does it reach their own core, and the other one?');
     const KEYS = ['a', 'd'];
@@ -1247,6 +1388,81 @@ async function runArm(armName) {
 }
 
 // ===========================================================================
+// THE `solo` ARM — ONE BROWSER, NO ROOM. The single-player regression guard.
+//
+// It is in this file rather than a new one because the thing it protects is the
+// thing the room cells change: PSO Ver.2's boot seed. A fix that makes a room
+// seed correctly is worthless if it stops a lone player getting past the
+// Serial Number / Access Key screen, and that is exactly the regression a
+// room-only rig cannot see. Same rules as every other arm — real clicks, real
+// <select>, no engine method — and it asserts the seed lands AND that the core
+// is genuinely running afterwards, because a core wedged by a bad restore also
+// reports "applied".
+// ===========================================================================
+async function runSoloArm() {
+  ARM = 'solo';
+  const D = RESULT.arms_detail.solo = { load: load1(), steps: [] };
+  say(`\n${'='.repeat(78)}\n== ARM solo  — one console, no room at all  (load ${D.load})\n${'='.repeat(78)}`);
+  const pg = await launch('host', /^mobile/.test(NAME) ? true : false);
+  try {
+    await gotoSettled(pg, PAGE);
+    const mounted = await until(pg, () =>
+      (typeof window.__dcProbe === 'function') ? true : null, 90000);
+    cell(!!mounted, 'solo-page-loads', `${ORIGIN}/dreamcast.html loaded on one machine`,
+      'the page never finished wiring — nothing below means anything');
+    if (!mounted) return;
+
+    const bf = await bootFully(pg, 'solo', BOOT_MS);
+    D.boot = { ok: bf.ok, ms: bf.ms, why: bf.why, probe: bf.probe };
+    cell(bf.ok, 'solo-reaches-a-running-core',
+      `a lone console booted ${GAME} and is producing frames (fps ${bf.probe && bf.probe.fps})`,
+      `a lone console never reached a running core: ${bf.why}`);
+    if (!bf.ok) { await shot(pg, 'solo-dead'); return; }
+
+    if (!seedDisc()) {
+      voidc('solo-is-seeded-past-the-credential-screen',
+        `${GAME} ships no boot seed, so there is nothing to apply — not a failure`);
+    } else {
+      // The seed is applied on a heartbeat, so give it a bounded window rather
+      // than sampling once and calling a slow phone a regression.
+      const t = Date.now();
+      let s = null;
+      while (Date.now() - t < 120000) {
+        s = await seedRead(pg);
+        if (s.loadedOK || s.loadFailed || s.skippedOwnState) break;
+        await sleep(2000);
+      }
+      D.seed = s;
+      (s.lines || []).forEach((l) => say(`  ....  ${l}`));
+      cell(!!(s && s.loadedOK && !s.loadFailed),
+        'solo-is-seeded-past-the-credential-screen',
+        `the lone console applied the boot seed and the core ACCEPTED it: ${J((s.lines || []).slice(-3))}`,
+        `the lone console did not get seeded: fetched=${s && s.fetched} applied=${s && s.applied} ` +
+        `loadedOK=${s && s.loadedOK} loadFailed=${s && s.loadFailed} skippedOwnState=${s && s.skippedOwnState}. ` +
+        'PSO Ver.2 keeps its Serial Number / Access Key in RAM only — without the seed the player stops dead on ' +
+        'the credential screen with no character.');
+      // ⚠ "applied" IS NOT "alive". CLAUDE.md gate #10: a savestate that fails
+      // to restore silently cold-boots and still produces a plausible number,
+      // and a bad restore can also park the pump. Only moving frames prove it.
+      const f1 = (await probe(pg)).lockstep;
+      const p1 = await probe(pg); await sleep(6000); const p2 = await probe(pg);
+      D.aliveAfterSeed = { fps1: p1.fps, fps2: p2.fps, ls: f1 };
+      cell((p2.fps || 0) > 0,
+        'solo-is-still-running-AFTER-the-seed',
+        `the core is still producing frames after the restore (fps ${p1.fps} -> ${p2.fps})`,
+        `the core stopped after the seed was applied (fps ${p1.fps} -> ${p2.fps}) — a restore that wedges the ` +
+        'pump is worse than no seed at all');
+      await shot(pg, 'solo-seeded');
+    }
+  } finally {
+    D.errors = pg.__errs.slice(0, 12);
+    D.log = pg.__net.slice(-40);
+    D.loadEnd = load1();
+    if (!KEEP) { for (const b of browsers.splice(0)) { try { await b.close(); } catch (e) {} } }
+  }
+}
+
+// ===========================================================================
 (async () => {
   const lines = selfAudit();
   say('== room_crossdevice_test ==');
@@ -1261,7 +1477,7 @@ async function runArm(armName) {
 
   let fatal = null;
   for (const a of ARMS) {
-    try { await runArm(a); }
+    try { if (a === 'solo') await runSoloArm(); else await runArm(a); }
     catch (e) { ARM = a; bad('arm-crashed', `${a}: ${(e && e.stack) || e}`); fatal = e; }
     finally { for (const b of browsers.splice(0)) { try { await b.close(); } catch (e) {} } }
   }

@@ -2756,7 +2756,23 @@
             worker.postMessage({ cmd: 'loadState', data: buf }, [buf]);
           });
         }
-        if (seedArmed && d.calls > 0) {
+        // ⚠ SOLO ONLY, AND THE `!NET.session` IS THE WHOLE POINT. This fires on
+        // the first heartbeat that reports frames FLOWING, which in a room is
+        // the first heartbeat AFTER the start barrier releases — so in a room
+        // it used to post a 27 MB machine image at whatever frame this peer's
+        // own heartbeat happened to land on. Two peers replacing their whole
+        // machine at different frames are forked by construction, which is the
+        // one thing the lockstep architecture exists to prevent.
+        // It is worse than a fork, too: the worker resets its lockstep frame
+        // counter to `data.frame|0` on every loadState and clears the queue
+        // (flycast_worker.js:1444-1446), while dropping any input below that
+        // counter (:804) — so a post-barrier seed parks the core on frame 0
+        // waiting for an input the page already fed and will never send again.
+        // In a room the seed is applied by seedBeforeFrameZero() instead, as
+        // part of BEING LOADED. seedArmed is never set there, so this guard is
+        // belt-and-braces — and it is here because a silent re-arm would be
+        // invisible until two people had already lost an evening.
+        if (seedArmed && d.calls > 0 && !NET.session) {
           seedArmed = false;
           seedPromise.then((buf) => {
             if (!buf) return;   // fetchSeedState already logged why; cold boot stands
@@ -2800,6 +2816,15 @@
         break;
       case 'stateLoaded': {
         const lbl = seedLabel; seedLabel = null;
+        // ⚠ HAND THE ROOM SEED THE CORE'S OWN ANSWER, NEVER "we posted it".
+        // CLAUDE.md gate #10: a savestate that fails to restore SILENTLY COLD
+        // BOOTS and still produces a plausible-looking result. This ack is
+        // trustworthy — flycast_worker.js:1448 posts `success: !!ok` where ok is
+        // `emscripten_load_state`'s return, and that is
+        // `retro_unserialize(...) ? 1 : 0` (EmscriptenWorker.cpp) — so unlike
+        // the GameCube worker, which posts stateLoaded on every path including
+        // failure, false here really does mean the core refused the bytes.
+        if (pendingSeedAck) { const done = pendingSeedAck; pendingSeedAck = null; done(!!d.success); }
         // A seed the core rejects is NOT fatal: nothing was restored, the
         // guest carries on with its own cold boot, and the player types the
         // credentials by hand exactly as before. Never a black screen.
@@ -3857,6 +3882,34 @@
       setStatus(!NET.session ? 'Running.'
         : LS.armed ? 'Waiting for the other players — nothing runs until everyone is in.'
         : 'Loaded, but this console is NOT part of the room — open Play Online and read the warning.');
+      // ⚠ IN A ROOM THE SEED IS PART OF *BEING LOADED*, NOT PART OF RUNNING,
+      // AND THAT DISTINCTION IS THE WHOLE FIX. The barrier already holds every
+      // peer until all of them are loaded; a console that declares itself ready
+      // while a 27 MB machine image is still to come has lied to the barrier
+      // about what it is holding at frame 0. Applying it HERE — after the gate
+      // is armed, before the pump is switched on — means every peer reaches
+      // frame 0 already seeded and identical, which preserves BOTH the
+      // credentials and determinism.
+      //
+      // ⚠ WHY AFTER lsArmBeforeFreerun() AND NOT BEFORE IT. The worker's
+      // loadState turns its own pump on (flycast_worker.js:1440,
+      // `if (ok && !freerun) { freerun = true; pumpKick(0); }`), so seeding
+      // before the gate was armed would let this core free-run for the duration
+      // of an async ack — the exact "already past the point where the gate
+      // could be armed" state lsRestartIntoRoom() exists to avoid. Armed first,
+      // the pump parks on an empty lockstep queue instead and runs nothing.
+      //
+      // ⚠ AND THE DETERMINISM HANDSHAKE SURVIVES IT. lsArmBeforeFreerun() has
+      // just run emscripten_lockstep_normalize (flush, round-trip, flush), and
+      // the core executes ZERO guest instructions between that and this restore
+      // — freerun is still off and the lockstep pump is parked — so the block
+      // table the seed's own emu.start() rebuilds against is the empty one the
+      // normalize just left, identically on every peer. emscripten_load_state
+      // then calls flycast_lockstep_reset() itself on success. The seeded path
+      // is in fact the STRONGER of the two: the normalize's own measurements
+      // record that pushing a state into both instances was "the only thing
+      // that ever helped".
+      if (NET.session && seedPromise) await seedBeforeFrameZero();
       worker.postMessage({ cmd: 'freerun', on: 1 });
       startInputPump();
       // A returning player always wins. If this browser already holds its own
@@ -3864,7 +3917,16 @@
       await savedStateReady;
       if (STATE_KEY !== stateKeyFor(key)) await loadSavedStateFor(key);   // selection changed late
       if (seedPromise) {
-        if (savedState) pageLog('[seed] this browser has its own saved state — seed skipped');
+        // ⚠ A ROOM WAS ALREADY DEALT WITH ABOVE, BEFORE FRAME 0 — including the
+        // saved-state case. "A returning player always wins" is right for a lone
+        // player and WRONG in a room: every machine in a room begins at frame 0
+        // (lsRestartIntoRoom() says so to the player in as many words, and warns
+        // that unsaved progress is lost), so a peer that skipped the seed
+        // because THIS browser happens to hold a savestate would sit at frame 0
+        // holding a different machine from everyone else. Nothing here restores
+        // that savestate; it would simply have gone unseeded.
+        if (NET.session) { /* seedBeforeFrameZero() already resolved it */ }
+        else if (savedState) pageLog('[seed] this browser has its own saved state — seed skipped');
         else seedArmed = true;
       }
     } catch (err) {
@@ -3979,6 +4041,110 @@
   let autoloadPromise = null;   // heartbeat, NOT a fixed timer (see the fix comment)
   let seedArmed   = false;    // applied on the first frame-producing heartbeat
   let seedLabel   = null;     // custom toast/log for the seed's stateLoaded ack
+  // ---- the room's half of the seed ------------------------------------------
+  let seedRoomState  = null;  // null = not a seeded room boot | 'pending' | 'ok' | 'failed'
+  let seedRoomWhy    = null;  // the sentence the player is shown when it failed
+  let pendingSeedAck = null;  // resolver for the worker's stateLoaded ack
+
+  // How long a room boot will wait for the seed. Matched to the disc load's own
+  // 120 s tolerance rather than invented: the seed is 0.75% of the disc's bytes
+  // and its fetch starts alongside it, so anything approaching this is broken,
+  // not slow. A room MAY block here — the barrier is a block, and every peer is
+  // waiting anyway — but it must never block FOREVER, so this is bounded and
+  // ends in a named failure rather than a console that never finishes booting.
+  const SEED_ROOM_MS = 120000;
+
+  function seedRoomFailed(why) {
+    seedRoomState = 'failed';
+    seedRoomWhy = why;
+    pageLog('[seed] THIS CONSOLE CANNOT START IN A ROOM — ' + why);
+    setStatus('This console cannot start in the room: ' + why);
+    return false;
+  }
+
+  // ---------------------------------------------------------------------------
+  // APPLY THE SEED BEFORE FRAME 0. Called from the boot, in a room only.
+  //
+  // WHY IT IS NOT THE HEARTBEAT PATH. The solo trigger fires on the first
+  // telemetry frame that reports video actually flowing, which is exactly the
+  // right signal for a lone console and USELESS in a room: a room's core is
+  // parked on an empty lockstep queue at frame 0 and produces no frames at all
+  // until the barrier releases. So in a room that trigger either never fires —
+  // PSO Ver.2 then sits on the Serial Number / Access Key screen forever, with
+  // no character, because the seed is the ONLY thing that carries them — or it
+  // fires AFTER the start, at a frame each peer picks independently.
+  //
+  // ⚠ IT GATES ON THE CORE'S ANSWER, NEVER ON HAVING POSTED THE MESSAGE.
+  // See the stateLoaded case for why this worker's ack can be trusted.
+  //
+  // ⚠ FAILURE IS NOT FATAL TO THE BOOT, BUT IT IS FATAL TO BEING READY. The
+  // console still loads, still arms the gate, still parks at frame 0 — it just
+  // cannot declare itself ready, because a peer that plays on unseeded while
+  // the others seeded is the silent divergence this whole architecture exists
+  // to prevent. The single-player promise that EVERY seed failure falls through
+  // to a normal playable cold boot is kept where it was made: solo.
+  // ---------------------------------------------------------------------------
+  async function seedBeforeFrameZero() {
+    seedRoomState = 'pending'; seedRoomWhy = null;
+    setStatus('Preparing the game — every player has to begin from the same frame 0.');
+    pageLog('[seed] room boot: applying the seed BEFORE this console can declare itself ready');
+    let buf = null;
+    try {
+      buf = await Promise.race([
+        seedPromise,
+        new Promise((r) => setTimeout(() => r('timeout'), SEED_ROOM_MS)),
+      ]);
+    } catch (e) {
+      return seedRoomFailed('the boot seed threw while being fetched: ' + ((e && e.message) || e));
+    }
+    if (buf === 'timeout') {
+      return seedRoomFailed('the boot seed did not arrive within ' + Math.round(SEED_ROOM_MS / 1000) + ' s');
+    }
+    if (!buf) {
+      return seedRoomFailed('the boot seed could not be fetched or decoded — the log above names the step that failed');
+    }
+    const ok = await new Promise((resolve) => {
+      const t = setTimeout(() => {
+        if (!pendingSeedAck) return;   // already answered
+        pendingSeedAck = null; resolve('timeout');
+      }, SEED_ROOM_MS);
+      pendingSeedAck = (v) => { clearTimeout(t); resolve(v); };
+      seedLabel = '✓ Ready — serial and access key already entered';
+      pageLog('[seed] applying ' + buf.byteLength + ' B at frame 0, before the barrier');
+      worker.postMessage({ cmd: 'loadState', data: buf, frame: 0 }, [buf]);
+    });
+    if (ok === 'timeout') {
+      return seedRoomFailed('the emulator never answered the seed restore within ' +
+                            Math.round(SEED_ROOM_MS / 1000) + ' s');
+    }
+    if (!ok) {
+      return seedRoomFailed('the emulator REJECTED the boot seed (retro_unserialize returned 0)');
+    }
+    seedRoomState = 'ok';
+    pageLog('[seed] applied and CONFIRMED by the core at frame 0 — every peer in this room starts from ' +
+            'these same bytes');
+    // Hand the status line back to the barrier. Leaving "Preparing the game…"
+    // up until the barrier releases would tell a player who is now waiting on
+    // OTHER people that their own console is still busy.
+    setStatus(LS.armed ? 'Waiting for the other players — nothing runs until everyone is in.' : 'Running.');
+    return true;
+  }
+
+  // WHAT THIS CONSOLE IS HOLDING AT FRAME 0, as one string the barrier can
+  // compare. setReady()'s second argument is what lib/netplay.js's _checkBarrier
+  // compares across peers, and it already refuses a room whose players are not
+  // on the same disc. A room where one peer seeded and another cold-booted is
+  // the SAME class of mismatch — same disc, different machine at frame 0 — so it
+  // is declared the same way and refused by the same tested path, with the
+  // engine naming the odd one out on every peer's screen. (That matters because
+  // the engine has no "not ready because X" channel of its own: setReady(false)
+  // is a no-op, and nothing on the wire carries a reason.)
+  // ⚠ NOT currentGameKey(): that value is also the savestate storage key, and
+  // changing it would orphan the savestate of every existing player.
+  const roomDiscTag = () => {
+    const g = currentGameKey();
+    return seedRoomState == null ? g : g + (seedRoomState === 'ok' ? '#seeded' : '#coldboot');
+  };
 
   function seedAllowed() {
     // Measurement runs must boot cold on purpose — an auto-seeding probe would
@@ -6596,14 +6762,40 @@
     if (b.started) { btxt = 'Everyone started together at frame ' + (b.startFrame != null ? b.startFrame : 0) + '.'; bcls = 'go'; }
     else if (notReady.length) { btxt = 'Nobody starts until everyone is ready — waiting for ' + notReady.join(', ') + '.'; bcls = 'hold'; }
     else { btxt = 'Everyone is ready. Starting together.'; bcls = 'go'; }
+    // ⚠ AN HONEST REFUSAL BEATS A SILENT DIVERGENCE, AND BEATS A BARE WAIT.
+    // This console cannot be part of a room it would diverge from, and the
+    // player is owed the reason in the same place they are already reading the
+    // barrier — not only in the log. The other peers still see the ordinary
+    // "waiting for <player>", because lib/netplay.js has no channel that
+    // carries a reason: setReady(false) is a no-op and 'lsbar' names only WHO
+    // is missing, never why. That limit is real and is not papered over here.
+    if (seedRoomState === 'failed') {
+      btxt = 'This console cannot start in the room — ' + (seedRoomWhy || 'the boot seed could not be applied') +
+             '. Everyone in a room has to begin from the same frame 0, so it will not start one it would ' +
+             'immediately diverge from. Leave the room to play on your own.';
+      bcls = 'hold';
+    } else if (seedRoomState === 'pending') {
+      btxt = 'Preparing the game — this console is still being brought to the same starting point as everyone else.';
+      bcls = 'hold';
+    }
     if (btxt !== ROOM.lastBarrier) { bar.textContent = btxt; bar.className = bcls; ROOM.lastBarrier = btxt; }
 
     // The ready button exists only while there is something to be ready FOR.
     if (rdy) {
-      const canReady = !b.started && youPort != null && t.you && !t.you.ready && netLocalLoad() >= 1;
+      // ⚠ THE SEED IS PART OF BEING LOADED. netLocalLoad() answers 1 the moment
+      // `booted` is set, which happens BEFORE the gate is even armed — so on a
+      // seeded disc it is not, on its own, an answer to "is this console ready
+      // to be frame 0". A console still fetching or applying the seed must not
+      // be able to declare itself ready, and one that COULD NOT seed must never
+      // be able to: it would start a room it is guaranteed to diverge from.
+      const seedHold = (seedRoomState === 'pending' || seedRoomState === 'failed');
+      const canReady = !b.started && youPort != null && t.you && !t.you.ready &&
+                       netLocalLoad() >= 1 && !seedHold;
       rdy.style.display = (!b.started && youPort != null) ? '' : 'none';
       rdy.disabled = !canReady;
       rdy.textContent = (t.you && t.you.ready) ? "You're ready" :
+        seedRoomState === 'failed'  ? 'Cannot start — see below' :
+        seedRoomState === 'pending' ? 'Preparing the game…' :
         (netLocalLoad() < 1 ? 'Loading the game…' : "I'm ready");
     }
   }
@@ -6633,6 +6825,10 @@
       readyShown: !!($('netReady') && $('netReady').style.display !== 'none'),
       readyEnabled: !!($('netReady') && !$('netReady').disabled),
       localLoad: netLocalLoad(),
+      // The seed, for rigs: 'ok' means the CORE confirmed the restore, not that
+      // a message was posted. dreamcast/tools/room_crossdevice_test.mjs asserts
+      // both peers reach 'ok' before either can press ready.
+      seed: { state: seedRoomState, why: seedRoomWhy, disc: roomDiscTag() },
     };
   };
 
@@ -6764,7 +6960,7 @@
         // same game. #romSelect is what this console loaded (the room's
         // 'room-game' handler sets it for a joiner), so it is the honest
         // answer to "what am I holding at frame 0".
-        if (typeof sess.setReady === 'function') sess.setReady(true, currentGameKey());
+        if (typeof sess.setReady === 'function') sess.setReady(true, roomDiscTag());
         else pageLog('[net] this build has no start barrier yet (session.setReady is missing)');
       } catch (e) { pageLog('[net] setReady threw: ' + ((e && e.message) || e)); }
       netRoomRender();
