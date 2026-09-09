@@ -184,7 +184,50 @@
       transform: translate(-50%, -50%);
       width: 100%; height: 100%; min-width: 44px; min-height: 44px;
     }
-</style>
+
+    /* ── ONLINE PLAY (lockstep room). Shape copied from genesis.html so the
+       two consoles present the same control to a player. ── */
+    #netOverlay { position: fixed; inset: 0; z-index: 2147483000; display: none;
+      align-items: center; justify-content: center; background: rgba(0,0,0,.72); }
+    #netOverlay.on { display: flex; }
+    #netBox { background: #15171a; color: #e8e8e8; border: 1px solid #444; border-radius: 14px;
+      padding: 20px 22px; width: min(460px, 94vw); max-height: 88vh; overflow: auto;
+      box-shadow: 0 12px 48px rgba(0,0,0,.6); font: 14px/1.5 system-ui, sans-serif; }
+    #netBox h6 { margin: 0 0 6px; font-size: 18px; color: #fff; }
+    #netBox .lead { color: #9aa; margin: 0 0 14px; font-size: 13px; }
+    #netRow { display: flex; gap: 10px; margin-bottom: 12px; }
+    #netRow button, .netActions button { flex: 1; min-height: 44px; border-radius: 9px;
+      border: 1px solid #555; background: #2a2d31; color: #eee; font-size: 14px; cursor: pointer; }
+    #netRow button.on, #netBox button.primary { background: #2b7cd3; border-color: #2b7cd3; color: #fff; font-weight: 600; }
+    .netLabel { color: #9aa; font-size: 12px; margin: 10px 0 4px; text-transform: uppercase; letter-spacing: .06em; }
+    #netCode { font: 700 30px/1.1 ui-monospace, Menlo, monospace; letter-spacing: 5px; text-align: center;
+      background: #0e1013; border: 1px dashed #4a4; border-radius: 10px; padding: 13px; color: #9f9; user-select: all; }
+    #netCodeIn { width: 100%; box-sizing: border-box; min-height: 44px; font: 700 20px/1 ui-monospace, Menlo, monospace;
+      letter-spacing: 4px; text-align: center; text-transform: uppercase; background: #0e1013; color: #eee;
+      border: 1px solid #555; border-radius: 9px; padding: 11px; }
+    #netGame { width: 100%; box-sizing: border-box; min-height: 44px; background: #0e1013; color: #eee;
+      border: 1px solid #555; border-radius: 9px; padding: 10px 12px; font-size: 15px; }
+    .netActions { display: flex; gap: 10px; margin-top: 12px; }
+    #netRoster { list-style: none; margin: 6px 0 0; padding: 0; }
+    #netRoster li { display: flex; align-items: center; gap: 9px; padding: 5px 0; font-size: 13px; }
+    #netRoster .dot { width: 9px; height: 9px; border-radius: 50%; background: #666; flex: none; }
+    #netRoster .dot.on { background: #5c5; box-shadow: 0 0 8px #5c5; }
+    #netRoster .dot.me { background: #6af; box-shadow: 0 0 8px #6af; }
+    #netStatus { margin-top: 12px; font-size: 13px; color: #9aa; }
+    #netStatus.good { color: #7ee787; } #netStatus.bad { color: #ff7b72; } #netStatus.busy { color: #d8b44a; }
+    /* The live session readout, over the picture. Hidden with no session, so
+       single player is untouched. */
+    #netHud { position: absolute; left: 8px; top: 8px; z-index: 40; display: none;
+      font: 11px/1.45 ui-monospace, Menlo, monospace; color: #cfe; background: rgba(0,0,0,.55);
+      border: 1px solid #2a3a44; border-radius: 7px; padding: 6px 9px; pointer-events: none; max-width: 70%; }
+    #netHud.on { display: block; }
+    #netHud .mode { color: #7ee787; font-weight: 700; }
+    #netHud .warn { color: #d8b44a; }
+    #netDesync { position: absolute; left: 50%; top: 12px; transform: translateX(-50%); z-index: 41;
+      display: none; max-width: 90%; font: 12px/1.5 system-ui, sans-serif; color: #fff;
+      background: rgba(140,20,20,.94); border: 1px solid #f66; border-radius: 8px; padding: 8px 12px; }
+    #netDesync.on { display: block; }
+  </style>
   <!-- THE FLOOR NO RUNTIME GATE CAN REACH.  This page had no <noscript> at all, so a
        visitor with JS disabled (blocked by an extension, or on a browser where the first
        script threw) got the full shell — including an enabled-looking Start button that
@@ -210,6 +253,9 @@
   <div id="controlBar">
     <select id="romSelect"></select>
     <button id="btnStart">Start</button>
+    <!-- Hidden until Netplay.supported() proves the browser can do it: a button
+         that does nothing when pressed reads as "the site is broken". -->
+    <button id="btnNet" type="button" hidden>👥 Play Online</button>
     <button id="btnSave" disabled>Save State</button>
     <button id="btnLoad" disabled>Load State</button>
     <button id="btnExport" disabled>⬆ Export State</button>
@@ -270,7 +316,49 @@
     </div>
   </div>
   <div id="rotateHint">Landscape gives a bigger picture.</div>
+  <div id="netHud" aria-live="polite"></div>
+  <div id="netDesync" role="alert" aria-live="assertive"></div>
   <div id="toast"></div>
+</div>
+
+<div id="netOverlay">
+  <div id="netBox">
+    <h6>👥 Play Online</h6>
+    <p class="lead">Everyone runs the game on their own machine and plays together, exactly like
+      two controllers plugged into one PlayStation. <b>Join the room first</b> — you do not need a
+      disc loaded yet. Once you are both in, you each press Start and the two consoles begin on
+      the same frame.</p>
+    <div id="netRow">
+      <button id="netHostBtn" class="primary" type="button">Open a room</button>
+      <button id="netJoinBtn" type="button">Join a room</button>
+    </div>
+    <div id="netHostPane" style="display:none">
+      <div class="netLabel">Share this code</div>
+      <div id="netCode">·····</div>
+      <div class="netActions"><button id="netCopy" type="button">Copy code</button></div>
+    </div>
+    <div id="netJoinPane" style="display:none">
+      <div class="netLabel">Game the room is playing</div>
+      <select id="netGame"></select>
+      <div class="netLabel">Their code</div>
+      <input id="netCodeIn" type="text" maxlength="5" autocomplete="off" autocapitalize="characters"
+             spellcheck="false" placeholder="ABC12" inputmode="latin">
+      <div class="netActions"><button id="netGo" class="primary" type="button">Join</button></div>
+    </div>
+    <!-- One row per CONTROLLER PORT of the console, filled from the engine's own
+         port count — never from a number written here. A PlayStation has two,
+         and this core implements exactly two (there is no multitap in it). -->
+    <div id="netRoom" style="display:none">
+      <div class="netLabel">The room <span id="netRoomPorts"></span></div>
+      <ul id="netRoster"></ul>
+      <span id="netBarrier"></span>
+    </div>
+    <div id="netStatus">Not connected.</div>
+    <div class="netActions">
+      <button id="netLeave" type="button" style="display:none">Leave</button>
+      <button id="netClose" type="button">Close</button>
+    </div>
+  </div>
 </div>
 <script>
 (function () {
@@ -294,6 +382,7 @@
     { label: 'Legend of Dragoon (Disc 3)', base: 'LegendOfDragoonDisc3', size: 559173888, chunks: chunkRange('LegendOfDragoonDisc3', 'g'), chunkSizes: [89128960,89128960,89128960,89128960,89128960,89128960,24400128] },
     { label: 'Legend of Dragoon (Disc 4)', base: 'LegendOfDragoonDisc4', size: 748204128, chunks: chunkRange('LegendOfDragoonDisc4', 'i'), chunkSizes: [89128960,89128960,89128960,89128960,89128960,89128960,89128960,89128960,35172448] }
   ];
+  var ROM_INDEX = 0;
   var ROM_NAME = ROMS[0].base, ROM_CHUNKS = ROMS[0].chunks, ROM_SIZE = ROMS[0].size || 0, ROM_CHUNK_SIZES = ROMS[0].chunkSizes || null;
   const KEYMAP = { up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', cross: 'z', circle: 'x', square: 's', triangle: 'd', l1: 'w', r1: 'r', l2: 'e', r2: 't', start: 'v', select: 'c' };
   const $ = id => document.getElementById(id);
@@ -365,7 +454,7 @@
   var workerReady = false; var workerReadyResolve = null;
   var workerReadyPromise = new Promise(function (res) { workerReadyResolve = res; });
   function _onWorkerReady() { if (workerReady) return; workerReady = true; pageLog('[ui] worker runtime ready'); if (workerReadyResolve) workerReadyResolve(); }
-  window.var_setup = function () { pageLog('[ui] var_setup — spawning worker'); SoundFeedStreamData = Module.cwrap('SoundFeedStreamData', 'null', ['number', 'number']); vram_ptr = Module._get_ptr(0); padStatus1 = Module._get_ptr(1); padStatus2 = Module._get_ptr(2); Module.SDL.defaults.copyOnLock = false; Module.SDL.defaults.opaqueFrontBuffer = false; pcsx_worker = new Worker('/ps1/ps1Wasm/dist/wasmpsx_worker.js?v=' + Date.now()); pcsx_worker.onmessage = onWorkerMsg; window.pcsx_worker = pcsx_worker; if (tryAllocVramSab()) { pcsx_worker.postMessage({ cmd: 'vramSab', sab: vramSAB }); pageLog('[vram-sab] installed (' + (VRAM_SAB_PAYLOAD_BYTES/1048576) + ' MiB)'); } setStatus('Runtime ready. Fetching ROM...'); fetchRomAndBoot(); };
+  window.var_setup = function () { pageLog('[ui] var_setup — spawning worker'); SoundFeedStreamData = Module.cwrap('SoundFeedStreamData', 'null', ['number', 'number']); vram_ptr = Module._get_ptr(0); padStatus1 = Module._get_ptr(1); padStatus2 = Module._get_ptr(2); Module.SDL.defaults.copyOnLock = false; Module.SDL.defaults.opaqueFrontBuffer = false; pcsx_worker = new Worker('/ps1/ps1Wasm/dist/wasmpsx_worker.js?v=' + Date.now() + (NET.session ? '&netgate=1' : '')); if (NET.session) { lsArmBeforeBoot(); pageLog('[lockstep] worker spawned GATED (?netgate=1) — the core will not run a frame this page did not ask for'); } pcsx_worker.onmessage = onWorkerMsg; window.pcsx_worker = pcsx_worker; if (tryAllocVramSab()) { pcsx_worker.postMessage({ cmd: 'vramSab', sab: vramSAB }); pageLog('[vram-sab] installed (' + (VRAM_SAB_PAYLOAD_BYTES/1048576) + ' MiB)'); } setStatus('Runtime ready. Fetching ROM...'); fetchRomAndBoot(); };
 
   var mobilePadState = { cross: false, circle: false, square: false, triangle: false, l1: false, r1: false, l2: false, r2: false, start: false, select: false, up: false, down: false, left: false, right: false };
 
@@ -631,6 +720,14 @@
     // canvas for the streaming host to captureStream(). Streaming is cancelled;
     // this page draws for its own viewer and nobody else.
     Module._CheckJoy(); Module._CheckKeyboard(); updatePadState();
+    // ⚠ UNDER LOCKSTEP THIS SAMPLER MUST NOT REACH THE CORE. The gated step
+    // carries the pads for BOTH ports, built from the engine's agreed image;
+    // an 8 ms wall-clock poll pushing this machine's own live PADSTATE
+    // (analog sticks included) on top of that is a host-timed guest-state
+    // write, which is a desync by construction. CheckJoy/CheckKeyboard still
+    // run above so mobilePadState — the only thing that crosses the wire —
+    // stays current.
+    if (LS.armed) { setTimeout(pollController, 8); return; }
     var src = Module.HEAPU8.subarray(padStatus1, padStatus1 + 48);
     var arr; while (states_arrs.length > 50) states_arrs.pop();
     if (states_arrs.length > 0) { arr = states_arrs.pop(); arr.set(src); } else arr = new Uint8Array(src);
@@ -652,13 +749,28 @@
   function onWorkerMsg(e) {
     var data = e.data;
     switch (data.cmd) {
-      case 'print': pageLog('> ' + data.txt); break;
+      case 'print': {
+        pageLog('> ' + data.txt);
+        // THE START BARRIER. "My core is booted and holding, on this disc."
+        // Nobody runs frame 0 until every seated peer has said this about the
+        // SAME disc. The worker announces its own boot, so this is the moment
+        // the barrier can honestly be cleared — not when the page finished
+        // SENDING the disc.
+        // ⚠ Under the gate the core has run ZERO frames at this point: the
+        // worker's pcsx_mainloop() pump is itself gated, so romEnd's call to it
+        // does nothing. Frame 0 is the first frame the engine admits.
+        if (LS.armed && /romEnd (lazy-)?booted/.test(String(data.txt))) lsDeclareReady();
+        break;
+      }
       case 'setStatus': setStatus(data.txt); break;
       case 'setUI': break;
       case 'workerReady': _onWorkerReady(); break;
       case 'render': { var _t0 = performance.now(); if (_perfLastRenderMs) { var _gap = _t0 - _perfLastRenderMs; _perfGapSum += _gap; if (_gap > _perfGapMax) _perfGapMax = _gap; _perfGapCount++; } _perfLastRenderMs = _t0; var v = data.vram; Module.HEAPU8.set(v, vram_ptr); pcsx_worker.postMessage({ cmd: 'return_vram', vram: v }, [v.buffer]); Module._render(data.x, data.y, data.sx, data.sy, data.dx, data.dy, data.rgb24); renderFrames++; var _t1 = performance.now(); var _proc = _t1 - _t0; _perfProcSum += _proc; if (_proc > _perfProcMax) _perfProcMax = _proc; var now = _t1; if (now - lastFpsLog > 1000) { var _gapAvg = _perfGapCount ? (_perfGapSum / _perfGapCount).toFixed(1) : '?'; var _procAvg = renderFrames ? (_perfProcSum / renderFrames).toFixed(2) : '?'; fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now - lastFpsLog)).toFixed(1) + ' | gap avg=' + _gapAvg + 'ms max=' + _perfGapMax.toFixed(0) + 'ms | proc avg=' + _procAvg + 'ms max=' + _perfProcMax.toFixed(1) + 'ms'; renderFrames = 0; lastFpsLog = now; _perfGapSum = 0; _perfGapMax = 0; _perfGapCount = 0; _perfProcSum = 0; _perfProcMax = 0; } break; }
       case 'renderTick': { var _t0 = performance.now(); if (_perfLastRenderMs) { var _gap = _t0 - _perfLastRenderMs; _perfGapSum += _gap; if (_gap > _perfGapMax) _perfGapMax = _gap; _perfGapCount++; } _perfLastRenderMs = _t0; if (!vramSabI32 || !vramSabBytes) break; var rx,ry,rsx,rsy,rdx,rdy,rrgb,ok=false; for (var attempt=0; attempt<8; attempt++) { var s0 = Atomics.load(vramSabI32, 0); if (s0 & 1) continue; rx=Atomics.load(vramSabI32,1); ry=Atomics.load(vramSabI32,2); rsx=Atomics.load(vramSabI32,3); rsy=Atomics.load(vramSabI32,4); rdx=Atomics.load(vramSabI32,5); rdy=Atomics.load(vramSabI32,6); rrgb=Atomics.load(vramSabI32,7); Module.HEAPU8.set(vramSabBytes, vram_ptr); var s1 = Atomics.load(vramSabI32, 0); if (s1 === s0) { ok = true; break; } } if (!ok) break; Module._render(rx,ry,rsx,rsy,rdx,rdy,rrgb); renderFrames++; var _t1 = performance.now(); var _proc = _t1 - _t0; _perfProcSum += _proc; if (_proc > _perfProcMax) _perfProcMax = _proc; var now2 = _t1; if (now2 - lastFpsLog > 1000) { var _gapAvg2 = _perfGapCount ? (_perfGapSum / _perfGapCount).toFixed(1) : '?'; var _procAvg2 = renderFrames ? (_perfProcSum / renderFrames).toFixed(2) : '?'; fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now2 - lastFpsLog)).toFixed(1) + ' | gap avg=' + _gapAvg2 + 'ms max=' + _perfGapMax.toFixed(0) + 'ms | proc avg=' + _procAvg2 + 'ms max=' + _perfProcMax.toFixed(1) + 'ms [SAB]'; renderFrames = 0; lastFpsLog = now2; _perfGapSum = 0; _perfGapMax = 0; _perfGapCount = 0; _perfProcSum = 0; _perfProcMax = 0; } break; }
       case 'return_states': states_arrs.push(data.states); break;
+      case 'netFrame': lsOnWorkerFrame(); break;
+      case 'netHashResult': lsOnWorkerHash(data); break;
+      case 'netUngated': pageLog('[lockstep] core handed back to its own scheduler'); break;
       // AUDIO BATCH FROM THE WORKER.
       //
       // Two invariants that were both broken here, and each one silently
@@ -884,7 +996,7 @@
     }
     return fetchRomStreamAndBoot();
   }
-  var started = false; function startEmulator() { if (started) return; started = true; try { window.XboxInput && XboxInput.offerGameControls('ps1 start'); } catch (e) {} var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; ROM_SIZE = pick.size || 0; ROM_CHUNK_SIZES = pick.chunkSizes || null; SAVE_KEY = ROM_NAME + '.ps1state'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); bindAudioDiagCtx(); } } catch (e) {} pageLog('[ui] loading /ps1/ps1Wasm/dist/pcsx_ww.js ...'); setStatus('Loading LLVM runtime...'); var s = document.createElement('script'); s.src = '/ps1/ps1Wasm/dist/pcsx_ww.js?v=' + Date.now(); document.body.appendChild(s); }
+  var started = false; function startEmulator() { if (started) return; started = true; try { window.XboxInput && XboxInput.offerGameControls('ps1 start'); } catch (e) {} var sel = $('romSelect'); if (sel) { ROM_INDEX = +sel.value || 0; var pick = ROMS[ROM_INDEX] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; ROM_SIZE = pick.size || 0; ROM_CHUNK_SIZES = pick.chunkSizes || null; SAVE_KEY = ROM_NAME + '.ps1state'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); bindAudioDiagCtx(); } } catch (e) {} pageLog('[ui] loading /ps1/ps1Wasm/dist/pcsx_ww.js ...'); setStatus('Loading LLVM runtime...'); var s = document.createElement('script'); s.src = '/ps1/ps1Wasm/dist/pcsx_ww.js?v=' + Date.now(); document.body.appendChild(s); }
   $('btnStart').addEventListener('click', startEmulator);
   const DB_NAME = 'PS1WASMDB', STORE = 'PS1WASMSTATES'; var SAVE_KEY = ROM_NAME + '.ps1state';
   function openDB() { return new Promise((resolve, reject) => { var req = indexedDB.open(DB_NAME); req.onupgradeneeded = e => e.target.result.createObjectStore(STORE); req.onsuccess = e => resolve(e.target.result); req.onerror = () => reject(req.error); }); }
@@ -1053,76 +1165,562 @@
   document.addEventListener('touchstart', function (e) { if (e.target.closest('.faceBtn, .shoulderBtn, .dpadV, .dpadH, .sysBtn, .menuBtn')) {} }, { passive: true });
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // ONLINE PLAY IS NOT WIRED ON THIS PAGE YET — AND UNLIKE snes/gba, THAT IS A
-  // JOB, NOT A LIMIT.
+  // ONLINE PLAY — DETERMINISTIC LOCKSTEP. Every player runs their own PS1, only
+  // pad bytes cross the wire, and nobody advances a frame until every seated
+  // port has an input for it. Streaming was cancelled by user directive
+  // 2026-09-08 ("WE WILL NOT USE STREAMING!"); the bar is "IT WILL BE AS IF
+  // MULTIPLAYER ARE ON THE SAME CONSOLE".
   //
-  // WHAT WAS HERE. Until 2026-09-08 this page was the host half of a STREAMING
-  // session: it captured its own canvas and audio, published them over WebRTC,
-  // and dropped a remote player's buttons into CONTROLLER PORT 2. The user
-  // cancelled streaming outright ("WE WILL NOT USE STREAMING!") and specified
-  // deterministic lockstep instead: every player runs their own core and only
-  // pad bytes cross the wire.
+  // WHY THIS CORE CAN CARRY IT — each claim measured against the SHIPPED binary,
+  // not inferred from the source tree (which is stale: the shipped worker JS was
+  // hand-patched after the wasm was built, and `_scheduleMainLoop` appears
+  // nowhere in pcsx-wasm-src/).
   //
-  // WHY THIS CORE CAN CARRY LOCKSTEP. Everything the architecture needs is
-  // already here, which is NOT true of snes.html or gba.html:
-  //   * TWO REAL PORTS. plugins/sdlinput/pad.h:126 `PADSTATE PadState[2]`, and
-  //     the SIO picks the port from the guest's own control register
-  //     (libpcsxcore/sio.c: `CtrlReg & 0x2002` selects PAD1_startPoll(1) or
-  //     PAD2_startPoll(2)). This page already writes both, at a 24-byte stride.
-  //   * A REAL ONE-FRAME CALL. `_one_iter()` runs exactly one frame — its CPU
-  //     loop is `while (!DoGPUUpdate) execI();` and the scanline counter raises
-  //     DoGPUUpdate at end-of-frame — and it is already exported
-  //     (Makefile.modern: WORKER_EXPORT=..._one_iter...).
-  //   * NO GUEST-VISIBLE HOST CLOCK that I could find: the BIOS rand() HLE is an
-  //     LCG seeded from GUEST RAM (psxbios.c), so it is deterministic and is
-  //     captured by savestates, and the CD shell-open time() branch is dead
-  //     because SetCdOpenCaseTime() has no callers.
+  //   * TWO REAL PORTS, ALREADY ON THE WIRE. pad.h:126 `PADSTATE PadState[2]`;
+  //     PADquery() returns PSE_PAD_USE_PORT1|PSE_PAD_USE_PORT2
+  //     (pad_worker.c:63-65); sio.c picks the port from the guest's own control
+  //     register (`CtrlReg & 0x2002` -> PAD1_startPoll(1) / PAD2_startPoll(2),
+  //     sio.c:255-261) and PADstartPoll sets CurPad = pad-1 so PADpoll reads
+  //     g.PadState[1]. pollController has been shipping all 48 bytes — BOTH
+  //     PADSTATE entries, 24-byte stride — to the worker for a long time with
+  //     nothing written into port 2's half.
   //
-  // WHAT STANDS IN THE WAY, PRECISELY. The core DRIVES ITSELF. `_one_iter()`
-  // ends with an EM_ASM that calls `_scheduleMainLoop(delay)`, a MessageChannel
-  // /setTimeout hop in the worker's post-JS which calls `pcsx_mainloop()` which
-  // calls `_one_iter()` again. The page never asks for a frame at all — it only
-  // pushes pad bytes on an 8 ms setTimeout and receives rendered frames. So the
-  // frame gate has nowhere to stand: there is no point at which this page can
-  // decide whether frame N may run.
+  //   * A REAL ONE-FRAME CALL. `_one_iter()` runs exactly one video frame — its
+  //     CPU loop is `while (!DoGPUUpdate) execI();` and psxcounters.c:293-298
+  //     raises DoGPUUpdate once per vblank — and it is exported
+  //     (Makefile.modern:7 WORKER_EXPORT=...,_one_iter,...).
   //
-  // THE SCOPED JOB, so this is a plan and not a wish:
-  //   1. In the worker, replace `globalThis._scheduleMainLoop` with a no-op and
-  //      drive `_one_iter()` from a message the page sends per gated frame.
-  //      `_scheduleMainLoop` is plain post-JS, NOT baked into the wasm, so this
-  //      needs no rebuild of the core.
-  //   2. Move the pad write from the 8 ms poll into that per-frame message, so
-  //      input is a function of the emulated frame index rather than of wall
-  //      time — the same change that made the Genesis rig able to answer a
-  //      determinism question at all.
-  //   3. THEN MEASURE, before believing any of it: write the ps1 analogue of
-  //      tools/genesis_determinism_probe.mjs and show two independent cores
-  //      staying byte-identical from a cold boot. The `updated_display` frame
-  //      limiter (plugins/dfxvideo/fps.c) derives its delay from gettimeofday
-  //      and gates a deferred `EmuUpdate()`, so it is the first thing that
-  //      would have to be shown not to move guest state.
-  //   4. Only then copy genesis.html's room and frame gate.
+  //   * THE SELF-DRIVE SEAM IS JS, SO NO CORE REBUILD. one_iter ends with an
+  //     EM_ASM whose body is `_scheduleMainLoop($0)` — ASM_CONSTS[199284] in
+  //     wasmpsx_worker.js. That body is JS, not wasm:
+  //         grep -c -a scheduleMainLoop wasmpsx_worker.wasm  ->  0
+  //     The wasm resolves the bare name from the worker global scope at call
+  //     time, so the LOCKSTEP FRAME GATE block appended to wasmpsx_worker.js
+  //     redirects it. The gate is armed from the WORKER URL (?netgate=1) rather
+  //     than by a message, because pcsx_init() starts the self-drive chain from
+  //     inside romEnd and a message could not land before frame 0.
   //
-  // ⚠ UNTIL STEP 3 HAS A RESULT, THIS PAGE OFFERS NO ONLINE PLAY. The button is
-  // removed rather than left pointing at a lobby that streams, and no room can
-  // be opened: shipping a frame gate over an unmeasured core would produce two
-  // consoles that silently diverge, which is worse than no online play because
-  // it looks like it is working.
+  // TWO HOST-CLOCK LEAKS WERE CLOSED, because either one desyncs a room:
+  //   1. AUDIO CREDIT. The page's audio drain posts 'soundBytes', which
+  //      DECREMENTS SoundGetBytesBuffered_value in the worker — and
+  //      dfsound/spu.c:469-474 makes SPUasync bail while that counter is over
+  //      TESTSIZE. That is a guest-state write on an ASYNCHRONOUS message, so
+  //      its timing differs per peer. Under the gate the worker zeroes the
+  //      counter inside each gated step instead, which is what a
+  //      perfectly-draining sink looks like and is a pure function of the frame
+  //      index.
+  //   2. THE PAD BUFFER IS BUILT, NOT COPIED. Single-player copies 48 live bytes
+  //      out of the main module's g.PadState — which includes analog stick
+  //      values that CheckJoy() wrote from THIS machine's gamepad. Under
+  //      lockstep the buffer is constructed from the engine's agreed image and
+  //      nothing else, with fixed PadMode/PadID/JoyKeyStatus/analog-centres.
+  //
+  // ⚠ KeyStatus IS ACTIVE-LOW — 0xFFFF at rest, a press CLEARS a bit
+  // (xkb.c:43 `KeyStatus &= ~(1 << j)`). And PADpoll computes
+  // `n = KeyStatus & JoyKeyStatus`, so JoyKeyStatus must also be 0xFFFF or every
+  // button reads as held.
   // ═══════════════════════════════════════════════════════════════════════════
 
-  // The page's liveness seam. NOT a netplay seam any more, and it does not
-  // pretend to be one. `live` is kept because tools/mobile_chrome_test.mjs uses
-  // it as its "the emulator is actually running" witness.
+  var PS1_PORTS = 2;            // this core has exactly two; there is no multitap
+  var LS_PAD_BYTES = 2;         // KeyStatus is 16 bits, so two bytes carry a pad exactly
+  var PADSTATE_STRIDE = 24;     // sizeof(PADSTATE), measured: 0x201134 - 0x20111c
+  var PS1_HW_HZ = 59.94;        // NTSC PSX video rate; every shipped disc here is NTSC-U
+  var FRAME_MS = 1000 / PS1_HW_HZ;
+  var MAX_CATCHUP_FRAMES = 4;
+
+  var NET = { session: null, role: null, leaving: false };
+  var LS = {
+    armed: false, running: false, fault: null,
+    workerFrame: 0, fedTo: 0, inFlight: 0,
+    frames: 0, hashes: 0, hashEvery: 60,
+    stalling: false, waitingOn: [], stallReason: null,
+    accum: 0, lastTs: 0,
+    // ---- WHY IS THE GUEST NOT AT 1.000x? ----------------------------------
+    // Three different causes produce the same low rate, and they have opposite
+    // fixes, so the page records which one is actually happening:
+    //   svc*      — wall time from posting a netStep to the worker's netFrame
+    //               reply. If the mean approaches the frame budget (16.68 ms),
+    //               the CORE is the limiter and no page-side change helps.
+    //   capHits   — ticks that stopped because the in-flight lookahead was
+    //               full. Symptom of a slow worker OR of too tight a bound.
+    //   gateStalls— ticks that stopped because the ENGINE had no input yet,
+    //               i.e. genuinely waiting on the other player.
+    svcSum: 0, svcCount: 0, svcMax: 0, pend: [],
+    capHits: 0, gateStalls: 0,
+  };
+
+  function lsEngine() {
+    var s = NET.session;
+    if (!s) return null;
+    try { return s.ls || null; } catch (e) { return null; }
+  }
+  function netSupported() { return !!(window.Netplay && Netplay.supported && Netplay.supported()); }
+
+  // The local player's KeyStatus, active-low, from the same mobilePadState that
+  // keyboard, touch and gamepad all funnel into. This is the ONLY thing about
+  // this machine that crosses the wire.
+  function ps1LocalMask() {
+    var b0 = 0xFF, b1 = 0xFF;
+    if (mobilePadState.select) b0 &= ~(1 << 0); if (mobilePadState.start) b0 &= ~(1 << 3);
+    if (mobilePadState.up) b0 &= ~(1 << 4); if (mobilePadState.right) b0 &= ~(1 << 5);
+    if (mobilePadState.down) b0 &= ~(1 << 6); if (mobilePadState.left) b0 &= ~(1 << 7);
+    if (mobilePadState.l2) b1 &= ~(1 << 0); if (mobilePadState.r2) b1 &= ~(1 << 1);
+    if (mobilePadState.l1) b1 &= ~(1 << 2); if (mobilePadState.r1) b1 &= ~(1 << 3);
+    if (mobilePadState.triangle) b1 &= ~(1 << 4); if (mobilePadState.circle) b1 &= ~(1 << 5);
+    if (mobilePadState.cross) b1 &= ~(1 << 6); if (mobilePadState.square) b1 &= ~(1 << 7);
+    return [b0, b1];
+  }
+
+  // A machine holding several seats gets its first seat from the real controls;
+  // further seats would need a second local pad, so they rest.
+  function lsLocalPads() {
+    var ls = lsEngine();
+    var ports = (ls && ls.localPorts && ls.localPorts.length) ? ls.localPorts : [0];
+    var m = ps1LocalMask();
+    var out = {};
+    ports.forEach(function (port, k) {
+      var b = new Uint8Array(LS_PAD_BYTES);
+      b[0] = (k === 0) ? m[0] : 0xFF;
+      b[1] = (k === 0) ? m[1] : 0xFF;
+      out[port] = b;
+    });
+    return out;
+  }
+
+  // Build the 48-byte PADSTATE pair the worker memcpy's over &g.PadState[0].
+  // Constructed from the agreed image ONLY — see the host-clock note above.
+  function lsPadBuffer(image, padBytes) {
+    var buf = new Uint8Array(PADSTATE_STRIDE * PS1_PORTS);
+    for (var p = 0; p < PS1_PORTS; p++) {
+      var base = p * PADSTATE_STRIDE;
+      var k0 = image[p * padBytes], k1 = image[p * padBytes + 1];
+      // An unseated port must read as "nothing held", not as zero.
+      if (k0 === undefined) k0 = 0xFF;
+      if (k1 === undefined) k1 = 0xFF;
+      buf[base + 4] = 0;        // PadMode = 0 (digital)
+      buf[base + 5] = 0x41;     // PadID   = 0x41 (standard digital pad)
+      buf[base + 6] = k0; buf[base + 7] = k1;        // KeyStatus
+      buf[base + 8] = 0xFF; buf[base + 9] = 0xFF;    // JoyKeyStatus — masks nothing
+      buf[base + 10] = 0x80; buf[base + 11] = 0x80;  // analog centres
+      buf[base + 12] = 0x80; buf[base + 13] = 0x80;
+    }
+    return buf;
+  }
+
+  // ---- releasing the gate, which is not optional -----------------------------
+  // ⚠ A GATED CORE WHOSE ROOM IS GONE IS A FROZEN CONSOLE. If the session ends
+  // while the gate is armed, nothing sends netStep again and the player is left
+  // on a still picture with no explanation. Leaving hands the console back.
+  function lsDisarm(why) {
+    if (!LS.armed) return;
+    LS.armed = false; LS.running = false;
+    LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
+    // Hand the core back to its own scheduler, and stop holding a leaver's pad
+    // down on port 2.
+    try {
+      if (pcsx_worker) {
+        pcsx_worker.postMessage({ cmd: 'netUngate' });
+        var rest = lsPadBuffer(new Uint8Array(PS1_PORTS * LS_PAD_BYTES).fill(0xFF), LS_PAD_BYTES);
+        pcsx_worker.postMessage({ cmd: 'padStatus', states: rest }, [rest.buffer]);
+      }
+    } catch (e) {}
+    pageLog('[lockstep] frame gate RELEASED — ' + why + '. This console free-runs from here and is '
+      + 'no longer sharing frames with anybody.');
+  }
+
+  // ---- arming, BEFORE the worker exists --------------------------------------
+  // The gate has to be armed at worker-construction time (?netgate=1), so this
+  // runs before var_setup() spawns it. That is why a room may not be opened on a
+  // console that is already running.
+  function lsArmBeforeBoot() {
+    if (!NET.session || LS.armed) return false;
+    var ls = lsEngine();
+    if (!ls) {
+      LS.fault = 'the room published no lockstep engine, so this core cannot be frame-gated';
+      pageLog('[lockstep] ⚠ ' + LS.fault);
+      return false;
+    }
+    LS.armed = true; LS.running = false; LS.fault = null;
+    LS.workerFrame = 0; LS.fedTo = 0; LS.inFlight = 0; LS.frames = 0; LS.hashes = 0;
+    LS.accum = 0; LS.lastTs = 0;
+    pageLog('[lockstep] ARMED before the first frame — this core advances only when every seated '
+      + 'port has an input for the frame. ports=' + JSON.stringify(ls.roster)
+      + ' mine=' + JSON.stringify(ls.localPorts));
+    return true;
+  }
+
+  // "My core is booted and holding at frame 0, on this disc." Nobody runs frame
+  // 0 until EVERY seated peer has said this about the SAME disc — the engine
+  // COMPARES the string rather than trusting it.
+  function lsDisc() {
+    var r = ROMS[ROM_INDEX] || ROMS[0];
+    return r.label + ':' + (r.size | 0);
+  }
+  function lsDeclareReady() {
+    if (!NET.session || !LS.armed) return;
+    try { NET.session.setReady(true, lsDisc()); } catch (e) {
+      pageLog('[lockstep] ⚠ start barrier refused: ' + ((e && e.message) || e));
+    }
+  }
+
+  // ---- THE FEED LOOP ---------------------------------------------------------
+  // The core lives in a worker, so a frame cannot be run synchronously the way
+  // genesis.html does it. The page feeds gated frames with a bounded lookahead
+  // and the worker's netFrame reply retires them.
+  function lsFeedOne() {
+    var ls = lsEngine();
+    if (!ls) { lsDisarm('the session went away'); return false; }
+    if (ls.state !== 'running' && ls.state !== 'stalled') {
+      // The BARRIER decides when frame 0 runs, not this page.
+      if (LS.running) {
+        LS.running = false;
+        pageLog('[lockstep] frame gate DISENGAGED — engine state ' + ls.state);
+      }
+      return false;
+    }
+    if (!LS.running) {
+      LS.running = true;
+      pageLog('[lockstep] FRAME GATE ENGAGED at frame ' + ls.frame + ' — delay=' + ls.delay
+        + ' frames (' + Math.round(ls.delay * FRAME_MS) + ' ms), ports=' + JSON.stringify(ls.roster));
+    }
+    var r = ls.beginFrame(lsLocalPads());
+    if (!r || !r.ready) {
+      LS.stalling = !!(r && r.reason === 'stall');
+      LS.stallReason = r ? r.reason : 'the engine returned nothing';
+      LS.waitingOn = (r && r.waitingOn) ? r.waitingOn.slice() : [];
+      return false;
+    }
+    LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
+
+    var pb = ls.padBytes | 0;
+    var states = lsPadBuffer(r.image, pb);
+    // ⚠ THE LOCAL PAD GOES ROUND THROUGH THE ENGINE TOO. Applying our own bytes
+    // directly would land them a different number of frames earlier here than
+    // there — a desync by construction, and exactly the shortcut the old relay
+    // took.
+    pcsx_worker.postMessage({ cmd: 'netStep', frame: r.frame, count: 1, states: states.buffer }, [states.buffer]);
+    LS.pend.push(performance.now());
+    LS.inFlight++;
+    LS.fedTo = r.frame + 1;
+    LS.frames++;
+
+    // The exact bytes the core was handed, for a test to assert on rather than a
+    // UI flag.
+    window.__ps1LsImage = Array.prototype.slice.call(r.image.subarray(0, ls.portCount * pb));
+    window.__ps1SentP1 = [r.image[0], r.image[1]];
+    window.__ps1SentP2 = [r.image[pb], r.image[pb + 1]];
+
+    // ⚠ THE INTERVAL COMES FROM THE ENGINE, NOT THIS PAGE'S COPY. The host's
+    // value is pushed to every guest in 'lsgo'; a page hashing on its own number
+    // would fingerprint DIFFERENT frames from its peers, and two machines that
+    // never hash the same frame compare nothing — a silently dead desync
+    // detector, which is the worst failure this file can have.
+    if (ls.wantsHash(r.frame)) {
+      pcsx_worker.postMessage({ cmd: 'netHash', frame: r.frame });
+    }
+    // The fingerprint is LATE — it comes back from the worker after the clock
+    // has moved — so the frame is closed with no hash and submitHash fills it in.
+    ls.endFrame(null);
+    return true;
+  }
+
+  function lsOnWorkerFrame() {
+    var t0 = LS.pend.shift();
+    if (t0 != null) {
+      var dt = performance.now() - t0;
+      LS.svcSum += dt; LS.svcCount++;
+      if (dt > LS.svcMax) LS.svcMax = dt;
+    }
+    LS.inFlight = Math.max(0, LS.inFlight - 1);
+    LS.workerFrame++;
+    window.__ps1Frames = (window.__ps1Frames | 0) + 1;
+  }
+  function lsOnWorkerHash(d) {
+    var ls = lsEngine();
+    if (!ls || typeof ls.submitHash !== 'function') return;
+    if (ls.submitHash(d.frame | 0, d.hash >>> 0)) LS.hashes++;
+  }
+
+  // Paced from rAF at exactly 1.000x. Speeding the guest up is forbidden.
+  function lsTick(ts) {
+    if (!LS.armed || !pcsx_worker) { LS.lastTs = 0; return; }
+    if (!LS.lastTs) { LS.lastTs = ts; LS.accum = 0; return; }
+    var d = ts - LS.lastTs; LS.lastTs = ts;
+    if (d > 100) d = 100;               // a long stall must not fast-forward the guest
+    LS.accum += d;
+    var lookahead = Math.max(1, (lsEngine() || {}).delay | 0);
+    var ran = 0, stalled = false;
+    while (LS.accum >= FRAME_MS && ran < MAX_CATCHUP_FRAMES) {
+      // Getting further ahead of the worker than the input delay is not a frame
+      // we are entitled to run; treat it exactly like a stall so the wait is not
+      // banked and then sprinted through.
+      if (LS.inFlight >= lookahead) { LS.capHits++; stalled = true; break; }
+      if (!lsFeedOne()) { LS.gateStalls++; stalled = true; break; }
+      LS.accum -= FRAME_MS; ran++;
+    }
+    // ⚠ AND THE WAIT MUST NOT BE BANKED ACROSS TICKS. Without this, `accum`
+    // grows by up to 100 ms every rAF while the other player is silent, and the
+    // moment their input lands the guest runs MAX_CATCHUP_FRAMES every tick
+    // until the debt clears — a fast-forward, which CLAUDE.md gate #9 forbids.
+    if (stalled && LS.accum > FRAME_MS) LS.accum = FRAME_MS;
+  }
+  (function lsRaf(ts) { requestAnimationFrame(lsRaf); lsTick(ts || 0); })(0);
+
+  // ---- the room -------------------------------------------------------------
+  function netStatus(msg, cls) {
+    var el = $('netStatus'); if (!el) return;
+    el.textContent = msg; el.className = cls || '';
+  }
+  function netGameId() { var r = ROMS[ROM_INDEX] || ROMS[0]; return r.label; }
+  function netTransport() {
+    // lib/netplay.js defaults to 'local' (BroadcastChannel, same browser only),
+    // which is a test transport. A real room needs a real one.
+    try {
+      var t = new URLSearchParams(location.search).get('net');
+      if (t === 'local') return 'local';
+    } catch (e) {}
+    return 'peerjs';
+  }
+
+  function netRoomRender() {
+    var ls = lsEngine(), s = NET.session;
+    var room = $('netRoom'), ul = $('netRoster');
+    if (!room || !ul || !s) return;
+    room.style.display = '';
+    var rep = (ls && ls.rosterReport) ? ls.rosterReport() : [];
+    var ports = (ls && ls.portCount) ? ls.portCount : PS1_PORTS;
+    var pl = $('netRoomPorts'); if (pl) pl.textContent = '(' + ports + ' controller ports)';
+    ul.innerHTML = '';
+    for (var p = 0; p < ports; p++) {
+      var row = rep.filter(function (r) { return r.port === p; })[0];
+      var li = document.createElement('li');
+      li.textContent = 'Port ' + (p + 1) + ' — '
+        + (!row ? 'empty'
+           : row.dropped ? 'left the room'
+           : row.local ? 'you'
+           : 'another player');
+      ul.appendChild(li);
+    }
+    var bar = $('netBarrier');
+    if (bar) {
+      bar.textContent = (ls && ls.state === 'waiting')
+        ? 'Waiting for everyone to be ready — nobody runs frame 0 alone.'
+        : (ls ? 'Room state: ' + ls.state : '');
+    }
+    $('netLeave').style.display = '';
+  }
+
+  function netOnDesync(d) {
+    var el = $('netDesync'); if (el) {
+      el.classList.add('on');
+      el.textContent = 'The consoles disagreed about the game state'
+        + (d && d.frame != null ? ' at frame ' + d.frame : '')
+        + '. Play has stopped rather than drifting apart silently.';
+    }
+    pageLog('[lockstep] ⚠ DESYNC ' + JSON.stringify(d || {}));
+  }
+
+  function netWire(session) {
+    NET.session = session;
+    var dz = $('netDesync'); if (dz) dz.classList.remove('on');
+    session.on('status', function (st) { netStatus(String(st && st.text || st || '')); });
+    session.on('desync', netOnDesync);
+    session.on('lockstep', function () { netRoomRender(); });
+    session.on('room', function () { netRoomRender(); });
+    session.on('roster', function () { netRoomRender(); });
+    session.on('barrier', function () { netRoomRender(); });
+    session.on('close', function () { lsDisarm('the room closed'); });
+    // ⚠ THE ENGINE MUST EXIST BEFORE THE FIRST PEER IS SEATED, and it must carry
+    // THIS console's numbers rather than lib/netplay.js's Dreamcast defaults
+    // (4 ports, 64-byte pads). A PSX pad is a 16-bit active-low KeyStatus, so
+    // two bytes carry it exactly and the per-frame image is 4 bytes, not 256.
+    try {
+      session.startLockstep({ portCount: PS1_PORTS, padBytes: LS_PAD_BYTES, hashEvery: LS.hashEvery });
+    } catch (e) {
+      pageLog('[lockstep] ⚠ startLockstep failed: ' + ((e && e.message) || e));
+    }
+    netRoomRender();
+  }
+
+  // ⚠ A ROOM MAY NOT BE OPENED ON A CONSOLE THAT IS ALREADY RUNNING. This is not
+  // politeness: the gate is armed at WORKER-CONSTRUCTION time (?netgate=1), so a
+  // player who pressed Start first would have an ungated worker and would
+  // free-run on their own clock while their peer sat at the start barrier
+  // forever. One console runs, the other is frozen, and neither says why.
+  function netRefuseIfRunning() {
+    if (!started) return false;
+    netStatus('This console is already running a game. Online play has to be set up BEFORE the game '
+      + 'starts, so that every player begins on the same frame — reload the page, join the room, then '
+      + 'press Start together.', 'bad');
+    return true;
+  }
+
+  async function netStartHost() {
+    if (NET.session) return;
+    if (netRefuseIfRunning()) return;
+    $('netHostPane').style.display = ''; $('netJoinPane').style.display = 'none';
+    var code = Netplay.makeCode(5);
+    $('netCode').textContent = code;
+    var game = netGameId();
+    NET.role = 'host';
+    netStatus('Room open for ' + game + '. Share the code — you both load the disc once you are in.', 'busy');
+    var s = new Netplay.Session({ game: game, host: true, code: code, portCount: PS1_PORTS, transport: netTransport() });
+    netWire(s);
+    pageLog('[net] room ' + code + ' open for ' + game);
+    await s.start();
+  }
+
+  async function netStartGuest() {
+    if (NET.session) return;
+    if (netRefuseIfRunning()) return;
+    var code = (($('netCodeIn') || {}).value || '').trim().toUpperCase();
+    if (!/^[A-HJ-NP-Z2-9]{5}$/.test(code)) {
+      netStatus('That does not look like a code — 5 characters, no I O 0 or 1.', 'bad');
+      return;
+    }
+    // lib/netplay.js refuses a pairing whose game names differ, so the joiner
+    // must name the same disc the host chose — hence the selector in the join
+    // pane. A wrong pick fails with "the other player is on <game>" rather than
+    // connecting to nothing.
+    var i = +(($('netGame') || {}).value || 0) || 0;
+    var game = (ROMS[i] || ROMS[0]).label;
+    ['romSelect'].forEach(function (id) {
+      var sel = $(id); if (!sel) return;
+      sel.value = String(i);
+      sel.dispatchEvent(new Event('change'));
+    });
+    NET.role = 'guest';
+    var s = new Netplay.Session({ game: game, host: false, code: code, portCount: PS1_PORTS, transport: netTransport() });
+    netWire(s);
+    // ⚠ NO START LOCK. Under streaming a joiner had no emulator and must not
+    // launch one. Under lockstep a joiner runs their own console and MUST start
+    // it — that lock was the single line that made this two-machines-one-emulator.
+    pageLog('[net] joining room ' + code + ' (' + game + ')');
+    await s.start();
+  }
+
+  function netLeave() {
+    var s = NET.session;
+    NET.leaving = true;
+    if (s) { try { s.close(); } catch (e) {} }
+    NET.session = null; NET.role = null;
+    lsDisarm('you left the room');
+    var lv = $('netLeave'); if (lv) lv.style.display = 'none';
+    $('netHostPane').style.display = 'none'; $('netJoinPane').style.display = 'none';
+    $('netRoom').style.display = 'none';
+    netStatus('Left the room.');
+    setTimeout(function () { NET.leaving = false; }, 2000);
+  }
+
+  // ---- the HUD, and wiring the controls -------------------------------------
+  var _hudAt = 0;
+  function netHudTick(ts) {
+    if (ts - _hudAt < 250) return;
+    _hudAt = ts;
+    var hud = $('netHud'); if (!hud) return;
+    if (!NET.session) { hud.classList.remove('on'); return; }
+    hud.classList.add('on');
+    var ls = lsEngine();
+    var bits = ['<span class="mode">LOCKSTEP</span> ' + (NET.role || '')];
+    if (ls) {
+      bits.push('frame ' + ls.frame + ' · delay ' + ls.delay);
+      bits.push('ports ' + JSON.stringify(ls.roster) + ' mine ' + JSON.stringify(ls.localPorts));
+    }
+    bits.push('fed ' + LS.frames + ' · ran ' + LS.workerFrame + ' · hashes ' + LS.hashes);
+    if (LS.stalling || LS.waitingOn.length) {
+      bits.push('<span class="warn">waiting for port ' + LS.waitingOn.join(',') + '</span>');
+    }
+    if (LS.fault) bits.push('<span class="warn">' + LS.fault + '</span>');
+    hud.innerHTML = bits.join('<br>');
+  }
+  (function hudRaf(ts) { requestAnimationFrame(hudRaf); netHudTick(ts || 0); })(0);
+
+  function netOpen() {
+    var sel = $('netGame');
+    if (sel && !sel.options.length) {
+      ROMS.forEach(function (r, i) {
+        var o = document.createElement('option');
+        o.value = String(i); o.textContent = r.label;
+        sel.appendChild(o);
+      });
+      sel.value = String(ROM_INDEX);
+    }
+    $('netOverlay').classList.add('on');
+  }
+  function netClose() { $('netOverlay').classList.remove('on'); }
+
+  (function wireNetplay() {
+    // Refuse to RENDER rather than present a dead control: a button that does
+    // nothing when pressed reads as "the site is broken".
+    if (!netSupported()) return;
+    var b = $('btnNet');
+    if (b) { b.hidden = false; b.style.display = ''; b.addEventListener('click', netOpen); }
+    $('netClose').addEventListener('click', netClose);
+    $('netOverlay').addEventListener('click', function (e) { if (e.target === $('netOverlay')) netClose(); });
+    $('netHostBtn').addEventListener('click', function () {
+      $('netHostBtn').classList.add('on'); $('netJoinBtn').classList.remove('on');
+      netStartHost();
+    });
+    $('netJoinBtn').addEventListener('click', function () {
+      $('netJoinBtn').classList.add('on'); $('netHostBtn').classList.remove('on');
+      $('netJoinPane').style.display = ''; $('netHostPane').style.display = 'none';
+    });
+    $('netGo').addEventListener('click', netStartGuest);
+    $('netLeave').addEventListener('click', netLeave);
+    $('netCopy').addEventListener('click', function () {
+      try { navigator.clipboard.writeText($('netCode').textContent.trim()); netStatus('Code copied.', 'good'); } catch (e) {}
+    });
+    // An invitation looks like ?np=CODE — ps1_multiplayer.html forwards exactly
+    // that parameter here.
+    try {
+      var np = new URLSearchParams(location.search).get('np');
+      if (np && /^[A-HJ-NP-Z2-9]{5}$/i.test(np)) {
+        netOpen();
+        $('netJoinBtn').classList.add('on');
+        $('netJoinPane').style.display = '';
+        $('netCodeIn').value = np.toUpperCase();
+        netStatus('You were invited to room ' + np.toUpperCase() + '. Pick the game they are on, then Join.');
+      }
+    } catch (e) {}
+  })();
+
+  // ---- the test seam --------------------------------------------------------
+  // Shape follows genesis.html's __genNet() so one rig can ask every page the
+  // same questions. `live` is KEPT because tools/mobile_chrome_test.mjs uses it
+  // as its "the emulator is actually running" witness.
   window.__ps1Net = function () {
+    var ls = lsEngine();
     return {
-      supported: false,
-      reason: 'the PS1 core drives its own frame loop from inside wasm '
-            + '(_one_iter -> _scheduleMainLoop), so there is no seam for a frame gate yet; '
-            + 'see the ONLINE PLAY block in ps1.html for the scoped job',
-      mode: 'none',
+      supported: netSupported(),
+      architecture: 'lockstep',
+      mode: NET.session ? (NET.role || 'in-room') : 'none',
       live: renderFrames > 0 || (window.__ps1Frames | 0) > 0,
+      armed: LS.armed,
+      running: LS.running,
+      frames: LS.frames,            // frames this page FED through the gate
+      workerFrames: LS.workerFrame, // frames the core actually RAN
+      hashes: LS.hashes,
+      fault: LS.fault,
+      stalling: LS.stalling,
+      waitingOn: LS.waitingOn.slice(),
+      stallReason: LS.stallReason,
+      state: ls ? ls.state : null,
+      frame: ls ? ls.frame : null,
+      delay: ls ? ls.delay : null,
+      hashEvery: ls ? ls.hashEvery : null,
+      portCount: ls ? ls.portCount : PS1_PORTS,
+      roster: ls ? ls.roster : null,
+      localPorts: ls ? ls.localPorts : null,
+      svcAvgMs: LS.svcCount ? +(LS.svcSum / LS.svcCount).toFixed(2) : null,
+      svcMaxMs: +LS.svcMax.toFixed(2),
+      svcCount: LS.svcCount,
+      capHits: LS.capHits,
+      gateStalls: LS.gateStalls,
+      frameBudgetMs: +(1000 / PS1_HW_HZ).toFixed(3),
+      image: window.__ps1LsImage || null,
       sentP1: window.__ps1SentP1 || null,
       sentP2: window.__ps1SentP2 || null,
+      hz: PS1_HW_HZ,
     };
   };
 })();

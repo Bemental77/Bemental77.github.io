@@ -1,0 +1,217 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ps1 determinism harness</title>
+<body>
+<pre id="log">booting…</pre>
+<script>
+// Harness for tools/ps1_determinism_probe.mjs. Spawns N INDEPENDENT PS1 cores
+// in the same page, feeds them the identical ROM bytes and the identical pad
+// bytes per emulated frame, and compares a full-guest-state fingerprint.
+//
+// The fingerprint is FNV-1a over a SAVESTATE (worker cmd 'netHash'), not over
+// VRAM. VRAM is downstream of GPUupdateLace1(), which one_iter() runs only when
+// `updated_display != -1` — i.e. only when the dfxvideo frame limiter is live —
+// so a VRAM hash can report a host-clock artifact as a desync. A savestate is
+// the canonical guest state (psxM + registers + GPU + SPU + counters).
+const logEl = document.getElementById('log');
+const lines = [];
+function log(s) { lines.push(s); logEl.textContent = lines.join('\n'); if (window.__state) window.__state.progress = s; }
+window.__log = () => lines.slice();
+
+function mkWorker() {
+  // ?netgate=1 arms the frame gate from the WORKER URL. It cannot be a message:
+  // pcsx_init() starts the self-drive chain from inside romEnd, so a message
+  // could not land before frame 0.
+  const w = new Worker('/ps1/ps1Wasm/dist/wasmpsx_worker.js?netgate=1&v=' + Date.now());
+  const st = { w, ready: false, booted: false, frames: 0, prints: [], waiters: new Map() };
+  w.onmessage = (e) => {
+    const d = e.data;
+    if (d.cmd === 'workerReady') { st.ready = true; const r = st.waiters.get('ready'); if (r) { st.waiters.delete('ready'); r(d); } }
+    else if (d.cmd === 'print') { st.prints.push(String(d.txt)); if (/romEnd booted/.test(d.txt)) st.booted = true; }
+    else if (d.cmd === 'netBooted') { st.booted = !!d.ok; if (!d.ok) st.prints.push('netBoot FAILED: ' + d.err); const r = st.waiters.get('boot'); if (r) { st.waiters.delete('boot'); r(d); } }
+    else if (d.cmd === 'netFrame') { st.frames += (d.ran | 0); const r = st.waiters.get('step'); if (r) { st.waiters.delete('step'); r(d); } }
+    else if (d.cmd === 'netHashResult') { const r = st.waiters.get('hash'); if (r) { st.waiters.delete('hash'); r(d); } }
+    else if (d.cmd === 'netSchedStatsResult') { const r = st.waiters.get('sched'); if (r) { st.waiters.delete('sched'); r(d); } }
+    // Recycle the VRAM transfer buffer. The worker's SendSound/render pools are
+    // refilled ONLY by these replies; without them every frame allocates a fresh
+    // 2 MB Uint8Array. This reply touches the worker's JS-side free pool only —
+    // never guest state — so it cannot perturb determinism.
+    else if (d.cmd === 'render') { st.w.postMessage({ cmd: 'return_vram', vram: d.vram }, [d.vram.buffer]); }
+    // ⚠ 'SoundFeedStreamData' is deliberately NOT credited back here. The
+    // 'soundBytes' reply DECREMENTS a counter the SPU reads
+    // (dfsound/spu.c:469-474 makes SPUasync bail while the buffer is over
+    // TESTSIZE), so it is a guest-state write on an ASYNCHRONOUS message. Both
+    // cores are treated identically, which keeps this probe sound; but that
+    // asymmetry is exactly the kind of host-timing leak a lockstep room cannot
+    // have, so the page integration must credit audio INSIDE the gated step.
+  };
+  w.onerror = (e) => { st.prints.push('WORKER ERROR ' + (e.message || e)); };
+  return st;
+}
+
+function ask(st, kind, msg, transfer) {
+  return new Promise((res, rej) => {
+    st.waiters.set(kind, res);
+    st.w.postMessage(msg, transfer || []);
+    setTimeout(() => { if (st.waiters.get(kind) === res) { st.waiters.delete(kind); rej(new Error('timeout ' + kind)); } }, 120000);
+  });
+}
+
+// Kick off and poll, rather than awaiting one long evaluate: a multi-minute
+// run blows CDP's protocolTimeout and reports as a rig failure.
+window.__state = { started: false, done: false, result: null, error: null, progress: '' };
+window.__start = function (opts) {
+  if (window.__state.started) return true;
+  window.__state.started = true;
+  window.__run(opts).then(
+    (r) => { window.__state.result = r; window.__state.done = true; },
+    (e) => { window.__state.error = String((e && e.stack) || e); window.__state.done = true; },
+  );
+  return true;
+};
+
+window.__run = async function (opts) {
+  const nCores = opts.cores || 2;
+  const romUrl = opts.romUrl;
+  const romBytes = opts.romBytes | 0;
+  const frames = opts.frames | 0;
+  const hashEvery = opts.hashEvery | 0;
+  const romName = opts.romName || 'probe.bin';
+  const skewMs = opts.skewMs | 0;
+
+  log('skew: ' + (skewMs > 0 ? ('up to ' + skewMs + ' ms of random wall-clock offset per non-zero core per batch') : 'off'));
+  log('fetching ' + romUrl + ' (' + (romBytes ? romBytes + ' bytes via Range' : 'whole file') + ')');
+  const headers = romBytes ? { Range: 'bytes=0-' + (romBytes - 1) } : {};
+  const resp = await fetch(romUrl, { headers });
+  const buf = new Uint8Array(await resp.arrayBuffer());
+  log('rom status=' + resp.status + ' bytes=' + buf.length);
+  if (romBytes && resp.status !== 206) {
+    log('WARNING: expected 206 for a Range request, got ' + resp.status + ' — the server ignored Range');
+  }
+
+  const cores = [];
+  for (let i = 0; i < nCores; i++) cores.push(mkWorker());
+
+  // Boot every core from the identical byte range, via the harness-owned
+  // 'netBoot' command. The page's romBegin/romChunk/romEnd protocol is NOT used:
+  // it has a lazy-URL mode and a streaming-write mode, and neither matches the
+  // checked-in pcsx-wasm-src/js/worker_funcs.js. A determinism probe should not
+  // depend on the disc loader — it needs both cores to get identical bytes by an
+  // identical path, which this does directly.
+  // ⚠ WAIT FOR THE RUNTIME BEFORE BOOTING. netBoot touches FS and calls
+  // pcsx_init; sending it before the wasm has instantiated means FS is
+  // undefined, boot fails, and the run burns its whole boot timeout looking
+  // exactly like a dead core. The worker posts 'workerReady' from its postRun
+  // hook — gate on that, not on a delay.
+  log('waiting for workerReady from ' + cores.length + ' cores…');
+  const tReady = performance.now();
+  while (performance.now() - tReady < 120000 && !cores.every(c => c.ready)) await new Promise(r => setTimeout(r, 50));
+  log('ready: ' + cores.map(c => c.ready).join(','));
+  if (!cores.every(c => c.ready)) return { ok: false, reason: 'worker runtime never signalled ready', prints: cores.map(c => c.prints.slice(-25)) };
+
+  const boots = cores.map(st => {
+    const copy = buf.slice();
+    return ask(st, 'boot', { cmd: 'netBoot', name: romName, buf: copy.buffer }, [copy.buffer]);
+  });
+  await Promise.all(boots).catch(e => log('boot ask failed: ' + e.message));
+
+  const t0 = performance.now();
+  while (performance.now() - t0 < 180000 && !cores.every(c => c.booted)) await new Promise(r => setTimeout(r, 100));
+  const bootedAll = cores.every(c => c.booted);
+  log('booted: ' + cores.map(c => c.booted).join(',') + (bootedAll ? '' : '  ← NOT ALL BOOTED'));
+  if (!bootedAll) return { ok: false, reason: 'boot failed', prints: cores.map(c => c.prints.slice(-25)) };
+
+  // Pad bytes are a pure function of the emulated frame index — never of wall
+  // time. Both ports get a deterministic pattern so the test also proves the
+  // PORT 2 write path is exercised, not just port 1.
+  const PADSTATE = 24, PAD_BYTES = PADSTATE * 2;
+  function padsForFrame(n) {
+    const a = new Uint8Array(PAD_BYTES);
+    a.fill(0);
+    // PADSTATE layout (pad.h tagPadState, wasm32): +0 JoyDev* +4 PadMode
+    // +5 PadID +6 KeyStatus +8 JoyKeyStatus +10 AnalogStatus[2][2] ...
+    // ⚠ BOTH KeyStatus AND JoyKeyStatus MUST BE 0xFFFF. PADpoll computes
+    //   n = KeyStatus & JoyKeyStatus  (pad_worker.c CMD_READ_DATA_AND_VIBRATE)
+    // and the encoding is ACTIVE-LOW, so leaving JoyKeyStatus at 0 does not mean
+    // "no joystick" — it means EVERY BUTTON HELD DOWN on every frame.
+    for (const base of [0, PADSTATE]) {
+      a[base + 4] = 0;      // PadMode = 0 (digital; analog bytes are not polled)
+      a[base + 5] = 0x41;   // PadID = 0x41 (standard digital pad)
+      a[base + 6] = 0xFF; a[base + 7] = 0xFF;   // KeyStatus     — nothing held
+      a[base + 8] = 0xFF; a[base + 9] = 0xFF;   // JoyKeyStatus  — nothing held
+      a[base + 10] = 0x80; a[base + 11] = 0x80; // analog centres
+      a[base + 12] = 0x80; a[base + 13] = 0x80;
+    }
+    // Press Start (bit 3 of byte 0) on both ports for a window of frames, so
+    // input actually varies and actually reaches the guest.
+    if (n >= 120 && n < 130) { a[6] &= ~(1 << 3); a[PADSTATE + 6] &= ~(1 << 3); }
+    if (n >= 300 && n < 310) { a[7] &= ~(1 << 6); a[PADSTATE + 7] &= ~(1 << 6); } // Cross
+    return a;
+  }
+
+  const hashes = [];      // [{frame, per-core hash}]
+  let firstDiverge = null;
+  const step = hashEvery > 0 ? hashEvery : frames;
+
+  // Batch consecutive frames that share a pad value into ONE message. A
+  // round-trip per frame per core dominated the run; the pad only changes at a
+  // few known frames, and inside a run of identical pads a batch of N is
+  // exactly N sequential _one_iter() calls with the same latched input — the
+  // same guest execution, far fewer messages.
+  const BOUNDARIES = [120, 130, 300, 310];
+  function nextBoundary(from, limit) {
+    let b = limit;
+    for (const x of BOUNDARIES) if (x > from && x < b) b = x;
+    return b;
+  }
+
+  for (let f = 0; f < frames; f += step) {
+    const n = Math.min(step, frames - f);
+    const end = f + n;
+    let c = f;
+    while (c < end) {
+      const nxt = nextBoundary(c, end);
+      const run = nxt - c;
+      const pads = padsForFrame(c);
+      // ── THE SKEW ARM ────────────────────────────────────────────────────
+      // Two cores agreeing while they run under SIMILAR wall-clock conditions
+      // is weak evidence: if host time leaked into guest state, both would
+      // sample similar host time and could agree by coincidence. Deliberately
+      // desynchronising their wall clocks — core 0 steps immediately, every
+      // other core waits a random interval first — makes the two cores'
+      // real-time experience of the SAME guest frame differ by a growing
+      // amount. If the fingerprints still match under that, host time
+      // demonstrably does not reach guest state, which is the property
+      // lockstep actually needs.
+      await Promise.all(cores.map(async (st, ci) => {
+        if (skewMs > 0 && ci > 0) await new Promise(r => setTimeout(r, Math.floor(Math.random() * skewMs)));
+        const cp = pads.slice();
+        return ask(st, 'step', { cmd: 'netStep', frame: c, count: run, states: cp.buffer }, [cp.buffer]);
+      }));
+      c = nxt;
+    }
+    const hs = await Promise.all(cores.map(st => ask(st, 'hash', { cmd: 'netHash', frame: f + n })));
+    const rec = { frame: f + n, hash: hs.map(h => h.hash >>> 0), len: hs.map(h => h.len), head: hs.map(h => h.head), err: hs.map(h => h.err) };
+    hashes.push(rec);
+    const allSame = rec.hash.every(h => h === rec.hash[0]);
+    const lensSame = rec.len.every(l => l === rec.len[0]);
+    const headsSame = JSON.stringify(rec.head[0]) === JSON.stringify(rec.head[1] === undefined ? rec.head[0] : rec.head[1]);
+    log('frame ' + rec.frame + '  len=' + rec.len.join('/') + '  hash=' + rec.hash.map(h => h.toString(16)).join('/')
+        + (allSame && lensSame ? '  MATCH' : '  ***DIVERGED***')
+        + (headsSame ? '' : '  [gz headers differ: ' + JSON.stringify(rec.head) + ']'));
+    if ((!allSame || !lensSame) && firstDiverge === null) firstDiverge = rec.frame;
+  }
+
+  const sched = await Promise.all(cores.map(st => ask(st, 'sched', { cmd: 'netSchedStats' })));
+  log('sched: ' + JSON.stringify(sched));
+
+  return {
+    ok: firstDiverge === null,
+    frames, cores: nCores,
+    framesRan: cores.map(c => c.frames),
+    firstDiverge, hashes, sched,
+    prints: cores.map(c => c.prints.slice(-12))
+  };
+};
+</script>
+</body>

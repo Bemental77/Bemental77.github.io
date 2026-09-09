@@ -415,6 +415,42 @@
   // snes9x_2005.wasm via snes/snesWasm/build.sh. Until that rebuild happens this
   // page ships single player and says so, rather than presenting an online
   // button that pairs two people onto one controller.
+  //
+  // ── TWO MEASURED REFINEMENTS (2026-09-09), both of which SHRINK that job ────
+  // The paragraph above is confirmed — `S9xReadJoypad` really does return a
+  // hardcoded 0 for every port but 0, and it was checked in LIVE WASM MEMORY,
+  // not just read: after 200 frames with `_setJoypadInput(0x0201)`,
+  //     IPPU.Joypads[0..4] = 0xffff0201 0x0 0x0 0x0 0x0
+  // and `_setJoypadInput(0x5A5A5A5A)` changed exactly 4 bytes in the low 1 MB
+  // (one i32 at 0x17b10) — one slot, not an array of five. But two details are
+  // different from what is written above:
+  //
+  //   1. ⚠ NO MULTITAP IS INVOLVED, so ignore the Super Multitap framing. At
+  //      runtime `IPPU.Controller == 1 == SNES_JOYPAD`, NOT SNES_MULTIPLAYER5:
+  //      exports.c:137 sets ControllerOption = SNES_JOYPAD, ppu.c:1780 derives
+  //      Controller = 1-1 = SNES_MULTIPLAYER5, and S9xNextController()
+  //      (ppu.c:1781, :1937-1939) immediately advances it to SNES_JOYPAD. A
+  //      plain second controller needs nothing enabled — ppu.c:2098-2099
+  //      ALREADY writes IPPU.Joypads[1] into FillRAM[0x421a]/[0x421b], the
+  //      standard auto-read registers for port 2, unconditionally. Only
+  //      S9xReadJoypad starves it.
+  //
+  //   2. ⚠ build.sh DOES NOT RUN TODAY, so budget that before the C change.
+  //      It passes `-s EXTRA_EXPORTED_RUNTIME_METHODS='["cwrap"]'`, which is a
+  //      HARD ERROR on both installed toolchains — emsdk/upstream/emscripten/
+  //      tools/settings.py:251 lists it "No longer supported, use
+  //      EXPORTED_RUNTIME_METHODS" and the only accepted value is []. Same
+  //      one-word rename the N64 core already took (see CLAUDE.md). The C
+  //      itself is clean: all 40 source/*.c compile with 0 errors under emcc
+  //      4.0.10 (~/emsdk-upstream) and 6.0.2 (repo emsdk/) — verified
+  //      -fsyntax-only; a full LINK was NOT attempted, so that part is unproven.
+  //
+  // And the reason the rest of this is worth doing: the core is bit-
+  // deterministic where lockstep needs it to be. Two arms entered from a common
+  // _loadState, 120 frames, same input: 0 of 529,136 savestate bytes differed,
+  // and one _mainLoop() advances the frame counters by exactly +1. The frame
+  // seam and the fingerprint are both already sound; the second pad is the
+  // whole of what is missing.
 
   function runFrame() {
     var m = padMask();
