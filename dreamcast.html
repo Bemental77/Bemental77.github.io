@@ -6291,6 +6291,19 @@
     role: NET.role,
     state: NET.session ? NET.session.state : null,
     code: NET.session ? NET.session.code : null,
+    // ⚠ WHICH DISC EACH SIDE THINKS THE ROOM IS FOR, from the ENGINE rather
+    // than from this page's picker. Without these two fields the disc-agreement
+    // failure is invisible from outside the page, which is exactly how it
+    // survived: dreamcast/tools/room_crossdevice_test.mjs:911 sets the JOINER's
+    // #romSelect to the host's game itself, so the rig loads the right disc for
+    // the wrong reason and reports "both cores loaded gauntlet" on a room that
+    // never named a disc at all.
+    //   roomDisc  what THIS engine publishes in its roster (host-authoritative)
+    //   toldDisc  what this side has been TOLD the room is for
+    // Host with roomDisc null, or guest with toldDisc null once connected, IS
+    // the bug — no log-reading required.
+    roomDisc: safe(() => NET.session.ls.report().game, null),
+    toldDisc: safe(() => NET.session.ls.report().roomGame, null),
     // ⚠ `capture` / `mirrorTicks` / `mirrorErr` / `videoTracks` / `guestAudio`
     // ARE GONE, not renamed. They described the streaming path — which canvas
     // was being captured, how many frames its probe produced, whether the guest
