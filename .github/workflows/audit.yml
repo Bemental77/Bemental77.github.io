@@ -13,9 +13,16 @@ name: Audit
 # `cancel-in-progress: true`. This job MUST NOT join that group or a push would
 # cancel a running deploy. It has its own per-ref group below.
 
+# ⚠ dev ONLY, NOT prod. `prod` is a FAST-FORWARD of `dev` — the same commit is
+# pushed to both — so auditing both ran this identical sha TWICE and produced
+# THREE workflow runs per change: Deploy(prod), Audit(prod), Audit(dev). The
+# duplicate is pure waste and it is not free: each Audit run takes minutes and
+# competes with the deploy for a runner, so the fix the user is waiting on ships
+# slower because a redundant copy of the same test run is queued ahead of it.
+# Auditing dev covers every commit; nothing reaches prod that dev did not carry.
 on:
   push:
-    branches: [dev, prod]
+    branches: [dev]
   pull_request:
   workflow_dispatch:
 
