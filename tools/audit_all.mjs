@@ -95,6 +95,13 @@ const HARNESSES = [
     fast: true, ci: true, server: false, requires: [], timeoutMs: 10 * MIN,
   },
   {
+    name: 'netplay-invariants',
+    file: 'tools/netplay_invariants.mjs',
+    cmd: ['node', 'tools/netplay_invariants.mjs'],
+    desc: 'the six code SHAPES that produced user-visible netplay failures, asserted statically — no browser rig can catch these, because a rig only ever drives a HEALTHY room and these only appear when a piece of room state is MISSING. Covers: an unseated console must not drive port 0 (it took over Player 1), the Ready label must name its blocker rather than contradict `disabled`, declaring ready must be visible before the barrier releases (it was circular), class Lockstep must own the disc it publishes in the roster (it read a field only NetplaySession had, so every roster carried game:null), Lockstep events the page listens for on the Session must be forwarded (room-game never arrived), and a joiner must never publish the room\'s disc',
+    fast: true, ci: true, server: false, requires: ['dreamcast.html', 'lib/netplay.js'], timeoutMs: 2 * MIN,
+  },
+  {
     name: 'undefined-calls',
     file: 'tools/undefined_call_scan.mjs',
     cmd: ['node', 'tools/undefined_call_scan.mjs'],
@@ -454,7 +461,18 @@ const HARNESSES = [
     name: 'dreamcast-room-crossdevice',
     file: 'dreamcast/tools/room_crossdevice_test.mjs',
     cmd: ['node', 'dreamcast/tools/room_crossdevice_test.mjs',
-          '--url', ORIGIN, '--play', 'none', '--latems', '45000', '--name', 'audit-xdev',
+          // ⚠ --play, NOT 'none'. With the play phase off this harness paired two
+          // browsers and STOPPED before a disc was ever loaded — so the entire
+          // phase where the game boots, the barrier releases and pads reach the
+          // other console went untested by the standing audit. Six defects
+          // reached the user through that hole: the roster publishing game:null,
+          // room-game emitted on Lockstep but listened for on the Session, two
+          // URL writers letting a joiner name the disc, the host having no seat
+          // in its own room, a Ready button whose label contradicted its
+          // disabled state, and an unseated console driving PORT 0 — taking over
+          // Player 1's character. Every one of them lives past the point this
+          // arm used to stop at.
+          '--url', ORIGIN, '--play', 'panel-open', '--latems', '45000', '--name', 'audit-xdev',
           '--arms', 'panel-open,panel-closed,host-busy,mobile-joiner,host-ignores,late-joiner,rejoin,host-reload,no-direct-path'],
     desc: 'TWO browsers pairing THE WAY A PERSON DOES — real mouse clicks at real coordinates (hit-tested with elementFromPoint), real keystrokes, and NOTHING else: it never calls approve()/setReady()/any engine method, and a self-audit over its own source refuses to run if it starts to. It exists because every other netplay rig here supplies the human action itself and therefore cannot notice a missing one. Nine arms: the baseline, a host with the lobby panel CLOSED, a host mid disc-download, a phone joiner, a host who never answers the prompt, a 45 s gap before anyone knocks, a joiner who reloads and retries, a host who reloads mid-room, and no-direct-path. A one-way roster (the joiner sees the host, the host never sees the joiner) is a NAMED failure, never a timeout. The `no-direct-path` arm forces iceTransportPolicy=relay with no relay configured on both pages so NO RTCPeerConnection can form a candidate pair — the closest thing to two hostile networks that runs on one box — and it carries an arm-difference proof, reporting VOID rather than green if nothing was constructed under the wrapper. ⚠ THAT ARM IS RED TODAY AND THE RED IS REAL: it reproduces the production one-way roster exactly',
     fast: false, ci: false,
