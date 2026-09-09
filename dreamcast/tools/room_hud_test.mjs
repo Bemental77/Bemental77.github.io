@@ -300,7 +300,15 @@ try {
   // ---- NOT lockstep is a FAULT, not a mode ----
   await page.evaluate(() => { window.__dcNetTelemetryOverride = null; });
   await page.evaluate(() => { window.__dcNetHud(); });
-  await page.reload({ waitUntil: 'domcontentloaded' });
+  // ⚠ NAVIGATE, DO NOT RELOAD. Opening a room now writes it into the address
+  // bar (dreamcast.html netRememberRoomInUrl), so that a reload — the
+  // deliberate one, a pull-to-refresh, or a phone discarding a backgrounded tab
+  // — comes back INTO THE SAME ROOM instead of onto a blank page. A reload here
+  // therefore lands in the hand-off with the lobby overlay open over #btnNet,
+  // and this step threw "Node is either not clickable or not an Element" on a
+  // page that was behaving exactly as designed. This step wants a clean slate,
+  // which is a fresh navigation to the bare URL.
+  await page.goto(URL_, { waitUntil: 'domcontentloaded', timeout: 120000 });
   await page.waitForFunction(() => typeof window.__dcNetHud === 'function', { timeout: 60000 });
   await page.click('#btnNet'); await page.click('#netHostBtn');
   await page.waitForFunction(() => /^[A-HJ-NP-Z2-9]{5}$/.test((document.getElementById('netCode').textContent || '').trim()), { timeout: 30000 });
