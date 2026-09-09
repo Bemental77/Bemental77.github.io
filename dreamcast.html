@@ -3835,7 +3835,6 @@
         if (qs.has('nofog'))    worker.postMessage({ cmd: 'fog', on: 0 });
         if (qs.has('nomodvol')) worker.postMessage({ cmd: 'modvol', on: 0 });
       }
-      setStatus('Running.');
       // ⚠ ORDER IS LOAD-BEARING. The gate is armed BEFORE the pump is switched
       // on, so this core has run ZERO frames when it starts gating and its
       // "frame 0" is the room's frame 0. Arming after freerun would let each
@@ -3843,6 +3842,21 @@
       // at different guest frames are already desynced before anybody presses
       // anything. No-op with no room.
       lsArmBeforeFreerun();
+      // ⚠ THE STATUS LINE FOLLOWS THE GATE, NOT THE BOOT — which is why it is
+      // written HERE, after the arm, and not before it with the rest of the
+      // boot's bookkeeping. It read a flat "Running." for every path, so the
+      // user's screenshot said "Running." at the top of a page whose own HUD
+      // read "core ran 0" two lines below it: a core armed and parked at the
+      // start barrier runs ZERO frames until every player is in, and telling
+      // that player the console is running tells them the wait is somebody
+      // else's problem. lsFeed() flips it to "Running." the moment the barrier
+      // actually releases, and back again if the gate disengages.
+      // The third branch is the one that must never be reachable: in a room and
+      // NOT armed. lsRestartIntoRoom() exists so a console cannot get here, but
+      // if one ever does it says so rather than inheriting the reassuring line.
+      setStatus(!NET.session ? 'Running.'
+        : LS.armed ? 'Waiting for the other players — nothing runs until everyone is in.'
+        : 'Loaded, but this console is NOT part of the room — open Play Online and read the warning.');
       worker.postMessage({ cmd: 'freerun', on: 1 });
       startInputPump();
       // A returning player always wins. If this browser already holds its own
@@ -4889,12 +4903,20 @@
     // precisely what "everyone starts together" means, and why there is no
     // savestate handoff to fail silently (CLAUDE.md gate #10).
     if (ls.state !== 'running' && ls.state !== 'stalled') {
-      if (LS.running) { LS.running = false; pageLog('[lockstep] frame gate DISENGAGED — engine state ' + ls.state); }
+      if (LS.running) {
+        LS.running = false;
+        pageLog('[lockstep] frame gate DISENGAGED — engine state ' + ls.state);
+        setStatus('Holding — the room is not running. Nothing advances until every player is back.');
+      }
       return;
     }
     if (!LS.running) {
       LS.running = true;
       LS.engagedAt = _now();
+      // NOW it is running, and not one moment earlier. See the setStatus() at
+      // the end of the boot for why "Running." must not be printed over a core
+      // parked at the barrier.
+      setStatus('Running.');
       LS.fedTo = ls.frame; LS.workerFrame = ls.frame;
       LS.hashSink = (typeof ls.submitHash === 'function');
       if (!LS.hashSink) {
@@ -5314,6 +5336,7 @@
     role: null,         // 'host' | 'guest' | null — who OPENED the room, nothing more
     guest: false,       // this side joined rather than opened
     leaving: false,     // this side pressed Leave (decides what 'closed' means)
+    restarting: false,  // a reload into the room hand-off is in flight (lsRestartIntoRoom)
     sentP2: null,       // last remote-port bytes handed to the worker
     // ---- WHY A ROOM IS NOT CONNECTING ------------------------------------
     // ⚠ THE HUD SAID "waiting for players" FOREVER FOR THIS. Reported
@@ -5609,11 +5632,112 @@
   }
 
 
+  // ---------------------------------------------------------------------------
+  // OPENING OR JOINING A ROOM FROM A CONSOLE THAT IS ALREADY PLAYING
+  // ---------------------------------------------------------------------------
+  // THE BUG THIS EXISTS FOR, in the player's words: "omfg, I had it open."
+  // Starting the game and THEN opening a room is the obvious thing to do, and
+  // it produced a room that could never start.
+  //
+  // WHY IT COULD NEVER START. The frame gate is armed by lsArmBeforeFreerun(),
+  // which runs at ONE point in the boot — between the disc load and
+  // {cmd:'freerun',on:1} — and that ordering is load-bearing, not incidental:
+  // it is what guarantees a core in a room has run ZERO frames when it starts
+  // gating, so its frame 0 IS the room's frame 0. A core that is already
+  // free-running is PAST that point and can never go back to it. With no room
+  // yet, lsArmBeforeFreerun() returns at its first line (`!NET.session`) and is
+  // never called again, so the page ends up in a room with LS.armed false: HUD
+  // "frame-gated NO", nothing comparing the cores, and a barrier waiting on a
+  // machine that will never arrive. Measured, host side, in
+  // dreamcast/tools/room_crossdevice_test.mjs's `host-running` arm:
+  // lockstep {"armed":false,"running":false,"coreFrame":0} on a live core.
+  //
+  // ⚠ THE GATE IS NOT ARMED MID-RUN, AND THAT IS THE WHOLE POINT. Two cores
+  // that have free-run for different numbers of frames are ALREADY diverged —
+  // different guest frames, different RAM, different everything — and arming a
+  // gate over that ships a room whose simulations are forked while the panel
+  // says LOCKSTEP. That is the exact silent desync this architecture exists to
+  // prevent, and it is strictly worse than not starting at all.
+  //
+  // SO THE CONSOLE RESTARTS, UNDER THE GATE. This reloads the page into the
+  // hand-off the lobby page already uses (?np=<code>&game=<key>[&join=1]),
+  // which re-runs the ONE boot path that works: seat count before the disc
+  // load, normalize + lockstep armed before free-run, barrier at frame 0. It is
+  // not a new code path — it is the tested one, entered on purpose.
+  //
+  // ⚠ IT RUNS BEFORE ANY PEER EXISTS. The restart happens as the room is being
+  // FORMED — before the host has published a code anyone has typed, before the
+  // joiner has knocked — so nobody is left holding a seat in a room whose peer
+  // vanished. (That failure has its own named cell, `host-reload`, and it is a
+  // deadlock: reloading a side that is ALREADY seated strands the other one.)
+  //
+  // Cost, stated plainly to the player: unsaved progress in the running game is
+  // gone. It was going anyway — every machine in a room begins at frame 0 —
+  // and a saved state is not applied on top of a room's boot.
+  function lsRoomWouldStartUngated() {
+    // `booted` is set the moment the run loop is switched on, which is one line
+    // after lsArmBeforeFreerun()'s only call site. So booted-and-not-armed is
+    // exactly "this core is free-running outside a gate", with no window in
+    // which a normal room boot could be mistaken for it: those two lines are
+    // synchronous and no render can interleave between them.
+    return !!booted && !LS.armed;
+  }
+
+  function lsRestartIntoRoom(code, joining) {
+    if (NET.restarting) return true;
+    NET.restarting = true;
+    const game = $('romSelect').value;
+    const q = new URLSearchParams(location.search);   // keep ?mobile / ?turn / ?signal
+    q.set('np', code);
+    q.set('game', game);
+    if (joining) q.set('join', '1'); else q.delete('join');
+    // ⚠ AND IT DOES NOT PRESS START ON ARRIVAL. The hand-off receiver's
+    // unconditional `$('btnStart').click()` is right for the LOBBY, where the
+    // party is already formed before anyone is sent here — but a room that is
+    // being opened or joined RIGHT NOW has no roster yet, and a machine that
+    // starts loading its disc before the room has seated it boots with the
+    // wrong controller count and, on a warm cache, before `session.ls` even
+    // exists. Measured here, both sides, symmetric:
+    //   [host] ⚠ the room published no lockstep engine, so this core cannot be frame-gated
+    //   [join] ⚠ the room published no lockstep engine, so this core cannot be frame-gated
+    // — the restarted side won the race against its own pairing and came back
+    // UNGATED, which is the very thing the restart exists to prevent.
+    // With this flag the host presses Start when it can see the room is full
+    // (exactly what it does today when it opens a room from a cold page), and
+    // the joiner is started by the 'room-game' handler, which fires only once
+    // the host's roster has seated it — the one moment the seat count is known.
+    q.set('npwait', '1');
+    const url = location.pathname + '?' + q.toString() + location.hash;
+    // Say it where the player is looking. The lobby panel is open at this point
+    // (both entry controls live inside it), and on a phone it is the whole
+    // screen.
+    netOpen();
+    const codeEl = $('netCode'); if (codeEl && !joining) codeEl.textContent = code;
+    netStatus((joining ? 'Joining room ' + code + '. ' : 'Opening room ' + code + '. ') +
+              'Restarting your console first — everyone in a room has to begin on the SAME frame, and this one ' +
+              'is already running. Anything unsaved in the game you were playing is lost.', 'busy');
+    pageLog('[net] the core is already free-running, so it cannot be frame-gated where it stands — restarting ' +
+            'into the room hand-off ' + url + '. lsArmBeforeFreerun() only runs between the disc load and ' +
+            'free-run; arming a gate over a core that has already run frames would fork the simulations ' +
+            'silently, which is worse than not starting.');
+    // A beat so the sentence above is readable rather than a flash. The reload
+    // replaces this entry: going "back" to a console that no longer exists is
+    // not a state anyone wants returned to.
+    setTimeout(() => { location.replace(url); }, 1500);
+    return true;
+  }
+
   // `fixedCode` is the handoff from dreamcast_multiplayer.html. That page shows a
   // code to the player BEFORE anything is downloaded, so minting a fresh one here
   // would silently strand a guest already waiting on the published one.
   async function netStartHost(fixedCode) {
     if (NET.session) return;
+    // ⚠ A CONSOLE THAT IS ALREADY PLAYING RESTARTS INTO THE ROOM. See
+    // lsRestartIntoRoom() above for why the gate cannot be armed where it
+    // stands. Nothing has been published yet, so nobody is stranded by this.
+    // The hand-off receiver calls back in here with `booted` false, so this
+    // cannot loop.
+    if (lsRoomWouldStartUngated()) return void lsRestartIntoRoom(fixedCode || Netplay.makeCode(5), false);
     // NO `if (!booted) return` HERE. See netOpen() above: the gate was a
     // streaming requirement and streaming is cancelled. A room is opened before
     // any disc is fetched, which is what lets four people agree on a game and
@@ -5665,6 +5789,12 @@
       netStatus('That does not look like a code — 5 characters, no I O 0 or 1.', 'bad');
       return;
     }
+    // ⚠ SAME RESTART AS THE HOST, and this is the side the user was on. The
+    // room is not joined from here at all — the page reloads into the join
+    // hand-off, boots under the gate, and knocks once. Knocking first and
+    // reloading afterwards would strand the host holding a request from a peer
+    // that no longer exists.
+    if (lsRoomWouldStartUngated()) return void lsRestartIntoRoom(code, true);
     NET.role = 'guest';
     // ⚠ THE JOINER DOES NOT PICK THE GAME. THE HOST ALREADY DID.
     // This read `$('netGame').value` and handed it to the session, which refuses
@@ -5682,6 +5812,9 @@
     const s = new Netplay.Session({ host: false, code, transport: netTransport() });
     NET.session = s;
     s.on('status', netOnStatus);
+    // The host named the disc when it opened the room. Select it here so the
+    // player loads the right game without being asked, and say so rather than
+    // silently changing their selection under them.
     s.on('room-game', (e) => {
       const g = e && e.game;
       if (!g || !GAMES[g]) return;
@@ -5728,7 +5861,22 @@
     // because under streaming a guest had no emulator and must not launch one.
     // Under lockstep a joiner runs their own console and MUST start it — the
     // lock was the single line that made this page two-machines-one-emulator.
-    pageLog('[net] joining room ' + code + ' (' + game + ') via ' + netTransport());
+    // ⚠ NO `game` HERE. This line read `' (' + game + ')'`, and `game` is
+    // declared ONLY inside the Start handler (`const game = GAMES[key]`), so in
+    // this function it was an unresolved identifier: a ReferenceError thrown ON
+    // THE LINE BEFORE `await s.start()`. The session object had already been
+    // constructed and the room panel already started, so the joiner painted a
+    // room, an input pump and a "connecting" status — and NEVER SIGNALLED AT
+    // ALL. Both sides then sat on "waiting for players" until the 75 s lonely
+    // timer, which is exactly the deadlock this page keeps being reported for.
+    // Introduced by 8e7a1c4d, which removed the joiner's game pick (the host
+    // names the disc now) and left this reference behind. Measured in
+    // dreamcast/tools/room_crossdevice_test.mjs: the joiner console printed
+    // "game is not defined" one tick after "joiner-can-press-join" passed.
+    // The joiner does not know the disc yet by design — the room tells it, in
+    // the 'room-game' handler above — so there is nothing to name here.
+    pageLog('[net] joining room ' + code + ' via ' + netTransport() +
+            ' — the host names the disc once this machine is in');
     await s.start();
   }
 
@@ -6097,15 +6245,37 @@
     // clock from its own inputs, so the players are in separate universes that
     // happen to look alike for a few seconds. That is exactly "what is on
     // screen is not the shared game", which is what this banner is for.
-    const ungated = (t.mode === 'lockstep') && !!(t.barrier && t.barrier.started) && !t.gated;
+    // ⚠ A ROOM THAT CANNOT EVER GATE MUST NOT WAIT FOR "STARTED" TO SAY SO.
+    // This read `barrier.started && !gated`, which is the right alarm for a
+    // room that ran ungated — but the failure the user hit never reaches
+    // `started`: a console that was already free-running when the room formed
+    // never arms, never readies the barrier the others are waiting on, and so
+    // `started` stays false FOREVER. The banner therefore stayed silent on the
+    // one screen that most needed it, while the panel said LOCKSTEP and the
+    // player sat watching "waiting for players" for as long as they could bear.
+    // `booted && !armed` is exactly "this core is free-running outside a gate":
+    // lsArmBeforeFreerun() is called one line before `booted` is set, and those
+    // two lines are synchronous, so a normal room boot never reads this way.
+    const bootedNow = safe(() => booted, false);
+    const cannotGate = (t.mode === 'lockstep') && bootedNow && !t.armed;
+    const ungated = (t.mode === 'lockstep') && !t.gated &&
+                    (!!(t.barrier && t.barrier.started) || cannotGate);
     const notLockstepFault = (t.mode === 'lockstep') ? ungated
       : (t.mode === 'none' ? connected : true);
     if (notLockstepFault && ban && !HUD.desyncLatched) {
       ban.innerHTML = ungated
-        ? '<b>⚠ THE ROOM STARTED BUT THIS CONSOLE IS NOT FRAME-GATED</b>' +
-          'Every machine is running the game on its own clock, so nothing anyone does is shared. ' +
-          esc(t.gateFault || 'the page is not feeding the core one agreed frame at a time') +
-          '<span class="detail">Leave and rejoin. Do not keep playing — the simulations are already apart.</span>'
+        ? (cannotGate && !(t.barrier && t.barrier.started)
+            ? '<b>⚠ THIS ROOM CANNOT START — THIS CONSOLE WAS ALREADY RUNNING</b>' +
+              'The game was already playing when this room was formed, so this console could not be frame-gated: ' +
+              'the gate is armed once, between loading the disc and running the first frame, and this core is ' +
+              'past that point. It will sit at "waiting for players" forever, and so will everyone else in the ' +
+              'room — they are waiting on this machine.' +
+              '<span class="detail">Leave the room and open or join it again. The console restarts and comes ' +
+              'back gated, which is the only way two machines can share a frame 0.</span>'
+            : '<b>⚠ THE ROOM STARTED BUT THIS CONSOLE IS NOT FRAME-GATED</b>' +
+              'Every machine is running the game on its own clock, so nothing anyone does is shared. ' +
+              esc(t.gateFault || 'the page is not feeding the core one agreed frame at a time') +
+              '<span class="detail">Leave and rejoin. Do not keep playing — the simulations are already apart.</span>')
         : '<b>⚠ THIS SESSION IS NOT RUNNING LOCKSTEP</b>' +
           esc(t.fault || 'the session reported no lockstep telemetry') +
           '. Online play on this page is lockstep only — every machine runs the game. ' +
@@ -6197,11 +6367,13 @@
     const netFault = NET.fault;
     const modeWord = netFault ? 'CANNOT CONNECT'
       : (t.mode === 'lockstep')
-        ? ((started && !gated) ? 'NOT FRAME-GATED' : 'LOCKSTEP')
+        ? (((started || cannotGate) && !gated) ? 'NOT FRAME-GATED' : 'LOCKSTEP')
       : (t.mode === 'none' && !connected) ? 'ROOM OPEN' : 'NOT LOCKSTEP';
     const tagline = netFault ? netFault.text
       : (modeWord === 'NOT FRAME-GATED')
-        ? 'the room started but THIS core is not gated — it is running on its own clock'
+        ? (cannotGate && !started
+            ? 'this console was ALREADY RUNNING when the room formed, so it can never be gated — nothing will start'
+            : 'the room started but THIS core is not gated — it is running on its own clock')
       : (modeWord === 'LOCKSTEP' && !started && emptiedOut)
         ? 'the other player dropped out — this room is empty again, waiting for them to rejoin'
       : (modeWord === 'LOCKSTEP' && !started)
@@ -6249,7 +6421,10 @@
     // finish downloading does not need "frame-gated NO · desync check OFF"
     // shouting at them about a game that has not begun — a panel that cries
     // wolf while you wait teaches people to ignore the row that matters.
-    if (t.mode === 'lockstep' && (started || t.armed)) {
+    // `cannotGate` joins the guard for the same reason the banner needed it: a
+    // room that can never start never sets `started`, and the row that says so
+    // was hidden behind exactly that flag.
+    if (t.mode === 'lockstep' && (started || t.armed || cannotGate)) {
       html += '<br><span class="k">frame-gated</span> ' + (gated ? 'YES' : 'NO') +
         ' <span class="k">· desync check</span> ' +
         (t.detecting ? ('on, ' + (t.hashesCompared || 0) + ' compared')
@@ -6581,7 +6756,15 @@
       // everyone when the barrier releases.
       await lsChooseDelay(sess);
       try {
-        if (typeof sess.setReady === 'function') sess.setReady(true);
+        // ⚠ NAME THE DISC THIS MACHINE ACTUALLY LOADED. setReady()'s second
+        // argument is what the barrier COMPARES, and with it omitted the engine
+        // falls back to `this.game` — which a joiner is deliberately
+        // constructed without, so the two sides declared different discs and
+        // the barrier would refuse a room in which both players were on the
+        // same game. #romSelect is what this console loaded (the room's
+        // 'room-game' handler sets it for a joiner), so it is the honest
+        // answer to "what am I holding at frame 0".
+        if (typeof sess.setReady === 'function') sess.setReady(true, currentGameKey());
         else pageLog('[net] this build has no start barrier yet (session.setReady is missing)');
       } catch (e) { pageLog('[net] setReady threw: ' + ((e && e.message) || e)); }
       netRoomRender();
@@ -6627,7 +6810,16 @@
                 $('romSelect').value + ' as ' + npCode + ' via ' + netTransport());
         // The phone shell's splash waits for a Start that this player already
         // pressed — on the other page.
-        const sp = $('mobileSplash'); if (sp) sp.style.display = 'none';
+        // ⚠ EXCEPT WHEN THIS SIDE STILL HAS TO PRESS START. On a phone the ONLY
+        // Start control in the product is #mobileSplashStart, INSIDE this splash
+        // (#btnStart lives in #wrap, which the mobile shell hides). So hiding
+        // the splash on a host that is deliberately waiting for players —
+        // `npwait` without `join` — would leave that player with a room, a code,
+        // and no way whatsoever to start the game. #netOverlay is z-index 99999
+        // against the splash's 2000, so the lobby still draws on top of it and
+        // the code is readable; closing the lobby reveals Start underneath.
+        const npHostWaiting = (QS.get('npwait') === '1') && !npJoin;
+        const sp = $('mobileSplash'); if (sp && !npHostWaiting) sp.style.display = 'none';
         // ⚠ THE ROOM FIRST, THE DISC SECOND — the order the lobby's own controls
         // already use (open a room, then press Start), and the order netStartHost
         // documents in its body ("NO `if (!booted) return` HERE … a room is
@@ -6646,9 +6838,24 @@
         } else {
           netStartHost(npCode);
         }
-        const st = $('btnStart');
-        if (st && !st.disabled) st.click();
-        else pageLog('[net] Start is held down — not overriding it; the room is open either way');
+        // ⚠ `npwait` = "the room is being formed right now, do not start yet".
+        // See lsRestartIntoRoom(). The lobby's own hand-off never sets it and
+        // is unchanged: there the party is agreed before anybody arrives here.
+        if (QS.get('npwait') === '1') {
+          pageLog('[net] npwait: the room is still forming, so the disc is NOT loaded yet — a machine that ' +
+                  'boots before the room seats it gets the wrong controller count and can miss the frame gate ' +
+                  'entirely. ' + (npJoin ? 'This joiner starts as soon as the host seats it.'
+                                         : 'Press Start once everyone you are waiting for is in the room.'));
+          if (!npJoin) {
+            netOpen();
+            netStatus('Your console restarted so it can start on the same frame as everyone else. Room ' + npCode +
+                      ' is open again — share the code, and press Start once everyone is in.', 'busy');
+          }
+        } else {
+          const st = $('btnStart');
+          if (st && !st.disabled) st.click();
+          else pageLog('[net] Start is held down — not overriding it; the room is open either way');
+        }
       }
     }
   })();

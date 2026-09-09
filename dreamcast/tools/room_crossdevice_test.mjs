@@ -108,6 +108,24 @@
 //                 pick up a phone and load the page. Every other rig here
 //                 joins about one second after the room opens, so an idle
 //                 broker connection has never been held open this long.
+//   host-running  ⚠ THE "omfg, I HAD IT OPEN" ARM (host side). The host boots
+//                 the disc and lets the core FREE-RUN to a live frame, and only
+//                 THEN opens a room. Every other arm in this file, and every
+//                 other netplay rig in this repo, opens or joins the room
+//                 FIRST and presses Start afterwards — so the one ordering a
+//                 person actually falls into has never been tested. The gate is
+//                 armed in lsArmBeforeFreerun(), which runs between the disc
+//                 load and {cmd:'freerun',on:1}; a core that is already
+//                 free-running is PAST that point forever.
+//   joiner-running the same thing on the side that joins: the player already
+//                 had the game up, then typed a friend's code. This is the
+//                 exact pair the user reported.
+//   mobile-host-running / mobile-joiner-running
+//                 the same two, with THAT side on a phone — the device the
+//                 report came from. The mobile shell hides #wrap, so a phone's
+//                 only Start control is #mobileSplashStart inside the splash
+//                 that the room hand-off hides; a restarted phone host must
+//                 still be able to start its own game.
 //   rejoin        the joiner is left unadmitted, gives up, RELOADS THE PAGE and
 //                 tries the same code again. The host is then holding a stale
 //                 request from a peer that no longer exists while a second one
@@ -497,6 +515,68 @@ const probe = (pg) => pg.evaluate(() => {
 });
 const pad = (pg) => pg.evaluate(() => (typeof window.__dcPad === 'function' ? Array.from(window.__dcPad()) : null));
 
+// OPEN "Play Online" THE WAY A PERSON DOES, FROM WHATEVER STATE THIS PAGE IS IN
+// RIGHT NOW. The entry scan at the top of an arm runs before anything is
+// started, and on a phone it finds #mobileSplashNet — a control INSIDE the
+// splash that pressing Start HIDES. A player who has already started a game
+// reaches online play through the shell's ≡ menu instead (#mNet lives in
+// #mobileMenu, which is display:none until #mobileMenuBtn opens it), so a rig
+// that remembers the pre-boot answer reports "the control exists but is not
+// visible" for a product that is fine.
+// human() refuses to click anything that is not visible and does not fall back
+// to el.click(), so trying several ids in turn cannot produce a stray click.
+async function openLobbyNow(pg, preferred) {
+  const order = (preferred ? [preferred] : [])
+    .concat(pg.__mobile ? ['mNet', 'mobileSplashNet', 'btnNet'] : ['btnNet', 'mNet', 'mobileSplashNet']);
+  const tried = [];
+  for (const id of order) {
+    if (tried.indexOf(id) >= 0) continue;
+    tried.push(id);
+    const r = await human(pg, '#' + id, 'Play Online');
+    if (r.ok) return r;
+  }
+  if (pg.__mobile) {
+    const m = await human(pg, '#mobileMenuBtn', 'the ≡ menu');
+    if (m.ok) {
+      await sleep(500);
+      for (const id of ['mNet', 'btnNet']) {
+        const r = await human(pg, '#' + id, 'Play Online');
+        if (r.ok) { r.viaMenu = true; return r; }
+      }
+    }
+  }
+  return { ok: false, why: 'nothing on this page opens online play in its current state (tried ' +
+                          tried.join(', ') + (pg.__mobile ? ' and the ≡ menu' : '') + ')' };
+}
+
+// BOOT A PAGE ALL THE WAY TO A LIVE CORE, using only controls a person presses.
+// Used by the `host-running` / `joiner-running` arms to reach the state the
+// user was in when they opened a room: a game already up and running.
+// ⚠ IT WAITS FOR FRAMES, NOT FOR `booted`. `booted` is set the moment the run
+// loop is switched on; the state under test is a core that has ALREADY
+// FREE-RUN past the point where the lockstep gate could have been armed, and
+// only a moving frame counter proves that.
+async function bootFully(pg, what, deadlineMs) {
+  const sel = pg.__mobile ? '#mobileRomSelect' : '#romSelect';
+  const startSel = pg.__mobile ? '#mobileSplashStart' : '#btnStart';
+  const picked = await pick(pg, sel, GAME);
+  const pressed = await human(pg, startSel, 'Start');
+  if (!pressed.ok) return { ok: false, why: `${what}: could not press Start — ${pressed.why}`, picked };
+  const t = Date.now();
+  let last = '', p = null;
+  while (Date.now() - t < deadlineMs) {
+    p = await probe(pg).catch(() => null);
+    if (p) {
+      const l = `${what} ${p.phase} ${Math.round(100 * (p.discBytes || 0) / (p.discTotal || 1))}% fps ${p.fps}`;
+      if (l !== last) { last = l; process.stdout.write('  ....  booting  ' + l + '                \r'); }
+      if (p.booted && (p.fps || 0) > 0) { process.stdout.write('\n'); return { ok: true, probe: p, ms: Date.now() - t }; }
+    }
+    await sleep(2500);
+  }
+  process.stdout.write('\n');
+  return { ok: false, why: `${what}: never reached a running core within ${(deadlineMs / 1000).toFixed(0)} s`, probe: p };
+}
+
 const shot = async (pg, tag) => {
   const f = path.join(OUT, `${NAME}-${ARM}-${pg.__role}-${tag}.png`);
   try { await pg.screenshot({ path: f }); RESULT.shots = (RESULT.shots || []).concat(f); } catch (e) {}
@@ -585,8 +665,17 @@ async function runArm(armName) {
   const D = RESULT.arms_detail[armName] = { load: load1(), steps: [] };
   say(`\n${'='.repeat(78)}\n== ARM ${armName}  (load ${D.load})\n${'='.repeat(78)}`);
 
-  const mobileJoiner = armName === 'mobile-joiner';
-  const host = await launch('host', false);
+  const mobileJoiner = /^mobile-joiner/.test(armName);
+  // A PHONE HOST IS A DIFFERENT PRODUCT FROM A DESKTOP ONE, and the difference
+  // bites exactly here: the mobile shell hides #wrap, so the ONLY Start control
+  // in the whole product is #mobileSplashStart INSIDE #mobileSplash — which the
+  // room hand-off hides. A host that is deliberately waiting for players would
+  // be left with a room, a code, and no way to start the game.
+  const mobileHost = /^mobile-host/.test(armName);
+  // WHICH SIDE ALREADY HAD THE GAME RUNNING BEFORE THE ROOM EXISTED.
+  const preBoot = /^(host-running|mobile-host-running)$/.test(armName) ? 'host'
+                : /^(joiner-running|mobile-joiner-running)$/.test(armName) ? 'join' : null;
+  const host = await launch('host', mobileHost);
   const join = await launch('join', mobileJoiner);
   const pages = [host, join];
 
@@ -626,12 +715,27 @@ async function runArm(armName) {
       'no BroadcastChannel echo between the profiles — only the broker + ICE can pair these two',
       'a BroadcastChannel crossed the two profiles: this run proves nothing about two devices');
 
+    // -- 0b. THE SIDE THAT WAS ALREADY PLAYING ------------------------------
+    // Boot to a LIVE, FREE-RUNNING core before this side has any room at all.
+    if (preBoot === 'host') {
+      say('\n-- host: starts the game FIRST and plays it. The room does not exist yet.');
+      const bf = await bootFully(host, 'host', BOOT_MS);
+      D.preBoot = { role: 'host', ok: bf.ok, ms: bf.ms, probe: bf.probe, why: bf.why };
+      cell(bf.ok, 'the-already-playing-side-really-is-playing',
+        `the host reached a live core before opening a room (phase ${bf.probe && bf.probe.phase}, ` +
+        `fps ${bf.probe && bf.probe.fps}, lockstep ${J(bf.probe && bf.probe.lockstep)}) — this is the state ` +
+        'the user was in when they opened a room',
+        `the host never reached a running core, so this arm never applied: ${bf.why}`);
+      if (!bf.ok) return;
+      await shot(host, '0-already-playing');
+    }
+
     // -- 1. THE HOST OPENS A ROOM, clicking only what a person clicks -------
     say(`\n-- host: picks ${GAME}, opens the lobby, opens a room`);
     const hostPick = await pick(host, '#romSelect', GAME);
     cell(hostPick.ok, 'host-can-pick-the-disc', `#romSelect set to ${GAME}`,
       `could not pick ${GAME}: ${J(hostPick)}`);
-    const openLobby = await human(host, '#btnNet', 'Play Online');
+    const openLobby = await openLobbyNow(host, entry[0].found[0]);
     cell(openLobby.ok, 'host-can-open-the-lobby', 'the host pressed "Play Online" with the mouse',
       `the host could not press "Play Online": ${openLobby.why}`);
     await sleep(600);
@@ -704,7 +808,7 @@ async function runArm(armName) {
       const jPick = await pick(join, join.__mobile ? '#mobileRomSelect' : '#romSelect', GAME);
       cell(jPick.ok, 'joiner-can-pick-the-disc' + label, `the joiner picked ${GAME} from its own picker`,
         `the joiner could not pick the disc: ${J(jPick)}`);
-      const jOpen = await human(join, '#' + jEntryId, 'Play Online');
+      const jOpen = await openLobbyNow(join, jEntryId);
       cell(jOpen.ok, 'joiner-can-open-the-lobby' + label, `the joiner pressed #${jEntryId}`,
         `the joiner could not open the lobby: ${jOpen.why}`);
       await sleep(600);
@@ -725,6 +829,17 @@ async function runArm(armName) {
         `the joiner could not press "Join": ${jGo.why}`);
       await shot(join, '3-joined' + label);
     };
+    if (preBoot === 'join') {
+      say('\n-- joiner: ALREADY had the game up and running before anyone gave them a code.');
+      const bf = await bootFully(join, 'joiner', BOOT_MS);
+      D.preBoot = { role: 'join', ok: bf.ok, ms: bf.ms, probe: bf.probe, why: bf.why };
+      cell(bf.ok, 'the-already-playing-side-really-is-playing',
+        `the joiner reached a live core before typing anyone's code (phase ${bf.probe && bf.probe.phase}, ` +
+        `fps ${bf.probe && bf.probe.fps}, lockstep ${J(bf.probe && bf.probe.lockstep)})`,
+        `the joiner never reached a running core, so this arm never applied: ${bf.why}`);
+      if (!bf.ok) return;
+      await shot(join, '0-already-playing');
+    }
     await joinerJoins('');
 
     // -- 3. THE ADMISSION — THE CELL THIS RIG EXISTS FOR --------------------
@@ -951,6 +1066,29 @@ async function runArm(armName) {
     for (const pg of pages) {
       const already = (await probe(pg)).phase;
       if (armName === 'host-busy' && pg.__role === 'host') { starts.push({ ok: true, why: 'already started for this arm' }); continue; }
+      // The whole point of these arms: this side was ALREADY playing. Pressing
+      // Start again is a no-op anyway (the handler returns on `booted`), but
+      // asserting it as a pass would hide that.
+      // ⚠ READ THE LIVE STATE, DO NOT ASSUME IT. This side WAS running before
+      // the room existed — but forming the room is supposed to RESTART it under
+      // the gate, so by now it is a fresh page that has not started. Skipping
+      // Start on the assumption it is still up would leave it never booting and
+      // blame the barrier for it.
+      if (preBoot && pg.__role === preBoot) {
+        const live = await probe(pg).catch(() => null);
+        if (live && live.booted) { starts.push({ ok: true, why: 'still running from before the room existed' }); continue; }
+        // A restarted joiner is started by the room itself the moment the host
+        // seats it, so a boot is usually ALREADY IN FLIGHT here. Start is
+        // disabled while one is, and pressing a disabled control is a failure
+        // this rig reports rather than clicks through — so read the button and
+        // let the boot that is already running be the answer.
+        const busy = await pg.evaluate(() => {
+          const b = document.getElementById('btnStart');
+          return !!(b && b.disabled);
+        }).catch(() => false);
+        if (busy) { starts.push({ ok: true, why: 'the room started it already — a boot is in flight' }); continue; }
+        say(`  ....  ${pg.__role} was restarted by forming the room — pressing Start on the fresh page`);
+      }
       starts.push(await human(pg, pg.__mobile ? '#mobileSplashStart' : '#btnStart', 'Start'));
       say(`  ....  ${pg.__role} pressed Start (was ${already})`);
     }
@@ -989,11 +1127,36 @@ async function runArm(armName) {
       return;
     }
 
+    // -- 5a2. EVERY CORE IN THIS ROOM IS ARMED --------------------------------
+    // THE CELL THE `*-running` ARMS EXIST FOR. Being in a room is not the
+    // claim; being FRAME-GATED is. `armed` means the page put the worker into
+    // lockstep mode before the pump ever ran a frame, which is the only way two
+    // cores can share a frame 0. A core that was already free-running when the
+    // room formed is past that point forever, and a room containing one cannot
+    // work no matter what anybody presses next.
+    {
+      const gates = await Promise.all(pages.map(async (pg) => ({ role: pg.__role, ls: (await probe(pg)).lockstep })));
+      D.gates = gates;
+      say(`  ....  gate: ${J(gates.map((g) => g.role + ' armed=' + (g.ls && g.ls.armed)))}`);
+      cell(gates.every((g) => g.ls && g.ls.armed === true),
+        'every-core-in-the-room-is-frame-gated',
+        `both consoles armed the frame gate before running a frame: ${J(gates)}`,
+        `A CONSOLE IN THIS ROOM IS NOT FRAME-GATED: ${J(gates)}. lsArmBeforeFreerun() runs once, between the ` +
+        'disc load and {cmd:\'freerun\',on:1}; a core that was already free-running when the room formed never ' +
+        'reaches it, so nothing gates it, nothing compares it, and the barrier waits on a machine that will ' +
+        'never arrive.');
+    }
+
     // -- 5b. READY, pressed as a button, on both ---------------------------
     say('\n-- both players press "I\'m ready" — the only control the barrier has');
     for (const pg of pages) {
       const r = await readRoster(pg);
-      if (!r.overlayOpen) await human(pg, '#' + ((pg.__mobile ? entry[1].found[0] : entry[0].found[0]) || 'btnNet'), 'Play Online');
+      // ⚠ INDEX BY WHICH PAGE THIS IS, NOT BY FORM FACTOR. This read
+      // `pg.__mobile ? entry[1] : entry[0]`, which silently hands a MOBILE HOST
+      // the joiner's control id — fine while only the joiner was ever a phone,
+      // wrong the moment a host is one.
+      const eIdx = pages.indexOf(pg);
+      if (!r.overlayOpen) await openLobbyNow(pg, entry[eIdx] && entry[eIdx].found[0]);
       await sleep(500);
       // The button is disabled until this machine's own disc is fully loaded.
       const gotReady = await until(pg, () => {
