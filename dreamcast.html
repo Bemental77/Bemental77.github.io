@@ -744,6 +744,14 @@
     <div id="netRoom" style="display:none">
       <div class="netLabel">The room <span id="netRoomGame"></span><span id="netRoomPorts"></span></div>
       <ul id="netRoster"></ul>
+      <!-- ⚠ THE PLAY BUTTON BELONGS *IN* THE LOBBY. Starting the game meant
+           finding #btnStart on the page BEHIND this panel — which on a phone the
+           mobile shell hides outright, and on desktop is covered by the panel the
+           player is looking at. So "how do I actually start it" had no answer in
+           the one place the player is reading. This is that answer: it loads the
+           disc on every console in the room and then hands off to the barrier,
+           which still holds everyone at frame 0 until all are ready. -->
+      <button id="netPlay" class="primary" type="button" style="display:none">Play</button>
       <button id="netReady" type="button" style="display:none">I'm ready</button>
       <span id="netBarrier"></span>
     </div>
@@ -6564,7 +6572,20 @@
       // (per-player-load-progress) is what caught it and is what stops it
       // coming back.
       you: (t.you && typeof t.you === 'object')
-        ? { port: num(t.you.port), name: t.you.name || null, ready: !!t.you.ready, loadPct: num(t.you.loadPct) }
+        ? { port: num(t.you.port), name: t.you.name || null, ready: !!t.you.ready, loadPct: num(t.you.loadPct),
+            // ⚠ "0% loaded" MEANT THREE DIFFERENT THINGS and named none of them:
+            // the load is HELD waiting for a player; the load started and not
+            // one byte has arrived; or it is genuinely early. The user sat on
+            // "P1 you 0% loaded" with the other player already ready and had no
+            // way to tell which — and neither did I, which is why the next
+            // question was guesswork. This says it.
+            loadState: (function () {
+              if (safe(() => booted, false)) return 'loaded';
+              if (NET.startArmed) return 'held-for-players';
+              if (!PROG.discTotal) return 'not-started';
+              if (!PROG.discBytes) return 'no-bytes-yet';
+              return 'loading';
+            })() }
         : null,
       peers: (arr(t.peers) || []).map((q) => ({
         id: q && q.id != null ? String(q.id) : null,
@@ -7095,6 +7116,18 @@
         pct = (typeof src.loadPct === 'number') ? Math.max(0, Math.min(1, src.loadPct)) : null;
         if (peer && peer.connected === false) { cls = 'gone'; state = 'disconnected'; }
         else if (src.ready) { cls = 'ready'; state = 'ready'; }
+        // ⚠ NAME THE STATE, DO NOT JUST PRINT A ZERO. "0% loaded" was shown for
+        // three different situations and distinguished none of them, so a room
+        // that was WAITING ON PURPOSE looked identical to one whose download had
+        // produced nothing at all. The user read "P1 you 0% loaded" next to a
+        // player already marked ready and asked, reasonably, why the game was
+        // not booting — a question the row itself should have answered.
+        else if (isYou && src.loadState === 'held-for-players') {
+          cls = 'loading'; state = 'waiting for players';
+        }
+        else if (isYou && src.loadState === 'no-bytes-yet') {
+          cls = 'loading'; state = 'starting the download…';
+        }
         else if (pct != null && pct < 1) { cls = 'loading'; state = Math.round(pct * 100) + '% loaded'; }
         else { cls = 'loading'; state = 'not ready'; }
         if (isYou) cls += ' you';
@@ -7135,6 +7168,21 @@
       bcls = 'hold';
     }
     if (btxt !== ROOM.lastBarrier) { bar.textContent = btxt; bar.className = bcls; ROOM.lastBarrier = btxt; }
+
+    // ⚠ PLAY IS THE HOST'S CONTROL AND IT LIVES HERE. It appears once the room
+    // has somebody else in it and this console has not started loading, which is
+    // exactly the moment the player is asking "everyone is in, now what?".
+    // A joiner never sees it: the room starts a joiner by itself.
+    const playBtn = $('netPlay');
+    if (playBtn) {
+      const others = peers.filter((q) => q && q.port != null).length;
+      const notLoading = !safe(() => booted, false) && (NET.startArmed || !PROG.discTotal);
+      const showPlay = NET.role === 'host' && !b.started && notLoading;
+      playBtn.style.display = showPlay ? '' : 'none';
+      playBtn.disabled = others < 1;
+      playBtn.textContent = others < 1 ? 'Waiting for a player to join…'
+                                       : 'Play — load the game on every console';
+    }
 
     // The ready button exists only while there is something to be ready FOR.
     if (rdy) {
@@ -7333,6 +7381,18 @@
         else pageLog('[net] this build has no start barrier yet (session.setReady is missing)');
       } catch (e) { pageLog('[net] setReady threw: ' + ((e && e.message) || e)); }
       netRoomRender();
+    });
+    // ⚠ ONE ACTION, THE ONE THE PLAYER IS LOOKING AT. This does exactly what
+    // pressing Start does — it does not duplicate the boot path, it presses it —
+    // so there is no second code path to drift. netRoomRender() decides when it
+    // is shown and what it says.
+    const play = $('netPlay');
+    if (play) play.addEventListener('click', () => {
+      const st = $('btnStart');
+      if (!st) return;
+      pageLog('[net] Play pressed in the lobby — starting the game for this room');
+      if (st.disabled) st.disabled = false;
+      try { st.click(); } catch (e) { pageLog('[net] Play failed: ' + ((e && e.message) || e)); }
     });
     $('netLeave').addEventListener('click', netLeave);
     pageLog('[net] online play available (' + netTransport() + ' signalling)');
