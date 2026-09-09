@@ -42,7 +42,7 @@
   (N64Wasm is single-threaded and never touches SharedArrayBuffer), and
   tools/n64_page_test.mjs asserts that as a standing invariant.
 -->
-<script src="/lib/netplay.js"></script>
+<script src="/lib/netplay.js?v=055f3e69"></script>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -189,12 +189,23 @@
   $('btnHost').addEventListener('click', function () {
     code = Netplay.makeCode(5);
     $('code').textContent = code;
-    $('hostPane').style.display = '';
+    // ⚠ 'block', NOT ''. `style.display = ''` REMOVES the inline style and falls
+    // straight back to the stylesheet — and line 71 is
+    //     #hostPane, #joinPane { display: none; }
+    // so the pane could never open. Measured on production: setting '' left
+    // getComputedStyle().display === 'none' for BOTH panes; 'block' gives
+    // 'block' and #codeIn finally has a box (width 494).
+    // Consequence: NOBODY COULD JOIN AN N64 ROOM — there was no visible field to
+    // type a code into — and the host never saw its own code panel either. The
+    // host half went unnoticed because the room code is readable from #code's
+    // textContent whether or not the panel is visible, so a rig that reads the
+    // code passes while a human staring at the page sees nothing.
+    $('hostPane').style.display = 'block';
     $('joinPane').style.display = 'none';
   });
 
   $('btnJoinPane').addEventListener('click', function () {
-    $('joinPane').style.display = '';
+    $('joinPane').style.display = 'block';   // see the note above: '' resolves to none
     $('hostPane').style.display = 'none';
     $('codeIn').focus();
   });
