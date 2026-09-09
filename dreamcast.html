@@ -5928,7 +5928,21 @@
     const game = $('romSelect').value;
     const q = new URLSearchParams(location.search);   // keep ?mobile / ?turn / ?signal
     q.set('np', code);
-    q.set('game', game);
+    // ⚠ A JOINER MUST NOT CARRY ITS OWN GAME INTO THE ROOM. The room's disc is
+    // the HOST's, and this page's picker holds whatever this player last looked
+    // at — which is not the same thing and is usually wrong. Baking it here
+    // produced two consoles in one room on two different discs, photographed by
+    // the user on his own devices:
+    //     phone  (host)   ?np=J5HJF&game=gauntlet&npwait=1
+    //     laptop (joiner) ?np=J5HJF&game=pso2&join=1&npwait=1
+    // Both seated, both "waiting for the other players", neither ever starting.
+    // The joiner had loaded PSO2 because its own dropdown said so, so it could
+    // never satisfy a barrier whose other member was on Gauntlet.
+    // Leaving ?game unset for a joiner is what makes the 'room-game' handler
+    // authoritative — and depending on that message is SAFE now in a way it was
+    // not before, because lib/netplay.js's roster heartbeat repeats it instead
+    // of sending it once.
+    if (joining) q.delete('game'); else q.set('game', game);
     if (joining) q.set('join', '1'); else q.delete('join');
     // ⚠ AND IT DOES NOT PRESS START ON ARRIVAL. The hand-off receiver's
     // unconditional `$('btnStart').click()` is right for the LOBBY, where the
