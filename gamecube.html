@@ -7109,6 +7109,13 @@ window.GcRate = (function () {
       var buf;
       if (/\.gz$/.test(ROM_CHUNKS[i]) && typeof DecompressionStream === 'function') {
         buf = await new Response(r.body.pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
+      } else if (/\.gz$/.test(ROM_CHUNKS[i])) {
+        // NOT a fallback — there is nothing to fall back TO. `r.arrayBuffer()` on a .gz part
+        // returns the compressed bytes (devserver.mjs:87-98 and GitHub Pages both send
+        // Content-Type application/gzip with no Content-Encoding), and a core handed DEFLATE
+        // instead of a disc boots into a hang with no error anywhere. Say it out loud.
+        setStatus('This browser cannot decompress the disc (needs DecompressionStream — Safari 16.4+)');
+        return;
       } else {
         buf = await r.arrayBuffer();
       }
@@ -7706,7 +7713,18 @@ window.GcRate = (function () {
               if (total >= srDiscMB * 1048576) break;
               var r = await fetch(ROM_CHUNKS[i]);
               if (!r.ok) throw new Error(ROM_CHUNKS[i] + ' -> ' + r.status);
-              var buf = await r.arrayBuffer();
+              // Same inflate as the JIT chunk loader at :7110 — ROM_CHUNKS are .gz names
+              // (chunkRange, :2133) and nothing on the wire decompresses them. Without this
+              // the window is filled with DEFLATE bytes, which is a disc-shaped nothing:
+              // exactly the failure that hung Mario Party 4's recomp for two days.
+              var buf;
+              if (/\.gz$/.test(ROM_CHUNKS[i]) && typeof DecompressionStream === 'function') {
+                buf = await new Response(r.body.pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
+              } else if (/\.gz$/.test(ROM_CHUNKS[i])) {
+                throw new Error('disc parts are gzipped and this browser has no DecompressionStream');
+              } else {
+                buf = await r.arrayBuffer();
+              }
               total += buf.byteLength;
               rw.postMessage({ cmd: 'romChunk', buf: buf }, [buf]);
             }
@@ -8329,13 +8347,42 @@ window.GcRate = (function () {
     if (discP) return discP;
     console.log('[recomp-live] prefetching disc parts + fst...');
     var suffixes = ['aa', 'ab', 'ac', 'ad', 'ae', 'af'];
+    // ⚠ THE PARTS SHIP GZIPPED AND NOTHING ON THE WIRE INFLATES THEM. 932b6ef1 renamed the six
+    // MP4 parts to *.gz and taught the JIT chunk loader to stream-inflate (:7110-7111) — this
+    // prefetch got the new NAME and not the inflate, so from that commit until this one the
+    // recomp worker was handed 482,282,834 bytes of raw DEFLATE as "the disc". Neither
+    // tools/devserver.mjs (:87-98,:128 — Content-Type application/gzip, no Content-Encoding)
+    // nor GitHub Pages marks a .gz as encoded, so fetch().arrayBuffer() really does hand back
+    // the compressed bytes; the browser never decompresses anything.
+    //
+    // HOW IT PRESENTED: a grey screen and nothing else. The trimmed image is 598,382,592 B and
+    // /sound/mpgcsnd.msm lives at disc offset 0x20CB1F20 (550,510,368) per mp4_fst_trimmed.bin
+    // — past the end of the 482 MB gzip blob, so recomp_worker.js:703 zero-fills the read,
+    // msmsys.c:809 sees version 0 != MSM_FILE_VERSION 2 and returns MSM_ERR_INVALIDFILE (-121),
+    // and audio.c:57-58 prints "MSM(Sound Manager) Error:Error Code -121" and then runs
+    // `while (1);` FOREVER. The guest hangs inside its own code, one frame in, with no trap, no
+    // wgpu error and no dead worker to point at.
+    //
+    // The magic check below exists because that is the whole failure mode: a disc that is the
+    // wrong bytes loads exactly as quietly as a disc that is the right bytes. GMPE01 at 0 and
+    // 0xC2339F3D at 0x1C are the GameCube header; if they are not there we are not holding a
+    // disc, and saying so is worth more than a grey canvas.
     discP = Promise.all([
       Promise.all(suffixes.map(function (sx) {
         return fetch(window.ASSET_BASE + '/gamecube/roms/MarioParty4.bin.part' + sx + '.gz').then(function (r) {
           if (!r.ok) throw new Error('part' + sx + ' ' + r.status);
-          return r.arrayBuffer();
+          if (typeof DecompressionStream !== 'function')
+            throw new Error('part' + sx + ': the disc parts are gzipped and this browser has no DecompressionStream');
+          return new Response(r.body.pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
         });
-      })),
+      })).then(function (bufs) {
+        var head = new DataView(bufs[0], 0, 32), id = '';
+        for (var i = 0; i < 6; i++) id += String.fromCharCode(head.getUint8(i));
+        if (id !== 'GMPE01' || head.getUint32(0x1C, false) !== 0xC2339F3D)
+          throw new Error('assembled disc is not Mario Party 4: id="' + id + '" magic=0x' +
+                          (head.getUint32(0x1C, false) >>> 0).toString(16));
+        return bufs;
+      }),
       fetch('/gamecube/recomp/mp4_fst_trimmed.bin').then(function (r) {
         if (!r.ok) throw new Error('fst ' + r.status);
         return r.arrayBuffer();
