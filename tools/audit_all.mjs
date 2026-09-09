@@ -95,6 +95,13 @@ const HARNESSES = [
     fast: true, ci: true, server: false, requires: [], timeoutMs: 10 * MIN,
   },
   {
+    name: 'undelivered',
+    file: 'tools/undelivered.mjs',
+    cmd: ['node', 'tools/undelivered.mjs'],
+    desc: 'the OPEN WORK — what was promised and is not built, printed on every audit run with the evidence for why each is still open. Asked directly, "how come the auditor let you stop working?": because every other harness answers "is the built thing broken" and NONE answers "what have we not built". A gap left the moment it stopped being spoken about. Each entry carries a verify() that must FAIL while the gap is real, so an entry that silently goes out of date fails the gate instead of quietly lying',
+    fast: true, ci: true, server: false, requires: [], timeoutMs: 2 * MIN,
+  },
+  {
     name: 'netplay-invariants',
     file: 'tools/netplay_invariants.mjs',
     cmd: ['node', 'tools/netplay_invariants.mjs'],
