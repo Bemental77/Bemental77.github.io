@@ -5726,6 +5726,37 @@ window.GcRate = (function () {
     wireButton('mobileL', KEYMAP.l); wireButton('mobileR', KEYMAP.r); wireButton('mobileZ', KEYMAP.z);
     wireButton('mobileStart', KEYMAP.start); wireButton('mobileSelect', KEYMAP.select); wireDpad();
   }
+  // ---------------------------------------------------------------------------
+  // GAMECUBE NETPLAY STUB — the four names pollController() calls were NEVER
+  // DEFINED ANYWHERE IN THE REPO. Measured: `GCNET`, `gcNetRemoteMask`,
+  // `gcNetApplyMask` and `gcNetPumpMirror` each appear ONLY at their call sites
+  // in this file and have zero definitions in gamecube.html or lib/*.js.
+  //
+  // THIS WAS NOT A COSMETIC ReferenceError. The throw happens at
+  // `var _rm = gcNetRemoteMask()`, which sits BEFORE both
+  // `dolphin_worker.postMessage({cmd:'input'})` and the `setTimeout(pollController,10)`
+  // that re-arms the loop. So every GameCube visit lost ALL controller input and
+  // the poll loop died on its first pass — the buttons did nothing, and nothing
+  // in the console said why.
+  //
+  // These are deliberately INERT, not an implementation. GameCube lockstep does
+  // not exist yet (dolphin_worker.js contains zero occurrences of "lockstep"),
+  // so a stub that silently invented remote-pad semantics would be worse than
+  // none. `gcNetRemoteMask()` returning null is what the call site already
+  // treats as "no remote player", so single-player takes exactly the path it was
+  // always meant to. When GC netplay is written, replace this block — the call
+  // sites and the port-1 byte layout they document are already correct.
+  var GCNET = { role: null, mirrorCtx: null, sentP1: null, sentP2: null };
+  // null means "nobody remote is seated" — the call site skips the mask.
+  function gcNetRemoteMask() { return null; }
+  // Kept faithful to the layout the call site documents: port 1 is bytes 8..15,
+  // port 0 is never touched. Unreachable while gcNetRemoteMask() returns null.
+  function gcNetApplyMask(arr, off, mask) {
+    if (!mask || !arr) return;
+    for (var i = 0; i < 8 && (off + i) < arr.length; i++) arr[off + i] = mask[i] & 0xff;
+  }
+  function gcNetPumpMirror() { /* no capture mirror without a session */ }
+
   function pollController() {
     if (!dolphin_worker) return;
     if (Module._CheckJoy) Module._CheckJoy(); if (Module._CheckKeyboard) Module._CheckKeyboard();
