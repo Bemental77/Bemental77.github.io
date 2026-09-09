@@ -3549,7 +3549,29 @@
     // two other unverified changes and the game crashed at boot (reverted in
     // e6707b6). This is narrower: it arms only where eager provably cannot fit,
     // so a machine with the headroom keeps the confirmed-good eager runtime.
-    const budgetForces = !eagerDiscFitsBudget(file.bytes || 0);
+    // ⚠ THE BUDGET IS A PROPERTY OF THE DISC, NOT OF ONE FILE. This asked
+    // `eagerDiscFitsBudget(file.bytes)` — the size of the track being fetched —
+    // so a disc split across several large tracks was judged one track at a
+    // time and each one passed. Measured on a phone loading Gauntlet Legends:
+    //
+    //   Track3  487,889,472 B = 465 MB x 2.2 = 1024 MB  -> under 1200, EAGER
+    //   Track5  696,634,176 B = 664 MB x 2.2 = 1462 MB  -> over  1200, lazy
+    //   total                  1131 MB downloaded, photographed at "75.1%"
+    //
+    // while Sonic Adventure 2, whose whole disc is ONE 1,185,760,800 B track,
+    // tripped the ceiling and streamed — 9,265,296 B to disc-ready on the live
+    // origin. Same page, same format, opposite outcome, decided entirely by how
+    // many files the disc happens to be cut into. Track3 has a .bgz index and
+    // could have streamed; it was fetched whole because 465 < 1200.
+    //
+    // The transient cost that ceiling exists to bound is the whole disc landing
+    // in memory, so the whole disc is what has to be measured against it.
+    // `key` is not in scope here (tryPostLazy takes file/base/why), so the disc
+    // is found by its base path — the one thing every file of a disc shares.
+    const _disc = Object.keys(GAMES).map((k) => GAMES[k]).find((g) => g.base === base);
+    const _discBytes = (_disc && _disc.files || []).reduce((n, f) => n + (f.bytes || 0), 0)
+      || (file.bytes || 0);
+    const budgetForces = !eagerDiscFitsBudget(_discBytes);
     if (why !== 'fallback' && !QS.has('lazydisc') && !budgetForces) return false;
     if (budgetForces && why !== 'fallback' && !QS.has('lazydisc')) {
       // Name the guard that ACTUALLY fired. This line used to always say "exceeds
