@@ -118,6 +118,34 @@ async function waitFor(page, fn, ms, what) {
 // TABS in one context — the same configuration dreamcast/tools/determinism_probe.mjs
 // uses and describes — and the save-memory hazard is handled instead by the
 // page neutering LoadSram inside a room.
+
+// ⚠ SELECT THE ROM BY ITS LABEL, THROUGH THE PICKER, AND FAIL IF IT DOES NOT
+// TAKE. `?game=` on this page is read by applyUrlParams, which matches on the
+// ROM's FILE NAME (`r.file === g || r.file === g + '.z64'`) — NOT on its label.
+// So passing a label silently selected nothing and the page booted ROMS[0].
+// MEASURED: an `attach` run asked for "Mario Kart 64" (PAL, 50 Hz) and reported
+// `pacing to 60 Hz from the ROM header`, i.e. it had actually booted Super
+// Mario 64. Both tabs booted the SAME wrong game so the determinism comparison
+// was still valid, but every rate figure was against the wrong region and the
+// run was not testing the title it named. This is CLAUDE.md's stale-selection
+// trap in a new costume, so it is asserted rather than assumed.
+async function selectRom(page, label) {
+  const ok = await page.evaluate((want) => {
+    const sel = document.getElementById('romSelect');
+    if (!sel) return false;
+    for (let i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].textContent.trim() === want) {
+        sel.value = sel.options[i].value;
+        sel.dispatchEvent(new Event('change'));
+        return true;
+      }
+    }
+    return false;
+  }, label);
+  if (!ok) throw new Error('ROM "' + label + '" is not in this page\'s picker — it would have booted ROMS[0] silently');
+  return ok;
+}
+
 async function openPage(browser, url, tag, log, sameContext, preload) {
   let ctx = null, page;
   if (sameContext) {
@@ -254,6 +282,7 @@ async function runBridge(browser, log) {
   try {
     // Press Start on both, then wait for the core to be booted AND armed.
     for (const P of [A, B]) {
+      await selectRom(P.page, GAME);
       await P.page.evaluate(() => {
         const b = document.getElementById('btnStart');
         if (b && !b.disabled) b.click();
@@ -438,6 +467,7 @@ async function runAttach(browser, log) {
     await drain(A, B);
     // Press Start on both. The page arms in beforeRun, so no frame runs first.
     for (const P of [A, B]) {
+      await selectRom(P.page, GAME);
       await P.page.evaluate(() => { const b = document.getElementById('btnStart'); if (b && !b.disabled) b.click(); });
     }
     for (const [tag, P] of [['A', A], ['B', B]]) {

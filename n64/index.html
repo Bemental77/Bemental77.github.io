@@ -3734,6 +3734,23 @@ N64Rate.selfTest = function (logFn) {
       requestAnimationFrame(tick);
     };
     requestAnimationFrame(tick);
+    // ⚠ AND A TIMER BESIDE IT, BECAUSE rAF STOPS IN A BACKGROUND TAB AND THIS
+    // CORE LIVES IN THE PAGE.
+    // dreamcast.html does not need this: its core runs in a WORKER that owns its
+    // own pump, so guest progress survives the tab being backgrounded. N64Wasm is
+    // single-threaded and in-page, so when the player switches tabs rAF is
+    // suspended, this machine feeds nothing, and — because lockstep never
+    // guesses — EVERY OTHER PLAYER IN THE ROOM STALLS on it.
+    // MEASURED, and this is exactly how it was found: in the `attach` arm the
+    // background tab reported framesA=0 while the foreground tab ran 3 frames and
+    // then failed with `engine state failed` after stalling 120 s on it.
+    // A timer is throttled in a background tab (roughly once a second) rather
+    // than suspended, so the room degrades to slow instead of dying. It cannot
+    // make the guest run FAST: lsDueNow() is still the governor, so this only
+    // ever adds opportunities to run a frame that is already due.
+    setInterval(function () {
+      if (LS.armed) { try { lsFeed(); } catch (e) {} }
+    }, 4);
     void hookIv;
 
     pageLog('[net] online play available (' + netTransport() + ' signalling) — deterministic lockstep, '
