@@ -6242,7 +6242,21 @@
     // "game is not defined" one tick after "joiner-can-press-join" passed.
     // The joiner does not know the disc yet by design — the room tells it, in
     // the 'room-game' handler above — so there is nothing to name here.
-    netRememberRoomInUrl(code, ($('romSelect') ? $('romSelect').value : null), true);
+    // ⚠ NO GAME. A JOINER DOES NOT GET TO NAME THE ROOM'S DISC — the host does,
+    // and it arrives on the 'room-game' event, which rewrites this URL with the
+    // right one at :6193. Passing $('romSelect').value here published whatever
+    // this player last had selected, which is the DEFAULT on a fresh page.
+    //
+    // This is the SECOND writer of that parameter and it survived the first fix.
+    // lsRestartIntoRoom() was corrected in 60e13d00 to stop baking a joiner's
+    // own pick into the hand-off, and the URL STILL came back
+    //     ?np=JWKJ5&game=pso2&join=1&npwait=1
+    // on a room whose host was on gauntlet — measured through the browser on
+    // production, driving both sides. The joiner then loads pso2 and can never
+    // satisfy a barrier whose other member is on gauntlet, which is what the
+    // user photographed twice: both consoles seated, both "waiting for the other
+    // players", neither ever starting.
+    netRememberRoomInUrl(code, null, true);
     pageLog('[net] joining room ' + code + ' via ' + netTransport() +
             ' — the host names the disc once this machine is in; the address bar now carries the room, so a ' +
             'reload (or a phone discarding this tab) comes back into it instead of onto a blank page');
