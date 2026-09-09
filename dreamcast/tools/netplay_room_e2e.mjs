@@ -475,6 +475,58 @@ try {
       'room silently plays with the wrong number of pads.');
   }
 
+  // ---- 4c. A GATED CORE IS NOT A WEDGED CORE -------------------------------
+  // ⚠ THE PAGE TOLD A USER THEIR EMULATOR HAD DIED WHILE IT WAS WORKING
+  // CORRECTLY. Reported 2026-09-08 from two real devices: the host's screen
+  // read "The emulator has stopped: … every frame for 12s has been identical —
+  // the game is wedged, not the renderer" over a core that was parked at this
+  // very barrier waiting for the other player.
+  //
+  // The stall detector (dreamcast.html checkStall) is driven ENTIRELY by the
+  // worker's {cmd:'fps'} message, which is posted from inside video_cb and so
+  // only once per retro_run. A gated core never reaches retro_run — the pump
+  // returns early on an empty input queue — so every clock that detector
+  // watches stops ON PURPOSE. All of its branches are fooled, not just the
+  // duplicate-frames one.
+  //
+  // Nothing here could catch that, because the barrier below is held for about
+  // a second and the detector's threshold is twelve. So this holds the room
+  // shut for longer than STALL_MS on purpose and asserts the page stays quiet.
+  const STALL_MS_PAGE = 12000;
+  say(`\n== 4c. every core parks at the barrier for >${STALL_MS_PAGE / 1000}s — none may be called WEDGED ==`);
+  await sleep(STALL_MS_PAGE + 3000);
+  const parked = await Promise.all(pages.map((pg) => pg.evaluate(() => ({
+    stall: window.__dcStall ? window.__dcStall() : null,
+    ls: window.__dcNet ? window.__dcNet().lockstep : null,
+    headline: window.__dcProbe ? window.__dcProbe().headline : null,
+  }))));
+  parked.forEach((p, i) => say(`  ....  P${i + 1} armed=${p.ls && p.ls.armed} running=${p.ls && p.ls.running} ` +
+    `stallState=${J(p.stall && p.stall.state)} gateHold=${J((p.stall && p.stall.gateHold || '').slice(0, 60))}`));
+  const seamOK = parked.every((p) => p.stall);
+  if (!seamOK) {
+    cell(false, 'a-core-held-at-the-barrier-is-not-called-WEDGED', '',
+      'window.__dcStall is missing, so this build cannot answer whether it calls a gated core wedged. ' +
+      `read: ${J(parked.map((p) => p.stall))}`);
+  } else {
+    const anyArmed = parked.some((p) => p.ls && p.ls.armed);
+    const quiet = parked.every((p) => !p.stall.state && !p.stall.alertBar);
+    cell(anyArmed && quiet, 'a-core-held-at-the-barrier-is-not-called-WEDGED',
+      `all ${PLAYERS} cores sat gated for ${(STALL_MS_PAGE + 3000) / 1000}s and NONE raised the stall banner — ` +
+      `gate hold reported as: ${J((parked[0].stall.gateHold || '').slice(0, 90))}`,
+      'a correctly-gated core was reported as a stalled/wedged emulator. ' +
+      `stallState=${J(parked.map((p) => p.stall.state))} banner=${J(parked.map((p) => p.stall.alertBar))} ` +
+      `armed=${J(parked.map((p) => p.ls && p.ls.armed))}. Telling a player their emulator died while it ` +
+      'correctly waits for another player is its own bug.');
+    // ⚠ AND THE SUPPRESSION MUST BE NARROW. A blanket "lockstep is on, so never
+    // report a stall" would blind the page to every real wedge for the whole
+    // session, which trades one bug for a worse one. The hold must be REASONED
+    // and reported, not merely silent.
+    cell(parked.every((p) => !p.ls || !p.ls.armed || !!p.stall.gateHold),
+      'the-quiet-is-REASONED-not-blanket',
+      'every gated core can say in words WHY its frames stopped, so the suppression is a judgement and not a mute',
+      `a core is armed but reports no gate-hold reason: ${J(parked.map((p) => ({ armed: p.ls && p.ls.armed, hold: p.stall.gateHold })))}`);
+  }
+
   // ---- 5. the start barrier ------------------------------------------------
   say('\n== 5. the start barrier ==');
   // ⚠ SOMEBODY HAS TO PRESS READY, and the first version of this rig never did

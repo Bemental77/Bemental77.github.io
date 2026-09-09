@@ -422,6 +422,16 @@
     #netStatus.bad  { border-color: #f85149; color: #ff7b72; }
     #netStatus.busy { border-color: #9e6a03; color: #ffa657; }
     .netActions { display: flex; gap: 8px; margin-top: 14px; justify-content: flex-end; }
+    /* THE RELAY ROW. Collapsed by default — most people on one network never
+       need it — but present, because for two devices on different networks it
+       is the difference between a room that works and one that cannot. */
+    #netRelayBox { margin-top: 14px; border: 1px solid #30363d; border-radius: 6px;
+      padding: 8px 11px; background: #0d1117; }
+    #netRelayBox > summary { cursor: pointer; color: #8bd; font-size: 12px;
+      text-transform: uppercase; letter-spacing: .06em; min-height: 30px;
+      display: flex; align-items: center; }
+    #netRelayBox p.lead { margin: 8px 0 10px; font-size: 12.5px; }
+    #netRelayIn { width: 100%; box-sizing: border-box; font: 13px/1.3 ui-monospace, Menlo, monospace; }
 
     /* ---- THE ROOM ----------------------------------------------------------
        Online play is a ROOM, not a pair. The Dreamcast has four controller
@@ -478,6 +488,10 @@
     #netHud .mode { font-weight: 700; letter-spacing: .04em; }
     #netHud.stream .mode { color: #ffa657; }
     #netHud.lockstep .mode { color: #7ee787; }
+    /* A room that CANNOT CONNECT is not a shade of "waiting" — it reads as the
+       failure it is, in the same register as the stalling case below. */
+    #netHud.fault .mode { color: #ff7b72; }
+    #netHud.netfault { border-color: #8c2b22; background: rgba(58,10,6,.92); }
     #netHud .warn { color: #ffa657; font-weight: 700; }
     /* STALLING IS ITS OWN COLOUR, not a word buried in a line. A player whose
        game has stopped needs to know in one glance that it stopped BECAUSE OF
@@ -726,6 +740,25 @@
       <button id="netReady" type="button" style="display:none">I'm ready</button>
       <span id="netBarrier"></span>
     </div>
+    <!-- ⚠ WHY THIS CONTROL EXISTS, AND WHY IT SHIPS EMPTY. Two browsers on
+         networks that will not carry a direct path between them need a TURN
+         relay. lib/netplay.js ships STUN ONLY and its ICE block records the
+         measurements behind that: every public relay tried returned 701/400,
+         and peerjs's own two do not resolve at all — so a relay was nearly
+         shipped here decoratively, which would have been a lie in a config
+         object rather than a fix. No credentials are baked in and no default
+         is filled: a player or an operator supplies a relay that actually
+         relays, or the field stays empty and says so. -->
+    <details id="netRelayBox">
+      <summary>Relay server — needed to play across some networks</summary>
+      <p class="lead" id="netRelayState">…</p>
+      <input id="netRelayIn" type="text" autocomplete="off" spellcheck="false"
+             placeholder="turn:host:3478|username|password">
+      <div class="netActions">
+        <button id="netRelayApply" type="button">Use this relay</button>
+        <button id="netRelayClear" type="button">Clear</button>
+      </div>
+    </details>
     <div id="netStatus">Not connected.</div>
     <div class="netActions">
       <button id="netLeave" type="button" style="display:none">Leave</button>
@@ -4389,6 +4422,10 @@
   const STALL_MS = 12000;         // generous: a savestate restore can pause frames
   const NEVER_STARTED_MS = 60000; // booted, disc loaded, and still no frame ever
   let stallState = '';
+  // Kept SEPARATE from stallState on purpose. A legitimate lockstep hold is not
+  // a stall that later "recovers", and folding it into stallState would make
+  // the release log claim the page recovered from a fault that never happened.
+  let gateHoldState = '';
   function rebaseStallClocks() {
     const now = Date.now();
     lastTelemetryAt = lastCallsAt = lastDistinctAt = now;
@@ -4427,6 +4464,45 @@
   function checkStall() {
     checkPreBootStall();
     if (!booted || document.hidden) return;
+    // ⚠ A CORE HELD AT THE LOCKSTEP GATE IS NOT A WEDGED CORE, and telling a
+    // player their emulator died while it correctly waits is its own bug.
+    // Reported 2026-09-08 from a real two-device test: the host's page raised
+    // "The emulator has stopped: … every frame for 12s has been identical — the
+    // game is wedged, not the renderer" over a console that was doing exactly
+    // what lockstep requires.
+    //
+    // WHY EVERY BRANCH BELOW IS FOOLED, not just the duplicate-frames one. This
+    // detector is driven entirely by the worker's {cmd:'fps'} message, which is
+    // posted from inside video_cb (dreamcast/flycast-bridge/EmscriptenWorker.cpp
+    // :749) and therefore only once per retro_run. A gated core does not reach
+    // retro_run at all — the pump returns early on an empty input queue
+    // (dreamcast/flycast_libretro/flycast_worker.js:608-642) — so lastTelemetryAt
+    // freezes and the 'telemetry' branch fires at 12 s, while a core gated
+    // BEFORE its first free-run frame has framesEverFlowed=false and takes
+    // 'no-first-frame' at 60 s. Suppressing the alarm here is not hiding a
+    // fault; raising it was inventing one.
+    //
+    // ⚠ WHAT IS DELIBERATELY *NOT* SUPPRESSED: a core that is armed, RELEASED
+    // and waiting on nobody. That one has no excuse and keeps the full alarm —
+    // otherwise arming lockstep would blind the page to every real wedge.
+    const gateHeld = safe(() => lsGateHoldReason(), null);
+    if (gateHeld) {
+      if (gateHoldState !== gateHeld) {
+        gateHoldState = gateHeld;
+        pageLog('[stall] frames have stopped and that is CORRECT — ' + gateHeld);
+      }
+      // Hold the clocks at "now" for as long as the gate holds, so the instant
+      // it releases the detector starts counting from THERE rather than firing
+      // immediately on time the core spent legitimately waiting.
+      rebaseStallClocks();
+      return;
+    }
+    if (gateHoldState) {
+      gateHoldState = '';
+      pageLog('[stall] the lockstep gate released — stall clocks rebased from here');
+      rebaseStallClocks();
+      return;
+    }
     const now = Date.now();
     let state = '';
     let why = '';
@@ -4465,6 +4541,28 @@
       if (bar && /STALLED/.test(bar.textContent)) bar.classList.remove('on');
     }
   }
+
+  // Test seam for the stall detector. It had none: `stallState` is a closure
+  // local and the alert bar's text was reachable only by scraping the DOM, so
+  // "did the page call a correctly-gated core wedged" was not an assertable
+  // question — which is why the bug shipped. Paired with __dcNet().lockstep,
+  // this is what dreamcast/tools/netplay_room_e2e.mjs asserts against.
+  window.__dcStall = () => ({
+    state: stallState,                       // '' when the detector is quiet
+    gateHold: safe(() => lsGateHoldReason(), null),
+    gateHoldLatched: gateHoldState || null,
+    // THE BANNER, read as the player sees it: null when it is not showing.
+    alertBar: safe(() => {
+      const b = document.getElementById('alertBar');
+      return (b && b.classList.contains('on')) ? b.textContent : null;
+    }, null),
+    statusText: safe(() => (document.getElementById('status') || {}).textContent, null),
+    framesEver: safe(() => framesEverFlowed, false),
+    distinctEver: safe(() => distinctEverFlowed, false),
+    sinceTelemetryMs: safe(() => (lastTelemetryAt ? Date.now() - lastTelemetryAt : null), null),
+    sinceDistinctMs: safe(() => (lastDistinctAt ? Date.now() - lastDistinctAt : null), null),
+    stallCount: safe(() => counters.stall || 0, 0),
+  });
 
   // Heartbeat: RELEASE builds print nothing once boot telemetry caps out,
   // which idle-kills probes and leaves the Log panel blind. One line / 2s.
@@ -4674,6 +4772,33 @@
     fault: null,         // why this machine is NOT frame-gated, in words
     engagedAt: 0,
   };
+
+  // WHY THE FRAME GATE IS HOLDING THIS CORE, in words a player can read — or
+  // null when it is not holding, which is the only answer that lets the stall
+  // detector raise its alarm. Read by checkStall() (see the block there) and
+  // published on window.__dcStall for the test that proves a gated core is
+  // never called wedged.
+  //
+  // ⚠ THE THREE STATES ARE NOT INTERCHANGEABLE. `LS.stalling` is FALSE at the
+  // start barrier — it is only ever set by the engine-refusal path inside
+  // lsFeed(), which is unreachable until ls.state is running/stalled — so a
+  // barrier park has to be recognised by `armed && !running`. Using
+  // LS.stalling alone would leave the exact case that was misreported (a core
+  // parked at the barrier waiting to be let in) still reading as wedged.
+  function lsGateHoldReason() {
+    if (!LS.armed) return null;
+    if (!LS.running) {
+      return 'this console is parked at the lockstep start barrier — no core runs frame 0 until every player is in';
+    }
+    if (LS.stalling || LS.workerStall) {
+      const who = (LS.waitingOn && LS.waitingOn.length)
+        ? LS.waitingOn.map((p) => 'P' + (p + 1)).join(' and ')
+        : 'another player';
+      return 'this console is holding for ' + who + '’s input — a lockstep core stalls rather than guess a '
+        + 'missing frame, because a guess is a permanent fork';
+    }
+    return null;
+  }
 
   // HOW LONG A LOCKSTEP FRAME ACTUALLY IS, MEASURED — not 1000/60.
   // ⚠ A FRAME IS ONE retro_run, NOT ONE VBLANK. lib/netplay.js says so directly
@@ -5161,6 +5286,23 @@
     guest: false,       // this side joined rather than opened
     leaving: false,     // this side pressed Leave (decides what 'closed' means)
     sentP2: null,       // last remote-port bytes handed to the worker
+    // ---- WHY A ROOM IS NOT CONNECTING ------------------------------------
+    // ⚠ THE HUD SAID "waiting for players" FOREVER FOR THIS. Reported
+    // 2026-09-08 from two real devices on DIFFERENT networks: both screens sat
+    // on that one line while the two browsers had already given up on each
+    // other. lib/netplay.js knew — it had put the reason in `lastError`, raised
+    // it as a 'warning', and in the single-link case set state 'failed' with a
+    // message that names the cause and the cure ("one of these networks is
+    // blocking direct peer-to-peer traffic … needs a relay server"). Nothing on
+    // this page listened to any of them, and netStatus() writes into the LOBBY
+    // panel, which a player who has closed the lobby cannot see.
+    //
+    // "Waiting" and "this can never connect" look identical to a player, and
+    // only one of them is worth waiting through. So the reason is LATCHED here
+    // and the on-canvas HUD prints it.
+    fault: null,        // { text, kind, at } — the reason, once there is one
+    roomAt: 0,          // when this side entered a room (bounds the wait)
+    everPeered: false,  // has a peer channel EVER opened on this side
   };
 
   // BroadcastChannel pairs two tabs in ONE browser and needs no third party, so
@@ -5173,6 +5315,130 @@
   }
   function netSupported() {
     return !!(window.Netplay && Netplay.supported && Netplay.supported());
+  }
+
+  // ---- CONNECTION FAULTS: latched, named, and shown where a player is looking
+  // A fault is LATCHED and survives until the next join. It is deliberately not
+  // cleared by a later 'signalling' status: when a link dies the HOST drops
+  // back to 'signalling' ("waiting for someone to ask to join"), and clearing
+  // there is exactly how the page went back to claiming it was merely waiting
+  // for players in a room that had already failed to connect.
+  // ⚠ FAULTS ARE RANKED, AND THE RANK IS LOAD-BEARING. The engine's own
+  // messages ('net' — the ICE watchdog's "one of these networks is blocking
+  // direct peer-to-peer traffic … needs a relay server", and anything that
+  // reaches state 'failed') NAME THE CAUSE AND THE CURE. This page's own
+  // bounded-wait guess ('lonely') is weaker and must never overwrite one.
+  const NET_FAULT_RANK = { peer: 1, lonely: 2, net: 3 };
+  function netSetFault(text, kind) {
+    text = String(text == null ? '' : text).trim();
+    if (!text) return;
+    kind = kind || 'net';
+    if (NET.fault && NET.fault.text === text) return;
+    if (NET.fault && (NET_FAULT_RANK[kind] || 0) < (NET_FAULT_RANK[NET.fault.kind] || 0)) return;
+    NET.fault = { text, kind, at: Date.now() };
+    pageLog('[net] FAULT (' + kind + ') ' + text);
+  }
+  function netClearFault() { NET.fault = null; }
+
+  // Is a TURN relay configured, and what is it? Two browsers behind NATs that
+  // will not carry a direct path between them need one; lib/netplay.js ships
+  // STUN ONLY, because every public relay it measured was dead (see the ICE
+  // block at the top of that file — peerjs's own two do not even resolve).
+  // A page that cannot answer "is a relay configured" cannot tell a player why
+  // their room will not connect, so this reads the engine's real answer rather
+  // than a copy kept here.
+  // ⚠ CONFIGURED IS NOT WORKING. An entry in an iceServers array proves
+  // nothing; only a gathered 'relay' candidate does. This says which one it is.
+  function netRelayInfo() {
+    let list = [];
+    try { list = (window.Netplay && Netplay.iceConfig) ? (Netplay.iceConfig() || []) : []; } catch (e) {}
+    const relays = list.filter((sv) => /^turns?:/i.test(String((sv && sv.urls) || '')));
+    return { configured: relays.length > 0, count: relays.length, urls: relays.map((sv) => String(sv.urls)) };
+  }
+
+  // ---- supplying a relay, from the page ------------------------------------
+  // The engine reads window.NETPLAY_TURN at CONNECT time (turnFromEnv() in
+  // lib/netplay.js), so setting it is the whole integration — no engine call
+  // and no parsing duplicated here, which matters because that parser already
+  // handles the pipe form and a credential containing ':'.
+  // Remembered per-browser, because the person who needs a relay needs it every
+  // time and typing a TURN URL on a phone once is enough.
+  const NET_RELAY_KEY = 'dc.netplay.turn';
+  function netRelaySet(raw) {
+    raw = String(raw == null ? '' : raw).trim();
+    try {
+      if (raw) window.NETPLAY_TURN = raw;
+      else { try { delete window.NETPLAY_TURN; } catch (e2) { window.NETPLAY_TURN = null; } }
+    } catch (e) {}
+    try {
+      if (raw) localStorage.setItem(NET_RELAY_KEY, raw);
+      else localStorage.removeItem(NET_RELAY_KEY);
+    } catch (e) {}
+    pageLog('[net] relay ' + (raw ? 'set to ' + raw.split('|')[0] : 'cleared')
+      + ' — takes effect on the next room, because iceServers() is read at connect time');
+    netRelayRender();
+  }
+  function netRelayRestore() {
+    try {
+      const v = localStorage.getItem(NET_RELAY_KEY);
+      if (v && !window.NETPLAY_TURN) window.NETPLAY_TURN = v;
+      const el = $('netRelayIn');
+      if (el && v) el.value = v;
+    } catch (e) {}
+    netRelayRender();
+  }
+  function netRelayRender() {
+    const el = $('netRelayState');
+    if (!el) return;
+    const relay = netRelayInfo();
+    // ⚠ SAY "CONFIGURED", NEVER "WORKING". Only a gathered 'relay' candidate
+    // proves a relay relays, and this page has not gathered one.
+    el.textContent = relay.configured
+      ? 'A relay is configured (' + relay.urls.join(', ') + '). That is what the next room will be '
+        + 'offered — it is not proof the relay works, only that one is set.'
+      : 'No relay configured. Two devices on the same network usually connect without one; two on '
+        + 'different networks often cannot. There is no working free public relay, so this has to be '
+        + 'one you or your host provides.';
+  }
+
+  // Every one of these is a thing the ENGINE already names and the page used to
+  // throw away. Registered on both the host and the guest session.
+  function netAttachFaultHandlers(s) {
+    NET.fault = null; NET.roomAt = Date.now(); NET.everPeered = false;
+    // A link whose ICE never came up, in a room where somebody else is still
+    // connected. The session survives; that seat does not.
+    try { s.on('warning', (e) => netSetFault((e && e.detail) || 'a player could not connect', 'net')); } catch (e) {}
+    // A channel opened — whatever went wrong before this is no longer the story.
+    try { s.on('peer-joined', () => { NET.everPeered = true; netClearFault(); }); } catch (e) {}
+    // ⚠ peer-left IS LOG-ONLY, DELIBERATELY. It fires on a graceful Leave as
+    // well as on a dead link, so mapping it to a fault would put "CANNOT
+    // CONNECT" on screen because somebody quit normally — a new false alarm of
+    // exactly the class this change exists to remove. The cases that ARE faults
+    // (ICE never came up, the session failed) already arrive above as
+    // 'warning'/'failed', and they arrive with a message that names the cure.
+    try { s.on('peer-left', (e) => pageLog('[net] a player left: ' + ((e && e.why) || 'closed'))); } catch (e) {}
+    try { s.on('reject', (e) => pageLog('[net] a caller was refused: ' + ((e && e.why) || '?'))); } catch (e) {}
+  }
+
+  // A BOUNDED WAIT. "Waiting for players" is honest for the minute a friend
+  // spends typing in a code; it is a lie after several with nothing on the
+  // wire. lib/netplay.js bounds its OWN attempts (about 36 s of knocking, then
+  // ICE_CONNECT_MS = 25 s once an offer exists) but a HOST legitimately waits
+  // forever for someone to arrive, so nothing in the engine bounds THIS. The
+  // page does — and it says which of the two situations it is rather than
+  // leaving a player to guess whether to keep waiting.
+  const NET_LONELY_MS = 75000;
+  function netConnectWatch() {
+    if (NET.fault || NET.everPeered || !NET.roomAt) return;
+    if (Date.now() - NET.roomAt < NET_LONELY_MS) return;
+    const secs = Math.round(NET_LONELY_MS / 1000);
+    const relay = netRelayInfo();
+    const because = relay.configured
+      ? 'A relay is configured, so the usual cause is ruled out — check you both typed the same code and picked the same game.'
+      : 'No relay server is configured, and two devices on different networks usually cannot reach each other without one.';
+    netSetFault((NET.role === 'guest'
+      ? 'Still trying to reach that room after ' + secs + ' s. '
+      : 'Nobody has managed to connect to this room in ' + secs + ' s. ') + because, 'lonely');
   }
 
   // Host: what player 2 is holding, or null when nobody is connected. Read from
@@ -5236,11 +5502,28 @@
       // WHO hung up decides what this says. The channel's onclose fires on both
       // sides and arrives AFTER netLeave() has set its own text, so without the
       // flag the person who pressed Leave is told the other player left.
-      netStatus(NET.leaving ? 'Left the room.' : 'The room closed.', 'busy');
+      // ⚠ A ROOM THAT CLOSED *BECAUSE IT COULD NOT CONNECT* MUST NOT GO BLANK.
+      // Measured 2026-09-08 by dreamcast/tools/netplay_unreachable_test.mjs: on
+      // the side whose link died, this branch tore the HUD down and the player
+      // was left with an empty canvas and the words "The room closed" — the
+      // reason had been on screen for a moment and was then deleted. That is
+      // strictly worse than saying nothing, because the one screen that had the
+      // answer is the one that wipes it.
+      // A DELIBERATE Leave is different: the player knows why, and keeping a
+      // fault panel over a session they ended themselves is noise.
+      const why = (!NET.leaving && NET.fault) ? NET.fault.text : null;
+      netStatus(NET.leaving ? 'Left the room.' : ('The room closed' + (why ? ': ' + why : '.')),
+                why ? 'bad' : 'busy');
       lsDisarm(NET.leaving ? 'you left the room' : 'the room closed');
-      netHudStop(); netRoomStop();
+      netRoomStop();
+      if (!why) netHudStop();
     } else if (s === 'failed') {
       netStatus('Could not connect' + (e.detail ? ': ' + e.detail : '.'), 'bad');
+      // ⚠ AND IT MUST REACH THE HUD. netStatus() writes into the LOBBY panel,
+      // which is exactly what a player who has closed the lobby cannot see —
+      // the reported case, where both screens showed only the on-canvas HUD and
+      // the HUD was still saying "waiting for players".
+      netSetFault(e.detail || 'the connection failed', 'net');
     }
     pageLog('[net] ' + (NET.role || 'session') + ' ' + s + (e.detail ? ' (' + e.detail + ')' : ''));
   }
@@ -5287,6 +5570,7 @@
     });
     NET.session = s2;
     s2.on('status', netOnStatus);
+    netAttachFaultHandlers(s2);
     // The room is drawn from the moment there IS one, not from `connected`: the
     // person who opened it needs to watch the seats fill.
     netHudClearDesync(); netRoomStart(); netHudStart();
@@ -5311,6 +5595,7 @@
     const s = new Netplay.Session({ game, host: false, code, transport: netTransport() });
     NET.session = s;
     s.on('status', netOnStatus);
+    netAttachFaultHandlers(s);
     netHudClearDesync(); netRoomStart(); netHudStart();
     NET.guest = true;
     // The input pump has to run before this machine boots, because the pad has
@@ -5648,6 +5933,9 @@
     if (!s) { netHudStop(); return; }
     const connected = (s.state === 'connected');
     netWatchLockstep(s);
+    // Bounds the wait. See netConnectWatch(): the engine bounds its own
+    // attempts, but nothing bounds a host sitting in an empty room.
+    try { netConnectWatch(); } catch (e) {}
     const t = netTelemetry() || { mode: 'none', fault: 'no session telemetry' };
     HUD.mode = t.mode; HUD.tel = t;
 
@@ -5754,10 +6042,18 @@
     // because there the architecture name would be a lie about what is running.
     const gated = !!t.gated;
     const started = !!(t.barrier && t.barrier.started);
-    const modeWord = (t.mode === 'lockstep')
+    // ⚠ A CONNECTION FAULT OUTRANKS "WAITING", and that ordering is the whole
+    // fix. Both of the user's screens read "waiting for players — nothing
+    // starts until everyone is in" while the two browsers had already stopped
+    // trying to reach each other. That line is not merely unhelpful there, it
+    // is wrong: it tells a player the room is fine and someone else is late.
+    const netFault = NET.fault;
+    const modeWord = netFault ? 'CANNOT CONNECT'
+      : (t.mode === 'lockstep')
         ? ((started && !gated) ? 'NOT FRAME-GATED' : 'LOCKSTEP')
       : (t.mode === 'none' && !connected) ? 'ROOM OPEN' : 'NOT LOCKSTEP';
-    const tagline = (modeWord === 'NOT FRAME-GATED')
+    const tagline = netFault ? netFault.text
+      : (modeWord === 'NOT FRAME-GATED')
         ? 'the room started but THIS core is not gated — it is running on its own clock'
       : (modeWord === 'LOCKSTEP' && !started)
         ? 'waiting for players — nothing starts until everyone is in'
@@ -5766,7 +6062,20 @@
       : (modeWord === 'ROOM OPEN')
         ? 'waiting for players — nothing starts until everyone is in'
         : 'every machine runs the game · your pad drives your own console';
-    let html = '<span class="mode">' + modeWord + '</span> <span class="k">' + tagline + '</span>';
+    // esc() on the tagline because it now carries ENGINE text (the fault
+    // message), not only the literals above.
+    let html = '<span class="mode">' + modeWord + '</span> <span class="'
+      + (netFault ? 'warn' : 'k') + '">' + esc(tagline) + '</span>';
+    // WHETHER A RELAY IS CONFIGURED, shown at the moment it matters. "No relay"
+    // is the difference between a room that works across two houses and one
+    // that does not, and a player told only "cannot connect" has no next step.
+    if (netFault) {
+      const relay = netRelayInfo();
+      html += '<br><span class="k">relay</span> ' + (relay.configured
+        ? esc(relay.count + ' configured (' + relay.urls.join(', ') + ')')
+        : '<span class="warn">none configured</span> <span class="k">· add one in Play Online → '
+          + 'Relay server, or with ?turn=…</span>');
+    }
     const fms = lsFrameMs();
     html += '<br><span class="k">input delay</span> ' +
       (d == null ? '—' : d + (d === 1 ? ' frame' : ' frames') + ' (' + Math.round(d * fms) + ' ms' +
@@ -5799,7 +6108,8 @@
     html += roster;
     if (stalled) html += '<br><span class="stall">⏸ ' + stallWhy + '</span>';
 
-    el.className = 'on ' + (modeWord === 'LOCKSTEP' ? 'lockstep' : 'fault') + (stalled ? ' stalling' : '');
+    el.className = 'on ' + (modeWord === 'LOCKSTEP' ? 'lockstep' : 'fault')
+      + (netFault ? ' netfault' : '') + (stalled ? ' stalling' : '');
     if (html !== HUD.text) { el.innerHTML = html; HUD.text = html; }
     HUD.stalled = stalled; HUD.stallWhy = stallWhy; HUD.waitingOn = waitNames;
   }
@@ -5999,6 +6309,14 @@
     bannerVisible: !!($('netDesync') && $('netDesync').classList.contains('on')),
     bannerText: $('netDesync') ? ($('netDesync').textContent || '') : '',
     telemetry: HUD.tel || null,
+    // THE CONNECTION FAULT, as an assertable value rather than a substring of
+    // the rendered text. "The room said it could not connect" is the claim the
+    // cross-network arm has to be able to make.
+    fault: NET.fault ? { text: NET.fault.text, kind: NET.fault.kind } : null,
+    faultShown: !!($('netHud') && $('netHud').classList.contains('netfault')),
+    relay: netRelayInfo(),
+    everPeered: NET.everPeered,
+    roomAgeMs: NET.roomAt ? Date.now() - NET.roomAt : null,
   });
 
   (function wireNetplay() {
@@ -6036,6 +6354,13 @@
       sel.value = want;
     };
     syncNetGame();
+    // A relay saved on a previous visit has to be back in force BEFORE the
+    // first room is opened, not after it fails.
+    netRelayRestore();
+    const rApply = $('netRelayApply');
+    if (rApply) rApply.addEventListener('click', () => netRelaySet(($('netRelayIn') || {}).value || ''));
+    const rClear = $('netRelayClear');
+    if (rClear) rClear.addEventListener('click', () => { const i = $('netRelayIn'); if (i) i.value = ''; netRelaySet(''); });
     // Re-sync on every route by which the disc can change: the desktop picker,
     // the phone picker (which writes through to #romSelect), and opening the
     // lobby at all — a player picks the game and THEN goes looking for the
