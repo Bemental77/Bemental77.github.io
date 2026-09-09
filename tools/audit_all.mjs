@@ -95,6 +95,13 @@ const HARNESSES = [
     fast: true, ci: true, server: false, requires: [], timeoutMs: 10 * MIN,
   },
   {
+    name: 'undefined-calls',
+    file: 'tools/undefined_call_scan.mjs',
+    cmd: ['node', 'tools/undefined_call_scan.mjs'],
+    desc: 'every project-shaped call on a shipped page resolves to a definition reachable at runtime — the gate for the class that cost gamecube.html ALL controller input (gcNetRemoteMask and two more were called and defined nowhere; the page parsed fine and pollController threw before it could post input or re-arm its loop)',
+    fast: true, ci: true, server: false, requires: [], timeoutMs: 2 * MIN,
+  },
+  {
     name: 'seqlock',
     file: 'gamecube/seqlock.test.mjs',
     cmd: ['node', 'gamecube/seqlock.test.mjs'],
@@ -527,6 +534,24 @@ const HARNESSES = [
     fast: false, ci: false,
     ciWhy: 'same as netplay-ws-signal — real brokers and two browsers',
     server: true, requires: ['lib/netplay.js'], timeoutMs: 20 * MIN,
+  },
+  {
+    name: 'ps1-netplay',
+    file: 'tools/ps1_netplay_test.mjs',
+    cmd: ['node', 'tools/ps1_netplay_test.mjs'],
+    desc: 'ps1.html plays two-player lockstep end to end — each machine running its own core, one agreed pad image per frame into BOTH PSX controller ports, fingerprints compared both ways',
+    fast: false, ci: false,
+    ciWhy: 'it streams a 451 MB PSX disc into two browser windows; the size-bounded CI checkout omits ps1/ps1Wasm/roms',
+    server: true, requires: ['ps1.html', 'ps1/ps1Wasm/dist/wasmpsx_worker.js'], timeoutMs: 25 * MIN,
+  },
+  {
+    name: 'ps1-determinism',
+    file: 'tools/ps1_determinism_probe.mjs',
+    cmd: ['node', 'tools/ps1_determinism_probe.mjs', '--frames', '600', '--every', '150', '--skew', '40'],
+    desc: 'the PS1 CORE is deterministic: two independent cores, identical bytes and identical per-frame pads, savestate fingerprints compared — with a SKEW arm that deliberately desynchronises their wall clocks, so a host-clock leak into guest state cannot pass',
+    fast: false, ci: false,
+    ciWhy: 'needs a PSX disc (ps1/ps1Wasm/roms) and a browser; the size-bounded CI checkout omits both',
+    server: true, requires: ['ps1.html', 'ps1/ps1Wasm/dist/wasmpsx_worker.js'], timeoutMs: 25 * MIN,
   },
   {
     name: 'genesis-netplay',
