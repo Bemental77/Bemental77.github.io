@@ -25,6 +25,17 @@
 // exercised by tools/netplay_realui_pair_test.mjs and
 // tools/audit_peerjs_crossdevice.mjs.
 //
+// ⚠ THE TRANSPORT NAME BELOW IS 'peerjs-only', AND IT HAS TO BE. Pairing is no
+// longer carried by the peerjs DataConnection alone: a page that asks for
+// 'peerjs' now opens the WebSocket relay AND peerjs concurrently, because a
+// DataConnection is itself a WebRTC connection and two devices on different
+// networks could not open one (lib/netplay.js, the 'ws' block). In that
+// arrangement a peerjs broker that dies is CORRECTLY silent — the relay is
+// still carrying the session, and shouting about a path nobody needs is how a
+// working room gets reported as broken. So every diagnosis this file asserts
+// is, by design, suppressed under the shipped plan. 'peerjs-only' names the
+// subject these arms were always about and keeps them measuring it.
+//
 // USAGE  npm run web  &&  node tools/netplay_signalling_test.mjs
 import puppeteer from 'puppeteer';
 const CHROME = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
@@ -83,7 +94,7 @@ const installFakePeer = (page, mode) => page.evaluate((mode) => {
 
 const run = (page, isHost) => page.evaluate((isHost) => {
   window.__st = []; window.__threw = null;
-  const s = new Netplay.Session({ game: 'g', host: isHost, code: 'ABCDE', transport: 'peerjs' });
+  const s = new Netplay.Session({ game: 'g', host: isHost, code: 'ABCDE', transport: 'peerjs-only' });
   window.__s = s;
   s.on('status', (e) => window.__st.push(e.state + (e.detail ? ': ' + e.detail : '')));
   s.start().then((v) => { window.__started = v; }, (e) => { window.__threw = String(e && e.message || e); });

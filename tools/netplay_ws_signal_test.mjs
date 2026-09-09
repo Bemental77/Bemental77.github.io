@@ -120,10 +120,10 @@ const mk = async (breakDirect) => {
   return { ctx, page: p };
 };
 
-const boot = (p, isHost, code) => p.evaluate(async (code, isHost) => {
+const boot = (p, isHost, code, transport) => p.evaluate(async (code, isHost, transport) => {
   window.__log = [];
   window.__req = null;
-  const s = new Netplay.Session({ game: 'wsrig', host: isHost, code, transport: 'ws', delayFrames: 0 });
+  const s = new Netplay.Session({ game: 'wsrig', host: isHost, code, transport: transport || 'ws', delayFrames: 0 });
   window.__s = s;
   s.on('status', (e) => window.__log.push(e.state + (e.detail ? ':' + e.detail : '')));
   // The page approves from its own handler — the built-in dialog is not
@@ -131,7 +131,7 @@ const boot = (p, isHost, code) => p.evaluate(async (code, isHost) => {
   // still the gate either way.
   if (isHost) s.on('join-request', (r) => { window.__req = { id: r.id, sas: r.sas }; r.approve(); });
   return await s.start();
-}, code, isHost);
+}, code, isHost, transport);
 
 const read = (p) => p.evaluate(() => ({
   state: window.__s.state,
@@ -171,7 +171,7 @@ const A = await mk(false), B = await mk(false);
 const code1 = await A.page.evaluate(() => Netplay.makeCode(5));
 info('code', code1 + '  (never transmitted — the topic is derived from it)');
 
-const started = await Promise.all([boot(A.page, true, code1), boot(B.page, false, code1)]);
+const started = await Promise.all([boot(A.page, true, code1, 'ws'), boot(B.page, false, code1, 'ws')]);
 started[0] && started[1] ? ok('ws-transport-starts', 'both sessions returned from start()')
                          : bad('ws-transport-starts', JSON.stringify(started));
 
@@ -222,7 +222,7 @@ await A.ctx.close(); await B.ctx.close();
 console.log('\n== arm 2: direct path DELIBERATELY BROKEN (iceTransportPolicy:relay, no relay) ==');
 const C = await mk(true), D = await mk(true);
 const code2 = await C.page.evaluate(() => Netplay.makeCode(5));
-await Promise.all([boot(C.page, true, code2), boot(D.page, false, code2)]);
+await Promise.all([boot(C.page, true, code2, 'ws'), boot(D.page, false, code2, 'ws')]);
 const r2 = await waitPair(C.page, D.page, 60000);
 const brokeIt = await D.page.evaluate(() => window.__iceCfg && window.__iceCfg.iceTransportPolicy);
 // ARM-DIFFERENCE PROOF: if the flag did not actually take, this cell proves
@@ -243,10 +243,68 @@ if (brokeIt === 'relay') {
 await C.ctx.close(); await D.ctx.close();
 
 // ---------------------------------------------------------------------------
+// ARM 4: THE SHIPPED CONFIGURATION. Every page asks for transport 'peerjs';
+// that now opens the relay AND the peerjs DataConnection concurrently. Broken
+// direct path again, because the whole claim is that a visitor no longer needs
+// one to be let into a room.
+console.log('\n== arm 4: the SHIPPED plan (transport:"peerjs"), direct path BROKEN ==');
+const plan = await mk(false);
+const shipped = await plan.page.evaluate(() => ({
+  peerjs: Netplay.signalPlan('peerjs'),
+  none: Netplay.signalPlan(),
+  local: Netplay.signalPlan('local'),
+  ws: Netplay.signalPlan('ws'),
+  only: Netplay.signalPlan('peerjs-only'),
+  brokers: Netplay.signalBrokers(),
+}));
+JSON.stringify(shipped.peerjs) === '["ws","peerjs"]' && JSON.stringify(shipped.none) === '["ws","peerjs"]'
+  ? ok('SHIPPED-PLAN-IS-RELAY-FIRST', 'signalPlan("peerjs") = ' + JSON.stringify(shipped.peerjs) + ' — every page gets the relay without a page edit')
+  : bad('SHIPPED-PLAN-IS-RELAY-FIRST', JSON.stringify(shipped));
+JSON.stringify(shipped.local) === '["local"]' && JSON.stringify(shipped.ws) === '["ws"]' && JSON.stringify(shipped.only) === '["peerjs"]'
+  ? ok('forced-plans-are-honoured', 'local/ws/peerjs-only each open exactly one path')
+  : bad('forced-plans-are-honoured', JSON.stringify(shipped));
+shipped.brokers.length >= 2
+  ? ok('broker-list-has-a-spare', shipped.brokers.length + ' brokers: ' + shipped.brokers.join(' '))
+  : bad('broker-list-has-a-spare', JSON.stringify(shipped.brokers));
+await plan.ctx.close();
+
+const F = await mk(true), G = await mk(true);
+const code4 = await F.page.evaluate(() => Netplay.makeCode(5));
+await Promise.all([boot(F.page, true, code4, 'peerjs'), boot(G.page, false, code4, 'peerjs')]);
+const r4 = await waitPair(F.page, G.page, 60000);
+const broke4 = await G.page.evaluate(() => window.__iceCfg && window.__iceCfg.iceTransportPolicy);
+broke4 === 'relay'
+  ? ok('arm4-difference-proof', 'relay-only ICE with no relay on both pages')
+  : bad('arm4-difference-proof', `iceTransportPolicy=${broke4} — arm did not apply, the cell below is VOID`);
+if (broke4 === 'relay') {
+  r4.h.req
+    ? ok('SHIPPED-PLAN-PAIRS-WITH-NO-DIRECT-PATH', `host asked to admit the joiner ${r4.reqMs} ms after start() over ${r4.h.kind} (${r4.h.url})`)
+    : bad('SHIPPED-PLAN-PAIRS-WITH-NO-DIRECT-PATH', `no join request in ${r4.ms} ms — host=${JSON.stringify(r4.h.log)} guest=${JSON.stringify(r4.g.log)}`);
+  // EXACTLY-ONCE DELIVERY. Two paths carrying the same handshake must not
+  // produce a duplicate 'answer': the second setRemoteDescription throws
+  // "Called in wrong state: stable" into the catch in _onSignal and fails a
+  // session that was connecting fine.
+  // ⚠ THE FIRST VERSION OF THIS CELL MATCHED /failed/ AND WAS WRONG. In this
+  // arm a 'failed' status is the CORRECT outcome — the game link genuinely
+  // cannot open with relay-only ICE and no relay, and saying so is the whole
+  // point of the ICE watchdog. Matching any failure scored a working diagnosis
+  // as a bug. Match the duplicate's own signature instead.
+  const dupe = JSON.stringify([r4.h.log, r4.g.log, r4.h.err, r4.g.err]);
+  !/wrong state|stable|InvalidStateError/i.test(dupe)
+    ? ok('no-duplicate-message-failure', 'no setRemoteDescription state error with both paths carrying the same handshake')
+    : bad('no-duplicate-message-failure', dupe);
+  // And the failure that IS expected here must be the honest one.
+  /blocking direct peer-to-peer/.test(dupe)
+    ? ok('broken-game-path-is-diagnosed', 'both sides named the real fault instead of hanging on "signalling"')
+    : bad('broken-game-path-is-diagnosed', dupe);
+}
+await F.ctx.close(); await G.ctx.close();
+
+// ---------------------------------------------------------------------------
 if (process.env.WS_QUIET === '1') {
   console.log('\n== arm 3: a code nobody is hosting is DIAGNOSED, not hung ==');
   const E = await mk(false);
-  await boot(E.page, false, await E.page.evaluate(() => Netplay.makeCode(5)));
+  await boot(E.page, false, await E.page.evaluate(() => Netplay.makeCode(5)), 'ws');
   const t0 = Date.now();
   let e = null;
   while (Date.now() - t0 < 45000) {
