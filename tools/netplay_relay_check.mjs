@@ -73,13 +73,34 @@ if (turn) {
                         : 'RESULT: FAIL — a relay was configured and the session still could not connect');
   code = connected ? 0 : 1;
 } else {
-  // No relay: relay-only CANNOT connect, so what is under test is whether the
-  // failure is DIAGNOSED. A hang here is the bug; a clear message is the pass.
-  const diagnosed = /blocking direct peer-to-peer/.test(JSON.stringify([h.log, g.log]));
-  console.log(diagnosed
-    ? 'RESULT: PASS — no relay configured, and both sides SAID SO instead of hanging on "signalling"'
-    : `RESULT: FAIL — no relay and no diagnosis; host=${h.st} guest=${g.st} (this is the frozen screen)`);
-  code = diagnosed ? 0 : 1;
+  // ⚠ THIS ARM'S PASS CONDITION INVERTED WHEN THE PRODUCT IMPROVED, and it
+  // spent a while calling the improvement a failure. It was written when a
+  // relay-only ICE policy with no TURN server meant the room COULD NOT CONNECT,
+  // so the only thing worth testing was whether the dead end was DIAGNOSED
+  // rather than left hanging on "signalling". Since the WSS fallback landed,
+  // the same configuration CONNECTS — the pads go down the relay — and both
+  // sides say "connected over a relay — slower than a direct link". The old
+  // check read that success as "no diagnosis" and printed "this is the frozen
+  // screen" about a room that was working.
+  //
+  // Two outcomes are now correct, and the wrong one is silence:
+  //   connected over a relay          -> the fallback carried it, and SAID so
+  //   failed, naming the network      -> no path at all, diagnosed
+  // A room that neither connects nor explains itself is the only failure.
+  const said = JSON.stringify([h.log, g.log]);
+  const relayed = (h.st === 'connected' && g.st === 'connected') && /relay/i.test(said);
+  const diagnosed = /blocking direct peer-to-peer/.test(said);
+  if (relayed) {
+    console.log('RESULT: PASS — no TURN configured and no direct path, and the room still connected');
+    console.log('              over the WSS relay, telling both players it is slower than a direct link');
+    code = 0;
+  } else if (diagnosed) {
+    console.log('RESULT: PASS — the room could not connect and both sides NAMED the network as the cause');
+    code = 0;
+  } else {
+    console.log(`RESULT: FAIL — host=${h.st} guest=${g.st}, neither connected nor explained (the frozen screen)`);
+    code = 1;
+  }
 }
 await b.close();
 process.exit(code);

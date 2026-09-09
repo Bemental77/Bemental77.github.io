@@ -219,13 +219,22 @@ const HARNESSES = [
     fast: true, ci: true, server: true,
     requires: ['tools/audio_tap.js', 'tools/fixtures/audio_selftest.html'], timeoutMs: 8 * MIN,
   },
-  {
-    name: 'control-map-drift',
-    file: 'tools/control_map_drift_test.mjs',
-    cmd: ['node', 'tools/control_map_drift_test.mjs'],
-    desc: 'player 2 gets the button player 1 gets — each console ships the pad and key tables TWICE (emulator page and *_multiplayer.html lobby) and three of the six pairs had already drifted; a drift is invisible from either UI',
-    fast: true, ci: true, server: true, requires: [], timeoutMs: 10 * MIN,
-  },
+  // ⚠ RETIRED — THE BUG CLASS IS GONE, NOT THE TEST'S NERVE. This compared each
+  // emulator page's control tables against its *_multiplayer.html twin, and it
+  // earned its keep: it caught genesis with 4 of 6 face buttons swapped, n64
+  // with L and Z swapped, and gamecube binding Start to pad index 7 so RT opened
+  // the pause menu while Start did nothing.
+  //
+  // Those pages no longer map controls. Under lockstep every player runs their
+  // own core, so the lobby pages became redirects that hand a room code to the
+  // real emulator page — genesis_multiplayer.html is 59 lines now, and all seven
+  // carry ZERO of GP/KEYMAP/B/D. There is exactly one control table per console,
+  // so there is nothing left to drift, and the harness fails with "declaration
+  // `B` not found" because it is looking for tables that were deleted.
+  //
+  // Kept in NOT_RUN rather than deleted: if a second control table ever appears
+  // on any console, this is the check to bring back, and tools/no_streaming_test.mjs
+  // is what would notice the architecture regressing far enough to need it.
   {
     name: 'mobile-chrome',
     file: 'tools/mobile_chrome_test.mjs',
@@ -497,6 +506,37 @@ const HARNESSES = [
     requires: ['dreamcast.html'],
     timeoutMs: 5 * MIN,
   },
+  // Flagged UNDECLARED by this runner's own audit: present on disk, run by
+  // nobody. All three guard the cross-network pairing work — the thing that was
+  // deadlocking two real devices — so leaving them unrun would be the same gap
+  // that let thirteen pages keep streaming while passing their tests.
+  {
+    name: 'netplay-ws-signal',
+    file: 'tools/netplay_ws_signal_test.mjs',
+    cmd: ['node', 'tools/netplay_ws_signal_test.mjs'],
+    desc: 'pairing works with every direct WebRTC path deliberately dead — the case two devices on different networks are in, where signalling itself used to need NAT traversal before the game connection existed',
+    fast: false, ci: false,
+    ciWhy: 'it opens real WSS connections to public brokers and drives two browser profiles; a CI runner without egress to those hosts fails for a reason unrelated to the change',
+    server: true, requires: ['lib/netplay.js'], timeoutMs: 20 * MIN,
+  },
+  {
+    name: 'netplay-relay-play',
+    file: 'tools/netplay_relay_play_test.mjs',
+    cmd: ['node', 'tools/netplay_relay_play_test.mjs'],
+    desc: 'a room with NO direct path still plays: pads cross over the relay, and the room discloses the cost rather than pretending it is a direct link',
+    fast: false, ci: false,
+    ciWhy: 'same as netplay-ws-signal — real brokers and two browsers',
+    server: true, requires: ['lib/netplay.js'], timeoutMs: 20 * MIN,
+  },
+  {
+    name: 'genesis-netplay',
+    file: 'tools/genesis_netplay_test.mjs',
+    cmd: ['node', 'tools/genesis_netplay_test.mjs'],
+    desc: 'genesis.html plays two-player lockstep end to end — each machine running its own core, one agreed pad image per frame, fingerprints compared both ways',
+    fast: false, ci: false,
+    ciWhy: 'it boots the Genesis core against genesis/genesisWasm ROMs, which the size-bounded CI checkout omits',
+    server: true, requires: ['genesis.html', 'genesis/genesisWasm'], timeoutMs: 25 * MIN,
+  },
   {
     name: 'netplay-lockstep',
     file: 'tools/netplay_lockstep_test.mjs',
@@ -585,6 +625,8 @@ const HARNESSES = [
 // omission you can read is not the same thing as a silence.
 // ---------------------------------------------------------------------------
 const NOT_RUN = [
+  { file: 'tools/control_map_drift_test.mjs',
+    why: 'the bug class it policed no longer exists: under lockstep every player runs their own core, so the *_multiplayer.html pages became lobby redirects that map no controls at all (all seven carry zero of GP/KEYMAP/B/D; genesis_multiplayer.html is 59 lines). One control table per console means nothing can drift. It caught real bugs before that — genesis 4 of 6 face buttons swapped, n64 L/Z swapped, gamecube Start bound to pad index 7 — so it is retired rather than deleted, and is the check to restore if a second table ever reappears' },
   { file: 'tools/verify_artifact_complete.mjs',
     why: 'it asserts against a STAGED DEPLOY ARTIFACT, which only the deploy job produces — it is a step in .github/workflows/deploy.yml, run there on every deploy. Its invariant (every tracked file deploy.exclude does not exclude must exist in the artifact) is what makes the blobless+sparse CI checkout safe: a sparse checkout that omits a path does not fail, rsync just copies nothing for it and prints a clean summary. Run it locally with `git ls-files -z | node tools/verify_artifact_complete.mjs .`, which passes trivially because the working tree is complete by construction; the arm that means something needs _deploy' },
   { file: 'tools/catalog_urls.mjs',
