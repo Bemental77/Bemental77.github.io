@@ -5308,6 +5308,7 @@
     // only one of them is worth waiting through. So the reason is LATCHED here
     // and the on-canvas HUD prints it.
     fault: null,        // { text, kind, at } — the reason, once there is one
+    lastLeave: null,    // { why, at } — the engine's own word for the last departure
     roomAt: 0,          // when this side entered a room (bounds the wait)
     everPeered: false,  // has a peer channel EVER opened on this side
   };
@@ -5458,7 +5459,12 @@
     // exactly the class this change exists to remove. The cases that ARE faults
     // (ICE never came up, the session failed) already arrive above as
     // 'warning'/'failed', and they arrive with a message that names the cure.
-    try { s.on('peer-left', (e) => pageLog('[net] a player left: ' + ((e && e.why) || 'closed'))); } catch (e) {}
+    try {
+      s.on('peer-left', (e) => {
+        NET.lastLeave = { why: (e && e.why) || 'closed', at: Date.now() };
+        pageLog('[net] a player left: ' + NET.lastLeave.why);
+      });
+    } catch (e) {}
     try { s.on('reject', (e) => pageLog('[net] a caller was refused: ' + ((e && e.why) || '?'))); } catch (e) {}
     // Relay mode engaging is the room RECOVERING, not failing — it fires when
     // the fallback takes over and again when the measured delay changes.
@@ -6107,6 +6113,22 @@
     // class this panel was fixed to stop raising.
     const relayMode = safe(() => netRelayMode(), null);
     if (relayMode) netClearFault();
+    // ⚠ AN EMPTY ROOM THAT USED TO HAVE SOMEBODY IN IT IS NOT THE SAME ROOM AS
+    // ONE NOBODY HAS JOINED YET, AND THE PAGE SAID THE SAME THING ABOUT BOTH.
+    // Reproduced on one box 2026-09-08 (another session's no-direct-path arm):
+    // both sides engage relay mode and report connected, and IN THE SAME SECOND
+    // the host takes a 'channel-closed' from the OTHER carrier and evicts the
+    // peer, reverting to _status('signalling', 'waiting for someone to ask to
+    // join') — while the joiner still believes it holds maple port 1 for another
+    // ~24 s. That window is the user's two screenshots, and neither side was
+    // told anything during it. The host half is answerable here: this side knows
+    // it HAD a peer and now has none.
+    // ⚠ NOT A FAULT, so it does not take the red CANNOT CONNECT banner — a
+    // player quitting normally produces exactly this state too, and the honest
+    // sentence covers both. The guest half needs the engine to notice sooner.
+    let peersNow = null;
+    try { if (typeof s.roomInfo === 'function') { const ri = s.roomInfo(); peersNow = ri ? ri.links : null; } } catch (e) {}
+    const emptiedOut = !!(NET.everPeered && !NET.leaving && peersNow === 0 && !connected);
     const netFault = NET.fault;
     const modeWord = netFault ? 'CANNOT CONNECT'
       : (t.mode === 'lockstep')
@@ -6115,10 +6137,14 @@
     const tagline = netFault ? netFault.text
       : (modeWord === 'NOT FRAME-GATED')
         ? 'the room started but THIS core is not gated — it is running on its own clock'
+      : (modeWord === 'LOCKSTEP' && !started && emptiedOut)
+        ? 'the other player dropped out — this room is empty again, waiting for them to rejoin'
       : (modeWord === 'LOCKSTEP' && !started)
         ? 'waiting for players — nothing starts until everyone is in'
       : (modeWord === 'LOCKSTEP')
         ? 'every machine runs the game · your pad drives your own console · no core advances alone'
+      : (emptiedOut)
+        ? 'the other player dropped out — this room is empty again, waiting for them to rejoin'
       : (modeWord === 'ROOM OPEN')
         ? 'waiting for players — nothing starts until everyone is in'
         : 'every machine runs the game · your pad drives your own console';
@@ -6389,6 +6415,7 @@
     faultShown: !!($('netHud') && $('netHud').classList.contains('netfault')),
     relay: netRelayInfo(),          // TURN/ICE config — "is a relay CONFIGURED"
     relayMode: safe(() => netRelayMode(), null),  // transport — "is the room ON a relay"
+    lastLeave: NET.lastLeave || null,
     everPeered: NET.everPeered,
     roomAgeMs: NET.roomAt ? Date.now() - NET.roomAt : null,
   });

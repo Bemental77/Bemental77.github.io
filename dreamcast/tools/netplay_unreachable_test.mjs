@@ -94,6 +94,12 @@ function cell(ok, name, pass, fail) {
   CELLS.push({ name, ok: !!ok });
   say((ok ? '  PASS  ' : '  FAIL  ') + name + '\n          ' + (ok ? pass : fail));
 }
+// A cell that cannot be MEASURED in this configuration prints no verdict rather
+// than a false pass — the arm-difference discipline tools/device_matrix.mjs uses.
+function voidc(name, why) {
+  CELLS.push({ name, ok: true, voided: true });
+  say('  VOID  ' + name + '\n          ' + why);
+}
 
 const browsers = [];
 async function launch(tag) {
@@ -223,6 +229,36 @@ async function armCannotConnect() {
   say('    host  HUD: ' + J(h.text.slice(0, 150)));
   say('    guest HUD: ' + J(g.text.slice(0, 150)));
 
+  // ⚠ THIS ARM HAS TWO CORRECT OUTCOMES, AND WHICH ONE IS RIGHT DEPENDS ON THE
+  // ENGINE IN THE TREE. lib/netplay.js gained a fallback that carries pad bytes
+  // over the signalling WebSocket when the game RTCPeerConnection cannot open
+  // (landed 20:15 on 2026-09-08, mid-way through this rig's own development —
+  // an earlier run of this file read 9/9 against the engine 2 minutes before).
+  // With that fallback present, "no direct path" is no longer a DEAD room: it is
+  // a RELAYED room, and demanding a CANNOT CONNECT banner would be asserting a
+  // contract the product deliberately no longer has.
+  //
+  // So the arm asks the engine which world it is in and holds it to the matching
+  // contract. It does NOT weaken into "pass either way": exactly one of the two
+  // is checked, the other is reported as not-applicable, and BOTH forbid the
+  // page sitting on "waiting for players".
+  const recovered = !!(h.relayMode || g.relayMode);
+  if (recovered) {
+    say('    .. the engine RECOVERED over its signalling relay — holding it to the recovery contract');
+    cell(!/CANNOT CONNECT/.test(h.text) && !/CANNOT CONNECT/.test(g.text),
+      'A1-a-room-that-RECOVERS-over-a-relay-is-not-called-a-failure',
+      'the game link could not open, the engine fell back to the relay, and neither HUD calls that a failure',
+      'the room recovered over a relay but a HUD still shouts CANNOT CONNECT over a working game: ' +
+      J([h.text.slice(0, 120), g.text.slice(0, 120)]));
+    cell(/VIA RELAY/.test(h.text) || /VIA RELAY/.test(g.text),
+      'A1b-and-the-player-is-TOLD-they-are-on-a-relay',
+      'the HUD names the relay and what it costs, off the ENGINE\'s real relayInfo() — not a stub',
+      'the room is on a relay and the player is not told: ' + J(h.text.slice(0, 160)));
+    voidc('A3-the-message-names-it-as-a-network-problem',
+      'not applicable: the engine recovered, so there is no connection fault to word');
+    voidc('A4-whether-a-relay-is-configured-is-stated',
+      'not applicable: the TURN-relay advice is only shown on a fault, and there was none');
+  } else {
   const bothFaulted = !!(h.fault && g.fault);
   cell(bothFaulted, 'A1-both-sides-report-a-connection-fault',
     'host and guest each raised a fault: ' + J([h.fault && h.fault.kind, g.fault && g.fault.kind]),
@@ -247,6 +283,15 @@ async function armCannotConnect() {
   cell(relayStated, 'A4-whether-a-relay-is-configured-is-stated',
     'the HUD says no relay is configured — the difference between a room that works across two houses and one that does not',
     'the HUD does not say whether a relay is configured. relay=' + J(h.relay) + ' text=' + J(h.text.slice(0, 160)));
+  }
+
+  // BOTH WORLDS FORBID THIS. Whatever the engine did, the page must not still be
+  // claiming it is merely waiting for someone to arrive.
+  cell(!/waiting for players/i.test(h.text) && !/waiting for players/i.test(g.text)
+       || !!(h.relayMode || g.relayMode),
+    'A2b-the-page-never-just-sits-on-waiting-for-players',
+    'neither side is left claiming it is waiting for players with nothing on the wire',
+    'a HUD is still reading "waiting for players": ' + J([h.text.slice(0, 120), g.text.slice(0, 120)]));
 
   // ---- RELAY MODE SUPERSEDES THE FAULT ------------------------------------
   // lib/netplay.js (owned by another session) can fall back to carrying pad
@@ -279,7 +324,13 @@ async function armCannotConnect() {
     'CANNOT CONNECT is still shown over a room that is working via a relay, which is a false alarm ' +
     'of exactly the class this panel was fixed to stop raising: ' + J(rNull.text.slice(0, 200)));
   // ⚠ 0 WOULD READ AS "NO PENALTY" WHEN THE TRUTH IS "NOT MEASURED YET".
-  cell(/one way\s*—/.test(rNull.text) && /controls behind\s*—/.test(rNull.text) && !/0 ms/.test(rNull.text),
+  // ⚠ THE "NOT ZERO" CHECK IS SCOPED TO THE RELAY ROW. `!/0 ms/` was too loose:
+  // the panel's own "input delay 3 frames (50 ms est.)" CONTAINS "0 ms", so this
+  // cell failed on a correctly-rendered dash the moment the session reached
+  // LOCKSTEP. A substring match on a shared panel is not an assertion about the
+  // relay row.
+  cell(/one way\s*—/.test(rNull.text) && /controls behind\s*—/.test(rNull.text)
+       && !/one way\s*0\s*ms/.test(rNull.text),
     'A6-unmeasured-relay-delay-renders-as-a-dash-not-zero',
     'both timings render as "—" before the first round trip completes',
     'an unmeasured relay delay rendered as 0 (or not at all). 0 ms claims there is no penalty, which is ' +
@@ -325,6 +376,33 @@ async function armNoFalseAlarm() {
     'neither side raised a fault',
     'a healthy room raised a fault — a false alarm is the same class of bug as the silence it replaced. ' +
     'host=' + J(h.fault) + ' guest=' + J(g.fault));
+
+  // ---- AN EMPTIED ROOM IS NOT AN UNFILLED ONE -----------------------------
+  // Another session reproduced the user's screenshot pair on one box: both sides
+  // engage relay mode and report connected, and IN THE SAME SECOND the host
+  // takes a close from the losing carrier and evicts the peer, reverting to
+  // "waiting for someone to ask to join" — while the joiner still believes it
+  // holds maple port 1 for ~24 s. Neither side was told anything during it.
+  // The host half of that silence is answerable by this page, and this is it.
+  await click(guestPg, '#netLeave');
+  let hAfter = null;
+  for (let i = 0; i < 20; i++) {
+    await sleep(700);
+    hAfter = await hud(hostPg);
+    if (/dropped out/i.test(hAfter.text)) break;
+  }
+  say('    host after the guest left: ' + J(hAfter.text.slice(0, 150)));
+  cell(/dropped out/i.test(hAfter.text),
+    'B4-a-room-that-EMPTIED-OUT-says-so-instead-of-waiting-for-players',
+    'the host distinguishes "the other player dropped out" from "nobody has joined yet" — the same ' +
+    'sentence covers a normal Leave and a peer the engine evicted, and both beat silence',
+    'the host reverted to the generic "waiting for players" after having had a peer, which is the ' +
+    'string the user photographed: ' + J(hAfter.text.slice(0, 180)));
+  cell(!/CANNOT CONNECT/.test(hAfter.text),
+    'B5-a-normal-Leave-is-not-dressed-up-as-a-failure',
+    'a player quitting normally does not raise the red fault banner',
+    'a graceful Leave raised CANNOT CONNECT: ' + J(hAfter.text.slice(0, 160)));
+
   await b.close(); browsers.splice(browsers.indexOf(b), 1);
 }
 
