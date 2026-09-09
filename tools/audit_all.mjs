@@ -341,11 +341,32 @@ const HARNESSES = [
     name: 'dreamcast-mp-page',
     file: 'tools/dreamcast_mp_page_test.mjs',
     cmd: ['node', 'tools/dreamcast_mp_page_test.mjs'],
-    desc: 'dreamcast_multiplayer.html mints a code, hands off to dreamcast.html under THAT code, and the guest becomes player 2 while issuing ZERO requests under /dreamcast/ — a "light" guest that quietly pulls 563 MB is the failure mode',
+    // ⚠ THIS HARNESS ASSERTS THE CANCELLED ARCHITECTURE AND IS EXPECTED TO
+    // FAIL. Its subject was a guest who WATCHED the host: it drives
+    // lib/netplay-ui.js's `.np-*` card, waits for a video track, samples pixels
+    // out of #mpVideo, and reads a pad mask off __dcmpMask. None of that exists
+    // any more — dreamcast_multiplayer.html is a lobby that hands every player
+    // to dreamcast.html, so a joiner runs its own core and DOES pull the disc.
+    // The old desc claimed the opposite as the requirement: "the guest becomes
+    // player 2 while issuing ZERO requests under /dreamcast/". Under lockstep
+    // that is not a light guest, it is a guest with no game.
+    // What replaced it: tools/no_streaming_test.mjs (the machinery is gone) and
+    // dreamcast/tools/lobby_handoff_test.mjs (the hand-off actually pairs).
+    desc: 'STALE — asserts the streaming guest (video track, #mpVideo pixels, __dcmpMask) that dreamcast_multiplayer.html no longer has; superseded by no-streaming + dreamcast-lobby-handoff. Its one still-live check is the disc-list drift against dreamcast.html',
     fast: false, ci: false,
     ciWhy: 'the host boots a 563 MB Dreamcast disc out of dreamcast/discs (2.7 GB)',
     server: true, requires: ['dreamcast/discs', 'dreamcast/flycast_libretro/flycast_worker_emcc.wasm'],
     timeoutMs: 30 * MIN,
+  },
+  {
+    name: 'dreamcast-lobby-handoff',
+    file: 'dreamcast/tools/lobby_handoff_test.mjs',
+    cmd: ['node', 'dreamcast/tools/lobby_handoff_test.mjs'],
+    desc: 'two browsers, real clicks and keystrokes only: the lobby mints a code and hands BOTH players to dreamcast.html (the joiner carrying &join=1), they take different roles, a human presses Allow, and both rosters seat both players on DIFFERENT maple ports — the other half of no-streaming, which can only prove the machinery is gone and never that the replacement pairs',
+    fast: false, ci: false,
+    ciWhy: 'pairs two Chrome profiles over the public peerjs broker; --boot also loads a disc on both',
+    server: true, requires: ['dreamcast.html', 'dreamcast_multiplayer.html'],
+    timeoutMs: 20 * MIN,
   },
   {
     name: 'gamecube-mp-page',
