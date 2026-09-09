@@ -5093,7 +5093,32 @@
   function lsLocalPads() {
     const raw = packPad({ localOnly: true });
     const ls = lsEngine();
-    const ports = (ls && ls.localPorts && ls.localPorts.length) ? ls.localPorts : [0];
+    // ⚠ NEVER FALL BACK TO PORT 0 INSIDE A ROOM. This read `: [0]`, so a console
+    // whose seat was not known yet drove PLAYER 1 — somebody else's character.
+    // The user, seated as Player 2 on a phone: "player 2 took over as player 1!
+    // wtf, it def should not do that."
+    //
+    // It is a REACHABLE state, not a theoretical one: lib/netplay.js:3635
+    // documents a path where "_recount() never runs so `localPorts` stays
+    // EMPTY". Defaulting that to port 0 means the failure mode of "I do not know
+    // which player I am" is "act as Player 1", which is the worst possible
+    // guess — it fights the actual Player 1 for their own character.
+    //
+    // In a room, no seat means NO PAD: send nothing and let the barrier and the
+    // roster sort the seat out. A solo console (no session at all) still uses
+    // port 0, because there it is not a guess — it is the only port.
+    const inRoom = !!NET.session;
+    const known = (ls && ls.localPorts && ls.localPorts.length) ? ls.localPorts : null;
+    if (!known && inRoom) {
+      if (!lsLocalPads._warned) {
+        lsLocalPads._warned = true;
+        pageLog('[lockstep] this console has no seat yet, so it is sending NO pad rather than driving ' +
+                'port 0 — taking Player 1\'s controller because our own seat is unknown is worse than ' +
+                'sending nothing for a frame');
+      }
+      return {};
+    }
+    const ports = known || [0];
     const out = {};
     ports.forEach((port, k) => {
       const b = new Uint8Array(64);
