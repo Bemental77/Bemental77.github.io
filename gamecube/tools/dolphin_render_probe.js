@@ -71,11 +71,50 @@ let   lastDspSentinel          = null;
 let   dspSentinelStreak        = 0;
 const wildIdleCount            = Object.create(null);
 
+// ⚠ '.mjs' IS LOAD-BEARING AND ITS ABSENCE FAILS SILENTLY-ISH.  Without it the fallthrough
+// at the Content-Type line below serves application/octet-stream, and a browser REFUSES a
+// dynamic import() of a non-JavaScript MIME type.  ?srimage=1's render worker does exactly
+// that (sr_render_worker.js:339 imports sab_image.mjs), so the run reports
+// "Failed to fetch dynamically imported module" and then PRESENT STALLED — which reads like
+// an emulator or AOT-image fault when it is purely this table.  sr_image_probe.mjs already
+// declares it; this map did not, and every ?srimage=1 run through this probe was void.
+// '.dol' likewise: the render worker fetches sab_main.dol / sab_fst.bin as ArrayBuffers,
+// where octet-stream is correct, so those two need no entry.
 const MIME = {
-  '.html': 'text/html', '.js': 'application/javascript', '.wasm': 'application/wasm',
+  '.html': 'text/html', '.js': 'application/javascript', '.mjs': 'text/javascript',
+  '.wasm': 'application/wasm',
   '.json': 'application/json', '.css': 'text/css', '.png': 'image/png',
   '.bin': 'application/octet-stream', '.iso': 'application/octet-stream',
+  '.dol': 'application/octet-stream',
 };
+
+// ── /gamedata/... IS THIS SAME TREE, LOCALLY ────────────────────────────────
+// The game library moved to a separate GitHub Pages repo (Bemental77/gamedata)
+// published at the SAME ORIGIN under /gamedata/ — see deploy.exclude's OFFSITE
+// block. gamecube.html therefore asks for '/gamedata/gamecube/roms/...'.
+//
+// THIS SERVER IS NOT tools/devserver.mjs. It is a second, private static server
+// (see startServer below), and it did not know the prefix — so every ROM chunk
+// 404'd and the run reported nonBlack:0, video_cb count=0, published=0.00/s and
+// compile=0, which reads EXACTLY like a dead JIT or a broken renderer. Measured
+// here before this fix, ROM_IDX=1 (Sonic Adventure 2 Battle): three 404s,
+// '[rom] size hint ? MB across 17 chunks', and a black canvas for the whole 45 s.
+// A rig that cannot fetch the disc cannot answer any question about the emulator.
+//
+// ⚠ READ FROM lib/asset_base.js, NEVER HARDCODED. That file is the ONE switch for
+// the whole site and '' must survive as '' (the reverted value), so the prefix is
+// parsed from it here. ⚠ THE REGEX IS ANCHORED AT START-OF-LINE and that is not
+// cosmetic: lib/asset_base.js documents the switch with COMMENTED example
+// assignments ("//     window.ASSET_BASE = '';"), and an unanchored match picks up
+// the first of those, yields '', strips nothing, and puts the 404s straight back —
+// the same trap tools/catalog_urls.mjs calls out.
+const OFFSITE_PREFIX = (() => {
+  try {
+    const m = /^window\.ASSET_BASE\s*=\s*'([^']*)'/m
+      .exec(fs.readFileSync(path.join(ROOT, 'lib', 'asset_base.js'), 'utf8'));
+    return m ? m[1] : '';
+  } catch (e) { return ''; }
+})();
 
 function startServer() {
   return new Promise((resolve) => {
@@ -84,6 +123,11 @@ function startServer() {
       res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
       res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
       let urlPath = decodeURIComponent(req.url.split('?')[0]);
+      // Map the offsite library prefix back onto this tree (see OFFSITE_PREFIX above).
+      if (OFFSITE_PREFIX &&
+          (urlPath === OFFSITE_PREFIX || urlPath.startsWith(OFFSITE_PREFIX + '/'))) {
+        urlPath = urlPath.slice(OFFSITE_PREFIX.length) || '/';
+      }
       if (urlPath === '/') urlPath = '/gamecube.html';
       // Headless gameplay-state injection: serve the PROBE_LOAD_STATE file
       // (a gzipped save-state exported from gamecube.html) at a fixed route so

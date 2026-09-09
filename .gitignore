@@ -148,3 +148,13 @@ ps1/ps1Wasm/roms/MonsterRancher2.bin
 # linked in; there is no --preload-file separation). This repo publishes to
 # GitHub Pages -- do NOT commit or publish this directory.
 n64/sm64-native/
+
+# Deploy staging directory. `.github/workflows/deploy.yml` rsyncs the artifact
+# into ./_deploy, and the two deploy gates (tools/verify_artifact_complete.mjs,
+# tools/verify_deploy_assets.mjs) are run against it — so it gets created
+# locally whenever anyone reproduces the deploy. deploy.exclude already keeps it
+# out of the artifact, but nothing kept it out of the INDEX, and this repo
+# shares one index across concurrent agents. A stray `git add -A` beside a local
+# staging run would have swept ~2.8 GiB of hardlinked artifact into a commit —
+# the same class of accident as the /state.bin rule above.
+/_deploy

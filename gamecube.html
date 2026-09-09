@@ -6,6 +6,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <link rel="icon" href="data:,">
   <script src="/coi-serviceworker.js"></script>
+  <!-- The game library's origin. ONE constant for the whole site, so the split
+       is revertible by editing a single line — see lib/asset_base.js. -->
+  <script src="/lib/asset_base.js"></script>
   <script src="/lib/wakelock.js"></script>
   <!-- Shared capability layer: publishes window.__cap in the same shape on all three
        emulator pages so one rig (tools/device_matrix.mjs) can ask each of them the same
@@ -2119,7 +2122,7 @@ window.GcRate = (function () {
 <script>
 (function () {
   'use strict';
-  const ROM_ROOT = '/gamecube/roms/';
+  const ROM_ROOT = window.ASSET_BASE + '/gamecube/roms/';
   // ── GZIPPED ROM CHUNKS ────────────────────────────────────────────────
   // The chunks ship gzipped because GitHub Pages refuses to DEPLOY an artifact
   // over 10 GB and this site's ROM libraries do not fit beside the Dreamcast
@@ -8297,7 +8300,7 @@ window.GcRate = (function () {
     var suffixes = ['aa', 'ab', 'ac', 'ad', 'ae', 'af'];
     discP = Promise.all([
       Promise.all(suffixes.map(function (sx) {
-        return fetch('/gamecube/roms/MarioParty4.bin.part' + sx + '.gz').then(function (r) {
+        return fetch(window.ASSET_BASE + '/gamecube/roms/MarioParty4.bin.part' + sx + '.gz').then(function (r) {
           if (!r.ok) throw new Error('part' + sx + ' ' + r.status);
           return r.arrayBuffer();
         });

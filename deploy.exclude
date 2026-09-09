@@ -14,6 +14,12 @@
 .github
 .claude
 _deploy
+# The list itself is not a served file. It used to be excluded by a separate
+# `--exclude='/deploy.exclude'` flag in the workflow, which made it the ONE
+# exclusion not expressed here — enough to make tools/verify_artifact_complete.mjs
+# report a false MISSING, since that check derives "what belongs in the artifact"
+# from this file alone. One list, no exceptions.
+/deploy.exclude
 emsdk
 node_modules
 *.tsbuildinfo
@@ -43,3 +49,64 @@ send.email.ts
 /ps1/duckstation-master
 /gamecube/docs
 /dreamcast/docs
+
+# ─── OFFSITE-BEGIN ──────────────────────────────────────────────────────────
+# NOT "not on the site" — SERVED FROM A DIFFERENT REPO, SAME ORIGIN.
+#
+# The game library lives in Bemental77/gamedata, whose GitHub Pages site is
+# published at https://caseybement.com/gamedata/ — a *project* Pages site under
+# the same custom apex domain as this one. Same origin means no CORS and no
+# cross-origin-isolation problem, which is load-bearing: these pages need
+# SharedArrayBuffer and run under COOP/COEP via coi-serviceworker.js, whose
+# scope is `/` and which rewrites no URLs (it re-stamps COEP/CORP/COOP onto
+# whatever it proxies). A real CDN on another host would have needed CORP
+# headers on every ROM; this needs none.
+#
+# WHY. Measured on run 34290489234, the last deploy that actually published:
+#   checkout 345 s · stage 48 s · upload 341 s · deploy 223 s = 960 s
+# 909 of those 960 s were moving the library, on EVERY push, including one-line
+# HTML edits. Deploys were slower than the interval between pushes, so each new
+# push cancelled the pending one and fixes never reached production at all —
+# four Dreamcast games sat broken live with their fix committed and pushed.
+# MEASURED FOR THE FOUR PATHS BELOW, staged the way the workflow stages it
+# (rsync --exclude-from into a scratch dir, then `du -sh` and
+# `find -type f | wc -l`) from a TRACKED-ONLY mirror, because a tracked-only
+# tree is what the CI checkout materialises — rsyncing the whole working tree
+# instead measures 12 GiB / 22,832 files and is not the artifact:
+#   before   9.1 GiB · 2056 files   (this file with no OFFSITE block)
+#   after    2.8 GiB · 1921 files   (the four paths below)
+# Of the 2.8 GiB that remains, 2.5 GiB is /dreamcast/discs — see DEFERRED below.
+#
+# The files remain tracked in this repo (local dev, tools/audit_all.mjs and the
+# probe rigs all read them from the working tree) — they are only kept out of
+# the deploy artifact, and out of the CI checkout via the sparse-checkout that
+# .github/workflows/deploy.yml DERIVES FROM THIS BLOCK. That derivation is why
+# the markers exist; do not rename them without updating the workflow.
+#
+# ⚠ EDITING THESE FILES IN *THIS* REPO NO LONGER CHANGES THE SITE. They are
+# still tracked here (local dev, tools/audit_all.mjs and the probe rigs all read
+# them from the working tree) but the published bytes come from the gamedata
+# repo. Add or replace a ROM/disc in BOTH places, or the catalogs will name a
+# URL that does not resolve — and note the deploy job will correctly report
+# `deploy=false` for such a push, because nothing in THIS artifact changed.
+# `node tools/verify_live_catalogs.mjs` is what catches the mismatch.
+#
+# TO REVERT: delete this block, and set ASSET_BASE back to '' in lib/asset_base.js
+# — ONE line, whole site. Proven in both directions: with '' all 207 catalog URLs
+# resolve at the old paths, with '/gamedata' all 207 resolve at the new ones.
+#
+# ⚠ DEFERRED ON PURPOSE — /dreamcast/discs IS DELIBERATELY NOT LISTED BELOW.
+# dreamcast.html's ASSET_BASE conversion exists but is still UNCOMMITTED, and
+# the ORDER is the whole risk: excluding the discs while the DEPLOYED page still
+# fetches '/dreamcast/discs/...' 404s all five Dreamcast games the instant it
+# ships. Keeping them is safe in BOTH directions and costs only artifact size —
+# the deployed page finds them here, and the converted page finds them on
+# gamedata (verified with a ranged GET: /gamedata/dreamcast/discs/pso2/Track1.bin
+# answers 206). Add the line in the SAME commit that lands the converted
+# dreamcast.html, never before. Measured, that step takes the artifact from
+# 2.8 GiB / 1921 files to 237 MiB / 1845 files.
+/gamecube/roms
+/ps1/ps1Wasm/roms
+/n64/N64Wasm/roms
+/gba/gbaWasm/roms
+# ─── OFFSITE-END ────────────────────────────────────────────────────────────

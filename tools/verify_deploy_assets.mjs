@@ -75,6 +75,16 @@ const ALWAYS_REQUIRED = new Map([
    'gba script.js Module.locateFile = p => "/gba/gbaWasm/dist/" + p'],
   ['/snes/snesWasm/snes9x_2005.wasm',
    'snes.html Module.locateFile = p => "/snes/snesWasm/" + p'],
+  // ⚠ THE ONE RUNTIME URL ON THE N64 PAGE THAT NOTHING CAN SEE. It is a bare
+  // RELATIVE literal inside a vendored dist script — n64/N64Wasm/dist/script.js:253
+  // `let file = 'assets.zip';` — and it resolves only because n64/index.html:49
+  // sets <base href="/n64/N64Wasm/dist/">. No static scanner recovers it, and it
+  // sits one directory away from n64/N64Wasm/roms, which deploy.exclude now
+  // strips. A future exclusion widened from `/n64/N64Wasm/roms` to
+  // `/n64/N64Wasm` would drop it in total silence — the same shape as the
+  // mips_emit.js production 404 this file exists for.
+  ['/n64/N64Wasm/dist/assets.zip',
+   "n64/N64Wasm/dist/script.js:253 downloadFile('assets.zip'), resolved against <base href> on n64/index.html:49"],
   // Block-gzip disc reader, and the per-track block indexes. The reader is a
   // literal <script src>, but the worker reaches it through importScripts and
   // the indexes are only ever built as `base + file.index`, so nothing here is

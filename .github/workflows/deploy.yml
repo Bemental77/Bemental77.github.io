@@ -169,11 +169,55 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Checkout (shallow)
+      # ⚠ BLOBLESS + SPARSE. The game library moved to a separate Pages repo
+      # (Bemental77/gamedata, same origin, /gamedata/...) so it is no longer in
+      # this artifact — but a PLAIN CHECKOUT WOULD STILL DOWNLOAD IT. Measured on
+      # run 34290489234, the last deploy that actually published:
+      #   checkout 345 s · stage 48 s · upload 341 s · deploy 223 s = 960 s
+      # Excluding the library from the artifact only removes the last three. The
+      # 345 s is `actions/checkout` fetching 9 GB of ROM blobs to copy none of
+      # them, so it has to be fetched-sparse to go away.
+      #
+      # `filter: blob:none` fetches no file contents up front; the sparse
+      # patterns below then materialise only the paths this job actually copies,
+      # and the offsite library is never transferred.
+      - name: Checkout (metadata only)
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: /deploy.exclude
+          sparse-checkout-cone-mode: false
           lfs: false
+
+      # ⚠ THE PATTERN LIST IS DERIVED FROM deploy.exclude, NEVER WRITTEN HERE.
+      # A second hand-maintained copy is the two-sources-of-truth defect this
+      # pipeline has already paid for twice, and a drifted copy here would not
+      # over-fetch harmlessly — it would SILENTLY OMIT a path the artifact needs,
+      # which rsync then copies as nothing and reports as a clean run.
+      # "Verify the artifact is complete" below is what makes that safe.
+      - name: Widen the checkout to everything except the offsite library
+        run: |
+          set -eo pipefail
+          test -f deploy.exclude
+          { echo '/*'
+            sed -n '/OFFSITE-BEGIN/,/OFFSITE-END/p' deploy.exclude \
+              | grep -E '^/' | sed 's|^|!|'
+          } > /tmp/sparse.txt
+          echo "::group::sparse-checkout patterns (derived from deploy.exclude)"
+          cat /tmp/sparse.txt
+          echo "::endgroup::"
+          # A derivation that silently yielded nothing would quietly fetch the
+          # whole library again and undo the point of this step, while still
+          # producing a correct artifact — i.e. it would cost 345 s and look fine.
+          test "$(grep -c '^!' /tmp/sparse.txt)" -ge 1 || {
+            echo "::error::derived ZERO offsite patterns from deploy.exclude — is the OFFSITE-BEGIN/END block still there?"
+            exit 1; }
+          git sparse-checkout set --no-cone --stdin < /tmp/sparse.txt
+          echo "::group::working tree after widening"
+          du -sh . 2>/dev/null | tail -1
+          find . -path ./.git -prune -o -type f -print | wc -l
+          echo "::endgroup::"
 
       - name: Stage deploy artifact
         run: |
@@ -185,9 +229,12 @@ jobs:
           # tools/deploy_should_run.mjs in the decide job above, so "what the
           # site serves" is defined in exactly one place. Do not re-inline these
           # patterns here.
-          rsync -a --delete --exclude-from=deploy.exclude \
-            --exclude='/deploy.exclude' \
-            ./ _deploy/
+          # ⚠ NO SECOND --exclude FLAG. `/deploy.exclude` is listed INSIDE
+          # deploy.exclude now. It used to be the one exclusion not expressed in
+          # the file, which was enough to make the completeness check below
+          # report a false MISSING, since that check derives "what belongs in the
+          # artifact" from deploy.exclude alone. One list, no exceptions.
+          rsync -a --delete --exclude-from=deploy.exclude ./ _deploy/
           echo "::group::Deploy artifact size + top dirs"
           du -sh _deploy
           du -sh _deploy/* | sort -h | tail -20
@@ -195,6 +242,16 @@ jobs:
           echo "::group::Deploy file count"
           find _deploy -type f | wc -l
           echo "::endgroup::"
+
+      # ⚠ THE GUARD THAT MAKES THE SPARSE CHECKOUT SAFE. A sparse checkout that
+      # omits a path by mistake does not fail: rsync copies nothing for it,
+      # prints a clean summary, and the artifact ships without a file the site
+      # needs — the same silent-omission shape as the sab.map and mips_emit.js
+      # production 404s. This asserts the invariant that closes it: every TRACKED
+      # file that deploy.exclude does not exclude must exist in the artifact.
+      # Both halves are derived, so there is no list here to drift.
+      - name: Verify the artifact is complete
+        run: git ls-files -z | node tools/verify_artifact_complete.mjs _deploy
 
       - name: Verify runtime assets survived the exclude list
         # Two shipped features were silently dead in production because the rsync

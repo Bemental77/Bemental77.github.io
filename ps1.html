@@ -3,23 +3,21 @@
 <head>
   <script src="/lib/capability.js"></script>
   <script src="/lib/xboxinput.js"></script>
-  <!-- ⚠ NO NETPLAY SCRIPTS ARE LOADED HERE, ON PURPOSE.
-       /lib/netplay-host.js is the host half of STREAMING — it captures this
-       canvas with captureStream(), interposes on the audio graph, and publishes
-       both over WebRTC. Streaming is cancelled by user directive 2026-09-08
-       ("WE WILL NOT USE STREAMING!").
-       /lib/netplay.js is the LOCKSTEP engine and this core COULD carry it — two
-       real controller ports, and _one_iter() is a genuine one-frame call — but
-       the core drives its own loop from inside wasm, so there is no seam for a
-       frame gate yet and no determinism measurement to rest one on. Opening a
-       room over an unmeasured core would produce two consoles that silently
-       diverge. See the ONLINE PLAY block near the end of this page for the
-       scoped job. -->
+  <!-- ONLINE PLAY IS DETERMINISTIC LOCKSTEP. Only /lib/netplay.js is loaded.
+       /lib/netplay-host.js is the host half of STREAMING and is deliberately
+       NOT here — streaming is cancelled by user directive 2026-09-08 ("WE WILL
+       NOT USE STREAMING!"). Every player runs their own core and only pad bytes
+       cross the wire. The ONLINE PLAY block near the end of this page carries
+       the evidence this rests on, including the determinism measurement. -->
+  <script src="/lib/netplay.js"></script>
   <meta charset="UTF-8" />
   <title>PS1 Wasm — Monster Rancher 2</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <link rel="icon" href="data:,">
   <script src="/coi-serviceworker.js"></script>
+  <!-- The game library's origin. ONE constant for the whole site, so the split
+       is revertible by editing a single line — see lib/asset_base.js. -->
+  <script src="/lib/asset_base.js"></script>
   <script src="/lib/wakelock.js"></script>
   <script src="/lib/audiodiag.js"></script>
   <script>if (new URLSearchParams(location.search).has('eruda')) { var s=document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/eruda'; s.onload=function(){eruda.init();}; document.head.appendChild(s); }</script>
@@ -277,7 +275,7 @@
 <script>
 (function () {
   'use strict';
-  const ROM_ROOT = '/ps1/ps1Wasm/roms/';
+  const ROM_ROOT = window.ASSET_BASE + '/ps1/ps1Wasm/roms/';
   // ── GZIPPED ROM CHUNKS ────────────────────────────────────────────────
   // The chunks ship gzipped because GitHub Pages refuses to DEPLOY an artifact
   // over 10 GB and this site's ROM libraries do not fit beside the Dreamcast
