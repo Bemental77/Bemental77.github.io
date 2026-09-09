@@ -7087,10 +7087,23 @@
                        netLocalLoad() >= 1 && !seedHold;
       rdy.style.display = (!b.started && youPort != null) ? '' : 'none';
       rdy.disabled = !canReady;
+      // ⚠ THE LABEL MUST NAME THE REASON THE BUTTON IS DEAD.
+      // It used to be computed from netLocalLoad() ALONE while `disabled` also
+      // required a SEAT — so a console that was loaded but not yet seated drew
+      // an inviting "I'm ready" over a disabled control. Measured on production,
+      // host on gauntlet, for 40 s straight:
+      //     booted true · armed true · readyTxt "I'm ready" · readyDisabled TRUE
+      // The user pressed it over and over and reported "nothing is happening",
+      // which was exactly right: a disabled button eats the click and the label
+      // told him the opposite. A control that cannot act must say why, or the
+      // player is left blaming himself for a state the page created.
       rdy.textContent = (t.you && t.you.ready) ? "You're ready" :
         seedRoomState === 'failed'  ? 'Cannot start — see below' :
         seedRoomState === 'pending' ? 'Preparing the game…' :
-        (netLocalLoad() < 1 ? 'Loading the game…' : "I'm ready");
+        (netLocalLoad() < 1)        ? 'Loading the game…' :
+        (youPort == null || !t.you) ? 'Waiting for a seat in the room…' :
+        b.started                   ? 'The room already started' :
+        "I'm ready";
     }
   }
   function netRoomStart() {
