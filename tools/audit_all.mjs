@@ -387,6 +387,18 @@ const HARNESSES = [
     server: true, requires: ['lib/netplay.js'], timeoutMs: 25 * MIN,
   },
 
+  {
+    name: 'dreamcast-room-crossdevice',
+    file: 'dreamcast/tools/room_crossdevice_test.mjs',
+    cmd: ['node', 'dreamcast/tools/room_crossdevice_test.mjs',
+          '--url', ORIGIN, '--play', 'none', '--latems', '45000', '--name', 'audit-xdev',
+          '--arms', 'panel-open,panel-closed,host-busy,mobile-joiner,host-ignores,late-joiner,rejoin,host-reload'],
+    desc: 'TWO browsers pairing THE WAY A PERSON DOES — real mouse clicks at real coordinates (hit-tested with elementFromPoint), real keystrokes, and NOTHING else: it never calls approve()/setReady()/any engine method, and a self-audit over its own source refuses to run if it starts to. It exists because every other netplay rig here supplies the human action itself and therefore cannot notice a missing one. Eight arms: the baseline, a host with the lobby panel CLOSED, a host mid disc-download, a phone joiner, a host who never answers the prompt, a 45 s gap before anyone knocks, a joiner who reloads and retries, and a host who reloads mid-room. A one-way roster (the joiner sees the host, the host never sees the joiner) is a NAMED failure, never a timeout',
+    fast: false, ci: false,
+    ciWhy: 'it needs the real peerjs broker and real ICE between two Chrome profiles — network-dependent by design, exactly like audit-peerjs-crossdevice and netplay-realui-pair. ⚠ AND IT CANNOT PROVE WHAT IT LOOKS LIKE IT PROVES: both browsers sit on ONE box behind ONE NAT, so a green run closes the real-UI gap and NOT the two-networks gap. With no working TURN relay (public relays measured returning 701/400; peerjs\'s own two do not resolve) symmetric-NAT peers cannot connect at all and nothing here detects it. Marking this ci:true would put a green tick under a claim no rig in this repo can make',
+    server: true, requires: ['dreamcast.html', 'lib/netplay.js'], timeoutMs: 25 * MIN,
+  },
+
   // ---- the lockstep determinism gate -------------------------------------
   // THE ONLY GATE THAT CAN CATCH THIS REGRESSION, and the reason it is worth
   // three minutes of a full run: the fix it protects is INVISIBLE TO EVERY
