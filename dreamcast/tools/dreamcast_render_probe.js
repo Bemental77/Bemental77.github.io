@@ -23,6 +23,34 @@
 // yet, run `npm i --no-save puppeteer` (see TODO note at the bottom).
 
 const http = require('http');
+
+// ⚠ THIS SERVER IS NOT tools/devserver.mjs, AND THAT DIFFERENCE HAS BITTEN TWICE.
+// The ROM and disc libraries are served from the Bemental77/gamedata repo at
+// the same origin under /gamedata (lib/asset_base.js holds the one constant).
+// A probe that runs its OWN static server knows nothing about that prefix and
+// 404s every asset — and the failure does NOT look like a missing file. On the
+// GameCube probe it read as compile=0 / published 0.00/s / nonBlack 0, i.e.
+// exactly like a dead JIT; here it read as "start failed: fetch
+// /gamedata/dreamcast/discs/gauntlet/Track1.bin -> 404" against an origin that
+// answers that same path with 206 in production.
+//
+// The prefix is READ from lib/asset_base.js rather than hardcoded, and the
+// regex is ANCHORED AT START-OF-LINE on purpose: that file also contains a
+// commented example line assigning '', and an unanchored match picks the
+// comment and strips nothing.
+function offsitePrefix(root) {
+  try {
+    const src = require('fs').readFileSync(require('path').join(root, 'lib/asset_base.js'), 'utf8');
+    const m = /^window\.ASSET_BASE\s*=\s*'([^']*)'/m.exec(src);
+    return m ? m[1] : '';
+  } catch (e) { return ''; }
+}
+function stripOffsite(urlPath, prefix) {
+  if (!prefix) return urlPath;
+  if (urlPath === prefix) return '/';
+  if (urlPath.startsWith(prefix + '/')) return urlPath.slice(prefix.length);
+  return urlPath;
+}
 const fs   = require('fs');
 const path = require('path');
 let   puppeteer;
@@ -73,6 +101,7 @@ function startServer() {
       res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
       res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
       let urlPath = decodeURIComponent(req.url.split('?')[0]);
+      urlPath = stripOffsite(urlPath, offsitePrefix(ROOT));
       if (urlPath === '/') urlPath = '/dreamcast.html';
       const filePath = path.join(ROOT, urlPath);
       fs.stat(filePath, (err, stat) => {

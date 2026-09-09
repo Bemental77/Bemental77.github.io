@@ -2086,7 +2086,7 @@
   const GAMES = {
     pso2: {
       name: 'Phantasy Star Online Ver. 2 (USA)',
-      base: '/dreamcast/discs/pso2/',
+      base: window.ASSET_BASE + '/dreamcast/discs/pso2/',
       cue:  'PSO.cue',
       productId: 'MK-51193',
       files: [
@@ -2112,7 +2112,7 @@
     // which is how pso2 ships (git ls-tree origin/prod -- dreamcast/discs/pso2).
     cannonspike: {
       name: 'Cannon Spike (USA)',
-      base: '/dreamcast/discs/cannonspike/',
+      base: window.ASSET_BASE + '/dreamcast/discs/cannonspike/',
       cue:  'CannonSpike.cue',
       // From the disc's own IP.BIN header (+0x40). flycast stats
       // /bios/dc/textures/<id>/ and throws if it is missing — see the worker shim.
@@ -2128,7 +2128,7 @@
     },
     sa2: {
       name: 'Sonic Adventure 2 (USA)',
-      base: '/dreamcast/discs/sa2/',
+      base: window.ASSET_BASE + '/dreamcast/discs/sa2/',
       cue:  'SonicAdventure2.cue',
       productId: 'MK-51117',
       files: [
@@ -2147,7 +2147,7 @@
     // asserts against, not a disc-wide figure.
     gauntlet: {
       name: 'Gauntlet Legends (USA)',
-      base: '/dreamcast/discs/gauntlet/',
+      base: window.ASSET_BASE + '/dreamcast/discs/gauntlet/',
       cue:  'GauntletLegends.cue',
       productId: 'T9710N',
       files: [
@@ -2170,7 +2170,7 @@
     // cannot see this image's header at 0x4b85988.
     mvc2: {
       name: 'Marvel vs. Capcom 2 (USA)',
-      base: '/dreamcast/discs/mvc2/',
+      base: window.ASSET_BASE + '/dreamcast/discs/mvc2/',
       cue:  'MvC2.cdi',
       productId: 'T1212N',
       files: [

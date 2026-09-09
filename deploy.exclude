@@ -95,16 +95,22 @@ send.email.ts
 # — ONE line, whole site. Proven in both directions: with '' all 207 catalog URLs
 # resolve at the old paths, with '/gamedata' all 207 resolve at the new ones.
 #
-# ⚠ DEFERRED ON PURPOSE — /dreamcast/discs IS DELIBERATELY NOT LISTED BELOW.
-# dreamcast.html's ASSET_BASE conversion exists but is still UNCOMMITTED, and
-# the ORDER is the whole risk: excluding the discs while the DEPLOYED page still
-# fetches '/dreamcast/discs/...' 404s all five Dreamcast games the instant it
-# ships. Keeping them is safe in BOTH directions and costs only artifact size —
-# the deployed page finds them here, and the converted page finds them on
-# gamedata (verified with a ranged GET: /gamedata/dreamcast/discs/pso2/Track1.bin
-# answers 206). Add the line in the SAME commit that lands the converted
-# dreamcast.html, never before. Measured, that step takes the artifact from
-# 2.8 GiB / 1921 files to 237 MiB / 1845 files.
+# /dreamcast/discs JOINED THE BLOCK 2026-09-09, and the ORDER was the whole risk:
+# excluding the discs while the DEPLOYED page still fetched '/dreamcast/discs/...'
+# would have 404'd all five Dreamcast games the instant it shipped. So the line
+# below lands in the SAME commit as dreamcast.html's ASSET_BASE conversion, never
+# before it. Preconditions verified first, per disc rather than extrapolated from
+# one: a ranged GET of every game's first file at /gamedata answers 206 —
+# pso2/Track1.bin, cannonspike/Track1.bin, sa2/Track1.bin, gauntlet/Track1.bin,
+# mvc2/MvC2.cdi.bgzi.json — and `node tools/verify_live_catalogs.mjs` reads
+# 207 of 207 resolve · 0 DEAD · 0 NO-RANGE with histogram {"206":207}.
+#
+# ⚠ /dreamcast/states IS DELIBERATELY NOT HERE. dreamcast.html:4037 fetches
+# SEED_URL = 'dreamcast/states/pso2_boot.state' WITHOUT the ASSET_BASE prefix,
+# and that seed is the only thing carrying PSO Ver.2's Serial Number / Access
+# Key — excluding it would strand every player on the credential screen.
+#
+/dreamcast/discs
 /gamecube/roms
 /ps1/ps1Wasm/roms
 /n64/N64Wasm/roms
