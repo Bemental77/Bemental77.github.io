@@ -195,6 +195,9 @@ const GAME     = arg('game', 'gauntlet');
 const NAME     = arg('name', 'xdev');
 const ARMS     = arg('arms', 'panel-open,panel-closed,host-busy,mobile-joiner').split(',').map((s) => s.trim()).filter(Boolean);
 const PLAYARG  = arg('play', 'panel-open');
+// The disc the JOINER starts on, which must NOT be the room's. Empty = pick
+// the opposite of --game automatically. The room is required to correct it.
+const JOINER_DISC = arg('joinerdisc', '');
 const FRESH    = has('fresh');
 const HEADFUL  = has('headful');
 const KEEP     = has('keep');
@@ -908,9 +911,27 @@ async function runArm(armName) {
     const jEntryId = entry[1].found[0] || 'btnNet';
     const joinerJoins = async (label) => {
       say(`\n-- joiner${mobileJoiner ? ' (phone)' : ''}${label}: picks ${GAME}, opens the lobby, types ${code}`);
-      const jPick = await pick(join, join.__mobile ? '#mobileRomSelect' : '#romSelect', GAME);
-      cell(jPick.ok, 'joiner-can-pick-the-disc' + label, `the joiner picked ${GAME} from its own picker`,
-        `the joiner could not pick the disc: ${J(jPick)}`);
+      // ⚠ THE JOINER DELIBERATELY PICKS THE **WRONG** DISC.
+      //
+      // This line used to set the joiner's picker to GAME — the host's game —
+      // and that single line made this rig STRUCTURALLY BLIND to the defect a
+      // real player hit on his first attempt. It loaded the right disc for the
+      // wrong reason and then reported `both cores loaded gauntlet`, so 45+
+      // green cells sat on top of a room that never told anyone what it was
+      // for. Three separate bugs hid behind it: the roster published game:null
+      // because Lockstep read a field only NetplaySession owned; two different
+      // URL writers let a joiner name the room's disc; and 'room-game' was
+      // emitted on the Lockstep while the page listened on the Session, so it
+      // never arrived at all.
+      //
+      // The room is supposed to TELL the joiner which disc to load. The only
+      // way to test that is to start it on a different one and require the room
+      // to correct it — a joiner that already holds the answer proves nothing.
+      const WRONG = (JOINER_DISC || (GAME === 'pso2' ? 'gauntlet' : 'pso2'));
+      const jPick = await pick(join, join.__mobile ? '#mobileRomSelect' : '#romSelect', WRONG);
+      cell(jPick.ok, 'joiner-starts-on-a-DIFFERENT-disc' + label,
+        `the joiner deliberately holds ${WRONG} while the room is for ${GAME} — the room must correct it`,
+        `the joiner could not pick the wrong disc on purpose: ${J(jPick)}`);
       const jOpen = await openLobbyNow(join, jEntryId);
       cell(jOpen.ok, 'joiner-can-open-the-lobby' + label, `the joiner pressed #${jEntryId}`,
         `the joiner could not open the lobby: ${jOpen.why}`);
@@ -1191,6 +1212,25 @@ async function runArm(armName) {
         }).catch(() => false);
         if (busy) { starts.push({ ok: true, why: 'the room started it already — a boot is in flight' }); continue; }
         say(`  ....  ${pg.__role} was restarted by forming the room — pressing Start on the fresh page`);
+      }
+      // ⚠ A BOOT ALREADY IN FLIGHT IS A PASS, ON ANY ARM.
+      // This check used to sit behind `if (preBoot && ...)`, i.e. only on the
+      // arms that deliberately pre-boot a side. But a JOINER now auto-starts as
+      // the ordinary case — 'room-game' selects the room's disc and presses
+      // Start for it, because "a joiner should not have to press Start" — so by
+      // the time this loop reaches it, Start is legitimately disabled with a
+      // load underway. Pressing a disabled control is a failure this rig
+      // reports rather than clicks through, so without this it FAILS the
+      // product for doing exactly what it is supposed to do. Caught the moment
+      // the joiner stopped being handed the right disc by the rig itself.
+      const inFlight = await pg.evaluate(() => {
+        const b = document.getElementById('btnStart');
+        return !!(b && b.disabled);
+      }).catch(() => false);
+      if (inFlight) {
+        starts.push({ ok: true, why: 'the room started this side already — a boot is in flight' });
+        say(`  ....  ${pg.__role} was started BY THE ROOM (Start disabled, load underway)`);
+        continue;
       }
       starts.push(await human(pg, pg.__mobile ? '#mobileSplashStart' : '#btnStart', 'Start'));
       say(`  ....  ${pg.__role} pressed Start (was ${already})`);
