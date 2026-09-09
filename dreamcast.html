@@ -6018,8 +6018,48 @@
   // `fixedCode` is the handoff from dreamcast_multiplayer.html. That page shows a
   // code to the player BEFORE anything is downloaded, so minting a fresh one here
   // would silently strand a guest already waiting on the published one.
+  // ---------------------------------------------------------------------------
+  // ⚠ AN EXPLICIT CLICK MUST NEVER NO-OP SILENTLY.
+  //
+  // netStartHost() and netStartGuest() both opened with a bare
+  // `if (NET.session) return;`. That is correct about not stacking two sessions
+  // and WRONG about saying nothing: the user pressed "Open a room" on a page
+  // that had arrived through the join hand-off (?np=J5HJF&join=1&npwait=1) and
+  // was sitting on "Looking for the host...", and the button did literally
+  // nothing — no message, no log line, no change. Reported verbatim as
+  // "clicking open a room seems to do nothing".
+  //
+  // A player pressing Open/Join while stuck in a room that never formed is
+  // telling us exactly what they want. So: if the room has already STARTED,
+  // refuse out loud and point at Leave — tearing down a live game under the
+  // other players would be worse than a refusal. Otherwise drop the session
+  // that never got anywhere and honour the click.
+  function netReplaceSession(what) {
+    if (!NET.session) return true;
+    // ⚠ ASK THE ENGINE, NOT A NAME I WISHED EXISTED. `session.lockstepReport()`
+    // is not a thing — the state lives on `session.ls.report()`, whose `state`
+    // is 'running'/'stalled' once the barrier has released (lib/netplay.js's own
+    // rosterStale test uses exactly that pair). `session.ls` also does not exist
+    // until the room has an engine, hence the safe() wrapper rather than a
+    // chain of &&.
+    const st = safe(() => NET.session.ls.report().state, null);
+    const started = (st === 'running' || st === 'stalled') ||
+                    safe(() => !!(NET.session.ls.report().barrier || {}).started, false);
+    if (started) {
+      netStatus('You are already in a room that has started. Press Leave first, then ' + what + '.', 'bad');
+      pageLog('[net] ' + what + ' refused — this console is already playing in a room; Leave first');
+      return false;
+    }
+    pageLog('[net] ' + what + ' pressed while an unstarted session existed (role=' + NET.role +
+            ', state=' + safe(() => NET.session.state, '?') + ') — closing it and honouring the click ' +
+            'rather than returning silently');
+    netLeave();
+    NET.leaving = false;   // this is a REPLACEMENT, not a departure
+    return true;
+  }
+
   async function netStartHost(fixedCode) {
-    if (NET.session) return;
+    if (!netReplaceSession('open a room')) return;
     // ⚠ A CONSOLE THAT IS ALREADY PLAYING RESTARTS INTO THE ROOM. See
     // lsRestartIntoRoom() above for why the gate cannot be armed where it
     // stands. Nothing has been published yet, so nobody is stranded by this.
@@ -6074,7 +6114,7 @@
   }
 
   async function netStartGuest() {
-    if (NET.session) return;
+    if (!netReplaceSession('join a room')) return;
     const code = ($('netCodeIn').value || '').trim().toUpperCase();
     if (!/^[A-HJ-NP-Z2-9]{5}$/.test(code)) {
       netStatus('That does not look like a code — 5 characters, no I O 0 or 1.', 'bad');
