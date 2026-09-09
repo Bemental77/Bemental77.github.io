@@ -1272,9 +1272,14 @@ async function runArm(armName) {
       const tRe = Date.now();
       let re = { hit: null, all: [] }, seatedAgain = false;
       while (Date.now() - tRe < ADMIT_MS) {
-        const hostSide = reloadSide === 'host' ? join : host;
-        re = await findAdmitControl(hostSide);
-        if (re.hit) { await clickAt(hostSide, re.hit.box, re.hit.text); say(`  ....  pressed "${re.hit.text}" for the returning peer`); }
+        // ⚠ ADMISSION IS ALWAYS THE HOST'S. This read `reloadSide === 'host' ?
+        // join : host`, which watched the JOINER for an Allow when the HOST was
+        // the side that reloaded — and a reloaded host is exactly the case that
+        // MUST ask again, because its own record of who it has admitted died
+        // with the page. The arm sat on "someone is asking to join" for the
+        // whole admit window while the dialog was on the other screen.
+        re = await findAdmitControl(host);
+        if (re.hit) { await clickAt(host, re.hit.box, re.hit.text); say(`  ....  pressed "${re.hit.text}" for the returning peer`); }
         const [a, b] = await Promise.all([readRoster(host), readRoster(join)]);
         if (occupied(a).length >= 2 && occupied(b).length >= 2) { seatedAgain = true; break; }
         await sleep(1200);
