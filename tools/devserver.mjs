@@ -44,10 +44,26 @@ const TYPES = {
   '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf',
 };
 
+// ── /gamedata/... IS THIS SAME TREE, LOCALLY ────────────────────────────────
+// In production the game library is a SEPARATE GitHub Pages repo
+// (Bemental77/gamedata) published at the SAME ORIGIN under /gamedata/ — see
+// deploy.exclude, the OFFSITE-BEGIN block. Locally those files are still sitting
+// in this tree at their old paths, so the prefix is mapped away here.
+//
+// WHY MAP IT INSTEAD OF LETTING THE PAGES USE A DIFFERENT URL IN DEV: so the URL
+// a page requests is byte-identical locally and live. A dev/prod URL split is
+// exactly how a path bug reaches production unseen, and this repo has paid for
+// that more than once (dolphin_captures/sab.map and n64/bementalJIT/mips_emit.js
+// both passed locally and 404'd live). One URL, both places.
+const OFFSITE_PREFIX = '/gamedata';
+
 // Resolve inside ROOT only. A traversal must 403 rather than read the disk.
 function resolveSafe(urlPath) {
   let p;
   try { p = decodeURIComponent(urlPath.split('?')[0].split('#')[0]); } catch (e) { return null; }
+  if (p === OFFSITE_PREFIX || p.startsWith(OFFSITE_PREFIX + '/')) {
+    p = p.slice(OFFSITE_PREFIX.length) || '/';
+  }
   const full = path.resolve(ROOT, '.' + (p.startsWith('/') ? p : '/' + p));
   if (full !== ROOT && !full.startsWith(ROOT + path.sep)) return null;
   return full;

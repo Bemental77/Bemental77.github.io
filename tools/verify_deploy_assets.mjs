@@ -34,7 +34,7 @@
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
-import { runInNewContext } from 'node:vm';
+import { extractAll, selfTest, assetBase } from './catalog_urls.mjs';
 
 // Files whose literal runtime URLs must resolve in the artifact. These are the
 // entry points a browser actually loads — pages plus the worker shims/glue they
@@ -87,12 +87,10 @@ const ALWAYS_REQUIRED = new Map([
   // production. That is the same shape as the sab.map and mips_emit.js losses
   // this file already exists to catch.
   ['/lib/bgz.js', 'dreamcast.html <script src>, and flycast_worker.js importScripts("/lib/bgz.js")'],
-  ['/dreamcast/discs/pso2/Track3.bin.bgzi.json', 'dreamcast.html GAMES.pso2 files[].index'],
-  ['/dreamcast/discs/cannonspike/Track3.bin.bgzi.json', 'dreamcast.html GAMES.cannonspike files[].index'],
-  ['/dreamcast/discs/sa2/Track3.bin.bgzi.json', 'dreamcast.html GAMES.sa2 files[].index'],
-  ['/dreamcast/discs/gauntlet/Track3.bin.bgzi.json', 'dreamcast.html GAMES.gauntlet files[].index'],
-  ['/dreamcast/discs/gauntlet/Track5.bin.bgzi.json', 'dreamcast.html GAMES.gauntlet files[].index'],
-  ['/dreamcast/discs/mvc2/MvC2.cdi.bgzi.json', 'dreamcast.html GAMES.mvc2 files[].index'],
+  // (The six disc indexes that used to be listed here are DERIVED from the
+  //  catalog now — see tools/catalog_urls.mjs. A list maintained beside the
+  //  catalog is precisely what drifted and shipped four 404ing games while this
+  //  very check reported "67 present · 0 MISSING".)
   // Built-in ROMs: fetched from an array literal, not a literal URL argument.
   ['/snes/snesWasm/roms/simcity.smc', 'snes.html ROMS[0].url'],
   ['/genesis/genesisWasm/dist/genesis_plus_gx.wasm',
@@ -103,12 +101,8 @@ const ALWAYS_REQUIRED = new Map([
   // the directory would otherwise pass silently.
   ['/genesis/genesisWasm/roms/Sonic the Hedgehog 3 (USA).gen', 'genesis.html ROMS[0].url'],
   ['/genesis/genesisWasm/roms/X-Men (U).gen', 'genesis.html ROMS[1].url'],
-  // PS1 discs are split; the page builds chunk names arithmetically from
-  // ROM_ROOT + base + ".bin.parta" + <letter>, so probe the first chunk of the
-  // default title. A deploy filter that strips the directory shows up here.
-  // .gz because the ROM libraries are gzipped and inflated by the page — see
-  // the chunkRange note in ps1.html. The raw name no longer exists anywhere.
-  ['/ps1/ps1Wasm/roms/MonsterRancher2.bin.partaa.gz', 'ps1.html ROMS[0] chunkRange("MonsterRancher2","f")'],
+  // (The PS1 chunk probe that used to be listed here is derived too — and now
+  //  ALL EIGHT titles' chunks are, not just the first chunk of the default one.)
 ]);
 
 // Known-optional at runtime: the code has an explicit graceful path, so a 404 is
@@ -154,73 +148,15 @@ const catalogFaults = [];         // structural faults in the catalog itself, no
 const skipDirAbsent = new Set();  // staged mode: whole disc dir absent from the checkout
 
 // ---------------------------------------------------------------------------
-// THE DREAMCAST DISC CATALOG — derived, never hand-listed.
+// THE GAME CATALOGS — derived, never hand-listed, and now ALL FIVE of them.
 //
-// WHY THIS EXISTS (measured 2026-09-08, on the LIVE site): four of five
-// Dreamcast games 404'd their disc in production WHILE THIS CHECK PASSED, 67
-// present / 0 MISSING. A commit converted every disc to block-gzip (.bgz plus a
-// .bgzi.json block index) and DELETED the old .gz parts, but updated only
-// gauntlet's GAMES entry. Every file the check knew about existed; the catalog
-// simply NAMED DIFFERENT ONES. "Does this file exist?" cannot see that. The
-// only question that can is "does every URL the catalog NAMES resolve?", so the
-// URL list is now derived FROM the catalog instead of maintained beside it —
-// a list maintained beside it is precisely what drifted.
-//
-// The parts are built as .map(s => name + s + ext), so no static regex can
-// recover them. The object literal is evaluated instead, in a bare context with
-// no globals: it is pure data plus arrow functions over string literals.
-function extractGames(text, srcName) {
-  const i = text.indexOf('const GAMES = {');
-  if (i < 0) return null;
-  const j = text.indexOf('\n  };', i);
-  if (j < 0) return null;
-  // A parse failure must be LOUD. If this silently returned {}, the check would
-  // go straight back to reporting 0 MISSING on a catalog that names nothing
-  // which exists — the exact production failure above, wearing a PASS.
-  const g = runInNewContext(text.slice(i, j + 5) + '\nGAMES;', Object.create(null),
-                            { timeout: 5000, filename: srcName });
-  if (!g || typeof g !== 'object' || !Object.keys(g).length) return null;
-  return g;
-}
-
-// Every URL a game's entry names, plus the one structural rule that no amount
-// of URL-resolving can express.
-function catalogUrls(games) {
-  const out = [];
-  for (const [key, g] of Object.entries(games)) {
-    // Not deployed on purpose — dreamcast.html:2152 relabels the option and
-    // :3685 refuses to launch it. Asserting on it would be a false red.
-    if (g.hosted === false) continue;
-    const base = g.base;
-    if (!base) { catalogFaults.push('GAMES.' + key + ' has no base'); continue; }
-    for (const f of g.files || []) {
-      const why = 'dreamcast.html GAMES.' + key + ' files[' + f.name + ']';
-      if (f.parts) {
-        // ⚠ THE RULE THIS GATE WILL NOT TRADE FOR SPEED. Per dreamcast.html:3614,
-        // the extension test in fetchDiscInto is /\.gz$/, which does NOT match
-        // ".bgz" — so a .bgz file with no index makes the EAGER path "silently
-        // write COMPRESSED bytes" into the disc buffer. That is a corrupt disc
-        // that still loads, not a clean failure. Every URL below would resolve
-        // and the game would still be broken, so this is checked structurally
-        // rather than by fetching anything. A 404 is loud and recoverable;
-        // silent corruption is neither.
-        if (f.parts.some((n) => /\.bgz$/.test(n)) && !f.index) {
-          catalogFaults.push(
-            'GAMES.' + key + ' ' + f.name + ' has .bgz parts but no index: — the eager path ' +
-            'would write COMPRESSED bytes into the disc buffer (dreamcast.html:3614)');
-        }
-        if (f.index) out.push([base + f.index, why + ' .index']);
-        for (const n of f.parts) out.push([base + n, why + ' .parts[]']);
-      } else {
-        out.push([base + f.name, why]);
-      }
-    }
-    if (g.cue && !(g.files || []).some((f) => f.name === g.cue)) {
-      out.push([base + g.cue, 'dreamcast.html GAMES.' + key + '.cue']);
-    }
-  }
-  return out;
-}
+// The extraction moved to tools/catalog_urls.mjs so that this check and
+// tools/verify_live_catalogs.mjs read the catalogs from ONE place. It used to
+// cover dreamcast.html only; gamecube.html, ps1.html, the N64 list and the GBA
+// romlist were still represented by a handful of hand-written singleton URLs —
+// i.e. by exactly the maintained-beside-it list that drifted and shipped four
+// 404ing games while this file reported "67 present · 0 MISSING".
+// ---------------------------------------------------------------------------
 
 // ⚠ SOURCE/TARGET COHERENCE — a flaw this tool shipped with, caught in review.
 // The first version read WORKING-TREE sources while checking LIVE URLs, which
@@ -255,34 +191,46 @@ for (const src of SOURCES) {
   const dyn = (text.match(/(?:fetch\(|importScripts\()\s*[`'"]?\s*(?:\$\{|['"]\s*\+)/g) || []).length;
   if (dyn) unchecked.push(`${src}: ${dyn} dynamically-built URL(s) not statically checkable`);
 
-  // The disc catalog is DATA, not a URL literal — evaluate it and expand it.
-  if (src === 'dreamcast.html') {
-    const games = extractGames(text, src);
-    if (!games) {
-      console.error('[deploy-assets] FATAL: could not evaluate the GAMES catalog in ' + src +
-        '. Refusing to report a result — this check PASSED at 67 present / 0 MISSING while ' +
-        'four games were 404 in production, and a silently-empty catalog is that same PASS.');
-      process.exit(2);
-    }
-    for (const [u, why] of catalogUrls(games)) {
-      if (!found.has(u)) found.set(u, new Set());
-      found.get(u).add(why);
-    }
-    // STAGED MODE ONLY: the CI checkout omits dreamcast/discs entirely — which
-    // is why this harness had to be marked ci:false, since it reported MISSING
-    // for files that were deployed fine and so nobody read the red. An ABSENT
-    // DIRECTORY is not evidence of breakage; a PRESENT directory missing a
-    // NAMED file is. Live mode has no such excuse and asserts on everything.
-    if (!liveMode) {
-      for (const [k, g] of Object.entries(games)) {
-        if (g.hosted === false || !g.base) continue;
-        if (!existsSync(join(root, g.base.replace(/^\//, '')))) {
-          for (const [u] of catalogUrls({ [k]: g })) skipDirAbsent.add(u);
-        }
-      }
-    }
+}
+
+// ── EVERY CATALOG'S OWN URLS ────────────────────────────────────────────────
+// Evaluated from the catalogs themselves. A parse failure is FATAL, never an
+// empty list: a silently-empty catalog reports "0 MISSING", which is the exact
+// PASS that shipped over four broken games.
+{
+  const { urls: catUrls, faults, unreadable } = extractAll(readSource);
+  for (const f of faults) catalogFaults.push(f);
+  for (const u of unreadable) {
+    console.error('[deploy-assets] FATAL: could not read the catalog source ' + u +
+      '. Refusing to report a result — a catalog that contributes nothing must not' +
+      ' read as a pass.');
+    process.exit(2);
+  }
+  for (const [u, why] of catUrls) {
+    if (!found.has(u)) found.set(u, new Set());
+    found.get(u).add(why);
   }
 }
+
+// ── OFFSITE URLS ────────────────────────────────────────────────────────────
+// The game library is served from a SEPARATE Pages repo at the SAME ORIGIN
+// (see deploy.exclude, the OFFSITE-BEGIN block). Those URLs are deliberately
+// not in this artifact, so asking "is the file in _deploy?" about them is the
+// wrong question — it would report every ROM and every disc part as MISSING.
+//
+// ⚠ THEY ARE NOT THEREFORE UNCHECKED, and this must never become a way to bury
+// breakage. Existence-in-the-artifact simply cannot answer it;
+// `node tools/verify_live_catalogs.mjs` resolves every one of them against the
+// live origin with a real ranged GET, which is the only place the answer lives.
+// This block only decides WHICH question each URL gets asked.
+//
+// The prefix is read from the page's own ASSET_BASE rather than written out
+// here, so there is no second copy of it to drift.
+const OFFSITE = (() => {
+  const b = assetBase(readSource);   // lib/asset_base.js — the one constant
+  return b ? (u) => u === b || u.startsWith(b + '/') : () => false;
+})();
+const offsite = [];
 
 const missing = [], optionalMissing = [], ok = [];
 
@@ -319,44 +267,15 @@ function assertCatchesFoundingCases() {
 }
 assertCatchesFoundingCases();
 
-// SELF-TEST 2: the catalog expansion must catch ITS founding case — the
+// SELF-TEST 2: the CATALOG extraction must catch ITS founding case — the
 // 2026-09-08 break, where four games named .part*.gz files the bgz conversion
-// had deleted. A gate that cannot fail on the bug it was written for is
-// decoration, and this one shipped a PASS over that exact bug once already.
-function assertCatchesCatalogFoundingCases() {
-  const BROKEN = [
-    "  const GAMES = {",
-    "    sa2: { name: 'x', base: '/dreamcast/discs/sa2/', cue: 'S.cue',",
-    "      files: [ { name: 'Track1.bin' },",
-    "        { name: 'Track3.bin', bytes: 1,",
-    "          parts: ['aa','ab'].map(s => 'Track3.bin.part' + s + '.gz') },",
-    "        { name: 'S.cue' } ] },",
-    "  };",
-  ].join('\n');
-  const g = extractGames(BROKEN, 'self-test');
-  if (!g) { console.error('[deploy-assets] SELF-TEST FAILED: catalog would not evaluate'); process.exit(2); }
-  const urls = catalogUrls(g).map(([u]) => u);
-  // The .map()-built part names are the whole point: a static regex sees none
-  // of these, which is why the 404s were invisible.
-  for (const want of ['/dreamcast/discs/sa2/Track3.bin.partaa.gz',
-                      '/dreamcast/discs/sa2/Track3.bin.partab.gz',
-                      '/dreamcast/discs/sa2/Track1.bin']) {
-    if (!urls.includes(want)) {
-      console.error('[deploy-assets] SELF-TEST FAILED: catalog expansion did not yield ' + want +
-                    '\n  got: ' + urls.join(', '));
-      process.exit(2);
-    }
-  }
-  // And the silent-corruption rule: .bgz parts with no index: must fault.
-  const before = catalogFaults.length;
-  catalogUrls(extractGames(BROKEN.replace(/\.gz'\)/, ".bgz')"), 'self-test'));
-  if (catalogFaults.length !== before + 1) {
-    console.error('[deploy-assets] SELF-TEST FAILED: .bgz parts with no index: did not fault');
-    process.exit(2);
-  }
-  catalogFaults.length = before;   // discard the synthetic fault
-}
-assertCatchesCatalogFoundingCases();
+// had deleted. That test now lives beside the extraction it guards, in
+// tools/catalog_urls.mjs, and additionally pins that ASSET_BASE is actually
+// APPLIED — a silently-empty base would put every URL back on the old origin
+// and still "resolve" in a staged check, which is the move-shaped version of
+// the same false pass. A gate that cannot fail on the bug it was written for
+// is decoration, and this one shipped a PASS over that exact bug once already.
+selfTest();
 
 for (const [u, why] of ALWAYS_REQUIRED) {
   if (!found.has(u)) found.set(u, new Set([`ALWAYS_REQUIRED (${why})`]));
@@ -366,6 +285,8 @@ for (const u of urls) {
   // Staged mode, whole disc directory not in the checkout — see the note in the
   // catalog block. Reported, never counted as breakage.
   if (skipDirAbsent.has(u)) continue;
+  // Served from the asset repo — resolved by verify_live_catalogs.mjs instead.
+  if (OFFSITE(u)) { offsite.push(u); continue; }
   if (looksLikeSplitPrefix(u)) {
     // Check the first real chunk instead of the (non-existent) prefix.
     // The chunk may be stored gzipped (the pages inflate it), so accept either
@@ -389,7 +310,14 @@ if (skipDirAbsent.size) {
                  `directory is absent from this checkout (use --live to assert on them)`);
 }
 console.log(`[deploy-assets] target=${liveMode ? origin : resolve(root)}`);
-console.log(`[deploy-assets] ${ok.length} present · ${optionalMissing.length} optional-missing · ${missing.length} MISSING`);
+console.log(`[deploy-assets] ${ok.length} present · ${offsite.length} offsite · ` +
+            `${optionalMissing.length} optional-missing · ${missing.length} MISSING`);
+if (offsite.length) {
+  console.log(`  offsite   ${offsite.length} catalog URL(s) are served from the asset repo at the same`);
+  console.log(`            origin, so they are NOT expected in this artifact. Existence here`);
+  console.log(`            cannot answer for them — resolve them against the live origin with:`);
+  console.log(`              node tools/verify_live_catalogs.mjs`);
+}
 for (const u of optionalMissing) console.log(`  optional  ${u}\n            (${OPTIONAL.get(u)})`);
 for (const u of unchecked) console.log(`  unchecked ${u}`);
 for (const u of missing) console.log(`  MISSING   ${u}\n            referenced by: ${[...found.get(u)].join(', ')}`);

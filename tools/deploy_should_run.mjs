@@ -48,11 +48,20 @@ function toRegExp(pat) {
   return new RegExp(anchored ? `^${rx}(/|$)` : `(^|/)${rx}(/|$)`);
 }
 
-function load() {
+export function load() {
   const txt = fs.readFileSync(EXCLUDE, 'utf8');
   return txt.split('\n').map((l) => l.trim())
     .filter((l) => l && !l.startsWith('#'))
     .map((p) => ({ pat: p, rx: toRegExp(p) }));
+}
+
+// Exported so other checkers apply the SAME rsync-semantics matcher against the
+// SAME file. tools/verify_artifact_complete.mjs uses it to assert that every
+// tracked, non-excluded file survived into the artifact — reimplementing the
+// matcher there would be the second copy this whole file exists to avoid.
+export function excluderFromExcludeFile() {
+  const rules = load();
+  return (f) => rules.find((r) => r.rx.test(f)) || null;
 }
 
 function main(files) {
@@ -97,8 +106,12 @@ function main(files) {
   }
 }
 
+// Imported for the matcher alone? Then do not run the CLI.
+const invokedDirectly = process.argv[1] &&
+  path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname);
 let argv = process.argv.slice(2);
-if (argv.length) main(argv);
+if (!invokedDirectly) { /* imported as a module — no CLI side effects */ }
+else if (argv.length) main(argv);
 else {
   let buf = '';
   process.stdin.setEncoding('utf8');

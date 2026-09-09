@@ -140,6 +140,32 @@ const HARNESSES = [
     server: false, requires: ['dreamcast/discs/gauntlet'], timeoutMs: 5 * MIN,
   },
   {
+    // THE ARM THE ENTRY ABOVE SAYS IS MISSING. deploy-assets asks "is the file
+    // present?"; it PASSED at "67 present · 0 MISSING" while four of five
+    // Dreamcast games 404'd in production, because the catalog had been changed
+    // to name DIFFERENT files and every file it knew about still existed.
+    // This asks the only question that catches that: does every URL the catalogs
+    // NAME actually resolve? All five catalogs are expanded from their own
+    // source (tools/catalog_urls.mjs), including the .map()-built disc part
+    // names and the character-code-built ROM chunk names that no static regex
+    // can recover.
+    //
+    // ⚠ It runs against the LOCAL server here, not the live origin. Locally it
+    // proves the catalogs are internally consistent with the files on disk —
+    // which is what a pre-push gate can honestly assert. The live-origin arm is
+    // the same command with --origin, run after a deploy, and it is the only
+    // thing that can see a production 404.
+    name: 'live-catalogs',
+    file: 'tools/verify_live_catalogs.mjs',
+    cmd: ['node', 'tools/verify_live_catalogs.mjs', '--origin', 'http://localhost:8080'],
+    desc: 'every URL the five game catalogs NAME resolves, with a real ranged GET (never HEAD — Pages answers HEAD 200 even where it honours Range only on GET), and every block-gzip disc part answers 206 rather than 200',
+    fast: true, ci: false,
+    ciWhy: 'it resolves all 207 catalog URLs, which live under the ROM and disc libraries the size-bounded CI checkout does not carry; against the live origin it is a POST-deploy check, not a pre-merge one',
+    server: true,
+    requires: ['dreamcast/discs/gauntlet', 'gamecube/roms', 'ps1/ps1Wasm/roms', 'n64/N64Wasm/roms', 'gba/gbaWasm/roms'],
+    timeoutMs: 10 * MIN,
+  },
+  {
     name: 'dc-core-drift',
     file: 'dreamcast/tools/verify_core_tree.sh',
     cmd: ['bash', 'dreamcast/tools/verify_core_tree.sh'],
@@ -538,6 +564,10 @@ const HARNESSES = [
 // omission you can read is not the same thing as a silence.
 // ---------------------------------------------------------------------------
 const NOT_RUN = [
+  { file: 'tools/verify_artifact_complete.mjs',
+    why: 'it asserts against a STAGED DEPLOY ARTIFACT, which only the deploy job produces — it is a step in .github/workflows/deploy.yml, run there on every deploy. Its invariant (every tracked file deploy.exclude does not exclude must exist in the artifact) is what makes the blobless+sparse CI checkout safe: a sparse checkout that omits a path does not fail, rsync just copies nothing for it and prints a clean summary. Run it locally with `git ls-files -z | node tools/verify_artifact_complete.mjs .`, which passes trivially because the working tree is complete by construction; the arm that means something needs _deploy' },
+  { file: 'tools/catalog_urls.mjs',
+    why: 'a MODULE, not a harness — the shared catalog extractor imported by tools/verify_deploy_assets.mjs and tools/verify_live_catalogs.mjs, both of which ARE in the table above. Its own self-tests (the 2026-09-08 four-games-404 case, the ASSET_BASE comment trap, and the falsy-empty-string revert trap) run unconditionally at the start of both callers, so it cannot regress silently' },
   { file: 'tools/dreamcast_netplay_test.mjs',
     why: '⚠ IT ASSERTS A CANCELLED ARCHITECTURE. It judges pixels read from the guest\u2019s own <video> and calls __dcNet().guestAudio / __dcNetStream() \u2014 but streaming was cancelled by user directive 2026-09-08 and dreamcast.html has none of those any more. It is named here rather than quietly deleted because an omission you can read is not a silence: it still holds the only ONE-BROWSER TWO-TAB arm (BroadcastChannel signalling in a single profile, no broker, fast) and should be REWRITTEN as the two-tab room test rather than dropped. Covering it today: dreamcast/tools/room_hud_test.mjs (flow + session honesty, one browser) and dreamcast/tools/netplay_room_e2e.mjs (N browsers, N cores)' },
   { file: 'tools/ps1_pad_test.mjs',
