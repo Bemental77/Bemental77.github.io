@@ -49,13 +49,49 @@ const STREAMING = [
 // says "lockstep" in a comment and never feeds a frame is still streaming.
 const LOCKSTEP = ['beginFrame', 'lsInput', 'lsNormalize', 'submitHash'];
 
+// ⚠ COMMENTS MUST BE STRIPPED AS BLOCKS, NOT AS LINES. A page that REMOVED the
+// streaming machinery says so in prose — dreamcast.html:394 reads "There is no
+// #netVideo any more" inside a multi-line HTML comment, and a line-prefix filter
+// counted that as evidence the machinery was present. A gate that fails a page
+// for documenting its own fix is a gate nobody will keep.
+function stripComments(s) {
+  return s
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .split('\n').filter((l) => !/^\s*\/\//.test(l)).join('\n');
+}
+
+// A LOBBY is a real and correct piece of this architecture, not a half-converted
+// page: it agrees on a game and a room code and then HANDS EVERY PLAYER — host
+// and joiners alike — to the page that actually runs a core. It therefore drives
+// no frame loop of its own and never should. Requiring beginFrame of it would
+// force a lobby to pretend to be an emulator.
+// What IS required of one is stricter than the old check, not looser: it must
+// carry no streaming machinery, and it must hand off to a page that itself
+// passes this gate.
+const LOBBY_HANDOFF = {
+  'n64_multiplayer.html':      { to: 'n64/index.html',   link: /\/n64\/\?np=|'\/n64\/'/ },
+  'dreamcast_multiplayer.html':{ to: 'dreamcast.html',   link: /dreamcast\.html\?np=/ },
+  'gamecube_multiplayer.html': { to: 'gamecube.html',    link: /gamecube\.html\?np=/ },
+};
+
 let fail = 0, scoped = 0, skipped = 0;
+const verdict = {};
 for (const p of PAGES) {
   let s;
   try { s = fs.readFileSync(p, 'utf8'); }
   catch (e) { console.log(`  SKIP  ${p} — not present`); skipped++; continue; }
 
-  const online = /netHostBtn|lobbyCard|Play Online|NetplayHost|Netplay\.Session/.test(s);
+  // ⚠ SCOPE IS DECIDED ON LIVE CODE, NOT ON PROSE — the same rule this file
+  // already applies to the machinery scan below, and for the same reason. It
+  // used to test the RAW source, so a page that had REMOVED its online play and
+  // explained the removal in a comment was still scoped as an online page and
+  // then failed for not driving a frame loop it deliberately no longer has.
+  // MEASURED: gamecube.html, whose only remaining matches were two historical
+  // comments describing a menu entry that is not in the DOM (there is no
+  // #mNet/#btnNet element on that page at all).
+  const stripped = stripComments(s);
+  const online = /netHostBtn|lobbyCard|Play Online|NetplayHost|Netplay\.(Session|Lockstep|makeCode)/.test(stripped);
   if (!online) { console.log(`  n/a   ${p} — no online play`); skipped++; continue; }
   scoped++;
 
@@ -65,21 +101,40 @@ for (const p of PAGES) {
   // line-prefix filter counted that as evidence the machinery was present. A
   // gate that fails a page for documenting its own fix is a gate nobody will
   // keep. Strip <!-- -->, block comments and // lines, then scan what is left.
-  const live = s
-    .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .split('\n').filter((l) => !/^\s*\/\//.test(l)).join('\n');
+  const live = stripped;
   const streams = STREAMING.filter((k) => live.includes(k));
   const drives  = LOCKSTEP.filter((k) => live.includes(k));
 
+  const lobby = LOBBY_HANDOFF[p];
   if (streams.length) {
     console.log(`  FAIL  ${p} — still carries streaming machinery: ${streams.join(', ')}`);
-    fail++;
+    verdict[p] = false; fail++;
+  } else if (lobby) {
+    // A lobby passes on the hand-off, and the hand-off must be REAL: the URL it
+    // sends players to has to appear in live code, not in a comment.
+    if (!lobby.link.test(live)) {
+      console.log(`  FAIL  ${p} — a lobby must hand players to ${lobby.to}, and no such hand-off is in its live code`);
+      verdict[p] = false; fail++;
+    } else {
+      console.log(`  PASS  ${p} — lobby, no streaming machinery, hands off to ${lobby.to}`);
+      verdict[p] = true;
+    }
   } else if (!drives.length) {
     console.log(`  FAIL  ${p} — offers online play but drives no lockstep frame loop (looked for ${LOCKSTEP.join(', ')})`);
-    fail++;
+    verdict[p] = false; fail++;
   } else {
     console.log(`  PASS  ${p} — lockstep (${drives.join(', ')}), no streaming machinery`);
+    verdict[p] = true;
+  }
+}
+
+// A lobby that hands off to a page which itself FAILS is not a pass — it is a
+// working front door onto a broken room.
+for (const [p, l] of Object.entries(LOBBY_HANDOFF)) {
+  if (verdict[p] !== true) continue;
+  if (verdict[l.to] === false) {
+    console.log(`  FAIL  ${p} — hands off to ${l.to}, which does not pass this gate`);
+    fail++;
   }
 }
 

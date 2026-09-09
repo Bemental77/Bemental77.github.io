@@ -321,6 +321,132 @@ function buildRecompTriangleFifo() {
 // guest-advance per pump), just yields ~8x more often so presents track the emulated rate.
 var PUMP_BATCH_ITERS = 2;
 
+// ---------------------------------------------------------------------------
+// LOCKSTEP PUMP (2026-09-08). Online play on this page used to mean ONE
+// emulator: gamecube.html captured its canvas, streamed it over WebRTC, and
+// dropped the guest's pad bits into port 1. Player 2 was watching a video of
+// somebody else's console and every button they pressed cost a network round
+// trip plus an encode plus a decode. That architecture is CANCELLED. Under
+// lockstep every machine runs its own core, only pad bytes cross the wire, and
+// each player's own input is applied locally — which is what a console does.
+//
+// WHAT CHANGES HERE, AND WHAT MUST NOT. Exactly one thing changes: the pump
+// will not start emulated frame N until it HOLDS the pad image for frame N, for
+// every seated port. Everything else — the fixed-iteration determinism
+// contract above, the zero-clamp yield chain, the savestate skip, the recomp
+// fixture — is untouched, and with lockstep off (the default, and every single
+// player session) pumpBatch runs the identical path it ran before.
+//
+// ⚠ THE GUEST RATE IS NOT A KNOB HERE (CLAUDE.md gate #9). This worker has NO
+// real-time governor at all — startTickLoop() runs the pump flat out because
+// this core is BELOW native speed and has no idle budget to give back. So the
+// gate can only ever make the guest run SLOWER (a stall), never faster. A
+// stall is not repaid: there is no catch-up sprint anywhere in this file, and
+// adding one would be the exact "manufactured speed" failure gate #9 forbids.
+//
+// ⚠ AND IT NEVER GUESSES. A missing input STALLS. Substituting a plausible pad
+// value would fork the machines silently and permanently, and there is no
+// rollback here to unfork them.
+//
+// ⚠ THE LOCKSTEP QUANTUM IS A PUMP BATCH, NOT A VIDEO FRAME, AND THAT IS
+// DELIBERATE. One `_run_iter_batch(1)` is one retro_run, which the
+// determinize-boot note above calls "~one dispatch slice" — it is NOT one
+// presented frame (that note measured 16 quanta/batch against ~90 VI/s, i.e.
+// several quanta per VI). What lockstep actually requires is a DETERMINISTIC
+// UNIT OF GUEST ADVANCE that every peer applies identically with input latched
+// at identical boundaries, and the fixed-iteration contract above already
+// guarantees exactly that per pump. So one lockstep frame = one pump batch =
+// LS_ITERS quanta, with the pad written once immediately before the batch —
+// which is also what a real console does (the pad is polled once per frame).
+// LS_ITERS is a CONSTANT rather than a page parameter on purpose: every peer
+// runs the same build, so a constant cannot disagree between machines, whereas
+// a negotiated value is one more thing that can desync by construction.
+var LS_ITERS = PUMP_BATCH_ITERS;
+// 4 ports x 8 bytes (EmscriptenWorker.cpp:117 `static uint8_t g_pad[32]`;
+// input_state_cb reads g_pad[port*8 + id/8] bit (id%8) at :290-330). A longer
+// buffer would run off the end of g_pad into whatever the linker put after it.
+var LS_PAD_BYTES = 32;
+var lockstep = false;
+var lsFrame = 0;                 // next lockstep frame to run
+var lsQueue = new Map();         // frame -> Uint8Array(32) pad image
+var lsHashEvery = 60;
+var lsStallSince = 0;
+var lsStats = { frames: 0, stalls: 0, stallMs: 0, maxStallMs: 0, queued: 0, dropped: 0, iters: 0 };
+
+// THE FINGERPRINT. Two cores that are frame-gated but never COMPARED are worse
+// than two cores that are not gated at all, because they look right while they
+// silently diverge. This is what lib/netplay.js's desync detector consumes.
+//
+// ⚠ IT IS A SAMPLE OF MEM1, NOT A SERIALIZED STATE, AND THE DIFFERENCE MATTERS.
+// A full retro_serialize would be the authoritative answer but it costs a whole
+// state (megabytes) per sample and this worker's save path is an async
+// request/poll dance (bem_save_request/bem_state_poll below). A strided sample
+// of guest RAM is cheap enough to take every lsHashEvery frames and is a real
+// witness: any divergence that changes gameplay changes guest RAM. What it can
+// do is MISS a divergence that has not yet reached the sampled words — so a
+// PASS here is necessary, not sufficient, and this comment is the place that
+// says so rather than a report that overclaims.
+//
+// The stride is prime-ish relative to the page size so the sample is not
+// aligned to any one structure, and the words are read as u32 from the wasm
+// heap at the address Dolphin reports for MEM1.
+var LS_FP_STRIDE = 4093 * 4;     // bytes between sampled words
+function lsFingerprint() {
+  var words = [];
+  try {
+    if (!Module || !Module._dolphin_get_ram_addr || !Module.HEAPU32) return words;
+    var base = Module._dolphin_get_ram_addr() >>> 0;
+    var size = (Module._dolphin_get_ram_size ? Module._dolphin_get_ram_size() : 0) >>> 0;
+    if (!base || !size) return words;                 // Memory::Init has not run
+    var h = 0x811c9dc5;
+    var n = 0;
+    for (var off = 0; off + 4 <= size; off += LS_FP_STRIDE) {
+      var v = Module.HEAPU32[(base + off) >>> 2] >>> 0;
+      h = (Math.imul((h ^ v) >>> 0, 0x01000193)) >>> 0;
+      n++;
+    }
+    // A handful of named scalars alongside the RAM roll-up, so a mismatch can
+    // say something more useful than "the memory differs".
+    words.push(h >>> 0, n >>> 0, size >>> 0, lsStats.iters >>> 0);
+  } catch (e) { /* a fingerprint that throws must not stop the pump */ }
+  return words;
+}
+function lsHash(words) {
+  var h = 0x811c9dc5;
+  for (var i = 0; i < words.length; i++) h = (Math.imul((h ^ (words[i] >>> 0)) >>> 0, 0x01000193)) >>> 0;
+  return h >>> 0;
+}
+function lsWritePads(u8) {
+  if (!Module || !Module._get_pad_ptr || !Module.HEAPU8) return false;
+  var ptr = Module._get_pad_ptr();
+  if (!ptr) return false;
+  Module.HEAPU8.set(u8.length > LS_PAD_BYTES ? u8.subarray(0, LS_PAD_BYTES) : u8, ptr);
+  return true;
+}
+// Returns true when the pads for lsFrame are in hand and have been written, so
+// the caller may advance the guest. Returns false to STALL.
+function lsGateReady() {
+  var inp = lsQueue.get(lsFrame);
+  if (!inp) {
+    if (!lsStallSince) {
+      lsStallSince = performance.now();
+      lsStats.stalls++;
+      postMessage({ cmd: 'lsStall', f: lsFrame, on: 1 });
+    }
+    return false;
+  }
+  if (lsStallSince) {
+    var d = performance.now() - lsStallSince;
+    lsStallSince = 0;
+    lsStats.stallMs += d;
+    if (d > lsStats.maxStallMs) lsStats.maxStallMs = d;
+    postMessage({ cmd: 'lsStall', f: lsFrame, on: 0, ms: Math.round(d) });
+  }
+  lsQueue.delete(lsFrame);
+  lsWritePads(inp);
+  return true;
+}
+
 function pumpBatch() {
   // [savestate-fix PM61] while DoState serializes on the CPU/EmuThread, skip the
   // GPU pump so RunGpuLoopSlice can't race the memory/GPU restore. Gated on the
@@ -336,6 +462,14 @@ function pumpBatch() {
     if (Module._bem_drain_async) Module._bem_drain_async();
     return;
   }
+  // ---- LOCKSTEP GATE ------------------------------------------------------
+  // Placed BEFORE the engine arms below so it covers BOTH of them, and after
+  // the savestate skip so a state restore is never gated (a restore is not a
+  // frame and must not wait on the wire). A refusal returns without advancing
+  // the guest by so much as one quantum: the picture holds, the audio ring
+  // drains, and the page is told WHY so a frozen console is explainable
+  // instead of looking hung.
+  if (lockstep && !lsGateReady()) return;
   if (Module && Module._run_iter_batch) {
     // [recomp perf 2026-08-28] Once the recomp worker is driving the game, dolphin
     // is ONLY the renderer — its own emulation loop is redundant work on the very
@@ -359,7 +493,23 @@ function pumpBatch() {
     // on this thread. It does not pay: the recomp worker produces ~16 frames per
     // rendered frame uncapped (skipped=112293), so the renderer is the limiter
     // and the pump is not what is holding it back.
-    for (var i = 0; i < PUMP_BATCH_ITERS; i++) Module._run_iter_batch(1);
+    // Under lockstep the batch size is LS_ITERS (== PUMP_BATCH_ITERS today), so
+    // the guest-advance-per-pump contract is byte-identical to the free-running
+    // path; only WHEN a pump happens changes.
+    var _iters = lockstep ? LS_ITERS : PUMP_BATCH_ITERS;
+    for (var i = 0; i < _iters; i++) Module._run_iter_batch(1);
+    lsStats.iters += _iters;
+    if (lockstep) {
+      var _f = lsFrame++;
+      lsStats.frames++;
+      // The page needs to know a frame completed so it can produce the input
+      // for _f + delay. This is the frame clock for the whole session.
+      postMessage({ cmd: 'lsFrame', f: _f });
+      if (lsHashEvery > 0 && (_f % lsHashEvery) === 0) {
+        var _w = lsFingerprint();
+        if (_w.length) postMessage({ cmd: 'lsHash', f: _f, h: lsHash(_w), w: _w });
+      }
+    }
     // [recomp-bridge] armed fixture: apply once (RAM image + f32-array swaps + fifo upload),
     // then re-render each pump until the pump budget runs out.
     if (__recompFix && Module._recomp_render_fifo && __recompFixPumps > 0) {
@@ -789,12 +939,101 @@ self.onmessage = function (e) {
       }
       break;
     case 'input':
+      // ⚠ DEAD WHILE THE FRAME GATE IS ARMED. This is the free-running relay:
+      // the page posts it on its own ~10 ms timer, which is not aligned to any
+      // emulated frame. Under lockstep the pad image arrives as 'lsInput' keyed
+      // to an exact frame and is written by lsGateReady() immediately before
+      // that frame runs; letting this path also write g_pad would overwrite the
+      // agreed image with this machine's local pad at an arbitrary point mid
+      // frame, which is a desync with no symptom other than divergence.
+      if (lockstep) break;
       if (Module && Module.calledRun && Module.HEAPU8 && Module._get_pad_ptr) {
         var ptr = Module._get_pad_ptr();
         if (data.states && data.states.length) {
           Module.HEAPU8.set(data.states, ptr);
         }
       }
+      break;
+
+    // ---- LOCKSTEP -----------------------------------------------------------
+    // ⚠ ARM THIS AFTER THE DISC LOADS AND BEFORE THE PUMP EVER RUNS A FRAME.
+    // Two machines that free-ran for different numbers of pumps before the gate
+    // engaged are at different guest positions, which is a desync at "frame 0".
+    // gamecube.html's lsArmBeforeFreerun() is what guarantees the ordering; this
+    // handler only reports what it was told so a mis-ordering is visible rather
+    // than silent.
+    case 'lockstep': {
+      var _on = !!e.data.on;
+      // ⚠ REFUSE TO ARM A GATE THAT DOES NOT GATE THE GUEST. Under emscripten
+      // dual-core — the shipped default — retro_run advances ZERO guest CPU
+      // cycles (Main.cpp:434-464); the CPU thread free-runs on its own pthread.
+      // Gating pumpBatch there would hold the PICTURE while both machines kept
+      // executing and diverging, i.e. it would look like working lockstep and
+      // be a silent permanent fork. Saying so out loud and refusing is the only
+      // honest behaviour; a session that cannot be gated must know it.
+      if (_on && Module && Module._bem_is_dual_core && Module._bem_is_dual_core()) {
+        postMessage({ cmd: 'lsState', on: 0, f: lsFrame, refused: true,
+          error: 'this core is in DUAL-CORE mode, where retro_run advances no guest CPU cycles '
+               + '(DolphinLibretro/Main.cpp:434-464) — the CPU runs free on its own pthread, so a '
+               + 'pump gate would freeze the picture while the guests diverged. Lockstep needs the '
+               + 'single-core branch (Main.cpp:471 RunSingleFrame), which this build does not boot.' });
+        postMessage({ cmd: 'print', txt: '[lockstep] ⚠ REFUSED TO ARM — dual-core retro_run gates nothing' });
+        break;
+      }
+      if (_on === lockstep) { postMessage({ cmd: 'lsState', on: lockstep ? 1 : 0, f: lsFrame }); break; }
+      lockstep = _on;
+      lsQueue.clear();
+      lsStallSince = 0;
+      if (_on) {
+        lsFrame = e.data.frame | 0;
+        lsHashEvery = (e.data.hashEvery == null) ? 60 : (e.data.hashEvery | 0);
+      }
+      postMessage({ cmd: 'print', txt: '[lockstep] ' + (_on
+        ? 'ON — the pump will not advance the guest until it holds every seated port\'s pad'
+        : 'OFF — free-running pump resumed') + ' frame=' + lsFrame + ' hashEvery=' + lsHashEvery
+        + ' itersPerFrame=' + LS_ITERS });
+      postMessage({ cmd: 'lsState', on: lockstep ? 1 : 0, f: lsFrame });
+      break;
+    }
+    // One exact frame's WHOLE pad image — every seated port's bytes, built by
+    // lib/netplay.js's beginFrame(). Never a single player's pad: under lockstep
+    // every machine writes every port.
+    case 'lsInput': {
+      var _lf = e.data.f | 0;
+      // Already run; it cannot be un-run. Counted rather than dropped silently
+      // so a page feeding the wrong frame numbers is diagnosable.
+      if (_lf < lsFrame) { lsStats.dropped++; break; }
+      lsQueue.set(_lf, e.data.states);
+      lsStats.queued++;
+      break;
+    }
+    // HOW MANY CONTROLLERS THIS CONSOLE PRESENTS — sent BEFORE the disc, never
+    // after. The SI devices are created during boot (EmscriptenWorker.cpp's
+    // g_player_ports block), so this is part of the starting state; arriving
+    // late means this machine has a different device set from its peers and
+    // frame 0 is already a desync. A late one is REPORTED rather than applied.
+    case 'players': {
+      var _n = Math.max(1, Math.min(4, e.data.n | 0));
+      if (!Module || !Module._bem_set_players) {
+        postMessage({ cmd: 'players', ok: false, n: _n,
+                      error: 'this build does not export _bem_set_players — relink' });
+        break;
+      }
+      if (bootStarted) {
+        postMessage({ cmd: 'players', ok: false, n: _n, late: true,
+                      error: 'the disc has already started loading — the SI devices are made during boot '
+                           + 'and this build does not hotplug, so the port count can no longer change' });
+        break;
+      }
+      Module._bem_set_players(_n);
+      var _got = Module._bem_get_players ? Module._bem_get_players() : _n;
+      postMessage({ cmd: 'print', txt: '[lockstep] presenting ' + _got + ' controller(s) — sent before the disc load' });
+      postMessage({ cmd: 'players', ok: true, n: _got });
+      break;
+    }
+    case 'lsStats':
+      postMessage({ cmd: 'lsStats', on: lockstep ? 1 : 0, f: lsFrame,
+                    itersPerFrame: LS_ITERS, queued: lsQueue.size, stats: lsStats });
       break;
     case 'saveState':
       // [savestate-deadlock-fix PM61] do NOT call _state_size/_save_state here —

@@ -116,6 +116,23 @@ bool retro_unserialize(const void* data, size_t size);
 // value IS the steady-state.
 static uint8_t g_pad[32] = {};
 
+// HOW MANY SI PORTS THIS CONSOLE PRESENTS TO THE GAME.
+//
+// ⚠ DEFAULT 1, AND THAT DEFAULT IS LOAD-BEARING. Every single-player session
+// must present exactly the one controller it has always presented: games notice
+// the difference. SSBM's roster, Mario Party's board setup and SA2B's mode
+// select all branch on how many pads the SI reports, so plugging four
+// unconditionally is a behaviour change dressed up as a netplay feature.
+// Only a lockstep room raises it, and it raises it to exactly the number of
+// seats the room actually filled.
+//
+// ⚠ AND IT MUST BE SET BEFORE retro_load_game. The SI devices are created
+// during boot, so the port count is part of the starting state and has to be
+// identical on every machine before any of them loads — which is the whole
+// reason lib/netplay.js forms the room BEFORE anything boots and refuses a
+// late joiner.
+static int g_player_ports = 1;
+
 static bool g_loaded = false;
 
 // [HW-render 2026-06-17] WebGL2 hardware-render path (adapted from the working
@@ -334,6 +351,35 @@ extern "C" {
 EMSCRIPTEN_KEEPALIVE
 void* get_pad_ptr(void) { return g_pad; }
 
+// Set by gamecube.html's lsPlayersBeforeDisc() from the lockstep roster, BEFORE
+// the disc is handed to load_iso. A no-op with no room (the page sends nothing),
+// so a solo boot is byte-for-byte the boot it always was.
+EMSCRIPTEN_KEEPALIVE
+void bem_set_players(int n) {
+    g_player_ports = (n < 1) ? 1 : (n > 4 ? 4 : n);
+}
+EMSCRIPTEN_KEEPALIVE
+int bem_get_players(void) { return g_player_ports; }
+
+// IS THE GUEST CPU DRIVEN BY retro_run, OR IS IT FREE-RUNNING ON ITS OWN THREAD?
+//
+// This exists so the JS side cannot arm a frame gate that does not gate
+// anything. Under emscripten DUAL-CORE — the shipped default (Boot.cpp:289-290,
+// "dual-core is the product") — retro_run's body advances ZERO guest CPU cycles:
+// Main.cpp:434-464 runs only EmulatorState(true) + RunGpuLoopSlice(), and the
+// CPU thread runs continuously on its own pthread (JitWasm.cpp:611's
+// `while (*state_ptr == CPU::State::Running)`). Gating the JS pump there would
+// freeze the PICTURE while both guests kept executing and diverging — a
+// lockstep session that looks correct and is not. Only the single-core branch
+// (Main.cpp:471, `system.GetCPU().RunSingleFrame()`) makes one retro_run equal
+// one emulated frame on the calling thread, which is the quantum lockstep needs.
+//
+// Returns 1 for dual-core (NOT gateable), 0 for single-core (gateable).
+EMSCRIPTEN_KEEPALIVE
+int bem_is_dual_core(void) {
+    return Core::System::GetInstance().IsDualCoreMode() ? 1 : 0;
+}
+
 // PowerPCState placement-new redirect. Forward-declared instead of #include
 // to avoid pulling Core/PowerPC/PowerPC.h into the libretro shim TU.
 extern "C" void dolphin_set_ppc_state_external_storage(uint32_t addr);
@@ -470,10 +516,18 @@ int load_iso(const char* path) {
         MAIN_THREAD_EM_ASM({ postMessage({cmd: 'audioRate', rate: $0}); },
                            (unsigned)_av.timing.sample_rate);
     }
-    retro_set_controller_port_device(0, EMW_RETRO_DEVICE_JOYPAD);
+    // ONE DEVICE PER SEATED PLAYER. input_state_cb (:290) already bases every
+    // read on `port * 8` and already guards `port >= 4`, and g_pad is already
+    // 4 ports wide — so the ONLY thing that used to stop players 2-4 existing
+    // was that no device was ever created for their ports, which meant the
+    // frontend never polled them. g_player_ports is 1 unless a lockstep room
+    // raised it (see its declaration), so single player is unchanged.
+    for (int _p = 0; _p < g_player_ports; _p++)
+        retro_set_controller_port_device((unsigned)_p, EMW_RETRO_DEVICE_JOYPAD);
     MAIN_THREAD_EM_ASM({
-        postMessage({cmd: 'print', txt: '[worker] SI port 0 = GC controller (joypad)'});
-    });
+        postMessage({cmd: 'print', txt: '[worker] SI ports 0..' + ($0 - 1)
+                     + ' = GC controller (joypad), ' + $0 + ' presented'});
+    }, g_player_ports);
     Libretro::Video::ContextReset();
     MAIN_THREAD_EM_ASM({
         postMessage({cmd: 'print', txt: '[worker] video backend ContextReset done'});
