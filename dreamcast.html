@@ -8,26 +8,26 @@
   <script src="/coi-serviceworker.js"></script>
   <!-- The game library's origin. ONE constant for the whole site, so the split
        is revertible by editing a single line — see lib/asset_base.js. -->
-  <script src="/lib/asset_base.js"></script>
+  <script src="/lib/asset_base.js?v=27d8c0a4"></script>
   <script src="/lib/wakelock.js"></script>
   <!-- Shared capability layer: publishes window.__cap in the same shape on all three
        emulator pages so one rig (tools/device_matrix.mjs) can ask each of them the same
        questions. The pinned-facts and share-sheet patterns in this file are what the
        module generalises; it does not replace this page's own probeWebGL2 or its
        [glinfo] pinning, which remain the authority on what the WORKER's context got. -->
-  <script src="/lib/capability.js"></script>
+  <script src="/lib/capability.js?v=e25dca87"></script>
   <script src="/lib/xboxinput.js"></script>
   <!-- Block-gzip disc reader. Shared with the flycast worker shim, which
        importScripts()es this same file, so the eager and lazy paths cannot
        disagree about where a block lives. See tools/bgzip.mjs. -->
-  <script src="/lib/bgz.js"></script>
+  <script src="/lib/bgz.js?v=47820efd"></script>
   <!-- Online co-op. ONE INSTANCE RUNS THE GAME: the host's emulator is the only
        emulator, it streams its picture and sound over WebRTC, and the person who
        joins sends controller state back which the host feeds in as PLAYER 2. The
        emulator is never told any of this is happening — it sees a second pad on
        the same machine. Everything below is guarded on Netplay.supported(): a
        browser without RTCPeerConnection never sees the button at all. -->
-  <script src="/lib/netplay.js"></script>
+  <script src="/lib/netplay.js?v=055f3e69"></script>
   <script>
     // NEVER PRESENT AN ENABLED START BEHIND A BROKEN PATH. Gates BOTH Start
     // controls (#btnStart and the mobile splash's #mobileSplashStart — the phone
@@ -6456,13 +6456,24 @@
               // The barrier's own readiness is what "ready" means here, not a
               // local flag: a machine that has finished downloading but has not
               // been admitted past the barrier is NOT ready.
-              ready: (r.state === 'running' || r.state === 'stalled'),
+              // ⚠ DECLARED counts, not just RELEASED. This read only
+              // `r.state === 'running' || 'stalled'` — but declareReady() puts
+              // the engine in 'waiting', so a peer that had successfully
+              // declared still drew as NOT READY until the barrier released,
+              // and the barrier only releases once everyone is ready. The
+              // player presses Ready, the row does not change, presses again.
+              ready: (r.state === 'running' || r.state === 'stalled' || !!r.declaredReady),
               loadPct: netLocalLoad(),
             },
             peers: seats.filter((q) => q && q.peer && !q.local).map((q) => ({
               id: q.peer, name: q.peer, port: q.port,
               connected: !q.dropped,
-              ready: (r.state === 'running' || r.state === 'stalled'),
+              // The host's barrier already computes who it is still waiting on
+              // and broadcasts it; readyPeers is that list inverted. Falling
+              // back to the state keeps this correct on a build whose engine
+              // does not report it.
+              ready: (r.state === 'running' || r.state === 'stalled' ||
+                      (Array.isArray(r.readyPeers) && r.readyPeers.indexOf(q.peer) >= 0)),
               loadPct: null,
               frame: r.frame, rttMs: null,
               stalling: (r.state === 'stalled') && LSWAIT.ports.indexOf(q.port) >= 0,
