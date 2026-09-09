@@ -152,6 +152,7 @@ const hud = (pg) => pg.evaluate(() => {
   return {
     text: h.text || '',
     fault: h.fault || null,            // absent on the pre-change build
+    relayMode: h.relayMode || null,    // transport relay, not the TURN config
     faultShown: !!h.faultShown,
     relay: h.relay || null,
     visible: !!h.visible,
@@ -247,6 +248,53 @@ async function armCannotConnect() {
     'the HUD says no relay is configured — the difference between a room that works across two houses and one that does not',
     'the HUD does not say whether a relay is configured. relay=' + J(h.relay) + ' text=' + J(h.text.slice(0, 160)));
 
+  // ---- RELAY MODE SUPERSEDES THE FAULT ------------------------------------
+  // lib/netplay.js (owned by another session) can fall back to carrying pad
+  // bytes over the SIGNALLING WebSocket when the game link cannot open. That
+  // turns this exact scenario from "the room is over" into "the room is slower"
+  // — so the CANNOT CONNECT banner, correct a moment ago, must yield.
+  //
+  // ⚠ THE ENGINE SIDE IS NOT IN THE TREE YET, so the relay object is STUBBED
+  // here through the very accessor the engine will implement (relayInfo() /
+  // relayNotice()). This asserts THIS PAGE'S half of the contract — which is
+  // the half that can be wrong before the other half exists. When the engine
+  // lands, the real object flows through the identical code path.
+  const stub = async (pg, timings) => pg.evaluate((t) => {
+    const S = (window.Netplay && window.Netplay.sessions) || [];
+    const s = S[S.length - 1]; if (!s) return false;
+    s.relayInfo = () => ({ active: true, path: 'wss', peers: 1,
+                           oneWayMs: t.oneWayMs, delayFrames: t.delayFrames });
+    s.relayNotice = () => 'This room is on a relay. It is playable, but it is not a direct link.';
+    return true;
+  }, timings);
+
+  // (a) engaged, but no round trip has completed yet -> both timings null
+  await stub(hostPg, { oneWayMs: null, delayFrames: null });
+  await sleep(1200);
+  const rNull = await hud(hostPg);
+  say('    relay(null timings) HUD: ' + J(rNull.text.slice(0, 190)));
+  cell(/VIA RELAY/.test(rNull.text) && !/CANNOT CONNECT/.test(rNull.text),
+    'A5-relay-mode-SUPERSEDES-the-cannot-connect-banner',
+    'the room fell back to a relay and the HUD stopped calling it a failure — it is slower, not over',
+    'CANNOT CONNECT is still shown over a room that is working via a relay, which is a false alarm ' +
+    'of exactly the class this panel was fixed to stop raising: ' + J(rNull.text.slice(0, 200)));
+  // ⚠ 0 WOULD READ AS "NO PENALTY" WHEN THE TRUTH IS "NOT MEASURED YET".
+  cell(/one way\s*—/.test(rNull.text) && /controls behind\s*—/.test(rNull.text) && !/0 ms/.test(rNull.text),
+    'A6-unmeasured-relay-delay-renders-as-a-dash-not-zero',
+    'both timings render as "—" before the first round trip completes',
+    'an unmeasured relay delay rendered as 0 (or not at all). 0 ms claims there is no penalty, which is ' +
+    'the opposite of "we have not measured it yet": ' + J(rNull.text.slice(0, 200)));
+
+  // (b) the first round trip lands
+  await stub(hostPg, { oneWayMs: 48, delayFrames: 6 });
+  await sleep(1200);
+  const rNum = await hud(hostPg);
+  say('    relay(measured) HUD:     ' + J(rNum.text.slice(0, 190)));
+  cell(/48 ms/.test(rNum.text) && /6 frames/.test(rNum.text),
+    'A7-a-measured-relay-delay-is-shown-in-frames-and-ms',
+    'the relay cost is shown in the unit a player feels: 48 ms one way, controls 6 frames behind',
+    'a measured relay delay was not rendered: ' + J(rNum.text.slice(0, 200)));
+
   await b.close(); browsers.splice(browsers.indexOf(b), 1);
 }
 
@@ -269,6 +317,10 @@ async function armNoFalseAlarm() {
   cell(h.state === 'connected' && g.state === 'connected', 'B1-the-ordinary-room-still-connects',
     'both sides reached connected through the real Allow control — the fault path did not break pairing',
     'pairing itself regressed: host=' + J(h.state) + ' guest=' + J(g.state));
+  cell(!/VIA RELAY/.test(h.text) && !/VIA RELAY/.test(g.text) && !h.relayMode && !g.relayMode,
+    'B3-a-direct-room-shows-no-relay-row',
+    'a normal direct room draws no relay row at all — the relay fields are null and nothing is claimed',
+    'a direct room claimed to be on a relay: ' + J([h.relayMode, g.relayMode]));
   cell(!h.fault && !g.fault, 'B2-no-fault-is-invented-on-a-healthy-room',
     'neither side raised a fault',
     'a healthy room raised a fault — a false alarm is the same class of bug as the silence it replaced. ' +

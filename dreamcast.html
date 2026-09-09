@@ -6,6 +6,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <link rel="icon" href="data:,">
   <script src="/coi-serviceworker.js"></script>
+  <!-- The game library's origin. ONE constant for the whole site, so the split
+       is revertible by editing a single line — see lib/asset_base.js. -->
+  <script src="/lib/asset_base.js"></script>
   <script src="/lib/wakelock.js"></script>
   <!-- Shared capability layer: publishes window.__cap in the same shape on all three
        emulator pages so one rig (tools/device_matrix.mjs) can ask each of them the same
@@ -492,6 +495,10 @@
        failure it is, in the same register as the stalling case below. */
     #netHud.fault .mode { color: #ff7b72; }
     #netHud.netfault { border-color: #8c2b22; background: rgba(58,10,6,.92); }
+    /* RELAY MODE is a WORKING room that is slower — amber, like stalling, and
+       deliberately NOT the red of a fault. */
+    #netHud.relay { border-color: #9e6a03; }
+    #netHud .mode.relay { color: #ffa657; }
     #netHud .warn { color: #ffa657; font-weight: 700; }
     /* STALLING IS ITS OWN COLOUR, not a word buried in a line. A player whose
        game has stopped needs to know in one glance that it stopped BECAUSE OF
@@ -5401,6 +5408,41 @@
         + 'one you or your host provides.';
   }
 
+  // ---- RELAY MODE: the room still works, it just travels differently ------
+  // lib/netplay.js (owned by another session) can carry pad bytes over the
+  // SIGNALLING WebSocket when the game RTCPeerConnection cannot open — the same
+  // ICE_CONNECT_MS path whose message used to mean "this room is over". It now
+  // means "this room changed how it travels", which is a different sentence and
+  // has to read as one.
+  //
+  // ⚠ EVERY ACCESSOR IS OPTIONAL AND TRIED IN ORDER. This page must render
+  // correctly BOTH before that engine change lands (every accessor absent, so
+  // this returns null and nothing below draws) and after. roomInfo().relay is
+  // the cheapest seam the engine offers; relayInfo() returns the same object;
+  // session.relay is the raw field. A missing one costs this row, never the panel.
+  function netRelayMode() {
+    const s = NET.session;
+    if (!s) return null;
+    let r = null;
+    try { if (typeof s.roomInfo === 'function') { const ri = s.roomInfo(); r = (ri && ri.relay) || null; } } catch (e) {}
+    if (!r) { try { if (typeof s.relayInfo === 'function') r = s.relayInfo() || null; } catch (e) {} }
+    if (!r) { try { r = s.relay || null; } catch (e) {} }
+    if (!r || !r.active) return null;
+    let notice = null;
+    try { if (typeof s.relayNotice === 'function') notice = s.relayNotice(); } catch (e) {}
+    return {
+      active: true,
+      path: r.path == null ? null : r.path,
+      peers: r.peers == null ? null : r.peers,
+      // ⚠ NULL IS NOT ZERO, AND THE DIFFERENCE IS THE WHOLE POINT. These are
+      // null until the first round trip completes. Rendering 0 would read as
+      // "no penalty" when the truth is "not measured yet" — the opposite claim.
+      oneWayMs: (typeof r.oneWayMs === 'number') ? r.oneWayMs : null,
+      delayFrames: (typeof r.delayFrames === 'number') ? r.delayFrames : null,
+      notice: notice || r.notice || null,
+    };
+  }
+
   // Every one of these is a thing the ENGINE already names and the page used to
   // throw away. Registered on both the host and the guest session.
   function netAttachFaultHandlers(s) {
@@ -5418,6 +5460,16 @@
     // 'warning'/'failed', and they arrive with a message that names the cure.
     try { s.on('peer-left', (e) => pageLog('[net] a player left: ' + ((e && e.why) || 'closed'))); } catch (e) {}
     try { s.on('reject', (e) => pageLog('[net] a caller was refused: ' + ((e && e.why) || '?'))); } catch (e) {}
+    // Relay mode engaging is the room RECOVERING, not failing — it fires when
+    // the fallback takes over and again when the measured delay changes.
+    try {
+      s.on('relay', (e) => {
+        NET.everPeered = true;
+        netClearFault();
+        const d = (e && typeof e.oneWayMs === 'number') ? Math.round(e.oneWayMs) + 'ms one way' : 'delay not measured yet';
+        pageLog('[net] relay mode engaged (' + d + ') — the room carries input over the signalling link');
+      });
+    } catch (e) {}
   }
 
   // A BOUNDED WAIT. "Waiting for players" is honest for the minute a friend
@@ -6047,6 +6099,14 @@
     // starts until everyone is in" while the two browsers had already stopped
     // trying to reach each other. That line is not merely unhelpful there, it
     // is wrong: it tells a player the room is fine and someone else is late.
+    // ⚠ RELAY MODE OUTRANKS THE FAULT, because it is a WORKING room. The ICE
+    // watchdog still reports "one of these networks is blocking direct
+    // peer-to-peer traffic" on its way past, and if that latched while the
+    // session carried on over the relay the panel would be shouting CANNOT
+    // CONNECT over a game people were playing — a false alarm of exactly the
+    // class this panel was fixed to stop raising.
+    const relayMode = safe(() => netRelayMode(), null);
+    if (relayMode) netClearFault();
     const netFault = NET.fault;
     const modeWord = netFault ? 'CANNOT CONNECT'
       : (t.mode === 'lockstep')
@@ -6071,7 +6131,7 @@
     // that does not, and a player told only "cannot connect" has no next step.
     if (netFault) {
       const relay = netRelayInfo();
-      html += '<br><span class="k">relay</span> ' + (relay.configured
+      html += '<br><span class="k">TURN relay</span> ' + (relay.configured
         ? esc(relay.count + ' configured (' + relay.urls.join(', ') + ')')
         : '<span class="warn">none configured</span> <span class="k">· add one in Play Online → '
           + 'Relay server, or with ?turn=…</span>');
@@ -6104,12 +6164,25 @@
         (t.detecting ? ('on, ' + (t.hashesCompared || 0) + ' compared')
                      : '<span class="warn">OFF — nothing is comparing the cores</span>');
     }
+    // WHAT THE RELAY COSTS, in the unit a player feels. Shown whenever relay
+    // mode is on — a slower room the player has not been told about reads as a
+    // broken one.
+    if (relayMode) {
+      const ms = (relayMode.oneWayMs == null) ? '—' : Math.round(relayMode.oneWayMs) + ' ms';
+      const df = (relayMode.delayFrames == null) ? '—'
+        : relayMode.delayFrames + (relayMode.delayFrames === 1 ? ' frame' : ' frames');
+      html += '<br><span class="mode relay">VIA RELAY</span>' +
+        (relayMode.path ? ' <span class="k">' + esc(relayMode.path) + '</span>' : '') +
+        ' <span class="k">· one way</span> ' + esc(ms) +
+        ' <span class="k">· controls behind</span> ' + esc(df);
+      if (relayMode.notice) html += '<br><span class="warn">' + esc(relayMode.notice) + '</span>';
+    }
     if (t.gateFault) html += '<br><span class="warn">⚠ ' + esc(t.gateFault) + '</span>';
     html += roster;
     if (stalled) html += '<br><span class="stall">⏸ ' + stallWhy + '</span>';
 
     el.className = 'on ' + (modeWord === 'LOCKSTEP' ? 'lockstep' : 'fault')
-      + (netFault ? ' netfault' : '') + (stalled ? ' stalling' : '');
+      + (netFault ? ' netfault' : '') + (relayMode ? ' relay' : '') + (stalled ? ' stalling' : '');
     if (html !== HUD.text) { el.innerHTML = html; HUD.text = html; }
     HUD.stalled = stalled; HUD.stallWhy = stallWhy; HUD.waitingOn = waitNames;
   }
@@ -6314,7 +6387,8 @@
     // cross-network arm has to be able to make.
     fault: NET.fault ? { text: NET.fault.text, kind: NET.fault.kind } : null,
     faultShown: !!($('netHud') && $('netHud').classList.contains('netfault')),
-    relay: netRelayInfo(),
+    relay: netRelayInfo(),          // TURN/ICE config — "is a relay CONFIGURED"
+    relayMode: safe(() => netRelayMode(), null),  // transport — "is the room ON a relay"
     everPeered: NET.everPeered,
     roomAgeMs: NET.roomAt ? Date.now() - NET.roomAt : null,
   });
