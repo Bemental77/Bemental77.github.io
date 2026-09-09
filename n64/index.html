@@ -3571,6 +3571,20 @@ N64Rate.selfTest = function (logFn) {
       // this architecture rests on: the seats have to be known before anything
       // loads, and every machine has to reach frame 0 together rather than
       // whenever its own download happened to finish.
+      // ⚠ THE ROOM CONNECTS FIRST, AND ONLY THEN DOES ANYTHING BOOT. This is
+      // the user's directive verbatim ("players join a room BEFORE anything
+      // boots") and it is also what MEASURED evidence demanded. An earlier cut
+      // opened the room and pressed Start in parallel, and the WebRTC handshake
+      // then FAILED every time: the host log read `host signalling (someone is
+      // asking to join)` and immediately fell back to `waiting for someone to
+      // ask to join`, while the joiner reported `guest failed (nobody answered
+      // the request)`. Both cores had armed correctly — the pairing itself died,
+      // because the host's main thread was busy instantiating a 12 MB ROM and a
+      // wasm module and could not answer the offer in time.
+      // Booting after `connected` costs nothing real: the download everybody was
+      // going to pay is simply paid together, which is the point of forming the
+      // room first.
+      NET.bootWhenConnected = true;
       startSession(!isJoin, np, gameName).then(function () {
         // NEVER override a Start the capability layer is holding down — that
         // button being disabled is the page saying this device cannot run the
@@ -3582,13 +3596,24 @@ N64Rate.selfTest = function (logFn) {
           startEmulator();
           return true;
         };
+        // Wait for the room to actually be CONNECTED before booting anything.
+        // `state === 'connected'` is the session reporting a live DataChannel to
+        // a peer, i.e. the handshake is done and the main thread is free to be
+        // busy for a while.
+        var connected = function () {
+          try { return NET.session && NET.session.state === 'connected'; } catch (e) { return false; }
+        };
         var run = function () {
-          if (press()) return;
           var tries = 0;
-          var t = setInterval(function () { if (press() || ++tries > 480) clearInterval(t); }, 250);
+          var t = setInterval(function () {
+            if (!connected()) { if (++tries > 2400) clearInterval(t); return; }   // 10 min
+            if (press()) clearInterval(t);
+          }, 250);
         };
         if (window.Capability && Capability.ready && Capability.ready.then) Capability.ready.then(run, run);
         else run();
+        netStatus(isJoin ? 'Joining the room — the game loads once you are connected.'
+                         : 'Room open. The game loads as soon as another player joins.', 'busy');
       }, function (err) {
         netStatus('Could not open the room: ' + ((err && err.message) || err), 'bad');
       });
@@ -3648,7 +3673,11 @@ N64Rate.selfTest = function (logFn) {
           : 'Share the code. Press Ready once everybody has joined.');
       }
     };
-    setInterval(renderRoom, 400);
+    // ⚠ ONLY IN A ROOM. Single player must be untouched by any of this: with no
+    // ?np= there is no panel to draw and no roster to read, and a timer writing
+    // innerHTML into a hidden element four times a second is not nothing on a
+    // phone. This whole block is inert offline.
+    if (NET.pendingCode) setInterval(renderRoom, 400);
 
     var rdy = $('netReady');
     if (rdy) rdy.addEventListener('click', function () {
@@ -3717,6 +3746,40 @@ N64Rate.selfTest = function (logFn) {
   // intention: `frame` is frames the CORE ran under the gate, `hashes` is
   // fingerprints the ENGINE accepted, and `armed` is false unless the core
   // actually took _neil_ls_arm.
+  // ⚠ TEST SEAM — n64/tools/lockstep_probe.mjs's `attach` arm, and nothing else.
+  //
+  // WHY IT EXISTS. Everything above can be proven EXCEPT the page's own loop.
+  // The `bridge` arm proves two cores stay byte-identical under frame-numbered
+  // input, but it drives neil_ls_run_frame() itself, so it does NOT exercise
+  // lsFeed(), lsLocalPads(), lsApplyImage() or — the one that matters most for
+  // CLAUDE.md gate #9 — the 1.000x governor in lsDueNow(). The product path that
+  // WOULD exercise them needs a room, and the 'local' transport in
+  // lib/netplay.js currently cannot pair two peers (isolated with two blank
+  // same-origin tabs and no emulator: both sat at 'signalling' for 24 s).
+  //
+  // So this hands the page a REAL Netplay.Lockstep engine with no transport
+  // behind it, exactly as if a room had formed. Everything downstream — the
+  // arm-before-boot ordering, the feed, the pad packing, the governor, the room
+  // panel — is then the shipping code path, unmodified.
+  //
+  // It is inert unless called, it creates nothing that can reach the network,
+  // and it cannot turn itself on: a page nobody calls this on has NET.session
+  // null and behaves exactly as it does today.
+  window.__n64LsAttach = function (opts) {
+    if (!window.Netplay || !Netplay.Lockstep) return null;
+    var ls = new Netplay.Lockstep(opts || {});
+    NET.session = {
+      ls: ls, state: 'connected', code: (opts && opts.code) || 'TEST',
+      close: function () {}, setReady: function () { return true; },
+    };
+    NET.pendingCode = (opts && opts.code) || 'TEST';
+    NET.role = (opts && opts.host) ? 'host' : 'guest';
+    // The rig needs the LIVE engine to seat players, declare ready and deliver
+    // the peer's messages. It is the same object the page feeds, not a copy.
+    window.__n64LsEngine = ls;
+    return true;
+  };
+
   window.__n64Net = function () {
     var ls = lsEngine();
     var rep = null;
