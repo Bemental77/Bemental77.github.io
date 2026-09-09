@@ -3,12 +3,18 @@
 <head>
   <script src="/lib/capability.js"></script>
   <script src="/lib/xboxinput.js"></script>
-  <!-- ONLINE CO-OP. Both are inert unless Netplay.supported(); netplay-host.js
-       additionally does nothing at all without ?np=<code> in the URL, which is
-       what ps1_multiplayer.html hands over. The lobby is NOT here — see the
-       ONLINE CO-OP block near the end of this page. -->
-  <script src="/lib/netplay.js"></script>
-  <script src="/lib/netplay-host.js"></script>
+  <!-- ⚠ NO NETPLAY SCRIPTS ARE LOADED HERE, ON PURPOSE.
+       /lib/netplay-host.js is the host half of STREAMING — it captures this
+       canvas with captureStream(), interposes on the audio graph, and publishes
+       both over WebRTC. Streaming is cancelled by user directive 2026-09-08
+       ("WE WILL NOT USE STREAMING!").
+       /lib/netplay.js is the LOCKSTEP engine and this core COULD carry it — two
+       real controller ports, and _one_iter() is a genuine one-frame call — but
+       the core drives its own loop from inside wasm, so there is no seam for a
+       frame gate yet and no determinism measurement to rest one on. Opening a
+       room over an unmeasured core would produce two consoles that silently
+       diverge. See the ONLINE PLAY block near the end of this page for the
+       scoped job. -->
   <meta charset="UTF-8" />
   <title>PS1 Wasm — Monster Rancher 2</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -106,8 +112,8 @@
     #mobileMenuBox button:last-child { margin-bottom: 0; }
     #mobileMenuBox button:disabled { opacity: 0.4; }
     /* SHORT VIEWPORT — a phone in LANDSCAPE is ~390 px tall, and this single
-       column of entries is taller than that, so the last ones (Play Online and
-       Close among them) sat BELOW THE FOLD with a centred flex item's top edge
+       column of entries is taller than that, so the last ones sat BELOW THE
+       FOLD with a centred flex item's top edge
        clipped and unscrollable. Two columns fit, and #mobileMenu scrolls now as
        a backstop. Measured before this: #mNet rect top=434 in a 390 px
        viewport, elementFromPoint at its centre returned a different button. */
@@ -128,7 +134,7 @@
        device was in portrait. MEASURED on dreamcast.html at 390x844 with the
        core running: document.elementFromPoint at the centre of #mobileMenuBtn
        returned #rotateHint, and the hint measured rect=0,0,390x844 — the menu
-       button, START, the d-pad, the face buttons and Play Online were ALL
+       button, START, the d-pad and the face buttons were ALL
        unreachable in portrait. Four of the six pages had no dismiss gesture at
        all, so on those it was a permanent lock-out, not a nuisance.
        It is now a small pill that CANNOT intercept a touch (pointer-events:
@@ -213,9 +219,6 @@
     <button id="btnMute" disabled>🔊 Mute</button>
     <button id="btnResetAudio" disabled>↻ Reset Audio</button>
     <button id="btnFull" disabled>⛶ Fullscreen</button>
-    <!-- hidden until Netplay.supported() proves the browser can do it: a control
-         that does nothing when pressed reads as "the site is broken". -->
-    <button id="btnNet" type="button" hidden>👥 Play Online</button>
     <button id="btnLog" type="button">Toggle Log</button>
   </div>
   <div id="canvasWrap"><canvas id="canvas" width="640" height="480"></canvas></div>
@@ -230,7 +233,6 @@
     <label for="mobileRomSelect">Choose a game</label>
     <select id="mobileRomSelect"></select>
     <button id="mobileSplashStart" type="button">Start</button>
-    <button id="mobileSplashNet" type="button" hidden style="min-width:0;padding:8px 14px;font-size:13px;background:#1d1d1d;border-color:#333;color:#aaa">👥 Play Online</button>
     <p class="rotateTip">Rotate to landscape for the best view.</p>
   </div>
   <div id="mobileScreen"></div>
@@ -428,21 +430,22 @@
     // returning PSE_PAD_USE_PORT1|PSE_PAD_USE_PORT2 (:63-65). Port 2's slot has
     // been crossing the wire all along with nothing written into it.
     //
+    // ⚠ PORT 2 IS WRITTEN NEUTRAL, UNCONDITIONALLY. It used to carry a STREAMING
+    // guest's pad relayed through lib/netplay-host.js; streaming is cancelled
+    // (user directive 2026-09-08) and nothing writes a remote player here any
+    // more. The write itself STAYS, because these bytes are STICKY — leaving
+    // them alone would freeze whatever was last stored on controller 2.
     // ⚠ KeyStatus IS ACTIVE-LOW — 0xFFFF at rest, and a press CLEARS a bit
-    // (plugins/sdlinput/xkb.c:43 `KeyStatus &= ~(1 << j)`). The wire mask is
-    // active-high, so the inversion happens HERE, in one place, next to the note
-    // that explains it. It is also written unconditionally: with nobody
-    // connected both bytes go back to 0xFF, so a guest who disconnects mid-jump
-    // cannot leave a button held on port 2.
+    // (plugins/sdlinput/xkb.c:43 `KeyStatus &= ~(1 << j)`), so 0xFF/0xFF is
+    // "no buttons held", not "all buttons held".
     if (padStatus2) {
-      var _host = window.NetplayHost;
-      var _rm = _host ? _host.remoteMask() : null;
       var c0 = 0xFF, c1 = 0xFF;
-      if (_rm !== null) { c0 = (~_rm) & 0xFF; c1 = (~(_rm >> 8)) & 0xFF; }
       Module.HEAPU8[padStatus2 + 6] = c0; Module.HEAPU8[padStatus2 + 7] = c1;
-      // The literal bytes the core was handed, kept so the netplay test can
-      // assert on THOSE rather than on a session flag or a UI state.
-      if (_host) _host.report([b0, b1], [c0, c1]);
+      // The literal bytes the core was handed, kept so a test can assert on
+      // THOSE rather than on a UI state. These used to go out through
+      // NetplayHost.report(); they are published directly now.
+      window.__ps1SentP1 = [b0, b1];
+      window.__ps1SentP2 = [c0, c1];
     }
   }
 
@@ -626,10 +629,9 @@
 
   function pollController() {
     if (!pcsx_worker) return;
-    // No-ops unless netplay fell back to a mirror canvas (it does not here — the
-    // canvas is main-thread and captures directly — but the fallback must still
-    // be fed if it ever wins).
-    if (window.NetplayHost) NetplayHost.pumpMirror();
+    // ⚠ NOTHING IS MIRRORED OR CAPTURED HERE ANY MORE. This used to pump a mirror
+    // canvas for the streaming host to captureStream(). Streaming is cancelled;
+    // this page draws for its own viewer and nobody else.
     Module._CheckJoy(); Module._CheckKeyboard(); updatePadState();
     var src = Module.HEAPU8.subarray(padStatus1, padStatus1 + 48);
     var arr; while (states_arrs.length > 50) states_arrs.pop();
@@ -1053,81 +1055,78 @@
   document.addEventListener('touchstart', function (e) { if (e.target.closest('.faceBtn, .shoulderBtn, .dpadV, .dpadH, .sysBtn, .menuBtn')) {} }, { passive: true });
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // ONLINE CO-OP — THE HOST HALF, AND NOTHING ELSE.
+  // ONLINE PLAY IS NOT WIRED ON THIS PAGE YET — AND UNLIKE snes/gba, THAT IS A
+  // JOB, NOT A LIMIT.
   //
-  // THE MODEL: ONE INSTANCE RUNS THE GAME. This page's emulator is the only
-  // emulator. It streams its picture and its sound over WebRTC and the guest
-  // sends controller state back, which lands in port 2 (see updatePadState).
+  // WHAT WAS HERE. Until 2026-09-08 this page was the host half of a STREAMING
+  // session: it captured its own canvas and audio, published them over WebRTC,
+  // and dropped a remote player's buttons into CONTROLLER PORT 2. The user
+  // cancelled streaming outright ("WE WILL NOT USE STREAMING!") and specified
+  // deterministic lockstep instead: every player runs their own core and only
+  // pad bytes cross the wire.
   //
-  // THE LOBBY IS NOT HERE. It is ps1_multiplayer.html, because a GUEST needs no
-  // core and no disc — and the discs here are the largest on the site, up to
-  // 731,911,824 bytes in nine gzipped parts. Pairing on THIS page would make
-  // both players download one. So the party forms there and only the HOST is
-  // sent back carrying ?np=<code>&game=<label>. The button below is a link to
-  // that page, not a lobby.
+  // WHY THIS CORE CAN CARRY LOCKSTEP. Everything the architecture needs is
+  // already here, which is NOT true of snes.html or gba.html:
+  //   * TWO REAL PORTS. plugins/sdlinput/pad.h:126 `PADSTATE PadState[2]`, and
+  //     the SIO picks the port from the guest's own control register
+  //     (libpcsxcore/sio.c: `CtrlReg & 0x2002` selects PAD1_startPoll(1) or
+  //     PAD2_startPoll(2)). This page already writes both, at a 24-byte stride.
+  //   * A REAL ONE-FRAME CALL. `_one_iter()` runs exactly one frame — its CPU
+  //     loop is `while (!DoGPUUpdate) execI();` and the scanline counter raises
+  //     DoGPUUpdate at end-of-frame — and it is already exported
+  //     (Makefile.modern: WORKER_EXPORT=..._one_iter...).
+  //   * NO GUEST-VISIBLE HOST CLOCK that I could find: the BIOS rand() HLE is an
+  //     LCG seeded from GUEST RAM (psxbios.c), so it is deterministic and is
+  //     captured by savestates, and the CD shell-open time() branch is dead
+  //     because SetCdOpenCaseTime() has no callers.
+  //
+  // WHAT STANDS IN THE WAY, PRECISELY. The core DRIVES ITSELF. `_one_iter()`
+  // ends with an EM_ASM that calls `_scheduleMainLoop(delay)`, a MessageChannel
+  // /setTimeout hop in the worker's post-JS which calls `pcsx_mainloop()` which
+  // calls `_one_iter()` again. The page never asks for a frame at all — it only
+  // pushes pad bytes on an 8 ms setTimeout and receives rendered frames. So the
+  // frame gate has nowhere to stand: there is no point at which this page can
+  // decide whether frame N may run.
+  //
+  // THE SCOPED JOB, so this is a plan and not a wish:
+  //   1. In the worker, replace `globalThis._scheduleMainLoop` with a no-op and
+  //      drive `_one_iter()` from a message the page sends per gated frame.
+  //      `_scheduleMainLoop` is plain post-JS, NOT baked into the wasm, so this
+  //      needs no rebuild of the core.
+  //   2. Move the pad write from the 8 ms poll into that per-frame message, so
+  //      input is a function of the emulated frame index rather than of wall
+  //      time — the same change that made the Genesis rig able to answer a
+  //      determinism question at all.
+  //   3. THEN MEASURE, before believing any of it: write the ps1 analogue of
+  //      tools/genesis_determinism_probe.mjs and show two independent cores
+  //      staying byte-identical from a cold boot. The `updated_display` frame
+  //      limiter (plugins/dfxvideo/fps.c) derives its delay from gettimeofday
+  //      and gates a deferred `EmuUpdate()`, so it is the first thing that
+  //      would have to be shown not to move guest state.
+  //   4. Only then copy genesis.html's room and frame gate.
+  //
+  // ⚠ UNTIL STEP 3 HAS A RESULT, THIS PAGE OFFERS NO ONLINE PLAY. The button is
+  // removed rather than left pointing at a lobby that streams, and no room can
+  // be opened: shipping a frame gate over an unmeasured core would produce two
+  // consoles that silently diverge, which is worse than no online play because
+  // it looks like it is working.
   // ═══════════════════════════════════════════════════════════════════════════
-  (function wireNetplay() {
-    if (!window.NetplayHost || !NetplayHost.supported()) return;
-    var go = function () {
-      var sel = isMobile ? $('mobileRomSelect') : $('romSelect');
-      var pick = ROMS[+(sel && sel.value) || 0] || ROMS[0];
-      location.href = NetplayHost.lobbyUrl('/ps1_multiplayer.html', pick.label);
+
+  // The page's liveness seam. NOT a netplay seam any more, and it does not
+  // pretend to be one. `live` is kept because tools/mobile_chrome_test.mjs uses
+  // it as its "the emulator is actually running" witness.
+  window.__ps1Net = function () {
+    return {
+      supported: false,
+      reason: 'the PS1 core drives its own frame loop from inside wasm '
+            + '(_one_iter -> _scheduleMainLoop), so there is no seam for a frame gate yet; '
+            + 'see the ONLINE PLAY block in ps1.html for the scoped job',
+      mode: 'none',
+      live: renderFrames > 0 || (window.__ps1Frames | 0) > 0,
+      sentP1: window.__ps1SentP1 || null,
+      sentP2: window.__ps1SentP2 || null,
     };
-    ['btnNet', 'mobileSplashNet'].forEach(function (id) {
-      var b = $(id); if (!b) return;
-      b.hidden = false;
-      b.addEventListener('click', go);
-    });
-    NetplayHost.arm({
-      seam: '__ps1Net',
-      players: 'p2',
-      log: function (m) { pageLog(m); },
-      canvas: function () { return $('canvas'); },
-      // "Is there a game to stream?" answered by FRAMES, not by a start flag:
-      // `started` is set the instant Start is pressed, long before the runtime
-      // exists, and capturing then would publish a black canvas.
-      live: function () { return renderFrames > 0; },
-      // The CPU + pad wire, which is a DIFFERENT question and is the one player
-      // 2 actually depends on: padStatus1 means the pointer table has been read
-      // and pcsx_worker means the 48-byte pad message has somewhere to go.
-      coreUp: function () { return !!(padStatus1 && pcsx_worker); },
-      // The disc is named by its LABEL, never by its index into ROMS. CLAUDE.md
-      // records an index going stale exactly this way.
-      selectGame: function (label) {
-        for (var i = 0; i < ROMS.length; i++) {
-          if (ROMS[i].label !== label) continue;
-          ['romSelect', 'mobileRomSelect'].forEach(function (id) {
-            var sel = $(id); if (!sel) return;
-            sel.value = String(i);
-            sel.dispatchEvent(new Event('change'));
-          });
-          return label;
-        }
-        return null;
-      },
-      // ⚠ NEVER override a Start the capability layer is holding down: that
-      // button being disabled means the page has decided this device cannot run
-      // the emulator, and clicking past it is the exact bug the gate exists to
-      // stop. lib/capability.js decides AFTER this script runs, so this waits
-      // for Capability.ready rather than reading a decision that has not been
-      // made yet — a race that would let a handoff boot a gated device.
-      pressStart: function () {
-        var attempt = function () {
-          var b = $('btnStart');
-          if (!b || b.disabled || b.getAttribute('aria-disabled') === 'true') {
-            pageLog('[net] Start is held down — not overriding it');
-            return;
-          }
-          if (isMobile) { var sp = $('mobileSplash'); if (sp) sp.style.display = 'none'; }
-          startEmulator();
-        };
-        if (window.Capability && Capability.ready && Capability.ready.then) {
-          Capability.ready.then(function () { setTimeout(attempt, 0); }, function () { setTimeout(attempt, 0); });
-        } else setTimeout(attempt, 0);
-      },
-      onStatus: function (e) { if (e.state === 'connected') setStatus('Player 2 connected (controller port 2).'); },
-    });
-  })();
+  };
 })();
 </script>
   <script>

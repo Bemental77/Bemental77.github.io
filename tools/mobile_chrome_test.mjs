@@ -97,17 +97,26 @@ const PAGES = [
     menuBtn: '#mobileMenuBtn', menu: '#mobileMenu', menuOpenClass: 'open',
     menuNet: null, splashNet: null },       // this page has no mobile netplay entry
 
+  // ⚠ splashNet is null since 2026-09-08: ps1.html no longer has an online
+  // button. Streaming was cancelled and this core cannot yet be frame-gated (it
+  // drives its own loop from inside wasm), so the control was REMOVED rather
+  // than left pointing at a lobby that streams. `__ps1Net().live` survives as a
+  // pure liveness witness and still arms this cell.
   { name: 'ps1', url: '/ps1.html',
     shell: '#mobileShell', start: '#mobileSplashStart',
     seam: '__ps1Net', liveField: 'live', liveMs: 240000,
     menuBtn: '#mobileMenuBtn', menu: '#mobileMenu', menuOpenClass: 'open',
-    menuNet: null, splashNet: '#mobileSplashNet' },
+    menuNet: null, splashNet: null },
 
+  // ⚠ splashNet is null since 2026-09-08 — the shipped snes9x_2005 core answers
+  // ONE controller (exports.c S9xReadJoypad returns 0 for every port but 0), so
+  // a lockstep room could seat one person and the button was removed instead of
+  // presenting a control that cannot work.
   { name: 'snes', url: '/snes.html',
     shell: '#mobileShell', start: '#mobileSplashStart',
     seam: '__snesNet', liveField: 'live', liveMs: 180000,
     menuBtn: '#mobileMenuBtn', menu: '#mobileMenu', menuOpenClass: 'open',
-    menuNet: null, splashNet: '#mobileSplashNet' },
+    menuNet: null, splashNet: null },
 
   { name: 'genesis', url: '/genesis.html',
     shell: '#mobileShell', start: '#mobileSplashStart',
@@ -130,7 +139,10 @@ const PAGES = [
     shell: '#spShell', start: '#btnPlayGame',
     seam: '__gbaNet', liveField: 'live', liveMs: 240000,
     menuBtn: '#spMenuBtn', menu: '#spMenuOverlay', menuOpenClass: 'open',
-    menuNet: '#spNetBtn', splashNet: null },
+    // ⚠ menuNet is null since 2026-09-08 — a Game Boy Advance has one KEYINPUT
+    // register and this core implements no link cable, so there is no second
+    // controller to give anybody and #spNetBtn was removed.
+    menuNet: null, splashNet: null },
 
   // The seven lobby pages. They have no emulator, no splash and no hamburger —
   // their whole chrome is the lobby card lib/netplay-guest.js mounts. What can

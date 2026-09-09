@@ -2,227 +2,59 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
-<title>PlayStation — Play Online</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>PS1 — Online play moved</title>
 <!--
-  ps1_multiplayer.html — THE PARTY, AND PLAYER 2'S WHOLE MACHINE.
+  ps1_multiplayer.html — A REDIRECT. THERE IS NOTHING ELSE ON THIS PAGE.
 
-  The sibling of dreamcast_multiplayer.html and gamecube_multiplayer.html, and it
-  exists for the same reason. ONE browser runs an emulator: the host boots the
-  disc, captures its canvas and audio and streams both over WebRTC; the guest
-  sends controller state back and the host drops it into PORT 2. So the GUEST
-  NEEDS NO CORE AND NO DISC — a <video> and a pad.
+  WHAT THIS FILE USED TO BE, AND WHY IT IS GONE.
+  It was player 2's WHOLE MACHINE. Exactly one browser in a session ran an
+  emulator: the host booted the game, captured its canvas and its audio and
+  streamed both over WebRTC, and whoever opened this page sent controller state
+  back and watched a <video>. They needed no core, no ROM and no WebAssembly.
 
-  The saving here is the largest on the site. ps1.html's discs are split, gzipped
-  multi-part images: Metal Gear Solid disc 2 is 731,911,824 bytes across nine
-  parts, and the page reassembles them client-side before it can show anything. A
-  phone or a console browser that only wants to be player 2 should pay none of
-  that, and on a metered connection it often cannot. tools/mp_page_test.mjs
-  asserts that negative directly: ZERO requests under /ps1/ from the guest tab.
+  The user cancelled that architecture outright on 2026-09-08 — "WE WILL NOT USE
+  STREAMING!", "IT WILL BE AS IF MULTIPLAYER ARE ON THE SAME CONSOLE" — in favour
+  of deterministic lockstep: every player runs their own core, only pad bytes
+  cross the wire, and each player's own input is applied locally so it is as
+  immediate as a local console.
 
-  ⚠ THIS CONSOLE REALLY HAS TWO PORTS, AND THE GUEST REALLY IS PLAYER 2.
-  That is not true of every page in this family and it is worth stating where it
-  is. PCSX's pad plugin keeps `g.PadState[2]` and reports
-  PSE_PAD_USE_PORT1|PSE_PAD_USE_PORT2 (ps1/ps1Wasm/pcsx-wasm-src/plugins/sdlinput/
-  pad_worker.c:63-65); PADstartPoll(2) sets CurPad = 1 and PADpoll reads
-  g.PadState[1].KeyStatus (pad_worker.c:126-130, :213-217); and ps1.html already
-  computes `padStatus2 = Module._get_ptr(2)` and already copies 48 bytes — BOTH
-  PADSTATE entries — to the emulator worker every 8 ms. Port 2's slot was simply
-  never filled. The host arm fills it.
+  Under lockstep THERE IS NO SECOND KIND OF MACHINE. Everybody runs the same
+  emulator page, so a separate "guest" page has nothing left to be. ps1.html does not offer online play at present — the PS1 core drives its own frame loop
+  from inside wasm, so there is no seam for a frame gate yet. The block at the end of ps1.html
+  states the scoped job and the measurement it has to pass first.
 
-  WHAT EACH SIDE DOES
-    HOST  picks a disc, is given a code, and is handed to
-          ps1.html?np=<code>&game=<label>. That page selects the disc, presses
-          its own Start, waits for the core to come up, and then hosts under THAT
-          EXACT CODE. No session is opened here for a host: navigating away would
-          tear down the RTCPeerConnection and leave a paired guest holding a code
-          that leads nowhere.
-    GUEST stays here. lib/netplay.js's guest retries 'peer-unavailable' rather
-          than failing, so joining while the host is still downloading three
-          quarters of a gigabyte is the normal case, not a race.
-
-  NO coi-serviceworker.js ON PURPOSE — cross-origin isolation buys
-  SharedArrayBuffer, which this page has no use for, and its registration forces
-  a reload that has produced phantom "Execution context destroyed" failures in
-  the rigs. If a sibling page already registered it this page is isolated anyway
-  and still works: that worker stamps Cross-Origin-Resource-Policy: cross-origin
-  onto what it proxies, which is what lets lib/netplay.js load the PeerJS broker
-  under COEP.
+  ⚠ IT IS A REDIRECT RATHER THAN A DELETION so that a link or a QR code someone
+  already shared still lands somewhere useful instead of a 404. Any ?np=<code>
+  is carried through, because that is what an invitation looks like.
 -->
-<script src="/lib/netplay.js"></script>
-<script src="/lib/netplay-ui.js"></script>
-<script src="/lib/netplay-guest.js"></script>
 <style>
-  /* Only this console's own controls. The shell's CSS lives in
-     lib/netplay-guest.js, because it is the same on every page. */
-  #face { width: 176px; height: 176px; }
-  #tTriangle { left: 58px; top: 0;    width: 60px; height: 60px; }
-  #tSquare   { left: 0;    top: 58px; width: 60px; height: 60px; }
-  #tCircle   { right: 0;   top: 58px; width: 60px; height: 60px; }
-  #tCross    { left: 58px; top: 116px; width: 60px; height: 60px; }
-  #tL1 { position: absolute; left: max(14px, env(safe-area-inset-left)); bottom: 226px; width: 74px; height: 42px; }
-  #tL2 { position: absolute; left: max(14px, env(safe-area-inset-left)); bottom: 178px; width: 74px; height: 42px; }
-  #tR1 { position: absolute; right: max(14px, env(safe-area-inset-right)); bottom: 226px; width: 74px; height: 42px; }
-  #tR2 { position: absolute; right: max(14px, env(safe-area-inset-right)); bottom: 178px; width: 74px; height: 42px; }
-  #tStart  { position: absolute; left: 50%; margin-left: 4px;   bottom: max(18px, env(safe-area-inset-bottom)); width: 86px; height: 40px; }
-  #tSelect { position: absolute; left: 50%; margin-left: -94px; bottom: max(18px, env(safe-area-inset-bottom)); width: 86px; height: 40px; }
+  html,body{margin:0;height:100%;background:#111;color:#ddd;
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    display:flex;align-items:center;justify-content:center;text-align:center}
+  div{max-width:34rem;padding:24px}
+  a{color:#8cf}
 </style>
 </head>
 <body>
+<div>
+  <p>Taking you to <a id="go" href="/ps1.html">the PS1 emulator</a>…</p>
+  <p style="color:#888;font-size:13px">Online play now runs on the emulator page itself —
+     every player runs their own console.</p>
+</div>
 <script>
-'use strict';
-(function () {
-  // ===========================================================================
-  // PLAYER 2'S CONTROLLER
-  //
-  // ⚠ WIRE FORMAT SHARED WITH ps1.html — do not drift. lib/netplay.js's sendPad
-  // carries ONE int32. The bits below are the core's own DKEY indices, verbatim
-  // from ps1/ps1Wasm/pcsx-wasm-src/plugins/sdlinput/pad.h:55-72, so the host has
-  // no translation table to get wrong: bit N set here means DKEY N pressed.
-  //
-  // ⚠ THE CORE'S REGISTER IS ACTIVE-LOW and this mask is ACTIVE-HIGH. KeyStatus
-  // is 0xFFFF at rest and a PRESS CLEARS a bit (xkb.c:43 `KeyStatus &= ~(1<<j)`).
-  // Sending the register value itself would make "nothing pressed" the int32 -1
-  // and "connected but idle" indistinguishable from a torn packet, so the wire
-  // carries presses and ps1.html's updatePadState does the inversion in one place.
-  //
-  // The analog sticks are deliberately NOT in the mask: this page's pad is
-  // digital (PadMode stays 0, PadID 0x41) exactly as ps1.html's own pad is, and
-  // sending stick bytes the host would have to ignore is a format that lies.
-  // ===========================================================================
-  const D = { SELECT: 0, L3: 1, R3: 2, START: 3, UP: 4, RIGHT: 5, DOWN: 6, LEFT: 7,
-              L2: 8, R2: 9, L1: 10, R1: 11, TRIANGLE: 12, CIRCLE: 13, CROSS: 14, SQUARE: 15 };
-  // Keyboard, copied VERBATIM from ps1.html's own KEYMAP so muscle memory carries
-  // between the two pages: d-pad on the arrows, cross z, circle x, square s,
-  // triangle d, L1 w, R1 r, L2 e, R2 t, Start v, Select c.
-  const KEYMAP = {
-    [D.UP]: ['arrowup'], [D.DOWN]: ['arrowdown'],
-    [D.LEFT]: ['arrowleft'], [D.RIGHT]: ['arrowright'],
-    [D.CROSS]: ['z'], [D.CIRCLE]: ['x'], [D.SQUARE]: ['s'], [D.TRIANGLE]: ['d'],
-    [D.L1]: ['w'], [D.R1]: ['r'], [D.L2]: ['e'], [D.R2]: ['t'],
-    [D.START]: ['v'], [D.SELECT]: ['c'],
-  };
-  const MAPPED = new Set(Object.values(KEYMAP).flat());
-  // Standard-mapping gamepad index -> DKEY, and it MUST equal ps1.html's own
-  // GP_BUTTON_KEYS (ps1.html:982-984, with Start/Select on 9/8 from
-  // GP_START_BTN/GP_SELECT_BTN). A guest on a console browser or a desktop with
-  // a pad is exactly the "as if player 2 was on the same couch" case, so a real
-  // controller has to work here too.
-  //
-  // ⚠ 10 and 11 ARE DELIBERATELY UNBOUND, matching ps1.html. They were L3/R3
-  // until 2026-09-08, which contradicted this page's own header twice over: a
-  // DIGITAL PlayStation pad (PadMode 0, PadID 0x41 — what both sides send) has
-  // no stick clicks to press, and on Xbox Edge those two buttons fire
-  // BrowserBack/BrowserForward, which ps1.html:960-967 answers with a history
-  // sentinel rather than a binding. tools/control_map_drift_test.mjs now fails
-  // on any divergence from ps1.html.
-  const GP = [D.CROSS, D.CIRCLE, D.SQUARE, D.TRIANGLE, D.L1, D.R1, D.L2, D.R2,
-              D.SELECT, D.START, -1, -1, D.UP, D.DOWN, D.LEFT, D.RIGHT];
-
-  const held = new Set();
-  const touched = new Set();
-  const stick = { x: 0, y: 0 };
-  const norm = (e) => String(e.key || '').toLowerCase();
-
-  function packMask() {
-    let m = 0;
-    for (const idStr of Object.keys(KEYMAP)) {
-      if (KEYMAP[idStr].some((k) => held.has(k))) m |= (1 << (+idStr));
-    }
-    touched.forEach((id) => { m |= (1 << id); });
-
-    // The on-screen disc is analog on THIS side because a threshold is what makes
-    // diagonals reachable with a thumb; it leaves as d-pad bits because that is
-    // all a digital PlayStation pad has.
-    let ax = stick.x, ay = stick.y;
-    const pads = (navigator.getGamepads && navigator.getGamepads()) || [];
-    for (let p = 0; p < pads.length; p++) {
-      const gp = pads[p]; if (!gp) continue;
-      const btns = gp.buttons || [];
-      for (let i = 0; i < btns.length && i < GP.length; i++) {
-        // `>= 0`, not a truthiness test: D.SELECT is 0. An unbound slot is -1,
-        // and `1 << -1` is 0x80000000 — a bit no button owns, on a mask the far
-        // side reads as an int32.
-        if (btns[i] && btns[i].pressed && GP[i] >= 0) m |= (1 << GP[i]);
-      }
-      const a = gp.axes || [], dz = 0.3;
-      if (!ax && !ay && a.length >= 2) {
-        ax = Math.abs(a[0]) > dz ? a[0] : 0;
-        ay = Math.abs(a[1]) > dz ? a[1] : 0;
-      }
-      break;      // one remote player, one pad
-    }
-    if (!ax && !ay) {
-      ax = (held.has('arrowright') ? 1 : 0) - (held.has('arrowleft') ? 1 : 0);
-      ay = (held.has('arrowdown') ? 1 : 0) - (held.has('arrowup') ? 1 : 0);
-    }
-    if (ax > 0.4) m |= (1 << D.RIGHT);
-    if (ax < -0.4) m |= (1 << D.LEFT);
-    if (ay > 0.4) m |= (1 << D.DOWN);
-    if (ay < -0.4) m |= (1 << D.UP);
-    return m | 0;
-  }
-
-  // ---- the disc list is a COPY, and the test is what keeps it honest ---------
-  // lib/netplay.js refuses a pairing whose game names differ, so both sides must
-  // name the same key. Fetching ps1.html to read its ROMS[] would undo the whole
-  // point of this page — it is the emulator that player 2 exists to avoid — so
-  // the labels are copied and tools/mp_page_test.mjs compares the two lists and
-  // FAILS on drift.
-  //
-  // The key is the ROM's LABEL STRING, never its index. CLAUDE.md records an
-  // index going stale in exactly this way: ROM_IDX=1 was documented as PSO and
-  // silently loaded Sonic Adventure 2 Battle for months of runs.
-  const GAMES = [
-    { value: 'Monster Rancher 2',                     label: 'Monster Rancher 2' },
-    { value: 'Metal Gear Solid (Disc 1)',             label: 'Metal Gear Solid (Disc 1)' },
-    { value: 'Metal Gear Solid (Disc 2)',             label: 'Metal Gear Solid (Disc 2)' },
-    { value: "Harry Potter & the Sorcerer's Stone",   label: "Harry Potter & the Sorcerer's Stone" },
-    { value: 'Legend of Dragoon (Disc 1)',            label: 'Legend of Dragoon (Disc 1)' },
-    { value: 'Legend of Dragoon (Disc 2)',            label: 'Legend of Dragoon (Disc 2)' },
-    { value: 'Legend of Dragoon (Disc 3)',            label: 'Legend of Dragoon (Disc 3)' },
-    { value: 'Legend of Dragoon (Disc 4)',            label: 'Legend of Dragoon (Disc 4)' },
-  ];
-
-  NetplayGuest.mount({
-    seam: '__ps1mp',
-    title: 'PlayStation — Play Online',
-    lede: 'One player loads the disc; everyone else just watches and plays. '
-        + 'Player 2 needs no disc and no download — pick <b>Join</b> on the device you want to play on.',
-    games: GAMES,
-    defaultGame: 'Monster Rancher 2',
-    hostPage: '/ps1.html',
-    aspect: '4 / 3',
-    players: 'p2',
-    connectedMsg: 'Connected — you are Player 2 (controller port 2).',
-    mapped: MAPPED,
-    packMask,
-    onKeyDown: (e) => held.add(norm(e)),
-    // Release is NEVER filtered: a key that went down while the lobby's code
-    // field had focus must still come up, or it stays held on the host's port 2
-    // forever — a stuck button on somebody else's machine.
-    onKeyUp: (e) => held.delete(norm(e)),
-    onBlur: () => { held.clear(); touched.clear(); stick.x = stick.y = 0; },
-    padHtml:
-      '<div id="disc"><div id="nub"></div></div>' +
-      '<div id="face">' +
-        '<div class="tb" id="tTriangle">&#9651;</div>' +
-        '<div class="tb" id="tSquare">&#9633;</div>' +
-        '<div class="tb" id="tCircle">&#9711;</div>' +
-        '<div class="tb" id="tCross">&#10005;</div>' +
-      '</div>' +
-      '<div class="tb sq" id="tL1">L1</div><div class="tb sq" id="tL2">L2</div>' +
-      '<div class="tb sq" id="tR1">R1</div><div class="tb sq" id="tR2">R2</div>' +
-      '<div class="tb sq" id="tSelect">Select</div><div class="tb sq" id="tStart">Start</div>',
-    wirePad({ holdButton, wireDisc, $ }) {
-      const b = (id, bit) => holdButton($(id), () => touched.add(bit), () => touched.delete(bit));
-      b('tCross', D.CROSS); b('tCircle', D.CIRCLE); b('tSquare', D.SQUARE); b('tTriangle', D.TRIANGLE);
-      b('tL1', D.L1); b('tL2', D.L2); b('tR1', D.R1); b('tR2', D.R2);
-      b('tStart', D.START); b('tSelect', D.SELECT);
-      wireDisc($('disc'), $('nub'), (x, y) => { stick.x = x; stick.y = y; });
-    },
-  });
-})();
+  // Carry an invitation through. `?np=<code>` is how a room is shared, and the
+  // emulator page reads exactly that parameter to pre-fill the join box.
+  (function () {
+    var q = '';
+    try {
+      var np = new URLSearchParams(location.search).get('np');
+      if (np && /^[A-HJ-NP-Z2-9]{5}$/i.test(np)) q = '?np=' + encodeURIComponent(np.toUpperCase());
+    } catch (e) {}
+    var to = '/ps1.html' + q;
+    document.getElementById('go').href = to;
+    location.replace(to);
+  })();
 </script>
 </body>
 </html>

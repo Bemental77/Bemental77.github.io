@@ -3,12 +3,17 @@
 <head>
   <script src="/lib/capability.js"></script>
   <script src="/lib/xboxinput.js"></script>
-  <!-- ONLINE CO-OP. Both are inert unless Netplay.supported(); netplay-host.js
-       additionally does nothing at all without ?np=<code> in the URL, which is
-       what snes_multiplayer.html hands over. The lobby is NOT here — see the
-       ONLINE CO-OP block near the end of this page. -->
-  <script src="/lib/netplay.js"></script>
-  <script src="/lib/netplay-host.js"></script>
+  <!-- ⚠ NO NETPLAY SCRIPTS ARE LOADED HERE, ON PURPOSE.
+       /lib/netplay-host.js is the host half of STREAMING — it captures this
+       canvas with captureStream(), interposes on the audio graph, and publishes
+       both over WebRTC. Streaming is cancelled by user directive 2026-09-08
+       ("WE WILL NOT USE STREAMING!").
+       /lib/netplay.js is the LOCKSTEP engine and is genuinely wanted — but this
+       page cannot use it, because the shipped snes9x_2005 core answers exactly
+       one controller and has no port index for a second player (see the note
+       above runFrame()). Loading the engine to open a room that could only ever
+       seat one person would be a control that lies. Both come back the moment
+       the core gains a second pad. -->
   <meta charset="UTF-8" />
   <title>SNES Wasm</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -89,8 +94,8 @@
     #mobileMenuBox h6 { margin: 0 0 14px; font-size: 12px; text-transform: uppercase; letter-spacing: 2px; color: #888; }
     #mobileMenuBox button { display: block; width: 100%; margin-bottom: 8px; padding: 10px; border: 1px solid #444; background: #2c2c2c; color: #eee; border-radius: 6px; font-size: 14px; }
     /* SHORT VIEWPORT — a phone in LANDSCAPE is ~390 px tall, and this single
-       column of entries is taller than that, so the last ones (Play Online and
-       Close among them) sat BELOW THE FOLD with a centred flex item's top edge
+       column of entries is taller than that, so the last ones sat BELOW THE
+       FOLD with a centred flex item's top edge
        clipped and unscrollable. Two columns fit, and #mobileMenu scrolls now as
        a backstop. Measured before this: #mNet rect top=434 in a 390 px
        viewport, elementFromPoint at its centre returned a different button. */
@@ -114,7 +119,7 @@
        device was in portrait. MEASURED on dreamcast.html at 390x844 with the
        core running: document.elementFromPoint at the centre of #mobileMenuBtn
        returned #rotateHint, and the hint measured rect=0,0,390x844 — the menu
-       button, START, the d-pad, the face buttons and Play Online were ALL
+       button, START, the d-pad and the face buttons were ALL
        unreachable in portrait. Four of the six pages had no dismiss gesture at
        all, so on those it was a permanent lock-out, not a nuisance.
        It is now a small pill that CANNOT intercept a touch (pointer-events:
@@ -200,7 +205,6 @@
     <button id="btnFull" disabled>⛶ Fullscreen</button>
     <!-- hidden until Netplay.supported() proves the browser can do it: a control
          that does nothing when pressed reads as "the site is broken". -->
-    <button id="btnNet" type="button" hidden>👥 Play Online</button>
   </div>
   <div id="canvasWrap"><canvas id="canvas" width="256" height="224"></canvas></div>
   <div id="statusBar"><span id="status">Idle.</span><span id="fps"></span></div>
@@ -214,7 +218,6 @@
     <label for="mobileRomSelect">Choose a game</label>
     <select id="mobileRomSelect"></select>
     <button id="mobileSplashStart" type="button">Start</button>
-    <button id="mobileSplashNet" type="button" hidden style="min-width:0;padding:8px 14px;font-size:13px;background:#1d1d1d;border-color:#333;color:#aaa">👥 Play Online</button>
     <p class="rotateTip">Rotate to landscape for the best view.</p>
   </div>
   <div id="mobileScreen"></div>
@@ -367,9 +370,21 @@
   var frameCount = 0, presented = 0, lastFpsAt = 0, guestFrames = 0;
   window.__snesFrames = 0;     // read by tools/legacy_emu_page_test.mjs
 
-  // ── ONLINE CO-OP: THE REMOTE PLAYER SHARES CONTROLLER 1 ───────────────────
-  // ⚠ AND IT IS A SHARE, NOT A SECOND PAD. This build of snes9x_2005 exposes one
-  // controller and one only. Its own shim says so:
+  // ── ONLINE CO-OP IS NOT AVAILABLE ON THIS PAGE, AND THAT IS AN HONEST ─────
+  //    ANSWER RATHER THAN A MISSING FEATURE.
+  //
+  // WHAT WAS HERE, AND WHY IT WENT. Until 2026-09-08 this page was the host half
+  // of a STREAMING session: it captured its own canvas and audio with
+  // captureStream(), published them over WebRTC, and OR'd a remote player's
+  // buttons into the SAME controller mask as the local player's. Two people
+  // shared one pad and only one of them ran an emulator. The user cancelled
+  // streaming outright ("WE WILL NOT USE STREAMING!") and specified deterministic
+  // lockstep instead: every player runs their own core and only pad bytes cross
+  // the wire.
+  //
+  // WHY LOCKSTEP CANNOT BE WIRED HERE YET — a CORE limitation, not a page one.
+  // This build of snes9x_2005 exposes ONE controller and one only. Its own shim
+  // says so, verbatim:
   //
   //     snes/snesWasm/source/exports.c:19      int joyPadInput = 0;
   //     snes/snesWasm/source/exports.c:32-35   void setJoypadInput(int32_t input)
@@ -380,41 +395,41 @@
   //
   // The comment is the author's and translates as "1P only supported", and the
   // wasm agrees: the module's whole export list holds exactly one joypad symbol,
-  // taking one i32 and storing it to one address. Snes9x underneath is
-  // five-player capable (IPPU.Joypads[5]; ppu.c:1468 reads Joypads[1] for the
-  // $4017 serial port; ppu.c:2060-2062 already polls all five) — every port above
-  // 0 simply hits that `return 0`. Reaching it needs a few lines in exports.c and
-  // a REBUILD of snes9x_2005.wasm.
+  // taking one i32 and storing it to one address. There is no port index to
+  // address a second player with, so a lockstep room here could only seat one
+  // person — which is not multiplayer, it is single player with extra latency.
   //
-  // So the remote player's buttons are OR'd into the SAME mask as the local
-  // player's. That is a real, useful thing — taking turns, or a second pair of
-  // hands on a hard section — and snes_multiplayer.html says exactly that in its
-  // lobby rather than promising a Player 2 this core does not have.
-  function netSharedMask(local) {
-    var host = window.NetplayHost;
-    if (!host) return local;
-    var rm = host.remoteMask();
-    return (rm === null) ? local : (local | (rm & 0xffff));
-  }
+  // ⚠ THE FRAME SEAM ITSELF IS ALREADY FINE. `Module._mainLoop()` runs exactly
+  // one frame (S9xMainLoop returns at the SCAN_KEYS_FLAG break, cpuexec.c), and
+  // this page already drives it from a fixed-timestep accumulator. The ONLY
+  // missing piece is the second pad.
+  //
+  // WHAT WOULD FIX IT, precisely, so this is a scoped job and not a wish:
+  // snes9x underneath is FIVE-player capable and already polls all five —
+  // ppu.h:59 `uint32_t Joypads[5]`, ppu.c:2056-2062 `for (i = 0; i < 5; i++)
+  // IPPU.Joypads[i] = S9xReadJoypad(i)`, and Super Multitap is implemented at
+  // ppu.c:1445/1451 with `Settings.MultiPlayer5 = true` already set in
+  // exports.c:136. Turning `joyPadInput` into `joyPadInput[5]`, adding
+  // `setJoypadInputPort(port, mask)` beside the existing setter, and returning
+  // `joyPadInput[port]` from S9xReadJoypad is a few lines — plus a REBUILD of
+  // snes9x_2005.wasm via snes/snesWasm/build.sh. Until that rebuild happens this
+  // page ships single player and says so, rather than presenting an online
+  // button that pairs two people onto one controller.
 
   function runFrame() {
-    var p1 = padMask();
-    var m = netSharedMask(p1);
+    var m = padMask();
     Module._setJoypadInput(m);
-    // The literal mask the core was handed, kept so the netplay test can assert
-    // on THAT rather than on a session flag or a UI state. p2 is the remote
-    // player's contribution on its own; on this console it lands in p1's slot,
-    // which is the whole point of reporting both.
-    if (window.NetplayHost) NetplayHost.report(m, m & ~p1);
+    // The literal mask the core was handed, kept so a test can assert on THAT
+    // rather than on a UI state.
+    window.__snesMask = m;
     Module._mainLoop();
     frameCount++; guestFrames++; window.__snesFrames++;
   }
 
   function draw() {
-    // No-ops unless netplay fell back to a mirror canvas (it does not here — the
-    // canvas is main-thread and captures directly — but the fallback must still
-    // be fed if it ever wins).
-    if (window.NetplayHost) NetplayHost.pumpMirror();
+    // ⚠ NOTHING IS MIRRORED OR CAPTURED HERE ANY MORE. This used to pump a mirror
+    // canvas for the streaming host to captureStream(). Streaming is cancelled;
+    // this page draws for its own viewer and nobody else.
     var p = Module._getScreenBuffer();
     // ALLOW_MEMORY_GROWTH=1 (build.sh) means HEAPU8.buffer can be replaced on a
     // grow, which detaches any view we cached — so re-view it every frame.
@@ -847,79 +862,48 @@
     wireDpad();
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // ONLINE CO-OP — THE HOST HALF, AND NOTHING ELSE.
-  //
-  // THE MODEL: ONE INSTANCE RUNS THE GAME. This page's emulator is the only
-  // emulator. It streams its picture and its sound over WebRTC and the remote
-  // player sends controller state back, which is OR'd into controller 1 above —
-  // see the note there for why it cannot be a second pad on this core.
-  //
-  // THE LOBBY IS NOT HERE. It is snes_multiplayer.html, because a GUEST needs no
-  // core and no ROM, and pairing on this page would mean both players load an
-  // emulator so that one of them can watch a video. The button below is a link
-  // to that page, not a lobby.
-  // ═══════════════════════════════════════════════════════════════════════════
-  (function wireNetplay() {
-    if (!window.NetplayHost || !NetplayHost.supported()) return;
-    var go = function () {
-      var sel = isMobile ? $('mobileRomSelect') : $('romSelect');
-      var pick = ROMS[+(sel && sel.value) || 0] || ROMS[0];
-      location.href = NetplayHost.lobbyUrl('/snes_multiplayer.html', pick.label);
+  // The page's liveness seam. It is NOT a netplay seam any more and it does not
+  // pretend to be one: `supported:false` with a reason in words is the honest
+  // answer for a core that cannot address a second player. `live` is kept
+  // because tools/mobile_chrome_test.mjs uses it as its "the emulator is
+  // actually running" witness, and that question is still meaningful here.
+  window.__snesNet = function () {
+    return {
+      supported: false,
+      reason: 'the shipped snes9x_2005 core answers one controller only '
+            + '(exports.c S9xReadJoypad returns 0 for every port but 0), so a lockstep '
+            + 'room could seat one person; it needs a few lines in exports.c and a wasm rebuild',
+      mode: 'none',
+      live: (window.__snesFrames | 0) > 0,
+      frames: window.__snesFrames | 0,
+      mask: window.__snesMask | 0,
     };
-    ['btnNet', 'mobileSplashNet'].forEach(function (id) {
-      var b = $(id); if (!b) return;
-      b.hidden = false;
-      b.addEventListener('click', go);
-    });
-    NetplayHost.arm({
-      seam: '__snesNet',
-      players: 'shared',
-      log: function (m) { if (window.console) console.log(m); },
-      canvas: function () { return $('canvas'); },
-      // "Is there a game to stream?" answered by FRAMES, not by a start flag: a
-      // start flag is set the instant Start is pressed, long before the core
-      // exists, and capturing then would publish a black canvas.
-      live: function () { return window.__snesFrames > 0; },
-      coreUp: function () { return !!(window.Module && Module._setJoypadInput && wasmReady); },
-      // The game is named by its LABEL, never by its index into ROMS. CLAUDE.md
-      // records an index going stale exactly this way.
-      selectGame: function (label) {
-        for (var i = 0; i < ROMS.length; i++) {
-          if (ROMS[i].label !== label) continue;
-          ['romSelect', 'mobileRomSelect'].forEach(function (id) {
-            var sel = $(id); if (!sel) return;
-            sel.value = String(i);
-            sel.dispatchEvent(new Event('change'));
-          });
-          return label;
-        }
-        return null;
-      },
-      // ⚠ NEVER override a Start the capability layer is holding down: that
-      // button being disabled means the page has decided this device cannot run
-      // the emulator, and clicking past it is the exact bug the gate exists to
-      // stop. The core is not loaded yet when this runs, so it polls for
-      // wasmReady rather than assuming a duration, and gives up rather than
-      // spinning forever if the gate never releases.
-      pressStart: function () {
-        var tries = 0;
-        var attempt = function () {
-          if (!wasmReady) return false;
-          var b = isMobile ? $('mobileSplashStart') : $('btnStart');
-          if (!b || b.disabled || b.getAttribute('aria-disabled') === 'true') return false;
-          if (isMobile) $('mobileSplash').style.display = 'none';
-          startFromList();
-          return true;
-        };
-        if (attempt()) return;
-        var iv = setInterval(function () {
-          if (attempt() || ++tries > 480) clearInterval(iv);   // 480 x 250 ms = 2 min
-        }, 250);
-      },
-      onStatus: function (e) { if (e.state === 'connected') setStatus('A remote player joined — you share controller 1.'); },
-    });
-  })();
+  };
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ONLINE PLAY IS NOT OFFERED ON THIS PAGE.
+  //
+  // Streaming was cancelled by user directive 2026-09-08 and lockstep cannot be
+  // wired against this core, because the shipped snes9x_2005 build answers ONE
+  // controller and has no port index to address a second player with — see the
+  // long note above runFrame() for the exact lines and for the scoped change
+  // (plus a wasm rebuild) that would lift it.
+  //
+  // ⚠ SO THERE IS NO BUTTON. #btnNet and #mobileSplashNet have been REMOVED from
+  // the markup, not merely hidden: a control that cannot work is worse than no
+  // control, because the visitor presses it and concludes the site is broken —
+  // and a hidden one is still dead weight that reads, to anyone grepping the
+  // page, as though online play exists here.
+  //
+  // WHEN THE CORE GAINS A SECOND PAD, copy genesis.html — it is the worked
+  // example on this site and the only place the shape should be written down:
+  // an in-page room overlay, seats assigned before anything boots, the frame
+  // gate armed inside bootRom between the load and `running = true`, every
+  // seated port written from one agreed image each frame, and a serialized-state
+  // fingerprint handed to the engine once a second so the two cores are COMPARED
+  // rather than merely gated. tools/genesis_netplay_test.mjs is the harness
+  // shape and tools/genesis_determinism_probe.mjs is the evidence it rests on.
+  // ═══════════════════════════════════════════════════════════════════════════
 
   // ── load the core ─────────────────────────────────────────────────────────
   initCanvas();

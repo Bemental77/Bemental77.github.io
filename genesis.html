@@ -3,12 +3,20 @@
 <head>
   <script src="/lib/capability.js"></script>
   <script src="/lib/xboxinput.js"></script>
-  <!-- ONLINE CO-OP. Both are inert unless Netplay.supported(); netplay-host.js
-       additionally does nothing at all without ?np=<code> in the URL, which is
-       what genesis_multiplayer.html hands over. The lobby is NOT here — see the
-       ONLINE CO-OP block near the end of this page. -->
+  <!-- ONLINE CO-OP — LOCKSTEP, AND NOTHING ELSE. Inert unless
+       Netplay.supported(). The room is formed ON THIS PAGE (see the ONLINE
+       CO-OP block near the end) because every player runs their own core, so
+       there is no second kind of machine to send anywhere.
+
+       ⚠ /lib/netplay-host.js IS DELIBERATELY NOT LOADED ANY MORE. That file is
+       the host half of STREAMING: it captures this canvas with
+       captureStream(), interposes on the audio graph, publishes both into the
+       session, and hands the page ONE int32 of remote pad. Streaming is
+       cancelled by user directive 2026-09-08 ("WE WILL NOT USE STREAMING!"),
+       so the page that used to be player 2's whole machine is gone and this
+       page is the only page. The file itself still exists because n64/index.html
+       has not been converted yet; nothing here routes to it. -->
   <script src="/lib/netplay.js"></script>
-  <script src="/lib/netplay-host.js"></script>
   <meta charset="UTF-8" />
   <title>Genesis Wasm</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -223,6 +231,50 @@
       transform: translate(-50%, -50%);
       width: 100%; height: 100%; min-width: 44px; min-height: 44px;
     }
+
+    /* ── THE ROOM. Lockstep only; there is no picture to show and no video
+          element anywhere on this page. Hidden entirely until Netplay.supported()
+          says the browser can do it. */
+    #netOverlay { position: fixed; inset: 0; z-index: 2147483000; display: none;
+      align-items: center; justify-content: center; background: rgba(0,0,0,.72); }
+    #netOverlay.on { display: flex; }
+    #netBox { background: #15171a; color: #e8e8e8; border: 1px solid #444; border-radius: 14px;
+      padding: 20px 22px; width: min(460px, 94vw); max-height: 88vh; overflow: auto;
+      box-shadow: 0 12px 48px rgba(0,0,0,.6); font: 14px/1.5 system-ui, sans-serif; }
+    #netBox h6 { margin: 0 0 6px; font-size: 18px; color: #fff; }
+    #netBox .lead { color: #9aa; margin: 0 0 14px; font-size: 13px; }
+    #netRow { display: flex; gap: 10px; margin-bottom: 12px; }
+    #netRow button, .netActions button { flex: 1; min-height: 44px; border-radius: 9px;
+      border: 1px solid #555; background: #2a2d31; color: #eee; font-size: 14px; cursor: pointer; }
+    #netRow button.on, #netBox button.primary { background: #2b7cd3; border-color: #2b7cd3; color: #fff; font-weight: 600; }
+    .netLabel { color: #9aa; font-size: 12px; margin: 10px 0 4px; text-transform: uppercase; letter-spacing: .06em; }
+    #netCode { font: 700 30px/1.1 ui-monospace, Menlo, monospace; letter-spacing: 5px; text-align: center;
+      background: #0e1013; border: 1px dashed #4a4; border-radius: 10px; padding: 13px; color: #9f9; user-select: all; }
+    #netCodeIn { width: 100%; box-sizing: border-box; min-height: 44px; font: 700 20px/1 ui-monospace, Menlo, monospace;
+      letter-spacing: 4px; text-align: center; text-transform: uppercase; background: #0e1013; color: #eee;
+      border: 1px solid #555; border-radius: 9px; padding: 11px; }
+    #netGame { width: 100%; box-sizing: border-box; min-height: 44px; background: #0e1013; color: #eee;
+      border: 1px solid #555; border-radius: 9px; padding: 10px 12px; font-size: 15px; }
+    .netActions { display: flex; gap: 10px; margin-top: 12px; }
+    #netRoster { list-style: none; margin: 6px 0 0; padding: 0; }
+    #netRoster li { display: flex; align-items: center; gap: 9px; padding: 5px 0; font-size: 13px; }
+    #netRoster .dot { width: 9px; height: 9px; border-radius: 50%; background: #666; flex: none; }
+    #netRoster .dot.on { background: #5c5; box-shadow: 0 0 8px #5c5; }
+    #netRoster .dot.me { background: #6af; box-shadow: 0 0 8px #6af; }
+    #netStatus { margin-top: 12px; font-size: 13px; color: #9aa; }
+    #netStatus.good { color: #7ee787; } #netStatus.bad { color: #ff7b72; } #netStatus.busy { color: #d8b44a; }
+    /* The live session readout, over the picture. Hidden with no session, so
+       single player is untouched. */
+    #netHud { position: absolute; left: 8px; top: 8px; z-index: 40; display: none;
+      font: 11px/1.45 ui-monospace, Menlo, monospace; color: #cfe; background: rgba(0,0,0,.55);
+      border: 1px solid #2a3a44; border-radius: 7px; padding: 6px 9px; pointer-events: none; max-width: 70%; }
+    #netHud.on { display: block; }
+    #netHud .mode { color: #7ee787; font-weight: 700; }
+    #netHud .warn { color: #d8b44a; }
+    #netDesync { position: absolute; left: 50%; top: 12px; transform: translateX(-50%); z-index: 41;
+      display: none; max-width: 90%; font: 12px/1.5 system-ui, sans-serif; color: #fff;
+      background: rgba(140,20,20,.94); border: 1px solid #f66; border-radius: 8px; padding: 8px 12px; }
+    #netDesync.on { display: block; }
   </style>
   <!-- THE FLOOR NO RUNTIME GATE CAN REACH. A visitor with JS disabled (blocked by an
        extension, or on a browser where the first script threw) would otherwise get the
@@ -263,7 +315,14 @@
          that does nothing when pressed reads as "the site is broken". -->
     <button id="btnNet" type="button" hidden>👥 Play Online</button>
   </div>
-  <div id="canvasWrap"><canvas id="canvas" width="320" height="224"></canvas></div>
+  <!-- ⚠ THERE IS NO <video> HERE, AND THAT IS THE ARCHITECTURE. Under streaming
+       a guest ran no core and watched a video of the host's canvas. Every player
+       now runs their own Genesis, so the only picture on this page is this
+       page's own canvas. -->
+  <div id="canvasWrap"><canvas id="canvas" width="320" height="224"></canvas>
+    <div id="netHud" aria-live="polite"></div>
+    <div id="netDesync" role="alert" aria-live="assertive"></div>
+  </div>
   <div id="statusBar"><span id="status">Idle.</span><span id="fps"></span></div>
   <div id="keyHelp">Keyboard — D-pad <b>arrows</b> · <b>a</b> A · <b>s</b> B · <b>d</b> C · <b>q</b> X · <b>w</b> Y · <b>e</b> Z · <b>Enter</b> Start · <b>Shift</b> Mode. A gamepad works too.</div>
 </div>
@@ -314,6 +373,54 @@
   </div>
   <div id="rotateHint">Landscape gives a bigger picture.</div>
 </div>
+<!-- ═══ THE ROOM ═══════════════════════════════════════════════════════════════
+     ⚠ THIS PANEL DESCRIBES LOCKSTEP AND ONLY LOCKSTEP. There is no mode
+     selector: streaming one machine's picture to the others is cancelled, and
+     anything other than lockstep is a FAULT rather than an option.
+     ⚠ AND THE ORDER IS BACKWARDS FROM THE OLD ONE. Under streaming the host had
+     to be running a game before anyone could join, because there was no canvas
+     to capture until then. Under lockstep everybody joins FIRST, ports are
+     assigned, and only then does each machine load the same cartridge and start
+     together — so nobody boots a game to find out whether they even got a
+     port. -->
+<div id="netOverlay">
+  <div id="netBox">
+    <h6>👥 Play Online</h6>
+    <p class="lead">Everyone runs the game on their own machine and plays together, exactly like
+      two controllers plugged into one Genesis. <b>Join the room first</b> — you do not need a
+      game loaded yet. Once you are both in, you each press Start and the two consoles begin
+      on the same frame.</p>
+    <div id="netRow">
+      <button id="netHostBtn" class="primary" type="button">Open a room</button>
+      <button id="netJoinBtn" type="button">Join a room</button>
+    </div>
+    <div id="netHostPane" style="display:none">
+      <div class="netLabel">Share this code</div>
+      <div id="netCode">·····</div>
+      <div class="netActions"><button id="netCopy" type="button">Copy code</button></div>
+    </div>
+    <div id="netJoinPane" style="display:none">
+      <div class="netLabel">Game the room is playing</div>
+      <select id="netGame"></select>
+      <div class="netLabel">Their code</div>
+      <input id="netCodeIn" type="text" maxlength="5" autocomplete="off" autocapitalize="characters"
+             spellcheck="false" placeholder="ABC12" inputmode="latin">
+      <div class="netActions"><button id="netGo" class="primary" type="button">Join</button></div>
+    </div>
+    <!-- One row per CONTROLLER PORT of the console, filled from the engine's own
+         port count — never from a number written here. A Mega Drive has two. -->
+    <div id="netRoom" style="display:none">
+      <div class="netLabel">The room <span id="netRoomPorts"></span></div>
+      <ul id="netRoster"></ul>
+      <span id="netBarrier"></span>
+    </div>
+    <div id="netStatus">Not connected.</div>
+    <div class="netActions">
+      <button id="netLeave" type="button" style="display:none">Leave</button>
+      <button id="netClose" type="button">Close</button>
+    </div>
+  </div>
+</div>
 <div id="toast"></div>
 
 <script>
@@ -360,6 +467,18 @@
   function setStatus(t) { if (statusEl) statusEl.textContent = t; if (mobileStatusEl) mobileStatusEl.textContent = t; }
   function toast(msg, isErr) { toastEl.textContent = msg; toastEl.classList.toggle('err', !!isErr); toastEl.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(() => toastEl.classList.remove('show'), 2400); }
   function banner(html) { var b = $('banner'); if (!b) return; b.innerHTML = html; b.style.display = 'block'; }
+  // This page has no on-screen log panel, so the online-play trail goes to the
+  // console AND to a small ring a test can read back. A room that refuses to
+  // gate has to be able to say why after the fact, not only while someone is
+  // watching devtools.
+  var __genLog = [];
+  window.__genLogLines = __genLog;
+  function pageLog(msg) {
+    var line = String(msg);
+    __genLog.push(line);
+    if (__genLog.length > 200) __genLog.shift();
+    try { console.log('[genesis]', line); } catch (e) {}
+  }
 
   const isMobile = (() => {
     const ua = navigator.userAgent.toLowerCase();
@@ -446,53 +565,266 @@
   var presented = 0, lastFpsAt = 0, guestFrames = 0;
   window.__genFrames = 0;     // read by tools/genesis_page_test.mjs
 
-  // ── ONLINE CO-OP: CONTROLLER PORT B IS THE REMOTE PLAYER ──────────────────
-  // lib/netplay-host.js hands back ONE int32, or null when nobody is connected.
-  // Its bits are already this core's own libretro ids — the same `BIT` table
-  // padMask() uses for port 0 — so there is nothing to translate here.
+  // ═══════════════════════════════════════════════════════════════════════════
+  // THE LOCKSTEP FRAME DRIVER — the frame gate, on a synchronous core.
   //
-  // THIS IS A REAL SECOND CONTROLLER, not a shared one, and that is a property
-  // of the core rather than of this page: `gpx_set_pad(unsigned port, int mask)`
-  // keeps pad[8] and serves every port through input_state_cb
-  // (genesis/genesisWasm/source/gpgx_shim.c:58-59, :251-264, :369-374), and
-  // Genesis Plus GX's own config_default() leaves input.system[0] AND
-  // input.system[1] as SYSTEM_GAMEPAD. Port B has been sitting there wired up
-  // the whole time; this page just never wrote to it.
+  // WHAT THIS REPLACED, AND WHY IT HAD TO GO. This page used to ask
+  // lib/netplay-host.js for ONE int32 of remote pad and drop it into port B
+  // while the other machine ran no core at all and watched a video of this
+  // canvas. Streaming is cancelled (user directive 2026-09-08). Both machines
+  // now run their own Genesis and only pad bytes cross the wire.
   //
-  // ⚠ THE RELEASE HAS TO BE WRITTEN TOO. pad[1] is sticky — it holds whatever
-  // was last stored — so a guest who disconnects mid-jump would leave the button
-  // held on port B for the rest of the session. netP2Live remembers whether
-  // anything was ever put there so the zero is written exactly once, rather than
-  // 60 times a second forever after.
-  var netP2 = 0, netP2Live = false;
-  function netApplyRemote() {
-    var host = window.NetplayHost;
-    if (!host) return;
-    var rm = host.remoteMask();
-    if (rm === null) {
-      if (netP2Live) { Module._gpx_set_pad(1, 0); netP2 = 0; netP2Live = false; }
-      return;
+  // THE LOOP, and why each piece is where it is:
+  //
+  //   ls.beginFrame(myPads) -> { ready, frame, image } | { ready:false, waitingOn }
+  //     The engine answers with the WHOLE controller picture for one exact
+  //     emulated frame — every seated port's bytes — or it refuses. A refusal
+  //     STALLS this machine. It never predicts: a guessed pad forks the two
+  //     simulations silently and permanently, and there is no rollback here to
+  //     unfork them.
+  //
+  //   gpx_set_pad(p, mask) for EVERY port, then ONE gpx_run()
+  //     `gpx_run()` is exactly one `retro_run()` (gpgx_shim.c:343-350), and
+  //     `gpx_set_pad(unsigned port, int mask)` writes `pad[port]`, served to the
+  //     core through input_state_cb (gpgx_shim.c:250-264, :369-374). Both ports
+  //     are gamepads at boot because Genesis-Plus-GX's config_default() sets
+  //     input.system[0] and input.system[1] to SYSTEM_GAMEPAD and the shim never
+  //     calls retro_set_controller_port_device.
+  //
+  //   ls.endFrame(hash) — IMMEDIATELY, because this core is SYNCHRONOUS.
+  //     Dreamcast's core lives in a worker, so its fingerprint arrives late and
+  //     it needs Lockstep.submitHash() to feed a hash for a frame whose clock
+  //     has already advanced. Here `gpx_run()` has RETURNED by the time the next
+  //     line executes, so the hash for the frame just run is available at once
+  //     and goes straight into endFrame(). Simpler, and not by accident: this is
+  //     the shape endFrame(hash, words) was written for.
+  //
+  // ⚠ THE GUEST RATE IS NOT TOUCHED (CLAUDE.md gate #9). The accumulator in
+  // loop() still paces every frame to FRAME_MS = 1000 / gpx_fps(), i.e. 1.000x
+  // hardware. This gate can only make the guest run SLOWER (a stall), never
+  // faster: it decides WHETHER the frame the accumulator already asked for may
+  // run, never how many are asked for.
+  //
+  // ⚠ AND THE CORE MUST NOT RUN ONE FRAME BEFORE THE GATE IS ARMED. Two machines
+  // that free-ran for different numbers of frames are at different guest frames,
+  // which is a desync at "frame 0". lsArmBeforeFreerun() therefore runs inside
+  // bootRom() BETWEEN the gpx_load() and `running = true`, with no yield in
+  // between, so the first frame this core ever runs is the room's frame 0.
+  //
+  // MEASURED BEFORE ANY OF THIS WAS WRITTEN — tools/genesis_determinism_probe.mjs,
+  // two separate Chrome processes, each cold-booting the same cartridge with no
+  // savestate and no state transfer, identical input keyed to the emulated frame
+  // index: STATE IDENTICAL over 1800 frames, 3/3 runs, on both Sonic 3 and
+  // X-Men. That is why this design cold-boots both machines instead of copying
+  // one machine's state to the other.
+  // ═══════════════════════════════════════════════════════════════════════════
+  var LS = {
+    armed: false,        // the frame gate is engaged; runFrame() is gated
+    running: false,      // ...and the barrier released, so frames are flowing
+    frames: 0,           // gated frames this core has run
+    hashEvery: 60,
+    hashes: 0,
+    stalling: false, waitingOn: [], stallReason: null,
+    fault: null,         // why this machine is NOT frame-gated, in words
+  };
+
+  function lsEngine() {
+    var s = NET.session;
+    if (!s) return null;
+    try { return s.ls || null; } catch (e) { return null; }
+  }
+
+  // THIS MACHINE'S OWN PAD, KEYED BY THE PORT THE ROOM GAVE IT.
+  // ⚠ THE KEYBOARD IS NOT PORT 0 ANY MORE. It is whichever port this player
+  // holds: a player told they are Player 2 has to drive Player 2's character,
+  // and padMask() builds the local mask with no idea which port it is for. The
+  // engine places these bytes at port*padBytes in the image it builds, so the
+  // re-mapping happens in exactly one place.
+  // A machine holding SEVERAL seats gets its first seat from keyboard+gamepad,
+  // which is what a splitter would do.
+  function lsLocalPads() {
+    var ls = lsEngine();
+    var ports = (ls && ls.localPorts && ls.localPorts.length) ? ls.localPorts : [0];
+    var mask = padMask();
+    var out = {};
+    ports.forEach(function (port, k) {
+      var b = new Uint8Array(LS_PAD_BYTES);
+      var m = (k === 0) ? mask : 0;   // further seats need a second local pad
+      b[0] = m & 0xff; b[1] = (m >> 8) & 0xff;
+      out[port] = b;
+    });
+    return out;
+  }
+
+  // A Genesis pad is a 12-bit libretro mask, so two bytes carry it exactly.
+  // Handed to the engine explicitly rather than left at its 64-byte Dreamcast
+  // default: the image is portCount * padBytes and every byte of it crosses the
+  // wire every frame.
+  var LS_PAD_BYTES = 2;
+
+  // THE FINGERPRINT. The serialized state is what lockstep must keep identical,
+  // so that is what is hashed — not the framebuffer, which can agree while the
+  // machines have already diverged.
+  // ⚠ IT IS NOT FREE: gpx_state_size() is ~1 MB for this core, so hashing every
+  // frame would cost more than the emulation. Once a second (hashEvery = 60) is
+  // enough to catch a divergence long before a human could act on it.
+  var lsStatePtr = 0, lsStateSize = 0;
+  function lsFingerprint() {
+    if (!lsStatePtr) {
+      lsStateSize = Module._gpx_state_size() >>> 0;
+      if (!lsStateSize) return null;
+      lsStatePtr = Module._gpx_alloc(lsStateSize);
+      if (!lsStatePtr) { lsStateSize = 0; return null; }
     }
-    netP2 = rm & 0xffff; netP2Live = true;
-    Module._gpx_set_pad(1, netP2);
+    if (!Module._gpx_state_save(lsStatePtr, lsStateSize)) return null;
+    // ⚠ HASHED 32 BITS AT A TIME, AND THE REASON IS THE FRAME BUDGET. A
+    // byte-wise loop over this core's ~1 MB state is ~1,000,000 iterations
+    // INSIDE a 16.7 ms frame; a word-wise one is a quarter of that for identical
+    // coverage — every byte still contributes, because each 32-bit word carries
+    // four of them. The pointer is 4-aligned (gpx_alloc -> malloc) and the size
+    // is a whole number of words for this core, but neither is assumed: any
+    // trailing bytes are folded in below.
+    // ALLOW_MEMORY_GROWTH=1 can replace HEAPU8.buffer, so re-view every time.
+    var words = lsStateSize >>> 2;
+    var h = 0x811c9dc5;
+    if ((lsStatePtr & 3) === 0) {
+      var u32 = new Uint32Array(Module.HEAPU8.buffer, lsStatePtr, words);
+      for (var i = 0; i < words; i++) {
+        h ^= u32[i];
+        h = Math.imul(h, 16777619) >>> 0;
+      }
+    } else {
+      words = 0;   // unaligned: fall through to the byte loop for everything
+    }
+    var u8 = new Uint8Array(Module.HEAPU8.buffer, lsStatePtr, lsStateSize);
+    for (var b = words << 2; b < lsStateSize; b++) {
+      h ^= u8[b];
+      h = Math.imul(h, 16777619) >>> 0;
+    }
+    return h >>> 0;
+  }
+
+  // ---- releasing the gate, which is not optional ----------------------------
+  // ⚠ A GATED CORE WHOSE ROOM IS GONE IS A FROZEN CONSOLE. The gate holds the
+  // frame; if the session ends while it is armed, nothing ever releases it and
+  // the player is left staring at a still picture with no room and no
+  // explanation. Leaving a room (or the room closing under you) therefore hands
+  // the console back: the gate opens, the accumulator resumes at 1.000x, and the
+  // game carries on single-player from exactly the frame it was holding.
+  function lsDisarm(why) {
+    if (!LS.armed) return;
+    LS.armed = false; LS.running = false;
+    LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
+    // A leaver's pad must not stay held down on this machine's port B.
+    try { if (wasmReady) for (var p = 0; p < 2; p++) Module._gpx_set_pad(p, 0); } catch (e) {}
+    pageLog('[lockstep] frame gate RELEASED — ' + why + '. This console free-runs from here and is '
+      + 'no longer sharing frames with anybody.');
+  }
+
+  // ---- arming, AFTER the cartridge is loaded and BEFORE the first frame ------
+  function lsArmBeforeFreerun() {
+    if (!NET.session || LS.armed) return false;
+    var ls = lsEngine();
+    if (!ls) {
+      LS.fault = 'the room published no lockstep engine, so this core cannot be frame-gated';
+      pageLog('[lockstep] ⚠ ' + LS.fault);
+      return false;
+    }
+    LS.armed = true; LS.running = false; LS.frames = 0; LS.hashes = 0; LS.fault = null;
+    pageLog('[lockstep] ARMED before the first frame — this core advances only when every seated '
+      + 'port has an input for the frame, so no console runs a frame the others did not. '
+      + 'ports=' + JSON.stringify(ls.roster) + ' mine=' + JSON.stringify(ls.localPorts));
+    // "My core is booted and holding at frame 0, on this cartridge." Nobody runs
+    // frame 0 until EVERY seated peer has said this, about the SAME cartridge —
+    // the engine compares the string and refuses a room that does not agree.
+    try { NET.session.setReady(true, lsDisc()); } catch (e) {
+      pageLog('[lockstep] ⚠ start barrier refused: ' + ((e && e.message) || e));
+    }
+    return true;
+  }
+
+  // WHAT "THE SAME GAME" MEANS, COMPARED RATHER THAN TRUSTED. Two machines with
+  // the same cartridge must produce the same string; the name alone would let a
+  // different dump of the same title through, and the two would desync on the
+  // first frame that reads a byte the dumps disagree about.
+  function lsDisc() { return romName + ':' + (romBytesLen | 0); }
+  var romBytesLen = 0;
+
+  // ---- THE GATED FRAME ------------------------------------------------------
+  // Returns true if a frame actually ran. A false return STALLS the guest: the
+  // accumulator keeps its credit and the console simply does not advance, which
+  // is what "wait for the other player" has to mean when nothing may be guessed.
+  function lsRunFrame() {
+    var ls = lsEngine();
+    if (!ls) { lsDisarm('the session went away'); return false; }
+    if (ls.state !== 'running' && ls.state !== 'stalled') {
+      // The BARRIER decides when frame 0 runs, not this page. Until the engine
+      // says 'running' nothing advances and the console sits on frame 0 — which
+      // is precisely what "everyone starts together" means.
+      if (LS.running) { LS.running = false; pageLog('[lockstep] frame gate DISENGAGED — engine state ' + ls.state); }
+      return false;
+    }
+    if (!LS.running) {
+      LS.running = true;
+      pageLog('[lockstep] FRAME GATE ENGAGED at frame ' + ls.frame + ' — delay=' + ls.delay
+        + ' frames (' + Math.round(ls.delay * FRAME_MS) + ' ms), ports=' + JSON.stringify(ls.roster));
+    }
+    var r = ls.beginFrame(lsLocalPads());
+    if (!r || !r.ready) {
+      LS.stalling = !!(r && r.reason === 'stall');
+      LS.stallReason = r ? r.reason : 'the engine returned nothing';
+      LS.waitingOn = (r && r.waitingOn) ? r.waitingOn.slice() : [];
+      return false;
+    }
+    LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
+
+    // EVERY SEATED PORT IS WRITTEN, EVERY FRAME, FROM THE ONE AGREED IMAGE.
+    // ⚠ Including this machine's own: the local pad goes round through the
+    // engine so that it lands on the SAME emulated frame on every machine. A
+    // local shortcut that applied our own pad directly would put it a different
+    // number of frames earlier here than there, which is a desync by
+    // construction — and it is exactly the shortcut the old relay took.
+    var pb = ls.padBytes | 0;
+    for (var p = 0; p < ls.portCount; p++) {
+      var m = (r.image[p * pb] | (r.image[p * pb + 1] << 8)) & 0xffff;
+      Module._gpx_set_pad(p, m);
+    }
+    Module._gpx_run();
+    guestFrames++; window.__genFrames++; LS.frames++;
+
+    // The exact masks the core was handed, for a test to assert on rather than
+    // on a session flag or a UI state.
+    window.__genLsImage = Array.prototype.slice.call(r.image.subarray(0, ls.portCount * pb));
+
+    // ⚠ THE INTERVAL COMES FROM THE ENGINE, NOT FROM THIS PAGE'S COPY OF IT.
+    // The host's parameters win and are pushed to every guest in 'lsgo', so a
+    // page that hashed on its own LS.hashEvery would fingerprint DIFFERENT
+    // frames from its peers the moment the host chose another value — and two
+    // machines that never hash the same frame never compare anything. The
+    // desync detector would then be silently dead while everything looked fine,
+    // which is the worst failure this file can have.
+    var every = (ls.hashEvery == null) ? LS.hashEvery : (ls.hashEvery | 0);
+    var h = null;
+    if (every > 0 && (r.frame % every) === 0) { h = lsFingerprint(); if (h != null) LS.hashes++; }
+    ls.endFrame(h);
+    return true;
   }
 
   function runFrame() {
-    var p1 = padMask();
-    Module._gpx_set_pad(0, p1);
-    netApplyRemote();
-    // The literal masks the core was handed, kept so the netplay test can assert
-    // on THOSE rather than on a session flag or a UI state.
-    if (window.NetplayHost) NetplayHost.report(p1, netP2);
+    // ⚠ SINGLE PLAYER IS UNTOUCHED. With no room, LS.armed is false and this is
+    // byte-for-byte the loop that shipped: one local mask into port 0, one
+    // gpx_run(). Port 1 is never written, so pad[1] stays 0 exactly as before.
+    if (LS.armed) return lsRunFrame();
+    Module._gpx_set_pad(0, padMask());
     Module._gpx_run();
     guestFrames++; window.__genFrames++;
+    return true;
   }
 
   function draw() {
-    // No-ops unless netplay fell back to a mirror canvas (it does not here — the
-    // canvas is main-thread and captures directly — but the fallback must still
-    // be fed if it ever wins).
-    if (window.NetplayHost) NetplayHost.pumpMirror();
+    // ⚠ NOTHING IS MIRRORED OR CAPTURED HERE ANY MORE. This used to pump a
+    // mirror canvas for the streaming host to captureStream(). Every player runs
+    // their own core, so this page draws for its own viewer and nobody else.
     var w = Module._gpx_width(), h = Module._gpx_height();
     if (!w || !h) return;
     resizeCanvas(w, h);
@@ -514,8 +846,29 @@
     if (d > 100) d = 100;          // a long stall must not fast-forward the guest
     accum += d;
     var ran = 0;
-    while (accum >= FRAME_MS && ran < MAX_CATCHUP_FRAMES) { runFrame(); accum -= FRAME_MS; ran++; }
+    // ⚠ A STALLED FRAME MUST NOT SPEND ITS CREDIT. runFrame() returns false when
+    // the frame gate is holding this console because some seated port's input for
+    // the frame has not arrived. Draining `accum` anyway would bank the wait, and
+    // the guest would then SPRINT through the backlog the moment the input landed
+    // — the one thing CLAUDE.md gate #9 forbids. Breaking out instead leaves the
+    // credit untouched, so the console resumes at exactly 1.000x from where it
+    // stopped. The `d > 100` clamp above already stops a long wait from
+    // accumulating more than one tick's worth.
+    var stalled = false;
+    while (accum >= FRAME_MS && ran < MAX_CATCHUP_FRAMES) {
+      if (!runFrame()) { stalled = true; break; }
+      accum -= FRAME_MS; ran++;
+    }
+    // ⚠ AND THE WAIT MUST NOT BE BANKED ACROSS TICKS EITHER. Breaking out alone
+    // is not enough: `accum` would keep growing by up to 100 ms every rAF for as
+    // long as the other player is silent, and the moment their input arrived the
+    // guest would run MAX_CATCHUP_FRAMES every tick until the debt cleared —
+    // a fast-forward, which is forbidden. A stall means those wall-clock
+    // milliseconds did not happen for the guest at all, so the credit is capped
+    // at a single frame and the console resumes at 1.000x, not above it.
+    if (stalled && accum > FRAME_MS) accum = FRAME_MS;
     if (ran) draw();
+    if (NET.session) netHudTick(ts);
     if (!lastFpsAt) lastFpsAt = ts;
     if (ts - lastFpsAt >= 1000) {
       var secs = (ts - lastFpsAt) / 1000;
@@ -565,7 +918,20 @@
 
   function bootRom(bytes, name) {
     if (!wasmReady) { toast('Core not ready yet', true); return false; }
+    // ⚠ A CARTRIDGE MAY NOT BE SWAPPED INSIDE A LIVE ROOM, and this is measured
+    // rather than cautious. tools/genesis_determinism_probe.mjs `reload` arm:
+    // gpx_load() into a core that has already run does NOT reproduce a cold boot
+    // — it diverged at the pre-run mark in 3/3 runs, reproducibly, in the same
+    // byte range. Two machines that loaded at different points in their core's
+    // life are therefore not on the same frame 0. Refusing out loud beats
+    // running and diverging.
+    if (LS.armed || (NET.session && running)) {
+      toast('Leave the room before changing game', true);
+      setStatus('A room is open — leave it before loading another cartridge.');
+      return false;
+    }
     romName = name;
+    romBytesLen = bytes.length;
     initAudio();
     var ptr = Module._gpx_alloc(bytes.length);
     if (!ptr) { toast('Out of memory loading ROM', true); return false; }
@@ -588,7 +954,16 @@
     HW_HZ = Module._gpx_fps() || HW_HZ;
     FRAME_MS = 1000 / HW_HZ;
     resizeCanvas(Module._gpx_width() || 320, Module._gpx_height() || 224);
-    lastTs = 0; accum = 0; running = true;
+    lastTs = 0; accum = 0;
+    // ⚠ ARM THE FRAME GATE HERE, AND ONLY HERE — AFTER the cartridge is loaded
+    // and BEFORE `running = true`. There is no `await` between the gpx_load()
+    // above and this line, so the rAF loop cannot interleave and this core
+    // cannot run a single free frame before the gate closes. A machine that
+    // free-ran even one frame is a frame ahead of its peers forever, which is a
+    // desync at "frame 0" — the exact failure the ordering exists to prevent.
+    // With no room this is a no-op and the console free-runs as it always has.
+    lsArmBeforeFreerun();
+    running = true;
     // XBOX: stick drives the GAME from here, not Edge's cursor (lib/xboxinput.js).
     try { window.XboxInput && XboxInput.offerGameControls('genesis running'); } catch (e) {}
     setStatus('Running — ' + name);
@@ -662,6 +1037,14 @@
   }
   async function loadState() {
     if (!running) return toast('Nothing running', true);
+    // ⚠ NOT INSIDE A ROOM. Restoring a state moves THIS console to a different
+    // point in the game while the others stay where they are — an instant,
+    // permanent desync. It is also the one operation this core does not do
+    // exactly: tools/genesis_determinism_probe.mjs `rewind` arm shows
+    // gpx_state_save -> gpx_state_load does NOT round-trip byte-exactly (3/3
+    // runs, diverging at frame 60 in the same byte range), so even restoring the
+    // SAME state on both machines would not put them back in step.
+    if (LS.armed) return toast('Not while you are in a room', true);
     try {
       var stored = await idbGet(saveKey());
       if (!stored) return toast('No save state for ' + romName, true);
@@ -752,7 +1135,21 @@
     inp.click();
   }
 
-  function resetGame() { if (running) { Module._gpx_reset(); toast('Reset'); } }
+  // ⚠ RESET IS REFUSED INSIDE A ROOM, and the reason is specific rather than
+  // general caution. Genesis-Plus-GX's SOFT reset seeds the 68000 cycle counter
+  // from rand() — `m68k.cycles = (MCYCLES_PER_LINE * lines_per_frame) *
+  // ((double)rand() / RAND_MAX)` in core/genesis.c — against a musl PRNG that is
+  // never srand()ed. The sequence is therefore fixed but it ADVANCES ON EVERY
+  // RESET, so two players who have pressed Reset a different number of times
+  // draw different values and desync on the spot. It is the ONLY guest-visible
+  // nondeterminism this core has (its wasm imports no clock and no entropy at
+  // all), and this is where it is contained.
+  function resetGame() {
+    if (!running) return;
+    if (LS.armed) return toast('Not while you are in a room', true);
+    Module._gpx_reset();
+    toast('Reset');
+  }
   function toggleMute() {
     muted = !muted;
     if (audioCtx) { muted ? audioCtx.suspend() : audioCtx.resume().catch(() => {}); }
@@ -918,78 +1315,413 @@
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // ONLINE CO-OP — THE HOST HALF, AND NOTHING ELSE.
+  // ONLINE CO-OP — LOCKSTEP, AND NOTHING ELSE.
   //
-  // THE MODEL: ONE INSTANCE RUNS THE GAME. This page's emulator is the only
-  // emulator. It streams its picture and its sound over WebRTC and the guest
-  // sends controller state back, which lands in port B above.
+  // THE MODEL: EVERY PLAYER RUNS THEIR OWN GENESIS. Only pad bytes cross the
+  // wire — two bytes per controller per emulated frame — and each machine
+  // applies every seated port's input to its own core on the SAME frame number.
+  // It is as if both controllers were plugged into one console.
   //
-  // THE LOBBY IS NOT HERE. It is genesis_multiplayer.html, because a GUEST needs
-  // no core and no ROM, and pairing on this page would mean both players load an
-  // emulator to have one of them watch a video. So the party forms there and
-  // only the HOST is sent back here carrying ?np=<code>&game=<label>. The button
-  // below is a link to that page, not a lobby.
+  // WHAT THIS REPLACED. Until 2026-09-08 this page was the ONLY emulator in a
+  // session: it captured its own canvas and audio with captureStream() and
+  // published them over WebRTC, and genesis_multiplayer.html was player 2's
+  // whole machine — a <video> and a pad. The user cancelled that outright ("WE
+  // WILL NOT USE STREAMING!"), so the lobby page is gone, /lib/netplay-host.js
+  // is no longer loaded, and the room forms HERE.
+  //
+  // THE ORDER IS THE ARCHITECTURE, and it is backwards from the streaming one:
+  //   1. Everyone opens this page and joins the room. NOTHING IS LOADED YET —
+  //      under streaming the host had to be running a game before anyone could
+  //      join, because there was no canvas to capture until then. Making a
+  //      player boot a cartridge before they can find out whether they even got
+  //      a port is exactly the wrong way round.
+  //   2. The host seats each joiner in the lowest free controller port. The
+  //      roster is broadcast, so every machine maps the same person to the same
+  //      port — get this wrong and players drive each other's characters.
+  //   3. Everyone presses Start. Each machine loads the SAME cartridge and arms
+  //      the frame gate before running a single frame (bootRom ->
+  //      lsArmBeforeFreerun), then tells the engine it is holding at frame 0.
+  //   4. The BARRIER releases when every seated peer has said that, about the
+  //      same cartridge. Frame 0 then runs on every machine together.
+  //
+  // ⚠ WHY THERE IS NO SEAT-COUNT MESSAGE BEFORE THE LOAD. Dreamcast has to send
+  // one: its Maple devices are created inside retro_load_game and it cannot
+  // hotplug, so the controller COUNT is part of the starting state. This core
+  // does not have that problem — Genesis-Plus-GX's config_default() leaves
+  // input.system[0] AND input.system[1] as SYSTEM_GAMEPAD and the shim never
+  // calls retro_set_controller_port_device, so both Mega Drive ports are
+  // gamepads from boot on every machine no matter how many people are in the
+  // room. Sending a count here would be cargo-culted ceremony. What DOES matter
+  // is that an unseated port is written all-zero, which is what a controller
+  // nobody is holding does, and is byte-for-byte what single player already did.
+  //
+  // ⚠ THE ROOM IS TWO PEOPLE, BECAUSE THE CONSOLE IS. A Mega Drive has two
+  // controller ports. The shim keeps pad[8] and serves all eight through
+  // input_state_cb, but the core only POLLS two: reaching four (4-Way Play) or
+  // eight (Team Player) needs retro_set_controller_port_device, which is neither
+  // in gpgx_shim.c nor in build.sh's EXPORTED_FUNCTIONS, so JavaScript cannot
+  // reach it. That is a core rebuild, not a page change, and until it happens
+  // this room seats two and says so rather than seating four and dropping half
+  // the inputs on the floor.
   // ═══════════════════════════════════════════════════════════════════════════
+
+  // A Mega Drive has two controller ports, and this number is READ FROM THE
+  // CORE'S BEHAVIOUR rather than assumed: Genesis-Plus-GX's config_default()
+  // makes input.system[0] and input.system[1] gamepads and
+  // osd_input_update_internal_bitmasks() polls exactly those two.
+  var GEN_PORTS = 2;
+
+  var NET = {
+    session: null,     // the live Netplay.Session, or null
+    role: null,        // 'host' | 'guest'
+    leaving: false,    // WHO hung up, so the notice can say
+  };
+
+  // ⚠ THE DEFAULT MUST BE 'peerjs', NOT lib/netplay.js's 'local'. `local`
+  // signalling pairs two tabs of the SAME browser and nothing else, so a page
+  // that took the default would look perfect in a test rig and pair with nobody
+  // on the internet. `?net=local` selects it deliberately, which is what the
+  // two-peer harness uses so it needs no broker.
+  function netTransport() {
+    var v = new URLSearchParams(location.search).get('net');
+    return v === 'local' ? 'local' : 'peerjs';
+  }
+  function netSupported() {
+    return !!(window.Netplay && Netplay.supported && Netplay.supported());
+  }
+  function netStatus(text, cls) {
+    var el = $('netStatus');
+    if (!el) return;
+    el.textContent = text;
+    el.className = cls || '';
+  }
+  function netOpen() {
+    $('netOverlay').classList.add('on');
+    // The game list on the JOIN side has to name what this player actually has
+    // selected now, not what was selected when the page loaded.
+    netSyncGameList();
+    if (!NET.session) netStatus('Not connected. Open a room or join one — you do not need a game running first.');
+  }
+  function netClose() { $('netOverlay').classList.remove('on'); }
+
+  function netSyncGameList() {
+    var sel = $('netGame');
+    if (!sel) return;
+    var want = (isMobile ? $('mobileRomSelect') : $('romSelect'));
+    var cur = sel.value;
+    sel.innerHTML = '';
+    ROMS.forEach(function (r, i) {
+      var o = document.createElement('option');
+      o.value = String(i); o.textContent = r.label;
+      sel.appendChild(o);
+    });
+    sel.value = cur || (want ? want.value : '0') || '0';
+  }
+
+  // lib/netplay.js binds the game name into the pairing handshake and REFUSES a
+  // joiner who names a different one, so both sides must agree on the label
+  // before they ever connect. The cartridge itself is compared again, harder, at
+  // the start barrier (lsDisc()).
+  function netGameId() {
+    var sel = isMobile ? $('mobileRomSelect') : $('romSelect');
+    var i = +(sel && sel.value) || 0;
+    return (ROMS[i] || ROMS[0]).label;
+  }
+
+  function netOnStatus(e) {
+    var s = e.state;
+    if (s === 'signalling') {
+      netStatus(NET.role === 'host'
+        ? 'Waiting for someone to join with code ' + NET.session.code + '…'
+        : 'Looking for the host…', 'busy');
+    } else if (s === 'connected') {
+      // ⚠ NOT "you are Player 2". Which port a player holds is the ENGINE's
+      // answer — hardcoding it here is how a Player 2 ends up told they are
+      // Player 1 and reaches for the wrong character.
+      var ls = lsEngine();
+      var mine = (ls && ls.localPorts && ls.localPorts.length) ? ls.localPorts[0] : null;
+      netStatus(mine != null
+        ? 'In the room — you are Player ' + (mine + 1) + '. Press Start when you are both ready.'
+        : 'In the room. Press Start when you are both ready.', 'good');
+      $('netLeave').style.display = '';
+      netRoomRender();
+    } else if (s === 'closed') {
+      // The channel's onclose fires on BOTH sides and arrives after netLeave()
+      // has set its own text, so without the flag the person who pressed Leave
+      // is told the other player left.
+      netStatus(NET.leaving ? 'Left the room.' : 'The room closed.', 'busy');
+      lsDisarm(NET.leaving ? 'you left the room' : 'the room closed');
+      netRoomRender();
+      // The readout describes a session; with none, it must not keep describing
+      // the last one over a picture that is now single player.
+      $('netHud').classList.remove('on');
+    } else if (s === 'failed') {
+      netStatus('Could not connect' + (e.detail ? ': ' + e.detail : '.'), 'bad');
+    }
+    pageLog('[net] ' + (NET.role || 'session') + ' ' + s + (e.detail ? ' (' + e.detail + ')' : ''));
+  }
+
+  // ---- the room, one row per CONTROLLER PORT --------------------------------
+  function netRoomRender() {
+    var box = $('netRoom'), ul = $('netRoster');
+    if (!box || !ul) return;
+    var ls = lsEngine();
+    if (!NET.session || !ls) { box.style.display = 'none'; return; }
+    box.style.display = '';
+    $('netRoomPorts').textContent = ' — this console has ' + ls.portCount + ' controller ports';
+    ul.innerHTML = '';
+    var mine = ls.localPorts || [];
+    for (var p = 0; p < ls.portCount; p++) {
+      var peer = ls.roster[p];
+      var li = document.createElement('li');
+      var dot = document.createElement('span');
+      dot.className = 'dot' + (peer ? (mine.indexOf(p) >= 0 ? ' dot me on' : ' on') : '');
+      var t = document.createElement('span');
+      t.textContent = 'Player ' + (p + 1) + ' — '
+        + (peer ? (mine.indexOf(p) >= 0 ? 'you' : 'connected') : 'empty');
+      li.appendChild(dot); li.appendChild(t);
+      ul.appendChild(li);
+    }
+  }
+
+  // ---- the live readout, over the picture -----------------------------------
+  // ⚠ IT REPORTS WHAT IS TRUE, NOT WHAT WAS INTENDED. "Lockstep" here means the
+  // cores are frame-gated and nothing else; a session that is connected but not
+  // gating says so, because gated-and-silently-diverging is worse than not
+  // gated — it looks right.
+  var netHudAt = 0;
+  function netHudTick(ts) {
+    var hud = $('netHud');
+    if (!hud) return;
+    if (!NET.session) { hud.classList.remove('on'); return; }
+    if (ts - netHudAt < 250) return;
+    netHudAt = ts;
+    hud.classList.add('on');
+    var ls = lsEngine();
+    if (!ls) {
+      hud.innerHTML = '<span class="warn">⚠ connected, but no lockstep engine — this is NOT lockstep</span>';
+      return;
+    }
+    var rows = [];
+    if (!LS.armed) {
+      rows.push('<span class="warn">room open — press Start to load the game</span>');
+    } else {
+      rows.push('<span class="mode">LOCKSTEP</span> frame ' + ls.frame
+        + ' · delay ' + ls.delay + ' (' + Math.round(ls.delay * FRAME_MS) + ' ms)');
+      rows.push('ports ' + ls.portCount + ' · mine ' + JSON.stringify(ls.localPorts)
+        + ' · fingerprints ' + LS.hashes);
+      if (LS.stalling) {
+        rows.push('<span class="warn">waiting for Player '
+          + LS.waitingOn.map(function (p) { return p + 1; }).join(', ') + '…</span>');
+      }
+    }
+    hud.innerHTML = rows.join('<br>');
+  }
+
+  // A divergence is named and shown, never swallowed. The engine reports which
+  // frame and which peer; a session that has diverged is over, because every
+  // frame after it is a different game on each machine.
+  function netOnDesync(d) {
+    var el = $('netDesync');
+    pageLog('[lockstep] ⚠ DESYNC ' + JSON.stringify(d));
+    if (!el) return;
+    el.classList.add('on');
+    el.innerHTML = '<b>⚠ The two consoles stopped agreeing</b><br>'
+      + 'Frame ' + (d && d.frame != null ? d.frame : '?')
+      + (d && d.peer ? ' · ' + String(d.peer).slice(0, 8) : '')
+      + '. Online play has stopped; leave the room and start again.';
+    lsDisarm('the consoles diverged at frame ' + (d && d.frame != null ? d.frame : '?'));
+  }
+
+  function netWire(session) {
+    NET.session = session;
+    // A latched desync notice belongs to the room that produced it. Leaving it
+    // up over a fresh room would report a divergence that has not happened.
+    $('netDesync').classList.remove('on');
+    session.on('status', netOnStatus);
+    session.on('desync', netOnDesync);
+    session.on('lockstep', function () { netRoomRender(); });
+    session.on('room', function () { netRoomRender(); });
+    // ⚠ THE ENGINE HAS TO EXIST BEFORE THE FIRST PEER IS SEATED, and it must be
+    // built with THIS console's numbers rather than lib/netplay.js's Dreamcast
+    // defaults (4 ports, 64-byte pads). A Genesis pad is a 12-bit libretro mask,
+    // so two bytes carry it exactly and the per-frame image is 4 bytes rather
+    // than 256.
+    try {
+      session.startLockstep({ portCount: GEN_PORTS, padBytes: LS_PAD_BYTES, hashEvery: LS.hashEvery });
+    } catch (e) {
+      pageLog('[lockstep] ⚠ startLockstep failed: ' + ((e && e.message) || e));
+    }
+    netRoomRender();
+  }
+
+  // ⚠ A ROOM MAY NOT BE OPENED ON A CONSOLE THAT IS ALREADY RUNNING, and this
+  // guard is not politeness — without it the page has a silent desync hole. The
+  // frame gate is armed inside bootRom(); a player who pressed Start first and
+  // opened a room second would never arm it, so they would free-run on their own
+  // clock while their peer sat waiting at the start barrier for a readiness
+  // message that never comes. One console runs, the other is frozen, and neither
+  // says why. Everyone joins BEFORE anything boots — that ordering IS the
+  // architecture, so the honest answer here is to say so out loud.
+  function netRefuseIfRunning() {
+    if (!running) return false;
+    netStatus('This console is already running a game. Online play has to be set up BEFORE the game '
+      + 'starts, so that every player begins on the same frame — reload the page, join the room, then '
+      + 'press Start together.', 'bad');
+    return true;
+  }
+
+  async function netStartHost() {
+    if (NET.session) return;
+    if (netRefuseIfRunning()) return;
+    // NO "you must boot first" GATE. That was a streaming requirement — there
+    // was nothing to capture until a game was running — and streaming is
+    // cancelled. A room opens before anything is fetched, which is what lets
+    // both players agree on a game and then load it at the same time.
+    $('netHostPane').style.display = '';
+    $('netJoinPane').style.display = 'none';
+    $('netHostBtn').classList.add('on'); $('netJoinBtn').classList.remove('on');
+    var code = Netplay.makeCode(5);
+    $('netCode').textContent = code;
+    var game = netGameId();
+    NET.role = 'host';
+    netStatus('Room open for ' + game + '. Share the code — you both load the game once you are in.', 'busy');
+    var s = new Netplay.Session({ game: game, host: true, code: code, portCount: GEN_PORTS, transport: netTransport() });
+    netWire(s);
+    pageLog('[net] room ' + code + ' open for ' + game);
+    await s.start();
+  }
+
+  async function netStartGuest() {
+    if (NET.session) return;
+    if (netRefuseIfRunning()) return;
+    var code = ($('netCodeIn').value || '').trim().toUpperCase();
+    if (!/^[A-HJ-NP-Z2-9]{5}$/.test(code)) {
+      netStatus('That does not look like a code — 5 characters, no I O 0 or 1.', 'bad');
+      return;
+    }
+    // lib/netplay.js refuses a pairing whose game names differ, so the joiner
+    // MUST name the same cartridge the host chose — that is why the join pane
+    // carries a game selector. A wrong pick fails with "the other player is on
+    // <game>" instead of connecting to nothing.
+    var i = +($('netGame').value || 0) || 0;
+    var game = (ROMS[i] || ROMS[0]).label;
+    // Keep the page's own picker in step, so pressing Start loads what the room
+    // is playing rather than whatever was selected before.
+    ['romSelect', 'mobileRomSelect'].forEach(function (id) {
+      var sel = $(id); if (!sel) return;
+      sel.value = String(i);
+      sel.dispatchEvent(new Event('change'));
+    });
+    NET.role = 'guest';
+    var s = new Netplay.Session({ game: game, host: false, code: code, portCount: GEN_PORTS, transport: netTransport() });
+    netWire(s);
+    // ⚠ NO START LOCK. Under streaming a joiner had no emulator and must not
+    // launch one, so Start was disabled for a guest. Under lockstep a joiner
+    // runs their own console and MUST start it — that lock was the single line
+    // that made this two-machines-one-emulator.
+    pageLog('[net] joining room ' + code + ' (' + game + ')');
+    await s.start();
+  }
+
+  function netLeave() {
+    var s = NET.session;
+    NET.leaving = true;
+    if (s) { try { s.close(); } catch (e) {} }
+    NET.session = null; NET.role = null;
+    $('netLeave').style.display = 'none';
+    $('netHostPane').style.display = 'none';
+    $('netJoinPane').style.display = 'none';
+    lsDisarm('you left the room');
+    netRoomRender();
+    $('netHud').classList.remove('on');
+    netStatus('Left the room.');
+    pageLog('[net] session closed by this side');
+    setTimeout(function () { NET.leaving = false; }, 2000);
+  }
+
   (function wireNetplay() {
-    if (!window.NetplayHost || !NetplayHost.supported()) return;
-    var go = function () {
-      var sel = isMobile ? $('mobileRomSelect') : $('romSelect');
-      var pick = ROMS[+(sel && sel.value) || 0] || ROMS[0];
-      location.href = NetplayHost.lobbyUrl('/genesis_multiplayer.html', pick.label);
-    };
+    // Refuse to render rather than present a dead control: a button that does
+    // nothing when pressed reads as "the site is broken".
+    if (!netSupported()) return;
     ['btnNet', 'mobileSplashNet'].forEach(function (id) {
       var b = $(id); if (!b) return;
       b.hidden = false;
-      b.addEventListener('click', go);
+      b.style.display = '';
+      b.addEventListener('click', netOpen);
     });
-    NetplayHost.arm({
-      seam: '__genNet',
-      players: 'p2',
-      log: function (m) { if (window.console) console.log(m); },
-      canvas: function () { return $('canvas'); },
-      // "Is there a game to stream?" answered by FRAMES, not by a start flag: a
-      // start flag is set the instant Start is pressed, long before the core
-      // exists, and capturing then would publish a black canvas.
-      live: function () { return window.__genFrames > 0; },
-      coreUp: function () { return !!(window.Module && Module._gpx_set_pad && wasmReady); },
-      // The game is named by its LABEL, never by its index into ROMS. CLAUDE.md
-      // records an index going stale exactly this way.
-      selectGame: function (label) {
-        for (var i = 0; i < ROMS.length; i++) {
-          if (ROMS[i].label !== label) continue;
-          ['romSelect', 'mobileRomSelect'].forEach(function (id) {
-            var s = $(id); if (!s) return;
-            s.value = String(i);
-            s.dispatchEvent(new Event('change'));
-          });
-          return label;
-        }
-        return null;
-      },
-      // ⚠ NEVER override a Start the capability layer is holding down: that
-      // button being disabled means the page has decided this device cannot run
-      // the emulator, and clicking past it is the exact bug the gate exists to
-      // stop. The core is also not loaded yet when this runs, so it polls for
-      // wasmReady rather than assuming a duration — and gives up rather than
-      // spinning forever if the gate never releases.
-      pressStart: function () {
-        var tries = 0;
-        var attempt = function () {
-          if (!wasmReady) return false;
-          var b = isMobile ? $('mobileSplashStart') : $('btnStart');
-          if (!b || b.disabled || b.getAttribute('aria-disabled') === 'true') return false;
-          if (isMobile) $('mobileSplash').style.display = 'none';
-          startFromList();
-          return true;
-        };
-        if (attempt()) return;
-        var iv = setInterval(function () {
-          if (attempt() || ++tries > 480) clearInterval(iv);   // 480 x 250 ms = 2 min
-        }, 250);
-      },
-      onStatus: function (e) { if (e.state === 'connected') setStatus('Player 2 connected (controller port B).'); },
+    $('netClose').addEventListener('click', netClose);
+    $('netLeave').addEventListener('click', netLeave);
+    $('netHostBtn').addEventListener('click', function () { netStartHost(); });
+    $('netJoinBtn').addEventListener('click', function () {
+      $('netJoinPane').style.display = '';
+      $('netHostPane').style.display = 'none';
+      $('netJoinBtn').classList.add('on'); $('netHostBtn').classList.remove('on');
+      netSyncGameList();
     });
+    $('netGo').addEventListener('click', function () { netStartGuest(); });
+    $('netCopy').addEventListener('click', function () {
+      // ⚠ writeText REJECTS A PROMISE, it does not throw. A bare try/catch here
+      // would report "Code copied" on a browser that refused the clipboard, and
+      // the player would share nothing and wonder why nobody joined.
+      var code = $('netCode').textContent.trim();
+      try {
+        navigator.clipboard.writeText(code)
+          .then(function () { toast('Code copied'); })
+          .catch(function () { toast('Could not copy — read the code out instead', true); });
+      } catch (e) { toast('Could not copy — read the code out instead', true); }
+    });
+    $('netOverlay').addEventListener('click', function (e) { if (e.target === $('netOverlay')) netClose(); });
+    netSyncGameList();
+
+    // A room the visitor was invited into: genesis.html?np=<code>. There is no
+    // separate lobby page any more, so this is the whole handoff — it fills the
+    // code in and opens the panel on the JOIN side, and the visitor still
+    // presses Join themselves.
+    try {
+      var np = new URLSearchParams(location.search).get('np');
+      if (np && /^[A-HJ-NP-Z2-9]{5}$/i.test(np)) {
+        $('netCodeIn').value = np.toUpperCase();
+        $('netJoinBtn').click();
+        netOpen();
+      }
+    } catch (e) {}
   })();
+
+  // The page's own test seam. It reports what is TRUE about the session rather
+  // than that one exists, so a test cannot pass on a page that opened a room and
+  // then free-ran.
+  window.__genNet = function () {
+    var ls = lsEngine();
+    return {
+      supported: netSupported(),
+      session: !!NET.session,
+      role: NET.role,
+      mode: 'lockstep',            // there is no other mode on this page
+      // ⚠ `live` MEANS "THE EMULATOR IS ACTUALLY PRODUCING FRAMES", and it is
+      // not netplay state at all. tools/mobile_chrome_test.mjs uses it as the
+      // witness that arms its orientation cell — without it that cell VOIDs and
+      // stops being able to tell a fixed page from a broken one. Frames, never a
+      // start flag: a start flag is true the instant Start is pressed, long
+      // before a core exists.
+      live: (window.__genFrames | 0) > 0,
+      armed: LS.armed,
+      running: LS.running,
+      frames: LS.frames,
+      hashes: LS.hashes,
+      fault: LS.fault,
+      stalling: LS.stalling,
+      waitingOn: LS.waitingOn.slice(),
+      ports: ls ? ls.portCount : GEN_PORTS,
+      roster: ls ? ls.roster.slice() : null,
+      localPorts: ls ? ls.localPorts.slice() : null,
+      frame: ls ? ls.frame : 0,
+      state: ls ? ls.state : null,
+      // The literal bytes the core was handed for every port on the last gated
+      // frame — an assertion target that cannot be faked by a UI flag.
+      image: window.__genLsImage || null,
+    };
+  };
 
   // ── load the core ─────────────────────────────────────────────────────────
   resizeCanvas(320, 224);
