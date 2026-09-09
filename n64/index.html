@@ -3748,9 +3748,7 @@ N64Rate.selfTest = function (logFn) {
     // than suspended, so the room degrades to slow instead of dying. It cannot
     // make the guest run FAST: lsDueNow() is still the governor, so this only
     // ever adds opportunities to run a frame that is already due.
-    setInterval(function () {
-      if (LS.armed) { try { lsFeed(); } catch (e) {} }
-    }, 4);
+    if (NET.pendingCode) lsArmFeedTimer();
     void hookIv;
 
     pageLog('[net] online play available (' + netTransport() + ' signalling) — deterministic lockstep, '
@@ -3782,6 +3780,24 @@ N64Rate.selfTest = function (logFn) {
   // It is inert unless called, it creates nothing that can reach the network,
   // and it cannot turn itself on: a page nobody calls this on has NET.session
   // null and behaves exactly as it does today.
+  // The timer half of the feed. Armed only when there is actually a room —
+  // either by the ?np= handoff or by the test seam below — because 250 wakeups a
+  // second to read one boolean is not free on a phone and single player must be
+  // untouched. Idempotent: a second call does not add a second timer.
+  // ⚠ DECLARED WITHOUT AN INITIALIZER ON PURPOSE. wireNetplay() is a nested IIFE
+  // that runs EARLIER in this file than these lines, and it calls
+  // lsArmFeedTimer() — which works, because a function declaration hoists. But
+  // `var lsFeedTimer = 0` would then execute afterwards and RESET the handle to
+  // 0, so the idempotence check would pass a second time and arm a SECOND timer
+  // feeding the same core. A bare `var` hoists without reassigning.
+  var lsFeedTimer;
+  function lsArmFeedTimer() {
+    if (lsFeedTimer) return;
+    lsFeedTimer = setInterval(function () {
+      if (LS.armed) { try { lsFeed(); } catch (e) {} }
+    }, 4);
+  }
+
   window.__n64LsAttach = function (opts) {
     if (!window.Netplay || !Netplay.Lockstep) return null;
     var ls = new Netplay.Lockstep(opts || {});
@@ -3794,6 +3810,8 @@ N64Rate.selfTest = function (logFn) {
     // The rig needs the LIVE engine to seat players, declare ready and deliver
     // the peer's messages. It is the same object the page feeds, not a copy.
     window.__n64LsEngine = ls;
+    // wireNetplay already ran, so the ?np= arming above cannot have fired.
+    lsArmFeedTimer();
     return true;
   };
 
