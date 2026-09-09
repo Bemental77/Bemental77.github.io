@@ -378,5 +378,84 @@ console.log('\n== the transferred-state path is kept, and is NOT the start path 
   gf ? ok('truncated-reported', gf.error) : bad('truncated-reported', 'silent');
 }
 
+// ===========================================================================
+// A ROSTER IS A SNAPSHOT, AND A PEER HAS TO BE ABLE TO TELL WHEN ITS COPY HAS
+// STOPPED BEING TRUE.
+//
+// THE FAILURE THESE CELLS EXIST FOR, from two real devices on caseybement.com:
+//   PHONE  "you are Player 2 (maple port 1) · P1 f126ff364842db19 · P2 you"
+//   DESKTOP "the other player dropped out — this room is empty again"
+// Both at "frame 0 · core ran 0", neither saying anything was wrong. The
+// roster had exactly three senders — seat(), unseat(), the barrier release —
+// with no retransmit and no way to ask, so the phone was drawing a message
+// that arrived before everything went wrong and had no way to know.
+// The page renders rosterEvicted / rosterStale as a banner, so these two flags
+// ARE the "your screen may be lying to you" claim and must be tested here
+// rather than only in a browser rig where the reconnect usually wins the race.
+// ===========================================================================
+console.log('\n== a guest can tell when its picture of the room has stopped being true ==');
+{
+  const b = room([{ id: 'H', host: true }, { id: 'A' }]);
+  b.H.seat('H', 1); b.H.seat('A', 1);
+  is('roster-seq-advances', b.A.rosterSeq > 0, true);
+  is('a-seated-guest-is-not-evicted', b.A.report().rosterEvicted, false);
+  is('a-fresh-roster-is-not-stale', b.A.report().rosterStale, false);
+  // The host drops this player. On the wire that is an ordinary roster whose
+  // seats no longer include them — which is exactly what the phone never got.
+  b.H.unseat('A');
+  is('the-guest-KNOWS-it-was-dropped', b.A.report().rosterEvicted, true);
+  is('the-guest-holds-no-port', b.A.localPorts.length, 0);
+  // The host is never "evicted" from its own room — it IS the roster.
+  is('the-host-never-reports-eviction', b.H.report().rosterEvicted, false);
+}
+{
+  // Silence is the other half: a guest that has heard NO authoritative roster
+  // for four heartbeats must stop claiming to know who is in the room. Aged by
+  // hand rather than by waiting nine seconds.
+  const b = room([{ id: 'H', host: true }, { id: 'A' }]);
+  b.H.seat('H', 1); b.H.seat('A', 1);
+  is('not-stale-while-heard-from', b.A.report().rosterStale, false);
+  b.A.rosterAt = Date.now() - 60000;
+  is('nine-seconds-of-silence-is-STALE', b.A.report().rosterStale, true);
+  is('the-host-is-never-stale-to-itself', b.H.report().rosterStale, false);
+  // ...and a retransmit clears it. This is the whole point of the heartbeat:
+  // the room reconverges on its own instead of waiting for the next seat change
+  // that may never come.
+  b.H._rosterSend();
+  is('a-retransmit-clears-the-staleness', b.A.report().rosterStale, false);
+  is('a-retransmit-does-not-move-the-seats', JSON.stringify(b.A.roster), JSON.stringify(['H', 'A', null, null]));
+}
+{
+  // A LATE OR REORDERED ROSTER MUST NEVER UNDO A NEWER ONE. A relay can
+  // deliver a heartbeat after the seat change it precedes, and applying it
+  // would unseat somebody who is in the room.
+  const b = room([{ id: 'H', host: true }, { id: 'A' }]);
+  b.H.seat('H', 1); b.H.seat('A', 1);
+  const newest = b.A.rosterSeq;
+  b.A.receive({ t: 'lsroster', r: [null, null, null, null], portCount: 4, seq: newest - 1 });
+  is('a-stale-roster-is-ignored', JSON.stringify(b.A.roster), JSON.stringify(['H', 'A', null, null]));
+  b.A.receive({ t: 'lsroster', r: ['H', 'A', 'B', null], portCount: 4, seq: newest + 1 });
+  is('a-newer-roster-is-applied', JSON.stringify(b.A.roster), JSON.stringify(['H', 'A', 'B', null]));
+}
+{
+  // THE RETURNING PLAYER GETS THEIR OWN PORT BACK. Ports are handed out
+  // lowest-free-first, so without seatHistory a player whose page reloaded
+  // could be given a seat somebody else was about to take — i.e. a different
+  // character — while nothing had run a frame.
+  const b = room([{ id: 'H', host: true }, { id: 'A' }, { id: 'B' }]);
+  b.H.seat('H', 1); b.H.seat('A', 1); b.H.seat('B', 1);
+  eq('three-seated', b.H.roster, ['H', 'A', 'B', null]);
+  b.H.unseat('A');                       // A's page went away
+  eq('the-seat-is-freed', b.H.roster, ['H', null, 'B', null]);
+  b.H.seat('A', 1);                      // ...and came back
+  eq('the-returning-player-gets-PORT-1-BACK', b.H.roster, ['H', 'A', 'B', null]);
+  // Re-seating an already-seated peer is a no-op on the seats and still
+  // republishes, which is what a reconnect that KEPT its seat needs.
+  const before = JSON.stringify(b.H.roster);
+  const got = b.H.seat('A', 1);
+  eq('reseating-a-seated-peer-moves-nobody', b.H.roster, JSON.parse(before));
+  eq('reseating-reports-the-port-it-already-had', got, [1]);
+}
+
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'}  ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
