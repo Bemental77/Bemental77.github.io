@@ -648,6 +648,24 @@ async function bootFully(pg, what, deadlineMs) {
   return { ok: false, why: `${what}: never reached a running core within ${(deadlineMs / 1000).toFixed(0)} s`, probe: p };
 }
 
+// PRESS START ON A PAGE THAT MAY ALREADY BE STARTING ONE.
+// After a mid-room reload the room itself often starts the returning console
+// (the 'room-game' handler auto-starts a joiner the moment it is seated), and
+// #btnStart is disabled while a boot is in flight. Pressing a disabled control
+// is a failure this rig reports rather than clicks through, so read the button
+// and let a boot that is already running be the answer.
+async function pg2Start(pg, wasPreBooted) {
+  const live = await probe(pg).catch(() => null);
+  if (live && live.booted) return { ok: true, why: 'already booted' };
+  const busy = await pg.evaluate(() => {
+    const b = document.getElementById('btnStart'), m = document.getElementById('mobileSplashStart');
+    return !!((b && b.disabled) || (m && m.disabled));
+  }).catch(() => false);
+  if (busy) return { ok: true, why: 'a boot is already in flight (Start is held down)' };
+  const r = await human(pg, pg.__mobile ? '#mobileSplashStart' : '#btnStart', 'Start');
+  return { ok: r.ok, why: r.why || 'pressed Start', wasPreBooted: !!wasPreBooted };
+}
+
 const shot = async (pg, tag) => {
   const f = path.join(OUT, `${NAME}-${ARM}-${pg.__role}-${tag}.png`);
   try { await pg.screenshot({ path: f }); RESULT.shots = (RESULT.shots || []).concat(f); } catch (e) {}
@@ -744,8 +762,22 @@ async function runArm(armName) {
   // be left with a room, a code, and no way to start the game.
   const mobileHost = /^mobile-host/.test(armName);
   // WHICH SIDE ALREADY HAD THE GAME RUNNING BEFORE THE ROOM EXISTED.
-  const preBoot = /^(host-running|mobile-host-running)$/.test(armName) ? 'host'
-                : /^(joiner-running|mobile-joiner-running)$/.test(armName) ? 'join' : null;
+  const preBoot = /^(host-running|mobile-host-running)(-reload)?$/.test(armName) ? 'host'
+                : /^(joiner-running|mobile-joiner-running)(-reload)?$/.test(armName) ? 'join' : null;
+  // ⚠ WHICH SIDE RELOADS *MID-ROOM*, AND WHY THIS IS THE USER'S ARM.
+  // Every reload rig in this repo before today reloaded a side that had NOT
+  // been seated (`rejoin`) or reloaded it back to a BARE URL (`host-reload`),
+  // which is a peer LEAVING. The state the user photographed is neither: both
+  // consoles had been seated, both had loaded the disc with TWO controllers
+  // plugged in, both sat at "core ran 0" — and then one side's page came back.
+  // A phone does that unasked when a backgrounded tab is discarded, and the
+  // room hand-off leaves ?np=<code>&join=1&npwait=1 in the address bar, so what
+  // comes back is a page that RE-KNOCKS on the same room with a NEW identity.
+  // The reload here is therefore at the page's OWN LIVE URL, taken with
+  // pg.url() — reloading to the bare page would test a different thing and is
+  // what made the existing arm miss this.
+  const reloadSide = /^(joiner-reload|joiner-running-reload|mobile-joiner-running-reload)$/.test(armName) ? 'join'
+                   : /^(host-reload-live|host-running-reload|mobile-host-running-reload)$/.test(armName) ? 'host' : null;
   const host = await launch('host', mobileHost);
   const join = await launch('join', mobileJoiner);
   const pages = [host, join];
@@ -1196,6 +1228,126 @@ async function runArm(armName) {
     if (!booted.every(Boolean)) {
       voidc('the-barrier-releases', 'not measurable: a core never booted');
       return;
+    }
+
+    // -- 5a1. THE MID-ROOM RELOAD — THE USER'S TWO SCREENSHOTS ---------------
+    // Both consoles are now seated, loaded, and parked at frame 0 under the
+    // gate. That is EXACTLY the state the user photographed ("frame 0 · core
+    // ran 0 · 2 controllers plugged in" on both), and it is the state in which
+    // one side's page came back: the phone reloaded, its old identity died with
+    // the old page, and the host — which unseats a peer whose link is gone —
+    // was left drawing an empty room while the phone still drew a full one.
+    //
+    // THE PRODUCT REQUIREMENT, stated so a cell can fail on it: the room must
+    // RECONVERGE. Not "the survivor is told" (that is the `host-reload` cell,
+    // for a peer that really left) — reconverge, because the peer came BACK and
+    // is standing in the same room asking to play. Nothing may have advanced a
+    // frame in the meantime, which is what makes reconvergence legal at all.
+    if (reloadSide) {
+      const rl = reloadSide === 'host' ? host : join;
+      const other = reloadSide === 'host' ? join : host;
+      const liveUrl = await rl.evaluate(() => location.href);
+      D.reload = { side: reloadSide, url: liveUrl };
+      say(`\n-- the ${reloadSide === 'host' ? 'HOST' : 'JOINER'} page RELOADS mid-room, at its own live URL`);
+      say(`  ....  ${liveUrl}`);
+      const preRoster = await Promise.all(pages.map(readRoster));
+      D.reload.before = preRoster.map((r) => ({ rows: r.rows.map((x) => x.text), hud: (r.hud || '').slice(0, 200) }));
+      await gotoSettled(rl, liveUrl);
+      // A page handed ?np=<code>[&join=1] re-enters the room by itself. A page
+      // reloaded to a BARE url has no room at all any more, so a person has to
+      // drive the lobby again — which is a human action and is allowed.
+      const carriesRoom = /[?&]np=/.test(liveUrl);
+      D.reload.carriesRoom = carriesRoom;
+      if (!carriesRoom) {
+        if (reloadSide === 'join') await joinerJoins('-after-reload');
+        else {
+          say('  ....  the host came back to a bare page — re-opening a room is the only thing a person can do');
+          const oL = await openLobbyNow(host, entry[0].found[0]);
+          if (oL.ok) { await sleep(600); await human(host, '#netHostBtn', 'Open a room'); }
+        }
+      }
+      // The host may be asked to admit the returning peer again. Pressing Allow
+      // is a human action; NOT being asked at all is also a legitimate product
+      // answer, so this is a scan, not a requirement.
+      const tRe = Date.now();
+      let re = { hit: null, all: [] }, seatedAgain = false;
+      while (Date.now() - tRe < ADMIT_MS) {
+        const hostSide = reloadSide === 'host' ? join : host;
+        re = await findAdmitControl(hostSide);
+        if (re.hit) { await clickAt(hostSide, re.hit.box, re.hit.text); say(`  ....  pressed "${re.hit.text}" for the returning peer`); }
+        const [a, b] = await Promise.all([readRoster(host), readRoster(join)]);
+        if (occupied(a).length >= 2 && occupied(b).length >= 2) { seatedAgain = true; break; }
+        await sleep(1200);
+      }
+      const [h3, j3] = await Promise.all([readRoster(host), readRoster(join)]);
+      D.reload.after = { host: { rows: h3.rows.map((x) => x.text), hud: (h3.hud || '').slice(0, 240), status: h3.status },
+                         join: { rows: j3.rows.map((x) => x.text), hud: (j3.hud || '').slice(0, 240), status: j3.status } };
+      await shot(host, '5r-after-reload'); await shot(join, '5r-after-reload');
+      const ho3 = occupied(h3), jo3 = occupied(j3);
+      say(`  ....  after the reload: host sees ${ho3.length} seat(s) ${J(h3.rows.map((r) => r.text))}`);
+      say(`  ....                    join sees ${jo3.length} seat(s) ${J(j3.rows.map((r) => r.text))}`);
+      say(`  ....  host HUD  "${(h3.hud || '').slice(0, 190)}"`);
+      say(`  ....  join HUD  "${(j3.hud || '').slice(0, 190)}"`);
+      cell(ho3.length >= 2 && jo3.length >= 2, 'the-room-RECONVERGES-after-one-side-reloads',
+        `both machines are back in one room after the ${reloadSide} reloaded: host ${J(ho3.map((x) => x.who))}, ` +
+        `joiner ${J(jo3.map((x) => x.who))}${seatedAgain ? '' : ' (roster read after the admit scan)'}`,
+        `THE ROOM DID NOT RECONVERGE. Host draws ${J(h3.rows.map((r) => r.text))} and the joiner draws ` +
+        `${J(j3.rows.map((r) => r.text))} — the exact pair of screenshots the user sent: one device says it is ` +
+        'alone, the other says it is in a room with somebody. Nothing had run a frame, so there was no ' +
+        'determinism reason to refuse the returning peer.');
+      const p3 = [hudPort(h3), hudPort(j3)];
+      cell(p3.every((x) => x != null) && p3[0] !== p3[1], 'the-two-sides-still-hold-DIFFERENT-ports-after-a-reload',
+        `host port ${p3[0]}, joiner port ${p3[1]}`,
+        `maple ports after the reload: host ${J(p3[0])}, joiner ${J(p3[1])} — two players on one port drive the ` +
+        'same character, and a null means that side was never told which player it is');
+      // ⚠ NOBODY MAY HAVE ADVANCED. Reconvergence is only safe because no core
+      // has run a frame; if one had, the two simulations would already be
+      // forked and re-seating would be papering over a desync.
+      const ran3 = [hudCoreRan(h3), hudCoreRan(j3)];
+      D.reload.coreRan = ran3;
+      cell(ran3.every((n) => n == null || n === 0), 'no-core-ran-a-frame-while-the-room-was-broken',
+        `neither console advanced while the room was inconsistent: core ran ${J(ran3)}`,
+        `a core advanced while the room was inconsistent: core ran ${J(ran3)}. Two cores that have run different ` +
+        'numbers of frames are already forked, and nothing downstream of this can make them the same game again');
+      // The returning side has a fresh page and has to load the disc again.
+      // ⚠ CLOSE THE LOBBY FIRST. #btnStart lives in #wrap and the lobby overlay
+      // is drawn OVER it, so a mouse aimed at Start lands on the overlay — the
+      // first version of this step sat at "0% loaded" forever for exactly that
+      // reason and read as a page that could not boot.
+      say('  ....  the returning side closes the lobby and loads its disc again');
+      const rlRoom = await readRoster(rl);
+      if (rlRoom.overlayOpen) await human(rl, '#netClose', 'Close');
+      await sleep(400);
+      const st = await pg2Start(rl, preBoot === reloadSide);
+      D.reload.restart = st;
+      const back = await (async () => {
+        const dl = Date.now() + BOOT_MS;
+        let lastl = '';
+        while (Date.now() < dl) {
+          const p = await probe(rl).catch(() => null);
+          if (p) {
+            const l = `${rl.__role} ${p.phase} ${Math.round(100 * (p.discBytes || 0) / (p.discTotal || 1))}%`;
+            if (l !== lastl) { lastl = l; process.stdout.write('  ....  reloading  ' + l + '            \r'); }
+            if (p.booted) return p;
+          }
+          await sleep(2500);
+        }
+        return null;
+      })();
+      process.stdout.write('\n');
+      D.reload.rebooted = !!back;
+      cell(!!back, 'the-reloaded-side-boots-again',
+        `the ${reloadSide} loaded ${GAME} again after its reload (phase ${back && back.phase})`,
+        `the ${reloadSide} never got a core back after reloading: ${J(st)} — a room nobody can re-enter after one ` +
+        'page reload is not a room two people can use');
+      if (!back) { voidc('the-barrier-releases', 'not measurable: the reloaded side never booted again'); return; }
+      // The OTHER side must still be sane: still gated, still at frame 0.
+      const og = (await probe(other)).lockstep;
+      D.reload.otherGate = og;
+      cell(!!(og && og.armed) && (og.coreFrame | 0) === 0, 'the-side-that-did-NOT-reload-is-still-gated-at-frame-0',
+        `the ${reloadSide === 'host' ? 'joiner' : 'host'} is still armed and holding at frame ${og && og.coreFrame}`,
+        `the side that did not reload is armed=${J(og && og.armed)} at frame ${J(og && og.coreFrame)} — it must ` +
+        'still be gated at 0, or it has run frames its partner never will');
     }
 
     // -- 5a2. EVERY CORE IN THIS ROOM IS ARMED --------------------------------
