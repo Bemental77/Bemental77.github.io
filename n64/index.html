@@ -3264,6 +3264,23 @@ N64Rate.selfTest = function (logFn) {
     var M = window.Module;
     if (!M || !M._neil_ls_run_frame) return false;
     lsApplyImage(img);
+    // ⚠ TEST SEAM — THE BYTES THE CORE WAS ACTUALLY HANDED, recorded AFTER
+    // lsApplyImage so it is the same array that reached _neil_ls_set_pad and
+    // not an intention. genesis.html publishes the identical thing as
+    // window.__genLsImage; this is the N64 half, and without it there is no way
+    // to prove from outside that a press on one machine reached the OTHER
+    // machine's core rather than merely reaching its network layer. A roster
+    // entry or a `running` flag cannot tell those two apart.
+    // ⚠ WRITTEN IN PLACE, NOT ALLOCATED. This runs on EVERY gated frame and the
+    // measured CPU headroom on this core is 1.03x (tools/n64_boot_test.mjs on
+    // mariokart.z64: cpuMsPerFrame 19.34 against a 20 ms budget at 50 Hz), so a
+    // fresh array per frame is a cost this path cannot casually afford. Reusing
+    // one buffer keeps the seam free.
+    try {
+      var _im = window.__n64LsImage;
+      if (!_im || _im.length !== img.length) _im = window.__n64LsImage = new Array(img.length);
+      for (var _i = 0; _i < img.length; _i++) _im[_i] = img[_i];
+    } catch (e) {}
     M._neil_ls_run_frame();
     LS.frame++;
     try { LS.lastFp = M._neil_last_fp ? (M._neil_last_fp() >>> 0) : 0; } catch (e) { LS.lastFp = 0; }
@@ -3837,6 +3854,10 @@ N64Rate.selfTest = function (logFn) {
       })(),
       frame: LS.frame,
       fed: LS.fed,
+      // The exact pad bytes the core was last handed, 4 per port in this page's
+      // wire order (see LS_PAD_BYTES). Null until the gate has fed a frame.
+      image: (window.__n64LsImage || null),
+      padBytes: LS_PAD_BYTES,
       hashes: LS.hashes,
       hashSink: LS.hashSink,
       lastFp: LS.lastFp,

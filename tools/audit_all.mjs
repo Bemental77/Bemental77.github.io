@@ -563,6 +563,15 @@ const HARNESSES = [
     server: true, requires: ['genesis.html', 'genesis/genesisWasm'], timeoutMs: 25 * MIN,
   },
   {
+    name: 'console-room-crossdevice',
+    file: 'tools/console_room_crossdevice_test.mjs',
+    cmd: ['node', 'tools/console_room_crossdevice_test.mjs'],
+    desc: 'n64 and genesis play lockstep between TWO SEPARATE CHROME PROFILES over the shipped ws/peerjs signalling — the profiles are proven unable to see each other’s BroadcastChannel, so the room can only have formed the way a real pair of players would; warm and cold profiles both',
+    fast: false, ci: false,
+    ciWhy: 'it boots both cores against n64/N64Wasm and genesis/genesisWasm ROMs (which the size-bounded CI checkout omits) AND needs a reachable public MQTT broker, so a red run would mean "the internet", not "this repo"',
+    server: true, requires: ['genesis.html', 'n64/index.html', 'lib/netplay.js'], timeoutMs: 30 * MIN,
+  },
+  {
     name: 'netplay-lockstep',
     file: 'tools/netplay_lockstep_test.mjs',
     cmd: ['node', 'tools/netplay_lockstep_test.mjs'],

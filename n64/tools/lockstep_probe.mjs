@@ -72,7 +72,13 @@ const BASE = flag('url', 'http://localhost:8080');
 const GAME = flag('game', 'Mario Kart 64');
 const FRAMES = parseInt(flag('frames', '900'), 10);
 const RUNS = parseInt(flag('runs', '2'), 10);
-const ARMS = flag('arms', 'solo,bridge').split(',').map((s) => s.trim()).filter(Boolean);
+// ⚠ `pair` IS IN THE DEFAULT NOW, AND IT WAS NOT BEFORE. It is the only arm
+// that exercises a real room — two cores, a real engine, a real admission — and
+// leaving it out of the default meant the product path was never actually run:
+// when it was finally invoked it failed 0/2, and had done so silently for as
+// long as the default excluded it. solo and bridge can both pass on a build
+// whose pairing is completely broken.
+const ARMS = flag('arms', 'solo,bridge,pair').split(',').map((s) => s.trim()).filter(Boolean);
 const JSONPATH = flag('json', '/tmp/n64-lockstep.json');
 
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -99,6 +105,62 @@ async function waitFor(page, fn, ms, what) {
     if (Date.now() - t0 > ms) throw new Error('timed out after ' + ms + ' ms waiting for ' + what);
     await sleep(150);
   }
+}
+
+// ⚠ ADMISSION IS A HUMAN PRESSING "Allow", AND A RIG THAT NEVER PRESSES IT
+// LOOKS EXACTLY LIKE A BROKEN EMULATOR. This is not a hypothetical: the `pair`
+// arm had no approval step at all and failed 0/2 with
+//   "timed out after 240000 ms waiting for host core to arm"
+// which reads like the core is dead. It is not. The chain is:
+// lib/netplay.js:2837 builds an Allow/Deny dialog and waits for a person; with
+// nobody to press it the guest gives up ("guest failed (nobody answered the
+// request)"), the host never reaches `connected`, and because the page
+// deliberately boots ONLY after connecting (n64/index.html's
+// `NET.bootWhenConnected = true`) the core never boots, never arms, and the rig
+// blames the core. The host log tell is the pair
+//   "host signalling (someone is asking to join)" -> "(waiting for someone to
+//   ask to join)"
+// with no `connected` in between.
+//
+// ⚠ AND IT IS A REAL MOUSE CLICK, NOT el.click(). elementFromPoint() is asked
+// FIRST what is actually on top at those coordinates: a button covered by an
+// overlay is a finding, not something to click through. el.click() would fire
+// the handler regardless and hide exactly that class of bug.
+async function clickReal(page, sel) {
+  const box = await page.evaluate((s) => {
+    const el = document.querySelector(s);
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    if (!r.width || !r.height) return { covered: 'the control has no box' };
+    const x = r.left + r.width / 2, y = r.top + r.height / 2;
+    const top = document.elementFromPoint(x, y);
+    if (top !== el && !el.contains(top)) {
+      return { covered: 'covered by <' + (top ? top.tagName.toLowerCase() : 'nothing') + '>' };
+    }
+    return { x, y };
+  }, sel);
+  if (!box) return { clicked: false, why: 'no such control' };
+  if (box.covered) return { clicked: false, why: box.covered };
+  await page.mouse.click(box.x, box.y);
+  return { clicked: true };
+}
+
+// Watch the HOST for the admission dialog and press Allow the way a person
+// would. Returns a handle whose .approved says whether it ever fired, so a run
+// can report "nobody ever asked" separately from "asked and was let in".
+function admitWatcher(page, log, tag) {
+  const h = { approved: false, why: null, stop: false };
+  (async () => {
+    while (!h.stop && !h.approved) {
+      try {
+        const r = await clickReal(page, '#npApproveAllow');
+        if (r.clicked) { h.approved = true; log.push('[' + tag + '] [rig] pressed Allow — the joiner is admitted'); break; }
+        if (r.why && r.why !== 'no such control') h.why = r.why;
+      } catch (e) { /* navigation between polls */ }
+      await sleep(200);
+    }
+  })();
+  return h;
 }
 
 // ⚠ A FRESH CONTEXT PER CORE IS NOT COSMETIC. The two cores must not share
@@ -543,6 +605,11 @@ async function runPair(browser, log) {
   await sleep(400);                      // let the host publish before the joiner calls
   const B = await openPage(browser, joinUrl, 'join', log, true);
 
+  // ⚠ ARMED BEFORE THE JOINER CAN POSSIBLY ASK. The dialog is transient — the
+  // guest gives up on its own — so a watcher started after the wait below would
+  // race it and lose. See admitWatcher's header for what this cost.
+  const admit = admitWatcher(A.page, log, 'host');
+
   try {
     // 1. Both cores must ARM BEFORE THEY RUN A FRAME. This is the ordering the
     //    whole architecture rests on, so it is asserted rather than assumed:
@@ -620,6 +687,10 @@ async function runPair(browser, log) {
 
     return {
       arm: 'pair', code, armed,
+      // Reported so a pass cannot be confused with a room that never needed
+      // admitting, and so a future regression in the dialog is named rather
+      // than showing up as a dead core.
+      admitted: admit.approved, admitBlocked: admit.why,
       framesHost: last.a ? last.a.frame : 0,
       framesJoin: last.b ? last.b.frame : 0,
       compared, firstDiff,
@@ -639,6 +710,7 @@ async function runPair(browser, log) {
               || (last.b && last.b.engine && last.b.engine.desync)),
     };
   } finally {
+    admit.stop = true;
     await A.close().catch(() => {});
     await B.close().catch(() => {});
   }

@@ -1720,6 +1720,16 @@
       // The literal bytes the core was handed for every port on the last gated
       // frame — an assertion target that cannot be faked by a UI flag.
       image: window.__genLsImage || null,
+      // ⚠ THE ENGINE'S OWN COUNTERS, and `hashesCompared` is the one that
+      // matters. `armed` only says this core is GATED; it says nothing about
+      // whether the two simulations are being CHECKED against each other, and a
+      // gated room with nothing comparing it diverges silently — which is worse
+      // than not gating at all, because it looks right. Without this field a rig
+      // can see fingerprints being PRODUCED (LS.hashes, above) and still have no
+      // way to tell whether any of them were ever COMPARED to the peer's.
+      // n64/index.html has published the same report all along; this is the
+      // Genesis half.
+      engine: (function () { try { return ls && ls.report ? ls.report() : null; } catch (e) { return null; } })(),
     };
   };
 
