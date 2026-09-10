@@ -4370,7 +4370,33 @@
       vmuRoomSubscribed = true;
       ls.on('cards', (c) => {
         if (!c) return;
-        if (c.error) { vmuRoomFail(c.error); return; }
+        // ⚠ "HAS TO BE AGREED AGAIN" IS NOT A FAILURE — IT IS AN INSTRUCTION.
+        // lib/netplay.js calls _cardInvalidate() whenever the seating changes
+        // ("a player took a seat", "a player left the room"), which is an
+        // ordinary event: somebody joins, or a peer drops and rejoins after a
+        // phone backgrounds its tab. Routing that to vmuRoomFail() put the
+        // console into a TERMINAL state — the Ready control read "Cannot start —
+        // see below" and the only advice on offer was "Leave the room to play on
+        // your own card", while the other player sat at "ready" waiting forever.
+        // The user hit exactly that: his phone hosting, his laptop rejoining
+        // after the phone went quiet, and a room that could never start again.
+        //
+        // The set genuinely IS void at that moment and must not be used — every
+        // console has to hold the same cards at frame 0. But the answer is to
+        // agree a NEW one, which this page already knows how to do, so it does
+        // that instead of giving up. A real failure (a card that will not
+        // decompress, a port count that disagrees) still goes to vmuRoomFail.
+        if (c.error) {
+          if (/agreed again/.test(String(c.error))) {
+            pageLog('[vmu] the seating changed (' + c.error + ') — re-agreeing the card set rather than ' +
+                    'refusing the room; the old set is void but a new one can be reached');
+            vmuRoomState = 'pending'; vmuRoomWhy = null; vmuRoomHash = null;
+            vmuRoomMine = null;
+            vmuRoomExchange();
+            return;
+          }
+          vmuRoomFail(c.error); return;
+        }
         if (c.set && c.hash) vmuInstallRoomCards(c.set, c.hash);
       });
     }
@@ -5214,7 +5240,30 @@
     PROG.lastAdvanceAt = now;
   }
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) rebaseStallClocks();
+    if (document.hidden) return;
+    rebaseStallClocks();
+    // ⚠ A BACKGROUNDED TAB GOES SILENT, AND THE ROOM HAS TO RECOVER FROM IT.
+    // A phone suspends timers and network in a background tab, so a host that
+    // switches away stops sending — including the roster heartbeat, which is a
+    // timer. The other player then sees, correctly, "Nothing has been heard from
+    // the host for 19 s" and sits in "Looking for the host...". That is the
+    // ordinary consequence of glancing at the other device, so recovering must
+    // not require the player to press Leave and rejoin.
+    //
+    // Coming back to the foreground, this console re-announces immediately
+    // rather than waiting for the next beat: a host pushes the roster, a guest
+    // asks for one. Both are idempotent and already exist for exactly this kind
+    // of resynchronisation — the heartbeat that closed the stale-roster bug is
+    // the same mechanism, just on a timer that a suspended tab had stopped.
+    try {
+      const ls = NET.session && NET.session.ls;
+      if (ls) {
+        if (NET.role === 'host' && typeof ls._rosterSend === 'function') ls._rosterSend();
+        else if (typeof ls.requestRoster === 'function') ls.requestRoster();
+        pageLog('[net] back in the foreground — re-announcing to the room rather than waiting for the ' +
+                'next heartbeat, because a suspended tab stops the timer that would have sent it');
+      }
+    } catch (e) { /* a room that cannot re-announce still recovers on the next beat */ }
   });
   // Pre-boot half of the stall detector. Everything below this covers a RUNNING
   // emulator; the window from Start to first frame — which is where a 1.13 GB
