@@ -50,65 +50,23 @@ const OPEN = [
     evidence: "tools/audit_all.mjs's dreamcast-room-crossdevice ciWhy records the measurement, and its no-direct-path arm is RED for real.",
     verify: () => /no working TURN relay|701\/400/.test(read('tools/audit_all.mjs')),
   },
-  {
-    id: 'genesis-can-run-frames-before-its-gate-closes',
-    what: 'On Genesis, a joiner has been observed running TWO frames before the lockstep gate closed. Rare, and it passes on re-run.',
-    why: 'A core that runs frames nobody else ran is diverged before frame 0, and the room then looks perfectly correct while being silently forked — the one outcome the barrier exists to prevent. Arming is page-side and races the core coming up; the engine cannot see frames that ran before it was armed. Rarity is not mitigation here: a fork is permanent, and the room reports nothing.',
-    evidence: 'console_room_crossdevice_test, standing auditor pass 10: FAIL [genesis/warm] no-frame-ran-before-the-gate-closed — frames at the moment of arming: host 0, join 2. A targeted re-run read host 0, join 0 and 44 pass / 0 FAIL, so it is intermittent, not constant.',
-    // Open until arming provably precedes the first frame rather than racing it.
-    verify: () => /lockstep/.test(read('genesis.html')),
-  },
-  // ── CLOSED 2026-09-09: 'relay-play-stalls-under-jitter' ────────────────────
-  // The entry said a relayed room could not PLAY because the input delay is
-  // chosen once from one RTT sample and cannot cover 101-259 ms of jitter, and
-  // that closing it needed an ADAPTIVE delay. That diagnosis was WRONG, and it
-  // was wrong in a way worth recording: it was inferred from the symptom
-  // (a room that stalls on a slow link) and never measured.
-  //
-  // What the two consoles actually held, once they were asked — the frames each
-  // had for the port it was waiting on (/tmp/dc-xdev/diag2.stdout):
-  //     host  HELD port1 = 6..22,24..30   (want f=23)
-  //     join  HELD port0 = 6..23,25..29   (want f=24)
-  // Inputs present ABOVE the frame they were stuck on. That is a HOLE, not a
-  // horizon: the input for that one frame was sent and never arrived. No
-  // quantity of input delay repairs a hole, which is why the delay-raise
-  // machinery — which DID fire, ten times in one 8 s stall, contrary to
-  // the report that it never fired — changed nothing at all.
-  //
-  // The cause is that the signalling relay LOSES MESSAGES and lockstep sends
-  // each frame's input exactly once. Counted at the relay layer in the same
-  // run: host pub:46 rxOk:46 gapSeq:12 against a peer that published 58 —
-  // 46+12=58 exactly, 20.7% of publishes never arrived — with dropSeq:0, so the
-  // reorder guard was not the one discarding them. A free public MQTT broker at
-  // QoS 0 is a datagram service, and one lost datagram is a permanent deadlock.
-  //
-  // FIXED by retransmission that needs no new protocol: lockstep bounds its own
-  // divergence (a peer stalled at g holds its partner to g+delay, so nothing is
-  // queued past g+2*delay), so a window of 2*delay frames provably covers every
-  // frame anyone can still want. Every relay publish carries that whole window,
-  // run-length compressed, and it is re-published while the room is live so a
-  // stalled peer — which produces no new input and would otherwise flush
-  // nothing — still gets the repeat. Input is idempotent, so a repeat cannot
-  // change what any core simulates.
-  // Two more real defects fell out of the same measurement: _applyPendingDelay
-  // filled f+D+1..f+D' while this console had queued only through (f-1)+D, so
-  // the delay raise MANUFACTURED a hole at f+D and sent f+D' twice with
-  // different bytes; and dreamcast.html's lsChooseDelay overrode the relay's own
-  // repeated measurement DOWNWARD with a single sample ("input delay 23 -> 12
-  // frames" against a 320 ms one-way path).
-  // Measured after, same rig, same arm: 44 pass / 0 FAIL, core ran
-  // [71,71] -> [208,208] in 6 s on BOTH consoles, every held range contiguous
-  // (`HELD port1 = 16..287 (want f=288)`), and gapSeq 63/51 — the transport was
-  // still losing publishes and the room ran through it. The direct-path arm is
-  // unchanged at 43 pass / 0 FAIL and reads [73,75] -> [220,219], so the
-  // remaining rate gap is the two cores on one box, not the link.
-  //
-  // ⚠ ITS verify() WAS THE THIRD LIAR IN THIS FILE. It was
-  //     /lsChooseDelay/.test(dreamcast.html) && !/adaptiveDelay|delayAdapt/.test(lib/netplay.js)
-  // — a function that still exists and two identifier spellings nobody ever
-  // used. It could only ever have gone stale by someone happening to type
-  // `adaptiveDelay`, and it would have kept reporting OPEN after any real fix.
-  // The replacement below tests a live code shape.
+  // ── CLOSED 2026-09-10: 'genesis-can-run-frames-before-its-gate-closes' ────
+  // It was a MEASUREMENT bug, not a Genesis bug, and closing it is the honest
+  // outcome rather than a fix. The rig polled the seam until it saw `armed` and
+  // THEN read the live `frame` field — so it recorded the frame at the moment it
+  // happened to poll, not the frame at the moment the gate closed. The joiner
+  // arms second, so when the host is already ready the barrier releases at once
+  // and the joiner's core legitimately advances before the next poll lands.
+  // Hence `host 0, join 2` against a console that had done nothing wrong, and
+  // hence the intermittency: it was a race between a poll interval and a barrier
+  // release, which is exactly what it looked like.
+  // genesis.html now LATCHES the engine frame at the instant of arming
+  // (`armedAtFrame`) and the rig asserts on that, a value that cannot drift.
+  // Reads `frames at the moment of arming: host 0, join 0`, 44 pass / 0 FAIL.
+  // The underlying invariant is unchanged and still worth asserting — the boot
+  // ordering that guarantees it is documented at genesis.html's LOCKSTEP FRAME
+  // DRIVER block: lsArmBeforeFreerun() runs inside bootRom() between gpx_load()
+  // and `running = true`, with no await between them.
 
   {
     id: 'a-long-enough-loss-burst-still-deadlocks-a-relayed-room',

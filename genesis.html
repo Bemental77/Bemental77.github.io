@@ -759,6 +759,15 @@
       return false;
     }
     LS.armed = true; LS.running = false; LS.frames = 0; LS.hashes = 0; LS.fault = null;
+    // ⚠ LATCH THE FRAME AT THE INSTANT OF ARMING. A rig that polls for
+    // `armed` and THEN reads the frame count is not measuring what it claims:
+    // the joiner arms second, so if the host is already ready the barrier
+    // releases immediately and this core legitimately advances before the next
+    // poll lands. That read "frames at the moment of arming: host 0, join 2"
+    // and failed a console that had done nothing wrong — intermittently, which
+    // is exactly what a race between a poll interval and a barrier release
+    // looks like. This value cannot drift, so an assertion on it is real.
+    LS.armedAtFrame = (ls && typeof ls.frame === 'number') ? (ls.frame | 0) : 0;
     pageLog('[lockstep] ARMED before the first frame — this core advances only when every seated '
       + 'port has an input for the frame, so no console runs a frame the others did not. '
       + 'ports=' + JSON.stringify(ls.roster) + ' mine=' + JSON.stringify(ls.localPorts));
@@ -1734,6 +1743,10 @@
       // before a core exists.
       live: (window.__genFrames | 0) > 0,
       armed: LS.armed,
+      // The frame this core was on when the gate closed — latched, not sampled.
+      // `frame` below moves; this one is the answer to "did anything run before
+      // the gate", which is the determinism question worth asserting on.
+      armedAtFrame: (LS.armedAtFrame == null ? null : LS.armedAtFrame | 0),
       running: LS.running,
       frames: LS.frames,
       hashes: LS.hashes,

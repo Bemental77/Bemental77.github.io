@@ -493,9 +493,21 @@ async function runArm(consoleName, temp) {
       }
       armedState[role] = st;
     }
-    cell(Object.values(armedState).every((s) => (s.frame | 0) === 0),
+    // ⚠ ASSERT ON THE LATCHED VALUE, NOT A SAMPLED ONE. This read `s.frame`,
+    // which the seam reports LIVE — so it measured the frame at the moment this
+    // rig happened to poll, not the frame at the moment the gate closed. The
+    // joiner arms second, so if the host is already ready the barrier releases
+    // immediately and the joiner's core legitimately advances before the next
+    // poll lands. That produced `frames at the moment of arming: host 0, join 2`
+    // against a console that had done nothing wrong, intermittently — which is
+    // exactly what a race between a poll interval and a barrier release looks
+    // like. The page now latches the frame AT arming (`armedAtFrame`), a value
+    // that cannot drift. Falls back to the old field where a page does not
+    // publish it yet, so this stays honest rather than silently vacuous.
+    const armedAt = (s) => (s && s.armedAtFrame != null) ? (s.armedAtFrame | 0) : (s.frame | 0);
+    cell(Object.values(armedState).every((s) => armedAt(s) === 0),
       'no-frame-ran-before-the-gate-closed',
-      'frames at the moment of arming: host ' + (armedState.host.frame | 0) + ', join ' + (armedState.join.frame | 0));
+      'frames at the moment of arming: host ' + armedAt(armedState.host) + ', join ' + armedAt(armedState.join));
 
     // ---- 4. THE START BARRIER --------------------------------------------
     if (C.ready) {
