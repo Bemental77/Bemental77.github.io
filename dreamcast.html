@@ -4675,20 +4675,41 @@
     seedRoomState = 'pending'; seedRoomWhy = null;
     setStatus('Preparing the game — every player has to begin from the same frame 0.');
     pageLog('[seed] room boot: applying the seed BEFORE this console can declare itself ready');
+    // ⚠ A FETCH THAT FAILED ONCE IS NOT A CONSOLE THAT CANNOT PLAY.
+    // Every failure below used to be TERMINAL on the first miss, and the three
+    // here are all transport: the request threw, it timed out, or it decoded to
+    // nothing. On the flaky phone connection this feature exists for, that is a
+    // room permanently unstartable because one request lost — with the other
+    // player correctly seated and ready, waiting forever. The same shape as the
+    // card-set failure the user photographed, in the sibling state machine.
+    //
+    // So the transport half RETRIES, bounded, re-issuing the fetch rather than
+    // re-awaiting the promise that already settled. The RESTORE half below does
+    // NOT retry and must not: a core that rejects these bytes rejects them
+    // again, and quietly starting unseeded is the divergence this whole path
+    // exists to prevent.
     let buf = null;
-    try {
-      buf = await Promise.race([
-        seedPromise,
-        new Promise((r) => setTimeout(() => r('timeout'), SEED_ROOM_MS)),
-      ]);
-    } catch (e) {
-      return seedRoomFailed('the boot seed threw while being fetched: ' + ((e && e.message) || e));
-    }
-    if (buf === 'timeout') {
-      return seedRoomFailed('the boot seed did not arrive within ' + Math.round(SEED_ROOM_MS / 1000) + ' s');
-    }
-    if (!buf) {
-      return seedRoomFailed('the boot seed could not be fetched or decoded — the log above names the step that failed');
+    let seedTry = 0;
+    const SEED_TRIES = 3;
+    for (;;) {
+      seedTry++;
+      let err = null;
+      try {
+        buf = await Promise.race([
+          seedPromise,
+          new Promise((r) => setTimeout(() => r('timeout'), SEED_ROOM_MS)),
+        ]);
+      } catch (e) { err = 'threw while being fetched: ' + ((e && e.message) || e); buf = null; }
+      if (!err && buf === 'timeout') err = 'did not arrive within ' + Math.round(SEED_ROOM_MS / 1000) + ' s';
+      if (!err && !buf) err = 'could not be fetched or decoded — the log above names the step that failed';
+      if (!err) break;
+      if (seedTry >= SEED_TRIES) {
+        return seedRoomFailed('the boot seed ' + err + ' (' + seedTry + ' attempts)');
+      }
+      pageLog('[seed] attempt ' + seedTry + ' of ' + SEED_TRIES + ' failed (' + err + ') — re-fetching rather ' +
+              'than refusing the room; one lost request must not cost every player in it their game');
+      setStatus('Preparing the game — retrying (' + seedTry + '/' + SEED_TRIES + ')…');
+      seedPromise = fetchSeedState();
     }
     const ok = await new Promise((resolve) => {
       const t = setTimeout(() => {

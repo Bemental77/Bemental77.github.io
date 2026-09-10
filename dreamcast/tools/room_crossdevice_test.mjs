@@ -200,6 +200,8 @@ const ORIGIN   = arg('url', 'https://caseybement.com').replace(/\/$/, '');
 const GAME     = arg('game', 'gauntlet');
 const NAME     = arg('name', 'xdev');
 const SEATCHANGE_ARM = 'seat-change';
+// How many boot-seed fetches to fail outright before letting one through.
+const FAIL_SEED = parseInt(arg('fail-seed', '0'), 10) || 0;
 const ARMS     = arg('arms', 'panel-open,panel-closed,host-busy,mobile-joiner').split(',').map((s) => s.trim()).filter(Boolean);
 const PLAYARG  = arg('play', 'panel-open');
 // The disc the JOINER starts on, which must NOT be the room's. Empty = pick
@@ -372,6 +374,26 @@ async function launch(role, mobile) {
       window.RTCPeerConnection = Wrapped;
       window.webkitRTCPeerConnection = Wrapped;
     });
+  }
+  // FAULT INJECTION FOR THE BOOT SEED. Every seed failure used to be terminal
+  // on the FIRST miss, so one lost request on a phone connection made a room
+  // permanently unstartable — with the other player seated, ready, and waiting
+  // forever. The page now retries the transport half. An untested retry is
+  // worth nothing, so this fails the first N seed requests for real, at the
+  // network, and the arm asserts the room still starts.
+  if (FAIL_SEED > 0) {
+    await pg.evaluateOnNewDocument((n) => {
+      window.__seedFetchFails = 0;
+      const real = window.fetch;
+      window.fetch = function (input) {
+        const u = String((input && input.url) || input || '');
+        if (u.indexOf('pso2_boot.state') >= 0 && window.__seedFetchFails < n) {
+          window.__seedFetchFails++;
+          return Promise.reject(new TypeError('injected seed transport failure #' + window.__seedFetchFails));
+        }
+        return real.apply(this, arguments);
+      };
+    }, FAIL_SEED);
   }
   if (mobile) { await pg.setUserAgent(IPHONE.ua); await pg.setViewport(IPHONE.viewport); }
   else await pg.setViewport({ width: 1280, height: 860 });
