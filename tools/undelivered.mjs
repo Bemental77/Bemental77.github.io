@@ -19,14 +19,30 @@ import { readFileSync, existsSync } from 'fs';
 const read = (p) => (existsSync(p) ? readFileSync(p, 'utf8') : '');
 
 const OPEN = [
-  {
-    id: 'vmu-does-not-carry-into-a-room',
-    what: "A player's saved VMU does not carry into an ONLINE room. In a room, seeding is suppressed and the console plays a blank card.",
-    why: 'Netplay has no state handoff — peers cold-boot and stay identical BY CONSTRUCTION (dreamcast.html:5595). A VMU is guest-visible memory, so seeding two different stored cards would desync the instant a game read one. Suppressing it is correct until the cards are exchanged over the link before frame 0.',
-    evidence: 'Observed live on a two-browser pairing: the joiner reported seedSkipped and read blank card headers [196,0,164] rather than the 0x77 card planted in its IndexedDB.',
-    // Open while the page still suppresses seeding in a room.
-    verify: () => /seedSkipped|seed[^\n]*suppress/i.test(read('dreamcast.html')),
-  },
+  // ── CLOSED 2026-09-09: 'vmu-does-not-carry-into-a-room' ────────────────────
+  // It said a saved card could not follow a player into a room, and it was true:
+  // seeding was suppressed there because peers must hold byte-identical guest
+  // memory at frame 0 and there was no handoff. The room now agrees a full card
+  // SET before frame 0 — each console contributes the card for the seat it holds
+  // (its stored card, or the exact bytes of its own blank power-on card), the
+  // host assembles once every occupied port has contributed, and every console
+  // installs the SAME set for all ports before it declares ready. A mismatch
+  // REFUSES the room through the same tested path that refuses two different
+  // discs, rather than desyncing.
+  // Proven on two real browsers: both declare "gauntlet#cards:542da858", both
+  // install {0:d500aec5, 1:b19a59c5}, every port byte-identical over all 131072
+  // bytes, "Everyone started together at frame 0.", and afterwards each side has
+  // persisted only the seat it played. The standing auditor then read
+  // 43 pass · 0 FAIL against production, up from 31 pass · 1 FAIL.
+  //
+  // ⚠ ITS verify() WAS ALREADY LYING WHEN THE FIX SHIPPED — the second entry to
+  // do this, so the pattern is the rule and not an accident. It tested for the
+  // string `seedSkipped` in dreamcast.html, which SURVIVED the fix: the
+  // local-seed path still skips seeding in a room, because the cards now arrive
+  // over the link instead. The gap was closed and the gate went on reporting it
+  // OPEN. Same lesson the snes entry recorded: a verify() must test an artifact
+  // or a live code shape, never a string that prose or a leftover can satisfy.
+
   {
     id: 'no-working-turn-relay',
     what: 'Two peers on genuinely hostile networks (symmetric NAT) cannot connect at all, and nothing detects it.',
