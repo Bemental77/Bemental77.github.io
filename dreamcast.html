@@ -5419,8 +5419,25 @@
       state = 'no-video'; why = 'the emulator is running but has produced no video for ' +
         Math.round((now - lastCallsAt) / 1000) + 's';
     } else if (distinctEverFlowed && now - lastDistinctAt > STALL_MS) {
-      state = 'duplicate-frames'; why = 'the emulator is still presenting, but every frame for ' +
-        Math.round((now - lastDistinctAt) / 1000) + 's has been identical — the game is wedged, not the renderer';
+      // ⚠ THIS BRANCH IS ONLY REACHABLE WHILE THE EMULATOR IS DEMONSTRABLY
+      // RUNNING. Getting here requires now - lastCallsAt <= STALL_MS, i.e. video
+      // fields are still arriving; the core is advancing guest frames. So "The
+      // emulator has stopped" is simply FALSE here, and it was shown to a player
+      // whose own overlay read "frame 2877 · core ran 2870" — seven frames of
+      // lead, exactly the input delay, which is a healthy gated core.
+      //
+      // A STILL PICTURE IS NOT A DEAD EMULATOR. A menu waiting for the second
+      // player to press Start draws the same frame indefinitely and is working
+      // perfectly. In a room that is not merely possible, it is the EXPECTED
+      // state between "everyone loaded" and "everyone joined the game", and
+      // shouting EMULATOR STALLED at that moment teaches people to distrust the
+      // one banner that matters.
+      state = 'duplicate-frames';
+      why = 'the picture has not changed for ' + Math.round((now - lastDistinctAt) / 1000) +
+            's, but the emulator is still running — the game is drawing the same frame' +
+            (safe(() => (NET.session && NET.session.state === 'running'), false)
+              ? '. In a room this is usually a menu waiting for another player to press Start'
+              : '');
     }
     if (state === stallState) return;   // edge-triggered: report transitions only
     if (state) {
@@ -5430,16 +5447,25 @@
                     'pc=0x' + safe(() => lastPc.toString(16), '?') +
                     ' fps=' + lastFps + ' fields=' + lastCalls + ' iters=' + lastIps;
       pageLog('[stall] ' + why + ' — ' + facts.stall);
-      setStatus('The emulator has stopped: ' + why);
-      showAlert('EMULATOR STALLED (' + state + ')');
-      showToast('The emulator stopped — tap the banner for diagnostics', false);
+      // ⚠ SEVERITY MATCHES THE EVIDENCE. Every other state here means the
+      // emulator is NOT running; duplicate-frames means it demonstrably IS, and
+      // only the picture is still. Same diagnostics, honest wording.
+      if (state === 'duplicate-frames') {
+        setStatus('The picture is not changing: ' + why);
+        showAlert('THE PICTURE IS NOT CHANGING (the emulator is still running)');
+        showToast('The picture has not changed for a while — tap the banner for diagnostics', false);
+      } else {
+        setStatus('The emulator has stopped: ' + why);
+        showAlert('EMULATOR STALLED (' + state + ')');
+        showToast('The emulator stopped — tap the banner for diagnostics', false);
+      }
     } else if (stallState) {
       pageLog('[stall] recovered from "' + stallState + '" at +' + ((now - T0) / 1000).toFixed(1) + 's');
       stallState = '';
       const bar = document.getElementById('alertBar');
       // Only clear the banner if a stall is what put it there — a lost GPU
       // context does not recover and its notice must not be wiped by this.
-      if (bar && /STALLED/.test(bar.textContent)) bar.classList.remove('on');
+      if (bar && /STALLED|PICTURE IS NOT CHANGING/.test(bar.textContent)) bar.classList.remove('on');
     }
   }
 
