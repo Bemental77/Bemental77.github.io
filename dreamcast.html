@@ -5550,7 +5550,74 @@
     workerStall: false,  // the CORE's own gate says it has no input for its frame
     fault: null,         // why this machine is NOT frame-gated, in words
     engagedAt: 0,
+    // ---- THE FEED'S OWN ARITHMETIC, counted rather than inferred ----------
+    // `bfCalls` is how many times this page ASKED the engine for a frame and
+    // `bfStall` how often it was refused. The pair is the difference between
+    // "the engine is starving" and "the page stopped asking" — two failures
+    // that look identical from outside (a frozen `core ran`) and have opposite
+    // fixes. Counting is free; the LOGGING below is not, and is query-gated.
+    bfCalls: 0, bfStall: 0, bfSkipped: 0,
   };
+
+  // ---- ?lsdiag=1 — WHY A ROOM STARVED, ARMED FROM THE QUERY STRING --------
+  // SHIPS OFF. A stall on a slow path is a timing fault, and per-frame console
+  // output is not free on one — so this is a rate-limited dump of state the
+  // engine and the driver already hold, not new bookkeeping, and nothing but
+  // the counters above runs when it is off. The three questions it exists to
+  // answer, none of which any existing seam could: WHICH side stalls, whether
+  // `_stalled` FLAPS (stall/resume pairs), and whether the host's delay raise
+  // is ever REACHED (the engine emits 'delay' from _scheduleDelay, so a run
+  // with no `DELAY` line never got there).
+  const LSDIAG = (() => { try { return new URLSearchParams(location.search).has('lsdiag'); } catch (e) { return false; } })();
+  const LSD = { last: 0, wired: false, stalls: 0, resumes: 0, delays: 0 };
+  function lsDiagWire(ls) {
+    if (!LSDIAG || LSD.wired || !ls || typeof ls.on !== 'function') return;
+    LSD.wired = true;
+    ls.on('stall', (e) => { LSD.stalls++; pageLog('[lockstep] diag STALL#' + LSD.stalls + ' f=' + e.frame + ' wait=' + JSON.stringify(e.waitingOn) + ' peers=' + JSON.stringify(e.waitingPeers)); });
+    ls.on('resume', (e) => { LSD.resumes++; pageLog('[lockstep] diag RESUME#' + LSD.resumes + ' f=' + e.frame + ' after=' + Math.round(e.ms) + 'ms'); });
+    ls.on('delay', (e) => { LSD.delays++; pageLog('[lockstep] diag DELAY ' + e.from + ' -> ' + e.to + ' at f=' + e.at + ' (' + e.reason + ')'); });
+    pageLog('[lockstep] diag ARMED host=' + !!ls.isHost + ' delay=' + ls.delay + ' bump=' + ls.delayBumpAfterMs + 'ms budget=' + ls.stallBudgetMs + 'ms');
+  }
+  // WHAT THIS CONSOLE ACTUALLY HOLDS FOR ONE PORT, as ranges. THE decisive
+  // reading: a stall whose held frames end AT the stalled frame is LATENESS
+  // (the input has not arrived yet); a stall with frames present ABOVE the
+  // stalled frame is a HOLE, i.e. an input that was sent, skipped, and is
+  // never coming — and no amount of extra delay repairs a hole.
+  function lsDiagHave(ls, port) {
+    try {
+      const fs = [];
+      ls.inputs.forEach((m, f) => { if (m && m.has(port)) fs.push(f); });
+      fs.sort((a, b) => a - b);
+      if (!fs.length) return 'none';
+      const out = [];
+      let s = fs[0], p = fs[0];
+      for (let i = 1; i < fs.length; i++) {
+        if (fs[i] === p + 1) { p = fs[i]; continue; }
+        out.push(s === p ? String(s) : s + '..' + p); s = p = fs[i];
+      }
+      out.push(s === p ? String(s) : s + '..' + p);
+      return out.join(',');
+    } catch (e) { return 'err'; }
+  }
+  function lsDiagTick(ls, r) {
+    if (!LSDIAG || !ls) return;
+    const t = _now();
+    if (t - LSD.last < 500) return;
+    LSD.last = t;
+    const rep = (typeof ls.report === 'function') ? ls.report() : {};
+    if (r && !r.ready && r.waitingOn && r.waitingOn.length) {
+      const p = r.waitingOn[0];
+      pageLog('[lockstep] diag HELD port' + p + ' = ' + lsDiagHave(ls, p) + '  (want f=' + ls.frame + ')');
+      const rl = (NET.session && typeof NET.session.relayInfo === 'function') ? NET.session.relayInfo() : null;
+      if (rl && rl.stats) pageLog('[lockstep] diag RELAY ' + JSON.stringify(rl.stats) + ' oneWay=' + Math.round(rl.oneWayMs || 0));
+    }
+    pageLog('[lockstep] diag st=' + rep.state + ' host=' + !!ls.isHost + ' f=' + ls.frame + ' d=' + ls.delay +
+            ' core=' + LS.framesRun + ' fed=' + LS.fedTo + ' wf=' + LS.workerFrame +
+            ' bf=' + LS.bfCalls + '/' + LS.bfStall + ' skip=' + LS.bfSkipped +
+            ' rx=' + rep.inputsReceived + ' tx=' + rep.inputsSent +
+            ' stalls=' + rep.stalls + ' sMs=' + rep.stallMs + ' lead=' + rep.minLead + '/' + rep.meanLead +
+            ' last=' + (r ? (r.ready ? 'ready' : r.reason + JSON.stringify(r.waitingOn || [])) : 'none'));
+  }
 
   // WHY THE FRAME GATE IS HOLDING THIS CORE, in words a player can read — or
   // null when it is not holding, which is the only answer that lets the stall
@@ -5693,6 +5760,7 @@
                    'but NOTHING is comparing their fingerprints — a divergence would go undetected';
         pageLog('[lockstep] ⚠ ' + LS.fault);
       }
+      lsDiagWire(ls);
       pageLog('[lockstep] FRAME GATE ENGAGED at frame ' + ls.frame + ' — this core advances only when every ' +
               'seated port has an input for the frame. delay=' + ls.delay + ' frames (' +
               Math.round(ls.delay * FRAME_MS) + ' ms), ports=' + JSON.stringify(ls.roster) +
@@ -5705,12 +5773,16 @@
     // visible.
     const lookahead = Math.max(1, ls.delay | 0);
     let fed = 0;
+    if ((LS.fedTo - LS.workerFrame) >= lookahead) { LS.bfSkipped++; lsDiagTick(ls, null); }
     while ((LS.fedTo - LS.workerFrame) < lookahead) {
+      LS.bfCalls++;
       const r = ls.beginFrame(lsLocalPads());
       if (!r || !r.ready) {
+        LS.bfStall++;
         LS.stalling = !!(r && r.reason === 'stall');
         LS.stallReason = r ? r.reason : 'the engine returned nothing';
         LS.waitingOn = (r && r.waitingOn) ? r.waitingOn.slice() : [];
+        lsDiagTick(ls, r);
         break;
       }
       LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
@@ -5731,6 +5803,7 @@
       // worth catching rather than sprinting the guest.
       if (++fed > 240) { pageLog('[lockstep] ⚠ feed loop hit its 240-frame bound — not sprinting the guest'); break; }
     }
+    lsDiagTick(ls, null);
   }
 
   // ---- what the worker tells us --------------------------------------------
@@ -5787,7 +5860,22 @@
       // now matches the engine, so a relay room can choose a delay that covers
       // the path it actually has. A direct room is unaffected — nothing here
       // raises a delay that the measurement does not ask for.
-      const want = r && r.recommendedDelay != null ? Math.max(1, Math.min(30, r.recommendedDelay | 0)) : null;
+      // ⚠ A RELAYED ROOM'S OWN MEASUREMENT IS THE FLOOR, AND THIS USED TO
+      // OVERRIDE IT DOWNWARD. relay mode measures the path it actually uses,
+      // repeatedly (rping/rpong every 4 s, smoothed) and sets the delay from
+      // it; rttReport takes ONE sample through whatever link exists at Ready.
+      // On the relay the two disagreed by 2x in the same run and the smaller
+      // one won: `[lockstep] input delay 23 -> 12 frames ... chosen from the
+      // worst measured RTT 349 ms` while the relay had just reported 320 ms
+      // ONE WAY (/tmp/dc-xdev/diag1.stdout). Twelve frames is 200 ms of cover
+      // for a 320 ms path — a starve chosen deliberately over a measurement
+      // that was already correct. Take the larger: a delay that is too big
+      // costs lag the player can feel, one that is too small costs a room that
+      // does not run.
+      const relayFloor = (sess.relay && sess.relay.active && sess.relay.delayFrames)
+        ? (sess.relay.delayFrames | 0) : 0;
+      let want = r && r.recommendedDelay != null ? Math.max(1, Math.min(30, r.recommendedDelay | 0)) : null;
+      if (relayFloor > 0) want = Math.min(30, Math.max(want || 0, relayFloor));
       if (want == null || want === ls.delay) return ls.delay;
       const was = ls.delay;
       ls.delay = want;

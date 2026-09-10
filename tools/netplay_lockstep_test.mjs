@@ -620,5 +620,185 @@ console.log('\n== the memory cards are AGREED before frame 0, or nobody starts =
   is('ASKING-RECOVERS-THE-SET', b.A.cardSetHash, b.H.cardSetHash);
 }
 
+// ===========================================================================
+// A ROOM ON A TRANSPORT THAT LOSES MESSAGES
+//
+// The signalling relay is a free public MQTT broker at QoS 0, and it was
+// MEASURED losing 12 of 58 publishes — 20.7% — between two browsers on one
+// box (lib/netplay.js, the block above RELAY_REPAIR_MS). Lockstep sends each
+// frame's input exactly once and never guesses, so one loss is a PERMANENT
+// deadlock: both consoles read a hole rather than a horizon —
+//     host  HELD port1 = 6..22,24..30   (want f=23)
+// inputs present ABOVE the frame they are stuck on, which no amount of extra
+// input delay can repair.
+//
+// These cells drive the three functions that fix it — _relayNote,
+// _relayWindow, _relayApplyWindow — with a transport that really does drop
+// one publish in five, and assert the room still runs.
+// ===========================================================================
+console.log('\n== a lossy transport does not deadlock a lockstep room ==');
+{
+  // A stand-in for the relay half of a NetplaySession: the real methods, on an
+  // object holding only the state they touch. Nothing here reimplements them.
+  const relaySide = (delay) => {
+    const o = Object.create(Session.prototype);
+    o._relayWin = new Map();
+    o._relayWinPeer = null;
+    o.ls = { delay, state: 'running' };
+    o.delayFrames = delay;
+    return o;
+  };
+  // window depth must cover 2*delay — the most a peer can be behind — or a
+  // stalled partner's missing frame ages out before the repeat reaches it.
+  const d6 = relaySide(6), d30 = relaySide(30);
+  (d6._relayWinDepth() >= 12 && d30._relayWinDepth() >= 60)
+    ? ok('window-covers-twice-the-delay', `delay 6 -> ${d6._relayWinDepth()}, delay 30 -> ${d30._relayWinDepth()}`)
+    : bad('window-covers-twice-the-delay', `${d6._relayWinDepth()} / ${d30._relayWinDepth()}`);
+
+  // A HELD BUTTON IS ONE RUN. Without this the window is 96 frames of
+  // identical base64 on every publish.
+  const r = relaySide(6);
+  for (let f = 10; f < 20; f++) r._relayNote({ t: 'ls', f, i: [[0, 'AAAA']], peer: 'H' });
+  r._relayNote({ t: 'ls', f: 20, i: [[0, 'BBBB']], peer: 'H' });
+  const w = r._relayWindow();
+  eq('a-held-pad-is-one-run', w.v.map((x) => [x[0], x[1]]), [[10, 10], [20, 1]]);
+  is('the-window-names-its-sender', w.p, 'H');
+
+  // AND IT EXPANDS BACK TO EXACTLY THE FRAMES THAT WENT IN.
+  const seen = [];
+  const rx = Object.create(Session.prototype);
+  rx._onData = (m) => { seen.push(m.f); return true; };
+  const n = rx._relayApplyWindow(w, null);
+  is('expands-to-every-frame', n, 11);
+  eq('expands-in-order', seen, [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+
+  // ---- and now the whole thing, end to end, under real loss --------------
+  // Two engines, delay 6, 300 frames. Every 'ls' goes into the sender's
+  // window; a publish carries the WHOLE window and is dropped outright one
+  // time in five by a seeded generator (deterministic, so a failure here is
+  // reproducible rather than a flake).
+  const DELAY = 6, FRAMES = 300;
+  let seed = 0x2f6e2b1;
+  const rnd = () => { seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  let dropped = 0, published = 0;
+
+  const side = { H: relaySide(DELAY), A: relaySide(DELAY) };
+  const eng = {};
+  const publish = (from) => {
+    const win = side[from]._relayWindow();
+    if (!win) return;
+    published++;
+    if (rnd() < 0.2) { dropped++; return; }             // the broker ate it
+    const to = from === 'H' ? 'A' : 'H';
+    const rxs = Object.create(Session.prototype);
+    rxs._onData = (m) => { eng[to].receive(m); return true; };
+    rxs._relayApplyWindow(win, null);
+  };
+  for (const spec of [{ id: 'H', host: true }, { id: 'A' }]) {
+    eng[spec.id] = new Lockstep({
+      host: spec.host, peerId: spec.id, portCount: 2, delay: DELAY, hashEvery: 0,
+      send: (m) => {
+        const tagged = Object.assign({ peer: spec.id }, m);
+        // Control traffic is not per-frame and rides its own path; only the
+        // per-frame input goes through the lossy window, which is exactly how
+        // the relay carries it.
+        if (tagged.t !== 'ls') { const to = spec.id === 'H' ? 'A' : 'H'; eng[to] && eng[to].receive(tagged); return; }
+        side[spec.id]._relayNote(tagged);
+        publish(spec.id);
+      },
+    });
+  }
+  eng.H.seat('H', 1); eng.H.seat('A', 1);
+  eng.H.declareReady('g'); eng.A.declareReady('g');
+  is('the-lossy-room-started', eng.H.state, 'running');
+
+  // Drive both consoles. A publish is also emitted with no new input, which is
+  // what RELAY_REPAIR_MS does for a stalled peer — without it the repeat never
+  // travels and the room stays wedged holding its own cure.
+  let ranH = 0, ranA = 0;
+  for (let i = 0; i < FRAMES * 6; i++) {
+    for (const id of ['H', 'A']) {
+      const r2 = eng[id].beginFrame(pad(i & 1 ? 1 : 0));
+      if (r2.ready) { eng[id].endFrame(null); if (id === 'H') ranH++; else ranA++; }
+    }
+    publish('H'); publish('A');
+    if (ranH >= FRAMES && ranA >= FRAMES) break;
+  }
+  (dropped > 20) ? ok('the-transport-really-lost-messages', `${dropped} of ${published} publishes dropped`)
+                 : bad('the-transport-really-lost-messages', `only ${dropped}/${published} dropped — the arm did nothing`);
+  (ranH >= FRAMES && ranA >= FRAMES)
+    ? ok('BOTH-CONSOLES-RAN-EVERY-FRAME-THROUGH-A-LOSSY-LINK', `H ${ranH}, A ${ranA} of ${FRAMES}`)
+    : bad('BOTH-CONSOLES-RAN-EVERY-FRAME-THROUGH-A-LOSSY-LINK',
+          `H ran ${ranH}, A ran ${ranA} of ${FRAMES} — a lost input is still a permanent deadlock`);
+  is('nobody-diverged', eng.H.state === 'desync' || eng.A.state === 'desync', false);
+}
+
+// ===========================================================================
+// RAISING THE INPUT DELAY MID-SESSION LEAVES NO HOLE
+//
+// The raise exists to cure a stall, and the version that shipped manufactured
+// one: it filled f+D+1 .. f+D' while this console had queued only through
+// (f-1)+D, so frame f+D was never queued by anybody and the room deadlocked on
+// it forever. The property is not "the delay changed" — it is that this
+// peer's own input stream is CONTIGUOUS across the switch, with each frame
+// sent exactly once.
+// ===========================================================================
+console.log('\n== a delay raise leaves a contiguous input stream ==');
+{
+  const runRaise = (label, stallFirst) => {
+    const sentFrames = [];
+    const b = room([{ id: 'H', host: true }, { id: 'A' }], { portCount: 2, delay: 4 });
+    b.H.seat('H', 1); b.H.seat('A', 1);
+    const origSend = b.H._send;
+    b.H._send = (m) => { if (m && m.t === 'ls') for (const it of m.i) if ((it[0] | 0) === 0) sentFrames.push(m.f); return origSend(m); };
+    b.H.declareReady('g'); b.A.declareReady('g');
+    // Run both up to frame 10 so there is history on each side.
+    for (let i = 0; i < 10; i++) {
+      const rh = b.H.beginFrame(pad(0)); if (rh.ready) b.H.endFrame(null);
+      const ra = b.A.beginFrame(pad(0)); if (ra.ready) b.A.endFrame(null);
+    }
+    // The host schedules the raise, then both sides walk forward into it.
+    // `stallFirst` reproduces the OTHER position the raise can land in: a peer
+    // whose lsdelay arrived late applies it on a repeat attempt at a frame
+    // whose scheduling block is already spent.
+    b.H._scheduleDelay(9);
+    if (stallFirst) { b.bus = null; }
+    for (let i = 0; i < 40; i++) {
+      const rh = b.H.beginFrame(pad(0)); if (rh.ready) b.H.endFrame(null);
+      const ra = b.A.beginFrame(pad(0)); if (ra.ready) b.A.endFrame(null);
+    }
+    const uniq = Array.from(new Set(sentFrames)).sort((x, y) => x - y);
+    const dupes = sentFrames.length - uniq.length;
+    let holes = [];
+    for (let i = 1; i < uniq.length; i++) if (uniq[i] !== uniq[i - 1] + 1) holes.push(uniq[i - 1] + 1);
+    (holes.length === 0)
+      ? ok(`no-hole-across-the-raise-${label}`, `frames ${uniq[0]}..${uniq[uniq.length - 1]}, delay ${b.H.delay}`)
+      : bad(`no-hole-across-the-raise-${label}`, `frame(s) ${JSON.stringify(holes)} were never queued — a hole is a permanent stall`);
+    (dupes === 0)
+      ? ok(`each-frame-queued-once-${label}`, `${sentFrames.length} sends, ${uniq.length} distinct`)
+      : bad(`each-frame-queued-once-${label}`, `${dupes} frame(s) sent twice — two different pads for one frame`);
+    return b;
+  };
+  const b1 = runRaise('host', false);
+  is('the-raise-took-effect', b1.H.delay, 9);
+  is('the-guest-adopted-the-same-delay', b1.A.delay, 9);
+  runRaise('late', true);
+
+  // A raise already agreed is RE-SENT, not re-decided: the relay loses
+  // messages, and a lost lsdelay leaves the two consoles on two schedules.
+  const c = room([{ id: 'H', host: true }, { id: 'A' }], { portCount: 2, delay: 4 });
+  c.H.seat('H', 1); c.H.seat('A', 1);
+  c.H.declareReady('g'); c.A.declareReady('g');
+  const raises = [];
+  c.H.on('delay', (e) => raises.push(e));
+  const sent = [];
+  const os = c.H._send; c.H._send = (m) => { if (m && m.t === 'lsdelay') sent.push(m); return os(m); };
+  c.H._scheduleDelay(9); c.H._scheduleDelay(20); c.H._scheduleDelay(30);
+  is('one-raise-is-decided-once', raises.length, 1);
+  is('and-retransmitted-verbatim', sent.length, 3);
+  eq('every-copy-names-the-same-frame-and-delay',
+     sent.map((m) => [m.at, m.d]), [[sent[0].at, 9], [sent[0].at, 9], [sent[0].at, 9]]);
+}
+
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'}  ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

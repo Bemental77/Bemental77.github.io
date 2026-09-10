@@ -58,13 +58,68 @@ const OPEN = [
     // Open until arming provably precedes the first frame rather than racing it.
     verify: () => /lockstep/.test(read('genesis.html')),
   },
+  // ── CLOSED 2026-09-09: 'relay-play-stalls-under-jitter' ────────────────────
+  // The entry said a relayed room could not PLAY because the input delay is
+  // chosen once from one RTT sample and cannot cover 101-259 ms of jitter, and
+  // that closing it needed an ADAPTIVE delay. That diagnosis was WRONG, and it
+  // was wrong in a way worth recording: it was inferred from the symptom
+  // (a room that stalls on a slow link) and never measured.
+  //
+  // What the two consoles actually held, once they were asked — the frames each
+  // had for the port it was waiting on (/tmp/dc-xdev/diag2.stdout):
+  //     host  HELD port1 = 6..22,24..30   (want f=23)
+  //     join  HELD port0 = 6..23,25..29   (want f=24)
+  // Inputs present ABOVE the frame they were stuck on. That is a HOLE, not a
+  // horizon: the input for that one frame was sent and never arrived. No
+  // quantity of input delay repairs a hole, which is why the delay-raise
+  // machinery — which DID fire, ten times in one 8 s stall, contrary to
+  // the report that it never fired — changed nothing at all.
+  //
+  // The cause is that the signalling relay LOSES MESSAGES and lockstep sends
+  // each frame's input exactly once. Counted at the relay layer in the same
+  // run: host pub:46 rxOk:46 gapSeq:12 against a peer that published 58 —
+  // 46+12=58 exactly, 20.7% of publishes never arrived — with dropSeq:0, so the
+  // reorder guard was not the one discarding them. A free public MQTT broker at
+  // QoS 0 is a datagram service, and one lost datagram is a permanent deadlock.
+  //
+  // FIXED by retransmission that needs no new protocol: lockstep bounds its own
+  // divergence (a peer stalled at g holds its partner to g+delay, so nothing is
+  // queued past g+2*delay), so a window of 2*delay frames provably covers every
+  // frame anyone can still want. Every relay publish carries that whole window,
+  // run-length compressed, and it is re-published while the room is live so a
+  // stalled peer — which produces no new input and would otherwise flush
+  // nothing — still gets the repeat. Input is idempotent, so a repeat cannot
+  // change what any core simulates.
+  // Two more real defects fell out of the same measurement: _applyPendingDelay
+  // filled f+D+1..f+D' while this console had queued only through (f-1)+D, so
+  // the delay raise MANUFACTURED a hole at f+D and sent f+D' twice with
+  // different bytes; and dreamcast.html's lsChooseDelay overrode the relay's own
+  // repeated measurement DOWNWARD with a single sample ("input delay 23 -> 12
+  // frames" against a 320 ms one-way path).
+  // Measured after, same rig, same arm: 44 pass / 0 FAIL, core ran
+  // [71,71] -> [208,208] in 6 s on BOTH consoles, every held range contiguous
+  // (`HELD port1 = 16..287 (want f=288)`), and gapSeq 63/51 — the transport was
+  // still losing publishes and the room ran through it. The direct-path arm is
+  // unchanged at 43 pass / 0 FAIL and reads [73,75] -> [220,219], so the
+  // remaining rate gap is the two cores on one box, not the link.
+  //
+  // ⚠ ITS verify() WAS THE THIRD LIAR IN THIS FILE. It was
+  //     /lsChooseDelay/.test(dreamcast.html) && !/adaptiveDelay|delayAdapt/.test(lib/netplay.js)
+  // — a function that still exists and two identifier spellings nobody ever
+  // used. It could only ever have gone stale by someone happening to type
+  // `adaptiveDelay`, and it would have kept reporting OPEN after any real fix.
+  // The replacement below tests a live code shape.
+
   {
-    id: 'relay-play-stalls-under-jitter',
-    what: 'Two peers with NO direct path pair, seat, gate and compare fingerprints correctly — and then cannot PLAY. The cores advance a few frames and stop.',
-    why: 'Delay-based lockstep picks its input delay ONCE, at Ready, from a single RTT measurement (dreamcast.html lsChooseDelay -> Lockstep.recommendDelay). The signalling relay is not stable enough for that: one run measured 101ms, 195ms, 200ms and 259ms ONE WAY on the same link. A delay that covers the fast sample starves on the slow one, and a core waiting on input still in flight never advances. Covering the worst case needs an ADAPTIVE delay that rises when the queue starves — a real protocol change, not a constant.',
-    evidence: 'room_crossdevice_test --arms no-direct-path --play: PAIRING is green (21 pass / 0 FAIL, with the arm-difference proof that relay-only ICE with no relay was in force and 7 RTCPeerConnections per side could form no candidate pair). PLAY is not: core ran [34,35] -> [34,35] and [31,36] -> [31,36] over ~6 s, join port1=false, 41 pass / 3 FAIL.',
-    // Open until the delay adapts. A single fixed choice cannot cover 101-259ms of jitter.
-    verify: () => /lsChooseDelay/.test(read('dreamcast.html')) && !/adaptiveDelay|delayAdapt/.test(read('lib/netplay.js')),
+    id: 'a-long-enough-loss-burst-still-deadlocks-a-relayed-room',
+    what: 'A relayed room now survives message loss, but only a BOUNDED amount of it. A loss burst longer than the retransmission window is still a permanent deadlock, and nobody has measured how long a real burst is.',
+    why: 'The repair is redundancy, not recovery: every relay publish re-sends the last 2*delay frames of this peer\'s input (RELAY_WIN_MIN..RELAY_WIN_MAX frames), so a frame survives unless EVERY publish carrying it is lost. There is no ACK, no NACK, and no way to ask for a frame that has aged out of the window — if one does, the room stalls forever exactly as it did before, and the only reason that is acceptable today is an unmeasured assumption about burst length. Measured loss on this box was 20.7% of publishes and appeared independent; a real carrier middlebox or a broker outage is not independent, and a two-second gap at 150 ms repair spacing is thirteen consecutive losses.',
+    evidence: '/tmp/dc-xdev/fix1.stdout — gapSeq 63 (host) and 51 (join) publishes lost inside one 60 s run, and the room ran through all of them: core ran [71,71] -> [208,208], 44 pass / 0 FAIL. That is evidence the window WORKS at this burst length, not that there is no burst length at which it does not.',
+    // Open while recovery is a fixed-size window with nothing behind it. It
+    // closes when a peer can ASK for a frame it is missing (a request keyed by
+    // frame, not a blind repeat) — at which point a burst of any length is
+    // survivable and this stops being a bound.
+    verify: () => /RELAY_WIN_MAX/.test(read('lib/netplay.js')) && !/_relayRequest|lsnak|lsreq/.test(read('lib/netplay.js')),
   },
   {
     id: 'never-tested-across-two-networks',
