@@ -903,7 +903,24 @@
     // a fast-forward, which is forbidden. A stall means those wall-clock
     // milliseconds did not happen for the guest at all, so the credit is capped
     // at a single frame and the console resumes at 1.000x, not above it.
-    if (stalled && accum > FRAME_MS) accum = FRAME_MS;
+    // ⚠ AND NOT ONLY WHEN STALLED. This clamp used to require `stalled`, so it
+    // covered a frame lockstep withheld and nothing else — while a tick that ran
+    // late for ANY OTHER reason (a cold profile still fetching, a GC pause, a
+    // contended box) banked its debt and then let the guest sprint up to
+    // MAX_CATCHUP_FRAMES per tick until it cleared. That is a fast-forward, and
+    // gate #9 forbids it whatever caused the debt: the guest may run SLOWER than
+    // hardware, never faster.
+    //
+    // Measured: the standing auditor read `the-guest-is-never-sped-up
+    // 1.0210x hardware` and `1.0223x` on genesis/COLD while genesis/WARM read
+    // 1.0025x and 1.0027x on the same build — a cold profile hitches during load,
+    // banks the hitch, and makes it up at speed. Warm has less to bank.
+    //
+    // Dropping the debt means the console does NOT make up lost time. That is
+    // the correct trade and the one the rest of this file already states: those
+    // wall-clock milliseconds did not happen for the guest, so they are gone
+    // rather than owed.
+    if (accum > FRAME_MS) accum = FRAME_MS;
     if (ran) draw();
     if (NET.session) netHudTick(ts);
     if (!lastFpsAt) lastFpsAt = ts;
