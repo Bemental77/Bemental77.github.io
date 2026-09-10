@@ -51,6 +51,14 @@ const OPEN = [
     verify: () => /no working TURN relay|701\/400/.test(read('tools/audit_all.mjs')),
   },
   {
+    id: 'genesis-can-run-frames-before-its-gate-closes',
+    what: 'On Genesis, a joiner has been observed running TWO frames before the lockstep gate closed. Rare, and it passes on re-run.',
+    why: 'A core that runs frames nobody else ran is diverged before frame 0, and the room then looks perfectly correct while being silently forked — the one outcome the barrier exists to prevent. Arming is page-side and races the core coming up; the engine cannot see frames that ran before it was armed. Rarity is not mitigation here: a fork is permanent, and the room reports nothing.',
+    evidence: 'console_room_crossdevice_test, standing auditor pass 10: FAIL [genesis/warm] no-frame-ran-before-the-gate-closed — frames at the moment of arming: host 0, join 2. A targeted re-run read host 0, join 0 and 44 pass / 0 FAIL, so it is intermittent, not constant.',
+    // Open until arming provably precedes the first frame rather than racing it.
+    verify: () => /lockstep/.test(read('genesis.html')),
+  },
+  {
     id: 'relay-play-stalls-under-jitter',
     what: 'Two peers with NO direct path pair, seat, gate and compare fingerprints correctly — and then cannot PLAY. The cores advance a few frames and stop.',
     why: 'Delay-based lockstep picks its input delay ONCE, at Ready, from a single RTT measurement (dreamcast.html lsChooseDelay -> Lockstep.recommendDelay). The signalling relay is not stable enough for that: one run measured 101ms, 195ms, 200ms and 259ms ONE WAY on the same link. A delay that covers the fast sample starves on the slow one, and a core waiting on input still in flight never advances. Covering the worst case needs an ADAPTIVE delay that rises when the queue starves — a real protocol change, not a constant.',
