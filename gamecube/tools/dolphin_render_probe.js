@@ -1369,6 +1369,18 @@ function startServer() {
             }
           } catch (_e) {}
           try {
+            // [recomp W4 2026-09-10] The recomp path's GUEST-EXECUTED clock. gate #10 records
+            // that guest_rate_witness.mjs reads a FALSE ZERO here (no CoreTiming, no AI-DMA
+            // callback — this engine is a native port, not a DBT), so the CoreTiming-derived
+            // `speed`/`exec`/`idleFrac` rows above are structurally 0 on this route and are
+            // NOT a zero-rate reading. globalCounter is MP4's own per-frame counter
+            // (~/gc_refs/marioparty4/src/game/main.c:115) read out of the running recomp by
+            // gc_input.c __recomp_pad_witness; padSeq is the worker's VIWaitForRetrace count.
+            // Two witnesses of different provenance for the same clock.
+            try {
+              const P = window.__gcPad;
+              if (P) { const w = P.witness(); o.gcGlobal = w ? w.globalCounter : null; o.padSeq = P.seq(); }
+            } catch (_e) {}
             const R = window.__gcRate;
             if (R) o.rate = { path: R.path, speed: R.speed, cap: R.capFps,
                               // cap is min(guestCap, renderCap) on the recomp path. Capture
@@ -1377,6 +1389,10 @@ function startServer() {
                               // hardware-rate arm is usually guest-bound).
                               gcap: R.guestCap, rcap: R.renderCap,
                               pub: R.published, shown: R.shown, starved: R.starved,
+                              // producedPerS/guestCap is the recomp path's analogue of the
+                              // JIT's idle-skip fraction: how much of the wall clock the guest
+                              // spends computing vs parked waiting for its next frame credit.
+                              produced: R.producedPerS, acked: R.ackedPerS,
                               nativeHz: R.nativeHz, uncapped: R.uncapped };
             const _f = document.getElementById('fps');
             if (_f) o.head = _f.textContent;
@@ -1483,6 +1499,60 @@ function startServer() {
               + '  W4 guestGC=' + (row.gcps == null ? 'n/a' : row.gcps + '/s')
               + ' retrace=' + (row.rtps == null ? 'n/a' : row.rtps + '/s')
               + '  [ticksHz=' + row.hz + ' period=' + row.aiPer + ' NumBlocks=' + row.nblk + ']');
+            // ---- [recomp-witness] the guest-rate row FOR THE RECOMP PATH -----
+            // The row above is structurally blank here and says so: W1/W2/W3 read
+            // Dolphin's CoreTiming, which the recomp path parks. This engine is a
+            // NATIVE PORT, so its clock is FRAMES, not cycles, and its witnesses are:
+            //   R1  MP4's own GlobalCounter (main.c:115) — GUEST-EXECUTED, the W4 of
+            //       this path: it advances only because the game's main loop ran.
+            //   R2  the worker's VIWaitForRetrace count — same clock, different
+            //       provenance (host bookkeeping), so agreement is a real cross-check.
+            //   R3  drawn/s — the PE SetFinish counter; ONLY THIS PROVES LIVENESS
+            //       (a wedge screenshots a plausible stale frame at speed 1.000x).
+            //   R4  the page's credits-consumed model (window.__gcRate.speed).
+            // IDLE FRACTION. "Cycles credited but never executed" has no meaning
+            // without cycle-crediting, so idleFrac above is null here and that is
+            // correct, not a 0%. The measurable analogue is how much of the wall
+            // clock the guest spends computing versus parked in Atomics.wait for its
+            // next frame credit: produced/guestCap busy, the rest idle. A rate
+            // without that beside it is not a result (CLAUDE.md gate #10).
+            if (row.path === 'recomp') {
+              const nHz = (s.rate && s.rate.nativeHz) || 60;
+              const dGC = (s.gcGlobal != null && _srPrev.gcGlobal != null)
+                ? u32d(s.gcGlobal, _srPrev.gcGlobal) : null;
+              const dSeq = (s.padSeq != null && _srPrev.padSeq != null)
+                ? (s.padSeq - _srPrev.padSeq) : null;
+              row.rGcHz  = dGC  == null ? null : +(dGC / dw).toFixed(2);
+              row.rSeqHz = dSeq == null ? null : +(dSeq / dw).toFixed(2);
+              row.rGuestGC  = row.rGcHz  == null ? null : +(row.rGcHz / nHz).toFixed(4);
+              row.rGuestSeq = row.rSeqHz == null ? null : +(row.rSeqHz / nHz).toFixed(4);
+              const prod = s.rate && s.rate.produced, gcap = s.rate && s.rate.gcap;
+              row.rBusyFrac = (prod > 0 && gcap > 0) ? +Math.min(1, prod / gcap).toFixed(4) : null;
+              row.rIdleFrac = row.rBusyFrac == null ? null : +(1 - row.rBusyFrac).toFixed(4);
+              // W5: drawn/s divided by the guest rate. ⚠ `drawn` is Δ PE SetFinish and is NOT
+              // divided by 2 the way the publish seqlock is; MP4 issues TWO PE finishes per
+              // rendered frame, so this reads ~120 on a 60 Hz title. It is 120 PE-FINISHES per
+              // guest-second, NOT 120 distinct frames — at 1.000x only 60 distinct frames exist
+              // per second and calling that 120 fps is the fabricated number gate #9 forbids.
+              // The page's own `shown`/`pub` are the frame counts.
+              row.rW5 = (row.rGuestGC > 0) ? +(row.drawn / row.rGuestGC).toFixed(1) : null;
+              console.log('[recomp-witness] t=' + row.tsec + 's'
+                + '  R1 GlobalCounter=' + (row.rGcHz == null ? 'n/a' : row.rGcHz + '/s')
+                + ' => ' + (row.rGuestGC == null ? 'n/a' : row.rGuestGC + 'x')
+                + '  R2 viRetrace=' + (row.rSeqHz == null ? 'n/a' : row.rSeqHz + '/s')
+                + ' => ' + (row.rGuestSeq == null ? 'n/a' : row.rGuestSeq + 'x')
+                + '  R3 drawn=' + row.drawn + '/s (liveness)'
+                + '  R4 credits=' + (s.rate && s.rate.speed != null ? (+s.rate.speed).toFixed(4) + 'x' : '--')
+                + '  || idle(waiting for credit)='
+                + (row.rIdleFrac == null ? 'n/a' : (100 * row.rIdleFrac).toFixed(1) + '%')
+                + '  produced=' + (prod == null ? '--' : (+prod).toFixed(1))
+                + '/s of guestCap ' + (gcap == null ? '--' : (+gcap).toFixed(0)) + '/s'
+                + '  W5 drawn/rate=' + (row.rW5 == null ? 'n/a' : row.rW5 + ' PE-finish/guest-s'
+                    + ' (~' + (row.rW5 / 2).toFixed(1) + ' frames; MP4 finishes twice per frame)')
+                + '  shown=' + (s.rate && s.rate.shown != null ? (+s.rate.shown).toFixed(0) : '--')
+                + '/pub=' + (s.rate && s.rate.pub != null ? (+s.rate.pub).toFixed(0) : '--')
+                + '  [nativeHz=' + nHz + ']');
+            }
             _srRows.push(row);
             {
               // [submitted-vs-rendered] one line that walks a frame's geometry from

@@ -360,15 +360,42 @@ perl -0pi -e 's/(BOOL HuTHPEndCheck\(void\)\s*\n\{)/$1\n    return 1;/' "$BUILD/
 #     sprite stays valid but draws nothing) so the demo can advance.
 perl -0pi -e 's/(static void THPViewSprFunc\(HuSprite \*arg0\)\s*\n\{)/$1\n    return;/' "$BUILD/src/game/thpmain.c" 2>/dev/null || true
 #     [input inject] the recomp has no VI-retrace interrupt firing PadReadVSync, so HuPadBtnDown
-#     never gets real input. Deliver host buttons: OR __recomp_inject_btn (set by the harness via
-#     ___recomp_set_inject_btn) into HuPadBtnDown[0] at HuPadRead's end (shims/src/gc_input.c).
+#     never gets real input. Deliver host buttons: OR __recomp_inject_btn[p] (set by the host via
+#     ___recomp_set_pad) into HuPadBtnDown[p] at HuPadRead's end (shims/src/gc_input.c).
 #     FRAME-SCOPED (not one-shot): HuPadRead runs MORE THAN ONCE per retrace in some overlays
 #     (mentDll char-select), and a consume-on-first-delivery let the second call recompute
 #     HuPadBtnDown from _Pad state and WIPE the injected bit before the game logic saw it (the
 #     eaten-A stall). The pacing side sets the cells for exactly one frame and clears them at
 #     the next retrace, and the HuPrcKill zombie fix removed the double-processing that the
 #     one-shot was protecting against.
-perl -0pi -e 's/(_PadBtnDown\[i\] = 0;\s*\n\s*\})\n\}/$1\n    { extern int __recomp_inject_btn; extern int __recomp_inject_dstk; extern int __recomp_inject_stkx; extern int __recomp_inject_stky; HuPadBtnDown[0] |= (unsigned short)__recomp_inject_btn; HuPadDStkRep[0] |= (unsigned char)__recomp_inject_dstk; if (__recomp_inject_stkx) HuPadStkX[0] = (s8)__recomp_inject_stkx; if (__recomp_inject_stky) HuPadStkY[0] = (s8)__recomp_inject_stky; }\n}/' "$BUILD/src/game/pad.c" 2>/dev/null || true
+#     [four ports 2026-09-10] THE INDEX WAS THE HARDCODED LITERAL 0 AND THAT WAS THE WHOLE
+#     TWO-PLAYER BLOCKER. game/pad.c's HuPadRead already loops i=0..3 over four-element arrays,
+#     and mentDll's character select reads HuPadBtnDown[player->pad_idx] per player
+#     (~/gc_refs/marioparty4/src/REL/mentDll/main.c:3987-4025), so this bake is the only place
+#     that collapsed four ports into one. It is now a four-iteration loop over the arrays in
+#     gc_input.c and nothing else changed about it.
+#     RECOMP_SINGLEPORT=1 bakes the OLD one-port line instead — port 0 and nothing else, exactly
+#     as this shipped before 2026-09-10. It exists so the four-port claim has a MATCHED NEGATIVE
+#     CONTROL: same tree, same shims, same witness export, one loop bound. Without it the only
+#     available control was the previously-shipped wasm, which also predates
+#     ___recomp_pad_witness — so it reads four zeros for the trivial reason that it has no
+#     witness at all, and a vacuous control proves nothing.
+#     gamecube/tools/recomp_fourport_test.mjs is what consumes it.
+if [ -n "${RECOMP_SINGLEPORT:-}" ]; then
+  echo "[recomp] ⚠ RECOMP_SINGLEPORT=1 — baking the OLD port-0-only input path (A/B control arm)"
+  perl -0pi -e 's/(_PadBtnDown\[i\] = 0;\s*\n\s*\})\n\}/$1\n    { extern int __recomp_inject_btn[4]; extern int __recomp_inject_dstk[4]; extern int __recomp_inject_stkx[4]; extern int __recomp_inject_stky[4]; HuPadBtnDown[0] |= (unsigned short)__recomp_inject_btn[0]; HuPadDStkRep[0] |= (unsigned char)__recomp_inject_dstk[0]; if (__recomp_inject_stkx[0]) HuPadStkX[0] = (s8)__recomp_inject_stkx[0]; if (__recomp_inject_stky[0]) HuPadStkY[0] = (s8)__recomp_inject_stky[0]; }\n}/' "$BUILD/src/game/pad.c" 2>/dev/null || true
+  BAKE_MARK='__recomp_inject_btn\[0\]'
+else
+  perl -0pi -e 's/(_PadBtnDown\[i\] = 0;\s*\n\s*\})\n\}/$1\n    { extern int __recomp_inject_btn[4]; extern int __recomp_inject_dstk[4]; extern int __recomp_inject_stkx[4]; extern int __recomp_inject_stky[4]; int __rp; for (__rp = 0; __rp < 4; __rp++) { HuPadBtnDown[__rp] |= (unsigned short)__recomp_inject_btn[__rp]; HuPadDStkRep[__rp] |= (unsigned char)__recomp_inject_dstk[__rp]; if (__recomp_inject_stkx[__rp]) HuPadStkX[__rp] = (s8)__recomp_inject_stkx[__rp]; if (__recomp_inject_stky[__rp]) HuPadStkY[__rp] = (s8)__recomp_inject_stky[__rp]; } }\n}/' "$BUILD/src/game/pad.c" 2>/dev/null || true
+  BAKE_MARK='__recomp_inject_btn\[__rp\]'
+fi
+#     ⚠ THE BAKE ABOVE ENDS IN `|| true`, SO A PATTERN THAT STOPS MATCHING IS SILENT — and a
+#     recomp with no bake boots perfectly and simply never accepts a button. Assert it landed.
+if ! grep -q "$BAKE_MARK" "$BUILD/src/game/pad.c" 2>/dev/null; then
+  echo "[recomp] FATAL: the input bake did not apply to $BUILD/src/game/pad.c" >&2
+  echo "[recomp]        (HuPadRead's tail no longer matches the perl pattern) — input would be DEAD" >&2
+  exit 1
+fi
 #     [system clocks] __OSBusClock/__OSCoreClock (os.h, AT_ADDRESS 0x800000F8/FC) are written by the
 #     bootrom + OSInit on real HW; here AT_ADDRESS is stripped -> plain BSS globals, and OSInit is a
 #     no-op import, so they stay 0 -> the OSTicksToMilliseconds macro (ticks/(__OSBusClock/4000))
@@ -922,7 +949,7 @@ if emcc "$BUILD"/obj/*.o -o "$BUILD/mp4_game.js" \
      -sERROR_ON_UNDEFINED_SYMBOLS=0 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2176mb -sINITIAL_MEMORY=$AUDIO_INITMEM \
      -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=32768 ${RECOMP_PROFILING_FUNCS:+--profiling-funcs} \
      -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node,web,worker -sINVOKE_RUN=0 \
-     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn,___recomp_set_inject_dstk,___recomp_set_inject_stkx,___recomp_set_inject_stky,_HuMemHeapPtrGet,___recomp_dirty_base,___recomp_dirty_count,___recomp_dirty_overflow,___recomp_dirty_reset,___recomp_autoboard_arm,___recomp_aram_base,___recomp_static_top,___recomp_card_base,___recomp_card_size,___recomp_card_seq,___recomp_card_adopt,___recomp_card_slots,___recomp_card_time"$AUDIO_EXPORTS" \
+     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_pad,___recomp_pad_witness,___recomp_set_inject_btn,___recomp_set_inject_dstk,___recomp_set_inject_stkx,___recomp_set_inject_stky,_HuMemHeapPtrGet,___recomp_dirty_base,___recomp_dirty_count,___recomp_dirty_overflow,___recomp_dirty_reset,___recomp_autoboard_arm,___recomp_aram_base,___recomp_static_top,___recomp_card_base,___recomp_card_size,___recomp_card_seq,___recomp_card_adopt,___recomp_card_slots,___recomp_card_time"$AUDIO_EXPORTS" \
      -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAP32,HEAPU32,wasmMemory,wasmExports \
      -Wl,--no-entry -Wl,--no-gc-sections -Wl,--allow-undefined -Wl,--allow-multiple-definition -O2 2>"$BUILD/link.txt"; then
   echo "[recomp] LINKED: $BUILD/mp4_game.js + $BUILD/mp4_game.wasm ($(stat -f%z "$BUILD/mp4_game.wasm" 2>/dev/null) bytes)"

@@ -7347,7 +7347,13 @@ window.GcRate = (function () {
   // is what gamecube_multiplayer.html already had there.
   var GP_BUTTON_KEYS = { 0: KEYMAP.a, 1: KEYMAP.b, 2: KEYMAP.x, 3: KEYMAP.y, 4: KEYMAP.l, 5: KEYMAP.r, 6: KEYMAP.z, 7: KEYMAP.z, 8: KEYMAP.select, 9: KEYMAP.start, 12: KEYMAP.up, 13: KEYMAP.down, 14: KEYMAP.left, 15: KEYMAP.right }; var gpPressed = {}; var gpPolling = false; var GP_AXIS_DEAD = 0.35;
   function gpEdge(id, keyLabel, pressed) { if (pressed && !gpPressed[id]) { dispatchKey('keydown', keyLabel); gpPressed[id] = true; } else if (!pressed && gpPressed[id]) { dispatchKey('keyup', keyLabel); gpPressed[id] = false; } }
-  function pollGamepads() { var pads = (navigator.getGamepads && navigator.getGamepads()) || []; for (var i = 0; i < pads.length; i++) { var gp = pads[i]; if (!gp) continue; var btns = gp.buttons || []; for (var b in GP_BUTTON_KEYS) { var bi = +b, key = GP_BUTTON_KEYS[b]; gpEdge(i + ':b' + bi, key, !!(btns[bi] && btns[bi].pressed)); } var ax = gp.axes || []; var axX = ax[0] || 0, axY = ax[1] || 0; gpEdge(i + ':axL', KEYMAP.left, axX < -GP_AXIS_DEAD); gpEdge(i + ':axR', KEYMAP.right, axX > GP_AXIS_DEAD); gpEdge(i + ':axU', KEYMAP.up, axY < -GP_AXIS_DEAD); gpEdge(i + ':axD', KEYMAP.down, axY > GP_AXIS_DEAD); } requestAnimationFrame(pollGamepads); }
+  // ⚠ THIS LOOP IS WHERE FOUR CONTROLLERS BECAME ONE. It walks every connected gamepad and
+  // funnels all of them through dispatchKey — a single keyboard-shaped stream with no port on
+  // it — so on the recomp path (the engine that runs Mario Party 4) pads 0..3 all landed on
+  // player 1. The recomp block publishes window.gcRecompPadSink, which routes gamepad i to
+  // GameCube port i; when it exists the pads belong to it and dispatchKey is not called for
+  // them at all. The keyboard path below/above is untouched and remains player 1.
+  function pollGamepads() { var pads = (navigator.getGamepads && navigator.getGamepads()) || []; var sink = window.gcRecompPadSink; for (var i = 0; i < pads.length; i++) { var gp = pads[i]; if (!gp) continue; if (sink) { sink(i, gp); continue; } var btns = gp.buttons || []; for (var b in GP_BUTTON_KEYS) { var bi = +b, key = GP_BUTTON_KEYS[b]; gpEdge(i + ':b' + bi, key, !!(btns[bi] && btns[bi].pressed)); } var ax = gp.axes || []; var axX = ax[0] || 0, axY = ax[1] || 0; gpEdge(i + ':axL', KEYMAP.left, axX < -GP_AXIS_DEAD); gpEdge(i + ':axR', KEYMAP.right, axX > GP_AXIS_DEAD); gpEdge(i + ':axU', KEYMAP.up, axY < -GP_AXIS_DEAD); gpEdge(i + ':axD', KEYMAP.down, axY > GP_AXIS_DEAD); } requestAnimationFrame(pollGamepads); }
   window.addEventListener('gamepadconnected', function (e) { setStatus('Controller connected: ' + e.gamepad.id); if (!gpPolling) { gpPolling = true; requestAnimationFrame(pollGamepads); } }); window.addEventListener('gamepaddisconnected', function () { setStatus('Controller disconnected'); }); if (navigator.getGamepads) { gpPolling = true; requestAnimationFrame(pollGamepads); }
   // [portrait-gate FIX 2026-09-08] The hint is a NON-BLOCKING pill now
   // (pointer-events: none — see its CSS), and it retires itself after
@@ -7846,7 +7852,12 @@ window.GcRate = (function () {
     else console.warn('[recomp-live] ignoring malformed ?fps=' + q.get('fps') + '; staying at ' + GUEST_HZ + '/s');
   }
   var BOOT_MS = parseInt(q.get('bootms') || '50000', 10);
-  var pace = new SharedArrayBuffer(64);
+  // 576 bytes of this are load-bearing (recomp_worker.js PACE_I32_CELLS = 144): cells 0-15 are
+  // credits + the legacy port-0 input cells + the savestate channel, 16-31 are the FOUR-PORT pad
+  // block, 36-79 the game's-own-pad-state witness, 80-143 the raw MEM1 peek windows. Rounded up
+  // so adding a cell does not mean re-deriving a size in two files. It was 64 bytes for as long
+  // as this engine had one controller.
+  var pace = new SharedArrayBuffer(1024);
   var paceI32 = new Int32Array(pace);
   if (TARGET === 0) Atomics.store(paceI32, 5, 1);   // uncapped
   var rw = null;
@@ -8328,7 +8339,135 @@ window.GcRate = (function () {
   window.addEventListener('blur', function () {   // focus loss must not leave the stick stuck held
     heldKeys = {};
     Atomics.store(paceI32, 8, 0); Atomics.store(paceI32, 9, 0);
+    for (var _p = 0; _p < PAD_PORTS; _p++) gcPadStick(_p, 0, 0);
   });
+
+  // ── FOUR CONTROLLER PORTS ────────────────────────────────────────────────────────────────
+  // [2026-09-10] "imagine fucking mario party! it needs to be immediate to EVERY PLAYER, UP TO
+  // 8 PLAYERS!" — GameCube is the four-controller console and Mario Party 4 is THE four-player
+  // title, and this engine could express exactly one player. Two separate places collapsed the
+  // ports, and BOTH had to go:
+  //   1. the recomp itself baked HuPadBtnDown[0] (build_wasm.sh) over four scalars in
+  //      shims/src/gc_input.c — fixed there, four arrays and ___recomp_set_pad(port, ...);
+  //   2. THIS PAGE. pollGamepads (:7350) loops over every connected gamepad and funnels all of
+  //      them through dispatchKey, which is ONE keyboard-shaped stream. Four physical
+  //      controllers therefore moved one character — the exact "one controller moving two
+  //      characters" failure — and no amount of work in the worker could have separated them,
+  //      because the port was already lost before the SAB.
+  // A gamepad's index IS its controller port. The sink below is installed only while the recomp
+  // engine owns the game; pollGamepads defers to it and skips dispatchKey entirely for pads.
+  // The KEYBOARD stays on the legacy cells 1/2/3/4/8/9, which the worker folds into port 0 —
+  // so a keyboard-only visitor is player 1 and gamepad 1 is player 2, with no conflict.
+  var PAD_PORTS = 4, PAD_BASE = 16, PAD_STRIDE = 4;
+  // Mirrors of recomp_worker.js's SAB map — see the GUEST-STATE WITNESS block there.
+  var PEEK_SEQ = 32, WIT_BASE = 36, WIT_CELLS = 48;
+  var PEEK_BASE = WIT_BASE + WIT_CELLS, PEEK_WINDOWS = 4, PEEK_CELLS = 16;
+
+  // btn/dstk are EDGE bits: OR-ed in, and the worker exchange-clears them once it has delivered
+  // exactly one frame of them (HuPadBtnDown/HuPadDStkRep are edge-triggered in the game).
+  function gcPadEdge(port, btnBits, dstkBits) {
+    if (!paceI32 || !(port >= 0) || port >= PAD_PORTS) return;
+    var b = PAD_BASE + port * PAD_STRIDE;
+    if (btnBits) Atomics.or(paceI32, b, btnBits | 0);
+    if (dstkBits) Atomics.or(paceI32, b + 1, dstkBits | 0);
+  }
+  // stkx/stky are HELD LEVELS: HuPadStkX/Y are compared against thresholds (>=5, >=50), so a
+  // one-frame blip is invisible to a held-analog UI — the character-select cursor is exactly
+  // that. Stored, not OR-ed, and cleared on release.
+  function gcPadStick(port, x, y) {
+    if (!paceI32 || !(port >= 0) || port >= PAD_PORTS) return;
+    var b = PAD_BASE + port * PAD_STRIDE;
+    Atomics.store(paceI32, b + 2, x | 0);
+    Atomics.store(paceI32, b + 3, y | 0);
+  }
+
+  // Same button->bit table as KEYB above, keyed by Standard Gamepad index — deliberately the
+  // same indices GP_BUTTON_KEYS (:7348) uses, so the two cannot describe different controllers.
+  // GC pad bits: a=0x100 b=0x200 x=0x400 y=0x800 z=0x10 l=0x40 r=0x20 start=0x1000.
+  var GP_PORT_BTN  = { 0: 0x100, 1: 0x200, 2: 0x400, 3: 0x800, 4: 0x40, 5: 0x20, 6: 0x10, 7: 0x10, 9: 0x1000 };
+  // HuPadDStkRep bits: left=1 right=2 down=4 up=8 (KEYD above).
+  var GP_PORT_DPAD = { 12: 8, 13: 4, 14: 1, 15: 2 };
+  var GP_PORT_DEAD = 0.35, gpPortHeld = {};
+  // One gamepad, one port. Returns nothing; called from pollGamepads once per rAF per pad.
+  function gcPadFromGamepad(port, gp) {
+    if (port >= PAD_PORTS) return;      // a 5th pad has no GameCube port to go to
+    var btns = gp.buttons || [], bits = 0, dbits = 0, k, bi;
+    for (k in GP_PORT_BTN) {
+      bi = +k;
+      var down = !!(btns[bi] && btns[bi].pressed), id = port + ':b' + bi;
+      if (down && !gpPortHeld[id]) bits |= GP_PORT_BTN[k];      // press EDGE only
+      gpPortHeld[id] = down;
+    }
+    var ax = gp.axes || [], axX = ax[0] || 0, axY = ax[1] || 0;
+    // The d-pad feeds BOTH channels: the repeat channel (menus that scroll on HuPadDStkRep) and
+    // the held stick (menus that threshold HuPadStkX/Y). pad.c:134 masks the d-pad bits out of
+    // HuPadBtn, so the stick is the only live navigation surface on several screens.
+    var dx = 0, dy = 0;
+    for (k in GP_PORT_DPAD) {
+      bi = +k;
+      var ddown = !!(btns[bi] && btns[bi].pressed), did = port + ':d' + bi;
+      if (ddown && !gpPortHeld[did]) dbits |= GP_PORT_DPAD[k];
+      gpPortHeld[did] = ddown;
+      if (ddown) { if (bi === 14) dx = -80; else if (bi === 15) dx = 80;
+                   else if (bi === 12) dy = 80; else if (bi === 13) dy = -80; }
+    }
+    if (Math.abs(axX) > GP_PORT_DEAD) dx = Math.max(-80, Math.min(80, Math.round(axX * 80)));
+    // HuPadStkY is POSITIVE UP; the Gamepad API's axis 1 is negative up. Invert once, here.
+    if (Math.abs(axY) > GP_PORT_DEAD) dy = Math.max(-80, Math.min(80, Math.round(-axY * 80)));
+    // A stick pushed past the threshold also needs to produce d-stick REPEAT edges, or a pad
+    // with no d-pad cannot move a menu cursor at all.
+    var sdir = (dx <= -50 ? 1 : 0) | (dx >= 50 ? 2 : 0) | (dy <= -50 ? 4 : 0) | (dy >= 50 ? 8 : 0);
+    var sid = port + ':sdir';
+    if (sdir && sdir !== gpPortHeld[sid]) dbits |= sdir;
+    gpPortHeld[sid] = sdir;
+    gcPadEdge(port, bits, dbits);
+    gcPadStick(port, dx, dy);
+  }
+
+  // Test seam. A harness — and lockstep, when it lands — must be able to drive four ports and
+  // read back what the GAME'S OWN pad arrays hold, without a keyboard and without postMessage
+  // (which cannot reach the recomp worker once _main() runs). `peek` mirrors the guest windows
+  // named by ?peek=<hex>,<hex>...; `seq` advances once per guest frame, so a reader can tell a
+  // fresh sample from a stale one.
+  window.__gcPad = {
+    ports: PAD_PORTS,
+    edge: gcPadEdge,
+    stick: gcPadStick,
+    seq: function () { return paceI32 ? Atomics.load(paceI32, PEEK_SEQ) : 0; },
+    // The GAME'S OWN pad arrays, read by C symbol in gc_input.c __recomp_pad_witness().
+    // Rows of four (one per port): 0 HuPadBtnDown, 4 HuPadBtn, 8 HuPadDStkRep, 12 HuPadStkX,
+    // 16 HuPadStkY, 20 HuPadErr, 24 winKey, 28 cfg.character, 32 cfg.pad_idx, 36 cfg.iscom,
+    // 40 the host-side injected bits (so "never injected" and "injected but never delivered"
+    // are two DIFFERENT answers rather than one shrug).
+    witness: function () {
+      if (!paceI32) return null;
+      var o = {}, names = ['btnDown', 'btn', 'dstkRep', 'stkX', 'stkY', 'err', 'winKey',
+                           'cfgChar', 'cfgPad', 'cfgCom', 'injected'];
+      for (var r = 0; r < names.length; r++) {
+        o[names[r]] = [];
+        for (var p = 0; p < 4; p++) o[names[r]].push(Atomics.load(paceI32, WIT_BASE + r * 4 + p));
+      }
+      // Row 11 is scalar: WHERE the game is. Without it a harness cannot tell "four ports are
+      // dead" from "no message window was open when I looked" — opposite conclusions.
+      o.ovl = Atomics.load(paceI32, WIT_BASE + 44);
+      o.ovlEvt = Atomics.load(paceI32, WIT_BASE + 45);
+      o.openWindows = Atomics.load(paceI32, WIT_BASE + 46);
+      // MP4's OWN frame counter (main.c:115). A GUEST-EXECUTED clock — it advances only because
+      // the game ran — so it is the recomp path's W4, independent of both the worker's retrace
+      // bookkeeping and the renderer's frame counters.
+      o.globalCounter = Atomics.load(paceI32, WIT_BASE + 47) >>> 0;
+      return o;
+    },
+    peek: function (w) {
+      if (!paceI32 || !(w >= 0) || w >= PEEK_WINDOWS) return null;
+      var out = new Uint8Array(PEEK_CELLS * 4);
+      out.set(new Uint8Array(paceI32.buffer, (PEEK_BASE + w * PEEK_CELLS) * 4, PEEK_CELLS * 4));
+      return Array.from(out);
+    }
+  };
+  // Publishing the sink is what makes pollGamepads route per-port; it is set here, inside the
+  // recomp block, so the JIT path (which has its own SI plumbing) is untouched.
+  window.gcRecompPadSink = gcPadFromGamepad;
 
   // Credit grant = THE GUEST CLOCK. TARGET credits per wall-clock second, and nothing else in
   // this file is allowed to touch emulated time. rAF only decides how often we top the pool up;
@@ -8414,6 +8553,13 @@ window.GcRate = (function () {
       // guest-bound cap in one arm to a render-bound cap in another is comparing two
       // different quantities and is not a control at all — see ?ratetest=1 test 19.
       guestCap: r.guestCap, renderCap: r.renderCap,
+      // Published as NUMBERS as well as prose: producedPerS/guestCap is the recomp path's
+      // analogue of the JIT's idle-skip fraction. There is no cycle-crediting here — this is
+      // native code, not a DBT — so "credited cycles the JIT never executed" has no meaning;
+      // what IS measurable is how much of the wall clock the guest spends computing versus
+      // parked in Atomics.wait for its next frame credit. A rate without that fraction beside
+      // it is not a result (CLAUDE.md gate #10), and prose cannot be read by a harness.
+      producedPerS: r.producedPerS, ackedPerS: r.ackedPerS,
       starved: r.starved,
       capNote: 'recomp: min(guest ' + GcRate.num(r.guestCap) + '/s, render ' +
                GcRate.num(r.renderCap) + '/s) from measured busy time',

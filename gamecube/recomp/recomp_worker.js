@@ -15,7 +15,9 @@
 //              pace i32[0]=frame-credits i32[1]=btn i32[2]=dstk i32[3]=stkx i32[4]=stky
 //              i32[5]=uncapped i32[8]=held-stkx i32[9]=held-stky, and the savestate channel
 //              i32[10]=cmd i32[11]=total i32[12]=chunkLen i32[13]=seq i32[14]=consumed
-//              i32[15]=status (see the SAVE STATES block).
+//              i32[15]=status (see the SAVE STATES block). i32[16..31] = the FOUR-PORT pad
+//              block and i32[32..99] = the guest-state witness window — see the PAD_PORTS /
+//              PEEK_SEQ block further down. Cells 1-4 and 8-9 stay live as a port-0 alias.
 //            | {cmd:'cardLoad', img:ArrayBuffer}  swap the live memory-card image (import)
 //            | {cmd:'cardDump'}                   snapshot the live card out right now
 //            NOTE: inbound messages are only serviced BEFORE Module._main() is called — after
@@ -34,7 +36,34 @@ let peekAddrs = null;      // debug: guest offsets to hex-dump every 1200 frames
 let testFullMem = false;   // debug: ship full mem1 every frame (fixture-equivalence bisect)
 let XF_SHADOW_ALL = false; // matrix-memory shadow BROKE glyph texgen state (2026-08-26 bisect); registers-only
 let parts = [], fstBuf = null;
-const PART_SIZE = 104857600;   // 100MiB fixed part boundaries (gamecube.html chunkRange)
+// [part-table 2026-09-04] Cumulative byte offset of each disc part, built at boot from the
+// parts' REAL byteLengths (buildPartIndex, called from boot()). This REPLACES
+// `const PART_SIZE = 104857600;  // 100MiB fixed part boundaries (gamecube.html chunkRange)`,
+// which serveDvdRead divided the read offset by. chunkRange (gamecube.html:2064) only builds
+// part URLs — it says nothing about part SIZE — and the sizes on disk say the constant was
+// wrong twice over. Measured with `ls -la gamecube/roms/*.bin.parta*` on 2026-09-04:
+//   * MarioParty4.bin.parta{a..e} ARE 104,857,600 B, but partaf is 74,094,592 B. The old clamp
+//     `Math.min(length - done, PART_SIZE - po)` sized the copy off the CONSTANT, not off the
+//     short final part, so `new Uint8Array(part, po, chunk)` threw RangeError on any read that
+//     ran off the end of the trimmed image instead of zero-filling it.
+//   * SonicAdventure2Battle.bin.parta{a..p} and PhantasyStarOnline1And2Plus.bin.parta{a..p} are
+//     89,128,960 B each (partaq 33,914,880 B) — NOT 100 MiB. `offset / PART_SIZE` maps every
+//     read of those images to the wrong part at the wrong offset, with no error at all.
+// gamecube.html's prefetchDisc() (:7924-7942) hardcodes the six MP4 parts, so only the first
+// failure is reachable from the shipping page today — but the second is one chunk-list change
+// away, and a cumulative table makes the split layout DATA rather than an assumption.
+let partStarts = [], discBytes = 0;
+
+function buildPartIndex(list) {
+  partStarts = new Array(list.length);
+  let acc = 0;
+  for (let i = 0; i < list.length; i++) {
+    partStarts[i] = acc;
+    acc += (list[i] && list[i].byteLength) | 0;
+  }
+  discBytes = acc;
+  return acc;
+}
 
 // ---- AUDIO transport (page AudioWorklet ring) -------------------------------------------
 // THE STATE OF THIS PATH. [2026-09-02] THE SHIPPED gamecube/recomp/mp4_game.wasm NOW HAS SOUND
@@ -487,6 +516,109 @@ function regionBytes(mem, base, stride, count) {
 //     (restored) fiber struct at the next context switch.
 //   * Anything in the dolphin worker. It is the renderer; the forced full resync re-seeds it.
 const ST_CMD = 10, ST_TOTAL = 11, ST_LEN = 12, ST_SEQ = 13, ST_CONSUMED = 14, ST_STATUS = 15;
+
+// ── FOUR CONTROLLER PORTS ───────────────────────────────────────────────────────────────────
+// [2026-09-10] Mario Party 4 is THE four-player title and this engine could express exactly one
+// player: gc_input.c held four SCALARS, their setters took no port, and build_wasm.sh baked
+// `HuPadBtnDown[0]`. Nothing about the GAME was the limit — game/pad.c declares every channel
+// as [4] and HuPadRead loops i=0..3 — so the whole blocker lived in the two lines above and in
+// the six single-port SAB cells below.
+//
+// The pace SAB now carries one block per port. Cells 0..15 are UNCHANGED (credits, the legacy
+// port-0 cells, the savestate channel); the per-port block starts at PAD_BASE:
+//
+//   PAD_BASE + port*PAD_STRIDE + 0   btn   one-shot edge  -> HuPadBtnDown[port]
+//                              + 1   dstk  one-shot edge  -> HuPadDStkRep[port]
+//                              + 2   stkx  HELD level     -> HuPadStkX[port]
+//                              + 3   stky  HELD level     -> HuPadStkY[port]
+//
+// ⚠ THE LEGACY CELLS ARE AN ALIAS FOR PORT 0, NOT A SECOND SOURCE OF TRUTH. gamecube.html's
+// keyboard listeners and gamecube/recomp/recomp_probe.mjs:348-353 write cells 1/2/3/4/8/9 and
+// call ___recomp_set_inject_*; folding them into port 0 here is what keeps a keyboard-only
+// visitor (and every existing harness) working while a gamepad on index 1 reaches port 1.
+const PAD_PORTS = 4, PAD_BASE = 16, PAD_STRIDE = 4;
+
+// ── GUEST-STATE WITNESS WINDOW ──────────────────────────────────────────────────────────────
+// A postMessage cannot reach this worker once _main() runs (see the SAVE STATES block), and the
+// guest's state lives in THIS worker's wasm instance — so the page has no way to read what the
+// game itself thinks its four pads are doing. That is not a debugging luxury: "four ports are
+// wired" is only worth anything if it can be checked against the GAME'S OWN arrays rather than
+// against the flag we just set. Each frame the worker mirrors two things into the pace SAB and
+// bumps PEEK_SEQ last, so the page reads them synchronously with no guest cooperation:
+//
+//   WIT_*   ___recomp_pad_witness() — the game's own HuPadBtnDown/HuPadBtn/HuPadDStkRep/
+//           HuPadStkX/HuPadStkY/HuPadErr/winKey/GWPlayerCfg, read BY C SYMBOL in gc_input.c.
+//           ⚠ THIS IS A NATIVE PORT, NOT AN EMULATOR: there is no Gekko address map, so the
+//           GameCube addresses in the symbol map (HuPadBtnDown = 0x801D3AD0) name NOTHING here.
+//           A harness that peeked those MEM1 offsets read four zeros and looked exactly like
+//           dead input — it was reading empty arena.
+//   PEEK_*  the raw MEM1 offsets named by the boot message's peekAddrs, which DO exist (the
+//           arena the renderer is fed from) and are what the older guestPeek log line dumps.
+const PEEK_SEQ = 32;              // bumped AFTER everything below is filled (publish barrier)
+const WIT_BASE = 36, WIT_CELLS = 48;                            // ___recomp_pad_witness block
+const PEEK_BASE = WIT_BASE + WIT_CELLS;                         // = 80; first MEM1 window cell
+const PEEK_WINDOWS = 4;           // how many raw MEM1 windows are mirrored
+const PEEK_CELLS = 16;            // 64 bytes each
+const PACE_I32_CELLS = PEEK_BASE + PEEK_WINDOWS * PEEK_CELLS;   // = 144; page allocates ≥ this
+
+// Deliver one frame of pad state to the guest, one call per port. Prefers the four-port export;
+// falls back to the legacy single-port setters when running against an older mp4_game.wasm, in
+// which case ports 1-3 are simply not delivered (rather than silently landing on player 1).
+function applyPads() {
+  if (!Module) return;
+  const scripted = inputScript ? inputScript[viRetrace + 1] : null;
+  // legacy port-0 cells: two one-shot edges, two one-shot sticks, two held sticks
+  const lBtn = Atomics.exchange(paceI32, 1, 0), lDstk = Atomics.exchange(paceI32, 2, 0);
+  const lOsX = Atomics.exchange(paceI32, 3, 0), lOsY = Atomics.exchange(paceI32, 4, 0);
+  const lHeldX = Atomics.load(paceI32, 8), lHeldY = Atomics.load(paceI32, 9);
+  const setPad = Module.___recomp_set_pad || null;
+  for (let p = 0; p < PAD_PORTS; p++) {
+    const b = PAD_BASE + p * PAD_STRIDE;
+    let btn = Atomics.exchange(paceI32, b, 0);
+    let dstk = Atomics.exchange(paceI32, b + 1, 0);
+    let stkx = Atomics.load(paceI32, b + 2);
+    let stky = Atomics.load(paceI32, b + 3);
+    if (p === 0) {
+      btn |= lBtn; dstk |= lDstk;
+      stkx = stkx || lOsX || lHeldX; stky = stky || lOsY || lHeldY;
+      if (scripted) {
+        btn |= scripted[0]; dstk |= scripted[1];
+        stkx = stkx || scripted[2]; stky = stky || scripted[3];
+      }
+    }
+    if (setPad) setPad(p, btn, dstk, stkx, stky);
+    else if (p === 0) {
+      if (Module.___recomp_set_inject_btn) Module.___recomp_set_inject_btn(btn);
+      if (Module.___recomp_set_inject_dstk) Module.___recomp_set_inject_dstk(dstk);
+      if (Module.___recomp_set_inject_stkx) Module.___recomp_set_inject_stkx(stkx);
+      if (Module.___recomp_set_inject_stky) Module.___recomp_set_inject_stky(stky);
+    }
+  }
+}
+
+// Mirror the game's own pad state (and any watched MEM1 windows) into the pace SAB. Called once
+// per frame, after the guest has run. Cheap: 176 B + up to 4×64 B of copying.
+function publishPeek() {
+  if (!Module || !paceI32 || paceI32.length < PACE_I32_CELLS) return;
+  const buf = Module.wasmMemory.buffer;
+  if (Module.___recomp_pad_witness) {
+    const at = Module.___recomp_pad_witness() >>> 0;      // fills the block, returns its address
+    if (at && at + WIT_CELLS * 4 <= buf.byteLength)
+      new Uint8Array(paceI32.buffer).set(new Uint8Array(buf, at, WIT_CELLS * 4), WIT_BASE * 4);
+  }
+  if (peekAddrs && peekAddrs.length) {
+    const src = new Uint8Array(buf);
+    const dst = new Uint8Array(paceI32.buffer);
+    const n = Math.min(peekAddrs.length, PEEK_WINDOWS);
+    for (let w = 0; w < n; w++) {
+      const off = 0x80000000 + (peekAddrs[w] >>> 0);
+      if (off + PEEK_CELLS * 4 > src.length) continue;
+      dst.set(src.subarray(off, off + PEEK_CELLS * 4), (PEEK_BASE + w * PEEK_CELLS) * 4);
+    }
+  }
+  Atomics.store(paceI32, PEEK_SEQ, (Atomics.load(paceI32, PEEK_SEQ) + 1) | 0);
+}
+
 const ST_PAGE = 65536;            // wasm page granularity; memory size is always a multiple
 const ST_MAGIC = 'GCRECOMP';
 const ST_VERSION = 1;
@@ -668,11 +800,19 @@ function serveDvdRead(mem, dv, block, addr, length, offset, cbIdx) {
   const dst = new Uint8Array(mem.buffer, addr, length);
   let done = 0;
   while (done < length) {
-    const pi = Math.floor((offset + done) / PART_SIZE);
-    const po = (offset + done) % PART_SIZE;
+    const off = offset + done;
+    // Zero-fill stays the behaviour for a read the assembled image cannot answer, but it is now
+    // reachable ONLY when the offset genuinely falls past the end (or lands in a part that was
+    // never delivered) — never because a fixed 100 MiB stride mis-sized a copy. See the
+    // part-table note at the top of this file for the measured part sizes.
+    if (off >= discBytes) { dst.fill(0, done); break; }
+    let pi = 0;
+    while (pi + 1 < partStarts.length && partStarts[pi + 1] <= off) pi++;
     const part = parts[pi];
     if (!part) { dst.fill(0, done); break; }
-    const chunk = Math.min(length - done, PART_SIZE - po);
+    const po = off - partStarts[pi];
+    const chunk = Math.min(length - done, part.byteLength - po);
+    if (chunk <= 0) { dst.fill(0, done); break; }
     dst.set(new Uint8Array(part, po, chunk), done);
     done += chunk;
   }
@@ -685,6 +825,7 @@ function serveDvdRead(mem, dv, block, addr, length, offset, cbIdx) {
 
 async function boot(msg) {
   parts = msg.parts;
+  buildPartIndex(parts);   // real per-part byteLengths -> serveDvdRead's map (note at :37-53)
   fstBuf = new Uint8Array(msg.fst);
   paceI32 = new Int32Array(msg.pace);
   if (msg.stage) stageSab = msg.stage;   // savestate load transport (see the SAVE STATES block)
@@ -1057,18 +1198,14 @@ async function boot(msg) {
                           regions: regions.map((r) => ({ addr: r.addr, bytes: r.bytes.buffer })) }, transfers);
           }
           if (Module._gx_fifo_reset) Module._gx_fifo_reset();
-          // input from the pace SAB (page keyboard/gamepad): buttons/d-pad (cells 1-2) are
-          // one-shot edges (exchange-cleared — they feed the game's EDGE-triggered
-          // HuPadBtnDown/HuPadDStkRep); the analog stick merges the HELD state the page
-          // maintains in cells 8/9 via keydown/keyup (HuPadStkX/Y are LEVEL thresholds —
-          // a single-frame blip can't drive held-analog UIs like character select).
-          const scripted = inputScript ? inputScript[viRetrace + 1] : null;
-          const os3 = Atomics.exchange(paceI32, 3, 0), os4 = Atomics.exchange(paceI32, 4, 0);
-          const h3 = Atomics.load(paceI32, 8), h4 = Atomics.load(paceI32, 9);
-          if (Module.___recomp_set_inject_btn) Module.___recomp_set_inject_btn(Atomics.exchange(paceI32, 1, 0) | (scripted ? scripted[0] : 0));
-          if (Module.___recomp_set_inject_dstk) Module.___recomp_set_inject_dstk(Atomics.exchange(paceI32, 2, 0) | (scripted ? scripted[1] : 0));
-          if (Module.___recomp_set_inject_stkx) Module.___recomp_set_inject_stkx(os3 || h3 || (scripted ? scripted[2] : 0));
-          if (Module.___recomp_set_inject_stky) Module.___recomp_set_inject_stky(os4 || h4 || (scripted ? scripted[3] : 0));
+          // input from the pace SAB (page keyboard/gamepad): buttons/d-pad are one-shot edges
+          // (exchange-cleared — they feed the game's EDGE-triggered HuPadBtnDown/HuPadDStkRep);
+          // the analog stick is the HELD state the page maintains via keydown/keyup (HuPadStkX/Y
+          // are LEVEL thresholds — a single-frame blip can't drive held-analog UIs like
+          // character select). Now FOUR PORTS: see the PAD_* block at the top of this file.
+          // Cells 1/2/3/4/8/9 remain live as a PORT-0 ALIAS so the existing keyboard listeners
+          // and gamecube/recomp/recomp_probe.mjs keep working unchanged.
+          publishPeek();
           viRetrace++;
           pumpAudio();
           cardPoll();
@@ -1098,6 +1235,17 @@ async function boot(msg) {
           // savestate command cell — LAST, so the frame is fully shipped, the FIFO reset and
           // the pacing credit consumed before a snapshot is taken or memory is overwritten.
           stateServiceCmd();
+          // ⚠ THE INPUT LATCH IS *AFTER* THE CREDIT WAIT, AND THAT ORDER IS LOAD-BEARING.
+          // This is the whole lockstep primitive: one credit granted == one guest frame run with
+          // exactly the pad bytes that were in the SAB when it was granted. Latching before the
+          // wait (where this used to be) made the binding off by one — the worker read the pads,
+          // THEN parked, so anything the page wrote while it was parked landed a frame late.
+          // Deterministic, so it was harmless for a single player, but a netplay peer must be
+          // able to say "frame N runs with THESE bytes" and have it be true. It is also after
+          // stateServiceCmd because a restore overwrites linear memory, which is where
+          // __recomp_inject_* lives — latching first would hand the guest bytes a restore then
+          // discards.
+          applyPads();
           return 0;
         }
         // NOT a silent 0 any more — see the census block above. The return value is unchanged
@@ -1160,7 +1308,8 @@ async function boot(msg) {
   new Uint8Array(Module.wasmMemory.buffer).set(fst, 0x81C00000);
   d.setUint32(0x80000038, 0x81C00000, true);
   d.setUint32(0x8000003C, fst.length, true);
-  log('module up (' + hostNames.length + ' host stubs, ' + parts.length + ' disc parts); running main()');
+  log('module up (' + hostNames.length + ' host stubs, ' + parts.length + ' disc parts, ' +
+      discBytes + 'B image); running main()');
   // Boot census: every unmodelled import is 'never called' at this point, so this line is the
   // full inventory of what has no body. The later censuses are the interesting ones — they say
   // which of these the guest actually reaches.
