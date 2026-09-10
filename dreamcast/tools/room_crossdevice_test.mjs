@@ -1910,6 +1910,22 @@ async function runArm(armName) {
         for (let i = 0; i < a.length; i++) if (Math.abs(a[i] - b[i]) > 12) d++;
         return (d / a.length) * 100;
       };
+      // ⚠ WHOLE-FRAME CHANGE DOES NOT SAY *WHO* JOINED. Gauntlet lays the four
+      // players out as vertical panels across the screen, so a join lights the
+      // panel belonging to THAT player. Comparing the frame as one blob cannot
+      // tell "player 2 appeared" from "the menu advanced", and those are exactly
+      // the two readings that have to be separated to answer why player 2 never
+      // showed up as player 2. Per-quarter, at 160x120: column q spans
+      // x = q*40 .. q*40+39.
+      const quarters = (a, b) => {
+        const out = [0, 0, 0, 0], tot = [0, 0, 0, 0];
+        for (let y = 0; y < 120; y++) for (let x = 0; x < 160; x++) {
+          const q = Math.min(3, (x / 40) | 0), i = y * 160 + x;
+          tot[q]++;
+          if (Math.abs(a[i] - b[i]) > 12) out[q]++;
+        }
+        return out.map((n, q) => +((n / tot[q]) * 100).toFixed(2));
+      };
       // ⚠ THE CONTROL IS A QUIET WINDOW, NOT THE OTHER PLAYER.
       // Pressing on the host first and the joiner second confounded the two:
       // host Start read 0.00% and joiner Start read 99.12%, which is equally
@@ -1924,6 +1940,38 @@ async function runArm(armName) {
       const quietPct = (qb4 && qaf) ? changed(qb4, qaf) : -1;
       say(`  ....  BASELINE: ${(QUIET_MS / 1000).toFixed(1)}s with nobody pressing — ${quietPct.toFixed(2)}% changed`);
 
+      // ⚠ AND ON WHICH PORT. A frame that changed proves SOMETHING happened; it
+      // does not prove PLAYER 2 happened. The joiner's Start arriving on port 0
+      // would advance the menu as player 1 and look identical from the pixels —
+      // and would be an exact explanation of "why didn't player 2 show up as
+      // player 2". So read the maple pad image while the key is held and say
+      // which ports carry it.
+      const padDuring = async (pg) => {
+        await pg.evaluate(() => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' })));
+        await sleep(700);
+        const img = await pad(pg);
+        await pg.evaluate(() => window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter' })));
+        await sleep(400);
+        if (!img) return null;
+        const on = [];
+        for (let p = 0; p < 4; p++) if (img.slice(p * 64, p * 64 + 12).some((b) => b !== 0)) on.push(p);
+        return on;
+      };
+      const startPorts = await padDuring(pages[1]);
+      say(`  ....  joiner held Start — maple ports carrying it: ${J(startPorts)}`);
+      D.startPorts = startPorts;
+      const jSeat = D.cardSeats && D.cardSeats.join != null ? D.cardSeats.join : 1;
+      if (!startPorts) {
+        voidc('PLAYER-2s-START-ARRIVES-AS-PLAYER-2', 'the pad image could not be read — no verdict');
+      } else {
+        cell(startPorts.length === 1 && startPorts[0] === jSeat,
+          'PLAYER-2s-START-ARRIVES-AS-PLAYER-2',
+          `Start held on the joiner appears on maple port ${jSeat} and nowhere else`,
+          `Start held on the joiner appears on port(s) ${J(startPorts)}, and player 2 holds port ${jSeat}. ` +
+          'If it lands on port 0 the second player is pressing PLAYER ONE\'s button, which advances the menu ' +
+          'while player 2 never appears — exactly what "player 2 did not show up as player 2" looks like.');
+      }
+
       const b4 = await shotOf(pages[1]);
       // Enter is Start (dreamcast.html:5500 "Enter = Start"). Hold it like a
       // person would, not a single synthetic edge.
@@ -1934,6 +1982,45 @@ async function runArm(armName) {
               'the canvas could not be sampled on the joiner — no verdict');
       } else {
         const pct = changed(b4, af);
+        const perQ = quarters(b4, af);
+        const quietQ = (qb4 && qaf) ? quarters(qb4, qaf) : [0, 0, 0, 0];
+        say(`  ....  per-panel change: ${J(perQ)}%  (quiet baseline ${J(quietQ)}%)`);
+        D.p2Panel = { perQuarter: perQ, quietPerQuarter: quietQ };
+        // Player 2's panel is the SECOND column. A join must move it well past
+        // the quiet baseline for that same column.
+        const jq = 1;
+        // ⚠ A WHOLE-SCREEN TRANSITION MAKES THIS CELL MEANINGLESS, and it PASSED
+        // that way first: all four panels read [100, 99.48, 98.29, 98.71] and the
+        // cell reported "player 2's panel lit up" on the strength of the second
+        // number. When every quarter moves, panel 2 moving says nothing about
+        // player 2 — it says the menu advanced, which ANY controller's Start
+        // does. Refusing to answer is the only honest reading here.
+        const others = [0, 2, 3].map((q) => perQ[q]);
+        // ⚠ AND PLAYER 3'S PANEL IS THE CONTROL. Nobody is sitting in seat 3, so
+        // it must stay put while seat 2 lights. A second reading passed this cell
+        // with [3.56, 29.06, 28.08, 3.42] — seats 2 AND 3 moving together, which
+        // is a CENTRED effect straddling the middle of the screen, not a join.
+        // Two ways to pass wrongly, both seen, both now refused.
+        const centred = perQ[2] > 0 && Math.abs(perQ[jq] - perQ[2]) < Math.max(5, perQ[jq] * 0.35);
+        if (others.every((v) => v >= 50)) {
+          voidc('PLAYER-2s-OWN-PANEL-IS-WHAT-LIGHTS-UP',
+                `not measurable here: the WHOLE screen changed (${J(perQ)}%), which is a menu advancing rather ` +
+                'than a player joining. Any controller\'s Start does that, so this cannot separate "player 2 ' +
+                'joined" from "the menu moved". Answering it needs the run driven to the character-select ' +
+                'screen first, which this arm does not do.');
+        } else if (centred) {
+          voidc('PLAYER-2s-OWN-PANEL-IS-WHAT-LIGHTS-UP',
+                `not measurable here: seat 2 changed ${perQ[jq]}% and seat 3 changed ${perQ[2]}% — nobody is ` +
+                'sitting in seat 3, so a change that straddles both is something centred on the screen, not ' +
+                'player 2 appearing in their own panel.');
+        } else
+        cell(perQ[jq] >= quietQ[jq] + 5.0,
+          'PLAYER-2s-OWN-PANEL-IS-WHAT-LIGHTS-UP',
+          `player 2's panel changed ${perQ[jq]}% against a quiet baseline of ${quietQ[jq]}% ` +
+          `(all four panels: ${J(perQ)})`,
+          `player 2's panel changed ${perQ[jq]}% against a quiet baseline of ${quietQ[jq]}% — the picture ` +
+          `moved (${J(perQ)}) but not in player 2's half of it, which is "the menu advanced", not "player 2 ` +
+          'joined". This is the reading behind "why did player 2 not show up as player 2".');
         D.p2Join = { changedPct: +pct.toFixed(2), quietBaselinePct: +quietPct.toFixed(2) };
         say(`  ....  joiner pressed Start 3x — ${pct.toFixed(2)}% of the frame changed`);
         if (quietPct >= 5.0) {
