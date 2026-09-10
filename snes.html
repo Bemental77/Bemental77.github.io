@@ -865,7 +865,18 @@
       if (!runFrame()) { stalled = true; break; }
       accum -= FRAME_MS; ran++;
     }
-    if (stalled && accum > FRAME_MS) accum = FRAME_MS;
+    // ⚠ NOT ONLY WHEN STALLED — the same defect that shipped on Genesis. This
+    // clamp used to require `stalled`, so it covered a frame LOCKSTEP withheld
+    // and nothing else, while a tick that ran late for any OTHER reason (a cold
+    // profile still fetching, a GC pause, a contended box) banked its debt and
+    // then let the guest run up to MAX_CATCHUP_FRAMES per tick until it cleared.
+    // That is a fast-forward, and CLAUDE.md gate #9 forbids it whatever caused
+    // the debt: the guest may run SLOWER than hardware, never faster.
+    // On Genesis this measured 1.0210x and 1.0223x on a COLD profile against
+    // 1.0025x warm, and the clamp took it to 1.0028x. Dropping the debt means
+    // the console does not make up lost time, which is the correct trade: those
+    // wall-clock milliseconds did not happen for the guest.
+    if (accum > FRAME_MS) accum = FRAME_MS;
     if (NET.session) netHudTick(ts);
     if (ran) draw();
     if (!lastFpsAt) lastFpsAt = ts;
