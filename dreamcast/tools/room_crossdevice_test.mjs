@@ -1575,6 +1575,33 @@ async function runArm(armName) {
       // `pg.__mobile ? entry[1] : entry[0]`, which silently hands a MOBILE HOST
       // the joiner's control id — fine while only the joiner was ever a phone,
       // wrong the moment a host is one.
+      // ⚠ WHAT THE CORE HOLDS *BEFORE* A SINGLE FRAME RUNS.
+      // The cards are read further down, but that read happens after the
+      // barrier releases and the guest has been running for seconds — so
+      // "installed" and "still installed" were the same measurement, and could
+      // not tell an exchange that never landed from one the guest overwrote.
+      // On pso2 the page's own bookkeeping said port 1 held b19a59c5 while the
+      // core held bb3f15b2 with a zeroed head, and nothing here could say which
+      // side of frame 0 it was lost on.
+      if (!D.cardsPreBarrier) D.cardsPreBarrier = {};
+      try {
+        D.cardsPreBarrier[pg.__role] = await pg.evaluate(async () => {
+          const v = (typeof window.__dcVmu === 'function') ? window.__dcVmu() : null;
+          const out = {};
+          for (const s2 of ((v && v.slots) || [])) {
+            if (!s2.present) continue;
+            const d = await window.__dcVmuLive(s2.port);
+            if (!d || !d.data) { out[s2.port] = null; continue; }
+            const u = new Uint8Array(d.data);
+            let h = 0x811c9dc5;
+            for (let i = 0; i < u.length; i++) h = Math.imul((h ^ u[i]) >>> 0, 0x01000193) >>> 0;
+            out[s2.port] = { ptr: d.ptr, head: Array.from(u.slice(0, 4)), sum: ('0000000' + (h >>> 0).toString(16)).slice(-8) };
+          }
+          return out;
+        });
+        say(`  ....  ${pg.__role} cards BEFORE frame 0: ${J(D.cardsPreBarrier[pg.__role])}`);
+      } catch (e) { D.cardsPreBarrier[pg.__role] = { error: String((e && e.message) || e) }; }
+
       const eIdx = pages.indexOf(pg);
       if (!r.overlayOpen) await openLobbyNow(pg, entry[eIdx] && entry[eIdx].found[0]);
       await sleep(500);
@@ -1639,6 +1666,25 @@ async function runArm(armName) {
         }
         return out;
       });
+      // ⚠ ON A SEEDED DISC THE CARDS ARE NOT SETTLED AT FRAME 0.
+      // The boot state replaces the card in any port it was not captured with,
+      // so the room writes the agreed set AGAIN at a fixed frame (240) on every
+      // console. Reading before that frame measures the guest's replacement and
+      // reports a fixed bug as broken — which is exactly what happened: the
+      // cells ran at 20.8 s and the re-install landed at 24.3 s.
+      if (seedDisc()) {
+        const WANT = 300;   // comfortably past the page's VMU_REINSTALL_FRAME
+        const tW = Date.now();
+        let ran = [null, null];
+        while (Date.now() - tW < 60000) {
+          const rr = await Promise.all(pages.map(readRoster));
+          ran = rr.map(hudCoreRan);
+          if (ran.every((n) => (n || 0) >= WANT)) break;
+          await sleep(1500);
+        }
+        say(`  ....  seeded disc: waited for frame ${WANT} before reading cards — core ran ${J(ran)}`);
+        D.cardsWaitedForReinstall = { want: WANT, ran, ms: Date.now() - tW };
+      }
       const [hc, jc] = await Promise.all(pages.map(cardsOf));
       const [hl, jl] = await Promise.all(pages.map(liveCards));
       D.cards = { host: hc, join: jc, live: { host: hl, join: jl } };

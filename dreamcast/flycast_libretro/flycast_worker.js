@@ -415,6 +415,23 @@
   let discLoadedOnce = false;   // so a late 'players' is REPORTED, not ignored
   let lockstep = false;
   let lsFrame = 0;                  // next emulated frame to run
+  // CARDS THAT MUST BE (RE)INSTALLED AT AN EXACT FRAME, NOT "SOON".
+  //
+  // On a seeded disc the boot savestate was captured when this console had ONE
+  // memory card. A room attaches one per player, so the port that was not in
+  // the state gets re-initialised by the guest during its first frames and
+  // player 2's card is replaced by a blank one. Measured: port 1 reads the
+  // right card (b19a59c5) BEFORE frame 0 on both machines and reads zeros
+  // afterwards, at the SAME pointer — an in-place overwrite by the guest, not a
+  // reallocation. On the unseeded disc the identical exchange survives, which
+  // is what identifies the savestate as the cause.
+  //
+  // Re-installing "once things settle" would be a fork: two consoles writing
+  // guest-visible memory at two different frames is exactly the divergence
+  // lockstep exists to prevent. So the write is scheduled at a FRAME NUMBER and
+  // performed by the frame loop below, which makes it identical on every
+  // console by construction.
+  const vmuAtFrame = [];            // { port, data, atFrame }
   let lsQueue = new Map();          // frame -> Uint8Array(256) maple image
   let lsHashEvery = 60;
   let lsPendingHash = -1;           // frame whose fingerprint is owed, -1 = none
@@ -666,6 +683,34 @@
       }
       lsQueue.delete(lsFrame);
       lsWritePads(inp);
+    }
+    // Apply any card scheduled for THIS frame, before the frame runs. Every
+    // console reaches this frame with the same bytes, so the write is part of
+    // the deterministic timeline rather than a race against it.
+    if (vmuAtFrame.length && lockstep) {
+      for (let i = vmuAtFrame.length - 1; i >= 0; i--) {
+        if (vmuAtFrame[i].atFrame !== lsFrame) continue;
+        const job = vmuAtFrame.splice(i, 1)[0];
+        try {
+          const M = self.Module;
+          const ptr = M._flycast_vmu_ptr(job.port) >>> 0, size = M._flycast_vmu_size(job.port) >>> 0;
+          const src = new Uint8Array(job.data);
+          if (!ptr || !size || src.length !== size) {
+            postMessage({ cmd: 'print', txt: '[vmu] port ' + job.port + ': frame-' + job.atFrame +
+                          ' re-install skipped (ptr=' + ptr + ' size=' + size + ' src=' + src.length + ')' });
+            postMessage({ cmd: 'vmuSeeded', port: job.port, ok: false, why: 'no card or size mismatch at frame' });
+            continue;
+          }
+          M.HEAPU8.set(src, ptr);
+          vmuGenSeen[job.port] = M._flycast_vmu_gen(job.port) >>> 0;
+          postMessage({ cmd: 'print', txt: '[vmu] port ' + job.port + ': re-installed ' + size +
+                        ' B at frame ' + job.atFrame + ' — the boot state had replaced it' });
+          postMessage({ cmd: 'vmuSeeded', port: job.port, ok: true, atFrame: job.atFrame });
+        } catch (err) {
+          postMessage({ cmd: 'print', txt: '[vmu] port ' + job.port + ': frame re-install threw: ' +
+                        (err && err.message ? err.message : String(err)) });
+        }
+      }
     }
     const t0 = performance.now();
     try {
@@ -1609,6 +1654,15 @@
         // data.port selects the seat (0 == Player 1). An absent port means 0,
         // which is what the single-card contract used to mean.
         const port = (data.port | 0) >= 0 && (data.port | 0) < VMU_PORTS_MAX ? (data.port | 0) : 0;
+        // Deferred to an exact frame — see vmuAtFrame above. Anything already
+        // at or past that frame is applied immediately rather than dropped,
+        // because a card that silently never lands is the bug being fixed.
+        if (data.atFrame != null && (data.atFrame | 0) > lsFrame) {
+          vmuAtFrame.push({ port: port, data: data.data, atFrame: data.atFrame | 0 });
+          postMessage({ cmd: 'print', txt: '[vmu] port ' + port + ': queued for frame ' + (data.atFrame | 0) +
+                        ' (now at ' + lsFrame + ') — every console writes it on the same frame or the room forks' });
+          break;
+        }
         try {
           const M = self.Module;
           const ptr = M._flycast_vmu_ptr(port) >>> 0, size = M._flycast_vmu_size(port) >>> 0;

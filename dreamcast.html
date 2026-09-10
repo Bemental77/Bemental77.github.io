@@ -4345,6 +4345,33 @@
         if (!ok) { vmuRoomFail('the emulator refused the room\'s card for Player ' + (p + 1)); return; }
         vmuRoomInstalled[p] = got;
       }
+      // ⚠ ON A SEEDED DISC THE GUEST TAKES THE CARD BACK. Measured on pso2: port
+      // 1 reads the agreed card before frame 0 on BOTH machines and reads zeros
+      // once frames run, at the same pointer. The boot state was captured with
+      // one memory card, so the port added for player 2 is re-initialised by
+      // the guest and their save is gone. The identical exchange survives on an
+      // unseeded disc, which is what names the state as the cause.
+      //
+      // So write the set again at a fixed FRAME. Same bytes, same frame, every
+      // console — deterministic by construction, and a no-op where the guest
+      // never touched the card.
+      if (seedRoomState === 'ok') {
+        for (const p of setPorts) {
+          const e = set[p];
+          try {
+            const wire2 = e.bytes instanceof Uint8Array ? e.bytes : new Uint8Array(e.bytes || 0);
+            const raw2 = await vmuInflate(wire2, e.enc);
+            if (raw2 && raw2.byteLength === (e.size | 0)) {
+              vmuSeedPort(p, raw2, 8000, VMU_REINSTALL_FRAME);
+            }
+          } catch (x) {
+            pageLog('[vmu] could not schedule the frame-' + VMU_REINSTALL_FRAME + ' re-install for Player ' +
+                    (p + 1) + ': ' + ((x && x.message) || x));
+          }
+        }
+        pageLog('[vmu] seeded boot: the set will be written again at frame ' + VMU_REINSTALL_FRAME +
+                ' on every console, because the boot state replaces cards in ports it was not captured with');
+      }
       vmuRoomHash = hash; vmuRoomState = 'ok'; vmuRoomWhy = null;
       vmuRoomStopBeat();
       pageLog('[vmu] the room agreed a card set (' + hash + ') and this console has INSTALLED it: ' +
@@ -4439,14 +4466,28 @@
       worker.postMessage({ cmd: 'vmuInfo' });
     });
   }
-  function vmuSeedPort(port, bytes, ms = 8000) {
+  function vmuSeedPort(port, bytes, ms = 8000, atFrame = null) {
     return new Promise((resolve) => {
       const t = setTimeout(() => { pendingVmuSeed.delete(port); resolve(false); }, ms);
       pendingVmuSeed.set(port, (ok) => { clearTimeout(t); resolve(!!ok); });
       const copy = new Uint8Array(bytes);   // transferred; keep the caller's buffer intact
-      worker.postMessage({ cmd: 'vmuLoad', port: port, data: copy.buffer }, [copy.buffer]);
+      const msg = { cmd: 'vmuLoad', port: port, data: copy.buffer };
+      // atFrame defers the write to an EXACT emulated frame. See the worker's
+      // vmuAtFrame comment: on a seeded disc the boot state replaces the card
+      // in a port it was not captured with, so the set has to be written again
+      // once the guest has settled — and "once it has settled" must mean the
+      // same frame on every console or the room forks.
+      if (atFrame != null) msg.atFrame = atFrame | 0;
+      worker.postMessage(msg, [copy.buffer]);
     });
   }
+
+  // HOW LONG THE BOOT STATE NEEDS BEFORE THE CARDS STAY PUT. Frames, not
+  // milliseconds: a frame number is the same on a phone and a desktop, a
+  // millisecond is not. 240 = 4 s of emulated time at 60 Hz, comfortably past
+  // the guest's maple re-initialisation, and every console applies it on that
+  // frame whenever it happens to get there.
+  const VMU_REINSTALL_FRAME = 240;
 
   // Called once, AFTER the disc has loaded (the cards are created inside
   // retro_load_game) and BEFORE the pump is switched on, so nothing the guest
