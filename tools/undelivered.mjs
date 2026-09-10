@@ -51,9 +51,17 @@ const OPEN = [
     verify: () => /no working TURN relay|701\/400/.test(read('tools/audit_all.mjs')),
   },
   {
+    id: 'relay-play-stalls-under-jitter',
+    what: 'Two peers with NO direct path pair, seat, gate and compare fingerprints correctly — and then cannot PLAY. The cores advance a few frames and stop.',
+    why: 'Delay-based lockstep picks its input delay ONCE, at Ready, from a single RTT measurement (dreamcast.html lsChooseDelay -> Lockstep.recommendDelay). The signalling relay is not stable enough for that: one run measured 101ms, 195ms, 200ms and 259ms ONE WAY on the same link. A delay that covers the fast sample starves on the slow one, and a core waiting on input still in flight never advances. Covering the worst case needs an ADAPTIVE delay that rises when the queue starves — a real protocol change, not a constant.',
+    evidence: 'room_crossdevice_test --arms no-direct-path --play: PAIRING is green (21 pass / 0 FAIL, with the arm-difference proof that relay-only ICE with no relay was in force and 7 RTCPeerConnections per side could form no candidate pair). PLAY is not: core ran [34,35] -> [34,35] and [31,36] -> [31,36] over ~6 s, join port1=false, 41 pass / 3 FAIL.',
+    // Open until the delay adapts. A single fixed choice cannot cover 101-259ms of jitter.
+    verify: () => /lsChooseDelay/.test(read('dreamcast.html')) && !/adaptiveDelay|delayAdapt/.test(read('lib/netplay.js')),
+  },
+  {
     id: 'never-tested-across-two-networks',
     what: 'Every netplay result in this repo comes from ONE box behind ONE NAT. The two-networks case is unestablished.',
-    why: 'Both browsers run on the same machine, so a green run closes the real-UI gap and NOT the network gap. Marking those rigs ci:true would put a green tick under a claim no rig here can make.',
+    why: 'Both browsers run on the same machine, so a green run closes the real-UI gap and NOT the network gap. The no-direct-path arm narrows it — it proves a room forms with no direct WebRTC path available — but it does not prove two genuinely separate networks, different ISPs, or a symmetric NAT on both ends.',
     evidence: 'tools/audit_all.mjs: "both browsers sit on ONE box behind ONE NAT".',
     verify: () => /ONE box behind ONE NAT/.test(read('tools/audit_all.mjs')),
   },

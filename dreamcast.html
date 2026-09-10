@@ -5756,7 +5756,30 @@
       // allowed to hold up the barrier, and its absence simply leaves the
       // default in force.
       const r = await sess.rttReport(600);
-      const want = r && r.recommendedDelay != null ? Math.max(1, Math.min(10, r.recommendedDelay | 0)) : null;
+      // ⚠ 30, NOT 10 — THE ENGINE'S CEILING, BECAUSE A RELAY ROOM NEEDS IT.
+      // This clamped the measured recommendation to 10 frames (167 ms at 60 Hz)
+      // while lib/netplay.js:1252 accepts up to 30 (500 ms). On a DIRECT link
+      // that is invisible: the worst RTT there measured 2 ms and the chooser
+      // picks 2 frames. On the RELAY it is fatal. Measured against production
+      // with a direct path made impossible (relay-only ICE, no relay
+      // configured, 7 RTCPeerConnections per side and no candidate pair
+      // possible):
+      //     [host] relay mode engaged (195ms one way)
+      //     [join] relay mode engaged (200ms one way)
+      //     core ran [34,35] -> [34,35] over ~6 s        <- stopped
+      //     each-sides-own-pad-reaches-its-OWN-core: join port1=false
+      // ~400 ms round trip cannot be covered by 167 ms of delay, so the queue
+      // starves and every core parks waiting for input that is still in flight.
+      // The room formed, gated and compared fingerprints correctly — it simply
+      // could not be played.
+      //
+      // Capping BELOW what the engine supports also silently discarded the
+      // engine's own answer: recommendDelay() had already computed the right
+      // figure from the measured RTT and this line threw it away. The clamp
+      // now matches the engine, so a relay room can choose a delay that covers
+      // the path it actually has. A direct room is unaffected — nothing here
+      // raises a delay that the measurement does not ask for.
+      const want = r && r.recommendedDelay != null ? Math.max(1, Math.min(30, r.recommendedDelay | 0)) : null;
       if (want == null || want === ls.delay) return ls.delay;
       const was = ls.delay;
       ls.delay = want;
