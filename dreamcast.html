@@ -2880,6 +2880,17 @@
                 (d.late ? ' ⚠ TOO LATE — the disc was already loaded' : '') +
                 (d.error ? ' — ' + d.error : ''));
         break;
+      // THE DIFFERENCE BETWEEN "DELIVERED" AND "READ". flycast_worker.js has had
+      // _emscripten_get_port_polls() the whole time and NOTHING asked it — not
+      // this page, not the rig. So "2 controllers plugged in" on the overlay was
+      // our own playersAck (what we TOLD the core to create), and a port the
+      // game never polls looks exactly the same from here as one it does.
+      // That is the gap behind "why is player 2 not showing as connected": the
+      // room can be perfectly seated while the GUEST has no second player.
+      case 'portPolls':
+        LS.portPolls = { ok: !!d.ok, polls: (d.polls || []).slice(), players: d.players,
+                         error: d.error || null, at: Date.now() };
+        break;
       case 'lsStats':
         LS.workerStats = d;
         break;
@@ -5656,6 +5667,7 @@
     hashSink: null,      // null = untested, true = submitHash exists, false = NOT COMPARING
     bootPlayers: 0,      // controllers this machine created inside retro_load_game
     playersAck: null,    // the worker's answer to {cmd:'players'}
+    portPolls: null,     // the worker's answer to {cmd:'portPolls'} — per-port POLL counts
     normalizeAck: null,  // the determinism handshake's answer
     stalling: false, waitingOn: [], stallReason: null,
     workerStall: false,  // the CORE's own gate says it has no input for its frame
@@ -8044,6 +8056,24 @@
   // page's own vmuRoom* state instead would test nothing, because the terminal
   // state that reached the user was set by the HANDLER for that engine message.
   window.__dcLsEngine = () => (NET.session && NET.session.ls) || null;
+
+  // ASK THE CORE WHETHER IT HAS ACTUALLY READ EACH PORT, and wait for the answer.
+  // A port with zero polls is a controller the GAME does not know about, however
+  // correct the room's seating is.
+  window.__dcPortPolls = function (ms) {
+    return new Promise((resolve) => {
+      if (!worker) { resolve(null); return; }
+      const before = LS.portPolls ? LS.portPolls.at : 0;
+      const t0 = Date.now(), lim = ms || 4000;
+      const tick = () => {
+        if (LS.portPolls && LS.portPolls.at !== before) { resolve(LS.portPolls); return; }
+        if (Date.now() - t0 > lim) { resolve(LS.portPolls || null); return; }
+        setTimeout(tick, 100);
+      };
+      try { worker.postMessage({ cmd: 'portPolls' }); } catch (e) { resolve(null); return; }
+      tick();
+    });
+  };
 
   window.__dcNetRoom = () => {
     const ul = $('netRoster');

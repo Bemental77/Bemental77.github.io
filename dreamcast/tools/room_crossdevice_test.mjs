@@ -1826,6 +1826,131 @@ async function runArm(armName) {
       }
     }
 
+    // -- 5b-ii. DOES THE GAME ACTUALLY READ PORT 1? -----------------------
+    //
+    // Reported by the user against a room that was, by every measure this rig
+    // had, perfect: two consoles seated, "you are Player 1 (maple port 0)" on
+    // one and "you are Player 2 (maple port 1)" on the other, each listing the
+    // other's peer id, frame-gated YES, desync check on. And Gauntlet Legends
+    // showed PLAYER 2 as an empty panel.
+    //
+    // ⚠ EVERY CELL ABOVE MEASURES DELIVERY, NOT READING. The pads reach the
+    // core; nothing asked whether the GUEST ever polls the port they arrive on.
+    // flycast_worker.js has exposed _emscripten_get_port_polls() the whole time
+    // (its own comment calls it "the difference between delivered and read") and
+    // no page and no rig had ever called it. The overlay's "2 controllers
+    // plugged in" is playersAck — what we TOLD the core to create — so a port
+    // the game never polls looked identical from outside to one it does.
+    {
+      const pp = await Promise.all(pages.map((pg) =>
+        pg.evaluate(() => (typeof window.__dcPortPolls === 'function') ? window.__dcPortPolls(6000) : null)));
+      D.portPolls = { host: pp[0], join: pp[1] };
+      say(`  ....  port polls host ${J(pp[0])}`);
+      say(`  ....  port polls join ${J(pp[1])}`);
+      const seats = [D.cardSeats && D.cardSeats.host != null ? D.cardSeats.host : 0,
+                     D.cardSeats && D.cardSeats.join != null ? D.cardSeats.join : 1];
+      const wanted = Array.from(new Set(seats)).sort();
+      const polledOn = (rep) => (rep && rep.ok && rep.polls) ? wanted.filter((p) => (rep.polls[p] | 0) > 0) : [];
+      const hOK = polledOn(pp[0]), jOK = polledOn(pp[1]);
+      if (!pp[0] || !pp[0].ok || !pp[1] || !pp[1].ok) {
+        voidc('THE-GAME-POLLS-EVERY-SEATED-PORT',
+          `the core did not answer the poll census (host ${J(pp[0])} join ${J(pp[1])}) — no verdict`);
+      } else {
+        cell(hOK.length === wanted.length && jOK.length === wanted.length,
+          'THE-GAME-POLLS-EVERY-SEATED-PORT',
+          `both cores READ every seated port ${J(wanted)}: host polls ${J(pp[0].polls)} join polls ${J(pp[1].polls)}`,
+          `a seated port is never polled by the guest: seats ${J(wanted)}, host polls ${J(pp[0].polls)} ` +
+          `(read ${J(hOK)}), join polls ${J(pp[1].polls)} (read ${J(jOK)}). The room is correctly seated and ` +
+          'the GAME has no such player — reported as "player 2 is not showing as connected" on a room whose ' +
+          'own overlay said 2 controllers plugged in.');
+      }
+    }
+
+    // -- 5b-iii. CAN PLAYER 2 ACTUALLY JOIN THE GAME? ---------------------
+    //
+    // The cell above proves the GUEST reads port 1. It does not prove a person
+    // sitting at the second machine can get into the game, and that is what was
+    // actually reported: a correctly-seated room where Gauntlet Legends showed
+    // PLAYER 2 as an empty panel.
+    //
+    // Gauntlet joins a player when they press START on their own controller, so
+    // press it on the JOINER and look at the screen. Pixels, not counters — the
+    // whole point is that every counter already read healthy. The frame is
+    // compared before and after over the WHOLE canvas; a join lights a panel
+    // that was dark, which is a large change, while a static menu is not.
+    {
+      const shotOf = (pg) => pg.evaluate(() => {
+        const c = document.querySelector('canvas');
+        if (!c || !c.width) return null;
+        const t = document.createElement('canvas');
+        t.width = 160; t.height = 120;
+        const x = t.getContext('2d');
+        try { x.drawImage(c, 0, 0, 160, 120); } catch (e) { return null; }
+        const d = x.getImageData(0, 0, 160, 120).data;
+        const out = [];
+        for (let i = 0; i < d.length; i += 4) out.push((d[i] + d[i + 1] + d[i + 2]) / 3 | 0);
+        return out;
+      });
+      // ⚠ WITH A CONTROL, because "nothing changed" is exactly what a STATIC
+      // SCREEN also reports. Pressing Start on the HOST is the same stimulus on
+      // a port everyone agrees works; if that moves nothing either, this moment
+      // in the boot cannot answer the question and the cell must go VOID rather
+      // than blame player 2.
+      const pressStart = async (pg) => {
+        for (let i = 0; i < 3; i++) {
+          await pg.evaluate(() => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' })));
+          await sleep(220);
+          await pg.evaluate(() => window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter' })));
+          await sleep(600);
+        }
+        await sleep(2500);
+      };
+      const changed = (a, b) => {
+        let d = 0;
+        for (let i = 0; i < a.length; i++) if (Math.abs(a[i] - b[i]) > 12) d++;
+        return (d / a.length) * 100;
+      };
+      // ⚠ THE CONTROL IS A QUIET WINDOW, NOT THE OTHER PLAYER.
+      // Pressing on the host first and the joiner second confounded the two:
+      // host Start read 0.00% and joiner Start read 99.12%, which is equally
+      // consistent with the HOST's press landing late inside the joiner's
+      // window. One actor per run, and the baseline is the same length of time
+      // with NOBODY pressing anything — that is what separates "player 2's
+      // button did this" from "the game moved on by itself".
+      const QUIET_MS = 4460;   // the same span pressStart() occupies
+      const qb4 = await shotOf(pages[1]);
+      await sleep(QUIET_MS);
+      const qaf = await shotOf(pages[1]);
+      const quietPct = (qb4 && qaf) ? changed(qb4, qaf) : -1;
+      say(`  ....  BASELINE: ${(QUIET_MS / 1000).toFixed(1)}s with nobody pressing — ${quietPct.toFixed(2)}% changed`);
+
+      const b4 = await shotOf(pages[1]);
+      // Enter is Start (dreamcast.html:5500 "Enter = Start"). Hold it like a
+      // person would, not a single synthetic edge.
+      await pressStart(pages[1]);
+      const af = await shotOf(pages[1]);
+      if (!b4 || !af) {
+        voidc('PLAYER-2-CAN-JOIN-THE-GAME-BY-PRESSING-START',
+              'the canvas could not be sampled on the joiner — no verdict');
+      } else {
+        const pct = changed(b4, af);
+        D.p2Join = { changedPct: +pct.toFixed(2), quietBaselinePct: +quietPct.toFixed(2) };
+        say(`  ....  joiner pressed Start 3x — ${pct.toFixed(2)}% of the frame changed`);
+        if (quietPct >= 5.0) {
+          voidc('PLAYER-2-CAN-JOIN-THE-GAME-BY-PRESSING-START',
+                `not measurable here: the picture changed ${quietPct.toFixed(2)}% with NOBODY pressing anything, ` +
+                'so a change after a press proves nothing about the press');
+        } else
+        cell(pct >= quietPct + 5.0,
+          'PLAYER-2-CAN-JOIN-THE-GAME-BY-PRESSING-START',
+          `Start on the joiner moved ${pct.toFixed(2)}% of the picture — the game responded to player 2`,
+          `Start on the joiner changed ${pct.toFixed(2)}% of the picture. The room is seated, the guest POLLS ` +
+          'port 1, and pressing the join button does nothing visible — which is what "player 2 is not showing ' +
+          'as connected" looks like from the inside. A quiet window of the same length changed ' +
+          quietPct.toFixed(2) + '%.');
+      }
+    }
+
     // -- 5c. core ran advances, sampled twice ------------------------------
     for (const pg of pages) { const r = await readRoster(pg); if (r.overlayOpen) await human(pg, '#netClose', 'Close'); }
     await sleep(3000);
