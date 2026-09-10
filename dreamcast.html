@@ -5637,7 +5637,15 @@
     // port 0, because there it is not a guess — it is the only port.
     const inRoom = !!NET.session;
     const known = (ls && ls.localPorts && ls.localPorts.length) ? ls.localPorts : null;
-    if (!known && inRoom) {
+    // ⚠ ASYMMETRIC ON PURPOSE: a HOST with an unknown seat is not guessing, a
+    // GUEST is. Suppressing for both broke the host's own input on the other
+    // consoles — the auditor read `the-press-reaches-the-pressers-own-core —
+    // host core was handed 0x0 at its own port 0`. The host seats ITSELF first,
+    // lowest-free-first, so port 0 is its port by construction even before
+    // localPorts populates. A joiner has no such guarantee, and a joiner
+    // assuming port 0 is what made Player 2 take over Player 1's character.
+    const isHostSide = (NET.role === 'host');
+    if (!known && inRoom && !isHostSide) {
       if (!lsLocalPads._warned) {
         lsLocalPads._warned = true;
         pageLog('[lockstep] this console has no seat yet, so it is sending NO pad rather than driving ' +

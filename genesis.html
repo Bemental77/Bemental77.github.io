@@ -660,7 +660,18 @@
     // port 0, because there it is not a guess — it is the only port.
     var inRoom = !!(typeof NET !== 'undefined' && NET && NET.session);
     var known = (ls && ls.localPorts && ls.localPorts.length) ? ls.localPorts : null;
-    if (!known && inRoom) return {};
+    // ⚠ A HOST WITH AN UNKNOWN SEAT IS NOT GUESSING — a GUEST is.
+    // Suppressing the pad for BOTH broke the host's own input: the auditor
+    // caught `the-press-reaches-the-pressers-own-core — host core was handed
+    // 0x0 at its own port 0`. The host seats ITSELF first, lowest-free-first
+    // (lib/netplay.js _ensureLockstep -> seat), so its port is 0 by
+    // construction and port 0 is the right answer for it even in the window
+    // before localPorts has populated. A JOINER has no such guarantee, and a
+    // joiner assuming port 0 is exactly what made Player 2 take over Player 1's
+    // character. So the rule is asymmetric on purpose: no seat means no pad for
+    // a guest, and port 0 for a host.
+    var isHostSide = (typeof NET !== 'undefined' && NET && NET.role === 'host');
+    if (!known && inRoom && !isHostSide) return {};
     var ports = known || [0];
     var mask = padMask();
     var out = {};
