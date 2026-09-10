@@ -100,14 +100,16 @@ const OPEN = [
   // watched the wrong file. The two entries below are what is actually left,
   // and both test a live code shape in the file the gap is IN.
   {
-    id: 'gamecube-lockstep-is-not-fingerprinted',
-    what: 'GameCube rooms are frame-gated but NOTHING compares the two simulations.',
-    why: 'gamecube.html drives Lockstep.beginFrame()/endFrame() per guest frame and never calls submitHash(), because the recomp exposes no deterministic state hash — so lib/netplay.js has nothing to put in an lsh and a divergence would go undetected. Gated and silently diverging is worse than not gated, because it looks right. There is a known divergence SOURCE too: each machine adopts its own IndexedDB memory-card image before _main() (the recomp card shim), and nothing agrees a card set the way dreamcast.html does with ls.contributeCards().',
-    evidence: 'tools/no_streaming_test.mjs reports gamecube.html as "lockstep (beginFrame)" with no submitHash among its tokens, while dreamcast.html reports "(beginFrame, lsInput, lsNormalize, submitHash)". The page states the gap itself as a standing fault in window.__gcLockstep().fault.',
-    // LIVE CODE SHAPE, in the file the gap is in: the page never CALLS submitHash,
-    // and never contributes a card set. Wiring either makes this go stale.
-    verify: () => !/\.submitHash\s*\(/.test(read('gamecube.html'))
-                && !/contributeCards/.test(read('gamecube.html')),
+    id: 'gamecube-rooms-do-not-agree-a-memory-card-set',
+    what: 'Two GameCube consoles in one room start from DIFFERENT memory cards.',
+    why: 'Each machine adopts its own IndexedDB card image before _main() (the recomp card shim), and nothing agrees a set the way dreamcast.html does with ls.contributeCards(). That is a divergence SOURCE sitting inside a frame-gated room. As of 2026-09-10 it is at least DETECTED rather than silent — the card image is part of what the new state fingerprint hashes, so two consoles holding different cards now raise a desync naming the frame instead of quietly playing different games. Detected is not fixed: the room reports the fork and stops, where dreamcast.html trades the cards before frame 0 so there is no fork to report.',
+    evidence: 'gamecube.html has no contributeCards() call, while dreamcast.html builds a card set, verifies each contributor\'s fingerprint and installs it before the barrier. gamecube/tools/gc_room_test.mjs now proves the DETECTOR (a-REAL-divergence-is-detected-and-named) but nothing agrees a set.',
+    // ⚠ ANCHORED ON A CALL, NOT A MENTION. The bare word appears in this page's
+    // OWN COMMENT explaining that it does not do this — so a plain
+    // /contributeCards/ test matched the prose describing the gap and declared
+    // the gap closed. Fourth time a verify here has matched a comment rather
+    // than code. A call site has a receiver and a paren; a sentence does not.
+    verify: () => !/\.contributeCards\s*\(/.test(read('gamecube.html')),
   },
   {
     id: 'gamecube-lockstep-is-mario-party-4-only',

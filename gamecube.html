@@ -8,7 +8,7 @@
   <script src="/coi-serviceworker.js"></script>
   <!-- The game library's origin. ONE constant for the whole site, so the split
        is revertible by editing a single line — see lib/asset_base.js. -->
-  <script src="/lib/asset_base.js"></script>
+  <script src="/lib/asset_base.js?v=27d8c0a4"></script>
   <script src="/lib/wakelock.js"></script>
   <!-- Shared capability layer: publishes window.__cap in the same shape on all three
        emulator pages so one rig (tools/device_matrix.mjs) can ask each of them the same
@@ -16,7 +16,7 @@
        :1409 already learned that lesson for WebGPU; the module generalises it and adds
        the functional SAB/worker test. Does not replace __gcGpu, which stays the page's
        own render-path authority. -->
-  <script src="/lib/capability.js"></script>
+  <script src="/lib/capability.js?v=e25dca87"></script>
   <script src="/lib/xboxinput.js"></script>
   <!-- Online co-op. BOTH HALVES RUN THE GAME NOW. The old shape — "THE HOST HALF
        ONLY lives on this page: the guest runs on gamecube_multiplayer.html … a
@@ -24,7 +24,7 @@
        machine boots the disc and the room exchanges nothing but pad bytes
        (tools/no_streaming_test.mjs machine-checks that). netplay-ui.js is the
        shared lobby; it renders nothing at all when Netplay.supported() is false. -->
-  <script src="/lib/netplay.js"></script>
+  <script src="/lib/netplay.js?v=055f3e69"></script>
   <script src="/lib/netplay-ui.js"></script>
   <script>
     // NEVER PRESENT AN ENABLED START BEHIND A BROKEN PATH.
@@ -7886,9 +7886,10 @@ window.GcRate = (function () {
     else console.warn('[recomp-live] ignoring malformed ?fps=' + q.get('fps') + '; staying at ' + GUEST_HZ + '/s');
   }
   var BOOT_MS = parseInt(q.get('bootms') || '50000', 10);
-  // 576 bytes of this are load-bearing (recomp_worker.js PACE_I32_CELLS = 144): cells 0-15 are
+  // 588 bytes of this are load-bearing (recomp_worker.js PACE_I32_CELLS = 147): cells 0-15 are
   // credits + the legacy port-0 input cells + the savestate channel, 16-31 are the FOUR-PORT pad
-  // block, 36-79 the game's-own-pad-state witness, 80-143 the raw MEM1 peek windows. Rounded up
+  // block, 36-79 the game's-own-pad-state witness, 80-143 the raw MEM1 peek windows, and 144-146
+  // the lockstep state FINGERPRINT (seq, frame, hash). Rounded up
   // so adding a cell does not mean re-deriving a size in two files. It was 64 bytes for as long
   // as this engine had one controller.
   var pace = new SharedArrayBuffer(1024);
@@ -8571,6 +8572,10 @@ window.GcRate = (function () {
   // lib/netplay.js releases it, and every machine's first frame is the room's frame 0.
   // ═══════════════════════════════════════════════════════════════════════════════════════════
   var PAD_ACK = 33, LS_ARMED = 34;      // mirrors of recomp_worker.js's interlock cells
+  // The recomp's state fingerprint — see recomp_worker.js publishFingerprint().
+  // FP_SEQ is bumped LAST, so a reader that sees a new seq is reading a frame
+  // and hash that belong together.
+  var FP_SEQ = 200, FP_FRAME = 201, FP_HASH = 202, FP_DIAG = 203, FP_INJECT = 204;
   var LS_PAD_BYTES = 64;                // the engine's default; GC state fits in the first 6
   var GCLS = {
     armed: false,        // the credit gate is interlocked and the worker knows it
@@ -8688,16 +8693,23 @@ window.GcRate = (function () {
       GCLS.running = true;
       GCLS.fedTo = ls.frame;
       GCLS.ports = (ls.localPorts || []).slice();
-      // ⚠ SAY IT, DO NOT ASSUME IT AWAY. The engine HAS submitHash() and this page never calls
-      // it, because the recomp exposes no state fingerprint yet — so these cores are frame-gated
-      // with NOTHING comparing them. Gated and silently diverging is worse than not gated,
-      // because it looks right. This is a standing fault, not a conditional one, and it is
-      // recorded in tools/undelivered.mjs as `gamecube-lockstep-has-no-fingerprint`.
-      GCLS.hashSink = false;
-      GCLS.fault = 'frame-gated but NOT fingerprinted: the recomp publishes no deterministic state ' +
-                   'hash, so lib/netplay.js has nothing to compare and a divergence would go ' +
-                   'undetected. Two machines can also start from DIFFERENT memory cards, which is ' +
-                   'a divergence source this gate does not close.';
+      // THE FINGERPRINT. This page used to drive the frame gate with NOTHING comparing the two
+      // simulations, which is worse than not gating at all: it looks right while each player
+      // watches a different game. recomp_worker.js now publishes a strided FNV-1a over the guest
+      // window (MEM1 only — the recomp's own heap and fiber stacks hold host pointers that differ
+      // between two healthy browsers) every 30 guest frames, keyed on the frame it describes, and
+      // gcLsPumpHash() below hands it to lib/netplay.js.
+      //
+      // ⚠ WHAT IS STILL NOT CLOSED, stated rather than assumed away: the two machines can still
+      // START from different memory cards. Each adopts its own IndexedDB card image before
+      // _main(), and nothing agrees a card set the way dreamcast.html does with contributeCards().
+      // The fingerprint now REPORTS that divergence instead of hiding it, which is the difference
+      // between a known gap and a silent one.
+      GCLS.hashSink = true;
+      GCLS.hashSeq = -1; GCLS.hashesSent = 0; GCLS.lastHash = null; GCLS.lastHashFrame = -1;
+      GCLS.fault = 'frame-gated and fingerprinted, but the two consoles still adopt their OWN ' +
+                   'memory cards before _main() — a divergence source this gate does not close. ' +
+                   'It is now DETECTED rather than silent.';
       gcLsSay('⚠ ' + GCLS.fault);
       gcLsSay('FRAME GATE ENGAGED at frame ' + ls.frame + ' — this core advances only when every seated ' +
               'port has an input for the frame. delay=' + ls.delay + ' frames, ports=' +
@@ -8725,6 +8737,32 @@ window.GcRate = (function () {
     Atomics.add(paceI32, 0, 1); Atomics.notify(paceI32, 0);   // exactly one frame
     GCLS.fedTo = r.frame + 1; GCLS.framesFed++;
     ls.endFrame(null);
+    gcLsPumpHash(ls);
+  }
+
+  // Hand the recomp's newest fingerprint to the engine. Reads the publish
+  // barrier first: FP_SEQ is bumped AFTER the frame and hash are stored, so an
+  // unchanged seq means there is nothing new and a changed one means both cells
+  // belong to the same frame. Never invents a hash for a frame it did not see.
+  function gcLsPumpHash(ls) {
+    if (!GCLS.hashSink || !paceI32 || typeof ls.submitHash !== 'function') return;
+    var seq = Atomics.load(paceI32, FP_SEQ);
+    // ⚠ seq 0 MEANS THE WORKER HAS PUBLISHED NOTHING, and the cells below are
+    // still the SharedArrayBuffer's initial zeros. Submitting them anyway sent
+    // hash 00000000 for frame 0 from both machines, which the engine dutifully
+    // compared and found to AGREE — a green divergence detector that had never
+    // seen the guest. A fingerprint that reports health it did not measure is
+    // worse than none, so nothing is submitted until the barrier has moved.
+    if (seq === 0 || seq === GCLS.hashSeq) return;
+    GCLS.hashSeq = seq;
+    var f = Atomics.load(paceI32, FP_FRAME) | 0;
+    var h = Atomics.load(paceI32, FP_HASH) | 0;
+    if (f === GCLS.lastHashFrame) return;
+    GCLS.lastHashFrame = f;
+    GCLS.lastHash = ('0000000' + (h >>> 0).toString(16)).slice(-8);
+    GCLS.hashesSent++;
+    try { ls.submitHash(f, h >>> 0); }
+    catch (e) { gcLsSay('submitHash threw at frame ' + f + ': ' + ((e && e.message) || e)); }
   }
 
   // ARM BEFORE THE FIRST CREDIT — called from startRecomp() between the boot postMessage and
@@ -8766,6 +8804,15 @@ window.GcRate = (function () {
 
   // Test seam. tools/netplay_invariants.mjs and the two-page room test read this; it reports the
   // RECOMP engine's gate, which is the only GameCube path that has one.
+  // Test seam: perturb THIS console's fingerprint so the divergence detector has
+  // something to detect. Used by gamecube/tools/gc_room_test.mjs; harmless when
+  // never called, because the cell is zero and the hash is untouched.
+  window.__gcForceDesync = function (v) {
+    if (!paceI32) return false;
+    Atomics.store(paceI32, FP_INJECT, (v == null ? 0xBADF00D : v) | 0);
+    return true;
+  };
+
   window.__gcLockstep = function () {
     var ls = gcLsEngine();
     return {
@@ -8779,6 +8826,25 @@ window.GcRate = (function () {
       stalling: GCLS.stalling, waitingOn: GCLS.waitingOn.slice(), stallReason: GCLS.stallReason,
       earned: gcLsEarned, guestFrames: (paceI32 ? Atomics.load(paceI32, PAD_ACK) : 0),
       hashSink: GCLS.hashSink, fault: GCLS.fault,
+      // Raw cells, so a rig can tell "the worker never published" apart from
+      // "the page never forwarded" — different bugs with one symptom, and the
+      // pair that separated them when the first fingerprint silently published
+      // nothing for 300 frames while every page-side counter read healthy.
+      fpDiag: paceI32 ? Atomics.load(paceI32, FP_DIAG) : null,
+      fpSeqRaw: paceI32 ? Atomics.load(paceI32, FP_SEQ) : null,
+      fpFrameRaw: paceI32 ? Atomics.load(paceI32, FP_FRAME) : null,
+      fpHashRaw: paceI32 ? (Atomics.load(paceI32, FP_HASH) >>> 0).toString(16) : null,
+      // The divergence detector, reported so a rig can assert on it rather than
+      // trust that wiring it up was enough. hashesSent/lastHash come from this
+      // page; hashesCompared/diverged come from the ENGINE, which is what
+      // actually compares them against the peer's.
+      hashesSent: GCLS.hashesSent | 0, lastHash: GCLS.lastHash, lastHashFrame: GCLS.lastHashFrame,
+      hashesCompared: ls && ls.stats ? (ls.stats.hashesCompared | 0) : null,
+      lastAgreedFrame: ls ? (ls.lastAgreedFrame == null ? null : ls.lastAgreedFrame | 0) : null,
+      // `desync` is the engine's own diagnosis object — frame, both hashes, and
+      // the last frame every peer still agreed on. Null while healthy.
+      desync: ls && ls.desync ? { frame: ls.desync.frame, lastAgreedFrame: ls.desync.lastAgreedFrame,
+                                  mine: ls.desync.mine, differ: ls.desync.differ } : null,
     };
   };
 

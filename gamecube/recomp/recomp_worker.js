@@ -576,7 +576,36 @@ const WIT_BASE = 36, WIT_CELLS = 48;                            // ___recomp_pad
 const PEEK_BASE = WIT_BASE + WIT_CELLS;                         // = 80; first MEM1 window cell
 const PEEK_WINDOWS = 4;           // how many raw MEM1 windows are mirrored
 const PEEK_CELLS = 16;            // 64 bytes each
-const PACE_I32_CELLS = PEEK_BASE + PEEK_WINDOWS * PEEK_CELLS;   // = 144; page allocates ≥ this
+// FINGERPRINT CELLS. A room that is frame-gated with nothing comparing the two
+// simulations is worse than one that is not gated, because it looks right while
+// each player watches a different game. gamecube.html drives beginFrame() and
+// endFrame() per guest frame and has never called submitHash(), for the honest
+// reason that the recomp published no deterministic state hash. These three
+// cells are that hash.
+//
+// ⚠ WHAT IS HASHED AND WHY ONLY THAT. The GUEST WINDOW ONLY (MEM1 at
+// 0x80000000). This is a native port, not an emulator: the recomp's own
+// .data/.bss, C heap and fiber stacks sit in the same linear memory and hold
+// HOST pointers, allocation order and Asyncify bookkeeping that differ between
+// two browsers WITHOUT the simulation having diverged at all. Hashing those
+// would report a divergence on every healthy room, which is worse than no
+// fingerprint: an alarm that is always on gets switched off.
+// ⚠ PLACED AT 200, NOT DIRECTLY AFTER THE PEEK WINDOWS. Cells immediately past
+// the old end of the layout did not behave as private: values written there
+// came back as things this file never stored. Rather than litigate ownership of
+// a contested cell, the fingerprint sits well clear of it. The page allocates
+// 1024 B = 256 cells, so 200-202 are inside the buffer with room to spare.
+const FP_SEQ  = 200;              // bumped last (publish barrier)
+const FP_FRAME = 201;             // which guest frame the hash below describes
+const FP_HASH = 202;              // the hash itself
+const FP_DIAG = 203;              // stage / covered, for a rig to read
+// A TEST SEAM WITH A PURPOSE. A divergence detector that has never reported a
+// divergence is untested, and the only honest way to test one is to cause one.
+// Setting this cell on ONE console perturbs its hash, which must make both sides
+// report a desync. It proves the REPORTING path — compare, name the frame, raise
+// it — not the coverage; coverage is argued from what is hashed, above.
+const FP_INJECT = 204;
+const PACE_I32_CELLS = PEEK_BASE + PEEK_WINDOWS * PEEK_CELLS;   // = 144; unchanged
 
 // Deliver one frame of pad state to the guest, one call per port. Prefers the four-port export;
 // falls back to the legacy single-port setters when running against an older mp4_game.wasm, in
@@ -640,6 +669,97 @@ function publishPeek() {
   }
   Atomics.store(paceI32, PEEK_SEQ, (Atomics.load(paceI32, PEEK_SEQ) + 1) | 0);
 }
+
+// ---------------------------------------------------------------------------
+// THE STATE FINGERPRINT.
+//
+// Sampled, not exhaustive: MEM1 is 24 MiB and hashing all of it every frame
+// would cost more than the frame. A strided FNV-1a over one word in every 64
+// touches ~384 KiB per hash and still covers the whole window, so a divergence
+// anywhere in guest RAM is caught within a few hashes rather than never.
+//
+// ⚠ EVERY CONSOLE MUST HASH THE SAME FRAME. The frame number travels WITH the
+// hash and lib/netplay.js compares like for like; a hash without its frame is
+// two machines comparing different moments and calling it a fork.
+const FP_EVERY = 30;              // guest frames between fingerprints
+
+// ⚠ WHAT IS HASHED, AND WHY NOT "GUEST RAM".
+//
+// The first attempt hashed 24 MiB at linear offset 0x80000000, on the strength
+// of a comment in this file calling that "the guest MEM1 window". It published
+// NOTHING, every frame, silently: linear memory here is 300 MB, so that offset
+// is a gigabyte and a half past the end. The comment describes a configuration
+// this build is not in. Measured, not assumed — the module was asked:
+//
+//   ___recomp_pad_witness() = 19093136   ___recomp_card_base() = 16946112
+//   ___recomp_aram_base()   = 168880     wasmMemory            = 300 MB
+//
+// and both consoles returned IDENTICAL values, which is what makes hashing at
+// these addresses meaningful at all.
+//
+// So the fingerprint covers two things with known extent that are unambiguously
+// GUEST state, rather than a broad sweep of a native port's linear memory —
+// which holds host pointers, malloc order and Asyncify bookkeeping that differ
+// between two healthy browsers and would report a fork on every room:
+//
+//   1. THE GAME'S OWN LIVE STATE — the ___recomp_pad_witness() block: MP4's
+//      HuPadBtnDown/HuPadBtn/HuPadDStkRep/HuPadStkX/HuPadStkY/HuPadErr/winKey/
+//      GWPlayerCfg, read by C symbol. It changes every frame and is exactly
+//      what diverges first when two machines stop agreeing about the game.
+//   2. THE MEMORY CARD IMAGE — strided. Each console adopts its OWN card from
+//      IndexedDB before _main(), which is a known divergence SOURCE this gate
+//      does not close; including it here means that fork is REPORTED instead of
+//      silent.
+//
+// ⚠ THIS IS NOT A WHOLE-STATE HASH, and must not be described as one. It will
+// catch a divergence that reaches the game's own variables or the card, which
+// is the class that matters, and it can miss one confined to memory it does not
+// cover. That is a smaller claim than "fingerprinted" and it is the true one.
+const FP_CARD_STRIDE = 64;        // words: sample 1 in 64 of the card image
+
+function publishFingerprint(frame) {
+  if (!Module || !paceI32 || paceI32.length <= FP_DIAG) return;
+  if ((frame % FP_EVERY) !== 0) return;
+  let h = 0x811c9dc5;
+  let covered = 0;
+  try {
+    const buf = Module.wasmMemory.buffer;
+    if (Module.___recomp_pad_witness) {
+      const at = Module.___recomp_pad_witness() >>> 0;
+      if (at && at + WIT_CELLS * 4 <= buf.byteLength) {
+        const w = new Uint32Array(buf, at, WIT_CELLS);
+        for (let i = 0; i < w.length; i++) h = Math.imul((h ^ w[i]) >>> 0, 0x01000193) >>> 0;
+        covered++;
+      }
+    }
+    if (Module.___recomp_card_base && Module.___recomp_card_size) {
+      const cb = Module.___recomp_card_base() >>> 0, cs = Module.___recomp_card_size() >>> 0;
+      if (cb && cs >= 4 && cb + cs <= buf.byteLength) {
+        const c = new Uint32Array(buf, cb, cs >>> 2);
+        for (let i = 0; i < c.length; i += FP_CARD_STRIDE) h = Math.imul((h ^ c[i]) >>> 0, 0x01000193) >>> 0;
+        covered++;
+      }
+    }
+  } catch (e) { Atomics.store(paceI32, FP_DIAG, -1); return; }
+  Atomics.store(paceI32, FP_DIAG, covered);
+  // Nothing readable means nothing to say. Publishing a hash over zero bytes
+  // would make two consoles "agree" without either having looked at the guest —
+  // which is precisely the false green this replaced.
+  if (!covered) {
+    if (!publishFingerprint._said) {
+      publishFingerprint._said = 1;
+      postMessage({ cmd: 'print', txt: '[gc-lockstep] ⚠ NO STATE FINGERPRINT: neither the pad-witness ' +
+                    'block nor the card image is readable, so a divergence would go undetected' });
+    }
+    return;
+  }
+  const inject = Atomics.load(paceI32, FP_INJECT) | 0;
+  if (inject) h = Math.imul((h ^ inject) >>> 0, 0x01000193) >>> 0;
+  Atomics.store(paceI32, FP_FRAME, frame | 0);
+  Atomics.store(paceI32, FP_HASH, h | 0);
+  Atomics.store(paceI32, FP_SEQ, (Atomics.load(paceI32, FP_SEQ) + 1) | 0);
+}
+
 
 const ST_PAGE = 65536;            // wasm page granularity; memory size is always a multiple
 const ST_MAGIC = 'GCRECOMP';
@@ -1229,6 +1349,10 @@ async function boot(msg) {
           // and gamecube/recomp/recomp_probe.mjs keep working unchanged.
           publishPeek();
           viRetrace++;
+          // The fingerprint is keyed on the GUEST FRAME, and viRetrace IS that
+          // clock here (gamecube.html derives the guest rate from it). Published
+          // after the increment so the number names the frame just completed.
+          publishFingerprint(viRetrace);
           pumpAudio();
           cardPoll();
           // Periodic host-import census. main() never returns to the worker event loop (see the

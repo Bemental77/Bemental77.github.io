@@ -279,6 +279,42 @@ if (released) {
     ? ok('lockstep-never-speeds-the-guest-up', `host ${rateH.toFixed(3)}x, guest ${rateG.toFixed(3)}x of hardware`)
     : bad('lockstep-never-speeds-the-guest-up', `host ${rateH.toFixed(3)}x, guest ${rateG.toFixed(3)}x`);
 
+  // ---- 2b. THE DIVERGENCE DETECTOR ----------------------------------------------------------
+  // Until this existed, these two cores were frame-gated with NOTHING comparing
+  // them: gamecube.html drove beginFrame()/endFrame() per guest frame and never
+  // called submitHash(), because the recomp published no state hash. Gated and
+  // silently diverging is worse than not gated — it looks right while each
+  // player watches a different game.
+  //
+  // ⚠ THREE SEPARATE CLAIMS, because wiring a fingerprint up is not the same as
+  // it working. (a) each page PRODUCES hashes, (b) the engine COMPARED them
+  // against the peer's — a hash nobody compares is decoration, and this is the
+  // cell that catches a fingerprint that never reaches the wire — and (c) they
+  // AGREED, which is what says the two simulations are actually the same one.
+  console.log(`  ....  fp cells host seq=${h2.fpSeqRaw} f=${h2.fpFrameRaw} h=${h2.fpHashRaw} · ` +
+              `guest seq=${g2.fpSeqRaw} f=${g2.fpFrameRaw} h=${g2.fpHashRaw}`);
+  (h2.hashesSent > 0 && g2.hashesSent > 0)
+    ? ok('both-cores-PUBLISH-a-state-fingerprint',
+         `host ${h2.hashesSent} and guest ${g2.hashesSent} hashes, newest host ${h2.lastHash} @f${h2.lastHashFrame}`)
+    : bad('both-cores-PUBLISH-a-state-fingerprint',
+          `host sent ${h2.hashesSent} guest sent ${g2.hashesSent} — a frame-gated room with no fingerprint ` +
+          'cannot tell a shared simulation from two different ones');
+  (h2.hashesCompared > 0 && g2.hashesCompared > 0)
+    ? ok('the-fingerprints-are-actually-COMPARED-against-the-peer',
+         `host compared ${h2.hashesCompared}, guest compared ${g2.hashesCompared}`)
+    : bad('the-fingerprints-are-actually-COMPARED-against-the-peer',
+          `host compared ${h2.hashesCompared} guest compared ${g2.hashesCompared} — hashes are being produced ` +
+          'and never reaching the other machine, which detects nothing');
+  (!h2.desync && !g2.desync)
+    ? ok('the-two-simulations-AGREE',
+         `no divergence; last frame both sides agreed on: host f${h2.lastAgreedFrame} guest f${g2.lastAgreedFrame}`)
+    : bad('the-two-simulations-AGREE',
+          `DIVERGED host ${JSON.stringify(h2.desync)} guest ${JSON.stringify(g2.desync)} — the two machines ` +
+          'are running different games. Either the fingerprint covers memory that legitimately differs ' +
+          'between two browsers, or the room really is forking.');
+
+
+
   // ---- 3. per-port routing from the roster --------------------------------------------------
   const pH = (h2.ports || []).slice(), pG = (g2.ports || []).slice();
   (pH.length && pG.length && JSON.stringify(pH) !== JSON.stringify(pG))
@@ -324,6 +360,30 @@ if (released) {
             : bad('the-hosts-own-button-reaches-its-own-port',
                   `HuPadBtnDown[${hPort}] = ${hex(seen.btnDown[hPort])} — the host's own input was dropped`);
   }
+  // ⚠ LAST, DELIBERATELY. This poisons the room on purpose, and a desync HALTS
+  // the frame gate — running it before the gameplay cells made every one of them
+  // fail for a reason that had nothing to do with gameplay.
+  // (d) AND IT ACTUALLY FIRES. A divergence detector that has never reported a
+  // divergence is untested — three green cells above are equally consistent with
+  // a hash over constant bytes that can only ever agree. So cause one: perturb
+  // the GUEST's fingerprint and require BOTH sides to notice and name the frame.
+  // Then put it back and confirm the room is not permanently poisoned.
+  await guest.evaluate(() => window.__gcForceDesync(0x1234abcd));
+  let dH2 = null, dG2 = null;
+  for (let i = 0; i < 40; i++) {
+    await sleep(500);
+    [dH2, dG2] = await Promise.all([
+      host.evaluate(() => window.__gcLockstep()),
+      guest.evaluate(() => window.__gcLockstep()),
+    ]);
+    if (dH2.desync || dG2.desync) break;
+  }
+  (dH2 && dG2 && (dH2.desync || dG2.desync))
+    ? ok('a-REAL-divergence-is-detected-and-named',
+         `injected on the guest: host ${JSON.stringify(dH2.desync)} guest ${JSON.stringify(dG2.desync)}`)
+    : bad('a-REAL-divergence-is-detected-and-named',
+          'the guest\'s fingerprint was deliberately perturbed and NEITHER machine reported a desync — ' +
+          'the three cells above are green over a detector that cannot detect anything');
   console.log('  [host] fault: ' + (h2.fault || 'none'));
 }
 
