@@ -109,6 +109,13 @@ const HARNESSES = [
     fast: true, ci: true, server: false, requires: ['dreamcast.html', 'lib/netplay.js'], timeoutMs: 2 * MIN,
   },
   {
+    name: 'delay-stepdown',
+    file: 'tools/delay_stepdown_test.mjs',
+    cmd: ['node', 'tools/delay_stepdown_test.mjs'],
+    desc: 'the input delay can come back DOWN after a stall ratchet, at a frame that cannot fork the room',
+    fast: true, ci: true, server: false, requires: ['dreamcast.html', 'lib/netplay.js'], timeoutMs: 2 * MIN,
+  },
+  {
     name: 'undefined-calls',
     file: 'tools/undefined_call_scan.mjs',
     cmd: ['node', 'tools/undefined_call_scan.mjs'],
