@@ -138,6 +138,11 @@
 //                 fix that makes a room seed correctly is worthless if it stops
 //                 a lone player getting past PSO's Serial Number / Access Key
 //                 screen, and a room-only rig cannot see that.
+//   seat-change   the room forms, the card set is AGREED, and then the seating
+//                 changes — the ordinary thing that happens when somebody joins
+//                 or a backgrounded phone drops and rejoins. Asserts the set is
+//                 re-agreed rather than the room dying. Needs --play seat-change,
+//                 because the cards only exist in the play phase.
 //   rejoin        the joiner is left unadmitted, gives up, RELOADS THE PAGE and
 //                 tries the same code again. The host is then holding a stale
 //                 request from a peer that no longer exists while a second one
@@ -194,6 +199,7 @@ const has = (n) => argv.includes('--' + n);
 const ORIGIN   = arg('url', 'https://caseybement.com').replace(/\/$/, '');
 const GAME     = arg('game', 'gauntlet');
 const NAME     = arg('name', 'xdev');
+const SEATCHANGE_ARM = 'seat-change';
 const ARMS     = arg('arms', 'panel-open,panel-closed,host-busy,mobile-joiner').split(',').map((s) => s.trim()).filter(Boolean);
 const PLAYARG  = arg('play', 'panel-open');
 // The disc the JOINER starts on, which must NOT be the room's. Empty = pick
@@ -1684,6 +1690,72 @@ async function runArm(armName) {
         `both declare ${J(tagged[0])}`,
         `the declarations do not carry the card set: ${J(tagged)} — a peer with different cards would be ` +
         'admitted silently instead of refused');
+
+      // (6) A SEATING CHANGE AFTER THE SET IS AGREED MUST NOT END THE ROOM.
+      //
+      // This cell exists because the user photographed the failure on his own
+      // two devices and NOTHING here was capable of producing it. His phone,
+      // hosting, read "Cannot start — see below — a player took a seat — the
+      // card set has to be agreed again ... Leave the room to play on your own
+      // card", while his laptop sat at "You're ready" forever. A room that can
+      // never start, whose only advice is to leave.
+      //
+      // Every arm above forms a room ONCE and then leaves the seating alone, so
+      // the card set settles and is never disturbed again. lib/netplay.js calls
+      // _cardInvalidate() on any seat change — "a player took a seat", "a player
+      // left the room" — which happens when somebody joins, or when a peer drops
+      // and rejoins because a phone backgrounded its tab. The page routed that
+      // to a TERMINAL failure. The `rejoin` arm looks like it would catch this
+      // and does not: the joiner it reloads was never ADMITTED, so no set was
+      // ever agreed to invalidate.
+      //
+      // ⚠ WHAT THIS PROVES AND WHAT IT DOES NOT. It delivers the engine's REAL
+      // invalidation — same function, same reason string lib/netplay.js passes
+      // on a seat change — and asserts the page reaches an agreed set again
+      // instead of parking in 'failed'. That is the defect. It does NOT re-drive
+      // the seating plumbing that calls it; the arms above already do that. If
+      // this is ever weakened to poke vmuRoomState directly it stops testing
+      // anything, because the terminal state was set by the HANDLER.
+      if (armName === SEATCHANGE_ARM) {
+        say('\n-- the seating changes AFTER the set is agreed: does the room re-agree, or die?');
+        const before = hc.cards && hc.cards.hash;
+        const kick = (pg) => pg.evaluate(() => {
+          const ls = (typeof window.__dcLsEngine === 'function') ? window.__dcLsEngine() : null;
+          if (!ls) return { fired: false, why: 'no live lockstep engine on the page' };
+          if (typeof ls._cardInvalidate !== 'function') return { fired: false, why: '_cardInvalidate is not a function on the engine' };
+          ls._cardInvalidate('a player took a seat');
+          return { fired: true };
+        });
+        const fired = await kick(pages[0]);
+        say(`  ....  invalidation fired on the host: ${J(fired)}`);
+        if (!fired.fired) {
+          // A cell that cannot deliver its stimulus must not report a verdict.
+          say(`  VOID  a-seat-change-after-the-set-is-agreed-does-not-END-THE-ROOM — ${fired.why}`);
+          D.seatChange = { void: fired.why };
+        } else {
+          let after = null;
+          const tSC = Date.now();
+          while (Date.now() - tSC < 25000) {
+            await sleep(1000);
+            const [h2, j2] = await Promise.all(pages.map(cardsOf));
+            after = { host: h2.cards, join: j2.cards };
+            if (h2.cards && h2.cards.state === 'ok' && j2.cards && j2.cards.state === 'ok') break;
+            if (h2.cards && h2.cards.state === 'failed') break;
+          }
+          D.seatChange = { before, after, waitedMs: Date.now() - tSC };
+          say(`  ....  after the seat change ${J(after)}`);
+          cell(!!(after && after.host && after.join &&
+                  after.host.state === 'ok' && after.join.state === 'ok' &&
+                  after.host.hash && after.host.hash === after.join.hash),
+            'a-seat-change-after-the-set-is-agreed-does-not-END-THE-ROOM',
+            `the set was re-agreed in ${((Date.now() - tSC) / 1000).toFixed(1)} s and both consoles hold ` +
+            `${J(after.host.hash)} again`,
+            `the room is stuck after an ORDINARY seat change: host ${J(after && after.host)} ` +
+            `join ${J(after && after.join)}. This is the state the user photographed — "Cannot start ... ` +
+            `Leave the room to play on your own card" — with a correctly-seated, ready player on the other ` +
+            `device waiting forever.`);
+        }
+      }
     }
 
     // -- 5c. core ran advances, sampled twice ------------------------------

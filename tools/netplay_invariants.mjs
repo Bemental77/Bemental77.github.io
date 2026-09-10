@@ -155,6 +155,33 @@ if (!dc || !np) {
   } else ok(n);
 }
 
+// ---- 7. A RE-AGREEABLE CARD ERROR MUST NOT BE TERMINAL --------------------
+{
+  const n = 'a-seat-change-does-not-permanently-refuse-the-room';
+  // Photographed by the user on his own two devices: his phone hosting read
+  // "Cannot start — see below — a player took a seat — the card set has to be
+  // agreed again ... Leave the room to play on your own card", while his laptop
+  // sat correctly seated at "You're ready" forever.
+  //
+  // lib/netplay.js calls _cardInvalidate() on ANY seating change — somebody
+  // joins, or a peer drops and rejoins after a phone backgrounds its tab. The
+  // set genuinely is void at that moment and must not be used; the answer is to
+  // agree a NEW one, not to end the room. The page routed it to vmuRoomFail(),
+  // which is terminal.
+  //
+  // The browser arm that proves this is `seat-change` in
+  // dreamcast/tools/room_crossdevice_test.mjs, and it is the expensive one. This
+  // is the cheap shape-check that fails on a revert with no browser at all.
+  const invalidateReason = /agreed again/.test(np);
+  const pageRecovers = /agreed again/.test(dc) && /vmuRoomExchange\(\)/.test(dc);
+  if (invalidateReason && !pageRecovers) {
+    bad(n, 'lib/netplay.js invalidates the card set on an ordinary seat change, and dreamcast.html has no ' +
+           're-agreement path for it — every card error goes to the terminal vmuRoomFail(). A room that a ' +
+           'second player JOINING can kill is a room that cannot be joined. A genuine failure (a card that ' +
+           'will not decompress, a port count that disagrees) must still refuse.');
+  } else ok(n);
+}
+
 console.log(`\n[netplay-invariants] ${pass} passed, ${fails.length} failed`);
 if (fails.length) {
   console.log('These are the shapes that produced user-visible netplay failures. A browser rig');

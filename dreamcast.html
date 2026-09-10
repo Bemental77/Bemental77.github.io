@@ -7975,6 +7975,14 @@
     ROOM.timer = 0;
     const box = $('netRoom'); if (box) box.style.display = 'none';
   }
+  // A HANDLE ON THE LIVE ENGINE, for rigs that must deliver a REAL stimulus.
+  // room_crossdevice_test's `seat-change` arm calls ls._cardInvalidate() with
+  // the same reason string lib/netplay.js passes on an ordinary seat change, and
+  // then asserts this page re-agrees the card set instead of dying. Poking the
+  // page's own vmuRoom* state instead would test nothing, because the terminal
+  // state that reached the user was set by the HANDLER for that engine message.
+  window.__dcLsEngine = () => (NET.session && NET.session.ls) || null;
+
   window.__dcNetRoom = () => {
     const ul = $('netRoster');
     return {
