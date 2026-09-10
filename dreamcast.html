@@ -7767,6 +7767,34 @@
         (t.controllers != null ? ' <span class="k">· ' + t.controllers + ' controller' +
           (t.controllers === 1 ? '' : 's') + ' plugged in</span>' : '');
     }
+    // ⚠ HAVING A SEAT IS NOT BEING IN THE GAME, AND NOTHING SAID SO.
+    //
+    // Reported verbatim: "why is player 2 not showing as connected? it should be
+    // showing as two players connected on the same console." The room was
+    // perfect — both consoles seated, correct ports, frame-gated, 48 fingerprints
+    // compared — and Gauntlet Legends showed PLAYER 2 as an empty panel, because
+    // the person at the second machine had not pressed Start.
+    //
+    // That is the GAME'S join flow and it is correct: on a real Dreamcast a
+    // second controller being plugged in does not put a player in the game
+    // either, they press Start. Verified end to end on caseybement.com — the
+    // joiner pressed Start and both machines then rendered PLAYER 1 and PLAYER 2
+    // side by side, each "ENTER INITIALS / HEALTH 1000", players 3 and 4 still
+    // empty (dreamcast/tools/room_crossdevice_test.mjs shot 8-after-p2-start).
+    //
+    // What was missing was anybody SAYING it. The panel said "2 controllers
+    // plugged in" and left the player to infer that the game still needs a press
+    // from each of them. So say it, for the first while after the room starts —
+    // long enough to be read, not so long it becomes furniture.
+    if (t.barrier && t.barrier.started && t.coreFrame != null && t.coreFrame < 5400) {
+      html += '<br><span class="k">to get into the game, each player presses</span> Start ' +
+              '<span class="k">on their OWN machine — a plugged-in controller is not a player until ' +
+              'it does, exactly as on the console</span>';
+      // ⚠ FADED ON THE GUEST'S OWN CLOCK, not the wall clock. 5400 frames is
+      // about 90 s of emulated time, and it is the same number of frames on
+      // every machine in the room — a wall-clock timer would hide this sooner on
+      // a phone that stalled than on the desktop it is waiting for.
+    }
     // Frame-gated, and whether anything is CHECKING. Gated-but-unchecked is
     // worse than not gated, because it looks right until the evening is gone.
     // ⚠ NOT SHOWN BEFORE THE ROOM STARTS. A player waiting for three friends to

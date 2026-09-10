@@ -1926,6 +1926,62 @@ async function runArm(armName) {
         }
         return out.map((n, q) => +((n / tot[q]) * 100).toFixed(2));
       };
+      // ⚠ CLOSE THE LOBBY FIRST. A screenshot taken at the moment of the press
+      // showed the Play Online overlay STILL OPEN over the canvas on the joiner,
+      // with a focused "Join" button — so every Enter this cell sent went to the
+      // modal, not to Gauntlet. Every per-panel reading above was taken through
+      // that, which is why they were noise. The overlay also means the room was
+      // still mid-load: the same shot read "frame 248 · core ran 246".
+      for (const pg of pages) {
+        const r0 = await readRoster(pg);
+        if (r0.overlayOpen) await human(pg, '#netClose', 'Close');
+      }
+      await sleep(1500);
+      // And give the disc time to get somewhere the question makes sense.
+      {
+        const t0 = Date.now();
+        while (Date.now() - t0 < 45000) {
+          const rr = await Promise.all(pages.map(readRoster));
+          const ran = rr.map(hudCoreRan);
+          if (ran.every((n) => (n || 0) > 900)) break;
+          await sleep(2000);
+        }
+        const rr = await Promise.all(pages.map(readRoster));
+        say(`  ....  lobby closed; core ran ${J(rr.map(hudCoreRan))} before the player-2 test`);
+      }
+
+      // ⚠ FIRST GET TO THE SCREEN THE QUESTION IS ABOUT.
+      // Pressing Start straight after the room starts lands in the attract/title
+      // sequence, where ANY controller's Start advances the menu — which is why
+      // the per-panel cell below could not tell a join from a page turn. The
+      // user's own screenshots are of the CHARACTER SELECT: four panels, player
+      // 1's already filled with a wizard and stats, players 2-4 dark. That is
+      // where "player 2 did not show up as player 2" happens.
+      //
+      // So walk the HOST forward with Start until the picture settles, then stop
+      // touching it. A settled picture after a few advances is a menu waiting for
+      // input, which is the state to test player 2 in. Bounded, and it reports
+      // where it got to rather than assuming it arrived.
+      const stillness = async (pg, ms) => {
+        const a = await shotOf(pg); await sleep(ms); const b = await shotOf(pg);
+        return (a && b) ? changed(a, b) : 100;
+      };
+      let advanced = 0, settledAt = null;
+      for (let i = 0; i < 6; i++) {
+        const st = await stillness(pages[0], 1500);
+        if (st < 2.0) { settledAt = i; break; }
+        await pages[0].evaluate(() => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' })));
+        await sleep(200);
+        await pages[0].evaluate(() => window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter' })));
+        advanced++;
+        await sleep(2500);
+      }
+      const finalStill = await stillness(pages[0], 1500);
+      say(`  ....  walked the host forward with Start x${advanced}; picture now moving ${finalStill.toFixed(2)}%/1.5s` +
+          (settledAt != null ? ` (settled after ${settledAt})` : ''));
+      D.menuWalk = { advanced, settledAt, finalStill: +finalStill.toFixed(2) };
+      await sleep(1200);
+
       // ⚠ THE CONTROL IS A QUIET WINDOW, NOT THE OTHER PLAYER.
       // Pressing on the host first and the joiner second confounded the two:
       // host Start read 0.00% and joiner Start read 99.12%, which is equally
@@ -1957,6 +2013,11 @@ async function runArm(armName) {
         for (let p = 0; p < 4; p++) if (img.slice(p * 64, p * 64 + 12).some((b) => b !== 0)) on.push(p);
         return on;
       };
+      // LOOK AT THE SCREEN THE VERDICT IS ABOUT. Two cells voided here without
+      // anyone being able to say WHICH screen they voided on, and the answer
+      // turned out to matter: attract mode cycles the whole picture, so no
+      // before/after comparison taken during it can mean anything.
+      await shot(pages[1], '7-p2-start');
       const startPorts = await padDuring(pages[1]);
       say(`  ....  joiner held Start — maple ports carrying it: ${J(startPorts)}`);
       D.startPorts = startPorts;
@@ -1977,6 +2038,8 @@ async function runArm(armName) {
       // person would, not a single synthetic edge.
       await pressStart(pages[1]);
       const af = await shotOf(pages[1]);
+      await shot(pages[1], '8-after-p2-start');
+      await shot(pages[0], '8-after-p2-start-host');
       if (!b4 || !af) {
         voidc('PLAYER-2-CAN-JOIN-THE-GAME-BY-PRESSING-START',
               'the canvas could not be sampled on the joiner — no verdict');
