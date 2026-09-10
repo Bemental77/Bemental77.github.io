@@ -18,11 +18,14 @@
        own render-path authority. -->
   <script src="/lib/capability.js"></script>
   <script src="/lib/xboxinput.js"></script>
-  <!-- Online co-op. THE HOST HALF ONLY lives on this page: the guest runs on
-       gamecube_multiplayer.html, which needs no core, no SharedArrayBuffer and
-       no ROM — a <video> and a pad. Everything below is guarded on
-       Netplay.supported() and nothing here runs without ?np=. -->
+  <!-- Online co-op. BOTH HALVES RUN THE GAME NOW. The old shape — "THE HOST HALF
+       ONLY lives on this page: the guest runs on gamecube_multiplayer.html … a
+       <video> and a pad" — was the streaming architecture, and it is gone: every
+       machine boots the disc and the room exchanges nothing but pad bytes
+       (tools/no_streaming_test.mjs machine-checks that). netplay-ui.js is the
+       shared lobby; it renders nothing at all when Netplay.supported() is false. -->
   <script src="/lib/netplay.js"></script>
+  <script src="/lib/netplay-ui.js"></script>
   <script>
     // NEVER PRESENT AN ENABLED START BEHIND A BROKEN PATH.
     // Measured on a desktop profile with no WebGPU adapter: this page logged
@@ -7792,6 +7795,37 @@ window.GcRate = (function () {
   }
   console.log('[gcroute] ' + decided.reason);
 
+  // ---- ONLINE CO-OP: THE ROOM ITSELF ------------------------------------------------------
+  // lib/netplay-ui.js is the shared lobby every page uses; with no `onHost` handoff it means
+  // "the emulator is on THIS page", which is exactly the case here — both sides load the disc
+  // and run the game. Nothing is streamed and nothing but pad bytes crosses the wire.
+  // It is mounted HERE, outside engine(), so the button exists on a plain visit before any
+  // disc has been fetched; see the GCROOM note inside engine().
+  var GCROOM = { session: null, role: null };
+  function gcNetTransport() {
+    return new URLSearchParams(location.search).get('net') === 'local' ? 'local' : 'peerjs';
+  }
+  function gcNetOnReady(session, role) {
+    GCROOM.session = session; GCROOM.role = role;
+    console.log('[gc-lockstep] room formed, role=' + role + ' — loading the disc on this machine; ' +
+                'the barrier holds frame 0 until every seated player has it');
+    try {
+      var b = document.getElementById('btnStart');
+      if (b && b.getAttribute('aria-disabled') !== 'true' && !b.disabled) b.click();
+    } catch (e) { console.log('[gc-lockstep] could not start the disc: ' + e); }
+  }
+  function gcNetMount() {
+    if (!window.NetplayUI || !window.Netplay || !window.Netplay.supported()) return;
+    try {
+      NetplayUI.mount({
+        game: 'MarioParty4', transport: gcNetTransport(),
+        onSession: function (sess, role) { GCROOM.session = sess; GCROOM.role = role; },
+        onReady: gcNetOnReady,
+      });
+    } catch (e) { console.log('[gc-lockstep] lobby did not mount: ' + e); }
+  }
+  gcNetMount();
+
   if (decided.engage === true) { engine(); }
   else {
     // AUTO, undecided. __romBase is set synchronously inside startEmulator (gamecube.html:5905)
@@ -7906,12 +7940,28 @@ window.GcRate = (function () {
   // The render stage is measured on this side of the mailbox: wall time during which at least
   // one frame is in flight to dolphin_worker (outstanding > 0). Guest and renderer are separate
   // threads running as a pipeline, so the sustainable rate is 1/max(stage time) = min(rates).
+  // ── THE LOCKSTEP INTERLOCK, ON THE CREDIT POOL ────────────────────────────────────────────
+  // A credit is permission to run exactly one guest frame. In a room the guest needs TWO
+  // permissions for each one and they are ANDed:
+  //   1. THE WALL CLOCK has earned it — the integrator below, untouched, which is what keeps
+  //      the guest at exactly 1.000x. Lockstep never adds a credit the clock did not earn, so
+  //      it can only ever make the guest SLOWER. Speeding it up is forbidden (gate #9).
+  //   2. THE ROOM has an input image for that exact frame — Lockstep.beginFrame().
+  // The seam is the pool: while gcLsGate is set, granted credits are HELD here instead of
+  // reaching the SAB, and gcLsStep() releases them one at a time, each paired with one agreed
+  // input image. `load()` still reports the total outstanding entitlement so the model's
+  // backlog clamp keeps meaning what it meant.
+  var gcLsEarned = 0;      // credits the clock has granted that the room has not released
+  var gcLsGate = false;    // a room owns the frame gate
   var rate = GcRate.makeModel({
     guestHz: GUEST_HZ, target: TARGET, maxDtMs: MAX_DT_MS, maxBacklog: MAX_BACKLOG,
     pool: {
-      load:  function () { return Atomics.load(paceI32, 0); },
-      add:   function (n) { Atomics.add(paceI32, 0, n); Atomics.notify(paceI32, 0); },
-      reset: function () { Atomics.store(paceI32, 0, 0); }
+      load:  function () { return Atomics.load(paceI32, 0) + gcLsEarned; },
+      add:   function (n) {
+        if (gcLsGate) { gcLsEarned += n; return; }
+        Atomics.add(paceI32, 0, n); Atomics.notify(paceI32, 0);
+      },
+      reset: function () { gcLsEarned = 0; Atomics.store(paceI32, 0, 0); }
     }
   });
   // A hidden tab gets no rAF, so no credits and no emulated time: that is the "a long hide is a
@@ -8365,8 +8415,17 @@ window.GcRate = (function () {
 
   // btn/dstk are EDGE bits: OR-ed in, and the worker exchange-clears them once it has delivered
   // exactly one frame of them (HuPadBtnDown/HuPadDStkRep are edge-triggered in the game).
+  // ⚠ IN A ROOM THESE DO NOT REACH THE GUEST. gcLsStage is the local capture buffer: local input
+  // has to travel through the room and come back inside the agreed image, or this machine would
+  // apply its own bytes a frame early and only here — which is a desync, not a latency win.
+  // gcLsFreshStage/gcLsStage are declared here so both paths can see them.
+  var gcLsStage = null;
+  function gcLsFreshStage() {
+    return { btn: [0, 0, 0, 0], dstk: [0, 0, 0, 0], stkx: [0, 0, 0, 0], stky: [0, 0, 0, 0] };
+  }
   function gcPadEdge(port, btnBits, dstkBits) {
     if (!paceI32 || !(port >= 0) || port >= PAD_PORTS) return;
+    if (gcLsStage) { gcLsStage.btn[port] |= btnBits | 0; gcLsStage.dstk[port] |= dstkBits | 0; return; }
     var b = PAD_BASE + port * PAD_STRIDE;
     if (btnBits) Atomics.or(paceI32, b, btnBits | 0);
     if (dstkBits) Atomics.or(paceI32, b + 1, dstkBits | 0);
@@ -8376,6 +8435,7 @@ window.GcRate = (function () {
   // that. Stored, not OR-ed, and cleared on release.
   function gcPadStick(port, x, y) {
     if (!paceI32 || !(port >= 0) || port >= PAD_PORTS) return;
+    if (gcLsStage) { gcLsStage.stkx[port] = x | 0; gcLsStage.stky[port] = y | 0; return; }
     var b = PAD_BASE + port * PAD_STRIDE;
     Atomics.store(paceI32, b + 2, x | 0);
     Atomics.store(paceI32, b + 3, y | 0);
@@ -8469,12 +8529,266 @@ window.GcRate = (function () {
   // recomp block, so the JIT path (which has its own SI plumbing) is untouched.
   window.gcRecompPadSink = gcPadFromGamepad;
 
+  // ═══════════════════════════════════════════════════════════════════════════════════════════
+  // ONLINE CO-OP — THE LOCKSTEP FRAME GATE FOR THE RECOMP ENGINE
+  //
+  // "imagine fucking mario party! it needs to be immediate to EVERY PLAYER, UP TO 8 PLAYERS!"
+  // GameCube is the four-controller console and Mario Party 4 is the four-player title, so this
+  // is the machine that has to carry it. Two things had to exist first and now do: the recomp
+  // can express four ports at all (see the FOUR CONTROLLER PORTS block above), and it has a real
+  // frame boundary to gate on — recomp_worker.js latches the pad bytes immediately after
+  // consuming a frame credit, so ONE CREDIT IS EXACTLY ONE GUEST FRAME WITH KNOWN INPUT.
+  //
+  // ⚠ WHY THIS COULD NOT LIVE ON THE JIT PATH. gamecube.html's own note (search "WHY LOCKSTEP IS
+  // NOT HERE YET") records the reason: under emscripten dual-core `retro_run` advances ZERO
+  // guest cycles and the CPU free-runs inside JitWasm::Run's unbounded loop, so there is no
+  // one-emulated-frame boundary to gate. The recomp path has one by construction.
+  //
+  // THE LOOP, and why each piece is where it is:
+  //
+  //   beginFrame(myPads) -> { ready, frame, image } | { ready:false, waitingOn }
+  //     The engine answers with EVERY seated port's bytes for one exact frame, or it refuses.
+  //     A refusal STALLS this machine. It never predicts: a guessed pad forks the simulations
+  //     silently and permanently, and there is no rollback here to unfork them.
+  //
+  //   release ONE credit + write the image
+  //     ⚠ THE PAD CELLS ARE A SINGLE SLOT, NOT A QUEUE. Feeding two frames before the worker
+  //     latched the first would overwrite it, and the two machines would run different inputs on
+  //     the same numbered frame — a desync with no symptom. So exactly one frame is in flight,
+  //     and the next one waits on PAD_ACK, which the worker bumps only after latching.
+  //
+  //   endFrame(null)
+  //     Advances the engine's clock. No fingerprint is submitted YET — see the fault note in
+  //     gcLsStep(): being frame-gated with nothing comparing the cores is worse than not being
+  //     gated, because it looks right, so this states it rather than assuming it away.
+  //
+  // ⚠ THE GUEST RATE IS NOT TOUCHED (gate #9). Credits are still earned by the wall clock and
+  // this gate can only withhold them. It cannot manufacture one, so it cannot speed the guest up.
+  //
+  // ⚠ AND NO CORE RUNS FRAME 0 BEFORE THE ROOM DOES. gcLsArmBeforeFirstCredit() sets the gate
+  // BEFORE requestAnimationFrame(grantLoop) is ever called, so not one credit reaches the SAB
+  // and the worker parks on Atomics.wait at its very first VIWaitForRetrace. The barrier in
+  // lib/netplay.js releases it, and every machine's first frame is the room's frame 0.
+  // ═══════════════════════════════════════════════════════════════════════════════════════════
+  var PAD_ACK = 33, LS_ARMED = 34;      // mirrors of recomp_worker.js's interlock cells
+  var LS_PAD_BYTES = 64;                // the engine's default; GC state fits in the first 6
+  var GCLS = {
+    armed: false,        // the credit gate is interlocked and the worker knows it
+    running: false,      // ...and the barrier released, so this page is feeding
+    // ⚠ THE ROOM IS FORMED BEFORE THE ENGINE EXISTS, and it has to be. In auto mode engine()
+    // does not run until the visitor presses Start, so a lobby mounted in here would only
+    // appear after the disc had loaded — which is the exact thing lib/netplay-ui.js says not to
+    // do ("pairing after boot means one player sits watching a loaded game while the other is
+    // still typing a code, and on this site a disc load is over a gigabyte"). GCROOM is
+    // therefore owned by the enclosing block and filled by the lobby; these two read it.
+    get session() { return GCROOM.session; },
+    get role() { return GCROOM.role; },
+    pendingAck: -1,      // PAD_ACK value the in-flight image is waiting to pass; -1 = idle
+    fedTo: 0, framesFed: 0,
+    bfCalls: 0, bfStall: 0,
+    stalling: false, waitingOn: [], stallReason: null,
+    fault: null,         // why this machine is NOT frame-gated, in words
+    hashSink: null,      // null = untested, false = NOTHING is comparing the cores
+    ports: null,         // the seats this machine holds, from the roster
+  };
+  function gcLsSay(t) { try { console.log('[gc-lockstep] ' + t); } catch (e) {} }
+  function gcLsEngine() {
+    var s = GCLS.session;
+    if (!s) return null;
+    try { return s.ls || null; } catch (e) { return null; }
+  }
+  // Seats are handed out lowest-free-first by lib/netplay.js seat(), so a count is enough — but
+  // it is read from the ROSTER, never from a number written here.
+  function gcLsSeatedCount(ls) {
+    var n = 0;
+    try { for (var i = 0; i < ls.roster.length; i++) if (ls.roster[i] != null) n++; } catch (e) {}
+    return Math.max(1, Math.min(PAD_PORTS, n));
+  }
+  function gcLsDisc() { return (window.__romBase || 'MarioParty4'); }
+
+  // THIS MACHINE'S OWN PADS, KEYED BY THE PORT THE ROOM GAVE IT.
+  // The keyboard writes the legacy port-0 cells and the gamepads write gcLsStage (see
+  // gcPadEdge); both are DRAINED here, so local input travels through the room and comes back
+  // in the agreed image instead of also being applied straight to the guest.
+  //
+  // ⚠ NEVER FALL BACK TO PORT 0 INSIDE A ROOM. A console whose seat is not known yet would drive
+  // PLAYER 1 — somebody else's character. It is a reachable state, not a theoretical one:
+  // lib/netplay.js documents a path where _recount() never runs so `localPorts` stays EMPTY.
+  // "I do not know which player I am" must not resolve to "act as Player 1".
+  // ⚠ ASYMMETRIC ON PURPOSE: a HOST with an unknown seat is not guessing, a GUEST is. The host
+  // seats ITSELF first, lowest-free-first, so port 0 is its port by construction even before
+  // localPorts populates. Suppressing for both would drop the host's own input.
+  function gcLsLocalPads() {
+    var kbBtn = Atomics.exchange(paceI32, 1, 0), kbDstk = Atomics.exchange(paceI32, 2, 0);
+    var kbOsX = Atomics.exchange(paceI32, 3, 0), kbOsY = Atomics.exchange(paceI32, 4, 0);
+    var kbX = Atomics.load(paceI32, 8) || kbOsX, kbY = Atomics.load(paceI32, 9) || kbOsY;
+    var ls = gcLsEngine();
+    var inRoom = !!GCLS.session;
+    var known = (ls && ls.localPorts && ls.localPorts.length) ? ls.localPorts : null;
+    var isHostSide = (GCLS.role === 'host');
+    if (!known && inRoom && !isHostSide) {
+      if (!gcLsLocalPads._warned) {
+        gcLsLocalPads._warned = true;
+        gcLsSay('this console has no seat yet, so it is sending NO pad rather than driving port 0 — ' +
+                'taking Player 1\'s controller because our own seat is unknown is worse than sending ' +
+                'nothing for a frame');
+      }
+      gcLsStage = gcLsFreshStage();
+      return {};
+    }
+    var ports = known || [0];
+    var out = {}, stage = gcLsStage || gcLsFreshStage();
+    // Seat k of this machine is driven by local device k: the FIRST seat by the keyboard merged
+    // with gamepad 0 (which is what a splitter would do), each further seat by the next gamepad.
+    for (var k = 0; k < ports.length; k++) {
+      var port = ports[k];
+      var b = new Uint8Array(LS_PAD_BYTES);
+      var btn = stage.btn[k] | 0, dstk = stage.dstk[k] | 0;
+      var sx = stage.stkx[k] | 0, sy = stage.stky[k] | 0;
+      if (k === 0) { btn |= kbBtn; dstk |= kbDstk; sx = sx || kbX; sy = sy || kbY; }
+      b[0] = btn & 0xFF; b[1] = (btn >> 8) & 0xFF;
+      b[2] = dstk & 0xFF;
+      b[4] = sx & 0xFF; b[5] = sy & 0xFF;
+      out[port] = b;
+    }
+    gcLsStage = gcLsFreshStage();   // edges are one frame's worth; holds are re-sampled each poll
+    return out;
+  }
+
+  // The agreed image -> the per-port SAB cells the worker latches. STORE, never OR: the image is
+  // the whole truth for this frame on every machine, including for this machine's own ports.
+  function gcLsWriteImage(image) {
+    for (var p = 0; p < PAD_PORTS; p++) {
+      var o = p * LS_PAD_BYTES;
+      var btn = image[o] | (image[o + 1] << 8);
+      var dstk = image[o + 2];
+      var sx = image[o + 4]; if (sx > 127) sx -= 256;
+      var sy = image[o + 5]; if (sy > 127) sy -= 256;
+      var c = PAD_BASE + p * PAD_STRIDE;
+      Atomics.store(paceI32, c, btn);
+      Atomics.store(paceI32, c + 1, dstk);
+      Atomics.store(paceI32, c + 2, sx);
+      Atomics.store(paceI32, c + 3, sy);
+    }
+  }
+
+  // ONE STEP = AT MOST ONE GUEST FRAME. Called from the rAF grant loop and from a short timer,
+  // because a frame that becomes feedable between two rAFs should not wait for the next one.
+  function gcLsStep() {
+    var ls = gcLsEngine();
+    if (!GCLS.armed || !ls) return;
+    if (ls.state !== 'running' && ls.state !== 'stalled') {
+      if (GCLS.running) {
+        GCLS.running = false;
+        gcLsSay('frame gate DISENGAGED — engine state ' + ls.state + '; nothing advances until the room is back');
+      }
+      return;
+    }
+    if (!GCLS.running) {
+      GCLS.running = true;
+      GCLS.fedTo = ls.frame;
+      GCLS.ports = (ls.localPorts || []).slice();
+      // ⚠ SAY IT, DO NOT ASSUME IT AWAY. The engine HAS submitHash() and this page never calls
+      // it, because the recomp exposes no state fingerprint yet — so these cores are frame-gated
+      // with NOTHING comparing them. Gated and silently diverging is worse than not gated,
+      // because it looks right. This is a standing fault, not a conditional one, and it is
+      // recorded in tools/undelivered.mjs as `gamecube-lockstep-has-no-fingerprint`.
+      GCLS.hashSink = false;
+      GCLS.fault = 'frame-gated but NOT fingerprinted: the recomp publishes no deterministic state ' +
+                   'hash, so lib/netplay.js has nothing to compare and a divergence would go ' +
+                   'undetected. Two machines can also start from DIFFERENT memory cards, which is ' +
+                   'a divergence source this gate does not close.';
+      gcLsSay('⚠ ' + GCLS.fault);
+      gcLsSay('FRAME GATE ENGAGED at frame ' + ls.frame + ' — this core advances only when every seated ' +
+              'port has an input for the frame. delay=' + ls.delay + ' frames, ports=' +
+              JSON.stringify(ls.roster) + ', mine=' + JSON.stringify(ls.localPorts));
+    }
+    // One frame in flight at a time — the pad cells are a single slot (see the header).
+    if (GCLS.pendingAck >= 0) {
+      if (Atomics.load(paceI32, PAD_ACK) === GCLS.pendingAck) return;   // not latched yet
+      GCLS.pendingAck = -1;
+    }
+    if (gcLsEarned <= 0) return;      // the wall clock has not earned a frame — this is the 1.000x half
+    GCLS.bfCalls++;
+    var r = ls.beginFrame(gcLsLocalPads());
+    if (!r || !r.ready) {
+      GCLS.bfStall++;
+      GCLS.stalling = !!(r && r.reason === 'stall');
+      GCLS.stallReason = r ? r.reason : 'the engine returned nothing';
+      GCLS.waitingOn = (r && r.waitingOn) ? r.waitingOn.slice() : [];
+      return;                          // STALL. Never predict.
+    }
+    GCLS.stalling = false; GCLS.waitingOn = []; GCLS.stallReason = null;
+    gcLsWriteImage(r.image);
+    GCLS.pendingAck = Atomics.load(paceI32, PAD_ACK);
+    gcLsEarned--;
+    Atomics.add(paceI32, 0, 1); Atomics.notify(paceI32, 0);   // exactly one frame
+    GCLS.fedTo = r.frame + 1; GCLS.framesFed++;
+    ls.endFrame(null);
+  }
+
+  // ARM BEFORE THE FIRST CREDIT — called from startRecomp() between the boot postMessage and
+  // requestAnimationFrame(grantLoop), which is the only window in which "this core has never run
+  // a frame" is still true.
+  function gcLsArmBeforeFirstCredit() {
+    if (!GCLS.session || GCLS.armed) return false;
+    if (Atomics.load(paceI32, 5)) {
+      GCLS.fault = 'this page was opened with ?fps=0 (uncapped freerun), which disarms the credit ' +
+                   'throttle the frame gate is built on. A room cannot be gated on a guest nothing paces.';
+      gcLsSay('⚠ REFUSING TO GATE — ' + GCLS.fault);
+      return false;
+    }
+    // ⚠ CREATE THE ENGINE IF THE ROOM HAS NOT NEEDED ONE YET. lib/netplay.js builds session.ls
+    // LAZILY from _ensureLockstep(), so a HOST SITTING ALONE IN A ROOM IT JUST OPENED HAS NO
+    // ENGINE — nobody has connected, so nothing has seated, so nothing built one. Without this
+    // the gate would refuse and the core would FREE-RUN UNGATED, which is the one outcome this
+    // whole architecture exists to prevent.
+    var ls = gcLsEngine();
+    if (!ls && typeof GCLS.session._ensureLockstep === 'function') {
+      try { ls = GCLS.session._ensureLockstep(); } catch (e) { gcLsSay('could not build the engine: ' + e); }
+    }
+    if (!ls) {
+      GCLS.fault = 'the room published no lockstep engine, so this core cannot be frame-gated';
+      gcLsSay('⚠ ' + GCLS.fault);
+      return false;
+    }
+    gcLsGate = true;                                   // credits stop reaching the SAB
+    Atomics.store(paceI32, LS_ARMED, 1);               // the worker stops folding local input in
+    gcLsStage = gcLsFreshStage();
+    GCLS.armed = true; GCLS.running = false; GCLS.pendingAck = -1; GCLS.fault = null;
+    gcLsSay('ARMED before the first credit — the worker parks at its first VIWaitForRetrace until the ' +
+            'barrier releases, so no core runs a frame the others did not');
+    // The barrier compares what each machine ACTUALLY LOADED, not what it intended.
+    try { GCLS.session.setReady(true, gcLsDisc()); } catch (e) { gcLsSay('setReady failed: ' + e); }
+    setInterval(gcLsStep, 4);   // rAF alone would cap the feed at the display refresh
+    return true;
+  }
+
+  // Test seam. tools/netplay_invariants.mjs and the two-page room test read this; it reports the
+  // RECOMP engine's gate, which is the only GameCube path that has one.
+  window.__gcLockstep = function () {
+    var ls = gcLsEngine();
+    return {
+      supported: !!(window.Netplay && window.Netplay.supported()),
+      architecture: 'lockstep', streaming: false,
+      engine: 'recomp', gated: !!GCLS.armed, running: !!GCLS.running,
+      role: GCLS.role, ports: ls ? (ls.localPorts || []).slice() : null,
+      roster: ls ? (ls.roster || []).slice() : null,
+      state: ls ? ls.state : null, frame: ls ? ls.frame : null, delay: ls ? ls.delay : null,
+      framesFed: GCLS.framesFed, bfCalls: GCLS.bfCalls, bfStall: GCLS.bfStall,
+      stalling: GCLS.stalling, waitingOn: GCLS.waitingOn.slice(), stallReason: GCLS.stallReason,
+      earned: gcLsEarned, guestFrames: (paceI32 ? Atomics.load(paceI32, PAD_ACK) : 0),
+      hashSink: GCLS.hashSink, fault: GCLS.fault,
+    };
+  };
+
   // Credit grant = THE GUEST CLOCK. TARGET credits per wall-clock second, and nothing else in
   // this file is allowed to touch emulated time. rAF only decides how often we top the pool up;
   // the amount is integrated against wall time, so an irregular rAF cadence does not change the
   // speed — but an unbounded one would (see the 1.000x integrity note above), hence the clamps.
   function grantLoop(t) {
     if (rw) rate.grant(t);
+    if (GCLS.armed) gcLsStep();
     requestAnimationFrame(grantLoop);
   }
 
@@ -8733,6 +9047,9 @@ window.GcRate = (function () {
                      glueUrl: '/gamecube/recomp/' + recompBuildDir + 'mp4_game.js',
                      wasmUrl: '/gamecube/recomp/' + recompBuildDir + 'mp4_game.wasm' }, bootTransfer);
     bootSent = true;    // from here on, Save/Load/Export belong to THIS worker, not dolphin
+    // ⚠ BEFORE THE FIRST CREDIT AND NOT ONE LINE LATER. This is the only moment at which "this
+    // core has never run a frame" is still true; grantLoop below is what starts the guest.
+    gcLsArmBeforeFirstCredit();
     requestAnimationFrame(grantLoop);
   }
 

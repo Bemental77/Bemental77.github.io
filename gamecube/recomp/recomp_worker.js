@@ -538,6 +538,23 @@ const ST_CMD = 10, ST_TOTAL = 11, ST_LEN = 12, ST_SEQ = 13, ST_CONSUMED = 14, ST
 // visitor (and every existing harness) working while a gamepad on index 1 reaches port 1.
 const PAD_PORTS = 4, PAD_BASE = 16, PAD_STRIDE = 4;
 
+// ── THE LOCKSTEP INTERLOCK ──────────────────────────────────────────────────────────────────
+// Two cells, and between them they are the whole worker half of the frame gate.
+//
+//   PAD_ACK   bumped once per guest frame, at the END of applyPads — i.e. after the credit was
+//             consumed and the pad bytes were latched. The page needs this because THE PAD
+//             CELLS ARE A SINGLE SLOT, NOT A QUEUE: if it wrote a second frame's image before
+//             the first was latched, the second would silently overwrite the first and the two
+//             machines would run different inputs on the same numbered frame — a desync that
+//             looks like nothing at all. PEEK_SEQ cannot serve: it is bumped BEFORE the credit
+//             wait, so it advances while an unlatched image is still pending.
+//   LS_ARMED  non-zero = a room owns the input. applyPads then reads ONLY the per-port block
+//             and ignores the legacy port-0 aliases and the ?board=1 script, because under
+//             lockstep the local keyboard's bytes must travel through the room and come back in
+//             the agreed image — folding them straight into port 0 as well would apply this
+//             machine's own input a frame early and only on this machine.
+const PAD_ACK = 33, LS_ARMED = 34;
+
 // ── GUEST-STATE WITNESS WINDOW ──────────────────────────────────────────────────────────────
 // A postMessage cannot reach this worker once _main() runs (see the SAVE STATES block), and the
 // guest's state lives in THIS worker's wasm instance — so the page has no way to read what the
@@ -566,7 +583,8 @@ const PACE_I32_CELLS = PEEK_BASE + PEEK_WINDOWS * PEEK_CELLS;   // = 144; page a
 // which case ports 1-3 are simply not delivered (rather than silently landing on player 1).
 function applyPads() {
   if (!Module) return;
-  const scripted = inputScript ? inputScript[viRetrace + 1] : null;
+  const lsOn = Atomics.load(paceI32, LS_ARMED) !== 0;
+  const scripted = (!lsOn && inputScript) ? inputScript[viRetrace + 1] : null;
   // legacy port-0 cells: two one-shot edges, two one-shot sticks, two held sticks
   const lBtn = Atomics.exchange(paceI32, 1, 0), lDstk = Atomics.exchange(paceI32, 2, 0);
   const lOsX = Atomics.exchange(paceI32, 3, 0), lOsY = Atomics.exchange(paceI32, 4, 0);
@@ -578,7 +596,7 @@ function applyPads() {
     let dstk = Atomics.exchange(paceI32, b + 1, 0);
     let stkx = Atomics.load(paceI32, b + 2);
     let stky = Atomics.load(paceI32, b + 3);
-    if (p === 0) {
+    if (p === 0 && !lsOn) {
       btn |= lBtn; dstk |= lDstk;
       stkx = stkx || lOsX || lHeldX; stky = stky || lOsY || lHeldY;
       if (scripted) {
@@ -594,6 +612,10 @@ function applyPads() {
       if (Module.___recomp_set_inject_stky) Module.___recomp_set_inject_stky(stky);
     }
   }
+  // LAST, and it is a promise to the page: everything above has been latched into the guest's
+  // own globals, so the slot is free for the next frame's image.
+  Atomics.add(paceI32, PAD_ACK, 1);
+  Atomics.notify(paceI32, PAD_ACK);
 }
 
 // Mirror the game's own pad state (and any watched MEM1 windows) into the pace SAB. Called once

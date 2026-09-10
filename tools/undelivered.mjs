@@ -86,12 +86,37 @@ const OPEN = [
     evidence: 'tools/audit_all.mjs: "both browsers sit on ONE box behind ONE NAT".',
     verify: () => /ONE box behind ONE NAT/.test(read('tools/audit_all.mjs')),
   },
+  // ⚠ THIS REPLACES `gamecube-has-no-lockstep`, WHOSE verify() COULD ONLY EVER
+  // HAVE BEEN WRONG. It read
+  //     () => !/lockstep/.test(read('gamecube/dolphin_libretro/dolphin_worker.js'))
+  // — the string "lockstep" appearing ANYWHERE in that file, including in a
+  // comment, would have closed it; and the frame gate GameCube actually needed
+  // was never going to live in dolphin_worker.js at all, because the JIT path
+  // has no emulated-frame boundary to gate (gamecube.html's own note: under
+  // emscripten dual-core `retro_run` advances ZERO guest cycles). It landed in
+  // the RECOMP engine instead, so the old entry would have gone on reporting
+  // "GameCube has no netplay at all" indefinitely while two machines played
+  // Mario Party 4 in a room. Its wording understated the blockers and its test
+  // watched the wrong file. The two entries below are what is actually left,
+  // and both test a live code shape in the file the gap is IN.
   {
-    id: 'gamecube-has-no-lockstep',
-    what: 'GameCube has no netplay at all.',
-    why: 'dolphin_worker.js contains zero occurrences of "lockstep"; the page carries a stub. Its controller input was also entirely dead until the gcNetRemoteMask fix.',
-    evidence: 'grep -c lockstep gamecube/dolphin_libretro/dolphin_worker.js -> 0',
-    verify: () => !/lockstep/.test(read('gamecube/dolphin_libretro/dolphin_worker.js')),
+    id: 'gamecube-lockstep-is-not-fingerprinted',
+    what: 'GameCube rooms are frame-gated but NOTHING compares the two simulations.',
+    why: 'gamecube.html drives Lockstep.beginFrame()/endFrame() per guest frame and never calls submitHash(), because the recomp exposes no deterministic state hash — so lib/netplay.js has nothing to put in an lsh and a divergence would go undetected. Gated and silently diverging is worse than not gated, because it looks right. There is a known divergence SOURCE too: each machine adopts its own IndexedDB memory-card image before _main() (the recomp card shim), and nothing agrees a card set the way dreamcast.html does with ls.contributeCards().',
+    evidence: 'tools/no_streaming_test.mjs reports gamecube.html as "lockstep (beginFrame)" with no submitHash among its tokens, while dreamcast.html reports "(beginFrame, lsInput, lsNormalize, submitHash)". The page states the gap itself as a standing fault in window.__gcLockstep().fault.',
+    // LIVE CODE SHAPE, in the file the gap is in: the page never CALLS submitHash,
+    // and never contributes a card set. Wiring either makes this go stale.
+    verify: () => !/\.submitHash\s*\(/.test(read('gamecube.html'))
+                && !/contributeCards/.test(read('gamecube.html')),
+  },
+  {
+    id: 'gamecube-lockstep-is-mario-party-4-only',
+    what: 'Only ONE GameCube title can be played in a room — the other three cannot be gated at all.',
+    why: 'The frame gate is built on the recomp engine\'s credit protocol (one credit == one guest frame with known input), and the recomp is the Mario Party 4 decompilation compiled to wasm. Sonic Adventure 2 Battle, PSO and 240pSuite run on the JIT path, where gamecube.html\'s own note records that under emscripten dual-core retro_run advances ZERO guest cycles and the CPU free-runs inside JitWasm::Run\'s unbounded loop — there is no one-emulated-frame boundary to gate, so lockstep is not merely unwired there, it is unbuildable until that changes.',
+    evidence: 'gamecube.html routes engines from RECOMP_TITLES, which holds exactly one entry; gamecube/tools/gc_room_test.mjs boots two rooms of that one title and nothing else can follow it.',
+    // The routing table itself, which the live router reads — adding a second
+    // title to it is exactly the change that should make this stale.
+    verify: () => /RECOMP_TITLES\s*=\s*\{\s*MarioParty4:\s*1\s*\}/.test(read('gamecube.html')),
   },
   // ── CLOSED 2026-09-09: 'snes-needs-a-core-rebuild' ─────────────────────────
   // It said "SNES cannot present a second controller", and it was true: the

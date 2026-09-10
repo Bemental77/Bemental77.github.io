@@ -91,7 +91,12 @@ for (const p of PAGES) {
   // comments describing a menu entry that is not in the DOM (there is no
   // #mNet/#btnNet element on that page at all).
   const stripped = stripComments(s);
-  const online = /netHostBtn|lobbyCard|Play Online|NetplayHost|Netplay\.(Session|Lockstep|makeCode)/.test(stripped);
+  // ⚠ A PAGE THAT MOUNTS THE SHARED LOBBY HAS ONLINE PLAY. NetplayUI.mount() builds the
+  // Netplay.Session itself (lib/netplay-ui.js:192), so a page can be fully online without ever
+  // naming Netplay.Session — and this scope test would call it "no online play" and skip every
+  // check. gamecube.html measured exactly that on 2026-09-10 the moment it gained a real
+  // lockstep frame gate: n/a, while driving beginFrame() per guest frame.
+  const online = /netHostBtn|lobbyCard|Play Online|NetplayHost|NetplayUI\.mount|Netplay\.(Session|Lockstep|makeCode)/.test(stripped);
   if (!online) { console.log(`  n/a   ${p} — no online play`); skipped++; continue; }
   scoped++;
 

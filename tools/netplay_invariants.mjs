@@ -46,7 +46,10 @@ if (!dc || !np) {
   // snes.html joined 2026-09-09, the day it gained a second controller. A page
   // is added HERE at the same time it gains a room — not after somebody reports
   // the bug on it, which is the whole point of the paragraph above.
-  const PAGES = ['dreamcast.html', 'ps1.html', 'n64/index.html', 'genesis.html', 'snes.html'];
+  // gamecube.html joined 2026-09-10, the day its recomp engine gained a lockstep frame gate —
+  // added HERE at the same time it gained a room, per the paragraph above.
+  const PAGES = ['dreamcast.html', 'ps1.html', 'n64/index.html', 'genesis.html', 'snes.html',
+                 'gamecube.html'];
   for (const page of PAGES) {
     const src = read(page);
     if (!src) continue;
