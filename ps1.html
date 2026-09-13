@@ -9,7 +9,7 @@
        NOT USE STREAMING!"). Every player runs their own core and only pad bytes
        cross the wire. The ONLINE PLAY block near the end of this page carries
        the evidence this rests on, including the determinism measurement. -->
-  <script src="/lib/netplay.js?v=a73964c3"></script>
+  <script src="/lib/netplay.js?v=fb6cec45"></script>
   <meta charset="UTF-8" />
   <title>PS1 Wasm — Monster Rancher 2</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -1228,7 +1228,7 @@
   var FRAME_MS = 1000 / PS1_HW_HZ;
   var MAX_CATCHUP_FRAMES = 4;
 
-  var NET = { session: null, role: null, leaving: false };
+  var NET = { session: null, role: null, leaving: false, handoff: null /* what ?np=… carried — { code, game, host, join } — or null */ };
   var LS = {
     armed: false, running: false, fault: null,
     workerFrame: 0, fedTo: 0, inFlight: 0,
@@ -1559,10 +1559,44 @@
     pageLog('[lockstep] ⚠ DESYNC ' + JSON.stringify(d || {}));
   }
 
+  function netOnStatus(e) {
+    var s = e && e.state;
+    if (s === 'signalling') {
+      netStatus(NET.role === 'host'
+        ? 'Waiting for someone to join with code ' + (NET.session ? NET.session.code : '') + '…'
+        : 'Looking for the host…', 'busy');
+    } else if (s === 'connected') {
+      // ⚠ NOT "you are Player 2". Which port a player holds is the ENGINE's
+      // answer — hardcoding it is how a Player 2 ends up told they are Player 1.
+      var ls = lsEngine();
+      var mine = (ls && ls.localPorts && ls.localPorts.length) ? ls.localPorts[0] : null;
+      netStatus(mine != null
+        ? 'In the room — you are Player ' + (mine + 1) + '. Press Start when you are both ready.'
+        : 'In the room. Press Start when you are both ready.', 'good');
+      $('netLeave').style.display = '';
+      netRoomRender();
+    } else if (s === 'closed') {
+      // onclose fires on BOTH sides and lands after netLeave() set its own
+      // text, so without the flag the one who pressed Leave is told the other
+      // player left.
+      netStatus(NET.leaving ? 'Left the room.' : 'The room closed.', 'busy');
+      lsDisarm(NET.leaving ? 'you left the room' : 'the room closed');
+      netRoomRender();
+    } else if (s === 'failed') {
+      netStatus('Could not connect' + (e.detail ? ': ' + e.detail : '.'), 'bad');
+    }
+    pageLog('[net] ' + (NET.role || 'session') + ' ' + s + (e && e.detail ? ' (' + e.detail + ')' : ''));
+  }
+
   function netWire(session) {
     NET.session = session;
     var dz = $('netDesync'); if (dz) dz.classList.remove('on');
-    session.on('status', function (st) { netStatus(String(st && st.text || st || '')); });
+    // ⚠ THE STATUS EVENT IS { state, detail, code, sas } — it has never carried
+    // `.text` (lib/netplay.js _emit('status', …)). This line used to stringify
+    // the event, so the host's #netStatus read "[object Object]" from the moment
+    // signalling began — on the plain Host button and on the lobby hand-off
+    // alike. genesis.html and snes.html switch on e.state; so does this now.
+    session.on('status', netOnStatus);
     session.on('desync', netOnDesync);
     session.on('lockstep', function () { netRoomRender(); });
     session.on('room', function () { netRoomRender(); });
@@ -1594,11 +1628,15 @@
     return true;
   }
 
-  async function netStartHost() {
+  async function netStartHost(presetCode) {
     if (NET.session) return;
     if (netRefuseIfRunning()) return;
     $('netHostPane').style.display = ''; $('netJoinPane').style.display = 'none';
-    var code = Netplay.makeCode(5);
+    // The lobby (multiplayer.html) mints the code so it can be read aloud before
+    // anybody arrives here, and hands it in as `presetCode`; a valid one is used
+    // as-is. Anything else mints — including the click event, which the button
+    // wiring deliberately never passes.
+    var code = (typeof presetCode === 'string' && /^[A-HJ-NP-Z2-9]{5}$/.test(presetCode)) ? presetCode : Netplay.makeCode(5);
     $('netCode').textContent = code;
     var game = netGameId();
     NET.role = 'host';
@@ -1688,6 +1726,32 @@
   }
   function netClose() { $('netOverlay').classList.remove('on'); }
 
+  // ?game=<label> from the lobby, resolved against THIS page's ROMS[] and applied
+  // to everything a room reads BEFORE any room opens, because lib/netplay.js
+  // binds the game name into the pairing and refuses a joiner who names another.
+  // Matched by LABEL: CLAUDE.md records a ROM index going stale exactly the way
+  // an index-only link would. A bare number is still accepted, for a link typed
+  // by hand. Returns the index, or -1 when the link names a disc this page has
+  // not got — and then touches nothing.
+  // ⚠ ROM_INDEX IS SET HERE, NOT JUST #romSelect. netGameId() reads ROM_INDEX,
+  // and its only other writer is startEmulator() — so without that line a
+  // host=1 hand-off opens the room under ROMS[0]'s label whatever the link said.
+  // ⚠ CALL netOpen() FIRST: it populates #netGame lazily, and a value assigned
+  // to an empty <select> is silently dropped.
+  function netPreselectGame(game) {
+    if (!game) return -1;
+    var idx = -1, i;
+    for (i = 0; i < ROMS.length; i++) if (ROMS[i].label === game) idx = i;
+    if (idx < 0 && /^\d+$/.test(game) && +game < ROMS.length) idx = +game;
+    if (idx < 0) return -1;
+    // One dispatch: #romSelect's own 'change' listener mirrors #mobileRomSelect.
+    var sel = $('romSelect');
+    if (sel) { sel.value = String(idx); sel.dispatchEvent(new Event('change')); }
+    ROM_INDEX = idx;
+    var ng = $('netGame'); if (ng) ng.value = String(idx);
+    return idx;
+  }
+
   (function wireNetplay() {
     // Refuse to RENDER rather than present a dead control: a button that does
     // nothing when pressed reads as "the site is broken".
@@ -1710,15 +1774,51 @@
       try { navigator.clipboard.writeText($('netCode').textContent.trim()); netStatus('Code copied.', 'good'); } catch (e) {}
     });
     // An invitation looks like ?np=CODE — ps1_multiplayer.html forwards exactly
-    // that parameter here.
+    // that parameter here. Bare, it fills the code in and opens the panel on the
+    // JOIN side, and the visitor still presses Join themselves.
+    //
+    // ---- ?np=<code>&game=<label>&host=1 | &join=1: HANDED OVER FROM THE LOBBY
+    // multiplayer.html mints the code so it can be read aloud before anything
+    // loads, and hands EVERYONE here — under lockstep a joiner runs their own
+    // core, so both sides need this page. `host=1` opens the room under the
+    // lobby's code instead of minting one; `join=1` joins it with no further
+    // click. The disc is preselected FIRST either way (netPreselectGame): the
+    // room reads the page's picker, and a room opened under the wrong label
+    // refuses the very player it was made for.
+    // ⚠ A LINK NAMING A DISC THIS PAGE HAS NOT GOT OPENS NO ROOM. Hosting
+    // under whatever happened to be selected would seat the joiner on the wrong
+    // disc and the start barrier would then refuse both of them — so the
+    // panel says so and falls back to the bare behaviour, where the visitor
+    // picks.
     try {
-      var np = new URLSearchParams(location.search).get('np');
+      var npq = new URLSearchParams(location.search);
+      var np = npq.get('np');
+      if (np != null) NET.handoff = { code: np.toUpperCase(), game: npq.get('game'), host: npq.get('host') === '1', join: npq.get('join') === '1' };
       if (np && /^[A-HJ-NP-Z2-9]{5}$/i.test(np)) {
+        // netOpen() first: it is what populates #netGame (see netPreselectGame).
         netOpen();
-        $('netJoinBtn').classList.add('on');
-        $('netJoinPane').style.display = '';
-        $('netCodeIn').value = np.toUpperCase();
-        netStatus('You were invited to room ' + np.toUpperCase() + '. Pick the game they are on, then Join.');
+        var ho = NET.handoff;
+        var hoIdx = netPreselectGame(ho.game);
+        var hoUnknown = !!ho.game && hoIdx < 0;
+        if (ho.host && !hoUnknown) {
+          $('netHostBtn').classList.add('on'); $('netJoinBtn').classList.remove('on');
+          pageLog('[net] handed a room by the lobby: hosting ' + netGameId() + ' as ' + ho.code);
+          netStartHost(ho.code);
+        } else if (ho.join && hoIdx >= 0) {
+          // netStartGuest() reads the code and the disc out of the join pane's
+          // own controls — the ones a person types into — so the hand-off fills
+          // those rather than growing a second path that could drift from them.
+          $('netJoinBtn').click();
+          $('netCodeIn').value = ho.code;
+          pageLog('[net] handed a room by the lobby: joining ' + ROMS[hoIdx].label + ' as ' + ho.code);
+          netStartGuest();
+        } else {
+          $('netJoinBtn').classList.add('on');
+          $('netJoinPane').style.display = '';
+          $('netCodeIn').value = np.toUpperCase();
+          netStatus('You were invited to room ' + np.toUpperCase() + '. Pick the game they are on, then Join.');
+          if (hoUnknown) netStatus('The link names "' + ho.game + '", which is not on this page. Pick the game the other player is on, then Join.', 'bad');
+        }
       }
     } catch (e) {}
   })();
@@ -1733,6 +1833,10 @@
       supported: netSupported(),
       architecture: 'lockstep',
       mode: NET.session ? (NET.role || 'in-room') : 'none',
+      // What the URL handed over — { code, game, host, join } — or null when it
+      // carried no ?np=, so a rig can see what the page PARSED, not only what it
+      // did about it.
+      handoff: NET.handoff,
       live: renderFrames > 0 || (window.__ps1Frames | 0) > 0,
       armed: LS.armed,
       running: LS.running,

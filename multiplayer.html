@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Play Online — any console, any game</title>
+<!--
+  multiplayer.html — ONE FRONT DOOR FOR EVERY ROOM ON THE SITE.
+
+  WHAT IT IS. A lobby, and only a lobby. The host picks ANY console and ANY game
+  the site can run online, opens a party, and gets a five-character code plus an
+  invite link. Everyone — host and joiners alike — is then handed to the page
+  that actually runs that console, with the code in the URL. Under lockstep
+  (user directive 2026-09-08: "IT WILL BE AS IF MULTIPLAYER ARE ON THE SAME
+  CONSOLE") every player runs their own core and only pad bytes cross the wire,
+  so there is no second kind of machine: a joiner needs the emulator exactly as
+  much as the host does, and the ONLY thing this page decides is which page that
+  is and which flag marks the joiner.
+
+  WHY ONE PAGE. Before this there were seven *_multiplayer.html files. Three
+  were real lobbies (dreamcast, n64, gamecube) and four were redirects, and the
+  n64 one's copied game list had already drifted two titles behind the page it
+  hands off to. A player also had to know which console's lobby to open before
+  they could join a friend — the code alone told them nothing. One page with one
+  catalogue, one invite-link format and one drift test replaces all of that. The
+  old lobbies stay as they are so links already shared keep working.
+
+  THE HAND-OFF CONTRACT, per console. lib/netplay.js REFUSES a pairing whose
+  game names differ, so every player must name the same key — and each page
+  names games differently, which is why the catalogue below carries the key the
+  page's own ?np= receiver matches on:
+     dreamcast  /dreamcast.html?np=CODE&game=<romSelect value>[&join=1]
+     n64        /n64/?np=CODE&game=<ROMS label>[&join=1]
+     gamecube   /gamecube.html?np=CODE&game=<ROMS label>[&join=1]
+     genesis    /genesis.html?np=CODE&game=<ROMS label>&host=1 | &join=1
+     snes       /snes.html?np=CODE&game=<ROMS label>&host=1 | &join=1
+     ps1        /ps1.html?np=CODE&game=<ROMS label>&host=1 | &join=1
+  The three cartridge pages take an explicit &host=1 because their bare ?np=
+  receiver predates this page and means "fill the JOIN box"; changing that
+  meaning would break invitations already in the wild.
+
+  THE INVITE LINK. /multiplayer.html?np=CODE&sys=<console>&game=<key>. Opening it
+  lands on the Join card with everything preset, so a joiner needs to know
+  nothing but that they were invited. A bare code still works — the joiner picks
+  the console and game the host told them — because a code read out over a call
+  is how most rooms will be shared.
+
+  ⚠ WHY NO SESSION IS OPENED HERE — FOR EITHER SIDE. Creating the Netplay.Session
+  on this page and then navigating would tear down the RTCPeerConnection, the
+  DataChannel and the signalling socket, and leave the other player holding a
+  code that leads nowhere. This page MINTS or READS a code; the emulator page
+  opens the room under that exact code. lib/netplay-ui.js is therefore not
+  loaded (its contract hands a LIVE session to a page that keeps it).
+
+  ⚠ THE LISTS BELOW ARE COPIES, AND tools/multiplayer_page_test.mjs IS WHAT KEEPS
+  THEM HONEST. Fetching six emulator pages to read their ROMS[] arrays would
+  cost a lobby the whole site; a copy costs nothing until it drifts, and the
+  test FAILS on drift against every page's live list, in order.
+
+  NO coi-serviceworker.js ON PURPOSE. Cross-origin isolation buys
+  SharedArrayBuffer, which a lobby has no use for, and the script's registration
+  forces a page reload that has already produced phantom "Execution context
+  destroyed" failures in the rigs.
+-->
+<script src="/lib/netplay.js?v=fb6cec45"></script>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; background: #0b0d10; color: #e8e8e8;
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  a { color: #7cc; }
+  #wrap { max-width: 600px; margin: 0 auto; padding: 28px 16px 56px; }
+  h1 { font-size: 22px; margin: 0 0 6px; }
+  .lede { color: #9aa; font-size: 13.5px; margin: 0 0 22px; }
+  .card { background: #141820; border: 1px solid #232a35; border-radius: 12px;
+          padding: 16px; margin-bottom: 14px; }
+  .card h2 { font-size: 15px; margin: 0 0 10px; color: #cde; }
+  label { display: block; font-size: 12.5px; color: #9aa; margin: 10px 0 4px; }
+  select, input { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #2c3542;
+                  background: #0e1218; color: #e8e8e8; font-size: 15px; }
+  select:disabled, input:disabled { opacity: .7; }
+  button { min-height: 44px; padding: 10px 16px; border-radius: 9px; border: 1px solid #35506b;
+           background: #17324b; color: #dbe9f7; font-size: 14.5px; cursor: pointer; }
+  button:hover { background: #1d3e5d; }
+  button.sec { background: #171b22; border-color: #2c3542; color: #b9c4d1; }
+  button:disabled { opacity: .45; cursor: default; }
+  .row { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+  .row button { flex: 1; min-width: 140px; }
+  /* The console picker is a row of chips, not a <select>: six choices fit on a
+     phone and a player can see every console at once instead of opening a list
+     to find out what is even offered. */
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip { flex: 1 1 calc(33% - 8px); min-width: 120px; min-height: 44px; padding: 8px 10px;
+          border-radius: 9px; border: 1px solid #2c3542; background: #0e1218; color: #cfd8e3;
+          font-size: 14px; text-align: left; }
+  .chip small { display: block; color: #7f8b99; font-size: 11.5px; margin-top: 2px; }
+  .chip[aria-pressed="true"] { border-color: #4d8fd6; background: #17324b; color: #fff; }
+  .chip[disabled] { opacity: .45; cursor: default; }
+  #code { font: 700 34px/1.1 ui-monospace, SFMono-Regular, Menlo, monospace;
+          letter-spacing: 6px; text-align: center; padding: 14px 0 6px; color: #9fe0a0; }
+  .hint { font-size: 12.5px; color: #8d99a8; }
+  .warn { font-size: 12.5px; color: #e5c07b; }
+  .invited { font-size: 13.5px; color: #cfe6d0; background: #10221a; border: 1px solid #245c3a;
+             border-radius: 9px; padding: 10px 12px; margin-bottom: 12px; }
+  /* ⚠ PANES HIDE ON [hidden], NEVER ON A BARE #id RULE. dreamcast_multiplayer.html
+     records the trap: a stylesheet `display:none` plus `el.style.display = ''` in
+     script reveals NOTHING — clearing the inline style hands the element straight
+     back to the rule — and the lobby minted a code and hid the only control that
+     carried it. removeAttribute('hidden') is one state, in the DOM, with no race. */
+  [hidden] { display: none !important; }
+  code { color: #9cf; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h1>Play Online</h1>
+  <p class="lede">Any console, any game. Everyone runs the game on their own device, in lockstep —
+     only controller input crosses the network, so your own buttons are as immediate as they are offline.</p>
+
+  <div id="unsupported" class="card" hidden>
+    <h2>This browser cannot do online play</h2>
+    <p class="hint" id="unsupportedWhy"></p>
+    <p class="hint"><a href="/playground.html">Play single player instead →</a></p>
+  </div>
+
+  <div id="invitedCard" class="card" hidden>
+    <div class="invited" id="invitedText"></div>
+    <div class="row">
+      <button id="btnInvitedJoin" type="button">Join and start my console</button>
+      <button id="btnInvitedPick" class="sec" type="button">That is not the game they meant</button>
+    </div>
+  </div>
+
+  <div id="pick" class="card">
+    <h2>1. Pick the console and the game</h2>
+    <label>Console</label>
+    <div class="chips" id="consoles"></div>
+    <label for="game">Game</label>
+    <select id="game"></select>
+    <p class="hint" id="sysNote"></p>
+    <div class="row">
+      <button id="btnHost" type="button">Open a party</button>
+      <button id="btnJoinPane" class="sec" type="button">I have a code</button>
+    </div>
+  </div>
+
+  <div id="hostPane" class="card" hidden>
+    <h2>2. Share this</h2>
+    <div id="code">-----</div>
+    <p class="hint">Read the code out, or send the link — the link already knows the console and the game.</p>
+    <label for="invite">Invite link</label>
+    <input id="invite" readonly>
+    <div class="row">
+      <button id="btnCopyLink" class="sec" type="button">Copy link</button>
+      <button id="btnCopy" class="sec" type="button">Copy code</button>
+      <button id="btnGo" type="button">Start my console</button>
+    </div>
+    <p class="hint" style="margin-top:12px">Pressing Start opens the emulator and the room.
+       Nobody's game begins until every player's console has finished loading —
+       that is the start barrier, and it is what makes frame 0 the same moment for everybody.</p>
+  </div>
+
+  <div id="joinPane" class="card" hidden>
+    <h2>2. Enter the room code</h2>
+    <label for="codeIn">Code</label>
+    <input id="codeIn" maxlength="5" autocapitalize="characters" autocomplete="off"
+           spellcheck="false" placeholder="ABCDE">
+    <p class="hint">Five characters. There is no I, O, 0 or 1 in a code. The console and game above
+       must be the ones the host picked.</p>
+    <p class="warn" id="joinWarn" hidden></p>
+    <div class="row">
+      <button id="btnJoin" type="button">Join and start my console</button>
+    </div>
+  </div>
+
+  <p class="hint"><a href="/playground.html">← All emulators</a></p>
+</div>
+
+<script>
+'use strict';
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var QS = new URLSearchParams(location.search);
+  var CODE_RE = /^[A-HJ-NP-Z2-9]{5}$/;
+
+  // NEVER RENDER WHAT CANNOT WORK. Same rule lib/netplay-ui.js and
+  // lib/capability.js apply: a control the visitor can press that does nothing
+  // reads as "the site is broken", which is worse than an honest explanation.
+  if (!window.Netplay || !Netplay.supported()) {
+    var missing = (typeof RTCPeerConnection !== 'function') ? 'WebRTC (RTCPeerConnection)'
+                : (typeof BroadcastChannel !== 'function') ? 'BroadcastChannel'
+                : 'the netplay library';
+    $('unsupportedWhy').textContent =
+      'Online play needs ' + missing + ', which this browser does not provide. ' +
+      'Single player does not need it and still works.';
+    $('pick').hidden = true;
+    $('unsupported').hidden = false;
+    window.__mp = function () { return { supported: false, missing: missing }; };
+    return;
+  }
+
+  // ---------------------------------------------------------------------------
+  // THE CATALOGUE. One entry per console the site can run online.
+  //
+  //   page     the emulator page that opens the room
+  //   handoff  the LITERAL hand-off prefix. tools/no_streaming_test.mjs requires
+  //            a lobby's hand-off to appear in LIVE code (comments stripped) and
+  //            matches on it — a URL assembled from fragments would pass a grep
+  //            in a comment and strand every player in practice.
+  //   hostFlag what marks the HOST on that page's ?np= receiver ('' where a
+  //            bare ?np=&game= already means "host", as on dreamcast/n64/gamecube)
+  //   games    [{ key, label }] — `key` is what goes in &game= and what
+  //            lib/netplay.js compares; `label` is what the player reads.
+  //   players  seats that page's core can actually drive (tools/undelivered.mjs
+  //            'ports' entry records where each number comes from)
+  //   note     one line the picker shows for that console
+  // ---------------------------------------------------------------------------
+  var CONSOLES = [
+    { key: 'dreamcast', name: 'Dreamcast', page: '/dreamcast.html', handoff: '/dreamcast.html?np=', hostFlag: '',
+      players: 4, note: 'Four maple ports. Gauntlet Legends is the four-player co-op this path was built for.',
+      games: [
+        { key: 'pso2',        label: 'Phantasy Star Online Ver. 2 (USA)' },
+        { key: 'cannonspike', label: 'Cannon Spike (USA)' },
+        { key: 'sa2',         label: 'Sonic Adventure 2 (USA)' },
+        { key: 'gauntlet',    label: 'Gauntlet Legends (USA)' },
+        { key: 'mvc2',        label: 'Marvel vs. Capcom 2 (USA)' },
+      ] },
+    { key: 'n64', name: 'Nintendo 64', page: '/n64/', handoff: '/n64/?np=', hostFlag: '',
+      players: 4, note: 'Four controller ports.',
+      games: [
+        'Super Mario 64', 'Mario Kart 64', 'Zelda: Ocarina of Time', 'Paper Mario',
+        'Star Fox 64', 'Pokémon Snap', 'Donkey Kong 64', 'Banjo-Tooie',
+        "Conker's Bad Fur Day", 'Diddy Kong Racing', 'Star Wars Episode I: Racer',
+        "Cruis'n USA", 'NFL Blitz 2001', 'The New Tetris', 'Gauntlet Legends',
+        'ClayFighter 63⅓', 'Flying Dragon', 'Wheel of Fortune', 'Mario Party',
+        'Dinosaur Planet', 'Super Mario 64: Star Road', 'Zelda: The Missing Link',
+        'Banjo-Kazooie: Jiggies of Time', 'Banjo-Dreamie',
+        'Banjo-Kazooie: Christmas Edition', 'Star Fox: Survival',
+        'Super Mario Odyssey 64 (hack)',
+      ].map(function (l) { return { key: l, label: l }; }) },
+    { key: 'gamecube', name: 'GameCube', page: '/gamecube.html', handoff: '/gamecube.html?np=', hostFlag: '',
+      players: 4,
+      // tools/undelivered.mjs 'gamecube-lockstep-is-mario-party-4-only': the
+      // frame gate is built on the recomp engine, and the recomp is the Mario
+      // Party 4 port. The other three titles run on the JIT path, which has no
+      // one-emulated-frame boundary to gate — so they are NOT offered here.
+      note: 'Only Mario Party 4 can run a room on GameCube — the other titles have no frame gate yet.',
+      games: [ { key: 'Mario Party 4', label: 'Mario Party 4' } ] },
+    { key: 'genesis', name: 'Sega Genesis', page: '/genesis.html', handoff: '/genesis.html?np=', hostFlag: 'host=1',
+      players: 2, note: 'Two players.',
+      games: [ 'Sonic the Hedgehog 3', 'X-Men' ].map(function (l) { return { key: l, label: l }; }) },
+    { key: 'snes', name: 'Super Nintendo', page: '/snes.html', handoff: '/snes.html?np=', hostFlag: 'host=1',
+      players: 2, note: 'Two players.',
+      games: [ 'SimCity' ].map(function (l) { return { key: l, label: l }; }) },
+    { key: 'ps1', name: 'PlayStation', page: '/ps1.html', handoff: '/ps1.html?np=', hostFlag: 'host=1',
+      players: 2, note: 'Two players. Only the host has to pick the disc number — everyone loads the same one.',
+      games: [
+        'Monster Rancher 2', 'Metal Gear Solid (Disc 1)', 'Metal Gear Solid (Disc 2)',
+        "Harry Potter & the Sorcerer's Stone", 'Legend of Dragoon (Disc 1)',
+        'Legend of Dragoon (Disc 2)', 'Legend of Dragoon (Disc 3)', 'Legend of Dragoon (Disc 4)',
+      ].map(function (l) { return { key: l, label: l }; }) },
+    // gba.html's own header: the core cannot carry lockstep — one KEYINPUT
+    // register, _emuRunFrame takes no player index, and there is no link cable
+    // to be a second machine with. Listed so a visitor is TOLD, not left to
+    // wonder why it is missing.
+    { key: 'gba', name: 'Game Boy Advance', page: '/gba.html', handoff: null, hostFlag: '',
+      players: 1, note: 'No online play — a Game Boy Advance has one controller and no link cable here.',
+      games: [] },
+  ];
+  var BY_KEY = {};
+  CONSOLES.forEach(function (c) { BY_KEY[c.key] = c; });
+
+  // BroadcastChannel pairs two tabs in ONE browser with no third party, which is
+  // what the headless rigs use; PeerJS's public broker is what pairs two
+  // DEVICES. Default to the one real players need and carry the choice across
+  // the hand-off — identical spelling to every emulator page's netTransport().
+  var transport = QS.get('net') === 'local' ? 'local' : 'peerjs';
+
+  var sys = null;                 // the CONSOLES entry currently picked
+  var code = null;                // minted by "Open a party"
+  var chips = {};
+
+  function gameOf(c, key) {
+    for (var i = 0; i < c.games.length; i++) if (c.games[i].key === key) return c.games[i];
+    return null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // WHERE EVERYBODY ENDS UP. `join` is the whole difference between the two
+  // sides: under lockstep both boot a core and the flag only decides which one
+  // opens the room and which one knocks on it. The three cartridge pages need
+  // an explicit host flag — see the header.
+  // ---------------------------------------------------------------------------
+  function emulatorUrl(c, gameKey, theCode, join) {
+    if (!c || !c.handoff) return null;
+    var u = c.handoff + encodeURIComponent(theCode) + '&game=' + encodeURIComponent(gameKey);
+    if (join) u += '&join=1';
+    else if (c.hostFlag) u += '&' + c.hostFlag;
+    if (transport === 'local') u += '&net=local';
+    return u;
+  }
+  function inviteUrl(c, gameKey, theCode) {
+    var u = location.origin + '/multiplayer.html?np=' + encodeURIComponent(theCode)
+          + '&sys=' + encodeURIComponent(c.key) + '&game=' + encodeURIComponent(gameKey);
+    if (transport === 'local') u += '&net=local';
+    return u;
+  }
+
+  // ---- the console chips + game picker ---------------------------------------
+  var sel = $('game');
+  CONSOLES.forEach(function (c) {
+    var b = document.createElement('button');
+    b.type = 'button'; b.className = 'chip';
+    b.innerHTML = '<span></span><small></small>';
+    b.firstChild.textContent = c.name;
+    b.lastChild.textContent = c.games.length
+      ? (c.games.length + (c.games.length === 1 ? ' game' : ' games') + ' · up to ' + c.players + ' players')
+      : 'not online';
+    b.setAttribute('aria-pressed', 'false');
+    if (!c.games.length) b.disabled = true;
+    b.addEventListener('click', function () { pickConsole(c.key); });
+    chips[c.key] = b;
+    $('consoles').appendChild(b);
+  });
+
+  function pickConsole(key, preferGame) {
+    var c = BY_KEY[key];
+    if (!c || !c.games.length) return false;
+    sys = c;
+    Object.keys(chips).forEach(function (k) { chips[k].setAttribute('aria-pressed', k === key ? 'true' : 'false'); });
+    sel.innerHTML = '';
+    c.games.forEach(function (g) {
+      var o = document.createElement('option');
+      o.value = g.key; o.textContent = g.label;
+      sel.appendChild(o);
+    });
+    // Gauntlet Legends is the co-op target on both consoles that have it.
+    var dflt = gameOf(c, preferGame) ? preferGame
+             : gameOf(c, 'gauntlet') ? 'gauntlet'
+             : gameOf(c, 'Gauntlet Legends') ? 'Gauntlet Legends'
+             : c.games[0].key;
+    sel.value = dflt;
+    $('sysNote').textContent = c.note || '';
+    return true;
+  }
+
+  // ?sys=&game= preselects (an emulator page's "Play Online" can name itself);
+  // the default is the Dreamcast, whose four-port co-op is what this exists for.
+  var preSys = QS.get('sys'), preGame = QS.get('game');
+  if (!pickConsole(preSys, preGame)) pickConsole('dreamcast', preGame);
+
+  // ---- host ------------------------------------------------------------------
+  function showHost() {
+    $('hostPane').hidden = false;
+    $('joinPane').hidden = true;
+    $('code').textContent = code;
+    $('invite').value = inviteUrl(sys, sel.value, code);
+  }
+  $('btnHost').addEventListener('click', function () {
+    code = Netplay.makeCode(5);
+    showHost();
+  });
+  // Changing the game after minting must re-point the link — the link IS the
+  // game choice for whoever opens it.
+  sel.addEventListener('change', function () { if (code && !$('hostPane').hidden) $('invite').value = inviteUrl(sys, sel.value, code); });
+
+  function copy(text, btn, was) {
+    // ⚠ writeText REJECTS A PROMISE, it does not throw. A bare try/catch would
+    // report "Copied" on a browser that refused the clipboard.
+    var done = function (ok) {
+      btn.textContent = ok ? 'Copied' : 'Copy failed — read it out';
+      setTimeout(function () { btn.textContent = was; }, 1800);
+    };
+    try { navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); }); }
+    catch (e) { done(false); }
+  }
+  $('btnCopy').addEventListener('click', function () { if (code) copy(code, $('btnCopy'), 'Copy code'); });
+  $('btnCopyLink').addEventListener('click', function () { if (code) copy($('invite').value, $('btnCopyLink'), 'Copy link'); });
+  $('btnGo').addEventListener('click', function () {
+    if (!code || !sys) return;
+    location.href = emulatorUrl(sys, sel.value, code, false);
+  });
+
+  // ---- join ------------------------------------------------------------------
+  $('btnJoinPane').addEventListener('click', function () {
+    $('joinPane').hidden = false;
+    $('hostPane').hidden = true;
+    $('codeIn').focus();
+  });
+  function tryJoin(raw) {
+    var v = (raw || '').trim().toUpperCase();
+    var warn = $('joinWarn');
+    // The same alphabet every page's netStartGuest() enforces. Refusing a
+    // malformed code HERE means the player is told on the page they typed it
+    // on, rather than after a hand-off into an emulator that then cannot pair.
+    if (!CODE_RE.test(v)) {
+      warn.hidden = false;
+      warn.textContent = 'That does not look like a code — five characters, and no I, O, 0 or 1.';
+      return false;
+    }
+    warn.hidden = true;
+    location.href = emulatorUrl(sys, sel.value, v, true);
+    return true;
+  }
+  $('btnJoin').addEventListener('click', function () { tryJoin($('codeIn').value); });
+  $('codeIn').addEventListener('keydown', function (e) { if (e.key === 'Enter') tryJoin($('codeIn').value); });
+
+  // ---- an invitation: /multiplayer.html?np=CODE&sys=<console>&game=<key> ------
+  // Everything is known, so the joiner is shown ONE button. The pickers stay on
+  // the page underneath — "that is not the game they meant" reveals them — so a
+  // host who changed their mind after sending the link does not strand anyone.
+  var invited = null;
+  (function () {
+    var np = (QS.get('np') || '').toUpperCase();
+    if (!CODE_RE.test(np)) return;
+    var c = BY_KEY[preSys || ''];
+    var g = c ? gameOf(c, preGame || '') : null;
+    if (!c || !c.games.length || !g) {
+      // A code with no (or an unknown) game: the join pane, code filled in, and
+      // the player picks what the host told them.
+      $('joinPane').hidden = false;
+      $('codeIn').value = np;
+      if (preSys || preGame) {
+        $('joinWarn').hidden = false;
+        $('joinWarn').textContent = 'The link named a game this site does not offer online' +
+          (preSys ? ' on ' + preSys : '') + ' — pick the console and game the host is on.';
+      }
+      return;
+    }
+    invited = { code: np, sys: c.key, game: g.key };
+    $('invitedText').textContent = 'You are invited to ' + g.label + ' on the ' + c.name +
+      ' — room ' + np + '. Your own console loads the game; nothing starts until everyone is in.';
+    $('invitedCard').hidden = false;
+    $('pick').hidden = true;
+    $('btnInvitedJoin').addEventListener('click', function () { tryJoin(np); });
+    $('btnInvitedPick').addEventListener('click', function () {
+      $('invitedCard').hidden = true;
+      $('pick').hidden = false;
+      $('joinPane').hidden = false;
+      $('codeIn').value = np;
+    });
+  })();
+
+  // ---------------------------------------------------------------------------
+  // TEST SEAM. tools/multiplayer_page_test.mjs reads the catalogue through it
+  // and compares every list against the page it hands off to.
+  // ---------------------------------------------------------------------------
+  window.__mp = function () {
+    return {
+      supported: true,
+      architecture: 'lockstep',      // there is no streaming path on this page
+      transport: transport,
+      consoles: CONSOLES.map(function (c) {
+        return { key: c.key, page: c.page, handoff: c.handoff, hostFlag: c.hostFlag,
+                 players: c.players, games: c.games.map(function (g) { return g.key; }) };
+      }),
+      sys: sys ? sys.key : null,
+      game: sel.value,
+      code: code,
+      hostUrl: code ? emulatorUrl(sys, sel.value, code, false) : null,
+      joinUrl: code ? emulatorUrl(sys, sel.value, code, true) : null,
+      invite: code ? inviteUrl(sys, sel.value, code) : null,
+      invited: invited,
+    };
+  };
+  // The catalogue itself, for a rig that runs WITHOUT a browser (the drift test
+  // parses this file with a regex and needs one anchor it can find).
+  window.__mpCatalog = CONSOLES;
+})();
+</script>
+</body>
+</html>

@@ -32,7 +32,7 @@ const PAGES = [
   'gba.html', 'genesis.html', 'n64/index.html',
   'dreamcast_multiplayer.html', 'gamecube_multiplayer.html', 'ps1_multiplayer.html',
   'snes_multiplayer.html', 'genesis_multiplayer.html', 'gba_multiplayer.html',
-  'n64_multiplayer.html',
+  'n64_multiplayer.html', 'multiplayer.html',
 ];
 
 // Every library a page may pull a definition from. A name defined here is not

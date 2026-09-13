@@ -31,6 +31,7 @@ const PAGES = [
   'dreamcast_multiplayer.html', 'gamecube_multiplayer.html', 'ps1_multiplayer.html',
   'snes_multiplayer.html', 'gba_multiplayer.html', 'genesis_multiplayer.html',
   'n64_multiplayer.html',
+  'multiplayer.html',
 ];
 
 // Machinery that only exists to stream one machine's picture to another. Each
@@ -73,6 +74,16 @@ const LOBBY_HANDOFF = {
   'n64_multiplayer.html':      { to: 'n64/index.html',   link: /\/n64\/\?np=|'\/n64\/'/ },
   'dreamcast_multiplayer.html':{ to: 'dreamcast.html',   link: /dreamcast\.html\?np=/ },
   'gamecube_multiplayer.html': { to: 'gamecube.html',    link: /gamecube\.html\?np=/ },
+  // THE ONE-URL LOBBY hands off to EVERY console page, so it carries one
+  // target per console and must show every hand-off literally.
+  'multiplayer.html': { to: 'every console page', targets: [
+    { to: 'dreamcast.html', link: /\/dreamcast\.html\?np=/ },
+    { to: 'n64/index.html', link: /\/n64\/\?np=/ },
+    { to: 'gamecube.html',  link: /\/gamecube\.html\?np=/ },
+    { to: 'genesis.html',   link: /\/genesis\.html\?np=/ },
+    { to: 'snes.html',      link: /\/snes\.html\?np=/ },
+    { to: 'ps1.html',       link: /\/ps1\.html\?np=/ },
+  ] },
 };
 
 let fail = 0, scoped = 0, skipped = 0;
@@ -117,8 +128,10 @@ for (const p of PAGES) {
   } else if (lobby) {
     // A lobby passes on the hand-off, and the hand-off must be REAL: the URL it
     // sends players to has to appear in live code, not in a comment.
-    if (!lobby.link.test(live)) {
-      console.log(`  FAIL  ${p} — a lobby must hand players to ${lobby.to}, and no such hand-off is in its live code`);
+    const targets = lobby.targets || [lobby];
+    const missing = targets.filter((t) => !t.link.test(live)).map((t) => t.to);
+    if (missing.length) {
+      console.log(`  FAIL  ${p} — a lobby must hand players to ${missing.join(', ')}, and no such hand-off is in its live code`);
       verdict[p] = false; fail++;
     } else {
       console.log(`  PASS  ${p} — lobby, no streaming machinery, hands off to ${lobby.to}`);
@@ -137,9 +150,11 @@ for (const p of PAGES) {
 // working front door onto a broken room.
 for (const [p, l] of Object.entries(LOBBY_HANDOFF)) {
   if (verdict[p] !== true) continue;
-  if (verdict[l.to] === false) {
-    console.log(`  FAIL  ${p} — hands off to ${l.to}, which does not pass this gate`);
-    fail++;
+  for (const t of (l.targets || [l])) {
+    if (verdict[t.to] === false) {
+      console.log(`  FAIL  ${p} — hands off to ${t.to}, which does not pass this gate`);
+      fail++;
+    }
   }
 }
 

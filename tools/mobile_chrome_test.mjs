@@ -223,6 +223,13 @@ const PAGES = [
   { name: 'n64_multiplayer', url: '/n64_multiplayer.html',
     lobby: { seam: '__n64mp', emu: '/n64/',
              chrome: ['#game', '#btnHost', '#btnJoinPane', '#wrap > .hint > a[href="/n64/"]'] } },
+  // THE ONE-URL LOBBY. Its default console is the Dreamcast, so the hand-off
+  // this cell checks lands on /dreamcast.html; the per-console hand-offs are
+  // tools/multiplayer_page_browser_test.mjs's job. The Back link has no id and
+  // is selected by href for the same reason as n64's above.
+  { name: 'multiplayer', url: '/multiplayer.html',
+    lobby: { seam: '__mp', emu: '/dreamcast.html',
+             chrome: ['#game', '#btnHost', '#btnJoinPane', '#wrap > .hint > a[href="/playground.html"]'] } },
   { name: 'gamecube_multiplayer', url: '/gamecube_multiplayer.html',
     staticChrome: ['a.cta', 'a[href="/gamecube.html"]'] },
   ...[['ps1', '/ps1.html'], ['snes', '/snes.html'],

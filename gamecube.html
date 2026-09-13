@@ -24,7 +24,7 @@
        machine boots the disc and the room exchanges nothing but pad bytes
        (tools/no_streaming_test.mjs machine-checks that). netplay-ui.js is the
        shared lobby; it renders nothing at all when Netplay.supported() is false. -->
-  <script src="/lib/netplay.js?v=a73964c3"></script>
+  <script src="/lib/netplay.js?v=fb6cec45"></script>
   <script src="/lib/netplay-ui.js"></script>
   <script>
     // NEVER PRESENT AN ENABLED START BEHIND A BROKEN PATH.
@@ -7802,6 +7802,45 @@ window.GcRate = (function () {
   // It is mounted HERE, outside engine(), so the button exists on a plain visit before any
   // disc has been fetched; see the GCROOM note inside engine().
   var GCROOM = { session: null, role: null };
+  // ---- ?np=<CODE>&game=<label>[&join=1]: HANDED OVER FROM THE LOBBY ----------------------
+  // multiplayer.html mints ONE code and sends every player to this page with it in the URL;
+  // under lockstep the joiner runs a core too, so both sides arrive here. dreamcast.html and
+  // n64/index.html already honour these three parameters; this is the GameCube receiver.
+  // A hand-off only presets what a person would otherwise do in the lobby panel — the code,
+  // Host/Join — and connects without the click (lib/netplay-ui.js: code / join / autoconnect).
+  // Without ?np= the mount below is exactly what it was.
+  // The game is named by its LABEL (ROMS[i].label), the way the lobby shows it; a bare index
+  // is accepted too. ROMS itself is a const inside the main IIFE — the recomp pin block above
+  // records that referencing it from here threw and killed the whole block — so the labels
+  // are read back off #romSelect, whose options populateRomSelect built FROM ROMS[i].label.
+  // ⚠ The room's game id stays 'MarioParty4' whatever the link names: the GameCube lockstep
+  // room is only known to work for Mario Party 4 (it routes to the recomp engine with no
+  // query parameter), and lib/netplay.js refuses a pairing whose game ids differ, so both
+  // sides naming one fixed id is what lets them pair at all.
+  // What was parsed is published for a rig; null on a visit without ?np=.
+  window.__gcNetHandoff = null;
+  function gcNetHandoff() {
+    var q = new URLSearchParams(location.search);
+    var code = (q.get('np') || '').trim().toUpperCase();
+    if (!/^[A-HJ-NP-Z2-9]{5}$/.test(code)) return null;
+    var game = q.get('game') || '';
+    var join = q.get('join') === '1';
+    var selects = [document.getElementById('romSelect'), document.getElementById('mobileRomSelect')].filter(Boolean);
+    var opts = selects.length ? selects[0].options : [];
+    var romIdx = -1;
+    for (var oi = 0; oi < opts.length; oi++) if (opts[oi].textContent === game) { romIdx = oi; break; }
+    if (romIdx < 0 && /^\d+$/.test(game) && +game < opts.length) romIdx = +game;
+    if (romIdx >= 0) {
+      // 'change', not just .value: populateRomSelect's listener is what persists gcwasm_romIdx
+      // and mirrors the other select, and assigning .value alone fires nothing.
+      selects.forEach(function (s) { s.value = String(romIdx); s.dispatchEvent(new Event('change')); });
+    } else {
+      console.log('[gc-lockstep] the link named a game that is not on this page: ' +
+                  (game ? '"' + game + '"' : '(no game given)') +
+                  ' — leaving the ROM select as it was; the room still opens as ' + code);
+    }
+    return { code: code, game: game, join: join, romIdx: romIdx };
+  }
   function gcNetTransport() {
     return new URLSearchParams(location.search).get('net') === 'local' ? 'local' : 'peerjs';
   }
@@ -7815,13 +7854,23 @@ window.GcRate = (function () {
     } catch (e) { console.log('[gc-lockstep] could not start the disc: ' + e); }
   }
   function gcNetMount() {
+    // Parsed BEFORE the support gate so the ROM preselect and __gcNetHandoff happen on a
+    // browser that cannot pair at all — the person still picked that game.
+    var handoff = window.__gcNetHandoff = gcNetHandoff();
     if (!window.NetplayUI || !window.Netplay || !window.Netplay.supported()) return;
     try {
-      NetplayUI.mount({
+      var mountOpts = {
         game: 'MarioParty4', transport: gcNetTransport(),
         onSession: function (sess, role) { GCROOM.session = sess; GCROOM.role = role; },
         onReady: gcNetOnReady,
-      });
+      };
+      if (handoff) {
+        mountOpts.code = handoff.code; mountOpts.join = handoff.join; mountOpts.autoconnect = true;
+        console.log('[gc-lockstep] handed a room by the lobby: ' + (handoff.join ? 'joining' : 'hosting') +
+                    ' as ' + handoff.code + ' via ' + gcNetTransport() +
+                    (handoff.romIdx >= 0 ? ', ROM #' + handoff.romIdx + ' (' + handoff.game + ')' : ''));
+      }
+      NetplayUI.mount(mountOpts);
     } catch (e) { console.log('[gc-lockstep] lobby did not mount: ' + e); }
   }
   gcNetMount();

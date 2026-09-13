@@ -116,6 +116,27 @@ const HARNESSES = [
     fast: true, ci: true, server: false, requires: ['dreamcast.html', 'lib/netplay.js'], timeoutMs: 2 * MIN,
   },
   {
+    name: 'multiplayer-page',
+    file: 'tools/multiplayer_page_test.mjs',
+    cmd: ['node', 'tools/multiplayer_page_test.mjs'],
+    desc: 'the one-URL lobby (multiplayer.html) copies every console\'s game list and hands off to six pages — this parses its catalogue and each page\'s live ROMS[]/romSelect, in order, and FAILS on drift (lib/netplay.js refuses a pairing whose game names differ, so a drifted key fails the room with "the other player is on <game>"); it also proves each page\'s ?np= receiver reads every parameter the lobby sends, incl. host=1 on the cartridge pages',
+    fast: true, ci: true, server: false, requires: ['multiplayer.html'], timeoutMs: 2 * MIN,
+  },
+  {
+    name: 'multiplayer-page-browser',
+    file: 'tools/multiplayer_page_browser_test.mjs',
+    cmd: ['node', 'tools/multiplayer_page_browser_test.mjs'],
+    desc: 'the one-URL lobby driven in Chrome: every control reachable (the [hidden] trap that hid a minted code on dreamcast_multiplayer.html), Open a party mints a code and an invite link, Start and Join really NAVIGATE to each of the six console pages under that exact code and game (navigations answered 204 so nothing boots), an invite link opened cold on a phone lands on one Join button, and a browser without WebRTC gets the explanation and no controls',
+    fast: true, ci: true, server: true, requires: ['multiplayer.html'], timeoutMs: 8 * MIN,
+  },
+  {
+    name: 'gc-np-handoff',
+    file: 'tools/gc_np_handoff_test.mjs',
+    cmd: ['node', 'tools/gc_np_handoff_test.mjs'],
+    desc: 'gamecube.html honours the lobby hand-off: ?np=<code>&game=<label>[&join=1] preselects the ROM on both selects (and persists it), mounts the shared lobby under THAT code on the right side, and a link naming a game not on the page still mounts and says so',
+    fast: true, ci: true, server: true, requires: ['gamecube.html', 'lib/netplay-ui.js'], timeoutMs: 8 * MIN,
+  },
+  {
     name: 'undefined-calls',
     file: 'tools/undefined_call_scan.mjs',
     cmd: ['node', 'tools/undefined_call_scan.mjs'],
