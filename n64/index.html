@@ -3746,8 +3746,9 @@ N64Rate.selfTest = function (logFn) {
         var ls = sess.ls;
         if (ls && ls.isHost && typeof sess.rttReport === 'function') {
           var rep = await sess.rttReport(600);
+          // Clamp matches the engine (Lockstep.recommendDelay answers up to 30): capping at 10 threw the engine's own answer away — see dreamcast.html chooseDelay, "Capping BELOW what the engine supports".
           var want = (rep && rep.recommendedDelay != null)
-            ? Math.max(1, Math.min(10, rep.recommendedDelay | 0)) : null;
+            ? Math.max(1, Math.min(30, rep.recommendedDelay | 0)) : null;
           if (want != null && want !== ls.delay) {
             pageLog('[lockstep] input delay ' + ls.delay + ' -> ' + want + ' frames, chosen from the '
                   + 'worst measured RTT ' + (rep.worstMs == null ? '?' : Math.round(rep.worstMs)) + ' ms');
