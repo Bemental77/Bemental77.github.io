@@ -117,6 +117,69 @@ console.log('\n== the lobby: nobody starts until everybody is ready, on the same
   is('wrong-disc-peer-state', b.A.state, 'failed');
 }
 {
+  // ⚠ A HOST ALONE NEVER STARTS — even with two pads plugged in. The pages now
+  // declare ready BY THEMSELVES the moment a core is loaded (the user's
+  // directive: no ready button, the room starts when both are able), so this
+  // is the only thing standing between 'the host's disc finished first' and a
+  // party of one that then refuses everybody else as a late joiner —
+  // n64/index.html records that exact failure from an earlier auto-ready cut.
+  const b = room([{ id: 'H', host: true }, { id: 'A' }]);
+  const bars = [];
+  b.H.on('barrier', (x) => bars.push(x));
+  b.H.seat('H', 2);                         // couch host: two ports, ONE person
+  b.H.declareReady('g');
+  is('lone-host-holds', b.H.state, 'waiting');
+  is('lone-host-runs-nothing', b.H.beginFrame({ 0: pad(1), 1: pad(2) }).reason, 'not-started');
+  const last = bars[bars.length - 1];
+  last && last.alone === true && last.waitingFor.length === 0
+    ? ok('lone-host-barrier-says-alone', 'lsbar carries alone:true with nobody missing — the panel can say "waiting for another player"')
+    : bad('lone-host-barrier-says-alone', JSON.stringify(last));
+  b.H.seat('A', 1); b.A.declareReady('g');
+  b.engines.every((e) => e.state === 'running') ? ok('second-peer-releases', 'the room started by itself once two PEOPLE were in and loaded')
+                                                : bad('second-peer-releases', b.engines.map((e) => e.state).join(','));
+  is('second-peer-not-late', b.A.localPorts.length, 1);
+}
+{
+  // THE BARRIER IS A FUNCTION OF THE ROSTER. Declares are irrevocable, so a
+  // room whose still-loading third player LEFT used to sit forever with two
+  // able consoles: nothing could declare again, so nothing re-checked.
+  const b = room([{ id: 'H', host: true }, { id: 'A' }, { id: 'B' }]);
+  b.H.seat('H', 1); b.H.seat('A', 1); b.H.seat('B', 1);
+  b.H.declareReady('g'); b.A.declareReady('g');
+  is('three-room-holds-for-the-loader', b.H.state, 'waiting');
+  b.H.unseat('B');
+  b.H.state === 'running' && b.A.state === 'running'
+    ? ok('loader-leaving-releases-the-able-two', 'unseat re-ran the barrier; nobody had to declare again')
+    : bad('loader-leaving-releases-the-able-two', b.H.state + ',' + b.A.state);
+}
+{
+  // A PAGE THAT CAME BACK IS NOT THE PAGE THAT DECLARED. The host keeps the
+  // returning incarnation's seat but must forget its declare, or the barrier
+  // releases onto a core that is still loading.
+  const b = room([{ id: 'H', host: true }, { id: 'A' }]);
+  const bars = [];
+  b.H.on('barrier', (x) => bars.push(x));
+  b.H.seat('H', 1); b.H.seat('A', 1);
+  b.A.declareReady('g');
+  is('forget-ready-returns-had', b.H.forgetReady('A'), true);
+  b.H.declareReady('g');
+  is('forgotten-declare-holds-the-room', b.H.state, 'waiting');
+  eq('forgotten-peer-is-named-as-waiting', bars[bars.length - 1].waitingFor, ['A']);
+  eq('forgotten-peer-kept-its-seat', b.H.roster.slice(0, 2), ['H', 'A']);
+  b.A.declareReady('g');
+  is('re-declare-releases', b.H.state, 'running');
+  is('forget-ready-is-a-no-op-once-running', b.H.forgetReady('A'), false);
+}
+{
+  // `alone` is PUBLIC on report() so a party panel needs no private field.
+  const b = room([{ id: 'H', host: true }, { id: 'A' }]);
+  b.H.seat('H', 1); b.H.declareReady('g');
+  is('report-alone-true', b.H.report().alone, true);
+  b.H.seat('A', 1);
+  is('report-alone-false-after-second-seat', b.H.report().alone, false);
+  is('seat-rechecked-barrier-names-newcomer', b.H.report().readyPeers.indexOf('A'), -1);
+}
+{
   // One machine, two controllers: two players, two ports — NOT two pads OR'd
   // into one, which is what the page does today (dreamcast.html:4419-4424).
   const b = room([{ id: 'H', host: true }, { id: 'A' }]);
