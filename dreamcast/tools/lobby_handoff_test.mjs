@@ -44,10 +44,14 @@
 //   6. the joiner can be admitted by pressing a control a person can see;
 //   7. both rosters agree, and each side is told a DIFFERENT maple port —
 //      SEATED, WITH A PORT;
-//   8. GATED: with a disc loaded, lockstep is ARMED and the core is parked at
-//      frame 0, i.e. a core in a room runs ZERO free-running frames. Nobody
-//      presses "I'm ready" here, so the barrier must never release and the
-//      frame counter must stay at 0.
+//   8. GATED, AND THEN STARTED BY ITSELF: with a disc loaded on both, lockstep
+//      is ARMED on both, each console declares itself ready with nothing
+//      pressed, the barrier releases BY ITSELF, and no frame ran between the
+//      arm and the release (armedAtFrame / releasedAtFrame both 0). This cell
+//      used to be the inverse — "nobody presses I'm ready, so the barrier must
+//      never release" — and the Ready button it leaned on is gone (user,
+//      2026-09-13: "should start when both are able to start, instead of an
+//      I'm ready button and dumb conditions to start the damn game").
 //
 // ⚠ CELL 8 CURRENTLY FAILS, AND IT IS NOT THE HAND-OFF THAT FAILS IT.
 // Measured with the hand-off taken out of the picture completely — plain
@@ -322,9 +326,13 @@ const readRoster = (pg) => pg.evaluate(() => {
 // A seat somebody actually holds. The placeholder the page draws before the
 // engine publishes a room ("the session has not published a room yet") is NOT
 // a seat and must never be counted as one.
+// A free seat draws "—" in the who-column and "open" in the state column (the
+// page's seat vocabulary); the older who-text "open" is still excluded so a
+// row from either form never counts as a person.
 const occupied = (r) => (r && r.rows ? r.rows : [])
   .map((x, i) => ({ i, ...x }))
-  .filter((x) => x.who && !/^open$/i.test(x.who) && !/has not published a room/i.test(x.who));
+  .filter((x) => x.who && !/^(open|—)$/i.test(x.who) && !/\bfree\b/.test(x.cls || '') &&
+                 !/has not published a room/i.test(x.who));
 // WHICH PORT THIS MACHINE WAS TOLD IT HOLDS — from the HUD sentence a player
 // reads ("you are Player 2 (maple port 1)"), falling back to the roster row
 // this page marks "(you)". Both are DOM; neither asks the engine.
@@ -346,6 +354,10 @@ const probe = (pg) => pg.evaluate(() => {
     role: n ? n.role : null, netState: n ? n.state : null, code: n ? n.code : null,
     lockstep: n && n.lockstep
       ? { armed: n.lockstep.armed, running: n.lockstep.running, coreFrame: n.lockstep.coreFrame,
+          // The page's own record of the frame counter at the two moments
+          // cell 8 is about: when it armed the gate, and when the barrier
+          // released. Both must read 0 for "no frame ran before the release".
+          armedAtFrame: n.lockstep.armedAtFrame, releasedAtFrame: n.lockstep.releasedAtFrame,
           fault: n.lockstep.fault, normalize: n.lockstep.normalize }
       : null,
   };
@@ -566,7 +578,7 @@ async function findAdmitControl(pg) {
       voidc('a-core-in-a-room-is-GATED', 'not requested: pass --boot to load the disc on both machines and measure the frame gate');
       return;
     }
-    say(`\n-- both machines load ${GAME} and arm the gate (nobody presses "I'm ready", so the barrier must NOT release)`);
+    say(`\n-- both machines load ${GAME} and arm the gate — nobody presses anything: each console declares itself and the barrier releases BY ITSELF`);
     const deadline = Date.now() + BOOT_MS;
     const booted = [];
     for (const pg of pages) {
@@ -593,12 +605,32 @@ async function findAdmitControl(pg) {
         `not measurable: a disc never finished inside ${(BOOT_MS / 1000).toFixed(0)} s — ${J(booted.map(Boolean))}`);
       return;
     }
+    // ⚠ THE BARRIER RELEASES BY ITSELF — nobody presses anything, because
+    // there is nothing to press (user, 2026-09-13). Each side's
+    // `party.declared` flips by itself once it is able, and the host's barrier
+    // releases once both distinct peers have declared. Waited for, not slept:
+    // the host's declare rides an RTT probe (lsChooseDelay).
+    const partyOf = (pg) => pg.evaluate(() => (typeof window.__dcNetRoom === 'function' ? window.__dcNetRoom().party : null));
+    const released = await (async () => {
+      const dl = Date.now() + 45000;
+      while (Date.now() < dl) {
+        const rs = await Promise.all(pages.map(readRoster));
+        if (rs.every((r) => /Playing — everyone started together at frame/.test(r.barrier))) return rs;
+        await sleep(500);
+      }
+      return null;
+    })();
+    const parties = await Promise.all(pages.map(partyOf));
+    const barriersNow = released || await Promise.all(pages.map(readRoster));
+    RESULT.steps.party = { released: !!released, parties, barriers: barriersNow.map((r) => r.barrier) };
+    say(`  ....  party ${J(parties.map((p) => p && { state: p.state, declared: p.declared, able: p.able, alone: p.alone }))}`);
+    say(`  ....  barrier host "${barriersNow[0].barrier}" | join "${barriersNow[1].barrier}"`);
     await sleep(6000);
     const g1 = await Promise.all(pages.map(probe));
     await sleep(6000);
     const g2 = await Promise.all(pages.map(probe));
     RESULT.steps.gate = { first: g1, second: g2 };
-    say(`  ....  armed ${J(g2.map((p) => p.lockstep && p.lockstep.armed))} · coreFrame ${J(g1.map((p) => p.lockstep && p.lockstep.coreFrame))} -> ${J(g2.map((p) => p.lockstep && p.lockstep.coreFrame))}`);
+    say(`  ....  armed ${J(g2.map((p) => p.lockstep && p.lockstep.armed))} · armedAtFrame ${J(g2.map((p) => p.lockstep && p.lockstep.armedAtFrame))} · releasedAtFrame ${J(g2.map((p) => p.lockstep && p.lockstep.releasedAtFrame))} · coreFrame ${J(g1.map((p) => p.lockstep && p.lockstep.coreFrame))} -> ${J(g2.map((p) => p.lockstep && p.lockstep.coreFrame))}`);
     await shot(host, '5-gated'); await shot(join, '5-gated');
     const armed = g2.every((p) => p.lockstep && p.lockstep.armed === true);
     cell(armed,
@@ -614,22 +646,36 @@ async function findAdmitControl(pg) {
       'lazily-read disc, or simply a host who opens a room and waits — there is no engine to arm against and ' +
       'nothing ever re-arms. It needs a re-arm on the room becoming live, which is a change to the lockstep ' +
       'core and not to this hand-off.');
-    // ⚠ THIS CELL IS VOID WHEN THE GATE IS NOT ARMED, AND THE FIRST VERSION OF
-    // IT WAS NOT. LS.framesRun counts frames the core reported completing UNDER
-    // LOCKSTEP; an unarmed core is not feeding it at all, so it reads 0 for a
-    // core that is free-running as hard as it can. That produced a PASS reading
-    // "both cores are parked at frame 0" on the very run whose cell above had
-    // just failed for not being gated — a counter that cannot move being quoted
-    // as evidence that nothing moved.
+    cell(!!released && parties.every((p) => p && p.declared),
+      'the-barrier-releases-by-itself',
+      `both consoles declared themselves (${J(parties.map((p) => p && p.state))}) and both print the release with ` +
+      `nothing pressed: ${J(barriersNow.map((r) => r.barrier))}`,
+      `the barrier did not release by itself: barriers ${J(barriersNow.map((r) => r.barrier))}, party ${J(parties)} — ` +
+      'and there is no button left that could release it');
+    // ⚠ NO FRAME RAN BEFORE THE RELEASE. `armedAtFrame` is the lockstep frame
+    // counter the page recorded when it armed the gate and `releasedAtFrame`
+    // the same counter when the barrier released; both must be 0, or a core
+    // ran frames its partner never will. VOID when the gate is not armed —
+    // LS.framesRun counts frames run UNDER lockstep and reads 0 for an ungated
+    // core too, so on an unarmed core it is not evidence of anything (the
+    // first version of the old zero-frames cell passed on exactly that).
     if (!armed) {
-      voidc('a-gated-core-runs-ZERO-free-running-frames',
-        'not measurable: the gate is not armed (see above), and coreFrame only counts frames run UNDER lockstep — ' +
-        'it reads 0 for an ungated core too, so it is not evidence of anything here');
+      voidc('no-frame-ran-before-the-release',
+        'not measurable: the gate is not armed (see above), and the frame counters only count frames run UNDER ' +
+        'lockstep — they read 0 for an ungated core too, so they are not evidence of anything here');
+      voidc('the-cores-advance-together-after-the-release', 'not measurable: the gate is not armed (see above)');
     } else {
-      cell(g2.every((p) => p.lockstep && p.lockstep.coreFrame === 0),
-        'a-gated-core-runs-ZERO-free-running-frames',
-        `both cores are parked at frame 0 over 12 s with nobody ready: ${J(g1.map((p) => p.lockstep.coreFrame))} -> ${J(g2.map((p) => p.lockstep.coreFrame))}`,
-        `a core ran frames before the barrier released: ${J(g1.map((p) => p.lockstep.coreFrame))} -> ${J(g2.map((p) => p.lockstep.coreFrame))}`);
+      const pre = g2.map((p) => ({ armedAt: p.lockstep.armedAtFrame, releasedAt: p.lockstep.releasedAtFrame }));
+      cell(pre.every((x) => x.armedAt === 0 && x.releasedAt === 0),
+        'no-frame-ran-before-the-release',
+        `both cores armed at frame 0 and were still at frame 0 when the barrier released: ${J(pre)}`,
+        `a core ran frames between arming and the release: ${J(pre)} — two cores that have run different numbers ` +
+        'of frames are already forked');
+      cell(g2.every((p, i) => p.lockstep.running === true && (p.lockstep.coreFrame | 0) > (g1[i].lockstep.coreFrame | 0)),
+        'the-cores-advance-together-after-the-release',
+        `both cores are running past the barrier: core ran ${J(g1.map((p) => p.lockstep.coreFrame))} -> ${J(g2.map((p) => p.lockstep.coreFrame))}`,
+        `a core is not advancing after the release: running ${J(g2.map((p) => p.lockstep.running))}, core ran ` +
+        `${J(g1.map((p) => p.lockstep.coreFrame))} -> ${J(g2.map((p) => p.lockstep.coreFrame))}`);
     }
   } finally {
     RESULT.hostErrors = host.__errs.slice(0, 12);

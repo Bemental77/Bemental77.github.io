@@ -24,8 +24,8 @@
        machine boots the disc and the room exchanges nothing but pad bytes
        (tools/no_streaming_test.mjs machine-checks that). netplay-ui.js is the
        shared lobby; it renders nothing at all when Netplay.supported() is false. -->
-  <script src="/lib/netplay.js?v=fb6cec45"></script>
-  <script src="/lib/netplay-ui.js"></script>
+  <script src="/lib/netplay.js?v=40595af6"></script>
+  <script src="/lib/netplay-ui.js?v=66f15769"></script>
   <script>
     // NEVER PRESENT AN ENABLED START BEHIND A BROKEN PATH.
     // Measured on a desktop profile with no WebGPU adapter: this page logged
@@ -7470,6 +7470,9 @@ window.GcRate = (function () {
          + '(DolphinLibretro/Main.cpp:434-464) and the CPU runs free on its own pthread, so a '
          + 'frame gate would hold the picture while the guests diverged.',
       rom: (function () { var sel = $('romSelect'); return sel ? sel.value : null; })(),
+      // The party (the recomp block's room, gamecube.html gcNetParty): the one online path this
+      // page has. Null until that block has run; it is a separate script and defines the global.
+      party: (typeof window.__gcNetParty === 'function' ? window.__gcNetParty() : null),
     };
   };
 })();
@@ -7844,14 +7847,228 @@ window.GcRate = (function () {
   function gcNetTransport() {
     return new URLSearchParams(location.search).get('net') === 'local' ? 'local' : 'peerjs';
   }
+  // ---- THE ROOM PRESSES START ------------------------------------------------------------
+  // No click (user 2026-09-13): once the party has formed, this page presses its own Start.
+  // Two Starts, one per shell: the desktop button's click IS startEmulator (:7189); the mobile
+  // splash's is a pointerdown handler (:7403) that also copies the phone's ROM pick across, so
+  // when the splash is up that is the one to fire — .click() dispatches no pointerdown.
+  // ⚠ NEVER THROUGH A HOLD. aria-disabled is lib/capability.js's mark (the sole writer of it on
+  // these controls) and `disabled` is gcApplyStartGuard's; a Start either one is holding stays
+  // held, and the panel says so — the returned string — instead of this page pressing past it.
+  function gcNetPressStart() {
+    var splash = document.getElementById('mobileSplash');
+    var m = document.getElementById('mobileSplashStart'), d = document.getElementById('btnStart');
+    var mobileUp = !!(splash && m && splash.style.display === 'flex');
+    var b = mobileUp ? m : d;
+    if (!b) return 'this page has no Start button';
+    if (b.getAttribute('aria-disabled') === 'true' || b.disabled)
+      return 'Start is held on this device (' + (b.getAttribute('data-cap-blocked') || b.title || 'disabled') +
+             ') — the room will not press through it';
+    if (window.__gcStartedAtMs) return null;                       // already running
+    if (mobileUp && typeof PointerEvent === 'function')
+      b.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+    else b.click();
+    return null;
+  }
   function gcNetOnReady(session, role) {
     GCROOM.session = session; GCROOM.role = role;
     console.log('[gc-lockstep] room formed, role=' + role + ' — loading the disc on this machine; ' +
                 'the barrier holds frame 0 until every seated player has it');
+    var held = null;
+    try { held = gcNetPressStart(); } catch (e) { held = 'could not start the disc: ' + e; }
+    GCPARTY.held = held;
+    if (held) console.log('[gc-lockstep] ' + held);
+    gcNetPartySync();
+  }
+
+  // ---- THE PARTY PANEL: THE ROOM AS SEEN FROM THIS CONSOLE ---------------------------------
+  // lib/netplay-ui.js draws the rows and the button label; this block supplies what only the
+  // page knows — the disc's load, the credit gate (armed = loaded+gated → "ready", running →
+  // "playing"), the barrier's who-is-missing — in the shared vocabulary, plus the barrier
+  // sentence. ⚠ The gate lives INSIDE engine() (GCLS is built there, on Start), so it is read
+  // back through window.__gcLockstep(), the seam engine() publishes; engine() calls
+  // gcNetPartySync() itself at every transition, and a 1 s tick covers what no event carries.
+  var GCPARTY = { ui: null, loadPct: 0, said: null, held: null, rows: null, timer: 0 };
+  // ⚠ NEVER A NONCE ON SCREEN. A peer is 'host' (port 0) or 'player'; the roster holds
+  // 16-hex stableNonces and dreamcast's HUD once printed one ("P1 dc51b70458829649").
+  function gcNetWho(port, local) { return (port === 0 ? 'host' : 'player') + (local ? ' (you)' : ''); }
+  // Is this peer's link inside lib/netplay.js's DISCONNECT_GRACE window? Read off the link's
+  // own grace timer rather than remembered from the 'warning' event: the recovery (the pc
+  // reporting 'connected' again) clears that timer and emits nothing.
+  function gcNetLinkBlipped(s, peer) {
     try {
-      var b = document.getElementById('btnStart');
-      if (b && b.getAttribute('aria-disabled') !== 'true' && !b.disabled) b.click();
-    } catch (e) { console.log('[gc-lockstep] could not start the disc: ' + e); }
+      var it = s._links.values(), n;
+      while (!(n = it.next()).done) {
+        var L = n.value;
+        if (L && L.graceTimer && (!s.isHost || L.nonce === peer)) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+  function gcNetLocalState(g) {
+    if (g && g.running) return 'playing';
+    if (g && g.gated) return 'ready';
+    if (GCPARTY.loadPct >= 100) return 'loaded';       // disc in; gate not armed yet — or refused
+    if (GCPARTY.loadPct > 0 || window.__gcStartedAtMs) return 'loading ' + GCPARTY.loadPct + '%';
+    return 'connecting';
+  }
+  // `seat.ready` is the host's lobby (host-only, lib/netplay.js roomInfo); a guest reads the
+  // same fact off the host's broadcast barrier (`lsbar` → ls._bar): seated and not waited on.
+  function gcNetPeerState(seat, bar) {
+    if (seat.dropped) return 'disconnected';
+    var ready = seat.ready || !!(bar && bar.seated && bar.seated.indexOf(seat.peer) >= 0 &&
+                                 (bar.waitingFor || []).indexOf(seat.peer) < 0);
+    if (ready) return 'ready';
+    if (seat.load >= 100) return 'loaded';
+    if (seat.load > 0) return 'loading ' + seat.load + '%';
+    return 'connecting';
+  }
+  function gcNetPartyRows(s, g) {
+    var info; try { info = s.roomInfo(); } catch (e) { return null; }
+    var rows = [], p;
+    var roster = null; try { roster = s.ls ? s.ls.roster : null; } catch (e) {}
+    if (!roster || !roster.some(function (q) { return q != null; })) {
+      // ⚠ NO ROSTER YET, BUT THE LOAD MAY ALREADY BE UNDER WAY: a host alone (no engine until
+      // the first dc.onopen seats somebody — lib/netplay.js _onPeerUp), or a guest in the gap
+      // between its channel opening and the host's roster landing. MEASURED 2026-09-13:
+      // returning null here left the panel on the component's pre-party picture, and both
+      // consoles read "ready" / "Everyone is loaded — starting." for the ten seconds their
+      // discs were still loading. Host at 0, the paired player at 1, exactly as the engine
+      // will seat them (lowest-free-first, host first); the local seat from the gate and the
+      // load, the remote seat from the load it reported.
+      // ⚠ BRANCH ON THE ROSTER, NOT ON `info.state === 'idle'`. 'idle' is the engine's state
+      // until THIS console declares (Lockstep.declareReady → 'waiting'), while the host's engine
+      // — roster and all — exists from the first dc.onopen; so with three people in, the host
+      // read "2/4" over a port-2 row of "open" and the third player drew itself in the second
+      // player's seat. The roster is the fact.
+      var n = info.portCount || 2, meAt = info.host ? 0 : 1, otherAt = info.host ? 1 : 0;
+      var linked = s.state === 'connected';
+      var otherLoad = 0; try { s._load.forEach(function (v, k) { if (k !== info.me) otherLoad = v; }); } catch (e) {}
+      for (p = 0; p < n; p++) {
+        var st0 = 'open';
+        if (p === meAt) st0 = gcNetLocalState(g);
+        else if (p === otherAt && linked) st0 = otherLoad >= 100 ? 'loaded' : otherLoad > 0 ? 'loading ' + otherLoad + '%' : 'connecting';
+        // A guest still reaching for its host leaves that seat 'open': 'connecting' there counted
+        // as seated, and the seam read 2 seated / alone=false with nobody paired.
+        rows.push({ port: p, who: gcNetWho(p, p === meAt), state: st0 });
+      }
+      return rows;
+    }
+    var bar = gcNetBar(s);
+    for (p = 0; p < info.seats.length; p++) {
+      var seat = info.seats[p];
+      if (seat.peer == null) { rows.push({ port: p, who: gcNetWho(p, false), state: 'open' }); continue; }
+      var st;
+      if (seat.dropped != null) st = 'disconnected';      // a port gone limp mid-game is not 'playing'
+      else if (info.started) st = 'playing';
+      else if (seat.local) st = gcNetLocalState(g);
+      else if (gcNetLinkBlipped(s, seat.peer)) st = 'disconnected';
+      else st = gcNetPeerState(seat, bar);
+      rows.push({ port: p, who: gcNetWho(p, seat.local), state: st });
+    }
+    return rows;
+  }
+  function gcNetPartySentence(rows, g, bar, code) {
+    if (g && g.running) return 'Playing — everyone started together at frame ' + g.startFrame + '.';
+    if (g && g.fault && !g.gated) return '⚠ ' + g.fault;     // a genuine refusal keeps its sentence
+    if (GCPARTY.held) return GCPARTY.held;
+    var seated = rows.filter(function (r) { return r.state !== 'open'; });
+    if (seated.length < 2 || (bar && bar.alone))
+      return 'Waiting for another player — share the code ' + code + '. Starts by itself once two are in and loaded.';
+    var notReady = seated.filter(function (r) { return r.state !== 'ready'; });
+    if (notReady.length)
+      return 'Starts by itself when everyone is loaded — waiting for ' +
+             notReady.map(function (r) { return r.who; }).join(' and ') + '.';
+    return 'Everyone is loaded — starting.';
+  }
+  // The room, or null — and once the component has LET GO of the session (Leave closes it and
+  // nulls its handle), let go of it here too. ⚠ MEASURED 2026-09-13: GCROOM.session was never
+  // cleared, and the 1 s tick re-pushed the closed room's rows every second — the button read
+  // "Party" over rows saying "host (you) connecting" in a room that no longer existed, and the
+  // seam still named its code.
+  function gcNetRoom() {
+    var ui = GCPARTY.ui, s = GCROOM.session;
+    if (s && ui && ui.session !== s) {
+      GCROOM.session = GCROOM.role = null;
+      GCPARTY.said = GCPARTY.held = GCPARTY.rows = null;
+      ui.setRows(null);
+      return null;
+    }
+    return s;
+  }
+  function gcNetBar(s) {
+    // ⚠ PUBLIC, NOT PRIVATE. This read `s.ls._bar` in three places — the engine's
+    // own field, which a page has no contract with. lib/netplay.js now publishes
+    // the host's latest barrier verdict ({seated, ready, waitingFor, discs, alone})
+    // on roomInfo(), so that is what is read; the private field stays only as the
+    // fallback for an engine older than that (a cached lib on a phone).
+    try {
+      if (!s) return null;
+      var info = s.roomInfo ? s.roomInfo() : null;
+      if (info && info.barrier) return info.barrier;
+      return s.ls ? (s.ls._bar || null) : null;
+    } catch (e) { return null; }
+  }
+  function gcNetPartySync() {
+    var ui = GCPARTY.ui, s = gcNetRoom();
+    if (!ui || !s) return;
+    if (window.__gcStartedAtMs) GCPARTY.held = null;      // a Start that ran is not held
+    var g = null; try { g = window.__gcLockstep ? window.__gcLockstep() : null; } catch (e) {}
+    var rows = gcNetPartyRows(s, g);
+    GCPARTY.rows = rows;
+    ui.setRows(rows);
+    // The component's own words stand while the link is still forming or already gone
+    // ('Connecting…', 'Disconnected.', an error); the room's sentence is for a room.
+    if (s.state === 'closed' || s.state === 'failed') return;
+    if (s.state !== 'connected' && !s.ls) return;
+    var bar = gcNetBar(s);
+    var line = gcNetPartySentence(rows || ui.party().rows, g, bar, s.code);
+    if (line !== GCPARTY.said) { GCPARTY.said = line; ui.say(line, /^⚠|is held/.test(line)); }
+  }
+  // The seam: party = { code, seated, ports, state, alone, declared, able, autoStart, rows }, so
+  // a rig can assert the auto-declare and the auto-start without a button. A READ, NOT A PUSH:
+  // the rows are computed fresh and handed to the component to classify, never drawn — this used
+  // to call gcNetPartySync(), so reading the seam could rewrite the status line. engine() hands in
+  // its own gate fields (then this must not call back into __gcLockstep, which built them).
+  function gcNetParty(g) {
+    if (g === undefined) { try { g = window.__gcLockstep ? window.__gcLockstep() : null; } catch (e) { g = null; } }
+    var ui = GCPARTY.ui, s = gcNetRoom();
+    var rows = s ? gcNetPartyRows(s, g) : null;
+    var p = ui ? ui.party(rows) : { code: null, seated: 0, ports: 0, state: 'waiting', rows: rows || [] };
+    var bar = gcNetBar(s);
+    return {
+      code: s ? s.code : p.code, seated: p.seated, ports: p.ports, state: p.state,
+      alone: bar ? !!bar.alone : p.seated < 2,
+      declared: !!(g && g.declared), able: !!(g && g.gated), autoStart: true,
+      held: GCPARTY.held, loadPct: GCPARTY.loadPct, rows: p.rows,
+    };
+  }
+  window.__gcNetParty = function () { return gcNetParty(); };
+  function gcNetLoadProgress(pct) {
+    pct = Math.max(0, Math.min(100, pct | 0));
+    if (pct === GCPARTY.loadPct) return;
+    GCPARTY.loadPct = pct;
+    var s = GCROOM.session;
+    if (s && typeof s.setLoadProgress === 'function') { try { s.setLoadProgress(pct); } catch (e) {} }
+    gcNetPartySync();
+  }
+  function gcNetWatch(sess) {
+    // Deferred a tick: the page subscribes BEFORE lib/netplay-ui.js does (onSession runs first
+    // in its connect()), so a same-tick read would see the panel's state from before the event.
+    ['status', 'room', 'lockstep', 'warning', 'peer-joined', 'peer-left', 'barrier-failed'].forEach(function (ev) {
+      sess.on(ev, function () { setTimeout(gcNetPartySync, 0); });
+    });
+    // ⚠ PROGRESS REPORTED BEFORE THE LINK WAS UP NEVER REACHED THE PEER. The prefetch starts at
+    // engine() entry (:8962), before anyone has paired; setLoadProgress() records the value
+    // locally and drops the send, and then DEDUPS the next call with the same value
+    // (lib/netplay.js setLoadProgress `if (this._load.get(me) === v) return`) — so a console
+    // whose disc landed before the pair formed showed "connecting" on the other screen right
+    // up to "ready". Forget the recorded value on 'connected' and report it again.
+    sess.on('status', function (e) {
+      if (!e || e.state !== 'connected' || !GCPARTY.loadPct) return;
+      try { sess._load.delete((sess.ls && sess.ls.peerId) || sess._nonce); sess.setLoadProgress(GCPARTY.loadPct); } catch (err) {}
+    });
+    if (!GCPARTY.timer) GCPARTY.timer = setInterval(gcNetPartySync, 1000);
   }
   function gcNetMount() {
     // Parsed BEFORE the support gate so the ROM preselect and __gcNetHandoff happen on a
@@ -7861,7 +8078,7 @@ window.GcRate = (function () {
     try {
       var mountOpts = {
         game: 'MarioParty4', transport: gcNetTransport(),
-        onSession: function (sess, role) { GCROOM.session = sess; GCROOM.role = role; },
+        onSession: function (sess, role) { GCROOM.session = sess; GCROOM.role = role; gcNetWatch(sess); },
         onReady: gcNetOnReady,
       };
       if (handoff) {
@@ -7870,7 +8087,8 @@ window.GcRate = (function () {
                     ' as ' + handoff.code + ' via ' + gcNetTransport() +
                     (handoff.romIdx >= 0 ? ', ROM #' + handoff.romIdx + ' (' + handoff.game + ')' : ''));
       }
-      NetplayUI.mount(mountOpts);
+      var ui = NetplayUI.mount(mountOpts);
+      if (ui && ui.supported && typeof ui.setRows === 'function') GCPARTY.ui = ui;   // a cached pre-party component has none
     } catch (e) { console.log('[gc-lockstep] lobby did not mount: ' + e); }
   }
   gcNetMount();
@@ -8644,6 +8862,8 @@ window.GcRate = (function () {
     fault: null,         // why this machine is NOT frame-gated, in words
     hashSink: null,      // null = untested, false = NOTHING is comparing the cores
     ports: null,         // the seats this machine holds, from the roster
+    declared: false,     // setReady() went through — this console's own, automatic, "ready"
+    startFrame: -1,      // the engine frame the gate engaged at; -1 until it has
   };
   function gcLsSay(t) { try { console.log('[gc-lockstep] ' + t); } catch (e) {} }
   function gcLsEngine() {
@@ -8735,12 +8955,14 @@ window.GcRate = (function () {
       if (GCLS.running) {
         GCLS.running = false;
         gcLsSay('frame gate DISENGAGED — engine state ' + ls.state + '; nothing advances until the room is back');
+        gcNetPartySync();
       }
       return;
     }
     if (!GCLS.running) {
       GCLS.running = true;
       GCLS.fedTo = ls.frame;
+      GCLS.startFrame = ls.frame;     // the party's "everyone started together at frame N"
       GCLS.ports = (ls.localPorts || []).slice();
       // THE FINGERPRINT. This page used to drive the frame gate with NOTHING comparing the two
       // simulations, which is worse than not gating at all: it looks right while each player
@@ -8763,6 +8985,7 @@ window.GcRate = (function () {
       gcLsSay('FRAME GATE ENGAGED at frame ' + ls.frame + ' — this core advances only when every seated ' +
               'port has an input for the frame. delay=' + ls.delay + ' frames, ports=' +
               JSON.stringify(ls.roster) + ', mine=' + JSON.stringify(ls.localPorts));
+      gcNetPartySync();
     }
     // One frame in flight at a time — the pad cells are a single slot (see the header).
     if (GCLS.pendingAck >= 0) {
@@ -8823,6 +9046,7 @@ window.GcRate = (function () {
       GCLS.fault = 'this page was opened with ?fps=0 (uncapped freerun), which disarms the credit ' +
                    'throttle the frame gate is built on. A room cannot be gated on a guest nothing paces.';
       gcLsSay('⚠ REFUSING TO GATE — ' + GCLS.fault);
+      gcNetPartySync();
       return false;
     }
     // ⚠ CREATE THE ENGINE IF THE ROOM HAS NOT NEEDED ONE YET. lib/netplay.js builds session.ls
@@ -8837,6 +9061,7 @@ window.GcRate = (function () {
     if (!ls) {
       GCLS.fault = 'the room published no lockstep engine, so this core cannot be frame-gated';
       gcLsSay('⚠ ' + GCLS.fault);
+      gcNetPartySync();
       return false;
     }
     gcLsGate = true;                                   // credits stop reaching the SAB
@@ -8846,7 +9071,12 @@ window.GcRate = (function () {
     gcLsSay('ARMED before the first credit — the worker parks at its first VIWaitForRetrace until the ' +
             'barrier releases, so no core runs a frame the others did not');
     // The barrier compares what each machine ACTUALLY LOADED, not what it intended.
-    try { GCLS.session.setReady(true, gcLsDisc()); } catch (e) { gcLsSay('setReady failed: ' + e); }
+    // ⚠ THIS IS THE ONLY "READY" THERE IS. No button, no click: the instant this core is booted
+    // and gated it declares itself (user 2026-09-13 — no "I'm ready" anywhere). It is safe to
+    // declare alone because lib/netplay.js's barrier never releases for one seated peer.
+    try { GCLS.declared = !!GCLS.session.setReady(true, gcLsDisc()); }
+    catch (e) { gcLsSay('setReady failed: ' + e); }
+    gcNetPartySync();
     setInterval(gcLsStep, 4);   // rAF alone would cap the feed at the display refresh
     return true;
   }
@@ -8868,6 +9098,13 @@ window.GcRate = (function () {
       supported: !!(window.Netplay && window.Netplay.supported()),
       architecture: 'lockstep', streaming: false,
       engine: 'recomp', gated: !!GCLS.armed, running: !!GCLS.running,
+      // The party's view of this gate: declared = setReady() went through; startFrame = the
+      // engine frame the gate engaged at ("everyone started together at frame N"). `party` is
+      // built from a copy of these fields, never from a second __gcLockstep() call — that
+      // would recurse.
+      declared: !!GCLS.declared, startFrame: GCLS.startFrame,
+      party: gcNetParty({ gated: !!GCLS.armed, running: !!GCLS.running, fault: GCLS.fault,
+                          declared: !!GCLS.declared, startFrame: GCLS.startFrame }),
       role: GCLS.role, ports: ls ? (ls.localPorts || []).slice() : null,
       roster: ls ? (ls.roster || []).slice() : null,
       state: ls ? ls.state : null, frame: ls ? ls.frame : null, delay: ls ? ls.delay : null,
@@ -8935,6 +9172,11 @@ window.GcRate = (function () {
     // wrong bytes loads exactly as quietly as a disc that is the right bytes. GMPE01 at 0 and
     // 0xC2339F3D at 0x1C are the GameCube header; if they are not there we are not holding a
     // disc, and saying so is worth more than a grey canvas.
+    // The party's "loading N%": one unit per part plus one for the fst, reported as each lands.
+    // Coarse (seven steps) but genuine — the inflate stream exposes no byte count, and a
+    // percentage invented from wall time would be the "loading" bar that lies.
+    var units = suffixes.length + 1, unitsDone = 0;
+    var landed = function (buf) { unitsDone++; gcNetLoadProgress(Math.round(unitsDone * 100 / units)); return buf; };
     discP = Promise.all([
       Promise.all(suffixes.map(function (sx) {
         return fetch(window.ASSET_BASE + '/gamecube/roms/MarioParty4.bin.part' + sx + '.gz').then(function (r) {
@@ -8942,7 +9184,7 @@ window.GcRate = (function () {
           if (typeof DecompressionStream !== 'function')
             throw new Error('part' + sx + ': the disc parts are gzipped and this browser has no DecompressionStream');
           return new Response(r.body.pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
-        });
+        }).then(landed);
       })).then(function (bufs) {
         var head = new DataView(bufs[0], 0, 32), id = '';
         for (var i = 0; i < 6; i++) id += String.fromCharCode(head.getUint8(i));
@@ -8954,9 +9196,9 @@ window.GcRate = (function () {
       fetch('/gamecube/recomp/mp4_fst_trimmed.bin').then(function (r) {
         if (!r.ok) throw new Error('fst ' + r.status);
         return r.arrayBuffer();
-      })
+      }).then(landed)
     ]);
-    discP.catch(function () { discP = null; });   // failed prefetch: next call refetches
+    discP.catch(function () { discP = null; gcNetLoadProgress(0); });   // failed prefetch: next call refetches
     return discP;
   }
   prefetchDisc();

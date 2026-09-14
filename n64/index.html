@@ -24,7 +24,7 @@
        the wire. The file still exists because sibling pages have not been
        converted yet; loading it here would ship a second, contradictory online
        architecture on a page that has one. -->
-  <script src="/lib/netplay.js?v=fb6cec45"></script>
+  <script src="/lib/netplay.js?v=40595af6"></script>
   <script>
     // Same honest-failure contract as the sibling pages, with the spec that makes
     // this the PORTABILITY REFERENCE: Capability.SPECS.n64 requires only
@@ -140,11 +140,13 @@
     #mobileMenuBox button:last-child { margin-bottom: 0; }
     #mobileMenuBox button:disabled { opacity: 0.4; }
     /* SHORT VIEWPORT — a phone in LANDSCAPE is ~390 px tall, and this single
-       column of entries is taller than that, so the last ones (Play Online and
-       Close among them) sat BELOW THE FOLD with a centred flex item's top edge
-       clipped and unscrollable. Two columns fit, and #mobileMenu scrolls now as
-       a backstop. Measured before this: #mNet rect top=434 in a 390 px
-       viewport, elementFromPoint at its centre returned a different button. */
+       column of entries is taller than that, so the last ones (Close among
+       them) sat BELOW THE FOLD with a centred flex item's top edge clipped and
+       unscrollable. Two columns fit, and #mobileMenu scrolls now as a backstop.
+       Measured before this on the menu's then-last entry, an online button
+       that no longer exists (the Party control is #mobileSplashNet on the
+       splash, not in this menu): rect top=434 in a 390 px viewport, and
+       elementFromPoint at its centre returned a different button. */
     @media (max-height: 520px) {
       #mobileMenuBox { display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
         min-width: min(430px, 92vw); padding: 12px 14px; }
@@ -250,22 +252,30 @@
      Hidden unless a room actually exists (?np=<code>), so a single-player visit
      never sees it and its DOM costs nothing.
 
-     ⚠ WHY THERE IS A READY BUTTON AND NOT AN AUTO-START. Only a human knows
-     whether the party is complete. An earlier cut declared Ready automatically
-     as soon as this core finished booting, and MEASURED the exact failure that
-     invites: whichever machine booted first passed the start barrier ALONE, with
-     `ports=[null,null,null,null], mine=[]` — an empty roster — and the engine
-     then refuses everyone else as a late joiner, because the device set is part
-     of the starting state. Waiting for a person to say "we are all here" is not
-     friction, it is the only correct trigger, and it is what makes "as many
-     players as the console can" work rather than just two.
+     ⚠ THERE IS NO READY BUTTON, AND THE ROOM STARTS BY ITSELF. This panel
+     used to carry one, and the reason was measured: an earlier auto-ready cut
+     declared the instant this core finished booting, and whichever machine
+     booted first passed the start barrier ALONE — `ports=[null,null,null,null],
+     mine=[]`, an empty roster — after which the engine refused everyone else as
+     a late joiner. That failure is closed where it belongs now, in the engine:
+     Lockstep._checkBarrier never releases with fewer than TWO DISTINCT seated
+     peers and reports the condition as `info.alone` (lib/netplay.js, grep
+     'info.alone'). So this page declares by itself the moment the core is
+     booted AND gated — gated in beforeRun (lsArmBeforeBoot), declared when
+     Module.callMain returns (declareWhenMainReturns -> chooseDelayThenReady),
+     because an awaited IndexedDB read sits between those two in
+     dist/script.js — a host alone can never start, and the user's directive
+     (2026-09-13: no "I'm ready", no conditions — it starts when both are able)
+     is met without a click.
+     A player is "host" (port 0) or "player" here, never a peer nonce — and
+     that includes the engine's own fail strings, which lsParty() rewrites.
 -->
 <div id="lsRoom" hidden>
-  <div class="lsHead">Online room <b id="lsCode">-----</b></div>
+  <div class="lsHead">Party <b id="lsCode">-----</b></div>
   <div id="lsSeats" class="lsSeats"></div>
   <div id="lsMsg" class="lsMsg">Waiting for players…</div>
   <div class="lsBtns">
-    <button id="netReady" type="button">Ready</button>
+    <button id="lsCopy" type="button" class="sec">Copy code</button>
     <button id="netLeave" type="button" class="sec">Leave</button>
   </div>
 </div>
@@ -293,7 +303,7 @@
     <button id="btnDiag" type="button">🩺 Diagnostics</button>
     <!-- hidden until Netplay.supported() proves the browser can do it: a control
          that does nothing when pressed reads as "the site is broken". -->
-    <button id="btnNet" type="button" hidden>👥 Play Online</button>
+    <button id="btnNet" type="button" hidden>Party</button>
   </div>
   <div id="canvasDiv"><canvas id="canvas" width="640" height="480"></canvas></div>
   <div id="statusBar"><span id="status">Idle.</span><span id="fps"></span></div>
@@ -317,7 +327,7 @@
     <select id="mobileRomSelect"></select>
     <button id="mobileSplashStart" type="button">Start</button>
     <button id="mobileSplashDiag" type="button" style="min-width:0;padding:8px 14px;font-size:13px;background:#1d1d1d;border-color:#333;color:#aaa">🩺 Diagnostics</button>
-    <button id="mobileSplashNet" type="button" hidden style="min-width:0;padding:8px 14px;font-size:13px;background:#1d1d1d;border-color:#333;color:#aaa">👥 Play Online</button>
+    <button id="mobileSplashNet" type="button" hidden style="min-width:0;padding:8px 14px;font-size:13px;background:#1d1d1d;border-color:#333;color:#aaa">Party</button>
     <p class="rotateTip">Rotate to landscape for the best view.</p>
   </div>
   <div id="mobileScreen"></div>
@@ -2543,6 +2553,7 @@ N64Rate.selfTest = function (logFn) {
         if (step.done) break;
         chunks.push(step.value); got += step.value.length;
         setStatus('Downloading ' + rom.label + '… ' + (got / 1048576).toFixed(1) + (contentLen ? ' / ' + (contentLen / 1048576).toFixed(1) : '') + ' MB');
+        lsReportLoad(contentLen ? (got / contentLen) * 99 : 1);
       }
       var bytes = new Uint8Array(got), off = 0;
       for (var i = 0; i < chunks.length; i++) { bytes.set(chunks[i], off); off += chunks[i].length; }
@@ -3066,7 +3077,16 @@ N64Rate.selfTest = function (logFn) {
   // pad would fork the simulations silently and permanently, and there is no
   // rollback here to unfork them.
   // ═══════════════════════════════════════════════════════════════════════════
-  var NET = { session: null, role: null, guest: false, leaving: false };
+  var NET = { session: null, role: null, guest: false, leaving: false,
+    game: null,          // the ROM label the room is on — the disc tag setReady() declares
+    declaring: false,    // the declare is in flight (the host measures RTT first) — once, ever
+    declared: false,     // setReady(true) HAS BEEN CALLED — a result, not an intention
+    mainRan: false,      // Module.callMain RETURNED — the core has booted, not merely been gated
+    bootStarted: false,  // this page pressed its own Start
+    startBlocked: false, // ...or could not, because the capability layer is holding it
+    loadPct: 0,          // the last ROM-download percentage told to the session (1..99)
+    errorLogged: null,   // the raw engine fail string already sent to the log (once, not per tick)
+  };
   var LS = {
     armed: false,       // the core has been put into lockstep mode
     running: false,     // ...and the barrier released, so this page is feeding
@@ -3077,6 +3097,8 @@ N64Rate.selfTest = function (logFn) {
     stalling: false, waitingOn: [], stallReason: null,
     stalls: 0, stallMs: 0, stallSince: 0,
     fault: null,        // why this machine is NOT frame-gated, in words
+    armedAtFrame: null, // the engine frame when the gate closed — latched, never sampled
+    startedAt: null,    // the frame everyone started together at — latched as the gate engages
     baseWall: 0, baseFrame: 0,   // the 1.000x governor's anchor
     reanchors: 0,       // times debt was DISCARDED rather than sprinted through
     viHz: 0,            // from the ROM header; 0 = unknown, and then we do not pace
@@ -3096,6 +3118,123 @@ N64Rate.selfTest = function (logFn) {
     var n = 0;
     try { for (var i = 0; i < ls.roster.length; i++) if (ls.roster[i] != null) n++; } catch (e) {}
     return Math.max(1, Math.min(4, n));
+  }
+  // The OTHER consoles' rows read "loading N%" from this number and nothing
+  // else: lib/netplay.js only ever knows a load figure a page tells it
+  // (Session.setLoadProgress), and this page told it nothing, so every peer saw
+  // this one sit at 0% and then jump straight to ready. Capped at 99 — 100 is
+  // setReady()'s to say, and it says it when the core is actually gated.
+  function lsReportLoad(pct) {
+    var s = NET.session; if (!s || typeof s.setLoadProgress !== 'function') return;
+    var v = Math.max(1, Math.min(99, Math.round(pct)));
+    if (v === NET.loadPct) return;
+    NET.loadPct = v;
+    try { s.setLoadProgress(v); } catch (e) {}
+  }
+  // ---- THE PARTY, AS ONE SHAPE ------------------------------------------------
+  // What the button, the panel and the test seam all read. Built from the
+  // ENGINE's roster and the SESSION's load report, never from a count kept here.
+  // ⚠ NEVER A NONCE. dreamcast's HUD once printed "P1 dc51b70458829649" — a
+  // peer's 16-hex stableNonce — on screen. A row here carries a port and a role
+  // ("host" is port 0, everyone else "player"); the peer id is not in the shape.
+  // Row states are exactly: connecting, loading N%, loaded, ready, playing,
+  // disconnected, open. `alone` is computed from the roster on every call, NOT
+  // taken from the last barrier report: the host's barrier info is only
+  // recomputed when somebody declares, so after a lone declare it still says
+  // alone:true while the second player is already seated and downloading.
+  function lsParty() {
+    var sess = NET.session, ls = lsEngine();
+    var info = null, rep = null;
+    try { info = sess && typeof sess.roomInfo === 'function' ? sess.roomInfo() : null; } catch (e) {}
+    try { rep = ls && typeof ls.report === 'function' ? ls.report() : null; } catch (e) {}
+    var seats = (info && info.seats) || ((rep && rep.ports) || []).map(function (p) {
+      return { port: p.port, peer: p.peer, local: !!p.local, load: null, ready: false, dropped: p.dropped || null };
+    });
+    var ports = (info && info.portCount) || (rep && rep.portCount) || 4;
+    var readyPeers = (rep && rep.readyPeers) || [];
+    var distinct = [];
+    seats.forEach(function (x) { if (x.peer != null && distinct.indexOf(x.peer) < 0) distinct.push(x.peer); });
+    var connected = !!(sess && sess.state === 'connected');
+    var playing = !!(LS.running || (rep && (rep.state === 'running' || rep.state === 'stalled')));
+    // The engine gave up (a stall past stallBudgetMs, a disc mismatch, a
+    // desync). Nothing in this room runs again until somebody leaves it.
+    var stopped = !!(rep && (rep.state === 'failed' || rep.state === 'desync' || rep.state === 'ended'));
+    var isReady = function (x) { return x.local ? !!NET.declared : (!!x.ready || readyPeers.indexOf(x.peer) >= 0); };
+    var rowState = function (x) {
+      if (x.peer == null) return 'open';
+      if (x.dropped) return 'disconnected';
+      // A stopped room names the port whose input never came as what it is —
+      // the engine does not mark it dropped, but LS.waitingOn was latched at
+      // the stall the fail grew out of.
+      if (stopped && !x.local && LS.waitingOn.indexOf(x.port) >= 0) return 'disconnected';
+      if (playing) return 'playing';
+      if (isReady(x)) return 'ready';
+      if (x.local) {
+        // 'loaded' is the core's word: Module.callMain returned. Armed alone is
+        // not it — the gate closes in beforeRun, and an awaited IndexedDB read
+        // (LoadSram) sits between that hook and main().
+        if (NET.mainRan) return 'loaded';                    // booted and gated; the declare is in flight
+        if (!connected && !NET.bootStarted) return 'connecting';
+        return 'loading ' + (NET.loadPct | 0) + '%';
+      }
+      // A remote seat at 0 has not pressed Start yet (this page reports 1% the
+      // instant it does), so it is connecting, not a download stuck at zero.
+      var load = x.load == null ? 0 : (x.load | 0);
+      return load >= 100 ? 'loaded' : (load > 0 ? 'loading ' + load + '%' : 'connecting');
+    };
+    var who = function (x) { return (x.port === 0 ? 'host' : 'player ' + (x.port + 1)) + (x.local ? ' (you)' : ''); };
+    var notReady = seats.filter(function (x) { return x.peer != null && !x.dropped && !isReady(x); });
+    // ⚠ A JOINER BEFORE ITS FIRST ROSTER IS NOT ALONE — it is in a room that
+    // has a host by construction and simply has not been told the seats yet.
+    // Read as `distinct.length < 2` it drew the HOST's sentence ("share the
+    // code …") on the guest for a moment. Unknown is reported as waiting for
+    // the host, which is literally what it is waiting for.
+    var isHost = info ? !!info.host : (NET.role === 'host');
+    var rosterUnknown = !isHost && distinct.length === 0;
+    var alone = rosterUnknown ? false : distinct.length < 2;
+    var state = playing ? 'playing'
+      : (stopped || alone || rosterUnknown) ? 'waiting'
+      : notReady.length ? 'loading' : 'starting';
+    // ⚠ NEVER A NONCE, PART TWO. The engine's fail strings embed PEER IDS —
+    // lib/netplay.js `'no input from ' + waitingPeers.join(', ')` on the
+    // stall budget (8 s by default, and this page passes no override) and
+    // `p + ' has "' + discs[p] + '"'` on a disc mismatch — and a peer id IS
+    // the session's 16-hex stableNonce. Rendered verbatim, that is exactly the
+    // "P1 dc51b70458829649" the design forbids. So the string is never handed
+    // to the panel raw: every roster peer id becomes its seat word, anything
+    // 16-hex that is left becomes "a player", and the raw text goes to the log
+    // once. A rig cell forces the stall and reads the sentence back.
+    var error = null;
+    if (rep && (rep.error || stopped)) {
+      var raw = String(rep.error || (rep.state === 'desync' ? 'the games went out of sync' : 'the room ended'));
+      var text = raw;
+      seats.forEach(function (x) {
+        if (x.peer == null) return;
+        text = text.split(String(x.peer)).join(x.port === 0 ? 'host' : 'player ' + (x.port + 1));
+      });
+      if (info && info.me) text = text.split(String(info.me)).join(isHost ? 'host' : 'this console');
+      text = text.replace(/\b[0-9a-f]{16}\b/g, 'a player');
+      error = text;
+      if (NET.errorLogged !== raw) { NET.errorLogged = raw; pageLog('[lockstep] engine stopped: ' + raw); }
+    }
+    return {
+      code: NET.pendingCode || (sess && sess.code) || null,
+      seated: distinct.length, ports: ports,
+      state: state,
+      alone: alone,
+      declared: !!NET.declared,
+      able: !!(LS.armed && NET.mainRan && !LS.fault),
+      autoStart: true,
+      startBlocked: !!NET.startBlocked,
+      rows: seats.map(function (x) {
+        return { port: x.port, who: x.peer == null ? null : (x.port === 0 ? 'host' : 'player'),
+                 local: !!x.local, state: rowState(x) };
+      }),
+      waitingFor: rosterUnknown ? ['host'] : notReady.map(who),
+      startedAt: LS.startedAt,
+      stopped: stopped,
+      error: error,
+    };
   }
 
   // ---- this machine's OWN pad, in the room's wire format --------------------
@@ -3327,6 +3466,7 @@ N64Rate.selfTest = function (logFn) {
     }
     if (!LS.running) {
       LS.running = true;
+      LS.startedAt = ls.frame | 0;        // "everyone started together at frame N"
       LS.baseWall = 0;                    // anchor the governor at the real start
       LS.hashSink = (typeof ls.endFrame === 'function');
       pageLog('[lockstep] FRAME GATE ENGAGED at frame ' + ls.frame + ' — this core advances only when every '
@@ -3408,6 +3548,9 @@ N64Rate.selfTest = function (logFn) {
     try { if (M._neil_fp_always) M._neil_fp_always(1); } catch (e) {}
     LS.armed = true; LS.running = false; LS.frame = 0; LS.fed = 0; LS.hashes = 0;
     LS.baseWall = 0; LS.baseFrame = 0; LS.fault = null;
+    // Latched here, not sampled by a rig later: the joiner arms second, and if
+    // the barrier releases before its next poll the sampled frame has moved.
+    LS.armedAtFrame = (typeof ls.frame === 'number') ? (ls.frame | 0) : 0;
     lsWireKeys();
     pageLog('[lockstep] ARMED before the core ever ran a frame — mainLoop() is now inert and '
           + 'neil_ls_run_frame() is the only thing that advances this guest, so this core\'s '
@@ -3446,6 +3589,40 @@ N64Rate.selfTest = function (logFn) {
       pageLog('[net] ' + msg);
     };
 
+    // ⚠ THE DECLARE WAITS FOR main(), AND ARMING IS NOT THAT. dist/script.js
+    // runs `this.beforeRun(); … await this.LoadSram(); Module.callMain(…)`
+    // (:233-237): an awaited IndexedDB round-trip sits between the hook that
+    // gates the core and the call that boots it. A declare fired from beforeRun
+    // left this page synchronously — 'lsready' was on the wire before main()
+    // had run — and a host that had already declared answers with lsgo, begin()
+    // and its first inputs at once, so the receive-kick or the next rAF tick
+    // could call lsFeed() -> _neil_ls_run_frame() -> mainLoopInner() on a core
+    // whose main() had not executed (mymain.cpp neil_ls_run_frame has no
+    // "main has run" guard). The earlier comment here claimed callMain ran
+    // synchronously after this hook; it did not. So callMain itself is
+    // wrapped, and the declare is made the instant it RETURNS — `declared`
+    // then means booted AND gated, which is what "able" has to mean.
+    var declareWhenMainReturns = function () {
+      var M = window.Module;
+      if (!M || typeof M.callMain !== 'function') {
+        LS.fault = 'this build of the core exposes no Module.callMain, so the page cannot tell '
+                 + 'when main() has run and will not declare itself loaded';
+        pageLog('[lockstep] ⚠ ' + LS.fault);
+        return;
+      }
+      if (M.__lsDeclareHooked) return;
+      M.__lsDeclareHooked = true;
+      var callMain = M.callMain;
+      M.callMain = function () {
+        var r = callMain.apply(this, arguments);
+        // main() has returned: the ROM is loaded, emscripten_set_main_loop is
+        // registered (and inert under the gate). Only now is this console able.
+        NET.mainRan = true;
+        pageLog('[lockstep] main() has run — the core is booted and gated; declaring now');
+        try { autoDeclare(); } catch (e) { pageLog('[lockstep] declare threw: ' + ((e && e.message) || e)); }
+        return r;
+      };
+    };
     // Arm inside beforeRun — the one hook where Module exists and callMain has
     // not run. Wrapping rather than replacing, so the vendored controller's own
     // beforeRun keeps doing whatever it does.
@@ -3457,7 +3634,8 @@ N64Rate.selfTest = function (logFn) {
       app.beforeRun = function () {
         prev();
         syncViHz();
-        try { lsArmBeforeBoot(); } catch (e) { pageLog('[lockstep] arm threw: ' + ((e && e.message) || e)); }
+        try { if (lsArmBeforeBoot()) declareWhenMainReturns(); }
+        catch (e) { pageLog('[lockstep] arm threw: ' + ((e && e.message) || e)); }
       };
     };
     var hookIv = setInterval(hookBeforeRun, 100);
@@ -3473,6 +3651,13 @@ N64Rate.selfTest = function (logFn) {
     // machine. That is a real, stated cost — an online session does not see your
     // saved game — and it is the only option that is correct; the alternative is
     // a silent desync a few seconds in.
+    // ⚠ IT WAS A NO-OP FOR EVERY ONLINE BOOT. This was called once, from
+    // startSession — which the ?np= handoff runs BEFORE press() injects
+    // dist/script.js, the script that creates window.myApp — so `!app`
+    // returned every time and the vendored LoadSram ran anyway. The hook that
+    // fires when myApp exists is window.postLoad (script.js:1602-1604), so the
+    // neuter is installed from there; the crossdevice rig asserts the
+    // "saved game NOT loaded" line on both roles.
     var neuterSram = function () {
       var app = window.myApp;
       if (!app || app.__lsSramNeutered || !NET.session) return;
@@ -3485,6 +3670,12 @@ N64Rate.selfTest = function (logFn) {
               + 'untouched on disk; they simply are not used online.');
         return undefined;
       };
+    };
+    var prevPostLoad = window.postLoad;
+    window.postLoad = function () {
+      if (typeof prevPostLoad === 'function') prevPostLoad.apply(this, arguments);
+      neuterSram();
+      hookBeforeRun();
     };
 
     var watchLockstep = function (sess) {
@@ -3516,7 +3707,7 @@ N64Rate.selfTest = function (logFn) {
     };
 
     var onStatus = function (e) {
-      if (e.state === 'connected') netStatus('Connected. Press Ready when everyone is in.', 'ok');
+      if (e.state === 'connected') netStatus('Connected — the game loads by itself now, and starts once everyone is loaded.', 'ok');
       else if (e.state === 'closed' || e.state === 'failed') {
         lsDisarm(NET.leaving ? 'you left the room' : 'the room closed');
       }
@@ -3531,6 +3722,7 @@ N64Rate.selfTest = function (logFn) {
       if (NET.session) return;
       NET.role = asHost ? 'host' : 'guest';
       NET.guest = !asHost;
+      NET.game = game;
       var s = new Netplay.Session({
         game: game, host: asHost, code: code, transport: netTransport(),
         // THE CONSOLE'S port count, handed to the engine rather than assumed by
@@ -3558,7 +3750,6 @@ N64Rate.selfTest = function (logFn) {
       s.on('status', onStatus);
       try { s.on('lockstep', function () { watchLockstep(s); }); } catch (e) {}
       watchLockstep(s);
-      neuterSram();
       pageLog('[net] ' + (asHost ? 'room ' + code + ' open' : 'joining room ' + code)
             + ' (' + game + ') via ' + netTransport());
       // ⚠ DO NOT AWAIT start() BEFORE BOOTING. For a HOST, start() does not
@@ -3589,6 +3780,9 @@ N64Rate.selfTest = function (logFn) {
       var b = $(id); if (!b) return;
       b.hidden = false;
       b.addEventListener('click', function () {
+        // In a room the control OPENS the party panel; with no room it goes to
+        // the lobby that mints a code. Same id, same button, live label.
+        if (NET.pendingCode) { var r = $('lsRoom'); if (r) r.hidden = false; return; }
         var sel = isMobile ? $('mobileRomSelect') : $('romSelect');
         var pick = ROMS[+(sel && sel.value) || 0] || ROMS[0];
         location.href = '/n64_multiplayer.html?game=' + encodeURIComponent(pick.label);
@@ -3639,7 +3833,9 @@ N64Rate.selfTest = function (logFn) {
         // emulator at all.
         var press = function () {
           var b = $('btnStart');
-          if (b && (b.disabled || b.getAttribute('aria-disabled') === 'true')) return false;
+          if (b && (b.disabled || b.getAttribute('aria-disabled') === 'true')) { NET.startBlocked = true; return false; }
+          NET.startBlocked = false; NET.bootStarted = true;
+          lsReportLoad(1);
           if (isMobile) { var sp = $('mobileSplash'); if (sp) sp.style.display = 'none'; }
           startEmulator();
           return true;
@@ -3667,7 +3863,7 @@ N64Rate.selfTest = function (logFn) {
       });
     }
 
-    // ---- THE START BARRIER, AND THE ROOM PANEL -----------------------------
+    // ---- THE START BARRIER, AND THE PARTY PANEL ----------------------------
     // "My core is booted and holding at frame 0, on this ROM." Nobody advances
     // frame 0 until EVERY seated peer has said this. It is what makes "all cores
     // start together" true rather than hoped for: without it each machine would
@@ -3675,12 +3871,26 @@ N64Rate.selfTest = function (logFn) {
     // at different times are at different guest positions — a desync before
     // anybody has pressed anything.
     //
-    // ⚠ A HUMAN PRESSES READY, AND THAT IS NOT LAZINESS. See the panel's comment
-    // in the markup: an auto-ready-on-boot cut MEASURED the failure it invites —
-    // the machine that booted first passed the barrier ALONE with an empty
-    // roster, and the engine then refuses everyone else as a late joiner. Only a
-    // person knows the party is complete.
-    var readyDeclared = false;
+    // ⚠ NOBODY PRESSES READY. This page declares BY ITSELF, from the callMain
+    // wrapper above (declareWhenMainReturns), the instant main() has returned
+    // on a core that lsArmBeforeBoot() gated in beforeRun — the point at which
+    // this console is able to run frame 0, and nothing else is a prerequisite
+    // here (no seed, no cards; the ROM is already in the core).
+    // An earlier auto-ready cut MEASURED the failure that invites — the machine
+    // that booted first passed the barrier ALONE with an empty roster and the
+    // engine then refused everyone else as a late joiner — and a human Ready
+    // button was the fix. It is closed in the ENGINE now, where every page's
+    // declare arrives: Lockstep._checkBarrier never releases with fewer than two
+    // distinct seated peers and says so as `info.alone` (lib/netplay.js, grep
+    // 'info.alone'). So declaring early is free, a host alone can never start,
+    // and the room starts the moment the second console is loaded — the user's
+    // directive (2026-09-13) verbatim: no "I'm ready", no conditions.
+    var autoDeclare = function () {
+      var sess = NET.session;
+      if (!sess || NET.declaring) return;
+      NET.declaring = true;
+      chooseDelayThenReady(sess);
+    };
     var roomEl = $('lsRoom');
     if (roomEl && NET.pendingCode) {
       roomEl.hidden = false;
@@ -3688,52 +3898,77 @@ N64Rate.selfTest = function (logFn) {
     }
     var setMsg = function (t, cls) {
       var m = $('lsMsg'); if (!m) return;
-      m.textContent = t; m.className = 'lsMsg' + (cls ? ' ' + cls : '');
+      if (m.textContent !== t) m.textContent = t;
+      m.className = 'lsMsg' + (cls ? ' ' + cls : '');
     };
-    // The panel is rendered from the ENGINE's own report, never from a count
-    // this file keeps: a seat list that disagrees with the engine is worse than
-    // no seat list, because a player has to know they are Player 3 BEFORE the
-    // game starts — that is which character they get.
+    // The one control's text is LIVE: "Party" with no room; the code, the seat
+    // count and the room's state (waiting | loading | starting | playing) with one.
+    var partyLabel = function (p) {
+      return 'Party' + (p.code ? ' · ' + p.code + ' · ' + p.seated + '/' + p.ports + ' · ' + p.state : '');
+    };
+    // The panel is rendered from lsParty() — the ENGINE's roster and the
+    // SESSION's load report — never from a count this file keeps: a seat list
+    // that disagrees with the engine is worse than no seat list, because a
+    // player has to know they are P3 BEFORE the game starts — that is which
+    // character they get.
     var renderRoom = function () {
-      var ls = lsEngine();
+      var p = lsParty();
+      ['btnNet', 'mobileSplashNet'].forEach(function (id) {
+        var b = $(id); if (!b) return;
+        var t = partyLabel(p); if (b.textContent !== t) b.textContent = t;
+      });
       var seats = $('lsSeats');
       if (!seats) return;
-      var rep = null;
-      try { rep = ls && typeof ls.report === 'function' ? ls.report() : null; } catch (e) {}
-      var ports = (rep && rep.ports) || [];
-      if (!ports.length) { seats.innerHTML = '<div class="seat empty"><span>Connecting…</span></div>'; return; }
-      seats.innerHTML = ports.map(function (p) {
-        var who = p.peer ? (p.local ? 'You' : 'Player ' + (p.port + 1)) : 'Empty';
-        var cls = 'seat' + (p.local ? ' me' : '') + (p.peer ? '' : ' empty');
-        return '<div class="' + cls + '"><span>P' + (p.port + 1) + ' · ' + who + '</span>'
-             + '<span class="st">' + (p.peer ? (p.local && readyDeclared ? 'ready' : 'in') : '—') + '</span></div>';
-      }).join('');
-      if (LS.running) {
-        setMsg(LS.stalling
-          ? ('Waiting for ' + (LS.waitingOn.length ? 'player ' + LS.waitingOn.map(function (x) { return x + 1; }).join(', ') : 'a player') + '…')
-          : ('Playing together — frame ' + LS.frame + '.'), LS.stalling ? '' : 'ok');
-      } else if (readyDeclared) {
-        setMsg('Ready — waiting for the other players to finish loading.');
-      } else {
-        var n = ports.filter(function (p) { return p.peer; }).length;
-        setMsg(n > 1
-          ? (n + ' players in the room. Press Ready when everybody is here.')
-          : 'Share the code. Press Ready once everybody has joined.');
+      if (!p.rows.length) seats.innerHTML = '<div class="seat empty"><span>Connecting…</span></div>';
+      else {
+        var html = p.rows.map(function (r) {
+          var cls = 'seat' + (r.local ? ' me' : '') + (r.who ? '' : ' empty')
+                  + (r.state === 'ready' || r.state === 'playing' ? ' rdy' : '');
+          return '<div class="' + cls + '"><span>P' + (r.port + 1) + ' · ' + (r.who ? r.who + (r.local ? ' (you)' : '') : '—') + '</span>'
+               + '<span class="st">' + r.state + '</span></div>';
+        }).join('');
+        if (seats.innerHTML !== html) seats.innerHTML = html;
       }
+      // Exactly one sentence. A genuine refusal keeps its own.
+      if (LS.fault) setMsg(LS.fault, 'bad');
+      else if (p.startBlocked) setMsg('This device cannot start the emulator — Start is held by the capability check (see the banner). The room waits.', 'bad');
+      // The engine's words never reach the panel raw — lsParty() has already
+      // turned every peer id into a seat word (see NEVER A NONCE, PART TWO).
+      else if (p.error) setMsg('The room stopped — ' + p.error + '. Leave the party to keep playing by yourself.', 'bad');
+      else if (p.state === 'playing') {
+        // The design's sentence LEADS; a stall is appended, never substituted —
+        // measured: the rig read "Waiting for player 2…" on a room that had
+        // started together, because a stall replaced the sentence outright.
+        setMsg('Playing — everyone started together at frame ' + (LS.startedAt | 0) + '.'
+          + (LS.stalling ? ' Waiting for ' + (LS.waitingOn.length
+              ? LS.waitingOn.map(function (x) { return x === 0 ? 'host' : 'player ' + (x + 1); }).join(', ') : 'a player') + '…' : ''),
+          LS.stalling ? '' : 'ok');
+      }
+      else if (p.alone) setMsg('Waiting for another player — share the code ' + p.code + '. Starts by itself once two are in and loaded.');
+      else if (p.waitingFor.length) setMsg('Starts by itself when everyone is loaded — waiting for ' + p.waitingFor.join(', ') + '.');
+      // `starting`: everyone has declared and the barrier has not released. On
+      // the host that is unobservable (declare -> _checkBarrier -> begin() is
+      // one synchronous call), so this is a GUEST between its own 'lsready'
+      // and the host's 'lsgo' — one round trip — and what it is waiting for is
+      // the host. The design's second sentence covers it; there is no fourth.
+      else setMsg('Starts by itself when everyone is loaded — waiting for ' + (NET.role === 'host' ? 'the room' : 'host') + '.');
     };
     // ⚠ ONLY IN A ROOM. Single player must be untouched by any of this: with no
     // ?np= there is no panel to draw and no roster to read, and a timer writing
     // innerHTML into a hidden element four times a second is not nothing on a
     // phone. This whole block is inert offline.
-    if (NET.pendingCode) setInterval(renderRoom, 400);
+    var roomTick = NET.pendingCode ? setInterval(renderRoom, 400) : 0;
 
-    var rdy = $('netReady');
-    if (rdy) rdy.addEventListener('click', function () {
-      var sess = NET.session;
-      if (!sess || readyDeclared) return;
-      readyDeclared = true;
-      rdy.disabled = true;
-      chooseDelayThenReady(sess);
+    // The code is the one thing a player has to hand to the other player.
+    var copy = $('lsCopy');
+    if (copy) copy.addEventListener('click', function () {
+      var code = NET.pendingCode || '';
+      var done = function () { copy.textContent = 'Copied'; setTimeout(function () { copy.textContent = 'Copy code'; }, 1500); };
+      var show = function () { try { prompt('Room code', code); } catch (e) {} };
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(code).then(done, show);
+        else show();
+      } catch (e) { show(); }
     });
 
     async function chooseDelayThenReady(sess) {
@@ -3742,6 +3977,8 @@ N64Rate.selfTest = function (logFn) {
       // the barrier releases. The delay must be identical everywhere — two
       // machines holding inputs for different numbers of frames desync by
       // construction — so only the host sets it and 'lsgo' pushes it to everyone.
+      // It still runs FIRST: the host only boots once a peer is linked (press()
+      // waits for `connected`), so there is a peer to ping by the time this runs.
       try {
         var ls = sess.ls;
         if (ls && ls.isHost && typeof sess.rttReport === 'function') {
@@ -3757,10 +3994,14 @@ N64Rate.selfTest = function (logFn) {
         }
       } catch (e) { pageLog('[lockstep] delay choice failed, keeping the default: ' + ((e && e.message) || e)); }
       try {
-        if (typeof sess.setReady === 'function') sess.setReady(true);
+        if (typeof sess.setReady === 'function') { sess.setReady(true, NET.game); NET.declared = true; }
         else pageLog('[net] this build has no start barrier yet (session.setReady is missing)');
       } catch (e) { pageLog('[net] setReady threw: ' + ((e && e.message) || e)); }
-      netStatus('Ready — waiting for the other players to finish loading.', 'busy');
+      netStatus('Loaded — the game starts by itself once everyone is.', 'busy');
+      // Drawn NOW, not at the next 400 ms tick: the seam says declared in the
+      // same breath, and a panel that lags it reads "waiting for host (you)"
+      // on a host that has already declared — measured by the crossdevice rig.
+      try { renderRoom(); } catch (e) {}
     }
 
     var leave = $('netLeave');
@@ -3769,7 +4010,15 @@ N64Rate.selfTest = function (logFn) {
       NET.leaving = true;
       if (s) { try { s.close(); } catch (e) {} }
       NET.session = null; NET.role = null; NET.guest = false;
+      // ⚠ THE CODE GOES TOO, AND THE TICK STOPS. pendingCode was only ever
+      // written, so after Leave the 400 ms tick kept drawing "Party · CODE ·
+      // 0/4 · waiting" and "share the code …" on a page that had left the
+      // room. No session means the control reads "Party" and nothing else.
+      NET.pendingCode = null; NET.declared = false; NET.declaring = false;
+      if (roomTick) { clearInterval(roomTick); roomTick = 0; }
       lsDisarm('you left the room');
+      try { renderRoom(); } catch (e) {}
+      var r = $('lsRoom'); if (r) r.hidden = true;
       netStatus('Left the room.');
       setTimeout(function () { NET.leaving = false; }, 2000);
     });
@@ -3876,7 +4125,14 @@ N64Rate.selfTest = function (logFn) {
       state: NET.session ? NET.session.state : null,
       code: NET.session ? NET.session.code : null,
       armed: LS.armed,
+      // The engine frame when the gate closed — latched, not sampled (see LS).
+      armedAtFrame: (LS.armedAtFrame == null ? null : LS.armedAtFrame | 0),
       running: LS.running,
+      // THE PARTY — what the button, the panel and a rig all read. `declared`
+      // and `able` are results of doing the thing (setReady was called; the
+      // core took _neil_ls_arm); `autoStart` says this page presses its own
+      // Start and declares by itself; no row carries a peer nonce.
+      party: lsParty(),
       coreArmed: (function () {
         try { return !!(window.Module && Module._neil_ls_armed && Module._neil_ls_armed()); }
         catch (e) { return null; }

@@ -43,6 +43,11 @@ const has = (n) => argv.includes('--' + n);
 const BASE = flag('url', 'http://localhost:8080');
 const SECONDS = parseInt(flag('seconds', '8'), 10);
 const CHROME = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+// The disc. ROMS[3] is Harry Potter & the Sorcerer's Stone, 346,032,644 bytes —
+// the smallest disc ps1.html lists (ps1.html ROMS[]); the page default,
+// Monster Rancher 2, is 451 MB and every other disc is larger. Two peers stream
+// it, so the smallest is the honest default for a gate; --rom N picks another.
+const ROM = parseInt(flag('rom', '3'), 10);
 
 // ⚠ EVERY waitForFunction HERE MUST POLL ON A TIMER, NOT ON rAF. Puppeteer's
 // default `polling: 'raf'` runs the predicate inside requestAnimationFrame, and
@@ -142,6 +147,21 @@ const maskAt = (img, port) => (img ? ((img[port * 2] | (img[port * 2 + 1] << 8))
     // The ordering is the product requirement, not a convenience: the gate is
     // armed at WORKER-CONSTRUCTION time (?netgate=1), so a player who pressed
     // Start first would have an ungated worker that free-ran on its own clock.
+    // THE ONE CONTROL. With no room it reads exactly "Party"; inside one it is
+    // the live status readout (checked again once the room is playing).
+    const label0 = await A.page.evaluate(() => document.getElementById('btnNet').textContent.trim());
+    ok('the-party-button-reads-Party-with-no-room', label0 === 'Party', `#btnNet reads "${label0}"`);
+
+    // The host PICKS the disc before opening the room — a dropdown, not a
+    // download. The room is named for the picker (ps1.html netGameIndex), and
+    // the joiner has to name the same disc or lib/netplay.js refuses the pair.
+    const picked = await A.page.evaluate((i) => {
+      const s = document.getElementById('romSelect');
+      s.value = String(i); s.dispatchEvent(new Event('change'));
+      return s.options[s.selectedIndex] ? s.options[s.selectedIndex].textContent : null;
+    }, ROM);
+    console.log(`  INFO  disc  ROMS[${ROM}] = ${picked}`);
+
     // Drive the REAL controls: a test that called the session constructor
     // directly would pass on a page whose buttons were wired to nothing.
     const hostCode = await A.page.evaluate(() => {
@@ -150,13 +170,32 @@ const maskAt = (img, port) => (img ? ((img[port * 2] | (img[port * 2 + 1] << 8))
       return document.getElementById('netCode').textContent.trim();
     });
     ok('host-mints-a-code', /^[A-HJ-NP-Z2-9]{5}$/.test(hostCode), `code=${hostCode}`);
-    await sleep(800);
-    await B.page.evaluate((code) => {
+
+    // ---- A HOST ALONE NEVER STARTS ----------------------------------------
+    // The page auto-declares and auto-loads, so the guard against a party of
+    // one has to hold with NOBODY else in the room: three seconds alone, and
+    // no worker may have been spawned (that is what `armed` means here), the
+    // disc must not be streaming, and the status line must say it is waiting.
+    await sleep(3000);
+    const alone = await A.page.evaluate(() => {
+      const n = window.__ps1Net();
+      return { armed: n.armed, live: n.live, party: n.party,
+               barrier: (document.getElementById('netBarrier') || {}).textContent || '' };
+    });
+    ok('a-host-alone-never-starts',
+       !alone.armed && !alone.live && alone.party.autoStarted === false && alone.party.loading === false
+         && alone.party.seated <= 1 && alone.party.alone === true
+         && /^Waiting for another player — share the code [A-HJ-NP-Z2-9]{5}\./.test(alone.barrier.trim()),
+       `after 3 s alone: armed=${alone.armed} live=${alone.live} loading=${alone.party.loading} seated=${alone.party.seated} `
+       + `alone=${alone.party.alone} autoStarted=${alone.party.autoStarted} label="${alone.party.label}" status="${alone.barrier.trim()}"`);
+
+    await B.page.evaluate((code, i) => {
       document.getElementById('btnNet').click();
       document.getElementById('netJoinBtn').click();
+      document.getElementById('netGame').value = String(i);   // the disc the room is on
       document.getElementById('netCodeIn').value = code;
       document.getElementById('netGo').click();
-    }, hostCode);
+    }, hostCode, ROM);
 
     // ⚠ A HUMAN HAS TO SAY YES, and that is the design. Knowing the room code is
     // not enough: lib/netplay.js refuses to open a peer connection until the
@@ -185,26 +224,38 @@ const maskAt = (img, port) => (img ? ((img[port * 2] | (img[port * 2 + 1] << 8))
        `host=port ${pa}, guest=port ${pb} — both on port 0 would look like it worked `
        + `and would mean one player driving both controllers`);
 
-    // ---- 2. NOTHING HAS RUN YET ------------------------------------------
-    const before = await Promise.all([
-      A.page.evaluate(() => window.__ps1Frames | 0),
-      B.page.evaluate(() => window.__ps1Frames | 0),
-    ]);
-    ok('no-core-ran-before-the-room-formed', before[0] === 0 && before[1] === 0,
-       `core frames so far: ${before.join('/')}`);
-
-    // ---- 3. BOTH PRESS START --------------------------------------------
-    // Under lockstep a joiner runs their OWN console and MUST start it. Under
-    // streaming this button was disabled for a guest — that single line was what
-    // made the old page two-machines-one-emulator.
-    await Promise.all([
-      A.page.evaluate(() => document.getElementById('btnStart').click()),
-      B.page.evaluate(() => document.getElementById('btnStart').click()),
-    ]);
-
-    const armed = async (p) => p.page.waitForFunction(
-      () => window.__ps1Net().armed, { timeout: 120000, polling: POLL_MS }).then(() => true).catch(() => false);
-    const [aa, ab] = await Promise.all([armed(A), armed(B)]);
+    // ---- 2+3. NOBODY PRESSES START ------------------------------------------
+    // ⚠ THE CELL THIS FILE NOW EXISTS FOR. User, 2026-09-13: "should start when
+    // both are able to start, instead of an I'm ready button and dumb
+    // conditions to start the damn game." The old flow clicked #btnStart on
+    // both peers right here; a page that still needs that click passes nothing
+    // below. On this page `armed` means the worker was spawned GATED
+    // (?netgate=1) — i.e. startEmulator() ran — and `party.autoStarted` is the
+    // page's own record of having pressed it. The old
+    // 'no-core-ran-before-the-room-formed' cell is gone for the reason the
+    // genesis rig gives: it read a counter at a moment the product now races
+    // past by working; 'no-ungated-frame-was-run' (fed vs ran) is the ordering
+    // proof here.
+    const armed = async (p, ms) => p.page.waitForFunction(
+      () => window.__ps1Net().armed, { timeout: ms, polling: POLL_MS }).then(() => true).catch(() => false);
+    let [aa, ab] = await Promise.all([armed(A, 120000), armed(B, 120000)]);
+    const autoParty = await Promise.all([A, B].map((p) => p.page.evaluate(() => window.__ps1Net().party)));
+    const byItself = aa && ab && autoParty.every((q) => q && q.autoStart === true && q.autoStarted === true);
+    ok('the-room-started-both-cores-by-itself', byItself,
+       `host armed=${aa} guest armed=${ab} with NO Start click · autoStarted=${autoParty.map((q) => q && q.autoStarted).join('/')} `
+       + `gameIdx=${autoParty.map((q) => q && q.gameIdx).join('/')} labels=${JSON.stringify(autoParty.map((q) => q && q.label))} `
+       + `status=${JSON.stringify(autoParty.map((q) => q && q.barrier))}`);
+    if (!(aa && ab)) {
+      // FALLBACK, only so the cells below still measure lockstep on a page whose
+      // auto-start is broken. The cell above has already FAILED; this cannot
+      // un-fail it.
+      console.log('  ....  fallback  clicking Start on the peer(s) that did not start by themselves — the cell above stays FAILED');
+      await Promise.all([
+        aa ? null : A.page.evaluate(() => document.getElementById('btnStart').click()),
+        ab ? null : B.page.evaluate(() => document.getElementById('btnStart').click()),
+      ]);
+      [aa, ab] = await Promise.all([armed(A, 120000), armed(B, 120000)]);
+    }
     ok('both-cores-armed-the-frame-gate', aa && ab, `host armed=${aa} guest armed=${ab}`);
 
     // ---- 4. LET THEM PLAY (the disc has to stream in first) --------------
@@ -212,6 +263,31 @@ const maskAt = (img, port) => (img ? ((img[port * 2] | (img[port * 2 + 1] << 8))
       () => window.__ps1Net().frames > 30, { timeout: 240000, polling: POLL_MS }).then(() => true).catch(() => false);
     const [ra, rb] = await Promise.all([running(A), running(B)]);
     ok('both-cores-advance', ra && rb, `host running=${ra} guest running=${rb}`);
+
+    // ---- 4b. THE PARTY BUTTON AND THE PANEL SAY SO ------------------------
+    // One control, live text; seats in the panel's exact vocabulary; a seat is
+    // "host" or "player" and never a peer id; and the status line names the
+    // frame everyone started on. Asserted on the seam AND on the rendered
+    // roster text, because the nonce defect was in the RENDERED string (this
+    // page's HUD printed the whole roster).
+    const VOCAB = /^(connecting|loading \d+%|loaded|ready|playing|disconnected|open)$/;
+    const partyNow = await Promise.all([A, B].map((p) => p.page.evaluate(() => {
+      const n = window.__ps1Net();
+      return { party: n.party,
+               roster: Array.from(document.querySelectorAll('#netRoster li')).map((li) => li.textContent.trim()),
+               hud: (document.getElementById('netHud') || {}).textContent || '' };
+    })));
+    ok('the-party-button-is-live',
+       partyNow.every((q) => /^Party · [A-HJ-NP-Z2-9]{5} · 2\/2 · (starting|playing)$/.test(q.party.label)),
+       `#btnNet reads ${JSON.stringify(partyNow.map((q) => q.party.label))}`);
+    ok('seats-use-the-vocabulary-and-never-a-nonce',
+       partyNow.every((q) => q.party.rows.length === 2
+         && q.party.rows.every((r) => VOCAB.test(r.state) && (r.port === 0 ? r.who === 'host' : r.who === 'player'))
+         && q.roster.length === 2 && !q.roster.some((t) => /\b[0-9a-f]{16}\b/.test(t)) && !/\b[0-9a-f]{16}\b/.test(q.hud)),
+       `rows=${JSON.stringify(partyNow.map((q) => q.party.rows))} rendered=${JSON.stringify(partyNow.map((q) => q.roster))}`);
+    ok('the-status-line-says-everyone-started-together',
+       partyNow.every((q) => /^Playing — everyone started together at frame \d+\.$/.test(q.party.barrier)),
+       `#netBarrier reads ${JSON.stringify(partyNow.map((q) => q.party.barrier))}`);
 
     // THE ORDERING ASSERTION THAT MATTERS MOST. The worker's pcsx_mainloop pump
     // is itself gated, so the core can only ever have run frames the page fed

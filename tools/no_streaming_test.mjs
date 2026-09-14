@@ -107,7 +107,12 @@ for (const p of PAGES) {
   // naming Netplay.Session — and this scope test would call it "no online play" and skip every
   // check. gamecube.html measured exactly that on 2026-09-10 the moment it gained a real
   // lockstep frame gate: n/a, while driving beginFrame() per guest frame.
-  const online = /netHostBtn|lobbyCard|Play Online|NetplayHost|NetplayUI\.mount|Netplay\.(Session|Lockstep|makeCode)/.test(stripped);
+  // ⚠ 'Play Online' IS NO LONGER THE LABEL — the online control is now 'Party'
+  // (one button that IS the room's status). gamecube.html scopes on a SINGLE
+  // token, NetplayUI.mount, so a page that renamed its label and later stopped
+  // mounting the shared lobby would silently fall out of scope and be reported
+  // n/a instead of checked. The party tokens are added for that reason.
+  const online = /netHostBtn|lobbyCard|Play Online|Party ·|netParty|gcNetParty|NetplayHost|NetplayUI\.mount|Netplay\.(Session|Lockstep|makeCode)/.test(stripped);
   if (!online) { console.log(`  n/a   ${p} — no online play`); skipped++; continue; }
   scoped++;
 

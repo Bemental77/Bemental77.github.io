@@ -9,7 +9,7 @@
        NOT USE STREAMING!"). Every player runs their own core and only pad bytes
        cross the wire. The ONLINE PLAY block near the end of this page carries
        the evidence this rests on, including the determinism measurement. -->
-  <script src="/lib/netplay.js?v=fb6cec45"></script>
+  <script src="/lib/netplay.js?v=40595af6"></script>
   <meta charset="UTF-8" />
   <title>PS1 Wasm — Monster Rancher 2</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -254,8 +254,11 @@
     <select id="romSelect"></select>
     <button id="btnStart">Start</button>
     <!-- Hidden until Netplay.supported() proves the browser can do it: a button
-         that does nothing when pressed reads as "the site is broken". -->
-    <button id="btnNet" type="button" hidden>👥 Play Online</button>
+         that does nothing when pressed reads as "the site is broken".
+         ⚠ ITS TEXT IS LIVE (netPartyButtons): "Party" with no room, and
+         "Party · CODE · seated/ports · state" inside one. It is the party's
+         status readout as much as its door — there is no other. -->
+    <button id="btnNet" type="button" hidden>Party</button>
     <button id="btnSave" disabled>Save State</button>
     <button id="btnLoad" disabled>Load State</button>
     <button id="btnExport" disabled>⬆ Export State</button>
@@ -323,11 +326,11 @@
 
 <div id="netOverlay">
   <div id="netBox">
-    <h6>👥 Play Online</h6>
+    <h6>👥 Party</h6>
     <p class="lead">Everyone runs the game on their own machine and plays together, exactly like
       two controllers plugged into one PlayStation. <b>Join the room first</b> — you do not need a
-      disc loaded yet. Once you are both in, you each press Start and the two consoles begin on
-      the same frame.</p>
+      disc loaded yet. Once two of you are in, every console loads the disc and starts by itself
+      on the same frame. There is nothing else to press.</p>
     <div id="netRow">
       <button id="netHostBtn" class="primary" type="button">Open a room</button>
       <button id="netJoinBtn" type="button">Join a room</button>
@@ -972,6 +975,9 @@
             batch = new Uint8Array(BATCH_BYTES);
             batchPos = 0;
             total += BATCH_BYTES;
+            // The room sees this seat as "loading N%" — 99 at most, because 100
+            // is the core's word (romEnd booted -> lsDeclareReady), not the fetch's.
+            if (totalSize) netLoadProgress(Math.min(99, Math.floor(total * 100 / totalSize)));
             if ((total % (16 << 20)) === 0) setStatus('Loading ' + (total/1048576).toFixed(0) + ' / ' + totalMB + ' MB');
           }
         }
@@ -1228,7 +1234,17 @@
   var FRAME_MS = 1000 / PS1_HW_HZ;
   var MAX_CATCHUP_FRAMES = 4;
 
-  var NET = { session: null, role: null, leaving: false, handoff: null /* what ?np=… carried — { code, game, host, join } — or null */ };
+  var NET = {
+    session: null, role: null, leaving: false,
+    handoff: null,      // what ?np=… carried — { code, game, host, join } — or null
+    // ---- the party (see THE PARTY below) ----
+    autoStarted: false, // the party pressed this page's own Start (netMaybeAutoStart)
+    loadPct: 0,         // how far the disc stream is, as told to the room (setLoadProgress)
+    bar: null,          // the host's last barrier report — { seated, waitingFor, alone }
+    gameIdx: -1,        // the ROMS[] index the room agreed on; the auto-start loads THIS
+    startedAtFrame: 0,  // the engine frame at which this core's gate first engaged
+    tick: 0,            // the 500 ms party tick, alive only inside a room
+  };
   var LS = {
     armed: false, running: false, fault: null,
     workerFrame: 0, fedTo: 0, inFlight: 0,
@@ -1408,6 +1424,7 @@
     }
     if (!LS.running) {
       LS.running = true;
+      NET.startedAtFrame = ls.frame | 0;   // "everyone started together at frame N"
       pageLog('[lockstep] FRAME GATE ENGAGED at frame ' + ls.frame + ' — delay=' + ls.delay
         + ' frames (' + Math.round(ls.delay * FRAME_MS) + ' ms), ports=' + JSON.stringify(ls.roster));
     }
@@ -1510,7 +1527,18 @@
     var el = $('netStatus'); if (!el) return;
     el.textContent = msg; el.className = cls || '';
   }
-  function netGameId() { var r = ROMS[ROM_INDEX] || ROMS[0]; return r.label; }
+  // ⚠ THE PICKER, NOT ROM_INDEX. ROM_INDEX's writers are startEmulator() and
+  // netPreselectGame(), so a room opened from a picker a person had CHANGED was
+  // named for the disc the page loaded with — and the auto-start (which goes
+  // through startEmulator, which reads the picker) then loaded a different disc
+  // than the room was named for, on the host itself. One source: #romSelect,
+  // which the mobile picker mirrors into.
+  function netGameIndex() {
+    var sel = $('romSelect');
+    var i = sel ? (+sel.value || 0) : ROM_INDEX;
+    return ROMS[i] ? i : 0;
+  }
+  function netGameId() { return ROMS[netGameIndex()].label; }
   function netTransport() {
     // lib/netplay.js defaults to 'local' (BroadcastChannel, same browser only),
     // which is a test transport. A real room needs a real one.
@@ -1521,32 +1549,218 @@
     return 'peerjs';
   }
 
+  // ═══ THE PARTY ═══════════════════════════════════════════════════════════
+  // ⚠ THERE IS NO READY BUTTON AND NO HOST "PLAY" CLICK. User, 2026-09-13:
+  // "There should be a button for the online party status, and should start
+  // when both are able to start, instead of an I'm ready button and dumb
+  // conditions to start the damn game." So: ONE control (#btnNet, labelled
+  // Party, its text live), one panel, and the room STARTS BY ITSELF.
+  //   * DECLARING was already automatic — lsDeclareReady() fires on the worker's
+  //     own "romEnd booted" line, with the gate armed since worker construction.
+  //   * LOADING is automatic now — netMaybeAutoStart() presses this page's own
+  //     Start (startEmulator, the same function the button calls) the moment
+  //     this console is seated and the room holds TWO DISTINCT seated peers.
+  //     The host's load therefore fires on the FIRST seated joiner, never on
+  //     room open; a joiner's the instant it is seated.
+  //   * STARTING is the engine's. lib/netplay.js Lockstep._checkBarrier never
+  //     releases with fewer than two distinct seated peers (`alone`), so a page
+  //     may auto-declare freely: a host alone can never start a party of one.
+  // ⚠ IT NEVER OVERRIDES THE CAPABILITY LAYER. aria-disabled="true" /
+  // data-cap-blocked on #btnStart means lib/capability.js is holding Start
+  // down because this browser cannot run the core; the party must not press
+  // through that, and the status line says so instead.
+  // ⚠ NEVER A NONCE ON SCREEN. The roster holds 16-hex peer ids (dreamcast's
+  // HUD once printed "P1 dc51b70458829649", and this page's HUD printed the
+  // whole roster); a seat here is "host" (port 0) or "player", and its state
+  // is exactly one of: connecting, loading N%, loaded, ready, playing,
+  // disconnected, open.
+  // genesis.html and snes.html carry the same block; the three must not drift.
+  // The one difference is this core's shape: the gate is armed at WORKER
+  // CONSTRUCTION, so `LS.armed` means "the worker exists", not "the disc is
+  // in" — `started` is the load witness and `declaredReady` the loaded one.
+  function netCapHeld() {
+    var b = $('btnStart');
+    return !!(b && (b.getAttribute('aria-disabled') === 'true' || b.hasAttribute('data-cap-blocked')));
+  }
+  function netSeatedCount() {
+    var ls = lsEngine(); if (!ls) return 0;
+    var seen = [];
+    for (var p = 0; p < ls.portCount; p++) {
+      var x = ls.roster[p];
+      if (x != null && seen.indexOf(x) < 0) seen.push(x);
+    }
+    return seen.length;
+  }
+  // Live from the roster, NOT from the last barrier report: the host recomputes
+  // `alone` only when somebody declares, so a report taken while alone would
+  // still read alone after a joiner had been seated and started loading.
+  function netAlone() { return netSeatedCount() < 2; }
+  function netEngineReport() {
+    var ls = lsEngine();
+    try { return ls && ls.report ? ls.report() : null; } catch (e) { return null; }
+  }
+  function netSeatName(port) { return port === 0 ? 'host' : 'player'; }
+  function netPortLabel(port) { return port === 0 ? 'host' : 'player ' + (port + 1); }
+  function netPeerLabel(peer) {
+    var ls = lsEngine();
+    if (ls && peer != null) for (var p = 0; p < ls.portCount; p++) if (ls.roster[p] === peer) return netPortLabel(p);
+    return 'a player';
+  }
+  function netPartyRows() {
+    var ls = lsEngine(), s = NET.session;
+    if (!ls || !s) return [];
+    var rep = netEngineReport() || {};
+    var info = null; try { info = s.roomInfo(); } catch (e) {}
+    var playing = ls.state === 'running' || ls.state === 'stalled';
+    var rows = [];
+    for (var p = 0; p < ls.portCount; p++) {
+      var peer = ls.roster[p];
+      var seat = (info && info.seats && info.seats[p]) || {};
+      if (peer == null) { rows.push({ port: p, who: null, local: false, state: seat.dropped ? 'disconnected' : 'open' }); continue; }
+      var local = peer === ls.peerId;
+      var ready = local ? !!rep.declaredReady
+        : !!(seat.ready || (rep.readyPeers && rep.readyPeers.indexOf(peer) >= 0));
+      // This console knows its own stream; a peer's arrives via 'lsload'. 100
+      // is the core's word (romEnd booted), which is why ready counts as 100.
+      var load = local ? (ready ? 100 : (NET.loadPct | 0)) : (seat.load | 0);
+      var state = playing ? 'playing'
+        : ready ? 'ready'
+        : load >= 100 ? 'loaded'
+        : (local ? started : load > 0) ? ('loading ' + load + '%')
+        : 'connecting';
+      rows.push({ port: p, who: netSeatName(p), local: local, state: state });
+    }
+    return rows;
+  }
+  // ⚠ THE LABEL AND THE SENTENCE ARE ONE ANSWER, READ OFF ONE SOURCE.
+  // This used to read `declaredReady && !alone` — THIS console's own declare —
+  // so a room where the other player was still downloading printed
+  //     Party · 2/2 · starting     …     waiting for player 2.
+  // at the same moment, on the same screen. Caught by
+  // tools/console_room_crossdevice_test.mjs's genesis arm
+  // (the-party-control-and-sentence-read-the-room). `starting` means the room
+  // is about to release, which is exactly netBarrierText()'s empty waiting
+  // list — so both are computed from the SAME rows here, and cannot disagree.
+  function netPartyState() {
+    var ls = lsEngine();
+    if (LS.running || (ls && (ls.state === 'running' || ls.state === 'stalled'))) return 'playing';
+    if (netAlone()) return 'waiting';
+    var rows = netPartyRows().filter(function (r) { return r.who; });
+    if (rows.length && rows.every(function (r) { return r.state === 'ready' || r.state === 'playing'; })) return 'starting';
+    if (rows.some(function (r) { return r.state === 'loaded' || r.state.indexOf('loading') === 0; })) return 'loading';
+    if (started) return 'loading';
+    return 'waiting';
+  }
+  function netPartyLabel() {
+    var s = NET.session, ls = lsEngine();
+    // A session that has closed under this side is still held until Leave; the
+    // door must not keep describing it as a room.
+    if (!s || s.state === 'closed' || s.state === 'failed') return 'Party';
+    return 'Party · ' + s.code + ' · ' + netSeatedCount() + '/' + (ls ? ls.portCount : PS1_PORTS) + ' · ' + netPartyState();
+  }
+  function netPartyButtons() {
+    var t = netPartyLabel();
+    ['btnNet', 'mobileSplashNet'].forEach(function (id) {
+      var b = $(id); if (b && b.textContent !== t) b.textContent = t;
+    });
+  }
+  // The status line says exactly one thing. A genuine refusal (no engine, a
+  // disc mismatch the barrier rejected, a capability hold) keeps its own words.
+  // ⚠ AN ENGINE STRING CARRIES PEER IDS, AND A PEER ID IS A 16-HEX NONCE.
+  // lib/netplay.js's fail text is `'no input from ' + waitingPeers.join(', ')`
+  // and its disc-mismatch text is `p + ' has "' + discs[p] + '"'` — rendered
+  // raw that put `Cannot start — no input from 76e494f866656aac for 8s.` on
+  // screen, which is the "never a nonce" rule broken in the one place a player
+  // most needs to understand what happened. Caught by
+  // tools/console_room_crossdevice_test.mjs (a-stall-fail-never-shows-a-nonce).
+  // Every roster peer becomes its seat word; anything 16-hex still left becomes
+  // 'a player'; the raw string still goes to the log once, for diagnosis.
+  function netScrubPeers(raw) {
+    var ls = lsEngine();
+    var text = String(raw == null ? '' : raw);
+    if (ls) {
+      for (var p = 0; p < ls.portCount; p++) {
+        var peer = ls.roster[p];
+        if (peer == null) continue;
+        text = text.split(String(peer)).join(peer === ls.peerId ? 'this console' : netPortLabel(p));
+      }
+    }
+    return text.replace(/\b[0-9a-f]{16}\b/g, 'a player');
+  }
+  function netBarrierText() {
+    var ls = lsEngine(), s = NET.session;
+    if (!ls || !s) return '';
+    if (LS.fault) return netScrubPeers(LS.fault) + '.';
+    if (ls.state === 'failed' || ls.state === 'desync' || ls.state === 'ended') {
+      var raw = ls.error || (ls.state === 'desync' ? 'the games went out of sync' : 'the room ended');
+      if (NET.errorLogged !== raw) { NET.errorLogged = raw; pageLog('[lockstep] engine stopped: ' + raw); }
+      return 'The room stopped — ' + netScrubPeers(raw) + '. Leave the party to keep playing by yourself.';
+    }
+    if (netCapHeld()) return 'This device cannot run the emulator, so the party cannot start it here.';
+    if (netPartyState() === 'playing') return 'Playing — everyone started together at frame ' + (NET.startedAtFrame | 0) + '.';
+    if (netAlone()) return 'Waiting for another player — share the code ' + s.code + '. Starts by itself once two are in and loaded.';
+    var who = netPartyRows().filter(function (r) { return r.who && r.state !== 'ready' && r.state !== 'playing'; })
+      .map(function (r) { return r.local ? 'this console' : netPortLabel(r.port); });
+    return 'Starts by itself when everyone is loaded — waiting for ' + (who.length ? who.join(' and ') : 'the room') + '.';
+  }
+  // The room's disc wins over whatever the picker held: startEmulator() reads
+  // #romSelect (and sets ROM_INDEX from it), so the picker is put on the room's
+  // index first. #romSelect's own change listener mirrors the phone picker.
+  function netSyncPickersToRoom() {
+    if (!(NET.gameIdx >= 0)) return;
+    var sel = $('romSelect');
+    if (sel && sel.value !== String(NET.gameIdx)) { sel.value = String(NET.gameIdx); sel.dispatchEvent(new Event('change')); }
+    ROM_INDEX = NET.gameIdx;
+  }
+  function netMaybeAutoStart() {
+    if (!NET.session || NET.autoStarted || started) return;
+    var ls = lsEngine();
+    // No seat, no load: a console without a port has nothing to play from, and
+    // the host loads on the FIRST seated joiner — never on room open.
+    if (!ls || !(ls.localPorts && ls.localPorts.length)) return;
+    if (netSeatedCount() < 2) return;
+    if (netCapHeld()) return;   // the status line's to explain, not this function's to press through
+    NET.autoStarted = true;
+    netSyncPickersToRoom();
+    pageLog('[net] two players are seated, so this console loads ' + netGameId() + ' by itself — there is nothing '
+      + 'to press. LOADING is not RUNNING: the worker is spawned gated (?netgate=1), and the barrier holds '
+      + 'frame 0 until everyone is loaded.');
+    // The same steps the phone's Start tap takes (the splash away, then
+    // startEmulator, then the orientation check), so the two paths cannot drift.
+    if (isMobile) { var sp = $('mobileSplash'); if (sp) sp.style.display = 'none'; }
+    startEmulator();
+    if (isMobile) { try { checkOrientation(); } catch (e) {} }
+  }
+  function netLoadProgress(pct) {
+    pct = Math.max(0, Math.min(100, pct | 0));
+    if (pct === NET.loadPct) return;
+    NET.loadPct = pct;
+    if (NET.session) { try { NET.session.setLoadProgress(pct); } catch (e) {} }   // emits 'room' -> netRoomRender
+  }
+  function netPartyReset() {
+    NET.autoStarted = false; NET.loadPct = 0; NET.bar = null;
+    NET.gameIdx = -1; NET.startedAtFrame = 0;
+    if (NET.tick) { clearInterval(NET.tick); NET.tick = 0; }
+    netPartyButtons();
+  }
+
   function netRoomRender() {
+    netPartyButtons();
     var ls = lsEngine(), s = NET.session;
     var room = $('netRoom'), ul = $('netRoster');
     if (!room || !ul || !s) return;
     room.style.display = '';
-    var rep = (ls && ls.rosterReport) ? ls.rosterReport() : [];
     var ports = (ls && ls.portCount) ? ls.portCount : PS1_PORTS;
     var pl = $('netRoomPorts'); if (pl) pl.textContent = '(' + ports + ' controller ports)';
     ul.innerHTML = '';
-    for (var p = 0; p < ports; p++) {
-      var row = rep.filter(function (r) { return r.port === p; })[0];
+    netPartyRows().forEach(function (r) {
       var li = document.createElement('li');
-      li.textContent = 'Port ' + (p + 1) + ' — '
-        + (!row ? 'empty'
-           : row.dropped ? 'left the room'
-           : row.local ? 'you'
-           : 'another player');
+      li.textContent = 'Port ' + (r.port + 1) + ' — ' + (r.who ? r.who + (r.local ? ' (you)' : '') + ' · ' : '') + r.state;
       ul.appendChild(li);
-    }
-    var bar = $('netBarrier');
-    if (bar) {
-      bar.textContent = (ls && ls.state === 'waiting')
-        ? 'Waiting for everyone to be ready — nobody runs frame 0 alone.'
-        : (ls ? 'Room state: ' + ls.state : '');
-    }
+    });
+    var bar = $('netBarrier'); if (bar) bar.textContent = netBarrierText();
     $('netLeave').style.display = '';
+    netMaybeAutoStart();
   }
 
   function netOnDesync(d) {
@@ -1571,8 +1785,8 @@
       var ls = lsEngine();
       var mine = (ls && ls.localPorts && ls.localPorts.length) ? ls.localPorts[0] : null;
       netStatus(mine != null
-        ? 'In the room — you are Player ' + (mine + 1) + '. Press Start when you are both ready.'
-        : 'In the room. Press Start when you are both ready.', 'good');
+        ? 'In the room — you are Player ' + (mine + 1) + '. The disc loads and the game starts by itself; there is nothing to press.'
+        : 'In the room. The disc loads and the game starts by itself; there is nothing to press.', 'good');
       $('netLeave').style.display = '';
       netRoomRender();
     } else if (s === 'closed') {
@@ -1581,6 +1795,7 @@
       // player left.
       netStatus(NET.leaving ? 'Left the room.' : 'The room closed.', 'busy');
       lsDisarm(NET.leaving ? 'you left the room' : 'the room closed');
+      netPartyReset();
       netRoomRender();
     } else if (s === 'failed') {
       netStatus('Could not connect' + (e.detail ? ': ' + e.detail : '.'), 'bad');
@@ -1598,10 +1813,14 @@
     // alike. genesis.html and snes.html switch on e.state; so does this now.
     session.on('status', netOnStatus);
     session.on('desync', netOnDesync);
-    session.on('lockstep', function () { netRoomRender(); });
+    session.on('lockstep', function (e) { if (e && e.barrier) NET.bar = e.barrier; netRoomRender(); });
     session.on('room', function () { netRoomRender(); });
-    session.on('roster', function () { netRoomRender(); });
-    session.on('barrier', function () { netRoomRender(); });
+    // The host's roster names the disc the room is on. A joiner loads THAT — not
+    // whatever its picker held — so the two agree at the barrier.
+    session.on('room-game', function (e) {
+      if (e && e.game && NET.role !== 'host') { var i = netPreselectGame(e.game); if (i >= 0) NET.gameIdx = i; }
+      netRoomRender();
+    });
     session.on('close', function () { lsDisarm('the room closed'); });
     // ⚠ THE ENGINE MUST EXIST BEFORE THE FIRST PEER IS SEATED, and it must carry
     // THIS console's numbers rather than lib/netplay.js's Dreamcast defaults
@@ -1612,6 +1831,9 @@
     } catch (e) {
       pageLog('[lockstep] ⚠ startLockstep failed: ' + ((e && e.message) || e));
     }
+    // The party tick: re-asks the auto-start every half second (an event can
+    // land before this side is seated) and keeps the live label honest.
+    if (!NET.tick) NET.tick = setInterval(netRoomRender, 500);
     netRoomRender();
   }
 
@@ -1623,8 +1845,8 @@
   function netRefuseIfRunning() {
     if (!started) return false;
     netStatus('This console is already running a game. Online play has to be set up BEFORE the game '
-      + 'starts, so that every player begins on the same frame — reload the page, join the room, then '
-      + 'press Start together.', 'bad');
+      + 'starts, so that every player begins on the same frame — reload the page and join the room; '
+      + 'the disc then loads and the game starts by itself.', 'bad');
     return true;
   }
 
@@ -1639,8 +1861,9 @@
     var code = (typeof presetCode === 'string' && /^[A-HJ-NP-Z2-9]{5}$/.test(presetCode)) ? presetCode : Netplay.makeCode(5);
     $('netCode').textContent = code;
     var game = netGameId();
+    NET.gameIdx = netGameIndex();
     NET.role = 'host';
-    netStatus('Room open for ' + game + '. Share the code — you both load the disc once you are in.', 'busy');
+    netStatus('Room open for ' + game + '. Share the code — the disc loads and the game starts by itself once someone joins.', 'busy');
     var s = new Netplay.Session({ game: game, host: true, code: code, portCount: PS1_PORTS, transport: netTransport() });
     netWire(s);
     pageLog('[net] room ' + code + ' open for ' + game);
@@ -1666,12 +1889,15 @@
       sel.value = String(i);
       sel.dispatchEvent(new Event('change'));
     });
+    NET.gameIdx = i;
     NET.role = 'guest';
     var s = new Netplay.Session({ game: game, host: false, code: code, portCount: PS1_PORTS, transport: netTransport() });
     netWire(s);
-    // ⚠ NO START LOCK. Under streaming a joiner had no emulator and must not
-    // launch one. Under lockstep a joiner runs their own console and MUST start
-    // it — that lock was the single line that made this two-machines-one-emulator.
+    // ⚠ NO START LOCK, AND NO START CLICK EITHER. Under streaming a joiner had
+    // no emulator and Start was disabled for it — the single line that made
+    // this two-machines-one-emulator. Under lockstep a joiner runs its own
+    // console, and the party loads it BY ITSELF the moment this side is seated
+    // (netMaybeAutoStart): there is nothing here for a person to press.
     pageLog('[net] joining room ' + code + ' (' + game + ')');
     await s.start();
   }
@@ -1682,6 +1908,7 @@
     if (s) { try { s.close(); } catch (e) {} }
     NET.session = null; NET.role = null;
     lsDisarm('you left the room');
+    netPartyReset();
     var lv = $('netLeave'); if (lv) lv.style.display = 'none';
     $('netHostPane').style.display = 'none'; $('netJoinPane').style.display = 'none';
     $('netRoom').style.display = 'none';
@@ -1701,7 +1928,9 @@
     var bits = ['<span class="mode">LOCKSTEP</span> ' + (NET.role || '')];
     if (ls) {
       bits.push('frame ' + ls.frame + ' · delay ' + ls.delay);
-      bits.push('ports ' + JSON.stringify(ls.roster) + ' mine ' + JSON.stringify(ls.localPorts));
+      // Port NUMBERS. The roster is 16-hex peer ids and this line used to print
+      // it whole — a nonce on screen, the same defect dreamcast's HUD shipped.
+      bits.push('ports ' + ls.portCount + ' · mine ' + JSON.stringify(ls.localPorts) + ' · party ' + netPartyState());
     }
     bits.push('fed ' + LS.frames + ' · ran ' + LS.workerFrame + ' · hashes ' + LS.hashes);
     if (LS.stalling || LS.waitingOn.length) {
@@ -1720,7 +1949,7 @@
         o.value = String(i); o.textContent = r.label;
         sel.appendChild(o);
       });
-      sel.value = String(ROM_INDEX);
+      sel.value = String(netGameIndex());
     }
     $('netOverlay').classList.add('on');
   }
@@ -1733,9 +1962,9 @@
   // an index-only link would. A bare number is still accepted, for a link typed
   // by hand. Returns the index, or -1 when the link names a disc this page has
   // not got — and then touches nothing.
-  // ⚠ ROM_INDEX IS SET HERE, NOT JUST #romSelect. netGameId() reads ROM_INDEX,
-  // and its only other writer is startEmulator() — so without that line a
-  // host=1 hand-off opens the room under ROMS[0]'s label whatever the link said.
+  // ⚠ ROM_INDEX IS SET HERE, NOT JUST #romSelect. lsDisc() reads ROM_INDEX and
+  // its only other writers are startEmulator() and netSyncPickersToRoom(); the
+  // room's NAME now comes from the picker (netGameIndex), which this also sets.
   // ⚠ CALL netOpen() FIRST: it populates #netGame lazily, and a value assigned
   // to an empty <select> is silently dropped.
   function netPreselectGame(game) {
@@ -1829,10 +2058,31 @@
   // as its "the emulator is actually running" witness.
   window.__ps1Net = function () {
     var ls = lsEngine();
+    var rep = netEngineReport();
     return {
       supported: netSupported(),
+      session: !!NET.session,
       architecture: 'lockstep',
       mode: NET.session ? (NET.role || 'in-room') : 'none',
+      // THE PARTY, as a rig sees it: the auto-declare (`declared`) and the
+      // auto-start (`autoStarted`) are assertable with no button anywhere, and
+      // `rows` is the panel's exact vocabulary rather than its rendered text.
+      party: {
+        code: NET.session ? NET.session.code : null,
+        seated: netSeatedCount(),
+        ports: ls ? ls.portCount : PS1_PORTS,
+        state: NET.session ? netPartyState() : null,
+        alone: NET.session ? netAlone() : null,
+        declared: !!(rep && rep.declaredReady),
+        able: !started && !netCapHeld(),
+        autoStart: true,
+        autoStarted: NET.autoStarted,
+        loading: !!started && !(rep && rep.declaredReady), loadPct: NET.loadPct, capHeld: netCapHeld(), gameIdx: NET.gameIdx,
+        rows: netPartyRows(),
+        label: $('btnNet') ? $('btnNet').textContent : null,
+        barrier: $('netBarrier') ? $('netBarrier').textContent : '',
+      },
+      engine: rep,
       // What the URL handed over — { code, game, host, join } — or null when it
       // carried no ?np=, so a rig can see what the page PARSED, not only what it
       // did about it.

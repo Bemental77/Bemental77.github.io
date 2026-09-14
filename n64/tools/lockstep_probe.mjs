@@ -624,25 +624,23 @@ async function runPair(browser, log) {
       armed[tag] = { frame: st.frame, viHz: st.viHz, state: st.state };
     }
 
-    // 2. BOTH PLAYERS PRESS READY — the rig does what a person does, because
-    //    that is the real trigger. There is deliberately no auto-ready in the
-    //    product (an earlier cut had one and the first machine to boot passed the
-    //    barrier alone with an empty roster), so a rig that bypassed the button
-    //    would be testing a path no player can take.
-    //    Wait until BOTH sides can see two seated ports first; pressing before
-    //    the peer is seated is exactly the bug the button exists to prevent.
+    // 2. NOBODY PRESSES READY — THERE IS NO BUTTON. Each page declares by
+    //    itself the instant Module.callMain RETURNS on a core it gated in
+    //    beforeRun (n64/index.html lsArmBeforeBoot -> declareWhenMainReturns ->
+    //    chooseDelayThenReady; an awaited IndexedDB read sits between the two
+    //    in dist/script.js, so gated is not yet booted), and the ENGINE refuses to release with fewer
+    //    than two distinct seated peers (lib/netplay.js _checkBarrier,
+    //    `info.alone`) — the guard an earlier auto-ready cut lacked when the
+    //    first machine to boot passed the barrier alone with an empty roster.
+    //    The wait is kept so step 3 is a statement about a room of two, not
+    //    about one machine: a rig that asserted `running` before both seats
+    //    were visible could pass on a party of one.
     for (const [tag, P] of [['host', A], ['join', B]]) {
       await waitFor(P.page, () => {
         const n = window.__n64Net && window.__n64Net();
         const ports = n && n.engine && n.engine.ports;
         return (ports && ports.filter((p) => p.peer).length >= 2) ? true : null;
       }, 180000, tag + ' to see both players seated');
-    }
-    for (const [tag, P] of [['host', A], ['join', B]]) {
-      await P.page.evaluate(() => {
-        const b = document.getElementById('netReady');
-        if (b && !b.disabled) b.click();
-      });
     }
 
     // 3. The barrier must release and BOTH must actually start running frames.

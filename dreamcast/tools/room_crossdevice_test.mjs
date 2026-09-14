@@ -543,9 +543,13 @@ const readRoster = (pg) => pg.evaluate(() => {
 // Seats that are actually held by somebody. The placeholder row the page draws
 // before the engine publishes a room ("the session has not published a room
 // yet") is NOT a seat and must not be counted as one.
+// A free seat draws "—" in the who-column and "open" in the state column (the
+// page's seat vocabulary); the older who-text "open" is still excluded so a
+// row from either form never counts as a person.
 const occupied = (r) => (r && r.rows ? r.rows : [])
   .map((x, i) => ({ i, ...x }))
-  .filter((x) => x.who && !/^open$/i.test(x.who) && !/has not published a room/i.test(x.who));
+  .filter((x) => x.who && !/^(open|—)$/i.test(x.who) && !/\bfree\b/.test(x.cls || '') &&
+                 !/has not published a room/i.test(x.who));
 // WHICH PORT THIS MACHINE WAS TOLD IT HOLDS. Read from the HUD sentence the
 // user photographed ("you are Player 2 (maple port 1)"), and — because the HUD
 // is a separate element that can be absent while the roster is fine — falling
@@ -621,14 +625,17 @@ const seedRead = (pg) => pg.evaluate(() => {
     skippedOwnState: /own saved state — seed skipped/.test(log),
     state: room && room.seed ? room.seed.state : null,
     why:   room && room.seed ? room.seed.why   : null,
-    readyShown:   room ? room.readyShown   : null,
-    readyEnabled: room ? room.readyEnabled : null,
+    // There is no Ready button any more. `able` is the page's own answer to
+    // "may this console declare" and `declared` whether it has, BY ITSELF —
+    // the pair the old readyEnabled/readyShown described a button with.
+    able:     room && room.party ? !!room.party.able     : null,
+    declared: room && room.party ? !!room.party.declared : null,
     barrier: room ? room.barrier : null,
   };
 });
 const seedDisc = () => SEEDED_DISCS.includes(GAME);
 
-// OPEN "Play Online" THE WAY A PERSON DOES, FROM WHATEVER STATE THIS PAGE IS IN
+// OPEN "Party" THE WAY A PERSON DOES, FROM WHATEVER STATE THIS PAGE IS IN
 // RIGHT NOW. The entry scan at the top of an arm runs before anything is
 // started, and on a phone it finds #mobileSplashNet — a control INSIDE the
 // splash that pressing Start HIDES. A player who has already started a game
@@ -645,7 +652,7 @@ async function openLobbyNow(pg, preferred) {
   for (const id of order) {
     if (tried.indexOf(id) >= 0) continue;
     tried.push(id);
-    const r = await human(pg, '#' + id, 'Play Online');
+    const r = await human(pg, '#' + id, 'Party');
     if (r.ok) return r;
   }
   if (pg.__mobile) {
@@ -653,7 +660,7 @@ async function openLobbyNow(pg, preferred) {
     if (m.ok) {
       await sleep(500);
       for (const id of ['mNet', 'btnNet']) {
-        const r = await human(pg, '#' + id, 'Play Online');
+        const r = await human(pg, '#' + id, 'Party');
         if (r.ok) { r.viaMenu = true; return r; }
       }
     }
@@ -902,7 +909,7 @@ async function runArm(armName) {
     }));
     D.entry = entry;
     cell(entry.every((e) => e.found.length > 0), 'both-machines-offer-a-way-in',
-      `a visible "Play Online" control on both: ${J(entry.map((e) => e.role + ':' + e.found[0]))}`,
+      `a visible "Party" control on both: ${J(entry.map((e) => e.role + ':' + e.found[0]))}`,
       `no visible online-play control: ${J(entry)} — on that device the product cannot be entered at all`);
 
     // Two profiles must not be able to hear each other except through the
@@ -937,8 +944,8 @@ async function runArm(armName) {
     cell(hostPick.ok, 'host-can-pick-the-disc', `#romSelect set to ${GAME}`,
       `could not pick ${GAME}: ${J(hostPick)}`);
     const openLobby = await openLobbyNow(host, entry[0].found[0]);
-    cell(openLobby.ok, 'host-can-open-the-lobby', 'the host pressed "Play Online" with the mouse',
-      `the host could not press "Play Online": ${openLobby.why}`);
+    cell(openLobby.ok, 'host-can-open-the-lobby', 'the host pressed "Party" with the mouse',
+      `the host could not press "Party": ${openLobby.why}`);
     await sleep(600);
     const hostRoom = await human(host, '#netHostBtn', 'Open a room');
     cell(hostRoom.ok, 'host-can-open-a-room', 'the host pressed "Open a room"',
@@ -1538,14 +1545,15 @@ async function runArm(armName) {
     // the barrier's whole job is to hold every peer until all are loaded, so a
     // console that declares itself ready while a 27 MB machine image is still
     // to come has lied to the barrier about what it is holding at frame 0.
-    // Sampled BEFORE anybody presses ready, which is the only moment at which
-    // the distinction is observable.
+    // The declare is AUTOMATIC now (no Ready button), so this is sampled as the
+    // consoles finish loading, and the honest-refusal half below reads the
+    // page's own `party.able` / `party.declared` rather than a button's state.
     let seedPre = null;
     if (seedDisc()) {
       seedPre = await Promise.all(pages.map(async (pg) => ({ role: pg.__role, ...(await seedRead(pg)) })));
       D.seedBeforeReady = seedPre;
       seedPre.forEach((s) => say(`  ....  seed[${s.role}] state=${s.state} applied=${s.applied} ` +
-                                 `loadedOK=${s.loadedOK} readyEnabled=${s.readyEnabled}`));
+                                 `loadedOK=${s.loadedOK} able=${s.able} declared=${s.declared}`));
       cell(seedPre.every((s) => s.loadedOK && !s.loadFailed),
         'both-peers-are-SEEDED-before-either-can-declare-ready',
         `both consoles applied the boot seed and the core ACCEPTED it before the barrier was touched: ` +
@@ -1559,16 +1567,26 @@ async function runArm(armName) {
       // seed must not be able to press ready. Only meaningful when one failed.
       const stuck = seedPre.filter((s) => !s.loadedOK);
       if (stuck.length) {
-        cell(stuck.every((s) => s.readyEnabled === false),
+        cell(stuck.every((s) => s.able === false && s.declared === false),
           'an-unseeded-console-cannot-declare-itself-ready',
-          `the console(s) that could not seed are held out of the barrier: ${J(stuck.map((s) => s.role + ' readyEnabled=' + s.readyEnabled))}`,
-          `an UNSEEDED console can still press ready: ${J(stuck.map((s) => s.role + ' readyEnabled=' + s.readyEnabled))} — ` +
+          `the console(s) that could not seed are held out of the barrier: ${J(stuck.map((s) => s.role + ' able=' + s.able + ' declared=' + s.declared))}`,
+          `an UNSEEDED console declared itself anyway: ${J(stuck.map((s) => s.role + ' able=' + s.able + ' declared=' + s.declared))} — ` +
           'it will start a room it is guaranteed to diverge from, silently');
       }
     }
 
-    // -- 5b. READY, pressed as a button, on both ---------------------------
-    say('\n-- both players press "I\'m ready" — the only control the barrier has');
+    // -- 5b. NOBODY PRESSES ANYTHING — each console declares and the room starts BY ITSELF
+    // ⚠ THIS USED TO PRESS "I'm ready" ON BOTH MACHINES. That control is gone
+    // (user, 2026-09-13: "should start when both are able to start, instead of
+    // an I'm ready button and dumb conditions to start the damn game"), so the
+    // rig now does the one thing a person does here: NOTHING. It reads each
+    // side's `party.able` flip to true as its disc finishes and its gate arms,
+    // reads `party.declared` flip to true BY ITSELF afterwards, and then reads
+    // the barrier release. A rig that pressed anything here — or called
+    // setReady as a fallback (the self-audit refuses that pattern) — would
+    // green-light a page whose auto-declare is missing.
+    say('\n-- nobody presses anything: each console declares itself, and the room starts by itself');
+    const partyOf = (pg) => pg.evaluate(() => (typeof window.__dcNetRoom === 'function' ? window.__dcNetRoom().party : null));
     for (const pg of pages) {
       const r = await readRoster(pg);
       // ⚠ INDEX BY WHICH PAGE THIS IS, NOT BY FORM FACTOR. This read
@@ -1605,32 +1623,67 @@ async function runArm(armName) {
       const eIdx = pages.indexOf(pg);
       if (!r.overlayOpen) await openLobbyNow(pg, entry[eIdx] && entry[eIdx].found[0]);
       await sleep(500);
-      // The button is disabled until this machine's own disc is fully loaded.
-      const gotReady = await until(pg, () => {
-        const b = document.getElementById('netReady');
-        return (b && b.style.display !== 'none' && !b.disabled) ? true : null;
+      // ABLE: this machine's own disc is fully loaded and its gate is armed
+      // (and, on pso2, the seed is applied and the agreed cards installed) —
+      // the same predicate the deleted button's `disabled` was computed from.
+      const able = await until(pg, () => {
+        const p = (typeof window.__dcNetRoom === 'function') ? window.__dcNetRoom().party : null;
+        return (p && p.able) ? p : null;
       }, 120000, 1000);
-      if (!gotReady) {
-        bad('both-players-can-press-ready',
-          `${pg.__role}: "I'm ready" never became pressable (shown/enabled) — the barrier has no other control, so ` +
-          'this room can never start');
-        continue;
-      }
-      const c = await human(pg, '#netReady', "I'm ready");
-      cell(c.ok, 'both-players-can-press-ready', `${pg.__role} pressed "I'm ready"`,
-        `${pg.__role} could not press ready: ${c.why}`);
-      await sleep(800);
+      cell(!!able, 'each-console-becomes-able-by-itself',
+        `${pg.__role} is able to declare: ${J(able && { state: able.state, seated: able.seated, alone: able.alone, rows: able.rows })}`,
+        `${pg.__role} never became able to declare — party ${J(await partyOf(pg))}; nothing can start this room`);
+      if (!able) continue;
+      // DECLARED, with nothing pressed. A few ticks of grace: the host awaits
+      // an RTT probe (lsChooseDelay, ≤600 ms per peer) before it declares.
+      const declared = await until(pg, () => {
+        const p = (typeof window.__dcNetRoom === 'function') ? window.__dcNetRoom().party : null;
+        return (p && p.declared) ? p : null;
+      }, 15000, 250);
+      cell(!!declared, 'each-console-declares-ready-by-itself',
+        `${pg.__role} declared itself ready with no control pressed (state ${declared && declared.state}, ` +
+        `alone ${declared && declared.alone}, sentence "${declared && declared.sentence}")`,
+        `${pg.__role} was able but never declared — party ${J(await partyOf(pg))}. The auto-declare is missing, ` +
+        'and there is no button left that could start this room');
+      if (!declared) continue;
+      // ⚠ THE DECLARE NAMES WHAT THE CONSOLE HOLDS — the disc, the seed state
+      // AND the card set's fingerprint. On pso2 the page once declared
+      // "pso2#seeded" from inside the seed path, before the card exchange had
+      // begun: both sides' tags matched on the omission, the barrier released
+      // with the cards unmet, and the cores sat at frame 2 for the rest of the
+      // run while every non-seeded arm passed. `declaredTag` is what was SENT;
+      // `holds` is roomDiscTag() NOW; `cards.hash` is the installed set. A
+      // declare that omits an installed set, or a seed the core confirmed, is
+      // the defect — whatever the barrier then does.
+      const held = await pg.evaluate(() => {
+        const r = (typeof window.__dcNetRoom === 'function') ? window.__dcNetRoom() : null;
+        return r ? { declaredTag: r.party && r.party.declaredTag, holds: r.party && r.party.holds,
+                     seed: r.seed && r.seed.state, cards: r.cards && r.cards.state, hash: r.cards && r.cards.hash } : null;
+      });
+      const namesCards = !held || held.cards !== 'ok' || (!!held.hash && String(held.declaredTag || '').indexOf('#cards:' + held.hash) >= 0);
+      const namesSeed = !held || held.seed !== 'ok' || /#seeded/.test(String(held.declaredTag || ''));
+      cell(!!held && !!held.declaredTag && held.declaredTag === held.holds && namesCards && namesSeed,
+        'the-declare-names-what-the-console-holds',
+        `${pg.__role} sent "${held && held.declaredTag}" — the disc${held && held.seed === 'ok' ? ', the seed' : ''}` +
+        `${held && held.cards === 'ok' ? ' and the installed card set ' + held.hash : ''}; it still holds exactly that`,
+        `${pg.__role} declared "${held && held.declaredTag}" while it holds "${held && held.holds}" ` +
+        `(seed ${held && held.seed}, cards ${held && held.cards} ${held && held.hash}) — a declare that omits a ` +
+        'frame-0 prerequisite lets the barrier release on two consoles that only LOOK alike');
     }
-    await sleep(4000);
+    // The barrier releases on its own once both have declared — no click and
+    // no fallback. Waited for rather than slept: the host's declare rides an
+    // RTT probe, and a fixed 4 s would read a slow probe as a stuck room.
+    await until(host, () => /started together at frame/i.test(((document.getElementById('netBarrier') || {}).textContent || '')) ? true : null, 20000, 500);
+    await sleep(1500);
     const bars = await Promise.all(pages.map(readRoster));
     D.barrier = bars.map((b) => b.barrier);
     await shot(host, '6-barrier'); await shot(join, '6-barrier');
     say(`  ....  host barrier: "${bars[0].barrier}"  |  join barrier: "${bars[1].barrier}"`);
-    cell(bars.every((b) => /started together at frame/i.test(b.barrier)),
+    cell(bars.every((b) => /Playing — everyone started together at frame/i.test(b.barrier)),
       'the-barrier-releases',
-      `both machines print the release: ${J(bars.map((b) => b.barrier))}`,
+      `both machines print the release BY THEMSELVES: ${J(bars.map((b) => b.barrier))}`,
       `the barrier never released: ${J(bars.map((b) => b.barrier))} — this is the "waiting for players" the user was ` +
-      'left staring at');
+      'left staring at, and there is no button that could have released it');
 
     // -- 5b. THE CARDS CARRIED INTO THE ROOM, AND ARE THE SAME ON BOTH -----
     // The invariant is absolute: every peer holds BYTE-IDENTICAL guest-visible

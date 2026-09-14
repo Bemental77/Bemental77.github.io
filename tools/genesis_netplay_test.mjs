@@ -23,10 +23,20 @@
 //   1. The room forms and seats TWO ports — the console's real count.
 //   2. Each peer holds a DIFFERENT port. (Both on port 0 would look like it
 //      worked and would mean one player driving both characters.)
-//   3. NEITHER core ran a frame before the gate was armed. This is the ordering
-//      that cannot be recovered from: a core that free-ran even one frame is a
-//      frame ahead forever.
+//   3. NOBODY PRESSES START. User, 2026-09-13: "should start when both are
+//      able to start, instead of an I'm ready button and dumb conditions to
+//      start the damn game." Both cores arm the gate BY THEMSELVES once two are
+//      seated (the page presses its own Start); a click here is a FALLBACK
+//      that fails the cell. And a host ALONE never starts — checked before the
+//      joiner arrives, since the engine refuses a party of one.
+//   3b. NEITHER core ran a frame before the gate was armed: `armedAtFrame` is
+//      latched at arming and must read 0, and every frame run must be a gated
+//      one. (The old cell read the frame counter at a moment the product now
+//      legitimately races past; the latched value cannot race.)
 //   4. Both cores advance, and advance TOGETHER (frame counts within one).
+//   4b. The ONE control reads "Party · CODE · 2/2 · playing", every seat is in
+//      the panel's exact vocabulary, no 16-hex nonce reaches the screen, and
+//      the status line says everyone started together.
 //   5. A key held on peer A appears in peer B's core input image AT PORT A's
 //      INDEX — the actual proof that a remote pad reaches the other console.
 //   6. Fingerprints were exchanged and the engine reported NO desync.
@@ -144,6 +154,11 @@ async function openPeer(browser, tag, role) {
        `visibilityState host=${vis[0]} guest=${vis[1]} — a hidden page gets no rAF and would run zero frames`);
     ok('peers-loaded', true, 'two genesis.html windows, core initialised, no game loaded yet');
 
+    // THE ONE CONTROL. With no room it reads exactly "Party"; inside one it is
+    // the live status readout (checked again once the room is playing).
+    const label0 = await A.page.evaluate(() => document.getElementById('btnNet').textContent.trim());
+    ok('the-party-button-reads-Party-with-no-room', label0 === 'Party', `#btnNet reads "${label0}"`);
+
     // Drive the REAL controls, not an internal API: the host opens the panel and
     // opens a room, the page mints its own code, and the guest types that code
     // in. A test that called the session constructor directly would pass on a
@@ -153,7 +168,24 @@ async function openPeer(browser, tag, role) {
       document.getElementById('netHostBtn').click();
       return document.getElementById('netCode').textContent.trim();
     });
-    await sleep(800);
+
+    // ---- A HOST ALONE NEVER STARTS ----------------------------------------
+    // The page auto-declares and auto-loads, so the guard against a party of
+    // one has to hold with NOBODY else in the room: three seconds alone, and
+    // the core must be neither loading, armed nor live, and the status line
+    // must say it is waiting for another player.
+    await sleep(3000);
+    const alone = await A.page.evaluate(() => {
+      const n = window.__genNet();
+      return { armed: n.armed, live: n.live, party: n.party,
+               barrier: (document.getElementById('netBarrier') || {}).textContent || '' };
+    });
+    ok('a-host-alone-never-starts',
+       !alone.armed && !alone.live && alone.party.autoStarted === false && alone.party.seated <= 1
+         && alone.party.alone === true && /^Waiting for another player — share the code [A-HJ-NP-Z2-9]{5}\./.test(alone.barrier.trim()),
+       `after 3 s alone: armed=${alone.armed} live=${alone.live} seated=${alone.party.seated} alone=${alone.party.alone} `
+       + `autoStarted=${alone.party.autoStarted} label="${alone.party.label}" status="${alone.barrier.trim()}"`);
+
     await B.page.evaluate((code) => {
       document.getElementById('btnNet').click();
       document.getElementById('netJoinBtn').click();
@@ -194,27 +226,41 @@ async function openPeer(browser, tag, role) {
     ok('each-peer-holds-a-different-port', pa != null && pb != null && pa !== pb,
        `host=port ${pa}, guest=port ${pb}`);
 
-    // ---- 2. NOTHING HAS RUN YET ------------------------------------------
-    const framesBefore = await Promise.all([
-      A.page.evaluate(() => window.__genFrames | 0),
-      B.page.evaluate(() => window.__genFrames | 0),
-    ]);
-    ok('no-core-ran-before-the-room-formed', framesBefore[0] === 0 && framesBefore[1] === 0,
-       `frames run so far: ${framesBefore.join('/')}`);
-
-    // ---- 3. BOTH PRESS START --------------------------------------------
-    // Under lockstep a joiner runs their own console and MUST start it. Under
-    // streaming this button was disabled for a guest — that single line was
-    // what made the old page two-machines-one-emulator.
-    await Promise.all([
-      A.page.evaluate(() => document.getElementById('btnStart').click()),
-      B.page.evaluate(() => document.getElementById('btnStart').click()),
-    ]);
-
-    const armed = async (p) => p.page.waitForFunction(
-      () => window.__genNet().armed, { timeout: 60000, polling: POLL_MS }).then(() => true).catch(() => false);
-    const [aa, ab] = await Promise.all([armed(A), armed(B)]);
+    // ---- 2+3. NOBODY PRESSES START ------------------------------------------
+    // ⚠ THE CELL THIS FILE NOW EXISTS FOR. The old flow clicked #btnStart on
+    // both peers right here; a page that still needs that click passes nothing
+    // below. `armed` is set inside bootRom() between the core's load call and
+    // `running = true`, so an armed core is one the PAGE loaded by itself, and
+    // `party.autoStarted` is the page's own record of having pressed it.
+    // The old 'no-core-ran-before-the-room-formed' cell read the frame counter
+    // here and required 0 — with the room loading and releasing both cores by
+    // itself the instant the second seat fills, that read races the product
+    // WORKING. The property it stood for is `armedAtFrame === 0` (latched at
+    // arming, cannot race) plus 'no-ungated-frame-was-run' below.
+    const armed = async (p, ms) => p.page.waitForFunction(
+      () => window.__genNet().armed, { timeout: ms, polling: POLL_MS }).then(() => true).catch(() => false);
+    let [aa, ab] = await Promise.all([armed(A, 60000), armed(B, 60000)]);
+    const autoParty = await Promise.all([A, B].map((p) => p.page.evaluate(() => window.__genNet().party)));
+    const byItself = aa && ab && autoParty.every((q) => q && q.autoStart === true && q.autoStarted === true);
+    ok('the-room-started-both-cores-by-itself', byItself,
+       `host armed=${aa} guest armed=${ab} with NO Start click · autoStarted=${autoParty.map((q) => q && q.autoStarted).join('/')} `
+       + `declared=${autoParty.map((q) => q && q.declared).join('/')} labels=${JSON.stringify(autoParty.map((q) => q && q.label))} `
+       + `status=${JSON.stringify(autoParty.map((q) => q && q.barrier))}`);
+    if (!(aa && ab)) {
+      // FALLBACK, only so the cells below still measure lockstep on a page whose
+      // auto-start is broken. The cell above has already FAILED; this cannot
+      // un-fail it.
+      console.log('  ....  fallback  clicking Start on the peer(s) that did not start by themselves — the cell above stays FAILED');
+      await Promise.all([
+        aa ? null : A.page.evaluate(() => document.getElementById('btnStart').click()),
+        ab ? null : B.page.evaluate(() => document.getElementById('btnStart').click()),
+      ]);
+      [aa, ab] = await Promise.all([armed(A, 60000), armed(B, 60000)]);
+    }
     ok('both-cores-armed-the-frame-gate', aa && ab, `host armed=${aa} guest armed=${ab}`);
+    const armedAt = await Promise.all([A, B].map((p) => p.page.evaluate(() => window.__genNet().armedAtFrame)));
+    ok('the-gate-closed-at-frame-0', armedAt.every((f) => f === 0),
+       `armedAtFrame host=${armedAt[0]} guest=${armedAt[1]} — latched at arming, so it cannot race the barrier release`);
 
     // THE ORDERING ASSERTION THAT MATTERS MOST. `armed` is set inside bootRom()
     // between gpx_load() and `running = true`, with no await in between, so if
@@ -232,6 +278,29 @@ async function openPeer(browser, tag, role) {
       () => window.__genNet().frames > 30, { timeout: 60000, polling: POLL_MS }).then(() => true).catch(() => false);
     const [ra, rb] = await Promise.all([running(A), running(B)]);
     ok('both-cores-advance', ra && rb, `host running=${ra} guest running=${rb}`);
+
+    // ---- 4b. THE PARTY BUTTON AND THE PANEL SAY SO ------------------------
+    // One control, live text; seats in the panel's exact vocabulary; a seat is
+    // "host" or "player" and never a peer id; and the status line names the
+    // frame everyone started on. Asserted on the seam AND on the rendered
+    // roster text, because the nonce defect was in the RENDERED string.
+    const VOCAB = /^(connecting|loading \d+%|loaded|ready|playing|disconnected|open)$/;
+    const partyNow = await Promise.all([A, B].map((p) => p.page.evaluate(() => {
+      const n = window.__genNet();
+      return { party: n.party,
+               roster: Array.from(document.querySelectorAll('#netRoster li')).map((li) => li.textContent.trim()) };
+    })));
+    ok('the-party-button-is-live',
+       partyNow.every((q) => /^Party · [A-HJ-NP-Z2-9]{5} · 2\/2 · (starting|playing)$/.test(q.party.label)),
+       `#btnNet reads ${JSON.stringify(partyNow.map((q) => q.party.label))}`);
+    ok('seats-use-the-vocabulary-and-never-a-nonce',
+       partyNow.every((q) => q.party.rows.length === 2
+         && q.party.rows.every((r) => VOCAB.test(r.state) && (r.port === 0 ? r.who === 'host' : r.who === 'player'))
+         && q.roster.length === 2 && !q.roster.some((t) => /\b[0-9a-f]{16}\b/.test(t))),
+       `rows=${JSON.stringify(partyNow.map((q) => q.party.rows))} rendered=${JSON.stringify(partyNow.map((q) => q.roster))}`);
+    ok('the-status-line-says-everyone-started-together',
+       partyNow.every((q) => /^Playing — everyone started together at frame \d+\.$/.test(q.party.barrier)),
+       `#netBarrier reads ${JSON.stringify(partyNow.map((q) => q.party.barrier))}`);
 
     // ---- 5. A KEY ON ONE MACHINE REACHES THE OTHER'S CORE -----------------
     // Held for well over the input delay so it cannot be missed, and asserted on

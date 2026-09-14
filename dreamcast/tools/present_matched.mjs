@@ -271,25 +271,33 @@ const tap = async (pg, key) => {
     say(`  ....  P${i + 1} booted`);
   }
 
-  // ---- 3b. RELEASE THE START BARRIER (gated arm only) ----------------------
-  // ⚠ SOMEBODY HAS TO PRESS READY. Under lockstep the page arms the frame gate
-  // between the disc load and {cmd:'freerun',on:1}, so every core parks on an
-  // EMPTY queue at frame 0 until the last player declares ready. Skipping this
-  // does not produce a slow room — it produces four cores that have run zero
-  // frames, emit no [vbl] heartbeat at all, and hold a static picture. Measured
-  // here first time out: 0 samples and distinct signatures [1,1,1,1] after 90 s
-  // of key taps. That is the barrier working, not a wedge.
+  // ---- 3b. WAIT FOR THE START BARRIER TO RELEASE BY ITSELF (gated arm only) --
+  // ⚠ THE BARRIER HOLDS UNTIL EVERY CONSOLE HAS DECLARED. Under lockstep the
+  // page arms the frame gate between the disc load and {cmd:'freerun',on:1},
+  // so every core parks on an EMPTY queue at frame 0 until the last player is
+  // ready. Measuring before that does not produce a slow room — it produces
+  // four cores that have run zero frames, emit no [vbl] heartbeat at all, and
+  // hold a static picture. Measured here first time out: 0 samples and
+  // distinct signatures [1,1,1,1] after 90 s of key taps. That is the barrier
+  // working, not a wedge.
+  // ⚠ NOTHING IS PRESSED AND NOTHING IS CALLED. This used to click #netReady
+  // and fall back to session.setReady(); the button is gone (user, 2026-09-13)
+  // and the fallback would let a page with no auto-declare measure as if it
+  // had one. Each page declares by itself; wait for its own `party.declared`
+  // and abort if one never flips.
   if (GATED) {
     const readyPath = [];
+    const t0 = Date.now();
     for (let i = 0; i < PLAYERS; i++) {
-      readyPath.push(await pages[i].evaluate(() => {
-        const b = document.getElementById('netReady');
-        if (b && !b.disabled && b.style.display !== 'none') { b.click(); return 'button'; }
-        const s = (window.Netplay.sessions || []).filter((x) => x.state !== 'closed').pop();
-        if (s && typeof s.setReady === 'function') { s.setReady(true); return 'api'; }
-        return 'none';
-      }));
-      await sleep(500);
+      const p = await until(pages[i], () => {
+        const q = (typeof window.__dcNetRoom === 'function') ? window.__dcNetRoom().party : null;
+        return (q && q.declared) ? q : null;
+      }, Math.max(5000, 30000 - (Date.now() - t0)), 250);
+      readyPath.push(p ? 'auto@' + (Date.now() - t0) + 'ms' : 'never');
+    }
+    if (readyPath.some((r) => r === 'never')) {
+      say(`  ⚠ a console never declared ready by itself (${J(readyPath)}) — ABORTING rather than measuring parked cores`);
+      process.exit(2);
     }
     await sleep(2000);
     const st = await Promise.all(pages.map((pg) => pg.evaluate(() => {

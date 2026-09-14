@@ -44,6 +44,23 @@
 // only page JS it evaluates is READ-ONLY state through the pages' own published
 // seams, window.__genNet() / window.__n64Net().
 //
+// NO CLICK STARTS THE GAME. Each console declares itself ready the instant its
+// core is gated and the room starts by itself once two are loaded (the user's
+// directive of 2026-09-13; the engine never releases with fewer than two
+// distinct seated peers — lib/netplay.js _checkBarrier, `info.alone`). So the
+// barrier cells assert the ABSENCE of a click (`no-ready-click-was-needed`) and
+// that a console declared ahead of its partner HELD rather than started
+// (`a-host-alone-never-starts`).
+//
+// NEVER A NONCE. The engine's own fail strings name peers by PEER ID, and a
+// peer id is a 16-hex stableNonce; a page that renders them raw prints exactly
+// what the design forbids. The last cell of every arm FREEZES the joiner with
+// the debugger, lets the host stall past its budget, and reads the sentence
+// each role draws (`a-stall-fail-never-shows-a-nonce`). And on N64 the save
+// file has to stay out of the room — `the-saved-game-is-not-loaded-online`
+// reads the page's own log line on both roles, because the neuter that was
+// supposed to produce it measured 0 lines across three earlier runs.
+//
 // ARMS
 //   warm  — the profile is reused, i.e. the HTTP cache already holds the core
 //           and the ROM. This is a returning player.
@@ -234,6 +251,58 @@ function admitWatcher(page, tag) {
 }
 
 // ---------------------------------------------------------------------------
+// THE ONE-DECLARED WINDOW. "A console alone never starts" can only be asserted
+// while exactly one console has declared and the other has not, so both seams
+// are sampled every 50 ms from the moment a boot can begin and the FIRST sample
+// in which exactly one side is declared is kept, with what that side was doing.
+// `party.declared` is the page's own statement that it called setReady
+// (n64/index.html lsParty); a page that publishes no `party` yet is read through
+// the engine's declaredReady (lib/netplay.js report()) — the same fact from the
+// other side — so the cell is honest on both consoles. Read-only, like every
+// other evaluate in this file.
+// ---------------------------------------------------------------------------
+const declaredOf = (n) => !!(n && ((n.party && n.party.declared) || (n.engine && n.engine.declaredReady)));
+function windowWatcher(pages, seam, ui) {
+  const h = { stop: false, first: null, order: [], done: false };
+  (async () => {
+    while (!h.stop) {
+      let a = null, b = null;
+      try { [a, b] = await Promise.all([netState(pages.host, seam), netState(pages.join, seam)]); } catch (e) {}
+      const dh = declaredOf(a), dj = declaredOf(b);
+      if (dh && !h.order.includes('host')) h.order.push('host');
+      if (dj && !h.order.includes('join')) h.order.push('join');
+      if (!h.first && dh !== dj) {
+        h.first = { at: Date.now(), declared: dh ? 'host' : 'join',
+          host: { declared: dh, running: !!(a && a.running), frame: (a && a.frame) | 0, party: (a && a.party) || null },
+          join: { declared: dj, running: !!(b && b.running), frame: (b && b.frame) | 0, party: (b && b.party) || null } };
+        // The DOM is read at once — n64/index.html draws the panel in the same
+        // breath it sets `declared` — and, where that read is not yet the
+        // loading sentence (a page that only redraws on its 400 ms tick), once
+        // more after a tick, but only while the window is still open: a read
+        // inside the tick is the PREVIOUS state's words, and it measured
+        // exactly that ("waiting for host (you), player 2" with the host
+        // already declared on the seam). A stale read is discarded, never
+        // asserted; an unread window VOIDs that half of the cell.
+        const lone = dh ? 'host' : 'join';
+        const fresh = (u) => !!(u && / · loading$/.test(u.button || '') && /^Starts by itself when everyone is loaded/.test(u.msg || ''));
+        try { [h.first.host.ui, h.first.join.ui] = await Promise.all([partyUi(pages.host, ui), partyUi(pages.join, ui)]); } catch (e) {}
+        if (!fresh(h.first[lone].ui)) {
+          await sleep(450);
+          let a2 = null, b2 = null;
+          try { [a2, b2] = await Promise.all([netState(pages.host, seam), netState(pages.join, seam)]); } catch (e) {}
+          if (declaredOf(a2) !== declaredOf(b2)) {
+            try { [h.first.host.ui, h.first.join.ui] = await Promise.all([partyUi(pages.host, ui), partyUi(pages.join, ui)]); } catch (e) {}
+          } else { h.first.host.ui = null; h.first.join.ui = null; }
+        }
+      }
+      if (dh && dj) { h.done = true; break; }
+      await sleep(50);
+    }
+  })();
+  return h;
+}
+
+// ---------------------------------------------------------------------------
 // THE TWO CONSOLES. Everything that differs between them lives here, so the
 // body of the test below is one code path and cannot drift between consoles.
 // ---------------------------------------------------------------------------
@@ -287,9 +356,15 @@ const CONSOLES = {
     // way, so the rig does too rather than clicking through it.
     closeFirst: '#netClose',
     start: '#btnStart',
+    // The one control and the one sentence, read as TEXT (see partyUi).
+    ui: { button: '#btnNet', msg: '#netBarrier' },
     // Genesis declares itself ready from inside lsArmBeforeFreerun
-    // (genesis.html:735-742) — there is no Ready button to press.
+    // (genesis.html:753-779) — there is no Ready button to press. Kept as a
+    // field so a console that grows one again is a visible edit here.
     ready: null,
+    // No save memory reaches a Genesis room's core, so there is no line to
+    // read; the cell is skipped, not voided (nothing is missing from the rig).
+    bootLog: null,
   },
   n64: {
     label: 'N64',
@@ -322,15 +397,24 @@ const CONSOLES = {
       if (!t.typed) return { clicked: false, why: t.why };
       return await clickReal(p, '#btnJoin');
     },
+    ui: { button: '#btnNet', msg: '#lsMsg' },
     // Nothing to press: n64/index.html presses its own Start once the room
     // reports `connected`, because the room is deliberately formed BEFORE
     // anything boots (an earlier cut that booted in parallel had the WebRTC
     // handshake fail every time, the host being busy instantiating a 12 MB ROM).
     start: null,
-    // N64 DOES have a start barrier button and it is deliberate: the page
-    // comments record that an earlier auto-ready let the first machine to boot
-    // pass the barrier alone with an empty roster.
-    ready: '#netReady',
+    // ⚠ NO READY CONTROL ANY MORE, ON PURPOSE. n64/index.html declares by
+    // itself the instant lsArmBeforeBoot() gates the core; the failure its old
+    // button existed to prevent (an earlier auto-ready let the first machine to
+    // boot pass the barrier alone with an empty roster) is closed in the
+    // engine, which never releases with fewer than two distinct seated peers
+    // (lib/netplay.js _checkBarrier, `info.alone`). A rig that looked for a
+    // button here would be testing a path no player has.
+    ready: null,
+    // The page's own word that dist/script.js's LoadSram was NOT allowed to
+    // write this browser's <rom>.sram into /game.savememory before callMain
+    // (n64/index.html neuterSram). Read from the console on both roles.
+    bootLog: '[lockstep] saved game NOT loaded',
   },
 };
 
@@ -338,6 +422,18 @@ const CONSOLES = {
 const netState = (page, seam) => page.evaluate((s) => {
   try { return window[s] ? window[s]() : null; } catch (e) { return { error: String(e) }; }
 }, seam);
+// What the page DRAWS — the one control's text and the one sentence — because
+// a seam can be right while the pixels say "Press Ready". Null where the page
+// has no such element, which VOIDs the cell rather than failing it.
+const partyUi = (page, ui) => page.evaluate((u) => {
+  const t = (sel) => { const el = sel && document.querySelector(sel); return el ? (el.textContent || '').trim() : null; };
+  return { button: t(u && u.button), msg: t(u && u.msg) };
+}, ui || null).catch(() => ({ button: null, msg: null }));
+// The row vocabulary, exactly (n64/index.html lsParty; the design every page
+// converges on). Anything else on a row — a nonce, "in", "—" — fails.
+const ROW_STATE = /^(connecting|loading \d{1,3}%|loaded|ready|playing|disconnected|open)$/;
+const rowsOk = (p) => !!(p && Array.isArray(p.rows) && p.rows.length && p.rows.every((r) =>
+  ROW_STATE.test(String(r.state)) && (r.who === 'host' || r.who === 'player' || r.who === null)));
 
 // ---------------------------------------------------------------------------
 // One arm: one console, one profile temperature.
@@ -350,6 +446,13 @@ async function runArm(consoleName, temp) {
   const detail = { load: load1() };
   const browsers = [];
   const pages = {};
+  let watch = null, throttle = null;
+  const releaseThrottle = async () => {
+    const t = throttle; throttle = null;
+    if (!t) return;
+    try { await t.send('Emulation.setCPUThrottlingRate', { rate: 1 }); } catch (e) {}
+    try { await t.detach(); } catch (e) {}
+  };
 
   const launch = async (role) => {
     const dir = path.join(PROFBASE, consoleName, role);
@@ -422,6 +525,30 @@ async function runArm(consoleName, temp) {
       return detail;
     }
 
+    // ---- 0b. THE ONE-DECLARED WINDOW IS WATCHED FROM HERE ----------------
+    // Armed BEFORE the room forms. See windowWatcher; a page still navigating
+    // (the N64 pair moves lobby -> emulator in step 1) simply reads as not
+    // declared until it is there.
+    watch = windowWatcher(pages, C.seam, C.ui);
+    // ⚠ A CONSOLE THAT PRESSES ITS OWN START BOOTS BOTH SIDES AT THE SAME
+    // INSTANT — `connected` fires on both ends of one data channel — so the
+    // window in which the host is declared and the joiner is not is a race
+    // between two boots on one box, i.e. sometimes unobservable. The joiner is
+    // therefore made the slower device until the window has been seen (CDP CPU
+    // throttling, the lever a slow phone is emulated with). It slows the
+    // JOINER's JS only; nothing in either page is driven. Armed here and not
+    // after admission because Genesis starts itself the instant `connected`
+    // fires — within the admission poll — and a throttle applied after the
+    // Allow click landed on a joiner that had already booted (VOID, measured).
+    try {
+      throttle = await pages.join.target().createCDPSession();
+      await throttle.send('Emulation.setCPUThrottlingRate', { rate: 6 });
+      (async () => {
+        while (watch && !watch.first && !watch.done && !watch.stop) await sleep(50);
+        await releaseThrottle();
+      })();
+    } catch (e) { throttle = null; say('  ⚠ could not throttle the joiner: ' + e.message); }
+
     // ---- 1. THE HOST OPENS A ROOM, THE JOINER TYPES THE CODE -------------
     const admit = admitWatcher(pages.host, 'host');
     const oh = await C.openHost(pages.host);
@@ -456,6 +583,12 @@ async function runArm(consoleName, temp) {
     // Only where the page asks for it. This is the line that made the old page
     // two-machines-one-emulator when it was missing: under streaming a guest
     // had no emulator and Start was disabled for them.
+    // ⚠ HOST FIRST, JOINER ONLY ONCE THE HOST HAS DECLARED. On a console whose
+    // Start is a click, the rig's order IS the one-declared window: the host
+    // boots, declares by itself and is seen HOLDING before the joiner's console
+    // is even started. A page that presses its own Start (the directive:
+    // loading starts by itself once two are seated) leaves nothing to click,
+    // and that is recorded as what it is, not as a failure to click.
     if (C.start) {
       if (C.closeFirst) {
         for (const role of ['host', 'join']) {
@@ -464,30 +597,46 @@ async function runArm(consoleName, temp) {
         }
         await sleep(300);
       }
-      // Wait for the control to be live — the ROM list has to be in before the
-      // page enables it — then press it on BOTH sides for real.
-      for (const role of ['host', 'join']) {
-        await waitFor(pages[role], (s) => {
-          const b = document.querySelector(s);
-          return (b && !b.disabled && b.getAttribute('aria-disabled') !== 'true') ? true : null;
-        }, 60000, role + ' Start to become pressable', C.start);
-      }
-      for (const role of ['host', 'join']) {
-        const r = await clickReal(pages[role], C.start);
-        cell(r.clicked, role + '-pressed-Start-for-real',
-          r.clicked ? 'a real click on this console\'s own Start' : ('could not press Start: ' + r.why));
-      }
+      const startOwn = async (role) => {
+        // Wait for the control to be live — the ROM list has to be in before
+        // the page enables it — or for the page to have started by itself.
+        const r = await waitFor(pages[role], (a) => {
+          const n = window[a.seam] && window[a.seam]();
+          if (n && n.armed) return { own: true };
+          const b = document.querySelector(a.sel);
+          return (b && !b.disabled && b.getAttribute('aria-disabled') !== 'true') ? { own: false } : null;
+        }, 60000, role + ' Start to become pressable', { sel: C.start, seam: C.seam });
+        if (r && r.own) { cell(true, role + '-start-was-pressed-by-the-page', 'the page pressed its own Start — nothing for a person to click'); return; }
+        const c = await clickReal(pages[role], C.start);
+        if (!c.clicked && /disabled/.test(c.why || '')) {
+          const own = await waitFor(pages[role], (s) => { const n = window[s] && window[s](); return (n && n.armed) ? true : null; },
+                                    15000, role + ' page-pressed Start to arm', C.seam);
+          if (own) { cell(true, role + '-start-was-pressed-by-the-page', 'Start was already taken by the page itself under the rig\'s click, and the core armed'); return; }
+        }
+        cell(c.clicked, role + '-pressed-Start-for-real',
+          c.clicked ? 'a real click on this console\'s own Start' : ('could not press Start: ' + c.why));
+      };
+      await startOwn('host');
+      const held = await waitFor(pages.host, (s) => {
+        const n = window[s] && window[s]();
+        const d = !!(n && ((n.party && n.party.declared) || (n.engine && n.engine.declaredReady)));
+        return d ? { running: !!n.running, frame: n.frame | 0 } : null;
+      }, 300000, 'host to declare by itself', C.seam);
+      if (held) say('  [host] declared by itself, running=' + held.running + ' frame=' + held.frame + ' — starting the joiner now');
+      else say('  [host] never declared — starting the joiner anyway so step 3 can name the failure');
+      await startOwn('join');
     }
 
     // ---- 3. BOTH CORES ARM BEFORE EITHER RUNS A FRAME --------------------
     const armedState = {};
+    const armedAt = (s) => (s && s.armedAtFrame != null) ? (s.armedAtFrame | 0) : (s.frame | 0);
     for (const role of ['host', 'join']) {
       const st = await waitFor(pages[role], (s) => {
         const n = window[s] && window[s]();
         return (n && n.armed) ? n : null;
       }, 300000, role + ' core to arm', C.seam);
       if (!cell(!!st, role + '-core-armed-the-frame-gate',
-        st ? ('armed with the core still at frame ' + (st.frame | 0)) : 'never armed')) {
+        st ? ('armed with the core at frame ' + armedAt(st) + (st.armedAtFrame != null ? ' (latched at arming)' : ' (sampled — this page latches nothing)')) : 'never armed')) {
         detail.netLogTail = (detail.netLog || []).slice(-25);
         return detail;
       }
@@ -504,28 +653,51 @@ async function runArm(consoleName, temp) {
     // like. The page now latches the frame AT arming (`armedAtFrame`), a value
     // that cannot drift. Falls back to the old field where a page does not
     // publish it yet, so this stays honest rather than silently vacuous.
-    const armedAt = (s) => (s && s.armedAtFrame != null) ? (s.armedAtFrame | 0) : (s.frame | 0);
     cell(Object.values(armedState).every((s) => armedAt(s) === 0),
       'no-frame-ran-before-the-gate-closed',
       'frames at the moment of arming: host ' + armedAt(armedState.host) + ', join ' + armedAt(armedState.join));
 
-    // ---- 4. THE START BARRIER --------------------------------------------
-    if (C.ready) {
-      // Wait until BOTH sides can see two seated ports first: pressing Ready
-      // before the peer is seated is exactly the bug the button exists to stop.
-      for (const role of ['host', 'join']) {
-        await waitFor(pages[role], (s) => {
-          const n = window[s] && window[s]();
-          const ports = n && n.engine && n.engine.ports;
-          return (ports && ports.filter((p) => p.peer).length >= 2) ? true : null;
-        }, 120000, role + ' to see both seats', C.seam);
-      }
-      for (const role of ['host', 'join']) {
-        const r = await clickReal(pages[role], C.ready);
-        cell(r.clicked, role + '-pressed-Ready-for-real', r.clicked ? 'a real click on the barrier button' : ('could not press Ready: ' + r.why));
-      }
-    } else {
-      voidc('ready-button', 'this console declares itself ready when the core arms — there is no button to press');
+    // ---- 4. THE START BARRIER — NOBODY PRESSES ANYTHING ------------------
+    // Both sides must see two seated ports first, so what follows is a
+    // statement about a room of two and not about one machine.
+    for (const role of ['host', 'join']) {
+      await waitFor(pages[role], (s) => {
+        const n = window[s] && window[s]();
+        const ports = n && n.engine && n.engine.ports;
+        return (ports && ports.filter((p) => p.peer).length >= 2) ? true : null;
+      }, 120000, role + ' to see both seats', C.seam);
+    }
+    // Each console declared BY ITSELF (see declaredOf), and there is no
+    // #netReady on either page — the control this rig used to press.
+    const declared = {};
+    for (const role of ['host', 'join']) {
+      declared[role] = await waitFor(pages[role], (s) => {
+        const n = window[s] && window[s]();
+        const d = !!(n && ((n.party && n.party.declared) || (n.engine && n.engine.declaredReady)));
+        return d ? { via: (n.party && n.party.declared) ? 'party.declared' : 'engine.declaredReady',
+                     button: !!document.getElementById('netReady') } : null;
+      }, 120000, role + ' to declare by itself', C.seam);
+    }
+    const anyButton = !!((declared.host && declared.host.button) || (declared.join && declared.join.button));
+    cell(!!declared.host && !!declared.join && !anyButton,
+      'no-ready-click-was-needed',
+      'host ' + (declared.host ? 'declared (' + declared.host.via + ')' : 'NEVER declared')
+      + ', join ' + (declared.join ? 'declared (' + declared.join.via + ')' : 'NEVER declared')
+      + ' — this rig clicked nothing, and #netReady ' + (anyButton ? 'STILL EXISTS' : 'does not exist'));
+
+    // ---- 4b. THE SAVE FILE STAYS OUT OF THE ROOM ---------------------------
+    // N64 only. dist/script.js's LoadSram writes THIS browser's <rom>.sram into
+    // /game.savememory before callMain, so two peers with different saves boot
+    // into different guest state — a frame-0 prerequisite. The page's neuter
+    // used to be installed from startSession, before window.myApp existed, and
+    // so did nothing: 0 occurrences of its log line in n64.json, n64-warm.json
+    // and n64-verify.json while other [lockstep] lines were captured fine. It
+    // is installed from window.postLoad now; both roles must say so. By this
+    // point both cores have declared, which is after their LoadSram ran.
+    if (C.bootLog) {
+      const seen = (role) => (detail.netLog || []).some((l) => l.startsWith('[' + role + '] ') && l.includes(C.bootLog));
+      cell(seen('host') && seen('join'), 'the-saved-game-is-not-loaded-online',
+        'log line "' + C.bootLog + '": host ' + (seen('host') ? 'yes' : 'NO') + ', join ' + (seen('join') ? 'yes' : 'NO'));
     }
 
     // ---- 5. BOTH CONSOLES ACTUALLY ADVANCE -------------------------------
@@ -540,6 +712,69 @@ async function runArm(consoleName, temp) {
         detail.netLogTail = (detail.netLog || []).slice(-25);
         return detail;
       }
+    }
+
+    // ---- 5b. A HOST ALONE NEVER STARTS -----------------------------------
+    // The first sample in which exactly one console had declared (see
+    // windowWatcher): that console must have been HOLDING — not running, at
+    // frame 0 — and both are running now that the other has loaded. VOID, not
+    // PASS, when the window was never seen: an unobserved window proves
+    // nothing either way.
+    if (watch) watch.stop = true;
+    await releaseThrottle();
+    const w = watch && watch.first;
+    if (!w) {
+      voidc('a-host-alone-never-starts',
+        'both consoles declared within one 50 ms poll of each other, so no sample caught one declared and the other not — nothing to assert');
+    } else {
+      const lone = w[w.declared], other = w[w.declared === 'host' ? 'join' : 'host'];
+      const otherRow = other.party && other.party.rows ? other.party.rows.filter((r) => r.local).map((r) => r.state).join('/') : null;
+      cell(!lone.running && lone.frame === 0 && running.host.frame > 0 && running.join.frame > 0,
+        'a-host-alone-never-starts',
+        w.declared + ' declared first while the ' + (w.declared === 'host' ? 'joiner' : 'host') + ' had not'
+        + (otherRow != null ? ' (its own row read "' + otherRow + '")' : '')
+        + (lone.party ? (lone.party.alone ? ' and was not even seated' : ' — seated but not loaded') : '')
+        + ' — the ' + w.declared + ' was ' + (lone.running ? 'RUNNING' : 'holding') + ' at frame ' + lone.frame
+        + '; then the other loaded and both ran (host ' + running.host.frame + ', join ' + running.join.frame + ')');
+      detail.window = { declaredFirst: w.declared, lone: { running: lone.running, frame: lone.frame }, otherRow, order: watch.order.slice() };
+    }
+
+    // ---- 5c. THE PAGE SAYS SO, IN THE WORDS THE DESIGN FIXES ---------------
+    // The control reads "Party · CODE · seated/ports · state" and the sentence
+    // is one of the three, read from the DOM at two moments: the one-declared
+    // sample (state must be `loading`, sentence "Starts by itself when everyone
+    // is loaded — waiting for <who>.") and now, running (state `playing`,
+    // sentence "Playing — everyone started together at frame N."). Every row
+    // state on the seam is from the fixed vocabulary at both moments.
+    // The panel ticks every 400 ms and a room that has just released stalls
+    // for a frame or two while the slower core catches up, so this is polled
+    // for up to 3 s and the LAST read is asserted on.
+    let nowUi = null, nowNet = null;
+    for (let i = 0; i < 12; i++) {
+      nowUi = await partyUi(pages.host, C.ui); nowNet = await netState(pages.host, C.seam);
+      if (nowUi.button && / · playing$/.test(nowUi.button) && /^Playing — everyone started together at frame \d+\.$/.test(nowUi.msg || '')) break;
+      await sleep(250);
+    }
+    if (!C.ui || nowUi.button == null || nowUi.msg == null) {
+      voidc('the-party-control-and-sentence-read-the-room',
+        'this page has no ' + JSON.stringify(C.ui) + ' to read — the vocabulary cannot be checked from the DOM');
+    } else {
+      const codeRe = detail.code ? detail.code.replace(/[^A-Z0-9]/g, '') : '[A-HJ-NP-Z2-9]{5}';
+      const playingBtn = new RegExp('^Party · ' + codeRe + ' · 2/' + C.ports + ' · playing$');
+      // Anchored at the front only: a mid-game stall is APPENDED to this
+      // sentence by the page ("… at frame 0. Waiting for player 2…").
+      const playingMsg = /^Playing — everyone started together at frame \d+\./;
+      const loadingBtn = new RegExp('^Party · ' + codeRe + ' · 2/' + C.ports + ' · loading$');
+      const loadingMsg = /^Starts by itself when everyone is loaded — waiting for (host|player \d)( \(you\))?\.$/;
+      const wu = w && w[w.declared].ui;
+      const atWindow = wu ? (loadingBtn.test(wu.button || '') && loadingMsg.test(wu.msg || '')) : null;
+      const rowsNow = rowsOk(nowNet && nowNet.party);
+      const rowsThen = w ? rowsOk(w[w.declared].party) : null;
+      cell(playingBtn.test(nowUi.button) && playingMsg.test(nowUi.msg) && rowsNow && atWindow !== false && rowsThen !== false,
+        'the-party-control-and-sentence-read-the-room',
+        'now: button "' + nowUi.button + '", sentence "' + nowUi.msg + '"'
+        + ', rows ' + JSON.stringify((nowNet && nowNet.party && nowNet.party.rows || []).map((r) => (r.who || 'open') + ':' + r.state))
+        + (wu ? ' · at the one-declared sample: button "' + wu.button + '", sentence "' + wu.msg + '"' : ' · (no one-declared sample to read)'));
     }
 
     const t0 = Date.now();
@@ -648,6 +883,68 @@ async function runArm(consoleName, temp) {
 
     detail.frames = { before, after: { host: after.host.frame, join: after.join.frame } };
     detail.hashes = { host: after.host.hashes, join: after.join.hashes, compared: cmp };
+
+    // ---- 10. A STALL PAST THE BUDGET NEVER PUTS A NONCE ON SCREEN ----------
+    // The engine's fail string on the stall budget names the peer it was
+    // waiting on BY PEER ID — lib/netplay.js `'no input from ' +
+    // waitingPeers.join(', ')`, armed by stallBudgetMs = 8000 when a page
+    // passes nothing — and a peer id is the session's 16-hex stableNonce. So
+    // the joiner's JS is FROZEN with the debugger (CDP Debugger.pause: nothing
+    // in either page is driven, the joiner simply stops answering, as a locked
+    // phone would), the host is left to stall past its budget, and the sentence
+    // it draws is read back. Then the joiner is resumed and — its host now
+    // silent — fails the same way from the guest side, so both roles' words are
+    // checked. Runs LAST: it ends the room. A side whose engine never reaches
+    // `failed` is VOID for that half, never a PASS.
+    const NONCE = /[0-9a-f]{16}/;
+    const failedOn = (s) => {
+      const n = window[s] && window[s]();
+      const e = n && n.engine;
+      return (e && e.state === 'failed') ? { error: e.error == null ? null : String(e.error), party: (n.party && n.party.error) || null } : null;
+    };
+    let dbg = null;
+    try {
+      dbg = await pages.join.target().createCDPSession();
+      await dbg.send('Debugger.enable');
+      await dbg.send('Debugger.pause');
+    } catch (e) { dbg = null; say('  ⚠ could not freeze the joiner: ' + e.message); }
+    if (!dbg) {
+      voidc('a-stall-fail-never-shows-a-nonce', 'the joiner could not be frozen, so no stall was forced');
+    } else {
+      // ⚠ READ AFTER THE PANEL'S OWN TICK, NOT INSIDE IT. The page redraws on
+      // a 400 ms interval and this rig polls the seam every 200 ms, so a DOM
+      // read taken the instant the engine reports `failed` can be the PREVIOUS
+      // state's words — measured on the first run of this cell: both roles'
+      // engines carried the fail string while #lsMsg still read "Playing —
+      // everyone started together at frame 0. Waiting for player 2…". The
+      // same lesson windowWatcher already carries. Polled for up to 3 s until
+      // the sentence has left "Playing"; the LAST read is what is judged.
+      const settled = async (page) => {
+        let u = null;
+        for (let i = 0; i < 12; i++) {
+          u = await partyUi(page, C.ui);
+          if (u && u.msg != null && !/^Playing/.test(u.msg)) break;
+          await sleep(250);
+        }
+        return u;
+      };
+      const hostFail = await waitFor(pages.host, failedOn, 30000, 'host engine to fail on the stall budget', C.seam);
+      const hostUi = hostFail ? await settled(pages.host) : await partyUi(pages.host, C.ui);
+      try { await dbg.send('Debugger.resume'); await dbg.send('Debugger.disable'); await dbg.detach(); } catch (e) {}
+      const joinFail = await waitFor(pages.join, failedOn, 30000, 'joiner engine to fail once its host fell silent', C.seam);
+      const joinUi = joinFail ? await settled(pages.join) : await partyUi(pages.join, C.ui);
+      const judge = (role, f, ui) => {
+        if (!f) return { ok: null, text: role + ': engine never reached `failed` within 30 s — nothing to read' };
+        const msg = (ui && ui.msg) || '';
+        const clean = !NONCE.test(msg) && !(f.party && NONCE.test(f.party)) && !/^Playing/.test(msg);
+        return { ok: clean, text: role + ': engine "' + f.error + '" (' + (NONCE.test(f.error || '') ? 'a peer id IS in it' : 'no peer id in it')
+          + ') -> sentence "' + msg + '"' + (f.party && NONCE.test(f.party) ? ' and party.error carries a nonce' : '') };
+      };
+      const jh = judge('host', hostFail, hostUi), jj = judge('join', joinFail, joinUi);
+      if (jh.ok == null && jj.ok == null) voidc('a-stall-fail-never-shows-a-nonce', jh.text + ' · ' + jj.text);
+      else cell(jh.ok !== false && jj.ok !== false, 'a-stall-fail-never-shows-a-nonce', jh.text + ' · ' + jj.text);
+      detail.stallFail = { host: hostFail, hostUi, join: joinFail, joinUi };
+    }
     detail.loadEnd = load1();
     return detail;
   } catch (e) {
@@ -655,6 +952,8 @@ async function runArm(consoleName, temp) {
     detail.error = e.message;
     return detail;
   } finally {
+    if (watch) watch.stop = true;
+    await releaseThrottle();
     detail.netLogTail = (detail.netLog || []).slice(-30);
     delete detail.netLog;
     if (!KEEP) for (const b of browsers) { try { await b.close(); } catch (e) {} }

@@ -65,17 +65,58 @@ if (!dc || !np) {
   }
 }
 
-// ---- 2. THE READY LABEL MUST NOT CONTRADICT THE DISABLED STATE ------------
+// ---- 1b. A WebRTC 'disconnected' BLIP MUST NOT UNSEAT A PLAYER ---------------
+// The spec defines 'disconnected' as transient; on a phone on cellular it is a
+// radio hand-off. lib/netplay.js used to call _linkGone on it directly, and on
+// the host that unseated the guest before the game started — photographed live
+// 2026-09-13 as "the other player dropped out … P2 open" on the desktop while
+// the phone still showed itself seated and loading. Only 'failed', or a blip
+// that never recovers inside DISCONNECT_GRACE_MS, may tear a link down.
 {
-  const n = 'ready-button-label-names-its-blocker';
-  // The regression: textContent computed from load progress alone while
-  // `disabled` also required a seat, so a dead button read "I'm ready".
-  const namesSeat = /Waiting for a seat in the room/.test(dc);
-  if (!namesSeat) {
-    bad(n, 'the Ready button can be DISABLED for want of a seat while its label still reads ' +
-           '"I\'m ready". A disabled control eats the click silently, so the player presses it ' +
-           'again and again with no feedback — reported verbatim three times. The label must ' +
-           'state the actual blocker.');
+  const n = 'webrtc-disconnected-is-a-grace-period-not-a-death';
+  const direct = /connectionState\s*===\s*'disconnected'[^\n]*_linkGone\(/.test(np);
+  const grace = /_armDisconnectGrace\(/.test(np) && /DISCONNECT_GRACE_MS\s*=\s*\d+/.test(np) &&
+                /st\s*===\s*'disconnected'\)\s*this\._armDisconnectGrace\(L\)/.test(np);
+  if (direct || !grace) {
+    bad(n, direct ? 'lib/netplay.js calls _linkGone straight from a \'disconnected\' connectionState — a cellular blip unseats the player'
+                  : 'lib/netplay.js has no _armDisconnectGrace / DISCONNECT_GRACE_MS path for a \'disconnected\' connectionState');
+  } else ok(n);
+}
+
+// ---- 1c. THE BARRIER NEEDS TWO PEOPLE -------------------------------------------
+// The pages auto-declare on load now; without this guard the first console to
+// finish its disc starts a party of one and refuses everyone else as late.
+{
+  const n = 'barrier-holds-a-host-alone';
+  /alone:\s*seated\.length\s*<\s*2/.test(np) && /if \(info\.alone\) return;/.test(np)
+    ? ok(n) : bad(n, 'lib/netplay.js _checkBarrier does not refuse to release with fewer than two distinct seated peers');
+}
+
+// ---- 2. THERE IS NO READY BUTTON AND NO PLAY BUTTON — THE PARTY SAYS WHERE IT IS
+// This cell used to assert the Ready button's label named its blocker ("Waiting
+// for a seat in the room…"). The button is gone (user, 2026-09-13: "should
+// start when both are able to start, instead of an I'm ready button and dumb
+// conditions"), so the assertion is inverted: no #netReady / #netPlay may come
+// back, and the one status line must own the party vocabulary — the three
+// sentences a player can be shown, and the exact per-seat states.
+{
+  const n = 'party-status-replaces-the-ready-and-play-buttons';
+  const buttonBack = /id="netReady"|id="netPlay"/.test(dc);
+  const sentences = [
+    /Waiting for another player — share the code /,
+    /Starts by itself once two are in and loaded\./,
+    /Starts by itself when everyone is loaded — waiting for /,
+    /Playing — everyone started together at frame /,
+  ];
+  const seatStates = ["'connecting'", "'loaded'", "'ready'", "'playing'", "'disconnected'", "'loading ' +"];
+  const missingSentence = sentences.filter((re) => !re.test(dc));
+  const missingState = seatStates.filter((s) => dc.indexOf(s) < 0);
+  const autoDeclare = /function netAutoReady\(/.test(dc) && /NET\.loadWhenSeated/.test(dc);
+  if (buttonBack || missingSentence.length || missingState.length || !autoDeclare) {
+    bad(n, buttonBack ? 'dreamcast.html has an id="netReady" or id="netPlay" control again — the room must start by itself'
+      : missingSentence.length ? 'dreamcast.html is missing a party-status sentence: ' + missingSentence.map(String).join(' ')
+      : missingState.length ? 'dreamcast.html is missing a seat-state word: ' + missingState.join(' ')
+      : 'dreamcast.html has no netAutoReady()/NET.loadWhenSeated — nothing declares or loads without a press');
   } else ok(n);
 }
 

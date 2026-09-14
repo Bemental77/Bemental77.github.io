@@ -39,9 +39,13 @@
 //   two SEPARATE Chrome profiles, and the transport the page picks for itself,
 //   which is the broker two real machines need.
 //
-//   DOES NOT: boot a disc. Two cores booting Gauntlet is minutes of download
-//   and gigabytes of RAM, and it belongs in the end-to-end rig rather than in a
-//   gate that runs on every audit. THE FULL PROOF — N browsers, N cores, N
+//   DOES NOT: wait for a disc to boot. Two cores booting Gauntlet is minutes of
+//   download and gigabytes of RAM, and it belongs in the end-to-end rig rather
+//   than in a gate that runs on every audit. What it DOES assert (2026-09-13)
+//   is that the load BEGINS on both machines BY ITSELF once the two are in the
+//   room — nobody presses Start, nobody presses Ready — through the page's
+//   `party` seam and the disc bytes it starts fetching; the download is then
+//   abandoned with the browsers. THE FULL PROOF — N browsers, N cores, N
 //   distinct characters, per-player latency and screenshots — is
 //   `dreamcast/tools/netplay_room_e2e.mjs`. Run that for evidence; run this for
 //   a fast regression gate on the FLOW.
@@ -378,17 +382,47 @@ try {
   if (!(gConn && hConn)) {
     summary.diagnosis = await diagnose({ opener: host, joiner: guest }, 'the two sides never paired');
   } else {
-    // ⚠ THE ONE LINE THAT MADE THIS PAGE TWO-MACHINES-ONE-EMULATOR.
-    // netGuestStartLock() used to DISABLE Start for whoever joined.
-    console.log('\n== a joiner runs their OWN console ==');
-    const startState = await Promise.all([host, guest].map((p) => p.evaluate(() => {
-      const b = document.getElementById('btnStart');
-      return { disabled: !!b.disabled, ariaDisabled: b.getAttribute('aria-disabled'), title: b.title };
-    })));
-    T.cell(startState.every((s) => !s.disabled), 'the-joiner-can-start-its-own-core',
-      `Start is enabled on both machines: ${J(startState)} — the guest start lock is gone`,
-      `Start states ${J(startState)} — a joiner that cannot press Start has no core of its own, ` +
-      'which is the streaming architecture wearing a new name');
+    // ⚠ NOBODY PRESSES START. User, 2026-09-13: "should start when both are
+    // able to start, instead of an I'm ready button and dumb conditions to
+    // start the damn game." The cell that stood here asserted Start was
+    // ENABLED for the joiner (the streaming-era guest lock, gone) — a page
+    // could pass it and still make two people click. The product now presses
+    // its own Start on BOTH machines the moment two are seated, and that is
+    // what this asserts: through the `party` seam (`autoStart: true`, and a
+    // state past 'waiting') and the disc bytes the page starts fetching
+    // (__dcProbe().discBytes), never by clicking. It does not wait for the
+    // 1.1 GB — the e2e rig does — "the load began by itself on both sides" is
+    // the flow. A missing `party` seam is a FAIL, not a void: the seam is part
+    // of the product definition every console page converges on.
+    console.log('\n== the room starts both consoles by itself ==');
+    const AUTOSTART_MS = parseInt(process.env.AUTOSTART_MS || '30000', 10);
+    const startClicked = false;   // this rig never touches #btnStart; stated so the cell can say so
+    const readAuto = (p) => p.evaluate(() => {
+      const room = window.__dcNetRoom ? window.__dcNetRoom() : null;
+      const net = window.__dcNet ? window.__dcNet() : null;
+      const probe = window.__dcProbe ? window.__dcProbe() : null;
+      const party = (room && room.party) || (net && net.party) || null;
+      return { party,
+               discBytes: probe ? (probe.discBytes | 0) : 0, phase: probe ? probe.phase : null,
+               booted: !!(probe && probe.booted),
+               startDisabled: !!(document.getElementById('btnStart') || {}).disabled };
+    });
+    const began = (s) => !!(s.discBytes > 0 || s.booted || (s.party && /^(loading|starting|playing)$/.test(s.party.state)));
+    let auto = null;
+    const tAuto = Date.now();
+    for (;;) {
+      auto = await Promise.all([host, guest].map(readAuto));
+      if (auto.every(began)) break;
+      if (Date.now() - tAuto > AUTOSTART_MS) break;
+      await sleep(500);
+    }
+    summary.autoStart = auto;
+    const seamOk = auto.every((s) => s.party && s.party.autoStart === true);
+    T.cell(!startClicked && seamOk && auto.every(began), 'the-room-started-both-cores-by-itself',
+      `both machines began loading with no Start click in ${Date.now() - tAuto} ms: ` +
+      J(auto.map((s) => ({ state: s.party.state, seated: s.party.seated, discBytes: s.discBytes, phase: s.phase }))),
+      (seamOk ? '' : 'no `party` seam on __dcNetRoom()/__dcNet() (autoStart must read true) — ') +
+      `after ${AUTOSTART_MS} ms: ${J(auto.map((s) => ({ party: s.party && { state: s.party.state, seated: s.party.seated, alone: s.party.alone, able: s.party.able }, discBytes: s.discBytes, phase: s.phase, booted: s.booted, startDisabled: s.startDisabled })))}`);
 
     console.log('\n== the room reports ports ==');
     const huds = await Promise.all([host, guest].map((p) => p.evaluate(() => window.__dcNetHud())));
@@ -425,10 +459,31 @@ try {
       'neither side latched a desync', `desync latched: ${J(huds.map((h) => h.bannerText))}`);
 
     console.log('\n== leaving ==');
+    // ⚠ THE OPENER DOES NOT CLOSE WHEN ITS LAST GUEST LEAVES BEFORE THE GAME HAS
+    // STARTED — it goes back to 'signalling', "waiting for someone to ask to
+    // join" (lib/netplay.js _linkGone: "AN EMPTY ROOM IS NOT A CLOSED ONE, ON
+    // THE HOST"). This cell used to demand closed|failed and read that
+    // documented behaviour as a fault. 'signalling' alone proves nothing (it is
+    // also the pre-join state), so the witness is the departure itself: the
+    // joiner's seat freed, or the opener's own "[net] a player left" line.
+    // Once a game HAS started the engine does close, and closed|failed still pass.
+    const seatedBefore = await host.evaluate(() => { const r = window.__dcNetRoom ? window.__dcNetRoom() : null; return r && r.party ? r.party.seated : null; });
     await click(guest, '#netLeave');
-    const sawLeave = await until(host, "const s=window.__dcNet().state; return (s==='closed'||s==='failed') ? s : null;", 30000);
-    T.cell(!!sawLeave, 'the-opener-sees-the-joiner-leave', `opener session state = ${sawLeave}`,
-      `opener still reports ${J((await host.evaluate(() => window.__dcNet())).state)}`);
+    const sawLeave = await until(host,
+      "const n = window.__dcNet(); const r = window.__dcNetRoom ? window.__dcNetRoom() : null;" +
+      "const seated = r && r.party ? r.party.seated : null;" +
+      "if (n.state === 'closed' || n.state === 'failed') return { state: n.state, seated };" +
+      "if (n.state === 'signalling' && seated != null && seated <= 1) return { state: n.state, seated };" +
+      "return null;", 30000);
+    const leftLine = (SIDE.opener.netConsole || []).find((t) => /a player left/i.test(t)) || null;
+    const openerNow = await host.evaluate(() => window.__dcNet().state);
+    T.cell(!!(sawLeave || (openerNow === 'signalling' && leftLine)), 'the-opener-sees-the-joiner-leave',
+      sawLeave
+        ? `opener session state = ${sawLeave.state}, seated ${seatedBefore} -> ${sawLeave.seated}` +
+          (sawLeave.state === 'signalling' ? ' — the room had not started, so it stays OPEN for the next player rather than closing' : '')
+        : `opener back to 'signalling' and logged "${leftLine}"`,
+      `opener still reports ${J(openerNow)} with seated=${J(seatedBefore)} before the leave and no "a player left" line; ` +
+      `netConsole tail: ${J((SIDE.opener.netConsole || []).slice(-3))}`);
   }
 
   try {

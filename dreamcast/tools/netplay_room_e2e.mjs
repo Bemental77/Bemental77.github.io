@@ -248,7 +248,17 @@ try {
   // ---- 1. every player opens the page, nothing booted ----------------------
   say(`\n== 1. ${PLAYERS} browsers open the page — no disc, nothing started ==`);
   for (let i = 0; i < PLAYERS; i++) await launch(i);
-  await Promise.all(pages.map((pg) => gotoSettled(pg, ORIGIN + '/dreamcast.html')));
+  // ⚠ P2+ OPEN WITH ?party_hold=25000 — A MEASUREMENT ARM, NOT A CONTROL. The
+  // room now starts by itself the instant every console is able, which erased
+  // the one state section 4c exists to test: a console PARKED at the barrier
+  // for longer than the stall detector's 12 s while another still loads — the
+  // real slow-phone case, and the one the page once called "wedged". The arm
+  // holds P2's own auto-declare for 25 s after it becomes able (dreamcast.html
+  // PARTY_HOLD_MS, ships off); P2 still declares BY ITSELF when it expires, so
+  // nothing here presses or calls anything, and section 5's hold-then-release
+  // is a real observation again rather than two declares inside one poll.
+  const PARTY_HOLD_MS = 25000;
+  await Promise.all(pages.map((pg, i) => gotoSettled(pg, ORIGIN + '/dreamcast.html' + (i > 0 ? '?party_hold=' + PARTY_HOLD_MS : ''))));
   const mounted = await Promise.all(pages.map((pg) => until(pg, () => (typeof window.__dcNet === 'function' && typeof window.__dcNetRoom === 'function') || null, 90000)));
   cell(mounted.every(Boolean), 'every-browser-mounts',
     `all ${PLAYERS} pages published __dcNet + __dcNetRoom`,
@@ -400,15 +410,30 @@ try {
   // ⚠ A JOINER MUST BE ABLE TO START. Under streaming, netGuestStartLock()
   // DISABLED Start for everyone but the host — that single line was what made
   // this page two-machines-one-emulator.
+  // ⚠ AND NOW THE ROOM STARTS THE LOAD BY ITSELF, so by the time this reads
+  // the button it is usually ALREADY DISABLED WITH A LOAD UNDERWAY (the host's
+  // fires on the first seat, a joiner's on 'room-game'). That is the product
+  // working, not the old lock: the lock was `aria-disabled` / a bare disabled
+  // with NO load in flight. So the cell reads the load, and presses Start only
+  // on a machine the room did not start — which would itself be the finding.
   const startState = await Promise.all(pages.map((pg) => pg.evaluate(() => {
     const b = document.getElementById('btnStart');
-    return { disabled: !!b.disabled, ariaDisabled: b.getAttribute('aria-disabled') };
+    const p = window.__dcProbe();
+    const room = (typeof window.__dcNetRoom === 'function') ? window.__dcNetRoom() : null;
+    return { disabled: !!b.disabled, ariaDisabled: b.getAttribute('aria-disabled'),
+             inFlight: !!(p.booted || (p.discTotal | 0) > 0),
+             autoStarted: !!(room && room.party && (room.party.autoStarted || room.party.loadWhenSeated === false)) };
   })));
-  cell(startState.every((s) => !s.disabled), 'joiners-can-start-their-own-core',
-    `Start is enabled on all ${PLAYERS} machines — the guest start lock is gone`,
-    `Start states: ${J(startState)} — a joiner that cannot start has no core, which is the old architecture`);
+  cell(startState.every((s) => s.ariaDisabled !== 'true' && (!s.disabled || s.inFlight)), 'joiners-can-start-their-own-core',
+    `every machine is loading or can load: ${J(startState)} — the guest start lock is gone, and the room started ` +
+    `${startState.filter((s) => s.inFlight).length}/${PLAYERS} of them by itself`,
+    `Start states: ${J(startState)} — a machine whose Start is held with no load in flight has no core, which is the old architecture`);
 
-  for (const pg of pages) await click(pg, '#btnStart');
+  for (let i = 0; i < PLAYERS; i++) {
+    if (startState[i].inFlight) { say(`  ....  P${i + 1} was started BY THE ROOM (load underway) — not pressing Start`); continue; }
+    say(`  ....  P${i + 1} was NOT started by the room — pressing Start for it`);
+    await click(pages[i], '#btnStart');
+  }
   const bootDeadline = Date.now() + BOOT_MS;
   const bootedAll = [];
   for (let i = 0; i < PLAYERS; i++) {
@@ -492,18 +517,31 @@ try {
   // Nothing here could catch that, because the barrier below is held for about
   // a second and the detector's threshold is twelve. So this holds the room
   // shut for longer than STALL_MS on purpose and asserts the page stays quiet.
+  // ⚠ THE HOLD IS P2's ?party_hold ARM NOW, not a Ready button nobody pressed:
+  // the room starts by itself, so without the arm both cores are RUNNING by
+  // the time this samples and there is no parked core to misreport. If no
+  // core is parked at the sample (the arm did not take), the two cells are
+  // NOT OBSERVABLE and say so — a running core reporting no hold reason is
+  // correct, not a mute.
   const STALL_MS_PAGE = 12000;
-  say(`\n== 4c. every core parks at the barrier for >${STALL_MS_PAGE / 1000}s — none may be called WEDGED ==`);
+  say(`\n== 4c. a core parks at the barrier for >${STALL_MS_PAGE / 1000}s (P2 holds its declare) — none may be called WEDGED ==`);
   await sleep(STALL_MS_PAGE + 3000);
   const parked = await Promise.all(pages.map((pg) => pg.evaluate(() => ({
     stall: window.__dcStall ? window.__dcStall() : null,
     ls: window.__dcNet ? window.__dcNet().lockstep : null,
     headline: window.__dcProbe ? window.__dcProbe().headline : null,
+    party: (typeof window.__dcNetRoom === 'function') ? window.__dcNetRoom().party : null,
   }))));
   parked.forEach((p, i) => say(`  ....  P${i + 1} armed=${p.ls && p.ls.armed} running=${p.ls && p.ls.running} ` +
+    `declared=${p.party && p.party.declared} holdMs=${p.party && p.party.holdMs} ` +
     `stallState=${J(p.stall && p.stall.state)} gateHold=${J((p.stall && p.stall.gateHold || '').slice(0, 60))}`));
   const seamOK = parked.every((p) => p.stall);
-  if (!seamOK) {
+  const anyParked = parked.some((p) => p.ls && p.ls.armed && !p.ls.running);
+  if (!anyParked) {
+    say('  VOID  a-core-held-at-the-barrier-is-not-called-WEDGED  not observable: no core was parked at the sample — ' +
+        `the room had already started by itself (running ${J(parked.map((p) => p.ls && p.ls.running))}); the ?party_hold arm did not hold P2`);
+    say('  VOID  the-quiet-is-REASONED-not-blanket  not observable for the same reason');
+  } else if (!seamOK) {
     cell(false, 'a-core-held-at-the-barrier-is-not-called-WEDGED', '',
       'window.__dcStall is missing, so this build cannot answer whether it calls a gated core wedged. ' +
       `read: ${J(parked.map((p) => p.stall))}`);
@@ -529,36 +567,46 @@ try {
 
   // ---- 5. the start barrier ------------------------------------------------
   say('\n== 5. the start barrier ==');
-  // ⚠ SOMEBODY HAS TO PRESS READY, and the first version of this rig never did
-  // — then reported the barrier as a FAILURE when it correctly held the room.
-  // The page's #netReady is a human action (dreamcast.html:5381-5389, which
-  // calls session.setReady). Press it on every machine, one at a time, so the
-  // hold-then-release below is a real observation and not a timing accident.
-  const readyPath = [];
-  for (let i = 0; i < PLAYERS; i++) {
-    const how = await pages[i].evaluate(() => {
-      const b = document.getElementById('netReady');
-      if (b && !b.disabled && b.style.display !== 'none') { b.click(); return 'button'; }
-      const s = (window.Netplay.sessions || []).filter((x) => x.state !== 'closed').pop();
-      if (s && typeof s.setReady === 'function') { s.setReady(true); return 'api'; }
-      return 'none';
-    });
-    readyPath.push(how);
-    // Read the room BEFORE the last player says ready: it must still be holding.
-    if (i === PLAYERS - 2) {
-      await sleep(1200);
-      const held = await Promise.all(pages.map((pg) => pg.evaluate(() => {
-        const s = (window.Netplay.sessions || []).filter((x) => x.state !== 'closed').pop();
-        return s && s.ls ? s.ls.state : null;
-      })));
-      cell(held.every((s) => s !== 'running'), 'the-barrier-HOLDS-until-the-LAST-player-is-ready',
-        `${PLAYERS - 1} of ${PLAYERS} machines declared ready and none of them started: ${J(held)} — on a 1,131 MB ` +
-        'disc the slowest phone decides when the room starts, and that wait is reported rather than being a pause',
-        `engine states with one player still not ready: ${J(held)} — somebody ran ahead`);
-    }
-    await sleep(500);
+  // ⚠ NOBODY PRESSES READY — THERE IS NOTHING TO PRESS. This loop used to click
+  // #netReady and, when the button was not there, call session.setReady() as a
+  // fallback. Both are gone: the button was deleted (user, 2026-09-13: "should
+  // start when both are able to start, instead of an I'm ready button and dumb
+  // conditions"), and the fallback would green-light a page whose auto-declare
+  // is missing — the exact defect this section now exists to catch. Each page
+  // declares BY ITSELF the instant it is able; this rig only watches
+  // `party.declared` flip, and the engines' state while it does.
+  const partyOf = (pg) => pg.evaluate(() => (typeof window.__dcNetRoom === 'function' ? window.__dcNetRoom().party : null));
+  const lsStateOf = (pg) => pg.evaluate(() => {
+    const s = (window.Netplay.sessions || []).filter((x) => x.state !== 'closed').pop();
+    return s && s.ls ? s.ls.state : null;
+  });
+  const declaredAt = new Array(PLAYERS).fill(null);
+  let heldSample = null;   // engine states at a moment when SOME but not ALL had declared
+  const t0 = Date.now();
+  while (Date.now() - t0 < 30000) {
+    const ps = await Promise.all(pages.map(partyOf));
+    ps.forEach((p, i) => { if (p && p.declared && declaredAt[i] == null) declaredAt[i] = Date.now() - t0; });
+    const n = declaredAt.filter((x) => x != null).length;
+    if (n > 0 && n < PLAYERS && !heldSample) heldSample = { n, states: await Promise.all(pages.map(lsStateOf)) };
+    if (n === PLAYERS) break;
+    await sleep(250);
   }
-  say(`  ....  ready was declared via ${J(readyPath)} (button = the product path, api = the button was not available)`);
+  const readyPath = declaredAt.map((ms) => (ms == null ? 'never' : 'auto@' + ms + 'ms'));
+  cell(declaredAt.every((x) => x != null), 'every-machine-declares-ready-by-itself',
+    `all ${PLAYERS} consoles declared ready with nothing pressed: ${J(readyPath)}`,
+    `a console never declared: ${J(readyPath)} — party ${J(await Promise.all(pages.map(partyOf)))}. The auto-declare ` +
+    'is missing, and there is no button that could stand in for it');
+  // The hold is observable only when the declares did not all land inside one
+  // 250 ms poll. When they did, say so rather than asserting on nothing.
+  if (heldSample) {
+    cell(heldSample.states.every((s) => s !== 'running'), 'the-barrier-HOLDS-until-the-LAST-player-is-ready',
+      `${heldSample.n} of ${PLAYERS} machines had declared and none of them started: ${J(heldSample.states)} — on a 1,131 MB ` +
+      'disc the slowest phone decides when the room starts, and that wait is reported rather than being a pause',
+      `engine states with a player still not ready: ${J(heldSample.states)} — somebody ran ahead`);
+  } else {
+    say(`  ....  the-barrier-HOLDS-until-the-LAST-player-is-ready: not observable this run — all ${PLAYERS} declared inside one 250 ms poll`);
+  }
+  say(`  ....  ready was declared via ${J(readyPath)} (auto = the product path; there is no button)`);
   await sleep(2000);
   const lsStates = await Promise.all(pages.map((pg) => pg.evaluate(() => {
     const s = (window.Netplay.sessions || []).filter((x) => x.state !== 'closed').pop();

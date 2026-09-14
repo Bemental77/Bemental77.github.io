@@ -212,15 +212,64 @@ try {
     'before the game starts because it is which character they get',
     `no row marked "you", or it does not say P3: ${J(r4.rows)}`);
   const loadingRow = r4.rows.find((x) => /loading/.test(x.cls));
-  cell(!!loadingRow && /41% loaded/.test(loadingRow.text),
+  // ⚠ THE EXACT VOCABULARY: "loading 41%", not "41% loaded". The rows speak
+  // one fixed set of words — connecting · loading N% · loaded · ready ·
+  // playing · disconnected · open — and this is the cell that pins the form.
+  cell(!!loadingRow && /loading 41%/.test(loadingRow.text),
     'per-player-load-progress',
     `"${loadingRow && loadingRow.text}" — the room shows WHICH player is still downloading and how far, ` +
     'rather than a silent freeze while somebody pulls 1,131 MB',
-    `no per-player progress: ${J(r4.rows)}`);
-  cell(/waiting for/i.test(r4.barrier) && /P2/.test(r4.barrier) && r4.barrierClass === 'hold',
+    `no per-player progress in the "loading N%" form: ${J(r4.rows)}`);
+  const seatWords = /^(connecting|loading \d+%|loaded|ready|playing|disconnected|open)$/;
+  const offVocab = (r4.party && r4.party.rows || []).filter((x) => !seatWords.test(x.state));
+  cell(r4.party && r4.party.rows.length === 4 && offVocab.length === 0,
+    'every-seat-state-is-in-the-vocabulary',
+    `party.rows ${J(r4.party.rows.map((x) => x.state))} — nothing a player is shown is outside the seven words`,
+    `a seat state outside the vocabulary: ${J(offVocab)} (party ${J(r4.party)})`);
+  // ⚠ THE BARRIER LINE IS THE PARTY'S STATUS NOW. There is no Ready button and
+  // no Play button; the sentence has to say the room starts BY ITSELF and name
+  // who it is waiting on, because that is all the player has.
+  cell(/Starts by itself when everyone is loaded — waiting for /.test(r4.barrier) && /P2/.test(r4.barrier) && r4.barrierClass === 'hold',
     'start-barrier-names-who-is-holding',
     `the barrier reads "${r4.barrier}"`,
-    `the barrier reads "${r4.barrier}" (class ${r4.barrierClass}) and does not name who is holding it up`);
+    `the barrier reads "${r4.barrier}" (class ${r4.barrierClass}) — it must say the room starts by itself and name who is holding it up`);
+  // ⚠ NO CONTROL TO PRESS. The user's verdict (2026-09-13): "No simple party,
+  // get ready system this is klunky as fuck … should start when both are able
+  // to start, instead of an I'm ready button and dumb conditions to start the
+  // damn game." If either control comes back, this cell is the one that says so.
+  const controls = await page.evaluate(() => {
+    const names = [];
+    for (const b of document.querySelectorAll('#netRoom button, #netBox button')) {
+      const t = (b.textContent || '').trim();
+      if (/^(i'm ready|ready|play\b)/i.test(t) || /netReady|netPlay/.test(b.id)) names.push({ id: b.id, text: t });
+    }
+    return { names, readyEl: !!document.getElementById('netReady'), playEl: !!document.getElementById('netPlay') };
+  });
+  cell(!controls.readyEl && !controls.playEl && controls.names.length === 0,
+    'no-ready-or-play-control-exists',
+    'the room panel has no "I\'m ready" and no "Play" — the party declares and starts by itself',
+    `a ready/play control is back: ${J(controls)}`);
+  // ⚠ THE ONE CONTROL IS "PARTY", AND IT IS LIVE. Its text carries the code,
+  // the seats and where the party is, so a player who closed the panel can read
+  // the room off the button that opens it — and pressing it opens the status.
+  await page.evaluate(() => document.getElementById('netClose').click());
+  await sleep(700);
+  const partyBtn = await page.evaluate(() => ({
+    text: (document.getElementById('btnNet').textContent || '').trim(),
+    closed: !document.getElementById('netOverlay').classList.contains('on'),
+    party: window.__dcNetRoom().party,
+  }));
+  await page.click('#btnNet');
+  await sleep(300);
+  const reopened = await page.evaluate(() => ({
+    on: document.getElementById('netOverlay').classList.contains('on'),
+    barrier: (document.getElementById('netBarrier').textContent || '').trim(),
+  }));
+  cell(/^🌐 Party · [A-HJ-NP-Z2-9]{5} · 3\/4 · (waiting|loading|starting|playing)$/.test(partyBtn.text) &&
+       partyBtn.closed && reopened.on && reopened.barrier === r4.barrier,
+    'the-party-button-opens-the-status',
+    `the button read "${partyBtn.text}" with the panel closed, and pressing it opened the panel on "${reopened.barrier}"`,
+    `button "${partyBtn.text}" closed=${partyBtn.closed} → reopened ${J(reopened)} (expected "Party · CODE · 3/4 · <state>" and the same status)`);
 
   // =========================================================================
   // 3. THE HUD — mode, input delay in FRAMES, named stall, loud desync
