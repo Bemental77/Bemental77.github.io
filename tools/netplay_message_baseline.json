@@ -1,0 +1,425 @@
+{
+ "when": "2026-09-16T21:47:19.264Z",
+ "model": "jev-latest",
+ "policy": {
+  "leak": 0.7,
+  "noNextStep": 0.3,
+  "blame": 0.7,
+  "jargon": 2.4
+ },
+ "regression": {
+  "leak": 0.2,
+  "next": 0.2,
+  "blame": 0.2,
+  "jargon": 0.35
+ },
+ "note": "ratchet baseline — see the header of tools/netplay_message_judge.mjs",
+ "snapshot": {
+  "Failed to initialize emulator memory: <value 1>": {
+   "file": "dreamcast.html",
+   "leak": 0.77,
+   "next": 0.07,
+   "blame": 0.27,
+   "jargon": 2.12
+  },
+  "Starts by itself when everyone is loaded — waiting for <value 1>, <value 2>.": {
+   "file": "n64/index.html",
+   "leak": 0.68,
+   "next": 0.14,
+   "blame": 0.19,
+   "jargon": 2.82
+  },
+  "Could not hand the canvas to the emulator: <value 1>": {
+   "file": "dreamcast.html",
+   "leak": 0.73,
+   "next": 0.07,
+   "blame": 0.25,
+   "jargon": 2.23
+  },
+  "This console cannot start in the room: <value 1>": {
+   "file": "dreamcast.html",
+   "leak": 0.66,
+   "next": 0.09,
+   "blame": 0.4,
+   "jargon": 1.85
+  },
+  "Playing — everyone started together at frame <value 1>.<value 2> Waiting for <value 3>host<value 4>player <value 5>, <value 6>a player<value 7>…<value 8><value 9>": {
+   "file": "n64/index.html",
+   "leak": 0.83,
+   "next": 0.25,
+   "blame": 0.16,
+   "jargon": 2.49
+  },
+  "The picture is not changing: <value 1>": {
+   "file": "dreamcast.html",
+   "leak": 0.74,
+   "next": 0.09,
+   "blame": 0.22,
+   "jargon": 1.73
+  },
+  "The room stopped — <value 1>. Leave the party to keep playing by yourself.": {
+   "file": "n64/index.html",
+   "leak": 0.9,
+   "next": 0.75,
+   "blame": 0.57,
+   "jargon": 2
+  },
+  "The GPU dropped this page’s graphics context — the picture cannot come back.": {
+   "file": "dreamcast.html",
+   "leak": 0.21,
+   "next": 0.1,
+   "blame": 0.43,
+   "jargon": 2.19
+  },
+  "This device cannot start the emulator — Start is held by the capability check (see the banner). The room waits.": {
+   "file": "n64/index.html",
+   "leak": 0.14,
+   "next": 0.15,
+   "blame": 0.53,
+   "jargon": 2.19
+  },
+  "Starts by itself when everyone is loaded — waiting for <value 1>host<value 2>the room<value 3>host<value 4>.": {
+   "file": "n64/index.html",
+   "leak": 0.44,
+   "next": 0.25,
+   "blame": 0.2,
+   "jargon": 2.52
+  },
+  "Preparing the game — every player has to begin from the same frame 0.": {
+   "file": "dreamcast.html",
+   "leak": 0.75,
+   "next": 0.22,
+   "blame": 0.17,
+   "jargon": 1.55
+  },
+  "Rate-model self-test — no emulator started.": {
+   "file": "n64/index.html",
+   "leak": 0.3,
+   "next": 0.1,
+   "blame": 0.21,
+   "jargon": 2.42
+  },
+  "That does not look like a code — 5 characters, no I O 0 or 1.": {
+   "file": "dreamcast.html",
+   "leak": 0.16,
+   "next": 0.12,
+   "blame": 0.62,
+   "jargon": 1.52
+  },
+  "<b>Could not load <value 1>.</b> <value 2> — the built-in ROM lives at <code><value 3></code>. You can still use <b>Browse…</b> to open a <code>.gen</code>/<code>.bin</code>/<code>.md</code> from this device.": {
+   "file": "genesis.html",
+   "leak": 0.94,
+   "next": 0.89,
+   "blame": 0.34,
+   "jargon": 2.1
+  },
+  "<b><value 1> did not load.</b> Genesis-Plus-GX rejected the image. If this is a <code>.smd</code> it is the INTERLEAVED Super Magic Drive format and has to be converted first — <code>genesis/genesisWasm/tools/smd_to_bin.mjs</code> does that.": {
+   "file": "genesis.html",
+   "leak": 0.43,
+   "next": 0.64,
+   "blame": 0.38,
+   "jargon": 2.74
+  },
+  "The core refused this ROM.": {
+   "file": "genesis.html",
+   "leak": 0.22,
+   "next": 0.1,
+   "blame": 0.26,
+   "jargon": 1.91
+  },
+  "<b>Could not load <value 1>.</b> <value 2> — the built-in ROM lives at <code><value 3></code>. You can still use <b>Browse…</b> to open a <code>.smc</code>/<code>.sfc</code> from this device.": {
+   "file": "snes.html",
+   "leak": 0.94,
+   "next": 0.9,
+   "blame": 0.32,
+   "jargon": 1.94
+  },
+  "Cross-origin isolation could not be enabled.": {
+   "file": "dreamcast.html",
+   "leak": 0.11,
+   "next": 0.09,
+   "blame": 0.23,
+   "jargon": 2.05
+  },
+  "You are already in a room that has started. Press Leave first, then <value 1>.": {
+   "file": "dreamcast.html",
+   "leak": 0.52,
+   "next": 0.69,
+   "blame": 0.41,
+   "jargon": 1.8
+  },
+  "This browser cannot run the emulator.": {
+   "file": "dreamcast.html",
+   "leak": 0.05,
+   "next": 0.09,
+   "blame": 0.68,
+   "jargon": 0.49
+  },
+  "No WebGPU on this machine — the emulator cannot render here. See 🩺 Diagnostics.": {
+   "file": "gamecube.html",
+   "leak": 0.09,
+   "next": 0.37,
+   "blame": 0.6,
+   "jargon": 1.36
+  },
+  "The link names \"<value 1>\", which is not on this page. Pick the game the other player is on, then Join.": {
+   "file": "genesis.html",
+   "leak": 0.54,
+   "next": 0.84,
+   "blame": 0.27,
+   "jargon": 2.19
+  },
+  "The emulator runtime has not started. See the log.": {
+   "file": "dreamcast.html",
+   "leak": 0.09,
+   "next": 0.13,
+   "blame": 0.18,
+   "jargon": 1.64
+  },
+  "Loading Dolphin libretro core...": {
+   "file": "gamecube.html",
+   "leak": 0.25,
+   "next": 0.23,
+   "blame": 0.06,
+   "jargon": 1.73
+  },
+  "Failed to load emulator core.": {
+   "file": "n64/index.html",
+   "leak": 0.07,
+   "next": 0.08,
+   "blame": 0.19,
+   "jargon": 1.24
+  },
+  "Emulator crashed (<value 1>) — reload to retry. Add ?eruda to the URL to see details.": {
+   "file": "n64/index.html",
+   "leak": 0.77,
+   "next": 0.93,
+   "blame": 0.18,
+   "jargon": 1.69
+  },
+  "Waiting for worker runtime…": {
+   "file": "ps1.html",
+   "leak": 0.06,
+   "next": 0.16,
+   "blame": 0.15,
+   "jargon": 1.4
+  },
+  "Emulator failed to start — see the log.": {
+   "file": "dreamcast.html",
+   "leak": 0.09,
+   "next": 0.15,
+   "blame": 0.22,
+   "jargon": 1.02
+  },
+  "Preparing the game — retrying (<value 1>/<value 2>)…": {
+   "file": "dreamcast.html",
+   "leak": 0.31,
+   "next": 0.35,
+   "blame": 0.21,
+   "jargon": 0.87
+  },
+  "Room <value 1> is open — share the code. The game loads on every console by itself the moment somebody joins, and starts by itself once everyone is loaded.": {
+   "file": "dreamcast.html",
+   "leak": 0.43,
+   "next": 0.8,
+   "blame": 0.18,
+   "jargon": 1.95
+  },
+  "This game needs a newer browser than this one. Safari can run it from 16.4 onwards, and current Chrome, Edge and Firefox all can. Everything else on the site still works here.": {
+   "file": "gamecube.html",
+   "leak": 0.07,
+   "next": 0.52,
+   "blame": 0.64,
+   "jargon": 0.77
+  },
+  "A room is open — leave it before loading another cartridge.": {
+   "file": "genesis.html",
+   "leak": 0.08,
+   "next": 0.63,
+   "blame": 0.56,
+   "jargon": 1.27
+  },
+  "Not enough memory for the whole disc — switching to streaming...": {
+   "file": "dreamcast.html",
+   "leak": 0.06,
+   "next": 0.5,
+   "blame": 0.42,
+   "jargon": 1.19
+  },
+  "Waiting for emulator runtime...": {
+   "file": "dreamcast.html",
+   "leak": 0.05,
+   "next": 0.18,
+   "blame": 0.13,
+   "jargon": 1.13
+  },
+  "The games have gone out of sync — this room is over.": {
+   "file": "n64/index.html",
+   "leak": 0.05,
+   "next": 0.14,
+   "blame": 0.16,
+   "jargon": 0.89
+  },
+  "Runtime ready. Fetching ROM...": {
+   "file": "ps1.html",
+   "leak": 0.07,
+   "next": 0.28,
+   "blame": 0.09,
+   "jargon": 1.42
+  },
+  "You were invited to room <value 1>. Pick the game they are on, then Join.": {
+   "file": "ps1.html",
+   "leak": 0.46,
+   "next": 0.79,
+   "blame": 0.12,
+   "jargon": 1.57
+  },
+  "This console is already running a game. Online play has to be set up BEFORE the game starts, so that every player begins on the same frame — reload the page and join the room; the disc then loads and the game starts by itself.": {
+   "file": "ps1.html",
+   "leak": 0.24,
+   "next": 0.94,
+   "blame": 0.47,
+   "jargon": 1.57
+  },
+  "This console is already running a game. Online play has to be set up BEFORE the game starts, so that every player begins on the same frame — reload the page and join the room; the game then loads and starts by itself.": {
+   "file": "genesis.html",
+   "leak": 0.27,
+   "next": 0.95,
+   "blame": 0.42,
+   "jargon": 1.63
+  },
+  "Runtime ready. Loading ROM...": {
+   "file": "gamecube.html",
+   "leak": 0.06,
+   "next": 0.33,
+   "blame": 0.08,
+   "jargon": 1.4
+  },
+  "Room open for <value 1>. Share the code — the game loads and starts by itself once someone joins.": {
+   "file": "genesis.html",
+   "leak": 0.31,
+   "next": 0.85,
+   "blame": 0.13,
+   "jargon": 1.7
+  },
+  "Core failed to start — reload to retry (see log).": {
+   "file": "n64/index.html",
+   "leak": 0.12,
+   "next": 0.79,
+   "blame": 0.23,
+   "jargon": 1.44
+  },
+  "Room open for <value 1>. Share the code — everyone loads the game once you are all in.": {
+   "file": "dreamcast.html",
+   "leak": 0.32,
+   "next": 0.85,
+   "blame": 0.09,
+   "jargon": 1.41
+  },
+  "The graphics could not start on this device, so the game cannot run here. Closing other tabs and reloading frees one often enough to be worth trying; another browser or another device is the reliable fix.": {
+   "file": "dreamcast.html",
+   "leak": 0.06,
+   "next": 0.94,
+   "blame": 0.59,
+   "jargon": 0.93
+  },
+  "Room open for <value 1>. Share the code — the disc loads and the game starts by itself once someone joins.": {
+   "file": "ps1.html",
+   "leak": 0.24,
+   "next": 0.9,
+   "blame": 0.11,
+   "jargon": 1.62
+  },
+  "Room open. Nothing downloads yet — share the code, and the game loads on every console together the moment somebody joins.": {
+   "file": "dreamcast.html",
+   "leak": 0.1,
+   "next": 0.89,
+   "blame": 0.19,
+   "jargon": 1.66
+  },
+  "Waiting for another player — share the code <value 1>. Starts by itself once two are in and loaded.": {
+   "file": "n64/index.html",
+   "leak": 0.29,
+   "next": 0.93,
+   "blame": 0.1,
+   "jargon": 1.22
+  },
+  "This room is playing <value 1> — loading it now. The game begins once everyone is in.": {
+   "file": "dreamcast.html",
+   "leak": 0.38,
+   "next": 0.87,
+   "blame": 0.06,
+   "jargon": 0.66
+  },
+  "Connected — the game loads by itself now, and starts once everyone is loaded.": {
+   "file": "n64/index.html",
+   "leak": 0.05,
+   "next": 0.75,
+   "blame": 0.11,
+   "jargon": 0.97
+  },
+  "Loaded — the game starts by itself once everyone is.": {
+   "file": "n64/index.html",
+   "leak": 0.06,
+   "next": 0.66,
+   "blame": 0.11,
+   "jargon": 0.56
+  },
+  "Holding — the room is not running. Nothing advances until every player is back.": {
+   "file": "dreamcast.html",
+   "leak": 0.06,
+   "next": 0.74,
+   "blame": 0.13,
+   "jargon": 0.61
+  },
+  "Not connected. Open a room or join one — you do not need a game running first.": {
+   "file": "dreamcast.html",
+   "leak": 0.05,
+   "next": 0.91,
+   "blame": 0.28,
+   "jargon": 0.52
+  },
+  "<b>Super Nintendo could not start.</b> The emulator could not be downloaded. Nothing is wrong with your device — this is a fault on our side. Reloading the page is worth one try; if it happens again the site is broken and there is nothing you can do about it from here.": {
+   "file": "snes.html",
+   "leak": 0.08,
+   "next": 0.83,
+   "blame": 0.06,
+   "jargon": 0.81
+  },
+  "<b>Genesis could not start.</b> The emulator could not be downloaded. Nothing is wrong with your device — this is a fault on our side. Reloading the page is worth one try; if it happens again the site is broken and there is nothing you can do about it from here.": {
+   "file": "genesis.html",
+   "leak": 0.07,
+   "next": 0.86,
+   "blame": 0.06,
+   "jargon": 0.91
+  },
+  "Core ready. Pick a game and press Start.": {
+   "file": "genesis.html",
+   "leak": 0.05,
+   "next": 0.91,
+   "blame": 0.11,
+   "jargon": 0.89
+  },
+  "Initializing... (page will reload once)": {
+   "file": "dreamcast.html",
+   "leak": 0.05,
+   "next": 0.81,
+   "blame": 0.11,
+   "jargon": 0.57
+  },
+  "Waiting for another player — the game loads by itself once somebody joins.": {
+   "file": "dreamcast.html",
+   "leak": 0.05,
+   "next": 0.88,
+   "blame": 0.08,
+   "jargon": 0.22
+  },
+  "Pick a game and tap Start.": {
+   "file": "dreamcast.html",
+   "leak": 0.04,
+   "next": 0.91,
+   "blame": 0.09,
+   "jargon": 0.03
+  }
+ }
+}
