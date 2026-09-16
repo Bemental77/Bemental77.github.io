@@ -223,6 +223,52 @@ if (!dc || !np) {
   } else ok(n);
 }
 
+// ---- 9. A JOINER'S GAME IS THE ROOM'S GAME, NOT THEIR PICK ------------------
+// The lobby lets a player type a room code with any game selected, and the
+// barrier compares what each machine LOADED (lib/netplay.js:2014-2019) — it
+// FAILS the room on a mismatch rather than converging it, after both sides have
+// already paid for the download. So every page that can hold a room must follow
+// the host's roster announcement ('room-game') and load THAT.
+//
+// dreamcast.html, genesis.html, snes.html and ps1.html always did. n64 did NOT:
+// a player who typed a code with the wrong ROM selected downloaded it, booted
+// it, and was refused at the barrier. A browser rig cannot catch this, because
+// every rig hands BOTH sides the same game.
+//
+// gamecube.html is exempt BY CATALOGUE, not by oversight: multiplayer.html
+// offers exactly one GameCube game and the page mounts a constant game name, so
+// there is nothing for a joiner to get wrong. The exemption is asserted, so it
+// stops being an exemption the moment a second GameCube game is offered.
+{
+  const n = 'every-multi-game-console-follows-the-rooms-game';
+  const lobby = read('multiplayer.html');
+  const PAGES = { dreamcast: 'dreamcast.html', n64: 'n64/index.html', gamecube: 'gamecube.html',
+                  genesis: 'genesis.html', snes: 'snes.html', ps1: 'ps1.html' };
+  if (!lobby) {
+    bad(n, 'multiplayer.html is unreadable, so the catalogue cannot be checked');
+  } else {
+    const missing = [];
+    for (const [key, file] of Object.entries(PAGES)) {
+      // How many games does the lobby offer for this console? One game cannot
+      // mismatch; more than one can.
+      const blk = new RegExp("key:\\s*'" + key + "'[\\s\\S]*?games:\\s*\\[([\\s\\S]*?)\\]\\s*\\}", 'm').exec(lobby);
+      const body = blk ? blk[1] : '';
+      const count = (body.match(/key:/g) || []).length || (body.match(/'/g) || []).length / 2;
+      const src = read(file);
+      if (!src) { missing.push(file + ' unreadable'); continue; }
+      const follows = /on\('room-game'/.test(src);
+      if (count > 1 && !follows) {
+        missing.push(file + ' offers ' + count + ' games online and never handles \'room-game\' — a joiner ' +
+                     'boots their OWN pick and the room fails at the barrier');
+      }
+      if (count <= 1 && follows) {
+        // Not a failure. Following with one game is harmless; say nothing.
+      }
+    }
+    missing.length ? bad(n, missing.join('; ')) : ok(n);
+  }
+}
+
 console.log(`\n[netplay-invariants] ${pass} passed, ${fails.length} failed`);
 if (fails.length) {
   console.log('These are the shapes that produced user-visible netplay failures. A browser rig');

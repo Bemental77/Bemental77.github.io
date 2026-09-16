@@ -700,7 +700,9 @@ window.N64Rate = (function () {
     //   o.costMs   _neil_frame_cost_ms()   (monotonic accumulator)
     //   o.costN    _neil_frame_cost_n()    (monotonic accumulator)
     //   o.coreFps  parseCoreFps(<fps_text from the heap>) or null
-    //   o.shown    host presents this window (wrapped-RAF count)
+    //   o.shown    host presents this window: ANIMATION FRAMES IN WHICH A NEW FIELD WAS DRAWN
+    //              (the page's observePresents, driven by the core's own field counter) —
+    //              never rAF callbacks, and never a refresh that re-showed one picture
     //   o.arm      name of an active measurement arm, or null/'' for the shipped path
     s.window = function (t, o) {
       o = o || {};
@@ -1898,6 +1900,28 @@ N64Rate.selfTest = function (logFn) {
   // allows it (mymain.cpp:914). So this counter is bounded by the DISPLAY REFRESH and can never
   // show headroom — which is why it used to be the whole readout and told the user nothing.
   // It is kept as "shown", one term of four.
+  //
+  // ⚠ IT COUNTS ANIMATION FRAMES IN WHICH A NEW FIELD WAS DRAWN — NOT DISPLAY REFRESHES, AND
+  // NOT rAF CALLBACKS. Those are three different numbers and this page has now had the wrong
+  // one twice:
+  //   * before 2026-09-01 it counted CALLBACKS, so every extra rAF loop on the page multiplied
+  //     it (measured 60 -> 180 with two extra loops, a 3.00x inflation);
+  //   * the dedupe that fixed that counted the first callback of each animation frame, WHOEVER
+  //     it belonged to, which is still not this page's own drawing. MEASURED 2026-09-13 on the
+  //     live page (mariokart.z64, headless 60 Hz, load 4.6-8.3): the shipped page read 53.8,
+  //     53.6 and 54.0 presents/s, and registering two idle rAF loops — exactly what jQuery.fx
+  //     and the MOBILE TOUCH OVERLAY do — moved it to 59.2, 59.9 and 60.1, i.e. +10.9%, +11.8%
+  //     and +11.4% for animation frames in which this page drew nothing at all. Two of those
+  //     three runs FAILED tools/n64_page_test.mjs `rafdedupe`.
+  // The frames those extra loops added were real animation frames, so counting them would not
+  // be a rounding error — it would be counting a REPRESENTATION OF THE SAME IMAGE as a frame,
+  // which is the fabricated number CLAUDE.md gate #9 exists to forbid ("re-presenting the same
+  // frame to make a counter read 120"). So the counter is driven by the one witness that is
+  // neither the display's nor the callback population's: the CORE'S OWN FIELD COUNTER. An
+  // animation frame counts as a present when _neil_vi_total moved since the last one — one new
+  // picture, at most one per refresh. A catch-up run that advances the guest twice inside a
+  // single frame still counts ONCE, because only the last of the two was ever seen, and that
+  // difference is exactly what `decoupled` (:decoupled, shown < viHz - 1) reports.
   var rafTicks = 0;
 
   // ---- the pace governor, live wiring (see N64Rate.makePacer for the whole argument) -------
@@ -1929,8 +1953,34 @@ N64Rate.selfTest = function (logFn) {
     try { pacer.tick(paceIo, cbMs, !!activeArm); } catch (e) { }
   }
 
+  // THE PRESENT OBSERVER. One rAF loop of its own, on the RAW callback so it can neither feed
+  // paceTick nor be counted by anything else, and it RE-REGISTERS BEFORE IT DOES ANYTHING.
+  // That ordering is the whole point: emscripten's main loop re-registers itself AFTER its
+  // iteration ("MainLoop.runIter(iterFunc);if(!checkIsRunning())return;MainLoop.scheduler()",
+  // n64/N64Wasm/dist/n64wasm.js offset 88512), so when an iteration overruns the frame budget —
+  // and this core has 0.66 ms of slack per frame to begin with — its next callback lands in the
+  // frame AFTER next and it is simply absent from an animation frame that did happen. A counter
+  // that lives inside that callback cannot see those frames, which is why the shipped page read
+  // 53.8/s where the display ran 60 and why two idle rAF loops "added" 6 presents a second: they
+  // were present in the frames emscripten had missed. This loop is present in every animation
+  // frame, so nothing any other loop does can change what it counts.
+  // What it counts is a NEW PICTURE, not a refresh: the core's own field counter must have moved
+  // since the last frame. Reading it one frame late is harmless — the count over a window is the
+  // same — and a frame in which the guest advanced TWICE still counts once, because one image
+  // reached the screen.
+  var observing = false;
+  function observePresents() {
+    if (observing) return;
+    observing = true;
+    (function tick() {
+      rawRaf(tick);          // re-register FIRST, always: this loop is in every animation frame
+      rafTicks++;
+    })();
+  }
+
+  var rawRaf = window.requestAnimationFrame.bind(window);
   (function wrapRaf() {
-    var o = window.requestAnimationFrame.bind(window);
+    var o = rawRaf;
     window.requestAnimationFrame = function (cb) {
       return o(function (t) {
         var t0 = performance.now();
@@ -1939,20 +1989,16 @@ N64Rate.selfTest = function (logFn) {
         // overlay also use rAF; the timestamp dedupe keeps this to one catch-up pass per frame
         // rather than one per registered callback.
         //
-        // [raf-dedupe 2026-09-01] `rafTicks++` USED TO SIT ABOVE `cb(t)`, OUTSIDE THIS DEDUPE.
-        // It therefore counted CALLBACKS, not animation frames — so `shown` scaled with the
-        // number of registered rAF loops instead of with the display. MEASURED on the live page
-        // (sm64.z64, 60 Hz): with the shipped single loop `shown` read 60; with two extra loops
-        // registered — which is exactly what the mobile touch overlay and jQuery do — it read
-        // 180, a 3.00x inflation of a quantity the page's own comment above calls "bounded by
-        // the DISPLAY REFRESH and can never show headroom". A headline reading "180 shown" on a
-        // 60 Hz panel is the same class of fabricated number gate #9 exists to forbid, and it
-        // also silently breaks `r.decoupled` (:716-717), whose whole test is `shown < viHz - 1`.
-        // Counting inside the dedupe makes `shown` mean animation frames on every path.
-        if (t !== lastPaceT) { lastPaceT = t; rafTicks++; paceTick(performance.now() - t0); }
+        // ⚠ `rafTicks++` USED TO SIT HERE and no longer does — see the two measured mistakes in
+        // the comment on `var rafTicks`. This dedupe is the right place for ONE CATCH-UP PASS
+        // per animation frame (that is a scheduling decision, and it belongs on the frame
+        // clock); it is the wrong place to count what was SHOWN, because who got here first is
+        // a fact about the rAF callback population and not about this page drawing anything.
+        if (t !== lastPaceT) { lastPaceT = t; paceTick(performance.now() - t0); }
       });
     };
   })();
+  observePresents();
 
   var rate = window.N64Rate.makeRate({});
   var lastRate = null;
@@ -2034,8 +2080,10 @@ N64Rate.selfTest = function (logFn) {
         + '120    = 120 PRODUCIBLE frames/s, per title. This cartridge: '
         + (r.viHz ? r.viHz + ' Hz fields' : 'region unknown')
         + (r.gameHz ? ', game renders ' + window.N64Rate.num(r.gameHz, 1) + ' fps' : '') + '.\n'
-        + 'shown  = host presents (requestAnimationFrame). Bounded by the display refresh; it is '
-        + 'not capacity.\nmade   = distinct frames the game actually produced this second.\n'
+        + 'shown  = new pictures this page actually put on screen this second: animation frames in '
+        + 'which the core\'s own field counter moved. Bounded by the display refresh, and a refresh '
+        + 'that re-showed the same picture is NOT one of these. It is not capacity.\n'
+        + 'made   = distinct frames the game actually produced this second.\n'
         + 'e2e    = the same capacity measured END TO END (core callback + catch-up runs), so '
         + 'unlike cap it pays for the overlay, GL submission and the main-loop wrapper. '
         + 'e2e = speed / duty; duty this second was '
@@ -3748,6 +3796,21 @@ N64Rate.selfTest = function (logFn) {
         if (typeof s.startLockstep === 'function') s.startLockstep({ portCount: 4, padBytes: LS_PAD_BYTES });
       } catch (e) { pageLog('[lockstep] startLockstep threw: ' + ((e && e.message) || e)); }
       s.on('status', onStatus);
+      // The host's roster names the ROM the room is on. A joiner loads THAT --
+      // not whatever its picker held -- so the two agree at the barrier.
+      // genesis.html:1836, snes.html:1817 and ps1.html:1818 already do this;
+      // this page and gamecube.html did not, so a player who typed a room code
+      // with the wrong ROM selected in the lobby downloaded it, booted it, and
+      // was refused at the barrier by lib/netplay.js:2014-2019 ("different
+      // game: everyone must load ..."), which FAILS the room rather than
+      // converging it.
+      s.on('room-game', function (e) {
+        if (!e || !e.game || NET.role === 'host') return;
+        NET.roomGame = e.game;
+        var i = netPreselectGame(e.game);
+        if (i >= 0) { NET.game = ROMS[i].label; pageLog('[net] the room is on ' + ROMS[i].label + ' -- this console follows it'); }
+        else pageLog('[net] the room named "' + e.game + '", which is not on this page');
+      });
       try { s.on('lockstep', function () { watchLockstep(s); }); } catch (e) {}
       watchLockstep(s);
       pageLog('[net] ' + (asHost ? 'room ' + code + ' open' : 'joining room ' + code)
@@ -3768,6 +3831,26 @@ N64Rate.selfTest = function (logFn) {
       watchLockstep(s);
     };
 
+    // Point both ROM pickers at a game named by LABEL (or file), and return its
+    // index, or -1 when this page does not carry it. Named so the hand-off and
+    // the room's own announcement below use ONE code path -- they disagreed
+    // before, and the disagreement was silent.
+    function netPreselectGame(name) {
+      if (!name) return -1;
+      var idx = -1, gi;
+      for (gi = 0; gi < ROMS.length; gi++) {
+        if (ROMS[gi].label === name || ROMS[gi].file === name) idx = gi;
+      }
+      if (idx >= 0) {
+        ['romSelect', 'mobileRomSelect'].forEach(function (id) {
+          var sel = $(id); if (!sel) return;
+          sel.value = String(idx);
+          sel.dispatchEvent(new Event('change'));
+        });
+      }
+      return idx;
+    }
+
     // ---- ?np=<code>&game=<label>: HANDED OVER FROM n64_multiplayer.html -----
     // Both sides come through here now, not just the host: under lockstep a
     // joiner needs the emulator too, so the lobby sends everybody to this page.
@@ -3785,7 +3868,11 @@ N64Rate.selfTest = function (logFn) {
         if (NET.pendingCode) { var r = $('lsRoom'); if (r) r.hidden = false; return; }
         var sel = isMobile ? $('mobileRomSelect') : $('romSelect');
         var pick = ROMS[+(sel && sel.value) || 0] || ROMS[0];
-        location.href = '/n64_multiplayer.html?game=' + encodeURIComponent(pick.label);
+        // ONE URL for every console (commit ea6dd165). This used to send the
+        // player to /n64_multiplayer.html — a SECOND lobby, with its own
+        // catalogue to drift and its own copy of the flow. The one lobby takes
+        // the console and the game as ?sys=&game= and hands back to this page.
+        location.href = '/multiplayer.html?sys=n64&game=' + encodeURIComponent(pick.label);
       });
     });
 
@@ -3795,17 +3882,7 @@ N64Rate.selfTest = function (logFn) {
       NET.pendingCode = np;
       // The game is named by its LABEL, never by its index into ROMS[].
       // CLAUDE.md records an index going stale exactly this way.
-      var idx = -1, gi;
-      for (gi = 0; gi < ROMS.length; gi++) {
-        if (ROMS[gi].label === npGame || ROMS[gi].file === npGame) idx = gi;
-      }
-      if (idx >= 0) {
-        ['romSelect', 'mobileRomSelect'].forEach(function (id) {
-          var sel = $(id); if (!sel) return;
-          sel.value = String(idx);
-          sel.dispatchEvent(new Event('change'));
-        });
-      }
+      var idx = netPreselectGame(npGame);
       var gameName = idx >= 0 ? ROMS[idx].label : npGame;
       pageLog('[net] handed a session by the lobby: ' + (isJoin ? 'joining' : 'hosting')
             + ' ' + gameName + ' as ' + np);
@@ -3847,10 +3924,23 @@ N64Rate.selfTest = function (logFn) {
         var connected = function () {
           try { return NET.session && NET.session.state === 'connected'; } catch (e) { return false; }
         };
+        // ⚠ A JOINER WAITS FOR THE ROOM TO NAME THE ROM before it boots one.
+        // Booting on `connected` alone is what let a joiner pay for a 12 MB
+        // download of the WRONG ROM and then be refused at the barrier. The
+        // wait is BOUNDED and it is not a prerequisite for running: past the
+        // bound this console loads the ROM it was handed, which is dreamcast
+        // .html's documented behaviour (NET_GUEST_LOAD_FALLBACK_MS) -- LOADING
+        // is not RUNNING, and the barrier still holds every core at frame 0.
+        // ⚠ ITS OWN COUNTER. `tries` is the CONNECT timeout and it climbs while
+        // the room is still forming, so sharing it made this wait a no-op on
+        // exactly the slow pairings it exists for: 48 ticks of connecting and
+        // the very first post-connect tick already exceeds the budget.
+        var NET_ROOM_GAME_WAIT_TICKS = 48;          // 250ms ticks, from `connected`
         var run = function () {
-          var tries = 0;
+          var tries = 0, waited = 0;
           var t = setInterval(function () {
             if (!connected()) { if (++tries > 2400) clearInterval(t); return; }   // 10 min
+            if (isJoin && !NET.roomGame && ++waited <= NET_ROOM_GAME_WAIT_TICKS) return;
             if (press()) clearInterval(t);
           }, 250);
         };

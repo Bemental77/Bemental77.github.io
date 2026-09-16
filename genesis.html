@@ -2139,8 +2139,18 @@
   s.src = '/genesis/genesisWasm/dist/genesis_plus_gx.js';
   s.onerror = function () {
     setStatus('Core failed to load.');
-    banner('<b>The Genesis core could not be loaded.</b> <code>/genesis/genesisWasm/dist/genesis_plus_gx.js</code> did not fetch. '
-      + 'If you are seeing this on the live site it is a deploy problem, not your browser.');
+    // ⚠ THE PATH GOES TO THE LOG, NOT TO THE PLAYER. This read
+    // "<code>/genesis/genesisWasm/dist/genesis_plus_gx.js</code> did not fetch", which
+    // names a file only the person who deployed the site can act on, and then
+    // stopped. Judged by tools/netplay_message_judge.mjs at leak 0.88 with
+    // "does the reader know what happens next" 0.13 — the two worst readings in
+    // the whole corpus. The detail is still here, one line down, for whoever is
+    // actually debugging it.
+    console.log('[core] /genesis/genesisWasm/dist/genesis_plus_gx.js did not fetch');
+    banner('<b>Genesis could not start.</b> The emulator could not be downloaded. '
+      + 'Nothing is wrong with your device — this is a fault on our side. Reloading the page is '
+      + 'worth one try; if it happens again the site is broken and there is nothing you can do '
+      + 'about it from here.');
   };
   document.body.appendChild(s);
 })();

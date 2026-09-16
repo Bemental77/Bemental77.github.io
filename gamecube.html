@@ -7117,7 +7117,13 @@ window.GcRate = (function () {
         // returns the compressed bytes (devserver.mjs:87-98 and GitHub Pages both send
         // Content-Type application/gzip with no Content-Encoding), and a core handed DEFLATE
         // instead of a disc boots into a hang with no error anywhere. Say it out loud.
-        setStatus('This browser cannot decompress the disc (needs DecompressionStream — Safari 16.4+)');
+        // ⚠ NAMES A WAY OUT. This said "This browser cannot decompress the disc
+        // (needs DecompressionStream — Safari 16.4+)" — judged blame 0.71 with
+        // next-step 0.18: it names the API that is missing, which is the one
+        // detail a player cannot use, and never says what would work.
+        console.log('[disc] no DecompressionStream on this browser — cannot inflate the .gz disc parts');
+        setStatus('This game needs a newer browser than this one. Safari can run it from 16.4 onwards, '
+                + 'and current Chrome, Edge and Firefox all can. Everything else on the site still works here.');
         return;
       } else {
         buf = await r.arrayBuffer();
@@ -7861,6 +7867,19 @@ window.GcRate = (function () {
     var mobileUp = !!(splash && m && splash.style.display === 'flex');
     var b = mobileUp ? m : d;
     if (!b) return 'this page has no Start button';
+    // ⚠ WHICH SHELL THE ROOM REACHED FOR IS A REPORTED FACT, not an inference from the
+    // viewport, and it is recorded HERE — before the hold — so the witness costs no disc.
+    // The two Starts are genuinely different code paths: the desktop button's click IS
+    // startEmulator (:7189), while the splash's is a pointerdown handler (:7403) that ALSO
+    // copies #mobileRomSelect into #romSelect before starting, and .click() dispatches no
+    // pointerdown. Every rig that drives this page runs the DESKTOP shell, so the splash
+    // path had no witness at all. It is reachable — the lobby hands a phone
+    // /gamecube.html?code=…&join=1, gcNetMount sets autoconnect, the room forms with no
+    // press, and gcNetOnReady lands here with the splash up — so it must not be deleted.
+    // `pressed` is which Start the room WENT FOR; the returned string (party.held) says
+    // whether it went through, so a rig can hold Start, assert pressed==='mobile-splash',
+    // and never boot a 1 GB disc.
+    GCPARTY.pressed = mobileUp ? 'mobile-splash' : 'desktop';
     if (b.getAttribute('aria-disabled') === 'true' || b.disabled)
       return 'Start is held on this device (' + (b.getAttribute('data-cap-blocked') || b.title || 'disabled') +
              ') — the room will not press through it';
@@ -7888,22 +7907,52 @@ window.GcRate = (function () {
   // sentence. ⚠ The gate lives INSIDE engine() (GCLS is built there, on Start), so it is read
   // back through window.__gcLockstep(), the seam engine() publishes; engine() calls
   // gcNetPartySync() itself at every transition, and a 1 s tick covers what no event carries.
-  var GCPARTY = { ui: null, loadPct: 0, said: null, held: null, rows: null, timer: 0 };
+  // `blips` and `peerLoad` are THIS PAGE'S OWN records of two facts the engine
+  // does not publish per-seat; both are fed from public events (see gcNetWatch)
+  // so no drawing code has to reach into lib/netplay.js for them. `pressed` is
+  // the witness for which shell gcNetPressStart() actually fired — see there.
+  var GCPARTY = { ui: null, loadPct: 0, said: null, held: null, rows: null, timer: 0,
+                  blips: {}, peerLoad: 0, pressed: null };
+  var GC_BLIP_MS = 15000;      // > lib/netplay.js:378 DISCONNECT_GRACE_MS (12000)
   // ⚠ NEVER A NONCE ON SCREEN. A peer is 'host' (port 0) or 'player'; the roster holds
   // 16-hex stableNonces and dreamcast's HUD once printed one ("P1 dc51b70458829649").
   function gcNetWho(port, local) { return (port === 0 ? 'host' : 'player') + (local ? ' (you)' : ''); }
-  // Is this peer's link inside lib/netplay.js's DISCONNECT_GRACE window? Read off the link's
-  // own grace timer rather than remembered from the 'warning' event: the recovery (the pc
-  // reporting 'connected' again) clears that timer and emits nothing.
+  // Is this peer's link inside lib/netplay.js's DISCONNECT_GRACE window?
+  // ⚠ THE ANSWER IS THE PAGE'S OWN WINDOW, NOT THE ENGINE'S FIELD. This used to
+  // walk `s._links` looking for a live `L.graceTimer` — a private map AND a
+  // private field, and the only thing standing between this panel and a lib
+  // upgrade. The public fact is the 'warning' event _armDisconnectGrace emits
+  // when the grace ARMS (lib/netplay.js:3547, {detail, peer}); gcNetWatch opens
+  // a window on it and this reads the window. Three other warnings carry a peer
+  // and are not blips, and each is excluded WITHOUT parsing English:
+  //   :3243 the relay upgrade  -> carries relay:true
+  //   :3122 nothing-from-host  -> carries peer:null
+  //   :3538 ICE timeout        -> is followed by _linkGone, so the seat goes
+  //                               dropped and gcNetPartyRows reads that first
+  // GC_BLIP_MS is deliberately LONGER than the engine's grace so the two cannot
+  // race: if the link really died, 'peer-left' + seat.dropped take the row over
+  // long before the window lapses; if it came back, the row clears when the
+  // window does — or at once, via the advisory fast-clear below.
   function gcNetLinkBlipped(s, peer) {
+    var key = s.isHost ? peer : '#host';        // a guest has ONE link and it is HOST_LINK
+    var until = GCPARTY.blips[key];
+    if (!until) return false;
+    if (Date.now() >= until) { delete GCPARTY.blips[key]; return false; }
+    // FAST CLEAR — ADVISORY ONLY, AND THE PAGE IS CORRECT WITHOUT IT. The engine
+    // clears L.graceTimer the instant the pc reports 'connected' again
+    // (_clearDisconnectGrace) and emits NOTHING, so a 1 s blip would otherwise
+    // read 'disconnected' for the full window. If this private ever goes away
+    // the row simply clears on the window instead of immediately.
     try {
-      var it = s._links.values(), n;
-      while (!(n = it.next()).done) {
-        var L = n.value;
-        if (L && L.graceTimer && (!s.isHost || L.nonce === peer)) return true;
+      var it = s._links.values(), nx, found = false, inGrace = false;
+      while (!(nx = it.next()).done) {
+        var L = nx.value;
+        if (!L || L.nonce !== key) continue;
+        found = true; if (L.graceTimer) inGrace = true;
       }
+      if (found && !inGrace) { delete GCPARTY.blips[key]; return false; }
     } catch (e) {}
-    return false;
+    return true;
   }
   function gcNetLocalState(g) {
     if (g && g.running) return 'playing';
@@ -7943,7 +7992,16 @@ window.GcRate = (function () {
       // player's seat. The roster is the fact.
       var n = info.portCount || 2, meAt = info.host ? 0 : 1, otherAt = info.host ? 1 : 0;
       var linked = s.state === 'connected';
-      var otherLoad = 0; try { s._load.forEach(function (v, k) { if (k !== info.me) otherLoad = v; }); } catch (e) {}
+      // ⚠ PUBLIC MIRROR, NOT THE ENGINE'S `_load` MAP. This read s._load directly.
+      // Nothing is lost: an lsload cannot be OBSERVED before the roster on the link
+      // that carries both — the host sends lsroster from _onPeerUp inside dc.onopen
+      // and emits 'connected' on the next line (lib/netplay.js:4067-4068), and every
+      // lsload rides the same ordered DataChannel after it. So in the genuine
+      // pre-roster window s._load held nothing for a peer either. The mirror below
+      // is fed from roomInfo().seats[].load whenever a roster IS present, which
+      // covers the one case ordering does not: a roster this side once had and
+      // momentarily does not.
+      var otherLoad = GCPARTY.peerLoad | 0;
       for (p = 0; p < n; p++) {
         var st0 = 'open';
         if (p === meAt) st0 = gcNetLocalState(g);
@@ -7958,6 +8016,8 @@ window.GcRate = (function () {
     for (p = 0; p < info.seats.length; p++) {
       var seat = info.seats[p];
       if (seat.peer == null) { rows.push({ port: p, who: gcNetWho(p, false), state: 'open' }); continue; }
+      // Feed the pre-roster mirror from the public seat load while a roster exists.
+      if (!seat.local && (seat.load | 0) > GCPARTY.peerLoad) GCPARTY.peerLoad = seat.load | 0;
       var st;
       if (seat.dropped != null) st = 'disconnected';      // a port gone limp mid-game is not 'playing'
       else if (info.started) st = 'playing';
@@ -7991,6 +8051,7 @@ window.GcRate = (function () {
     if (s && ui && ui.session !== s) {
       GCROOM.session = GCROOM.role = null;
       GCPARTY.said = GCPARTY.held = GCPARTY.rows = null;
+      GCPARTY.blips = {}; GCPARTY.peerLoad = 0; GCPARTY.pressed = null;
       ui.setRows(null);
       return null;
     }
@@ -8041,16 +8102,37 @@ window.GcRate = (function () {
       alone: bar ? !!bar.alone : p.seated < 2,
       declared: !!(g && g.declared), able: !!(g && g.gated), autoStart: true,
       held: GCPARTY.held, loadPct: GCPARTY.loadPct, rows: p.rows,
+      // null until the room pressed this console's own Start; then 'mobile-splash'
+      // or 'desktop' — which of the two shells' paths actually ran.
+      pressed: GCPARTY.pressed,
     };
   }
   window.__gcNetParty = function () { return gcNetParty(); };
+  // ⚠ DO NOT REPORT PROGRESS THE ROOM CANNOT HEAR — AND DO NOT REACH INTO THE
+  // ENGINE TO UNDO IT. setLoadProgress() DROPS the send when no channel is open
+  // but still RECORDS the value, and then dedups the next call with the same one
+  // (lib/netplay.js:4346 `if (this._load.get(me) === v) return v`), so a console
+  // whose disc landed before the pair formed could never report it afterwards and
+  // read "connecting" on the other screen right up to "ready". The page used to
+  // defeat that by DELETING ITS OWN KEY out of `sess._load` — a write into a
+  // private map of lib/netplay.js, the exact coupling that makes a lib upgrade
+  // break a page silently.
+  // It does not need to. Nothing here reads the engine's record of the LOCAL
+  // seat (gcNetPartyRows sends seat.local to gcNetLocalState, which reads
+  // GCPARTY.loadPct), so the page simply does not push until there is a link to
+  // push down; gcNetWatch's 'status' handler pushes the current value the moment
+  // there is one, and with no prior entry the dedup cannot swallow it.
   function gcNetLoadProgress(pct) {
     pct = Math.max(0, Math.min(100, pct | 0));
     if (pct === GCPARTY.loadPct) return;
     GCPARTY.loadPct = pct;
-    var s = GCROOM.session;
-    if (s && typeof s.setLoadProgress === 'function') { try { s.setLoadProgress(pct); } catch (e) {} }
+    gcNetPushLoad(GCROOM.session);
     gcNetPartySync();
+  }
+  function gcNetPushLoad(s) {
+    if (!s || !GCPARTY.loadPct) return;
+    if (s.state !== 'connected' || typeof s.setLoadProgress !== 'function') return;
+    try { s.setLoadProgress(GCPARTY.loadPct); } catch (e) {}
   }
   function gcNetWatch(sess) {
     // Deferred a tick: the page subscribes BEFORE lib/netplay-ui.js does (onSession runs first
@@ -8058,16 +8140,28 @@ window.GcRate = (function () {
     ['status', 'room', 'lockstep', 'warning', 'peer-joined', 'peer-left', 'barrier-failed'].forEach(function (ev) {
       sess.on(ev, function () { setTimeout(gcNetPartySync, 0); });
     });
-    // ⚠ PROGRESS REPORTED BEFORE THE LINK WAS UP NEVER REACHED THE PEER. The prefetch starts at
-    // engine() entry (:8962), before anyone has paired; setLoadProgress() records the value
-    // locally and drops the send, and then DEDUPS the next call with the same value
-    // (lib/netplay.js setLoadProgress `if (this._load.get(me) === v) return`) — so a console
-    // whose disc landed before the pair formed showed "connecting" on the other screen right
-    // up to "ready". Forget the recorded value on 'connected' and report it again.
+    // PROGRESS REPORTED BEFORE THE LINK WAS UP NEVER REACHED THE PEER. The prefetch starts at
+    // engine() entry (:8962), before anyone has paired, so gcNetLoadProgress holds the value
+    // and this is where it goes out: the first open channel on this session. No prior entry
+    // exists in the engine's map, so its dedup cannot swallow the send.
+    // ⚠ KNOWN RESIDUAL, NAMED RATHER THAN PAPERED OVER: if a THIRD player joins while this
+    // console's percentage is FROZEN (already 100, gate not yet armed), the repeat push is
+    // deduped and that player sees this seat as 'connecting' until the gate arms — at which
+    // point the host's barrier broadcast (lsbar) names this seat ready and the row is right
+    // again. Closing it needs a public re-send on the engine (setLoadProgress(pct, force)),
+    // and forging a false percentage to get past the dedup is not a fix.
     sess.on('status', function (e) {
-      if (!e || e.state !== 'connected' || !GCPARTY.loadPct) return;
-      try { sess._load.delete((sess.ls && sess.ls.peerId) || sess._nonce); sess.setLoadProgress(GCPARTY.loadPct); } catch (err) {}
+      if (!e || e.state !== 'connected') return;
+      gcNetPushLoad(sess);
     });
+    // THE BLIP WINDOW, from public events only — see gcNetLinkBlipped for why each of the
+    // other peer-bearing warnings is excluded by a FIELD rather than by its wording.
+    sess.on('warning', function (e) {
+      if (!e || !e.peer || e.relay) return;
+      GCPARTY.blips[e.peer] = Date.now() + GC_BLIP_MS;
+    });
+    sess.on('peer-left', function (e) { if (e && e.peer) delete GCPARTY.blips[e.peer]; });
+    sess.on('peer-joined', function (e) { if (e && e.peer) delete GCPARTY.blips[e.peer]; });
     if (!GCPARTY.timer) GCPARTY.timer = setInterval(gcNetPartySync, 1000);
   }
   function gcNetMount() {
@@ -9054,9 +9148,15 @@ window.GcRate = (function () {
     // ENGINE — nobody has connected, so nothing has seated, so nothing built one. Without this
     // the gate would refuse and the core would FREE-RUN UNGATED, which is the one outcome this
     // whole architecture exists to prevent.
+    // ⚠ PUBLIC, NOT `_ensureLockstep()`. setReady(false) IS the engine's published door onto
+    // the same lazy build: lib/netplay.js:4334-4336 calls _ensureLockstep() and THEN returns
+    // false for `on === false`, so it builds the engine (and, on a host, seats this console —
+    // the same side effect the private call has) and declares nothing. The engine handle is
+    // then read back off the public `session.ls`, which is what roomInfo() reads.
     var ls = gcLsEngine();
-    if (!ls && typeof GCLS.session._ensureLockstep === 'function') {
-      try { ls = GCLS.session._ensureLockstep(); } catch (e) { gcLsSay('could not build the engine: ' + e); }
+    if (!ls && GCLS.session && typeof GCLS.session.setReady === 'function') {
+      try { GCLS.session.setReady(false); ls = gcLsEngine(); }
+      catch (e) { gcLsSay('could not build the engine: ' + e); }
     }
     if (!ls) {
       GCLS.fault = 'the room published no lockstep engine, so this core cannot be frame-gated';

@@ -122,7 +122,101 @@ const EXPECT = {
   nav.url = null; await p.click('#btnJoin'); await sleep(300);
   const warned = await visible(p, '#joinWarn');
   warned && !nav.url ? ok('malformed-code-refused-on-the-lobby', 'warning shown, no navigation') : bad('malformed-code-refused-on-the-lobby', `warn=${warned} nav=${nav.url}`);
+
+  // ---- THE LINK MUST NAME THE CONSOLE THE PAGE IS SHOWING -------------------
+  // pickConsole() rebuilds the game list and repoints `sys`, but it did NOT
+  // re-point #invite — only the game <select>'s own change handler did
+  // (multiplayer.html:372). So a host could mint a code, change their mind
+  // about the console, and hand out a link still naming the OLD console while
+  // "Start my console" took THEM to the new one. Two players, two different
+  // pages, one code they can never meet on. Nothing else here catches it: every
+  // other cell picks a console and then never changes it.
+  {
+    const chip = (k) => p.evaluate((key) => {
+      const c = window.__mpCatalog.find((x) => x.key === key);
+      [...document.querySelectorAll('#consoles button')].find((b) => b.firstChild.textContent === c.name).click();
+    }, k);
+    await chip('dreamcast');
+    await p.click('#btnHost');
+    const code = await until(async () => {
+      const t = await p.evaluate(() => (document.getElementById('code').textContent || '').trim());
+      return CODE_RE.test(t) ? t : null;
+    });
+    await chip('genesis');
+    await sleep(150);
+    const after = await seam(p);
+    const gameNow = await p.evaluate(() => document.getElementById('game').value);
+    // ⚠ READ THE INPUT, NOT THE SEAM. window.__mp() RECOMPUTES `invite` from the
+    // live `sys` and `sel.value`, so it is right even when the field the host
+    // copies is stale — asserting the seam here passed against the defect and
+    // proved nothing. What a person hands over is #invite's value and the Copy
+    // link button, which reads that same field.
+    const shownInvite = await p.evaluate(() => document.getElementById('invite').value);
+    const iv = decoded(shownInvite || '');
+    (iv.q.np === code && iv.q.sys === 'genesis' && iv.q.game === gameNow && after.sys === 'genesis')
+      ? ok('invite-follows-a-console-change', shownInvite)
+      : bad('invite-follows-a-console-change',
+            `#invite=${shownInvite} — but the page now shows sys=${after.sys} game="${gameNow}" code=${code}`);
+  }
   await p.close();
+
+  // ---- A PARTY THAT IS ALREADY OPEN IS NOT RE-OPENED SILENTLY ---------------
+  // #pick stays visible while the host pane is open (showHost touches only
+  // hostPane/joinPane), so "Open a party" remains one click away the whole time
+  // the code is on screen — and it minted a NEW code every time. A host who
+  // pressed it again, or who came back to the tab and pressed the button they
+  // remembered, invalidated the code their friend was typing, with no sign that
+  // anything had changed but five characters.
+  {
+    const chip = (k) => p2.evaluate((key) => {
+      const c = window.__mpCatalog.find((x) => x.key === key);
+      [...document.querySelectorAll('#consoles button')].find((b) => b.firstChild.textContent === c.name).click();
+    }, k);
+    const { p: p2 } = await lobbyPage(false);
+    await p2.goto(ORIGIN + '/multiplayer.html?net=local', { waitUntil: 'domcontentloaded' });
+    await chip('dreamcast');
+    await p2.click('#btnHost');
+    const first = await until(async () => {
+      const t = await p2.evaluate(() => (document.getElementById('code').textContent || '').trim());
+      return CODE_RE.test(t) ? t : null;
+    });
+    await p2.click('#btnHost');
+    await sleep(150);
+    const second = await p2.evaluate(() => (document.getElementById('code').textContent || '').trim());
+    first === second
+      ? ok('open-a-party-twice-keeps-the-code', `${first} survived a second press`)
+      : bad('open-a-party-twice-keeps-the-code',
+            `${first} -> ${second} — the code a friend is typing was replaced with no warning`);
+    await p2.close();
+  }
+
+  // ---- A PASTED INVITE LINK IS A CODE ---------------------------------------
+  // The host is handed two things to share, a code and a LINK, and the join box
+  // is the obvious place a person pastes either. CODE_RE rejected the link with
+  // "That does not look like a code", which is true and useless: the code is
+  // right there in the ?np= of the thing they pasted, along with the console
+  // and the game, and the lobby already knows how to read all three from a URL
+  // — it does exactly that for ?np= in its own address bar.
+  {
+    const { p: p3, nav: nav3 } = await lobbyPage(false);
+    await p3.goto(ORIGIN + '/multiplayer.html?net=local', { waitUntil: 'domcontentloaded' });
+    await p3.evaluate(() => {
+      const c = window.__mpCatalog.find((x) => x.key === 'dreamcast');
+      [...document.querySelectorAll('#consoles button')].find((b) => b.firstChild.textContent === c.name).click();
+    });
+    await p3.click('#btnJoinPane');
+    const link = ORIGIN + '/multiplayer.html?np=K7MQ2&sys=genesis&game=' + encodeURIComponent('X-Men') + '&net=local';
+    await p3.evaluate((v) => { document.getElementById('codeIn').value = v; }, link);
+    nav3.url = null;
+    await p3.click('#btnJoin');
+    const pasted = await until(async () => nav3.url, 4000);
+    const d = decoded(pasted || '');
+    (d.path === '/genesis.html' && d.q.np === 'K7MQ2' && d.q.game === 'X-Men' && d.q.join === '1')
+      ? ok('a-pasted-invite-link-joins', pasted)
+      : bad('a-pasted-invite-link-joins',
+            `${pasted} — pasting the link the host was told to send was refused as "not a code"`);
+    await p3.close();
+  }
 }
 
 // ---------------------------------------------------------------------------

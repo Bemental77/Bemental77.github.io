@@ -145,17 +145,23 @@
   // must name the same key — and the key is the ROM's LABEL STRING, never its
   // index into ROMS[]. CLAUDE.md records an index going stale exactly this way
   // (ROM_IDX=1 silently loaded the wrong GameCube title for months).
-  // tools/mp_page_test.mjs compares this list against n64/index.html's ROMS[]
-  // and FAILS on drift. It was ALREADY drifted when this page was rewritten —
-  // it carried "Conker's Bad Fur Day" and "Cruis'n USA", which are not in the
-  // live list — so this copy was re-extracted from the page rather than edited.
+  // tools/dreamcast_mp_page_test.mjs compares this list against BOTH sources —
+  // n64/index.html's ROMS[] and multiplayer.html's catalogue — and FAILS on
+  // drift. ⚠ IT NAMED tools/mp_page_test.mjs UNTIL 2026-09-16, AND THAT HARNESS
+  // HAD BEEN RETIRED (audit_all.mjs NOT_RUN), so nothing compared this list at
+  // all. It had drifted again by then, in the opposite direction to the note it
+  // replaced: "Conker's Bad Fur Day" and "Cruis'n USA" were dropped here as
+  // absent from the live list, the live list later carried them, and this copy
+  // offered 25 of 27 games. Re-extracted from n64/index.html mechanically, never
+  // hand-typed — both re-additions are exactly the titles whose names contain an
+  // apostrophe, which is what a hand-copy gets wrong.
   var GAMES = [
     'Super Mario 64', 'Mario Kart 64', 'Zelda: Ocarina of Time', 'Paper Mario',
     'Star Fox 64', 'Pokémon Snap', 'Donkey Kong 64', 'Banjo-Tooie',
-    'Diddy Kong Racing', 'Star Wars Episode I: Racer', 'NFL Blitz 2001',
-    'The New Tetris', 'Gauntlet Legends', 'ClayFighter 63⅓', 'Flying Dragon',
-    'Wheel of Fortune', 'Mario Party', 'Dinosaur Planet',
-    'Super Mario 64: Star Road', 'Zelda: The Missing Link',
+    "Conker's Bad Fur Day", 'Diddy Kong Racing', 'Star Wars Episode I: Racer',
+    "Cruis'n USA", 'NFL Blitz 2001', 'The New Tetris', 'Gauntlet Legends',
+    'ClayFighter 63⅓', 'Flying Dragon', 'Wheel of Fortune', 'Mario Party',
+    'Dinosaur Planet', 'Super Mario 64: Star Road', 'Zelda: The Missing Link',
     'Banjo-Kazooie: Jiggies of Time', 'Banjo-Dreamie',
     'Banjo-Kazooie: Christmas Edition', 'Star Fox: Survival',
     'Super Mario Odyssey 64 (hack)'

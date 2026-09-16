@@ -133,6 +133,12 @@
 
   <div id="pick" class="card">
     <h2>1. Pick the console and the game</h2>
+    <!-- THE GAME IS NOT THE JOINER'S TO GET RIGHT. Every page that can hold a room follows the
+         host's roster ('room-game'): dreamcast.html, genesis.html:1836, snes.html:1817,
+         ps1.html:1818 and n64/index.html. gamecube.html is exempt because its catalogue below
+         holds ONE game and the page mounts a constant name. Before n64 followed, a player who
+         typed a code with the wrong ROM selected downloaded it, booted it, and the room FAILED
+         at the barrier (lib/netplay.js:2014-2019, "different game: everyone must load ..."). -->
     <label>Console</label>
     <div class="chips" id="consoles"></div>
     <label for="game">Game</label>
@@ -165,8 +171,9 @@
     <label for="codeIn">Code</label>
     <input id="codeIn" maxlength="5" autocapitalize="characters" autocomplete="off"
            spellcheck="false" placeholder="ABCDE">
-    <p class="hint">Five characters. There is no I, O, 0 or 1 in a code. The console and game above
-       must be the ones the host picked.</p>
+    <p class="hint">Five characters. There is no I, O, 0 or 1 in a code. Pick the same
+       <em>console</em> — the game is whichever one the host is on, and your console follows the
+       room rather than your pick.</p>
     <p class="warn" id="joinWarn" hidden></p>
     <div class="row">
       <button id="btnJoin" type="button">Join and start my console</button>
@@ -341,6 +348,13 @@
              : c.games[0].key;
     sel.value = dflt;
     $('sysNote').textContent = c.note || '';
+    // ⚠ THE LINK FOLLOWS THE CONSOLE TOO. Only the game <select>'s change
+    // handler re-pointed #invite, so a host who minted a code and THEN changed
+    // console handed out a link naming the old console while "Start my console"
+    // took them to the new one — two players on two different pages, holding one
+    // code they could never meet on. #pick stays visible the whole time the host
+    // pane is open, so changing console after minting is one click away.
+    if (code && !$('hostPane').hidden) $('invite').value = inviteUrl(c, sel.value, code);
     return true;
   }
 
@@ -357,7 +371,13 @@
     $('invite').value = inviteUrl(sys, sel.value, code);
   }
   $('btnHost').addEventListener('click', function () {
-    code = Netplay.makeCode(5);
+    // ⚠ IDEMPOTENT. This minted a NEW code on every press, and #pick — this
+    // button — stays visible the whole time the code is on screen, so a host who
+    // pressed it again, or came back to the tab and pressed the button they
+    // remembered, silently invalidated the code their friend was typing. The
+    // only visible difference was five characters. Pressing it again now just
+    // shows the party that is already open; a reload is how you get a new one.
+    if (!code) code = Netplay.makeCode(5);
     showHost();
   });
   // Changing the game after minting must re-point the link — the link IS the
@@ -388,8 +408,23 @@
     $('codeIn').focus();
   });
   function tryJoin(raw) {
-    var v = (raw || '').trim().toUpperCase();
+    var v = (raw || '').trim();
     var warn = $('joinWarn');
+    // A host is handed TWO things to share — a code and a link — and this box is
+    // where a person pastes whichever one they were sent. Refusing the link with
+    // "that does not look like a code" was true and useless: the code is in its
+    // ?np=, along with the console and the game, and this page already reads all
+    // three out of a URL when one is in its own address bar.
+    if (/[?&]np=/.test(v)) {
+      try {
+        var u = new URL(v, location.origin);
+        var linkSys = u.searchParams.get('sys');
+        var linkGame = u.searchParams.get('game');
+        if (linkSys && BY_KEY[linkSys]) pickConsole(linkSys, linkGame || undefined);
+        v = u.searchParams.get('np') || '';
+      } catch (e) { /* not a URL after all — fall through to the code check */ }
+    }
+    v = v.toUpperCase();
     // The same alphabet every page's netStartGuest() enforces. Refusing a
     // malformed code HERE means the player is told on the page they typed it
     // on, rather than after a hand-off into an emulator that then cannot pair.

@@ -2516,7 +2516,13 @@
         if (d.txt && d.txt.indexOf('returned NULL') >= 0) {
           PROG.stopped = 'the emulator could not get a WebGL2 context from this device — ' +
                          'there is no renderer, so nothing can ever appear';
-          setStatus('This device would not give the emulator a WebGL2 context.');
+          // ⚠ WHAT NOW. This said "This device would not give the emulator a
+          // WebGL2 context." — judged next-step 0.10, blame 0.63, and needing
+          // 2.44 of technical knowledge on a 0-3 scale. The reason is still in
+          // showFatal below and in the log; the status line is for the player.
+          setStatus('The graphics could not start on this device, so the game cannot run here. '
+                  + 'Closing other tabs and reloading frees one often enough to be worth trying; '
+                  + 'another browser or another device is the reliable fix.');
           showFatal('This device would not give the emulator a graphics context', [
             d.txt,
             'The emulator renders WebGL2 from its worker thread. Without a context there is ' +
@@ -5707,12 +5713,25 @@
   //     frame-gated with NOTHING comparing them — gated and silently diverging
   //     is worse than not gated, because it looks right.
   //
-  // ⚠ THE GUEST RATE IS NOT TOUCHED (CLAUDE.md gate #9). The worker's real-time
-  // governor still paces every frame to 1.000x; this gate can only make the
-  // guest run SLOWER (a stall), never faster. That is why the lookahead below
-  // is bounded — a deep worker queue is not a speed-up (the pump is idempotent
-  // and paced per frame) but it hides a stall from the player and grows without
-  // limit.
+  // ⚠ THE GUEST RATE IS NOT TOUCHED (CLAUDE.md gate #9) — BUT THAT IS A
+  // PROPERTY OF THE LOOKAHEAD BELOW, NOT A FREE ONE. This comment used to say
+  // flatly that the gate "can only make the guest run SLOWER (a stall), never
+  // faster". That is FALSE, and it was measured false: the worker rebases the
+  // 1.000x governor on every stall (flycast_worker.js:669, so that a stall is
+  // never repaid), so a queue shallow enough to stall EVERY frame throws the
+  // governor's accumulated lead away before it can ever be spent, and the pump
+  // stops pacing entirely. Measured on Gauntlet, same scene, one frame of
+  // queue: 9,128 worker parks (grep 'core parked at frame'
+  // /tmp/dc-e2e/after_fix.stdout) and guestX=1.5128576 at fps=44 (:18178),
+  // with the page's own bottom bar reading `pump 47 it/s, busy 97%, paced 0%`
+  // in the screenshot /tmp/dc-e2e/after_fix-P1.png. With two frames of queue:
+  // 60-69 parks, guestX=1.00754432 at fps=29 (after_la2.stdout:282), bar
+  // `pump 29 it/s, busy 58%, paced 38%` (after_la2-P1.png). The `paced`/`busy`
+  // halves of that pair live in the SCREENSHOTS — an earlier version of this
+  // comment cited the .stdout files for them, which do not contain the string.
+  // So the lookahead is bounded at BOTH ends. Too deep hides a stall from the
+  // player and grows without limit; too shallow lets the guest outrun the
+  // hardware, which is the one thing this product forbids.
   //
   // ⚠ AND THE CORE MUST NOT RUN ONE FRAME BEFORE THE GATE IS ARMED. Two
   // machines that free-ran for different numbers of frames before lockstep
@@ -5977,12 +5996,60 @@
               Math.round(ls.delay * FRAME_MS) + ' ms), ports=' + JSON.stringify(ls.roster) +
               ', mine=' + JSON.stringify(ls.localPorts));
     }
-    // ⚠ BOUNDED LOOKAHEAD. The engine can never cover more than `delay` frames
-    // ahead of this core anyway (an input for frame F is scheduled by its
-    // owner's attempt at F-delay), so `delay` is the natural ceiling and a
-    // larger one would only queue memory and delay the moment a stall becomes
-    // visible.
-    const lookahead = Math.max(1, ls.delay | 0);
+    // ⚠ BOUNDED LOOKAHEAD — AND IT IS NOT THE SAME QUANTITY AS `delay`.
+    // This number is how many frames of input this console keeps QUEUED IN ITS
+    // OWN WORKER. It used to be `Math.max(1, ls.delay)`, on the reasoning that
+    // the engine can never cover more than `delay` frames ahead anyway (an
+    // input for frame F is scheduled by its owner's attempt at F-delay). That
+    // reasoning is about what the ENGINE can produce; it says nothing about how
+    // deep this console's worker queue should be, and tying the two together
+    // made a protocol constant silently own a local flow-control one.
+    //
+    // ⚠ WHAT IT COST, MEASURED. For one day Lockstep.recommendDelay() answered
+    // 1 frame on a fast link (it has since been reverted to ceil(x)+1 with a
+    // floor of 2 — see lib/netplay.js, and the loopback matched pair that
+    // refutes the change), and this line followed it down to a lookahead of 1.
+    // The worker was then handed frame N only after it had already finished
+    // N-1, so its queue was empty at the top of essentially every frame. The
+    // worker treats an empty queue as a stall, and a stall REBASES THE 1.000x
+    // GOVERNOR (dreamcast/flycast_libretro/flycast_worker.js:669,
+    // `paceBaseWall = 0; paceBaseCyc = 0;` — deliberately, so a stall is never
+    // repaid). Rebasing it once per frame throws the accumulated lead away
+    // before the governor can ever spend it, so it stops pacing altogether.
+    // Counts are `grep -c 'core parked at frame'` on each run's .stdout; the
+    // guestX/fps pairs are that run's own liveness line; the pump/paced figures
+    // are read off that run's screenshot, which is where they live:
+    //     delay 2, lookahead 2 (base_before): 28 parks · guestX=0.99529216
+    //         fps=29 (:198) · bar `pump 29 it/s, busy 59%, paced 37%`
+    //     delay 1, lookahead 1 (after_fix): 9,128 parks · guestX=1.5128576
+    //         fps=44 (:18178) · bar `pump 47 it/s, busy 97%, paced 0%`
+    //     delay 1, lookahead 1, second run (after_fix2): 4,717 parks, and the
+    //         rig's own guest-rate cell FAILED at [1.546, 1.560]
+    // 1.5x is the game running half again faster than a Dreamcast, which is the
+    // one thing this product forbids outright (CLAUDE.md gate #9).
+    //
+    // ⚠ AND THE QUEUE IS NOT FREE TO THE PLAYER EITHER — IT IS INPUT LATENCY.
+    // A frame handed to the worker is not run until the frames already queued
+    // ahead of it have run, so a depth of 2 puts the core's consumption of a
+    // just-fed image ~2 frames behind the feed: 69 ms on a title whose frame
+    // measures 34.5 ms. dreamcast/tools/netplay_room_e2e.mjs section 8a
+    // measures that depth and reports it AS a latency term, because it is one.
+    // The solo path pays nothing like it: frameStep() below posts
+    // {cmd:'input'} with the current pad every rAF and the worker uses whatever
+    // it last received, with no per-frame queue at all.
+    //
+    // So 2 is the floor, and it is a floor imposed by the WORKER'S GOVERNOR,
+    // not by the protocol: it is the smallest depth that leaves the worker
+    // holding frame N+1 while it runs frame N, which is what keeps the queue
+    // non-empty across the page<->worker postMessage round trip. If the
+    // governor re-anchored by frame count instead of zeroing its base
+    // (n64/index.html:3460 and :3475 do exactly that, and cost one free frame
+    // for it), a shallower queue would be affordable and the player would get
+    // those 34-69 ms back. That is an unfixed defect in the worker, recorded
+    // here because this line is the workaround for it. A DEEPER queue is not
+    // free either — it delays the moment a real stall becomes visible — so this
+    // takes the floor and nothing more.
+    const lookahead = Math.max(2, ls.delay | 0);
     let fed = 0;
     if ((LS.fedTo - LS.workerFrame) >= lookahead) { LS.bfSkipped++; lsDiagTick(ls, null); }
     while ((LS.fedTo - LS.workerFrame) < lookahead) {
@@ -6010,8 +6077,10 @@
       // here and never read it.
       ls.endFrame(null);                 // advance the clock; the hash is late — see submitHash
       // A runaway feed would be a bug in this loop, not a feature. The bound is
-      // never reached in practice (lookahead is `delay`), and reaching it is
-      // worth catching rather than sprinting the guest.
+      // never reached in practice — the while condition above stops at
+      // `lookahead` frames queued, which is 2 or the agreed delay, whichever is
+      // larger — and reaching it is worth catching rather than sprinting the
+      // guest.
       if (++fed > 240) { pageLog('[lockstep] ⚠ feed loop hit its 240-frame bound — not sprinting the guest'); break; }
     }
     lsDiagTick(ls, null);
@@ -6047,7 +6116,21 @@
       // that does not answer inside 600 ms is not a peer whose RTT should be
       // allowed to hold up the barrier, and its absence simply leaves the
       // default in force.
-      const r = await sess.rttReport(600);
+      // ⚠ ASK FOR THE DELAY IN THIS TITLE'S FRAMES, NOT IN 60 Hz FRAMES.
+      // rttReport() used to hardcode 1000/60 (lib/netplay.js), and a lockstep
+      // frame is one retro_run: ~34.5 ms on Gauntlet/PSO Ver.2, which render
+      // every other VBlank (measured /tmp/dc-e2e/base_before.stdout:180). So the
+      // recommendation was counted in frames half the length of the ones the
+      // room actually runs.
+      // ⚠ AND ON A COLD ROOM THIS IS STILL THE 60 Hz FALLBACK — say so rather
+      // than imply otherwise. This runs before the barrier, so no core has
+      // presented a frame and lsFrameMs() has nothing measured to return; the
+      // proof is in the same run's own log, `[lockstep] input delay 3 -> 2
+      // frames (33 ms estimated at 60 Hz ...)` at :50, against a panel that then
+      // read 69 ms. Passing it is what makes the seam right for the case where
+      // the figure IS known — a console that has already been running when the
+      // room is opened — and it is inert, by construction, when it is not.
+      const r = await sess.rttReport(600, lsFrameMs());
       // ⚠ 30, NOT 10 — THE ENGINE'S CEILING, BECAUSE A RELAY ROOM NEEDS IT.
       // This clamped the measured recommendation to 10 frames (167 ms at 60 Hz)
       // while lib/netplay.js:1252 accepts up to 30 (500 ms). On a DIRECT link
