@@ -63,6 +63,7 @@
   destroyed" failures in the rigs.
 -->
 <script src="/lib/netplay.js?v=40595af6"></script>
+<script src="/lib/mpgames.js"></script>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -276,6 +277,15 @@
   ];
   var BY_KEY = {};
   CONSOLES.forEach(function (c) { BY_KEY[c.key] = c; });
+  // ONLY MULTIPLAYER GAMES ARE OFFERED. The lists above mirror each page's
+  // ROMS[] exactly (tools/multiplayer_page_test.mjs); lib/mpgames.js names the
+  // titles with no multiplayer mode, and they are taken out here — a room for a
+  // game that never reads controller 2 leaves player 2 with nothing to do.
+  CONSOLES.forEach(function (c) {
+    c.solo = c.games.filter(function (g) { return MPGames.isSolo(c.key, g.key); });
+    c.games = c.games.filter(function (g) { return !MPGames.isSolo(c.key, g.key); });
+    if (!c.games.length && c.solo.length) c.note = 'No multiplayer games on this console yet — every game here is single-player.';
+  });
 
   // BroadcastChannel pairs two tabs in ONE browser with no third party, which is
   // what the headless rigs use; PeerJS's public broker is what pairs two
@@ -322,7 +332,7 @@
     b.firstChild.textContent = c.name;
     b.lastChild.textContent = c.games.length
       ? (c.games.length + (c.games.length === 1 ? ' game' : ' games') + ' · up to ' + c.players + ' players')
-      : 'not online';
+      : (c.solo && c.solo.length ? 'single-player only' : 'not online');
     b.setAttribute('aria-pressed', 'false');
     if (!c.games.length) b.disabled = true;
     b.addEventListener('click', function () { pickConsole(c.key); });
@@ -362,6 +372,12 @@
   // the default is the Dreamcast, whose four-port co-op is what this exists for.
   var preSys = QS.get('sys'), preGame = QS.get('game');
   if (!pickConsole(preSys, preGame)) pickConsole('dreamcast', preGame);
+  // A page's Party button naming a single-player game: say so, rather than
+  // silently swapping in a different game.
+  if (preSys && preGame && MPGames.isSolo(preSys, preGame)) {
+    $('sysNote').textContent = preGame + ' is single-player, so it has no party mode. ' +
+      (sys && sys.key === preSys ? 'Pick one of the multiplayer games below.' : 'Pick a console and a multiplayer game below.');
+  }
 
   // ---- host ------------------------------------------------------------------
   function showHost() {
