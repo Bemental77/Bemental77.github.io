@@ -19,7 +19,7 @@
 # of whatever is live is saved to *.prev.{js,wasm} first so the SW build can be restored.
 set -e
 
-ROOT=/Users/caseybement/Bemental77.github.io
+ROOT=${DOLPHIN_ROOT:-/Users/caseybement/Bemental77.github.io}
 BUILD=$ROOT/gamecube/dolphin-src/build-wasm-4010
 SRC=$ROOT/gamecube/dolphin-src/Source/Core
 BRIDGE=$ROOT/gamecube/dolphin-bridge

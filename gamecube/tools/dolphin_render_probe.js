@@ -21,7 +21,7 @@ const ROOT = process.env.PROBE_ROOT || '/Users/caseybement/Bemental77.github.io'
 const PORT_REQUESTED = parseInt(process.env.PROBE_PORT || '0', 10);
 let PORT = PORT_REQUESTED;
 const TEST_DURATION_MS = parseInt(process.env.PROBE_DURATION_MS || '60000', 10);
-const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const CHROME = process.env.PROBE_CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 // Set to truthy (any non-empty value) to capture chrome://tracing JSON +
 // page.metrics() snapshots. Default ON because the artifacts are cheap and
 // the V8 wasm tier-up signal is not visible from console logs alone.
