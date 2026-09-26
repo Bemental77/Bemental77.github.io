@@ -27,6 +27,10 @@ OUT=$ROOT/gamecube/dolphin_libretro
 
 source $HOME/emsdk-upstream/emsdk_env.sh > /dev/null 2>&1
 
+# In-place sed: BSD (macOS) needs `-i ''`, GNU needs a bare `-i` (GNU reads `''` as the
+# script and the real script as a FILE, so both post-link patches below silently no-op'd).
+if sed --version > /dev/null 2>&1; then SED_I=(sed -i); else SED_I=(sed -i ''); fi
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MEMORY SIZING — env-overridable, defaults are EXACTLY what shipped before, so a
 # plain `bash dolphin_worker_link_4010.sh` still produces the same import limits.
@@ -403,12 +407,12 @@ fi
 # Post-build patches (same as canonical; no-op if the target string is absent under WGPU).
 # NOTE: these MUST target "$OUT_JS", not the hardcoded live path — under
 # LINK_OUT_JS the emitted file is in scratch and the live worker must not be touched.
-sed -i '' 's|for(var name of transferredCanvasNames)|if(!transferredCanvasNames)transferredCanvasNames=[];for(var name of transferredCanvasNames)|' "$OUT_JS" || true
+"${SED_I[@]}" 's|for(var name of transferredCanvasNames)|if(!transferredCanvasNames)transferredCanvasNames=[];for(var name of transferredCanvasNames)|' "$OUT_JS" || true
 node "$BRIDGE/patch_blit_getparameter.mjs" "$OUT_JS" || true
 # [2026-07-13] emdawnwebgpu's blend-factor enum table uses Dawn's names 'src1alpha' /
 # 'one-minus-src1alpha', but Chrome implements the WebGPU-spec strings 'src1-alpha' /
 # 'one-minus-src1-alpha' — createRenderPipeline rejects the Dawn spelling (TypeError, dual-source
 # pipelines fail). One global replace fixes both (the long name contains the short one).
-sed -i '' 's|src1alpha|src1-alpha|g' "$OUT_JS" || true
+"${SED_I[@]}" 's|src1alpha|src1-alpha|g' "$OUT_JS" || true
 
 echo "linked (WebGPU 4010): $OUT_JS"
