@@ -27,6 +27,7 @@ shipped disc; the reproducing command is printed next to each one. Artifact:
 | **JIT baseline, re-measured** | **0.3781x delivered / 141.6 MHz executed / 23.2% idle-skipped**, stock V8, n=3, cross-witness spread ≤0.0005. **1.000x costs 373.5 MHz on this scene → the JIT is 2.64x short.** §8.6b |
 | ~~JIT baseline `0.4450x`~~ | **RETRACTED, §8.6c** — a 75 s cold boot read over one 40 s window; re-reading that band from four fresh runs of ONE frozen binary returns **0.3338x–0.5097x**. The V8-tier mismatch §8.1 warned about measures **null on both engines** (§8.6d) and was the least of its defects. |
 | **WHOLE-IMAGE BOOT IN A BROWSER** | **LINKS, INSTANTIATES, AND RUNS THE GUEST'S OWN `__start`** — wasm md5 `7bcca5756df27133d684c4281410171b`. `__init_registers` / `__init_hardware` / `__init_data` / `DBInit` all return **fault-free**, then `OSInit` reaches **27 distinct hardware registers** across PI/MI/DSP/SI/EXI/DI in **126 host-boundary crossings**. It stops in **`__OSInitAudioSystem`**, spinning on a DSP register — **no device model and no interrupt delivery**, not a translator bug (the GAP class is still zero). Modelling one register (EXI `TSTART`) moved it from 21 registers to 27, with a **falsifying control arm on the same md5**. **Nothing renders and no `drawn/s` is claimed.** §10 |
+| **CITY ESCAPE IN THE PAGE AT 1.000x, 2026-09-29** | Chrome, `?srimage=1&srrender=1&srmode=main&srcapture=0`, host pacer on: **0.9968 / 0.9997 / 0.9985x delivered, 59.75-59.93 XFB/s, capacity 1.615 / 1.696 / 1.639** (idle 0.727, 132 MHz executed), 0 faults, 0 page errors. Not drawn: with frames posted, the software-WebGPU consumer falls behind and the page's un-backpressured relay (gamecube.html:7682) grows to 8 GB. Host changed across a restart (same wasm 1.04x -> 1.90x unpaced): compare within a session only. §10.10 |
 | **CITY ESCAPE AT 1.000x CAPACITY, 2026-09-29** | Node: overlays translated ahead of time from the disc (6 modules, position-independent, hash-guarded), a memory card and a controller transcribed from Dolphin, scripted input -> `stg13D` resident at ~45-48 guest s, 59.3 DrawDones/guest s, 0 faults. Window 70-150 guest s, idle 0.728 (needs 132.3 MHz): **0.69x -> 0.78x -> 0.88-1.02x -> 1.04-1.09x capacity** (n=3 per step; FMA fast path, guest-memory fast path). Thin headroom; no screenshot (node has no renderer). §10.8-10.9 |
 | **WHOLE-IMAGE SPEED, 2026-09-29** | Node, `mcwarnD` frame loop, n=3 matched pairs on one binary each: baseline **0.0986x** -> **0.78x** (a 24 MB MEM1 hash at every context switch, a verification instrument, removed from the image) -> **6.5x capacity** (Dolphin's busy-wait skip transcribed: 96.8% idle, 100 MHz executed; 15.5 MHz needed at 1.000x). With nothing to skip the executed rate is 300-380 MHz = 0.62-0.78 of Gekko: 1.000x needs >= ~22-38% idle. The browser figures in §10.6e predate both changes. §10.7 |
 | **WHOLE-IMAGE BOOT — THE GUEST'S FRAMES REACH DOLPHIN IN THE PAGE, 2026-09-29** | Behind `?srimage=1&srrender=1&srmode=main&srbase=…/guest/` (off by default): SAB boots from `__start` on a pthread in the browser, runs its frame loop at 59.943 DrawDones per guest second, and its whole frames stream to Dolphin's GP decoder — `[recompLive] fifo=2135B draws=3 skipped=0`, 0 page errors; the `?srcapture=0` arm posts nothing. The picture itself is not verified (offscreen WebGPU); the guest runs far below 1.000x. §10.6e |
@@ -3657,6 +3658,51 @@ SR_OVERLAYS="$(ls /tmp/ov/*.c | tr '\n' ' ')" SR_PTHREAD=1 SR_MEM=1879048192 SR_
 SR_IMG=/tmp/img SRN_ISO=sab.iso SRS_MS=240000 SRS_POSTMS=0 SRS_EXI=2 SRS_CARD=1 SRS_SI=1 SRS_INPUT="$(cat input_ce.txt)" \
     SRS_FROM_GS=70 SRS_TO_GS=150 SRS_FMA=1 SRS_OUT=ce.json node gamecube/recomp/sr/run_image_stream.mjs
 ```
+
+#### 10.10 City Escape IN THE PAGE, paced to 1.000x (2026-09-29)
+
+**⚠ The host changed under the same binary.** After a container restart, wasm `cf3b5033` (§10.9's
+last row, 1.04-1.09x there) read **1.8963x** unpaced on the same window (load 3.9, CPU "Intel Xeon
+@ 2.10GHz", 4 cores). Absolute rates in this README are per-host; only pairs taken in one session
+compare. Everything below was taken after the restart.
+
+**The pacer** (`sr_image.c`, `sr_image_set_pace`; `pace` in `startGuest`/`guest_config.json`,
+`SRS_PACE` in the node rig). Gate #9's second knob: once per VI field the host waits until wall
+time has caught up with guest time. The guest still never reads the wall clock (its time is retired
+work); falling behind by >100 ms re-anchors instead of sprinting, and the deficit is counted
+(`behind`). Capacity at 1.000x = guest s / (wall s - waited s).
+
+Node, wasm `4efee00f`, window 70-150 guest s: paced **1.0001x / 1.0001x** delivered, 59.94 / 59.93
+DrawDones per wall s, host waited 38.7% / 37.4% -> **capacity 1.63 / 1.60**, 0 ms behind; the same
+binary unpaced read 1.817x (load 1.5-3.9).
+
+**In Chrome** (`gamecube.html?srimage=1&srrender=1&srmode=main&srbase=…/guest/&srdisc=1500&srcapture=0`,
+headless Chromium 140 via `gamecube/recomp/sr_image/sr_page_run.mjs`, hermetic tree, guest md5
+`4efee00f`, Dolphin md5 `ced4905a` stable before/after every run; the guest's machine comes from
+`guest/guest_config.json`: card, SI, the City Escape input script, `pace: 1`). Window 70-150 guest s,
+`stg13D` resident, 0 faults, 0 refused overlays, 0 page errors, n=3, load 2.1-5.7 (the first run
+started at 30.4 falling):
+
+| run | guest s / wall s | executed MHz | idle | published XFB / s | host waited | capacity at 1.000x |
+|---|---|---|---|---|---|---|
+| 1 | 0.9968 | 132.8 | 0.726 | 59.75 | 38.3% | 1.615 |
+| 2 | 0.9997 | 132.7 | 0.727 | 59.93 | 41.1% | 1.696 |
+| 3 | 0.9985 | 132.0 | 0.728 | 59.86 | 39.1% | 1.639 |
+
+**City Escape runs at 1.000x in the page with ~1.6x capacity on this host.** That margin is NOT
+enough for the device class that includes phones several times slower than a 2.1 GHz Xeon core.
+
+**What the page does NOT do yet: draw it.** `srcapture=0` is the arm where no frame is posted, so
+drawn/s is 0 by construction. With `srcapture=1` the run fails, and the mechanism was measured: this
+box renders WebGPU in SOFTWARE (Dawn: "vkCreateInstance: Found no drivers" -> SwiftShader), the
+Dolphin consumer cannot keep up with ~60 gameplay frames per second, and the page relays every
+frame with a 24 MB MEM1 snapshot with no backpressure (`gamecube.html:7682-7684`: "does not model
+backpressure ... the frames simply queue") -- at 26 min the renderer process held 8.0 GB and the GPU
+process 5.8 GB RSS on a 16 GB box with no swap, the page stopped answering CDP, and the only guest
+line that arrived was frame 1. Unpaced it was worse (1.5-1.9 guest s per wall s of frames). The fix
+belongs in `gamecube.html` (relay Dolphin's `recompAck` to the render worker so it can hold or merge
+frames); this work is not allowed to edit that file, so it is named here instead. Whether a real GPU
+keeps up is not measured.
 
 #### What is still missing before a first rendered frame
 

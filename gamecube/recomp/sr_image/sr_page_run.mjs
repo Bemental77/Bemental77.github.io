@@ -75,6 +75,15 @@ const browser = await puppeteer.launch({ executablePath: CHROME, headless: 'new'
          '--disable-features=IntensiveWakeUpThrottling', '--disable-dev-shm-usage',
          '--js-flags=--max-old-space-size=4096'], protocolTimeout: 120000 });
 try { require(path.join(REPO, 'tools/browser_leak_guard.js')).guard(browser, fileURLToPath(import.meta.url)); } catch (_) {}
+// HARD DEADLINE.  A page that thrashes (measured 2026-09-29: renderer 8.0 GB + GPU process 5.8 GB
+// RSS, no swap) stops answering CDP, puppeteer's awaits never settle, and even `timeout`'s SIGTERM
+// was not acted on for 20 minutes.  Kill the browser and exit from a timer that needs nothing
+// from the page.
+setTimeout(() => {
+  try { log({ kind: 'deadline', note: 'page unresponsive; browser killed' }); } catch (_) {}
+  try { process.kill(browser.process().pid, 'SIGKILL'); } catch (_) {}
+  process.exit(2);
+}, MS + 90000).unref();
 const page = await browser.newPage();
 let errLines = 0;
 page.on('console', (m) => {
