@@ -10,6 +10,8 @@
        cross the wire. The ONLINE PLAY block near the end of this page carries
        the evidence this rests on, including the determinism measurement. -->
   <script src="/lib/netplay.js?v=40595af6"></script>
+  <script src="/lib/mpgames.js"></script>
+  <script>MPGames.gateParty('ps1', ['btnNet', 'mobileSplashNet'], ['romSelect', 'mobileRomSelect']);</script>
   <meta charset="UTF-8" />
   <title>PS1 Wasm — Monster Rancher 2</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -1493,7 +1495,10 @@
     var d = ts - LS.lastTs; LS.lastTs = ts;
     if (d > 100) d = 100;               // a long stall must not fast-forward the guest
     LS.accum += d;
-    var lookahead = Math.max(1, (lsEngine() || {}).delay | 0);
+    // Capped at 2: frames queued in the worker ahead of the feed point add ON
+    // TOP of the input delay (see dreamcast.html's feed loop), so
+    // max(1, delay) paid the delay twice.
+    var lookahead = Math.max(1, Math.min(2, (lsEngine() || {}).delay | 0));
     var ran = 0, stalled = false;
     while (LS.accum >= FRAME_MS && ran < MAX_CATCHUP_FRAMES) {
       // Getting further ahead of the worker than the input delay is not a frame

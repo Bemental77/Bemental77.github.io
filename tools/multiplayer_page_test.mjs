@@ -104,6 +104,29 @@ for (const [key, p] of Object.entries(PAGES)) {
        : bad('gba-is-listed-as-not-online', JSON.stringify({ games: c.games.length, handoff: c.handoff }));
 }
 
+// ---- single-player titles (lib/mpgames.js) ----------------------------------
+// Every key there must be a real title on that console's page, or a rename
+// silently re-offers a solo game for a party.
+{
+  const ctx = { window: {}, location: { search: '' } };
+  vm.runInNewContext(read('lib/mpgames.js'), ctx);
+  const SOLO = ctx.window.MPGames.SOLO;
+  for (const [sys, keys] of Object.entries(SOLO)) {
+    const c = byKey[sys];
+    const missing = c ? keys.filter((k) => !c.games.some((g) => g.key === k)) : keys;
+    missing.length ? bad(`${sys}-solo-keys-exist`, `not on the page: [${missing.join(' | ')}]`)
+                   : ok(`${sys}-solo-keys-exist`, `${keys.length} single-player title(s), all on the page`);
+  }
+  for (const f of ['n64/index.html', 'ps1.html', 'snes.html']) {
+    /MPGames\.gateParty\(/.test(live(read(f)))
+      ? ok(`${f}-party-gated`, 'Party disabled on a single-player game')
+      : bad(`${f}-party-gated`, 'no MPGames.gateParty call');
+  }
+  /MPGames\.isSolo\(/.test(live(lobby))
+    ? ok('lobby-filters-solo', 'lobby offers only multiplayer titles')
+    : bad('lobby-filters-solo', 'multiplayer.html does not filter through MPGames.isSolo');
+}
+
 // ---- the hand-off literals and the receivers --------------------------------
 const lobbyLive = live(lobby);
 const RECEIVER = {

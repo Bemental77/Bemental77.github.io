@@ -272,7 +272,10 @@ WGPUStagingTexture::~WGPUStagingTexture()
   // [wgpu xfb-band 2026-07-31] a still-pending async encode must not touch this
   // object (or its map buffer) after destruction; its callback owns + frees the ctx.
   if (m_pending_encode)
+  {
     m_pending_encode->orphaned = true;
+    m_pending_encode->owner = nullptr;  // the callback must not read this destroyed staging
+  }
 }
 
 void WGPUStagingTexture::CopyFromTexture(const AbstractTexture* src,

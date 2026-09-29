@@ -312,10 +312,6 @@ protected:
           {
             EncodeEfbToRam(c, mapped);
             c->pending.encode_done = true;
-            // Unregister before delete: a later ReadTexels must take the plain
-            // base-copy path (map bytes are valid now), not deref freed ctx.
-            if (c->pending.owner && c->pending.owner->m_pending_encode == &c->pending)
-              c->pending.owner->m_pending_encode = nullptr;
             ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3854u));
           }
           // orphaned && !deferred: staging reused and no flush destination recorded
@@ -323,6 +319,14 @@ protected:
         }
         wgpuBufferUnmap(c->buffer);
       }
+      // Unregister before delete on EVERY path — deferred, orphaned, null range and a
+      // failed map included. Only the plain success path used to do it, so the others
+      // left m_pending_encode pointing into this freed ctx, and the next copy on the
+      // same staging wrote `old->orphaned = true` (and ReadTexels its def_* fields)
+      // into freed heap — the "null function or function signature mismatch" trap in
+      // TextureCacheBase::FlushEFBCopy.
+      if (c->pending.owner && c->pending.owner->m_pending_encode == &c->pending)
+        c->pending.owner->m_pending_encode = nullptr;
       wgpuBufferRelease(c->buffer);
       delete c;
     };

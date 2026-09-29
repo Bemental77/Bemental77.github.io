@@ -73,6 +73,30 @@ static void OnDeviceLost(WGPUDevice const*, WGPUDeviceLostReason reason, WGPUStr
   }, (int)reason, (int)(intptr_t)message.data, (int)message.length);
 }
 
+// Whether the device got the dual-source-blending feature. Adapters without it (software
+// WebGPU, many mobile/integrated GPUs) reject BOTH the `enable dual_source_blending;` fragment
+// module and every pipeline using a Src1 blend factor — every draw failed and the screen stayed
+// black. Without the feature the fragment shader writes ONE output whose alpha is ocol1.a (the
+// blend alpha) and blending uses plain SrcAlpha — Dolphin's usual no-dual-source fallback; only
+// the EFB destination-alpha constant is lost.
+static bool s_has_dsb = true;
+
+static void AdaptFragmentWGSL(std::string& wgsl)
+{
+  if (s_has_dsb)
+    return;
+  auto repl = [&wgsl](const char* from, const char* to) {
+    const size_t at = wgsl.find(from);
+    if (at != std::string::npos)
+      wgsl.replace(at, std::strlen(from), to);
+  };
+  repl("enable dual_source_blending;\n", "");
+  repl("    @location(0) @blend_src(0) member: vec4<f32>,\n"
+       "    @location(0) @blend_src(1) member_1: vec4<f32>,\n",
+       "    @location(0) member: vec4<f32>,\n");
+  repl("return FragmentOutput(_e26, _e27);", "return FragmentOutput(vec4<f32>(_e26.xyz, _e27.w));");
+}
+
 // [WGPU-PROF — TEMP] per-frame draw counters: DrawIndexed accumulates, ShowImage reads + resets.
 static int s_frame_draws = 0;
 static double s_frame_draw_ms = 0.0;
@@ -150,6 +174,7 @@ WGPUGfx::WGPUGfx(const WindowSystemInfo& wsi)
     WGPUFeatureName required_features[1];
     size_t required_count = 0;
     const bool has_dsb = wgpuAdapterHasFeature(adapter, WGPUFeatureName_DualSourceBlending);
+    s_has_dsb = has_dsb;
     if (has_dsb)
       required_features[required_count++] = WGPUFeatureName_DualSourceBlending;
     dev_desc.requiredFeatureCount = required_count;
@@ -1607,6 +1632,8 @@ WGPUGfx::CreateShaderFromSource(ShaderStage stage, [[maybe_unused]] std::string_
   else
     return nullptr;  // Geometry/Compute not provided in B1
 
+  if (stage == ShaderStage::Pixel)
+    AdaptFragmentWGSL(wgsl);
   if (!m_device)
     return std::make_unique<WGPUShader>(stage, nullptr, std::move(wgsl));
 
@@ -1630,6 +1657,8 @@ WGPUGfx::CreateShaderFromBinary(ShaderStage stage, const void* data, size_t leng
   else
     return nullptr;
 
+  if (stage == ShaderStage::Pixel)
+    AdaptFragmentWGSL(wgsl);
   if (!m_device)
     return std::make_unique<WGPUShader>(stage, nullptr, std::move(wgsl));
 
@@ -2399,7 +2428,7 @@ std::unique_ptr<AbstractPipeline> WGPUGfx::CreatePipeline(const AbstractPipeline
   WGPUBlendState blend = {};
   blend.color.operation =
       config.blending_state.subtract ? WGPUBlendOperation_ReverseSubtract : WGPUBlendOperation_Add;
-  const bool use_dual_src = config.blending_state.use_dual_src;
+  const bool use_dual_src = config.blending_state.use_dual_src && s_has_dsb;
   blend.color.srcFactor = MapSrcFactor(config.blending_state.src_factor.Value(), use_dual_src);
   blend.color.dstFactor = MapDstFactor(config.blending_state.dst_factor.Value(), use_dual_src);
   blend.alpha.operation = config.blending_state.subtract_alpha ? WGPUBlendOperation_ReverseSubtract

@@ -6049,7 +6049,14 @@
     // here because this line is the workaround for it. A DEEPER queue is not
     // free either — it delays the moment a real stall becomes visible — so this
     // takes the floor and nothing more.
-    const lookahead = Math.max(2, ls.delay | 0);
+    // ⚠ 2, NOT max(2, delay). An input sampled now is scheduled for frame
+    // (this feed point + delay), so every frame queued in the worker ahead of
+    // the feed point is added ON TOP of the delay: max(2, delay) paid the delay
+    // TWICE. With the delay ratcheted to its 30-frame ceiling that was 60
+    // frames — 2 s at Gauntlet's 30 fps — on every button. The engine already
+    // holds `delay` frames of every peer's input, so feeding 2 ahead never
+    // waits on the network any more than feeding 30 ahead would.
+    const lookahead = 2;
     let fed = 0;
     if ((LS.fedTo - LS.workerFrame) >= lookahead) { LS.bfSkipped++; lsDiagTick(ls, null); }
     while ((LS.fedTo - LS.workerFrame) < lookahead) {

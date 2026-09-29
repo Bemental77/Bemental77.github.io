@@ -21,7 +21,7 @@ const ROOT = process.env.PROBE_ROOT || '/Users/caseybement/Bemental77.github.io'
 const PORT_REQUESTED = parseInt(process.env.PROBE_PORT || '0', 10);
 let PORT = PORT_REQUESTED;
 const TEST_DURATION_MS = parseInt(process.env.PROBE_DURATION_MS || '60000', 10);
-const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const CHROME = process.env.PROBE_CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 // Set to truthy (any non-empty value) to capture chrome://tracing JSON +
 // page.metrics() snapshots. Default ON because the artifacts are cheap and
 // the V8 wasm tier-up signal is not visible from console logs alone.
@@ -345,7 +345,21 @@ function startServer() {
       }
     }
   });
-  page.on('pageerror', (err) => buckets.page_err.push(err && err.stack ? err.stack : (err && err.message ? err.message : String(err))));
+  // [timeline 2026-09-29] A pageerror and a device-loss used to be reported only in the
+  // end-of-run buckets, with no time — so "which came first, the wasm trap or the lost
+  // device?" (cause vs consequence) could not be answered from a log. Stamp and echo
+  // them live, relative to page-load, so they interleave with [probe] milestones.
+  const _tl0 = Date.now();
+  const _tl = () => '[t=' + ((Date.now() - _tl0) / 1000).toFixed(1) + 's]';
+  page.on('console', (msg) => {
+    const t = msg.text();
+    if (/RESTORE-OK|RESTORE-FAIL|DEVICE LOST|first frame \(/.test(t)) console.log('[timeline] ' + _tl() + ' ' + t.slice(0, 200));
+  });
+  page.on('pageerror', (err) => {
+    const s = err && err.stack ? err.stack : (err && err.message ? err.message : String(err));
+    console.log('[timeline] ' + _tl() + ' pageerror: ' + String(s).split('\n')[0].slice(0, 200));
+    buckets.page_err.push(_tl() + ' ' + s);
+  });
 
   await page.setCacheEnabled(false);
   const _extra = process.env.PROBE_QUERY ? ('&' + process.env.PROBE_QUERY) : '';
