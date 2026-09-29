@@ -3704,6 +3704,36 @@ belongs in `gamecube.html` (relay Dolphin's `recompAck` to the render worker so 
 frames); this work is not allowed to edit that file, so it is named here instead. Whether a real GPU
 keeps up is not measured.
 
+#### 10.11 Headroom levers measured after §10.10, and the margin for slower devices (2026-09-29)
+
+Profile of wasm `4efee00f` at City Escape (node `--cpu-prof`, `--profiling-funcs` build, LOCATING
+only; futex waits of idle host threads excluded): of ~162 s busy, translated bodies 77.5 s (48%),
+`gk_tail_write` (the GX write-gather feed) 20.8 s (13%), the FMA family (`gk_ni_madd_single` +
+libc `fma`/`normalize`) ~17 s (10%), the out-of-line memory paths ~9 s (6%), `psq_l`/`psq_st` ~8 s.
+Top translated function: `HandleReverb` (0x800fa704, the AX reverb). Three levers, each a matched
+set on one session's host (load 0.9-3.4), window 70-150 guest s unless stated, n=3 interleaved:
+
+| lever | arm OFF (guest s / wall s) | arm ON | verdict |
+|---|---|---|---|
+| FMA zero-operand path (`fmaFast` 2 vs 1; 0 x finite is an exact signed zero) | 2.0732 / 2.0844 / 2.1051 | 2.1141 / 2.2338 / 2.1363 | +3.5% mean; with WPAR on: 2.0926 / 1.9994 / 2.0834 -> 2.1812 / 2.0967 / 2.2526 (+5.7%). Small; kept (default 2 in `sr_driver.c`). 20 M cases through `gk_ni_madd_double/single` incl. zeros, infinities, NaNs, denormals vs libc: 0 mismatches. |
+| WPAR stores skip the mapping walk (`wparFast`) | 2.0876 mean | 2.0585 mean (FMA 1); 2.1768 vs 2.1614 (FMA 2) | **null** (-1.4% / +0.7%, inside noise): the 13% is `gk_tail_write`'s own work, not the walk |
+| `-O3` instead of `-O2` (whole image, window 70-350) | 2.0563 / 2.1345 / 2.1521 | 2.1676 / 2.1407 / 2.1244 | **null** (+1.4%) |
+
+Compiler flags and path shortcuts are exhausted at the few-percent level. The page (paced, Chrome,
+wasm `a49885e4`, which is `ea1fb1f4` with FMA arm 2 as default) read 0.9957 / 0.9986x delivered,
+59.68 / 59.87 XFB/s, **capacity 1.557 / 1.635** (load 1.2-3.0); node unpaced on the same session read
+~2.1x. The paced capacity estimate runs below the unpaced rate on the same binary (1.60-1.63 vs
+1.82 in node, §10.10), so it is the conservative number.
+
+**The margin for the target device class.** On this host SAB's City Escape needs 132 MHz of executed
+guest work per second (idle 0.727) and the page has ~1.6x capacity. A device whose single-thread
+wasm speed is 1.6x slower than this 2.1 GHz Xeon core is at the line; the "several times slower"
+phones are not reached by anything measured here. What remains is structural, in order of measured
+share: (1) the translated bodies themselves -- guest registers live in `GekkoState` memory and are
+written back at every call (a translator-level register cache would be the lever); (2) the GX feed
+at 13%, whose per-store decode could follow Dolphin's actual cadence (the FIFO processed in slices,
+not per store) -- a model change that has to be transcribed, not approximated; (3) FMA at ~10%.
+
 #### What is still missing before a first rendered frame
 
 0. ~~A GP consumer that answers DrawDone~~ — PE modelled, §10.6d; the frames still need a renderer
