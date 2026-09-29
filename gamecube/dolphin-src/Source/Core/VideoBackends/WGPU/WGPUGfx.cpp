@@ -2004,18 +2004,14 @@ void WGPUGfx::EnsureDummyResources()
 }
 
 // ---------------------------------------------------------------------------------------------
-// [recomp gpu-backpressure 2026-09-29] The recomp path hands Dolphin a finished guest frame
-// every 1/60 s whether or not the GPU has executed the previous ones. Its ack (worker_funcs.js)
-// fires when recomp_render_fifo RETURNS -- when the CPU has ENCODED the work -- so the page's
-// skipRender backpressure never saw the GPU. On a GPU slower than the stream every frame's
-// command buffers, queued uploads and readback buffers piled up in the GPU process (MP4 title
-// on SwiftShader: 95 MB -> 8.7 GB in 100 s). Dropping only the draws is not enough -- the
-// frame's uploads and EFB copies still queued, and the GPU process still grew to 6.8 GB.
-// The present readback is the frame's completion ticket: it is issued after the frame's work
-// and its map callback fires only once the GPU has executed everything before it. Its failure
-// path decrements the count as well (a lost device rejects pending maps), so it cannot wedge. recomp_gpu_pending() reports how
-// many are outstanding; the glue treats a frame arriving at the cap exactly like the page's
-// existing skipRender (RAM applied, FIFO not rendered).
+// [recomp gpu-backpressure 2026-09-29] The recomp glue (worker_funcs.js) used to ack a frame
+// when recomp_render_fifo RETURNED -- when the CPU had ENCODED it -- so the producers' own
+// backpressure (the page's skipRender, the SR relay's 2-post limit) never saw the GPU. On a GPU
+// slower than the stream every frame's command buffers, queued uploads and readback buffers
+// piled up in the GPU process (MP4 title on SwiftShader: 95 MB -> 8.7 GB in 100 s). The glue now
+// holds each ack until the frame's present readback -- issued after the frame's work, completed
+// only once the GPU has executed it -- has come back; this is the count of those outstanding.
+// The readback's failure path decrements it too (a lost device rejects pending maps).
 extern "C" EMSCRIPTEN_KEEPALIVE u32 recomp_gpu_pending()
 {
   WGPUGfx* gfx = WGPUGfx::GetInstance();

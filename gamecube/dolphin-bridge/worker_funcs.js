@@ -201,6 +201,16 @@ var __ticks = 0;
 // self-contained render state (VCD/VAT/XF/BP/GX_PASSCLR TEV) so it does not depend on
 // MP4's live state. All encodings cited to Dolphin source (CPMemory.h/XFMemory.h/BPMemory.h).
 var __recompFrame = 0, __recompPtr = 0, __recompBytes = null;
+// [recomp gpu-backpressure 2026-09-29] recompAck held until the frame's GPU work has run: while
+// more frames are held than the backend has present readbacks in flight, the oldest is done.
+var __recompHeldAcks = [];
+function __recompReleaseAcks() {
+  var pend = Module && Module._recomp_gpu_pending ? (Module._recomp_gpu_pending() >>> 0) : 0;
+  while (__recompHeldAcks.length > pend)
+    postMessage({ cmd: 'recompAck', n: __recompHeldAcks.shift() });
+}
+setInterval(function () { if (__recompHeldAcks.length) __recompReleaseAcks(); }, 4);
+
 // [recomp-bridge] armed by the 'recompFix' message (see its case below)
 var __recompFix = null, __recompFixApplied = false, __recompFixPtr = 0, __recompFixLen = 0,
     __recompFixPumps = 0, __recompPauseCpu = false, __recompXfbAddr = 0,
@@ -1185,16 +1195,6 @@ self.onmessage = function (e) {
         }
       }
       if (e.data.skipRender) { __recompT.skip++; break; }   // backlogged: state applied, draw skipped
-      // [recomp gpu-backpressure 2026-09-29] The page's skipRender only sees the CPU side (the
-      // ack below fires when the FIFO has been ENCODED). With 2 frames' present readbacks still
-      // unexecuted on the GPU, treat this frame the same way: RAM applied, FIFO not rendered, so
-      // a GPU slower than the stream cannot accumulate queued work without bound (WGPUGfx.cpp
-      // recomp_gpu_pending). Acked, because the page counted it as a render frame.
-      if (Module._recomp_gpu_pending && Module._recomp_gpu_pending() >= 2) {
-        __recompT.gpuSkip = (__recompT.gpuSkip || 0) + 1;
-        postMessage({ cmd: 'recompAck', n: e.data.n });
-        break;
-      }
       var fb2 = new Uint8Array(e.data.fifo);
       // Present the recomp's OWN display-copy dest (last 0x4B value in the stream). The old
       // retarget-to-JIT-XFB made the 614KB XFB write land inside the recomp guest's live heap
@@ -1223,7 +1223,14 @@ self.onmessage = function (e) {
       __recompT.prep += tB - tA; __recompT.fifo += tC - tB; __recompT.present += tD - tC;
       __recompT.n++; __recompT.regB += regBytes2; __recompT.fifoB += fb2.length;
       __recompLiveFrames++;
-      postMessage({ cmd: 'recompAck', n: e.data.n });
+      // [recomp gpu-backpressure 2026-09-29] Ack when the GPU has EXECUTED the frame, not when
+      // the CPU has encoded it. The producers already know what to do while acks are
+      // outstanding (the page marks later frames skipRender, the SR relay thins superseded
+      // frames to their state commands), but they only ever saw the CPU side, so a GPU slower
+      // than the stream accumulated every frame's work in the GPU process. The frame's present
+      // readback is its completion ticket (WGPUGfx.cpp recomp_gpu_pending).
+      __recompHeldAcks.push(e.data.n);
+      __recompReleaseAcks();
       // [vtx-census 2026-08-28] Rank vertex-loader formats by vertices actually
       // loaded. Under emscripten the SOFTWARE VertexLoader is used (no
       // VertexLoaderX64/ARM64), and its per-vertex indirect-call pipeline is
@@ -1255,8 +1262,8 @@ self.onmessage = function (e) {
           + ' | ms/f prep=' + (__recompT.prep / _n).toFixed(2) + ' fifo=' + (__recompT.fifo / _n).toFixed(2)
           + ' present=' + (__recompT.present / _n).toFixed(2) + ' | regKB/f=' + (__recompT.regB / _n / 1024).toFixed(1)
           + ' fifoKB/f=' + (__recompT.fifoB / _n / 1024).toFixed(1) + ' skipped=' + __recompT.skip
-          + ' gpuSkip=' + (__recompT.gpuSkip || 0) });
-        __recompT = { prep: 0, fifo: 0, present: 0, n: 0, regB: 0, fifoB: 0, skip: __recompT.skip, gpuSkip: 0 };
+          + ' ackHeld=' + __recompHeldAcks.length });
+        __recompT = { prep: 0, fifo: 0, present: 0, n: 0, regB: 0, fifoB: 0, skip: __recompT.skip };
       }
       break;
     }
