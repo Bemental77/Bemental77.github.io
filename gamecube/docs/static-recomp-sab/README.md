@@ -3734,6 +3734,46 @@ written back at every call (a translator-level register cache would be the lever
 at 13%, whose per-store decode could follow Dolphin's actual cadence (the FIFO processed in slices,
 not per store) -- a model change that has to be transcribed, not approximated; (3) FMA at ~10%.
 
+#### 10.12 Backpressure on the page relay, and what it exposed in the consumer (2026-09-29)
+
+`gamecube.html` now forwards Dolphin's `recompAck` to the render worker (`{cmd:'ack', n}`, commit
+56705d8). `sr_render_worker.js` keeps **at most 2 posts un-acked**. While it is over that limit it:
+- keeps draining the ring;
+- keeps the newest frame whole;
+- reduces every frame that frame supersedes to its STATE commands, with the primitives (0x80-0xBF,
+  header + count x vertex size) cut out (`sr_image/sr_gp_thin.js`, sr_gx.c's sizing carried across
+  calls);
+- copies MEM1 only when a post actually goes out.
+
+A frame that does not walk cleanly is never thinned. The GP ring grew 8 -> 64 MB, because a City
+Escape frame is about 2.5 MB of stream and the page run reported `lostBytes` 10.7 MB at 8 MB. A
+consumer that stops acking for 10 s is declared stalled: the held state is discarded and reported,
+never resumed.
+
+**The thinner, checked against the guest's own C decoder** (node, `SRS_THIN=1`, paced, 90 s,
+through `stg13D`):
+- 5,200 frames walked with 0 unclean, 0 unknown opcodes, and every frame boundary re-joins its chunk
+  exactly.
+- Primitives found: 6,441,990, against `sr_gp_prims` = 6,445,247 at the end. The difference is the
+  unpumped tail, about 2 frames; frames 5,200 vs XFB copies 5,202.
+- A second walker fed ONLY the draw-stripped stream (469 MB of 1,310 MB) ends in the same VCD/VAT
+  state.
+
+**In the page, `srcapture=1`, this box** (headless Chromium, software WebGPU), runs bp1/bp2, guest
+wasm `1139afce`, Dolphin `d9a3f5dd`:
+- **Posting works.** Posts are acked in step (p 696 / a 694), 0 page errors, and Dolphin DRAWS:
+  `[recompLive] f481 ... draws=820`, `f721 ... draws=6462`.
+- **The renderer process is bounded at 4.8-6.0 GB** (the SR image is a fixed 1.8 GB of it).
+- **The GPU process is not bounded, and that growth is Dolphin's.** It rose from 0.4 GB to
+  8.1-8.6 GB over ~400 posted frames (~19 MB per post), with only 2 posts ever in flight. Then
+  Dolphin stopped acking (post 701/726) and the box ran out of memory.
+- **The delivered guest rate did NOT hold 1.000x.** The pacer fell 11.8 s behind, because
+  SwiftShader rendering took the cores.
+
+So on this box: the relay is bounded, frames are drawn, and the consumer's GPU-side memory is the
+wall. That code (`dolphin_libretro` / the recomp present path) is outside this work's paths. Whether a
+hardware GPU shows the same per-frame growth is unmeasured.
+
 #### What is still missing before a first rendered frame
 
 0. ~~A GP consumer that answers DrawDone~~ — PE modelled, §10.6d; the frames still need a renderer

@@ -84,6 +84,26 @@ setTimeout(() => {
   try { process.kill(browser.process().pid, 'SIGKILL'); } catch (_) {}
   process.exit(2);
 }, MS + 90000).unref();
+// RSS of THIS browser's renderer and GPU processes every 5 s (descendants of its pid only, so a
+// sibling's Chrome on the same box is never counted).
+import('node:child_process').then(({ execSync }) => {
+  const root = browser.process() && browser.process().pid;
+  const tick = () => {
+    try {
+      const rows = execSync('ps -eo pid=,ppid=,rss=,args=', { maxBuffer: 1 << 24 }).toString().trim().split('\n')
+        .map((l) => { const m = l.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/); return m && { pid: +m[1], ppid: +m[2], rss: +m[3], args: m[4] }; })
+        .filter(Boolean);
+      const mine = new Set([root]); let grew = true;
+      while (grew) { grew = false; for (const r of rows) if (!mine.has(r.pid) && mine.has(r.ppid)) { mine.add(r.pid); grew = true; } }
+      let renderer = 0, gpu = 0;
+      for (const r of rows) if (mine.has(r.pid)) {
+        if (r.args.includes('--type=renderer')) renderer += r.rss; else if (r.args.includes('--type=gpu-process')) gpu += r.rss;
+      }
+      log({ kind: 'rss', rendererMB: Math.round(renderer / 1024), gpuMB: Math.round(gpu / 1024) });
+    } catch (_) {}
+  };
+  setInterval(tick, 5000).unref();
+});
 const page = await browser.newPage();
 let errLines = 0;
 page.on('console', (m) => {
@@ -120,7 +140,14 @@ try {
   for (const at of SHOTS.sort((a, b) => a - b)) {
     const wait = at - (Date.now() - tStart);
     if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-    try { const f = `${SHOT_PREFIX}_${at}.png`; await page.screenshot({ path: f }); log({ kind: 'shot', file: f }); }
+    try {
+      const f = `${SHOT_PREFIX}_${at}.png`;
+      // the srimage log panel covers the canvas: hide it for the shot, then put it back
+      await page.evaluate(() => { const p = document.getElementById('srimagePanel'); if (p) p.style.visibility = 'hidden'; });
+      await page.screenshot({ path: f });
+      await page.evaluate(() => { const p = document.getElementById('srimagePanel'); if (p) p.style.visibility = ''; });
+      log({ kind: 'shot', file: f });
+    }
     catch (e) { log({ kind: 'shot-failed', text: String(e.message) }); }
   }
   const rest = MS - (Date.now() - tStart);

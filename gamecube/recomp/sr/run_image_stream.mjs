@@ -22,6 +22,13 @@ const MS = +(process.env.SRS_MS || 60000), POSTMS = +(process.env.SRS_POSTMS || 
 const stage = await import('data:text/javascript;base64,' +
   fs.readFileSync(path.join(HERE, '../sr_image/sr_boot_stage.js')).toString('base64'));
 const G = await import(pathToFileURL(path.join(HERE, '../sr_image/sr_guest.js')).href);
+// SRS_THIN=1: every pumped chunk also goes through the page's frame thinner (sr_gp_thin.js), and
+// three things are checked against the GUEST'S OWN C decoder: frames found == XFB copies, prims
+// found == sr_gp_prims, and a second walker fed ONLY the draw-stripped stream ends in the same
+// VCD/VAT state with no unknown opcodes (i.e. removing draws never desyncs the state stream).
+const T = await import(pathToFileURL(path.join(HERE, '../sr_image/sr_gp_thin.js')).href);
+const thinA = new T.GpThinner(), thinB = new T.GpThinner();
+const thinSt = { frames: 0, prims: 0, unclean: 0, bytes: 0, strippedBytes: 0, rejoinMismatch: 0, first: null };
 const md5 = (f) => crypto.createHash('md5').update(fs.readFileSync(f)).digest('hex');
 const md5Before = md5(path.join(DIR, 'sab_image.wasm'));
 
@@ -108,6 +115,17 @@ const timer = POSTMS <= 0 ? null : setInterval(() => {
   if (!f) return;
   if (!f.fifo) { posts.push({ lost: f.lost }); return; }
   const w = walk(f.fifo);
+  if (process.env.SRS_THIN) {
+    if (!thinSt.first) thinSt.first = { xfb: M._sr_image_xfb_copies() >>> 0, prims: M._sr_gp_prims() >>> 0, note: 'counters at first chunk (includes it)' };
+    const frs = thinA.split(f.fifo);
+    let tot = 0;
+    for (const fr of frs) {
+      thinSt.frames++; thinSt.prims += fr.prims.length; if (!fr.clean) thinSt.unclean++; tot += fr.bytes.length;
+      const sb = T.stripDraws(fr); thinSt.strippedBytes += sb.length;
+      thinB.split(sb);
+    }
+    thinSt.bytes += f.fifo.length; if (tot !== f.fifo.length) thinSt.rejoinMismatch++;
+  }
   copiesInPosts += w.copies; badOps += w.bad; if (w.overrun) overruns++;
   if (process.env.SRS_DUMP && f.n <= 8) fs.writeFileSync(path.join(process.env.SRS_DUMP, `post_${f.n}.bin`), f.fifo);
   posts.push({ n: f.n, bytes: f.fifo.length, framesInPost: f.framesInPost, copies: w.copies, prims: w.prims,
@@ -118,6 +136,12 @@ await new Promise((r) => setTimeout(r, MS));
 if (timer) clearInterval(timer);
 clearInterval(sampler);
 const guest = G.guestCounters(M);
+if (process.env.SRS_THIN) {
+  thinSt.last = { xfb: M._sr_image_xfb_copies() >>> 0, prims: M._sr_gp_prims() >>> 0, note: 'at end (may include unpumped work)' };
+  thinSt.stateEqual = JSON.stringify([thinA.vlo, thinA.vhi, thinA.vat]) === JSON.stringify([thinB.vlo, thinB.vhi, thinB.vat]);
+  thinSt.unknownA = thinA.unknown; thinSt.unknownB = thinB.unknown;
+  guest.thin = thinSt;
+}
 guest.exi = M._sr_exi_card_cmds ? { cardCmds: M._sr_exi_card_cmds() >>> 0, cardRd: M._sr_exi_card_rd() >>> 0, cardWr: M._sr_exi_card_wr() >>> 0, tstarts: M._sr_exi_tstarts() >>> 0, romReads: M._sr_exi_rom_reads() >>> 0 } : null;
 guest.ov = { entries: M._sr_image_ov_entries() >>> 0, refused: M._sr_image_ov_refused() >>> 0,
   lastRefused: '0x' + (M._sr_image_ov_last_refused() >>> 0).toString(16),
