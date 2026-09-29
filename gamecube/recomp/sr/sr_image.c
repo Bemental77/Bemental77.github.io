@@ -725,10 +725,11 @@ void gk_dev_write(uint32_t p, uint32_t n) {
 #define MODEL_AID   8u
 #define MODEL_AXCMD 9u
 #define MODEL_DI    10u
+#define MODEL_PE    11u
 static uint32_t g_model_on = (1u << MODEL_AR) | (1u << MODEL_RM) | (1u << MODEL_IRQ) |
                              (1u << MODEL_PIREV) | (1u << MODEL_VI) | (1u << MODEL_AI) |
                              (1u << MODEL_UCODE) | (1u << MODEL_AID) | (1u << MODEL_AXCMD) |
-                             (1u << MODEL_DI);
+                             (1u << MODEL_DI) | (1u << MODEL_PE);
 static int model(uint32_t id) { return (g_model_on >> id) & 1u; }
 static uint32_t g_model_events[16];
 static uint32_t g_strict;    // defined with its setter next to img_hook (tentative here)
@@ -1179,6 +1180,92 @@ static void di_finish(void) {                              // :1307-1348, ReplyT
     }
 }
 
+// ------------------------------------------------------------------------ PE (id 11)
+// [2026-09-29] The pixel engine's two CPU-visible side effects, driven by the GP command
+// decoder in sr_gx.c (which sees every WPAR byte with the capture arm off or on):
+//   BP 0x45 (BPMEM_SETDRAWDONE) value 0x02 -> PixelEngine::SetFinish     BPStructs.cpp:190-218
+//   BP 0x47 (BPMEM_PE_TOKEN_ID)            -> SetToken(v & 0xFFFF, no interrupt)   :226-240
+//   BP 0x48 (BPMEM_PE_TOKEN_INT_ID)        -> SetToken(v & 0xFFFF, interrupt)      :242-256
+// SetToken/SetFinish mark a pending token/finish and RaiseEvent (PixelEngine.cpp:230-268):
+// ONE event, not rescheduled while raised, at max(500, cycles_into_future) CPU cycles in the
+// single-core arm.  cycles_into_future is the GPU's own processing estimate; there is no GPU
+// here, so the 500-cycle floor is what this uses — a timing approximation of the GPU's cost,
+// stated, not a behaviour change.  The event (SetTokenFinish_OnMainThread :195-219) latches
+// token = pending and raises PE_TOKEN (0x200) / PE_FINISH (0x400) through PI, gated by the
+// enables in PE_CTRL (0xCC00100A: bit0 token enable, bit1 finish enable, bits 2/3 write-1 to
+// clear the signal and always read back 0 — :134-155).  PE_TOKEN_REG 0xCC00100E reads the
+// latched token (:157).
+#define PE_CTRL_EA  0xCC00100Au
+#define PE_TOKEN_EA 0xCC00100Eu
+#define PI_CAUSE_PE_TOKEN  0x00000200u
+#define PI_CAUSE_PE_FINISH 0x00000400u
+#define SR_F_GP_UNKNOWN 0xC6F00000u   // the GP decoder met an opcode Dolphin hands to OnUnknown
+static uint32_t g_pe_ctrl = 0, g_pe_token = 0, g_pe_token_pending = 0;
+static int      g_pe_tok_int_pending = 0, g_pe_fin_pending = 0, g_pe_sig_tok = 0, g_pe_sig_fin = 0;
+static int      g_pe_raised = 0;
+static uint64_t g_pe_at = UINT64_MAX;
+static uint32_t g_pe_finishes = 0, g_pe_tokens = 0, g_xfb_copies = 0, g_pe_drawdone_bp = 0;
+static uint64_t g_xfb_first = 0, g_xfb_last = 0, g_fin_first = 0, g_fin_last = 0;
+static uint32_t g_vi_tfbl_last = 0, g_vi_flips = 0;
+static uint64_t g_flip_first = 0, g_flip_last = 0;
+void sr_gx_mark_frame(void);                       // sr_gx.c
+static void pe_update_irq(void) {                  // PixelEngine.cpp:171-182
+    if (!model(MODEL_IRQ)) return;
+    pi_set(PI_CAUSE_PE_TOKEN,  g_pe_sig_tok && (g_pe_ctrl & 1u));
+    pi_set(PI_CAUSE_PE_FINISH, g_pe_sig_fin && (g_pe_ctrl & 2u));
+}
+static void pe_raise_event(void) {                 // :230-243
+    if (g_pe_raised) return;
+    g_pe_raised = 1; g_pe_at = g_gk_cycles + 500u; ev_rearm();
+}
+static void pe_event(void) {                       // :195-219
+    g_pe_at = UINT64_MAX; g_pe_raised = 0;
+    g_pe_token = g_pe_token_pending;
+    if (g_pe_tok_int_pending) { g_pe_tok_int_pending = 0; g_pe_sig_tok = 1; g_pe_tokens++; }
+    if (g_pe_fin_pending) {
+        g_pe_fin_pending = 0; g_pe_sig_fin = 1; g_pe_finishes++;
+        if (!g_fin_first) g_fin_first = g_gk_cycles;
+        g_fin_last = g_gk_cycles;
+    }
+    g_model_events[MODEL_PE]++;
+    pe_update_irq();
+}
+void sr_gp_on_bp(uint32_t reg, uint32_t val) {
+    if (reg == 0x52 && (val & (1u << 14))) {        // EFB copy, copy-to-XFB bit: GXCopyDisp
+        g_xfb_copies++; if (!g_xfb_first) g_xfb_first = g_gk_cycles; g_xfb_last = g_gk_cycles;
+        sr_gx_mark_frame();
+    }
+    if (reg == 0x45) g_pe_drawdone_bp++;
+    if (!model(MODEL_PE)) return;
+    if (reg == 0x45) {
+        if ((val & 0xFFu) == 0x02) { g_pe_fin_pending = 1; pe_raise_event(); }
+    } else if (reg == 0x47 || reg == 0x48) {
+        g_pe_token_pending = val & 0xFFFFu;
+        if (reg == 0x48) g_pe_tok_int_pending = 1;
+        pe_raise_event();
+    }
+}
+void sr_gp_on_unknown(uint32_t op) {
+    if (model(MODEL_PE) && !g_fault) g_fault = SR_F_GP_UNKNOWN | (op & 0xFFu);
+}
+static void vi_tfbl_witness(void) {                // a VI framebuffer FLIP: TFBL changed value
+    uint32_t v = dev_r32(0xCC00201Cu);
+    if (v != g_vi_tfbl_last) {
+        if (g_vi_tfbl_last) { g_vi_flips++; if (!g_flip_first) g_flip_first = g_gk_cycles; g_flip_last = g_gk_cycles; }
+        g_vi_tfbl_last = v;
+    }
+}
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_pe_finishes(void) { return g_pe_finishes; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_pe_tokens(void)   { return g_pe_tokens; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_pe_drawdone_bp(void) { return g_pe_drawdone_bp; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_xfb_copies(void)  { return g_xfb_copies; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_vi_flips(void)    { return g_vi_flips; }
+// kcycles of the first/last XFB copy, PE finish and VI flip: the frame loop's rate in GUEST time
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_frame_kcyc(uint32_t which) {
+    const uint64_t v[6] = {g_xfb_first, g_xfb_last, g_fin_first, g_fin_last, g_flip_first, g_flip_last};
+    return which < 6 ? (uint32_t)(v[which] / 1000u) : 0;
+}
+
 // ------------------------------------------------------------- device read / write
 static void dev_read_models(uint32_t ea, uint32_t n) {
     if (model(MODEL_AR) && dev_hits(ea, n, 0xCC005016u, 2)) dev_w16(0xCC005016u, 1);
@@ -1188,6 +1275,10 @@ static void dev_read_models(uint32_t ea, uint32_t n) {
         if (dev_hits(ea, n, DI_BASE + 0x00, 4)) { di_w(0x00, g_di_disr); di_trace(0, g_di_disr); }
         if (dev_hits(ea, n, DI_BASE + 0x04, 4)) di_w(0x04, g_di_dicvr);
         if (dev_hits(ea, n, DI_BASE + 0x24, 4)) di_w(0x24, 1u);      // DICFG.CONFIG = 1 (:276-277)
+    }
+    if (model(MODEL_PE)) {
+        if (dev_hits(ea, n, PE_CTRL_EA, 2))  dev_w16(PE_CTRL_EA, g_pe_ctrl & 3u);
+        if (dev_hits(ea, n, PE_TOKEN_EA, 2)) dev_w16(PE_TOKEN_EA, g_pe_token);
     }
     if (model(MODEL_AID) && dev_hits(ea, n, AID_LEFT, 2))              // :352-361
         dev_w16(AID_LEFT, g_aid_left > 0 ? g_aid_left - 1u : 0u);
@@ -1205,6 +1296,14 @@ static void dev_read_models(uint32_t ea, uint32_t n) {
     }
 }
 static void dev_write_models(uint32_t ea, uint32_t n) {
+    if (model(MODEL_PE) && dev_hits(ea, n, PE_CTRL_EA, 2)) {          // PixelEngine.cpp:134-155
+        uint32_t v = dev_r16(PE_CTRL_EA);
+        if (v & 4u) g_pe_sig_tok = 0;
+        if (v & 8u) g_pe_sig_fin = 0;
+        g_pe_ctrl = v & 3u; dev_w16(PE_CTRL_EA, g_pe_ctrl);
+        pe_update_irq();
+    }
+    if (dev_hits(ea, n, 0xCC00201Cu, 4)) vi_tfbl_witness();          // witness only, no behaviour
     if (model(MODEL_UCODE) && g_dsp_model && dev_hits(ea, n, 0xCC005002u, 2)) {
         // DSPHLE.cpp:179-190: the LOW half sends; then "clear MSB to show that it is progressed".
         uint32_t mail = dev_r32(0xCC005000u);
@@ -1522,6 +1621,7 @@ static void ev_rearm(void) {
     if (model(MODEL_AID) && g_aid_irq_at < at) at = g_aid_irq_at;
     if (g_dsp_int_at < at) at = g_dsp_int_at;
     if (model(MODEL_DI) && g_di_done_at < at) at = g_di_done_at;
+    if (model(MODEL_PE) && g_pe_at < at) at = g_pe_at;
     if (g_watch_next < at) at = g_watch_next;
     if (g_strict && g_fault) at = 0;          // strict: the next block head ends the run
     g_gk_event_at = at;
@@ -1567,6 +1667,7 @@ void gk_event(void) {
     watch_check();
     if (g_dsp_int_at <= g_gk_cycles) { g_dsp_int_at = UINT64_MAX; dsp_gen_int(); }
     if (model(MODEL_DI) && g_di_done_at <= g_gk_cycles) di_finish();
+    if (model(MODEL_PE) && g_pe_at <= g_gk_cycles) pe_event();
     if (model(MODEL_AI) && g_ai_next <= g_gk_cycles) ai_event();
     if (model(MODEL_AID)) {
         if (g_aid_irq_at <= g_gk_cycles) { g_aid_irq_at = UINT64_MAX; aid_gen_int(); }

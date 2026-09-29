@@ -61,6 +61,112 @@ static uint32_t g_gx_bytes   = 0;   // WPAR store BYTES       -- counted with ca
 static uint32_t g_gx_off_max = 0;   // largest offset seen INTO the WPAR page (see below)
 static int      g_gx_capture = 0;   // THE ARM.  Off by default.
 
+// ------------------------------------------------------------ THE GP COMMAND DECODER
+// [2026-09-29] The stream is also DECODED here, command by command, with the capture arm
+// off or on, so the pixel engine's side effects that the CPU waits on (GXSetDrawDone ->
+// PE FINISH, GXSetDrawSync -> PE TOKEN) can be raised by sr_image.c's PE model, and a frame
+// can be cut at its copy to the XFB.  Transcribed from Dolphin's own decoder:
+//   command sizes         VideoCommon/OpcodeDecoding.h:130-245 (detail::RunCommand)
+//   CP VCD / VAT state    VideoCommon/CPMemory.cpp:132-182 (LoadCPReg), bitfields CPMemory.h
+//   vertex size           VideoCommon/VertexLoaderBase.cpp:274-302 and the four
+//                         VertexLoader_{Position,Normal,Color,TextCoord}.h size tables
+// Display lists (0x40) are opaque 9-byte commands here: their CONTENTS are not decoded, so a
+// BP write inside a display list is not seen (counted in g_gp_dls).  An opcode Dolphin would
+// hand to OnUnknown is REPORTED (sr_gp_on_unknown), never skipped silently.
+void sr_gp_on_bp(uint32_t reg, uint32_t val);          // sr_image.c
+void sr_gp_on_unknown(uint32_t op);                     // sr_image.c
+static uint32_t g_vcd_lo = 0, g_vcd_hi = 0, g_vat[8][3];
+static uint8_t  g_hdr[80];
+static uint32_t g_hn = 0, g_skip = 0;
+static uint32_t g_gp_cmds = 0, g_gp_prims = 0, g_gp_verts = 0, g_gp_dls = 0, g_gp_unknown = 0,
+                g_gp_bad_fmt = 0;
+static uint32_t cf_bytes(uint32_t f) { return f <= 1 ? 1u : f <= 3 ? 2u : 4u; }   // u8 s8 | u16 s16 | f32 (5-7 as f32)
+static uint32_t vtx_size(uint32_t vat) {
+    const uint32_t lo = g_vcd_lo, hi = g_vcd_hi, g0 = g_vat[vat][0], g1 = g_vat[vat][1], g2 = g_vat[vat][2];
+    uint32_t size = (uint32_t)__builtin_popcount(lo & 0x1FFu);            // PosMatIdx + TexMatIdx
+    uint32_t t = (lo >> 9) & 3u;                                          // Position
+    if (t == 1) size += cf_bytes((g0 >> 1) & 7u) * ((g0 & 1u) ? 3u : 2u);
+    else if (t) size += t - 1u;                                           // index8 = 1, index16 = 2
+    t = (lo >> 11) & 3u;                                                  // Normal
+    if (t) {
+        uint32_t ntb = (g0 >> 9) & 1u, idx3 = (g0 >> 31) & 1u;
+        if (t == 1) size += cf_bytes((g0 >> 10) & 7u) * (ntb ? 9u : 3u);
+        else        size += (t - 1u) * ((ntb && idx3) ? 3u : 1u);
+    }
+    for (uint32_t c = 0; c < 2; c++) {                                    // Color0/1
+        t = (lo >> (13 + 2 * c)) & 3u;
+        uint32_t fmt = (g0 >> (c ? 18 : 14)) & 7u;
+        if (t == 1) { static const uint8_t cs[6] = {2, 3, 4, 2, 3, 4};
+                      if (fmt > 5) { g_gp_bad_fmt++; } else size += cs[fmt]; }
+        else if (t) size += t - 1u;
+    }
+    static const uint8_t cnt_bit[8] = {21, 0, 9, 18, 27, 5, 14, 23};      // TexNCoordElements
+    static const uint8_t fmt_bit[8] = {22, 1, 10, 19, 28, 6, 15, 24};     // TexNCoordFormat
+    static const uint8_t grp[8]     = {0, 1, 1, 1, 1, 2, 2, 2};
+    for (uint32_t i = 0; i < 8; i++) {                                    // Tex0..7
+        t = (hi >> (2 * i)) & 3u;
+        if (!t) continue;
+        const uint32_t g = grp[i] == 0 ? g0 : grp[i] == 1 ? g1 : g2;
+        if (t == 1) size += cf_bytes((g >> fmt_bit[i]) & 7u) * (((g >> cnt_bit[i]) & 1u) ? 2u : 1u);
+        else size += t - 1u;
+    }
+    return size;
+}
+static uint32_t be32(const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
+static void gp_feed(const uint8_t *b, uint32_t n) {
+    while (n) {
+        if (g_skip) { uint32_t k = n < g_skip ? n : g_skip; g_skip -= k; b += k; n -= k; continue; }
+        g_hdr[g_hn++] = *b++; n--;
+        const uint8_t op = g_hdr[0];
+        uint32_t need;
+        if (op == 0x00) { g_hn = 0; continue; }                            // NOP
+        else if (op == 0x08) need = 6;                                     // CP
+        else if (op == 0x10) need = g_hn < 5 ? 5 : 5 + 4 * (((be32(g_hdr + 1) >> 16) & 0xFu) + 1);  // XF
+        else if (op == 0x20 || op == 0x28 || op == 0x30 || op == 0x38) need = 5;   // indexed XF
+        else if (op == 0x40) need = 9;                                     // CALL_DL
+        else if (op == 0x48) need = 1;                                     // INVL_VC
+        else if (op == 0x61) need = 5;                                     // BP
+        else if (op >= 0x80 && op <= 0xBF) need = 3;                       // primitive header
+        else { g_gp_unknown++; g_hn = 0; sr_gp_on_unknown(op); continue; }   // OnUnknown: 1 byte
+        if (g_hn < need) continue;
+        g_gp_cmds++;
+        if (op == 0x08) {
+            const uint32_t sub = g_hdr[1], v = be32(g_hdr + 2);
+            switch (sub & 0xF0u) {
+            case 0x50: g_vcd_lo = v; break;
+            case 0x60: g_vcd_hi = v; break;
+            case 0x70: g_vat[sub & 7u][0] = v; break;
+            case 0x80: g_vat[sub & 7u][1] = v; break;
+            case 0x90: g_vat[sub & 7u][2] = v; break;
+            default: break;
+            }
+        } else if (op == 0x61) {
+            sr_gp_on_bp(g_hdr[1], ((uint32_t)g_hdr[2] << 16) | ((uint32_t)g_hdr[3] << 8) | g_hdr[4]);
+        } else if (op == 0x40) {
+            g_gp_dls++;
+        } else if (op >= 0x80) {
+            const uint32_t cnt = ((uint32_t)g_hdr[1] << 8) | g_hdr[2];
+            g_gp_prims++; g_gp_verts += cnt;
+            g_skip = cnt * vtx_size(op & 7u);
+        }
+        g_hn = 0;
+    }
+}
+EMSCRIPTEN_KEEPALIVE uint32_t sr_gp_cmds(void)    { return g_gp_cmds; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_gp_prims(void)   { return g_gp_prims; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_gp_verts(void)   { return g_gp_verts; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_gp_dls(void)     { return g_gp_dls; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_gp_unknown(void) { return g_gp_unknown; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_gp_bad_fmt(void) { return g_gp_bad_fmt; }
+
+// FRAME CUTS in the captured stream: the capture offset just past each copy to the XFB (BP
+// 0x52 with bit 14), so a consumer can hand Dolphin one frame at a time.
+#define SR_GX_CUTS 4096
+static uint32_t g_gx_cuts[SR_GX_CUTS], g_gx_ncuts = 0;
+void sr_gx_mark_frame(void) { if (g_gx_ncuts < SR_GX_CUTS) g_gx_cuts[g_gx_ncuts] = g_gx_pos; g_gx_ncuts++; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_gx_cuts(void)   { return (uint32_t)(uintptr_t)g_gx_cuts; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_gx_ncuts(void)  { return g_gx_ncuts; }
+
 // THE HOOK.  gekko_rt.h:GK_WPOST sends everything at or above GK_WPAR_OFF here, so this
 // function owns the split and gk_dev_write keeps exactly the domain it had.
 void gk_tail_write(uint32_t p, uint32_t n) {
@@ -86,10 +192,11 @@ void gk_tail_write(uint32_t p, uint32_t n) {
 
     g_gx_writes++;
     g_gx_bytes += n;
-    if (!g_gx_capture) return;
-    if (g_gx_pos + n > SR_GX_FIFO_CAP) { g_gx_dropped += n; return; }
-    memcpy(g_gx_fifo + g_gx_pos, g_ram + p, n);
-    g_gx_pos += n;
+    if (g_gx_capture) {
+        if (g_gx_pos + n > SR_GX_FIFO_CAP) g_gx_dropped += n;
+        else { memcpy(g_gx_fifo + g_gx_pos, g_ram + p, n); g_gx_pos += n; }
+    }
+    gp_feed(g_ram + p, n);      // after the append, so a frame cut lands past its own copy
 }
 
 // ---- THE ARM

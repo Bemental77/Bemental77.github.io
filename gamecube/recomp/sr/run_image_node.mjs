@@ -57,7 +57,7 @@ const arms = { exi: +env('SRN_EXI', 1), dsp: +env('SRN_DSP', 1) };
 // sr_image_set_model(id, on): the [2026-09-29] models (sr_image.c "THE NEXT DEVICES").
 // A binary that predates them lacks the export, and the result records 'absent' rather
 // than pretending the arm was set.
-const MODELS = { AR: 1, RM: 2, IRQ: 3, PIREV: 4, VI: 5, AI: 6, UCODE: 7, AID: 8, AXCMD: 9, DI: 10 };
+const MODELS = { AR: 1, RM: 2, IRQ: 3, PIREV: 4, VI: 5, AI: 6, UCODE: 7, AID: 8, AXCMD: 9, DI: 10, PE: 11 };
 const setModel = opt('_sr_image_set_model'), getModel = opt('_sr_image_get_model');
 for (const [k, id] of Object.entries(MODELS)) {
   if (!setModel) { arms[k.toLowerCase()] = 'absent'; continue; }
@@ -284,7 +284,7 @@ for (const [k, fn] of [['dspEvents', '_sr_image_dsp_events'], ['aramBytes', '_sr
                        ['irqLast', '_sr_image_irq_last'], ['piCause', '_sr_image_pi_cause'],
                        ['piMask', '_sr_image_pi_mask'], ['viFrames', '_sr_image_vi_frames'],
                        ['ucodeCrc', '_sr_image_ucode_crc'], ['axLists', '_sr_ax_lists'], ['axPBs', '_sr_ax_pbs'], ['axVoices', '_sr_ax_voices'], ['axUnknownCmds', '_sr_ax_unknown_cmds'], ['ucode', '_sr_image_ucode'], ['axCmdlist', '_sr_image_ax_cmdlist'],
-                       ['indirectFaultLr', '_sr_image_indirect_fault_lr'], ['indirectFaultTarget', '_sr_image_indirect_fault_target'], ['diCmds', '_sr_image_di_cmds'], ['diBytes', '_sr_image_di_bytes'], ['tbCalls', '_sr_tb_calls'], ['idleSkips', '_sr_image_idle_skips'], ['recycled', '_sr_os_recycled'], ['ovEntries', '_sr_image_ov_entries'], ['ovRefused', '_sr_image_ov_refused'], ['idleMcycles', '_sr_image_idle_mcycles'], ['cyclesM', '_sr_image_cycles_m'],
+                       ['indirectFaultLr', '_sr_image_indirect_fault_lr'], ['indirectFaultTarget', '_sr_image_indirect_fault_target'], ['diCmds', '_sr_image_di_cmds'], ['diBytes', '_sr_image_di_bytes'], ['tbCalls', '_sr_tb_calls'], ['idleSkips', '_sr_image_idle_skips'], ['recycled', '_sr_os_recycled'], ['ovEntries', '_sr_image_ov_entries'], ['gpCmds', '_sr_gp_cmds'], ['gpPrims', '_sr_gp_prims'], ['gpVerts', '_sr_gp_verts'], ['gpDLs', '_sr_gp_dls'], ['gpUnknown', '_sr_gp_unknown'], ['gpBadFmt', '_sr_gp_bad_fmt'], ['peFinishes', '_sr_image_pe_finishes'], ['peTokens', '_sr_image_pe_tokens'], ['drawDoneBP', '_sr_image_pe_drawdone_bp'], ['xfbCopies', '_sr_image_xfb_copies'], ['viFlips', '_sr_image_vi_flips'], ['ovRefused', '_sr_image_ov_refused'], ['idleMcycles', '_sr_image_idle_mcycles'], ['cyclesM', '_sr_image_cycles_m'],
                        ['tbStalls', '_sr_tb_stalls'], ['decExc', '_sr_tb_dec_exceptions'],
                        ['tbHi', '_sr_tb_hi'], ['tbLo', '_sr_tb_lo'], ['gxWrites', '_sr_gx_writes'],
                        ['gxBytes', '_sr_gx_bytes']]) {
@@ -307,7 +307,18 @@ for (const spec of (process.env.SRN_PEEK || '').split(',').filter(Boolean)) {
   peek[hex(ea)] = words;
 }
 if (getModel) for (const [k, id] of Object.entries(MODELS)) extra['ev_' + k] = M._sr_image_model_events(id) >>> 0;
+// THE FRAME LOOP IN GUEST TIME: (n-1) intervals between the first and last event, over the
+// guest seconds between them (486 MHz Gekko).  Not wall time — gate #9.
+const frameLoop = {};
+if (opt('_sr_image_frame_kcyc')) {
+  const k = (i) => M._sr_image_frame_kcyc(i) >>> 0;
+  const rate = (n, a, b) => (n > 1 && b > a) ? +((n - 1) / ((b - a) * 1000 / 486e6)).toFixed(3) : null;
+  frameLoop.xfbCopies = { n: M._sr_image_xfb_copies() >>> 0, firstK: k(0), lastK: k(1), perGuestSecond: rate(M._sr_image_xfb_copies() >>> 0, k(0), k(1)) };
+  frameLoop.peFinishes = { n: M._sr_image_pe_finishes() >>> 0, firstK: k(2), lastK: k(3), perGuestSecond: rate(M._sr_image_pe_finishes() >>> 0, k(2), k(3)) };
+  frameLoop.viFlips = { n: M._sr_image_vi_flips() >>> 0, firstK: k(4), lastK: k(5), perGuestSecond: rate(M._sr_image_vi_flips() >>> 0, k(4), k(5)) };
+}
 const result = {
+  frameLoop,
   apploader, disc, diLog, diTrace, faultBt, watch, ring, peek, backtrace, tailRing, osTrace, threads, atBudget,
   wasm: wasmPath, md5Before, md5After: md5(wasmPath), arms,
   osMode: api.osGetMode(), fst, copied, ms, returned: ret === null ? null : hex(ret), threw,

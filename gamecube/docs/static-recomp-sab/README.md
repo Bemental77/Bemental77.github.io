@@ -27,6 +27,7 @@ shipped disc; the reproducing command is printed next to each one. Artifact:
 | **JIT baseline, re-measured** | **0.3781x delivered / 141.6 MHz executed / 23.2% idle-skipped**, stock V8, n=3, cross-witness spread ≤0.0005. **1.000x costs 373.5 MHz on this scene → the JIT is 2.64x short.** §8.6b |
 | ~~JIT baseline `0.4450x`~~ | **RETRACTED, §8.6c** — a 75 s cold boot read over one 40 s window; re-reading that band from four fresh runs of ONE frozen binary returns **0.3338x–0.5097x**. The V8-tier mismatch §8.1 warned about measures **null on both engines** (§8.6d) and was the least of its defects. |
 | **WHOLE-IMAGE BOOT IN A BROWSER** | **LINKS, INSTANTIATES, AND RUNS THE GUEST'S OWN `__start`** — wasm md5 `7bcca5756df27133d684c4281410171b`. `__init_registers` / `__init_hardware` / `__init_data` / `DBInit` all return **fault-free**, then `OSInit` reaches **27 distinct hardware registers** across PI/MI/DSP/SI/EXI/DI in **126 host-boundary crossings**. It stops in **`__OSInitAudioSystem`**, spinning on a DSP register — **no device model and no interrupt delivery**, not a translator bug (the GAP class is still zero). Modelling one register (EXI `TSTART`) moved it from 21 registers to 27, with a **falsifying control arm on the same md5**. **Nothing renders and no `drawn/s` is claimed.** §10 |
+| **WHOLE-IMAGE BOOT — FRAME LOOP AT 59.94/GUEST-s, 2026-09-29** | With a PE model (DrawDone/PE-finish from a GP decoder over the FIFO) the overlay's frame loop runs: **556 DrawDones in 10 s of guest time = 59.944 per guest second**, idle 3 M of 4,860 M cycles (PE off: 4,379 M idle, stuck in `GXDrawDone`, same md5 `cad618ff9a675def5512086bb69de5e3`). Native Dolphin confirms the first overlay (`mcwarnD` at `0x811ffe60`), the XFBs and 640x480; it has a memory card, the SR boot does not yet. **Nothing is drawn.** §10.6d |
 | **WHOLE-IMAGE BOOT — FIRST FRAME SUBMITTED, 2026-09-29** | **The overlay's first frame reaches the GP FIFO: `GXCopyDisp` (BP `0x52 = 0x004803`, copy-to-XFB `0x538460`, 640x480) then `GXSetDrawDone`**, and the boot stops WAITING in `GXDrawDone` because no PE/GP model answers it — no VI flip yet. Got there by fixing the DI model reporting every completion as DEINT, recycling leaked host threads, correcting the apploader's FST address (`0x817EDE20`, not `hdr[0x430]`), and linking the first REL overlay (`mcwarnD.rel`) translated from OSLink's own bytes behind a hash guard. Binary `c177aeb92de7a22d250503bb66502c4d`, overlay off / poisoned-guard arms stop at the prolog on the same md5. **Nothing renders; no `drawn/s` is claimed.** §10.6c |
 | **WHOLE-IMAGE BOOT, 2026-09-29** | **Past `__OSInitAudioSystem`, `__ARChecksize`, `RealMode`, `__AI_SRC_INIT` and the DSP boot task, with interrupts delivered — to the first AX COMMAND LIST** (`SR_F_DSP_AXCMD`, 6 M guest cycles), node, binary `7e9f25717aa3e8cbc136dc2fe9287fe4`; **then through it** (§10.6a: AX command lists HLE'd, 18 lists / 1,152 PBs, binary `46645ebdadabcd49cedf4454b9a8c0a8`) **to main's loop at 48 M cycles, where a mode callback an overlay should have installed is NULL**; §10.6b adds the apploader's real arena (read from the disc's own apploader) and a DI model reading the ISO (the first file, `GCAX.conf`, is read; DI off parks the boot in that read for 10 s of guest time) — the NULL callback survives every arm (binary `f5aa45f7562baa082dbe28203e0347dd`). Eight run-time-switchable models (exception entry included) + `SR_OS_HLE` linked into the image, each with a run-time control arm on that md5 that brings back the wall it removed (the documented `__OSInitAudioSystem` stop included). The ucode SAB uploads hashes to `0x4e8a8b21` = AX. **Nothing renders**: AX command processing, DI, and a GX consumer are missing. §10.6 |
 | **guest OS CONTEXT SWITCH** | **WORKS** — 63 assertions / 0 failures, incl. a three-thread non-LIFO rotation on three real host threads and a control arm that reproduces `0xe00e78ac` with the host layer off. §6 (superseded there) and [`recomp/sr/CONTEXT_SWITCH.md`](../../recomp/sr/CONTEXT_SWITCH.md) |
@@ -3396,9 +3397,58 @@ SelectThread and `0x8036e050` READY at its entry `0x80135d28`. Both READY thread
 is what the OS itself says, not a lost switch. That is consistent with the stale-resume and leak fixes having
 been its cause; it is not proven that they were.
 
+#### 10.6d The oracle's answer, and the frame loop running (2026-09-29)
+
+**Oracle (real Dolphin, the shipped JIT path).** `gamecube/tools/dolphin_render_probe.js`,
+`ROM_IDX=1` cold boot, headless, `dolphin_worker_emcc.wasm` md5 `ced4905af7d45e977433255f07a9e0c9`
+(unchanged across every run), load < 2, guest MEM1 read with `PROBE_MEM1_PEEK` at fixed wall
+times (one run per time):
+
+| wall time | `__OSModuleInfoList` (0x800030C8) | header at 0x811FFE60 |
+|---|---|---|
+| 22 s | empty | zeros |
+| 26 s | empty | zeros |
+| 30 s | empty (already unlinked) | **id `0x5a` = 90 = `mcwarnD.rel`**, then `0x13` sections, sectionInfo `0x811ffea8`, name `0x80fedd68` — byte-identical to the SR boot's linked header |
+| 35 s / 55 s | head = tail = `0x811ffe60` | **id `0x5c` = 92 = `otherprintD.rel`** |
+
+and `*0x800000F4 = 0x817EBE20` (bi2 = FST - 0x2000), i.e. **the apploader FST correction of §10.6c
+is what Dolphin holds**. The probe's own snapshot reports `xfbAddr` `4a2460` then `538460` with
+`xfbDims` `28001e0` (640x480) — the same two XFBs and size as the SR stream. So: **the first
+overlay is `mcwarnD`, at the same address, and the XFB target/size agree.** Whether Dolphin's first
+copy has clear on was not read (no BP log on that path). **Dolphin has a card in slot A**:
+`Config::MAIN_SLOT_A` defaults to `MemoryCardFolder` (`Core/Config/MainSettings.cpp:133-134`) and
+nothing under `DolphinLibretro/` overrides it; there `mcwarnD` is gone within ~4 s and the boot moves on
+to `otherprintD`. The SR boot has no card, so it stays in `mcwarnD` — see "still missing".
+
+**PE model (id 11) + a GP command decoder.** `sr_gx.c` now decodes every WPAR byte as GP commands
+(Dolphin's `OpcodeDecoding.h:130-245` sizes, `CPMemory.cpp:132-182` VCD/VAT state, the
+`VertexLoader_*` size tables for primitives; display-list contents are not decoded; an unknown
+opcode faults), with the capture arm off or on. `sr_image.c` turns BP `0x45 = 2` / `0x47` / `0x48`
+into `PixelEngine::SetFinish`/`SetToken` (one event, 500 CPU cycles later — the single-core
+floor of `RaiseEvent`; the GPU's own cost is not modelled), latched into PE_FINISH / PE_TOKEN on PI
+behind PE_CTRL's enables (`PixelEngine.cpp:134-219`). Each copy to the XFB also cuts the captured
+stream into frames (`sr_gx_cuts`).
+
+Binary **`cad618ff9a675def5512086bb69de5e3`**, same flags as §10.6c, 10 s of guest time:
+
+| arm | idle M cycles | GP cmds | prims / verts | unknown ops | PE finishes | XFB copies | TFBL changes | TFBL at end |
+|---|---|---|---|---|---|---|---|---|
+| `SRN_PE=0` | 4,379 of 4,860 | 409 | 0 / 0 | 0 | 0 | 2 | 1 | `0x4a2460` (stuck in `GXDrawDone`) |
+| **`SRN_PE=1`** | **3** of 4,860 | 132,032 | 1,718 / 6,872 | **0** | **556** | 557 | 1,111 | `0x538460` |
+
+**The guest's frame loop, in guest time:** 556 DrawDone completions from 357.1 M to 4,856.8 M
+cycles = **59.944 per guest second** (NTSC 60 Hz field rate: 59.94); XFB copies 55.9/s over a window
+that includes the pre-overlay init copy. TFBL changes at 111.6/s — twice per frame; what the second
+write per frame is was not identified, so that column is a register-write count, not a flip rate.
+1.2 MB of GP stream decoded with zero unknown opcodes and zero invalid colour formats, which a
+desynchronised decoder would not produce over 132 k commands (evidence of sizing, not proof).
+**Still nothing is drawn**: the stream is decoded for its side effects only.
+
 #### What is still missing before a first rendered frame
 
-0. **A GP consumer that answers DrawDone** (PE FINISH, and the PE token for `GXSetDrawSync`),
+0. ~~A GP consumer that answers DrawDone~~ — PE modelled, §10.6d; the frames still need a renderer
+   (next item) and the boot needs a memory card in slot A to follow Dolphin past `mcwarnD`.
+0b. **A GP consumer that renders** (PE FINISH, and the PE token for `GXSetDrawSync`),
    i.e. §10.2d's routing of this FIFO to Dolphin — the frame exists as a GP stream now.
    Question for the native oracle (`docs/ORACLES.md`): *with no memory card inserted, is SAB's
    first rendered screen the `mcwarnD` warning, and is its first XFB copy to `0x00538460` from a
