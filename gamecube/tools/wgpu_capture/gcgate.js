@@ -21,7 +21,11 @@
   };
   let curDyn = null;
   const sbg = GPURenderPassEncoder.prototype.setBindGroup;
-  GPURenderPassEncoder.prototype.setBindGroup = function (i, g, dyn, a, b) { if (i === 0 && dyn) curDyn = Array.from(dyn.length !== undefined && typeof dyn !== 'number' ? (a !== undefined ? dyn.slice(a, a + b) : dyn) : []); return sbg.call(this, i, g, dyn, a, b); };
+  GPURenderPassEncoder.prototype.setBindGroup = function (...args) {
+    const [i, , dyn, a, b] = args;
+    if (i === 0 && dyn && typeof dyn !== 'number' && dyn.length !== undefined) curDyn = Array.from(a !== undefined ? dyn.slice(a, a + b) : dyn);
+    return sbg.apply(this, args);
+  };
   let udraws = [];
   function decode(ps, vs) {
     const P = new DataView(ushadow.buffer, ps), V = new DataView(ushadow.buffer, vs);

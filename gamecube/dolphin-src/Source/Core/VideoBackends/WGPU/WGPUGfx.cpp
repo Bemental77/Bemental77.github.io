@@ -2402,8 +2402,17 @@ std::unique_ptr<AbstractPipeline> WGPUGfx::CreatePipeline(const AbstractPipeline
   // emulated as depthCompare=Always (WebGPU has no separate depth-test-enable). ---
   WGPUDepthStencilState depth = {};
   depth.format = WGPUTextureFormat_Depth32Float;
-  depth.depthWriteEnabled =
-      config.depth_state.update_enable ? WGPUOptionalBool_True : WGPUOptionalBool_False;
+  // A DISABLED depth test also disables depth writes. That is the GameCube rule and the rule of
+  // every API Dolphin's other backends target (Vulkan depthTestEnable=false, D3D11 DepthEnable=
+  // FALSE — D3DState.cpp "if the test is disabled write is disabled too" — and GL's
+  // glDisable(GL_DEPTH_TEST)). WebGPU has no test-enable switch, so a disabled test is emulated
+  // below as compare=Always — and Always still WRITES when depthWriteEnabled is set. Mario Party 4
+  // draws its full-screen backdrop with z-compare off and z-update on; this used to stamp the
+  // nearest depth over the whole EFB, so every later LEqual draw (the mode-select card fan, the
+  // envelope, the pedestal) failed the depth test and vanished.
+  depth.depthWriteEnabled = (config.depth_state.test_enable && config.depth_state.update_enable) ?
+                                WGPUOptionalBool_True :
+                                WGPUOptionalBool_False;
   // [WGPU C1 2026-07-13] bSupportsReversedDepthRange=false (WebGPU forbids reversed viewport
   // depth) -> VideoCommon uses the reverse-Z 1-z remap, so Less/Greater swap here — mirrors
   // D3DState.cpp:500 "Less/greater are swapped due to inverted depth".
