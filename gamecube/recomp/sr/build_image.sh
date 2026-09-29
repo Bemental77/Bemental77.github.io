@@ -286,6 +286,10 @@ OCIMFS_FLAG=()
 # object is newer than it and than gekko_rt.h is NOT recompiled -- so a host-layer-only
 # change (sr_image.c) relinks in minutes instead of recompiling 35 MB.
 # SR_SPLIT=1 restores the single-TU build.
+# [2026-09-29, later] ONE FUNCTION CAN STILL DO IT: SAB's fn_80150b6c (~13.6k lines, ~1,400
+# guest loads/stores) compiled ALONE peaked at 10.4 GB and was OOM-killed once GK_MAP grew an
+# inline MEM1 arm in front of gk_tail's three window tests.  Fixed in gekko_rt.h, not here:
+# the non-MEM1 path is out of line (gk_*_s), and the same function now peaks at 3.3 GB.
 SR_SPLIT="${SR_SPLIT:-8}"
 # SR_PTHREAD=1 — [2026-09-29] link for SR_OS_HLE (one host thread per guest thread,
 # CONTEXT_SWITCH.md), which the boot needs from the first OSSleepThread on (README §10.6).
