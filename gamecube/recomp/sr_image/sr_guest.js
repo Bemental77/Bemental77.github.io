@@ -113,7 +113,8 @@ export async function startGuest(mod, api, opts = {}) {
     if (!mod._sr_image_set_pace) throw new Error('pace requested but this image has no pacer');
     mod._sr_image_set_pace(opts.pace ? 1 : 0);
   }
-  if (opts.fmaFast !== undefined && mod._sr_set_fma_fast) mod._sr_set_fma_fast(opts.fmaFast ? 1 : 0);
+  if (opts.fmaFast !== undefined && mod._sr_set_fma_fast) mod._sr_set_fma_fast(opts.fmaFast | 0);   // 0 libc, 1 exact-product, 2 + zero operand
+  if (opts.wparFast !== undefined) mod._sr_set_wpar_fast(opts.wparFast ? 1 : 0);
   // idleLoop: the busy-wait skip (sr.py --idle-skip builds), default on; 0 = the control arm
   if (opts.idleLoop !== undefined && mod._sr_image_set_idle_loop) mod._sr_image_set_idle_loop(opts.idleLoop ? 1 : 0);
   // snapMem: the verification-only MEM1 hash per context switch (sr_host_os.c) — the matched-pair

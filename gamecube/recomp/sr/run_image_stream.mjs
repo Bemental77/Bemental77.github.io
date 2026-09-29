@@ -87,6 +87,7 @@ await G.startGuest(M, api, { hle: 12, snapMem: +(process.env.SRS_SNAPMEM || 0),
   idleLoop: process.env.SRS_IDLELOOP === undefined ? undefined : +process.env.SRS_IDLELOOP,
   exiModel: +(process.env.SRS_EXI || 1),
   fmaFast: process.env.SRS_FMA === undefined ? undefined : +process.env.SRS_FMA,
+  wparFast: process.env.SRS_WPAR === undefined ? undefined : +process.env.SRS_WPAR,
   pace: process.env.SRS_PACE === undefined ? undefined : +process.env.SRS_PACE, si: +(process.env.SRS_SI || 0),
   input: (process.env.SRS_INPUT || '').split(',').filter(Boolean).map((x) => x.split(':').map((y) => parseInt(y))), card: process.env.SRS_CARD === undefined ? 1 : +process.env.SRS_CARD });
 const pump = G.makePump(M, api);
