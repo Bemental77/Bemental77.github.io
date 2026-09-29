@@ -27,6 +27,7 @@ shipped disc; the reproducing command is printed next to each one. Artifact:
 | **JIT baseline, re-measured** | **0.3781x delivered / 141.6 MHz executed / 23.2% idle-skipped**, stock V8, n=3, cross-witness spread ≤0.0005. **1.000x costs 373.5 MHz on this scene → the JIT is 2.64x short.** §8.6b |
 | ~~JIT baseline `0.4450x`~~ | **RETRACTED, §8.6c** — a 75 s cold boot read over one 40 s window; re-reading that band from four fresh runs of ONE frozen binary returns **0.3338x–0.5097x**. The V8-tier mismatch §8.1 warned about measures **null on both engines** (§8.6d) and was the least of its defects. |
 | **WHOLE-IMAGE BOOT IN A BROWSER** | **LINKS, INSTANTIATES, AND RUNS THE GUEST'S OWN `__start`** — wasm md5 `7bcca5756df27133d684c4281410171b`. `__init_registers` / `__init_hardware` / `__init_data` / `DBInit` all return **fault-free**, then `OSInit` reaches **27 distinct hardware registers** across PI/MI/DSP/SI/EXI/DI in **126 host-boundary crossings**. It stops in **`__OSInitAudioSystem`**, spinning on a DSP register — **no device model and no interrupt delivery**, not a translator bug (the GAP class is still zero). Modelling one register (EXI `TSTART`) moved it from 21 registers to 27, with a **falsifying control arm on the same md5**. **Nothing renders and no `drawn/s` is claimed.** §10 |
+| **WHOLE-IMAGE SPEED, 2026-09-29** | Node, `mcwarnD` frame loop, n=3 matched pairs on one binary each: baseline **0.0986x** -> **0.78x** (a 24 MB MEM1 hash at every context switch, a verification instrument, removed from the image) -> **6.5x capacity** (Dolphin's busy-wait skip transcribed: 96.8% idle, 100 MHz executed; 15.5 MHz needed at 1.000x). With nothing to skip the executed rate is 300-380 MHz = 0.62-0.78 of Gekko: 1.000x needs >= ~22-38% idle. The browser figures in §10.6e predate both changes. §10.7 |
 | **WHOLE-IMAGE BOOT — THE GUEST'S FRAMES REACH DOLPHIN IN THE PAGE, 2026-09-29** | Behind `?srimage=1&srrender=1&srmode=main&srbase=…/guest/` (off by default): SAB boots from `__start` on a pthread in the browser, runs its frame loop at 59.943 DrawDones per guest second, and its whole frames stream to Dolphin's GP decoder — `[recompLive] fifo=2135B draws=3 skipped=0`, 0 page errors; the `?srcapture=0` arm posts nothing. The picture itself is not verified (offscreen WebGPU); the guest runs far below 1.000x. §10.6e |
 | **WHOLE-IMAGE BOOT — FRAME LOOP AT 59.94/GUEST-s, 2026-09-29** | With a PE model (DrawDone/PE-finish from a GP decoder over the FIFO) the overlay's frame loop runs: **556 DrawDones in 10 s of guest time = 59.944 per guest second**, idle 3 M of 4,860 M cycles (PE off: 4,379 M idle, stuck in `GXDrawDone`, same md5 `cad618ff9a675def5512086bb69de5e3`). Native Dolphin confirms the first overlay (`mcwarnD` at `0x811ffe60`), the XFBs and 640x480; it has a memory card, the SR boot does not yet. **Nothing is drawn.** §10.6d |
 | **WHOLE-IMAGE BOOT — FIRST FRAME SUBMITTED, 2026-09-29** | **The overlay's first frame reaches the GP FIFO: `GXCopyDisp` (BP `0x52 = 0x004803`, copy-to-XFB `0x538460`, 640x480) then `GXSetDrawDone`**, and the boot stops WAITING in `GXDrawDone` because no PE/GP model answers it — no VI flip yet. Got there by fixing the DI model reporting every completion as DEINT, recycling leaked host threads, correcting the apploader's FST address (`0x817EDE20`, not `hdr[0x430]`), and linking the first REL overlay (`mcwarnD.rel`) translated from OSLink's own bytes behind a hash guard. Binary `c177aeb92de7a22d250503bb66502c4d`, overlay off / poisoned-guard arms stop at the prolog on the same md5. **Nothing renders; no `drawn/s` is claimed.** §10.6c |
@@ -3491,6 +3492,80 @@ address. **What is not shown**: the picture. **Rate**: the guest reached ~15 gue
 the guest is far below 1.000x in the browser (not measured against wall time precisely here;
 node measured 6.1 guest s per 60 wall s at nice 19), and the page presents a post every 100 ms of
 host time. Neither number is a speed-up; gate #9.
+
+#### 10.7 SPEED — the whole image against 1.000x (2026-09-29)
+
+**Rig.** `gamecube/recomp/sr/run_image_stream.mjs` with `SRS_POSTMS=0` (no frame pump, so no
+MEM1 copies on the measurement arm): the guest boots on its own pthread exactly as in the page,
+the main thread samples guest counters once per wall second, and the window runs from the
+first sample past 1.0 guest s (inside `mcwarnD`'s frame loop) to the end. Node 22, `nice 0`,
+4 cores, load stated per row. **guest s / wall s** = credited guest cycles / 486e6 per wall
+second; **executed MHz** = credited minus idle-skipped cycles per wall second (retired-work
+CYCLES, summed Gekko costs per block — not an instruction count); **idle** = skipped / credited.
+At 1.000x the host must execute 486 x (1 - idle) MHz.
+
+**Baseline** (wasm `cfcf36640b7374fceae32d354ace1a60`, n=3, load 1.2-2.3): **0.0986 / 0.0986 / 0.0986
+guest s per wall s**, 47.9 MHz executed, idle **0.0000**, 5.91 DrawDones per wall s. Needed at
+1.000x: 486 MHz.
+
+**Where the time went** (`node --cpu-prof`, a `--profiling-funcs` build, used to LOCATE only):
+of the ~40 s the three guest threads were busy, **32.6 s was `host_select_thread` self time**
+and every translated function together ~5 s. The cause, read in the source: `snapshot()`
+(sr_host_os.c) hashed all 24 MB of MEM1 with FNV-1a at EVERY context switch — a
+verify_ctxsw.mjs instrument, never meant for a running game.
+
+**Change 1 — the MEM1 hash off for the image** (`sr_os_set_snap_mem`, default ON so
+verify_ctxsw keeps its evidence; `sr_image_init_hle` turns it off). Matched pair on ONE binary
+(`6d1c0724ed6346f857863c8ba947d379`), the hash re-armed at run time (`SRS_SNAPMEM=1`) as the control:
+
+| arm | guest s / wall s (n=3) | executed MHz | idle | load |
+|---|---|---|---|---|
+| hash ON (old behaviour) | 0.1024 / 0.1033 / 0.1063 | 49.8-51.6 | 0 | 1.1-1.6 |
+| **hash OFF** | **0.7724 / 0.7830 / 0.7747** | **375.4-380.5** | 0 | 1.2-2.3 |
+
+**7.5x.** The remaining gap to 1.000x is 486 vs ~377 MHz with ZERO idle: the image never idles
+on this screen. Profiled again: `fn_80117df8` 20.4 s + `fn_800f3710` 11.6 s of ~35 s busy — a
+FRAME LIMITER, `while (VIGetRetraceCount() <= last + n - 1) ;` (0x80117e0c-0x80117e24; the map
+names 0x800f3710 `IPCGetBufferLo`, but its body is `lwz r3,-29952(r13); blr`, the retrace
+counter). The guest spends ~90% of its executed cycles spinning on a counter only the VI
+interrupt changes — which is exactly what Dolphin's idle skipping exists for (below).
+
+**Change 2 — Dolphin's busy-wait skip** (`sr.py --idle-skip`, `SR_IDLE_SKIP=1`): the loop
+detector is Dolphin's `IsBusyWaitLoop` transcribed (PPCAnalyst.cpp:737-788: loops to its own
+start, no CTR branch, only Integer/Load instructions, never overwrites a register it read first;
+a `bl` to a pure getter is followed and inlined as Dolphin's block builder does). The taken
+back-edge calls `gk_idle_loop`, i.e. CoreTiming::Idle — guest time jumps to the next scheduled
+event. **150 loops** in main.dol (+1 in `mcwarnD`), the frame limiter at 0x80117e0c among them;
+the generated C differs from the default build ONLY at those 150 back-edges (checked by diff),
+and a default build (`--idle-skip` absent) is unchanged. Matched pair on ONE binary
+(`0cd0ec34d1b76825b04c645b802713f3`), `sr_image_set_idle_loop(0|1)` at run time, window
+1.0-30.0 guest s (all inside `mcwarnD`; see the note on 34 guest s below), load 1.1-1.2:
+
+| arm | guest s / wall s (n=3) | executed MHz | idle | MHz needed at 1.000x |
+|---|---|---|---|---|
+| skip OFF | 0.6833 / 0.6365 / 0.6235 | 303-332 | 0 | 486 |
+| **skip ON** | **6.476 / 5.918 / 6.473** | **92-100** | **0.968** | **15.5** |
+
+(The ON window is only ~4 wall s at 1 s sampling — coarse; the per-second series inside it reads
+7.0-7.3 guest s/wall s at 0.969 idle in steady state.) Also re-measured on the same window,
+change 1's pair: hash ON 0.1046 / 0.1046 / 0.1028, hash OFF 0.7779 / 0.7833 / 0.7463.
+
+**Where that leaves 1.000x.** On this screen the image has **~6.5x headroom** in node: at
+1.000x it would need 15.5 MHz of executed guest work and it executes ~100 MHz while doing
+so — a capacity figure, not a speed-up: nothing here runs the guest faster than 1.000x, and
+the skip is the same trajectory in fewer host instructions. **The structural limit for a
+heavier scene is the executed rate: ~300-380 MHz of guest cycles per wall second when nothing
+is skipped (0.62-0.78 of a 486 MHz Gekko).** So 1.000x holds for any scene that idles at least
+~22-38% of its guest time, and not below that. The JIT path's measured idle across scenes was
+24-72% (CLAUDE.md gate 10), so a heavy in-game scene would sit at or near the line; raising
+the executed rate itself (build flags, the per-block event check, context-switch hand-off
+cost) is the next work, and it needs a heavier scene than `mcwarnD` to be profiled honestly.
+
+**A new functional wall, found by running faster.** At ~34 guest s the game unloads `mcwarnD`
+and calls into a NEW REL at 0x811fff40; its bytes do not match the translated module, the guard
+refuses it (`ovRefused`), and the run faults `0xC61FFF40` and degrades (0 frames, 0.2-0.3 guest
+s/wall s) — every measurement above ends its window at 30 guest s for that reason. Which REL it is
+(expected: `otherprintD`, as in Dolphin §10.6d) is the next overlay to translate.
 
 #### What is still missing before a first rendered frame
 

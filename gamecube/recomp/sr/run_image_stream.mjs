@@ -83,12 +83,20 @@ function walk(b) {
   return { copies, prims, bad, overrun: i - b.length };
 }
 
-G.startGuest(M, api, { hle: 12 });
+await G.startGuest(M, api, { hle: 12, snapMem: +(process.env.SRS_SNAPMEM || 0),
+  idleLoop: process.env.SRS_IDLELOOP === undefined ? undefined : +process.env.SRS_IDLELOOP });
 const pump = G.makePump(M, api);
 const posts = [];
 let copiesInPosts = 0, badOps = 0, overruns = 0;
 if (process.env.SRS_DUMP) fs.mkdirSync(process.env.SRS_DUMP, { recursive: true });
-const timer = setInterval(() => {
+// THE RATE SAMPLER (SRS_POSTMS=0 turns the pump off entirely, so the measurement arm does no
+// 24 MB MEM1 copies): once per second, guest kcycles credited and idle-skipped, vs wall time.
+const samples = [];
+const sampler = setInterval(() => {
+  samples.push({ wallMs: performance.now() - t0, kc: M._sr_image_kcycles() >>> 0,
+                 idleKc: M._sr_image_idle_kcycles() >>> 0, loopSkips: M._sr_image_idle_loop_skips ? M._sr_image_idle_loop_skips() >>> 0 : null, skips: M._sr_image_idle_skips() >>> 0, tb: M._sr_tb_calls() >>> 0, irq: M._sr_image_irq_delivered() >>> 0, fin: M._sr_image_pe_finishes() >>> 0 });
+}, 1000);
+const timer = POSTMS <= 0 ? null : setInterval(() => {
   const f = pump();
   if (!f) return;
   if (!f.fifo) { posts.push({ lost: f.lost }); return; }
@@ -100,13 +108,28 @@ const timer = setInterval(() => {
                wallMs: +(performance.now() - t0).toFixed(0) });
 }, POSTMS);
 await new Promise((r) => setTimeout(r, MS));
-clearInterval(timer);
+if (timer) clearInterval(timer);
+clearInterval(sampler);
 const guest = G.guestCounters(M);
+// the window: from the first sample at or past SRS_FROM_GS guest seconds (default 1.0, i.e.
+// inside mcwarnD's frame loop) to the last sample
+const FROM = +(process.env.SRS_FROM_GS || 1.0) * 486e3;
+const TO = +(process.env.SRS_TO_GS || 30) * 486e3;   // stay inside mcwarnD: a later REL is not in the image
+const inWin = samples.filter((x) => x.kc < TO);
+const a = samples.find((x) => x.kc >= FROM), b = inWin[inWin.length - 1];
+let rate = null;
+if (a && b && b.wallMs > a.wallMs) {
+  const w = (b.wallMs - a.wallMs) / 1000, dk = b.kc - a.kc, di = b.idleKc - a.idleKc;
+  rate = { windowWallS: +w.toFixed(2), guestSecondsPerWallSecond: +(dk / 486e3 / w).toFixed(4),
+           creditedMHz: +(dk / 1e3 / w).toFixed(2), executedMHz: +((dk - di) / 1e3 / w).toFixed(2),
+           idleFraction: +(di / dk).toFixed(4), drawDonesPerWallS: +((b.fin - a.fin) / w).toFixed(2),
+           mhzNeededAt1x: +(486 * (1 - di / dk)).toFixed(1) };
+}
 const result = {
   md5Before, md5After: md5(path.join(DIR, 'sab_image.wasm')), wallMs: MS, discMs: +discMs.toFixed(0),
-  apploader, guest, posts: posts.length, copiesInPosts, badOps, overruns,
+  apploader, rate, guest, posts: posts.length, copiesInPosts, badOps, overruns,
   lost: posts.length ? posts[posts.length - 1].lost : 0,
-  firstPosts: posts.slice(0, 6), lastPosts: posts.slice(-3),
+  samples, firstPosts: posts.slice(0, 6), lastPosts: posts.slice(-3),
 };
 fs.writeFileSync(OUT, JSON.stringify(result, null, 1));
 console.log(JSON.stringify({ ...result, firstPosts: undefined, lastPosts: undefined }));

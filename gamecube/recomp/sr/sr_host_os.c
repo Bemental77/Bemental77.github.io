@@ -105,11 +105,22 @@ static void fault(uint32_t code, uint32_t detail) {
 // transcription in this file is the shipped function.
 static GekkoState g_snap;
 static uint32_t   g_snap_hash, g_snap_valid;
+// [2026-09-29] THE MEM1 HASH IS A VERIFICATION INSTRUMENT, and it cost the whole image most of
+// its speed: 24 MB of FNV-1a at EVERY context switch.  Profiled (node --cpu-prof, locating only):
+// host_select_thread SELF time = 32.6 s of the ~40 s the three running guest threads were
+// busy, translated guest code ~5 s.  verify_ctxsw.mjs needs the hash (its default stays ON);
+// the whole image turns it off in sr_image_init_hle, and sr_os_set_snap_mem(1) restores it on
+// the same binary as the matched-pair control arm.
+static uint32_t   g_snap_mem = 1;
+EMSCRIPTEN_KEEPALIVE void sr_os_set_snap_mem(uint32_t on) { g_snap_mem = on; }
 static void snapshot(GekkoState *st) {
     g_snap = *st;
-    uint32_t h = 2166136261u;                       // FNV-1a over MEM1
-    for (uint32_t i = 0; i < g_ram_size; i++) { h ^= g_ram[i]; h *= 16777619u; }
-    g_snap_hash = h; g_snap_valid = 1;
+    if (g_snap_mem) {
+        uint32_t h = 2166136261u;                   // FNV-1a over MEM1
+        for (uint32_t i = 0; i < g_ram_size; i++) { h ^= g_ram[i]; h *= 16777619u; }
+        g_snap_hash = h;
+    }
+    g_snap_valid = 1;
 }
 
 // --------------------------------------------------------- park / hand-off

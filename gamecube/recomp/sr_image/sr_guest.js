@@ -74,7 +74,8 @@ export async function loadDisc(mod, size, parts) {
 }
 
 // Start the guest.  Everything the node runner sets, in the same order.
-export function startGuest(mod, api, { hle = 12, strict = 0, parkMs = 3600000 } = {}) {
+export async function startGuest(mod, api, opts = {}) {
+  const { hle = 12, strict = 0, parkMs = 3600000 } = opts;
   api.setExiModel(1);
   mod._sr_image_set_dsp_model(1);
   for (let id = 1; id <= 11; id++) mod._sr_image_set_model(id, 1);
@@ -83,7 +84,19 @@ export function startGuest(mod, api, { hle = 12, strict = 0, parkMs = 3600000 } 
   mod._sr_os_set_timeout(parkMs);
   api.setStrict(strict);
   mod._sr_gx_set_capture(2);                       // the frame ring
+  // idleLoop: the busy-wait skip (sr.py --idle-skip builds), default on; 0 = the control arm
+  if (opts.idleLoop !== undefined && mod._sr_image_set_idle_loop) mod._sr_image_set_idle_loop(opts.idleLoop ? 1 : 0);
+  // snapMem: the verification-only MEM1 hash per context switch (sr_host_os.c) — the matched-pair
+  // control arm; sr_image_init_hle (run on the boot thread) turns it off, so arm it after.
   const rc = mod._sr_image_boot_thread(hle);
+  if (opts.snapMem) {
+    const t = Date.now();   // async wait: the thread's start needs this event loop to turn
+    while (!(mod._sr_image_boot_thread_state() >>> 0)) {
+      if (Date.now() - t > 10000) throw new Error('boot thread did not start');
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    mod._sr_os_set_snap_mem(1);
+  }
   if (rc !== 0) throw new Error('sr_image_boot_thread: pthread_create returned ' + rc);
 }
 

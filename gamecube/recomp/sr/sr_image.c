@@ -1547,7 +1547,25 @@ static int img_idle(void) {
     return 1;
 }
 EMSCRIPTEN_KEEPALIVE uint32_t sr_image_idle_skips(void)     { return g_idle_skips; }
+// [2026-09-29] THE BUSY-WAIT SKIP.  sr.py --idle-skip emits gk_idle_loop(st) on the taken
+// back-edge of every loop Dolphin's IsBusyWaitLoop accepts (PPCAnalyst.cpp:737-788); this is
+// Dolphin's response, CoreTiming::Idle (Jit64/Jit_Branch.cpp:142 -> skip to the next scheduled
+// event).  The loop cannot change guest state by itself, so jumping guest time to the event that
+// can end it is the same guest trajectory in fewer host instructions.  Run-time arm
+// sr_image_set_idle_loop(0) = the loop spins as written, on the same binary.
+static uint32_t g_idle_loop_on = 1, g_idle_loop_skips = 0;
+EMSCRIPTEN_KEEPALIVE void     sr_image_set_idle_loop(uint32_t on) { g_idle_loop_on = on; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_idle_loop_skips(void)     { return g_idle_loop_skips; }
+void gk_idle_loop(GekkoState *st) {
+    (void)st;
+    if (!g_idle_loop_on || g_gk_event_at == UINT64_MAX || g_gk_event_at <= g_gk_cycles) return;
+    g_idle_cycles += g_gk_event_at - g_gk_cycles;
+    g_gk_cycles = g_gk_event_at;
+    g_idle_loop_skips++;
+    gk_event();
+}
 EMSCRIPTEN_KEEPALIVE uint32_t sr_image_idle_mcycles(void)   { return (uint32_t)(g_idle_cycles / 1000000u); }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_idle_kcycles(void)   { return (uint32_t)(g_idle_cycles / 1000u); }
 EMSCRIPTEN_KEEPALIVE uint32_t sr_image_cycles_m(void)       { return (uint32_t)(g_gk_cycles / 1000000u); }
 
 // THE GUEST-TIME BUDGET.  The device-read watchdog cannot see a guest that spins on MEMORY
@@ -2170,6 +2188,7 @@ EMSCRIPTEN_KEEPALIVE int sr_image_init(void) {
 #ifdef __EMSCRIPTEN_PTHREADS__
 EMSCRIPTEN_KEEPALIVE int sr_image_init_hle(int nthreads) {
     int n = sr_os_init(nthreads);
+    sr_os_set_snap_mem(0);          // verification-only 24 MB hash per switch: off for the image
     sr_os_mode(SR_OS_HLE);
     sr_host_hook = img_hook;
     return n;

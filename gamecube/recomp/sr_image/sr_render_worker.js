@@ -354,7 +354,7 @@ async function runGuestArm(msg, base) {
     disc = await loadDisc(mod, GC_DISC_BYTES, fetchSabParts(romRoot));
   }
   const apploader = stageApploader(mod, api, mod.HEAPU8.subarray(disc.ptr, disc.ptr + disc.size));
-  startGuest(mod, api, { hle: 12 });
+  await startGuest(mod, api, { hle: 12 });
   // THE CONTROL ARM (?srcapture=0, same wasm): the guest runs identically but the frame ring is
   // off, so nothing is posted.  A picture in that arm did not come from this stream.
   if (msg.capture === 0) mod._sr_gx_set_capture(0);

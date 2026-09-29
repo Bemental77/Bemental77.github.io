@@ -180,8 +180,10 @@ elif [ -n "${SR_GEN:-}" ]; then
   [ "$(cd "$(dirname "$SR_GEN")" && pwd)/$(basename "$SR_GEN")" = "$OUT/sr_gen.c" ] || cp "$SR_GEN" "$OUT/sr_gen.c"
   DISPATCH_SRC=("$OUT/sr_dispatch.c")
 else
+  # SR_IDLE_SKIP=1 — [2026-09-29] Dolphin's busy-wait skip (sr.py --idle-skip).
+  IDLE_ARG=(); [ -n "${SR_IDLE_SKIP:-}" ] && IDLE_ARG=(--idle-skip)
   python3 "$SR/sr.py" --image "$DOL" --map "$REPO/dolphin_captures/sab.map" \
-          --all --indirect --jumptables --retire --boundaries outer+calls \
+          --all --indirect --jumptables --retire --boundaries outer+calls ${IDLE_ARG[@]+"${IDLE_ARG[@]}"} \
           "${HOSTARGS[@]}" \
           --skiplist "$OUT/skiplist.json" \
           --dispatch-out "$OUT/sr_dispatch.c" \
@@ -203,7 +205,7 @@ EXPORTS=$EXPORTS,_sr_image_set_dsp_model,_sr_image_dsp_events,_sr_image_aram_byt
 EXPORTS=$EXPORTS,_sr_image_set_model,_sr_image_get_model,_sr_image_model_events
 EXPORTS=$EXPORTS,_sr_image_irq_delivered,_sr_image_dec_delivered,_sr_image_irq_last
 EXPORTS=$EXPORTS,_sr_image_pi_cause,_sr_image_pi_mask,_sr_image_vi_frames,_sr_image_ucode_crc,_sr_image_ucode,_sr_image_ax_cmdlist
-EXPORTS=$EXPORTS,_sr_image_idle_skips,_sr_image_idle_mcycles,_sr_image_cycles_m,_sr_image_set_budget_mcycles,_sr_image_tail,_sr_image_tail_n,_sr_os_trace_mask,_sr_os_ring,_sr_os_ring_n,_sr_image_set_past_fault,_sr_image_budget_thread,_sr_image_budget_state,_sr_image_budget_threads,_sr_image_budget_threads_n,_sr_image_budget_runq,_sr_ax_pbs,_sr_ax_lists,_sr_ax_voices,_sr_ax_unknown_cmds,_sr_image_indirect_fault_lr,_sr_image_indirect_fault_target,_sr_image_indirect_fault_r1,_sr_image_set_disc,_sr_image_di_cmds,_sr_image_di_bytes,_sr_image_di_log,_sr_image_set_watch,_sr_image_watch_hit,_sr_image_watch_kcyc,_sr_image_watch_thread,_sr_image_watch_new,_sr_image_watch_state,_sr_image_watch_stack,_sr_image_set_watch_cond,_sr_image_set_watch_e0,_sr_image_di_trace,_sr_image_di_trace_n,_sr_os_recycled,_sr_image_ov_entries,_sr_image_ov_refused,_sr_image_set_ov,_sr_gp_cmds,_sr_gp_prims,_sr_gp_verts,_sr_gp_dls,_sr_gp_unknown,_sr_gp_bad_fmt,_sr_gx_cuts,_sr_gx_ncuts,_sr_image_pe_finishes,_sr_image_pe_tokens,_sr_image_pe_drawdone_bp,_sr_image_xfb_copies,_sr_image_vi_flips,_sr_image_frame_kcyc,_sr_image_kcycles,_sr_image_set_disc_mem,_sr_gx_ring_base,_sr_gx_ring_cap,_sr_gx_ring_pub,_sr_gx_ring_frames
+EXPORTS=$EXPORTS,_sr_image_idle_skips,_sr_image_idle_mcycles,_sr_image_cycles_m,_sr_image_set_budget_mcycles,_sr_image_tail,_sr_image_tail_n,_sr_os_trace_mask,_sr_os_ring,_sr_os_ring_n,_sr_image_set_past_fault,_sr_image_budget_thread,_sr_image_budget_state,_sr_image_budget_threads,_sr_image_budget_threads_n,_sr_image_budget_runq,_sr_ax_pbs,_sr_ax_lists,_sr_ax_voices,_sr_ax_unknown_cmds,_sr_image_indirect_fault_lr,_sr_image_indirect_fault_target,_sr_image_indirect_fault_r1,_sr_image_set_disc,_sr_image_di_cmds,_sr_image_di_bytes,_sr_image_di_log,_sr_image_set_watch,_sr_image_watch_hit,_sr_image_watch_kcyc,_sr_image_watch_thread,_sr_image_watch_new,_sr_image_watch_state,_sr_image_watch_stack,_sr_image_set_watch_cond,_sr_image_set_watch_e0,_sr_image_di_trace,_sr_image_di_trace_n,_sr_os_recycled,_sr_image_ov_entries,_sr_image_ov_refused,_sr_image_set_ov,_sr_gp_cmds,_sr_gp_prims,_sr_gp_verts,_sr_gp_dls,_sr_gp_unknown,_sr_gp_bad_fmt,_sr_gx_cuts,_sr_gx_ncuts,_sr_image_pe_finishes,_sr_image_pe_tokens,_sr_image_pe_drawdone_bp,_sr_image_xfb_copies,_sr_image_vi_flips,_sr_image_frame_kcyc,_sr_image_kcycles,_sr_image_set_disc_mem,_sr_gx_ring_base,_sr_gx_ring_cap,_sr_gx_ring_pub,_sr_gx_ring_frames,_sr_image_idle_kcycles,_sr_os_set_snap_mem,_sr_image_set_idle_loop,_sr_image_idle_loop_skips
 EXPORTS=$EXPORTS,_sr_os_mode,_sr_os_get_mode,_sr_os_set_msr,_sr_os_get_msr
 EXPORTS=$EXPORTS,_sr_os_trace,_sr_os_trace_n,_sr_os_trace_reset
 # THE CLOCK, READ-ONLY (plus the two writes that are legitimately the host's).
@@ -363,7 +365,7 @@ nice -n 19 emcc ${SR_OPT:--O2} -DSR_MMIO ${OV_DEF[@]+"${OV_DEF[@]}"} -I"$SR" \
   -sSTACK_SIZE=8388608 \
   -sEXPORTED_FUNCTIONS="$EXPORTS" \
   -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPU32,wasmMemory \
-  -Wl,--no-entry
+  -Wl,--no-entry ${SR_LFLAGS_EXTRA:-}
 set +x
 
 # stat -f%z / md5 -q are the macOS spellings; fall back to the GNU ones.

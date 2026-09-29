@@ -53,10 +53,12 @@ def main():
     ap.add_argument('--dol', required=True)
     ap.add_argument('--map', default=os.path.join(os.path.dirname(__file__), '../../../dolphin_captures/sab.map'))
     ap.add_argument('--out', required=True)
+    ap.add_argument('--idle-skip', action='store_true', help='as sr.py --idle-skip (match the image)')
     a = ap.parse_args()
     if len(a.rel) != len(a.module):
         raise SystemExit('--rel and --module pair up')
     sr.RETIRE = True                               # the image is built with --retire
+    sr.IDLE_SKIP = a.idle_skip                     # and, when it was, with --idle-skip
 
     ram = open(a.ram, 'rb').read()
     if len(ram) != 0x01800000:
@@ -116,7 +118,7 @@ def main():
 
     # sr.emit_c derives `emitted` from its own list, so a call into the image's DOL would come
     # out as sr_extern(); emit the bodies here with the full emitted set instead.
-    out = [sr.HEADER, '\n// overlay functions']
+    out = [sr.HEADER + (sr.IDLE_DECL if sr.IDLE_SKIP else ''), '\n// overlay functions']
     for lo, _, name in ok:
         out.append(f'void fn_{lo:08x}(GekkoState *st);   /* {name} */')
     bodies = []
