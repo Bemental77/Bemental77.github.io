@@ -135,7 +135,7 @@ export async function startGuest(mod, api, opts = {}) {
 // frame published since the last call (so no GP command is ever skipped: the consumer keeps
 // CP/XF/BP state across calls), plus a MEM1 snapshot taken now.  Returns null when there was
 // nothing new.
-export function makePump(mod, api) {
+export function makePump(mod, api, { mem1: withMem1 = true } = {}) {
   const base = mod._sr_gx_ring_base() >>> 0, cap = mod._sr_gx_ring_cap() >>> 0;
   let r = 0, framesSeen = 0, posts = 0, lost = 0;
   return function pump() {
@@ -151,7 +151,7 @@ export function makePump(mod, api) {
     if (a + n <= cap) fifo.set(H.subarray(base + a, base + a + n));
     else { fifo.set(H.subarray(base + a, base + cap)); fifo.set(H.subarray(base, base + (n - (cap - a))), cap - a); }
     const ram = api.ram();
-    const mem1 = H.slice(ram, ram + 0x01800000);   // live RAM at post time (see README §10.6e)
+    const mem1 = withMem1 ? H.slice(ram, ram + 0x01800000) : null;   // live RAM at post time (README §10.6e)
     const framesInPost = frames - framesSeen;
     r = pub; framesSeen = frames; posts++;
     return { n: posts, fifo, mem1, framesInPost, guestFrames: frames, lost };

@@ -58,6 +58,7 @@
 
 import { bindImage, stageBoot, readLog, summarize, readDev } from './sr_boot_stage.js';
 import { stageApploader, loadDisc, startGuest, makePump, guestCounters } from './sr_guest.js';
+import { GpThinner, stripDraws } from './sr_gp_thin.js';
 
 // [2026-09-29] THE PACED-GUEST ARM.  ?srmode=main with an image that exports
 // _sr_image_boot_thread (build_image.sh SR_PTHREAD=1 SR_MEM=1879048192 SR_POOL=14, served
@@ -370,8 +371,51 @@ async function runGuestArm(msg, base) {
   // off, so nothing is posted.  A picture in that arm did not come from this stream.
   if (msg.capture === 0) mod._sr_gx_set_capture(0);
   say('guest-started', { dolBytes: staged.dolBytes, apploader, discBytes: disc.size });
-  const pump = makePump(mod, api);
-  const periodMs = (msg.postMs | 0) || 100;
+  // BACKPRESSURE (2026-09-29).  The page forwards Dolphin's recompAck as {cmd:'ack', n}
+  // (gamecube.html, the srrender relay).  At most MAX_UNACKED posts are in flight; while over, the
+  // worker HOLDS: it keeps draining the ring (so nothing is lost), keeps the NEWEST frame whole, and
+  // reduces every frame it supersedes to its state commands (sr_gp_thin.js).  MEM1 is copied only
+  // when a post actually goes out -- never queued.  Without an ack channel (an older page) nothing
+  // is ever acked, so the hold is armed only once the first ack has been seen.
+  const MAX_UNACKED = 2;
+  const pump = makePump(mod, api, { mem1: false });
+  const thin = new GpThinner();
+  let posted = 0, acked = 0, ackSeen = false;
+  let held = null;                  // newest whole frame not yet posted: { bytes, prims, clean }
+  const pendState = [];             // state-only (or unthinnable whole) frames, in stream order
+  let pendBytes = 0;
+  const st = { frames: 0, thinned: 0, thinRefused: 0, droppedPrimBytes: 0, holds: 0, maxPend: 0, lostBytes: 0 };
+  // A CONSUMER THAT STOPS ACKING (measured: Dolphin on software WebGPU stopped at post 726 while its
+  // GPU process sat at 8.6 GB) would make the held state stream grow forever.  After STALL_MS with
+  // un-acked posts and no ack progress, the consumer is declared stalled: nothing more is held or
+  // posted, the ring is still drained, and the report says so.  Never silently resumed -- the
+  // state stream it would need has been discarded.
+  const STALL_MS = 10000;
+  let lastAckAt = performance.now(), stalled = false;
+  onAck = (n) => { ackSeen = true; if (n > acked) { acked = n; lastAckAt = performance.now(); } };
+  const supersede = (fr) => {        // fr will never be shown: keep its state, drop its draws
+    let bytes;
+    if (fr.clean) { bytes = stripDraws(fr); st.thinned++; st.droppedPrimBytes += fr.bytes.length - bytes.length; }
+    else { bytes = fr.bytes; st.thinRefused++; }
+    pendState.push(bytes); pendBytes += bytes.length; if (pendBytes > st.maxPend) st.maxPend = pendBytes;
+  };
+  const tryPost = () => {
+    if (!held) return false;
+    if (ackSeen && posted - acked >= MAX_UNACKED) { st.holds++; return false; }
+    const parts = pendState.splice(0);
+    const out = new Uint8Array(pendBytes + held.bytes.length);
+    let o = 0; for (const p of parts) { out.set(p, o); o += p.length; }
+    out.set(held.bytes, o);
+    pendBytes = 0; held = null;
+    const ram = api.ram();
+    const mem1 = mod.HEAPU8.slice(ram, ram + 0x01800000);       // live RAM, at post time only
+    posted++;
+    const sizes = { n: posted, fifoBytes: out.length };
+    self.postMessage({ cmd: 'frame', n: posted, fifo: out.buffer, mem1: mem1.buffer, regions: [] }, [out.buffer, mem1.buffer]);
+    if (posted === 1 || posted % 200 === 0) say('guest', Object.assign(sizes, { bp: Object.assign({ posted, acked }, st) }, guestCounters(mod)));
+    return true;
+  };
+  const periodMs = (msg.postMs | 0) || 16;
   let reports = 0, ticks = 0;
   const t0 = performance.now();
   setInterval(() => {
@@ -383,29 +427,40 @@ async function runGuestArm(msg, base) {
       // characters (gamecube.html srSay caller), so the fields a rate needs come first
       const g = guestCounters(mod);
       say('guest', { timed: 1, w: Math.round(performance.now() - t0), kc: g.guestKcycles, ikc: g.idleKcycles,
-                     sl: g.paceSleptMs, bh: g.paceBehindMs, xfb: g.xfbCopies, fin: g.peFinishes, prims: g.gpPrims, vf: g.viFrames, mods: g.mods,
-                     f: g.fault, ref: g.ovRefused });
+                     sl: g.paceSleptMs, bh: g.paceBehindMs, xfb: g.xfbCopies, fin: g.peFinishes, prims: g.gpPrims, vf: g.viFrames,
+                     p: posted, a: acked, th: st.thinned, tr: st.thinRefused, pm: st.maxPend, lb: st.lostBytes, st: stalled ? 1 : 0, f: g.fault });
+    }
+    if (!stalled && ackSeen && posted > acked && performance.now() - lastAckAt > STALL_MS) {
+      stalled = true; pendState.length = 0; pendBytes = 0; held = null;
+      say('guest', { consumerStalled: true, posted, acked, lastAckAgoMs: Math.round(performance.now() - lastAckAt) });
     }
     const f = pump();
-    if (f && f.fifo) {
-      // measure before transferring (a transferred buffer reads as length 0)
-      const sizes = { n: f.n, fifoBytes: f.fifo.length, framesInPost: f.framesInPost };
-      self.postMessage({ cmd: 'frame', n: f.n, fifo: f.fifo.buffer, mem1: f.mem1.buffer, regions: [] },
-                       [f.fifo.buffer, f.mem1.buffer]);
-      if (f.n === 1 || f.n % 200 === 0) say('guest', Object.assign(sizes, guestCounters(mod), { lost: f.lost }));
+    if (f && f.fifo && stalled) {
+      // drained, not kept
+    } else if (f && f.fifo) {
+      for (const fr of thin.split(f.fifo)) {
+        st.frames++;
+        if (held) supersede(held);
+        held = fr;
+      }
+      tryPost();
     } else if (f && !f.fifo) {
+      st.lostBytes = f.lost;
       say('guest', Object.assign({ lostBytes: f.lost }, guestCounters(mod)));
-    } else if (++reports % 300 === 0) {
-      say('guest', Object.assign({ idlePump: true }, guestCounters(mod)));
+    } else {
+      tryPost();                     // an ack may have freed a slot for a held frame
+      if (++reports % 1800 === 0) say('guest', Object.assign({ idlePump: true }, guestCounters(mod)));
     }
   }, periodMs);
 }
 
+let onAck = null;
 self.onmessage = async (e) => {
   const msg = e.data || {};
   // the page streams the disc BEFORE 'boot' (gamecube.html srPost after the romChunk loop)
   if (msg.cmd === 'romChunk') { discParts.push(msg.buf); return; }
   if (msg.cmd === 'romEnd') { discEnd = msg.size >>> 0; return; }
+  if (msg.cmd === 'ack') { if (onAck) onAck(msg.n | 0); return; }
   if (msg.cmd !== 'boot') return;
   const base = msg.base || './';
   // mode 'gx'   — drive SAB's GX entry points to a picture (the default).

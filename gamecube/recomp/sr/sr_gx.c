@@ -170,7 +170,10 @@ static uint32_t g_gx_cuts[SR_GX_CUTS], g_gx_ncuts = 0;
 // g_ring_pub is advanced, with a release store, only at a copy to the XFB.  The reader keeps
 // its own read count; if it ever falls more than the ring's size behind, bytes were lost and
 // it must say so (sr_render_worker.js reports `lost`), never render a torn stream.
-#define SR_GX_RING (8u << 20)
+// [2026-09-29] 8 MB -> 64 MB: a City Escape frame is ~2.5 MB of GP stream, so 8 MB held ~3 frames
+// and a worker tick delayed by one 24 MB MEM1 copy overflowed it (the page reported lostBytes
+// 10.7 MB, after which the stream the renderer got was torn).  Static, inside SR_MEM.
+#define SR_GX_RING (64u << 20)
 static uint8_t  g_gx_ring[SR_GX_RING];
 static uint32_t g_ring_w = 0, g_ring_pub = 0, g_ring_frames = 0;
 EMSCRIPTEN_KEEPALIVE uint32_t sr_gx_ring_base(void)  { return (uint32_t)(uintptr_t)g_gx_ring; }

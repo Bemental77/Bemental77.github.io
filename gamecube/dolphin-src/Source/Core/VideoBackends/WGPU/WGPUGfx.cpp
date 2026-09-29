@@ -2003,6 +2003,21 @@ void WGPUGfx::EnsureDummyResources()
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// [recomp gpu-backpressure 2026-09-29] The recomp glue (worker_funcs.js) used to ack a frame
+// when recomp_render_fifo RETURNED -- when the CPU had ENCODED it -- so the producers' own
+// backpressure (the page's skipRender, the SR relay's 2-post limit) never saw the GPU. On a GPU
+// slower than the stream every frame's command buffers, queued uploads and readback buffers
+// piled up in the GPU process (MP4 title on SwiftShader: 95 MB -> 8.7 GB in 100 s). The glue now
+// holds each ack until the frame's present readback -- issued after the frame's work, completed
+// only once the GPU has executed it -- has come back; this is the count of those outstanding.
+// The readback's failure path decrements it too (a lost device rejects pending maps).
+extern "C" EMSCRIPTEN_KEEPALIVE u32 recomp_gpu_pending()
+{
+  WGPUGfx* gfx = WGPUGfx::GetInstance();
+  return gfx ? gfx->GetReadbacksInFlight() : 0;
+}
+
 void WGPUGfx::DrawIndexed(WGPUBuffer vertex_buffer, WGPUBuffer index_buffer,
                           WGPUBuffer uniform_buffer, u32 vs_uniform_offset, u32 ps_uniform_offset,
                           u32 num_indices, u32 base_index, u32 base_vertex)

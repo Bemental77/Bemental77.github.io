@@ -7,7 +7,7 @@
 
 uint8_t  *g_ram = 0;
 uint32_t  g_ram_size = 0;
-int       g_gk_fma_fast = 1;       // gekko_rt.h gk_fma: the exact-product fast path (run-time arm)
+int       g_gk_fma_fast = 2;       // gekko_rt.h gk_fma: the exact-product fast path (run-time arm)
 EMSCRIPTEN_KEEPALIVE void sr_set_fma_fast(int on) { g_gk_fma_fast = on; }
 uint32_t  g_fault = 0;
 // THE HID0.  Seeded with the value the GameCube's BS2 leaves (gekko_rt.h

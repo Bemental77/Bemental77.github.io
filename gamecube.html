@@ -7660,7 +7660,15 @@ window.GcRate = (function () {
       }
       var origOnWorkerMsg = dolphin_worker.onmessage;
       dolphin_worker.onmessage = function (e) {
-        if (e.data && e.data.cmd === 'recompAck') { srState.acks++; return; }
+        if (e.data && e.data.cmd === 'recompAck') {
+          srState.acks++;
+          // BACKPRESSURE: the render worker needs to know how far Dolphin has got, or it relays
+          // every frame (plus a 24 MB RAM image) into an unbounded queue — measured 8.0 GB
+          // renderer + 5.8 GB GPU process on a GPU that could not keep up. It holds or merges
+          // frames while more than a couple are un-acked (sr_render_worker.js).
+          if (window.__srRenderWorker) window.__srRenderWorker.postMessage({ cmd: 'ack', n: e.data.n });
+          return;
+        }
         if (origOnWorkerMsg) origOnWorkerMsg(e);
       };
       var rw = new Worker('/gamecube/recomp/sr_image/sr_render_worker.js', { type: 'module' });
