@@ -68,6 +68,27 @@ static char     rom_path[512] = "/game.gen";
 static int core_inited = 0;
 static int game_loaded = 0;
 
+/* ── rollback support (off by default; genesis.html turns it on for a
+ * rollback room only) ────────────────────────────────────────────────────────
+ * fast_states: answer RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE with bit 2
+ * ("use fast savestates"). Without it retro_unserialize() runs state_load() ->
+ * system_reset() with reset_do_not_clear_buffers = 0 (core/state.c:64-66),
+ * which clears VDP/render/pattern-cache buffers that are NOT in the blob, and
+ * the FM/blip sound buffer state is not restored (libretro.c retro_unserialize
+ * -> restore_sound_buffer only under fast_savestates). MEASURED on the shipped
+ * binary (tools/rollback_state_measure.mjs): a run that had loaded a state
+ * diverged from one that had not, byte-for-byte, within 1 frame — so a
+ * rollback could never re-converge with a peer that did not roll back. This is
+ * the upstream mechanism RetroArch run-ahead / rollback netplay rely on.
+ * With fast_states == 0 the callback answers exactly as before (unsupported),
+ * so single-player and lockstep keep the shipped behaviour.
+ *
+ * vid_skip: during a rollback RE-SIMULATION the frames are never presented,
+ * so the RGB565 -> RGBA conversion (not part of the emulated state) is skipped.
+ */
+static int fast_states = 0;
+static int vid_skip = 0;
+
 static double av_fps         = 59.922751;
 static double av_sample_rate = 44100.0;
 
@@ -175,6 +196,17 @@ static bool env_cb(unsigned cmd, void *data)
       case RETRO_ENVIRONMENT_SET_GEOMETRY:
          return true;
 
+      case RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE:
+         /* See fast_states above. 1 = video, 2 = audio, 4 = fast savestates:
+          * video and audio stay enabled, so retro_run takes the same path it
+          * takes when this is unanswered (do_skip = 0, audio_hard_disable = 0,
+          * libretro.c:3896-3912). Only the savestate behaviour changes. */
+         if (!fast_states)
+            return false;
+         if (data)
+            *(int *)data = 1 | 2 | 4;
+         return true;
+
       /* Everything else — system dir, save dir, rumble, perf counters,
        * audio-buffer status, core-option categories/version — is genuinely
        * unsupported here. Returning false makes the core take its own
@@ -196,6 +228,9 @@ static void video_cb(const void *data, unsigned width, unsigned height,
    if (height > GPX_MAX_H) height = GPX_MAX_H;
    vid_w = width;
    vid_h = height;
+
+   if (vid_skip)
+      return;
 
    /* NULL means "repeat the last frame" (libretro.c:4011 on a skipped frame).
     * Leave vid_rgba alone and report no new frame. */
@@ -400,6 +435,24 @@ float *gpx_audio_buf(void) { return aout; }
 
 EMSCRIPTEN_KEEPALIVE
 void gpx_audio_clear(void) { a_r = a_w; }
+
+/* Rollback: the write cursor before a re-simulation, and a rewind to it
+ * afterwards, so the re-simulated frames' audio (a repeat of frames already
+ * heard) is discarded exactly, without touching what is still queued. */
+EMSCRIPTEN_KEEPALIVE
+unsigned gpx_audio_wpos(void) { return a_w; }
+EMSCRIPTEN_KEEPALIVE
+void gpx_audio_rewind(unsigned w)
+{
+   /* only ever backwards, and never behind the reader */
+   if ((unsigned)(a_w - w) <= (unsigned)(a_w - a_r))
+      a_w = w;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void gpx_set_fast_savestates(int on) { fast_states = on ? 1 : 0; }
+EMSCRIPTEN_KEEPALIVE
+void gpx_set_video_skip(int on) { vid_skip = on ? 1 : 0; }
 
 /* ── save states ─────────────────────────────────────────────────────────── */
 EMSCRIPTEN_KEEPALIVE

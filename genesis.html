@@ -16,7 +16,7 @@
        so the page that used to be player 2's whole machine is gone and this
        page is the only page. The file itself still exists because n64/index.html
        has not been converted yet; nothing here routes to it. -->
-  <script src="/lib/netplay.js?v=40595af6"></script>
+  <script src="/lib/netplay.js?v=67280207"></script>
   <meta charset="UTF-8" />
   <title>Genesis Wasm</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -528,7 +528,7 @@
   var gpState = {};   // gamepad-only view, OR-ed in padMask()
 
   window.Module = {
-    locateFile: (p) => CORE_DIR + p,
+    locateFile: (p) => CORE_DIR + p + '?v=66b69161',   // core stamp: a cached old .wasm must never pair with a new .js
     print: (t) => console.log('[genesis]', t),
     printErr: (t) => console.warn('[genesis]', t),
     onRuntimeInitialized: function () {
@@ -677,6 +677,7 @@
     if (!known && inRoom && !isHostSide) return {};
     var ports = known || [0];
     var mask = padMask();
+    latSample(ls, mask);
     var out = {};
     ports.forEach(function (port, k) {
       var b = new Uint8Array(LS_PAD_BYTES);
@@ -744,6 +745,7 @@
   // game carries on single-player from exactly the frame it was holding.
   function lsDisarm(why) {
     if (!LS.armed) return;
+    rbFree();
     LS.armed = false; LS.running = false;
     LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
     // A leaver's pad must not stay held down on this machine's port B.
@@ -818,6 +820,9 @@
       return false;
     }
     LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
+    // The HOST decided lockstep or rollback ('lsgo' carries it) — never this
+    // page's own query string, which only says what THIS console would propose.
+    if (ls.rollback) return rbRunFrame(ls, r);
 
     // EVERY SEATED PORT IS WRITTEN, EVERY FRAME, FROM THE ONE AGREED IMAGE.
     // ⚠ Including this machine's own: the local pad goes round through the
@@ -848,7 +853,179 @@
     var h = null;
     if (every > 0 && (r.frame % every) === 0) { h = lsFingerprint(); if (h != null) LS.hashes++; }
     ls.endFrame(h);
+    latWitness(ls, r);
     return true;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ROLLBACK — ZERO LOCAL INPUT LAG. The engine half (and the reasoning) is in
+  // lib/netplay.js above _beginFrameRb; this is the core half.
+  //
+  // THE CANONICAL STEP. Every frame, first-time or re-simulated, is run as
+  //     gpx_state_load(slot[k]) -> set pads -> gpx_run() -> gpx_state_save(slot[k+1])
+  // on BOTH consoles. MEASURED (tools/rollback_state_measure.mjs, 2026-09-29):
+  // a Genesis-Plus-GX run that LOADED a state and one that did not differ
+  // byte-for-byte within 1 frame — state_load() runs system_reset(), which
+  // resets things the blob does not carry (the YM2612 BUSY timer, PSG deltas,
+  // VDP odd_frame...). So a console that rolled back and one that did not would
+  // fork. Loading before EVERY frame makes a frame a pure function of
+  // (blob, pads): 2994/2994 confirmed frames after 428 rollbacks / 2568
+  // re-simulated frames matched a straight run byte-for-byte on Sonic 3.
+  // Cost: 1.5 ms p50 / 2.3 ms p90 per step (load+run+save, slots in the wasm
+  // heap), 1.4 ms with video conversion skipped for re-simulation — W=8 fits a
+  // 16.7 ms tick at p90.
+  // ⚠ Known cost of that purity: state the blob does not carry is reset every
+  // frame. The build carries the BUSY timer (genesis/genesisWasm/tools/
+  // patch_fm_busy_state.py); VDP interlace field parity (odd_frame) is still
+  // lost, so an interlaced mode (Sonic 2's split screen) renders one field.
+  //
+  // ⚠ GATE 9. A re-simulation re-runs frames the guest already lived through
+  // once on a guess; nothing is presented and no accumulator credit is spent on
+  // it. Exactly one NEW frame runs per credit, as in lockstep, and the loop()'s
+  // debt clamp still applies — so the guest clock never passes wall time.
+  //
+  // ⚠ AUDIO. The re-simulated frames' samples are a repeat of audio already
+  // queued; gpx_audio_wpos()/gpx_audio_rewind() drop exactly them.
+  // gpx_set_fast_savestates(1) keeps the FM/blip output state across the
+  // per-frame load (without it every load cleared the blip buffers).
+  // ═══════════════════════════════════════════════════════════════════════════
+  var RB = {
+    slots: null, slotFrame: null, n: 0, size: 0,
+    resimFrames: 0, rollbacks: 0, maxDepth: 0, hashes: 0, missingSlot: 0,
+    resimMs: 0, maxTickMs: 0, lastTickMs: 0, fault: null,
+  };
+  var RB_WINDOW = 8;     // measured: see above. The HOST's value wins ('lsgo').
+  function rbFree() {
+    try {
+      if (RB.slots) RB.slots.forEach(function (p) { if (p) Module._gpx_free(p); });
+      if (Module._gpx_set_video_skip) Module._gpx_set_video_skip(0);
+    } catch (e) {}
+    RB.slots = null; RB.slotFrame = null;
+  }
+  function rbInit(ls) {
+    rbFree();
+    RB.size = Module._gpx_state_size() >>> 0;
+    RB.n = (ls.rollback | 0) + 4;
+    RB.slots = []; RB.slotFrame = [];
+    for (var i = 0; i < RB.n; i++) {
+      var p = Module._gpx_alloc(RB.size);
+      if (!p) { RB.fault = 'out of memory for the rollback ring'; return false; }
+      // zeroed, so the bytes past the serialized content are identical on
+      // every console and the fingerprint over the whole slot is well defined
+      Module.HEAPU8.fill(0, p, p + RB.size);
+      RB.slots.push(p); RB.slotFrame.push(-1);
+    }
+    if (Module._gpx_set_fast_savestates) Module._gpx_set_fast_savestates(1);
+    // the start of the room's frame 0: this core has run nothing yet
+    var s0 = ls.frame % RB.n;
+    if (!Module._gpx_state_save(RB.slots[s0], RB.size)) { RB.fault = 'gpx_state_save refused'; return false; }
+    RB.slotFrame[s0] = ls.frame;
+    return true;
+  }
+  function rbSlot(k) {
+    var i = k % RB.n;
+    return RB.slotFrame[i] === k ? RB.slots[i] : 0;
+  }
+  function rbStep(k, image, pb, ports) {
+    var src = rbSlot(k);
+    if (!src) return false;
+    Module._gpx_state_load(src, RB.size);
+    for (var p = 0; p < ports; p++) Module._gpx_set_pad(p, (image[p * pb] | (image[p * pb + 1] << 8)) & 0xffff);
+    Module._gpx_run();
+    var j = (k + 1) % RB.n;
+    RB.slotFrame[j] = -1;
+    if (!Module._gpx_state_save(RB.slots[j], RB.size)) return false;
+    RB.slotFrame[j] = k + 1;
+    return true;
+  }
+  function rbHash(ptr) {
+    var words = RB.size >>> 2, h = 0x811c9dc5;
+    var u32 = new Uint32Array(Module.HEAPU8.buffer, ptr, words);
+    for (var i = 0; i < words; i++) { h ^= u32[i]; h = Math.imul(h, 16777619) >>> 0; }
+    var u8 = new Uint8Array(Module.HEAPU8.buffer, ptr, RB.size);
+    for (var b = words << 2; b < RB.size; b++) { h ^= u8[b]; h = Math.imul(h, 16777619) >>> 0; }
+    return h >>> 0;
+  }
+  function rbRunFrame(ls, r) {
+    var t0 = performance.now();
+    if (!RB.slots && !rbInit(ls)) {
+      LS.fault = 'rollback could not start: ' + RB.fault;
+      try { ls.fail(LS.fault); } catch (e) {}
+      return false;
+    }
+    var pb = ls.padBytes | 0, ports = ls.portCount | 0;
+    if (r.rollback) {
+      // RE-SIMULATE, NOT PRESENTED: video conversion off, audio rewound after.
+      var ta = performance.now();
+      var w0 = Module._gpx_audio_wpos ? Module._gpx_audio_wpos() : null;
+      if (Module._gpx_set_video_skip) Module._gpx_set_video_skip(1);
+      var okAll = true;
+      for (var i = 0; i < r.rollback.frames.length; i++) {
+        var fr = r.rollback.frames[i];
+        if (!rbStep(fr.frame, fr.image, pb, ports)) { okAll = false; break; }
+      }
+      if (Module._gpx_set_video_skip) Module._gpx_set_video_skip(0);
+      if (w0 != null) Module._gpx_audio_rewind(w0);
+      if (!okAll) {
+        RB.missingSlot++;
+        LS.fault = 'rollback to frame ' + r.rollback.from + ' found no savestate for it';
+        try { ls.fail(LS.fault); } catch (e) {}
+        return false;
+      }
+      RB.rollbacks++; RB.resimFrames += r.rollback.frames.length;
+      if (r.rollback.depth > RB.maxDepth) RB.maxDepth = r.rollback.depth;
+      RB.resimMs += performance.now() - ta;
+    }
+    if (!rbStep(r.frame, r.image, pb, ports)) {
+      RB.missingSlot++;
+      LS.fault = 'no savestate for frame ' + r.frame;
+      try { ls.fail(LS.fault); } catch (e) {}
+      return false;
+    }
+    guestFrames++; window.__genFrames++; LS.frames++;
+    window.__genLsImage = Array.prototype.slice.call(r.image.subarray(0, ports * pb));
+    ls.endFrame(null);
+    // FINGERPRINTS OF CONFIRMED FRAMES ONLY: the state after k is slot k+1.
+    var due = ls.takeHashDue();
+    for (var d = 0; d < due.length; d++) {
+      var after = rbSlot(due[d] + 1);
+      if (!after) { RB.missingSlot++; continue; }
+      ls.submitHash(due[d], rbHash(after));
+      LS.hashes++; RB.hashes++;
+    }
+    latWitness(ls, r);
+    var dt = performance.now() - t0;
+    RB.lastTickMs = dt; if (dt > RB.maxTickMs) RB.maxTickMs = dt;
+    return true;
+  }
+
+  // ---- LOCAL INPUT LATENCY, AS A PLAYER FEELS IT (test witness) ----------
+  // When this console's pad changes, note the engine frame that is NEXT to run
+  // and the time; when a frame that ran carries the new pad at this console's
+  // port, the difference is the local input lag in frames (and ms). Lockstep
+  // reads `delay` (+1 if the change landed after that frame's first attempt);
+  // rollback reads 0.
+  var LAT = { pending: null, last: -1, samples: [], overlapped: 0 };
+  function latSample(ls, mask) {
+    if (mask === LAT.last) return;
+    LAT.last = mask;
+    if (!ls || !LS.running) return;
+    // A change that lands while the previous one is still in flight is not
+    // measurable (a release of a press that never reached a frame reads as 0
+    // lag against the old image), so it is counted and left out.
+    var over = !!LAT.pending;
+    if (over) LAT.overlapped++;
+    LAT.pending = { mask: mask, frame: ls.frame | 0, t: performance.now(), overlap: over };
+  }
+  function latWitness(ls, r) {
+    var P = LAT.pending;
+    if (!P || !ls.localPorts || !ls.localPorts.length) return;
+    var port = ls.localPorts[0], pb = ls.padBytes | 0;
+    var m = (r.image[port * pb] | (r.image[port * pb + 1] << 8)) & 0xffff;
+    if (m !== P.mask) return;
+    if (!P.overlap) LAT.samples.push({ frames: r.frame - P.frame, ms: +(performance.now() - P.t).toFixed(2), mask: m });
+    if (LAT.samples.length > 200) LAT.samples.shift();
+    LAT.pending = null;
   }
 
   function runFrame() {
@@ -1474,6 +1651,16 @@
     gameIdx: -1,        // the ROMS[] index the room agreed on; the auto-start loads THIS
     startedAtFrame: 0,  // the engine frame at which this core's gate first engaged
     tick: 0,            // the 500 ms party tick, alive only inside a room
+    // ROLLBACK — THE DEFAULT (&rb=0 opts a host back into delay lockstep).
+    // What THIS console proposes if it HOSTS; a guest adopts whatever the
+    // host's 'lsgo' says, so a mixed pair is impossible. Made the default after
+    // tools/genesis_rollback_test.mjs proved it two-tab: 0 frames of local lag
+    // (lockstep: 3-4), no desync over 18,060 frames at 100 ms one-way, 1.000x.
+    rbWant: (function () { try { return new URLSearchParams(location.search).get('rb') !== '0'; } catch (e) { return true; } })(),
+    // TEST SEAM (&nplag=MS): hold every incoming frame-input message MS ms
+    // before the engine sees it — an injected one-way network delay for the
+    // two-tab rigs, whose loopback wire is ~1 ms. Never set by the product.
+    lagMs: (function () { try { return Math.max(0, +(new URLSearchParams(location.search).get('nplag') || 0) | 0); } catch (e) { return 0; } })(),
   };
 
   // ⚠ THE DEFAULT MUST BE 'peerjs', NOT lib/netplay.js's 'local'. `local`
@@ -1797,6 +1984,12 @@
       rows.push('<span class="warn">party · ' + netPartyState()
         + (netAlone() ? ' — waiting for another player' : NET.loading ? ' — loading the game' : ' — the game loads by itself') + '</span>');
     } else {
+      if (ls.rollback) {
+        var rr = ls.rollbackReport();
+        rows.push('<span class="mode">ROLLBACK</span> frame ' + ls.frame
+          + ' · input delay 0 · window ' + rr.window + ' · confirmed ' + rr.confirmedFrame);
+        rows.push('rollbacks ' + RB.rollbacks + ' · re-simulated ' + RB.resimFrames + ' (max depth ' + RB.maxDepth + ')');
+      } else
       rows.push('<span class="mode">LOCKSTEP</span> frame ' + ls.frame
         + ' · delay ' + ls.delay + ' (' + Math.round(ls.delay * FRAME_MS) + ' ms)');
       rows.push('ports ' + ls.portCount + ' · mine ' + JSON.stringify(ls.localPorts)
@@ -1845,7 +2038,16 @@
     // so two bytes carry it exactly and the per-frame image is 4 bytes rather
     // than 256.
     try {
-      session.startLockstep({ portCount: GEN_PORTS, padBytes: LS_PAD_BYTES, hashEvery: LS.hashEvery });
+      var eng = session.startLockstep({ portCount: GEN_PORTS, padBytes: LS_PAD_BYTES, hashEvery: LS.hashEvery,
+                                        rollback: NET.rbWant ? RB_WINDOW : 0 });
+      if (NET.lagMs > 0 && eng) {
+        var rx = eng.receive.bind(eng);
+        eng.receive = function (m) {
+          if (m && m.t === 'ls') { setTimeout(function () { rx(m); }, NET.lagMs); return true; }
+          return rx(m);
+        };
+        pageLog('[net] TEST: incoming frame inputs held ' + NET.lagMs + ' ms (injected one-way delay)');
+      }
     } catch (e) {
       pageLog('[lockstep] ⚠ startLockstep failed: ' + ((e && e.message) || e));
     }
@@ -2088,7 +2290,19 @@
       // carried no ?np=, so a rig can see what the page PARSED, not only what it
       // did about it.
       handoff: NET.handoff,
-      mode: 'lockstep',            // there is no other mode on this page
+      // 'lockstep' or 'rollback' — decided by the HOST's 'lsgo', read off the engine.
+      mode: (ls && ls.rollback) ? 'rollback' : 'lockstep',
+      rbWant: NET.rbWant,
+      lagMs: NET.lagMs,
+      rollback: (ls && ls.rollback) ? {
+        engine: ls.rollbackReport(),
+        page: { rollbacks: RB.rollbacks, resimFrames: RB.resimFrames, maxDepth: RB.maxDepth, hashes: RB.hashes,
+                missingSlot: RB.missingSlot, resimMs: +RB.resimMs.toFixed(1), maxTickMs: +RB.maxTickMs.toFixed(2),
+                fault: RB.fault, slots: RB.n },
+      } : null,
+      // Local input lag samples: { frames, ms } per pad change (see latWitness).
+      latency: LAT.samples.slice(),
+      latencyOverlapped: LAT.overlapped,
       // ⚠ `live` MEANS "THE EMULATOR IS ACTUALLY PRODUCING FRAMES", and it is
       // not netplay state at all. tools/mobile_chrome_test.mjs uses it as the
       // witness that arms its orientation cell — without it that cell VOIDs and
@@ -2136,7 +2350,7 @@
   // absolute literal URLs it can see statically, so a concatenated one is
   // reported UNCHECKED — which is how two runtime assets stayed 404 on the live
   // site while being present in git.
-  s.src = '/genesis/genesisWasm/dist/genesis_plus_gx.js';
+  s.src = '/genesis/genesisWasm/dist/genesis_plus_gx.js?v=66b69161';
   s.onerror = function () {
     setStatus('Core failed to load.');
     // ⚠ THE PATH GOES TO THE LOG, NOT TO THE PLAYER. This read

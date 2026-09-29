@@ -1,0 +1,346 @@
+// run_image_node.mjs — drive the WHOLE-IMAGE SAB boot (build_image.sh) under NODE.
+//
+// sr_image_probe.mjs drives the same module in a real browser and stays the acceptance
+// instrument for "does it instantiate IN A BROWSER".  This file answers the other
+// question — "how far does the guest's own __start get?" — without a browser, so it
+// needs no Chromium, no page, no server and no probe lock.  Both run the SAME wasm when
+// the image is linked with SR_ENV=web,worker,node (one md5, two hosts).
+//
+// THE STAGING IS NOT RE-TYPED HERE.  Every cited low-memory value lives in
+// ../sr_image/sr_boot_stage.js (OS_GLOBALS / EXC_VECTORS / bindImage / summarize /
+// readDev).  That file is an ES module with a .js extension and no package.json
+// "type", so Node would load it as CommonJS; it has no imports, so it is loaded
+// verbatim through a data: URL instead.  One copy of the tables, not three.
+//
+//   SR_IMG=<dir with sab_image.mjs + sab_image.wasm + sab_main.dol [+ sab_fst.bin]> \
+//   node gamecube/recomp/sr/run_image_node.mjs
+//
+// env (every switch is RUN-TIME, so each control arm is the same binary / same md5):
+//   SRN_EXI=0 / SRN_DSP=0     turn ONE device model off
+//   SRN_AR=0 SRN_RM=0 SRN_IRQ=0 SRN_PIREV=0 SRN_VI=0 SRN_AI=0 SRN_UCODE=0 SRN_AID=0 SRN_AXCMD=0 SRN_DI=0   the 2026-09-29 models (sr_image_set_model)
+//   SRN_OSMODE=<n>            sr_os_mode() after init (3 = IRQ default, 4 = CTX)
+//   SRN_WATCHDOG=<n>          device READS before the watchdog throws (default 3000000)
+//   SRN_STRICT=1              first unimplemented host boundary throws
+//   SRN_OUT=<path>            JSON result (default /tmp/sr-image-node.json)
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const DIR = path.resolve(process.env.SR_IMG || path.join(HERE, '../sr_image'));
+const OUT = process.env.SRN_OUT || '/tmp/sr-image-node.json';
+const env = (k, d) => (process.env[k] === undefined || process.env[k] === '' ? d : process.env[k]);
+
+const stageSrc = fs.readFileSync(path.join(HERE, '../sr_image/sr_boot_stage.js'), 'utf8');
+const S = await import('data:text/javascript;base64,' + Buffer.from(stageSrc).toString('base64'));
+
+const hex = (v) => '0x' + (v >>> 0).toString(16);
+const md5 = (f) => crypto.createHash('md5').update(fs.readFileSync(f)).digest('hex');
+const wasmPath = path.join(DIR, 'sab_image.wasm');
+const md5Before = md5(wasmPath);
+
+const factory = (await import(pathToFileURL(path.join(DIR, 'sab_image.mjs')).href)).default;
+const M = await factory();
+const opt = (name) => (typeof M[name] === 'function' ? M[name] : null);
+const api = S.bindImage(M, {
+  setDspModel: '_sr_image_set_dsp_model', dspEvents: '_sr_image_dsp_events',
+  aramBytes: '_sr_image_aram_bytes',
+});
+if (!api.init()) throw new Error('sr_image_init() returned 0');
+
+api.setExiModel(+env('SRN_EXI', 1));
+api.setDspModel(+env('SRN_DSP', 1));
+// Later device models are optional exports: a binary that predates them simply lacks
+// the switch, and the result records that rather than pretending the arm was set.
+const arms = { exi: +env('SRN_EXI', 1), dsp: +env('SRN_DSP', 1) };
+// sr_image_set_model(id, on): the [2026-09-29] models (sr_image.c "THE NEXT DEVICES").
+// A binary that predates them lacks the export, and the result records 'absent' rather
+// than pretending the arm was set.
+const MODELS = { AR: 1, RM: 2, IRQ: 3, PIREV: 4, VI: 5, AI: 6, UCODE: 7, AID: 8, AXCMD: 9, DI: 10, PE: 11 };
+const setModel = opt('_sr_image_set_model'), getModel = opt('_sr_image_get_model');
+for (const [k, id] of Object.entries(MODELS)) {
+  if (!setModel) { arms[k.toLowerCase()] = 'absent'; continue; }
+  setModel(id, +env('SRN_' + k, 1));
+  arms[k.toLowerCase()] = getModel(id);
+}
+api.setWatchdog(+env('SRN_WATCHDOG', 3000000) >>> 0);
+// SRN_BUDGET=<M guest cycles>: bound the run by GUEST time (sr_image_set_budget_mcycles).
+// Default 4860 = 10 s of Gekko time.  0 = unbounded.
+if (opt('_sr_image_set_budget_mcycles')) M._sr_image_set_budget_mcycles(+env('SRN_BUDGET', 4860) >>> 0);
+// SRN_HLE=<n>: SR_OS_HLE with n host threads (needs a SR_PTHREAD=1 build).
+if (process.env.SRN_HLE) {
+  if (!opt('_sr_image_init_hle')) throw new Error('SRN_HLE set but this binary was not linked SR_PTHREAD=1');
+  // The timeout FIRST: the pool threads park inside sr_os_init with whatever it is then.
+  M._sr_os_set_timeout(+env('SRN_PARK_MS', 600000));
+  M._sr_image_init_hle(+process.env.SRN_HLE);
+}
+api.setStrict(+env('SRN_STRICT', 0));
+if (process.env.SRN_OSMODE) api.osMode(+process.env.SRN_OSMODE);
+// Thread events only (10..17) plus DEC_EXC (27): see sr_host_os.c g_trace_mask.
+if (opt('_sr_os_trace_mask')) M._sr_os_trace_mask(+env('SRN_TRACE_MASK', 0x0803FC00), 0);
+// SRN_PAST_FAULT=1: keep delivering interrupts after the first fault — EXPLORATORY ONLY.
+if (opt('_sr_image_set_past_fault')) M._sr_image_set_past_fault(+env('SRN_PAST_FAULT', 0));
+// Every fault in order (the first is g_fault; later ones are recorded by the image, if any).
+
+
+// ---- staging: identical order to sr_boot_stage.js stageBoot()
+const dol = fs.readFileSync(path.join(DIR, 'sab_main.dol'));
+const p = M._malloc(dol.length);
+M.HEAPU8.set(dol, p);
+const copied = api.loadDol(p, dol.length);
+M._free(p);
+if (copied >>> 24 === 0xC6) throw new Error('sr_image_load_dol failed: 0x' + (copied >>> 0).toString(16));
+let fst = { staged: false, why: 'no sab_fst.bin' };
+const fstPath = path.join(DIR, 'sab_fst.bin');
+if (fs.existsSync(fstPath)) fst = S.stageFst(M, api, new Uint8Array(fs.readFileSync(fstPath)));
+for (const [ea, v] of S.OS_GLOBALS) api.setGlobal(ea >>> 0, v >>> 0);
+for (const ea of S.EXC_VECTORS) api.setGlobal(ea >>> 0, S.PPC_RFI);
+// THE APPLOADER'S WRITES — [2026-09-29], SRN_APPLOADER (default 1; 0 = the old staging).
+// sr_boot_stage.js stages arenaHi = 0 (OSInit then falls back to __ArenaHi 0x81700000) and puts
+// the FST at 0x803EDE20 with OS_DVD_BI2 = 0.  The disc's own apploader (ISO 0x2460, loaded at
+// 0x81200000, 2001/11/14), read instruction by instruction, does this instead — every input
+// below is read from the ISO, nothing is typed in:
+//   0x81200498-0x812004c4  read bi2 (disc 0x440) header: debug-monitor size, simulated memsize
+//   0x812004c8-0x812004f4  *0xE8 = bi2[0]; *0xF0 = bi2[4]; *0xEC = (0x80000000 + *0x28 - *0xE8) & ~31
+//   0x81200540-0x81200550  if *0xF0 == 0: *0xF0 = *0x28 (24 MB)
+//   0x81200554-0x812005c8  FST address = (*0xEC - hdr[0x42C]) & ~31  (the *0xF0 == *0x28 arm)
+//   0x812005ec-0x81200624  *0xF4 = FST - 0x2000; read bi2 (disc 0x440, 0x2000 bytes) there
+//   0x81200660-0x8120067c  read the FST (disc hdr[0x424], (hdr[0x428]+31)&~31 bytes) to FST address
+//   0x81200b98-0x81200bd0  *0x20 = 0x0D15EA5E; *0x24 = 1; *0x30 = 0; *0x34 = *0x38 = FST; *0x3C = hdr[0x42C]
+// ⚠ An earlier version of this block (commit a2b1be6) took the FST address from hdr[0x430]
+// (0x803EDE20), which is what sr_boot_stage.js also uses.  That field is NOT what the apploader
+// reads for this: the FST lands at 0x817EDE20, at the top of MEM1, and OS_DVD_BI2 is non-zero.
+const appArm = +env('SRN_APPLOADER', 1);
+let apploader = null;
+if (appArm) {
+  if (!process.env.SRN_ISO) throw new Error('SRN_APPLOADER=1 needs SRN_ISO=<path to the SAB ISO>');
+  const fd = fs.openSync(process.env.SRN_ISO, 'r'), hdr = Buffer.alloc(0x20), bi2 = Buffer.alloc(0x2000);
+  fs.readSync(fd, hdr, 0, 0x20, 0x420);
+  fs.readSync(fd, bi2, 0, 0x2000, 0x440);
+  const fstOff = hdr.readUInt32BE(4), fstSize = hdr.readUInt32BE(8), fstMax = hdr.readUInt32BE(12);
+  const physSize = 0x01800000;                           // *0x80000028, staged from OS_GLOBALS
+  const e8 = bi2.readUInt32BE(0);
+  let f0 = bi2.readUInt32BE(4);
+  const ec = ((0x80000000 + physSize - e8) & ~31) >>> 0;
+  if (f0 === 0) f0 = physSize;
+  if (f0 !== physSize) throw new Error('apploader arm: simulated memsize != physical — branch not transcribed');
+  const fstAddr = ((ec - fstMax) & ~31) >>> 0, bi2Addr = (fstAddr - 0x2000) >>> 0;
+  const len = (fstSize + 31) & ~31, fst = Buffer.alloc(len);
+  fs.readSync(fd, fst, 0, len, fstOff); fs.closeSync(fd);
+  M.HEAPU8.set(fst, api.ram() + (fstAddr & 0x01FFFFFF));
+  M.HEAPU8.set(bi2, api.ram() + (bi2Addr & 0x01FFFFFF));
+  api.setGlobal(0x800000E8, e8); api.setGlobal(0x800000EC, ec); api.setGlobal(0x800000F0, f0);
+  api.setGlobal(0x800000F4, bi2Addr);
+  api.setGlobal(0x80000020, 0x0D15EA5E); api.setGlobal(0x80000024, 1);
+  api.setGlobal(0x80000030, 0); api.setGlobal(0x80000034, fstAddr);
+  api.setGlobal(0x80000038, fstAddr); api.setGlobal(0x8000003C, fstMax >>> 0);
+  apploader = { fstAddr: hex(fstAddr), bi2Addr: hex(bi2Addr), fstLen: len, arenaHi: hex(fstAddr), ec: hex(ec), f0: hex(f0),
+                bi2DebugFlag: hex(bi2.readUInt32BE(0xC)) };
+}
+// The DI model's disc (SR_NODEFS=1 builds): the path is handed to C, which opens it with stdio.
+let disc = null;
+if (opt('_sr_image_set_disc') && process.env.SRN_ISO) {
+  const b = Buffer.from(path.resolve(process.env.SRN_ISO) + '\0');
+  const p2 = M._malloc(b.length); M.HEAPU8.set(b, p2);
+  disc = M._sr_image_set_disc(p2) ? 'open' : 'FAILED'; M._free(p2);
+}
+
+// SRN_WATCH=<ea>[:<step cycles>] — the first change of one guest word (sr_image_set_watch).
+if (process.env.SRN_WATCH && opt('_sr_image_set_watch')) {
+  const [wa, ws, wv] = process.env.SRN_WATCH.split(':');
+  M._sr_image_set_watch(parseInt(wa, 16) >>> 0, +(ws || 1000));
+  if (wv !== undefined) M._sr_image_set_watch_cond(parseInt(wv, 16) >>> 0);
+}
+// SRN_GX=<file> — arm sr_gx.c's FIFO capture (run-time arm) and write the captured GP stream.
+if (process.env.SRN_GX && opt('_sr_gx_set_capture')) M._sr_gx_set_capture(1);
+// SRN_OV=0|1|2 — overlay arm (sr_image_set_ov): off / guarded (default) / guard poisoned.
+if (process.env.SRN_OV !== undefined && opt('_sr_image_set_ov')) M._sr_image_set_ov(+process.env.SRN_OV >>> 0);
+// SRN_WATCH_E0=1 — capture the same snapshot at the first DI RequestError (0xE0) command.
+if (process.env.SRN_WATCH_E0 && opt('_sr_image_set_watch_e0')) M._sr_image_set_watch_e0(1);
+const t0 = performance.now();
+let ret = null, threw = null;
+try { ret = api.boot() >>> 0; } catch (err) { threw = String(err && err.message || err); }
+const ms = performance.now() - t0;
+
+const gb = api.state() >>> 2, H = M.HEAPU32;
+// GekkoState: gpr[32] | ps0[32] u64 | ps1[32] u64 | cr xer lr ctr fpscr gqr[8] pc
+const tail = gb + 32 + 64 * 2;
+const regs = { r1: hex(H[gb + 1]), r3: hex(H[gb + 3]), r4: hex(H[gb + 4]), r31: hex(H[gb + 31]),
+               cr: hex(H[tail]), lr: hex(H[tail + 2]), ctr: hex(H[tail + 3]) };
+// The GUEST call stack at the stop, read from the PowerPC EABI back chain: [r1] is the
+// caller's r1 and [backchain + 4] is the LR its callee saved.  No PC exists in this image,
+// so this is the only way to see WHERE a wedged guest is beyond the boundary log.
+const rd32 = (ea) => { const b = api.ram() + (ea & 0x01FFFFFF), U = M.HEAPU8;
+  return ((U[b] << 24) | (U[b + 1] << 16) | (U[b + 2] << 8) | U[b + 3]) >>> 0; };
+const backtrace = [];
+for (let sp = H[gb + 1] >>> 0, i = 0; i < 24 && sp >= 0x80000000 && sp < 0x81800000; i++) {
+  const next = rd32(sp); if (next <= sp) break;
+  backtrace.push(hex(rd32(next + 4))); sp = next;
+}
+const tailRing = [];
+if (opt('_sr_image_tail')) {
+  const tn = M._sr_image_tail_n() >>> 0, tb = M._sr_image_tail() >>> 2;
+  for (let k = Math.max(0, tn - 64); k < tn; k++) {
+    const i = tb + (k % 64) * 4;
+    tailRing.push(`${hex(H[i])} lr=${hex(H[i + 1])} msr=${hex(H[i + 2])} th=${hex(H[i + 3])}`);
+  }
+}
+// sr_host_os.c's event trace (the FIRST 4,096 events): thread hand-offs, starts, resumes.
+const osTrace = [];
+if (opt('_sr_os_trace')) {
+  const tn = M._sr_os_trace_n() >>> 0, tb = M._sr_os_trace() >>> 2;
+  const EV = {10:'SELECT_ENTER',11:'SELECT_SAVE',12:'HANDOFF',13:'START_THREAD',14:'RESUMED',15:'SELECT_RETURN',16:'THREAD_ENTRY',17:'THREAD_EXIT',27:'DEC_EXC'};
+  for (let k = 0; k < tn; k++) {
+    const ev = H[tb + 3 * k];
+    if (EV[ev]) osTrace.push(`${EV[ev]} ${hex(H[tb + 3 * k + 1])} ${hex(H[tb + 3 * k + 2])}`);
+  }
+}
+// Every guest thread on __OSActiveThreadQueue (0x800000DC head, linkActive at +0x2FC;
+// dolsdk2001 include/dolphin/os/OSThread.h + OSThread.c), with its saved PC/LR/r1 and the
+// back chain from its saved r1 — where each thread is PARKED when the run stops.
+const threads = [];
+for (let t = rd32(0x800000DC), n = 0; t && n < 32; t = rd32(t + 0x2FC), n++) {
+  const bt = [];
+  for (let sp = rd32(t + 4), i = 0; i < 12 && sp >= 0x80000000 && sp < 0x81800000; i++) {
+    const next = rd32(sp); if (next <= sp) break; bt.push(hex(rd32(next + 4))); sp = next;
+  }
+  threads.push({ thread: hex(t), state: rd32(t + 0x2C8) >>> 16, prio: rd32(t + 0x2D0),
+                 srr0: hex(rd32(t + 0x198)), lr: hex(rd32(t + 0x84)), r1: hex(rd32(t + 4)), bt });
+}
+// The thread that was RUNNING when the guest-time budget ran out, with its registers.
+let atBudget = null;
+if (opt('_sr_image_budget_thread') && H[(M._sr_image_budget_state() >>> 2) + 1]) {
+  const b = M._sr_image_budget_state() >>> 2, bt2 = [];
+  for (let sp = H[b + 1] >>> 0, i = 0; i < 16 && sp >= 0x80000000 && sp < 0x81800000; i++) {
+    const next = rd32(sp); if (next <= sp) break; bt2.push(hex(rd32(next + 4))); sp = next;
+  }
+  atBudget = { thread: hex(M._sr_image_budget_thread()), lr: hex(H[b + 32 + 128 + 2]),
+               r1: hex(H[b + 1]), r3: hex(H[b + 3]), bt: bt2, threads: [],
+               runQueueBits: opt('_sr_image_budget_runq') ? hex(M._sr_image_budget_runq()) : null };
+  if (opt('_sr_image_budget_threads')) {
+    const tb = M._sr_image_budget_threads() >>> 2;
+    for (let k = 0; k < (M._sr_image_budget_threads_n() >>> 0); k++) {
+      const r = (j) => H[tb + 6 * k + j] >>> 0, bt3 = [];
+      for (let sp = r(5), i = 0; i < 10 && sp >= 0x80000000 && sp < 0x81800000; i++) {
+        const next = rd32(sp); if (next <= sp) break; bt3.push(hex(rd32(next + 4))); sp = next;
+      }
+      atBudget.threads.push({ thread: hex(r(0)), state: r(1), prio: r(2), srr0: hex(r(3)), lr: hex(r(4)), r1: hex(r(5)), bt: bt3 });
+    }
+  }
+}
+// Back chain from r1 AT an indirect-call fault (sr_driver.c records it): where the bad call was made from.
+const faultBt = [];
+if (opt('_sr_image_indirect_fault_r1') && M._sr_image_indirect_fault_r1()) {
+  for (let sp = M._sr_image_indirect_fault_r1() >>> 0, i = 0; i < 16 && sp >= 0x80000000 && sp < 0x81800000; i++) {
+    const next = rd32(sp); if (next <= sp) break; faultBt.push(hex(rd32(next + 4))); sp = next;
+  }
+}
+let watch = null;
+if (opt('_sr_image_watch_hit') && M._sr_image_watch_hit()) {
+  const b = M._sr_image_watch_state() >>> 2, wbt = [];
+  for (let sp = H[b + 1] >>> 0, i = 0; i < 16 && sp >= 0x80000000 && sp < 0x81800000; i++) {
+    const next = rd32(sp); if (next <= sp) break; wbt.push(hex(rd32(next + 4)) + '@' + hex(next)); sp = next;
+  }
+  const rstr = (a) => { let t = ''; for (let i = 0; i < 64; i++) { const c = M.HEAPU8[api.ram() + ((a + i) & 0x01FFFFFF)]; if (!c) break; t += String.fromCharCode(c); } return t; };
+  // printable runs in the 4 KB stack snapshot taken at the hit (paths built on the stack)
+  const sb = M._sr_image_watch_stack(), strs = [];
+  for (let i = 0, cur = ''; i < 4096; i++) { const c = M.HEAPU8[sb + i];
+    if (c >= 32 && c < 127) cur += String.fromCharCode(c); else { if (cur.length >= 5) strs.push(hex(H[b + 1] + i - cur.length) + ':' + cur); cur = ''; } }
+  const sw = (ea) => { const o = (ea - H[b + 1]) >>> 0; if (o + 4 > 4096) return null;
+    return hex(((M.HEAPU8[sb + o] << 24) | (M.HEAPU8[sb + o + 1] << 16) | (M.HEAPU8[sb + o + 2] << 8) | M.HEAPU8[sb + o + 3]) >>> 0); };
+  const words = (process.env.SRN_WATCH_WORDS || '').split(',').filter(Boolean).map((x) => [x, sw(parseInt(x, 16) >>> 0)]);
+  watch = { words, stackStrings: strs, str: (process.env.SRN_WATCH_STR || '').split(',').filter(Boolean).map((x) => { const [f, o] = x.split('+'); const fr = wbt.map((e) => e.split('@')).find((e) => e[0] === f); return fr ? rstr(rd32(parseInt(fr[1], 16) + (+o))) : null; }), atKcycles: M._sr_image_watch_kcyc(), newValue: hex(M._sr_image_watch_new()),
+            thread: hex(M._sr_image_watch_thread()), lr: hex(H[b + 32 + 128 + 2]),
+            r3: hex(H[b + 3]), r4: hex(H[b + 4]), r5: hex(H[b + 5]), gpr: Array.from({ length: 32 }, (_, i) => hex(H[b + i])), bt: wbt };
+}
+const ring = [];
+if (opt('_sr_os_ring')) {
+  const EVN = {10:'ENTER',11:'SAVE',12:'HANDOFF',13:'START',14:'RESUMED',15:'RETURN',16:'ENTRY',17:'EXIT',30:'IRQ_ENTER',31:'IRQ_RETURN',32:'IRQ_RESUME',33:'RESUME_CTX_R3'};
+  const rn = M._sr_os_ring_n() >>> 0, rb = M._sr_os_ring() >>> 2;
+  for (let k = Math.max(0, rn - 256); k < rn; k++) { const i = rb + (k % 256) * 4;
+    ring.push(`s${H[i + 3] | 0} ${EVN[H[i]]} ${hex(H[i + 1])} ${hex(H[i + 2])}`); }
+}
+const diLog = [];
+if (opt('_sr_image_di_log')) {
+  const b = M._sr_image_di_log() >>> 2;
+  for (let k = 0; k < Math.min(64, M._sr_image_di_cmds() >>> 0); k++)
+    diLog.push([0, 1, 2, 3, 4].map((j) => hex(H[b + 8 * k + j])).join(' ') + ` @${H[b + 8 * k + 5]}k int=${H[b + 8 * k + 6]} state=${H[b + 8 * k + 7]}`);
+}
+const diTrace = [];
+if (opt('_sr_image_di_trace')) {
+  const b = M._sr_image_di_trace() >>> 2, n = M._sr_image_di_trace_n() >>> 0;
+  for (let i = Math.max(0, n - 256); i < n; i++) { const o = b + 3 * (i & 255);
+    diTrace.push(`@${H[o]}k ${['rd', 'wr', 'raise'][H[o + 1]]} ${hex(H[o + 2])}`); }
+}
+regs.msr = opt('_sr_os_get_msr') ? hex(M._sr_os_get_msr()) : null;
+regs.curThread = hex(rd32(0x800000E4));
+const log = S.summarize(S.readLog(M, api));
+const n = api.devLogN(), dbase = api.devLogPtr() >>> 2, first = [];
+for (let i = 0; i < n; i++) first.push([hex(H[dbase + 2 * i]), H[dbase + 2 * i + 1]]);
+const extra = {};
+for (const [k, fn] of [['dspEvents', '_sr_image_dsp_events'], ['aramBytes', '_sr_image_aram_bytes'],
+                       ['irqDelivered', '_sr_image_irq_delivered'], ['decDelivered', '_sr_image_dec_delivered'],
+                       ['irqLast', '_sr_image_irq_last'], ['piCause', '_sr_image_pi_cause'],
+                       ['piMask', '_sr_image_pi_mask'], ['viFrames', '_sr_image_vi_frames'],
+                       ['ucodeCrc', '_sr_image_ucode_crc'], ['axLists', '_sr_ax_lists'], ['axPBs', '_sr_ax_pbs'], ['axVoices', '_sr_ax_voices'], ['axUnknownCmds', '_sr_ax_unknown_cmds'], ['ucode', '_sr_image_ucode'], ['axCmdlist', '_sr_image_ax_cmdlist'],
+                       ['indirectFaultLr', '_sr_image_indirect_fault_lr'], ['indirectFaultTarget', '_sr_image_indirect_fault_target'], ['diCmds', '_sr_image_di_cmds'], ['diBytes', '_sr_image_di_bytes'], ['tbCalls', '_sr_tb_calls'], ['idleSkips', '_sr_image_idle_skips'], ['recycled', '_sr_os_recycled'], ['ovEntries', '_sr_image_ov_entries'], ['gpCmds', '_sr_gp_cmds'], ['gpPrims', '_sr_gp_prims'], ['gpVerts', '_sr_gp_verts'], ['gpDLs', '_sr_gp_dls'], ['gpUnknown', '_sr_gp_unknown'], ['gpBadFmt', '_sr_gp_bad_fmt'], ['peFinishes', '_sr_image_pe_finishes'], ['peTokens', '_sr_image_pe_tokens'], ['drawDoneBP', '_sr_image_pe_drawdone_bp'], ['xfbCopies', '_sr_image_xfb_copies'], ['viFlips', '_sr_image_vi_flips'], ['ovRefused', '_sr_image_ov_refused'], ['idleMcycles', '_sr_image_idle_mcycles'], ['cyclesM', '_sr_image_cycles_m'],
+                       ['tbStalls', '_sr_tb_stalls'], ['decExc', '_sr_tb_dec_exceptions'],
+                       ['tbHi', '_sr_tb_hi'], ['tbLo', '_sr_tb_lo'], ['gxWrites', '_sr_gx_writes'],
+                       ['gxBytes', '_sr_gx_bytes']]) {
+  const f = opt(fn); if (f) extra[k] = f() >>> 0;
+}
+// SRN_PEEK=<ea>[:<n words>],...  read guest MEM1 words after the run (big-endian), so a
+// runtime table (e.g. the exception table the guest's own OSInit filled) is READ, not guessed.
+const peek = {};
+for (const spec of (process.env.SRN_PEEK || '').split(',').filter(Boolean)) {
+  const [eaS, nS] = spec.split(':'); const ea = parseInt(eaS, 16) >>> 0; const nw = +(nS || 1);
+  const words = [];
+  for (let i = 0; i < nw; i++) {
+    // 0xCC...... reads the device page sr_image.c keeps (gekko_rt.h:191-193 GK_HWREG_OFF =
+    // ram size + 256 KB L1 + 4 KB WPAR), i.e. the last value the device model left there.
+    const e = (ea + 4 * i) >>> 0;
+    const ph = (e >>> 24) === 0xCC ? 0x01800000 + 0x40000 + 0x1000 + (e - 0xCC000000) : e & 0x01FFFFFF;
+    const b = api.ram() + ph, U = M.HEAPU8;
+    words.push(hex(((U[b] << 24) | (U[b + 1] << 16) | (U[b + 2] << 8) | U[b + 3]) >>> 0));
+  }
+  peek[hex(ea)] = words;
+}
+if (getModel) for (const [k, id] of Object.entries(MODELS)) extra['ev_' + k] = M._sr_image_model_events(id) >>> 0;
+// THE FRAME LOOP IN GUEST TIME: (n-1) intervals between the first and last event, over the
+// guest seconds between them (486 MHz Gekko).  Not wall time — gate #9.
+const frameLoop = {};
+if (opt('_sr_image_frame_kcyc')) {
+  const k = (i) => M._sr_image_frame_kcyc(i) >>> 0;
+  const rate = (n, a, b) => (n > 1 && b > a) ? +((n - 1) / ((b - a) * 1000 / 486e6)).toFixed(3) : null;
+  frameLoop.xfbCopies = { n: M._sr_image_xfb_copies() >>> 0, firstK: k(0), lastK: k(1), perGuestSecond: rate(M._sr_image_xfb_copies() >>> 0, k(0), k(1)) };
+  frameLoop.peFinishes = { n: M._sr_image_pe_finishes() >>> 0, firstK: k(2), lastK: k(3), perGuestSecond: rate(M._sr_image_pe_finishes() >>> 0, k(2), k(3)) };
+  frameLoop.viFlips = { n: M._sr_image_vi_flips() >>> 0, firstK: k(4), lastK: k(5), perGuestSecond: rate(M._sr_image_vi_flips() >>> 0, k(4), k(5)) };
+}
+const result = {
+  frameLoop,
+  apploader, disc, diLog, diTrace, faultBt, watch, ring, peek, backtrace, tailRing, osTrace, threads, atBudget,
+  wasm: wasmPath, md5Before, md5After: md5(wasmPath), arms,
+  osMode: api.osGetMode(), fst, copied, ms, returned: ret === null ? null : hex(ret), threw,
+  fault: hex(api.fault()), regs,
+  devReads: api.devReads(), devWrites: api.devWrites(), exiClears: api.exiClears(),
+  distinctRegs: new Set(first.filter(([, k]) => k === 1 || k === 2).map(([a]) => a)).size,
+  devFirstTouch: first, extra,
+  logTotal: log.total, logDropped: log.dropped, logDistinct: log.distinct,
+  lastRuns: log.runs.slice(-40),
+};
+fs.writeFileSync(OUT, JSON.stringify(result, null, 1));
+if (process.env.SRN_GX && opt('_sr_gx_fifo_base'))
+  fs.writeFileSync(process.env.SRN_GX, M.HEAPU8.subarray(M._sr_gx_fifo_base(), M._sr_gx_fifo_base() + M._sr_gx_fifo_pos()));
+// SRN_DUMP=<file> — MEM1 as it stands at the stop (24 MB).  Used by rel_image.py to translate
+// an overlay from the bytes OSLink actually produced, never from the file's placeholders.
+if (process.env.SRN_DUMP) fs.writeFileSync(process.env.SRN_DUMP, M.HEAPU8.subarray(api.ram(), api.ram() + 0x01800000));
+const lastDev = first[first.length - 1];
+console.log(JSON.stringify({
+  md5: md5Before, md5Same: md5Before === result.md5After, arms, apploader, osMode: result.osMode, ms: Math.round(ms),
+  returned: result.returned, threw, fault: result.fault, regs,
+  devReads: result.devReads, devWrites: result.devWrites, distinctRegs: result.distinctRegs,
+  lastDev, peek, crossings: log.total, distinctCrossings: log.distinct.length, extra,
+  lastRuns: log.runs.slice(-8).map((r) => `${r.addr} ${r.disp} x${r.n}`),
+}, null, 1));
+console.log('full JSON ->', OUT);

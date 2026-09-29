@@ -197,6 +197,104 @@ def ends_block(w):
 
 
 RETIRE = False   # --retire; off by default so no existing artifact changes
+IDLE_SKIP = False  # --idle-skip; off by default so no existing artifact changes
+
+
+# ----------------------------------------------------------------------------- IDLE SKIP
+# [2026-09-29] Dolphin's busy-wait detector, transcribed (Core/PowerPC/PPCAnalyst.cpp:737-788
+# IsBusyWaitLoop, used at :943-944 for a branch back to its own block's start).  A loop that
+#   * branches back to its own start and contains no CTR branch,
+#   * contains only Integer and Load instructions (Dolphin OpType), i.e. writes no memory,
+#   * never overwrites a register it read before writing it in the same iteration,
+# cannot change guest state on its own: only an interrupt/event can end it.  The JIT then calls
+# CoreTiming::Idle (skip to the next scheduled event) on the taken back-edge
+# (Jit64/Jit_Branch.cpp:142/206/335).  Dolphin's block builder follows `bl` into a short callee
+# and inlines its `blr` (PPCAnalyst.cpp branch following / found_call), so a loop that calls a
+# pure getter (`bl VIGetRetraceCount` = `lwz r3,..; blr`) is covered — which is exactly SAB's
+# frame limiter at 0x80117e0c.  This returns (in_regs, out_regs) for an Integer/Load
+# instruction, or None when the instruction is any other type.
+_LOAD_D = {32: 0, 33: 1, 34: 0, 35: 1, 40: 0, 41: 1, 42: 0, 43: 1}        # op: update form?
+_LOAD_X = {23: 0, 55: 1, 87: 0, 119: 1, 279: 0, 311: 1, 343: 0, 375: 1}   # xo: update form?
+_INT_D_AD = {7, 8, 12, 13, 14, 15}           # mulli subfic addic addic. addi addis: rA -> rD
+_INT_D_SA = {24, 25, 26, 27, 28, 29}         # ori oris xori xoris andi. andis.: rS -> rA
+_INT_X_ABD = {266, 40, 8, 10, 235, 491, 459, 75, 11, 138, 136}   # rA,rB -> rD (OE bit masked)
+_INT_X_AD = {104, 202, 234, 200}                                 # rA -> rD
+_INT_X_SBA = {444, 28, 316, 124, 60, 412, 24, 536, 792, 476, 284}  # rS,rB -> rA
+_INT_X_SA = {824, 26, 954, 922}                                  # rS -> rA
+
+
+def int_or_load_regs(w):
+    f = F(w)
+    op, A, B, D = f['op'], f['rA'], f['rB'], f['rD']
+    ra = [A] if A else []
+    if op in _LOAD_D:
+        return (ra, [D] + ([A] if _LOAD_D[op] else []))
+    if op in _INT_D_AD:
+        return (ra if op in (14, 15) else [A], [D])
+    if op in (10, 11):
+        return ([A], [])
+    if op in _INT_D_SA or op == 21:
+        return ([D], [A])                    # rS is in the rD field
+    if op == 20:
+        return ([D, A], [A])
+    if op == 23:
+        return ([D, B], [A])
+    if op == 31:
+        xo = f['xo']
+        if xo in _LOAD_X:
+            return (ra + [B], [D] + ([A] if _LOAD_X[xo] else []))
+        if xo in (0, 32):
+            return ([A, B], [])
+        if (xo & 0x1FF) in _INT_X_ABD:
+            return ([A, B], [D])
+        if (xo & 0x1FF) in _INT_X_AD:
+            return ([A], [D])
+        if xo in _INT_X_SBA:
+            return ([D, B], [A])
+        if xo in _INT_X_SA:
+            return ([D], [A])
+    return None
+
+
+def busy_wait_loop(img, start, end, max_callee=16):
+    """True when [start, end] (end = the back-branch) is a Dolphin busy-wait loop."""
+    seq, pc = [], start
+    while pc < end:
+        w = img.word(pc)
+        if w is None:
+            return False
+        f = F(w)
+        if f['op'] == 18 and f['LK'] and not f['AA']:          # bl: inline a pure leaf
+            tgt = (pc + f['LI']) & 0xFFFFFFFF
+            for k in range(max_callee):
+                cw = img.word(tgt + 4 * k)
+                if cw is None:
+                    return False
+                if cw == 0x4E800020:                          # blr
+                    break
+                seq.append(cw)
+            else:
+                return False
+        elif f['op'] == 16:                                    # bc out of the loop
+            if not (f['BO'] & 4) or f['LK'] or f['AA']:        # CTR branch / call
+                return False
+        else:
+            seq.append(w)
+        pc += 4
+    disallowed, written = set(), set()
+    for w in seq:
+        r = int_or_load_regs(w)
+        if r is None:
+            return False
+        ins, outs = r
+        for x in ins:
+            if x not in written:
+                disallowed.add(x)
+        for x in outs:
+            if x in disallowed:
+                return False
+            written.add(x)
+    return True
 
 
 # ------------------------------------------------------------------ image loader
@@ -283,6 +381,8 @@ def F(w):
 def ea(f, disp='d'):
     """Effective address expression for a d-form load/store."""
     off = f[disp]
+    if isinstance(off, str):                 # a relocated displacement (rel_all.py)
+        return f"((uint32_t)({off}))" if f['rA'] == 0 else f"(st->gpr[{f['rA']}] + (uint32_t)({off}))"
     if f['rA'] == 0:
         return f"({off:#x}u)" if off >= 0 else f"((uint32_t)({off}))"
     return f"(st->gpr[{f['rA']}] + (uint32_t)({off}))"
@@ -298,6 +398,7 @@ class Translator:
     def __init__(self, img, fn_lo, fn_hi, resolve_call=None, starts=None, emitted=None,
                  branch_reloc=None, indirect=False, jumptables=False):
         self.img, self.lo, self.hi = img, fn_lo, fn_hi
+        self.idle_loops = []
         self.resolve_call = resolve_call
         # INDIRECT DISPATCH (blrl / bctr / bctrl).  Off by default so the historical
         # coverage numbers stay comparable.  When on, an indirect branch becomes a
@@ -335,6 +436,22 @@ class Translator:
     def gp(self, r):
         return f"st->gpr[{r}]"
 
+    # ---- HOOKS for position-independent overlay translation (rel_all.py).  The defaults
+    # reproduce the historical output byte for byte.
+    def addr_expr(self, v):
+        """C expression for a guest CODE ADDRESS this translation writes into guest state."""
+        return f"{v:#010x}u"
+
+    def extern_expr(self, tgt):
+        return f"sr_extern(st, {tgt:#010x}u);"
+
+    def jt_key(self):
+        return "st->ctr & ~3u"
+
+    def fix_fields(self, pc, f):
+        """Adjust decoded fields at a relocation site; may return replacement C lines."""
+        return None
+
     def callexpr(self, tgt, pc, w):
         """C text for transferring control to another function.
 
@@ -345,7 +462,7 @@ class Translator:
         if self.starts is not None and tgt not in self.starts:
             raise Untranslatable(f"branch target {tgt:#010x} is not a function start", pc, w)
         if self.emitted is not None and tgt not in self.emitted:
-            return f"sr_extern(st, {tgt:#010x}u);"
+            return self.extern_expr(tgt)
         if self.emitted is None:
             return f"CALL({tgt:#010x}u);"
         return f"fn_{tgt:08x}(st);"
@@ -488,6 +605,9 @@ class Translator:
     # --- the instruction translator ---------------------------------------
     def inst(self, pc, w):
         f = F(w)
+        fixed = self.fix_fields(pc, f)
+        if fixed is not None:
+            return fixed
         op, o = f['op'], []
         A, B, D, S = f['rA'], f['rB'], f['rD'], f['rS']
 
@@ -502,7 +622,7 @@ class Translator:
             if pc in self.branch_reloc:                  # relocated cross-module branch
                 tgt = self.branch_reloc[pc]
                 if f['LK']:
-                    o.append(f"st->lr = {pc + 4:#010x}u;")
+                    o.append(f"st->lr = {self.addr_expr(pc + 4)};")
                     o.append(self.callexpr(tgt, pc, w))
                 else:
                     o.append(self.callexpr(tgt, pc, w) + " return;")
@@ -511,11 +631,15 @@ class Translator:
             if f['LK']:
                 # LR is materialised BEFORE the call: the callee's `mflr r0; stw r0,N(r1)`
                 # prologue writes it to guest memory, and that store is diffed.
-                o.append(f"st->lr = {pc + 4:#010x}u;")
+                o.append(f"st->lr = {self.addr_expr(pc + 4)};")
                 o.append(self.callexpr(tgt, pc, w))
             elif self.lo <= tgt < self.hi:
                 self.labels.add(tgt)
-                o.append(f"goto L_{tgt:08x};")
+                if IDLE_SKIP and tgt <= pc and busy_wait_loop(self.img, tgt, pc):
+                    self.idle_loops.append((tgt, pc))
+                    o.append(f"gk_idle_loop(st); goto L_{tgt:08x};   /* busy-wait loop */")
+                else:
+                    o.append(f"goto L_{tgt:08x};")
             else:                                        # tail call: LR untouched by `b`
                 o.append(self.callexpr(tgt, pc, w) + " return;")
             return o
@@ -526,11 +650,15 @@ class Translator:
             cond, pre = self.branch_cond(f)
             o += pre
             if f['LK']:
-                o.append(f"if ({cond}) {{ st->lr = {pc + 4:#010x}u; "
+                o.append(f"if ({cond}) {{ st->lr = {self.addr_expr(pc + 4)}; "
                          f"{self.callexpr(tgt, pc, w)} }}")
             elif self.lo <= tgt < self.hi:
                 self.labels.add(tgt)
-                o.append(f"if ({cond}) goto L_{tgt:08x};")
+                if IDLE_SKIP and tgt <= pc and (f['BO'] & 4) and busy_wait_loop(self.img, tgt, pc):
+                    self.idle_loops.append((tgt, pc))
+                    o.append(f"if ({cond}) {{ gk_idle_loop(st); goto L_{tgt:08x}; }}   /* busy-wait loop */")
+                else:
+                    o.append(f"if ({cond}) goto L_{tgt:08x};")
             else:
                 o.append(f"if ({cond}) {{ {self.callexpr(tgt, pc, w)} return; }}")
             return o
@@ -543,7 +671,7 @@ class Translator:
                     raise Untranslatable("blrl (indirect call through LR)", pc, w)
                 cond, pre = self.branch_cond(f)
                 o += pre
-                body = (f"{{ uint32_t _t = st->lr & ~3u; st->lr = {pc + 4:#010x}u;"
+                body = (f"{{ uint32_t _t = st->lr & ~3u; st->lr = {self.addr_expr(pc + 4)};"
                         f" sr_indirect(st, _t); }}")
                 o.append(body if cond == "1" else f"if ({cond}) {body}")
                 return o
@@ -562,7 +690,7 @@ class Translator:
             cond, pre = self.branch_cond(f)
             o += pre
             if f['LK']:                                  # bctrl: a call, execution resumes
-                body = (f"{{ st->lr = {pc + 4:#010x}u;"
+                body = (f"{{ st->lr = {self.addr_expr(pc + 4)};"
                         f" sr_indirect(st, st->ctr & ~3u); }}")
                 o.append(body if cond == "1" else f"if ({cond}) {body}")
             else:                                        # bctr: a tail jump, LR untouched
@@ -572,7 +700,7 @@ class Translator:
                     # directly; anything not in the table still falls through to
                     # sr_indirect(), which FAULTS -- a value outside the table means
                     # the bound check was not what we read, and must not be guessed.
-                    body = ["{ switch (st->ctr & ~3u) {"]
+                    body = ["{ switch (" + self.jt_key() + ") {"]
                     for t in sorted(set(tgts)):
                         if self.lo <= t < self.hi:
                             self.labels.add(t)
@@ -871,15 +999,34 @@ class Translator:
             if xo == 339:                                # mfspr
                 spr = f['SPR']
                 src = {8: 'st->lr', 9: 'st->ctr', 1: 'st->xer'}.get(spr)
+                # [2026-09-29] GQR0-7 (912-919) live in GekkoState.gqr, which gk_psq_l/st read;
+                # HID2 (920) is the image host layer's (sr_image.c g_spr[920], set by __OSPSInit)
+                if src is None and 912 <= spr <= 919:
+                    src = f'st->gqr[{spr - 912}]'
+                if src is None and spr == 920:
+                    o.append(f"{{ uint32_t sr_image_spr(uint32_t); {self.gp(D)} = sr_image_spr(920u); }}")
+                    return o
                 if src is None:
                     raise Untranslatable(f"mfspr SPR{spr} (privileged/host)", pc, w)
                 o.append(f"{self.gp(D)} = {src};"); return o
             if xo == 467:                                # mtspr
                 spr = f['SPR']
                 dst = {8: 'st->lr', 9: 'st->ctr', 1: 'st->xer'}.get(spr)
+                if dst is None and 912 <= spr <= 919:
+                    dst = f'st->gqr[{spr - 912}]'
+                if dst is None and spr == 920:
+                    o.append(f"{{ void sr_image_set_spr(uint32_t, uint32_t); sr_image_set_spr(920u, {self.gp(S)}); }}")
+                    return o
                 if dst is None:
                     raise Untranslatable(f"mtspr SPR{spr} (privileged/host)", pc, w)
                 o.append(f"{dst} = {self.gp(S)};"); return o
+            if xo == 371:                                # mftb: the guest clock (sr_host_os.c)
+                tbr = f['SPR']
+                if tbr not in (268, 269):
+                    raise Untranslatable(f"mftb TBR{tbr}", pc, w)
+                o.append(f"{{ uint64_t sr_tb_read(void); uint64_t _t = sr_tb_read();"
+                         f" {self.gp(D)} = (uint32_t){'(_t >> 32)' if tbr == 269 else '_t'}; }}")
+                return o
             if xo == 19:  o.append(f"{self.gp(D)} = st->cr;"); return o          # mfcr
             if xo == 144:                                                        # mtcrf
                 crm = f['CRM']
@@ -1253,6 +1400,13 @@ void sr_extern(GekkoState *st, uint32_t addr);
 void sr_indirect(GekkoState *st, uint32_t addr);
 """
 
+# Appended to HEADER only under --idle-skip, so a default build's output stays byte-identical.
+IDLE_DECL = """
+// IDLE SKIP (--idle-skip): called on the taken back-edge of a busy-wait loop (sr.py
+// busy_wait_loop, Dolphin's IsBusyWaitLoop) — the host skips guest time to its next event.
+void gk_idle_loop(GekkoState *st);
+"""
+
 
 def index_functions(img, syms):
     """map entries present in THIS image, deduped by address -> (size, name)."""
@@ -1426,7 +1580,7 @@ def emit_dispatch_tu(fns):
 def emit_c(img, fns, starts=None, branch_reloc=None, indirect=False,
            jumptables=False, split_dispatch=False):
     emitted = {lo for lo, _, _ in fns}
-    out = [HEADER]
+    out = [HEADER + (IDLE_DECL if IDLE_SKIP else "")]
     if len(fns) > 1:
         out.append("\n// forward declarations (calls may be forward or mutually recursive)")
         for lo, _, name in fns:
@@ -1507,6 +1661,10 @@ def main():
                          'because MSR and time are STATE with one host owner; cache '
                          'maintenance has no state here, so emitting is the correct '
                          'outcome and host-binding is the bug.')
+    ap.add_argument('--idle-skip', action='store_true',
+                    help='emit gk_idle_loop(st) on the taken back-edge of every busy-wait '
+                         'loop (Dolphin PPCAnalyst IsBusyWaitLoop, transcribed). Off by default '
+                         'so existing artifacts stay byte-identical.')
     ap.add_argument('--retire', action='store_true',
                     help='THE DRIVE: emit gk_retire(N) at the head of every basic '
                          'block, N = the summed Gekko cycle cost of its instructions '
@@ -1560,6 +1718,8 @@ def main():
     hosts = {int(x, 16) for x in a.host}
     global RETIRE
     RETIRE = bool(a.retire)
+    global IDLE_SKIP
+    IDLE_SKIP = bool(a.idle_skip)
 
     img = Image.from_dol(a.image)
     syms = load_map(a.map)

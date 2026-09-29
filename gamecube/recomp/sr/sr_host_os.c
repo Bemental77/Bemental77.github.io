@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <time.h>
+#include <setjmp.h>
 #include <emscripten.h>
 #include "gekko_rt.h"
 #include "sr_host_os.h"
@@ -27,7 +28,7 @@ static uint32_t g_park_ms = 4000;       // watchdog: a hand-off that never comes
 
 #define SR_MAX_THREADS 16
 typedef struct {
-    int             used, bound, started, pending_start, exited;
+    int             used, bound, started, pending_start, exited, recycle;
     uint32_t        guest_thread;
     int             handoff_from;
     int             token;
@@ -38,12 +39,41 @@ static SrHT g_ht[SR_MAX_THREADS];
 static int  g_nht = 0;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local int g_self = -1;
+// [2026-09-29] SLOT RECYCLING.  Every pool thread (slot > 0) keeps a jmp_buf at the top of
+// ht_main.  A host thread whose guest thread can never resume — it EXITED (SelectThread with
+// no context to save: OSExitThread/OSCancelThread of itself) or was ORPHANED (the game re-created
+// its OSThread, see host_select_thread) — longjmps back there and frees its slot.  Before this
+// such slots leaked (CONTEXT_SWITCH.md §7) and SAB exhausted a 12-slot pool at 83 M cycles
+// (fault 0xC5048410, SR_F_NO_HOST_THREAD).  Slot 0 is the caller's own thread: no base, so it
+// keeps the old park-for-good behaviour.
+static jmp_buf g_ht_base[SR_MAX_THREADS];
+static pthread_cond_t g_free_cv = PTHREAD_COND_INITIALIZER;
+static uint32_t g_recycled = 0;
+void (*sr_recycle_hook)(void) = 0;          // per-thread state of the image layer (IRQ jmp stack)
+static void ht_recycle_self(int self);
 
 // ------------------------------------------------------------------ trace
 #define SR_TRACE_CAP 4096
 static uint32_t g_trace[SR_TRACE_CAP * 3];
 static uint32_t g_trace_n = 0;
+// [2026-09-29] Event filter: bit ev set = record.  Default ALL, so every existing reader of
+// the trace sees exactly what it always did.  The whole-image run sets it to the thread
+// events, because the 4,096-entry trace is otherwise full of OSGetTick before the first switch.
+static uint64_t g_trace_mask = ~(uint64_t)0;
+EMSCRIPTEN_KEEPALIVE void sr_os_trace_mask(uint32_t lo, uint32_t hi) {
+    g_trace_mask = ((uint64_t)hi << 32) | lo;
+}
+// [2026-09-29] A RING of the LAST 256 thread events, each with the HOST SLOT that recorded it —
+// the first-4,096 trace cannot show the end of a long run, and cannot show which host thread
+// did what, which is the question when two host threads may be running guest code at once.
+#define SR_RING 256
+static uint32_t g_ring[SR_RING * 4], g_ring_n = 0;
+EMSCRIPTEN_KEEPALIVE uint32_t *sr_os_ring(void)   { return g_ring; }
+EMSCRIPTEN_KEEPALIVE uint32_t  sr_os_ring_n(void) { return g_ring_n; }
+void sr_os_ring_mark(uint32_t ev, uint32_t a, uint32_t b);
 static void tr(uint32_t ev, uint32_t a, uint32_t b) {
+    if (ev >= 10 && ev <= 17) sr_os_ring_mark(ev, a, b);
+    if (ev < 64 && !((g_trace_mask >> ev) & 1u)) return;
     pthread_mutex_lock(&g_lock);
     if (g_trace_n < SR_TRACE_CAP) {
         g_trace[g_trace_n * 3 + 0] = ev;
@@ -52,6 +82,14 @@ static void tr(uint32_t ev, uint32_t a, uint32_t b) {
         g_trace_n++;
     }
     pthread_mutex_unlock(&g_lock);
+}
+void sr_os_ring_mark(uint32_t ev, uint32_t a, uint32_t b) {
+    {
+        pthread_mutex_lock(&g_lock);
+        uint32_t i = (g_ring_n++ % SR_RING) * 4u;
+        g_ring[i] = ev; g_ring[i + 1] = a; g_ring[i + 2] = b; g_ring[i + 3] = (uint32_t)g_self;
+        pthread_mutex_unlock(&g_lock);
+    }
 }
 static void fault(uint32_t code, uint32_t detail) {
     if (!g_fault) g_fault = code | (detail & 0x0000FFFFu);
@@ -67,11 +105,22 @@ static void fault(uint32_t code, uint32_t detail) {
 // transcription in this file is the shipped function.
 static GekkoState g_snap;
 static uint32_t   g_snap_hash, g_snap_valid;
+// [2026-09-29] THE MEM1 HASH IS A VERIFICATION INSTRUMENT, and it cost the whole image most of
+// its speed: 24 MB of FNV-1a at EVERY context switch.  Profiled (node --cpu-prof, locating only):
+// host_select_thread SELF time = 32.6 s of the ~40 s the three running guest threads were
+// busy, translated guest code ~5 s.  verify_ctxsw.mjs needs the hash (its default stays ON);
+// the whole image turns it off in sr_image_init_hle, and sr_os_set_snap_mem(1) restores it on
+// the same binary as the matched-pair control arm.
+static uint32_t   g_snap_mem = 1;
+EMSCRIPTEN_KEEPALIVE void sr_os_set_snap_mem(uint32_t on) { g_snap_mem = on; }
 static void snapshot(GekkoState *st) {
     g_snap = *st;
-    uint32_t h = 2166136261u;                       // FNV-1a over MEM1
-    for (uint32_t i = 0; i < g_ram_size; i++) { h ^= g_ram[i]; h *= 16777619u; }
-    g_snap_hash = h; g_snap_valid = 1;
+    if (g_snap_mem) {
+        uint32_t h = 2166136261u;                   // FNV-1a over MEM1
+        for (uint32_t i = 0; i < g_ram_size; i++) { h ^= g_ram[i]; h *= 16777619u; }
+        g_snap_hash = h;
+    }
+    g_snap_valid = 1;
 }
 
 // --------------------------------------------------------- park / hand-off
@@ -97,7 +146,9 @@ static int ht_park(int slot) {
         if (rc == ETIMEDOUT) { pthread_mutex_unlock(&g_lock); return -1; }
     }
     g_ht[slot].token = 0;
+    int rec = g_ht[slot].recycle && slot > 0 && slot == g_self;
     pthread_mutex_unlock(&g_lock);
+    if (rec) ht_recycle_self(slot);                 // does not return
     return 0;
 }
 
@@ -105,18 +156,32 @@ static int ht_park(int slot) {
 // guest thread; slot 0 is whoever called sr_os_init (the harness / the emulator's
 // own worker), which is the guest thread that is already running.
 static int slot_for(uint32_t guest_thread) {
-    for (int i = 0; i < g_nht; i++)
-        if (g_ht[i].bound && g_ht[i].guest_thread == guest_thread) return i;
-    for (int i = 0; i < g_nht; i++)
-        if (g_ht[i].used && !g_ht[i].bound) {
-            g_ht[i].bound = 1; g_ht[i].guest_thread = guest_thread; return i;
-        }
-    return -1;
+    int r = -1;
+    pthread_mutex_lock(&g_lock);                    // a recycling thread frees its slot concurrently
+    for (int i = 0; i < g_nht && r < 0; i++)
+        if (g_ht[i].bound == 1 && g_ht[i].guest_thread == guest_thread) r = i;
+    for (int i = 0; i < g_nht && r < 0; i++)
+        if (g_ht[i].used && !g_ht[i].bound) { g_ht[i].bound = 1; g_ht[i].guest_thread = guest_thread; r = i; }
+    pthread_mutex_unlock(&g_lock);
+    return r;
 }
+static void ht_recycle_self(int self) {
+    if (sr_recycle_hook) sr_recycle_hook();
+    tr(SR_EV_THREAD_EXIT, (uint32_t)self, g_ht[self].guest_thread);   // (tr takes g_lock itself)
+    pthread_mutex_lock(&g_lock);
+    g_ht[self].bound = 0; g_ht[self].guest_thread = 0; g_ht[self].started = 0;
+    g_ht[self].pending_start = 0; g_ht[self].exited = 0; g_ht[self].recycle = 0;
+    g_ht[self].handoff_from = -1; g_recycled++;
+    pthread_cond_broadcast(&g_free_cv);
+    pthread_mutex_unlock(&g_lock);
+    longjmp(g_ht_base[self], 1);
+}
+EMSCRIPTEN_KEEPALIVE uint32_t sr_os_recycled(void) { return g_recycled; }
 
 static void *ht_main(void *p) {
-    int idx = (int)(intptr_t)p;
+    volatile int idx = (int)(intptr_t)p;
     g_self = idx;
+    setjmp(g_ht_base[idx]);                         // a recycled slot comes back here, free
     for (;;) {
         if (ht_park(idx) != 0) return 0;          // watchdog / shutdown
         if (!g_ht[idx].used) return 0;
@@ -125,6 +190,16 @@ static void *ht_main(void *p) {
             g_ht[idx].pending_start = 0;
             tr(SR_EV_THREAD_ENTRY, (uint32_t)idx, st->pc);
             if (!sr_dispatch(st->pc, st)) fault(SR_F_NOT_DISPATCH, st->pc);
+            // [2026-09-29] A guest thread function that RETURNS executes `blr`, i.e. goes to
+            // the LR its context was created with — OSCreateThread sets it to OSExitThread
+            // (dolsdk2001 src/os/OSThread.c:438 in OSCreateThread: `thread->context.lr =
+            // (u32)OSExitThread`), with the return value in r3 as OSExitThread's argument.
+            // The translated body's blr returned to C with that LR in st->lr, so perform the
+            // jump.  OSExitThread switches away and this host thread parks in SelectThread's
+            // MORIBUND path; only a guest whose LR is not a translated function falls through
+            // to the fault below.  Only when sr_irq_resume_hook is installed (the whole
+            // image): verify_ctxsw.mjs asserts the fault for its own synthetic threads.
+            else if (sr_irq_resume_hook && !g_fault && sr_dispatch(st->lr, st)) { /* exited */ }
             // The guest entry RETURNED.  On hardware a thread function returns into
             // OSExitThread, which switches away and never comes back; if we get here
             // the guest never did that, so nothing will ever re-post the thread that
@@ -353,6 +428,32 @@ static void dec_check(void) {
     tr(SR_EV_DEC_EXC, (uint32_t)sr_tb_read(), g_dec_exceptions);
 }
 
+// [2026-09-29] THE DECREMENTER AS AN EVENT the whole-image layer can DELIVER.  dec_check()
+// above counts a due exception and rolls the register over; it runs only from
+// sr_tb_credit_cycles(), which a --retire build never calls (gk_retire feeds g_gk_cycles
+// directly).  sr_image.c's event check (gekko_rt.h gk_event, -DSR_MMIO only) asks WHEN the
+// next one is due and then TAKES it through the same dec_check(), so there is still exactly
+// one implementation of DecrementerCallback (SystemTimers.cpp:139-143) and one counter.
+uint64_t sr_dec_due_at(void) { return g_dec_armed ? g_dec_due_cycles : UINT64_MAX; }
+int sr_dec_take(void) {
+    uint32_t before = g_dec_exceptions;
+    dec_check();
+    return g_dec_exceptions != before;
+}
+// [2026-09-29] A guest-time budget reached on a POOL host thread cannot end the run by
+// throwing — the node/browser caller is blocked on the MAIN host thread, parked in
+// ht_park().  So the pool thread wakes slot 0 and parks itself for good; slot 0 resumes,
+// meets the same budget at its next block head, and throws there.  Returns 0 on slot 0.
+int sr_os_budget_yield(void) {
+    if (g_self <= 0) return 0;
+    ht_post(0);
+    for (;;) ht_park(g_self);
+}
+
+// OSLoadContext's register half for a host that has just run an exception handler and is
+// performing the handler's own OSLoadContext(context) — sr_image.c's interrupt delivery.
+void sr_os_ctx_load(GekkoState *st, uint32_t ctx) { ctx_load(st, ctx); }
+
 void sr_tb_credit_cycles(uint64_t cycles) {
     g_gk_cycles += cycles;
     g_tb_dry_reads = 0;
@@ -435,8 +536,24 @@ static void ppc_mtdec(GekkoState *st) {
 //                                        return address of that bl and gpr[3] was
 //                                        stamped 1 by OSSaveContext.
 // ============================================================================
+// [2026-09-29] TWO HOOKS THE WHOLE-IMAGE LAYER (sr_image.c) FILLS IN, both NULL in every
+// other build, so the ctxsw differential is unaffected (verify_ctxsw.mjs: 63/0 with them).
+//   sr_idle_hook        the idle spin at 0x800ebea0 is broken on hardware by an external
+//                       interrupt whose handler readies a thread.  With an interrupt layer
+//                       present, the hook advances guest time to the next scheduled device
+//                       event and services it; it returns 0 when NOTHING is scheduled, which
+//                       is a genuine deadlock and still faults SR_F_IDLE_NO_IRQ by name.
+//   sr_irq_resume_hook  a thread switched away INSIDE an exception (its context carries
+//                       OS_CONTEXT_STATE_EXC, so SelectThread skips OSSaveContext) resumes on
+//                       hardware by OSLoadContext's rfi to the INTERRUPTED point.  Its host
+//                       thread is parked inside that very exception's delivery frame, so the
+//                       hook returns control there; it does not return if it can.
+int  (*sr_idle_hook)(void) = 0;
+void (*sr_irq_resume_hook)(GekkoState *st, uint32_t ctx) = 0;
+
 static void host_select_thread(GekkoState *st) {
     uint32_t saved_ctx = 0;      // the guest thread whose continuation WE are, or 0
+    uint32_t exc_ctx   = 0;      // [2026-09-29] ...or the EXC context we were preempted in
 
     st->gpr[0] = st->lr;
     st->gpr[4] = 0x802c0000u;
@@ -506,7 +623,7 @@ L_800ebe5c:
     st->gpr[0] = gk_r16(st->gpr[6] + OSCTX_STATE);
     st->gpr[0] = gk_rotl32(st->gpr[0], 0) & gk_mask(30, 30);
     gk_rc(st, st->gpr[0]);
-    if (gk_cr_bit(st, 2) == 0) goto L_800ebe7c;              /* context is an EXC frame */
+    if (gk_cr_bit(st, 2) == 0) { exc_ctx = st->gpr[6]; goto L_800ebe7c; }  /* an EXC frame */
 
     // ---- 0x800ebe68  bl OSSaveContext ------------------------------------
     st->lr = 0x800ebe6cu;
@@ -525,13 +642,37 @@ L_800ebe7c:
     gk_w32(st->gpr[3] + 228, st->gpr[4]);                    /* __gCurrentThread = 0 */
     if (gk_cr_bit(st, 2) == 0) goto L_800ebec4;
     // The idle path.  On hardware the spin at 0x800ebea0 is broken by an external
-    // interrupt whose handler calls OSWakeupThread.  There is no interrupt delivery
-    // in this runtime (docs/static-recomp-sab/README.md §8.3 item 1), so the spin
-    // could never terminate: refuse it by name instead of hanging.
+    // interrupt whose handler calls OSWakeupThread.  Without an interrupt layer
+    // (sr_idle_hook == NULL: every build but the whole image) the spin could never
+    // terminate, so it is refused by name instead of hanging.  WITH one, the shipped
+    // words are transcribed (0x800ebe94..0x800ebec0):
+    //   addi r3,r31,1824 / bl OSSetCurrentContext / bl OSEnableInterrupts /
+    //   spin: lwz r0,RunQueueBits / beq spin / bl OSDisableInterrupts /
+    //   lwz r0,RunQueueBits / beq -> OSEnableInterrupts / addi r3,r31,1824 / bl OSClearContext
     st->gpr[3] = st->gpr[31] + 1824u;
+    st->lr = 0x800ebe9cu;
     os_set_current_context(st);
-    fault(SR_F_IDLE_NO_IRQ, 0);
-    st->gpr[3] = 0; goto L_epi;
+    if (!sr_idle_hook) { fault(SR_F_IDLE_NO_IRQ, 0); st->gpr[3] = 0; goto L_epi; }
+    for (;;) {
+        st->lr = 0x800ebea0u;
+        os_enable_interrupts(st);
+        for (;;) {                                           /* 0x800ebea0 */
+            st->gpr[0] = gk_r32(sda(st, SAB_SDA_RUNQUEUEBITS));
+            gk_cmp_unsigned(st, 0, st->gpr[0], 0u);
+            if (gk_cr_bit(st, 2) == 0) break;
+            if (!sr_idle_hook()) { fault(SR_F_IDLE_NO_IRQ, 1); st->gpr[3] = 0; goto L_epi; }
+            if (g_fault) { st->gpr[3] = 0; goto L_epi; }
+        }
+        st->lr = 0x800ebeb0u;
+        os_disable_interrupts(st);
+        st->gpr[0] = gk_r32(sda(st, SAB_SDA_RUNQUEUEBITS));
+        gk_cmp_unsigned(st, 0, st->gpr[0], 0u);
+        if (gk_cr_bit(st, 2) == 0) break;
+    }
+    st->gpr[3] = st->gpr[31] + 1824u;
+    st->lr = 0x800ebec4u;
+    os_clear_context(st);
+    goto L_800ebec4;
 
 L_800ebec4:
     st->gpr[3] = 0u;
@@ -579,6 +720,44 @@ L_800ebec4:
         // is still 0x800ebe6c with gpr[3] == 1, so it still returns NULL.
         if (next == saved_ctx) { ctx_load(st, next); goto L_800ebe6c; }
 
+        // [2026-09-29] The host thread running a guest thread IS that guest thread's host
+        // thread.  verify_ctxsw.mjs binds slot 0 explicitly (sr_os_bind_self); the whole-image
+        // boot cannot know the default thread's address before OSInit has created it, so the
+        // first switch AWAY from an unbound slot binds it.  Without this, slot_for(next)
+        // handed the new thread slot 0 — the CALLER's own slot — and the caller "parked" on a
+        // token it had just posted to itself and ran on AS the new thread (measured: HANDOFF
+        // then SELECT_RETURN on the same host thread, no THREAD_ENTRY).
+        if (self >= 0 && !g_ht[self].bound && saved_ctx) {
+            g_ht[self].bound = 1; g_ht[self].guest_thread = saved_ctx; g_ht[self].started = 1;
+        }
+        // [2026-09-29] A BOUND SLOT IS ONLY A CONTINUATION IF THE GUEST CONTEXT STILL SAYS SO.
+        // A parked host thread can resume `next` only where the guest's own context says
+        // `next` resumes: at 0x800ebe6c (the OSSaveContext return inside SelectThread) or at an
+        // interrupted point (OS_CONTEXT_STATE_EXC).  If the game has since RE-CREATED the thread
+        // on the same OSThread struct — OSCreateThread -> OSInitContext rewrites srr0 to the new
+        // entry and r3 to 0 (dolsdk2001 src/os/OSContext.c:397-440) — the parked host thread is a
+        // continuation of a thread that no longer exists.  Measured: SAB re-creates 0x80358410
+        // at 24.5 M cycles; resuming the stale host thread ran it with r3 = 0 into SelectThread's
+        // idle path with r31 = garbage, and the run queue collapsed.  The stale slot is ORPHANED
+        // (bound = 2: never matched, never reused, parked for good) and a fresh one starts `next`.
+        for (int i = 0; i < g_nht; i++)
+            if (g_ht[i].bound == 1 && g_ht[i].guest_thread == next && g_ht[i].started) {
+                uint32_t srr0 = gk_r32(next + OSCTX_SRR0);
+                uint32_t cst  = gk_r16(next + OSCTX_STATE);
+                if (srr0 != 0x800ebe6cu && !(cst & OSCTX_STATE_EXC)) {
+                    if (i == 0) { g_ht[i].bound = 2; g_ht[i].guest_thread = 0; tr(SR_EV_THREAD_EXIT, 0u, next); continue; }
+                    // wake the stale host thread only to free itself; wait until it has
+                    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 1 + g_park_ms / 1000u;
+                    pthread_mutex_lock(&g_lock);
+                    g_ht[i].bound = 2; g_ht[i].recycle = 1;
+                    g_ht[i].token = 1; pthread_cond_signal(&g_ht[i].cv);
+                    while (g_ht[i].bound != 0)
+                        if (pthread_cond_timedwait(&g_free_cv, &g_lock, &ts) == ETIMEDOUT) break;
+                    int freed = g_ht[i].bound == 0;
+                    pthread_mutex_unlock(&g_lock);
+                    if (!freed) { fault(SR_F_PARK_TIMEOUT, next & 0xFFFFu); st->gpr[3] = 0; goto L_epi; }
+                }
+            }
         to = slot_for(next);
         if (to < 0) { fault(SR_F_NO_HOST_THREAD, next & 0xFFFFu); st->gpr[3] = 0; goto L_epi; }
 
@@ -597,9 +776,21 @@ L_800ebec4:
         // simply abandons this stack.  A wasm host thread cannot unwind its own
         // guest frames without an exception, so it parks here for good.  Documented
         // in CONTEXT_SWITCH.md §7 as the one leak in this design.
-        if (!saved_ctx) { ht_park(self); fault(SR_F_NO_CONT, next & 0xFFFFu); st->gpr[3] = 0; goto L_epi; }
+        if (!saved_ctx) {
+            // [2026-09-29] ...unless it was an EXC frame and this host thread is inside
+            // that exception's delivery: then resuming it IS the rfi to the interrupted
+            // point, and the hook takes it there (it does not return when it can).
+            if (exc_ctx && sr_irq_resume_hook) {
+                if (ht_park(self) != 0) { fault(SR_F_PARK_TIMEOUT, exc_ctx & 0xFFFFu); st->gpr[3] = 0; goto L_epi; }
+                if (!g_fault) sr_irq_resume_hook(st, exc_ctx);
+                fault(SR_F_NO_CONT, exc_ctx & 0xFFFFu); st->gpr[3] = 0; goto L_epi;
+            }
+            if (self > 0) ht_recycle_self(self);    // its guest thread is gone: free the slot
+            ht_park(self); fault(SR_F_NO_CONT, next & 0xFFFFu); st->gpr[3] = 0; goto L_epi;
+        }
 
         if (ht_park(self) != 0) {                    /* ---- parked ---- */
+            if (g_ht[self].bound == 2) for (;;) ht_park(self);   // orphaned: stays parked
             fault(SR_F_PARK_TIMEOUT, saved_ctx & 0xFFFFu);
             st->gpr[3] = 0; goto L_epi;
         }
@@ -607,6 +798,7 @@ L_800ebec4:
         // ---- resumed.  The hardware got here by rfi to srr0 == 0x800ebe6c with
         // gpr[3] == 1.  Reproduce exactly that: restore our own registers out of
         // our own OSContext and re-enter at L_800ebe6c.
+        sr_os_ring_mark(33, saved_ctx, gk_r32(saved_ctx + OSCTX_GPR(3)));   // RESUMED: ctx r3 (must be 1)
         ctx_load(st, saved_ctx);
         tr(SR_EV_RESUMED, saved_ctx, (uint32_t)self);
         goto L_800ebe6c;

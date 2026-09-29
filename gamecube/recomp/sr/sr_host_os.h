@@ -328,6 +328,18 @@ uint32_t sr_dec_read(void);
 void     sr_dec_write(uint32_t v);
 
 int  sr_host_call(GekkoState *st, uint32_t addr);   // 1 = handled, 0 = not ours
+uint64_t sr_dec_due_at(void);                       // UINT64_MAX when not armed
+int      sr_dec_take(void);                         // 1 if a decrementer exception fired now
+void     sr_os_ctx_load(GekkoState *st, uint32_t ctx);
+extern int  (*sr_idle_hook)(void);
+extern void (*sr_irq_resume_hook)(GekkoState *st, uint32_t ctx);
+extern void (*sr_recycle_hook)(void);
+void sr_os_set_snap_mem(uint32_t on);   // the MEM1 hash at every switch (verification only)   // called on a pool thread about to free its slot
+int      sr_os_init(int nthreads);
+int      sr_os_budget_yield(void);
+void     sr_os_ring_mark(uint32_t ev, uint32_t a, uint32_t b);
+void     sr_os_set_msr(uint32_t m);
+uint32_t sr_os_get_msr(void);
 
 // Install the hook WITHOUT creating any host thread and WITHOUT needing -pthread.
 // This is what a plain (non-context-switch) build calls to get SR_OS_IRQ; the

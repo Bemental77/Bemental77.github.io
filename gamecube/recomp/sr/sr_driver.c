@@ -7,6 +7,8 @@
 
 uint8_t  *g_ram = 0;
 uint32_t  g_ram_size = 0;
+int       g_gk_fma_fast = 1;       // gekko_rt.h gk_fma: the exact-product fast path (run-time arm)
+EMSCRIPTEN_KEEPALIVE void sr_set_fma_fast(int on) { g_gk_fma_fast = on; }
 uint32_t  g_fault = 0;
 // THE HID0.  Seeded with the value the GameCube's BS2 leaves (gekko_rt.h
 // GK_HID0_BOOT, cited to Dolphin Boot_BS2Emu.cpp:85) so a FIXTURE build -- which
@@ -70,11 +72,34 @@ void sr_extern(GekkoState *st, uint32_t addr) {
 // Indirect dispatch for blrl / bctr / bctrl.  A distinct fault prefix from sr_extern
 // so a differential can tell "unresolved INDIRECT target" (0xE1) apart from "direct
 // call outside the emitted set" (0xE0) — the two need different fixes.
+#ifdef SR_MMIO
+// [2026-09-29] WHOLE-IMAGE ONLY (-DSR_MMIO; every fixture build compiles the #else arm, so its
+// object is unchanged).  Two things a boot needs and a fixture never does:
+//   * an indirect call (blrl/bctrl) to a HOST-BOUND function — sr.py --host keeps those out of
+//     sr_dispatch, so a function POINTER to e.g. OSDisableInterrupts used to fault 0xE1 even
+//     though the host layer implements it.  A target inside MEM1 now goes to the hook, which
+//     services it or names it (sr_image.c img_hook: 0xC6 + the address).
+//   * WHERE a bad indirect call came from: the fault code carries the target only, and by the
+//     time a strict run stops (the next block head) the guest has moved on.  st->lr is the
+//     return address the bctrl/blrl just set, i.e. the call site + 4.
+uint32_t g_indirect_fault_lr = 0, g_indirect_fault_target = 0, g_indirect_fault_r1 = 0;
+void sr_indirect(GekkoState *st, uint32_t addr) {
+    if (!sr_dispatch(addr, st)) {
+        if (addr >= 0x80000000u && addr < 0x81800000u && sr_host_hook && sr_host_hook(st, addr)) return;
+        if (!g_fault) {
+            g_fault = 0xE1000000u | (addr & 0x00FFFFFFu);
+            g_indirect_fault_lr = st->lr; g_indirect_fault_target = addr;
+            g_indirect_fault_r1 = st->gpr[1];       // for the back chain AT the fault
+        }
+    }
+}
+#else
 void sr_indirect(GekkoState *st, uint32_t addr) {
     if (!sr_dispatch(addr, st)) {
         if (!g_fault) g_fault = 0xE1000000u | (addr & 0x00FFFFFFu);
     }
 }
+#endif
 
 // Dispatch by guest address — the same table a full build would generate.
 EMSCRIPTEN_KEEPALIVE uint32_t sr_call(uint32_t addr) {

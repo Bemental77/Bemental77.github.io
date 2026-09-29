@@ -57,6 +57,16 @@
 'use strict';
 
 import { bindImage, stageBoot, readLog, summarize, readDev } from './sr_boot_stage.js';
+import { stageApploader, loadDisc, startGuest, makePump, guestCounters } from './sr_guest.js';
+
+// [2026-09-29] THE PACED-GUEST ARM.  ?srmode=main with an image that exports
+// _sr_image_boot_thread (build_image.sh SR_PTHREAD=1 SR_MEM=1879048192 SR_POOL=14, served
+// under ?srbase=) no longer calls main() by hand: it boots SAB from __start on a pthread of its
+// own with every device model on, and streams the guest's OWN frames (sr_guest.js).  It needs
+// the whole disc: ?srdisc=1500 makes the page stream every part before 'boot'.  An image
+// without that export keeps the old 'main' measurement arm below, unchanged.
+const discParts = [];
+let discEnd = null;
 
 // ===================================================================== GUEST ADDRESSES
 // Recovered by disassembly against ~/gc_refs/dolsdk2001/src/gx/*.c and src/vi/vi.c, and
@@ -315,8 +325,64 @@ function postFrame(n, withMem1) {
   return sizes;
 }
 
+// A GameCube disc image is always 1,459,978,240 bytes; the image is SAB's own binary, so its
+// disc is SAB's 17 gzipped parts (gamecube.html:2139 chunkRange('SonicAdventure2Battle', 'q')).
+// When the page did not stream them (?srdisc), this worker fetches them itself and inflates
+// each straight into wasm memory — the whole ISO is never held twice.
+const GC_DISC_BYTES = 1459978240;
+async function* fetchSabParts(romRoot) {
+  for (let c = 'a'.charCodeAt(0); c <= 'q'.charCodeAt(0); c++) {
+    const url = romRoot + 'SonicAdventure2Battle.bin.parta' + String.fromCharCode(c) + '.gz';
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(url + ' -> ' + r.status);
+    const rd = r.body.pipeThrough(new DecompressionStream('gzip')).getReader();
+    for (;;) { const { done, value } = await rd.read(); if (done) break; yield value; }
+    say('status', { text: 'disc part ' + String.fromCharCode(c) + ' inflated' });
+  }
+}
+async function runGuestArm(msg, base) {
+  const staged = await stageBoot(mod, api, base);
+  let disc;
+  if (discEnd !== null && discParts.length) {
+    say('status', { text: 'guest arm: page-streamed disc ' + (discEnd / 1048576).toFixed(1) + ' MB' });
+    disc = await loadDisc(mod, discEnd, (async function* () {
+      while (discParts.length) yield new Uint8Array(discParts.shift());   // drop each part once copied
+    })());
+  } else {
+    const romRoot = msg.romRoot || new URL('/gamecube/roms/', self.location.href).href;
+    say('status', { text: 'guest arm: fetching SAB disc parts from ' + romRoot });
+    disc = await loadDisc(mod, GC_DISC_BYTES, fetchSabParts(romRoot));
+  }
+  const apploader = stageApploader(mod, api, mod.HEAPU8.subarray(disc.ptr, disc.ptr + disc.size));
+  await startGuest(mod, api, { hle: 12 });
+  // THE CONTROL ARM (?srcapture=0, same wasm): the guest runs identically but the frame ring is
+  // off, so nothing is posted.  A picture in that arm did not come from this stream.
+  if (msg.capture === 0) mod._sr_gx_set_capture(0);
+  say('guest-started', { dolBytes: staged.dolBytes, apploader, discBytes: disc.size });
+  const pump = makePump(mod, api);
+  const periodMs = (msg.postMs | 0) || 100;
+  let reports = 0;
+  setInterval(() => {
+    const f = pump();
+    if (f && f.fifo) {
+      // measure before transferring (a transferred buffer reads as length 0)
+      const sizes = { n: f.n, fifoBytes: f.fifo.length, framesInPost: f.framesInPost };
+      self.postMessage({ cmd: 'frame', n: f.n, fifo: f.fifo.buffer, mem1: f.mem1.buffer, regions: [] },
+                       [f.fifo.buffer, f.mem1.buffer]);
+      if (f.n === 1 || f.n % 200 === 0) say('guest', Object.assign(sizes, guestCounters(mod), { lost: f.lost }));
+    } else if (f && !f.fifo) {
+      say('guest', Object.assign({ lostBytes: f.lost }, guestCounters(mod)));
+    } else if (++reports % 300 === 0) {
+      say('guest', Object.assign({ idlePump: true }, guestCounters(mod)));
+    }
+  }, periodMs);
+}
+
 self.onmessage = async (e) => {
   const msg = e.data || {};
+  // the page streams the disc BEFORE 'boot' (gamecube.html srPost after the romChunk loop)
+  if (msg.cmd === 'romChunk') { discParts.push(msg.buf); return; }
+  if (msg.cmd === 'romEnd') { discEnd = msg.size >>> 0; return; }
   if (msg.cmd !== 'boot') return;
   const base = msg.base || './';
   // mode 'gx'   — drive SAB's GX entry points to a picture (the default).
@@ -345,6 +411,11 @@ self.onmessage = async (e) => {
       gxDropped: '_sr_gx_dropped', gxOffMax: '_sr_gx_off_max',
     });
     if (!api.init()) throw new Error('sr_image_init() returned 0');
+    if (mode === 'main' && typeof mod._sr_image_boot_thread === 'function') {
+      say('ready', { mode: 'guest', capture: 2, ramSize: api.ramSize() });
+      await runGuestArm(msg, base);
+      return;
+    }
 
     // Layout guard — see the note beside PS0_OFF.  A mismatch here means float arguments
     // would land in the wrong place, so it is fatal rather than a warning.

@@ -27,6 +27,11 @@ shipped disc; the reproducing command is printed next to each one. Artifact:
 | **JIT baseline, re-measured** | **0.3781x delivered / 141.6 MHz executed / 23.2% idle-skipped**, stock V8, n=3, cross-witness spread ≤0.0005. **1.000x costs 373.5 MHz on this scene → the JIT is 2.64x short.** §8.6b |
 | ~~JIT baseline `0.4450x`~~ | **RETRACTED, §8.6c** — a 75 s cold boot read over one 40 s window; re-reading that band from four fresh runs of ONE frozen binary returns **0.3338x–0.5097x**. The V8-tier mismatch §8.1 warned about measures **null on both engines** (§8.6d) and was the least of its defects. |
 | **WHOLE-IMAGE BOOT IN A BROWSER** | **LINKS, INSTANTIATES, AND RUNS THE GUEST'S OWN `__start`** — wasm md5 `7bcca5756df27133d684c4281410171b`. `__init_registers` / `__init_hardware` / `__init_data` / `DBInit` all return **fault-free**, then `OSInit` reaches **27 distinct hardware registers** across PI/MI/DSP/SI/EXI/DI in **126 host-boundary crossings**. It stops in **`__OSInitAudioSystem`**, spinning on a DSP register — **no device model and no interrupt delivery**, not a translator bug (the GAP class is still zero). Modelling one register (EXI `TSTART`) moved it from 21 registers to 27, with a **falsifying control arm on the same md5**. **Nothing renders and no `drawn/s` is claimed.** §10 |
+| **WHOLE-IMAGE SPEED, 2026-09-29** | Node, `mcwarnD` frame loop, n=3 matched pairs on one binary each: baseline **0.0986x** -> **0.78x** (a 24 MB MEM1 hash at every context switch, a verification instrument, removed from the image) -> **6.5x capacity** (Dolphin's busy-wait skip transcribed: 96.8% idle, 100 MHz executed; 15.5 MHz needed at 1.000x). With nothing to skip the executed rate is 300-380 MHz = 0.62-0.78 of Gekko: 1.000x needs >= ~22-38% idle. The browser figures in §10.6e predate both changes. §10.7 |
+| **WHOLE-IMAGE BOOT — THE GUEST'S FRAMES REACH DOLPHIN IN THE PAGE, 2026-09-29** | Behind `?srimage=1&srrender=1&srmode=main&srbase=…/guest/` (off by default): SAB boots from `__start` on a pthread in the browser, runs its frame loop at 59.943 DrawDones per guest second, and its whole frames stream to Dolphin's GP decoder — `[recompLive] fifo=2135B draws=3 skipped=0`, 0 page errors; the `?srcapture=0` arm posts nothing. The picture itself is not verified (offscreen WebGPU); the guest runs far below 1.000x. §10.6e |
+| **WHOLE-IMAGE BOOT — FRAME LOOP AT 59.94/GUEST-s, 2026-09-29** | With a PE model (DrawDone/PE-finish from a GP decoder over the FIFO) the overlay's frame loop runs: **556 DrawDones in 10 s of guest time = 59.944 per guest second**, idle 3 M of 4,860 M cycles (PE off: 4,379 M idle, stuck in `GXDrawDone`, same md5 `cad618ff9a675def5512086bb69de5e3`). Native Dolphin confirms the first overlay (`mcwarnD` at `0x811ffe60`), the XFBs and 640x480; it has a memory card, the SR boot does not yet. **Nothing is drawn.** §10.6d |
+| **WHOLE-IMAGE BOOT — FIRST FRAME SUBMITTED, 2026-09-29** | **The overlay's first frame reaches the GP FIFO: `GXCopyDisp` (BP `0x52 = 0x004803`, copy-to-XFB `0x538460`, 640x480) then `GXSetDrawDone`**, and the boot stops WAITING in `GXDrawDone` because no PE/GP model answers it — no VI flip yet. Got there by fixing the DI model reporting every completion as DEINT, recycling leaked host threads, correcting the apploader's FST address (`0x817EDE20`, not `hdr[0x430]`), and linking the first REL overlay (`mcwarnD.rel`) translated from OSLink's own bytes behind a hash guard. Binary `c177aeb92de7a22d250503bb66502c4d`, overlay off / poisoned-guard arms stop at the prolog on the same md5. **Nothing renders; no `drawn/s` is claimed.** §10.6c |
+| **WHOLE-IMAGE BOOT, 2026-09-29** | **Past `__OSInitAudioSystem`, `__ARChecksize`, `RealMode`, `__AI_SRC_INIT` and the DSP boot task, with interrupts delivered — to the first AX COMMAND LIST** (`SR_F_DSP_AXCMD`, 6 M guest cycles), node, binary `7e9f25717aa3e8cbc136dc2fe9287fe4`; **then through it** (§10.6a: AX command lists HLE'd, 18 lists / 1,152 PBs, binary `46645ebdadabcd49cedf4454b9a8c0a8`) **to main's loop at 48 M cycles, where a mode callback an overlay should have installed is NULL**; §10.6b adds the apploader's real arena (read from the disc's own apploader) and a DI model reading the ISO (the first file, `GCAX.conf`, is read; DI off parks the boot in that read for 10 s of guest time) — the NULL callback survives every arm (binary `f5aa45f7562baa082dbe28203e0347dd`). Eight run-time-switchable models (exception entry included) + `SR_OS_HLE` linked into the image, each with a run-time control arm on that md5 that brings back the wall it removed (the documented `__OSInitAudioSystem` stop included). The ucode SAB uploads hashes to `0x4e8a8b21` = AX. **Nothing renders**: AX command processing, DI, and a GX consumer are missing. §10.6 |
 | **guest OS CONTEXT SWITCH** | **WORKS** — 63 assertions / 0 failures, incl. a three-thread non-LIFO rotation on three real host threads and a control arm that reproduces `0xe00e78ac` with the host layer off. §6 (superseded there) and [`recomp/sr/CONTEXT_SWITCH.md`](../../recomp/sr/CONTEXT_SWITCH.md) |
 
 The two 2026-09-02 additions each came from a **harness** defect, not a translator one,
@@ -3096,6 +3101,511 @@ run that disagrees with it has a wiring bug.
    image's device model.
 5. **Only then** enumerate what genuinely cannot be serviced, with counts. `sr_image.c`
    hand-answers 16 addresses today; that is the whole surface at risk.
+
+### 10.6 PAST `__OSInitAudioSystem`: the whole image boots to its first AX command list (2026-09-29)
+
+Measured under **node** (`recomp/sr/run_image_node.mjs`, same V8 wasm limits, no browser, no
+probe lock), on whole-image `--all` binaries built by `build_image.sh` at HEAD + this work.
+Every number below comes from the JSON the runner writes; every model has a run-time switch,
+so **every control arm is the same binary and the same md5 (hash checked before and after
+every run)**. Machine load 0.3-2 during the arm table (the sibling agent's browser probes had
+finished). A browser run was NOT repeated for these binaries.
+
+**Reproducing the documented stop.** The §10.1 binary `7bcca5756df27133d684c4281410171b` is not
+in the tree (build outputs are git-ignored, `recomp/sr_image/.gitignore`), and HEAD's sources
+have moved since it was built, so that md5 cannot be rebuilt. What reproduces is the STOP: at
+HEAD, the `--all` binary `ed98732466d6b906ae10b5a2a8a55172` with the existing DSP model switched
+OFF (`SRN_DSP=0`) spins on `DSP_CONTROL` `0xCC00500A` in `__OSInitAudioSystem` (LR
+`0x800e4bb8`, last first-touch `0xCC005012` write, 17 registers) — §10.1/§10.2c's wedge. With
+the model ON (the default since §10.2c) the same binary already ran through `OSInit` and stopped
+in `__ARChecksize` on `AR_MODE` `0xCC005016` (LR `0x800f63b8`).
+
+**The build had to change first.** `-O2` on the 34.9 MB one-TU `sr_gen.c` was OOM-killed by the
+kernel at **13,505,824 kB RSS** (`dmesg`: `Killed process 2784 (clang)`) on this 16 GB box.
+`build_image.sh` now splits the generated file at function starts (`SR_SPLIT`, default 8 — the
+file has one header of forward declarations and no file-scope statics, so the split changes no
+semantics), compiles the parts one at a time with a per-part cache, and relinks a host-layer
+change in ~60 s. `SR_PTHREAD=1` links the `-pthread` variant `SR_OS_HLE` needs.
+
+#### The walls, in the order the boot meets them — headline binary `7e9f25717aa3e8cbc136dc2fe9287fe4`
+
+`SR_PTHREAD=1` build, `SRN_STRICT=1 SRN_HLE=12 SRN_BUDGET=4860` (strict now also stops on the
+first device/ucode fault, not only on an unimplemented boundary; the budget bounds a run at
+4,860 M retired Gekko cycles = 10 s of guest time).
+
+| # | wall (shipped PC) | what the device does | model (`sr_image.c` "THE NEXT DEVICES") | reference |
+|---|---|---|---|---|
+| 1 | `__OSInitAudioSystem` `0x800e4b74` | DSP reset/ARAM/mailbox handshake | §10.2c (existing) | §10.2c |
+| 2 | `__ARChecksize` `0x800f6320`, spin at `0x800f63c0` on `AR_MODE` | read-only, reads 1 | id 1 **AR**; also `Do_ARAM_DMA` transcribed exactly (register masks, HSP-None ARAM->MRAM writes ZEROS, mode-4 mirror) | `HW/DSP.cpp:148-149,:183,:456-567`; `HSP/HSP.cpp:27-40`; dolsdk2001 `src/ar/ar.c:222` |
+| 3 | `RealMode` `0x800e8a4c` from `__OSInitMemoryProtection` | `rfi` into real mode to run `Config24MB` (BAT writes) | id 2 **RM**: the shipped words are interpreted (whitelist: addi/addis/ori/rlwinm/isync/mfmsr/mflr/mtspr BAT,SRR0/1/rfi); anything else raises | shipped words `0x800e894c-0x800e89c8`, `0x800e8a4c-0x800e8a60` |
+| 4 | `OSInit` consoleType | `PI_FLIPPER_REV` reads `0x246500B1` | id 4 **PIREV** | `ProcessorInterface.cpp:29,:136` |
+| 5 | `__AI_SRC_INIT` spin at `0x800f5a2c` on `AISCNT` `0xCC006C08` | sample counter clocked by the CPU clock | id 6 **AI**: AICR/AISCNT/AIIT, 10,116 / 15,174 cycles per sample, the stopped-counter quirk transcribed | `AudioInterface.cpp:96-155,:187-189,:193-204,:213-315,:348-356` |
+| 6 | `__DSP_boot_task` spin at `0x800fea14` on `DSPCheckMailToDSP` | HLE: a CPU mail is consumed at once; the boot ROM collects the task and switches ucode by `HashEctor` | id 7 **UCODE**: `MailHandler` queue with per-mail interrupt, ROM ucode, INIT, and AX's mail protocol | `DSPHLE.cpp:63-76,:179-190`; `MailHandler.cpp:18-70`; `UCodes/ROM.cpp`; `Common/Hash.cpp:33-44`; `UCodes.cpp:154-167` |
+| 7 | interrupts | PI cause/mask; exception entry; guest dispatcher; `OSLoadContext` | id 3 **IRQ** (below) | `ProcessorInterface.cpp:50-82,:149-156`; `PowerPC.cpp:583-632`; dolsdk2001 `src/os/OS.c:344-420`, `include/dolphin/os/OSException.h:35-53` |
+| 8 | VI | Preset timing, half-line clock on retired cycles, DI0-3 `IR_INT`, PI VI line | id 5 **VI** (no pixels) | `VideoInterface.cpp:96-178,:317-334,:343-369,:435-447,:467-477,:760-773,:905-1002` |
+| 9 | audio DMA | block walk every 121,392 cycles, AID interrupt 200 cycles after enable and on wrap | id 8 **AID** (no samples leave) | `HW/DSP.cpp:266-270,:314-361,:424-454`; `SystemTimers.cpp:78-94` |
+| 10 | first `OSSleepThread` -> `SelectThread` `0x800ebd68` — the stop on the pre-AID binary `19296103af03be4887b2e599f36084ba`; on the headline binary wall 11 comes FIRST (the no-HLE arm below stops at the same AX fault) | a real thread switch | `SR_OS_HLE` linked into the image (§10.5 item 2), idle loop transcribed | CONTEXT_SWITCH.md; shipped words `0x800ebe94-0x800ebec0`; `CoreTiming.cpp:574-588` (idle skip) |
+| **11** | **first AX command list** (`SR_F_DSP_AXCMD`, `0xc6c20180`) | the AX ucode processes a 0x180-byte command list | **NOT MODELLED — raises** | `UCodes/AX.cpp:113-360` |
+
+**The ucode SAB boots is AX.** `BootUCode` hashes the uploaded IRAM image to `0x4e8a8b21`
+(`HashEctor`, computed in-image from the guest's own upload), which `UCodes.cpp:156` maps to
+`AXUCode`. AX's `Initialize` mail (`0xDCD10000`, with interrupt) is modelled; its **command list
+is not**, and the first one arrives at 6 M guest cycles (~14 ms), sent from an interrupt —
+the back chain at the stop is `0x800f8440 <- 0x800f5d44 <- 0x800e8094 (__OSDispatchInterrupt)
+<- 0x8006d820 <- 0x800d2874 <- 0x800d3aec (main)`, i.e. the AI-DMA callback's first audio frame.
+
+#### The interrupt path (id 3), and why it is not an approximation
+
+A guest exception is entered only at a **basic-block head** (`gekko_rt.h` `gk_retire`, which
+under `-DSR_MMIO` only now also compares the retired-cycle counter to the next device event —
+fixture builds are byte-identical: `sr_driver.c` objects md5 `2a547a27…` / `9fe618c5…` HEAD vs
+now, `-DSR_VERIFY` / plain), where every guest register is in `*st` (sr.py keeps no C locals
+across blocks). Entry is the CPU's (`SRR1 = MSR & 0x87C0FFFF`, `MSR &= ~0x04EF36`, external
+before decrementer) then `__OSEVStart`'s context save; the second-level handler
+(`ExternalInterruptHandler` `0x800e80c8`, `DecrementerExceptionHandler` `0x800e445c`, read from
+the `0x80003000` table the guest's OSInit filled) is checked word-for-word against
+`OS_EXCEPTION_SAVE_GPRS` and its closing `b` is decoded — `__OSDispatchInterrupt` `0x800e7d84`
+then RUNS TRANSLATED. Its `OSLoadContext(context)` never returns: `img_host` longjmps to the
+live delivery frame (per host thread, `_Thread_local`), and `sr_host_os.c`'s own `ctx_load`
+(RAS fixup included) restores the registers. Stated gaps: **SRR0 is written as 0** (sr.py has no
+PC); FPRs are snapshotted around the handler instead of the lazy FP-unavailable save.
+
+One bug this found in the existing thread layer, fixed in `sr_host_os.c`: `slot_for()` handed a
+new thread **slot 0 — the caller's own** when the caller had never been bound (the ctxsw harness
+binds it explicitly; the boot cannot know the default thread's address in advance). Measured
+before the fix: `HANDOFF 0x802bafc8->0x8036dd40` followed by `SELECT_RETURN` on the SAME host
+thread and no `THREAD_ENTRY`, i.e. one host thread running two guest threads. The first switch
+away from an unbound slot now binds it. `verify_ctxsw.mjs`: **63 passed / 0 failed** after every
+`sr_host_os.c` change here.
+
+#### Falsifying control arms — ONE binary, `7e9f25717aa3e8cbc136dc2fe9287fe4`, md5 identical before/after every arm
+
+| arm | ends with | LR / where | device reads | regs | M cycles |
+|---|---|---|---|---|---|
+| **all models ON** | **strict fault `0xc6c20180` (AX command list)** | `0x800f82d8`, in the AI-DMA callback | 237 | 60 | 6 |
+| `SRN_DSP=0` | watchdog | `0x800e4bb8` `__OSInitAudioSystem` — **§10.1's documented stop** | 3,000,001 | 17 | 9 |
+| `SRN_EXI=0` | watchdog | `0x800e9820` `__OSReadROM`/EXISync — §10.2's | 3,000,001 | 13 | 18 |
+| `SRN_AR=0` | watchdog | `0x800f63b8` `__ARChecksize`, on `0xCC005016` | 3,000,001 | 50 | 15 |
+| `SRN_RM=0` | strict UNIMPL `0x800e8a4c` | `0x800e8aa4` `__OSInitMemoryProtection` | 31 | 24 | 0 |
+| `SRN_AI=0` | watchdog | `0x800f5a2c` `__AI_SRC_INIT`, on `0xCC006C08` | 3,000,001 | 57 | 15 |
+| `SRN_UCODE=0` | watchdog | `0x800fea18` `__DSP_boot_task`, on `0xCC005000` | 3,000,001 | 59 | 27 |
+| `SRN_IRQ=0` | **budget — 4,860 M cycles, never reaches the AX wall**, 0 interrupts | `0x800f857c` (DSP task code) | 217 | 56 | 4,860 |
+| `SRN_VI=0` | budget, never reaches the AX wall | `0x800f857c` | 265 | 75 | 4,860 |
+| `SRN_PIREV=0` | same AX fault — but `consoleType` (`0x8000002C`) reads **`0x10000004`** vs **`0x10000006`** ON (`= 4 + (0x246500B1 >> 28)`, shipped words `0x800e37b0-0x800e3800`) | `0x800f82d8` | 237 | 60 | 6 |
+| `SRN_AID=0` | the AX frame is never sent; the boot goes on to **`0xe1000000`** (`sr_indirect` to address 0 — a null function pointer) in `main` | `0x800d3b74` | 300 | 109 | 48 |
+| no `SRN_HLE` (osMode 4) | same AX fault — the first command list precedes the first thread switch | `0x800f82d8` | 237 | 60 | 6 |
+
+The AID arm is a control, not a result: with no audio DMA no frame is requested, so the boot is
+running on a machine whose audio never starts. That it then calls through a null pointer in
+`main` is recorded, not diagnosed.
+
+#### Exploratory arm — what is behind the AX wall (NOT a result)
+
+`SRN_PAST_FAULT=1` keeps delivering interrupts after the first fault (default OFF: a faulted
+guest is not the machine). Same binary, non-strict, 10 s budget: **2,600 external interrupts
+delivered**, 108 distinct registers (VI 45, DSP 30, CP 17, EXI 12, PI 8, PE 8, SI 6, AI 5,
+MI 3, DI 3), **644 GX FIFO writes / 1,727 bytes** (GXInit), four guest threads created and
+switched (`0x802bafc8` main prio 16, `0x8036dd40` prio 12, `0x8036da30` prio 24, `0x8036e050`
+prio 8 suspended), and the main thread in `VIWaitForRetrace` (`0x800f28a8`) called from the
+video-init routine `0x80118134` (VISetNextFrameBuffer / VIFlush / wait). No DVD command was
+issued (DI: 3 registers, all init). From ~2,000 M cycles on the state is FROZEN with the
+run queue holding two ready threads (`RunQueueBits 0x88000`) while `__gCurrentThread` is 0 —
+either the guest reacting to a DSP that never answered, or a scheduling defect in the
+interrupt/thread interplay; it is not separated here and nothing after the AX fault is claimed.
+
+#### 10.6a THE AX WALL, REMOVED — `sr_ax.c`, and the next stop is a NULL "current mode" pointer
+
+`recomp/sr/sr_ax.c` is a C transcription of the reference AX HLE for ucode `0x4e8a8b21` only:
+`UCodes/AX.cpp` `HandleCommandList` (all 20 commands; `CMD_COMPRESSOR` raises because the
+reference asserts this ucode cannot send it), `ProcessPBList` with the no-LPF PB memory layout
+(`HasLpf`), `LoadPBUpdates`/`ApplyUpdatesForMs`, `ConvertMixerControl`'s `0x4e8a8b21` branch,
+`AXVoice.h` `ProcessVoice` (AX_GC arm: linear resampling because no `dsp_coef.bin` is present —
+the reference configuration — signed volume envelope, `MixAdd` with dpop), and
+`Core/DSP/DSPAccelerator.cpp` `ReadSample` (ADPCM / PCM, the 16-byte-frame pred-scale reload,
+the end-address exception with `AXVoice.h`'s loop/one-shot handling). The work-end mail
+`DSP_YIELD` is pushed with its interrupt 2,500 cycles later (`AX.cpp:92-111`). Switch: model
+id 9 **AXCMD**.
+
+Binary **`46645ebdadabcd49cedf4454b9a8c0a8`** (md5 identical before/after every arm),
+`SRN_STRICT=1 SRN_HLE=12 SRN_BUDGET=4860`:
+
+| arm | ends with | LR | reads | regs | M cycles | interrupts | AX lists / PBs | GX writes | idle skips |
+|---|---|---|---|---|---|---|---|---|---|
+| **all ON** | **`0xe1000000` — `blrl` to address 0** | `0x800d3b74` (main) | 606 | 109 | 48 | 47 | **18 / 1,152** (0 voices running) | 873 | 510 |
+| `SRN_AXCMD=0` | `0xc6c20180` — the §10.6 AX wall, back | `0x800f82d8` | 237 | 60 | 6 | 2 | 0 / 0 | 0 | 0 |
+| `SRN_AID=0` | the same `0xe1000000` | `0x800d3b74` | 300 | 109 | 48 | 11 | 0 / 0 | 873 | 498 |
+
+**The new wall is not audio** — the AID-off arm reaches the identical fault without a single AX
+frame. `sr_driver.c`'s `sr_indirect` now records the call site under `-DSR_MMIO` (fixture
+objects unchanged: `sr_driver.c` md5 `2a547a27…` / `9fe618c5…`, HEAD vs now), and it is
+`0x80019e30`, in `0x80019e18`:
+
+```
+80019e24  lwz  r3, -31420(r13)   ; the "current mode" object, SDA 0x803AD904
+80019e28  lwz  r12, 12(r3)       ; its update callback
+80019e30  blrl                   ; ...called from main's loop at 0x800d31dc/…/0x800d39e0
+```
+
+`0x803AD904` reads **0** at the stop (`SRN_PEEK`), so `r12` came from address `0x0000000C`. No
+instruction in `main.dol` stores to `-31420(r13)` except the setter at `0x8001a01c`, and nothing in
+`main.dol` references that setter (no `bl`, no `lis/addi` pair, no data word) — so the object is set
+from code that is **not in the DOL**, i.e. an overlay (`.rel`), which has to be read from the disc.
+And the disc has not been touched: DI shows 3 registers, all init, **no DVD command issued**.
+So the next wall is the **DI device + the disc**, and why the boot reaches `main`'s loop without
+having issued a read is the first question for it.
+
+⚠ Two runtime gaps this exposed, stated: (1) `gk_phys` masks an EA below `0x80000000` into MEM1,
+so the load from `0x0000000C` returned low memory instead of the DSI the hardware would take —
+the fault landed one instruction later, on the `blrl`; (2) an indirect call to a HOST-BOUND
+function used to fault `0xE1` (sr.py keeps host-bound functions out of `sr_dispatch`); under
+`-DSR_MMIO` it now reaches the host hook.
+
+#### 10.6b The apploader's arena, the DVD interface, and the wall that is left
+
+**The arena covered the FST — found by reading the disc's own apploader.** `sr_boot_stage.js`
+stages `arenaHi = 0` (so `OSInit` falls back to `__ArenaHi` `0x81700000`) and names the
+consequence as a known gap: the arena then covers the FST at `0x803EDE20`. The shipped apploader
+(ISO `0x2460`, loaded at `0x81200000`, dated 2001/11/14) says what the machine really holds.
+
+> ⚠ **CORRECTED 2026-09-29 (§10.6c).** This paragraph first said the apploader reads the FST to
+> `hdr[0x430]` (`0x803EDE20`). **That was wrong**: `hdr[0x430]` is not the address the shipped
+> code uses. The apploader COMPUTES it: `0x812004c8-0x812004f4` set `*0xEC = (0x80000000 +
+> *0x28 - bi2[0]) & ~31`, and `0x81200554-0x812005c8` place the FST at
+> `(*0xEC - hdr[0x42C]) & ~31` = **`0x817EDE20`** on this disc (bi2 goes `0x2000` below it,
+> `0x812005ec-0x81200624`). Staged at `0x803EDE20` the FST sat inside the game's heap; an early
+> `memset` overwrote it and the first `DVDOpen` after `GCAX.conf` failed. The runner's comments
+> (`run_image_node.mjs`, the apploader block) carry the PC-by-PC derivation.
+
+`0x81200b98-0x81200bd0` finish with `*0x80000024 = 1`, `*0x80000030 = 0`,
+**`*0x80000034 = *0x80000038 = FST`**, `*0x8000003C = hdr[0x42C]` — arenaHi IS the FST's
+address. `run_image_node.mjs` now performs exactly those writes, values read
+from the ISO (`SRN_APPLOADER`, default 1). `sr_boot_stage.js` / `sr_image_worker.js` (outside this
+work's paths) still carry the old values and need the same correction.
+
+**DI** (model id 10, `sr_image.c`): registers with their write masks, the post-BS2 power-on state
+(`ReadyNoReadsMade`, cover closed, `DICFG = 1`), Inquiry / Read sector / Read disc ID / Seek /
+RequestError / StopMotor / AudioBufferConfig, `CheckReadPreconditions`, the out-of-bounds check,
+`FinishExecutingCommand` and TCINT/DEINT — all `HW/DVD/DVDInterface.cpp`. Data is read from the
+ISO by the host (`SR_NODEFS=1` links `-sNODERAWFS`; node only). Every command completes after the
+reference's `MINIMUM_COMMAND_LATENCY_US` = 300 us; its seek/rate model for reads is **not**
+reproduced. DTK streaming raises. Also found on the way: exception delivery must NEST — with one
+`jmp_buf` per host thread, a handler that re-enabled interrupts let an inner delivery overwrite the
+outer one and emscripten's `throw Infinity` escaped the module; it is now a per-thread stack.
+
+Binary **`f5aa45f7562baa082dbe28203e0347dd`** (`SR_NODEFS=1 SR_PTHREAD=1`), `SRN_STRICT=1
+SRN_HLE=12 SRN_BUDGET=4860 SRN_ISO=<sab.iso>`, md5 identical before/after every arm:
+
+| arm | ends with | M cycles (idle) | regs | interrupts | AX lists | GX writes | DVD commands |
+|---|---|---|---|---|---|---|---|
+| **all ON** | `0xe1000000` null "current mode" callback (call site `0x80019e30`) | 40 (1) | 115 | 45 | 17 | 873 | **1: `A8000000` 0x7C0 bytes at disc 0x3D976928 = `GCAX.conf`** (FST entry 1487) |
+| `SRN_DI=0` | budget: **main parked in the DVD read** (`0x800ef544 <- 0x8013a1d4 <- 0x8013f794`), 4,823 M of 4,860 M cycles idle | 4,860 | 68 | 5,205 | 2,002 | 0 | 0 (the command is written, never completed) |
+| `SRN_APPLOADER=0` | the same null callback — **with zero DVD commands** (the `GCAX.conf` open no longer reaches the drive) | 48 (3) | 109 | 47 | 18 | 873 | 0 |
+
+So the disc path works and is load-bearing (DI off parks the boot forever), the apploader fix is
+load-bearing (off, the audio config is never read), and **the null mode callback survives both**:
+it is not audio (§10.6a's AID arm), not the disc and not the arena. Its setter (`0x8001a01c`) is
+referenced nowhere in `main.dol`; the disc carries 76 `.rel` overlays (`advertiseD.rel`,
+`mcwarnD.rel`, … — FST); and no overlay read was issued before `main`'s loop made the call. Why
+the boot does not load one is the open question, and it needs the native oracle
+(`docs/ORACLES.md`, not available on this box) to answer in one run rather than by inference. Two
+candidates, neither tested: an overlay chosen by the memory-card probe (EXI has only the TSTART
+model, no card device), or a loader thread the scheduling here starves.
+
+#### 10.6c To the first frame SUBMITTED: a DI bit bug, a thread leak, and the overlay (2026-09-29)
+
+The null "current mode" callback of §10.6b was **not** a missing overlay load and not a starved
+loader. It was three defects in this host layer, each found by reading the shipped code at the
+point the run stopped, and behind them the overlay itself.
+
+**1. Every DVD completion was reported as an ERROR.** `di_finish` ORed `g_di_done_int` into
+DISR, but that variable holds the bit NUMBER (4 = TCINT, `DVDInterface.h:211`), so every
+"transfer complete" raised `0x04` = **DEINT** (`:209`). The DISR ring (`SRN_*` diagnostic
+`diTrace`) showed it directly: every raise read back `0x2e` = masks `0x2a` | DEINT. SAB's
+`__DVDInterruptHandler` turns that into cause 2 (`0x800edf3c-0x800edf70`: `intr = (DISR & 0x54)
+& (mask << 1)`, TC -> 1, DE -> 2), and `cbForStateBusy` answers a non-TC completion with
+RequestError (`0x800f0f84-0x800f107c`) — the `E0`/`E3` (StopMotor) pair the log recorded after
+the third read. Why the first two reads (`GCAX.conf`, and a `0xD00` read) did not also end in RequestError was not traced.
+Fixed to `1u << g_di_done_int`. Binary `0afcdc49e36fdcc9c9ec355a2f8ce31b` (before): 5 DVD
+commands, `E0`+`E3`; binary `10bb853f9ef5bb3ca4e59725f96ff95c` (after): 12 reads, all TC, no
+error command.
+
+**2. Host threads leaked until the pool ran out.** With the reads completing, the boot created
+and retired guest threads until `slot_for` found no free host thread (fault `0xC5048410`,
+`SR_F_NO_HOST_THREAD`, 83 M cycles). A host thread whose guest thread EXITED (SelectThread with
+nothing to save) or was ORPHANED (the game re-created its `OSThread`, §10.6b's stale-resume fix)
+parked forever — the one leak `CONTEXT_SWITCH.md` §7 documented. Each pool thread now keeps a
+`jmp_buf` at the top of `ht_main`; such a thread `longjmp`s back and frees its slot (an orphan is
+woken only to do that, and its re-creator waits until it has). Slot 0, the caller's own thread,
+keeps the old behaviour. `verify_ctxsw.mjs`: **63 passed, 0 failed** on the rebuilt fixtures
+(`3cb2f051a0f235bbf39255f91610f053` / trace `10ebfd79215419154d9ef9448eba523e`).
+
+**3. Then the overlay — which was the "only reachable from an overlay" setter all along.** The
+next stop is `unimplemented host boundary at 0x811fff40`: `LoadRel` (`0x80019e70`) has read
+**`mcwarnD.rel`** (DI log: `0x4ea0` bytes at disc `0x41BBFC6C` -> `0x811ffe60`; FST name by
+offset), `OSLink`ed it (`0x80019f18`) and calls `module->prolog` (`0x80019f20-0x80019f28`) — code
+that is not in `main.dol`. So the mode callback is installed by the memory-card-warning overlay,
+exactly as the §10.6b static reading of `0x800d385c-0x800d386c` (`LoadRel("MCWARN", 0)`) said.
+
+**Overlays in the whole image** (`rel_image.py`, new; `SR_OVERLAYS=` in `build_image.sh`): the
+overlay is translated from the bytes OSLink produced — a MEM1 dump the runner writes at the stop
+(`SRN_DUMP=`), because `Relocate()` patches ADDR16/ADDR32/REL24 sites in place
+(`dolsdk2001 src/os/OSLink.c:146-200`) and the file holds placeholders there (658 of 3,146 words
+differ for `mcwarnD` sec1). Section addresses are read from the LINKED header in RAM, boundaries
+from `rel.translate_module_reach`, and only overlay functions are emitted — calls into the DOL go
+straight to the image's own `fn_` bodies (139 functions, 0 refused, 44 direct DOL callees, 0
+`sr_extern`). **The guard**: each module carries the FNV-1a of its linked exec section; `sr_image.c`
+re-hashes the RAM range before trusting an entry (cached until the next DI or ARAM->MRAM DMA) and a
+mismatch refuses the entry, which then faults as untranslated. Not covered: code the CPU copies in
+without a DMA (SAB reads its RELs in place).
+
+Binary **`c177aeb92de7a22d250503bb66502c4d`** (`SR_NODEFS=1 SR_PTHREAD=1
+SR_OVERLAYS=ov_mcwarnD.c`), `SRN_STRICT=1 SRN_HLE=12 SRN_BUDGET=4860 SRN_ISO=<sab.iso>`, md5
+identical before/after each arm, load 1.1-1.6:
+
+| arm (`SRN_OV`) | ends with | M cycles (idle) | overlay entries / refused | DVD cmds | GX bytes | copies to XFB |
+|---|---|---|---|---|---|---|
+| `0` overlays off | `unimplemented host boundary at 0x811fff40` (the prolog) | 83 (3) | 0 / 0 | 13 | 2,466 | 1 (init) |
+| `2` guard poisoned | the same, **refused** | 83 (3) | 0 / **1** | 13 | 2,466 | 1 |
+| **`1` guarded** | budget, 10 s of guest time | 4,860 (4,379) | **6 / 0** | 30 | 3,506 | **2** |
+
+GX stream (`SRN_GX=<file>` arms sr_gx.c's capture; capture off is the same binary's default) in
+the ON arm, parsed as GP opcodes, md5 `bea4af6cfe6bc9cad220190d042f12c9` on two runs:
+`BP 0x4a 0x077e7f` (640x480 source), `BP 0x4d 0x28` (stride 1,280 B), `BP 0x4b 0x029c23` (dest
+`0x538460`), **`BP 0x52 0x004803` — the EFB copy with bit 14 = copy to XFB and bit 11 = clear,
+i.e. `GXCopyDisp`**, then **`BP 0x45 0x000002` = `GXSetDrawDone`**. The first `GXCopyDisp` (byte
+1707) is the init-time one that already existed before this section; the second is the overlay's
+first frame.
+
+**THE STOP: a frame has been SUBMITTED, and nothing consumes it.** At the budget the main thread
+(`0x802bafc8`) is WAITING in **`GXDrawDone`** (`0x8010154c`: it writes `0x45000002` to the FIFO,
+clears the DrawDone flag at SDA `-29408` and `OSSleepThread`s until it is set) — back chain
+`0x801015a4 <- 0x80117d64 <- 0x80070c30 <- 0x812001a0` (**the overlay**) `<- 0x80019e60` (main's
+call through the once-NULL mode pointer) `<- 0x800d3890 <- 0x800d3b30`. The flag is set only by
+the PE FINISH interrupt handler, and there is **no PE / GP model**: the FIFO bytes go nowhere.
+VI `TFBL` (`0xCC00201C`, peeked from the device page) still reads `0x004a2460` — the other half of
+the double buffer (`0x538460 - 0x4a2460 = 0x96000 = 640*480*2`): **no VI flip has happened**, and
+cannot until DrawDone returns. Idle is 90% of guest time because every thread is waiting on it.
+
+Neither of the coordinator's two candidate causes was it: the memory card was never consulted
+before the overlay choice was acted on (no card model was built; `mcwarnD` is loaded anyway, and
+whether SAB would pick it with a card present is an open question below), and no loader thread
+was starved (the DVD reads were issued and completed; they were being reported as errors).
+Step 2's "frozen scheduler" (two ready, none running) does not recur on this binary: at the
+budget the run queue is empty with `0x802bafc8` WAITING in `GXDrawDone`, `0x8036dd40` WAITING
+(back chain `0x800f28d0 <- 0x80135cc0`, not identified), `0x8036da30` in the idle path of
+SelectThread and `0x8036e050` READY at its entry `0x80135d28`. Both READY threads carry
+**`suspend = 1`** (peeked at `OSThread+0x2CC` on the same md5: `0x8036e318 = 0x00010001,
+0x00000001, prio 8` and `0x8036dcf8 = 0x00010001, 0x00000001, prio 24`), so an empty run queue
+is what the OS itself says, not a lost switch. That is consistent with the stale-resume and leak fixes having
+been its cause; it is not proven that they were.
+
+#### 10.6d The oracle's answer, and the frame loop running (2026-09-29)
+
+**Oracle (real Dolphin, the shipped JIT path).** `gamecube/tools/dolphin_render_probe.js`,
+`ROM_IDX=1` cold boot, headless, `dolphin_worker_emcc.wasm` md5 `ced4905af7d45e977433255f07a9e0c9`
+(unchanged across every run), load < 2, guest MEM1 read with `PROBE_MEM1_PEEK` at fixed wall
+times (one run per time):
+
+| wall time | `__OSModuleInfoList` (0x800030C8) | header at 0x811FFE60 |
+|---|---|---|
+| 22 s | empty | zeros |
+| 26 s | empty | zeros |
+| 30 s | empty (already unlinked) | **id `0x5a` = 90 = `mcwarnD.rel`**, then `0x13` sections, sectionInfo `0x811ffea8`, name `0x80fedd68` — byte-identical to the SR boot's linked header |
+| 35 s / 55 s | head = tail = `0x811ffe60` | **id `0x5c` = 92 = `otherprintD.rel`** |
+
+and `*0x800000F4 = 0x817EBE20` (bi2 = FST - 0x2000), i.e. **the apploader FST correction of §10.6c
+is what Dolphin holds**. The probe's own snapshot reports `xfbAddr` `4a2460` then `538460` with
+`xfbDims` `28001e0` (640x480) — the same two XFBs and size as the SR stream. So: **the first
+overlay is `mcwarnD`, at the same address, and the XFB target/size agree.** Whether Dolphin's first
+copy has clear on was not read (no BP log on that path). **Dolphin has a card in slot A**:
+`Config::MAIN_SLOT_A` defaults to `MemoryCardFolder` (`Core/Config/MainSettings.cpp:133-134`) and
+nothing under `DolphinLibretro/` overrides it; there `mcwarnD` is gone within ~4 s and the boot moves on
+to `otherprintD`. The SR boot has no card, so it stays in `mcwarnD` — see "still missing".
+
+**PE model (id 11) + a GP command decoder.** `sr_gx.c` now decodes every WPAR byte as GP commands
+(Dolphin's `OpcodeDecoding.h:130-245` sizes, `CPMemory.cpp:132-182` VCD/VAT state, the
+`VertexLoader_*` size tables for primitives; display-list contents are not decoded; an unknown
+opcode faults), with the capture arm off or on. `sr_image.c` turns BP `0x45 = 2` / `0x47` / `0x48`
+into `PixelEngine::SetFinish`/`SetToken` (one event, 500 CPU cycles later — the single-core
+floor of `RaiseEvent`; the GPU's own cost is not modelled), latched into PE_FINISH / PE_TOKEN on PI
+behind PE_CTRL's enables (`PixelEngine.cpp:134-219`). Each copy to the XFB also cuts the captured
+stream into frames (`sr_gx_cuts`).
+
+Binary **`cad618ff9a675def5512086bb69de5e3`**, same flags as §10.6c, 10 s of guest time:
+
+| arm | idle M cycles | GP cmds | prims / verts | unknown ops | PE finishes | XFB copies | TFBL changes | TFBL at end |
+|---|---|---|---|---|---|---|---|---|
+| `SRN_PE=0` | 4,379 of 4,860 | 409 | 0 / 0 | 0 | 0 | 2 | 1 | `0x4a2460` (stuck in `GXDrawDone`) |
+| **`SRN_PE=1`** | **3** of 4,860 | 132,032 | 1,718 / 6,872 | **0** | **556** | 557 | 1,111 | `0x538460` |
+
+**The guest's frame loop, in guest time:** 556 DrawDone completions from 357.1 M to 4,856.8 M
+cycles = **59.944 per guest second** (NTSC 60 Hz field rate: 59.94); XFB copies 55.9/s over a window
+that includes the pre-overlay init copy. TFBL changes at 111.6/s — twice per frame; what the second
+write per frame is was not identified, so that column is a register-write count, not a flip rate.
+1.2 MB of GP stream decoded with zero unknown opcodes and zero invalid colour formats, which a
+desynchronised decoder would not produce over 132 k commands (evidence of sizing, not proof).
+**Still nothing is drawn**: the stream is decoded for its side effects only.
+
+#### 10.6e The guest's own frames in the page, through Dolphin's decoder (2026-09-29)
+
+**Opt-in only.** `gamecube.html?srimage=1&srrender=1&srmode=main&srbase=/gamecube/recomp/sr_image/guest/`
+— with no page change: the existing render arm (`?srimage=1&srrender=1`) already relays
+`{cmd:'frame', fifo, mem1, regions}` from `sr_render_worker.js` to the dolphin worker's
+`recompFrame` consumer (`worker_funcs.js` `recomp_render_fifo` -> `recomp_present`). What is new:
+
+- `sr_image/sr_guest.js` (shared by the page worker and the node harness): stages the apploader's
+  writes from the disc bytes, puts the whole ISO in wasm memory (`sr_image_set_disc_mem`; the DI
+  model memcpy's instead of stdio), starts the guest **from `__start` on a pthread of its own**
+  (`sr_image_boot_thread`: that thread becomes slot 0, so the worker's JS thread stays free), and
+  pumps frames out of the shared wasm memory.
+- `sr_gx.c` capture arm 2, **the frame ring**: an 8 MB byte ring published a whole frame at a
+  time (release store at each copy to the XFB); the reader reports `lost` instead of rendering a
+  torn stream. A post carries every whole frame since the last one (never skips a GP command, so
+  the consumer's CP/XF/BP state stays exact) plus a MEM1 snapshot taken at post time (**not**
+  frame-consistent: the guest keeps running while it is copied — stated, not solved).
+- `sr_render_worker.js`: `?srmode=main` with an image exporting `_sr_image_boot_thread` runs this
+  guest arm; if the page did not stream the disc (`?srdisc=`) the worker fetches SAB's 17 parts
+  itself and inflates each straight into wasm memory. Any other image keeps the old `main` arm.
+- The image: `SR_PTHREAD=1 SR_MEM=1879048192 SR_POOL=14 SR_ENV=web,worker SR_OVERLAYS=ov_mcwarnD.c`
+  (wasm `2bdced8dd999632264ced11acd2f438f`, gitignored under `sr_image/guest/`, like every image).
+
+**Node, the same module** (`sr/run_image_stream.mjs`, same md5, 60 s wall, `nice 19`): 6.123 guest s,
+323 PE finishes at **59.947 per guest second**, 324 posts / 324 copies-to-XFB found by an
+independent GP walk of the posted bytes, **0 bad opcodes, 0 overruns, 0 bytes lost**.
+
+**Browser** (`dolphin_render_probe.js`, `ROM_IDX=1`, headless, 200 s, dolphin wasm
+`ced4905af7d45e977433255f07a9e0c9` and SR wasm unchanged before/after; load 1-7 while a sibling
+worked):
+
+| arm | guest s reached | XFB copies / PE finishes (guest) | DrawDone rate (guest time) | posts consumed by Dolphin | Dolphin's own report | page errors |
+|---|---|---|---|---|---|---|
+| **capture on** | 15.43 | 882 / 881 | **59.943/s** | 800+ (`[recompLive] f241/f481/f721`) | **`fifo=2135B draws=3` per frame, `skipped=0`** | 0 |
+| `?srcapture=0` (same wasms) | 14.97 | 854 / 853 | 59.943/s | 0 (no `[recompLive] f` line) | — | 0 |
+
+`draws=3` is Dolphin's decoder-level draw count for one frame of this stream, matching the SR
+side's own primitive count (2,693 primitives / 882 frames = 3.05). **The canvas is NOT evidence
+here**: its 2D sample (`nonBlack 32622`, rows 133-285) is byte-identical in the capture-off arm,
+so it is the JIT boot's leftover, not this stream; the WebGPU output is offscreen in this
+container and was not read. **What is shown**: the guest's frames reach Dolphin's GP decoder
+whole and in order, and are drawn there (3 draws each) and presented from the guest's XFB
+address. **What is not shown**: the picture. **Rate**: the guest reached ~15 guest s in the run —
+the guest is far below 1.000x in the browser (not measured against wall time precisely here;
+node measured 6.1 guest s per 60 wall s at nice 19), and the page presents a post every 100 ms of
+host time. Neither number is a speed-up; gate #9.
+
+#### 10.7 SPEED — the whole image against 1.000x (2026-09-29)
+
+**Rig.** `gamecube/recomp/sr/run_image_stream.mjs` with `SRS_POSTMS=0` (no frame pump, so no
+MEM1 copies on the measurement arm): the guest boots on its own pthread exactly as in the page,
+the main thread samples guest counters once per wall second, and the window runs from the
+first sample past 1.0 guest s (inside `mcwarnD`'s frame loop) to the end. Node 22, `nice 0`,
+4 cores, load stated per row. **guest s / wall s** = credited guest cycles / 486e6 per wall
+second; **executed MHz** = credited minus idle-skipped cycles per wall second (retired-work
+CYCLES, summed Gekko costs per block — not an instruction count); **idle** = skipped / credited.
+At 1.000x the host must execute 486 x (1 - idle) MHz.
+
+**Baseline** (wasm `cfcf36640b7374fceae32d354ace1a60`, n=3, load 1.2-2.3): **0.0986 / 0.0986 / 0.0986
+guest s per wall s**, 47.9 MHz executed, idle **0.0000**, 5.91 DrawDones per wall s. Needed at
+1.000x: 486 MHz.
+
+**Where the time went** (`node --cpu-prof`, a `--profiling-funcs` build, used to LOCATE only):
+of the ~40 s the three guest threads were busy, **32.6 s was `host_select_thread` self time**
+and every translated function together ~5 s. The cause, read in the source: `snapshot()`
+(sr_host_os.c) hashed all 24 MB of MEM1 with FNV-1a at EVERY context switch — a
+verify_ctxsw.mjs instrument, never meant for a running game.
+
+**Change 1 — the MEM1 hash off for the image** (`sr_os_set_snap_mem`, default ON so
+verify_ctxsw keeps its evidence; `sr_image_init_hle` turns it off). Matched pair on ONE binary
+(`6d1c0724ed6346f857863c8ba947d379`), the hash re-armed at run time (`SRS_SNAPMEM=1`) as the control:
+
+| arm | guest s / wall s (n=3) | executed MHz | idle | load |
+|---|---|---|---|---|
+| hash ON (old behaviour) | 0.1024 / 0.1033 / 0.1063 | 49.8-51.6 | 0 | 1.1-1.6 |
+| **hash OFF** | **0.7724 / 0.7830 / 0.7747** | **375.4-380.5** | 0 | 1.2-2.3 |
+
+**7.5x.** The remaining gap to 1.000x is 486 vs ~377 MHz with ZERO idle: the image never idles
+on this screen. Profiled again: `fn_80117df8` 20.4 s + `fn_800f3710` 11.6 s of ~35 s busy — a
+FRAME LIMITER, `while (VIGetRetraceCount() <= last + n - 1) ;` (0x80117e0c-0x80117e24; the map
+names 0x800f3710 `IPCGetBufferLo`, but its body is `lwz r3,-29952(r13); blr`, the retrace
+counter). The guest spends ~90% of its executed cycles spinning on a counter only the VI
+interrupt changes — which is exactly what Dolphin's idle skipping exists for (below).
+
+**Change 2 — Dolphin's busy-wait skip** (`sr.py --idle-skip`, `SR_IDLE_SKIP=1`): the loop
+detector is Dolphin's `IsBusyWaitLoop` transcribed (PPCAnalyst.cpp:737-788: loops to its own
+start, no CTR branch, only Integer/Load instructions, never overwrites a register it read first;
+a `bl` to a pure getter is followed and inlined as Dolphin's block builder does). The taken
+back-edge calls `gk_idle_loop`, i.e. CoreTiming::Idle — guest time jumps to the next scheduled
+event. **150 loops** in main.dol (+1 in `mcwarnD`), the frame limiter at 0x80117e0c among them;
+the generated C differs from the default build ONLY at those 150 back-edges (checked by diff),
+and a default build (`--idle-skip` absent) is unchanged. Matched pair on ONE binary
+(`0cd0ec34d1b76825b04c645b802713f3`), `sr_image_set_idle_loop(0|1)` at run time, window
+1.0-30.0 guest s (all inside `mcwarnD`; see the note on 34 guest s below), load 1.1-1.2:
+
+| arm | guest s / wall s (n=3) | executed MHz | idle | MHz needed at 1.000x |
+|---|---|---|---|---|
+| skip OFF | 0.6833 / 0.6365 / 0.6235 | 303-332 | 0 | 486 |
+| **skip ON** | **6.476 / 5.918 / 6.473** | **92-100** | **0.968** | **15.5** |
+
+(The ON window is only ~4 wall s at 1 s sampling — coarse; the per-second series inside it reads
+7.0-7.3 guest s/wall s at 0.969 idle in steady state.) Also re-measured on the same window,
+change 1's pair: hash ON 0.1046 / 0.1046 / 0.1028, hash OFF 0.7779 / 0.7833 / 0.7463.
+
+**Where that leaves 1.000x.** On this screen the image has **~6.5x headroom** in node: at
+1.000x it would need 15.5 MHz of executed guest work and it executes ~100 MHz while doing
+so — a capacity figure, not a speed-up: nothing here runs the guest faster than 1.000x, and
+the skip is the same trajectory in fewer host instructions. **The structural limit for a
+heavier scene is the executed rate: ~300-380 MHz of guest cycles per wall second when nothing
+is skipped (0.62-0.78 of a 486 MHz Gekko).** So 1.000x holds for any scene that idles at least
+~22-38% of its guest time, and not below that. The JIT path's measured idle across scenes was
+24-72% (CLAUDE.md gate 10), so a heavy in-game scene would sit at or near the line; raising
+the executed rate itself (build flags, the per-block event check, context-switch hand-off
+cost) is the next work, and it needs a heavier scene than `mcwarnD` to be profiled honestly.
+
+**A new functional wall, found by running faster.** At ~34 guest s the game unloads `mcwarnD`
+and calls into a NEW REL at 0x811fff40; its bytes do not match the translated module, the guard
+refuses it (`ovRefused`), and the run faults `0xC61FFF40` and degrades (0 frames, 0.2-0.3 guest
+s/wall s) — every measurement above ends its window at 30 guest s for that reason. Which REL it is
+(expected: `otherprintD`, as in Dolphin §10.6d) is the next overlay to translate.
+
+#### What is still missing before a first rendered frame
+
+0. ~~A GP consumer that answers DrawDone~~ — PE modelled, §10.6d; the frames still need a renderer
+   (next item) and the boot needs a memory card in slot A to follow Dolphin past `mcwarnD`.
+0b. **A GP consumer that renders** (PE FINISH, and the PE token for `GXSetDrawSync`),
+   i.e. §10.2d's routing of this FIFO to Dolphin — the frame exists as a GP stream now.
+   Question for the native oracle (`docs/ORACLES.md`): *with no memory card inserted, is SAB's
+   first rendered screen the `mcwarnD` warning, and is its first XFB copy to `0x00538460` from a
+   640x480 EFB with clear on?* One run answers whether this boot's path is the real one.
+1. ~~AX command-list HLE~~ — **done, §10.6a** (`sr_ax.c`). The strict wall is now the null
+   "current mode" callback, which points at the disc (item 3).
+2. The exploratory arm's frozen scheduler state must be explained (guest reaction vs a defect in
+   the exception-inside-SelectThread path, `sr_host_os.c` `exc_ctx` / `sr_irq_resume_hook`).
+3. ~~DI (DVD)~~ — **modelled, §10.6b**, node-only disc backend. The strict wall is the NULL
+   "current mode" callback, which survives the audio, disc and arena arms; next step is the native
+   oracle's answer to "which overlay is loaded before `main`'s loop, and by whom".
+4. **GX -> pixels**: `sr_gx.c` captures the FIFO; nothing on this path draws it. §10.2d's routing
+   to Dolphin (and its three blockers — note blocker 1, "no shared memory", is now half-gone:
+   the `SR_PTHREAD=1` image links `-pthread` with a shared, fixed 256 MB memory) is still the
+   destination; the models above are its acceptance tests, per §10.2d's own disposition.
+5. SI/PAD, EXI interrupts, the VI horizontal beam position (a read RAISES), SRR0.
+
+Reproduce (paths are this box's; the ISO is `cat gamecube/roms/SonicAdventure2Battle.bin.parta?.gz | gunzip`,
+md5 `9ef5fadf4b8756af820df997468a5a16`, FST 0x121db bytes at ISO offset 0x1fd100):
+
+```bash
+SR_NODEFS=1 SR_PTHREAD=1 SR_ENV=node SR_OUT=/tmp/img bash gamecube/recomp/sr/build_image.sh sab.iso   # ~40 min cold, 60 s relink
+cp sab_fst.bin /tmp/img/
+SR_IMG=/tmp/img SRN_ISO=sab.iso SRN_STRICT=1 SRN_HLE=12 SRN_BUDGET=4860 node gamecube/recomp/sr/run_image_node.mjs
+SR_IMG=/tmp/img SRN_ISO=sab.iso SRN_STRICT=1 SRN_HLE=12 SRN_BUDGET=4860 SRN_DI=0 node gamecube/recomp/sr/run_image_node.mjs  # etc.
+# arms: SRN_{EXI,DSP,AR,RM,IRQ,PIREV,VI,AI,UCODE,AID,AXCMD,DI,APPLOADER}=0; SRN_PAST_FAULT=1 is exploratory only
+# §10.6c overlay: dump MEM1 at the prolog stop, translate the REL from it, relink with it
+SR_IMG=/tmp/img SRN_ISO=sab.iso SRN_STRICT=1 SRN_HLE=12 SRN_DUMP=/tmp/mem1.bin node gamecube/recomp/sr/run_image_node.mjs
+python3 gamecube/recomp/sr/rel_image.py --iso sab.iso --ram /tmp/mem1.bin --rel mcwarnD.rel --module 0x811ffe60 \
+    --dispatch /tmp/img/sr_dispatch.c --dol /tmp/img/sab_main.dol --out /tmp/img/ov_mcwarnD.c
+SR_OVERLAYS=/tmp/img/ov_mcwarnD.c SR_GEN=/tmp/img/sr_gen.c SR_NODEFS=1 SR_PTHREAD=1 SR_ENV=node SR_OUT=/tmp/img \
+    bash gamecube/recomp/sr/build_image.sh /tmp/img/sab_main.dol
+SR_IMG=/tmp/img SRN_ISO=sab.iso SRN_STRICT=1 SRN_HLE=12 SRN_GX=/tmp/gx.bin SRN_OV=1 node gamecube/recomp/sr/run_image_node.mjs  # SRN_OV=0|2 arms
+```
 
 ### 10.3 Three things that came free with the run
 

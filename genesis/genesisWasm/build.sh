@@ -10,8 +10,9 @@
 #   2. emcc that archive together with source/gpgx_shim.c — a libretro frontend
 #      written in C — into dist/genesis_plus_gx.{js,wasm}.
 #
-# The upstream source tree is NOT vendored into this repo (it is ~90 MB and we
-# do not patch it). It is cloned to $GPGX_SRC, default ~/gpgx-src, and pinned by
+# The upstream source tree is NOT vendored into this repo (it is ~90 MB). ONE
+# patch is applied, idempotently, by tools/patch_fm_busy_state.py (see it:
+# the YM2612 BUSY timer was not in the savestate, so a loaded state diverged). It is cloned to $GPGX_SRC, default ~/gpgx-src, and pinned by
 # GPGX_REV so a rebuild reproduces the shipped binary.
 #
 # Toolchain: the VENDORED emsdk at the repo root (6.0.2 per
@@ -28,16 +29,29 @@ JOBS="${JOBS:-8}"
 
 echo "== toolchain =="
 # shellcheck disable=SC1091
-source "$ROOT/emsdk/emsdk_env.sh" >/dev/null 2>&1
+# EMSDK_ENV overrides the toolchain for a checkout whose vendored emsdk/ has no
+# installed `upstream/` (the scripts are tracked, the 1 GB toolchain is not).
+# The 2026-09-29 rollback rebuild used ~/emsdk-upstream (4.0.10) this way.
+EMSDK_ENV="${EMSDK_ENV:-$ROOT/emsdk/emsdk_env.sh}"
+source "$EMSDK_ENV" >/dev/null 2>&1
 emcc --version | head -1
-cat "$ROOT/emsdk/upstream/emscripten/emscripten-version.txt"
+EM_ROOT="$(dirname "$(command -v emcc)")"
+cat "$EM_ROOT/emscripten-version.txt" 2>/dev/null || true
+# GROWABLE_ARRAYBUFFERS only exists on toolchains that default it ON (6.0.2);
+# on 4.0.10 the setting is unknown (a hard error) and the heap is already a
+# plain ArrayBuffer, which is what =0 asks for. See the block after the link.
+GROW_FLAG=()
+if grep -q "GROWABLE_ARRAYBUFFERS" "$EM_ROOT/src/settings.js" 2>/dev/null; then GROW_FLAG=(-s GROWABLE_ARRAYBUFFERS=0); fi
 
-if [ ! -d "$GPGX_SRC/.git" ]; then
+if [ ! -d "$GPGX_SRC/.git" ] && [ ! -f "$GPGX_SRC/Makefile.libretro" ]; then
   echo "== clone Genesis-Plus-GX -> $GPGX_SRC =="
   git clone --depth 1 https://github.com/libretro/Genesis-Plus-GX.git "$GPGX_SRC"
 fi
 echo "== core rev =="
-git -C "$GPGX_SRC" log --oneline -1
+git -C "$GPGX_SRC" log --oneline -1 2>/dev/null || cat "$GPGX_SRC/REV.txt" 2>/dev/null || echo "(no git metadata)"
+
+echo "== patch: carry the YM2612 BUSY timer in savestates (rollback needs exact load) =="
+python3 "$HERE/tools/patch_fm_busy_state.py" "$GPGX_SRC"
 
 echo "== 1/2 build core archive =="
 ( cd "$GPGX_SRC" && emmake make -f Makefile.libretro platform=emscripten -j"$JOBS" )
@@ -84,14 +98,14 @@ emcc -O3 \
   -o "$HERE/dist/genesis_plus_gx.js" \
   -s WASM=1 \
   -s ALLOW_MEMORY_GROWTH=1 \
-  -s GROWABLE_ARRAYBUFFERS=0 \
+  "${GROW_FLAG[@]}" \
   -s INITIAL_MEMORY=64MB \
   -s STACK_SIZE=1MB \
   -s ENVIRONMENT=web \
   -s EXIT_RUNTIME=0 \
   -s ASSERTIONS=0 \
   -s EXPORTED_RUNTIME_METHODS='["HEAPU8","HEAP16","HEAP32","HEAPU32","HEAPF32"]' \
-  -s EXPORTED_FUNCTIONS='["_gpx_init","_gpx_load","_gpx_run","_gpx_reset","_gpx_video","_gpx_width","_gpx_height","_gpx_frame_is_new","_gpx_fps","_gpx_sample_rate","_gpx_set_pad","_gpx_audio_avail","_gpx_audio_read","_gpx_audio_buf","_gpx_audio_clear","_gpx_state_size","_gpx_state_save","_gpx_state_load","_gpx_sram_size","_gpx_sram_ptr","_gpx_alloc","_gpx_free","_gpx_set_log","_malloc","_free"]'
+  -s EXPORTED_FUNCTIONS='["_gpx_init","_gpx_load","_gpx_run","_gpx_reset","_gpx_video","_gpx_width","_gpx_height","_gpx_frame_is_new","_gpx_fps","_gpx_sample_rate","_gpx_set_pad","_gpx_audio_avail","_gpx_audio_read","_gpx_audio_buf","_gpx_audio_clear","_gpx_audio_wpos","_gpx_audio_rewind","_gpx_set_fast_savestates","_gpx_set_video_skip","_gpx_state_size","_gpx_state_save","_gpx_state_load","_gpx_sram_size","_gpx_sram_ptr","_gpx_alloc","_gpx_free","_gpx_set_log","_malloc","_free"]'
 
 # GROWABLE_ARRAYBUFFERS=0 IS A BUG FIX, NOT A TUNING KNOB — MEASURED 2026-09-06.
 # emsdk 6.0.2's default (=1) hands the heap out as a RESIZABLE ArrayBuffer
