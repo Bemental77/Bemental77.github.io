@@ -1073,6 +1073,12 @@ static uint32_t g_watch_on_e0 = 0;
 EMSCRIPTEN_KEEPALIVE void sr_image_set_watch_e0(uint32_t on) { g_watch_on_e0 = on; }
 static void watch_capture(uint32_t tag);                   // defined with the watchpoint below
 EMSCRIPTEN_KEEPALIVE uint32_t *sr_image_di_log(void) { return g_di_log; }
+// [2026-09-29] The browser's disc: the whole ISO in wasm memory (the page streams the parts;
+// sr_render_worker.js copies them here).  Same reads, memcpy instead of stdio.
+static const uint8_t *g_disc_mem = 0;
+EMSCRIPTEN_KEEPALIVE int sr_image_set_disc_mem(const uint8_t *p, uint32_t size) {
+    g_disc_mem = p; g_disc_size = size; return p != 0;
+}
 EMSCRIPTEN_KEEPALIVE int sr_image_set_disc(const char *path) {
     if (g_disc) fclose(g_disc);
     g_disc = fopen(path, "rb");
@@ -1101,10 +1107,11 @@ static int di_read(uint64_t off, uint32_t mar, uint32_t len, uint32_t outlen) { 
     if (!di_read_ok()) return 2;
     if (len > outlen) len = outlen;
     if (off + len > g_disc_size) { g_di_error = 0x52100; return 2; }                // BlockOOB
-    if (!g_disc) { if (!g_fault) g_fault = SR_F_DI_DISC | 1u; return 4; }
+    if (!g_disc && !g_disc_mem) { if (!g_fault) g_fault = SR_F_DI_DISC | 1u; return 4; }
     uint32_t p = mar & 0x03FFFFFFu;
     if (p + len > g_ram_size) { if (!g_fault) g_fault = SR_F_DI_DISC | 2u; return 4; }
-    if (fseeko(g_disc, (off_t)off, SEEK_SET) != 0 || fread(g_ram + p, 1, len, g_disc) != len) {
+    if (g_disc_mem) memcpy(g_ram + p, g_disc_mem + off, len);
+    else if (fseeko(g_disc, (off_t)off, SEEK_SET) != 0 || fread(g_ram + p, 1, len, g_disc) != len) {
         if (!g_fault) g_fault = SR_F_DI_DISC | 3u; return 4;
     }
     g_di_bytes += len; g_ov_gen++;
@@ -1260,6 +1267,7 @@ EMSCRIPTEN_KEEPALIVE uint32_t sr_image_pe_tokens(void)   { return g_pe_tokens; }
 EMSCRIPTEN_KEEPALIVE uint32_t sr_image_pe_drawdone_bp(void) { return g_pe_drawdone_bp; }
 EMSCRIPTEN_KEEPALIVE uint32_t sr_image_xfb_copies(void)  { return g_xfb_copies; }
 EMSCRIPTEN_KEEPALIVE uint32_t sr_image_vi_flips(void)    { return g_vi_flips; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_kcycles(void)     { return (uint32_t)(g_gk_cycles / 1000u); }
 // kcycles of the first/last XFB copy, PE finish and VI flip: the frame loop's rate in GUEST time
 EMSCRIPTEN_KEEPALIVE uint32_t sr_image_frame_kcyc(uint32_t which) {
     const uint64_t v[6] = {g_xfb_first, g_xfb_last, g_fin_first, g_fin_last, g_flip_first, g_flip_last};
@@ -2166,6 +2174,34 @@ EMSCRIPTEN_KEEPALIVE int sr_image_init_hle(int nthreads) {
     sr_host_hook = img_hook;
     return n;
 }
+// [2026-09-29] THE BROWSER'S BOOT: the whole guest on a pthread of its own, which then IS
+// slot 0 (sr_os_init binds the calling thread), so the worker's JS thread stays free to
+// stream frames out of the shared wasm memory while the guest runs.  Node calls
+// sr_image_init_hle + sr_image_boot on its main thread instead; the guest side is identical.
+#include <pthread.h>
+uint32_t sr_image_boot(void);
+static int g_bt_n = 0;
+static volatile uint32_t g_bt_state = 0, g_bt_ret = 0;    // 1 running, 2 returned
+static void *boot_thread(void *arg) {
+    (void)arg;
+    sr_image_init_hle(g_bt_n);
+    g_bt_state = 1;
+    g_bt_ret = sr_image_boot();
+    g_bt_state = 2;
+    return 0;
+}
+EMSCRIPTEN_KEEPALIVE int sr_image_boot_thread(int nthreads) {
+    pthread_attr_t a; pthread_t t;
+    g_bt_n = nthreads;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, 8u << 20);               // as the node main thread (STACK_SIZE)
+    int rc = pthread_create(&t, &a, boot_thread, 0);
+    pthread_attr_destroy(&a);
+    if (rc == 0) pthread_detach(t);
+    return rc;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_boot_thread_state(void) { return g_bt_state; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_boot_thread_ret(void)   { return g_bt_ret; }
 #endif
 
 // Run the guest from the DOL entry point.  RETURNS ONLY WHEN THE GUEST RETURNS OR

@@ -203,7 +203,7 @@ EXPORTS=$EXPORTS,_sr_image_set_dsp_model,_sr_image_dsp_events,_sr_image_aram_byt
 EXPORTS=$EXPORTS,_sr_image_set_model,_sr_image_get_model,_sr_image_model_events
 EXPORTS=$EXPORTS,_sr_image_irq_delivered,_sr_image_dec_delivered,_sr_image_irq_last
 EXPORTS=$EXPORTS,_sr_image_pi_cause,_sr_image_pi_mask,_sr_image_vi_frames,_sr_image_ucode_crc,_sr_image_ucode,_sr_image_ax_cmdlist
-EXPORTS=$EXPORTS,_sr_image_idle_skips,_sr_image_idle_mcycles,_sr_image_cycles_m,_sr_image_set_budget_mcycles,_sr_image_tail,_sr_image_tail_n,_sr_os_trace_mask,_sr_os_ring,_sr_os_ring_n,_sr_image_set_past_fault,_sr_image_budget_thread,_sr_image_budget_state,_sr_image_budget_threads,_sr_image_budget_threads_n,_sr_image_budget_runq,_sr_ax_pbs,_sr_ax_lists,_sr_ax_voices,_sr_ax_unknown_cmds,_sr_image_indirect_fault_lr,_sr_image_indirect_fault_target,_sr_image_indirect_fault_r1,_sr_image_set_disc,_sr_image_di_cmds,_sr_image_di_bytes,_sr_image_di_log,_sr_image_set_watch,_sr_image_watch_hit,_sr_image_watch_kcyc,_sr_image_watch_thread,_sr_image_watch_new,_sr_image_watch_state,_sr_image_watch_stack,_sr_image_set_watch_cond,_sr_image_set_watch_e0,_sr_image_di_trace,_sr_image_di_trace_n,_sr_os_recycled,_sr_image_ov_entries,_sr_image_ov_refused,_sr_image_set_ov,_sr_gp_cmds,_sr_gp_prims,_sr_gp_verts,_sr_gp_dls,_sr_gp_unknown,_sr_gp_bad_fmt,_sr_gx_cuts,_sr_gx_ncuts,_sr_image_pe_finishes,_sr_image_pe_tokens,_sr_image_pe_drawdone_bp,_sr_image_xfb_copies,_sr_image_vi_flips,_sr_image_frame_kcyc
+EXPORTS=$EXPORTS,_sr_image_idle_skips,_sr_image_idle_mcycles,_sr_image_cycles_m,_sr_image_set_budget_mcycles,_sr_image_tail,_sr_image_tail_n,_sr_os_trace_mask,_sr_os_ring,_sr_os_ring_n,_sr_image_set_past_fault,_sr_image_budget_thread,_sr_image_budget_state,_sr_image_budget_threads,_sr_image_budget_threads_n,_sr_image_budget_runq,_sr_ax_pbs,_sr_ax_lists,_sr_ax_voices,_sr_ax_unknown_cmds,_sr_image_indirect_fault_lr,_sr_image_indirect_fault_target,_sr_image_indirect_fault_r1,_sr_image_set_disc,_sr_image_di_cmds,_sr_image_di_bytes,_sr_image_di_log,_sr_image_set_watch,_sr_image_watch_hit,_sr_image_watch_kcyc,_sr_image_watch_thread,_sr_image_watch_new,_sr_image_watch_state,_sr_image_watch_stack,_sr_image_set_watch_cond,_sr_image_set_watch_e0,_sr_image_di_trace,_sr_image_di_trace_n,_sr_os_recycled,_sr_image_ov_entries,_sr_image_ov_refused,_sr_image_set_ov,_sr_gp_cmds,_sr_gp_prims,_sr_gp_verts,_sr_gp_dls,_sr_gp_unknown,_sr_gp_bad_fmt,_sr_gx_cuts,_sr_gx_ncuts,_sr_image_pe_finishes,_sr_image_pe_tokens,_sr_image_pe_drawdone_bp,_sr_image_xfb_copies,_sr_image_vi_flips,_sr_image_frame_kcyc,_sr_image_kcycles,_sr_image_set_disc_mem,_sr_gx_ring_base,_sr_gx_ring_cap,_sr_gx_ring_pub,_sr_gx_ring_frames
 EXPORTS=$EXPORTS,_sr_os_mode,_sr_os_get_mode,_sr_os_set_msr,_sr_os_get_msr
 EXPORTS=$EXPORTS,_sr_os_trace,_sr_os_trace_n,_sr_os_trace_reset
 # THE CLOCK, READ-ONLY (plus the two writes that are legitimately the host's).
@@ -300,7 +300,11 @@ NODEFS_FLAGS=()
 [ -n "${SR_NODEFS:-}" ] && NODEFS_FLAGS=(-sNODERAWFS=1)
 if [ -n "$SR_PTHREAD" ]; then
   PT_CFLAGS=(-pthread)
-  PT_LFLAGS=(-pthread -sPTHREAD_POOL_SIZE=12 -sDEFAULT_PTHREAD_STACK_SIZE=2097152 -sINITIAL_MEMORY=268435456)
+  # SR_MEM / SR_POOL — [2026-09-29] the browser guest build holds the whole ISO in wasm memory
+  # (SR_MEM=1879048192) and boots on a pthread of its own (sr_image_boot_thread: one more pool
+  # thread than SRN_HLE's host threads).  Defaults are the node build's.
+  PT_LFLAGS=(-pthread -sPTHREAD_POOL_SIZE=${SR_POOL:-12} -sDEFAULT_PTHREAD_STACK_SIZE=2097152 -sINITIAL_MEMORY=${SR_MEM:-268435456})
+  EXPORTS=$EXPORTS,_sr_image_boot_thread,_sr_image_boot_thread_state,_sr_image_boot_thread_ret
   EXPORTS=$EXPORTS,_sr_image_init_hle,_sr_os_set_timeout
 fi
 PART_KEY="${SR_OPT:--O2} ${PT_CFLAGS[*]:-}"

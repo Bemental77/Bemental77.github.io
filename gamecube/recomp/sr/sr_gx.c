@@ -163,7 +163,27 @@ EMSCRIPTEN_KEEPALIVE uint32_t sr_gp_bad_fmt(void) { return g_gp_bad_fmt; }
 // 0x52 with bit 14), so a consumer can hand Dolphin one frame at a time.
 #define SR_GX_CUTS 4096
 static uint32_t g_gx_cuts[SR_GX_CUTS], g_gx_ncuts = 0;
-void sr_gx_mark_frame(void) { if (g_gx_ncuts < SR_GX_CUTS) g_gx_cuts[g_gx_ncuts] = g_gx_pos; g_gx_ncuts++; }
+// THE FRAME RING — capture arm 2.  The browser boot runs the guest on pthreads while the
+// worker's JS thread streams frames out of the SHARED wasm memory, so the stream is written
+// to a byte ring (monotonic write count g_ring_w) and published a WHOLE FRAME at a time:
+// g_ring_pub is advanced, with a release store, only at a copy to the XFB.  The reader keeps
+// its own read count; if it ever falls more than the ring's size behind, bytes were lost and
+// it must say so (sr_render_worker.js reports `lost`), never render a torn stream.
+#define SR_GX_RING (8u << 20)
+static uint8_t  g_gx_ring[SR_GX_RING];
+static uint32_t g_ring_w = 0, g_ring_pub = 0, g_ring_frames = 0;
+EMSCRIPTEN_KEEPALIVE uint32_t sr_gx_ring_base(void)  { return (uint32_t)(uintptr_t)g_gx_ring; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_gx_ring_cap(void)   { return SR_GX_RING; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_gx_ring_pub(void)   { return __atomic_load_n(&g_ring_pub, __ATOMIC_ACQUIRE); }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_gx_ring_frames(void){ return __atomic_load_n(&g_ring_frames, __ATOMIC_ACQUIRE); }
+void sr_gx_mark_frame(void) {
+    if (g_gx_ncuts < SR_GX_CUTS) g_gx_cuts[g_gx_ncuts] = g_gx_pos;
+    g_gx_ncuts++;
+    if (g_gx_capture == 2) {
+        __atomic_store_n(&g_ring_pub, g_ring_w, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_ring_frames, g_ring_frames + 1, __ATOMIC_RELEASE);
+    }
+}
 EMSCRIPTEN_KEEPALIVE uint32_t sr_gx_cuts(void)   { return (uint32_t)(uintptr_t)g_gx_cuts; }
 EMSCRIPTEN_KEEPALIVE uint32_t sr_gx_ncuts(void)  { return g_gx_ncuts; }
 
@@ -192,7 +212,10 @@ void gk_tail_write(uint32_t p, uint32_t n) {
 
     g_gx_writes++;
     g_gx_bytes += n;
-    if (g_gx_capture) {
+    if (g_gx_capture == 2) {
+        for (uint32_t i = 0; i < n; i++) g_gx_ring[(g_ring_w + i) & (SR_GX_RING - 1u)] = g_ram[p + i];
+        g_ring_w += n;
+    } else if (g_gx_capture) {
         if (g_gx_pos + n > SR_GX_FIFO_CAP) g_gx_dropped += n;
         else { memcpy(g_gx_fifo + g_gx_pos, g_ram + p, n); g_gx_pos += n; }
     }
@@ -200,7 +223,7 @@ void gk_tail_write(uint32_t p, uint32_t n) {
 }
 
 // ---- THE ARM
-EMSCRIPTEN_KEEPALIVE void sr_gx_set_capture(int on) { g_gx_capture = on ? 1 : 0; }
+EMSCRIPTEN_KEEPALIVE void sr_gx_set_capture(int on) { g_gx_capture = on == 2 ? 2 : on ? 1 : 0; }   // 2 = frame ring
 EMSCRIPTEN_KEEPALIVE int  sr_gx_get_capture(void)   { return g_gx_capture; }
 
 // ---- THE STREAM.  base is a byte offset into the wasm heap; JS reads

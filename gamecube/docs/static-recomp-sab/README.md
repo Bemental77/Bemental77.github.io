@@ -27,6 +27,7 @@ shipped disc; the reproducing command is printed next to each one. Artifact:
 | **JIT baseline, re-measured** | **0.3781x delivered / 141.6 MHz executed / 23.2% idle-skipped**, stock V8, n=3, cross-witness spread ≤0.0005. **1.000x costs 373.5 MHz on this scene → the JIT is 2.64x short.** §8.6b |
 | ~~JIT baseline `0.4450x`~~ | **RETRACTED, §8.6c** — a 75 s cold boot read over one 40 s window; re-reading that band from four fresh runs of ONE frozen binary returns **0.3338x–0.5097x**. The V8-tier mismatch §8.1 warned about measures **null on both engines** (§8.6d) and was the least of its defects. |
 | **WHOLE-IMAGE BOOT IN A BROWSER** | **LINKS, INSTANTIATES, AND RUNS THE GUEST'S OWN `__start`** — wasm md5 `7bcca5756df27133d684c4281410171b`. `__init_registers` / `__init_hardware` / `__init_data` / `DBInit` all return **fault-free**, then `OSInit` reaches **27 distinct hardware registers** across PI/MI/DSP/SI/EXI/DI in **126 host-boundary crossings**. It stops in **`__OSInitAudioSystem`**, spinning on a DSP register — **no device model and no interrupt delivery**, not a translator bug (the GAP class is still zero). Modelling one register (EXI `TSTART`) moved it from 21 registers to 27, with a **falsifying control arm on the same md5**. **Nothing renders and no `drawn/s` is claimed.** §10 |
+| **WHOLE-IMAGE BOOT — THE GUEST'S FRAMES REACH DOLPHIN IN THE PAGE, 2026-09-29** | Behind `?srimage=1&srrender=1&srmode=main&srbase=…/guest/` (off by default): SAB boots from `__start` on a pthread in the browser, runs its frame loop at 59.943 DrawDones per guest second, and its whole frames stream to Dolphin's GP decoder — `[recompLive] fifo=2135B draws=3 skipped=0`, 0 page errors; the `?srcapture=0` arm posts nothing. The picture itself is not verified (offscreen WebGPU); the guest runs far below 1.000x. §10.6e |
 | **WHOLE-IMAGE BOOT — FRAME LOOP AT 59.94/GUEST-s, 2026-09-29** | With a PE model (DrawDone/PE-finish from a GP decoder over the FIFO) the overlay's frame loop runs: **556 DrawDones in 10 s of guest time = 59.944 per guest second**, idle 3 M of 4,860 M cycles (PE off: 4,379 M idle, stuck in `GXDrawDone`, same md5 `cad618ff9a675def5512086bb69de5e3`). Native Dolphin confirms the first overlay (`mcwarnD` at `0x811ffe60`), the XFBs and 640x480; it has a memory card, the SR boot does not yet. **Nothing is drawn.** §10.6d |
 | **WHOLE-IMAGE BOOT — FIRST FRAME SUBMITTED, 2026-09-29** | **The overlay's first frame reaches the GP FIFO: `GXCopyDisp` (BP `0x52 = 0x004803`, copy-to-XFB `0x538460`, 640x480) then `GXSetDrawDone`**, and the boot stops WAITING in `GXDrawDone` because no PE/GP model answers it — no VI flip yet. Got there by fixing the DI model reporting every completion as DEINT, recycling leaked host threads, correcting the apploader's FST address (`0x817EDE20`, not `hdr[0x430]`), and linking the first REL overlay (`mcwarnD.rel`) translated from OSLink's own bytes behind a hash guard. Binary `c177aeb92de7a22d250503bb66502c4d`, overlay off / poisoned-guard arms stop at the prolog on the same md5. **Nothing renders; no `drawn/s` is claimed.** §10.6c |
 | **WHOLE-IMAGE BOOT, 2026-09-29** | **Past `__OSInitAudioSystem`, `__ARChecksize`, `RealMode`, `__AI_SRC_INIT` and the DSP boot task, with interrupts delivered — to the first AX COMMAND LIST** (`SR_F_DSP_AXCMD`, 6 M guest cycles), node, binary `7e9f25717aa3e8cbc136dc2fe9287fe4`; **then through it** (§10.6a: AX command lists HLE'd, 18 lists / 1,152 PBs, binary `46645ebdadabcd49cedf4454b9a8c0a8`) **to main's loop at 48 M cycles, where a mode callback an overlay should have installed is NULL**; §10.6b adds the apploader's real arena (read from the disc's own apploader) and a DI model reading the ISO (the first file, `GCAX.conf`, is read; DI off parks the boot in that read for 10 s of guest time) — the NULL callback survives every arm (binary `f5aa45f7562baa082dbe28203e0347dd`). Eight run-time-switchable models (exception entry included) + `SR_OS_HLE` linked into the image, each with a run-time control arm on that md5 that brings back the wall it removed (the documented `__OSInitAudioSystem` stop included). The ucode SAB uploads hashes to `0x4e8a8b21` = AX. **Nothing renders**: AX command processing, DI, and a GX consumer are missing. §10.6 |
@@ -3443,6 +3444,53 @@ write per frame is was not identified, so that column is a register-write count,
 1.2 MB of GP stream decoded with zero unknown opcodes and zero invalid colour formats, which a
 desynchronised decoder would not produce over 132 k commands (evidence of sizing, not proof).
 **Still nothing is drawn**: the stream is decoded for its side effects only.
+
+#### 10.6e The guest's own frames in the page, through Dolphin's decoder (2026-09-29)
+
+**Opt-in only.** `gamecube.html?srimage=1&srrender=1&srmode=main&srbase=/gamecube/recomp/sr_image/guest/`
+— with no page change: the existing render arm (`?srimage=1&srrender=1`) already relays
+`{cmd:'frame', fifo, mem1, regions}` from `sr_render_worker.js` to the dolphin worker's
+`recompFrame` consumer (`worker_funcs.js` `recomp_render_fifo` -> `recomp_present`). What is new:
+
+- `sr_image/sr_guest.js` (shared by the page worker and the node harness): stages the apploader's
+  writes from the disc bytes, puts the whole ISO in wasm memory (`sr_image_set_disc_mem`; the DI
+  model memcpy's instead of stdio), starts the guest **from `__start` on a pthread of its own**
+  (`sr_image_boot_thread`: that thread becomes slot 0, so the worker's JS thread stays free), and
+  pumps frames out of the shared wasm memory.
+- `sr_gx.c` capture arm 2, **the frame ring**: an 8 MB byte ring published a whole frame at a
+  time (release store at each copy to the XFB); the reader reports `lost` instead of rendering a
+  torn stream. A post carries every whole frame since the last one (never skips a GP command, so
+  the consumer's CP/XF/BP state stays exact) plus a MEM1 snapshot taken at post time (**not**
+  frame-consistent: the guest keeps running while it is copied — stated, not solved).
+- `sr_render_worker.js`: `?srmode=main` with an image exporting `_sr_image_boot_thread` runs this
+  guest arm; if the page did not stream the disc (`?srdisc=`) the worker fetches SAB's 17 parts
+  itself and inflates each straight into wasm memory. Any other image keeps the old `main` arm.
+- The image: `SR_PTHREAD=1 SR_MEM=1879048192 SR_POOL=14 SR_ENV=web,worker SR_OVERLAYS=ov_mcwarnD.c`
+  (wasm `2bdced8dd999632264ced11acd2f438f`, gitignored under `sr_image/guest/`, like every image).
+
+**Node, the same module** (`sr/run_image_stream.mjs`, same md5, 60 s wall, `nice 19`): 6.123 guest s,
+323 PE finishes at **59.947 per guest second**, 324 posts / 324 copies-to-XFB found by an
+independent GP walk of the posted bytes, **0 bad opcodes, 0 overruns, 0 bytes lost**.
+
+**Browser** (`dolphin_render_probe.js`, `ROM_IDX=1`, headless, 200 s, dolphin wasm
+`ced4905af7d45e977433255f07a9e0c9` and SR wasm unchanged before/after; load 1-7 while a sibling
+worked):
+
+| arm | guest s reached | XFB copies / PE finishes (guest) | DrawDone rate (guest time) | posts consumed by Dolphin | Dolphin's own report | page errors |
+|---|---|---|---|---|---|---|
+| **capture on** | 15.43 | 882 / 881 | **59.943/s** | 800+ (`[recompLive] f241/f481/f721`) | **`fifo=2135B draws=3` per frame, `skipped=0`** | 0 |
+| `?srcapture=0` (same wasms) | 14.97 | 854 / 853 | 59.943/s | 0 (no `[recompLive] f` line) | — | 0 |
+
+`draws=3` is Dolphin's decoder-level draw count for one frame of this stream, matching the SR
+side's own primitive count (2,693 primitives / 882 frames = 3.05). **The canvas is NOT evidence
+here**: its 2D sample (`nonBlack 32622`, rows 133-285) is byte-identical in the capture-off arm,
+so it is the JIT boot's leftover, not this stream; the WebGPU output is offscreen in this
+container and was not read. **What is shown**: the guest's frames reach Dolphin's GP decoder
+whole and in order, and are drawn there (3 draws each) and presented from the guest's XFB
+address. **What is not shown**: the picture. **Rate**: the guest reached ~15 guest s in the run —
+the guest is far below 1.000x in the browser (not measured against wall time precisely here;
+node measured 6.1 guest s per 60 wall s at nice 19), and the page presents a post every 100 ms of
+host time. Neither number is a speed-up; gate #9.
 
 #### What is still missing before a first rendered frame
 
