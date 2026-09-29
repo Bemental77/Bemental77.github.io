@@ -19,10 +19,19 @@
       if (b === ubuf) { const src = ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset + (doff || 0) * (data.BYTES_PER_ELEMENT || 1), size !== undefined ? size * (data.BYTES_PER_ELEMENT || 1) : data.byteLength - (doff || 0) * (data.BYTES_PER_ELEMENT || 1)) : new Uint8Array(data, doff || 0, size); ushadow.set(src, off); } }
     return wb.call(this, b, off, data, doff, size);
   };
-  let curDyn = null;
+  let curDyn = null, curG1 = '';
+  const g1tag = new WeakMap(), g1tex = new WeakMap(); let curG1T = null;
+  const cbg = GPUDevice.prototype.createBindGroup;
+  GPUDevice.prototype.createBindGroup = function (d) {
+    const g = cbg.call(this, d);
+    try { if (CFG.udump && d && d.entries && d.entries.length === 16) g1tag.set(g, d.entries.filter(e => e.binding < 8).sort((a, b) => a.binding - b.binding).map(e => { const t = v2t.get(e.resource); return t ? t.width + 'x' + t.height + (t.usage & 16 ? 'RT' : '') : '?'; }).join(','));
+      if (CFG.udump && d && d.entries && d.entries.length === 16) g1tex.set(g, d.entries.filter(e => e.binding < 8).map(e => v2t.get(e.resource))); } catch (e) {}
+    return g;
+  };
   const sbg = GPURenderPassEncoder.prototype.setBindGroup;
   GPURenderPassEncoder.prototype.setBindGroup = function (...args) {
     const [i, , dyn, a, b] = args;
+    if (i === 1) { curG1 = g1tag.get(args[1]) || ''; curG1T = g1tex.get(args[1]) || null; }
     if (i === 0 && dyn && typeof dyn !== 'number' && dyn.length !== undefined) curDyn = Array.from(a !== undefined ? dyn.slice(a, a + b) : dyn);
     return sbg.apply(this, args);
   };
@@ -37,7 +46,19 @@
     for (let i = 0; i < ntg; i++) { const m = V.getUint32(3872 + i * 16, true); tg.push(((m >> 4) & 7) + ':' + ((m >> 7) & 31) + (m & 2 ? 'q' : '')); }
     const chans = []; for (let c = 0; c < 2; c++) chans.push((V.getUint32(3872 + c * 16 + 8, true) >>> 0).toString(16) + '/' + (V.getUint32(3872 + c * 16 + 12, true) >>> 0).toString(16));
     const tev = []; for (let i = 0; i < nts; i++) { const cc = P.getUint32(592 + i * 16, true) >>> 0, ac = P.getUint32(596 + i * 16, true) >>> 0, ind = P.getUint32(600 + i * 16, true) >>> 0; tev.push(cc.toString(16) + ',' + ac.toString(16) + (ind ? ',i' + ind.toString(16) : '')); }
-    return 'tg=' + ntg + '[' + tg.join(' ') + '] cc=' + ncc + '[' + chans.join(' ') + '] ts=' + nts + ' ind=' + nind + ' comp=' + comp.toString(16) + ' tev=' + tev.join(' | ');
+    let extra = '';
+    if (nts >= 2) {
+      const ks = []; for (let i = 0; i < nts; i++) { const ord = P.getUint32(848 + (i >> 1) * 16, true) >>> 0, ksel = P.getUint32(852 + (i >> 1) * 16, true) >>> 0;
+        const kc = (ksel >> ((i & 1) ? 14 : 4)) & 31, ka = (ksel >> ((i & 1) ? 19 : 9)) & 31;
+        const kv = [0, 1, 2, 3].map(j => P.getInt32(976 + kc * 16 + j * 4, true)).join(',');
+        const o = (i & 1) ? (ord >> 12) & 0xfff : ord & 0xfff; // texmap 0-2, texcoord 3-5, enable 6, colorchan 7-9
+        ks.push('s' + i + '[map' + (o & 7) + ' tc' + ((o >> 3) & 7) + (o & 64 ? '' : ' notex') + ' kc' + kc + '=' + kv + ']'); }
+      const dual = V.getUint32(4, true);
+      const m = []; for (let g = 0; g < ntg; g++) { const r = [0, 1].map(k => [0, 1, 2, 3].map(j => V.getFloat32(896 + (3 * g + k) * 16 + j * 4, true).toFixed(3)).join(',')).join(' / ');
+        m.push('tm' + g + '(' + r + ') post=' + (V.getUint32(3872 + g * 16 + 4, true) >>> 0).toString(16)); }
+      extra = ' || ' + ks.join(' ') + ' dual=' + dual + ' ' + m.join(' ');
+    }
+    return 'tg=' + ntg + '[' + tg.join(' ') + '] cc=' + ncc + '[' + chans.join(' ') + '] ts=' + nts + ' ind=' + nind + ' comp=' + comp.toString(16) + ' tev=' + tev.join(' | ') + extra;
   }
   const crp = GPUDevice.prototype.createRenderPipeline;
   GPUDevice.prototype.createRenderPipeline = function (d) {
@@ -65,7 +86,7 @@
     if (!orig) continue;
     GPURenderPassEncoder.prototype[fn] = function (...a) {
       if (self.__gcgate.open) { self.__gcgate.passed++; if (fn === 'drawIndexed' || fn === 'draw') trace.push(curP + ' vp=' + curVp + ' n=' + a[0]);
-        if (CFG.udump && fn === 'drawIndexed' && curDyn && curDyn.length === 2) udraws.push([curDyn[0], curDyn[1], a[0]]); return orig.apply(this, a); }
+        if (CFG.udump && fn === 'drawIndexed' && curDyn && curDyn.length === 2) udraws.push([curDyn[0], curDyn[1], a[0], curG1, curG1T]); return orig.apply(this, a); }
       self.__gcgate.dropped++;
     };
   }
@@ -119,11 +140,19 @@
   };
   self.addEventListener('message', function (e) {
     const m = e.data;
+    if (m && m.cmd === 'gcgateRam') {
+      try { const M = self.Module; const base = M._dolphin_get_ram_addr();
+        postMessage({ cmd: 'gcgateRamReply', base, words: m.addrs.map(a => a.toString(16) + ':' + Array.from(M.HEAPU8.subarray(base + a, base + a + (m.len || 16))).map(x => x.toString(16).padStart(2, '0')).join('')) });
+      } catch (err) { postMessage({ cmd: 'gcgateRamReply', err: String(err) }); }
+      return;
+    }
     if (m && m.cmd === 'recompFrame' && typeof m.gate === 'boolean') {
       if (self.__gcgate.open && !m.gate) { postMessage({ cmd: 'print', txt: '[gcgate] CLOSE: rts=' + rts.map(t => t.width + 'x' + t.height + ':' + t.format + ':u' + t.usage).join(' ') + ' dev=' + !!dev });
         { const out = []; let prev = null, rep = 0; for (const t of trace) { if (t.replace(/ n=\d+$/, '') === prev) { rep++; continue; } if (prev !== null) out.push(prev + (rep > 1 ? ' x' + rep : '')); prev = t.replace(/ n=\d+$/, ''); rep = 1; } if (prev) out.push(prev + (rep > 1 ? ' x' + rep : ''));
           postMessage({ cmd: 'print', txt: '[gcgate] TRACE ' + trace.length + ' draws:\n' + out.join('\n') }); trace = []; }
-        if (CFG.udump && ushadow) { const lines = udraws.map((d, i) => i + ' n=' + d[2] + ' ' + decode(d[0], d[1])); postMessage({ cmd: 'print', txt: '[gcgate] UDUMP TRACE ' + lines.length + '\n' + lines.join('\n') }); udraws = []; }
+        if (CFG.udump && ushadow) { const lines = udraws.map((d, i) => i + ' n=' + d[2] + ' tex=[' + d[3] + '] ' + decode(d[0], d[1])); postMessage({ cmd: 'print', txt: '[gcgate] UDUMP TRACE ' + lines.length + '\n' + lines.join('\n') });
+          if (CFG.dumpTag) for (const d of udraws) if (d[3].startsWith(CFG.dumpTag)) for (const t of (d[4] || [])) if (t && t.width > 1 && !rts.includes(t)) { rts.push(t); postMessage({ cmd: 'print', txt: '[gcgate] will dump ' + t.width + 'x' + t.height }); }
+          if (CFG.dumpTex) for (const d of udraws) for (const t of (d[4] || [])) if (t && (t.width + 'x' + t.height) === CFG.dumpTex && !rts.includes(t)) { rts.push(t); postMessage({ cmd: 'print', txt: '[gcgate] will dump bound texture ' + CFG.dumpTex + ' fmt=' + t.format + ' mips=' + t.mipLevelCount + ' layers=' + t.depthOrArrayLayers }); } udraws = []; }
         if (dev && rts.length) { const l = rts; rts = []; dump(l).catch(err => postMessage({ cmd: 'print', txt: '[gcgate] dump ERR ' + err })); } }
       self.__gcgate.open = m.gate;
       if (m.gate) postMessage({ cmd: 'print', txt: '[gcgate] OPEN for frame ' + m.n + ' draws passed=' + self.__gcgate.passed + ' dropped=' + self.__gcgate.dropped });

@@ -190,6 +190,19 @@ EMSCRIPTEN_KEEPALIVE uint32_t sr_gx_ncuts(void)  { return g_gx_ncuts; }
 
 // THE HOOK.  gekko_rt.h:GK_WPOST sends everything at or above GK_WPAR_OFF here, so this
 // function owns the split and gk_dev_write keeps exactly the domain it had.
+// [2026-09-29] gk_wpar_write: the WPAR store gekko_rt.h's GK_WPAR_DIRECT routes here -- the same
+// big-endian byte stores gk_w*_m makes at the offset gk_tail's WPAR arm computes, then the same
+// hook.  g_wpar_fast = 0 is the control arm (every WPAR store takes the mapped path again).
+int g_wpar_fast = 1;
+EMSCRIPTEN_KEEPALIVE void sr_set_wpar_fast(int on) { g_wpar_fast = on ? 1 : 0; }
+void gk_wpar_write(uint32_t ea, uint32_t v, uint32_t n) {
+    const uint32_t p = GK_WPAR_OFF + (ea & (GK_WPAR_SIZE - 1u));
+    if (n == 4) { g_ram[p] = (uint8_t)(v >> 24); g_ram[p + 1] = (uint8_t)(v >> 16);
+                  g_ram[p + 2] = (uint8_t)(v >> 8); g_ram[p + 3] = (uint8_t)v; }
+    else if (n == 2) { g_ram[p] = (uint8_t)(v >> 8); g_ram[p + 1] = (uint8_t)v; }
+    else g_ram[p] = (uint8_t)v;
+    gk_tail_write(p, n);
+}
 void gk_tail_write(uint32_t p, uint32_t n) {
     if (p >= GK_HWREG_OFF) { gk_dev_write(p, n); return; }
 

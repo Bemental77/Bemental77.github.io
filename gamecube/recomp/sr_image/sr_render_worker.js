@@ -378,7 +378,14 @@ async function runGuestArm(msg, base) {
     // a timed report every 5 s of wall time, so guest s per wall s can be read off the log
     // (the frame-count reports below are not evenly spaced in wall time)
     if (++ticks % Math.max(1, Math.round(5000 / periodMs)) === 0)
-      say('guest', Object.assign({ timed: true, wallMs: Math.round(performance.now() - t0) }, guestCounters(mod)));
+    {
+      // compact and in this order ON PURPOSE: the page's panel/console line is cut at 300
+      // characters (gamecube.html srSay caller), so the fields a rate needs come first
+      const g = guestCounters(mod);
+      say('guest', { timed: 1, w: Math.round(performance.now() - t0), kc: g.guestKcycles, ikc: g.idleKcycles,
+                     sl: g.paceSleptMs, bh: g.paceBehindMs, xfb: g.xfbCopies, fin: g.peFinishes, prims: g.gpPrims, vf: g.viFrames, mods: g.mods,
+                     f: g.fault, ref: g.ovRefused });
+    }
     const f = pump();
     if (f && f.fifo) {
       // measure before transferring (a transferred buffer reads as length 0)

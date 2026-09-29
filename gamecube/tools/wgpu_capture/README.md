@@ -12,7 +12,10 @@ With draws gated off, the same page publishes ~60 readbacks/s, so the GPU queue 
   every color attachment used in the window, plus the EFB depth snapshotted right before each
   EFB->XFB copy, and prints a per-draw pipeline/viewport trace. `CFG` knobs: `depthAlways`,
   `cullNone`, `blendOff`, `writeAll`, `noDiscard` (JS-level A/B, no rebuild), and `udump`
-  (per-draw TEV/texgen decode from the uniform ring).
+  (per-draw TEV/texgen/konst/tex-matrix decode from the uniform ring, plus the bound texture
+  sizes), `dumpTex:'WxH'` / `dumpTag:'<tex-size prefix>'` (dump bound textures, e.g. a model's
+  reflection map). It also answers `{cmd:'gcgateRam', addrs}` with guest-RAM bytes read through
+  the worker's `Module._dolphin_get_ram_addr()`; `gcsnap.mjs`'s `ram:<name>` plan step uses it.
 - `gcsnap.mjs`: boots MP4 (recomp path) in the overlay, drives keys, and runs `GATE_AT`/`GATE_K`
   plus a `settle` step that saves the dumps as PNGs to `/tmp/gcsnap`.
 - `snaprun.sh`: lock + md5 guard around one run. `msab.sh`: mode-select capture with a CFG.

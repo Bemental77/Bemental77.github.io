@@ -422,9 +422,24 @@ typedef gk_gword gk_gword_u __attribute__((aligned(1)));
 __attribute__((noinline)) static uint8_t  gk_r8_s (uint32_t ea){ return gk_r8_m(ea); }
 __attribute__((noinline)) static uint16_t gk_r16_s(uint32_t ea){ return gk_r16_m(ea); }
 __attribute__((noinline)) static uint32_t gk_r32_s(uint32_t ea){ return gk_r32_m(ea); }
-__attribute__((noinline)) static void gk_w8_s (uint32_t ea,uint8_t v){ gk_w8_m(ea,v); }
-__attribute__((noinline)) static void gk_w16_s(uint32_t ea,uint16_t v){ gk_w16_m(ea,v); }
-__attribute__((noinline)) static void gk_w32_s(uint32_t ea,uint32_t v){ gk_w32_m(ea,v); }
+#ifdef SR_MMIO
+/* [2026-09-29] THE WRITE-GATHER PIPE, DIRECT.  GX pushes every vertex through stores to the WPAR
+   page; they took gk_w*_s -> GK_MAP -> gk_map_slow -> gk_tail -> byte stores -> GK_WPOST ->
+   gk_tail_write.  gk_wpar_write (sr_gx.c) does the same byte stores at the same offset and calls
+   the same gk_tail_write, skipping only the mapping walk: WPAR is its own page (0xCC008000), which
+   neither the locked cache (segment 0xE) nor the HWREG window (0xCC000000..0xCC007FFF) overlaps,
+   so testing it first cannot change which window an address lands in.  Run-time arm:
+   g_wpar_fast = 0 restores the mapped path on the same binary. */
+extern int  g_wpar_fast;
+extern void gk_wpar_write(uint32_t ea, uint32_t v, uint32_t n);
+#define GK_WPAR_DIRECT(ea, v, n) \
+    if (g_wpar_fast && ((ea) & ~(GK_WPAR_SIZE - 1u)) == GK_WPAR_LO) { gk_wpar_write((ea), (v), (n)); return; }
+#else
+#define GK_WPAR_DIRECT(ea, v, n)
+#endif
+__attribute__((noinline)) static void gk_w8_s (uint32_t ea,uint8_t v){ GK_WPAR_DIRECT(ea, v, 1) gk_w8_m(ea,v); }
+__attribute__((noinline)) static void gk_w16_s(uint32_t ea,uint16_t v){ GK_WPAR_DIRECT(ea, v, 2) gk_w16_m(ea,v); }
+__attribute__((noinline)) static void gk_w32_s(uint32_t ea,uint32_t v){ GK_WPAR_DIRECT(ea, v, 4) gk_w32_m(ea,v); }
 static inline uint8_t  gk_r8 (uint32_t ea){
     if (GK_FAST(ea,1)) return g_ram[ea & 0x01FFFFFFu];
     return gk_r8_s(ea); }
@@ -527,6 +542,12 @@ static inline double gk_fma(double a, double c, double b) {
     if (!g_gk_fma_fast) return fma(a, c, b);
     const uint64_t ua = gk_db(a), uc = gk_db(c);
     const int ea = (int)((ua >> 52) & 0x7FF), ec = (int)((uc >> 52) & 0x7FF);
+    // [2026-09-29] arm 2: an exactly-zero operand (either sign) times a FINITE one is an exact
+    // signed zero, so `a*c + b` is again RN(a*c + b) = fma(a,c,b), signed-zero rules included
+    // (the sum of the exact product and b rounds identically).  0 x inf/NaN stays with libc.
+    if (g_gk_fma_fast >= 2 &&
+        (((ua << 1) == 0 && ec != 0x7FF) || ((uc << 1) == 0 && ea != 0x7FF)))
+        return a * c + b;
     if (ea != 0 && ea != 0x7FF && ec != 0 && ec != 0x7FF) {
         const int e = (ea - 1023) + (ec - 1023);
         if (e > -1000 && e < 1000 && gk_sigbits(ua) + gk_sigbits(uc) <= 53) {

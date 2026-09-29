@@ -61,6 +61,8 @@ export function guestCounters(mod) {
     // the hash guard, and the REL module ids resident on the guest's own __OSModuleInfoList
     idleKcycles: mod._sr_image_idle_kcycles ? mod._sr_image_idle_kcycles() >>> 0 : null,
     ovRefused: mod._sr_image_ov_refused ? mod._sr_image_ov_refused() >>> 0 : null,
+    paceSleptMs: mod._sr_image_pace_slept_ms ? mod._sr_image_pace_slept_ms() >>> 0 : null,
+    paceBehindMs: mod._sr_image_pace_behind_ms ? mod._sr_image_pace_behind_ms() >>> 0 : null,
     mods: (() => {
       const rd = (ea) => { const b = mod._sr_ram() + (ea & 0x01FFFFFF), U = mod.HEAPU8;
         return ((U[b] << 24) | (U[b + 1] << 16) | (U[b + 2] << 8) | U[b + 3]) >>> 0; };
@@ -105,7 +107,14 @@ export async function startGuest(mod, api, opts = {}) {
   mod._sr_os_set_timeout(parkMs);
   api.setStrict(strict);
   mod._sr_gx_set_capture(2);                       // the frame ring
-  if (opts.fmaFast !== undefined && mod._sr_set_fma_fast) mod._sr_set_fma_fast(opts.fmaFast ? 1 : 0);
+  // pace: the host waits once per field until wall time catches up with guest time (1.000x
+  // delivered; gate #9's second knob).  Off unless asked: the node rig measures capacity unpaced.
+  if (opts.pace !== undefined) {
+    if (!mod._sr_image_set_pace) throw new Error('pace requested but this image has no pacer');
+    mod._sr_image_set_pace(opts.pace ? 1 : 0);
+  }
+  if (opts.fmaFast !== undefined && mod._sr_set_fma_fast) mod._sr_set_fma_fast(opts.fmaFast | 0);   // 0 libc, 1 exact-product, 2 + zero operand
+  if (opts.wparFast !== undefined) mod._sr_set_wpar_fast(opts.wparFast ? 1 : 0);
   // idleLoop: the busy-wait skip (sr.py --idle-skip builds), default on; 0 = the control arm
   if (opts.idleLoop !== undefined && mod._sr_image_set_idle_loop) mod._sr_image_set_idle_loop(opts.idleLoop ? 1 : 0);
   // snapMem: the verification-only MEM1 hash per context switch (sr_host_os.c) — the matched-pair
