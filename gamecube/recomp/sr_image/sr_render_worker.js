@@ -372,8 +372,13 @@ async function runGuestArm(msg, base) {
   say('guest-started', { dolBytes: staged.dolBytes, apploader, discBytes: disc.size });
   const pump = makePump(mod, api);
   const periodMs = (msg.postMs | 0) || 100;
-  let reports = 0;
+  let reports = 0, ticks = 0;
+  const t0 = performance.now();
   setInterval(() => {
+    // a timed report every 5 s of wall time, so guest s per wall s can be read off the log
+    // (the frame-count reports below are not evenly spaced in wall time)
+    if (++ticks % Math.max(1, Math.round(5000 / periodMs)) === 0)
+      say('guest', Object.assign({ timed: true, wallMs: Math.round(performance.now() - t0) }, guestCounters(mod)));
     const f = pump();
     if (f && f.fifo) {
       // measure before transferring (a transferred buffer reads as length 0)
