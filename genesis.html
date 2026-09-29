@@ -528,7 +528,7 @@
   var gpState = {};   // gamepad-only view, OR-ed in padMask()
 
   window.Module = {
-    locateFile: (p) => CORE_DIR + p,
+    locateFile: (p) => CORE_DIR + p + '?v=66b69161',   // core stamp: a cached old .wasm must never pair with a new .js
     print: (t) => console.log('[genesis]', t),
     printErr: (t) => console.warn('[genesis]', t),
     onRuntimeInitialized: function () {
@@ -2350,7 +2350,7 @@
   // absolute literal URLs it can see statically, so a concatenated one is
   // reported UNCHECKED — which is how two runtime assets stayed 404 on the live
   // site while being present in git.
-  s.src = '/genesis/genesisWasm/dist/genesis_plus_gx.js';
+  s.src = '/genesis/genesisWasm/dist/genesis_plus_gx.js?v=66b69161';
   s.onerror = function () {
     setStatus('Core failed to load.');
     // ⚠ THE PATH GOES TO THE LOG, NOT TO THE PLAYER. This read
