@@ -86,7 +86,8 @@ function walk(b) {
 await G.startGuest(M, api, { hle: 12, snapMem: +(process.env.SRS_SNAPMEM || 0),
   idleLoop: process.env.SRS_IDLELOOP === undefined ? undefined : +process.env.SRS_IDLELOOP,
   exiModel: +(process.env.SRS_EXI || 1),
-  fmaFast: process.env.SRS_FMA === undefined ? undefined : +process.env.SRS_FMA, si: +(process.env.SRS_SI || 0),
+  fmaFast: process.env.SRS_FMA === undefined ? undefined : +process.env.SRS_FMA,
+  pace: process.env.SRS_PACE === undefined ? undefined : +process.env.SRS_PACE, si: +(process.env.SRS_SI || 0),
   input: (process.env.SRS_INPUT || '').split(',').filter(Boolean).map((x) => x.split(':').map((y) => parseInt(y))), card: process.env.SRS_CARD === undefined ? 1 : +process.env.SRS_CARD });
 const pump = G.makePump(M, api);
 const posts = [];
@@ -99,7 +100,7 @@ const rdg = (ea) => { const b = api.ram() + (ea & 0x01FFFFFF), U = M.HEAPU8; ret
 const modIds = () => { const o = []; for (let h = rdg(0x800030C8), n = 0; h && n < 8; h = rdg(h + 4), n++) o.push(rdg(h)); return o.join('/'); };
 const sampler = setInterval(() => {
   samples.push({ xfb: M._sr_image_xfb_copies() >>> 0, prims: M._sr_gp_prims() >>> 0, vframes: M._sr_image_vi_frames() >>> 0, mods: modIds(), fault: '0x' + (M._sr_image_fault() >>> 0).toString(16), wallMs: performance.now() - t0, kc: M._sr_image_kcycles() >>> 0,
-                 idleKc: M._sr_image_idle_kcycles() >>> 0, loopSkips: M._sr_image_idle_loop_skips ? M._sr_image_idle_loop_skips() >>> 0 : null, skips: M._sr_image_idle_skips() >>> 0, tb: M._sr_tb_calls() >>> 0, irq: M._sr_image_irq_delivered() >>> 0, fin: M._sr_image_pe_finishes() >>> 0 });
+                 idleKc: M._sr_image_idle_kcycles() >>> 0, slept: M._sr_image_pace_slept_ms ? M._sr_image_pace_slept_ms() >>> 0 : null, behind: M._sr_image_pace_behind_ms ? M._sr_image_pace_behind_ms() >>> 0 : null, loopSkips: M._sr_image_idle_loop_skips ? M._sr_image_idle_loop_skips() >>> 0 : null, skips: M._sr_image_idle_skips() >>> 0, tb: M._sr_tb_calls() >>> 0, irq: M._sr_image_irq_delivered() >>> 0, fin: M._sr_image_pe_finishes() >>> 0 });
 }, 1000);
 const timer = POSTMS <= 0 ? null : setInterval(() => {
   const f = pump();
@@ -134,6 +135,13 @@ if (a && b && b.wallMs > a.wallMs) {
            creditedMHz: +(dk / 1e3 / w).toFixed(2), executedMHz: +((dk - di) / 1e3 / w).toFixed(2),
            idleFraction: +(di / dk).toFixed(4), drawDonesPerWallS: +((b.fin - a.fin) / w).toFixed(2),
            mhzNeededAt1x: +(486 * (1 - di / dk)).toFixed(1) };
+  // paced runs (SRS_PACE=1): wall ms the host WAITED, and the capacity that implies at 1.000x
+  if (a.slept != null && b.slept != null) {
+    const sl = (b.slept - a.slept) / 1000;
+    rate.pacedSleptFraction = +(sl / w).toFixed(4);
+    rate.pacedBehindMs = b.behind - a.behind;
+    rate.capacityAt1x = w > sl ? +(rate.guestSecondsPerWallSecond * w / (w - sl)).toFixed(3) : null;
+  }
 }
 const result = {
   md5Before, md5After: md5(path.join(DIR, 'sab_image.wasm')), wallMs: MS, discMs: +discMs.toFixed(0),

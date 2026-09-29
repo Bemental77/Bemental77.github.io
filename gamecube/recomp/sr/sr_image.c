@@ -43,6 +43,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <emscripten.h>
+#include <emscripten/threading.h>   /* emscripten_thread_sleep: the pacer */
 #include "gekko_rt.h"
 #include "sr_host_os.h"
 
@@ -929,6 +930,38 @@ static void vi_schedule(void) {
 // :905-1002 Update(), the parts that are not presentation: advance and wrap the counter,
 // then raise IR_INT on a VCT/HCT match.  (BeginField/EndField present the XFB, and the SI
 // poll at :950-969 is SI's — neither is modelled; both are named in README §10.6.)
+// ------------------------------------------------------------ THE PACER (host only, id: none)
+// [2026-09-29] GATE #9's SECOND KNOB.  Guest time is retired guest work (gk_retire) and nothing
+// here changes it: the guest never reads the wall clock.  What this does is make the HOST WAIT,
+// once per 60 Hz field, until wall time has caught up with guest time -- so a host faster than a
+// Gekko delivers exactly 1.000x instead of fast-forwarding.  Measured need: the page arm ran SAB
+// at ~1.5 guest s per wall s unpaced (2026-09-29), which floods the renderer with frames that do
+// not exist yet on hardware.  OFF by default (the node rig measures capacity unpaced); the page
+// arms it.  A host that falls BEHIND by more than 100 ms re-anchors instead of sprinting to catch
+// up, so the delivered rate never exceeds 1.000x; the deficit is counted, not hidden.
+//   slept   = wall ms spent waiting  -> capacity at 1.000x ~= wall / (wall - slept)
+//   behind  = wall ms lost to re-anchoring (time the host could not keep up)
+static int      g_pace;
+static double   g_pace_t0, g_pace_slept, g_pace_behind;
+static uint64_t g_pace_c0;
+static uint32_t g_pace_rebases;
+static void pace_field(void) {
+    const double now = emscripten_get_now();
+    if (g_pace_t0 == 0.0) { g_pace_t0 = now; g_pace_c0 = g_gk_cycles; return; }
+    const double due = g_pace_t0 + (double)(g_gk_cycles - g_pace_c0) / 486000.0;   // 486 MHz, in ms
+    if (due > now) {
+        emscripten_thread_sleep(due - now);
+        g_pace_slept += due - now;
+    } else if (now - due > 100.0) {
+        g_pace_rebases++; g_pace_behind += now - due;
+        g_pace_t0 = now; g_pace_c0 = g_gk_cycles;
+    }
+}
+EMSCRIPTEN_KEEPALIVE void     sr_image_set_pace(int on)    { g_pace = on ? 1 : 0; g_pace_t0 = 0.0; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_pace_slept_ms(void)  { return (uint32_t)g_pace_slept; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_pace_behind_ms(void) { return (uint32_t)g_pace_behind; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_pace_rebases(void)   { return g_pace_rebases; }
+
 static void vi_half_line(void) {
     uint32_t total = vi_half_lines_per_frame();
     if (g_si_model) {                    // VideoInterface.cpp:955-1019: at the CURRENT count, before ++
@@ -936,7 +969,7 @@ static void vi_half_line(void) {
         uint32_t odd = 3u * (vtr & 0xFu) + (vto & 0x3FFu) + 2u * ((vtr >> 4) & 0x3FFu) + ((vto >> 16) & 0x3FFu);
         sr_si_half_line(g_vi_hl, odd, g_vi_fields);
     }
-    if (++g_vi_hl >= total) { g_vi_hl = 0; g_vi_fields++; }
+    if (++g_vi_hl >= total) { g_vi_hl = 0; g_vi_fields++; if (g_pace) pace_field(); }
     uint32_t hlw = vi_r32(0x04) & 0x3FFu;
     for (uint32_t i = 0; i < 4; i++) {
         uint32_t r = vi_r32(0x30 + 4 * i);
