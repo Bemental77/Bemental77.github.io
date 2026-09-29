@@ -27,6 +27,7 @@ shipped disc; the reproducing command is printed next to each one. Artifact:
 | **JIT baseline, re-measured** | **0.3781x delivered / 141.6 MHz executed / 23.2% idle-skipped**, stock V8, n=3, cross-witness spread ≤0.0005. **1.000x costs 373.5 MHz on this scene → the JIT is 2.64x short.** §8.6b |
 | ~~JIT baseline `0.4450x`~~ | **RETRACTED, §8.6c** — a 75 s cold boot read over one 40 s window; re-reading that band from four fresh runs of ONE frozen binary returns **0.3338x–0.5097x**. The V8-tier mismatch §8.1 warned about measures **null on both engines** (§8.6d) and was the least of its defects. |
 | **WHOLE-IMAGE BOOT IN A BROWSER** | **LINKS, INSTANTIATES, AND RUNS THE GUEST'S OWN `__start`** — wasm md5 `7bcca5756df27133d684c4281410171b`. `__init_registers` / `__init_hardware` / `__init_data` / `DBInit` all return **fault-free**, then `OSInit` reaches **27 distinct hardware registers** across PI/MI/DSP/SI/EXI/DI in **126 host-boundary crossings**. It stops in **`__OSInitAudioSystem`**, spinning on a DSP register — **no device model and no interrupt delivery**, not a translator bug (the GAP class is still zero). Modelling one register (EXI `TSTART`) moved it from 21 registers to 27, with a **falsifying control arm on the same md5**. **Nothing renders and no `drawn/s` is claimed.** §10 |
+| **WHOLE-IMAGE BOOT, 2026-09-29** | **Past `__OSInitAudioSystem`, `__ARChecksize`, `RealMode`, `__AI_SRC_INIT` and the DSP boot task, with interrupts delivered — to the first AX COMMAND LIST** (`SR_F_DSP_AXCMD`, 6 M guest cycles), node, binary `7e9f25717aa3e8cbc136dc2fe9287fe4`. Eight run-time-switchable models (exception entry included) + `SR_OS_HLE` linked into the image, each with a run-time control arm on that md5 that brings back the wall it removed (the documented `__OSInitAudioSystem` stop included). The ucode SAB uploads hashes to `0x4e8a8b21` = AX. **Nothing renders**: AX command processing, DI, and a GX consumer are missing. §10.6 |
 | **guest OS CONTEXT SWITCH** | **WORKS** — 63 assertions / 0 failures, incl. a three-thread non-LIFO rotation on three real host threads and a control arm that reproduces `0xe00e78ac` with the host layer off. §6 (superseded there) and [`recomp/sr/CONTEXT_SWITCH.md`](../../recomp/sr/CONTEXT_SWITCH.md) |
 
 The two 2026-09-02 additions each came from a **harness** defect, not a translator one,
@@ -3096,6 +3097,142 @@ run that disagrees with it has a wiring bug.
    image's device model.
 5. **Only then** enumerate what genuinely cannot be serviced, with counts. `sr_image.c`
    hand-answers 16 addresses today; that is the whole surface at risk.
+
+### 10.6 PAST `__OSInitAudioSystem`: the whole image boots to its first AX command list (2026-09-29)
+
+Measured under **node** (`recomp/sr/run_image_node.mjs`, same V8 wasm limits, no browser, no
+probe lock), on whole-image `--all` binaries built by `build_image.sh` at HEAD + this work.
+Every number below comes from the JSON the runner writes; every model has a run-time switch,
+so **every control arm is the same binary and the same md5 (hash checked before and after
+every run)**. Machine load 0.3-2 during the arm table (the sibling agent's browser probes had
+finished). A browser run was NOT repeated for these binaries.
+
+**Reproducing the documented stop.** The §10.1 binary `7bcca5756df27133d684c4281410171b` is not
+in the tree (build outputs are git-ignored, `recomp/sr_image/.gitignore`), and HEAD's sources
+have moved since it was built, so that md5 cannot be rebuilt. What reproduces is the STOP: at
+HEAD, the `--all` binary `ed98732466d6b906ae10b5a2a8a55172` with the existing DSP model switched
+OFF (`SRN_DSP=0`) spins on `DSP_CONTROL` `0xCC00500A` in `__OSInitAudioSystem` (LR
+`0x800e4bb8`, last first-touch `0xCC005012` write, 17 registers) — §10.1/§10.2c's wedge. With
+the model ON (the default since §10.2c) the same binary already ran through `OSInit` and stopped
+in `__ARChecksize` on `AR_MODE` `0xCC005016` (LR `0x800f63b8`).
+
+**The build had to change first.** `-O2` on the 34.9 MB one-TU `sr_gen.c` was OOM-killed by the
+kernel at **13,505,824 kB RSS** (`dmesg`: `Killed process 2784 (clang)`) on this 16 GB box.
+`build_image.sh` now splits the generated file at function starts (`SR_SPLIT`, default 8 — the
+file has one header of forward declarations and no file-scope statics, so the split changes no
+semantics), compiles the parts one at a time with a per-part cache, and relinks a host-layer
+change in ~60 s. `SR_PTHREAD=1` links the `-pthread` variant `SR_OS_HLE` needs.
+
+#### The walls, in the order the boot meets them — headline binary `7e9f25717aa3e8cbc136dc2fe9287fe4`
+
+`SR_PTHREAD=1` build, `SRN_STRICT=1 SRN_HLE=12 SRN_BUDGET=4860` (strict now also stops on the
+first device/ucode fault, not only on an unimplemented boundary; the budget bounds a run at
+4,860 M retired Gekko cycles = 10 s of guest time).
+
+| # | wall (shipped PC) | what the device does | model (`sr_image.c` "THE NEXT DEVICES") | reference |
+|---|---|---|---|---|
+| 1 | `__OSInitAudioSystem` `0x800e4b74` | DSP reset/ARAM/mailbox handshake | §10.2c (existing) | §10.2c |
+| 2 | `__ARChecksize` `0x800f6320`, spin at `0x800f63c0` on `AR_MODE` | read-only, reads 1 | id 1 **AR**; also `Do_ARAM_DMA` transcribed exactly (register masks, HSP-None ARAM->MRAM writes ZEROS, mode-4 mirror) | `HW/DSP.cpp:148-149,:183,:456-567`; `HSP/HSP.cpp:27-40`; dolsdk2001 `src/ar/ar.c:222` |
+| 3 | `RealMode` `0x800e8a4c` from `__OSInitMemoryProtection` | `rfi` into real mode to run `Config24MB` (BAT writes) | id 2 **RM**: the shipped words are interpreted (whitelist: addi/addis/ori/rlwinm/isync/mfmsr/mflr/mtspr BAT,SRR0/1/rfi); anything else raises | shipped words `0x800e894c-0x800e89c8`, `0x800e8a4c-0x800e8a60` |
+| 4 | `OSInit` consoleType | `PI_FLIPPER_REV` reads `0x246500B1` | id 4 **PIREV** | `ProcessorInterface.cpp:29,:136` |
+| 5 | `__AI_SRC_INIT` spin at `0x800f5a2c` on `AISCNT` `0xCC006C08` | sample counter clocked by the CPU clock | id 6 **AI**: AICR/AISCNT/AIIT, 10,116 / 15,174 cycles per sample, the stopped-counter quirk transcribed | `AudioInterface.cpp:96-155,:187-189,:193-204,:213-315,:348-356` |
+| 6 | `__DSP_boot_task` spin at `0x800fea14` on `DSPCheckMailToDSP` | HLE: a CPU mail is consumed at once; the boot ROM collects the task and switches ucode by `HashEctor` | id 7 **UCODE**: `MailHandler` queue with per-mail interrupt, ROM ucode, INIT, and AX's mail protocol | `DSPHLE.cpp:63-76,:179-190`; `MailHandler.cpp:18-70`; `UCodes/ROM.cpp`; `Common/Hash.cpp:33-44`; `UCodes.cpp:154-167` |
+| 7 | interrupts | PI cause/mask; exception entry; guest dispatcher; `OSLoadContext` | id 3 **IRQ** (below) | `ProcessorInterface.cpp:50-82,:149-156`; `PowerPC.cpp:583-632`; dolsdk2001 `src/os/OS.c:344-420`, `include/dolphin/os/OSException.h:35-53` |
+| 8 | VI | Preset timing, half-line clock on retired cycles, DI0-3 `IR_INT`, PI VI line | id 5 **VI** (no pixels) | `VideoInterface.cpp:96-178,:317-334,:343-369,:435-447,:467-477,:760-773,:905-1002` |
+| 9 | audio DMA | block walk every 121,392 cycles, AID interrupt 200 cycles after enable and on wrap | id 8 **AID** (no samples leave) | `HW/DSP.cpp:266-270,:314-361,:424-454`; `SystemTimers.cpp:78-94` |
+| 10 | first `OSSleepThread` -> `SelectThread` `0x800ebd68` — the stop on the pre-AID binary `19296103af03be4887b2e599f36084ba`; on the headline binary wall 11 comes FIRST (the no-HLE arm below stops at the same AX fault) | a real thread switch | `SR_OS_HLE` linked into the image (§10.5 item 2), idle loop transcribed | CONTEXT_SWITCH.md; shipped words `0x800ebe94-0x800ebec0`; `CoreTiming.cpp:574-588` (idle skip) |
+| **11** | **first AX command list** (`SR_F_DSP_AXCMD`, `0xc6c20180`) | the AX ucode processes a 0x180-byte command list | **NOT MODELLED — raises** | `UCodes/AX.cpp:113-360` |
+
+**The ucode SAB boots is AX.** `BootUCode` hashes the uploaded IRAM image to `0x4e8a8b21`
+(`HashEctor`, computed in-image from the guest's own upload), which `UCodes.cpp:156` maps to
+`AXUCode`. AX's `Initialize` mail (`0xDCD10000`, with interrupt) is modelled; its **command list
+is not**, and the first one arrives at 6 M guest cycles (~14 ms), sent from an interrupt —
+the back chain at the stop is `0x800f8440 <- 0x800f5d44 <- 0x800e8094 (__OSDispatchInterrupt)
+<- 0x8006d820 <- 0x800d2874 <- 0x800d3aec (main)`, i.e. the AI-DMA callback's first audio frame.
+
+#### The interrupt path (id 3), and why it is not an approximation
+
+A guest exception is entered only at a **basic-block head** (`gekko_rt.h` `gk_retire`, which
+under `-DSR_MMIO` only now also compares the retired-cycle counter to the next device event —
+fixture builds are byte-identical: `sr_driver.c` objects md5 `2a547a27…` / `9fe618c5…` HEAD vs
+now, `-DSR_VERIFY` / plain), where every guest register is in `*st` (sr.py keeps no C locals
+across blocks). Entry is the CPU's (`SRR1 = MSR & 0x87C0FFFF`, `MSR &= ~0x04EF36`, external
+before decrementer) then `__OSEVStart`'s context save; the second-level handler
+(`ExternalInterruptHandler` `0x800e80c8`, `DecrementerExceptionHandler` `0x800e445c`, read from
+the `0x80003000` table the guest's OSInit filled) is checked word-for-word against
+`OS_EXCEPTION_SAVE_GPRS` and its closing `b` is decoded — `__OSDispatchInterrupt` `0x800e7d84`
+then RUNS TRANSLATED. Its `OSLoadContext(context)` never returns: `img_host` longjmps to the
+live delivery frame (per host thread, `_Thread_local`), and `sr_host_os.c`'s own `ctx_load`
+(RAS fixup included) restores the registers. Stated gaps: **SRR0 is written as 0** (sr.py has no
+PC); FPRs are snapshotted around the handler instead of the lazy FP-unavailable save.
+
+One bug this found in the existing thread layer, fixed in `sr_host_os.c`: `slot_for()` handed a
+new thread **slot 0 — the caller's own** when the caller had never been bound (the ctxsw harness
+binds it explicitly; the boot cannot know the default thread's address in advance). Measured
+before the fix: `HANDOFF 0x802bafc8->0x8036dd40` followed by `SELECT_RETURN` on the SAME host
+thread and no `THREAD_ENTRY`, i.e. one host thread running two guest threads. The first switch
+away from an unbound slot now binds it. `verify_ctxsw.mjs`: **63 passed / 0 failed** after every
+`sr_host_os.c` change here.
+
+#### Falsifying control arms — ONE binary, `7e9f25717aa3e8cbc136dc2fe9287fe4`, md5 identical before/after every arm
+
+| arm | ends with | LR / where | device reads | regs | M cycles |
+|---|---|---|---|---|---|
+| **all models ON** | **strict fault `0xc6c20180` (AX command list)** | `0x800f82d8`, in the AI-DMA callback | 237 | 60 | 6 |
+| `SRN_DSP=0` | watchdog | `0x800e4bb8` `__OSInitAudioSystem` — **§10.1's documented stop** | 3,000,001 | 17 | 9 |
+| `SRN_EXI=0` | watchdog | `0x800e9820` `__OSReadROM`/EXISync — §10.2's | 3,000,001 | 13 | 18 |
+| `SRN_AR=0` | watchdog | `0x800f63b8` `__ARChecksize`, on `0xCC005016` | 3,000,001 | 50 | 15 |
+| `SRN_RM=0` | strict UNIMPL `0x800e8a4c` | `0x800e8aa4` `__OSInitMemoryProtection` | 31 | 24 | 0 |
+| `SRN_AI=0` | watchdog | `0x800f5a2c` `__AI_SRC_INIT`, on `0xCC006C08` | 3,000,001 | 57 | 15 |
+| `SRN_UCODE=0` | watchdog | `0x800fea18` `__DSP_boot_task`, on `0xCC005000` | 3,000,001 | 59 | 27 |
+| `SRN_IRQ=0` | **budget — 4,860 M cycles, never reaches the AX wall**, 0 interrupts | `0x800f857c` (DSP task code) | 217 | 56 | 4,860 |
+| `SRN_VI=0` | budget, never reaches the AX wall | `0x800f857c` | 265 | 75 | 4,860 |
+| `SRN_PIREV=0` | same AX fault — but `consoleType` (`0x8000002C`) reads **`0x10000004`** vs **`0x10000006`** ON (`= 4 + (0x246500B1 >> 28)`, shipped words `0x800e37b0-0x800e3800`) | `0x800f82d8` | 237 | 60 | 6 |
+| `SRN_AID=0` | the AX frame is never sent; the boot goes on to **`0xe1000000`** (`sr_indirect` to address 0 — a null function pointer) in `main` | `0x800d3b74` | 300 | 109 | 48 |
+| no `SRN_HLE` (osMode 4) | same AX fault — the first command list precedes the first thread switch | `0x800f82d8` | 237 | 60 | 6 |
+
+The AID arm is a control, not a result: with no audio DMA no frame is requested, so the boot is
+running on a machine whose audio never starts. That it then calls through a null pointer in
+`main` is recorded, not diagnosed.
+
+#### Exploratory arm — what is behind the AX wall (NOT a result)
+
+`SRN_PAST_FAULT=1` keeps delivering interrupts after the first fault (default OFF: a faulted
+guest is not the machine). Same binary, non-strict, 10 s budget: **2,600 external interrupts
+delivered**, 108 distinct registers (VI 45, DSP 30, CP 17, EXI 12, PI 8, PE 8, SI 6, AI 5,
+MI 3, DI 3), **644 GX FIFO writes / 1,727 bytes** (GXInit), four guest threads created and
+switched (`0x802bafc8` main prio 16, `0x8036dd40` prio 12, `0x8036da30` prio 24, `0x8036e050`
+prio 8 suspended), and the main thread in `VIWaitForRetrace` (`0x800f28a8`) called from the
+video-init routine `0x80118134` (VISetNextFrameBuffer / VIFlush / wait). No DVD command was
+issued (DI: 3 registers, all init). From ~2,000 M cycles on the state is FROZEN with the
+run queue holding two ready threads (`RunQueueBits 0x88000`) while `__gCurrentThread` is 0 —
+either the guest reacting to a DSP that never answered, or a scheduling defect in the
+interrupt/thread interplay; it is not separated here and nothing after the AX fault is claimed.
+
+#### What is still missing before a first rendered frame
+
+1. **AX command-list HLE** — `AXUCode::HandleCommandList` + PB processing + mixing
+   (`UCodes/AX.cpp` 843 lines, `AXVoice.h` 610, `AXStructs.h` 322). This is the strict wall. The
+   PB state the DSP writes back (positions, ADPCM state, end flags) is guest-visible, so
+   "acknowledge the frame without doing it" is not an option under the no-approximation rule.
+2. The exploratory arm's frozen scheduler state must be explained (guest reaction vs a defect in
+   the exception-inside-SelectThread path, `sr_host_os.c` `exc_ctx` / `sr_irq_resume_hook`).
+3. **DI (DVD)**: not reached yet; the disc is 1.46 GB and would be read from the ISO by the host.
+4. **GX -> pixels**: `sr_gx.c` captures the FIFO; nothing on this path draws it. §10.2d's routing
+   to Dolphin (and its three blockers — note blocker 1, "no shared memory", is now half-gone:
+   the `SR_PTHREAD=1` image links `-pthread` with a shared, fixed 256 MB memory) is still the
+   destination; the models above are its acceptance tests, per §10.2d's own disposition.
+5. SI/PAD, EXI interrupts, the VI horizontal beam position (a read RAISES), SRR0.
+
+Reproduce (paths are this box's; the ISO is `cat gamecube/roms/SonicAdventure2Battle.bin.parta?.gz | gunzip`,
+md5 `9ef5fadf4b8756af820df997468a5a16`, FST 0x121db bytes at ISO offset 0x1fd100):
+
+```bash
+SR_PTHREAD=1 SR_OUT=/tmp/img bash gamecube/recomp/sr/build_image.sh sab.iso   # ~40 min cold, 60 s relink
+cp sab_fst.bin /tmp/img/
+SR_IMG=/tmp/img SRN_STRICT=1 SRN_HLE=12 SRN_BUDGET=4860 node gamecube/recomp/sr/run_image_node.mjs
+SR_IMG=/tmp/img SRN_STRICT=1 SRN_HLE=12 SRN_BUDGET=4860 SRN_AR=0 node gamecube/recomp/sr/run_image_node.mjs  # etc.
+```
 
 ### 10.3 Three things that came free with the run
 

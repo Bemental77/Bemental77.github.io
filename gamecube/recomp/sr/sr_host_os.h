@@ -331,6 +331,10 @@ int  sr_host_call(GekkoState *st, uint32_t addr);   // 1 = handled, 0 = not ours
 uint64_t sr_dec_due_at(void);                       // UINT64_MAX when not armed
 int      sr_dec_take(void);                         // 1 if a decrementer exception fired now
 void     sr_os_ctx_load(GekkoState *st, uint32_t ctx);
+extern int  (*sr_idle_hook)(void);
+extern void (*sr_irq_resume_hook)(GekkoState *st, uint32_t ctx);
+int      sr_os_init(int nthreads);
+int      sr_os_budget_yield(void);
 void     sr_os_set_msr(uint32_t m);
 uint32_t sr_os_get_msr(void);
 

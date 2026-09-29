@@ -65,6 +65,7 @@ uint32_t     sr_call(uint32_t addr);
 // from sr_host_os.c — EMSCRIPTEN_KEEPALIVE there, but sr_host_os.h declares only
 // sr_host_call() and sr_os_init_irq(), so the MSR accessors are declared here.
 void         sr_os_set_msr(uint32_t m);
+void         sr_os_mode(int m);
 uint32_t     sr_os_get_msr(void);
 
 // ---------------------------------------------------------------- fault codes
@@ -356,8 +357,26 @@ static uint32_t g_dsp_mail  = 0;    // the DSP's last mail, latched on read (Mai
 // DSPHLE::SetUCode (DSPHLE.cpp:72-77) calls ClearPending() and THEN the new ucode's
 // Initialize(), so a ucode change REPLACES the queue rather than appending to it, and
 // both ucodes this model knows push exactly one mail.
-static uint32_t g_dsp_mail_q = DSP_ROM_MAIL;
-static uint32_t g_dsp_mail_pending = 1;
+// [2026-09-29] THE QUEUE IS NOW MailHandler's OWN SHAPE (DSPHLE/MailHandler.cpp:18-70): a
+// FIFO of (mail, interrupt-on-pop) pairs.  The one-slot version above was exact for the two
+// ucodes that each push one mail; the boot task and the AX ucode that follow it push mails
+// WITH a DSP interrupt, and the interrupt is attached to the FRONT mail (PushMail, :20-30),
+// which a single slot cannot represent.  Power-on: the ROM ucode's 0x8071FEED (see above).
+#define DSP_MQ 32
+static uint32_t g_mq_mail[DSP_MQ] = { DSP_ROM_MAIL };
+static uint8_t  g_mq_irq[DSP_MQ];
+static uint32_t g_mq_head = 0, g_mq_n = 1;
+#define SR_F_DSP_MQ 0xC6C00000u         // more than DSP_MQ mails queued: raise, never drop
+static void mq_clear(void) { g_mq_n = 0; }
+static void dsp_gen_int(void);          // DSP.cpp:389-396, defined after irq_update
+static void mq_push(uint32_t mail, int irq) {
+    if (irq) { if (!g_mq_n) dsp_gen_int(); else g_mq_irq[g_mq_head] = 1; }
+    if (g_mq_n == DSP_MQ) { if (!g_fault) g_fault = SR_F_DSP_MQ; return; }
+    uint32_t i = (g_mq_head + g_mq_n) % DSP_MQ;
+    g_mq_mail[i] = mail; g_mq_irq[i] = 0; g_mq_n++;
+}
+static void ucode_set(uint32_t which);  // DSPHLE::SetUCode — THE NEXT DEVICES, id 7
+static void aid_reset(void);            // THE NEXT DEVICES, id 8
 static uint32_t g_dsp_events = 0;   // modelled DSP actions taken — the ON-arm's witness
 static uint32_t g_aram_bytes = 0;   // bytes actually moved by a modelled ARAM DMA
 static uint8_t *g_aram = 0;         // allocated on the first DMA, never before
@@ -484,7 +503,8 @@ static void dsp_ctrl_write(void) {
         // A reset is `SetUCode(UCODE_ROM)` (DSPHLE.cpp:208), which clears the pending
         // queue and then lets the BOOT ROM mail 0x8071FEED — it does NOT leave the
         // mailbox empty.  The latched m_last_mail is not cleared by SetUCode either.
-        g_dsp_mail_q = DSP_ROM_MAIL; g_dsp_mail_pending = 1;
+        ucode_set(0);                               // UCODE_ROM: clear, push 0x8071FEED
+        aid_reset();                                // DSP.cpp:266-270: reset clears AudioDMAControl
         g_dsp_events++;
         dev_log(DSP_CONTROL_EA, DEVK_DSP_RESET);
     }
@@ -492,14 +512,13 @@ static void dsp_ctrl_write(void) {
     // is CLEARING the bit that starts the DSP, which is why the mail cannot be queued at
     // reset time (step 2 of the sequence above spins until the mailbox is EMPTY).
     if ((old & DSPC_INIT) && !(w & DSPC_INIT)) {
-        g_dsp_mail_q = DSP_INIT_MAIL;
-        g_dsp_mail_pending = 1;
+        ucode_set(1);                               // UCODE_INIT_AUDIO_SYSTEM: push 0x80544348
         g_dsp_events++;
         dev_log(DSP_CONTROL_EA, DEVK_DSP_MAIL);
     }
     g_dsp_ctrl = eff;
     dev_w16(DSP_CONTROL_EA, eff);
-    irq_update();      // the mask bits may have changed: DSP.cpp:291 UpdateInterrupts()
+    irq_update();      // the mask bits may have changed: DSP.cpp:301 UpdateInterrupts()
 }
 
 // DSP -> CPU mailbox read, staged into the window before the guest's load completes.
@@ -507,9 +526,13 @@ static void dsp_ctrl_write(void) {
 // consuming it, the LOW read consumes it and then clears bit 0x80000000 of the latched
 // value, and while the DSP is HALTED neither sees anything new.
 static void dsp_mail_read(int low) {
-    if (!(g_dsp_ctrl & DSPC_HALT) && g_dsp_mail_pending) {
-        g_dsp_mail = g_dsp_mail_q;
-        if (low) g_dsp_mail_pending = 0;
+    if (!(g_dsp_ctrl & DSPC_HALT) && g_mq_n) {
+        g_dsp_mail = g_mq_mail[g_mq_head];
+        if (low) {
+            int gen = g_mq_irq[g_mq_head];
+            g_mq_head = (g_mq_head + 1) % DSP_MQ; g_mq_n--;
+            if (gen) dsp_gen_int();
+        }
         g_dsp_events++;
         dev_log(low ? DSP_MAIL_FROM_LO : DSP_MAIL_FROM_HI, DEVK_DSP_MAIL);
     }
@@ -634,6 +657,24 @@ void gk_dev_write(uint32_t p, uint32_t n) {
 //               the counter's edges against OSGetTime, so the counter and the timebase MUST be
 //               the same clock — which they are: both are g_gk_cycles.  NO SAMPLES: no stream
 //               audio is decoded and nothing is mixed.
+//   id 7  UCODE the CPU->DSP mailbox and the DSP-side ucode STATE MACHINES, HLE'd exactly as
+//               Dolphin's default (MAIN_DSP_HLE) configuration HLEs them: writing
+//               MAIL_TO_DSP_LO hands the mail to the current ucode and clears the MSB
+//               (DSPHLE/DSPHLE.cpp:179-190); the boot ROM collects the boot-task parameters
+//               and, on 0x80F3D001, hashes the uploaded IRAM image with HashEctor and switches
+//               to the ucode that hash names (UCodes/ROM.cpp HandleMail/BootUCode,
+//               Common/Hash.cpp:33-44, UCodes/UCodes.cpp UCodeFactory).  Of the ucodes that
+//               can be chosen, ONLY the AX mail protocol is modelled, and only up to its first
+//               COMMAND LIST: AX's command processing (voice parameter blocks, mixing) is not,
+//               and reaching it RAISES SR_F_DSP_AXCMD rather than acknowledging work that was
+//               never done.  An unknown hash RAISES too (the reference panics there).
+//   id 8  AID   the DSP interface's AUDIO DMA (the CPU->AI sample FIFO): START/CONTROL/
+//               BLOCKS_LEFT (HW/DSP.cpp:314-361), the per-32-byte-block walk
+//               UpdateAudioDMA (:424-454) on SystemTimers' AudioDMACallback period
+//               (SystemTimers.cpp:78-94: 486e6 * AID divisor / 13.5e6 cycles — 121,392 at
+//               32 kHz), and the AID interrupt: 200 cycles after enable (:342-346) and on each
+//               buffer wrap.  NO SAMPLES LEAVE: Dolphin's SendAIBuffer (the speaker) has no
+//               counterpart here, so the blocks are walked and discarded.
 #include <setjmp.h>
 #define MODEL_AR    1u
 #define MODEL_RM    2u
@@ -641,18 +682,23 @@ void gk_dev_write(uint32_t p, uint32_t n) {
 #define MODEL_PIREV 4u
 #define MODEL_VI    5u
 #define MODEL_AI    6u
+#define MODEL_UCODE 7u
+#define MODEL_AID   8u
 static uint32_t g_model_on = (1u << MODEL_AR) | (1u << MODEL_RM) | (1u << MODEL_IRQ) |
-                             (1u << MODEL_PIREV) | (1u << MODEL_VI) | (1u << MODEL_AI);
+                             (1u << MODEL_PIREV) | (1u << MODEL_VI) | (1u << MODEL_AI) |
+                             (1u << MODEL_UCODE) | (1u << MODEL_AID);
 static int model(uint32_t id) { return (g_model_on >> id) & 1u; }
-static uint32_t g_model_events[8];
+static uint32_t g_model_events[16];
+static uint32_t g_strict;    // defined with its setter next to img_hook (tentative here)
 static void ev_rearm(void);
+static void tail_mark(uint32_t kind, uint32_t a);   // the tail ring, next to img_hook
 EMSCRIPTEN_KEEPALIVE void sr_image_set_model(uint32_t id, uint32_t on) {
-    if (id >= 8) return;
+    if (id >= 16) return;
     if (on) g_model_on |= 1u << id; else g_model_on &= ~(1u << id);
     ev_rearm();
 }
-EMSCRIPTEN_KEEPALIVE uint32_t sr_image_get_model(uint32_t id) { return id < 8 ? model(id) : 0; }
-EMSCRIPTEN_KEEPALIVE uint32_t sr_image_model_events(uint32_t id) { return id < 8 ? g_model_events[id] : 0; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_get_model(uint32_t id) { return id < 16 ? model(id) : 0; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_model_events(uint32_t id) { return id < 16 ? g_model_events[id] : 0; }
 
 // ---------------------------------------------------------------- fault codes (0xC6Bx)
 #define SR_F_RM_OPCODE    0xC6B00000u   // RealMode target contains an opcode outside the whitelist
@@ -690,6 +736,94 @@ static void irq_update(void) {
     if (!model(MODEL_IRQ)) return;
     pi_set(PI_CAUSE_DSP, ((g_dsp_ctrl >> 1) & g_dsp_ctrl & DSPC_INT_BITS) != 0);
 }
+
+// DSP.cpp:389-396 GenerateDSPInterrupt(INT_DSP): the status bit is set whatever the mask,
+// and UpdateInterrupts decides the PI line.
+static void dsp_gen_int(void) {
+    g_dsp_ctrl |= DSPC_DSP;
+    dev_w16(DSP_CONTROL_EA, g_dsp_ctrl);
+    irq_update();
+}
+
+// ------------------------------------------------------------------ DSP ucodes (id 7)
+#define SR_F_DSP_UCODE  0xC6C10000u   // BootUCode hashed to a ucode this layer has no model of
+#define SR_F_DSP_AXCMD  0xC6C20000u   // the AX ucode was handed a command list (not modelled)
+#define SR_F_DSP_AXTASK 0xC6C30000u   // an AX task mail this layer does not model (new ucode)
+#define UC_ROM  0u
+#define UC_INIT 1u
+#define UC_AX   2u
+static uint32_t g_uc = UC_ROM, g_uc_crc = 0, g_uc_boots = 0;
+static uint32_t g_rom_next = 0, g_rom_ram = 0, g_rom_len = 0, g_rom_dmem = 0, g_rom_imem = 0, g_rom_pc = 0;
+static uint32_t g_ax_state = 0;       // 0 WaitingForCmdListSize, 1 ...Address, 2 WaitingForNextTask
+static uint32_t g_ax_cmdlist_size = 0, g_ax_cmdlist_addr = 0;
+static void ucode_set(uint32_t which) {                      // DSPHLE.cpp:71-76 SetUCode
+    mq_clear();
+    g_uc = which;
+    if (which == UC_ROM)  { g_rom_next = 0; mq_push(DSP_ROM_MAIL, 0); }   // ROM.cpp Initialize
+    if (which == UC_INIT) mq_push(DSP_INIT_MAIL, 0);                     // INIT.cpp:20-23
+    if (which == UC_AX)   { g_ax_state = 0; mq_push(0xDCD10000u, 1); }   // AX.cpp InitializeShared:
+                                                                         //   PushMail(DSP_INIT, true)
+}
+// Common/Hash.cpp:33-44 HashEctor, over guest bytes in memory order.
+static uint32_t hash_ector(uint32_t pa, uint32_t len) {
+    uint32_t crc = 0;
+    for (uint32_t i = 0; i < len; i++) { crc ^= g_ram[pa + i]; crc = (crc << 3) | (crc >> 29); }
+    return crc;
+}
+static void rom_boot_ucode(void) {                            // ROM.cpp BootUCode
+    uint32_t pa = g_rom_ram & 0x3FFFFFFFu;
+    g_uc_boots++;
+    if (pa + g_rom_len > g_ram_size) { if (!g_fault) g_fault = SR_F_DSP_UCODE | 0xFFFFu; return; }
+    g_uc_crc = hash_ector(pa, g_rom_len);
+    switch (g_uc_crc) {                                       // UCodes.cpp:154-167, the GC AX set
+    case 0x3ad3b7acu: case 0x3daf59b9u: case 0x4e8a8b21u: case 0x07f88145u:
+    case 0xe2136399u: case 0x3389a79eu:
+        ucode_set(UC_AX); g_model_events[MODEL_UCODE]++; return;
+    default:
+        if (!g_fault) g_fault = SR_F_DSP_UCODE | (g_uc_crc & 0xFFFFu);
+        return;
+    }
+}
+static void ucode_mail(uint32_t mail) {                       // DSPHLE.cpp:63-69 SendMailToDSP
+    g_model_events[MODEL_UCODE]++;
+    if (g_uc == UC_ROM) {                                     // ROM.cpp HandleMail, verbatim
+        if (g_rom_next == 0) {
+            if ((mail & 0xFFFF0000u) != 0x80F30000u) mq_push(0xFEEE0000u | (mail & 0xFFFFu), 0);
+            else g_rom_next = mail;
+            return;
+        }
+        switch (g_rom_next) {
+        case 0x80F3A001u: g_rom_ram  = mail; break;
+        case 0x80F3A002u: g_rom_len  = mail & 0xFFFFu; break;
+        case 0x80F3B002u: g_rom_dmem = mail & 0xFFFFu; break;
+        case 0x80F3C002u: g_rom_imem = mail & 0xFFFFu; break;
+        case 0x80F3D001u: g_rom_pc   = mail & 0xFFFFu; rom_boot_ucode(); return;
+        default: break;
+        }
+        g_rom_next = 0;
+        return;
+    }
+    if (g_uc == UC_INIT) return;                              // INIT.cpp HandleMail: empty
+    if (g_uc == UC_AX) {                                      // AX.cpp HandleMail
+        if (g_ax_state == 0) {
+            if ((mail & 0xFFFF0000u) == 0xBABE0000u) { g_ax_cmdlist_size = mail & 0xFFFFu; g_ax_state = 1; }
+            return;                                           // else: ERROR_LOG only
+        }
+        if (g_ax_state == 1) {                                // CopyCmdList + HandleCommandList
+            g_ax_cmdlist_addr = mail;
+            if (!g_fault) g_fault = SR_F_DSP_AXCMD | (g_ax_cmdlist_size & 0xFFFFu);
+            return;
+        }
+        uint32_t m = 0xCDD10000u | (mail & 0xFFFFu);           // "does not check for CDD1"
+        if (m == 0xCDD10000u) { mq_push(0xDCD10001u, 1); g_ax_state = 0; }   // MAIL_RESUME -> DSP_RESUME
+        else if (m == 0xCDD10002u) ucode_set(UC_ROM);                        // MAIL_RESET
+        else if (m == 0xCDD10003u) g_ax_state = 0;                           // MAIL_CONTINUE
+        else if (!g_fault) g_fault = SR_F_DSP_AXTASK | (mail & 0xFFFFu);    // MAIL_NEW_UCODE etc.
+    }
+}
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_ucode_crc(void)  { return g_uc_crc; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_ucode(void)      { return g_uc; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_ax_cmdlist(void) { return g_ax_cmdlist_addr; }
 
 // ------------------------------------------------------------------------ VI
 #define VI_BASE 0xCC002000u
@@ -829,11 +963,47 @@ static void ai_cr_write(uint32_t v) {                        // :213-277
     ai_update_irq();
 }
 
+// ------------------------------------------------------------------------ AID (id 8)
+#define AID_START_HI 0xCC005030u
+#define AID_START_LO 0xCC005032u
+#define AID_CTRL     0xCC005036u
+#define AID_LEFT     0xCC00503Au
+static uint32_t g_aid_cur = 0, g_aid_left = 0, g_aid_on = 0, g_aid_blocks = 0;
+static uint64_t g_aid_next = UINT64_MAX, g_aid_irq_at = UINT64_MAX;
+static uint32_t aid_src(void) {             // :200-203, :314-321 — HI keeps 0x03ff on GC
+    return ((dev_r16(AID_START_HI) & 0x03FFu) << 16) | (dev_r16(AID_START_LO) & 0xFFE0u);
+}
+static uint64_t aid_period(void) {          // SystemTimers.cpp:78-83
+    return (uint64_t)486000000u * ((g_ai_ctrl & AICR_AIDFR) ? 3372u : 2248u) / 13500000u;
+}
+static void aid_gen_int(void) {             // GenerateDSPInterrupt(INT_AID)
+    g_dsp_ctrl |= DSPC_AID; dev_w16(DSP_CONTROL_EA, g_dsp_ctrl);
+    g_model_events[MODEL_AID]++;
+    irq_update();
+}
+static void aid_reset(void) {
+    if (!model(MODEL_AID)) return;
+    dev_w16(AID_CTRL, 0); g_aid_on = 0;
+}
+static void aid_update(void) {              // DSP.cpp:424-454 UpdateAudioDMA
+    uint32_t ctl = dev_r16(AID_CTRL);
+    if (!(ctl & 0x8000u)) return;           // disabled: Dolphin sends 8 zero samples
+    g_aid_blocks++;                         // (the 32 bytes at g_aid_cur would go to the mixer)
+    if (g_aid_left != 0) { g_aid_left--; g_aid_cur += 32u; }
+    if (g_aid_left == 0) {
+        g_aid_cur = aid_src();
+        g_aid_left = ctl & 0x7FFFu;
+        aid_gen_int();
+    }
+}
+
 // ------------------------------------------------------------- device read / write
 static void dev_read_models(uint32_t ea, uint32_t n) {
     if (model(MODEL_AR) && dev_hits(ea, n, 0xCC005016u, 2)) dev_w16(0xCC005016u, 1);
     if (model(MODEL_PIREV) && dev_hits(ea, n, PI_REV_EA, 4)) dev_w32(PI_REV_EA, 0x246500B1u);
     if (model(MODEL_IRQ) && dev_hits(ea, n, PI_INTSR_EA, 4)) dev_w32(PI_INTSR_EA, g_pi_cause);
+    if (model(MODEL_AID) && dev_hits(ea, n, AID_LEFT, 2))              // :352-361
+        dev_w16(AID_LEFT, g_aid_left > 0 ? g_aid_left - 1u : 0u);
     if (model(MODEL_AI)) {
         if (dev_hits(ea, n, AI_CR_EA, 4))  dev_w32(AI_CR_EA, g_ai_ctrl);
         if (dev_hits(ea, n, AI_CNT_EA, 4)) dev_w32(AI_CNT_EA, ai_count_read());
@@ -848,6 +1018,13 @@ static void dev_read_models(uint32_t ea, uint32_t n) {
     }
 }
 static void dev_write_models(uint32_t ea, uint32_t n) {
+    if (model(MODEL_UCODE) && g_dsp_model && dev_hits(ea, n, 0xCC005002u, 2)) {
+        // DSPHLE.cpp:179-190: the LOW half sends; then "clear MSB to show that it is progressed".
+        uint32_t mail = dev_r32(0xCC005000u);
+        ucode_mail(mail);
+        dev_w16(0xCC005000u, (mail >> 16) & 0x7FFFu);
+        if (g_fault) ev_rearm();              // a ucode wall: let strict stop at the next block
+    }
     if (model(MODEL_AR)) {
         if (dev_hits(ea, n, 0xCC005016u, 2)) dev_w16(0xCC005016u, 1);              // WMASK_NONE
         if (dev_hits(ea, n, 0xCC00501Au, 2)) dev_w16(0xCC00501Au, dev_r16(0xCC00501Au) & 0x07FFu);
@@ -864,6 +1041,20 @@ static void dev_write_models(uint32_t ea, uint32_t n) {
                 g_pi_mask = dev_r32(PI_INTMR_EA);
                 pi_update();
             }
+        }
+    }
+    if (model(MODEL_AID)) {
+        if (dev_hits(ea, n, AID_START_HI, 2)) dev_w16(AID_START_HI, dev_r16(AID_START_HI) & 0x03FFu);
+        if (dev_hits(ea, n, AID_START_LO, 2)) dev_w16(AID_START_LO, dev_r16(AID_START_LO) & 0xFFE0u);
+        if (dev_hits(ea, n, AID_CTRL, 2)) {                              // :322-347
+            uint32_t ctl = dev_r16(AID_CTRL);
+            if (!g_aid_on && (ctl & 0x8000u)) {
+                g_aid_cur = aid_src(); g_aid_left = ctl & 0x7FFFu;
+                g_aid_irq_at = g_gk_cycles + 200u;
+            }
+            g_aid_on = (ctl & 0x8000u) != 0;
+            if (g_aid_next == UINT64_MAX) g_aid_next = g_gk_cycles + aid_period();
+            ev_rearm();
         }
     }
     if (model(MODEL_AI) && ea >= AI_CR_EA && ea < AI_CR_EA + 0x10u) {
@@ -923,9 +1114,13 @@ static void dev_write_models(uint32_t ea, uint32_t n) {
 // FP-unavailable exception (MSR[FP] is cleared by the entry above) and this runtime does not
 // raise that exception, so a handler that uses the FPU must not be able to clobber the
 // interrupted thread's registers.
-static uint32_t g_irq_depth = 0, g_irq_ctx = 0, g_irq_delivered = 0, g_irq_last = 0;
+static uint32_t g_irq_delivered = 0, g_irq_last = 0;
 static uint32_t g_dec_delivered = 0;
-static jmp_buf  g_irq_jmp;
+// PER HOST THREAD.  Under SR_OS_HLE each guest thread runs on its own host thread, and a
+// thread preempted inside an exception is PARKED inside that exception's delivery frame on
+// its own stack — so "which delivery is live" is a property of the host thread.
+static _Thread_local uint32_t g_irq_depth = 0, g_irq_ctx = 0;
+static _Thread_local jmp_buf  g_irq_jmp;
 static const uint32_t SAVE_GPRS_TEMPLATE[18] = {
     0x90040000u, 0x90240004u, 0x90440008u, 0xBCC40018u,
     0x7C11E2A6u, 0x900401A8u, 0x7C12E2A6u, 0x900401ACu, 0x7C13E2A6u, 0x900401B0u,
@@ -970,6 +1165,7 @@ static int irq_enter(GekkoState *st, uint32_t exc) {
     st->gpr[3] = exc; st->gpr[4] = vctx; st->gpr[5] = handler;
     uint32_t saved_depth_ctx = g_irq_ctx;
     g_irq_depth++; g_irq_ctx = vctx; g_irq_last = exc;
+    tail_mark(0x10 | exc, vctx);                    // 0xEEEE0014 external / 0xEEEE0018 dec
     int loaded = setjmp(g_irq_jmp);
     if (!loaded) {
         if (!sr_dispatch(disp, st)) { if (!g_fault) g_fault = SR_F_IRQ_NOTRANS | (disp & 0xFFFFu); }
@@ -979,6 +1175,7 @@ static int irq_enter(GekkoState *st, uint32_t exc) {
     }
     g_irq_depth--; g_irq_ctx = saved_depth_ctx;
     sr_os_ctx_load(st, vctx);                      // registers + MSR <- SRR1 (OSContext.c:281)
+    tail_mark(0x20, vctx);                         // 0xEEEE0020 returned from the exception
     memcpy(st->ps0, fsave0, sizeof fsave0); memcpy(st->ps1, fsave1, sizeof fsave1);
     st->fpscr = fpscr;
     return 1;
@@ -990,9 +1187,62 @@ static int irq_load_context(GekkoState *st) {
     longjmp(g_irq_jmp, 1);
 }
 
+// sr_host_os.c's sr_irq_resume_hook: this host thread was switched away inside the
+// exception it is now being resumed from — perform that exception's OSLoadContext.
+static void irq_resume(GekkoState *st, uint32_t ctx) {
+    (void)st;
+    if (g_irq_depth && g_irq_ctx == ctx) longjmp(g_irq_jmp, 1);
+}
+
+// sr_host_os.c's sr_idle_hook: the guest is in SelectThread's idle spin with MSR[EE] set.
+// That loop retires cycles and does nothing else until an interrupt readies a thread, so
+// guest time is advanced straight to the next scheduled device event — which is what
+// Dolphin does with an idle loop (CoreTiming.cpp:574-588 Idle(): the remaining downcount is
+// counted as idled cycles and the next event runs).  Returns 0 when nothing at all is
+// scheduled: then no interrupt can ever arrive and the idle is a real deadlock.
+static uint64_t g_idle_cycles = 0;
+static uint32_t g_idle_skips = 0;
+static int img_idle(void) {
+    ev_rearm();       // EE was just set by a direct C call (os_enable_interrupts), not a crossing
+    tail_mark(0x30, (uint32_t)(g_gk_event_at - g_gk_cycles));   // 0xEEEE0030 idle skip
+    if (g_gk_event_at == UINT64_MAX) return 0;
+    if (g_gk_event_at > g_gk_cycles) {
+        g_idle_cycles += g_gk_event_at - g_gk_cycles;
+        g_gk_cycles = g_gk_event_at;
+    }
+    g_idle_skips++;
+    gk_event();
+    return 1;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_idle_skips(void)     { return g_idle_skips; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_idle_mcycles(void)   { return (uint32_t)(g_idle_cycles / 1000000u); }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_cycles_m(void)       { return (uint32_t)(g_gk_cycles / 1000000u); }
+
+// THE GUEST-TIME BUDGET.  The device-read watchdog cannot see a guest that spins on MEMORY
+// (a software flag an interrupt handler would set) — measured: the SRN_IRQ=0 arm ran 1,200 s
+// of wall time with no output.  A budget in RETIRED GUEST CYCLES bounds every run by guest
+// time instead, deterministically, and throws the same way the watchdog does.  0 = off.
+static uint64_t g_budget = 0;
+static uint32_t g_budget_hit = 0, g_budget_thread = 0;
+static GekkoState g_budget_st;
+static uint32_t g_bthr[16 * 6], g_bthr_n = 0, g_bthr_bits = 0;
+EMSCRIPTEN_KEEPALIVE uint32_t *sr_image_budget_threads(void)   { return g_bthr; }
+EMSCRIPTEN_KEEPALIVE uint32_t  sr_image_budget_threads_n(void) { return g_bthr_n; }
+EMSCRIPTEN_KEEPALIVE uint32_t  sr_image_budget_runq(void)      { return g_bthr_bits; }
+EMSCRIPTEN_KEEPALIVE uint32_t    sr_image_budget_thread(void) { return g_budget_thread; }
+EMSCRIPTEN_KEEPALIVE GekkoState *sr_image_budget_state(void)  { return &g_budget_st; }
+EMSCRIPTEN_KEEPALIVE void sr_image_set_budget_mcycles(uint32_t m) { g_budget = (uint64_t)m * 1000000u; }
+
+// THE EXPLORATORY ARM.  By default no exception is entered once g_fault is set: a faulted
+// guest is not the machine any more.  sr_image_set_past_fault(1) delivers anyway, so ONE run
+// can show what the boot would reach NEXT if the first wall were modelled.  Everything such a
+// run reports after its first fault is exploratory and must be quoted as such (README §10.6).
+static uint32_t g_past_fault = 0;
+EMSCRIPTEN_KEEPALIVE void sr_image_set_past_fault(uint32_t on) { g_past_fault = on; }
+
 uint64_t g_gk_event_at = 0;     // 0: the first block head evaluates everything once
 static void ev_rearm(void) {
-    uint64_t at = UINT64_MAX;
+    uint64_t at = g_budget ? g_budget : UINT64_MAX;
     if (model(MODEL_IRQ)) {
         uint64_t d = sr_dec_due_at();
         if (d < at) at = d;
@@ -1000,11 +1250,40 @@ static void ev_rearm(void) {
     }
     if (model(MODEL_VI) && g_vi_next < at) at = g_vi_next;
     if (model(MODEL_AI) && g_ai_next < at) at = g_ai_next;
+    if (model(MODEL_AID) && g_aid_next < at) at = g_aid_next;
+    if (model(MODEL_AID) && g_aid_irq_at < at) at = g_aid_irq_at;
+    if (g_strict && g_fault) at = 0;          // strict: the next block head ends the run
     g_gk_event_at = at;
 }
 
 void gk_event(void) {
     GekkoState *st = sr_state();
+    // STRICT MEANS THE FIRST FAULT OF ANY KIND ENDS THE RUN — not only an unimplemented host
+    // boundary (img_hook), but a device or ucode wall raised inside a model (SR_F_DSP_AXCMD,
+    // SR_F_IRQ_*, ...), which sets g_fault and returns.  The next block head is the stop.
+    if (g_strict && g_fault)
+        EM_ASM({ throw new Error('sr_image strict: fault 0x' + ($0 >>> 0).toString(16)); }, g_fault);
+    if (g_budget && g_gk_cycles >= g_budget) {
+        if (!g_budget_hit) {            // the thread that was RUNNING when time ran out
+            g_budget_hit = 1; g_budget_thread = gk_r32(0x800000E4u); g_budget_st = *st;
+            // ...and every guest thread AT THAT INSTANT (__OSActiveThreadQueue at 0x800000DC,
+            // linkActive at +0x2FC), because what the hand-off to slot 0 below does next is
+            // not part of the measurement.
+            uint32_t t = gk_r32(0x800000DCu);
+            for (g_bthr_n = 0; t && g_bthr_n < 16; t = gk_r32(t + 0x2FCu), g_bthr_n++) {
+                uint32_t *r = &g_bthr[g_bthr_n * 6];
+                r[0] = t; r[1] = gk_r16(t + 0x2C8u); r[2] = gk_r32(t + 0x2D0u);
+                r[3] = gk_r32(t + 0x198u); r[4] = gk_r32(t + 0x84u); r[5] = gk_r32(t + 4u);
+            }
+            g_bthr_bits = gk_r32(st->gpr[13] + (uint32_t)-30176);   // RunQueueBits (SDA -30176)
+        }
+        if (!g_fault) g_fault = 0xC6BF0000u;
+#ifdef __EMSCRIPTEN_PTHREADS__
+        sr_os_budget_yield();           // a pool thread does not return from this
+#endif
+        EM_ASM({ throw new Error('sr_image budget: ' + $0 + ' M guest cycles retired'); },
+               (uint32_t)(g_gk_cycles / 1000000u));
+    }
     if (model(MODEL_VI)) {
         if (g_vi_next == UINT64_MAX) vi_schedule();
         while (g_vi_next <= g_gk_cycles) {
@@ -1015,9 +1294,13 @@ void gk_event(void) {
         }
     }
     if (model(MODEL_AI) && g_ai_next <= g_gk_cycles) ai_event();
+    if (model(MODEL_AID)) {
+        if (g_aid_irq_at <= g_gk_cycles) { g_aid_irq_at = UINT64_MAX; aid_gen_int(); }
+        while (g_aid_next <= g_gk_cycles) { uint64_t due = g_aid_next; aid_update(); g_aid_next = due + aid_period(); }
+    }
     if (model(MODEL_IRQ)) {
         if (sr_dec_take()) g_dec_pending = 1;
-        if (!g_fault && (sr_os_get_msr() & 0x8000u)) {
+        if ((!g_fault || g_past_fault) && (sr_os_get_msr() & 0x8000u)) {
             // PowerPC.cpp:590 before :617 — external first.
             if (g_ext_pending) {
                 g_ext_pending = 0;
@@ -1393,9 +1676,46 @@ static int img_host(GekkoState *st, uint32_t addr) {
 static uint32_t g_strict = 0;
 EMSCRIPTEN_KEEPALIVE void sr_image_set_strict(uint32_t on) { g_strict = on; }
 
+static int img_hook_inner(GekkoState *st, uint32_t addr);
+// THE TAIL RING — [2026-09-29].  The boundary log keeps the FIRST 16,384 crossings, which is
+// the right instrument for "how far did the boot get" and the wrong one for "what was it
+// doing when it stopped" once a run is seconds of guest time long.  This keeps the LAST 64,
+// each with the caller's LR, MSR after the crossing, and the current guest thread.
+#define TAIL_N 64
+static uint32_t g_tail[TAIL_N * 4];
+static uint32_t g_tail_n = 0;
+EMSCRIPTEN_KEEPALIVE uint32_t *sr_image_tail(void)   { return g_tail; }
+EMSCRIPTEN_KEEPALIVE uint32_t  sr_image_tail_n(void) { return g_tail_n; }
+// Non-crossing events share the ring: addr = 0xEEEE00kk, lr = the event's argument.
+static void tail_mark(uint32_t kind, uint32_t a) {
+    uint32_t i = (g_tail_n++ % TAIL_N) * 4u;
+    g_tail[i] = 0xEEEE0000u | kind; g_tail[i + 1] = a; g_tail[i + 2] = sr_os_get_msr();
+    g_tail[i + 3] = gk_r32(0x800000E4u);
+}
+static void tail_rec(GekkoState *st, uint32_t addr) {
+    uint32_t i = (g_tail_n++ % TAIL_N) * 4u;
+    g_tail[i] = addr; g_tail[i + 1] = st->lr; g_tail[i + 2] = sr_os_get_msr();
+    g_tail[i + 3] = gk_r32(0x800000E4u);
+}
+
 static int img_hook(GekkoState *st, uint32_t addr) {
+    int r = img_hook_inner(st, addr);
+    tail_rec(st, addr);
+    return r;
+}
+static int img_hook_inner(GekkoState *st, uint32_t addr) {
     if (img_host(st, addr)) return 1;
-    if (sr_host_call(st, addr)) { img_log(addr, IMG_D_OS); return 1; }
+    if (sr_host_call(st, addr)) {
+        img_log(addr, IMG_D_OS);
+        // [2026-09-29] MSR[EE] can only change here (the --msr-audit containment: no emitted
+        // body touches MSR), so this is where a pending interrupt becomes deliverable.  The
+        // CPU takes it right after the mtmsr (PowerPC.cpp:588 checks EE on every exception
+        // check); re-arming makes the very next block head — the instruction after this
+        // call — take it.  Without this, measured: 3 deliveries in 10 s of guest time with
+        // DSP|VI pending and unmasked, because EE was only ever on between two crossings.
+        ev_rearm();
+        return 1;
+    }
     img_log(addr, IMG_D_UNIMPL);
     if (!g_fault) g_fault = SR_F_IMG_UNIMPL | (addr & 0x00ffffffu);
     if (g_strict)
@@ -1409,8 +1729,21 @@ EMSCRIPTEN_KEEPALIVE int sr_image_init(void) {
     if (!sr_init()) return 0;
     sr_os_init_irq();      // installs sr_host_os.c's hook and sets SR_OS_IRQ
     sr_host_hook = img_hook;   // ...then take it over, chaining to it (img_hook above)
+    sr_idle_hook = img_idle;
+    sr_irq_resume_hook = irq_resume;
     return 1;
 }
+// [2026-09-29] SR_OS_HLE for the whole image — §10.5 item 2.  Needs a -pthread link
+// (build_image.sh SR_PTHREAD=1); creates the host thread pool (one host thread per guest
+// thread, CONTEXT_SWITCH.md) and puts the image's hook back on top of it.
+#ifdef __EMSCRIPTEN_PTHREADS__
+EMSCRIPTEN_KEEPALIVE int sr_image_init_hle(int nthreads) {
+    int n = sr_os_init(nthreads);
+    sr_os_mode(SR_OS_HLE);
+    sr_host_hook = img_hook;
+    return n;
+}
+#endif
 
 // Run the guest from the DOL entry point.  RETURNS ONLY WHEN THE GUEST RETURNS OR
 // FAULTS — sr.py's output is straight-line C in which a guest `bl` is a host call, so

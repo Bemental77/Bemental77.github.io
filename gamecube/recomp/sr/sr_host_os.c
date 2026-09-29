@@ -43,7 +43,15 @@ static _Thread_local int g_self = -1;
 #define SR_TRACE_CAP 4096
 static uint32_t g_trace[SR_TRACE_CAP * 3];
 static uint32_t g_trace_n = 0;
+// [2026-09-29] Event filter: bit ev set = record.  Default ALL, so every existing reader of
+// the trace sees exactly what it always did.  The whole-image run sets it to the thread
+// events, because the 4,096-entry trace is otherwise full of OSGetTick before the first switch.
+static uint64_t g_trace_mask = ~(uint64_t)0;
+EMSCRIPTEN_KEEPALIVE void sr_os_trace_mask(uint32_t lo, uint32_t hi) {
+    g_trace_mask = ((uint64_t)hi << 32) | lo;
+}
 static void tr(uint32_t ev, uint32_t a, uint32_t b) {
+    if (ev < 64 && !((g_trace_mask >> ev) & 1u)) return;
     pthread_mutex_lock(&g_lock);
     if (g_trace_n < SR_TRACE_CAP) {
         g_trace[g_trace_n * 3 + 0] = ev;
@@ -365,6 +373,16 @@ int sr_dec_take(void) {
     dec_check();
     return g_dec_exceptions != before;
 }
+// [2026-09-29] A guest-time budget reached on a POOL host thread cannot end the run by
+// throwing — the node/browser caller is blocked on the MAIN host thread, parked in
+// ht_park().  So the pool thread wakes slot 0 and parks itself for good; slot 0 resumes,
+// meets the same budget at its next block head, and throws there.  Returns 0 on slot 0.
+int sr_os_budget_yield(void) {
+    if (g_self <= 0) return 0;
+    ht_post(0);
+    for (;;) ht_park(g_self);
+}
+
 // OSLoadContext's register half for a host that has just run an exception handler and is
 // performing the handler's own OSLoadContext(context) — sr_image.c's interrupt delivery.
 void sr_os_ctx_load(GekkoState *st, uint32_t ctx) { ctx_load(st, ctx); }
@@ -451,8 +469,24 @@ static void ppc_mtdec(GekkoState *st) {
 //                                        return address of that bl and gpr[3] was
 //                                        stamped 1 by OSSaveContext.
 // ============================================================================
+// [2026-09-29] TWO HOOKS THE WHOLE-IMAGE LAYER (sr_image.c) FILLS IN, both NULL in every
+// other build, so the ctxsw differential is unaffected (verify_ctxsw.mjs: 63/0 with them).
+//   sr_idle_hook        the idle spin at 0x800ebea0 is broken on hardware by an external
+//                       interrupt whose handler readies a thread.  With an interrupt layer
+//                       present, the hook advances guest time to the next scheduled device
+//                       event and services it; it returns 0 when NOTHING is scheduled, which
+//                       is a genuine deadlock and still faults SR_F_IDLE_NO_IRQ by name.
+//   sr_irq_resume_hook  a thread switched away INSIDE an exception (its context carries
+//                       OS_CONTEXT_STATE_EXC, so SelectThread skips OSSaveContext) resumes on
+//                       hardware by OSLoadContext's rfi to the INTERRUPTED point.  Its host
+//                       thread is parked inside that very exception's delivery frame, so the
+//                       hook returns control there; it does not return if it can.
+int  (*sr_idle_hook)(void) = 0;
+void (*sr_irq_resume_hook)(GekkoState *st, uint32_t ctx) = 0;
+
 static void host_select_thread(GekkoState *st) {
     uint32_t saved_ctx = 0;      // the guest thread whose continuation WE are, or 0
+    uint32_t exc_ctx   = 0;      // [2026-09-29] ...or the EXC context we were preempted in
 
     st->gpr[0] = st->lr;
     st->gpr[4] = 0x802c0000u;
@@ -522,7 +556,7 @@ L_800ebe5c:
     st->gpr[0] = gk_r16(st->gpr[6] + OSCTX_STATE);
     st->gpr[0] = gk_rotl32(st->gpr[0], 0) & gk_mask(30, 30);
     gk_rc(st, st->gpr[0]);
-    if (gk_cr_bit(st, 2) == 0) goto L_800ebe7c;              /* context is an EXC frame */
+    if (gk_cr_bit(st, 2) == 0) { exc_ctx = st->gpr[6]; goto L_800ebe7c; }  /* an EXC frame */
 
     // ---- 0x800ebe68  bl OSSaveContext ------------------------------------
     st->lr = 0x800ebe6cu;
@@ -541,13 +575,37 @@ L_800ebe7c:
     gk_w32(st->gpr[3] + 228, st->gpr[4]);                    /* __gCurrentThread = 0 */
     if (gk_cr_bit(st, 2) == 0) goto L_800ebec4;
     // The idle path.  On hardware the spin at 0x800ebea0 is broken by an external
-    // interrupt whose handler calls OSWakeupThread.  There is no interrupt delivery
-    // in this runtime (docs/static-recomp-sab/README.md §8.3 item 1), so the spin
-    // could never terminate: refuse it by name instead of hanging.
+    // interrupt whose handler calls OSWakeupThread.  Without an interrupt layer
+    // (sr_idle_hook == NULL: every build but the whole image) the spin could never
+    // terminate, so it is refused by name instead of hanging.  WITH one, the shipped
+    // words are transcribed (0x800ebe94..0x800ebec0):
+    //   addi r3,r31,1824 / bl OSSetCurrentContext / bl OSEnableInterrupts /
+    //   spin: lwz r0,RunQueueBits / beq spin / bl OSDisableInterrupts /
+    //   lwz r0,RunQueueBits / beq -> OSEnableInterrupts / addi r3,r31,1824 / bl OSClearContext
     st->gpr[3] = st->gpr[31] + 1824u;
+    st->lr = 0x800ebe9cu;
     os_set_current_context(st);
-    fault(SR_F_IDLE_NO_IRQ, 0);
-    st->gpr[3] = 0; goto L_epi;
+    if (!sr_idle_hook) { fault(SR_F_IDLE_NO_IRQ, 0); st->gpr[3] = 0; goto L_epi; }
+    for (;;) {
+        st->lr = 0x800ebea0u;
+        os_enable_interrupts(st);
+        for (;;) {                                           /* 0x800ebea0 */
+            st->gpr[0] = gk_r32(sda(st, SAB_SDA_RUNQUEUEBITS));
+            gk_cmp_unsigned(st, 0, st->gpr[0], 0u);
+            if (gk_cr_bit(st, 2) == 0) break;
+            if (!sr_idle_hook()) { fault(SR_F_IDLE_NO_IRQ, 1); st->gpr[3] = 0; goto L_epi; }
+            if (g_fault) { st->gpr[3] = 0; goto L_epi; }
+        }
+        st->lr = 0x800ebeb0u;
+        os_disable_interrupts(st);
+        st->gpr[0] = gk_r32(sda(st, SAB_SDA_RUNQUEUEBITS));
+        gk_cmp_unsigned(st, 0, st->gpr[0], 0u);
+        if (gk_cr_bit(st, 2) == 0) break;
+    }
+    st->gpr[3] = st->gpr[31] + 1824u;
+    st->lr = 0x800ebec4u;
+    os_clear_context(st);
+    goto L_800ebec4;
 
 L_800ebec4:
     st->gpr[3] = 0u;
@@ -595,6 +653,16 @@ L_800ebec4:
         // is still 0x800ebe6c with gpr[3] == 1, so it still returns NULL.
         if (next == saved_ctx) { ctx_load(st, next); goto L_800ebe6c; }
 
+        // [2026-09-29] The host thread running a guest thread IS that guest thread's host
+        // thread.  verify_ctxsw.mjs binds slot 0 explicitly (sr_os_bind_self); the whole-image
+        // boot cannot know the default thread's address before OSInit has created it, so the
+        // first switch AWAY from an unbound slot binds it.  Without this, slot_for(next)
+        // handed the new thread slot 0 — the CALLER's own slot — and the caller "parked" on a
+        // token it had just posted to itself and ran on AS the new thread (measured: HANDOFF
+        // then SELECT_RETURN on the same host thread, no THREAD_ENTRY).
+        if (self >= 0 && !g_ht[self].bound && saved_ctx) {
+            g_ht[self].bound = 1; g_ht[self].guest_thread = saved_ctx; g_ht[self].started = 1;
+        }
         to = slot_for(next);
         if (to < 0) { fault(SR_F_NO_HOST_THREAD, next & 0xFFFFu); st->gpr[3] = 0; goto L_epi; }
 
@@ -613,7 +681,17 @@ L_800ebec4:
         // simply abandons this stack.  A wasm host thread cannot unwind its own
         // guest frames without an exception, so it parks here for good.  Documented
         // in CONTEXT_SWITCH.md §7 as the one leak in this design.
-        if (!saved_ctx) { ht_park(self); fault(SR_F_NO_CONT, next & 0xFFFFu); st->gpr[3] = 0; goto L_epi; }
+        if (!saved_ctx) {
+            // [2026-09-29] ...unless it was an EXC frame and this host thread is inside
+            // that exception's delivery: then resuming it IS the rfi to the interrupted
+            // point, and the hook takes it there (it does not return when it can).
+            if (exc_ctx && sr_irq_resume_hook) {
+                if (ht_park(self) != 0) { fault(SR_F_PARK_TIMEOUT, exc_ctx & 0xFFFFu); st->gpr[3] = 0; goto L_epi; }
+                if (!g_fault) sr_irq_resume_hook(st, exc_ctx);
+                fault(SR_F_NO_CONT, exc_ctx & 0xFFFFu); st->gpr[3] = 0; goto L_epi;
+            }
+            ht_park(self); fault(SR_F_NO_CONT, next & 0xFFFFu); st->gpr[3] = 0; goto L_epi;
+        }
 
         if (ht_park(self) != 0) {                    /* ---- parked ---- */
             fault(SR_F_PARK_TIMEOUT, saved_ctx & 0xFFFFu);

@@ -17,7 +17,7 @@
 //
 // env (every switch is RUN-TIME, so each control arm is the same binary / same md5):
 //   SRN_EXI=0 / SRN_DSP=0     turn ONE device model off
-//   SRN_AR=0 SRN_RM=0 SRN_IRQ=0 SRN_PIREV=0 SRN_VI=0 SRN_AI=0   the 2026-09-29 models (sr_image_set_model)
+//   SRN_AR=0 SRN_RM=0 SRN_IRQ=0 SRN_PIREV=0 SRN_VI=0 SRN_AI=0 SRN_UCODE=0 SRN_AID=0   the 2026-09-29 models (sr_image_set_model)
 //   SRN_OSMODE=<n>            sr_os_mode() after init (3 = IRQ default, 4 = CTX)
 //   SRN_WATCHDOG=<n>          device READS before the watchdog throws (default 3000000)
 //   SRN_STRICT=1              first unimplemented host boundary throws
@@ -56,7 +56,7 @@ const arms = { exi: +env('SRN_EXI', 1), dsp: +env('SRN_DSP', 1) };
 // sr_image_set_model(id, on): the [2026-09-29] models (sr_image.c "THE NEXT DEVICES").
 // A binary that predates them lacks the export, and the result records 'absent' rather
 // than pretending the arm was set.
-const MODELS = { AR: 1, RM: 2, IRQ: 3, PIREV: 4, VI: 5, AI: 6 };
+const MODELS = { AR: 1, RM: 2, IRQ: 3, PIREV: 4, VI: 5, AI: 6, UCODE: 7, AID: 8 };
 const setModel = opt('_sr_image_set_model'), getModel = opt('_sr_image_get_model');
 for (const [k, id] of Object.entries(MODELS)) {
   if (!setModel) { arms[k.toLowerCase()] = 'absent'; continue; }
@@ -64,8 +64,24 @@ for (const [k, id] of Object.entries(MODELS)) {
   arms[k.toLowerCase()] = getModel(id);
 }
 api.setWatchdog(+env('SRN_WATCHDOG', 3000000) >>> 0);
+// SRN_BUDGET=<M guest cycles>: bound the run by GUEST time (sr_image_set_budget_mcycles).
+// Default 4860 = 10 s of Gekko time.  0 = unbounded.
+if (opt('_sr_image_set_budget_mcycles')) M._sr_image_set_budget_mcycles(+env('SRN_BUDGET', 4860) >>> 0);
+// SRN_HLE=<n>: SR_OS_HLE with n host threads (needs a SR_PTHREAD=1 build).
+if (process.env.SRN_HLE) {
+  if (!opt('_sr_image_init_hle')) throw new Error('SRN_HLE set but this binary was not linked SR_PTHREAD=1');
+  // The timeout FIRST: the pool threads park inside sr_os_init with whatever it is then.
+  M._sr_os_set_timeout(+env('SRN_PARK_MS', 600000));
+  M._sr_image_init_hle(+process.env.SRN_HLE);
+}
 api.setStrict(+env('SRN_STRICT', 0));
 if (process.env.SRN_OSMODE) api.osMode(+process.env.SRN_OSMODE);
+// Thread events only (10..17) plus DEC_EXC (27): see sr_host_os.c g_trace_mask.
+if (opt('_sr_os_trace_mask')) M._sr_os_trace_mask(+env('SRN_TRACE_MASK', 0x0803FC00), 0);
+// SRN_PAST_FAULT=1: keep delivering interrupts after the first fault — EXPLORATORY ONLY.
+if (opt('_sr_image_set_past_fault')) M._sr_image_set_past_fault(+env('SRN_PAST_FAULT', 0));
+// Every fault in order (the first is g_fault; later ones are recorded by the image, if any).
+
 
 // ---- staging: identical order to sr_boot_stage.js stageBoot()
 const dol = fs.readFileSync(path.join(DIR, 'sab_main.dol'));
@@ -99,6 +115,69 @@ const gb = api.state() >>> 2, H = M.HEAPU32;
 const tail = gb + 32 + 64 * 2;
 const regs = { r1: hex(H[gb + 1]), r3: hex(H[gb + 3]), r4: hex(H[gb + 4]), r31: hex(H[gb + 31]),
                cr: hex(H[tail]), lr: hex(H[tail + 2]), ctr: hex(H[tail + 3]) };
+// The GUEST call stack at the stop, read from the PowerPC EABI back chain: [r1] is the
+// caller's r1 and [backchain + 4] is the LR its callee saved.  No PC exists in this image,
+// so this is the only way to see WHERE a wedged guest is beyond the boundary log.
+const rd32 = (ea) => { const b = api.ram() + (ea & 0x01FFFFFF), U = M.HEAPU8;
+  return ((U[b] << 24) | (U[b + 1] << 16) | (U[b + 2] << 8) | U[b + 3]) >>> 0; };
+const backtrace = [];
+for (let sp = H[gb + 1] >>> 0, i = 0; i < 24 && sp >= 0x80000000 && sp < 0x81800000; i++) {
+  const next = rd32(sp); if (next <= sp) break;
+  backtrace.push(hex(rd32(next + 4))); sp = next;
+}
+const tailRing = [];
+if (opt('_sr_image_tail')) {
+  const tn = M._sr_image_tail_n() >>> 0, tb = M._sr_image_tail() >>> 2;
+  for (let k = Math.max(0, tn - 64); k < tn; k++) {
+    const i = tb + (k % 64) * 4;
+    tailRing.push(`${hex(H[i])} lr=${hex(H[i + 1])} msr=${hex(H[i + 2])} th=${hex(H[i + 3])}`);
+  }
+}
+// sr_host_os.c's event trace (the FIRST 4,096 events): thread hand-offs, starts, resumes.
+const osTrace = [];
+if (opt('_sr_os_trace')) {
+  const tn = M._sr_os_trace_n() >>> 0, tb = M._sr_os_trace() >>> 2;
+  const EV = {10:'SELECT_ENTER',11:'SELECT_SAVE',12:'HANDOFF',13:'START_THREAD',14:'RESUMED',15:'SELECT_RETURN',16:'THREAD_ENTRY',17:'THREAD_EXIT',27:'DEC_EXC'};
+  for (let k = 0; k < tn; k++) {
+    const ev = H[tb + 3 * k];
+    if (EV[ev]) osTrace.push(`${EV[ev]} ${hex(H[tb + 3 * k + 1])} ${hex(H[tb + 3 * k + 2])}`);
+  }
+}
+// Every guest thread on __OSActiveThreadQueue (0x800000DC head, linkActive at +0x2FC;
+// dolsdk2001 include/dolphin/os/OSThread.h + OSThread.c), with its saved PC/LR/r1 and the
+// back chain from its saved r1 — where each thread is PARKED when the run stops.
+const threads = [];
+for (let t = rd32(0x800000DC), n = 0; t && n < 32; t = rd32(t + 0x2FC), n++) {
+  const bt = [];
+  for (let sp = rd32(t + 4), i = 0; i < 12 && sp >= 0x80000000 && sp < 0x81800000; i++) {
+    const next = rd32(sp); if (next <= sp) break; bt.push(hex(rd32(next + 4))); sp = next;
+  }
+  threads.push({ thread: hex(t), state: rd32(t + 0x2C8) >>> 16, prio: rd32(t + 0x2D0),
+                 srr0: hex(rd32(t + 0x198)), lr: hex(rd32(t + 0x84)), r1: hex(rd32(t + 4)), bt });
+}
+// The thread that was RUNNING when the guest-time budget ran out, with its registers.
+let atBudget = null;
+if (opt('_sr_image_budget_thread') && H[(M._sr_image_budget_state() >>> 2) + 1]) {
+  const b = M._sr_image_budget_state() >>> 2, bt2 = [];
+  for (let sp = H[b + 1] >>> 0, i = 0; i < 16 && sp >= 0x80000000 && sp < 0x81800000; i++) {
+    const next = rd32(sp); if (next <= sp) break; bt2.push(hex(rd32(next + 4))); sp = next;
+  }
+  atBudget = { thread: hex(M._sr_image_budget_thread()), lr: hex(H[b + 32 + 128 + 2]),
+               r1: hex(H[b + 1]), r3: hex(H[b + 3]), bt: bt2, threads: [],
+               runQueueBits: opt('_sr_image_budget_runq') ? hex(M._sr_image_budget_runq()) : null };
+  if (opt('_sr_image_budget_threads')) {
+    const tb = M._sr_image_budget_threads() >>> 2;
+    for (let k = 0; k < (M._sr_image_budget_threads_n() >>> 0); k++) {
+      const r = (j) => H[tb + 6 * k + j] >>> 0, bt3 = [];
+      for (let sp = r(5), i = 0; i < 10 && sp >= 0x80000000 && sp < 0x81800000; i++) {
+        const next = rd32(sp); if (next <= sp) break; bt3.push(hex(rd32(next + 4))); sp = next;
+      }
+      atBudget.threads.push({ thread: hex(r(0)), state: r(1), prio: r(2), srr0: hex(r(3)), lr: hex(r(4)), r1: hex(r(5)), bt: bt3 });
+    }
+  }
+}
+regs.msr = opt('_sr_os_get_msr') ? hex(M._sr_os_get_msr()) : null;
+regs.curThread = hex(rd32(0x800000E4));
 const log = S.summarize(S.readLog(M, api));
 const n = api.devLogN(), dbase = api.devLogPtr() >>> 2, first = [];
 for (let i = 0; i < n; i++) first.push([hex(H[dbase + 2 * i]), H[dbase + 2 * i + 1]]);
@@ -107,7 +186,8 @@ for (const [k, fn] of [['dspEvents', '_sr_image_dsp_events'], ['aramBytes', '_sr
                        ['irqDelivered', '_sr_image_irq_delivered'], ['decDelivered', '_sr_image_dec_delivered'],
                        ['irqLast', '_sr_image_irq_last'], ['piCause', '_sr_image_pi_cause'],
                        ['piMask', '_sr_image_pi_mask'], ['viFrames', '_sr_image_vi_frames'],
-                       ['tbCalls', '_sr_tb_calls'],
+                       ['ucodeCrc', '_sr_image_ucode_crc'], ['ucode', '_sr_image_ucode'], ['axCmdlist', '_sr_image_ax_cmdlist'],
+                       ['tbCalls', '_sr_tb_calls'], ['idleSkips', '_sr_image_idle_skips'], ['idleMcycles', '_sr_image_idle_mcycles'], ['cyclesM', '_sr_image_cycles_m'],
                        ['tbStalls', '_sr_tb_stalls'], ['decExc', '_sr_tb_dec_exceptions'],
                        ['tbHi', '_sr_tb_hi'], ['tbLo', '_sr_tb_lo'], ['gxWrites', '_sr_gx_writes'],
                        ['gxBytes', '_sr_gx_bytes']]) {
@@ -127,7 +207,7 @@ for (const spec of (process.env.SRN_PEEK || '').split(',').filter(Boolean)) {
 }
 if (getModel) for (const [k, id] of Object.entries(MODELS)) extra['ev_' + k] = M._sr_image_model_events(id) >>> 0;
 const result = {
-  peek,
+  peek, backtrace, tailRing, osTrace, threads, atBudget,
   wasm: wasmPath, md5Before, md5After: md5(wasmPath), arms,
   osMode: api.osGetMode(), fst, copied, ms, returned: ret === null ? null : hex(ret), threw,
   fault: hex(api.fault()), regs,

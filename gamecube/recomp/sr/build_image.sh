@@ -202,7 +202,8 @@ EXPORTS=$EXPORTS,_sr_image_set_dsp_model,_sr_image_dsp_events,_sr_image_aram_byt
 # [2026-09-29] the next devices (sr_image.c "THE NEXT DEVICES"): one run-time switch per model
 EXPORTS=$EXPORTS,_sr_image_set_model,_sr_image_get_model,_sr_image_model_events
 EXPORTS=$EXPORTS,_sr_image_irq_delivered,_sr_image_dec_delivered,_sr_image_irq_last
-EXPORTS=$EXPORTS,_sr_image_pi_cause,_sr_image_pi_mask,_sr_image_vi_frames
+EXPORTS=$EXPORTS,_sr_image_pi_cause,_sr_image_pi_mask,_sr_image_vi_frames,_sr_image_ucode_crc,_sr_image_ucode,_sr_image_ax_cmdlist
+EXPORTS=$EXPORTS,_sr_image_idle_skips,_sr_image_idle_mcycles,_sr_image_cycles_m,_sr_image_set_budget_mcycles,_sr_image_tail,_sr_image_tail_n,_sr_os_trace_mask,_sr_image_set_past_fault,_sr_image_budget_thread,_sr_image_budget_state,_sr_image_budget_threads,_sr_image_budget_threads_n,_sr_image_budget_runq
 EXPORTS=$EXPORTS,_sr_os_mode,_sr_os_get_mode,_sr_os_set_msr,_sr_os_get_msr
 EXPORTS=$EXPORTS,_sr_os_trace,_sr_os_trace_n,_sr_os_trace_reset
 # THE CLOCK, READ-ONLY (plus the two writes that are legitimately the host's).
@@ -284,6 +285,20 @@ OCIMFS_FLAG=()
 # change (sr_image.c) relinks in minutes instead of recompiling 35 MB.
 # SR_SPLIT=1 restores the single-TU build.
 SR_SPLIT="${SR_SPLIT:-8}"
+# SR_PTHREAD=1 — [2026-09-29] link for SR_OS_HLE (one host thread per guest thread,
+# CONTEXT_SWITCH.md), which the boot needs from the first OSSleepThread on (README §10.6).
+# EVERY TU must then be compiled -pthread (wasm-ld refuses shared memory with an object that
+# lacks the atomics feature), so the part cache is keyed on it.  Same shape as
+# build_ctxsw.sh: fixed memory (no growth: -Wpthreads-mem-growth), a pre-created pool, and
+# pthread stacks large enough for translated call depth.
+SR_PTHREAD="${SR_PTHREAD:-}"
+PT_CFLAGS=(); PT_LFLAGS=(-sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=134217728)
+if [ -n "$SR_PTHREAD" ]; then
+  PT_CFLAGS=(-pthread)
+  PT_LFLAGS=(-pthread -sPTHREAD_POOL_SIZE=12 -sDEFAULT_PTHREAD_STACK_SIZE=2097152 -sINITIAL_MEMORY=268435456)
+  EXPORTS=$EXPORTS,_sr_image_init_hle,_sr_os_set_timeout
+fi
+PART_KEY="${SR_OPT:--O2} ${PT_CFLAGS[*]:-}"
 GEN_SRC=("$OUT/sr_gen.c")
 if [ "$SR_SPLIT" -gt 1 ]; then
   mkdir -p "$OUT/parts"
@@ -307,10 +322,10 @@ PYEOF
   for ((k = 0; k < SR_SPLIT; k++)); do
     c="$OUT/parts/sr_gen_$k.c"; o="$OUT/parts/sr_gen_$k.o"
     if [ ! -f "$o" ] || [ "$c" -nt "$o" ] || [ "$SR/gekko_rt.h" -nt "$o" ] || \
-       [ "$(cat "$o.flags" 2>/dev/null)" != "${SR_OPT:--O2}" ]; then
+       [ "$(cat "$o.flags" 2>/dev/null)" != "$PART_KEY" ]; then
       echo "[sr] compiling part $k/$SR_SPLIT"
-      nice -n 19 emcc ${SR_OPT:--O2} -DSR_MMIO -I"$SR" -c "$c" -o "$o" 2>"$o.log" || { tail -20 "$o.log"; exit 1; }
-      echo "${SR_OPT:--O2}" > "$o.flags"
+      nice -n 19 emcc ${SR_OPT:--O2} ${PT_CFLAGS[@]+"${PT_CFLAGS[@]}"} -DSR_MMIO -I"$SR" -c "$c" -o "$o" 2>"$o.log" || { tail -20 "$o.log"; exit 1; }
+      echo "$PART_KEY" > "$o.flags"
     else
       echo "[sr] part $k/$SR_SPLIT up to date"
     fi
@@ -323,12 +338,12 @@ fi
 
 set -x
 nice -n 19 emcc ${SR_OPT:--O2} -DSR_MMIO -I"$SR" \
-  ${OCIMFS_FLAG[@]+"${OCIMFS_FLAG[@]}"} \
+  ${OCIMFS_FLAG[@]+"${OCIMFS_FLAG[@]}"} ${PT_LFLAGS[@]+"${PT_LFLAGS[@]}"} \
   "${GEN_SRC[@]}" ${DISPATCH_SRC[@]+"${DISPATCH_SRC[@]}"} "$SR/sr_driver.c" "$SR/sr_host_os.c" "$SR/sr_image.c" "$SR/sr_gx.c" \
   -o "$OUT/sab_image.mjs" \
   -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT="${SR_ENV:-web,worker}" \
   -sINVOKE_RUN=0 -sEXIT_RUNTIME=0 \
-  -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=134217728 -sSTACK_SIZE=8388608 \
+  -sSTACK_SIZE=8388608 \
   -sEXPORTED_FUNCTIONS="$EXPORTS" \
   -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPU32,wasmMemory \
   -Wl,--no-entry
