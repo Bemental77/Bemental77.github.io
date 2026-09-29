@@ -1651,9 +1651,12 @@
     gameIdx: -1,        // the ROMS[] index the room agreed on; the auto-start loads THIS
     startedAtFrame: 0,  // the engine frame at which this core's gate first engaged
     tick: 0,            // the 500 ms party tick, alive only inside a room
-    // ROLLBACK (&rb=1): what THIS console proposes if it HOSTS. A guest adopts
-    // whatever the host's 'lsgo' says, so a mixed pair is impossible.
-    rbWant: (function () { try { return new URLSearchParams(location.search).get('rb') === '1'; } catch (e) { return false; } })(),
+    // ROLLBACK — THE DEFAULT (&rb=0 opts a host back into delay lockstep).
+    // What THIS console proposes if it HOSTS; a guest adopts whatever the
+    // host's 'lsgo' says, so a mixed pair is impossible. Made the default after
+    // tools/genesis_rollback_test.mjs proved it two-tab: 0 frames of local lag
+    // (lockstep: 3-4), no desync over 18,060 frames at 100 ms one-way, 1.000x.
+    rbWant: (function () { try { return new URLSearchParams(location.search).get('rb') !== '0'; } catch (e) { return true; } })(),
     // TEST SEAM (&nplag=MS): hold every incoming frame-input message MS ms
     // before the engine sees it — an injected one-way network delay for the
     // two-tab rigs, whose loopback wire is ~1 ms. Never set by the product.

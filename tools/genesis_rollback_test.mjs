@@ -7,7 +7,8 @@
 //   &nplag=MS   — the page's test seam: every incoming frame-input message is
 //                 held MS ms before the engine sees it (an injected one-way
 //                 network delay; the loopback wire itself is ~1 ms)
-//   &rb=1       — the HOST proposes rollback (the guest adopts it from 'lsgo')
+//   &rb=1 / &rb=0 — the HOST proposes rollback (the page default) or delay
+//                 lockstep; the guest adopts the host's choice from 'lsgo'
 //
 // For each arm it drives both keyboards with a scripted pattern for --seconds
 // and reports, from the pages' own seams (never a UI flag):
@@ -80,7 +81,8 @@ async function arm(name, rb) {
   try { (await import('./browser_leak_guard.js')).default.guard(browser, 'genesis_rollback'); } catch (_e) {}
   const out = { name, rb, lag: LAG };
   try {
-    const q = `&nplag=${LAG}` + (rb ? '&rb=1' : '');
+    // rollback is the page default; the lockstep arm opts out explicitly
+    const q = `&nplag=${LAG}` + (rb ? '&rb=1' : '&rb=0');
     const A = await openPeer(browser, q), B = await openPeer(browser, q);
     const code = await A.page.evaluate(() => {
       document.getElementById('btnNet').click();
