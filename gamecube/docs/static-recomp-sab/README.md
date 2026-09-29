@@ -27,7 +27,7 @@ shipped disc; the reproducing command is printed next to each one. Artifact:
 | **JIT baseline, re-measured** | **0.3781x delivered / 141.6 MHz executed / 23.2% idle-skipped**, stock V8, n=3, cross-witness spread ≤0.0005. **1.000x costs 373.5 MHz on this scene → the JIT is 2.64x short.** §8.6b |
 | ~~JIT baseline `0.4450x`~~ | **RETRACTED, §8.6c** — a 75 s cold boot read over one 40 s window; re-reading that band from four fresh runs of ONE frozen binary returns **0.3338x–0.5097x**. The V8-tier mismatch §8.1 warned about measures **null on both engines** (§8.6d) and was the least of its defects. |
 | **WHOLE-IMAGE BOOT IN A BROWSER** | **LINKS, INSTANTIATES, AND RUNS THE GUEST'S OWN `__start`** — wasm md5 `7bcca5756df27133d684c4281410171b`. `__init_registers` / `__init_hardware` / `__init_data` / `DBInit` all return **fault-free**, then `OSInit` reaches **27 distinct hardware registers** across PI/MI/DSP/SI/EXI/DI in **126 host-boundary crossings**. It stops in **`__OSInitAudioSystem`**, spinning on a DSP register — **no device model and no interrupt delivery**, not a translator bug (the GAP class is still zero). Modelling one register (EXI `TSTART`) moved it from 21 registers to 27, with a **falsifying control arm on the same md5**. **Nothing renders and no `drawn/s` is claimed.** §10 |
-| **WHOLE-IMAGE BOOT, 2026-09-29** | **Past `__OSInitAudioSystem`, `__ARChecksize`, `RealMode`, `__AI_SRC_INIT` and the DSP boot task, with interrupts delivered — to the first AX COMMAND LIST** (`SR_F_DSP_AXCMD`, 6 M guest cycles), node, binary `7e9f25717aa3e8cbc136dc2fe9287fe4`; **then through it** (§10.6a: AX command lists HLE'd, 18 lists / 1,152 PBs, binary `46645ebdadabcd49cedf4454b9a8c0a8`) **to main's loop at 48 M cycles, where a mode callback an overlay should have installed is NULL and no DVD command has been issued**. Eight run-time-switchable models (exception entry included) + `SR_OS_HLE` linked into the image, each with a run-time control arm on that md5 that brings back the wall it removed (the documented `__OSInitAudioSystem` stop included). The ucode SAB uploads hashes to `0x4e8a8b21` = AX. **Nothing renders**: AX command processing, DI, and a GX consumer are missing. §10.6 |
+| **WHOLE-IMAGE BOOT, 2026-09-29** | **Past `__OSInitAudioSystem`, `__ARChecksize`, `RealMode`, `__AI_SRC_INIT` and the DSP boot task, with interrupts delivered — to the first AX COMMAND LIST** (`SR_F_DSP_AXCMD`, 6 M guest cycles), node, binary `7e9f25717aa3e8cbc136dc2fe9287fe4`; **then through it** (§10.6a: AX command lists HLE'd, 18 lists / 1,152 PBs, binary `46645ebdadabcd49cedf4454b9a8c0a8`) **to main's loop at 48 M cycles, where a mode callback an overlay should have installed is NULL**; §10.6b adds the apploader's real arena (read from the disc's own apploader) and a DI model reading the ISO (the first file, `GCAX.conf`, is read; DI off parks the boot in that read for 10 s of guest time) — the NULL callback survives every arm (binary `f5aa45f7562baa082dbe28203e0347dd`). Eight run-time-switchable models (exception entry included) + `SR_OS_HLE` linked into the image, each with a run-time control arm on that md5 that brings back the wall it removed (the documented `__OSInitAudioSystem` stop included). The ucode SAB uploads hashes to `0x4e8a8b21` = AX. **Nothing renders**: AX command processing, DI, and a GX consumer are missing. §10.6 |
 | **guest OS CONTEXT SWITCH** | **WORKS** — 63 assertions / 0 failures, incl. a three-thread non-LIFO rotation on three real host threads and a control arm that reproduces `0xe00e78ac` with the host layer off. §6 (superseded there) and [`recomp/sr/CONTEXT_SWITCH.md`](../../recomp/sr/CONTEXT_SWITCH.md) |
 
 The two 2026-09-02 additions each came from a **harness** defect, not a translator one,
@@ -3256,15 +3256,57 @@ the fault landed one instruction later, on the `blrl`; (2) an indirect call to a
 function used to fault `0xE1` (sr.py keeps host-bound functions out of `sr_dispatch`); under
 `-DSR_MMIO` it now reaches the host hook.
 
+#### 10.6b The apploader's arena, the DVD interface, and the wall that is left
+
+**The arena covered the FST — found by reading the disc's own apploader.** `sr_boot_stage.js`
+stages `arenaHi = 0` (so `OSInit` falls back to `__ArenaHi` `0x81700000`) and names the
+consequence as a known gap: the arena then covers the FST at `0x803EDE20`. The shipped apploader
+(ISO `0x2460`, loaded at `0x81200000`, dated 2001/11/14) says what the machine really holds:
+`0x81200b1c-0x81200b40` read the FST to `hdr[0x430]` (= `0x803EDE20`) with length
+`(hdr[0x428]+31)&~31`, and `0x81200b98-0x81200bd0` finish with `*0x80000024 = 1`,
+`*0x80000030 = 0`, **`*0x80000034 = *0x80000038 = hdr[0x430]`**, `*0x8000003C = hdr[0x42C]` —
+arenaHi IS the FST's address. `run_image_node.mjs` now performs exactly those writes, values read
+from the ISO (`SRN_APPLOADER`, default 1). `sr_boot_stage.js` / `sr_image_worker.js` (outside this
+work's paths) still carry the old values and need the same correction.
+
+**DI** (model id 10, `sr_image.c`): registers with their write masks, the post-BS2 power-on state
+(`ReadyNoReadsMade`, cover closed, `DICFG = 1`), Inquiry / Read sector / Read disc ID / Seek /
+RequestError / StopMotor / AudioBufferConfig, `CheckReadPreconditions`, the out-of-bounds check,
+`FinishExecutingCommand` and TCINT/DEINT — all `HW/DVD/DVDInterface.cpp`. Data is read from the
+ISO by the host (`SR_NODEFS=1` links `-sNODERAWFS`; node only). Every command completes after the
+reference's `MINIMUM_COMMAND_LATENCY_US` = 300 us; its seek/rate model for reads is **not**
+reproduced. DTK streaming raises. Also found on the way: exception delivery must NEST — with one
+`jmp_buf` per host thread, a handler that re-enabled interrupts let an inner delivery overwrite the
+outer one and emscripten's `throw Infinity` escaped the module; it is now a per-thread stack.
+
+Binary **`f5aa45f7562baa082dbe28203e0347dd`** (`SR_NODEFS=1 SR_PTHREAD=1`), `SRN_STRICT=1
+SRN_HLE=12 SRN_BUDGET=4860 SRN_ISO=<sab.iso>`, md5 identical before/after every arm:
+
+| arm | ends with | M cycles (idle) | regs | interrupts | AX lists | GX writes | DVD commands |
+|---|---|---|---|---|---|---|---|
+| **all ON** | `0xe1000000` null "current mode" callback (call site `0x80019e30`) | 40 (1) | 115 | 45 | 17 | 873 | **1: `A8000000` 0x7C0 bytes at disc 0x3D976928 = `GCAX.conf`** (FST entry 1487) |
+| `SRN_DI=0` | budget: **main parked in the DVD read** (`0x800ef544 <- 0x8013a1d4 <- 0x8013f794`), 4,823 M of 4,860 M cycles idle | 4,860 | 68 | 5,205 | 2,002 | 0 | 0 (the command is written, never completed) |
+| `SRN_APPLOADER=0` | the same null callback — **with zero DVD commands** (the `GCAX.conf` open no longer reaches the drive) | 48 (3) | 109 | 47 | 18 | 873 | 0 |
+
+So the disc path works and is load-bearing (DI off parks the boot forever), the apploader fix is
+load-bearing (off, the audio config is never read), and **the null mode callback survives both**:
+it is not audio (§10.6a's AID arm), not the disc and not the arena. Its setter (`0x8001a01c`) is
+referenced nowhere in `main.dol`; the disc carries 76 `.rel` overlays (`advertiseD.rel`,
+`mcwarnD.rel`, … — FST); and no overlay read was issued before `main`'s loop made the call. Why
+the boot does not load one is the open question, and it needs the native oracle
+(`docs/ORACLES.md`, not available on this box) to answer in one run rather than by inference. Two
+candidates, neither tested: an overlay chosen by the memory-card probe (EXI has only the TSTART
+model, no card device), or a loader thread the scheduling here starves.
+
 #### What is still missing before a first rendered frame
 
 1. ~~AX command-list HLE~~ — **done, §10.6a** (`sr_ax.c`). The strict wall is now the null
    "current mode" callback, which points at the disc (item 3).
 2. The exploratory arm's frozen scheduler state must be explained (guest reaction vs a defect in
    the exception-inside-SelectThread path, `sr_host_os.c` `exc_ctx` / `sr_irq_resume_hook`).
-3. **DI (DVD)** — now the wall (§10.6a): no DVD command has been issued by the time `main`'s
-   loop calls the mode callback an overlay would have installed. The disc is 1.46 GB and would be
-   read from the ISO by the host.
+3. ~~DI (DVD)~~ — **modelled, §10.6b**, node-only disc backend. The strict wall is the NULL
+   "current mode" callback, which survives the audio, disc and arena arms; next step is the native
+   oracle's answer to "which overlay is loaded before `main`'s loop, and by whom".
 4. **GX -> pixels**: `sr_gx.c` captures the FIFO; nothing on this path draws it. §10.2d's routing
    to Dolphin (and its three blockers — note blocker 1, "no shared memory", is now half-gone:
    the `SR_PTHREAD=1` image links `-pthread` with a shared, fixed 256 MB memory) is still the
@@ -3275,10 +3317,11 @@ Reproduce (paths are this box's; the ISO is `cat gamecube/roms/SonicAdventure2Ba
 md5 `9ef5fadf4b8756af820df997468a5a16`, FST 0x121db bytes at ISO offset 0x1fd100):
 
 ```bash
-SR_PTHREAD=1 SR_OUT=/tmp/img bash gamecube/recomp/sr/build_image.sh sab.iso   # ~40 min cold, 60 s relink
+SR_NODEFS=1 SR_PTHREAD=1 SR_ENV=node SR_OUT=/tmp/img bash gamecube/recomp/sr/build_image.sh sab.iso   # ~40 min cold, 60 s relink
 cp sab_fst.bin /tmp/img/
-SR_IMG=/tmp/img SRN_STRICT=1 SRN_HLE=12 SRN_BUDGET=4860 node gamecube/recomp/sr/run_image_node.mjs
-SR_IMG=/tmp/img SRN_STRICT=1 SRN_HLE=12 SRN_BUDGET=4860 SRN_AR=0 node gamecube/recomp/sr/run_image_node.mjs  # etc.
+SR_IMG=/tmp/img SRN_ISO=sab.iso SRN_STRICT=1 SRN_HLE=12 SRN_BUDGET=4860 node gamecube/recomp/sr/run_image_node.mjs
+SR_IMG=/tmp/img SRN_ISO=sab.iso SRN_STRICT=1 SRN_HLE=12 SRN_BUDGET=4860 SRN_DI=0 node gamecube/recomp/sr/run_image_node.mjs  # etc.
+# arms: SRN_{EXI,DSP,AR,RM,IRQ,PIREV,VI,AI,UCODE,AID,AXCMD,DI,APPLOADER}=0; SRN_PAST_FAULT=1 is exploratory only
 ```
 
 ### 10.3 Three things that came free with the run

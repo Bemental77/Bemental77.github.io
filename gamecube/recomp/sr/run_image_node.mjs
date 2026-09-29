@@ -17,7 +17,7 @@
 //
 // env (every switch is RUN-TIME, so each control arm is the same binary / same md5):
 //   SRN_EXI=0 / SRN_DSP=0     turn ONE device model off
-//   SRN_AR=0 SRN_RM=0 SRN_IRQ=0 SRN_PIREV=0 SRN_VI=0 SRN_AI=0 SRN_UCODE=0 SRN_AID=0 SRN_AXCMD=0   the 2026-09-29 models (sr_image_set_model)
+//   SRN_AR=0 SRN_RM=0 SRN_IRQ=0 SRN_PIREV=0 SRN_VI=0 SRN_AI=0 SRN_UCODE=0 SRN_AID=0 SRN_AXCMD=0 SRN_DI=0   the 2026-09-29 models (sr_image_set_model)
 //   SRN_OSMODE=<n>            sr_os_mode() after init (3 = IRQ default, 4 = CTX)
 //   SRN_WATCHDOG=<n>          device READS before the watchdog throws (default 3000000)
 //   SRN_STRICT=1              first unimplemented host boundary throws
@@ -35,6 +35,7 @@ const env = (k, d) => (process.env[k] === undefined || process.env[k] === '' ? d
 const stageSrc = fs.readFileSync(path.join(HERE, '../sr_image/sr_boot_stage.js'), 'utf8');
 const S = await import('data:text/javascript;base64,' + Buffer.from(stageSrc).toString('base64'));
 
+const hex = (v) => '0x' + (v >>> 0).toString(16);
 const md5 = (f) => crypto.createHash('md5').update(fs.readFileSync(f)).digest('hex');
 const wasmPath = path.join(DIR, 'sab_image.wasm');
 const md5Before = md5(wasmPath);
@@ -56,7 +57,7 @@ const arms = { exi: +env('SRN_EXI', 1), dsp: +env('SRN_DSP', 1) };
 // sr_image_set_model(id, on): the [2026-09-29] models (sr_image.c "THE NEXT DEVICES").
 // A binary that predates them lacks the export, and the result records 'absent' rather
 // than pretending the arm was set.
-const MODELS = { AR: 1, RM: 2, IRQ: 3, PIREV: 4, VI: 5, AI: 6, UCODE: 7, AID: 8, AXCMD: 9 };
+const MODELS = { AR: 1, RM: 2, IRQ: 3, PIREV: 4, VI: 5, AI: 6, UCODE: 7, AID: 8, AXCMD: 9, DI: 10 };
 const setModel = opt('_sr_image_set_model'), getModel = opt('_sr_image_get_model');
 for (const [k, id] of Object.entries(MODELS)) {
   if (!setModel) { arms[k.toLowerCase()] = 'absent'; continue; }
@@ -95,16 +96,41 @@ const fstPath = path.join(DIR, 'sab_fst.bin');
 if (fs.existsSync(fstPath)) fst = S.stageFst(M, api, new Uint8Array(fs.readFileSync(fstPath)));
 for (const [ea, v] of S.OS_GLOBALS) api.setGlobal(ea >>> 0, v >>> 0);
 for (const ea of S.EXC_VECTORS) api.setGlobal(ea >>> 0, S.PPC_RFI);
-// Optional disc image for a DI model: the host layer reads it through a JS import, so
-// only a binary that has one uses it.
-const discHook = opt('_sr_image_set_disc_size');
-if (discHook && process.env.SRN_ISO) {
-  const st = fs.statSync(process.env.SRN_ISO);
-  globalThis.__srDiscFd = fs.openSync(process.env.SRN_ISO, 'r');
-  discHook(st.size >>> 0);
+// THE APPLOADER'S LAST WRITES — [2026-09-29], SRN_APPLOADER (default 1; 0 = the old staging).
+// sr_boot_stage.js stages arenaHi = 0 and OSBootInfo.version = 0, which lets OSInit fall back
+// to __ArenaHi 0x81700000 — so the arena COVERS the FST at 0x803EDE20 and the first heap the
+// game builds overwrites it (sr_boot_stage.js already names that gap).  What the disc's own
+// apploader does instead, read from its shipped words (ISO 0x2460 = 0x81200000, 2001/11/14):
+//   0x81200b1c-0x81200b40  FST dest = hdr[0x430], length = (hdr[0x428] + 31) & ~31, disc
+//                          offset = hdr[0x424]  -> read into MEM1
+//   0x81200b98-0x81200bd0  *0x80000020 = 0x0D15EA5E; *0x80000024 = 1; *0x80000030 = 0;
+//                          *0x80000034 = *0x80000038 = hdr[0x430]; *0x8000003C = hdr[0x42C]
+// so arenaHi IS the FST's address and the arena ends below it.  The values are read from
+// the ISO (SRN_ISO) here, not typed in.
+const appArm = +env('SRN_APPLOADER', 1);
+let apploader = null;
+if (appArm) {
+  if (!process.env.SRN_ISO) throw new Error('SRN_APPLOADER=1 needs SRN_ISO=<path to the SAB ISO>');
+  const fd = fs.openSync(process.env.SRN_ISO, 'r'), hdr = Buffer.alloc(0x20);
+  fs.readSync(fd, hdr, 0, 0x20, 0x420);
+  const fstOff = hdr.readUInt32BE(4), fstSize = hdr.readUInt32BE(8), fstMax = hdr.readUInt32BE(12);
+  const fstAddr = hdr.readUInt32BE(16);
+  const len = (fstSize + 31) & ~31, fst = Buffer.alloc(len);
+  fs.readSync(fd, fst, 0, len, fstOff); fs.closeSync(fd);
+  M.HEAPU8.set(fst, api.ram() + (fstAddr & 0x01FFFFFF));
+  api.setGlobal(0x80000020, 0x0D15EA5E); api.setGlobal(0x80000024, 1);
+  api.setGlobal(0x80000030, 0); api.setGlobal(0x80000034, fstAddr >>> 0);
+  api.setGlobal(0x80000038, fstAddr >>> 0); api.setGlobal(0x8000003C, fstMax >>> 0);
+  apploader = { fstAddr: hex(fstAddr), fstLen: len, fstMax: hex(fstMax), arenaHi: hex(fstAddr) };
+}
+// The DI model's disc (SR_NODEFS=1 builds): the path is handed to C, which opens it with stdio.
+let disc = null;
+if (opt('_sr_image_set_disc') && process.env.SRN_ISO) {
+  const b = Buffer.from(path.resolve(process.env.SRN_ISO) + '\0');
+  const p2 = M._malloc(b.length); M.HEAPU8.set(b, p2);
+  disc = M._sr_image_set_disc(p2) ? 'open' : 'FAILED'; M._free(p2);
 }
 
-const hex = (v) => '0x' + (v >>> 0).toString(16);
 const t0 = performance.now();
 let ret = null, threw = null;
 try { ret = api.boot() >>> 0; } catch (err) { threw = String(err && err.message || err); }
@@ -176,6 +202,12 @@ if (opt('_sr_image_budget_thread') && H[(M._sr_image_budget_state() >>> 2) + 1])
     }
   }
 }
+const diLog = [];
+if (opt('_sr_image_di_log')) {
+  const b = M._sr_image_di_log() >>> 2;
+  for (let k = 0; k < Math.min(64, M._sr_image_di_cmds() >>> 0); k++)
+    diLog.push([0, 1, 2, 3, 4].map((j) => hex(H[b + 6 * k + j])).join(' ') + ` @${H[b + 6 * k + 5]}k`);
+}
 regs.msr = opt('_sr_os_get_msr') ? hex(M._sr_os_get_msr()) : null;
 regs.curThread = hex(rd32(0x800000E4));
 const log = S.summarize(S.readLog(M, api));
@@ -187,7 +219,7 @@ for (const [k, fn] of [['dspEvents', '_sr_image_dsp_events'], ['aramBytes', '_sr
                        ['irqLast', '_sr_image_irq_last'], ['piCause', '_sr_image_pi_cause'],
                        ['piMask', '_sr_image_pi_mask'], ['viFrames', '_sr_image_vi_frames'],
                        ['ucodeCrc', '_sr_image_ucode_crc'], ['axLists', '_sr_ax_lists'], ['axPBs', '_sr_ax_pbs'], ['axVoices', '_sr_ax_voices'], ['axUnknownCmds', '_sr_ax_unknown_cmds'], ['ucode', '_sr_image_ucode'], ['axCmdlist', '_sr_image_ax_cmdlist'],
-                       ['indirectFaultLr', '_sr_image_indirect_fault_lr'], ['indirectFaultTarget', '_sr_image_indirect_fault_target'], ['tbCalls', '_sr_tb_calls'], ['idleSkips', '_sr_image_idle_skips'], ['idleMcycles', '_sr_image_idle_mcycles'], ['cyclesM', '_sr_image_cycles_m'],
+                       ['indirectFaultLr', '_sr_image_indirect_fault_lr'], ['indirectFaultTarget', '_sr_image_indirect_fault_target'], ['diCmds', '_sr_image_di_cmds'], ['diBytes', '_sr_image_di_bytes'], ['tbCalls', '_sr_tb_calls'], ['idleSkips', '_sr_image_idle_skips'], ['idleMcycles', '_sr_image_idle_mcycles'], ['cyclesM', '_sr_image_cycles_m'],
                        ['tbStalls', '_sr_tb_stalls'], ['decExc', '_sr_tb_dec_exceptions'],
                        ['tbHi', '_sr_tb_hi'], ['tbLo', '_sr_tb_lo'], ['gxWrites', '_sr_gx_writes'],
                        ['gxBytes', '_sr_gx_bytes']]) {
@@ -207,7 +239,7 @@ for (const spec of (process.env.SRN_PEEK || '').split(',').filter(Boolean)) {
 }
 if (getModel) for (const [k, id] of Object.entries(MODELS)) extra['ev_' + k] = M._sr_image_model_events(id) >>> 0;
 const result = {
-  peek, backtrace, tailRing, osTrace, threads, atBudget,
+  apploader, disc, diLog, peek, backtrace, tailRing, osTrace, threads, atBudget,
   wasm: wasmPath, md5Before, md5After: md5(wasmPath), arms,
   osMode: api.osGetMode(), fst, copied, ms, returned: ret === null ? null : hex(ret), threw,
   fault: hex(api.fault()), regs,
@@ -220,7 +252,7 @@ const result = {
 fs.writeFileSync(OUT, JSON.stringify(result, null, 1));
 const lastDev = first[first.length - 1];
 console.log(JSON.stringify({
-  md5: md5Before, md5Same: md5Before === result.md5After, arms, osMode: result.osMode, ms: Math.round(ms),
+  md5: md5Before, md5Same: md5Before === result.md5After, arms, apploader, osMode: result.osMode, ms: Math.round(ms),
   returned: result.returned, threw, fault: result.fault, regs,
   devReads: result.devReads, devWrites: result.devWrites, distinctRegs: result.distinctRegs,
   lastDev, peek, crossings: log.total, distinctCrossings: log.distinct.length, extra,

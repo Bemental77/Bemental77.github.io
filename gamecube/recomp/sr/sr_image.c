@@ -698,7 +698,21 @@ void gk_dev_write(uint32_t p, uint32_t n) {
 //               UCodes/AX.cpp + AXVoice.h + DSPAccelerator.cpp for ucode 0x4e8a8b21 — and the
 //               work-end mail DSP_YIELD with its interrupt 2,500 cycles later (AX.cpp:92-111).
 //               OFF restores SR_F_DSP_AXCMD, the wall it removes.
+//   id 10 DI    the DVD interface (HW/DVD/DVDInterface.cpp): DISR/DICVR/DICMDBUF/DIMAR/
+//               DILENGTH/DICR/DIIMMBUF/DICFG with their write masks (:548-631), the power-on
+//               state after an emulated BS2 (:262-277, :533; Boot.cpp:366 ReadyNoReadsMade),
+//               ExecuteCommand for Inquiry / Read sector / Read disc ID / Seek / RequestError /
+//               StopMotor / AudioBufferConfig (:783-1213), CheckReadPreconditions and the
+//               block-out-of-bounds check (:705-780), FinishExecutingCommand (:1307-1348) and
+//               the TCINT/DEINT interrupt (:633-665).  The DATA is read from the ISO itself
+//               (sr_image_set_disc; the whole disc is the "mini DVD" 1,459,978,240 bytes, which
+//               is exactly MINI_DVD_SIZE).  TIMING: every command completes after the
+//               reference's MINIMUM_COMMAND_LATENCY_US = 300 us (:52, :1204-1211); the
+//               reference's seek/read-rate model for READS (ScheduleReads / DVDMath) is NOT
+//               reproduced, so reads complete faster than on hardware — stated, not hidden.
+//               DTK audio streaming (0xE1/0xE2) RAISES.
 #include <setjmp.h>
+#include <stdio.h>
 #define MODEL_AR    1u
 #define MODEL_RM    2u
 #define MODEL_IRQ   3u
@@ -708,9 +722,11 @@ void gk_dev_write(uint32_t p, uint32_t n) {
 #define MODEL_UCODE 7u
 #define MODEL_AID   8u
 #define MODEL_AXCMD 9u
+#define MODEL_DI    10u
 static uint32_t g_model_on = (1u << MODEL_AR) | (1u << MODEL_RM) | (1u << MODEL_IRQ) |
                              (1u << MODEL_PIREV) | (1u << MODEL_VI) | (1u << MODEL_AI) |
-                             (1u << MODEL_UCODE) | (1u << MODEL_AID) | (1u << MODEL_AXCMD);
+                             (1u << MODEL_UCODE) | (1u << MODEL_AID) | (1u << MODEL_AXCMD) |
+                             (1u << MODEL_DI);
 static int model(uint32_t id) { return (g_model_on >> id) & 1u; }
 static uint32_t g_model_events[16];
 static uint32_t g_strict;    // defined with its setter next to img_hook (tentative here)
@@ -1029,11 +1045,131 @@ static void aid_update(void) {              // DSP.cpp:424-454 UpdateAudioDMA
     }
 }
 
+// ------------------------------------------------------------------------ DI (id 10)
+#define DI_BASE   0xCC006000u
+#define PI_CAUSE_DI 0x00000004u
+#define SR_F_DI       0xC6E00000u   // a DI command/sub-command/width this model does not cover
+#define SR_F_DI_DISC  0xC6E10000u   // a read with no disc backend, or a failed host read
+static FILE    *g_disc = 0;
+static uint64_t g_disc_size = 0;
+static uint32_t g_di_state = 1;        // DriveState::ReadyNoReadsMade (Boot.cpp:366)
+static uint32_t g_di_error = 0;
+static uint64_t g_di_done_at = UINT64_MAX;
+static uint32_t g_di_done_int = 0;     // 2 = DEINT, 4 = TCINT (the DISR bit)
+static uint32_t g_di_cmds = 0, g_di_bytes = 0;
+static uint32_t g_di_disr = 0, g_di_dicvr = 0;   // the device's copies (w1c bits, read-only CVR)
+static uint32_t g_di_log[64 * 6];
+EMSCRIPTEN_KEEPALIVE uint32_t *sr_image_di_log(void) { return g_di_log; }
+EMSCRIPTEN_KEEPALIVE int sr_image_set_disc(const char *path) {
+    if (g_disc) fclose(g_disc);
+    g_disc = fopen(path, "rb");
+    if (!g_disc) return 0;
+    fseeko(g_disc, 0, SEEK_END); g_disc_size = (uint64_t)ftello(g_disc);
+    return 1;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_di_cmds(void)  { return g_di_cmds; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_di_bytes(void) { return g_di_bytes; }
+static uint32_t di_r(uint32_t o) { return dev_r32(DI_BASE + o); }
+static void     di_w(uint32_t o, uint32_t v) { dev_w32(DI_BASE + o, v); }
+static void di_update_irq(void) {                          // :633-643 UpdateInterrupts
+    uint32_t sr = g_di_disr, cv = g_di_dicvr;
+    int on = ((sr >> 2) & (sr >> 1) & 1) || ((sr >> 4) & (sr >> 3) & 1) ||
+             ((sr >> 6) & (sr >> 5) & 1) || ((cv >> 2) & (cv >> 1) & 1);
+    if (model(MODEL_IRQ)) pi_set(PI_CAUSE_DI, on);
+}
+// :705-739 CheckReadPreconditions — the disc is always inside and the cover closed here.
+static int di_read_ok(void) {
+    if (g_di_state == 3) { g_di_error = 0x62800; return 0; }                             // DiscChangeDetected: MediumChanged
+    if (g_di_state == 5) { g_di_error = 0x20400; return 0; }                             // MotorStopped
+    if (g_di_state == 6) { g_di_error = 0x20401; return 0; }                             // DiscIdNotRead
+    return 1;
+}
+static int di_read(uint64_t off, uint32_t mar, uint32_t len, uint32_t outlen) {   // :742-779
+    if (!di_read_ok()) return 2;
+    if (len > outlen) len = outlen;
+    if (off + len > g_disc_size) { g_di_error = 0x52100; return 2; }                // BlockOOB
+    if (!g_disc) { if (!g_fault) g_fault = SR_F_DI_DISC | 1u; return 4; }
+    uint32_t p = mar & 0x03FFFFFFu;
+    if (p + len > g_ram_size) { if (!g_fault) g_fault = SR_F_DI_DISC | 2u; return 4; }
+    if (fseeko(g_disc, (off_t)off, SEEK_SET) != 0 || fread(g_ram + p, 1, len, g_disc) != len) {
+        if (!g_fault) g_fault = SR_F_DI_DISC | 3u; return 4;
+    }
+    g_di_bytes += len;
+    return 4;
+}
+static void di_execute(void) {                             // :783-1213 ExecuteCommand
+    uint32_t c0 = di_r(0x08), c1 = di_r(0x0C), c2 = di_r(0x10);
+    uint32_t mar = di_r(0x14), len = di_r(0x18);
+    uint32_t cmd = c0 >> 24, it = 4;                       // TCINT unless an error says DEINT
+    if (g_di_cmds < 64) {                                  // the first 64 commands, for the report
+        uint32_t *r = &g_di_log[g_di_cmds * 6];
+        r[0] = c0; r[1] = c1; r[2] = c2; r[3] = mar; r[4] = len; r[5] = (uint32_t)(g_gk_cycles / 1000u);
+    }
+    g_di_cmds++;
+    if (cmd != 0xE0) g_di_error = 0;
+    switch (cmd) {
+    case 0x12:                                             // Inquiry
+        if (mar + 12u > g_ram_size) { if (!g_fault) g_fault = SR_F_DI | 0x12u; return; }
+        gk_w32(0x80000000u | mar, 0x00000002u); gk_w32(0x80000000u | (mar + 4), 0x20060526u);
+        gk_w32(0x80000000u | (mar + 8), 0x41000000u);
+        break;
+    case 0xA8:
+        if ((c0 & 0xFF) == 0x00) {                         // Read sector
+            if (g_di_state == 1) g_di_state = 0;
+            it = (uint32_t)di_read((uint64_t)c1 << 2, mar, c2, len);
+        } else if ((c0 & 0xFF) == 0x40) {                  // Read disc ID
+            if (g_di_state == 6) g_di_state = 1; else if (g_di_state == 1) g_di_state = 0;
+            it = (uint32_t)di_read(0, mar, 0x20, len);
+        } else { if (!g_fault) g_fault = SR_F_DI | (c0 & 0xFFFFu); return; }
+        break;
+    case 0xAB: break;                                      // Seek: "Currently unimplemented"
+    case 0xE0: {                                           // RequestError
+        uint32_t ds = g_di_state == 0 ? 0 : g_di_state - 1;
+        di_w(0x20, (ds << 24) | g_di_error);
+        g_di_error = 0;
+        break;
+    }
+    case 0xE3:                                             // StopMotor
+        if (g_di_state == 0 || g_di_state == 1 || g_di_state == 6) g_di_state = 5;
+        if (c0 & (1u << 17)) { if (!g_fault) g_fault = SR_F_DI | 0xE3u; return; }   // eject
+        break;
+    case 0xE4:                                             // AudioBufferConfig
+        if (!di_read_ok()) { it = 2; break; }
+        if (g_di_state == 0) { g_di_error = 0x52402; it = 2; break; }              // InvalidPeriod
+        break;                                             // (DTK enable recorded nowhere: no DTK)
+    default:
+        if (!g_fault) g_fault = SR_F_DI | ((cmd << 8) & 0xFF00u); return;
+    }
+    g_di_done_at = g_gk_cycles + 300u * 486u;              // MINIMUM_COMMAND_LATENCY_US
+    g_di_done_int = it;
+    ev_rearm();
+}
+static void di_finish(void) {                              // :1307-1348, ReplyType::Interrupt
+    g_di_done_at = UINT64_MAX;
+    uint32_t cr = di_r(0x1C);
+    if (g_di_done_int == 4) {
+        uint32_t len = di_r(0x18);
+        di_w(0x14, di_r(0x14) + len);
+        di_w(0x18, 0);
+    }
+    if (cr & 1u) {
+        di_w(0x1C, cr & ~1u);
+        g_di_disr |= g_di_done_int; di_w(0x00, g_di_disr); // DEINT = bit 2, TCINT = bit 4
+        g_model_events[MODEL_DI]++;
+        di_update_irq();
+    }
+}
+
 // ------------------------------------------------------------- device read / write
 static void dev_read_models(uint32_t ea, uint32_t n) {
     if (model(MODEL_AR) && dev_hits(ea, n, 0xCC005016u, 2)) dev_w16(0xCC005016u, 1);
     if (model(MODEL_PIREV) && dev_hits(ea, n, PI_REV_EA, 4)) dev_w32(PI_REV_EA, 0x246500B1u);
     if (model(MODEL_IRQ) && dev_hits(ea, n, PI_INTSR_EA, 4)) dev_w32(PI_INTSR_EA, g_pi_cause);
+    if (model(MODEL_DI)) {
+        if (dev_hits(ea, n, DI_BASE + 0x00, 4)) di_w(0x00, g_di_disr);
+        if (dev_hits(ea, n, DI_BASE + 0x04, 4)) di_w(0x04, g_di_dicvr);
+        if (dev_hits(ea, n, DI_BASE + 0x24, 4)) di_w(0x24, 1u);      // DICFG.CONFIG = 1 (:276-277)
+    }
     if (model(MODEL_AID) && dev_hits(ea, n, AID_LEFT, 2))              // :352-361
         dev_w16(AID_LEFT, g_aid_left > 0 ? g_aid_left - 1u : 0u);
     if (model(MODEL_AI)) {
@@ -1074,6 +1210,29 @@ static void dev_write_models(uint32_t ea, uint32_t n) {
                 pi_update();
             }
         }
+    }
+    if (model(MODEL_DI) && ea >= DI_BASE && ea < DI_BASE + 0x40u) {
+        uint32_t o = ea - DI_BASE;
+        if (n != 4 || (o & 3u)) { if (!g_fault) g_fault = SR_F_DI | 0xFFFFu; }
+        else if (o == 0x00) {                              // :550-575 DISR
+            uint32_t v = di_r(0x00), old = g_di_disr;
+            // masks (bits 1,3,5) and BREAK (bit 0) take the written value; DEINT/TCINT/BRKINT
+            // (bits 2,4,6) are write-1-to-clear.
+            uint32_t nv = (v & 0x2Bu) | (old & 0x54u & ~v);
+            if (nv & 1u) { if (!g_fault) g_fault = SR_F_DI | 0xB0u; }   // BREAK: DEBUG_ASSERT
+            g_di_disr = nv; di_w(0x00, nv); di_update_irq();
+        } else if (o == 0x04) {                            // :577-587 DICVR
+            uint32_t v = di_r(0x04), old = g_di_dicvr;
+            uint32_t nv = (old & ~0x2u) | (v & 0x2u);
+            if (v & 0x4u) nv &= ~0x4u;
+            g_di_dicvr = nv; di_w(0x04, nv); di_update_irq();
+        } else if (o == 0x14) di_w(0x14, di_r(0x14) & ~0xFC00001Fu);   // :611-612 GC mask
+        else if (o == 0x18) di_w(0x18, di_r(0x18) & ~0x1Fu);           // :613-614
+        else if (o == 0x1C) {                              // :615-623 DICR
+            uint32_t v = di_r(0x1C) & 7u;
+            di_w(0x1C, v);
+            if (v & 1u) di_execute();
+        } else if (o == 0x24) di_w(0x24, 1u);             // read-only (InvalidWrite): keep it
     }
     if (model(MODEL_AID)) {
         if (dev_hits(ea, n, AID_START_HI, 2)) dev_w16(AID_START_HI, dev_r16(AID_START_HI) & 0x03FFu);
@@ -1151,8 +1310,15 @@ static uint32_t g_dec_delivered = 0;
 // PER HOST THREAD.  Under SR_OS_HLE each guest thread runs on its own host thread, and a
 // thread preempted inside an exception is PARKED inside that exception's delivery frame on
 // its own stack — so "which delivery is live" is a property of the host thread.
+// A STACK, not one slot: an exception can be entered while a handler runs (a handler that
+// re-enables interrupts), and the inner delivery must not overwrite the outer one's jmp_buf —
+// measured: with one slot the outer handler's OSLoadContext longjmp'd into the inner, already
+// returned frame and `throw Infinity` (emscripten's longjmp) escaped the module.
+#define IRQ_NEST 8
 static _Thread_local uint32_t g_irq_depth = 0, g_irq_ctx = 0;
-static _Thread_local jmp_buf  g_irq_jmp;
+static _Thread_local uint32_t g_irq_ctxs[IRQ_NEST];
+static _Thread_local jmp_buf  g_irq_jmps[IRQ_NEST];
+#define SR_F_IRQ_NEST 0xC6B70000u
 static const uint32_t SAVE_GPRS_TEMPLATE[18] = {
     0x90040000u, 0x90240004u, 0x90440008u, 0xBCC40018u,
     0x7C11E2A6u, 0x900401A8u, 0x7C12E2A6u, 0x900401ACu, 0x7C13E2A6u, 0x900401B0u,
@@ -1195,10 +1361,12 @@ static int irq_enter(GekkoState *st, uint32_t exc) {
 
     sr_os_set_msr((msr & ~0x04EF36u) | 0x30u);     // exception entry, then __OSEVStart's rfi
     st->gpr[3] = exc; st->gpr[4] = vctx; st->gpr[5] = handler;
-    uint32_t saved_depth_ctx = g_irq_ctx;
+    if (g_irq_depth >= IRQ_NEST) { if (!g_fault) g_fault = SR_F_IRQ_NEST | exc; return 0; }
+    uint32_t saved_depth_ctx = g_irq_ctx, my = g_irq_depth;
+    g_irq_ctxs[my] = vctx;
     g_irq_depth++; g_irq_ctx = vctx; g_irq_last = exc;
     tail_mark(0x10 | exc, vctx);                    // 0xEEEE0014 external / 0xEEEE0018 dec
-    int loaded = setjmp(g_irq_jmp);
+    int loaded = setjmp(g_irq_jmps[my]);
     if (!loaded) {
         if (!sr_dispatch(disp, st)) { if (!g_fault) g_fault = SR_F_IRQ_NOTRANS | (disp & 0xFFFFu); }
         else if (!g_fault) g_fault = SR_F_IRQ_NOLOAD | (disp & 0xFFFFu);
@@ -1216,14 +1384,14 @@ static int irq_enter(GekkoState *st, uint32_t exc) {
 // The handler's OSLoadContext for the context THIS layer entered with: never returns.
 static int irq_load_context(GekkoState *st) {
     if (!g_irq_depth || st->gpr[3] != g_irq_ctx) return 0;
-    longjmp(g_irq_jmp, 1);
+    longjmp(g_irq_jmps[g_irq_depth - 1], 1);
 }
 
 // sr_host_os.c's sr_irq_resume_hook: this host thread was switched away inside the
 // exception it is now being resumed from — perform that exception's OSLoadContext.
 static void irq_resume(GekkoState *st, uint32_t ctx) {
     (void)st;
-    if (g_irq_depth && g_irq_ctx == ctx) longjmp(g_irq_jmp, 1);
+    if (g_irq_depth && g_irq_ctx == ctx) longjmp(g_irq_jmps[g_irq_depth - 1], 1);
 }
 
 // sr_host_os.c's sr_idle_hook: the guest is in SelectThread's idle spin with MSR[EE] set.
@@ -1285,6 +1453,7 @@ static void ev_rearm(void) {
     if (model(MODEL_AID) && g_aid_next < at) at = g_aid_next;
     if (model(MODEL_AID) && g_aid_irq_at < at) at = g_aid_irq_at;
     if (g_dsp_int_at < at) at = g_dsp_int_at;
+    if (model(MODEL_DI) && g_di_done_at < at) at = g_di_done_at;
     if (g_strict && g_fault) at = 0;          // strict: the next block head ends the run
     g_gk_event_at = at;
 }
@@ -1327,6 +1496,7 @@ void gk_event(void) {
         }
     }
     if (g_dsp_int_at <= g_gk_cycles) { g_dsp_int_at = UINT64_MAX; dsp_gen_int(); }
+    if (model(MODEL_DI) && g_di_done_at <= g_gk_cycles) di_finish();
     if (model(MODEL_AI) && g_ai_next <= g_gk_cycles) ai_event();
     if (model(MODEL_AID)) {
         if (g_aid_irq_at <= g_gk_cycles) { g_aid_irq_at = UINT64_MAX; aid_gen_int(); }

@@ -203,7 +203,7 @@ EXPORTS=$EXPORTS,_sr_image_set_dsp_model,_sr_image_dsp_events,_sr_image_aram_byt
 EXPORTS=$EXPORTS,_sr_image_set_model,_sr_image_get_model,_sr_image_model_events
 EXPORTS=$EXPORTS,_sr_image_irq_delivered,_sr_image_dec_delivered,_sr_image_irq_last
 EXPORTS=$EXPORTS,_sr_image_pi_cause,_sr_image_pi_mask,_sr_image_vi_frames,_sr_image_ucode_crc,_sr_image_ucode,_sr_image_ax_cmdlist
-EXPORTS=$EXPORTS,_sr_image_idle_skips,_sr_image_idle_mcycles,_sr_image_cycles_m,_sr_image_set_budget_mcycles,_sr_image_tail,_sr_image_tail_n,_sr_os_trace_mask,_sr_image_set_past_fault,_sr_image_budget_thread,_sr_image_budget_state,_sr_image_budget_threads,_sr_image_budget_threads_n,_sr_image_budget_runq,_sr_ax_pbs,_sr_ax_lists,_sr_ax_voices,_sr_ax_unknown_cmds,_sr_image_indirect_fault_lr,_sr_image_indirect_fault_target
+EXPORTS=$EXPORTS,_sr_image_idle_skips,_sr_image_idle_mcycles,_sr_image_cycles_m,_sr_image_set_budget_mcycles,_sr_image_tail,_sr_image_tail_n,_sr_os_trace_mask,_sr_image_set_past_fault,_sr_image_budget_thread,_sr_image_budget_state,_sr_image_budget_threads,_sr_image_budget_threads_n,_sr_image_budget_runq,_sr_ax_pbs,_sr_ax_lists,_sr_ax_voices,_sr_ax_unknown_cmds,_sr_image_indirect_fault_lr,_sr_image_indirect_fault_target,_sr_image_set_disc,_sr_image_di_cmds,_sr_image_di_bytes,_sr_image_di_log
 EXPORTS=$EXPORTS,_sr_os_mode,_sr_os_get_mode,_sr_os_set_msr,_sr_os_get_msr
 EXPORTS=$EXPORTS,_sr_os_trace,_sr_os_trace_n,_sr_os_trace_reset
 # THE CLOCK, READ-ONLY (plus the two writes that are legitimately the host's).
@@ -293,6 +293,11 @@ SR_SPLIT="${SR_SPLIT:-8}"
 # pthread stacks large enough for translated call depth.
 SR_PTHREAD="${SR_PTHREAD:-}"
 PT_CFLAGS=(); PT_LFLAGS=(-sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=134217728)
+# SR_NODEFS=1 — [2026-09-29] node-only build whose DI model reads the ISO through the host
+# file system (-sNODERAWFS: stdio goes to node's fs; from a pthread it is proxied to the main
+# thread).  The browser build has no disc backend: a DVD read there raises SR_F_DI_DISC.
+NODEFS_FLAGS=()
+[ -n "${SR_NODEFS:-}" ] && NODEFS_FLAGS=(-sNODERAWFS=1)
 if [ -n "$SR_PTHREAD" ]; then
   PT_CFLAGS=(-pthread)
   PT_LFLAGS=(-pthread -sPTHREAD_POOL_SIZE=12 -sDEFAULT_PTHREAD_STACK_SIZE=2097152 -sINITIAL_MEMORY=268435456)
@@ -338,7 +343,7 @@ fi
 
 set -x
 nice -n 19 emcc ${SR_OPT:--O2} -DSR_MMIO -I"$SR" \
-  ${OCIMFS_FLAG[@]+"${OCIMFS_FLAG[@]}"} ${PT_LFLAGS[@]+"${PT_LFLAGS[@]}"} \
+  ${OCIMFS_FLAG[@]+"${OCIMFS_FLAG[@]}"} ${PT_LFLAGS[@]+"${PT_LFLAGS[@]}"} ${NODEFS_FLAGS[@]+"${NODEFS_FLAGS[@]}"} \
   "${GEN_SRC[@]}" ${DISPATCH_SRC[@]+"${DISPATCH_SRC[@]}"} "$SR/sr_driver.c" "$SR/sr_host_os.c" "$SR/sr_image.c" "$SR/sr_ax.c" "$SR/sr_gx.c" \
   -o "$OUT/sab_image.mjs" \
   -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT="${SR_ENV:-web,worker}" \
