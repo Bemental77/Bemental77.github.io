@@ -369,6 +369,20 @@ static uint32_t g_mq_head = 0, g_mq_n = 1;
 #define SR_F_DSP_MQ 0xC6C00000u         // more than DSP_MQ mails queued: raise, never drop
 static void mq_clear(void) { g_mq_n = 0; }
 static void dsp_gen_int(void);          // DSP.cpp:389-396, defined after irq_update
+// MailHandler::PushMail(mail, interrupt, cycles_into_future): with an empty queue the DSP
+// interrupt is SCHEDULED that many cycles out (GenerateDSPInterruptFromDSPEmu, DSP.cpp:399-404).
+static uint64_t g_dsp_int_at = UINT64_MAX;
+static void ev_rearm(void);
+static void mq_push_delay(uint32_t mail, int irq, uint32_t cycles) {
+    if (irq) {
+        if (g_mq_n) g_mq_irq[g_mq_head] = 1;
+        else if (!cycles) dsp_gen_int();
+        else { uint64_t at = g_gk_cycles + cycles; if (at < g_dsp_int_at) g_dsp_int_at = at; ev_rearm(); }
+    }
+    if (g_mq_n == DSP_MQ) { if (!g_fault) g_fault = SR_F_DSP_MQ; return; }
+    uint32_t i = (g_mq_head + g_mq_n) % DSP_MQ;
+    g_mq_mail[i] = mail; g_mq_irq[i] = 0; g_mq_n++;
+}
 static void mq_push(uint32_t mail, int irq) {
     if (irq) { if (!g_mq_n) dsp_gen_int(); else g_mq_irq[g_mq_head] = 1; }
     if (g_mq_n == DSP_MQ) { if (!g_fault) g_fault = SR_F_DSP_MQ; return; }
@@ -377,9 +391,14 @@ static void mq_push(uint32_t mail, int irq) {
 }
 static void ucode_set(uint32_t which);  // DSPHLE::SetUCode — THE NEXT DEVICES, id 7
 static void aid_reset(void);            // THE NEXT DEVICES, id 8
+void sr_ax_command_list(uint32_t addr, uint16_t size);   // sr_ax.c, id 9
 static uint32_t g_dsp_events = 0;   // modelled DSP actions taken — the ON-arm's witness
 static uint32_t g_aram_bytes = 0;   // bytes actually moved by a modelled ARAM DMA
 static uint8_t *g_aram = 0;         // allocated on the first DMA, never before
+uint8_t *sr_image_aram_ptr(void) {  // sr_ax.c's accelerator reads it (DSP::ReadARAM)
+    if (!g_aram) g_aram = (uint8_t *)calloc(1, 0x01000000u);
+    return g_aram;
+}
 
 #define DEV_LOG_CAP 512
 // [guest addr][kind]: 1=read 2=write 3=EXI-model, and 4..6 the three DSP-model actions.
@@ -675,6 +694,10 @@ void gk_dev_write(uint32_t p, uint32_t n) {
 //               32 kHz), and the AID interrupt: 200 cycles after enable (:342-346) and on each
 //               buffer wrap.  NO SAMPLES LEAVE: Dolphin's SendAIBuffer (the speaker) has no
 //               counterpart here, so the blocks are walked and discarded.
+//   id 9  AXCMD the AX ucode's COMMAND LIST processing — sr_ax.c, a transcription of
+//               UCodes/AX.cpp + AXVoice.h + DSPAccelerator.cpp for ucode 0x4e8a8b21 — and the
+//               work-end mail DSP_YIELD with its interrupt 2,500 cycles later (AX.cpp:92-111).
+//               OFF restores SR_F_DSP_AXCMD, the wall it removes.
 #include <setjmp.h>
 #define MODEL_AR    1u
 #define MODEL_RM    2u
@@ -684,9 +707,10 @@ void gk_dev_write(uint32_t p, uint32_t n) {
 #define MODEL_AI    6u
 #define MODEL_UCODE 7u
 #define MODEL_AID   8u
+#define MODEL_AXCMD 9u
 static uint32_t g_model_on = (1u << MODEL_AR) | (1u << MODEL_RM) | (1u << MODEL_IRQ) |
                              (1u << MODEL_PIREV) | (1u << MODEL_VI) | (1u << MODEL_AI) |
-                             (1u << MODEL_UCODE) | (1u << MODEL_AID);
+                             (1u << MODEL_UCODE) | (1u << MODEL_AID) | (1u << MODEL_AXCMD);
 static int model(uint32_t id) { return (g_model_on >> id) & 1u; }
 static uint32_t g_model_events[16];
 static uint32_t g_strict;    // defined with its setter next to img_hook (tentative here)
@@ -811,7 +835,15 @@ static void ucode_mail(uint32_t mail) {                       // DSPHLE.cpp:63-6
         }
         if (g_ax_state == 1) {                                // CopyCmdList + HandleCommandList
             g_ax_cmdlist_addr = mail;
-            if (!g_fault) g_fault = SR_F_DSP_AXCMD | (g_ax_cmdlist_size & 0xFFFFu);
+            if (!model(MODEL_AXCMD)) {                        // the control arm: the old wall
+                if (!g_fault) g_fault = SR_F_DSP_AXCMD | (g_ax_cmdlist_size & 0xFFFFu);
+                return;
+            }
+            sr_ax_command_list(mail, (uint16_t)g_ax_cmdlist_size);
+            g_ax_cmdlist_size = 0;
+            mq_push_delay(0xDCD10002u, 1, 2500);              // SignalWorkEnd: DSP_YIELD
+            g_ax_state = 2;
+            g_model_events[MODEL_AXCMD]++;
             return;
         }
         uint32_t m = 0xCDD10000u | (mail & 0xFFFFu);           // "does not check for CDD1"
@@ -1252,6 +1284,7 @@ static void ev_rearm(void) {
     if (model(MODEL_AI) && g_ai_next < at) at = g_ai_next;
     if (model(MODEL_AID) && g_aid_next < at) at = g_aid_next;
     if (model(MODEL_AID) && g_aid_irq_at < at) at = g_aid_irq_at;
+    if (g_dsp_int_at < at) at = g_dsp_int_at;
     if (g_strict && g_fault) at = 0;          // strict: the next block head ends the run
     g_gk_event_at = at;
 }
@@ -1293,6 +1326,7 @@ void gk_event(void) {
             g_vi_next = t ? due + t : UINT64_MAX;
         }
     }
+    if (g_dsp_int_at <= g_gk_cycles) { g_dsp_int_at = UINT64_MAX; dsp_gen_int(); }
     if (model(MODEL_AI) && g_ai_next <= g_gk_cycles) ai_event();
     if (model(MODEL_AID)) {
         if (g_aid_irq_at <= g_gk_cycles) { g_aid_irq_at = UINT64_MAX; aid_gen_int(); }
@@ -1772,3 +1806,6 @@ EMSCRIPTEN_KEEPALIVE uint32_t sr_image_call(uint32_t addr) {
 }
 
 EMSCRIPTEN_KEEPALIVE uint32_t sr_image_fault(void) { return g_fault; }
+extern uint32_t g_indirect_fault_lr, g_indirect_fault_target;   // sr_driver.c, -DSR_MMIO
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_indirect_fault_lr(void)     { return g_indirect_fault_lr; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_indirect_fault_target(void) { return g_indirect_fault_target; }

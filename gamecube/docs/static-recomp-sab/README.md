@@ -27,7 +27,7 @@ shipped disc; the reproducing command is printed next to each one. Artifact:
 | **JIT baseline, re-measured** | **0.3781x delivered / 141.6 MHz executed / 23.2% idle-skipped**, stock V8, n=3, cross-witness spread ≤0.0005. **1.000x costs 373.5 MHz on this scene → the JIT is 2.64x short.** §8.6b |
 | ~~JIT baseline `0.4450x`~~ | **RETRACTED, §8.6c** — a 75 s cold boot read over one 40 s window; re-reading that band from four fresh runs of ONE frozen binary returns **0.3338x–0.5097x**. The V8-tier mismatch §8.1 warned about measures **null on both engines** (§8.6d) and was the least of its defects. |
 | **WHOLE-IMAGE BOOT IN A BROWSER** | **LINKS, INSTANTIATES, AND RUNS THE GUEST'S OWN `__start`** — wasm md5 `7bcca5756df27133d684c4281410171b`. `__init_registers` / `__init_hardware` / `__init_data` / `DBInit` all return **fault-free**, then `OSInit` reaches **27 distinct hardware registers** across PI/MI/DSP/SI/EXI/DI in **126 host-boundary crossings**. It stops in **`__OSInitAudioSystem`**, spinning on a DSP register — **no device model and no interrupt delivery**, not a translator bug (the GAP class is still zero). Modelling one register (EXI `TSTART`) moved it from 21 registers to 27, with a **falsifying control arm on the same md5**. **Nothing renders and no `drawn/s` is claimed.** §10 |
-| **WHOLE-IMAGE BOOT, 2026-09-29** | **Past `__OSInitAudioSystem`, `__ARChecksize`, `RealMode`, `__AI_SRC_INIT` and the DSP boot task, with interrupts delivered — to the first AX COMMAND LIST** (`SR_F_DSP_AXCMD`, 6 M guest cycles), node, binary `7e9f25717aa3e8cbc136dc2fe9287fe4`. Eight run-time-switchable models (exception entry included) + `SR_OS_HLE` linked into the image, each with a run-time control arm on that md5 that brings back the wall it removed (the documented `__OSInitAudioSystem` stop included). The ucode SAB uploads hashes to `0x4e8a8b21` = AX. **Nothing renders**: AX command processing, DI, and a GX consumer are missing. §10.6 |
+| **WHOLE-IMAGE BOOT, 2026-09-29** | **Past `__OSInitAudioSystem`, `__ARChecksize`, `RealMode`, `__AI_SRC_INIT` and the DSP boot task, with interrupts delivered — to the first AX COMMAND LIST** (`SR_F_DSP_AXCMD`, 6 M guest cycles), node, binary `7e9f25717aa3e8cbc136dc2fe9287fe4`; **then through it** (§10.6a: AX command lists HLE'd, 18 lists / 1,152 PBs, binary `46645ebdadabcd49cedf4454b9a8c0a8`) **to main's loop at 48 M cycles, where a mode callback an overlay should have installed is NULL and no DVD command has been issued**. Eight run-time-switchable models (exception entry included) + `SR_OS_HLE` linked into the image, each with a run-time control arm on that md5 that brings back the wall it removed (the documented `__OSInitAudioSystem` stop included). The ucode SAB uploads hashes to `0x4e8a8b21` = AX. **Nothing renders**: AX command processing, DI, and a GX consumer are missing. §10.6 |
 | **guest OS CONTEXT SWITCH** | **WORKS** — 63 assertions / 0 failures, incl. a three-thread non-LIFO rotation on three real host threads and a control arm that reproduces `0xe00e78ac` with the host layer off. §6 (superseded there) and [`recomp/sr/CONTEXT_SWITCH.md`](../../recomp/sr/CONTEXT_SWITCH.md) |
 
 The two 2026-09-02 additions each came from a **harness** defect, not a translator one,
@@ -3209,15 +3209,62 @@ run queue holding two ready threads (`RunQueueBits 0x88000`) while `__gCurrentTh
 either the guest reacting to a DSP that never answered, or a scheduling defect in the
 interrupt/thread interplay; it is not separated here and nothing after the AX fault is claimed.
 
+#### 10.6a THE AX WALL, REMOVED — `sr_ax.c`, and the next stop is a NULL "current mode" pointer
+
+`recomp/sr/sr_ax.c` is a C transcription of the reference AX HLE for ucode `0x4e8a8b21` only:
+`UCodes/AX.cpp` `HandleCommandList` (all 20 commands; `CMD_COMPRESSOR` raises because the
+reference asserts this ucode cannot send it), `ProcessPBList` with the no-LPF PB memory layout
+(`HasLpf`), `LoadPBUpdates`/`ApplyUpdatesForMs`, `ConvertMixerControl`'s `0x4e8a8b21` branch,
+`AXVoice.h` `ProcessVoice` (AX_GC arm: linear resampling because no `dsp_coef.bin` is present —
+the reference configuration — signed volume envelope, `MixAdd` with dpop), and
+`Core/DSP/DSPAccelerator.cpp` `ReadSample` (ADPCM / PCM, the 16-byte-frame pred-scale reload,
+the end-address exception with `AXVoice.h`'s loop/one-shot handling). The work-end mail
+`DSP_YIELD` is pushed with its interrupt 2,500 cycles later (`AX.cpp:92-111`). Switch: model
+id 9 **AXCMD**.
+
+Binary **`46645ebdadabcd49cedf4454b9a8c0a8`** (md5 identical before/after every arm),
+`SRN_STRICT=1 SRN_HLE=12 SRN_BUDGET=4860`:
+
+| arm | ends with | LR | reads | regs | M cycles | interrupts | AX lists / PBs | GX writes | idle skips |
+|---|---|---|---|---|---|---|---|---|---|
+| **all ON** | **`0xe1000000` — `blrl` to address 0** | `0x800d3b74` (main) | 606 | 109 | 48 | 47 | **18 / 1,152** (0 voices running) | 873 | 510 |
+| `SRN_AXCMD=0` | `0xc6c20180` — the §10.6 AX wall, back | `0x800f82d8` | 237 | 60 | 6 | 2 | 0 / 0 | 0 | 0 |
+| `SRN_AID=0` | the same `0xe1000000` | `0x800d3b74` | 300 | 109 | 48 | 11 | 0 / 0 | 873 | 498 |
+
+**The new wall is not audio** — the AID-off arm reaches the identical fault without a single AX
+frame. `sr_driver.c`'s `sr_indirect` now records the call site under `-DSR_MMIO` (fixture
+objects unchanged: `sr_driver.c` md5 `2a547a27…` / `9fe618c5…`, HEAD vs now), and it is
+`0x80019e30`, in `0x80019e18`:
+
+```
+80019e24  lwz  r3, -31420(r13)   ; the "current mode" object, SDA 0x803AD904
+80019e28  lwz  r12, 12(r3)       ; its update callback
+80019e30  blrl                   ; ...called from main's loop at 0x800d31dc/…/0x800d39e0
+```
+
+`0x803AD904` reads **0** at the stop (`SRN_PEEK`), so `r12` came from address `0x0000000C`. No
+instruction in `main.dol` stores to `-31420(r13)` except the setter at `0x8001a01c`, and nothing in
+`main.dol` references that setter (no `bl`, no `lis/addi` pair, no data word) — so the object is set
+from code that is **not in the DOL**, i.e. an overlay (`.rel`), which has to be read from the disc.
+And the disc has not been touched: DI shows 3 registers, all init, **no DVD command issued**.
+So the next wall is the **DI device + the disc**, and why the boot reaches `main`'s loop without
+having issued a read is the first question for it.
+
+⚠ Two runtime gaps this exposed, stated: (1) `gk_phys` masks an EA below `0x80000000` into MEM1,
+so the load from `0x0000000C` returned low memory instead of the DSI the hardware would take —
+the fault landed one instruction later, on the `blrl`; (2) an indirect call to a HOST-BOUND
+function used to fault `0xE1` (sr.py keeps host-bound functions out of `sr_dispatch`); under
+`-DSR_MMIO` it now reaches the host hook.
+
 #### What is still missing before a first rendered frame
 
-1. **AX command-list HLE** — `AXUCode::HandleCommandList` + PB processing + mixing
-   (`UCodes/AX.cpp` 843 lines, `AXVoice.h` 610, `AXStructs.h` 322). This is the strict wall. The
-   PB state the DSP writes back (positions, ADPCM state, end flags) is guest-visible, so
-   "acknowledge the frame without doing it" is not an option under the no-approximation rule.
+1. ~~AX command-list HLE~~ — **done, §10.6a** (`sr_ax.c`). The strict wall is now the null
+   "current mode" callback, which points at the disc (item 3).
 2. The exploratory arm's frozen scheduler state must be explained (guest reaction vs a defect in
    the exception-inside-SelectThread path, `sr_host_os.c` `exc_ctx` / `sr_irq_resume_hook`).
-3. **DI (DVD)**: not reached yet; the disc is 1.46 GB and would be read from the ISO by the host.
+3. **DI (DVD)** — now the wall (§10.6a): no DVD command has been issued by the time `main`'s
+   loop calls the mode callback an overlay would have installed. The disc is 1.46 GB and would be
+   read from the ISO by the host.
 4. **GX -> pixels**: `sr_gx.c` captures the FIFO; nothing on this path draws it. §10.2d's routing
    to Dolphin (and its three blockers — note blocker 1, "no shared memory", is now half-gone:
    the `SR_PTHREAD=1` image links `-pthread` with a shared, fixed 256 MB memory) is still the

@@ -17,7 +17,7 @@
 //
 // env (every switch is RUN-TIME, so each control arm is the same binary / same md5):
 //   SRN_EXI=0 / SRN_DSP=0     turn ONE device model off
-//   SRN_AR=0 SRN_RM=0 SRN_IRQ=0 SRN_PIREV=0 SRN_VI=0 SRN_AI=0 SRN_UCODE=0 SRN_AID=0   the 2026-09-29 models (sr_image_set_model)
+//   SRN_AR=0 SRN_RM=0 SRN_IRQ=0 SRN_PIREV=0 SRN_VI=0 SRN_AI=0 SRN_UCODE=0 SRN_AID=0 SRN_AXCMD=0   the 2026-09-29 models (sr_image_set_model)
 //   SRN_OSMODE=<n>            sr_os_mode() after init (3 = IRQ default, 4 = CTX)
 //   SRN_WATCHDOG=<n>          device READS before the watchdog throws (default 3000000)
 //   SRN_STRICT=1              first unimplemented host boundary throws
@@ -56,7 +56,7 @@ const arms = { exi: +env('SRN_EXI', 1), dsp: +env('SRN_DSP', 1) };
 // sr_image_set_model(id, on): the [2026-09-29] models (sr_image.c "THE NEXT DEVICES").
 // A binary that predates them lacks the export, and the result records 'absent' rather
 // than pretending the arm was set.
-const MODELS = { AR: 1, RM: 2, IRQ: 3, PIREV: 4, VI: 5, AI: 6, UCODE: 7, AID: 8 };
+const MODELS = { AR: 1, RM: 2, IRQ: 3, PIREV: 4, VI: 5, AI: 6, UCODE: 7, AID: 8, AXCMD: 9 };
 const setModel = opt('_sr_image_set_model'), getModel = opt('_sr_image_get_model');
 for (const [k, id] of Object.entries(MODELS)) {
   if (!setModel) { arms[k.toLowerCase()] = 'absent'; continue; }
@@ -186,8 +186,8 @@ for (const [k, fn] of [['dspEvents', '_sr_image_dsp_events'], ['aramBytes', '_sr
                        ['irqDelivered', '_sr_image_irq_delivered'], ['decDelivered', '_sr_image_dec_delivered'],
                        ['irqLast', '_sr_image_irq_last'], ['piCause', '_sr_image_pi_cause'],
                        ['piMask', '_sr_image_pi_mask'], ['viFrames', '_sr_image_vi_frames'],
-                       ['ucodeCrc', '_sr_image_ucode_crc'], ['ucode', '_sr_image_ucode'], ['axCmdlist', '_sr_image_ax_cmdlist'],
-                       ['tbCalls', '_sr_tb_calls'], ['idleSkips', '_sr_image_idle_skips'], ['idleMcycles', '_sr_image_idle_mcycles'], ['cyclesM', '_sr_image_cycles_m'],
+                       ['ucodeCrc', '_sr_image_ucode_crc'], ['axLists', '_sr_ax_lists'], ['axPBs', '_sr_ax_pbs'], ['axVoices', '_sr_ax_voices'], ['axUnknownCmds', '_sr_ax_unknown_cmds'], ['ucode', '_sr_image_ucode'], ['axCmdlist', '_sr_image_ax_cmdlist'],
+                       ['indirectFaultLr', '_sr_image_indirect_fault_lr'], ['indirectFaultTarget', '_sr_image_indirect_fault_target'], ['tbCalls', '_sr_tb_calls'], ['idleSkips', '_sr_image_idle_skips'], ['idleMcycles', '_sr_image_idle_mcycles'], ['cyclesM', '_sr_image_cycles_m'],
                        ['tbStalls', '_sr_tb_stalls'], ['decExc', '_sr_tb_dec_exceptions'],
                        ['tbHi', '_sr_tb_hi'], ['tbLo', '_sr_tb_lo'], ['gxWrites', '_sr_gx_writes'],
                        ['gxBytes', '_sr_gx_bytes']]) {
