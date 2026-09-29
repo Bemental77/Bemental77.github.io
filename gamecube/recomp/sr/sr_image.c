@@ -468,6 +468,7 @@ static void irq_update(void);   // THE INTERRUPT LAYER, below
 static void dev_w32(uint32_t ea, uint32_t v) {
     dev_w16(ea, v >> 16); dev_w16(ea + 2, v & 0xFFFFu);
 }
+static uint32_t g_ov_gen = 1;          // bumped by every DMA into MEM1 (see OVERLAYS below)
 static void dsp_aram_dma(void) {
     uint32_t mm  = ((dev_r16(AR_DMA_MMADDR_EA) & 0x03FFu) << 16) | (dev_r16(AR_DMA_MMADDR_EA + 2) & 0xFFE0u);
     uint32_t ar  = ((dev_r16(AR_DMA_ARADDR_EA) & 0x03FFu) << 16) | (dev_r16(AR_DMA_ARADDR_EA + 2) & 0xFFE0u);
@@ -480,6 +481,7 @@ static void dsp_aram_dma(void) {
     while (len) {
         if (mm + 8u > g_ram_size) { if (!g_fault) g_fault = SR_F_ARAM_MM_RANGE | (mm >> 8); break; }
         if (dir) {
+            g_ov_gen++;
             if (ar < ARAM_SIZE) memcpy(g_ram + mm, g_aram + (ar & ARAM_MASK), 8);
             else                memset(g_ram + mm, 0, 8);                 // HSP None: Read -> 0
             g_aram_bytes += 8;
@@ -1058,7 +1060,17 @@ static uint64_t g_di_done_at = UINT64_MAX;
 static uint32_t g_di_done_int = 0;     // 2 = DEINT, 4 = TCINT (the DISR bit)
 static uint32_t g_di_cmds = 0, g_di_bytes = 0;
 static uint32_t g_di_disr = 0, g_di_dicvr = 0;   // the device's copies (w1c bits, read-only CVR)
-static uint32_t g_di_log[64 * 6];
+static uint32_t g_di_log[64 * 8];   // c0 c1 c2 mar len kcycles, then result int + drive state
+static uint32_t g_di_trace[256 * 3], g_di_trace_n = 0;   // DISR reads/writes/raises: kcyc, what, value
+static void di_trace(uint32_t what, uint32_t v) {
+    uint32_t *t = &g_di_trace[(g_di_trace_n++ & 255u) * 3];
+    t[0] = (uint32_t)(g_gk_cycles / 1000u); t[1] = what; t[2] = v;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t *sr_image_di_trace(void) { return g_di_trace; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_di_trace_n(void) { return g_di_trace_n; }
+static uint32_t g_watch_on_e0 = 0;
+EMSCRIPTEN_KEEPALIVE void sr_image_set_watch_e0(uint32_t on) { g_watch_on_e0 = on; }
+static void watch_capture(uint32_t tag);                   // defined with the watchpoint below
 EMSCRIPTEN_KEEPALIVE uint32_t *sr_image_di_log(void) { return g_di_log; }
 EMSCRIPTEN_KEEPALIVE int sr_image_set_disc(const char *path) {
     if (g_disc) fclose(g_disc);
@@ -1094,7 +1106,7 @@ static int di_read(uint64_t off, uint32_t mar, uint32_t len, uint32_t outlen) { 
     if (fseeko(g_disc, (off_t)off, SEEK_SET) != 0 || fread(g_ram + p, 1, len, g_disc) != len) {
         if (!g_fault) g_fault = SR_F_DI_DISC | 3u; return 4;
     }
-    g_di_bytes += len;
+    g_di_bytes += len; g_ov_gen++;
     return 4;
 }
 static void di_execute(void) {                             // :783-1213 ExecuteCommand
@@ -1102,7 +1114,7 @@ static void di_execute(void) {                             // :783-1213 ExecuteC
     uint32_t mar = di_r(0x14), len = di_r(0x18);
     uint32_t cmd = c0 >> 24, it = 4;                       // TCINT unless an error says DEINT
     if (g_di_cmds < 64) {                                  // the first 64 commands, for the report
-        uint32_t *r = &g_di_log[g_di_cmds * 6];
+        uint32_t *r = &g_di_log[g_di_cmds * 8];
         r[0] = c0; r[1] = c1; r[2] = c2; r[3] = mar; r[4] = len; r[5] = (uint32_t)(g_gk_cycles / 1000u);
     }
     g_di_cmds++;
@@ -1124,6 +1136,7 @@ static void di_execute(void) {                             // :783-1213 ExecuteC
         break;
     case 0xAB: break;                                      // Seek: "Currently unimplemented"
     case 0xE0: {                                           // RequestError
+        if (g_watch_on_e0) watch_capture(c0);              // diagnostic: who asked (SRN_WATCH_E0)
         uint32_t ds = g_di_state == 0 ? 0 : g_di_state - 1;
         di_w(0x20, (ds << 24) | g_di_error);
         g_di_error = 0;
@@ -1142,6 +1155,7 @@ static void di_execute(void) {                             // :783-1213 ExecuteC
     }
     g_di_done_at = g_gk_cycles + 300u * 486u;              // MINIMUM_COMMAND_LATENCY_US
     g_di_done_int = it;
+    if (g_di_cmds <= 64) { g_di_log[(g_di_cmds - 1) * 8 + 6] = it; g_di_log[(g_di_cmds - 1) * 8 + 7] = g_di_state; }
     ev_rearm();
 }
 static void di_finish(void) {                              // :1307-1348, ReplyType::Interrupt
@@ -1154,7 +1168,12 @@ static void di_finish(void) {                              // :1307-1348, ReplyT
     }
     if (cr & 1u) {
         di_w(0x1C, cr & ~1u);
-        g_di_disr |= g_di_done_int; di_w(0x00, g_di_disr); // DEINT = bit 2, TCINT = bit 4
+        // g_di_done_int is the bit NUMBER (DVDInterface.h:209 DEINT = bit 2, :211 TCINT = bit 4).
+        // [fixed 2026-09-29] this used to OR the number itself in, so every "TCINT" (4) raised
+        // DEINT (0x04): the SDK's __DVDInterruptHandler (SAB 0x800edf3c-0x800edf70) turned it
+        // into cause 2, and cbForStateBusy (0x800f0f84-0x800f107c) answered with RequestError.
+        g_di_disr |= 1u << g_di_done_int; di_w(0x00, g_di_disr);
+        di_trace(2, g_di_disr);
         g_model_events[MODEL_DI]++;
         di_update_irq();
     }
@@ -1166,7 +1185,7 @@ static void dev_read_models(uint32_t ea, uint32_t n) {
     if (model(MODEL_PIREV) && dev_hits(ea, n, PI_REV_EA, 4)) dev_w32(PI_REV_EA, 0x246500B1u);
     if (model(MODEL_IRQ) && dev_hits(ea, n, PI_INTSR_EA, 4)) dev_w32(PI_INTSR_EA, g_pi_cause);
     if (model(MODEL_DI)) {
-        if (dev_hits(ea, n, DI_BASE + 0x00, 4)) di_w(0x00, g_di_disr);
+        if (dev_hits(ea, n, DI_BASE + 0x00, 4)) { di_w(0x00, g_di_disr); di_trace(0, g_di_disr); }
         if (dev_hits(ea, n, DI_BASE + 0x04, 4)) di_w(0x04, g_di_dicvr);
         if (dev_hits(ea, n, DI_BASE + 0x24, 4)) di_w(0x24, 1u);      // DICFG.CONFIG = 1 (:276-277)
     }
@@ -1220,6 +1239,7 @@ static void dev_write_models(uint32_t ea, uint32_t n) {
             // (bits 2,4,6) are write-1-to-clear.
             uint32_t nv = (v & 0x2Bu) | (old & 0x54u & ~v);
             if (nv & 1u) { if (!g_fault) g_fault = SR_F_DI | 0xB0u; }   // BREAK: DEBUG_ASSERT
+            di_trace(1, v);
             g_di_disr = nv; di_w(0x00, nv); di_update_irq();
         } else if (o == 0x04) {                            // :577-587 DICVR
             uint32_t v = di_r(0x04), old = g_di_dicvr;
@@ -1318,6 +1338,8 @@ static uint32_t g_dec_delivered = 0;
 static _Thread_local uint32_t g_irq_depth = 0, g_irq_ctx = 0;
 static _Thread_local uint32_t g_irq_ctxs[IRQ_NEST];
 static _Thread_local jmp_buf  g_irq_jmps[IRQ_NEST];
+// a recycled pool thread (sr_host_os.c ht_recycle_self) abandons any delivery frames it held
+static void irq_tls_reset(void) { g_irq_depth = 0; g_irq_ctx = 0; }
 #define SR_F_IRQ_NEST 0xC6B70000u
 static const uint32_t SAVE_GPRS_TEMPLATE[18] = {
     0x90040000u, 0x90240004u, 0x90440008u, 0xBCC40018u,
@@ -1366,6 +1388,7 @@ static int irq_enter(GekkoState *st, uint32_t exc) {
     g_irq_ctxs[my] = vctx;
     g_irq_depth++; g_irq_ctx = vctx; g_irq_last = exc;
     tail_mark(0x10 | exc, vctx);                    // 0xEEEE0014 external / 0xEEEE0018 dec
+    sr_os_ring_mark(30, vctx, pctx);                // IRQ_ENTER virtual ctx, physical ctx
     int loaded = setjmp(g_irq_jmps[my]);
     if (!loaded) {
         if (!sr_dispatch(disp, st)) { if (!g_fault) g_fault = SR_F_IRQ_NOTRANS | (disp & 0xFFFFu); }
@@ -1376,6 +1399,7 @@ static int irq_enter(GekkoState *st, uint32_t exc) {
     g_irq_depth--; g_irq_ctx = saved_depth_ctx;
     sr_os_ctx_load(st, vctx);                      // registers + MSR <- SRR1 (OSContext.c:281)
     tail_mark(0x20, vctx);                         // 0xEEEE0020 returned from the exception
+    sr_os_ring_mark(31, vctx, gk_r32(0x800000E4u)); // IRQ_RETURN
     memcpy(st->ps0, fsave0, sizeof fsave0); memcpy(st->ps1, fsave1, sizeof fsave1);
     st->fpscr = fpscr;
     return 1;
@@ -1391,6 +1415,7 @@ static int irq_load_context(GekkoState *st) {
 // exception it is now being resumed from — perform that exception's OSLoadContext.
 static void irq_resume(GekkoState *st, uint32_t ctx) {
     (void)st;
+    sr_os_ring_mark(32, ctx, g_irq_depth ? g_irq_ctx : 0);   // IRQ_RESUME request
     if (g_irq_depth && g_irq_ctx == ctx) longjmp(g_irq_jmps[g_irq_depth - 1], 1);
 }
 
@@ -1440,6 +1465,49 @@ EMSCRIPTEN_KEEPALIVE void sr_image_set_budget_mcycles(uint32_t m) { g_budget = (
 static uint32_t g_past_fault = 0;
 EMSCRIPTEN_KEEPALIVE void sr_image_set_past_fault(uint32_t on) { g_past_fault = on; }
 
+// THE WATCHPOINT — [2026-09-29].  sr_image_set_watch(ea, step): every `step` retired cycles
+// the event check compares one guest word with its last value and, on the FIRST change, keeps
+// the registers of the code that was running (LR, r1 for the back chain, the current thread).
+// Granularity is `step` cycles and a block, so "who" is the thread/back chain, not the store.
+static uint32_t g_watch_ea = 0, g_watch_val = 0, g_watch_hit = 0, g_watch_step = 0;
+static uint64_t g_watch_next = UINT64_MAX, g_watch_at = 0;
+static GekkoState g_watch_st; static uint32_t g_watch_thread = 0, g_watch_new = 0;
+static uint8_t g_watch_stack[4096];
+EMSCRIPTEN_KEEPALIVE uint8_t *sr_image_watch_stack(void) { return g_watch_stack; }
+static void watch_capture(uint32_t tag) {
+    if (g_watch_hit) return;
+    g_watch_hit = 1; g_watch_at = g_gk_cycles; g_watch_st = *sr_state();
+    g_watch_thread = gk_r32(0x800000E4u); g_watch_new = tag;
+    uint32_t sp = g_watch_st.gpr[1] & 0x01FFFFFFu;
+    if (sp + sizeof g_watch_stack <= g_ram_size) memcpy(g_watch_stack, g_ram + sp, sizeof g_watch_stack);
+}
+EMSCRIPTEN_KEEPALIVE void sr_image_set_watch(uint32_t ea, uint32_t step) {
+    g_watch_ea = ea; g_watch_step = step ? step : 1000; g_watch_hit = 0;
+    g_watch_val = gk_r32(ea); g_watch_next = g_gk_cycles + g_watch_step;
+}
+static uint32_t g_watch_use_cond = 0, g_watch_cond = 0, g_watch_armed = 0;
+EMSCRIPTEN_KEEPALIVE void sr_image_set_watch_cond(uint32_t v) { g_watch_use_cond = 1; g_watch_cond = v; g_watch_armed = 0; }
+EMSCRIPTEN_KEEPALIVE uint32_t    sr_image_watch_hit(void)    { return g_watch_hit; }
+EMSCRIPTEN_KEEPALIVE uint32_t    sr_image_watch_kcyc(void)   { return (uint32_t)(g_watch_at / 1000u); }
+EMSCRIPTEN_KEEPALIVE uint32_t    sr_image_watch_thread(void) { return g_watch_thread; }
+EMSCRIPTEN_KEEPALIVE uint32_t    sr_image_watch_new(void)    { return g_watch_new; }
+EMSCRIPTEN_KEEPALIVE GekkoState *sr_image_watch_state(void)  { return &g_watch_st; }
+static void watch_check(void) {
+    if (g_watch_next > g_gk_cycles) return;
+    g_watch_next = g_gk_cycles + g_watch_step;
+    uint32_t v = gk_r32(g_watch_ea);
+    // with a condition: hit only when the word becomes g_watch_cond after having been
+    // something else at a previous check (e.g. the "1" OSSaveContext wrote going back to 0)
+    int hit = g_watch_use_cond ? (v == g_watch_cond && g_watch_armed) : (v != g_watch_val);
+    if (g_watch_use_cond && v != g_watch_cond) g_watch_armed = 1;
+    if (hit && !g_watch_hit) {
+        g_watch_hit = 1; g_watch_at = g_gk_cycles; g_watch_st = *sr_state();
+        g_watch_thread = gk_r32(0x800000E4u); g_watch_new = v; g_watch_next = UINT64_MAX;
+        uint32_t sp = g_watch_st.gpr[1] & 0x01FFFFFFu;     // 4 KB of stack at the hit
+        if (sp + sizeof g_watch_stack <= g_ram_size) memcpy(g_watch_stack, g_ram + sp, sizeof g_watch_stack);
+    }
+}
+
 uint64_t g_gk_event_at = 0;     // 0: the first block head evaluates everything once
 static void ev_rearm(void) {
     uint64_t at = g_budget ? g_budget : UINT64_MAX;
@@ -1454,6 +1522,7 @@ static void ev_rearm(void) {
     if (model(MODEL_AID) && g_aid_irq_at < at) at = g_aid_irq_at;
     if (g_dsp_int_at < at) at = g_dsp_int_at;
     if (model(MODEL_DI) && g_di_done_at < at) at = g_di_done_at;
+    if (g_watch_next < at) at = g_watch_next;
     if (g_strict && g_fault) at = 0;          // strict: the next block head ends the run
     g_gk_event_at = at;
 }
@@ -1495,6 +1564,7 @@ void gk_event(void) {
             g_vi_next = t ? due + t : UINT64_MAX;
         }
     }
+    watch_check();
     if (g_dsp_int_at <= g_gk_cycles) { g_dsp_int_at = UINT64_MAX; dsp_gen_int(); }
     if (model(MODEL_DI) && g_di_done_at <= g_gk_cycles) di_finish();
     if (model(MODEL_AI) && g_ai_next <= g_gk_cycles) ai_event();
@@ -1902,6 +1972,52 @@ static void tail_rec(GekkoState *st, uint32_t addr) {
     g_tail[i + 3] = gk_r32(0x800000E4u);
 }
 
+// OVERLAYS — [2026-09-29].  A REL's code is translated ahead of time from the bytes OSLink
+// produced (rel_image.py, from an SRN_DUMP of MEM1 at the call into it) and linked in with
+// -DSR_HAVE_OV; the DOL reaches it only through pointers (the prolog via module->prolog at
+// LoadRel 0x80019f20-0x80019f28, callbacks), i.e. through sr_indirect -> this hook.
+// THE GUARD: a translation stands for particular bytes at a particular address.  Before an
+// entry is trusted, the module's linked exec section is re-hashed (FNV-1a) against the hash
+// taken at translation time; the check is cached until the next DMA into MEM1 (DI read or
+// ARAM->MRAM), the ways a new module's bytes arrive here.  A mismatch REFUSES the entry, which
+// then faults as untranslated.  Not covered: code the CPU itself copies into a translated
+// range without a DMA (SAB's RELs are DVD-read in place, DI log @83309k).
+#ifdef SR_HAVE_OV
+extern const uint32_t sr_ov_table[][3];
+extern const uint32_t sr_ov_count;
+int sr_dispatch_ov(uint32_t addr, GekkoState *st);
+#endif
+#define OV_MAX 64
+static uint32_t g_ov_checked[OV_MAX], g_ov_valid[OV_MAX], g_ov_entries = 0, g_ov_refused = 0;
+// Run-time arm (same binary): 0 = overlays off, 1 = guarded (default), 2 = guard POISONED
+// (every expected hash is treated as wrong) — the falsifying arm for the guard itself.
+static uint32_t g_ov_mode = 1;
+EMSCRIPTEN_KEEPALIVE void sr_image_set_ov(uint32_t m) { g_ov_mode = m; for (int i = 0; i < OV_MAX; i++) g_ov_checked[i] = 0; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_ov_entries(void) { return g_ov_entries; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_ov_refused(void) { return g_ov_refused; }
+static int ov_dispatch(GekkoState *st, uint32_t addr) {
+#ifdef SR_HAVE_OV
+    if (!g_ov_mode) return 0;
+    for (uint32_t i = 0; i < sr_ov_count && i < OV_MAX; i++) {
+        uint32_t base = sr_ov_table[i][0], size = sr_ov_table[i][1];
+        if (addr - base >= size) continue;
+        if (g_ov_checked[i] != g_ov_gen) {
+            uint32_t h = 2166136261u, p = base & 0x01FFFFFFu;
+            if (p + size > g_ram_size) return 0;
+            for (uint32_t k = 0; k < size; k++) { h ^= g_ram[p + k]; h *= 16777619u; }
+            g_ov_valid[i] = (h == sr_ov_table[i][2]) && g_ov_mode != 2; g_ov_checked[i] = g_ov_gen;
+        }
+        if (!g_ov_valid[i]) { g_ov_refused++; return 0; }
+        if (!sr_dispatch_ov(addr, st)) return 0;
+        g_ov_entries++;
+        return 1;
+    }
+#else
+    (void)st; (void)addr;
+#endif
+    return 0;
+}
+
 static int img_hook(GekkoState *st, uint32_t addr) {
     int r = img_hook_inner(st, addr);
     tail_rec(st, addr);
@@ -1920,6 +2036,7 @@ static int img_hook_inner(GekkoState *st, uint32_t addr) {
         ev_rearm();
         return 1;
     }
+    if (ov_dispatch(st, addr)) return 1;
     img_log(addr, IMG_D_UNIMPL);
     if (!g_fault) g_fault = SR_F_IMG_UNIMPL | (addr & 0x00ffffffu);
     if (g_strict)
@@ -1935,6 +2052,7 @@ EMSCRIPTEN_KEEPALIVE int sr_image_init(void) {
     sr_host_hook = img_hook;   // ...then take it over, chaining to it (img_hook above)
     sr_idle_hook = img_idle;
     sr_irq_resume_hook = irq_resume;
+    sr_recycle_hook = irq_tls_reset;
     return 1;
 }
 // [2026-09-29] SR_OS_HLE for the whole image — §10.5 item 2.  Needs a -pthread link
@@ -1976,6 +2094,7 @@ EMSCRIPTEN_KEEPALIVE uint32_t sr_image_call(uint32_t addr) {
 }
 
 EMSCRIPTEN_KEEPALIVE uint32_t sr_image_fault(void) { return g_fault; }
-extern uint32_t g_indirect_fault_lr, g_indirect_fault_target;   // sr_driver.c, -DSR_MMIO
+extern uint32_t g_indirect_fault_lr, g_indirect_fault_target, g_indirect_fault_r1;   // sr_driver.c, -DSR_MMIO
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_indirect_fault_r1(void)     { return g_indirect_fault_r1; }
 EMSCRIPTEN_KEEPALIVE uint32_t sr_image_indirect_fault_lr(void)     { return g_indirect_fault_lr; }
 EMSCRIPTEN_KEEPALIVE uint32_t sr_image_indirect_fault_target(void) { return g_indirect_fault_target; }

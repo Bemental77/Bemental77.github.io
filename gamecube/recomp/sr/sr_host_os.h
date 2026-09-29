@@ -333,8 +333,10 @@ int      sr_dec_take(void);                         // 1 if a decrementer except
 void     sr_os_ctx_load(GekkoState *st, uint32_t ctx);
 extern int  (*sr_idle_hook)(void);
 extern void (*sr_irq_resume_hook)(GekkoState *st, uint32_t ctx);
+extern void (*sr_recycle_hook)(void);   // called on a pool thread about to free its slot
 int      sr_os_init(int nthreads);
 int      sr_os_budget_yield(void);
+void     sr_os_ring_mark(uint32_t ev, uint32_t a, uint32_t b);
 void     sr_os_set_msr(uint32_t m);
 uint32_t sr_os_get_msr(void);
 

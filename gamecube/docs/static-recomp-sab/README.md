@@ -27,6 +27,7 @@ shipped disc; the reproducing command is printed next to each one. Artifact:
 | **JIT baseline, re-measured** | **0.3781x delivered / 141.6 MHz executed / 23.2% idle-skipped**, stock V8, n=3, cross-witness spread ≤0.0005. **1.000x costs 373.5 MHz on this scene → the JIT is 2.64x short.** §8.6b |
 | ~~JIT baseline `0.4450x`~~ | **RETRACTED, §8.6c** — a 75 s cold boot read over one 40 s window; re-reading that band from four fresh runs of ONE frozen binary returns **0.3338x–0.5097x**. The V8-tier mismatch §8.1 warned about measures **null on both engines** (§8.6d) and was the least of its defects. |
 | **WHOLE-IMAGE BOOT IN A BROWSER** | **LINKS, INSTANTIATES, AND RUNS THE GUEST'S OWN `__start`** — wasm md5 `7bcca5756df27133d684c4281410171b`. `__init_registers` / `__init_hardware` / `__init_data` / `DBInit` all return **fault-free**, then `OSInit` reaches **27 distinct hardware registers** across PI/MI/DSP/SI/EXI/DI in **126 host-boundary crossings**. It stops in **`__OSInitAudioSystem`**, spinning on a DSP register — **no device model and no interrupt delivery**, not a translator bug (the GAP class is still zero). Modelling one register (EXI `TSTART`) moved it from 21 registers to 27, with a **falsifying control arm on the same md5**. **Nothing renders and no `drawn/s` is claimed.** §10 |
+| **WHOLE-IMAGE BOOT — FIRST FRAME SUBMITTED, 2026-09-29** | **The overlay's first frame reaches the GP FIFO: `GXCopyDisp` (BP `0x52 = 0x004803`, copy-to-XFB `0x538460`, 640x480) then `GXSetDrawDone`**, and the boot stops WAITING in `GXDrawDone` because no PE/GP model answers it — no VI flip yet. Got there by fixing the DI model reporting every completion as DEINT, recycling leaked host threads, correcting the apploader's FST address (`0x817EDE20`, not `hdr[0x430]`), and linking the first REL overlay (`mcwarnD.rel`) translated from OSLink's own bytes behind a hash guard. Binary `c177aeb92de7a22d250503bb66502c4d`, overlay off / poisoned-guard arms stop at the prolog on the same md5. **Nothing renders; no `drawn/s` is claimed.** §10.6c |
 | **WHOLE-IMAGE BOOT, 2026-09-29** | **Past `__OSInitAudioSystem`, `__ARChecksize`, `RealMode`, `__AI_SRC_INIT` and the DSP boot task, with interrupts delivered — to the first AX COMMAND LIST** (`SR_F_DSP_AXCMD`, 6 M guest cycles), node, binary `7e9f25717aa3e8cbc136dc2fe9287fe4`; **then through it** (§10.6a: AX command lists HLE'd, 18 lists / 1,152 PBs, binary `46645ebdadabcd49cedf4454b9a8c0a8`) **to main's loop at 48 M cycles, where a mode callback an overlay should have installed is NULL**; §10.6b adds the apploader's real arena (read from the disc's own apploader) and a DI model reading the ISO (the first file, `GCAX.conf`, is read; DI off parks the boot in that read for 10 s of guest time) — the NULL callback survives every arm (binary `f5aa45f7562baa082dbe28203e0347dd`). Eight run-time-switchable models (exception entry included) + `SR_OS_HLE` linked into the image, each with a run-time control arm on that md5 that brings back the wall it removed (the documented `__OSInitAudioSystem` stop included). The ucode SAB uploads hashes to `0x4e8a8b21` = AX. **Nothing renders**: AX command processing, DI, and a GX consumer are missing. §10.6 |
 | **guest OS CONTEXT SWITCH** | **WORKS** — 63 assertions / 0 failures, incl. a three-thread non-LIFO rotation on three real host threads and a control arm that reproduces `0xe00e78ac` with the host layer off. §6 (superseded there) and [`recomp/sr/CONTEXT_SWITCH.md`](../../recomp/sr/CONTEXT_SWITCH.md) |
 
@@ -3261,11 +3262,20 @@ function used to fault `0xE1` (sr.py keeps host-bound functions out of `sr_dispa
 **The arena covered the FST — found by reading the disc's own apploader.** `sr_boot_stage.js`
 stages `arenaHi = 0` (so `OSInit` falls back to `__ArenaHi` `0x81700000`) and names the
 consequence as a known gap: the arena then covers the FST at `0x803EDE20`. The shipped apploader
-(ISO `0x2460`, loaded at `0x81200000`, dated 2001/11/14) says what the machine really holds:
-`0x81200b1c-0x81200b40` read the FST to `hdr[0x430]` (= `0x803EDE20`) with length
-`(hdr[0x428]+31)&~31`, and `0x81200b98-0x81200bd0` finish with `*0x80000024 = 1`,
-`*0x80000030 = 0`, **`*0x80000034 = *0x80000038 = hdr[0x430]`**, `*0x8000003C = hdr[0x42C]` —
-arenaHi IS the FST's address. `run_image_node.mjs` now performs exactly those writes, values read
+(ISO `0x2460`, loaded at `0x81200000`, dated 2001/11/14) says what the machine really holds.
+
+> ⚠ **CORRECTED 2026-09-29 (§10.6c).** This paragraph first said the apploader reads the FST to
+> `hdr[0x430]` (`0x803EDE20`). **That was wrong**: `hdr[0x430]` is not the address the shipped
+> code uses. The apploader COMPUTES it: `0x812004c8-0x812004f4` set `*0xEC = (0x80000000 +
+> *0x28 - bi2[0]) & ~31`, and `0x81200554-0x812005c8` place the FST at
+> `(*0xEC - hdr[0x42C]) & ~31` = **`0x817EDE20`** on this disc (bi2 goes `0x2000` below it,
+> `0x812005ec-0x81200624`). Staged at `0x803EDE20` the FST sat inside the game's heap; an early
+> `memset` overwrote it and the first `DVDOpen` after `GCAX.conf` failed. The runner's comments
+> (`run_image_node.mjs`, the apploader block) carry the PC-by-PC derivation.
+
+`0x81200b98-0x81200bd0` finish with `*0x80000024 = 1`, `*0x80000030 = 0`,
+**`*0x80000034 = *0x80000038 = FST`**, `*0x8000003C = hdr[0x42C]` — arenaHi IS the FST's
+address. `run_image_node.mjs` now performs exactly those writes, values read
 from the ISO (`SRN_APPLOADER`, default 1). `sr_boot_stage.js` / `sr_image_worker.js` (outside this
 work's paths) still carry the old values and need the same correction.
 
@@ -3298,8 +3308,101 @@ the boot does not load one is the open question, and it needs the native oracle
 candidates, neither tested: an overlay chosen by the memory-card probe (EXI has only the TSTART
 model, no card device), or a loader thread the scheduling here starves.
 
+#### 10.6c To the first frame SUBMITTED: a DI bit bug, a thread leak, and the overlay (2026-09-29)
+
+The null "current mode" callback of §10.6b was **not** a missing overlay load and not a starved
+loader. It was three defects in this host layer, each found by reading the shipped code at the
+point the run stopped, and behind them the overlay itself.
+
+**1. Every DVD completion was reported as an ERROR.** `di_finish` ORed `g_di_done_int` into
+DISR, but that variable holds the bit NUMBER (4 = TCINT, `DVDInterface.h:211`), so every
+"transfer complete" raised `0x04` = **DEINT** (`:209`). The DISR ring (`SRN_*` diagnostic
+`diTrace`) showed it directly: every raise read back `0x2e` = masks `0x2a` | DEINT. SAB's
+`__DVDInterruptHandler` turns that into cause 2 (`0x800edf3c-0x800edf70`: `intr = (DISR & 0x54)
+& (mask << 1)`, TC -> 1, DE -> 2), and `cbForStateBusy` answers a non-TC completion with
+RequestError (`0x800f0f84-0x800f107c`) — the `E0`/`E3` (StopMotor) pair the log recorded after
+the third read. Why the first two reads (`GCAX.conf`, and a `0xD00` read) did not also end in RequestError was not traced.
+Fixed to `1u << g_di_done_int`. Binary `0afcdc49e36fdcc9c9ec355a2f8ce31b` (before): 5 DVD
+commands, `E0`+`E3`; binary `10bb853f9ef5bb3ca4e59725f96ff95c` (after): 12 reads, all TC, no
+error command.
+
+**2. Host threads leaked until the pool ran out.** With the reads completing, the boot created
+and retired guest threads until `slot_for` found no free host thread (fault `0xC5048410`,
+`SR_F_NO_HOST_THREAD`, 83 M cycles). A host thread whose guest thread EXITED (SelectThread with
+nothing to save) or was ORPHANED (the game re-created its `OSThread`, §10.6b's stale-resume fix)
+parked forever — the one leak `CONTEXT_SWITCH.md` §7 documented. Each pool thread now keeps a
+`jmp_buf` at the top of `ht_main`; such a thread `longjmp`s back and frees its slot (an orphan is
+woken only to do that, and its re-creator waits until it has). Slot 0, the caller's own thread,
+keeps the old behaviour. `verify_ctxsw.mjs`: **63 passed, 0 failed** on the rebuilt fixtures
+(`3cb2f051a0f235bbf39255f91610f053` / trace `10ebfd79215419154d9ef9448eba523e`).
+
+**3. Then the overlay — which was the "only reachable from an overlay" setter all along.** The
+next stop is `unimplemented host boundary at 0x811fff40`: `LoadRel` (`0x80019e70`) has read
+**`mcwarnD.rel`** (DI log: `0x4ea0` bytes at disc `0x41BBFC6C` -> `0x811ffe60`; FST name by
+offset), `OSLink`ed it (`0x80019f18`) and calls `module->prolog` (`0x80019f20-0x80019f28`) — code
+that is not in `main.dol`. So the mode callback is installed by the memory-card-warning overlay,
+exactly as the §10.6b static reading of `0x800d385c-0x800d386c` (`LoadRel("MCWARN", 0)`) said.
+
+**Overlays in the whole image** (`rel_image.py`, new; `SR_OVERLAYS=` in `build_image.sh`): the
+overlay is translated from the bytes OSLink produced — a MEM1 dump the runner writes at the stop
+(`SRN_DUMP=`), because `Relocate()` patches ADDR16/ADDR32/REL24 sites in place
+(`dolsdk2001 src/os/OSLink.c:146-200`) and the file holds placeholders there (658 of 3,146 words
+differ for `mcwarnD` sec1). Section addresses are read from the LINKED header in RAM, boundaries
+from `rel.translate_module_reach`, and only overlay functions are emitted — calls into the DOL go
+straight to the image's own `fn_` bodies (139 functions, 0 refused, 44 direct DOL callees, 0
+`sr_extern`). **The guard**: each module carries the FNV-1a of its linked exec section; `sr_image.c`
+re-hashes the RAM range before trusting an entry (cached until the next DI or ARAM->MRAM DMA) and a
+mismatch refuses the entry, which then faults as untranslated. Not covered: code the CPU copies in
+without a DMA (SAB reads its RELs in place).
+
+Binary **`c177aeb92de7a22d250503bb66502c4d`** (`SR_NODEFS=1 SR_PTHREAD=1
+SR_OVERLAYS=ov_mcwarnD.c`), `SRN_STRICT=1 SRN_HLE=12 SRN_BUDGET=4860 SRN_ISO=<sab.iso>`, md5
+identical before/after each arm, load 1.1-1.6:
+
+| arm (`SRN_OV`) | ends with | M cycles (idle) | overlay entries / refused | DVD cmds | GX bytes | copies to XFB |
+|---|---|---|---|---|---|---|
+| `0` overlays off | `unimplemented host boundary at 0x811fff40` (the prolog) | 83 (3) | 0 / 0 | 13 | 2,466 | 1 (init) |
+| `2` guard poisoned | the same, **refused** | 83 (3) | 0 / **1** | 13 | 2,466 | 1 |
+| **`1` guarded** | budget, 10 s of guest time | 4,860 (4,379) | **6 / 0** | 30 | 3,506 | **2** |
+
+GX stream (`SRN_GX=<file>` arms sr_gx.c's capture; capture off is the same binary's default) in
+the ON arm, parsed as GP opcodes, md5 `bea4af6cfe6bc9cad220190d042f12c9` on two runs:
+`BP 0x4a 0x077e7f` (640x480 source), `BP 0x4d 0x28` (stride 1,280 B), `BP 0x4b 0x029c23` (dest
+`0x538460`), **`BP 0x52 0x004803` — the EFB copy with bit 14 = copy to XFB and bit 11 = clear,
+i.e. `GXCopyDisp`**, then **`BP 0x45 0x000002` = `GXSetDrawDone`**. The first `GXCopyDisp` (byte
+1707) is the init-time one that already existed before this section; the second is the overlay's
+first frame.
+
+**THE STOP: a frame has been SUBMITTED, and nothing consumes it.** At the budget the main thread
+(`0x802bafc8`) is WAITING in **`GXDrawDone`** (`0x8010154c`: it writes `0x45000002` to the FIFO,
+clears the DrawDone flag at SDA `-29408` and `OSSleepThread`s until it is set) — back chain
+`0x801015a4 <- 0x80117d64 <- 0x80070c30 <- 0x812001a0` (**the overlay**) `<- 0x80019e60` (main's
+call through the once-NULL mode pointer) `<- 0x800d3890 <- 0x800d3b30`. The flag is set only by
+the PE FINISH interrupt handler, and there is **no PE / GP model**: the FIFO bytes go nowhere.
+VI `TFBL` (`0xCC00201C`, peeked from the device page) still reads `0x004a2460` — the other half of
+the double buffer (`0x538460 - 0x4a2460 = 0x96000 = 640*480*2`): **no VI flip has happened**, and
+cannot until DrawDone returns. Idle is 90% of guest time because every thread is waiting on it.
+
+Neither of the coordinator's two candidate causes was it: the memory card was never consulted
+before the overlay choice was acted on (no card model was built; `mcwarnD` is loaded anyway, and
+whether SAB would pick it with a card present is an open question below), and no loader thread
+was starved (the DVD reads were issued and completed; they were being reported as errors).
+Step 2's "frozen scheduler" (two ready, none running) does not recur on this binary: at the
+budget the run queue is empty with `0x802bafc8` WAITING in `GXDrawDone`, `0x8036dd40` WAITING
+(back chain `0x800f28d0 <- 0x80135cc0`, not identified), `0x8036da30` in the idle path of
+SelectThread and `0x8036e050` READY at its entry `0x80135d28`. Both READY threads carry
+**`suspend = 1`** (peeked at `OSThread+0x2CC` on the same md5: `0x8036e318 = 0x00010001,
+0x00000001, prio 8` and `0x8036dcf8 = 0x00010001, 0x00000001, prio 24`), so an empty run queue
+is what the OS itself says, not a lost switch. That is consistent with the stale-resume and leak fixes having
+been its cause; it is not proven that they were.
+
 #### What is still missing before a first rendered frame
 
+0. **A GP consumer that answers DrawDone** (PE FINISH, and the PE token for `GXSetDrawSync`),
+   i.e. §10.2d's routing of this FIFO to Dolphin — the frame exists as a GP stream now.
+   Question for the native oracle (`docs/ORACLES.md`): *with no memory card inserted, is SAB's
+   first rendered screen the `mcwarnD` warning, and is its first XFB copy to `0x00538460` from a
+   640x480 EFB with clear on?* One run answers whether this boot's path is the real one.
 1. ~~AX command-list HLE~~ — **done, §10.6a** (`sr_ax.c`). The strict wall is now the null
    "current mode" callback, which points at the disc (item 3).
 2. The exploratory arm's frozen scheduler state must be explained (guest reaction vs a defect in
@@ -3322,6 +3425,13 @@ cp sab_fst.bin /tmp/img/
 SR_IMG=/tmp/img SRN_ISO=sab.iso SRN_STRICT=1 SRN_HLE=12 SRN_BUDGET=4860 node gamecube/recomp/sr/run_image_node.mjs
 SR_IMG=/tmp/img SRN_ISO=sab.iso SRN_STRICT=1 SRN_HLE=12 SRN_BUDGET=4860 SRN_DI=0 node gamecube/recomp/sr/run_image_node.mjs  # etc.
 # arms: SRN_{EXI,DSP,AR,RM,IRQ,PIREV,VI,AI,UCODE,AID,AXCMD,DI,APPLOADER}=0; SRN_PAST_FAULT=1 is exploratory only
+# §10.6c overlay: dump MEM1 at the prolog stop, translate the REL from it, relink with it
+SR_IMG=/tmp/img SRN_ISO=sab.iso SRN_STRICT=1 SRN_HLE=12 SRN_DUMP=/tmp/mem1.bin node gamecube/recomp/sr/run_image_node.mjs
+python3 gamecube/recomp/sr/rel_image.py --iso sab.iso --ram /tmp/mem1.bin --rel mcwarnD.rel --module 0x811ffe60 \
+    --dispatch /tmp/img/sr_dispatch.c --dol /tmp/img/sab_main.dol --out /tmp/img/ov_mcwarnD.c
+SR_OVERLAYS=/tmp/img/ov_mcwarnD.c SR_GEN=/tmp/img/sr_gen.c SR_NODEFS=1 SR_PTHREAD=1 SR_ENV=node SR_OUT=/tmp/img \
+    bash gamecube/recomp/sr/build_image.sh /tmp/img/sab_main.dol
+SR_IMG=/tmp/img SRN_ISO=sab.iso SRN_STRICT=1 SRN_HLE=12 SRN_GX=/tmp/gx.bin SRN_OV=1 node gamecube/recomp/sr/run_image_node.mjs  # SRN_OV=0|2 arms
 ```
 
 ### 10.3 Three things that came free with the run

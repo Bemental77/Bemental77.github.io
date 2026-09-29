@@ -203,7 +203,7 @@ EXPORTS=$EXPORTS,_sr_image_set_dsp_model,_sr_image_dsp_events,_sr_image_aram_byt
 EXPORTS=$EXPORTS,_sr_image_set_model,_sr_image_get_model,_sr_image_model_events
 EXPORTS=$EXPORTS,_sr_image_irq_delivered,_sr_image_dec_delivered,_sr_image_irq_last
 EXPORTS=$EXPORTS,_sr_image_pi_cause,_sr_image_pi_mask,_sr_image_vi_frames,_sr_image_ucode_crc,_sr_image_ucode,_sr_image_ax_cmdlist
-EXPORTS=$EXPORTS,_sr_image_idle_skips,_sr_image_idle_mcycles,_sr_image_cycles_m,_sr_image_set_budget_mcycles,_sr_image_tail,_sr_image_tail_n,_sr_os_trace_mask,_sr_image_set_past_fault,_sr_image_budget_thread,_sr_image_budget_state,_sr_image_budget_threads,_sr_image_budget_threads_n,_sr_image_budget_runq,_sr_ax_pbs,_sr_ax_lists,_sr_ax_voices,_sr_ax_unknown_cmds,_sr_image_indirect_fault_lr,_sr_image_indirect_fault_target,_sr_image_set_disc,_sr_image_di_cmds,_sr_image_di_bytes,_sr_image_di_log
+EXPORTS=$EXPORTS,_sr_image_idle_skips,_sr_image_idle_mcycles,_sr_image_cycles_m,_sr_image_set_budget_mcycles,_sr_image_tail,_sr_image_tail_n,_sr_os_trace_mask,_sr_os_ring,_sr_os_ring_n,_sr_image_set_past_fault,_sr_image_budget_thread,_sr_image_budget_state,_sr_image_budget_threads,_sr_image_budget_threads_n,_sr_image_budget_runq,_sr_ax_pbs,_sr_ax_lists,_sr_ax_voices,_sr_ax_unknown_cmds,_sr_image_indirect_fault_lr,_sr_image_indirect_fault_target,_sr_image_indirect_fault_r1,_sr_image_set_disc,_sr_image_di_cmds,_sr_image_di_bytes,_sr_image_di_log,_sr_image_set_watch,_sr_image_watch_hit,_sr_image_watch_kcyc,_sr_image_watch_thread,_sr_image_watch_new,_sr_image_watch_state,_sr_image_watch_stack,_sr_image_set_watch_cond,_sr_image_set_watch_e0,_sr_image_di_trace,_sr_image_di_trace_n,_sr_os_recycled,_sr_image_ov_entries,_sr_image_ov_refused,_sr_image_set_ov
 EXPORTS=$EXPORTS,_sr_os_mode,_sr_os_get_mode,_sr_os_set_msr,_sr_os_get_msr
 EXPORTS=$EXPORTS,_sr_os_trace,_sr_os_trace_n,_sr_os_trace_reset
 # THE CLOCK, READ-ONLY (plus the two writes that are legitimately the host's).
@@ -341,10 +341,18 @@ fi
 # host layer is still being edited, without linking a half-written sr_image.c.
 [ -n "${SR_PARTS_ONLY:-}" ] && { echo "[sr] SR_PARTS_ONLY: parts compiled, not linking"; exit 0; }
 
+# SR_OVERLAYS="a.c b.c" — [2026-09-29] REL overlays translated by rel_image.py from the
+# bytes OSLink produced; linked with -DSR_HAVE_OV so sr_image.c's guarded ov_dispatch can
+# reach them (see OVERLAYS in sr_image.c).  Empty: no overlay code, the old behaviour.
+OV_SRC=(); OV_DEF=()
+if [ -n "${SR_OVERLAYS:-}" ]; then
+  read -r -a OV_SRC <<< "$SR_OVERLAYS"; OV_DEF=(-DSR_HAVE_OV)
+  echo "[sr] overlays: ${OV_SRC[*]}"
+fi
 set -x
-nice -n 19 emcc ${SR_OPT:--O2} -DSR_MMIO -I"$SR" \
+nice -n 19 emcc ${SR_OPT:--O2} -DSR_MMIO ${OV_DEF[@]+"${OV_DEF[@]}"} -I"$SR" \
   ${OCIMFS_FLAG[@]+"${OCIMFS_FLAG[@]}"} ${PT_LFLAGS[@]+"${PT_LFLAGS[@]}"} ${NODEFS_FLAGS[@]+"${NODEFS_FLAGS[@]}"} \
-  "${GEN_SRC[@]}" ${DISPATCH_SRC[@]+"${DISPATCH_SRC[@]}"} "$SR/sr_driver.c" "$SR/sr_host_os.c" "$SR/sr_image.c" "$SR/sr_ax.c" "$SR/sr_gx.c" \
+  "${GEN_SRC[@]}" ${DISPATCH_SRC[@]+"${DISPATCH_SRC[@]}"} "$SR/sr_driver.c" "$SR/sr_host_os.c" "$SR/sr_image.c" "$SR/sr_ax.c" "$SR/sr_gx.c" ${OV_SRC[@]+"${OV_SRC[@]}"} \
   -o "$OUT/sab_image.mjs" \
   -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT="${SR_ENV:-web,worker}" \
   -sINVOKE_RUN=0 -sEXIT_RUNTIME=0 \

@@ -80,13 +80,14 @@ void sr_extern(GekkoState *st, uint32_t addr) {
 //   * WHERE a bad indirect call came from: the fault code carries the target only, and by the
 //     time a strict run stops (the next block head) the guest has moved on.  st->lr is the
 //     return address the bctrl/blrl just set, i.e. the call site + 4.
-uint32_t g_indirect_fault_lr = 0, g_indirect_fault_target = 0;
+uint32_t g_indirect_fault_lr = 0, g_indirect_fault_target = 0, g_indirect_fault_r1 = 0;
 void sr_indirect(GekkoState *st, uint32_t addr) {
     if (!sr_dispatch(addr, st)) {
         if (addr >= 0x80000000u && addr < 0x81800000u && sr_host_hook && sr_host_hook(st, addr)) return;
         if (!g_fault) {
             g_fault = 0xE1000000u | (addr & 0x00FFFFFFu);
             g_indirect_fault_lr = st->lr; g_indirect_fault_target = addr;
+            g_indirect_fault_r1 = st->gpr[1];       // for the back chain AT the fault
         }
     }
 }

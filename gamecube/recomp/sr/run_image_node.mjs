@@ -96,32 +96,47 @@ const fstPath = path.join(DIR, 'sab_fst.bin');
 if (fs.existsSync(fstPath)) fst = S.stageFst(M, api, new Uint8Array(fs.readFileSync(fstPath)));
 for (const [ea, v] of S.OS_GLOBALS) api.setGlobal(ea >>> 0, v >>> 0);
 for (const ea of S.EXC_VECTORS) api.setGlobal(ea >>> 0, S.PPC_RFI);
-// THE APPLOADER'S LAST WRITES — [2026-09-29], SRN_APPLOADER (default 1; 0 = the old staging).
-// sr_boot_stage.js stages arenaHi = 0 and OSBootInfo.version = 0, which lets OSInit fall back
-// to __ArenaHi 0x81700000 — so the arena COVERS the FST at 0x803EDE20 and the first heap the
-// game builds overwrites it (sr_boot_stage.js already names that gap).  What the disc's own
-// apploader does instead, read from its shipped words (ISO 0x2460 = 0x81200000, 2001/11/14):
-//   0x81200b1c-0x81200b40  FST dest = hdr[0x430], length = (hdr[0x428] + 31) & ~31, disc
-//                          offset = hdr[0x424]  -> read into MEM1
-//   0x81200b98-0x81200bd0  *0x80000020 = 0x0D15EA5E; *0x80000024 = 1; *0x80000030 = 0;
-//                          *0x80000034 = *0x80000038 = hdr[0x430]; *0x8000003C = hdr[0x42C]
-// so arenaHi IS the FST's address and the arena ends below it.  The values are read from
-// the ISO (SRN_ISO) here, not typed in.
+// THE APPLOADER'S WRITES — [2026-09-29], SRN_APPLOADER (default 1; 0 = the old staging).
+// sr_boot_stage.js stages arenaHi = 0 (OSInit then falls back to __ArenaHi 0x81700000) and puts
+// the FST at 0x803EDE20 with OS_DVD_BI2 = 0.  The disc's own apploader (ISO 0x2460, loaded at
+// 0x81200000, 2001/11/14), read instruction by instruction, does this instead — every input
+// below is read from the ISO, nothing is typed in:
+//   0x81200498-0x812004c4  read bi2 (disc 0x440) header: debug-monitor size, simulated memsize
+//   0x812004c8-0x812004f4  *0xE8 = bi2[0]; *0xF0 = bi2[4]; *0xEC = (0x80000000 + *0x28 - *0xE8) & ~31
+//   0x81200540-0x81200550  if *0xF0 == 0: *0xF0 = *0x28 (24 MB)
+//   0x81200554-0x812005c8  FST address = (*0xEC - hdr[0x42C]) & ~31  (the *0xF0 == *0x28 arm)
+//   0x812005ec-0x81200624  *0xF4 = FST - 0x2000; read bi2 (disc 0x440, 0x2000 bytes) there
+//   0x81200660-0x8120067c  read the FST (disc hdr[0x424], (hdr[0x428]+31)&~31 bytes) to FST address
+//   0x81200b98-0x81200bd0  *0x20 = 0x0D15EA5E; *0x24 = 1; *0x30 = 0; *0x34 = *0x38 = FST; *0x3C = hdr[0x42C]
+// ⚠ An earlier version of this block (commit a2b1be6) took the FST address from hdr[0x430]
+// (0x803EDE20), which is what sr_boot_stage.js also uses.  That field is NOT what the apploader
+// reads for this: the FST lands at 0x817EDE20, at the top of MEM1, and OS_DVD_BI2 is non-zero.
 const appArm = +env('SRN_APPLOADER', 1);
 let apploader = null;
 if (appArm) {
   if (!process.env.SRN_ISO) throw new Error('SRN_APPLOADER=1 needs SRN_ISO=<path to the SAB ISO>');
-  const fd = fs.openSync(process.env.SRN_ISO, 'r'), hdr = Buffer.alloc(0x20);
+  const fd = fs.openSync(process.env.SRN_ISO, 'r'), hdr = Buffer.alloc(0x20), bi2 = Buffer.alloc(0x2000);
   fs.readSync(fd, hdr, 0, 0x20, 0x420);
+  fs.readSync(fd, bi2, 0, 0x2000, 0x440);
   const fstOff = hdr.readUInt32BE(4), fstSize = hdr.readUInt32BE(8), fstMax = hdr.readUInt32BE(12);
-  const fstAddr = hdr.readUInt32BE(16);
+  const physSize = 0x01800000;                           // *0x80000028, staged from OS_GLOBALS
+  const e8 = bi2.readUInt32BE(0);
+  let f0 = bi2.readUInt32BE(4);
+  const ec = ((0x80000000 + physSize - e8) & ~31) >>> 0;
+  if (f0 === 0) f0 = physSize;
+  if (f0 !== physSize) throw new Error('apploader arm: simulated memsize != physical — branch not transcribed');
+  const fstAddr = ((ec - fstMax) & ~31) >>> 0, bi2Addr = (fstAddr - 0x2000) >>> 0;
   const len = (fstSize + 31) & ~31, fst = Buffer.alloc(len);
   fs.readSync(fd, fst, 0, len, fstOff); fs.closeSync(fd);
   M.HEAPU8.set(fst, api.ram() + (fstAddr & 0x01FFFFFF));
+  M.HEAPU8.set(bi2, api.ram() + (bi2Addr & 0x01FFFFFF));
+  api.setGlobal(0x800000E8, e8); api.setGlobal(0x800000EC, ec); api.setGlobal(0x800000F0, f0);
+  api.setGlobal(0x800000F4, bi2Addr);
   api.setGlobal(0x80000020, 0x0D15EA5E); api.setGlobal(0x80000024, 1);
-  api.setGlobal(0x80000030, 0); api.setGlobal(0x80000034, fstAddr >>> 0);
-  api.setGlobal(0x80000038, fstAddr >>> 0); api.setGlobal(0x8000003C, fstMax >>> 0);
-  apploader = { fstAddr: hex(fstAddr), fstLen: len, fstMax: hex(fstMax), arenaHi: hex(fstAddr) };
+  api.setGlobal(0x80000030, 0); api.setGlobal(0x80000034, fstAddr);
+  api.setGlobal(0x80000038, fstAddr); api.setGlobal(0x8000003C, fstMax >>> 0);
+  apploader = { fstAddr: hex(fstAddr), bi2Addr: hex(bi2Addr), fstLen: len, arenaHi: hex(fstAddr), ec: hex(ec), f0: hex(f0),
+                bi2DebugFlag: hex(bi2.readUInt32BE(0xC)) };
 }
 // The DI model's disc (SR_NODEFS=1 builds): the path is handed to C, which opens it with stdio.
 let disc = null;
@@ -131,6 +146,18 @@ if (opt('_sr_image_set_disc') && process.env.SRN_ISO) {
   disc = M._sr_image_set_disc(p2) ? 'open' : 'FAILED'; M._free(p2);
 }
 
+// SRN_WATCH=<ea>[:<step cycles>] — the first change of one guest word (sr_image_set_watch).
+if (process.env.SRN_WATCH && opt('_sr_image_set_watch')) {
+  const [wa, ws, wv] = process.env.SRN_WATCH.split(':');
+  M._sr_image_set_watch(parseInt(wa, 16) >>> 0, +(ws || 1000));
+  if (wv !== undefined) M._sr_image_set_watch_cond(parseInt(wv, 16) >>> 0);
+}
+// SRN_GX=<file> — arm sr_gx.c's FIFO capture (run-time arm) and write the captured GP stream.
+if (process.env.SRN_GX && opt('_sr_gx_set_capture')) M._sr_gx_set_capture(1);
+// SRN_OV=0|1|2 — overlay arm (sr_image_set_ov): off / guarded (default) / guard poisoned.
+if (process.env.SRN_OV !== undefined && opt('_sr_image_set_ov')) M._sr_image_set_ov(+process.env.SRN_OV >>> 0);
+// SRN_WATCH_E0=1 — capture the same snapshot at the first DI RequestError (0xE0) command.
+if (process.env.SRN_WATCH_E0 && opt('_sr_image_set_watch_e0')) M._sr_image_set_watch_e0(1);
 const t0 = performance.now();
 let ret = null, threw = null;
 try { ret = api.boot() >>> 0; } catch (err) { threw = String(err && err.message || err); }
@@ -202,11 +229,49 @@ if (opt('_sr_image_budget_thread') && H[(M._sr_image_budget_state() >>> 2) + 1])
     }
   }
 }
+// Back chain from r1 AT an indirect-call fault (sr_driver.c records it): where the bad call was made from.
+const faultBt = [];
+if (opt('_sr_image_indirect_fault_r1') && M._sr_image_indirect_fault_r1()) {
+  for (let sp = M._sr_image_indirect_fault_r1() >>> 0, i = 0; i < 16 && sp >= 0x80000000 && sp < 0x81800000; i++) {
+    const next = rd32(sp); if (next <= sp) break; faultBt.push(hex(rd32(next + 4))); sp = next;
+  }
+}
+let watch = null;
+if (opt('_sr_image_watch_hit') && M._sr_image_watch_hit()) {
+  const b = M._sr_image_watch_state() >>> 2, wbt = [];
+  for (let sp = H[b + 1] >>> 0, i = 0; i < 16 && sp >= 0x80000000 && sp < 0x81800000; i++) {
+    const next = rd32(sp); if (next <= sp) break; wbt.push(hex(rd32(next + 4)) + '@' + hex(next)); sp = next;
+  }
+  const rstr = (a) => { let t = ''; for (let i = 0; i < 64; i++) { const c = M.HEAPU8[api.ram() + ((a + i) & 0x01FFFFFF)]; if (!c) break; t += String.fromCharCode(c); } return t; };
+  // printable runs in the 4 KB stack snapshot taken at the hit (paths built on the stack)
+  const sb = M._sr_image_watch_stack(), strs = [];
+  for (let i = 0, cur = ''; i < 4096; i++) { const c = M.HEAPU8[sb + i];
+    if (c >= 32 && c < 127) cur += String.fromCharCode(c); else { if (cur.length >= 5) strs.push(hex(H[b + 1] + i - cur.length) + ':' + cur); cur = ''; } }
+  const sw = (ea) => { const o = (ea - H[b + 1]) >>> 0; if (o + 4 > 4096) return null;
+    return hex(((M.HEAPU8[sb + o] << 24) | (M.HEAPU8[sb + o + 1] << 16) | (M.HEAPU8[sb + o + 2] << 8) | M.HEAPU8[sb + o + 3]) >>> 0); };
+  const words = (process.env.SRN_WATCH_WORDS || '').split(',').filter(Boolean).map((x) => [x, sw(parseInt(x, 16) >>> 0)]);
+  watch = { words, stackStrings: strs, str: (process.env.SRN_WATCH_STR || '').split(',').filter(Boolean).map((x) => { const [f, o] = x.split('+'); const fr = wbt.map((e) => e.split('@')).find((e) => e[0] === f); return fr ? rstr(rd32(parseInt(fr[1], 16) + (+o))) : null; }), atKcycles: M._sr_image_watch_kcyc(), newValue: hex(M._sr_image_watch_new()),
+            thread: hex(M._sr_image_watch_thread()), lr: hex(H[b + 32 + 128 + 2]),
+            r3: hex(H[b + 3]), r4: hex(H[b + 4]), r5: hex(H[b + 5]), gpr: Array.from({ length: 32 }, (_, i) => hex(H[b + i])), bt: wbt };
+}
+const ring = [];
+if (opt('_sr_os_ring')) {
+  const EVN = {10:'ENTER',11:'SAVE',12:'HANDOFF',13:'START',14:'RESUMED',15:'RETURN',16:'ENTRY',17:'EXIT',30:'IRQ_ENTER',31:'IRQ_RETURN',32:'IRQ_RESUME',33:'RESUME_CTX_R3'};
+  const rn = M._sr_os_ring_n() >>> 0, rb = M._sr_os_ring() >>> 2;
+  for (let k = Math.max(0, rn - 256); k < rn; k++) { const i = rb + (k % 256) * 4;
+    ring.push(`s${H[i + 3] | 0} ${EVN[H[i]]} ${hex(H[i + 1])} ${hex(H[i + 2])}`); }
+}
 const diLog = [];
 if (opt('_sr_image_di_log')) {
   const b = M._sr_image_di_log() >>> 2;
   for (let k = 0; k < Math.min(64, M._sr_image_di_cmds() >>> 0); k++)
-    diLog.push([0, 1, 2, 3, 4].map((j) => hex(H[b + 6 * k + j])).join(' ') + ` @${H[b + 6 * k + 5]}k`);
+    diLog.push([0, 1, 2, 3, 4].map((j) => hex(H[b + 8 * k + j])).join(' ') + ` @${H[b + 8 * k + 5]}k int=${H[b + 8 * k + 6]} state=${H[b + 8 * k + 7]}`);
+}
+const diTrace = [];
+if (opt('_sr_image_di_trace')) {
+  const b = M._sr_image_di_trace() >>> 2, n = M._sr_image_di_trace_n() >>> 0;
+  for (let i = Math.max(0, n - 256); i < n; i++) { const o = b + 3 * (i & 255);
+    diTrace.push(`@${H[o]}k ${['rd', 'wr', 'raise'][H[o + 1]]} ${hex(H[o + 2])}`); }
 }
 regs.msr = opt('_sr_os_get_msr') ? hex(M._sr_os_get_msr()) : null;
 regs.curThread = hex(rd32(0x800000E4));
@@ -219,7 +284,7 @@ for (const [k, fn] of [['dspEvents', '_sr_image_dsp_events'], ['aramBytes', '_sr
                        ['irqLast', '_sr_image_irq_last'], ['piCause', '_sr_image_pi_cause'],
                        ['piMask', '_sr_image_pi_mask'], ['viFrames', '_sr_image_vi_frames'],
                        ['ucodeCrc', '_sr_image_ucode_crc'], ['axLists', '_sr_ax_lists'], ['axPBs', '_sr_ax_pbs'], ['axVoices', '_sr_ax_voices'], ['axUnknownCmds', '_sr_ax_unknown_cmds'], ['ucode', '_sr_image_ucode'], ['axCmdlist', '_sr_image_ax_cmdlist'],
-                       ['indirectFaultLr', '_sr_image_indirect_fault_lr'], ['indirectFaultTarget', '_sr_image_indirect_fault_target'], ['diCmds', '_sr_image_di_cmds'], ['diBytes', '_sr_image_di_bytes'], ['tbCalls', '_sr_tb_calls'], ['idleSkips', '_sr_image_idle_skips'], ['idleMcycles', '_sr_image_idle_mcycles'], ['cyclesM', '_sr_image_cycles_m'],
+                       ['indirectFaultLr', '_sr_image_indirect_fault_lr'], ['indirectFaultTarget', '_sr_image_indirect_fault_target'], ['diCmds', '_sr_image_di_cmds'], ['diBytes', '_sr_image_di_bytes'], ['tbCalls', '_sr_tb_calls'], ['idleSkips', '_sr_image_idle_skips'], ['recycled', '_sr_os_recycled'], ['ovEntries', '_sr_image_ov_entries'], ['ovRefused', '_sr_image_ov_refused'], ['idleMcycles', '_sr_image_idle_mcycles'], ['cyclesM', '_sr_image_cycles_m'],
                        ['tbStalls', '_sr_tb_stalls'], ['decExc', '_sr_tb_dec_exceptions'],
                        ['tbHi', '_sr_tb_hi'], ['tbLo', '_sr_tb_lo'], ['gxWrites', '_sr_gx_writes'],
                        ['gxBytes', '_sr_gx_bytes']]) {
@@ -232,14 +297,18 @@ for (const spec of (process.env.SRN_PEEK || '').split(',').filter(Boolean)) {
   const [eaS, nS] = spec.split(':'); const ea = parseInt(eaS, 16) >>> 0; const nw = +(nS || 1);
   const words = [];
   for (let i = 0; i < nw; i++) {
-    const ph = (ea + 4 * i) & 0x01FFFFFF, b = api.ram() + ph, U = M.HEAPU8;
+    // 0xCC...... reads the device page sr_image.c keeps (gekko_rt.h:191-193 GK_HWREG_OFF =
+    // ram size + 256 KB L1 + 4 KB WPAR), i.e. the last value the device model left there.
+    const e = (ea + 4 * i) >>> 0;
+    const ph = (e >>> 24) === 0xCC ? 0x01800000 + 0x40000 + 0x1000 + (e - 0xCC000000) : e & 0x01FFFFFF;
+    const b = api.ram() + ph, U = M.HEAPU8;
     words.push(hex(((U[b] << 24) | (U[b + 1] << 16) | (U[b + 2] << 8) | U[b + 3]) >>> 0));
   }
   peek[hex(ea)] = words;
 }
 if (getModel) for (const [k, id] of Object.entries(MODELS)) extra['ev_' + k] = M._sr_image_model_events(id) >>> 0;
 const result = {
-  apploader, disc, diLog, peek, backtrace, tailRing, osTrace, threads, atBudget,
+  apploader, disc, diLog, diTrace, faultBt, watch, ring, peek, backtrace, tailRing, osTrace, threads, atBudget,
   wasm: wasmPath, md5Before, md5After: md5(wasmPath), arms,
   osMode: api.osGetMode(), fst, copied, ms, returned: ret === null ? null : hex(ret), threw,
   fault: hex(api.fault()), regs,
@@ -250,6 +319,11 @@ const result = {
   lastRuns: log.runs.slice(-40),
 };
 fs.writeFileSync(OUT, JSON.stringify(result, null, 1));
+if (process.env.SRN_GX && opt('_sr_gx_fifo_base'))
+  fs.writeFileSync(process.env.SRN_GX, M.HEAPU8.subarray(M._sr_gx_fifo_base(), M._sr_gx_fifo_base() + M._sr_gx_fifo_pos()));
+// SRN_DUMP=<file> — MEM1 as it stands at the stop (24 MB).  Used by rel_image.py to translate
+// an overlay from the bytes OSLink actually produced, never from the file's placeholders.
+if (process.env.SRN_DUMP) fs.writeFileSync(process.env.SRN_DUMP, M.HEAPU8.subarray(api.ram(), api.ram() + 0x01800000));
 const lastDev = first[first.length - 1];
 console.log(JSON.stringify({
   md5: md5Before, md5Same: md5Before === result.md5After, arms, apploader, osMode: result.osMode, ms: Math.round(ms),
