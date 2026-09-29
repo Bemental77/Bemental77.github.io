@@ -57,6 +57,16 @@ export function guestCounters(mod) {
     bootThread: mod._sr_image_boot_thread_state() >>> 0,
     viFrames: mod._sr_image_vi_frames() >>> 0, siPolls: mod._sr_si_polls ? mod._sr_si_polls() >>> 0 : null,
     siMode: mod._sr_si_mode ? mod._sr_si_mode() >>> 0 : null,
+    // guest time skipped by the busy-wait skip (so executed = kc - idleKc), overlay refusals by
+    // the hash guard, and the REL module ids resident on the guest's own __OSModuleInfoList
+    idleKcycles: mod._sr_image_idle_kcycles ? mod._sr_image_idle_kcycles() >>> 0 : null,
+    ovRefused: mod._sr_image_ov_refused ? mod._sr_image_ov_refused() >>> 0 : null,
+    mods: (() => {
+      const rd = (ea) => { const b = mod._sr_ram() + (ea & 0x01FFFFFF), U = mod.HEAPU8;
+        return ((U[b] << 24) | (U[b + 1] << 16) | (U[b + 2] << 8) | U[b + 3]) >>> 0; };
+      const o = []; for (let h = rd(0x800030C8), n = 0; h && n < 8; h = rd(h + 4), n++) o.push(rd(h));
+      return o.join('/');
+    })(),
   };
 }
 

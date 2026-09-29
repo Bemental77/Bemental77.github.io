@@ -27,6 +27,7 @@ shipped disc; the reproducing command is printed next to each one. Artifact:
 | **JIT baseline, re-measured** | **0.3781x delivered / 141.6 MHz executed / 23.2% idle-skipped**, stock V8, n=3, cross-witness spread ≤0.0005. **1.000x costs 373.5 MHz on this scene → the JIT is 2.64x short.** §8.6b |
 | ~~JIT baseline `0.4450x`~~ | **RETRACTED, §8.6c** — a 75 s cold boot read over one 40 s window; re-reading that band from four fresh runs of ONE frozen binary returns **0.3338x–0.5097x**. The V8-tier mismatch §8.1 warned about measures **null on both engines** (§8.6d) and was the least of its defects. |
 | **WHOLE-IMAGE BOOT IN A BROWSER** | **LINKS, INSTANTIATES, AND RUNS THE GUEST'S OWN `__start`** — wasm md5 `7bcca5756df27133d684c4281410171b`. `__init_registers` / `__init_hardware` / `__init_data` / `DBInit` all return **fault-free**, then `OSInit` reaches **27 distinct hardware registers** across PI/MI/DSP/SI/EXI/DI in **126 host-boundary crossings**. It stops in **`__OSInitAudioSystem`**, spinning on a DSP register — **no device model and no interrupt delivery**, not a translator bug (the GAP class is still zero). Modelling one register (EXI `TSTART`) moved it from 21 registers to 27, with a **falsifying control arm on the same md5**. **Nothing renders and no `drawn/s` is claimed.** §10 |
+| **CITY ESCAPE AT 1.000x CAPACITY, 2026-09-29** | Node: overlays translated ahead of time from the disc (6 modules, position-independent, hash-guarded), a memory card and a controller transcribed from Dolphin, scripted input -> `stg13D` resident at ~45-48 guest s, 59.3 DrawDones/guest s, 0 faults. Window 70-150 guest s, idle 0.728 (needs 132.3 MHz): **0.69x -> 0.78x -> 0.88-1.02x -> 1.04-1.09x capacity** (n=3 per step; FMA fast path, guest-memory fast path). Thin headroom; no screenshot (node has no renderer). §10.8-10.9 |
 | **WHOLE-IMAGE SPEED, 2026-09-29** | Node, `mcwarnD` frame loop, n=3 matched pairs on one binary each: baseline **0.0986x** -> **0.78x** (a 24 MB MEM1 hash at every context switch, a verification instrument, removed from the image) -> **6.5x capacity** (Dolphin's busy-wait skip transcribed: 96.8% idle, 100 MHz executed; 15.5 MHz needed at 1.000x). With nothing to skip the executed rate is 300-380 MHz = 0.62-0.78 of Gekko: 1.000x needs >= ~22-38% idle. The browser figures in §10.6e predate both changes. §10.7 |
 | **WHOLE-IMAGE BOOT — THE GUEST'S FRAMES REACH DOLPHIN IN THE PAGE, 2026-09-29** | Behind `?srimage=1&srrender=1&srmode=main&srbase=…/guest/` (off by default): SAB boots from `__start` on a pthread in the browser, runs its frame loop at 59.943 DrawDones per guest second, and its whole frames stream to Dolphin's GP decoder — `[recompLive] fifo=2135B draws=3 skipped=0`, 0 page errors; the `?srcapture=0` arm posts nothing. The picture itself is not verified (offscreen WebGPU); the guest runs far below 1.000x. §10.6e |
 | **WHOLE-IMAGE BOOT — FRAME LOOP AT 59.94/GUEST-s, 2026-09-29** | With a PE model (DrawDone/PE-finish from a GP decoder over the FIFO) the overlay's frame loop runs: **556 DrawDones in 10 s of guest time = 59.944 per guest second**, idle 3 M of 4,860 M cycles (PE off: 4,379 M idle, stuck in `GXDrawDone`, same md5 `cad618ff9a675def5512086bb69de5e3`). Native Dolphin confirms the first overlay (`mcwarnD` at `0x811ffe60`), the XFBs and 640x480; it has a memory card, the SR boot does not yet. **Nothing is drawn.** §10.6d |
@@ -3566,6 +3567,96 @@ and calls into a NEW REL at 0x811fff40; its bytes do not match the translated mo
 refuses it (`ovRefused`), and the run faults `0xC61FFF40` and degrades (0 frames, 0.2-0.3 guest
 s/wall s) — every measurement above ends its window at 30 guest s for that reason. Which REL it is
 (expected: `otherprintD`, as in Dolphin §10.6d) is the next overlay to translate.
+
+#### 10.8 Overlays generically, a memory card, a controller — SAB reaches City Escape (2026-09-29)
+
+**Overlays, position-independent** (`gamecube/recomp/sr/rel_all.py`). Each `.rel` is translated
+AHEAD OF TIME from the disc, not from a RAM dump: file-backed sections are laid out symbolically
+(`0x90000000 + k x 4 MB`, BSS at `0xA4000000 + k x 1 MB`), relocations are applied through
+`rel.Rel.relocate`, and every relocated site whose target is a module section becomes an
+expression over `g_ov_sec[id][sec]` — the section addresses `sr_image.c` reads at dispatch time
+from the guest's own `__OSModuleInfoList` (0x800030C8). HA16/HI16/LO16 halves, LR literals and
+jump-table keys are rebased the same way; calls between modules go through `sr_indirect`. **The
+hash guard stays:** FNV-1a over the exec section with every relocation-site word masked, checked
+against guest RAM at dispatch, invalidated by DMA overlap; a mismatch is refused and counted
+(`ovRefused`, `ovLastRefused`, `ovMissingId`) per module. DOL functions an overlay (or the
+skiplist) enters mid-body (e.g. `__save_gpr`/`__restore_gpr`) are given extra entries
+(`ov_dolfix.c`, `sr_dol_extra_dispatch`). Six modules are linked: `mcwarnD`, `otherprintD`,
+`titleD`, `advertiseD`, `eventD`, `stg13D`.
+**The module at 0x811fff40, by name from the REL header:** it is not one module. `mcwarnD` (id 90)
+sits there first; with NO card the SR run next loads `advertiseD` (id 91) there; native Dolphin,
+which has a card, loads **`otherprintD` (id 92)** — and with the card model below the SR run
+does the same, `otherprintD` at 0.5 guest s.
+
+**Memory card (EXI), transcribed from Dolphin** (`sr_exi.c`): EXI channel registers (CSR/MAR/
+LEN/CR/DATA), the card command set (0x00 ID, 0x52 read, 0x83/0x85/0x89/0x81 status/ID/
+interrupt, 0xF1/0xF2/0xF4 erase/write) with Dolphin's DMA completion timing, a blank formatted
+0x80 Mbit card (header/directory/BAT with checksums), IPL SRAM plus `SetCardFlashID`, and the
+RTC from a fixed time origin. Arm: `sr_image_set_card(0)` = card absent (the `mcwarnD` ->
+`advertiseD` path above). **SI/PAD** (`sr_si.c`): SI registers, the controller's
+RunBuffer/GetData/command set, polls scheduled from VI half-lines as Dolphin does, and an input
+table keyed on VI frames (`SRS_INPUT="from:to:buttons,..."`).
+
+**City Escape.** Scripted input (Start every 120 frames from frame 650, A 60 frames later, until
+frame 2800; `input_ce.txt`), card present, SI on. Module sequence: `mcwarnD` -> `otherprintD` ->
+`eventD` (10 guest s) -> `advertiseD` (24.8) -> `eventD` (44.9) -> **`stg13D` at ~45-48 guest s**,
+90,112 B written to the card, 0 faults, 0 refused overlays, **~59.3 DrawDones per guest second
+and ~1,100-1,200 primitives per frame** in the stage. What is NOT established: the picture — the
+node rig has no renderer, so "gameplay" rests on the stage module being resident and drawing
+~1,100 prims a frame, not on a screenshot; and the scripted input stops at frame 2800, so the
+measured window (70-150 guest s) is the stage running without input.
+
+#### 10.9 SPEED at City Escape — at 1.000x capacity, just (2026-09-29)
+
+Same rig as §10.7, `run_image_stream.mjs`, window **70-150 guest s** (all inside `stg13D`),
+240 s wall per run, pump off, n=3 interleaved, md5 identical before and after every run,
+load 1.0-6.1 (4 cores; the first `imgj` run started at 6.1). **idle is 0.728 on every arm**,
+so **1.000x needs 486 x 0.272 = 132.3 MHz executed.**
+
+| build (wasm md5) | change vs row above | guest s / wall s | executed MHz |
+|---|---|---|---|
+| `d8f26b29` (commit 32b0cdc) | — | 0.6896 / 0.6867 / 0.6919 | 90.9-91.5 |
+| `e801d5c3`, FMA fast path OFF | GK_MAP MEM1 first + slow path out of line; GX ring copy | 0.7853 / 0.7739 / 0.7269 | 96-104 |
+| `e801d5c3`, FMA fast path ON (run-time arm, same binary) | exact `a*c+b` when the product is exact, else libc `fma` | 0.9967 / 0.8810 / 0.8776, and 0.9004 / 0.9029 / 1.0202 | 116-135 |
+| **`cf3b5033`** (commit 823452b) | guest words as a type that does not alias the register file; MEM1 fast path | **1.0382 / 1.0532 / 1.0939** | **137-145** |
+
+Last pair interleaved with the `e801d5c3` FMA-ON second triple: +15% / +17% / +7%.
+**City Escape runs at 1.04-1.09x CAPACITY in node — 4-9% headroom.** That is a capacity figure:
+the node rig is unpaced, nothing here runs the guest faster than 1.000x in the product, and the
+margin is thin enough that load swings of the size seen (`e801d5c3` FMA-ON spread 0.88-1.02) can
+erase it.
+
+Where the time went before these changes (`node --cpu-prof` on a `--profiling-funcs` build of
+`d8f26b29`, locating only, never compared with an unprofiled number): of 204 s, the busy guest
+thread was 191 s — translated bodies 109 s, the libc `fma` family 39 s, `gk_tail_write` 17 s,
+`gk_r64` 5.4 s. The fixes target those in order.
+- **FMA:** wasm has no fused multiply-add, so `fma()` is soft-float. When both operands are
+  normal, their significands need at most 53 bits together and the product exponent is within
+  +-1000, `a*c` is exact and `a*c + b` rounds once = `fma(a,c,b)` bit for bit; paired-single
+  (24 x 25 bits) always qualifies. 20 M random and cancellation cases vs libc `fma`: 0 mismatches.
+- **Memory:** the old accessors stored four `uint8_t`; a char store aliases everything, so clang
+  re-loaded the `g_ram` pointer 4 times per store and every guest register touched next (read in
+  the `-S` output of `fn_80150b6c`). 32-bit guest words are now `unsigned long` (32-bit on wasm32,
+  no such field in `GekkoState`); 8/16-bit stay chars, so all guest-memory types still alias each
+  other. 20 M random accesses (MEM1, bounds, locked cache, WPAR, HWREG, out of range) against the
+  mapped form: 0 mismatches in value, fault, hook calls or final memory; leaf goldens 1056/0.
+- **A build fact found on the way:** with GK_MAP's MEM1 arm inlined in front of the three window
+  tests, clang -O2 on `fn_80150b6c` ALONE peaked at 10.4 GB and was OOM-killed; with the window
+  path out of line it peaks at 3.3 GB.
+
+Next, if more headroom is wanted: `g_ram`/`g_ram_size` are still re-loaded after each out-of-line
+slow-path join, `gk_retire`'s event check is per block, and `gk_tail_write` (the GX FIFO) is
+unchanged.
+
+Reproduce (node):
+```bash
+python3 gamecube/recomp/sr/rel_all.py --iso sab.iso --dispatch /tmp/img/sr_dispatch.c --dol /tmp/img/sab_main.dol \
+    --outdir /tmp/ov --idle-skip --skiplist /tmp/img/skiplist.json
+SR_OVERLAYS="$(ls /tmp/ov/*.c | tr '\n' ' ')" SR_PTHREAD=1 SR_MEM=1879048192 SR_POOL=14 SR_GEN=/tmp/img/sr_gen.c \
+    SR_OUT=/tmp/img SR_ENV=node bash gamecube/recomp/sr/build_image.sh /tmp/img/sab_main.dol
+SR_IMG=/tmp/img SRN_ISO=sab.iso SRS_MS=240000 SRS_POSTMS=0 SRS_EXI=2 SRS_CARD=1 SRS_SI=1 SRS_INPUT="$(cat input_ce.txt)" \
+    SRS_FROM_GS=70 SRS_TO_GS=150 SRS_FMA=1 SRS_OUT=ce.json node gamecube/recomp/sr/run_image_stream.mjs
+```
 
 #### What is still missing before a first rendered frame
 

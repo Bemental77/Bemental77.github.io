@@ -233,19 +233,25 @@ static inline int gk_tail(uint32_t ea, uint32_t n, uint32_t *p) {
 #endif
     return 0;
 }
-/* [2026-09-29] MEM1 FIRST.  An EA in 0x80000000..0x81FFFFFF can be none of the tail windows
-   (locked cache 0xE, WPAR/HWREG 0xCC), so gk_tail() would return 0 and the result would be
-   gk_phys(ea) = ea & 0x03FFFFFF = ea & 0x01FFFFFF with the same bounds check: this is the
-   identical mapping, tested first because it is almost every access a game makes. */
-#define GK_MAP(ea, n, p, fail)  do {                                           \
-        if (((ea) >> 25) == 0x40u) {                                           \
-            (p) = (ea) & 0x01FFFFFFu;                                          \
-            if (!gk_ok((p), (n))) { fail; }                                    \
-        } else if (!gk_tail((ea), (n), &(p))) {                                \
-            (p) = gk_phys(ea);                                                 \
-            if (!gk_ok((p), (n))) { fail; }                                    \
-        }                                                                      \
-    } while (0)
+/* [2026-09-29] MEM1 FIRST, SLOW PATH OUT OF LINE.  An EA in 0x80000000..0x81FFFFFF can be none
+   of the tail windows (locked cache 0xE, WPAR/HWREG 0xCC), so gk_tail() would return 0 and the
+   result would be gk_phys(ea) = ea & 0x03FFFFFF = ea & 0x01FFFFFF with the same bounds check:
+   the inline test is that identical mapping, done first because it is almost every access a
+   game makes.  EVERYTHING else -- including a MEM1-segment EA past g_ram_size, which must still
+   raise the fault -- goes to gk_map_slow(), which is the old GK_MAP body verbatim.  It is kept
+   out of line because the old fully-inlined form put gk_tail's three window tests at every one
+   of the ~1,400 loads/stores of SAB's largest function (fn_80150b6c), and clang -O2 on that one
+   function alone was OOM-killed at 10.4 GB peak RSS (measured 2026-09-29).  0xFFFFFFFF is never
+   a valid offset (MEM1 + tail < 64 MB), so it is the failure sentinel. */
+__attribute__((noinline)) static uint32_t gk_map_slow(uint32_t ea, uint32_t n) {
+    uint32_t p;
+    if (!gk_tail(ea, n, &p)) {
+        p = gk_phys(ea);
+        if (!gk_ok(p, n)) return 0xFFFFFFFFu;
+    }
+    return p;
+}
+#define GK_MAP(ea, n, p, fail)  do {                                                   (p) = (ea) & 0x01FFFFFFu;                                                      if (!(((ea) >> 25) == 0x40u && (p) + (n) <= g_ram_size)) {                         (p) = gk_map_slow((ea), (n));                                                  if ((p) == 0xFFFFFFFFu) { fail; }                                          }                                                                          } while (0)
 /* WPAR ONLY.  A store to the write-gather pipe is not a memory change anyone can
    compare; a store to the locked cache is, and is logged like any other. */
 /* Bounded on BOTH sides rather than just the low end.  Without -DSR_MMIO the WPAR
@@ -366,20 +372,79 @@ extern void gk_tail_write(uint32_t p, uint32_t n);
 #endif
 
 // ------------------------------------------------------- big-endian guest memory
-static inline uint8_t  gk_r8 (uint32_t ea){ uint32_t p; GK_MAP(ea,1,p,return 0); GK_RD(p,1); return g_ram[p]; }
-static inline uint16_t gk_r16(uint32_t ea){ uint32_t p; GK_MAP(ea,2,p,return 0); GK_RD(p,2);
+// The mapped forms: every window, every hook.  Under SR_VERIFY they are the ONLY forms.
+static inline uint8_t  gk_r8_m (uint32_t ea){ uint32_t p; GK_MAP(ea,1,p,return 0); GK_RD(p,1); return g_ram[p]; }
+static inline uint16_t gk_r16_m(uint32_t ea){ uint32_t p; GK_MAP(ea,2,p,return 0); GK_RD(p,2);
     return (uint16_t)((g_ram[p]<<8)|g_ram[p+1]); }
-static inline uint32_t gk_r32(uint32_t ea){ uint32_t p; GK_MAP(ea,4,p,return 0); GK_RD(p,4);
+static inline uint32_t gk_r32_m(uint32_t ea){ uint32_t p; GK_MAP(ea,4,p,return 0); GK_RD(p,4);
     return ((uint32_t)g_ram[p]<<24)|((uint32_t)g_ram[p+1]<<16)|((uint32_t)g_ram[p+2]<<8)|g_ram[p+3]; }
-static inline uint64_t gk_r64(uint32_t ea){ return ((uint64_t)gk_r32(ea)<<32) | gk_r32(ea+4); }
-
-static inline void gk_w8 (uint32_t ea,uint8_t v){ uint32_t p; GK_MAP(ea,1,p,return);
+static inline void gk_w8_m (uint32_t ea,uint8_t v){ uint32_t p; GK_MAP(ea,1,p,return);
     GK_WPRE(p,1); g_ram[p]=v; GK_WPOST(p,1); }
-static inline void gk_w16(uint32_t ea,uint16_t v){ uint32_t p; GK_MAP(ea,2,p,return); GK_WPRE(p,2);
+static inline void gk_w16_m(uint32_t ea,uint16_t v){ uint32_t p; GK_MAP(ea,2,p,return); GK_WPRE(p,2);
     g_ram[p]=(uint8_t)(v>>8); g_ram[p+1]=(uint8_t)v; GK_WPOST(p,2); }
-static inline void gk_w32(uint32_t ea,uint32_t v){ uint32_t p; GK_MAP(ea,4,p,return); GK_WPRE(p,4);
+static inline void gk_w32_m(uint32_t ea,uint32_t v){ uint32_t p; GK_MAP(ea,4,p,return); GK_WPRE(p,4);
     g_ram[p]=(uint8_t)(v>>24); g_ram[p+1]=(uint8_t)(v>>16); g_ram[p+2]=(uint8_t)(v>>8); g_ram[p+3]=(uint8_t)v;
     GK_WPOST(p,4); }
+
+#ifdef SR_VERIFY
+static inline uint8_t  gk_r8 (uint32_t ea){ return gk_r8_m(ea); }
+static inline uint16_t gk_r16(uint32_t ea){ return gk_r16_m(ea); }
+static inline uint32_t gk_r32(uint32_t ea){ return gk_r32_m(ea); }
+static inline void gk_w8 (uint32_t ea,uint8_t v){ gk_w8_m(ea,v); }
+static inline void gk_w16(uint32_t ea,uint16_t v){ gk_w16_m(ea,v); }
+static inline void gk_w32(uint32_t ea,uint32_t v){ gk_w32_m(ea,v); }
+#else
+/* [2026-09-29] MEM1 FAST PATH, AND GUEST WORDS THAT DO NOT ALIAS THE REGISTER FILE.
+   WHAT IS THE SAME.  For an EA in 0x80000000..0x81FFFFFF with p + n <= g_ram_size the mapped
+   form computes p = ea & 0x01FFFFFF (GK_MAP above), and its hooks are all no-ops there: GK_RD
+   fires only at p >= GK_HWREG_OFF and GK_WPOST only at p >= GK_WPAR_OFF, both >= g_ram_size.
+   So the fast path is that same access with the dead checks removed; every other EA -- the
+   locked cache, WPAR, device registers, and an out-of-bounds MEM1 EA that must fault -- goes to
+   the mapped form, out of line.
+   WHAT CHANGES, AND WHY IT IS THE POINT.  The mapped form stores four uint8_t, and a char store
+   may alias ANY object, so clang must assume each guest store can overwrite st->gpr[], ps0/ps1,
+   g_ram and g_ram_size: read from the -S output of SAB's fn_80150b6c, every guest store
+   re-loaded the g_ram pointer four times and re-loaded every guest register it touched next.
+   A 32-bit guest word is accessed here as `unsigned long` (32 bits on wasm32), a type NOTHING
+   in GekkoState or the runtime globals has, so type-based alias analysis may keep them in
+   registers.  That is only sound if every access to GUEST MEMORY is either this type or a char
+   type (chars alias everything): 8- and 16-bit accesses stay bytes, 64-bit ones are two words,
+   dcbz stays bytes.  Guest memory and the host register file are disjoint host objects, so the
+   no-alias fact is true, not assumed.  On an LP64 host (the native unit tests) there is no
+   32-bit type other than unsigned int, so it falls back to uint32_t: same values, no gain. */
+#if defined(__SIZEOF_LONG__) && __SIZEOF_LONG__ == 4
+typedef unsigned long gk_gword;
+#else
+typedef uint32_t gk_gword;
+#endif
+typedef gk_gword gk_gword_u __attribute__((aligned(1)));
+#define GK_FAST(ea, n)  (((ea) >> 25) == 0x40u && ((ea) & 0x01FFFFFFu) + (n) <= g_ram_size)
+__attribute__((noinline)) static uint8_t  gk_r8_s (uint32_t ea){ return gk_r8_m(ea); }
+__attribute__((noinline)) static uint16_t gk_r16_s(uint32_t ea){ return gk_r16_m(ea); }
+__attribute__((noinline)) static uint32_t gk_r32_s(uint32_t ea){ return gk_r32_m(ea); }
+__attribute__((noinline)) static void gk_w8_s (uint32_t ea,uint8_t v){ gk_w8_m(ea,v); }
+__attribute__((noinline)) static void gk_w16_s(uint32_t ea,uint16_t v){ gk_w16_m(ea,v); }
+__attribute__((noinline)) static void gk_w32_s(uint32_t ea,uint32_t v){ gk_w32_m(ea,v); }
+static inline uint8_t  gk_r8 (uint32_t ea){
+    if (GK_FAST(ea,1)) return g_ram[ea & 0x01FFFFFFu];
+    return gk_r8_s(ea); }
+static inline uint16_t gk_r16(uint32_t ea){
+    if (GK_FAST(ea,2)) { const uint8_t *q = g_ram + (ea & 0x01FFFFFFu); return (uint16_t)((q[0]<<8)|q[1]); }
+    return gk_r16_s(ea); }
+static inline uint32_t gk_r32(uint32_t ea){
+    if (GK_FAST(ea,4)) return __builtin_bswap32((uint32_t)*(const gk_gword_u *)(g_ram + (ea & 0x01FFFFFFu)));
+    return gk_r32_s(ea); }
+static inline void gk_w8 (uint32_t ea,uint8_t v){
+    if (GK_FAST(ea,1)) { g_ram[ea & 0x01FFFFFFu] = v; return; }
+    gk_w8_s(ea,v); }
+static inline void gk_w16(uint32_t ea,uint16_t v){
+    if (GK_FAST(ea,2)) { uint8_t *q = g_ram + (ea & 0x01FFFFFFu); q[0]=(uint8_t)(v>>8); q[1]=(uint8_t)v; return; }
+    gk_w16_s(ea,v); }
+static inline void gk_w32(uint32_t ea,uint32_t v){
+    if (GK_FAST(ea,4)) { *(gk_gword_u *)(g_ram + (ea & 0x01FFFFFFu)) = (gk_gword)__builtin_bswap32(v); return; }
+    gk_w32_s(ea,v); }
+#endif
+static inline uint64_t gk_r64(uint32_t ea){ return ((uint64_t)gk_r32(ea)<<32) | gk_r32(ea+4); }
 static inline void gk_w64(uint32_t ea,uint64_t v){ gk_w32(ea,(uint32_t)(v>>32)); gk_w32(ea+4,(uint32_t)v); }
 
 // ------------------------------------------------------------------ bit casts
