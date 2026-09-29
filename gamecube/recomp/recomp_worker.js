@@ -1191,7 +1191,16 @@ async function boot(msg) {
         case 'OSReport': osReport(a[0], a[1]); return 0;
         case 'OSPanic':  log('OSPanic at ' + cstr(a[0]) + ':' + a[1]); osReport(a[2], a[3]); return 0;
         case 'OSInit':
-          Module._OSSetArenaLo(0x80004000); Module._OSSetArenaHi(0x81800000); return 0;
+          // Arena starts ABOVE the static-asset window. Compiled-in .inc textures (Hu3D reflection,
+          // toon and hilite maps, fonts) are shipped to guest-physical 0..staticTop (see the
+          // STATIC ASSETS note in the frame sync), so an arena at 0x80004000 handed that same
+          // window to heap allocations and GX copy targets, which then overwrote the assets in
+          // Dolphin's RAM. MP4's title cube sampled its reflection map (C8 @ 0x10400, TLUT @
+          // 0x10240) out of whatever landed there: flat cyan on WebGPU, frame noise on the
+          // Software renderer; the toon ramp and hilite maps (used by the character models) are
+          // exposed the same way.
+          Module._OSSetArenaLo(Math.max(0x80004000, 0x80000000 + Math.ceil(staticTop / 0x10000) * 0x10000));
+          Module._OSSetArenaHi(0x81800000); return 0;
         case 'OSGetTime': case '__OSGetSystemTime': return BigInt(viRetrace) * 675000n;
         case 'OSGetTick': return (viRetrace * 675000) >>> 0;
         case 'DVDInit': { const f = Module.___DVDFSInit; if (f) f(); return 0; }
