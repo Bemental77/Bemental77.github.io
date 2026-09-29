@@ -98,6 +98,19 @@ const plan = (process.env.PLAN || `${TITLE - 8}:snap:t0,${TITLE - 2}:snap:t1,${T
 for (const [at, k, name] of plan) {
   while ((Date.now() - t0) / 1000 < +at) await new Promise(r => setTimeout(r, 250));
   if (k === 'snap') await snap(name);
+  else if (k === 'ram') { // ram:<name> -> guest RAM bytes at RAMADDRS, read inside the worker (needs /gcgate.js)
+    const r = await p.evaluate((addrs) => new Promise((res) => {
+      const w = window.dolphin_worker; if (!w) return res('no worker');
+      const h = (e) => { if (e.data && e.data.cmd === 'gcgateRamReply') { w.removeEventListener('message', h); res(JSON.stringify(e.data)); } };
+      w.addEventListener('message', h); w.postMessage({ cmd: 'gcgateRam', addrs, len: 16 }); setTimeout(() => res('timeout'), 5000);
+    }), (process.env.RAMADDRS || '0x10240,0x10400,0x10800').split(',').map(x => parseInt(x)));
+    console.log(`[t=${T()}] RAM ${name} ${r}`);
+  }
+  else if (k === 'cells') { // cells:<name> -> dump CELLS env "hexaddr:count"
+    const [ad, cnt] = (process.env.CELLS || '0x026B3B40:73').split(':');
+    const v = await p.evaluate((a, c) => Array.from(new Uint32Array(sharedMemory.buffer, a, c)).map(x => (x >>> 0).toString(16)), parseInt(ad), +cnt);
+    console.log(`[t=${T()}] CELLS ${ad}: ${v.join(' ')}`);
+  }
   else if (k === 'settle') { // wait until the ring publish index has not moved for 90 s (after the gate window), then dump all slots
     let last = -1, since = Date.now();
     for (;;) { const v = await p.evaluate(() => [new Uint32Array(sharedMemory.buffer)[0x026E0008 / 4] * 100 + (self.__gcDumps || []).length, (self.__gate || {}).sent | 0, (self.__gcDumps || []).length]);
