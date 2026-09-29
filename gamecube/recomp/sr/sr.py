@@ -381,6 +381,8 @@ def F(w):
 def ea(f, disp='d'):
     """Effective address expression for a d-form load/store."""
     off = f[disp]
+    if isinstance(off, str):                 # a relocated displacement (rel_all.py)
+        return f"((uint32_t)({off}))" if f['rA'] == 0 else f"(st->gpr[{f['rA']}] + (uint32_t)({off}))"
     if f['rA'] == 0:
         return f"({off:#x}u)" if off >= 0 else f"((uint32_t)({off}))"
     return f"(st->gpr[{f['rA']}] + (uint32_t)({off}))"
@@ -434,6 +436,22 @@ class Translator:
     def gp(self, r):
         return f"st->gpr[{r}]"
 
+    # ---- HOOKS for position-independent overlay translation (rel_all.py).  The defaults
+    # reproduce the historical output byte for byte.
+    def addr_expr(self, v):
+        """C expression for a guest CODE ADDRESS this translation writes into guest state."""
+        return f"{v:#010x}u"
+
+    def extern_expr(self, tgt):
+        return f"sr_extern(st, {tgt:#010x}u);"
+
+    def jt_key(self):
+        return "st->ctr & ~3u"
+
+    def fix_fields(self, pc, f):
+        """Adjust decoded fields at a relocation site; may return replacement C lines."""
+        return None
+
     def callexpr(self, tgt, pc, w):
         """C text for transferring control to another function.
 
@@ -444,7 +462,7 @@ class Translator:
         if self.starts is not None and tgt not in self.starts:
             raise Untranslatable(f"branch target {tgt:#010x} is not a function start", pc, w)
         if self.emitted is not None and tgt not in self.emitted:
-            return f"sr_extern(st, {tgt:#010x}u);"
+            return self.extern_expr(tgt)
         if self.emitted is None:
             return f"CALL({tgt:#010x}u);"
         return f"fn_{tgt:08x}(st);"
@@ -587,6 +605,9 @@ class Translator:
     # --- the instruction translator ---------------------------------------
     def inst(self, pc, w):
         f = F(w)
+        fixed = self.fix_fields(pc, f)
+        if fixed is not None:
+            return fixed
         op, o = f['op'], []
         A, B, D, S = f['rA'], f['rB'], f['rD'], f['rS']
 
@@ -601,7 +622,7 @@ class Translator:
             if pc in self.branch_reloc:                  # relocated cross-module branch
                 tgt = self.branch_reloc[pc]
                 if f['LK']:
-                    o.append(f"st->lr = {pc + 4:#010x}u;")
+                    o.append(f"st->lr = {self.addr_expr(pc + 4)};")
                     o.append(self.callexpr(tgt, pc, w))
                 else:
                     o.append(self.callexpr(tgt, pc, w) + " return;")
@@ -610,7 +631,7 @@ class Translator:
             if f['LK']:
                 # LR is materialised BEFORE the call: the callee's `mflr r0; stw r0,N(r1)`
                 # prologue writes it to guest memory, and that store is diffed.
-                o.append(f"st->lr = {pc + 4:#010x}u;")
+                o.append(f"st->lr = {self.addr_expr(pc + 4)};")
                 o.append(self.callexpr(tgt, pc, w))
             elif self.lo <= tgt < self.hi:
                 self.labels.add(tgt)
@@ -629,7 +650,7 @@ class Translator:
             cond, pre = self.branch_cond(f)
             o += pre
             if f['LK']:
-                o.append(f"if ({cond}) {{ st->lr = {pc + 4:#010x}u; "
+                o.append(f"if ({cond}) {{ st->lr = {self.addr_expr(pc + 4)}; "
                          f"{self.callexpr(tgt, pc, w)} }}")
             elif self.lo <= tgt < self.hi:
                 self.labels.add(tgt)
@@ -650,7 +671,7 @@ class Translator:
                     raise Untranslatable("blrl (indirect call through LR)", pc, w)
                 cond, pre = self.branch_cond(f)
                 o += pre
-                body = (f"{{ uint32_t _t = st->lr & ~3u; st->lr = {pc + 4:#010x}u;"
+                body = (f"{{ uint32_t _t = st->lr & ~3u; st->lr = {self.addr_expr(pc + 4)};"
                         f" sr_indirect(st, _t); }}")
                 o.append(body if cond == "1" else f"if ({cond}) {body}")
                 return o
@@ -669,7 +690,7 @@ class Translator:
             cond, pre = self.branch_cond(f)
             o += pre
             if f['LK']:                                  # bctrl: a call, execution resumes
-                body = (f"{{ st->lr = {pc + 4:#010x}u;"
+                body = (f"{{ st->lr = {self.addr_expr(pc + 4)};"
                         f" sr_indirect(st, st->ctr & ~3u); }}")
                 o.append(body if cond == "1" else f"if ({cond}) {body}")
             else:                                        # bctr: a tail jump, LR untouched
@@ -679,7 +700,7 @@ class Translator:
                     # directly; anything not in the table still falls through to
                     # sr_indirect(), which FAULTS -- a value outside the table means
                     # the bound check was not what we read, and must not be guessed.
-                    body = ["{ switch (st->ctr & ~3u) {"]
+                    body = ["{ switch (" + self.jt_key() + ") {"]
                     for t in sorted(set(tgts)):
                         if self.lo <= t < self.hi:
                             self.labels.add(t)
@@ -978,15 +999,34 @@ class Translator:
             if xo == 339:                                # mfspr
                 spr = f['SPR']
                 src = {8: 'st->lr', 9: 'st->ctr', 1: 'st->xer'}.get(spr)
+                # [2026-09-29] GQR0-7 (912-919) live in GekkoState.gqr, which gk_psq_l/st read;
+                # HID2 (920) is the image host layer's (sr_image.c g_spr[920], set by __OSPSInit)
+                if src is None and 912 <= spr <= 919:
+                    src = f'st->gqr[{spr - 912}]'
+                if src is None and spr == 920:
+                    o.append(f"{{ uint32_t sr_image_spr(uint32_t); {self.gp(D)} = sr_image_spr(920u); }}")
+                    return o
                 if src is None:
                     raise Untranslatable(f"mfspr SPR{spr} (privileged/host)", pc, w)
                 o.append(f"{self.gp(D)} = {src};"); return o
             if xo == 467:                                # mtspr
                 spr = f['SPR']
                 dst = {8: 'st->lr', 9: 'st->ctr', 1: 'st->xer'}.get(spr)
+                if dst is None and 912 <= spr <= 919:
+                    dst = f'st->gqr[{spr - 912}]'
+                if dst is None and spr == 920:
+                    o.append(f"{{ void sr_image_set_spr(uint32_t, uint32_t); sr_image_set_spr(920u, {self.gp(S)}); }}")
+                    return o
                 if dst is None:
                     raise Untranslatable(f"mtspr SPR{spr} (privileged/host)", pc, w)
                 o.append(f"{dst} = {self.gp(S)};"); return o
+            if xo == 371:                                # mftb: the guest clock (sr_host_os.c)
+                tbr = f['SPR']
+                if tbr not in (268, 269):
+                    raise Untranslatable(f"mftb TBR{tbr}", pc, w)
+                o.append(f"{{ uint64_t sr_tb_read(void); uint64_t _t = sr_tb_read();"
+                         f" {self.gp(D)} = (uint32_t){'(_t >> 32)' if tbr == 269 else '_t'}; }}")
+                return o
             if xo == 19:  o.append(f"{self.gp(D)} = st->cr;"); return o          # mfcr
             if xo == 144:                                                        # mtcrf
                 crm = f['CRM']

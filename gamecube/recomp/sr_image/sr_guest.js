@@ -55,6 +55,8 @@ export function guestCounters(mod) {
     diCmds: mod._sr_image_di_cmds() >>> 0, ovEntries: mod._sr_image_ov_entries() >>> 0,
     fault: '0x' + (mod._sr_image_fault() >>> 0).toString(16),
     bootThread: mod._sr_image_boot_thread_state() >>> 0,
+    viFrames: mod._sr_image_vi_frames() >>> 0, siPolls: mod._sr_si_polls ? mod._sr_si_polls() >>> 0 : null,
+    siMode: mod._sr_si_mode ? mod._sr_si_mode() >>> 0 : null,
   };
 }
 
@@ -76,7 +78,16 @@ export async function loadDisc(mod, size, parts) {
 // Start the guest.  Everything the node runner sets, in the same order.
 export async function startGuest(mod, api, opts = {}) {
   const { hle = 12, strict = 0, parkMs = 3600000 } = opts;
-  api.setExiModel(1);
+  // exiModel: 1 = the TSTART-only model, 2 = the full EXI (sr_exi.c) with a memory card in slot A
+  // unless card === 0 (the card-absent arm)
+  api.setExiModel(opts.exiModel === undefined ? 1 : opts.exiModel);
+  if (mod._sr_image_set_card) mod._sr_image_set_card(opts.card === 0 ? 0 : 1);
+  // si: the serial interface with a controller on port 0 (sr_si.c); input: [[fromFrame, toFrame,
+  // buttons], ...] keyed on VI frames of GUEST time (Start 0x1000, A 0x0100, B 0x0200, d-pad 1/2/4/8)
+  if (opts.si && mod._sr_image_set_si) {
+    mod._sr_image_set_si(1);
+    for (const [a, b, btn] of (opts.input || [])) mod._sr_si_input_add(a >>> 0, b >>> 0, btn >>> 0);
+  }
   mod._sr_image_set_dsp_model(1);
   for (let id = 1; id <= 11; id++) mod._sr_image_set_model(id, 1);
   api.setWatchdog(0);                              // device-read watchdog off: the guest runs until stopped
@@ -84,6 +95,7 @@ export async function startGuest(mod, api, opts = {}) {
   mod._sr_os_set_timeout(parkMs);
   api.setStrict(strict);
   mod._sr_gx_set_capture(2);                       // the frame ring
+  if (opts.fmaFast !== undefined && mod._sr_set_fma_fast) mod._sr_set_fma_fast(opts.fmaFast ? 1 : 0);
   // idleLoop: the busy-wait skip (sr.py --idle-skip builds), default on; 0 = the control arm
   if (opts.idleLoop !== undefined && mod._sr_image_set_idle_loop) mod._sr_image_set_idle_loop(opts.idleLoop ? 1 : 0);
   // snapMem: the verification-only MEM1 hash per context switch (sr_host_os.c) — the matched-pair

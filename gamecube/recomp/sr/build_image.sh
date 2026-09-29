@@ -205,7 +205,7 @@ EXPORTS=$EXPORTS,_sr_image_set_dsp_model,_sr_image_dsp_events,_sr_image_aram_byt
 EXPORTS=$EXPORTS,_sr_image_set_model,_sr_image_get_model,_sr_image_model_events
 EXPORTS=$EXPORTS,_sr_image_irq_delivered,_sr_image_dec_delivered,_sr_image_irq_last
 EXPORTS=$EXPORTS,_sr_image_pi_cause,_sr_image_pi_mask,_sr_image_vi_frames,_sr_image_ucode_crc,_sr_image_ucode,_sr_image_ax_cmdlist
-EXPORTS=$EXPORTS,_sr_image_idle_skips,_sr_image_idle_mcycles,_sr_image_cycles_m,_sr_image_set_budget_mcycles,_sr_image_tail,_sr_image_tail_n,_sr_os_trace_mask,_sr_os_ring,_sr_os_ring_n,_sr_image_set_past_fault,_sr_image_budget_thread,_sr_image_budget_state,_sr_image_budget_threads,_sr_image_budget_threads_n,_sr_image_budget_runq,_sr_ax_pbs,_sr_ax_lists,_sr_ax_voices,_sr_ax_unknown_cmds,_sr_image_indirect_fault_lr,_sr_image_indirect_fault_target,_sr_image_indirect_fault_r1,_sr_image_set_disc,_sr_image_di_cmds,_sr_image_di_bytes,_sr_image_di_log,_sr_image_set_watch,_sr_image_watch_hit,_sr_image_watch_kcyc,_sr_image_watch_thread,_sr_image_watch_new,_sr_image_watch_state,_sr_image_watch_stack,_sr_image_set_watch_cond,_sr_image_set_watch_e0,_sr_image_di_trace,_sr_image_di_trace_n,_sr_os_recycled,_sr_image_ov_entries,_sr_image_ov_refused,_sr_image_set_ov,_sr_gp_cmds,_sr_gp_prims,_sr_gp_verts,_sr_gp_dls,_sr_gp_unknown,_sr_gp_bad_fmt,_sr_gx_cuts,_sr_gx_ncuts,_sr_image_pe_finishes,_sr_image_pe_tokens,_sr_image_pe_drawdone_bp,_sr_image_xfb_copies,_sr_image_vi_flips,_sr_image_frame_kcyc,_sr_image_kcycles,_sr_image_set_disc_mem,_sr_gx_ring_base,_sr_gx_ring_cap,_sr_gx_ring_pub,_sr_gx_ring_frames,_sr_image_idle_kcycles,_sr_os_set_snap_mem,_sr_image_set_idle_loop,_sr_image_idle_loop_skips
+EXPORTS=$EXPORTS,_sr_image_idle_skips,_sr_image_idle_mcycles,_sr_image_cycles_m,_sr_image_set_budget_mcycles,_sr_image_tail,_sr_image_tail_n,_sr_os_trace_mask,_sr_os_ring,_sr_os_ring_n,_sr_image_set_past_fault,_sr_image_budget_thread,_sr_image_budget_state,_sr_image_budget_threads,_sr_image_budget_threads_n,_sr_image_budget_runq,_sr_ax_pbs,_sr_ax_lists,_sr_ax_voices,_sr_ax_unknown_cmds,_sr_image_indirect_fault_lr,_sr_image_indirect_fault_target,_sr_image_indirect_fault_r1,_sr_image_set_disc,_sr_image_di_cmds,_sr_image_di_bytes,_sr_image_di_log,_sr_image_set_watch,_sr_image_watch_hit,_sr_image_watch_kcyc,_sr_image_watch_thread,_sr_image_watch_new,_sr_image_watch_state,_sr_image_watch_stack,_sr_image_set_watch_cond,_sr_image_set_watch_e0,_sr_image_di_trace,_sr_image_di_trace_n,_sr_os_recycled,_sr_image_ov_entries,_sr_image_ov_refused,_sr_image_set_ov,_sr_image_ov_last_refused,_sr_image_ov_name,_sr_image_ov_missing_id,_sr_image_ov_missing_hdr,_sr_image_set_card,_sr_image_set_si,_sr_si_input_add,_sr_si_polls,_sr_si_xfers,_sr_si_mode,_sr_exi_card_cmds,_sr_exi_card_rd,_sr_exi_card_wr,_sr_exi_tstarts,_sr_exi_rom_reads,_sr_gp_cmds,_sr_gp_prims,_sr_gp_verts,_sr_gp_dls,_sr_gp_unknown,_sr_gp_bad_fmt,_sr_gx_cuts,_sr_gx_ncuts,_sr_image_pe_finishes,_sr_image_pe_tokens,_sr_image_pe_drawdone_bp,_sr_image_xfb_copies,_sr_image_vi_flips,_sr_image_frame_kcyc,_sr_image_kcycles,_sr_image_set_disc_mem,_sr_gx_ring_base,_sr_gx_ring_cap,_sr_gx_ring_pub,_sr_gx_ring_frames,_sr_image_idle_kcycles,_sr_os_set_snap_mem,_sr_image_set_idle_loop,_sr_image_idle_loop_skips,_sr_set_fma_fast
 EXPORTS=$EXPORTS,_sr_os_mode,_sr_os_get_mode,_sr_os_set_msr,_sr_os_get_msr
 EXPORTS=$EXPORTS,_sr_os_trace,_sr_os_trace_n,_sr_os_trace_reset
 # THE CLOCK, READ-ONLY (plus the two writes that are legitimately the host's).
@@ -352,13 +352,25 @@ fi
 # reach them (see OVERLAYS in sr_image.c).  Empty: no overlay code, the old behaviour.
 OV_SRC=(); OV_DEF=()
 if [ -n "${SR_OVERLAYS:-}" ]; then
-  read -r -a OV_SRC <<< "$SR_OVERLAYS"; OV_DEF=(-DSR_HAVE_OV)
-  echo "[sr] overlays: ${OV_SRC[*]}"
+  read -r -a OV_C <<< "$SR_OVERLAYS"; OV_DEF=(-DSR_HAVE_OV)
+  echo "[sr] overlays: ${OV_C[*]}"
+  # each overlay TU is compiled on its own, cached like the parts (rel_all.py writes one per
+  # module; a 14 MB module in the link command would be compiled on every relink)
+  for c in "${OV_C[@]}"; do
+    o="${c%.c}.o"
+    if [ ! -f "$o" ] || [ "$c" -nt "$o" ] || [ "$SR/gekko_rt.h" -nt "$o" ] || \
+       [ "$(cat "$o.flags" 2>/dev/null)" != "$PART_KEY" ]; then
+      echo "[sr] compiling overlay $(basename "$c")"
+      nice -n 19 emcc ${SR_OPT:--O2} ${PT_CFLAGS[@]+"${PT_CFLAGS[@]}"} -DSR_MMIO -I"$SR" -c "$c" -o "$o" 2>"$o.log" || { tail -20 "$o.log"; exit 1; }
+      echo "$PART_KEY" > "$o.flags"
+    fi
+    OV_SRC+=("$o")
+  done
 fi
 set -x
 nice -n 19 emcc ${SR_OPT:--O2} -DSR_MMIO ${OV_DEF[@]+"${OV_DEF[@]}"} -I"$SR" \
   ${OCIMFS_FLAG[@]+"${OCIMFS_FLAG[@]}"} ${PT_LFLAGS[@]+"${PT_LFLAGS[@]}"} ${NODEFS_FLAGS[@]+"${NODEFS_FLAGS[@]}"} \
-  "${GEN_SRC[@]}" ${DISPATCH_SRC[@]+"${DISPATCH_SRC[@]}"} "$SR/sr_driver.c" "$SR/sr_host_os.c" "$SR/sr_image.c" "$SR/sr_ax.c" "$SR/sr_gx.c" ${OV_SRC[@]+"${OV_SRC[@]}"} \
+  "${GEN_SRC[@]}" ${DISPATCH_SRC[@]+"${DISPATCH_SRC[@]}"} "$SR/sr_driver.c" "$SR/sr_host_os.c" "$SR/sr_image.c" "$SR/sr_ax.c" "$SR/sr_gx.c" "$SR/sr_exi.c" "$SR/sr_si.c" ${OV_SRC[@]+"${OV_SRC[@]}"} \
   -o "$OUT/sab_image.mjs" \
   -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT="${SR_ENV:-web,worker}" \
   -sINVOKE_RUN=0 -sEXIT_RUNTIME=0 \

@@ -114,6 +114,7 @@ static uint32_t vtx_size(uint32_t vat) {
 }
 static uint32_t be32(const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
 static void gp_feed(const uint8_t *b, uint32_t n) {
+    if (g_skip >= n) { g_skip -= n; return; }      // inside a primitive's vertex data: the common case
     while (n) {
         if (g_skip) { uint32_t k = n < g_skip ? n : g_skip; g_skip -= k; b += k; n -= k; continue; }
         g_hdr[g_hn++] = *b++; n--;
@@ -213,7 +214,9 @@ void gk_tail_write(uint32_t p, uint32_t n) {
     g_gx_writes++;
     g_gx_bytes += n;
     if (g_gx_capture == 2) {
-        for (uint32_t i = 0; i < n; i++) g_gx_ring[(g_ring_w + i) & (SR_GX_RING - 1u)] = g_ram[p + i];
+        const uint32_t w = g_ring_w & (SR_GX_RING - 1u), k = SR_GX_RING - w;
+        if (n <= k) memcpy(g_gx_ring + w, g_ram + p, n);
+        else { memcpy(g_gx_ring + w, g_ram + p, k); memcpy(g_gx_ring, g_ram + p + k, n - k); }
         g_ring_w += n;
     } else if (g_gx_capture) {
         if (g_gx_pos + n > SR_GX_FIFO_CAP) g_gx_dropped += n;

@@ -233,8 +233,15 @@ static inline int gk_tail(uint32_t ea, uint32_t n, uint32_t *p) {
 #endif
     return 0;
 }
+/* [2026-09-29] MEM1 FIRST.  An EA in 0x80000000..0x81FFFFFF can be none of the tail windows
+   (locked cache 0xE, WPAR/HWREG 0xCC), so gk_tail() would return 0 and the result would be
+   gk_phys(ea) = ea & 0x03FFFFFF = ea & 0x01FFFFFF with the same bounds check: this is the
+   identical mapping, tested first because it is almost every access a game makes. */
 #define GK_MAP(ea, n, p, fail)  do {                                           \
-        if (!gk_tail((ea), (n), &(p))) {                                       \
+        if (((ea) >> 25) == 0x40u) {                                           \
+            (p) = (ea) & 0x01FFFFFFu;                                          \
+            if (!gk_ok((p), (n))) { fail; }                                    \
+        } else if (!gk_tail((ea), (n), &(p))) {                                \
             (p) = gk_phys(ea);                                                 \
             if (!gk_ok((p), (n))) { fail; }                                    \
         }                                                                      \
@@ -437,20 +444,49 @@ static inline double gk_ni_add(double a, double b){
 }
 static inline double gk_ni_sub(double a, double b){ return gk_ni_add(a, -b); }
 
+// [2026-09-29] EXACT FMA WITHOUT THE SOFTWARE FMA WHEN THE PRODUCT IS EXACT.  wasm has no fused
+// multiply-add, so libc fma() is a soft-float routine (musl fma/normalize/mul/scalbn: 21% of the
+// busy time of the City Escape run, node --cpu-prof).  fma(a,c,b) is RN(a*c + b).  When a*c is
+// EXACTLY representable -- both operands normal, the two significands together need at most 53
+// bits, and the product's exponent stays inside the normal range -- the plain product is that
+// exact value and `a*c + b` rounds once, which IS fma(a,c,b), bit for bit (overflow and
+// underflow of the final sum round identically, since both round the same exact real).  Anything
+// else takes libc fma().  Single-precision operands (24 bits) times Force25Bit(c) (25 bits) is
+// 49 bits: the paired-single / fmadds path is always the fast one.
+static inline int gk_sigbits(uint64_t u) {       // significant bits of a normal double's significand
+    uint64_t m = (u & 0x000FFFFFFFFFFFFFULL) | 0x0010000000000000ULL;
+    return 53 - __builtin_ctzll(m);
+}
+extern int g_gk_fma_fast;                        // run-time arm (sr_driver.c): 0 = always libc fma
+static inline double gk_fma(double a, double c, double b) {
+    if (!g_gk_fma_fast) return fma(a, c, b);
+    const uint64_t ua = gk_db(a), uc = gk_db(c);
+    const int ea = (int)((ua >> 52) & 0x7FF), ec = (int)((uc >> 52) & 0x7FF);
+    if (ea != 0 && ea != 0x7FF && ec != 0 && ec != 0x7FF) {
+        const int e = (ea - 1023) + (ec - 1023);
+        if (e > -1000 && e < 1000 && gk_sigbits(ua) + gk_sigbits(uc) <= 53) {
+            // a*c is exact here, so whether or not the compiler contracts this into a fused
+            // operation the result is RN(a*c + b) either way (wasm has no fused op at all)
+            return a * c + b;
+        }
+    }
+    return fma(a, c, b);
+}
+
 // Interpreter_FPUtils.h:285  NI_madd_msub<sub, single=true> — a*c+b with frC forced to a
 // 25-bit mantissa, computed as one 64-bit FMA, plus the 2Sum tie-break correction that
 // makes the later narrowing to single round exactly once (the Mario-Strikers case).
 static inline double gk_ni_madd_single(double a, double c, double b, int sub){
     const double c_round = gk_force25(c);
     const double b_sign  = sub ? -b : b;
-    double value = fma(a, c_round, b_sign);
+    double value = gk_fma(a, c_round, b_sign);
     const uint64_t rb = gk_db(value);
     const uint64_t D_MASK  = 0x000000001FFFFFFFULL;
     const uint64_t EVEN_TIE= 0x0000000010000000ULL;
     if ((rb & D_MASK) == EVEN_TIE) {
         const double a_prime = b_sign - value;
         const double b_prime = value + a_prime;
-        const double delta_a = fma(a, c_round, a_prime);
+        const double delta_a = gk_fma(a, c_round, a_prime);
         const double delta_b = b_sign - b_prime;
         const double error   = delta_a + delta_b;
         if (error != 0.0) {
@@ -468,7 +504,7 @@ static inline double gk_ni_madd_single(double a, double c, double b, int sub){
 }
 // double-precision FMA form (fmadd/fmsub): plain std::fma, no frC rounding, no tie fix.
 static inline double gk_ni_madd_double(double a, double c, double b, int sub){
-    double v = fma(a, c, sub ? -b : b);
+    double v = gk_fma(a, c, sub ? -b : b);
     if (isnan(v)) {
         if (isnan(a)) return gk_bd(gk_db(a) | 0x0008000000000000ULL);
         if (isnan(b)) return gk_bd(gk_db(b) | 0x0008000000000000ULL);
@@ -492,21 +528,61 @@ static inline void gk_set_both(GekkoState *st, int d, float p0, float p1){
 }
 
 // ------------------------------------------------------ paired quantized ld/st
-// Interpreter_LoadStorePaired.cpp:218 Helper_Dequantize / :144 Helper_Quantize.
-// Only QUANTIZE_FLOAT (gqr type 0) is emitted inline; sr.py marks a function
-// UNTRANSLATABLE if it cannot prove the GQR index is float-mode, and the runtime
-// still checks at execution time so a wrong assumption faults instead of lying.
+// Interpreter_LoadStorePaired.cpp:218 Helper_Dequantize / :144 Helper_Quantize, ALL types.
+// [2026-09-29] Was float-mode only (a non-float GQR faulted 0xDEAD0001/2); SAB's game code sets
+// integer GQRs (mtspr 912-919), so the integer types are transcribed: the u8/u16/s8/s16 value is
+// converted to float, multiplied by the float scale table entry (single precision, as Dolphin's
+// `float(T(v)) * m_dequantizeTable[ld_scale]`), then widened; stores scale in float, clamp to the
+// type's range in float, and truncate (ScaleAndClamp).  Types 1-3 are invalid on hardware
+// (Dolphin asserts and loads 0); they still fault here.  GQR: st_type 0-2, st_scale 8-13,
+// ld_type 16-18, ld_scale 24-29 (UGQR).
+static inline float gk_qscale(uint32_t s, int dequant) {
+    // m_dequantizeTable[s] = 2^-s for s < 32, 2^(64-s) for s >= 32; m_quantizeTable the inverse
+    int e = s < 32 ? (int)s : (int)s - 64;
+    if (dequant) e = -e;
+    float f = 1.0f;
+    if (e > 0) while (e--) f *= 2.0f; else while (e++ < 0) f *= 0.5f;
+    return f;
+}
+static inline double gk_deq(uint32_t t, uint32_t v, float sc) {
+    float f;
+    switch (t) {
+    case 4: f = (float)(uint8_t)v;  break;
+    case 5: f = (float)(uint16_t)v; break;
+    case 6: f = (float)(int8_t)v;   break;
+    default: f = (float)(int16_t)v; break;       // 7
+    }
+    return (double)(f * sc);
+}
 static inline void gk_psq_l(GekkoState *st, int d, uint32_t ea, int w, int i){
     const uint32_t gqr = st->gqr[i];
     const uint32_t ld_type = (gqr >> 16) & 7;
-    if (ld_type != 0) { g_fault = 0xDEAD0001u; return; }   // non-float mode: refuse
+    if (ld_type == 0) {
+        if (w) {
+            st->ps0[d] = gk_cvt_to_double(gk_r32(ea));
+            st->ps1[d] = gk_db(1.0);
+        } else {
+            uint64_t pair = gk_r64(ea);
+            st->ps0[d] = gk_cvt_to_double((uint32_t)(pair >> 32));
+            st->ps1[d] = gk_cvt_to_double((uint32_t)pair);
+        }
+        return;
+    }
+    if (ld_type < 4) { g_fault = 0xDEAD0001u; return; }   // invalid type: Dolphin asserts
+    const float sc = gk_qscale((gqr >> 24) & 0x3F, 1);
+    const int wide = (ld_type == 5 || ld_type == 7);
     if (w) {
-        st->ps0[d] = gk_cvt_to_double(gk_r32(ea));
+        uint32_t v = wide ? gk_r16(ea) : gk_r8(ea);
+        st->ps0[d] = gk_db(gk_deq(ld_type, v, sc));
         st->ps1[d] = gk_db(1.0);
+    } else if (wide) {
+        uint32_t v = gk_r32(ea);
+        st->ps0[d] = gk_db(gk_deq(ld_type, v >> 16, sc));
+        st->ps1[d] = gk_db(gk_deq(ld_type, v & 0xFFFF, sc));
     } else {
-        uint64_t pair = gk_r64(ea);
-        st->ps0[d] = gk_cvt_to_double((uint32_t)(pair >> 32));
-        st->ps1[d] = gk_cvt_to_double((uint32_t)pair);
+        uint32_t v = gk_r16(ea);
+        st->ps0[d] = gk_db(gk_deq(ld_type, v >> 8, sc));
+        st->ps1[d] = gk_db(gk_deq(ld_type, v & 0xFF, sc));
     }
 }
 
@@ -519,13 +595,37 @@ static inline uint32_t gk_cvt_to_single_ftz(uint64_t x){
     return (uint32_t)((x >> 32) & 0x80000000u);
 }
 
+static inline uint32_t gk_qclamp(uint32_t t, uint64_t psbits, float sc) {
+    double ps; memcpy(&ps, &psbits, 8);
+    float v = (float)ps * sc, lo, hi;
+    switch (t) {
+    case 4: lo = 0.0f; hi = 255.0f; break;
+    case 5: lo = 0.0f; hi = 65535.0f; break;
+    case 6: lo = -128.0f; hi = 127.0f; break;
+    default: lo = -32768.0f; hi = 32767.0f; break;
+    }
+    v = v < lo ? lo : v > hi ? hi : v;            // std::clamp (NaN passes through: not modelled)
+    return (t == 4 || t == 5) ? (uint32_t)v : (uint32_t)(int32_t)v;
+}
 static inline void gk_psq_st(GekkoState *st, int s, uint32_t ea, int w, int i){
     const uint32_t gqr = st->gqr[i];
     const uint32_t st_type = (gqr >> 0) & 7;
-    if (st_type != 0) { g_fault = 0xDEAD0002u; return; }
-    const uint32_t c0 = gk_cvt_to_single_ftz(st->ps0[s]);
-    if (w) { gk_w32(ea, c0); }
-    else   { gk_w32(ea, c0); gk_w32(ea + 4, gk_cvt_to_single_ftz(st->ps1[s])); }
+    if (st_type == 0) {
+        const uint32_t c0 = gk_cvt_to_single_ftz(st->ps0[s]);
+        if (w) { gk_w32(ea, c0); }
+        else   { gk_w32(ea, c0); gk_w32(ea + 4, gk_cvt_to_single_ftz(st->ps1[s])); }
+        return;
+    }
+    if (st_type < 4) { g_fault = 0xDEAD0002u; return; }
+    const float sc = gk_qscale((gqr >> 8) & 0x3F, 0);
+    const uint32_t a = gk_qclamp(st_type, st->ps0[s], sc);
+    const int wide = (st_type == 5 || st_type == 7);
+    if (w) { if (wide) gk_w16(ea, (uint16_t)a); else gk_w8(ea, (uint8_t)a); }
+    else {
+        const uint32_t b = gk_qclamp(st_type, st->ps1[s], sc);
+        if (wide) gk_w32(ea, ((a & 0xFFFFu) << 16) | (b & 0xFFFFu));
+        else gk_w16(ea, (uint16_t)(((a & 0xFFu) << 8) | (b & 0xFFu)));
+    }
 }
 
 // ------------------------------- fres / frsqrte (Gekko's table approximations)

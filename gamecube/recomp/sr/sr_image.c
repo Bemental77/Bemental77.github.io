@@ -330,7 +330,20 @@ static uint64_t img_r64(uint32_t ea) {
 static uint8_t  g_dev_seen_rd[GK_HWREG_SIZE];
 static uint8_t  g_dev_seen_wr[GK_HWREG_SIZE];
 static uint32_t g_dev_rd_n = 0, g_dev_wr_n = 0;   // total accesses, not distinct
-static uint32_t g_exi_model = 1;
+static uint32_t g_exi_model = 1;          // 0 off, 1 TSTART self-clear (the first model), 2 sr_exi.c
+static uint32_t g_card_arm = 1;           // with model 2: 1 = a memory card in slot A, 0 = absent
+void sr_exi_write(uint32_t ea, uint32_t n);
+void sr_exi_read(uint32_t ea, uint32_t n);
+uint64_t sr_exi_next_event(void);
+void sr_exi_event(uint64_t now);
+void sr_exi_init(int card_present);
+EMSCRIPTEN_KEEPALIVE void sr_image_set_card(uint32_t on) { g_card_arm = on; }
+void sr_si_half_line(uint32_t half_line_count, uint32_t odd_field_len, uint32_t fields);
+void sr_si_read(uint32_t ea, uint32_t n);
+void sr_si_write(uint32_t ea, uint32_t n);
+void sr_si_init(void);
+static uint32_t g_si_model = 0;          // [2026-09-29] 1 = sr_si.c (controller on port 0)
+EMSCRIPTEN_KEEPALIVE void sr_image_set_si(uint32_t on) { g_si_model = on; }
 static uint32_t g_exi_clears = 0;
 static uint32_t g_watchdog = 0;                   // 0 = off
 
@@ -468,7 +481,7 @@ static void irq_update(void);   // THE INTERRUPT LAYER, below
 static void dev_w32(uint32_t ea, uint32_t v) {
     dev_w16(ea, v >> 16); dev_w16(ea + 2, v & 0xFFFFu);
 }
-static uint32_t g_ov_gen = 1;          // bumped by every DMA into MEM1 (see OVERLAYS below)
+static void ov_dma(uint32_t pa, uint32_t len);   // OVERLAYS, below
 static void dsp_aram_dma(void) {
     uint32_t mm  = ((dev_r16(AR_DMA_MMADDR_EA) & 0x03FFu) << 16) | (dev_r16(AR_DMA_MMADDR_EA + 2) & 0xFFE0u);
     uint32_t ar  = ((dev_r16(AR_DMA_ARADDR_EA) & 0x03FFu) << 16) | (dev_r16(AR_DMA_ARADDR_EA + 2) & 0xFFE0u);
@@ -478,10 +491,10 @@ static void dsp_aram_dma(void) {
     uint32_t mode = dev_r16(0xCC005012u) & 0xFu;   // AR_INFO, masked 0x7f on write (:167)
     if (!g_aram) g_aram = (uint8_t *)calloc(1, ARAM_SIZE);
     ar &= 0x03FFFFFFu; mm &= 0x03FFFFFFu;
+    if (dir) ov_dma(mm, len);                       // ARAM -> MRAM may overwrite overlay code
     while (len) {
         if (mm + 8u > g_ram_size) { if (!g_fault) g_fault = SR_F_ARAM_MM_RANGE | (mm >> 8); break; }
         if (dir) {
-            g_ov_gen++;
             if (ar < ARAM_SIZE) memcpy(g_ram + mm, g_aram + (ar & ARAM_MASK), 8);
             else                memset(g_ram + mm, 0, 8);                 // HSP None: Read -> 0
             g_aram_bytes += 8;
@@ -595,6 +608,8 @@ void gk_dev_read(uint32_t p, uint32_t n) {
         if (dev_hits(ea, n, DSP_MAIL_FROM_HI, 2)) dsp_mail_read(0);
         if (dev_hits(ea, n, DSP_MAIL_FROM_LO, 2)) dsp_mail_read(1);
     }
+    if (g_exi_model == 2) sr_exi_read(GK_HWREG_LO + off, n);
+    if (g_si_model) sr_si_read(GK_HWREG_LO + off, n);
     dev_read_models(GK_HWREG_LO + off, n);   // [2026-09-29] AR / PI / VI, below
     if (g_watchdog && g_dev_rd_n > g_watchdog) dev_watchdog();
 }
@@ -607,7 +622,9 @@ void gk_dev_write(uint32_t p, uint32_t n) {
     uint32_t ea = GK_HWREG_LO + off;
     // TWO INDEPENDENT MODELS, TWO INDEPENDENT SWITCHES.  Each `if` is its own falsifying
     // control arm; neither early-returns past the other, so a run can turn off exactly one.
-    if (g_exi_model) {
+    if (g_exi_model == 2) sr_exi_write(ea, n);   // [2026-09-29] the full EXI (sr_exi.c)
+    if (g_si_model) sr_si_write(ea, n);          // [2026-09-29] SI + controller (sr_si.c)
+    else if (g_exi_model) {
         // EXI CR of any of the three channels, written with TSTART set: complete instantly.
         if (ea >= EXI_BASE && ea < EXI_BASE + 3u * EXI_CHAN_SZ &&
             ((ea - EXI_BASE) % EXI_CHAN_SZ) == EXI_CR_OFF) {
@@ -914,6 +931,11 @@ static void vi_schedule(void) {
 // poll at :950-969 is SI's — neither is modelled; both are named in README §10.6.)
 static void vi_half_line(void) {
     uint32_t total = vi_half_lines_per_frame();
+    if (g_si_model) {                    // VideoInterface.cpp:955-1019: at the CURRENT count, before ++
+        uint32_t vtr = vi_r16(0x00), vto = vi_r32(0x0C);
+        uint32_t odd = 3u * (vtr & 0xFu) + (vto & 0x3FFu) + 2u * ((vtr >> 4) & 0x3FFu) + ((vto >> 16) & 0x3FFu);
+        sr_si_half_line(g_vi_hl, odd, g_vi_fields);
+    }
     if (++g_vi_hl >= total) { g_vi_hl = 0; g_vi_fields++; }
     uint32_t hlw = vi_r32(0x04) & 0x3FFu;
     for (uint32_t i = 0; i < 4; i++) {
@@ -1114,7 +1136,7 @@ static int di_read(uint64_t off, uint32_t mar, uint32_t len, uint32_t outlen) { 
     else if (fseeko(g_disc, (off_t)off, SEEK_SET) != 0 || fread(g_ram + p, 1, len, g_disc) != len) {
         if (!g_fault) g_fault = SR_F_DI_DISC | 3u; return 4;
     }
-    g_di_bytes += len; g_ov_gen++;
+    g_di_bytes += len; ov_dma(p, len);
     return 4;
 }
 static void di_execute(void) {                             // :783-1213 ExecuteCommand
@@ -1263,6 +1285,11 @@ static void vi_tfbl_witness(void) {                // a VI framebuffer FLIP: TFB
     }
 }
 EMSCRIPTEN_KEEPALIVE uint32_t sr_image_pe_finishes(void) { return g_pe_finishes; }
+// for sr_exi.c: PI INT_CAUSE_EXI (ProcessorInterface.h: 0x10), the scheduler, the overlay guard
+void sr_image_pi_set_exi(int on) { if (model(MODEL_IRQ)) pi_set(0x10u, on); }
+void sr_image_pi_set_si(int on)  { if (model(MODEL_IRQ)) pi_set(0x08u, on); }   // INT_CAUSE_SI
+void sr_image_ev_rearm(void) { ev_rearm(); }
+void sr_image_ov_dma(uint32_t pa, uint32_t len) { ov_dma(pa, len); }
 EMSCRIPTEN_KEEPALIVE uint32_t sr_image_pe_tokens(void)   { return g_pe_tokens; }
 EMSCRIPTEN_KEEPALIVE uint32_t sr_image_pe_drawdone_bp(void) { return g_pe_drawdone_bp; }
 EMSCRIPTEN_KEEPALIVE uint32_t sr_image_xfb_copies(void)  { return g_xfb_copies; }
@@ -1648,6 +1675,7 @@ static void ev_rearm(void) {
     if (g_dsp_int_at < at) at = g_dsp_int_at;
     if (model(MODEL_DI) && g_di_done_at < at) at = g_di_done_at;
     if (model(MODEL_PE) && g_pe_at < at) at = g_pe_at;
+    if (g_exi_model == 2) { uint64_t e = sr_exi_next_event(); if (e < at) at = e; }
     if (g_watch_next < at) at = g_watch_next;
     if (g_strict && g_fault) at = 0;          // strict: the next block head ends the run
     g_gk_event_at = at;
@@ -1694,6 +1722,7 @@ void gk_event(void) {
     if (g_dsp_int_at <= g_gk_cycles) { g_dsp_int_at = UINT64_MAX; dsp_gen_int(); }
     if (model(MODEL_DI) && g_di_done_at <= g_gk_cycles) di_finish();
     if (model(MODEL_PE) && g_pe_at <= g_gk_cycles) pe_event();
+    if (g_exi_model == 2) sr_exi_event(g_gk_cycles);
     if (model(MODEL_AI) && g_ai_next <= g_gk_cycles) ai_event();
     if (model(MODEL_AID)) {
         if (g_aid_irq_at <= g_gk_cycles) { g_aid_irq_at = UINT64_MAX; aid_gen_int(); }
@@ -2099,50 +2128,102 @@ static void tail_rec(GekkoState *st, uint32_t addr) {
     g_tail[i + 3] = gk_r32(0x800000E4u);
 }
 
-// OVERLAYS — [2026-09-29].  A REL's code is translated ahead of time from the bytes OSLink
-// produced (rel_image.py, from an SRN_DUMP of MEM1 at the call into it) and linked in with
-// -DSR_HAVE_OV; the DOL reaches it only through pointers (the prolog via module->prolog at
-// LoadRel 0x80019f20-0x80019f28, callbacks), i.e. through sr_indirect -> this hook.
-// THE GUARD: a translation stands for particular bytes at a particular address.  Before an
-// entry is trusted, the module's linked exec section is re-hashed (FNV-1a) against the hash
-// taken at translation time; the check is cached until the next DMA into MEM1 (DI read or
-// ARAM->MRAM), the ways a new module's bytes arrive here.  A mismatch REFUSES the entry, which
-// then faults as untranslated.  Not covered: code the CPU itself copies into a translated
-// range without a DMA (SAB's RELs are DVD-read in place, DI log @83309k).
+// OVERLAYS — [2026-09-29], position-independent (rel_all.py).  Every REL this build carries was
+// translated ahead of time from the DISC against a symbolic layout; the addresses it
+// materialises read g_ov_sec[module id][section], which this layer fills from the LINKED module
+// header OSLink leaves on __OSModuleInfoList (0x800030C8 head, link.next at +4, sectionInfo at
+// +0x10, each entry {offset|exec bit, size}, OSLink.c:236-247 made the offsets absolute).
+// The DOL reaches overlay code only through pointers (module->prolog, callbacks), i.e.
+// sr_indirect -> img_hook -> here.
+// THE GUARD: before an entry is trusted, the module's exec section in RAM is hashed with every
+// relocation-site word zeroed (the bitmap rel_all.py emitted) and compared with the hash of the
+// file's bytes; OSLink changes only those words, so a match means THIS module's code is what
+// sits there.  Validation is cached per module until a DMA (DI read, ARAM->MRAM) touches its
+// range.  A mismatch refuses the entry (it then faults as untranslated) and is REPORTED by name.
+uint32_t g_ov_sec[128][20];
 #ifdef SR_HAVE_OV
-extern const uint32_t sr_ov_table[][3];
-extern const uint32_t sr_ov_count;
-int sr_dispatch_ov(uint32_t addr, GekkoState *st);
+typedef struct { uint32_t id, esec, esize, hash, vexec, eoff; const uint32_t *mask; const char *name; } SrOvm;
+extern const SrOvm sr_ovm[];
+extern const uint32_t sr_ovm_n;
+int sr_ov_dispatch_sym(uint32_t v, GekkoState *st);
 #endif
-#define OV_MAX 64
-static uint32_t g_ov_checked[OV_MAX], g_ov_valid[OV_MAX], g_ov_entries = 0, g_ov_refused = 0;
-// Run-time arm (same binary): 0 = overlays off, 1 = guarded (default), 2 = guard POISONED
-// (every expected hash is treated as wrong) — the falsifying arm for the guard itself.
-static uint32_t g_ov_mode = 1;
-EMSCRIPTEN_KEEPALIVE void sr_image_set_ov(uint32_t m) { g_ov_mode = m; for (int i = 0; i < OV_MAX; i++) g_ov_checked[i] = 0; }
+#define OV_MAX 128
+static uint32_t g_ov_valid_at[OV_MAX];      // runtime exec base a module was validated at (0 = not)
+static uint32_t g_ov_entries = 0, g_ov_refused = 0, g_ov_last_refused = 0xFFFFFFFFu;
+static uint32_t g_ov_mode = 1;              // 0 off, 1 guarded, 2 guard poisoned (control arm)
+static uint32_t g_ov_missing_id = 0, g_ov_missing_hdr = 0;
 EMSCRIPTEN_KEEPALIVE uint32_t sr_image_ov_entries(void) { return g_ov_entries; }
 EMSCRIPTEN_KEEPALIVE uint32_t sr_image_ov_refused(void) { return g_ov_refused; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_ov_last_refused(void) { return g_ov_last_refused; }   // (slot << 16) | id
+EMSCRIPTEN_KEEPALIVE void sr_image_set_ov(uint32_t m) { g_ov_mode = m; memset(g_ov_valid_at, 0, sizeof g_ov_valid_at); }
+// a DMA into guest RAM: forget any validated module it overlaps
+static void ov_dma(uint32_t pa, uint32_t len) {
+#ifdef SR_HAVE_OV
+    for (uint32_t i = 0; i < sr_ovm_n && i < OV_MAX; i++) {
+        uint32_t b = g_ov_valid_at[i] & 0x01FFFFFFu;
+        if (g_ov_valid_at[i] && pa < b + sr_ovm[i].esize && b < pa + len) g_ov_valid_at[i] = 0;
+    }
+#else
+    (void)pa; (void)len;
+#endif
+}
 static int ov_dispatch(GekkoState *st, uint32_t addr) {
 #ifdef SR_HAVE_OV
     if (!g_ov_mode) return 0;
-    for (uint32_t i = 0; i < sr_ov_count && i < OV_MAX; i++) {
-        uint32_t base = sr_ov_table[i][0], size = sr_ov_table[i][1];
-        if (addr - base >= size) continue;
-        if (g_ov_checked[i] != g_ov_gen) {
-            uint32_t h = 2166136261u, p = base & 0x01FFFFFFu;
-            if (p + size > g_ram_size) return 0;
-            for (uint32_t k = 0; k < size; k++) { h ^= g_ram[p + k]; h *= 16777619u; }
-            g_ov_valid[i] = (h == sr_ov_table[i][2]) && g_ov_mode != 2; g_ov_checked[i] = g_ov_gen;
+    for (uint32_t h = gk_r32(0x800030C8u), n = 0; h && n < 64; h = gk_r32(h + 4u), n++) {
+        const uint32_t id = gk_r32(h), si = gk_r32(h + 0x10u), nsec = gk_r32(h + 0x0Cu);
+        for (uint32_t i = 0; i < sr_ovm_n && i < OV_MAX; i++) {
+            const SrOvm *m = &sr_ovm[i];
+            if (m->id != id || m->esec >= nsec) continue;
+            const uint32_t eb = gk_r32(si + 8u * m->esec) & ~1u;
+            if (addr - eb >= m->esize) continue;
+            if (g_ov_valid_at[i] != eb) {
+                uint32_t hsh = 2166136261u, p = eb & 0x01FFFFFFu;
+                if (p + m->esize > g_ram_size) return 0;
+                for (uint32_t w = 0; w < m->esize / 4u; w++) {
+                    int masked = (m->mask[w >> 5] >> (w & 31)) & 1u;
+                    for (uint32_t k = 0; k < 4; k++) { hsh ^= masked ? 0u : g_ram[p + 4 * w + k]; hsh *= 16777619u; }
+                }
+                if (hsh != m->hash || g_ov_mode == 2) {       // same id + range, different bytes
+                    g_ov_refused++; g_ov_last_refused = (i << 16) | id;
+                    continue;                                   // a duplicate id may be the other module
+                }
+                g_ov_valid_at[i] = eb;
+                for (uint32_t k = 0; k < nsec && k < 20; k++) g_ov_sec[id][k] = gk_r32(si + 8u * k) & ~1u;
+            }
+            // other linked modules' section bases too (cross-module references)
+            for (uint32_t h2 = gk_r32(0x800030C8u), n2 = 0; h2 && n2 < 64; h2 = gk_r32(h2 + 4u), n2++) {
+                uint32_t id2 = gk_r32(h2), si2 = gk_r32(h2 + 0x10u), ns2 = gk_r32(h2 + 0x0Cu);
+                if (id2 < 128 && id2 != id) for (uint32_t k = 0; k < ns2 && k < 20; k++) g_ov_sec[id2][k] = gk_r32(si2 + 8u * k) & ~1u;
+            }
+            if (!sr_ov_dispatch_sym(addr - eb + m->vexec, st)) return 0;
+            g_ov_entries++;
+            return 1;
         }
-        if (!g_ov_valid[i]) { g_ov_refused++; return 0; }
-        if (!sr_dispatch_ov(addr, st)) return 0;
-        g_ov_entries++;
-        return 1;
     }
 #else
-    (void)st; (void)addr;
+    (void)st;
 #endif
+    // not served: name the linked module the address lies in (id, and the name OSLink kept at
+    // header+0x14 / size +0x18 when the REL carries one), so a missing overlay is reported by
+    // what it IS, not only by an address
+    for (uint32_t h = gk_r32(0x800030C8u), n = 0; h && n < 64; h = gk_r32(h + 4u), n++) {
+        uint32_t si = gk_r32(h + 0x10u), ns = gk_r32(h + 0x0Cu);
+        for (uint32_t k = 0; k < ns && k < 20; k++) {
+            uint32_t b = gk_r32(si + 8u * k), sz = gk_r32(si + 8u * k + 4u);
+            if ((b & 1u) && addr - (b & ~1u) < sz) { g_ov_missing_id = gk_r32(h); g_ov_missing_hdr = h; return 0; }
+        }
+    }
     return 0;
+}
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_ov_missing_id(void)  { return g_ov_missing_id; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_ov_missing_hdr(void) { return g_ov_missing_hdr; }
+EMSCRIPTEN_KEEPALIVE const char *sr_image_ov_name(uint32_t slot) {
+#ifdef SR_HAVE_OV
+    return slot < sr_ovm_n ? sr_ovm[slot].name : "";
+#else
+    (void)slot; return "";
+#endif
 }
 
 static int img_hook(GekkoState *st, uint32_t addr) {
@@ -2163,6 +2244,10 @@ static int img_hook_inner(GekkoState *st, uint32_t addr) {
         ev_rearm();
         return 1;
     }
+#ifdef SR_HAVE_OV
+    { int sr_dol_extra_dispatch(uint32_t v, GekkoState *st);   // rel_all.py ov_dolfix.c
+      if (sr_dol_extra_dispatch(addr, st)) return 1; }
+#endif
     if (ov_dispatch(st, addr)) return 1;
     img_log(addr, IMG_D_UNIMPL);
     if (!g_fault) g_fault = SR_F_IMG_UNIMPL | (addr & 0x00ffffffu);
@@ -2238,6 +2323,8 @@ EMSCRIPTEN_KEEPALIVE uint32_t sr_image_boot(void) {
     if (model(MODEL_AR)) { dev_w16(0xCC005016u, 1); dev_w16(0xCC00501Au, 156); }  // DSP.cpp:148-149
     if (model(MODEL_VI)) vi_preset();
     if (model(MODEL_AI)) dev_w32(AI_CR_EA, g_ai_ctrl);
+    if (g_exi_model == 2) sr_exi_init((int)g_card_arm);
+    if (g_si_model) sr_si_init();
     ev_rearm();
     return sr_call(g_dol_entry);
 }

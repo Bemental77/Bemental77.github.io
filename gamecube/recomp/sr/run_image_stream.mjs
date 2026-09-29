@@ -84,7 +84,10 @@ function walk(b) {
 }
 
 await G.startGuest(M, api, { hle: 12, snapMem: +(process.env.SRS_SNAPMEM || 0),
-  idleLoop: process.env.SRS_IDLELOOP === undefined ? undefined : +process.env.SRS_IDLELOOP });
+  idleLoop: process.env.SRS_IDLELOOP === undefined ? undefined : +process.env.SRS_IDLELOOP,
+  exiModel: +(process.env.SRS_EXI || 1),
+  fmaFast: process.env.SRS_FMA === undefined ? undefined : +process.env.SRS_FMA, si: +(process.env.SRS_SI || 0),
+  input: (process.env.SRS_INPUT || '').split(',').filter(Boolean).map((x) => x.split(':').map((y) => parseInt(y))), card: process.env.SRS_CARD === undefined ? 1 : +process.env.SRS_CARD });
 const pump = G.makePump(M, api);
 const posts = [];
 let copiesInPosts = 0, badOps = 0, overruns = 0;
@@ -92,8 +95,10 @@ if (process.env.SRS_DUMP) fs.mkdirSync(process.env.SRS_DUMP, { recursive: true }
 // THE RATE SAMPLER (SRS_POSTMS=0 turns the pump off entirely, so the measurement arm does no
 // 24 MB MEM1 copies): once per second, guest kcycles credited and idle-skipped, vs wall time.
 const samples = [];
+const rdg = (ea) => { const b = api.ram() + (ea & 0x01FFFFFF), U = M.HEAPU8; return ((U[b] << 24) | (U[b + 1] << 16) | (U[b + 2] << 8) | U[b + 3]) >>> 0; };
+const modIds = () => { const o = []; for (let h = rdg(0x800030C8), n = 0; h && n < 8; h = rdg(h + 4), n++) o.push(rdg(h)); return o.join('/'); };
 const sampler = setInterval(() => {
-  samples.push({ wallMs: performance.now() - t0, kc: M._sr_image_kcycles() >>> 0,
+  samples.push({ xfb: M._sr_image_xfb_copies() >>> 0, prims: M._sr_gp_prims() >>> 0, vframes: M._sr_image_vi_frames() >>> 0, mods: modIds(), fault: '0x' + (M._sr_image_fault() >>> 0).toString(16), wallMs: performance.now() - t0, kc: M._sr_image_kcycles() >>> 0,
                  idleKc: M._sr_image_idle_kcycles() >>> 0, loopSkips: M._sr_image_idle_loop_skips ? M._sr_image_idle_loop_skips() >>> 0 : null, skips: M._sr_image_idle_skips() >>> 0, tb: M._sr_tb_calls() >>> 0, irq: M._sr_image_irq_delivered() >>> 0, fin: M._sr_image_pe_finishes() >>> 0 });
 }, 1000);
 const timer = POSTMS <= 0 ? null : setInterval(() => {
@@ -111,6 +116,11 @@ await new Promise((r) => setTimeout(r, MS));
 if (timer) clearInterval(timer);
 clearInterval(sampler);
 const guest = G.guestCounters(M);
+guest.exi = M._sr_exi_card_cmds ? { cardCmds: M._sr_exi_card_cmds() >>> 0, cardRd: M._sr_exi_card_rd() >>> 0, cardWr: M._sr_exi_card_wr() >>> 0, tstarts: M._sr_exi_tstarts() >>> 0, romReads: M._sr_exi_rom_reads() >>> 0 } : null;
+guest.ov = { entries: M._sr_image_ov_entries() >>> 0, refused: M._sr_image_ov_refused() >>> 0,
+  lastRefused: '0x' + (M._sr_image_ov_last_refused() >>> 0).toString(16),
+  missingId: M._sr_image_ov_missing_id ? M._sr_image_ov_missing_id() >>> 0 : null,
+  missingHdr: M._sr_image_ov_missing_hdr ? '0x' + (M._sr_image_ov_missing_hdr() >>> 0).toString(16) : null };
 // the window: from the first sample at or past SRS_FROM_GS guest seconds (default 1.0, i.e.
 // inside mcwarnD's frame loop) to the last sample
 const FROM = +(process.env.SRS_FROM_GS || 1.0) * 486e3;
