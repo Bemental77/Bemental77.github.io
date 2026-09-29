@@ -175,7 +175,9 @@ if [ -n "${SR_FNS:-}" ]; then
           "${HOSTARGS[@]}" --out "$OUT/sr_gen.c"
 elif [ -n "${SR_GEN:-}" ]; then
   echo "[sr] reusing pre-generated $SR_GEN"
-  cp "$SR_GEN" "$OUT/sr_gen.c"
+  # cp onto itself exits 1 under set -e; SR_GEN="$OUT/sr_gen.c" is the natural way to say
+  # "skip the translation, keep what the last run generated".
+  [ "$(cd "$(dirname "$SR_GEN")" && pwd)/$(basename "$SR_GEN")" = "$OUT/sr_gen.c" ] || cp "$SR_GEN" "$OUT/sr_gen.c"
   DISPATCH_SRC=("$OUT/sr_dispatch.c")
 else
   python3 "$SR/sr.py" --image "$DOL" --map "$REPO/dolphin_captures/sab.map" \
@@ -197,6 +199,10 @@ EXPORTS=$EXPORTS,_sr_image_log_reset,_sr_image_spr,_sr_image_set_spr,_sr_image_s
 EXPORTS=$EXPORTS,_sr_image_dev_log,_sr_image_dev_log_n,_sr_image_dev_reads,_sr_image_dev_writes
 EXPORTS=$EXPORTS,_sr_image_exi_clears,_sr_image_set_exi_model,_sr_image_set_watchdog,_sr_image_set_strict
 EXPORTS=$EXPORTS,_sr_image_set_dsp_model,_sr_image_dsp_events,_sr_image_aram_bytes
+# [2026-09-29] the next devices (sr_image.c "THE NEXT DEVICES"): one run-time switch per model
+EXPORTS=$EXPORTS,_sr_image_set_model,_sr_image_get_model,_sr_image_model_events
+EXPORTS=$EXPORTS,_sr_image_irq_delivered,_sr_image_dec_delivered,_sr_image_irq_last
+EXPORTS=$EXPORTS,_sr_image_pi_cause,_sr_image_pi_mask,_sr_image_vi_frames
 EXPORTS=$EXPORTS,_sr_os_mode,_sr_os_get_mode,_sr_os_set_msr,_sr_os_get_msr
 EXPORTS=$EXPORTS,_sr_os_trace,_sr_os_trace_n,_sr_os_trace_reset
 # THE CLOCK, READ-ONLY (plus the two writes that are legitimately the host's).
@@ -265,10 +271,60 @@ SR_OCIMFS="${SR_OCIMFS-20}"
 OCIMFS_FLAG=()
 [ -n "$SR_OCIMFS" ] && OCIMFS_FLAG=(-sBINARYEN_EXTRA_PASSES="-ocimfs=$SR_OCIMFS")
 
+# ------------------------------------------------------------------ SR_SPLIT (default 8)
+# [2026-09-29] THE ONE-TU COMPILE IS OOM-KILLED ON A 16 GB BOX.  Measured: clang -O2 on the
+# 34.9 MB sr_gen.c reached anon-rss 13,505,824 kB and the kernel's memcg OOM killer took it
+# (dmesg "Killed process 2784 (clang) ... anon-rss:13505824kB").  The generated file is
+# one header (forward declarations, ~4,700 lines) followed by one `void fn_XXXXXXXX(...) {`
+# body per function with NO file-scope statics, so it splits at function starts into
+# independent TUs with no semantic change: every fn_ is already an external symbol, and
+# cross-TU calls resolve at link exactly as intra-TU ones did.  The parts are compiled ONE
+# AT A TIME (peak memory is one part's), and a part whose text did not change and whose
+# object is newer than it and than gekko_rt.h is NOT recompiled -- so a host-layer-only
+# change (sr_image.c) relinks in minutes instead of recompiling 35 MB.
+# SR_SPLIT=1 restores the single-TU build.
+SR_SPLIT="${SR_SPLIT:-8}"
+GEN_SRC=("$OUT/sr_gen.c")
+if [ "$SR_SPLIT" -gt 1 ]; then
+  mkdir -p "$OUT/parts"
+  python3 - "$OUT/sr_gen.c" "$OUT/parts" "$SR_SPLIT" <<'PYEOF'
+import os, re, sys
+src, outdir, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+lines = open(src).read().split('\n')
+starts = [i for i, l in enumerate(lines) if re.match(r'^void fn_[0-9a-f]{8}\(GekkoState \*st\) \{$', l)]
+assert starts, 'no function bodies found -- sr.py output format changed?'
+head, body = lines[:starts[0]], lines[starts[0]:]
+rel = [s - starts[0] for s in starts]
+cuts = [rel[min(len(rel) - 1, (len(rel) * k) // n)] for k in range(n)] + [len(body)]
+for k in range(n):
+    txt = '\n'.join(head + body[cuts[k]:cuts[k + 1]]) + '\n'
+    p = os.path.join(outdir, f'sr_gen_{k}.c')
+    if not os.path.exists(p) or open(p).read() != txt:
+        open(p, 'w').write(txt)
+print(f'[sr] split {len(starts)} functions into {n} TUs', file=sys.stderr)
+PYEOF
+  GEN_SRC=()
+  for ((k = 0; k < SR_SPLIT; k++)); do
+    c="$OUT/parts/sr_gen_$k.c"; o="$OUT/parts/sr_gen_$k.o"
+    if [ ! -f "$o" ] || [ "$c" -nt "$o" ] || [ "$SR/gekko_rt.h" -nt "$o" ] || \
+       [ "$(cat "$o.flags" 2>/dev/null)" != "${SR_OPT:--O2}" ]; then
+      echo "[sr] compiling part $k/$SR_SPLIT"
+      nice -n 19 emcc ${SR_OPT:--O2} -DSR_MMIO -I"$SR" -c "$c" -o "$o" 2>"$o.log" || { tail -20 "$o.log"; exit 1; }
+      echo "${SR_OPT:--O2}" > "$o.flags"
+    else
+      echo "[sr] part $k/$SR_SPLIT up to date"
+    fi
+    GEN_SRC+=("$o")
+  done
+fi
+# SR_PARTS_ONLY=1: compile the generated parts and stop -- lets the 35 MB half build while the
+# host layer is still being edited, without linking a half-written sr_image.c.
+[ -n "${SR_PARTS_ONLY:-}" ] && { echo "[sr] SR_PARTS_ONLY: parts compiled, not linking"; exit 0; }
+
 set -x
-emcc ${SR_OPT:--O2} -DSR_MMIO -I"$SR" \
+nice -n 19 emcc ${SR_OPT:--O2} -DSR_MMIO -I"$SR" \
   ${OCIMFS_FLAG[@]+"${OCIMFS_FLAG[@]}"} \
-  "$OUT/sr_gen.c" ${DISPATCH_SRC[@]+"${DISPATCH_SRC[@]}"} "$SR/sr_driver.c" "$SR/sr_host_os.c" "$SR/sr_image.c" "$SR/sr_gx.c" \
+  "${GEN_SRC[@]}" ${DISPATCH_SRC[@]+"${DISPATCH_SRC[@]}"} "$SR/sr_driver.c" "$SR/sr_host_os.c" "$SR/sr_image.c" "$SR/sr_gx.c" \
   -o "$OUT/sab_image.mjs" \
   -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT="${SR_ENV:-web,worker}" \
   -sINVOKE_RUN=0 -sEXIT_RUNTIME=0 \
@@ -278,9 +334,12 @@ emcc ${SR_OPT:--O2} -DSR_MMIO -I"$SR" \
   -Wl,--no-entry
 set +x
 
-echo "[sr] wasm: $OUT/sab_image.wasm  $(stat -f%z "$OUT/sab_image.wasm") bytes"
-echo "[sr] md5 : $(md5 -q "$OUT/sab_image.wasm")"
-echo "[sr] mjs : $OUT/sab_image.mjs  $(stat -f%z "$OUT/sab_image.mjs") bytes"
+# stat -f%z / md5 -q are the macOS spellings; fall back to the GNU ones.
+fsize() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1"; }
+fmd5()  { md5 -q "$1" 2>/dev/null || md5sum "$1" | cut -d' ' -f1; }
+echo "[sr] wasm: $OUT/sab_image.wasm  $(fsize "$OUT/sab_image.wasm") bytes"
+echo "[sr] md5 : $(fmd5 "$OUT/sab_image.wasm")"
+echo "[sr] mjs : $OUT/sab_image.mjs  $(fsize "$OUT/sab_image.mjs") bytes"
 
 # ---------------------------------------------------------------- OVER-CAP BODY GATE
 # emcc exits 0 on a module no browser will load (see the -ocimfs note above), and the

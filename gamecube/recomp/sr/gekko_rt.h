@@ -89,7 +89,26 @@ extern uint32_t g_hid0;
 // that then polls the timebase raises SR_F_TB_STALL by name instead of spinning on
 // a plausible wrong number.
 extern uint64_t g_gk_cycles;
+#ifdef SR_MMIO
+// THE EVENT CHECK — -DSR_MMIO (the whole-image boot) ONLY, so every fixture, golden and
+// slice build keeps the one-line gk_retire below byte for byte.  A device that acts at a
+// guest TIME (a VI line, the decrementer, a DMA that completes) and an interrupt that is
+// waiting for MSR[EE] both need a point in the emitted code where the host may run; the
+// basic-block head is that point, because it is where the retirement drive already is
+// and because every guest register is in *st there (sr.py keeps no C locals across
+// blocks).  It is the same granularity Dolphin's JIT checks at: CoreTiming events and
+// external exceptions are serviced between blocks (Jit64 WriteExceptionExit /
+// CoreTiming::Advance), never inside one.  g_gk_event_at is the earliest cycle anything
+// is due; UINT64_MAX when nothing is, which makes this one compare per block.
+extern uint64_t g_gk_event_at;
+void gk_event(void);
+static inline void gk_retire(uint32_t cycles){
+    g_gk_cycles += cycles;
+    if (g_gk_cycles >= g_gk_event_at) gk_event();
+}
+#else
 static inline void gk_retire(uint32_t cycles){ g_gk_cycles += cycles; }
+#endif
 
 static inline uint32_t gk_phys(uint32_t ea) { return ea & 0x03FFFFFFu; }
 

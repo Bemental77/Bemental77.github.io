@@ -402,32 +402,65 @@ static int dev_hits(uint32_t ea, uint32_t n, uint32_t reg, uint32_t rsz) {
     return ea < reg + rsz && reg < ea + n;
 }
 
-// The ARAM DMA, zero-latency.  Dolphin's Do_ARAM_DMA byte-swaps on the way in and out
-// because its ARAM buffer is host-endian; MEM1 here is already GUEST bytes (gk_r32
-// assembles big-endian on every access), so ARAM holds guest bytes too and the transfer
-// is a memcpy.  The 0x3ffffff masks are Dolphin's, and its comment gives the reason:
-// "Incoming data into ARAM is mirrored every 64MB (verified on real HW)".
+// The ARAM DMA, zero-latency — [2026-09-29] NOW A TRANSCRIPTION OF Do_ARAM_DMA, not a memcpy.
+// Every rule below is ~/dolphin-upstream (0cd3bb89c2) Source/Core/Core/HW/DSP.cpp, and each
+// one matters to __ARChecksize (0x800f6320), which is the first code after OSInit that reads
+// ARAM BACK and decides the machine's ARAM size from what it sees:
+//   * the address registers are MASKED on write (DSP.cpp:166-201 directly_mapped_vars):
+//     _H halves keep 0x03ff, _L halves keep 0xffe0, CNT_H also keeps the dir bit 0x8000.
+//   * both addresses are masked to 0x3ffffff ("mirrored every 64MB", :476-477 / :525-526).
+//   * ARAddr < m_aram.size (16 MB on GC) goes to ARAM at `ARAddr & mask` (:479 / :528).
+//   * ARAddr >= size on GC goes to the HSP (:506-515 / :558-567).  With no HSP device —
+//     MAIN_HSP_DEVICE defaults to None (Config/MainSettings.cpp:252-253) — HSPManager::Read
+//     RETURNS 0 and Write is DISCARDED (HSP/HSP.cpp:27-40).  So an out-of-range ARAM->MRAM
+//     transfer WRITES ZEROS into MRAM.  The previous model dropped it and left MRAM alone,
+//     which is exactly the difference an ARAM size probe measures.
+//   * AR_INFO mode 4 (`(m_aram_info.Hex & 0xf) == 4`) additionally mirrors an MRAM->ARAM
+//     write below 0x400000 to +0x400000 (:537-546).  __ARChecksize runs in that mode.
+//   * the transfer walks in 8-byte steps and leaves MMAddr/ARAddr advanced and count 0
+//     (:501-503 / :553-555); those are the values the registers READ BACK afterwards.
+// MEM1 here is already GUEST byte order and so is ARAM, so each 8-byte step is a copy; the
+// swap64 pairs in Dolphin exist because its ARAM is host-endian.  Completion is immediate
+// (the reference schedules CompleteARAM `(count/32)*246` ticks later, :464-465) — the same
+// zero-latency statement the DSPReset and TSTART models make.  MMAddr beyond MEM1 is not
+// memory this runtime has (Dolphin's Memory::Write_U64 would hit its own unmapped path), so
+// such a step RAISES a named fault instead of guessing.
+#define SR_F_ARAM_MM_RANGE 0xC6A00000u
+static void irq_update(void);   // THE INTERRUPT LAYER, below
+static void dev_w32(uint32_t ea, uint32_t v) {
+    dev_w16(ea, v >> 16); dev_w16(ea + 2, v & 0xFFFFu);
+}
 static void dsp_aram_dma(void) {
-    uint32_t mm  = dev_r32(AR_DMA_MMADDR_EA) & 0x03FFFFFFu;
-    uint32_t ar  = dev_r32(AR_DMA_ARADDR_EA) & 0x03FFFFFFu;
-    uint32_t cnt = dev_r32(AR_DMA_CNT_EA);
+    uint32_t mm  = ((dev_r16(AR_DMA_MMADDR_EA) & 0x03FFu) << 16) | (dev_r16(AR_DMA_MMADDR_EA + 2) & 0xFFE0u);
+    uint32_t ar  = ((dev_r16(AR_DMA_ARADDR_EA) & 0x03FFu) << 16) | (dev_r16(AR_DMA_ARADDR_EA + 2) & 0xFFE0u);
+    uint32_t cnt = ((dev_r16(AR_DMA_CNT_EA) & 0x83FFu) << 16) | (dev_r16(AR_DMA_CNT_LO_EA) & 0xFFE0u);
     uint32_t len = cnt & 0x7FFFFFFFu;      // DSP.h:114-122  count:31, dir:1
     uint32_t dir = cnt >> 31;              // 0: MRAM -> ARAM   1: ARAM -> MRAM
+    uint32_t mode = dev_r16(0xCC005012u) & 0xFu;   // AR_INFO, masked 0x7f on write (:167)
     if (!g_aram) g_aram = (uint8_t *)calloc(1, ARAM_SIZE);
-    // A transfer that would leave either buffer is DROPPED, not clamped, and the status
-    // bit is still raised — because that is what the hardware does with an out-of-range
-    // ARAddr too (Dolphin falls through to the HSP path and moves nothing).  The bytes
-    // actually moved are counted separately so "the DMA completed" and "the DMA moved
-    // data" can never be confused for one another from the outside.
-    if (g_aram && len && mm + len <= g_ram_size && (ar & ARAM_MASK) + len <= ARAM_SIZE) {
-        if (dir) memcpy(g_ram + mm, g_aram + (ar & ARAM_MASK), len);
-        else     memcpy(g_aram + (ar & ARAM_MASK), g_ram + mm, len);
-        g_aram_bytes += len;
+    ar &= 0x03FFFFFFu; mm &= 0x03FFFFFFu;
+    while (len) {
+        if (mm + 8u > g_ram_size) { if (!g_fault) g_fault = SR_F_ARAM_MM_RANGE | (mm >> 8); break; }
+        if (dir) {
+            if (ar < ARAM_SIZE) memcpy(g_ram + mm, g_aram + (ar & ARAM_MASK), 8);
+            else                memset(g_ram + mm, 0, 8);                 // HSP None: Read -> 0
+            g_aram_bytes += 8;
+        } else if (ar < ARAM_SIZE) {
+            if (mode == 4u && ar < 0x400000u)
+                memcpy(g_aram + ((ar + 0x400000u) & ARAM_MASK), g_ram + mm, 8);
+            memcpy(g_aram + (ar & ARAM_MASK), g_ram + mm, 8);
+            g_aram_bytes += 8;
+        }                                                                 // else HSP None: discarded
+        mm += 8; ar += 8; len -= 8;
     }
+    dev_w32(AR_DMA_MMADDR_EA, mm);
+    dev_w32(AR_DMA_ARADDR_EA, ar);
+    dev_w32(AR_DMA_CNT_EA, (dir << 31) | len);
     g_dsp_ctrl = (g_dsp_ctrl & ~DSPC_DMASTATE) | DSPC_ARAM;
     dev_w16(DSP_CONTROL_EA, g_dsp_ctrl);
     g_dsp_events++;
     dev_log(AR_DMA_CNT_EA, DEVK_DSP_ARAM);
+    irq_update();
 }
 
 // DSP_CONTROL write.  The guest has already stored its 16 bits into the window; this
@@ -466,6 +499,7 @@ static void dsp_ctrl_write(void) {
     }
     g_dsp_ctrl = eff;
     dev_w16(DSP_CONTROL_EA, eff);
+    irq_update();      // the mask bits may have changed: DSP.cpp:291 UpdateInterrupts()
 }
 
 // DSP -> CPU mailbox read, staged into the window before the guest's load completes.
@@ -496,6 +530,9 @@ static void dev_watchdog(void) {
                              ' — the guest is spinning on a device register'); }, g_dev_rd_n);
 }
 
+static void dev_read_models(uint32_t ea, uint32_t n);
+static void dev_write_models(uint32_t ea, uint32_t n);
+
 void gk_dev_read(uint32_t p, uint32_t n) {
     uint32_t off = p - GK_HWREG_OFF;
     if (off >= GK_HWREG_SIZE) return;
@@ -514,6 +551,7 @@ void gk_dev_read(uint32_t p, uint32_t n) {
         if (dev_hits(ea, n, DSP_MAIL_FROM_HI, 2)) dsp_mail_read(0);
         if (dev_hits(ea, n, DSP_MAIL_FROM_LO, 2)) dsp_mail_read(1);
     }
+    dev_read_models(GK_HWREG_LO + off, n);   // [2026-09-29] AR / PI / VI, below
     if (g_watchdog && g_dev_rd_n > g_watchdog) dev_watchdog();
 }
 
@@ -549,6 +587,490 @@ void gk_dev_write(uint32_t p, uint32_t n) {
         if (dev_hits(ea, n, DSP_CONTROL_EA, 2))    dsp_ctrl_write();
         if (dev_hits(ea, n, AR_DMA_CNT_LO_EA, 2))  dsp_aram_dma();
     }
+    dev_write_models(ea, n);                 // [2026-09-29] AR / PI / VI, below
+}
+
+// ======================================================= [2026-09-29] THE NEXT DEVICES
+//
+// Everything in this block was added because the WHOLE-IMAGE boot (build_image.sh --all,
+// SR_SPLIT build, run under node by run_image_node.mjs) reached it — README §10.6 has the
+// trajectory, one row per wall.  Each piece is SWITCHABLE AT RUN TIME through
+// sr_image_set_model(id, on), so each claim has its falsifying control arm on ONE binary
+// with ONE md5, the discipline the EXI and DSP models already follow.  Citations are to
+// ~/dolphin-upstream at 0cd3bb89c2 (Source/Core/Core/...) and to the public SDK decomp
+// github.com/doldecomp/dolsdk2001 (src/...).
+//
+//   id 1  AR    ARAM controller registers that are not the DMA: AR_MODE is READ-ONLY and
+//               reads 1 ("ARAM Controller has init'd", HW/DSP.cpp:148, registered with
+//               WMASK_NONE at :183); AR_REFRESH powers on at 156 (:149) and keeps 0x07ff of
+//               a write (:168, :187).  __ARChecksize (0x800f6320) spins on
+//               `while (!(__DSPRegs[11] & 1))` (dolsdk2001 src/ar/ar.c:222) — i.e. on AR_MODE.
+//   id 2  RM    RealMode(fn) at 0x800e8a4c, the `rfi`-into-physical-mode trampoline that
+//               __OSInitMemoryProtection (0x800e8a64) uses to run Config24MB/Config48MB.  The
+//               translator refuses it (mtspr SRR0).  It is INTERPRETED from the shipped words,
+//               with a whitelist of the opcodes those BAT-configuration bodies are made of;
+//               any other opcode RAISES.  Nothing is skipped: the BAT writes land in the SPR
+//               file, the MSR round trip is performed, and the final `rfi` must return to the
+//               caller's LR or it raises too.
+//   id 3  IRQ   THE INTERRUPT PATH.  PI INTSR/INTMR as the device (ProcessorInterface.cpp),
+//               the external-interrupt and decrementer exceptions ENTERED the way the CPU and
+//               DOLSDK's first-level vector enter them (PowerPC.cpp:583-632, dolsdk2001
+//               src/os/OS.c:344-420), the guest's OWN second-level handler and dispatcher run
+//               translated, and the handler's closing OSLoadContext(context) performed as a
+//               real non-returning context load (setjmp/longjmp to the live delivery frame).
+//   id 4  PIREV PI_FLIPPER_REV reads FLIPPER_REV_C = 0x246500B1 (ProcessorInterface.cpp:29,
+//               :136).  OSInit adds its top nibble to BootInfo->consoleType
+//               (dolsdk2001 src/os/OS.c OSInit, `__PIRegs[11] & 0xF0000000`).
+//   id 5  VI    the video interface's TIMING and its four display interrupts: the Preset
+//               register values (VideoInterface.cpp:95-178), the half-line counter advanced by
+//               RETIRED GUEST CYCLES at GetTicksPerHalfLine() (:760-773), IR_INT raised at
+//               VCT/HCT (:989-1001) and the PI VI line (:435-447).  NO PIXELS: no XFB is
+//               scanned out and nothing is drawn — this is the clock the guest's
+//               VIWaitForRetrace sleeps on, not a display.
+//   id 6  AI    the audio interface's streaming SAMPLE COUNTER and its interrupt
+//               (AudioInterface.cpp, whole file): AICR, AISCNT, AIIT, clocked by RETIRED GUEST
+//               CYCLES at 486e6 * divisor / 108e6 cycles per sample (divisors 2248 / 3372 on GC,
+//               :348-356; Mixer.h:58).  __AI_SRC_INIT (dolsdk2001 src/ai/ai.c:365-421) measures
+//               the counter's edges against OSGetTime, so the counter and the timebase MUST be
+//               the same clock — which they are: both are g_gk_cycles.  NO SAMPLES: no stream
+//               audio is decoded and nothing is mixed.
+#include <setjmp.h>
+#define MODEL_AR    1u
+#define MODEL_RM    2u
+#define MODEL_IRQ   3u
+#define MODEL_PIREV 4u
+#define MODEL_VI    5u
+#define MODEL_AI    6u
+static uint32_t g_model_on = (1u << MODEL_AR) | (1u << MODEL_RM) | (1u << MODEL_IRQ) |
+                             (1u << MODEL_PIREV) | (1u << MODEL_VI) | (1u << MODEL_AI);
+static int model(uint32_t id) { return (g_model_on >> id) & 1u; }
+static uint32_t g_model_events[8];
+static void ev_rearm(void);
+EMSCRIPTEN_KEEPALIVE void sr_image_set_model(uint32_t id, uint32_t on) {
+    if (id >= 8) return;
+    if (on) g_model_on |= 1u << id; else g_model_on &= ~(1u << id);
+    ev_rearm();
+}
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_get_model(uint32_t id) { return id < 8 ? model(id) : 0; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_model_events(uint32_t id) { return id < 8 ? g_model_events[id] : 0; }
+
+// ---------------------------------------------------------------- fault codes (0xC6Bx)
+#define SR_F_RM_OPCODE    0xC6B00000u   // RealMode target contains an opcode outside the whitelist
+#define SR_F_RM_RETURN    0xC6B10000u   // RealMode's final rfi did not return to the caller's LR
+#define SR_F_IRQ_HANDLER  0xC6B20000u   // exception handler body is not the OS_EXCEPTION_SAVE_GPRS shape
+#define SR_F_IRQ_UNRECOV  0xC6B30000u   // SRR1[RI] clear: DOLSDK would take OSDefaultExceptionHandler
+#define SR_F_IRQ_NOLOAD   0xC6B40000u   // the guest dispatcher RETURNED without OSLoadContext(context)
+#define SR_F_IRQ_NOTRANS  0xC6B50000u   // the dispatcher is not a translated function
+#define SR_F_PI_WIDTH     0xC6B60000u   // a non-32-bit access to a PI register (Dolphin: InvalidWrite)
+
+// ------------------------------------------------------------------------ PI
+#define PI_INTSR_EA   0xCC003000u
+#define PI_INTMR_EA   0xCC003004u
+#define PI_REV_EA     0xCC00302Cu
+#define PI_CAUSE_DSP  0x00000040u
+#define PI_CAUSE_VI   0x00000100u
+// ProcessorInterface.cpp:50-57 Init(): mask 0, cause = INT_CAUSE_RST_BUTTON | INT_CAUSE_VI.
+static uint32_t g_pi_cause = 0x00010000u | PI_CAUSE_VI;
+static uint32_t g_pi_mask  = 0;
+static uint32_t g_ext_pending = 0;   // PowerPC's `Exceptions & EXCEPTION_EXTERNAL_INT`
+static uint32_t g_dec_pending = 0;   // PowerPC's `Exceptions & EXCEPTION_DECREMENTER`
+// ProcessorInterface.cpp:149-156 UpdateException, transcribed: the pending flag is SET or
+// CLEARED from cause & mask each time either changes, and CheckExternalExceptions clears it
+// when the exception is TAKEN (PowerPC.cpp:602).
+static void pi_update(void) {
+    g_ext_pending = (g_pi_cause & g_pi_mask) != 0;
+    ev_rearm();
+}
+static void pi_set(uint32_t bit, int on) {       // ProcessorInterface::SetInterrupt
+    if (on) g_pi_cause |= bit; else g_pi_cause &= ~bit;
+    pi_update();
+}
+// DSP.cpp:372-382 UpdateInterrupts: each status bit's mask is the bit directly to its left.
+static void irq_update(void) {
+    if (!model(MODEL_IRQ)) return;
+    pi_set(PI_CAUSE_DSP, ((g_dsp_ctrl >> 1) & g_dsp_ctrl & DSPC_INT_BITS) != 0);
+}
+
+// ------------------------------------------------------------------------ VI
+#define VI_BASE 0xCC002000u
+static uint32_t g_vi_hl = 0;              // m_half_line_count, VideoInterface.cpp:174
+static uint64_t g_vi_next = UINT64_MAX;   // cycle of the next half-line Update()
+static uint32_t g_vi_fields = 0;          // half-line counter wraps (one per FRAME)
+static uint32_t vi_r16(uint32_t o) { return dev_r16(VI_BASE + o); }
+static uint32_t vi_r32(uint32_t o) { return dev_r32(VI_BASE + o); }
+// VideoInterface.cpp:760-773: 2 * ticks/s / CLOCK_FREQUENCIES[clock & 1] * HLW; the
+// frequencies are 27 MHz and 54 MHz and ticks/s is the 486 MHz CPU clock.
+static uint32_t vi_ticks_per_half_line(void) {
+    uint32_t per_sample = 2u * 486000000u / ((vi_r16(0x6C) & 1u) ? 54000000u : 27000000u);
+    return per_sample * (vi_r32(0x04) & 0x3FFu);
+}
+// :467-477 GetHalfLinesPerEvenField/OddField.
+static uint32_t vi_half_lines_per_frame(void) {
+    uint32_t vtr = vi_r16(0x00), equ = vtr & 0xFu, acv = (vtr >> 4) & 0x3FFu;
+    uint32_t vto = vi_r32(0x0C), vte = vi_r32(0x10);
+    return (3u * equ + (vte & 0x3FFu) + 2u * acv + ((vte >> 16) & 0x3FFu)) +
+           (3u * equ + (vto & 0x3FFu) + 2u * acv + ((vto >> 16) & 0x3FFu));
+}
+// :435-447 UpdateInterrupts — IR_INT (bit 31) && IR_MASK (bit 28) of any of the four.
+static void vi_update_irq(void) {
+    int line = 0;
+    for (uint32_t i = 0; i < 4; i++) {
+        uint32_t r = vi_r32(0x30 + 4 * i);
+        if ((r & 0x80000000u) && (r & 0x10000000u)) line = 1;
+    }
+    if (model(MODEL_IRQ)) pi_set(PI_CAUSE_VI, line);
+}
+static void vi_schedule(void) {
+    uint32_t t = vi_ticks_per_half_line();
+    g_vi_next = (model(MODEL_VI) && t) ? g_gk_cycles + t : UINT64_MAX;
+}
+// :905-1002 Update(), the parts that are not presentation: advance and wrap the counter,
+// then raise IR_INT on a VCT/HCT match.  (BeginField/EndField present the XFB, and the SI
+// poll at :950-969 is SI's — neither is modelled; both are named in README §10.6.)
+static void vi_half_line(void) {
+    uint32_t total = vi_half_lines_per_frame();
+    if (++g_vi_hl >= total) { g_vi_hl = 0; g_vi_fields++; }
+    uint32_t hlw = vi_r32(0x04) & 0x3FFu;
+    for (uint32_t i = 0; i < 4; i++) {
+        uint32_t r = vi_r32(0x30 + 4 * i);
+        uint32_t hct = r & 0x7FFu, vct = (r >> 16) & 0x7FFu;
+        uint32_t target = hct > hlw ? 1u : 0u;
+        if (1u + g_vi_hl / 2u == vct && (g_vi_hl & 1u) == target) {
+            dev_w16(VI_BASE + 0x30 + 4 * i, (r >> 16) | 0x8000u);
+            g_model_events[MODEL_VI]++;
+        }
+    }
+    vi_update_irq();
+}
+static void vi_preset(void) {        // VideoInterface.cpp:95-178, NTSC (SAB is GSNE8P)
+    dev_w16(VI_BASE + 0x00, 0x0006);           // EQU 6, ACV 0
+    dev_w16(VI_BASE + 0x02, 0x0001);           // ENB 1, FMT 0 (NTSC)
+    dev_w32(VI_BASE + 0x04, 0x476901ADu);      // HLW 429, HCE 105, HCS 71
+    dev_w32(VI_BASE + 0x08, 0x02EA5140u);      // HSY 64, HBE640 162, HBS640 373
+    dev_w32(VI_BASE + 0x0C, 0x000501F6u);      // odd  PRB 502, PSB 5
+    dev_w32(VI_BASE + 0x10, 0x000401F7u);      // even PRB 503, PSB 4
+    dev_w32(VI_BASE + 0x14, 0x410C410Cu);      // burst odd  BS0 12 BE0 520 BS2 12 BE2 520
+    dev_w32(VI_BASE + 0x18, 0x40ED40EDu);      // burst even BS0 13 BE0 519 BS2 13 BE2 519
+    dev_w32(VI_BASE + 0x30, 0x110701AEu);      // DI0 HCT 430 VCT 263 MASK 1
+    dev_w32(VI_BASE + 0x34, 0x10010001u);      // DI1 HCT 1   VCT 1   MASK 1
+    dev_w16(VI_BASE + 0x6C, 0x0001);           // m_clock = IsNTSC(region) = 54 MHz
+    g_vi_hl = 0;
+    vi_schedule();
+}
+
+// ------------------------------------------------------------------------ AI (id 6)
+#define AI_CR_EA   0xCC006C00u
+#define AI_CNT_EA  0xCC006C08u
+#define AI_IT_EA   0xCC006C0Cu
+#define PI_CAUSE_AI 0x00000020u
+#define AICR_PSTAT 0x01u
+#define AICR_AISFR 0x02u
+#define AICR_MSK   0x04u
+#define AICR_INT   0x08u
+#define AICR_VLD   0x10u
+#define AICR_SCRST 0x20u
+#define AICR_AIDFR 0x40u
+// AudioInterface.cpp Init (:193-204): control 0, then SetAISSampleRate(48k) sets AISFR=1 and
+// SetAIDSampleRate(32k) sets AIDFR=1 — so the register powers on as 0x42.
+static uint32_t g_ai_ctrl = AICR_AISFR | AICR_AIDFR;
+static uint32_t g_ai_count = 0, g_ai_it = 0;
+static uint64_t g_ai_last = 0, g_ai_next = UINT64_MAX;
+// m_cpu_cycles_per_sample = 486e6 * divisor / 108e6 (:187-189); divisor 2248 at 48 kHz and
+// 3372 at "32 kHz" on GC (:348-356).
+static uint64_t ai_cps(void) { return (g_ai_ctrl & AICR_AISFR) ? 10116u : 15174u; }
+static void ai_update_irq(void) {                            // :96-100
+    if (model(MODEL_IRQ)) pi_set(PI_CAUSE_AI, (g_ai_ctrl & AICR_INT) && (g_ai_ctrl & AICR_MSK));
+}
+static void ai_increase(uint32_t amount) {                   // :108-123 IncreaseSampleCount
+    if (!(g_ai_ctrl & AICR_PSTAT)) return;
+    uint32_t old = g_ai_count + 1u;
+    g_ai_count += amount;
+    if ((uint32_t)(g_ai_it - old) <= (uint32_t)(g_ai_count - old)) {
+        g_ai_ctrl |= AICR_INT; g_model_events[MODEL_AI]++;
+        ai_update_irq();
+    }
+}
+static uint64_t ai_period(void) {                            // :125-133 GetAIPeriod
+    uint64_t period = ai_cps() * (uint32_t)(g_ai_it - g_ai_count);
+    uint64_t s_period = ai_cps() * 108000000u / ((g_ai_ctrl & AICR_AISFR) ? 2248u : 3372u);
+    return period == 0 ? s_period : (period < s_period ? period : s_period);
+}
+static void ai_schedule(void) { g_ai_next = g_gk_cycles + ai_period(); }
+static void ai_event(void) {                                 // :140-155 Update
+    g_ai_next = UINT64_MAX;
+    if (!(g_ai_ctrl & AICR_PSTAT)) return;
+    uint64_t diff = g_gk_cycles - g_ai_last;
+    if (diff > ai_cps()) {
+        uint32_t samples = (uint32_t)(diff / ai_cps());
+        g_ai_last += (uint64_t)samples * ai_cps();
+        ai_increase(samples);
+    }
+    ai_schedule();
+}
+static uint32_t ai_count_read(void) {                        // :289-296, INCLUDING its quirk:
+    // a STOPPED counter reads back sample_counter + m_last_cpu_time / cps.  That is the
+    // reference's behaviour as written and it is transcribed, not corrected.
+    uint64_t streamed = (g_ai_ctrl & AICR_PSTAT) ? (g_gk_cycles - g_ai_last) : g_ai_last;
+    return g_ai_count + (uint32_t)(streamed / ai_cps());
+}
+static void ai_cr_write(uint32_t v) {                        // :213-277
+    uint32_t c = g_ai_ctrl;
+    c = (c & ~(AICR_MSK | AICR_VLD)) | (v & (AICR_MSK | AICR_VLD));
+    c = (c & ~(AICR_AISFR | AICR_AIDFR)) | (v & (AICR_AISFR | AICR_AIDFR));
+    if ((v & AICR_PSTAT) != (g_ai_ctrl & AICR_PSTAT)) {
+        c = (c & ~AICR_PSTAT) | (v & AICR_PSTAT);
+        g_ai_ctrl = c;
+        g_ai_last = g_gk_cycles;
+        ai_schedule();
+    }
+    if (v & AICR_INT)   c &= ~AICR_INT;
+    if (v & AICR_SCRST) { g_ai_count = 0; g_ai_last = g_gk_cycles; }
+    g_ai_ctrl = c;
+    ai_update_irq();
+}
+
+// ------------------------------------------------------------- device read / write
+static void dev_read_models(uint32_t ea, uint32_t n) {
+    if (model(MODEL_AR) && dev_hits(ea, n, 0xCC005016u, 2)) dev_w16(0xCC005016u, 1);
+    if (model(MODEL_PIREV) && dev_hits(ea, n, PI_REV_EA, 4)) dev_w32(PI_REV_EA, 0x246500B1u);
+    if (model(MODEL_IRQ) && dev_hits(ea, n, PI_INTSR_EA, 4)) dev_w32(PI_INTSR_EA, g_pi_cause);
+    if (model(MODEL_AI)) {
+        if (dev_hits(ea, n, AI_CR_EA, 4))  dev_w32(AI_CR_EA, g_ai_ctrl);
+        if (dev_hits(ea, n, AI_CNT_EA, 4)) dev_w32(AI_CNT_EA, ai_count_read());
+        if (dev_hits(ea, n, AI_IT_EA, 4))  dev_w32(AI_IT_EA, g_ai_it);
+    }
+    if (model(MODEL_VI)) {
+        // VideoInterface.cpp:317-334: vertical = 1 + hl/2; horizontal from the tick offset
+        // into the current line.  The horizontal position needs m_ticks_last_line_start,
+        // which this model does not keep — a read of it RAISES rather than returning a guess.
+        if (dev_hits(ea, n, VI_BASE + 0x2C, 2)) dev_w16(VI_BASE + 0x2C, 1u + g_vi_hl / 2u);
+        if (dev_hits(ea, n, VI_BASE + 0x2E, 2) && !g_fault) g_fault = SR_F_IMG_UNIMPL | 0xCC202Eu;
+    }
+}
+static void dev_write_models(uint32_t ea, uint32_t n) {
+    if (model(MODEL_AR)) {
+        if (dev_hits(ea, n, 0xCC005016u, 2)) dev_w16(0xCC005016u, 1);              // WMASK_NONE
+        if (dev_hits(ea, n, 0xCC00501Au, 2)) dev_w16(0xCC00501Au, dev_r16(0xCC00501Au) & 0x07FFu);
+    }
+    if (model(MODEL_IRQ)) {
+        if (dev_hits(ea, n, PI_INTSR_EA, 4) || dev_hits(ea, n, PI_INTMR_EA, 4)) {
+            if (n != 4 || (ea != PI_INTSR_EA && ea != PI_INTMR_EA)) {
+                if (!g_fault) g_fault = SR_F_PI_WIDTH | (ea & 0xFFFFu);
+            } else if (ea == PI_INTSR_EA) {                // ProcessorInterface.cpp:71-75
+                g_pi_cause &= ~dev_r32(PI_INTSR_EA);
+                dev_w32(PI_INTSR_EA, g_pi_cause);
+                pi_update();
+            } else {                                       // :77-82
+                g_pi_mask = dev_r32(PI_INTMR_EA);
+                pi_update();
+            }
+        }
+    }
+    if (model(MODEL_AI) && ea >= AI_CR_EA && ea < AI_CR_EA + 0x10u) {
+        // All four AI registers are registered 32-bit only (AudioInterface.cpp:213-315).
+        if (n != 4 || (ea & 3u)) { if (!g_fault) g_fault = SR_F_PI_WIDTH | (ea & 0xFFFFu); }
+        else if (ea == AI_CR_EA)  ai_cr_write(dev_r32(AI_CR_EA));
+        else if (ea == AI_CNT_EA) { g_ai_count = dev_r32(AI_CNT_EA); g_ai_last = g_gk_cycles; ai_schedule(); }
+        else if (ea == AI_IT_EA)  { g_ai_it = dev_r32(AI_IT_EA); ai_schedule(); }
+        ev_rearm();
+    }
+    if (model(MODEL_VI) && ea >= VI_BASE && ea < VI_BASE + 0x80u) {
+        // A write to any DI HI half re-evaluates the line (:343-369).  Clearing IR_INT is
+        // what the guest's handler does (dolsdk2001 src/vi/vi.c:164-181).
+        for (uint32_t i = 0; i < 4; i++)
+            if (dev_hits(ea, n, VI_BASE + 0x30 + 4 * i, 2)) vi_update_irq();
+        if (dev_hits(ea, n, VI_BASE + 0x02, 2) && (dev_r16(VI_BASE + 0x02) & 2u)) {
+            // :392-417: RST clears every interrupt register and the RST bit itself.
+            for (uint32_t i = 0; i < 4; i++) dev_w32(VI_BASE + 0x30 + 4 * i, 0);
+            dev_w16(VI_BASE + 0x02, dev_r16(VI_BASE + 0x02) & ~2u);
+            vi_update_irq();
+        }
+        // A timing register change takes effect at the next half line, as in Dolphin, where
+        // UpdateParameters only changes the period CoreTiming uses from then on.
+        if (g_vi_next == UINT64_MAX) vi_schedule();
+    }
+}
+
+// ------------------------------------------------------------------- DELIVERY
+// THE ONE PLACE A GUEST EXCEPTION IS ENTERED.  Called from gk_event() at a basic-block head
+// (gekko_rt.h), where every guest register is in *st.
+//
+// What hardware + DOLSDK do, and what this does for each step:
+//   CPU (PowerPC.cpp:583-632)  SRR1 = MSR & 0x87C0FFFF; MSR &= ~0x04EF36; jump to the vector.
+//                              External beats decrementer (:590 before :617).  Done here.
+//   __OSEVStart (OS.c:348-420) r4 = *(0xC0) (physical context); store r3,r4,r5; state |= EXC;
+//                              store CR LR CTR XER SRR0 SRR1; check SRR1[RI]; r3 = exception;
+//                              r4 = *(0xD4) (virtual context); jump to OSExceptionTable[exc]
+//                              (0x80003000).  Done here, reading the table the guest's own
+//                              OSInit filled.  RI clear RAISES instead of running
+//                              OSDefaultExceptionHandler.
+//   2nd-level handler          ExternalInterruptHandler / DecrementerExceptionHandler are
+//                              OS_EXCEPTION_SAVE_GPRS (dolsdk2001 include/dolphin/os/
+//                              OSException.h:35-53) then `b <dispatcher>`.  They contain mfspr
+//                              GQRn, which the translator refuses, so their 18 words are
+//                              CHECKED against that template (any mismatch raises), performed,
+//                              and the branch target is DECODED from the 19th word.
+//   dispatcher                 __OSDispatchInterrupt / DecrementerExceptionCallback RUN
+//                              TRANSLATED, on the interrupted stack, as on hardware.
+//   OSLoadContext(context)     the dispatcher's last act; never returns.  img_host() below
+//                              longjmps back here when it sees it for THIS context, and the
+//                              registers are loaded by sr_host_os.c's ctx_load — the same
+//                              transcription (RAS fixup included) the context tier uses.
+// ⚠ NOT MODELLED, stated: SRR0.  sr.py keeps no program counter, so the saved SRR0 is written
+// as 0.  Only code that inspects a saved context's SRR0 could see it; OSLoadContext's RAS
+// fixup (0x800e78ac..0x800e78bc) is the one reader on this path, and 0 is outside that range.
+// FPRs are SNAPSHOTTED and restored around the handler: DOLSDK saves them lazily through the
+// FP-unavailable exception (MSR[FP] is cleared by the entry above) and this runtime does not
+// raise that exception, so a handler that uses the FPU must not be able to clobber the
+// interrupted thread's registers.
+static uint32_t g_irq_depth = 0, g_irq_ctx = 0, g_irq_delivered = 0, g_irq_last = 0;
+static uint32_t g_dec_delivered = 0;
+static jmp_buf  g_irq_jmp;
+static const uint32_t SAVE_GPRS_TEMPLATE[18] = {
+    0x90040000u, 0x90240004u, 0x90440008u, 0xBCC40018u,
+    0x7C11E2A6u, 0x900401A8u, 0x7C12E2A6u, 0x900401ACu, 0x7C13E2A6u, 0x900401B0u,
+    0x7C14E2A6u, 0x900401B4u, 0x7C15E2A6u, 0x900401B8u, 0x7C16E2A6u, 0x900401BCu,
+    0x7C17E2A6u, 0x900401C0u };
+
+static int irq_enter(GekkoState *st, uint32_t exc) {
+    uint32_t msr = sr_os_get_msr();
+    uint32_t handler = gk_r32(0x80003000u + 4u * exc);
+    for (int i = 0; i < 18; i++)
+        if (gk_r32(handler + 4u * (uint32_t)i) != SAVE_GPRS_TEMPLATE[i]) {
+            if (!g_fault) g_fault = SR_F_IRQ_HANDLER | (handler & 0xFFFFu);
+            return 0;
+        }
+    uint32_t b = gk_r32(handler + 72u);
+    if ((b & 0xFC000003u) != 0x48000000u) { if (!g_fault) g_fault = SR_F_IRQ_HANDLER | 0xFFFFu; return 0; }
+    uint32_t disp = handler + 72u + (uint32_t)(((int32_t)(b << 6)) >> 6 & ~3);
+
+    uint32_t srr1 = msr & 0x87C0FFFFu;
+    if (!(srr1 & 0x2u)) { if (!g_fault) g_fault = SR_F_IRQ_UNRECOV | (exc & 0xFFFFu); return 0; }
+    uint32_t pctx = 0x80000000u | gk_r32(0x800000C0u);   // OS_CURRENTCONTEXT_PADDR
+    uint32_t vctx = gk_r32(0x800000D4u);
+    // __OSEVStart
+    gk_w32(pctx + OSCTX_GPR(3), st->gpr[3]);
+    gk_w32(pctx + OSCTX_GPR(4), st->gpr[4]);
+    gk_w32(pctx + OSCTX_GPR(5), st->gpr[5]);
+    gk_w16(pctx + OSCTX_STATE, (uint16_t)(gk_r16(pctx + OSCTX_STATE) | OSCTX_STATE_EXC));
+    gk_w32(pctx + OSCTX_CR, st->cr);   gk_w32(pctx + OSCTX_LR, st->lr);
+    gk_w32(pctx + OSCTX_CTR, st->ctr); gk_w32(pctx + OSCTX_XER, st->xer);
+    gk_w32(pctx + OSCTX_SRR0, 0);      gk_w32(pctx + OSCTX_SRR1, srr1);
+    // OS_EXCEPTION_SAVE_GPRS(r4 = virtual context)
+    gk_w32(vctx + OSCTX_GPR(0), st->gpr[0]);
+    gk_w32(vctx + OSCTX_GPR(1), st->gpr[1]);
+    gk_w32(vctx + OSCTX_GPR(2), st->gpr[2]);
+    for (int r = 6; r < 32; r++) gk_w32(vctx + OSCTX_GPR(r), st->gpr[r]);
+    for (int q = 1; q < 8; q++)  gk_w32(vctx + OSCTX_GQR(q), st->gqr[q]);
+
+    uint64_t fsave0[32], fsave1[32]; uint32_t fpscr = st->fpscr;
+    memcpy(fsave0, st->ps0, sizeof fsave0); memcpy(fsave1, st->ps1, sizeof fsave1);
+
+    sr_os_set_msr((msr & ~0x04EF36u) | 0x30u);     // exception entry, then __OSEVStart's rfi
+    st->gpr[3] = exc; st->gpr[4] = vctx; st->gpr[5] = handler;
+    uint32_t saved_depth_ctx = g_irq_ctx;
+    g_irq_depth++; g_irq_ctx = vctx; g_irq_last = exc;
+    int loaded = setjmp(g_irq_jmp);
+    if (!loaded) {
+        if (!sr_dispatch(disp, st)) { if (!g_fault) g_fault = SR_F_IRQ_NOTRANS | (disp & 0xFFFFu); }
+        else if (!g_fault) g_fault = SR_F_IRQ_NOLOAD | (disp & 0xFFFFu);
+        g_irq_depth--; g_irq_ctx = saved_depth_ctx;
+        return 0;
+    }
+    g_irq_depth--; g_irq_ctx = saved_depth_ctx;
+    sr_os_ctx_load(st, vctx);                      // registers + MSR <- SRR1 (OSContext.c:281)
+    memcpy(st->ps0, fsave0, sizeof fsave0); memcpy(st->ps1, fsave1, sizeof fsave1);
+    st->fpscr = fpscr;
+    return 1;
+}
+
+// The handler's OSLoadContext for the context THIS layer entered with: never returns.
+static int irq_load_context(GekkoState *st) {
+    if (!g_irq_depth || st->gpr[3] != g_irq_ctx) return 0;
+    longjmp(g_irq_jmp, 1);
+}
+
+uint64_t g_gk_event_at = 0;     // 0: the first block head evaluates everything once
+static void ev_rearm(void) {
+    uint64_t at = UINT64_MAX;
+    if (model(MODEL_IRQ)) {
+        uint64_t d = sr_dec_due_at();
+        if (d < at) at = d;
+        if ((sr_os_get_msr() & 0x8000u) && (g_ext_pending || g_dec_pending)) at = 0;
+    }
+    if (model(MODEL_VI) && g_vi_next < at) at = g_vi_next;
+    if (model(MODEL_AI) && g_ai_next < at) at = g_ai_next;
+    g_gk_event_at = at;
+}
+
+void gk_event(void) {
+    GekkoState *st = sr_state();
+    if (model(MODEL_VI)) {
+        if (g_vi_next == UINT64_MAX) vi_schedule();
+        while (g_vi_next <= g_gk_cycles) {
+            uint64_t due = g_vi_next;
+            vi_half_line();
+            uint32_t t = vi_ticks_per_half_line();
+            g_vi_next = t ? due + t : UINT64_MAX;
+        }
+    }
+    if (model(MODEL_AI) && g_ai_next <= g_gk_cycles) ai_event();
+    if (model(MODEL_IRQ)) {
+        if (sr_dec_take()) g_dec_pending = 1;
+        if (!g_fault && (sr_os_get_msr() & 0x8000u)) {
+            // PowerPC.cpp:590 before :617 — external first.
+            if (g_ext_pending) {
+                g_ext_pending = 0;
+                if (irq_enter(st, 4)) { g_irq_delivered++; g_model_events[MODEL_IRQ]++; }
+            } else if (g_dec_pending) {
+                g_dec_pending = 0;
+                if (irq_enter(st, 8)) { g_dec_delivered++; g_model_events[MODEL_IRQ]++; }
+            }
+        }
+    }
+    ev_rearm();
+}
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_irq_delivered(void) { return g_irq_delivered; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_dec_delivered(void) { return g_dec_delivered; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_irq_last(void)      { return g_irq_last; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_pi_cause(void)      { return g_pi_cause; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_pi_mask(void)       { return g_pi_mask; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_image_vi_frames(void)     { return g_vi_fields; }
+
+// ------------------------------------------------------------------- REAL MODE (id 2)
+// Interpret RealMode (0x800e8a4c) and the function it `rfi`s into, from the shipped words.
+static int img_realmode(GekkoState *st) {
+    uint32_t pc = 0x800e8a4cu, srr0 = 0, srr1 = 0, ret = st->lr;
+    for (int step = 0; step < 256; step++) {
+        uint32_t w = gk_r32(pc), op = w >> 26;
+        uint32_t rd = (w >> 21) & 31u, ra = (w >> 16) & 31u;
+        uint32_t sprn = ((w >> 16) & 31u) | (((w >> 11) & 31u) << 5), xo = (w >> 1) & 0x3FFu;
+        int32_t  si = (int16_t)(w & 0xFFFFu);
+        if (op == 14)      st->gpr[rd] = (ra ? st->gpr[ra] : 0) + (uint32_t)si;          // addi
+        else if (op == 15) st->gpr[rd] = (ra ? st->gpr[ra] : 0) + ((uint32_t)si << 16);  // addis
+        else if (op == 24) st->gpr[ra] = st->gpr[rd] | (w & 0xFFFFu);                    // ori
+        else if (op == 21 && !(w & 1u)) {                                               // rlwinm
+            uint32_t sh = (w >> 11) & 31u, mb = (w >> 6) & 31u, me = (w >> 1) & 31u;
+            st->gpr[ra] = gk_rotl32(st->gpr[rd], sh) & gk_mask(mb, me);
+        }
+        else if (w == 0x4C00012Cu) { }                                                   // isync
+        else if (op == 31 && xo == 83)  st->gpr[rd] = sr_os_get_msr();                   // mfmsr
+        else if (op == 31 && xo == 339 && sprn == 8) st->gpr[rd] = st->lr;               // mflr
+        else if (op == 31 && xo == 467 && sprn == 26) srr0 = st->gpr[rd];                // mtsrr0
+        else if (op == 31 && xo == 467 && sprn == 27) srr1 = st->gpr[rd];                // mtsrr1
+        else if (op == 31 && xo == 467 && sprn >= 528 && sprn <= 543) g_spr[sprn] = st->gpr[rd]; // BATs
+        else if (w == 0x4C000064u) {                                                     // rfi
+            sr_os_set_msr(srr1);
+            pc = srr0 | 0x80000000u;             // physical -> the flat MEM1 alias
+            if (pc == ret) { g_model_events[MODEL_RM]++; return 1; }
+            if (srr0 & 0x80000000u) { if (!g_fault) g_fault = SR_F_RM_RETURN | (srr0 & 0xFFFFu); return 1; }
+            continue;
+        }
+        else { if (!g_fault) g_fault = SR_F_RM_OPCODE | (pc & 0xFFFFu); return 1; }
+        pc += 4;
+    }
+    if (!g_fault) g_fault = SR_F_RM_RETURN | 0xFFFFu;
+    return 1;
 }
 
 EMSCRIPTEN_KEEPALIVE uint32_t *sr_image_dev_log(void)   { return g_dev_log; }
@@ -819,6 +1341,20 @@ static int img_host(GekkoState *st, uint32_t addr) {
         return 1;
     }
 
+    // ---- [2026-09-29] 0x800e8a4c RealMode — see THE NEXT DEVICES, id 2.
+    case 0x800e8a4cu:
+        if (!model(MODEL_RM)) return 0;
+        img_realmode(st);
+        img_log(addr, IMG_D_REAL);
+        return 1;
+    // ---- [2026-09-29] 0x800e56bc OSLoadContext, for the context an exception was entered
+    // with (THE NEXT DEVICES, id 3).  Any OTHER context falls through to sr_host_os.c, i.e.
+    // a thread switch is still that layer's business and still refused outside SR_OS_HLE.
+    case 0x800e56bcu:
+        if (!model(MODEL_IRQ) || !g_irq_depth || st->gpr[3] != g_irq_ctx) return 0;
+        img_log(addr, IMG_D_REAL);
+        return irq_load_context(st);        // longjmps; does not return for our context
+
     default:
         return 0;
     }
@@ -885,6 +1421,13 @@ EMSCRIPTEN_KEEPALIVE int sr_image_init(void) {
 EMSCRIPTEN_KEEPALIVE uint32_t sr_image_boot(void) {
     if (!g_dol_loaded) return SR_F_IMG_NO_DOL;
     g_fault = 0;
+    // [2026-09-29] power-on device state, applied HERE (not in sr_image_init) so the run-time
+    // model switches set between init and boot decide it — each OFF arm boots with the
+    // window exactly as the previous build left it (all zero).
+    if (model(MODEL_AR)) { dev_w16(0xCC005016u, 1); dev_w16(0xCC00501Au, 156); }  // DSP.cpp:148-149
+    if (model(MODEL_VI)) vi_preset();
+    if (model(MODEL_AI)) dev_w32(AI_CR_EA, g_ai_ctrl);
+    ev_rearm();
     return sr_call(g_dol_entry);
 }
 

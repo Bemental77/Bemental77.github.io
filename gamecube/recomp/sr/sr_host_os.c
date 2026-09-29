@@ -353,6 +353,22 @@ static void dec_check(void) {
     tr(SR_EV_DEC_EXC, (uint32_t)sr_tb_read(), g_dec_exceptions);
 }
 
+// [2026-09-29] THE DECREMENTER AS AN EVENT the whole-image layer can DELIVER.  dec_check()
+// above counts a due exception and rolls the register over; it runs only from
+// sr_tb_credit_cycles(), which a --retire build never calls (gk_retire feeds g_gk_cycles
+// directly).  sr_image.c's event check (gekko_rt.h gk_event, -DSR_MMIO only) asks WHEN the
+// next one is due and then TAKES it through the same dec_check(), so there is still exactly
+// one implementation of DecrementerCallback (SystemTimers.cpp:139-143) and one counter.
+uint64_t sr_dec_due_at(void) { return g_dec_armed ? g_dec_due_cycles : UINT64_MAX; }
+int sr_dec_take(void) {
+    uint32_t before = g_dec_exceptions;
+    dec_check();
+    return g_dec_exceptions != before;
+}
+// OSLoadContext's register half for a host that has just run an exception handler and is
+// performing the handler's own OSLoadContext(context) — sr_image.c's interrupt delivery.
+void sr_os_ctx_load(GekkoState *st, uint32_t ctx) { ctx_load(st, ctx); }
+
 void sr_tb_credit_cycles(uint64_t cycles) {
     g_gk_cycles += cycles;
     g_tb_dry_reads = 0;
