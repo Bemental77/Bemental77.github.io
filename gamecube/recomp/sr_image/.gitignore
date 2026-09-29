@@ -26,3 +26,4 @@ sab_fst.bin
 sr_gen.c
 sr_dispatch.c
 skiplist.json
+guest/guest_config.json

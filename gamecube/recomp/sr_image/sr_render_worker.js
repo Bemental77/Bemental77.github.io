@@ -354,7 +354,18 @@ async function runGuestArm(msg, base) {
     disc = await loadDisc(mod, GC_DISC_BYTES, fetchSabParts(romRoot));
   }
   const apploader = stageApploader(mod, api, mod.HEAPU8.subarray(disc.ptr, disc.ptr + disc.size));
-  await startGuest(mod, api, { hle: 12 });
+  // THE MACHINE, read from the image directory: `guest_config.json` next to sab_image.mjs, e.g.
+  // {"exiModel":2,"card":1,"si":1,"input":[[650,656,4096],...]} — the memory card (sr_exi.c) and
+  // controller (sr_si.c) the City Escape runs use.  ABSENT = the old defaults (TSTART-only EXI,
+  // no card, no SI), so a guest directory without the file boots exactly as before.  It lives with
+  // the build rather than in the query string because the page does not forward new parameters.
+  let gcfg = {};
+  try {
+    const r = await fetch(base + 'guest_config.json', { cache: 'no-store' });
+    if (r.ok) gcfg = await r.json();
+  } catch (_) { gcfg = {}; }
+  say('status', { text: 'guest config: ' + JSON.stringify(Object.assign({}, gcfg, { input: (gcfg.input || []).length })) });
+  await startGuest(mod, api, Object.assign({ hle: 12 }, gcfg));
   // THE CONTROL ARM (?srcapture=0, same wasm): the guest runs identically but the frame ring is
   // off, so nothing is posted.  A picture in that arm did not come from this stream.
   if (msg.capture === 0) mod._sr_gx_set_capture(0);
