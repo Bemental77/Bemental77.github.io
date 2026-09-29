@@ -32,6 +32,8 @@ public:
   static WGPUGfx* GetInstance() { return static_cast<WGPUGfx*>(g_gfx.get()); }
   WGPUDevice GetDevice() const { return m_device; }
   WGPUQueue GetQueue() const { return m_queue; }
+  // Present readbacks issued but not yet completed by the GPU (recomp backpressure ticket).
+  u32 GetReadbacksInFlight() const { return static_cast<u32>(m_readback_in_flight); }
 
   // [WGPU-PROF — TEMP] texture-upload accumulation: WGPUTexture::Load adds, ShowImage reads+resets.
   static double s_prof_tex_load_ms;
