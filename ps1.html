@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+  <script src="/lib/debugreport.js"></script>
   <script src="/lib/capability.js?v=e25dca87"></script>
   <script src="/lib/xboxinput.js"></script>
   <!-- ONLINE PLAY IS DETERMINISTIC LOCKSTEP. Only /lib/netplay.js is loaded.
@@ -1402,11 +1403,45 @@
     var r = ROMS[ROM_INDEX] || ROMS[0];
     return r.label + ':' + (r.size | 0);
   }
+
+  // ⚠ THE HOST CHOOSES THE INPUT DELAY FROM THE MEASURED LINK, BEFORE IT
+  // DECLARES. This page used to leave the engine's default (3 frames, 50 ms) in
+  // force whatever the link was, and let the engine's stall-driven raise find
+  // the right number one step every few seconds. Measured with
+  // tools/netplay_device_matrix.mjs, two Chrome processes over a 100 ms one-way
+  // link: 3 -> 5 -> 7 -> 8 -> 10 -> 11 -> 12 -> 13 over the first 42 s of play,
+  // and the room delivered 0.84x with ~115 audio dropouts/min while it climbed
+  // (/tmp/npdm/after1, PS1 arm d). dreamcast.html has done this since its
+  // lsChooseDelay(); this is the same measurement: one RTT sample per seated
+  // peer (rttReport), Lockstep.recommendDelay(), and a relayed room's own
+  // measurement as the floor. It only ever RAISES the default — a fast link
+  // keeps its low delay — and the engine still adjusts from there.
+  async function lsChooseDelay(sess) {
+    try {
+      var ls = sess && sess.ls;
+      if (!ls || !ls.isHost || ls.rollback || typeof sess.rttReport !== 'function') return null;
+      var r = await sess.rttReport(600);
+      var relayFloor = (sess.relay && sess.relay.active && sess.relay.delayFrames) ? (sess.relay.delayFrames | 0) : 0;
+      var want = (r && r.recommendedDelay != null) ? Math.max(1, Math.min(30, r.recommendedDelay | 0)) : 0;
+      want = Math.max(want, relayFloor);
+      if (!(want > ls.delay)) return ls.delay;
+      var was = ls.delay;
+      ls.delay = want;
+      pageLog('[lockstep] input delay ' + was + ' -> ' + want + ' frames — chosen from the worst measured RTT '
+        + (r && r.worstMs != null ? Math.round(r.worstMs) : '?') + ' ms' + (relayFloor ? ' (relay floor ' + relayFloor + ')' : ''));
+      return want;
+    } catch (e) { pageLog('[lockstep] delay choice failed, keeping the default: ' + ((e && e.message) || e)); }
+    return null;
+  }
   function lsDeclareReady() {
     if (!NET.session || !LS.armed) return;
-    try { NET.session.setReady(true, lsDisc()); } catch (e) {
-      pageLog('[lockstep] ⚠ start barrier refused: ' + ((e && e.message) || e));
-    }
+    var sess = NET.session;
+    lsChooseDelay(sess).then(function () {
+      if (NET.session !== sess || !LS.armed) return;
+      try { sess.setReady(true, lsDisc()); } catch (e) {
+        pageLog('[lockstep] ⚠ start barrier refused: ' + ((e && e.message) || e));
+      }
+    });
   }
 
   // ---- THE FEED LOOP ---------------------------------------------------------
