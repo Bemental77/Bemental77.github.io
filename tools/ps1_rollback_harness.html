@@ -1,0 +1,203 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ps1 rollback harness</title>
+<body>
+<pre id="log">booting…</pre>
+<script>
+// Harness for tools/ps1_rollback_probe.mjs. Is the PS1 worker's raw-memory
+// savestate EXACT, and is a core that keeps rolling back indistinguishable
+// from one that never guessed?
+//
+//   core A (reference): gated, runs frames 0..N with the TRUE pads, straight
+//          through ('netStep'), no savestates at all.
+//   core B (rollback):  gated, runs the same frames through 'netRbStep' the way
+//          a rollback room does — each frame on a PREDICTION of the pads
+//          (repeat-last of what has "arrived", with a random lateness of
+//          0..maxLag frames), and whenever the truth arrives and contradicts a
+//          frame already run, it rewinds to the earliest wrong frame and
+//          re-simulates up to the present.
+// Every `every` frames, B fingerprints its CONFIRMED end state (the slot after
+// frame k: psxM + psxH + VRAM) and A fingerprints its live state after the
+// same frame. Any mismatch is a desync.
+const logEl = document.getElementById('log');
+const lines = [];
+function log(s) { lines.push(s); logEl.textContent = lines.slice(-60).join('\n'); if (window.__state) window.__state.progress = s; }
+window.__log = () => lines.slice();
+
+function mkWorker() {
+  const w = new Worker('/ps1/ps1Wasm/dist/wasmpsx_worker.js?netgate=1&v=' + Date.now());
+  const st = { w, ready: false, booted: false, prints: [], q: [], frames: 0 };
+  w.onmessage = (e) => {
+    const d = e.data;
+    if (d.cmd === 'workerReady') st.ready = true;
+    else if (d.cmd === 'print') st.prints.push(String(d.txt));
+    else if (d.cmd === 'render') st.w.postMessage({ cmd: 'return_vram', vram: d.vram }, [d.vram.buffer]);
+    else if (d.cmd === 'SoundFeedStreamData') st.w.postMessage({ cmd: 'return_pSound', pSound: d.pSound }, [d.pSound.buffer]);
+    else if (d.cmd === 'coreRate') st.coreRate = d;
+    const r = st.q.length && st.q[0].want === d.cmd ? st.q.shift() : null;
+    if (r) r.res(d);
+  };
+  w.onerror = (e) => st.prints.push('WORKER ERROR ' + (e.message || e));
+  return st;
+}
+// Replies come back in message order, so a FIFO of expected reply types works.
+function ask(st, want, msg, transfer) {
+  return new Promise((res) => { st.q.push({ want, res }); st.w.postMessage(msg, transfer || []); });
+}
+function post(st, want, msg, transfer) { return ask(st, want, msg, transfer); }
+
+// Deterministic pad script: KeyStatus bytes (active-low) for port 0 and 1.
+function truePad(f, port) {
+  let x = Math.imul((f >> 3) + 1 + port * 7919, 2654435761) >>> 0;
+  let b0 = 0xFF, b1 = 0xFF;
+  // Start early on (skips intros), then a mix of dpad/face buttons that changes every 8 frames.
+  if (f >= 200 && f < 206) b0 &= ~(1 << 3);
+  if (f >= 400 && f < 406) b1 &= ~(1 << 6);
+  if (f > 500) { b0 &= ~((x & 0xF0)); b1 &= ~((x >>> 8) & 0xF0); }
+  return [b0, b1];
+}
+function padBuf(img) {  // img: [[b0,b1],[b0,b1]] -> 48-byte PADSTATE pair
+  const a = new Uint8Array(48);
+  for (let p = 0; p < 2; p++) {
+    const o = p * 24;
+    a[o + 4] = 0; a[o + 5] = 0x41; a[o + 6] = img[p][0]; a[o + 7] = img[p][1];
+    a[o + 8] = 0xFF; a[o + 9] = 0xFF; a[o + 10] = 0x80; a[o + 11] = 0x80; a[o + 12] = 0x80; a[o + 13] = 0x80;
+  }
+  return a.buffer;
+}
+
+window.__state = { started: false, done: false, result: null, error: null, progress: '' };
+window.__start = function (opts) {
+  if (window.__state.started) return true;
+  window.__state.started = true;
+  window.__run(opts).then((r) => { window.__state.result = r; window.__state.done = true; },
+                          (e) => { window.__state.error = String((e && e.stack) || e); window.__state.done = true; });
+  return true;
+};
+
+async function fetchDisc(url, maxBytes) {
+  const resp = await fetch(url);
+  const ds = resp.body.pipeThrough(new DecompressionStream('gzip'));
+  const rd = ds.getReader();
+  const parts = []; let n = 0;
+  while (n < maxBytes) { const { done, value } = await rd.read(); if (done) break; parts.push(value); n += value.length; }
+  try { rd.cancel(); } catch (e) {}
+  const out = new Uint8Array(Math.min(n, maxBytes)); let o = 0;
+  for (const p of parts) { const t = Math.min(p.length, out.length - o); out.set(p.subarray(0, t), o); o += t; if (o >= out.length) break; }
+  return out;
+}
+
+window.__run = async function (opts) {
+  const N = opts.frames | 0, EVERY = opts.every | 0, MAXLAG = opts.maxLag | 0, RING = opts.ring | 0, WARM = opts.warm | 0;
+  const P2 = opts.p2 !== false;   // is port 2 the "remote" (predicted) one
+  log('fetching disc chunk ' + opts.url);
+  const disc = await fetchDisc(opts.url, opts.bytes);
+  log('disc bytes ' + disc.length);
+  const A = mkWorker(), B = mkWorker();
+  const t0 = performance.now();
+  while (performance.now() - t0 < 120000 && !(A.ready && B.ready)) await new Promise(r => setTimeout(r, 50));
+  if (!(A.ready && B.ready)) return { ok: false, reason: 'workers never ready' };
+  for (const st of [A, B]) {
+    const c = disc.slice();
+    const r = await ask(st, 'netBooted', { cmd: 'netBoot', name: 'disc.bin', buf: c.buffer }, [c.buffer]);
+    if (!r.ok) return { ok: false, reason: 'boot failed: ' + r.err };
+  }
+  log('booted; coreRate A=' + JSON.stringify(A.coreRate) + ' B=' + JSON.stringify(B.coreRate));
+  if (!A.coreRate || !A.coreRate.take) return { ok: false, reason: 'takeover not active', prints: A.prints.slice(-10) };
+
+  // Warm both cores identically (plain gated frames) so the checked window is gameplay-ish.
+  for (let f = 0; f < WARM; f += 60) {
+    const n = Math.min(60, WARM - f);
+    const pb = padBuf([truePad(f, 0), truePad(f, 1)]);
+    const pb2 = pb.slice(0);
+    await Promise.all([ask(A, 'netFrame', { cmd: 'netStep', frame: f, count: n, states: pb }, [pb]),
+                       ask(B, 'netFrame', { cmd: 'netStep', frame: f, count: n, states: pb2 }, [pb2])]);
+  }
+  // NOTE: warm frames use one pad per 60-frame batch on BOTH cores — identical, so fine.
+  const bench = await ask(B, 'netSnapBenchResult', { cmd: 'netSnapBench', reps: 30 });
+  log('snap bench: bytes=' + bench.bytes + ' roundtrip-identical=' + bench.same);
+
+  const init = await ask(B, 'netRbReady', { cmd: 'netRbInit', frame: WARM, ring: RING });
+  if (!init.ok) return { ok: false, reason: 'rbInit: ' + init.err };
+
+  // B's simulated engine.
+  const used = new Map();            // frame -> JSON of image used
+  let known = WARM - 1;              // remote input known for frames <= known
+  let rollbacks = 0, resimFrames = 0, maxDepth = 0;
+  const stepMs = [], resimStepMs = [];
+  const checks = []; let mismatches = 0, missing = 0;
+  const truthImg = (f) => [truePad(f, 0), truePad(f, 1)];
+  const predImg = (f) => { const k = Math.min(f, known); return P2 ? [truePad(f, 0), truePad(k, 1)] : [truePad(k, 0), truePad(f, 1)]; };
+  let rng = 12345; const rand = () => (rng = Math.imul(rng, 1103515245) + 12345 >>> 0) / 4294967296;
+  const pendingHash = [];            // confirmed frames to fingerprint on B
+  let confirmedTo = WARM - 1;
+
+  for (let f = WARM; f < WARM + N; f++) {
+    // remote input arrives with random lateness
+    const lag = Math.floor(rand() * (MAXLAG + 1));
+    const newKnown = Math.max(known, f - 1 - lag);
+    known = newKnown;
+    // earliest wrong frame among those run
+    let from = -1;
+    for (let k = confirmedTo + 1; k < f; k++) {
+      if (k > known) break;
+      if (used.get(k) !== JSON.stringify(truthImg(k))) { from = k; break; }
+    }
+    const resim = [];
+    if (from >= 0) {
+      for (let k = from; k < f; k++) {
+        // NEGATIVE CONTROL (opts.broken): re-simulate on the SAME wrong guess, i.e. a
+        // rollback that restores but does not correct. It must be caught as a mismatch,
+        // or the fingerprint is not sensitive to input and a pass means nothing.
+        const img = opts.broken ? JSON.parse(used.get(k)) : predImg(k);
+        used.set(k, JSON.stringify(opts.broken ? predImg(k) : img));   // broken: the engine BELIEVES it corrected
+        resim.push({ frame: k, states: padBuf(img) });
+      }
+      rollbacks++; resimFrames += resim.length; if (resim.length > maxDepth) maxDepth = resim.length;
+    }
+    // frames <= known are now final
+    while (confirmedTo < Math.min(known, f - 1)) {
+      confirmedTo++;
+      if ((confirmedTo - WARM) % EVERY === EVERY - 1) pendingHash.push(confirmedTo);
+    }
+    const img = predImg(f); used.set(f, JSON.stringify(img));
+    const hash = pendingHash.splice(0);
+    const transfer = [];
+    const sb = padBuf(img); transfer.push(sb); for (const r of resim) transfer.push(r.states);
+    const rb = await ask(B, 'netFrame', { cmd: 'netRbStep', frame: f, states: sb, resim, hash, ring: RING }, transfer);
+    if (rb.err) return { ok: false, reason: 'B step ' + f + ': ' + rb.err, checks };
+    (resim.length ? resimStepMs : stepMs).push(rb.ms);
+    for (const h of rb.hashes) {
+      if (h.hash == null) { missing++; continue; }
+      checks.push({ frame: h.frame, b: h.hash });
+    }
+    // A: straight truth
+    const ta = padBuf(truthImg(f));
+    await ask(A, 'netFrame', { cmd: 'netStep', frame: f, count: 1, states: ta }, [ta]);
+    const want = checks.filter(c => c.a === undefined && c.frame <= f);
+    // A can only hash its LIVE state, so hash at exactly frame k: we request A's hash right after frame k.
+    if ((f - WARM) % EVERY === EVERY - 1) {
+      const ah = await ask(A, 'netLiveHashResult', { cmd: 'netLiveHash' });
+      (A.hashes || (A.hashes = new Map())).set(f, ah.hash);
+    }
+    for (const c of checks) if (c.a === undefined && A.hashes && A.hashes.has(c.frame)) {
+      c.a = A.hashes.get(c.frame); if (c.a !== c.b) { mismatches++; log('*** MISMATCH frame ' + c.frame + ' A=' + c.a + ' B=' + c.b); }
+    }
+    if ((f - WARM) % 300 === 0) log('frame ' + f + ' rollbacks=' + rollbacks + ' resim=' + resimFrames + ' checks=' + checks.length + ' mism=' + mismatches);
+  }
+  const stats = await ask(B, 'netRbStatsResult', { cmd: 'netRbStats' });
+  const pct = (a, p) => { if (!a.length) return null; const s = a.slice().sort((x, y) => x - y); return +s[Math.min(s.length - 1, Math.floor(p * s.length))].toFixed(2); };
+  const compared = checks.filter(c => c.a !== undefined).length;
+  return {
+    ok: mismatches === 0 && compared > 0 && missing === 0,
+    frames: N, warm: WARM, maxLag: MAXLAG, ring: RING,
+    compared, mismatches, missing, rollbacks, resimFrames, maxDepth,
+    snapBytes: bench.bytes, snapSaveMs: { p50: pct(bench.saveMs, .5), p90: pct(bench.saveMs, .9) }, snapLoadMs: { p50: pct(bench.loadMs, .5), p90: pct(bench.loadMs, .9) }, snapRoundTripIdentical: bench.same,
+    stepMs: { p50: pct(stepMs, .5), p90: pct(stepMs, .9), n: stepMs.length },
+    resimStepMs: { p50: pct(resimStepMs, .5), p90: pct(resimStepMs, .9), n: resimStepMs.length },
+    worker: stats, coreRate: A.coreRate,
+    sample: checks.slice(0, 4),
+  };
+};
+</script>
+</body>

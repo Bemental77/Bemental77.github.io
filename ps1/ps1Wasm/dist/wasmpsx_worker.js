@@ -37,6 +37,7 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
     if (d < schedMin) schedMin = d;
     if (d > schedMax) schedMax = d;
     if (GATE) return;                 // the page drives frames instead
+    if (TAKE) return paceSchedule();  // solo: the ONE governor (see paceSchedule)
     return origSched.apply(this, arguments);
   };
 
@@ -198,7 +199,9 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
     if (!GATE) return;
     try {
       if (typeof soundbuffer_ptr !== 'undefined' && soundbuffer_ptr) {
-        var v = Module.getValue(soundbuffer_ptr, 'i32') - GATED_DRAIN;
+        // One frame of 44.1 kHz stereo s16 at the DISC's rate (coreHz: 59.94
+        // NTSC / 50 PAL once the takeover has read Config.PsxType).
+        var v = Module.getValue(soundbuffer_ptr, 'i32') - (TAKE ? Math.round(44100 * 4 / coreHz) : GATED_DRAIN);
         Module.setValue(soundbuffer_ptr, v > 0 ? v : 0, 'i32');
       }
     } catch (e) {}
@@ -213,7 +216,228 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
   // the gate the pump does nothing; 'netUngate' clears GATE first, so handing
   // the console back still restarts it.
   var origMainloop = pcsx_mainloop;
-  pcsx_mainloop = function () { if (GATE) return; return origMainloop.apply(this, arguments); };
+  pcsx_mainloop = function () {
+    if (GATE) return;
+    if (TAKE) { runFrame(); return; }
+    return origMainloop.apply(this, arguments);
+  };
+
+  // ══ ONE GOVERNOR, REGION-CORRECT, AND A FAST EXACT SAVESTATE ═══════════════
+  //
+  // (1) THE RATE BUG. Measured solo with the page's own start path, the worker's
+  // one_iter count per second (one_iter = exactly one guest vblank:
+  // psxcounters.c:293-298 raises DoGPUUpdate once per frame):
+  //     Monster Rancher 2 (SLUS00917) ...... 49.99 /s   <- NTSC disc at 50
+  //     Metal Gear Solid D1 (SLUS00594) .... 59.06 /s
+  //     Harry Potter (SLUS01415) ........... 60.31 /s
+  //     Legend of Dragoon D1 (SCUS94491) ... 59.66 /s
+  // EVERY disc in ps1.html's ROMS[] is NTSC-U (SYSTEM.CNF BOOT=SLUS_/SCUS_, the
+  // license sector reads "Sony Computer Entertainment Amer ica"), and the core
+  // agrees: CheckCdrom() leaves Config.PsxType NTSC (libpcsxcore/misc.c:362-365;
+  // 0x8A3AF = 566191 in this build reads 0), so each one_iter is 1/60 s of guest
+  // CPU time. The 50 came from the GPU PLUGIN's limiter, not the console:
+  // dfxvideo SetAutoFrameCap() paces at `PSXDisplay.PAL ? 50 : 59.94`
+  // (fps.c:359; the select at 0x8AD30 = 568624 in this build), and PSXDisplay.PAL
+  // is whatever bit 3 of the guest's last GP1(08h) was (gpu.c:956). Monster
+  // Rancher 2's first GP1(08h) sets it (GPUSTAT read 0xd4922200 at vblank 316:
+  // bit 20 set) — so the limiter slowed an NTSC console to 50 Hz, i.e. the
+  // guest ran at 0.833x. The other three titles merely wandered ±1.5% around
+  // 59.94 because the limiter is a busy-wait on a millisecond clock that loses
+  // every oversleep for good.
+  //
+  // (2) THE LIMITER IS ALSO A DETERMINISM LEAK. dfxvideo's frame SKIPPER
+  // (fps.c FrameSkip, on by default here: pcsx_init stores UseFrameSkip=1 at
+  // 0x8A954 = 567508) decides from gettimeofday whether the next frame's
+  // primitives are DRAWN (gpu.c:1292 `if(bSkipNextFrame) primFunc=primTableSkip`).
+  // So VRAM — guest state — depended on host time: exactly what rollback cannot
+  // have (a re-simulated frame runs at a different wall time than the first
+  // pass). Commit 0f6c3aa papered over it for lockstep by stepping the worker's
+  // clock +1 s per gated step; that made every frame look "late", so the
+  // skipper skipped up to MAXSKIP=120 flips in a row.
+  //
+  // THE FIX: after pcsx_init, turn dfxvideo's limiter AND skipper off
+  // (UseFrameLimit=0 at 567504, UseFrameSkip=0 at 567508 — pcsx_init is their
+  // only writer in this binary) and set `updated_display` (198800) to 0 before
+  // every one_iter, so its head runs GPUupdateLace1() every vblank — Pete's
+  // canonical no-skip path: the display updates on every vblank that drew
+  // (gpu.c GPUupdateLace1). Then NOTHING in the vblank path reads a host
+  // clock (the only other reads are FrameCap/FrameSkip/calcfps, now dead, and
+  // an SPU diagnostic accumulator at 570568 nothing else reads), every
+  // primitive is drawn, and the core is a pure function of (disc, pads, frame
+  // index). The pace comes from ONE place: the page's 1.000x accumulator under
+  // a gate, and paceSchedule() below when solo — at the DISC's rate, 59.94 Hz
+  // for NTSC and 50 Hz for PAL (Config.PsxType), never the GPU plugin's guess.
+  //
+  // ⚠ These addresses belong to THIS wasm (dist/wasmpsx_worker.wasm, built
+  // "Apr 23 2026", md5 3d5732589c8a6836813c195a651b1e63). coreSigOk() checks three string constants at
+  // their addresses before anything is written; a different build fails the
+  // check, logs it, and runs exactly as before (limiter and all).
+  var CORE = {
+    PsxType: 566191,         // u8  Config.PsxType (0 NTSC, 1 PAL) — misc.c CheckCdrom
+    UseFrameSkip: 567508,    // u8  dfxvideo UseFrameSkip
+    UseFrameLimit: 567504,   // u8  dfxvideo UseFrameLimit
+    updatedDisplay: 198800,  // i32 fps.c updated_display (one_iter's Lace1 gate)
+    palFlag: 568624,         // i32 dfxvideo PSXDisplay.PAL
+    gpuStat: 567496,         // i32 dfxvideo lGPUstatusRet
+    sbrk: 198784,            // u32 sbrk break (sbrk() in this build, func $78)
+    sigs: [[3996, 'SetAutoFrameCap %d %f\n'], [3120, 'ES\u0000'], [3721, 'CD-ROM ID: %.9s\n']],
+  };
+  var TAKE = false, TAKE_WHY = 'not booted';
+  var HZ_NTSC = 59.94, HZ_PAL = 50;
+  var coreHz = HZ_NTSC, coreRegion = 'NTSC';
+  function coreSigOk() {
+    try {
+      var u8 = Module.HEAPU8;
+      for (var i = 0; i < CORE.sigs.length; i++) {
+        var a = CORE.sigs[i][0], s = CORE.sigs[i][1];
+        for (var k = 0; k < s.length; k++) if (u8[a + k] !== s.charCodeAt(k)) return false;
+      }
+      return true;
+    } catch (e) { return false; }
+  }
+  function coreTakeover() {
+    if (/[?&]corelimiter=1/.test(q)) { TAKE = false; TAKE_WHY = '?corelimiter=1 (the old dfxvideo limiter, for an A/B)'; }
+    else if (!coreSigOk()) { TAKE = false; TAKE_WHY = 'this wasm is not the build the core addresses were read from'; }
+    else {
+      var u8 = Module.HEAPU8;
+      u8[CORE.UseFrameSkip] = 0;
+      u8[CORE.UseFrameLimit] = 0;
+      coreRegion = u8[CORE.PsxType] ? 'PAL' : 'NTSC';
+      coreHz = u8[CORE.PsxType] ? HZ_PAL : HZ_NTSC;
+      TAKE = true; TAKE_WHY = 'ok';
+    }
+    try {
+      postMessage({ cmd: 'print', txt: '[core] ' + (TAKE
+        ? 'region ' + coreRegion + ' (Config.PsxType) -> ' + coreHz + ' Hz, one governor: the dfxvideo limiter and frame skipper are OFF'
+        : 'governor takeover SKIPPED — ' + TAKE_WHY + '; the dfxvideo limiter paces this core') });
+      postMessage({ cmd: 'coreRate', take: TAKE, why: TAKE_WHY, hz: coreHz, region: coreRegion });
+    } catch (e) {}
+  }
+  var origInit = pcsx_init;
+  pcsx_init = function () {
+    var r = origInit.apply(this, arguments);
+    try { coreTakeover(); } catch (e) { TAKE = false; TAKE_WHY = 'takeover threw: ' + e; }
+    return r;
+  };
+
+  // One guest frame. With the takeover live, updated_display = 0 makes
+  // one_iter's head run GPUupdateLace1 (the display update) every vblank; the
+  // dfxvideo limiter that used to set it is off.
+  var QUIET = false, quietRenders = 0, quietAudio = 0;
+  function runFrame() {
+    if (TAKE) Module.HEAP32[CORE.updatedDisplay >> 2] = 0;
+    _one_iter();
+  }
+  // Frames that are re-simulated (rollback) are not presented and their audio
+  // is not played again: the host side of render/SendSound is skipped. Neither
+  // writes guest memory — both only copy OUT of it — so this cannot fork state.
+  var origRender = render;
+  render = function () { if (QUIET) { quietRenders++; return; } return origRender.apply(this, arguments); };
+  var origSendSound = SendSound;
+  SendSound = function () { if (QUIET) { quietAudio++; return; } return origSendSound.apply(this, arguments); };
+
+  // SOLO PACER — an absolute timeline at the disc's rate. Frame n starts at
+  // t0 + n/Hz; a frame that finishes early waits for its slot. Falling behind
+  // by more than one frame DROPS the debt instead of sprinting (CLAUDE.md gate
+  // #9: the guest may run slower than hardware, never faster), so at most one
+  // frame ever runs back-to-back to cover timer lateness.
+  var paceDue = 0, paceCh = null, pacePending = false, paceDrops = 0, paceFrames = 0;
+  if (typeof MessageChannel !== 'undefined') {
+    paceCh = new MessageChannel();
+    paceCh.port1.onmessage = function () { pacePending = false; pcsx_mainloop(); };
+  }
+  function paceKick() {
+    if (pacePending) return;
+    pacePending = true;
+    if (paceCh) paceCh.port2.postMessage(0); else setTimeout(function () { pacePending = false; pcsx_mainloop(); }, 0);
+  }
+  function paceSchedule() {
+    var now = performance.now(), period = 1000 / coreHz;
+    paceFrames++;
+    if (!paceDue) paceDue = now;
+    paceDue += period;
+    if (paceDue < now - period) { paceDue = now; paceDrops++; }
+    var wait = paceDue - now;
+    if (wait > 1) setTimeout(paceKick, wait); else paceKick();
+  }
+
+  // ── THE FAST EXACT SAVESTATE ──────────────────────────────────────────────
+  // The whole guest lives in wasm linear memory: static data (psxRegs, GTE,
+  // counters, SPU channels and RAM, dfxvideo state, CD-ROM state, memory card
+  // images) and the sbrk heap (psxM/psxP/psxH/psxR, the LUTs, VRAM). The only
+  // mutable wasm global is the stack pointer, which is at its base between
+  // frames. So a snapshot of [1024, sbrk) taken BETWEEN one_iter calls IS the
+  // machine; restoring it (plus the JS FS stream offsets — the ISO FILE's
+  // buffer is in wasm memory but its fd offset lives in JS) resumes exactly.
+  // No gzip, no freeze functions: one memcpy each way. This replaces the
+  // 188-241 ms gzipped SaveState for rollback.
+  var SNAP_LO = 1024;
+  function snapTop() { return Module.HEAPU32[CORE.sbrk >> 2] >>> 0; }
+  function fsPositions() {
+    var out = [];
+    try { var st = FS.streams; for (var i = 0; i < st.length; i++) if (st[i]) out.push(i, st[i].position); } catch (e) {}
+    return out;
+  }
+  function fsRestore(p) {
+    try { var st = FS.streams; for (var i = 0; i < p.length; i += 2) if (st[p[i]]) st[p[i]].position = p[i + 1]; } catch (e) {}
+  }
+  function snapSave(slot) {
+    var hi = snapTop(), n = hi - SNAP_LO;
+    if (!slot.buf || slot.buf.length < n) slot.buf = new Uint8Array(n + (256 << 10));
+    slot.buf.set(Module.HEAPU8.subarray(SNAP_LO, hi));
+    slot.len = n;
+    slot.fs = fsPositions();
+    return n;
+  }
+  function snapLoad(slot) {
+    Module.HEAPU8.set(slot.buf.subarray(0, slot.len), SNAP_LO);
+    fsRestore(slot.fs);
+  }
+  // A fingerprint of GUEST state inside a slot: main RAM + the hardware page
+  // (found through the core's own LUT, locateMem above) + VRAM. Host-side bytes
+  // in the snapshot (the stack's dead area, stdio buffers, the SPU timing
+  // accumulator) are deliberately not hashed — they may legitimately differ
+  // between two consoles that agree on every guest byte.
+  function slotHash(slot) {
+    if (!memMapTried) { memMapTried = true; try { memMap = locateMem(); } catch (e) { memMap = null; } }
+    if (!memMap) return null;
+    var b = slot.buf.buffer, o = slot.buf.byteOffset - SNAP_LO;
+    var h = 0x811c9dc5 | 0;
+    h = fnvWords(new Uint32Array(b, o + memMap.m, 0x200000 >> 2), h);
+    h = fnvWords(new Uint32Array(b, o + memMap.hw, 0x10000 >> 2), h);
+    if (vram_ptr && (vram_ptr & 3) === 0) h = fnvWords(new Uint32Array(b, o + vram_ptr, (1024 * 512 * 2) >> 2), h);
+    return h >>> 0;
+  }
+  function liveHash() {
+    var tmp = { buf: null, len: 0 };
+    snapSave(tmp);
+    return slotHash(tmp);
+  }
+
+  // The ROLLBACK RING. slotFrame[i] = the frame whose START slot i holds.
+  var RB = { n: 0, slots: [], slotFrame: [], live: -1, steps: 0, resim: 0, saveMs: 0, runMs: 0, loadMs: 0, maxStepMs: 0, lastBytes: 0 };
+  function rbSlotOf(k) { var i = k % RB.n; return RB.slotFrame[i] === k ? i : -1; }
+  function rbGrow(n) {
+    n = Math.max(2, n | 0);
+    if (n <= RB.n) return;
+    // Re-home every held frame into the bigger ring (k % n changes with n).
+    var held = [];
+    for (var i = 0; i < RB.n; i++) if (RB.slotFrame[i] >= 0) held.push({ k: RB.slotFrame[i], s: RB.slots[i] });
+    RB.n = n; RB.slots = []; RB.slotFrame = [];
+    for (var j = 0; j < n; j++) { RB.slots.push({ buf: null, len: 0, fs: [] }); RB.slotFrame.push(-1); }
+    for (var h = 0; h < held.length; h++) { var t = held[h].k % n; RB.slots[t] = held[h].s; RB.slotFrame[t] = held[h].k; }
+  }
+  function rbSaveFrame(k) {
+    var i = k % RB.n;
+    RB.slotFrame[i] = -1;
+    var t = performance.now();
+    RB.lastBytes = snapSave(RB.slots[i]);
+    RB.saveMs += performance.now() - t;
+    RB.slotFrame[i] = k;
+  }
+  function latchPads(states) {
+    if (states && typeof padStatus1 !== 'undefined' && padStatus1) Module.HEAPU8.set(new Uint8Array(states), padStatus1);
+  }
 
   var origMain = main_onmessage;
   main_onmessage = function (event) {
@@ -226,11 +450,13 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
       case 'netStep': {
         var n = (data.count | 0) || 1;
         try {
-          netClockJump();
+          // With the governor takeover the core reads no host clock at all, so
+          // the +1 s clock step (0f6c3aa) has nothing left to defeat.
+          if (!TAKE) netClockJump();
           if (data.states && typeof padStatus1 !== 'undefined' && padStatus1) {
             Module.HEAPU8.set(new Uint8Array(data.states), padStatus1);
           }
-          for (var i = 0; i < n; i++) { _one_iter(); creditAudio(); }
+          for (var i = 0; i < n; i++) { runFrame(); creditAudio(); }
           postMessage({ cmd: 'netFrame', frame: data.frame, ran: n });
         } catch (e) {
           postMessage({ cmd: 'netFrame', frame: data.frame, ran: 0, err: String(e) });
@@ -245,6 +471,103 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
       case 'soundBytes': {
         if (GATE) break;
         return origMain(event);
+      }
+
+      // ── ROLLBACK ────────────────────────────────────────────────────────
+      // 'netRbInit' {frame, ring}: the room's frame `frame` is about to be the
+      // first this core runs; keep its start state. Must arrive before any
+      // netRbStep, which message order guarantees.
+      case 'netRbInit': {
+        try {
+          if (!TAKE) throw new Error('rollback needs the governor takeover (' + TAKE_WHY + ')');
+          rbGrow(data.ring | 0);
+          RB.live = data.frame | 0;
+          rbSaveFrame(RB.live);
+          postMessage({ cmd: 'netRbReady', ok: true, frame: RB.live, ring: RB.n, bytes: RB.lastBytes });
+        } catch (e) {
+          postMessage({ cmd: 'netRbReady', ok: false, err: String((e && e.message) || e) });
+        }
+        break;
+      }
+      // 'netRbStep' {frame, states, resim:[{frame, states}], hidden, hash:[k], ring}
+      //   resim:  frames to RE-SIMULATE first (from the earliest wrong one up
+      //           to frame-1): load the start of resim[0], then for each: latch
+      //           its pads, run it unpresented, keep the start of the next.
+      //   frame:  the present frame (presented unless `hidden`), then keep the
+      //           start of frame+1.
+      //   hash:   confirmed frames k whose END state (= slot k+1) to fingerprint.
+      // The live state after the last frame IS the saved start of the next, so
+      // no load happens unless there is something to re-simulate.
+      case 'netRbStep': {
+        var t0 = performance.now(), err = null, resimRan = 0, hashes = [];
+        try {
+          if (data.ring) rbGrow(data.ring | 0);
+          var rs = data.resim || [];
+          if (rs.length) {
+            var si = rbSlotOf(rs[0].frame | 0);
+            if (si < 0) throw new Error('no savestate for frame ' + rs[0].frame + ' (ring ' + RB.n + ')');
+            var tl = performance.now();
+            snapLoad(RB.slots[si]);
+            RB.loadMs += performance.now() - tl;
+            QUIET = true;
+            try {
+              for (var ri = 0; ri < rs.length; ri++) {
+                latchPads(rs[ri].states);
+                var tr = performance.now();
+                runFrame(); creditAudio();
+                RB.runMs += performance.now() - tr;
+                rbSaveFrame((rs[ri].frame | 0) + 1);
+                resimRan++;
+              }
+            } finally { QUIET = false; }
+            RB.resim += resimRan;
+          } else if (rbSlotOf(data.frame | 0) < 0) {
+            throw new Error('the ring does not hold the start of frame ' + data.frame);
+          }
+          latchPads(data.states);
+          QUIET = !!data.hidden;
+          var tp = performance.now();
+          try { runFrame(); creditAudio(); } finally { QUIET = false; }
+          RB.runMs += performance.now() - tp;
+          rbSaveFrame((data.frame | 0) + 1);
+          RB.live = (data.frame | 0) + 1;
+          RB.steps++;
+          var hk = data.hash || [];
+          for (var hi = 0; hi < hk.length; hi++) {
+            var hs = rbSlotOf((hk[hi] | 0) + 1);
+            hashes.push({ frame: hk[hi] | 0, hash: hs < 0 ? null : slotHash(RB.slots[hs]) });
+          }
+        } catch (e) { err = String((e && e.message) || e); QUIET = false; }
+        var ms = performance.now() - t0;
+        if (ms > RB.maxStepMs) RB.maxStepMs = ms;
+        postMessage({ cmd: 'netFrame', frame: data.frame, ran: err ? 0 : 1, resim: resimRan, ms: ms, hashes: hashes, err: err });
+        break;
+      }
+      case 'netRbStats': {
+        postMessage({ cmd: 'netRbStatsResult', take: TAKE, why: TAKE_WHY, hz: coreHz, region: coreRegion,
+          ring: RB.n, steps: RB.steps, resim: RB.resim, bytes: RB.lastBytes,
+          saveMsAvg: (RB.steps + RB.resim) ? RB.saveMs / (RB.steps + RB.resim) : 0,
+          runMsAvg: (RB.steps + RB.resim) ? RB.runMs / (RB.steps + RB.resim) : 0,
+          loadMsTotal: RB.loadMs, maxStepMs: RB.maxStepMs, quietRenders: quietRenders, quietAudio: quietAudio,
+          paceFrames: paceFrames, paceDrops: paceDrops, calls: schedCalls });
+        break;
+      }
+      // Rig-only: a full-guest fingerprint of the LIVE state (same regions as
+      // the rollback fingerprint), and a save/load round-trip timer.
+      case 'netLiveHash': {
+        postMessage({ cmd: 'netLiveHashResult', tag: data.tag, hash: liveHash(), calls: schedCalls });
+        break;
+      }
+      case 'netSnapBench': {
+        var reps = (data.reps | 0) || 20, sl = { buf: null, len: 0, fs: [] }, ts = [], tl2 = [];
+        var h0 = liveHash();
+        for (var bi = 0; bi < reps; bi++) {
+          var a0 = performance.now(); snapSave(sl); var a1 = performance.now(); snapLoad(sl); var a2 = performance.now();
+          ts.push(a1 - a0); tl2.push(a2 - a1);
+        }
+        var h1 = liveHash();
+        postMessage({ cmd: 'netSnapBenchResult', bytes: sl.len, saveMs: ts, loadMs: tl2, same: h0 === h1, top: snapTop() });
+        break;
       }
 
       case 'netHash': {
@@ -289,6 +612,16 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
         } catch (e) {
           postMessage({ cmd: 'netBooted', ok: false, err: String((e && e.stack) || e) });
         }
+        break;
+      }
+
+      // Diagnostic: read i32 words of the core's memory. Read-only; a rig uses
+      // it to watch core globals (e.g. the dfxvideo PAL flag) without a
+      // debugger, because CDP evaluate cannot interleave with this worker.
+      case 'netPeek': {
+        var out = [];
+        try { var a = data.addrs || []; for (var k = 0; k < a.length; k++) out.push(Module.HEAP32[(a[k] >>> 0) >> 2]); } catch (e) { out = null; }
+        postMessage({ cmd: 'netPeekResult', tag: data.tag, vals: out, calls: schedCalls });
         break;
       }
 
