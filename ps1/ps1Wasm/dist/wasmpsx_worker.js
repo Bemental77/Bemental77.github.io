@@ -63,7 +63,101 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
   // removes the question. `head` is reported so a mismatch can be attributed to
   // the header rather than to guest state.
   var GZ_HEADER = 10;
+
+  // ⚠ THE GZIPPED SAVESTATE COSTS ~200 ms PER FINGERPRINT, AND THE PAGE ASKS
+  // FOR ONE EVERY SECOND. Measured (/tmp/claude-0/ps1hash.mjs, Monster Rancher
+  // 2, desktop Chrome): 188 / 218 / 212 / 241 / 224 / 204 ms each — SaveState()
+  // deflates ~3.5 MB through gzwrite (libpcsxcore/misc.c:497-530). This worker
+  // is single-threaded, so every fingerprint froze the core for ~12 frames the
+  // page could never give back (it may not sprint — CLAUDE.md gate #9). That
+  // was the whole of the PS1 room's 0.84x and its ~300 audio dropouts/min in
+  // tools/netplay_device_matrix.mjs, against 0.999x solo.
+  //
+  // So the fingerprint is now FNV over the guest's MAIN RAM and hardware page
+  // directly — psxM (2 MB) + psxH (64 KB), the same bytes SaveState writes
+  // first (misc.c:513-515) — which costs ~1-2 ms. They are found through the
+  // core's own read lookup table: psxMemInit fills psxMemRLUT[i] =
+  // &psxM[(i & 0x1f) << 16] for i < 0x80, [0x1f80] = psxH and
+  // [0x1fc0 + i] = &psxR[i << 16] (libpcsxcore/psxmem.c:85-93) — a pattern
+  // no other data in the heap has. The search runs ONCE, on the first
+  // fingerprint, which both peers take at the same frame on the same build.
+  //   Coverage trade, stated: CPU registers, GPU and SPU state are no longer
+  //   hashed directly; a divergence there is caught once it reaches RAM, which
+  //   game logic does within frames. ?nethash=full restores the savestate hash
+  //   (and its cost) for an investigation. If the table is ever NOT found the
+  //   old hash is used, and the log says so.
+  var FULL_HASH = /[?&]nethash=full/.test(q);
+
+  // ⚠ ONE GOVERNOR, NOT TWO. Under the gate the PAGE paces the console
+  // (ps1.html lsTick: rAF credit at exactly 59.94 Hz). The core carries its
+  // own frame limiter too — dfxvideo FrameCap(), a busy-wait on
+  // gettimeofday/emscripten_get_now (plugins/dfxvideo/fps.c:79-124) — and it
+  // kept running inside every gated step. Two independent clocks each capping
+  // the same frame rate lose to each other's jitter, and this one also paced
+  // at its OWN notion of the frame period: measured with
+  // tools/netplay_device_matrix.mjs, a gated worker fed WITHOUT any page
+  // pacing still produced only ~50 frames/s (/tmp/npdm/ps1-a-coreexp) while
+  // spending ~45% of its time inside emscripten_get_now (worker CPU profile,
+  // /tmp/npdm/ps1-a-prof). Solo, the same limiter spun ~80% of the time.
+  // So while gated, the core's clock is stepped forward a full second at the
+  // start of every step: FrameCap then always finds the frame overdue and
+  // returns without waiting. performance.now is patched only in THIS worker
+  // and only after the first gated step; it stays monotonic. The guest never
+  // reads this clock into its state (the full-savestate fingerprints of the
+  // two peers agreed while their wall clocks differed).
+  var netSkew = 0, netClockPatched = false;
+  function netClockJump() {
+    if (!GATE) return;
+    if (!netClockPatched) {
+      netClockPatched = true;
+      var realNow = performance.now.bind(performance);
+      performance.now = function () { return realNow() + netSkew; };
+      // gettimeofday reaches JS through Date.now (emscripten_date_now), and
+      // the limiter's tick arithmetic reads THAT clock while its usleep spins
+      // on performance.now — both have to move or the wait is only moved.
+      var realDate = Date.now;
+      Date.now = function () { return realDate() + netSkew; };
+    }
+    netSkew += 1000;
+  }
+  var memMap = null, memMapTried = false;
+  function locateMem() {
+    var h = new Int32Array(Module.HEAPU8.buffer);
+    var n = h.length - 0x2000;
+    for (var i = 0; i < n; i++) {
+      var m = h[i];
+      if (m === 0 || h[i + 1] !== ((m + 0x10000) | 0)) continue;
+      if (h[i + 0x1f] !== ((m + 0x1f0000) | 0) || h[i + 0x20] !== m || h[i + 0x7f] !== ((m + 0x1f0000) | 0)) continue;
+      var R = h[i + 0x1fc0];
+      if (!R || h[i + 0x1fc1] !== ((R + 0x10000) | 0)) continue;   // the READ table maps the BIOS; the write table does not
+      var H = h[i + 0x1f80];
+      if (!H) continue;
+      return { m: m >>> 0, hw: H >>> 0, table: (i * 4) >>> 0 };
+    }
+    return null;
+  }
+  function fnvWords(u32, h) {
+    for (var i = 0; i < u32.length; i++) h = Math.imul(h ^ u32[i], 16777619);
+    return h;
+  }
+  function ramHash() {
+    var buf = Module.HEAPU8.buffer;
+    var h = 0x811c9dc5 | 0;
+    h = fnvWords(new Uint32Array(buf, memMap.m, 0x200000 >> 2), h);
+    h = fnvWords(new Uint32Array(buf, memMap.hw, 0x10000 >> 2), h);
+    return h >>> 0;
+  }
   function stateHash() {
+    if (!FULL_HASH) {
+      if (!memMapTried) {
+        memMapTried = true;
+        try { memMap = locateMem(); } catch (e) { memMap = null; }
+        try { postMessage({ cmd: 'print', txt: '[lockstep] fingerprint = ' + (memMap ? 'RAM (psxM@0x' + memMap.m.toString(16) + ' + psxH@0x' + memMap.hw.toString(16) + ')' : 'SAVESTATE (the RAM table was not found — ~200 ms per fingerprint)') }); } catch (e) {}
+      }
+      if (memMap) {
+        try { return { hash: ramHash(), len: 0x210000, head: null }; } catch (e) { /* fall through to the savestate */ }
+      }
+    }
     try {
       Module.ccall('SaveState', 'number', ['string'], ['/tmp/nphash']);
       var b = Module.FS.readFile('/tmp/nphash');
@@ -87,11 +181,25 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
   // diverges. Under the gate the counter is instead zeroed INSIDE each gated
   // step: a pure function of the emulated frame index, and behaviourally what a
   // perfectly-draining sink looks like (SPUasync always mixes).
+  // ⚠ ZERO WAS "A PERFECTLY-DRAINING SINK" — ONE THAT DRAINS INFINITELY FAST.
+  // With the counter zeroed every step, SPUasync never saw a full buffer and
+  // mixed on every call, so a gated core PRODUCED ~7x real-time audio:
+  // measured 16.2 M sample frames in ~50 s of a two-player room (~320 k/s
+  // against 44,100/s; ps1.html's AudioDiag framesProduced,
+  // /tmp/npdm/ps1-a-fix5). The page's SDL queue cannot play that, and what
+  // came out was 21-23% audible with ~310 dropouts/min, against 85% audible
+  // and ~22/min solo. So the gated sink now drains at the rate a real one
+  // does — one emulated frame's worth of 44.1 kHz stereo s16 per step,
+  // 44100 * 4 / 59.94 = 2943 bytes — still a pure function of the frame
+  // index, so the determinism argument above is untouched, and the SPU mixes
+  // exactly as much as the guest's own time produces.
+  var GATED_DRAIN = Math.round(44100 * 4 / 59.94);
   function creditAudio() {
     if (!GATE) return;
     try {
       if (typeof soundbuffer_ptr !== 'undefined' && soundbuffer_ptr) {
-        Module.setValue(soundbuffer_ptr, 0, 'i32');
+        var v = Module.getValue(soundbuffer_ptr, 'i32') - GATED_DRAIN;
+        Module.setValue(soundbuffer_ptr, v > 0 ? v : 0, 'i32');
       }
     } catch (e) {}
   }
@@ -118,6 +226,7 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
       case 'netStep': {
         var n = (data.count | 0) || 1;
         try {
+          netClockJump();
           if (data.states && typeof padStatus1 !== 'undefined' && padStatus1) {
             Module.HEAPU8.set(new Uint8Array(data.states), padStatus1);
           }
@@ -127,6 +236,15 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
           postMessage({ cmd: 'netFrame', frame: data.frame, ran: 0, err: String(e) });
         }
         break;
+      }
+
+      // Under the gate the PAGE's drain credit is ignored: it arrives on the
+      // page's wall clock, which is exactly the per-peer input creditAudio()
+      // exists to keep out of the SPU (it used to land between steps and could
+      // drive the counter negative).
+      case 'soundBytes': {
+        if (GATE) break;
+        return origMain(event);
       }
 
       case 'netHash': {
