@@ -25,7 +25,7 @@
        machine boots the disc and the room exchanges nothing but pad bytes
        (tools/no_streaming_test.mjs machine-checks that). netplay-ui.js is the
        shared lobby; it renders nothing at all when Netplay.supported() is false. -->
-  <script src="/lib/netplay.js?v=69b4a34d"></script>
+  <script src="/lib/netplay.js?v=f9e3ce48"></script>
   <script src="/lib/netplay-ui.js?v=66f15769"></script>
   <script>
     // NEVER PRESENT AN ENABLED START BEHIND A BROKEN PATH.
@@ -7670,6 +7670,17 @@ window.GcRate = (function () {
           if (window.__srRenderWorker) window.__srRenderWorker.postMessage({ cmd: 'ack', n: e.data.n });
           return;
         }
+        if (e.data && e.data.cmd === 'recompGate') {
+          // [vi-timing-gate 2026-09-30] Dolphin is holding this takeover until its emulated
+          // hardware exists (worker_funcs.js __recompGate). The render worker must hold its posts
+          // (and not call the silence a stalled consumer) until it is released.
+          srState.gate = e.data.state;
+          if (window.__srRenderWorker)
+            window.__srRenderWorker.postMessage({ cmd: 'gate', held: e.data.state !== 'released' });
+          srSay('dolphin gate: ' + e.data.state + ' after ' + ((e.data.ms || 0) / 1000).toFixed(1) + 's'
+                + (e.data.state === 'timeout' ? ' — emulated hardware has not come up; still waiting' : ''));
+          return;
+        }
         if (origOnWorkerMsg) origOnWorkerMsg(e);
       };
       var rw = new Worker('/gamecube/recomp/sr_image/sr_render_worker.js', { type: 'module' });
@@ -7771,13 +7782,16 @@ window.GcRate = (function () {
     // (window._firstFrame) plus a settling second, with a wall-clock ceiling so a boot
     // that never draws still hands over rather than hanging silently.
     var srT0 = Date.now();
+    // ?srbootms=N overrides the 90 s ceiling (a test arm: ?srbootms=1 forces the takeover into the
+    // window before Dolphin's emulated hardware exists — the case worker_funcs.js __recompGate holds).
+    var SR_CEIL_MS = (function () { var v = parseInt(q0.get('srbootms'), 10); return isFinite(v) && v >= 0 ? v : 90000; })();
     var srTimer = setInterval(function () {
       if (typeof dolphin_worker === 'undefined' || !dolphin_worker) return;
       if (window._firstFrame && !window.__srFirstFrameAt) window.__srFirstFrameAt = Date.now();
       if (window.__srFirstFrameAt && Date.now() - window.__srFirstFrameAt >= 2000) {
         clearInterval(srTimer); srTakeover('renderer up');
-      } else if (Date.now() - srT0 >= 90000) {
-        clearInterval(srTimer); srTakeover('90s ceiling — renderer may not be up');
+      } else if (Date.now() - srT0 >= SR_CEIL_MS) {
+        clearInterval(srTimer); srTakeover((SR_CEIL_MS / 1000) + 's ceiling — renderer may not be up');
       }
     }, 500);
   }
@@ -9313,7 +9327,9 @@ window.GcRate = (function () {
   prefetchDisc();
 
   var hudStatus = '';   // transient state (taking over / failed) shown until frames flow
+  var gateStatus = '';  // Dolphin's pre-hardware takeover hold; shown while set, frames or not
   setInterval(function () {
+    if (gateStatus) { hud(gateStatus); return; }
     if (rate.framesSeen === 0 && hudStatus) { hud(hudStatus); return; }
     // One call does both knobs: knob 1 SPEED (emulated time / wall time, cumulative, measured
     // off credits consumed) and knob 2 CAP (measured busy time per stage). Both are asserted by
@@ -9387,6 +9403,16 @@ window.GcRate = (function () {
         // instead of driving `outstanding` negative, which would disable backpressure outright
         // and stop the render-busy segment ever reopening (?ratetest=1 test 7a).
         rate.ack(performance.now());
+        return;
+      }
+      if (e.data && e.data.cmd === 'recompGate') {
+        // [vi-timing-gate 2026-09-30] the takeover is held until Dolphin's emulated hardware
+        // exists (worker_funcs.js __recompGate): say so on the HUD instead of a silent pause.
+        var gs = (e.data.ms || 0) / 1000;
+        gateStatus = e.data.state === 'released' ? ''
+          : e.data.state === 'timeout' ? 'recomp: emulated hardware not up after ' + gs.toFixed(0) + 's — still waiting'
+          : 'recomp: waiting for emulated hardware (' + gs.toFixed(0) + 's)';
+        console.log('[recomp-live] dolphin gate ' + e.data.state + ' at ' + gs.toFixed(1) + 's');
         return;
       }
       if (origOnWorkerMsg) origOnWorkerMsg(e);
