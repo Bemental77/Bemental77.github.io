@@ -111,6 +111,13 @@ const HARNESSES = [
     fast: true, ci: true, server: false, requires: [], timeoutMs: 2 * MIN,
   },
   {
+    name: 'debugreport',
+    file: 'tools/debugreport_test.mjs',
+    cmd: ['node', 'tools/debugreport_test.mjs'],
+    desc: 'lib/debugreport.js ("Copy debug") in a fake DOM: loading it schedules NO timer/rAF/observer (only error listeners), the button lands in each of the 8 pages\' toolbar + mobile menu + splash and nowhere else, collect() has every section and survives every accessor throwing, peer ids become seats and TURN credentials are redacted, the ClipboardItem copy starts synchronously inside the gesture with writeText / execCommand / overlay fallbacks, AudioContexts are captured, and ?debugreport=0 installs nothing',
+    fast: true, ci: true, server: false, requires: ['lib/debugreport.js'], timeoutMs: 2 * MIN,
+  },
+  {
     name: 'netplay-invariants',
     file: 'tools/netplay_invariants.mjs',
     cmd: ['node', 'tools/netplay_invariants.mjs'],

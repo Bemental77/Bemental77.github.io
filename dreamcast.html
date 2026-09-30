@@ -5,6 +5,7 @@
   <title>Dreamcast (Bemental77)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <link rel="icon" href="data:,">
+  <script src="/lib/debugreport.js?v=ba6f809e"></script>
   <script src="/coi-serviceworker.js"></script>
   <!-- The game library's origin. ONE constant for the whole site, so the split
        is revertible by editing a single line — see lib/asset_base.js. -->
@@ -27,7 +28,7 @@
        emulator is never told any of this is happening — it sees a second pad on
        the same machine. Everything below is guarded on Netplay.supported(): a
        browser without RTCPeerConnection never sees the button at all. -->
-  <script src="/lib/netplay.js?v=a644057b"></script>
+  <script src="/lib/netplay.js?v=7d445faf"></script>
   <script>
     // NEVER PRESENT AN ENABLED START BEHIND A BROKEN PATH. Gates BOTH Start
     // controls (#btnStart and the mobile splash's #mobileSplashStart — the phone
@@ -6176,6 +6177,22 @@
       const relayFloor = (sess.relay && sess.relay.active && sess.relay.delayFrames)
         ? (sess.relay.delayFrames | 0) : 0;
       let want = r && r.recommendedDelay != null ? Math.max(1, Math.min(30, r.recommendedDelay | 0)) : null;
+      // ⚠ THREE OR FOUR PLAYERS: A GUEST'S INPUT REACHES ANOTHER GUEST IN TWO HOPS.
+      // Every guest links only to the host, which forwards frame traffic
+      // (lib/netplay.js RELAYED), so guest A's pad for frame F reaches guest B
+      // after A->host plus host->B — the sum of TWO measured paths, not the
+      // worst one. rttReport's recommendation covers one hop. Simulated with the
+      // real engines (tools/netplay_pace_sim_n.mjs, 70 +-20 ms one way): a
+      // one-hop choice (6) had to be raised to 10-11 through stalls and the room
+      // delivered 0.986x (3 players) / 0.992x (4); choosing from the two worst
+      // RTTs (10) held 0.997x / 0.999x. With two players this is the old answer.
+      try {
+        const rtts = r && r.peers ? Object.keys(r.peers).map((k) => r.peers[k]).filter((v) => v != null).sort((a, b) => b - a) : [];
+        if (rtts.length >= 2 && window.Netplay && Netplay.Lockstep && Netplay.Lockstep.recommendDelay) {
+          const two = Math.max(1, Math.min(30, Netplay.Lockstep.recommendDelay(rtts[0] + rtts[1], 1000 / 60) | 0));
+          if (want == null || two > want) want = two;
+        }
+      } catch (e) {}
       if (relayFloor > 0) want = Math.min(30, Math.max(want || 0, relayFloor));
       if (want == null || want === ls.delay) return ls.delay;
       const was = ls.delay;

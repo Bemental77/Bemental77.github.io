@@ -136,10 +136,10 @@ const MID_EVAL = flag('mid-eval', '');
 const SOLO_S = +flag('solo-seconds', '40');
 // Solo results from an EARLIER run (its matrix.json), so a cell can be judged
 // against a solo baseline without re-measuring it every time.
-const BASELINE = {};
+const BASELINE = {}, BASELINE_PAIR = {}, BASELINE_MOBILE = {}, BASELINE_N = {};
 if (flag('baseline', '')) {
   for (const f of flag('baseline', '').split(',')) {
-    try { const r = JSON.parse(fs.readFileSync(f, 'utf8')); for (const [k, v] of Object.entries(r.solo || {})) { const [c, d] = k.split(':'); if (d === 'desktop') BASELINE[c] = v; } } catch (e) { console.error('baseline ' + f + ': ' + e.message); }
+    try { const r = JSON.parse(fs.readFileSync(f, 'utf8')); for (const [k, v] of Object.entries(r.solo || {})) { const [c, d] = k.split(':'); if (d === 'desktop') BASELINE[c] = v; if (d === 'pair') BASELINE_PAIR[c] = v; if (d === 'mobile') BASELINE_MOBILE[c] = v; BASELINE_N[k] = v; } } catch (e) { console.error('baseline ' + f + ': ' + e.message); }
   }
 }
 const SHOTS_AT = flag('shots', '') ? flag('shots', '').split(',').map(Number) : null;
@@ -175,12 +175,21 @@ const ANDROID_UA = 'Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 
 const CONSOLES = {
   dc: { name: 'Dreamcast', title: 'Gauntlet Legends', page: '/dreamcast.html', game: 'gauntlet', hostFlag: '',
         hz: '59.94', witness: '(window.__dcProbe ? window.__dcProbe().guestX : null)',
-        frames: 'null', bootMs: 360000, seam: 'window.__dcNet && window.__dcNet()' },
+        frames: 'null', bootMs: 360000, seam: 'window.__dcNet && window.__dcNet()',
+        // A Dreamcast lockstep frame is one retro_run, which is one FRAME THE GAME
+        // RENDERS — ~34.5 ms on Gauntlet, not a 59.94 Hz field (dreamcast.html
+        // lsChooseDelay notes) — so engine frames/s is not a rate here. The
+        // SH4-clock witness (guestX) is.
+        rateBy: 'witness' },
   n64: { name: 'N64', title: 'Mario Kart 64', page: '/n64/', game: 'Mario Kart 64', hostFlag: '',
          hz: '((window.__n64Net && window.__n64Net().viHz) || 60)',
          witness: '(window.__n64Rate ? window.__n64Rate.speed : null)', frames: 'null', bootMs: 240000, seam: 'window.__n64Net && window.__n64Net()' },
   gc: { name: 'GameCube', title: 'Mario Party 4', page: '/gamecube.html', game: 'Mario Party 4', hostFlag: '',
-        hz: '59.94', witness: '(window.__gcRate ? window.__gcRate.speed : null)', frames: 'null', bootMs: 360000, seam: 'window.__gcNet && window.__gcNet()' },
+        // __gcRate.speed is CUMULATIVE since boot (credits consumed / wall), so it lags any
+        // change by minutes; producedPerS is the recomp's per-second guest frame count at the
+        // path's pinned GUEST_HZ (60) — gamecube.html's own 'guest = N frames/s' line.
+        hz: '((window.__gcRate && window.__gcRate.guestHz) || 60)',
+        witness: '(window.__gcRate && window.__gcRate.producedPerS != null ? window.__gcRate.producedPerS / ((window.__gcRate.guestHz) || 60) : null)', frames: 'null', bootMs: 360000, seam: 'window.__gcNet && window.__gcNet()' },
   gen: { name: 'Genesis', title: 'Sonic the Hedgehog 3', page: '/genesis.html', game: 'Sonic the Hedgehog 3', hostFlag: '&host=1',
          hz: '((window.Module && window.Module._gpx_fps && window.Module._gpx_fps()) || 59.922751)',
          witness: 'null', frames: '(window.__genFrames|0)', bootMs: 120000, seam: 'window.__genNet && window.__genNet()' },
@@ -202,11 +211,16 @@ const ARMS = {
   a: { id: 'a', what: 'desktop host + desktop joiner', host: DESKTOP, join: DESKTOP },
   b: { id: 'b', what: 'mobile-emulated 4x-throttled HOST + desktop joiner', host: MOBILE, join: DESKTOP },
   c: { id: 'c', what: 'desktop host + mobile-emulated 4x-throttled JOINER', host: DESKTOP, join: MOBILE },
-  d: { id: 'd', what: 'desktop pair, P2P link 100 ms one-way + 2% retransmit (+200 ms, head-of-line)',
+  d: { id: 'd', what: 'desktop pair, P2P link 100 ms one-way; 2% loss (reliable channel: +200 ms retransmit, head-of-line; unreliable channel: dropped)',
        host: DESKTOP, join: DESKTOP, p2p: { delayMs: 100, lossFrac: 0.02, rtxMs: 200 } },
   drelay: { id: 'drelay', what: 'desktop pair, room forced onto RELAY mode; broker 100 ms one-way + 2% loss',
             host: DESKTOP, join: DESKTOP, relay: true, broker: { delayMs: 100, loss: 0.02 } },
   e: { id: 'e', what: 'desktop pair, soak', host: DESKTOP, join: DESKTOP, soak: true },
+  // FOUR-PORT CONSOLES (Dreamcast, GameCube, N64): three and four players, each
+  // in their own browser process. On this 4-core box that is 3-4 emulators at
+  // once, so these are judged against the `trio`/`quad` solo controls.
+  q3: { id: 'q3', what: 'three desktop players', host: DESKTOP, join: DESKTOP, players: 3 },
+  q4: { id: 'q4', what: 'four desktop players', host: DESKTOP, join: DESKTOP, players: 4 },
 };
 
 const consoles = flag('consoles', 'dc,n64,gc,gen,ps1').split(',').map((s) => s.trim()).filter(Boolean);
@@ -217,7 +231,7 @@ for (const a of arms) if (!ARMS[a]) { console.error('unknown arm ' + a); process
 // Default: the throttled mobile device whenever arm b or c runs.
 const SOLO_DEVS = flag('solo', (arms.includes('b') || arms.includes('c')) ? 'mobile' : 'none')
   .split(',').map((s) => s.trim()).filter((s) => s && s !== 'none');
-for (const s of SOLO_DEVS) if (!['mobile', 'desktop', 'pair'].includes(s)) { console.error('unknown --solo device ' + s); process.exit(2); }
+for (const s of SOLO_DEVS) if (!['mobile', 'desktop', 'pair', 'trio', 'quad'].includes(s)) { console.error('unknown --solo device ' + s); process.exit(2); }
 const SOLO_ONLY = has('solo-only');
 
 fs.mkdirSync(OUT, { recursive: true });
@@ -242,7 +256,16 @@ function lockOwnerAlive() {
     try { process.kill(pid, 0); return true; } catch (e) { return false; }
   } catch (e) { return null; }
 }
+// ⚠ COURTESY GAP. Releasing and immediately re-taking the lock between cells
+// starves every other agent polling for it (they poll every 5-10 s; this
+// process re-took it in milliseconds, cell after cell, for over an hour). So a
+// release is followed by LOCK_GAP_S seconds in which this process does not
+// try, and if anyone took the lock in that gap they go first.
+const LOCK_GAP_S = +(process.env.NPDM_LOCK_GAP_S || 30);
+let lastRelease = 0;
 async function acquireLock(tag) {
+  const gap = lastRelease ? LOCK_GAP_S * 1000 - (Date.now() - lastRelease) : 0;
+  if (gap > 0) { say(`[lock] courtesy gap ${Math.round(gap / 1000)}s before re-taking it`); await sleep(gap); }
   let waited = 0, said = 0;
   for (;;) {
     try {
@@ -274,6 +297,7 @@ function releaseLock() {
     if (pid === process.pid) fs.rmSync(LOCK, { recursive: true, force: true });
   } catch (e) {}
   lockHeld = false;
+  lastRelease = Date.now();
 }
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => { releaseLock(); process.exit(130); });
 process.on('exit', releaseLock);
@@ -433,6 +457,17 @@ function preloadSrc(cfg) {
       const ch = this;
       let q = Q.get(ch); if (!q) { q = { last: 0 }; Q.set(ch, q); }
       M.p2p.sent++;
+      // An UNRELIABLE channel (lib/netplay.js's 'lsu' input channel: unordered
+      // or maxRetransmits 0) loses the message outright; a reliable ordered one
+      // retransmits and blocks everything behind it.
+      const unreliable = ch.ordered === false || ch.maxRetransmits === 0;
+      if (unreliable) {
+        M.p2p.unreliable = (M.p2p.unreliable || 0) + 1;
+        if (Math.random() < CFG.p2p.lossFrac) { M.p2p.lost = (M.p2p.lost || 0) + 1; return; }
+        const at = now() + CFG.p2p.delayMs;
+        setTimeout(() => { try { if (ch.readyState === 'open') send.call(ch, data); } catch (e) {} }, CFG.p2p.delayMs);
+        return;
+      }
       const rtx = Math.random() < CFG.p2p.lossFrac;
       if (rtx) M.p2p.rtx++;
       const at = Math.max(now() + CFG.p2p.delayMs + (rtx ? CFG.p2p.rtxMs : 0), q.last);
@@ -531,7 +566,10 @@ async function launchPlayer(role, device, cellTag, pre) {
   const page = (await browser.pages())[0] || await browser.newPage();
   page.setDefaultTimeout(120000);
   const P = { role, device, browser, page, dir, errors: [], consoleErrors: [], log: [], throttled: [], throttleRejected: [] };
-  page.on('pageerror', (e) => P.errors.push(String((e && e.message) || e).slice(0, 300)));
+  page.on('pageerror', (e) => {
+    P.errors.push(String((e && e.message) || e).slice(0, 300));
+    (P.errorStacks = P.errorStacks || []).push(String((e && e.stack) || '').slice(0, 1200));
+  });
   page.on('console', (m) => {
     const t = m.text();
     if (m.type() === 'error') P.consoleErrors.push(t.slice(0, 200));
@@ -624,8 +662,12 @@ async function runCell(cid, aid, attempt) {
   const fg = freeGB();
   if (fg != null && fg < MIN_FREE_GB + 1.2) { cell.error = `disk: only ${fg.toFixed(2)} GB free`; return cell; }
   await acquireLock(tag);
-  let broker = null, H = null, J = null;
+  let broker = null;
+  const PS = [];
+  const nPlayers = A.players || 2;
   const loadTick = setInterval(() => { const l = load1(); if (l != null) cell.loads.push(l); }, 10000);
+  const allState = () => Promise.all(PS.map((P) => engineState(P)));
+  const bad = (st) => st.some((x) => x && x.engine && /desync|failed|ended/.test(x.engine.state));
   try {
     cell.uptimeAtLock = uptime();
     broker = await startBroker({ port: 0 });
@@ -635,49 +677,60 @@ async function runCell(cid, aid, attempt) {
                              p2p: A.p2p || null, relay: !!A.relay });
     const code = mkCode();
     cell.code = code;
-    H = await launchPlayer('host', A.host, tag, Object.assign({}, pre, { hooks: preloadSrc(cfg('host')) }));
-    J = await launchPlayer('joiner', A.join, tag, Object.assign({}, pre, { hooks: preloadSrc(cfg('joiner')) }));
-    cell.prewarm = { host: await prewarm(H, C), joiner: await prewarm(J, C) };
+    cell.nPlayers = nPlayers;
+    for (let i = 0; i < nPlayers; i++) {
+      const role = i === 0 ? 'host' : (i === 1 ? 'joiner' : 'joiner' + i);
+      PS.push(await launchPlayer(role, i === 0 ? A.host : A.join, tag, Object.assign({}, pre, { hooks: preloadSrc(cfg(role)) })));
+    }
+    const H = PS[0];
+    cell.prewarm = {};
+    for (const P of PS) cell.prewarm[P.role] = await prewarm(P, C);
     const tOpen = Date.now();
     await H.page.goto(handoffUrl(C, code, 'host', broker.url), { waitUntil: 'domcontentloaded' });
     // Give the host's relay subscription a head start: a joiner publishing into
     // an empty topic is the "slow host" case, which is not what is measured here.
     for (let i = 0; i < 40; i++) { if (broker.stats.clients >= 1) break; await sleep(250); }
     await sleep(1500);
-    await J.page.goto(handoffUrl(C, code, 'join', broker.url), { waitUntil: 'domcontentloaded' });
-    // ---- admit, then wait for both engines to run --------------------------------
-    let admitted = false, admitHow = null; const tBootLimit = Date.now() + C.bootMs;
+    // Joiners arrive one after another, each admitted by the host's real Allow.
+    let admitted = 0; const admitHow = [];
+    const tryAdmit = async () => {
+      const btn = await H.page.$('#npApproveAllow').catch(() => null);
+      if (!btn) return false;
+      try { await H.page.click('#npApproveAllow'); admitHow.push('mouse'); }
+      catch (e) { await H.page.evaluate(() => { const b = document.getElementById('npApproveAllow'); if (b) b.click(); }).catch(() => {}); admitHow.push('dom'); }
+      admitted++; await sleep(500); return true;
+    };
+    for (let i = 1; i < PS.length; i++) {
+      await PS[i].page.goto(handoffUrl(C, code, 'join', broker.url), { waitUntil: 'domcontentloaded' });
+      for (let k = 0; k < 60 && admitted < i; k++) { if (!(await tryAdmit())) await sleep(500); }
+    }
+    cell.admitAtS = +((Date.now() - tOpen) / 1000).toFixed(1);
+    // ---- wait for every engine to run --------------------------------
+    const tBootLimit = Date.now() + C.bootMs;
     let running = false; let lastLog = 0;
     while (Date.now() < tBootLimit) {
-      if (!admitted) {
-        const btn = await H.page.$('#npApproveAllow').catch(() => null);
-        if (btn) {
-          try { await H.page.click('#npApproveAllow'); admitHow = 'mouse'; }
-          catch (e) { await H.page.evaluate(() => { const b = document.getElementById('npApproveAllow'); if (b) b.click(); }).catch(() => {}); admitHow = 'dom (mouse click failed: ' + String(e.message).slice(0, 60) + ')'; }
-          admitted = true; cell.admitAtS = +((Date.now() - tOpen) / 1000).toFixed(1);
-        }
-      }
-      const [hs, js] = await Promise.all([engineState(H), engineState(J)]);
-      const ok = (s) => s && s.engine && (s.engine.state === 'running' || s.engine.state === 'stalled') && s.ready > 30;
-      if (ok(hs) && ok(js)) { running = true; break; }
+      if (admitted < PS.length - 1) await tryAdmit();
+      const st = await allState();
+      const ok = (x) => x && x.engine && (x.engine.state === 'running' || x.engine.state === 'stalled') && x.ready > 30;
+      if (st.every(ok)) { running = true; break; }
       if (Date.now() - lastLog > 15000) {
         lastLog = Date.now();
-        say(`  [${tag}] waiting · admitted=${admitted} host=${JSON.stringify(hs && hs.engine)} ready=${hs && hs.ready} · joiner=${JSON.stringify(js && js.engine)} ready=${js && js.ready} · broker=${JSON.stringify(broker.stats)}`);
+        say(`  [${tag}] waiting · admitted=${admitted}/${PS.length - 1} · ` + PS.map((P, i) => `${P.role}=${JSON.stringify(st[i] && st[i].engine)} ready=${st[i] && st[i].ready}`).join(' · ') + ` · broker=${JSON.stringify(broker.stats)}`);
       }
-      if ((hs && hs.engine && /desync|failed|ended/.test(hs.engine.state)) || (js && js.engine && /desync|failed|ended/.test(js.engine.state))) break;
+      if (bad(st)) break;
       await sleep(1000);
     }
-    cell.admitted = admitted; cell.admitHow = admitHow;
+    cell.admitted = admitted; cell.admitHow = admitHow.join(',');
     cell.startS = +((Date.now() - tOpen) / 1000).toFixed(1);
     cell.running = running;
+    cell.shots = {}; for (const P of PS) cell.shots[P.role] = [];
     if (!running) {
-      cell.error = `room never reached running on both players within ${C.bootMs / 1000}s`;
+      cell.error = `room never reached running on all ${PS.length} players within ${C.bootMs / 1000}s`;
     } else {
-      say(`  [${tag}] both engines running after ${cell.startS}s — measuring ${seconds}s`);
+      say(`  [${tag}] all ${PS.length} engines running after ${cell.startS}s — measuring ${seconds}s`);
       // ---- the measured window -------------------------------------------------
       const tM = Date.now();
-      const mark = await Promise.all([H, J].map((P) => P.page.evaluate(() => ({ ready: window.__npdm.readyFrames, win: window.__npdm.win.length, t: performance.now() - window.__npdm.t0, drop: window.__npdm.audio.dropouts, aq: window.__npdm.audio.quanta, stalls: window.__npdm.stalls.length, resumes: window.__npdm.resumes.length })).catch(() => null)));
-      cell.shots = { host: [], joiner: [] };
+      const mark = await Promise.all(PS.map((P) => P.page.evaluate(() => ({ ready: window.__npdm.readyFrames, win: window.__npdm.win.length, t: performance.now() - window.__npdm.t0, drop: window.__npdm.audio.dropouts, aq: window.__npdm.audio.quanta, stalls: window.__npdm.stalls.length, resumes: window.__npdm.resumes.length })).catch(() => null)));
       const pressAt = [8, 22, 36, 50].filter((s) => s < seconds - 4);
       // Screenshot times (s into the window). --shots overrides, e.g. for a
       // cell where the capture itself is suspected of perturbing the page.
@@ -687,16 +740,16 @@ async function runCell(cid, aid, attempt) {
         const el = (Date.now() - tM) / 1000;
         if (nextShot < shotAt.length && el >= shotAt[nextShot]) {
           const i = nextShot++;
-          const [a, b] = await Promise.all([canvasShot(H.page, path.join(OUT, `${tag}-host-${i}.png`)), canvasShot(J.page, path.join(OUT, `${tag}-joiner-${i}.png`))]);
-          cell.shots.host.push(Object.assign({ atS: Math.round(el) }, a)); cell.shots.joiner.push(Object.assign({ atS: Math.round(el) }, b));
+          const shots = await Promise.all(PS.map((P) => canvasShot(P.page, path.join(OUT, `${tag}-${P.role}-${i}.png`))));
+          PS.forEach((P, k) => cell.shots[P.role].push(Object.assign({ atS: Math.round(el) }, shots[k])));
           if (i === 1) {
             // The whole viewport once, as evidence of what each player actually SAW.
-            await Promise.all([H, J].map((P) => P.page.screenshot({ type: 'jpeg', quality: 60, path: path.join(OUT, `${tag}-${P.role}-full.jpg`) }).catch(() => {})));
+            await Promise.all(PS.map((P) => P.page.screenshot({ type: 'jpeg', quality: 60, path: path.join(OUT, `${tag}-${P.role}-full.jpg`) }).catch(() => {})));
           }
         }
         if (nextPress < pressAt.length && el >= pressAt[nextPress]) {
           nextPress++;
-          const P = (pi++ % 2 === 0) ? H : J;
+          const P = PS[(pi++) % Math.min(2, PS.length)];
           try {
             await P.page.evaluate(() => window.__npdm.press());
             await P.page.keyboard.down('ArrowLeft'); await sleep(400); await P.page.keyboard.up('ArrowLeft');
@@ -706,7 +759,7 @@ async function runCell(cid, aid, attempt) {
           cell.profiled = true;
           // Main thread AND every dedicated worker (several cores run in one).
           const targets = [];
-          for (const P of [H, J]) {
+          for (const P of PS) {
             targets.push({ c: P.cdp, name: `${tag}-${P.role}` });
             P.page.workers().forEach((w, i) => targets.push({ c: w.client, name: `${tag}-${P.role}-w${i}-${w.url().split('/').pop().split('?')[0]}` }));
           }
@@ -719,19 +772,20 @@ async function runCell(cid, aid, attempt) {
           }));
         }
         if (MID_EVAL && !cell.midEval && el >= seconds / 2) {
-          cell.midEval = { atS: Math.round(el), js: MID_EVAL, res: await Promise.all([H, J].map((P) => P.page.evaluate(MID_EVAL).then((r) => String(r)).catch((e) => 'ERR ' + e.message))) };
+          cell.midEval = { atS: Math.round(el), js: MID_EVAL, res: await Promise.all(PS.map((P) => P.page.evaluate(MID_EVAL).then((r) => String(r)).catch((e) => 'ERR ' + e.message))) };
         }
         if (A.soak && Math.round(el) % 60 === 0) say(`  [${tag}] soak ${Math.round(el)}s · load ${load1()}`);
-        const [hs, js] = await Promise.all([engineState(H), engineState(J)]);
-        if ((hs && hs.engine && /desync|failed|ended/.test(hs.engine.state)) || (js && js.engine && /desync|failed|ended/.test(js.engine.state))) {
-          cell.endedEarly = `engine state host=${hs && hs.engine && hs.engine.state} joiner=${js && js.engine && js.engine.state} at ${Math.round(el)}s`;
+        const st = await allState();
+        if (bad(st)) {
+          cell.endedEarly = 'engine state ' + PS.map((P, i) => `${P.role}=${st[i] && st[i].engine && st[i].engine.state}`).join(' ') + ` at ${Math.round(el)}s`;
           break;
         }
         await sleep(1000);
       }
       cell.measuredS = +((Date.now() - tM) / 1000).toFixed(1);
       // ---- collect ---------------------------------------------------------------
-      for (const [P, m] of [[H, mark[0]], [J, mark[1]]]) {
+      for (let pi2 = 0; pi2 < PS.length; pi2++) {
+        const P = PS[pi2], m = mark[pi2];
         const d = await P.page.evaluate((m) => {
           const M = window.__npdm; const e = M.engine;
           let rep = null; try { rep = e ? e.report() : null; } catch (x) {}
@@ -761,27 +815,30 @@ async function runCell(cid, aid, attempt) {
             winT0: m.t,
           };
         }, m).catch((e) => ({ collectError: String(e.message || e) }));
-        d.errors = P.errors.slice(); d.consoleErrors = P.consoleErrors.slice(0, 20); d.consoleErrorCount = P.consoleErrors.length;
+        d.errors = P.errors.slice(); d.errorStacks = (P.errorStacks || []).slice(0, 4); d.consoleErrors = P.consoleErrors.slice(0, 20); d.consoleErrorCount = P.consoleErrors.length;
         d.throttled = P.throttled; d.throttleRejected = P.throttleRejected; d.throttleProof = P.throttleProof || null;
         d.device = P.device;
         cell.players[P.role] = d;
       }
     }
     // Errors are captured whether or not the room ran.
-    for (const P of [H, J]) {
+    for (const P of PS) {
       if (!cell.players[P.role]) cell.players[P.role] = { errors: P.errors.slice(), consoleErrors: P.consoleErrors.slice(0, 20), device: P.device, throttleProof: P.throttleProof || null };
       cell.players[P.role].log = P.log.slice(-80);
     }
     if (!running) {
-      cell.shots = { host: [await canvasShot(H.page, path.join(OUT, `${tag}-host-fail.png`))], joiner: [await canvasShot(J.page, path.join(OUT, `${tag}-joiner-fail.png`))] };
-      cell.failState = { host: await engineState(H), joiner: await engineState(J) };
+      cell.failState = {};
+      for (const P of PS) {
+        cell.shots[P.role] = [await canvasShot(P.page, path.join(OUT, `${tag}-${P.role}-fail.png`))];
+        cell.failState[P.role] = await engineState(P);
+      }
     }
     cell.broker = Object.assign({}, broker.stats, { impair: Object.assign({}, broker.impair) });
   } catch (e) {
     cell.error = 'rig error: ' + String(e && e.stack || e).slice(0, 400);
   } finally {
     clearInterval(loadTick);
-    await closePlayer(H); await closePlayer(J);
+    for (const P of PS) await closePlayer(P);
     if (broker) await broker.close().catch(() => {});
     cell.uptimeAfter = uptime();
     releaseLock();
@@ -903,13 +960,16 @@ function analysePlayer(d, peerRole) {
   const wit = W.map((w) => w.witness).filter((x) => typeof x === 'number' && isFinite(x));
   r.witnessX = wit.length ? +(wit.reduce((a, b) => a + b, 0) / wit.length).toFixed(4) : null;
   r.witnessMax = wit.length ? +Math.max(...wit).toFixed(4) : null;
+  let wm = null;
+  for (let i = 0; i + 5 <= wit.length; i++) { const v = wit.slice(i, i + 5).reduce((x, y) => x + y, 0) / 5; if (wm == null || v > wm) wm = v; }
+  r.witnessMaxWin5 = wm == null ? null : +wm.toFixed(4);
   const fr = W.map((w) => w.frames).filter((x) => typeof x === 'number');
   r.frameCounterX = fr.length >= 2 ? +(((fr[fr.length - 1] - fr[0]) / Math.max(1, W.length - 1)) / hz).toFixed(4) : null;
   r.stalls = d.stalls ? d.stalls.length : null;
   r.stallMs = d.resumes ? d.resumes.reduce((a, x) => a + x.ms, 0) : null;
   const who = {};
   for (const s of d.stalls || []) for (const p of (s.waitingPeers && s.waitingPeers.length ? s.waitingPeers : ['port ' + (s.waitingOn || []).join(',')])) {
-    const k = p === d.peerId ? 'self' : (p === peerRole.peerId ? peerRole.role : p); who[k] = (who[k] || 0) + 1;
+    const k = p === d.peerId ? 'self' : (peerRole[p] || p); who[k] = (who[k] || 0) + 1;
   }
   r.waitedOn = who;
   r.delayChanges = (d.delays || []).map((x) => `${x.from}->${x.to}@f${x.at}`);
@@ -930,16 +990,19 @@ function analysePlayer(d, peerRole) {
 function verdict(cell, solo, soloAudio) {
   const why = [];
   if (cell.error) return { pass: false, why: [cell.error] };
-  const h = cell.players.host, j = cell.players.joiner;
-  const ah = analysePlayer(h, { role: 'joiner', peerId: j && j.peerId });
-  const aj = analysePlayer(j, { role: 'host', peerId: h && h.peerId });
-  cell.analysis = { host: ah, joiner: aj };
-  for (const [name, a, d] of [['host', ah, h], ['joiner', aj, j]]) {
+  const roles = Object.keys(cell.players);
+  const peerRoles = {};
+  for (const r of roles) if (cell.players[r] && cell.players[r].peerId) peerRoles[cell.players[r].peerId] = r;
+  cell.analysis = {};
+  for (const r of roles) cell.analysis[r] = analysePlayer(cell.players[r], peerRoles);
+  for (const name of roles) {
+    const a = cell.analysis[name], d = cell.players[name];
     if (!a) { why.push(name + ': nothing collected'); continue; }
-    const x = a.witnessX != null ? Math.min(a.witnessX, a.engineX) : a.engineX;
+    const byW = CONSOLES[cell.console] && CONSOLES[cell.console].rateBy === 'witness';
+    const x = byW ? a.witnessX : (a.witnessX != null ? Math.min(a.witnessX, a.engineX) : a.engineX);
     if (!(x >= RATE_FLOOR)) why.push(`${name} rate ${x}x < ${RATE_FLOOR}`);
-    if (a.maxWin5 > RATE_CEIL_WIN) why.push(`${name} FAST-FORWARD: a 5-s window ran at ${a.maxWin5}x`);
-    if (a.witnessMax != null && a.witnessMax > 1.05) why.push(`${name} page witness peaked at ${a.witnessMax}x`);
+    if (!byW && a.maxWin5 > RATE_CEIL_WIN) why.push(`${name} FAST-FORWARD: a 5-s window ran at ${a.maxWin5}x`);
+    if (a.witnessMaxWin5 != null && a.witnessMaxWin5 > RATE_CEIL_WIN) why.push(`${name} FAST-FORWARD by the page's own witness: a 5-s window at ${a.witnessMaxWin5}x`);
     if (a.desync) why.push(`${name} DESYNC`);
     if (!(a.hashesCompared > 0)) why.push(`${name} compared 0 fingerprints`);
     if (a.errors) why.push(`${name} ${a.errors} page error(s): ${(d.errors || [])[0]}`);
@@ -952,7 +1015,16 @@ function verdict(cell, solo, soloAudio) {
     // room must not make audio worse than the same game alone (x1.25 for
     // scene-to-scene variation), and never less than the flat floor.
     const soloPm = soloAudio && soloAudio.perMin != null ? soloAudio.perMin : null;
-    const allow = Math.max(AUDIO_DROPOUTS_PER_MIN, soloPm != null ? soloPm * 1.25 : 0);
+    // When the box itself cannot run two of these side by side (pair control below
+    // the floor), a starved producer is the box's too: the pair control's own
+    // dropout rate is then the reference instead.
+    const pairA = cell.pairSolo && cell.pairSolo.rate && cell.pairSolo.rate.x < RATE_FLOOR && cell.pairSolo.audio ? cell.pairSolo.audio.perMin : null;
+    // A THROTTLED player is judged against the same game solo ON THAT DEVICE.
+    const dev = ARMS[cell.arm] && ARMS[cell.arm][name === 'host' ? 'host' : 'join'];  // every joiner shares the arm's joiner device
+    const mobA = dev && dev.kind === 'mobile' && solo && solo.audio ? solo.audio.perMin : null;
+    const allow = Math.max(AUDIO_DROPOUTS_PER_MIN, soloPm != null ? soloPm * 1.25 : 0, pairA != null ? pairA * 1.25 : 0, mobA != null ? mobA * 1.25 : 0);
+    a.audio.mobileSoloPerMin = mobA;
+    a.audio.pairPerMin = pairA;
     a.audio.allowPerMin = +allow.toFixed(2); a.audio.soloPerMin = soloPm;
     if (perMinExcess > allow) why.push(`${name} audio ${a.audio.dropouts} dropouts (${a.audio.perMin}/min; ${perMinExcess.toFixed(1)}/min beyond stalls; allowed ${allow.toFixed(1)}${soloPm != null ? ' = solo ' + soloPm + ' x1.25' : ''})`);
   }
@@ -961,12 +1033,69 @@ function verdict(cell, solo, soloAudio) {
   let limited = null;
   for (const [name, dev] of [['host', ARMS[cell.arm].host], ['joiner', ARMS[cell.arm].join]]) {
     if (dev.kind !== 'mobile' || !solo) continue;
-    if (solo.rate && solo.rate.x < RATE_FLOOR) limited = `${name} device SOLO cap ${solo.rate.x}x (${solo.rate.src}) — below ${RATE_FLOOR} with no room at all`;
+    const a = cell.analysis && cell.analysis[name];
+    const x = a ? (a.witnessX != null ? a.witnessX : a.engineX) : null;
+    if (solo.rate && solo.rate.x < RATE_FLOOR && x != null && x >= 0.9 * solo.rate.x) {
+      limited = `${name} device SOLO cap ${solo.rate.x}x (${solo.rate.src}) — below ${RATE_FLOOR} with no room at all; the room delivered ${x}x (>= 90% of it)`;
+    }
   }
-  return { pass: why.length === 0, deviceLimited: limited, why };
+  // BOX-LIMITED: both players of a room share this one machine, so the room is
+  // compared with TWO SOLO INSTANCES RUN SIDE BY SIDE (the `pair` control). If
+  // that control itself cannot reach the floor, and the room delivers at least
+  // 90% of it, the shortfall belongs to the machine, not to netplay — and only
+  // a rate failure is excused by that; everything else still fails.
+  let boxLimited = null;
+  const pair = cell.pairSolo;   // the N-instance control matching this cell's player count
+  if (pair && pair.rate && pair.rate.x < RATE_FLOOR && cell.analysis) {
+    const xs = Object.keys(cell.analysis).map((k) => { const a = cell.analysis[k]; return a ? (a.witnessX != null ? a.witnessX : a.engineX) : null; });
+    if (xs.every((x) => x != null && x >= 0.9 * pair.rate.x)) {
+      boxLimited = `${pair.count || 2} SOLO instances side by side on this box reach only ${pair.rate.x}x; the room delivered ${xs.join('/')}x (>= 90% of that)`;
+    }
+  }
+  const nonRate = why.filter((w) => !/ rate [\d.]+x < /.test(w));
+  return { pass: why.length === 0, deviceLimited: limited, boxLimited, nonRateFailures: nonRate, why };
 }
 
 // ---- main -----------------------------------------------------------------------------
+function buildTable(RESULT) {
+  const rows = RESULT.cells.filter((c, i, a) => !a.slice(i + 1).some((d) => d.console === c.console && d.arm === c.arm));
+  const lines = ['| console | arm | verdict | host x (engine/witness) | joiner x | stalls h/j | delay h/j | lat frames h/j | canvas h/j | audio drop/min h/j | desync | errors | load |',
+                 '|---|---|---|---|---|---|---|---|---|---|---|---|---|'];
+  for (const c of rows) {
+    const a = c.analysis || {}; const h = a.host || {}; const j = a.joiner || {};
+    const cv = (k) => ((c.shots && c.shots[k]) || []).slice(-2).some((s) => s.showing) ? 'ok' : 'BLANK';
+    const v = c.void ? 'VOID' : (c.verdict.pass ? 'PASS' : ((c.verdict.nonRateFailures || []).length === 0 && (c.verdict.boxLimited || c.verdict.deviceLimited) ? (c.verdict.boxLimited ? 'BOX-LIMITED' : 'DEVICE-LIMITED') : 'FAIL'));
+    lines.push(`| ${c.console} | ${c.arm} | ${v} | ${h.engineX ?? '-'}/${h.witnessX ?? '-'} | ${j.engineX ?? '-'}/${j.witnessX ?? '-'} | ${h.stalls ?? '-'}/${j.stalls ?? '-'} | ${h.delayNow ?? '-'}/${j.delayNow ?? '-'} | ${JSON.stringify(h.latFrames || [])}/${JSON.stringify(j.latFrames || [])} | ${c.error ? '-' : cv('host') + '/' + cv('joiner')} | ${h.audio ? h.audio.perMin : '-'}/${j.audio ? j.audio.perMin : '-'} | ${(h.desync || j.desync) ? 'YES' : 'no'} | ${(h.errors || 0) + (j.errors || 0)} | ${c.maxLoad} |`);
+  }
+  for (const [cid, s] of Object.entries(RESULT.solo)) lines.push(`| ${cid} | SOLO | ${s.rate ? s.rate.x + 'x (' + s.rate.src + ')' : 'no rate'} | canvas ${s.shot ? (s.shot.showing ? 'ok' : 'BLACK') : '-'} | throttle proof ${s.throttleProof ? s.throttleProof.ratio + 'x' : '-'} |`);
+  return { rows, table: lines.join('\n') };
+}
+const cellLabel = (c) => c.void ? 'VOID' : (c.verdict.pass ? 'PASS' : ((c.verdict.nonRateFailures || []).length === 0 && (c.verdict.boxLimited || c.verdict.deviceLimited) ? (c.verdict.boxLimited ? 'BOX-LIMITED' : 'DEVICE-LIMITED') : 'FAIL'));
+
+// --rejudge a.json,b.json: recompute every verdict from saved cells with the
+// CURRENT thresholds and --baseline solos, and print one combined table. The
+// newest cell per console x arm wins (files in the order given).
+if (flag('rejudge', '')) {
+  const R = { solo: {}, cells: [] };
+  for (const f of flag('rejudge', '').split(',')) {
+    const r = JSON.parse(fs.readFileSync(f, 'utf8'));
+    Object.assign(R.solo, r.solo || {});
+    for (const c of r.cells || []) { c.from = f; R.cells.push(c); }
+  }
+  for (const c of R.cells) {
+    const cid = c.console;
+    const ctl = { 2: 'pair', 3: 'trio', 4: 'quad' }[(ARMS[c.arm] && ARMS[c.arm].players) || 2];
+    c.pairSolo = R.solo[cid + ':' + ctl] || (ctl === 'pair' ? BASELINE_PAIR[cid] : BASELINE_N[cid + ':' + ctl]) || null;
+    c.verdict = verdict(c, R.solo[cid + ':mobile'] || BASELINE_MOBILE[cid], (BASELINE[cid] || R.solo[cid + ':desktop'] || {}).audio);
+  }
+  const { rows, table } = buildTable(R);
+  console.log(table);
+  for (const c of rows) console.log(`${c.console}/${c.arm} [${cellLabel(c)}] ${c.verdict.why.join(' · ')}${c.verdict.boxLimited ? ' [box: ' + c.verdict.boxLimited + ']' : ''}${c.verdict.deviceLimited ? ' [device: ' + c.verdict.deviceLimited + ']' : ''} (${c.from})`);
+  const out = flag('rejudge-out', '');
+  if (out) fs.writeFileSync(out, JSON.stringify({ table, cells: rows.map((c) => ({ console: c.console, arm: c.arm, label: cellLabel(c), why: c.verdict.why, analysis: c.analysis, from: c.from })) }, null, 1));
+  process.exit(0);
+}
+
 (async () => {
   say(`=== netplay device matrix · consoles=${consoles.join(',')} arms=${arms.join(',')} seconds=${SECONDS} ===`);
   say(`uptime: ${uptime()} · free ${freeGB() && freeGB().toFixed(2)} GB · out ${OUT}`);
@@ -980,7 +1109,7 @@ function verdict(cell, solo, soloAudio) {
     for (const dk of SOLO_DEVS) {
       const dev = dk === 'mobile' ? MOBILE : DESKTOP;
       say(`--- ${cid} SOLO cap, ${dk}${dev.cpu ? ' ' + dev.cpu + 'x' : ''} ---`);
-      const s = await runSolo(cid, dev, dk === 'pair' ? 2 : 1);
+      const s = await runSolo(cid, dev, { pair: 2, trio: 3, quad: 4 }[dk] || 1);
       RESULT.solo[cid + ':' + dk] = s; save();
       say(`  solo ${cid}/${dk}: live=${s.live} rate=${JSON.stringify(s.rate)} throttleProof=${JSON.stringify(s.throttleProof)} canvas=${s.shot && (s.shot.showing ? 'ok' : 'BLACK')} audio=${s.audio ? s.audio.dropouts + ' drop/' + s.audio.quanta + 'q' : '-'} raf=${s.rafMean}${s.each && s.each.length > 1 ? ' each=' + s.each.map((e) => e.rate && e.rate.x).join('/') : ''} loads=${s.loads.join(',')} ${s.start ? JSON.stringify(s.start) : ''} ${s.error || ''}`);
     }
@@ -992,11 +1121,13 @@ function verdict(cell, solo, soloAudio) {
         const maxLoad = cell.loads.length ? Math.max(...cell.loads) : load1();
         cell.maxLoad = maxLoad;
         cell.void = maxLoad != null && maxLoad > VOID_LOAD;
-        cell.verdict = verdict(cell, RESULT.solo[cid + ':mobile'], (RESULT.solo[cid + ':desktop'] || BASELINE[cid] || {}).audio);
+        const ctl = { 2: 'pair', 3: 'trio', 4: 'quad' }[ARMS[aid].players || 2];
+        cell.pairSolo = RESULT.solo[cid + ':' + ctl] || (ctl === 'pair' ? BASELINE_PAIR[cid] : BASELINE_N[cid + ':' + ctl]) || null;
+        cell.verdict = verdict(cell, RESULT.solo[cid + ':mobile'] || BASELINE_MOBILE[cid], (RESULT.solo[cid + ':desktop'] || BASELINE[cid] || {}).audio);
         RESULT.cells.push(cell); save();
         const v = cell.verdict;
-        say(`  => ${cell.void ? 'VOID (load ' + maxLoad + ')' : (v.pass ? 'PASS' : 'FAIL')} ${v.deviceLimited ? '[DEVICE-LIMITED: ' + v.deviceLimited + '] ' : ''}${v.why.join(' · ')}`);
-        if (cell.analysis) for (const k of ['host', 'joiner']) {
+        say(`  => ${cell.void ? 'VOID (load ' + maxLoad + ')' : (v.pass ? 'PASS' : (v.nonRateFailures.length === 0 && (v.boxLimited || v.deviceLimited) ? (v.boxLimited ? 'BOX-LIMITED' : 'DEVICE-LIMITED') : 'FAIL'))} ${v.deviceLimited ? '[device: ' + v.deviceLimited + '] ' : ''}${v.boxLimited ? '[box: ' + v.boxLimited + '] ' : ''}${v.why.join(' · ')}`);
+        if (cell.analysis) for (const k of Object.keys(cell.analysis)) {
           const a = cell.analysis[k]; if (!a) continue;
           say(`     ${k.padEnd(6)} engine ${a.engineX}x (5s ${a.minWin5}..${a.maxWin5}) witness ${a.witnessX} fc ${a.frameCounterX} · stalls ${a.stalls}/${a.stallMs}ms on ${JSON.stringify(a.waitedOn)} · delay ${a.delayNow} [${a.delayChanges.join(' ')}] · lat ${JSON.stringify(a.latFrames)} · audio ${JSON.stringify(a.audio)} · hashes ${a.hashesCompared} · relay ${a.relay} · err ${a.errors}/${a.consoleErrors}`);
           const shots = (cell.shots && cell.shots[k]) || [];
@@ -1006,22 +1137,13 @@ function verdict(cell, solo, soloAudio) {
       }
     }
   }
-  // ---- summary table ----
-  const rows = RESULT.cells.filter((c, i, a) => !a.slice(i + 1).some((d) => d.console === c.console && d.arm === c.arm));
-  const lines = ['| console | arm | verdict | host x (engine/witness) | joiner x | stalls h/j | delay h/j | lat frames h/j | canvas h/j | audio drop/min h/j | desync | errors | load |',
-                 '|---|---|---|---|---|---|---|---|---|---|---|---|---|'];
-  for (const c of rows) {
-    const a = c.analysis || {}; const h = a.host || {}; const j = a.joiner || {};
-    const cv = (k) => ((c.shots && c.shots[k]) || []).slice(-2).some((s) => s.showing) ? 'ok' : 'BLANK';
-    const v = c.void ? 'VOID' : (c.verdict.pass ? 'PASS' : (c.verdict.deviceLimited ? 'DEVICE-LIMITED' : 'FAIL'));
-    lines.push(`| ${c.console} | ${c.arm} | ${v} | ${h.engineX ?? '-'}/${h.witnessX ?? '-'} | ${j.engineX ?? '-'}/${j.witnessX ?? '-'} | ${h.stalls ?? '-'}/${j.stalls ?? '-'} | ${h.delayNow ?? '-'}/${j.delayNow ?? '-'} | ${JSON.stringify(h.latFrames || [])}/${JSON.stringify(j.latFrames || [])} | ${c.error ? '-' : cv('host') + '/' + cv('joiner')} | ${h.audio ? h.audio.perMin : '-'}/${j.audio ? j.audio.perMin : '-'} | ${(h.desync || j.desync) ? 'YES' : 'no'} | ${(h.errors || 0) + (j.errors || 0)} | ${c.maxLoad} |`);
-  }
-  for (const [cid, s] of Object.entries(RESULT.solo)) lines.push(`| ${cid} | SOLO | ${s.rate ? s.rate.x + 'x (' + s.rate.src + ')' : 'no rate'} | canvas ${s.shot ? (s.shot.showing ? 'ok' : 'BLACK') : '-'} | throttle proof ${s.throttleProof ? s.throttleProof.ratio + 'x' : '-'} |`);
-  RESULT.table = lines.join('\n');
+  const { rows, table: _t } = buildTable(RESULT);
+  RESULT.table = _t;
+
   save();
   fs.writeFileSync(path.join(OUT, 'table.md'), RESULT.table + '\n');
   say('\n' + RESULT.table);
   say(`full JSON: ${path.join(OUT, 'matrix.json')}`);
-  const fails = rows.filter((c) => !c.void && !c.verdict.pass).length;
+  const fails = rows.filter((c) => !c.void && !c.verdict.pass && !((c.verdict.nonRateFailures || []).length === 0 && (c.verdict.boxLimited || c.verdict.deviceLimited))).length;
   process.exit(fails ? 1 : 0);
 })().catch((e) => { console.error(e); releaseLock(); process.exit(3); });
