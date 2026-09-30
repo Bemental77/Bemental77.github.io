@@ -6177,6 +6177,22 @@
       const relayFloor = (sess.relay && sess.relay.active && sess.relay.delayFrames)
         ? (sess.relay.delayFrames | 0) : 0;
       let want = r && r.recommendedDelay != null ? Math.max(1, Math.min(30, r.recommendedDelay | 0)) : null;
+      // ⚠ THREE OR FOUR PLAYERS: A GUEST'S INPUT REACHES ANOTHER GUEST IN TWO HOPS.
+      // Every guest links only to the host, which forwards frame traffic
+      // (lib/netplay.js RELAYED), so guest A's pad for frame F reaches guest B
+      // after A->host plus host->B — the sum of TWO measured paths, not the
+      // worst one. rttReport's recommendation covers one hop. Simulated with the
+      // real engines (tools/netplay_pace_sim_n.mjs, 70 +-20 ms one way): a
+      // one-hop choice (6) had to be raised to 10-11 through stalls and the room
+      // delivered 0.986x (3 players) / 0.992x (4); choosing from the two worst
+      // RTTs (10) held 0.997x / 0.999x. With two players this is the old answer.
+      try {
+        const rtts = r && r.peers ? Object.keys(r.peers).map((k) => r.peers[k]).filter((v) => v != null).sort((a, b) => b - a) : [];
+        if (rtts.length >= 2 && window.Netplay && Netplay.Lockstep && Netplay.Lockstep.recommendDelay) {
+          const two = Math.max(1, Math.min(30, Netplay.Lockstep.recommendDelay(rtts[0] + rtts[1], 1000 / 60) | 0));
+          if (want == null || two > want) want = two;
+        }
+      } catch (e) {}
       if (relayFloor > 0) want = Math.min(30, Math.max(want || 0, relayFloor));
       if (want == null || want === ls.delay) return ls.delay;
       const was = ls.delay;

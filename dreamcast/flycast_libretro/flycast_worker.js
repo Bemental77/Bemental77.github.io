@@ -751,7 +751,16 @@
       const cyc = Module._flycast_guest_cycles();
       if (!paceBaseWall) { paceBaseWall = nowW; paceBaseCyc = cyc; }
       const lead = (cyc - paceBaseCyc) / SH4_HZ * 1000 - (nowW - paceBaseWall);
-      if (lead < -250 || lead > 250) { paceBaseWall = nowW; paceBaseCyc = cyc; }
+      // ⚠ BEHIND IS REBASED AT ONE FRAME, NOT AT 250 ms. The old window let the
+      // core repay up to a quarter-second of debt at full speed — a sprint, which
+      // CLAUDE.md gate #9 forbids. Measured with tools/netplay_device_matrix.mjs
+      // (the page's own SH4-clock witness, guestX): the throttled-phone SOLO run
+      // peaked at 1.18x for a second and 1.032x over five
+      // (/tmp/npdm/after1 dc:mobile), and two-player rooms read 1.020-1.030x
+      // five-second windows after every dip. Behind by more than a frame now
+      // means those milliseconds did not happen for the guest; ahead is still
+      // waited out exactly as before.
+      if (lead < -BEHIND_REBASE_MS || lead > 250) { paceBaseWall = nowW; paceBaseCyc = cyc; }
       else delay = Math.max(0, Math.min(50, lead));
     } else {
       // uncap: TRUE free-run (lever-11 rig fix, 2026-08-28). The historical
@@ -772,6 +781,7 @@
   // Serialize the full emulator state and hand the bytes to the page. MUST be
   // called only at a clean asyncify boundary (from pumpTick, or when not
   // free-running) — see the pendingSave note above.
+  var BEHIND_REBASE_MS = 17;     // one 60 Hz field: jitter below it is absorbed, debt above it is dropped
   function doSaveState() {
     const Module = self.Module;
     try {
