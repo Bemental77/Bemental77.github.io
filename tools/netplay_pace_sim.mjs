@@ -65,78 +65,120 @@ export function simulate(sc) {
   const q = new Q();
   const peers = {};
   const delayLog = [];
-  // ---- the room, formed synchronously (the barrier is not what is measured)
+  // Up to four consoles. 'H' is the host; every other id is a guest linked to
+  // the host only — the product's STAR: a guest's frame traffic reaches the
+  // other guests through the host's Session (lib/netplay.js RELAYED), which
+  // relays it on the host's thread, so a busy host delays the relay too.
+  const ids = sc.peers || ['H', 'G'];
+  const guests = ids.filter((x) => x !== 'H');
+  const RELAYED = { ls: 1, lsh: 1, lsd: 1, lsping: 1, lspong: 1, lspace: 1 };
   let live = false;
+  const lastAt = {};   // ordered per directed link
+  const link = (from, to, m) => {
+    // one-way latency of the host<->guest link that `from`/`to` share
+    const g = from === 'H' ? to : from;
+    const lat = Math.max(0, sc.latency(T, rnd, g));
+    const k = from + '>' + to;
+    const at = Math.max(lastAt[k] || 0, T + lat);
+    lastAt[k] = at;
+    q.push(at, () => arrive(to, m, from));
+  };
+  const arrive = (to, m, from) => {
+    const p = peers[to];
+    if (T < p.busyUntil) { q.push(p.busyUntil, () => arrive(to, m, from)); return; }
+    if (m.__to && m.__to !== to) {                // at the host, on its way to another guest
+      link('H', m.__to, m); return;
+    }
+    deliver(p, m);
+  };
   const mk = (id, host) => {
-    const p = { id, host, busyUntil: 0, baseWall: 0, baseFrame: 0, frames: 0, reanchors: 0,
-                cost: sc.cost[id], lastDeliver: 0, feedArmed: false, perSec: [], stalledMs: 0 };
+    const cost = sc.cost[id];
+    const p = { id, host, busyUntil: 0, baseWall: 0, baseFrame: 0, frames: 0, reanchors: 0, lostMs: 0,
+                cost, costSum: 0, costN: 0 };
     p.ls = new Lockstep({
       host, peerId: id, portCount: 4, padBytes: 4, delay: 2, hashEvery: 0, frameHz: viHz,
       now: () => T,
       send: (m) => {
         const tagged = Object.assign({ peer: id }, m);
-        const other = peers[host ? 'G' : 'H'];
-        if (!live) { other.ls.receive(tagged); return; }
-        const lat = Math.max(0, sc.latency(T, rnd, id));
-        const at = Math.max(p.lastDeliver, T + lat);   // ordered channel
-        p.lastDeliver = at;
-        q.push(at, () => deliver(other, tagged));
+        if (!live) { for (const o of ids) if (o !== id) peers[o].ls.receive(tagged); return; }
+        if (host) { for (const g of guests) link('H', g, tagged); return; }
+        link(id, 'H', tagged);
+        if (RELAYED[m.t]) for (const g of guests) if (g !== id) link(id, 'H', Object.assign({ __to: g }, tagged));
       },
     });
     peers[id] = p;
     return p;
   };
-  const H = mk('H', true), G = mk('G', false);
+  for (const id of ids) mk(id, id === 'H');
+  const H = peers.H;
   H.ls.on('delay', (e) => delayLog.push({ t: +(T / 1000).toFixed(2), from: e.from, to: e.to, at: e.at, down: e.to < e.from }));
-  H.ls.seat('H', 1); H.ls.seat('G', 1);
+  for (const id of ids) H.ls.seat(id, 1);
   H.ls.delay = sc.startDelay;        // what the page picks from the RTT sample at Ready
-  H.ls.declareReady('g'); G.ls.declareReady('g');
-  if (H.ls.state !== 'running' || G.ls.state !== 'running') throw new Error('barrier did not release');
+  for (const id of ids) peers[id].ls.declareReady('g');
+  for (const id of ids) if (peers[id].ls.state !== 'running') throw new Error('barrier did not release for ' + id);
   live = true;
 
-  // A message is processed when the peer's thread is free.
   function deliver(p, m) {
-    if (T < p.busyUntil) { q.push(p.busyUntil, () => deliver(p, m)); return; }
+    if (m.__to) { m = Object.assign({}, m); delete m.__to; }
     p.ls.receive(m);
     if (m.t === 'ls') feed(p);        // n64/index.html kicks the feed on arrival
   }
-  // n64/index.html lsDueNow(), verbatim in behaviour.
+  // n64/index.html lsDueNow(): re-anchors instead of repaying debt; the debt
+  // it discards is what the page reports as selfLostMs.
   function due(p) {
     if (!p.baseWall) { p.baseWall = T; p.baseFrame = p.frames; return true; }
     const d = p.baseWall + (p.frames - p.baseFrame) * period;
     if (T < d) return false;
-    if (T - d > period * 2) { p.baseWall = T; p.baseFrame = p.frames; p.reanchors++; }
+    // sc.repayMs: MEASUREMENT ONLY — how much debt a console may run back to
+    // its schedule. The product repays at most 2 periods (CLAUDE.md gate #9).
+    if (T - d > Math.max(period * 2, sc.repayMs || 0)) { p.lostMs += T - d; p.baseWall = T; p.baseFrame = p.frames; p.reanchors++; }
     return true;
   }
-  // One pass of lsFeed(). A frame occupies the peer's thread for `cost` ms, so
-  // the loop continues at T + cost rather than in the same instant.
   function feed(p) {
     if (T < p.busyUntil) return;
     if (!due(p)) return;
     const r = p.ls.beginFrame(new Uint8Array(4));
-    if (!r.ready) { p.baseWall = 0; return; }
+    if (!r.ready) { if (!sc.repayMs) p.baseWall = 0; return; }
     const c = typeof p.cost === 'function' ? p.cost(T, rnd) : p.cost;
+    p.costSum += c; p.costN++;
     p.busyUntil = T + c;
     p.frames++;
     p.ls.endFrame(null);
+    // what the page publishes: capacity from the frame cost, and the time lost
+    // without waiting
+    p.ls.selfCap = p.costN ? period / (p.costSum / p.costN) : 0;
+    p.ls.selfLostMs = p.lostMs;
     q.push(p.busyUntil, () => feed(p));
   }
-  // The 4 ms feed timer, per peer.
-  for (const p of [H, G]) {
+  for (const id of ids) {
+    const p = peers[id];
     const tick = () => { feed(p); if (T < secs * 1000) q.push(T + 4, tick); };
     q.push(0, tick);
   }
-  // Per-second samples.
   const samples = [];
-  let lastH = 0, lastG = 0, lastSm = 0;
+  const last = {}; for (const id of ids) last[id] = 0;
+  let lastSm = 0;
   const sample = () => {
-    const s = H.ls.stats.stallMs + G.ls.stats.stallMs;
-    samples.push({ s: samples.length + 1, rateH: (H.frames - lastH) / viHz, rateG: (G.frames - lastG) / viHz,
-                   delay: H.ls.delay, stallMs: Math.round(s - lastSm) });
-    lastH = H.frames; lastG = G.frames; lastSm = s;
+    const sm = ids.reduce((a, id) => a + peers[id].ls.stats.stallMs, 0);
+    const row = { s: samples.length + 1, rateH: (H.frames - last.H) / viHz, delay: H.ls.delay, stallMs: Math.round(sm - lastSm) };
+    for (const id of ids) { row['rate' + id] = (peers[id].frames - last[id]) / viHz; last[id] = peers[id].frames; }
+    if (peers.G) row.rateG = row.rateG;   // two-peer compatibility
+    lastSm = sm;
+    samples.push(row);
     if (T < secs * 1000) q.push(T + 1000, sample);
   };
   q.push(1000, sample);
+  // Verdicts: every console's own answer to "who is the room waiting on",
+  // from its own paceReport and the rate it measured over the last 3 s.
+  const verdicts = {};
+  const vAt = (secs - 1) * 1000;
+  const fAt = {}; q.push(vAt - 3000, () => { for (const id of ids) fAt[id] = peers[id].frames; });
+  q.push(vAt, () => {
+    for (const id of ids) {
+      const rate = (peers[id].frames - fAt[id]) / 3 / viHz;
+      verdicts[id] = Lockstep.paceVerdict(peers[id].ls.paceReport(), rate);
+    }
+  });
   while (q.size) { const [t, , fn] = q.pop(); if (t > secs * 1000 + 1) break; T = t; fn(); }
 
   const warm = sc.warm == null ? 5 : sc.warm;
@@ -144,17 +186,19 @@ export function simulate(sc) {
   const rate = tail.reduce((a, x) => a + x.rateH, 0) / Math.max(1, tail.length);
   const secsBelow = tail.filter((x) => x.rateH < 0.99).length;
   const ups = delayLog.filter((d) => !d.down).length, downs = delayLog.filter((d) => d.down).length;
-  // An oscillation is a give-back that is later taken straight back by a raise.
   let reversals = 0;
   for (let i = 1; i < delayLog.length; i++) if (delayLog[i - 1].down && !delayLog[i].down) reversals++;
+  const G = peers[guests[0]];
   return {
-    name: sc.name, secs, viHz, startDelay: sc.startDelay,
+    name: sc.name, secs, viHz, startDelay: sc.startDelay, peers: ids.length,
     rate: +rate.toFixed(4), secsBelow99: secsBelow, windowSecs: tail.length,
     framesH: H.frames, framesG: G.frames,
     stallsH: H.ls.stats.stalls, stallsG: G.ls.stats.stalls,
     stallMsH: Math.round(H.ls.stats.stallMs), stallMsG: Math.round(G.ls.stats.stallMs),
+    stallMs: Object.fromEntries(ids.map((id) => [id, Math.round(peers[id].ls.stats.stallMs)])),
     reanchorsH: H.reanchors, reanchorsG: G.reanchors,
     delayEnd: H.ls.delay, raises: ups, givebacks: downs, reversals,
+    verdicts: Object.fromEntries(ids.map((id) => [id, verdicts[id] ? { kind: verdicts[id].kind, port: verdicts[id].port, text: verdicts[id].text } : null])),
     delayLog, samples,
   };
 }
@@ -189,6 +233,32 @@ const SCEN = {
   // must not read as a slow link.
   'both-slow': { startDelay: 5, cost: { H: (T, rnd) => 26 + rnd() * 12, G: (T, rnd) => 24 + rnd() * 16 },
                  latency: uni(70, 30) },
+  // ROOM 49K4T, as reported: a desktop host with a 4.28x cap and a joiner
+  // that manages 0.93x. The room can only go 0.93x — and the HOST must say it
+  // is waiting on player 2, not blame itself (it did, live).
+  'fast-host-slow-joiner': { startDelay: 3, cost: { H: 20 / 4.28, G: 20 / 0.93 }, latency: uni(25, 8) },
+  // A WAN link, 50-150 ms one way, with 0.3% of packets lost and resent after
+  // a 200 ms RTO (holding up everything behind them — an ordered channel).
+  // Both machines are fast. The room must hold 1.000x once the delay covers it.
+  wan: { startDelay: 7, cost: { H: 5, G: 12 }, latency: (T, rnd) => 100 + (rnd() * 2 - 1) * 50 },
+  // ...and the same link LOSING 0.3% of packets, each resent after a 200 ms
+  // RTO while everything behind it waits (a reliable ORDERED channel). The
+  // delay cannot buy this back without ~350 ms of lag, and the 1.000x
+  // governor never repays a stall, so the room loses ~2%. Recorded, not
+  // hidden: the fix is on the transport (inputs on an unreliable channel,
+  // each packet carrying the last few frames), not in the delay.
+  'wan-loss': { startDelay: 7, cost: { H: 5, G: 12 },
+                latency: (T, rnd) => 100 + (rnd() * 2 - 1) * 50 + (rnd() < 0.003 ? 200 : 0) },
+  // FOUR PLAYERS. All fast, all near: 1.000x, no raises.
+  'four-clean': { peers: ['H', 'G1', 'G2', 'G3'], startDelay: 3, cost: { H: 6, G1: 9, G2: 12, G3: 8 }, latency: uni(20, 5) },
+  // Four players, ONE slow link (player 3's: 150 +-40 ms). Every console
+  // waits, so it is link-shaped; the delay must rise to cover the relayed
+  // path (G1 <-> G2 goes through the host: 20 + 150 ms) and then hold 1.000x.
+  'four-slow-link': { peers: ['H', 'G1', 'G2', 'G3'], startDelay: 3, cost: { H: 6, G1: 9, G2: 8, G3: 8 },
+                      latency: (T, rnd, g) => (g === 'G2' ? 150 + (rnd() * 2 - 1) * 40 : 20 + (rnd() * 2 - 1) * 5) },
+  // Four players, ONE slow MACHINE (player 3 at 0.77x). No raise; every
+  // console names player 3; player 3 names itself.
+  'four-slow-machine': { peers: ['H', 'G1', 'G2', 'G3'], startDelay: 3, cost: { H: 6, G1: 9, G2: 26, G3: 8 }, latency: uni(20, 5) },
   // Bigger hiccups: long enough that one stall outlasts delayBumpAfterMs, so
   // the raise fires every time — the case the give-back has to live with.
   'big-hiccups': { startDelay: 4, cost: { H: 8, G: 8 },
@@ -210,6 +280,24 @@ const EXPECT = {
   spike: (r) => !r.raises ? 'a sustained latency rise was never covered'
              : r.delayEnd > r.startDelay + 1 ? 'the delay never came back down after the spike (ended ' + r.delayEnd + ')' : null,
   'both-slow': (r) => r.raises > 1 ? r.raises + ' raises for two slow MACHINES (delay ' + r.startDelay + ' -> ' + r.delayEnd + ')' : null,
+  'fast-host-slow-joiner': (r) => Math.abs(r.rate - 0.93) > 0.01 ? 'room rate ' + r.rate + ', expected the joiner\'s 0.93x'
+             : r.raises ? r.raises + ' raises for a slow machine'
+             : r.verdicts.H.kind !== 'device' || r.verdicts.H.port !== 1 ? 'the HOST blamed ' + JSON.stringify(r.verdicts.H)
+             : r.verdicts.G.kind !== 'self' ? 'the joiner did not name itself: ' + JSON.stringify(r.verdicts.G)
+             : !/0\.93x/.test(r.verdicts.H.text) ? 'the host\'s sentence lacks the joiner\'s cap: ' + r.verdicts.H.text : null,
+  // After the delay settles, a WAN room holds 1.000x: judged on the last 60 s.
+  wan: (r) => { const t = r.samples.slice(-60); const lo = t.filter((x) => x.rateH < 0.99).length;
+               const m = t.reduce((a, x) => a + x.rateH, 0) / t.length;
+               return m < 0.998 ? 'last 60 s at ' + m.toFixed(4) + 'x (' + lo + ' s below 0.99)' : null; },
+  'wan-loss': (r) => { const t = r.samples.slice(-60); const m = t.reduce((a, x) => a + x.rateH, 0) / t.length;
+               return m < 0.96 ? 'last 60 s at ' + m.toFixed(4) + 'x' : r.reversals > 2 ? r.reversals + ' reversals' : null; },
+  'four-clean': (r) => r.rate < 0.999 ? 'four fast consoles at ' + r.rate : r.raises ? r.raises + ' raises' : null,
+  'four-slow-link': (r) => { const t = r.samples.slice(-60); const m = t.reduce((a, x) => a + x.rateH, 0) / t.length;
+               return !r.raises ? 'never raised for a slow link' : m < 0.995 ? 'last 60 s at ' + m.toFixed(4) + 'x' : null; },
+  'four-slow-machine': (r) => Math.abs(r.rate - 20 / 26) > 0.01 ? 'room rate ' + r.rate + ', expected player 3\'s ' + (20 / 26).toFixed(3)
+             : r.raises ? r.raises + ' raises for a slow machine'
+             : ['H', 'G1', 'G3'].some((id) => r.verdicts[id].kind !== 'device' || r.verdicts[id].port !== 2) ? 'not everyone named player 3: ' + JSON.stringify(r.verdicts)
+             : r.verdicts.G2.kind !== 'self' ? 'player 3 did not name itself: ' + JSON.stringify(r.verdicts.G2) : null,
   // A floor below what the link needs must be raised to what it needs and
   // then HELD: no oscillation, and the time lost to re-probing shrinks.
   'low-sample': (r) => r.delayEnd !== 6 ? 'expected to settle at 6, ended at ' + r.delayEnd
@@ -222,12 +310,13 @@ const EXPECT = {
 
 if (import.meta.url === 'file://' + process.argv[1] || process.argv[1].endsWith('netplay_pace_sim.mjs')) {
   const only = flag('scenario', null);
+  const repay = +flag('repay', '0');
   const secs = +flag('secs', '120');
   const asJson = argv.includes('--json');
   const names = only ? [only] : Object.keys(SCEN);
   let failed = 0;
   for (const n of names) {
-    const r = simulate(Object.assign({ name: n, secs, seed: 7 }, SCEN[n]));
+    const r = simulate(Object.assign({ name: n, secs, seed: 7, repayMs: repay }, SCEN[n]));
     const ex = EXPECT[n] ? EXPECT[n](r) : null;
     if (ex) { failed++; console.log(`  FAIL  ${n}: ${ex}`); }
     if (asJson) console.log(JSON.stringify(r));

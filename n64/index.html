@@ -3479,7 +3479,13 @@ N64Rate.selfTest = function (logFn) {
     // re-anchoring: the guest resumes at exactly 1.000x from here, and the
     // seconds lost stay lost — which is correct, because every machine in the
     // room lost them.
-    if (now - due > period * 2) { LS.baseWall = now; LS.baseFrame = LS.frame; LS.reanchors++; }
+    if (now - due > period * 2) {
+      // The debt being discarded is time this console LOST WITHOUT WAITING — a
+      // frame that ran late on this device. Counted, and published to the room
+      // (ls.selfLostMs), so a late-running device is named as such.
+      LS.lostMs = (LS.lostMs || 0) + (now - due);
+      LS.baseWall = now; LS.baseFrame = LS.frame; LS.reanchors++;
+    }
     return true;
   }
   function lsRunOneFrame(img) {
@@ -3503,7 +3509,13 @@ N64Rate.selfTest = function (logFn) {
       if (!_im || _im.length !== img.length) _im = window.__n64LsImage = new Array(img.length);
       for (var _i = 0; _i < img.length; _i++) _im[_i] = img[_i];
     } catch (e) {}
+    // THIS CONSOLE'S CAPACITY, measured on the frames it actually runs: wall ms
+    // inside one lockstep frame (the whole mainLoopInner — emulation AND the GL
+    // it issues). cap = field period / mean cost; published to the room.
+    var _t0 = performance.now();
     M._neil_ls_run_frame();
+    var _dt = performance.now() - _t0;
+    LS.costAvg = LS.costAvg ? LS.costAvg + 0.02 * (_dt - LS.costAvg) : _dt;
     LS.frame++;
     try { lsGlWitness(); } catch (e) {}
     try { LS.lastFp = M._neil_last_fp ? (M._neil_last_fp() >>> 0) : 0; } catch (e) { LS.lastFp = 0; }
@@ -3650,43 +3662,45 @@ N64Rate.selfTest = function (logFn) {
     if (!ports || !ports.length) return 'another player';
     return ports[0] === 0 ? 'the host' : 'player ' + (ports[0] + 1);
   }
+  function lsSelfCap() { return (LS.viHz > 0 && LS.costAvg > 0) ? (1000 / LS.viHz) / LS.costAvg : 0; }
   function lsPace() {
     var now = performance.now();
     var h = LS.paceHist || (LS.paceHist = []);
     if (!h.length || now - h[h.length - 1].t >= 250) h.push({ t: now, f: LS.frame });
     while (h.length > 2 && now - h[1].t > LS_PACE_HOLD_MS) h.shift();
     var span = h.length ? (now - h[0].t) : 0;
-    var v = { rate: null, slow: false, who: null, text: '', own: null, peers: [] };
+    var ls = lsEngine();
+    // What this console tells the room about itself, every tick: its measured
+    // capacity and the time it lost running late (lib/netplay.js publishes
+    // them in 'lspace', so every other screen can show this player's cap).
+    if (ls) { try { ls.selfCap = lsSelfCap(); ls.selfLostMs = LS.lostMs || 0; if (NET.rttMs) ls.rttMs = NET.rttMs; } catch (e) {} }
+    var v = { rate: null, slow: false, who: null, kind: null, text: '', capsText: '', caps: [] };
+    var pr = null;
+    try { pr = ls && typeof ls.paceReport === 'function' ? ls.paceReport() : null; } catch (e) {}
+    var fx = function (x) { return window.N64Rate ? window.N64Rate.num(x, 2) : x.toFixed(2); };
+    // EVERY PLAYER'S CAP, on every screen: "P1 host 4.28x · P2 1.93x (you)".
+    if (pr) {
+      var rows = [{ ports: pr.self ? pr.self.ports : [], cap: lsSelfCap(), me: true }].concat((pr.peers || []).map(function (p) {
+        return { ports: p.ports, cap: p.cap, me: false };
+      }));
+      rows.sort(function (a, b) { return ((a.ports[0] == null ? 9 : a.ports[0]) - (b.ports[0] == null ? 9 : b.ports[0])); });
+      v.caps = rows;
+      v.capsText = 'Speed caps: ' + rows.map(function (r) {
+        var p = r.ports && r.ports.length ? r.ports[0] : null;
+        return (p == null ? '?' : 'P' + (p + 1) + (p === 0 ? ' host' : '')) + ' ' + (r.cap ? fx(r.cap) + 'x' : '—') + (r.me ? ' (you)' : '');
+      }).join(' · ');
+    }
     if (!LS.running || !(LS.viHz > 0) || span < LS_PACE_HOLD_MS * 0.8) return v;
     v.rate = (h[h.length - 1].f - h[0].f) / (span / 1000) / LS.viHz;
-    var ls = lsEngine(), pr = null;
-    try { pr = ls && typeof ls.paceReport === 'function' ? ls.paceReport() : null; } catch (e) {}
-    var own = pr && pr.own ? pr.own.share : null;
-    var peers = (pr && pr.peers || []).filter(function (p) { return p.ageMs < 4000; });
-    v.own = own; v.peers = peers.map(function (p) { return { ports: p.ports, share: p.share }; });
-    if (v.rate >= LS_PACE_SLOW) return v;
-    v.slow = true;
-    var pct = window.N64Rate ? window.N64Rate.num(v.rate, 2) : v.rate.toFixed(2);
-    var head = 'The room is running at ' + pct + 'x';
-    var waiting = peers.filter(function (p) { return p.share >= 0.1; });
-    if (own !== null && own >= 0.1 && peers.length) {
-      var calm = peers.filter(function (p) { return p.share < own * 0.5; });
-      if (calm.length) {
-        v.who = lsSeatWord(calm[0].ports);
-        v.text = head + ' — waiting on ' + v.who + ': that device cannot run this game at full speed, '
-               + 'and online play can only go as fast as the slowest console.';
-      } else {
-        v.who = 'connection';
-        v.text = head + ' — every console is waiting on the connection; the input delay rises to cover it '
-               + '(now ' + (pr ? pr.delay : '?') + ' frames).';
-      }
-    } else if (own !== null && own < 0.1) {
-      v.who = 'this device';
-      v.text = head + ' — this device cannot run this game at full speed'
-             + (waiting.length ? ', and ' + lsSeatWord(waiting[0].ports) + ' is waiting on it.' : '.');
-    } else {
-      v.text = head + '.';
-    }
+    if (!pr || !Netplay.Lockstep.paceVerdict) return v;
+    // ⚠ THE ATTRIBUTION IS THE ENGINE'S, not a threshold written here. This
+    // used to compare the stalled share to a FIXED 10%, and live (room 49K4T)
+    // a 4.28x desktop host that had waited ~7% — all of a 0.93x room's lost
+    // time — read "< 10%" and blamed itself. Lockstep.paceVerdict compares
+    // waiting to the time the room actually lost, per console, by port.
+    var vd = Netplay.Lockstep.paceVerdict(pr, v.rate, { slowBelow: LS_PACE_SLOW, name: lsSeatWord });
+    v.kind = vd.kind; v.who = vd.port; v.slow = v.rate < LS_PACE_SLOW;
+    v.text = vd.text;
     return v;
   }
   // ---- IS THIS CONSOLE ACTUALLY DRAWING? --------------------------------------
@@ -4172,8 +4186,13 @@ N64Rate.selfTest = function (logFn) {
         var pace = lsPace();
         LS.paceVerdict = pace;
         if (pace.slow) {
-          setMsg('Playing — everyone started together at frame ' + (LS.startedAt | 0) + '. ' + pace.text, '');
-          if (LS.paceSaid !== pace.text) { LS.paceSaid = pace.text; if (!LS_GL.lost) setStatus(pace.text); pageLog('[lockstep] ' + pace.text); }
+          setMsg('Playing — everyone started together at frame ' + (LS.startedAt | 0) + '. ' + pace.text
+                 + (pace.capsText ? ' ' + pace.capsText + '.' : ''), '');
+          // The status line changes only when the VERDICT changes (who/why), not
+          // every time the rate's second decimal moves.
+          var key = pace.kind + ':' + pace.who;
+          if (LS.paceSaid !== key) { LS.paceSaid = key; pageLog('[lockstep] ' + pace.text + ' ' + pace.capsText); }
+          if (!LS_GL.lost) setStatus(pace.text + (pace.capsText ? ' ' + pace.capsText + '.' : ''));
         } else {
           if (LS.paceSaid && pace.rate !== null) {
             LS.paceSaid = '';
@@ -4181,6 +4200,7 @@ N64Rate.selfTest = function (logFn) {
             pageLog('[lockstep] the room is back to full speed (' + window.N64Rate.num(pace.rate, 3) + 'x)');
           }
           setMsg('Playing — everyone started together at frame ' + (LS.startedAt | 0) + '.'
+            + (pace.capsText ? ' ' + pace.capsText + '.' : '')
             + (LS.stalling ? ' Waiting for ' + (LS.waitingOn.length
                 ? LS.waitingOn.map(function (x) { return x === 0 ? 'host' : 'player ' + (x + 1); }).join(', ') : 'a player') + '…' : ''),
             LS.stalling ? '' : 'ok');
@@ -4235,6 +4255,7 @@ N64Rate.selfTest = function (logFn) {
         var ls = sess.ls;
         if (ls && ls.isHost && typeof sess.rttReport === 'function') {
           var rep = await sess.rttReport(600);
+          if (rep && rep.worstMs != null) NET.rttMs = Math.round(rep.worstMs);
           // Clamp matches the engine (Lockstep.recommendDelay answers up to 30): capping at 10 threw the engine's own answer away — see dreamcast.html chooseDelay, "Capping BELOW what the engine supports".
           var want = (rep && rep.recommendedDelay != null)
             ? Math.max(1, Math.min(30, rep.recommendedDelay | 0)) : null;
@@ -4360,6 +4381,10 @@ N64Rate.selfTest = function (logFn) {
     // The rig needs the LIVE engine to seat players, declare ready and deliver
     // the peer's messages. It is the same object the page feeds, not a copy.
     window.__n64LsEngine = ls;
+    // The product kicks the feed the moment an input lands (watchLockstep's
+    // receive wrap); a rig that delivers the peer's messages itself calls this
+    // after each 'ls' so it measures the same pipeline.
+    window.__n64LsKick = function () { if (LS.armed) { try { lsFeed(); } catch (e) {} } };
     // wireNetplay already ran, so the ?np= arming above cannot have fired.
     lsArmFeedTimer();
     return true;

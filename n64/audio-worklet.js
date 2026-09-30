@@ -40,6 +40,21 @@ class N64AudioProcessor extends AudioWorkletProcessor {
     this.underruns = 0;
     this.missing = 0;
     this.sinceReport = 0;
+    // THE PRODUCER'S OWN RATE, measured: frames received per frame of audio
+    // time, over ~4 s. A room that runs at 0.93x (online play goes as fast as
+    // its slowest console) produces 7% fewer samples than the DAC eats, and a
+    // fixed 0.95 floor could only cover 5%: the queue drained, the processor
+    // re-buffered 272 ms of silence, and it did that every ~14 s — "audio cuts
+    // out" (room 49K4T). So the floor FOLLOWS the measured production rate,
+    // slowly (<= 0.5% per second, never below 0.85): a sustained slow room
+    // plays continuously at its own speed, as the game itself is running,
+    // and a short stall is still ridden through by the cushion.
+    this.rxFrames = 0; this.rxAtLast = 0; this.qSinceRate = 0;
+    this.prodEst = 1; this.floor = 0.95;
+    // After a real underrun, resume as soon as a SMALL amount is queued and
+    // let the steering refill the cushion — re-buffering the whole 272 ms
+    // turned every dry spell into a quarter second of extra silence.
+    this.resumeFrames = 2048;
     this.port.onmessage = (e) => {
       const d = e.data;
       if (d && d.s) {
@@ -50,6 +65,7 @@ class N64AudioProcessor extends AudioWorkletProcessor {
           this.ringR[w] = s[2 * i + 1] / 32768;
         }
         this.writeFrame += n;
+        this.rxFrames += n;
         // never let the writer lap the reader (drop oldest by advancing read)
         if (this.writeFrame - this.readPos > RING_FRAMES - 256) {
           this.readPos = this.writeFrame - (RING_FRAMES - 256);
@@ -64,13 +80,22 @@ class N64AudioProcessor extends AudioWorkletProcessor {
     const left = out[0], right = out[1] || out[0];
     const frames = left.length; // 128
     let backlog = this.writeFrame - this.readPos;
-    if (this.buffering && backlog >= this.targetFrames) this.buffering = false;
+    // production-rate estimate, once a second of audio time
+    if (++this.qSinceRate >= 344) {
+      const inst = (this.rxFrames - this.rxAtLast) / (this.qSinceRate * frames);
+      this.rxAtLast = this.rxFrames; this.qSinceRate = 0;
+      if (this.everPlayed) this.prodEst += 0.25 * (Math.min(1.1, inst) - this.prodEst);
+      const tgt = Math.min(0.95, Math.max(0.85, this.prodEst - 0.01));
+      this.floor += Math.max(-0.005, Math.min(0.005, tgt - this.floor));
+    }
+    const resumeAt = this.everPlayed ? Math.min(this.targetFrames, this.resumeFrames) : this.targetFrames;
+    if (this.buffering && backlog >= resumeAt) this.buffering = false;
     let i = 0;
     if (!this.buffering) {
       // steer the resample ratio to hold the queue at target (±5%, smoothed);
       // the audible 0.90 'emergency stretch' is gone — pitch warble traded a
       // dropout for an equally objectionable artifact (user-rejected)
-      const want = Math.min(1.05, Math.max(0.95, 1 + (backlog - this.targetFrames) / (this.targetFrames * 8)));
+      const want = Math.min(1.05, Math.max(this.floor, 1 + (backlog - this.targetFrames) / (this.targetFrames * 8)));
       this.ratio += 0.05 * (want - this.ratio);
       const mask = RING_FRAMES - 1;
       for (; i < frames; i++) {
@@ -90,7 +115,8 @@ class N64AudioProcessor extends AudioWorkletProcessor {
     if (++this.sinceReport >= 11) { // ~32 ms at 128-frame quanta / 44.1 kHz
       this.sinceReport = 0;
       backlog = Math.max(0, this.writeFrame - this.readPos);
-      this.port.postMessage({ b: Math.round(backlog * 2), u: this.underruns, m: this.missing, r: Math.round(this.ratio * 1000) / 1000 });
+      this.port.postMessage({ b: Math.round(backlog * 2), u: this.underruns, m: this.missing, r: Math.round(this.ratio * 1000) / 1000,
+                              p: Math.round(this.prodEst * 1000) / 1000, f: Math.round(this.floor * 1000) / 1000 });
     }
     return true;
   }
