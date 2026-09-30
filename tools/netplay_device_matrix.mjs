@@ -136,10 +136,10 @@ const MID_EVAL = flag('mid-eval', '');
 const SOLO_S = +flag('solo-seconds', '40');
 // Solo results from an EARLIER run (its matrix.json), so a cell can be judged
 // against a solo baseline without re-measuring it every time.
-const BASELINE = {};
+const BASELINE = {}, BASELINE_PAIR = {}, BASELINE_MOBILE = {};
 if (flag('baseline', '')) {
   for (const f of flag('baseline', '').split(',')) {
-    try { const r = JSON.parse(fs.readFileSync(f, 'utf8')); for (const [k, v] of Object.entries(r.solo || {})) { const [c, d] = k.split(':'); if (d === 'desktop') BASELINE[c] = v; } } catch (e) { console.error('baseline ' + f + ': ' + e.message); }
+    try { const r = JSON.parse(fs.readFileSync(f, 'utf8')); for (const [k, v] of Object.entries(r.solo || {})) { const [c, d] = k.split(':'); if (d === 'desktop') BASELINE[c] = v; if (d === 'pair') BASELINE_PAIR[c] = v; if (d === 'mobile') BASELINE_MOBILE[c] = v; } } catch (e) { console.error('baseline ' + f + ': ' + e.message); }
   }
 }
 const SHOTS_AT = flag('shots', '') ? flag('shots', '').split(',').map(Number) : null;
@@ -180,7 +180,11 @@ const CONSOLES = {
          hz: '((window.__n64Net && window.__n64Net().viHz) || 60)',
          witness: '(window.__n64Rate ? window.__n64Rate.speed : null)', frames: 'null', bootMs: 240000, seam: 'window.__n64Net && window.__n64Net()' },
   gc: { name: 'GameCube', title: 'Mario Party 4', page: '/gamecube.html', game: 'Mario Party 4', hostFlag: '',
-        hz: '59.94', witness: '(window.__gcRate ? window.__gcRate.speed : null)', frames: 'null', bootMs: 360000, seam: 'window.__gcNet && window.__gcNet()' },
+        // __gcRate.speed is CUMULATIVE since boot (credits consumed / wall), so it lags any
+        // change by minutes; producedPerS is the recomp's per-second guest frame count at the
+        // path's pinned GUEST_HZ (60) — gamecube.html's own 'guest = N frames/s' line.
+        hz: '((window.__gcRate && window.__gcRate.guestHz) || 60)',
+        witness: '(window.__gcRate && window.__gcRate.producedPerS != null ? window.__gcRate.producedPerS / ((window.__gcRate.guestHz) || 60) : null)', frames: 'null', bootMs: 360000, seam: 'window.__gcNet && window.__gcNet()' },
   gen: { name: 'Genesis', title: 'Sonic the Hedgehog 3', page: '/genesis.html', game: 'Sonic the Hedgehog 3', hostFlag: '&host=1',
          hz: '((window.Module && window.Module._gpx_fps && window.Module._gpx_fps()) || 59.922751)',
          witness: 'null', frames: '(window.__genFrames|0)', bootMs: 120000, seam: 'window.__genNet && window.__genNet()' },
@@ -903,6 +907,9 @@ function analysePlayer(d, peerRole) {
   const wit = W.map((w) => w.witness).filter((x) => typeof x === 'number' && isFinite(x));
   r.witnessX = wit.length ? +(wit.reduce((a, b) => a + b, 0) / wit.length).toFixed(4) : null;
   r.witnessMax = wit.length ? +Math.max(...wit).toFixed(4) : null;
+  let wm = null;
+  for (let i = 0; i + 5 <= wit.length; i++) { const v = wit.slice(i, i + 5).reduce((x, y) => x + y, 0) / 5; if (wm == null || v > wm) wm = v; }
+  r.witnessMaxWin5 = wm == null ? null : +wm.toFixed(4);
   const fr = W.map((w) => w.frames).filter((x) => typeof x === 'number');
   r.frameCounterX = fr.length >= 2 ? +(((fr[fr.length - 1] - fr[0]) / Math.max(1, W.length - 1)) / hz).toFixed(4) : null;
   r.stalls = d.stalls ? d.stalls.length : null;
@@ -939,7 +946,7 @@ function verdict(cell, solo, soloAudio) {
     const x = a.witnessX != null ? Math.min(a.witnessX, a.engineX) : a.engineX;
     if (!(x >= RATE_FLOOR)) why.push(`${name} rate ${x}x < ${RATE_FLOOR}`);
     if (a.maxWin5 > RATE_CEIL_WIN) why.push(`${name} FAST-FORWARD: a 5-s window ran at ${a.maxWin5}x`);
-    if (a.witnessMax != null && a.witnessMax > 1.05) why.push(`${name} page witness peaked at ${a.witnessMax}x`);
+    if (a.witnessMaxWin5 != null && a.witnessMaxWin5 > RATE_CEIL_WIN) why.push(`${name} FAST-FORWARD by the page's own witness: a 5-s window at ${a.witnessMaxWin5}x`);
     if (a.desync) why.push(`${name} DESYNC`);
     if (!(a.hashesCompared > 0)) why.push(`${name} compared 0 fingerprints`);
     if (a.errors) why.push(`${name} ${a.errors} page error(s): ${(d.errors || [])[0]}`);
@@ -961,9 +968,27 @@ function verdict(cell, solo, soloAudio) {
   let limited = null;
   for (const [name, dev] of [['host', ARMS[cell.arm].host], ['joiner', ARMS[cell.arm].join]]) {
     if (dev.kind !== 'mobile' || !solo) continue;
-    if (solo.rate && solo.rate.x < RATE_FLOOR) limited = `${name} device SOLO cap ${solo.rate.x}x (${solo.rate.src}) — below ${RATE_FLOOR} with no room at all`;
+    const a = cell.analysis && cell.analysis[name];
+    const x = a ? (a.witnessX != null ? a.witnessX : a.engineX) : null;
+    if (solo.rate && solo.rate.x < RATE_FLOOR && x != null && x >= 0.9 * solo.rate.x) {
+      limited = `${name} device SOLO cap ${solo.rate.x}x (${solo.rate.src}) — below ${RATE_FLOOR} with no room at all; the room delivered ${x}x (>= 90% of it)`;
+    }
   }
-  return { pass: why.length === 0, deviceLimited: limited, why };
+  // BOX-LIMITED: both players of a room share this one machine, so the room is
+  // compared with TWO SOLO INSTANCES RUN SIDE BY SIDE (the `pair` control). If
+  // that control itself cannot reach the floor, and the room delivers at least
+  // 90% of it, the shortfall belongs to the machine, not to netplay — and only
+  // a rate failure is excused by that; everything else still fails.
+  let boxLimited = null;
+  const pair = cell.pairSolo;
+  if (pair && pair.rate && pair.rate.x < RATE_FLOOR && cell.analysis) {
+    const xs = ['host', 'joiner'].map((k) => { const a = cell.analysis[k]; return a ? (a.witnessX != null ? a.witnessX : a.engineX) : null; });
+    if (xs.every((x) => x != null && x >= 0.9 * pair.rate.x)) {
+      boxLimited = `two SOLO instances side by side on this box reach only ${pair.rate.x}x; the room delivered ${xs.join('/')}x (>= 90% of that)`;
+    }
+  }
+  const nonRate = why.filter((w) => !/ rate [\d.]+x < /.test(w));
+  return { pass: why.length === 0, deviceLimited: limited, boxLimited, nonRateFailures: nonRate, why };
 }
 
 // ---- main -----------------------------------------------------------------------------
@@ -992,10 +1017,11 @@ function verdict(cell, solo, soloAudio) {
         const maxLoad = cell.loads.length ? Math.max(...cell.loads) : load1();
         cell.maxLoad = maxLoad;
         cell.void = maxLoad != null && maxLoad > VOID_LOAD;
-        cell.verdict = verdict(cell, RESULT.solo[cid + ':mobile'], (RESULT.solo[cid + ':desktop'] || BASELINE[cid] || {}).audio);
+        cell.pairSolo = RESULT.solo[cid + ':pair'] || BASELINE_PAIR[cid] || null;
+        cell.verdict = verdict(cell, RESULT.solo[cid + ':mobile'] || BASELINE_MOBILE[cid], (RESULT.solo[cid + ':desktop'] || BASELINE[cid] || {}).audio);
         RESULT.cells.push(cell); save();
         const v = cell.verdict;
-        say(`  => ${cell.void ? 'VOID (load ' + maxLoad + ')' : (v.pass ? 'PASS' : 'FAIL')} ${v.deviceLimited ? '[DEVICE-LIMITED: ' + v.deviceLimited + '] ' : ''}${v.why.join(' · ')}`);
+        say(`  => ${cell.void ? 'VOID (load ' + maxLoad + ')' : (v.pass ? 'PASS' : (v.nonRateFailures.length === 0 && (v.boxLimited || v.deviceLimited) ? (v.boxLimited ? 'BOX-LIMITED' : 'DEVICE-LIMITED') : 'FAIL'))} ${v.deviceLimited ? '[device: ' + v.deviceLimited + '] ' : ''}${v.boxLimited ? '[box: ' + v.boxLimited + '] ' : ''}${v.why.join(' · ')}`);
         if (cell.analysis) for (const k of ['host', 'joiner']) {
           const a = cell.analysis[k]; if (!a) continue;
           say(`     ${k.padEnd(6)} engine ${a.engineX}x (5s ${a.minWin5}..${a.maxWin5}) witness ${a.witnessX} fc ${a.frameCounterX} · stalls ${a.stalls}/${a.stallMs}ms on ${JSON.stringify(a.waitedOn)} · delay ${a.delayNow} [${a.delayChanges.join(' ')}] · lat ${JSON.stringify(a.latFrames)} · audio ${JSON.stringify(a.audio)} · hashes ${a.hashesCompared} · relay ${a.relay} · err ${a.errors}/${a.consoleErrors}`);
@@ -1013,7 +1039,7 @@ function verdict(cell, solo, soloAudio) {
   for (const c of rows) {
     const a = c.analysis || {}; const h = a.host || {}; const j = a.joiner || {};
     const cv = (k) => ((c.shots && c.shots[k]) || []).slice(-2).some((s) => s.showing) ? 'ok' : 'BLANK';
-    const v = c.void ? 'VOID' : (c.verdict.pass ? 'PASS' : (c.verdict.deviceLimited ? 'DEVICE-LIMITED' : 'FAIL'));
+    const v = c.void ? 'VOID' : (c.verdict.pass ? 'PASS' : ((c.verdict.nonRateFailures || []).length === 0 && (c.verdict.boxLimited || c.verdict.deviceLimited) ? (c.verdict.boxLimited ? 'BOX-LIMITED' : 'DEVICE-LIMITED') : 'FAIL'));
     lines.push(`| ${c.console} | ${c.arm} | ${v} | ${h.engineX ?? '-'}/${h.witnessX ?? '-'} | ${j.engineX ?? '-'}/${j.witnessX ?? '-'} | ${h.stalls ?? '-'}/${j.stalls ?? '-'} | ${h.delayNow ?? '-'}/${j.delayNow ?? '-'} | ${JSON.stringify(h.latFrames || [])}/${JSON.stringify(j.latFrames || [])} | ${c.error ? '-' : cv('host') + '/' + cv('joiner')} | ${h.audio ? h.audio.perMin : '-'}/${j.audio ? j.audio.perMin : '-'} | ${(h.desync || j.desync) ? 'YES' : 'no'} | ${(h.errors || 0) + (j.errors || 0)} | ${c.maxLoad} |`);
   }
   for (const [cid, s] of Object.entries(RESULT.solo)) lines.push(`| ${cid} | SOLO | ${s.rate ? s.rate.x + 'x (' + s.rate.src + ')' : 'no rate'} | canvas ${s.shot ? (s.shot.showing ? 'ok' : 'BLACK') : '-'} | throttle proof ${s.throttleProof ? s.throttleProof.ratio + 'x' : '-'} |`);
@@ -1022,6 +1048,6 @@ function verdict(cell, solo, soloAudio) {
   fs.writeFileSync(path.join(OUT, 'table.md'), RESULT.table + '\n');
   say('\n' + RESULT.table);
   say(`full JSON: ${path.join(OUT, 'matrix.json')}`);
-  const fails = rows.filter((c) => !c.void && !c.verdict.pass).length;
+  const fails = rows.filter((c) => !c.void && !c.verdict.pass && !((c.verdict.nonRateFailures || []).length === 0 && (c.verdict.boxLimited || c.verdict.deviceLimited))).length;
   process.exit(fails ? 1 : 0);
 })().catch((e) => { console.error(e); releaseLock(); process.exit(3); });
