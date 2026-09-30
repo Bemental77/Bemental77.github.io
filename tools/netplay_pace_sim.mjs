@@ -74,12 +74,25 @@ export function simulate(sc) {
   const RELAYED = { ls: 1, lsh: 1, lsd: 1, lsping: 1, lspong: 1, lspace: 1 };
   let live = false;
   const lastAt = {};   // ordered per directed link
+  // TWO CHANNELS PER LINK. Control traffic, and everything when
+  // sc.transport is not 'unreliable', rides a RELIABLE ORDERED channel: a
+  // lost packet (sc.loss) is resent after sc.rto and everything behind it on
+  // that channel waits (head-of-line). With sc.transport === 'unreliable',
+  // input messages ('ls' without `rel`) ride an UNORDERED, maxRetransmits:0
+  // channel: a lost packet is simply gone, and nothing waits for it.
+  const stats = { dropped: 0, resent: 0 };
   const link = (from, to, m) => {
-    // one-way latency of the host<->guest link that `from`/`to` share
-    const g = from === 'H' ? to : from;
+    const g = from === 'H' ? to : from;                // the host<->guest link in use
     const lat = Math.max(0, sc.latency(T, rnd, g));
+    const lost = sc.loss > 0 && rnd() < sc.loss;
+    if (sc.transport === 'unreliable' && m.t === 'ls' && !m.rel) {
+      if (lost) { stats.dropped++; return; }
+      q.push(T + lat, () => arrive(to, m, from));
+      return;
+    }
     const k = from + '>' + to;
-    const at = Math.max(lastAt[k] || 0, T + lat);
+    if (lost) stats.resent++;
+    const at = Math.max(lastAt[k] || 0, T + lat + (lost ? (sc.rto || 200) : 0));
     lastAt[k] = at;
     q.push(at, () => arrive(to, m, from));
   };
@@ -113,7 +126,16 @@ export function simulate(sc) {
   const H = peers.H;
   H.ls.on('delay', (e) => delayLog.push({ t: +(T / 1000).toFixed(2), from: e.from, to: e.to, at: e.at, down: e.to < e.from }));
   for (const id of ids) H.ls.seat(id, 1);
-  H.ls.delay = sc.startDelay;        // what the page picks from the RTT sample at Ready
+  // What the page picks at Ready. sc.pingSamples: choose it the way the page
+  // now does — N round trips per guest, jitter margin — instead of a fixed value.
+  let startDelay = sc.startDelay;
+  if (sc.pingSamples) {
+    const byPeer = {};
+    for (const g of guests) { byPeer[g] = []; for (let i = 0; i < sc.pingSamples; i++) byPeer[g].push(sc.latency(0, rnd, g) + sc.latency(0, rnd, g)); }
+    startDelay = Lockstep.recommendDelayForRoom(byPeer, period);
+    sc.startDelay = startDelay;
+  }
+  H.ls.delay = startDelay;
   for (const id of ids) peers[id].ls.declareReady('g');
   for (const id of ids) if (peers[id].ls.state !== 'running') throw new Error('barrier did not release for ' + id);
   live = true;
@@ -198,6 +220,7 @@ export function simulate(sc) {
     stallMs: Object.fromEntries(ids.map((id) => [id, Math.round(peers[id].ls.stats.stallMs)])),
     reanchorsH: H.reanchors, reanchorsG: G.reanchors,
     delayEnd: H.ls.delay, raises: ups, givebacks: downs, reversals,
+    dropped: stats.dropped, resent: stats.resent, naks: ids.reduce((a, id) => a + (peers[id].ls.stats.naksSent || 0), 0),
     verdicts: Object.fromEntries(ids.map((id) => [id, verdicts[id] ? { kind: verdicts[id].kind, port: verdicts[id].port, text: verdicts[id].text } : null])),
     delayLog, samples,
   };
@@ -247,8 +270,21 @@ const SCEN = {
   // governor never repays a stall, so the room loses ~2%. Recorded, not
   // hidden: the fix is on the transport (inputs on an unreliable channel,
   // each packet carrying the last few frames), not in the delay.
-  'wan-loss': { startDelay: 7, cost: { H: 5, G: 12 },
-                latency: (T, rnd) => 100 + (rnd() * 2 - 1) * 50 + (rnd() < 0.003 ? 200 : 0) },
+  'wan-loss': { startDelay: 7, cost: { H: 5, G: 12 }, loss: 0.003, rto: 200,
+                latency: (T, rnd) => 100 + (rnd() * 2 - 1) * 50 },
+  // THE SAME LINK, with inputs on an UNORDERED, UNRELIABLE channel and every
+  // input message carrying the last delay+2 frames (lib/netplay.js
+  // _sendInputs). A lost packet is covered by the next one; nothing waits on
+  // a retransmission. Target: >= 0.999x with no repay.
+  'wan-loss-unreliable': { startDelay: 7, pingSamples: 8, cost: { H: 5, G: 12 }, loss: 0.003, rto: 200, transport: 'unreliable',
+                           latency: (T, rnd) => 100 + (rnd() * 2 - 1) * 50 },
+  // ...at 2% loss, where bursts can outrun the window: the NAK path must keep
+  // it from ever wedging.
+  'wan-heavy-loss-unreliable': { startDelay: 7, pingSamples: 8, cost: { H: 5, G: 12 }, loss: 0.02, rto: 200, transport: 'unreliable',
+                                 latency: (T, rnd) => 100 + (rnd() * 2 - 1) * 50 },
+  // Four players on that lossy WAN, unreliable inputs relayed by the host.
+  'four-wan-loss-unreliable': { peers: ['H', 'G1', 'G2', 'G3'], startDelay: 8, pingSamples: 8, cost: { H: 6, G1: 9, G2: 12, G3: 8 },
+                                loss: 0.003, rto: 200, transport: 'unreliable', latency: (T, rnd) => 60 + (rnd() * 2 - 1) * 30 },
   // FOUR PLAYERS. All fast, all near: 1.000x, no raises.
   'four-clean': { peers: ['H', 'G1', 'G2', 'G3'], startDelay: 3, cost: { H: 6, G1: 9, G2: 12, G3: 8 }, latency: uni(20, 5) },
   // Four players, ONE slow link (player 3's: 150 +-40 ms). Every console
@@ -289,6 +325,12 @@ const EXPECT = {
   wan: (r) => { const t = r.samples.slice(-60); const lo = t.filter((x) => x.rateH < 0.99).length;
                const m = t.reduce((a, x) => a + x.rateH, 0) / t.length;
                return m < 0.998 ? 'last 60 s at ' + m.toFixed(4) + 'x (' + lo + ' s below 0.99)' : null; },
+  'wan-loss-unreliable': (r) => { const t = r.samples.slice(-60); const m = t.reduce((a, x) => a + x.rateH, 0) / t.length;
+               return m < 0.999 ? 'last 60 s at ' + m.toFixed(4) + 'x (target 0.999, no repay)' : null; },
+  'wan-heavy-loss-unreliable': (r) => { const t = r.samples.slice(-60); const m = t.reduce((a, x) => a + x.rateH, 0) / t.length;
+               return m < 0.99 ? 'last 60 s at ' + m.toFixed(4) + 'x' : null; },
+  'four-wan-loss-unreliable': (r) => { const t = r.samples.slice(-60); const m = t.reduce((a, x) => a + x.rateH, 0) / t.length;
+               return m < 0.999 ? 'last 60 s at ' + m.toFixed(4) + 'x' : null; },
   'wan-loss': (r) => { const t = r.samples.slice(-60); const m = t.reduce((a, x) => a + x.rateH, 0) / t.length;
                return m < 0.96 ? 'last 60 s at ' + m.toFixed(4) + 'x' : r.reversals > 2 ? r.reversals + ' reversals' : null; },
   'four-clean': (r) => r.rate < 0.999 ? 'four fast consoles at ' + r.rate : r.raises ? r.raises + ' raises' : null,
