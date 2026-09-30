@@ -146,6 +146,32 @@ const bad=(n,d)=>{fail++;console.log('  FAIL  '+n+' — '+d);};
     : bad('a-guest-adopts-the-same-floor-from-lsgo', `state ${g.state}, delay ${g.delay}, floor ${g._delayFloor}`);
 }
 
+// ---- A BUSY PEER'S PING IS NOT THE WIRE (2026-09-30, live N64 room) ---------
+// ICE RTT 51 ms, one ping taken while the phone was booting read 506 ms ->
+// "input delay 3 -> 17 frames" (340 ms at 50 Hz), and the floor pinned it.
+{
+  const L = globalThis.Netplay.Lockstep;
+  const d = L.recommendDelayFromSamples([48, 50, 52, 55, 60, 506], 20);
+  (d === 3) ? ok('a-busy-thread-outlier-does-not-size-the-delay', `[48..60, 506] at 50 Hz -> ${d}`)
+            : bad('a-busy-thread-outlier-does-not-size-the-delay', `got ${d}, want 3`);
+  const relay = L.recommendDelayFromSamples([202, 390, 400, 518, 300], 20);
+  (relay >= 17) ? ok('a-genuinely-slow-jittery-relay-still-gets-a-big-delay', `relay samples -> ${relay}`)
+                : bad('a-genuinely-slow-jittery-relay-still-gets-a-big-delay', `got ${relay}, want >= 17`);
+  const ls = new L({ peerId:'H', host:true, localPorts:[0], portCount:4, padBytes:8,
+    send:(m)=>sent.push(m), now:()=>now });
+  ls.roster=['H','G',null,null];
+  ls.netFloorDelay = 3; ls.delay = 17;           // what Session.rttReport + the page set
+  ls.begin();
+  (ls._delayFloor === 3) ? ok('an-inflated-start-is-not-the-floor', `start 17, wire floor 3 -> floor ${ls._delayFloor}`)
+                         : bad('an-inflated-start-is-not-the-floor', `floor ${ls._delayFloor}`);
+  ls.frame = 200; ls._queuedTo = 217; ls._leadMinPrev = 14; ls._leadMinCur = 15;
+  now += 100000; ls._lastStallAt = now - ls.delayCalmMs - 1; ls._lastGiveBackAt = 0;
+  const r = ls._maybeGiveDelayBack();
+  (r && ls._pendingDelay && ls._pendingDelay.d === 4)
+    ? ok('proven-slack-gives-the-lag-back-in-one-window', `17 -> ${ls._pendingDelay.d} (lead >= 14 for a full bucket)`)
+    : bad('proven-slack-gives-the-lag-back-in-one-window', JSON.stringify(ls._pendingDelay));
+}
+
 // ---- NEVER LOWER INTO A DELAY THE LINK JUST FAILED AT (2026-09-30) ----------
 // Measured before this: tools/netplay_pace_sim.mjs big-hiccups oscillated
 // 4->6->5->4->6 every 12 s (9 reversals in 120 s).
@@ -169,11 +195,12 @@ const bad=(n,d)=>{fail++;console.log('  FAIL  '+n+' — '+d);};
     ? ok('it-does-not-step-into-the-failed-delay-during-the-cooldown', `held at ${ls.delay}`)
     : bad('it-does-not-step-into-the-failed-delay-during-the-cooldown', `delay ${ls.delay}, pending ${JSON.stringify(ls._pendingDelay)}`);
   // ...unless the link has PROVED slack: a full calm bucket whose smallest lead
-  // leaves a frame of margin after the step
+  // leaves a frame of margin after the step. Since 2026-09-30 the step IS the
+  // proven slack (lead 3 -> 2 frames unneeded), not one frame of it.
   ls._leadMinPrev = 3; ls._leadMinCur = 4;
   const r3 = ls._maybeGiveDelayBack();
-  (r3 && ls._pendingDelay && ls._pendingDelay.d === 4)
-    ? ok('measured-slack-overrides-the-cooldown', `lead >= 3 for a full bucket -> 5 -> 4`)
+  (r3 && ls._pendingDelay && ls._pendingDelay.d === 3)
+    ? ok('measured-slack-overrides-the-cooldown', `lead >= 3 for a full bucket -> 5 -> 3`)
     : bad('measured-slack-overrides-the-cooldown', JSON.stringify(ls._pendingDelay));
   // after the cooldown, it may try 4 again — and failing at 4 AGAIN doubles it
   const cd1 = ls._failCooldown;
