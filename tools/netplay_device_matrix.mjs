@@ -211,7 +211,7 @@ const ARMS = {
   a: { id: 'a', what: 'desktop host + desktop joiner', host: DESKTOP, join: DESKTOP },
   b: { id: 'b', what: 'mobile-emulated 4x-throttled HOST + desktop joiner', host: MOBILE, join: DESKTOP },
   c: { id: 'c', what: 'desktop host + mobile-emulated 4x-throttled JOINER', host: DESKTOP, join: MOBILE },
-  d: { id: 'd', what: 'desktop pair, P2P link 100 ms one-way + 2% retransmit (+200 ms, head-of-line)',
+  d: { id: 'd', what: 'desktop pair, P2P link 100 ms one-way; 2% loss (reliable channel: +200 ms retransmit, head-of-line; unreliable channel: dropped)',
        host: DESKTOP, join: DESKTOP, p2p: { delayMs: 100, lossFrac: 0.02, rtxMs: 200 } },
   drelay: { id: 'drelay', what: 'desktop pair, room forced onto RELAY mode; broker 100 ms one-way + 2% loss',
             host: DESKTOP, join: DESKTOP, relay: true, broker: { delayMs: 100, loss: 0.02 } },
@@ -457,6 +457,17 @@ function preloadSrc(cfg) {
       const ch = this;
       let q = Q.get(ch); if (!q) { q = { last: 0 }; Q.set(ch, q); }
       M.p2p.sent++;
+      // An UNRELIABLE channel (lib/netplay.js's 'lsu' input channel: unordered
+      // or maxRetransmits 0) loses the message outright; a reliable ordered one
+      // retransmits and blocks everything behind it.
+      const unreliable = ch.ordered === false || ch.maxRetransmits === 0;
+      if (unreliable) {
+        M.p2p.unreliable = (M.p2p.unreliable || 0) + 1;
+        if (Math.random() < CFG.p2p.lossFrac) { M.p2p.lost = (M.p2p.lost || 0) + 1; return; }
+        const at = now() + CFG.p2p.delayMs;
+        setTimeout(() => { try { if (ch.readyState === 'open') send.call(ch, data); } catch (e) {} }, CFG.p2p.delayMs);
+        return;
+      }
       const rtx = Math.random() < CFG.p2p.lossFrac;
       if (rtx) M.p2p.rtx++;
       const at = Math.max(now() + CFG.p2p.delayMs + (rtx ? CFG.p2p.rtxMs : 0), q.last);
