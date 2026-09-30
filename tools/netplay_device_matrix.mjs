@@ -959,7 +959,12 @@ function verdict(cell, solo, soloAudio) {
     // room must not make audio worse than the same game alone (x1.25 for
     // scene-to-scene variation), and never less than the flat floor.
     const soloPm = soloAudio && soloAudio.perMin != null ? soloAudio.perMin : null;
-    const allow = Math.max(AUDIO_DROPOUTS_PER_MIN, soloPm != null ? soloPm * 1.25 : 0);
+    // When the box itself cannot run two of these side by side (pair control below
+    // the floor), a starved producer is the box's too: the pair control's own
+    // dropout rate is then the reference instead.
+    const pairA = cell.pairSolo && cell.pairSolo.rate && cell.pairSolo.rate.x < RATE_FLOOR && cell.pairSolo.audio ? cell.pairSolo.audio.perMin : null;
+    const allow = Math.max(AUDIO_DROPOUTS_PER_MIN, soloPm != null ? soloPm * 1.25 : 0, pairA != null ? pairA * 1.25 : 0);
+    a.audio.pairPerMin = pairA;
     a.audio.allowPerMin = +allow.toFixed(2); a.audio.soloPerMin = soloPm;
     if (perMinExcess > allow) why.push(`${name} audio ${a.audio.dropouts} dropouts (${a.audio.perMin}/min; ${perMinExcess.toFixed(1)}/min beyond stalls; allowed ${allow.toFixed(1)}${soloPm != null ? ' = solo ' + soloPm + ' x1.25' : ''})`);
   }
@@ -992,6 +997,44 @@ function verdict(cell, solo, soloAudio) {
 }
 
 // ---- main -----------------------------------------------------------------------------
+function buildTable(RESULT) {
+  const rows = RESULT.cells.filter((c, i, a) => !a.slice(i + 1).some((d) => d.console === c.console && d.arm === c.arm));
+  const lines = ['| console | arm | verdict | host x (engine/witness) | joiner x | stalls h/j | delay h/j | lat frames h/j | canvas h/j | audio drop/min h/j | desync | errors | load |',
+                 '|---|---|---|---|---|---|---|---|---|---|---|---|---|'];
+  for (const c of rows) {
+    const a = c.analysis || {}; const h = a.host || {}; const j = a.joiner || {};
+    const cv = (k) => ((c.shots && c.shots[k]) || []).slice(-2).some((s) => s.showing) ? 'ok' : 'BLANK';
+    const v = c.void ? 'VOID' : (c.verdict.pass ? 'PASS' : ((c.verdict.nonRateFailures || []).length === 0 && (c.verdict.boxLimited || c.verdict.deviceLimited) ? (c.verdict.boxLimited ? 'BOX-LIMITED' : 'DEVICE-LIMITED') : 'FAIL'));
+    lines.push(`| ${c.console} | ${c.arm} | ${v} | ${h.engineX ?? '-'}/${h.witnessX ?? '-'} | ${j.engineX ?? '-'}/${j.witnessX ?? '-'} | ${h.stalls ?? '-'}/${j.stalls ?? '-'} | ${h.delayNow ?? '-'}/${j.delayNow ?? '-'} | ${JSON.stringify(h.latFrames || [])}/${JSON.stringify(j.latFrames || [])} | ${c.error ? '-' : cv('host') + '/' + cv('joiner')} | ${h.audio ? h.audio.perMin : '-'}/${j.audio ? j.audio.perMin : '-'} | ${(h.desync || j.desync) ? 'YES' : 'no'} | ${(h.errors || 0) + (j.errors || 0)} | ${c.maxLoad} |`);
+  }
+  for (const [cid, s] of Object.entries(RESULT.solo)) lines.push(`| ${cid} | SOLO | ${s.rate ? s.rate.x + 'x (' + s.rate.src + ')' : 'no rate'} | canvas ${s.shot ? (s.shot.showing ? 'ok' : 'BLACK') : '-'} | throttle proof ${s.throttleProof ? s.throttleProof.ratio + 'x' : '-'} |`);
+  return { rows, table: lines.join('\n') };
+}
+const cellLabel = (c) => c.void ? 'VOID' : (c.verdict.pass ? 'PASS' : ((c.verdict.nonRateFailures || []).length === 0 && (c.verdict.boxLimited || c.verdict.deviceLimited) ? (c.verdict.boxLimited ? 'BOX-LIMITED' : 'DEVICE-LIMITED') : 'FAIL'));
+
+// --rejudge a.json,b.json: recompute every verdict from saved cells with the
+// CURRENT thresholds and --baseline solos, and print one combined table. The
+// newest cell per console x arm wins (files in the order given).
+if (flag('rejudge', '')) {
+  const R = { solo: {}, cells: [] };
+  for (const f of flag('rejudge', '').split(',')) {
+    const r = JSON.parse(fs.readFileSync(f, 'utf8'));
+    Object.assign(R.solo, r.solo || {});
+    for (const c of r.cells || []) { c.from = f; R.cells.push(c); }
+  }
+  for (const c of R.cells) {
+    const cid = c.console;
+    c.pairSolo = R.solo[cid + ':pair'] || BASELINE_PAIR[cid] || null;
+    c.verdict = verdict(c, R.solo[cid + ':mobile'] || BASELINE_MOBILE[cid], (BASELINE[cid] || R.solo[cid + ':desktop'] || {}).audio);
+  }
+  const { rows, table } = buildTable(R);
+  console.log(table);
+  for (const c of rows) console.log(`${c.console}/${c.arm} [${cellLabel(c)}] ${c.verdict.why.join(' · ')}${c.verdict.boxLimited ? ' [box: ' + c.verdict.boxLimited + ']' : ''}${c.verdict.deviceLimited ? ' [device: ' + c.verdict.deviceLimited + ']' : ''} (${c.from})`);
+  const out = flag('rejudge-out', '');
+  if (out) fs.writeFileSync(out, JSON.stringify({ table, cells: rows.map((c) => ({ console: c.console, arm: c.arm, label: cellLabel(c), why: c.verdict.why, analysis: c.analysis, from: c.from })) }, null, 1));
+  process.exit(0);
+}
+
 (async () => {
   say(`=== netplay device matrix · consoles=${consoles.join(',')} arms=${arms.join(',')} seconds=${SECONDS} ===`);
   say(`uptime: ${uptime()} · free ${freeGB() && freeGB().toFixed(2)} GB · out ${OUT}`);
@@ -1032,18 +1075,9 @@ function verdict(cell, solo, soloAudio) {
       }
     }
   }
-  // ---- summary table ----
-  const rows = RESULT.cells.filter((c, i, a) => !a.slice(i + 1).some((d) => d.console === c.console && d.arm === c.arm));
-  const lines = ['| console | arm | verdict | host x (engine/witness) | joiner x | stalls h/j | delay h/j | lat frames h/j | canvas h/j | audio drop/min h/j | desync | errors | load |',
-                 '|---|---|---|---|---|---|---|---|---|---|---|---|---|'];
-  for (const c of rows) {
-    const a = c.analysis || {}; const h = a.host || {}; const j = a.joiner || {};
-    const cv = (k) => ((c.shots && c.shots[k]) || []).slice(-2).some((s) => s.showing) ? 'ok' : 'BLANK';
-    const v = c.void ? 'VOID' : (c.verdict.pass ? 'PASS' : ((c.verdict.nonRateFailures || []).length === 0 && (c.verdict.boxLimited || c.verdict.deviceLimited) ? (c.verdict.boxLimited ? 'BOX-LIMITED' : 'DEVICE-LIMITED') : 'FAIL'));
-    lines.push(`| ${c.console} | ${c.arm} | ${v} | ${h.engineX ?? '-'}/${h.witnessX ?? '-'} | ${j.engineX ?? '-'}/${j.witnessX ?? '-'} | ${h.stalls ?? '-'}/${j.stalls ?? '-'} | ${h.delayNow ?? '-'}/${j.delayNow ?? '-'} | ${JSON.stringify(h.latFrames || [])}/${JSON.stringify(j.latFrames || [])} | ${c.error ? '-' : cv('host') + '/' + cv('joiner')} | ${h.audio ? h.audio.perMin : '-'}/${j.audio ? j.audio.perMin : '-'} | ${(h.desync || j.desync) ? 'YES' : 'no'} | ${(h.errors || 0) + (j.errors || 0)} | ${c.maxLoad} |`);
-  }
-  for (const [cid, s] of Object.entries(RESULT.solo)) lines.push(`| ${cid} | SOLO | ${s.rate ? s.rate.x + 'x (' + s.rate.src + ')' : 'no rate'} | canvas ${s.shot ? (s.shot.showing ? 'ok' : 'BLACK') : '-'} | throttle proof ${s.throttleProof ? s.throttleProof.ratio + 'x' : '-'} |`);
-  RESULT.table = lines.join('\n');
+  const { rows, table: _t } = buildTable(RESULT);
+  RESULT.table = _t;
+
   save();
   fs.writeFileSync(path.join(OUT, 'table.md'), RESULT.table + '\n');
   say('\n' + RESULT.table);
