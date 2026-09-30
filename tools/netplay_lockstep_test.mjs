@@ -382,7 +382,7 @@ console.log('\n== a peer that goes away is reported, not waited on forever ==');
   t += 600;
   b.H.beginFrame(pad(1));
   is('budget-fails', b.H.state, 'failed');
-  /no input from A/.test(b.H.error || '') ? ok('budget-names-them', b.H.error) : bad('budget-names-them', String(b.H.error));
+  /no input from player 2/.test(b.H.error || '') ? ok('budget-names-them', b.H.error) : bad('budget-names-them', String(b.H.error));
 }
 
 console.log('\n== a long session does not grow without bound ==');
