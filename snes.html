@@ -787,6 +787,16 @@
       NET.startedAtFrame = ls.frame | 0;   // "everyone started together at frame N"
       pageLog('[lockstep] FRAME GATE ENGAGED at frame ' + ls.frame + ' — delay=' + ls.delay
         + ' frames (' + Math.round(ls.delay * FRAME_MS) + ' ms), ports=' + JSON.stringify(ls.roster));
+      // ⚠ THE PARTY PANEL GETS OUT OF THE WAY THE MOMENT THE GAME STARTS. A
+      // lobby hand-off opens it (netOpen() in the ?np= receiver) and nothing
+      // closed it, so every player started the room behind a modal covering the
+      // game. That is not only a view problem: compositing the full-page
+      // overlay over a canvas repainted every frame cost the page its frame
+      // rate. Measured with tools/netplay_device_matrix.mjs (genesis, two
+      // desktop players): rAF ~42/s and 0.93x delivered with the panel open,
+      // 60/s and ~0.995x within one second of closing it (/tmp/npdm/gen-a-close).
+      // The room's state stays on the HUD and on the Party button.
+      if (typeof netClose === 'function') { netClose(); pageLog('[net] the game started — party panel closed'); }
     }
     var r = ls.beginFrame(lsLocalPads());
     if (!r || !r.ready) {
