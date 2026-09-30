@@ -133,6 +133,16 @@ const PROFILE_S = +flag('profile', '0');
 // DIAGNOSTIC: JS evaluated on BOTH players at the midpoint of the measured
 // window (e.g. to close an overlay and see whether the frame rate recovers).
 const MID_EVAL = flag('mid-eval', '');
+const SOLO_S = +flag('solo-seconds', '40');
+// Solo results from an EARLIER run (its matrix.json), so a cell can be judged
+// against a solo baseline without re-measuring it every time.
+const BASELINE = {};
+if (flag('baseline', '')) {
+  for (const f of flag('baseline', '').split(',')) {
+    try { const r = JSON.parse(fs.readFileSync(f, 'utf8')); for (const [k, v] of Object.entries(r.solo || {})) { const [c, d] = k.split(':'); if (d === 'desktop') BASELINE[c] = v; } } catch (e) { console.error('baseline ' + f + ': ' + e.message); }
+  }
+}
+const SHOTS_AT = flag('shots', '') ? flag('shots', '').split(',').map(Number) : null;
 
 // ---- PASS thresholds ---------------------------------------------------------
 // RATE: the product definition is exactly 1.000x (CLAUDE.md gate #9). 0.99 is
@@ -141,15 +151,16 @@ const MID_EVAL = flag('mid-eval', '');
 // sampling slack, not an allowance to sprint).
 const RATE_FLOOR = 0.99;
 const RATE_CEIL_WIN = 1.02;
-// AUDIO: a dropout is an audible gap. At 1.000x with a sound producer there is
-// no reason for ANY on a desktop — but lockstep legitimately STOPS the core
-// during a stall, and a stopped core has nothing to play, so each stall can
-// cost one gap that is not an audio defect (it is already counted as a stall).
-// The threshold is therefore: dropouts beyond one-per-stall must stay under
-// 2 per minute — i.e. at most one audible click every 30 s that the stall
-// counter does not already explain. Anything the page's own buffer should
-// have absorbed shows up well above that (the phone room that prompted this
-// was described as "broken audio", which is continuous, not 2/min).
+// AUDIO: a dropout is an audible gap (an all-zero hole <= 400 ms between
+// audible audio). Lockstep legitimately STOPS the core during a stall, and a
+// stopped core has nothing to play, so each stall may cost one gap that is
+// already counted as a stall — those are subtracted. What remains is judged
+// against the SAME GAME PLAYED SOLO on a desktop (the `desktop` solo cap, or
+// --baseline): a room may not make audio worse than the game alone, x1.25 for
+// scene-to-scene variation, with a floor of 2/min (one click every 30 s) for
+// a game whose solo run has none. A fixed absolute number would either fail a
+// room for a gap the single-player game has too (PS1 Monster Rancher 2 solo
+// measured ~22/min), or pass a room that had made a quiet game crackle.
 const AUDIO_DROPOUTS_PER_MIN = 2;
 
 const ANDROID_UA = 'Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -164,18 +175,24 @@ const ANDROID_UA = 'Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 
 const CONSOLES = {
   dc: { name: 'Dreamcast', title: 'Gauntlet Legends', page: '/dreamcast.html', game: 'gauntlet', hostFlag: '',
         hz: '59.94', witness: '(window.__dcProbe ? window.__dcProbe().guestX : null)',
-        frames: 'null', bootMs: 360000 },
+        frames: 'null', bootMs: 360000, seam: 'window.__dcNet && window.__dcNet()' },
   n64: { name: 'N64', title: 'Mario Kart 64', page: '/n64/', game: 'Mario Kart 64', hostFlag: '',
          hz: '((window.__n64Net && window.__n64Net().viHz) || 60)',
-         witness: '(window.__n64Rate ? window.__n64Rate.speed : null)', frames: 'null', bootMs: 240000 },
+         witness: '(window.__n64Rate ? window.__n64Rate.speed : null)', frames: 'null', bootMs: 240000, seam: 'window.__n64Net && window.__n64Net()' },
   gc: { name: 'GameCube', title: 'Mario Party 4', page: '/gamecube.html', game: 'Mario Party 4', hostFlag: '',
-        hz: '59.94', witness: '(window.__gcRate ? window.__gcRate.speed : null)', frames: 'null', bootMs: 360000 },
+        hz: '59.94', witness: '(window.__gcRate ? window.__gcRate.speed : null)', frames: 'null', bootMs: 360000, seam: 'window.__gcNet && window.__gcNet()' },
   gen: { name: 'Genesis', title: 'Sonic the Hedgehog 3', page: '/genesis.html', game: 'Sonic the Hedgehog 3', hostFlag: '&host=1',
          hz: '((window.Module && window.Module._gpx_fps && window.Module._gpx_fps()) || 59.922751)',
-         witness: 'null', frames: '(window.__genFrames|0)', bootMs: 120000 },
+         witness: 'null', frames: '(window.__genFrames|0)', bootMs: 120000, seam: 'window.__genNet && window.__genNet()' },
   ps1: { name: 'PS1', title: 'Monster Rancher 2', page: '/ps1.html', game: 'Monster Rancher 2', hostFlag: '&host=1',
          hz: '((window.__ps1Net && window.__ps1Net().hz) || 59.94)',
-         witness: 'null', frames: '(window.__ps1Frames|0)', bootMs: 300000 },
+         witness: 'null', frames: '(window.__ps1Frames|0)', bootMs: 300000,
+         // SOLO has no gated-frame counter (__ps1Frames counts only frames the
+         // lockstep feed retired), so the solo cap reads the SPU: frames the
+         // page's AudioDiag counted as PRODUCED, against the 44100 Hz SPU rate
+         // (lib/audiodiag.js NOMINAL_RATE.ps1, dfsound/sdl.c:80).
+         soloFrames: '(window.__audioDiag ? window.__audioDiag.framesProduced : null)', soloHz: '44100',
+         aux: '(window.__audioDiag ? window.__audioDiag.framesProduced : null)', seam: 'window.__ps1Net && window.__ps1Net()' },
 };
 
 // ---- the arms ----------------------------------------------------------------
@@ -352,7 +369,7 @@ function preloadSrc(cfg) {
       t: Math.round(now() - M.t0), ready: M.readyFrames - lastReady, frame: e ? e.frame : null,
       state: e ? e.state : null, delay: e ? e.delay : null,
       stalls: rep ? rep.stalls : null, stallMs: rep ? rep.stallMs : null,
-      witness: ev(CFG.witness), frames: ev(CFG.frames), hz: ev(CFG.hz),
+      witness: ev(CFG.witness), frames: ev(CFG.frames), hz: ev(CFG.hz), aux: ev(CFG.aux || 'null'),
       aq: M.audio.quanta, aDrop: M.audio.dropouts, raf: rafN,
     });
     rafN = 0;
@@ -614,7 +631,7 @@ async function runCell(cid, aid, attempt) {
     broker = await startBroker({ port: 0 });
     if (A.broker) broker.setImpair(A.broker);
     const pre = { mqtt: mqttSource(), hooks: null };
-    const cfg = (role) => ({ role, console: cid, witness: C.witness, frames: C.frames, hz: C.hz,
+    const cfg = (role) => ({ role, console: cid, witness: C.witness, frames: C.frames, hz: C.hz, seam: C.seam, aux: C.aux || 'null',
                              p2p: A.p2p || null, relay: !!A.relay });
     const code = mkCode();
     cell.code = code;
@@ -662,7 +679,9 @@ async function runCell(cid, aid, attempt) {
       const mark = await Promise.all([H, J].map((P) => P.page.evaluate(() => ({ ready: window.__npdm.readyFrames, win: window.__npdm.win.length, t: performance.now() - window.__npdm.t0, drop: window.__npdm.audio.dropouts, aq: window.__npdm.audio.quanta, stalls: window.__npdm.stalls.length, resumes: window.__npdm.resumes.length })).catch(() => null)));
       cell.shots = { host: [], joiner: [] };
       const pressAt = [8, 22, 36, 50].filter((s) => s < seconds - 4);
-      const shotAt = [5, Math.floor(seconds / 2), seconds - 3];
+      // Screenshot times (s into the window). --shots overrides, e.g. for a
+      // cell where the capture itself is suspected of perturbing the page.
+      const shotAt = SHOTS_AT ? SHOTS_AT.filter((x) => x < seconds) : [5, Math.floor(seconds / 2), seconds - 3];
       let nextPress = 0, nextShot = 0, pi = 0;
       while ((Date.now() - tM) / 1000 < seconds) {
         const el = (Date.now() - tM) / 1000;
@@ -685,12 +704,18 @@ async function runCell(cid, aid, attempt) {
         }
         if (PROFILE_S && !cell.profiled && el >= Math.max(5, seconds / 2 - PROFILE_S / 2)) {
           cell.profiled = true;
-          await Promise.all([H, J].map(async (P) => {
-            try { await P.cdp.send('Profiler.enable'); await P.cdp.send('Profiler.setSamplingInterval', { interval: 500 }); await P.cdp.send('Profiler.start'); } catch (e) {}
+          // Main thread AND every dedicated worker (several cores run in one).
+          const targets = [];
+          for (const P of [H, J]) {
+            targets.push({ c: P.cdp, name: `${tag}-${P.role}` });
+            P.page.workers().forEach((w, i) => targets.push({ c: w.client, name: `${tag}-${P.role}-w${i}-${w.url().split('/').pop().split('?')[0]}` }));
+          }
+          await Promise.all(targets.map(async (t) => {
+            try { await t.c.send('Profiler.enable'); await t.c.send('Profiler.setSamplingInterval', { interval: 500 }); await t.c.send('Profiler.start'); } catch (e) {}
           }));
           await sleep(PROFILE_S * 1000);
-          await Promise.all([H, J].map(async (P) => {
-            try { const { profile } = await P.cdp.send('Profiler.stop'); fs.writeFileSync(path.join(OUT, `${tag}-${P.role}.cpuprofile`), JSON.stringify(profile)); } catch (e) {}
+          await Promise.all(targets.map(async (t) => {
+            try { const { profile } = await t.c.send('Profiler.stop'); fs.writeFileSync(path.join(OUT, `${t.name}.cpuprofile`), JSON.stringify(profile)); } catch (e) {}
           }));
         }
         if (MID_EVAL && !cell.midEval && el >= seconds / 2) {
@@ -731,6 +756,8 @@ async function runCell(cid, aid, attempt) {
             p2p: M.p2p, relayForced: M.relayForced, report: rep ? JSON.parse(JSON.stringify(rep)) : null, native, sess,
             peerId: e ? e.peerId : null, localPorts: e ? e.localPorts : null,
             hz: (() => { try { return eval(M.cfg.hz); } catch (x) { return null; } })(),
+            // The page's OWN net seam, whole (minus bulky arrays), as evidence.
+            seam: (() => { try { const v = eval(M.cfg.seam); return v == null ? null : JSON.parse(JSON.stringify(v, (k, x) => (Array.isArray(x) && x.length > 64) ? '[' + x.length + ' items]' : x)); } catch (x) { return 'ERR ' + x; } })(),
             winT0: m.t,
           };
         }, m).catch((e) => ({ collectError: String(e.message || e) }));
@@ -794,17 +821,22 @@ async function soloMeasure(P, C, tag, i) {
   let live = false;
   while (Date.now() < tLimit) {
     const w = await P.page.evaluate(() => { const W = window.__npdm.win; return W.length ? W[W.length - 1] : null; }).catch(() => null);
-    if (w && ((w.witness != null && w.witness > 0.05) || (w.frames != null && w.frames > 120))) { live = true; break; }
+    if (w && ((w.witness != null && w.witness > 0.05) || (w.frames != null && w.frames > 120 * (w.hz > 1000 ? 735 : 1)))) { live = true; break; }
     await sleep(2000);
   }
   out.live = live;
   if (live) {
     await sleep(15000);
-    const m0 = await P.page.evaluate(() => window.__npdm.win.length);
-    await sleep(40000);
-    out.win = await P.page.evaluate((m0) => window.__npdm.win.slice(m0), m0);
+    const a0 = await P.page.evaluate(() => ({ n: window.__npdm.win.length, a: Object.assign({}, window.__npdm.audio) }));
+    await sleep(SOLO_S * 1000);
+    out.win = await P.page.evaluate((m0) => window.__npdm.win.slice(m0), a0.n);
     out.shot = await canvasShot(P.page, path.join(OUT, `${tag}${i ? '-' + i : ''}.png`));
-    out.audio = await P.page.evaluate(() => window.__npdm.audio);
+    // Audio over the SAME window as the rate, not since page load.
+    const a1 = await P.page.evaluate(() => Object.assign({}, window.__npdm.audio));
+    const mins = a1.sampleRate ? ((a1.quanta - a0.a.quanta) * 128 / a1.sampleRate) / 60 : null;
+    out.audio = Object.assign({}, a1, { dropoutsInWindow: a1.dropouts - a0.a.dropouts,
+      audibleFracInWindow: (a1.quanta - a0.a.quanta) ? +((a1.audibleQuanta - a0.a.audibleQuanta) / (a1.quanta - a0.a.quanta)).toFixed(3) : null,
+      perMin: mins ? +((a1.dropouts - a0.a.dropouts) / mins).toFixed(2) : null });
   }
   out.errors = P.errors.slice(); out.throttleProof = P.throttleProof || null; out.throttled = P.throttled; out.throttleRejected = P.throttleRejected;
   out.rate = soloRate(out);
@@ -821,7 +853,7 @@ async function runSolo(cid, device, count = 1) {
   const loadTick = setInterval(() => { const l = load1(); if (l != null) out.loads.push(l); }, 10000);
   try {
     for (let i = 0; i < count; i++) {
-      Ps.push(await launchPlayer('solo' + i, device, tag, { mqtt: '/*none*/', hooks: preloadSrc({ role: 'solo', console: cid, witness: C.witness, frames: C.frames, hz: C.hz }) }));
+      Ps.push(await launchPlayer('solo' + i, device, tag, { mqtt: '/*none*/', hooks: preloadSrc({ role: 'solo', console: cid, witness: C.witness, frames: C.soloFrames || C.frames, hz: C.soloHz || C.hz, seam: C.seam }) }));
     }
     out.start = await Promise.all(Ps.map((P) => soloBoot(P, C)));
     out.each = await Promise.all(Ps.map((P, i) => soloMeasure(P, C, tag, i)));
@@ -895,7 +927,7 @@ function analysePlayer(d, peerRole) {
   r.relay = d.sess && d.sess.relay ? !!d.sess.relay.active : false;
   return r;
 }
-function verdict(cell, solo) {
+function verdict(cell, solo, soloAudio) {
   const why = [];
   if (cell.error) return { pass: false, why: [cell.error] };
   const h = cell.players.host, j = cell.players.joiner;
@@ -916,7 +948,13 @@ function verdict(cell, solo) {
     if (!lastTwo.some((s) => s.showing)) why.push(`${name} canvas BLANK (${lastTwo.map((s) => s.litFrac != null ? s.litFrac + '/' + s.colours + 'c' : s.why).join(', ')})`);
     const excess = (a.audio.dropouts || 0) - (a.stalls || 0);
     const perMinExcess = a.audio.renderedMin ? excess / a.audio.renderedMin : 0;
-    if (perMinExcess > AUDIO_DROPOUTS_PER_MIN) why.push(`${name} audio ${a.audio.dropouts} dropouts (${a.audio.perMin}/min; ${perMinExcess.toFixed(1)}/min beyond stalls)`);
+    // The allowance is the console's OWN solo desktop rate when measured: a
+    // room must not make audio worse than the same game alone (x1.25 for
+    // scene-to-scene variation), and never less than the flat floor.
+    const soloPm = soloAudio && soloAudio.perMin != null ? soloAudio.perMin : null;
+    const allow = Math.max(AUDIO_DROPOUTS_PER_MIN, soloPm != null ? soloPm * 1.25 : 0);
+    a.audio.allowPerMin = +allow.toFixed(2); a.audio.soloPerMin = soloPm;
+    if (perMinExcess > allow) why.push(`${name} audio ${a.audio.dropouts} dropouts (${a.audio.perMin}/min; ${perMinExcess.toFixed(1)}/min beyond stalls; allowed ${allow.toFixed(1)}${soloPm != null ? ' = solo ' + soloPm + ' x1.25' : ''})`);
   }
   if (cell.endedEarly) why.push('ended early: ' + cell.endedEarly);
   // Device-limited: a throttled player that cannot do 1.000x SOLO.
@@ -954,7 +992,7 @@ function verdict(cell, solo) {
         const maxLoad = cell.loads.length ? Math.max(...cell.loads) : load1();
         cell.maxLoad = maxLoad;
         cell.void = maxLoad != null && maxLoad > VOID_LOAD;
-        cell.verdict = verdict(cell, RESULT.solo[cid + ':mobile']);
+        cell.verdict = verdict(cell, RESULT.solo[cid + ':mobile'], (RESULT.solo[cid + ':desktop'] || BASELINE[cid] || {}).audio);
         RESULT.cells.push(cell); save();
         const v = cell.verdict;
         say(`  => ${cell.void ? 'VOID (load ' + maxLoad + ')' : (v.pass ? 'PASS' : 'FAIL')} ${v.deviceLimited ? '[DEVICE-LIMITED: ' + v.deviceLimited + '] ' : ''}${v.why.join(' · ')}`);
