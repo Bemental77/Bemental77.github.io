@@ -53,6 +53,24 @@
 static const char* savestate_magic = "M64+SAVE";
 static const int savestate_latest_version = 0x00010000;  /* 1.0 */
 
+/* NEIL RAW STATE (src/libretro/neil_rawstate.c) reuses THIS serializer, so
+ * the raw state and the gzip state can never disagree about what a state is.
+ * Two hooks, both inert for every existing caller:
+ *   savestates_m64p_last_len     bytes the last savestates_save_m64p wrote
+ *                                (the event-queue tail makes it variable);
+ *   savestates_keep_code_cache   when nonzero, loading does NOT wipe the
+ *                                whole cached-interpreter/JIT code cache —
+ *                                the raw loader has already invalidated
+ *                                exactly the pages whose code bytes differ.
+ *                                0 (the default) = the shipped behaviour. */
+size_t savestates_m64p_last_len = 0;
+int savestates_keep_code_cache = 0;
+/* When nonzero the loader (or saver) skips the two 4 MiB TLB lookup tables:
+ * the raw code sets it only when neil_tlb_gen proves the destination already
+ * holds identical bytes. 0 (the default) = the shipped behaviour. */
+int savestates_skip_tlb_luts = 0;
+extern uint32_t neil_tlb_gen; /* r4300/tlb.c */
+
 #define GETARRAY(buff, type, count) \
     (to_little_endian_buffer(buff, sizeof(type),count), \
      buff += count*sizeof(type), \
@@ -225,8 +243,17 @@ int savestates_load_m64p(const unsigned char *data, size_t size)
    g_dev.pi.flashram.erase_offset = GETDATA(curr, unsigned int);
    g_dev.pi.flashram.write_pointer = GETDATA(curr, unsigned int);
 
-   COPYARRAY(tlb_LUT_r, curr, unsigned int, 0x100000);
-   COPYARRAY(tlb_LUT_w, curr, unsigned int, 0x100000);
+   if (savestates_skip_tlb_luts)
+   {
+      /* raw loader proved (neil_tlb_gen) the LUTs are already these bytes */
+      curr += 2 * 0x100000 * sizeof(unsigned int);
+   }
+   else
+   {
+      COPYARRAY(tlb_LUT_r, curr, unsigned int, 0x100000);
+      COPYARRAY(tlb_LUT_w, curr, unsigned int, 0x100000);
+      neil_tlb_gen++;
+   }
 
    *r4300_llbit() = GETDATA(curr, unsigned int);
    COPYARRAY(r4300_regs(), curr, int64_t, 32);
@@ -275,7 +302,13 @@ int savestates_load_m64p(const unsigned char *data, size_t size)
       tlb_e[i].phys_odd   = GETDATA(curr, unsigned int);
    }
 
-   savestates_load_set_pc(GETDATA(curr, uint32_t));
+   {
+      uint32_t loaded_pc = GETDATA(curr, uint32_t);
+      if (savestates_keep_code_cache)
+         generic_jump_to(loaded_pc);
+      else
+         savestates_load_set_pc(loaded_pc);
+   }
 
    *r4300_next_interrupt() = GETDATA(curr, unsigned int);
    g_dev.vi.next_vi  = GETDATA(curr, unsigned int);
@@ -469,8 +502,16 @@ int savestates_save_m64p(unsigned char *data, size_t size)
    PUTDATA(curr, unsigned int, g_dev.pi.flashram.erase_offset);
    PUTDATA(curr, unsigned int, g_dev.pi.flashram.write_pointer);
 
-   PUTARRAY(tlb_LUT_r, curr, unsigned int, 0x100000);
-   PUTARRAY(tlb_LUT_w, curr, unsigned int, 0x100000);
+   if (savestates_skip_tlb_luts)
+   {
+      /* raw fast save: the destination already holds these exact bytes */
+      curr += 2 * 0x100000 * sizeof(unsigned int);
+   }
+   else
+   {
+      PUTARRAY(tlb_LUT_r, curr, unsigned int, 0x100000);
+      PUTARRAY(tlb_LUT_w, curr, unsigned int, 0x100000);
+   }
 
    PUTDATA(curr, unsigned int, *r4300_llbit());
    PUTARRAY(r4300_regs(), curr, int64_t, 32);
@@ -522,7 +563,9 @@ int savestates_save_m64p(unsigned char *data, size_t size)
    to_little_endian_buffer(queue, 4, queuelength/4);
    PUTARRAY(queue, curr, char, queuelength);
 
-   /* Deliver callback to indicate completion 
+   savestates_m64p_last_len = (size_t)(curr - data);
+
+   /* Deliver callback to indicate completion
     * of state saving operation */
    StateChanged(M64CORE_STATE_SAVECOMPLETE, 1);
 

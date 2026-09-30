@@ -236,3 +236,30 @@ int neilGetAudioWritePosition()
 {
     return neilAudioWritePosition;
 }
+/* NEIL RAW STATE — the audio plugin's format state.
+ * aiDacrateChanged() derives these from AI_DACRATE when the AI reports a
+ * format change (ai->samples_format_changed). The raw state restores that
+ * flag EXACTLY rather than forcing it to 1 as the m64p loader does, so the
+ * derived values must travel with it or the resampler would run at a rate
+ * from a different point in time. The output ring (resampled_out_buf /
+ * neilAudioWritePosition) and the resampler's filter history are HOST output,
+ * not guest state, and are deliberately not captured: audio that has already
+ * been handed to the speaker cannot be rolled back, so what to do with the
+ * samples a rollback re-simulates is the page's decision. */
+int neil_audio_state_io(unsigned char* buf, int save)
+{
+   int v[4];
+   if (!buf)
+      return (int)sizeof(v);
+   if (save)
+   {
+      v[0] = GameFreq; v[1] = (int)CountsPerSecond; v[2] = (int)BytesPerSecond; v[3] = (int)CountsPerByte;
+      memcpy(buf, v, sizeof(v));
+   }
+   else
+   {
+      memcpy(v, buf, sizeof(v));
+      GameFreq = v[0]; CountsPerSecond = (unsigned)v[1]; BytesPerSecond = (unsigned)v[2]; CountsPerByte = (unsigned)v[3];
+   }
+   return (int)sizeof(v);
+}

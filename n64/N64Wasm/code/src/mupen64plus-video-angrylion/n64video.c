@@ -355,3 +355,79 @@ void n64video_close(void)
     vi_close();
     // parallel_close();
 }
+
+/* NEIL RAW STATE — the angrylion RDP/VI state the m64p savestate never had.
+ *
+ * The m64p format keeps the DPC/DPS registers only. The RDP itself is stateful
+ * between commands and between frames: tile descriptors, TMEM, other-modes,
+ * combiner/blender selections, fill/prim/env colours, the colour/Z image
+ * addresses, a partially assembled command that straddles two DP transfers,
+ * and the noise generator (state.rseed) whose output is written INTO RDRAM
+ * framebuffers. It also keeps the "hidden" 9th RDRAM bit plane (coverage /
+ * delta-Z) in its own 4 MiB array. Restoring RDRAM but none of this hands the
+ * next command list a future frame's RDP. Only worker 0 exists (parallel is
+ * forced off above), and rdp_cmd_buf_pos never leaves 0 in that mode.
+ *
+ * VI statics are presentation-only (the VI never writes RDRAM) but include the
+ * VI noise seed and the field/interlace history, so they are captured too:
+ * a restored frame then PRESENTS identically, not merely computes identically.
+ * The 1.4 MiB prescale output buffer is not: it is regenerated from RDRAM.
+ *
+ * rdp_state holds pointers into itself and into static tables; they are valid
+ * for any instance of the same wasm binary (identical static layout). */
+static void al_io(unsigned char* p, int save, void* v, size_t n)
+{
+    if (save) memcpy(p, v, n); else memcpy(v, p, n);
+}
+
+int neil_al_state_io(unsigned char* buf, int save)
+{
+    size_t o = 0;
+#define AL_IO(v) do { if (buf) al_io(buf + o, save, (void*)&(v), sizeof(v)); o += sizeof(v); } while (0)
+    AL_IO(state[0]);
+    AL_IO(rdp_cmd_buf[0]);
+    AL_IO(rdp_cmd_buf_pos);
+    AL_IO(rdp_cmd_pos);
+    AL_IO(rdp_cmd_id);
+    AL_IO(rdp_cmd_len);
+    AL_IO(rdp_pipeline_crashed);
+    /* VI (presentation) */
+    AL_IO(prevvicurrent);
+    AL_IO(emucontrolsvicurrent);
+    AL_IO(prevserrate);
+    AL_IO(lowerfield);
+    AL_IO(oldvstart);
+    AL_IO(prevwasblank);
+    AL_IO(vactivelines);
+    AL_IO(ispal);
+    AL_IO(minhpass);
+    AL_IO(maxhpass);
+    AL_IO(x_add);
+    AL_IO(x_start);
+    AL_IO(y_add);
+    AL_IO(y_start);
+    AL_IO(v_sync);
+    AL_IO(vi_width_low);
+    AL_IO(frame_buffer);
+    AL_IO(tvfadeoutstate);
+    AL_IO(rseed[0]);
+    AL_IO(zb_address);
+    AL_IO(prescale_ptr);
+    AL_IO(linecount);
+    AL_IO(ctrl);
+    AL_IO(hres);
+    AL_IO(vres);
+    AL_IO(hres_raw);
+    AL_IO(vres_raw);
+    AL_IO(v_start);
+    AL_IO(h_start);
+    AL_IO(v_current_line);
+#undef AL_IO
+    return (int)o;
+}
+
+/* The hidden bit plane, exposed separately because it is 4 MiB: the raw
+ * state copies it whole, and nothing else writes it except rdram_init and
+ * the three rdram_write_pair* primitives in n64video/rdp/rdram.c. */
+unsigned char* neil_al_hidden_ptr(void) { return rdram_hidden; }
+int neil_al_hidden_size(void) { return (int)sizeof(rdram_hidden); }
