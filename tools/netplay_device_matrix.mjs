@@ -1,0 +1,989 @@
+#!/usr/bin/env node
+// ============================================================================
+// netplay_device_matrix.mjs — DOES A REAL TWO-PLAYER ROOM WORK ON EVERY DEVICE?
+// ============================================================================
+//
+// WHY THIS EXISTS. A real room failed: an Android phone hosting N64 Mario Kart
+// showed a black screen and held the room to 0.36x with broken audio, while the
+// desktop joiner rendered fine. Every netplay rig before this one put both
+// players in ONE desktop Chrome (`?net=local`, a BroadcastChannel), so the
+// asymmetric case — one weak device, one strong one — had never been run.
+//
+// WHAT IS DIFFERENT HERE
+//   * TWO BROWSER PROCESSES. Each player is its own `puppeteer.launch` with its
+//     own profile. A BroadcastChannel cannot cross that boundary, so the pages
+//     pair over the SHIPPED signalling path — the MQTT relay (`?signal=ws`,
+//     lib/netplay.js signalPlan) — pointed at a broker this rig runs
+//     (tools/mqtt_ws_broker.mjs, `?wsbroker=`), because the public brokers
+//     reset from this sandbox. After signalling, game traffic is a real WebRTC
+//     DataChannel between the two processes (host candidates; mDNS obfuscation
+//     is switched off so the two processes can resolve each other), or — in the
+//     `drelay` arm — the room's own relay mode over the broker.
+//   * DEVICE CONDITIONS PER PLAYER, via CDP on that player's page: Android UA
+//     (+ UA-CH metadata), touch, isMobile, landscape 915x412, and
+//     Emulation.setCPUThrottlingRate 4 on the page AND on every dedicated
+//     worker it spawns (the emulators run in workers on several consoles; a
+//     page-only throttle would leave the actual CPU loop untouched). Every
+//     throttled target is recorded, and the throttle is PROVEN by a busy-loop
+//     timing before/after (arm-difference proof, same rule as
+//     tools/device_matrix.mjs: a placebo arm prints no verdict).
+//   * NETWORK CONDITIONS. `d`: 100 ms one-way on the P2P DataChannel, modelled
+//     in-page as an ordered FIFO (a reliable ordered SCTP channel never
+//     reorders), plus 2% of messages paying an extra 200 ms retransmit with
+//     head-of-line blocking — CDP's Network.emulateNetworkConditions does NOT
+//     reach WebRTC, so it cannot be used for this. `drelay`: WebRTC forced to
+//     relay-only with no TURN, so the room falls back to its relay mode over
+//     the broker, and the BROKER delays every delivery 100 ms and drops 2%.
+//
+// ⚠ WHAT THIS STILL CANNOT DO, said plainly so a PASS is not overclaimed:
+//   * the "phone" is desktop Chromium with a mobile UA, touch and a CPU
+//     throttle. It is NOT a phone GPU, NOT WebKit, NOT Android's audio stack
+//     and NOT thermal throttling. A black screen caused by a mobile GPU driver
+//     cannot reproduce here. A PASS here is necessary, not sufficient.
+//   * both players share one 4-core box (and it is shared with other agents),
+//     so both emulators contend for CPU. A throttled player is measured SOLO
+//     first so a device that simply lacks the CPU is reported device-limited
+//     with numbers instead of being blamed on netplay.
+//   * rendering is SwiftShader (no GPU in this container).
+//
+// MEASURED PER CELL, ON BOTH PLAYERS
+//   rate      delivered guest rate: frames the lockstep engine actually RAN per
+//             wall second / the console's frame rate, AND the page's own rate
+//             witness where it publishes one (dc __dcProbe().guestX, n64
+//             __n64Rate.speed, gc __gcRate.speed, genesis/ps1 frame counters).
+//             maxWin5 is the fastest 5-second window — the fast-forward check.
+//   stalls    count, total ms, and WHO was waited on (the 'stall' event's
+//             waitingPeers, mapped to host/joiner).
+//   delay     every input-delay change the engine made (raise/lower, frame).
+//   latency   local input latency in frames: the rig presses a key, and the
+//             first frame the engine RAN whose image carries a changed pad at
+//             this machine's own port is the arrival (hook on
+//             Lockstep.prototype.beginFrame — console-independent).
+//   audio     a sink-side tap on every connect() to AudioContext.destination:
+//             render quanta counted, and a DROPOUT = an all-zero hole of
+//             <= 400 ms between audible audio (the shape a starved ring buffer
+//             produces). Page-native counters are recorded alongside.
+//   canvas    a composited screenshot clipped to the largest visible canvas,
+//             decoded here; black (< 2% lit pixels or < 8 colours) is a FAIL.
+//   desync    engine desync + hashesCompared (> 0 required: an unchecked room
+//             is not a synchronised one).
+//   errors    uncaught page errors (pageerror). Console errors are recorded.
+//
+// PASS = both players >= 0.99x delivered, no 5-s window above 1.02x, canvas
+// non-black on both, 0 desyncs with hashesCompared > 0, 0 page errors, and
+// audio dropouts under the threshold (see AUDIO_DROPOUTS_PER_MIN).
+//
+// USAGE
+//   npm run web
+//   node tools/browser_leak_guard.js reap && uptime
+//   node tools/netplay_device_matrix.mjs --consoles gen,ps1 --arms a,b,c
+//   (the rig takes /tmp/bemental-probe.lock itself around EVERY cell)
+//
+// FLAGS
+//   --consoles dc,n64,gc,gen,ps1    (default all five)
+//   --arms a,b,c,d,drelay,e         (default a,b,c,d,drelay; e is the 10-min soak)
+//   --seconds N    measured seconds per cell (default 60)
+//   --soak N       seconds for arm e (default 600)
+//   --solo mobile,desktop,pair   measure the SOLO cap (no room) of these
+//                  devices; `pair` = two desktop solos AT ONCE (contention control)
+//                  first (default: mobile whenever arm b or c runs; 'none' = skip)
+//   --solo-only    measure the solo caps and no cells
+//   --name N       output under /tmp/npdm/<N>/ (default: timestamp)
+//   --retries N    re-run a load-voided cell up to N times (default 1)
+//   --url BASE     default http://localhost:8080
+//   --keep-profiles  do not delete the per-player profiles
+//   --query '&k=v'   append to both hand-off URLs (diagnostic arms only)
+// ============================================================================
+
+import { createRequire } from 'node:module';
+import { execSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import zlib from 'node:zlib';
+import { fileURLToPath } from 'node:url';
+import { startBroker } from './mqtt_ws_broker.mjs';
+
+const require = createRequire(path.join(os.homedir(), 'probe-deps') + '/');
+const puppeteer = require('puppeteer');
+const __filename = fileURLToPath(import.meta.url);
+
+const argv = process.argv.slice(2);
+const flag = (n, d) => { const i = argv.indexOf('--' + n); return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : d; };
+const has = (n) => argv.includes('--' + n);
+
+const BASE = flag('url', 'http://localhost:8080').replace(/\/$/, '');
+const SECONDS = +flag('seconds', '60');
+const SOAK = +flag('soak', '600');
+const RETRIES = +flag('retries', '1');
+const NAME = flag('name', new Date().toISOString().replace(/[:.]/g, '-'));
+const OUT = path.join('/tmp/npdm', NAME);
+const CHROME = process.env.CHROME_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
+const LOCK = process.env.PROBE_LOCK_DIR || '/tmp/bemental-probe.lock';
+const VOID_LOAD = +(process.env.NPDM_VOID_LOAD || 25);
+const MIN_FREE_GB = 3;
+const KEEP_PROFILES = has('keep-profiles');
+// Appended to BOTH players' hand-off URLs — a DIAGNOSTIC arm (e.g. '&rb=0' to
+// run Genesis in lockstep instead of rollback). Recorded on every cell.
+const EXTRA_Q = flag('query', '');
+// DIAGNOSTIC: a CPU profile of each player's main thread for N seconds, taken
+// at the middle of the measured window. It PERTURBS the cell (profiling costs
+// time), so a --profile cell's rates are not results — see CLAUDE.md gate #10.
+const PROFILE_S = +flag('profile', '0');
+// DIAGNOSTIC: JS evaluated on BOTH players at the midpoint of the measured
+// window (e.g. to close an overlay and see whether the frame rate recovers).
+const MID_EVAL = flag('mid-eval', '');
+
+// ---- PASS thresholds ---------------------------------------------------------
+// RATE: the product definition is exactly 1.000x (CLAUDE.md gate #9). 0.99 is
+// the floor the task set; 1.02 over any 5-s window is the fast-forward ceiling
+// (a 5-s window at 60 fps quantises to 1/300 = 0.33%, so 1.02 is 6 quanta of
+// sampling slack, not an allowance to sprint).
+const RATE_FLOOR = 0.99;
+const RATE_CEIL_WIN = 1.02;
+// AUDIO: a dropout is an audible gap. At 1.000x with a sound producer there is
+// no reason for ANY on a desktop — but lockstep legitimately STOPS the core
+// during a stall, and a stopped core has nothing to play, so each stall can
+// cost one gap that is not an audio defect (it is already counted as a stall).
+// The threshold is therefore: dropouts beyond one-per-stall must stay under
+// 2 per minute — i.e. at most one audible click every 30 s that the stall
+// counter does not already explain. Anything the page's own buffer should
+// have absorbed shows up well above that (the phone room that prompted this
+// was described as "broken audio", which is continuous, not 2/min).
+const AUDIO_DROPOUTS_PER_MIN = 2;
+
+const ANDROID_UA = 'Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) '
+                 + 'Chrome/140.0.0.0 Mobile Safari/537.36';
+
+// ---- the consoles ------------------------------------------------------------
+// `game` is the key each page's ?np= receiver matches on (multiplayer.html's
+// hand-off contract): the romSelect VALUE on dreamcast, the ROMS[] label on the
+// others. `hostFlag` — the three cartridge-era pages need &host=1 to host.
+// `hz`: an in-page expression for the console's lockstep frame rate.
+// `witness`: an in-page expression returning the page's OWN rate reading (x hw).
+const CONSOLES = {
+  dc: { name: 'Dreamcast', title: 'Gauntlet Legends', page: '/dreamcast.html', game: 'gauntlet', hostFlag: '',
+        hz: '59.94', witness: '(window.__dcProbe ? window.__dcProbe().guestX : null)',
+        frames: 'null', bootMs: 360000 },
+  n64: { name: 'N64', title: 'Mario Kart 64', page: '/n64/', game: 'Mario Kart 64', hostFlag: '',
+         hz: '((window.__n64Net && window.__n64Net().viHz) || 60)',
+         witness: '(window.__n64Rate ? window.__n64Rate.speed : null)', frames: 'null', bootMs: 240000 },
+  gc: { name: 'GameCube', title: 'Mario Party 4', page: '/gamecube.html', game: 'Mario Party 4', hostFlag: '',
+        hz: '59.94', witness: '(window.__gcRate ? window.__gcRate.speed : null)', frames: 'null', bootMs: 360000 },
+  gen: { name: 'Genesis', title: 'Sonic the Hedgehog 3', page: '/genesis.html', game: 'Sonic the Hedgehog 3', hostFlag: '&host=1',
+         hz: '((window.Module && window.Module._gpx_fps && window.Module._gpx_fps()) || 59.922751)',
+         witness: 'null', frames: '(window.__genFrames|0)', bootMs: 120000 },
+  ps1: { name: 'PS1', title: 'Monster Rancher 2', page: '/ps1.html', game: 'Monster Rancher 2', hostFlag: '&host=1',
+         hz: '((window.__ps1Net && window.__ps1Net().hz) || 59.94)',
+         witness: 'null', frames: '(window.__ps1Frames|0)', bootMs: 300000 },
+};
+
+// ---- the arms ----------------------------------------------------------------
+const DESKTOP = { kind: 'desktop' };
+const MOBILE = { kind: 'mobile', cpu: 4 };
+const ARMS = {
+  a: { id: 'a', what: 'desktop host + desktop joiner', host: DESKTOP, join: DESKTOP },
+  b: { id: 'b', what: 'mobile-emulated 4x-throttled HOST + desktop joiner', host: MOBILE, join: DESKTOP },
+  c: { id: 'c', what: 'desktop host + mobile-emulated 4x-throttled JOINER', host: DESKTOP, join: MOBILE },
+  d: { id: 'd', what: 'desktop pair, P2P link 100 ms one-way + 2% retransmit (+200 ms, head-of-line)',
+       host: DESKTOP, join: DESKTOP, p2p: { delayMs: 100, lossFrac: 0.02, rtxMs: 200 } },
+  drelay: { id: 'drelay', what: 'desktop pair, room forced onto RELAY mode; broker 100 ms one-way + 2% loss',
+            host: DESKTOP, join: DESKTOP, relay: true, broker: { delayMs: 100, loss: 0.02 } },
+  e: { id: 'e', what: 'desktop pair, soak', host: DESKTOP, join: DESKTOP, soak: true },
+};
+
+const consoles = flag('consoles', 'dc,n64,gc,gen,ps1').split(',').map((s) => s.trim()).filter(Boolean);
+const arms = flag('arms', 'a,b,c,d,drelay').split(',').map((s) => s.trim()).filter(Boolean);
+for (const c of consoles) if (!CONSOLES[c]) { console.error('unknown console ' + c); process.exit(2); }
+for (const a of arms) if (!ARMS[a]) { console.error('unknown arm ' + a); process.exit(2); }
+// Solo caps: which devices to measure ALONE (no room) before the cells.
+// Default: the throttled mobile device whenever arm b or c runs.
+const SOLO_DEVS = flag('solo', (arms.includes('b') || arms.includes('c')) ? 'mobile' : 'none')
+  .split(',').map((s) => s.trim()).filter((s) => s && s !== 'none');
+for (const s of SOLO_DEVS) if (!['mobile', 'desktop', 'pair'].includes(s)) { console.error('unknown --solo device ' + s); process.exit(2); }
+const SOLO_ONLY = has('solo-only');
+
+fs.mkdirSync(OUT, { recursive: true });
+const logStream = fs.createWriteStream(path.join(OUT, 'run.log'), { flags: 'a' });
+const T0 = Date.now();
+const say = (s) => {
+  const line = '[' + ((Date.now() - T0) / 1000).toFixed(1).padStart(7) + 's] ' + s;
+  console.log(line);
+  try { logStream.write(line + '\n'); } catch (e) {}
+};
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const uptime = () => { try { return execSync('uptime').toString().trim(); } catch (e) { return ''; } };
+const load1 = () => { const m = uptime().match(/load averages?: ([\d.]+)/); return m ? +m[1] : null; };
+const freeGB = () => { try { return +execSync("df -k / | tail -1 | awk '{print $4}'").toString().trim() / 1048576; } catch (e) { return null; } };
+
+// ---- the probe lock (compatible with tools/probe_lock.sh) --------------------
+let lockHeld = false;
+function lockOwnerAlive() {
+  try {
+    const pid = +fs.readFileSync(path.join(LOCK, 'owner'), 'utf8').trim().split(/\s+/)[0];
+    if (!pid) return null;
+    try { process.kill(pid, 0); return true; } catch (e) { return false; }
+  } catch (e) { return null; }
+}
+async function acquireLock(tag) {
+  let waited = 0, said = 0;
+  for (;;) {
+    try {
+      fs.mkdirSync(LOCK);
+      fs.writeFileSync(path.join(LOCK, 'owner'), `${process.pid} netplay_device_matrix:${tag} ${new Date().toTimeString().slice(0, 8)}\n`);
+      lockHeld = true;
+      say(`[lock] ACQUIRED ${LOCK} for ${tag} after ${waited}s · ${uptime()}`);
+      return;
+    } catch (e) {
+      const alive = lockOwnerAlive();
+      if (alive === false) { say('[lock] owner is gone — reclaiming a stale lock'); try { fs.rmSync(LOCK, { recursive: true, force: true }); } catch (_e) {} continue; }
+      if (alive === null) {
+        // ownerless: reclaim after 10 min untouched (probe_lock.sh's rule)
+        try { const st = fs.statSync(LOCK); if (Date.now() - st.mtimeMs > 10 * 60000) { fs.rmSync(LOCK, { recursive: true, force: true }); continue; } } catch (_e) { continue; }
+      }
+      if (waited - said >= 60 || said === 0) {
+        said = waited || 1;
+        let who = ''; try { who = fs.readFileSync(path.join(LOCK, 'owner'), 'utf8').trim(); } catch (_e) {}
+        say(`[lock] waiting — held by: ${who || '(ownerless)'}`);
+      }
+      await sleep(5000); waited += 5;
+    }
+  }
+}
+function releaseLock() {
+  if (!lockHeld) return;
+  try {
+    const pid = +fs.readFileSync(path.join(LOCK, 'owner'), 'utf8').trim().split(/\s+/)[0];
+    if (pid === process.pid) fs.rmSync(LOCK, { recursive: true, force: true });
+  } catch (e) {}
+  lockHeld = false;
+}
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => { releaseLock(); process.exit(130); });
+process.on('exit', releaseLock);
+
+// ---- mqtt.js, injected ---------------------------------------------------------
+// lib/netplay.js loads mqtt from cdnjs (WS_LIB) unless window.mqtt already
+// exists (loadMqtt). Chromium here has no route to cdnjs, so the SAME file is
+// fetched once by this process and defined before any page script runs.
+const MQTT_URL = 'https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.3.4/mqtt.min.js';
+const MQTT_CACHE = '/tmp/npdm/mqtt-5.3.4.min.js';
+function mqttSource() {
+  if (!fs.existsSync(MQTT_CACHE) || fs.statSync(MQTT_CACHE).size < 100000) {
+    execSync(`curl -sS -f -o ${MQTT_CACHE} ${MQTT_URL}`);
+  }
+  return fs.readFileSync(MQTT_CACHE, 'utf8');
+}
+
+// ---- the in-page instrument -------------------------------------------------------
+// Installed with evaluateOnNewDocument, before any page script. Everything it
+// does is READ-ONLY with respect to the game except the two network shims,
+// which exist only in arms d / drelay.
+function preloadSrc(cfg) {
+  return `(() => {
+  const CFG = ${JSON.stringify(cfg)};
+  const now = () => performance.now();
+  const M = window.__npdm = {
+    cfg: CFG, t0: now(), readyFrames: 0, lastFrame: null, stalls: [], resumes: [], delays: [],
+    lat: [], latPending: null, win: [], desyncs: [], engineSeen: false,
+    audio: { ctxs: 0, taps: 0, quanta: 0, audibleQuanta: 0, zeroQuanta: 0, dropouts: 0, longSilences: 0,
+             firstAudibleAt: null, err: null, curZero: 0, sawAudible: false },
+    p2p: { sent: 0, delayed: 0, rtx: 0 }, relayForced: false,
+  };
+  // ---------------- lockstep hooks (prototype-level, console-independent) ----------------
+  const hook = () => {
+    const L = window.Netplay && window.Netplay.Lockstep;
+    if (!L) return false;
+    if (L.prototype.__npdm) return true;
+    L.prototype.__npdm = true;
+    const emit = L.prototype._emit;
+    L.prototype._emit = function (ev, a) {
+      try {
+        const t = Math.round(now() - M.t0);
+        if (ev === 'stall') M.stalls.push({ t, frame: a.frame, waitingPeers: (a.waitingPeers || []).slice(), waitingOn: (a.waitingOn || []).slice(), why: a.why || null });
+        else if (ev === 'resume') M.resumes.push({ t, frame: a.frame, ms: Math.round(a.ms) });
+        else if (ev === 'delay') M.delays.push({ t, frame: this.frame, from: a.from, to: a.to, at: a.at, reason: a.reason || null });
+        else if (ev === 'desync') M.desyncs.push({ t, d: JSON.parse(JSON.stringify(a || {})) });
+      } catch (e) {}
+      return emit.call(this, ev, a);
+    };
+    const begin = L.prototype.beginFrame;
+    L.prototype.beginFrame = function (pads) {
+      const r = begin.call(this, pads);
+      try {
+        M.engineSeen = true;
+        M.engine = this;
+        if (r && r.ready) {
+          M.readyFrames++;
+          M.lastFrame = r.frame;
+          const lp = this.localPorts && this.localPorts.length ? this.localPorts[0] : null;
+          if (lp != null && r.image) {
+            const pb = this.padBytes | 0;
+            const key = Array.prototype.join.call(r.image.subarray(lp * pb, lp * pb + pb), ',');
+            const P = M.latPending;
+            if (P && P.base === null) P.base = M.lastLocalKey;          // pad before the press
+            if (P && P.base !== null && key !== P.base) {
+              M.lat.push({ frames: r.frame - P.frame, ms: +(now() - P.t).toFixed(1), delay: this.delay, rollback: !!this.rollback });
+              M.latPending = null;
+            }
+            M.lastLocalKey = key;
+          }
+        }
+      } catch (e) {}
+      return r;
+    };
+    return true;
+  };
+  if (!hook()) { const iv = setInterval(() => { if (hook()) clearInterval(iv); }, 10); }
+  // The rig calls this immediately before a real key press.
+  M.press = () => {
+    const e = M.engine;
+    M.latPending = { frame: e ? e.frame : null, t: now(), base: (M.lastLocalKey == null ? null : M.lastLocalKey) };
+    return M.latPending.frame;
+  };
+  // ---------------- per-second sampler ----------------
+  let lastReady = 0, rafN = 0;
+  const rafTick = () => { rafN++; requestAnimationFrame(rafTick); };
+  requestAnimationFrame(rafTick);
+  const ev = (s) => { try { return eval(s); } catch (e) { return null; } };
+  setInterval(() => {
+    const e = M.engine;
+    const rep = (() => { try { return e ? e.report() : null; } catch (x) { return null; } })();
+    M.win.push({
+      t: Math.round(now() - M.t0), ready: M.readyFrames - lastReady, frame: e ? e.frame : null,
+      state: e ? e.state : null, delay: e ? e.delay : null,
+      stalls: rep ? rep.stalls : null, stallMs: rep ? rep.stallMs : null,
+      witness: ev(CFG.witness), frames: ev(CFG.frames), hz: ev(CFG.hz),
+      aq: M.audio.quanta, aDrop: M.audio.dropouts, raf: rafN,
+    });
+    rafN = 0;
+    lastReady = M.readyFrames;
+    if (M.win.length > 1500) M.win.shift();
+  }, 1000);
+  // ---------------- audio sink tap ----------------
+  // Every connect() to a context's destination is ALSO connected into a
+  // collector that feeds an AudioWorklet which counts render quanta and holes.
+  try {
+    const orig = AudioNode.prototype.connect;
+    const per = new WeakMap();
+    const WORKLET = 'class T extends AudioWorkletProcessor{constructor(){super();this.q=0;this.aud=0;this.zero=0;this.cur=0;this.drop=0;this.longS=0;this.seen=false;this.first=null;this.n=0;}'
+      + 'process(ins){const i=ins[0];let z=true;if(i&&i.length){for(let c=0;c<i.length&&z;c++){const ch=i[c];for(let k=0;k<ch.length;k++){if(ch[k]!==0){z=false;break;}}}}'
+      + 'this.q++;if(z){this.zero++;if(this.seen)this.cur++;}else{this.aud++;if(!this.seen){this.seen=true;this.first=currentTime;}'
+      + 'if(this.cur>0){const ms=this.cur*128*1000/sampleRate;if(ms<=400)this.drop++;else this.longS++;}this.cur=0;}'
+      + 'if(++this.n>=375){this.n=0;this.port.postMessage({q:this.q,aud:this.aud,zero:this.zero,drop:this.drop,longS:this.longS,first:this.first});}return true;}}'
+      + 'registerProcessor("npdm-tap",T);';
+    const url = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }));
+    const setup = (ctx) => {
+      let s = per.get(ctx);
+      if (s) return s;
+      s = { col: ctx.createGain(), ready: false };
+      per.set(ctx, s);
+      M.audio.ctxs++;
+      s.col.gain.value = 1;
+      ctx.audioWorklet.addModule(url).then(() => {
+        const node = new AudioWorkletNode(ctx, 'npdm-tap', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
+        const mute = ctx.createGain(); mute.gain.value = 0;
+        orig.call(s.col, node); orig.call(node, mute); orig.call(mute, ctx.destination);
+        M.audio.taps++;
+        // Several contexts sum; this page almost always has one.
+        const mine = { q: 0, aud: 0, zero: 0, drop: 0, longS: 0 };
+        node.port.onmessage = (m) => {
+          const d = m.data;
+          M.audio.quanta += d.q - mine.q; M.audio.audibleQuanta += d.aud - mine.aud; M.audio.zeroQuanta += d.zero - mine.zero;
+          M.audio.dropouts += d.drop - mine.drop; M.audio.longSilences += d.longS - mine.longS;
+          Object.assign(mine, d);
+          if (d.first != null && M.audio.firstAudibleAt == null) M.audio.firstAudibleAt = Math.round(now() - M.t0);
+          M.audio.sampleRate = ctx.sampleRate; M.audio.state = ctx.state;
+        };
+      }).catch((e) => { M.audio.err = String(e && e.message || e); });
+      return s;
+    };
+    AudioNode.prototype.connect = function (dest) {
+      try {
+        const ctx = this.context;
+        if (ctx && dest && dest === ctx.destination && ctx.audioWorklet && !(ctx instanceof OfflineAudioContext)) {
+          const s = setup(ctx);
+          if (this !== s.col) orig.call(this, s.col);
+        }
+      } catch (e) {}
+      return orig.apply(this, arguments);
+    };
+  } catch (e) { M.audio.err = 'tap install: ' + e; }
+  // ---------------- network shims (arms d / drelay only) ----------------
+  if (CFG.p2p) {
+    const send = RTCDataChannel.prototype.send;
+    const Q = new WeakMap();
+    RTCDataChannel.prototype.send = function (data) {
+      const ch = this;
+      let q = Q.get(ch); if (!q) { q = { last: 0 }; Q.set(ch, q); }
+      M.p2p.sent++;
+      const rtx = Math.random() < CFG.p2p.lossFrac;
+      if (rtx) M.p2p.rtx++;
+      const at = Math.max(now() + CFG.p2p.delayMs + (rtx ? CFG.p2p.rtxMs : 0), q.last);
+      q.last = at;
+      M.p2p.delayed++;
+      setTimeout(() => { try { if (ch.readyState === 'open') send.call(ch, data); } catch (e) {} }, Math.max(0, at - now()));
+    };
+  }
+  if (CFG.relay) {
+    const PC = window.RTCPeerConnection;
+    const W = function (cfg, ...rest) {
+      const c = Object.assign({}, cfg || {}, { iceTransportPolicy: 'relay' });
+      M.relayForced = true;
+      return new PC(c, ...rest);
+    };
+    W.prototype = PC.prototype;
+    Object.setPrototypeOf(W, PC);
+    window.RTCPeerConnection = W;
+  }
+})();`;
+}
+
+// ---- PNG decode (Chrome emits 8-bit RGB/RGBA, non-interlaced) ------------------------
+function decodePng(buf) {
+  let off = 8, w = 0, h = 0, ct = 0; const idat = [];
+  while (off < buf.length) {
+    const len = buf.readUInt32BE(off); const type = buf.toString('ascii', off + 4, off + 8);
+    const data = buf.subarray(off + 8, off + 8 + len);
+    if (type === 'IHDR') { w = data.readUInt32BE(0); h = data.readUInt32BE(4); ct = data[9]; }
+    else if (type === 'IDAT') idat.push(data);
+    else if (type === 'IEND') break;
+    off += 12 + len;
+  }
+  const bpp = ct === 6 ? 4 : 3;
+  const raw = zlib.inflateSync(Buffer.concat(idat));
+  const stride = w * bpp; const px = Buffer.alloc(h * stride);
+  for (let y = 0; y < h; y++) {
+    const f = raw[y * (stride + 1)]; const src = raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1));
+    const cur = px.subarray(y * stride, (y + 1) * stride); const prev = y ? px.subarray((y - 1) * stride, y * stride) : null;
+    for (let i = 0; i < stride; i++) {
+      const a = i >= bpp ? cur[i - bpp] : 0, b = prev ? prev[i] : 0, c = (prev && i >= bpp) ? prev[i - bpp] : 0;
+      let v = src[i];
+      if (f === 1) v += a; else if (f === 2) v += b; else if (f === 3) v += (a + b) >> 1;
+      else if (f === 4) { const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c); v += (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c); }
+      cur[i] = v & 255;
+    }
+  }
+  return { w, h, bpp, px };
+}
+function judgePixels(img) {
+  let lit = 0, n = 0; const colours = new Set(); let lum = 0;
+  for (let i = 0; i < img.px.length; i += img.bpp * 3) {       // every 3rd pixel is plenty
+    const r = img.px[i], g = img.px[i + 1], b = img.px[i + 2];
+    n++; if (Math.max(r, g, b) > 32) lit++;
+    lum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    colours.add((r >> 4) << 8 | (g >> 4) << 4 | (b >> 4));
+  }
+  const litFrac = n ? lit / n : 0;
+  return { w: img.w, h: img.h, litFrac: +litFrac.toFixed(4), colours: colours.size, meanLum: +(lum / (n || 1)).toFixed(1),
+           showing: litFrac >= 0.02 && colours.size >= 8 };
+}
+async function canvasShot(page, file) {
+  try {
+    const rect = await page.evaluate(() => {
+      let best = null;
+      for (const c of document.querySelectorAll('canvas')) {
+        const r = c.getBoundingClientRect(); const s = getComputedStyle(c);
+        if (s.display === 'none' || s.visibility === 'hidden' || +s.opacity === 0) continue;
+        const x = Math.max(0, r.left), y = Math.max(0, r.top);
+        const w = Math.min(innerWidth, r.right) - x, h = Math.min(innerHeight, r.bottom) - y;
+        if (w < 16 || h < 16) continue;
+        if (!best || w * h > best.w * best.h) best = { x, y, w, h, id: c.id || null };
+      }
+      return best;
+    });
+    if (!rect) return { showing: false, why: 'no visible canvas in the viewport' };
+    const buf = await page.screenshot({ type: 'png', clip: { x: rect.x, y: rect.y, width: rect.w, height: rect.h }, captureBeyondViewport: false });
+    fs.writeFileSync(file, buf);
+    return Object.assign(judgePixels(decodePng(Buffer.from(buf))), { canvas: rect.id, file });
+  } catch (e) { return { showing: false, why: 'screenshot failed: ' + String(e.message || e).slice(0, 120) }; }
+}
+
+// ---- a player's browser ---------------------------------------------------------
+async function launchPlayer(role, device, cellTag, pre) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `npdm-${cellTag}-${role}-`));
+  const browser = await puppeteer.launch({
+    headless: 'new', executablePath: CHROME, userDataDir: dir, protocolTimeout: 240000,
+    args: ['--no-sandbox', '--disable-dev-shm-usage', '--autoplay-policy=no-user-gesture-required',
+           '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
+           '--disable-backgrounding-occluded-windows',
+           '--disable-features=WebRtcHideLocalIpsWithMdns,CalculateNativeWinOcclusion',
+           '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist',
+           '--disk-cache-size=104857600', '--window-size=1280,800'],
+  });
+  try { (await import('./browser_leak_guard.js')).default.guard(browser, __filename); } catch (_e) {}
+  const page = (await browser.pages())[0] || await browser.newPage();
+  page.setDefaultTimeout(120000);
+  const P = { role, device, browser, page, dir, errors: [], consoleErrors: [], log: [], throttled: [], throttleRejected: [] };
+  page.on('pageerror', (e) => P.errors.push(String((e && e.message) || e).slice(0, 300)));
+  page.on('console', (m) => {
+    const t = m.text();
+    if (m.type() === 'error') P.consoleErrors.push(t.slice(0, 200));
+    if (/\[net\]|lockstep|desync|relay|stall|delay|audio|underrun|fault|error/i.test(t) && P.log.length < 3000) P.log.push(((Date.now() - T0) / 1000).toFixed(1) + ' ' + t.slice(0, 300));
+  });
+  const cdp = await page.createCDPSession();
+  P.cdp = cdp;
+  if (device.kind === 'mobile') {
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width: 915, height: 412, deviceScaleFactor: 2, mobile: true,
+      screenOrientation: { type: 'landscapePrimary', angle: 90 },
+    });
+    await cdp.send('Emulation.setUserAgentOverride', {
+      userAgent: ANDROID_UA, platform: 'Linux armv81',
+      userAgentMetadata: { brands: [{ brand: 'Chromium', version: '140' }, { brand: 'Google Chrome', version: '140' }],
+        fullVersion: '140.0.0.0', platform: 'Android', platformVersion: '14.0.0', architecture: '', model: 'Pixel 7', mobile: true },
+    });
+    await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 });
+  } else {
+    await page.setViewport({ width: 1280, height: 800 });
+  }
+  // THE CPU THROTTLE MUST REACH THE WORKERS. Measured first, applied second, so
+  // the arm-difference proof is a before/after on the same page.
+  if (device.cpu) {
+    const busy = () => page.evaluate(() => { const t = performance.now(); let x = 0; for (let i = 0; i < 3e6; i++) x += Math.sqrt(i); return performance.now() - t + (x < 0 ? 1 : 0); }).catch(() => null);
+    await page.goto('about:blank');
+    const before = await busy();
+    await cdp.send('Emulation.setCPUThrottlingRate', { rate: device.cpu });
+    P.throttled.push('page');
+    const after = await busy();
+    P.throttleProof = { beforeMs: before && +before.toFixed(1), afterMs: after && +after.toFixed(1), ratio: (before && after) ? +(after / before).toFixed(2) : null };
+    page.on('workercreated', async (w) => {
+      try { await w.client.send('Emulation.setCPUThrottlingRate', { rate: device.cpu }); P.throttled.push('worker:' + w.url().split('/').pop().slice(0, 40)); }
+      catch (e) { P.throttleRejected.push(w.url().split('/').pop().slice(0, 40) + ': ' + String(e.message || e).slice(0, 80)); }
+    });
+  }
+  await page.evaluateOnNewDocument(pre.mqtt);
+  await page.evaluateOnNewDocument(pre.hooks);
+  return P;
+}
+async function closePlayer(P) {
+  if (!P) return;
+  try { await P.browser.close(); } catch (e) {}
+  if (!KEEP_PROFILES) { try { fs.rmSync(P.dir, { recursive: true, force: true }); } catch (e) {} }
+}
+// Absorb coi-serviceworker's first-visit reload BEFORE the room opens, so the
+// room is not torn down and reopened under the players (tools/device_matrix.mjs
+// documents the reload). n64/ ships no service worker and settles immediately.
+async function prewarm(P, C) {
+  await P.page.goto(BASE + C.page, { waitUntil: 'domcontentloaded' });
+  for (let i = 0; i < 40; i++) {
+    const s = await P.page.evaluate(async () => {
+      let regs = -1; try { regs = (await navigator.serviceWorker.getRegistrations()).length; } catch (e) {}
+      return { coi: !!self.crossOriginIsolated, regs };
+    }).catch(() => null);
+    if (s && s.coi) return { coi: true, ms: i * 300 };
+    if (s && i >= 8 && s.regs === 0) return { coi: false, ms: i * 300, note: 'no service worker on this page' };
+    await sleep(300);
+  }
+  return { coi: false, timedOut: true };
+}
+
+const CODE_ALPHA = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const mkCode = () => Array.from({ length: 5 }, () => CODE_ALPHA[Math.floor(Math.random() * CODE_ALPHA.length)]).join('');
+
+function handoffUrl(C, code, role, brokerUrl) {
+  const g = encodeURIComponent(C.game);
+  const q = `?np=${code}&game=${g}` + (role === 'host' ? C.hostFlag : '&join=1')
+          + `&signal=ws&wsbroker=${encodeURIComponent(brokerUrl)}` + EXTRA_Q;
+  return BASE + C.page + q;
+}
+
+const engineState = (P) => P.page.evaluate(() => {
+  const M = window.__npdm; const e = M && M.engine;
+  let sess = null;
+  try {
+    const ss = (window.Netplay && window.Netplay.sessions) || [];
+    const s = ss[ss.length - 1];
+    if (s) sess = { state: s.state, isHost: !!s.isHost, relay: s.relay ? { active: !!s.relay.active, oneWayMs: s.relay.oneWayMs, delayFrames: s.relay.delayFrames } : null };
+  } catch (x) {}
+  return { engine: e ? { state: e.state, frame: e.frame, delay: e.delay } : null, sess, ready: M ? M.readyFrames : 0 };
+}).catch(() => null);
+
+// ---- one cell ---------------------------------------------------------------------
+async function runCell(cid, aid, attempt) {
+  const C = CONSOLES[cid]; const A = ARMS[aid];
+  const tag = `${cid}-${aid}` + (attempt ? `-r${attempt}` : '');
+  const seconds = A.soak ? SOAK : SECONDS;
+  const cell = { console: cid, arm: aid, what: A.what, attempt, seconds, query: EXTRA_Q || null, uptimeBefore: uptime(), loads: [], players: {} };
+  const fg = freeGB();
+  if (fg != null && fg < MIN_FREE_GB + 1.2) { cell.error = `disk: only ${fg.toFixed(2)} GB free`; return cell; }
+  await acquireLock(tag);
+  let broker = null, H = null, J = null;
+  const loadTick = setInterval(() => { const l = load1(); if (l != null) cell.loads.push(l); }, 10000);
+  try {
+    cell.uptimeAtLock = uptime();
+    broker = await startBroker({ port: 0 });
+    if (A.broker) broker.setImpair(A.broker);
+    const pre = { mqtt: mqttSource(), hooks: null };
+    const cfg = (role) => ({ role, console: cid, witness: C.witness, frames: C.frames, hz: C.hz,
+                             p2p: A.p2p || null, relay: !!A.relay });
+    const code = mkCode();
+    cell.code = code;
+    H = await launchPlayer('host', A.host, tag, Object.assign({}, pre, { hooks: preloadSrc(cfg('host')) }));
+    J = await launchPlayer('joiner', A.join, tag, Object.assign({}, pre, { hooks: preloadSrc(cfg('joiner')) }));
+    cell.prewarm = { host: await prewarm(H, C), joiner: await prewarm(J, C) };
+    const tOpen = Date.now();
+    await H.page.goto(handoffUrl(C, code, 'host', broker.url), { waitUntil: 'domcontentloaded' });
+    // Give the host's relay subscription a head start: a joiner publishing into
+    // an empty topic is the "slow host" case, which is not what is measured here.
+    for (let i = 0; i < 40; i++) { if (broker.stats.clients >= 1) break; await sleep(250); }
+    await sleep(1500);
+    await J.page.goto(handoffUrl(C, code, 'join', broker.url), { waitUntil: 'domcontentloaded' });
+    // ---- admit, then wait for both engines to run --------------------------------
+    let admitted = false, admitHow = null; const tBootLimit = Date.now() + C.bootMs;
+    let running = false; let lastLog = 0;
+    while (Date.now() < tBootLimit) {
+      if (!admitted) {
+        const btn = await H.page.$('#npApproveAllow').catch(() => null);
+        if (btn) {
+          try { await H.page.click('#npApproveAllow'); admitHow = 'mouse'; }
+          catch (e) { await H.page.evaluate(() => { const b = document.getElementById('npApproveAllow'); if (b) b.click(); }).catch(() => {}); admitHow = 'dom (mouse click failed: ' + String(e.message).slice(0, 60) + ')'; }
+          admitted = true; cell.admitAtS = +((Date.now() - tOpen) / 1000).toFixed(1);
+        }
+      }
+      const [hs, js] = await Promise.all([engineState(H), engineState(J)]);
+      const ok = (s) => s && s.engine && (s.engine.state === 'running' || s.engine.state === 'stalled') && s.ready > 30;
+      if (ok(hs) && ok(js)) { running = true; break; }
+      if (Date.now() - lastLog > 15000) {
+        lastLog = Date.now();
+        say(`  [${tag}] waiting · admitted=${admitted} host=${JSON.stringify(hs && hs.engine)} ready=${hs && hs.ready} · joiner=${JSON.stringify(js && js.engine)} ready=${js && js.ready} · broker=${JSON.stringify(broker.stats)}`);
+      }
+      if ((hs && hs.engine && /desync|failed|ended/.test(hs.engine.state)) || (js && js.engine && /desync|failed|ended/.test(js.engine.state))) break;
+      await sleep(1000);
+    }
+    cell.admitted = admitted; cell.admitHow = admitHow;
+    cell.startS = +((Date.now() - tOpen) / 1000).toFixed(1);
+    cell.running = running;
+    if (!running) {
+      cell.error = `room never reached running on both players within ${C.bootMs / 1000}s`;
+    } else {
+      say(`  [${tag}] both engines running after ${cell.startS}s — measuring ${seconds}s`);
+      // ---- the measured window -------------------------------------------------
+      const tM = Date.now();
+      const mark = await Promise.all([H, J].map((P) => P.page.evaluate(() => ({ ready: window.__npdm.readyFrames, win: window.__npdm.win.length, t: performance.now() - window.__npdm.t0, drop: window.__npdm.audio.dropouts, aq: window.__npdm.audio.quanta, stalls: window.__npdm.stalls.length, resumes: window.__npdm.resumes.length })).catch(() => null)));
+      cell.shots = { host: [], joiner: [] };
+      const pressAt = [8, 22, 36, 50].filter((s) => s < seconds - 4);
+      const shotAt = [5, Math.floor(seconds / 2), seconds - 3];
+      let nextPress = 0, nextShot = 0, pi = 0;
+      while ((Date.now() - tM) / 1000 < seconds) {
+        const el = (Date.now() - tM) / 1000;
+        if (nextShot < shotAt.length && el >= shotAt[nextShot]) {
+          const i = nextShot++;
+          const [a, b] = await Promise.all([canvasShot(H.page, path.join(OUT, `${tag}-host-${i}.png`)), canvasShot(J.page, path.join(OUT, `${tag}-joiner-${i}.png`))]);
+          cell.shots.host.push(Object.assign({ atS: Math.round(el) }, a)); cell.shots.joiner.push(Object.assign({ atS: Math.round(el) }, b));
+          if (i === 1) {
+            // The whole viewport once, as evidence of what each player actually SAW.
+            await Promise.all([H, J].map((P) => P.page.screenshot({ type: 'jpeg', quality: 60, path: path.join(OUT, `${tag}-${P.role}-full.jpg`) }).catch(() => {})));
+          }
+        }
+        if (nextPress < pressAt.length && el >= pressAt[nextPress]) {
+          nextPress++;
+          const P = (pi++ % 2 === 0) ? H : J;
+          try {
+            await P.page.evaluate(() => window.__npdm.press());
+            await P.page.keyboard.down('ArrowLeft'); await sleep(400); await P.page.keyboard.up('ArrowLeft');
+          } catch (e) {}
+        }
+        if (PROFILE_S && !cell.profiled && el >= Math.max(5, seconds / 2 - PROFILE_S / 2)) {
+          cell.profiled = true;
+          await Promise.all([H, J].map(async (P) => {
+            try { await P.cdp.send('Profiler.enable'); await P.cdp.send('Profiler.setSamplingInterval', { interval: 500 }); await P.cdp.send('Profiler.start'); } catch (e) {}
+          }));
+          await sleep(PROFILE_S * 1000);
+          await Promise.all([H, J].map(async (P) => {
+            try { const { profile } = await P.cdp.send('Profiler.stop'); fs.writeFileSync(path.join(OUT, `${tag}-${P.role}.cpuprofile`), JSON.stringify(profile)); } catch (e) {}
+          }));
+        }
+        if (MID_EVAL && !cell.midEval && el >= seconds / 2) {
+          cell.midEval = { atS: Math.round(el), js: MID_EVAL, res: await Promise.all([H, J].map((P) => P.page.evaluate(MID_EVAL).then((r) => String(r)).catch((e) => 'ERR ' + e.message))) };
+        }
+        if (A.soak && Math.round(el) % 60 === 0) say(`  [${tag}] soak ${Math.round(el)}s · load ${load1()}`);
+        const [hs, js] = await Promise.all([engineState(H), engineState(J)]);
+        if ((hs && hs.engine && /desync|failed|ended/.test(hs.engine.state)) || (js && js.engine && /desync|failed|ended/.test(js.engine.state))) {
+          cell.endedEarly = `engine state host=${hs && hs.engine && hs.engine.state} joiner=${js && js.engine && js.engine.state} at ${Math.round(el)}s`;
+          break;
+        }
+        await sleep(1000);
+      }
+      cell.measuredS = +((Date.now() - tM) / 1000).toFixed(1);
+      // ---- collect ---------------------------------------------------------------
+      for (const [P, m] of [[H, mark[0]], [J, mark[1]]]) {
+        const d = await P.page.evaluate((m) => {
+          const M = window.__npdm; const e = M.engine;
+          let rep = null; try { rep = e ? e.report() : null; } catch (x) {}
+          let native = null;
+          try {
+            native = {
+              dcAudio: window.__dcProbe ? window.__dcProbe().audio : undefined,
+              n64Audio: window.__audioDbg ? (typeof window.__audioDbg === 'function' ? window.__audioDbg() : window.__audioDbg) : undefined,
+              audioDiag: window.AudioDiag && window.__audioDiag ? window.AudioDiag.report() : undefined,
+              n64Rate: window.__n64Rate ? { speed: window.__n64Rate.speed, starved: window.__n64Rate.starved, cap: window.__n64Rate.cap } : undefined,
+              gcRate: window.__gcRate ? { path: window.__gcRate.path, speed: window.__gcRate.speed, starved: window.__gcRate.starved, capFps: window.__gcRate.capFps } : undefined,
+            };
+            native = JSON.parse(JSON.stringify(native));
+          } catch (x) { native = { err: String(x) }; }
+          let sess = null;
+          try { const ss = window.Netplay.sessions; const s = ss[ss.length - 1]; sess = { relay: s.relay ? JSON.parse(JSON.stringify(s.relay)) : null, peerId: s.peerId || null }; } catch (x) {}
+          return {
+            t: performance.now() - M.t0, ready: M.readyFrames - m.ready,
+            win: M.win.slice(m.win), stalls: M.stalls.slice(m.stalls), resumes: M.resumes.slice(m.resumes),
+            allStalls: M.stalls.length, delays: M.delays.slice(), lat: M.lat.slice(), desyncs: M.desyncs.slice(),
+            audio: Object.assign({}, M.audio, { dropoutsInWindow: M.audio.dropouts - m.drop, quantaInWindow: M.audio.quanta - m.aq }),
+            p2p: M.p2p, relayForced: M.relayForced, report: rep ? JSON.parse(JSON.stringify(rep)) : null, native, sess,
+            peerId: e ? e.peerId : null, localPorts: e ? e.localPorts : null,
+            hz: (() => { try { return eval(M.cfg.hz); } catch (x) { return null; } })(),
+            winT0: m.t,
+          };
+        }, m).catch((e) => ({ collectError: String(e.message || e) }));
+        d.errors = P.errors.slice(); d.consoleErrors = P.consoleErrors.slice(0, 20); d.consoleErrorCount = P.consoleErrors.length;
+        d.throttled = P.throttled; d.throttleRejected = P.throttleRejected; d.throttleProof = P.throttleProof || null;
+        d.device = P.device;
+        cell.players[P.role] = d;
+      }
+    }
+    // Errors are captured whether or not the room ran.
+    for (const P of [H, J]) {
+      if (!cell.players[P.role]) cell.players[P.role] = { errors: P.errors.slice(), consoleErrors: P.consoleErrors.slice(0, 20), device: P.device, throttleProof: P.throttleProof || null };
+      cell.players[P.role].log = P.log.slice(-80);
+    }
+    if (!running) {
+      cell.shots = { host: [await canvasShot(H.page, path.join(OUT, `${tag}-host-fail.png`))], joiner: [await canvasShot(J.page, path.join(OUT, `${tag}-joiner-fail.png`))] };
+      cell.failState = { host: await engineState(H), joiner: await engineState(J) };
+    }
+    cell.broker = Object.assign({}, broker.stats, { impair: Object.assign({}, broker.impair) });
+  } catch (e) {
+    cell.error = 'rig error: ' + String(e && e.stack || e).slice(0, 400);
+  } finally {
+    clearInterval(loadTick);
+    await closePlayer(H); await closePlayer(J);
+    if (broker) await broker.close().catch(() => {});
+    cell.uptimeAfter = uptime();
+    releaseLock();
+  }
+  return cell;
+}
+
+// ---- solo cap of a device (no room) ----------------------------------------------------
+// `count` > 1 runs that many INDEPENDENT solo emulators at once, each in its own
+// browser — the CONTENTION CONTROL. Two players of a room share this one box,
+// so a room can only be blamed for a shortfall that two solo emulators running
+// side by side do NOT show.
+async function soloBoot(P, C) {
+  await prewarm(P, C);
+  await P.page.goto(BASE + C.page, { waitUntil: 'domcontentloaded' });
+  await sleep(3000);
+  return P.page.evaluate((game) => {
+    const sels = ['romSelect', 'mobileRomSelect'].map((id) => document.getElementById(id)).filter(Boolean);
+    let picked = null;
+    for (const s of sels) {
+      for (const o of s.options) if (o.value === game || o.textContent.trim() === game) { s.value = o.value; picked = o.value; break; }
+      s.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    const sp = document.getElementById('mobileSplash');
+    const splashUp = !!(sp && getComputedStyle(sp).display !== 'none' && sp.offsetParent !== null);
+    const b = splashUp ? document.getElementById('mobileSplashStart') : document.getElementById('btnStart');
+    if (!b) return { picked, pressed: null };
+    try { b.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })); } catch (e) {}
+    try { b.dispatchEvent(new PointerEvent('pointerup', { bubbles: true })); } catch (e) {}
+    b.click();
+    return { picked, pressed: b.id, splashUp, disabled: !!b.disabled, aria: b.getAttribute('aria-disabled') };
+  }, C.game);
+}
+async function soloMeasure(P, C, tag, i) {
+  const out = {};
+  const tLimit = Date.now() + C.bootMs;
+  let live = false;
+  while (Date.now() < tLimit) {
+    const w = await P.page.evaluate(() => { const W = window.__npdm.win; return W.length ? W[W.length - 1] : null; }).catch(() => null);
+    if (w && ((w.witness != null && w.witness > 0.05) || (w.frames != null && w.frames > 120))) { live = true; break; }
+    await sleep(2000);
+  }
+  out.live = live;
+  if (live) {
+    await sleep(15000);
+    const m0 = await P.page.evaluate(() => window.__npdm.win.length);
+    await sleep(40000);
+    out.win = await P.page.evaluate((m0) => window.__npdm.win.slice(m0), m0);
+    out.shot = await canvasShot(P.page, path.join(OUT, `${tag}${i ? '-' + i : ''}.png`));
+    out.audio = await P.page.evaluate(() => window.__npdm.audio);
+  }
+  out.errors = P.errors.slice(); out.throttleProof = P.throttleProof || null; out.throttled = P.throttled; out.throttleRejected = P.throttleRejected;
+  out.rate = soloRate(out);
+  const W = out.win || [];
+  out.rafMean = W.length ? +(W.reduce((a, w) => a + (w.raf || 0), 0) / W.length).toFixed(1) : null;
+  return out;
+}
+async function runSolo(cid, device, count = 1) {
+  const C = CONSOLES[cid];
+  const tag = `${cid}-solo-${device.kind}${device.cpu ? device.cpu + 'x' : ''}${count > 1 ? '-x' + count : ''}`;
+  const out = { console: cid, device, count, uptimeBefore: uptime(), loads: [] };
+  await acquireLock(tag);
+  const Ps = [];
+  const loadTick = setInterval(() => { const l = load1(); if (l != null) out.loads.push(l); }, 10000);
+  try {
+    for (let i = 0; i < count; i++) {
+      Ps.push(await launchPlayer('solo' + i, device, tag, { mqtt: '/*none*/', hooks: preloadSrc({ role: 'solo', console: cid, witness: C.witness, frames: C.frames, hz: C.hz }) }));
+    }
+    out.start = await Promise.all(Ps.map((P) => soloBoot(P, C)));
+    out.each = await Promise.all(Ps.map((P, i) => soloMeasure(P, C, tag, i)));
+    // Headline = the first instance (count 1) or the WORST instance (control).
+    const rated = out.each.filter((e) => e.rate);
+    const worst = rated.sort((a, b) => a.rate.x - b.rate.x)[0] || out.each[0];
+    Object.assign(out, { live: out.each.every((e) => e.live), win: worst.win, shot: worst.shot, audio: worst.audio,
+                         errors: out.each.flatMap((e) => e.errors), throttleProof: worst.throttleProof,
+                         throttled: worst.throttled, throttleRejected: worst.throttleRejected, rafMean: worst.rafMean });
+  } catch (e) {
+    out.error = 'rig error: ' + String(e && e.stack || e).slice(0, 300);
+  } finally {
+    clearInterval(loadTick);
+    for (const P of Ps) await closePlayer(P);
+    out.uptimeAfter = uptime();
+    releaseLock();
+  }
+  out.rate = soloRate(out);
+  return out;
+}
+function soloRate(s) {
+  if (!s.win || s.win.length < 5) return null;
+  const W = s.win;
+  const wit = W.map((w) => w.witness).filter((x) => typeof x === 'number' && isFinite(x));
+  if (wit.length >= 5) return { src: 'page witness', x: +(wit.reduce((a, b) => a + b, 0) / wit.length).toFixed(4) };
+  const f0 = W[0].frames, f1 = W[W.length - 1].frames, dt = (W[W.length - 1].t - W[0].t) / 1000, hz = W[W.length - 1].hz;
+  if (f0 != null && f1 != null && dt > 0 && hz) return { src: 'page frame counter', x: +(((f1 - f0) / dt) / hz).toFixed(4) };
+  return null;
+}
+
+// ---- verdicts -----------------------------------------------------------------------
+function analysePlayer(d, peerRole) {
+  const r = { };
+  if (!d || !d.win) return null;
+  const W = d.win.filter((w) => w.ready != null);
+  const hz = d.hz || (W.length && W[W.length - 1].hz) || 60;
+  const secs = W.length;
+  const ready = W.reduce((a, w) => a + w.ready, 0);
+  r.hz = +(+hz).toFixed(3);
+  r.engineX = secs ? +((ready / secs) / hz).toFixed(4) : null;
+  let maxWin5 = 0;
+  for (let i = 0; i + 5 <= W.length; i++) { const s = W.slice(i, i + 5).reduce((a, w) => a + w.ready, 0) / 5 / hz; if (s > maxWin5) maxWin5 = s; }
+  r.maxWin5 = +maxWin5.toFixed(4);
+  let minWin5 = Infinity;
+  for (let i = 0; i + 5 <= W.length; i++) { const s = W.slice(i, i + 5).reduce((a, w) => a + w.ready, 0) / 5 / hz; if (s < minWin5) minWin5 = s; }
+  r.minWin5 = minWin5 === Infinity ? null : +minWin5.toFixed(4);
+  const wit = W.map((w) => w.witness).filter((x) => typeof x === 'number' && isFinite(x));
+  r.witnessX = wit.length ? +(wit.reduce((a, b) => a + b, 0) / wit.length).toFixed(4) : null;
+  r.witnessMax = wit.length ? +Math.max(...wit).toFixed(4) : null;
+  const fr = W.map((w) => w.frames).filter((x) => typeof x === 'number');
+  r.frameCounterX = fr.length >= 2 ? +(((fr[fr.length - 1] - fr[0]) / Math.max(1, W.length - 1)) / hz).toFixed(4) : null;
+  r.stalls = d.stalls ? d.stalls.length : null;
+  r.stallMs = d.resumes ? d.resumes.reduce((a, x) => a + x.ms, 0) : null;
+  const who = {};
+  for (const s of d.stalls || []) for (const p of (s.waitingPeers && s.waitingPeers.length ? s.waitingPeers : ['port ' + (s.waitingOn || []).join(',')])) {
+    const k = p === d.peerId ? 'self' : (p === peerRole.peerId ? peerRole.role : p); who[k] = (who[k] || 0) + 1;
+  }
+  r.waitedOn = who;
+  r.delayChanges = (d.delays || []).map((x) => `${x.from}->${x.to}@f${x.at}`);
+  r.delayNow = d.report ? d.report.delay : null;
+  r.latFrames = (d.lat || []).map((x) => x.frames);
+  r.desync = !!(d.report && d.report.desync) || (d.desyncs || []).length > 0 || (d.report && d.report.state === 'desync');
+  r.hashesCompared = d.report ? d.report.hashesCompared : null;
+  const a = d.audio || {};
+  const mins = (a.quantaInWindow && a.sampleRate) ? (a.quantaInWindow * 128 / a.sampleRate) / 60 : null;
+  r.audio = { taps: a.taps, audibleFrac: a.quanta ? +(a.audibleQuanta / a.quanta).toFixed(3) : null,
+              dropouts: a.dropoutsInWindow, perMin: mins ? +(a.dropoutsInWindow / mins).toFixed(2) : null,
+              renderedMin: mins ? +mins.toFixed(2) : null, err: a.err || null, firstAudibleAt: a.firstAudibleAt };
+  r.errors = (d.errors || []).length;
+  r.consoleErrors = d.consoleErrorCount || 0;
+  r.relay = d.sess && d.sess.relay ? !!d.sess.relay.active : false;
+  return r;
+}
+function verdict(cell, solo) {
+  const why = [];
+  if (cell.error) return { pass: false, why: [cell.error] };
+  const h = cell.players.host, j = cell.players.joiner;
+  const ah = analysePlayer(h, { role: 'joiner', peerId: j && j.peerId });
+  const aj = analysePlayer(j, { role: 'host', peerId: h && h.peerId });
+  cell.analysis = { host: ah, joiner: aj };
+  for (const [name, a, d] of [['host', ah, h], ['joiner', aj, j]]) {
+    if (!a) { why.push(name + ': nothing collected'); continue; }
+    const x = a.witnessX != null ? Math.min(a.witnessX, a.engineX) : a.engineX;
+    if (!(x >= RATE_FLOOR)) why.push(`${name} rate ${x}x < ${RATE_FLOOR}`);
+    if (a.maxWin5 > RATE_CEIL_WIN) why.push(`${name} FAST-FORWARD: a 5-s window ran at ${a.maxWin5}x`);
+    if (a.witnessMax != null && a.witnessMax > 1.05) why.push(`${name} page witness peaked at ${a.witnessMax}x`);
+    if (a.desync) why.push(`${name} DESYNC`);
+    if (!(a.hashesCompared > 0)) why.push(`${name} compared 0 fingerprints`);
+    if (a.errors) why.push(`${name} ${a.errors} page error(s): ${(d.errors || [])[0]}`);
+    const shots = (cell.shots && cell.shots[name]) || [];
+    const lastTwo = shots.slice(-2);
+    if (!lastTwo.some((s) => s.showing)) why.push(`${name} canvas BLANK (${lastTwo.map((s) => s.litFrac != null ? s.litFrac + '/' + s.colours + 'c' : s.why).join(', ')})`);
+    const excess = (a.audio.dropouts || 0) - (a.stalls || 0);
+    const perMinExcess = a.audio.renderedMin ? excess / a.audio.renderedMin : 0;
+    if (perMinExcess > AUDIO_DROPOUTS_PER_MIN) why.push(`${name} audio ${a.audio.dropouts} dropouts (${a.audio.perMin}/min; ${perMinExcess.toFixed(1)}/min beyond stalls)`);
+  }
+  if (cell.endedEarly) why.push('ended early: ' + cell.endedEarly);
+  // Device-limited: a throttled player that cannot do 1.000x SOLO.
+  let limited = null;
+  for (const [name, dev] of [['host', ARMS[cell.arm].host], ['joiner', ARMS[cell.arm].join]]) {
+    if (dev.kind !== 'mobile' || !solo) continue;
+    if (solo.rate && solo.rate.x < RATE_FLOOR) limited = `${name} device SOLO cap ${solo.rate.x}x (${solo.rate.src}) — below ${RATE_FLOOR} with no room at all`;
+  }
+  return { pass: why.length === 0, deviceLimited: limited, why };
+}
+
+// ---- main -----------------------------------------------------------------------------
+(async () => {
+  say(`=== netplay device matrix · consoles=${consoles.join(',')} arms=${arms.join(',')} seconds=${SECONDS} ===`);
+  say(`uptime: ${uptime()} · free ${freeGB() && freeGB().toFixed(2)} GB · out ${OUT}`);
+  const RESULT = { when: new Date().toISOString(), base: BASE, seconds: SECONDS, thresholds: { RATE_FLOOR, RATE_CEIL_WIN, AUDIO_DROPOUTS_PER_MIN, VOID_LOAD },
+                   limits: ['mobile = desktop Chromium + UA/touch/viewport + CPU throttle; not a phone GPU, not WebKit',
+                            'both players share one 4-core box with other agents; SwiftShader rendering',
+                            'arm d network impairment is an in-page FIFO shim on RTCDataChannel.send; CDP network emulation does not reach WebRTC'],
+                   solo: {}, cells: [] };
+  const save = () => fs.writeFileSync(path.join(OUT, 'matrix.json'), JSON.stringify(RESULT, null, 1));
+  for (const cid of consoles) {
+    for (const dk of SOLO_DEVS) {
+      const dev = dk === 'mobile' ? MOBILE : DESKTOP;
+      say(`--- ${cid} SOLO cap, ${dk}${dev.cpu ? ' ' + dev.cpu + 'x' : ''} ---`);
+      const s = await runSolo(cid, dev, dk === 'pair' ? 2 : 1);
+      RESULT.solo[cid + ':' + dk] = s; save();
+      say(`  solo ${cid}/${dk}: live=${s.live} rate=${JSON.stringify(s.rate)} throttleProof=${JSON.stringify(s.throttleProof)} canvas=${s.shot && (s.shot.showing ? 'ok' : 'BLACK')} audio=${s.audio ? s.audio.dropouts + ' drop/' + s.audio.quanta + 'q' : '-'} raf=${s.rafMean}${s.each && s.each.length > 1 ? ' each=' + s.each.map((e) => e.rate && e.rate.x).join('/') : ''} loads=${s.loads.join(',')} ${s.start ? JSON.stringify(s.start) : ''} ${s.error || ''}`);
+    }
+    for (const aid of (SOLO_ONLY ? [] : arms)) {
+      let cell = null;
+      for (let attempt = 0; attempt <= RETRIES; attempt++) {
+        say(`--- ${cid} × ${aid} (${ARMS[aid].what})${attempt ? ' retry ' + attempt : ''} ---`);
+        cell = await runCell(cid, aid, attempt);
+        const maxLoad = cell.loads.length ? Math.max(...cell.loads) : load1();
+        cell.maxLoad = maxLoad;
+        cell.void = maxLoad != null && maxLoad > VOID_LOAD;
+        cell.verdict = verdict(cell, RESULT.solo[cid + ':mobile']);
+        RESULT.cells.push(cell); save();
+        const v = cell.verdict;
+        say(`  => ${cell.void ? 'VOID (load ' + maxLoad + ')' : (v.pass ? 'PASS' : 'FAIL')} ${v.deviceLimited ? '[DEVICE-LIMITED: ' + v.deviceLimited + '] ' : ''}${v.why.join(' · ')}`);
+        if (cell.analysis) for (const k of ['host', 'joiner']) {
+          const a = cell.analysis[k]; if (!a) continue;
+          say(`     ${k.padEnd(6)} engine ${a.engineX}x (5s ${a.minWin5}..${a.maxWin5}) witness ${a.witnessX} fc ${a.frameCounterX} · stalls ${a.stalls}/${a.stallMs}ms on ${JSON.stringify(a.waitedOn)} · delay ${a.delayNow} [${a.delayChanges.join(' ')}] · lat ${JSON.stringify(a.latFrames)} · audio ${JSON.stringify(a.audio)} · hashes ${a.hashesCompared} · relay ${a.relay} · err ${a.errors}/${a.consoleErrors}`);
+          const shots = (cell.shots && cell.shots[k]) || [];
+          say(`     ${k.padEnd(6)} canvas ${shots.map((s) => (s.showing ? 'OK' : 'BLANK') + '(' + s.litFrac + '/' + s.colours + ')').join(' ')}`);
+        }
+        if (!cell.void) break;
+      }
+    }
+  }
+  // ---- summary table ----
+  const rows = RESULT.cells.filter((c, i, a) => !a.slice(i + 1).some((d) => d.console === c.console && d.arm === c.arm));
+  const lines = ['| console | arm | verdict | host x (engine/witness) | joiner x | stalls h/j | delay h/j | lat frames h/j | canvas h/j | audio drop/min h/j | desync | errors | load |',
+                 '|---|---|---|---|---|---|---|---|---|---|---|---|---|'];
+  for (const c of rows) {
+    const a = c.analysis || {}; const h = a.host || {}; const j = a.joiner || {};
+    const cv = (k) => ((c.shots && c.shots[k]) || []).slice(-2).some((s) => s.showing) ? 'ok' : 'BLANK';
+    const v = c.void ? 'VOID' : (c.verdict.pass ? 'PASS' : (c.verdict.deviceLimited ? 'DEVICE-LIMITED' : 'FAIL'));
+    lines.push(`| ${c.console} | ${c.arm} | ${v} | ${h.engineX ?? '-'}/${h.witnessX ?? '-'} | ${j.engineX ?? '-'}/${j.witnessX ?? '-'} | ${h.stalls ?? '-'}/${j.stalls ?? '-'} | ${h.delayNow ?? '-'}/${j.delayNow ?? '-'} | ${JSON.stringify(h.latFrames || [])}/${JSON.stringify(j.latFrames || [])} | ${c.error ? '-' : cv('host') + '/' + cv('joiner')} | ${h.audio ? h.audio.perMin : '-'}/${j.audio ? j.audio.perMin : '-'} | ${(h.desync || j.desync) ? 'YES' : 'no'} | ${(h.errors || 0) + (j.errors || 0)} | ${c.maxLoad} |`);
+  }
+  for (const [cid, s] of Object.entries(RESULT.solo)) lines.push(`| ${cid} | SOLO | ${s.rate ? s.rate.x + 'x (' + s.rate.src + ')' : 'no rate'} | canvas ${s.shot ? (s.shot.showing ? 'ok' : 'BLACK') : '-'} | throttle proof ${s.throttleProof ? s.throttleProof.ratio + 'x' : '-'} |`);
+  RESULT.table = lines.join('\n');
+  save();
+  fs.writeFileSync(path.join(OUT, 'table.md'), RESULT.table + '\n');
+  say('\n' + RESULT.table);
+  say(`full JSON: ${path.join(OUT, 'matrix.json')}`);
+  const fails = rows.filter((c) => !c.void && !c.verdict.pass).length;
+  process.exit(fails ? 1 : 0);
+})().catch((e) => { console.error(e); releaseLock(); process.exit(3); });
