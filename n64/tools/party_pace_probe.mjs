@@ -20,6 +20,8 @@
 //            (the signalling) delayed by --netms (default 60 ms, +/- --jitter
 //            ms), ordered, in BOTH windows: a one-way link latency. CDP network
 //            emulation reaches neither, so it is injected before page scripts.
+//   solo-cpu4 : the host's own cap — mobile emulation + the same CPU
+//            throttle, no room.
 //   solo / solo2 : CONTROL — one (or two side-by-side) cores with no room.
 //            Measured here: two MK64 cores under SwiftShader deliver 0.687x and
 //            0.396x SOLO, so any two-core room on this box is CPU-bound and a
@@ -211,11 +213,16 @@ async function canvasPixels(page) {
 
 const out = { arm: ARM, code: CODE, secs: SECS, netms: ARM === 'net' ? NETMS : 0, jitter: ARM === 'net' ? JITTER : 0, cpu: ARM === 'cpu4' ? CPU : 1 };
 let host, join;
-if (ARM === 'solo' || ARM === 'solo2') {
+if (ARM === 'solo' || ARM === 'solo2' || ARM === 'solo-cpu4') {
   // CONTROL: the same ROM with no room, on a desktop tab (and, for solo2, a
   // second one beside it) — what this box's cores deliver without lockstep.
   try {
-    const pages = [await open('solo', `${BASE}/n64/?game=${encodeURIComponent(GAME)}&autostart`, false)];
+    // solo-cpu4: THE HOST'S OWN CAP — the mobile-emulated page, CPU-throttled
+    // exactly as the cpu4 arm throttles the host, running the game ALONE. A
+    // room can never beat this number, whatever the network does.
+    const mob = ARM === 'solo-cpu4';
+    const pages = [await open('solo', `${BASE}/n64/?game=${encodeURIComponent(GAME)}&autostart`, mob)];
+    if (mob) { const cdp = await pages[0].createCDPSession(); await cdp.send('Emulation.setCPUThrottlingRate', { rate: CPU }); }
     if (ARM === 'solo2') pages.push(await open('solo-b', `${BASE}/n64/?game=${encodeURIComponent(GAME)}&autostart`, true));
     await new Promise((r) => setTimeout(r, 15000));
     const sp = pages.map(() => []);

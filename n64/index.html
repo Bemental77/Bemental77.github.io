@@ -3525,6 +3525,9 @@ N64Rate.selfTest = function (logFn) {
       LS.startedAt = ls.frame | 0;        // "everyone started together at frame N"
       LS.baseWall = 0;                    // anchor the governor at the real start
       LS.hashSink = (typeof ls.endFrame === 'function');
+      // The engine's pace window compares frames run against this: a slow
+      // MACHINE loses frames without waiting, a slow LINK loses them waiting.
+      if (LS.viHz > 0) ls.frameHz = LS.viHz;
       pageLog('[lockstep] FRAME GATE ENGAGED at frame ' + ls.frame + ' — this core advances only when every '
             + 'seated port has an input for the frame. delay=' + ls.delay + ' frames, ports='
             + JSON.stringify(ls.roster) + ', mine=' + JSON.stringify(ls.localPorts)

@@ -71,7 +71,7 @@ export function simulate(sc) {
     const p = { id, host, busyUntil: 0, baseWall: 0, baseFrame: 0, frames: 0, reanchors: 0,
                 cost: sc.cost[id], lastDeliver: 0, feedArmed: false, perSec: [], stalledMs: 0 };
     p.ls = new Lockstep({
-      host, peerId: id, portCount: 4, padBytes: 4, delay: 2, hashEvery: 0,
+      host, peerId: id, portCount: 4, padBytes: 4, delay: 2, hashEvery: 0, frameHz: viHz,
       now: () => T,
       send: (m) => {
         const tagged = Object.assign({ peer: id }, m);
@@ -184,6 +184,11 @@ const SCEN = {
   // then back. The delay must go up to cover it, and come back DOWN after.
   spike: { startDelay: 3, cost: { H: 8, G: 8 },
            latency: (T, rnd) => (T > 20000 && T < 50000 ? 190 : 40) + (rnd() * 2 - 1) * 5 },
+  // BOTH machines slower than real time, with jittery frame times — the
+  // browser rig on this box. They wait on each other now and then, and that
+  // must not read as a slow link.
+  'both-slow': { startDelay: 5, cost: { H: (T, rnd) => 26 + rnd() * 12, G: (T, rnd) => 24 + rnd() * 16 },
+                 latency: uni(70, 30) },
   // Bigger hiccups: long enough that one stall outlasts delayBumpAfterMs, so
   // the raise fires every time — the case the give-back has to live with.
   'big-hiccups': { startDelay: 4, cost: { H: 8, G: 8 },
@@ -204,6 +209,7 @@ const EXPECT = {
              : r.raises ? 'the delay was raised for a slow machine (' + r.raises + ' raises)' : null,
   spike: (r) => !r.raises ? 'a sustained latency rise was never covered'
              : r.delayEnd > r.startDelay + 1 ? 'the delay never came back down after the spike (ended ' + r.delayEnd + ')' : null,
+  'both-slow': (r) => r.raises > 1 ? r.raises + ' raises for two slow MACHINES (delay ' + r.startDelay + ' -> ' + r.delayEnd + ')' : null,
   // A floor below what the link needs must be raised to what it needs and
   // then HELD: no oscillation, and the time lost to re-probing shrinks.
   'low-sample': (r) => r.delayEnd !== 6 ? 'expected to settle at 6, ended at ' + r.delayEnd
