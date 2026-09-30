@@ -24,7 +24,10 @@ import { createHash } from 'crypto';
 import { execSync } from 'child_process';
 
 // Libs whose staleness can break a page's behaviour rather than just its looks.
-const LIBS = ['lib/netplay.js', 'lib/asset_base.js', 'lib/capability.js', 'lib/bgz.js'];
+// lib/debugreport.js is here because a player's "Copy debug" report is only as
+// good as the collector the device actually ran: a stale cached copy would read
+// seams that moved and print n/a where the answer is.
+const LIBS = ['lib/netplay.js', 'lib/asset_base.js', 'lib/capability.js', 'lib/bgz.js', 'lib/debugreport.js'];
 
 const PAGES = [
   'index.html', 'dreamcast.html', 'gamecube.html', 'ps1.html', 'snes.html',
