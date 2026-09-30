@@ -61,6 +61,18 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 globalThis.window = globalThis; globalThis.self = globalThis;
 (0, eval)(fs.readFileSync(process.env.NETPLAY_JS || path.join(root, 'lib/netplay.js'), 'utf8'));
 const { Lockstep } = globalThis.Netplay;
+// MIXED-VERSION ROOMS: sc.oldIds consoles run the engine as of a git revision
+// (sc.oldRef, default the last commit before the adaptive room) — a guest on a
+// cached page talking to a new host, or the reverse.
+import { execSync } from 'node:child_process';
+const OLD = new Map();
+function oldLockstep(ref) {
+  if (!OLD.has(ref)) {
+    const src = execSync('git show ' + ref + ':lib/netplay.js', { cwd: root, maxBuffer: 64 << 20 }).toString();
+    const w = {}; new Function('window', src)(w); OLD.set(ref, w.Netplay.Lockstep);
+  }
+  return OLD.get(ref);
+}
 
 function prng(seed) { let a = seed >>> 0; return () => { a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
 class Q {
@@ -134,7 +146,7 @@ export function simulate(sc) {
       stepMs: (sc.stepMs && sc.stepMs[id] != null) ? sc.stepMs[id] : (sc.stepMsAll || 1.5),
       ring: new Map(), st: 0x811c9dc5, started: false, beganAt: null, declared: false,
       sampled: new Map(), lagN: 0, lagBad: 0, resim: 0, maxTickWork: 0, aheadMax: -Infinity,
-      hashes: new Map(), win: [], winAt: 0, winF: 0, frameAt: [], creditOver: -Infinity,
+      hashes: new Map(), win: [], winAt: 0, winF: 0, frameAt: [], creditOver: -Infinity, rejoinTicks: 0, pacedTicks: 0,
     };
     const opts = { host, peerId: id, portCount: sc.portCount || Math.max(2, n), padBytes: PAD, delay: 2, hashEvery: 30,
                    rollback: sc.window || 8, now: () => T, frameHz: HZ,
@@ -143,8 +155,11 @@ export function simulate(sc) {
                      if (host) { for (const o of ids) if (o !== 'H') hop('H', o, JSON.parse(JSON.stringify(tagged))); }
                      else hop(id, 'H', tagged);
                    } };
-    if (sc.catchUp !== false) { opts.rbCatchUp = true; opts.selfStepMs = p.stepMs; }
-    p.ls = new Lockstep(opts);
+    const old = sc.oldIds && sc.oldIds.includes(id);
+    if (sc.catchUp !== false && !old) { opts.rbCatchUp = true; opts.selfStepMs = p.stepMs; }
+    if (sc.lockstep) { opts.rollback = 0; opts.delay = sc.delay || 3; }
+    p.ls = old ? new (oldLockstep(sc.oldRef || 'ffc0f52'))(opts) : new Lockstep(opts);
+    p.old = !!old;
     p.ls.selfStepMs = p.stepMs;
   }
   const H = P.H;
@@ -200,7 +215,7 @@ export function simulate(sc) {
   }
   function tick(p) {
     const ls = p.ls;
-    if (outage(p.id)) { p.lastTs = 0; return; }               // a backgrounded tab runs nothing
+    if (outage(p.id) && !sc.linkOnly) { p.lastTs = 0; return; }   // a backgrounded tab runs nothing (sc.linkOnly: only its link is down)
     if (!p.declared && ls.localPorts.length) { p.declared = true; ls.declareReady('g'); }
     const running = ls.state === 'running' || ls.state === 'stalled';
     if (!running) { p.lastTs = 0; return; }
@@ -210,13 +225,18 @@ export function simulate(sc) {
     const pace = typeof ls.rbPace === 'function' ? ls.rbPace() : 1;
     p.accum += d * pace;
     let work = 0, ran = 0;
+    // genesis.html: a console a REJOIN-sized gap behind the room holds its last
+    // picture ("rejoining") and runs everything hidden until it is back.
+    const rejoining = typeof ls.rbRejoining === 'function' && ls.rbRejoining();
+    if (rejoining) p.rejoinTicks++;
     if (typeof ls.rbCatchUp === 'function' && sc.catchUp !== false) {
       const k = ls.rbCatchUp();
       for (let i = 0; i < k; i++) { const w = runFrame(p, true); if (!w) break; work += w; }
     }
-    while (p.accum >= FRAME && ran < 4) { const w = runFrame(p, false); if (!w) break; work += w; p.accum -= FRAME; ran++; }
+    while (p.accum >= FRAME && ran < 4) { const w = runFrame(p, rejoining); if (!w) break; work += w; p.accum -= FRAME; ran++; }
     if (p.accum > FRAME) p.accum = FRAME;
-    if (ran) p.presented++;
+    if (ran && !rejoining) p.presented++;
+    if (pace < 1) p.pacedTicks++;
     p.ticks++;
     if (work > p.maxTickWork) p.maxTickWork = work;
     p.busyUntil = T + work;
@@ -281,7 +301,7 @@ export function simulate(sc) {
       window: ls.rollback, windowPeak: ls._rbWinPeak || ls.rollback, stalls: rb.windowStalls, advWaits: rb.advantageWaits,
       rollbacks: rb.rollbacks, maxDepth: rb.maxDepth, resim: p.resim, catchUp: rb.catchUpFrames || 0,
       windowChanges: rb.windowChanges || 0, holeNaks: rb.holeNaks || 0, compared: rep.hashesCompared, maxTickWork: +p.maxTickWork.toFixed(1),
-      lag: p.lagBad + '/' + p.lagN };
+      lag: p.lagBad + '/' + p.lagN, rejoinTicks: p.rejoinTicks, pacedTicks: p.pacedTicks, old: p.old };
   }
   // ---- the straight run: every fingerprinted state vs the TRUE inputs -----
   // True input for (frame, port): the owner's pad sampled on its first try,
@@ -331,11 +351,12 @@ for (const players of [2, 4]) for (const ow of [0, 50, 100, 150]) {
 CELLS['rb-2p-100ms-phone'] = { players: 2, baseMs: 100, jitterMs: 30, loss: 0.02, stepMs: { G1: 6 } };
 CELLS['rb-4p-50ms-phone'] = { players: 4, baseMs: 50, jitterMs: 20, loss: 0.02, stepMs: { G3: 6 } };
 // ⚠ REPORTED, NOT GATED: a 6 ms/step phone in a FOUR-player room at 100 ms one
-// way re-simulates ~20-frame corrections from three remote players and has no
-// capacity left for them (it presents ~30% of its ticks; the room measured
-// 0.983-0.987x). That is a device limit, not a pacing bug: the same phone holds
-// >= 0.995x in the 2-player and 50 ms cells above. Spreading a correction over
-// several ticks was tried and made it WORSE (presented 0.75 -> 0.56 at 2p/100).
+// way re-simulates ~20-frame corrections from three remote players. The ROOM now
+// holds 1.000x here, but the phone itself presents only ~38% of its display
+// ticks (every deep correction overruns a tick): a device-capacity limit, not a
+// pacing bug. Spreading a correction over several ticks was tried and made it
+// worse (presented 0.75 -> 0.56 at 2p/100); slowing the others (rbPace < 1) was
+// a visible sustained slowdown and is gone.
 CELLS['rb-4p-100ms-phone'] = { players: 4, baseMs: 100, jitterMs: 30, loss: 0.02, stepMs: { G3: 6 }, info: true };
 // the room with display ticks that hitch (a 60 ms stall on 1% of ticks)
 CELLS['rb-2p-100ms-hitchy'] = { players: 2, baseMs: 100, jitterMs: 30, loss: 0.02, hiccup: { p: 0.01, ms: 60 } };

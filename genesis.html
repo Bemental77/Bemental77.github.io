@@ -1094,11 +1094,11 @@
     LAT.pending = null;
   }
 
-  function runFrame() {
+  function runFrame(hidden) {
     // ⚠ SINGLE PLAYER IS UNTOUCHED. With no room, LS.armed is false and this is
     // byte-for-byte the loop that shipped: one local mask into port 0, one
     // gpx_run(). Port 1 is never written, so pad[1] stays 0 exactly as before.
-    if (LS.armed) return lsRunFrame();
+    if (LS.armed) return lsRunFrame(hidden);
     Module._gpx_set_pad(0, padMask());
     Module._gpx_run();
     guestFrames++; window.__genFrames++;
@@ -1136,6 +1136,11 @@
     // never past its clock, never presented.
     var lsE = (LS.armed && LS.running) ? lsEngine() : null;
     accum += d * ((lsE && lsE.rollback && typeof lsE.rbPace === 'function') ? lsE.rbPace() : 1);
+    // ⚠ REJOINING IS NOT SHOWN AS A FAST-FORWARD (gate 9). A console that was
+    // away is a rejoin-sized gap behind the room: until it is back, EVERY frame
+    // runs hidden, the last picture holds, and the HUD says so.
+    var rejoining = !!(lsE && lsE.rollback && typeof lsE.rbRejoining === 'function' && lsE.rbRejoining());
+    if (rejoining) { NET.notice = 'Rejoining the room — catching up…'; NET.noticeUntil = Date.now() + 400; }
     if (lsE && lsE.rollback && typeof lsE.rbCatchUp === 'function') {
       var cu = lsE.rbCatchUp();
       for (var ci = 0; ci < cu; ci++) if (!lsRunFrame(true)) break;
@@ -1151,7 +1156,7 @@
     // accumulating more than one tick's worth.
     var stalled = false;
     while (accum >= FRAME_MS && ran < MAX_CATCHUP_FRAMES) {
-      if (!runFrame()) { stalled = true; break; }
+      if (!runFrame(rejoining)) { stalled = true; break; }
       accum -= FRAME_MS; ran++;
     }
     // ⚠ AND THE WAIT MUST NOT BE BANKED ACROSS TICKS EITHER. Breaking out alone
@@ -1179,7 +1184,7 @@
     // wall-clock milliseconds did not happen for the guest, so they are gone
     // rather than owed.
     if (accum > FRAME_MS) accum = FRAME_MS;
-    if (ran) draw();
+    if (ran && !rejoining) draw();
     if (NET.session) netHudTick(ts);
     if (!lastFpsAt) lastFpsAt = ts;
     if (ts - lastFpsAt >= 1000) {
