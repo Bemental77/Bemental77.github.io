@@ -253,10 +253,18 @@ function startServer() {
     wild_jump: [],
     page_err: [],
     other: [],
+    // [vi-timing-gate 2026-09-30] Every recomp-takeover line and every wasm trap, UNCAPPED and
+    // regardless of which bucket below also takes it. '[recompLive] ...' lands in `other`, which
+    // prints only its last 15 lines, so a takeover that held for the hardware, or trapped
+    // (RuntimeError: divide by zero in Video_OutputXFB <- recomp_present), was invisible here.
+    recomp: [],
   };
+  const _recompT0 = Date.now();
+  const _recompRe = /\[recompLive\]|\[recomp-live\]|\[gcroute\]|RuntimeError|divide by zero|unreachable|integer overflow|memory access out of bounds/;
 
   page.on('console', (msg) => {
     const t = msg.text();
+    if (_recompRe.test(t)) buckets.recomp.push('[t=' + ((Date.now() - _recompT0) / 1000).toFixed(1) + 's] ' + t);
     if (t.includes('video_cb')) buckets.video_cb.push(t);
     else if (t.includes('first frame received') || t.includes('[render]')) buckets.render.push(t);
     else if (t.includes('pre-dispatch') || t.includes('pre-region-dispatch')) buckets.bemental_predispatch.push(t);
@@ -3712,6 +3720,12 @@ function startServer() {
   p4c.slice(0, 3).concat(p4c.length > 6 ? ['  ...'] : [], p4c.slice(-3)).forEach(l => console.log('  ' + l));
   console.log('\n--- other (last 15 of ' + buckets.other.length + ') ---');
   buckets.other.slice(-15).forEach(l => console.log('  ' + l));
+  // [vi-timing-gate 2026-09-30] first 40 + last 20, so a takeover's whole start sequence is kept.
+  const _rc = buckets.recomp;
+  console.log('\n--- recomp takeover + wasm traps (count=' + _rc.length + ') ---');
+  _rc.slice(0, 40).concat(_rc.length > 60 ? ['  ... (' + (_rc.length - 60) + ' more)'] : [],
+                          _rc.length > 40 ? _rc.slice(Math.max(40, _rc.length - 20)) : [])
+     .forEach(l => console.log('  ' + l));
   console.log('\n--- wtraj (full, count=' + ((buckets.wtraj||[]).length) + ') ---');
   (buckets.wtraj||[]).forEach(l => console.log(l));
   console.log('\n--- mmio_trace (full, count=' + ((buckets.mmio_trace||[]).length) + ') ---');
