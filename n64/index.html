@@ -2066,7 +2066,12 @@ N64Rate.selfTest = function (logFn) {
     try {
       r = rate.window(performance.now(), {
         vi: Module._neil_vi_total(), costMs: Module._neil_frame_cost_ms(), costN: Module._neil_frame_cost_n(),
-        coreFps: readCoreFps(), shown: shown, arm: activeArm, pace: pace
+        // ⚠ NOT IN A PARTY. The pace governor's busy time is the "duty" behind
+        // e2e, and under lockstep the governor is idle (lsFeed runs the frames),
+        // so duty read ~0 and e2e printed nonsense — the live report showed
+        // "547.85x e2e" beside a 0.36x room. No duty, no e2e: the rate model's
+        // own ?ratetest P11 contract for a window with no pace data.
+        coreFps: readCoreFps(), shown: shown, arm: activeArm, pace: (typeof LS !== 'undefined' && LS.armed) ? null : pace
       });
     } catch (e) { return; }
     lastRate = r;
@@ -3500,6 +3505,7 @@ N64Rate.selfTest = function (logFn) {
     } catch (e) {}
     M._neil_ls_run_frame();
     LS.frame++;
+    try { lsGlWitness(); } catch (e) {}
     try { LS.lastFp = M._neil_last_fp ? (M._neil_last_fp() >>> 0) : 0; } catch (e) { LS.lastFp = 0; }
     return true;
   }
@@ -3591,6 +3597,7 @@ N64Rate.selfTest = function (logFn) {
       return false;
     }
     M._neil_ls_arm(1);
+    try { lsGlWatchCanvas(); } catch (e) {}
     // Fingerprint every frame from here. This is the ONLY thing comparing the
     // two simulations; without it the cores would be gated and silently
     // diverging, which looks correct and is the failure the whole engine exists
@@ -3619,6 +3626,121 @@ N64Rate.selfTest = function (logFn) {
     try { if (window.Module && Module._neil_ls_arm) Module._neil_ls_arm(0); } catch (e) {}
     pageLog('[lockstep] frame gate RELEASED — ' + why + '. This console free-runs from here and is '
           + 'no longer sharing frames with anybody.');
+  }
+
+  // ---- WHO IS THE ROOM WAITING ON? ------------------------------------------
+  // Reported live (room EWLE9, 2026-09-30): a desktop joiner at "speed 0.36x
+  // audio SLOW" whose only explanation was a panel line flickering "Waiting for
+  // host…". Lockstep runs at the pace of the SLOWEST console — that is inherent,
+  // and CLAUDE.md gate #9 forbids buying it back by running anybody's guest
+  // faster — so the only honest fix for the player is to SAY which console is
+  // slow and why. Every console publishes its stalled share per second
+  // ('lspace', lib/netplay.js _paceTick), and that tells the three cases apart:
+  //   * this console never waits and others do   -> THIS device is too slow
+  //   * this console waits and a peer does not     -> THAT device is too slow
+  //   * everybody waits                            -> the CONNECTION is slow
+  // The room rate is frames this core actually ran over wall time, at the ROM's
+  // own field rate — the same witness as the "speed" figure.
+  var LS_PACE_SLOW = 0.95;          // below this for LS_PACE_HOLD_MS, the room is "slow"
+  var LS_PACE_HOLD_MS = 3000;
+  function lsSeatWord(ports) {
+    if (!ports || !ports.length) return 'another player';
+    return ports[0] === 0 ? 'the host' : 'player ' + (ports[0] + 1);
+  }
+  function lsPace() {
+    var now = performance.now();
+    var h = LS.paceHist || (LS.paceHist = []);
+    if (!h.length || now - h[h.length - 1].t >= 250) h.push({ t: now, f: LS.frame });
+    while (h.length > 2 && now - h[1].t > LS_PACE_HOLD_MS) h.shift();
+    var span = h.length ? (now - h[0].t) : 0;
+    var v = { rate: null, slow: false, who: null, text: '', own: null, peers: [] };
+    if (!LS.running || !(LS.viHz > 0) || span < LS_PACE_HOLD_MS * 0.8) return v;
+    v.rate = (h[h.length - 1].f - h[0].f) / (span / 1000) / LS.viHz;
+    var ls = lsEngine(), pr = null;
+    try { pr = ls && typeof ls.paceReport === 'function' ? ls.paceReport() : null; } catch (e) {}
+    var own = pr && pr.own ? pr.own.share : null;
+    var peers = (pr && pr.peers || []).filter(function (p) { return p.ageMs < 4000; });
+    v.own = own; v.peers = peers.map(function (p) { return { ports: p.ports, share: p.share }; });
+    if (v.rate >= LS_PACE_SLOW) return v;
+    v.slow = true;
+    var pct = window.N64Rate ? window.N64Rate.num(v.rate, 2) : v.rate.toFixed(2);
+    var head = 'The room is running at ' + pct + 'x';
+    var waiting = peers.filter(function (p) { return p.share >= 0.1; });
+    if (own !== null && own >= 0.1 && peers.length) {
+      var calm = peers.filter(function (p) { return p.share < own * 0.5; });
+      if (calm.length) {
+        v.who = lsSeatWord(calm[0].ports);
+        v.text = head + ' — waiting on ' + v.who + ': that device cannot run this game at full speed, '
+               + 'and online play can only go as fast as the slowest console.';
+      } else {
+        v.who = 'connection';
+        v.text = head + ' — every console is waiting on the connection; the input delay rises to cover it '
+               + '(now ' + (pr ? pr.delay : '?') + ' frames).';
+      }
+    } else if (own !== null && own < 0.1) {
+      v.who = 'this device';
+      v.text = head + ' — this device cannot run this game at full speed'
+             + (waiting.length ? ', and ' + lsSeatWord(waiting[0].ports) + ' is waiting on it.' : '.');
+    } else {
+      v.text = head + '.';
+    }
+    return v;
+  }
+  // ---- IS THIS CONSOLE ACTUALLY DRAWING? --------------------------------------
+  // Reported live: an Android host in a party showed its touch controls and
+  // "Running." over a BLACK game area, while the joiner rendered the race. The
+  // mobile-emulated Chrome here draws the host fine (composited screenshot,
+  // n64/tools/party_pace_probe.mjs), so what differs on the real phone is not
+  // reproducible on this box. What the page CAN do is witness it: every few
+  // seconds it reads a few pixels of the default framebuffer in the SAME task
+  // as a frame, before the browser presents and clears it, and it listens for
+  // the one event that turns a running core into a black canvas silently —
+  // webglcontextlost. The result goes to the log (Diagnostics) and, when it is
+  // conclusive, to the status line, so the next report says which one it was.
+  var LS_GL = { armedAt: 0, reads: 0, lit: 0, lastAt: 0, lost: false, restored: false, said: '' };
+  function lsGlWitness() {
+    var now = performance.now();
+    if (now - LS_GL.lastAt < 1000) return;          // one read a second: each one is a GPU sync
+    LS_GL.lastAt = now;
+    // Module.ctx when emscripten set it; otherwise the canvas hands back the
+    // context the core already created (getContext returns the existing one —
+    // safe here because a frame has just run, so it exists).
+    var M = window.Module, gl = M && M.ctx;
+    if (!gl) { try { gl = $('canvas').getContext('webgl2'); } catch (e) { gl = null; } }
+    if (!gl || typeof gl.readPixels !== 'function') return;
+    if (gl.isContextLost && gl.isContextLost()) { LS_GL.lost = true; return; }
+    try {
+      var W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
+      if (!(W > 8 && H > 8)) return;
+      var rfb = gl.getParameter(gl.READ_FRAMEBUFFER_BINDING);
+      var ppb = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+      if (ppb) gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+      var px = new Uint8Array(4 * 16), lit = false;
+      // One 16-pixel row through the middle third of the picture.
+      gl.readPixels((W >> 1) - 8, H >> 1, 16, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      for (var i = 0; i < px.length; i += 4) if (px[i] + px[i + 1] + px[i + 2] > 24) { lit = true; break; }
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, rfb);
+      if (ppb) gl.bindBuffer(gl.PIXEL_PACK_BUFFER, ppb);
+      LS_GL.reads++; if (lit) LS_GL.lit++;
+    } catch (e) { LS_GL.err = (e && e.message) || String(e); }
+  }
+  function lsGlWatchCanvas() {
+    var c = $('canvas');
+    if (!c || c.__lsGlWatch) return;
+    c.__lsGlWatch = true;
+    c.addEventListener('webglcontextlost', function () {
+      LS_GL.lost = true;
+      pageLog('[gl] ⚠ WebGL CONTEXT LOST — the browser took this page\'s graphics away. The core keeps '
+            + 'running (the room is not held up) but nothing it draws can reach the screen.');
+      if (NET.session) setStatus('This browser dropped the game\'s graphics (WebGL context lost) — the game is '
+            + 'still running for the room but cannot be shown here. Leave the party and reload to see it again.');
+    });
+    c.addEventListener('webglcontextrestored', function () {
+      LS_GL.restored = true;
+      pageLog('[gl] WebGL context restored by the browser — the core\'s textures and shaders were not, '
+            + 'so the picture stays black until the page is reloaded.');
+    });
   }
 
   // ---- the room -------------------------------------------------------------
@@ -3747,6 +3869,15 @@ N64Rate.selfTest = function (logFn) {
           return r;
         };
       }
+      // Every delay change the host decides goes in the log, so a room that felt
+      // laggy or slow can be read afterwards from Diagnostics: raises, give-backs
+      // and why. The engine keeps the same list (report().delayHistory).
+      try {
+        ls.on('delay', function (d) {
+          pageLog('[lockstep] input delay ' + (d && d.from) + ' -> ' + (d && d.to) + ' frames at frame '
+                + (d && d.at) + ' — ' + ((d && d.reason) || ''));
+        });
+      } catch (e) {}
       try {
         ls.on('desync', function (d) {
           pageLog('[lockstep] ⚠ DESYNC at frame ' + (d && d.frame) + ' — the simulations no longer '
@@ -4031,10 +4162,36 @@ N64Rate.selfTest = function (logFn) {
         // The design's sentence LEADS; a stall is appended, never substituted —
         // measured: the rig read "Waiting for player 2…" on a room that had
         // started together, because a stall replaced the sentence outright.
-        setMsg('Playing — everyone started together at frame ' + (LS.startedAt | 0) + '.'
-          + (LS.stalling ? ' Waiting for ' + (LS.waitingOn.length
-              ? LS.waitingOn.map(function (x) { return x === 0 ? 'host' : 'player ' + (x + 1); }).join(', ') : 'a player') + '…' : ''),
-          LS.stalling ? '' : 'ok');
+        // A SLOW ROOM SAYS WHO IS SLOW, and says it where a phone player can
+        // read it too: this panel sits under the mobile shell (z-index 60 vs
+        // 1000), so the sentence also goes to the status line, which the mobile
+        // shell shows (#mobileStatus). A momentary stall keeps its old wording.
+        var pace = lsPace();
+        LS.paceVerdict = pace;
+        if (pace.slow) {
+          setMsg('Playing — everyone started together at frame ' + (LS.startedAt | 0) + '. ' + pace.text, '');
+          if (LS.paceSaid !== pace.text) { LS.paceSaid = pace.text; if (!LS_GL.lost) setStatus(pace.text); pageLog('[lockstep] ' + pace.text); }
+        } else {
+          if (LS.paceSaid && pace.rate !== null) {
+            LS.paceSaid = '';
+            if (!LS_GL.lost) setStatus('Running — the room is back to full speed.');
+            pageLog('[lockstep] the room is back to full speed (' + window.N64Rate.num(pace.rate, 3) + 'x)');
+          }
+          setMsg('Playing — everyone started together at frame ' + (LS.startedAt | 0) + '.'
+            + (LS.stalling ? ' Waiting for ' + (LS.waitingOn.length
+                ? LS.waitingOn.map(function (x) { return x === 0 ? 'host' : 'player ' + (x + 1); }).join(', ') : 'a player') + '…' : ''),
+            LS.stalling ? '' : 'ok');
+        }
+        // The draw witness's verdict, once, when it is conclusive.
+        if (!LS_GL.said && LS_GL.reads >= 10) {
+          LS_GL.said = LS_GL.lit ? 'drawing' : 'black';
+          pageLog('[gl] draw witness: ' + LS_GL.lit + ' of ' + LS_GL.reads + ' reads of this console\'s own '
+                + 'framebuffer (taken right after a frame) had picture in them'
+                + (LS_GL.lit ? ' — the core IS drawing; a black screen here would be the browser not presenting it.'
+                             : ' — the core is drawing NOTHING visible on this device.'));
+          if (!LS_GL.lit) setStatus('The game is running for the room, but this device is drawing a black picture '
+                                  + '(WebGL' + (LS_GL.lost ? ' context lost' : ' produced no pixels') + '). Open 🩺 Diagnostics and share it.');
+        }
       }
       else if (p.alone) setMsg('Waiting for another player — share the code ' + p.code + '. Starts by itself once two are in and loaded.');
       else if (p.waitingFor.length) setMsg('Starts by itself when everyone is loaded — waiting for ' + p.waitingFor.join(', ') + '.');
@@ -4239,6 +4396,13 @@ N64Rate.selfTest = function (logFn) {
       hashSink: LS.hashSink,
       lastFp: LS.lastFp,
       viHz: LS.viHz,
+      // WHO THE ROOM IS WAITING ON (lsPace) and the engine's own pace report —
+      // every console's stalled share and the delay's history.
+      pace: LS.paceVerdict || null,
+      paceReport: (function () { var e = lsEngine(); try { return e && e.paceReport ? e.paceReport() : null; } catch (x) { return null; } })(),
+      // The draw witness: reads of this console's own framebuffer right after a
+      // frame, and whether the browser ever took the WebGL context away.
+      gl: { reads: LS_GL.reads, lit: LS_GL.lit, lost: LS_GL.lost, restored: LS_GL.restored, verdict: LS_GL.said || null, err: LS_GL.err || null },
       stalling: LS.stalling,
       waitingOn: LS.waitingOn.slice(),
       stalls: LS.stalls,

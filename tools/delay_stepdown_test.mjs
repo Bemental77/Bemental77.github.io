@@ -145,5 +145,98 @@ const bad=(n,d)=>{fail++;console.log('  FAIL  '+n+' — '+d);};
     ? ok('a-guest-adopts-the-same-floor-from-lsgo', `delay ${g.delay}, floor ${g._delayFloor}`)
     : bad('a-guest-adopts-the-same-floor-from-lsgo', `state ${g.state}, delay ${g.delay}, floor ${g._delayFloor}`);
 }
+
+// ---- NEVER LOWER INTO A DELAY THE LINK JUST FAILED AT (2026-09-30) ----------
+// Measured before this: tools/netplay_pace_sim.mjs big-hiccups oscillated
+// 4->6->5->4->6 every 12 s (9 reversals in 120 s).
+{
+  const ls = mk(); ls.delay = 6; ls._delayFloor = 2; ls.frame = 100; ls._queuedTo = 106;
+  now = 50000;
+  // the room had to raise away from 4 just now: 4 is the delay that failed
+  ls.delay = 4; ls._noteLinkFailed(); ls.delay = 6;
+  ls._lastStallAt = now; ls._lastGiveBackAt = 0;
+  now += ls.delayCalmMs + 1;                   // calm has elapsed, cooldown has not
+  sent.length = 0;
+  const r = ls._maybeGiveDelayBack();
+  (r && ls._pendingDelay && ls._pendingDelay.d === 5)
+    ? ok('a-give-back-stops-one-above-the-delay-that-failed', `6 -> ${ls._pendingDelay.d}, not to 4 (failed at 4, ${ls._failedUntil - now} ms of cooldown left)`)
+    : bad('a-give-back-stops-one-above-the-delay-that-failed', JSON.stringify(ls._pendingDelay));
+  // applied, calm again: 5 is as low as it may go until the cooldown runs out
+  ls._applyPendingDelay(ls._pendingDelay.at); ls._lastGiveBackAt = now - ls.delayCalmMs - 1;
+  now += 1; ls._lastStallAt = now - ls.delayCalmMs - 1;
+  const r2 = ls._maybeGiveDelayBack();
+  (!r2 && ls.delay === 5 && !ls._pendingDelay)
+    ? ok('it-does-not-step-into-the-failed-delay-during-the-cooldown', `held at ${ls.delay}`)
+    : bad('it-does-not-step-into-the-failed-delay-during-the-cooldown', `delay ${ls.delay}, pending ${JSON.stringify(ls._pendingDelay)}`);
+  // ...unless the link has PROVED slack: a full calm bucket whose smallest lead
+  // leaves a frame of margin after the step
+  ls._leadMinPrev = 3; ls._leadMinCur = 4;
+  const r3 = ls._maybeGiveDelayBack();
+  (r3 && ls._pendingDelay && ls._pendingDelay.d === 4)
+    ? ok('measured-slack-overrides-the-cooldown', `lead >= 3 for a full bucket -> 5 -> 4`)
+    : bad('measured-slack-overrides-the-cooldown', JSON.stringify(ls._pendingDelay));
+  // after the cooldown, it may try 4 again — and failing at 4 AGAIN doubles it
+  const cd1 = ls._failCooldown;
+  ls.delay = 4; ls._noteLinkFailed();
+  (ls._failCooldown === cd1 * 2)
+    ? ok('failing-at-the-same-delay-again-doubles-the-cooldown', `${cd1} -> ${ls._failCooldown} ms`)
+    : bad('failing-at-the-same-delay-again-doubles-the-cooldown', `${cd1} -> ${ls._failCooldown}`);
+}
+
+// ---- A SLOW MACHINE IS NOT A SLOW LINK ---------------------------------------
+// The host raises on a sustained stall share ONLY when every console reports
+// waiting too. A console slower than real time is waited on and never waits.
+{
+  const run = (peerShare) => {
+    const ls = mk(); ls.delay = 3; ls.frame = 0; now = 0;
+    ls._paceBornAt = 0; ls._paceWinOpen = false;
+    sent.length = 0;
+    // the host stalls 40% of every window; the guest reports `peerShare`
+    for (let w = 0; w < 4; w++) {
+      ls.receive({ t: 'lspace', s: peerShare, fr: 30, w: 1000, peer: 'G' });
+      ls._paceTick();                       // opens / closes a window
+      ls.stats.stallMs += 400; now += 1000;
+      ls._paceTick();
+    }
+    return { raised: !!ls._pendingDelay && ls._pendingDelay.d > 3, pd: ls._pendingDelay,
+             reports: sent.filter((m) => m.t === 'lspace').length };
+  };
+  const slow = run(0.0), link = run(0.4);
+  (!slow.raised)
+    ? ok('a-slow-guest-machine-does-not-raise-the-delay', 'host waited 40% of every window, guest reported 0% — no raise')
+    : bad('a-slow-guest-machine-does-not-raise-the-delay', JSON.stringify(slow.pd));
+  (link.raised && link.pd.d === 5)
+    ? ok('a-slow-link-raises-it', `every console waited 40% -> 3 -> ${link.pd.d} after three windows`)
+    : bad('a-slow-link-raises-it', JSON.stringify(link.pd));
+  (slow.reports >= 3)
+    ? ok('every-window-is-published-to-the-room', `${slow.reports} 'lspace' reports`)
+    : bad('every-window-is-published-to-the-room', `${slow.reports}`);
+}
+
+// ---- A STARTED ROOM IS NEVER STARTED AGAIN ------------------------------------
+// Measured on the pre-2026-09-30 engine: a host stalled at frame 20 that then
+// received a repeated 'lsready' went back to state running at FRAME 0, and a
+// stalled guest handed a repeated 'lsgo' did the same.
+{
+  now = 1;
+  const H = new L({ peerId:'H', host:true, portCount:2, padBytes:2, delay:3, hashEvery:0, send:()=>{}, now:()=>now });
+  H.seat('H', 1); H.seat('G', 1); H.declareReady('d'); H.receive({ t:'lsready', peer:'G', disc:'d' });
+  for (let k = 0; k < 20; k++) H.receive({ t:'ls', f:k, i:[[1, 'AAA=']], peer:'G' });
+  for (let i = 0; i < 40; i++) { const r = H.beginFrame({}); if (r.ready) H.endFrame(null); }
+  const before = H.frame, st = H.state;
+  H.receive({ t:'lsready', peer:'G', disc:'d' });
+  (st === 'stalled' && H.frame === before && H.state === 'stalled')
+    ? ok('a-repeated-lsready-does-not-restart-a-stalled-host', `stalled at frame ${before}, still ${H.frame}`)
+    : bad('a-repeated-lsready-does-not-restart-a-stalled-host', `${st}@${before} -> ${H.state}@${H.frame}`);
+  const G = new L({ peerId:'G', host:false, portCount:2, padBytes:2, send:()=>{}, now:()=>now });
+  const go = { t:'lsgo', delay:3, hashEvery:0, portCount:2, padBytes:2, r:['H','G'] };
+  G.receive(go);
+  for (let i = 0; i < 10; i++) { const r = G.beginFrame({}); if (r.ready) G.endFrame(null); }
+  const gb = G.frame, gs = G.state;
+  G.receive(go);
+  (gs === 'stalled' && G.frame === gb)
+    ? ok('a-repeated-lsgo-does-not-restart-a-stalled-guest', `stalled at frame ${gb}, still ${G.frame}`)
+    : bad('a-repeated-lsgo-does-not-restart-a-stalled-guest', `${gs}@${gb} -> ${G.state}@${G.frame}`);
+}
 console.log(`\n[delay] ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

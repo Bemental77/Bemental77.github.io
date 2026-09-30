@@ -177,10 +177,41 @@ const SCEN = {
   // every calm window gives back into the next hiccup.
   hiccups: { startDelay: 4, cost: { H: 8, G: 8 },
              latency: (T, rnd) => ((T % 12000) > 6000 && (T % 12000) < 6700 ? 420 : 45) + (rnd() * 2 - 1) * 8 },
+  // The mirror image: the GUEST is the slow machine, so it is the HOST that
+  // waits — the one console that decides the delay. It must still not raise.
+  'slow-guest': { startDelay: 2, cost: { H: 8, G: 52 }, latency: uni(15, 5) },
+  // A sustained latency rise (a relay switch, a congested uplink) for 30 s,
+  // then back. The delay must go up to cover it, and come back DOWN after.
+  spike: { startDelay: 3, cost: { H: 8, G: 8 },
+           latency: (T, rnd) => (T > 20000 && T < 50000 ? 190 : 40) + (rnd() * 2 - 1) * 5 },
   // Bigger hiccups: long enough that one stall outlasts delayBumpAfterMs, so
   // the raise fires every time — the case the give-back has to live with.
   'big-hiccups': { startDelay: 4, cost: { H: 8, G: 8 },
              latency: (T, rnd) => ((T % 12000) > 6000 && (T % 12000) < 6900 ? 900 : 45) + (rnd() * 2 - 1) * 8 },
+};
+
+// What each scenario must show (null = pass, else the reason). Written for
+// the default --secs 120 and above.
+const EXPECT = {
+  clean: (r) => r.rate < 0.999 ? 'a clean LAN room must hold 1.000x, read ' + r.rate
+             : r.raises ? 'a clean room raised its delay' : null,
+  jitter: (r) => r.rate < 0.999 ? 'a delay that covers the jitter must hold 1.000x, read ' + r.rate : null,
+  // The room can only run at the slowest machine's pace — and must not pile
+  // lag on top of that: a slow MACHINE is not a slow LINK.
+  'slow-host': (r) => Math.abs(r.rate - 20 / 52) > 0.01 ? 'room rate ' + r.rate + ' is not the host capacity ' + (20 / 52).toFixed(4)
+             : r.raises ? 'the delay was raised for a slow machine (' + r.raises + ' raises) — lag with no benefit' : null,
+  'slow-guest': (r) => Math.abs(r.rate - 20 / 52) > 0.01 ? 'room rate ' + r.rate + ' is not the guest capacity'
+             : r.raises ? 'the delay was raised for a slow machine (' + r.raises + ' raises)' : null,
+  spike: (r) => !r.raises ? 'a sustained latency rise was never covered'
+             : r.delayEnd > r.startDelay + 1 ? 'the delay never came back down after the spike (ended ' + r.delayEnd + ')' : null,
+  // A floor below what the link needs must be raised to what it needs and
+  // then HELD: no oscillation, and the time lost to re-probing shrinks.
+  'low-sample': (r) => r.delayEnd !== 6 ? 'expected to settle at 6, ended at ' + r.delayEnd
+             : r.rate < 0.995 ? 'rate ' + r.rate + ' below 0.995'
+             : r.reversals > Math.ceil(r.secs / 120) ? r.reversals + ' reversals in ' + r.secs + ' s' : null,
+  // A hiccup no acceptable delay can cover must not move the delay at all.
+  hiccups: (r) => r.reversals ? r.reversals + ' reversals' : r.delayEnd > r.startDelay + 1 ? 'delay climbed to ' + r.delayEnd : null,
+  'big-hiccups': (r) => r.reversals ? r.reversals + ' reversals' : r.delayEnd > r.startDelay + 1 ? 'delay climbed to ' + r.delayEnd : null,
 };
 
 if (import.meta.url === 'file://' + process.argv[1] || process.argv[1].endsWith('netplay_pace_sim.mjs')) {
@@ -188,8 +219,11 @@ if (import.meta.url === 'file://' + process.argv[1] || process.argv[1].endsWith(
   const secs = +flag('secs', '120');
   const asJson = argv.includes('--json');
   const names = only ? [only] : Object.keys(SCEN);
+  let failed = 0;
   for (const n of names) {
     const r = simulate(Object.assign({ name: n, secs, seed: 7 }, SCEN[n]));
+    const ex = EXPECT[n] ? EXPECT[n](r) : null;
+    if (ex) { failed++; console.log(`  FAIL  ${n}: ${ex}`); }
     if (asJson) console.log(JSON.stringify(r));
     else {
       console.log(`${n.padEnd(11)} rate ${r.rate.toFixed(4)}x  secs<0.99 ${String(r.secsBelow99).padStart(3)}/${r.windowSecs}  ` +
@@ -197,4 +231,6 @@ if (import.meta.url === 'file://' + process.argv[1] || process.argv[1].endsWith(
       if (argv.includes('--history')) console.log('   ' + r.delayLog.map((d) => `${d.t}s:${d.from}->${d.to}`).join('  '));
     }
   }
+  console.log(`\n[pace-sim] ${names.length - failed} passed, ${failed} failed`);
+  process.exit(failed ? 1 : 0);
 }

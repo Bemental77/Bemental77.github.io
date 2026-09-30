@@ -151,7 +151,13 @@ console.log('=== netplay rollback (node, real Lockstep engines, simulated wire) 
 // by agreement, which would read as a spurious small lag — skipped.)
 const lagOf = (R) => { const all = [...R.con.H.lag.slice(10), ...R.con.G.lag.slice(10)].filter((x) => x != null); const h = {}; for (const x of all) h[x] = (h[x] || 0) + 1; return { n: all.length, h }; };
 {
-  const B = runRoom({ latencyMs: 50, rollback: 0, seconds: 10, unique: true });
+  // The delay a page would actually pick for this link (recommendDelay, from the
+  // RTT at Ready). It used to run at delay 2 over a 50 ms one-way path — two
+  // frames short — which the engine then never raised (no single stall passed
+  // 400 ms), so this arm measured a lockstep room running at ~0.82x with a
+  // constant lag. The pace controller (lib/netplay.js _paceTick) now raises a
+  // room like that to what the link needs, which is the correct BEFORE.
+  const B = runRoom({ latencyMs: 50, rollback: 0, seconds: 10, unique: true, delay: L.recommendDelay(100, 1000 / 60) });
   const lb = lagOf(B);
   ok('BEFORE-lockstep-local-lag-is-the-delay', lb.n > 500 && Object.keys(lb.h).length === 1 && lb.h[B.E.H.delay] === lb.n,
      `lockstep (delay=${B.E.H.delay}): local pad applied N frames after sampling, histogram ${JSON.stringify(lb.h)} over ${lb.n} frames = ${Math.round(B.E.H.delay * 1000 / 60)} ms at 60 Hz`);

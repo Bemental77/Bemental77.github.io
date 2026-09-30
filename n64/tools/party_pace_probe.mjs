@@ -48,6 +48,7 @@ const BASE = flag('url', 'http://localhost:8080');
 const GAME = flag('game', 'Mario Kart 64');
 const JSON_OUT = flag('json', '');
 const SHOT = flag('shot', '');
+const LOSE_GL = argv.includes('--lose-gl');
 const CHROME = '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
 const ALPHA = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const CODE = Array.from({ length: 5 }, () => ALPHA[Math.floor(Math.random() * ALPHA.length)]).join('');
@@ -69,17 +70,32 @@ try { (await import('../../tools/browser_leak_guard.js')).default.guard(browser,
 // Runs before any page script: optional link delay + the delay-event recorder.
 function preloadSrc(netms, jitter) {
   return `(() => {
-    window.__pp = { delays: [], stalls: 0, resumes: 0, t0: performance.now() };
+    window.__pp = { delays: [], stalls: 0, resumes: 0, rx: [], begins: [], t0: performance.now() };
     if (${netms} > 0) {
       // The game's inputs travel on an RTCDataChannel (the BroadcastChannel only
       // signals), so the delay goes on DataChannel.send. Ordered, like the
       // channel itself: a jittered message never overtakes an earlier one.
+      // ⚠ ONE QUEUE PER CHANNEL, DRAINED IN ORDER — not one setTimeout per
+      // message. Timers are whole milliseconds, so two messages due in the
+      // same millisecond with per-message timers can fire in the WRONG order;
+      // that reordered an 'ls' ahead of 'lsgo' in this rig, begin() then
+      // cleared it, and the room deadlocked on a hole no real (ordered)
+      // DataChannel can produce.
       const dsend = RTCDataChannel.prototype.send;
       RTCDataChannel.prototype.send = function (m) {
         const self = this, now = performance.now();
-        const at = Math.max(self.__ppLast || 0, now + Math.max(0, ${netms} + (Math.random() * 2 - 1) * ${jitter}));
+        const q = self.__ppQ || (self.__ppQ = []);
+        const last = q.length ? q[q.length - 1].at : (self.__ppLast || 0);
+        const at = Math.max(last, now + Math.max(0, ${netms} + (Math.random() * 2 - 1) * ${jitter}));
         self.__ppLast = at;
-        setTimeout(() => { try { if (self.readyState === 'open') dsend.call(self, m); } catch (e) {} }, at - now);
+        q.push({ at, m });
+        const drain = () => {
+          self.__ppT = 0;
+          const t = performance.now();
+          while (q.length && q[0].at <= t) { const x = q.shift(); try { if (self.readyState === 'open') dsend.call(self, x.m); } catch (e) {} }
+          if (q.length) self.__ppT = setTimeout(drain, Math.max(0, q[0].at - t));
+        };
+        if (!self.__ppT) self.__ppT = setTimeout(drain, Math.max(0, q[0].at - now));
       };
       const post = BroadcastChannel.prototype.postMessage;
       BroadcastChannel.prototype.postMessage = function (m) {
@@ -98,6 +114,19 @@ function preloadSrc(netms, jitter) {
           else if (ev === 'resume') window.__pp.resumes++;
         } catch (e) {}
         return emit.call(this, ev, a);
+      };
+      // Count the start messages and every begin(): a SECOND begin() on a
+      // console that is already playing resets it to frame 0.
+      const recv = L.prototype.receive;
+      L.prototype.receive = function (m) {
+        try { if (m && (m.t === 'lsgo' || m.t === 'lsready')) window.__pp.rx.push({ t: m.t, state: this.state, frame: this.frame, at: Math.round(performance.now() - window.__pp.t0) }); } catch (e) {}
+        return recv.call(this, m);
+      };
+      const begin = L.prototype.begin;
+      L.prototype.begin = function () {
+        window.__ppLs = this;
+        try { window.__pp.begins.push({ state: this.state, frame: this.frame, at: Math.round(performance.now() - window.__pp.t0) }); } catch (e) {}
+        return begin.call(this);
       };
       L.prototype.__ppWrapped = true;
       return true;
@@ -139,6 +168,15 @@ const sample = (page) => page.evaluate(() => {
                display: cs.display, visibility: cs.visibility, parent: c.parentElement && c.parentElement.id,
                topAtCenter: top ? (top.id || top.tagName) : null, chain: anc.join(' ') };
   }
+  const E = window.__ppLs; let eng = null;
+  if (E) {
+    const have = {};
+    for (const [f, m] of E.inputs) for (const p of m.keys()) have[p] = Math.max(have[p] == null ? -1 : have[p], f);
+    const holes = [];
+    for (const p of E.occupiedPorts()) for (let f = E.frame; f < E.frame + 3; f++) if (E._inputFor(f, p) === undefined) holes.push(p + '@' + f);
+    eng = { frame: E.frame, delay: E.delay, queuedTo: E._queuedTo, scheduledTo: E._scheduledTo, pending: E._pendingDelay,
+            maxInput: have, holes, sent: E.stats.sent, recv: E.stats.received, state: E.state };
+  }
   const st = document.getElementById('mobileStatus'), s2 = document.getElementById('status');
   const fps = document.getElementById('fps');
   const r = window.__n64Rate || null;
@@ -146,10 +184,11 @@ const sample = (page) => page.evaluate(() => {
     t: performance.now(), net: n && { state: n.state, running: n.running, frame: n.frame, stalls: n.stalls, stallMs: n.stallMs,
       stalling: n.stalling, waitingOn: n.waitingOn, reanchors: n.reanchors, fault: n.fault, viHz: n.viHz,
       delay: n.engine && n.engine.delay, estate: n.engine && n.engine.state, efr: n.engine && n.engine.frame,
-      minLead: n.engine && n.engine.minLead, meanLead: n.engine && n.engine.meanLead, desync: n.engine && n.engine.desync },
-    rate: r && { speed: r.speed, from: r.speedFrom, starved: r.starved, shown: r.shown, made: r.made, lost: r.lost },
+      minLead: n.engine && n.engine.minLead, meanLead: n.engine && n.engine.meanLead, desync: n.engine && n.engine.desync,
+      pace: n.pace || null, gl: n.gl || null, delayHistory: n.engine && n.engine.delayHistory },
+    rate: r && { speed: r.speed, from: r.speedFrom, starved: r.starved, shown: r.shown, made: r.made, lost: r.lost, e2e: r.e2eHwX },
     status: (st && st.textContent) || (s2 && s2.textContent) || '', fpsText: fps ? fps.textContent : null,
-    canvas, pp: window.__pp ? { delays: window.__pp.delays.slice(), stalls: window.__pp.stalls, resumes: window.__pp.resumes } : null,
+    canvas, eng, pp: window.__pp ? { delays: window.__pp.delays.slice(), stalls: window.__pp.stalls, resumes: window.__pp.resumes, rx: window.__pp.rx.slice(0, 20), begins: window.__pp.begins.slice(0, 20) } : null,
   };
 });
 
@@ -245,6 +284,7 @@ try {
       hostFps: +((h.net.frame - lastH.net.frame) / dt).toFixed(1), joinFps: +((j.net.frame - lastJ.net.frame) / ((j.t - lastJ.t) / 1000)).toFixed(1),
       delay: h.net.delay, hostStalls: h.net.stalls, joinStalls: j.net.stalls, hostWait: h.net.waitingOn, joinWait: j.net.waitingOn,
       hostSpeed: h.rate && h.rate.speed, joinSpeed: j.rate && j.rate.speed, joinStarved: j.rate && j.rate.starved,
+      hostPace: h.net.pace && h.net.pace.text, joinPace: j.net.pace && j.net.pace.text,
       hostStatus: h.status.slice(0, 120), joinFps_text: (j.fpsText || '').slice(0, 160) });
     lastH = h; lastJ = j;
   }
@@ -260,6 +300,20 @@ try {
   out.desync = lastH.net.desync || lastJ.net.desync || null;
   out.speedSamples = { host: tl.map((x) => x.hostSpeed), join: tl.map((x) => x.joinSpeed), joinStarved: tl.filter((x) => x.joinStarved).length };
   out.hostCanvas = lastH.canvas; out.hostStatus = lastH.status; out.joinFpsText = lastJ.fpsText;
+  out.joinStatus = lastJ.status; out.hostGl = lastH.net.gl; out.joinGl = lastJ.net.gl;
+  out.hostPace = lastH.net.pace; out.joinPace = lastJ.net.pace; out.joinE2e = lastJ.rate && lastJ.rate.e2e;
+  out.engineDelayHistory = lastH.net.delayHistory;
+  out.engHost = lastH.eng; out.engJoin = lastJ.eng;
+  out.startMsgs = { host: { rx: lastH.pp && lastH.pp.rx, begins: lastH.pp && lastH.pp.begins }, join: { rx: lastJ.pp && lastJ.pp.rx, begins: lastJ.pp && lastJ.pp.begins } };
+  if (LOSE_GL) {
+    // Take the host's WebGL context away the way a phone's browser can, and
+    // read what the page then tells its player.
+    await host.evaluate(() => { const g = document.getElementById('canvas').getContext('webgl2');
+      const x = g && g.getExtension('WEBGL_lose_context'); if (x) x.loseContext(); });
+    await new Promise((r) => setTimeout(r, 2500));
+    const after = await sample(host);
+    out.glLoss = { gl: after.net.gl, status: after.status };
+  }
   const px = await canvasPixels(host);
   out.hostPixels = { nonBlack: px.nonBlack, total: px.total, distinct: px.distinct, box: px.box };
   if (SHOT && px.png) writeFileSync(SHOT, Buffer.from(px.png, 'base64'));
