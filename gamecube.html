@@ -797,7 +797,9 @@ window.GcRate = (function () {
     };
 
     // A 'frame' message from recomp_worker. Returns whether the renderer should skip the draw.
-    m.frame = function (n, t) {
+    // `presentGate` (optional): the PAGE says this frame cannot be presented anyway (see the
+    // main-thread-replay gate at the recomp 'frame' handler) — skip its draw like backpressure.
+    m.frame = function (n, t, presentGate) {
       drainCredits();
       m.framesSeen = n;
       if (m.lastFrameAt) {
@@ -806,7 +808,7 @@ window.GcRate = (function () {
         m.guestBusyMs += t - start; m.guestBusyN++;
       }
       m.lastFrameAt = t;
-      var skipRender = m.outstanding >= 2;
+      var skipRender = m.outstanding >= 2 || !!presentGate;
       if (skipRender) m.dropped++;
       else { if (m.outstanding === 0) m.renderBusyFrom = t; m.outstanding++; }
       return skipRender;
@@ -2179,6 +2181,52 @@ window.GcRate = (function () {
     console.log(s);
   }
   function setStatus(t) { if (statusEl) statusEl.textContent = t; if (mobileStatusEl) mobileStatusEl.textContent = t; }
+
+  // [main-thread 2026-10-01] DISC FETCH + GZIP INFLATE OFF THE MAIN THREAD.
+  // Every disc loader (the JIT chunk loader, the recomp prefetch, the ?sr stream) did
+  // `new Response(r.body.pipeThrough(new DecompressionStream('gzip'))).arrayBuffer()` on the
+  // page. A stream pipe runs on the thread that built it, so 0.6-1.4 GB of inflate ran HERE:
+  // a 4x-throttled phone profile booted MP4 with 106 s of main-thread long tasks (max 5.3 s,
+  // rAF 0.56/s), and a real phone logged the per-chunk pumps as 68-73 ms 'Promise.resolve'
+  // long tasks. Same fetch, same inflate, same bytes — done in a small worker pool and handed
+  // back as a transferred ArrayBuffer (zero-copy). Falls back to the old in-page inflate only
+  // if a worker cannot be built at all.
+  window.gcFetchInflate = (function () {
+    var SRC = 'self.onmessage=function(e){var d=e.data;(async function(){try{' +
+      'var r=await fetch(d.url);if(!r.ok)throw new Error(d.url+" -> "+r.status);' +
+      'var b=d.gz?await new Response(r.body.pipeThrough(new DecompressionStream("gzip"))).arrayBuffer():await r.arrayBuffer();' +
+      'self.postMessage({id:d.id,buf:b},[b]);}catch(x){self.postMessage({id:d.id,err:String(x&&x.message||x)});}})();};';
+    var pool = null, next = 0, seq = 0, waiting = {};
+    function onMsg(e) {
+      var w = waiting[e.data.id]; if (!w) return; delete waiting[e.data.id];
+      if (e.data.err) w.reject(new Error(e.data.err)); else w.resolve(e.data.buf);
+    }
+    function mkPool() {
+      if (pool !== null) return pool;
+      pool = [];
+      try {
+        var url = URL.createObjectURL(new Blob([SRC], { type: 'text/javascript' }));
+        // Two workers: the recomp prefetch fires six parts at once, and one inflate thread
+        // would serialise them behind each other exactly as the main thread did.
+        for (var i = 0; i < 2; i++) { var w = new Worker(url); w.onmessage = onMsg; pool.push(w); }
+      } catch (e) { pool = []; console.warn('[disc] inflate worker unavailable, inflating on the page: ' + e); }
+      return pool;
+    }
+    return function (url, gz) {
+      var abs = new URL(url, location.href).href;
+      var p = mkPool();
+      if (!p.length) {
+        return fetch(abs).then(function (r) {
+          if (!r.ok) throw new Error(url + ' -> ' + r.status);
+          return gz ? new Response(r.body.pipeThrough(new DecompressionStream('gzip'))).arrayBuffer() : r.arrayBuffer();
+        });
+      }
+      return new Promise(function (resolve, reject) {
+        var id = ++seq; waiting[id] = { resolve: resolve, reject: reject };
+        p[(next++) % p.length].postMessage({ id: id, url: abs, gz: !!gz });
+      });
+    };
+  })();
 
   // ===========================================================================
   // RENDER-PATH DISCLOSURE — [2026-08-29]
@@ -5788,6 +5836,7 @@ window.GcRate = (function () {
   }
   function gcNetPumpMirror() { /* no capture mirror without a session */ }
 
+  var _pcLast = null, _pcLastAt = 0;
   function pollController() {
     if (!dolphin_worker) return;
     if (Module._CheckJoy) Module._CheckJoy(); if (Module._CheckKeyboard) Module._CheckKeyboard();
@@ -5809,7 +5858,20 @@ window.GcRate = (function () {
     // handed to the emulator, not a session field.
     if (GCNET.role === 'host') { GCNET.sentP1 = Array.prototype.slice.call(arr.subarray(0, 8));
                                  GCNET.sentP2 = Array.prototype.slice.call(arr.subarray(8, 16)); }
-    dolphin_worker.postMessage({ cmd: 'input', states: arr }, [arr.buffer]);
+    // [main-thread 2026-10-01] Post only when the pad image CHANGED (plus a 500 ms keepalive).
+    // The worker latches it (worker_funcs.js 'input': HEAPU8.set into g_pad), so re-sending an
+    // identical image is a no-op there — but here it was ~100 postMessages/s of main-thread work
+    // whether or not anyone touched a control. Latency is unchanged: a change is still picked
+    // up on the next 10 ms poll. The keepalive re-asserts the image in case one landed before
+    // the core was running (the worker drops 'input' until Module.calledRun).
+    var _pcNow = performance.now(), _pcSame = !!_pcLast && (_pcNow - _pcLastAt) < 500;
+    for (var _pi = 0; _pcSame && _pi < 16; _pi++) if (arr[_pi] !== _pcLast[_pi]) _pcSame = false;
+    if (_pcSame) { states_arrs.push(arr); }
+    else {
+      if (!_pcLast) _pcLast = new Uint8Array(16);
+      _pcLast.set(arr.subarray(0, 16)); _pcLastAt = _pcNow;
+      dolphin_worker.postMessage({ cmd: 'input', states: arr }, [arr.buffer]);
+    }
     // The capture mirror rides THIS loop rather than rAF on purpose: it is a
     // setTimeout chain, so it survives the tab being backgrounded (degraded to
     // the timer clamp) where rAF stops dead. dreamcast.html MEASURED the rAF
@@ -6353,11 +6415,17 @@ window.GcRate = (function () {
         pubTotal = s >>> 1;
       }
     } catch (e) {}
-    return { captured: _capN, polls: _capPolls, queued: _capQ.length, queueDrops: _capQDrops,
+    // With the present worker (see _pwStart) the capture-side counters live there and arrive
+    // with every frame plus every 500 ms; the queue counters are this side's.
+    var W = _pw ? (_pwStats || {}) : null;
+    return { captured: W ? (W.captured | 0) : _capN, polls: W ? (W.polls | 0) : _capPolls,
+             queued: _capQ.length, queueDrops: _capQDrops,
              queueDepthMax: _capQDepthMax, qMax: PRESENT_QMAX, captureMs: PRESENT_CAPTURE_MS,
-             publishedTotal: pubTotal,
-             source: _ringOn ? 'ring' : 'slot', ringSlots: _ringSlots, ringNext: _ringNext,
-             ringSkipped: _ringSkipped, ringTears: _ringTears, ringBehindMax: _ringBehindMax };
+             publishedTotal: pubTotal, captureThread: _pw ? 'worker' : 'page',
+             source: W ? (W.source || 'slot') : (_ringOn ? 'ring' : 'slot'),
+             ringSlots: W ? W.ringSlots : _ringSlots, ringNext: W ? W.ringNext : _ringNext,
+             ringSkipped: W ? W.ringSkipped : _ringSkipped, ringTears: W ? W.ringTears : _ringTears,
+             ringBehindMax: W ? W.ringBehindMax : _ringBehindMax };
   };
   // Copy one published frame out of shared memory into a pooled ImageData. The CALLER owns the
   // seqlock acquire/re-check pair, because the ring and the legacy slot lock different words.
@@ -6452,13 +6520,79 @@ window.GcRate = (function () {
       else _capFromSlot(A);
     } catch (e) { /* transient during boot */ }
   }
+  // [main-thread 2026-10-01] PRESENT WORKER. Capture used to run HERE: per published frame a
+  // 1.2 MB SAB->ImageData copy, a 307k-iteration alpha pass and a 1.2 MB putImageData, plus a
+  // 4 ms poll timer for the life of the page — at 60 published/s on a phone that is the
+  // largest steady main-thread cost the WebGPU path has, and it competes with input, the HUD
+  // and the recomp relay. The SAME capture functions above (_capFromRing/_capFromSlot/
+  // _capCopyFrame — their source is shipped verbatim, so the seqlock and ring rules cannot
+  // drift) now run in a small worker, which turns each captured frame into an ImageBitmap and
+  // transfers it here. Presenting is one drawImage(bitmap) per rAF; nothing is copied on this
+  // thread. The queue (PRESENT_QMAX, drop-oldest) stays on this side; the worker reads its
+  // depth from a shared cell so ringPlan still declines frames that would only be dropped.
+  // Falls back to the in-page capture if the worker cannot start (no worker ImageData /
+  // createImageBitmap), so no browser loses the picture.
+  var _pw = null, _pwCtl = null, _pwStats = null, _pwFailed = false;
+  function _pwStart() {
+    try {
+      if (typeof createImageBitmap !== 'function') throw new Error('no createImageBitmap');
+      var src = [
+        'var PRESENT_RING=' + PRESENT_RING + ',PRESENT_RING_MAGIC=' + PRESENT_RING_MAGIC + ',PRESENT_QMAX=' + PRESENT_QMAX + ';',
+        'var sharedMemory=null,ctl=null,inflight=0;',
+        'var GcRate={ringPlan:' + GcRate.ringPlan.toString() + '};',
+        'var _capPool=[],_capW=0,_capH=0,_capQDrops=0,_capQDepthMax=0,_capN=0,_capPolls=0,_sabPresentSeq=0;',
+        'var _ringOn=false,_ringNext=0,_ringSlots=0,_ringSkipped=0,_ringTears=0,_ringBehindMax=0;',
+        // queue depth as the planner must see it = frames waiting on the page + bitmaps in flight
+        'var _capQ={get length(){return (ctl?Atomics.load(ctl,0):0)+inflight;},set length(v){}};',
+        'var canvasCtx2D={createImageData:function(w,h){return new ImageData(w,h);}};',
+        'function $(){return null;}',
+        _capCopyFrame.toString(), _capFromRing.toString(), _capFromSlot.toString(), _sabPresentCapture.toString(),
+        'function stats(){return {captured:_capN,polls:_capPolls,source:_ringOn?"ring":"slot",ringSlots:_ringSlots,ringNext:_ringNext,',
+        '  ringSkipped:_ringSkipped,ringTears:_ringTears,ringBehindMax:_ringBehindMax};}',
+        'function _capEnqueue(img){var d32=img._u32;for(var i=0;i<d32.length;i++)d32[i]|=0xFF000000;',
+        '  _capN++;inflight++;var w=img.width,h=img.height;',
+        '  createImageBitmap(img).then(function(bmp){inflight--;if(w===_capW&&h===_capH)_capPool.push(img);',
+        '    postMessage({bmp:bmp,stats:stats()},[bmp]);},function(e){inflight--;postMessage({err:String(e)});});}',
+        'self.onmessage=function(e){var d=e.data;if(d.cmd!=="init")return;sharedMemory=d.memory;ctl=new Int32Array(d.ctl);',
+        '  try{new ImageData(1,1);}catch(x){postMessage({unsupported:"ImageData: "+x});return;}',
+        '  setInterval(_sabPresentCapture,d.captureMs);setInterval(function(){postMessage({stats:stats()});},500);',
+        '  postMessage({ready:true});};'
+      ].join('\n');
+      var w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+      _pwCtl = new Int32Array(new SharedArrayBuffer(16));
+      w.onmessage = function (e) {
+        var d = e.data;
+        if (d.stats) _pwStats = d.stats;
+        if (d.bmp) {
+          _capQ.push(d.bmp);
+          if (_capQ.length > PRESENT_QMAX) { _capQ.shift().close(); _capQDrops++; }
+          if (_capQ.length > _capQDepthMax) _capQDepthMax = _capQ.length;
+          Atomics.store(_pwCtl, 0, _capQ.length);
+        } else if (d.unsupported || d.err) { _pwFallback(d.unsupported || d.err); }
+      };
+      w.onerror = function (ev) { _pwFallback((ev && ev.message) || 'worker error'); };
+      w.postMessage({ cmd: 'init', memory: sharedMemory, ctl: _pwCtl.buffer, captureMs: PRESENT_CAPTURE_MS });
+      _pw = w;
+    } catch (e) { _pwFallback(e && e.message || e); }
+  }
+  function _pwFallback(why) {
+    if (_pwFailed) return;
+    _pwFailed = true;
+    try { if (_pw) _pw.terminate(); } catch (e) {}
+    _pw = null;
+    while (_capQ.length) { var o = _capQ.shift(); if (o && o.close) o.close(); }
+    console.warn('[sab-present] present worker unavailable (' + why + ') — capturing on the page');
+    setInterval(_sabPresentCapture, PRESENT_CAPTURE_MS);
+  }
   function _sabPresentTick() {
     try {
       // Capture first: a frame published between the last 4ms poll and this tick must not have
-      // to wait a whole extra refresh (?ratetest=1 23's event ordering models this).
-      _sabPresentCapture();
+      // to wait a whole extra refresh (?ratetest=1 23's event ordering models this). With the
+      // present worker the capture clock lives there and frames arrive as messages instead.
+      if (!_pw) _sabPresentCapture();
       if (_capQ.length) {
         var img = _capQ.shift();
+        if (_pw) Atomics.store(_pwCtl, 0, _capQ.length);
         var c = $('canvas');
         if (c.width !== img.width) c.width = img.width;
         if (c.height !== img.height) c.height = img.height;
@@ -6472,13 +6606,18 @@ window.GcRate = (function () {
           // Ground truth for the diagnostics report: this path only runs when WGPUGfx is
           // bumping the publish seqlock, so reaching it PROVES the fast path is live.
           try { window.__gcGpu.present = 'sab-present / WGPU shared-heap (fast path) ' + img.width + 'x' + img.height; gcRenderBadge(); } catch (e) {} }
-        canvasCtx2D.putImageData(img, 0, 0);
-        if (img.width === _capW && img.height === _capH && _capPool.length <= PRESENT_QMAX) _capPool.push(img);
+        var _iw = img.width, _ih = img.height;
+        if (_pw) { canvasCtx2D.drawImage(img, 0, 0); img.close(); }
+        else {
+          canvasCtx2D.putImageData(img, 0, 0);
+          if (img.width === _capW && img.height === _capH && _capPool.length <= PRESENT_QMAX) _capPool.push(img);
+        }
         // [present-watchdog] the ONE authoritative "the WebGPU path is alive right now" stamp.
         _presentLastMs = performance.now();
         if (!_sabPresentActive) {
           _sabPresentActive = true;
-          pageLog('[sab-present] WGPU shared-heap present ACTIVE ' + img.width + 'x' + img.height);
+          pageLog('[sab-present] WGPU shared-heap present ACTIVE ' + _iw + 'x' + _ih +
+                  (_pw ? ' (capture in the present worker)' : ' (capture on the page)'));
         }
         // `shown` counts ONLY frames that got here — i.e. a seq we had not painted before. A
         // rAF tick that finds an empty queue counts nothing, so this can never be inflated by
@@ -6489,7 +6628,7 @@ window.GcRate = (function () {
     finally { requestAnimationFrame(_sabPresentTick); }
   }
   requestAnimationFrame(_sabPresentTick);
-  setInterval(_sabPresentCapture, PRESENT_CAPTURE_MS);
+  _pwStart();
   function paintFrame2D(pixels, w, h, pitch) {
     var c = $('canvas');
     if (!canvasCtx2D) canvasCtx2D = c.getContext('2d');
@@ -6666,6 +6805,22 @@ window.GcRate = (function () {
     for (var j = 0; j < second; ++j) data[j] = src[first + j];
     Atomics.store(hdr, 0, ((head + n) | 0));
   }
+  // [main-thread 2026-10-01] Hand the worklet's SAB ring to the dolphin worker, whose shim
+  // (dolphin_worker.js) then writes the core's PCM into it directly instead of posting every
+  // ~3 ms batch through this thread. Only while dolphin is THE producer: not muted (the old path
+  // dropped samples on the page while muted), and not once the recomp owns the game and pushes
+  // its own PCM into the same ring from here — two producers on one head index would race.
+  var _gcRingSent;
+  function gcAudioRingSync() {
+    try {
+      if (!dolphin_worker) return;
+      var sab = (GcAudio.inited && !audioMuted && !window.__gcRecompOwnsAudio) ? GcAudio.ring : null;
+      if (sab === _gcRingSent) return;
+      _gcRingSent = sab;
+      dolphin_worker.postMessage({ cmd: 'audioRing', sab: sab });
+    } catch (e) { console.warn('[audio] ring hand-off failed: ' + e); }
+  }
+  window._gcAudioRingSync = gcAudioRingSync;
   async function initGcAudio() {
     if (GcAudio.inited || GcAudio.initing) return;
     GcAudio.initing = true;
@@ -6730,6 +6885,7 @@ window.GcRate = (function () {
       GcAudio.ringCap = RING_SAMPLES;
       GcAudio.inited = true;
       window._gcAudioPushSamples = pushAudioSamples;
+      gcAudioRingSync();
       pageLog('[audio] AudioWorklet ready (sampleRate=' + ctx.sampleRate + ', state=' + ctx.state + ')');
       if (ctx.state !== 'running') {
         pageLog('[audio] AudioContext is ' + ctx.state + ' — click/tap the page to start sound');
@@ -6773,6 +6929,82 @@ window.GcRate = (function () {
     }
     for (var i = 0; i < TYPES.length; ++i) window.addEventListener(TYPES[i], once, true);
   })();
+  // [main-thread 2026-10-01] Audio-arrival accounting, shared by the per-batch 'audio' message
+  // (recomp path, and the dolphin path before the worklet ring exists) and the shim's 1 Hz
+  // 'audioStat' summary (dolphin path once the shim writes the ring itself).
+  function gcAudioArrived(frames, bytes) {
+    window._audN = (window._audN | 0) + frames;
+    var _anow = performance.now();
+    var data = { len: bytes };
+    // [audio fix 2026-08-28] 'legacy' was a lie. Module._feedAudio is
+    // `void feedAudio(int buf, int len) { (void)buf; (void)len; }` (EmscriptenMain.cpp) — it
+    // discards every sample and returns cleanly, and it was being handed a Uint8Array where
+    // the signature wants an int heap pointer. Label the state for what it is: DISCARDING.
+    var _sink = window._gcAudioPushSamples ? 'worklet' : 'DISCARDING(no-sink)';
+    if (!window._audT0) { window._audT0 = _anow;
+      console.log('[audio-diag] FIRST audio msg: bytes=' + data.len + ' muted=' + audioMuted
+        + ' sink=' + _sink + ' coreRate=' + (window._gcAudioRate | 0));
+    }
+    if (_anow - (window._audLog || 0) > 5000) {
+      // [audio-diag WINDOWED FIX 2026-08-29] This printed a LIFETIME MEAN, not a rate.
+      // _audN is a lifetime accumulator that is never reset and the divisor was the whole
+      // elapsed run, so the number lagged reality by however long the page had been open
+      // and could never recover. MEASURED against a windowed ground truth in the same run:
+      // printed 16106/16339/16316/16300 while the true windowed rates were
+      // 31774/26992/15219/15564 — it reported 0.46x during a window that was actually
+      // 0.99x, and 0.51x during one that was 0.475x. The user's falling
+      // 14746->11813 series was therefore a lifetime mean sagging toward a low
+      // instantaneous rate, and the real current value was NOT recoverable from it.
+      // Keep the lifetime figure (it is the honest all-run average) but lead with the
+      // window, because the window is what answers "how is it doing right now".
+      //
+      // WHY 32029 IS THE RIGHT DENOMINATOR, derived from source with no free parameters:
+      // AudioDMACallback is a CoreTiming event rescheduled every
+      // GetAudioDMACallbackPeriod(cpu_core_clock, aid_divisor) GUEST ticks
+      // (SystemTimers.cpp:80-87) -> UpdateAudioDMA (DSP.cpp:600) -> SendAIBuffer(..., 8)
+      // (DSP.cpp:624), and the else-branch at DSP.cpp:718 pushes 8 zero samples
+      // UNCONDITIONALLY, armed DMA or not. With m_cpu_core_clock = 486000000
+      // (SystemTimers.h:103) and the GC AID-32kHz divisor 1124*2*3/2 = 3372
+      // (AudioInterface.cpp:350,355-356) the period is 121392 ticks
+      // => 4003.5587 fires/emulated-second => 8x that = 32028.47 frames/EMULATED second.
+      // So frames/s / 32029 IS the guest multiple — the GameCube analogue of Dreamcast's
+      // production-rate / 44101.43. There is zero wall-clock input to the producer.
+      // CAVEAT, stated because it bounds what this number can prove: the AI-DMA event is
+      // scheduled on global_timer, so this witness is NOT independent of CoreTiming's
+      // credited-cycle `speed` — measured |aidmaX - speedCred|/speedCred = 0.106% mean,
+      // 0.43% max. It inherits idle-skip credit (windows reading ~1.00x here executed only
+      // 91.9 MHz of a 486 MHz Gekko = 18.9%). It can therefore only UNDER-report the
+      // deficit, never over-report it. It IS independent of the unvalidated [mips] meter.
+      window._audLog = _anow;
+      var _actx = getAudioCtx();
+      var _target = (window._gcAudioRate | 0) || 0;
+      var _wN = window._audN - (window._audNPrev | 0);
+      var _wMs = _anow - (window._audTPrev || window._audT0);
+      var _wRate = _wMs > 0 ? (_wN * 1000) / _wMs : 0;
+      var _lifeRate = (window._audN * 1000) / (_anow - window._audT0);
+      window._audNPrev = window._audN;
+      window._audTPrev = _anow;
+      console.log('[audio-diag] ' + _wRate.toFixed(0)
+        + ' frames/s NOW (lifetime ' + _lifeRate.toFixed(0) + ')'
+        + (_target ? '  guest=' + (_wRate / _target).toFixed(3) + 'x' : '')
+        + ' (core rate ' + (_target || '?')
+        + '; below that = core below real-time) muted=' + audioMuted
+        + ' sink=' + _sink
+        + ' ctx=' + (_actx ? _actx.state + '@' + _actx.sampleRate : 'null')
+        + (window._audDropped ? ' DROPPED=' + window._audDropped + ' frames' : ''));
+    }
+  }
+  function gcAudioDiscarded(frames) {
+    window._audDropped = (window._audDropped | 0) + frames;
+    if (!window._audDropWarned) {
+      window._audDropWarned = true;
+      console.error('[audio] NO SINK — audio samples are being DISCARDED. The AudioWorklet'
+        + ' never initialized (gestured=' + !!window._gcAudioGestured
+        + ' rate=' + (window._gcAudioRate | 0) + ' inited=' + GcAudio.inited
+        + ' initing=' + GcAudio.initing + '). Click or tap the page to start it.');
+      pageLog('[audio] NO SOUND: samples are being discarded — click/tap the page');
+    }
+  }
   function onWorkerMsg(e) {
     var data = e.data;
     switch (data.cmd) {
@@ -6821,65 +7053,7 @@ window.GcRate = (function () {
         // for these games it is 32029 Hz. A sustained ~29.6K frames/s was therefore triaged as
         // "core at 62% of real time" when it is ~93-100% of the CORRECT 32029 target. Compare
         // against the rate the core actually reported.
-        window._audN = (window._audN | 0) + ((data.len | 0) >> 2);
-        var _anow = performance.now();
-        // [audio fix 2026-08-28] 'legacy' was a lie. Module._feedAudio is
-        // `void feedAudio(int buf, int len) { (void)buf; (void)len; }` (EmscriptenMain.cpp) — it
-        // discards every sample and returns cleanly, and it was being handed a Uint8Array where
-        // the signature wants an int heap pointer. Label the state for what it is: DISCARDING.
-        var _sink = window._gcAudioPushSamples ? 'worklet' : 'DISCARDING(no-sink)';
-        if (!window._audT0) { window._audT0 = _anow;
-          console.log('[audio-diag] FIRST audio msg: bytes=' + data.len + ' muted=' + audioMuted
-            + ' sink=' + _sink + ' coreRate=' + (window._gcAudioRate | 0));
-        }
-        if (_anow - (window._audLog || 0) > 5000) {
-          // [audio-diag WINDOWED FIX 2026-08-29] This printed a LIFETIME MEAN, not a rate.
-          // _audN is a lifetime accumulator that is never reset and the divisor was the whole
-          // elapsed run, so the number lagged reality by however long the page had been open
-          // and could never recover. MEASURED against a windowed ground truth in the same run:
-          // printed 16106/16339/16316/16300 while the true windowed rates were
-          // 31774/26992/15219/15564 — it reported 0.46x during a window that was actually
-          // 0.99x, and 0.51x during one that was 0.475x. The user's falling
-          // 14746->11813 series was therefore a lifetime mean sagging toward a low
-          // instantaneous rate, and the real current value was NOT recoverable from it.
-          // Keep the lifetime figure (it is the honest all-run average) but lead with the
-          // window, because the window is what answers "how is it doing right now".
-          //
-          // WHY 32029 IS THE RIGHT DENOMINATOR, derived from source with no free parameters:
-          // AudioDMACallback is a CoreTiming event rescheduled every
-          // GetAudioDMACallbackPeriod(cpu_core_clock, aid_divisor) GUEST ticks
-          // (SystemTimers.cpp:80-87) -> UpdateAudioDMA (DSP.cpp:600) -> SendAIBuffer(..., 8)
-          // (DSP.cpp:624), and the else-branch at DSP.cpp:718 pushes 8 zero samples
-          // UNCONDITIONALLY, armed DMA or not. With m_cpu_core_clock = 486000000
-          // (SystemTimers.h:103) and the GC AID-32kHz divisor 1124*2*3/2 = 3372
-          // (AudioInterface.cpp:350,355-356) the period is 121392 ticks
-          // => 4003.5587 fires/emulated-second => 8x that = 32028.47 frames/EMULATED second.
-          // So frames/s / 32029 IS the guest multiple — the GameCube analogue of Dreamcast's
-          // production-rate / 44101.43. There is zero wall-clock input to the producer.
-          // CAVEAT, stated because it bounds what this number can prove: the AI-DMA event is
-          // scheduled on global_timer, so this witness is NOT independent of CoreTiming's
-          // credited-cycle `speed` — measured |aidmaX - speedCred|/speedCred = 0.106% mean,
-          // 0.43% max. It inherits idle-skip credit (windows reading ~1.00x here executed only
-          // 91.9 MHz of a 486 MHz Gekko = 18.9%). It can therefore only UNDER-report the
-          // deficit, never over-report it. It IS independent of the unvalidated [mips] meter.
-          window._audLog = _anow;
-          var _actx = getAudioCtx();
-          var _target = (window._gcAudioRate | 0) || 0;
-          var _wN = window._audN - (window._audNPrev | 0);
-          var _wMs = _anow - (window._audTPrev || window._audT0);
-          var _wRate = _wMs > 0 ? (_wN * 1000) / _wMs : 0;
-          var _lifeRate = (window._audN * 1000) / (_anow - window._audT0);
-          window._audNPrev = window._audN;
-          window._audTPrev = _anow;
-          console.log('[audio-diag] ' + _wRate.toFixed(0)
-            + ' frames/s NOW (lifetime ' + _lifeRate.toFixed(0) + ')'
-            + (_target ? '  guest=' + (_wRate / _target).toFixed(3) + 'x' : '')
-            + ' (core rate ' + (_target || '?')
-            + '; below that = core below real-time) muted=' + audioMuted
-            + ' sink=' + _sink
-            + ' ctx=' + (_actx ? _actx.state + '@' + _actx.sampleRate : 'null')
-            + (window._audDropped ? ' DROPPED=' + window._audDropped + ' frames' : ''));
-        }
+        gcAudioArrived((data.len | 0) >> 2, data.len | 0);
         if (audioMuted) break;
         // The AudioWorklet (lock-free SAB ring) is the ONLY real sink. There is no fallback:
         // the old `else if (Module._feedAudio)` branch threw the samples away and the diag
@@ -6887,18 +7061,21 @@ window.GcRate = (function () {
         if (window._gcAudioPushSamples) {
           window._gcAudioPushSamples(data.buf, data.len);
         } else {
-          window._audDropped = (window._audDropped | 0) + ((data.len | 0) >> 2);
-          if (!window._audDropWarned) {
-            window._audDropWarned = true;
-            console.error('[audio] NO SINK — audio samples are being DISCARDED. The AudioWorklet'
-              + ' never initialized (gestured=' + !!window._gcAudioGestured
-              + ' rate=' + (window._gcAudioRate | 0) + ' inited=' + GcAudio.inited
-              + ' initing=' + GcAudio.initing + '). Click or tap the page to start it.');
-            pageLog('[audio] NO SOUND: samples are being discarded — click/tap the page');
-          }
+          gcAudioDiscarded((data.len | 0) >> 2);
         }
         break;
       }
+      // [main-thread 2026-10-01] The dolphin worker no longer posts one 'audio' message per
+      // ~96-frame batch (333/s measured on SAB — 2 s of HandlePostMessage+deserialize per 10 s
+      // traced on the main thread). Once the page hands it the worklet's ring (gcAudioRingSync),
+      // the shim (dolphin_worker.js) writes PCM straight into that SAB ring and reports what it
+      // did here once a second, so gcAudioArrived's [audio-diag] accounting sees the same frame counts.
+      case 'audioStat': {
+        if (data.frames > 0) gcAudioArrived(data.frames | 0, (data.frames | 0) * 4);
+        if (data.dropped > 0) window._audRingFull = (window._audRingFull | 0) + (data.dropped | 0);
+        break;
+      }
+
       case 'stateSaved': if (pendingSaveResolve) { pendingSaveResolve(data.data); pendingSaveResolve = null; } break;
       // [jit-rate 2026-08-29] A restore replaces CoreTiming's global_timer with the SAVED run's
       // clock, so the window straddling the seam is a difference between two timelines, not a
@@ -7139,12 +7316,13 @@ window.GcRate = (function () {
     window.__gcRomStreaming = true;
     for (var i = 0; i < ROM_CHUNKS.length; i++) {
       setStatus('Loading ' + (i+1) + '/' + ROM_CHUNKS.length + ' — ' + (total/1048576).toFixed(0) + ' / ' + totalMB + ' MB');
-      var r = await fetch(ROM_CHUNKS[i]);
-      if (!r.ok) { setStatus('Chunk fetch failed: ' + ROM_CHUNKS[i]); return; }
       var buf;
-      if (/\.gz$/.test(ROM_CHUNKS[i]) && typeof DecompressionStream === 'function') {
-        buf = await new Response(r.body.pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
-      } else if (/\.gz$/.test(ROM_CHUNKS[i])) {
+      var _gzPart = /\.gz$/.test(ROM_CHUNKS[i]);
+      if (!_gzPart || typeof DecompressionStream === 'function') {
+        // fetch + inflate in window.gcFetchInflate's worker pool, not on this thread.
+        try { buf = await window.gcFetchInflate(ROM_CHUNKS[i], _gzPart); }
+        catch (e) { setStatus('Chunk fetch failed: ' + ROM_CHUNKS[i]); pageLog('[rom] ' + e); return; }
+      } else {
         // NOT a fallback — there is nothing to fall back TO. `r.arrayBuffer()` on a .gz part
         // returns the compressed bytes (devserver.mjs:87-98 and GitHub Pages both send
         // Content-Type application/gzip with no Content-Encoding), and a core handed DEFLATE
@@ -7157,8 +7335,6 @@ window.GcRate = (function () {
         setStatus('This game needs a newer browser than this one. Safari can run it from 16.4 onwards, '
                 + 'and current Chrome, Edge and Firefox all can. Everything else on the site still works here.');
         return;
-      } else {
-        buf = await r.arrayBuffer();
       }
       total += buf.byteLength;
       pageLog('[rom] chunk ' + (i+1) + '/' + ROM_CHUNKS.length + '  (' + (total/1048576).toFixed(1) + ' MB)');
@@ -7327,7 +7503,7 @@ window.GcRate = (function () {
   // Headless-driver export: return the gzipped IndexedDB state blob as base64
   // (so the node harness can write it to a file via exposeFunction). Save first.
   window.__probeExportGzB64 = async function () { try { var own = stateOwner(); var stored = own ? await own.getGz() : await idbGet(SAVE_KEY); if (!stored) return ''; var u8 = stored instanceof Uint8Array ? stored : new Uint8Array(stored); var bin = ''; for (var i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]); return btoa(bin); } catch (e) { return ''; } };
-  function toggleMute() { audioMuted = !audioMuted; var ctx = getAudioCtx(); if (ctx) { audioMuted ? ctx.suspend() : ctx.resume(); } $('btnMute').textContent = audioMuted ? '🔇 Unmute' : '🔊 Mute'; $('mMute').textContent = audioMuted ? 'Unmute' : 'Mute'; }
+  function toggleMute() { audioMuted = !audioMuted; gcAudioRingSync(); var ctx = getAudioCtx(); if (ctx) { audioMuted ? ctx.suspend() : ctx.resume(); } $('btnMute').textContent = audioMuted ? '🔇 Unmute' : '🔊 Mute'; $('mMute').textContent = audioMuted ? 'Unmute' : 'Mute'; }
   // [audio fix 2026-08-28] getAudioCtx() now returns the real GcAudio.ctx, so this finally does
   // something. Also flush the SAB ring — a stalled/underrun ring keeps replaying stale PCM after
   // the resume, which is what "Reset Audio" is for. If the worklet never came up, this click is
@@ -7395,8 +7571,14 @@ window.GcRate = (function () {
   // player 1. The recomp block publishes window.gcRecompPadSink, which routes gamepad i to
   // GameCube port i; when it exists the pads belong to it and dispatchKey is not called for
   // them at all. The keyboard path below/above is untouched and remains player 1.
-  function pollGamepads() { var pads = (navigator.getGamepads && navigator.getGamepads()) || []; var sink = window.gcRecompPadSink; for (var i = 0; i < pads.length; i++) { var gp = pads[i]; if (!gp) continue; if (sink) { sink(i, gp); continue; } var btns = gp.buttons || []; for (var b in GP_BUTTON_KEYS) { var bi = +b, key = GP_BUTTON_KEYS[b]; gpEdge(i + ':b' + bi, key, !!(btns[bi] && btns[bi].pressed)); } var ax = gp.axes || []; var axX = ax[0] || 0, axY = ax[1] || 0; gpEdge(i + ':axL', KEYMAP.left, axX < -GP_AXIS_DEAD); gpEdge(i + ':axR', KEYMAP.right, axX > GP_AXIS_DEAD); gpEdge(i + ':axU', KEYMAP.up, axY < -GP_AXIS_DEAD); gpEdge(i + ':axD', KEYMAP.down, axY > GP_AXIS_DEAD); } requestAnimationFrame(pollGamepads); }
-  window.addEventListener('gamepadconnected', function (e) { setStatus('Controller connected: ' + e.gamepad.id); if (!gpPolling) { gpPolling = true; requestAnimationFrame(pollGamepads); } }); window.addEventListener('gamepaddisconnected', function () { setStatus('Controller disconnected'); }); if (navigator.getGamepads) { gpPolling = true; requestAnimationFrame(pollGamepads); }
+  var gpIdleT = 0;
+  function pollGamepads() { var gpSeen = false; var pads = (navigator.getGamepads && navigator.getGamepads()) || []; var sink = window.gcRecompPadSink; for (var i = 0; i < pads.length; i++) { var gp = pads[i]; if (!gp) continue; gpSeen = true; if (sink) { sink(i, gp); continue; } var btns = gp.buttons || []; for (var b in GP_BUTTON_KEYS) { var bi = +b, key = GP_BUTTON_KEYS[b]; gpEdge(i + ':b' + bi, key, !!(btns[bi] && btns[bi].pressed)); } var ax = gp.axes || []; var axX = ax[0] || 0, axY = ax[1] || 0; gpEdge(i + ':axL', KEYMAP.left, axX < -GP_AXIS_DEAD); gpEdge(i + ':axR', KEYMAP.right, axX > GP_AXIS_DEAD); gpEdge(i + ':axU', KEYMAP.up, axY < -GP_AXIS_DEAD); gpEdge(i + ':axD', KEYMAP.down, axY > GP_AXIS_DEAD); }
+    // [main-thread 2026-10-01] Per-frame only while a pad is actually present. With none it was a
+    // getGamepads() call every rAF for nothing; now it re-checks once a second (and
+    // 'gamepadconnected' wakes it at once), so a pad that a browser exposes without firing the
+    // event is still found.
+    if (gpSeen) requestAnimationFrame(pollGamepads); else gpIdleT = setTimeout(function () { gpIdleT = 0; pollGamepads(); }, 1000); }
+  window.addEventListener('gamepadconnected', function (e) { setStatus('Controller connected: ' + e.gamepad.id); if (!gpPolling) { gpPolling = true; requestAnimationFrame(pollGamepads); } else if (gpIdleT) { clearTimeout(gpIdleT); gpIdleT = 0; requestAnimationFrame(pollGamepads); } }); window.addEventListener('gamepaddisconnected', function () { setStatus('Controller disconnected'); }); if (navigator.getGamepads) { gpPolling = true; requestAnimationFrame(pollGamepads); }
   // [portrait-gate FIX 2026-09-08] The hint is a NON-BLOCKING pill now
   // (pointer-events: none — see its CSS), and it retires itself after
   // ROTATE_HINT_MS so it does not sit on the picture forever. Rotating back to
@@ -7685,6 +7867,10 @@ window.GcRate = (function () {
       // deferTerminate: Dolphin answers {recompGate:'ready'} once its emulated hardware exists and
       // waits for 'recompGateGo' before it touches RAM (worker_funcs.js __recompGate).
       dolphin_worker.postMessage({ cmd: 'recompStart', deferTerminate: true });
+    // [main-thread 2026-10-01] The recomp pushes its own PCM through this page into the worklet
+    // ring from here on; take the ring back from the dolphin shim so there is one producer.
+    window.__gcRecompOwnsAudio = true;
+    if (window._gcAudioRingSync) window._gcAudioRingSync();
       // STOP the JIT guest for real -- but only once Dolphin's hardware is UP. recomp_pause_cpu
       // only breaks the dolphin-side CPU manager; the JIT loop lives in the ppc-worker THREAD and
       // would keep executing against the SHARED guest RAM, stomping whatever mem1 this worker
@@ -7796,20 +7982,15 @@ window.GcRate = (function () {
               // Stop as soon as the parts already sent cover the window — a 32 MB window
               // must not drag 1.4 GB across just because SAB has 17 parts.
               if (total >= srDiscMB * 1048576) break;
-              var r = await fetch(ROM_CHUNKS[i]);
-              if (!r.ok) throw new Error(ROM_CHUNKS[i] + ' -> ' + r.status);
-              // Same inflate as the JIT chunk loader at :7110 — ROM_CHUNKS are .gz names
+              // Same inflate as the JIT chunk loader — ROM_CHUNKS are .gz names
               // (chunkRange, :2133) and nothing on the wire decompresses them. Without this
               // the window is filled with DEFLATE bytes, which is a disc-shaped nothing:
               // exactly the failure that hung Mario Party 4's recomp for two days.
-              var buf;
-              if (/\.gz$/.test(ROM_CHUNKS[i]) && typeof DecompressionStream === 'function') {
-                buf = await new Response(r.body.pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
-              } else if (/\.gz$/.test(ROM_CHUNKS[i])) {
+              // Fetch + inflate run in window.gcFetchInflate's worker pool, off the main thread.
+              var _gzP = /\.gz$/.test(ROM_CHUNKS[i]);
+              if (_gzP && typeof DecompressionStream !== 'function')
                 throw new Error('disc parts are gzipped and this browser has no DecompressionStream');
-              } else {
-                buf = await r.arrayBuffer();
-              }
+              var buf = await window.gcFetchInflate(ROM_CHUNKS[i], _gzP);
               total += buf.byteLength;
               rw.postMessage({ cmd: 'romChunk', buf: buf }, [buf]);
             }
@@ -9308,9 +9489,25 @@ window.GcRate = (function () {
   // this file is allowed to touch emulated time. rAF only decides how often we top the pool up;
   // the amount is integrated against wall time, so an irregular rAF cadence does not change the
   // speed — but an unbounded one would (see the 1.000x integrity note above), hence the clamps.
-  function grantLoop(t) {
-    if (rw) rate.grant(t);
+  //
+  // [main-thread 2026-10-01] rAF is NOT a reliable wall-clock tick. Under the 4x phone profile
+  // with no WebGPU (main-thread WebGL2 replay) rAF fired 0.56/s while the main thread sat 87%
+  // idle — the compositor/GPU pipeline, not this thread, was the bottleneck — and every grant
+  // was clamped to MAX_DT_MS, so the guest ran at 0.21x. The same grant now ALSO runs on an
+  // 8 ms timer. This cannot speed the guest up: grant() integrates performance.now() deltas
+  // against TARGET and both callers share ONE monotonic clock (the rAF timestamp is no longer
+  // used — a frame-start time older than the last timer tick would re-count the overlap). A
+  // hidden tab still pauses: the timer skips while document.hidden, exactly as rAF stops.
+  function grantNow() {
+    if (rw && !document.hidden) rate.grant(performance.now());
+  }
+  var grantTimer = 0;
+  var rafSinceDraw = true, lastDrawAt = 0;
+  function grantLoop() {
+    rafSinceDraw = true;
+    grantNow();
     if (GCLS.armed) gcLsStep();
+    if (!grantTimer) grantTimer = setInterval(grantNow, 8);
     requestAnimationFrame(grantLoop);
   }
 
@@ -9349,12 +9546,12 @@ window.GcRate = (function () {
     var landed = function (buf) { unitsDone++; gcNetLoadProgress(Math.round(unitsDone * 100 / units)); return buf; };
     discP = Promise.all([
       Promise.all(suffixes.map(function (sx) {
-        return fetch(window.ASSET_BASE + '/gamecube/roms/MarioParty4.bin.part' + sx + '.gz').then(function (r) {
-          if (!r.ok) throw new Error('part' + sx + ' ' + r.status);
-          if (typeof DecompressionStream !== 'function')
-            throw new Error('part' + sx + ': the disc parts are gzipped and this browser has no DecompressionStream');
-          return new Response(r.body.pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
-        }).then(landed);
+        if (typeof DecompressionStream !== 'function')
+          return Promise.reject(new Error('part' + sx + ': the disc parts are gzipped and this browser has no DecompressionStream'));
+        // fetch + inflate off the main thread (window.gcFetchInflate) — six parts, ~600 MB inflated.
+        return window.gcFetchInflate(window.ASSET_BASE + '/gamecube/roms/MarioParty4.bin.part' + sx + '.gz', true)
+          .catch(function (e) { throw new Error('part' + sx + ' ' + (e && e.message || e)); })
+          .then(landed);
       })).then(function (bufs) {
         var head = new DataView(bufs[0], 0, 32), id = '';
         for (var i = 0; i < 6; i++) id += String.fromCharCode(head.getUint8(i));
@@ -9435,6 +9632,10 @@ window.GcRate = (function () {
     console.log('[recomp-live] parts loaded (' + parts.reduce(function (a, b) { return a + b.byteLength; }, 0) + 'B); taking over');
     // deferTerminate: see stopJit below and worker_funcs.js __recompGate.
     dolphin_worker.postMessage({ cmd: 'recompStart', deferTerminate: true });
+    // [main-thread 2026-10-01] The recomp pushes its own PCM through this page into the worklet
+    // ring from here on; take the ring back from the dolphin shim so there is one producer.
+    window.__gcRecompOwnsAudio = true;
+    if (window._gcAudioRingSync) window._gcAudioRingSync();
     // [vi-timing-gate 2026-09-30] ...but only once Dolphin's emulated hardware is UP: Dolphin
     // posts {recompGate:'ready'} and waits for 'recompGateGo' before it writes any RAM, so the
     // JIT is stopped first and keeps running until Dolphin's own boot is done.
@@ -9486,7 +9687,22 @@ window.GcRate = (function () {
         // decision: every frame's RAM state (regions/mem1) must land, but when the renderer is
         // behind the frame is marked skipRender, so the dolphin side applies state and skips
         // the draw and presents always sample the freshest game state.
-        var skipRender = rate.frame(e.data.n, performance.now());
+        // [main-thread 2026-10-01] PRESENT GATE for the no-WebGPU fallback. There the GL stream
+        // is REPLAYED ON THIS THREAD (render-worker.js main mode), so every frame dolphin draws
+        // is main-thread work. With the guest clock on a timer (grantNow) the recomp produces its
+        // full 60/s even when rAF is starved, and replaying all of it measured 66% of this
+        // thread in bufferSubData with long tasks in the seconds (4x phone profile, SwiftShader).
+        // A frame the display cannot show is not worth replaying: draw at most one frame per
+        // displayed frame (a rAF since the last draw). Skipped frames still apply their RAM state
+        // (worker_funcs.js skipRender), so the GUEST is untouched — only presents are capped,
+        // which is exactly the guest-rate / presented-rate split gate #9 demands.
+        // Floor: a draw at least every 250 ms even if rAF is starved outright (measured: rAF at
+        // 0/s for minutes with this thread idle while SwiftShader's GPU process was saturated),
+        // so the picture never freezes — 4 draws/s is the most a starved pipeline is offered.
+        var _fnow = performance.now();
+        var _pg = !!window.__gcMtGl && !rafSinceDraw && (_fnow - lastDrawAt) < 250;
+        var skipRender = rate.frame(e.data.n, _fnow, _pg);
+        if (!skipRender) { rafSinceDraw = false; lastDrawAt = _fnow; }
         var tr = [e.data.fifo].concat(e.data.regions.map(function (r) { return r.bytes; }));
         if (e.data.mem1) tr.push(e.data.mem1);
         dolphin_worker.postMessage({ cmd: 'recompFrame', n: e.data.n, fifo: e.data.fifo,

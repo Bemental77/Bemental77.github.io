@@ -96,6 +96,68 @@
     return;
   }
 
+  // [main-thread 2026-10-01] AUDIO STRAIGHT INTO THE WORKLET RING, NOT THROUGH THE PAGE.
+  // audio_sample_batch_cb (EmscriptenWorker.cpp) runs a MAIN_THREAD_ASYNC_EM_ASM on THIS
+  // worker that does `postMessage({cmd:'audio', buf, len})` — one message per ~96-frame batch,
+  // 333/s measured on SAB, each a task + structured-clone deserialize on the page's main thread
+  // just to copy ~384 B into a SharedArrayBuffer ring the page does not otherwise touch.
+  // Once the page hands over that ring ({cmd:'audioRing', sab}), the batch is written here with
+  // the page's own pushAudioSamples logic (same header layout: [0]=head, [1]=tail, [2]=capacity
+  // in int16 elements; same drop-on-full rule) and the page gets one {cmd:'audioStat'} a second
+  // carrying the frame counts its [audio-diag] accounting needs. `sab: null` hands the ring
+  // back (mute, or the recomp taking over as producer). Before any hand-off the old per-batch
+  // message is posted unchanged, so a page that never sends a ring behaves exactly as before.
+  var audRing = null, audHdr = null, audData = null, audCap = 0;
+  var audFrames = 0, audFull = 0, audStatAt = 0;
+  function audStatFlush(now) {
+    audStatAt = now;
+    if (audFrames || audFull) {
+      rawPostMessage({ cmd: 'audioStat', frames: audFrames, dropped: audFull });
+      audFrames = 0; audFull = 0;
+    }
+  }
+  function audWrite(u8, byteLen) {
+    var src = new Int16Array(u8.buffer, u8.byteOffset || 0, (byteLen | 0) >> 1);
+    audFrames += src.length >> 1;
+    if (audHdr) {
+      var head = Atomics.load(audHdr, 0), tail = Atomics.load(audHdr, 1);
+      var free = audCap - ((head - tail) | 0);
+      var n = src.length > free ? free : src.length;
+      if (n < src.length) audFull += (src.length - n) >> 1;
+      if (n > 0) {
+        var start = (head >>> 0) % audCap, first = Math.min(n, audCap - start);
+        audData.set(src.subarray(0, first), start);
+        if (n > first) audData.set(src.subarray(first, n), 0);
+        Atomics.store(audHdr, 0, (head + n) | 0);
+      }
+    }
+    var now = Date.now();
+    if (now - audStatAt >= 1000) audStatFlush(now);
+  }
+  var rawPostMessage = self.postMessage.bind(self);
+  self.postMessage = function (m, transfer) {
+    if (audRing !== null && m && m.cmd === 'audio' && m.buf) { audWrite(m.buf, m.len); return; }
+    return transfer === undefined ? rawPostMessage(m) : rawPostMessage(m, transfer);
+  };
+  // Registered BEFORE self.onmessage is first assigned, so it runs ahead of the emscripten
+  // handler and can keep this page->shim command away from it ('unknown cmd' otherwise).
+  self.addEventListener('message', function (e) {
+    var d = e && e.data;
+    if (!d || d.cmd !== 'audioRing') return;
+    e.stopImmediatePropagation();
+    if (d.sab instanceof SharedArrayBuffer) {
+      audRing = d.sab;
+      audHdr = new Int32Array(d.sab, 0, 4);
+      audCap = audHdr[2] | 0;
+      audData = new Int16Array(d.sab, 16, audCap);
+    } else if (audRing !== null) {
+      // handed back: keep swallowing the batches (counted, not written) so the page is not
+      // flooded again while muted / after the recomp takes over as the producer.
+      audRing = false; audHdr = null; audData = null; audCap = 0;
+    }
+    audStatFlush(Date.now());
+  });
+
   var bootstrapped = false;
   var earlyQueue = [];
   var shimOnMessage = function (e) {
