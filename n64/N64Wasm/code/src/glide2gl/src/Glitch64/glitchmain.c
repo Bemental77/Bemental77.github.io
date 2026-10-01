@@ -83,6 +83,7 @@ uint32_t grSstWinOpen(void)
    glide64_frameBuffer = (uint16_t*)malloc(width * height * sizeof(uint16_t));
    buf = (uint8_t*)malloc(width * height * 4 * sizeof(uint8_t));
    glViewport(0, 0, width, height);
+   glide_viewport_note(0, 0, width, height);
 
    packed_pixels_support = 0;
    npot_support          = 0;
@@ -189,6 +190,55 @@ static uint8_t  *nf_rgba;
 static uint16_t *nf_565;
 static int32_t  *nf_tmp;
 static int nf_cap;
+/* The lookup rows as last uploaded (xs: nf_lx[0..nf_lnx), ys: nf_ly[0..nf_lny), GL rows). */
+static int32_t  *nf_lx, *nf_ly;
+static int nf_lnx = -1, nf_lny = -1, nf_lcap;
+static int nf_unis;
+/* glGetError is a SYNCHRONOUS round trip to the GPU process in WebGL (it waits
+ * for everything queued so far): one after this pass's glReadPixels made the
+ * core wait for the frame it had just drawn, every frame, which undid the
+ * asynchronous hand-over (fbasync.js). The pass issues the identical commands
+ * every frame, so it is verified on the first NF_VERIFY passes after anything
+ * is (re)specified — a size or a lookup row — and trusted after that. */
+#define NF_VERIFY 3
+static int nf_verify = NF_VERIFY;
+
+/* THE VIEWPORT, WITHOUT ASKING. glGetIntegerv(GL_VIEWPORT) is not answered from
+ * WebGL's client-side state: it is a synchronous round trip to the GPU process,
+ * behind everything queued so far (measured on this box: up to 7.6 ms, once per
+ * readback). In this build exactly three places set the viewport — grSstWinOpen
+ * above, glsm's state bind at the start of every retro_run (glsm.c), and this
+ * pass, which puts back what it found — and the first two report it here. So
+ * the value to restore is known. The verification passes still query it and
+ * compare; a disagreement means something else moves the viewport, and the
+ * pass then queries it on every pass for good (nf_vp_untrusted). */
+static GLint nf_vp[4];
+static int nf_vp_known, nf_vp_untrusted;
+void glide_viewport_note(GLint x, GLint y, GLsizei w, GLsizei h)
+{
+   nf_vp[0] = x; nf_vp[1] = y; nf_vp[2] = w; nf_vp[3] = h;
+   nf_vp_known = 1;
+}
+
+/* EARLY HAND-OVER of the asynchronous readback (n64/N64Wasm/dist/fbasync.js
+ * st.prefetch): called at the start of every display list of a read_always
+ * title, before it queues a draw. It reads the copy the next glReadPixels will
+ * be handed — bytes fixed when that copy was taken, so neither what reaches
+ * RDRAM nor where changes; only the wait moves to where the GPU has had the
+ * guest's whole CPU time between the two lists. No-op when fbasync is off. */
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+void grFbPrefetch(void)
+{
+   EM_ASM({
+      var g = (typeof globalThis !== 'undefined') ? globalThis : self;
+      var f = g.__fbAsync;
+      if (f && f.prefetch) f.prefetch();
+   });
+}
+#else
+void grFbPrefetch(void) {}
+#endif
 
 static GLuint nf_shader(GLenum type, const char *src)
 {
@@ -257,11 +307,20 @@ uint16_t *grLfbReadSampled(const int32_t *sx, int nx, const int32_t *sy, int ny)
       nf_tmp  = (int32_t*)malloc((size_t)(nf_cap > n ? nf_cap : n) * 4);
       if (!nf_rgba || !nf_565 || !nf_tmp) { nf_failed = 1; return NULL; }
    }
+   if (nf_lcap < n || !nf_lx || !nf_ly)
+   {
+      free(nf_lx); free(nf_ly);
+      nf_lx = (int32_t*)malloc((size_t)n * 4);
+      nf_ly = (int32_t*)malloc((size_t)n * 4);
+      nf_lcap = n; nf_lnx = nf_lny = -1;
+      if (!nf_lx || !nf_ly) { nf_failed = 1; return NULL; }
+   }
 
    /* ---- save ---- */
    glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
-   while (glGetError() != GL_NO_ERROR) {}   /* not ours: the check below is about THIS pass only */
+   if (nf_verify > 0)
+      while (glGetError() != GL_NO_ERROR) {}   /* not ours: the check below is about THIS pass only */
    for (i = 0; i < 4; i++)
    {
       glActiveTexture(GL_TEXTURE0 + i);
@@ -271,7 +330,16 @@ uint16_t *grLfbReadSampled(const int32_t *sx, int nx, const int32_t *sy, int ny)
    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfb);
    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &rfb);
    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
-   glGetIntegerv(GL_VIEWPORT, vp);
+   if (nf_verify > 0 || !nf_vp_known || nf_vp_untrusted)
+   {
+      glGetIntegerv(GL_VIEWPORT, vp);
+      if (nf_vp_known && memcmp(vp, nf_vp, sizeof(vp)))
+         nf_vp_untrusted = 1;
+      memcpy(nf_vp, vp, sizeof(vp));
+      nf_vp_known = 1;
+   }
+   else
+      memcpy(vp, nf_vp, sizeof(vp));
    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
    glGetIntegerv(GL_PACK_ALIGNMENT, &packAlign);
    glGetBooleanv(GL_COLOR_WRITEMASK, mask);
@@ -288,23 +356,39 @@ uint16_t *grLfbReadSampled(const int32_t *sx, int nx, const int32_t *sy, int ny)
       /* RGB8: the window has no alpha (alpha:false), and a copy may not add one */
       glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
       nf_src_w = width; nf_src_h = height;
+      nf_verify = NF_VERIFY;
    }
    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width, height);
 
    /* ---- the sample positions: window column per N64 column, and GL row
     * (bottom-origin) per N64 row (top-origin), as R32I lookup rows ---- */
+   /* Uploaded only when they differ from what the textures already hold (they
+    * are the same every frame unless the VI/window geometry changes): a
+    * texture re-specified while the previous frame's pass may still read it
+    * costs a copy or a stall on a tile-based GPU. */
+   for (i = 0; i < ny; i++) nf_tmp[i] = height - 1 - sy[i];
    glActiveTexture(GL_TEXTURE1);
    glBindSampler(1, 0);
    glBindTexture(GL_TEXTURE_2D, nf_xs);
-   nf_params();
-   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-   glTexImage2D(GL_TEXTURE_2D, 0, GL_R32I, nx, 1, 0, GL_RED_INTEGER, GL_INT, sx);
-   for (i = 0; i < ny; i++) nf_tmp[i] = height - 1 - sy[i];
+   if (nf_lnx != nx || memcmp(nf_lx, sx, (size_t)nx * 4))
+   {
+      glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+      if (nf_lnx < 0) nf_params();
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_R32I, nx, 1, 0, GL_RED_INTEGER, GL_INT, sx);
+      memcpy(nf_lx, sx, (size_t)nx * 4); nf_lnx = nx;
+      nf_verify = NF_VERIFY;
+   }
    glActiveTexture(GL_TEXTURE2);
    glBindSampler(2, 0);
    glBindTexture(GL_TEXTURE_2D, nf_ys);
-   nf_params();
-   glTexImage2D(GL_TEXTURE_2D, 0, GL_R32I, ny, 1, 0, GL_RED_INTEGER, GL_INT, nf_tmp);
+   if (nf_lny != ny || memcmp(nf_ly, nf_tmp, (size_t)ny * 4))
+   {
+      glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+      if (nf_lny < 0) nf_params();
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_R32I, ny, 1, 0, GL_RED_INTEGER, GL_INT, nf_tmp);
+      memcpy(nf_ly, nf_tmp, (size_t)ny * 4); nf_lny = ny;
+      nf_verify = NF_VERIFY;
+   }
 
    /* ---- the native-size target ---- */
    glActiveTexture(GL_TEXTURE3);
@@ -314,18 +398,25 @@ uint16_t *grLfbReadSampled(const int32_t *sx, int nx, const int32_t *sy, int ny)
       nf_params();
       glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, nx, ny, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
       nf_dst_w = nx; nf_dst_h = ny;
+      glBindTexture(GL_TEXTURE_2D, 0);
+      glBindFramebuffer(GL_FRAMEBUFFER, nf_fbo);
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, nf_dst, 0);
+      nf_verify = NF_VERIFY;
    }
    glBindTexture(GL_TEXTURE_2D, 0);
    glBindFramebuffer(GL_FRAMEBUFFER, nf_fbo);
-   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, nf_dst, 0);
 
    for (i = 0; i < 10; i++) glDisable(caps[i]);
    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
    glViewport(0, 0, nx, ny);
    glUseProgram(nf_prog);
-   glUniform1i(glGetUniformLocation(nf_prog, "src"), 0);
-   glUniform1i(glGetUniformLocation(nf_prog, "xs"), 1);
-   glUniform1i(glGetUniformLocation(nf_prog, "ys"), 2);
+   if (!nf_unis)
+   {  /* sampler units: program state, set once */
+      glUniform1i(glGetUniformLocation(nf_prog, "src"), 0);
+      glUniform1i(glGetUniformLocation(nf_prog, "xs"), 1);
+      glUniform1i(glGetUniformLocation(nf_prog, "ys"), 2);
+      nf_unis = 1;
+   }
    glBindVertexArray(nf_vao);
    glDrawArrays(GL_TRIANGLES, 0, 3);
 
@@ -351,7 +442,11 @@ uint16_t *grLfbReadSampled(const int32_t *sx, int nx, const int32_t *sy, int ny)
    }
    glActiveTexture(active);
 
-   if (glGetError() != GL_NO_ERROR) { nf_failed = 1; return NULL; }
+   if (nf_verify > 0)
+   {
+      if (glGetError() != GL_NO_ERROR) { nf_failed = 1; return NULL; }
+      nf_verify--;
+   }
 
    /* the same 565 packing grLfbLock applies (bytes R,G,B of RGBA8) */
    for (i = 0; i < nx * ny; i++)

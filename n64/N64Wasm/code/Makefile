@@ -190,6 +190,12 @@ all: n64wasm.js
 # calledRun is NOT recoverable this way: 6.0.2 guards it behind #if ASSERTIONS
 # and never assigns it to Module (src/postamble.js:117-120). Anything gating on
 # Module.calledRun must be changed instead -- see tools/n64_boot_test.mjs.
+# THE WASM URL CARRIES THE WASM'S OWN HASH (the sed after emcc). The pages version
+# n64wasm.js (the worker imports it as n64wasm.js?v=WK_V), but the JS fetched the
+# binary as a bare "n64wasm.wasm", so for as long as an HTTP cache held the old one
+# a new JS could be paired with an old binary — and the two must match exactly (the
+# JS's EM_ASM table is keyed by addresses inside that binary). Now each JS names the
+# only binary it works with. Deterministic: same source, same bytes.
 n64wasm.js: $(FILES)
 	emcc -o $@ $(FILES) -s USE_SDL=2 -s USE_SDL_TTF=2 \
     -s USE_ZLIB=1 \
@@ -214,9 +220,11 @@ n64wasm.js: $(FILES)
     '_neil_fp_always','_neil_last_fp', \
     '_neil_state_size','_neil_state_save_raw','_neil_state_save_raw_fast','_neil_state_load_raw', \
     '_neil_state_last_load_mode','_neil_state_last_load_pages','_neil_state_m64p_region', \
-    '_neil_set_native_fbread','_neil_native_fbread_failed', \
+    '_neil_set_native_fbread','_neil_native_fbread_failed','_neil_set_vbo_mode', \
     '_malloc','_free']" \
 	-s INVOKE_RUN=0 \
+    && sed -i "s/locateFile(\"n64wasm.wasm\")/locateFile(\"n64wasm.wasm?v=$$(md5sum n64wasm.wasm | cut -c1-8)\")/" n64wasm.js \
+    && grep -q 'locateFile("n64wasm.wasm?v=' n64wasm.js \
     && mv n64wasm.js ../dist/ \
     && mv n64wasm.wasm ../dist/
 

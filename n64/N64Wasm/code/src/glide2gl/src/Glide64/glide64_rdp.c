@@ -354,6 +354,12 @@ void glide64ProcessDList(void)
   if (exception)
     return;
 
+  /* read_always: hand the previous display list's framebuffer copy over NOW,
+   * before this list queues any draw (glitchmain.c grFbPrefetch). The bytes
+   * that reach RDRAM, and the guest point where they do, are unchanged. */
+  if (settings.frame_buffer & fb_ref)
+    grFbPrefetch();
+
   /* Set states */
   if (settings.swapmode > 0)
     SwapOK                            = true;

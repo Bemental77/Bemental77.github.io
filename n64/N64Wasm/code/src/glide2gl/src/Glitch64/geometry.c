@@ -57,6 +57,7 @@ static bool       vbuf_drawing   = false;
 
 extern retro_environment_t environ_cb;
 extern bool vbuf_use_vbo;
+extern int  vbuf_orphan;
 
 void vbo_init(void)
 {
@@ -148,7 +149,12 @@ void vbo_draw(void)
       {
          glBindBuffer(GL_ARRAY_BUFFER, vbuf_vbo);
 
-         glBufferSubData(GL_ARRAY_BUFFER, 0, vbuf_length * sizeof(VBufVertex), vbuf_data);
+         /* orphan: fresh storage per draw, never an overwrite of data an
+          * earlier draw of this frame still reads (mymain.cpp g_vbo_mode) */
+         if (vbuf_orphan)
+            glBufferData(GL_ARRAY_BUFFER, vbuf_length * sizeof(VBufVertex), vbuf_data, GL_STREAM_DRAW);
+         else
+            glBufferSubData(GL_ARRAY_BUFFER, 0, vbuf_length * sizeof(VBufVertex), vbuf_data);
 
          glDrawArrays(vbuf_primitive, 0, vbuf_length);
          glBindBuffer(GL_ARRAY_BUFFER, 0);

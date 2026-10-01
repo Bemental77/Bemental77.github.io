@@ -2,9 +2,11 @@
 // fbasync_unit_test.mjs — THE ASYNC FRAMEBUFFER READBACK HANDS OVER EXACTLY
 // THE PREVIOUS CALL'S PIXELS, WHATEVER THE GPU IS DOING.
 //
-// The shim under test is the ?fbasync=1 block of n64/index.html, extracted
-// from the live file at run time (the only substitution is the query string it
-// reads, pinned to "?fbasync=1&fbwitness=1"), so this tests what ships.
+// The shim under test is n64/N64Wasm/dist/fbasync.js — the one implementation
+// the page and the core worker both install — loaded from the live file and
+// installed with the query string pinned to "?fbasync=1&fbwitness=1", so this
+// tests what ships. (Until 2026-10-01 this extracted a block of n64/index.html,
+// which no longer holds it; the test then exited 2 without testing anything.)
 //
 // It renders frames whose colour is a pure function of the frame number, calls
 // readPixels exactly the way Emscripten's _emscripten_glReadPixels does
@@ -18,7 +20,12 @@
 //   busy : a heavy fragment shader over the whole target every frame and only
 //          a 0 ms task boundary — the fence has almost never signalled.
 // The shim must hand over identical frame numbers in both (the copy may BLOCK,
-// it may never be late by a different amount or be skipped). Both regimes'
+// it may never be late by a different amount or be skipped).
+//   prefetch : busy, with st.prefetch() called before each frame is drawn —
+//          what the core does at the start of every display list (glide64_rdp.c
+//          ProcessDList -> glitchmain.c grFbPrefetch): the copy is read EARLY
+//          into the pack buffer's CPU-side copy and handed over from there. The
+//          frame handed over must be exactly the same as without it. Both regimes'
 // fence-not-signalled fractions are printed: if they do not differ, the test
 // has not exercised the thing it claims to and says so (VOID).
 //
@@ -31,13 +38,14 @@ const require = createRequire(process.env.HOME + '/probe-deps/');
 const puppeteer = require('puppeteer');
 const __filename = fileURLToPath(import.meta.url);
 const root = path.resolve(path.dirname(__filename), '../..');
-const html = fs.readFileSync(path.join(root, 'n64/index.html'), 'utf8');
-const a = html.indexOf('  var FB_Q = new URLSearchParams(location.search);');
-const b = html.indexOf('  var glFacts = { webgl2: false };');
-if (a < 0 || b < a) { console.error('could not find the fbasync block in n64/index.html'); process.exit(2); }
-const shim = html.slice(a, b).replace('new URLSearchParams(location.search)', "new URLSearchParams('?fbasync=1&fbwitness=1')");
+const src = fs.readFileSync(path.join(root, 'n64/N64Wasm/dist/fbasync.js'), 'utf8');
+if (src.indexOf('__n64InstallFbAsync') < 0) { console.error('n64/N64Wasm/dist/fbasync.js does not define __n64InstallFbAsync'); process.exit(2); }
+const shim = src + "\n;window.__n64InstallFbAsync(window, '?fbasync=1&fbwitness=1');";
 
-const browser = await puppeteer.launch({ headless: 'new', executablePath: '/opt/pw-browsers/chromium-1194/chrome-linux/chrome',
+// protocolTimeout: the three regimes run in ONE evaluate, and the busy ones draw a
+// deliberately heavy shader on SwiftShader — under load that outlasts puppeteer's
+// 180 s default and the test died on the timeout, not on a result.
+const browser = await puppeteer.launch({ headless: 'new', executablePath: '/opt/pw-browsers/chromium-1194/chrome-linux/chrome', protocolTimeout: 1800000,
   args: ['--no-sandbox', '--disable-dev-shm-usage', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'] });
 try { (await import('../../tools/browser_leak_guard.js')).default.guard(browser, __filename); } catch (_e) {}
 let pass = 0, fail = 0;
@@ -82,10 +90,11 @@ try {
       return found;
     };
     const tick = (ms) => new Promise((r) => setTimeout(r, ms));
-    const run = async (label, n, heavy, gapMs, kBase) => {
-      const out = { label, n, wrong: [], blockedBefore: st.blocked, asyncBefore: st.async, syncBefore: st.sync };
+    const run = async (label, n, heavy, gapMs, kBase, prefetch) => {
+      const out = { label, n, wrong: [], blockedBefore: st.blocked, asyncBefore: st.async, syncBefore: st.sync, earlyBefore: st.early };
       for (let i = 1; i <= n; i++) {
         const k = kBase + i;
+        if (prefetch) st.prefetch();
         frame(k, heavy);
         HEAP.fill(0);
         gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, HEAP, IDX);
@@ -94,6 +103,7 @@ try {
         await tick(gapMs);
       }
       out.blocked = st.blocked - out.blockedBefore; out.async = st.async - out.asyncBefore; out.sync = st.sync - out.syncBefore;
+      out.early = st.early - out.earlyBefore;
       return out;
     };
     const R = {};
@@ -101,6 +111,8 @@ try {
     R.idle = await run('idle', 60, false, 30, 0);
     st.invalidate('test');
     R.busy = await run('busy', 60, true, 0, 100);
+    st.invalidate('test');
+    R.prefetch = await run('prefetch', 60, true, 0, 500, true);
     // a rect change: the first call at the new rect hands over its OWN pixels
     frame(200, false); HEAP.fill(0);
     gl.readPixels(0, 0, W, H / 2, gl.RGBA, gl.UNSIGNED_BYTE, HEAP, IDX);
@@ -122,6 +134,10 @@ try {
     // restore twice from one snapshot (two rollbacks to the same frame)
     const snap2 = st.snapshot(); sn.g = readFull(306); st.restore(snap2); sn.h = readFull(307);
     st.restore(snap2); sn.i = readFull(308); st.release(snap2);
+    // the same with the early read in play: a prefetched pending copy, pinned,
+    // thrown away by later frames, restored — and prefetched again
+    st.prefetch(); const snap3 = st.snapshot(); sn.j = readFull(309); st.prefetch(); sn.k = readFull(310);
+    st.restore(snap3); st.prefetch(); sn.l = readFull(311); st.release(snap3);
     R.snap = sn;
     R.lastInvalidation = st.lastInvalidation;
     // DK64: a ZERO-AREA read (0,H,W,0) first, then real reads. The zero read
@@ -143,16 +159,19 @@ try {
     R.seqLen = st.seq.length;
     return R;
   });
-  for (const k of ['idle', 'busy']) {
+  for (const k of ['idle', 'busy', 'prefetch']) {
     const r = res[k];
     r.wrong.length === 0
-      ? ok(`${k}: all ${r.n} calls handed over exactly frame k-1 (the first: its own)`, `async ${r.async}, sync ${r.sync}, fence not signalled at read ${r.blocked}/${r.async}`)
+      ? ok(`${k}: all ${r.n} calls handed over exactly frame k-1 (the first: its own)`, `async ${r.async}, sync ${r.sync}, fence not signalled at read ${r.blocked}/${r.async}, handed over from the early read ${r.early}`)
       : bad(`${k}: wrong frame handed over`, JSON.stringify(r.wrong.slice(0, 5)));
   }
   const fi = res.idle.blocked / Math.max(1, res.idle.async), fb = res.busy.blocked / Math.max(1, res.busy.async);
   (fb - fi >= 0.5)
     ? ok('the two regimes really differ at the read point', `fence unsignalled: idle ${(fi * 100).toFixed(0)}% vs busy ${(fb * 100).toFixed(0)}%`)
     : bad('VOID: the regimes did not differ at the read point, so this proves nothing about GPU timing', `idle ${(fi * 100).toFixed(0)}% vs busy ${(fb * 100).toFixed(0)}%`);
+  (res.prefetch.early === res.prefetch.async && res.prefetch.async === res.prefetch.n - 1 && res.busy.early === 0)
+    ? ok('prefetch: every async hand-over came from the early read; none without it', `prefetch ${res.prefetch.early}/${res.prefetch.async}, busy ${res.busy.early}`)
+    : bad('prefetch was not exercised as claimed', JSON.stringify({ prefetch: [res.prefetch.early, res.prefetch.async], busy: res.busy.early }));
   (res.rectSwitchOwn && res.rectSwitchNext && res.lastInvalidation === 'rect')
     ? ok('a rect change reads synchronously once, then resumes the one-call offset')
     : bad('rect change', JSON.stringify({ own: res.rectSwitchOwn, next: res.rectSwitchNext, last: res.lastInvalidation }));
@@ -161,7 +180,10 @@ try {
     // snapshot pins 301; c: 301, d: 302 (discarded timeline); restore;
     // e: 301 (the pinned copy), f: 304; snapshot2 pins 305; g: 305;
     // restore -> h: 305; restore again -> i: 305.
-    const s = res.snap, want = { a: 300, b: 300, c: 301, d: 302, e: 301, f: 304, g: 305, h: 305, i: 305 };
+    // j..l: prefetch before snapshot3 reads 308's copy early (pinned); j: 308,
+    // k: 309 (prefetched); restore -> prefetch is a no-op (already read) ->
+    // l: 308 again.
+    const s = res.snap, want = { a: 300, b: 300, c: 301, d: 302, e: 301, f: 304, g: 305, h: 305, i: 305, j: 308, k: 309, l: 308 };
     const badK = Object.keys(want).filter((k) => s[k] !== want[k]);
     (badK.length === 0 && s.pinnedAfter === s.pinnedBefore - 1)
       ? ok('snapshot/restore (rollback, run-ahead): a restored console is handed the pinned copy, twice over', JSON.stringify(s))
