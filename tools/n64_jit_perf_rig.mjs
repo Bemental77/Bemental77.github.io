@@ -89,12 +89,24 @@ const [W0, W1] = (flag('window', '') || `${Math.floor(FRAMES * 2 / 3)}:${FRAMES}
 const CPU = +flag('cpu', '1');
 const ROUNDS = +flag('rounds', '1');
 const HASH = has('hash');
+// --nofbhash: hash RDRAM every frame but do NOT read the framebuffer back. The
+// fb hash is a readPixels with no pack buffer bound, which the page's fbasync
+// layer (n64/index.html) intercepts as one of ITS calls — so on a read_always
+// title (MK64, DK64, Banjo...) the rig's own witness joins the one-call-offset
+// chain it is trying to observe. RDRAM-only hashing takes it out.
+const FBHASH = !has('nofbhash');
+// --fbseq: record the page's fbasync witness (?fbwitness=1 is added to every
+// arm's URL) and report where two arms' readback sequences first differ.
+const FBSEQ = has('fbseq');
 const PROFILE_ARM = flag('profile', '');
 const SHOTS = (flag('shots', '') || '').split(',').filter(Boolean).map(Number);
 const OUT = flag('out', '/tmp/n64-perf-rig');
 const VIHZ = +flag('vihz', '50');
 const BASE = flag('url', 'http://localhost:8080');
 const CHUNK = +flag('chunk', '30');
+const DUMP_AT = +flag('dumpat', '0');
+const JITSPAN = +flag('jitspan', '0');
+const JITONLY = flag('jitonly', '') ? fs.readFileSync(flag('jitonly', ''), 'utf8').split(/\s+/).filter(Boolean).map((h) => parseInt(h, 16) >>> 0) : null;
 const CHROME = process.env.CHROME_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
 fs.mkdirSync(OUT, { recursive: true });
 
@@ -106,6 +118,11 @@ const ARMS = armSpecs.map((s) => {
   let spec = eq > 0 ? s.slice(eq + 1) : s, query = '';
   const qm = spec.indexOf('?');
   if (qm >= 0) { query = spec.slice(qm + 1); spec = spec.slice(0, qm); }
+  // rigslow=R (rig-only, stripped from the page URL): CDP CPU throttle for the
+  // WHOLE run of this arm. A TIMING-ONLY control: the guest work is identical,
+  // so a hash that moves with it is wall-clock dependence, not the emitter.
+  let slow = 0;
+  query = query.split('&').filter((kv) => { const m = /^rigslow=(\d+(?:\.\d+)?)$/.exec(kv); if (m) { slow = +m[1]; return false; } return kv; }).join('&');
   let emitter = null;
   if (spec === 'head') {
     const f = path.join(OUT, 'mips_emit.HEAD.js');
@@ -113,7 +130,7 @@ const ARMS = armSpecs.map((s) => {
     emitter = f;
   } else if (spec.startsWith('file:')) emitter = spec.slice(5);
   else if (spec !== 'off' && spec !== 'tree') throw new Error('unknown arm spec ' + spec);
-  return { name, spec, query, off: spec === 'off', emitter, emitterSrc: emitter ? fs.readFileSync(emitter) : null };
+  return { name, spec, query, slow, off: spec === 'off', emitter, emitterSrc: emitter ? fs.readFileSync(emitter) : null };
 });
 
 // ---- input plans: [f0, f1, ports[], mask, ax, ay] held over [f0, f1) ----
@@ -188,7 +205,7 @@ async function runArm(arm, round, opts) {
     });
   }
   await page.evaluateOnNewDocument(PRE);
-  const q = (arm.off ? '&jit=off' : '') + (arm.query ? '&' + arm.query : '');
+  const q = (arm.off ? '&jit=off' : '') + (arm.query ? '&' + arm.query : '') + (FBSEQ ? '&fbwitness=1' : '');
   await page.goto(`${BASE}/n64/?game=${encodeURIComponent(ROM)}&autostart${q}`, { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => window.__rig && window.__rig.main === true, { timeout: 240000 });
   if (!arm.off) await page.waitForFunction(() => !!(window.bementalMips && window.myApp && window.myApp.jitCompile), { timeout: 60000 });
@@ -204,15 +221,32 @@ async function runArm(arm, round, opts) {
       app.jitCompile = function (pp) { window.__rig.params = pp; return orig(pp); };
     }
   }, arm.off);
+  // --jitonly FILE: compile ONLY the span entries (hex vaddrs, one per line)
+  // listed — the span bisect, done rig-side so no page edit is needed. Every
+  // compile request's vaddr is recorded either way (res.compiled).
+  if (!arm.off) await page.evaluate((allow) => {
+    const bm = window.bementalMips, orig = bm.compileSpan, set = allow ? new Set(allow) : null;
+    window.__rigCompiled = [];
+    bm.compileSpan = function (p, M) {
+      const v = p.vaddr >>> 0; window.__rigCompiled.push(v);
+      if (set && !set.has(v)) return 0;
+      // --jitspan N: truncate every span to its first N instructions (legal:
+      // the fall-through exit sets PC = entry + span*stride)
+      if (window.__rigJitSpan > 0 && p.span > window.__rigJitSpan) p = Object.assign({}, p, { span: window.__rigJitSpan });
+      return orig(p, M);
+    };
+  }, JITONLY);
+  if (!arm.off && JITSPAN) await page.evaluate((n) => { window.__rigJitSpan = n; }, JITSPAN);
   const cdp = await page.createCDPSession();
+  if (arm.slow > 1) await cdp.send('Emulation.setCPUThrottlingRate', { rate: arm.slow });
   const res = { arm: arm.name, round, fp: [], rd: [], fb: [], errs, logs };
   let f = 0;
-  const stops = [...new Set([W0, W1, FRAMES, ...(round === 0 ? SHOTS : [])])].filter((x) => x > 0 && x <= FRAMES).sort((a, b) => a - b);
+  const stops = [...new Set([W0, W1, FRAMES, ...(DUMP_AT ? [DUMP_AT] : []), ...(round === 0 ? SHOTS : [])])].filter((x) => x > 0 && x <= FRAMES).sort((a, b) => a - b);
   let costA = null, prof = null, loadA = null, loadB = null, censusA = null, censusB = null, blocksA = 0;
   const runTo = async (to) => {
     while (f < to) {
       const end = Math.min(to, f + CHUNK);
-      const chunk = await page.evaluate((from, to, plan, hash) => {
+      const chunk = await page.evaluate((from, to, plan, hash, fbhash) => {
         const M = window.Module, out = { fp: [], rd: [], fb: [], ms: 0 };
         let dram = 0;
         if (hash && window.__rig.params) dram = M.HEAPU32[(window.__rig.params >> 2) + 24];
@@ -237,7 +271,7 @@ async function runArm(arm, round, opts) {
             }
             out.rd.push(h >>> 0);
             let g = 0;
-            if (gl) {
+            if (gl && fbhash) {
               const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
               if (!px || px.length !== W * H * 4) px = new Uint8Array(W * H * 4);
               const pr = gl.getParameter(gl.READ_FRAMEBUFFER_BINDING), pb = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
@@ -253,7 +287,7 @@ async function runArm(arm, round, opts) {
           }
         }
         return out;
-      }, f, end, plan, HASH);
+      }, f, end, plan, HASH, FBHASH);
       res.fp.push(...chunk.fp); res.rd.push(...chunk.rd); res.fb.push(...chunk.fb);
       if (f >= W0 && end <= W1) res.callMs = (res.callMs || 0) + chunk.ms;
       f = end;
@@ -288,6 +322,16 @@ async function runArm(arm, round, opts) {
       res.load = [loadA, loadB];
     }
     if (f === W0 && costA === null) await enterWindow();
+    if (DUMP_AT && f === DUMP_AT) {
+      // --dumpat N: write this arm's 8 MB of RDRAM after frame N (diagnosis)
+      const b64 = await page.evaluate(() => {
+        const M = window.Module, d = M.HEAPU32[(window.__rig.params >> 2) + 24];
+        const u = new Uint8Array(M.HEAPU8.buffer, d, 0x800000);
+        let s = ''; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000));
+        return btoa(s);
+      });
+      fs.writeFileSync(path.join(OUT, `rdram_${arm.name}_r${round}_f${f}.bin`), Buffer.from(b64, 'base64'));
+    }
     if (round === 0 && SHOTS.includes(f)) {
       await new Promise((r) => setTimeout(r, 150));
       const el = await page.$('#canvas');
@@ -295,10 +339,15 @@ async function runArm(arm, round, opts) {
       if (el) await el.screenshot({ path: file }); else await page.screenshot({ path: file });
     }
   }
+  if (!arm.off) {
+    res.compiled = await page.evaluate(() => window.__rigCompiled || []);
+    if (flag('jitlist', '')) fs.writeFileSync(flag('jitlist', '') + '.' + arm.name, [...new Set(res.compiled)].map((v) => v.toString(16)).join('\n') + '\n');
+  }
+  if (FBSEQ) res.fbseq = await page.evaluate(() => (window.__fbAsync && window.__fbAsync.seq) ? window.__fbAsync.seq.map((e) => e.join(':')) : null);
   res.jit = await page.evaluate(() => {
     const s = window.__jitStats ? window.__jitStats() : null;
     const e = window.bementalMips && window.bementalMips.stats;
-    if (s && e) { s.cacheHits = e.cacheHits || 0; s.labelEntries = e.labelEntries || 0; s.pageTruncated = e.pageTruncated || 0; }
+    if (s && e) { s.cacheHits = e.cacheHits || 0; s.labelEntries = e.labelEntries || 0; s.pageTruncated = e.pageTruncated || 0; s.pinnedBlocks = e.pinnedBlocks || 0; s.pinnedRegs = e.pinnedRegs || 0; }
     return s;
   });
   if (has('tiercheck') && !arm.off) {
@@ -431,7 +480,32 @@ async function attribute(page, prof) {
     cat[label] = (cat[label] || 0) + us;
   }
   const pct = (x) => +(100 * x / total).toFixed(2);
+  // WHO is an unlabelled hot function? For the top few, list the table slots
+  // that hold it and the guest instructions whose precomp ops point there.
+  const hotUnl = Object.entries(leafFn).sort((a, b) => b[1] - a[1]).slice(0, 6)
+    .map(([k]) => (k.match(/^(?:wasm-function\[|\$func|\$f)(\d+)\]?/) || [])[1]).filter(Boolean);
+  const who = hotUnl.length ? await page.evaluate((names) => {
+    const M = window.Module, pp = window.__rig.params, U = M.HEAPU32, q = pp >> 2, T = M.wasmTable, out = {};
+    const want = new Set(names), slots = {};
+    for (let ti = 1; ti < T.length; ti++) { let f = null; try { f = T.get(ti); } catch (e) {} if (f && want.has(String(f.name))) (slots[f.name] = slots[f.name] || []).push(ti); }
+    const pidx = {}; for (let k = 0; k < 46; k++) pidx[U[q + k]] = k;
+    const blocksBase = U[q + 32] >> 2, stride = U[q + 4], dram = U[q + 24];
+    for (const n of names) {
+      const ts = slots[n] || [], hits = [];
+      for (let k = 0; k < 0x100000 && hits.length < 4; k++) {
+        const bp = U[blocksBase + k]; if (!bp) continue;
+        const blk = U[bp >> 2], start = U[(bp >> 2) + 1], end = U[(bp >> 2) + 2];
+        if (!blk || end <= start) continue;
+        for (let i = 0; i < ((end - start) >>> 2) && hits.length < 4; i++) {
+          if (ts.includes(U[(blk + i * stride) >> 2])) { const a = (start + i * 4) >>> 0; hits.push(a.toString(16) + ':' + (a >= 0x80000000 && a < 0xC0000000 ? (U[(dram >> 2) + ((a & 0x7FFFFF) >>> 2)] >>> 0).toString(16) : '?')); }
+        }
+      }
+      out[n] = { tableSlots: ts.slice(0, 6), paramIdx: ts.filter((t) => pidx[t] !== undefined).map((t) => pidx[t]), opsAt: hits };
+    }
+    return out;
+  }, hotUnl).catch((e) => ({ error: String(e).slice(0, 120) })) : null;
   return {
+    who,
     labelled: labels ? { pages: labels.pages, interpFns: labels.instrs, total: Object.keys(L).length } : null,
     totalMs: +(total / 1000).toFixed(1),
     categories: Object.entries(cat).sort((a, b) => b[1] - a[1]).slice(0, 60).map(([k, v]) => [k, pct(v)]),
@@ -449,7 +523,7 @@ try {
       const summary = { round: r, arm: res.arm, costMsPerFrame: res.costMsPerFrame, callMsPerFrame: res.callMsPerFrame,
         wallMsPerFrame: res.wallMsPerFrame, capX: res.capX, load: res.load, frames: res.fp.length, compilesInWindow: res.compilesInWindow,
         jit: res.jit ? { blocks: res.jit.blocks, nativeOps: res.jit.nativeOps, fallbackOps: res.jit.fallbackOps,
-          nullOpsRejects: res.jit.nullOpsRejects, emitFails: res.jit.emitFails, mode: res.jit.mode, cacheHits: res.jit.cacheHits, labelEntries: res.jit.labelEntries, pageTruncated: res.jit.pageTruncated } : null,
+          nullOpsRejects: res.jit.nullOpsRejects, emitFails: res.jit.emitFails, mode: res.jit.mode, cacheHits: res.jit.cacheHits, labelEntries: res.jit.labelEntries, pageTruncated: res.jit.pageTruncated, pinnedBlocks: res.jit.pinnedBlocks, pinnedRegs: res.jit.pinnedRegs } : null,
         errs: res.errs.slice(0, 3), logs: res.logs.slice(0, 4) };
       console.log(JSON.stringify(summary));
       if (res.attribution) console.log(JSON.stringify(res.attribution, null, 1));
@@ -467,8 +541,13 @@ for (const r of results.slice(1)) {
   const dfp = firstDiff(ref.fp, r.fp), drd = HASH ? firstDiff(ref.rd, r.rd) : -1, dfb = HASH ? firstDiff(ref.fb, r.fb) : -1;
   const ok = dfp < 0 && drd < 0 && dfb < 0 && r.fp.length === FRAMES;
   if (!ok) fails++;
+  if (FBSEQ && ref.fbseq && r.fbseq) {
+    const d = firstDiff(ref.fbseq, r.fbseq);
+    console.log(`[fbseq] ${ref.arm} ${ref.fbseq.length} calls, ${r.arm} ${r.fbseq.length} calls, first difference at call ${d}` +
+      (d >= 0 ? ` (${ref.fbseq[d]} vs ${r.fbseq[d]})` : ''));
+  }
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${ref.arm}#${ref.round} vs ${r.arm}#${r.round}: frames=${r.fp.length}` +
-    ` fpFirstDiff=${dfp}` + (HASH ? ` rdramFirstDiff=${drd} fbFirstDiff=${dfb}` : ''));
+    ` fpFirstDiff=${dfp}` + (HASH ? ` rdramFirstDiff=${drd} fbFirstDiff=${dfb} rdramDiffFrames=${ref.rd.filter((h, k) => h !== r.rd[k]).length}` : ''));
 }
 // ---- timing summary: per arm, all rounds ----
 const byArm = {};
