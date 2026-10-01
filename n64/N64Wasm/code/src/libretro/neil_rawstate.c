@@ -96,6 +96,8 @@ void neil_intq_restore(const uint32_t* in);
 int neil_intq_words_max(void);
 /* mupen64plus-rsp-cxd4/rsp.c */
 int neil_cxd4_state_io(unsigned char* buf, int save);
+/* mupen64plus-rsp-hle/src/hle_plugin.c */
+int neil_hle_state_io(unsigned char* buf, int save);
 /* mupen64plus-video-angrylion/n64video.c */
 int neil_al_state_io(unsigned char* buf, int save);
 unsigned char* neil_al_hidden_ptr(void);
@@ -131,7 +133,8 @@ struct neil_raw_hdr
    uint32_t rsp_task_locked, rsp_audio_signal;
    uint32_t intq[NEIL_INTQ_WORDS];
    uint32_t audio_sz, cxd4_sz, al_sz, hidden_sz, savemem_sz;
-   uint32_t reserved[6];
+   uint32_t hle_sz;
+   uint32_t reserved[5];
 };
 
 static uint32_t g_nonce;          /* identifies THIS running instance */
@@ -143,13 +146,14 @@ static int g_last_load_pages;     /* pages invalidated by the last selective loa
 
 static uint32_t sz_audio(void)   { return (uint32_t)neil_audio_state_io(NULL, 0); }
 static uint32_t sz_cxd4(void)    { return (uint32_t)neil_cxd4_state_io(NULL, 0); }
+static uint32_t sz_hle(void)     { return (uint32_t)neil_hle_state_io(NULL, 0); }
 static uint32_t sz_al(void)      { return (uint32_t)neil_al_state_io(NULL, 0); }
 static uint32_t sz_hidden(void)  { return (uint32_t)neil_al_hidden_size(); }
 
 static uint32_t trailer_size(void)
 {
    return ALIGN8((uint32_t)sizeof(struct neil_raw_hdr))
-        + ALIGN8(sz_audio()) + ALIGN8(sz_cxd4()) + ALIGN8(sz_al())
+        + ALIGN8(sz_audio()) + ALIGN8(sz_cxd4()) + ALIGN8(sz_hle()) + ALIGN8(sz_al())
         + ALIGN8(sz_hidden()) + ALIGN8(NEIL_SAVEMEM_SIZE);
 }
 
@@ -178,6 +182,7 @@ static void zero_trailer_gaps(unsigned char* t, const struct neil_raw_hdr* h)
    zero_gap(t, o, (uint32_t)sizeof(*h)); o += ALIGN8((uint32_t)sizeof(*h));
    zero_gap(t, o, h->audio_sz);          o += ALIGN8(h->audio_sz);
    zero_gap(t, o, h->cxd4_sz);           o += ALIGN8(h->cxd4_sz);
+   zero_gap(t, o, h->hle_sz);            o += ALIGN8(h->hle_sz);
    zero_gap(t, o, h->al_sz);             o += ALIGN8(h->al_sz);
    zero_gap(t, o, h->hidden_sz);         o += ALIGN8(h->hidden_sz);
    zero_gap(t, o, h->savemem_sz);
@@ -269,6 +274,7 @@ static int save_raw(unsigned char* dst, int fast)
    neil_intq_save(h.intq);
    h.audio_sz = sz_audio();
    h.cxd4_sz = sz_cxd4();
+   h.hle_sz = sz_hle();
    h.al_sz = sz_al();
    h.hidden_sz = sz_hidden();
    h.savemem_sz = NEIL_SAVEMEM_SIZE;
@@ -281,6 +287,7 @@ static int save_raw(unsigned char* dst, int fast)
    p += ALIGN8((uint32_t)sizeof(h));
    neil_audio_state_io(p, 1);                     p += ALIGN8(h.audio_sz);
    neil_cxd4_state_io(p, 1);                      p += ALIGN8(h.cxd4_sz);
+   neil_hle_state_io(p, 1);                       p += ALIGN8(h.hle_sz);
    neil_al_state_io(p, 1);                        p += ALIGN8(h.al_sz);
    if (hid_partial)
    {
@@ -357,7 +364,7 @@ int neil_state_load_raw(const unsigned char* src)
       return 0;
    if (h.total_size != (uint32_t)neil_state_size())
       return 0;
-   if (h.audio_sz != sz_audio() || h.cxd4_sz != sz_cxd4() || h.al_sz != sz_al()
+   if (h.audio_sz != sz_audio() || h.cxd4_sz != sz_cxd4() || h.hle_sz != sz_hle() || h.al_sz != sz_al()
          || h.hidden_sz != sz_hidden() || h.savemem_sz != NEIL_SAVEMEM_SIZE)
       return 0;
    if (h.m64p_len + 1024u > NEIL_M64P_REGION)
@@ -420,6 +427,7 @@ int neil_state_load_raw(const unsigned char* src)
    p = src + NEIL_M64P_REGION + ALIGN8((uint32_t)sizeof(h));
    neil_audio_state_io((unsigned char*)p, 0);     p += ALIGN8(h.audio_sz);
    neil_cxd4_state_io((unsigned char*)p, 0);      p += ALIGN8(h.cxd4_sz);
+   neil_hle_state_io((unsigned char*)p, 0);       p += ALIGN8(h.hle_sz);
    neil_al_state_io((unsigned char*)p, 0);        p += ALIGN8(h.al_sz);
    memcpy(neil_al_hidden_ptr(), p, h.hidden_sz);  p += ALIGN8(h.hidden_sz);
    neil_hid_all_ep = neil_hid_epoch; /* the whole plane was just replaced */

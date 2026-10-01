@@ -23,6 +23,7 @@
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "common.h"
 #include "hle.h"
@@ -143,4 +144,20 @@ unsigned int hleDoRspCycles(unsigned int Cycles)
 void hleRomClosed(void)
 {
    /* do nothing */
+}
+
+/* NEIL RAW STATE — the HLE RSP's persistent state (everything in g_hle after
+ * the pointer block: the audio-list DMEM image, the per-ABI audio state for
+ * audio/naudio/nead microcodes, and the MP3 work buffer). The page runs this
+ * plugin whenever the gfx plugin is Glide64 (forceAngry off → RSP_HLE), and
+ * these survive from one audio task to the next exactly as DMEM would. */
+int neil_hle_state_io(unsigned char* buf, int save)
+{
+    unsigned char* base = (unsigned char*)&g_hle.alist_buffer;
+    size_t n = sizeof(g_hle) - (size_t)(base - (unsigned char*)&g_hle);
+    if (buf)
+    {
+        if (save) memcpy(buf, base, n); else memcpy(base, buf, n);
+    }
+    return (int)n;
 }
