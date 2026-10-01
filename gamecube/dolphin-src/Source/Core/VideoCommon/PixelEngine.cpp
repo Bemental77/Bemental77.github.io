@@ -30,6 +30,18 @@ u32 g_pe_setfinish_count = 0;
 
 namespace PixelEngine
 {
+std::atomic<int> g_efb_ram_outstanding{0};
+std::atomic<u32> g_efb_ram_drop_gen{0};
+
+// Arm cell 0x026B3E08: 0 (default) = hold; 0xEFB06A2D = no hold, drop a late write only if the
+// guest rewrote its destination (the fingerprint guard); 0xEFB0A11F = the old unordered
+// behaviour; 0xEFB0D0D0 = drop every late write. Census: 0x026B3E98 holds, 0x026B3E9C give-ups.
+static bool EfbRamHoldArmed()
+{
+  const u32 arm = *reinterpret_cast<volatile u32*>(uintptr_t(0x026B3E08u));
+  return arm == 0u;
+}
+
 enum
 {
   INT_CAUSE_PE_TOKEN = 0x200,   // GP Token
@@ -187,6 +199,32 @@ void PixelEngineManager::SetTokenFinish_OnMainThread_Static(Core::System& system
   system.GetPixelEngine().SetTokenFinish_OnMainThread(userdata, cycles_late);
 }
 
+void PixelEngineManager::ReleaseHeldTokenFinish()
+{
+  std::lock_guard lk(m_token_finish_mutex);
+  if (!m_raise_held || g_efb_ram_outstanding.load(std::memory_order_acquire) > 0)
+    return;
+  m_raise_held = false;
+  RaiseEvent(0);
+}
+
+void PixelEngineManager::PollHeldTokenFinish()
+{
+#ifdef __EMSCRIPTEN__
+  {
+    std::lock_guard lk(m_token_finish_mutex);
+    if (!m_raise_held || emscripten_get_now() - m_held_since_ms < 100.0)
+      return;
+    // Give up after 100 ms: the stragglers' generation is now stale, so their callbacks fall
+    // back to the fingerprint guard (write only if the guest has not reused the RAM).
+    g_efb_ram_drop_gen.fetch_add(1, std::memory_order_acq_rel);
+    g_efb_ram_outstanding.store(0, std::memory_order_release);
+    ++*reinterpret_cast<volatile u32*>(uintptr_t(0x026B3E9Cu));
+  }
+  ReleaseHeldTokenFinish();
+#endif
+}
+
 void PixelEngineManager::FlushPendingTokenFinish()
 {
   SetTokenFinish_OnMainThread(0, 0);
@@ -226,6 +264,20 @@ void PixelEngineManager::RaiseEvent(int cycles_into_future)
 {
   if (m_event_raised)
     return;
+  // [efb-ram ordering] the guest must not see this token/finish before the EFB->RAM writes
+  // issued ahead of it are in RAM. Hold it; ReleaseHeldTokenFinish raises it.
+  if (EfbRamHoldArmed() && g_efb_ram_outstanding.load(std::memory_order_acquire) > 0)
+  {
+    if (!m_raise_held)
+    {
+      m_raise_held = true;
+#ifdef __EMSCRIPTEN__
+      m_held_since_ms = emscripten_get_now();
+#endif
+      ++*reinterpret_cast<volatile u32*>(uintptr_t(0x026B3E98u));
+    }
+    return;
+  }
 
   m_event_raised = true;
 

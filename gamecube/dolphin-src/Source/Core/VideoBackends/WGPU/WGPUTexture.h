@@ -69,6 +69,21 @@ private:
 // (worst case = one callback-latency-late frame, never stale/zero bands).
 class WGPUStagingTexture;
 
+// [late-efb guard 2026-10-01] FNV-1a over a guest-RAM span (word-wise; a trailing partial
+// word is ignored). Used to tell whether the guest rewrote a deferred EFB-copy destination.
+inline u32 WGPUEfbGuardHash(const void* p, u32 len)
+{
+  const u8* b = static_cast<const u8*>(p);
+  u32 h = 2166136261u;
+  for (u32 i = 0; i + 4 <= len; i += 4)
+  {
+    u32 w;
+    __builtin_memcpy(&w, b + i, 4);
+    h = (h ^ w) * 16777619u;
+  }
+  return h;
+}
+
 struct WGPUEfbEncodePending
 {
   bool encode_done = false;   // callback ran, staging bytes valid
@@ -76,6 +91,10 @@ struct WGPUEfbEncodePending
   bool orphaned = false;      // staging reused/destroyed; don't touch its map
   void* def_dst = nullptr;    // deferred guest-RAM destination
   u32 def_stride = 0;
+  u32 def_len = 0;             // [late-efb guard] bytes of guest RAM the deferred write covers
+  u32 def_hash = 0;            // [late-efb guard] FNV-1a of that RAM when the write was deferred
+  double def_t = 0.0;          // [late-efb census] host ms when the write was deferred
+  u32 def_gen = 0;             // [efb-ram ordering] PixelEngine::g_efb_ram_drop_gen at deferral
   // Registration back-pointer: the callback unregisters itself from the staging
   // before deleting the ctx (else a later ReadTexels would read freed memory).
   // Only dereferenced on the !orphaned path; the staging dtor sets orphaned.

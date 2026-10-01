@@ -2145,6 +2145,16 @@ function startServer() {
               + '/' + (A[0x026B3B68 >> 2] >>> 0) + '/' + (A[0x026B3B70 >> 2] >>> 0)
               + ' lastIdlePc=' + (A[0x026B3B6C >> 2] >>> 0).toString(16)
               + ' arm=' + (A[0x026B3B74 >> 2] >>> 0).toString(16),
+            // [late-efb guard 2026-10-01] late EFB->RAM writes / dropped (guest reused the RAM, or arm 0x026B3E08) /
+            // last 16 destinations as guest offsets (host ptr - mem1 base) + bytes.
+            lateEfb: (A[0x026B3E00 >> 2] >>> 0) + '/' + (A[0x026B3E04 >> 2] >>> 0) + ' arm='
+              + (A[0x026B3E08 >> 2] >>> 0).toString(16) + ' ['
+              + Array.from({ length: 16 }, (_, i) => {
+                  const p = A[(0x026B3E10 >> 2) + i * 2] >>> 0, n = A[(0x026B3E10 >> 2) + i * 2 + 1] >>> 0;
+                  const b = A[0x02500020 >> 2] >>> 0;
+                  return p ? ((p - b) >>> 0).toString(16) + '+' + n.toString(16) : '-';
+                }).join(' ') + '] latSumMs=' + (A[0x026B3E90 >> 2] >>> 0) + ' latMaxMs=' + (A[0x026B3E94 >> 2] >>> 0)
+              + ' peHold=' + (A[0x026B3E98 >> 2] >>> 0) + ' peGiveUp=' + (A[0x026B3E9C >> 2] >>> 0),
             // [xf-word-loss PM37] producer first-word split: n(1.0) / n(0) / n(other) / lastOther
             // [m00-hunt PM37] runtime lanes at 0x800bb8f4: fbps1 / faps0 / result / hits
             xfi: (A[0x026B37B4 >> 2] >>> 0).toString(16) + '/'
@@ -2541,6 +2551,79 @@ function startServer() {
         console.log('[mem1-peek @' + pm[2] + 'ms]\n' + out);
       } catch (e) { console.log('[probe] mem1-peek failed: ' + e.message); }
     }, parseInt(pm[2], 10));
+  }
+
+  // ---- [modlist 2026-10-01] PROBE_MODLIST="ms,ms,...": walk the guest's REL module list
+  // (__OSModuleInfoList head @0x800030C8, dolsdk OSModule.h layout) at each time and print every
+  // loaded module's id, header address, and section table. Also prints the words at any
+  // PROBE_MODLIST_WORDS="hexaddr,..." (guest virtual 0x80xxxxxx). Read-only.
+  if (process.env.PROBE_MODLIST) {
+    const words = (process.env.PROBE_MODLIST_WORDS || '').split(',').filter(Boolean).map((h) => parseInt(h, 16));
+    for (const t of process.env.PROBE_MODLIST.split(',').map((x) => parseInt(x, 10)).filter((x) => x > 0)) {
+      setTimeout(async () => {
+        try {
+          const out = await page.evaluate((words) => {
+            if (!window.sharedMemory) return 'no sharedMemory';
+            const A = new Uint32Array(window.sharedMemory.buffer);
+            const B = new Uint8Array(window.sharedMemory.buffer);
+            const base = A[0x02500020 >> 2] >>> 0;
+            if (!base) return 'mem1base=0';
+            const r32 = (va) => { const o = (va & 0x01FFFFFF) >>> 0; return ((B[base + o] << 24) | (B[base + o + 1] << 16) | (B[base + o + 2] << 8) | B[base + o + 3]) >>> 0; };
+            const h = (v) => '0x' + (v >>> 0).toString(16);
+            const L = [];
+            let m = r32(0x800030C8), n = 0;
+            L.push('head=' + h(m) + ' tail=' + h(r32(0x800030CC)));
+            while (m && (m >>> 24) === 0x80 && n++ < 32) {
+              const id = r32(m), ns = r32(m + 0xC), si = r32(m + 0x10);
+              let secs = [];
+              for (let k = 0; k < ns && k < 24; k++) {
+                const off = r32(si + k * 8), sz = r32(si + k * 8 + 4);
+                if (sz) secs.push(k + ':' + h(off & ~1) + (off & 1 ? 'x' : '') + '+' + h(sz));
+              }
+              L.push('mod id=' + id + ' @' + h(m) + ' nsec=' + ns + ' bss=' + h(r32(m + 0x20)) + ' secs[' + secs.join(' ') + ']');
+              m = r32(m + 4);
+            }
+            for (const w of words) L.push('word ' + h(w) + ' = ' + h(r32(w)));
+            return L.join('\n');
+          }, words);
+          console.log('[modlist @' + t + 'ms]\n' + out);
+        } catch (e) { console.log('[probe] modlist failed: ' + e.message); }
+      }, t);
+    }
+  }
+
+  // ---- [watchword 2026-10-01] PROBE_WATCHWORD="80beca1c,800030c8": page-side 2 ms poll of
+  // guest words; every CHANGE is logged with its wall time. A sampled watch
+  // (it can miss a value that lives < 2 ms), not a watchpoint. Read-only.
+  if (process.env.PROBE_WATCHWORD) {
+    // A leading '*' per level dereferences: "**80bd3668" watches *(*(0x80bd3668)).
+    const ww = process.env.PROBE_WATCHWORD.split(',').filter(Boolean).map((h) => h.trim());
+    await page.evaluate((ww) => {
+      const last = {}; window.__ww = [];
+      const t0 = performance.now();
+      setInterval(() => {
+        if (!window.sharedMemory) return;
+        const A = new Uint32Array(window.sharedMemory.buffer);
+        const B = new Uint8Array(window.sharedMemory.buffer);
+        const base = A[0x02500020 >> 2] >>> 0; if (!base) return;
+        const rd = (a) => { const o = base + ((a & 0x01FFFFFF) >>> 0); return ((B[o] << 24) | (B[o + 1] << 16) | (B[o + 2] << 8) | B[o + 3]) >>> 0; };
+        for (const spec of ww) {
+          let lv = 0; while (spec[lv] === '*') lv++;
+          let a = parseInt(spec.slice(lv), 16), ok = true;
+          for (let k = 0; k < lv; k++) { a = rd(a); if ((a >>> 24) !== 0x80 && (a >>> 24) !== 0x81) { ok = false; break; } }
+          const v = ok ? rd(a) : 0xDEADBEEF;
+          const key = spec;
+          if (last[key] !== v) {
+            last[key] = v;
+            if (window.__ww.length < 400) window.__ww.push('t=' + ((performance.now() - t0) / 1000).toFixed(3) + ' ' + spec + (lv ? ' [@0x' + (a >>> 0).toString(16) + ']' : '') + ' = 0x' + v.toString(16));
+          }
+        }
+      }, 2);
+    }, ww);
+    setTimeout(async () => {
+      try { const L = await page.evaluate(() => window.__ww || []); console.log('[watchword]\n' + L.join('\n')); }
+      catch (e) { console.log('[watchword] read failed: ' + e.message); }
+    }, Math.max(1000, TEST_DURATION_MS - 3000));
   }
 
   // ---- report the WASM build's own raw DoState size (format-compat check) --

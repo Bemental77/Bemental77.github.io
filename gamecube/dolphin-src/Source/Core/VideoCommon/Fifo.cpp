@@ -335,6 +335,9 @@ void FifoManager::ResetVideoBuffer()
 // spawned gpu_thread parks (Core.cpp); its never-Run mainloop keeps FlushGpu/ExitGpuLoop no-op.
 void FifoManager::RunGpuLoopSlice()
 {
+  // [efb-ram ordering 2026-10-01] give-up timer for a PE token/finish held on late EFB->RAM
+  // writes (PixelEngine.h). Cheap: one lock + compare when nothing is held.
+  m_system.GetPixelEngine().PollHeldTokenFinish();
   {
         // Run events from the CPU thread.
         // [dc device-events 2026-07-22] Native's GPU thread pulls AsyncRequests because it IS the

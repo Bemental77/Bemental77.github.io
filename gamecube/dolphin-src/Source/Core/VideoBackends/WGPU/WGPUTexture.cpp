@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoBackends/WGPU/WGPUTexture.h"
+#include "VideoCommon/PixelEngine.h"
 
 #include <algorithm>  // std::max / std::min for mip-extent clamping
 #include <emscripten.h>  // MAIN_THREAD_EM_ASM for stub-hit logging
@@ -324,6 +325,16 @@ void WGPUStagingTexture::ReadTexels(const MathUtil::Rectangle<int>& rect, void* 
       p->deferred = true;
       p->def_dst = out_ptr;
       p->def_stride = out_stride;
+      // [late-efb guard 2026-10-01] Fingerprint the destination as the guest left it. The
+      // callback writes only if it is still unchanged, i.e. the guest has not reused that RAM
+      // in the meantime (see WGPUTextureCache.h CopyEFB callback for the SAB case).
+      p->def_len = static_cast<u32>(rect.GetHeight()) * out_stride;
+      p->def_hash = WGPUEfbGuardHash(out_ptr, p->def_len);
+      p->def_t = emscripten_get_now();
+      // [efb-ram ordering 2026-10-01] the PE holds its next token/finish until this write
+      // has landed (PixelEngine.h); the readback callback decrements and releases.
+      p->def_gen = PixelEngine::g_efb_ram_drop_gen.load(std::memory_order_acquire);
+      PixelEngine::g_efb_ram_outstanding.fetch_add(1, std::memory_order_acq_rel);
       return;
     }
     // encode already landed in the map buffer — fall through to the normal copy
