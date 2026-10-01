@@ -80,14 +80,18 @@
 //   (the rig takes /tmp/bemental-probe.lock itself around EVERY cell)
 //
 // FLAGS
-//   --consoles dc,n64,gc,gen,ps1    (default all five)
+//   --consoles dc,n64,gc,gen,ps1    (default all five; gba,snes are SOLO-ONLY: --solo-only)
 //   --arms a,b,c,d,drelay,e         (default a,b,c,d,drelay; e is the 10-min soak)
 //   --seconds N    measured seconds per cell (default 60)
 //   --soak N       seconds for arm e (default 600)
 //   --solo mobile,desktop,pair   measure the SOLO cap (no room) of these
 //                  devices; `pair` = two desktop solos AT ONCE (contention control)
 //                  first (default: mobile whenever arm b or c runs; 'none' = skip)
-//   --solo-only    measure the solo caps and no cells
+//   --solo-only    measure the solo caps and no cells. A solo also records
+//                  main-thread long tasks, page-native audio counters
+//                  (__audioDiag, lib/cart_audio.js __cartAudio) and a busy-loop
+//                  proof in every live worker (see the MOBILE note: the CDP
+//                  throttle never reaches workers here)
 //   --name N       output under /tmp/npdm/<N>/ (default: timestamp)
 //   --retries N    re-run a load-voided cell up to N times (default 1)
 //   --url BASE     default http://localhost:8080
@@ -193,6 +197,16 @@ const CONSOLES = {
   gen: { name: 'Genesis', title: 'Sonic the Hedgehog 3', page: '/genesis.html', game: 'Sonic the Hedgehog 3', hostFlag: '&host=1',
          hz: '((window.Module && window.Module._gpx_fps && window.Module._gpx_fps()) || 59.922751)',
          witness: 'null', frames: '(window.__genFrames|0)', bootMs: 120000, seam: 'window.__genNet && window.__genNet()' },
+  // SOLO-ONLY consoles (--solo-only): no room is ever opened on these by this
+  // rig. GBA has no netplay at all; the core runs one frame per emuRunFrame()
+  // call, so the page's own call counter IS the guest clock (59.7275 Hz =
+  // 16.78 MHz / 280896 cycles per frame). `boot` replaces soloBoot's generic
+  // romSelect/btnStart press for a page without those controls.
+  gba: { name: 'GBA', title: 'Sonic Advance 3', page: '/gba.html', game: 'Sonic Advance 3', hostFlag: '', soloOnly: true,
+         hz: '59.7275', witness: 'null', frames: '(window.myClass ? window.myClass.frameCnt : null)', bootMs: 120000, seam: 'null',
+         boot: `(() => { const i = window.ROMLIST.findIndex((r) => r.title === 'Sonic Advance 3'); document.getElementById('romselect').value = window.ROMLIST[i].url; myClass.loadRom(); return { picked: i }; })()` },
+  snes: { name: 'SNES', title: 'SimCity', page: '/snes.html', game: 'SimCity', hostFlag: '&host=1',
+          hz: '60.0988', witness: 'null', frames: '(window.__snesFrames|0)', bootMs: 120000, seam: 'window.__snesNet && window.__snesNet()' },
   ps1: { name: 'PS1', title: 'Monster Rancher 2', page: '/ps1.html', game: 'Monster Rancher 2', hostFlag: '&host=1',
          hz: '((window.__ps1Net && window.__ps1Net().hz) || 59.94)',
          witness: 'null', frames: '(window.__ps1Frames|0)', bootMs: 300000,
@@ -207,6 +221,14 @@ const CONSOLES = {
 // ---- the arms ----------------------------------------------------------------
 const DESKTOP = { kind: 'desktop' };
 const MOBILE = { kind: 'mobile', cpu: 4 };
+// ⚠ Emulation.setCPUThrottlingRate DOES NOT REACH WORKERS in this Chromium
+// (chromium-1194): on a worker target it is refused with "Operation is only
+// supported for pages, not workers" (measured 2026-10-01; every mobile solo
+// records it in throttleRejected, and workerProof times the same busy loop in
+// each live worker against the page's unthrottled time). The page-level
+// throttle slows the renderer MAIN thread. So on a console whose CPU loop runs
+// in a worker, this arm throttles the UI, not the emulator — read its rate as
+// an upper bound for a phone, not a measurement of one.
 const ARMS = {
   a: { id: 'a', what: 'desktop host + desktop joiner', host: DESKTOP, join: DESKTOP },
   b: { id: 'b', what: 'mobile-emulated 4x-throttled HOST + desktop joiner', host: MOBILE, join: DESKTOP },
@@ -329,7 +351,13 @@ function preloadSrc(cfg) {
     audio: { ctxs: 0, taps: 0, quanta: 0, audibleQuanta: 0, zeroQuanta: 0, dropouts: 0, longSilences: 0,
              firstAudibleAt: null, err: null, curZero: 0, sawAudible: false },
     p2p: { sent: 0, delayed: 0, rtx: 0 }, relayForced: false,
+    lt: { n: 0, ms: 0, max: 0, over100: 0 },
   };
+  // ---------------- main-thread long tasks (>50 ms) ----------------
+  try {
+    new PerformanceObserver((l) => { for (const e of l.getEntries()) { M.lt.n++; M.lt.ms += e.duration; if (e.duration > M.lt.max) M.lt.max = e.duration; if (e.duration > 100) M.lt.over100++; } })
+      .observe({ type: 'longtask', buffered: true });
+  } catch (e) { M.lt.err = String(e); }
   // ---------------- lockstep hooks (prototype-level, console-independent) ----------------
   const hook = () => {
     const L = window.Netplay && window.Netplay.Lockstep;
@@ -395,6 +423,10 @@ function preloadSrc(cfg) {
       stalls: rep ? rep.stalls : null, stallMs: rep ? rep.stallMs : null,
       witness: ev(CFG.witness), frames: ev(CFG.frames), hz: ev(CFG.hz), aux: ev(CFG.aux || 'null'),
       aq: M.audio.quanta, aDrop: M.audio.dropouts, raf: rafN,
+      lt: M.lt.n, ltMs: Math.round(M.lt.ms),
+      ad: (() => { const d = window.__audioDiag; return d ? { p: d.framesProduced, c: d.framesConsumed, u: d.underruns == null ? null : d.underruns, uf: d.underrunFrames, df: d.droppedFrames, fill: d.fill } : null; })(),
+      // lib/cart_audio.js's sink counters (gba/snes/genesis), page-native.
+      ca: (() => { const c = window.__cartAudio; return c ? { rx: c.rxFrames, u: c.underruns, m: c.missingFrames, o: c.overflowFrames, b: c.backlog, mode: c.mode } : null; })(),
     });
     rafN = 0;
     lastReady = M.readyFrames;
@@ -855,6 +887,10 @@ async function soloBoot(P, C) {
   await prewarm(P, C);
   await P.page.goto(BASE + C.page, { waitUntil: 'domcontentloaded' });
   await sleep(3000);
+  if (C.boot) {
+    for (let i = 0; i < 40; i++) { const ok = await P.page.evaluate(() => !!(window.myClass && window.myClass.isWasmReady)).catch(() => false); if (ok || !/gba/.test(C.page)) break; await sleep(500); }
+    return P.page.evaluate(C.boot).catch((e) => ({ bootError: String(e.message || e).slice(0, 200) }));
+  }
   return P.page.evaluate((game) => {
     const sels = ['romSelect', 'mobileRomSelect'].map((id) => document.getElementById(id)).filter(Boolean);
     let picked = null;
@@ -887,6 +923,48 @@ async function soloMeasure(P, C, tag, i) {
     const a0 = await P.page.evaluate(() => ({ n: window.__npdm.win.length, a: Object.assign({}, window.__npdm.audio) }));
     await sleep(SOLO_S * 1000);
     out.win = await P.page.evaluate((m0) => window.__npdm.win.slice(m0), a0.n);
+    const W0 = out.win[0], W1 = out.win[out.win.length - 1];
+    if (W0 && W1) {
+      const mins = (W1.t - W0.t) / 60000;
+      out.longTasks = { n: W1.lt - W0.lt, ms: W1.ltMs - W0.ltMs, perMin: mins ? +((W1.lt - W0.lt) / mins).toFixed(1) : null,
+                        msPerS: mins ? +((W1.ltMs - W0.ltMs) / (mins * 60)).toFixed(1) : null,
+                        max: await P.page.evaluate(() => Math.round(window.__npdm.lt.max)).catch(() => null) };
+      if (W0.ca && W1.ca) {
+        const s = (W1.t - W0.t) / 1000;
+        out.cartAudio = { mode: W1.ca.mode, rxPerS: +((W1.ca.rx - W0.ca.rx) / s).toFixed(1), underruns: W1.ca.u - W0.ca.u,
+                          underrunsPerMin: +((W1.ca.u - W0.ca.u) / (s / 60)).toFixed(2), missingFrames: W1.ca.m - W0.ca.m,
+                          overflowFrames: W1.ca.o - W0.ca.o, backlogEnd: W1.ca.b };
+      }
+      if (W0.ad && W1.ad) {
+        const s = (W1.t - W0.t) / 1000;
+        out.audioDiag = { producedPerS: W1.ad.p != null ? +((W1.ad.p - W0.ad.p) / s).toFixed(1) : null,
+                          consumedPerS: W1.ad.c != null && W0.ad.c != null ? +((W1.ad.c - W0.ad.c) / s).toFixed(1) : null,
+                          underruns: W1.ad.u != null && W0.ad.u != null ? W1.ad.u - W0.ad.u : null,
+                          underrunsPerMin: W1.ad.u != null && W0.ad.u != null ? +((W1.ad.u - W0.ad.u) / (s / 60)).toFixed(2) : null,
+                          droppedFrames: W1.ad.df != null ? (W1.ad.df - (W0.ad.df || 0)) : null, fillEnd: W1.ad.fill };
+      }
+    }
+    // THE THROTTLE MUST BE PROVEN ON THE WORKERS, not assumed from a CDP ack:
+    // the same busy loop in each live dedicated worker, against the page's
+    // UNTHROTTLED before-time. ~4x = throttled; ~1x = the worker escaped.
+    // Plus every worker TARGET in the browser (nested workers included), so a
+    // worker puppeteer never reported is visible as unthrottled.
+    if (P.throttleProof) {
+      out.workerProof = [];
+      for (const w of P.page.workers()) {
+        // ⚠ BOUNDED. An emulator worker that runs its CPU loop without
+        // yielding never services Runtime.evaluate, and an unbounded call then
+        // waits out protocolTimeout (240 s) PER WORKER — that hung a ps1 solo
+        // for 16+ minutes. Unresponsive is itself the answer: no proof.
+        const ms = await Promise.race([
+          w.evaluate(() => { const t = performance.now(); let x = 0; for (let i = 0; i < 3e6; i++) x += Math.sqrt(i); return performance.now() - t + (x < 0 ? 1 : 0); }).catch(() => null),
+          sleep(3000).then(() => 'unresponsive'),
+        ]);
+        if (ms === 'unresponsive') { out.workerProof.push({ url: w.url().split('/').pop().slice(0, 40), ms: null, note: 'did not answer in 3 s (busy loop never yields)' }); continue; }
+        out.workerProof.push({ url: w.url().split('/').pop().slice(0, 40), ms: ms && +ms.toFixed(1), ratioVsUnthrottledPage: (ms && P.throttleProof.beforeMs) ? +(ms / P.throttleProof.beforeMs).toFixed(2) : null });
+      }
+      out.workerTargets = P.browser.targets().filter((t) => /worker/.test(t.type())).map((t) => t.type() + ':' + t.url().split('/').pop().slice(0, 40));
+    }
     out.shot = await canvasShot(P.page, path.join(OUT, `${tag}${i ? '-' + i : ''}.png`));
     // Audio over the SAME window as the rate, not since page load.
     const a1 = await P.page.evaluate(() => Object.assign({}, window.__npdm.audio));
@@ -919,7 +997,8 @@ async function runSolo(cid, device, count = 1) {
     const worst = rated.sort((a, b) => a.rate.x - b.rate.x)[0] || out.each[0];
     Object.assign(out, { live: out.each.every((e) => e.live), win: worst.win, shot: worst.shot, audio: worst.audio,
                          errors: out.each.flatMap((e) => e.errors), throttleProof: worst.throttleProof,
-                         throttled: worst.throttled, throttleRejected: worst.throttleRejected, rafMean: worst.rafMean });
+                         throttled: worst.throttled, throttleRejected: worst.throttleRejected, rafMean: worst.rafMean,
+                         longTasks: worst.longTasks, audioDiag: worst.audioDiag, cartAudio: worst.cartAudio, workerProof: worst.workerProof, workerTargets: worst.workerTargets });
   } catch (e) {
     out.error = 'rig error: ' + String(e && e.stack || e).slice(0, 300);
   } finally {
@@ -1111,9 +1190,9 @@ if (flag('rejudge', '')) {
       say(`--- ${cid} SOLO cap, ${dk}${dev.cpu ? ' ' + dev.cpu + 'x' : ''} ---`);
       const s = await runSolo(cid, dev, { pair: 2, trio: 3, quad: 4 }[dk] || 1);
       RESULT.solo[cid + ':' + dk] = s; save();
-      say(`  solo ${cid}/${dk}: live=${s.live} rate=${JSON.stringify(s.rate)} throttleProof=${JSON.stringify(s.throttleProof)} canvas=${s.shot && (s.shot.showing ? 'ok' : 'BLACK')} audio=${s.audio ? s.audio.dropouts + ' drop/' + s.audio.quanta + 'q' : '-'} raf=${s.rafMean}${s.each && s.each.length > 1 ? ' each=' + s.each.map((e) => e.rate && e.rate.x).join('/') : ''} loads=${s.loads.join(',')} ${s.start ? JSON.stringify(s.start) : ''} ${s.error || ''}`);
+      say(`  solo ${cid}/${dk}: live=${s.live} rate=${JSON.stringify(s.rate)} throttleProof=${JSON.stringify(s.throttleProof)} canvas=${s.shot && (s.shot.showing ? 'ok' : 'BLACK')} audio=${s.audio ? s.audio.dropouts + ' drop/' + s.audio.quanta + 'q' : '-'} raf=${s.rafMean} perMin=${s.audio && s.audio.perMin} longTasks=${JSON.stringify(s.longTasks)} audioDiag=${JSON.stringify(s.audioDiag)} cartAudio=${JSON.stringify(s.cartAudio)} workers=${JSON.stringify(s.workerProof)} targets=${JSON.stringify(s.workerTargets)}${s.each && s.each.length > 1 ? ' each=' + s.each.map((e) => e.rate && e.rate.x).join('/') : ''} loads=${s.loads.join(',')} ${s.start ? JSON.stringify(s.start) : ''} ${s.error || ''}`);
     }
-    for (const aid of (SOLO_ONLY ? [] : arms)) {
+    for (const aid of ((SOLO_ONLY || CONSOLES[cid].soloOnly) ? [] : arms)) {
       let cell = null;
       for (let attempt = 0; attempt <= RETRIES; attempt++) {
         say(`--- ${cid} × ${aid} (${ARMS[aid].what})${attempt ? ' retry ' + attempt : ''} ---`);

@@ -318,6 +318,16 @@ async function run(name) {
   const page = await browser.newPage();
   await page.setViewport(VIEW);
   await page.setUserAgent(IPHONE);
+  // MIL_CPU=4: the phone profile's CPU throttle on the page. It is also tried
+  // on every worker, but chromium-1194 refuses it there ("Operation is only
+  // supported for pages, not workers") — so on a worker-hosted core only the
+  // main thread (input handling, presenting) is throttled.
+  if (+process.env.MIL_CPU > 1) {
+    const rate = +process.env.MIL_CPU;
+    await (await page.target().createCDPSession()).send('Emulation.setCPUThrottlingRate', { rate });
+    page.on('workercreated', (w) => { w.client.send('Emulation.setCPUThrottlingRate', { rate }).catch(() => {}); });
+    console.log('  CPU throttle ' + rate + 'x (page; workers refuse it)');
+  }
   const errs = [];
   page.on('pageerror', (e) => errs.push(String(e).slice(0, 160)));
   const out = { page: name, hook: null, errs };
