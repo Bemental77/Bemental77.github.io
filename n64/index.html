@@ -4098,7 +4098,9 @@ N64Rate.selfTest = function (logFn) {
   // rather than repaid (lsFeed).
   // ═══════════════════════════════════════════════════════════════════════════
   var RB_Q = new URLSearchParams(location.search);
-  var RB_WANT = RB_Q.get('rb') !== '0';                 // ?rb=0: propose delay-based lockstep (measurement arm only)
+  // Rollback is opt-in (?rb=1) until a weak device is proven to keep 1.000x in it:
+  // a 4x-CPU MK64 room measured 0.07x in rollback vs 0.55-0.62x in lockstep.
+  var RB_WANT = RB_Q.get('rb') === '1';
   var RB_WINDOW = Math.max(2, Math.min(12, +(RB_Q.get('rbw') || 8) | 0));
   var RB = { ready: false, fault: null, slots: [], n: 0, hidden: 0, stepMs: 0,
              rollbacks: 0, resimFrames: 0, maxDepth: 0, depthHist: {}, resimMs: 0, maxResimMs: 0,
@@ -4269,7 +4271,9 @@ N64Rate.selfTest = function (logFn) {
   // 1.000x. ?ra=N pins it (0 = off); ?ra=auto (default) adapts up to RA_MAX.
   // ═══════════════════════════════════════════════════════════════════════════
   var RA_Q = RB_Q.get('ra');
-  var RA_FIXED = (RA_Q != null && RA_Q !== 'auto') ? Math.max(0, Math.min(4, +RA_Q | 0)) : null;
+  // Run-ahead is off unless asked for (?ra=auto|N): GPU framebuffer state is not in
+  // the savestate, so hidden frames are only proven exact on MK64.
+  var RA_FIXED = RA_Q == null ? 0 : (RA_Q !== 'auto' ? Math.max(0, Math.min(4, +RA_Q | 0)) : null);
   var RA_MAX = 2, RA_BUDGET = 0.75, RA_UP_MS = 2000;
   var RA = { frames: RA_FIXED != null ? RA_FIXED : 0, fixed: RA_FIXED, runs: 0, hiddenFrames: 0, ms: 0,
              tickEma: 0, frameEma: 0, calmSince: 0, ups: 0, downs: 0, fault: null, lastImage: null };
