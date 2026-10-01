@@ -148,6 +148,10 @@ try {
      `switched ${tSw} s after the throttle; host at frame ${ha && ha.frame}, guest at ${gb && gb.frame}; delay ${s1[0].delay}/${s1[1].delay}; guest step ${s1[1].st} ms`);
   ok('the-slow-device-is-told-why', !!(gb && gb.mine && /^this device is too slow for zero-lag mode; using input delay/.test(gb.text)) && !!(ha && /too slow for zero-lag mode/.test(ha.text)),
      `guest: "${gb && gb.text}" | host: "${ha && ha.text}"`);
+  // genesis.html's status line carries the engine's sentence while the room is in delay
+  const lines = await Promise.all([A, B].map((p) => p.page.evaluate(() => { const el = document.getElementById('netBarrier'); return el ? el.textContent : ''; })));
+  ok('the-status-line-says-so', /too slow for zero-lag mode; using input delay/.test(lines[1]) && /too slow for zero-lag mode/.test(lines[0]),
+     `guest #netBarrier "${lines[1]}" | host "${lines[0]}"`);
   await sleep(8000);
   const r1 = await Promise.all([rate(A, 5000), rate(B, 5000)]);
   const s2 = await Promise.all([A, B].map((p) => p.page.evaluate(SNAP)));
