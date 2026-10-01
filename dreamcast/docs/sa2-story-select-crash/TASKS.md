@@ -192,3 +192,75 @@ accounting are checked. Both readings live in the same lever.
 - `dreamcast/tools/dc_input_repro.mjs` — the input rig, with a hard gate that VOIDS a
   negative result unless the pad bytes provably moved. The first attempt at this repro was
   wasted precisely because input silently never arrived.
+
+---
+
+## 9. 2026-10-01: the same crash, reported from a real phone as a "stall"
+
+A real Android phone (ANGLE "ARM, Mali-G715, OpenGL ES 3.2") on prod sent:
+
+```
+>> THE EMULATOR STALLED — telemetry at +80.0s, pc=0x8c10fe72 fps=54 fields=54 iters=52
+still working? NO — no progress for 33s while running   stall=1  pageError=0
+audio  drain 0/s (-100%) · buffer 0/16384 · 2,022,181 dropout frames
+depth-stencil in use  depth32f_stencil8 (vendor is not Mali/ARM)
+```
+
+`pc=0x8c10fe72` is the same lastPc as the original report at the top of this file. It is the
+last heartbeat's PC sample (SA2's frame loop), not the fault. **Reproduced under phone
+emulation** (Pixel UA, 915x412 @2x, touch, CDP 4x CPU on the page) with
+`dc_input_repro.mjs --game sa2 --mash --nodirs`: the same line,
+`what="Fatal: SH4 exception when blocked" sh4_pc=0xac000012 spc=0x4f24eef4`. The run then sat
+on a frozen frame, and the page reported it exactly as the phone did: `still working? NO`,
+`audio drain 0/s · buffer 0/16384`, `stall=1`. Caveat: CDP refuses
+`Emulation.setCPUThrottlingRate` on dedicated workers ("only supported for pages"), so the
+emulator worker itself was NOT throttled. Only the page was.
+
+What was wrong on the page side, all fixed in `dreamcast.html`:
+
+- **The crash line was never read.** The shim prints the decoded throw the instant the pump
+  dies. Nothing sniffed it, so the report headline was the stall detector's guess 12 s later.
+  The headline now leads with `THE GAME CRASHED INSIDE THE EMULATOR — <decoded throw>`, and
+  the banner says so at once.
+- **`drain 0/s` was read as "audio never drained".** In the reproduction the sink drained at
+  the writer's rate (`consumedRate` tracked `[audio] wrote=`) for the whole time the guest ran.
+  It dropped to 0 only when the guest died. The row now also prints the total seconds played
+  and how long ago the last drain happened.
+- **The depth-stencil row was wrong twice.** It was an inference from `gl.mali`, fed the
+  MASKED vendor (`"WebKit"` on every Chrome). The inference also came from a gl4/OIT path this
+  build does not run: the log reads `core/rend/gles/gles.cpp:624 ... OpenGL ES version 3.0`, and
+  the GLES renderer allocates `GL_DEPTH24_STENCIL8` on GLES3 whatever the vendor
+  (`gltex.cpp`). The shim now OBSERVES the renderer's `glRenderbufferStorage` call
+  (measured: `DEPTH24_STENCIL8 640x480`), and the GPU is identified from the UNMASKED renderer.
+
+### Runtime-lever arms on the current wasm (`eec9ff8c…`, box load 8-21, one run each)
+
+| arm | result |
+|---|---|
+| `noidleskip=1` | **CRASH**, same line |
+| `noimmfast=1` | **CRASH**, same line |
+| `rteintc=1` | **CRASH**, same line |
+| `noshard=1` | no crash in 110 s. **Inconclusive**: the default arm at the same load also did not reach the menu in 110 s |
+| `noic=1` (earlier, section 5) | **CRASH**. That arm also never fills the lever-5E3 RAS (fill gated on `g_ic_generation`), so RAS is not necessary for the crash |
+
+### Shipped mitigation: single-player rewind (`flycast_worker.js`, `recoverFromThrow`)
+
+The core cannot be rebuilt on this box, so the root fault (why the PC reaches `0x4f24eef4`)
+is still open. The shim now does the following:
+
+- It keeps one serialized snapshot in the wasm heap, refreshed every 10-30 s at a clean
+  asyncify boundary. Measured cost: 18.9-52.5 ms per 27.8-61.3 MB snapshot at load 15-17.
+  The interval adapts so that the snapshot's share of wall time stays at or under ~0.25%.
+- On a throw out of `run_iter` it clears the stale in-flight flag and restores the snapshot.
+  `emscripten_load_state` also flushes the JIT. It then runs 60 s with block chaining off and
+  restores chaining.
+- It is off under lockstep. It allows at most 3 rewinds per 10 min; after that the old "pump
+  stopped" behaviour and report stand. `?norecover=1` turns it off, and `?recoverchain=1`
+  rewinds without turning chaining off.
+
+Measured (`recdesk` arm): crash at +63 s, `REWOUND 8.3 s`, chaining off 60 s then back on.
+No further fault through +205 s, and the final screenshot is the Hero-story intro cutscene
+("That's a 10-4. Cargo secured on board..."), i.e. **past** the crash point. A `recoverchain`
+arm (rewind + JIT flush, chaining left on) also had no second fault in the following ~130 s
+(one run). That is a hint, not a result, that the fault depends on the JIT's state and not only
+on guest input.

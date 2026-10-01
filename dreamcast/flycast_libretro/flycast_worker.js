@@ -57,6 +57,47 @@
   }
 
   // ---------------------------------------------------------------------------
+  // DEPTH-STENCIL FORMAT, OBSERVED (2026-10-01). The diagnostics used to INFER
+  // which depth-stencil format the renderer allocates from `gl.mali`, and fed
+  // that inference the masked GL_VENDOR ("WebKit"), so a real Mali-G715 phone
+  // was reported as "depth32f_stencil8 (vendor is not Mali/ARM)". Watch the
+  // renderer's own glRenderbufferStorage calls instead and report each distinct
+  // depth/stencil internal format once. READ-ONLY: the call is forwarded
+  // unchanged. Lives here, not in webgl2-compat.js, because that file is baked
+  // into flycast_worker_emcc.js at link time and the core cannot be relinked on
+  // the box that owns it; this shim ships as-is.
+  // ---------------------------------------------------------------------------
+  try {
+    const P = self.WebGL2RenderingContext && self.WebGL2RenderingContext.prototype;
+    if (P && typeof P.renderbufferStorage === 'function' && !P.__dcDsWatch) {
+      const DS = { 0x88F0: 'DEPTH24_STENCIL8', 0x8CAD: 'DEPTH32F_STENCIL8', 0x84F9: 'DEPTH_STENCIL',
+                   0x81A5: 'DEPTH_COMPONENT16', 0x81A6: 'DEPTH_COMPONENT24', 0x8CAC: 'DEPTH_COMPONENT32F',
+                   0x8D48: 'STENCIL_INDEX8' };
+      const seen = Object.create(null);
+      const note = (fmt, w, h, ms) => {
+        const n = DS[fmt];
+        if (!n || seen[fmt]) return;
+        seen[fmt] = 1;
+        postMessage({ cmd: 'print', txt: '[glinfo] depth-stencil renderbuffer in use: ' + n + ' ' + w + 'x' + h +
+                     (ms ? ' samples=' + ms : '') + ' (observed glRenderbufferStorage, 0x' + fmt.toString(16) + ')' });
+      };
+      const rs = P.renderbufferStorage;
+      P.renderbufferStorage = function (t, fmt, w, h) {
+        try { note(fmt, w, h, 0); } catch (_) {}
+        return rs.call(this, t, fmt, w, h);
+      };
+      if (typeof P.renderbufferStorageMultisample === 'function') {
+        const rsm = P.renderbufferStorageMultisample;
+        P.renderbufferStorageMultisample = function (t, s, fmt, w, h) {
+          try { note(fmt, w, h, s); } catch (_) {}
+          return rsm.call(this, t, s, fmt, w, h);
+        };
+      }
+      P.__dcDsWatch = true;
+    }
+  } catch (_) { /* diagnostics only — never take the boot down */ }
+
+  // ---------------------------------------------------------------------------
   // Reuse SAB primitives from the gamecube tree — they're not gamecube-specific.
   // (importScripts is fine in classic-mode workers; module-mode would need
   // top-level await which the emcc factory output doesn't support today.)
@@ -632,6 +673,144 @@
     return runIterFlagPtr !== 0 && Module.HEAPU8[runIterFlagPtr] !== 0;
   }
 
+  // ---------------------------------------------------------------------------
+  // GUEST-CRASH RECOVERY: REWIND AND RETRY (2026-10-01).
+  //
+  // A real Mali-G715 phone on prod reported "THE EMULATOR STALLED — telemetry
+  // at +80.0s, pc=0x8c10fe72". That lastPc is the SA2 story-select crash
+  // (dreamcast/docs/sa2-story-select-crash/TASKS.md): the guest PC runs away,
+  // SA2's own exception handler falls into REIOS's 0xFF fill, and Do_Exception
+  // throws "Fatal: SH4 exception when blocked" out of retro_run. The pump catch
+  // below then stopped the emulator FOR GOOD — the picture froze and the page
+  // could only call it a stall 12 s later.
+  //
+  // The root fault (why the PC runs away) is in the C++ core and is NOT yet
+  // established; the strongest lead is the SH4 JIT's block chaining — the only
+  // runtime lever known to avoid it is ?nochain=1 (11/11 crash with it on, 0/2
+  // with it off; TASKS.md section 6, which calls it a lead, not a proven cause).
+  // The core cannot be rebuilt on the box that owns it. So the shim does what
+  // it can do from JS, and does it only in single-player:
+  //
+  //   * every RECOVER_EVERY_MS, at a clean asyncify boundary, serialize the
+  //     machine into ONE retained heap buffer (the previous one is freed only
+  //     after the new one exists — no copy into JS, no postMessage);
+  //   * when run_iter THROWS, restore that buffer (which also flushes the JIT —
+  //     emscripten_load_state calls flycast_lockstep_reset), turn block
+  //     chaining OFF for RECOVER_NOCHAIN_MS so the replay takes the path that
+  //     does not crash, then turn it back on;
+  //   * at most RECOVER_MAX rewinds per RECOVER_WINDOW_MS; past that the old
+  //     behaviour (pump stopped, report it) stands, so a truly dead guest is
+  //     never hidden behind an endless rewind loop.
+  //
+  // Never under lockstep: rewinding one console of a room forks it from every
+  // other console. ?norecover (page) turns it off for A/B.
+  //
+  // ⚠ GATE #9: the chain-off window runs the guest SLOWER than hardware (0.73x
+  // measured on desktop), never faster. The governor rebases on the restore,
+  // so there is no catch-up sprint either.
+  // ---------------------------------------------------------------------------
+  const RECOVER_EVERY_MS   = 10000;
+  const RECOVER_NOCHAIN_MS = 60000;
+  const RECOVER_MAX        = 3;
+  const RECOVER_WINDOW_MS  = 600000;
+  let recoverOn = true;
+  let recoverPtr = 0, recoverLen = 0, recoverAt = 0;
+  let recoverChainOffUntil = 0;
+  let recoverChainWanted = true;    // what the page last asked for via 'setchain'
+  let recoverKeepChain = false;     // ?recoverchain=1: rewind WITHOUT turning chaining off (A/B)
+  let recoverTimes = [];
+  let recoverSnaps = 0, recoverSnapMs = 0, recoverSnapMaxMs = 0;
+  function recoverDrop() {
+    try { if (recoverPtr && self.Module) self.Module._free(recoverPtr); } catch (_) {}
+    recoverPtr = 0; recoverLen = 0; recoverAt = 0;
+  }
+  function recoverSnapshot(Module, now) {
+    if (!recoverOn || lockstep || uncap) return;
+    // ADAPTIVE INTERVAL: keep the snapshot's share of wall time at or under
+    // ~0.25% (mean cost x 400), never more often than RECOVER_EVERY_MS and never
+    // less often than 30 s. Measured 18.9-28.3 ms per ~28-61 MB snapshot on a
+    // loaded desktop (load 17), i.e. the 10 s floor; a phone that pays 4x that
+    // backs off to 30 s instead of spending 1% of its frame budget on insurance.
+    const every = Math.min(30000, Math.max(RECOVER_EVERY_MS, recoverSnaps ? (recoverSnapMs / recoverSnaps) * 400 : 0));
+    if (recoverAt && now - recoverAt < every) return;
+    if (typeof Module._emscripten_save_state !== 'function') return;
+    recoverAt = now;   // even on failure: never retry every frame
+    const t0 = performance.now();
+    let pp = 0, ps = 0;
+    try {
+      pp = Module._malloc(4); ps = Module._malloc(4);
+      if (!pp || !ps) return;
+      if (!Module._emscripten_save_state(pp, ps)) return;
+      const buf = Module.HEAPU32[pp >>> 2] >>> 0, len = Module.HEAPU32[ps >>> 2] >>> 0;
+      if (!buf || !len) return;
+      if (recoverPtr) Module._free(recoverPtr);
+      recoverPtr = buf; recoverLen = len;
+    } catch (err) {
+      postMessage({ cmd: 'print', txt: '[recover] snapshot threw: ' + describeThrow(Module, err) + ' — recovery disabled' });
+      recoverOn = false; recoverDrop();
+      return;
+    } finally {
+      try { if (pp) Module._free(pp); if (ps) Module._free(ps); } catch (_) {}
+    }
+    const ms = performance.now() - t0;
+    recoverSnaps++; recoverSnapMs += ms; if (ms > recoverSnapMaxMs) recoverSnapMaxMs = ms;
+    // Reported, never assumed: the first three, then every 30th.
+    if (recoverSnaps <= 3 || recoverSnaps % 30 === 0)
+      postMessage({ cmd: 'print', txt: '[recover] snapshot #' + recoverSnaps + ' ' + recoverLen + ' B in ' +
+        ms.toFixed(1) + ' ms (mean ' + (recoverSnapMs / recoverSnaps).toFixed(1) + ', max ' +
+        recoverSnapMaxMs.toFixed(1) + ' ms; next in ' +
+        (Math.min(30000, Math.max(RECOVER_EVERY_MS, (recoverSnapMs / recoverSnaps) * 400)) / 1000).toFixed(0) + ' s)' });
+  }
+  // Called from the pump's catch with the pump already stopped. Returns true
+  // if the machine was rewound and the pump restarted.
+  function recoverFromThrow(Module, err, why) {
+    if (!recoverOn || lockstep || !recoverPtr) return false;
+    const now = performance.now();
+    recoverTimes = recoverTimes.filter((t) => now - t < RECOVER_WINDOW_MS);
+    if (recoverTimes.length >= RECOVER_MAX) {
+      postMessage({ cmd: 'print', txt: '[recover] NOT rewinding: ' + recoverTimes.length + ' rewinds in the last ' +
+        (RECOVER_WINDOW_MS / 60000) + ' min already — the guest keeps dying, so it is reported instead' });
+      return false;
+    }
+    // The throw unwound straight out of emscripten_run_iter, past the line
+    // that clears the in-flight flag. Left set, runIterSuspended() would read
+    // it as an asyncify suspension forever and the pump would spin on nothing.
+    try { if (runIterFlagPtr) Module.HEAPU8[runIterFlagPtr] = 0; } catch (_) {}
+    let ok = 0;
+    try { ok = Module._emscripten_load_state(recoverPtr, recoverLen) | 0; }
+    catch (e2) {
+      postMessage({ cmd: 'print', txt: '[recover] restore threw: ' + describeThrow(Module, e2) });
+      return false;
+    }
+    if (!ok) { postMessage({ cmd: 'print', txt: '[recover] restore returned 0' }); return false; }
+    recoverTimes.push(now);
+    const ageS = ((now - recoverAt) / 1000).toFixed(1);
+    if (!recoverKeepChain && typeof Module._flycast_set_chain === 'function') {
+      try { Module._flycast_set_chain(0); recoverChainOffUntil = now + RECOVER_NOCHAIN_MS; } catch (_) {}
+    }
+    // The snapshot just restored is the newest good point; keep it (a second
+    // throw inside the window rewinds to the same place) and do not overwrite
+    // it until the chain-off window has carried the guest past the fault.
+    recoverAt = now + RECOVER_NOCHAIN_MS;
+    postMessage({ cmd: 'print', txt: '[recover] REWOUND ' + ageS + ' s to the last snapshot after: ' + why +
+      (recoverChainOffUntil > now ? ' — block chaining OFF for ' + (RECOVER_NOCHAIN_MS / 1000) + ' s (guest may run below 1.000x)' : '') +
+      ' [rewind ' + recoverTimes.length + '/' + RECOVER_MAX + ']' });
+    postMessage({ cmd: 'guestRecovered', ageS: +ageS, n: recoverTimes.length, why: String(why).slice(0, 300),
+                  nochainMs: recoverChainOffUntil > now ? RECOVER_NOCHAIN_MS : 0 });
+    resetPace();
+    setFreerun(true);
+    return true;
+  }
+  function recoverTick(Module, now) {
+    if (recoverChainOffUntil && now >= recoverChainOffUntil) {
+      recoverChainOffUntil = 0;
+      try { if (Module._flycast_set_chain) Module._flycast_set_chain(recoverChainWanted ? 1 : 0); } catch (_) {}
+      postMessage({ cmd: 'print', txt: '[recover] block chaining restored to ' + (recoverChainWanted ? 'ON' : 'OFF (page asked)') });
+      recoverAt = 0;   // snapshot again from here
+    }
+    recoverSnapshot(Module, now);
+  }
+
   function pumpTick() {
     pumpQueued = false;
     if (!freerun) return;
@@ -646,6 +825,7 @@
     // corrupts the frame, so the next run_iter unwinds and the pump freezes — which
     // is what made Save State "break". Do the deferred save here instead.
     if (pendingSave) { pendingSave = false; doSaveState(); }
+    recoverTick(Module, performance.now());
     // ---- LOCKSTEP GATE ------------------------------------------------------
     // We are at a clean asyncify boundary here, which is the only place the
     // fingerprint of the frame we just finished can be read honestly.
@@ -732,9 +912,16 @@
       var pcTxt = '';
       try { if (Module._flycast_get_sh4_pc) pcTxt = ' sh4_pc=0x' + (Module._flycast_get_sh4_pc() >>> 0).toString(16); } catch (_) {}
       var stk = (err && err.stack) ? (' stack=' + String(err.stack).split('\n').slice(0, 4).join(' | ')) : '';
-      postMessage({ cmd: 'print', txt: '[flycast-shim] freerun run_iter threw (pump stopped): ' +
-        describeThrow(Module, err) + pcTxt + sh4StateLine(Module) + stk });
+      var desc = describeThrow(Module, err) + pcTxt + sh4StateLine(Module);
+      // Same evidence either way; the WORDS differ, because the page keys its
+      // verdict on them ('pump stopped' = the game is dead).
+      var canRecover = recoverOn && !lockstep && !!recoverPtr;
+      postMessage({ cmd: 'print', txt: '[flycast-shim] freerun run_iter threw (' +
+        (canRecover ? 'recovering' : 'pump stopped') + '): ' + desc + stk });
       dumpCrashContext(Module);
+      if (canRecover && recoverFromThrow(Module, err, desc)) return;
+      if (canRecover) postMessage({ cmd: 'print', txt: '[flycast-shim] freerun run_iter threw (pump stopped): ' +
+        'recovery failed after: ' + desc });
       return;
     }
     // Wall time actually spent emulating. Taken once, and reused as the
@@ -861,6 +1048,7 @@
         const on = !!data.on;
         if (on === lockstep) { postMessage({ cmd: 'lsState', on: lockstep ? 1 : 0, f: lsFrame }); break; }
         lockstep = on;
+        if (on) recoverDrop();   // a room never rewinds one console (see recoverFromThrow)
         lsQueue.clear();
         lsFrame = data.frame | 0;
         lsPendingHash = -1;
@@ -1408,6 +1596,7 @@
         try {
           resetPace();
           Module._emscripten_reset();
+          recoverAt = 0;   // never rewind a reset back to before it
           postMessage({ cmd: 'print', txt: '[flycast-shim] reset done' });
         } catch (err) {
           postMessage({ cmd: 'print', txt: '[flycast-shim] reset threw: ' + (err && err.message ? err.message : String(err)) });
@@ -1520,6 +1709,9 @@
           // A preceding Save typically stopped the pump (asyncify unwind). Resume
           // it from the restored state so Load actually continues the game.
           if (ok && !freerun) { freerun = true; pumpKick(0); }
+          // The retained crash snapshot belongs to the timeline just replaced;
+          // take a fresh one at the next clean boundary.
+          if (ok) recoverAt = 0;
           // A lockstep session restarts its frame numbering at the state it was
           // handed; anything still queued belongs to the machine we just threw
           // away. `frame` is optional so single-player Load State is unchanged.
@@ -1535,9 +1727,23 @@
         break;
       }
 
+      // Crash recovery (see recoverFromThrow). {on:0} frees the snapshot.
+      case 'recover': {
+        recoverOn = !!data.on;
+        if (data.keepChain !== undefined) recoverKeepChain = !!data.keepChain;
+        if (!recoverOn) recoverDrop();
+        postMessage({ cmd: 'print', txt: '[recover] ' + (recoverOn ? 'ON' : 'OFF') +
+          (recoverOn ? ' (snapshot every ' + (RECOVER_EVERY_MS / 1000) + ' s; on a guest crash rewind' +
+            (recoverKeepChain ? ', chaining LEFT ON' : ' and run ' + (RECOVER_NOCHAIN_MS / 1000) + ' s with chaining off') + ')' : '') });
+        break;
+      }
+
       case 'setchain': {
         try {
-          if (Module._flycast_set_chain) Module._flycast_set_chain((data.on | 0));
+          recoverChainWanted = !!(data.on | 0);
+          // A recovery chain-off window outranks a page request until it ends;
+          // recoverTick applies the page's wish then.
+          if (Module._flycast_set_chain && !recoverChainOffUntil) Module._flycast_set_chain((data.on | 0));
           postMessage({ cmd: 'print', txt: '[setchain] g_chain_enabled=' + (data.on | 0) });
         } catch (err) {
           postMessage({ cmd: 'print', txt: '[setchain] threw: ' + (err && err.message ? err.message : String(err)) });
