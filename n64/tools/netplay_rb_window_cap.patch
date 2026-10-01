@@ -1,0 +1,54 @@
+--- a/lib/netplay.js
++++ b/lib/netplay.js
+@@ -1503,6 +1503,11 @@
+       // slowest console can re-simulate, and used by rbCatchUp() to spend at
+       // most half a frame of this console's time on hidden frames. 0 = unknown.
+       this.selfStepMs = +opts.selfStepMs || 0;
++      // The deepest window this console can HOLD (frames its savestate ring
++      // reaches back without thinning), set by the page — and updated by it as
++      // memory is measured. Published in 'lsrb' as `mw`; the HOST never decides
++      // a window deeper than the smallest one in the room. 0 = no limit.
++      this.rbMaxWindow = Math.max(0, opts.rbMaxWindow | 0);
+       // ---- CAPACITY-GATED ROLLBACK (see the block above _capDecide) --------
+       // `rbResume`: this PAGE can run a rollback frame after a stretch of delay
+       // frames — it keeps the start of that first rollback frame itself, because
+@@ -3991,6 +3996,7 @@
+       } else {
+         const rb = { t: 'lsrb', peer: this.peerId, lp: late.p99, lx: late.max, n: late.n,
+                      st: Math.round((+this.selfStepMs || 0) * 10) / 10, ws, f: this.frame, w: this.rollback };
++        if (this.rbMaxWindow > 0) rb.mw = this.rbMaxWindow | 0;
+         // capacity gating: steps per frame (1 + re-simulated) and how late the
+         // room's INPUTS reach this console (frames, p99) — see _capDecide.
+         if (this._capGate) {
+@@ -4035,14 +4041,19 @@
+     }
+     // HOST. The window every console will run, from what they all measured.
+     _rbDecideWindow(now, own) {
+-      let late = own.n ? own.p99 : 0, st = +this.selfStepMs || 0;
++      let late = own.n ? own.p99 : 0, st = +this.selfStepMs || 0, cap = this.rbMaxWindow | 0;
+       for (const [pid, r] of this._rbPeerRb) {
+         if (now - r.at > RB_REPORT_MS * 4) continue;
+         if (this._portsOf(pid).every((p) => this.dropped.has(p))) continue;
+         if (r.n) late = Math.max(late, r.lp);
+         st = Math.max(st, r.st || 0);
++        if (r.mw > 0) cap = cap > 0 ? Math.min(cap, r.mw) : r.mw;
+       }
+-      const target = Lockstep.recommendWindow(late, st, this._frameMs());
++      // THE DEVICE CAP: never a window deeper than the smallest console's ring
++      // can hold. Late inputs beyond it stall (delay-like) instead of failing a
++      // console whose memory cannot reach back that far.
++      let target = Lockstep.recommendWindow(late, st, this._frameMs());
++      if (cap > 0 && target > cap) target = Math.max(RB_WINDOW_MIN, cap);
+       const cur = this._rbPendingW ? this._rbPendingW.w : this.rollback;
+       if (target > cur) {
+         this._rbShrink = 0;
+@@ -5227,7 +5238,8 @@
+         case 'lsrb': {             // host: a console's lateness report — and its heartbeat
+           if (!this.isHost || !m.peer || m.peer === this.peerId) return true;
+           this._rbPeerRb.set(m.peer, { lp: Math.max(0, +m.lp || 0), lx: Math.max(0, +m.lx || 0), n: m.n | 0,
+-                                       st: Math.max(0, +m.st || 0), ws: m.ws | 0, w: m.w | 0, f: m.f | 0, at: this._now() });
++                                       st: Math.max(0, +m.st || 0), ws: m.ws | 0, w: m.w | 0, f: m.f | 0, at: this._now(),
++                                       mw: Math.max(0, m.mw | 0) });
+           if (this._capGate && this.rollback) {
+             const rs = Math.max(1, +m.rs || 1);
+             const dp = Math.max(0, m.dp | 0);
