@@ -428,12 +428,109 @@
   window.my_SDL_UnlockSurface = function (surf) { var s = Module.SDL.surfaces[surf]; if (!s.locked || --s.locked > 0) return; var src = s.buffer >> 2; if (!img_data32) img_data32 = new Uint32Array(s.image.data.buffer); img_data32.set(Module.HEAP32.subarray(src, src + img_data32.length)); s.ctx.putImageData(s.image, 0, 0); };
   var padStatus1, padStatus2, vram_ptr; window.cout_print = t => pageLog(String(t)); var pcsx_worker = null; var SoundFeedStreamData; var states_arrs = []; var audioMuted = false; var audioDraining = false; var pendingSaveResolve = null; var pendingLoadResolve = null;
   function getAudioCtx() { try { return (Module && Module.preCreatedAudioContext) || (Module && Module.SDL && Module.SDL.audioContext) || null; } catch (e) { return null; } }
-  function resumeAudio() { if (audioMuted) return; var ctx = getAudioCtx(); if (ctx && ctx.state === 'suspended') { ctx.resume().catch(() => {}); } }
-  // Uniform audio telemetry (lib/audiodiag.js). PS1's sink is stock emscripten
-  // SDL1 — a main-thread setTimeout chain we do not own — so the fields this
-  // page can honestly fill are the PRODUCER counters and the context lifecycle.
-  // The sink-side fields stay null, which reports as "not observed" rather than
-  // as zero underruns; a rig reads the real output with tools/audio_tap.js.
+  function resumeAudio() { if (audioMuted) return; var ctx = getAudioCtx(); if (ctx && ctx.state === 'suspended') { ctx.resume().catch(() => {}); } if (AS.ctx && AS.ctx !== ctx && AS.ctx.state === 'suspended') { AS.ctx.resume().catch(() => {}); } }
+
+  // ═══ THE AUDIO SINK: the worker writes a SharedArrayBuffer ring, an
+  // AudioWorklet plays it. NO MAIN-THREAD HOP. ═══════════════════════════════
+  // The stock sink is emscripten SDL1: every batch the SPU mixes is posted to
+  // THIS thread ('SoundFeedStreamData'), copied into a C ring, and played by a
+  // setTimeout chain that schedules 512-sample AudioBufferSourceNodes ~108 ms
+  // ahead. Any main-thread task longer than that (a GC, a busy rAF, the room's
+  // network handling) is an audible hole, and so is a producer that runs even
+  // slightly slower than the sink: in a room the SPU is credited exactly one
+  // frame of 44.1 kHz per gated step, so a room at 0.9966x underfeeds a sink
+  // draining at 1.000x and the ring sits near empty, where every jitter is a
+  // hole. Measured with tools/netplay_device_matrix.mjs (MR2, desktop pair):
+  // 7.9-30.5 dropouts/min in rooms, 8.94/min solo.
+  // Now: the worker's SendSound writes straight into a SAB ring
+  // (wasmpsx_worker.js arWrite) and the worklet below reads it on the audio
+  // thread. It keeps a TARGET FILL (AS_TARGET_MS) instead of running on empty:
+  //   * it starts, and restarts after an underrun, only once the ring holds
+  //     3/4 of the target — one short hole instead of a stutter of tiny ones;
+  //   * IN A ROOM (the worker sets hdr[5] while gated) it trims its read rate
+  //     by at most ±0.5% (PI on the smoothed fill) so a producer that is a
+  //     fraction of a percent off the sink's clock neither drains nor floods
+  //     the ring. This is the PLAYBACK clock only; the guest's rate is
+  //     untouched (gate 9);
+  //   * SOLO the worker tops the ring up to the target every frame
+  //     (arSoloCredit: the SPU's buffered-bytes counter is set from the ring's
+  //     fill), so production follows consumption and the read rate stays 1:1.
+  // ?audiosink=sdl keeps the old sink for an A/B. Anything missing (no SAB, no
+  // AudioWorklet, addModule refused) falls back to it, and the log says why.
+  var AS = { on: false, why: 'not started', sab: null, hdr: null, cap: 16384, node: null, ctx: null, stats: null, prodBase: 0, msgs: 0 };
+  var AS_HDR_BYTES = 64, AS_TARGET_MS = 100;
+  var PS1_SINK_SRC = [
+    'class P extends AudioWorkletProcessor{',
+    'constructor(o){super();const t=o.processorOptions;this.h=new Int32Array(t.sab,0,16);this.d=new Int16Array(t.sab,t.hdrBytes,t.cap*2);this.m=t.cap-1;',
+    'this.base=(t.srcRate||44100)/sampleRate;this.f=0;this.pL=0;this.pR=0;this.cL=0;this.cR=0;this.play=false;this.primed=false;this.muted=false;',
+    'this.avg=-1;this.i=0;this.ratio=this.base;this.ur=0;this.urF=0;this.cons=0;this.skip=0;this.n=0;this.port.onmessage=(e)=>{if(e.data&&e.data.mute!=null)this.muted=!!e.data.mute;};}',
+    'process(_,outs){const o=outs[0],L=o[0],R=o[1]||L,N=L.length,h=this.h,d=this.d,m=this.m,k=1/32768;',
+    'const w=Atomics.load(h,0),r0=Atomics.load(h,1);let r=r0,av=(w-r)|0;const room=h[5]===1,T=room?h[6]:h[7];',
+    'if(av>3*T+N){r=(w-T)|0;av=T;this.skip++;this.primed=false;}',
+    'this.avg=this.avg<0?av:this.avg+(av-this.avg)*(N/(0.5*sampleRate));',
+    'if(room&&T>0){const e=(this.avg-T)/T,dt=N/sampleRate;this.i+=e*0.002*dt;if(this.i>0.004)this.i=0.004;if(this.i<-0.004)this.i=-0.004;',
+    'let a=e*0.003+this.i;if(a>0.005)a=0.005;if(a<-0.005)a=-0.005;this.ratio=this.base*(1+a);}else{this.ratio=this.base;this.i=0;}',
+    'if(!this.play&&av>=((T*3)>>2)&&av>=2)this.play=true;let f=0,used=0;',
+    'if(this.play){if(!this.primed){if(av-used<2){this.play=false;}else{let s=(r&m)*2;this.pL=d[s]*k;this.pR=d[s+1]*k;s=((r+1)&m)*2;this.cL=d[s]*k;this.cR=d[s+1]*k;used=2;this.f=0;this.primed=true;}}',
+    'while(f<N&&this.play){const t2=this.f;L[f]=this.pL+(this.cL-this.pL)*t2;R[f]=this.pR+(this.cR-this.pR)*t2;f++;this.f+=this.ratio;',
+    'while(this.f>=1){if(used>=av){this.play=false;this.primed=false;this.ur++;break;}this.pL=this.cL;this.pR=this.cR;const s=((r+used)&m)*2;this.cL=d[s]*k;this.cR=d[s+1]*k;used++;this.f-=1;}}}',
+    'if(f<N)this.urF+=N-f;for(;f<N;f++){L[f]=0;R[f]=0;}if(this.muted){L.fill(0);if(R!==L)R.fill(0);}',
+    'if(used||r!==r0)Atomics.store(h,1,(r+used)|0);this.cons+=used;h[8]=this.ur;h[9]=(h[9]+used)|0;',
+    'if(++this.n>=172){this.n=0;this.port.postMessage({fill:av,target:T,room:room,ratio:this.ratio,underruns:this.ur,underrunFrames:this.urF,consumedFrames:this.cons,skips:this.skip,playing:this.play});}',
+    'return true;}}registerProcessor("ps1-sink",P);'
+  ].join('\n');
+  function audioSinkStart() {
+    var no = /[?&]audiosink=sdl/.test(location.search) ? '?audiosink=sdl' : (typeof SharedArrayBuffer === 'undefined' ? 'no SharedArrayBuffer'
+      : (typeof AudioWorkletNode === 'undefined' ? 'no AudioWorklet' : null));
+    var ctx = null;
+    try { ctx = (Module.SDL && Module.SDL.audioContext) || getAudioCtx(); } catch (e) {}
+    if (!no && !(ctx && ctx.audioWorklet)) no = 'no AudioContext with an audioWorklet';
+    if (!no) { try { AS.sab = new SharedArrayBuffer(AS_HDR_BYTES + AS.cap * 4); } catch (e) { no = 'SharedArrayBuffer alloc: ' + e; } }
+    if (no) { AS.why = no; pageLog('[audio] SDL sink (the old main-thread path) — ' + no); return; }
+    AS.hdr = new Int32Array(AS.sab, 0, 16);
+    var tf = Math.round(44100 * AS_TARGET_MS / 1000);
+    AS.hdr[6] = tf; AS.hdr[7] = tf;
+    var url = URL.createObjectURL(new Blob([PS1_SINK_SRC], { type: 'application/javascript' }));
+    ctx.audioWorklet.addModule(url).then(function () {
+      var node = new AudioWorkletNode(ctx, 'ps1-sink', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
+        processorOptions: { sab: AS.sab, hdrBytes: AS_HDR_BYTES, cap: AS.cap, srcRate: 44100 } });
+      node.port.onmessage = function (e) { AS.stats = e.data; AS.msgs++; };
+      node.connect(ctx.destination);
+      AS.node = node; AS.ctx = ctx;
+      if (audioMuted) node.port.postMessage({ mute: true });
+      pcsx_worker.postMessage({ cmd: 'netAudioSab', sab: AS.sab, hdrBytes: AS_HDR_BYTES, cap: AS.cap });
+    }).catch(function (e) { AS.why = 'addModule: ' + ((e && e.message) || e); pageLog('[audio] SDL sink (the old main-thread path) — ' + AS.why); });
+  }
+  // The worker took the ring: stop the SDL pump (its setTimeout chain and its
+  // AudioBufferSourceNodes) and make AudioDiag read the ring's counters.
+  function audioSinkOn() {
+    AS.on = true; AS.why = 'ok';
+    try { if (typeof _SDL_PauseAudio === 'function') _SDL_PauseAudio(1); } catch (e) {}
+    var ad = window.__audioDiag;
+    if (ad) {
+      var produced = function () { return (Atomics.load(AS.hdr, 2) >>> 0) + AS.prodBase; };
+      try {
+        AS.prodBase = ad.framesProduced | 0;
+        Object.defineProperty(ad, 'framesProduced', { configurable: true, enumerable: true, get: produced, set: function (v) { AS.prodBase += v - produced(); } });
+        Object.defineProperty(ad, 'lastFeedMs', { configurable: true, enumerable: true, get: function () { return performance.now(); }, set: function () {} });
+        ad.capacity = AS.cap;
+        if (window.AudioDiag && window.AudioDiag.observeSink) window.AudioDiag.observeSink(AS.node, function (s) { return { fill: s.fill, capacity: AS.cap, underrunFrames: s.underrunFrames, consumedFrames: s.consumedFrames, resampling: true }; });
+      } catch (e) {}
+    }
+    try { if (AS.ctx && window.AudioDiag && !window.__audioDiagBound) { window.__audioDiagBound = true; window.AudioDiag.observeContext(AS.ctx); } } catch (e) {}
+    pageLog('[audio] SAB ring -> AudioWorklet sink ON (' + AS.cap + ' frames, target ' + AS_TARGET_MS + ' ms, ctx ' + (AS.ctx ? AS.ctx.sampleRate : '?') + ' Hz) — the main thread is off the audio path');
+  }
+  window.__ps1AudioSink = function () {
+    return { on: AS.on, why: AS.why, stats: AS.stats, msgs: AS.msgs,
+      produced: AS.hdr ? Atomics.load(AS.hdr, 2) >>> 0 : null, dropped: AS.hdr ? AS.hdr[3] : null,
+      fill: AS.hdr ? ((AS.hdr[0] - AS.hdr[1]) | 0) : null, underruns: AS.hdr ? AS.hdr[8] : null, ctxState: AS.ctx ? AS.ctx.state : null };
+  };
+  // Uniform audio telemetry (lib/audiodiag.js). With the SAB/AudioWorklet sink
+  // (THE AUDIO SINK, below) the producer counter reads the ring and the sink
+  // fields come from the worklet's own reports (audioSinkOn). On the fallback
+  // SDL1 sink — a main-thread setTimeout chain we do not own — only the
+  // PRODUCER counters and the context lifecycle are filled; the sink fields stay
+  // null ("not observed"), and a rig reads the real output with tools/audio_tap.js.
   if (window.AudioDiag) { window.AudioDiag.install('ps1'); }
   function bindAudioDiagCtx() { try { var c = getAudioCtx(); if (c && window.AudioDiag && !window.__audioDiagBound) { window.__audioDiagBound = true; window.AudioDiag.observeContext(c); } } catch (e) {} }
   document.addEventListener('click', resumeAudio); document.addEventListener('keydown', resumeAudio); document.addEventListener('visibilitychange', resumeAudio);
@@ -460,7 +557,7 @@
   var workerReady = false; var workerReadyResolve = null;
   var workerReadyPromise = new Promise(function (res) { workerReadyResolve = res; });
   function _onWorkerReady() { if (workerReady) return; workerReady = true; pageLog('[ui] worker runtime ready'); if (workerReadyResolve) workerReadyResolve(); }
-  window.var_setup = function () { pageLog('[ui] var_setup — spawning worker'); SoundFeedStreamData = Module.cwrap('SoundFeedStreamData', 'null', ['number', 'number']); vram_ptr = Module._get_ptr(0); padStatus1 = Module._get_ptr(1); padStatus2 = Module._get_ptr(2); Module.SDL.defaults.copyOnLock = false; Module.SDL.defaults.opaqueFrontBuffer = false; pcsx_worker = new Worker('/ps1/ps1Wasm/dist/wasmpsx_worker.js?v=' + Date.now() + (NET.session ? '&netgate=1' : '') + (/[?&]nethash=full/.test(location.search) ? '&nethash=full' : '')); if (NET.session) { lsArmBeforeBoot(); pageLog('[lockstep] worker spawned GATED (?netgate=1) — the core will not run a frame this page did not ask for'); } pcsx_worker.onmessage = onWorkerMsg; window.pcsx_worker = pcsx_worker; if (tryAllocVramSab()) { pcsx_worker.postMessage({ cmd: 'vramSab', sab: vramSAB }); pageLog('[vram-sab] installed (' + (VRAM_SAB_PAYLOAD_BYTES/1048576) + ' MiB)'); } setStatus('Runtime ready. Fetching ROM...'); fetchRomAndBoot(); };
+  window.var_setup = function () { pageLog('[ui] var_setup — spawning worker'); SoundFeedStreamData = Module.cwrap('SoundFeedStreamData', 'null', ['number', 'number']); vram_ptr = Module._get_ptr(0); padStatus1 = Module._get_ptr(1); padStatus2 = Module._get_ptr(2); Module.SDL.defaults.copyOnLock = false; Module.SDL.defaults.opaqueFrontBuffer = false; pcsx_worker = new Worker('/ps1/ps1Wasm/dist/wasmpsx_worker.js?v=' + Date.now() + (NET.session ? '&netgate=1' : '') + (/[?&]nethash=full/.test(location.search) ? '&nethash=full' : '')); if (NET.session) { lsArmBeforeBoot(); pageLog('[lockstep] worker spawned GATED (?netgate=1) — the core will not run a frame this page did not ask for'); } pcsx_worker.onmessage = onWorkerMsg; window.pcsx_worker = pcsx_worker; if (tryAllocVramSab()) { pcsx_worker.postMessage({ cmd: 'vramSab', sab: vramSAB }); pageLog('[vram-sab] installed (' + (VRAM_SAB_PAYLOAD_BYTES/1048576) + ' MiB)'); } try { audioSinkStart(); } catch (e) { pageLog('[audio] sink start threw: ' + e); } setStatus('Runtime ready. Fetching ROM...'); fetchRomAndBoot(); };
 
   var mobilePadState = { cross: false, circle: false, square: false, triangle: false, l1: false, r1: false, l2: false, r2: false, start: false, select: false, up: false, down: false, left: false, right: false };
 
@@ -782,12 +879,25 @@
       case 'coreRate': {
         // The disc's frame rate, from the core's own region detection.
         CORE_RATE = data;
-        if (data.take && data.hz > 0) { PS1_HW_HZ = data.hz; FRAME_MS = 1000 / PS1_HW_HZ; }
+        if (data.take && data.hz > 0 && data.hz !== PS1_HW_HZ) {
+          // The timeline keeps its place: frames due so far at the old period,
+          // the new period from now — no debt is dropped or invented.
+          if (LS.tlOn) { var tnow = performance.now(); LS.tlF0 = LS.tlF0 + (tnow - LS.tlT0) / FRAME_MS; LS.tlT0 = tnow; }
+          PS1_HW_HZ = data.hz; FRAME_MS = 1000 / PS1_HW_HZ;
+          // The GPU switched video mode (wasmpsx_worker.js "THE VBLANK RATE
+          // FOLLOWS THE GPU"): every peer's core switches at the same guest frame;
+          // the room clock and this page's timeline follow it from here.
+          var lsv = lsEngine();
+          if (lsv) lsv.frameHz = PS1_HW_HZ;
+          if (data.by) pageLog('[core] frame rate -> ' + PS1_HW_HZ + ' Hz (' + data.by + ')');
+        }
         break;
       }
       case 'netRbReady': if (data.ok) LS.rbBytes = data.bytes; pageLog('[rollback] savestate ring ' + (data.ok ? 'ready: ' + data.ring + ' slots of ' + ((data.bytes / 1048576).toFixed(2)) + ' MB, from frame ' + data.frame : 'FAILED: ' + data.err)); if (!data.ok) { LS.fault = 'rollback ring: ' + data.err; try { var lsx = lsEngine(); if (lsx) lsx.fail(LS.fault); } catch (e) {} } break;
       case 'netRbStatsResult': window.__ps1RbWorker = data; break;
-      case 'netPeekResult': case 'netSchedStatsResult': case 'netLiveHashResult': case 'netSnapBenchResult': break;
+      case 'netAudioSabOk': audioSinkOn(); break;
+      case 'netPeekResult': window.__ps1Peek = data; break;
+      case 'netSchedStatsResult': case 'netLiveHashResult': case 'netSnapBenchResult': break;
       case 'netHashResult': lsOnWorkerHash(data); break;
       case 'netUngated': pageLog('[lockstep] core handed back to its own scheduler'); break;
       // AUDIO BATCH FROM THE WORKER.
@@ -1111,7 +1221,7 @@
     });
     inp.click();
   }
-  function toggleMute() { audioMuted = !audioMuted; var ctx = getAudioCtx(); if (ctx) { audioMuted ? ctx.suspend() : ctx.resume(); } $('btnMute').textContent = audioMuted ? '🔇 Unmute' : '🔊 Mute'; $('mMute').textContent = audioMuted ? 'Unmute' : 'Mute'; }
+  function toggleMute() { audioMuted = !audioMuted; var ctx = getAudioCtx(); if (ctx) { audioMuted ? ctx.suspend() : ctx.resume(); } if (AS.node) { AS.node.port.postMessage({ mute: audioMuted }); } $('btnMute').textContent = audioMuted ? '🔇 Unmute' : '🔊 Mute'; $('mMute').textContent = audioMuted ? 'Unmute' : 'Mute'; }
   async function resetAudio() { var ctx = getAudioCtx(); if (!ctx) { toast('Audio not ready', true); return; } if (audioDraining) return; audioDraining = true; toast('Resetting audio…'); try { await ctx.suspend(); } catch (e) {} await new Promise(r => setTimeout(r, 150)); if (window._soundScratchPtr) { try { Module._free(window._soundScratchPtr); } catch (e) {} window._soundScratchPtr = 0; window._soundScratchSize = 0; } if (!audioMuted) { try { await ctx.resume(); } catch (e) {} } audioDraining = false; toast('Audio reset'); }
   function toggleFullscreen() { var el = isMobile ? $('mobileShell') : $('canvasWrap'); if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } else { var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen; if (fn) fn.call(el).catch(() => {}); } }
   $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnExport').addEventListener('click', exportState); $('btnImport').addEventListener('click', importState); $('btnMute').addEventListener('click', toggleMute); $('btnResetAudio').addEventListener('click', resetAudio); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; });
@@ -1291,6 +1401,10 @@
     // ---- rollback (the worker holds the savestate ring) ------------------
     rbInit: false, rbRing: 0, rollbacks: 0, resimFrames: 0, maxDepth: 0, rbHashes: 0,
     rbMissing: 0, stepMsSum: 0, stepMsCount: 0, stepMsMax: 0, hidden: 0, stepMsEwma: 0,
+    // ---- the rollback room's timeline (rbTimelineTick) --------------------
+    tlOn: false, tlT0: 0, tlF0: 0, tlDropped: 0, tlRepaid: 0, tlAhead: 0, tlDebtTicks: 0, tlMutedHidden: 0,
+    // ---- the undo ring's memory budget (rbBudgetBytes) ----------------------
+    rbBudget: 0, rbLogBudget: Infinity, rbLogBytes: 0, rbLogBytesMax: 0, rbHeld: 0, rbMemStalls: 0,
   };
 
   function lsEngine() {
@@ -1414,7 +1528,7 @@
     }
     LS.armed = true; LS.running = false; LS.fault = null;
     LS.workerFrame = 0; LS.fedTo = 0; LS.inFlight = 0; LS.frames = 0; LS.hashes = 0;
-    LS.accum = 0; LS.lastTs = 0; LS.rbInit = false;
+    LS.accum = 0; LS.lastTs = 0; LS.rbInit = false; LS.tlOn = false;
     pageLog('[lockstep] ARMED before the first frame — this core advances only when every seated '
       + 'port has an input for the frame. ports=' + JSON.stringify(ls.roster)
       + ' mine=' + JSON.stringify(ls.localPorts));
@@ -1475,9 +1589,23 @@
   // and the worker's netFrame reply retires them.
   // `hidden`: a catch-up frame the engine granted (ls.rbCatchUp, or every frame
   // while ls.rbRejoining()) — run, never presented, its audio not played.
-  function lsFeedOne(hidden) {
+  function lsFeedOne(hidden, quietAudio) {
     var ls = lsEngine();
     if (!ls) { lsDisarm('the session went away'); return false; }
+    // THE RING'S MEMORY BUDGET IS A WINDOW LIMIT, NOT A FAILURE. The worker
+    // keeps an undo log for every frame a rollback could still reach (back to
+    // the engine's frontier). If those logs are over this device's budget
+    // (rbBudgetBytes), running further ahead of the frontier would need more —
+    // so this console waits here, exactly like a window stall, until inputs
+    // arrive and the frontier (and the worker's logs) move on.
+    if (ls.rollback && LS.rbInit && LS.rbLogBytes > LS.rbLogBudget && (ls.state === 'running' || ls.state === 'stalled')) {
+      LS.rbMemStalls++; LS.stallReason = 'memory budget';
+      // The engine's housekeeping (reports, the host's acks, silent-peer
+      // checks) normally rides beginFrame; a console waiting here still owes
+      // it, exactly as one held by a window stall would.
+      try { if (typeof ls._rbTick === 'function') ls._rbTick(ls._now()); } catch (e) {}
+      return false;
+    }
     if (ls.state !== 'running' && ls.state !== 'stalled') {
       // The BARRIER decides when frame 0 runs, not this page.
       if (LS.running) {
@@ -1512,7 +1640,7 @@
     LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
     // The HOST decided lockstep or rollback ('lsgo' carries it) — never this
     // page's own query string, which only says what THIS console proposes.
-    if (ls.rollback) return rbFeedOne(ls, r, hidden);
+    if (ls.rollback) return rbFeedOne(ls, r, hidden, quietAudio);
 
     var pb = ls.padBytes | 0;
     var states = lsPadBuffer(r.image, pb);
@@ -1520,7 +1648,7 @@
     // directly would land them a different number of frames earlier here than
     // there — a desync by construction, and exactly the shortcut the old relay
     // took.
-    pcsx_worker.postMessage({ cmd: 'netStep', frame: r.frame, count: 1, states: states.buffer }, [states.buffer]);
+    pcsx_worker.postMessage({ cmd: 'netStep', frame: r.frame, count: 1, states: states.buffer, hidden: !!(hidden || r.hidden) }, [states.buffer]);
     LS.pend.push(performance.now());
     LS.inFlight++;
     LS.fedTo = r.frame + 1;
@@ -1579,10 +1707,16 @@
   // file is never read back during the session and the worker mounts no
   // IDBFS, so it cannot fork a room.
   //
-  // MEMORY. The ring is rbRingFrames() slots (window + 4) of 6.86 MB: 12 slots,
-  // ~82 MB, at the starting window of 8; an adaptive room that widens the
-  // window to cover a slow link grows it (measured 24 slots, ~157 MB, at
-  // 100 ms one way + 2% loss).
+  // MEMORY. The ring USED to be rbRingFrames() full copies of 6.86 MB: 12
+  // (~82 MB) at the starting window, 24 (~157 MB) at 100 ms one way + 2% loss
+  // — a phone risk. It is now an UNDO LOG (wasmpsx_worker.js "THE ROLLBACK RING
+  // IS AN UNDO LOG"): one shadow copy of the newest frame start, plus, per
+  // frame, only the 4 KB pages that frame changed. MEASURED
+  // (tools/ps1_rollback_probe.mjs, MR2, ring 12, 225 rollbacks / 718
+  // re-simulated frames, depth <= 7): 8.5 MB in all, ~18 pages (72 KB) per
+  // frame; save 0.52 ms avg (a SIMD page compare, 0.45-0.5 ms, where the old
+  // save was a 0.5 ms memcpy); 59/59 confirmed fingerprints still match the
+  // never-guessing core, and the --broken control mismatched 59/59.
   //
   // ⚠ GATE 9. Re-simulated frames are frames the guest already lived once, on
   // a guess; they are not presented and their audio is not replayed (the
@@ -1592,19 +1726,31 @@
   // THE RING FOLLOWS THE WINDOW. The worker's ring is indexed by the frames IT
   // has run, in message order, so frames this page has in flight need no extra
   // slots: a plan for frame f reaches back at most max(window, peak) + 1, and
-  // rbRingFrames() (= that + 4 margin) already covers it. At the starting
-  // window of 8 that is 12 slots x 6.86 MB = ~82 MB (was 16, ~110 MB). An
-  // adaptive room that widens the window grows it (rbGrow in the worker; slots
-  // move by reference, nothing is copied).
+  // rbRingFrames() (= that + 4 margin) already covers it. An adaptive room
+  // that widens the window grows it (rbGrow in the worker): a longer reach is
+  // only more undo logs, a few pages each — nothing is copied.
   function rbRingFor(ls) {
     return (typeof ls.rbRingFrames === 'function') ? ls.rbRingFrames() : ((ls.rollback | 0) + 4);
   }
-  function rbFeedOne(ls, r, hidden) {
+  // THE DEVICE BUDGET for the undo ring (shadow + logs + page pool). With
+  // full 6.86 MB slots a 34-frame reach was ~240 MB; the undo ring is ~9-12 MB
+  // at a few dozen pages a frame, but a scene that rewrites most of VRAM and
+  // RAM every frame could log ~2-4 MB a frame, so it is bounded all the same:
+  // by navigator.deviceMemory where the browser reports it (Chrome; GB,
+  // rounded down), 48 MB where it does not.
+  function rbBudgetBytes() {
+    var dm = 0; try { dm = +navigator.deviceMemory || 0; } catch (e) {}
+    var mb = !dm ? 48 : dm >= 8 ? 128 : dm >= 4 ? 64 : dm >= 2 ? 32 : 24;
+    return mb * 1048576;
+  }
+  function rbFeedOne(ls, r, hidden, quietAudio) {
     var pb = ls.padBytes | 0;
     var ring = rbRingFor(ls);
     if (!LS.rbInit) {
       // The start of the first frame this core runs, kept before it runs.
-      pcsx_worker.postMessage({ cmd: 'netRbInit', frame: r.rollback ? r.rollback.from : r.frame, ring: ring });
+      LS.rbBudget = rbBudgetBytes();
+      LS.rbLogBudget = LS.rbBudget - 12 * 1048576;   // the shadow (~8 MB) and the page pool (<= 4 MB) come first
+      pcsx_worker.postMessage({ cmd: 'netRbInit', frame: r.rollback ? r.rollback.from : r.frame, ring: ring, budget: LS.rbLogBudget });
       LS.rbInit = true; LS.rbRing = ring;
       ls.frameHz = PS1_HW_HZ;     // the room clock's frame period (lib/netplay.js _frameMs)
     }
@@ -1624,8 +1770,15 @@
     // FINGERPRINTS OF CONFIRMED FRAMES ONLY: the state after k is slot k+1,
     // hashed by the worker when it gets to this step.
     var due = (typeof ls.takeHashDue === 'function') ? ls.takeHashDue() : [];
+    // keepFrom: the earliest frame start a rollback can still name — one past
+    // the engine's frontier (the newest frame every port's input is known
+    // for, lib/netplay.js _rbFront, the same quantity its window is measured
+    // from). The worker never drops an undo log at or after it; older ones go
+    // first when the budget is tight.
+    var keepFrom = -1;
+    try { if (typeof ls._rbFront === 'function') keepFrom = (ls._rbFront() | 0) + 1; } catch (e) {}
     pcsx_worker.postMessage({ cmd: 'netRbStep', frame: r.frame, states: states.buffer, resim: resim,
-                              hidden: !!(hidden || r.hidden), hash: due, ring: ring }, transfer);
+                              hidden: !!(hidden || r.hidden), quietAudio: !!quietAudio, keepFrom: keepFrom, hash: due, ring: ring }, transfer);
     if (hidden || r.hidden) LS.hidden++;
     LS.rbRing = ring;
     LS.pend.push(performance.now());
@@ -1646,6 +1799,9 @@
       try { if (ls && typeof ls.fail === 'function') ls.fail(LS.fault); } catch (e) {}
       return;
     }
+    if (typeof d.bytes === 'number') LS.rbBytes = d.bytes;
+    if (typeof d.logBytes === 'number') { LS.rbLogBytes = d.logBytes; if (d.logBytes > LS.rbLogBytesMax) LS.rbLogBytesMax = d.logBytes; }
+    if (typeof d.held === 'number') LS.rbHeld = d.held;
     if (typeof d.ms === 'number') {
       LS.stepMsSum += d.ms; LS.stepMsCount++;
       if (d.ms > LS.stepMsMax) LS.stepMsMax = d.ms;
@@ -1728,7 +1884,10 @@
     // ⚠ REJOINING IS NOT SHOWN AS A FAST-FORWARD (gate 9). A console that was
     // away is a rejoin-sized gap behind: until it is back, EVERY frame runs
     // hidden, the last picture holds, and the HUD says so.
-    var rejoining = !!(rbRoom && typeof lsE.rbRejoining === 'function' && lsE.rbRejoining());
+    // Asked EVERY tick of a running room, rollback or not: a capacity-gated
+    // room (lib/netplay.js) may be in input-delay mode when a player comes
+    // back, and the engine answers false / 0 wherever it does not apply.
+    var rejoining = !!(LS.running && typeof lsE.rbRejoining === 'function' && lsE.rbRejoining());
     if (rejoining) { NET.notice = 'Rejoining the room — catching up…'; NET.noticeUntil = Date.now() + 400; }
     // Capped at 2: frames queued in the worker ahead of the feed point add ON
     // TOP of the input delay (see dreamcast.html's feed loop), so
@@ -1737,10 +1896,11 @@
     // flight lets a re-simulating step overrun a tick without losing a credit.
     // (Input is still applied to the frame it was sampled for.)
     var lookahead = lsE.rollback ? 2 : Math.max(1, Math.min(2, lsE.delay | 0));
-    if (rbRoom && typeof lsE.rbCatchUp === 'function' && LS.inFlight < lookahead + 2) {
-      var cu = lsE.rbCatchUp();
-      for (var ci = 0; ci < cu && LS.inFlight < lookahead + 2; ci++) if (!lsFeedOne(true)) break;
-    }
+    // A RUNNING ROOM — rollback or the input-delay mode a capacity-gated room
+    // can switch to — paces from the timeline (rbTimelineTick). The
+    // accumulator below only ever runs before the gate engages.
+    if (LS.running) { LS.accum = 0; rbTimelineTick(ts, d, lsE, rejoining, lookahead); return; }
+    LS.tlOn = false;
     var ran = 0, stalled = false;
     while (LS.accum >= FRAME_MS && ran < MAX_CATCHUP_FRAMES) {
       // Getting further ahead of the worker than the input delay is not a frame
@@ -1773,7 +1933,82 @@
     // already repaying the same loss, so it was repaid twice.)
     if (LS.accum > FRAME_MS) LS.accum = FRAME_MS;
   }
+  // ═══ A RUNNING ROOM (ROLLBACK, OR A CAPACITY-GATED ROOM'S INPUT-DELAY MODE)
+  // PACES FROM AN ABSOLUTE TIMELINE, NOT A CLAMPED ACCUMULATOR ═══════════════════════════════════════════════════════════════
+  // THE MEASURED LOSS. A desktop pair (tools/netplay_device_matrix.mjs, MR2,
+  // arm a) delivered 0.9966x with only 2 engine stalls (34 ms) in 60 s. The
+  // accumulator above drops whatever credit is left whenever a tick cannot
+  // feed — a worker reply that comes back late (steps of 5-6 ms, spikes of
+  // 40-50 ms; 24 cap hits) leaves its frames unrun for good, and so does any
+  // tick the window held back. Each loss is a fraction of a frame to a frame
+  // or two; a room's worth of them is the 0.3-0.6% that rooms ran short, and
+  // in a room the sink is credited exactly one frame of audio per frame run,
+  // so every lost frame is also a hole in the sound.
+  // THE TIMELINE. Frame (F0 + n) of this console is due at T0 + n x 16.683 ms.
+  // Each tick feeds the frames that are due — never one that is not, so the
+  // guest is NEVER ahead of its own wall clock (gate 9). A frame that could
+  // not be fed is still due on the next tick, and is repaid then, at most one
+  // extra frame per tick and at most RB_MAX_DEBT frames (67 ms) in all: a
+  // bigger gap (a stalled tab, a peer that went quiet, a frozen box) is DROPPED
+  // as before, because repaying it would be a visible fast-forward. Worst case
+  // the repay lands in the next 5-s window: 1 + 4/300 = 1.013x, under the
+  // matrix's 1.02x fast-forward bar, and the long-run rate is 1.000x.
+  // HIDDEN FRAMES COUNT AGAINST THE SAME TIMELINE. The debt is measured on the
+  // ENGINE's frame counter, which the room clock's hidden catch-up frames
+  // advance too, so a loss repaid by rbCatchUp is not repaid a second time (the
+  // reverted bank above was repaid twice). If catch-up frames put this console
+  // AHEAD of its own timeline, the timeline moves up to meet it (whole frames,
+  // phase kept) instead of holding the console back to "pay" for them.
+  // ⚠ AND A HIDDEN FRAME'S AUDIO PLAYS ONLY IF IT IS THIS CONSOLE'S OWN TIME.
+  // The room clock's hidden catch-up frames (rbCatchUp) do two different
+  // jobs. Repaying THIS console's lost frames (it stalled; its sink went that
+  // much short), their audio is guest time nobody has heard: it plays, and the
+  // sound stays at 1.000x. Moving a console that STARTED LATE up to the room,
+  // they run frames beyond its own wall clock: their audio would be extra
+  // sound on top of 1.000x, piling into the sink as latency (658761c played
+  // it unconditionally). So a hidden frame plays its audio iff it is within
+  // this console's timeline (frame < target); beyond it, it is muted, and
+  // the sink receives exactly one frame of sound per frame of wall clock.
+  var RB_MAX_DEBT = 4;
+  function rbTimelineTick(ts, d, lsE, rejoining, lookahead) {
+    var f = lsE.frame | 0;
+    if (!LS.tlOn) { LS.tlOn = true; LS.tlT0 = ts; LS.tlF0 = f; return; }
+    var target = Math.floor(LS.tlF0 + (ts - LS.tlT0) / FRAME_MS);
+    if (lsE.rollback) {
+      if (typeof lsE.rbCatchUp === 'function' && LS.inFlight < lookahead + 2) {
+        var cu = lsE.rbCatchUp();
+        for (var ci = 0; ci < cu && LS.inFlight < lookahead + 2; ci++) {
+          var mute = (lsE.frame | 0) >= target;
+          if (!lsFeedOne(true, mute)) break;
+          if (mute) LS.tlMutedHidden++;
+        }
+      }
+    } else if (typeof lsE.rbCatchUp === 'function') {
+      // DELAY MODE of a capacity-gated room (lib/netplay.js): the engine's
+      // catch-up for a returning player. Called exactly ONCE per tick — the
+      // engine uses the call as its tick mark for its one-frame-per-tick
+      // cadence rule. These hidden frames go through netStep, never presented
+      // and never heard.
+      var cu0 = lsE.rbCatchUp();
+      for (var c0 = 0; c0 < cu0 && LS.inFlight < lookahead + 2; c0++) { if (!lsFeedOne(true, true)) break; LS.tlMutedHidden++; }
+    }
+    f = lsE.frame | 0;
+    var due = target - f;
+    if (due < 0) { LS.tlF0 -= due; LS.tlAhead -= due; due = 0; }
+    if (due > 1 + RB_MAX_DEBT) { LS.tlDropped += due - 1 - RB_MAX_DEBT; LS.tlF0 -= due - 1 - RB_MAX_DEBT; due = 1 + RB_MAX_DEBT; }
+    // One frame per elapsed frame period, plus one frame of repayment.
+    var cap = Math.max(2, Math.ceil(d / FRAME_MS) + 1), ran = 0;
+    while (due > 0 && ran < cap) {
+      if (LS.inFlight >= lookahead) { LS.capHits++; break; }
+      if (!lsFeedOne(rejoining)) { LS.gateStalls++; break; }
+      due--; ran++;
+    }
+    if (ran > Math.ceil(d / FRAME_MS)) LS.tlRepaid += ran - Math.ceil(d / FRAME_MS);
+    if (due > 0) LS.tlDebtTicks++;
+  }
   (function lsRaf(ts) { requestAnimationFrame(lsRaf); lsTick(ts || 0); })(0);
+  // The worker's own rollback numbers (ring bytes, step-phase maxima), for the seam.
+  setInterval(function () { if (LS.armed && LS.rbInit && pcsx_worker) { try { pcsx_worker.postMessage({ cmd: 'netRbStats' }); } catch (e) {} } }, 2000);
 
   // ---- the room -------------------------------------------------------------
   function netStatus(msg, cls) {
@@ -1951,7 +2186,7 @@
     }
     if (netCapHeld()) return 'This device cannot run the emulator, so the party cannot start it here.';
     if (NET.notice && Date.now() > (NET.noticeUntil || 0)) NET.notice = null;
-    if (netPartyState() === 'playing') return NET.notice ? NET.notice : 'Playing — everyone started together at frame ' + (NET.startedAtFrame | 0) + '.';
+    if (netPartyState() === 'playing') return NET.notice ? NET.notice : NET.modeNote ? NET.modeNote : 'Playing — everyone started together at frame ' + (NET.startedAtFrame | 0) + '.';
     if (netAlone()) return 'Waiting for another player — share the code ' + s.code + '. Starts by itself once two are in and loaded.';
     var who = netPartyRows().filter(function (r) { return r.who && r.state !== 'ready' && r.state !== 'playing'; })
       .map(function (r) { return r.local ? 'this console' : netPortLabel(r.port); });
@@ -1993,7 +2228,7 @@
   }
   function netPartyReset() {
     NET.autoStarted = false; NET.loadPct = 0; NET.bar = null;
-    NET.gameIdx = -1; NET.startedAtFrame = 0; NET.notice = null;
+    NET.gameIdx = -1; NET.startedAtFrame = 0; NET.notice = null; NET.modeNote = null;
     if (NET.tick) { clearInterval(NET.tick); NET.tick = 0; }
     netPartyButtons();
   }
@@ -2085,6 +2320,15 @@
         pageLog('[lockstep] ' + e.rejoin.who + ' is back from frame ' + e.rejoin.at);
       }
       if (e && e.window) pageLog('[rollback] window ' + e.window.from + ' -> ' + e.window.to + ' frames' + (e.window.why ? ' — ' + e.window.why : ''));
+      // CAPACITY-GATED ROLLBACK (lib/netplay.js): the host may switch the room
+      // between zero-lag (rollback) and input delay; say so, as genesis.html does.
+      if (e && e.mode) {
+        var mt = String(e.mode.text || '');
+        mt = mt.charAt(0).toUpperCase() + mt.slice(1) + '.';
+        NET.modeNote = e.mode.to === 'delay' ? mt : null;
+        if (e.mode.to !== 'delay') { NET.notice = mt; NET.noticeUntil = Date.now() + 6000; }
+        pageLog('[lockstep] mode -> ' + e.mode.to + ' at frame ' + e.mode.frame + (e.mode.why ? ' — ' + e.mode.why : ''));
+      }
       netRoomRender();
     });
     session.on('room', function () { netRoomRender(); });
@@ -2351,13 +2595,17 @@
         window: ls.rollback,
         engine: (typeof ls.rollbackReport === 'function') ? ls.rollbackReport() : null,
         page: { rollbacks: LS.rollbacks, resimFrames: LS.resimFrames, maxDepth: LS.maxDepth, hashes: LS.rbHashes, hidden: LS.hidden,
-                stepMs: +(LS.stepMsEwma || 0).toFixed(2), ringMB: +((LS.rbRing * (LS.rbBytes || 0)) / 1048576).toFixed(1), snapBytes: LS.rbBytes || null,
+                stepMs: +(LS.stepMsEwma || 0).toFixed(2), ringMB: +((LS.rbBytes || 0) / 1048576).toFixed(1), ringBytes: LS.rbBytes || null,
                 missingSlot: LS.rbMissing, ring: LS.rbRing,
-                stepMsAvg: LS.stepMsCount ? +(LS.stepMsSum / LS.stepMsCount).toFixed(2) : null, stepMsMax: +LS.stepMsMax.toFixed(2) },
+                stepMsAvg: LS.stepMsCount ? +(LS.stepMsSum / LS.stepMsCount).toFixed(2) : null, stepMsMax: +LS.stepMsMax.toFixed(2),
+                timeline: { dropped: LS.tlDropped, repaid: LS.tlRepaid, ahead: LS.tlAhead, debtTicks: LS.tlDebtTicks, mutedHidden: LS.tlMutedHidden },
+                budget: { bytes: LS.rbBudget, logBudget: LS.rbLogBudget, logBytes: LS.rbLogBytes, logBytesMax: LS.rbLogBytesMax, held: LS.rbHeld, memStalls: LS.rbMemStalls },
+                worker: window.__ps1RbWorker || null },
       } : null,
       // Local input lag in frames, per change of this console's own pad.
       lat: { samples: LAT.samples.slice(-50), overlapped: LAT.overlapped },
       core: CORE_RATE,
+      audioSink: window.__ps1AudioSink ? window.__ps1AudioSink() : null,
       mode: NET.session ? (NET.role || 'in-room') : 'none',
       // THE PARTY, as a rig sees it: the auto-declare (`declared`) and the
       // auto-start (`autoStarted`) are assertable with no button anywhere, and
