@@ -1907,6 +1907,14 @@ N64Rate.selfTest = function (logFn) {
       P.readPixels = function (x, y, w, h, format, type, dst, dstIndex) {
         var gl = this;
         if (!st.on && !st.seq) return orig.apply(gl, arguments);
+        // ⚠ A ZERO-AREA READ IS NOT A READ. DK64's first readback is (0,480,
+        // 640x0). Taken through a pack buffer it created a 0-byte
+        // PIXEL_PACK_BUFFER, and the next (real) read on that context came back
+        // with bytes that varied by browser context while the context was
+        // lost (drawingBufferWidth 0) right after it — measured: two contexts
+        // handed the core 2826218052 vs 2297120715 on call #2, a room desync.
+        // It moves no pixels, so it goes straight to GL and changes no state.
+        if (!(w > 0 && h > 0)) return orig.apply(gl, arguments);
         st.calls++;
         if (!hooked) hookCore();
         if (st.bypass || arguments.length < 7 || !dst || typeof dst !== 'object' || !dst.buffer ||
