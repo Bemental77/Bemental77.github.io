@@ -60,7 +60,7 @@
     i64_eq: 0x51, i64_ne: 0x52, i64_lt_s: 0x53, i64_lt_u: 0x54, i64_gt_s: 0x55, i64_le_s: 0x57, i64_ge_s: 0x59,
     i32_add: 0x6A, i32_sub: 0x6B, i32_mul: 0x6C, i32_and: 0x71, i32_or: 0x72, i32_xor: 0x73, i32_shl: 0x74, i32_shr_s: 0x75, i32_shr_u: 0x76,
     i32_extend8_s: 0xC0, i32_extend16_s: 0xC1,
-    i64_add: 0x7C, i64_mul: 0x7E, i64_shr_s: 0x87, i64_and: 0x83, i64_or: 0x84, i64_xor: 0x85,
+    i64_add: 0x7C, i64_sub: 0x7D, i64_mul: 0x7E, i64_shr_s: 0x87, i64_and: 0x83, i64_or: 0x84, i64_xor: 0x85,
     i32_div_s: 0x6D, i32_div_u: 0x6E, i32_rem_s: 0x6F, i32_rem_u: 0x70,
     i32_wrap_i64: 0xA7, i64_extend_i32_s: 0xAC, i64_extend_i32_u: 0xAD,
     i64_shl: 0x86, i64_shr_u: 0x88,
@@ -79,6 +79,8 @@
     f32_convert_i32_s: 0xB2, f32_convert_i64_s: 0xB4, f32_demote_f64: 0xB6,
     f64_convert_i32_s: 0xB7, f64_convert_i64_s: 0xB9, f64_promote_f32: 0xBB,
     void_: 0x40,
+    // multi-entry spans (2026-09-30): intra-span dispatch + entry wrappers
+    br_table: 0x0E, return_: 0x0F, global_get: 0x23, global_set: 0x24,
   };
   var VT = { i32: 0x7F, i64: 0x7E, f32: 0x7D, f64: 0x7C };
 
@@ -90,6 +92,10 @@
   // groups rather than widening the wave-11a pair, so L_F32/L_F64 keep their
   // indices and roundToIntNat is untouched.
   var L_F32B = 39, L_F64B = 40;
+  // multi-entry spans (2026-09-30): the segment index the body dispatches to
+  // on entry and on every backward in-span branch (br_table at $top). A NEW
+  // local appended after every existing group, so no index above moves.
+  var L_START = 41;
 
   function loadI64(addr) { return [OP.i32_const, 0x00, OP.i64_load, 0x03].concat(leb(addr)); }
   function loadI32(addr) { return [OP.i32_const, 0x00, OP.i32_load, 0x02].concat(leb(addr)); }
@@ -317,11 +323,18 @@
   // 0x18-0x1B (MULT/MULTU/DIV/DIVU) — unguarded, they still run.
   var SPECIAL_RD_NOP = { 0x00: 1, 0x02: 1, 0x03: 1, 0x04: 1, 0x06: 1, 0x07: 1, 0x10: 1, 0x12: 1,
                          0x20: 1, 0x21: 1, 0x22: 1, 0x23: 1, 0x24: 1, 0x25: 1, 0x26: 1, 0x27: 1,
-                         0x2A: 1, 0x2B: 1 };
+                         0x2A: 1, 0x2B: 1,
+                         // doubleword ALU (2026-09-30): RDSLLV/RDSRLV/RDSRAV (recomp.c:258,
+                         // :266,:274), RDADD/RDADDU/RDSUB/RDSUBU (:418,:426,:434,:442),
+                         // RDSLL/RDSRL/RDSRA/RDSLL32/RDSRL32/RDSRA32 (:487-527) — every one
+                         // ends `if (dst->f.r.rd == reg) RNOP()`
+                         0x14: 1, 0x16: 1, 0x17: 1, 0x2C: 1, 0x2D: 1, 0x2E: 1, 0x2F: 1,
+                         0x38: 1, 0x3A: 1, 0x3B: 1, 0x3C: 1, 0x3E: 1, 0x3F: 1 };
   // I-type opcodes this emitter handles whose destination is rt AND which
   // recomp.c guards: RADDI/RADDIU (:1766,:1774), RSLTI/RSLTIU (:1782,:1790),
   // RANDI/RORI/RXORI/RLUI (:1798,:1806,:1814,:1822).
-  var ITYPE_RT_NOP = { 0x08: 1, 0x09: 1, 0x0A: 1, 0x0B: 1, 0x0C: 1, 0x0D: 1, 0x0E: 1, 0x0F: 1 };
+  var ITYPE_RT_NOP = { 0x08: 1, 0x09: 1, 0x0A: 1, 0x0B: 1, 0x0C: 1, 0x0D: 1, 0x0E: 1, 0x0F: 1,
+                       0x18: 1, 0x19: 1 };   // RDADDI/RDADDIU (recomp.c:1928,:1936)
 
   // ---- native ALU emitters ----
   // Returns body bytes (value computed and written into the cache) or null.
@@ -378,6 +391,23 @@
             [OP.end]);
         case 0x2A: v = C.read(rs).concat(C.read(rt), [OP.i64_lt_s], xu); break;                       // SLT
         case 0x2B: v = C.read(rs).concat(C.read(rt), [OP.i64_lt_u], xu); break;                       // SLTU
+        // ---- doubleword ALU (2026-09-30), mips_instructions.def:1502-1516,
+        // :1718-1740, :1752-1786. wasm's i64 shifts take the count mod 64,
+        // which is exactly `rrs32 & 0x3F` for the variable forms.
+        case 0x14: v = C.read(rt).concat(C.read(rs), [OP.i64_shl]); break;                            // DSLLV
+        case 0x16: v = C.read(rt).concat(C.read(rs), [OP.i64_shr_u]); break;                          // DSRLV
+        case 0x17: v = C.read(rt).concat(C.read(rs), [OP.i64_shr_s]); break;                          // DSRAV
+        case 0x2C:                                                                                     // DADD (no trap in this core)
+        case 0x2D: v = C.read(rs).concat(C.read(rt), [OP.i64_add]); break;                            // DADDU
+        case 0x2E:                                                                                     // DSUB (no trap in this core)
+        case 0x2F: v = C.read(rs).concat(C.read(rt), [OP.i64_sub]); break;                            // DSUBU
+        case 0x38: v = C.read(rt).concat([OP.i64_const], sleb(sa), [OP.i64_shl]); break;              // DSLL
+        case 0x3A: v = C.read(rt).concat([OP.i64_const], sleb(sa), [OP.i64_shr_u]); break;           // DSRL
+        case 0x3B: v = C.read(rt).concat([OP.i64_const], sleb(sa), [OP.i64_shr_s]); break;           // DSRA
+        case 0x3C: v = C.read(rt).concat([OP.i64_const], sleb(32 + sa), [OP.i64_shl]); break;         // DSLL32
+        case 0x3E: v = C.read(rt).concat([OP.i64_const], sleb(32 + sa), [OP.i64_shr_u]); break;      // DSRL32
+        case 0x3F: v = C.read(rt).concat([OP.i64_const], sleb(32 + sa), [OP.i64_shr_s]); break;      // DSRA32
+        case 0x0F: return [];                                                                          // SYNC: ADD_TO_PC(1) only (:1473)
         default: return null;
       }
       return v.concat(C.writeFromStack(dest));
@@ -393,6 +423,9 @@
       case 0x0D: v = C.read(rs).concat([OP.i64_const], sleb(imm), [OP.i64_or]); break;                    // ORI
       case 0x0E: v = C.read(rs).concat([OP.i64_const], sleb(imm), [OP.i64_xor]); break;                   // XORI
       case 0x0F: v = [OP.i64_const].concat(sleb((imm << 16) | 0)); break;                                 // LUI
+      case 0x18:                                                                                          // DADDI (no trap in this core, :129)
+      case 0x19: v = C.read(rs).concat([OP.i64_const], sleb(sext16(imm)), [OP.i64_add]); break;          // DADDIU (:135)
+      case 0x2F: return [];                                                                               // CACHE: ADD_TO_PC(1) only (:507)
       default: return null;
     }
     return v.concat(C.writeFromStack(dest));
@@ -461,6 +494,21 @@
     }
   }
 
+  // Any jump/branch that has a delay slot — WIDER than decodeBranch, which
+  // returns null for shapes it will not emit (BLEZ/BGTZ with rt != 0, BC1 when
+  // FCR31 is unavailable). Used only to keep labels off delay slots, where a
+  // too-wide answer merely drops a label and a too-narrow one would split a
+  // branch from its slot.
+  function isBranchWord(w) {
+    var op = (w >>> 26) & 0x3F;
+    if (op === 0x00) { var fn = w & 0x3F; return fn === 0x08 || fn === 0x09; }
+    if (op === 0x01) { var rt = (w >>> 16) & 0x1F; return rt <= 0x03 || (rt >= 0x10 && rt <= 0x13); }
+    if (op >= 0x02 && op <= 0x07) return true;
+    if (op >= 0x14 && op <= 0x17) return true;
+    if (op === 0x11 && ((w >>> 21) & 0x1F) === 0x08) return true;
+    return false;
+  }
+
   function emitCountBatch(p, addr) {
     var val = [OP.i32_const].concat(sleb((addr + 8) | 0),
       loadI32(p.lastAddr), [OP.i32_sub, OP.i32_const, 0x02, OP.i32_shr_u],
@@ -481,8 +529,19 @@
       C.flush(),                          // compile-state: dirty cleared on BOTH arms (flush emits stores only here, but the arm not taken loses nothing: dirty was already current)
       storeI32Const(p.pcGlobal, finalPtr),
       [OP.i32_const], sleb(p.genInt), [OP.call_indirect, 0x00, 0x00],
-      loadI32(p.pcGlobal), [OP.i32_const], sleb(finalPtr), [OP.i32_ne],
-      [OP.br_if].concat(leb(exitDepth + 1)),
+      // ALWAYS return to the dispatcher after gen_interrupt (2026-09-30).
+      // It used to continue in-block when PC was unchanged, but gen_interrupt
+      // can END THE FRAME without moving PC: a VI_INT event calls
+      // retro_return() (interrupt.c VI_INT case), which sets stop_stepping,
+      // and when the MI interrupt is masked no exception is raised. The
+      // interpreter's DECLARE_JUMP returns to r4300_step, which sees
+      // stop_stepping && VI_Count and ends retro_run right there
+      // (r4300.c:175-196); a block that kept going ran guest code into the
+      // NEXT frame. Latent on the entry back-edge since wave 2, it became a
+      // frame-1 divergence (MK64 boot) once every in-span branch went native.
+      // PC already holds the right successor (finalPtr, or gen_interrupt's
+      // redirect), so exiting is exact and costs one dispatch per interrupt.
+      [OP.br].concat(leb(exitDepth + 1)),
       [OP.end]
     );
   }
@@ -1237,18 +1296,132 @@
     // stays on the cached interpreter, exactly as it did before wave 1, and it
     // is retried on the next recompile when ops may be populated. span+1 is
     // scanned because delay-slot emission reads one instruction past the span.
-    var scanEnd = p.span + 1;
+    //
+    // ---- PAGE-END TRUNCATION (2026-09-30) — what the null-ops rejects WERE ----
+    // Every one of those rejects was a span that ran PAST ITS 4KB PAGE.
+    // recompile_block (recomp.c:2383-2455) does not stop at the page end: for
+    // KSEG0/KSEG1 code with no J/JR before it, it keeps compiling the NEXT
+    // page's words into this page's precomp array (up to index
+    // length-2+length/4) and then appends one or two FIN_BLOCK entries; for
+    // TLB-mapped / 0xa4000000 pages it stops at the page end and appends the
+    // FIN_BLOCKs right there. So the reported span covered (a) continuation
+    // instructions, (b) the FIN_BLOCK slots — whose source "words" the emitter
+    // would have emitted as ordinary instructions — and ended on an index the
+    // compile never wrote (ops == 0, calloc'd by init_block). MK64 on a phone:
+    // 44 such spans, each left entirely on the interpreter; the ROM's first
+    // one here was vaddr 0x800cdff8 (page offset 0xff8, span 14).
+    // The exact repair is to END THE JIT SPAN AT THE PAGE END: the block's
+    // fall-through exit then sets PC = &block[length], the first continuation
+    // entry, which THIS recompile wrote (non-null) — so the dispatcher runs the
+    // same op the cached interpreter would have reached by `PC++`, and nothing
+    // past the page is ever emitted (for a TLB page the next VIRTUAL page need
+    // not even be the next physical one that `source` points into).
+    var span = p.span;
+    var pageLen = ((p.blockEnd - p.blockStart) >>> 0) >>> 2;
+    var entryInPage = ((p.vaddr - p.blockStart) >>> 0) >>> 2;
+    if (pageLen > 0 && entryInPage < pageLen && span > pageLen - entryInPage) {
+      span = pageLen - entryInPage;
+      stats.pageTruncated = (stats.pageTruncated || 0) + 1;
+    }
+    if (span <= 0) return 0;
+    var scanEnd = span + 1;
     for (var g = 0; g < scanEnd; g++) {
       if (HEAPU32[(p.entryPtr + g * p.stride) >> 2] === 0) {
         stats.nullOpsRejects = (stats.nullOpsRejects || 0) + 1;
         if (stats.nullOpsRejects === 1 && typeof console !== 'undefined') {
           console.warn('[jit] span rejected: precomp_instr.ops == 0 at index ' + g +
-                       ' of ' + p.span + ' (vaddr 0x' + (p.vaddr >>> 0).toString(16) + ')');
+                       ' of ' + span + ' (vaddr 0x' + (p.vaddr >>> 0).toString(16) + ')');
         }
         return 0;
       }
     }
-    while (i < p.span) {
+
+    // ---- MULTI-ENTRY SPANS (2026-09-30) ----
+    // The core installs a JIT block as ONE instruction's ops: the span ENTRY
+    // (recomp.c:2583). Every other instruction of the span keeps its
+    // interpreter op, so control that arrives anywhere else — the return
+    // point after a JAL (the callee's JR lands at addr+8 via jump_to), or an
+    // in-span branch target — ran on the CACHED INTERPRETER until the next
+    // jump happened to hit an entry. And a PLAIN branch to any in-span target
+    // other than the entry EXITED the block to do exactly that.
+    // Labels fix both. A label is an in-span index that is (a) the target of
+    // an in-page PLAIN branch of this span, or (b) the return point addr+8 of
+    // a linking jump of this span, or (c) the entry itself. The body is laid
+    // out as one segment per label under a br_table (the classic switch
+    // lowering): a FORWARD in-span branch is a direct `br` to its segment, a
+    // BACKWARD one sets L_START and re-enters the dispatch at $top. Each label
+    // k >= 1 also gets an exported entry wrapper that is written into
+    // block[label].ops, so the dispatcher enters native code there too.
+    // Exactness: a label boundary is a join, so the register cache is flushed
+    // and emptied on the fall-through into it (branch tails already arrive
+    // flushed and empty). Count / last_addr / interrupt polling happen on the
+    // branch exactly as before — the only thing a native in-span branch skips
+    // is the round trip through the dispatcher, which the interpreter would
+    // make with the same PC, last_addr and Count.
+    // A label that is the DELAY SLOT of a branch is dropped (the branch's
+    // native emission consumes branch+slot as one unit), and so is a branch
+    // targeting ITSELF (the IDLE shape stays a fallback, as before).
+    // Label sources, all over the WHOLE 4KB page's words (the page is one
+    // physical page, so `source` is contiguous across it):
+    //   (a) PLAIN branch/jump targets inside this span — from this span OR
+    //       from another span of the same page (IDO's `j cond; ... cond: bne
+    //       body` loop shape ends one span at the `j` and lands in another);
+    //   (b) addr+8 of every linking jump in this span (the JR return point);
+    //   (c) addr+8 of every CONDITIONAL branch in this span: the not-taken
+    //       path already arrives there flushed and empty, so the label costs
+    //       nothing at run time, and it is where an interrupt taken on that
+    //       path returns to (EPC = the poll's final PC).
+    // A word that is really data can only ADD a label, which costs a cache
+    // flush at that boundary and never changes what executes.
+    var srcW = p.srcPtr >> 2;
+    var labelOrd = new Int32Array(span + 1).fill(-1);
+    var wantLabel = [0];
+    var pageW0 = srcW, pageN = span, pageA0 = p.vaddr >>> 0, spanOff = 0;
+    if (pageLen > 0 && entryInPage < pageLen) {
+      pageW0 = srcW - entryInPage; pageN = pageLen; pageA0 = p.blockStart >>> 0; spanOff = entryInPage;
+    }
+    for (var li = 0; li < pageN; li++) {
+      var lw = HEAPU32[pageW0 + li];
+      var la = (pageA0 + li * 4) >>> 0;
+      var ld0 = decodeBranch(lw, la, p);
+      if (!ld0) continue;
+      var own = li - spanOff;              // index within this span, if inside it
+      if (ld0.target !== null && ld0.target >= p.blockStart && ld0.target < p.blockEnd && la !== ((p.blockEnd - 4) >>> 0)) {
+        var lt = ((ld0.target - p.vaddr) | 0) / 4;
+        if (lt > 0 && lt < span && lt !== own) wantLabel.push(lt);
+      }
+      if (own >= 0 && own < span) {
+        if (ld0.link && own + 2 < span) wantLabel.push(own + 2);
+        else if (ld0.cond !== null && own + 2 < span) wantLabel.push(own + 2);
+      }
+    }
+    wantLabel.sort(function (a, b) { return a - b; });
+    var labels = [];
+    for (var lk = 0; lk < wantLabel.length; lk++) {
+      var lx = wantLabel[lk];
+      if (labels.length && labels[labels.length - 1] === lx) continue;
+      if (lx > 0 && isBranchWord(HEAPU32[srcW + lx - 1])) continue;   // a delay slot
+      labels.push(lx);
+    }
+    if (window.__jitNoLabels) labels = [0];   // attribution arm: single-entry spans
+    var nSeg = labels.length;
+    for (var lo = 0; lo < nSeg; lo++) labelOrd[labels[lo]] = lo;
+    // original interpreter ops at every label, read BEFORE any install
+    var labelOps = labels.map(function (x) { return HEAPU32[(p.entryPtr + x * p.stride) >> 2]; });
+    var seg = 0;
+    EXIT = nSeg; TOP = nSeg - 1;       // segment 0's depths (1 / 0 when nSeg == 1)
+    var closedSegs = 0;
+
+    while (i < span) {
+      // entering a label: close the previous segment with an EMPTY cache
+      if (i > 0 && labelOrd[i] >= 0) {
+        body = body.concat(C.flush());
+        C.invalidate();
+        body.push(OP.end);
+        closedSegs++;
+        seg = labelOrd[i];
+        EXIT = nSeg - seg; TOP = nSeg - 1 - seg;
+      }
       var word = HEAPU32[(p.srcPtr >> 2) + i];
       var addr = (p.vaddr + i * 4) >>> 0;
       var instrPtr = p.entryPtr + i * p.stride;
@@ -1258,8 +1431,12 @@
       var br = null, brOut = false, slotMem = false;
       var brReason = null;   // census: why a decodable branch was NOT emitted
       var dec = decodeBranch(word, addr, p);
-      if (dec && i + 1 >= p.span) {
+      if (dec && i + 1 >= span) {
         brReason = 'span-end';
+      } else if (dec && labelOrd[i + 1] >= 0) {
+        // cannot happen (delay-slot labels are dropped above); refuse rather
+        // than swallow a segment boundary inside branch+slot
+        brReason = 'slot-label';
       } else if (dec) {
         var slotWord = HEAPU32[(p.srcPtr >> 2) + i + 1];
         var isIdle = dec.target !== null && (dec.target === addr) && (slotWord === 0);
@@ -1334,10 +1511,19 @@
               : [OP.i32_const].concat(sleb(br.target | 0));
             return emitOutJumpTail(p, tb, exitD);
           }
-          return emitTailPoll(p, Cx, br.target, targetPtr, exitD).concat(
-            targetIdx === 0
-              ? bump('#backedge').concat([OP.br], leb(topD))
-              : bump('#exit:branch').concat(storeI32Const(p.pcGlobal, targetPtr), [OP.br], leb(exitD)));
+          // in-span label: native. Forward = direct br to that segment's
+          // block; backward (incl. the entry) = set L_START, re-dispatch at
+          // $top. `nest` is how many if/else frames the caller is inside.
+          var tOrd = (targetIdx >= 0 && targetIdx < span) ? labelOrd[targetIdx] : -1;
+          var nest = exitD - EXIT;
+          var poll = emitTailPoll(p, Cx, br.target, targetPtr, exitD);
+          if (tOrd > seg) return poll.concat(bump('#fwd'), [OP.br], leb(tOrd - seg - 1 + nest));
+          if (tOrd >= 0) {
+            return poll.concat(bump('#backedge'),
+              nSeg > 1 ? [OP.i32_const].concat(sleb(tOrd), [OP.local_set], leb(L_START)) : [],
+              [OP.br], leb(topD));
+          }
+          return poll.concat(bump('#exit:branch'), storeI32Const(p.pcGlobal, targetPtr), [OP.br], leb(exitD));
         }
         // delay-slot bytes at a given $exit depth. ALU slots emit inline as
         // before; memory/FP slots emit their native fast arm and bail the
@@ -1482,8 +1668,14 @@
     body = body.concat(
       C.flush(),
       bump('#exit:fallthrough'),
-      storeI32Const(p.pcGlobal, p.entryPtr + p.span * p.stride)
+      storeI32Const(p.pcGlobal, p.entryPtr + span * p.stride)
     );
+    if (closedSegs !== nSeg - 1) {
+      // a label was stepped over — never emit a module with unbalanced blocks
+      stats.fails++;
+      if (stats.fails <= 3) console.error('[bementalJIT] label/segment mismatch', closedSegs, nSeg, (p.vaddr >>> 0).toString(16));
+      return 0;
+    }
 
     // ---- DELAY-SLOT ENTRY GUARD (conker.z64 frame-82 divergence, 2026-09-04) ----
     // A JIT block is installed as ONE instruction's `ops`, and the core calls
@@ -1514,7 +1706,7 @@
     // instruction, so run the ENTRY instruction's ORIGINAL interpreter op and
     // return. That is exact — it is literally what `PC->ops()` would have done
     // — and it costs one i32 load per block entry.
-    var entryOps = HEAPU32[p.entryPtr >> 2];
+    var entryOps = labelOps[0];
     var slotGuard = [].concat(
       loadI32(p.delaySlot),
       [OP.if_, OP.void_],
@@ -1526,16 +1718,44 @@
         [OP.br].concat(leb(1)),          // inside the if (0) -> $exit block (1)
       [OP.end]);
 
-    var full = [0x09, 0x02, 0x7F, 0x20, 0x7E, 0x01, 0x7E, 0x01, 0x7F, 0x01, 0x7F, 0x01, 0x7D, 0x01, 0x7C, 0x01, 0x7D, 0x01, 0x7C,  // locals: 2xi32, 32xi64 regs, i64 scratch, i32 jump-target, i32 branch-cond, f32+f64 convert scratch (wave 11a), f32+f64 compare operand B (wave 11b)
+    // Multi-entry dispatch. Label 0's function IS the body, so the common
+    // entry costs exactly what it did before (plus one global read when the
+    // span has labels). Wrapper k (>= 1) runs its OWN delay-slot guard with
+    // ITS label's original op, sets the module global to k and calls the body;
+    // the body reads the global into L_START and resets it to 0, so a direct
+    // dispatcher call of label 0 always starts at segment 0.
+    var startPro = [], dispatch = [];
+    if (nSeg > 1) {
+      startPro = [OP.global_get, 0x00, OP.local_set].concat(leb(L_START), [OP.i32_const, 0x00, OP.global_set, 0x00]);
+      for (var bb = 0; bb < nSeg; bb++) dispatch.push(OP.block, OP.void_);
+      var tgts = [];
+      for (bb = 0; bb < nSeg; bb++) tgts = tgts.concat(leb(bb));
+      dispatch = dispatch.concat([OP.local_get], leb(L_START), [OP.br_table], leb(nSeg), tgts, leb(0), [OP.end]);
+    }
+
+    var full = [0x0A, 0x02, 0x7F, 0x20, 0x7E, 0x01, 0x7E, 0x01, 0x7F, 0x01, 0x7F, 0x01, 0x7D, 0x01, 0x7C, 0x01, 0x7D, 0x01, 0x7C, 0x01, 0x7F,  // locals: 2xi32, 32xi64 regs, i64 scratch, i32 jump-target, i32 branch-cond, f32+f64 convert scratch (wave 11a), f32+f64 compare operand B (wave 11b), i32 segment start (multi-entry)
       OP.block, OP.void_]
-      .concat(slotGuard,
+      .concat(slotGuard, startPro,
       [OP.loop, OP.void_])
-      .concat(bump('#block-iter'), body,
+      .concat(bump('#block-iter'), dispatch, body,
       [OP.end, OP.end, OP.end]);
 
     // census adds one imported host func "e"."c" (type 1: (i32)->()), which
     // takes function index 0 and pushes the defined block function to 1
     var cen = !!census.on;
+    var bodyFn = cen ? 1 : 0;
+    var funcs = [full];
+    for (var wk = 1; wk < nSeg; wk++) {
+      funcs.push([0x00].concat(            // no locals
+        loadI32(p.delaySlot), [OP.if_, OP.void_],
+          bump('#delayslot-entry'),
+          [OP.i32_const], sleb(labelOps[wk]), [OP.call_indirect, 0x00, 0x00],
+          [OP.return_],
+        [OP.end],
+        [OP.i32_const], sleb(wk), [OP.global_set, 0x00],
+        [OP.call], leb(bodyFn),
+        [OP.end]));
+    }
     var typeSec = section(1, cen
       ? [].concat(leb(2), [0x60, 0x00, 0x00], [0x60, 0x01, 0x7F, 0x00])
       : [].concat(leb(1), [0x60, 0x00, 0x00]));
@@ -1543,31 +1763,57 @@
       [1, 0x65, 1, 0x74, 0x01, 0x70, 0x00, 0x00],
       [1, 0x65, 1, 0x6D, 0x02, 0x00, 0x00],
       cen ? [1, 0x65, 1, 0x63, 0x00, 0x01] : []));
-    var funcSec = section(3, [].concat(leb(1), leb(0)));
-    var exportSec = section(7, [].concat(leb(1), [1, 0x66, 0x00], leb(cen ? 1 : 0)));
-    var codeSec = section(10, [].concat(leb(1), leb(full.length), full));
+    var fdecl = leb(nSeg);
+    for (wk = 0; wk < nSeg; wk++) fdecl = fdecl.concat(leb(0));
+    var funcSec = section(3, fdecl);
+    var globalSec = nSeg > 1 ? section(6, [0x01, 0x7F, 0x01, OP.i32_const, 0x00, OP.end]) : [];
+    // exports: "f" = label 0 (the body), "f<k>" = wrapper k
+    var exps = leb(nSeg).concat([1, 0x66, 0x00], leb(bodyFn));
+    for (wk = 1; wk < nSeg; wk++) {
+      var nm = ('f' + wk).split('').map(function (ch) { return ch.charCodeAt(0); });
+      exps = exps.concat(leb(nm.length), nm, [0x00], leb(bodyFn + wk));
+    }
+    var exportSec = section(7, exps);
+    var code = leb(nSeg);
+    for (wk = 0; wk < nSeg; wk++) code = code.concat(leb(funcs[wk].length), funcs[wk]);
+    var codeSec = section(10, code);
     var bytes = new Uint8Array([0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00]
-      .concat(typeSec, importSec, funcSec, exportSec, codeSec));
+      .concat(typeSec, importSec, funcSec, globalSec, exportSec, codeSec));
+    function installSlot(vkey, fn) {
+      var sidx = slotByVaddr[vkey];
+      if (sidx !== undefined) {
+        Module.wasmTable.set(sidx, fn);
+        stats.slotReuses++;
+      } else {
+        sidx = Module.wasmTable.length;
+        Module.wasmTable.grow(1);
+        Module.wasmTable.set(sidx, fn);
+        slotByVaddr[vkey] = sidx;
+        stats.distinctSlots++;
+      }
+      return sidx;
+    }
     try {
       var mod = new WebAssembly.Module(bytes);
       var inst = new WebAssembly.Instance(mod, { e: { t: Module.wasmTable, m: Module.wasmMemory, c: censusBump } });
-      var key = p.vaddr >>> 0;
-      var idx = slotByVaddr[key];
-      if (idx !== undefined) {
-        Module.wasmTable.set(idx, inst.exports.f);
-        stats.slotReuses++;
-      } else {
-        idx = Module.wasmTable.length;
-        Module.wasmTable.grow(1);
-        Module.wasmTable.set(idx, inst.exports.f);
-        slotByVaddr[key] = idx;
-        stats.distinctSlots++;
+      var idx = installSlot(p.vaddr >>> 0, inst.exports.f);
+      // Label entries: written straight into block[label].ops, the same field
+      // recomp.c:2583 writes for the entry. init_block resets every one of
+      // them to NOTCOMPILED on invalidation (cached_interp.c jump_to_func ->
+      // init_block), and a later recompile_block over the same range
+      // overwrites them with fresh interpreter ops — both exactly as for the
+      // entry itself. Written only if the field still holds the op read above.
+      for (wk = 1; wk < nSeg; wk++) {
+        var lptr = p.entryPtr + labels[wk] * p.stride;
+        if (HEAPU32[lptr >> 2] !== labelOps[wk]) continue;
+        HEAPU32[lptr >> 2] = installSlot((p.vaddr + labels[wk] * 4) >>> 0, inst.exports['f' + wk]);
+        stats.labelEntries = (stats.labelEntries || 0) + 1;
       }
       stats.blocks++;
       return idx;
     } catch (e) {
       stats.fails++;
-      if (stats.fails <= 3) console.error('[bementalJIT] compile failed:', e, 'span', p.span, 'vaddr', (p.vaddr >>> 0).toString(16));
+      if (stats.fails <= 3) console.error('[bementalJIT] compile failed:', e, 'span', span, 'vaddr', (p.vaddr >>> 0).toString(16));
       return 0;
     }
   }

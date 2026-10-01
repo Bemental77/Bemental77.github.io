@@ -121,10 +121,22 @@ function makeWorld(words, opts = {}) {
   ]));
   const si = new WebAssembly.Instance(stub, { e: { m: mem } });
   for (let i = 1; i < 8; i++) table.set(i, si.exports.f);
+  // table[7] = a gen_interrupt that changes NOTHING (a masked VI: the core's
+  // retro_return ends the frame without moving PC) when opts.genIntNoop
+  if (opts.genIntNoop) {
+    const nb = [0x00, 0x0b];
+    const nm = new WebAssembly.Module(new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
+      ...sec(1, [1, 0x60, 0, 0]), ...sec(3, [1, 0]), ...sec(7, [1, 1, 0x66, 0x00, 0x00]),
+      ...sec(10, [1, ...leb(nb.length), ...nb])]));
+    table.set(7, new WebAssembly.Instance(nm, {}).exports.f);
+  }
 
   for (let i = 0; i < words.length; i++) HEAPU32[(SRC >> 2) + i] = words[i] >>> 0;
   for (let i = 0; i < words.length + 4; i++) HEAPU32[(ENTRY + i * STRIDE) >> 2] = 1;
-  HEAPU32[NEXTINT >> 2] = 0xffffffff;   // next_interrupt never due
+  // recompile_block's calloc'd tail: a span that runs past its page ends on an
+  // entry the compile never wrote (see PAGE-END TRUNCATION in the emitter)
+  if (opts.nullOpsFrom !== undefined) for (let i = opts.nullOpsFrom; i < words.length + 4; i++) HEAPU32[(ENTRY + i * STRIDE) >> 2] = 0;
+  HEAPU32[NEXTINT >> 2] = opts.nextInt !== undefined ? opts.nextInt >>> 0 : 0xffffffff;   // default: next_interrupt never due
   HEAPU32[COUNT >> 2] = 0;
   HEAPU32[SKIPJ >> 2] = 0;
   HEAPU32[LASTADDR >> 2] = 0x80100000;
@@ -158,8 +170,8 @@ function makeWorld(words, opts = {}) {
   const p = {
     vaddr: 0x80100000, entryPtr: ENTRY, span: words.length, srcPtr: SRC, stride: STRIDE, addrOff: 4,
     pcGlobal: PCG, reg: REG, hi: HI, lo: LO,
-    blockStart: 0x80100000, blockEnd: 0x80100000 + words.length * 4,
-    lastAddr: LASTADDR, nextInt: NEXTINT, count: COUNT, cpo: 2, skipJump: SKIPJ, genInt: 1,
+    blockStart: 0x80100000, blockEnd: 0x80100000 + (opts.pageLen !== undefined ? opts.pageLen : words.length) * 4,
+    lastAddr: LASTADDR, nextInt: NEXTINT, count: COUNT, cpo: 2, skipJump: SKIPJ, genInt: opts.genIntNoop ? 7 : 1,
     readmemW: t(0), readmemB: t(1), readmemH: t(2), rdRdram: RD_RDRAM, rdRdramB: 0x112, rdRdramH: 0x113,
     dramBase: DRAM,
     writememW: t(3), writememB: t(4), writememH: t(5), wrRdram: WR_RDRAM, wrRdramB: 0x122, wrRdramH: 0x123,
@@ -170,6 +182,13 @@ function makeWorld(words, opts = {}) {
     fcr31: opts.noFcr31 ? 0 : FCR31A,
     delaySlot: opts.noDelaySlot ? 0 : DELAYSLOT,
   };
+  // entryOff: the span starts `entryOff` words into the page (words[] is the
+  // whole page), the way recompile_block hands over any entry past offset 0
+  if (opts.entryOff) {
+    const k = opts.entryOff;
+    p.vaddr += k * 4; p.entryPtr += k * STRIDE; p.srcPtr += k * 4; p.span -= k;
+    HEAPU32[PCG >> 2] = ENTRY + k * STRIDE;
+  }
   return { mem, table, HEAPU32, REG64, p };
 }
 
@@ -184,7 +203,7 @@ function T(name, words, { regs = {}, dram = {}, expectRegs = {}, expectDram = {}
                           fprF32 = {}, fprF64 = {}, fprI32 = {}, fprI64 = {}, fcr31 = 0, expectFcr31 = null,
                           expectFprI32 = {}, expectFprI64 = {}, expectFprF32 = {}, expectFprF64 = {},
                           expectRefused = false, expectPC = null, expectLastAddr = null, expectCount = null,
-                          lastAddr = null }) {
+                          lastAddr = null, enterAt = 0 }) {
   const bm = loadEmitter();
   const { mem, table, HEAPU32, REG64, p } = makeWorld(words, opts);
   const DV = new DataView(mem.buffer);
@@ -207,8 +226,16 @@ function T(name, words, { regs = {}, dram = {}, expectRegs = {}, expectDram = {}
   }
   if (!(idx > 0)) return { name, ok: false, detail: `emit FAILED (idx=${idx}, emitFails=${bm.stats.fails})` };
   let threw = null;
-  try { table.get(idx)(); } catch (e) { threw = String(e).slice(0, 120); }
   const bad = [];
+  // enterAt: enter through the op INSTALLED at that span index (a label
+  // entry), the way the dispatcher's `PC->ops()` would — PC points at it
+  let fnIdx = idx;
+  if (enterAt) {
+    fnIdx = HEAPU32[(ENTRY + enterAt * STRIDE) >> 2];
+    HEAPU32[PCG >> 2] = ENTRY + enterAt * STRIDE;
+    if (fnIdx === 1) bad.push(`no entry installed at index ${enterAt} (ops still the interpreter stub)`);
+  }
+  if (!bad.length) { try { table.get(fnIdx)(); } catch (e) { threw = String(e).slice(0, 120); } }
   for (const [r, want] of Object.entries(expectRegs)) {
     const got = '0x' + BigInt.asUintN(64, REG64[(REG >> 3) + (+r)]).toString(16);
     if (got !== want) bad.push(`reg[${r}]=${got} want ${want}`);
@@ -714,6 +741,106 @@ const tests = [
   T('no &delay_slot param => the whole span is refused',
     [I(OPC.ADDIU, 0, 8, 0x11), 0],
     { opts: { noDelaySlot: true }, expectRefused: true }),
+
+  // ---- MULTI-ENTRY SPANS + PAGE-END TRUNCATION (2026-09-30) ----
+  // Before: only the span ENTRY was native. A PLAIN branch to any other
+  // in-span index EXITED to the dispatcher, whose `PC->ops()` there was the
+  // interpreter op, so the rest ran on the cached interpreter; and a JAL's
+  // return point (reached by the callee's JR) was interpreter-only.
+  // RED against the pre-change emitter: the forward/backward/multi-segment
+  // cases (it exits at the branch: wrong PC, later regs unwritten), every
+  // enterAt case (no entry installed), and the truncation case (refused).
+  T('in-span FORWARD branch stays native (no exit at the branch)',
+    [I(OPC.BEQ, 0, 0, 2), I(OPC.ADDIU, 0, 8, 0x11), I(OPC.ADDIU, 0, 9, 0x22), I(OPC.ADDIU, 0, 10, 0x33), 0],
+    { expectRegs: { 8: '0x11', 9: '0x0', 10: '0x33' }, expectPC: ENTRY + 5 * STRIDE,
+      // labels: the target (3) and the not-taken fall-through (2)
+      expectLastAddr: '0x8010000c', expectCount: '0x4', expectStats: { labelEntries: 2 } }),
+  T('in-span BACKWARD branch to a non-entry label loops natively',
+    [I(OPC.ADDIU, 0, 1, 3), I(OPC.ADDIU, 2, 2, 1), I(OPC.ADDIU, 1, 1, 0xffff), I(OPC.BNE, 1, 0, 0xfffd), 0, I(OPC.ADDIU, 0, 3, 7), 0],
+    { expectRegs: { 1: '0x0', 2: '0x3', 3: '0x7' }, expectPC: ENTRY + 7 * STRIDE }),
+  T('BNEL backward to a label: slot runs only on the taken iterations',
+    [I(OPC.ADDIU, 0, 1, 2), I(OPC.ADDIU, 2, 2, 1), I(OPC.ADDIU, 1, 1, 0xffff), I(OPC.BNEL, 1, 0, 0xfffd), I(OPC.ADDIU, 3, 3, 5), 0],
+    { expectRegs: { 1: '0x0', 2: '0x2', 3: '0x5' }, expectPC: ENTRY + 6 * STRIDE }),
+  // three segments: forward seg0->seg1, forward seg1->seg2, backward seg2->seg1
+  T('three segments: forward, forward, and a backward re-dispatch',
+    [I(OPC.BEQ, 0, 0, 2), 0, I(OPC.ADDIU, 0, 9, 0x99),
+     I(OPC.ADDIU, 8, 8, 1),
+     I(OPC.BEQ, 0, 0, 2), 0, I(OPC.ADDIU, 0, 9, 0x77),
+     I(OPC.ADDIU, 0, 10, 0x55),
+     I(OPC.BNE, 8, 11, 0xfffa), 0, 0],
+    // labels: targets 3 and 7, fall-throughs 2, 6 and 10
+    { regs: { 11: '0x3' }, expectRegs: { 8: '0x3', 9: '0x0', 10: '0x55' }, expectPC: ENTRY + 11 * STRIDE,
+      expectStats: { labelEntries: 5 } }),
+  T('a label is ENTERABLE: its installed op runs from the label',
+    [I(OPC.ADDIU, 0, 1, 3), I(OPC.ADDIU, 2, 2, 1), I(OPC.ADDIU, 1, 1, 0xffff), I(OPC.BNE, 1, 0, 0xfffd), 0, I(OPC.ADDIU, 0, 3, 7), 0],
+    { enterAt: 1, regs: { 1: '0x2' }, expectRegs: { 1: '0x0', 2: '0x2', 3: '0x7' }, expectPC: ENTRY + 7 * STRIDE }),
+  T('a label entered as a DELAY SLOT runs its ONE original op',
+    [I(OPC.ADDIU, 0, 1, 3), I(OPC.ADDIU, 2, 2, 1), I(OPC.ADDIU, 1, 1, 0xffff), I(OPC.BNE, 1, 0, 0xfffd), 0, I(OPC.ADDIU, 0, 3, 7), 0],
+    { enterAt: 1, opts: { inDelaySlot: true }, regs: { 1: '0x2' }, lastAddr: 0x80100000,
+      expectRegs: { 1: '0x2', 2: '0x0', 3: '0x0' }, expectPC: ENTRY + 2 * STRIDE,
+      expectLastAddr: '0x80100000', expectCount: '0x0' }),
+  T('a JAL return point (addr+8) becomes an entry',
+    [((0x03 << 26) | ((0x80200000 >>> 2) & 0x3ffffff)) >>> 0, 0, I(OPC.ADDIU, 0, 5, 9), 0],
+    { enterAt: 2, expectRegs: { 5: '0x9' }, expectPC: ENTRY + 4 * STRIDE }),
+  // control: a target that is the DELAY SLOT of another branch gets no label,
+  // so that branch still exits to the dispatcher exactly as before
+  T('control: a branch into another branch\'s delay slot still exits there',
+    [I(OPC.ADDIU, 0, 8, 1), I(OPC.BEQ, 5, 6, 3), I(OPC.ADDIU, 0, 9, 2), I(OPC.BEQ, 0, 0, 0xfffe), 0, I(OPC.ADDIU, 0, 10, 3), 0],
+    // labels: 5 (target of idx 1) and 3 (its fall-through); NOT 2
+    { regs: { 5: '0x1', 6: '0x2' }, expectRegs: { 8: '0x1', 9: '0x2', 10: '0x0' }, expectPC: ENTRY + 2 * STRIDE,
+      expectStats: { labelEntries: 2 } }),
+  // the interrupt poll still runs on a NATIVE in-span branch: with
+  // next_interrupt due, gen_interrupt (the stub: PC += stride) moves PC off
+  // the target and the block exits there instead of continuing
+  T('in-span branch still polls next_interrupt and exits when PC moves',
+    [I(OPC.BEQ, 0, 0, 2), I(OPC.ADDIU, 0, 8, 0x11), I(OPC.ADDIU, 0, 9, 0x22), I(OPC.ADDIU, 0, 10, 0x33), 0],
+    { opts: { nextInt: 0 }, expectRegs: { 8: '0x11', 10: '0x0' }, expectPC: ENTRY + 4 * STRIDE }),
+  // (a) from ANOTHER span: a branch earlier in the page (outside this span)
+  // targets an index inside it — IDO's `j cond` loop shape
+  T('a same-page branch from OUTSIDE the span makes its target an entry',
+    [I(OPC.BEQ, 0, 0, 2), 0, I(OPC.ADDIU, 0, 8, 1), I(OPC.ADDIU, 0, 9, 2), 0],
+    { opts: { entryOff: 2 }, enterAt: 3, expectRegs: { 8: '0x0', 9: '0x2' }, expectPC: ENTRY + 5 * STRIDE,
+      expectStats: { labelEntries: 1 } }),
+  // ---- doubleword ALU + SYNC/CACHE native (2026-09-30) ----
+  // Each is checked against the C in mips_instructions.def (cited in the
+  // emitter). All were interpreter fallbacks before, so a stub op (PC += stride,
+  // writes nothing) would leave every destination at its seed — RED on HEAD.
+  T('DSLL32 / DSRL32 / DSRA32',
+    [R(0, 8, 9, 4, 0x3c), R(0, 8, 10, 4, 0x3e), R(0, 8, 11, 4, 0x3f), 0],
+    { regs: { 8: '0x80000001f0000003' },
+      expectRegs: { 9: '0x3000000000', 10: '0x8000000', 11: '0xfffffffff8000000' } }),
+  T('DSLL / DSRL / DSRA by 3',
+    [R(0, 8, 9, 3, 0x38), R(0, 8, 10, 3, 0x3a), R(0, 8, 11, 3, 0x3b), 0],
+    { regs: { 8: '0x80000001f0000003' },
+      expectRegs: { 9: '0xf80000018', 10: '0x100000003e000000', 11: '0xf00000003e000000' } }),
+  T('DSLLV / DSRLV / DSRAV use rs & 63',
+    [R(12, 8, 9, 0, 0x14), R(12, 8, 10, 0, 0x16), R(12, 8, 11, 0, 0x17), 0],
+    { regs: { 8: '0x80000001f0000003', 12: '0x44' },   // 0x44 & 63 = 4
+      expectRegs: { 9: '0x1f00000030', 10: '0x80000001f000000', 11: '0xf80000001f000000' } }),
+  T('DADDU / DSUBU / DADDIU wrap at 64 bits',
+    [R(8, 12, 9, 0, 0x2d), R(8, 12, 10, 0, 0x2f), I(0x19, 8, 11, 0xffff), 0],
+    { regs: { 8: '0xffffffffffffffff', 12: '0x2' },
+      expectRegs: { 9: '0x1', 10: '0xfffffffffffffffd', 11: '0xfffffffffffffffe' } }),
+  T('DADDU into r0 is a NOP (recomp.c RNOP), SYNC and CACHE do nothing',
+    [R(8, 12, 0, 0, 0x2d), R(0, 0, 0, 0, 0x0f), I(0x2f, 8, 1, 0x10), I(OPC.ADDIU, 0, 9, 7), 0],
+    { regs: { 0: '0x0', 8: '0x5', 12: '0x6' }, expectRegs: { 0: '0x0', 9: '0x7' },
+      expectStats: { fallbackOps: 0 } }),
+  // RED against HEAD's back-edge (and, before the fix, against every native
+  // in-span branch): gen_interrupt that leaves PC alone — a VI whose
+  // exception is masked still ends the frame via retro_return — must return
+  // control to r4300_step, not keep looping into the next frame.
+  T('gen_interrupt that does not move PC still returns to the dispatcher',
+    [I(OPC.ADDIU, 2, 2, 1), I(OPC.BNE, 2, 3, 0xfffe), 0, I(OPC.ADDIU, 0, 4, 9), 0],
+    { regs: { 3: '0x5' }, opts: { nextInt: 0, genIntNoop: true },
+      expectRegs: { 2: '0x1', 4: '0x0' }, expectPC: ENTRY }),
+  T('a span that runs past its PAGE compiles, and falls through AT the page end',
+    [I(OPC.ADDIU, 0, 8, 0x11), I(OPC.ADDIU, 0, 9, 0x22), I(OPC.ADDIU, 0, 10, 0x33), I(OPC.ADDIU, 0, 11, 0x44)],
+    { opts: { pageLen: 2, nullOpsFrom: 4 }, expectRegs: { 8: '0x11', 9: '0x22', 10: '0x0', 11: '0x0' },
+      expectPC: ENTRY + 2 * STRIDE, expectStats: { pageTruncated: 1 } }),
+  T('control: a span ending INSIDE its page is not truncated',
+    [I(OPC.ADDIU, 0, 8, 0x11), I(OPC.ADDIU, 0, 9, 0x22), 0],
+    { opts: { pageLen: 1024 }, expectRegs: { 8: '0x11', 9: '0x22' }, expectPC: ENTRY + 3 * STRIDE,
+      expectStats: { pageTruncated: undefined } }),
 ];
 
 let fail = 0;
