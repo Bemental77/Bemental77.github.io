@@ -226,5 +226,41 @@ if (want('away-15s-in-a-delay-room')) {
   ok('away-15s-in-a-delay-room', !bad.length, `${n} rooms in delay lockstep, a player away 15 s: ${rejoins} taken back, none failed, 0 desyncs, never below the ungated room (two players: but for the 3.5 s longer stall before the drop)`
      + '\n        ' + (bad.length ? bad.slice(0, 4).join('\n        ') : rows.slice(0, 4).join('\n        ')));
 }
+// ---- THE DEVICE CAP ON THE WINDOW (opts.rbMaxWindow, 'lsrb'/'lsready' mw) ----
+// A path that wants a deep window (150 ms one way: ~27 frames) and a console
+// whose savestate ring holds only 12: the host never decides a window deeper
+// than the smallest declared ring (never below RB_WINDOW_MIN), from the start
+// (declared at Ready) or when a console declares it later; nobody fails, no
+// desync, and the room still runs.
+if (want('window-cap')) {
+  const bad = [], rows = [];
+  for (const [players, atReady] of [[2, true], [4, true], [2, false], [4, false]]) {
+    const slow = players === 2 ? 'G1' : 'G2';
+    const sc = { name: 'cap', seed: 4, secs: 40, players, baseMs: 150, jitterMs: 40, loss: 0.02 };
+    if (atReady) sc.maxWindow = { [slow]: 12 };
+    else sc.maxWindowAt = (id, T) => (id === slow && T >= 15000 ? 12 : null);   // its page re-measured memory at 15 s
+    const free = simulate(Object.assign({}, sc, { maxWindow: null, maxWindowAt: null }));
+    const r = simulate(sc);
+    const tag = `${players}p/150ms/${atReady ? 'declared-at-Ready' : 'declared-at-15s'}`;
+    const c = Object.values(r.consoles);
+    const peak = Math.max(...c.map((x) => x.windowPeak || x.window));
+    const end = Math.max(...c.map((x) => x.window));
+    const failed = Object.entries(r.consoles).filter(([, x]) => x.state === 'failed' || x.state === 'desync').map(([k, x]) => k + ': ' + x.error);
+    rows.push(`${tag}: window peak ${peak}, end ${end} (uncapped room: peak ${Math.max(...Object.values(free.consoles).map((x) => x.windowPeak || x.window))}); room ${r.minRate.toFixed(4)}x; desync ${r.desyncs}; truth ${r.truthChecked - r.truthBad}/${r.truthChecked}`);
+    // ...and a capped window the path outgrows is not run at 0.5x: the gate
+    // moves the room to delay lockstep, said as a memory limit.
+    const sw = r.consoles.H.modes.find((m) => m.to === 'delay');
+    rows[rows.length - 1] += `; switch ${sw ? 'delay@' + sw.frame + ' "' + sw.text + '"' : 'none'}`;
+    const cappedPeak = atReady ? peak : Math.max(...c.map((x) => x.window));
+    // (a four-player 150 ms room needs most of a step's time for its deep
+    // corrections, so it may already have switched for TIME before 15 s; and
+    // the delay a capped room switches to starts low — inputs looked no later
+    // than the cap — and is raised by the pace machinery: >= 0.9x, not 0.5x)
+    const memOk = sw && (/cannot keep enough savestates/.test(sw.text) || (!atReady && sw.t < 15000 && /too slow/.test(sw.text)));
+    if ((sw && sw.t < 15000 && !atReady ? false : cappedPeak > 12) || failed.length || r.desyncs || r.truthBad || !r.truthChecked || r.minRate < 0.9
+        || !memOk || !sameEverywhere(r)) bad.push(rows[rows.length - 1] + ' ' + failed.join(' | '));
+  }
+  ok('window-cap', !bad.length, 'no window deeper than the smallest declared ring (12), and a room the cap would hold at ~0.5x switches to delay\n        ' + (bad.length ? bad : rows).join('\n        '));
+}
 console.log(`\n[rb-capacity] ${pass}/${pass + fail} passed`);
 process.exit(fail ? 1 : 0);

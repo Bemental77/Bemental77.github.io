@@ -46,8 +46,21 @@ function runArm(name, opt) {
   // ---- the mock core ----
   const core = { state: 0x12345, pad: 0 };
   const Module = { _neil_ls_run_frame() { core.state = mix(core.state, core.pad); }, _neil_last_fp() { return core.state; } };
+  let apiRef = null, lsRef = null;
   const sb = {
-    console, Math, Uint8Array, Int32Array, Array, Infinity, performance,
+    console, Math, Int32Array, Array, Infinity, performance,
+    // A slot is new Uint8Array(N64S.size = 8): opt.allocLimit makes the
+    // (allocLimit+1)th one throw, the way a full heap/browser refuses it.
+    Uint8Array: (function () {
+      const U = function (a, b, c) {
+        // live slots, not a running total: a freed slot gives its memory back
+        if (a === 8 && opt.allocLimit != null && apiRef && apiRef.RB.slots.length >= opt.allocLimit) throw new RangeError('out of memory (mock)');
+        return b === undefined ? new Uint8Array(a) : new Uint8Array(a, b, c);
+      };
+      U.prototype = Uint8Array.prototype; U.BYTES_PER_ELEMENT = 1;
+      return U;
+    })(),
+    lsEngine() { return lsRef; },
     location: { search: opt.query || '' }, URLSearchParams,
     navigator: { deviceMemory: 8 },
     window: { Module, __fbAsync: null, __n64RbLog: null, WebGL2RenderingContext: undefined },
@@ -63,8 +76,8 @@ function runArm(name, opt) {
   };
   sb.window.WebGL2RenderingContext = undefined;
   vm.createContext(sb);
-  vm.runInContext(SRC + '\n;this.__api = { rbRunFrame, RB, rbSlot };', sb);
-  const api = sb.__api;
+  vm.runInContext(SRC + '\n;this.__api = { rbRunFrame, RB, rbSlot, rbPublishCap };', sb);
+  const api = sb.__api; apiRef = api;
   if (opt.budgetSlots) api.RB.cap = opt.budgetSlots;   // re-applied after rbInit below
   // ---- the straight run ----
   const W = opt.window, P = opt.players;
@@ -88,7 +101,7 @@ function runArm(name, opt) {
     }
     return img;
   };
-  const ls = {
+  const ls = lsRef = {
     rollback: W, hashEvery: opt.hashEvery, frame: 0, selfStepMs: 0, fieldNames: null,
     rbRingFrames() { return W + 4; }, endFrame() {}, fail(why) { fails++; if (fails < 3) console.log('    engine fail: ' + why); },
     takeHashDue() { const q = hashDue.splice(0); return q; },
@@ -113,7 +126,7 @@ function runArm(name, opt) {
     }
     const cur = imageAt(f, f); used[f] = cur;
     const ok = api.rbRunFrame(ls, { frame: f, image: cur, rollback: plan }, false);
-    if (!budgetSet && opt.budgetSlots) { api.RB.cap = opt.budgetSlots; budgetSet = true; }
+    if (!budgetSet && opt.budgetSlots) { api.RB.cap = opt.budgetSlots; api.rbPublishCap('rig budget'); budgetSet = true; }
     if (!ok) { console.log(`    rbRunFrame failed at ${f}`); fails++; break; }
     // The present frame may run on a PREDICTION; the state is comparable with
     // the straight run whenever every frame so far ran on the true input.
@@ -134,12 +147,17 @@ function runArm(name, opt) {
     }
   }
   const RB = api.RB;
-  const pass = !fails && checked + hashOk >= 10 && !hashBad && RB.missingSlot === 0 && (!opt.budgetSlots || maxSlots <= opt.budgetSlots)
+  // THE WINDOW CAP the page tells the engine (rbPublishCap): always slots x K - 4
+  // from the CURRENT capacity and K; a refused allocation must LOWER it.
+  const wantCap = Math.max(4, RB.cap * Math.max(1, RB.k) - 4);
+  const capOk = ls.rbMaxWindow === wantCap && (opt.allocLimit == null || (RB.cap === opt.allocLimit && ls.rbMaxWindow <= Math.max(4, opt.allocLimit * RB.k - 4)));
+  if (!capOk) console.log(`    window cap ${ls.rbMaxWindow} != slots ${RB.cap} x K ${RB.k} - 4 = ${wantCap}`);
+  const pass = capOk && !fails && checked + hashOk >= 10 && !hashBad && (RB.missingSlot === 0 || opt.allowMissing) && (!opt.budgetSlots || maxSlots <= opt.budgetSlots)
              && (!opt.hashEvery || hashOk > 0) && RB.rollbacks > 0;
   console.log(`  ${pass ? 'PASS' : 'FAIL'}  ${name}: ${checked} of ${FRAMES} present states comparable, all = straight run; rollbacks ${RB.rollbacks}, `
     + `re-sim ${RB.resimFrames} + bridge ${RB.bridgeFrames} frames; saves ${RB.saves}, skipped ${RB.skippedSaves}; K=${RB.k}; `
     + `slots max ${maxSlots}${opt.budgetSlots ? ' (budget ' + opt.budgetSlots + ', evictions ' + RB.evictions + ')' : ''}; `
-    + `fingerprints ${hashOk} ok / ${hashBad} bad; missing ${RB.missingSlot}`);
+    + `fingerprints ${hashOk} ok / ${hashBad} bad; missing ${RB.missingSlot}; window cap ${ls.rbMaxWindow}`);
   return pass;
 }
 
@@ -158,6 +176,10 @@ const arms = [
   ['adaptive K', { query: '', window: 8, players: 2, hashEvery: 10, salt: 6 }],
   ['K=1, slot budget 4 < window (thinning)', { query: '?rbk=1', window: 12, players: 2, hashEvery: 10, budgetSlots: 4, salt: 7 }],
   ['K=3, slot budget 3 (thinning)', { query: '?rbk=3', window: 12, players: 2, hashEvery: 0, budgetSlots: 3, salt: 8 }],
+  // The mock engine here does NOT honour the cap (lib/netplay.js does: it
+  // shrinks the window or goes to delay), so fingerprints the thinned ring no
+  // longer holds are allowed to be skipped in this arm only — exactness is not.
+  ['K=2, the heap refuses the 5th slot (cap lowered)', { query: '?rbk=2', window: 8, players: 2, hashEvery: 10, allocLimit: 4, allowMissing: true, salt: 10 }],
   ['K=4 with run-ahead on (present saves forced)', { query: '?rbk=4', window: 8, players: 2, hashEvery: 10, ra: 1, salt: 9 }],
 ];
 for (const [n, o] of arms) { if (runArm(n, o)) pass++; else fail++; }

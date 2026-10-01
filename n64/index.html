@@ -25,7 +25,7 @@
        the wire. The file still exists because sibling pages have not been
        converted yet; loading it here would ship a second, contradictory online
        architecture on a page that has one. -->
-  <script src="/lib/netplay.js?v=7a8bb949"></script>
+  <script src="/lib/netplay.js?v=7c74eeaa"></script>
   <script src="/lib/mpgames.js"></script>
   <script>MPGames.gateParty('n64', ['btnNet', 'mobileSplashNet'], ['romSelect', 'mobileRomSelect']);</script>
   <script>
@@ -3537,6 +3537,18 @@ N64Rate.selfTest = function (logFn) {
       });
       if (info && info.me) text = text.split(String(info.me)).join(isHost ? 'host' : 'this console');
       text = text.replace(/\b[0-9a-f]{16}\b/g, 'a player');
+      // SAME GAME, DIFFERENT PAGE. The disc tag carries more than the cartridge
+      // (lsDiscTag: ' \u00b7 r1' protocol, ' \u00b7 fb-…' readback mode), so a
+      // console on an old cached page is refused as a "different game" while
+      // everyone picked the same one. Say what it is and what fixes it.
+      if (/same game|different game/.test(raw)) {
+        var tags = (raw.match(/"[^"]*"/g) || []).map(function (q) { return q.slice(1, -1); });
+        var base = tags.map(function (t) { return t.split(' \u00b7 ')[0]; });
+        if (tags.length > 1 && base.every(function (b) { return b === base[0]; })) {
+          text = 'everyone picked ' + base[0] + ', but not every console is running the same version of this page — '
+               + 'every player should reload the page (on a phone: close the tab and reopen it) and join again';
+        }
+      }
       error = text;
       if (NET.errorLogged !== raw) { NET.errorLogged = raw; pageLog('[lockstep] engine stopped: ' + raw); }
     }
@@ -3936,7 +3948,89 @@ N64Rate.selfTest = function (logFn) {
     dst.set(n64sSmView(), N64S.size);
     return true;
   }
+  // ═══ THE RAW STATE API (core b4004b8: neil_state_*) ═══════════════════════
+  // When the core exports it, every save and load goes through it instead of
+  // neil_serialize + the /savestate.gz directory trick: one call each way, the
+  // cartridge save memory, the LLE RSP, the RDP and the interpreter state the
+  // m64p format drops are IN the state (no 512 MB heap scans), and the loader
+  // invalidates only the code pages whose bytes changed (load mode 1). States
+  // live IN THE WASM HEAP (_malloc), which is a fixed 512 MB shared with the
+  // ROM: a slot that would leave the core less than N64S_RAW_RESERVE is never
+  // taken (rbPick then thins), so the ring is sized to the ROM by construction.
+  // Feature-detected; ?rawstate=0 keeps the legacy path (the control arm).
+  // ⚠ A FAILED _malloc DOES NOT RETURN 0 IN THIS BUILD — it ABORTS the runtime
+  // (TOTAL_MEMORY fixed, no growth: emscripten_resize_heap -> abort("OOM")).
+  // MEASURED: allocating until refusal threw Aborted(OOM). So the page never
+  // asks the heap for memory it may not have: it tracks the top of what it
+  // allocated (dlmalloc carves a fresh large block from the top), takes a
+  // slot only while the space above that top keeps N64S_RAW_RESERVE free for
+  // the core's own allocations, and never hands a state buffer back to the
+  // allocator — a freed one goes to a page-side pool and is reused.
+  var N64S_RAW_RESERVE = 64 * 1048576;
+  function n64sRawOk() {
+    if (N64S.raw != null) return N64S.raw;
+    var M = window.Module;
+    N64S.raw = !!(M && typeof M._neil_state_save_raw_fast === 'function' && typeof M._neil_state_load_raw === 'function'
+                  && typeof M._neil_state_size === 'function' && typeof M._malloc === 'function' && typeof M._free === 'function')
+               && new URLSearchParams(location.search).get('rawstate') !== '0';
+    if (N64S.raw) {
+      N64S.size = M._neil_state_size() >>> 0;
+      N64S.region = typeof M._neil_state_m64p_region === 'function' ? M._neil_state_m64p_region() >>> 0 : 16789504;
+      pageLog('[state] raw savestate API: ' + (N64S.size / 1048576).toFixed(1) + ' MB per state, in the wasm heap');
+    }
+    return N64S.raw;
+  }
+  // A state buffer in the wasm heap, or null when it would starve the core.
+  function n64sRawRoom() {
+    var len = window.Module.HEAPU8.length, top = N64S.top || 0;
+    return top ? Math.max(0, len - top - N64S_RAW_RESERVE) : len;
+  }
+  // How many more state buffers this heap can give without risking the core:
+  // the pool, plus what fits above the top while keeping the reserve.
+  function n64sRawCapacity() {
+    return (N64S.pool ? N64S.pool.length : 0) + Math.floor(n64sRawRoom() / N64S.size);
+  }
+  function n64sRawAlloc() {
+    var M = window.Module, v = N64S.pool && N64S.pool.length ? N64S.pool.pop() : null;
+    if (v) { if (v.buffer !== M.HEAPU8.buffer) { var q = v.__ptr; v = M.HEAPU8.subarray(q, q + N64S.size); v.__ptr = q; } N64S.heapBufs++; return v; }
+    if (N64S.top && n64sRawRoom() < N64S.size) return null;
+    var p = M._malloc(N64S.size);
+    if (!p) return null;
+    N64S.top = Math.max(N64S.top || 0, p + N64S.size);
+    v = M.HEAPU8.subarray(p, p + N64S.size);
+    v.__ptr = p; N64S.heapBufs = (N64S.heapBufs | 0) + 1;
+    return v;
+  }
+  function n64sFree(buf) {
+    if (buf && buf.__ptr) { (N64S.pool || (N64S.pool = [])).push(buf); N64S.heapBufs--; }
+  }
+  function n64sRawSave(dst) {
+    var M = window.Module, t0 = performance.now(), d = dst && dst.__ptr ? dst : null;
+    if (!d) { d = N64S.scratch || (N64S.scratch = n64sRawAlloc()); if (!d) { N64S.fault = 'no wasm heap left for a savestate'; return false; } }
+    if (!(M._neil_state_save_raw_fast(d.__ptr) | 0)) { N64S.fault = 'neil_state_save_raw refused'; return false; }
+    if (dst && d !== dst) dst.set(d);
+    N64S.located = true;
+    var dt = performance.now() - t0;
+    N64S.saves++; N64S.saveMs += dt; if (dt > N64S.maxSaveMs) N64S.maxSaveMs = dt;
+    return true;
+  }
+  function n64sRawLoad(src) {
+    var M = window.Module, t0 = performance.now(), s = src;
+    if (!src.__ptr) {
+      // A buffer the core did not write (a rig's copy): staged in a heap buffer
+      // of its own — never one the fast save reuses.
+      s = N64S.stage || (N64S.stage = n64sRawAlloc());
+      if (!s) { N64S.fault = 'no wasm heap left to stage a load'; return false; }
+      s.set(src.subarray(0, N64S.size));
+    }
+    if (!(M._neil_state_load_raw(s.__ptr) | 0)) { N64S.fault = 'neil_state_load_raw rejected the state (the machine is untouched)'; return false; }
+    if (typeof M._neil_state_last_load_mode === 'function' && M._neil_state_last_load_mode() === 1) N64S.keepLoads++;
+    var dt = performance.now() - t0;
+    N64S.loads++; N64S.loadMs += dt; if (dt > N64S.maxLoadMs) N64S.maxLoadMs = dt;
+    return true;
+  }
   function n64sSave(dst) {
+    if (n64sRawOk()) return n64sRawSave(dst);
     var M = window.Module, t0 = performance.now();
     if (N64S.located) n64sZeroTail();
     if (!n64sCall(false)) { N64S.fault = 'neil_serialize refused (savestates_save_m64p returned 0)'; return false; }
@@ -4002,6 +4096,7 @@ N64Rate.selfTest = function (logFn) {
   function n64sLoad(src) {
     var M = window.Module, t0 = performance.now();
     if (!N64S.located) { N64S.fault = 'a load before any save'; return false; }
+    if (N64S.raw) return n64sRawLoad(src);
     var keep = N64S_KEEP_CODE ? n64sCodeKeep(src) : null;
     // A slot's buffer is exactly state + save memory (alloc), so each half is
     // one subarray view; the copies themselves are memcpy.
@@ -4030,7 +4125,14 @@ N64Rate.selfTest = function (logFn) {
   // for a room: under read_always glide copies the RENDERED frame into RDRAM,
   // and two different GPUs rasterise a few pixels differently — the room would
   // "desync" on pixels no guest instruction ever read.
-  function n64sHashFull(u8) { return n64sFnv(2166136261, u8, 0, u8.length & ~3); }
+  // Raw layout: the trailer header's words 4-6 (instance nonce, TLB generation,
+  // hidden-plane epoch) are fast-save bookkeeping, not machine state, and differ
+  // between two instances — left out, everything else hashed.
+  function n64sHashFull(u8) {
+    if (!N64S.raw) return n64sFnv(2166136261, u8, 0, u8.length & ~3);
+    var R = N64S.region, h = n64sFnv(2166136261, u8, 0, R + 16);
+    return n64sFnv(h, u8, R + 28, u8.length & ~3);
+  }
   // The ROOM fingerprint of a saved state: the CPU fingerprint the lockstep path
   // already compares (_neil_last_fp: GPRs, CP0, FPRs, FCR31, PC — kept with the
   // slot), plus every device register, the RSP's 4 KB+4 KB, the PIF RAM, the
@@ -4043,13 +4145,18 @@ N64Rate.selfTest = function (logFn) {
   var N64S_FIELDS = ['cpu-fp', 'regs-hdr', 'sp-dmem', 'sp-imem', 'pif+flashregs', 'cpu-gpr-cp0-cp1', 'tlb+pc+queue',
                      'eeprom', 'controller-paks', 'sram', 'flashram'];
   function n64sRoomWords(u8, fp) {
-    var a = N64S_HDR + N64S_RDRAM, tail = a + N64S_SPPIF + N64S_LUT, S = 2166136261, sm = N64S.size;
+    // Raw layout: the m64p region ends where the legacy buffer did, and the
+    // save memory is the LAST section of the trailer (same struct layout).
+    var M64 = 16788288 + 1024;
+    var a = N64S_HDR + N64S_RDRAM, tail = a + N64S_SPPIF + N64S_LUT, S = 2166136261, sm = N64S.raw ? M64 : N64S.size;
     var w = [fp >>> 0, n64sFnv(S, u8, 0, N64S_HDR), n64sFnv(S, u8, a, a + 4096), n64sFnv(S, u8, a + 4096, a + 8192),
              n64sFnv(S, u8, a + 8192, a + (N64S_SPPIF & ~3)), n64sFnv(S, u8, tail & ~3, (tail + 4 + 256 + 128 + 16 + 256 + 8) & ~3),
              n64sFnv(S, u8, (tail + 4 + 256 + 128 + 16 + 256 + 8) & ~3, sm & ~3)];
-    if (u8.length >= sm + N64S_SM) {
-      w.push(n64sFnv(S, u8, sm, sm + 0x800), n64sFnv(S, u8, sm + 0x800, sm + 0x20800),
-             n64sFnv(S, u8, sm + 0x20800, sm + 0x28800), n64sFnv(S, u8, sm + 0x28800, sm + N64S_SM));
+    var so = N64S.raw ? u8.length - N64S_SM : sm;
+    if (N64S.raw ? (new DataView(u8.buffer, u8.byteOffset + N64S.region + 63 * 4, 4).getUint32(0, true) === N64S_SM)
+                 : u8.length >= sm + N64S_SM) {
+      w.push(n64sFnv(S, u8, so, so + 0x800), n64sFnv(S, u8, so + 0x800, so + 0x20800),
+             n64sFnv(S, u8, so + 0x20800, so + 0x28800), n64sFnv(S, u8, so + 0x28800, so + N64S_SM));
     }
     return w;
   }
@@ -4064,8 +4171,12 @@ N64Rate.selfTest = function (logFn) {
                                  saveMs: N64S.saves ? +(N64S.saveMs / N64S.saves).toFixed(2) : null, loadMs: N64S.loads ? +(N64S.loadMs / N64S.loads).toFixed(2) : null,
                                  maxSaveMs: +N64S.maxSaveMs.toFixed(2), maxLoadMs: +N64S.maxLoadMs.toFixed(2),
                                  keepCode: N64S_KEEP_CODE && !!window.__n64CorePtrs, codeKeptPerLoad: N64S.keepLoads ? +(N64S.codeKept / N64S.keepLoads).toFixed(1) : null,
-                                 codeDroppedPerLoad: N64S.keepLoads ? +(N64S.codeDropped / N64S.keepLoads).toFixed(1) : null }; },
-    alloc: function () { return new Uint8Array(N64S.size + N64S_SM); },
+                                 codeDroppedPerLoad: N64S.keepLoads ? +(N64S.codeDropped / N64S.keepLoads).toFixed(1) : null,
+                                 raw: !!N64S.raw, heapBufs: N64S.heapBufs | 0,
+                                 selectiveLoads: N64S.raw ? N64S.keepLoads : null }; },
+    alloc: function () { return n64sRawOk() ? n64sRawAlloc() : new Uint8Array(N64S.size + N64S_SM); },
+    free: function (buf) { n64sFree(buf); },
+    raw: function () { return n64sRawOk(); },
     save: function (dst) { return n64sSave(dst); },
     load: function (src) { return n64sLoad(src); },
     hashFull: function (u8) { return n64sHashFull(u8); },
@@ -4213,12 +4324,16 @@ N64Rate.selfTest = function (logFn) {
   }
   function rbInit(ls) {
     RB.n = rbSpan(ls);
-    RB.cap = Math.max(2, Math.floor(RB_RING_BUDGET_MB * 1048576 / (N64S.size + N64S_SM)));
+    n64sRawOk();
+    RB.cap = Math.max(2, Math.floor(RB_RING_BUDGET_MB * 1048576 / rbSlotBytes()));
+    if (RB.preCap > 0 && RB.preCap < RB.cap) RB.cap = RB.preCap;
+    rbPublishCap('the ring armed');
     RB.slots = [];
     if (!rbSaveAt(ls, ls.frame | 0)) { RB.fault = N64S.fault || 'the first savestate failed'; return false; }
     RB.ready = true;
     pageLog('[rollback] ARMED: window ' + (ls.rollback | 0) + ' frames, snapshots reach back ' + RB.n + ' frames, at most '
-          + RB.cap + ' exact states x ' + (N64S.size / 1048576).toFixed(1) + ' MB (allocated as used), one every '
+          + RB.cap + ' exact states x ' + (rbSlotBytes() / 1048576).toFixed(1) + ' MB (budget ' + RB_RING_BUDGET_MB
+          + ' MB, allocated as used; past it snapshots are thinned, never refused), one every '
           + (RB.kFixed ? RB.k + ' frames (?rbk)' : 'K frames, K adapted to the measured cost'
           ) + '; local input applied with 0 frames of delay');
     return true;
@@ -4227,10 +4342,46 @@ N64Rate.selfTest = function (logFn) {
   // must reach back as far as the largest window this room has run, BEFORE the
   // frame that could roll back that deep. Nothing is allocated here: slots are
   // added as saves need them, up to the budget, and thinned past it.
+  // THE BUDGET. navigator.deviceMemory is Chromium-only (and capped at 8):
+  // Safari — every iOS browser — reports nothing, and a 600 MB ring on top of
+  // the core's own heap is exactly what iOS kills a tab for. So with no
+  // deviceMemory the budget comes from what else the browser says: an iOS /
+  // iPadOS device (touch Mac UA included) or any mobile UA gets the phone
+  // budget, a desktop with a reported JS heap limit a quarter of it, and the
+  // rest a middle figure. Thinning (rbPick) keeps a room inside any budget.
   var RB_RING_BUDGET_MB = (function () {
-    var dm = +(navigator.deviceMemory || 0);
-    return dm && dm < 8 ? 300 : 600;
+    var dm = +(navigator.deviceMemory || 0), ua = navigator.userAgent || '';
+    if (dm) return dm < 4 ? 150 : dm < 8 ? 300 : 600;
+    var ios = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && (navigator.maxTouchPoints | 0) > 1);
+    if (ios || /Android|Mobile/.test(ua)) return 200;
+    var lim = performance && performance.memory && +performance.memory.jsHeapSizeLimit;
+    if (lim > 0) return Math.max(150, Math.min(600, Math.floor(lim / 4 / 1048576)));
+    return 400;
   })();
+  // What ONE slot really costs: the state, the 290 KB of cartridge save memory
+  // it carries (N64S_SM), and — when framebuffer readback is async — the GPU
+  // pack buffer its fbasync pin can keep alive (one RGBA copy of the frame).
+  function rbSlotBytes() {
+    var st = window.__fbAsync || {}, fb = 0;
+    if (st.on) { var c = document.querySelector('canvas'); fb = Math.max(640 * 480, c ? (c.width | 0) * (c.height | 0) : 0) * 4; }
+    return (N64S.raw ? N64S.size : N64S.size + N64S_SM) + fb;
+  }
+  // THE WINDOW THIS CONSOLE CAN HOLD, told to the engine (lib/netplay.js
+  // rbMaxWindow, carried in lsready and every 'lsrb'): the host never decides
+  // a window deeper than the smallest console's. `slots` snapshots, one every
+  // K frames, reach back slots*K frames; 4 frames of margin for the snapshot
+  // the next save replaces and the frames between the newest one and now.
+  // Re-published whenever K or the slot capacity changes — a heap that
+  // fragments (fewer slots fit) LOWERS it.
+  function rbPublishCap(why, slots) {
+    var ls = lsEngine(), n = slots != null ? slots : RB.cap;
+    if (!ls || !(n > 0)) return;
+    var c = Math.max(4, n * Math.max(1, RB.k) - 4);
+    if (ls.rbMaxWindow === c) return;
+    ls.rbMaxWindow = c; RB.maxWindow = c;
+    pageLog('[rollback] this console can hold a window of ' + c + ' frames (' + n + ' snapshots x one every ' + RB.k
+          + ' frames) — ' + why);
+  }
   function rbGrow(want) {
     var nn = want | 0;
     if (!RB.ready || nn <= RB.n) return true;
@@ -4268,12 +4419,17 @@ N64Rate.selfTest = function (logFn) {
     if (free.length) {
       // A K that grew leaves states nothing needs: keep one spare, hand the
       // rest back to the browser (16.8 MB each — a phone's memory).
-      for (i = 2; i < free.length; i++) { rbDrop(free[i]); S.splice(S.indexOf(free[i]), 1); RB.freed = (RB.freed | 0) + 1; }
+      for (i = 2; i < free.length; i++) { rbDrop(free[i]); n64sFree(free[i].buf); S.splice(S.indexOf(free[i]), 1); RB.freed = (RB.freed | 0) + 1; }
       return free[0];
     }
     if (S.length < RB.cap) {
-      try { s = { frame: -1, buf: new Uint8Array(N64S.size + N64S_SM), fb: null, fp: 0, pin: -1 }; S.push(s); return s; }
-      catch (e) { RB.cap = Math.max(S.length, 2); }
+      var nb = null;
+      try { nb = N64S.raw ? n64sRawAlloc() : new Uint8Array(N64S.size + N64S_SM); } catch (e) { nb = null; }
+      if (nb) { s = { frame: -1, buf: nb, fb: null, fp: 0, pin: -1 }; S.push(s); return s; }
+      RB.cap = Math.max(S.length, 2);
+      rbPublishCap('the ' + (N64S.raw ? 'wasm heap' : 'browser') + ' held only ' + RB.cap + ' snapshots');
+      pageLog('[rollback] the ' + (N64S.raw ? 'wasm heap (shared with the ROM)' : 'browser') + ' holds ' + S.length
+            + ' snapshots — past that they are thinned, never refused');
     }
     // Thin: never the anchor (or the oldest, standing in for it), never a
     // snapshot a fingerprint still needs unless nothing else is left.
@@ -4392,6 +4548,7 @@ N64Rate.selfTest = function (logFn) {
               + ' ms/frame expected, worst rollback ' + c1.worst.toFixed(1) + ' ms' + (best ? '' : ' (no K fits two fields)');
       pageLog('[rollback] snapshot every ' + RB.k + ' -> ' + nk + ' frames: ' + RB.kWhy);
       RB.k = nk; RB.kChanges++;
+      rbPublishCap('snapshot every ' + nk + ' frames');
       if (window.__n64RbLog) window.__n64RbLog.push(['k', RB.frames, nk]);
     }
   }
@@ -4763,6 +4920,59 @@ N64Rate.selfTest = function (logFn) {
   // load. It is the same frame on every machine (same ROM, same neutral input,
   // fresh boot), so the room still starts from one guest state; the disc tag's
   // 'r1' keeps a console that does not pre-roll out of the room.
+  // ROLLBACK-CAPABLE IS PROVEN, NOT ASSUMED. The engine reads rbCapable when
+  // this console declares (declareReady 'rb'), and a room rolls back only if
+  // every console said it can (lib/netplay.js). So, between main() returning
+  // and the declare, this page does what a rollback will need: one raw save
+  // (which also runs the one-time 512 MB heap scans for the state buffer and
+  // the save memory — here, while the room is still loading, not on frame 0).
+  // Nothing is LOADED here: before the pre-roll the
+  // core is pre-boot (lsPreroll) and a load would change the frame everyone
+  // starts from. Any failure declares this console NOT rollback-capable, so
+  // the room runs delay lockstep instead of failing on its first save.
+  // Likewise a read_always title with SYNCHRONOUS framebuffer readback
+  // (?fbasync=0): the GPU frame a re-simulated frame reads is not in any
+  // savestate and no fbasync pin restores it.
+  var LS_RB = { proven: null, why: null, ms: 0 };
+  function lsRbRefuse(why) {
+    LS_RB.proven = false; LS_RB.why = why;
+    var ls = lsEngine();
+    if (ls) ls.rbCapable = false;
+    pageLog('[rollback] this console declares itself NOT rollback-capable — ' + why + '; the room runs delay lockstep');
+  }
+  function lsRbProve() {
+    if (LS_RB.proven != null) return LS_RB.proven;
+    var ls = lsEngine();
+    if (!ls || !ls.rbCapable) { LS_RB.proven = false; LS_RB.why = 'not offered'; return false; }
+    var st = window.__fbAsync || {};
+    if (st.readAlways && !st.on) { lsRbRefuse('this title reads the framebuffer back every frame and readback is synchronous here (?fbasync=0)'); return false; }
+    // ⚠ ONE SAVE, NOT TWO COMPARED. Two back-to-back saves of this pre-boot
+    // core were measured to differ (raw API, MK64: byte 381640, inside RDRAM),
+    // so equality is not a property of a core that has not run its first frame
+    // — it refused rollback on every console. Exactness is the rollback
+    // probe's job (n64_rollback_probe, full-state hash against a straight run);
+    // this check proves only that the path EXISTS on this console: the state
+    // and save memory are found and a save succeeds.
+    var t0 = performance.now(), a = null;
+    try { a = window.__n64State.alloc(); } catch (e) { a = null; }
+    if (!a) { lsRbRefuse('no memory for a savestate'); return false; }
+    var ok = n64sSave(a);
+    try { window.__n64State.free(a); } catch (e) {}
+    if (!ok) { lsRbRefuse(N64S.fault || 'the savestate failed'); return false; }
+    // How many snapshots this console can hold, known now so the engine has
+    // it before Ready (lsready mw).
+    var budget = Math.max(2, Math.floor(RB_RING_BUDGET_MB * 1048576 / rbSlotBytes())), held = budget;
+    // (Raw: the buffer just saved into is back in the pool; nothing is
+    // allocated to find the answer — see N64S_RAW_RESERVE.)
+    if (N64S.raw) held = Math.max(2, Math.min(budget, n64sRawCapacity()));
+    RB.preCap = held;
+    rbPublishCap('measured before Ready', held);
+    LS_RB.proven = true; LS_RB.ms = performance.now() - t0;
+    pageLog('[rollback] savestate path proven before declaring (' + Math.round(LS_RB.ms) + ' ms' + (N64S.raw ? ', raw API' : ', heap scans included')
+          + '): this console is rollback-capable');
+    return true;
+  }
+
   function lsPreroll() {
     var M = window.Module;
     if (LS.prerolled || !LS.armed || !M || !M._neil_ls_run_frame) return;
@@ -5020,6 +5230,7 @@ N64Rate.selfTest = function (logFn) {
         // main() has returned: the ROM is loaded, emscripten_set_main_loop is
         // registered (and inert under the gate). Only now is this console able.
         NET.mainRan = true;
+        try { lsRbProve(); } catch (e) { lsRbRefuse('the savestate check threw: ' + ((e && e.message) || e)); }
         pageLog('[lockstep] main() has run — the core is booted and gated; declaring now');
         try { autoDeclare(); } catch (e) { pageLog('[lockstep] declare threw: ' + ((e && e.message) || e)); }
         return r;
@@ -5606,6 +5817,15 @@ N64Rate.selfTest = function (logFn) {
   window.__n64LsAttach = function (opts) {
     if (!window.Netplay || !Netplay.Lockstep) return null;
     var ls = new Netplay.Lockstep(opts || {});
+    // TEST-ONLY (?rbgate=0, rig attach only): no console advertises engine mode
+    // switching ('ms'), so the host never capacity-gates the room. Exactness rigs
+    // need rollback to actually RUN; on a loaded box the gate (lib/netplay.js
+    // _capDecide) correctly moves the room to delay and the rig measures nothing.
+    if (new URLSearchParams(location.search).get('rbgate') === '0' && typeof ls._lobbySet === 'function') {
+      var lobbySet = ls._lobbySet;
+      ls._lobbySet = function (p, d, cu, rb, wr, x) { return lobbySet.call(this, p, d, cu, rb, wr, Object.assign({}, x || {}, { ms: false })); };
+      pageLog('[rollback] ?rbgate=0: capacity gating disabled for this rig room');
+    }
     NET.session = {
       ls: ls, state: 'connected', code: (opts && opts.code) || 'TEST',
       close: function () {}, setReady: function () { return true; },
@@ -5639,7 +5859,7 @@ N64Rate.selfTest = function (logFn) {
         engine: (function () { try { return ls.rollbackReport(); } catch (e) { return null; } })(),
         page: { ready: RB.ready, slots: RB.n, reach: RB.n, cap: RB.cap, allocated: RB.slots.length, rollbacks: RB.rollbacks,
                 hidden: RB.hidden, stepMs: +(RB.stepMs || 0).toFixed(2), pace: LS.pace || 1,
-                k: RB.k, kFixed: RB.kFixed, kChanges: RB.kChanges, kWhy: RB.kWhy,
+                k: RB.k, kFixed: RB.kFixed, maxWindow: RB.maxWindow || 0, kChanges: RB.kChanges, kWhy: RB.kWhy,
                 runMs: +RB.runEma.toFixed(2), saveMs: +RB.saveEma.toFixed(2), loadMs: +RB.loadEma.toFixed(2),
                 rollbacksPerFrame: +RB.pEma.toFixed(4), depthAvg: RB.rollbacks ? +(RB.depthSum / RB.rollbacks).toFixed(2) : 0,
                 resimFrames: RB.resimFrames, bridgeFrames: RB.bridgeFrames, maxDepth: RB.maxDepth, depthHist: RB.depthHist, loads: RB.loads,
