@@ -31,6 +31,8 @@
 // USAGE (npm run web first)
 //   bash tools/probe_lock.sh run -- node n64/tools/n64_profile_probe.mjs [--cpu 4] [--desktop] [--secs 20]
 //        [--room lockstep|rollback] [--lat 50] [--noprofile] [--url http://localhost:8080] [--query k=v]
+// ⚠ This rig steps the core through window.Module / window.__n64State on the PAGE, so it pins
+// the main-thread core (?worker=0) unless --query names a worker= arm itself.
 import { createRequire } from 'node:module';
 import { writeFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -145,7 +147,7 @@ try {
       };
     } catch (e) {}
   });
-  await page.goto(`${BASE}/n64/?rbw=8${QUERY ? '&' + QUERY : ''}`, { waitUntil: 'domcontentloaded' });
+  await page.goto(`${BASE}/n64/?rbw=8${QUERY ? '&' + QUERY : ''}${/(^|&)worker=/.test(QUERY || '') ? '' : '&worker=0'}`, { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => !!document.getElementById('romSelect'), { timeout: 60000 });
   if (ROOM) {
     await page.waitForFunction(() => !!window.__n64LsAttach && !!window.Netplay, { timeout: 60000 });

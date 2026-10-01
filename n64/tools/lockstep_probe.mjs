@@ -86,6 +86,15 @@ const RUNS = parseInt(flag('runs', '2'), 10);
 // whose pairing is completely broken.
 const ARMS = flag('arms', 'solo,bridge,pair').split(',').map((s) => s.trim()).filter(Boolean);
 const JSONPATH = flag('json', '/tmp/n64-lockstep.json');
+// --query 'k=v&...' is appended to the `pair` and `attach` URLs (e.g. worker=0 for the
+// main-thread room, worker=1 to insist on the core worker). The `solo` and `bridge` arms
+// step window.Module themselves, so they always pin the MAIN-THREAD core (?worker=0): the
+// worker-hosted core's equivalence to it is n64/tools/n64_worker_probe.mjs --mode exact.
+const XQ = flag('query', '');
+const XQS = XQ ? '&' + XQ : '';
+// --join-query 'k=v' is appended to the JOINER's pair URL only: a MIXED room, e.g. a
+// main-thread host (--query worker=0) with a worker joiner (--join-query worker=1).
+const JQ = flag('join-query', '');
 
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const mkCode = () => Array.from({ length: 5 },
@@ -155,12 +164,14 @@ async function clickReal(page, sel) {
 // would. Returns a handle whose .approved says whether it ever fired, so a run
 // can report "nobody ever asked" separately from "asked and was let in".
 function admitWatcher(page, log, tag) {
-  const h = { approved: false, why: null, stop: false };
+  // It keeps watching after the first Allow: a page that RELOADS (the core worker's
+  // automatic fallback to the main thread, ?workerfail=) re-forms the room and asks again.
+  const h = { approved: false, approvals: 0, why: null, stop: false };
   (async () => {
-    while (!h.stop && !h.approved) {
+    while (!h.stop) {
       try {
         const r = await clickReal(page, '#npApproveAllow');
-        if (r.clicked) { h.approved = true; log.push('[' + tag + '] [rig] pressed Allow — the joiner is admitted'); break; }
+        if (r.clicked) { h.approved = true; h.approvals++; log.push('[' + tag + '] [rig] pressed Allow — the joiner is admitted'); await sleep(1000); continue; }
         if (r.why && r.why !== 'no such control') h.why = r.why;
       } catch (e) { /* navigation between polls */ }
       await sleep(200);
@@ -244,7 +255,7 @@ async function openPage(browser, url, tag, log, sameContext, preload) {
 // (ROM, frame index, input)" from anything the network or the engine does.
 // ---------------------------------------------------------------------------
 async function runSolo(browser, log) {
-  const url = BASE + '/n64/?game=' + encodeURIComponent(GAME) + '&autostart';
+  const url = BASE + '/n64/?game=' + encodeURIComponent(GAME) + '&autostart&worker=0';
   const trace = [];
   for (let rep = 0; rep < 2; rep++) {
     const { page, close } = await openPage(browser, url, 'solo' + rep, log, false);
@@ -325,7 +336,7 @@ async function runBridge(browser, log) {
   // rig has to honour it or it measures its own mistake. This mirrors it: the
   // hook is installed by evaluateOnNewDocument, so it is in place before any
   // page script runs, and it wraps beforeRun the moment myApp exists.
-  const url = BASE + '/n64/?game=' + encodeURIComponent(GAME);
+  const url = BASE + '/n64/?game=' + encodeURIComponent(GAME) + '&worker=0';
   const armEarly = (page) => page.evaluateOnNewDocument(() => {
     window.__armedAtBoot = false;
     const iv = setInterval(() => {
@@ -508,7 +519,7 @@ async function runBridge(browser, log) {
 // gate had become an accelerator, which CLAUDE.md gate #9 forbids outright.
 // ---------------------------------------------------------------------------
 async function runAttach(browser, log) {
-  const url = BASE + '/n64/?game=' + encodeURIComponent(GAME);
+  const url = BASE + '/n64/?game=' + encodeURIComponent(GAME) + XQS;
   const A = await openPage(browser, url, 'A', log, true);
   const B = await openPage(browser, url, 'B', log, true);
   try {
@@ -558,7 +569,9 @@ async function runAttach(browser, log) {
       const [na, nb] = await Promise.all([netState(A.page), netState(B.page)]);
       last = { a: na, b: nb };
       if (na && na.frame > 0 && na.lastFp) fpA.set(na.frame, na.lastFp >>> 0);
+      if (na && Array.isArray(na.fps)) for (const [f, v] of na.fps) if (f > 0 && v) fpA.set(f, v >>> 0);
       if (nb && nb.frame > 0 && nb.lastFp) fpB.set(nb.frame, nb.lastFp >>> 0);
+      if (nb && Array.isArray(nb.fps)) for (const [f, v] of nb.fps) if (f > 0 && v) fpB.set(f, v >>> 0);
       const desync = (na && na.engine && na.engine.desync) || (nb && nb.engine && nb.engine.desync);
       if (desync) break;
       if (Math.min(na ? na.frame : 0, nb ? nb.frame : 0) >= FRAMES) break;
@@ -603,9 +616,10 @@ async function runAttach(browser, log) {
 // ---------------------------------------------------------------------------
 async function runPair(browser, log) {
   const code = mkCode();
-  const q = '&net=local';
+  const q = '&net=local' + XQS;
   const hostUrl = BASE + '/n64/?np=' + code + '&game=' + encodeURIComponent(GAME) + q;
-  const joinUrl = hostUrl + '&join=1';
+  // The joiner's own --join-query wins over the shared --query (URLSearchParams.get takes the first).
+  const joinUrl = JQ ? BASE + '/n64/?np=' + code + '&game=' + encodeURIComponent(GAME) + '&' + JQ + q + '&join=1' : hostUrl + '&join=1';
 
   const A = await openPage(browser, hostUrl, 'host', log, true);
   await sleep(400);                      // let the host publish before the joiner calls
@@ -665,7 +679,11 @@ async function runPair(browser, log) {
       const [na, nb] = await Promise.all([netState(A.page), netState(B.page)]);
       last = { a: na, b: nb };
       if (na && na.frame > 0 && na.lastFp) sampA.set(na.frame, na.lastFp >>> 0);
+      // EVERY presented frame's fingerprint, not just the polled one: the page's ring (room_core.js FPR).
+      if (na && Array.isArray(na.fps)) for (const [f, v] of na.fps) if (f > 0 && v) sampA.set(f, v >>> 0);
       if (nb && nb.frame > 0 && nb.lastFp) sampB.set(nb.frame, nb.lastFp >>> 0);
+      // EVERY presented frame's fingerprint, not just the polled one: the page's ring (room_core.js FPR).
+      if (nb && Array.isArray(nb.fps)) for (const [f, v] of nb.fps) if (f > 0 && v) sampB.set(f, v >>> 0);
       if ((na && na.engine && na.engine.desync) || (nb && nb.engine && nb.engine.desync)) break;
       if (Math.min(na ? na.frame : 0, nb ? nb.frame : 0) >= FRAMES) break;
       if (Date.now() - t0 > 300000) break;
@@ -682,6 +700,10 @@ async function runPair(browser, log) {
       if (sampA.get(f) !== sampB.get(f)) { firstDiff = { frame: f, a: sampA.get(f), b: sampB.get(f) }; break; }
     }
 
+    // The page's own meter on each side (made / shown / speed): the readouts a player sees.
+    const meter = (P) => P.page.evaluate(() => { const r = window.__n64Rate; return r ? { speed: r.speed && +r.speed.toFixed(3), speedFrom: r.speedFrom,
+      made: r.made, shown: r.shown, gameHz: r.gameHz && +r.gameHz.toFixed(1), worker: !!(window.__n64Net && window.__n64Net().worker) } : null; }).catch(() => null);
+    const meters = { host: await meter(A), join: await meter(B) };
     // 6. THE GUEST RATE (CLAUDE.md gate #9). Frames actually run divided by wall
     //    seconds, against the ROM's own region rate. Lockstep may only ever make
     //    this LOWER than 1.000x; a figure above it would mean the gate had
@@ -694,7 +716,7 @@ async function runPair(browser, log) {
       // Reported so a pass cannot be confused with a room that never needed
       // admitting, and so a future regression in the dialog is named rather
       // than showing up as a dead core.
-      admitted: admit.approved, admitBlocked: admit.why,
+      admitted: admit.approved, admissions: admit.approvals, admitBlocked: admit.why, meters,
       framesHost: last.a ? last.a.frame : 0,
       framesJoin: last.b ? last.b.frame : 0,
       compared, firstDiff,
