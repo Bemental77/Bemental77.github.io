@@ -50,6 +50,14 @@
 //                    fingerprinted state equals a straight run of the true
 //                    inputs (stronger than the engines agreeing with each other).
 //
+// CAPACITY GATING (tools/netplay_rb_capacity_test.mjs) adds: `runFrac` (a
+// delay-lockstep frame costs that share of a rollback step — no savestate
+// load/save), `stepMsAt(id, T)` (a console's step cost over time), `rbResume`
+// / `freshStep` (the page keeps its step estimate fresh in delay lockstep),
+// `readyStepMs` (the step a page reports at Ready) and `hintMs` (the host's
+// one-way path hint). The zero-lag check counts rollback frames only, and the
+// straight run uses the inputs each owner actually queued for each frame.
+//
 // Deterministic (seeded PRNG): a cell reproduces exactly.
 // USAGE  node tools/netplay_rb_pace_sim.mjs [--cell NAME] [--secs N] [--json]
 //        NETPLAY_JS=/path/to/old/netplay.js node tools/netplay_rb_pace_sim.mjs   (A/B)
@@ -149,6 +157,10 @@ export function simulate(sc) {
     const p = P[id] = {
       id, host, busyUntil: 0, lastTs: 0, accum: 0, frames: 0, hidden: 0, presented: 0, ticks: 0,
       stepMs: (sc.stepMs && sc.stepMs[id] != null) ? sc.stepMs[id] : (sc.stepMsAll || 1.5),
+      // CAPACITY GATING (tools/netplay_rb_capacity_test.mjs): a DELAY-lockstep
+      // frame runs the core without the savestate load + save, so it costs
+      // runFrac x the rollback step (1 = the old model: every frame costs a step).
+      runFrac: sc.runFrac == null ? 1 : sc.runFrac, drainTo: -1, modes: [], truth: new Map(), truthTo: -1,
       ring: new Map(), st: 0x811c9dc5, started: false, beganAt: null, declared: false,
       sampled: new Map(), lagN: 0, lagBad: 0, resim: 0, maxTickWork: 0, aheadMax: -Infinity,
       hashes: new Map(), win: [], winAt: 0, winF: 0, frameAt: [], creditOver: -Infinity, rejoinTicks: 0, pacedTicks: 0,
@@ -162,12 +174,22 @@ export function simulate(sc) {
                    } };
     const old = sc.oldIds && sc.oldIds.includes(id);
     if (sc.catchUp !== false && !old) { opts.rbCatchUp = true; opts.selfStepMs = p.stepMs; }
+    // sc.readyStepMs: what the page had measured BEFORE the room started (a
+    // step cost from an earlier room) — the host's start-of-room decision reads it.
+    if (sc.readyStepMs && sc.readyStepMs[id] != null) opts.selfStepMs = sc.readyStepMs[id];
+    else if (sc.readyStepMs) opts.selfStepMs = 0;
+    if (sc.rbResume) opts.rbResume = true;
+    if (host && sc.hintMs) opts.rbHintMs = sc.hintMs;
     if (sc.lockstep) { opts.rollback = 0; opts.delay = sc.delay || 3; }
     // A naive page does not know rollback exists: it passes no rollback option.
     if (sc.naiveIds && sc.naiveIds.includes(id)) { delete opts.rollback; delete opts.rbCatchUp; delete opts.selfStepMs; }
     p.ls = old ? new (oldLockstep(sc.oldRef || 'ffc0f52'))(opts) : new Lockstep(opts);
     p.old = !!old;
-    p.ls.selfStepMs = p.stepMs;
+    if (!sc.readyStepMs) p.ls.selfStepMs = p.stepMs;
+    p.ls.on('mode', (e) => p.modes.push({ t: Math.round(T), frame: e.frame, to: e.to, delay: e.delay, window: e.window, mine: e.mine, text: e.text }));
+    // A room just back in rollback drains the delay queue it built: its own
+    // pad reaches the frames already on the wire late (by design) until then.
+    p.ls.on('mode', (e) => { if (e.to === 'rollback') p.drainTo = p.ls._queuedTo; });
   }
   const H = P.H;
   for (const id of ids) H.ls.seat(id, 1);
@@ -184,6 +206,16 @@ export function simulate(sc) {
     for (const port of ls.localPorts) pads[port] = padFor(p.id, port, f);
     if (!p.sampled.has(f)) p.sampled.set(f, pads);
     const r = ls.beginFrame(pads, hidden ? { hidden: true } : undefined);
+    // THE ROOM'S TRUTH for this console's ports: exactly what it PUT for each
+    // frame (its pad on the frame in rollback, `delay` frames ahead — or held —
+    // in delay lockstep), recorded as it is queued.
+    // (a delay-lockstep room's first `delay` frames are the agreed neutral prologue)
+    if (p.truthTo < 0 && !ls.rollback) for (let k = 0; k < ls.delay; k++) for (const port of ls.localPorts) p.truth.set(port * 1e7 + k, [0, 0]);
+    for (let k = p.truthTo + 1; k <= ls._queuedTo; k++) {
+      const mp = ls.inputs.get(k);
+      for (const port of ls.localPorts) { const v = mp && mp.get(port); if (v) p.truth.set(port * 1e7 + k, [v[0], v[1]]); }
+      p.truthTo = k;
+    }
     if (!r.ready) return 0;
     let work = 0;
     // sc.naiveIds: a page with NO rollback branch (an old cached ps1.html): it
@@ -196,9 +228,15 @@ export function simulate(sc) {
       p.st = st;
     }
     const first = p.sampled.get(r.frame);
+    // ZERO LAG is the rollback room's promise: not owed by a delay-lockstep
+    // frame (capacity gating), nor while the room moves its pads ahead for a
+    // switch to delay, nor while one just back in rollback drains its queue.
+    const zeroLagOwed = ls.rollback && !(ls._modeNext && ls._modeNext.m === 0) && r.frame > p.drainTo;
     for (const port of ls.localPorts) {
+      const b = r.image.subarray(port * PAD, port * PAD + PAD);
+      if (!zeroLagOwed) continue;
       p.lagN++;
-      const a = first[port], b = r.image.subarray(port * PAD, port * PAD + PAD);
+      const a = first[port];
       if (!(ls._limp && ls._isLimp && ls._isLimp(port, r.frame)) && (a[0] !== b[0] || a[1] !== b[1])) p.lagBad++;
     }
     // genesis.html rbStep: EVERY frame loads its own start slot first. After a
@@ -209,10 +247,16 @@ export function simulate(sc) {
     if (start === undefined) throw new Error(p.id + ': no savestate for the start of frame ' + r.frame);
     p.st = coreStep(start, r.image, r.frame);
     p.ring.set(r.frame + 1, p.st);
-    work += p.stepMs;
+    work += ls.rollback ? p.stepMs : p.stepMs * p.runFrac;
+    // A page measures its rollback step on rollback frames; one that declared
+    // rbResume keeps that estimate fresh in delay lockstep too (sc.stepMsAt
+    // changes a console's cost over time).
+    if (ls.rollback || sc.rbResume || sc.freshStep) ls.selfStepMs = p.stepMs;
     // Delay lockstep (a room that fell back from rollback): the page hands the
     // fingerprint of the frame it just ran straight to endFrame.
-    ls.endFrame(!ls.rollback && ls.wantsHash(r.frame) ? p.st : null);
+    const lsHash = !ls.rollback && ls.wantsHash(r.frame);
+    ls.endFrame(lsHash ? p.st : null);
+    if (lsHash) p.hashes.set(r.frame, p.st);
     for (const k of ls.takeHashDue()) {
       const s = p.ring.get(k + 1);
       if (s === undefined) throw new Error(p.id + ': no state for the hash of frame ' + k);
@@ -228,6 +272,7 @@ export function simulate(sc) {
   function tick(p) {
     const ls = p.ls;
     if (outage(p.id) && !sc.linkOnly) { p.lastTs = 0; return; }   // a backgrounded tab runs nothing (sc.linkOnly: only its link is down)
+    if (sc.stepMsAt) { const v = sc.stepMsAt(p.id, T); if (v != null) p.stepMs = v; }
     if (!p.declared && ls.localPorts.length) { p.declared = true; ls.declareReady('g'); }
     const running = ls.state === 'running' || ls.state === 'stalled';
     if (!running) { p.lastTs = 0; return; }
@@ -283,6 +328,16 @@ export function simulate(sc) {
   q.push(100, sample);
   while (q.size) { const [t, , fn] = q.pop(); if (t > secs * 1000 + 1) break; T = t; fn(); }
 
+  // The inputs an owner had already put for frames it had not yet RUN when the
+  // clock stopped (delay lockstep queues them `delay` frames ahead) are the
+  // room's truth for those frames too.
+  for (const id of ids) {
+    const p = P[id];
+    for (const [k, mp] of p.ls.inputs) for (const port of p.ls.localPorts) {
+      const v = mp.get(port);
+      if (v && !p.truth.has(port * 1e7 + k)) p.truth.set(port * 1e7 + k, [v[0], v[1]]);
+    }
+  }
   // ---- verdicts -----------------------------------------------------------
   const warm = (sc.warmSecs == null ? 5 : sc.warmSecs) * 1000;
   const out = { name: sc.name, players: n, consoles: {} };
@@ -313,12 +368,14 @@ export function simulate(sc) {
       window: ls.rollback, windowPeak: ls._rbWinPeak || ls.rollback, stalls: rb.windowStalls, advWaits: rb.advantageWaits,
       rollbacks: rb.rollbacks, maxDepth: rb.maxDepth, resim: p.resim, catchUp: rb.catchUpFrames || 0,
       windowChanges: rb.windowChanges || 0, holeNaks: rb.holeNaks || 0, compared: rep.hashesCompared, maxTickWork: +p.maxTickWork.toFixed(1),
-      lag: p.lagBad + '/' + p.lagN, rejoinTicks: p.rejoinTicks, pacedTicks: p.pacedTicks, old: p.old };
+      lag: p.lagBad + '/' + p.lagN, rejoinTicks: p.rejoinTicks, pacedTicks: p.pacedTicks, old: p.old,
+      mode: ls.rollback ? 'rollback' : 'delay', delay: ls.delay, modes: p.modes };
   }
   // ---- the straight run: every fingerprinted state vs the TRUE inputs -----
   // True input for (frame, port): the owner's pad sampled on its first try,
   // or neutral where the engine agreed the port was limp.
   let truthChecked = 0, truthBad = 0;
+  const truthBadAt = [];
   {
     const hostLs = H.ls;
     let maxK = -1;
@@ -333,21 +390,24 @@ export function simulate(sc) {
         const who = ownerOf(port); if (who == null) continue;
         const limp = hostLs._limp && hostLs._isLimp && hostLs._isLimp(port, k);
         if (limp) continue;
-        // padFor is a pure function of (console, port, frame), and it is
-        // exactly what the owner sampled on its first try at k.
-        img.set(padFor(who, port, k), port * PAD);
+        // What the owner put for (k, port): the pad it sampled on its first try
+        // at k in rollback, the one it sampled `delay` frames earlier (or held)
+        // in delay lockstep. padFor (a pure function of console, port and frame)
+        // where the owner never ran k.
+        const own = P[who] && P[who].truth.get(port * 1e7 + k);
+        img.set(own ? new Uint8Array(own) : padFor(who, port, k), port * PAD);
       }
       st = coreStep(st, img, k);
       byK.set(k, st);
     }
     for (const id of ids) for (const [k, s] of P[id].hashes) {
       // a frame the host no longer holds input for cannot be re-derived here
-      truthChecked++; if (byK.get(k) !== s) truthBad++;
+      truthChecked++; if (byK.get(k) !== s) { truthBad++; if (truthBadAt.length < 8) truthBadAt.push(id + '@' + k); }
     }
   }
   out.minRate = +minRate.toFixed(4); out.maxWin5s = +maxWin.toFixed(4);
   out.lagBad = lagBad; out.lagN = lagN; out.desyncs = desyncs; out.compared = compared;
-  out.truthChecked = truthChecked; out.truthBad = truthBad;
+  out.truthChecked = truthChecked; out.truthBad = truthBad; out.truthBadAt = truthBadAt;
   out.net = stats; out.events = events;
   out.aheadMax = Math.max(...ids.map((id) => P[id].aheadMax));
   out.creditOver = Math.max(...ids.map((id) => P[id].creditOver));
