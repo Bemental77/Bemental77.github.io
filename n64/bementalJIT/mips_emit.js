@@ -930,6 +930,76 @@
       [OP.end],
       st);
   }
+  // ROUND.* and CVT.W/L.* (2026-09-30). fpu.h round_w_s is
+  // `(int32_t) roundf(x)` — half AWAY from zero, which the shipped binary
+  // reaches through a libc call — so f32.nearest (half to EVEN) is NOT it.
+  // Exact replacement, valid for every input:
+  //     t = trunc(x);  r = (|x - t| >= 0.5) ? t + copysign(1, x) : t
+  // x - t is exact (it is x's own fractional bits), and t + +-1 is exact
+  // because a nonzero fraction implies |t| < 2^23 (2^52 for doubles).
+  // NaN: x - t is NaN, the test is false, r = NaN; +-inf: inf - inf = NaN,
+  // r = inf. Both then take the guard's INT_MIN arm, exactly as
+  // roundToIntNat's trunc/ceil/floor do (same LLVM guard in the binary).
+  // CVT.* selects trunc/ceil/floor/round from FCR31&3 at RUN TIME, like
+  // cvt_w_s; the store/guard tail is shared with roundToIntNat.
+  function roundModeNat(p, srcIsS, dstIsW, fs, fd, byFcr31) {
+    var P = srcIsS ? 'f32_' : 'f64_';
+    var FT = srcIsS ? VT.f32 : VT.f64;
+    var srcBank = srcIsS ? p.cp1Simple : p.cp1Double;
+    var dstBank = dstIsW ? p.cp1Simple : p.cp1Double;
+    var ld = srcIsS ? [OP.f32_load, 0x02, 0x00] : [OP.f64_load, 0x03, 0x00];
+    var X = srcIsS ? L_F32 : L_F64, T = srcIsS ? L_F32B : L_F64B;
+    var half = srcIsS ? [OP.f32_const].concat(f32Bytes(0.5)) : [OP.f64_const].concat(f64Bytes(0.5));
+    var one = srcIsS ? [OP.f32_const].concat(f32Bytes(1)) : [OP.f64_const].concat(f64Bytes(1));
+    var COPYSIGN = srcIsS ? 0x98 : 0xA6;
+    var roundAway = [].concat(
+      [OP.local_get], leb(X), [OP[P + 'trunc'], OP.local_set], leb(T),
+      [OP.local_get], leb(X), [OP.local_get], leb(T), [OP[P + 'sub'], OP[P + 'abs']], half, [OP[P + 'ge']],
+      [OP.if_, FT],
+        [OP.local_get], leb(T), one, [OP.local_get], leb(X), [COPYSIGN, OP[P + 'add']],
+      [OP.else_],
+        [OP.local_get], leb(T),
+      [OP.end]);
+    var rnd;
+    if (!byFcr31) rnd = roundAway;
+    else {
+      var mode = loadI32(p.fcr31).concat([OP.i32_const, 0x03, OP.i32_and, OP.local_set, L_WORD]);
+      var op1 = function (o) { return [OP.local_get].concat(leb(X), [OP[P + o]]); };
+      rnd = [].concat(mode,
+        [OP.local_get, L_WORD, OP.i32_eqz, OP.if_, FT],
+          roundAway,
+        [OP.else_],
+          [OP.local_get, L_WORD, OP.i32_const, 0x01, OP.i32_eq, OP.if_, FT],
+            op1('trunc'),
+          [OP.else_],
+            [OP.local_get, L_WORD, OP.i32_const, 0x02, OP.i32_eq, OP.if_, FT],
+              op1('ceil'),
+            [OP.else_],
+              op1('floor'),
+            [OP.end],
+          [OP.end],
+        [OP.end]);
+    }
+    var bound = dstIsW ? 2147483648 : 9223372036854775808;
+    var boundBytes = srcIsS ? [OP.f32_const].concat(f32Bytes(bound)) : [OP.f64_const].concat(f64Bytes(bound));
+    var cvtOp = srcIsS ? (dstIsW ? OP.i32_trunc_f32_s : OP.i64_trunc_f32_s)
+                       : (dstIsW ? OP.i32_trunc_f64_s : OP.i64_trunc_f64_s);
+    var minBytes = dstIsW ? [OP.i32_const].concat(sleb(-2147483648))
+                          : [OP.i64_const].concat(sleb64(-9223372036854775808n));
+    var st = dstIsW ? [OP.i32_store, 0x02, 0x00] : [OP.i64_store, 0x03, 0x00];
+    return [].concat(
+      fprPtr(srcBank, fs), ld, [OP.local_set], leb(X),
+      fprPtr(dstBank, fd),
+      rnd, [OP.local_tee], leb(X),
+      [OP[P + 'abs']], boundBytes, [OP[P + 'lt']],
+      [OP.if_, dstIsW ? VT.i32 : VT.i64],
+        [OP.local_get].concat(leb(X), [cvtOp]),
+      [OP.else_],
+        minBytes,
+      [OP.end],
+      st);
+  }
+
   // plain converts: no rounding mode is observable (see the set_rounding note)
   function plainCvtNat(p, sub, fn, fs, fd) {
     var S = 0x10, D = 0x11, W = 0x14, L = 0x15;
@@ -1085,6 +1155,11 @@
           // see the wave-11a note above. wave 11b adds the compares (0x30-0x3F).
           var rc = CVT_ROUND[fn];
           if (rc) { fpCvt = true; nat = roundToIntNat(p, S, rc[1], rc[0], fs, fd); break; }
+          // 2026-09-30: ROUND.L/.W (0x08/0x0C) as an exact roundf/round, and
+          // CVT.W/.L (0x24/0x25) as the FCR31&3 dispatch fpu.h performs
+          // (cvt_w_s etc., fpu.h:180-219). CVT needs FCR31's address.
+          if (fn === 0x08 || fn === 0x0C) { fpCvt = true; nat = roundModeNat(p, S, fn === 0x0C, fs, fd, false); break; }
+          if ((fn === 0x24 || fn === 0x25) && fcr31Ok(p)) { fpCvt = true; nat = roundModeNat(p, S, fn === 0x24, fs, fd, true); break; }
           var pc1 = plainCvtNat(p, sub, fn, fs, fd);
           if (pc1) { fpCvt = true; nat = pc1; break; }
           if (fn >= 0x30 && fcr31Ok(p)) {
@@ -1120,8 +1195,19 @@
       nat = plainCvtNat(p, sub, fn, fs, fd);
       if (nat === null) return null;
       fpCvt = true;
+    } else if (sub === 0x02 && fcr31Ok(p) && fs !== 0) {
+      // CFC1 (2026-09-30), mips_instructions.def:760-771: after the CU1 check,
+      // `if (rfs==31) rrt32 = SE32(FCR31)` — rrt32 is the LOW 32-bit half of
+      // reg[rt] only, so the high half is PRESERVED — and any rfs other than
+      // 0 and 31 writes nothing. RCFC1 (recomp.c:1549-1556) RNOPs rt == 0.
+      // fs == 0 (FCR0) stays a fallback: its address is not in the block.
+      if (rt === 0) return [];                                       // recomp.c RNOP
+      if (fs === 31) {
+        nat = C.read(rt).concat([OP.i64_const], sleb64(-4294967296n), [OP.i64_and],
+          loadI32(p.fcr31), [OP.i64_extend_i32_u, OP.i64_or], C.writeFromStack(rt));
+      } else nat = [];
     } else {
-      return null; // BC1 branches, COP1 control moves (CFC1/CTC1): fallback
+      return null; // BC1 branches, CTC1, CFC1 $0: fallback
     }
     if (fpCvt) stats.nativeFPCvt++;
     if (fpCmp) stats.nativeFPCmp++;

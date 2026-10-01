@@ -208,7 +208,7 @@ async function runArm(arm, round, opts) {
   const res = { arm: arm.name, round, fp: [], rd: [], fb: [], errs, logs };
   let f = 0;
   const stops = [...new Set([W0, W1, FRAMES, ...(round === 0 ? SHOTS : [])])].filter((x) => x > 0 && x <= FRAMES).sort((a, b) => a - b);
-  let costA = null, prof = null, loadA = null, loadB = null, censusA = null, censusB = null;
+  let costA = null, prof = null, loadA = null, loadB = null, censusA = null, censusB = null, blocksA = 0;
   const runTo = async (to) => {
     while (f < to) {
       const end = Math.min(to, f + CHUNK);
@@ -264,6 +264,7 @@ async function runArm(arm, round, opts) {
     loadA = load1();
     costA = await page.evaluate(() => ({ ms: Module._neil_frame_cost_ms(), n: Module._neil_frame_cost_n(), t: performance.now() }));
     censusA = await page.evaluate(() => (window.__jitCensusDump ? window.__jitCensusDump() : null));
+    blocksA = await page.evaluate(() => (window.__jitStats ? (window.__jitStats().blocks || 0) : 0));
     if (opts.profile) { await cdp.send('Profiler.enable'); await cdp.send('Profiler.setSamplingInterval', { interval: 250 }); await cdp.send('Profiler.start'); }
   };
   for (const stop of stops) {
@@ -282,6 +283,8 @@ async function runArm(arm, round, opts) {
       res.callMsPerFrame = +(res.callMs / (W1 - W0)).toFixed(3);
       res.wallMsPerFrame = +((costB.t - costA.t) / (W1 - W0)).toFixed(3);
       res.capX = +((1000 / res.costMsPerFrame) / VIHZ).toFixed(3);
+      // spans compiled INSIDE the window: compile time is charged to retro_run
+      res.compilesInWindow = (await page.evaluate(() => (window.__jitStats ? (window.__jitStats().blocks || 0) : 0))) - blocksA;
       res.load = [loadA, loadB];
     }
     if (f === W0 && costA === null) await enterWindow();
@@ -439,7 +442,7 @@ try {
       const res = await runArm(arm, r, { profile: r === 0 && PROFILE_ARM === arm.name });
       results.push(res);
       const summary = { round: r, arm: res.arm, costMsPerFrame: res.costMsPerFrame, callMsPerFrame: res.callMsPerFrame,
-        wallMsPerFrame: res.wallMsPerFrame, capX: res.capX, load: res.load, frames: res.fp.length,
+        wallMsPerFrame: res.wallMsPerFrame, capX: res.capX, load: res.load, frames: res.fp.length, compilesInWindow: res.compilesInWindow,
         jit: res.jit ? { blocks: res.jit.blocks, nativeOps: res.jit.nativeOps, fallbackOps: res.jit.fallbackOps,
           nullOpsRejects: res.jit.nullOpsRejects, emitFails: res.jit.emitFails, mode: res.jit.mode } : null,
         errs: res.errs.slice(0, 3), logs: res.logs.slice(0, 4) };

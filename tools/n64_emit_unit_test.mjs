@@ -283,6 +283,49 @@ function T(name, words, { regs = {}, dram = {}, expectRegs = {}, expectDram = {}
   return { name, ok: bad.length === 0, detail: bad.join('; ') };
 }
 
+
+// Reference for ROUND/CVT: fpu.h + the guard LLVM emitted in the shipped
+// binary (see the wave-11a note in the emitter). mode: 0 round (roundf, half
+// away), 1 trunc, 2 ceil, 3 floor.
+function refRound(x, mode) {
+  if (mode === 1) return Math.trunc(x);
+  if (mode === 2) return Math.ceil(x);
+  if (mode === 3) return Math.floor(x);
+  const t = Math.trunc(x);
+  return Math.abs(x - t) >= 0.5 ? t + (x < 0 ? -1 : 1) : t;
+}
+function refW(x, mode) { const r = refRound(x, mode); return (Math.abs(r) < 2147483648) ? ('0x' + ((r | 0) >>> 0).toString(16)) : '0x80000000'; }
+function refL(x, mode) {
+  const r = refRound(x, mode);
+  if (!(Math.abs(r) < 9223372036854775808)) return '0x8000000000000000';
+  return '0x' + BigInt.asUintN(64, BigInt(r)).toString(16);
+}
+function cvtCases() {
+  const vals = [2.5, -2.5, 0.5, -0.5, 1.5, -1.49, 3.7, -3.7, 0, -0, 1e10, -1e10, 2147483520, 8388607.5,
+                NaN, Infinity, -Infinity, 1e30];
+  const out = [];
+  for (const S of [true, false]) {
+    for (const W of [true, false]) {
+      const fmt = S ? FMT.S : FMT.D, sfx = (W ? 'W' : 'L') + '.' + (S ? 'S' : 'D');
+      const conv = (x) => S ? Math.fround(x) : x;
+      const exp = (x, m) => W ? refW(conv(x), m) : refL(conv(x), m);
+      // ROUND.*: one block per value
+      for (const v of vals) {
+        out.push(T(`ROUND.${sfx}(${v})`, [C1(fmt, 1, 2, W ? FN.ROUND_W : FN.ROUND_L)],
+          { [S ? 'fprF32' : 'fprF64']: { 1: v }, [W ? 'expectFprI32' : 'expectFprI64']: { 2: exp(v, 0) },
+            expectStats: { nativeFPCvt: 1, fallbackOps: 0 } }));
+      }
+      // CVT.*: every FCR31 rounding mode, FCR31 carrying unrelated bits too
+      for (const m of [0, 1, 2, 3]) for (const v of [2.5, -2.5, -0.5, 3.7, -3.7, NaN, 1e30]) {
+        out.push(T(`CVT.${sfx}(${v}) mode ${m}`, [C1(fmt, 1, 2, W ? FN.CVT_W : FN.CVT_L)],
+          { fcr31: 0x01800000 | m, [S ? 'fprF32' : 'fprF64']: { 1: v }, [W ? 'expectFprI32' : 'expectFprI64']: { 2: exp(v, m) },
+            expectFcr31: '0x' + ((0x01800000 | m) >>> 0).toString(16), expectStats: { nativeFPCvt: 1, fallbackOps: 0 } }));
+      }
+    }
+  }
+  return out;
+}
+
 const V = '0xdeadbeef12345678';
 const SLOW_ADDR = '0xffffffffa0000000';   // dispatch entry is not *_rdram => slow arm
 const HIT_ADDR = '0x100000';              // dispatch entry is *_rdram      => fast arm
@@ -434,21 +477,32 @@ const tests = [
     { fprF64: { 1: 0.25 }, expectFprF32: { 2: 0.25 },
       expectStats: { nativeFPCvt: 1, fallbackOps: 0 } }),
 
-  // ---- wave 11a: what must STILL fall back, and why ----
-  // ROUND.* lowers to a roundf() CALL in the shipped binary (func 2553 =
-  // `call 700`). C round() is half-AWAY-from-zero; wasm f32.nearest is
-  // half-to-EVEN. Emitting f32.nearest would be wrong at exactly .5, so this
-  // must keep falling back until roundf is open-coded.
-  T('ROUND.W.S must FALL BACK (roundf != f32.nearest at .5)', [C1(FMT.S, 1, 2, FN.ROUND_W)],
-    { expectStats: { nativeFPCvt: 0, fallbackOps: 1 } }),
-  T('ROUND.L.S must FALL BACK', [C1(FMT.S, 1, 2, FN.ROUND_L)],
-    { expectStats: { nativeFPCvt: 0, fallbackOps: 1 } }),
-  // CVT.W.* / CVT.L.* dispatch on FCR31&3 (funcs 2554-2557) and FCR31's
-  // address is not in the jit_params block
-  T('CVT.W.S must FALL BACK (FCR31 rounding-mode dispatch)', [C1(FMT.S, 1, 2, FN.CVT_W)],
-    { expectStats: { nativeFPCvt: 0, fallbackOps: 1 } }),
-  T('CVT.L.D must FALL BACK (FCR31 rounding-mode dispatch)', [C1(FMT.D, 1, 2, FN.CVT_L)],
-    { expectStats: { nativeFPCvt: 0, fallbackOps: 1 } }),
+  // ---- ROUND.* and CVT.W/L.* native (2026-09-30) ----
+  // These USED to be pinned as must-fall-back: ROUND because the binary's
+  // roundf is half-AWAY-from-zero (f32.nearest is half-to-even), CVT because
+  // it dispatches on FCR31&3 and FCR31's address was not in the param block.
+  // The emitter now open-codes roundf exactly and reads FCR31 (wave 11b put
+  // its address in the block), so they are VALUE tests against a reference
+  // of fpu.h + the LLVM guard: r = round(x); |r| < 2^k ? (int)r : INT_MIN.
+  // The .5 rows are the ones f32.nearest gets wrong (2.5 -> 2, -0.5 -> -0).
+  ...cvtCases(),
+  // without FCR31 the CVT forms cannot dispatch and must still fall back;
+  // ROUND does not read FCR31 and stays native
+  // CFC1 $31 writes ONLY the low word of rt (rrt32): the high half survives
+  T('CFC1 rt, $31 replaces the LOW word and keeps the high word',
+    [((0x11 << 26) | (0x02 << 21) | (9 << 16) | (31 << 11)) >>> 0, OR(10, 9, 0)],
+    { fcr31: 0x01800003, regs: { 9: '0xdeadbeef12345678' },
+      expectRegs: { 9: '0xdeadbeef01800003', 10: '0xdeadbeef01800003' }, expectStats: { fallbackOps: 0 } }),
+  T('CFC1 with CU1 clear still hands back to the interpreter',
+    [((0x11 << 26) | (0x02 << 21) | (9 << 16) | (31 << 11)) >>> 0],
+    { fcr31: 0x01800003, regs: { 9: '0x5' }, opts: { cu1: false }, expectRegs: { 9: '0x5' } }),
+  T('CFC1 rt, $0 (FCR0) stays a fallback', [((0x11 << 26) | (0x02 << 21) | (9 << 16) | (0 << 11)) >>> 0],
+    { expectStats: { fallbackOps: 1 } }),
+  T('CVT.W.S without &FCR31 still FALLS BACK', [C1(FMT.S, 1, 2, FN.CVT_W)],
+    { opts: { noFcr31: true }, expectStats: { nativeFPCvt: 0, fallbackOps: 1 } }),
+  T('ROUND.W.S without &FCR31 is still native', [C1(FMT.S, 1, 2, FN.ROUND_W)],
+    { opts: { noFcr31: true }, fprF32: { 1: 2.5 }, expectFprI32: { 2: '0x3' },
+      expectStats: { nativeFPCvt: 1, fallbackOps: 0 } }),
   // ---- wave 11b: FP compares + BC1 ----
   // FCR31 seeds carry NON-condition bits (rounding mode 3 + bit 24) in every
   // case below: a compare must REPLACE bit 23 and preserve the rest, and an
