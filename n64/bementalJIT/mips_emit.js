@@ -1334,6 +1334,14 @@
   // bounded by distinct block entries, not by recompile churn (vaddr keys
   // are stable across precomp_block realloc; host entryPtr is not)
   var slotByVaddr = Object.create(null);
+  // recompile cache (see compileSpan): hash -> [{ key, inst, labels, labelOps }]
+  var spanCache = new Map(), spanCacheN = 0, SPAN_CACHE_MAX = 16384;
+
+  // Append in place. compileSpan used `body = body.concat(...)` per
+  // instruction, which re-copies the whole body every time — quadratic in
+  // span length, and the emitter's JS was 11.25% of main-thread time in the
+  // MK64 race window under a 4x throttle (110 compiles in 700 frames).
+  function app(dst, src) { for (var q = 0; q < src.length; q++) dst.push(src[q]); }
 
   function compileSpan(p, Module) {
     // resolved once, on the first compile — the page sets window.__jitCensus
@@ -1466,6 +1474,45 @@
     if (pageLen > 0 && entryInPage < pageLen) {
       pageW0 = srcW - entryInPage; pageN = pageLen; pageA0 = p.blockStart >>> 0; spanOff = entryInPage;
     }
+
+    // ---- RECOMPILE CACHE (2026-09-30) ----
+    // MK64 recompiles ~110 spans inside a 700-frame race window (pages that
+    // hold both code and written data get invalidated, init_block resets
+    // them, and NOTCOMPILED recompiles the SAME code). Under a 4x CPU
+    // throttle the emitter's JS was 11.25% of all main-thread time there.
+    // Everything this function bakes into a module is a function of: the
+    // param-block addresses (static per session), vaddr/entryPtr/span/page
+    // bounds, the 4KB page's words (decode AND label discovery) and the ops
+    // fields of the span's precomp entries (fallback/guard targets). So the
+    // key is exactly that, compared IN FULL on a hit (the hash only picks the
+    // bucket), and a hit re-installs the very same instance — identical code,
+    // no byte generation, no wasm compile.
+    var keyLen = 6 + pageN + span + 1;
+    var keyArr = new Uint32Array(keyLen);
+    keyArr[0] = p.vaddr >>> 0; keyArr[1] = p.entryPtr >>> 0; keyArr[2] = span; keyArr[3] = p.blockStart >>> 0;
+    keyArr[4] = p.blockEnd >>> 0; keyArr[5] = p.srcPtr >>> 0;
+    var kh = 0x811c9dc5 | 0, kq;
+    for (kq = 0; kq < pageN; kq++) keyArr[6 + kq] = HEAPU32[pageW0 + kq];
+    for (kq = 0; kq <= span; kq++) keyArr[6 + pageN + kq] = HEAPU32[(p.entryPtr + kq * p.stride) >> 2];
+    for (kq = 0; kq < keyLen; kq++) kh = Math.imul(kh ^ keyArr[kq], 16777619);
+    var bucket = spanCache.get(kh);
+    if (bucket) {
+      for (var bi = 0; bi < bucket.length; bi++) {
+        var ce = bucket[bi], same = ce.key.length === keyLen;
+        for (kq = 0; same && kq < keyLen; kq++) same = ce.key[kq] === keyArr[kq];
+        if (!same) continue;
+        var hidx = installSlot(p.vaddr >>> 0, ce.inst.exports.f);
+        for (var hk = 1; hk < ce.labels.length; hk++) {
+          var hptr = p.entryPtr + ce.labels[hk] * p.stride;
+          if (HEAPU32[hptr >> 2] !== ce.labelOps[hk]) continue;
+          HEAPU32[hptr >> 2] = installSlot((p.vaddr + ce.labels[hk] * 4) >>> 0, ce.inst.exports['f' + hk]);
+          stats.labelEntries = (stats.labelEntries || 0) + 1;
+        }
+        stats.cacheHits = (stats.cacheHits || 0) + 1;
+        return hidx;
+      }
+    }
+
     for (var li = 0; li < pageN; li++) {
       var lw = HEAPU32[pageW0 + li];
       var la = (pageA0 + li * 4) >>> 0;
@@ -1501,7 +1548,7 @@
     while (i < span) {
       // entering a label: close the previous segment with an EMPTY cache
       if (i > 0 && labelOrd[i] >= 0) {
-        body = body.concat(C.flush());
+        app(body, [].concat(C.flush()));
         C.invalidate();
         body.push(OP.end);
         closedSegs++;
@@ -1635,7 +1682,7 @@
         }
         if (br.cond === null) {
           // unconditional: J/JAL/JR/JALR — capture, link, slot, count, flush, split
-          body = body.concat(
+          app(body, [].concat(
             cu1Prefix,
             captureBytes,
             linkBytes,
@@ -1643,14 +1690,14 @@
             emitCountBatch(p, addr),
             C.flush(),
             skipJumpSplit(C, EXIT, TOP)
-          );
+          ));
           C.invalidate();
         } else if (!br.likely) {
           // the condition is parked in a LOCAL rather than left on the wasm
           // stack across the slot: a memory delay slot emits its own
           // if/else and can br out of the block, and stack residue across
           // those is needless risk
-          body = body.concat(
+          app(body, [].concat(
             cu1Prefix,
             br.cond(C), [OP.local_set], leb(L_COND),
             linkBytes,
@@ -1663,19 +1710,19 @@
             [OP.else_],
               emitTailPoll(p, C, fallAddr, fallPtr, EXIT + 1),
             [OP.end]
-          );
+          ));
           C.invalidate();
         } else {
-          body = body.concat(
+          app(body, [].concat(
             cu1Prefix,
             br.cond(C),
             linkBytes,
             C.flush(),
             [OP.if_, OP.void_]
-          );
+          ));
           var Ct = new RegCache(p.reg);
           Ct.loaded = C.loaded.slice(); Ct.dirty = C.dirty.slice();
-          body = body.concat(
+          app(body, [].concat(
             emitSlot(Ct, EXIT + 1),
             emitCountBatch(p, addr),
             Ct.flush(),
@@ -1684,7 +1731,7 @@
               emitCountBatch(p, addr),
               emitTailPoll(p, C, fallAddr, fallPtr, EXIT + 1),
             [OP.end]
-          );
+          ));
           C.invalidate();
         }
         stats.nativeBranches++;
@@ -1698,14 +1745,14 @@
       var opsIdxL = HEAPU32[instrPtr >> 2];
       var ld = emitLoad(word, instrPtr, p, C, opsIdxL, EXIT);
       if (ld) {
-        body = body.concat(ld);
+        app(body, [].concat(ld));
         stats.nativeLoads++;
         i++;
         continue;
       }
       var st = emitStore(word, instrPtr, p, C, opsIdxL, EXIT);
       if (st) {
-        body = body.concat(st);
+        app(body, [].concat(st));
         stats.nativeStores++;
         i++;
         continue;
@@ -1714,7 +1761,7 @@
       // (e) COP1? (window.__jitNoFP disables FP emission for perf attribution)
       var fp = window.__jitNoFP ? null : (emitCop1(word, instrPtr, p, C, opsIdxL, EXIT) || emitCop1Mem(word, instrPtr, p, C, opsIdxL, EXIT));
       if (fp) {
-        body = body.concat(fp);
+        app(body, [].concat(fp));
         stats.nativeFP++;
         i++;
         continue;
@@ -1723,7 +1770,7 @@
       // (f) native COP0 (MFC0)?
       var c0 = emitCop0(word, p, C);
       if (c0) {
-        body = body.concat(c0);
+        app(body, [].concat(c0));
         stats.nativeCop0++;
         i++;
         continue;
@@ -1732,7 +1779,7 @@
       // (a) native ALU?
       var alu = emitAlu(word, C);
       if (alu !== null) {
-        body = body.concat(alu);
+        app(body, [].concat(alu));
         stats.nativeOps++;
         i++;
         continue;
@@ -1740,22 +1787,22 @@
 
       // (d) fallback: flush, call interp op, invalidate
       var opsIdx = HEAPU32[instrPtr >> 2];
-      body = body.concat(
+      app(body, [].concat(
         bump(mnem(word) + (brReason ? '@' + brReason : '')),
         C.flushAndInvalidate(),
         storeI32Const(p.pcGlobal, instrPtr),
         [OP.i32_const], sleb(opsIdx), [OP.call_indirect, 0x00, 0x00],
         loadI32(p.pcGlobal), [OP.i32_const], sleb(nextPtr),
         [OP.i32_ne, OP.br_if].concat(leb(EXIT))
-      );
+      ));
       stats.fallbackOps++;
       i++;
     }
-    body = body.concat(
+    app(body, [].concat(
       C.flush(),
       bump('#exit:fallthrough'),
       storeI32Const(p.pcGlobal, p.entryPtr + span * p.stride)
-    );
+    ));
     if (closedSegs !== nSeg - 1) {
       // a label was stepped over — never emit a module with unbalanced blocks
       stats.fails++;
@@ -1896,6 +1943,11 @@
         stats.labelEntries = (stats.labelEntries || 0) + 1;
       }
       stats.blocks++;
+      if (spanCacheN >= SPAN_CACHE_MAX) { spanCache.clear(); spanCacheN = 0; }
+      var nb = spanCache.get(kh);
+      if (!nb) { nb = []; spanCache.set(kh, nb); }
+      nb.push({ key: keyArr, inst: inst, labels: labels, labelOps: labelOps });
+      spanCacheN++;
       return idx;
     } catch (e) {
       stats.fails++;

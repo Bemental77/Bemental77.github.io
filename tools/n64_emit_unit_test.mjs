@@ -897,6 +897,40 @@ const tests = [
       expectStats: { pageTruncated: undefined } }),
 ];
 
+// ---- RECOMPILE CACHE (2026-09-30) ----
+// A recompile of the SAME span (same page words, same precomp ops, same
+// addresses) re-installs the cached instance; ANY difference in the key must
+// miss. Simulates init_block (ops reset) between the two compiles.
+function cacheCase(name, mutate, wantHit) {
+  const bm = loadEmitter();
+  const words = [I(OPC.ADDIU, 0, 1, 3), I(OPC.ADDIU, 2, 2, 1), I(OPC.ADDIU, 1, 1, 0xffff), I(OPC.BNE, 1, 0, 0xfffd), 0, I(OPC.ADDIU, 0, 3, 7), 0];
+  const w = makeWorld(words, {});
+  const Mod = { HEAPU32: w.HEAPU32, wasmTable: w.table, wasmMemory: w.mem };
+  const i1 = bm.compileSpan(w.p, Mod);
+  for (let k = 0; k < words.length + 4; k++) w.HEAPU32[(ENTRY + k * STRIDE) >> 2] = 1;   // init_block
+  mutate(w);
+  const i2 = bm.compileSpan(w.p, Mod);
+  const hits = bm.stats.cacheHits || 0;
+  const bad = [];
+  if (!(i1 > 0 && i2 > 0)) bad.push(`compile failed ${i1} ${i2}`);
+  if ((hits === 1) !== wantHit) bad.push(`cacheHits=${hits} want ${wantHit ? 1 : 0}`);
+  // run the second install from label 1 to prove the labels were re-installed
+  w.HEAPU32[PCG >> 2] = ENTRY + STRIDE;
+  const li = w.HEAPU32[(ENTRY + STRIDE) >> 2];
+  if (li === 1) bad.push('label 1 not re-installed');
+  else {
+    w.REG64[(REG >> 3) + 1] = 2n; w.REG64[(REG >> 3) + 2] = 0n;
+    try { w.table.get(li)(); } catch (e) { bad.push('trapped ' + e); }
+    const r2 = w.REG64[(REG >> 3) + 2], r3 = w.REG64[(REG >> 3) + 3];
+    const want3 = (w.HEAPU32[(SRC >> 2) + 5] === words[5]) ? 7n : 9n;
+    if (r2 !== 2n || r3 !== want3) bad.push(`r2=${r2} r3=${r3}`);
+  }
+  return { name, ok: bad.length === 0, detail: bad.join('; ') };
+}
+tests.push(cacheCase('recompile of an IDENTICAL span re-installs the cached instance (entry + labels)', () => {}, true));
+tests.push(cacheCase('control: one changed page word MISSES the cache', (w) => { w.HEAPU32[(SRC >> 2) + 5] = I(OPC.ADDIU, 0, 3, 9); }, false));
+tests.push(cacheCase('control: one changed precomp op MISSES the cache', (w) => { w.HEAPU32[(ENTRY + 2 * STRIDE) >> 2] = 2; }, false));
+
 let fail = 0;
 for (const t of tests) {
   if (!t.ok) fail++;

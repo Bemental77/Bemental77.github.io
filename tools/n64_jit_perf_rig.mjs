@@ -295,7 +295,12 @@ async function runArm(arm, round, opts) {
       if (el) await el.screenshot({ path: file }); else await page.screenshot({ path: file });
     }
   }
-  res.jit = await page.evaluate(() => (window.__jitStats ? window.__jitStats() : null));
+  res.jit = await page.evaluate(() => {
+    const s = window.__jitStats ? window.__jitStats() : null;
+    const e = window.bementalMips && window.bementalMips.stats;
+    if (s && e) { s.cacheHits = e.cacheHits || 0; s.labelEntries = e.labelEntries || 0; s.pageTruncated = e.pageTruncated || 0; }
+    return s;
+  });
   if (has('tiercheck') && !arm.off) {
     // every table slot added after main() is a JIT block function (the
     // emitter only ever grows the table); ask V8 which tier each one is in
@@ -444,7 +449,7 @@ try {
       const summary = { round: r, arm: res.arm, costMsPerFrame: res.costMsPerFrame, callMsPerFrame: res.callMsPerFrame,
         wallMsPerFrame: res.wallMsPerFrame, capX: res.capX, load: res.load, frames: res.fp.length, compilesInWindow: res.compilesInWindow,
         jit: res.jit ? { blocks: res.jit.blocks, nativeOps: res.jit.nativeOps, fallbackOps: res.jit.fallbackOps,
-          nullOpsRejects: res.jit.nullOpsRejects, emitFails: res.jit.emitFails, mode: res.jit.mode } : null,
+          nullOpsRejects: res.jit.nullOpsRejects, emitFails: res.jit.emitFails, mode: res.jit.mode, cacheHits: res.jit.cacheHits, labelEntries: res.jit.labelEntries, pageTruncated: res.jit.pageTruncated } : null,
         errs: res.errs.slice(0, 3), logs: res.logs.slice(0, 4) };
       console.log(JSON.stringify(summary));
       if (res.attribution) console.log(JSON.stringify(res.attribution, null, 1));
