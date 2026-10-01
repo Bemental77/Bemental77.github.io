@@ -229,8 +229,8 @@ bool retro_load_game(const struct retro_game_info* game)
         INFO_LOG_FMT(COMMON, "Suppressed popup (first of many, rest rate-limited): {} - {}",
                      caption, text);
       else if ((s_invalid_mem_popups % 100000UL) == 0)
-        INFO_LOG_FMT(COMMON, "Suppressed {} MMU invalid-access popups so far",
-                     s_invalid_mem_popups);
+        INFO_LOG_FMT(COMMON, "Suppressed {} MMU invalid-access popups so far (latest: {})",
+                     s_invalid_mem_popups, text);
       ++s_invalid_mem_popups;
       return true;
     }

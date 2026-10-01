@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 
 #include "Common/BitField.h"
@@ -176,6 +177,21 @@ union UPECtrlReg
   BitField<3, 1, bool, u16> pe_finish;  // Write only
 };
 
+// [efb-ram ordering 2026-10-01] EFB->RAM copies whose GPU readback had not landed when the
+// copy was flushed are written into guest RAM later, from the WebGPU mapAsync callback
+// (WGPUTexture.cpp ReadTexels, WGPUTextureCache.h CopyEFB). Real hardware has the copy in RAM
+// before the GP signals the token/finish that follows it. Here the write could land seconds
+// later, after the guest had been told the frame was done and had reused that RAM: on SAB
+// every late write targeted 0x80fffe60 (+0x8000), which is also its DVD staging buffer, and a
+// clobbered compressed file wedged eventD's init (pc 0x80bc63xx, 0.005x). So the PE HOLDS its
+// token/finish interrupt while any such write is outstanding; the callback releases it. If a
+// readback is slow (SwiftShader measured tens of seconds) or never resolves, PollHeldTokenFinish
+// gives up after 100 ms, releases the interrupt and bumps the generation; a straggler from an
+// older generation is then written only if its destination is unchanged (fingerprint guard),
+// and dropped if the guest has reused that RAM.
+extern std::atomic<int> g_efb_ram_outstanding;   // late writes not yet landed (current gen)
+extern std::atomic<u32> g_efb_ram_drop_gen;      // bumped on give-up; older writes are dropped
+
 class PixelEngineManager
 {
 public:
@@ -194,6 +210,10 @@ public:
   // gfx backend support
   void SetToken(const u16 token, const bool interrupt, int cycle_delay);
   void SetFinish(int cycle_delay);
+  // [efb-ram ordering] called by the WGPU readback callback when the last outstanding late
+  // EFB->RAM write has landed, and by the GPU slice every pump (give-up timer).
+  void ReleaseHeldTokenFinish();
+  void PollHeldTokenFinish();
   AlphaReadMode GetAlphaReadMode() const { return m_alpha_read.read_mode; }
 
 private:
@@ -218,6 +238,8 @@ private:
   bool m_token_interrupt_pending = false;
   bool m_finish_interrupt_pending = false;
   bool m_event_raised = false;
+  bool m_raise_held = false;      // [efb-ram ordering] RaiseEvent deferred until writes land
+  double m_held_since_ms = 0.0;
 
   bool m_signal_token_interrupt = false;
   bool m_signal_finish_interrupt = false;

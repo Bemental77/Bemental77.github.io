@@ -125,6 +125,22 @@ if (args.includes('--list')) {
   for (const c of CELLS) console.log(`${c.name.padEnd(20)} rom=${c.rom} ${c.state ? 'state' : 'cold '} — ${c.note}`);
   process.exit(0);
 }
+// WITNESS_QUERY_EXTRA appends to every cell's query, so a matched pair (e.g.
+// `bjit_batch=0` vs the default) runs the SAME cell definition off ONE binary.
+// Give each arm its own OUT_DIR so the artifacts do not overwrite each other.
+const QUERY_EXTRA = process.env.WITNESS_QUERY_EXTRA || '';
+if (QUERY_EXTRA) for (const c of CELLS) c.query = c.query ? `${c.query}&${QUERY_EXTRA}` : QUERY_EXTRA;
+// WITNESS_STATE_MS / WITNESS_EXTRA_MS: on a loaded box the 1.46 GB ISO write can finish
+// AFTER the default 30 s state hand-off, and the late restore then lands mid-boot and wedges
+// the run (observed 2026-10-01: "restore failed: timeout after 4000 polls", DoState at 70 s,
+// pc parked in 0x80bc63xx at 0.01x). Later hand-off + longer run keeps the 25 s settle and
+// the steady window the same length.
+const STATE_MS = +process.env.WITNESS_STATE_MS || 0;
+const EXTRA_MS = +process.env.WITNESS_EXTRA_MS || 0;
+for (const c of CELLS) {
+  if (c.state && STATE_MS) { c.ms += STATE_MS - c.stateMs; c.stateMs = STATE_MS; }
+  if (EXTRA_MS) c.ms += EXTRA_MS;
+}
 const only = (() => {
   const i = args.indexOf('--only');
   return i >= 0 && args[i + 1] ? new Set(args[i + 1].split(',').map((s) => s.trim())) : null;
@@ -140,7 +156,14 @@ fs.mkdirSync(OUT, { recursive: true });
 // therefore uses this process's own interpreter by absolute path.
 const NODE = JSON.stringify(process.execPath);
 const sh = (cmd) => spawnSync('bash', ['-c', cmd], { cwd: REPO, encoding: 'utf8', maxBuffer: 64 << 20 });
-const md5 = (f) => { const r = sh(`md5 -q ${JSON.stringify(f)}`); return (r.stdout || '').trim() || 'missing'; };
+// `md5 -q` is macOS-only; on Linux it does not exist and the hash guard silently
+// printed 'missing' before AND after every cell (2026-10-01), i.e. it guarded nothing.
+const md5 = (f) => {
+  let r = sh(`md5 -q ${JSON.stringify(f)} 2>/dev/null`);
+  let v = (r.stdout || '').trim();
+  if (!v) { r = sh(`md5sum ${JSON.stringify(f)} 2>/dev/null`); v = ((r.stdout || '').trim().split(/\s+/)[0]) || ''; }
+  return v || 'missing';
+};
 const load1 = () => { const r = sh('uptime'); return (r.stdout || '').trim(); };
 
 // Median / percentile over a small sample. Median, not mean: one GC pause or one
@@ -176,6 +199,16 @@ function makeSnapshot() {
   for (const e of COPY) {
     const r = sh(`cp -R ${JSON.stringify(path.join(REPO, 'gamecube', e))} ${JSON.stringify(path.join(snap, 'gamecube', e))}`);
     if (r.status !== 0) console.log(`  snapshot copy of gamecube/${e} failed: ${r.stderr}`);
+  }
+  // WITNESS_WORKER_DIR: serve a scratch-linked worker (dolphin_worker_link_4010.sh with
+  // LINK_OUT_JS) instead of the live one, so a candidate binary is measured without ever
+  // touching gamecube/dolphin_libretro (which sibling agents probe concurrently).
+  const wd = process.env.WITNESS_WORKER_DIR;
+  if (wd) {
+    for (const f of ['dolphin_worker_emcc.js', 'dolphin_worker_emcc.wasm']) {
+      fs.copyFileSync(path.join(wd, f), path.join(snap, 'gamecube/dolphin_libretro', f));
+    }
+    console.log(`  snapshot worker replaced from WITNESS_WORKER_DIR=${wd}`);
   }
   return { root: snap, frozen: true };
 }

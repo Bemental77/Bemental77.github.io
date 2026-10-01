@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include "Core/System.h"
+#include "VideoCommon/PixelEngine.h"
+
 #include <cstring>       // memcpy (depth float readback decode)
 #include <emscripten.h>  // MAIN_THREAD_EM_ASM (one-shot diagnostics)
 
@@ -303,9 +306,57 @@ protected:
             // Flush ran first: encode STRAIGHT into guest RAM at the recorded
             // destination (never the staging map — it may already belong to a newer
             // copy). Whole-frame write; VI's next fetch sees a complete frame.
-            c->dst = static_cast<char*>(c->pending.def_dst);
-            c->dst_stride = c->pending.def_stride;
-            EncodeEfbToRam(c, mapped);
+            //
+            // [late-efb guard 2026-10-01] This write lands whenever the GPU readback
+            // completes: arbitrarily long after the guest was told the frame was done, so
+            // the guest may already have reused that RAM. MEASURED on SAB (this box,
+            // SwiftShader): every recorded late write targeted guest 0x80fffe60 (+0x8000),
+            // which the game ALSO uses as the staging buffer for compressed DVD files
+            // (0x8001a088). A late copy clobbered the compressed bytes, the file
+            // decompressed into a garbage pointer at eventD bss+0x14bc (0x80beca1c =
+            // 0x1156b23f instead of 0x81367aa8), and eventD's init walked it at 0.005x
+            // (pc 0x80bc6304-0x80bc64b4, millions of MMU invalid reads). Census: @0x026B3E00
+            // late writes, @0x026B3E04 dropped, ring @0x026B3E10 = last 16 (host ptr, bytes).
+            {
+              // latency census: @0x026B3E90 sum ms, @0x026B3E94 max ms (deferral -> callback)
+              const u32 lat = static_cast<u32>(emscripten_get_now() - c->pending.def_t);
+              *reinterpret_cast<volatile u32*>(uintptr_t(0x026B3E90u)) += lat;
+              volatile u32* const mx = reinterpret_cast<volatile u32*>(uintptr_t(0x026B3E94u));
+              if (lat > *mx) *mx = lat;
+            }
+            volatile u32* const cn = reinterpret_cast<volatile u32*>(uintptr_t(0x026B3E00u));
+            const u32 k = *cn;
+            *cn = k + 1u;
+            volatile u32* const ring = reinterpret_cast<volatile u32*>(uintptr_t(0x026B3E10u));
+            ring[(k & 15u) * 2u] = static_cast<u32>(reinterpret_cast<uintptr_t>(c->pending.def_dst));
+            ring[(k & 15u) * 2u + 1u] = c->pending.def_stride * c->num_blocks_y;
+            // GUARD (default): write only if the destination still holds exactly what it
+            // held when the write was deferred. If the guest has since put anything else
+            // there (SAB reuses 0x80fffe60 as its DVD staging buffer), the copy is stale and
+            // writing it would corrupt the new data, so it is dropped. Arm 0xEFB0A11F =
+            // the old unguarded write (A/B control); 0xEFB0D0D0 = drop every late write.
+            // Arms (cell 0x026B3E08): 0 = HOLD (default: the PE token/finish waits up to 100 ms
+            // for this write, which is then exact); 0xEFB06A2D = no hold, fingerprint guard only;
+            // 0xEFB0A11F = the old unordered write; 0xEFB0D0D0 = drop every late write.
+            const u32 arm = *reinterpret_cast<volatile u32*>(uintptr_t(0x026B3E08u));
+            const bool stale_gen =
+                c->pending.def_gen != PixelEngine::g_efb_ram_drop_gen.load(std::memory_order_acquire);
+            // The fingerprint guard applies to the guard-only arm, and to a HOLD-arm straggler
+            // the PE gave up on (stale generation): written only if the guest left the RAM alone.
+            const bool guarded = arm == 0xEFB06A2Du || (arm == 0u && stale_gen);
+            const bool reused =
+                guarded &&
+                WGPUEfbGuardHash(c->pending.def_dst, c->pending.def_len) != c->pending.def_hash;
+            if (arm == 0xEFB0D0D0u || reused)
+            {
+              ++*reinterpret_cast<volatile u32*>(uintptr_t(0x026B3E04u));
+            }
+            else
+            {
+              c->dst = static_cast<char*>(c->pending.def_dst);
+              c->dst_stride = c->pending.def_stride;
+              EncodeEfbToRam(c, mapped);
+            }
             ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3854u));
           }
           else if (!c->pending.orphaned)
@@ -327,6 +378,15 @@ protected:
       // TextureCacheBase::FlushEFBCopy.
       if (c->pending.owner && c->pending.owner->m_pending_encode == &c->pending)
         c->pending.owner->m_pending_encode = nullptr;
+      // [efb-ram ordering] release this write's hold on EVERY callback path (success, null
+      // range, failed map) — unless the PE already gave up on its generation and reset the
+      // count — and let the PE raise a token/finish that was waiting on it.
+      if (c->pending.deferred &&
+          c->pending.def_gen == PixelEngine::g_efb_ram_drop_gen.load(std::memory_order_acquire))
+      {
+        if (PixelEngine::g_efb_ram_outstanding.fetch_sub(1, std::memory_order_acq_rel) <= 1)
+          Core::System::GetInstance().GetPixelEngine().ReleaseHeldTokenFinish();
+      }
       wgpuBufferRelease(c->buffer);
       delete c;
     };
