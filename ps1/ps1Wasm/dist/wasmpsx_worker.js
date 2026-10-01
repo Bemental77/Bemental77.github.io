@@ -218,6 +218,7 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
   var origMainloop = pcsx_mainloop;
   pcsx_mainloop = function () {
     if (GATE) return;
+    arSoloCredit();
     if (TAKE) { runFrame(); return; }
     return origMainloop.apply(this, arguments);
   };
@@ -241,7 +242,11 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
   // is whatever bit 3 of the guest's last GP1(08h) was (gpu.c:956). Monster
   // Rancher 2's first GP1(08h) sets it (GPUSTAT read 0xd4922200 at vblank 316:
   // bit 20 set) — so the limiter slowed an NTSC console to 50 Hz, i.e. the
-  // guest ran at 0.833x. The other three titles merely wandered ±1.5% around
+  // guest ran at 0.833x. [CORRECTED: that 50 Hz was right for the wrong
+  // reason. MR2 keeps the PAL bit set with the display on through play, and the
+  // hardware's vblank rate follows that bit — see "THE VBLANK RATE FOLLOWS THE
+  // GPU'S VIDEO-MODE BIT" below, which now paces it at 50 Hz from the GPU's
+  // own mode, with the core's frame timed as PAL to match.] The other three titles merely wandered ±1.5% around
   // 59.94 because the limiter is a busy-wait on a millisecond clock that loses
   // every oversleep for good.
   //
@@ -325,8 +330,44 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
   // dfxvideo limiter that used to set it is off.
   var QUIET = false, QUIET_AUDIO = false, quietRenders = 0, quietAudio = 0;
   function runFrame() {
-    if (TAKE) Module.HEAP32[CORE.updatedDisplay >> 2] = 0;
+    if (TAKE) { Module.HEAP32[CORE.updatedDisplay >> 2] = 0; if (VMODE) followVideoMode(); }
     _one_iter();
+  }
+
+  // ══ THE VBLANK RATE FOLLOWS THE GPU'S VIDEO-MODE BIT, AS THE HARDWARE'S DOES ══
+  // On a real PS1 the vertical timing is set by the GPU's video mode —
+  // GP1(08h) bit 3, GPUSTAT bit 20: 0 = NTSC/60 Hz (263 lines), 1 = PAL/50 Hz
+  // (314) — not by the region of the disc. PCSX instead times every frame from
+  // Config.PsxType, which CheckCdrom sets once from the disc. Measured (rig
+  // driving ps1.html solo, 300 s, netPeek of dfxvideo's PSXDisplay.PAL and
+  // lGPUstatusRet): Monster Rancher 2 (SLUS-00917) runs with the PAL bit SET and
+  // the display ON from 5-6 s after boot onward (GPUSTAT 0x5412200a; 239 of
+  // 243 samples, the other 4 before its first GP1(08h)) — so the hardware runs
+  // it at 50 vblanks/s, and pacing it at 59.94 was 1.2x too fast. It is not an
+  // emulation artefact of PCSX's GetID answer ("PCSX", unlicensed): patching
+  // that to a licensed "SCEA" left the bit set (81/85 samples).
+  // So before every frame, while the display is on, Config.PsxType is set to
+  // the GPU's mode: the core then times the frame as PAL (312 lines, VBlankStart
+  // 256, the SPU interval) and the page and pacer run at 50 Hz. This is a pure
+  // function of guest state (both bytes are in the snapshot), so a room and a
+  // rollback switch at the same frame everywhere. Stated limit: the root
+  // counter's line period (rcnts[3].target) is computed once at init from the
+  // boot region, so a PAL frame on an NTSC-booted core is 312 x 2154 = 672,048
+  // CPU cycles, 0.8% short of 677,376 — at 50 Hz the CPU runs at 0.992x, the
+  // vblank rate at 1.000x. ?vmode=core keeps PCSX's boot-region timing.
+  var VMODE = !/[?&]vmode=core/.test(q), vmodeSwitches = 0;
+  function followVideoMode() {
+    var u8 = Module.HEAPU8, h32 = Module.HEAP32;
+    var pal = h32[CORE.palFlag >> 2] ? 1 : 0, on = !((h32[CORE.gpuStat >> 2] >>> 23) & 1);
+    if (on && u8[CORE.PsxType] !== pal) { u8[CORE.PsxType] = pal; vmodeSwitches++; }
+    var hz = u8[CORE.PsxType] ? HZ_PAL : HZ_NTSC;
+    if (hz !== coreHz) {
+      coreHz = hz; coreRegion = u8[CORE.PsxType] ? 'PAL' : 'NTSC';
+      try {
+        postMessage({ cmd: 'coreRate', take: TAKE, why: TAKE_WHY, hz: coreHz, region: coreRegion, by: 'GPU video mode', switches: vmodeSwitches });
+        postMessage({ cmd: 'print', txt: '[core] GPU video mode -> ' + coreRegion + ' (GPUSTAT 0x' + (h32[CORE.gpuStat >> 2] >>> 0).toString(16) + '): ' + coreHz + ' Hz' });
+      } catch (e) {}
+    }
   }
   // Frames that are re-simulated (rollback) are not presented and their audio
   // is not played again: the host side of render/SendSound is skipped. Neither
@@ -334,7 +375,47 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
   var origRender = render;
   render = function () { if (QUIET) { quietRenders++; return; } return origRender.apply(this, arguments); };
   var origSendSound = SendSound;
-  SendSound = function () { if (QUIET_AUDIO) { quietAudio++; return; } return origSendSound.apply(this, arguments); };
+  SendSound = function (ptr, lBytes) {
+    if (QUIET_AUDIO) { quietAudio++; return; }
+    if (AR) { arWrite(ptr, lBytes); return; }
+    return origSendSound.apply(this, arguments);
+  };
+
+  // ── THE AUDIO RING (ps1.html "THE AUDIO SINK") ────────────────────────────
+  // The page hands over a SharedArrayBuffer ('netAudioSab'); from then on every
+  // batch the SPU mixes is written here and played by an AudioWorklet, with no
+  // postMessage and no main-thread hop. Header (Int32): [0] write, [1] read
+  // (stereo frames, wrapping), [2] frames produced, [3] frames dropped on a
+  // full ring, [5] 1 while gated (the worklet trims its read rate only then),
+  // [6]/[7] target fill in a room / solo, [8]/[9] the worklet's underruns and
+  // frames consumed.
+  // WHAT THE SPU MIXES IS UNCHANGED. Gated, it is still credited one frame of
+  // 44.1 kHz per step (creditAudio) — a pure function of the frame index, so
+  // the room's determinism argument does not move. Solo, the core's
+  // buffered-bytes counter used to fall only when the page's SDL callback
+  // replied 'soundBytes'; with the ring it is set from the ring's own fill
+  // before each frame (arSoloCredit), so the SPU tops the ring up to the
+  // target and production follows the sink exactly as it followed SDL.
+  var AR = null;
+  function arWrite(ptr, lBytes) {
+    var h = AR.h, n = lBytes >> 2, w = Atomics.load(h, 0), r = Atomics.load(h, 1);
+    h[5] = GATE ? 1 : 0;
+    var free = AR.cap - ((w - r) | 0);
+    if (n > free) { Atomics.add(h, 3, n - Math.max(0, free)); n = Math.max(0, free); }
+    if (!n) return;
+    var src = HEAP16, si = ptr >> 1, d = AR.d, m = AR.mask;
+    for (var i = 0; i < n; i++) { var o = ((w + i) & m) << 1; d[o] = src[si]; d[o + 1] = src[si + 1]; si += 2; }
+    Atomics.store(h, 0, (w + n) | 0);
+    Atomics.add(h, 2, n);
+  }
+  function arSoloCredit() {
+    if (!AR || GATE || typeof soundbuffer_ptr === 'undefined' || !soundbuffer_ptr) return;
+    var h = AR.h, fill = (Atomics.load(h, 0) - Atomics.load(h, 1)) | 0;
+    h[5] = 0;
+    // SPUasync mixes while the counter is <= 22050 (dfsound/worker.c), adding
+    // each batch to it — so it mixes (target - fill) bytes' worth this frame.
+    Module.setValue(soundbuffer_ptr, 22050 - (h[7] - fill) * 4, 'i32');
+  }
 
   // SOLO PACER — an absolute timeline at the disc's rate. Frame n starts at
   // t0 + n/Hz; a frame that finishes early waits for its slot. Falling behind
@@ -393,58 +474,307 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
     Module.HEAPU8.set(slot.buf.subarray(0, slot.len), SNAP_LO);
     fsRestore(slot.fs);
   }
-  // A fingerprint of GUEST state inside a slot: main RAM + the hardware page
-  // (found through the core's own LUT, locateMem above) + VRAM. Host-side bytes
-  // in the snapshot (the stack's dead area, stdio buffers, the SPU timing
-  // accumulator) are deliberately not hashed — they may legitimately differ
-  // between two consoles that agree on every guest byte.
-  function slotHash(slot) {
-    if (!memMapTried) { memMapTried = true; try { memMap = locateMem(); } catch (e) { memMap = null; } }
-    if (!memMap) return null;
-    var b = slot.buf.buffer, o = slot.buf.byteOffset - SNAP_LO;
-    var h = 0x811c9dc5 | 0;
-    h = fnvWords(new Uint32Array(b, o + memMap.m, 0x200000 >> 2), h);
-    h = fnvWords(new Uint32Array(b, o + memMap.hw, 0x10000 >> 2), h);
-    if (vram_ptr && (vram_ptr & 3) === 0) h = fnvWords(new Uint32Array(b, o + vram_ptr, (1024 * 512 * 2) >> 2), h);
-    // ...and ALL static data: the CPU/GTE registers (psxRegs), the root
-    // counters, the SPU (channels, registers, its 512 KB RAM), the CD-ROM
-    // controller, SIO and both memory-card images (Mcd1Data/Mcd2Data) — so a
-    // divergence there is caught at the next fingerprint, not when it reaches
-    // RAM. [1024, STATIC_END) is .data+.bss; the 64 KB above it is the stack.
-    // Excluded, because they hold HOST values that no guest path reads: the
-    // dfsound timing accumulator (two f64 at 570568, written and read only in
-    // the flush that stamps them with emscripten_get_now).
-    for (var si = 0; si < STATIC_SPANS.length; si += 2) h = fnvWords(new Uint32Array(b, o + STATIC_SPANS[si], (STATIC_SPANS[si + 1] - STATIC_SPANS[si]) >> 2), h);
-    return h >>> 0;
-  }
+  // A fingerprint of GUEST state: main RAM + the hardware page (found through
+  // the core's own LUT, locateMem above) + VRAM + ALL static data. Host-side
+  // bytes in the snapshot range (the stack's dead area, stdio buffers, the SPU
+  // timing accumulator) are deliberately not hashed — they may legitimately
+  // differ between two consoles that agree on every guest byte.
+  //   ...static data = the CPU/GTE registers (psxRegs), the root counters, the
+  // SPU (channels, registers, its 512 KB RAM), the CD-ROM controller, SIO and
+  // both memory-card images (Mcd1Data/Mcd2Data) — so a divergence there is
+  // caught at the next fingerprint, not when it reaches RAM. [1024, STATIC_END)
+  // is .data+.bss; the 64 KB above it is the stack. Excluded, because they hold
+  // HOST values that no guest path reads: the dfsound timing accumulator (two
+  // f64 at 570568, written and read only in the flush that stamps them with
+  // emscripten_get_now).
+  //
+  // ⚠ PER PAGE, SO A FINGERPRINT COSTS WHAT CHANGED. The old fingerprint ran
+  // FNV over all ~4.2 MB of those regions every time: 6-14 ms in the rollback
+  // probe — one step in every 60 paid it, and in a room that step is a spike
+  // the frame pacing has to absorb. Now the regions are cut into their 4 KB
+  // pages (HP: the pages, and each page's byte spans inside the regions); each
+  // page has its own FNV, and the fingerprint is FNV over the page hashes in
+  // page order. The undo ring keeps the page hashes of its shadow up to date
+  // for exactly the pages a frame changed (it knows them), so a fingerprint of
+  // the newest frame start is a 1,000-word loop, and one of a past frame
+  // re-hashes only the pages that frame's undo logs hold. Same bytes covered;
+  // a different (but just as deterministic) combining order than before, so
+  // both peers and the reference core must run this build — they do: a room
+  // compares fingerprints only between pages of the same build.
   var STATIC_END = 1129888;   // __heap_base 1195424 (sbrk's initial value) minus the 64 KB stack
   var STATIC_SPANS = [1024, 570568, 570584, STATIC_END];
+  var HP = null;
+  function hashPlan() {
+    if (HP) return HP;
+    if (!memMapTried) { memMapTried = true; try { memMap = locateMem(); } catch (e) { memMap = null; } }
+    if (!memMap) return null;
+    var regs = [memMap.m, memMap.m + 0x200000, memMap.hw, memMap.hw + 0x10000];
+    if (vram_ptr && (vram_ptr & 3) === 0) regs.push(vram_ptr, vram_ptr + 1024 * 512 * 2);
+    for (var si = 0; si < STATIC_SPANS.length; si++) regs.push(STATIC_SPANS[si]);
+    var by = new Map();
+    for (var r = 0; r < regs.length; r += 2) {
+      for (var a0 = regs[r]; a0 < regs[r + 1];) {
+        var pg = a0 >>> 12, e0 = Math.min(regs[r + 1], (pg + 1) << 12);
+        if (!by.has(pg)) by.set(pg, []);
+        by.get(pg).push(a0, e0);
+        a0 = e0;
+      }
+    }
+    var pages = Array.from(by.keys()).sort(function (x, y) { return x - y; });
+    var spans = [], idx = new Int32Array(pages[pages.length - 1] + 1).fill(-1);
+    for (var k = 0; k < pages.length; k++) {
+      var sp = by.get(pages[k]), pairs = [];
+      for (var t = 0; t < sp.length; t += 2) pairs.push([sp[t], sp[t + 1]]);
+      pairs.sort(function (x, y) { return x[0] - y[0]; });
+      var flat = [];
+      for (var t2 = 0; t2 < pairs.length; t2++) flat.push(pairs[t2][0], pairs[t2][1]);
+      spans.push(flat); idx[pages[k]] = k;
+    }
+    HP = { pages: pages, spans: spans, idx: idx };
+    return HP;
+  }
+  // FNV of page HP.pages[k]'s hashed bytes. `src` is indexed by absolute word
+  // address minus `off` (0 for the heap or the shadow; page << 10 for a
+  // page-sized undo buffer).
+  function pageHash(src, off, k) {
+    var sp = HP.spans[k], h = 0x811c9dc5 | 0;
+    for (var t = 0; t < sp.length; t += 2) for (var i = (sp[t] >> 2) - off, e = (sp[t + 1] >> 2) - off; i < e; i++) h = Math.imul(h ^ src[i], 16777619);
+    return h;
+  }
+  function combine(ph, ov) {
+    var h = 0x811c9dc5 | 0, n = HP.pages.length;
+    for (var k = 0; k < n; k++) {
+      var o = ov ? ov.get(HP.pages[k]) : undefined;
+      h = Math.imul(h ^ (o ? pageHash(o, HP.pages[k] << 10, k) : ph[k]), 16777619);
+    }
+    return h >>> 0;
+  }
+  function allPageHashes(src32) {
+    var ph = new Int32Array(HP.pages.length);
+    for (var k = 0; k < ph.length; k++) ph[k] = pageHash(src32, 0, k);
+    return ph;
+  }
   function liveHash() {
-    var tmp = { buf: null, len: 0 };
-    snapSave(tmp);
-    return slotHash(tmp);
+    if (!hashPlan()) return null;
+    return combine(allPageHashes(new Int32Array(Module.HEAPU8.buffer)), null);
   }
 
-  // The ROLLBACK RING. slotFrame[i] = the frame whose START slot i holds.
-  var RB = { n: 0, slots: [], slotFrame: [], live: -1, steps: 0, resim: 0, saveMs: 0, runMs: 0, loadMs: 0, maxStepMs: 0, lastBytes: 0 };
-  function rbSlotOf(k) { var i = k % RB.n; return RB.slotFrame[i] === k ? i : -1; }
-  function rbGrow(n) {
-    n = Math.max(2, n | 0);
-    if (n <= RB.n) return;
-    // Re-home every held frame into the bigger ring (k % n changes with n).
-    var held = [];
-    for (var i = 0; i < RB.n; i++) if (RB.slotFrame[i] >= 0) held.push({ k: RB.slotFrame[i], s: RB.slots[i] });
-    RB.n = n; RB.slots = []; RB.slotFrame = [];
-    for (var j = 0; j < n; j++) { RB.slots.push({ buf: null, len: 0, fs: [] }); RB.slotFrame.push(-1); }
-    for (var h = 0; h < held.length; h++) { var t = held[h].k % n; RB.slots[t] = held[h].s; RB.slotFrame[t] = held[h].k; }
+  // ══ THE ROLLBACK RING IS AN UNDO LOG, NOT A STACK OF SNAPSHOTS ═════════════
+  // It used to keep one full 6.86 MB copy of [1024, sbrk) per frame it could
+  // rewind to: 12 slots (~82 MB) at the starting window, 24 (~157 MB) at
+  // 100 ms one way + 2% loss — a phone risk. But a frame changes very little
+  // of that range: measured on Monster Rancher 2 (memmap rig, 4 KB pages),
+  // 18 of 1,676 pages per frame, and 85 of 105 64 KB blocks never changed in
+  // 2,000 frames. So the ring now holds:
+  //   * ONE shadow copy of the machine at the start of the newest frame
+  //     (UR.frame) — always byte-equal to live memory between steps, and
+  //   * per frame j, an UNDO LOG: the old (start-of-j) contents of exactly the
+  //     4 KB pages frame j changed, plus the JS FS stream offsets at start-of-j.
+  // Saving the start of frame j+1 = compare live against the shadow page by
+  // page, keep the shadow's old copy of every page that differs, copy the new
+  // one in. Rewinding to the start of frame k = apply the logs of frames
+  // UR.frame-1 ... k (newest first) to the shadow, then copy the shadow over
+  // live memory — the WHOLE range, not just the logged pages, so any stray
+  // write since the last save is reverted too, exactly as the old full-slot
+  // load did. A fingerprint of a past frame reads the shadow through the logs
+  // (oldest log wins per page), never touching live memory.
+  // Exactness is unchanged in kind: every byte of [1024, top) is either in the
+  // shadow or in a log, and a page is only ever left out of a log when it is
+  // byte-identical to the shadow. Bytes above sbrk (free memory) behave as
+  // they did with full slots: a heap that grows extends the shadow from live.
+  var PAGE = 4096, PAGE_W = 1024;
+  var UR = { sh: null, sh32: null, top: 0, cap: 0, list: 0, mem: null, simd: null, frame: -1, fs: [], logs: new Map(), pool: [], poolCap: 1024,
+             saves: 0, pages: 0, maxPages: 0, logPages: 0, cmpMs: 0, oldest: -1, maxLogPages: 0, check: /[?&]urcheck=1/.test(q), checkFails: 0, how: 'js' };
+  // THE COMPARE IS THE COST. Reading 6.86 MB twice per frame in JS is ~1.7 ms
+  // (node, Int32Array, early exit per page) — against 0.5 ms for the old
+  // full memcpy. So when the browser can, the shadow lives in its own
+  // WebAssembly.Memory and a 244-byte module compares it against the core's
+  // memory with SIMD (two memories: core imported as memory 0, shadow as 1):
+  // 0.45 ms for the same range. CMP_WASM is exactly this source, assembled with
+  // binaryen: wasm-as --enable-simd --enable-multimemory cmp.wat -o cmp.wasm
+  //   cmp(lo, top, list) -> n: for each 4 KB page of [lo, top) that differs
+  //   between core and shadow, store its page number at shadow[list + 4i].
+  //   (module
+  //     (import "e" "core" (memory $core 1))
+  //     (import "e" "own" (memory $own 1))
+  //     (func (export "cmp") (param $lo i32) (param $top i32) (param $list i32) (result i32)
+  //       (local $p i32) (local $a i32) (local $e i32) (local $n i32)
+  //       (local.set $a (local.get $lo))
+  //       (block $done
+  //         (loop $pages
+  //           (br_if $done (i32.ge_u (local.get $a) (local.get $top)))
+  //           (local.set $e (i32.add (i32.and (local.get $a) (i32.const -4096)) (i32.const 4096)))
+  //           (if (i32.gt_u (local.get $e) (local.get $top)) (then (local.set $e (local.get $top))))
+  //           (local.set $p (local.get $a))
+  //           (block $diff
+  //             (block $same
+  //               (loop $words
+  //                 (br_if $same (i32.ge_u (local.get $p) (local.get $e)))
+  //                 (br_if $diff (v128.any_true (v128.or
+  //                    (v128.or (v128.xor (v128.load $core (local.get $p)) (v128.load $own (local.get $p)))
+  //                             (v128.xor (v128.load $core offset=16 (local.get $p)) (v128.load $own offset=16 (local.get $p))))
+  //                    (v128.or (v128.xor (v128.load $core offset=32 (local.get $p)) (v128.load $own offset=32 (local.get $p)))
+  //                             (v128.xor (v128.load $core offset=48 (local.get $p)) (v128.load $own offset=48 (local.get $p)))))))
+  //                 (local.set $p (i32.add (local.get $p) (i32.const 64)))
+  //                 (br $words)))
+  //             (local.set $a (local.get $e))
+  //             (br $pages))
+  //           (i32.store $own (i32.add (local.get $list) (i32.shl (local.get $n) (i32.const 2))) (i32.shr_u (local.get $a) (i32.const 12)))
+  //           (local.set $n (i32.add (local.get $n) (i32.const 1)))
+  //           (local.set $a (local.get $e))
+  //           (br $pages)))
+  //       (local.get $n))
+  //   ) Anything that cannot instantiate it (no SIMD, no
+  // multi-memory) uses the JS loop, which gives the same answer; ?urcheck=1
+  // runs both on every save and counts disagreements (urcheck.fails).
+  var CMP_WASM = 'AGFzbQEAAAABCAFgA39/fwF/AhQCAWUEY29yZQIAAQFlA293bgIAAQMCAQAHBwEDY21wAAAKvAEBuQEBBH8gACEEAkADQCAEIAFPDQEgBEGAYHFBgCBqIQUgBSABSwRAIAEhBQsgBCEDAkACQANAIAMgBU8NASAD/QAEACAD/QBEAQD9USAD/QAEECAD/QBEARD9Uf1QIAP9AAQgIAP9AEQBIP1RIAP9AAQwIAP9AEQBMP1R/VD9UP1TDQIgA0HAAGohAwwACwALIAUhBAwBCyACIAZBAnRqIARBDHY2QgEAIAZBAWohBiAFIQQMAAsACyAGCw==';
+  function urSimdInit(cap) {
+    if (/[?&]urcmp=js/.test(q)) return null;
+    try {
+      var bin = atob(CMP_WASM), u = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+      var mem = new WebAssembly.Memory({ initial: Math.ceil((cap + 65536) / 65536) });
+      var inst = new WebAssembly.Instance(new WebAssembly.Module(u), { e: { core: wasmMemory, own: mem } });
+      return { mem: mem, cmp: inst.exports.cmp };
+    } catch (e) { return null; }
   }
+  function urViews() {
+    if (UR.mem) { UR.sh = new Uint8Array(UR.mem.buffer, 0, UR.cap); UR.sh32 = new Int32Array(UR.mem.buffer, 0, UR.cap >> 2); }
+    else UR.sh32 = new Int32Array(UR.sh.buffer, 0, UR.cap >> 2);
+  }
+  function urTopNow() {
+    var t = (snapTop() + PAGE - 1) & ~(PAGE - 1), L = Module.HEAPU8.length;
+    return t < L ? t : L;
+  }
+  function urRelease(L) {
+    for (var q = 0; q < L.bufs.length; q++) if (UR.pool.length < UR.poolCap) UR.pool.push(L.bufs[q]);
+    UR.logPages -= L.pages.length;
+  }
+  function urExtend(top) {
+    if (top <= UR.top) return;
+    if (top > UR.cap) {
+      var cap = top + (1 << 20);
+      if (UR.simd === null && !UR.sh) { UR.simd = urSimdInit(cap); UR.how = UR.simd ? 'simd' : 'js'; }
+      if (UR.simd) {
+        UR.mem = UR.simd.mem;
+        var need = Math.ceil((cap + 65536) / 65536) - (UR.mem.buffer.byteLength >> 16);
+        if (need > 0) UR.mem.grow(need);
+        UR.cap = cap; UR.list = cap; urViews();
+      } else {
+        UR.simd = false;
+        var nb = new Uint8Array(cap);
+        if (UR.sh) nb.set(UR.sh.subarray(0, UR.top));
+        UR.sh = nb; UR.cap = cap; urViews();
+      }
+    }
+    UR.sh.set(Module.HEAPU8.subarray(UR.top, top), UR.top);
+    UR.top = top;
+  }
+  function urInit(k) {
+    UR.logs.forEach(urRelease); UR.logs.clear(); UR.oldest = -1;
+    UR.top = 0; urExtend(urTopNow());
+    UR.frame = k; UR.fs = fsPositions();
+    UR.ph = hashPlan() ? allPageHashes(UR.sh32) : null;
+  }
+  function urRehash(p) { var k; if (UR.ph && p < HP.idx.length && (k = HP.idx[p]) >= 0) UR.ph[k] = pageHash(UR.sh32, 0, k); }
+  function urDiffJs(live32, lim, out) {
+    var sh32 = UR.sh32;
+    for (var p = 0; (p << 10) < lim; p++) {
+      var i = p ? p << 10 : 256, e = (p + 1) << 10;
+      if (e > lim) e = lim;
+      for (; i < e; i++) if (live32[i] !== sh32[i]) break;
+      if (i < e) out.push(p);
+    }
+    return out;
+  }
+  // Live memory is the start of frame UR.frame + 1: log frame UR.frame's
+  // changes and advance the shadow.
+  function urCommit() {
+    var t0 = performance.now(), heap = Module.HEAPU8, top = urTopNow();
+    var lim = top < UR.top ? top : UR.top, pages;
+    if (UR.simd) {
+      var n = UR.simd.cmp(1024, lim, UR.list);
+      pages = Array.prototype.slice.call(new Int32Array(UR.mem.buffer, UR.list, n));
+      if (UR.check) { var jp = urDiffJs(new Int32Array(heap.buffer), lim >> 2, []); if (jp.join() !== pages.join()) UR.checkFails++; }
+    } else pages = urDiffJs(new Int32Array(heap.buffer), lim >> 2, []);
+    var sh = UR.sh, bufs = [];
+    for (var k = 0; k < pages.length; k++) {
+      var p = pages[k], o = p << 12, b = UR.pool.pop() || new Uint8Array(PAGE);
+      b.set(sh.subarray(o, o + PAGE));
+      var s0 = p ? o : 1024, e0 = o + PAGE < lim ? o + PAGE : lim;
+      sh.set(heap.subarray(s0, e0), s0);
+      bufs.push(b);
+      urRehash(p);
+    }
+    urExtend(top);
+    UR.logs.set(UR.frame, { pages: pages, bufs: bufs, fs: UR.fs });
+    if (UR.oldest < 0) UR.oldest = UR.frame;
+    UR.logPages += pages.length;
+    UR.frame++; UR.fs = fsPositions();
+    urTrim();
+    UR.saves++; UR.pages += pages.length; if (pages.length > UR.maxPages) UR.maxPages = pages.length;
+    if (UR.logPages > UR.maxLogPages) UR.maxLogPages = UR.logPages;
+    UR.cmpMs += performance.now() - t0;
+  }
+  // Logs are contiguous: frames [UR.oldest, UR.frame). Drop the oldest while
+  // (a) it is older than the ring's reach (RB.n frames), or (b) the logs are
+  // over the device budget (RB.budget) AND it is older than RB.keepFrom, the
+  // earliest frame start the engine could still roll back to. (b) never
+  // drops a frame a rollback can name; the page stops running ahead instead
+  // (ps1.html lsFeedOne, "THE RING'S MEMORY BUDGET").
+  function urTrim() {
+    var lo = UR.frame - Math.max(2, RB.n);
+    while (UR.oldest >= 0 && UR.oldest < UR.frame) {
+      var old = UR.oldest < lo || (RB.budget > 0 && UR.logPages * PAGE > RB.budget && RB.keepFrom >= 0 && UR.oldest < RB.keepFrom);
+      if (!old) break;
+      var L = UR.logs.get(UR.oldest);
+      if (L) { urRelease(L); UR.logs.delete(UR.oldest); }
+      UR.oldest++;
+    }
+    if (UR.oldest >= UR.frame) UR.oldest = -1;
+  }
+  function urCanReach(k) {
+    if (k === UR.frame) return true;
+    if (k > UR.frame || k < 0) return false;
+    for (var j = k; j < UR.frame; j++) if (!UR.logs.has(j)) return false;
+    return true;
+  }
+  function urRestore(k) {
+    var fs = UR.fs;
+    for (var j = UR.frame - 1; j >= k; j--) {
+      var L = UR.logs.get(j);
+      for (var q = 0; q < L.pages.length; q++) { UR.sh.set(L.bufs[q], L.pages[q] << 12); urRehash(L.pages[q]); }
+      fs = L.fs;
+      urRelease(L); UR.logs.delete(j);
+    }
+    if (UR.oldest >= k) UR.oldest = -1;
+    Module.HEAPU8.set(UR.sh.subarray(1024, UR.top), 1024);
+    fsRestore(fs);
+    UR.frame = k; UR.fs = fs;
+  }
+  function urHashAt(k) {
+    if (!urCanReach(k)) return null;
+    var ov = null;
+    if (k < UR.frame) {
+      ov = new Map();
+      for (var j = UR.frame - 1; j >= k; j--) {
+        var L = UR.logs.get(j);
+        for (var q = 0; q < L.pages.length; q++) ov.set(L.pages[q], new Int32Array(L.bufs[q].buffer, L.bufs[q].byteOffset, PAGE_W));
+      }
+    }
+    return UR.ph ? combine(UR.ph, ov) : null;
+  }
+  function urBytes() { return UR.cap + (UR.logPages + UR.pool.length) * PAGE; }
+
+  var RB = { n: 0, live: -1, steps: 0, resim: 0, saveMs: 0, runMs: 0, loadMs: 0, maxStepMs: 0, lastBytes: 0,
+             maxRunMs: 0, maxSaveMs: 0, maxLoadMs: 0, maxHashMs: 0, hist: [0, 0, 0, 0, 0, 0], budget: 0, keepFrom: -1 };   // step ms: <8, <12, <17, <33, <67, >=67
+  function rbGrow(n) { n = Math.max(2, n | 0); if (n > RB.n) RB.n = n; }
   function rbSaveFrame(k) {
-    var i = k % RB.n;
-    RB.slotFrame[i] = -1;
     var t = performance.now();
-    RB.lastBytes = snapSave(RB.slots[i]);
-    RB.saveMs += performance.now() - t;
-    RB.slotFrame[i] = k;
+    if (UR.sh && UR.frame + 1 === k) urCommit(); else urInit(k);
+    t = performance.now() - t;
+    RB.saveMs += t; if (t > RB.maxSaveMs) RB.maxSaveMs = t;
+    RB.lastBytes = urBytes();
   }
   function latchPads(states) {
     if (states && typeof padStatus1 !== 'undefined' && padStatus1) Module.HEAPU8.set(new Uint8Array(states), padStatus1);
@@ -467,7 +797,10 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
           if (data.states && typeof padStatus1 !== 'undefined' && padStatus1) {
             Module.HEAPU8.set(new Uint8Array(data.states), padStatus1);
           }
-          for (var i = 0; i < n; i++) { runFrame(); creditAudio(); }
+          // A hidden frame (a returning player catching up in an input-delay
+          // room) is neither presented nor heard.
+          QUIET = QUIET_AUDIO = !!data.hidden;
+          try { for (var i = 0; i < n; i++) { runFrame(); creditAudio(); } } finally { QUIET = QUIET_AUDIO = false; }
           postMessage({ cmd: 'netFrame', frame: data.frame, ran: n });
         } catch (e) {
           postMessage({ cmd: 'netFrame', frame: data.frame, ran: 0, err: String(e) });
@@ -480,7 +813,7 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
       // exists to keep out of the SPU (it used to land between steps and could
       // drive the counter negative).
       case 'soundBytes': {
-        if (GATE) break;
+        if (GATE || AR) break;
         return origMain(event);
       }
 
@@ -492,8 +825,9 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
         try {
           if (!TAKE) throw new Error('rollback needs the governor takeover (' + TAKE_WHY + ')');
           rbGrow(data.ring | 0);
+          RB.budget = +data.budget > 0 ? +data.budget : 0;
           RB.live = data.frame | 0;
-          rbSaveFrame(RB.live);
+          var ti = performance.now(); urInit(RB.live); RB.saveMs += performance.now() - ti; RB.lastBytes = urBytes();
           postMessage({ cmd: 'netRbReady', ok: true, frame: RB.live, ring: RB.n, bytes: RB.lastBytes });
         } catch (e) {
           postMessage({ cmd: 'netRbReady', ok: false, err: String((e && e.message) || e) });
@@ -513,13 +847,19 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
         var t0 = performance.now(), err = null, resimRan = 0, hashes = [];
         try {
           if (data.ring) rbGrow(data.ring | 0);
+          if (typeof data.keepFrom === 'number') {
+            // ...and never past a fingerprint this same step still has to take.
+            var kf = data.keepFrom | 0, hq = data.hash || [];
+            for (var hq0 = 0; hq0 < hq.length; hq0++) if ((hq[hq0] | 0) + 1 < kf) kf = (hq[hq0] | 0) + 1;
+            RB.keepFrom = kf;
+          }
           var rs = data.resim || [];
           if (rs.length) {
-            var si = rbSlotOf(rs[0].frame | 0);
-            if (si < 0) throw new Error('no savestate for frame ' + rs[0].frame + ' (ring ' + RB.n + ')');
+            if (!urCanReach(rs[0].frame | 0)) throw new Error('no savestate for frame ' + rs[0].frame + ' (ring ' + RB.n + ')');
             var tl = performance.now();
-            snapLoad(RB.slots[si]);
-            RB.loadMs += performance.now() - tl;
+            urRestore(rs[0].frame | 0);
+            tl = performance.now() - tl;
+            RB.loadMs += tl; if (tl > RB.maxLoadMs) RB.maxLoadMs = tl;
             QUIET = true; QUIET_AUDIO = true;
             try {
               for (var ri = 0; ri < rs.length; ri++) {
@@ -532,33 +872,37 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
               }
             } finally { QUIET = false; QUIET_AUDIO = false; }
             RB.resim += resimRan;
-          } else if (rbSlotOf(data.frame | 0) < 0) {
+          } else if (UR.frame !== (data.frame | 0)) {
             throw new Error('the ring does not hold the start of frame ' + data.frame);
           }
           latchPads(data.states);
           // A HIDDEN catch-up frame (the room clock says this console is behind)
-          // is not PRESENTED — no fast-forward on screen — but its audio IS
-          // played: it is guest time nobody has heard yet, and dropping it leaves
-          // the sink that many frames short (a desktop pair measured 32-37
-          // dropouts/min while it was dropped; not all of that is this cause —
-          // see ps1.html's rate notes). Re-simulated frames above are
-          // repeats, so both stay quiet there.
-          QUIET = !!data.hidden;
+          // is not PRESENTED — no fast-forward on screen. Its audio plays unless
+          // the page says `quietAudio`: the page mutes exactly the hidden frames
+          // that run AHEAD of this console's own wall-clock timeline (a late
+          // starter being moved up to the room), and plays the ones that repay
+          // its own lost frames, so the sink gets one frame of sound per frame
+          // of wall clock (ps1.html rbTimelineTick). Re-simulated frames above
+          // are repeats, so they always stay quiet.
+          QUIET = !!data.hidden; QUIET_AUDIO = !!data.quietAudio;
           var tp = performance.now();
-          try { runFrame(); creditAudio(); } finally { QUIET = false; }
-          RB.runMs += performance.now() - tp;
+          try { runFrame(); creditAudio(); } finally { QUIET = false; QUIET_AUDIO = false; }
+          tp = performance.now() - tp;
+          RB.runMs += tp; if (tp > RB.maxRunMs) RB.maxRunMs = tp;
           rbSaveFrame((data.frame | 0) + 1);
           RB.live = (data.frame | 0) + 1;
           RB.steps++;
-          var hk = data.hash || [];
+          var hk = data.hash || [], th = performance.now();
           for (var hi = 0; hi < hk.length; hi++) {
-            var hs = rbSlotOf((hk[hi] | 0) + 1);
-            hashes.push({ frame: hk[hi] | 0, hash: hs < 0 ? null : slotHash(RB.slots[hs]) });
+            hashes.push({ frame: hk[hi] | 0, hash: urHashAt((hk[hi] | 0) + 1) });
           }
+          if (hk.length) { th = performance.now() - th; if (th > RB.maxHashMs) RB.maxHashMs = th; }
         } catch (e) { err = String((e && e.message) || e); QUIET = false; QUIET_AUDIO = false; }
         var ms = performance.now() - t0;
         if (ms > RB.maxStepMs) RB.maxStepMs = ms;
-        postMessage({ cmd: 'netFrame', frame: data.frame, ran: err ? 0 : 1, resim: resimRan, ms: ms, hashes: hashes, err: err });
+        RB.hist[ms < 8 ? 0 : ms < 12 ? 1 : ms < 17 ? 2 : ms < 33 ? 3 : ms < 67 ? 4 : 5]++;
+        postMessage({ cmd: 'netFrame', frame: data.frame, ran: err ? 0 : 1, resim: resimRan, ms: ms, hashes: hashes, err: err, bytes: RB.lastBytes,
+          logBytes: UR.logPages * PAGE, held: UR.oldest >= 0 ? UR.frame - UR.oldest : 0 });
         break;
       }
       case 'netRbStats': {
@@ -567,6 +911,10 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
           saveMsAvg: (RB.steps + RB.resim) ? RB.saveMs / (RB.steps + RB.resim) : 0,
           runMsAvg: (RB.steps + RB.resim) ? RB.runMs / (RB.steps + RB.resim) : 0,
           loadMsTotal: RB.loadMs, maxStepMs: RB.maxStepMs, quietRenders: quietRenders, quietAudio: quietAudio,
+          maxRunMs: RB.maxRunMs, maxSaveMs: RB.maxSaveMs, maxLoadMs: RB.maxLoadMs, maxHashMs: RB.maxHashMs, stepHist: RB.hist.slice(),
+          gpuPal: Module.HEAP32[CORE.palFlag >> 2], gpuStat: Module.HEAP32[CORE.gpuStat >> 2] >>> 0, vmode: VMODE, vmodeSwitches: vmodeSwitches,
+          ringBytes: urBytes(), shadowBytes: UR.cap, budget: RB.budget, maxLogBytes: UR.maxLogPages * PAGE, held: UR.oldest >= 0 ? UR.frame - UR.oldest : 0, cmpHow: UR.how, checkFails: UR.check ? UR.checkFails : null, logPages: UR.logPages, poolPages: UR.pool.length,
+          pagesPerSave: UR.saves ? UR.pages / UR.saves : 0, maxPagesPerSave: UR.maxPages, cmpMsAvg: UR.saves ? UR.cmpMs / UR.saves : 0,
           paceFrames: paceFrames, paceDrops: paceDrops, calls: schedCalls });
         break;
       }
@@ -574,6 +922,27 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
       // the rollback fingerprint), and a save/load round-trip timer.
       case 'netLiveHash': {
         postMessage({ cmd: 'netLiveHashResult', tag: data.tag, hash: liveHash(), calls: schedCalls });
+        break;
+      }
+      case 'netAudioSab': {
+        try {
+          AR = { h: new Int32Array(data.sab, 0, 16), d: new Int16Array(data.sab, data.hdrBytes, data.cap * 2), cap: data.cap, mask: data.cap - 1 };
+          AR.h[5] = GATE ? 1 : 0;
+          postMessage({ cmd: 'netAudioSabOk' });
+        } catch (e) { AR = null; postMessage({ cmd: 'print', txt: '[audio] ring refused: ' + e }); }
+        break;
+      }
+      case 'netSnapMap': {
+        var blk = (data.block | 0) || 65536, lo0 = SNAP_LO, hi0 = snapTop(), hs = [];
+        var u32m = new Uint32Array(Module.HEAPU8.buffer);
+        for (var a0 = lo0; a0 < hi0; a0 += blk) {
+          var e0 = Math.min(hi0, a0 + blk), hh = 0x811c9dc5 | 0;
+          for (var w0 = a0 >> 2; w0 < (e0 >> 2); w0++) hh = Math.imul(hh ^ u32m[w0], 16777619);
+          hs.push(hh >>> 0);
+        }
+        if (!memMapTried) { memMapTried = true; try { memMap = locateMem(); } catch (e) { memMap = null; } }
+        postMessage({ cmd: 'netSnapMapResult', lo: lo0, hi: hi0, block: blk, hashes: hs, mem: memMap, vram: vram_ptr, sb: soundbuffer_ptr, pad: padStatus1,
+          R: memMap ? Module.HEAP32[(memMap.table >> 2) + 0x1fc0] >>> 0 : null });
         break;
       }
       case 'netSnapBench': {

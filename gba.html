@@ -25,6 +25,7 @@
        is revertible by editing a single line — see lib/asset_base.js. -->
   <script src="/lib/asset_base.js?v=27d8c0a4"></script>
     <script src="/lib/audiodiag.js"></script>
+    <script src="/lib/cart_audio.js?v=6f95e7c9"></script>
     <!-- UI deps are SELF-HOSTED, same rationale as n64/vendor/: this page must not
          depend on five third-party CDNs staying reachable to render at all, and a
          sibling page's coi-serviceworker isolates this origin for every later visit.
@@ -1270,7 +1271,7 @@
          gate now covers this page's runtime assets too. -->
     <script src="/gba/gbaWasm/dist/settings.js"></script>
     <script src="/gba/gbaWasm/dist/romlist.js"></script>
-    <script src="/gba/gbaWasm/dist/script.js"></script>
+    <script src="/gba/gbaWasm/dist/script.js?v=caee350c"></script>
   <script>
     // The page's liveness seam. It is NOT a netplay seam any more and does not
     // pretend to be one: `supported:false` with a reason in words is the honest

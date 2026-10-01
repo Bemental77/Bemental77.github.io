@@ -28,6 +28,7 @@
        no -pthread, no -sSHARED_MEMORY), so cross-origin isolation buys this page
        nothing. Same reasoning as gba.html and n64/index.html. -->
   <script src="/lib/wakelock.js"></script>
+  <script src="/lib/cart_audio.js?v=6f95e7c9"></script>
   <style>
     html, body { margin: 0; padding: 0; height: 100%; background: #111; color: #ddd; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     body { overflow: hidden; }
@@ -389,6 +390,12 @@
   // what sample rate we ask for. getSoundBuffer() returns 2048 stereo frames,
   // DE-interleaved: left in [0..2047], right in [2048..4095].
   const SND_RATE = 36000, SND_BLOCK = 2048;
+  // WHAT THE GUEST ACTUALLY PRODUCES PER GUEST SECOND: the non-blargg
+  // S9xSoundCallback mixes exactly 600 frames per mainLoop()
+  // (snes/snesWasm/source/exports.c:139), i.e. 600 x 60.0988 = 36,059.3/s at
+  // 1.000x — 0.16% more than the 36,000 the old sink consumed. The sink
+  // resamples by this one fixed ratio, so pitch is exact and the queue holds.
+  const SND_PER_FRAME = 600, SND_SRC_RATE = SND_PER_FRAME * SNES_HZ;
 
   const $ = (id) => document.getElementById(id);
   const statusEl = $('status'), mobileStatusEl = $('mobileStatus'), fpsEl = $('fps'), toastEl = $('toast');
@@ -433,7 +440,7 @@
   // ── module state ──────────────────────────────────────────────────────────
   var wasmReady = false, running = false, romName = '', muted = false;
   var ctx2d = null, imgData = null;      // 512x448 — see getScreenBuffer() below
-  var audioCtx = null, sndBlock = null, sndPos = 0;
+  var audioCtx = null, audioSink = null;
   // ── TWO LOCAL PLAYERS ──────────────────────────────────────────────────────
   // padState[0] is Player 1 (keyboard set 1 + the touch shell), padState[1] is
   // Player 2 (keyboard set 2). gpState is the gamepad-only view and is kept
@@ -482,7 +489,11 @@
     var c = $('canvas');
     c.width = 256; c.height = 224;
     ctx2d = c.getContext('2d', { alpha: false });
-    imgData = ctx2d.getImageData(0, 0, 512, 448);
+    // ONLY THE QUADRANT THE CANVAS SHOWS. This was a 512x448 ImageData copied
+    // and put whole every frame — 917 KB of main-thread copying, and a put
+    // four times the canvas, for pixels clipped away. The canvas is 256x224,
+    // so 224 rows of 1 KB are exactly what reaches the screen.
+    imgData = ctx2d.createImageData(256, 224);
   }
 
   // The local mask for ONE player. `who` is 0 or 1 — it is a LOCAL seat index,
@@ -869,18 +880,41 @@
     var p = Module._getScreenBuffer();
     // ALLOW_MEMORY_GROWTH=1 (build.sh) means HEAPU8.buffer can be replaced on a
     // grow, which detaches any view we cached — so re-view it every frame.
-    var src = new Uint8Array(Module.HEAPU8.buffer, p, 512 * 448 * 4);
-    imgData.data.set(src);
+    var src = new Uint8Array(Module.HEAPU8.buffer, p, 512 * 448 * 4), dst = imgData.data;
+    for (var y = 0; y < 224; y++) dst.set(src.subarray(y * 2048, y * 2048 + 1024), y * 1024);
     ctx2d.putImageData(imgData, 0, 0);
     presented++;
   }
 
   var accum = 0, lastTs = 0;
+  // THE GUEST CLOCK IS NOT THE DISPLAY'S. tick() used to run only from
+  // requestAnimationFrame, so the guest advanced only when the compositor
+  // produced a frame — and a phone's compositor does not promise 60 Hz
+  // (low-power mode runs rAF at 30; a busy GPU or throttled tab delivers ticks
+  // 60-100 ms apart), and each tick past the 100 ms clamp, or past
+  // MAX_CATCHUP_FRAMES, dropped the rest of its time. Measured on the mobile
+  // profile (tools/netplay_device_matrix.mjs, 2026-10-01): rAF at 7-55/s.
+  // SOLO, a timer woken when the next frame is due now also calls tick(), so
+  // the guest keeps the wall clock whenever the CPU has room; rAF still calls
+  // it too. Both use performance.now() against ONE accumulator, so whichever
+  // comes second in a frame period finds no credit: exactly 1.000x, never
+  // faster (gate #9), and a late tick's debt is still dropped, never repaid.
+  // IN A ROOM nothing changes: the timer stands down and tick() keeps the rAF
+  // timestamps the lockstep/rollback pacing was built and measured on.
   function loop(ts) {
     requestAnimationFrame(loop);
+    tick(LS.armed ? ts : performance.now());
+  }
+  function timerTick() {
+    var solo = running && !LS.armed;
+    if (solo) tick(performance.now());
+    setTimeout(timerTick, solo ? Math.max(1, FRAME_MS - accum) : 50);
+  }
+  function tick(ts) {
     if (!running) { lastTs = 0; return; }
     if (!lastTs) { lastTs = ts; accum = 0; return; }
     var d = ts - lastTs; lastTs = ts;
+    if (d < 0) d = 0;
     if (d > 100) d = 100;          // a long stall must not fast-forward the guest
     accum += d;
     var ran = 0;
@@ -896,6 +930,7 @@
     var stalled = false;
     while (accum >= FRAME_MS && ran < MAX_CATCHUP_FRAMES) {
       if (!runFrame()) { stalled = true; break; }
+      sndPoll();
       accum -= FRAME_MS; ran++;
     }
     // ⚠ NOT ONLY WHEN STALLED — the same defect that shipped on Genesis. This
@@ -921,37 +956,48 @@
     }
   }
   requestAnimationFrame(loop);
+  setTimeout(timerTick, 16);
 
   // ── audio ─────────────────────────────────────────────────────────────────
+  // ONE BLOCK, ONCE. Called after every frame the guest ran. The core fills a
+  // 2,048-frame half of a 4,096 ring at 600 frames per mainLoop() and
+  // getSoundBuffer() hands the next half over only once it is full, else the
+  // same buffer again. A new block is recognised two ways: its content changed
+  // (certain), or the 600-per-frame production model says one is due (needed
+  // for silence, where two real blocks are identical). Called once per frame
+  // the getter can never go 5 calls without a block, so the core's own
+  // "stuck" reset (exports.c:306-312) cannot fire.
+  var sndPrev = new Float32Array(SND_BLOCK * 2), sndCredit = SND_BLOCK;
+  function sndPoll() {
+    if (!audioSink) return;
+    sndCredit += SND_PER_FRAME;
+    var p = Module._getSoundBuffer();
+    var cur = new Float32Array(Module.HEAPF32.buffer, p, SND_BLOCK * 2);
+    var differs = false;
+    for (var i = 0; i < SND_BLOCK * 2; i++) if (cur[i] !== sndPrev[i]) { differs = true; break; }
+    if (!differs && sndCredit < SND_BLOCK) return;
+    if (differs && sndCredit < SND_BLOCK) sndCredit = SND_BLOCK;   // resync the model
+    sndCredit = Math.min(sndCredit - SND_BLOCK, SND_BLOCK);
+    sndPrev.set(cur);
+    if (!muted) audioSink.pushPlanar(cur.subarray(0, SND_BLOCK), cur.subarray(SND_BLOCK), SND_BLOCK);
+  }
   function initAudio() {
     if (audioCtx) { if (audioCtx.state !== 'running') audioCtx.resume().catch(() => {}); return; }
     var AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return;
     try { audioCtx = new AC({ sampleRate: SND_RATE, latencyHint: 'playback' }); }
     catch (e) { try { audioCtx = new AC(); } catch (e2) { return; } }
-    var sp = audioCtx.createScriptProcessor(SND_BLOCK, 0, 2);
-    // One resampling path for every device. `step` is 1.0 when the context
-    // honoured our 36 kHz request (Chrome/Firefox do) and ~0.75 when it forced
-    // 48 kHz (some Safari builds), so a browser that ignores sampleRate gets
-    // correct PITCH rather than a game running a third too fast.
-    sp.onaudioprocess = function (ev) {
-      var oL = ev.outputBuffer.getChannelData(0), oR = ev.outputBuffer.getChannelData(1);
-      var n = oL.length;
-      if (!running || muted || !wasmReady) { oL.fill(0); oR.fill(0); return; }
-      var step = SND_RATE / audioCtx.sampleRate;
-      for (var i = 0; i < n; i++) {
-        if (!sndBlock || sndPos >= SND_BLOCK) {
-          var p = Module._getSoundBuffer();
-          sndBlock = new Float32Array(Module.HEAPF32.buffer, p, SND_BLOCK * 2);
-          sndPos = sndPos >= SND_BLOCK ? sndPos - SND_BLOCK : 0;
-        }
-        var idx = sndPos | 0;
-        oL[i] = sndBlock[idx];
-        oR[i] = sndBlock[SND_BLOCK + idx];
-        sndPos += step;
-      }
-    };
-    sp.connect(audioCtx.destination);
+    // ⚠ THE SINK NO LONGER PULLS FROM THE CORE. This used to be a main-thread
+    // ScriptProcessor whose callback called _getSoundBuffer() on the AUDIO
+    // clock. getSoundBuffer() returns the PREVIOUS 2,048-frame block unchanged
+    // when the core has not filled a new one (exports.c:317-321), so whenever
+    // the device's clock ran ahead of the guest — any slow frame, any late
+    // tick, and steadily at 36,000 vs 36,059/s — the speaker REPEATED 57 ms of
+    // audio, and a callback delayed past a block let the core overwrite one.
+    // Neither was a zero-hole and nothing counted them. Now sndPoll() takes
+    // each block exactly once, right after the frames that made it, and an
+    // AudioWorklet (lib/cart_audio.js) plays it off the main thread.
+    audioSink = window.CartAudio ? window.CartAudio.create(audioCtx, { srcRate: SND_SRC_RATE, targetMs: 80, maxMs: 400, page: 'snes' }) : null;
     audioCtx.resume().catch(() => {});
   }
   document.addEventListener('click', function () { if (!muted && audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {}); });

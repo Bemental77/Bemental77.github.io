@@ -25,7 +25,7 @@ function log(s) { lines.push(s); logEl.textContent = lines.slice(-60).join('\n')
 window.__log = () => lines.slice();
 
 function mkWorker() {
-  const w = new Worker('/ps1/ps1Wasm/dist/wasmpsx_worker.js?netgate=1&v=' + Date.now());
+  const w = new Worker('/ps1/ps1Wasm/dist/wasmpsx_worker.js?netgate=1&v=' + Date.now() + (location.search.length > 1 ? '&' + location.search.slice(1) : ''));
   const st = { w, ready: false, booted: false, prints: [], q: [], frames: 0 };
   w.onmessage = (e) => {
     const d = e.data;
@@ -117,7 +117,10 @@ window.__run = async function (opts) {
   const bench = await ask(B, 'netSnapBenchResult', { cmd: 'netSnapBench', reps: 30 });
   log('snap bench: bytes=' + bench.bytes + ' roundtrip-identical=' + bench.same);
 
-  const init = await ask(B, 'netRbReady', { cmd: 'netRbInit', frame: WARM, ring: RING });
+  // opts.budget (bytes): the undo ring's log budget. With a tiny one the worker
+  // drops every log older than keepFrom on every step — the hardest case for
+  // "never drop a frame a rollback (or a fingerprint) can still name".
+  const init = await ask(B, 'netRbReady', { cmd: 'netRbInit', frame: WARM, ring: RING, budget: opts.budget || 0 });
   if (!init.ok) return { ok: false, reason: 'rbInit: ' + init.err };
 
   // B's simulated engine.
@@ -164,7 +167,7 @@ window.__run = async function (opts) {
     const hash = pendingHash.splice(0);
     const transfer = [];
     const sb = padBuf(img); transfer.push(sb); for (const r of resim) transfer.push(r.states);
-    const rb = await ask(B, 'netFrame', { cmd: 'netRbStep', frame: f, states: sb, resim, hash, ring: RING }, transfer);
+    const rb = await ask(B, 'netFrame', { cmd: 'netRbStep', frame: f, states: sb, resim, hash, ring: RING, keepFrom: confirmedTo + 1 }, transfer);
     if (rb.err) return { ok: false, reason: 'B step ' + f + ': ' + rb.err, checks };
     (resim.length ? resimStepMs : stepMs).push(rb.ms);
     for (const h of rb.hashes) {
@@ -193,8 +196,8 @@ window.__run = async function (opts) {
     frames: N, warm: WARM, maxLag: MAXLAG, ring: RING,
     compared, mismatches, missing, rollbacks, resimFrames, maxDepth,
     snapBytes: bench.bytes, snapSaveMs: { p50: pct(bench.saveMs, .5), p90: pct(bench.saveMs, .9) }, snapLoadMs: { p50: pct(bench.loadMs, .5), p90: pct(bench.loadMs, .9) }, snapRoundTripIdentical: bench.same,
-    stepMs: { p50: pct(stepMs, .5), p90: pct(stepMs, .9), n: stepMs.length },
-    resimStepMs: { p50: pct(resimStepMs, .5), p90: pct(resimStepMs, .9), n: resimStepMs.length },
+    stepMs: { p50: pct(stepMs, .5), p90: pct(stepMs, .9), p99: pct(stepMs, .99), max: pct(stepMs, 1), n: stepMs.length },
+    resimStepMs: { p50: pct(resimStepMs, .5), p90: pct(resimStepMs, .9), p99: pct(resimStepMs, .99), max: pct(resimStepMs, 1), n: resimStepMs.length },
     worker: stats, coreRate: A.coreRate,
     sample: checks.slice(0, 4),
   };

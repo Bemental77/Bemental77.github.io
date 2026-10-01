@@ -11,6 +11,7 @@
 // Flags: --frames N (1800) --every N (30) --max-lag N (6) --ring N (12)
 //        --warm N (600) --rom BASE (MonsterRancher2) --mb N (89)
 //        --broken  negative control: rollbacks that do not correct; MUST fail
+//        --budget B  the undo ring's log budget in bytes (1 = trim to the frontier every step)
 // Env: CHROME_PATH
 import os from 'node:os';
 import fs from 'node:fs';
@@ -24,7 +25,7 @@ const arg = (n, d) => { const i = argv.indexOf('--' + n); return i >= 0 && i + 1
 const opts = {
   frames: +arg('frames', 1800), every: +arg('every', 30), maxLag: +arg('max-lag', 6), ring: +arg('ring', 12),
   warm: +arg('warm', 600), bytes: (+arg('mb', 89)) * 1048576,
-  broken: argv.includes('--broken'),
+  broken: argv.includes('--broken'), budget: +arg('budget', 0),
   url: '/ps1/ps1Wasm/roms/' + arg('rom', 'MonsterRancher2') + '.bin.partaa.gz',
 };
 const md5 = (f) => { try { return crypto.createHash('md5').update(fs.readFileSync(f)).digest('hex'); } catch (e) { return 'missing'; } };
