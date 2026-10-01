@@ -6,6 +6,16 @@
 > REF2 from VOID into 61/61. Rollback (REF==RB) is still NOT exact on the shipped
 > binary; the last residue needs the rebuild. See "Second pass" at the bottom.
 
+> **Lockstep rooms, 2026-10-01 (`dreamcast/docs/room-determinism/TASKS.md`):**
+> in a real two-browser room, ONE peer with 10 frames of history before the
+> seed forks the room at frame 0 — and still does with `_flycast_set_idleskip(0)`
+> on both peers, so the streak is not the only history carrier there. The
+> second carrier is NOT isolated; the source-read candidate is libretro
+> `first_run`, which makes `retro_unserialize` skip `emu.stop()/start()` on a
+> worker that has never run a frame. Rooms are guarded by refusing any anchor on a
+> worker that has run a frame; this card's REF/RB arms all ran on workers that
+> had, so they are unaffected.
+
 ## Status: NOT FEASIBLE on the shipped binary. dreamcast.html stays on delay-based lockstep, and the room panel now says why.
 
 The user requirement is zero local input lag, i.e. rollback at delay 0. That is

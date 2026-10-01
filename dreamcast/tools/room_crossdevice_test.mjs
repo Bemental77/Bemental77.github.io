@@ -1719,14 +1719,17 @@ async function runArm(armName) {
         }
         return out;
       });
-      // ⚠ ON A SEEDED DISC THE CARDS ARE NOT SETTLED AT FRAME 0.
-      // The boot state replaces the card in any port it was not captured with,
-      // so the room writes the agreed set AGAIN at a fixed frame (240) on every
-      // console. Reading before that frame measures the guest's replacement and
-      // reports a fixed bug as broken — which is exactly what happened: the
-      // cells ran at 20.8 s and the re-install landed at 24.3 s.
+      // ⚠ ON A SEEDED DISC A SEAT CAN HAVE NO CARD AT ALL — corrected
+      // 2026-10-01. This block used to wait for a frame-240 "re-install" of the
+      // set, written because port 1 read zeros once frames ran. That was the
+      // boot state (captured with ONE card) DELETING port 1's card on load; the
+      // re-install wrote 128 KB into the freed block and corrupted the heap
+      // (flycast_worker.js vmuGuardLoad). The page no longer writes there, and
+      // the worker reports such a port as deleted (__dcVmu().slots[].dead).
+      // Reading past frame 300 is still kept: it proves the cards that DO exist
+      // survive the first seconds of play on both consoles.
       if (seedDisc()) {
-        const WANT = 300;   // comfortably past the page's VMU_REINSTALL_FRAME
+        const WANT = 300;
         const tW = Date.now();
         let ran = [null, null];
         while (Date.now() - tW < 60000) {
@@ -1777,7 +1780,16 @@ async function runArm(armName) {
       const hpSeat = D.cardSeats && D.cardSeats.host != null ? D.cardSeats.host : 0;
       const jpSeat = D.cardSeats && D.cardSeats.join != null ? D.cardSeats.join : 1;
       const headIs = (live, port, byte) => !!(live[port] && live[port].head && live[port].head[0] === byte);
-      if (BLANK_JOINER) {
+      const deletedOn = (c, port) => !!(c && Array.isArray(c.slots) && c.slots.some((x) => (x.port | 0) === port && x.dead));
+      if (deletedOn(hc, jpSeat) || deletedOn(jc, jpSeat)) {
+        // The boot state has no card in Player 2's seat. The only correct
+        // outcome is the SAME on both consoles: the seat's card is reported
+        // deleted, nothing is read out of it and nothing is written into it.
+        cell(deletedOn(hc, jpSeat) && deletedOn(jc, jpSeat) && !hl[jpSeat] && !jl[jpSeat],
+          'A-SEAT-THE-BOOT-STATE-HAS-NO-CARD-IN-IS-DELETED-ON-BOTH-AND-NEVER-TOUCHED',
+          `port ${jpSeat}: deleted by the seed on both consoles, no live bytes read on either`,
+          `port ${jpSeat} disagrees: host slots ${J(hc.slots)} join slots ${J(jc.slots)} · live host ${J(hl[jpSeat])} join ${J(jl[jpSeat])}`);
+      } else if (BLANK_JOINER) {
         // The joiner brought nothing, so port 1 must be ITS OWN blank card's
         // bytes — present on both machines, identical, and NOT the host's card.
         // Byte-identity is cell (3); what this adds is that the blank actually
