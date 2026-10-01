@@ -3862,13 +3862,27 @@ N64Rate.selfTest = function (logFn) {
     }
     return 0;
   }
-  function n64sCall(fn) {
-    var app = window.myApp, ev = app && app.SaveStateEvent, r = 0;
-    if (app) app.SaveStateEvent = function () {};
+  // ⚠ NOTHING HERE ALLOCATES PER CALL (it runs on every snapshot): no closure
+  // per call, and the heap views below are made once and re-made only when
+  // the heap's buffer changes (memory growth).
+  function n64sNop() {}
+  function n64sCall(load) {
+    var app = window.myApp, ev = app && app.SaveStateEvent, r = 0, M = window.Module;
+    if (app) app.SaveStateEvent = n64sNop;
     N64S.quiet = true;
-    try { n64sGz(true); r = fn() | 0; }
+    try { n64sGz(true); r = (load ? M._neil_unserialize() : M._neil_serialize()) | 0; }
     finally { n64sGz(false); N64S.quiet = false; if (app) app.SaveStateEvent = ev; }
     return r;
+  }
+  function n64sView() {
+    var H = window.Module.HEAPU8, v = N64S.view;
+    if (!v || v.buffer !== H.buffer) v = N64S.view = H.subarray(N64S.ptr, N64S.ptr + N64S.size);
+    return v;
+  }
+  function n64sSmView() {
+    var H = window.Module.HEAPU8, v = N64S.smView;
+    if (!v || v.buffer !== H.buffer) v = N64S.smView = H.subarray(N64S.smPtr, N64S.smPtr + N64S_SM);
+    return v;
   }
   // The bytes after the event queue's 0xFFFFFFFF terminator are never written
   // by a save (the queue is variable-length), so they are zeroed before each
@@ -3919,23 +3933,23 @@ N64Rate.selfTest = function (logFn) {
       if (!N64S.smPtr) { N64S.fault = 'the core\'s save memory (EEPROM/paks/SRAM/flash) was not found in its heap, so a rollback could not restore it'; return false; }
       pageLog('[state] save memory (EEPROM, paks, SRAM, flash) at heap 0x' + N64S.smPtr.toString(16) + ': carried in every rollback slot');
     }
-    dst.set(H.subarray(N64S.smPtr, N64S.smPtr + N64S_SM), N64S.size);
+    dst.set(n64sSmView(), N64S.size);
     return true;
   }
   function n64sSave(dst) {
     var M = window.Module, t0 = performance.now();
     if (N64S.located) n64sZeroTail();
-    if (!n64sCall(function () { return M._neil_serialize(); })) { N64S.fault = 'neil_serialize refused (savestates_save_m64p returned 0)'; return false; }
+    if (!n64sCall(false)) { N64S.fault = 'neil_serialize refused (savestates_save_m64p returned 0)'; return false; }
     if (!N64S.located) {
       var p = n64sLocate();
       if (!p) { N64S.fault = 'the core\'s savestate buffer was not found in its heap'; return false; }
       N64S.ptr = p; N64S.located = true;
       pageLog('[state] exact savestate buffer at heap 0x' + p.toString(16) + ' (' + N64S.size + ' B): raw save/load, no gzip');
       n64sZeroTail();
-      if (!n64sCall(function () { return M._neil_serialize(); })) { N64S.fault = 'neil_serialize refused'; return false; }
+      if (!n64sCall(false)) { N64S.fault = 'neil_serialize refused'; return false; }
     }
     if (dst) {
-      dst.set(M.HEAPU8.subarray(N64S.ptr, N64S.ptr + N64S.size));
+      dst.set(n64sView());
       if (!n64sSaveMem(dst)) return false;
     }
     var dt = performance.now() - t0;
@@ -3962,12 +3976,14 @@ N64Rate.selfTest = function (logFn) {
   // the JIT's parameter block carries &invalid_code[0] and the RDRAM base
   // (recomp.c jit_params[31] and [24]); with the JIT off (?jit=off) they are
   // unknown and every load pays the full recompile, as it always did.
+  var N64S_KSEG = [0x80000, 0xA0000];
   function n64sCodeKeep(src) {
     var P = window.__n64CorePtrs;
     if (!P || !P.invalidCode || !P.dramBase || (P.dramBase & 3)) return null;
     var H8 = Module.HEAPU8, H32 = Module.HEAPU32, ic = P.invalidCode, dw = P.dramBase >>> 2;
-    var S32 = new Uint32Array(src.buffer, src.byteOffset + N64S_HDR, N64S_RDRAM >>> 2);
-    var keep = [], same = new Int8Array(N64S_RDRAM >>> 12), bases = [0x80000, 0xA0000];
+    var S32 = src.__n64sRd || (src.__n64sRd = new Uint32Array(src.buffer, src.byteOffset + N64S_HDR, N64S_RDRAM >>> 2));
+    var keep = N64S.keep || (N64S.keep = []), same = N64S.same || (N64S.same = new Int8Array(N64S_RDRAM >>> 12)), bases = N64S_KSEG;
+    keep.length = 0; same.fill(0);
     for (var r = 0; r < 2; r++) {
       for (var j = 0; j < same.length; j++) {
         var idx = bases[r] + j;
@@ -3987,10 +4003,13 @@ N64Rate.selfTest = function (logFn) {
     var M = window.Module, t0 = performance.now();
     if (!N64S.located) { N64S.fault = 'a load before any save'; return false; }
     var keep = N64S_KEEP_CODE ? n64sCodeKeep(src) : null;
-    M.HEAPU8.set(src.subarray(0, N64S.size), N64S.ptr);
-    if (!n64sCall(function () { return M._neil_unserialize(); })) { N64S.fault = 'neil_unserialize refused the state (savestates_load_m64p returned 0)'; return false; }
+    // A slot's buffer is exactly state + save memory (alloc), so each half is
+    // one subarray view; the copies themselves are memcpy.
+    var sv = src.length === N64S.size ? src : (src.__n64sHead || (src.__n64sHead = src.subarray(0, N64S.size)));
+    n64sView().set(sv);
+    if (!n64sCall(true)) { N64S.fault = 'neil_unserialize refused the state (savestates_load_m64p returned 0)'; return false; }
     // The cartridge/controller save memory, which the savestate leaves out.
-    if (N64S.smPtr) M.HEAPU8.set(src.subarray(N64S.size, N64S.size + N64S_SM), N64S.smPtr);
+    if (N64S.smPtr && src.length >= N64S.size + N64S_SM) n64sSmView().set(src.__n64sTail || (src.__n64sTail = src.subarray(N64S.size, N64S.size + N64S_SM)));
     if (keep) {
       var H8 = M.HEAPU8, ic = window.__n64CorePtrs.invalidCode;
       for (var i = 0; i < keep.length; i++) H8[ic + keep[i]] = 0;
@@ -4055,21 +4074,21 @@ N64Rate.selfTest = function (logFn) {
   };
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // ROLLBACK — ZERO LOCAL INPUT LAG, IN EVERY N64 ROOM.
+  // ROLLBACK — ZERO LOCAL INPUT LAG (OPT-IN: ?rb=1; see RB_DEFAULT below).
   //
   // The engine half (prediction, the window, the re-simulation plan, confirmed
   // fingerprints) is lib/netplay.js _beginFrameRb; genesis.html rbRunFrame is
   // the reference integration. This is the core half:
-  //   * every frame's START is kept: after frame k runs, the exact state is
-  //     saved into slot k+1 of a ring (W+3 slots, allocated as they are first
-  //     needed), with the framebuffer-readback pin (fbasync) and the CPU
-  //     fingerprint taken at the same instant;
+  //   * frame STARTS are kept, every K frames (SPARSE SNAPSHOTS, below): after
+  //     frame k runs, the exact state may be saved as the start of k+1, with
+  //     the framebuffer-readback pin (fbasync) and the CPU fingerprint taken
+  //     at the same instant, and the input every frame ran with is kept;
   //   * the local pad is applied to the frame it was sampled for (delay 0);
   //   * a remote port with no input yet is PREDICTED as its last real input
   //     (the engine's repeat-last);
   //   * when a late input contradicts a prediction, beginFrame hands back a
-  //     plan: load the start of the earliest wrong frame, re-run every frame up
-  //     to the present WITHOUT PRESENTING (nothing yields to the browser in
+  //     plan: load the newest snapshot at or before the earliest wrong frame,
+  //     re-run every frame up to the present WITHOUT PRESENTING (nothing yields to the browser in
   //     between, so only the last frame drawn in this task reaches the screen)
   //     and WITHOUT AUDIO (the re-simulated frames' samples are dropped: they
   //     were heard once, on the guess), then run the present frame.
@@ -4098,31 +4117,116 @@ N64Rate.selfTest = function (logFn) {
   // rather than repaid (lsFeed).
   // ═══════════════════════════════════════════════════════════════════════════
   var RB_Q = new URLSearchParams(location.search);
-  // Rollback is opt-in (?rb=1) until a weak device is proven to keep 1.000x in it:
-  // a 4x-CPU MK64 room measured 0.07x in rollback vs 0.55-0.62x in lockstep.
-  var RB_WANT = RB_Q.get('rb') === '1';
+  // ROLLBACK IS OPT-IN (?rb=1) UNTIL THE ENGINE'S CAPACITY GATE LANDS. Measured
+  // 2026-10-01 (MK64, 4x-CPU mobile arm, 2 players): rollback rooms ran at
+  // 0.06-0.26x while delay lockstep (robust-RTT input delay) is never slower,
+  // so N64 rooms default to delay lockstep and rollback is a measurement arm.
+  // ▶ ONE-LINE SWITCH — when the capacity gate lands, flip RB_DEFAULT to true:
+  var RB_DEFAULT = false;
+  var RB_WANT = RB_Q.get('rb') === '1' || (RB_DEFAULT && RB_Q.get('rb') !== '0');  // ?rb=1 / ?rb=0 override either way
   var RB_WINDOW = Math.max(2, Math.min(12, +(RB_Q.get('rbw') || 8) | 0));
-  var RB = { ready: false, fault: null, slots: [], n: 0, hidden: 0, stepMs: 0,
-             rollbacks: 0, resimFrames: 0, maxDepth: 0, depthHist: {}, resimMs: 0, maxResimMs: 0,
-             hashes: 0, missingSlot: 0, saveMs: 0, frames: 0, loads: 0 };
+  // ---- RE-SIMULATED FRAMES DRAW NOTHING (GLSKIP) -----------------------------
+  // A re-simulated frame is never seen (only the present frame, drawn last in
+  // the same task, reaches the screen) and its audio is dropped, so its GL
+  // draw calls are pure cost. While GLSKIP.on, the draw and clear calls are
+  // swallowed; every other GL call (textures, buffers, state) still runs, so
+  // the video plugin's GL objects stay exactly as they would have been.
+  // ⚠ UNLESS THE PIXELS CAN REACH THE GUEST. A title that reads the frame back
+  // (glide read_always: Mario Kart 64, Pokémon Snap, DK64, ... — fbasync's
+  // list) copies the RENDERED frame into RDRAM, so its hidden frames must draw
+  // exactly as the first run did: they are never skipped. Any other title is
+  // skipped only until the core reads the framebuffer back ONCE (any
+  // glReadPixels the page did not issue itself): from then on nothing is
+  // skipped again, and a re-simulation during which such a read happened is
+  // thrown away and re-run drawing (rbRunFrame), so the guest never reads a
+  // pixel a skipped draw left out. ?rbgl=1 draws every hidden frame (the
+  // control arm). Run-ahead's hidden frames (all but the last, whose picture
+  // is shown) skip too: their state is discarded whatever they read.
+  var GLSKIP = { on: false, disabled: RB_Q.get('rbgl') === '1' ? 'pinned off (?rbgl=1)' : null,
+                 taint: false, reads: 0, calls: 0, frames: 0, redo: 0 };
+  if (window.WebGL2RenderingContext) (function () {
+    var P = WebGL2RenderingContext.prototype;
+    ['drawArrays', 'drawElements', 'drawArraysInstanced', 'drawElementsInstanced', 'drawRangeElements',
+     'clear', 'clearBufferfv', 'clearBufferiv', 'clearBufferuiv', 'clearBufferfi', 'blitFramebuffer'].forEach(function (n) {
+      var f = P[n];
+      if (typeof f !== 'function') return;
+      P[n] = function () { if (GLSKIP.on) { GLSKIP.calls++; return; } return f.apply(this, arguments); };
+    });
+    var rp = P.readPixels;
+    P.readPixels = function () {
+      var st = window.__fbAsync;
+      if (!(st && st.bypass)) {
+        GLSKIP.reads++;
+        if (GLSKIP.on) GLSKIP.taint = true;
+        if (!GLSKIP.disabled) {
+          GLSKIP.disabled = 'the core read the framebuffer back (glReadPixels): its pixels can reach guest state';
+          pageLog('[rollback] re-simulated frames draw from now on — ' + GLSKIP.disabled);
+        }
+      }
+      return rp.apply(this, arguments);
+    };
+  })();
+  function glSkipOk() {
+    var st = window.__fbAsync || {};
+    return !GLSKIP.disabled && !st.on && !st.readAlways;
+  }
+
+  // ---- SPARSE SNAPSHOTS ------------------------------------------------------
+  // A save is a 16.8 MB savestates_save_m64p into the core's buffer plus a
+  // 16.8 MB copy out of the heap (n64sSave) — the largest fixed cost of a
+  // rollback step, paid on EVERY frame while the room runs, whether or not a
+  // prediction is ever wrong. So a frame's start is saved only every K frames
+  // (and where something else needs it, below); a rollback to frame f loads
+  // the NEWEST snapshot at or before f and re-runs the frames between it and
+  // f with the very inputs they ran with the first time (RB.img — they were
+  // right: f is the EARLIEST wrong frame), then the corrected frames as before.
+  // Exactness is unchanged: those bridge frames re-run a confirmed-equal
+  // history from an exact state, the same thing a re-simulation already is.
+  //   * K ADAPTS (rbAdaptK, once a second): it minimises the expected cost per
+  //     presented frame, (1 + p·D)·save/K + p·(load + (K-1)/2·run) — p the
+  //     measured rollbacks per frame, D their mean depth, the rest the
+  //     measured EMAs — among the K whose WORST rollback (window-deep, K-1
+  //     bridge frames, its saves) still fits two fields; if none does, the K
+  //     with the smallest worst case. ?rbk=N pins it (?rbk=1 = every frame,
+  //     the old ring), ?rbk=auto (default) adapts from 1 up to RB_K_MAX.
+  //   * ALWAYS SAVED, whatever K is: the state after every frame the engine
+  //     fingerprints (k % hashEvery === 0 — so every console of a room holds
+  //     the same frames to compare, whatever K each one chose), and the
+  //     present frame's while run-ahead is on (raRun restores it).
+  //   * THE RING IS A SET OF SLOTS, NOT k % n. Snapshots are kept back to the
+  //     newest one at or before (frame − RB.n) — the deepest rollback the room
+  //     can ask for (rbRingFrames) — and anything older is reused first. Under
+  //     the device's memory budget (RB_RING_BUDGET_MB) slots are added; past it
+  //     the snapshot whose removal leaves the smallest gap is dropped, so a
+  //     window that outgrows the budget costs a longer bridge, never a failure.
+  // ═══════════════════════════════════════════════════════════════════════════
+  var RB_K_Q = RB_Q.get('rbk');
+  var RB_K_FIXED = (RB_K_Q != null && RB_K_Q !== 'auto') ? Math.max(1, Math.min(16, +RB_K_Q | 0)) : null;
+  var RB_K_MAX = 8, RB_IMG = 1024;
+  var RB = { ready: false, fault: null, slots: [], n: 0, cap: 0, k: RB_K_FIXED || 1, kFixed: RB_K_FIXED, kChanges: 0, kAt: 0, kWhy: null,
+             img: new Array(RB_IMG), imgF: new Int32Array(RB_IMG).fill(-1),
+             hidden: 0, stepMs: 0, runEma: 0, saveEma: 0, loadEma: 0, pEma: 0, depthEma: 0,
+             rollbacks: 0, resimFrames: 0, bridgeFrames: 0, maxDepth: 0, depthHist: {}, resimMs: 0, maxResimMs: 0, depthSum: 0,
+             hashes: 0, missingSlot: 0, saveMs: 0, saves: 0, skippedSaves: 0, frames: 0, loads: 0, evictions: 0, glRedo: 0 };
+  function rbSpan(ls) {
+    return Math.max((ls.rollback | 0) + 3, typeof ls.rbRingFrames === 'function' ? ls.rbRingFrames() | 0 : 0);
+  }
   function rbInit(ls) {
-    RB.n = Math.max((ls.rollback | 0) + 3, typeof ls.rbRingFrames === 'function' ? ls.rbRingFrames() | 0 : 0);
-    RB.slots = new Array(RB.n);
-    if (!rbSaveSlot(ls.frame | 0)) { RB.fault = N64S.fault || 'the first savestate failed'; return false; }
+    RB.n = rbSpan(ls);
+    RB.cap = Math.max(2, Math.floor(RB_RING_BUDGET_MB * 1048576 / (N64S.size + N64S_SM)));
+    RB.slots = [];
+    if (!rbSaveAt(ls, ls.frame | 0)) { RB.fault = N64S.fault || 'the first savestate failed'; return false; }
     RB.ready = true;
-    pageLog('[rollback] ARMED: window ' + (ls.rollback | 0) + ' frames, ring of ' + RB.n + ' exact states x '
-          + (N64S.size / 1048576).toFixed(1) + ' MB (allocated as used); local input applied with 0 frames of delay');
+    pageLog('[rollback] ARMED: window ' + (ls.rollback | 0) + ' frames, snapshots reach back ' + RB.n + ' frames, at most '
+          + RB.cap + ' exact states x ' + (N64S.size / 1048576).toFixed(1) + ' MB (allocated as used), one every '
+          + (RB.kFixed ? RB.k + ' frames (?rbk)' : 'K frames, K adapted to the measured cost'
+          ) + '; local input applied with 0 frames of delay');
     return true;
   }
-  // THE RING FOLLOWS THE WINDOW (lib/netplay.js rbRingFrames). An adaptive
-  // room's host re-sizes the rollback window from what the link measures, and
-  // the ring must hold it BEFORE the frame that could reach that deep. A slot
-  // is indexed k % n, so every held frame moves to k % want — slot objects
-  // move, no bytes are copied; new slots are allocated as they are first used.
-  // ⚠ A slot is a 16.8 MB state. The ring is capped by what this device can
-  // hold beside its 512 MB core heap (RB_RING_BUDGET_MB, from
-  // navigator.deviceMemory); a room whose window outgrows it stops with that
-  // said, instead of the tab being killed for memory.
+  // THE REACH FOLLOWS THE WINDOW (lib/netplay.js rbRingFrames): the snapshots
+  // must reach back as far as the largest window this room has run, BEFORE the
+  // frame that could roll back that deep. Nothing is allocated here: slots are
+  // added as saves need them, up to the budget, and thinned past it.
   var RB_RING_BUDGET_MB = (function () {
     var dm = +(navigator.deviceMemory || 0);
     return dm && dm < 8 ? 300 : 600;
@@ -4130,66 +4234,177 @@ N64Rate.selfTest = function (logFn) {
   function rbGrow(want) {
     var nn = want | 0;
     if (!RB.ready || nn <= RB.n) return true;
-    if (nn * N64S.size / 1048576 > RB_RING_BUDGET_MB) {
-      RB.fault = 'the room\'s rollback window needs ' + nn + ' savestates (' + Math.round(nn * N64S.size / 1048576)
-               + ' MB), more than this device can hold (' + RB_RING_BUDGET_MB + ' MB)';
-      return false;
-    }
-    var slots = new Array(nn);
-    for (var i = 0; i < RB.n; i++) {
-      var sl = RB.slots[i];
-      if (sl && sl.frame >= 0 && !slots[sl.frame % nn]) slots[sl.frame % nn] = sl;
-      else if (sl) { var st = window.__fbAsync; if (sl.fb && st && st.release) { st.release(sl.fb); sl.fb = null; } sl.frame = -1;
-                     for (var q = 0; q < nn; q++) if (!slots[q]) { slots[q] = sl; break; } }
-    }
-    pageLog('[rollback] ring ' + RB.n + ' -> ' + nn + ' savestates (the room\'s window grew)');
-    RB.slots = slots; RB.n = nn;
+    pageLog('[rollback] snapshots reach back ' + RB.n + ' -> ' + nn + ' frames (the room\'s window grew)');
+    RB.n = nn;
     if (window.__n64RbLog) window.__n64RbLog.push(['grow', nn]);
     return true;
   }
+  // The snapshot of the start of frame k exactly (fingerprints, run-ahead).
   function rbSlot(k) {
-    var s = RB.slots[k % RB.n];
-    return (s && s.frame === k) ? s : null;
+    for (var i = 0; i < RB.slots.length; i++) if (RB.slots[i].frame === k) return RB.slots[i];
+    return null;
+  }
+  // The newest snapshot at or before the start of frame k (a rollback's base).
+  function rbAtOrBelow(k) {
+    var b = null;
+    for (var i = 0; i < RB.slots.length; i++) { var s = RB.slots[i]; if (s.frame >= 0 && s.frame <= k && (!b || s.frame > b.frame)) b = s; }
+    return b;
+  }
+  function rbDrop(s) {
+    var st = window.__fbAsync;
+    if (s.fb && st && st.release) st.release(s.fb);
+    s.fb = null; s.frame = -1; s.pin = -1;
+  }
+  // Snapshots of a timeline that is being replaced: everything after frame k.
+  function rbDropAbove(k) {
+    for (var i = 0; i < RB.slots.length; i++) if (RB.slots[i].frame > k) rbDrop(RB.slots[i]);
+  }
+  // Which slot the start of frame k is written to (see SPARSE SNAPSHOTS).
+  function rbPick(k) {
+    var S = RB.slots, i, s, anchor = null, H = k - RB.n, free = [];
+    for (i = 0; i < S.length; i++) if (S[i].frame === k) return S[i];
+    for (i = 0; i < S.length; i++) { s = S[i]; if (s.frame >= 0 && s.frame <= H && (!anchor || s.frame > anchor.frame)) anchor = s; }
+    for (i = 0; i < S.length; i++) { s = S[i]; if (s.frame < 0 || (anchor && s.frame < anchor.frame)) free.push(s); }
+    if (free.length) {
+      // A K that grew leaves states nothing needs: keep one spare, hand the
+      // rest back to the browser (16.8 MB each — a phone's memory).
+      for (i = 2; i < free.length; i++) { rbDrop(free[i]); S.splice(S.indexOf(free[i]), 1); RB.freed = (RB.freed | 0) + 1; }
+      return free[0];
+    }
+    if (S.length < RB.cap) {
+      try { s = { frame: -1, buf: new Uint8Array(N64S.size + N64S_SM), fb: null, fp: 0, pin: -1 }; S.push(s); return s; }
+      catch (e) { RB.cap = Math.max(S.length, 2); }
+    }
+    // Thin: never the anchor (or the oldest, standing in for it), never a
+    // snapshot a fingerprint still needs unless nothing else is left.
+    var ord = S.slice().sort(function (a, b) { return a.frame - b.frame; }), best = null, bestGap = Infinity;
+    for (i = 0; i < ord.length; i++) {
+      s = ord[i];
+      if (s === anchor || (!anchor && i === 0)) continue;
+      var gap = (i + 1 < ord.length ? ord[i + 1].frame : k) - (i > 0 ? ord[i - 1].frame : s.frame);
+      if (s.pin >= 0 && s.frame > H) gap += 1e6;
+      if (gap < bestGap) { bestGap = gap; best = s; }
+    }
+    if (best) { rbDrop(best); RB.evictions++; }
+    return best;
   }
   // Save the state at the START of frame k (i.e. after frame k-1 ran).
-  function rbSaveSlot(k) {
-    var i = k % RB.n, s = RB.slots[i];
-    if (!s) { try { s = RB.slots[i] = { frame: -1, buf: new Uint8Array(N64S.size + N64S_SM), fb: null, fp: 0 }; } catch (e) { N64S.fault = 'out of memory for the rollback ring'; return false; } }
-    s.frame = -1;
-    var st = window.__fbAsync;
-    if (s.fb && st && st.release) { st.release(s.fb); s.fb = null; }
+  function rbSaveAt(ls, k) {
+    var s = rbPick(k);
+    if (!s) { N64S.fault = 'out of memory for the rollback snapshots'; return false; }
+    rbDrop(s);
     var t0 = performance.now();
     if (!n64sSave(s.buf)) return false;
-    RB.saveMs += performance.now() - t0;
+    var dt = performance.now() - t0;
+    RB.saveMs += dt; RB.saves++;
+    RB.saveEma = RB.saveEma ? RB.saveEma + (dt - RB.saveEma) / 16 : dt;
+    var st = window.__fbAsync;
     if (st && st.on && st.snapshot) s.fb = st.snapshot();
     try { s.fp = window.Module._neil_last_fp() >>> 0; } catch (e) { s.fp = 0; }
     s.frame = k;
+    var he = ls.hashEvery | 0;
+    s.pin = (he > 0 && k >= 1 && ((k - 1) % he) === 0) ? k - 1 : -1;
     return true;
   }
+  function rbWantSave(ls, k, present) {
+    if (RB.k <= 1) return true;
+    if (present && RA.frames > 0) return true;                 // raRun restores the present state
+    var he = ls.hashEvery | 0;
+    if (he > 0 && k >= 1 && ((k - 1) % he) === 0) return true;  // a fingerprinted frame's after-state
+    var b = rbAtOrBelow(k - 1);
+    return !b || k - b.frame >= RB.k;
+  }
   function rbLoadSlot(s) {
+    var t0 = performance.now();
     if (!n64sLoad(s.buf)) return false;
     var st = window.__fbAsync;
     if (st && st.on && st.restore) st.restore(s.fb);
+    var dt = performance.now() - t0;
+    RB.loadEma = RB.loadEma ? RB.loadEma + (dt - RB.loadEma) / 8 : dt;
     RB.loads++;
     return true;
   }
-  // One frame on the core: the image, one neil_ls_run_frame, the start of the
+  // One frame on the core: the image (kept, for a later bridge), one
+  // neil_ls_run_frame, and — when the schedule wants it — the start of the
   // next frame saved. `present` frames also carry the page's own bookkeeping
-  // (capacity, the test seams); a re-simulated one carries none of it.
-  function rbStep(k, image, present) {
-    var M = window.Module;
-    lsApplyImage(image);
+  // (capacity, the test seams); a re-simulated or hidden one carries none.
+  function rbStep(ls, k, image, present, skipGl) {
+    var M = window.Module, j = k % RB_IMG, h = RB.img[j];
+    if (!h || h.length !== image.length) h = RB.img[j] = new Uint8Array(image.length);
+    if (h !== image) h.set(image);
+    RB.imgF[j] = k;
+    lsApplyImage(h);
     var t0 = performance.now();
-    M._neil_ls_run_frame();
+    if (skipGl) { GLSKIP.on = true; GLSKIP.frames++; }
+    try { M._neil_ls_run_frame(); } finally { GLSKIP.on = false; }
     var dt = performance.now() - t0;
+    RB.runEma = RB.runEma ? RB.runEma + (dt - RB.runEma) / 32 : dt;
     if (present) lsFrameDone(image, dt);
-    var ok = rbSaveSlot(k + 1);
-    // One rollback step (run + save) as measured here, published to the room
-    // (ls.selfStepMs): the host sizes the window's slack by the slowest
-    // console's, and rbCatchUp() spends at most half a frame of it per tick.
-    var st = performance.now() - t0;
-    RB.stepMs = RB.stepMs ? RB.stepMs + (st - RB.stepMs) / 32 : st;
-    return ok;
+    if (!rbWantSave(ls, k + 1, present)) { RB.skippedSaves++; return true; }
+    return rbSaveAt(ls, k + 1);
+  }
+  // A rollback: the newest snapshot at or before plan.from, the bridge to
+  // plan.from on the inputs those frames already ran with, then the plan.
+  function rbResim(ls, plan, skipGl) {
+    var from = plan.from, s = rbAtOrBelow(from), k;
+    if (!s) { RB.missingSlot++; return 'rollback to frame ' + from + ' found no savestate at or before it'; }
+    for (k = s.frame; k < from; k++) {
+      if (RB.imgF[k % RB_IMG] !== k) return 'rollback to frame ' + from + ': the input frame ' + k + ' ran with is no longer held';
+    }
+    rbDropAbove(s.frame);
+    if (!rbLoadSlot(s)) return 'rollback load failed: ' + N64S.fault;
+    GLSKIP.taint = false;
+    for (k = s.frame; k < from; k++) {
+      if (!rbStep(ls, k, RB.img[k % RB_IMG], false, skipGl)) return 're-simulation save failed: ' + N64S.fault;
+      RB.bridgeFrames++;
+    }
+    for (var i = 0; i < plan.frames.length; i++) {
+      var fr = plan.frames[i];
+      if (!rbStep(ls, fr.frame, fr.image, false, skipGl)) return 're-simulation save failed: ' + N64S.fault;
+    }
+    // A frame skipped its draws and the core then read pixels: re-run it all.
+    if (skipGl && GLSKIP.taint) { GLSKIP.redo++; return 'redo'; }
+    return true;
+  }
+  // K, re-decided once a second from what this console measures (see SPARSE
+  // SNAPSHOTS). F is the field period, W the room's current window.
+  function rbCostK(k, W, F) {
+    var run = RB.runEma, save = RB.saveEma, load = RB.loadEma || save, p = RB.pEma, D = Math.max(1, RB.depthEma || 1);
+    return { exp: (1 + p * D) * save / k + p * (load + (k - 1) / 2 * run),
+             worst: load + (W + k - 1) * run + Math.ceil((W + k) / k) * save };
+  }
+  function rbAdaptK(ls) {
+    if (RB.kFixed || RB.frames - RB.kAt < 50) return;
+    RB.kAt = RB.frames;
+    if (!(RB.runEma > 0) || !(RB.saveEma > 0)) return;
+    var F = LS.viHz > 0 ? 1000 / LS.viHz : 1000 / 60, W = Math.max(1, ls.rollback | 0);
+    var best = 0, bestExp = Infinity, safe = 0, safeWorst = Infinity;
+    for (var k = 1; k <= RB_K_MAX; k++) {
+      var c = rbCostK(k, W, F);
+      if (c.worst <= 2 * F && c.exp < bestExp - 1e-6) { bestExp = c.exp; best = k; }
+      if (c.worst < safeWorst - 1e-6) { safeWorst = c.worst; safe = k; }
+    }
+    var nk = best || safe || 1;
+    if (nk !== RB.k) {
+      var c1 = rbCostK(nk, W, F);
+      RB.kWhy = 'p=' + RB.pEma.toFixed(3) + '/frame depth=' + (RB.depthEma || 0).toFixed(1) + ' run=' + RB.runEma.toFixed(2)
+              + ' save=' + RB.saveEma.toFixed(2) + ' load=' + (RB.loadEma || 0).toFixed(2) + ' ms -> ' + c1.exp.toFixed(2)
+              + ' ms/frame expected, worst rollback ' + c1.worst.toFixed(1) + ' ms' + (best ? '' : ' (no K fits two fields)');
+      pageLog('[rollback] snapshot every ' + RB.k + ' -> ' + nk + ' frames: ' + RB.kWhy);
+      RB.k = nk; RB.kChanges++;
+      if (window.__n64RbLog) window.__n64RbLog.push(['k', RB.frames, nk]);
+    }
+  }
+  // ls.selfStepMs — what ONE frame of a window-deep rollback costs this
+  // console, every part of it measured here: the load (once per rollback),
+  // the run, the K-1 bridge frames a sparse snapshot can add, and the saves
+  // the re-simulation makes. The host sizes the window's slack by it and
+  // rbCatchUp() spends at most half a field of it per tick; under-reporting it
+  // is how a room gets a window this console cannot re-simulate in time.
+  function rbStepMs(ls) {
+    var W = Math.max(2, ls.rollback | 0), k = RB.k;
+    var ms = ((RB.loadEma || 0) + (W + k - 1) * RB.runEma + Math.ceil(W / k) * RB.saveEma) / W;
+    return ms > 0 ? ms : 0;
   }
   function rbFail(ls, why) {
     LS.fault = why;
@@ -4202,16 +4417,13 @@ N64Rate.selfTest = function (logFn) {
     if (r.rollback) {
       var ta = performance.now();
       audioFlushNow();
-      var s = rbSlot(r.rollback.from);
-      if (!s) { RB.missingSlot++; return rbFail(ls, 'rollback to frame ' + r.rollback.from + ' found no savestate for it'); }
-      if (!rbLoadSlot(s)) return rbFail(ls, 'rollback load failed: ' + N64S.fault);
-      for (var i = 0; i < r.rollback.frames.length; i++) {
-        var fr = r.rollback.frames[i];
-        if (!rbStep(fr.frame, fr.image, false)) return rbFail(ls, 're-simulation save failed: ' + N64S.fault);
-      }
+      var rr = rbResim(ls, r.rollback, glSkipOk());
+      if (rr === 'redo') rr = rbResim(ls, r.rollback, false);
+      if (rr !== true) return rbFail(ls, rr);
       audioDropNow();
       var d = r.rollback.depth | 0, ms = performance.now() - ta;
-      RB.rollbacks++; RB.resimFrames += r.rollback.frames.length; RB.resimMs += ms;
+      RB.rollbacks++; RB.resimFrames += r.rollback.frames.length; RB.resimMs += ms; RB.depthSum += d;
+      RB.depthEma = RB.depthEma ? RB.depthEma + (d - RB.depthEma) / 16 : d;
       if (d > RB.maxDepth) RB.maxDepth = d;
       if (ms > RB.maxResimMs) RB.maxResimMs = ms;
       RB.depthHist[d] = (RB.depthHist[d] || 0) + 1;
@@ -4223,22 +4435,27 @@ N64Rate.selfTest = function (logFn) {
       // bookkeeping — so the speakers stay at 1.000x (gate 9). The governor's
       // schedule moves with it (baseFrame), so it is never repaid as a sprint.
       audioFlushNow();
-      var okh = rbStep(r.frame, r.image, false);
+      var okh = rbStep(ls, r.frame, r.image, false, false);
       audioDropNow();
       if (!okh) return rbFail(ls, 'savestate failed: ' + N64S.fault);
       RB.hidden++; LS.frame++; LS.baseFrame++;
       if (window.__n64RbLog) window.__n64RbLog.push(['hidden', r.frame]);
     } else {
-      if (!rbStep(r.frame, r.image, true)) return rbFail(ls, 'savestate failed: ' + N64S.fault);
+      if (!rbStep(ls, r.frame, r.image, true, false)) return rbFail(ls, 'savestate failed: ' + N64S.fault);
       RB.frames++;
+      RB.pEma += ((r.rollback ? 1 : 0) - RB.pEma) / 128;
+      rbAdaptK(ls);
     }
+    RB.stepMs = rbStepMs(ls);
     if (RB.stepMs) ls.selfStepMs = RB.stepMs;
     ls.endFrame(null);
-    // FINGERPRINTS OF CONFIRMED FRAMES ONLY: the state after k is slot k+1.
+    // FINGERPRINTS OF CONFIRMED FRAMES ONLY: the state after k is the snapshot
+    // of k+1, which every console saves whatever its K (rbWantSave).
     var due = ls.takeHashDue ? ls.takeHashDue() : [];
     for (var j = 0; j < due.length; j++) {
       var after = rbSlot(due[j] + 1);
       if (!after) { RB.missingSlot++; continue; }
+      after.pin = -1;
       if (!ls.fieldNames) ls.fieldNames = N64S_FIELDS;
       ls.submitHash(due[j], n64sHashRoom(after.buf, after.fp), n64sRoomWords(after.buf, after.fp));
       LS.hashes++; RB.hashes++;
@@ -4288,7 +4505,12 @@ N64Rate.selfTest = function (logFn) {
     // local pad at this console's ports, every other port as last presented.
     var img = RA.lastImage.slice(0), mine = lsLocalPads();
     for (var p in mine) { var o = (+p) * LS_PAD_BYTES; if (o + LS_PAD_BYTES <= img.length) img.set(mine[p], o); }
-    for (var j = 0; j < n; j++) { lsApplyImage(img); M._neil_ls_run_frame(); }
+    var skip = glSkipOk();
+    for (var j = 0; j < n; j++) {
+      lsApplyImage(img);
+      if (skip && j < n - 1) { GLSKIP.on = true; GLSKIP.frames++; }
+      try { M._neil_ls_run_frame(); } finally { GLSKIP.on = false; }
+    }
     var ok = rbLoadSlot(base);
     audioDropNow();
     if (!ok) { RA.fault = N64S.fault; RA.frames = 0; RA.fixed = 0; pageLog('[runahead] ⚠ restore failed, run-ahead OFF: ' + N64S.fault); return; }
@@ -4313,8 +4535,11 @@ N64Rate.selfTest = function (logFn) {
       RA.frames--; RA.downs++; RA.calmSince = now; return;
     }
     if (!RA.calmSince || lostGrew || RA.tickEma > period * RA_BUDGET) { RA.calmSince = now; return; }
-    // What one more hidden frame would add: one frame of emulation.
-    var next = RA.tickEma + (LS.costAvg || per);
+    // What one more hidden frame would add: one frame of emulation — and, for
+    // the FIRST one, the state load raRun pays per tick and the present-frame
+    // saves sparse snapshots otherwise skip (rbWantSave).
+    var next = RA.tickEma + (LS.costAvg || per)
+             + (RA.frames === 0 ? (RB.loadEma || 0) + (RB.k > 1 ? RB.saveEma * (1 - 1 / RB.k) : 0) : 0);
     if (RA.frames < RA_MAX && next < period * RA_BUDGET && now - RA.calmSince > RA_UP_MS) {
       RA.frames++; RA.ups++; RA.calmSince = now;
     }
@@ -4932,9 +5157,8 @@ N64Rate.selfTest = function (logFn) {
       // netplay.js:2257-2260) and it makes the engine exist from the moment the
       // room does, which is before any core boots.
       try {
-        // ROLLBACK, NOT INPUT DELAY: the HOST's window wins ('lsgo' rb), so this
-        // is what this console proposes; ?rb=0 proposes delay-based lockstep
-        // (a measurement arm, never the product).
+        // The HOST's choice wins ('lsgo' rb), so this is what this console
+        // proposes: delay lockstep by default, rollback with ?rb=1 (RB_DEFAULT).
         if (typeof s.startLockstep === 'function') s.startLockstep({ portCount: 4, padBytes: LS_PAD_BYTES, rollback: RB_WANT ? RB_WINDOW : 0,
           rollbackOk: true, rbCatchUp: true });
       } catch (e) { pageLog('[lockstep] startLockstep threw: ' + ((e && e.message) || e)); }
@@ -5408,17 +5632,24 @@ N64Rate.selfTest = function (logFn) {
       supported: netSupported(),
       transport: netTransport(),
       architecture: 'lockstep',        // every console runs the game; frames are agreed
-      // 'rollback' (delay 0, predict + re-simulate) or 'lockstep' (delay-based,
-      // ?rb=0 measurement arm) — the HOST's choice, read off the engine.
+      // 'rollback' (delay 0, predict + re-simulate; ?rb=1) or 'lockstep'
+      // (delay-based, the default — RB_DEFAULT) — the HOST's choice, read off the engine.
       mode: ls ? (ls.rollback ? 'rollback' : 'lockstep') : null,
       rollback: (ls && ls.rollback) ? {
         engine: (function () { try { return ls.rollbackReport(); } catch (e) { return null; } })(),
-        page: { ready: RB.ready, slots: RB.n, allocated: RB.slots.filter(Boolean).length, rollbacks: RB.rollbacks,
+        page: { ready: RB.ready, slots: RB.n, reach: RB.n, cap: RB.cap, allocated: RB.slots.length, rollbacks: RB.rollbacks,
                 hidden: RB.hidden, stepMs: +(RB.stepMs || 0).toFixed(2), pace: LS.pace || 1,
-                resimFrames: RB.resimFrames, maxDepth: RB.maxDepth, depthHist: RB.depthHist, loads: RB.loads,
+                k: RB.k, kFixed: RB.kFixed, kChanges: RB.kChanges, kWhy: RB.kWhy,
+                runMs: +RB.runEma.toFixed(2), saveMs: +RB.saveEma.toFixed(2), loadMs: +RB.loadEma.toFixed(2),
+                rollbacksPerFrame: +RB.pEma.toFixed(4), depthAvg: RB.rollbacks ? +(RB.depthSum / RB.rollbacks).toFixed(2) : 0,
+                resimFrames: RB.resimFrames, bridgeFrames: RB.bridgeFrames, maxDepth: RB.maxDepth, depthHist: RB.depthHist, loads: RB.loads,
                 resimMsTotal: Math.round(RB.resimMs), resimMsPerRollback: RB.rollbacks ? +(RB.resimMs / RB.rollbacks).toFixed(2) : 0,
-                maxResimMs: +RB.maxResimMs.toFixed(1), saveMsPerFrame: RB.frames ? +(RB.saveMs / (RB.frames + RB.resimFrames)).toFixed(2) : null,
-                hashes: RB.hashes, missingSlot: RB.missingSlot, frames: RB.frames, fault: RB.fault },
+                resimMsPerDepthFrame: RB.depthSum ? +(RB.resimMs / RB.depthSum).toFixed(2) : 0,
+                maxResimMs: +RB.maxResimMs.toFixed(1), saves: RB.saves, skippedSaves: RB.skippedSaves, evictions: RB.evictions, freed: RB.freed | 0,
+                saveMsPerFrame: RB.frames ? +(RB.saveMs / (RB.frames + RB.resimFrames + RB.bridgeFrames + RB.hidden)).toFixed(2) : null,
+                hashes: RB.hashes, missingSlot: RB.missingSlot, frames: RB.frames, fault: RB.fault,
+                glSkip: { ok: glSkipOk(), disabled: GLSKIP.disabled, frames: GLSKIP.frames, callsSkipped: GLSKIP.calls,
+                          coreReads: GLSKIP.reads, redo: GLSKIP.redo } },
         state: window.__n64State.info(),
       } : null,
       runahead: { frames: RA.frames, fixed: RA.fixed, runs: RA.runs, hiddenFrames: RA.hiddenFrames,
