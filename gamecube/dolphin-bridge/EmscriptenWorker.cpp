@@ -7,6 +7,13 @@
 #include <emscripten/html5_webgl.h>
 #include <emscripten/atomic.h>  // [ppc-bridge cutover] emscripten_atomic_notify for the mailbox drain
 #include <libretro.h>
+#include <atomic>
+// [vi-timing-gate 2026-09-30] Set once load_iso's retro_load_game has returned true. Until then the
+// recomp gate must not call into Core::System from the worker's main JS thread at all: System is a
+// function-local static (System.h:135-139), so the FIRST GetInstance() constructs it, and a takeover
+// polling recomp_hw_ready() before load_iso (?bootms=1 / ?srbootms=1) made worker-main the
+// constructor — Dolphin's boot then never returned from retro_load_game.
+static std::atomic<int> g_recomp_core_loaded{0};
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -502,6 +509,7 @@ int load_iso(const char* path) {
     info.size = 0;
     info.meta = nullptr;
     bool ok = retro_load_game(&info);
+    if (ok) g_recomp_core_loaded.store(1, std::memory_order_release);   // [vi-timing-gate]
     MAIN_THREAD_EM_ASM({
         postMessage({cmd: 'print', txt: '[worker] load_iso: retro_load_game returned ' + ($0 ? 'true' : 'false')});
     }, ok ? 1 : 0);
@@ -619,6 +627,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE void recomp_pause_cpu(void)
 //     takeover (pause + RAM + frames) until this reads 1.
 static bool recomp_vi_timing_valid()
 {
+  if (!g_recomp_core_loaded.load(std::memory_order_acquire))
+    return false;   // before load_iso: do not even construct System (see g_recomp_core_loaded)
   auto& system = Core::System::GetInstance();
   return system.GetMemory().GetRAM() != nullptr &&
          system.GetVideoInterface().GetTargetRefreshRateNumerator() != 0;
@@ -626,13 +636,15 @@ static bool recomp_vi_timing_valid()
 
 extern "C" EMSCRIPTEN_KEEPALIVE uint32_t recomp_hw_ready(void)
 {
-  auto& system = Core::System::GetInstance();
-  return (recomp_vi_timing_valid() && system.GetCPU().HasCPURunStateBeenReached()) ? 1u : 0u;
+  if (!recomp_vi_timing_valid())   // checks g_recomp_core_loaded FIRST, before any GetInstance()
+    return 0u;
+  return Core::System::GetInstance().GetCPU().HasCPURunStateBeenReached() ? 1u : 0u;
 }
 
-// Presents / renders refused because the hardware was not up yet. Read by the page-side
-// harness through recomp_gate_refused(); a non-zero value on a normal boot means the JS gate
-// in worker_funcs.js was bypassed.
+// Presents / renders refused because the hardware was not up yet. Read by worker_funcs.js
+// (__recompRefused) into the '[recompLive] f<N> ... refused=' stats line and the gate's
+// held/released lines, which the render probe prints uncapped; a non-zero value on a normal boot
+// means something reached recomp_present / recomp_render_fifo around the JS gate.
 static uint32_t s_recomp_gate_refused = 0;
 extern "C" EMSCRIPTEN_KEEPALIVE uint32_t recomp_gate_refused(void)
 {

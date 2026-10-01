@@ -260,7 +260,10 @@ function startServer() {
     recomp: [],
   };
   const _recompT0 = Date.now();
-  const _recompRe = /\[recompLive\]|\[recomp-live\]|\[gcroute\]|RuntimeError|divide by zero|unreachable|integer overflow|memory access out of bounds/;
+  // Every wasm trap surfaces as "RuntimeError: <kind>" (divide by zero, unreachable, memory access
+  // out of bounds, ...), so RuntimeError is the trap matcher; bare words like "unreachable" also
+  // hit ordinary diagnostic prose and are NOT matched.
+  const _recompRe = /\[recompLive\]|\[recomp-live\]|\[gcroute\]|\[srimage\]|RuntimeError\b/;
 
   page.on('console', (msg) => {
     const t = msg.text();
