@@ -35,6 +35,38 @@
     // printErr, NOT to the parent shim's printErr. Without this override,
     // every "Patching OSReport" / "symbols loaded" / OSREPORT print from
     // Dolphin's LogManager is silently dropped under PROXY_TO_PTHREAD.
+    // [print relay 2026-10-01] {cmd:'print'} from a PTHREAD does not reach the page. A
+    // pthread's parent is the emscripten main worker, whose PThread worker.onmessage
+    // (dolphin_worker_emcc.js) knows checkMailbox/spawnThread/cleanupThread/loaded/
+    // callHandler and nothing else, so every such post ended as err("worker sent an
+    // unknown command print"): the real text was LOST and the page got that line instead
+    // (700+ times in one phone session). Every pthread print site posts {cmd:'print'} —
+    // ConsoleListenerNix.cpp's EM_ASM, worker_funcs.js, the overrides below — so this ONE
+    // wrapper rewrites them into emscripten's own callHandler protocol, which the parent
+    // runs as Module.print (the shim's page relay). It also rate-limits, because each
+    // line costs two postMessages and a main-thread log append: consecutive duplicates
+    // collapse, the first 300 lines pass, then at most 20 per 10 s plus a count of what
+    // was dropped.
+    (function () {
+      var rawPost = self.postMessage.bind(self);
+      var total = 0, winStart = 0, winN = 0, dropped = 0, lastTxt = null, rep = 0;
+      var send = function (txt) { rawPost({ cmd: 'callHandler', handler: 'print', args: [txt] }); };
+      self.postMessage = function (m, transfer) {
+        if (!m || m.cmd !== 'print') return transfer === undefined ? rawPost(m) : rawPost(m, transfer);
+        var txt = String(m.txt);
+        if (txt === lastTxt) { rep++; return; }
+        if (rep > 0) { send(lastTxt + '  (repeated ' + rep + ' more times)'); rep = 0; }
+        lastTxt = txt;
+        var now = Date.now();
+        if (now - winStart > 10000) {
+          if (dropped > 0) send('[print relay] ' + dropped + ' pthread log lines suppressed in the last window');
+          winStart = now; winN = 0; dropped = 0;
+        }
+        total++;
+        if (total > 300 && ++winN > 20) { dropped++; return; }
+        send(txt);
+      };
+    })();
     self.Module = self.Module || {};
     self.Module.print    = function (t) { postMessage({ cmd: 'print', txt: '[dolphin:stdout] ' + t }); };
     self.Module.printErr = function (t) { postMessage({ cmd: 'print', txt: '[dolphin:stderr] ' + t }); };

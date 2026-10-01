@@ -2152,17 +2152,30 @@ window.GcRate = (function () {
   })();
   const logEl = $('log'), statusEl = $('status'), mobileStatusEl = $('mobileStatus'), fpsEl = $('fps'), toastEl = $('toast');
   var _logLast = '', _logRepeat = 0, _logBufLen = 0;
+  // [main-thread 2026-10-01] pageLog used to do `logEl.textContent += s` and read
+  // scrollHeight on EVERY line: a full rebuild of a text node of up to 200 KB plus a
+  // forced layout, per message, on the main thread. A phone session logged long tasks
+  // in Worker.onmessage (onWorkerMsg 88 ms) while worker prints streamed in. Lines are
+  // now buffered in a JS string and written to the DOM at most every 250 ms, and the
+  // scroll position is only touched when the log panel is actually visible.
+  var _logText = '', _logFlushT = 0;
+  function _logFlush() {
+    _logFlushT = 0;
+    if (!logEl) return;
+    if (_logText.length > 200000) _logText = _logText.slice(-100000);
+    logEl.textContent = _logText;
+    if (logEl.offsetParent !== null) logEl.scrollTop = logEl.scrollHeight;
+  }
+  function _logAppend(line) {
+    _logText += line + '\n';
+    if (!_logFlushT) _logFlushT = setTimeout(_logFlush, 250);
+  }
   function pageLog(s) {
     // Coalesce consecutive duplicates and cap the log buffer so a stuck JIT
     // emitting thousands of identical PANIC lines can't OOM the tab.
     if (s === _logLast) { _logRepeat++; if (_logRepeat % 100 !== 0) return; s = '… (x' + _logRepeat + ')'; }
-    else { if (_logRepeat > 0 && logEl) { logEl.textContent += '… (x' + _logRepeat + ' suppressed)\n'; } _logLast = s; _logRepeat = 0; }
-    if (logEl) {
-      logEl.textContent += s + '\n';
-      _logBufLen += s.length + 1;
-      if (_logBufLen > 200000) { logEl.textContent = logEl.textContent.slice(-100000); _logBufLen = 100000; }
-      logEl.scrollTop = logEl.scrollHeight;
-    }
+    else { if (_logRepeat > 0) { _logAppend('… (x' + _logRepeat + ' suppressed)'); } _logLast = s; _logRepeat = 0; }
+    _logAppend(s);
     console.log(s);
   }
   function setStatus(t) { if (statusEl) statusEl.textContent = t; if (mobileStatusEl) mobileStatusEl.textContent = t; }
@@ -2369,7 +2382,10 @@ window.GcRate = (function () {
       wgpuOk:       gcWgpuOk(),
       deviceLost:   G.deviceLost || null,
       everPainted:  !!_presentLastMs,
-      msSinceStart: window.__gcStartedAtMs ? (Date.now() - window.__gcStartedAtMs) : 0,
+      // Boot window starts when the disc has finished streaming (0 while it streams); paths
+      // that never stream a disc fall back to the Start click.
+      msSinceStart: (!window.__gcStartedAtMs || window.__gcRomStreaming) ? 0
+                  : (Date.now() - (window.__gcRomStreamedAtMs || window.__gcStartedAtMs)),
       // performance.now() and _presentLastMs share a time origin; Date.now() does not.
       msSincePaint: _presentLastMs ? (performance.now() - _presentLastMs) : 0,
       hidden:       (typeof document !== 'undefined' && document.hidden) || _presentHiddenGraceUntil > performance.now(),
@@ -3813,7 +3829,18 @@ window.GcRate = (function () {
                   // worker BEFORE update-mem (the worker enables it on mem1 verify).
                   // [aot default-on 2026-07-04] the chain pack IS the CPU — plain
                   // gamecube.html loads it; ?noaot opts out (runtime compile only).
-                  var _aotWanted = !new URLSearchParams(location.search).has('noaot');
+                  // [aot-fetch 2026-10-01] OPT-IN ONLY (?aot=1). This used to fetch 59 MB
+                  // (aot_pack.bin + funcs + blocks) on EVERY game, on every device. A phone
+                  // report (Android Chrome 154) showed "[aot] pack loaded: 3457 funcs, 58465
+                  // blocks, 58 MB" followed by "AoT pack DISABLED -- per-block build_block_next
+                  // at runtime": ppc_worker never enables it (_rtCompile defaults on), so the
+                  // whole download was paid for and thrown away while the disc was streaming.
+                  // It is ALSO an MP4-only pack with no code-identity check: SAB's DOL bytes at
+                  // pack PCs 0x800057c0 / 0x80005a30 differ from MP4's (checked by the
+                  // ppc-worker agent), so enabling it on any other disc would run MP4 code.
+                  // ?noaot is still honoured (it wins over ?aot=1).
+                  var _aotQ = new URLSearchParams(location.search);
+                  var _aotWanted = _aotQ.get('aot') === '1' && !_aotQ.has('noaot');
                   var _sendUpdateMem = function () {
                     try {
                       window.ppc_worker.postMessage({
@@ -7106,6 +7133,10 @@ window.GcRate = (function () {
     pageLog('[rom] size hint ' + totalMB + ' MB across ' + ROM_CHUNKS.length + ' chunks');
     setStatus('Loading ' + ROM_NAME + '…');
     var total = 0;
+    // [boot-window 2026-10-01] the present watchdog's NO FIRST FRAME window is measured
+    // from the end of the disc stream, not from Start: a phone streamed 1392 MB in ~80 s and
+    // was told 'NO FIRST FRAME' at 61 s while still downloading.
+    window.__gcRomStreaming = true;
     for (var i = 0; i < ROM_CHUNKS.length; i++) {
       setStatus('Loading ' + (i+1) + '/' + ROM_CHUNKS.length + ' — ' + (total/1048576).toFixed(0) + ' / ' + totalMB + ' MB');
       var r = await fetch(ROM_CHUNKS[i]);
@@ -7135,6 +7166,7 @@ window.GcRate = (function () {
       buf = null;
     }
     pageLog('[rom] streamed ' + (total/1048576).toFixed(1) + ' MB — booting');
+    window.__gcRomStreaming = false; window.__gcRomStreamedAtMs = Date.now();
     setStatus('Booting emulator…');
     // [rom-size fix] Send the ACTUAL accumulated byte count (total), NOT the
     // HEAD-request hint (totalSize). HEAD Content-Length can undercount when a
@@ -7311,7 +7343,7 @@ window.GcRate = (function () {
     toast('Audio reset');
   }
   function toggleFullscreen() { var el = isMobile ? $('mobileShell') : $('canvasWrap'); if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } else { var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen; if (fn) fn.call(el).catch(() => {}); } }
-  $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnExport').addEventListener('click', exportState); $('btnImport').addEventListener('click', () => $('importFile').click()); $('importFile').addEventListener('change', (e) => { if (e.target.files && e.target.files[0]) importState(e.target.files[0]); e.target.value = ''; }); $('btnMute').addEventListener('click', toggleMute); $('btnResetAudio').addEventListener('click', resetAudio); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; });
+  $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnExport').addEventListener('click', exportState); $('btnImport').addEventListener('click', () => $('importFile').click()); $('importFile').addEventListener('change', (e) => { if (e.target.files && e.target.files[0]) importState(e.target.files[0]); e.target.value = ''; }); $('btnMute').addEventListener('click', toggleMute); $('btnResetAudio').addEventListener('click', resetAudio); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; _logFlush(); });
   $('btnDiag').addEventListener('click', gcShowDiag);
   $('diagClose').addEventListener('click', () => { $('diagOverlay').style.display = 'none'; });
   $('diagOverlay').addEventListener('click', (e) => { if (e.target === $('diagOverlay')) $('diagOverlay').style.display = 'none'; });
