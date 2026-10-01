@@ -13,8 +13,15 @@
 //   window.wasmReady()        called by WASM main() once init is complete
 //   window.writeAudio(ptr,n)  called by WASM each time new audio samples are ready
 
-const AUDIO_BLOCK_SIZE = 2048;
-const AUDIO_FIFO_MAXLEN = 4900;
+// THE GUEST'S AUDIO RATE, MEASURED, NOT ASSUMED. 44vba hands writeAudio()
+// 801.6 stereo frames per emulated frame on average (Sonic Advance 3, 596
+// frames, 2026-10-01), i.e. 47,878 per GUEST second at 59.7275 Hz — not the
+// 48,000 the old ScriptProcessor consumed. Playing 47,878/s at 48,000/s ran
+// the sink 0.25% faster than the guest could ever feed it, so even a perfect
+// 1.000x guest drained the FIFO and underran on a schedule. lib/cart_audio.js
+// resamples by this one fixed ratio: exact pitch, no rate steering.
+const GBA_HZ = 59.7275;
+const GBA_SRC_RATE = 801.6 * GBA_HZ;
 const WASM_SAVE_LEN = 0x22000; // libretro_save_buf size (0x20000 + 0x2000)
 
 // GBA key bitmask — order matches 44vba keyList: ["a","b","select","start","right","left","up","down","r","l"]
@@ -39,12 +46,10 @@ class MyClass {
         this.lastSaveFlag = 0;
         this.wasmAudioBuf = null;
 
-        // Audio FIFO (stereo interleaved, Int16)
+        // Audio: an AudioWorklet sink (lib/cart_audio.js). The samples are
+        // PUSHED from writeAudio(), off the main thread's critical path.
         this.audioContext = null;
-        this.audioFifo0 = new Int16Array(AUDIO_FIFO_MAXLEN);
-        this.audioFifo1 = new Int16Array(AUDIO_FIFO_MAXLEN);
-        this.audioFifoHead = 0;
-        this.audioFifoCnt = 0;
+        this.audioSink = null;
 
         // Expose the two callbacks the WASM binary calls into
         window['wasmReady'] = this.onWasmReady.bind(this);
@@ -104,6 +109,8 @@ class MyClass {
         // rAF loop runs even before a ROM is loaded; frames only execute once isRunning=true
         this._boundLoop = this._emuLoop.bind(this);
         window.requestAnimationFrame(this._boundLoop);
+        this._boundTimer = this._timerLoop.bind(this);
+        setTimeout(this._boundTimer, 16);
 
         const _fsChange = this._onFullscreenChange.bind(this);
         document.addEventListener('fullscreenchange', _fsChange);
@@ -166,33 +173,15 @@ class MyClass {
             this.wasmAudioPtr = ptr;
         }
 
-        // Accept as much as fits instead of discarding the whole batch. The old
-        // `if (cnt + frames >= MAXLEN) return;` threw away an ENTIRE batch the
-        // moment the FIFO was within one batch of full, so a steady mild
-        // overproduction produced periodic whole-batch dropouts rather than a
-        // gradual trim. Partial acceptance keeps the FIFO topped up and drops
-        // strictly less audio.
-        //
-        // NOTE (gate #9): dropping here can never slow the guest. _emuLoop is
-        // driven solely by rAF and never consults the FIFO, so this path has no
-        // back-edge into emulation timing.
-        const room = AUDIO_FIFO_MAXLEN - 1 - this.audioFifoCnt;
-        const n = Math.min(frames, room < 0 ? 0 : room);
-        let tail = (this.audioFifoHead + this.audioFifoCnt) % AUDIO_FIFO_MAXLEN;
-        for (let i = 0; i < n; i++) {
-            this.audioFifo0[tail] = this.wasmAudioBuf[i * 2];
-            this.audioFifo1[tail] = this.wasmAudioBuf[i * 2 + 1];
-            tail = (tail + 1) % AUDIO_FIFO_MAXLEN;
-        }
-        this.audioFifoCnt += n;
-
-        if (d) {
-            d.framesProduced += frames;
-            d.batchesFed++;
-            d.lastFeedMs = performance.now();
-            if (n < frames) { d.droppedFrames = (d.droppedFrames || 0) + (frames - n); d.batchesDropped++; }
-            d.fill = this.audioFifoCnt;
-        }
+        // PUSH, don't buffer here. The old path copied into a 4,900-frame
+        // (~100 ms) main-thread FIFO drained by a ScriptProcessor whose
+        // onaudioprocess also ran on the main thread, so any emulation frame,
+        // paint or touch handler longer than the slack starved the device —
+        // and the FIFO dropped whole batches when it filled. The worklet holds
+        // the cushion on the audio thread and counts every gap it plays.
+        // Gate #9: nothing here feeds back into _emuLoop's timing.
+        if (this.audioSink) this.audioSink.pushInt16(this.wasmAudioBuf, frames);
+        else if (d) { d.framesProduced += frames; d.droppedFrames = (d.droppedFrames || 0) + frames; d.batchesDropped++; }
     }
 
     // ── AUDIO ─────────────────────────────────────────────────────────────────
@@ -208,84 +197,84 @@ class MyClass {
             // the ScriptProcessor to compete with touch events on mobile.
             this.audioContext = new AudioContext({ latencyHint: 'playback', sampleRate: 48000 });
             if (window.AudioDiag) {
-                window.AudioDiag.install('gba', { capacity: AUDIO_FIFO_MAXLEN, ctxRate: this.audioContext.sampleRate });
+                window.AudioDiag.install('gba', { ctxRate: this.audioContext.sampleRate, srcRate: GBA_SRC_RATE });
                 window.AudioDiag.observeContext(this.audioContext);
             }
-            const sp = this.audioContext.createScriptProcessor(AUDIO_BLOCK_SIZE, 0, 2);
-            sp.onaudioprocess = (ev) => {
-                const o0 = ev.outputBuffer.getChannelData(0);
-                const o1 = ev.outputBuffer.getChannelData(1);
-                const d = window.__audioDiag;
-                if (!this.isRunning) { o0.fill(0); o1.fill(0); return; }
-                // Drain the FIFO. If it runs dry, output silence — rAF is the sole
-                // frame driver; running catch-up frames here caused double-speed
-                // emulation on mobile whenever a touch event delayed rAF.
-                const n = Math.min(AUDIO_BLOCK_SIZE, this.audioFifoCnt);
-                for (let i = 0; i < n; i++) {
-                    o0[i] = this.audioFifo0[this.audioFifoHead] / 32768;
-                    o1[i] = this.audioFifo1[this.audioFifoHead] / 32768;
-                    this.audioFifoHead = (this.audioFifoHead + 1) % AUDIO_FIFO_MAXLEN;
-                    this.audioFifoCnt--;
-                }
-                // Fill any remainder with silence
-                for (let i = n; i < AUDIO_BLOCK_SIZE; i++) { o0[i] = 0; o1[i] = 0; }
-                // COUNT THE ZERO-FILL. This sink used to starve completely
-                // silently: no counter, no log, nothing on the page observed it.
-                // A writer-side counter cannot see this — only the sink knows it
-                // ran dry — so without this the page could report healthy
-                // production while emitting gaps.
-                if (d) {
-                    d.framesConsumed = (d.framesConsumed || 0) + AUDIO_BLOCK_SIZE;
-                    if (n < AUDIO_BLOCK_SIZE) {
-                        d.underrunFrames = (d.underrunFrames || 0) + (AUDIO_BLOCK_SIZE - n);
-                        d.underruns = (d.underruns || 0) + 1;
-                    } else if (d.underrunFrames === null) {
-                        d.underrunFrames = 0;   // observed, and none so far
-                    }
-                    d.fill = this.audioFifoCnt;
-                }
-            };
-            sp.connect(this.audioContext.destination);
+            this.audioSink = window.CartAudio
+                ? window.CartAudio.create(this.audioContext, { srcRate: GBA_SRC_RATE, targetMs: 80, maxMs: 400, page: 'gba' })
+                : null;
             this.audioContext.resume();
         } catch (e) { console.log('Audio init failed:', e); }
     }
 
     // ── GAME LOOP ─────────────────────────────────────────────────────────────
 
-    _emuLoop(timestamp) {
+    // THE GUEST CLOCK IS NOT THE DISPLAY'S. This loop used to run frames only
+    // from requestAnimationFrame, so the guest could advance only when the
+    // compositor produced a frame — and a phone's compositor does not promise
+    // 60 Hz: low-power mode runs rAF at 30, a busy GPU or a throttled tab
+    // delivers ticks 60-100 ms apart, and every tick past the 50 ms clamp
+    // silently dropped the rest of its time. Measured on the mobile profile
+    // (tools/netplay_device_matrix.mjs, 2026-10-01): rAF at 10-38/s, guest
+    // 0.79x. Now a timer, woken when the next frame is due, keeps the guest on
+    // the wall clock whenever the CPU has room, and rAF still drives it when
+    // rAF is the faster of the two. Both feed ONE accumulator against
+    // performance.now(), so the second caller in a frame period finds no
+    // credit and does nothing: the guest still runs at exactly 1.000x and
+    // never faster (gate #9) — a late tick's debt is dropped, never repaid.
+    _emuLoop() {
         window.requestAnimationFrame(this._boundLoop)
-        if (!this.isRunning) return
+        this._tick(performance.now())
+    }
 
-        const GBA_FRAME_MS = 1000 / 59.7275
+    _timerLoop() {
+        this._tick(performance.now())
+        const FRAME_MS = 1000 / GBA_HZ
+        const wait = this.isRunning ? Math.max(1, FRAME_MS - (this._accum || 0)) : 50
+        setTimeout(this._boundTimer, wait)
+    }
+
+    _tick(now) {
+        if (!this.isRunning) { this._lastFrameTime = 0; return }
+
+        const GBA_FRAME_MS = 1000 / GBA_HZ
 
         if (!this._lastFrameTime) {
-            this._lastFrameTime = timestamp
+            this._lastFrameTime = now
             this._accum = 0
             return
         }
 
-        let delta = timestamp - this._lastFrameTime
-        this._lastFrameTime = timestamp
+        let delta = now - this._lastFrameTime
+        this._lastFrameTime = now
+        if (delta < 0) delta = 0
 
-        if (delta > 50) delta = 50
+        // Same policy as snes.html / genesis.html: a long stall must not
+        // fast-forward the guest, and no debt survives the tick.
+        if (delta > 100) delta = 100
 
         this._accum += delta
 
+        // At most three frames in one task. Four (snes/genesis's cap) measured
+        // 90.8 long tasks/min here on the mobile profile against 0 for three,
+        // because one GBA frame there costs ~15 ms: a fourth frame pushes the
+        // task past 50 ms, and a touch that lands behind it waits.
         const MAX_FRAMES = 3
 
-        let ranFrame = false
         let frames = 0
 
         while (this._accum >= GBA_FRAME_MS && frames < MAX_FRAMES) {
             for (let i = 0; i < this.gameSpeed; i++) {
-                this._runFrame(i === this.gameSpeed - 1)
+                this._runFrame(false)
             }
             this._accum -= GBA_FRAME_MS
             frames++
-            ranFrame = true
         }
+        if (this._accum > GBA_FRAME_MS) this._accum = GBA_FRAME_MS
 
-        if (ranFrame) {
+        // One present per tick, however many frames ran (the old loop also
+        // drew inside every _runFrame: up to four putImageData per tick).
+        if (frames) {
             this.drawContext.putImageData(this.idata, 0, 0)
         }
     }
