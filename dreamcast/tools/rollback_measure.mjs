@@ -66,6 +66,19 @@
 //   --reps R          timing reps for the isolated save/load microbench (default 12)
 //   --query Q         extra dreamcast.html query string
 //   --name TAG        output suffix. Output: /tmp/dc-rb/<TAG>.log / .json / .png
+//   --pre JS          run once in the worker (M = Module) before the anchor, e.g.
+//                     "M._flycast_set_idleskip(0)" — the no-rebuild determinism levers
+//   --onload JS       run in the worker after EVERY state load
+//   --diag N          DIAG MODE: three N-frame straight runs from one anchor, kept
+//                     byte-for-byte and diffed (ranges attributed to main RAM /
+//                     small state), plus guest cycles per frame; then exit
+//   --replay F,T      (diag) also load the frame-F state MID-RUN and re-run to T;
+//                     D2 vs RP isolates "a load perturbs what follows"
+//   --reload-each     every frame in every arm starts from a load of its own
+//                     saved state (with the full-flush load this leaks wasm
+//                     instances and crashed the renderer at 90 frames — use it
+//                     with --rbload only)
+//   --rbload          needs patch 0002: rollback mode + keep-code load for every load
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -92,6 +105,12 @@ const WARM = +arg('warm', 240);
 const REPS = +arg('reps', 12);
 const QUERY = arg('query', '');
 const NAME = arg('name', 'rb');
+const DIAG = +arg('diag', 0);          // >0: diag mode — N-frame byte diff of D1 vs D2 vs D3, then exit
+const PRE = arg('pre', '');             // JS run once in the worker (M = Module) after warm, before any arm
+const ONLOAD = arg('onload', '');
+const REPLAY = arg('replay', '');
+const RELOAD_EACH = argv.includes('--reload-each');
+const RBLOAD = argv.includes('--rbload');   // patch 0002: rollback mode + keep-code load       // diag mode: "FROM,TO" — load mid-run at FROM, re-run to TO, diff vs D2       // JS run in the worker after EVERY state load (M = Module)
 const URLBASE = arg('url', 'http://localhost:8080');
 const CHROME = process.env.CHROME_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
 const OUT = '/tmp/dc-rb';
@@ -171,9 +190,17 @@ function driverSource(PORT, LAG) {
       if (!ok) return null;
       return { ptr: M.HEAPU32[pp >>> 2] >>> 0, size: M.HEAPU32[ps >>> 2] >>> 0, ms };
     };
+    // --rbload (needs patch 0002): every load goes through the keep-code
+    // rollback load instead of the full-flush one. 1 = keep-code, 2 = it fell
+    // back to the full flush (counted), 0 = failed.
+    R.useRbLoad = false; R.rbFallbacks = 0; R.rbKeep = 0;
     R.load = function(s) {            // -> ms, or -1 on failure
       const t0 = performance.now();
-      const ok = M._emscripten_load_state(s.ptr, s.size);
+      let ok;
+      if (R.useRbLoad) {
+        ok = M._emscripten_load_state_rollback(s.ptr, s.size);
+        if (ok === 2) R.rbFallbacks++; else if (ok === 1) R.rbKeep++;
+      } else ok = M._emscripten_load_state(s.ptr, s.size);
       const ms = performance.now() - t0;
       return ok ? ms : -1;
     };
@@ -261,6 +288,157 @@ function driverSource(PORT, LAG) {
     };
 
     // ---- the arms ----------------------------------------------------------
+    // ---- DIAG: where do two runs from one anchor first differ? -------------
+    // Keeps a JS copy of EVERY start-of-frame state of a short straight run, so
+    // two runs can be diffed byte-for-byte and each differing range attributed
+    // to a region of the savestate (main RAM / VRAM / AICA RAM are located by
+    // content, everything else is "small state" and printed as hex).
+    R.diagStore = {};
+    R.diagCyc = {};
+    R.diagSched = {};
+    // Scheduler dump (patch 0001 export sh4_sched_debug_dump). Absent on the
+    // shipped binary — then null, and the comparison below is skipped.
+    const schedBuf = M._malloc(4 * 512);
+    R.schedDump = function() {
+      if (typeof M._sh4_sched_debug_dump !== 'function') return null;
+      const n = M._sh4_sched_debug_dump(schedBuf, 512);
+      return Array.from(new Int32Array(M.HEAPU8.buffer, schedBuf, n));
+    };
+    R.diagRun = async function(label, frames) {
+      R.active = true;
+      const keep = [], cyc = [], sch = [];
+      try {
+        await R.waitClean();
+        if (R.load(R.anchor) < 0) throw new Error('anchor load failed');
+        R.onLoad();
+        for (let f = 0; f <= frames; f++) {
+          await R.waitClean();
+          const s = R.save(); if (!s) throw new Error('save failed at ' + f);
+          keep.push(M.HEAPU8.slice(s.ptr, s.ptr + s.size));
+          cyc.push(M._flycast_guest_cycles());
+          sch.push(R.schedDump());
+          R.free(s);
+          if (f < frames) await R.frame(image(f));
+        }
+      } finally { R.active = false; }
+      R.diagStore[label] = keep;
+      R.diagCyc[label] = cyc;
+      R.diagSched[label] = sch;
+      return keep.length;
+    };
+    // REPLAY: the essence of REF==RB with no prediction logic. Run straight
+    // from the anchor to frame TO, keeping the start-of-frame state of FROM;
+    // then LOAD that state mid-run and re-run FROM..TO with the same pads,
+    // keeping a copy of each re-simulated start-of-frame state. Slots before
+    // FROM are null, so diagDiff compares only re-simulated frames.
+    R.diagReplay = async function(label, from, to) {
+      R.active = true;
+      const keep = [], cyc = [], sch = [];
+      let mid = null;
+      try {
+        await R.waitClean();
+        if (R.load(R.anchor) < 0) throw new Error('anchor load failed');
+        R.onLoad();
+        for (let f = 0; f < to; f++) {
+          await R.waitClean();
+          if (f === from) { mid = R.save(); if (!mid) throw new Error('mid save failed'); }
+          await R.frame(image(f));
+        }
+        await R.waitClean();
+        if (R.load(mid) < 0) throw new Error('mid load failed');
+        R.onLoad();
+        for (let f = 0; f < from; f++) { keep.push(null); cyc.push(null); sch.push(null); }
+        for (let f = from; f <= to; f++) {
+          await R.waitClean();
+          const s = R.save(); if (!s) throw new Error('save failed at ' + f);
+          keep.push(M.HEAPU8.slice(s.ptr, s.ptr + s.size));
+          cyc.push(M._flycast_guest_cycles());
+          sch.push(R.schedDump());
+          R.free(s);
+          if (f < to) await R.frame(image(f));
+        }
+      } finally { R.free(mid); R.active = false; }
+      R.diagStore[label] = keep;
+      R.diagCyc[label] = cyc;
+      R.diagSched[label] = sch;
+      return keep.length;
+    };
+    // Find where a guest region sits inside a state: read 64 B of guest memory
+    // through the shipped sh4_mem_read32 export at two offsets and search the
+    // state for them; both must imply the same base.
+    R.locate = function(st, guestBase, size) {
+      const rd = M._sh4_mem_read32;
+      const find = (pat) => {
+        const n = st.length - pat.length;
+        const b0 = pat[0];
+        for (let i = st.indexOf(b0); i >= 0 && i <= n; i = st.indexOf(b0, i + 1)) {
+          let ok = true;
+          for (let j = 1; j < pat.length; j++) if (st[i + j] !== pat[j]) { ok = false; break; }
+          if (ok) return i;
+        }
+        return -1;
+      };
+      const bases = [];
+      for (const frac of [0.13, 0.37, 0.61, 0.83]) {
+        const off = (Math.floor(size * frac) & ~63) >>> 0;
+        const pat = new Uint8Array(64);
+        const dv = new DataView(pat.buffer);
+        for (let w = 0; w < 16; w++) dv.setUint32(w * 4, rd((guestBase + off + w * 4) >>> 0) >>> 0, true);
+        let distinct = new Set(pat).size;
+        if (distinct < 6) continue;            // too uniform to locate uniquely
+        const at = find(pat);
+        if (at >= 0) bases.push(at - off);
+      }
+      if (!bases.length) return -1;
+      const b = bases[0];
+      return bases.every((x) => x === b) ? b : -2;
+    };
+    R.diagDiff = function(A, B) {
+      const a = R.diagStore[A], b = R.diagStore[B];
+      const regs = [
+        { name: 'mainRAM', guest: 0x8c000000, size: 16 << 20 },
+        { name: 'VRAM',    guest: 0xa5000000, size: 8 << 20 },
+        { name: 'AICAram', guest: 0xa0800000, size: 2 << 20 },
+      ];
+      for (const r of regs) r.at = R.locate(a[a.length - 1] || b[b.length - 1], r.guest, r.size);
+      const where = (o) => {
+        for (const r of regs) if (r.at >= 0 && o >= r.at && o < r.at + r.size)
+          return r.name + '+0x' + (o - r.at).toString(16) + (r.name === 'mainRAM' ? ' (guest 0x' + ((r.guest + o - r.at) >>> 0).toString(16) + ')' : '');
+        return 'small@0x' + o.toString(16);
+      };
+      const hex = (u, o, n) => Array.from(u.subarray(o, Math.min(u.length, o + n)), (x) => x.toString(16).padStart(2, '0')).join('');
+      const out = { regions: regs.map((r) => r.name + '@' + r.at), frames: [] };
+      for (let f = 0; f < Math.min(a.length, b.length); f++) {
+        const x = a[f], y = b[f];
+        if (!x || !y) continue;
+        const row = { f, sizeA: x.length, sizeB: y.length, bytes: 0, ranges: [], byRegion: {} };
+        const n = Math.min(x.length, y.length);
+        let cur = null;
+        for (let i = 0; i < n; i++) {
+          if (x[i] === y[i]) continue;
+          row.bytes++;
+          if (cur && i - cur.end <= 16) cur.end = i + 1;
+          else { cur = { start: i, end: i + 1 }; row.ranges.push(cur); }
+        }
+        for (const r of row.ranges) { const k = where(r.start).split(/[+@ ]/)[0]; row.byRegion[k] = (row.byRegion[k] || 0) + 1; }
+        row.nRanges = row.ranges.length;
+        row.ranges = row.ranges.slice(0, 40).map((r) => ({ at: where(r.start), len: r.end - r.start,
+          A: hex(x, r.start, Math.min(32, r.end - r.start)), B: hex(y, r.start, Math.min(32, r.end - r.start)) }));
+        out.frames.push(row);
+      }
+      return out;
+    };
+    R.diagFree = () => { R.diagStore = {}; return true; };
+
+    // Per-load hook (set from --onload): runs after EVERY R.load in every arm.
+    R.onLoadSrc = '';
+    // --reload-each: every frame starts from a LOAD of its own just-saved
+    // state, in every arm. Isolates "a load perturbs the next frame" from
+    // every other divergence: if REF==RB only under this flag, the residue is
+    // exactly the load's own effect on the following frame.
+    R.reloadEach = false;
+    R.onLoad = function() { if (R.onLoadSrc) (0, eval)('(function(M){' + R.onLoadSrc + '})')(M); };
+
     R.anchor = null;
     R.setAnchor = async function() { await R.waitClean(); R.anchor = R.save(); return R.anchor ? R.anchor.size : 0; };
 
@@ -272,12 +450,14 @@ function driverSource(PORT, LAG) {
       try {
         await R.waitClean();
         if (R.load(R.anchor) < 0) throw new Error('anchor load failed');
+        R.onLoad();
         for (let f = 0; f < frames; f++) {
           await R.waitClean();
           if (!nosave) {
             const s = R.save(); if (!s) throw new Error('save failed at ' + f);
             saveMs.push(s.ms);
             if ((f % every) === 0) hashes[f] = R.hash(s);
+            if (R.reloadEach) { if (R.load(s) < 0) throw new Error('reload failed at ' + f); R.onLoad(); }
             R.free(s);
           }
           frameMs.push(await R.frame(neutral ? NEUTRAL : image(f)));
@@ -305,6 +485,7 @@ function driverSource(PORT, LAG) {
       const runFrame = async (k, isResim) => {
         await R.waitClean();
         const s = R.save(); if (!s) throw new Error('save failed at ' + k);
+        if (R.reloadEach) { if (R.load(s) < 0) throw new Error('reload failed at ' + k); R.onLoad(); }
         const old = ring.get(k); if (old) R.free(old);
         ring.set(k, s);
         if (isResim) st.resimSaveMs.push(s.ms);
@@ -316,6 +497,7 @@ function driverSource(PORT, LAG) {
       try {
         await R.waitClean();
         if (R.load(R.anchor) < 0) throw new Error('anchor load failed');
+        R.onLoad();
         for (let f = 0; f < frames; f++) {
           // 1. inputs arrive: the real pad for frame f - lag is now known.
           let from = Infinity;
@@ -341,6 +523,7 @@ function driverSource(PORT, LAG) {
             if (!s0) throw new Error('no ring state for frame ' + from);
             await R.waitClean();
             const lm = R.load(s0); if (lm < 0) throw new Error('rollback load failed');
+            R.onLoad();
             st.loadMs.push(lm);
             st.rollbacks++; st.resim += depth; if (depth > st.maxDepth) st.maxDepth = depth;
             for (let k = from; k < f; k++) {
@@ -486,6 +669,65 @@ try {
   await page.screenshot({ path: path.join(OUT, NAME + '-scene.png') });
   say('scene screenshot -> ' + path.join(OUT, NAME + '-scene.png'));
 
+  if (PRE) { const r = await wEval(worker, '(function(M){' + PRE + '})(self.Module)'); say('PRE ' + JSON.stringify(PRE) + ' -> ' + JSON.stringify(r)); report.pre = PRE; }
+  if (RBLOAD) {
+    const ok = await wEval(worker, `(function(M){ if (typeof M._emscripten_load_state_rollback !== 'function' || typeof M._emscripten_set_rollback_mode !== 'function') return false;
+      M._emscripten_set_rollback_mode(1); self.__rb.useRbLoad = true; return true; })(self.Module)`);
+    if (!ok) { say('RBLOAD: this build does not export _emscripten_load_state_rollback (apply patch 0002 and rebuild)'); report.error = 'no rbload export'; await finish(4); }
+    say('RBLOAD: rollback mode ON (shard off, stale->recompile, watchdog off); every load keeps compiled code');
+    report.rbload = true;
+  }
+  if (RELOAD_EACH) { await wEval(worker, 'self.__rb.reloadEach = true; true'); say('RELOAD-EACH: every frame starts from a load of its own saved state'); report.reloadEach = true; }
+  if (ONLOAD) { await wEval(worker, 'self.__rb.onLoadSrc = ' + JSON.stringify(ONLOAD) + '; true'); say('ONLOAD hook ' + JSON.stringify(ONLOAD)); report.onload = ONLOAD; }
+  if (DIAG > 0) {
+    // ---- DIAG MODE: byte-level diff of three straight runs from one anchor ----
+    const size = await wEval(worker, 'self.__rb.setAnchor()');
+    say('DIAG anchor saved (' + size + ' B); ' + DIAG + ' frames x 3 runs');
+    for (const L of ['D1', 'D2', 'D3']) { await wEval(worker, `self.__rb.diagRun('${L}', ${DIAG})`); say('DIAG ' + L + ' done'); }
+    report.diag = {};
+    const pairs = [['D1', 'D2'], ['D2', 'D3']];
+    if (REPLAY) {
+      const [rf, rt] = REPLAY.split(',').map(Number);
+      await wEval(worker, `self.__rb.diagReplay('RP', ${rf}, ${Math.min(rt, DIAG)})`);
+      say(`DIAG RP done: load at frame ${rf} mid-run, re-ran to ${Math.min(rt, DIAG)}`);
+      pairs.push(['D2', 'RP']);
+    }
+    const cyc = await wEval(worker, 'self.__rb.diagCyc');
+    report.diagCycles = cyc;
+    for (const L of Object.keys(cyc)) {
+      const c = cyc[L]; const d = [];
+      for (let i = 1; i < c.length; i++) d.push(c[i] == null || c[i - 1] == null ? null : c[i] - c[i - 1]);
+      say(`DIAG ${L} guest cycles per frame: ${JSON.stringify(d)}`);
+    }
+    const sched = await wEval(worker, 'self.__rb.diagSched');
+    if (sched.D2 && sched.D2[0]) {
+      for (const [A, B] of pairs) {
+        const a = sched[A], b = sched[B];
+        for (let f = 0; f < Math.min(a.length, b.length); f++) {
+          if (!a[f] || !b[f]) continue;
+          if (JSON.stringify(a[f]) !== JSON.stringify(b[f])) say(`DIAG SCHED ${A}v${B} f${f}: ${JSON.stringify(a[f])} vs ${JSON.stringify(b[f])}`);
+        }
+      }
+    } else say('DIAG SCHED: sh4_sched_debug_dump not exported by this build (patch 0001 adds it)');
+    for (const [A, B] of pairs) {
+      const d = await wEval(worker, `self.__rb.diagDiff('${A}', '${B}')`);
+      report.diag[A + 'vs' + B] = d;
+      say(`DIAG ${A} vs ${B}: regions ${d.regions.join(' ')}`);
+      for (const r of d.frames) {
+        say(`DIAG ${A}v${B} f${r.f}: ${r.bytes} B differ in ${r.nRanges} ranges ${JSON.stringify(r.byRegion)}` + (r.sizeA !== r.sizeB ? ` SIZE ${r.sizeA}/${r.sizeB}` : ''));
+        if (r.bytes && (r === d.frames.find((q) => q.bytes) || r === d.frames[d.frames.length - 1]))
+          for (const g of r.ranges.slice(0, 24)) say(`    ${g.at} len ${g.len}  A=${g.A}  B=${g.B}`);
+      }
+    }
+    await wEval(worker, 'self.__rb.diagFree()');
+    const first = (k) => { const r = report.diag[k].frames.find((q) => q.bytes); return r ? r.f : -1; };
+    report.verdict = 'DIAG D1vsD2 firstDiffer=' + first('D1vsD2') + ' D2vsD3 firstDiffer=' + first('D2vsD3') +
+      (REPLAY ? ' D2vsRP firstDiffer=' + first('D2vsRP') : '');
+    say('VERDICT: ' + report.verdict);
+    await page.screenshot({ path: path.join(OUT, NAME + '-end.png') });
+    await finish(0);
+  }
+
   // ---- 1. isolated save/load + post-load frame cost ----
   const b = await wEval(worker, `self.__rb.bench(${REPS})`);
   report.bench = {
@@ -521,14 +763,17 @@ try {
   const cmp = (A, B) => {
     const keys = Object.keys(A).map(Number).filter((k) => B[k] !== undefined).sort((x, y) => x - y);
     let first = null, match = 0;
-    for (const k of keys) { if (A[k] === B[k]) match++; else if (first === null) first = k; }
-    return { compared: keys.length, matched: match, firstDiverge: first };
+    const bad = [];
+    for (const k of keys) { if (A[k] === B[k]) match++; else { if (first === null) first = k; if (bad.length < 24) bad.push(k); } }
+    return { compared: keys.length, matched: match, firstDiverge: first, diverged: bad };
   };
   report.exact = {
     selfREF1vsREF2: cmp(ref1.hashes, ref2.hashes),
     controlREFvsNOINPUT: cmp(ref1.hashes, noin.hashes),
     rollbackREF1vsRB: cmp(ref1.hashes, rb.hashes),
   };
+  if (RBLOAD) report.rbLoadCounts = await wEval(worker, '({ keep: self.__rb.rbKeep, fullFlushFallbacks: self.__rb.rbFallbacks })');
+  if (RBLOAD) say('RBLOAD loads: ' + JSON.stringify(report.rbLoadCounts));
   report.rb = {
     rollbacks: s.rollbacks, resimFrames: s.resim, maxDepth: s.maxDepth, mispredicted: s.mispredicted, watchdog: s.watchdog,
     loadMs: stat(s.loadMs), resimFrameMs: stat(s.resimFrameMs), resimSaveMs: stat(s.resimSaveMs),

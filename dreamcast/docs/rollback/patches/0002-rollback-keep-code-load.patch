@@ -1,0 +1,446 @@
+diff --git a/dreamcast/flycast-bridge/rec_wasm.cpp b/dreamcast/flycast-bridge/rec_wasm.cpp
+index b885ae7..24b60d9 100644
+--- a/dreamcast/flycast-bridge/rec_wasm.cpp
++++ b/dreamcast/flycast-bridge/rec_wasm.cpp
+@@ -32,6 +32,7 @@
+ #include "hw/sh4/sh4_interpreter.h"
+ #include "hw/sh4/dyna/ngen.h"
+ #include "hw/sh4/dyna/blockmanager.h"
++#include "hw/sh4/modules/mmu.h"   // mmu_enabled() — rollback keep-code load (patch 0002)
+ #include "hw/mem/addrspace.h"
+ #include "hw/pvr/pvr_mem.h"
+ #include "hw/aica/aica_if.h"
+@@ -291,6 +292,17 @@ static uint8_t s_block_stale[JIT_TABLE_SIZE];
+ // and every miss re-summed). 0 = not verified this generation; disarmed
+ // (gen==0) always verifies — boot behavior unchanged.
+ static uint32_t s_block_vgen[JIT_TABLE_SIZE];
++// ROLLBACK KEEP-CODE LOAD (patch 0002). The install UNIT a slot came from:
++// blocks sealed together in one shard tail-link each other with a bare
++// `return_call <idx>` resolved at compile time (bementalJIT wasm_emit.cpp
++// "intra-shard tail-link" — an UNVERIFIED edge, no jit_lookup), so dropping
++// ONE member of a shard while its siblings stay live is unsound: a sibling
++// would still jump into the stale body. Invalidation therefore works on whole
++// units. 0 = per-block install (its own module; no siblings).
++static uint32_t s_block_unit[JIT_TABLE_SIZE];
++static uint32_t s_cur_unit = 0, s_unit_serial = 0;
++// Slot of the last jit_lookup that returned STALE (valid only right after it).
++static uint32_t g_lookup_slot = 0;
+ static constexpr u32 SMC_CHUNKS = 1u << 22;   // 16MB >> 2
+ static inline void code_pages_mark_block(u32 vaddr, u32 code_bytes) {
+     if (!vaddr_in_ram(vaddr) || code_bytes == 0) return;
+@@ -350,6 +362,7 @@ static BlockFn jit_lookup(u32 vaddr) {
+                     return s_block_fn[slot];
+                 if (ram_code_sum(vaddr, s_block_len[slot]) != s_block_sum[slot]) {
+                     g_lookup_stale = true;
++                    g_lookup_slot = slot;
+                     s_block_vgen[slot] = 0;
+                     // Lever-4 F1 dedupe: bump ONLY on the clean->stale
+                     // transition. Repeat lookups of a known-stale block add
+@@ -385,6 +398,7 @@ static bool jit_register(u32 vaddr, BlockFn fn, u32 code_bytes) {
+             s_block_len[slot] = verify ? code_bytes : 0;
+             s_block_sum[slot] = verify ? ram_code_sum(vaddr, code_bytes) : 0;
+             s_block_stale[slot] = 0;   // fresh snapshot — no longer known-stale
++            s_block_unit[slot] = s_cur_unit;   // patch 0002: install unit
+             // Lever-5E1: the sum just computed IS this generation's verification.
+             s_block_vgen[slot] = (verify && g_ic_generation) ? g_ic_generation : 0;
+             // Build 2 (lever-4): a RE-compile moves this vaddr to a NEW wasmTable
+@@ -694,6 +708,7 @@ static void jit_clear() {
+     memset((void*)g_code_map, 0, sizeof(g_code_map));
+     memset(s_block_stale, 0, sizeof(s_block_stale));
+     memset(s_block_vgen, 0, sizeof(s_block_vgen));
++    memset(s_block_unit, 0, sizeof(s_block_unit));
+ }
+ 
+ // Lever-6B: dispatch-loop state hoisted to file scope so the inner loop can
+@@ -778,8 +793,10 @@ static std::map<u32, u32> s_unreg_len;
+ // must span-INTERPRET a parked pc from live RAM instead, forever — until
+ // reset() clears the parks, which is sound because bm_ResetCache refills the
+ // WHOLE FPCB with ngen_FailedToFindBlock first (see reset()).
++extern volatile uint32_t g_rb_mode, g_rb_parks;   // patch 0002, defined below
+ static inline void park_unregistered(u32 vaddr, u32 code_bytes) {
+     s_unreg_len[vaddr] = code_bytes;
++    if (g_rb_mode) ++g_rb_parks;   // patch 0002: history-dependent route — must read 0
+ }
+ 
+ // [2026-05-19] Forcing shard ON validated the path engages (124 seals fired in 60s)
+@@ -877,6 +894,7 @@ static void seal_pending_shard() {
+     // to prevent (recompile -> blockmanager.cpp:288 -> os_DebugBreak).
+ 
+     if (base_idx > 0) {
++        s_cur_unit = ++s_unit_serial;   // patch 0002: every member stamps this unit
+         for (int i = 0; i < count; ++i) {
+             BlockFn fn = reinterpret_cast<BlockFn>(
+                 static_cast<uintptr_t>(base_idx + i));
+@@ -1025,6 +1043,7 @@ static void seal_pending_shard() {
+ 
+         // Only the CURRENT shard's bookkeeping is cleared; the parks live in
+         // s_unreg_len and survive this (and every later) seal.
++        s_cur_unit = 0;   // patch 0002: later per-block installs are their own unit
+         s_pending_shard.clear();
+         s_pending_vaddrs.clear();
+         s_pending_len.clear();
+@@ -1034,6 +1053,7 @@ static void seal_pending_shard() {
+ 
+     // Only the CURRENT shard's bookkeeping is cleared; the probe-limit parks
+     // live in s_unreg_len and survive this (and every later) seal.
++    s_cur_unit = 0;   // patch 0002: later per-block installs are their own unit
+     s_pending_shard.clear();
+     s_pending_vaddrs.clear();
+     s_pending_len.clear();
+@@ -1048,6 +1068,166 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_shard_seal_now(void) {
+     if (s_shard_enabled) seal_pending_shard();
+ }
+ 
++// ===========================================================================
++// ROLLBACK KEEP-CODE LOAD (patch 0002) — dreamcast/docs/rollback/TASKS.md
++// ===========================================================================
++// emscripten_load_state flushes EVERY compiled block (bm_ResetCache ->
++// WasmDynarec::reset -> jit_clear), and the frames after a load recompile:
++// measured 47.9 ms load + 691 ms for the next 8 frames, a 1,487 ms p50
++// rollback step against a 33.3 ms frame. A rollback restores a state a few
++// frames old in the SAME scene; its code pages are almost never different
++// from what is resident. So: snapshot the resident code pages before the
++// load, compare after it, and drop only the install units whose code bytes
++// actually changed.
++//
++// ROUTING MUST STAY A PURE FUNCTION OF GUEST STATE, or keeping code trades a
++// cost problem for a determinism one. Two route splits exist today and both
++// charge different guest cycles:
++//   (a) a compiled-but-PENDING shard block span-interprets until its shard
++//       seals — whether a block is pending depends on compile history;
++//   (b) an SMC-stale block INTERPRETS (jit_lookup -> g_lookup_stale), while
++//       a peer that never compiled the old bytes COMPILES the new ones.
++// Rollback mode closes both: it runs with per-block synchronous install
++// (shard off: a block is live from its first execution, so (a) cannot occur)
++// and turns a stale hit into discard + recompile (so (b) routes compiled on
++// every peer). What remains history-dependent is a probe-limit PARK (table
++// occupancy), which is counted in g_rb_parks and must read 0 in the rig.
++volatile uint32_t g_rb_mode = 0;
++volatile uint32_t g_rb_parks = 0;          // parks seen while in rollback mode
++volatile uint32_t g_rb_last_discards = 0;  // blocks dropped by the last keep-code load
++volatile uint32_t g_rb_last_changed_pages = 0;
++volatile uint32_t g_rb_full_flushes = 0;   // keep-code loads that had to fall back
++
++void bm_DiscardBlock(RuntimeBlockInfo* block);   // blockmanager.cpp:310
++static constexpr u32 RB_PAGE_SHIFT = 12;                    // 4 KB
++static constexpr u32 RB_PAGES = 0x01000000u >> RB_PAGE_SHIFT; // 16 MB main RAM
++static uint8_t  s_rb_code_page[RB_PAGES];   // page holds registered code
++static uint8_t  s_rb_changed[RB_PAGES];
++static uint8_t* s_rb_shadow = nullptr;      // 16 MB, code pages only are filled
++
++static inline void rb_mark_span(u32 vaddr, u32 len, uint8_t* map) {
++    if (!vaddr_in_ram(vaddr) || len == 0) return;
++    const u32 lo = (vaddr & 0x00FFFFFFu) >> RB_PAGE_SHIFT;
++    u32 hi = ((vaddr & 0x00FFFFFFu) + len - 1) >> RB_PAGE_SHIFT;
++    if (hi >= RB_PAGES) hi = RB_PAGES - 1;
++    for (u32 p = lo; p <= hi; p++) map[p] = 1;
++}
++static inline bool rb_span_hits(u32 vaddr, u32 len, const uint8_t* map) {
++    if (!vaddr_in_ram(vaddr) || len == 0) return false;
++    const u32 lo = (vaddr & 0x00FFFFFFu) >> RB_PAGE_SHIFT;
++    u32 hi = ((vaddr & 0x00FFFFFFu) + len - 1) >> RB_PAGE_SHIFT;
++    if (hi >= RB_PAGES) hi = RB_PAGES - 1;
++    for (u32 p = lo; p <= hi; p++) if (map[p]) return true;
++    return false;
++}
++
++// Drop one slot from BOTH tables. flycast's FPCA entry goes back to
++// ngen_FailedToFindBlock (bm_DiscardBlock), so the next miss passes
++// bm_AddBlock's verify; our slot keeps its pc (the probe chain stays intact —
++// jit_lookup stops at pc==0, so a hole would orphan every later colliding
++// vaddr) but answers MISS: fn = nullptr with len = 0 skips the sum and is
++// returned as a plain miss, and the recompile's jit_register overwrites this
++// very slot (pc == vaddr branch).
++static void rb_discard_slot(u32 slot) {
++    const u32 v = s_block_pc[slot];
++    if (v == 0 || s_block_fn[slot] == nullptr) return;
++    // NOT bm_GetBlock(): that resolves through blkmap.upper_bound +
++    // containsCode(), and this backend registers every block with
++    // host_code_size = 0, so containsCode is false for all of them. Instead use
++    // the fact compile() relies on: block->code IS the RuntimeBlockInfo*
++    // ("Use the block's own heap address (`blk` itself) as the unique fake code
++    // pointer", WasmDynarec::compile) — so the FPCA entry for v names the block.
++    DynarecCodeEntryPtr c = bm_GetCodeByVAddr(v);   // mmu off (checked by caller)
++    if (c != (DynarecCodeEntryPtr)ngen_FailedToFindBlock)
++        bm_DiscardBlock((RuntimeBlockInfo*)(void*)c);
++    s_block_fn[slot] = nullptr;
++    s_block_len[slot] = 0;
++    s_block_sum[slot] = 0;
++    s_block_stale[slot] = 0;
++    s_block_vgen[slot] = 0;
++    s_block_unit[slot] = 0;
++}
++
++// Drop every slot in `slot`'s install unit (or just `slot` for unit 0).
++static u32 rb_discard_unit_of(u32 slot) {
++    const u32 unit = s_block_unit[slot];
++    if (unit == 0) { rb_discard_slot(slot); return 1; }
++    u32 n = 0;
++    for (u32 i = 0; i < JIT_TABLE_SIZE; i++)
++        if (s_block_unit[i] == unit) { rb_discard_slot(i); n++; }
++    return n;
++}
++
++// Enter/leave rollback mode. Entering FLUSHES once, so every peer starts the
++// mode from the same (empty) table and the same install model.
++extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_rollback_mode(int on) {
++    if (on) {
++        if (s_shard_enabled) seal_pending_shard();
++        s_shard_enabled = false;
++        g_rb_mode = 1;
++        g_rb_parks = 0;
++        bm_ResetCache();          // -> WasmDynarec::reset(): jit_clear + streak
++    } else {
++        g_rb_mode = 0;
++    }
++}
++
++// STEP 1 of a keep-code load (BEFORE retro_unserialize): record which RAM
++// pages hold resident code and copy exactly those pages aside.
++extern "C" EMSCRIPTEN_KEEPALIVE u32 flycast_rb_snapshot_code_pages(void) {
++    if (!s_rb_shadow) {
++        s_rb_shadow = (uint8_t*)malloc(0x01000000u);
++        if (!s_rb_shadow) return 0xFFFFFFFFu;
++    }
++    if (s_shard_enabled) seal_pending_shard();   // nothing may stay pending
++    memset(s_rb_code_page, 0, sizeof(s_rb_code_page));
++    for (u32 slot = 0; slot < JIT_TABLE_SIZE; slot++)
++        if (s_block_pc[slot] != 0 && s_block_fn[slot] != nullptr)
++            rb_mark_span(s_block_pc[slot], s_block_len[slot] ? s_block_len[slot] : 2, s_rb_code_page);
++    for (const auto& kv : s_unreg_len) rb_mark_span(kv.first, kv.second, s_rb_code_page);
++    u32 n = 0;
++    for (u32 p = 0; p < RB_PAGES; p++)
++        if (s_rb_code_page[p]) {
++            memcpy(s_rb_shadow + (p << RB_PAGE_SHIFT), &mem_b[p << RB_PAGE_SHIFT], 1u << RB_PAGE_SHIFT);
++            n++;
++        }
++    return n;
++}
++
++// STEP 2 (AFTER retro_unserialize): compare, then drop every install unit
++// with a block on a changed page. Returns the number of blocks dropped, or
++// 0xFFFFFFFF when the caller must fall back to the full flush (MMU on, a park
++// or pending span on a changed page, or no shadow).
++extern "C" EMSCRIPTEN_KEEPALIVE u32 flycast_rb_invalidate_changed(void) {
++    g_rb_last_discards = 0;
++    g_rb_last_changed_pages = 0;
++    if (!s_rb_shadow || mmu_enabled()) { ++g_rb_full_flushes; return 0xFFFFFFFFu; }
++    memset(s_rb_changed, 0, sizeof(s_rb_changed));
++    u32 changed = 0;
++    for (u32 p = 0; p < RB_PAGES; p++)
++        if (s_rb_code_page[p] &&
++            memcmp(s_rb_shadow + (p << RB_PAGE_SHIFT), &mem_b[p << RB_PAGE_SHIFT], 1u << RB_PAGE_SHIFT) != 0) {
++            s_rb_changed[p] = 1;
++            changed++;
++        }
++    g_rb_last_changed_pages = changed;
++    if (changed == 0) return 0;
++    for (const auto& kv : s_unreg_len)
++        if (rb_span_hits(kv.first, kv.second, s_rb_changed)) { ++g_rb_full_flushes; return 0xFFFFFFFFu; }
++    for (const auto& kv : s_pending_len)
++        if (rb_span_hits(kv.first, kv.second, s_rb_changed)) { ++g_rb_full_flushes; return 0xFFFFFFFFu; }
++    u32 dropped = 0;
++    for (u32 slot = 0; slot < JIT_TABLE_SIZE; slot++)
++        if (s_block_pc[slot] != 0 && s_block_fn[slot] != nullptr &&
++            rb_span_hits(s_block_pc[slot], s_block_len[slot] ? s_block_len[slot] : 2, s_rb_changed))
++            dropped += rb_discard_unit_of(slot);
++    // Every IC entry and LEVER-12 trace-edge stamp may name a dropped index.
++    if (g_ic_generation) { ++g_ic_generation; ++g_smc_gen_accounted; ++g_smc_mark_counts[4]; }
++    g_rb_last_discards = dropped;
++    return dropped;
++}
++
++
+ 
+ // Runtime-toggleable diagnostic gate. When false, all stats / GDROM /
+ // per-1000 PC sampler logs are suppressed at near-zero cost (single load
+@@ -1688,6 +1868,14 @@ isk_no_skip:
+     // dispatch but a std::async SH4 thread spawned by retro_unserialize's
+     // emu.start() under a clobbered ThreadedRendering. Fixed by the
+     // un-clobberable re-pin in Emulator::start() (emulator.cpp, WASM-gated).)
++    if (!fn && g_lookup_stale && g_rb_mode) {
++        // ROLLBACK MODE (patch 0002): a stale hit must route the SAME way on
++        // every peer, and a peer that never compiled the old bytes compiles
++        // the new ones. So drop the stale unit and fall into the miss path,
++        // which recompiles from live RAM — instead of interpreting.
++        rb_discard_unit_of(g_lookup_slot);
++        g_lookup_stale = false;
++    }
+     if (!fn && g_lookup_stale) {
+         // SMC-stale block: interpret one instruction from live RAM instead
+         // of recompiling (recompiling desyncs flycast's bm and crashes its
+diff --git a/dreamcast/flycast-bridge/EmscriptenWorker.cpp b/dreamcast/flycast-bridge/EmscriptenWorker.cpp
+index be16fd4..edb6583 100644
+--- a/dreamcast/flycast-bridge/EmscriptenWorker.cpp
++++ b/dreamcast/flycast-bridge/EmscriptenWorker.cpp
+@@ -173,6 +173,9 @@ static int      g_video_target_h = 0;
+ //   [4..7]   uint32 tail (reader = JS audio worklet)
+ //   [8..]    int16 stereo samples (capacity * 2 * sizeof(int16))
+ static uint8_t* g_audio_ring_base     = nullptr;
++// ROLLBACK (patch 0002): set by emscripten_rb_mute_audio around re-simulated
++// frames; audio_sample_batch_cb then discards the batch.
++static volatile uint32_t g_rb_mute_audio = 0;
+ static uint32_t g_audio_ring_capacity = 0;  // in stereo frames
+ 
+ // Audio-path observability (2026-08-28). Before this, BOTH ends of the ring
+@@ -987,6 +990,8 @@ static void video_cb(const void* data, unsigned w, unsigned h, size_t pitch) {
+ 
+ static size_t audio_sample_batch_cb(const int16_t* data, size_t frames) {
+     if (!data || !frames) return frames;
++    // ROLLBACK (patch 0002): re-simulated frames must not be heard twice.
++    if (g_rb_mute_audio) return frames;
+ 
+     // SAB ring path.
+     if (g_audio_ring_base && g_audio_ring_capacity) {
+@@ -1910,6 +1915,67 @@ int emscripten_load_state(const uint8_t* buf, size_t size) {
+     return ok;
+ }
+ 
++// ===========================================================================
++// ROLLBACK (patch 0002) — dreamcast/docs/rollback/TASKS.md
++// ===========================================================================
++extern "C" bool retro_unserialize_keepcode(const void* data, size_t size);   // libretro.cpp (C linkage)
++extern "C" {
++    uint32_t flycast_rb_snapshot_code_pages(void);   // rec_wasm.cpp
++    uint32_t flycast_rb_invalidate_changed(void);
++    void flycast_set_rollback_mode(int on);
++    void flycast_set_deterministic(int on);
++}
++// Audio produced while re-simulating is DISCARDED: the rollback driver sets
++// g_rb_mute_audio around resim frames; audio_sample_batch_cb returns early
++// (the core is still told every frame was consumed, like the overflow path).
++EMSCRIPTEN_KEEPALIVE void emscripten_rb_mute_audio(int on) { g_rb_mute_audio = on ? 1u : 0u; }
++
++// Cached serialize size. retro_serialize_size() is a FULL dc_serialize into a
++// sizing Serializer (libretro.cpp:2394-2413, plus its own emu.stop/start), so
++// emscripten_save_state pays the serializer twice per save. A rollback peer
++// saves every frame into a preallocated ring and needs the size once.
++EMSCRIPTEN_KEEPALIVE size_t emscripten_state_size(void) {
++    return g_loaded ? retro_serialize_size() : 0;
++}
++// Save into a caller-owned buffer (a ring slot): no malloc, no free, one
++// serializer pass. Returns 1 on success.
++EMSCRIPTEN_KEEPALIVE int emscripten_save_state_into(uint8_t* buf, size_t cap) {
++    if (!g_loaded || !buf || !cap) return 0;
++    return retro_serialize(buf, cap) ? 1 : 0;
++}
++
++// Enter/leave rollback mode: per-block synchronous install (no pending
++// shard spans), stale-hit -> recompile, wall-clock watchdog suspended. Every
++// peer in a rollback room calls this once at ROOM START, before the anchor.
++EMSCRIPTEN_KEEPALIVE void emscripten_set_rollback_mode(int on) {
++    flycast_set_rollback_mode(on ? 1 : 0);
++    flycast_set_deterministic(on ? 1 : 0);
++}
++
++// THE ROLLBACK LOAD. Same machine state as emscripten_load_state; the SH4
++// code cache is kept and only install units whose code bytes changed are
++// dropped. Falls back to the full flush when the precise path cannot prove
++// itself safe (MMU on, a parked/pending span on a changed page).
++// Returns 1 = loaded (keep-code), 2 = loaded (fell back to full flush), 0 = failed.
++// ⚠ Does NOT keep s_autoload_buf (the parity-cert copy): a 27 MB memcpy per
++// rollback is exactly the kind of cost this path exists to remove.
++EMSCRIPTEN_KEEPALIVE
++int emscripten_load_state_rollback(const uint8_t* buf, size_t size) {
++    if (!g_loaded || !buf || !size) return 0;
++    if (flycast_rb_snapshot_code_pages() == 0xFFFFFFFFu) {
++        return emscripten_load_state(buf, size) ? 2 : 0;
++    }
++    if (!retro_unserialize_keepcode(buf, size)) return 0;
++    int rc = 1;
++    if (flycast_rb_invalidate_changed() == 0xFFFFFFFFu) {
++        flycast_lockstep_reset();
++        rc = 2;
++    }
++    flycast_ic_invalidate();
++    flycast_rb_reset_host_history();
++    return rc;
++}
++
+ EMSCRIPTEN_KEEPALIVE
+ int emscripten_lockstep_normalize(void) {
+     // NORMALIZE-BY-ROUND-TRIP. Serialize this instance and immediately load its
+diff --git a/dreamcast/flycast-src/core/emulator.cpp b/dreamcast/flycast-src/core/emulator.cpp
+index c334d2b..3834bab 100644
+--- a/dreamcast/flycast-src/core/emulator.cpp
++++ b/dreamcast/flycast-src/core/emulator.cpp
+@@ -899,6 +899,38 @@ void Emulator::stepRange(u32 from, u32 to)
+ 	stop();
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// ROLLBACK KEEP-CODE LOAD (patch 0002, dreamcast/docs/rollback/TASKS.md).
++// Emulator::loadstate below minus getSh4Executor()->ResetCache(): the SH4 block
++// cache is KEPT and the wasm bridge (rec_wasm.cpp flycast_rb_invalidate_changed)
++// drops only the install units whose code pages changed. Everything else —
++// ARM7 rec flush, MMU table flush, memwatch reset, sh4_sched_ffts inside
++// dc_deserialize — is kept identical, so the restored MACHINE is the same one
++// the full path restores; only the host-side SH4 code cache survives.
++void emu_loadstate_keepcode(Deserializer& deser)
++{
++	if (!custom_texture.preloaded())
++	{
++		custom_texture.terminate();
++		custom_texture.init();
++	}
++#if FEAT_AREC == DYNAREC_JIT
++	aica::arm::recompiler::flush();
++#endif
++	mmu_flush_table();
++#if FEAT_SHREC != DYNAREC_NONE
++	bm_Reset();
++#endif
++	memwatch::unprotect();
++	memwatch::reset();
++
++	dc_deserialize(deser);
++
++	mmu_set_state();
++	EventManager::event(Event::LoadState);
++}
++#endif
++
+ void Emulator::loadstate(Deserializer& deser)
+ {
+ 	if (!custom_texture.preloaded())
+diff --git a/dreamcast/flycast-src/shell/libretro/libretro.cpp b/dreamcast/flycast-src/shell/libretro/libretro.cpp
+index d2bf28b..ad40275 100644
+--- a/dreamcast/flycast-src/shell/libretro/libretro.cpp
++++ b/dreamcast/flycast-src/shell/libretro/libretro.cpp
+@@ -2466,6 +2466,36 @@ bool retro_unserialize(const void * data, size_t size)
+ 	}
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// ROLLBACK KEEP-CODE LOAD (patch 0002): retro_unserialize with the SH4 block
++// cache kept (emulator.cpp emu_loadstate_keepcode). Same stop/start bracket,
++// same audio flush. Called only by EmscriptenWorker.cpp
++// emscripten_load_state_rollback, which does the page-precise invalidation.
++void emu_loadstate_keepcode(Deserializer& deser);
++extern "C" bool retro_unserialize_keepcode(const void * data, size_t size)
++{
++	std::lock_guard<std::mutex> lock(mtx_serialization);
++	if (!first_run)
++		try {
++			emu.stop();
++		} catch (const FlycastException& e) {
++			ERROR_LOG(COMMON, "%s", e.what());
++			return false;
++		}
++	try {
++		Deserializer deser(data, size);
++		emu_loadstate_keepcode(deser);
++		retro_audio_flush_buffer();
++		if (!first_run)
++			emu.start();
++		return true;
++	} catch (const Deserializer::Exception& e) {
++		ERROR_LOG(SAVESTATE, "Loading state failed: %s", e.what());
++		return false;
++	}
++}
++#endif
++
+ // Cheats
+ void retro_cheat_reset()
+ {

@@ -1,0 +1,184 @@
+diff --git a/dreamcast/flycast-bridge/rec_wasm.cpp b/dreamcast/flycast-bridge/rec_wasm.cpp
+index e3922ed..b885ae7 100644
+--- a/dreamcast/flycast-bridge/rec_wasm.cpp
++++ b/dreamcast/flycast-bridge/rec_wasm.cpp
+@@ -539,6 +539,20 @@ volatile uint32_t g_syncfpscr_count = 0;
+ // really reaches g_idleskip. The earlier "no runtime OFF exists yet" warning
+ // here is obsolete.
+ volatile uint32_t g_idleskip = 1;
++// ROLLBACK DETERMINISM (patch 0001, dreamcast/docs/rollback/TASKS.md).
++// The idle-skip progress bound's streak used to be a function-static inside
++// wasm_block_trampoline. No savestate carries it and no reset cleared it, so
++// two runs restored from the SAME bytes started with different streaks and
++// executed (or skipped) a different visit of PSO's frame-wait spin — a
++// different number of guest cycles burned before the next event. Hoisted
++// here so WasmDynarec::reset() (every state load, via bm_ResetCache) and
++// flycast_rb_reset_host_history() can zero it.
++static u32 s_isk_streak = 0;
++// Wall-clock guard. While set, the 2 s frame watchdog (dispatch_slice) is
++// suspended exactly as it is for a parity arm: it converts host wall time
++// into guest trajectory (it ends a frame at a wall-dependent dispatch), which
++// no rollback or lockstep peer can reproduce. Set by netplay rooms.
++volatile uint32_t g_deterministic = 0;
+ volatile uint32_t g_idleskip_burns = 0;
+ // Frame-watchdog run_iter generation (bumped in emscripten_run_iter). The
+ // watchdog's old reset heuristic (1M-dispatch gap) assumed a free-running
+@@ -823,6 +837,18 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_lockstep_reset(void) {
+ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_idleskip(int on) {
+     g_idleskip = !!on;
+ }
++// ROLLBACK DETERMINISM (patch 0001). on=1 suspends the wall-clock frame
++// watchdog (see g_deterministic). Netplay (lockstep or rollback) sets it.
++extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_deterministic(int on) {
++    g_deterministic = !!on;
++}
++// Zero every piece of HOST history that steers guest execution but is not in
++// the savestate and is not cleared by bm_ResetCache. Called by every load path
++// (emscripten_load_state, emscripten_load_state_rollback). Keep this list in
++// sync with dreamcast/docs/rollback/TASKS.md "sources of non-determinism".
++extern "C" EMSCRIPTEN_KEEPALIVE void flycast_rb_reset_host_history(void) {
++    s_isk_streak = 0;
++}
+ 
+ // g_cb_disp_count is defined above at line ~195 inside the extern "C" block;
+ // we read it (no forward decl needed) to drive the SHARD_DISPATCH_SEAL
+@@ -1622,7 +1648,8 @@ static void wasm_block_trampoline()
+         // later wait can reach its real execution in fewer than ISK_RUN
+         // skips) and it is why there is no per-dispatch reset store on the
+         // hot path. The progress bound is unaffected.
+-        static u32 s_isk_streak = 0;
++        // s_isk_streak lives at file scope (see g_idleskip) so a state load
++        // can zero it; it was a function-static here.
+         constexpr u32 ISK_RUN = 32;
+         if (s_isk_streak >= ISK_RUN) { s_isk_streak = 0; goto isk_no_skip; }
+         if (s_isk_cb_word && *s_isk_cb_word == 0x8c3c34d0u) {
+@@ -2410,6 +2437,10 @@ public:
+ 		// makes the delta start at 0 in BOTH, so the seal schedule is a pure
+ 		// function of guest execution.
+ 		s_dispatches_at_last_seal = s_dispatch_count;
++		// ROLLBACK DETERMINISM (patch 0001): the idle-skip streak is host
++		// history no savestate carries. Zero it on every reset so a restore
++		// starts the progress bound from the same phase on every run/peer.
++		s_isk_streak = 0;
+ 		// And drop the block shadow, so a peer with history and a fresh peer
+ 		// begin with the SAME (empty) block table and compile in the same
+ 		// guest order. Safe here specifically because flycast's bm_reset ran
+@@ -2457,7 +2488,7 @@ public:
+ 				// parity drift's primary source per the static audit).
+ 				// SUSPENDED while a parity arm hashes; replay frames run to
+ 				// natural completion instead.
+-				if ((s_dispatch_count & 0x3FFFF) == 0 && !g_parity_hashing) {
++				if ((s_dispatch_count & 0x3FFFF) == 0 && !g_parity_hashing && !g_deterministic) {
+ 					static double s_wd_start = 0.0;
+ 					static uint64_t s_wd_last = 0;
+ 					static uint32_t s_wd_gen = 0;
+diff --git a/dreamcast/flycast-bridge/EmscriptenWorker.cpp b/dreamcast/flycast-bridge/EmscriptenWorker.cpp
+index aa1e811..be16fd4 100644
+--- a/dreamcast/flycast-bridge/EmscriptenWorker.cpp
++++ b/dreamcast/flycast-bridge/EmscriptenWorker.cpp
+@@ -1533,6 +1533,7 @@ uintptr_t flycast_run_iter_flag_ptr(void) { return (uintptr_t)&s_run_iter_inflig
+ extern "C" { extern double g_attr_mainloop_ms, g_attr_retro_ms; }
+ // Frame-watchdog run_iter generation (defined in rec_wasm.cpp).
+ extern "C" { extern volatile uint32_t g_wd_iter_gen; }
++extern "C" void flycast_rb_reset_host_history(void);   // rec_wasm.cpp, patch 0001
+ 
+ // VMU bridge (defined in core/hw/maple/maple_devs.cpp under __EMSCRIPTEN__,
+ // patch 0014). The wasm VMU is in-memory only, so the page owns persistence:
+@@ -1606,6 +1607,14 @@ void emscripten_run_iter(void) {
+     // run_iter means the previous frame completed — the 2s stuck-frame clock
+     // must start over.
+     ++g_wd_iter_gen;
++    // ROLLBACK DETERMINISM (patch 0001): host history that steers the guest
++    // (the idle-skip streak) is zeroed at EVERY frame start, so the state at
++    // the start of frame k fully determines frame k. Zeroing it only on load
++    // is not enough for rollback: a re-simulation loads frame k's ring state
++    // and would start with streak 0 where the original run carried k frames
++    // of streak. Measured: with idle-skip OFF, three runs from one anchor are
++    // byte-identical over 7 states; with it ON they diverge at frame 1.
++    flycast_rb_reset_host_history();
+     static unsigned long s_call_count = 0;
+     ++s_call_count;
+     if (s_call_count < 5 || s_call_count % 1000 == 0) {
+@@ -1744,6 +1753,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void sh4_import_fnptrs(uint32_t* out) {
+ extern "C" void flycast_ic_invalidate(void);
+ extern "C" void flycast_lockstep_reset(void);
+ extern "C" void flycast_set_ic(int on);
++extern "C" void flycast_rb_reset_host_history(void);   // rec_wasm.cpp, patch 0001
+ // Lever-5B sizing instrument (defined in rec_wasm.cpp; read via ctxsnap 81).
+ extern "C" { extern volatile uint32_t g_syncsr_count; }
+ // Lever-10 sizing instrument (defined in rec_wasm.cpp; read via ctxsnap 89).
+@@ -1892,6 +1902,11 @@ int emscripten_load_state(const uint8_t* buf, size_t size) {
+     // flycast_ic_invalidate() above does NOT cover this: it is a no-op while
+     // g_ic_generation == 0, and it never touches the block table.
+     if (ok) flycast_lockstep_reset();
++    // ROLLBACK DETERMINISM (patch 0001): bm_ResetCache above already zeroes
++    // the idle-skip streak through WasmDynarec::reset(); this names the
++    // contract explicitly so a future load path that skips the flush (the
++    // keep-code rollback load, patch 0002) cannot forget it.
++    if (ok) flycast_rb_reset_host_history();
+     return ok;
+ }
+ 
+diff --git a/dreamcast/flycast-src/core/hw/sh4/sh4_sched.cpp b/dreamcast/flycast-src/core/hw/sh4/sh4_sched.cpp
+index 6ec2002..5b9135c 100755
+--- a/dreamcast/flycast-src/core/hw/sh4/sh4_sched.cpp
++++ b/dreamcast/flycast-src/core/hw/sh4/sh4_sched.cpp
+@@ -245,6 +245,40 @@ extern int vblank_schid;
+ // hw/sh4/modules/tmu.cpp
+ extern int tmu_sched[3];
+ 
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++// ROLLBACK DETERMINISM DIAGNOSTIC (patch 0001, dreamcast/docs/rollback/TASKS.md).
++// Measured on the shipped binary: the first frame after ANY state load is
++// exactly one SH4_TIMESLICE (448 cycles) shorter, the second one slice longer,
++// and the run reconverges after that — while the state saved immediately
++// after the load is byte-identical to the one loaded. So whatever moves the
++// frame end is scheduler state that is NOT serialized. sch_list (all entries,
++// including tmu_sched, which V58+ states no longer carry here), the next id
++// and ffb are dumped so the rig can diff them straight before a save against
++// straight after the load of that save. Layout of `out` (int32):
++//   [0..1] ffb lo/hi, [2] sh4_sched_next, [3] next_id, [4] n,
++//   then n x {tag, start, end}. Returns the number of ints written.
++extern "C" EMSCRIPTEN_KEEPALIVE int sh4_sched_debug_dump(int* out, int max)
++{
++	if (max < 5) return 0;
++	out[0] = (int)(u32)sh4_sched_ffb;
++	out[1] = (int)(u32)(sh4_sched_ffb >> 32);
++	out[2] = Sh4cntx.sh4_sched_next;
++	out[3] = sh4_sched_next_id;
++	int n = 0, w = 5;
++	for (const sched_list& sched : sch_list)
++	{
++		if (w + 3 > max) break;
++		out[w++] = sched.tag;
++		out[w++] = sched.start;
++		out[w++] = sched.end;
++		n++;
++	}
++	out[4] = n;
++	return w;
++}
++#endif
++
+ void sh4_sched_serialize(Serializer& ser)
+ {
+ 	ser << sh4_sched_ffb;
+diff --git a/dreamcast/flycast-src/core/hw/pvr/spg.cpp b/dreamcast/flycast-src/core/hw/pvr/spg.cpp
+index 53cbf4e..2a45095 100755
+--- a/dreamcast/flycast-src/core/hw/pvr/spg.cpp
++++ b/dreamcast/flycast-src/core/hw/pvr/spg.cpp
+@@ -200,6 +200,13 @@ static int spg_line_sched(int tag, int cycles, int jitter, void *arg)
+ 				u64 time_span = now - real_times[cpu_time_idx];
+ 				float cpu_speed = ((float)cycle_span / time_span) / (SH4_MAIN_CLOCK / 100000);
+ 				SH4FastEnough = cpu_speed >= 85.f;
++#ifdef __EMSCRIPTEN__
++				// ROLLBACK DETERMINISM (patch 0001): SH4FastEnough is HOST WALL
++				// TIME (getTimeMs above) turned into emulator state. Under a
++				// netplay room (g_deterministic, rec_wasm.cpp) it is pinned, so
++				// no consumer can steer anything by how fast this host is.
++				{ extern volatile uint32_t g_deterministic; if (g_deterministic) SH4FastEnough = true; }
++#endif
+ 			}
+ 			else {
+ 				SH4FastEnough = false;
