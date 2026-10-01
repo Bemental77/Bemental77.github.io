@@ -180,6 +180,9 @@ export function simulate(sc) {
     else if (sc.readyStepMs) opts.selfStepMs = 0;
     if (sc.rbResume) opts.rbResume = true;
     if (host && sc.hintMs) opts.rbHintMs = sc.hintMs;
+    // sc.maxWindow: { id: frames } — the deepest window that console's ring can
+    // hold (opts.rbMaxWindow, published in lsready/lsrb as `mw`).
+    if (sc.maxWindow && sc.maxWindow[id]) opts.rbMaxWindow = sc.maxWindow[id];
     if (sc.lockstep) { opts.rollback = 0; opts.delay = sc.delay || 3; }
     // A naive page does not know rollback exists: it passes no rollback option.
     if (sc.naiveIds && sc.naiveIds.includes(id)) { delete opts.rollback; delete opts.rbCatchUp; delete opts.selfStepMs; }
@@ -273,6 +276,7 @@ export function simulate(sc) {
     const ls = p.ls;
     if (outage(p.id) && !sc.linkOnly) { p.lastTs = 0; return; }   // a backgrounded tab runs nothing (sc.linkOnly: only its link is down)
     if (sc.stepMsAt) { const v = sc.stepMsAt(p.id, T); if (v != null) p.stepMs = v; }
+    if (sc.maxWindowAt) { const v = sc.maxWindowAt(p.id, T); if (v != null) p.ls.rbMaxWindow = v; }
     if (!p.declared && ls.localPorts.length) { p.declared = true; ls.declareReady('g'); }
     const running = ls.state === 'running' || ls.state === 'stalled';
     if (!running) { p.lastTs = 0; return; }
