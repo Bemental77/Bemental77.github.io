@@ -31,6 +31,8 @@
 //   no-catchup-page  a rollback room whose pages did not declare rbCatchUp
 //                    (ps1.html, n64/index.html): a guest away 4 s was left limp
 //                    19 s. Such a room is not adaptive and nobody is dropped.
+//   no-rollback-page a page with no rollback branch in a rollback room (2nd review)
+//   two-away-4p      two guests away at once, 2-8% loss (2nd review)
 //   mixed-version    a new host with a guest still on the pre-adaptive engine
 //                    (git ffc0f52), and both old: the new host dropped the old
 //                    guest, which has no way back (6/6 failed or desynced).
@@ -119,6 +121,35 @@ for (const [label, oldIds] of [['old-guest-new-host', ['G1']], ['all-old', ['G1'
     if (drops(r) || failedOf(r).length || r.desyncs) bad.push(`${dur}ms s${seed}: drops ${drops(r)} ${failedOf(r).join('; ')} desync ${r.desyncs}`);
   }
   ok(`mixed-version/${label}/an-old-page-is-never-dropped`, !bad.length, bad.join(' | ') || 'a guest on the pre-adaptive engine, away 3 s and 6 s: never dropped, never failed');
+}
+// ---- SECOND REVIEW ---------------------------------------------------------
+// A page with NO rollback branch (a cached old ps1.html) in a room whose host
+// wants rollback: it ran predicted frames and never rewound — 3/3 desynced. The
+// host now runs rollback only if every console declares it can (lsready `rb`).
+for (const [label, extra] of [['old-engine', { oldIds: ['G1'] }], ['new-engine', {}]]) {
+  const bad = []; let compared = 0, rb = [];
+  for (const seed of seeds(3)) {
+    const r = simulate(Object.assign({ name: 'n', seed, secs: 30, players: 2, baseMs: 50, jitterMs: 20, loss: 0.02, naiveIds: ['G1'] }, extra));
+    compared += r.compared; rb.push(r.consoles.H.window);
+    if (r.desyncs || failedOf(r).length) bad.push(`s${seed}: desyncs ${r.desyncs} ${failedOf(r).join('; ')}`);
+  }
+  ok(`no-rollback-page/${label}/the-room-falls-back-to-input-delay-and-agrees`, !bad.length && rb.every((w) => w === 0) && compared > 0,
+     bad.join(' | ') || `host rollback window ${rb.join('/')} (0 = delay lockstep); ${compared} fingerprints compared, 0 desyncs`);
+}
+// Four players, TWO guests away (overlapping), 2-8% loss: a console failed a
+// rewind to a THIRD party's drop frame (reviewer: 3/16 at 8%). The cause in the
+// rig was its relay: it forwarded inputs the host had already agreed were limp,
+// which the product's host never does (Lockstep.filterRelay, used by
+// Session._onRoomMsg); the sim now relays through it.
+{
+  const bad = []; let runs = 0;
+  for (const [loss, rto, n] of [[0.02, 0, 24], [0.05, 600, 16], [0.08, 900, 16]]) for (const seed of seeds(n)) {
+    const sc = { name: 'b', seed, secs: 40, players: 4, baseMs: 70, jitterMs: 25, loss, outages: [{ id: 'G1', from: 9000, to: 13000 }, { id: 'G3', from: 10000, to: 15000 }] };
+    if (rto) sc.rtoMs = rto;
+    const r = simulate(sc); runs++;
+    if (failedOf(r).length || r.desyncs || r.truthBad) bad.push(`${loss} s${seed}: ${failedOf(r).join('; ')} desync ${r.desyncs}`);
+  }
+  ok('two-away-4p/nobody-fails-a-third-party-drop', !bad.length, bad.slice(0, 3).join(' | ') || `${runs} four-player rooms, two guests away (overlapping), 2-8% loss`);
 }
 console.log(`\n[rb-outage] ${pass}/${pass + fail} passed`);
 process.exit(fail ? 1 : 0);

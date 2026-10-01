@@ -104,7 +104,7 @@ export function simulate(sc) {
     const base = typeof sc.baseMs === 'function' ? sc.baseMs(T, g) : (sc.baseMs || 0);
     return Math.max(0, base + rnd() * (sc.jitterMs || 0));
   };
-  const outage = (id) => sc.outage && sc.outage.id === id && T >= sc.outage.from && T < sc.outage.to;
+  const outage = (id) => (sc.outages || (sc.outage ? [sc.outage] : [])).some((o) => o.id === id && T >= o.from && T < o.to);
   // One hop. `m` is already a private copy.
   const hop = (from, to, m) => {
     if (outage(from) || outage(to)) { stats.dropped++; return; }
@@ -128,7 +128,12 @@ export function simulate(sc) {
     if (T < p.busyUntil) { q.push(p.busyUntil, () => arrive(to, m, from)); return; }
     p.ls.receive(m);
     // THE HOST FORWARDS a guest's frame traffic to every other guest (Session._relay).
-    if (p.host && RELAYED[m.t] && m.peer !== 'H') for (const o of ids) if (o !== 'H' && o !== m.peer) hop('H', o, JSON.parse(JSON.stringify(m)));
+    // ...through Lockstep.filterRelay, as Session._onRoomMsg does: never what the
+    // room agreed is limp.
+    if (p.host && RELAYED[m.t] && m.peer !== 'H') {
+      const fwd = typeof p.ls.filterRelay === 'function' ? p.ls.filterRelay(m) : m;
+      if (fwd) for (const o of ids) if (o !== 'H' && o !== m.peer) hop('H', o, JSON.parse(JSON.stringify(fwd)));
+    }
   };
   const seg = {};
   const padFor = (id, port, f) => {
@@ -158,6 +163,8 @@ export function simulate(sc) {
     const old = sc.oldIds && sc.oldIds.includes(id);
     if (sc.catchUp !== false && !old) { opts.rbCatchUp = true; opts.selfStepMs = p.stepMs; }
     if (sc.lockstep) { opts.rollback = 0; opts.delay = sc.delay || 3; }
+    // A naive page does not know rollback exists: it passes no rollback option.
+    if (sc.naiveIds && sc.naiveIds.includes(id)) { delete opts.rollback; delete opts.rbCatchUp; delete opts.selfStepMs; }
     p.ls = old ? new (oldLockstep(sc.oldRef || 'ffc0f52'))(opts) : new Lockstep(opts);
     p.old = !!old;
     p.ls.selfStepMs = p.stepMs;
@@ -179,7 +186,10 @@ export function simulate(sc) {
     const r = ls.beginFrame(pads, hidden ? { hidden: true } : undefined);
     if (!r.ready) return 0;
     let work = 0;
-    if (r.rollback) {
+    // sc.naiveIds: a page with NO rollback branch (an old cached ps1.html): it
+    // runs whatever image it is handed on its live state and never rewinds.
+    const naive = sc.naiveIds && sc.naiveIds.includes(p.id);
+    if (r.rollback && !naive) {
       let st = p.ring.get(r.rollback.from);
       if (st === undefined) throw new Error(p.id + ': rollback to ' + r.rollback.from + ' is outside the savestate ring (frame ' + f + ')');
       for (const fr of r.rollback.frames) { st = coreStep(st, fr.image, fr.frame); p.ring.set(fr.frame + 1, st); work += p.stepMs; p.resim++; }
@@ -195,12 +205,14 @@ export function simulate(sc) {
     // full plan that is the corrected state; after a SPREAD plan (the engine
     // re-simulated only part of the history this tick) it is the old branch,
     // which the next tick's plan goes on correcting.
-    const start = p.ring.get(r.frame);
+    const start = naive ? p.st : p.ring.get(r.frame);
     if (start === undefined) throw new Error(p.id + ': no savestate for the start of frame ' + r.frame);
     p.st = coreStep(start, r.image, r.frame);
     p.ring.set(r.frame + 1, p.st);
     work += p.stepMs;
-    ls.endFrame(null);
+    // Delay lockstep (a room that fell back from rollback): the page hands the
+    // fingerprint of the frame it just ran straight to endFrame.
+    ls.endFrame(!ls.rollback && ls.wantsHash(r.frame) ? p.st : null);
     for (const k of ls.takeHashDue()) {
       const s = p.ring.get(k + 1);
       if (s === undefined) throw new Error(p.id + ': no state for the hash of frame ' + k);

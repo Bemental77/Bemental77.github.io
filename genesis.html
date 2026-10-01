@@ -2147,7 +2147,7 @@
       // run an ADAPTIVE rollback room: a window sized from the measured link and
       // a room clock nobody waits on.
       var eng = session.startLockstep({ portCount: GEN_PORTS, padBytes: LS_PAD_BYTES, hashEvery: LS.hashEvery,
-                                        rollback: NET.rbWant ? RB_WINDOW : 0, rbCatchUp: true, frameHz: HW_HZ });
+                                        rollback: NET.rbWant ? RB_WINDOW : 0, rollbackOk: true, rbCatchUp: true, frameHz: HW_HZ });
       if (NET.lagMs > 0 && eng) {
         var rx = eng.receive.bind(eng);
         eng.receive = function (m) {

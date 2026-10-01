@@ -164,7 +164,10 @@ async function arm(name, rb) {
          `adaptive ${eh.adaptive}/${eg.adaptive}; window ${eh.window}/${eg.window} (peak ${eh.windowPeak}/${eg.windowPeak}, ${eh.windowChanges}/${eg.windowChanges} changes); `
          + `ring ${ph.ringFrames}/${pg.ringFrames} savestates (engine asks ${eh.ringFrames}/${eg.ringFrames}); hidden catch-up frames ${ph.hidden}/${pg.hidden}; `
          + `step ${ph.stepMs}/${pg.stepMs} ms; late p99 ${eh.lateP99}/${eg.lateP99} frames`);
-      ok(`${name}: rollbacks-under-injected-delay`, ph.rollbacks > 0 && pg.rollbacks > 0 && ph.maxDepth <= (eh.windowPeak || eh.window) + 1 && pg.maxDepth <= (eg.windowPeak || eg.window) + 1
+      // With NO injected delay a console whose display tick trails the other's
+      // gets every input before it runs the frame and may never roll back at all
+      // — that is the premise of "under injected delay", so it needs a delay.
+      ok(`${name}: rollbacks-under-injected-delay`, (LAG > 0 ? (ph.rollbacks > 0 && pg.rollbacks > 0) : true) && ph.maxDepth <= (eh.windowPeak || eh.window) + 1 && pg.maxDepth <= (eg.windowPeak || eg.window) + 1
            && ph.missingSlot === 0 && pg.missingSlot === 0,
          `host ${ph.rollbacks} rollbacks / ${ph.resimFrames} re-sim frames (${(ph.resimFrames / secs).toFixed(1)}/s, max depth ${ph.maxDepth}, `
          + `mean ${eh.meanDepth}, ${eh.mispredicted} mispredicted inputs, slowest tick ${ph.maxTickMs} ms); `

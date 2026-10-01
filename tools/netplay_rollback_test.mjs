@@ -50,7 +50,7 @@ const padFor = (port, f) => {
 };
 
 function runRoom({ latencyMs, jitterMs = 0, rollback, guestRollback = rollback, delay = 2,
-                   guestStartMs = 40, seconds = SECONDS, dropGuestAtMs = 0, unique = false }) {
+                   guestStartMs = 40, seconds = SECONDS, dropGuestAtMs = 0, unique = false, noRewind = false }) {
   // unique: every frame's pad is distinct (b[1] = f), so the frame a sampled pad
   // lands on is unambiguous — the latency arm. (Every remote frame then
   // mispredicts, so that arm is also the worst case for rollback work.)
@@ -65,8 +65,11 @@ function runRoom({ latencyMs, jitterMs = 0, rollback, guestRollback = rollback, 
     lastAt[to] = at;
     q.push({ at, to, msg: JSON.parse(JSON.stringify(m)) });
   };
+  // rollbackOk: this toy page CAN rewind even when it does not ask for rollback
+  // itself — the host runs rollback only for consoles that declare it
+  // (lsready rb); `noRewind` is a page that cannot.
   const mk = (id, host, rb) => new L({ peerId: id, host, portCount: 2, padBytes: 2, delay, hashEvery: 30,
-                                       rollback: rb, stallBudgetMs: 0, send: send(host ? 'G' : 'H'), now: () => now });
+                                       rollback: rb, rollbackOk: !(noRewind && !host), stallBudgetMs: 0, send: send(host ? 'G' : 'H'), now: () => now });
   const E = { H: mk('H', true, rollback), G: mk('G', false, guestRollback) };
   E.H.seat('H', 1); E.H.seat('G', 1);
   const con = {};
@@ -217,6 +220,13 @@ for (const latencyMs of [0, 50, 100]) {
      `${early} hashes submitted for frames past the confirmed frontier`);
 }
 
+// ---- a guest whose page CANNOT rewind: the host falls back to input delay --
+{
+  const R = runRoom({ latencyMs: 50, rollback: WINDOW, guestRollback: 0, noRewind: true, seconds: 10 });
+  ok('a-page-that-cannot-rewind-gets-input-delay-not-rollback', R.E.H.rollback === 0 && R.E.G.rollback === 0 && R.E.H.delay >= 1,
+     `host asked for rollback ${WINDOW}; guest declared no rollback: room rollback ${R.E.H.rollback}/${R.E.G.rollback}, delay ${R.E.H.delay}/${R.E.G.delay}`);
+}
+
 // ---- a DIVERGED core must still be caught (the detector is not dead) ------
 {
   const R = runRoom({ latencyMs: 50, rollback: WINDOW, seconds: 3 });
@@ -224,7 +234,7 @@ for (const latencyMs of [0, 50, 100]) {
   // guest's step differs from frame 120 on
   let now2 = 0; const msgs = [];
   const H = new L({ peerId: 'H', host: true, portCount: 2, padBytes: 2, hashEvery: 30, rollback: WINDOW, send: (m) => msgs.push(['G', m]), now: () => now2 });
-  const G = new L({ peerId: 'G', host: false, portCount: 2, padBytes: 2, hashEvery: 30, rollback: 0, send: (m) => msgs.push(['H', m]), now: () => now2 });
+  const G = new L({ peerId: 'G', host: false, portCount: 2, padBytes: 2, hashEvery: 30, rollback: 0, rollbackOk: true, send: (m) => msgs.push(['H', m]), now: () => now2 });
   H.seat('H', 1); H.seat('G', 1);
   const pump = () => { while (msgs.length) { const [to, m] = msgs.shift(); (to === 'H' ? H : G).receive(JSON.parse(JSON.stringify(m))); } };
   pump(); H.declareReady('d'); pump(); G.declareReady('d'); pump();
