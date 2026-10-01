@@ -123,7 +123,22 @@ try {
     const snap2 = st.snapshot(); sn.g = readFull(306); st.restore(snap2); sn.h = readFull(307);
     st.restore(snap2); sn.i = readFull(308); st.release(snap2);
     R.snap = sn;
-    R.invalidations = st.invalidations; R.lastInvalidation = st.lastInvalidation;
+    R.lastInvalidation = st.lastInvalidation;
+    // DK64: a ZERO-AREA read (0,H,W,0) first, then real reads. The zero read
+    // must move nothing and change no state; the first real read after an
+    // invalidate is synchronous (its own frame), then the one-call offset —
+    // and the context must survive (it was LOST here before the fix).
+    st.invalidate('test');
+    const callsBefore = st.calls;
+    frame(400, false); HEAP.fill(0);
+    gl.readPixels(0, H, W, 0, gl.RGBA, gl.UNSIGNED_BYTE, HEAP, IDX);
+    const zero = { callsMoved: st.calls - callsBefore, heapUntouched: HEAP[IDX] === 0 && HEAP[IDX + 1] === 0 };
+    zero.own = readFull(401); zero.next = readFull(402);
+    gl.readPixels(0, H, W, 0, gl.RGBA, gl.UNSIGNED_BYTE, HEAP, IDX);
+    zero.after = readFull(403);
+    zero.lost = gl.isContextLost(); zero.dbw = gl.drawingBufferWidth;
+    R.zero = zero;
+    R.invalidations = st.invalidations;
     R.glError = gl.getError();
     R.seqLen = st.seq.length;
     return R;
@@ -151,6 +166,12 @@ try {
     (badK.length === 0 && s.pinnedAfter === s.pinnedBefore - 1)
       ? ok('snapshot/restore (rollback, run-ahead): a restored console is handed the pinned copy, twice over', JSON.stringify(s))
       : bad('snapshot/restore', JSON.stringify({ got: s, want }));
+  }
+  {
+    const z = res.zero;
+    (z.callsMoved === 0 && z.heapUntouched && z.own === 401 && z.next === 401 && z.after === 402 && !z.lost && z.dbw === 640)
+      ? ok('a zero-area read (DK64) moves nothing, changes no state, and the context survives', JSON.stringify(z))
+      : bad('zero-area read', JSON.stringify(z));
   }
   (res.glError === 0 && errs.length === 0) ? ok('no GL error, no page error') : bad('errors', JSON.stringify({ gl: res.glError, errs }));
 } finally {
