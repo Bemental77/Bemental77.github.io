@@ -161,6 +161,49 @@ extern "C" {
     int globalTriangleTrigger = 0;
     bool pilotwingsFix = false;
     bool vbuf_use_vbo = false;
+    /* how glide streams its vertices (geometry.c vbo_draw), see neil_set_vbo_mode */
+    int vbuf_orphan = 0;
+}
+/* VERTEX STREAMING MODE (glide's geometry.c vbo_draw).
+ *   0 = client-side arrays: Emscripten's emulation re-uploads the interleaved
+ *       vertices ONCE PER ATTRIBUTE on every draw (5 bufferSubData + 5
+ *       vertexAttribPointer + their binds), into a ring of temporary buffers
+ *       that earlier draws of the same frame may still be reading — the
+ *       copy-or-stall case on a tile-based GPU. Measured on MK64: ~2000
+ *       bufferSubData and ~2000 vertexAttribPointer per field.
+ *   1 = ONE VBO, ORPHANED per draw (one glBufferData with the vertices): fresh
+ *       storage each time, so no draw ever overwrites data an earlier one still
+ *       reads, and the attribute pointers are set once. THE DEFAULT.
+ *   2 = one VBO overwritten per draw (glBufferSubData) — the old iOS path.
+ *  -1 = the page's config line (config.txt line 46: a VBO only on iOS, mode 2).
+ * The same vertex bytes reach the same shaders in every mode, so the image —
+ * and the framebuffer copy that lands in RDRAM — is unchanged.
+ * Chosen before main() by neil_set_vbo_mode, else by the page's ?vbo=-1|0|1|2
+ * (n64/N64Wasm/dist/fbasync.js publishes it in both realms; the A/B arm and
+ * kill switch), else 1. */
+static int g_vbo_mode = 1, g_vbo_mode_set = 0;
+extern "C" void neil_set_vbo_mode(int m) { g_vbo_mode = (m < -1 || m > 2) ? 1 : m; g_vbo_mode_set = 1; }
+static void apply_vbo_mode(void)
+{
+#ifdef __EMSCRIPTEN__
+    if (!g_vbo_mode_set)
+    {
+        int q = EM_ASM_INT({
+            var g = (typeof globalThis !== 'undefined') ? globalThis : self;
+            var f = g.__fbAsync;
+            return (f && typeof f.vboMode === 'number' && f.vboMode >= -1 && f.vboMode <= 2) ? f.vboMode : -9;
+        });
+        if (q != -9) g_vbo_mode = q;
+    }
+#endif
+    if (g_vbo_mode >= 0)
+    {
+        vbuf_use_vbo = g_vbo_mode != 0;
+        vbuf_orphan  = g_vbo_mode == 1;
+    }
+    printf("[gl] vertex streaming: %s (mode %d)\n",
+           !vbuf_use_vbo ? "client-side arrays" : vbuf_orphan ? "one VBO, orphaned per draw" : "one VBO, overwritten per draw",
+           g_vbo_mode);
 }
 
 void connectGamepad()
@@ -763,6 +806,7 @@ int main(int argc, char* argv[])
 
     readConfig();
     readCheats();
+    apply_vbo_mode();
 
     FILE* f = fopen(rom_name, "rb");
     fseek(f, 0, SEEK_END);

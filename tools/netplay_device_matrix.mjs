@@ -81,7 +81,11 @@
 //
 // FLAGS
 //   --consoles dc,n64,gc,gen,ps1    (default all five; gba,snes are SOLO-ONLY: --solo-only)
-//   --arms a,b,c,d,drelay,e         (default a,b,c,d,drelay; e is the 10-min soak)
+//   --arms a,b,c,d,drelay,e,ct      (default a,b,c,d,drelay; e is the 10-min soak; ct: the
+//                  joiner's emulator WORKER held to --worker-cpu of one core by a
+//                  cgroup cpu quota, default 0.35 — a CPU-throttled peer the CDP
+//                  throttle cannot make, since it never reaches a worker)
+//   NPDM_MIN_FREE_GB=N  lower the disk gate (default 3; a cell needs N + 1.2 GB)
 //   --seconds N    measured seconds per cell (default 60)
 //   --soak N       seconds for arm e (default 600)
 //   --solo mobile,desktop,pair   measure the SOLO cap (no room) of these
@@ -125,7 +129,10 @@ const OUT = path.join('/tmp/npdm', NAME);
 const CHROME = process.env.CHROME_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
 const LOCK = process.env.PROBE_LOCK_DIR || '/tmp/bemental-probe.lock';
 const VOID_LOAD = +(process.env.NPDM_VOID_LOAD || 25);
-const MIN_FREE_GB = 3;
+// The disk gate (a cell needs MIN_FREE_GB + 1.2 GB free: two profiles, each
+// with a 100 MB disk cache, plus the box's other tenants). NPDM_MIN_FREE_GB
+// lowers it on a box that is known to be tight — say so in the run's notes.
+const MIN_FREE_GB = process.env.NPDM_MIN_FREE_GB != null ? +process.env.NPDM_MIN_FREE_GB : 3;
 const KEEP_PROFILES = has('keep-profiles');
 // Appended to BOTH players' hand-off URLs — a DIAGNOSTIC arm (e.g. '&rb=0' to
 // run Genesis in lockstep instead of rollback). Recorded on every cell.
@@ -138,6 +145,11 @@ const PROFILE_S = +flag('profile', '0');
 // window (e.g. to close an overlay and see whether the frame rate recovers).
 const MID_EVAL = flag('mid-eval', '');
 const SOLO_S = +flag('solo-seconds', '40');
+// Arm `ct`: the share of ONE core the throttled joiner's worker threads get.
+// 0.35 makes a PS1 rollback step (~7 ms of CPU: run + save) cost ~20 ms of wall
+// time at 50 Hz — unaffordable — while a delay-lockstep frame (the core run
+// only, ~5.5 ms) still fits its 20 ms (~16 ms).
+const WORKER_CPU = +flag('worker-cpu', '0.35');
 // Solo results from an EARLIER run (its matrix.json), so a cell can be judged
 // against a solo baseline without re-measuring it every time.
 const BASELINE = {}, BASELINE_PAIR = {}, BASELINE_MOBILE = {}, BASELINE_N = {};
@@ -215,7 +227,10 @@ const CONSOLES = {
          // page's AudioDiag counted as PRODUCED, against the 44100 Hz SPU rate
          // (lib/audiodiag.js NOMINAL_RATE.ps1, dfsound/sdl.c:80).
          soloFrames: '(window.__audioDiag ? window.__audioDiag.framesProduced : null)', soloHz: '44100',
-         aux: '(window.__audioDiag ? window.__audioDiag.framesProduced : null)', seam: 'window.__ps1Net && window.__ps1Net()' },
+         aux: '(window.__audioDiag ? window.__audioDiag.framesProduced : null)', seam: 'window.__ps1Net && window.__ps1Net()',
+         // the page's own per-second render line: frames drawn, the gap between
+         // renders and the main-thread time each render took
+         ui: "(document.getElementById('fps') || {}).textContent || null" },
 };
 
 // ---- the arms ----------------------------------------------------------------
@@ -238,6 +253,13 @@ const ARMS = {
   drelay: { id: 'drelay', what: 'desktop pair, room forced onto RELAY mode; broker 100 ms one-way + 2% loss',
             host: DESKTOP, join: DESKTOP, relay: true, broker: { delayMs: 100, loss: 0.02 } },
   e: { id: 'e', what: 'desktop pair, soak', host: DESKTOP, join: DESKTOP, soak: true },
+  // A CPU-THROTTLED PEER WHOSE EMULATOR RUNS IN A WORKER (ps1): the CDP throttle
+  // never reaches a worker (see MOBILE), so the kernel throttles it — every
+  // DedicatedWorker thread of the joiner's renderer shares WORKER_CPU of one
+  // core (a cgroup cpu quota; see workerThrottleStart). The room must not run
+  // slower because rollback was chosen: the capacity gate must move it to delay.
+  ct: { id: 'ct', what: 'desktop host + desktop joiner whose emulator worker gets a fraction of one core (cgroup cpu quota: a CPU-throttled peer)',
+        host: DESKTOP, join: { kind: 'desktop', workerCpu: true } },
   // FOUR-PORT CONSOLES (Dreamcast, GameCube, N64): three and four players, each
   // in their own browser process. On this 4-core box that is 3-4 emulators at
   // once, so these are judged against the `trio`/`quad` solo controls.
@@ -421,12 +443,27 @@ function preloadSrc(cfg) {
       t: Math.round(now() - M.t0), ready: M.readyFrames - lastReady, frame: e ? e.frame : null,
       state: e ? e.state : null, delay: e ? e.delay : null,
       stalls: rep ? rep.stalls : null, stallMs: rep ? rep.stallMs : null,
-      witness: ev(CFG.witness), frames: ev(CFG.frames), hz: ev(CFG.hz), aux: ev(CFG.aux || 'null'),
+      witness: ev(CFG.witness), frames: ev(CFG.frames), hz: ev(CFG.hz), aux: ev(CFG.aux || 'null'), ui: ev(CFG.ui || 'null'),
       aq: M.audio.quanta, aDrop: M.audio.dropouts, raf: rafN,
       lt: M.lt.n, ltMs: Math.round(M.lt.ms),
       ad: (() => { const d = window.__audioDiag; return d ? { p: d.framesProduced, c: d.framesConsumed, u: d.underruns == null ? null : d.underruns, uf: d.underrunFrames, df: d.droppedFrames, fill: d.fill } : null; })(),
       // lib/cart_audio.js's sink counters (gba/snes/genesis), page-native.
       ca: (() => { const c = window.__cartAudio; return c ? { rx: c.rxFrames, u: c.underruns, m: c.missingFrames, o: c.overflowFrames, b: c.backlog, mode: c.mode } : null; })(),
+      // THE CAPACITY GATE'S INPUTS, as this engine sees them (lib/netplay.js
+      // _capDecide): its own step (st), steps per frame (rs), corrections per
+      // frame (cr), p90 depth (dp) and need — and, on the host, every console's
+      // row. Read-only.
+      cap: (() => {
+        try {
+          if (!e || !e._capGate) return null;
+          const rb = e.rbStats || {};
+          const o = { mode: e.rollback ? 'rb' : 'delay', st: +(+e.selfStepMs || 0).toFixed(2), rs: e._capSelfRs ? +e._capSelfRs.toFixed(3) : null,
+                      cr: e._capSelfCr != null ? +e._capSelfCr.toFixed(4) : null, dp: e._capSelfDp ? e._capSelfDp() : null,
+                      need: e._capNeed == null ? null : e._capNeed, n: rb.rollbacks, rf: rb.resimFrames, md: rb.maxDepth, ws: rb.windowStalls, w: e.rollback };
+          if (e.isHost && e._capRows) o.rows = e._capRows(e._now()).map((r) => ({ st: r.st, rs: r.rs, dp: r.dp, cr: r.cr, lt: r.lt }));
+          return o;
+        } catch (x) { return { err: String(x).slice(0, 80) }; }
+      })(),
     });
     rafN = 0;
     lastReady = M.readyFrames;
@@ -582,6 +619,71 @@ async function canvasShot(page, file) {
   } catch (e) { return { showing: false, why: 'screenshot failed: ' + String(e.message || e).slice(0, 120) }; }
 }
 
+// ---- a CPU-throttled EMULATOR thread (cgroup v1 cpu quota) -------------------------
+// Every DedicatedWorker thread of this player's renderer(s) is moved into a cpu
+// cgroup whose quota is `frac` of one core per 10 ms period, re-scanned every
+// 500 ms so a worker spawned later (the core starts at game load) is caught.
+// The kernel's own nr_throttled / throttled_time (cpu.stat) is the
+// arm-difference proof: a quota that never bit throttled nothing.
+const CG_ROOT = '/sys/fs/cgroup/cpu';
+function descendantPids(pid) {
+  const kids = new Map();
+  for (const d of fs.readdirSync('/proc')) {
+    if (!/^\d+$/.test(d)) continue;
+    try {
+      const st = fs.readFileSync(`/proc/${d}/stat`, 'utf8');
+      const pp = +st.slice(st.lastIndexOf(')') + 2).split(' ')[1];
+      if (!kids.has(pp)) kids.set(pp, []);
+      kids.get(pp).push(+d);
+    } catch (e) {}
+  }
+  const out = [], q = [pid];
+  while (q.length) { const p = q.shift(); for (const k of kids.get(p) || []) { out.push(k); q.push(k); } }
+  return out;
+}
+function workerThrottleStart(P, frac) {
+  const dir = path.join(CG_ROOT, `npdm-${process.pid}-${P.role}`);
+  try {
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, 'cpu.cfs_period_us'), '10000');
+    fs.writeFileSync(path.join(dir, 'cpu.cfs_quota_us'), String(Math.max(1000, Math.round(10000 * frac))));
+  } catch (e) { P.cg = { frac, err: 'cgroup refused: ' + String(e.message || e).slice(0, 120) }; return; }
+  P.cg = { dir, frac, tids: [], threads: [] };
+  const bpid = P.browser.process() && P.browser.process().pid;
+  const scan = () => {
+    for (const pid of descendantPids(bpid)) {
+      let cmd = '';
+      try { cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8'); } catch (e) { continue; }
+      if (!cmd.includes('--type=renderer')) continue;
+      let tids = [];
+      try { tids = fs.readdirSync(`/proc/${pid}/task`); } catch (e) { continue; }
+      for (const t of tids) {
+        if (P.cg.tids.includes(+t)) continue;
+        let comm = '';
+        try { comm = fs.readFileSync(`/proc/${pid}/task/${t}/comm`, 'utf8').trim(); } catch (e) { continue; }
+        if (!/^DedicatedWorker/.test(comm)) continue;
+        try { fs.writeFileSync(path.join(dir, 'tasks'), String(t)); P.cg.tids.push(+t); P.cg.threads.push(pid + '/' + t + ' ' + comm); } catch (e) {}
+      }
+    }
+  };
+  scan();
+  P.cg.timer = setInterval(scan, 500);
+}
+function workerThrottleStat(P) {
+  if (!P.cg || !P.cg.dir) return null;
+  try {
+    const o = {};
+    for (const l of fs.readFileSync(path.join(P.cg.dir, 'cpu.stat'), 'utf8').trim().split('\n')) { const [k, v] = l.split(' '); o[k] = +v; }
+    return o;
+  } catch (e) { return null; }
+}
+async function workerThrottleEnd(P) {
+  if (!P.cg || !P.cg.dir) return;
+  clearInterval(P.cg.timer);
+  // the browser is closed by now: its threads are gone and the group empties
+  for (let i = 0; i < 20; i++) { try { fs.rmdirSync(P.cg.dir); return; } catch (e) { await sleep(250); } }
+}
+
 // ---- a player's browser ---------------------------------------------------------
 async function launchPlayer(role, device, cellTag, pre) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `npdm-${cellTag}-${role}-`));
@@ -640,11 +742,14 @@ async function launchPlayer(role, device, cellTag, pre) {
   }
   await page.evaluateOnNewDocument(pre.mqtt);
   await page.evaluateOnNewDocument(pre.hooks);
+  if (device.workerCpu) workerThrottleStart(P, WORKER_CPU);
   return P;
 }
 async function closePlayer(P) {
   if (!P) return;
+  if (P.cg && P.cg.timer) clearInterval(P.cg.timer);
   try { await P.browser.close(); } catch (e) {}
+  await workerThrottleEnd(P);
   if (!KEEP_PROFILES) { try { fs.rmSync(P.dir, { recursive: true, force: true }); } catch (e) {} }
 }
 // Absorb coi-serviceworker's first-visit reload BEFORE the room opens, so the
@@ -705,7 +810,7 @@ async function runCell(cid, aid, attempt) {
     broker = await startBroker({ port: 0 });
     if (A.broker) broker.setImpair(A.broker);
     const pre = { mqtt: mqttSource(), hooks: null };
-    const cfg = (role) => ({ role, console: cid, witness: C.witness, frames: C.frames, hz: C.hz, seam: C.seam, aux: C.aux || 'null',
+    const cfg = (role) => ({ role, console: cid, witness: C.witness, frames: C.frames, hz: C.hz, seam: C.seam, aux: C.aux || 'null', ui: C.ui || 'null',
                              p2p: A.p2p || null, relay: !!A.relay });
     const code = mkCode();
     cell.code = code;
@@ -849,6 +954,7 @@ async function runCell(cid, aid, attempt) {
         }, m).catch((e) => ({ collectError: String(e.message || e) }));
         d.errors = P.errors.slice(); d.errorStacks = (P.errorStacks || []).slice(0, 4); d.consoleErrors = P.consoleErrors.slice(0, 20); d.consoleErrorCount = P.consoleErrors.length;
         d.throttled = P.throttled; d.throttleRejected = P.throttleRejected; d.throttleProof = P.throttleProof || null;
+        if (P.cg) d.workerThrottle = { frac: P.cg.frac, err: P.cg.err || null, threads: (P.cg.threads || []).slice(0, 16), stat: workerThrottleStat(P) };
         d.device = P.device;
         cell.players[P.role] = d;
       }
@@ -1024,17 +1130,25 @@ function soloRate(s) {
 function analysePlayer(d, peerRole) {
   const r = { };
   if (!d || !d.win) return null;
-  const W = d.win.filter((w) => w.ready != null);
-  const hz = d.hz || (W.length && W[W.length - 1].hz) || 60;
+  // ⚠ A CONSOLE WHOSE FRAME RATE CHANGES MID-RUN is judged per second at THAT
+  // second's own rate, and the one second in which the rate changed is left
+  // out (its frames ran at two rates; neither is right for all of them). PS1
+  // Monster Rancher 2 boots at 59.94 Hz and its GPU switches to 50 Hz video
+  // ~4-6 s in (wasmpsx_worker.js "THE VBLANK RATE FOLLOWS THE GPU"): judged at
+  // the final 50 Hz, the boot's 60 frames/s read as a 1.19x "fast-forward".
+  const W0 = d.win.filter((w) => w.ready != null);
+  const hz = d.hz || (W0.length && W0[W0.length - 1].hz) || 60;
+  const W = W0.filter((w, i) => !(i > 0 && W0[i - 1].hz && w.hz && W0[i - 1].hz !== w.hz))
+    .map((w) => Object.assign({}, w, { x: w.ready / (+w.hz || +hz) }));
+  r.hzSwitchWindowsDropped = W0.length - W.length;
   const secs = W.length;
-  const ready = W.reduce((a, w) => a + w.ready, 0);
   r.hz = +(+hz).toFixed(3);
-  r.engineX = secs ? +((ready / secs) / hz).toFixed(4) : null;
+  r.engineX = secs ? +(W.reduce((a, w) => a + w.x, 0) / secs).toFixed(4) : null;
   let maxWin5 = 0;
-  for (let i = 0; i + 5 <= W.length; i++) { const s = W.slice(i, i + 5).reduce((a, w) => a + w.ready, 0) / 5 / hz; if (s > maxWin5) maxWin5 = s; }
+  for (let i = 0; i + 5 <= W.length; i++) { const s = W.slice(i, i + 5).reduce((a, w) => a + w.x, 0) / 5; if (s > maxWin5) maxWin5 = s; }
   r.maxWin5 = +maxWin5.toFixed(4);
   let minWin5 = Infinity;
-  for (let i = 0; i + 5 <= W.length; i++) { const s = W.slice(i, i + 5).reduce((a, w) => a + w.ready, 0) / 5 / hz; if (s < minWin5) minWin5 = s; }
+  for (let i = 0; i + 5 <= W.length; i++) { const s = W.slice(i, i + 5).reduce((a, w) => a + w.x, 0) / 5; if (s < minWin5) minWin5 = s; }
   r.minWin5 = minWin5 === Infinity ? null : +minWin5.toFixed(4);
   const wit = W.map((w) => w.witness).filter((x) => typeof x === 'number' && isFinite(x));
   r.witnessX = wit.length ? +(wit.reduce((a, b) => a + b, 0) / wit.length).toFixed(4) : null;

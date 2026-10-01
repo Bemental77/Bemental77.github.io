@@ -12,14 +12,26 @@
 //   __n64InstallFbAsync(G, search)   installs G.__fbAsync, G.__fbDecide and the
 //                                    WebGL2RenderingContext.prototype.readPixels
 //                                    wrapper of the realm it is called in.
+//
+// Query switches it reads (the page's query string, in either realm):
+//   ?fbasync=1|0     force the asynchronous readback on / off (default: per title)
+//   ?fbwitness=1     record a hash of every hand-over (st.seq)
+//   ?fbprefetch=0    no early hand-over (st.prefetch is a no-op) — A/B arm, kill switch
+//   ?vbo=-1|0|1|2    the core's vertex streaming mode, read by the core at main()
+//                    (mymain.cpp apply_vbo_mode) from G.__fbAsync.vboMode: this file
+//                    is the one both realms install before main() runs. Default 1.
 (function (root) {
   root.__n64InstallFbAsync = function (G, search) {
     if (G.__fbAsync) return G.__fbAsync;   // once per realm
   var FB_Q = new URLSearchParams(search);
   var FB_FORCE = FB_Q.get('fbasync');                 // '1' | '0' | null (= per title)
   var FB_WITNESS = FB_Q.get('fbwitness') === '1';
+  // ?fbprefetch=0: no early hand-over (st.prefetch is a no-op) — the A/B arm and kill switch.
+  var FB_PREFETCH = FB_Q.get('fbprefetch') !== '0';
   G.__fbAsync = { on: FB_FORCE === '1', decided: FB_FORCE === '1' ? 'forced on (?fbasync=1)' : null,
                        calls: 0, async: 0, sync: 0, blocked: 0, invalidations: 0, pinned: 0, pool: 0,
+                       prefetchOn: FB_PREFETCH, prefetched: 0, prefetchBlocked: 0, early: 0,
+                       vboMode: FB_Q.has('vbo') ? +FB_Q.get('vbo') : undefined,
                        seq: FB_WITNESS ? [] : null };
   // Glide64_Ini.c's read_always = 1 branches, by the name each one tests
   // (HAVE_HWFBE is not defined in this build, so the #ifndef branches apply).
@@ -76,8 +88,44 @@
           gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
         }
         b.key = key; b.refs = 1;
+        b.cpuOk = false;                                     // about to be rewritten: any early copy is stale
         st.pool = fb.pool.length;
         return b;
+      };
+      // Read a pack buffer's bytes into its own CPU-side copy (b.cpu). The bytes
+      // are those its readPixels wrote — WHEN this runs moves only how long the
+      // GPU has had, never what is read (a pack buffer is written once, then only
+      // read, until it is acquired again — which clears cpuOk).
+      var fetchCpu = function (b) {
+        var gl = b.gl;
+        if (!b.cpu || b.cpu.length !== b.bytes) b.cpu = new Uint8Array(b.bytes);
+        var blocked = !!(b.fence && gl.getSyncParameter(b.fence, gl.SYNC_STATUS) !== gl.SIGNALED);
+        var was = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, b.buf);
+        gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, b.cpu);
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, was);
+        b.cpuOk = true;
+        return blocked;
+      };
+      // EARLY HAND-OVER. The core calls this at the START of a display list
+      // (glide64_rdp.c ProcessDList, read_always titles), before it queues that
+      // list's draws. The copy the NEXT readPixels will hand over is the one
+      // pending NOW, so it is read here, while the GPU process has nothing of
+      // the new frame queued in front of it: the wait is for the PREVIOUS
+      // frame's copy, which has had the whole guest CPU time between the two
+      // lists to finish. Without it the read happened after the new frame's
+      // draws and its own readPixels were queued, and (getBufferSubData being a
+      // synchronous round trip through the in-order command stream) the core
+      // waited for the frame it had just drawn — the one-call offset bought
+      // nothing. The bytes the core receives are identical either way.
+      st.prefetch = function () {
+        if (!st.on || !FB_PREFETCH) return;
+        for (var c = 0; c < ctxs.length; c++) {
+          var p = ctxs[c].__fb.pending;
+          if (!p || p.cpuOk) continue;
+          if (fetchCpu(p)) st.prefetchBlocked++;
+          st.prefetched++;
+        }
       };
       var dropPending = function () {
         for (var c = 0; c < ctxs.length; c++) { var fb = ctxs[c].__fb; if (fb.pending) { unref(fb.pending); fb.pending = null; } }
@@ -155,13 +203,27 @@
         var fb = fbOf(gl);
         // A different rect than the pending copy: it is from before the switch.
         if (fb.pending && fb.pending.key !== key) { unref(fb.pending); fb.pending = null; st.invalidations++; st.lastInvalidation = 'rect'; }
-        // 1. start this call's copy into a free pack buffer — no wait
+        var dstView = new Uint8Array(dst.buffer, dstByte, bytes);
+        var prev = fb.pending, blocked = false;
+        // 1. hand the core the PREVIOUS copy — complete, blocking if it must —
+        // BEFORE this call's readPixels is queued, so the synchronous read never
+        // has this frame's copy in front of it in the command stream. Already
+        // read by st.prefetch (the start of this display list): just copy it.
+        if (prev) {
+          if (prev.cpuOk) { dstView.set(prev.cpu); st.early++; }
+          else {
+            blocked = !!(prev.fence && gl.getSyncParameter(prev.fence, gl.SYNC_STATUS) !== gl.SIGNALED);
+            gl.bindBuffer(gl.PIXEL_PACK_BUFFER, prev.buf);
+            gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, dstView);
+          }
+          if (blocked) st.blocked++;
+        }
+        // 2. start this call's copy into a free pack buffer — no wait
         var cur = acquire(gl, bytes, key);
         gl.bindBuffer(gl.PIXEL_PACK_BUFFER, cur.buf);
         orig.call(gl, x, y, w, h, format, type, 0);
         cur.fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
-        var dstView = new Uint8Array(dst.buffer, dstByte, bytes);
-        if (!fb.pending) {
+        if (!prev) {
           // Nothing older exists (first call, or just dropped): hand over THIS
           // copy — the synchronous read — and keep it pending as well, so the
           // NEXT call hands over this one: the one-call offset from here on.
@@ -172,12 +234,6 @@
           fb.pending = cur;
           return;
         }
-        // 2. hand the core the PREVIOUS copy — complete, blocking if it must
-        var prev = fb.pending;
-        var blocked = !!(prev.fence && gl.getSyncParameter(prev.fence, gl.SYNC_STATUS) !== gl.SIGNALED);
-        if (blocked) st.blocked++;
-        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, prev.buf);
-        gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, dstView);
         gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
         unref(prev);                                         // consumed (a pinned copy survives)
         fb.pending = cur;

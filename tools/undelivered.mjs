@@ -15,6 +15,7 @@
 // rewritten. A todo list that can quietly go out of date is worse than none.
 // ---------------------------------------------------------------------------
 import { readFileSync, existsSync } from 'fs';
+import { createHash } from 'crypto';
 
 const read = (p) => (existsSync(p) ? readFileSync(p, 'utf8') : '');
 
@@ -99,17 +100,33 @@ const OPEN = [
   // Mario Party 4 in a room. Its wording understated the blockers and its test
   // watched the wrong file. The two entries below are what is actually left,
   // and both test a live code shape in the file the gap is IN.
+  // ── CLOSED 2026-10-01: 'gamecube-rooms-do-not-agree-a-memory-card-set' ───────
+  // It said two GameCube consoles in one room start from DIFFERENT memory cards,
+  // and it was true: each adopted its own IndexedDB card before _main(), and the
+  // card shim also stamped THIS machine's wall clock into guest memory. Now the
+  // room plays on ONE card — the host's, or one blank card — at the host's card
+  // clock: it travels through ls.contributeCards() gzipped, every console checks
+  // the raw fingerprint before booting it, the choice rides in the disc tag the
+  // barrier compares (gamecube.html gcLsAgreeCard / gcLsDisc), and only the host
+  // persists what the room saves. The fingerprint it was "detected" by is now the
+  // whole guest state, because tools/gc_netplay_det_test.mjs measured the whole
+  // linear memory byte-identical across browser processes.
   {
-    id: 'gamecube-rooms-do-not-agree-a-memory-card-set',
-    what: 'Two GameCube consoles in one room start from DIFFERENT memory cards.',
-    why: 'Each machine adopts its own IndexedDB card image before _main() (the recomp card shim), and nothing agrees a set the way dreamcast.html does with ls.contributeCards(). That is a divergence SOURCE sitting inside a frame-gated room. As of 2026-09-10 it is at least DETECTED rather than silent — the card image is part of what the new state fingerprint hashes, so two consoles holding different cards now raise a desync naming the frame instead of quietly playing different games. Detected is not fixed: the room reports the fork and stops, where dreamcast.html trades the cards before frame 0 so there is no fork to report.',
-    evidence: 'gamecube.html has no contributeCards() call, while dreamcast.html builds a card set, verifies each contributor\'s fingerprint and installs it before the barrier. gamecube/tools/gc_room_test.mjs now proves the DETECTOR (a-REAL-divergence-is-detected-and-named) but nothing agrees a set.',
-    // ⚠ ANCHORED ON A CALL, NOT A MENTION. The bare word appears in this page's
-    // OWN COMMENT explaining that it does not do this — so a plain
-    // /contributeCards/ test matched the prose describing the gap and declared
-    // the gap closed. Fourth time a verify here has matched a comment rather
-    // than code. A call site has a receiver and a paren; a sentence does not.
-    verify: () => !/\.contributeCards\s*\(/.test(read('gamecube.html')),
+    id: 'mario-party-4-recomp-stops-at-an-overlay-it-was-not-built-with',
+    what: 'The Mario Party 4 recomp (the engine GameCube rooms run on) STOPS when the game needs an overlay it was not built with — a party cannot get past the first board\'s first minigame/event scene.',
+    why: 'gamecube/recomp/build_wasm.sh AOT-dispatches exactly four overlays — OVL_BOOT, OVL_MODESEL, OVL_MENT and OVL_W01 (the first board) — so when a board asks for any other overlay (a minigame, an event scene, another board) omWatchOverlayProc calls a null entry: `null function or function signature mismatch` (seed 4 of the board masher at frame 12,737; a 2-tab ROOM on the board at frame 13,688 — on BOTH consoles at the same frame, no desync) or `table index is out of bounds`. Separately, Start-mashing through the menus reaches `memory access out of bounds` in LoadHSF <- Hu3DModelCreate inside modeseldll, and one seed hangs at frame 7,963 in a loop that makes no host call. All of these were hidden behind a FREEZE until 2026-10-01: HuAudSndGrpSetSet (and omWatchOverlayProc) busy-wait on OSGetTick, and this port\'s clock moved only at a retrace (fixed in recomp_worker.js THE TIMEBASE DURING A BUSY-WAIT; running the AI callbacks inside the wait, boot msg spinAudio, does not move the LoadHSF trap frame). Compiling the other overlays needs a rebuild of mp4_game.wasm from the decomp tree (~/gc_refs/marioparty4), which is not on the build box. In a room the simulation is shared, so every console stops on the same frame and the party panel says it was the game, not the room (gamecube.html window.__gcTrap).',
+    evidence: 'tools/gc_netplay_det.html ?hash=0: script=mash2 (Start-mashing) seeds 1-6 — HEAD worker HANGS at frames 5122-6394 on all six, the fixed worker reaches 20,000 on seed 3 and traps on 1/2/5/6 (frames 5680-7527); script=mash (board chain + masher) seeds 1-4 — 25,000 frames on 1 and 3, hang at 7963 on 2, null-function trap at 12,737 on 4. tools/gc_netplay_room_test.mjs CHAIN=1: both consoles stopped at frame 13,688 with 228/228 fingerprints agreed.',
+    // the shipped binary: a rebuilt mp4_game.wasm makes this entry stale and forces re-checking
+    verify: () => existsSync('gamecube/recomp/mp4_game.wasm') &&
+      createHash('md5').update(readFileSync('gamecube/recomp/mp4_game.wasm')).digest('hex') === '7040471c12551e8ebb57bffe94691944',
+  },
+  {
+    id: 'gamecube-room-is-delay-lockstep-not-rollback',
+    what: 'A GameCube room (Mario Party 4) delays every player\'s own input by the room\'s delay frames — it is delay lockstep, not zero-lag rollback.',
+    why: 'Rollback needs a savestate EVERY frame and a re-simulation burst on a misprediction. Re-simulation is cheap here (guest compute p50 0.4 ms, p95 7 ms per frame, measured in the worker); the SAVESTATE is not. The recomp\'s exact state is the whole guest — [0, heap top) + MEM1 = 63.5-65.6 MB, ~25-28 MB of it non-zero — and per frame only 29 pages (1.8 MB) change at p50 and 80 (5 MB) at p95, but wasm has no write barrier, so FINDING those pages costs a full sweep (~20 ms at the 3.4 GB/s the hasher measured) and copying the whole state out/in measured 15-480 ms each way on the dev box (load-dependent). Either way one snapshot costs most or all of a 16.7 ms frame before the game runs, so a per-frame ring is unaffordable. A dirty-page snapshot needs the stores instrumented at compile time — a rebuild of gamecube/recomp/mp4_game.wasm from the decomp tree (~/gc_refs/marioparty4), which is not on the build box.',
+    evidence: 'tools/gc_netplay_det_test.mjs: rollback-cost lines (snapshot MB, copy-out/copy-in ms) and "pages CHANGED per frame"; gamecube.html gcLsStep never reads ls.rollback.',
+    // a live code shape: the frame gate branching on the room's rollback window
+    verify: () => !/if\s*\(\s*ls\.rollback\b/.test(read('gamecube.html')),
   },
   {
     id: 'gamecube-lockstep-is-mario-party-4-only',

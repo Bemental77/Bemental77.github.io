@@ -30,6 +30,43 @@
 //            | {cmd:'stateError', op, txt}
 
 let Module = null, viRetrace = 0;
+// ---- THE TIMEBASE DURING A BUSY-WAIT ------------------------------------------------------
+// The guest clock is viRetrace * 675000 (675,000 ticks of the 40.5 MHz timebase = exactly 1/60 s),
+// so it moves only at a retrace. A guest that BUSY-WAITS on it — `while (OSGetTick() - t0 < n);`,
+// the SDK/MusyX delay idiom — never reaches the next retrace and so never sees it move: the
+// worker freezes forever with no trap. MEASURED 2026-10-01 by tools/gc_netplay_det_test.mjs: a
+// scripted input run hung at frame 5727, identically in two browser processes, right after
+// "objman>Call objectsetup / SOUND ####", and this file's spin detector tallied 200,001 of
+// 200,001 host calls as OSGetTick.
+// On hardware the timebase advances while the CPU spins. Here: the first TB_FREE_READS clock
+// reads in a frame return the frame-quantized time exactly as before (normal code reads the
+// clock a handful of times per frame, so it sees no change), and each read beyond that advances
+// a MONOTONIC offset by TB_SPIN_TICKS — roughly one poll-loop iteration on a 486 MHz Gekko. The
+// offset is never reset, so the clock never runs backwards at the next retrace, and it is a pure
+// function of the guest's own call sequence, so every console in a room computes the same time.
+// It travels in the save-state header with viRetrace.
+const TB_FREE_READS = 4096, TB_SPIN_TICKS = 64;
+let tbExtra = 0, tbReads = 0;
+let tbEngaged = 0, tbSpinAudio = false, tbSpinAcc = 0;
+function tbNow() {
+  if (++tbReads > TB_FREE_READS) {
+    tbExtra += TB_SPIN_TICKS;
+    // The AI interrupt keeps firing while a real CPU spins: every 675,000 ticks the wait consumes
+    // is one video frame of audio, so run that frame's AI DMA callbacks (pumpAudio -> MusyX's
+    // registered AI callback). Voices then progress and a wait on them can end the way it does on
+    // hardware rather than by its timeout. (boot msg spinAudio)
+    if (tbSpinAudio) { tbSpinAcc += TB_SPIN_TICKS; while (tbSpinAcc >= 675000) { tbSpinAcc -= 675000; pumpAudio(); } }
+    // Say WHERE, once per episode (bounded): the JS stack carries the guest's wasm frames by name.
+    if (tbReads === TB_FREE_READS + 1 && tbEngaged < 12) {
+      tbEngaged++;
+      const st = String(new Error().stack || '').split('\n').filter((l) => /wasm/.test(l)).slice(0, 8)
+        .map((l) => l.trim().replace(/^at /, '').replace(/ \(wasm:\/\/.*$/, '')).join(' <- ');
+      postMessage({ cmd: 'log', txt: '[recomp-worker] busy-wait clock engaged at frame ' + viRetrace +
+                    ' (a guest loop read the timebase ' + TB_FREE_READS + ' times in one frame) in ' + st });
+    }
+  }
+  return tbExtra;
+}
 let paceI32 = null;
 let inputScript = null;   // frame -> [btn, dstk, stkx, stky] canned choreography (?board=1)
 let peekAddrs = null;      // debug: guest offsets to hex-dump every 1200 frames (boot msg)
@@ -583,13 +620,11 @@ const PEEK_CELLS = 16;            // 64 bytes each
 // reason that the recomp published no deterministic state hash. These three
 // cells are that hash.
 //
-// ⚠ WHAT IS HASHED AND WHY ONLY THAT. The GUEST WINDOW ONLY (MEM1 at
-// 0x80000000). This is a native port, not an emulator: the recomp's own
-// .data/.bss, C heap and fiber stacks sit in the same linear memory and hold
-// HOST pointers, allocation order and Asyncify bookkeeping that differ between
-// two browsers WITHOUT the simulation having diverged at all. Hashing those
-// would report a divergence on every healthy room, which is worse than no
-// fingerprint: an alarm that is always on gets switched off.
+// WHAT IS HASHED: every page of linear memory that holds state — see THE STATE
+// FINGERPRINT below. (This note used to say the native port's own heap and
+// stacks "hold host pointers that differ between two browsers" and must not be
+// hashed. Measured 2026-10-01 by tools/gc_netplay_det_test.mjs: they do not —
+// the whole linear memory is byte-identical across browser processes.)
 // ⚠ PLACED AT 200, NOT DIRECTLY AFTER THE PEEK WINDOWS. Cells immediately past
 // the old end of the layout did not behave as private: values written there
 // came back as things this file never stored. Rather than litigate ownership of
@@ -671,95 +706,215 @@ function publishPeek() {
 }
 
 // ---------------------------------------------------------------------------
-// THE STATE FINGERPRINT.
+// THE STATE FINGERPRINT — THE WHOLE GUEST, SWEPT.
 //
-// Sampled, not exhaustive: MEM1 is 24 MiB and hashing all of it every frame
-// would cost more than the frame. A strided FNV-1a over one word in every 64
-// touches ~384 KiB per hash and still covers the whole window, so a divergence
-// anywhere in guest RAM is caught within a few hashes rather than never.
+// [2026-10-01] This used to hash two small things (the pad-witness block and 1 word in 64 of the
+// card image) on the stated ground that "linear memory here is 300 MB, so 0x80000000 is 1.5 GB
+// past the end" and that the rest of a native port's memory "holds host pointers, malloc order
+// and Asyncify bookkeeping that differ between two healthy browsers". BOTH PREMISES WERE WRONG,
+// and both are now MEASURED rather than argued:
+//   * boot() grows the memory to 0x82000000 before _main() (the resize below), and the
+//     determinism rig read memSize = 33,280 pages = 0x82000000 on every arm;
+//   * tools/gc_netplay_det_test.mjs ran this worker in SEPARATE BROWSER PROCESSES with fresh
+//     profiles, one uncapped and one paced at 1.000x, on the same scripted input, and found
+//     LOW + MEM1 + HIGH identical on EVERY frame and every 64 KiB page of the whole linear
+//     memory identical at every checkpoint. A native port of deterministic C, fed the same
+//     inputs, is the same bytes — there is no per-browser pointer anywhere in it.
+// So the fingerprint now covers EVERY page that holds state: LOW (MP4's statics, the ARAM array,
+// the card image, the C heap and every fiber stack — [0, lowCap)), MEM1 (the game's arena) and
+// HIGH (the FST page and above). A divergence anywhere in the guest is caught; the old version
+// could only see one confined to 192 bytes of pad state or 1/64th of the card.
 //
-// ⚠ EVERY CONSOLE MUST HASH THE SAME FRAME. The frame number travels WITH the
-// hash and lib/netplay.js compares like for like; a hash without its frame is
-// two machines comparing different moments and calling it a fork.
-const FP_EVERY = 30;              // guest frames between fingerprints
+// ROLLING, so it never costs a frame: one sweep hashes 1/FP_EVERY of the pages on each of
+// FP_EVERY consecutive frames and publishes on the last one. Every console hashes page k on the
+// same guest frame (the plan is a pure function of the frame number and of state that is itself
+// identical), so equal machines publish equal hashes. ~84 MB per 60 frames = ~1.4 MB/frame,
+// about 0.4 ms at the 3.4 GB/s the hasher measured.
+//
+// lowCap ADAPTS: the next sweep covers the highest non-zero LOW page this sweep saw plus a
+// 16 MiB margin (never below 48 MiB), so a C heap that grows is followed rather than missed.
+//
+// ⚠ EVERY CONSOLE MUST HASH THE SAME FRAME. The frame number travels WITH the hash and
+// lib/netplay.js compares like for like; viRetrace is that frame on every machine.
+const FP_EVERY = 60;              // guest frames per sweep (= between fingerprints)
+const FP_LOW_MIN = 768;           // pages: never sweep less than 48 MiB of LOW
+const FP_LOW_MARGIN = 256;        // pages: 16 MiB above the highest non-zero LOW page
+let fpLow = FP_LOW_MIN, fpNext = 0, fpAcc = 0, fpMaxNz = -1, fpLive = false;
 
-// ⚠ WHAT IS HASHED, AND WHY NOT "GUEST RAM".
-//
-// The first attempt hashed 24 MiB at linear offset 0x80000000, on the strength
-// of a comment in this file calling that "the guest MEM1 window". It published
-// NOTHING, every frame, silently: linear memory here is 300 MB, so that offset
-// is a gigabyte and a half past the end. The comment describes a configuration
-// this build is not in. Measured, not assumed — the module was asked:
-//
-//   ___recomp_pad_witness() = 19093136   ___recomp_card_base() = 16946112
-//   ___recomp_aram_base()   = 168880     wasmMemory            = 300 MB
-//
-// and both consoles returned IDENTICAL values, which is what makes hashing at
-// these addresses meaningful at all.
-//
-// So the fingerprint covers two things with known extent that are unambiguously
-// GUEST state, rather than a broad sweep of a native port's linear memory —
-// which holds host pointers, malloc order and Asyncify bookkeeping that differ
-// between two healthy browsers and would report a fork on every room:
-//
-//   1. THE GAME'S OWN LIVE STATE — the ___recomp_pad_witness() block: MP4's
-//      HuPadBtnDown/HuPadBtn/HuPadDStkRep/HuPadStkX/HuPadStkY/HuPadErr/winKey/
-//      GWPlayerCfg, read by C symbol. It changes every frame and is exactly
-//      what diverges first when two machines stop agreeing about the game.
-//   2. THE MEMORY CARD IMAGE — strided. Each console adopts its OWN card from
-//      IndexedDB before _main(), which is a known divergence SOURCE this gate
-//      does not close; including it here means that fork is REPORTED instead of
-//      silent.
-//
-// ⚠ THIS IS NOT A WHOLE-STATE HASH, and must not be described as one. It will
-// catch a divergence that reaches the game's own variables or the card, which
-// is the class that matters, and it can miss one confined to memory it does not
-// cover. That is a smaller claim than "fingerprinted" and it is the true one.
-const FP_CARD_STRIDE = 64;        // words: sample 1 in 64 of the card image
+// The hash of an all-zero 64 KiB page, computed from the hasher's own definition rather than by
+// hashing some page assumed to be untouched.
+let zeroPageHash = null;
+function zeroHash() {
+  if (zeroPageHash === null) {
+    let acc = 0xcbf29ce484222325n;
+    for (let i = 0; i < HPAGE / 8; i++) acc = BigInt.asUintN(64, acc * 0x100000001b3n);
+    zeroPageHash = Number(BigInt.asUintN(32, acc ^ (acc >> 32n))) | 0;
+  }
+  return zeroPageHash;
+}
+function fpPageAddr(i) {
+  if (i < fpLow) return i * HPAGE;
+  i -= fpLow;
+  return MEM1_LO + i * HPAGE;           // MEM1 then HIGH are contiguous: MEM1_HI == HIGH start
+}
 
 function publishFingerprint(frame) {
-  if (!Module || !paceI32 || paceI32.length <= FP_DIAG) return;
-  if ((frame % FP_EVERY) !== 0) return;
-  let h = 0x811c9dc5;
-  let covered = 0;
+  if (!Module || !paceI32 || paceI32.length <= FP_INJECT) return;
+  // Only a ROOM consumes it, and the page sets LS_ARMED before the first credit — so a room
+  // sweeps from frame 1 and a solo game pays nothing for it.
+  if (!Atomics.load(paceI32, LS_ARMED)) { fpLive = false; return; }
+  const phase = (frame - 1) % FP_EVERY;
+  const highPages = (Module.wasmMemory.buffer.byteLength - MEM1_LO) / HPAGE;   // MEM1 + HIGH
+  const total = fpLow + highPages;
+  if (phase === 0) { fpNext = 0; fpAcc = 0x811c9dc5; fpMaxNz = -1; fpLive = true; }
+  if (!fpLive) return;                  // joined mid-sweep (a state load): wait for the next one
+  const zh = zeroHash();
+  const end = Math.ceil(total * (phase + 1) / FP_EVERY);
   try {
-    const buf = Module.wasmMemory.buffer;
-    if (Module.___recomp_pad_witness) {
-      const at = Module.___recomp_pad_witness() >>> 0;
-      if (at && at + WIT_CELLS * 4 <= buf.byteLength) {
-        const w = new Uint32Array(buf, at, WIT_CELLS);
-        for (let i = 0; i < w.length; i++) h = Math.imul((h ^ w[i]) >>> 0, 0x01000193) >>> 0;
-        covered++;
-      }
+    for (; fpNext < end; fpNext++) {
+      const a = fpPageAddr(fpNext);
+      const h = stateHash(a, a + HPAGE, 0);
+      if (fpNext < fpLow && h !== zh) fpMaxNz = fpNext;
+      fpAcc = Math.imul((fpAcc ^ h) >>> 0, 0x01000193) >>> 0;
     }
-    if (Module.___recomp_card_base && Module.___recomp_card_size) {
-      const cb = Module.___recomp_card_base() >>> 0, cs = Module.___recomp_card_size() >>> 0;
-      if (cb && cs >= 4 && cb + cs <= buf.byteLength) {
-        const c = new Uint32Array(buf, cb, cs >>> 2);
-        for (let i = 0; i < c.length; i += FP_CARD_STRIDE) h = Math.imul((h ^ c[i]) >>> 0, 0x01000193) >>> 0;
-        covered++;
-      }
-    }
-  } catch (e) { Atomics.store(paceI32, FP_DIAG, -1); return; }
-  Atomics.store(paceI32, FP_DIAG, covered);
-  // Nothing readable means nothing to say. Publishing a hash over zero bytes
-  // would make two consoles "agree" without either having looked at the guest —
-  // which is precisely the false green this replaced.
-  if (!covered) {
+  } catch (e) {
+    fpLive = false;
+    Atomics.store(paceI32, FP_DIAG, -1);
     if (!publishFingerprint._said) {
       publishFingerprint._said = 1;
-      postMessage({ cmd: 'print', txt: '[gc-lockstep] ⚠ NO STATE FINGERPRINT: neither the pad-witness ' +
-                    'block nor the card image is readable, so a divergence would go undetected' });
+      postMessage({ cmd: 'print', txt: '[gc-lockstep] ⚠ NO STATE FINGERPRINT: the sweep threw (' +
+                    ((e && e.message) || e) + ') — a divergence would go undetected' });
     }
     return;
   }
+  if (phase !== FP_EVERY - 1) return;
+  let h = fpAcc;
   const inject = Atomics.load(paceI32, FP_INJECT) | 0;
   if (inject) h = Math.imul((h ^ inject) >>> 0, 0x01000193) >>> 0;
+  Atomics.store(paceI32, FP_DIAG, total);              // pages this sweep covered
   Atomics.store(paceI32, FP_FRAME, frame | 0);
   Atomics.store(paceI32, FP_HASH, h | 0);
   Atomics.store(paceI32, FP_SEQ, (Atomics.load(paceI32, FP_SEQ) + 1) | 0);
+  fpLow = Math.max(FP_LOW_MIN, fpMaxNz + 1 + FP_LOW_MARGIN);
 }
 
+// ---------------------------------------------------------------------------
+// WHOLE-STATE HASHING — the instrument the determinism question needed.
+//
+// A tiny hand-assembled wasm module that IMPORTS THE GAME'S OWN WebAssembly.Memory and runs an
+// i64 xor-multiply sweep over a byte range: h(ptr, end, seed) -> i32. Measured 3.4 GB/s on the
+// dev box against 1.7 GB/s for the equivalent Uint32 loop in JS, and checked bit-for-bit against
+// a BigInt reference before it was trusted. ptr/end must be 8-aligned (every caller passes
+// 64 KiB page bounds). Importing the memory rather than copying it is what makes this cheap:
+// nothing is allocated, and a grown memory is still the same Memory object.
+function hasherBytes() {
+  const sleb64 = (v) => {
+    v = BigInt.asIntN(64, v); const out = [];
+    for (;;) { const b = Number(v & 0x7fn); v >>= 7n;
+      if ((v === 0n && !(b & 0x40)) || (v === -1n && (b & 0x40))) { out.push(b); return out; }
+      out.push(b | 0x80); }
+  };
+  const sec = (id, c) => [id, c.length, ...c];          // every section here is < 128 bytes
+  const body = [1, 1, 0x7e,                              // one i64 local ($acc = local 3)
+    0x20, 2, 0xad, 0x42, ...sleb64(0xcbf29ce484222325n), 0x85, 0x21, 3,
+    0x02, 0x40, 0x03, 0x40,
+      0x20, 0, 0x20, 1, 0x4f, 0x0d, 1,
+      0x20, 3, 0x20, 0, 0x29, 3, 0, 0x85, 0x42, ...sleb64(0x100000001b3n), 0x7e, 0x21, 3,
+      0x20, 0, 0x41, 8, 0x6a, 0x21, 0, 0x0c, 0,
+    0x0b, 0x0b,
+    0x20, 3, 0x20, 3, 0x42, 32, 0x88, 0x85, 0xa7, 0x0b];
+  return new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
+    ...sec(1, [1, 0x60, 3, 0x7f, 0x7f, 0x7f, 1, 0x7f]),
+    ...sec(2, [1, 3, 0x65, 0x6e, 0x76, 6, 0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, 2, 0, 0]),
+    ...sec(3, [1, 0]), ...sec(7, [1, 1, 0x68, 0, 0]),
+    ...sec(10, [1, body.length, ...body])]);
+}
+let hashFn = null;
+function stateHash(lo, hi, seed) {
+  if (!hashFn) hashFn = new WebAssembly.Instance(new WebAssembly.Module(hasherBytes()),
+                                                 { env: { memory: Module.wasmMemory } }).exports.h;
+  return hashFn(lo >>> 0, hi >>> 0, seed | 0) | 0;
+}
+const HPAGE = 65536;
+const MEM1_LO = 0x80000000, MEM1_HI = 0x81800000;
+// The guest's state is not only MEM1. This is a NATIVE PORT: MP4's globals (the board, the
+// players, the RNG seed, HuPadBtnDown...) are C statics in the module's .data/.bss at the BOTTOM
+// of linear memory, beside the C heap and the fiber stacks. MEM1 holds only what the game
+// allocates from its own arena (OSInit sets ArenaLo/Hi into 0x80000000..0x81800000). So "the
+// guest state" = [0, lowTop) + MEM1, where lowTop is the end of the highest non-zero page
+// below MEM1, found by scanning (sbrk's pointer is not exported).
+function lowTopScan() {
+  const zh = zeroHash();
+  for (let p = (MEM1_LO / HPAGE) - 1; p >= 0; p--)
+    if (stateHash(p * HPAGE, (p + 1) * HPAGE, 0) !== zh) return (p + 1) * HPAGE;
+  return 0;
+}
+
+// DETERMINISM MODE (boot msg `det`) — a measurement arm, never on in a visitor's page. Each frame,
+// at one fixed point of the VI stub, hash LOW [0,lowTop), MEM1 and HIGH [MEM1_HI, memSize) and
+// post them in batches; every `pageEvery` frames post a hash per 64 KiB page of the WHOLE linear
+// memory so a mismatch can be localised to the page; stop at `until` and park. Two browser
+// contexts fed the same inputs either agree on every row or name the first frame they did not.
+let det = null;
+function detFrame(frame) {
+  if (det.hash === false) {                 // run-to-a-frame only (e.g. to produce a card image)
+    if (frame >= det.until) { postMessage({ cmd: 'detDone', frame }); for (;;) Atomics.wait(paceI32, 255, 0, 1000); }
+    return;
+  }
+  const t0 = performance.now();
+  if (det.lowTop === 0 || (frame % det.pageEvery) === 0) {
+    const memSize = Module.wasmMemory.buffer.byteLength;
+    const n = memSize / HPAGE;
+    det.lowTop = lowTopScan();
+    if ((frame % det.pageEvery) === 0) {
+      const pages = new Uint32Array(n);
+      for (let p = 0; p < n; p++) {
+        const h = stateHash(p * HPAGE, (p + 1) * HPAGE, 0);
+        pages[p] = h === zeroHash() ? 0 : (h >>> 0) || 1;
+      }
+      // what a rollback snapshot of exactly the guest state would cost, measured on THIS frame:
+      // copy LOW + MEM1 out into a preallocated buffer and the same bytes back in (a no-op write).
+      const lowB = det.lowTop, total = lowB + (MEM1_HI - MEM1_LO);
+      if (!det.snapBuf || det.snapBuf.length < total) det.snapBuf = new Uint8Array(total + (8 << 20));
+      const mem = new Uint8Array(Module.wasmMemory.buffer);
+      let s0 = performance.now();
+      det.snapBuf.set(mem.subarray(0, lowB), 0);
+      det.snapBuf.set(mem.subarray(MEM1_LO, MEM1_HI), lowB);
+      const snapMs = performance.now() - s0;
+      s0 = performance.now();
+      mem.set(det.snapBuf.subarray(0, lowB), 0);
+      mem.set(det.snapBuf.subarray(lowB, total), MEM1_LO);
+      const restoreMs = performance.now() - s0;
+      let nz = 0; for (let p = 0; p < n; p++) if (pages[p]) nz++;
+      postMessage({ cmd: 'detPages', frame, lowTop: det.lowTop, memSize, nonZeroPages: nz,
+                    snapBytes: total, snapMs, restoreMs, pages: pages.buffer }, [pages.buffer]);
+    }
+  }
+  // Per PAGE, folded: the same whole-region coverage as one sweep, plus how many 64 KiB pages
+  // CHANGED since the previous frame — the floor on what any rollback snapshot has to copy.
+  const lowPages = det.lowTop / HPAGE, memPages = (MEM1_HI - MEM1_LO) / HPAGE;
+  if (!det.prev || det.prev.length !== lowPages + memPages) det.prev = new Int32Array(lowPages + memPages);
+  let hLow = 0x811c9dc5, hMem1 = 0x811c9dc5, changed = 0;
+  for (let p = 0; p < lowPages + memPages; p++) {
+    const a = p < lowPages ? p * HPAGE : MEM1_LO + (p - lowPages) * HPAGE;
+    const h = stateHash(a, a + HPAGE, 0);
+    if (h !== det.prev[p]) { changed++; det.prev[p] = h; }
+    if (p < lowPages) hLow = Math.imul((hLow ^ h) >>> 0, 0x01000193) >>> 0;
+    else hMem1 = Math.imul((hMem1 ^ h) >>> 0, 0x01000193) >>> 0;
+  }
+  const hHigh = stateHash(MEM1_HI, Module.wasmMemory.buffer.byteLength, 0);
+  det.hashMs += performance.now() - t0;
+  det.rows.push(frame, hLow | 0, hMem1 | 0, hHigh, det.lastGuestUs | 0, changed);
+  if (det.rows.length >= 6 * 60 || frame >= det.until) {
+    const rows = new Int32Array(det.rows);
+    postMessage({ cmd: 'det', rows: rows.buffer, hashMs: det.hashMs, lowTop: det.lowTop }, [rows.buffer]);
+    det.rows = []; det.hashMs = 0;
+  }
+  if (frame >= det.until) {
+    postMessage({ cmd: 'detDone', frame });
+    for (;;) Atomics.wait(paceI32, 255, 0, 1000);   // park: the run is over, burn no CPU
+  }
+}
 
 const ST_PAGE = 65536;            // wasm page granularity; memory size is always a multiple
 const ST_MAGIC = 'GCRECOMP';
@@ -794,7 +949,7 @@ function stateSnapshot() {
     v: ST_VERSION, game: 'MarioParty4',
     memSize, page: ST_PAGE, pages: idx.length,
     sp: w.emscripten_stack_get_current() >>> 0,
-    viRetrace, staticTop, vcdLo, vcdHi, tlutSrc,
+    viRetrace, tbExtra, staticTop, vcdLo, vcdHi, tlutSrc,
     vatA: vatA.slice(), arrayBase: arrayBase.slice(), arrayStride: arrayStride.slice(),
     texImg0: texImg0.slice(),
     gxCp: [...gxShadow.cp], gxXf: [...gxShadow.xf], gxBp: [...gxShadow.bp],
@@ -858,6 +1013,7 @@ function stateApply(u8) {
   w._emscripten_stack_restore(hdr.sp >>> 0);
   // JS-side decoder/clock state
   viRetrace = hdr.viRetrace >>> 0;
+  tbExtra = +hdr.tbExtra || 0; tbReads = 0;          // absent in a state saved before the busy-wait clock
   staticTop = hdr.staticTop >>> 0;
   vcdLo = hdr.vcdLo >>> 0; vcdHi = hdr.vcdHi >>> 0; tlutSrc = hdr.tlutSrc >>> 0;
   for (let i = 0; i < 8; i++) { vatA[i] = hdr.vatA[i] >>> 0; texImg0[i] = hdr.texImg0[i] >>> 0; }
@@ -973,6 +1129,21 @@ async function boot(msg) {
   if (msg.stage) stageSab = msg.stage;   // savestate load transport (see the SAVE STATES block)
 
   const wasmBinary = await (await fetch(msg.wasmUrl)).arrayBuffer();
+  // THE BUILD IDENTITY. A lockstep room is only correct if every console runs the same guest, and
+  // what defines the guest here is three files: the wasm, its emscripten glue, and this worker
+  // (input latch, clock, DVD model). FNV-1a over all three, posted before _main() so the page can
+  // put it in the disc tag its barrier compares — a stale cached build is then refused by name
+  // instead of pairing and forking at the first fingerprint.
+  try {
+    const fnv = (h, u8) => { for (let i = 0; i < u8.length; i++) h = Math.imul((h ^ u8[i]) >>> 0, 0x01000193) >>> 0; return h; };
+    let bh = fnv(0x811c9dc5, new Uint8Array(wasmBinary));
+    const glueTxt = await (await fetch(msg.glueUrl)).arrayBuffer();
+    bh = fnv(bh, new Uint8Array(glueTxt));
+    const selfTxt = await (await fetch(String(self.location.href).split('?')[0])).arrayBuffer();
+    bh = fnv(bh, new Uint8Array(selfTxt));
+    postMessage({ cmd: 'build', hash: ('0000000' + (bh >>> 0).toString(16)).slice(-8),
+                  bytes: wasmBinary.byteLength + glueTxt.byteLength + selfTxt.byteLength });
+  } catch (e) { postMessage({ cmd: 'build', hash: 'unhashed', error: String((e && e.message) || e) }); }
   // Static-texture boundary = end of the wasm's INITIALIZED data segments (~0x25204): every
   // compiled-in .inc texture/TLUT lives below it, every real guest-RAM texture above it
   // (lowest observed 0x2bf800). NOT __data_end/__heap_base — those include BSS (the 16MB
@@ -1181,8 +1352,30 @@ async function boot(msg) {
     'OSGetTick', 'DVDInit', 'DVDReadAbsAsyncPrio', 'DVDReadAbsAsyncForBS', 'VIGetRetraceCount',
     'VIWaitForRetrace']);
 
+  // SPIN DETECTOR. A guest that loops without ever reaching VIWaitForRetrace freezes this worker
+  // with nothing said — and a loop that polls a host import (OSGetTime is derived from viRetrace,
+  // so a busy-wait on it never ends) is the likely shape. One increment per host call; past
+  // SPIN_CALLS calls inside one frame it tallies the next SPIN_TALLY by name and says which.
+  const SPIN_CALLS = 2000000, SPIN_TALLY = 200000;
+  let spinN = 0, spinTally = null, spinSaid = 0;
+  function spinCount(n) {
+    if (++spinN < SPIN_CALLS) return;
+    if (!spinTally) spinTally = new Map();
+    spinTally.set(n, (spinTally.get(n) || 0) + 1);
+    if (spinN === SPIN_CALLS + SPIN_TALLY && spinSaid < 5) {
+      spinSaid++;
+      // The JS stack here INCLUDES the guest's wasm frames by name (the module has a name
+      // section), which is what says WHICH loop is spinning.
+      const st = String(new Error().stack || '').split('\n').filter((l) => /wasm/.test(l)).slice(0, 8)
+        .map((l) => l.trim().replace(/^at /, '').replace(/ \(wasm:\/\/.*$/, '')).join(' <- ');
+      log('SPIN: the guest made ' + spinN + ' host calls without reaching VIWaitForRetrace (frame ' + viRetrace +
+          ') — top: ' + [...spinTally].sort((x, y) => y[1] - x[1]).slice(0, 6).map((e) => e[0] + '×' + e[1]).join(', ') +
+          (st ? ' — in ' + st : ''));
+    }
+  }
   function stub(n) {
     return (...a) => {
+      spinCount(n);
       switch (n) {
         // OSReport is the only one of the family this module actually imports today
         // (`wasm-objdump -j Import -x mp4_game.wasm` lists `func[1] sig=2 <OSReport>` and no
@@ -1201,13 +1394,15 @@ async function boot(msg) {
           // exposed the same way.
           Module._OSSetArenaLo(Math.max(0x80004000, 0x80000000 + Math.ceil(staticTop / 0x10000) * 0x10000));
           Module._OSSetArenaHi(0x81800000); return 0;
-        case 'OSGetTime': case '__OSGetSystemTime': return BigInt(viRetrace) * 675000n;
-        case 'OSGetTick': return (viRetrace * 675000) >>> 0;
+        case 'OSGetTime': case '__OSGetSystemTime': return BigInt(viRetrace) * 675000n + BigInt(tbNow());
+        case 'OSGetTick': return (viRetrace * 675000 + tbNow()) >>> 0;
         case 'DVDInit': { const f = Module.___DVDFSInit; if (f) f(); return 0; }
         case 'DVDReadAbsAsyncPrio':
         case 'DVDReadAbsAsyncForBS': return serveDvdRead(mem(), dv(), a[0], a[1], a[2], a[3], a[4]);
         case 'VIGetRetraceCount': return viRetrace;
         case 'VIWaitForRetrace': {
+          spinN = 0; spinTally = null; tbReads = 0;
+          if (det && det.leftAt) det.lastGuestUs = (performance.now() - det.leftAt) * 1000;
           const pos = Module._gx_fifo_pos ? Module._gx_fifo_pos() : 0;
           if (pos > 0) {
             const base = Module._gx_fifo_base();
@@ -1369,6 +1564,9 @@ async function boot(msg) {
           // emitted. Every 1800 frames = every 30 s of EMULATED time; one postMessage per 30 s
           // is far below the per-frame traffic already on this path.
           if ((viRetrace % 1800) === 0) reportImportCensus('frame ' + viRetrace);
+          // DETERMINISM MODE — at this one fixed point of every frame (after the frame's audio and
+          // card bookkeeping, before the credit wait and the next frame's input latch).
+          if (det) detFrame(viRetrace);
           // debug: periodic guest-side hex of watched addresses (boot msg peekAddrs;
           // diff against the dolphin worker's recompPeek of the same guest offsets)
           if (peekAddrs && (viRetrace % 1200) === 0) {
@@ -1401,6 +1599,7 @@ async function boot(msg) {
           // __recomp_inject_* lives — latching first would hand the guest bytes a restore then
           // discards.
           applyPads();
+          if (det) det.leftAt = performance.now();
           return 0;
         }
         // NOT a silent 0 any more — see the census block above. The return value is unchanged
@@ -1425,8 +1624,13 @@ async function boot(msg) {
   if (Module.___recomp_card_base && Module.___recomp_card_size) {
     cardBase = Module.___recomp_card_base() >>> 0;
     cardSize = Module.___recomp_card_size() >>> 0;
+    // THE CARD CLOCK IS GUEST-VISIBLE STATE. gc_card.c stamps it into every directory entry it
+    // writes (E_TIME) and keeps it in a static, i.e. in linear memory — so seeding it from THIS
+    // machine's Date.now() makes two consoles differ before frame 0. A room (and the determinism
+    // rig) pins it with boot msg `cardTime`; a solo visit keeps the wall clock, as before.
     if (Module.___recomp_card_time)
-      Module.___recomp_card_time(Math.max(0, Math.floor(Date.now() / 1000) - 946684800) >>> 0);
+      Module.___recomp_card_time((msg.cardTime != null ? msg.cardTime
+                                  : Math.max(0, Math.floor(Date.now() / 1000) - 946684800)) >>> 0);
     if (msg.card && msg.card.byteLength === cardSize) {
       new Uint8Array(Module.wasmMemory.buffer, cardBase, cardSize).set(new Uint8Array(msg.card));
       log('memcard: seeded persisted image (' + cardSize + 'B) at 0x' + cardBase.toString(16));
@@ -1442,6 +1646,12 @@ async function boot(msg) {
   if (msg.inputScript) { inputScript = msg.inputScript; log('input script: ' + Object.keys(inputScript).length + ' entries'); }
   if (msg.peekAddrs) peekAddrs = msg.peekAddrs;
   if (msg.testFullMem) { testFullMem = true; log('TESTFULLMEM: full mem1 every frame'); }
+  if (msg.spinAudio != null) tbSpinAudio = !!msg.spinAudio;
+  if (msg.det) {
+    det = { until: msg.det.until | 0 || 3600, pageEvery: msg.det.pageEvery | 0 || 300, rows: [], hash: msg.det.hash !== false,
+            lowTop: 0, hashMs: 0, snapBuf: null, leftAt: 0, lastGuestUs: 0 };
+    log('DETERMINISM MODE: whole-state hashes every frame to f' + det.until + ', page map every ' + det.pageEvery);
+  }
   // Tell the page the output rate BEFORE any 'audio' message, so it builds the AudioContext at
   // the right rate the first time (the same contract dolphin_worker's 'audioRate' has).
   audioTest = !!msg.audioTest;

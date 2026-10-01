@@ -506,6 +506,8 @@ grLfbLock( int32_t type, int32_t buffer, int32_t writeMode,
 #define grLfbUnlock(type, buffer) (true)
 
 uint16_t *grLfbReadSampled(const int32_t *sx, int nx, const int32_t *sy, int ny);
+void grFbPrefetch(void);
+void glide_viewport_note(GLint x, GLint y, GLsizei w, GLsizei h);
 extern int neil_native_fbread;
 
 void grLfbConstantAlpha( uint8_t alpha );

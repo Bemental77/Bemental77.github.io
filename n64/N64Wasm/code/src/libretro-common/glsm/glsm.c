@@ -25,6 +25,12 @@
 #include <glsym/glsym.h>
 #include <glsm/glsm.h>
 
+/* neil: told every viewport this file sets, so glide's native readback pass
+ * (glitchmain.c grLfbReadSampled) knows the viewport it must restore without a
+ * GL_VIEWPORT query — a synchronous round trip to the GPU process in WebGL.
+ * Weak: a build without glide links this to nothing. */
+extern void glide_viewport_note(GLint x, GLint y, GLsizei w, GLsizei h) __attribute__((weak));
+
 #ifndef GL_DEPTH_CLAMP
 #define GL_DEPTH_CLAMP                    0x864F
 #define GL_RASTERIZER_DISCARD             0x8C89
@@ -614,6 +620,8 @@ void rglViewport(GLint x, GLint y, GLsizei width, GLsizei height)
 #endif
    glsm_ctl(GLSM_CTL_IMM_VBO_DRAW, NULL);
    glViewport(x, y, width, height);
+   if (glide_viewport_note)
+      glide_viewport_note(x, y, width, height);
    gl_state.viewport.x = x;
    gl_state.viewport.y = y;
    gl_state.viewport.w = width;
@@ -2723,6 +2731,8 @@ static void glsm_state_bind(void)
          gl_state.viewport.y,
          640,
          480);
+   if (glide_viewport_note)
+      glide_viewport_note(gl_state.viewport.x, gl_state.viewport.y, 640, 480);
 
    for(i = 0; i < SGL_CAP_MAX; i ++)
    {

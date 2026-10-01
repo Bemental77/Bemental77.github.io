@@ -99,7 +99,8 @@ const coreStep = (st, image, k) => { let h = fnv(st, k); for (let i = 0; i < ima
 
 export function simulate(sc) {
   const rnd = prng(sc.seed || 11);
-  const HZ = 60, FRAME = 1000 / HZ, secs = sc.secs || 60;
+  // sc.hz: the console's frame rate (PS1 Monster Rancher 2 runs at 50 Hz).
+  const HZ = sc.hz > 0 ? sc.hz : 60, FRAME = 1000 / HZ, secs = sc.secs || 60;
   const n = sc.players || 2;
   const ids = ['H', 'G1', 'G2', 'G3'].slice(0, n);
   const PAD = 2;
@@ -145,9 +146,11 @@ export function simulate(sc) {
   };
   const seg = {};
   const padFor = (id, port, f) => {
-    // each console's pad changes every 4..24 frames, deterministically per (console, segment)
+    // each console's pad changes every 4..24 frames (sc.padEvery: [min, span]
+    // for another game's pace), deterministically per (console, segment)
     const s = seg[id] || (seg[id] = { at: [0], val: [] });
-    while (s.at[s.at.length - 1] <= f) s.at.push(s.at[s.at.length - 1] + 4 + ((fnv(0x1234 + ids.indexOf(id), s.at.length) % 21)));
+    const pe = sc.padEvery || [4, 21];
+    while (s.at[s.at.length - 1] <= f) s.at.push(s.at[s.at.length - 1] + pe[0] + ((fnv(0x1234 + ids.indexOf(id), s.at.length) % pe[1])));
     let i = 0; while (s.at[i + 1] <= f) i++;
     const v = fnv(0x9e37 + ids.indexOf(id) * 7919, i);
     return new Uint8Array([v & 0xff, (v >>> 8) & 0x0f]);

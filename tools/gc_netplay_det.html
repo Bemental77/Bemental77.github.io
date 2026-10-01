@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GC recomp determinism rig</title>
+<!-- The recomp guest WITHOUT gamecube.html's renderer, lobby or JIT boot: just
+     gamecube/recomp/recomp_worker.js, the disc, a scripted input stream and the worker's
+     DETERMINISM MODE (whole-state hashes every frame). Driven by tools/gc_netplay_det_test.mjs,
+     which runs this page in several independent browser profiles and compares the rows.
+     Query: frames=N  pace=free|hw  script=board|mash|none  seed=S  cardtime=SECS|wall
+            pageevery=N  -->
+<script src="/coi-serviceworker.js"></script>
+<style>body{background:#111;color:#ddd;font:13px monospace;margin:16px}</style>
+</head><body>
+<div id="out">booting…</div>
+<script>
+(function () {
+  'use strict';
+  var q = new URLSearchParams(location.search);
+  var FRAMES = parseInt(q.get('frames') || '3000', 10);
+  var PACE = q.get('pace') || 'free';                 // free = uncapped; hw = 60 credits/s
+  var SCRIPT = q.get('script') || 'board';
+  var SEED = parseInt(q.get('seed') || '1', 10) >>> 0;
+  var CT = q.get('cardtime') || '700000000';          // pinned by default; 'wall' = Date.now()
+  var out = document.getElementById('out');
+  var R = window.__det = { rows: [], pages: {}, pageMeta: {}, done: false, error: null, log: [],
+                           hashMs: 0, frames: 0, startedAt: 0, doneAt: 0 };
+  function say(t) { R.log.push(t); out.textContent = t; }
+  if (!window.crossOriginIsolated) { say('waiting for cross-origin isolation (coi reload)'); return; }
+
+  // Scripted input, a pure function of the frame number — the same on every machine.
+  //   board: gamecube.html's own ?board=1 chain (title -> Party Mode -> a board), autoboard on.
+  //   mash:  the board chain to frame 4650, then a seeded xorshift button masher, so the run
+  //          keeps exercising menus/board logic with input on most frames.
+  function script() {
+    var s = {};
+    var chain = [[1000, [0x1000,0,0,0]], [1300, [0x100,0,0,0]], [1600, [0,8,0,0]],
+                 [1700, [0x100,0,0,0]], [2100, [0x100,0,0,0]], [2500, [0x100,0,0,0]],
+                 [3400, [0x100,0,0,0]], [3800, [0x100,0,0,0]], [4300, [0x100,0,0,0]],
+                 [4400, [0,0,-80,0]], [4450, [0,0,-80,0]], [4500, [0,0,-80,0]],
+                 [4650, [0x100,0,0,0]]];
+    if (SCRIPT === 'none') return null;
+    // mash3: no board chain and no autoboard — the seeded masher (with Start) from the title on,
+    // which is what a person mashing a fresh boot does (and what gc_netplay_room_test.mjs does).
+    if (SCRIPT === 'mash3') {
+      var y = SEED || 1;
+      var rnd3 = function () { y ^= y << 13; y >>>= 0; y ^= y >>> 17; y ^= y << 5; y >>>= 0; return y; };
+      var B3 = [0x1000, 0x100, 0x100, 0x100, 0x200, 0x400, 0x800, 0x40, 0x20, 0x10, 0, 0];
+      for (var g = 600; g < FRAMES + 2; g++) {
+        var r3 = rnd3();
+        if ((r3 & 3) === 0) s[g] = [B3[(r3 >>> 2) % B3.length], (r3 >>> 8) & 0xf, ((r3 >>> 12) & 0x7f) - 64, ((r3 >>> 20) & 0x7f) - 64];
+      }
+      return s;
+    }
+    for (var i = 0; i < chain.length; i++) s[chain[i][0]] = chain[i][1];
+    if (SCRIPT === 'mash' || SCRIPT === 'mash2') {
+      var x = SEED || 1;
+      var rnd = function () { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; return x; };
+      var BTN = [0x100, 0x200, 0x0, 0x0, 0x0, 0x800, 0x400, 0x40, 0x20, 0x10];  // A B (idle x3) Y X L R Z
+      if (SCRIPT === 'mash2') BTN = [0x1000, 0x100, 0x100, 0x200, 0x0, 0x800, 0x400, 0x40, 0x20, 0x10];  // + Start
+      for (var f = 4700; f < FRAMES + 2; f++) {
+        var r = rnd();
+        if ((r & 7) < 2) s[f] = [BTN[(r >>> 3) % BTN.length], (r >>> 8) & 0xf, ((r >>> 12) & 0xff) - 128, ((r >>> 20) & 0xff) - 128];
+      }
+    }
+    return s;
+  }
+
+  function inflate(url) {
+    return fetch(url).then(function (r) {
+      if (!r.ok) throw new Error(url + ' ' + r.status);
+      return new Response(r.body.pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
+    });
+  }
+  var sfx = ['aa', 'ab', 'ac', 'ad', 'ae', 'af'];
+  say('fetching disc');
+  Promise.all([Promise.all(sfx.map(function (s) { return inflate('/gamecube/roms/MarioParty4.bin.part' + s + '.gz'); })),
+               fetch('/gamecube/recomp/mp4_fst_trimmed.bin').then(function (r) { return r.arrayBuffer(); })])
+  .then(function (pf) {
+    var parts = pf[0], fst = pf[1];
+    var pace = new SharedArrayBuffer(1024), pi = new Int32Array(pace);
+    if (PACE === 'free') Atomics.store(pi, 5, 1);
+    var w = new Worker('/gamecube/recomp/recomp_worker.js?v=' + Date.now());
+    R.startedAt = performance.now();
+    w.onmessage = function (e) {
+      var d = e.data;
+      if (d.cmd === 'det') {
+        var rows = new Int32Array(d.rows);
+        for (var i = 0; i < rows.length; i++) R.rows.push(rows[i]);
+        R.frames = rows.length ? rows[rows.length - 6] : R.frames; R.hashMs += d.hashMs;
+        out.textContent = 'frame ' + R.frames + ' / ' + FRAMES;
+      } else if (d.cmd === 'detPages') {
+        var u = new Uint32Array(d.pages), a = new Array(u.length);
+        for (var k = 0; k < u.length; k++) a[k] = u[k];
+        R.pages[d.frame] = a;
+        R.pageMeta[d.frame] = { lowTop: d.lowTop, memSize: d.memSize, nonZeroPages: d.nonZeroPages,
+                                snapBytes: d.snapBytes, snapMs: d.snapMs, restoreMs: d.restoreMs };
+      } else if (d.cmd === 'detDone') { R.done = true; R.doneAt = performance.now(); say('done at frame ' + d.frame); }
+      else if (d.cmd === 'card') { R.card = new Uint8Array(d.img); R.cardSeq = d.seq; }   // the game's own save, as a fixture
+      else if (d.cmd === 'log') { R.log.push(d.txt); if (/main stopped|boot failed/.test(d.txt)) R.error = d.txt; }
+      else if (d.cmd === 'frame') {
+        // The worker's own frame number (viRetrace) — the progress signal that works on ANY worker
+        // build, including one without DETERMINISM MODE (an A/B arm against an older file).
+        R.vi = d.n;
+        if (q.get('hash') === '0' && !R.done && d.n >= FRAMES) { R.done = true; R.doneAt = performance.now(); w.terminate(); say('reached frame ' + d.n); }
+      }
+      // 'audio' / 'card' / 'importCensus' are dropped: there is no renderer here.
+    };
+    w.onerror = function (e) { R.error = 'worker error: ' + (e.message || e); };
+    w.postMessage({ cmd: 'boot', parts: parts, fst: fst, pace: pace, card: null,
+                    cardTime: CT === 'wall' ? null : (parseInt(CT, 10) >>> 0),
+                    autoboard: SCRIPT !== 'none' && SCRIPT !== 'mash3', inputScript: script(),
+                    spinAudio: q.has('spinaudio') ? q.get('spinaudio') === '1' : undefined,
+                    det: { until: FRAMES, pageEvery: parseInt(q.get('pageevery') || '300', 10), hash: q.get('hash') !== '0' },
+                    peekAddrs: [], testFullMem: false, audioTest: false, xfShadowAll: true,
+                    glueUrl: '/gamecube/recomp/mp4_game.js', wasmUrl: '/gamecube/recomp/mp4_game.wasm' },
+                  parts.concat([fst]));
+    if (PACE === 'hw') {
+      // 1.000x: credits integrated against the wall clock at exactly 60/s, backlog clamped.
+      var last = performance.now(), acc = 0;
+      setInterval(function () {
+        var now = performance.now(); acc += (now - last) * 60 / 1000; last = now;
+        var n = Math.floor(acc); acc -= n;
+        if (n > 0 && Atomics.load(pi, 0) < 8) { Atomics.add(pi, 0, n); Atomics.notify(pi, 0); }
+      }, 4);
+    }
+    say('booted, running ' + FRAMES + ' frames (pace=' + PACE + ', script=' + SCRIPT + ', cardtime=' + CT + ')');
+  }).catch(function (e) { R.error = String(e && e.stack || e); say('FAILED: ' + R.error); });
+})();
+</script>
+</body></html>

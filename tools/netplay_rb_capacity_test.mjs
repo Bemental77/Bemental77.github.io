@@ -22,6 +22,16 @@
 //       picks from the RTT, Lockstep.recommendDelayForRoom), 0 desyncs, every
 //       fingerprinted state equal to a straight run of the agreed inputs, and
 //       nothing ever ahead of the room clock (gate 9).
+//       A cell the gate KEEPS in rollback must still show the slow console on
+//       >= 0.7 of its display ticks (the corrections' burst is charged at the
+//       rate it happens — lib/netplay.js CAP_LOST_FULL).
+//   ps1-rare-corrections  the PS1 room: two 8 ms/step consoles at 50 Hz, 100 ms
+//       one way, pads changing every 300-900 frames (a handful of corrections a
+//       minute). STAYS in rollback at >= 0.995x, zero lag, both presenting
+//       >= 0.9 — where the old frequency-blind burst bar read ~120% and switched.
+//   ps1-throttled-peer-switches  the same room with one console 2.5x slower
+//       (20 ms/step): switches to delay at the same frame everywhere, never
+//       below a delay-lockstep room.
 //   switch-both-ways  pages that declare rbResume; the slow console recovers
 //       (16 -> 1.5 ms) at 20 s: the room goes to delay, then back to rollback,
 //       at the SAME frames on every console.
@@ -97,8 +107,56 @@ for (const players of [2, 4]) for (const ow of [0, 50, 100]) for (const slow of 
   // one frame per display tick again, not three (it presented 0.31-0.33 of its
   // ticks before the fix, against 0.96 for the same room started in delay).
   if (sc.mode === 'delay' && !(sc.presented >= 0.7)) bad.push('the slow console presents only ' + sc.presented + ' of its display ticks after the switch (< 0.7)');
+  // ...and a room the gate KEEPS in rollback must not show the slow console in
+  // clumps either: the burst is charged at its rate (lib/netplay.js
+  // CAP_LOST_FULL), which keeps it presenting about three quarters of its ticks.
+  if (sc.mode === 'rollback' && !(sc.presented >= 0.7)) bad.push('the slow console stayed in rollback presenting only ' + sc.presented + ' of its display ticks (< 0.7)');
   ok(name, !bad.length && g.minRate >= l.minRate - 0.005 && sameEverywhere(g), line + (bad.length ? '\n        ' + bad.join('; ') : ''));
   if (json) console.log(JSON.stringify({ g, l }));
+}
+
+// ---- RARE CORRECTIONS ON A DEEP PATH: THE PS1 ROOM ---------------------------
+// PS1 Monster Rancher 2 in a real desktop room (tools/netplay_device_matrix.mjs
+// arm d: 100 ms one way + 2% loss; 50 Hz; a rollback step of ~8 ms on the rig's
+// box) corrected ~5 times a MINUTE at p90 depth 7, busy ~40% of its time. The
+// old burst bar charged each correction as if one came every third tick
+// (st x (p90 + 1) / 3F) and read 87-149%, moving every such room to 8-18 frames
+// of input delay. Both consoles 8 ms/step at 50 Hz, pads changing every 300-900
+// frames: the room STAYS in rollback (zero lag) at >= 0.995x, both consoles
+// presenting >= 0.9 of their ticks. And the same room with one console 2.5x
+// slower (a CPU-throttled peer, 20 ms/step) still switches to delay at the same
+// frame everywhere, never below a delay-lockstep room on the same link.
+if (want('ps1-rare-corrections')) {
+  const cell = { name: 'ps1', secs: SECS, seed: 21, players: 2, hz: 50, baseMs: 100, jitterMs: 30, loss: 0.02, stepMsAll: 8,
+                 padEvery: [300, 601], runFrac: RUN_FRAC };
+  let oldBar = 0, newNeed = 0;
+  globalThis.__simTick = (p, T) => {
+    if (p.id !== 'H' || !p.ls.rollback || T < 5000) return;
+    const F = p.ls._frameMs();
+    for (const r of p.ls._capRows(T)) if (r.st > 0) oldBar = Math.max(oldBar, r.st * Math.max(r.rs || 1, ((r.dp || 0) + 1) / 3) / F);
+    if (p.ls._capNeed > newNeed) newNeed = p.ls._capNeed;
+  };
+  let r;
+  try { r = simulate(cell); } finally { delete globalThis.__simTick; }
+  const bad = base(r), c = Object.values(r.consoles);
+  const switched = c.some((x) => x.modes.length);
+  if (switched) bad.push('switched: ' + JSON.stringify(modesOf(r)));
+  for (const [id, x] of Object.entries(r.consoles)) if (!(x.presented >= 0.9)) bad.push(id + ' presents ' + x.presented + ' of its ticks');
+  const rb = c.reduce((a, x) => a + (x.rollbacks || 0), 0);
+  ok('ps1-rare-corrections', !bad.length && rb > 0,
+     `room ${r.minRate.toFixed(4)}x in ${c.map((x) => x.mode).join('/')}, ${rb} corrections (max depth ${Math.max(...c.map((x) => x.maxDepth || 0))}), `
+     + `presents ${c.map((x) => x.presented).join('/')}, lag ${r.lagBad}/${r.lagN}, desync ${r.desyncs}, truth ${r.truthChecked - r.truthBad}/${r.truthChecked}; `
+     + `peak need ${Math.round(newNeed * 100)}% (the old burst bar read ${Math.round(oldBar * 100)}%)` + (bad.length ? '\n        ' + bad.join('; ') : ''));
+  const tc = Object.assign({}, cell, { stepMsAll: undefined, stepMs: { H: 8, G1: 20 } });
+  const g = simulate(tc);
+  const l = simulate(Object.assign({}, tc, { lockstep: true, delay: pageDelay(2, 100, 30), catchUp: false }));
+  const tbad = base(g), sc = g.consoles.G1;
+  if (sc.mode !== 'delay' || !g.consoles.H.modes.length) tbad.push('the throttled console did not switch the room (' + JSON.stringify(modesOf(g)) + ')');
+  if (!sameEverywhere(g)) tbad.push('switch frames differ: ' + JSON.stringify(modesOf(g)));
+  if (!(g.minRate >= l.minRate - 0.005)) tbad.push('gated ' + g.minRate + 'x below delay lockstep ' + l.minRate + 'x');
+  ok('ps1-throttled-peer-switches', !tbad.length,
+     `gated ${g.minRate.toFixed(4)}x (${Object.values(g.consoles).map((x) => x.mode + (x.mode === 'delay' ? x.delay : '')).join('/')}, switch ${sc.modes.map((m) => m.to + '@' + m.frame).join(',') || 'none'}: "${(sc.modes[0] || {}).text || ''}") `
+     + `vs delay lockstep ${l.minRate.toFixed(4)}x` + (tbad.length ? '\n        ' + tbad.join('; ') : ''));
 }
 
 // ---- the switch, both ways ------------------------------------------------
