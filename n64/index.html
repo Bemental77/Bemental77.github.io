@@ -25,7 +25,7 @@
        the wire. The file still exists because sibling pages have not been
        converted yet; loading it here would ship a second, contradictory online
        architecture on a page that has one. -->
-  <script src="/lib/netplay.js?v=46e6c73d"></script>
+  <script src="/lib/netplay.js?v=b29fcd50"></script>
   <script src="/lib/mpgames.js"></script>
   <script>MPGames.gateParty('n64', ['btnNet', 'mobileSplashNet'], ['romSelect', 'mobileRomSelect']);</script>
   <script>
@@ -1698,9 +1698,21 @@ N64Rate.selfTest = function (logFn) {
     if (/Starting R4300 emulator/.test(s)) mark('r4300-started');
   }
   var logTail = [], LOG_TAIL_MAX = 300;
+  // ⚠ APPEND, DO NOT REWRITE. `logEl.textContent += s` copied and re-laid-out
+  // the WHOLE log on every line (and `scrollTop = scrollHeight` forced a
+  // synchronous layout even with the log hidden), so a line cost grew with the
+  // session — on a phone, a main-thread tax on every message. Now: one text
+  // node per line, the oldest dropped past LOG_DOM_MAX (the pinned facts and
+  // logTail keep what the report needs), and scrolling only while the log is
+  // actually on screen.
+  var LOG_DOM_MAX = 3000, logDomLines = 0;
   function pageLog(s) {
     sniff(s);
-    if (logEl) { logEl.textContent += s + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+    if (logEl) {
+      logEl.appendChild(document.createTextNode(s + '\n'));
+      if (++logDomLines > LOG_DOM_MAX && logEl.firstChild) { logEl.removeChild(logEl.firstChild); logDomLines--; }
+      if (logEl.style.display === 'block') logEl.scrollTop = logEl.scrollHeight;
+    }
     logTail.push(s); if (logTail.length > LOG_TAIL_MAX) logTail.splice(0, logTail.length - LOG_TAIL_MAX);
     console.log(s);
   }
@@ -1734,6 +1746,217 @@ N64Rate.selfTest = function (logFn) {
   // invisible to somebody holding a phone. So the page measures both itself, up front, and pins
   // the result where a screenshot of the top of the panel carries it.
   function safe(fn, dflt) { try { var v = fn(); return (v === undefined || v === null) ? dflt : v; } catch (_) { return dflt; } }
+  // ---- ASYNCHRONOUS FRAMEBUFFER READBACK (fbasync — ON for read_always titles) -----
+  // Mario Kart 64 is configured in glide2gl with read_always (Glide64_Ini.c,
+  // "MARIOKART64"; also Banjo-Kazooie/Tooie, Pokemon Snap, Castlevania 1/2,
+  // Donkey Kong 64 and Ridge Racer 64 — the read_always = 1 lines of that
+  // file), so after every display list the core copies the rendered frame back
+  // into RDRAM: glReadPixels of the whole framebuffer (Glitch64/glitchmain.c
+  // grLfbLock). A synchronous readback makes the CPU wait for the GPU to finish
+  // everything queued — measured on this box in a 4-port lockstep room at 48.6%
+  // of all main-thread time (n64/tools/party_ghost_probe.mjs --profile), against
+  // ~0% solo — and on a tile-based phone GPU it is a full pipeline flush.
+  //
+  // This reads the CURRENT copy into a pixel-pack buffer without waiting and
+  // hands the core the PREVIOUS call's pixels. THE OFFSET IS FIXED — ALWAYS
+  // EXACTLY ONE CALL — AND DOES NOT DEPEND ON THE GPU. There is no "is it
+  // ready yet?" branch anywhere below: getBufferSubData is a complete read
+  // (WebGL never returns a pack buffer's contents before the readPixels that
+  // wrote it has executed), so when the previous copy has not finished the
+  // call BLOCKS for it — the old synchronous cost, paid rarely — and never
+  // skips or substitutes. Two consoles in a room therefore write the same
+  // bytes into RDRAM at the same guest point whatever their GPUs are doing;
+  // the witness below (?fbwitness=1) records, per call, a hash of the bytes
+  // handed over and whether the fence had signalled, so a rig can prove it.
+  //
+  // WHEN IT IS ON. Exactly when glide itself reads back every frame: the ROM
+  // header's internal name (bytes 0x20..0x33, the name glidemain.c hands to
+  // ReadSpecialSettings) matched with the SAME strstr rules as the
+  // read_always lines of Glide64_Ini.c (fbDecide, called from loadRom before
+  // the core boots). ?fbasync=0 opts out, ?fbasync=1 forces it on for any
+  // title. ⚠ A ROOM MUST AGREE: an async console hands RDRAM the copy one call
+  // later than a sync one, so the mode is part of this console's disc tag
+  // (lsDisc) and a room whose consoles disagree is refused at the barrier.
+  //
+  // What makes "previous" well-defined, and what resets it:
+  //   * the pending copy is keyed by the full rect (x, y, w, h, format, type);
+  //     a call with a DIFFERENT rect drops it, so a mode switch reads
+  //     synchronously instead of handing over a frame from before the switch;
+  //   * a core reset (_neil_reset) or a savestate load (_neil_unserialize)
+  //     drops it — the next call reads synchronously, exactly as a freshly
+  //     booted core's first call does;
+  //   * ROLLBACK AND RUN-AHEAD carry it: st.snapshot() taken with a savestate
+  //     pins the pending pack buffer (GPU side — no readback, no wait) and
+  //     st.restore(snap) after loading that state makes it pending again, so a
+  //     re-simulated frame is handed exactly the bytes the first run of that
+  //     frame was. Without this a console that rolled back would read its first
+  //     copy synchronously where its peers read the previous one — a desync by
+  //     construction. A pinned buffer is never reused until st.release(snap).
+  // Only calls with no pack buffer bound are touched; the page's own draw
+  // witness bypasses it.
+  var FB_Q = new URLSearchParams(location.search);
+  var FB_FORCE = FB_Q.get('fbasync');                 // '1' | '0' | null (= per title)
+  var FB_WITNESS = FB_Q.get('fbwitness') === '1';
+  window.__fbAsync = { on: FB_FORCE === '1', decided: FB_FORCE === '1' ? 'forced on (?fbasync=1)' : null,
+                       calls: 0, async: 0, sync: 0, blocked: 0, invalidations: 0, pinned: 0, pool: 0,
+                       seq: FB_WITNESS ? [] : null };
+  // Glide64_Ini.c's read_always = 1 branches, by the name each one tests
+  // (HAVE_HWFBE is not defined in this build, so the #ifndef branches apply).
+  var FB_READ_ALWAYS = ['MARIOKART64', 'POKEMON SNAP', 'DONKEY KONG 64', 'BANJO TOOIE',
+                        'Banjo-Kazooie', 'BANJO KAZOOIE 2', 'CASTLEVANIA', 'RIDGE RACER 64'];
+  function romInternalName(bytes) {
+    if (!bytes || bytes.length < 0x40) return null;
+    var b = bytes, sig = (b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3]) >>> 0, s = '';
+    for (var i = 0x20; i < 0x34; i++) {
+      var j = i;                                       // .z64: native big-endian
+      if (sig === 0x37804012) j = i ^ 1;               // .v64: 16-bit byte-swapped
+      else if (sig === 0x40123780) j = i ^ 3;          // .n64: 32-bit word-swapped
+      else if (sig !== 0x80371240) return null;
+      s += String.fromCharCode(b[j]);
+    }
+    return s.replace(/\0/g, '').replace(/ +$/, '');
+  }
+  window.__fbDecide = function (bytes) {
+    var st = window.__fbAsync, name = romInternalName(bytes);
+    st.romName = name;
+    var hit = null;
+    if (name) for (var i = 0; i < FB_READ_ALWAYS.length; i++) if (name.indexOf(FB_READ_ALWAYS[i]) >= 0) { hit = FB_READ_ALWAYS[i]; break; }
+    st.readAlways = !!hit;
+    if (FB_FORCE === '1') { st.on = true; st.decided = 'forced on (?fbasync=1)'; }
+    else if (FB_FORCE === '0') { st.on = false; st.decided = 'opted out (?fbasync=0)'; }
+    else { st.on = !!hit; st.decided = hit ? 'read_always title (' + hit + ')' : 'off — glide does not read this title back every frame'; }
+    return st.on;
+  };
+  if (window.WebGL2RenderingContext) {
+    (function () {
+      var P = WebGL2RenderingContext.prototype, orig = P.readPixels;
+      var st = window.__fbAsync, ctxs = [], hooked = false;
+      // A pack buffer: { gl, buf, bytes, key, fence, refs }. refs counts the
+      // owners — "pending" (the next call hands it over) and every snapshot
+      // that pinned it. Only a buffer with refs 0 is ever written again.
+      var fbOf = function (gl) {
+        if (!gl.__fb) { gl.__fb = { pending: null, pool: [] }; ctxs.push(gl); }
+        return gl.__fb;
+      };
+      var unref = function (b) {
+        if (!b || --b.refs > 0) return;
+        if (b.fence) { try { b.gl.deleteSync(b.fence); } catch (e) {} b.fence = null; }
+        var fb = fbOf(b.gl);
+        if (fb.pool.length < 16) { fb.pool.push(b); st.pool = fb.pool.length; }
+        else { try { b.gl.deleteBuffer(b.buf); } catch (e) {} }
+      };
+      var acquire = function (gl, bytes, key) {
+        var fb = fbOf(gl), b = null;
+        for (var i = 0; i < fb.pool.length; i++) if (fb.pool[i].bytes === bytes) { b = fb.pool.splice(i, 1)[0]; break; }
+        if (!b) {
+          b = { gl: gl, buf: gl.createBuffer(), bytes: bytes, key: key, fence: null, refs: 0 };
+          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, b.buf);
+          gl.bufferData(gl.PIXEL_PACK_BUFFER, bytes, gl.STREAM_READ);
+          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+        }
+        b.key = key; b.refs = 1;
+        st.pool = fb.pool.length;
+        return b;
+      };
+      var dropPending = function () {
+        for (var c = 0; c < ctxs.length; c++) { var fb = ctxs[c].__fb; if (fb.pending) { unref(fb.pending); fb.pending = null; } }
+      };
+      st.invalidate = function (why) { dropPending(); st.invalidations++; st.lastInvalidation = why || 'call'; };
+      // ROLLBACK / RUN-AHEAD: pin what the NEXT call would hand over.
+      st.snapshot = function () {
+        var out = [];
+        for (var c = 0; c < ctxs.length; c++) {
+          var p = ctxs[c].__fb.pending;
+          if (p) { p.refs++; st.pinned++; }
+          out.push([ctxs[c], p]);
+        }
+        return out;
+      };
+      st.restore = function (snap) {
+        if (!snap) return;
+        dropPending();
+        for (var i = 0; i < snap.length; i++) {
+          var fb = fbOf(snap[i][0]), p = snap[i][1];
+          if (p) p.refs++;
+          fb.pending = p;
+        }
+        st.restores = (st.restores | 0) + 1;
+      };
+      st.release = function (snap) {
+        if (!snap) return;
+        for (var i = 0; i < snap.length; i++) if (snap[i][1]) { unref(snap[i][1]); st.pinned--; }
+      };
+      var hookCore = function () {
+        var M = window.Module;
+        if (hooked || !M || typeof M._neil_reset !== 'function') return;
+        hooked = true;
+        ['_neil_reset', '_neil_unserialize'].forEach(function (n) {
+          var f = M[n]; if (typeof f !== 'function') return;
+          M[n] = function () { st.invalidate(n); return f.apply(this, arguments); };
+        });
+      };
+      // The witness: FNV-1a over every 61st byte of what the core was handed
+      // (~20 K reads of a 640x480 copy) — cheap enough not to move the timing.
+      var witness = function (x, y, w, h, u8, from, bytes, mode, blocked) {
+        var hsh = 2166136261 >>> 0;
+        hsh = Math.imul(hsh ^ (x * 65599 + y) , 16777619) >>> 0;
+        hsh = Math.imul(hsh ^ (w * 65599 + h), 16777619) >>> 0;
+        for (var i = from; i < from + bytes; i += 61) hsh = Math.imul(hsh ^ u8[i], 16777619) >>> 0;
+        if (st.seq.length < 40000) st.seq.push([st.calls, hsh, mode, blocked ? 1 : 0]);
+      };
+      P.readPixels = function (x, y, w, h, format, type, dst, dstIndex) {
+        var gl = this;
+        if (!st.on && !st.seq) return orig.apply(gl, arguments);
+        st.calls++;
+        if (!hooked) hookCore();
+        if (st.bypass || arguments.length < 7 || !dst || typeof dst !== 'object' || !dst.buffer ||
+            format !== gl.RGBA || type !== gl.UNSIGNED_BYTE || gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING)) {
+          st.sync++; return orig.apply(gl, arguments);
+        }
+        var bytes = w * h * 4;
+        var dstByte = dst.byteOffset + ((dstIndex | 0) * (dst.BYTES_PER_ELEMENT || 1));
+        if (dstByte + bytes > dst.buffer.byteLength) { st.sync++; return orig.apply(gl, arguments); }
+        var u8 = st.seq ? new Uint8Array(dst.buffer) : null;
+        if (!st.on) {                                       // witness only: the shipped synchronous read
+          var r0 = orig.apply(gl, arguments); st.sync++;
+          witness(x, y, w, h, u8, dstByte, bytes, 0, false);
+          return r0;
+        }
+        var key = x + ',' + y + ',' + w + 'x' + h + ':' + format + ':' + type;
+        var fb = fbOf(gl);
+        // A different rect than the pending copy: it is from before the switch.
+        if (fb.pending && fb.pending.key !== key) { unref(fb.pending); fb.pending = null; st.invalidations++; st.lastInvalidation = 'rect'; }
+        // 1. start this call's copy into a free pack buffer — no wait
+        var cur = acquire(gl, bytes, key);
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, cur.buf);
+        orig.call(gl, x, y, w, h, format, type, 0);
+        cur.fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+        var dstView = new Uint8Array(dst.buffer, dstByte, bytes);
+        if (!fb.pending) {
+          // Nothing older exists (first call, or just dropped): hand over THIS
+          // copy — the synchronous read — and keep it pending as well, so the
+          // NEXT call hands over this one: the one-call offset from here on.
+          gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, dstView);
+          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+          st.sync++;
+          if (u8) witness(x, y, w, h, u8, dstByte, bytes, 0, false);
+          fb.pending = cur;
+          return;
+        }
+        // 2. hand the core the PREVIOUS copy — complete, blocking if it must
+        var prev = fb.pending;
+        var blocked = !!(prev.fence && gl.getSyncParameter(prev.fence, gl.SYNC_STATUS) !== gl.SIGNALED);
+        if (blocked) st.blocked++;
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, prev.buf);
+        gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, dstView);
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+        unref(prev);                                         // consumed (a pinned copy survives)
+        fb.pending = cur;
+        st.async++;
+        if (u8) witness(x, y, w, h, u8, dstByte, bytes, 1, blocked);
+      };
+    })();
+  }
   var glFacts = { webgl2: false };
   (function glProbe() {
     if (new URLSearchParams(location.search).has('noglprobe')) { glFacts.skipped = true; return; }
@@ -1880,6 +2103,9 @@ N64Rate.selfTest = function (logFn) {
     return L.join('\n');
   }
   function openDiag() {
+    // The draw witness (a GPU sync per read) runs only now that a report was
+    // asked for: ten reads over the next ten seconds, verdict in the log.
+    try { if (typeof LS_GL !== 'undefined' && LS_GL.want !== Infinity) { LS_GL.want = 10; LS_GL.said = ''; LS_GL.reads = 0; LS_GL.lit = 0; } } catch (e) {}
     var t = diagText();
     $('diagVerdict').textContent = verdictLine();
     $('diagText').textContent = t;
@@ -2012,33 +2238,51 @@ N64Rate.selfTest = function (logFn) {
   // it lands there in every build.
   var fpsTextAt = null, fpsMiss = 0, lastScanAt = 0;
 
-  function scanForFpsText() {
-    try {
-      if (!window.Module || !Module.HEAPU8) return null;
-      var H = Module.HEAPU8, dec = new TextDecoder('latin1');
-      var CH = 1 << 22, RE = /^FPS: \d+ GameFPS: \d+/;
-      for (var base = 0; base < H.length; base += CH) {
-        var s = dec.decode(H.subarray(base, Math.min(base + CH + 64, H.length)));
-        var i = -1;
-        while ((i = s.indexOf('FPS: ', i + 1)) !== -1) {
-          // The rodata format strings "FPS: %d GameFPS: %d" live in this heap too and the scan
-          // reaches them FIRST (they sit near offset 21 K). The digit requirement is what makes
-          // this land on the formatted buffer instead — ?ratetest=1 S17a pins that down.
-          if (RE.test(s.slice(i, i + 40))) return base + i;
-        }
+  // ⚠ SCANNED IN SLICES, NEVER IN ONE TASK. The buffer sits above 158 MB of a
+  // 512 MB heap, and the old scan decoded everything below it in ONE call from
+  // the 1 s paint timer — on a phone that is a single long task of hundreds of
+  // ms ("TimerHandler:setInterval" in the user's own long-animation-frame
+  // report), repeated every 4 s whenever the parse missed. Now a job decodes
+  // 1 MB slices for at most FPS_SCAN_BUDGET_MS per slice-task, yields, and
+  // resumes 20 ms later, until it finds the buffer or reaches the end.
+  var FPS_SCAN_BUDGET_MS = 4, fpsScan = { pos: 0, busy: false, dec: null, passes: 0 };
+  function scanForFpsTextStep() {
+    if (!window.Module || !Module.HEAPU8) return null;
+    var H = Module.HEAPU8, CH = 1 << 20, RE = /^FPS: \d+ GameFPS: \d+/, t0 = performance.now();
+    var dec = fpsScan.dec || (fpsScan.dec = new TextDecoder('latin1'));
+    while (fpsScan.pos < H.length) {
+      var base = fpsScan.pos;
+      var s = dec.decode(H.subarray(base, Math.min(base + CH + 64, H.length)));
+      var i = -1;
+      while ((i = s.indexOf('FPS: ', i + 1)) !== -1) {
+        // The rodata format strings "FPS: %d GameFPS: %d" live in this heap too and the scan
+        // reaches them FIRST (they sit near offset 21 K). The digit requirement is what makes
+        // this land on the formatted buffer instead — ?ratetest=1 S17a pins that down.
+        if (RE.test(s.slice(i, i + 40))) { fpsScan.pos = 0; return base + i; }
       }
-    } catch (e) {}
+      fpsScan.pos += CH;
+      if (performance.now() - t0 > FPS_SCAN_BUDGET_MS) return -1;      // more to do: resume later
+    }
+    fpsScan.pos = 0; fpsScan.passes++;
     return null;
+  }
+  function fpsScanRun() {
+    if (fpsScan.busy) return;
+    fpsScan.busy = true;
+    (function step() {
+      var r = null;
+      try { r = scanForFpsTextStep(); } catch (e) { r = null; }
+      if (r === -1) { setTimeout(step, 20); return; }
+      fpsScan.busy = false;
+      if (r !== null && r > 0) { fpsTextAt = r; pageLog('[rate] core frame counters found at heap 0x' + r.toString(16)); }
+    })();
   }
   function readCoreFps() {
     if (!window.Module || !Module.HEAPU8) return null;
     var now = Date.now();
     if (fpsTextAt === null) {
-      if (now - lastScanAt < 4000) return null;
-      lastScanAt = now;
-      fpsTextAt = scanForFpsText();
-      if (fpsTextAt !== null) pageLog('[rate] core frame counters found at heap 0x' + fpsTextAt.toString(16));
-      else return null;
+      if (!fpsScan.busy && now - lastScanAt >= 4000) { lastScanAt = now; fpsScanRun(); }
+      return null;
     }
     var H = Module.HEAPU8, e = fpsTextAt;
     while (e < fpsTextAt + 48 && H[e] !== 0) e++;
@@ -2054,7 +2298,7 @@ N64Rate.selfTest = function (logFn) {
   // MUST run several times a second — see N64Rate.AUDIO_MAX_GAP_MS.
   setInterval(function () {
     if (!running || !window.Module || !Module._neilGetAudioWritePosition) return;
-    try { rate.audioSample(Module._neilGetAudioWritePosition(), performance.now()); } catch (e) {}
+    try { rate.audioSample((Module._neilGetAudioWritePosition() - AUD_DROPPED + 64000) % 64000, performance.now()); } catch (e) {}
   }, 200);
 
   function paintRate() {
@@ -2300,6 +2544,9 @@ N64Rate.selfTest = function (logFn) {
     // Surface core prints in our log pane and flip status when the game starts.
     var origPrint = app.processPrintStatement.bind(app);
     app.processPrintStatement = function (text) {
+      // The raw savestate calls (rollback, run-ahead: every frame) print
+      // "save state"/"load state" from the core; nothing else prints then.
+      if (N64S.quiet) return;
       origPrint(text);
       pageLog('> ' + text);
       if (String(text).indexOf('Starting R4300 emulator') !== -1) {
@@ -2357,7 +2604,10 @@ N64Rate.selfTest = function (logFn) {
           if (e.data.u > lastUnderruns) { app.rivetsData.audioSkipCount += (e.data.u - lastUnderruns); lastUnderruns = e.data.u; }
           window.__audioDbg = e.data; // diagnostics (b=backlog, u=dry calls, m=missing entries)
         };
-        setInterval(function () {
+        // The pump is callable on its own: rollback and run-ahead drain it
+        // BEFORE they re-run frames (so every sample a real frame produced is
+        // already queued) and then drop what the re-run produced (__n64AudioDrop).
+        var pump = function () {
           if (app.rivetsData.beforeEmulatorStarted) return;
           var write = Module._neilGetAudioWritePosition();
           var read = self.audioReadPosition;
@@ -2380,7 +2630,10 @@ N64Rate.selfTest = function (logFn) {
           // the audio-governs-gameplay coupling behind 'the whole game slows
           // when audio breaks'. Pacing belongs to IsFrameReady alone; the
           // worklet DRC absorbs clock drift and the ring bounds overshoot.
-        }, 8);
+        };
+        app.__n64AudioPump = pump;
+        app.__n64AudioDrop = function () { self.audioReadPosition = Module._neilGetAudioWritePosition(); };
+        setInterval(pump, 8);
         pageLog('[audio] AudioWorklet pump active');
       }).catch(function (err) {
         pageLog('[audio] worklet failed (' + err + '); falling back to ScriptProcessor');
@@ -2516,6 +2769,9 @@ N64Rate.selfTest = function (logFn) {
       };
       p_fcr31_seen = p.fcr31;
       p_delayslot_seen = p.delaySlot;
+      // For rollback's code-preserving load (n64sCodeKeep): where the core
+      // keeps invalid_code[] and RDRAM. Fixed for the life of the core.
+      if (!window.__n64CorePtrs && p.invalidCode && p.dramBase) window.__n64CorePtrs = { invalidCode: p.invalidCode, dramBase: p.dramBase };
       var entryOpsIdx = Module.HEAPU32[p.entryPtr >> 2];
       var idx = 0;
       if (mode === 'emit' && window.bementalMips) {
@@ -2621,6 +2877,14 @@ N64Rate.selfTest = function (logFn) {
       // does not parse, viHz stays null and every VI-derived figure is withheld.
       mark('rom-downloaded');
       romRegion = window.N64Rate.regionFromRom(bytes);
+      // Framebuffer readback mode, decided from the SAME header BEFORE the core
+      // boots, so glide's first readback already takes the chosen path.
+      try {
+        window.__fbDecide(bytes);
+        facts.fbasync = '[fb] ' + (window.__fbAsync.romName || '?') + ': readback ' + (window.__fbAsync.on ? 'ASYNC' : 'sync')
+          + ' — ' + window.__fbAsync.decided;
+        pageLog(facts.fbasync);
+      } catch (e) { pageLog('[fb] readback decision failed: ' + ((e && e.message) || e)); }
       rate.setViHz(romRegion ? romRegion.viHz : 0);
       rate.relatch();
       // The governor's wall-clock schedule is `viHz x elapsed`, so it needs the SAME region
@@ -2845,7 +3109,7 @@ N64Rate.selfTest = function (logFn) {
 
   function resetGame() { if (!running) return toast('Emulator not running', true); window.Module._neil_reset(); toast('Reset'); }
   function toggleFullscreen() { var el = isMobile ? $('mobileShell') : $('canvasDiv'); if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } else { var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen; if (fn) fn.call(el).catch(() => {}); } }
-  $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnExport').addEventListener('click', exportState); $('btnImport').addEventListener('click', importState); $('btnMute').addEventListener('click', toggleMute); $('btnReset').addEventListener('click', resetGame); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; });
+  $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnExport').addEventListener('click', exportState); $('btnImport').addEventListener('click', importState); $('btnMute').addEventListener('click', toggleMute); $('btnReset').addEventListener('click', resetGame); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; if (logEl.style.display === 'block') logEl.scrollTop = logEl.scrollHeight; });
 
   // ---- diagnostics wiring -----------------------------------------------------------------
   // Three entry points, because the report is worthless if it is only reachable from a state
@@ -3054,7 +3318,10 @@ N64Rate.selfTest = function (logFn) {
     var qs = new URLSearchParams(location.search);
     if (qs.has('game')) {
       var g = qs.get('game');
-      var idx = ROMS.findIndex(function (r) { return r.file === g || r.file === g + '.z64'; });
+      // By FILE or by LABEL: the lobby hands games over by label (?np=&game=), and
+      // every n64/tools rig asks for "Mario Kart 64" — which used to match nothing
+      // here, so `?game=Mario Kart 64&autostart` silently booted ROMS[0] instead.
+      var idx = ROMS.findIndex(function (r) { return r.file === g || r.file === g + '.z64' || r.label === g; });
       if (idx < 0 && /^\d+$/.test(g) && +g < ROMS.length) idx = +g;
       if (idx >= 0) { ['romSelect', 'mobileRomSelect'].forEach(function (id) { var s = $(id); if (s) s.value = String(idx); }); }
     }
@@ -3435,6 +3702,13 @@ N64Rate.selfTest = function (logFn) {
     if (!known && inRoom && !isHostSide) return {};
     var ports = known || [0];
     var out = {};
+    // TEST SEAM (n64/tools/n64_rollback_probe.mjs): a scripted pad that is a
+    // pure function of the engine frame, so a straight reference run can be
+    // given exactly the input this console played. Absent unless a rig sets it.
+    if (window.__n64PadOverride && ls) {
+      ports.forEach(function (port) { out[port] = window.__n64PadOverride(ls.frame | 0, port); });
+      return out;
+    }
     ports.forEach(function (port, k) { out[port] = lsPackLocal(k); });
     return out;
   }
@@ -3462,11 +3736,25 @@ N64Rate.selfTest = function (logFn) {
   // header and is never defaulted — with an unreadable header this returns true
   // and the room runs at whatever rate the feed achieves, which is stated in the
   // report rather than hidden behind a guessed 60.
+  // ?lsrepay=MS — A MEASUREMENT ARM, OFF BY DEFAULT. How much debt a console may
+  // run back to its 1.000x schedule (never ahead of it) after a stall or a late
+  // frame. The shipped value is two field periods (below); gate #9 governs any
+  // change to the default. Exists so the cost of NOT repaying can be measured
+  // on the real page (n64/tools/party_ghost_probe.mjs --query lsrepay=400).
+  var LS_REPAY_MS = Math.max(0, +(new URLSearchParams(location.search).get('lsrepay') || 0) || 0);
+  // ?lsdrive=raf|timer|all — WHICH DRIVERS may run a lockstep frame. A
+  // measurement arm; 'all' (rAF + 4 ms timer + input-arrival kick) is the
+  // shipped default.
+  var LS_DRIVE = (new URLSearchParams(location.search).get('lsdrive') || 'all');
+  function lsDriveOk(src) { return LS_DRIVE === 'all' || LS_DRIVE === src; }
   function lsDueNow() {
     if (!(LS.viHz > 0)) return true;
     var now = performance.now();
     if (!LS.baseWall) { LS.baseWall = now; LS.baseFrame = LS.frame; return true; }
-    var period = 1000 / LS.viHz;
+    // rbPace() (adaptive rollback room): a multiplier just under 1 while this
+    // console leads a peer that cannot close the gap — a SLOWER period, the
+    // one direction gate 9 allows. 1 everywhere else.
+    var period = 1000 / LS.viHz / ((LS.pace > 0 && LS.pace <= 1) ? LS.pace : 1);
     var due = LS.baseWall + ((LS.frame - LS.baseFrame) * period);
     if (now < due) return false;
     // ⚠ TIME LOST IS NEVER REPAID, AND THIS IS THE LINE THAT ENFORCES IT.
@@ -3480,7 +3768,7 @@ N64Rate.selfTest = function (logFn) {
     // re-anchoring: the guest resumes at exactly 1.000x from here, and the
     // seconds lost stay lost — which is correct, because every machine in the
     // room lost them.
-    if (now - due > period * 2) {
+    if (now - due > Math.max(period * 2, LS_REPAY_MS)) {
       // The debt being discarded is time this console LOST WITHOUT WAITING — a
       // frame that ran late on this device. Counted, and published to the room
       // (ls.selfLostMs), so a late-running device is named as such.
@@ -3489,10 +3777,553 @@ N64Rate.selfTest = function (logFn) {
     }
     return true;
   }
-  function lsRunOneFrame(img) {
+  // ═══════════════════════════════════════════════════════════════════════════
+  // EXACT SAVESTATES IN MEMORY — what rollback and run-ahead stand on.
+  //
+  // The core exports one savestate pair, _neil_serialize / _neil_unserialize
+  // (libretronew.c neil_serialize/neil_unserialize): savestates_save_m64p into
+  // the static 16.8 MB `savestate_buffer`, then gzip it to MEMFS
+  // /savestate.gz; the load gunzips that file back into the buffer and runs
+  // savestates_load_m64p on it. The gzip is the whole cost (a full-state
+  // deflate, per save) and nothing about exactness depends on it, so for the
+  // raw path '/savestate.gz' is made a DIRECTORY for the duration of one call:
+  // gzopen() then fails (EISDIR), gzwrite/gzread/gzclose on a NULL or failed
+  // stream return without touching the buffer (zlib checks), and what is left
+  // is exactly savestates_save_m64p / savestates_load_m64p on
+  // `savestate_buffer` — whose address is found once, by its own header
+  // ("M64+SAVE", version 0x00010000, the ROM's 32-hex-digit MD5), right after
+  // the first save. The load's return value is savestates_load_m64p's, so a
+  // corrupt or foreign buffer is refused (magic / version / MD5), not loaded.
+  // myApp.SaveStateEvent (the IndexedDB upload of /savestate.gz) and the core's
+  // printf("save state") are silenced for these calls only; a player's own
+  // Save State button is untouched (the directory exists only inside a call,
+  // and a player's /savestate.gz is moved aside and back around it).
+  //
+  // ⚠ This is the SAME exact state the Save State button writes — nothing is
+  // added or left out — so whatever it does not capture (the video plugin's
+  // own caches) is not captured here either; n64/tools/n64_rollback_probe.mjs
+  // measures whether a loaded state re-runs bit-for-bit (full-state hash, RDRAM
+  // included) before this is trusted with a room.
+  //
+  // ⚠ Swap to neil_state_save_raw / neil_state_load_raw (or whatever the core
+  // track lands in n64/N64Wasm/dist) when they exist: n64sCall() is the one
+  // place that would change.
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Rollback / run-ahead audio: everything real frames produced goes to the
+  // output first; what the re-run frames then produce is skipped. The fallback
+  // ScriptProcessor path (no AudioWorklet) has no pump to drain, so a re-run
+  // there skips from wherever it had read to — a short gap, never a repeat.
+  function audioFlushNow() { try { var a = window.myApp; if (a && a.__n64AudioPump) a.__n64AudioPump(); } catch (e) {} }
+  // Samples dropped this way, in ring entries: the rate meter's audio witness
+  // reads the core's write position, and re-simulated / hidden frames move it
+  // without one sample of them being played — so they are subtracted
+  // (MEASURED before this: a rollback room at 0.935x read "speed 1.276x").
+  var AUD_DROPPED = 0;
+  function audioDropNow() {
+    try {
+      var a = window.myApp; if (!a) return;
+      if (window.Module && Module._neilGetAudioWritePosition && typeof a.audioReadPosition === 'number')
+        AUD_DROPPED = (AUD_DROPPED + ((Module._neilGetAudioWritePosition() - a.audioReadPosition + 64000) % 64000)) % 64000;
+      if (a.__n64AudioDrop) a.__n64AudioDrop();
+      else if (window.Module && Module._neilGetAudioWritePosition) a.audioReadPosition = Module._neilGetAudioWritePosition();
+    } catch (e) {}
+  }
+  var N64S = { ptr: 0, size: 16788288 + 1024, located: false, fault: null, quiet: false, smPtr: 0,
+               saves: 0, loads: 0, saveMs: 0, loadMs: 0, maxSaveMs: 0, maxLoadMs: 0,
+               codeKept: 0, codeDropped: 0, keepLoads: 0 };
+  // ?keepcode=0: every load pays the full recompile (the control arm for n64sCodeKeep).
+  var N64S_KEEP_CODE = new URLSearchParams(location.search).get('keepcode') !== '0';
+  // savestates.c savestates_save_m64p's layout: 448 B of registers, 8 MB RDRAM,
+  // then SP mem + PIF + flashram, 2 x 4 MB tlb_LUT, then CPU/TLB/PC/queue.
+  var N64S_RDRAM = 0x800000, N64S_HDR = 448, N64S_SPPIF = 8192 + 64 + 24, N64S_LUT = 0x800000;
+  function n64sGz(off) {
+    var FS = window.Module && Module.FS; if (!FS) return false;
+    if (off) {
+      var st = null; try { st = FS.stat('/savestate.gz'); } catch (e) {}
+      if (st && FS.isDir(st.mode)) return true;
+      if (st) FS.rename('/savestate.gz', '/savestate.gz.user');
+      FS.mkdir('/savestate.gz');
+    } else {
+      try { FS.rmdir('/savestate.gz'); } catch (e) {}
+      try { FS.stat('/savestate.gz.user'); FS.rename('/savestate.gz.user', '/savestate.gz'); } catch (e) {}
+    }
+    return true;
+  }
+  function n64sLocate() {
+    var H = Module.HEAPU8, n = (H.length >>> 2) - 16, u32 = new Uint32Array(H.buffer, 0, n);
+    for (var i = 0; i < n; i++) {
+      if (u32[i] !== 0x2B34364D) continue;                                       // "M64+"
+      var o = i << 2;
+      if (H[o + 4] !== 0x53 || H[o + 5] !== 0x41 || H[o + 6] !== 0x56 || H[o + 7] !== 0x45) continue;   // "SAVE"
+      if (H[o + 8] !== 0 || H[o + 9] !== 1 || H[o + 10] !== 0 || H[o + 11] !== 0) continue;             // 0x00010000
+      var hex = true;
+      for (var k = 12; k < 44 && hex; k++) { var c = H[o + k]; hex = (c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102); }
+      if (hex && o + N64S.size <= H.length) return o;
+    }
+    return 0;
+  }
+  function n64sCall(fn) {
+    var app = window.myApp, ev = app && app.SaveStateEvent, r = 0;
+    if (app) app.SaveStateEvent = function () {};
+    N64S.quiet = true;
+    try { n64sGz(true); r = fn() | 0; }
+    finally { n64sGz(false); N64S.quiet = false; if (app) app.SaveStateEvent = ev; }
+    return r;
+  }
+  // The bytes after the event queue's 0xFFFFFFFF terminator are never written
+  // by a save (the queue is variable-length), so they are zeroed before each
+  // one: a slot is then a pure function of the guest state, on every console.
+  function n64sZeroTail() { Module.HEAPU8.fill(0, N64S.ptr + N64S.size - 2048, N64S.ptr + N64S.size); }
+  // ⚠ THE SAVESTATE LEAVES OUT THE CARTRIDGE'S SAVE MEMORY — and a game writes
+  // it while it plays. savestates_save_m64p captures RDRAM, RSP, CPU, TLB and
+  // the event queue, but not `saved_memory` (EEPROM, the four controller paks,
+  // SRAM, FlashRAM: libretro_memory.h). MEASURED: Mario Kart 64 rewrites its
+  // EEPROM every few frames from frame 80 to 206 of a fresh boot (it formats
+  // it), and a rollback across those writes left the re-simulated console
+  // reading the FUTURE's EEPROM — n64_rollback_probe diverged from a straight
+  // run at exactly frame 210, rollback on or adaptive, every time. So each slot
+  // carries those 290 KB too (eeprom 2 KB + paks 128 KB + SRAM 32 KB + flash
+  // 128 KB, one contiguous struct), restored with the state. The struct is
+  // found by its own layout: the core formats each controller pak with the
+  // fixed header format_mempak writes (si/mempak.c: 81 01 02 03 04 05 06 07
+  // ...), four of them 32 KB apart, the EEPROM 2 KB before the first; the
+  // EEPROM is cross-checked against the core's own export (neil_export_eep).
+  // A room boots with fresh save memory (LoadSram is neutered in a room), so
+  // the headers are there to be found.
+  var N64S_SM = 0x800 + 4 * 0x8000 + 0x8000 + 0x20000;
+  function n64sLocateSaveMem() {
+    var M = window.Module, H = M.HEAPU8, n = H.length - N64S_SM - 8;
+    var sig = [0x81, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
+    var ok = function (o) { for (var i = 0; i < 8; i++) if (H[o + i] !== sig[i]) return false; return true; };
+    var eep = null;
+    try {
+      var app = window.myApp, ev = app && app.ExportEepEvent;
+      if (app) app.ExportEepEvent = function () {};
+      N64S.quiet = true;
+      try { M._neil_export_eep(); eep = M.FS.readFile('/game.eep'); } finally { N64S.quiet = false; if (app) app.ExportEepEvent = ev; }
+    } catch (e) { eep = null; }
+    var found = [];
+    for (var o = H.indexOf(0x81, 0x800); o >= 0 && o < n; o = H.indexOf(0x81, o + 1)) {
+      if (!ok(o) || !ok(o + 0x8000) || !ok(o + 0x10000) || !ok(o + 0x18000)) continue;
+      var x = o - 0x800, same = true;
+      if (eep && eep.length === 0x800) for (var k = 0; k < 0x800 && same; k++) same = H[x + k] === eep[k];
+      if (same) found.push(x);
+      if (found.length > 1) break;
+    }
+    return found.length === 1 ? found[0] : 0;
+  }
+  function n64sSaveMem(dst) {
+    var H = window.Module.HEAPU8;
+    if (!N64S.smPtr) {
+      N64S.smPtr = n64sLocateSaveMem();
+      if (!N64S.smPtr) { N64S.fault = 'the core\'s save memory (EEPROM/paks/SRAM/flash) was not found in its heap, so a rollback could not restore it'; return false; }
+      pageLog('[state] save memory (EEPROM, paks, SRAM, flash) at heap 0x' + N64S.smPtr.toString(16) + ': carried in every rollback slot');
+    }
+    dst.set(H.subarray(N64S.smPtr, N64S.smPtr + N64S_SM), N64S.size);
+    return true;
+  }
+  function n64sSave(dst) {
+    var M = window.Module, t0 = performance.now();
+    if (N64S.located) n64sZeroTail();
+    if (!n64sCall(function () { return M._neil_serialize(); })) { N64S.fault = 'neil_serialize refused (savestates_save_m64p returned 0)'; return false; }
+    if (!N64S.located) {
+      var p = n64sLocate();
+      if (!p) { N64S.fault = 'the core\'s savestate buffer was not found in its heap'; return false; }
+      N64S.ptr = p; N64S.located = true;
+      pageLog('[state] exact savestate buffer at heap 0x' + p.toString(16) + ' (' + N64S.size + ' B): raw save/load, no gzip');
+      n64sZeroTail();
+      if (!n64sCall(function () { return M._neil_serialize(); })) { N64S.fault = 'neil_serialize refused'; return false; }
+    }
+    if (dst) {
+      dst.set(M.HEAPU8.subarray(N64S.ptr, N64S.ptr + N64S.size));
+      if (!n64sSaveMem(dst)) return false;
+    }
+    var dt = performance.now() - t0;
+    N64S.saves++; N64S.saveMs += dt; if (dt > N64S.maxSaveMs) N64S.maxSaveMs = dt;
+    return true;
+  }
+  // ⚠ A LOAD THROWS AWAY EVERY COMPILED BLOCK, AND MOST OF THEM ARE STILL RIGHT.
+  // savestates_load_set_pc ends in invalidate_r4300_cached_code(0,0), which
+  // sets invalid_code[] for all 1 M pages (cached_interp.c:603-607), so every
+  // block the game touches next is re-decoded and — with the JIT on — re-emitted
+  // as a fresh WebAssembly module, synchronously. MEASURED (n64_state_exact_probe,
+  // this box): the first frame after a load cost 47.8 ms p50 / 124 ms max against
+  // ~1 ms for an ordinary frame, so a rollback cost ~150 ms and a room ran at
+  // 0.54x. But a block compiled from a page is a pure function of that page's
+  // bytes, and a rollback goes back a handful of frames: the code pages are
+  // almost always the SAME bytes in the state being loaded. So, for the
+  // directly mapped segments (KSEG0 0x80000000 and KSEG1 0xA0000000, where
+  // this is exactly true — TLB-mapped pages are left invalidated, since their
+  // mapping is part of the state), every page that held valid compiled code
+  // before the load and whose 4 KB of RDRAM are byte-identical in the loaded
+  // state gets its invalid_code[] entry put back to 0 after the load. A page
+  // whose bytes differ (an overlay DMA'd in between) stays invalid and is
+  // recompiled, exactly as before. The two addresses come from the core itself:
+  // the JIT's parameter block carries &invalid_code[0] and the RDRAM base
+  // (recomp.c jit_params[31] and [24]); with the JIT off (?jit=off) they are
+  // unknown and every load pays the full recompile, as it always did.
+  function n64sCodeKeep(src) {
+    var P = window.__n64CorePtrs;
+    if (!P || !P.invalidCode || !P.dramBase || (P.dramBase & 3)) return null;
+    var H8 = Module.HEAPU8, H32 = Module.HEAPU32, ic = P.invalidCode, dw = P.dramBase >>> 2;
+    var S32 = new Uint32Array(src.buffer, src.byteOffset + N64S_HDR, N64S_RDRAM >>> 2);
+    var keep = [], same = new Int8Array(N64S_RDRAM >>> 12), bases = [0x80000, 0xA0000];
+    for (var r = 0; r < 2; r++) {
+      for (var j = 0; j < same.length; j++) {
+        var idx = bases[r] + j;
+        if (H8[ic + idx] !== 0) continue;
+        if (!same[j]) {
+          var a = dw + (j << 10), b = j << 10, eq = 1;
+          for (var w = 0; w < 1024; w++) if (H32[a + w] !== S32[b + w]) { eq = -1; break; }
+          same[j] = eq;
+        }
+        if (same[j] === 1) keep.push(idx);
+        else N64S.codeDropped++;
+      }
+    }
+    return keep;
+  }
+  function n64sLoad(src) {
+    var M = window.Module, t0 = performance.now();
+    if (!N64S.located) { N64S.fault = 'a load before any save'; return false; }
+    var keep = N64S_KEEP_CODE ? n64sCodeKeep(src) : null;
+    M.HEAPU8.set(src.subarray(0, N64S.size), N64S.ptr);
+    if (!n64sCall(function () { return M._neil_unserialize(); })) { N64S.fault = 'neil_unserialize refused the state (savestates_load_m64p returned 0)'; return false; }
+    // The cartridge/controller save memory, which the savestate leaves out.
+    if (N64S.smPtr) M.HEAPU8.set(src.subarray(N64S.size, N64S.size + N64S_SM), N64S.smPtr);
+    if (keep) {
+      var H8 = M.HEAPU8, ic = window.__n64CorePtrs.invalidCode;
+      for (var i = 0; i < keep.length; i++) H8[ic + keep[i]] = 0;
+      N64S.codeKept += keep.length; N64S.keepLoads++;
+    }
+    var dt = performance.now() - t0;
+    N64S.loads++; N64S.loadMs += dt; if (dt > N64S.maxLoadMs) N64S.maxLoadMs = dt;
+    return true;
+  }
+  // FNV-1a over u32 words [from, to) of a byte buffer (4-aligned offsets).
+  function n64sFnv(h, u8, from, to) {
+    var w = new Uint32Array(u8.buffer, u8.byteOffset + from, (to - from) >>> 2);
+    for (var i = 0; i < w.length; i++) h = Math.imul(h ^ w[i], 16777619) >>> 0;
+    return h >>> 0;
+  }
+  // The FULL state, every byte (RDRAM, RSP memory, the TLB tables, the CPU):
+  // for rigs that compare a console against itself (n64_rollback_probe). ⚠ Not
+  // for a room: under read_always glide copies the RENDERED frame into RDRAM,
+  // and two different GPUs rasterise a few pixels differently — the room would
+  // "desync" on pixels no guest instruction ever read.
+  function n64sHashFull(u8) { return n64sFnv(2166136261, u8, 0, u8.length & ~3); }
+  // The ROOM fingerprint of a saved state: the CPU fingerprint the lockstep path
+  // already compares (_neil_last_fp: GPRs, CP0, FPRs, FCR31, PC — kept with the
+  // slot), plus every device register, the RSP's 4 KB+4 KB, the PIF RAM, the
+  // TLB and the interrupt event queue — every byte of the state that is not
+  // RDRAM or the derived TLB lookup tables. The layout is savestates.c
+  // savestates_save_m64p's: 448 B of registers, 8 MB RDRAM, then SP mem +
+  // PIF + flashram, 2 x 4 MB tlb_LUT, then CPU/TLB/PC/queue to the end.
+  // Each region hashed on its own, so a mismatch NAMES the region (the engine's
+  // _diagnose compares these words field by field); the room hash folds them.
+  var N64S_FIELDS = ['cpu-fp', 'regs-hdr', 'sp-dmem', 'sp-imem', 'pif+flashregs', 'cpu-gpr-cp0-cp1', 'tlb+pc+queue',
+                     'eeprom', 'controller-paks', 'sram', 'flashram'];
+  function n64sRoomWords(u8, fp) {
+    var a = N64S_HDR + N64S_RDRAM, tail = a + N64S_SPPIF + N64S_LUT, S = 2166136261, sm = N64S.size;
+    var w = [fp >>> 0, n64sFnv(S, u8, 0, N64S_HDR), n64sFnv(S, u8, a, a + 4096), n64sFnv(S, u8, a + 4096, a + 8192),
+             n64sFnv(S, u8, a + 8192, a + (N64S_SPPIF & ~3)), n64sFnv(S, u8, tail & ~3, (tail + 4 + 256 + 128 + 16 + 256 + 8) & ~3),
+             n64sFnv(S, u8, (tail + 4 + 256 + 128 + 16 + 256 + 8) & ~3, sm & ~3)];
+    if (u8.length >= sm + N64S_SM) {
+      w.push(n64sFnv(S, u8, sm, sm + 0x800), n64sFnv(S, u8, sm + 0x800, sm + 0x20800),
+             n64sFnv(S, u8, sm + 0x20800, sm + 0x28800), n64sFnv(S, u8, sm + 0x28800, sm + N64S_SM));
+    }
+    return w;
+  }
+  function n64sHashRoom(u8, fp) {
+    var w = n64sRoomWords(u8, fp), h = 2166136261;
+    for (var i = 0; i < w.length; i++) h = Math.imul(h ^ w[i], 16777619) >>> 0;
+    return h >>> 0;
+  }
+  // TEST SEAM (n64/tools/n64_rollback_probe.mjs): the raw state API as shipped.
+  window.__n64State = {
+    info: function () { return { ptr: N64S.ptr, size: N64S.size, located: N64S.located, fault: N64S.fault, saves: N64S.saves, loads: N64S.loads,
+                                 saveMs: N64S.saves ? +(N64S.saveMs / N64S.saves).toFixed(2) : null, loadMs: N64S.loads ? +(N64S.loadMs / N64S.loads).toFixed(2) : null,
+                                 maxSaveMs: +N64S.maxSaveMs.toFixed(2), maxLoadMs: +N64S.maxLoadMs.toFixed(2),
+                                 keepCode: N64S_KEEP_CODE && !!window.__n64CorePtrs, codeKeptPerLoad: N64S.keepLoads ? +(N64S.codeKept / N64S.keepLoads).toFixed(1) : null,
+                                 codeDroppedPerLoad: N64S.keepLoads ? +(N64S.codeDropped / N64S.keepLoads).toFixed(1) : null }; },
+    alloc: function () { return new Uint8Array(N64S.size + N64S_SM); },
+    save: function (dst) { return n64sSave(dst); },
+    load: function (src) { return n64sLoad(src); },
+    hashFull: function (u8) { return n64sHashFull(u8); },
+    hashRoom: function (u8, fp) { return n64sHashRoom(u8, fp); },
+    roomWords: function (u8, fp) { return n64sRoomWords(u8, fp); },
+  };
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ROLLBACK — ZERO LOCAL INPUT LAG, IN EVERY N64 ROOM.
+  //
+  // The engine half (prediction, the window, the re-simulation plan, confirmed
+  // fingerprints) is lib/netplay.js _beginFrameRb; genesis.html rbRunFrame is
+  // the reference integration. This is the core half:
+  //   * every frame's START is kept: after frame k runs, the exact state is
+  //     saved into slot k+1 of a ring (W+3 slots, allocated as they are first
+  //     needed), with the framebuffer-readback pin (fbasync) and the CPU
+  //     fingerprint taken at the same instant;
+  //   * the local pad is applied to the frame it was sampled for (delay 0);
+  //   * a remote port with no input yet is PREDICTED as its last real input
+  //     (the engine's repeat-last);
+  //   * when a late input contradicts a prediction, beginFrame hands back a
+  //     plan: load the start of the earliest wrong frame, re-run every frame up
+  //     to the present WITHOUT PRESENTING (nothing yields to the browser in
+  //     between, so only the last frame drawn in this task reaches the screen)
+  //     and WITHOUT AUDIO (the re-simulated frames' samples are dropped: they
+  //     were heard once, on the guess), then run the present frame.
+  //
+  // UNLIKE genesis.html, a frame is NOT loaded-then-run every time: an N64
+  // state is 16.8 MB, and the load invalidates every compiled block
+  // (savestates_load_set_pc -> invalidate_r4300_cached_code(0,0)), so the
+  // straight path runs on without a load and only a rollback loads. That is
+  // correct only if a loaded state re-runs exactly as the original did;
+  // n64/tools/n64_rollback_probe.mjs is the measurement that decides it.
+  //
+  // FRAME 0 IS NOT A ROLLBACK TARGET UNTIL IT IS ONE. The core initialises its
+  // CPU and plugins inside its FIRST retro_run (libretronew.c first_time ->
+  // emu_step_initialize), so a state saved before any frame ran is a
+  // pre-boot image that cannot be loaded into a running core. Every console
+  // therefore runs ONE neutral pre-roll frame when the room starts, before its
+  // frame 0 (lsPreroll) — the same frame on every machine — and the
+  // room's frame 0 starts from an initialised core. The disc tag carries the
+  // protocol ('r1') so a console without the pre-roll is refused at the barrier.
+  //
+  // ⚠ GATE 9. A re-simulation re-runs frames the guest already lived through
+  // once on a guess; it spends no governor credit. Exactly one NEW frame runs
+  // per lsDueNow() credit, as in lockstep, so the guest clock never passes wall
+  // time. The engine's advantage wait (one skipped frame, at most one per 8)
+  // is a slowdown, and the governor's schedule is moved by that one period
+  // rather than repaid (lsFeed).
+  // ═══════════════════════════════════════════════════════════════════════════
+  var RB_Q = new URLSearchParams(location.search);
+  // Rollback is opt-in (?rb=1) until a weak device is proven to keep 1.000x in it:
+  // a 4x-CPU MK64 room measured 0.07x in rollback vs 0.55-0.62x in lockstep.
+  var RB_WANT = RB_Q.get('rb') === '1';
+  var RB_WINDOW = Math.max(2, Math.min(12, +(RB_Q.get('rbw') || 8) | 0));
+  var RB = { ready: false, fault: null, slots: [], n: 0, hidden: 0, stepMs: 0,
+             rollbacks: 0, resimFrames: 0, maxDepth: 0, depthHist: {}, resimMs: 0, maxResimMs: 0,
+             hashes: 0, missingSlot: 0, saveMs: 0, frames: 0, loads: 0 };
+  function rbInit(ls) {
+    RB.n = Math.max((ls.rollback | 0) + 3, typeof ls.rbRingFrames === 'function' ? ls.rbRingFrames() | 0 : 0);
+    RB.slots = new Array(RB.n);
+    if (!rbSaveSlot(ls.frame | 0)) { RB.fault = N64S.fault || 'the first savestate failed'; return false; }
+    RB.ready = true;
+    pageLog('[rollback] ARMED: window ' + (ls.rollback | 0) + ' frames, ring of ' + RB.n + ' exact states x '
+          + (N64S.size / 1048576).toFixed(1) + ' MB (allocated as used); local input applied with 0 frames of delay');
+    return true;
+  }
+  // THE RING FOLLOWS THE WINDOW (lib/netplay.js rbRingFrames). An adaptive
+  // room's host re-sizes the rollback window from what the link measures, and
+  // the ring must hold it BEFORE the frame that could reach that deep. A slot
+  // is indexed k % n, so every held frame moves to k % want — slot objects
+  // move, no bytes are copied; new slots are allocated as they are first used.
+  // ⚠ A slot is a 16.8 MB state. The ring is capped by what this device can
+  // hold beside its 512 MB core heap (RB_RING_BUDGET_MB, from
+  // navigator.deviceMemory); a room whose window outgrows it stops with that
+  // said, instead of the tab being killed for memory.
+  var RB_RING_BUDGET_MB = (function () {
+    var dm = +(navigator.deviceMemory || 0);
+    return dm && dm < 8 ? 300 : 600;
+  })();
+  function rbGrow(want) {
+    var nn = want | 0;
+    if (!RB.ready || nn <= RB.n) return true;
+    if (nn * N64S.size / 1048576 > RB_RING_BUDGET_MB) {
+      RB.fault = 'the room\'s rollback window needs ' + nn + ' savestates (' + Math.round(nn * N64S.size / 1048576)
+               + ' MB), more than this device can hold (' + RB_RING_BUDGET_MB + ' MB)';
+      return false;
+    }
+    var slots = new Array(nn);
+    for (var i = 0; i < RB.n; i++) {
+      var sl = RB.slots[i];
+      if (sl && sl.frame >= 0 && !slots[sl.frame % nn]) slots[sl.frame % nn] = sl;
+      else if (sl) { var st = window.__fbAsync; if (sl.fb && st && st.release) { st.release(sl.fb); sl.fb = null; } sl.frame = -1;
+                     for (var q = 0; q < nn; q++) if (!slots[q]) { slots[q] = sl; break; } }
+    }
+    pageLog('[rollback] ring ' + RB.n + ' -> ' + nn + ' savestates (the room\'s window grew)');
+    RB.slots = slots; RB.n = nn;
+    if (window.__n64RbLog) window.__n64RbLog.push(['grow', nn]);
+    return true;
+  }
+  function rbSlot(k) {
+    var s = RB.slots[k % RB.n];
+    return (s && s.frame === k) ? s : null;
+  }
+  // Save the state at the START of frame k (i.e. after frame k-1 ran).
+  function rbSaveSlot(k) {
+    var i = k % RB.n, s = RB.slots[i];
+    if (!s) { try { s = RB.slots[i] = { frame: -1, buf: new Uint8Array(N64S.size + N64S_SM), fb: null, fp: 0 }; } catch (e) { N64S.fault = 'out of memory for the rollback ring'; return false; } }
+    s.frame = -1;
+    var st = window.__fbAsync;
+    if (s.fb && st && st.release) { st.release(s.fb); s.fb = null; }
+    var t0 = performance.now();
+    if (!n64sSave(s.buf)) return false;
+    RB.saveMs += performance.now() - t0;
+    if (st && st.on && st.snapshot) s.fb = st.snapshot();
+    try { s.fp = window.Module._neil_last_fp() >>> 0; } catch (e) { s.fp = 0; }
+    s.frame = k;
+    return true;
+  }
+  function rbLoadSlot(s) {
+    if (!n64sLoad(s.buf)) return false;
+    var st = window.__fbAsync;
+    if (st && st.on && st.restore) st.restore(s.fb);
+    RB.loads++;
+    return true;
+  }
+  // One frame on the core: the image, one neil_ls_run_frame, the start of the
+  // next frame saved. `present` frames also carry the page's own bookkeeping
+  // (capacity, the test seams); a re-simulated one carries none of it.
+  function rbStep(k, image, present) {
     var M = window.Module;
-    if (!M || !M._neil_ls_run_frame) return false;
-    lsApplyImage(img);
+    lsApplyImage(image);
+    var t0 = performance.now();
+    M._neil_ls_run_frame();
+    var dt = performance.now() - t0;
+    if (present) lsFrameDone(image, dt);
+    var ok = rbSaveSlot(k + 1);
+    // One rollback step (run + save) as measured here, published to the room
+    // (ls.selfStepMs): the host sizes the window's slack by the slowest
+    // console's, and rbCatchUp() spends at most half a frame of it per tick.
+    var st = performance.now() - t0;
+    RB.stepMs = RB.stepMs ? RB.stepMs + (st - RB.stepMs) / 32 : st;
+    return ok;
+  }
+  function rbFail(ls, why) {
+    LS.fault = why;
+    pageLog('[rollback] ⚠ ' + why);
+    try { ls.fail(why); } catch (e) {}
+    return false;
+  }
+  function rbRunFrame(ls, r, hidden) {
+    if (!RB.ready && !rbInit(ls)) return rbFail(ls, 'rollback could not start: ' + (RB.fault || N64S.fault));
+    if (r.rollback) {
+      var ta = performance.now();
+      audioFlushNow();
+      var s = rbSlot(r.rollback.from);
+      if (!s) { RB.missingSlot++; return rbFail(ls, 'rollback to frame ' + r.rollback.from + ' found no savestate for it'); }
+      if (!rbLoadSlot(s)) return rbFail(ls, 'rollback load failed: ' + N64S.fault);
+      for (var i = 0; i < r.rollback.frames.length; i++) {
+        var fr = r.rollback.frames[i];
+        if (!rbStep(fr.frame, fr.image, false)) return rbFail(ls, 're-simulation save failed: ' + N64S.fault);
+      }
+      audioDropNow();
+      var d = r.rollback.depth | 0, ms = performance.now() - ta;
+      RB.rollbacks++; RB.resimFrames += r.rollback.frames.length; RB.resimMs += ms;
+      if (d > RB.maxDepth) RB.maxDepth = d;
+      if (ms > RB.maxResimMs) RB.maxResimMs = ms;
+      RB.depthHist[d] = (RB.depthHist[d] || 0) + 1;
+      if (window.__n64RbLog) window.__n64RbLog.push(['rb', r.frame, r.rollback.from, d]);
+    }
+    if (hidden) {
+      // A HIDDEN catch-up frame (ls.rbCatchUp): a frame of the room this console
+      // is behind on. Run like a re-simulation — its audio dropped, no page
+      // bookkeeping — so the speakers stay at 1.000x (gate 9). The governor's
+      // schedule moves with it (baseFrame), so it is never repaid as a sprint.
+      audioFlushNow();
+      var okh = rbStep(r.frame, r.image, false);
+      audioDropNow();
+      if (!okh) return rbFail(ls, 'savestate failed: ' + N64S.fault);
+      RB.hidden++; LS.frame++; LS.baseFrame++;
+      if (window.__n64RbLog) window.__n64RbLog.push(['hidden', r.frame]);
+    } else {
+      if (!rbStep(r.frame, r.image, true)) return rbFail(ls, 'savestate failed: ' + N64S.fault);
+      RB.frames++;
+    }
+    if (RB.stepMs) ls.selfStepMs = RB.stepMs;
+    ls.endFrame(null);
+    // FINGERPRINTS OF CONFIRMED FRAMES ONLY: the state after k is slot k+1.
+    var due = ls.takeHashDue ? ls.takeHashDue() : [];
+    for (var j = 0; j < due.length; j++) {
+      var after = rbSlot(due[j] + 1);
+      if (!after) { RB.missingSlot++; continue; }
+      if (!ls.fieldNames) ls.fieldNames = N64S_FIELDS;
+      ls.submitHash(due[j], n64sHashRoom(after.buf, after.fp), n64sRoomWords(after.buf, after.fp));
+      LS.hashes++; RB.hashes++;
+      // TEST SEAM (n64/tools/n64_rollback_probe.mjs): the confirmed state, for a
+      // rig to hash in full against a straight run. Absent unless a rig sets it.
+      if (window.__n64RbTap) { try { window.__n64RbTap(due[j], after.buf, after.fp); } catch (e) {} }
+    }
+    return true;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // RUN-AHEAD — the game's OWN lag frames, taken out of what the player sees.
+  //
+  // After the newest real frame (whose start-of-next state is already in the
+  // ring), run RA hidden frames with this console's LATEST pad (remote ports:
+  // their last input, as the engine predicts), leave the last one's picture
+  // in the canvas, and load the real state back. A game that shows a press
+  // two frames after it reads the pad shows it RA frames sooner — sooner than
+  // on the hardware. The hidden frames make no sound (their samples are
+  // dropped) and move nothing in the room: the real state is restored, with
+  // its framebuffer-readback pin, before the next real frame, so whatever RA
+  // this console chooses, its guest is the room's guest.
+  //
+  // ⚠ IT IS PAID FROM SPARE CAPACITY ONLY, AND ADAPTS. Each hidden frame costs a
+  // frame of emulation plus one state load per real frame. RA starts at 0,
+  // rises one frame at a time while the measured cost of a whole real tick
+  // (frame + save + re-simulation + run-ahead) stays under RA_BUDGET of the
+  // field period for RA_UP_MS, and falls to 0 the moment a tick overruns the
+  // period — so run-ahead can never be the reason this console falls below
+  // 1.000x. ?ra=N pins it (0 = off); ?ra=auto (default) adapts up to RA_MAX.
+  // ═══════════════════════════════════════════════════════════════════════════
+  var RA_Q = RB_Q.get('ra');
+  // Run-ahead is off unless asked for (?ra=auto|N): GPU framebuffer state is not in
+  // the savestate, so hidden frames are only proven exact on MK64.
+  var RA_FIXED = RA_Q == null ? 0 : (RA_Q !== 'auto' ? Math.max(0, Math.min(4, +RA_Q | 0)) : null);
+  var RA_MAX = 2, RA_BUDGET = 0.75, RA_UP_MS = 2000;
+  var RA = { frames: RA_FIXED != null ? RA_FIXED : 0, fixed: RA_FIXED, runs: 0, hiddenFrames: 0, ms: 0,
+             tickEma: 0, frameEma: 0, calmSince: 0, ups: 0, downs: 0, fault: null, lastImage: null };
+  function raRun(ls) {
+    var n = RA.frames;
+    if (n <= 0 || !RB.ready || !RA.lastImage) return;
+    var base = rbSlot(ls.frame | 0);
+    if (!base) return;
+    var t0 = performance.now(), M = window.Module;
+    audioFlushNow();
+    // The next frame's image as this console would build it now: the latest
+    // local pad at this console's ports, every other port as last presented.
+    var img = RA.lastImage.slice(0), mine = lsLocalPads();
+    for (var p in mine) { var o = (+p) * LS_PAD_BYTES; if (o + LS_PAD_BYTES <= img.length) img.set(mine[p], o); }
+    for (var j = 0; j < n; j++) { lsApplyImage(img); M._neil_ls_run_frame(); }
+    var ok = rbLoadSlot(base);
+    audioDropNow();
+    if (!ok) { RA.fault = N64S.fault; RA.frames = 0; RA.fixed = 0; pageLog('[runahead] ⚠ restore failed, run-ahead OFF: ' + N64S.fault); return; }
+    RA.runs++; RA.hiddenFrames += n; RA.ms += performance.now() - t0;
+  }
+  // Called with the wall time of one whole real tick (every frame this lsFeed
+  // pass ran, re-simulation and run-ahead included) and how many real frames it
+  // advanced. The budget is the field period per real frame, judged on a
+  // smoothed cost (a single rollback burst is not "no headroom"), and ANY time
+  // the governor had to write off (LS.lostMs grew: this console ran late)
+  // takes a hidden frame away at once.
+  function raAdapt(tickMs, frames) {
+    if (!(LS.viHz > 0) || frames <= 0) return;
+    var period = 1000 / LS.viHz, per = tickMs / frames, now = performance.now();
+    RA.tickEma = RA.tickEma ? RA.tickEma + 0.1 * (per - RA.tickEma) : per;
+    var lost = LS.lostMs || 0, lostGrew = lost > (RA.lostSeen || 0);
+    RA.lostSeen = lost;
+    if (RA.fixed != null) return;
+    if (RA.frames > 0 && (lostGrew || RA.tickEma > period * 0.9 || per > period * 3)) {
+      // Give a hidden frame back at once: the guest rate is the product; the
+      // head start is not.
+      RA.frames--; RA.downs++; RA.calmSince = now; return;
+    }
+    if (!RA.calmSince || lostGrew || RA.tickEma > period * RA_BUDGET) { RA.calmSince = now; return; }
+    // What one more hidden frame would add: one frame of emulation.
+    var next = RA.tickEma + (LS.costAvg || per);
+    if (RA.frames < RA_MAX && next < period * RA_BUDGET && now - RA.calmSince > RA_UP_MS) {
+      RA.frames++; RA.ups++; RA.calmSince = now;
+    }
+  }
+
+  // The page's own bookkeeping for a frame that is PRESENTED (lockstep, or the
+  // newest frame under rollback) — never for a re-simulated or hidden one.
+  function lsFrameDone(img, dt) {
+    var M = window.Module;
     // ⚠ TEST SEAM — THE BYTES THE CORE WAS ACTUALLY HANDED, recorded AFTER
     // lsApplyImage so it is the same array that reached _neil_ls_set_pad and
     // not an intention. genesis.html publishes the identical thing as
@@ -3500,27 +4331,64 @@ N64Rate.selfTest = function (logFn) {
     // to prove from outside that a press on one machine reached the OTHER
     // machine's core rather than merely reaching its network layer. A roster
     // entry or a `running` flag cannot tell those two apart.
-    // ⚠ WRITTEN IN PLACE, NOT ALLOCATED. This runs on EVERY gated frame and the
-    // measured CPU headroom on this core is 1.03x (tools/n64_boot_test.mjs on
-    // mariokart.z64: cpuMsPerFrame 19.34 against a 20 ms budget at 50 Hz), so a
-    // fresh array per frame is a cost this path cannot casually afford. Reusing
-    // one buffer keeps the seam free.
+    // ⚠ WRITTEN IN PLACE, NOT ALLOCATED: this runs on every presented frame.
     try {
       var _im = window.__n64LsImage;
       if (!_im || _im.length !== img.length) _im = window.__n64LsImage = new Array(img.length);
       for (var _i = 0; _i < img.length; _i++) _im[_i] = img[_i];
     } catch (e) {}
+    // Run-ahead builds its hidden frames' image from the last presented one.
+    if (!RA.lastImage || RA.lastImage.length !== img.length) RA.lastImage = new Uint8Array(img.length);
+    RA.lastImage.set(img);
     // THIS CONSOLE'S CAPACITY, measured on the frames it actually runs: wall ms
-    // inside one lockstep frame (the whole mainLoopInner — emulation AND the GL
-    // it issues). cap = field period / mean cost; published to the room.
-    var _t0 = performance.now();
-    M._neil_ls_run_frame();
-    var _dt = performance.now() - _t0;
-    LS.costAvg = LS.costAvg ? LS.costAvg + 0.02 * (_dt - LS.costAvg) : _dt;
+    // inside one frame (the whole mainLoopInner — emulation AND the GL it
+    // issues). cap = field period / mean cost; published to the room.
+    LS.costAvg = LS.costAvg ? LS.costAvg + 0.02 * (dt - LS.costAvg) : dt;
+    // Frames that alone cost more than a field period — a burst this device
+    // cannot absorb inside the governor's two-period allowance if it repeats.
+    if (LS.viHz > 0 && dt > 1000 / LS.viHz) { LS.costOver = (LS.costOver || 0) + 1; if (dt > (LS.costMax || 0)) LS.costMax = dt; }
     LS.frame++;
     try { lsGlWitness(); } catch (e) {}
     try { LS.lastFp = M._neil_last_fp ? (M._neil_last_fp() >>> 0) : 0; } catch (e) { LS.lastFp = 0; }
+    latWitness();
+  }
+  function lsRunOneFrame(img) {
+    var M = window.Module;
+    if (!M || !M._neil_ls_run_frame) return false;
+    lsApplyImage(img);
+    var _t0 = performance.now();
+    M._neil_ls_run_frame();
+    lsFrameDone(img, performance.now() - _t0);
     return true;
+  }
+
+  // ---- LOCAL INPUT LATENCY, AS THE ENGINE APPLIES IT (test witness) --------
+  // When this console's own pad changes, note the engine frame that is NEXT to
+  // run; when a presented frame carries the new pad at this console's port,
+  // the difference is the input lag the ROOM adds, in frames: `delay` under
+  // lockstep (+1 when the change landed after that frame's first attempt), 0
+  // under rollback. The game's own lag frames come on top of it and are
+  // measured separately (n64/tools/n64_lag_probe.mjs); run-ahead subtracts them.
+  var LAT = { pending: null, last: null, samples: [], overlapped: 0 };
+  function latNote(pads) {
+    var ls = lsEngine(); if (!ls || !LS.running) return;
+    var port = ls.localPorts && ls.localPorts.length ? ls.localPorts[0] : 0;
+    var b = pads && pads[port]; if (!b) return;
+    var key = b[0] + ',' + b[1] + ',' + b[2] + ',' + b[3];
+    if (key === LAT.last) return;
+    LAT.last = key;
+    if (LAT.pending) LAT.overlapped++;
+    LAT.pending = { key: key, port: port, frame: ls.frame | 0, t: performance.now() };
+  }
+  function latWitness() {
+    var P = LAT.pending, im = window.__n64LsImage; if (!P || !im) return;
+    var o = P.port * LS_PAD_BYTES;
+    if ((im[o] + ',' + im[o + 1] + ',' + im[o + 2] + ',' + im[o + 3]) !== P.key) return;
+    // LS.lastPresentFrame is the engine frame this image was run as; P.frame
+    // the frame that was next when the change was sampled.
+    LAT.samples.push({ frames: Math.max(0, (LS.lastPresentFrame | 0) - P.frame), ms: Math.round(performance.now() - P.t) });
+    if (LAT.samples.length > 200) LAT.samples.shift();
+    LAT.pending = null;
   }
 
   function lsFeed() {
@@ -3534,6 +4402,14 @@ N64Rate.selfTest = function (logFn) {
       return;
     }
     if (!LS.running) {
+      // The pre-roll runs HERE, when the room starts — not when main() returns.
+      // MEASURED: run right after callMain, it was the core's FIRST retro_run
+      // (plugin + option initialisation) and it then happened BEFORE the rest of
+      // dist/script.js's start-up on one console and not the other, and a
+      // two-tab room (mobile host, desktop joiner) diverged at frame 0 in every
+      // region of the state; the HEAD page, whose first retro_run is the room's
+      // frame 0, did not. Here every console has finished booting.
+      try { lsPreroll(); } catch (e) { pageLog('[lockstep] pre-roll threw: ' + ((e && e.message) || e)); }
       LS.running = true;
       LS.startedAt = ls.frame | 0;        // "everyone started together at frame N"
       LS.baseWall = 0;                    // anchor the governor at the real start
@@ -3541,39 +4417,91 @@ N64Rate.selfTest = function (logFn) {
       // The engine's pace window compares frames run against this: a slow
       // MACHINE loses frames without waiting, a slow LINK loses them waiting.
       if (LS.viHz > 0) ls.frameHz = LS.viHz;
-      pageLog('[lockstep] FRAME GATE ENGAGED at frame ' + ls.frame + ' — this core advances only when every '
-            + 'seated port has an input for the frame. delay=' + ls.delay + ' frames, ports='
-            + JSON.stringify(ls.roster) + ', mine=' + JSON.stringify(ls.localPorts)
+      pageLog('[lockstep] FRAME GATE ENGAGED at frame ' + ls.frame + ' — ' + (ls.rollback
+              ? 'ROLLBACK, window ' + ls.rollback + ' frames: this console applies its own input with 0 frames '
+                + 'of delay, predicts the others and re-simulates when a prediction was wrong'
+              : 'this core advances only when every seated port has an input for the frame. delay=' + ls.delay + ' frames')
+            + ', ports=' + JSON.stringify(ls.roster) + ', mine=' + JSON.stringify(ls.localPorts)
             + ', pacing to ' + (LS.viHz > 0 ? LS.viHz + ' Hz from the ROM header' : 'UNPACED (ROM header unreadable)'));
     }
     // ⚠ BOUNDED, AND THE BOUND IS THE GOVERNOR. The engine can never cover more
     // than `delay` frames ahead anyway, but the real limiter here is lsDueNow():
     // this loop stops the moment the guest would get ahead of wall time, which
     // is what keeps the guest at 1.000x rather than sprinting through a backlog.
-    var guard = 0;
+    var guard = 0, ran = 0, tick0 = performance.now();
+    if (ls.rollback) {
+      // ADAPTIVE ROOM (lib/netplay.js, the block above rbCatchUp): the ring
+      // follows the window, the credit follows rbPace(), and a console behind
+      // the room clock runs the hidden catch-up frames it is granted, first.
+      if (RB.ready && typeof ls.rbRingFrames === 'function' && RB.n < ls.rbRingFrames() && !rbGrow(ls.rbRingFrames())) {
+        rbFail(ls, 'rollback could not grow its ring: ' + RB.fault); return;
+      }
+      if (typeof ls.rbPace === 'function') {
+        var pace = ls.rbPace();
+        if (pace !== LS.pace) { LS.pace = pace; LS.baseWall = 0; }   // re-anchor at the new period
+      }
+      if (RB.ready && typeof ls.rbCatchUp === 'function') {
+        var cu = ls.rbCatchUp();
+        for (var ci = 0; ci < cu; ci++) {
+          var rh = ls.beginFrame(lsLocalPads(), { hidden: true });
+          if (!rh || !rh.ready || !rbRunFrame(ls, rh, true)) break;
+          ran++;
+        }
+      }
+    }
     while (lsDueNow()) {
-      var r = ls.beginFrame(lsLocalPads());
+      var pads = lsLocalPads();
+      latNote(pads);
+      if (ls.rollback && RB.ready && typeof ls.rbRingFrames === 'function' && RB.n < ls.rbRingFrames() && !rbGrow(ls.rbRingFrames())) {
+        rbFail(ls, 'rollback could not grow its ring: ' + RB.fault); break;
+      }
+      var r = ls.beginFrame(pads);
       if (!r || !r.ready) {
         if (!LS.stalling && r && r.reason === 'stall') { LS.stalls++; LS.stallSince = performance.now(); }
         LS.stalling = !!(r && r.reason === 'stall');
         LS.stallReason = r ? r.reason : 'the engine returned nothing';
         LS.waitingOn = (r && r.waitingOn) ? r.waitingOn.slice() : [];
+        if (r && r.reason === 'advantage') {
+          // ROLLBACK TIME SYNC: this console is ahead of the room and the engine
+          // withholds ONE frame. That is a slowdown (the direction gate 9
+          // allows), so the governor's schedule moves by one period instead of
+          // re-running the frame on the next tick, which would undo it.
+          if (LS.baseWall && LS.viHz > 0) LS.baseWall += 1000 / LS.viHz;
+          LS.advWaits = (LS.advWaits | 0) + 1;
+          break;
+        }
         // A stall must not be repaid. Re-anchoring the governor here is what
         // stops the core sprinting to "catch up" when the input finally lands —
         // time lost to a stall stays lost, which is correct: everybody lost it.
-        LS.baseWall = 0;
+        if (!LS_REPAY_MS) LS.baseWall = 0;
         break;
       }
       if (LS.stalling) {
         LS.stallMs += performance.now() - LS.stallSince;
         LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
       }
+      LS.lastPresentFrame = r.frame | 0;
+      // The HOST decided lockstep or rollback ('lsgo' carries it) — never this
+      // page's own query string, which only says what THIS console proposes.
+      if (ls.rollback) {
+        if (!rbRunFrame(ls, r)) break;
+        LS.fed++; ran++;
+        if (++guard > 240) { pageLog('[lockstep] ⚠ feed loop hit its 240-frame bound — not sprinting the guest'); break; }
+        // ⚠ ONE TASK NEVER HOLDS THE PAGE FOR MORE THAN ABOUT A FIELD. On a
+        // device without the capacity for the re-simulation the room asks of it,
+        // every pass of this loop is slower than a field, the governor keeps
+        // finding a frame due, and the loop ran on for minutes inside one task —
+        // MEASURED: a CPU-throttled two-tab room whose joiner froze its tab until
+        // the rig's 240 s protocol timeout. Yield; the next tick continues.
+        if (LS.viHz > 0 && performance.now() - tick0 > 1000 / LS.viHz) break;
+        continue;
+      }
       if (!lsRunOneFrame(r.image)) {
         LS.fault = 'this build of the core has no _neil_ls_run_frame — rebuild n64/N64Wasm/code';
         pageLog('[lockstep] ⚠ ' + LS.fault);
         break;
       }
-      LS.fed++;
+      LS.fed++; ran++;
       // ⚠ THE CORE IS IN THIS PAGE AND IS SYNCHRONOUS, so unlike dreamcast.html
       // the fingerprint for the frame just run is available RIGHT NOW and goes
       // straight into endFrame(). That is the shape lib/netplay.js's endFrame
@@ -3588,6 +4516,37 @@ N64Rate.selfTest = function (logFn) {
       else ls.endFrame(null);
       if (++guard > 240) { pageLog('[lockstep] ⚠ feed loop hit its 240-frame bound — not sprinting the guest'); break; }
     }
+    // RUN-AHEAD: once per tick, after the newest real frame, and only when a
+    // real frame ran (a tick that ran none leaves the last picture up).
+    if (ran && ls.rollback && RB.ready) {
+      try { raRun(ls); } catch (e) { RA.fault = (e && e.message) || String(e); RA.frames = 0; RA.fixed = 0; }
+      raAdapt(performance.now() - tick0, ran);
+    }
+    // THE AUDIO FEED RIDES THE FRAMES, NOT A CLOCK OF ITS OWN: what this tick's
+    // real frames produced goes to the worklet now, in the same task, instead of
+    // waiting up to 8 ms for the pump's timer — so a burst of frames (a tick
+    // that ran two, a rollback tick that took long) reaches the cushion as one
+    // delivery and a tick that ran none leaves it to the timer.
+    if (ran) audioFlushNow();
+  }
+
+  // THE PRE-ROLL: one frame, neutral pads on all four ports, run by EVERY
+  // console when the room starts, just before the room's frame 0 (lsFeed). The core
+  // initialises its CPU and video plugin inside its first retro_run
+  // (libretronew.c first_time -> emu_step_initialize), so without this the
+  // state at the room's frame 0 would be a pre-boot image a rollback could not
+  // load. It is the same frame on every machine (same ROM, same neutral input,
+  // fresh boot), so the room still starts from one guest state; the disc tag's
+  // 'r1' keeps a console that does not pre-roll out of the room.
+  function lsPreroll() {
+    var M = window.Module;
+    if (LS.prerolled || !LS.armed || !M || !M._neil_ls_run_frame) return;
+    LS.prerolled = true;
+    lsApplyImage(new Uint8Array(4 * LS_PAD_BYTES));
+    var t0 = performance.now();
+    M._neil_ls_run_frame();
+    pageLog('[lockstep] pre-roll frame run (' + Math.round(performance.now() - t0) + ' ms): the core is initialised '
+          + 'before the room\'s frame 0, so every frame of the room is a state that can be saved and loaded');
   }
 
   // ---- arming, and the ONE place the order matters --------------------------
@@ -3659,6 +4618,22 @@ N64Rate.selfTest = function (logFn) {
   // own field rate — the same witness as the "speed" figure.
   var LS_PACE_SLOW = 0.95;          // below this for LS_PACE_HOLD_MS, the room is "slow"
   var LS_PACE_HOLD_MS = 3000;
+  // WHAT THIS CONSOLE DECLARES AT THE BARRIER. The engine compares these
+  // strings and refuses a room whose consoles disagree (lib/netplay.js
+  // _checkBarrier, "different game"), so everything that changes what a guest
+  // frame DOES — not merely which cartridge — belongs in it:
+  //   * the framebuffer readback mode on a title glide reads back every frame
+  //     (fbasync): an async console hands RDRAM the copy one call later than a
+  //     sync one, so a mixed room would fork on the first read the game makes.
+  function lsDiscTag() {
+    var st = window.__fbAsync || {}, t = String(NET.game || '');
+    if (st.on || st.readAlways) t += ' \u00b7 fb-' + (st.on ? 'async' : 'sync');
+    //   * the room protocol: 'r1' = frame 0 follows one neutral pre-roll frame
+    //     (lsPreroll) and the console can roll back. A console that differs in
+    //     either would start the room one frame apart from the others.
+    t += ' \u00b7 r1';
+    return t;
+  }
   function lsSeatWord(ports) {
     if (!ports || !ports.length) return 'another player';
     return ports[0] === 0 ? 'the host' : 'player ' + (ports[0] + 1);
@@ -3715,10 +4690,20 @@ N64Rate.selfTest = function (logFn) {
   // the one event that turns a running core into a black canvas silently —
   // webglcontextlost. The result goes to the log (Diagnostics) and, when it is
   // conclusive, to the status line, so the next report says which one it was.
-  var LS_GL = { armedAt: 0, reads: 0, lit: 0, lastAt: 0, lost: false, restored: false, said: '' };
+  // ⚠ ON DEMAND ONLY. Each read is a readPixels of the default framebuffer,
+  // which on a tile-based phone GPU (Mali, Adreno, PowerVR) resolves and
+  // flushes the whole pipeline — the user's own phone report put a 439 ms
+  // FrameRequestCallback and a 552 ms timer on the main thread. So it no longer
+  // runs every second of every room: opening 🩺 Diagnostics (openDiag) asks for
+  // a burst of reads (LS_GL.want), ?glwitness=1 keeps the old always-on
+  // behaviour for a rig, and the context-lost listener (free) stays armed.
+  var LS_GL = { armedAt: 0, reads: 0, lit: 0, lastAt: 0, lost: false, restored: false, said: '',
+                want: new URLSearchParams(location.search).get('glwitness') === '1' ? Infinity : 0 };
   function lsGlWitness() {
+    if (!(LS_GL.want > 0)) return;
     var now = performance.now();
     if (now - LS_GL.lastAt < 1000) return;          // one read a second: each one is a GPU sync
+    LS_GL.want--;
     LS_GL.lastAt = now;
     // Module.ctx when emscripten set it; otherwise the canvas hands back the
     // context the core already created (getContext returns the existing one —
@@ -3736,7 +4721,9 @@ N64Rate.selfTest = function (logFn) {
       if (ppb) gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
       var px = new Uint8Array(4 * 16), lit = false;
       // One 16-pixel row through the middle third of the picture.
-      gl.readPixels((W >> 1) - 8, H >> 1, 16, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      if (window.__fbAsync) window.__fbAsync.bypass = true;
+      try { gl.readPixels((W >> 1) - 8, H >> 1, 16, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); }
+      finally { if (window.__fbAsync) window.__fbAsync.bypass = false; }
       for (var i = 0; i < px.length; i += 4) if (px[i] + px[i + 1] + px[i + 2] > 24) { lit = true; break; }
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, rfb);
       if (ppb) gl.bindBuffer(gl.PIXEL_PACK_BUFFER, ppb);
@@ -3820,6 +4807,7 @@ N64Rate.selfTest = function (logFn) {
       var app = window.myApp;
       if (!app || app.__lsBeforeRunHooked) return;
       app.__lsBeforeRunHooked = true;
+      if (hookIv) { clearInterval(hookIv); hookIv = 0; }      // its job is done: stop waking the page 10x/s
       var prev = app.beforeRun ? app.beforeRun.bind(app) : function () {};
       app.beforeRun = function () {
         prev();
@@ -3883,7 +4871,7 @@ N64Rate.selfTest = function (logFn) {
         var deliver = ls.receive.bind(ls);
         ls.receive = function (m) {
           var r = deliver(m);
-          if (m && m.t === 'ls' && LS.armed) { try { lsFeed(); } catch (e) {} }
+          if (m && m.t === 'ls' && LS.armed && lsDriveOk('timer')) { try { lsFeed(); } catch (e) {} }
           return r;
         };
       }
@@ -3944,7 +4932,11 @@ N64Rate.selfTest = function (logFn) {
       // netplay.js:2257-2260) and it makes the engine exist from the moment the
       // room does, which is before any core boots.
       try {
-        if (typeof s.startLockstep === 'function') s.startLockstep({ portCount: 4, padBytes: LS_PAD_BYTES });
+        // ROLLBACK, NOT INPUT DELAY: the HOST's window wins ('lsgo' rb), so this
+        // is what this console proposes; ?rb=0 proposes delay-based lockstep
+        // (a measurement arm, never the product).
+        if (typeof s.startLockstep === 'function') s.startLockstep({ portCount: 4, padBytes: LS_PAD_BYTES, rollback: RB_WANT ? RB_WINDOW : 0,
+          rollbackOk: true, rbCatchUp: true });
       } catch (e) { pageLog('[lockstep] startLockstep threw: ' + ((e && e.message) || e)); }
       s.on('status', onStatus);
       // The host's roster names the ROM the room is on. A joiner loads THAT --
@@ -3962,7 +4954,18 @@ N64Rate.selfTest = function (logFn) {
         if (i >= 0) { NET.game = ROMS[i].label; pageLog('[net] the room is on ' + ROMS[i].label + ' -- this console follows it'); }
         else pageLog('[net] the room named "' + e.game + '", which is not on this page');
       });
-      try { s.on('lockstep', function () { watchLockstep(s); }); } catch (e) {}
+      try { s.on('lockstep', function (e) {
+        watchLockstep(s);
+        // A player who went silent is dropped by the host and the game goes on;
+        // they come back by themselves. Named by SEAT, never by peer id.
+        var seat = function (x) { return 'Player ' + (((x && x.ports && x.ports.length) ? x.ports[0] : 1) + 1); };
+        if (e && e.leave) {
+          netStatus(e.leave.mine ? 'This console lost the room for a moment — your controller is idle until it catches back up.'
+                                 : seat(e.leave) + ' dropped out — their controller is idle and the game goes on; they rejoin by themselves.');
+        }
+        if (e && e.rejoin) netStatus(e.rejoin.mine ? 'Back in the room — your controller is live again.' : seat(e.rejoin) + ' is back.');
+        if (e && e.window) pageLog('[rollback] window ' + e.window.from + ' -> ' + e.window.to + ' frames' + (e.window.why ? ' — ' + e.window.why : ''));
+      }); } catch (e) {}
       watchLockstep(s);
       pageLog('[net] ' + (asHost ? 'room ' + code + ' open' : 'joining room ' + code)
             + ' (' + game + ') via ' + netTransport());
@@ -4254,8 +5257,14 @@ N64Rate.selfTest = function (logFn) {
       // waits for `connected`), so there is a peer to ping by the time this runs.
       try {
         var ls = sess.ls;
-        if (ls && ls.isHost && typeof sess.rttReport === 'function') {
-          var rep = await sess.rttReport(600);
+        // Under rollback there is no input delay to size (the engine pins it to 0).
+        if (ls && ls.isHost && !ls.rollback && typeof sess.rttReport === 'function') {
+          // Several round trips per player, at this cartridge's real field
+          // period: the engine sizes the delay to the jitter (mean + 2 sd) and,
+          // with three or four players, to the host-relayed guest-to-guest path
+          // (Lockstep.recommendDelayForRoom). One ping at a fixed 16.7 ms was
+          // measured to leave a 50-150 ms link stalling (tools/netplay_pace_sim.mjs).
+          var rep = await sess.rttReport(600, { samples: 6, frameMs: LS.viHz > 0 ? 1000 / LS.viHz : 1000 / 60 });
           if (rep && rep.worstMs != null) NET.rttMs = Math.round(rep.worstMs);
           // Clamp matches the engine (Lockstep.recommendDelay answers up to 30): capping at 10 threw the engine's own answer away — see dreamcast.html chooseDelay, "Capping BELOW what the engine supports".
           var want = (rep && rep.recommendedDelay != null)
@@ -4268,7 +5277,7 @@ N64Rate.selfTest = function (logFn) {
         }
       } catch (e) { pageLog('[lockstep] delay choice failed, keeping the default: ' + ((e && e.message) || e)); }
       try {
-        if (typeof sess.setReady === 'function') { sess.setReady(true, NET.game); NET.declared = true; }
+        if (typeof sess.setReady === 'function') { sess.setReady(true, lsDiscTag()); NET.declared = true; }
         else pageLog('[net] this build has no start barrier yet (session.setReady is missing)');
       } catch (e) { pageLog('[net] setReady threw: ' + ((e && e.message) || e)); }
       netStatus('Loaded — the game starts by itself once everyone is.', 'busy');
@@ -4302,7 +5311,7 @@ N64Rate.selfTest = function (logFn) {
     // an attempt that then stalls, which is what stops a stalled machine
     // starving its peers and deadlocking the whole room.
     var tick = function () {
-      if (LS.armed) { try { lsFeed(); } catch (e) {} }
+      if (LS.armed && lsDriveOk('raf')) { try { lsFeed(); } catch (e) {} }
       requestAnimationFrame(tick);
     };
     requestAnimationFrame(tick);
@@ -4366,7 +5375,7 @@ N64Rate.selfTest = function (logFn) {
   function lsArmFeedTimer() {
     if (lsFeedTimer) return;
     lsFeedTimer = setInterval(function () {
-      if (LS.armed) { try { lsFeed(); } catch (e) {} }
+      if (LS.armed && lsDriveOk('timer')) { try { lsFeed(); } catch (e) {} }
     }, 4);
   }
 
@@ -4385,7 +5394,7 @@ N64Rate.selfTest = function (logFn) {
     // The product kicks the feed the moment an input lands (watchLockstep's
     // receive wrap); a rig that delivers the peer's messages itself calls this
     // after each 'ls' so it measures the same pipeline.
-    window.__n64LsKick = function () { if (LS.armed) { try { lsFeed(); } catch (e) {} } };
+    window.__n64LsKick = function () { if (LS.armed && lsDriveOk('timer')) { try { lsFeed(); } catch (e) {} } };
     // wireNetplay already ran, so the ?np= arming above cannot have fired.
     lsArmFeedTimer();
     return true;
@@ -4398,7 +5407,30 @@ N64Rate.selfTest = function (logFn) {
     return {
       supported: netSupported(),
       transport: netTransport(),
-      architecture: 'lockstep',        // there is no other one on this page
+      architecture: 'lockstep',        // every console runs the game; frames are agreed
+      // 'rollback' (delay 0, predict + re-simulate) or 'lockstep' (delay-based,
+      // ?rb=0 measurement arm) — the HOST's choice, read off the engine.
+      mode: ls ? (ls.rollback ? 'rollback' : 'lockstep') : null,
+      rollback: (ls && ls.rollback) ? {
+        engine: (function () { try { return ls.rollbackReport(); } catch (e) { return null; } })(),
+        page: { ready: RB.ready, slots: RB.n, allocated: RB.slots.filter(Boolean).length, rollbacks: RB.rollbacks,
+                hidden: RB.hidden, stepMs: +(RB.stepMs || 0).toFixed(2), pace: LS.pace || 1,
+                resimFrames: RB.resimFrames, maxDepth: RB.maxDepth, depthHist: RB.depthHist, loads: RB.loads,
+                resimMsTotal: Math.round(RB.resimMs), resimMsPerRollback: RB.rollbacks ? +(RB.resimMs / RB.rollbacks).toFixed(2) : 0,
+                maxResimMs: +RB.maxResimMs.toFixed(1), saveMsPerFrame: RB.frames ? +(RB.saveMs / (RB.frames + RB.resimFrames)).toFixed(2) : null,
+                hashes: RB.hashes, missingSlot: RB.missingSlot, frames: RB.frames, fault: RB.fault },
+        state: window.__n64State.info(),
+      } : null,
+      runahead: { frames: RA.frames, fixed: RA.fixed, runs: RA.runs, hiddenFrames: RA.hiddenFrames,
+                  msPerRun: RA.runs ? +(RA.ms / RA.runs).toFixed(2) : null, tickMs: +RA.tickEma.toFixed(2),
+                  ups: RA.ups, downs: RA.downs, fault: RA.fault },
+      advWaits: LS.advWaits | 0,
+      // The ROOM's input lag for this console's own pad, in frames (LAT).
+      lat: { samples: LAT.samples.slice(-60), overlapped: LAT.overlapped },
+      prerolled: !!LS.prerolled,
+      disc: (function () { try { return lsDiscTag(); } catch (e) { return null; } })(),
+      fb: (function () { var st = window.__fbAsync || {}; return { on: !!st.on, decided: st.decided || null, rom: st.romName || null,
+             calls: st.calls, async: st.async, sync: st.sync, blocked: st.blocked, pinned: st.pinned, restores: st.restores | 0 }; })(),
       role: NET.role,
       state: NET.session ? NET.session.state : null,
       code: NET.session ? NET.session.code : null,
@@ -4428,6 +5460,9 @@ N64Rate.selfTest = function (logFn) {
       // WHO THE ROOM IS WAITING ON (lsPace) and the engine's own pace report —
       // every console's stalled share and the delay's history.
       pace: LS.paceVerdict || null,
+      // This console's own numbers, as published to the room.
+      selfCap: lsSelfCap(), costAvgMs: LS.costAvg || null, lostMs: Math.round(LS.lostMs || 0),
+      costOver: LS.costOver || 0, costMaxMs: LS.costMax ? Math.round(LS.costMax) : null,
       paceReport: (function () { var e = lsEngine(); try { return e && e.paceReport ? e.paceReport() : null; } catch (x) { return null; } })(),
       // The draw witness: reads of this console's own framebuffer right after a
       // frame, and whether the browser ever took the WebGL context away.

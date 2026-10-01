@@ -7,6 +7,13 @@
 #include <emscripten/html5_webgl.h>
 #include <emscripten/atomic.h>  // [ppc-bridge cutover] emscripten_atomic_notify for the mailbox drain
 #include <libretro.h>
+#include <atomic>
+// [vi-timing-gate 2026-09-30] Set once load_iso's retro_load_game has returned true. Until then the
+// recomp gate must not call into Core::System from the worker's main JS thread at all: System is a
+// function-local static (System.h:135-139), so the FIRST GetInstance() constructs it, and a takeover
+// polling recomp_hw_ready() before load_iso (?bootms=1 / ?srbootms=1) made worker-main the
+// constructor — Dolphin's boot then never returned from retro_load_game.
+static std::atomic<int> g_recomp_core_loaded{0};
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -502,6 +509,7 @@ int load_iso(const char* path) {
     info.size = 0;
     info.meta = nullptr;
     bool ok = retro_load_game(&info);
+    if (ok) g_recomp_core_loaded.store(1, std::memory_order_release);   // [vi-timing-gate]
     MAIN_THREAD_EM_ASM({
         postMessage({cmd: 'print', txt: '[worker] load_iso: retro_load_game returned ' + ($0 ? 'true' : 'false')});
     }, ok ? 1 : 0);
@@ -598,6 +606,51 @@ extern "C" EMSCRIPTEN_KEEPALIVE void recomp_pause_cpu(void)
   Core::System::GetInstance().GetCPU().Break();
 }
 
+// [vi-timing-gate 2026-09-30] The emulated hardware the recomp renders INTO has to exist
+// before anything on the recomp path touches it. The libretro port brings the video backend
+// up in load_iso (ContextReset, above), but guest RAM (Memory::Init), VI timing
+// (VI::Init -> UpdateRefreshRate) and the game boot all happen later, on the EmuThread that the
+// FIRST retro_run spawns (DolphinLibretro/Main.cpp:213-221, Core.cpp:696 HW::Init,
+// Core.cpp:755 BootUp). A takeover that lands in that window — the page's bootms ceiling on a
+// throttled phone host is exactly that — presented with m_target_refresh_rate_numerator == 0
+// (RuntimeError: divide by zero in Video_OutputXFB) and wrote its RAM image through
+// dolphin_get_ram_addr() == 0, i.e. over the bottom of this module's own heap.
+//
+// Two levels, both needed:
+//   recomp_vi_timing_valid() — the exact preconditions of one present/render call: guest RAM
+//     allocated and a non-zero VI refresh numerator. The C entry points below refuse without it.
+//   recomp_hw_ready()        — when a takeover may BEGIN: the EmuThread has also finished BootUp
+//     and entered CPUManager::Run (cpu_run_state_reached, CPU.cpp:125, set after
+//     CPUSetInitialExecutionState at Core.cpp:449-461). Before that, BootUp would still copy the
+//     DOL over the recomp's RAM image, and a Break() issued before the initial SetState(Running)
+//     is overwritten by it — the parked CPU would un-park itself. worker_funcs.js holds the whole
+//     takeover (pause + RAM + frames) until this reads 1.
+static bool recomp_vi_timing_valid()
+{
+  if (!g_recomp_core_loaded.load(std::memory_order_acquire))
+    return false;   // before load_iso: do not even construct System (see g_recomp_core_loaded)
+  auto& system = Core::System::GetInstance();
+  return system.GetMemory().GetRAM() != nullptr &&
+         system.GetVideoInterface().GetTargetRefreshRateNumerator() != 0;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE uint32_t recomp_hw_ready(void)
+{
+  if (!recomp_vi_timing_valid())   // checks g_recomp_core_loaded FIRST, before any GetInstance()
+    return 0u;
+  return Core::System::GetInstance().GetCPU().HasCPURunStateBeenReached() ? 1u : 0u;
+}
+
+// Presents / renders refused because the hardware was not up yet. Read by worker_funcs.js
+// (__recompRefused) into the '[recompLive] f<N> ... refused=' stats line and the gate's
+// held/released lines, which the render probe prints uncapped; a non-zero value on a normal boot
+// means something reached recomp_present / recomp_render_fifo around the JS gate.
+static uint32_t s_recomp_gate_refused = 0;
+extern "C" EMSCRIPTEN_KEEPALIVE uint32_t recomp_gate_refused(void)
+{
+  return s_recomp_gate_refused;
+}
+
 // [recomp-bridge 2026-08-25] Explicit present: with the CPU parked, VideoInterface emulation
 // (the CoreTiming OutputField events that normally call Video_OutputXFB -> ViSwap -> Present)
 // never fires, so recomp EFB->XFB copies pile up unseen. Drive the same call VI would
@@ -606,6 +659,14 @@ extern "C" EMSCRIPTEN_KEEPALIVE void recomp_present(uint32_t xfb_addr, uint32_t 
 {
   if (!g_video_backend)
     return;
+  // [vi-timing-gate 2026-09-30] no present until VI timing is valid (see recomp_hw_ready).
+  // Video_OutputXFB now refuses too; this keeps the fake tick clock from advancing for a
+  // present that never happened and counts the refusal.
+  if (!recomp_vi_timing_valid())
+  {
+    ++s_recomp_gate_refused;
+    return;
+  }
   static u64 s_fake_ticks = 0;
   s_fake_ticks += 100000;   // strictly-increasing tick for the presenter's frame pacing
   const u32 w = width ? width : 640;
@@ -620,6 +681,14 @@ extern "C" EMSCRIPTEN_KEEPALIVE void recomp_render_fifo(uint32_t ptr, uint32_t l
 {
   if (len == 0 || !g_vertex_manager)
     return;
+  // [vi-timing-gate 2026-09-30] The stream's texture loads read guest RAM and its EFB->XFB
+  // display copy WRITES guest RAM (memory.GetPointerForRange). With Memory::Init not yet run
+  // that is base nullptr + guest address — a write into this module's own low heap.
+  if (!recomp_vi_timing_valid())
+  {
+    ++s_recomp_gate_refused;
+    return;
+  }
   // [render-stage split 2026-08-29 TEMP] whole-stage region + in-situ timer-cost
   // calibration, so the reported split can be corrected by (calls x cost).
   BemStage::Bump(BemStage::kFrames);

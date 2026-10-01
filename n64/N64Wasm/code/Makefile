@@ -54,6 +54,7 @@ CFILES := src/glide2gl/src/Glide64/Combine.c \
     src/libretro-common/vfs/vfs_implementation.c \
     src/libretro/brumme_crc.c \
     src/libretro/libretronew.c \
+    src/libretro/neil_rawstate.c \
     src/mupen64plus-core/src/ai/ai_controller.c \
     src/mupen64plus-core/src/api/callbacks.c \
     src/mupen64plus-core/src/api/common.c \
@@ -210,7 +211,9 @@ n64wasm.js: $(FILES)
     '_neil_diff_enable','_neil_diff_count','_neil_diff_get','_neil_vi_total', \
     '_neil_frame_cost_ms','_neil_frame_cost_n','_neil_frame_cost_reset', \
     '_neil_ls_arm','_neil_ls_armed','_neil_ls_set_pad','_neil_ls_run_frame', \
-    '_neil_fp_always','_neil_last_fp']" \
+    '_neil_fp_always','_neil_last_fp', \
+    '_neil_state_size','_neil_state_save_raw','_neil_state_save_raw_fast','_neil_state_load_raw', \
+    '_neil_state_last_load_mode','_neil_state_last_load_pages','_neil_state_m64p_region']" \
 	-s INVOKE_RUN=0 \
     && mv n64wasm.js ../dist/ \
     && mv n64wasm.wasm ../dist/

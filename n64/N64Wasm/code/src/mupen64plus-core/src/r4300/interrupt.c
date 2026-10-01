@@ -309,6 +309,55 @@ void translate_event_queue(unsigned int base)
    add_interrupt_event_count(SPECIAL_INT, 0);
 }
 
+/* NEIL RAW STATE — the event queue EXACTLY as it stands.
+ *
+ * load_eventqueue_infos() rebuilds the queue by re-inserting every event with
+ * add_interrupt_event_count(), which re-sorts against the CURRENT Count and the
+ * static SPECIAL_done — neither of which the m64p format carries — and then
+ * overwrites next_interrupt with the head's count. On the common path that
+ * reproduces the original list, but "usually the same order" is not exact, and
+ * a rollback that replays an event one slot early is a desync. These two
+ * functions copy the list order verbatim, plus SPECIAL_done, and never sort.
+ * Format: out[0] = n, then n (type, count) pairs, then SPECIAL_done.
+ * Returns the number of uint32 written (at most 2 + 2*POOL_CAPACITY). */
+int neil_intq_save(uint32_t* out)
+{
+   struct node* e;
+   int n = 0;
+   for (e = q.first; e != NULL && n < POOL_CAPACITY; e = e->next)
+   {
+      out[1 + 2 * n]     = (uint32_t)e->data.type;
+      out[1 + 2 * n + 1] = e->data.count;
+      n++;
+   }
+   out[0] = (uint32_t)n;
+   out[1 + 2 * n] = (uint32_t)SPECIAL_done;
+   return 2 + 2 * n;
+}
+
+int neil_intq_words_max(void) { return 2 + 2 * POOL_CAPACITY; }
+
+void neil_intq_restore(const uint32_t* in)
+{
+   int n = (int)in[0], i;
+   struct node* tail = NULL;
+   if (n < 0 || n > POOL_CAPACITY)
+      return;
+   clear_queue(&q);
+   for (i = 0; i < n; i++)
+   {
+      struct node* e = alloc_node(&q.pool);
+      if (e == NULL)
+         break;
+      e->data.type  = (int)in[1 + 2 * i];
+      e->data.count = in[1 + 2 * i + 1];
+      e->next = NULL;
+      if (tail == NULL) q.first = e; else tail->next = e;
+      tail = e;
+   }
+   SPECIAL_done = (int)in[1 + 2 * n];
+}
+
 int save_eventqueue_infos(char *buf)
 {
    int len;

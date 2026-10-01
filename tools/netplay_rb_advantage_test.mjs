@@ -36,7 +36,7 @@ const L = globalThis.Netplay.Lockstep;
 let pass = 0, fail = 0;
 const ok = (n, c, d) => { if (c) { pass++; console.log('  PASS  ' + n + (d ? '  ' + d : '')); } else { fail++; console.log('  FAIL  ' + n + (d ? '  ' + d : '')); } };
 
-function run({ seconds = 60, latencyMs = 20, jitterMs = 10, tickJitterMs = 12, guestStartMs = 40, seed = +(process.env.SEED || 7) }) {
+function run({ seconds = 60, latencyMs = 20, jitterMs = 10, tickJitterMs = 12, guestStartMs = 40, seed = +(process.env.SEED || 7), catchUp = false }) {
   let now = 0;
   let s = seed >>> 0; const rnd = () => ((s = (Math.imul(s, 1103515245) + 12345) >>> 0) / 4294967296);
   const q = []; const lastAt = { H: 0, G: 0 };
@@ -47,12 +47,13 @@ function run({ seconds = 60, latencyMs = 20, jitterMs = 10, tickJitterMs = 12, g
     q.push({ at, to, msg: JSON.parse(JSON.stringify(m)) });
   };
   const mk = (id, host) => new L({ peerId: id, host, portCount: 2, padBytes: 2, delay: 2, hashEvery: 30,
-                                   rollback: 8, stallBudgetMs: 0, send: send(host ? 'G' : 'H'), now: () => now });
+                                   rollback: 8, stallBudgetMs: 0, send: send(host ? 'G' : 'H'), now: () => now,
+                                   rbCatchUp: catchUp, selfStepMs: catchUp ? 1.5 : 0 });
   const E = { H: mk('H', true), G: mk('G', false) };
   E.H.seat('H', 1); E.H.seat('G', 1);
   const FRAME = 1000 / 59.922751;
   const C = {};
-  for (const id of ['H', 'G']) C[id] = { next: id === 'H' ? 0 : guestStartMs, accum: 0, last: 0, ran: 0, declared: false, t0: null, ranAt: [] };
+  for (const id of ['H', 'G']) C[id] = { next: id === 'H' ? 0 : guestStartMs, accum: 0, last: 0, ran: 0, hidden: 0, declared: false, t0: null, ranAt: [] };
   const deliver = () => { q.sort((a, b) => a.at - b.at); while (q.length && q[0].at <= now) { const d = q.shift(); E[d.to].receive(d.msg); } };
   const end = seconds * 1000;
   while (true) {
@@ -64,8 +65,19 @@ function run({ seconds = 60, latencyMs = 20, jitterMs = 10, tickJitterMs = 12, g
     if (ls.state === 'running' || ls.state === 'stalled') {
       if (c.t0 == null) { c.t0 = now; c.last = now; }
       let d = now - c.last; c.last = now; if (d > 100) d = 100;
-      c.accum += d;
+      c.accum += d * (typeof ls.rbPace === 'function' ? ls.rbPace() : 1);
       let n = 0;
+      // genesis.html: the engine's hidden catch-up frames first (adaptive rooms only)
+      const k = typeof ls.rbCatchUp === 'function' ? ls.rbCatchUp() : 0;
+      for (let i = 0; i < k; i++) {
+        const f = ls.frame;
+        const pads = {}; for (const p of ls.localPorts) pads[p] = new Uint8Array([(f >> 4) & 0xff, p]);
+        const r = ls.beginFrame(pads, { hidden: true });
+        if (!r.ready) break;
+        ls.endFrame(null);
+        for (const kk of ls.takeHashDue()) ls.submitHash(kk, 1);
+        c.ran++; c.hidden++;
+      }
       while (c.accum >= FRAME && n < 4) {
         const f = ls.frame;
         const pads = {}; for (const p of ls.localPorts) pads[p] = new Uint8Array([(f >> 4) & 0xff, p]);
@@ -98,6 +110,24 @@ console.log('=== rollback advantage wait (real Lockstep, simulated jittered page
   const lead = R.E.H.frame - R.E.G.frame;
   ok('a-console-that-is-really-ahead-still-waits', wH >= 1 && Math.abs(lead) <= 3 && ws <= 3,
      `guest started 400 ms (~24 frames) late: host waited ${wH} times, window stalls ${ws}; after 20 s host-guest frame gap ${lead}`);
+}
+// ---- AN ADAPTIVE ROOM (both pages run catch-up frames): the console BEHIND
+// catches up with hidden frames and the one ahead NEVER waits a whole frame.
+{
+  const R = run({ catchUp: true });
+  const wH = R.E.H.rbStats.advantageWaits, wG = R.E.G.rbStats.advantageWaits;
+  ok('adaptive/jitter-alone-costs-nothing', R.E.H._rbAdaptive && R.E.G._rbAdaptive && wH === 0 && wG === 0 && R.rate('H') >= 0.995 && R.rate('G') >= 0.995,
+     `adaptive ${R.E.H._rbAdaptive}/${R.E.G._rbAdaptive}; whole-frame waits ${wH}/${wG}; host ${R.rate('H').toFixed(4)}x guest ${R.rate('G').toFixed(4)}x; hidden ${R.C.H.hidden}/${R.C.G.hidden}`);
+}
+{
+  const R = run({ seconds: 20, guestStartMs: 400, catchUp: true });
+  const wH = R.E.H.rbStats.advantageWaits, lead = R.E.H.frame - R.E.G.frame;
+  // (A guest that BOOTS late also declares late, so the barrier holds the host
+  // for it; the lag a guest carries from hearing 'lsgo' one latency late is
+  // what tools/netplay_rb_pace_sim.mjs's catch-up column measures.)
+  ok('adaptive/a-late-guest-and-the-host-never-waits', wH === 0 && Math.abs(lead) <= 3 && R.rate('H') >= 0.995,
+     `guest started 400 ms (~24 frames) late: host whole-frame waits ${wH}, guest ran ${R.C.G.hidden} hidden catch-up frames; `
+     + `after 20 s host-guest frame gap ${lead}; host ${R.rate('H').toFixed(4)}x`);
 }
 console.log(`\n[rb-advantage] ${pass}/${pass + fail} passed`);
 process.exit(fail ? 1 : 0);

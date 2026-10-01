@@ -30,8 +30,17 @@ tlb tlb_e[32];
 uint32_t tlb_LUT_r[0x100000];
 uint32_t tlb_LUT_w[0x100000];
 
+/* NEIL RAW STATE: bumped by EVERY writer of tlb_e/tlb_LUT_r/tlb_LUT_w
+ * (poweron, map, unmap; savestates_load_m64p bumps it too). It never goes
+ * backwards and is never loaded from a state, so "a state saved at generation
+ * G, loaded while the generation is still G, by the same instance" proves the
+ * TLB is byte-identical to that state's -- which is what lets the raw loader
+ * skip the 8 MiB LUT copy and keep the compiled-code cache. */
+uint32_t neil_tlb_gen = 1;
+
 void poweron_tlb(void)
 {
+   neil_tlb_gen++;
    /* clear TLB entries */		
    memset(tlb_e, 0, 32 * sizeof(tlb_e[0]));		
    memset(tlb_LUT_r, 0, 0x100000 * sizeof(tlb_LUT_r[0]));		
@@ -41,6 +50,8 @@ void poweron_tlb(void)
 void tlb_unmap(tlb *entry)
 {
     unsigned int i;
+
+    neil_tlb_gen++;
 
     if (entry->v_even)
     {
@@ -64,6 +75,8 @@ void tlb_unmap(tlb *entry)
 void tlb_map(tlb *entry)
 {
     unsigned int i;
+
+    neil_tlb_gen++;
 
     if (entry->v_even)
     {

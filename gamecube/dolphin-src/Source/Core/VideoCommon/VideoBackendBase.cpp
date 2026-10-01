@@ -113,6 +113,23 @@ void VideoBackendBase::Video_OutputXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride
   auto& system = Core::System::GetInstance();
   auto& core_timing = system.GetCoreTiming();
 
+  // [vi-timing-gate 2026-09-30] No present until VI timing exists. The next-swap estimate
+  // below divides by VideoInterfaceManager::m_target_refresh_rate_numerator, which is 0
+  // (VideoInterface.h:444) until HW::Init -> VI::Init -> Preset -> UpdateRefreshRate
+  // (VideoInterface.cpp:740) sets it to GetTicksPerSecond()*2. VI itself can never call this
+  // before then, but the libretro port initialises the video backend in load_iso's
+  // ContextReset, BEFORE the first retro_run spawns the EmuThread that runs HW::Init — and
+  // recomp_present (dolphin-bridge/EmscriptenWorker.cpp) drives this function directly. A
+  // present in that window trapped as `RuntimeError: divide by zero` (the only integer
+  // divide in this function's compiled body, i64.div_u at wasm 0x6e413a of a67652cc…).
+  // With no VI timing there is no emulated display to swap and no guest RAM to read the XFB
+  // from, so drop the whole present rather than just the estimate.
+  auto& vi = system.GetVideoInterface();
+  const s64 refresh_rate_den = vi.GetTargetRefreshRateDenominator();
+  const s64 refresh_rate_num = vi.GetTargetRefreshRateNumerator();
+  if (refresh_rate_num == 0)
+    return;
+
   if (!g_ActiveConfig.bImmediateXFB)
   {
     system.GetFifo().SyncGPU(Fifo::SyncGPUReason::Swap);
@@ -124,10 +141,7 @@ void VideoBackendBase::Video_OutputXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride
   }
 
   // Inform the Presenter of the next estimated swap time.
-
-  auto& vi = system.GetVideoInterface();
-  const s64 refresh_rate_den = vi.GetTargetRefreshRateDenominator();
-  const s64 refresh_rate_num = vi.GetTargetRefreshRateNumerator();
+  // (refresh_rate_num was read and checked non-zero at the top of this function.)
 
   const auto next_swap_estimated_ticks =
       ticks + (system.GetSystemTimers().GetTicksPerSecond() * refresh_rate_den / refresh_rate_num);

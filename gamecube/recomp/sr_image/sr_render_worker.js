@@ -366,6 +366,17 @@ async function runGuestArm(msg, base) {
     if (r.ok) gcfg = await r.json();
   } catch (_) { gcfg = {}; }
   say('status', { text: 'guest config: ' + JSON.stringify(Object.assign({}, gcfg, { input: (gcfg.input || []).length })) });
+  // [vi-timing-gate 2026-09-30] NOT WHILE DOLPHIN HOLDS THE TAKEOVER. Dolphin stages everything
+  // posted before its emulated hardware exists, and acks nothing meanwhile -- so a guest started now
+  // would pile up its superseded frames' state (measured: 1.0 GB of thinned state in 190 s of hold)
+  // and, unacked, eventually be declared a stalled consumer and lose that state for good. Started
+  // after the release, the guest's very first command reaches a live decoder. Waiting is reported.
+  if (gateHeld) {
+    say('status', { text: 'guest start HELD: Dolphin\'s emulated hardware is not up yet' });
+    const tw = performance.now();
+    await new Promise((res) => gateWaiters.push(res));
+    say('status', { text: 'guest start released after ' + Math.round(performance.now() - tw) + ' ms' });
+  }
   await startGuest(mod, api, Object.assign({ hle: 12 }, gcfg));
   // THE CONTROL ARM (?srcapture=0, same wasm): the guest runs identically but the frame ring is
   // off, so nothing is posted.  A picture in that arm did not come from this stream.
@@ -384,7 +395,7 @@ async function runGuestArm(msg, base) {
   let held = null;                  // newest whole frame not yet posted: { bytes, prims, clean }
   const pendState = [];             // state-only (or unthinnable whole) frames, in stream order
   let pendBytes = 0;
-  const st = { frames: 0, thinned: 0, thinRefused: 0, droppedPrimBytes: 0, holds: 0, maxPend: 0, lostBytes: 0 };
+  const st = { frames: 0, thinned: 0, thinRefused: 0, droppedPrimBytes: 0, holds: 0, maxPend: 0, lostBytes: 0, gateHolds: 0 };
   // A CONSUMER THAT STOPS ACKING (measured: Dolphin on software WebGPU stopped at post 726 while its
   // GPU process sat at 8.6 GB) would make the held state stream grow forever.  After STALL_MS with
   // un-acked posts and no ack progress, the consumer is declared stalled: nothing more is held or
@@ -393,6 +404,13 @@ async function runGuestArm(msg, base) {
   const STALL_MS = 10000;
   let lastAckAt = performance.now(), stalled = false;
   onAck = (n) => { ackSeen = true; if (n > acked) { acked = n; lastAckAt = performance.now(); } };
+  // [vi-timing-gate 2026-09-30] Dolphin HOLDS a takeover that lands before its emulated hardware
+  // exists (worker_funcs.js __recompGate) and withholds acks meanwhile. The guest does not start
+  // until that hold is released (above), but should a hold ever come after it has started, a
+  // 'gate' message arms the normal 2-in-flight hold at once -- before the first ack this worker
+  // never held, and posted a fresh 24 MiB MEM1 copy every period -- and the existing STALL_MS
+  // bound still applies. On release the ack clock restarts from now.
+  onGate = (h) => { ackSeen = true; lastAckAt = performance.now(); if (h) st.gateHolds++; };
   const supersede = (fr) => {        // fr will never be shown: keep its state, drop its draws
     let bytes;
     if (fr.clean) { bytes = stripDraws(fr); st.thinned++; st.droppedPrimBytes += fr.bytes.length - bytes.length; }
@@ -455,12 +473,20 @@ async function runGuestArm(msg, base) {
 }
 
 let onAck = null;
+let gateHeld = false, onGate = null;   // Dolphin's pre-hardware takeover hold (see runGuestArm)
+const gateWaiters = [];
 self.onmessage = async (e) => {
   const msg = e.data || {};
   // the page streams the disc BEFORE 'boot' (gamecube.html srPost after the romChunk loop)
   if (msg.cmd === 'romChunk') { discParts.push(msg.buf); return; }
   if (msg.cmd === 'romEnd') { discEnd = msg.size >>> 0; return; }
   if (msg.cmd === 'ack') { if (onAck) onAck(msg.n | 0); return; }
+  if (msg.cmd === 'gate') {
+    gateHeld = !!msg.held;
+    if (onGate) onGate(gateHeld);
+    if (!gateHeld) while (gateWaiters.length) gateWaiters.shift()();
+    return;
+  }
   if (msg.cmd !== 'boot') return;
   const base = msg.base || './';
   // mode 'gx'   — drive SAB's GX entry points to a picture (the default).

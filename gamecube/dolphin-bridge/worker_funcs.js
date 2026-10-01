@@ -216,6 +216,156 @@ var __recompFix = null, __recompFixApplied = false, __recompFixPtr = 0, __recomp
     __recompFixPumps = 0, __recompPauseCpu = false, __recompXfbAddr = 0,
     __recompLive = false, __recompLiveXfb = 0, __recompLivePtr = 0, __recompLiveCap = 0, __recompLiveFrames = 0, __vtxCensusPtr = 0;
 var __recompT = { prep: 0, fifo: 0, present: 0, n: 0, regB: 0, fifoB: 0, skip: 0 };
+
+// [vi-timing-gate 2026-09-30] A recomp takeover must not touch the emulated hardware before it
+// exists. The video backend comes up in load_iso (EmscriptenWorker.cpp ContextReset), but guest
+// RAM, VI timing and the game boot come later, on the EmuThread the first retro_run spawns. The
+// page can start the takeover inside that window — its bootms ceiling fires on a slow/throttled
+// host before the first frame — and every piece of the live path then misbehaved:
+//   recomp_present   -> Video_OutputXFB divided by VI's refresh numerator, still 0:
+//                       "RuntimeError: divide by zero" (netplay device matrix, phone host, x2);
+//   recompFrame RAM  -> _dolphin_get_ram_addr() is 0 before Memory::Init, so the 24 MiB mem1
+//                       image and every region landed at the bottom of THIS module's heap;
+//   recomp_pause_cpu -> a Break() before CPUSetInitialExecutionState is overwritten by it, so
+//                       the CPU the takeover parked would start running the JIT game again.
+// So the takeover is HELD until recomp_hw_ready() (RAM + VI timing + EmuThread in CPU Run, i.e.
+// BootUp finished). While held, frames are STAGED, and nothing a frame carries is discarded:
+//   RAM   — writes are kept in order; a mem1 full image is a complete snapshot, so it replaces
+//           everything before it and later regions are folded into it (bounded: one 24 MiB image);
+//   FIFO  — every drawable frame's FIFO is kept and replayed IN ORDER on release. Frames are not
+//           assumed self-contained: the SR relay (sr_render_worker.js tryPost) prepends a
+//           superseded frame's state commands only ONCE, to the next post, so dropping a staged
+//           FIFO would lose CP/XF/BP state (GXInit) for good. Past GATE_MAX_FIFOS entries the two
+//           oldest are CONCATENATED (a GP stream concatenates cleanly), so the count stays bounded
+//           and still no command is lost.
+// Producers are held back rather than trusted: acks are withheld while held (the MP4 page marks
+// every frame past 2 outstanding skipRender), and the page relays {cmd:'recompGate'} to the SR
+// worker, which then holds at 2 un-acked posts and copies MEM1 only when a post goes out.
+// Visible, never silent: a status line every GATE_REPORT_MS, a 'timeout' state after
+// GATE_TIMEOUT_MS (the page puts it on the HUD) — and it keeps waiting, reporting as it goes.
+var __recompGate = null;
+var GATE_MAX_FIFOS = 4, GATE_REPORT_MS = 5000, GATE_TIMEOUT_MS = 120000;
+// recomp_hw_ready() is the ONLY call this gate makes into Dolphin before the hardware is up: it
+// checks a plain flag first and never constructs Core::System (EmscriptenWorker.cpp
+// g_recomp_core_loaded). _dolphin_get_ram_addr() would construct it from this thread, so it is not
+// called while held. Measured 2026-09-30 (MP4 ?bootms=1 and SR ?srbootms=1, headless): with the
+// gate polling GetInstance() from here before load_iso, retro_load_game never returned in either
+// arm; with only that changed, both booted, held 5.2 s / 14.0 s, and released.
+function __recompHwReady() {
+  if (!Module || !Module._recomp_hw_ready) return false;
+  return (Module._recomp_hw_ready() >>> 0) !== 0;
+}
+// Presents/renders the C side refused for want of VI timing / guest RAM (EmscriptenWorker.cpp).
+// Nonzero on a normal boot means something reached recomp_present/render_fifo around this gate.
+function __recompRefused() {
+  return (Module && Module._recomp_gate_refused) ? (Module._recomp_gate_refused() >>> 0) : 0;
+}
+function __recompBegin() {
+  if (Module._recomp_pause_cpu) Module._recomp_pause_cpu();
+  var t2 = 0;
+  try { t2 = Module._dolphin_read32(0xCC00201C) >>> 0; } catch (er) {}
+  __recompLiveXfb = t2 & 0x00FFFFFF;
+  if (t2 & 0x10000000) __recompLiveXfb = (__recompLiveXfb << 5) >>> 0;
+  __recompLive = true;
+  postMessage({ cmd: 'print', txt: '[recompLive] started; xfb=0x' + __recompLiveXfb.toString(16) });
+}
+function __recompGateSummary(G) {
+  return G.frames + ' staged frame(s) (' + G.writes.length + ' write(s), ' + (G.bytes / 1048576).toFixed(1)
+    + ' MiB), ' + G.drawable + ' drawable in ' + G.fifos.length + ' FIFO(s) ' + (G.fifoBytes / 1024).toFixed(0)
+    + ' KiB, ' + G.folded + ' folded, refused=' + __recompRefused();
+}
+// THE PAGE'S HALF (deferTerminate). The JIT guest lives in the page's ppc-worker thread, and
+// Dolphin's own boot (load_iso -> retro_load_game, BootUp) still needs it: a page that terminated
+// it at takeover time had no way to know whether Dolphin had booted yet. So a page that sends
+// {recompStart, deferTerminate:true} keeps the JIT running; this gate posts {recompGate:'ready'}
+// once the hardware is up, the page terminates the ppc-worker and answers 'recompGateGo', and only
+// then is the RAM image written — the JIT can no longer stomp it. (Terminating it early was the
+// first suspect for the blocked boot; the measured cause was the System construction above, but
+// keeping the JIT alive until the hardware is up costs nothing and removes the RAM race.) A page without the flag (an
+// older cached page, which terminated the JIT itself) is released as soon as the hardware is up.
+function __recompArmGate(deferTerminate) {
+  var ready = __recompHwReady();
+  __recompGate = { t0: performance.now(), writes: [], fifos: [], frames: 0, drawable: 0, folded: 0,
+                   bytes: 0, fifoBytes: 0, timer: 0, lastReport: performance.now(), timedOut: false,
+                   wasHeld: !ready, needGo: !!deferTerminate, go: false, readySent: false };
+  __recompGate.timer = setInterval(__recompGatePoll, 20);
+  if (!ready) {
+    postMessage({ cmd: 'print', txt: '[recompLive] takeover HELD: emulated hardware not up yet'
+      + ' — staging frames until recomp_hw_ready()' });
+    postMessage({ cmd: 'recompGate', state: 'held', ms: 0 });
+  }
+  __recompGatePoll();
+}
+function __recompStage(d) {
+  var G = __recompGate;
+  G.frames++;
+  if (d.mem1) {
+    G.writes = [{ addr: 0, bytes: new Uint8Array(d.mem1), full: true }];
+    G.bytes = d.mem1.byteLength;
+  }
+  var regs = d.regions || [];
+  for (var i = 0; i < regs.length; i++) {
+    var R = regs[i], n = R.bytes.byteLength;
+    if (R.addr + n > 0x01800000) continue;            // same bound as the live path
+    var head = G.writes.length === 1 && G.writes[0].full ? G.writes[0].bytes : null;
+    if (head && R.addr + n <= head.length) head.set(new Uint8Array(R.bytes), R.addr);
+    else { G.writes.push({ addr: R.addr, bytes: new Uint8Array(R.bytes), full: false }); G.bytes += n; }
+  }
+  if (d.skipRender) { __recompT.skip++; return; }   // the producer already folded this one's state
+  G.drawable++;
+  G.fifos.push({ ns: [d.n], parts: [new Uint8Array(d.fifo)] });
+  G.fifoBytes += d.fifo.byteLength;
+  if (G.fifos.length > GATE_MAX_FIFOS) {             // fold the two OLDEST, in order: nothing lost
+    var f0 = G.fifos.shift(), f1 = G.fifos[0];
+    f1.ns = f0.ns.concat(f1.ns); f1.parts = f0.parts.concat(f1.parts);
+    G.folded++;
+  }
+}
+function __recompGatePoll() {
+  var G = __recompGate;
+  if (!G) return;
+  var now = performance.now();
+  if (!__recompHwReady()) {
+    if (now - G.lastReport >= GATE_REPORT_MS) {
+      G.lastReport = now;
+      var late = now - G.t0 >= GATE_TIMEOUT_MS;
+      if (late && !G.timedOut) G.timedOut = true;
+      postMessage({ cmd: 'print', txt: '[recompLive] takeover ' + (late ? 'TIMED OUT (still waiting)' : 'STILL HELD')
+        + ' after ' + ((now - G.t0) / 1000).toFixed(0) + 's: emulated hardware not up; '
+        + __recompGateSummary(G) });
+      postMessage({ cmd: 'recompGate', state: late ? 'timeout' : 'held', ms: Math.round(now - G.t0) });
+    }
+    return;
+  }
+  if (G.needGo && !G.go) {                            // hardware up: the page stops its JIT first
+    if (!G.readySent) { G.readySent = true; postMessage({ cmd: 'recompGate', state: 'ready', ms: Math.round(now - G.t0) }); }
+    return;
+  }
+  clearInterval(G.timer);
+  __recompGate = null;
+  __recompBegin();
+  var ram = Module._dolphin_get_ram_addr() >>> 0;
+  for (var i = 0; i < G.writes.length; i++)
+    Module.HEAPU8.set(G.writes[i].bytes, ram + G.writes[i].addr);
+  if (G.wasHeld || G.frames)
+    postMessage({ cmd: 'print', txt: '[recompLive] ' + (G.wasHeld ? 'hardware up' : 'JIT stopped')
+      + ' after ' + (now - G.t0).toFixed(0) + 'ms held: applied ' + __recompGateSummary(G) });
+  postMessage({ cmd: 'recompGate', state: 'released', ms: Math.round(now - G.t0) });
+  // Replay every staged FIFO in stream order through the live path. A folded entry is drawn once
+  // as one concatenated stream; acks pair 1:1 with the drawable frames the producer sent, so its
+  // other frames' acks are queued ahead of it (released with it on GPU completion).
+  for (var j = 0; j < G.fifos.length; j++) {
+    var F = G.fifos[j], len = 0, k;
+    for (k = 0; k < F.parts.length; k++) len += F.parts[k].length;
+    var buf = new Uint8Array(len), o = 0;
+    for (k = 0; k < F.parts.length; k++) { buf.set(F.parts[k], o); o += F.parts[k].length; }
+    for (k = 0; k < F.ns.length - 1; k++) __recompHeldAcks.push(F.ns[k]);
+    self.onmessage({ data: { cmd: 'recompFrame', n: F.ns[F.ns.length - 1], fifo: buf.buffer, mem1: null,
+                             regions: [], skipRender: false } });
+  }
+  __recompReleaseAcks();
+}
+
 function recompFixApply() {
   // park the emulated CPU FIRST (CPUManager::Break -> JitWasm::Run exits) so the RAM image
   // overwrite below cannot race the live JIT guest; retro_run keeps pumping GPU slice/present.
@@ -522,7 +672,10 @@ function pumpBatch() {
     }
     // [recomp-bridge] armed fixture: apply once (RAM image + f32-array swaps + fifo upload),
     // then re-render each pump until the pump budget runs out.
-    if (__recompFix && Module._recomp_render_fifo && __recompFixPumps > 0) {
+    // [vi-timing-gate 2026-09-30] same precondition as the live takeover: the fixture parks the
+    // CPU and writes a RAM image, so it waits for recomp_hw_ready() (pumps keep counting down
+    // only once it has actually been applied).
+    if (__recompFix && Module._recomp_render_fifo && __recompFixPumps > 0 && __recompHwReady()) {
       if (!__recompFixApplied) recompFixApply();
       var dN0 = Module.HEAPU32[0x026B289C >> 2] >>> 0;   // prim-draws-decoded SAB counter
       Module._recomp_render_fifo(__recompFixPtr, __recompFixLen);
@@ -1171,17 +1324,21 @@ self.onmessage = function (e) {
     // (pre-swapped by recomp_worker.js), retargets the display copy, renders through
     // recomp_render_fifo, and presents. Counters exposed via 'recompStats' polls.
     case 'recompStart': {
-      if (Module._recomp_pause_cpu) Module._recomp_pause_cpu();
-      var t2 = 0;
-      try { t2 = Module._dolphin_read32(0xCC00201C) >>> 0; } catch (er) {}
-      __recompLiveXfb = t2 & 0x00FFFFFF;
-      if (t2 & 0x10000000) __recompLiveXfb = (__recompLiveXfb << 5) >>> 0;
+      // [vi-timing-gate 2026-09-30] Only take over once the hardware exists (see __recompGate).
       __recompLive = true;
-      postMessage({ cmd: 'print', txt: '[recompLive] started; xfb=0x' + __recompLiveXfb.toString(16) });
+      if (__recompGate) break;                       // already waiting
+      if (!e.data.deferTerminate && __recompHwReady()) __recompBegin();   // older page: as before
+      else __recompArmGate(e.data.deferTerminate);
+      break;
+    }
+    case 'recompGateGo': {                           // the page has terminated its JIT ppc-worker
+      if (__recompGate) { __recompGate.go = true; __recompGatePoll(); }
       break;
     }
     case 'recompFrame': {
-      if (!__recompLive || !Module || !Module._recomp_render_fifo) break;
+      if (!__recompLive) break;
+      if (__recompGate) { __recompStage(e.data); break; }   // hardware not up yet: hold it
+      if (!Module || !Module._recomp_render_fifo) break;
       var tA = performance.now();
       var ram2 = Module._dolphin_get_ram_addr();
       if (e.data.mem1) Module.HEAPU8.set(new Uint8Array(e.data.mem1), ram2);   // one-time full image
@@ -1262,7 +1419,7 @@ self.onmessage = function (e) {
           + ' | ms/f prep=' + (__recompT.prep / _n).toFixed(2) + ' fifo=' + (__recompT.fifo / _n).toFixed(2)
           + ' present=' + (__recompT.present / _n).toFixed(2) + ' | regKB/f=' + (__recompT.regB / _n / 1024).toFixed(1)
           + ' fifoKB/f=' + (__recompT.fifoB / _n / 1024).toFixed(1) + ' skipped=' + __recompT.skip
-          + ' ackHeld=' + __recompHeldAcks.length });
+          + ' ackHeld=' + __recompHeldAcks.length + ' refused=' + __recompRefused() });
         __recompT = { prep: 0, fifo: 0, present: 0, n: 0, regB: 0, fifoB: 0, skip: __recompT.skip };
       }
       break;

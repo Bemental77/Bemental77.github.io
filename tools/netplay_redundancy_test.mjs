@@ -39,9 +39,25 @@ function room(delay) {
   }
   const ls = out.H.filter((m) => m.t === 'ls');
   const last = ls[ls.length - 1];
-  (last && Array.isArray(last.w) && last.w.length === 4 && last.w[3][0] === last.f - 1)
-    ? ok('every-input-message-carries-the-last-delay+2-frames', `f=${last.f}, window ${last.w.map((e) => e[0]).join(',')}`)
+  // `w` (one entry per frame) or, in a room where everyone reads it, `wr` (runs).
+  const framesOf = (m) => Array.isArray(m.w) ? m.w.map((e) => e[0])
+    : Array.isArray(m.wr) ? m.wr.flatMap((e) => Array.from({ length: e[1] }, (_, k) => e[0] + k)) : [];
+  const fr = last ? framesOf(last) : [];
+  (last && fr.length === 4 && fr[3] === last.f - 1)
+    ? ok('every-input-message-carries-the-last-delay+2-frames', `f=${last.f}, window ${fr.join(',')} (${last.wr ? 'run-length' : 'per frame'})`)
     : bad('every-input-message-carries-the-last-delay+2-frames', JSON.stringify(last));
+}
+// 1b. RUN-LENGTH: a pad held across the window costs one run, not one entry a frame
+{
+  const { H, out } = room(8);
+  for (let i = 0; i < 20; i++) {
+    H.receive({ t: 'ls', f: i + 8, i: [[1, 'AAA=']], peer: 'G' });
+    const r = H.beginFrame({ 0: pad(7) }); if (r.ready) H.endFrame(null);
+  }
+  const last = out.H.filter((m) => m.t === 'ls').pop();
+  (last && Array.isArray(last.wr) && last.wr.length === 1 && last.wr[0][1] === 9 && last.wr[0][2] === 0 && JSON.stringify(last).length < 90)
+    ? ok('a-held-pad-is-one-run', `${JSON.stringify(last)} (${JSON.stringify(last).length} B for 10 frames of input)`)
+    : bad('a-held-pad-is-one-run', JSON.stringify(last));
 }
 // 2. a dropped packet is covered by the next one: no stall
 {
@@ -93,6 +109,8 @@ function room(delay) {
   const { G } = room(2);
   G.receive({ t: 'ls', f: 5, i: [[0, 'AQA=']], peer: 'H', w: [[4, [[1, 'CQA=']]]] });
   (G._inputFor(4, 1) === undefined) ? ok('the-window-obeys-port-ownership') : bad('the-window-obeys-port-ownership', 'host wrote port 1 through w');
+  G.receive({ t: 'ls', f: 9, i: [[0, 'AQA=']], peer: 'H', wr: [[6, 3, [[1, 'CQA=']]]] });
+  (G._inputFor(7, 1) === undefined) ? ok('the-run-length-window-obeys-port-ownership') : bad('the-run-length-window-obeys-port-ownership', 'host wrote port 1 through wr');
 }
 console.log(`\n[redundancy] ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

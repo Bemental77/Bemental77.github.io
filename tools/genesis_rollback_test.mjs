@@ -156,7 +156,18 @@ async function arm(name, rb) {
          `histogram ${JSON.stringify(hist)} — every pad change ran on the frame it was sampled for`);
       const eh = na.rollback.engine, eg = nb.rollback.engine, ph = na.rollback.page, pg = nb.rollback.page;
       const secs = SECONDS + 3;
-      ok(`${name}: rollbacks-under-injected-delay`, ph.rollbacks > 0 && pg.rollbacks > 0 && ph.maxDepth <= eh.window && pg.maxDepth <= eg.window
+      // lib/netplay.js ADAPTIVE ROOM: both pages declare rbCatchUp, so the host
+      // must have made the room adaptive; the window may move, and the ring must
+      // have followed it (a depth is bounded by the LARGEST window run).
+      ok(`${name}: the-room-is-adaptive-and-the-ring-follows-the-window`, eh.adaptive && eg.adaptive
+           && ph.ringFrames >= eh.ringFrames && pg.ringFrames >= eg.ringFrames,
+         `adaptive ${eh.adaptive}/${eg.adaptive}; window ${eh.window}/${eg.window} (peak ${eh.windowPeak}/${eg.windowPeak}, ${eh.windowChanges}/${eg.windowChanges} changes); `
+         + `ring ${ph.ringFrames}/${pg.ringFrames} savestates (engine asks ${eh.ringFrames}/${eg.ringFrames}); hidden catch-up frames ${ph.hidden}/${pg.hidden}; `
+         + `step ${ph.stepMs}/${pg.stepMs} ms; late p99 ${eh.lateP99}/${eg.lateP99} frames`);
+      // With NO injected delay a console whose display tick trails the other's
+      // gets every input before it runs the frame and may never roll back at all
+      // — that is the premise of "under injected delay", so it needs a delay.
+      ok(`${name}: rollbacks-under-injected-delay`, (LAG > 0 ? (ph.rollbacks > 0 && pg.rollbacks > 0) : true) && ph.maxDepth <= (eh.windowPeak || eh.window) + 1 && pg.maxDepth <= (eg.windowPeak || eg.window) + 1
            && ph.missingSlot === 0 && pg.missingSlot === 0,
          `host ${ph.rollbacks} rollbacks / ${ph.resimFrames} re-sim frames (${(ph.resimFrames / secs).toFixed(1)}/s, max depth ${ph.maxDepth}, `
          + `mean ${eh.meanDepth}, ${eh.mispredicted} mispredicted inputs, slowest tick ${ph.maxTickMs} ms); `

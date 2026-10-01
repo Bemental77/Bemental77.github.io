@@ -17,7 +17,7 @@
        so the page that used to be player 2's whole machine is gone and this
        page is the only page. The file itself still exists because n64/index.html
        has not been converted yet; nothing here routes to it. -->
-  <script src="/lib/netplay.js?v=46e6c73d"></script>
+  <script src="/lib/netplay.js?v=b29fcd50"></script>
   <meta charset="UTF-8" />
   <title>Genesis Wasm</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -797,7 +797,9 @@
   // Returns true if a frame actually ran. A false return STALLS the guest: the
   // accumulator keeps its credit and the console simply does not advance, which
   // is what "wait for the other player" has to mean when nothing may be guessed.
-  function lsRunFrame() {
+  // `hidden`: a catch-up frame the engine granted (ls.rbCatchUp) — run, never
+  // presented, its audio dropped. See loop().
+  function lsRunFrame(hidden) {
     var ls = lsEngine();
     if (!ls) { lsDisarm('the session went away'); return false; }
     if (ls.state !== 'running' && ls.state !== 'stalled') {
@@ -823,7 +825,13 @@
       // The room's state stays on the HUD and on the Party button.
       if (typeof netClose === 'function') { netClose(); pageLog('[net] the game started — party panel closed'); }
     }
-    var r = ls.beginFrame(lsLocalPads());
+    // THE RING FOLLOWS THE WINDOW. An adaptive room's host re-sizes the rollback
+    // window from what the link measures (lib/netplay.js rbRingFrames); the
+    // ring must hold it BEFORE the frame that could reach that deep.
+    if (ls.rollback && RB.slots && typeof ls.rbRingFrames === 'function' && RB.n < ls.rbRingFrames()) {
+      if (!rbGrow(ls.rbRingFrames())) { LS.fault = 'rollback could not grow its ring: ' + RB.fault; try { ls.fail(LS.fault); } catch (e) {} return false; }
+    }
+    var r = ls.beginFrame(lsLocalPads(), hidden ? { hidden: true } : undefined);
     if (!r || !r.ready) {
       LS.stalling = !!(r && r.reason === 'stall');
       LS.stallReason = r ? r.reason : 'the engine returned nothing';
@@ -833,7 +841,7 @@
     LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
     // The HOST decided lockstep or rollback ('lsgo' carries it) — never this
     // page's own query string, which only says what THIS console would propose.
-    if (ls.rollback) return rbRunFrame(ls, r);
+    if (ls.rollback) return rbRunFrame(ls, r, hidden);
 
     // EVERY SEATED PORT IS WRITTEN, EVERY FRAME, FROM THE ONE AGREED IMAGE.
     // ⚠ Including this machine's own: the local pad goes round through the
@@ -902,10 +910,10 @@
   // ═══════════════════════════════════════════════════════════════════════════
   var RB = {
     slots: null, slotFrame: null, n: 0, size: 0,
-    resimFrames: 0, rollbacks: 0, maxDepth: 0, hashes: 0, missingSlot: 0,
+    resimFrames: 0, rollbacks: 0, maxDepth: 0, hashes: 0, missingSlot: 0, hidden: 0, stepMs: 0,
     resimMs: 0, maxTickMs: 0, lastTickMs: 0, fault: null,
   };
-  var RB_WINDOW = 8;     // measured: see above. The HOST's value wins ('lsgo').
+  var RB_WINDOW = 8;     // the STARTING window (measured to fit a tick, see above). The HOST's value wins ('lsgo'), and an adaptive room re-sizes it from the link (lib/netplay.js recommendWindow; rbGrow follows).
   function rbFree() {
     try {
       if (RB.slots) RB.slots.forEach(function (p) { if (p) Module._gpx_free(p); });
@@ -927,10 +935,36 @@
       RB.slots.push(p); RB.slotFrame.push(-1);
     }
     if (Module._gpx_set_fast_savestates) Module._gpx_set_fast_savestates(1);
+    ls.frameHz = HW_HZ;           // the room clock's frame period (lib/netplay.js _frameMs)
     // the start of the room's frame 0: this core has run nothing yet
     var s0 = ls.frame % RB.n;
     if (!Module._gpx_state_save(RB.slots[s0], RB.size)) { RB.fault = 'gpx_state_save refused'; return false; }
     RB.slotFrame[s0] = ls.frame;
+    return true;
+  }
+  // Grow the ring to `want` slots. A slot is indexed k % n, so every held frame
+  // moves to k % want — pointers only, no copying; the ring's n consecutive
+  // frames stay distinct modulo a larger n.
+  function rbGrow(want) {
+    var nn = want | 0;
+    if (!RB.slots || nn <= RB.n) return true;
+    var slots = new Array(nn), frames = new Array(nn);
+    for (var j = 0; j < nn; j++) { slots[j] = 0; frames[j] = -1; }
+    var spare = [];
+    for (var i = 0; i < RB.n; i++) {
+      var k = RB.slotFrame[i];
+      if (k >= 0 && !slots[k % nn]) { slots[k % nn] = RB.slots[i]; frames[k % nn] = k; }
+      else spare.push(RB.slots[i]);
+    }
+    for (var q = 0; q < nn; q++) {
+      if (slots[q]) continue;
+      var ptr = spare.length ? spare.pop() : Module._gpx_alloc(RB.size);
+      if (!ptr) { RB.fault = 'out of memory for a ' + nn + '-frame rollback ring'; return false; }
+      Module.HEAPU8.fill(0, ptr, ptr + RB.size);
+      slots[q] = ptr;
+    }
+    pageLog('[rollback] ring ' + RB.n + ' -> ' + nn + ' savestates (the room\'s window grew)');
+    RB.slots = slots; RB.slotFrame = frames; RB.n = nn;
     return true;
   }
   function rbSlot(k) {
@@ -940,6 +974,7 @@
   function rbStep(k, image, pb, ports) {
     var src = rbSlot(k);
     if (!src) return false;
+    var ts = performance.now();
     Module._gpx_state_load(src, RB.size);
     for (var p = 0; p < ports; p++) Module._gpx_set_pad(p, (image[p * pb] | (image[p * pb + 1] << 8)) & 0xffff);
     Module._gpx_run();
@@ -947,6 +982,11 @@
     RB.slotFrame[j] = -1;
     if (!Module._gpx_state_save(RB.slots[j], RB.size)) return false;
     RB.slotFrame[j] = k + 1;
+    // The measured cost of one step (load + run + save), published to the room
+    // (ls.selfStepMs): the host sizes the window's margin by the slowest
+    // console's, and rbCatchUp spends at most half a frame of it per tick.
+    var dt = performance.now() - ts;
+    RB.stepMs = RB.stepMs ? RB.stepMs + (dt - RB.stepMs) / 32 : dt;
     return true;
   }
   function rbHash(ptr) {
@@ -957,7 +997,7 @@
     for (var b = words << 2; b < RB.size; b++) { h ^= u8[b]; h = Math.imul(h, 16777619) >>> 0; }
     return h >>> 0;
   }
-  function rbRunFrame(ls, r) {
+  function rbRunFrame(ls, r, hidden) {
     var t0 = performance.now();
     if (!RB.slots && !rbInit(ls)) {
       LS.fault = 'rollback could not start: ' + RB.fault;
@@ -987,7 +1027,22 @@
       if (r.rollback.depth > RB.maxDepth) RB.maxDepth = r.rollback.depth;
       RB.resimMs += performance.now() - ta;
     }
-    if (!rbStep(r.frame, r.image, pb, ports)) {
+    // A HIDDEN catch-up frame is a frame of the room this console is behind on:
+    // run like a re-simulation — video conversion off, its audio rewound — so
+    // the screen and the speakers stay at 1.000x (gate 9).
+    var hw0 = null;
+    if (hidden) {
+      hw0 = Module._gpx_audio_wpos ? Module._gpx_audio_wpos() : null;
+      if (Module._gpx_set_video_skip) Module._gpx_set_video_skip(1);
+    }
+    var stepOk = rbStep(r.frame, r.image, pb, ports);
+    if (hidden) {
+      if (Module._gpx_set_video_skip) Module._gpx_set_video_skip(0);
+      if (hw0 != null) Module._gpx_audio_rewind(hw0);
+      RB.hidden++;
+    }
+    if (RB.stepMs) ls.selfStepMs = RB.stepMs;
+    if (!stepOk) {
       RB.missingSlot++;
       LS.fault = 'no savestate for frame ' + r.frame;
       try { ls.fail(LS.fault); } catch (e) {}
@@ -1039,11 +1094,11 @@
     LAT.pending = null;
   }
 
-  function runFrame() {
+  function runFrame(hidden) {
     // ⚠ SINGLE PLAYER IS UNTOUCHED. With no room, LS.armed is false and this is
     // byte-for-byte the loop that shipped: one local mask into port 0, one
     // gpx_run(). Port 1 is never written, so pad[1] stays 0 exactly as before.
-    if (LS.armed) return lsRunFrame();
+    if (LS.armed) return lsRunFrame(hidden);
     Module._gpx_set_pad(0, padMask());
     Module._gpx_run();
     guestFrames++; window.__genFrames++;
@@ -1073,7 +1128,23 @@
     if (!lastTs) { lastTs = ts; accum = 0; return; }
     var d = ts - lastTs; lastTs = ts;
     if (d > 100) d = 100;          // a long stall must not fast-forward the guest
-    accum += d;
+    // ROLLBACK, ADAPTIVE ROOM (lib/netplay.js, the ADAPTIVE ROOM block): the
+    // engine may hand back a credit multiplier just under 1 while this console
+    // leads a peer that cannot close the gap — a wait spread over a hundred
+    // frames instead of a frame missing — and it grants HIDDEN catch-up frames
+    // when this console is behind the room: frames the room has already run,
+    // never past its clock, never presented.
+    var lsE = (LS.armed && LS.running) ? lsEngine() : null;
+    accum += d * ((lsE && lsE.rollback && typeof lsE.rbPace === 'function') ? lsE.rbPace() : 1);
+    // ⚠ REJOINING IS NOT SHOWN AS A FAST-FORWARD (gate 9). A console that was
+    // away is a rejoin-sized gap behind the room: until it is back, EVERY frame
+    // runs hidden, the last picture holds, and the HUD says so.
+    var rejoining = !!(lsE && lsE.rollback && typeof lsE.rbRejoining === 'function' && lsE.rbRejoining());
+    if (rejoining) { NET.notice = 'Rejoining the room — catching up…'; NET.noticeUntil = Date.now() + 400; }
+    if (lsE && lsE.rollback && typeof lsE.rbCatchUp === 'function') {
+      var cu = lsE.rbCatchUp();
+      for (var ci = 0; ci < cu; ci++) if (!lsRunFrame(true)) break;
+    }
     var ran = 0;
     // ⚠ A STALLED FRAME MUST NOT SPEND ITS CREDIT. runFrame() returns false when
     // the frame gate is holding this console because some seated port's input for
@@ -1085,7 +1156,7 @@
     // accumulating more than one tick's worth.
     var stalled = false;
     while (accum >= FRAME_MS && ran < MAX_CATCHUP_FRAMES) {
-      if (!runFrame()) { stalled = true; break; }
+      if (!runFrame(rejoining)) { stalled = true; break; }
       accum -= FRAME_MS; ran++;
     }
     // ⚠ AND THE WAIT MUST NOT BE BANKED ACROSS TICKS EITHER. Breaking out alone
@@ -1113,7 +1184,7 @@
     // wall-clock milliseconds did not happen for the guest, so they are gone
     // rather than owed.
     if (accum > FRAME_MS) accum = FRAME_MS;
-    if (ran) draw();
+    if (ran && !rejoining) draw();
     if (NET.session) netHudTick(ts);
     if (!lastFpsAt) lastFpsAt = ts;
     if (ts - lastFpsAt >= 1000) {
@@ -1903,7 +1974,8 @@
       return 'The room stopped — ' + netScrubPeers(raw) + '. Leave the party to keep playing by yourself.';
     }
     if (netCapHeld()) return 'This device cannot run the emulator, so the party cannot start it here.';
-    if (netPartyState() === 'playing') return 'Playing — everyone started together at frame ' + (NET.startedAtFrame | 0) + '.';
+    if (NET.notice && Date.now() > (NET.noticeUntil || 0)) NET.notice = null;
+    if (netPartyState() === 'playing') return NET.notice ? NET.notice : 'Playing — everyone started together at frame ' + (NET.startedAtFrame | 0) + '.';
     if (netAlone()) return 'Waiting for another player — share the code ' + s.code + '. Starts by itself once two are in and loaded.';
     var who = netPartyRows().filter(function (r) { return r.who && r.state !== 'ready' && r.state !== 'playing'; })
       .map(function (r) { return r.local ? 'this console' : netPortLabel(r.port); });
@@ -1944,7 +2016,7 @@
   }
   function netPartyReset() {
     NET.autoStarted = false; NET.loading = false; NET.loadPct = 0; NET.bar = null;
-    NET.gameIdx = -1; NET.startedAtFrame = 0;
+    NET.gameIdx = -1; NET.startedAtFrame = 0; NET.notice = null;
     if (NET.tick) { clearInterval(NET.tick); NET.tick = 0; }
     netPartyButtons();
   }
@@ -1999,12 +2071,14 @@
         var rr = ls.rollbackReport();
         rows.push('<span class="mode">ROLLBACK</span> frame ' + ls.frame
           + ' · input delay 0 · window ' + rr.window + ' · confirmed ' + rr.confirmedFrame);
-        rows.push('rollbacks ' + RB.rollbacks + ' · re-simulated ' + RB.resimFrames + ' (max depth ' + RB.maxDepth + ')');
+        rows.push('rollbacks ' + RB.rollbacks + ' · re-simulated ' + RB.resimFrames + ' (max depth ' + RB.maxDepth + ')'
+          + ' · caught up ' + RB.hidden + (rr.adaptive ? ' · adaptive' : ''));
       } else
       rows.push('<span class="mode">LOCKSTEP</span> frame ' + ls.frame
         + ' · delay ' + ls.delay + ' (' + Math.round(ls.delay * FRAME_MS) + ' ms)');
       rows.push('ports ' + ls.portCount + ' · mine ' + JSON.stringify(ls.localPorts)
         + ' · fingerprints ' + LS.hashes);
+      if (NET.notice && Date.now() <= (NET.noticeUntil || 0)) rows.push('<span class="warn">' + NET.notice.replace(/[<>&]/g, '') + '</span>');
       if (LS.stalling) {
         rows.push('<span class="warn">waiting for Player '
           + LS.waitingOn.map(function (p) { return p + 1; }).join(', ') + '…</span>');
@@ -2035,7 +2109,26 @@
     $('netDesync').classList.remove('on');
     session.on('status', netOnStatus);
     session.on('desync', netOnDesync);
-    session.on('lockstep', function (e) { if (e && e.barrier) NET.bar = e.barrier; netRoomRender(); });
+    session.on('lockstep', function (e) {
+      if (e && e.barrier) NET.bar = e.barrier;
+      // A player who went silent (a backgrounded tab, a dead link) is dropped by
+      // the host and the game goes on; they come back by themselves. Named by
+      // SEAT — the engine's `who` — never by peer id.
+      if (e && e.leave) {
+        NET.noticeUntil = Date.now() + 15000;
+        NET.notice = e.leave.mine ? 'This console lost the room for a moment — your controller is idle until it catches back up.'
+          : 'Player ' + ((e.leave.ports && e.leave.ports.length ? e.leave.ports[0] : 1) + 1) + ' dropped out — their controller is idle and the game goes on; they rejoin by themselves.';
+        pageLog('[lockstep] ' + e.leave.who + ' went limp at frame ' + e.leave.at + (e.leave.why ? ' (' + e.leave.why + ')' : ''));
+      }
+      if (e && e.rejoin) {
+        NET.noticeUntil = Date.now() + 6000;
+        NET.notice = e.rejoin.mine ? 'Back in the room — your controller is live again.'
+          : 'Player ' + ((e.rejoin.ports && e.rejoin.ports.length ? e.rejoin.ports[0] : 1) + 1) + ' is back.';
+        pageLog('[lockstep] ' + e.rejoin.who + ' is back from frame ' + e.rejoin.at);
+      }
+      if (e && e.window) pageLog('[rollback] window ' + e.window.from + ' -> ' + e.window.to + ' frames' + (e.window.why ? ' — ' + e.window.why : ''));
+      netRoomRender();
+    });
     session.on('room', function () { netRoomRender(); });
     // The host's roster names the cartridge the room is on. A joiner loads THAT
     // — not whatever its picker held — so the two agree at the barrier.
@@ -2049,8 +2142,12 @@
     // so two bytes carry it exactly and the per-frame image is 4 bytes rather
     // than 256.
     try {
+      // rbCatchUp: this page runs the engine's hidden catch-up frames, applies
+      // rbPace(), and grows its ring to rbRingFrames() (rbGrow) — so the host may
+      // run an ADAPTIVE rollback room: a window sized from the measured link and
+      // a room clock nobody waits on.
       var eng = session.startLockstep({ portCount: GEN_PORTS, padBytes: LS_PAD_BYTES, hashEvery: LS.hashEvery,
-                                        rollback: NET.rbWant ? RB_WINDOW : 0 });
+                                        rollback: NET.rbWant ? RB_WINDOW : 0, rollbackOk: true, rbCatchUp: true, frameHz: HW_HZ });
       if (NET.lagMs > 0 && eng) {
         var rx = eng.receive.bind(eng);
         eng.receive = function (m) {
@@ -2307,7 +2404,7 @@
       lagMs: NET.lagMs,
       rollback: (ls && ls.rollback) ? {
         engine: ls.rollbackReport(),
-        page: { rollbacks: RB.rollbacks, resimFrames: RB.resimFrames, maxDepth: RB.maxDepth, hashes: RB.hashes,
+        page: { rollbacks: RB.rollbacks, resimFrames: RB.resimFrames, hidden: RB.hidden, stepMs: +(RB.stepMs || 0).toFixed(2), ringFrames: RB.n, maxDepth: RB.maxDepth, hashes: RB.hashes,
                 missingSlot: RB.missingSlot, resimMs: +RB.resimMs.toFixed(1), maxTickMs: +RB.maxTickMs.toFixed(2),
                 fault: RB.fault, slots: RB.n },
       } : null,

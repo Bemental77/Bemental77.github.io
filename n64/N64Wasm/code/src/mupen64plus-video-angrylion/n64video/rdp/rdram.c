@@ -31,6 +31,17 @@ static uint16_t* rdram16;
 static uint8_t* rdram8;
 static uint8_t rdram_hidden[RDRAM_MAX_SIZE / 2];
 
+// NEIL RAW STATE: which 4 KiB pages of rdram_hidden were written, and when.
+// neil_hid_ep[p] = the save epoch during which page p was last written;
+// neil_hid_all_ep = an epoch at which EVERY page counts as written (init,
+// and every state load, replace the whole plane). One u32 store per pixel
+// write; read only by neil_state_save_raw_fast (src/libretro/neil_rawstate.c).
+#define NEIL_HID_PAGES ((RDRAM_MAX_SIZE / 2) >> 12)
+uint32_t neil_hid_epoch = 1;
+uint32_t neil_hid_all_ep = 1;
+uint32_t neil_hid_ep[NEIL_HID_PAGES];
+#define NEIL_HID_MARK(i) (neil_hid_ep[(i) >> 12] = neil_hid_epoch)
+
 static void rdram_init(void)
 {
     idxlim8 = config.gfx.rdram_size - 1;
@@ -42,6 +53,7 @@ static void rdram_init(void)
     rdram8 = config.gfx.rdram;
 
     memset(rdram_hidden, 3, sizeof(rdram_hidden));
+    neil_hid_all_ep = neil_hid_epoch;
 }
 
 static STRICTINLINE bool rdram_valid_idx8(uint32_t in)
@@ -134,6 +146,7 @@ static STRICTINLINE void rdram_write_pair8(uint32_t in, uint8_t rval, uint8_t hv
         rdram8[in ^ BYTE_ADDR_XOR] = rval;
         if (in & 1) {
             rdram_hidden[in >> 1] = hval;
+            NEIL_HID_MARK(in >> 1);
         }
     }
 }
@@ -144,6 +157,7 @@ static STRICTINLINE void rdram_write_pair16(uint32_t in, uint16_t rval, uint8_t 
     if (rdram_valid_idx16(in)) {
         rdram16[in ^ WORD_ADDR_XOR] = rval;
         rdram_hidden[in] = hval;
+        NEIL_HID_MARK(in);
     }
 }
 
@@ -154,5 +168,6 @@ static STRICTINLINE void rdram_write_pair32(uint32_t in, uint32_t rval, uint8_t 
         rdram32[in] = rval;
         rdram_hidden[in << 1] = hval0;
         rdram_hidden[(in << 1) + 1] = hval1;
+        NEIL_HID_MARK(in << 1);
     }
 }

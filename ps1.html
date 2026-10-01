@@ -10,7 +10,7 @@
        NOT USE STREAMING!"). Every player runs their own core and only pad bytes
        cross the wire. The ONLINE PLAY block near the end of this page carries
        the evidence this rests on, including the determinism measurement. -->
-  <script src="/lib/netplay.js?v=46e6c73d"></script>
+  <script src="/lib/netplay.js?v=b29fcd50"></script>
   <script src="/lib/mpgames.js"></script>
   <script>MPGames.gateParty('ps1', ['btnNet', 'mobileSplashNet'], ['romSelect', 'mobileRomSelect']);</script>
   <meta charset="UTF-8" />
@@ -733,7 +733,11 @@
     // write, which is a desync by construction. CheckJoy/CheckKeyboard still
     // run above so mobilePadState — the only thing that crosses the wire —
     // stays current.
-    if (LS.armed) { setTimeout(pollController, 8); return; }
+    if (LS.armed) {
+      var lm = ps1LocalMask();
+      latSample(lsEngine(), (lm[0] | (lm[1] << 8)) & 0xffff);
+      setTimeout(pollController, 8); return;
+    }
     var src = Module.HEAPU8.subarray(padStatus1, padStatus1 + 48);
     var arr; while (states_arrs.length > 50) states_arrs.pop();
     if (states_arrs.length > 0) { arr = states_arrs.pop(); arr.set(src); } else arr = new Uint8Array(src);
@@ -774,7 +778,16 @@
       case 'render': { var _t0 = performance.now(); if (_perfLastRenderMs) { var _gap = _t0 - _perfLastRenderMs; _perfGapSum += _gap; if (_gap > _perfGapMax) _perfGapMax = _gap; _perfGapCount++; } _perfLastRenderMs = _t0; var v = data.vram; Module.HEAPU8.set(v, vram_ptr); pcsx_worker.postMessage({ cmd: 'return_vram', vram: v }, [v.buffer]); Module._render(data.x, data.y, data.sx, data.sy, data.dx, data.dy, data.rgb24); renderFrames++; var _t1 = performance.now(); var _proc = _t1 - _t0; _perfProcSum += _proc; if (_proc > _perfProcMax) _perfProcMax = _proc; var now = _t1; if (now - lastFpsLog > 1000) { var _gapAvg = _perfGapCount ? (_perfGapSum / _perfGapCount).toFixed(1) : '?'; var _procAvg = renderFrames ? (_perfProcSum / renderFrames).toFixed(2) : '?'; fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now - lastFpsLog)).toFixed(1) + ' | gap avg=' + _gapAvg + 'ms max=' + _perfGapMax.toFixed(0) + 'ms | proc avg=' + _procAvg + 'ms max=' + _perfProcMax.toFixed(1) + 'ms'; renderFrames = 0; lastFpsLog = now; _perfGapSum = 0; _perfGapMax = 0; _perfGapCount = 0; _perfProcSum = 0; _perfProcMax = 0; } break; }
       case 'renderTick': { var _t0 = performance.now(); if (_perfLastRenderMs) { var _gap = _t0 - _perfLastRenderMs; _perfGapSum += _gap; if (_gap > _perfGapMax) _perfGapMax = _gap; _perfGapCount++; } _perfLastRenderMs = _t0; if (!vramSabI32 || !vramSabBytes) break; var rx,ry,rsx,rsy,rdx,rdy,rrgb,ok=false; for (var attempt=0; attempt<8; attempt++) { var s0 = Atomics.load(vramSabI32, 0); if (s0 & 1) continue; rx=Atomics.load(vramSabI32,1); ry=Atomics.load(vramSabI32,2); rsx=Atomics.load(vramSabI32,3); rsy=Atomics.load(vramSabI32,4); rdx=Atomics.load(vramSabI32,5); rdy=Atomics.load(vramSabI32,6); rrgb=Atomics.load(vramSabI32,7); Module.HEAPU8.set(vramSabBytes, vram_ptr); var s1 = Atomics.load(vramSabI32, 0); if (s1 === s0) { ok = true; break; } } if (!ok) break; Module._render(rx,ry,rsx,rsy,rdx,rdy,rrgb); renderFrames++; var _t1 = performance.now(); var _proc = _t1 - _t0; _perfProcSum += _proc; if (_proc > _perfProcMax) _perfProcMax = _proc; var now2 = _t1; if (now2 - lastFpsLog > 1000) { var _gapAvg2 = _perfGapCount ? (_perfGapSum / _perfGapCount).toFixed(1) : '?'; var _procAvg2 = renderFrames ? (_perfProcSum / renderFrames).toFixed(2) : '?'; fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now2 - lastFpsLog)).toFixed(1) + ' | gap avg=' + _gapAvg2 + 'ms max=' + _perfGapMax.toFixed(0) + 'ms | proc avg=' + _procAvg2 + 'ms max=' + _perfProcMax.toFixed(1) + 'ms [SAB]'; renderFrames = 0; lastFpsLog = now2; _perfGapSum = 0; _perfGapMax = 0; _perfGapCount = 0; _perfProcSum = 0; _perfProcMax = 0; } break; }
       case 'return_states': states_arrs.push(data.states); break;
-      case 'netFrame': lsOnWorkerFrame(); break;
+      case 'netFrame': lsOnWorkerFrame(data); break;
+      case 'coreRate': {
+        // The disc's frame rate, from the core's own region detection.
+        CORE_RATE = data;
+        if (data.take && data.hz > 0) { PS1_HW_HZ = data.hz; FRAME_MS = 1000 / PS1_HW_HZ; }
+        break;
+      }
+      case 'netRbReady': if (data.ok) LS.rbBytes = data.bytes; pageLog('[rollback] savestate ring ' + (data.ok ? 'ready: ' + data.ring + ' slots of ' + ((data.bytes / 1048576).toFixed(2)) + ' MB, from frame ' + data.frame : 'FAILED: ' + data.err)); if (!data.ok) { LS.fault = 'rollback ring: ' + data.err; try { var lsx = lsEngine(); if (lsx) lsx.fail(LS.fault); } catch (e) {} } break;
+      case 'netRbStatsResult': window.__ps1RbWorker = data; break;
+      case 'netPeekResult': case 'netSchedStatsResult': case 'netLiveHashResult': case 'netSnapBenchResult': break;
       case 'netHashResult': lsOnWorkerHash(data); break;
       case 'netUngated': pageLog('[lockstep] core handed back to its own scheduler'); break;
       // AUDIO BATCH FROM THE WORKER.
@@ -1233,8 +1246,14 @@
   var PS1_PORTS = 2;            // this core has exactly two; there is no multitap
   var LS_PAD_BYTES = 2;         // KeyStatus is 16 bits, so two bytes carry a pad exactly
   var PADSTATE_STRIDE = 24;     // sizeof(PADSTATE), measured: 0x201134 - 0x20111c
-  var PS1_HW_HZ = 59.94;        // NTSC PSX video rate; every shipped disc here is NTSC-U
+  // The console's frame rate, from the DISC: the worker reports Config.PsxType
+  // after pcsx_init ('coreRate': 59.94 NTSC / 50 PAL) and this follows it.
+  // Every shipped disc is NTSC-U (SYSTEM.CNF BOOT=SLUS_/SCUS_), so 59.94 is
+  // also the default until the worker has spoken. Both peers boot the same
+  // disc (the start barrier compares it), so they agree on it.
+  var PS1_HW_HZ = 59.94;
   var FRAME_MS = 1000 / PS1_HW_HZ;
+  var CORE_RATE = null;         // the worker's 'coreRate' report
   var MAX_CATCHUP_FRAMES = 4;
 
   var NET = {
@@ -1247,6 +1266,9 @@
     gameIdx: -1,        // the ROMS[] index the room agreed on; the auto-start loads THIS
     startedAtFrame: 0,  // the engine frame at which this core's gate first engaged
     tick: 0,            // the 500 ms party tick, alive only inside a room
+    // ROLLBACK (zero local input lag) unless the URL says ?rb=0. This is what
+    // THIS console proposes; the host's choice arrives in 'lsgo' and wins.
+    rbWant: (function () { try { return new URLSearchParams(location.search).get('rb') !== '0'; } catch (e) { return true; } })(),
   };
   var LS = {
     armed: false, running: false, fault: null,
@@ -1266,6 +1288,9 @@
     //               i.e. genuinely waiting on the other player.
     svcSum: 0, svcCount: 0, svcMax: 0, pend: [],
     capHits: 0, gateStalls: 0,
+    // ---- rollback (the worker holds the savestate ring) ------------------
+    rbInit: false, rbRing: 0, rollbacks: 0, resimFrames: 0, maxDepth: 0, rbHashes: 0,
+    rbMissing: 0, stepMsSum: 0, stepMsCount: 0, stepMsMax: 0, hidden: 0, stepMsEwma: 0,
   };
 
   function lsEngine() {
@@ -1389,7 +1414,7 @@
     }
     LS.armed = true; LS.running = false; LS.fault = null;
     LS.workerFrame = 0; LS.fedTo = 0; LS.inFlight = 0; LS.frames = 0; LS.hashes = 0;
-    LS.accum = 0; LS.lastTs = 0;
+    LS.accum = 0; LS.lastTs = 0; LS.rbInit = false;
     pageLog('[lockstep] ARMED before the first frame — this core advances only when every seated '
       + 'port has an input for the frame. ports=' + JSON.stringify(ls.roster)
       + ' mine=' + JSON.stringify(ls.localPorts));
@@ -1448,7 +1473,9 @@
   // The core lives in a worker, so a frame cannot be run synchronously the way
   // genesis.html does it. The page feeds gated frames with a bounded lookahead
   // and the worker's netFrame reply retires them.
-  function lsFeedOne() {
+  // `hidden`: a catch-up frame the engine granted (ls.rbCatchUp, or every frame
+  // while ls.rbRejoining()) — run, never presented, its audio not played.
+  function lsFeedOne(hidden) {
     var ls = lsEngine();
     if (!ls) { lsDisarm('the session went away'); return false; }
     if (ls.state !== 'running' && ls.state !== 'stalled') {
@@ -1475,7 +1502,7 @@
       // The room's state stays on the HUD and on the Party button.
       if (typeof netClose === 'function') { netClose(); pageLog('[net] the game started — party panel closed'); }
     }
-    var r = ls.beginFrame(lsLocalPads());
+    var r = ls.beginFrame(lsLocalPads(), hidden ? { hidden: true } : undefined);
     if (!r || !r.ready) {
       LS.stalling = !!(r && r.reason === 'stall');
       LS.stallReason = r ? r.reason : 'the engine returned nothing';
@@ -1483,6 +1510,9 @@
       return false;
     }
     LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
+    // The HOST decided lockstep or rollback ('lsgo' carries it) — never this
+    // page's own query string, which only says what THIS console proposes.
+    if (ls.rollback) return rbFeedOne(ls, r, hidden);
 
     var pb = ls.padBytes | 0;
     var states = lsPadBuffer(r.image, pb);
@@ -1516,7 +1546,155 @@
     return true;
   }
 
-  function lsOnWorkerFrame() {
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ROLLBACK — ZERO LOCAL INPUT LAG. The engine half is lib/netplay.js
+  // _beginFrameRb (predict, then rewind on a contradicting late input); this is
+  // the console half, and genesis.html rbRunFrame is its reference. The
+  // difference: this core runs in a WORKER, so the savestate ring lives THERE
+  // ('netRbInit' / 'netRbStep' in wasmpsx_worker.js) and a frame — plus any
+  // re-simulation it needs — is one message. Messages are handled in order, so
+  // the ring always holds every frame start the plan can name.
+  //
+  // THE SAVESTATE. PCSX's own SaveState gzips ~3.5 MB through gzwrite:
+  // 188-241 ms. The worker instead copies wasm linear memory [1024, sbrk) —
+  // the whole machine; the only mutable wasm global is the stack pointer,
+  // which is at its base between frames — plus the JS FS stream offsets.
+  // MEASURED (tools/ps1_rollback_probe.mjs, desktop Chrome, 2026-09-30):
+  // 6,863,872 bytes, 0.5 ms p50 / 0.7 ms p90 to save, 0.5 / 0.6 ms to load.
+  // A core that kept guessing, rewinding and re-simulating (225 rollbacks,
+  // 672 re-simulated frames, depth up to 7) matched a core that never guessed
+  // on 59/59 confirmed fingerprints (psxM + psxH + VRAM) on Monster Rancher 2,
+  // Legend of Dragoon D1 and Metal Gear Solid D1; the same rig with rollbacks
+  // that restore but do not correct (--broken) mismatched 15 of 19 — the check
+  // can fail. The fingerprint now also covers ALL static data — CPU/GTE
+  // registers, root counters, SPU (registers, channels, its RAM), CD-ROM
+  // controller, SIO and both memory-card images — and still matched (29/29).
+  // That exactness needs the core to read no host clock, which the worker's
+  // governor takeover provides (dfxvideo's limiter/skipper off).
+  //
+  // MEMORY CARDS. A card write on a predicted frame IS undone: the guest's
+  // cards are Mcd1Data/Mcd2Data (libpcsxcore/sio.c:66, C globals -> static
+  // data -> inside every snapshot), and the core reads them from there only
+  // (LoadMcds runs once, in pcsx_init). SaveMcd's copy into the worker's MEMFS
+  // file is never read back during the session and the worker mounts no
+  // IDBFS, so it cannot fork a room.
+  //
+  // MEMORY. The ring is rbRingFrames() slots (window + 4) of 6.86 MB: 12 slots,
+  // ~82 MB, at the starting window of 8; an adaptive room that widens the
+  // window to cover a slow link grows it (measured 24 slots, ~157 MB, at
+  // 100 ms one way + 2% loss).
+  //
+  // ⚠ GATE 9. Re-simulated frames are frames the guest already lived once, on
+  // a guess; they are not presented and their audio is not replayed (the
+  // worker's QUIET flag). Exactly one NEW frame runs per 1.000x credit.
+  // ═══════════════════════════════════════════════════════════════════════════
+  var RB_WINDOW = 8;     // frames; the HOST's value wins ('lsgo')
+  // THE RING FOLLOWS THE WINDOW. The worker's ring is indexed by the frames IT
+  // has run, in message order, so frames this page has in flight need no extra
+  // slots: a plan for frame f reaches back at most max(window, peak) + 1, and
+  // rbRingFrames() (= that + 4 margin) already covers it. At the starting
+  // window of 8 that is 12 slots x 6.86 MB = ~82 MB (was 16, ~110 MB). An
+  // adaptive room that widens the window grows it (rbGrow in the worker; slots
+  // move by reference, nothing is copied).
+  function rbRingFor(ls) {
+    return (typeof ls.rbRingFrames === 'function') ? ls.rbRingFrames() : ((ls.rollback | 0) + 4);
+  }
+  function rbFeedOne(ls, r, hidden) {
+    var pb = ls.padBytes | 0;
+    var ring = rbRingFor(ls);
+    if (!LS.rbInit) {
+      // The start of the first frame this core runs, kept before it runs.
+      pcsx_worker.postMessage({ cmd: 'netRbInit', frame: r.rollback ? r.rollback.from : r.frame, ring: ring });
+      LS.rbInit = true; LS.rbRing = ring;
+      ls.frameHz = PS1_HW_HZ;     // the room clock's frame period (lib/netplay.js _frameMs)
+    }
+    var resim = [], transfer = [];
+    if (r.rollback) {
+      for (var i = 0; i < r.rollback.frames.length; i++) {
+        var fr = r.rollback.frames[i];
+        var b = lsPadBuffer(fr.image, pb);
+        resim.push({ frame: fr.frame, states: b.buffer }); transfer.push(b.buffer);
+      }
+      LS.rollbacks++; LS.resimFrames += resim.length;
+      if (resim.length > LS.maxDepth) LS.maxDepth = resim.length;
+    }
+    var states = lsPadBuffer(r.image, pb);
+    transfer.push(states.buffer);
+    ls.endFrame(null);
+    // FINGERPRINTS OF CONFIRMED FRAMES ONLY: the state after k is slot k+1,
+    // hashed by the worker when it gets to this step.
+    var due = (typeof ls.takeHashDue === 'function') ? ls.takeHashDue() : [];
+    pcsx_worker.postMessage({ cmd: 'netRbStep', frame: r.frame, states: states.buffer, resim: resim,
+                              hidden: !!(hidden || r.hidden), hash: due, ring: ring }, transfer);
+    if (hidden || r.hidden) LS.hidden++;
+    LS.rbRing = ring;
+    LS.pend.push(performance.now());
+    LS.inFlight++;
+    LS.fedTo = r.frame + 1;
+    LS.frames++;
+    window.__ps1LsImage = Array.prototype.slice.call(r.image.subarray(0, ls.portCount * pb));
+    window.__ps1SentP1 = [r.image[0], r.image[1]];
+    window.__ps1SentP2 = [r.image[pb], r.image[pb + 1]];
+    latWitness(ls, r);
+    return true;
+  }
+  function rbOnWorkerFrame(d) {
+    var ls = lsEngine();
+    if (d.err) {
+      LS.fault = 'rollback step failed: ' + d.err;
+      pageLog('[rollback] ⚠ ' + LS.fault);
+      try { if (ls && typeof ls.fail === 'function') ls.fail(LS.fault); } catch (e) {}
+      return;
+    }
+    if (typeof d.ms === 'number') {
+      LS.stepMsSum += d.ms; LS.stepMsCount++;
+      if (d.ms > LS.stepMsMax) LS.stepMsMax = d.ms;
+      // What one rollback step (load + run + save) costs THIS console, per
+      // frame, re-simulated ones included — published to the room
+      // (ls.selfStepMs): the host sizes the window's margin by the slowest
+      // console's, and rbCatchUp spends at most half a frame of it per tick.
+      var per = d.ms / (1 + (d.resim | 0));
+      LS.stepMsEwma = LS.stepMsEwma ? LS.stepMsEwma + (per - LS.stepMsEwma) / 32 : per;
+      if (ls) ls.selfStepMs = +LS.stepMsEwma.toFixed(2);
+    }
+    if (ls && d.hashes && typeof ls.submitHash === 'function') {
+      for (var i = 0; i < d.hashes.length; i++) {
+        var h = d.hashes[i];
+        if (h.hash == null) { LS.rbMissing++; continue; }
+        ls.submitHash(h.frame | 0, h.hash >>> 0);
+        LS.hashes++; LS.rbHashes++;
+      }
+    }
+  }
+
+  // ---- LOCAL INPUT LATENCY, AS A PLAYER FEELS IT (test witness) ------------
+  // Same shape as genesis.html's: when this console's pad changes, note the
+  // engine frame NEXT to run; when a frame carrying the new pad at this
+  // console's port is fed, the difference is the local lag in frames.
+  // Lockstep reads `delay`; rollback reads 0 (the pad lands on the frame it
+  // was sampled for).
+  var LAT = { pending: null, last: -1, samples: [], overlapped: 0 };
+  function latSample(ls, mask) {
+    if (mask === LAT.last) return;
+    LAT.last = mask;
+    if (!ls || !LS.running) return;
+    var over = !!LAT.pending;
+    if (over) LAT.overlapped++;
+    LAT.pending = { mask: mask, frame: ls.frame | 0, t: performance.now(), overlap: over };
+  }
+  function latWitness(ls, r) {
+    var P = LAT.pending;
+    if (!P || !ls.localPorts || !ls.localPorts.length) return;
+    var port = ls.localPorts[0], pb = ls.padBytes | 0;
+    var m = (r.image[port * pb] | (r.image[port * pb + 1] << 8)) & 0xffff;
+    if (m !== P.mask) return;
+    if (!P.overlap) LAT.samples.push({ frames: r.frame - P.frame, ms: +(performance.now() - P.t).toFixed(2), mask: m });
+    if (LAT.samples.length > 200) LAT.samples.shift();
+    LAT.pending = null;
+  }
+
+  function lsOnWorkerFrame(d) {
+    if (d && (d.hashes || d.err || typeof d.ms === 'number')) rbOnWorkerFrame(d);
     var t0 = LS.pend.shift();
     if (t0 != null) {
       var dt = performance.now() - t0;
@@ -1539,18 +1717,37 @@
     if (!LS.lastTs) { LS.lastTs = ts; LS.accum = 0; return; }
     var d = ts - LS.lastTs; LS.lastTs = ts;
     if (d > 100) d = 100;               // a long stall must not fast-forward the guest
-    LS.accum += d;
+    var lsE = lsEngine() || {};
+    var rbRoom = !!(LS.running && lsE.rollback);
+    // ROLLBACK, ADAPTIVE ROOM (lib/netplay.js, the ADAPTIVE ROOM block), the
+    // same contract as genesis.html: the credit is multiplied by rbPace()
+    // (1 today; never above 1), and HIDDEN catch-up frames run when this
+    // console is behind the room clock — frames the room has already run,
+    // never past its clock, never presented, their audio not played.
+    LS.accum += d * ((rbRoom && typeof lsE.rbPace === 'function') ? lsE.rbPace() : 1);
+    // ⚠ REJOINING IS NOT SHOWN AS A FAST-FORWARD (gate 9). A console that was
+    // away is a rejoin-sized gap behind: until it is back, EVERY frame runs
+    // hidden, the last picture holds, and the HUD says so.
+    var rejoining = !!(rbRoom && typeof lsE.rbRejoining === 'function' && lsE.rbRejoining());
+    if (rejoining) { NET.notice = 'Rejoining the room — catching up…'; NET.noticeUntil = Date.now() + 400; }
     // Capped at 2: frames queued in the worker ahead of the feed point add ON
     // TOP of the input delay (see dreamcast.html's feed loop), so
     // max(1, delay) paid the delay twice.
-    var lookahead = Math.max(1, Math.min(2, (lsEngine() || {}).delay | 0));
+    // Rollback has no delay to hide the worker round trip behind; two frames in
+    // flight lets a re-simulating step overrun a tick without losing a credit.
+    // (Input is still applied to the frame it was sampled for.)
+    var lookahead = lsE.rollback ? 2 : Math.max(1, Math.min(2, lsE.delay | 0));
+    if (rbRoom && typeof lsE.rbCatchUp === 'function' && LS.inFlight < lookahead + 2) {
+      var cu = lsE.rbCatchUp();
+      for (var ci = 0; ci < cu && LS.inFlight < lookahead + 2; ci++) if (!lsFeedOne(true)) break;
+    }
     var ran = 0, stalled = false;
     while (LS.accum >= FRAME_MS && ran < MAX_CATCHUP_FRAMES) {
       // Getting further ahead of the worker than the input delay is not a frame
       // we are entitled to run; treat it exactly like a stall so the wait is not
       // banked and then sprinted through.
       if (LS.inFlight >= lookahead) { LS.capHits++; stalled = true; break; }
-      if (!lsFeedOne()) { LS.gateStalls++; stalled = true; break; }
+      if (!lsFeedOne(rejoining)) { LS.gateStalls++; stalled = true; break; }
       LS.accum -= FRAME_MS; ran++;
     }
     // ⚠ AND THE WAIT MUST NOT BE BANKED ACROSS TICKS. Without this, `accum`
@@ -1568,6 +1765,12 @@
     // 1.0025x warm, and the clamp took it to 1.0028x. Dropping the debt means
     // the console does not make up lost time, which is the correct trade: those
     // wall-clock milliseconds did not happen for the guest.
+    // (Tried and REVERTED: banking two frames after a worker cap hit in a
+    // rollback room. A desktop pair at 100 ms one way then measured 5-s
+    // windows of 1.021x on the host — over the device matrix's 1.02x
+    // fast-forward bar — in 2 of 2 runs (the run before it, without the bank,
+    // peaked at 1.011x). Most likely the room clock's hidden catch-up was
+    // already repaying the same loss, so it was repaid twice.)
     if (LS.accum > FRAME_MS) LS.accum = FRAME_MS;
   }
   (function lsRaf(ts) { requestAnimationFrame(lsRaf); lsTick(ts || 0); })(0);
@@ -1747,7 +1950,8 @@
       return 'The room stopped — ' + netScrubPeers(raw) + '. Leave the party to keep playing by yourself.';
     }
     if (netCapHeld()) return 'This device cannot run the emulator, so the party cannot start it here.';
-    if (netPartyState() === 'playing') return 'Playing — everyone started together at frame ' + (NET.startedAtFrame | 0) + '.';
+    if (NET.notice && Date.now() > (NET.noticeUntil || 0)) NET.notice = null;
+    if (netPartyState() === 'playing') return NET.notice ? NET.notice : 'Playing — everyone started together at frame ' + (NET.startedAtFrame | 0) + '.';
     if (netAlone()) return 'Waiting for another player — share the code ' + s.code + '. Starts by itself once two are in and loaded.';
     var who = netPartyRows().filter(function (r) { return r.who && r.state !== 'ready' && r.state !== 'playing'; })
       .map(function (r) { return r.local ? 'this console' : netPortLabel(r.port); });
@@ -1789,7 +1993,7 @@
   }
   function netPartyReset() {
     NET.autoStarted = false; NET.loadPct = 0; NET.bar = null;
-    NET.gameIdx = -1; NET.startedAtFrame = 0;
+    NET.gameIdx = -1; NET.startedAtFrame = 0; NET.notice = null;
     if (NET.tick) { clearInterval(NET.tick); NET.tick = 0; }
     netPartyButtons();
   }
@@ -1863,7 +2067,26 @@
     // alike. genesis.html and snes.html switch on e.state; so does this now.
     session.on('status', netOnStatus);
     session.on('desync', netOnDesync);
-    session.on('lockstep', function (e) { if (e && e.barrier) NET.bar = e.barrier; netRoomRender(); });
+    session.on('lockstep', function (e) {
+      if (e && e.barrier) NET.bar = e.barrier;
+      // A player who went silent (a backgrounded tab, a dead link) is dropped by
+      // the host and the game goes on; they come back by themselves. Named by
+      // SEAT, never by peer id (as genesis.html).
+      if (e && e.leave) {
+        NET.noticeUntil = Date.now() + 15000;
+        NET.notice = e.leave.mine ? 'This console lost the room for a moment — your controller is idle until it catches back up.'
+          : 'Player ' + ((e.leave.ports && e.leave.ports.length ? e.leave.ports[0] : 1) + 1) + ' dropped out — their controller is idle and the game goes on; they rejoin by themselves.';
+        pageLog('[lockstep] ' + e.leave.who + ' went limp at frame ' + e.leave.at + (e.leave.why ? ' (' + e.leave.why + ')' : ''));
+      }
+      if (e && e.rejoin) {
+        NET.noticeUntil = Date.now() + 6000;
+        NET.notice = e.rejoin.mine ? 'Back in the room — your controller is live again.'
+          : 'Player ' + ((e.rejoin.ports && e.rejoin.ports.length ? e.rejoin.ports[0] : 1) + 1) + ' is back.';
+        pageLog('[lockstep] ' + e.rejoin.who + ' is back from frame ' + e.rejoin.at);
+      }
+      if (e && e.window) pageLog('[rollback] window ' + e.window.from + ' -> ' + e.window.to + ' frames' + (e.window.why ? ' — ' + e.window.why : ''));
+      netRoomRender();
+    });
     session.on('room', function () { netRoomRender(); });
     // The host's roster names the disc the room is on. A joiner loads THAT — not
     // whatever its picker held — so the two agree at the barrier.
@@ -1877,7 +2100,15 @@
     // (4 ports, 64-byte pads). A PSX pad is a 16-bit active-low KeyStatus, so
     // two bytes carry it exactly and the per-frame image is 4 bytes, not 256.
     try {
-      session.startLockstep({ portCount: PS1_PORTS, padBytes: LS_PAD_BYTES, hashEvery: LS.hashEvery });
+      // rbCatchUp: this page runs the engine's hidden catch-up frames, applies
+      // rbPace(), and grows its ring to rbRingFrames() — so the host may run an
+      // ADAPTIVE rollback room (a window sized from the measured link, a room
+      // clock nobody waits on). rollbackOk: this page CAN run rollback even
+      // with ?rb=0 (it only declines to propose it); an engine that asks every
+      // console before choosing rollback reads it, an older one ignores it.
+      session.startLockstep({ portCount: PS1_PORTS, padBytes: LS_PAD_BYTES, hashEvery: LS.hashEvery,
+                              rollback: NET.rbWant ? RB_WINDOW : 0, rbCatchUp: true, rollbackOk: true,
+                              frameHz: PS1_HW_HZ, selfStepMs: LS.stepMsEwma || 0 });
     } catch (e) {
       pageLog('[lockstep] ⚠ startLockstep failed: ' + ((e && e.message) || e));
     }
@@ -2113,6 +2344,20 @@
       supported: netSupported(),
       session: !!NET.session,
       architecture: 'lockstep',
+      // 'lockstep' or 'rollback' — decided by the HOST's 'lsgo', read off the engine.
+      netMode: (ls && ls.rollback) ? 'rollback' : 'lockstep',
+      rbWant: NET.rbWant,
+      rollback: (ls && ls.rollback) ? {
+        window: ls.rollback,
+        engine: (typeof ls.rollbackReport === 'function') ? ls.rollbackReport() : null,
+        page: { rollbacks: LS.rollbacks, resimFrames: LS.resimFrames, maxDepth: LS.maxDepth, hashes: LS.rbHashes, hidden: LS.hidden,
+                stepMs: +(LS.stepMsEwma || 0).toFixed(2), ringMB: +((LS.rbRing * (LS.rbBytes || 0)) / 1048576).toFixed(1), snapBytes: LS.rbBytes || null,
+                missingSlot: LS.rbMissing, ring: LS.rbRing,
+                stepMsAvg: LS.stepMsCount ? +(LS.stepMsSum / LS.stepMsCount).toFixed(2) : null, stepMsMax: +LS.stepMsMax.toFixed(2) },
+      } : null,
+      // Local input lag in frames, per change of this console's own pad.
+      lat: { samples: LAT.samples.slice(-50), overlapped: LAT.overlapped },
+      core: CORE_RATE,
       mode: NET.session ? (NET.role || 'in-room') : 'none',
       // THE PARTY, as a rig sees it: the auto-declare (`declared`) and the
       // auto-start (`autoStarted`) are assertable with no button anywhere, and

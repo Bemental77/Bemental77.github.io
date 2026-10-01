@@ -46,6 +46,14 @@ const SECS = +flag('secs', '60');
 const NETMS = +flag('netms', '60');
 const JITTER = +flag('jitter', '20');
 const CPU = +flag('cpu', '4');
+const LOSS = +flag('loss', '0');
+const QUERY = flag('query', '');        // extra page query for BOTH consoles, e.g. fbasync=1
+const QUERY_HOST = flag('queryhost', QUERY), QUERY_JOIN = flag('queryjoin', QUERY);
+const RTO = +flag('rto', '200');
+// --cpujoin N: CPU-throttle the JOINER N x. It moves WHEN that console reaches
+// each framebuffer readback relative to its GPU, which is what an async
+// readback must be immune to (?fbasync=1 with ?fbwitness=1; see n64/index.html).
+const CPUJOIN = +flag('cpujoin', '1');
 const BASE = flag('url', 'http://localhost:8080');
 const GAME = flag('game', 'Mario Kart 64');
 const JSON_OUT = flag('json', '');
@@ -70,7 +78,7 @@ const browser = await puppeteer.launch({
 try { (await import('../../tools/browser_leak_guard.js')).default.guard(browser, fileURLToPath(import.meta.url)); } catch (_e) {}
 
 // Runs before any page script: optional link delay + the delay-event recorder.
-function preloadSrc(netms, jitter) {
+function preloadSrc(netms, jitter, loss = 0, rto = 200) {
   return `(() => {
     window.__pp = { delays: [], stalls: 0, resumes: 0, rx: [], begins: [], t0: performance.now() };
     if (${netms} > 0) {
@@ -83,12 +91,25 @@ function preloadSrc(netms, jitter) {
       // that reordered an 'ls' ahead of 'lsgo' in this rig, begin() then
       // cleared it, and the room deadlocked on a hole no real (ordered)
       // DataChannel can produce.
+      // --loss P (percent): on the UNRELIABLE input channel ('lsu') a lost
+      // packet is dropped and nothing waits; on the reliable ORDERED channel it
+      // is resent after --rto ms and everything behind it waits (SCTP).
       const dsend = RTCDataChannel.prototype.send;
+      window.__ppNet = { lsuSent: 0, lsuDropped: 0, relSent: 0, relResent: 0 };
       RTCDataChannel.prototype.send = function (m) {
         const self = this, now = performance.now();
+        const lat = Math.max(0, ${netms} + (Math.random() * 2 - 1) * ${jitter});
+        const lost = Math.random() * 100 < ${loss};
+        if (self.label === 'lsu') {
+          window.__ppNet.lsuSent++;
+          if (lost) { window.__ppNet.lsuDropped++; return; }
+          setTimeout(() => { try { if (self.readyState === 'open') dsend.call(self, m); } catch (e) {} }, lat);
+          return;
+        }
+        window.__ppNet.relSent++; if (lost) window.__ppNet.relResent++;
         const q = self.__ppQ || (self.__ppQ = []);
         const last = q.length ? q[q.length - 1].at : (self.__ppLast || 0);
-        const at = Math.max(last, now + Math.max(0, ${netms} + (Math.random() * 2 - 1) * ${jitter}));
+        const at = Math.max(last, now + lat + (lost ? ${rto} : 0));
         self.__ppLast = at;
         q.push({ at, m });
         const drain = () => {
@@ -152,7 +173,7 @@ async function open(tag, url, mobile) {
   }
   page.on('console', (m) => { const t = m.text(); if (/lockstep|\[net\]|desync|error|delay/i.test(t)) log.push('[' + tag + '] ' + t); });
   page.on('pageerror', (e) => log.push('[' + tag + '] PAGEERROR ' + e.message));
-  await page.evaluateOnNewDocument(preloadSrc(ARM === 'net' ? NETMS : 0, ARM === 'net' ? JITTER : 0));
+  await page.evaluateOnNewDocument(preloadSrc(ARM === 'net' ? NETMS : 0, ARM === 'net' ? JITTER : 0, ARM === 'net' ? LOSS : 0, RTO));
   await page.goto(url, { waitUntil: 'domcontentloaded' });
   return page;
 }
@@ -187,7 +208,11 @@ const sample = (page) => page.evaluate(() => {
       stalling: n.stalling, waitingOn: n.waitingOn, reanchors: n.reanchors, fault: n.fault, viHz: n.viHz,
       delay: n.engine && n.engine.delay, estate: n.engine && n.engine.state, efr: n.engine && n.engine.frame,
       minLead: n.engine && n.engine.minLead, meanLead: n.engine && n.engine.meanLead, desync: n.engine && n.engine.desync,
-      pace: n.pace || null, gl: n.gl || null, delayHistory: n.engine && n.engine.delayHistory },
+      pace: n.pace || null, gl: n.gl || null, delayHistory: n.engine && n.engine.delayHistory,
+      // rollback rooms (?rb=1): the page's and the engine's own counts
+      mode: n.mode || null, hashes: n.hashes, disc: n.disc || null, fb: n.fb || null,
+      rb: n.rollback ? { page: n.rollback.page, engine: n.rollback.engine, state: n.rollback.state } : null,
+      ra: n.runahead || null, lat: n.lat ? n.lat.samples.map((x) => x.frames) : null },
     rate: r && { speed: r.speed, from: r.speedFrom, starved: r.starved, shown: r.shown, made: r.made, lost: r.lost, e2e: r.e2eHwX },
     status: (st && st.textContent) || (s2 && s2.textContent) || '', fpsText: fps ? fps.textContent : null,
     canvas, eng, pp: window.__pp ? { delays: window.__pp.delays.slice(), stalls: window.__pp.stalls, resumes: window.__pp.resumes, rx: window.__pp.rx.slice(0, 20), begins: window.__pp.begins.slice(0, 20) } : null,
@@ -239,13 +264,18 @@ if (ARM === 'solo' || ARM === 'solo2' || ARM === 'solo-cpu4') {
 }
 try {
   const g = encodeURIComponent(GAME);
-  host = await open('host', `${BASE}/n64/?np=${CODE}&game=${g}&net=local`, true);
+  host = await open('host', `${BASE}/n64/?np=${CODE}&game=${g}&net=local${QUERY_HOST ? '&' + QUERY_HOST : ''}`, true);
   if (ARM === 'cpu4') {
     const cdp = await host.createCDPSession();
     await cdp.send('Emulation.setCPUThrottlingRate', { rate: CPU });
   }
   await new Promise((r) => setTimeout(r, 1500));
-  join = await open('join', `${BASE}/n64/?np=${CODE}&game=${g}&net=local&join=1`, false);
+  join = await open('join', `${BASE}/n64/?np=${CODE}&game=${g}&net=local&join=1${QUERY_JOIN ? '&' + QUERY_JOIN : ''}`, false);
+  if (CPUJOIN > 1) {
+    const cdp = await join.createCDPSession();
+    await cdp.send('Emulation.setCPUThrottlingRate', { rate: CPUJOIN });
+    out.cpuJoin = CPUJOIN;
+  }
   // The host admits the joiner the way the person would: a tap on Allow, after
   // asking what is actually on top there (a covered button is a finding).
   let admitted = false, admitWhy = null;
@@ -311,6 +341,50 @@ try {
   out.hostPace = lastH.net.pace; out.joinPace = lastJ.net.pace; out.joinE2e = lastJ.rate && lastJ.rate.e2e;
   out.engineDelayHistory = lastH.net.delayHistory;
   out.engHost = lastH.eng; out.engJoin = lastJ.eng;
+  out.mode = { host: lastH.net.mode, join: lastJ.net.mode };
+  out.estate = { host: lastH.net.estate, join: lastJ.net.estate };
+  out.hashes = { host: lastH.net.hashes, join: lastJ.net.hashes };
+  out.disc = { host: lastH.net.disc, join: lastJ.net.disc };
+  out.fbMode = { host: lastH.net.fb, join: lastJ.net.fb };
+  out.rb = { host: lastH.net.rb, join: lastJ.net.rb };
+  out.ra = { host: lastH.net.ra, join: lastJ.net.ra };
+  out.latFrames = { host: lastH.net.lat, join: lastJ.net.lat };
+  out.netHost = await host.evaluate(() => window.__ppNet || null); out.netJoin = await join.evaluate(() => window.__ppNet || null);
+  // THE FRAMEBUFFER-READBACK WITNESS (?fbwitness=1): per readback, a hash of
+  // the bytes the core was handed. Both consoles run the same guest calls in
+  // the same order, so the sequences must agree position for position when
+  // both use the same mode — and, when one is async and one sync, the async
+  // console's call i must carry the sync console's call i-1 (the fixed offset).
+  const fbOf = (pg) => pg.evaluate(() => { const s = window.__fbAsync; return s ? { on: s.on, calls: s.calls, async: s.async, sync: s.sync,
+    blocked: s.blocked, invalidations: s.invalidations, last: s.lastInvalidation || null, seq: s.seq } : null; }).catch(() => null);
+  const fh = await fbOf(host), fj = await fbOf(join);
+  if (fh && fj) {
+    out.fb = { host: { ...fh, seq: undefined, n: fh.seq ? fh.seq.length : null }, join: { ...fj, seq: undefined, n: fj.seq ? fj.seq.length : null } };
+    if (fh.seq && fj.seq) {
+      const A = fh.seq, B = fj.seq, n = Math.min(A.length, B.length);
+      const cmp = (off) => {             // A[i] against B[i - off]
+        let compared = 0, first = null;
+        for (let i = Math.max(0, off); i < n; i++) {
+          const x = A[i], y = B[i - off]; if (!y) continue;
+          if (off !== 0 && (x[2] !== 1 || y[2] !== 0)) continue;   // only async-vs-sync pairs for the offset test
+          compared++; if (x[1] !== y[1] && !first) first = { i, a: x, b: y };
+        }
+        return { compared, firstMismatch: first };
+      };
+      out.fb.same = cmp(0);
+      if (fh.on && !fj.on) out.fb.offset1 = cmp(1);   // the host is the async one: A[i] against B[i-1]
+      if (!fh.on && fj.on) {              // the joiner is the async one: B[i] against A[i-1]
+        let compared = 0, first = null;
+        for (let i = 1; i < n; i++) { const x = B[i], y = A[i - 1]; if (x[2] !== 1 || y[2] !== 0) continue; compared++; if (x[1] !== y[1] && !first) first = { i, join: x, host: y }; }
+        out.fb.offset1 = { compared, firstMismatch: first };
+      }
+      // A sequence of identical frames would agree trivially: say how many
+      // DIFFERENT copies each console was handed.
+      out.fb.distinct = { host: new Set(A.map((x) => x[1])).size, join: new Set(B.map((x) => x[1])).size };
+      out.fb.blockedFrac = { host: fh.async ? +(fh.blocked / fh.async).toFixed(3) : null, join: fj.async ? +(fj.blocked / fj.async).toFixed(3) : null };
+    }
+    if (JSON_OUT) out.fbSeq = { host: fh.seq, join: fj.seq };
+  }
   out.startMsgs = { host: { rx: lastH.pp && lastH.pp.rx, begins: lastH.pp && lastH.pp.begins }, join: { rx: lastJ.pp && lastJ.pp.rx, begins: lastJ.pp && lastJ.pp.begins } };
   if (LOSE_GL) {
     // Take the host's WebGL context away the way a phone's browser can, and
@@ -332,7 +406,7 @@ try {
 } finally {
   out.log = log.slice(-80);
   if (JSON_OUT) writeFileSync(JSON_OUT, JSON.stringify(out, null, 1));
-  const brief = { ...out }; delete brief.timeline; delete brief.log;
+  const brief = { ...out }; delete brief.timeline; delete brief.log; delete brief.fbSeq;
   console.log(JSON.stringify(brief));
   await browser.close().catch(() => {});
 }
