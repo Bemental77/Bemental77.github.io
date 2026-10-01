@@ -1621,6 +1621,8 @@ N64Rate.selfTest = function (logFn) {
   return { pass: pass, fail: fail, lines: lines, summary: summary };
 };
 </script>
+<script src="/n64/N64Wasm/dist/fbasync.js?v=2e04f1b9"></script>
+<script src="/n64/N64Wasm/dist/jit_params.js?v=bb2930f6"></script>
 <script>
 (function () {
   'use strict';
@@ -1794,177 +1796,9 @@ N64Rate.selfTest = function (logFn) {
   //     construction. A pinned buffer is never reused until st.release(snap).
   // Only calls with no pack buffer bound are touched; the page's own draw
   // witness bypasses it.
-  var FB_Q = new URLSearchParams(location.search);
-  var FB_FORCE = FB_Q.get('fbasync');                 // '1' | '0' | null (= per title)
-  var FB_WITNESS = FB_Q.get('fbwitness') === '1';
-  window.__fbAsync = { on: FB_FORCE === '1', decided: FB_FORCE === '1' ? 'forced on (?fbasync=1)' : null,
-                       calls: 0, async: 0, sync: 0, blocked: 0, invalidations: 0, pinned: 0, pool: 0,
-                       seq: FB_WITNESS ? [] : null };
-  // Glide64_Ini.c's read_always = 1 branches, by the name each one tests
-  // (HAVE_HWFBE is not defined in this build, so the #ifndef branches apply).
-  var FB_READ_ALWAYS = ['MARIOKART64', 'POKEMON SNAP', 'DONKEY KONG 64', 'BANJO TOOIE',
-                        'Banjo-Kazooie', 'BANJO KAZOOIE 2', 'CASTLEVANIA', 'RIDGE RACER 64'];
-  function romInternalName(bytes) {
-    if (!bytes || bytes.length < 0x40) return null;
-    var b = bytes, sig = (b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3]) >>> 0, s = '';
-    for (var i = 0x20; i < 0x34; i++) {
-      var j = i;                                       // .z64: native big-endian
-      if (sig === 0x37804012) j = i ^ 1;               // .v64: 16-bit byte-swapped
-      else if (sig === 0x40123780) j = i ^ 3;          // .n64: 32-bit word-swapped
-      else if (sig !== 0x80371240) return null;
-      s += String.fromCharCode(b[j]);
-    }
-    return s.replace(/\0/g, '').replace(/ +$/, '');
-  }
-  window.__fbDecide = function (bytes) {
-    var st = window.__fbAsync, name = romInternalName(bytes);
-    st.romName = name;
-    var hit = null;
-    if (name) for (var i = 0; i < FB_READ_ALWAYS.length; i++) if (name.indexOf(FB_READ_ALWAYS[i]) >= 0) { hit = FB_READ_ALWAYS[i]; break; }
-    st.readAlways = !!hit;
-    if (FB_FORCE === '1') { st.on = true; st.decided = 'forced on (?fbasync=1)'; }
-    else if (FB_FORCE === '0') { st.on = false; st.decided = 'opted out (?fbasync=0)'; }
-    else { st.on = !!hit; st.decided = hit ? 'read_always title (' + hit + ')' : 'off — glide does not read this title back every frame'; }
-    return st.on;
-  };
-  if (window.WebGL2RenderingContext) {
-    (function () {
-      var P = WebGL2RenderingContext.prototype, orig = P.readPixels;
-      var st = window.__fbAsync, ctxs = [], hooked = false;
-      // A pack buffer: { gl, buf, bytes, key, fence, refs }. refs counts the
-      // owners — "pending" (the next call hands it over) and every snapshot
-      // that pinned it. Only a buffer with refs 0 is ever written again.
-      var fbOf = function (gl) {
-        if (!gl.__fb) { gl.__fb = { pending: null, pool: [] }; ctxs.push(gl); }
-        return gl.__fb;
-      };
-      var unref = function (b) {
-        if (!b || --b.refs > 0) return;
-        if (b.fence) { try { b.gl.deleteSync(b.fence); } catch (e) {} b.fence = null; }
-        var fb = fbOf(b.gl);
-        if (fb.pool.length < 16) { fb.pool.push(b); st.pool = fb.pool.length; }
-        else { try { b.gl.deleteBuffer(b.buf); } catch (e) {} }
-      };
-      var acquire = function (gl, bytes, key) {
-        var fb = fbOf(gl), b = null;
-        for (var i = 0; i < fb.pool.length; i++) if (fb.pool[i].bytes === bytes) { b = fb.pool.splice(i, 1)[0]; break; }
-        if (!b) {
-          b = { gl: gl, buf: gl.createBuffer(), bytes: bytes, key: key, fence: null, refs: 0 };
-          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, b.buf);
-          gl.bufferData(gl.PIXEL_PACK_BUFFER, bytes, gl.STREAM_READ);
-          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-        }
-        b.key = key; b.refs = 1;
-        st.pool = fb.pool.length;
-        return b;
-      };
-      var dropPending = function () {
-        for (var c = 0; c < ctxs.length; c++) { var fb = ctxs[c].__fb; if (fb.pending) { unref(fb.pending); fb.pending = null; } }
-      };
-      st.invalidate = function (why) { dropPending(); st.invalidations++; st.lastInvalidation = why || 'call'; };
-      // ROLLBACK / RUN-AHEAD: pin what the NEXT call would hand over.
-      st.snapshot = function () {
-        var out = [];
-        for (var c = 0; c < ctxs.length; c++) {
-          var p = ctxs[c].__fb.pending;
-          if (p) { p.refs++; st.pinned++; }
-          out.push([ctxs[c], p]);
-        }
-        return out;
-      };
-      st.restore = function (snap) {
-        if (!snap) return;
-        dropPending();
-        for (var i = 0; i < snap.length; i++) {
-          var fb = fbOf(snap[i][0]), p = snap[i][1];
-          if (p) p.refs++;
-          fb.pending = p;
-        }
-        st.restores = (st.restores | 0) + 1;
-      };
-      st.release = function (snap) {
-        if (!snap) return;
-        for (var i = 0; i < snap.length; i++) if (snap[i][1]) { unref(snap[i][1]); st.pinned--; }
-      };
-      var hookCore = function () {
-        var M = window.Module;
-        if (hooked || !M || typeof M._neil_reset !== 'function') return;
-        hooked = true;
-        ['_neil_reset', '_neil_unserialize'].forEach(function (n) {
-          var f = M[n]; if (typeof f !== 'function') return;
-          M[n] = function () { st.invalidate(n); return f.apply(this, arguments); };
-        });
-      };
-      // The witness: FNV-1a over every 61st byte of what the core was handed
-      // (~20 K reads of a 640x480 copy) — cheap enough not to move the timing.
-      var witness = function (x, y, w, h, u8, from, bytes, mode, blocked) {
-        var hsh = 2166136261 >>> 0;
-        hsh = Math.imul(hsh ^ (x * 65599 + y) , 16777619) >>> 0;
-        hsh = Math.imul(hsh ^ (w * 65599 + h), 16777619) >>> 0;
-        for (var i = from; i < from + bytes; i += 61) hsh = Math.imul(hsh ^ u8[i], 16777619) >>> 0;
-        if (st.seq.length < 40000) st.seq.push([st.calls, hsh, mode, blocked ? 1 : 0]);
-      };
-      P.readPixels = function (x, y, w, h, format, type, dst, dstIndex) {
-        var gl = this;
-        if (!st.on && !st.seq) return orig.apply(gl, arguments);
-        // ⚠ A ZERO-AREA READ IS NOT A READ. DK64's first readback is (0,480,
-        // 640x0). Taken through a pack buffer it created a 0-byte
-        // PIXEL_PACK_BUFFER, and the next (real) read on that context came back
-        // with bytes that varied by browser context while the context was
-        // lost (drawingBufferWidth 0) right after it — measured: two contexts
-        // handed the core 2826218052 vs 2297120715 on call #2, a room desync.
-        // It moves no pixels, so it goes straight to GL and changes no state.
-        if (!(w > 0 && h > 0)) return orig.apply(gl, arguments);
-        st.calls++;
-        if (!hooked) hookCore();
-        if (st.bypass || arguments.length < 7 || !dst || typeof dst !== 'object' || !dst.buffer ||
-            format !== gl.RGBA || type !== gl.UNSIGNED_BYTE || gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING)) {
-          st.sync++; return orig.apply(gl, arguments);
-        }
-        var bytes = w * h * 4;
-        var dstByte = dst.byteOffset + ((dstIndex | 0) * (dst.BYTES_PER_ELEMENT || 1));
-        if (dstByte + bytes > dst.buffer.byteLength) { st.sync++; return orig.apply(gl, arguments); }
-        var u8 = st.seq ? new Uint8Array(dst.buffer) : null;
-        if (!st.on) {                                       // witness only: the shipped synchronous read
-          var r0 = orig.apply(gl, arguments); st.sync++;
-          witness(x, y, w, h, u8, dstByte, bytes, 0, false);
-          return r0;
-        }
-        var key = x + ',' + y + ',' + w + 'x' + h + ':' + format + ':' + type;
-        var fb = fbOf(gl);
-        // A different rect than the pending copy: it is from before the switch.
-        if (fb.pending && fb.pending.key !== key) { unref(fb.pending); fb.pending = null; st.invalidations++; st.lastInvalidation = 'rect'; }
-        // 1. start this call's copy into a free pack buffer — no wait
-        var cur = acquire(gl, bytes, key);
-        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, cur.buf);
-        orig.call(gl, x, y, w, h, format, type, 0);
-        cur.fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
-        var dstView = new Uint8Array(dst.buffer, dstByte, bytes);
-        if (!fb.pending) {
-          // Nothing older exists (first call, or just dropped): hand over THIS
-          // copy — the synchronous read — and keep it pending as well, so the
-          // NEXT call hands over this one: the one-call offset from here on.
-          gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, dstView);
-          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-          st.sync++;
-          if (u8) witness(x, y, w, h, u8, dstByte, bytes, 0, false);
-          fb.pending = cur;
-          return;
-        }
-        // 2. hand the core the PREVIOUS copy — complete, blocking if it must
-        var prev = fb.pending;
-        var blocked = !!(prev.fence && gl.getSyncParameter(prev.fence, gl.SYNC_STATUS) !== gl.SIGNALED);
-        if (blocked) st.blocked++;
-        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, prev.buf);
-        gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, dstView);
-        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-        unref(prev);                                         // consumed (a pinned copy survives)
-        fb.pending = cur;
-        st.async++;
-        if (u8) witness(x, y, w, h, u8, dstByte, bytes, 1, blocked);
-      };
-    })();
-  }
+  // The implementation lives in /n64/N64Wasm/dist/fbasync.js (shared with the
+  // worker-hosted core, core_worker.js) — one implementation for both realms.
+  window.__n64InstallFbAsync(window, location.search);
   // NATIVE-RESOLUTION READBACK (core: glitchmain.c grLfbReadSampled). On a
   // read_always title the core now point-samples the frame ON THE GPU and
   // reads back only the N64-sized result (320x240 instead of 640x480), with
@@ -2325,25 +2159,31 @@ N64Rate.selfTest = function (logFn) {
   // MUST run several times a second — see N64Rate.AUDIO_MAX_GAP_MS.
   setInterval(function () {
     if (!running || !window.Module || !Module._neilGetAudioWritePosition) return;
-    try { rate.audioSample((Module._neilGetAudioWritePosition() - AUD_DROPPED + 64000) % 64000, performance.now()); } catch (e) {}
+    // Core worker: the position is the worker's, as of its last report, so it is timed on
+    // that report's clock rather than now (wkStatT; up to 100 ms apart otherwise).
+    var tA = WK.on ? wkStatT() : performance.now();
+    try { rate.audioSample((Module._neilGetAudioWritePosition() - AUD_DROPPED + 64000) % 64000, tA); } catch (e) {}
   }, 200);
 
   function paintRate() {
     var shown = rafTicks; rafTicks = 0;
+    // Core worker: the pictures are put up by the WORKER (one per tick in which it ran a
+    // field, on its own rAF), so that is what `shown` counts; this page's rAF says nothing.
+    if (WK.on) { var pr = WK.stat ? WK.stat.presents : 0; shown = pr - WK.presents0; WK.presents0 = pr; }
     var pace = pacer.drain();
     paceTotals.paced += pace.paced; paceTotals.denied += pace.denied;
     paceTotals.idle += pace.idle; paceTotals.notOwed += pace.notOwed; paceTotals.ticks += pace.ticks;
     if (!running || !window.Module || !Module._neil_vi_total) { if (fpsEl) fpsEl.textContent = ''; return; }
     var r;
     try {
-      r = rate.window(performance.now(), {
+      r = rate.window(WK.on ? wkStatT() : performance.now(), {
         vi: Module._neil_vi_total(), costMs: Module._neil_frame_cost_ms(), costN: Module._neil_frame_cost_n(),
         // ⚠ NOT IN A PARTY. The pace governor's busy time is the "duty" behind
         // e2e, and under lockstep the governor is idle (lsFeed runs the frames),
         // so duty read ~0 and e2e printed nonsense — the live report showed
         // "547.85x e2e" beside a 0.36x room. No duty, no e2e: the rate model's
         // own ?ratetest P11 contract for a window with no pace data.
-        coreFps: readCoreFps(), shown: shown, arm: activeArm, pace: (typeof LS !== 'undefined' && LS.armed) ? null : pace
+        coreFps: WK.on ? null : readCoreFps(), shown: shown, arm: activeArm, pace: ((typeof LS !== 'undefined' && LS.armed) || WK.on) ? null : pace
       });
     } catch (e) { return; }
     lastRate = r;
@@ -2554,6 +2394,205 @@ N64Rate.selfTest = function (logFn) {
   var pendingRom = null;
   var preCreatedCtx = null; // created inside the Start gesture so it's never autoplay-suspended
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // THE CORE WORKER — the emulator off the main thread (n64/docs/worker/README.md)
+  // ═══════════════════════════════════════════════════════════════════════════
+  // In this mode the core (the SAME n64wasm.{js,wasm}) runs in a dedicated Worker
+  // (/n64/N64Wasm/dist/core_worker.js) and draws into #canvas through an
+  // OffscreenCanvas. This page keeps the UI, the input devices and the audio
+  // graph; audio goes from the worker STRAIGHT to the AudioWorklet over a
+  // MessagePort. The worker owns the frame clock (the room's 1.000x governor,
+  // lsDueNow) and takes the pad image this page posts — see the worker's header
+  // for why that is the deterministic lockstep path and not SDL's DOM input.
+  //
+  // WHEN. ?worker=1 asks for it, ?worker=0 pins the main-thread core (the
+  // control arm and kill switch). It is only ever used for a SOLO console on a
+  // browser that can do it — Worker + transferControlToOffscreen + WebGL2 inside
+  // a worker (lib/capability.js webgl2Worker) + AudioWorklet — and never with a
+  // feature that still lives on the main thread: a room (?np=, rollback,
+  // lockstep, run-ahead all drive the core synchronously from this page), the
+  // non-default JIT arms, ?difftrace, ?turbo, ?fbwitness. Those boot the
+  // main-thread core exactly as before; the reason is logged.
+  var WK_V = 'c420a447';                           // cache-buster for the worker's scripts
+  var WK_DEFAULT = false;                    // the default for a capable solo console
+  var WK = { on: false, why: null, w: null, stat: null, statAt: 0, presents0: 0, pendingAudioPort: null,
+             evals: {}, evalId: 0, sent: null, composed: 0, posted: 0, fatal: null, booted: false };
+  function wkDecide() {
+    var q = new URLSearchParams(location.search), wq = q.get('worker');
+    var no = function (why) { WK.on = false; WK.why = why; return false; };
+    if (wq === '0' || wq === 'off') return no('pinned off (?worker=0)');
+    if (!(wq === '1' || wq === 'on' || WK_DEFAULT)) return no('off by default (?worker=1 enables it)');
+    if (typeof NET !== 'undefined' && NET && (NET.pendingCode || NET.session)) return no('a room drives the core synchronously from this page (rollback/lockstep)');
+    if (RATETEST) return no('?ratetest runs no emulator');
+    var jq = q.get('jit');
+    if (jq && jq !== 'off' && jq !== 'emit') return no('?jit=' + jq + ' is a main-thread measurement arm');
+    if (q.has('difftrace') || q.has('turbo') || q.has('ra') || q.get('fbwitness') === '1') return no('a main-thread measurement arm is on (?difftrace/?turbo/?ra/?fbwitness)');
+    if (typeof Worker !== 'function') return no('this browser has no Worker');
+    var cv = $('canvas');
+    if (!cv || typeof cv.transferControlToOffscreen !== 'function') return no('this browser cannot hand a canvas to a worker (no transferControlToOffscreen)');
+    if (typeof AudioWorkletNode !== 'function') return no('no AudioWorklet — the worker feeds audio only through one');
+    try {
+      if (window.Capability && Capability.REQ && Capability.REQ.webgl2Worker && window.__cap && window.__cap.webgl2
+          && !Capability.REQ.webgl2Worker.has(window.__cap)) return no('WebGL2 inside a worker is not available: ' + Capability.REQ.webgl2Worker.why(window.__cap));
+    } catch (e) {}
+    WK.on = true; WK.why = (wq === '1' || wq === 'on') ? 'requested (?worker=1)' : 'default for a capable solo console';
+    return true;
+  }
+
+  // ---- input: one pad image per port, in the core's own units -----------------------------
+  // [mask, axis0, axis1] x 4, where mask is neil_ls_set_pad's 14-bit order and the axes are
+  // exactly what mainLoopInner writes into neilbuttons[] on the main-thread path
+  // (mymain.cpp KEYBOARD/SDL joystick/MOBILE blocks): keyboard + touch + the first gamepad on
+  // port 0, the k-th connected gamepad on port k, user remaps from KeyMappings honoured.
+  var WK_BIT = { up: 0, down: 1, left: 2, right: 3, a: 4, b: 5, start: 6, z: 7, l: 8, r: 9, cup: 10, cdown: 11, cleft: 12, cright: 13 };
+  var WK_KEYS = [['Mapping_Up', 'up'], ['Mapping_Down', 'down'], ['Mapping_Left', 'left'], ['Mapping_Right', 'right'],
+                 ['Mapping_Action_A', 'a'], ['Mapping_Action_B', 'b'], ['Mapping_Action_Start', 'start'], ['Mapping_Action_Z', 'z'],
+                 ['Mapping_Action_L', 'l'], ['Mapping_Action_R', 'r'], ['Mapping_Action_CUP', 'cup'], ['Mapping_Action_CDOWN', 'cdown'],
+                 ['Mapping_Action_CLEFT', 'cleft'], ['Mapping_Action_CRIGHT', 'cright']];
+  var WK_JOY = [['Joy_Mapping_Up', 'up'], ['Joy_Mapping_Down', 'down'], ['Joy_Mapping_Left', 'left'], ['Joy_Mapping_Right', 'right'],
+                ['Joy_Mapping_Action_A', 'a'], ['Joy_Mapping_Action_B', 'b'], ['Joy_Mapping_Action_Start', 'start'], ['Joy_Mapping_Action_Z', 'z'],
+                ['Joy_Mapping_Action_L', 'l'], ['Joy_Mapping_Action_R', 'r'], ['Joy_Mapping_Action_CUP', 'cup'], ['Joy_Mapping_Action_CDOWN', 'cdown'],
+                ['Joy_Mapping_Action_CLEFT', 'cleft'], ['Joy_Mapping_Action_CRIGHT', 'cright']];
+  var wkHeld = new Set();
+  function wkKeyName(k) { return String(k == null ? '' : k).toLowerCase(); }
+  function wkCompose() {
+    var app = window.myApp, rd = (app && app.rivetsData) || {};
+    var km = (rd.inputController && rd.inputController.KeyMappings) || MAPPING_DEFAULTS;
+    var out = new Int32Array(12);
+    var gps = [], all = (navigator.getGamepads && navigator.getGamepads()) || [];
+    for (var gi = 0; gi < all.length; gi++) if (all[gi]) gps.push(all[gi]);
+    var S = 32767;
+    for (var p = 0; p < 4; p++) {
+      var m = 0, a0 = 0, a1 = 0, gp = gps[p];
+      if (gp) {
+        var bt = gp.buttons || [];
+        for (var j = 0; j < WK_JOY.length; j++) {
+          var bi = km[WK_JOY[j][0]];
+          if (bi != null && bi >= 0 && bt[bi] && bt[bi].pressed) m |= 1 << WK_BIT[WK_JOY[j][1]];
+        }
+        var ax = gp.axes || [];
+        var x0 = (ax[0] || 0) * S | 0, y0 = (ax[1] || 0) * S | 0, x1 = (ax[2] || 0) * S | 0, y1 = (ax[3] || 0) * S | 0;
+        if (rd.swapSticks) { var tx = x0, ty = y0; x0 = x1; y0 = y1; x1 = tx; y1 = ty; }
+        a0 = x0; a1 = y0;
+        if ((p === 1 && rd.invert2P) || (p === 2 && rd.invert3P) || (p === 3 && rd.invert4P)) a1 = -a1;
+        if (x1 < -16000) m |= 1 << WK_BIT.cleft;
+        if (x1 > 16000) m |= 1 << WK_BIT.cright;
+        if (y1 < -16000) m |= 1 << WK_BIT.cup;
+        if (y1 > 16000) m |= 1 << WK_BIT.cdown;
+      }
+      if (p === 0) {
+        for (var k = 0; k < WK_KEYS.length; k++) if (wkHeld.has(wkKeyName(km[WK_KEYS[k][0]]))) m |= 1 << WK_BIT[WK_KEYS[k][1]];
+        if (wkHeld.has(wkKeyName(km.Mapping_Action_Analog_Up))) a1 = -32000;
+        if (wkHeld.has(wkKeyName(km.Mapping_Action_Analog_Down))) a1 = 32000;
+        if (wkHeld.has(wkKeyName(km.Mapping_Action_Analog_Left))) a0 = -32000;
+        if (wkHeld.has(wkKeyName(km.Mapping_Action_Analog_Right))) a0 = 32000;
+        if (isMobile && !gp) {
+          // processMobileControls: the touch overlay's buttons OR in, its stick IS the stick.
+          var mp = mobilePadState;
+          for (var nm in WK_BIT) if (mp[nm]) m |= 1 << WK_BIT[nm];
+          a0 = (32000 * stickVec.x) | 0; a1 = -((32000 * stickVec.y) | 0);
+          // the vendored seam a harness spies on (tools/n64_page_test.mjs mobile pass)
+          try { pushControlsToCore(); } catch (e) {}
+        }
+      }
+      out[p * 3] = m; out[p * 3 + 1] = a0; out[p * 3 + 2] = a1;
+    }
+    WK.composed++;
+    var s = WK.sent, same = !!s;
+    if (s) for (var i = 0; i < 12; i++) if (s[i] !== out[i]) { same = false; break; }
+    if (!same && WK.w) { WK.sent = out; WK.posted++; WK.w.postMessage({ t: 'pad', p: out }); }
+  }
+  function wkWireInput() {
+    var editable = function (t) { return t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable); };
+    window.addEventListener('keydown', function (e) { if (editable(e.target)) return; wkHeld.add(wkKeyName(e.key)); wkCompose(); }, true);
+    // Release is never filtered (a key that went down before focus moved must still come up).
+    window.addEventListener('keyup', function (e) { wkHeld.delete(wkKeyName(e.key)); wkCompose(); }, true);
+    window.addEventListener('blur', function () { wkHeld.clear(); wkCompose(); });
+    // The touch overlay updates mobilePadState/stickVec in its own handlers; compose right
+    // after them (a microtask) so a tap is posted in the same task it arrived in.
+    ['pointerdown', 'pointermove', 'pointerup', 'pointercancel', 'touchstart', 'touchmove', 'touchend', 'touchcancel'].forEach(function (ev) {
+      window.addEventListener(ev, function () { queueMicrotask(wkCompose); }, { capture: true, passive: true });
+    });
+    // Gamepads have no events for button changes, and the overlay's minimum-press floor
+    // releases on a timer: a short heartbeat picks both up. It posts only on CHANGE.
+    setInterval(wkCompose, 8);
+    document.addEventListener('visibilitychange', function () { if (WK.w) WK.w.postMessage({ t: 'pause', on: document.hidden }); });
+  }
+
+  // ---- the read-only Module the rest of this page sees ---------------------------------------
+  // The meter, the status and the harness surfaces read a handful of counters off
+  // window.Module. In worker mode those are the worker's own numbers, as of its last report
+  // (100 ms cadence); nothing on this page can call into the core synchronously, and the
+  // facade deliberately has no HEAP, no _runMainLoop and no ls/rollback entry points, so any
+  // main-thread-only feature finds the core "not there" instead of driving a stale copy.
+  function wkFacade() {
+    return {
+      __worker: true,
+      _neil_vi_total: function () { return WK.stat ? WK.stat.vi : 0; },
+      _neil_frame_cost_ms: function () { return WK.stat ? WK.stat.costMs : 0; },
+      _neil_frame_cost_n: function () { return WK.stat ? WK.stat.costN : 0; },
+      _neilGetAudioWritePosition: function () { return WK.stat ? WK.stat.apos : 0; },
+      _neil_reset: function () { if (WK.w) WK.w.postMessage({ t: 'reset' }); },
+      printErr: null, onAbort: null
+    };
+  }
+  // Worker report time on THIS page's clock (performance.now()).
+  function wkStatT() { return WK.stat ? WK.stat.at - performance.timeOrigin : performance.now(); }
+
+  function wkOnMessage(e) {
+    var d = e.data || {};
+    switch (d.t) {
+      case 'stat': WK.stat = d; break;
+      case 'print':
+        pageLog('> ' + d.s);
+        if (String(d.s).indexOf('Starting R4300 emulator') !== -1) { running = true; mark('running'); setStatus('Running.'); }
+        break;
+      case 'log': pageLog(d.s); break;
+      case 'toast': if (d.bad) toast(d.s, true); break;
+      case 'booted': WK.booted = true; mark('worker-booted'); break;
+      case 'evalr': { var cb = WK.evals[d.id]; delete WK.evals[d.id]; if (cb) cb(d); break; }
+      case 'err':
+        pageLog('[worker-err] ' + d.s);
+        if (d.fatal) {
+          WK.fatal = d.s;
+          setStatus('Emulator crashed in the core worker — reload to retry, or add ?worker=0 to run it on the page. (' + String(d.s).slice(0, 120) + ')');
+          toast('Emulator crashed', true);
+        }
+        break;
+    }
+  }
+  function wkBoot(app, bytes, files) {
+    var q = new URLSearchParams(location.search);
+    var off = $('canvas').transferControlToOffscreen();
+    var w = new Worker('/n64/N64Wasm/dist/core_worker.js?v=' + WK_V);
+    WK.w = w;
+    w.onmessage = wkOnMessage;
+    w.onerror = function (e) { wkOnMessage({ data: { t: 'err', s: 'worker error: ' + ((e && e.message) || 'unknown'), fatal: true } }); };
+    window.Module = wkFacade();
+    var buf = (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) ? bytes.buffer : bytes.slice().buffer;
+    w.postMessage({ t: 'boot', canvas: off, rom: buf, files: files, romName: app.rom_name,
+                    viHz: (romRegion && romRegion.viHz > 0) ? romRegion.viHz : 0, search: location.search,
+                    jit: (q.get('jit') === 'off' || q.has('nojit')) ? 'off' : 'emit', rig: q.get('workerrig') === '1', v: WK_V },
+                  [off, buf]);
+    if (WK.pendingAudioPort) { w.postMessage({ t: 'audioPort', port: WK.pendingAudioPort }, [WK.pendingAudioPort]); WK.pendingAudioPort = null; }
+    wkWireInput();
+    wkCompose();
+    pageLog('[worker] core booting in a dedicated Worker (' + WK.why + ') — this page keeps UI, input and the audio graph');
+  }
+  // Rig surface (?workerrig=1): run a snippet inside the worker's realm, where `Module` is the
+  // live core. Used by n64/tools/n64_worker_probe.mjs; the worker refuses it without the flag.
+  window.__n64Worker = {
+    state: function () { return { on: WK.on, why: WK.why, booted: WK.booted, fatal: WK.fatal, stat: WK.stat, composed: WK.composed, posted: WK.posted, sent: WK.sent ? Array.prototype.slice.call(WK.sent) : null }; },
+    eval: function (src) {
+      return new Promise(function (res, rej) {
+        if (!WK.w) return rej(new Error('no core worker'));
+        var id = ++WK.evalId;
+        WK.evals[id] = function (d) { if ('e' in d && d.e !== undefined) rej(new Error(d.e)); else res(d.v); };
+        WK.w.postMessage({ t: 'eval', id: id, src: src });
+      });
+    }
+  };
+
   // script.js calls window.postLoad() right after constructing myApp and BEFORE
   // it defines window.Module / chain-loads input_controller.js + n64wasm.js —
   // the one hook where myApp exists but nothing has booted. All page-side
@@ -2596,6 +2635,31 @@ N64Rate.selfTest = function (logFn) {
     // Free-run mode only: the pump never drives frames, so force
     // disableAudioSync regardless of any stale localStorage option.
     app.rivetsData.disableAudioSync = true;
+    if (WK.on) {
+      // CORE WORKER: everything the vendored LoadEmulator would have written into the
+      // core's MEMFS (config.txt, cheat.txt, the stored save memory) is captured here and
+      // handed to the worker, which writes it into ITS MEMFS before main() — the same
+      // files, from the same vendored writers, so the core boots with the same settings.
+      app.LoadEmulator = async function (bytes) {
+        var files = {}, prevFS = window.FS;
+        window.FS = { writeFile: function (n, d) { files[String(n).replace(/^\//, '')] = d; } };
+        try {
+          this.beforeRun();
+          this.WriteConfigFile();
+          await this.LoadSram();
+        } finally { window.FS = prevFS; }
+        wkBoot(this, bytes, files);
+        this.initAudio();
+        try { if (window.jQuery) jQuery('#canvasDiv').show(); } catch (e) {}
+        this.rivetsData.beforeEmulatorStarted = false;
+        this.showToast = function () {}; this.toggleFPSModule = function () {};
+        this.setRemainingAudio = function () {}; this.setDoubleSpeed = function () {};
+        this.sendMobileControls = function (s, x, y) { WK.lastMobile = [s, x, y]; };
+        this.saveStateLocal = function () { this.rivetsData.noLocalSave = false; WK.w.postMessage({ t: 'saveState' }); };
+        this.loadStateLocal = function () { WK.w.postMessage({ t: 'loadState' }); };
+        this.reset = function () { WK.w.postMessage({ t: 'reset' }); };
+      };
+    }
     var origInitAudio = app.initAudio.bind(app);
     app.initAudio = function () {
       if (this.audioInited) return;
@@ -2619,7 +2683,7 @@ N64Rate.selfTest = function (logFn) {
       this.gainNode = ctx.createGain();
       this.gainNode.gain.value = 0.5;
       this.gainNode.connect(ctx.destination);
-      this.audioBufferResampled = new Int16Array(Module.HEAP16.buffer, Module._neilGetSoundBufferResampledAddress(), 64000);
+      if (!WK.on) this.audioBufferResampled = new Int16Array(Module.HEAP16.buffer, Module._neilGetSoundBufferResampledAddress(), 64000);
       this.audioReadPosition = 0;
       var SLACK = 24000; // Int16 entries (~272 ms stereo) — must exceed the deepest main-thread stall the cushion should absorb (gauntlet level-load bursts drained 16000)
       var workletBacklog = 0, lastUnderruns = 0;
@@ -2631,6 +2695,19 @@ N64Rate.selfTest = function (logFn) {
           if (e.data.u > lastUnderruns) { app.rivetsData.audioSkipCount += (e.data.u - lastUnderruns); lastUnderruns = e.data.u; }
           window.__audioDbg = e.data; // diagnostics (b=backlog, u=dry calls, m=missing entries)
         };
+        if (WK.on) {
+          // CORE WORKER: the worker feeds this node DIRECTLY over its own MessagePort
+          // (n64/audio-worklet.js adopts a port it is handed), so audio never waits on
+          // this thread. The backlog reports above still arrive here for the meter.
+          var ch = new MessageChannel();
+          node.port.postMessage({ port: ch.port1 }, [ch.port1]);
+          if (WK.w) WK.w.postMessage({ t: 'audioPort', port: ch.port2 }, [ch.port2]);
+          else WK.pendingAudioPort = ch.port2;
+          app.__n64AudioPump = function () {};
+          app.__n64AudioDrop = function () {};
+          pageLog('[audio] AudioWorklet fed directly by the core worker');
+          return;
+        }
         // The pump is callable on its own: rollback and run-ahead drain it
         // BEFORE they re-run frames (so every sample a real frame produced is
         // already queued) and then drop what the re-run produced (__n64AudioDrop).
@@ -2674,7 +2751,8 @@ N64Rate.selfTest = function (logFn) {
     // input_controller.js has run by now; route the core's per-frame mobile
     // pull to our pad state.
     window.myApp.rivetsData.inputController.updateMobileControls = pushControlsToCore;
-    setupJitBridge();
+    if (WK.on) pageLog('[jit] the JIT bridge runs inside the core worker (core_worker.js)');
+    else setupJitBridge();
     // ?difftrace: start the per-VI state-checksum trace HERE — a point that
     // is deterministically before the ROM download/callMain in every run,
     // so capture always begins at VI frame 0 (harness alignment).
@@ -2761,39 +2839,8 @@ N64Rate.selfTest = function (logFn) {
     // The bridge passes one pointer to a 10-u32 param block (recomp.c):
     // [vaddr, entryPtr, span, srcPtr, stride, addrOff, &PC, &reg, &hi, &lo]
     window.myApp.jitCompile = function (paramsPtr) {
-      var q = paramsPtr >> 2;
-      var p = {
-        vaddr: Module.HEAPU32[q], entryPtr: Module.HEAPU32[q + 1], span: Module.HEAPU32[q + 2],
-        srcPtr: Module.HEAPU32[q + 3], stride: Module.HEAPU32[q + 4], addrOff: Module.HEAPU32[q + 5],
-        pcGlobal: Module.HEAPU32[q + 6], reg: Module.HEAPU32[q + 7], hi: Module.HEAPU32[q + 8], lo: Module.HEAPU32[q + 9],
-        blockStart: Module.HEAPU32[q + 10], blockEnd: Module.HEAPU32[q + 11], lastAddr: Module.HEAPU32[q + 12],
-        nextInt: Module.HEAPU32[q + 13], count: Module.HEAPU32[q + 14], cpo: Module.HEAPU32[q + 15],
-        skipJump: Module.HEAPU32[q + 16], genInt: Module.HEAPU32[q + 17],
-        readmemW: Module.HEAPU32[q + 18], readmemB: Module.HEAPU32[q + 19], readmemH: Module.HEAPU32[q + 20],
-        rdRdram: Module.HEAPU32[q + 21], rdRdramB: Module.HEAPU32[q + 22], rdRdramH: Module.HEAPU32[q + 23],
-        dramBase: Module.HEAPU32[q + 24],
-        writememW: Module.HEAPU32[q + 25], writememB: Module.HEAPU32[q + 26], writememH: Module.HEAPU32[q + 27],
-        wrRdram: Module.HEAPU32[q + 28], wrRdramB: Module.HEAPU32[q + 29], wrRdramH: Module.HEAPU32[q + 30],
-        invalidCode: Module.HEAPU32[q + 31], blocksBase: Module.HEAPU32[q + 32], notCompiled: Module.HEAPU32[q + 33],
-        cp1Simple: Module.HEAPU32[q + 34], cp1Double: Module.HEAPU32[q + 35], cp0Status: Module.HEAPU32[q + 36],
-        readmemD: Module.HEAPU32[q + 37], writememD: Module.HEAPU32[q + 38],
-        rdRdramD: Module.HEAPU32[q + 39], wrRdramD: Module.HEAPU32[q + 40],
-        jumpToAddr: Module.HEAPU32[q + 41], jumpToFunc: Module.HEAPU32[q + 42],
-        // wave 11b: &FCR31, but ONLY when the core stamped the param-block
-        // version magic at index 44. A core built before wave 11b has a
-        // 43-entry array, so reading index 43 would return whatever static
-        // data follows it — and the emitter would STORE the FP condition bit
-        // through that address. The magic makes a page/core skew fall back
-        // (compares + BC1 stay on the interpreter) instead of corrupting
-        // guest memory. recomp.c stamps it next to the pointer it guards.
-        fcr31: (Module.HEAPU32[q + 44] === 0x4E36344B) ? Module.HEAPU32[q + 43] : 0,
-        // &g_dev.r4300.delay_slot. Behind the SAME version magic — a block
-        // entry that is reachable as a branch DELAY SLOT must run exactly one
-        // instruction, and without this address the emitter cannot tell.
-        // A core too old to carry it yields 0, and the emitter then refuses to
-        // compile any span at all rather than install an unsafe block.
-        delaySlot: (Module.HEAPU32[q + 44] === 0x4E36344B) ? Module.HEAPU32[q + 45] : 0,
-      };
+      // Decoded by /n64/N64Wasm/dist/jit_params.js — shared with core_worker.js.
+      var p = window.__n64JitParams(Module, paramsPtr);
       p_fcr31_seen = p.fcr31;
       p_delayslot_seen = p.delaySlot;
       // For rollback's code-preserving load (n64sCodeKeep): where the core
@@ -2956,6 +3003,24 @@ N64Rate.selfTest = function (logFn) {
     } catch (e) {}
     pendingRom = pick;
     setStatus('Loading core…');
+    wkDecide();
+    pageLog('[worker] core ' + (WK.on ? 'in a DEDICATED WORKER' : 'on the main thread') + ' — ' + WK.why);
+    if (WK.on) {
+      // input_controller.js ends by appending <script src="n64wasm.js"> to <head>: in
+      // worker mode the core must NOT also boot here (a second 512 MB heap). One-shot
+      // guard on head.appendChild: that one element is swallowed and the vendored
+      // "module initialised" callback is run in its place, which is what releases the
+      // boot poll below into onModuleReady -> loadRom -> (our) LoadEmulator.
+      var head = document.head, realAppend = head.appendChild;
+      head.appendChild = function (node) {
+        if (node && node.tagName === 'SCRIPT' && /(^|\/)n64wasm\.js(\?|$)/.test(node.getAttribute('src') || '')) {
+          head.appendChild = realAppend;
+          setTimeout(function () { try { window.myApp.initModule(); } catch (e) { pageLog('[worker] initModule: ' + e); } }, 0);
+          return node;
+        }
+        return realAppend.call(head, node);
+      };
+    }
     // script.js chain-loads input_controller.js -> n64wasm.js (both resolve via <base>).
     var s = document.createElement('script');
     s.src = '/n64/N64Wasm/dist/script.js?v=' + Date.now();
