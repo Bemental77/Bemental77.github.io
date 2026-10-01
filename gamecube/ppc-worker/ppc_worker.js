@@ -717,27 +717,42 @@
         // self.__runtimeCompile=1 to continue debugging; default uses the gekko AoT pack.
         const _rtCompile = (self.__runtimeCompileOff !== 1);
         if (_rtCompile) { self.__ppcChainOn = true; }
+        // [aot-release 2026-10-01] The MMIO / WGP-order / MI / PI / FIFO overrides below are
+        // CORRECTNESS + speed machinery for the dual-core worker and do NOT depend on the AoT
+        // pack — but they used to live inside `if (self.__aot)`, so a failed or skipped pack
+        // fetch (?noaot, a phone that drops a 59 MB download) silently ran WITHOUT them. They
+        // now install unconditionally; only the pack-specific provenance/chain work is gated.
+        // The pack itself is MP4-ONLY (gamecube/aot/mp4, symbols in aot_index.txt) and its
+        // dispatch (pcMap lookup) has NO code-identity check: on SAB the bytes at pack pc
+        // 0x800057c0 are 3bc40090... vs MP4's 9421ffe0... — enabling it on any other disc runs
+        // MP4 code. With runtime-compile owning dispatch (the default; __runtimeCompileOff is
+        // set nowhere) the pack is dead weight, so it is RELEASED below (~59 MB of worker heap).
+        const _aotOn = !!self.__aot && !_rtCompile;
         if (self.__aot) {
           // [indirect-base 2026-07-07] the pack no longer bakes mem1 — emitted code loads
-          // the base from SAB 0x02500020 at runtime. Enable unconditionally.
-          // [runtime per-block 2026-07-21] but NOT when runtime-compile mode owns dispatch.
-          self.__aot.enabled = !_rtCompile;
+          // the base from SAB 0x02500020 at runtime.
+          // [runtime per-block 2026-07-21] NOT when runtime-compile mode owns dispatch.
+          self.__aot.enabled = _aotOn;
           if (_rtCompile) {
-            postMessage({ cmd: 'print', txt: '[runtime-compile] AoT pack DISABLED — per-block build_block_next at runtime (dolphin_worker parity)' });
+            postMessage({ cmd: 'print', txt: '[runtime-compile] AoT pack DISABLED + released ('
+              + (self.__aot.pack ? self.__aot.pack.length : 0) + ' B) — per-block build_block_next at runtime (dolphin_worker parity)' });
           }
+        }
+        {
           // [cfg-provenance 2026-07-09 — PERMANENT] Publish the ACTIVE configuration so every
           // acceptance run records what it verified (the dead-C-slice + stale-pack false-"done"
           // class). SAB 0x026B1840 = cfg bits (bit1=AoT enabled; bit0=C-slice loop, bit2=legacy
           // loop — set at loop entry), 0x026B1844 = pack byte length (regen fingerprint).
           {
+            // bit1 = AoT ACTUALLY enabled (it used to be set whenever a pack was merely loaded).
             const _cv = new Uint32Array(sharedMemoryRef.buffer);
-            _cv[0x026B1840 >> 2] = (_cv[0x026B1840 >> 2] | 2) >>> 0;
-            _cv[0x026B1844 >> 2] = (self.__aot.pack ? self.__aot.pack.length : 0) >>> 0;
+            _cv[0x026B1840 >> 2] = (_aotOn ? (_cv[0x026B1840 >> 2] | 2) : (_cv[0x026B1840 >> 2] & ~2)) >>> 0;
+            _cv[0x026B1844 >> 2] = (_aotOn && self.__aot.pack ? self.__aot.pack.length : 0) >>> 0;
             // [pack-stamp 2026-07-10 — PERMANENT provenance] content fingerprint (FNV-1a over
             // every 4096th byte + length) @0x026B184C. A stale pack (emitter changed, pack not
             // regenerated — the 0x0600-channel contamination incident) is now VISIBLE in every
             // verify row, not discoverable only by byte-level audit.
-            if (self.__aot.pack) {
+            if (_aotOn && self.__aot.pack) {
               let h = 0x811c9dc5;
               const pk = self.__aot.pack;
               for (let i = 0; i < pk.length; i += 4096) { h ^= pk[i]; h = (h * 0x01000193) >>> 0; }
@@ -745,7 +760,7 @@
               _cv[0x026B184C >> 2] = h >>> 0;
             }
           }
-          postMessage({ cmd: 'print', txt: '[aot] ENABLED (indirect base; runtime mem1=0x'
+          if (_aotOn) postMessage({ cmd: 'print', txt: '[aot] ENABLED (indirect base; runtime mem1=0x'
             + (newMem1Addr >>> 0).toString(16) + ')' });
           // [wgp-order fix 2026-07-20 — the gc=33 DLBuf-overflow ROOT] PPC program order between
           // WGP stores and CP/PI-FIFO register MMIO is VIOLATED cross-worker: WGP data rides the
@@ -1081,7 +1096,7 @@
               return _fW32(a, v); };
             postMessage({ cmd: 'print', txt: '[worker-fifo] native-architecture gather pipe (arms at first WGP store)' });
           }
-          if (self.__aot.enabled && !self.__aot.table) {
+          if (_aotOn && self.__aot.enabled && !self.__aot.table) {
             // [aot-chain] Eager-instantiate the whole pack with a shared funcref table so
             // cross-function block exits tail-call in-wasm. Flat index in SAB @0x02700000:
             // (pc-0x80000000) -> ((table_slot+1)<<12 | entry_idx); entry cell @0x026B0904.
@@ -1158,6 +1173,7 @@
             }
           }
         }
+        if (self.__aot && !_aotOn) self.__aot = null;   // [aot-release] drop the unused pack
         postMessage({ cmd: 'update-mem-ack', mem1Addr: newMem1Addr, mem1Size: newMem1Size });
         break;
       }
