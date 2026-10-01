@@ -214,6 +214,7 @@ n64wasm.js: $(FILES)
     '_neil_fp_always','_neil_last_fp', \
     '_neil_state_size','_neil_state_save_raw','_neil_state_save_raw_fast','_neil_state_load_raw', \
     '_neil_state_last_load_mode','_neil_state_last_load_pages','_neil_state_m64p_region', \
+    '_neil_set_native_fbread','_neil_native_fbread_failed', \
     '_malloc','_free']" \
 	-s INVOKE_RUN=0 \
     && mv n64wasm.js ../dist/ \

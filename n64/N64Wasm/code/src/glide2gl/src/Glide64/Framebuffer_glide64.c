@@ -1043,46 +1043,73 @@ void CopyFrameBuffer(int32_t buffer)
       GrLfbInfo_t info;
       float scale_x = (settings.scr_res_x - rdp.offset_x*2.0f)  / MAX(width, rdp.vi_width);
       float scale_y = (settings.scr_res_y - rdp.offset_y*2.0f) / MAX(height, rdp.vi_height);
+      int        x_start  = 0;
+      int        y_start  = 0;
+      int         x_end   = width;
+      int         y_end   = height;
+      int read_alpha      = settings.frame_buffer & fb_read_alpha;
+      uint16_t  *samp     = NULL;      /* native path: samp[x + y*x_end] */
+      uint16_t  *ptr_src  = NULL;      /* window path: ptr_src[sx + sy*stride] */
+      uint32_t   stride   = 0;
+      static int32_t *nf_sx, *nf_sy;
+      static int nf_nx, nf_ny;
 
       FRDP("width: %d, height: %d, ul_y: %d, lr_y: %d, scale_x: %f, scale_y: %f, ci_width: %d, ci_height: %d\n",width, height, rdp.ci_upper_bound, rdp.ci_lower_bound, scale_x, scale_y, gDP.colorImage.width, gDP.colorImage.height);
       info.size = sizeof(GrLfbInfo_t);
 
-      if (grLfbLock (GR_LFB_READ_ONLY,
+      if ((settings.hacks&hack_PMario) && rdp.ci_count > 0 && rdp.frame_buffers[rdp.ci_count-1].status != CI_AUX)
+         read_alpha = false;
+
+      if (settings.hacks&hack_BAR)
+      {
+         x_start = 80;
+         y_start = 24;
+         x_end   = 240;
+         y_end   = 86;
+      }
+
+      /* NATIVE-RESOLUTION READBACK: the window pixel each N64 pixel takes is
+       * computed with the very expression the loops below always used, then
+       * the GPU copies exactly those pixels (grLfbReadSampled). Same bytes,
+       * a quarter of the readback at 2x scale, and no full-window 565 loop. */
+      if (neil_native_fbread && x_end > 0 && y_end > 0)
+      {
+         int x, y;
+         if (nf_nx < x_end) { free(nf_sx); nf_sx = (int32_t*)malloc(sizeof(int32_t) * x_end); nf_nx = nf_sx ? x_end : 0; }
+         if (nf_ny < y_end) { free(nf_sy); nf_sy = (int32_t*)malloc(sizeof(int32_t) * y_end); nf_ny = nf_sy ? y_end : 0; }
+         if (nf_sx && nf_sy && nf_nx >= x_end && nf_ny >= y_end)
+         {
+            for (x = 0; x < x_end; x++) nf_sx[x] = (int)(x*scale_x + rdp.offset_x);
+            for (y = 0; y < y_end; y++) nf_sy[y] = (int)(y * scale_y + rdp.offset_y);
+            samp = grLfbReadSampled(nf_sx, x_end, nf_sy, y_end);
+         }
+      }
+
+      if (!samp && grLfbLock (GR_LFB_READ_ONLY,
                buffer,
                GR_LFBWRITEMODE_565,
                GR_ORIGIN_UPPER_LEFT,
                FXFALSE,
                &info))
       {
-         int        x_start  = 0;
-         int        y_start  = 0;
-         int         x_end   = width;
-         int         y_end   = height;
-         uint32_t stride     = info.strideInBytes>>1;
-         int read_alpha      = settings.frame_buffer & fb_read_alpha;
+         stride  = info.strideInBytes>>1;
+         ptr_src = (uint16_t*)info.lfbPtr;
+      }
 
-         if ((settings.hacks&hack_PMario) && rdp.ci_count > 0 && rdp.frame_buffers[rdp.ci_count-1].status != CI_AUX)
-            read_alpha = false;
-
-         if (settings.hacks&hack_BAR)
-         {
-            x_start = 80;
-            y_start = 24;
-            x_end   = 240;
-            y_end   = 86;
-         }
-
+      if (samp || ptr_src)
+      {
+#define NF_SRC(x, y) (samp ? samp[(x) + (y) * x_end] \
+      : ptr_src[(int)((x)*scale_x + rdp.offset_x) + (int)((y) * scale_y + rdp.offset_y) * stride])
          if (g_gdp.fb_size <= G_IM_SIZ_16b)
          {
             int y, x;
-            uint16_t *ptr_src   = (uint16_t*)info.lfbPtr;
             uint16_t *ptr_dst   = (uint16_t*)(gfx_info.RDRAM + gDP.colorImage.address);
 
             for (y = y_start; y < y_end; y++)
             {
                for (x = x_start; x < x_end; x++)
                {
-                  uint16_t c = ptr_src[(int)(x*scale_x + rdp.offset_x) + (int)(y * scale_y + rdp.offset_y) * stride];
+                  uint16_t c = NF_SRC(x, y);
                   c = (c&0xFFC0) | ((c&0x001F) << 1) | 1;
                   if (read_alpha && c == 1)
                      c = 0;
@@ -1093,14 +1120,13 @@ void CopyFrameBuffer(int32_t buffer)
          else
          {
             int y, x;
-            uint16_t *ptr_src   = (uint16_t*)info.lfbPtr;
             uint32_t *ptr_dst = (uint32_t*)(gfx_info.RDRAM + gDP.colorImage.address);
 
             for (y = y_start; y < y_end; y++)
             {
                for (x = x_start; x < x_end; x++)
                {
-                  uint16_t c = ptr_src[(int)(x*scale_x + rdp.offset_x) + (int)(y * scale_y + rdp.offset_y) * stride];
+                  uint16_t c = NF_SRC(x, y);
                   c = (c&0xFFC0) | ((c&0x001F) << 1) | 1;
                   if (read_alpha && c == 1)
                      c = 0;
@@ -1108,9 +1134,11 @@ void CopyFrameBuffer(int32_t buffer)
                }
             }
          }
+#undef NF_SRC
 
          // Unlock the backbuffer
-         grLfbUnlock (GR_LFB_READ_ONLY, buffer);
+         if (!samp)
+            grLfbUnlock (GR_LFB_READ_ONLY, buffer);
          LRDP("LfbLock.  Framebuffer copy complete.\n");
       }
    }

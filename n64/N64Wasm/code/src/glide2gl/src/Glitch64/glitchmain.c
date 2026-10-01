@@ -163,6 +163,202 @@ int32_t grLfbLock( int32_t type, int32_t buffer, int32_t writeMode,
    return FXTRUE;
 }
 
+/* NATIVE-RESOLUTION READBACK (neil). CopyFrameBuffer's scaled branch (read_always
+ * titles: MK64, DK64, Banjo, ... rendering at 640x480 for a 320x240 N64 frame)
+ * used to read the WHOLE window back (grLfbLock: 640x480 RGBA, then a CPU loop
+ * converting all 307,200 pixels to 565) and then point-sample one window pixel
+ * per N64 pixel. This does the point sampling ON THE GPU and reads back only
+ * the sampled pixels: the caller computes, exactly as before, which window
+ * pixel each N64 pixel takes ((int)(x*scale_x + offset_x), same C expression),
+ * and the GPU copies exactly those texels (texelFetch: no filtering, no
+ * arithmetic on the colour) into a native-size RGBA8 target. The 565 values
+ * returned are therefore bit-identical to what the old path produced.
+ *
+ *   sx[0..nx), sy[0..ny): window pixel per N64 column / row, TOP-origin, as the
+ *   old index math used them. Returns NULL (the caller falls back to the old
+ *   path) if any sample lies outside the window, or GL refuses anything. */
+static int nf_failed_get(void);
+int neil_native_fbread = 1;
+/* page control (A/B arm, and a kill switch): 1 = native readback, 0 = the old full-window path */
+void neil_set_native_fbread(int on) { neil_native_fbread = on ? 1 : 0; }
+int neil_native_fbread_failed(void) { return nf_failed_get(); }
+static GLuint nf_prog, nf_vao, nf_fbo, nf_src, nf_dst, nf_xs, nf_ys;
+static int nf_dst_w, nf_dst_h, nf_src_w, nf_src_h, nf_failed;
+static int nf_failed_get(void) { return nf_failed; }
+static uint8_t  *nf_rgba;
+static uint16_t *nf_565;
+static int32_t  *nf_tmp;
+static int nf_cap;
+
+static GLuint nf_shader(GLenum type, const char *src)
+{
+   GLint ok = 0;
+   GLuint s = glCreateShader(type);
+   glShaderSource(s, 1, &src, NULL);
+   glCompileShader(s);
+   glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+   return ok ? s : 0;
+}
+
+static int nf_init(void)
+{
+   static const char *vs = "#version 300 es\n"
+      "void main(){vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));gl_Position=vec4(p*2.0-1.0,0.0,1.0);}\n";
+   static const char *fs = "#version 300 es\n"
+      "precision highp float; precision highp int; precision highp isampler2D; precision highp sampler2D;\n"
+      "uniform sampler2D src; uniform isampler2D xs; uniform isampler2D ys; out vec4 o;\n"
+      "void main(){ivec2 d=ivec2(gl_FragCoord.xy);"
+      "o=texelFetch(src,ivec2(texelFetch(xs,ivec2(d.x,0),0).r,texelFetch(ys,ivec2(d.y,0),0).r),0);}\n";
+   GLint ok = 0;
+   GLuint v = nf_shader(GL_VERTEX_SHADER, vs), f = nf_shader(GL_FRAGMENT_SHADER, fs);
+   if (!v || !f) return 0;
+   nf_prog = glCreateProgram();
+   glAttachShader(nf_prog, v); glAttachShader(nf_prog, f);
+   glLinkProgram(nf_prog);
+   glGetProgramiv(nf_prog, GL_LINK_STATUS, &ok);
+   if (!ok) return 0;
+   glGenVertexArrays(1, &nf_vao);
+   glGenFramebuffers(1, &nf_fbo);
+   glGenTextures(1, &nf_src); glGenTextures(1, &nf_dst); glGenTextures(1, &nf_xs); glGenTextures(1, &nf_ys);
+   return 1;
+}
+
+static void nf_params(void)
+{
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+}
+
+uint16_t *grLfbReadSampled(const int32_t *sx, int nx, const int32_t *sy, int ny)
+{
+   static const GLenum caps[] = { GL_BLEND, GL_DEPTH_TEST, GL_SCISSOR_TEST, GL_CULL_FACE, GL_STENCIL_TEST, GL_DITHER,
+                                  GL_POLYGON_OFFSET_FILL, GL_SAMPLE_ALPHA_TO_COVERAGE, GL_SAMPLE_COVERAGE, GL_RASTERIZER_DISCARD };
+   GLboolean was[10], mask[4];
+   GLint prog, active, tex[4], smp[4], dfb, rfb, vao, vp[4], pack, packAlign;
+   int i, n;
+
+   if (!neil_native_fbread || nf_failed || nx <= 0 || ny <= 0)
+      return NULL;
+   for (i = 0; i < nx; i++) if (sx[i] < 0 || sx[i] >= width) return NULL;
+   for (i = 0; i < ny; i++) if (sy[i] < 0 || sy[i] >= height) return NULL;
+   if (!nf_prog && !nf_init()) { nf_failed = 1; return NULL; }
+
+   n = nx > ny ? nx : ny;
+   if (nf_cap < nx * ny || !nf_tmp)
+   {
+      free(nf_rgba); free(nf_565); free(nf_tmp);
+      nf_cap  = nx * ny;
+      nf_rgba = (uint8_t*)malloc((size_t)nf_cap * 4);
+      nf_565  = (uint16_t*)malloc((size_t)nf_cap * 2);
+      nf_tmp  = (int32_t*)malloc((size_t)(nf_cap > n ? nf_cap : n) * 4);
+      if (!nf_rgba || !nf_565 || !nf_tmp) { nf_failed = 1; return NULL; }
+   }
+
+   /* ---- save ---- */
+   glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+   glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+   while (glGetError() != GL_NO_ERROR) {}   /* not ours: the check below is about THIS pass only */
+   for (i = 0; i < 4; i++)
+   {
+      glActiveTexture(GL_TEXTURE0 + i);
+      glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex[i]);
+      glGetIntegerv(GL_SAMPLER_BINDING, &smp[i]);
+   }
+   glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfb);
+   glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &rfb);
+   glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+   glGetIntegerv(GL_VIEWPORT, vp);
+   glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
+   glGetIntegerv(GL_PACK_ALIGNMENT, &packAlign);
+   glGetBooleanv(GL_COLOR_WRITEMASK, mask);
+   for (i = 0; i < 10; i++) was[i] = glIsEnabled(caps[i]);
+
+   /* ---- the window, as a texture: the SAME pixels grLfbLock's glReadPixels
+    * reads (the bound read framebuffer, origin 0,0, width x height) ---- */
+   glActiveTexture(GL_TEXTURE0);
+   glBindSampler(0, 0);
+   glBindTexture(GL_TEXTURE_2D, nf_src);
+   if (nf_src_w != width || nf_src_h != height)
+   {
+      nf_params();
+      /* RGB8: the window has no alpha (alpha:false), and a copy may not add one */
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+      nf_src_w = width; nf_src_h = height;
+   }
+   glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width, height);
+
+   /* ---- the sample positions: window column per N64 column, and GL row
+    * (bottom-origin) per N64 row (top-origin), as R32I lookup rows ---- */
+   glActiveTexture(GL_TEXTURE1);
+   glBindSampler(1, 0);
+   glBindTexture(GL_TEXTURE_2D, nf_xs);
+   nf_params();
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+   glTexImage2D(GL_TEXTURE_2D, 0, GL_R32I, nx, 1, 0, GL_RED_INTEGER, GL_INT, sx);
+   for (i = 0; i < ny; i++) nf_tmp[i] = height - 1 - sy[i];
+   glActiveTexture(GL_TEXTURE2);
+   glBindSampler(2, 0);
+   glBindTexture(GL_TEXTURE_2D, nf_ys);
+   nf_params();
+   glTexImage2D(GL_TEXTURE_2D, 0, GL_R32I, ny, 1, 0, GL_RED_INTEGER, GL_INT, nf_tmp);
+
+   /* ---- the native-size target ---- */
+   glActiveTexture(GL_TEXTURE3);
+   glBindTexture(GL_TEXTURE_2D, nf_dst);
+   if (nf_dst_w != nx || nf_dst_h != ny)
+   {
+      nf_params();
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, nx, ny, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+      nf_dst_w = nx; nf_dst_h = ny;
+   }
+   glBindTexture(GL_TEXTURE_2D, 0);
+   glBindFramebuffer(GL_FRAMEBUFFER, nf_fbo);
+   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, nf_dst, 0);
+
+   for (i = 0; i < 10; i++) glDisable(caps[i]);
+   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+   glViewport(0, 0, nx, ny);
+   glUseProgram(nf_prog);
+   glUniform1i(glGetUniformLocation(nf_prog, "src"), 0);
+   glUniform1i(glGetUniformLocation(nf_prog, "xs"), 1);
+   glUniform1i(glGetUniformLocation(nf_prog, "ys"), 2);
+   glBindVertexArray(nf_vao);
+   glDrawArrays(GL_TRIANGLES, 0, 3);
+
+   glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+   glPixelStorei(GL_PACK_ALIGNMENT, 4);
+   glReadPixels(0, 0, nx, ny, GL_RGBA, GL_UNSIGNED_BYTE, nf_rgba);
+
+   /* ---- restore ---- */
+   glBindVertexArray(vao);
+   glUseProgram(prog);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dfb);
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, rfb);
+   glViewport(vp[0], vp[1], vp[2], vp[3]);
+   glColorMask(mask[0], mask[1], mask[2], mask[3]);
+   for (i = 0; i < 10; i++) { if (was[i]) glEnable(caps[i]); else glDisable(caps[i]); }
+   glBindBuffer(GL_PIXEL_PACK_BUFFER, pack);
+   glPixelStorei(GL_PACK_ALIGNMENT, packAlign);
+   for (i = 3; i >= 0; i--)
+   {
+      glActiveTexture(GL_TEXTURE0 + i);
+      glBindTexture(GL_TEXTURE_2D, tex[i]);
+      glBindSampler(i, smp[i]);
+   }
+   glActiveTexture(active);
+
+   if (glGetError() != GL_NO_ERROR) { nf_failed = 1; return NULL; }
+
+   /* the same 565 packing grLfbLock applies (bytes R,G,B of RGBA8) */
+   for (i = 0; i < nx * ny; i++)
+      nf_565[i] = ((nf_rgba[i*4+0] >> 3) << 11) | ((nf_rgba[i*4+1] >> 2) << 5) | (nf_rgba[i*4+2] >> 3);
+   return nf_565;
+}
+
 int32_t grLfbReadRegion( int32_t src_buffer,
       uint32_t src_x, uint32_t src_y,
       uint32_t src_width, uint32_t src_height,
