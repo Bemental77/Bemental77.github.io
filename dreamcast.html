@@ -8028,6 +8028,18 @@
       ' <span class="k">· frame</span> ' + (t.frame == null ? '—' : t.frame) +
       (t.coreFrame != null ? ' <span class="k">· core ran</span> ' + t.coreFrame : '') +
       (t.stallTotalMs > 0 ? ' <span class="k">· stalled</span> ' + (t.stallTotalMs / 1000).toFixed(1) + ' s total' : '');
+    // ⚠ SAY WHY THERE IS AN INPUT DELAY AT ALL. The other netplay cores here
+    // (genesis.html) run ROLLBACK at delay 0; this one cannot yet, and a player
+    // comparing the two deserves the reason rather than a mystery. Measured on
+    // the shipped binary (dreamcast/docs/rollback/TASKS.md, rollback_measure.mjs):
+    // a state restore flushes the whole SH4 JIT, so one rollback costs
+    // hundreds of ms of recompile — far more than a frame. Lockstep is the only
+    // mode on every device until the core can restore without that flush.
+    if (d != null) {
+      html += '<br><span class="k">mode</span> delay-based lockstep <span class="k">· rollback ' +
+        '(zero input delay) is not available on the Dreamcast core yet: restoring a state recompiles the ' +
+        'whole CPU cache, which costs far more than one frame</span>';
+    }
     // WHICH PORT THIS PLAYER HOLDS, said in words as well as drawn as a chip —
     // it is which character they get, and a player who has to decode a chip
     // colour to find that out has not been told.
