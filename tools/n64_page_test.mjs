@@ -351,8 +351,12 @@ try {
     const off = await arm('&pace=0');
     t.on = on.pace; t.off = off.pace;
     t.onSpeed = on.rate && on.rate.speed; t.offSpeed = off.rate && off.rate.speed;
-    // Wired to the real core: both exports resolved out of the shipped dist/n64wasm.js.
-    t.wired = !!(on.pace && on.pace.wired && on.pace.runMainLoop && on.pace.viTotal);
+    // Wired to the real core: both exports resolved out of the shipped dist/n64wasm.js. With the
+    // core in its worker (the default since 2026-10-01) the governor is the worker's frame clock
+    // and the export it advances the guest with is _neil_ls_run_frame (`runFrame`); ?pace=0 is
+    // its control arm too (one field per animation frame, nothing else).
+    t.worker = !!(on.pace && on.pace.worker);
+    t.wired = !!(on.pace && on.pace.wired && (on.pace.runMainLoop || (on.pace.worker && on.pace.runFrame)) && on.pace.viTotal);
     // The cartridge region reached the SCHEDULE, not just the meter. mariokart.z64 is PAL.
     t.regionOk = !!(on.pace && on.pace.viHz === (rom === 'mariokart.z64' ? 50 : 60));
     // It ran, and it made decisions — a governor that never evaluates is not under test.
@@ -432,7 +436,11 @@ try {
     const t = result.rafdedupe;
     if (!want('rafdedupe')) { t.skipped = true; t.ok = true; } else {
     const page = await newPage(t);
-    await page.goto(`${base}?game=${rom}&autostart`, { waitUntil: 'domcontentloaded' });
+    // THE MAIN-THREAD CORE (?worker=0): this is a test of THIS PAGE's rAF accounting. With the
+    // core in its worker (the default) `shown` is counted on the WORKER's animation frames, which
+    // no page rAF loop can reach — and it tracks the worker's own frame rate, which moves with
+    // the scene, so the two-window comparison below would measure the game, not the dedupe.
+    await page.goto(`${base}?game=${rom}&autostart&worker=0`, { waitUntil: 'domcontentloaded' });
     await waitRunning(page);
     await page.waitForFunction('window.__n64Rate && window.__n64Rate.shown > 0', { timeout: 60000 }).catch(() => {});
     const sample = async () => {

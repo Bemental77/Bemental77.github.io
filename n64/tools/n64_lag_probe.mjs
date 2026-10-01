@@ -21,6 +21,8 @@
 //
 // USAGE (npm run web first):
 //   bash tools/probe_lock.sh run -- node n64/tools/n64_lag_probe.mjs [--warm 700] [--trials 8] [--gap 37] [--button start|a|up]
+// ⚠ This rig steps the core through window.Module / window.__n64State on the PAGE, so it pins
+// the main-thread core (?worker=0) unless --query names a worker= arm itself.
 import { createRequire } from 'node:module';
 import { existsSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -55,7 +57,7 @@ try {
       };
     }, 1);
   });
-  await pg.goto(`${BASE}/n64/?game=${encodeURIComponent(GAME)}&autostart${QUERY ? '&' + QUERY : ''}`, { waitUntil: 'domcontentloaded' });
+  await pg.goto(`${BASE}/n64/?game=${encodeURIComponent(GAME)}&autostart${QUERY ? '&' + QUERY : ''}${/(^|&)worker=/.test(QUERY || '') ? '' : '&worker=0'}`, { waitUntil: 'domcontentloaded' });
   await pg.waitForFunction(() => window.__refMain === true, { timeout: 240000 });
   const r = await pg.evaluate(async (WARM, TRIALS, GAP, K, bit) => {
     const M = window.Module, S = window.__n64State, FB = window.__fbAsync;

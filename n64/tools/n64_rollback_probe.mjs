@@ -28,6 +28,16 @@
 // other: this is a stronger statement than two cores comparing fingerprints,
 // and it can be made for 4 players on a 4-core box.
 //
+// THE CORE WORKER (the page's default since 2026-10-01): the room driver and the engine run
+// in n64/N64Wasm/dist/core_worker.js, so the two seams the rig needs INSIDE the room driver —
+// the scripted pad (__n64PadOverride) and the confirmed-state tap (__n64RbTap) — are installed
+// in the worker's realm through the page's ?workerrig=1 eval seam, after the core has booted
+// and before the room is declared, and read back the same way. The page still hands the rig
+// its engine (__n64LsEngine, adopted: every call goes to the worker's engine, in order). The
+// STRAIGHT REFERENCE pins the main-thread core (?worker=0): a worker room checked against a
+// main-thread straight run is the stronger, cross-realm statement. --query worker=0 runs the
+// room on the main thread instead (the control arm).
+//
 // USAGE (npm run web first):
 //   bash tools/probe_lock.sh run -- node n64/tools/n64_rollback_probe.mjs \
 //        --players 2|4 --latmin 40 --latmax 100 --secs 30 [--cpu 4] [--mobile] \
@@ -152,7 +162,7 @@ const launch = () => puppeteer.launch({
 });
 const browser = await launch();
 try { (await import('../../tools/browser_leak_guard.js')).default.guard(browser, fileURLToPath(import.meta.url)); } catch (_e) {}
-const out = { adaptive: ADAPTIVE, players: PLAYERS, latMs: [LATMIN, LATMAX], secs: SECS, cpu: CPU, mobile: MOBILE, hashEvery: HASH_EVERY, rbw: RBW, query: QUERY };
+const out = { worker: null, adaptive: ADAPTIVE, players: PLAYERS, latMs: [LATMIN, LATMAX], secs: SECS, cpu: CPU, mobile: MOBILE, hashEvery: HASH_EVERY, rbw: RBW, query: QUERY };
 const log = [];
 let room = null;
 try {
@@ -164,7 +174,7 @@ try {
   else await page.setViewport({ width: 1280, height: 900 });
   page.on('console', (m) => { const t = m.text(); if (/lockstep|rollback|runahead|\[state\]|\[fb\]|error|⚠/i.test(t)) log.push('[A] ' + t.slice(0, 300)); });
   page.on('pageerror', (e) => log.push('[A] PAGEERROR ' + e.message));
-  await page.goto(`${BASE}/n64/?game=${encodeURIComponent(GAME)}&rbw=${RBW}${QUERY ? '&' + QUERY : ''}`, { waitUntil: 'domcontentloaded' });
+  await page.goto(`${BASE}/n64/?game=${encodeURIComponent(GAME)}&rbw=${RBW}&workerrig=1${QUERY ? '&' + QUERY : ''}`, { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => !!window.__n64LsAttach && !!window.Netplay, { timeout: 60000 });
   if (CPU > 1) { const cdp = await page.createCDPSession(); await cdp.send('Emulation.setCPUThrottlingRate', { rate: CPU }); }
   await page.evaluate((cfg, src, padSrc) => {
@@ -197,6 +207,16 @@ try {
     await page.touchscreen.tap(b.x, b.y);
   } else await page.evaluate(() => document.getElementById('btnStart').click());
   await page.waitForFunction(() => { const n = window.__n64Net && window.__n64Net(); return n && n.armed && n.coreArmed && n.party && n.party.able; }, { timeout: 240000 });
+  out.worker = await page.evaluate(() => !!(window.__n64Net && window.__n64Net().worker));
+  if (out.worker) {
+    // The same two seams, in the realm the room driver runs in (see the header).
+    const src = PAD_SRC.replace('function __pad', 'self.__pad = function') + `;
+      self.__n64PadOverride = function (f, p) { return self.__pad(f, p); };
+      self.__rbFull = {}; self.__n64RbLog = [];
+      self.__n64RbTap = function (k, buf, fp) { self.__rbFull[k] = { full: self.__n64State.hashFull(buf), fp: fp >>> 0 }; };
+      ({ realm: typeof WorkerGlobalScope !== 'undefined' ? 'worker' : 'window', state: !!self.__n64State });`;
+    out.workerSeams = await page.evaluate((s2) => window.__n64Worker.eval(s2), src);
+  }
   await page.evaluate(() => { window.__n64LsEngine.declareReady('probe'); window.__ghost.postMessage({ t: 'ready', disc: 'probe' }); });
   await page.waitForFunction(() => { const n = window.__n64Net(); return n.running && n.frame > 10; }, { timeout: 120000 });
   const snap = () => page.evaluate(() => {
@@ -223,7 +243,10 @@ try {
   }
   const z = prev, secs = (z.t - a.t) / 1000;
   const rbA = a.rb && a.rb.page, rbZ = z.rb && z.rb.page;
-  room = await page.evaluate(() => ({ rblog: window.__n64RbLog.slice(0, 4000), full: window.__rbFull, frame: window.__n64LsEngine.frame, confirmed: window.__n64LsEngine._rbConfirmed }));
+  room = out.worker
+    ? Object.assign(await page.evaluate(() => window.__n64Worker.eval('({ rblog: self.__n64RbLog.slice(0, 4000), full: self.__rbFull })')),
+                    await page.evaluate(() => ({ frame: window.__n64LsEngine.frame, confirmed: window.__n64LsEngine._rbConfirmed })))
+    : await page.evaluate(() => ({ rblog: window.__n64RbLog.slice(0, 4000), full: window.__rbFull, frame: window.__n64LsEngine.frame, confirmed: window.__n64LsEngine._rbConfirmed }));
   Object.assign(out, {
     mode: z.mode, roomRate: +((z.frame - a.frame) / secs / (z.viHz || 50)).toFixed(4),
     secsBelow99: tl.filter((x) => x.rate < 0.99).length,
@@ -263,7 +286,9 @@ try {
         };
       }, 1);
     });
-    await pb.goto(`${BASE}/n64/?game=${encodeURIComponent(GAME)}&autostart${QUERY ? '&' + QUERY : ''}`, { waitUntil: 'domcontentloaded' });
+    // The reference is ALWAYS the main-thread core: it steps window.Module itself.
+    const refQ = (QUERY || '').split('&').filter((kv) => kv && !/^worker=/.test(kv)).join('&');
+    await pb.goto(`${BASE}/n64/?game=${encodeURIComponent(GAME)}&autostart&worker=0${refQ ? '&' + refQ : ''}`, { waitUntil: 'domcontentloaded' });
     await pb.waitForFunction(() => window.__refMain === true, { timeout: 240000 });
     const last = keys[keys.length - 1];
     const ref = await pb.evaluate(async (padSrc, players, keys, last) => {
