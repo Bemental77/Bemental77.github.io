@@ -232,6 +232,20 @@
 
   function onRuntimeInitialized() {
     const Module = self.Module;
+    // Count EVERY retro_run this worker ever performs, whoever asks for it (the
+    // pump, the legacy 'runFrame', a rig) — the anchor guard below needs "has
+    // this machine run a single frame?", and a counter on the export is the one
+    // place every caller passes through. Asyncify is unaffected: a suspended
+    // call returns through here and its rewind re-enters the wasm export
+    // directly, not this property.
+    try {
+      const rawRunIter = Module._emscripten_run_iter;
+      if (typeof rawRunIter === 'function' && !rawRunIter.__counted) {
+        const counted = function () { lsRunIterEver++; return rawRunIter.apply(this, arguments); };
+        counted.__counted = true;
+        Module._emscripten_run_iter = counted;
+      }
+    } catch (_) {}
     try {
       // SAB-pointer wiring — trivial global stores, safe from this thread.
       // The framebuffer and audio ring used to sit at page-chosen FIXED
@@ -370,6 +384,78 @@
     }
     return 0;
   }
+  // ---------------------------------------------------------------------------
+  // ⚠ A STATE LOAD CAN DELETE A MEMORY CARD, AND THE CORE KEEPS POINTING AT IT.
+  // retro_unserialize -> mcfg_DeserializeDevices (maple_cfg.cpp:546-583) frees
+  // EVERY maple device and re-creates only the ones the state was captured
+  // with. g_vmu_flash_ptr[port] (maple_devs.cpp:367) is set in OnSetup and
+  // cleared nowhere, so a port the state had no card in keeps its old pointer —
+  // into the FREED heap block of the deleted card — and flycast_vmu_ptr()
+  // still answers it, with the full 131072-byte size.
+  //
+  // Measured 2026-10-01 on the shipped dreamcast/states/pso2_boot.state (it was
+  // captured with ONE card): after the load, port 1's generation does not move
+  // (2 -> 2, port 0's does: 2 -> 4), and 32 marker bytes written through
+  // flycast_vmu_ptr(1) are NOT in the next retro_serialize (port 0's are, at
+  // the card's own offset). Every PSO ROOM therefore wrote the room's 128 KB
+  // card for Player 2 into freed heap at frame 240 (dreamcast.html's
+  // re-install). Two real two-browser rooms died right after it: one threw
+  // "memory access out of bounds" inside emscripten_builtin_malloc called from
+  // WasmDynarec::compile at frame ~326, the other hung at frame 242; the same
+  // seed, the same walk, SOLO (no frame-240 write) ran 60 guest seconds clean.
+  //
+  // Detected, not guessed: a card the load re-created ran OnSetup and
+  // deserialize, both of which bump g_vmu_flash_gen[port]; a card the load
+  // deleted bumps nothing. So every load site goes through vmuGuardLoad(), and
+  // a port whose generation did not move is DEAD until a later load re-creates
+  // it. vmuPtr() answers 0 for a dead port, and every read and write below goes
+  // through it — a dead card is reported as absent, never touched.
+  // ---------------------------------------------------------------------------
+  const vmuDead = [false, false, false, false];
+  function vmuPtr(M, port) {
+    if (port < 0 || port >= VMU_PORTS_MAX || vmuDead[port]) return 0;
+    return (M && typeof M._flycast_vmu_ptr === 'function') ? (M._flycast_vmu_ptr(port) >>> 0) : 0;
+  }
+  function vmuGuardLoad(M, load) {
+    const can = M && typeof M._flycast_vmu_gen === 'function' && typeof M._flycast_vmu_ptr === 'function';
+    const g0 = [];
+    if (can) for (let p = 0; p < VMU_PORTS_MAX; p++) g0.push(M._flycast_vmu_gen(p) >>> 0);
+    let r;
+    try { r = load(); }
+    finally {
+      // A load that FAILED before it reached the maple devices moved no
+      // generation at all; it deleted nothing, so it must not be read as
+      // "every card is gone". A successful load is judged as-is (a state with
+      // no cards at all legitimately moves nothing and deletes them all).
+      let anyMoved = false;
+      if (can) for (let p = 0; p < VMU_PORTS_MAX; p++) if ((M._flycast_vmu_gen(p) >>> 0) !== g0[p]) anyMoved = true;
+      if (can && (r || anyMoved)) {
+        const died = [], back = [];
+        for (let p = 0; p < VMU_PORTS_MAX; p++) {
+          const ptr = M._flycast_vmu_ptr(p) >>> 0;
+          const moved = (M._flycast_vmu_gen(p) >>> 0) !== g0[p];
+          const dead = ptr !== 0 && !moved;
+          if (dead && !vmuDead[p]) died.push(p);
+          if (!dead && vmuDead[p]) back.push(p);
+          vmuDead[p] = dead;
+          // (A re-created card's generation moved, and vmuPoll snapshots it to
+          // the page as the restored card — maple_devs.cpp deserialize bumps it
+          // for exactly that reason. Unchanged here.)
+        }
+        if (died.length) {
+          postMessage({ cmd: 'print', txt: '[vmu] the loaded state has NO memory card in port(s) ' +
+            died.map((p) => p + ' (Player ' + (p + 1) + ')').join(', ') + ' — the core deleted ' +
+            (died.length > 1 ? 'those cards' : 'that card') + '; it is reported absent and never read or written again ' +
+            '(its old pointer is freed memory)' });
+        }
+        if (back.length) {
+          postMessage({ cmd: 'print', txt: '[vmu] port(s) ' + back.join(', ') + ' have a memory card again (re-created by this load)' });
+        }
+        if (died.length || back.length) postMessage({ cmd: 'vmuDead', dead: vmuDead.slice() });
+      }
+    }
+    return r;
+  }
   function vmuPoll() {
     if (!vmuWatch) return;
     const M = self.Module;
@@ -379,8 +465,9 @@
     for (let port = 0; port < n; port++) {
       const gen = M._flycast_vmu_gen(port) >>> 0;
       if (gen === vmuGenSeen[port]) continue;
-      const ptr = M._flycast_vmu_ptr(port) >>> 0, size = M._flycast_vmu_size(port) >>> 0;
-      // An empty slot (no controller on that bus) reports 0/0. Do NOT bank the
+      const ptr = vmuPtr(M, port), size = ptr ? (M._flycast_vmu_size(port) >>> 0) : 0;
+      // An empty slot (no controller on that bus) reports 0/0 — and so does a
+      // card a state load deleted (vmuDead), whose generation never moves. Do NOT bank the
       // generation in that case — the card may still be created later, and
       // swallowing the bump would lose its first snapshot.
       if (!ptr || !size) continue;
@@ -456,16 +543,43 @@
   let discLoadedOnce = false;   // so a late 'players' is REPORTED, not ignored
   let lockstep = false;
   let lsFrame = 0;                  // next emulated frame to run
+  // ---------------------------------------------------------------------------
+  // THE ANCHOR GUARD — a room's frame 0 must not depend on what this worker did
+  // before it. A room is only deterministic because every peer anchors on a
+  // FRESH worker (a room is entered by reloading the page, lsRestartIntoRoom).
+  // State that no savestate carries makes a worker that has run ANY frame a
+  // different machine from one that has not:
+  //   * the idle-skip streak (rec_wasm.cpp:1625, `static u32 s_isk_streak`),
+  //     reset by nothing — dreamcast/docs/rollback/TASKS.md (f615765);
+  //   * and at least one more, NOT isolated (idle-skip off does not stop the
+  //     fork below). Source-read candidate: libretro's `first_run`
+  //     (libretro.cpp:176), cleared by the first retro_run — retro_unserialize
+  //     SKIPS emu.stop()/emu.start() while it is set (libretro.cpp:2447-2460),
+  //     so the same seed load takes a different path once a frame has run.
+  // Measured in a real two-browser room (dreamcast/docs/room-determinism/
+  // TASKS.md): give ONE peer 10 frames of history before the seed and the room
+  // desyncs AT FRAME 0 — with idle-skip ON, and again with idle-skip OFF on
+  // both, so turning idle-skip off does NOT make history safe.
+  //
+  // So the invariant is CHECKED on the first frame a lockstep anchor actually
+  // runs: this worker must never have run a frame (lsRunIterEver == 0, counted
+  // on the export in onRuntimeInitialized). Anything else REFUSES the frame — a
+  // console that would fork the room is stopped and named, never run. Cost:
+  // one integer compare per anchor.
+  // ---------------------------------------------------------------------------
+  let lsRunIterEver = 0;            // retro_runs this worker has EVER performed (all callers)
+  let lsAnchorCheck = false;        // the next lockstep frame to run is an anchor
+  let lsHistoryRefused = null;      // {f, frames, burns} once refused; the pump stays parked
   // CARDS THAT MUST BE (RE)INSTALLED AT AN EXACT FRAME, NOT "SOON".
   //
-  // On a seeded disc the boot savestate was captured when this console had ONE
-  // memory card. A room attaches one per player, so the port that was not in
-  // the state gets re-initialised by the guest during its first frames and
-  // player 2's card is replaced by a blank one. Measured: port 1 reads the
-  // right card (b19a59c5) BEFORE frame 0 on both machines and reads zeros
-  // afterwards, at the SAME pointer — an in-place overwrite by the guest, not a
-  // reallocation. On the unseeded disc the identical exchange survives, which
-  // is what identifies the savestate as the cause.
+  // ⚠ CORRECTED 2026-10-01: the case this was built for was misread. "Port 1
+  // reads the right card before frame 0 and zeros afterwards, at the SAME
+  // pointer" was not the guest re-initialising the card — the boot state
+  // (captured with ONE card) DELETED port 1's card when it loaded, and that
+  // pointer was freed heap the allocator then reused. Writing a card there at
+  // a later frame corrupted the wasm heap (see vmuGuardLoad, which now reports
+  // such a port dead so nothing reads or writes it). The frame-scheduled write
+  // below is still correct for a card that EXISTS, and is kept for that.
   //
   // Re-installing "once things settle" would be a fork: two consoles writing
   // guest-visible memory at two different frames is exactly the divergence
@@ -777,7 +891,7 @@
     // it as an asyncify suspension forever and the pump would spin on nothing.
     try { if (runIterFlagPtr) Module.HEAPU8[runIterFlagPtr] = 0; } catch (_) {}
     let ok = 0;
-    try { ok = Module._emscripten_load_state(recoverPtr, recoverLen) | 0; }
+    try { ok = vmuGuardLoad(Module, () => Module._emscripten_load_state(recoverPtr, recoverLen) | 0); }
     catch (e2) {
       postMessage({ cmd: 'print', txt: '[recover] restore threw: ' + describeThrow(Module, e2) });
       return false;
@@ -861,6 +975,23 @@
         if (d > lsStats.maxStallMs) lsStats.maxStallMs = d;
         postMessage({ cmd: 'lsStall', f: lsFrame, on: 0, ms: Math.round(d) });
       }
+      if (lsHistoryRefused) return;   // refused below; never run a forking frame
+      if (lsAnchorCheck) {
+        lsAnchorCheck = false;
+        let burns = 0;
+        try { burns = (typeof Module._flycast_ctx_snapshot === 'function') ? (Module._flycast_ctx_snapshot(90) >>> 0) : 0; } catch (_) {}
+        if (lsRunIterEver > 0 || burns > 0) {
+          lsHistoryRefused = { f: lsFrame, frames: lsRunIterEver, burns: burns };
+          postMessage({ cmd: 'print', txt: '[lockstep] ⚠ REFUSING frame ' + lsFrame + ' — this worker already ran ' +
+            lsRunIterEver + ' frame(s) (' + burns + ' idle-skip slices) BEFORE the room\'s anchor. State no savestate ' +
+            'carries (the idle-skip streak, and more) would make it a different machine from the other ' +
+            'consoles, and this frame would fork the room. A room must be entered on a freshly loaded page.' });
+          postMessage({ cmd: 'lsHistory', f: lsFrame, frames: lsRunIterEver, burns: burns });
+          return;
+        }
+        postMessage({ cmd: 'print', txt: '[lockstep] anchor frame ' + lsFrame + ': this worker has run no frame before ' +
+          'it — it starts the room on the same machine as everyone' });
+      }
       lsQueue.delete(lsFrame);
       lsWritePads(inp);
     }
@@ -873,7 +1004,7 @@
         const job = vmuAtFrame.splice(i, 1)[0];
         try {
           const M = self.Module;
-          const ptr = M._flycast_vmu_ptr(job.port) >>> 0, size = M._flycast_vmu_size(job.port) >>> 0;
+          const ptr = vmuPtr(M, job.port), size = ptr ? (M._flycast_vmu_size(job.port) >>> 0) : 0;
           const src = new Uint8Array(job.data);
           if (!ptr || !size || src.length !== size) {
             postMessage({ cmd: 'print', txt: '[vmu] port ' + job.port + ': frame-' + job.atFrame +
@@ -1049,6 +1180,7 @@
         if (on === lockstep) { postMessage({ cmd: 'lsState', on: lockstep ? 1 : 0, f: lsFrame }); break; }
         lockstep = on;
         if (on) recoverDrop();   // a room never rewinds one console (see recoverFromThrow)
+        lsAnchorCheck = on; lsHistoryRefused = null;
         lsQueue.clear();
         lsFrame = data.frame | 0;
         lsPendingHash = -1;
@@ -1108,7 +1240,7 @@
         }
         try {
           const t0 = performance.now();
-          const ok = self.Module._emscripten_lockstep_normalize() | 0;
+          const ok = vmuGuardLoad(self.Module, () => self.Module._emscripten_lockstep_normalize() | 0);
           const ms = Math.round(performance.now() - t0);
           postMessage({ cmd: 'print', txt: '[lockstep] normalize ' + (ok ? 'OK' : 'FAILED') + ' in ' + ms + ' ms' });
           postMessage({ cmd: 'lsNormalize', ok: !!ok, ms,
@@ -1704,7 +1836,7 @@
           const src = data.data ? new Uint8Array(data.data) : new Uint8Array(0);
           const ptr = Module._malloc(src.length);
           Module.HEAPU8.set(src, ptr);
-          const ok = Module._emscripten_load_state(ptr, src.length);
+          const ok = vmuGuardLoad(Module, () => Module._emscripten_load_state(ptr, src.length));
           Module._free(ptr);
           // A preceding Save typically stopped the pump (asyncify unwind). Resume
           // it from the restored state so Load actually continues the game.
@@ -1718,6 +1850,7 @@
           if (lockstep) {
             lsQueue.clear(); lsPendingHash = -1; lsStallSince = 0;
             lsFrame = data.frame | 0;
+            lsAnchorCheck = true;   // a new frame numbering is a new anchor
           }
           postMessage({ cmd: 'stateLoaded', success: !!ok });
         } catch (err) {
@@ -1831,7 +1964,7 @@
           const tick = () => {
             if (runIterSuspended()) { setTimeout(tick, 4); return; }
             let more = 1;
-            try { more = Module._emscripten_parity_tick(); }
+            try { lsRunIterEver++; more = Module._emscripten_parity_tick(); }
             catch (err) {
               if (isUnwind(err)) { setTimeout(tick, 8); return; }  // suspend escaping as throw: wait for rewind
               postMessage({ cmd: 'print', txt: '[parity] tick threw: ' + (err && err.message ? err.message : String(err)) });
@@ -1844,7 +1977,7 @@
             if (runIterSuspended()) { setTimeout(startWhenClean, 4); return; }
             postMessage({ cmd: 'print', txt: '[parity] running ' + n + ' frames x4 arms (stepwise)...' });
             let ok = 1;
-            try { ok = Module._emscripten_parity_begin(n, fromLoad); }
+            try { ok = vmuGuardLoad(Module, () => Module._emscripten_parity_begin(n, fromLoad)); }
             catch (err) {
               if (isUnwind(err)) { setTimeout(tick, 8); return; }   // begin suspended; it completes via rewind
               postMessage({ cmd: 'print', txt: '[parity] begin threw: ' + (err && err.message ? err.message : String(err)) });
@@ -1881,11 +2014,15 @@
         }
         try {
           const M = self.Module;
-          const ptr = M._flycast_vmu_ptr(port) >>> 0, size = M._flycast_vmu_size(port) >>> 0;
+          const ptr = vmuPtr(M, port), size = ptr ? (M._flycast_vmu_size(port) >>> 0) : 0;
           const src = new Uint8Array(data.data);
           if (!ptr || !size) {
-            postMessage({ cmd: 'print', txt: '[vmu] port ' + port + ': no card attached — seed skipped' });
-            postMessage({ cmd: 'vmuSeeded', port: port, ok: false, why: 'no card on that port' });
+            const gone = !!vmuDead[port];
+            postMessage({ cmd: 'print', txt: '[vmu] port ' + port + ': ' + (gone
+              ? 'the loaded state has no card here (the core deleted it) — NOT written; its old pointer is freed memory'
+              : 'no card attached — seed skipped') });
+            postMessage({ cmd: 'vmuSeeded', port: port, ok: false, dead: gone,
+                          why: gone ? 'the loaded state has no memory card in that port' : 'no card on that port' });
             break;
           }
           if (src.length !== size) {
@@ -1925,8 +2062,8 @@
         const port = (data.port | 0) >= 0 && (data.port | 0) < VMU_PORTS_MAX ? (data.port | 0) : 0;
         try {
           const M = self.Module;
-          const ptr = M._flycast_vmu_ptr(port) >>> 0, size = M._flycast_vmu_size(port) >>> 0;
-          if (!ptr || !size) { postMessage({ cmd: 'vmuDump', port: port, data: null, ptr: 0, size: 0 }); break; }
+          const ptr = vmuPtr(M, port), size = ptr ? (M._flycast_vmu_size(port) >>> 0) : 0;
+          if (!ptr || !size) { postMessage({ cmd: 'vmuDump', port: port, data: null, ptr: 0, size: 0, dead: !!vmuDead[port] }); break; }
           const copy = new Uint8Array(M.HEAPU8.subarray(ptr, ptr + size));
           postMessage({ cmd: 'vmuDump', port: port, data: copy, ptr: ptr, size: size,
                         gen: M._flycast_vmu_gen(port) >>> 0 }, [copy.buffer]);
@@ -1948,12 +2085,15 @@
               port: p,
               size: (M && M._flycast_vmu_size) ? (M._flycast_vmu_size(p) >>> 0) : 0,
               gen:  (M && M._flycast_vmu_gen)  ? (M._flycast_vmu_gen(p)  >>> 0) : 0,
-              present: !!((M && M._flycast_vmu_ptr) ? (M._flycast_vmu_ptr(p) >>> 0) : 0),
+              present: !!vmuPtr(M, p),
+              // A card a state load deleted: the console HAD one in this port
+              // and the loaded state did not. Absent, but not "never existed".
+              dead: !!vmuDead[p],
             });
           }
           postMessage({ cmd: 'vmuInfo', ports: vmuPortCount, slots: slots });
           postMessage({ cmd: 'print', txt: '[vmu] slots: ' +
-            (slots.length ? slots.map((x) => 'p' + x.port + (x.present ? '=' + x.size + 'B' : '=none')).join(' ')
+            (slots.length ? slots.map((x) => 'p' + x.port + (x.present ? '=' + x.size + 'B' : (x.dead ? '=deleted-by-state' : '=none'))).join(' ')
                           : 'none — this binary has no per-port VMU accessors') });
         } catch (err) {
           postMessage({ cmd: 'vmuInfo', ports: 0, slots: [], error: String(err && err.message || err) });
