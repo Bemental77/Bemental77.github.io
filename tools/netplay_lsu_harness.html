@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lockstep transport harness</title>
+<style>
+  :root { --bg: #111; --fg: #ddd; }
+  @media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) { --bg: #fff; --fg: #222; } }
+  body { background: var(--bg); color: var(--fg); font: 13px/1.4 ui-monospace, Menlo, monospace; margin: 16px; }
+</style>
+<!--
+  A TEST FIXTURE, NOT A PAGE ANYONE VISITS. tools/netplay_lsu_rig.mjs opens one
+  of these per browser PROCESS and drives the SHIPPED lib/netplay.js Session
+  through real RTCPeerConnections (signalling over a local MQTT broker,
+  ?signal=ws&wsbroker=...). The "console" is synthetic: a state word folded
+  from every frame's input image, run at exactly 60 frames/s by the same 1.000x
+  governor n64/index.html uses (re-anchor, never repay beyond two periods), and
+  fingerprinted into the engine every hashEvery frames so a desync is caught.
+  It costs nothing, so four of them fit on a 4-core box and the ROOM rate is a
+  statement about the transport and the engine, not about a CPU.
+-->
+<script src="/lib/netplay.js"></script>
+</head>
+<body>
+<pre id="out">starting…</pre>
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  var CODE = q.get('code'), HOST = q.get('host') === '1', N = +(q.get('n') || 2), HZ = +(q.get('hz') || 60);
+  var H = window.__H = { role: HOST ? 'host' : 'guest', frames: 0, stalls: 0, stallMs: 0, reanchors: 0, lostMs: 0,
+    state: 'init', err: null, desync: null, t0: 0, declared: false, chan: {}, log: [] };
+  var log = function (s) { H.log.push(((performance.now() / 1000) | 0) + ' ' + s); if (H.log.length > 200) H.log.shift(); };
+  // count what actually goes on each channel, by label
+  var send = RTCDataChannel.prototype.send;
+  RTCDataChannel.prototype.send = function (m) {
+    var k = this.label || '?'; var c = H.chan[k] || (H.chan[k] = { n: 0, bytes: 0, ls: 0 });
+    c.n++; c.bytes += (m && m.length) || 0; if (typeof m === 'string' && m.indexOf('"t":"ls"') >= 0) c.ls++;
+    return send.apply(this, arguments);
+  };
+  var s = new Netplay.Session({ game: 'harness', host: HOST, code: CODE, transport: 'peerjs', ui: false, portCount: 4, padBytes: 4 });
+  H.session = s;
+  s.on('join-request', function (r) { try { (r.approve || function () {})(); } catch (e) {} });
+  s.on('status', function (e) { log('status ' + e.state + (e.detail ? ' ' + e.detail : '')); });
+  s.startLockstep({ portCount: 4, padBytes: 4, hashEvery: 30, stallBudgetMs: 60000 });
+  s.start().catch(function (e) { H.err = String(e && e.message || e); });
+  var ls = function () { return s.ls; };
+  var seated = function () { var L = ls(); if (!L) return 0; var n = 0; for (var i = 0; i < L.roster.length; i++) if (L.roster[i] != null) n++; return n; };
+  // declare when the room is whole (host) / when this console has its port (guest)
+  setInterval(function () {
+    var L = ls(); if (!L || H.declared) return;
+    if (HOST ? seated() >= N : (L.localPorts.length > 0 && seated() >= 2)) {
+      H.declared = true;
+      // As the pages do: the host sizes the delay from measured RTTs first
+      // (several samples, this console's frame period — n64/index.html).
+      var go = function () { s.setReady(true, 'harness'); log('declared ready, seated ' + seated() + ', delay ' + L.delay); };
+      if (!HOST || typeof s.rttReport !== 'function') return go();
+      s.rttReport(600, { samples: 6, frameMs: 1000 / HZ }).then(function (rep) {
+        H.rtt = rep; if (rep && rep.recommendedDelay != null) L.delay = Math.max(1, Math.min(30, rep.recommendedDelay | 0));
+        go();
+      }, go);
+    }
+  }, 50);
+  // the synthetic console
+  var st = 2166136261 >>> 0, base = 0, baseF = 0, period = 1000 / HZ, stalling = false, stallAt = 0;
+  var fnv = function (h, v) { return Math.imul((h ^ (v >>> 0)) >>> 0, 16777619) >>> 0; };
+  var due = function () {
+    var now = performance.now();
+    if (!base) { base = now; baseF = H.frames; return true; }
+    var d = base + (H.frames - baseF) * period;
+    if (now < d) return false;
+    if (now - d > period * 2) { H.lostMs += now - d; base = now; baseF = H.frames; H.reanchors++; }
+    return true;
+  };
+  var feed = function () {
+    var L = ls(); if (!L) return;
+    H.state = L.state;
+    if (L.state !== 'running' && L.state !== 'stalled') return;
+    if (!H.t0) { H.t0 = performance.now(); log('frame gate engaged, delay ' + L.delay); }
+    var g = 0;
+    while (due() && g++ < 8) {
+      var pads = {}, f = L.frame;
+      for (var i = 0; i < L.localPorts.length; i++) {
+        var p = L.localPorts[i], b = new Uint8Array(4);
+        b[0] = (f * 7 + p * 31) & 255; b[1] = (f >> 3) & 255; b[2] = p; b[3] = (f % 97) & 255;
+        pads[p] = b;
+      }
+      var r = L.beginFrame(pads);
+      if (!r || !r.ready) {
+        if (!stalling && r && r.reason === 'stall') { stalling = true; stallAt = performance.now(); H.stalls++; }
+        base = 0; break;
+      }
+      if (stalling) { H.stallMs += performance.now() - stallAt; stalling = false; }
+      for (var k = 0; k < r.image.length; k++) st = fnv(st, r.image[k]);
+      st = fnv(st, r.frame);
+      L.endFrame(L.wantsHash() ? st : null, [st]);
+      H.frames++;
+    }
+    if (L.desync && !H.desync) { H.desync = L.desync; log('DESYNC ' + JSON.stringify(L.desync).slice(0, 200)); }
+  };
+  setInterval(feed, 4);
+  var raf = function () { feed(); requestAnimationFrame(raf); }; requestAnimationFrame(raf);
+  // the rig's view: links and their channels, by what they ARE (label, options, state)
+  H.snap = function () {
+    var L = ls(), links = [];
+    try {
+      s._links.forEach(function (x) {
+        links.push({ dc: x.dc ? x.dc.readyState : null, dcu: x.dcu ? { label: x.dcu.label, ordered: x.dcu.ordered,
+          maxRetransmits: x.dcu.maxRetransmits, state: x.dcu.readyState } : null, capU: !!x.capU, relay: !!x.relay });
+      });
+    } catch (e) {}
+    var rep = null; try { rep = L && L.report(); } catch (e) {}
+    return { role: H.role, state: L && L.state, frame: L && L.frame, frames: H.frames, t0: H.t0, now: performance.now(),
+      stalls: H.stalls, stallMs: Math.round(H.stallMs), reanchors: H.reanchors, lostMs: Math.round(H.lostMs),
+      delay: L && L.delay, roster: L && L.roster.map(function (x) { return x ? 1 : 0; }), localPorts: L && L.localPorts,
+      desync: H.desync, err: H.err || (L && L.error), links: links, chan: JSON.parse(JSON.stringify(H.chan)),
+      msgs: rep && rep.msgs, hashesCompared: rep && rep.hashesCompared, naks: L && L.stats && (L.stats.naksSent || 0),
+      naksAnswered: L && L.stats && (L.stats.naksAnswered || 0), hasLsu: typeof s._bindUnreliable === 'function',
+      delayHistory: rep && rep.delayHistory, rtt: H.rtt ? { worstMs: H.rtt.worstMs, recommendedDelay: H.rtt.recommendedDelay } : null,
+      log: H.log.slice(-30) };
+  };
+  H.closeLsu = function () { var n = 0; s._links.forEach(function (x) { if (x.dcu) { try { x.dcu.close(); n++; } catch (e) {} } }); return n; };
+  setInterval(function () { var v = H.snap(); document.getElementById('out').textContent = JSON.stringify({ role: v.role, state: v.state, frames: v.frames, delay: v.delay, links: v.links }, null, 1); }, 1000);
+})();
+</script>
+</body>
+</html>
