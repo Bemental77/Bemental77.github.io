@@ -1965,6 +1965,25 @@ N64Rate.selfTest = function (logFn) {
       };
     })();
   }
+  // NATIVE-RESOLUTION READBACK (core: glitchmain.c grLfbReadSampled). On a
+  // read_always title the core now point-samples the frame ON THE GPU and
+  // reads back only the N64-sized result (320x240 instead of 640x480), with
+  // bytes identical to the old full-window path. ?fbnative=0 selects the old
+  // path (the A/B arm). Applied before main() runs, so frame 0 already uses it.
+  (function () {
+    var want = new URLSearchParams(location.search).get('fbnative');
+    if (want == null) return;
+    var t = setInterval(function () {
+      var M = window.Module;
+      if (!M || typeof M.callMain !== 'function' || M.__fbNativeHooked) return;
+      M.__fbNativeHooked = true; clearInterval(t);
+      var cm = M.callMain;
+      M.callMain = function () {
+        if (typeof M._neil_set_native_fbread === 'function') M._neil_set_native_fbread(want === '0' ? 0 : 1);
+        return cm.apply(this, arguments);
+      };
+    }, 2);
+  })();
   var glFacts = { webgl2: false };
   (function glProbe() {
     if (new URLSearchParams(location.search).has('noglprobe')) { glFacts.skipped = true; return; }

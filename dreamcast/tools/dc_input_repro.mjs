@@ -19,6 +19,7 @@
 //   node dreamcast/tools/dc_input_repro.mjs --game sa2 --mash --nodirs --dur 200000
 //   node dreamcast/tools/dc_input_repro.mjs --noinput --dur 300000        # control arm
 //   node dreamcast/tools/dc_input_repro.mjs --q nochain=1 --mash --nodirs # JIT-lever arm
+//   node dreamcast/tools/dc_input_repro.mjs --q norecover=1 --mash --nodirs # raw crash (no shim rewind)
 //   node dreamcast/tools/dc_input_repro.mjs --script "3000:Enter;9000:m"  # exact taps
 //
 // Flags: --url BASE  --game KEY  --dur MS (measured from the first DISTINCT
@@ -83,6 +84,7 @@ if (CPUSLOW > 0) {
 }
 
 let CRASH = null;
+const RECOVERED = [];
 const tail = [];
 page.on('console', (m) => {
   const t = m.text();
@@ -90,7 +92,12 @@ page.on('console', (m) => {
   out.write(t + '\n');
   if (/pump stopped|run_iter threw|ABORT|abort\(|RuntimeError|watchdog #/i.test(t)) {
     say('!!! ' + t.slice(0, 400));
-    if (/pump stopped|run_iter threw/i.test(t) && !CRASH) CRASH = t;
+    // 'pump stopped' only: since 2026-10-01 the shim REWINDS a guest crash in
+    // single-player and prints "run_iter threw (recovering)" instead — that is
+    // a recovered crash, counted below, not a dead emulator. Use --q norecover=1
+    // to reproduce the raw crash.
+    if (/pump stopped/i.test(t) && !CRASH) CRASH = t;
+    if (/run_iter threw \(recovering\)/.test(t)) RECOVERED.push(t);
   }
 });
 page.on('pageerror', (e) => { const s = '[pageerror] ' + String(e).slice(0, 300); say(s); out.write(s + '\n'); });
@@ -229,7 +236,8 @@ if (CRASH) {
   say('--- last 60 console lines before/around the crash ---');
   for (const l of tail.slice(-60)) out.write('    ' + l + '\n');
 } else {
-  say('=== NOT reproduced in ' + ((Date.now() - BOOT_AT) / 1000).toFixed(0) + 's after first frame ===');
+  say('=== NOT reproduced in ' + ((Date.now() - BOOT_AT) / 1000).toFixed(0) + 's after first frame ===' +
+      (RECOVERED.length ? ' — but the guest crashed ' + RECOVERED.length + 'x and the shim REWOUND it (run with --q norecover=1 for the raw crash)' : ''));
   if (!INPUT_PROVEN) say('*** RESULT IS VOID: the input gate FAILED, so this run never tested input at all. ***');
 }
 

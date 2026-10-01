@@ -844,7 +844,8 @@
   function sniff(s) {
     if (typeof s !== 'string') return;
     if (s.indexOf('[glinfo]') >= 0) {
-      if (s.indexOf('granted attrs') >= 0)         facts.glAttrs   = s;
+      if (s.indexOf('depth-stencil renderbuffer in use') >= 0) facts.glDS = s;
+      else if (s.indexOf('granted attrs') >= 0)    facts.glAttrs   = s;
       else if (s.indexOf('gpu masked') >= 0)       facts.glGpu     = s;
       else if (s.indexOf('limits ') >= 0)          facts.glLimits  = s;
       else if (s.indexOf('drawingBuffer') >= 0)    facts.glDrawBuf = s;
@@ -866,6 +867,23 @@
     if (/factory rejected|ABORT:|importScripts failed|global missing after importScripts|runtime-init threw/.test(s)) {
       bump('coreStartupError');
       if (!facts.coreError) facts.coreError = s;
+    }
+    // THE GUEST CRASHED, AND UNTIL 2026-10-01 THE REPORT SAID "STALLED". The
+    // shim prints this line, with the decoded C++ exception, the SH4 state and
+    // the guest PC, the instant the pump dies (flycast_worker.js pumpTick catch).
+    // Nothing here read it, so the only thing a phone report carried was the
+    // stall detector's guess 12 s later — "telemetry at +80.0s, pc=0x8c10fe72"
+    // — where pc is the LAST HEARTBEAT's sample, not the fault. That is exactly
+    // what a real Mali-G715 phone sent on 2026-10-01, and it is the same
+    // lastPc as the SA2 story-select crash in
+    // dreamcast/docs/sa2-story-select-crash/TASKS.md, where this line reads
+    // `what="Fatal: SH4 exception when blocked" sh4_pc=0xac000012`.
+    if (s.indexOf('freerun run_iter threw (pump stopped)') >= 0) {
+      bump('guestCrash');
+      if (!facts.guestCrash) {
+        facts.guestCrash = s.replace(/^.*?pump stopped\):\s*/, '').slice(0, 400);
+        mark('guest-crash');
+      }
     }
     // Memory pressure has many spellings across engines; catch the family.
     if (/out of memory|Array buffer allocation failed|allocation size overflow|RangeError/i.test(s)) {
@@ -1463,17 +1481,21 @@
     if (g.ok && g.fboD24S8 !== 'COMPLETE' && g.fboD32FS8 !== 'COMPLETE')
       return 'THIS GPU COMPLETES NEITHER DEPTH-STENCIL FORMAT (depth24_stencil8=' + g.fboD24S8 +
              ', depth32f_stencil8=' + g.fboD32FS8 + ') — the renderer has no valid render target.';
-    // Only ONE of those two formats is the one this driver will actually be
-    // handed: core/rend/gles/gles.cpp sets `gl.mali = !stricmp(GL_VENDOR,
-    // "arm")` and core/rend/gl4/gldraw.cpp then picks GL_DEPTH24_STENCIL8 on
-    // mali and GL_DEPTH32F_STENCIL8 everywhere else. Naming the applicable one
-    // turns a curiosity into a finding.
-    if (g.ok && dsFormat().status !== 'COMPLETE')
+    // Only ONE of those two formats is the one the renderer actually uses, and
+    // it is now MEASURED from its own glRenderbufferStorage call (dsFormat) —
+    // the old gl.mali inference read the masked GL_VENDOR and a code path this
+    // build does not run. Naming the applicable one turns a curiosity into a
+    // finding.
+    if (g.ok && dsFormat().known && dsFormat().status !== 'COMPLETE' && dsFormat().status !== 'not probed')
       return 'THE DEPTH-STENCIL FORMAT THIS DRIVER WOULD ACTUALLY BE GIVEN IS NOT COMPLETE (' +
              dsFormat().name + ' = ' + dsFormat().status + ').';
     if (counters.incompleteFBO) return 'THE RENDERER WAS HANDED AN INCOMPLETE FRAMEBUFFER ' + counters.incompleteFBO + ' time(s) — it is drawing into nothing.';
     if (facts.memoryPressure) return 'THIS DEVICE RAN OUT OF MEMORY — ' + facts.memoryPressure;
+    // A crash outranks the stall it causes: the stall detector fires 12 s
+    // after the pump dies and only knows the heartbeat stopped.
+    if (facts.guestCrash) return 'THE GAME CRASHED INSIDE THE EMULATOR (the emulated CPU took an exception it cannot recover from; the picture is frozen on the last frame) — ' + facts.guestCrash;
     if (facts.stall) return 'THE EMULATOR STALLED — ' + facts.stall;
+    if (counters.guestRecovered) return 'THE GAME CRASHED INSIDE THE EMULATOR AND WAS REWOUND (' + counters.guestRecovered + 'x) — it kept running; last: ' + facts.guestRecovered;
     if (counters.pageError) return 'THE PAGE THREW — ' + facts.pageError;
     if (memInfo.reduced) return 'THE BROWSER REFUSED THE REQUESTED HEAP AND GAVE A SMALLER ONE — ' + memInfo.text;
     // Frames flowing outranks every "did it finish booting" heuristic — if the
@@ -1492,17 +1514,42 @@
     }
     return 'The emulator started but has never produced a frame.';
   }
-  // Which depth-stencil format Flycast will select on THIS device — see the
-  // gl.mali note in headline(). GL_VENDOR is the masked string, which is what
-  // gles.cpp compares, so the worker's own line is preferred over the probe's
-  // unmasked one.
+  // IS THIS GPU A MALI? From the UNMASKED strings — never from GL_VENDOR.
+  //
+  // Until 2026-10-01 this read the MASKED GL_VENDOR, which is "WebKit" on every
+  // Chrome, so a real Mali-G715 phone ("ANGLE (ARM, Mali-G715, OpenGL ES
+  // 3.2)") was reported as "vendor is not Mali/ARM". The worker's [glinfo] line
+  // carries both strings; the page probe carries the unmasked pair whenever
+  // WEBGL_debug_renderer_info exists (GLPROBE.masked === false).
+  function gpuIdentity() {
+    const g = GLPROBE || {};
+    const m = /unmasked="([^"]*)" \/ "([^"]*)"/.exec(facts.glGpu || '');
+    const uv = m ? m[1] : (g.masked === false ? String(g.vendor || '') : '');
+    const ur = m ? m[2] : (g.masked === false ? String(g.renderer || '') : '');
+    const known = !!(uv || ur) && !/^(null|undefined|\?)$/.test(ur || uv);
+    const mali = /\bmali\b/i.test(ur) || /\bmali\b/i.test(uv) || /^\s*arm\s*$/i.test(uv) ||
+                 /\(\s*arm\s*\)/i.test(uv) || /^ANGLE \(ARM,/i.test(ur);
+    return { known, mali, vendor: uv, renderer: ur, src: m ? 'worker' : 'page probe' };
+  }
+  // WHICH DEPTH-STENCIL FORMAT IS IN USE — MEASURED, not inferred. The shim
+  // (flycast_worker.js, "[glinfo] depth-stencil renderbuffer in use") watches
+  // the renderer's own glRenderbufferStorage calls, so this names the format
+  // the core actually allocated. The old row INFERRED it from gl.mali via a
+  // gl4/OIT code path this build does not run, and fed the inference the
+  // masked vendor besides — wrong on both counts. Before the first allocation
+  // (or on an older shim) the format is honestly reported as not yet seen.
   function dsFormat() {
     const g = GLPROBE || {};
-    const m = /masked="([^"]*)"/.exec(facts.glGpu || '');
-    const vendor = m ? m[1] : (g.vendor || '');
-    const mali = /^\s*arm\s*$/i.test(vendor) || /\bmali\b/i.test(vendor);
-    return mali ? { name: 'depth24_stencil8 (vendor reads Mali/ARM)', status: g.fboD24S8 || '?' }
-                : { name: 'depth32f_stencil8 (vendor is not Mali/ARM)', status: g.fboD32FS8 || '?' };
+    const id = gpuIdentity();
+    const gpu = id.known ? ((id.mali ? 'GPU IS Mali/ARM' : 'GPU is not Mali/ARM') + ' per the unmasked renderer "' +
+                            (id.renderer || id.vendor) + '"')
+                         : 'GPU name masked (no WEBGL_debug_renderer_info)';
+    const used = /in use: ([A-Z0-9_]+)/.exec(facts.glDS || '');
+    if (!used) return { known: false, name: 'not observed yet — ' + gpu, status: '?' };
+    const n = used[1];
+    const st = n === 'DEPTH24_STENCIL8' ? g.fboD24S8 : n === 'DEPTH32F_STENCIL8' ? g.fboD32FS8 : '';
+    return { known: true, name: n.toLowerCase() + ' (allocated by the renderer; ' + gpu + ')',
+             status: st || 'not probed' };
   }
   function verdictRows() {
     const rows = [];
@@ -1555,7 +1602,8 @@
            'warn');
     if (g.ok) {
       const ds = dsFormat();
-      push('depth-stencil in use', ds.name + ' = ' + ds.status, ds.status === 'COMPLETE' ? 'good' : 'bad');
+      push('depth-stencil in use', ds.name + ' = ' + ds.status,
+           !ds.known ? 'warn' : (ds.status === 'COMPLETE' ? 'good' : 'bad'));
       push('both DS formats', 'depth24_stencil8=' + g.fboD24S8 + '  depth32f_stencil8=' + g.fboD32FS8,
            (g.fboD24S8 === 'COMPLETE' && g.fboD32FS8 === 'COMPLETE') ? 'good' : 'warn');
       push('GPU', g.renderer + (g.masked ? '  (masked — no debug_renderer_info)' : ''));
@@ -1613,7 +1661,11 @@
              (a.resampling ? ' (resampling)' : '') +
              ' · drain ' + a.consumedRate + '/s (' + (drift >= 0 ? '+' : '') + drift.toFixed(1) + '%)' +
              ' · buffer ' + a.fill + '/' + a.capacity +
-             ' · ' + a.underrunTotal + ' dropout frames',
+             ' · ' + a.underrunTotal + ' dropout frames' +
+             ' · played ' + (a.srcRate ? (a.consumedTotal / a.srcRate).toFixed(1) : '?') + ' s in total' +
+             (a.consumedTotal > 0 && a.consumedRate === 0 && a.lastDrainAt
+               ? ' (last drained ' + ((Date.now() - a.lastDrainAt) / 1000).toFixed(0) + ' s ago — the sink is idle because nothing is being written)'
+               : (a.consumedTotal === 0 ? ' (NOTHING has ever drained)' : '')),
              off ? 'bad' : (a.underrunFrames > 0 ? 'warn' : 'good'));
       }
     }
@@ -1649,6 +1701,9 @@
   // global error handler at any point in the boot.
   // ---------------------------------------------------------------------------
   const DIAG_VERSION = 'dc-diag/2';
+  // Test seam: the exact text the Share button sends, for rigs that must judge
+  // a report's headline/rows without scraping the diagnostics panel.
+  window.__dcReport = (n) => buildReport(n || 60);
   function buildReport(tailLines) {
     const L = [];
     const nTail = tailLines || 60;
@@ -1684,7 +1739,7 @@
       }
       L.push('');
       L.push('--- GL (reported by the emulator worker) ---');
-      const gk = ['glGpu', 'glAttrs', 'glLimits', 'glDrawBuf', 'glExts', 'glNull', 'glLost',
+      const gk = ['glGpu', 'glDS', 'glAttrs', 'glLimits', 'glDrawBuf', 'glExts', 'glNull', 'glLost',
                   'glReportFailed', 'fboIncomplete', 'glInvalidEnum', 'glcompat'];
       let any = false;
       gk.forEach((k) => { if (facts[k]) { L.push(facts[k]); any = true; } });
@@ -2497,6 +2552,14 @@
           showMobileLog();
           showDiag('core startup error: ' + d.txt);
         }
+        // The pump died on a guest exception (see sniff()). Say so NOW, in the
+        // words the evidence supports, instead of letting the stall detector
+        // call it a stall 12 s later.
+        if (d.txt && d.txt.indexOf('freerun run_iter threw (pump stopped)') >= 0) {
+          setStatus('The game crashed inside the emulator — the picture is frozen. Reload to play again.');
+          showAlert('THE GAME CRASHED (emulated CPU exception)');
+          showToast('The game crashed inside the emulator — tap the banner for diagnostics', false);
+        }
         // WebGL context loss is PERMANENT here — the worker's own [glinfo] line
         // says Flycast does not rebuild its GL objects on restore. The emulator
         // keeps running, the rate bar keeps reading 1.000x, and the picture is
@@ -2594,6 +2657,10 @@
           // the #armBanner and prefixes the rate bar whenever it is set.
           if (qs.has('uncap'))     worker.postMessage({ cmd: 'uncap', on: 1 });
           if (qs.has('arm7selftest')) worker.postMessage({ cmd: 'arm7selftest', on: 1 });
+          // Guest-crash rewind (flycast_worker.js recoverFromThrow). ON by
+          // default in the shim; these are the A/B arms.
+          if (qs.has('norecover'))    worker.postMessage({ cmd: 'recover', on: 0 });
+          else if (qs.has('recoverchain')) worker.postMessage({ cmd: 'recover', on: 1, keepChain: 1 });
         }
         if (new URLSearchParams(location.search).has('nofastmem')) {
           worker.postMessage({ cmd: 'memfast', on: 0 });
@@ -2800,6 +2867,16 @@
             worker.postMessage({ cmd: 'loadState', data: buf }, [buf]);
           });
         }
+        break;
+      case 'guestRecovered':
+        // The guest crashed and the shim rewound it (flycast_worker.js
+        // recoverFromThrow). The game is running again; say what happened.
+        bump('guestRecovered');
+        facts.guestRecovered = 'rewound ' + d.ageS + ' s after: ' + d.why +
+          (d.nochainMs ? ' (block chaining off for ' + Math.round(d.nochainMs / 1000) + ' s)' : '');
+        mark('guest-recovered');
+        rebaseStallClocks();
+        showToast('The game hit an emulator fault and was rewound ' + Math.round(d.ageS) + ' s — carry on', false);
         break;
       case 'ips':
         // iters/s plus the pump's duty-cycle partition (busy / paced / wall,
@@ -3124,6 +3201,14 @@
     underrunFrames: 0,    // this second
     underrunTotal: 0,     // since the context was created
     consumedRate: 0,      // source frames/s drained out of the ring
+    // CUMULATIVE drain, so "drain 0/s" in a report taken AFTER the emulator
+    // stopped is not read as "audio never played". A real phone report on
+    // 2026-10-01 read "drain 0/s (-100%) · buffer 0/16384" and was taken for a
+    // dead audio path; under reproduction the sink drained at the writer's
+    // rate the whole time the guest ran, and went to 0 only when the guest
+    // crashed. consumedRate is the LAST second; these say what happened overall.
+    consumedTotal: 0,     // source frames drained since the context was created
+    lastDrainAt: 0,       // Date.now() of the last stats message with a nonzero drain
     outputRate: 0,        // output frames/s the graph asked for
     fill: 0, capacity: 0,
   };
@@ -3190,6 +3275,8 @@
         audioHealth.underrunFrames = d.underrunFrames | 0;
         audioHealth.underrunTotal += (d.underrunFrames | 0);
         audioHealth.consumedRate = Math.round(d.consumedFrames / dt);
+        audioHealth.consumedTotal += (d.consumedFrames | 0);
+        if ((d.consumedFrames | 0) > 0) audioHealth.lastDrainAt = Date.now();
         audioHealth.outputRate = Math.round(d.outputFrames / dt);
         audioHealth.fill = d.fill | 0;
         audioHealth.capacity = d.capacity | 0;
@@ -5237,6 +5324,8 @@
     interpAt:    'SH4 interpreter after N s',
     interprange: 'PC range interpreted',
     nochain:     'block chaining OFF',
+    norecover:   'guest-crash rewind OFF',
+    recoverchain:'guest-crash rewind keeps chaining ON',
     rteintc:     'legacy per-block RTE UpdateINTC',
     noshard:     'shard dispatch OFF',
     shard:       'shard dispatch forced ON',
@@ -5497,7 +5586,11 @@
       // ⚠ SEVERITY MATCHES THE EVIDENCE. Every other state here means the
       // emulator is NOT running; duplicate-frames means it demonstrably IS, and
       // only the picture is still. Same diagnostics, honest wording.
-      if (state === 'duplicate-frames') {
+      // A known guest crash already put the right words on screen; the stall
+      // that follows it is a consequence, recorded above, not a second fault.
+      if (facts.guestCrash) {
+        // keep the crash banner
+      } else if (state === 'duplicate-frames') {
         setStatus('The picture is not changing: ' + why);
         showAlert('THE PICTURE IS NOT CHANGING (the emulator is still running)');
         showToast('The picture has not changed for a while — tap the banner for diagnostics', false);

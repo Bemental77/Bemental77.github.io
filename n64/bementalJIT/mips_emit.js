@@ -96,6 +96,13 @@
   // on entry and on every backward in-span branch (br_table at $top). A NEW
   // local appended after every existing group, so no index above moves.
   var L_START = 41;
+  // RAW (2026-10-01): 1 while compiling a block that has pinned registers.
+  // Its body is then wrapped as (block $raw (block $exit ...) epilogue), and
+  // every exit that follows an interpreter/core call — where reg[] is already
+  // authoritative and a pinned local may be STALE (the op may have written
+  // reg[]) — branches one level further, to $raw, skipping the epilogue.
+  // 0 otherwise: the emitted bytes are then exactly the pre-pinning shape.
+  var RAW = 0;
 
   function loadI64(addr) { return [OP.i32_const, 0x00, OP.i64_load, 0x03].concat(leb(addr)); }
   function loadI32(addr) { return [OP.i32_const, 0x00, OP.i32_load, 0x02].concat(leb(addr)); }
@@ -224,7 +231,48 @@
     this.regBase = regBase;
     this.loaded = new Array(32).fill(false);
     this.dirty = new Array(32).fill(false);
+    // PINNED registers (2026-10-01, see PINNING in compileSpan): live in
+    // their locals for the WHOLE block — loaded once in the prologue, written
+    // back once in the epilogue — so a loop's back-edge and every label join
+    // carry them in locals instead of a store + reload. A pinned register is
+    // permanently loaded AND dirty in compile-state: the local is the
+    // authoritative copy everywhere inside the block, and reg[] is brought
+    // current (a) before every interpreter / core call (flushSnapshot,
+    // flushAll, flushAndInvalidate) and (b) on every exit — the $exit
+    // epilogue for plain exits, (a) for the RAW exits that follow a call.
+    this.pinned = new Array(32).fill(false);
+    this.err = { readOnlyWrite: -1 };     // shared with every clone
   }
+  RegCache.prototype.clone = function () {
+    var c = new RegCache(this.regBase);
+    c.loaded = this.loaded.slice(); c.dirty = this.dirty.slice(); c.pinned = this.pinned.slice();
+    c.err = this.err;
+    return c;
+  };
+  // `written` is an over-approximation of the registers the span's native
+  // code can write. A pinned register outside it is READ-ONLY in this block:
+  // permanently CLEAN, so it is never stored back (its local always equals
+  // reg[] — it is reloaded after every interpreter op, the only other
+  // writer). writeFromStack enforces that the approximation really is one.
+  RegCache.prototype.setPinned = function (pins, written) {
+    for (var r = 0; r < 32; r++) {
+      this.pinned[r] = !!pins[r];
+      if (pins[r]) { this.loaded[r] = true; this.dirty[r] = !!written[r]; }
+    }
+  };
+  // load every pinned register from reg[] into its local: the prologue, and
+  // the re-sync after an interpreter op that CONTINUES in-block (it may have
+  // written any register)
+  RegCache.prototype.reloadPinned = function () {
+    var out = [];
+    for (var r = 0; r < 32; r++) if (this.pinned[r]) out = out.concat(loadI64(this.regBase + r * 8), [OP.local_set], leb(L_REG0 + r));
+    return out;
+  };
+  RegCache.prototype.storePinned = function () {
+    var out = [];
+    for (var r = 0; r < 32; r++) if (this.pinned[r] && this.dirty[r]) out = out.concat(storeI64(this.regBase + r * 8, [OP.local_get].concat(leb(L_REG0 + r))));
+    return out;
+  };
   // value bytes that leave reg r (i64) on the stack; loads it first if needed
   RegCache.prototype.read = function (r) {
     var pre = [];
@@ -236,14 +284,19 @@
   };
   // consumes an i64 from the stack into reg r (local only; marks dirty)
   RegCache.prototype.writeFromStack = function (r) {
+    // never reached while gprWrites over-approximates; if it ever is, the
+    // whole span is refused (compileSpan checks err) rather than miscompiled
+    if (this.pinned[r] && !this.dirty[r]) this.err.readOnlyWrite = r;
     this.loaded[r] = true;
     this.dirty[r] = true;
     return [OP.local_set].concat(leb(L_REG0 + r));
   };
+  // flush(): the JOIN flush (label boundaries, branch tails). Pinned
+  // registers stay in their locals — that is the point of pinning.
   RegCache.prototype.flush = function () {
     var out = [];
     for (var r = 0; r < 32; r++) {
-      if (this.dirty[r]) {
+      if (this.dirty[r] && !this.pinned[r]) {
         out = out.concat(storeI64(this.regBase + r * 8, [OP.local_get].concat(leb(L_REG0 + r))));
         this.dirty[r] = false;
       }
@@ -268,12 +321,20 @@
     this.loaded[r] = true;
     return loadI64(this.regBase + r * 8).concat([OP.local_set], leb(L_REG0 + r));
   };
-  RegCache.prototype.invalidate = function () {
-    this.loaded.fill(false);
-    this.dirty.fill(false);
-  };
-  RegCache.prototype.flushAndInvalidate = function () {
+  // flushAll(): flush() PLUS the pinned registers — before a core call whose
+  // path always EXITS the block (gen_interrupt). Pinned stay loaded+dirty in
+  // compile-state (they are, on every other path).
+  RegCache.prototype.flushAll = function () {
     var out = this.flush();
+    return out.concat(this.storePinned());
+  };
+  RegCache.prototype.invalidate = function () {
+    for (var r = 0; r < 32; r++) if (!this.pinned[r]) { this.loaded[r] = false; this.dirty[r] = false; }
+  };
+  // before an interpreter op: reg[] must be complete, pinned included. A
+  // caller whose path CONTINUES after the op must then emit reloadPinned().
+  RegCache.prototype.flushAndInvalidate = function () {
+    var out = this.flushAll();
     this.invalidate();
     return out;
   };
@@ -516,6 +577,46 @@
     if (op === 0x10) return ((w >>> 21) & 0x1F) === 0x04;
     return (op >= 0x28 && op <= 0x2E) || op === 0x38 || op === 0x39 || op === 0x3C || op === 0x3D || op === 0x3F;
   }
+  // the subset of those that is ALWAYS a generic fallback, so ALWAYS hands
+  // back: MTC0, SWL/SWR/SDL/SDR, SC/SCD (SB/SH/SW/SD/SWC1/SDC1 are native and
+  // hand back only on their rare off-RDRAM arm). The instruction after one is
+  // made a LABEL (compileSpan, label source (d)): the dispatcher's very next
+  // `PC->ops()` then re-enters native code there instead of interpreting the
+  // rest of the span. It costs nothing at that boundary — the fallback has
+  // already flushed and emptied the register cache.
+  function alwaysHandsBack(w) {
+    var op = (w >>> 26) & 0x3F;
+    if (op === 0x10) return ((w >>> 21) & 0x1F) === 0x04;
+    return op === 0x2A || op === 0x2C || op === 0x2D || op === 0x2E || op === 0x38 || op === 0x3C;
+  }
+
+  // pinning (compileSpan): every GPR an instruction word can name, over-
+  // approximated — too wide only adds a pin, never changes what executes
+  var PIN_MAX = 12;
+  function gprRefs(w, refs) {
+    var op = (w >>> 26) & 0x3F, rs = (w >>> 21) & 0x1F, rt = (w >>> 16) & 0x1F;
+    if (op === 0x00) { refs[rs]++; refs[rt]++; refs[(w >>> 11) & 0x1F]++; return; }
+    if (op === 0x01) { refs[rs]++; return; }
+    if (op === 0x02) return;
+    if (op === 0x03) { refs[31]++; return; }
+    if (op >= 0x10 && op <= 0x13) { if (rs === 0 || rs === 1 || rs === 2 || rs === 4 || rs === 5 || rs === 6) refs[rt]++; return; }
+    if (op === 0x31 || op === 0x35 || op === 0x39 || op === 0x3D || op === 0x2F) { refs[rs]++; return; }
+    refs[rs]++; refs[rt]++;
+  }
+
+  // ...and every GPR an instruction word can WRITE, over-approximated: rd of
+  // any SPECIAL, $ra for JAL / REGIMM, rt of everything that is not a store,
+  // a branch, J, CACHE or an FP load/store. Scanned to span INCLUSIVE (the
+  // last branch's delay slot is emitted with it).
+  function gprWrites(w, out) {
+    var op = (w >>> 26) & 0x3F, rt = (w >>> 16) & 0x1F;
+    if (op === 0x00) { out[(w >>> 11) & 0x1F] = true; return; }
+    if (op === 0x01 || op === 0x03) { out[31] = true; return; }
+    if (op === 0x02 || (op >= 0x04 && op <= 0x07) || (op >= 0x14 && op <= 0x17)) return;
+    if ((op >= 0x28 && op <= 0x2F) || op === 0x38 || op === 0x39 || op === 0x3C || op === 0x3D || op === 0x3F) return;
+    if (op === 0x31 || op === 0x35) return;
+    out[rt] = true;
+  }
 
   function emitCountBatch(p, addr) {
     var val = [OP.i32_const].concat(sleb((addr + 8) | 0),
@@ -534,7 +635,7 @@
       loadI32(p.nextInt), loadI32(p.count), [OP.i32_le_u],
       [OP.if_, OP.void_],
       bump('#gen_interrupt'),
-      C.flush(),                          // compile-state: dirty cleared on BOTH arms (flush emits stores only here, but the arm not taken loses nothing: dirty was already current)
+      C.flushAll(),                       // compile-state: dirty cleared on BOTH arms (flush emits stores only here, but the arm not taken loses nothing: dirty was already current)
       storeI32Const(p.pcGlobal, finalPtr),
       [OP.i32_const], sleb(p.genInt), [OP.call_indirect, 0x00, 0x00],
       // ALWAYS return to the dispatcher after gen_interrupt (2026-09-30).
@@ -549,7 +650,7 @@
       // frame-1 divergence (MK64 boot) once every in-span branch went native.
       // PC already holds the right successor (finalPtr, or gen_interrupt's
       // redirect), so exiting is exact and costs one dispatch per interrupt.
-      [OP.br].concat(leb(exitDepth + 1)),
+      [OP.br].concat(leb(exitDepth + 1 + RAW)),
       [OP.end]
     );
   }
@@ -557,8 +658,9 @@
   // _OUT taken-tail: jump_to(target); last_addr = PC->addr (runtime — PC was
   // set by jump_to); poll gen_interrupt (PC already correct, no recheck —
   // the block exits regardless). targetBytes pushes the i32 target.
-  function emitOutJumpTail(p, targetBytes, exitDepth) {
+  function emitOutJumpTail(p, targetBytes, exitDepth, C) {
     return [].concat(
+      C.storePinned(),              // the caller's C.flush() left only pinned registers unwritten
       storeI32(p.jumpToAddr, targetBytes),
       [OP.i32_const], sleb(p.jumpToFunc), [OP.call_indirect, 0x00, 0x00],
       storeI32(p.lastAddr, loadI32(p.pcGlobal).concat([OP.i32_load, 0x02], leb(p.addrOff))),
@@ -568,7 +670,7 @@
         [OP.i32_const], sleb(p.genInt), [OP.call_indirect, 0x00, 0x00],
       [OP.end],
       bump('#exit:jump_to'),
-      [OP.br].concat(leb(exitDepth))
+      [OP.br].concat(leb(exitDepth + RAW))
     );
   }
 
@@ -604,7 +706,7 @@
         flushed,
         storeI32Const(p.pcGlobal, slow.ptr),
         [OP.i32_const], sleb(slow.opsIdx), [OP.call_indirect, 0x00, 0x00],
-        [OP.br].concat(leb(brDepth)));
+        [OP.br].concat(leb(brDepth + RAW)));
     }
     return [].concat(
       flushed,
@@ -612,9 +714,9 @@
       [OP.i32_const], sleb(opsIdx), [OP.call_indirect, 0x00, 0x00],
       refreshReg >= 0 ? loadI64(p.regBase + refreshReg * 8).concat([OP.local_set], leb(L_REG0 + refreshReg)) : [],
       exitAlways
-        ? [OP.br].concat(leb(brDepth))
+        ? [OP.br].concat(leb(brDepth + RAW))
         : [].concat(loadI32(p.pcGlobal), [OP.i32_const], sleb(instrPtr + p.stride), [OP.i32_ne],
-                    [OP.br_if], leb(brDepth)));
+                    [OP.br_if], leb(brDepth + RAW)));
   }
 
   // ---- native loads & stores ----
@@ -852,7 +954,7 @@
         // set, which only the interpreter does — hand back the whole branch
         storeI32Const(p.pcGlobal, slow ? slow.ptr : instrPtr),
         [OP.i32_const], sleb(slow ? slow.opsIdx : opsIdx), [OP.call_indirect, 0x00, 0x00],
-        [OP.br].concat(leb(exitDepth + 1)),
+        [OP.br].concat(leb(exitDepth + 1 + RAW)),
       [OP.end]
     );
   }
@@ -1189,7 +1291,7 @@
               preFlush,
               storeI32Const(p.pcGlobal, slow ? slow.ptr : instrPtr),
               [OP.i32_const], sleb(slow ? slow.opsIdx : opsIdx), [OP.call_indirect, 0x00, 0x00],
-              [OP.br].concat(leb(exitDepth + 2)));
+              [OP.br].concat(leb(exitDepth + 2 + RAW)));
             var cm = compareNat(p, S, fn, fs, rt, cmpBail);
             if (cm) { fpCmp = true; nat = cm; break; }
           }
@@ -1366,6 +1468,7 @@
     // before loading this script, and it must stay constant for the session
     // (it decides each module's import/type shape)
     if (census.on === null) census.on = !!(typeof window !== 'undefined' && window.__jitCensus);
+    RAW = 0;
     var HEAPU32 = Module.HEAPU32;
     var C = new RegCache(p.reg);
     p.regBase = p.reg;
@@ -1546,6 +1649,11 @@
         else if (ld0.cond !== null && own + 2 < span) wantLabel.push(own + 2);
       }
     }
+    // (d) the instruction after an op that always hands back to the
+    // dispatcher (see alwaysHandsBack) — scanned over the span only
+    for (var hb = 0; hb + 1 < span; hb++) {
+      if (alwaysHandsBack(HEAPU32[srcW + hb])) wantLabel.push(hb + 1);
+    }
     wantLabel.sort(function (a, b) { return a - b; });
     var labels = [];
     for (var lk = 0; lk < wantLabel.length; lk++) {
@@ -1559,6 +1667,45 @@
     for (var lo = 0; lo < nSeg; lo++) labelOrd[labels[lo]] = lo;
     // original interpreter ops at every label, read BEFORE any install
     var labelOps = labels.map(function (x) { return HEAPU32[(p.entryPtr + x * p.stride) >> 2]; });
+    // ---- PINNING (2026-10-01) ----
+    // In the MK64 race window the native back-edge ran 7.4M times and in-span
+    // forward branches 11.3M times per 700 frames (?jit=census), and EVERY
+    // one of them used to flush the dirty registers to reg[] and reload each
+    // one lazily on the far side — a label is a join, and joins were empty.
+    // A register referenced inside a native loop (the instructions from a
+    // backward in-span branch's label target through its delay slot) is
+    // instead PINNED: loaded once in the prologue, kept in its local across
+    // every join, written back on exit (see RegCache.pinned and RAW). The
+    // field decode below over-approximates (a data word or an FP register
+    // field can only add a pin, which costs a prologue load + epilogue store
+    // and never changes what executes). r0 is never pinned.
+    var pins = new Array(32).fill(false), nPins = 0, pinW = new Array(32).fill(false);
+    // OPT-IN (window.__jitPin, 2026-10-01): exact by the unit corpus and the
+    // 27-ROM hashed sweep, but its matched pairs on MK64 were inside the rig's
+    // noise (4x CPU: 0.979 and 1.056 against the unpinned emitter, opposite
+    // signs) — so it does not ship on until a quiet-box pair shows a gain.
+    if (typeof window !== 'undefined' && window.__jitPin) {
+      var refs = new Int32Array(32);
+      for (var pb = 0; pb + 1 < span; pb++) {
+        var pd = decodeBranch(HEAPU32[srcW + pb], (p.vaddr + pb * 4) >>> 0, p);
+        if (!pd || pd.target === null || pd.target < p.blockStart || pd.target >= p.blockEnd) continue;
+        var pt = ((pd.target - p.vaddr) | 0) / 4;
+        if (pt < 0 || pt >= pb || labelOrd[pt] < 0) continue;   // backward to a label, not a self-loop
+        for (var pr = pt; pr <= pb + 1; pr++) gprRefs(HEAPU32[srcW + pr], refs);
+      }
+      refs[0] = 0;
+      var cand = [];
+      for (var rr = 1; rr < 32; rr++) if (refs[rr] >= 2) cand.push(rr);
+      cand.sort(function (a, b) { return refs[b] - refs[a] || a - b; });
+      for (var pc2 = 0; pc2 < cand.length && pc2 < PIN_MAX; pc2++) { pins[cand[pc2]] = true; nPins++; }
+      for (var pw = 0; pw <= span && nPins; pw++) gprWrites(HEAPU32[srcW + pw], pinW);
+    }
+    if (nPins) {
+      C.setPinned(pins, pinW);
+      RAW = 1;
+      stats.pinnedBlocks = (stats.pinnedBlocks || 0) + 1;
+      stats.pinnedRegs = (stats.pinnedRegs || 0) + nPins;
+    }
     var seg = 0;
     EXIT = nSeg; TOP = nSeg - 1;       // segment 0's depths (1 / 0 when nSeg == 1)
     var closedSegs = 0;
@@ -1597,8 +1744,7 @@
         var isOut = dec.target === null || (dec.target < p.blockStart) || (dec.target >= p.blockEnd) || (addr === p.blockEnd - 4);
         // probe the slot with a throwaway cache clone — a rejected probe
         // must leave no compile-state behind
-        var probeC = new RegCache(p.reg);
-        probeC.loaded = C.loaded.slice(); probeC.dirty = C.dirty.slice();
+        var probeC = C.clone();
         if (isIdle) brReason = 'idle';
         else if (emitAlu(slotWord, probeC) !== null) { br = dec; brOut = isOut; }
         else {
@@ -1644,7 +1790,7 @@
               C.flushSnapshot(),
               storeI32Const(p.pcGlobal, instrPtr),
               [OP.i32_const], sleb(HEAPU32[instrPtr >> 2]), [OP.call_indirect, 0x00, 0x00],
-              [OP.br].concat(leb(EXIT + 1)),
+              [OP.br].concat(leb(EXIT + 1 + RAW)),
             [OP.end]);
         }
         var linkRegNo = br.link ? (br.linkReg !== undefined ? br.linkReg : 31) : -1;
@@ -1660,7 +1806,7 @@
             var tb = (br.targetReg !== undefined)
               ? [OP.local_get].concat(leb(L_JT))
               : [OP.i32_const].concat(sleb(br.target | 0));
-            return emitOutJumpTail(p, tb, exitD);
+            return emitOutJumpTail(p, tb, exitD, Cx);
           }
           // in-span label: native. Forward = direct br to that segment's
           // block; backward (incl. the entry) = set L_START, re-dispatch at
@@ -1738,8 +1884,7 @@
             C.flush(),
             [OP.if_, OP.void_]
           ));
-          var Ct = new RegCache(p.reg);
-          Ct.loaded = C.loaded.slice(); Ct.dirty = C.dirty.slice();
+          var Ct = C.clone();
           app(body, [].concat(
             emitSlot(Ct, EXIT + 1),
             emitCountBatch(p, addr),
@@ -1815,8 +1960,9 @@
         // (mi_controller.c:105): either can end the frame without moving PC,
         // so those hand back to the dispatcher unconditionally (see slowArm).
         mayGenInterrupt(word)
-          ? [OP.br].concat(leb(EXIT))
-          : [].concat(loadI32(p.pcGlobal), [OP.i32_const], sleb(nextPtr), [OP.i32_ne, OP.br_if], leb(EXIT))
+          ? [OP.br].concat(leb(EXIT + RAW))
+          : [].concat(loadI32(p.pcGlobal), [OP.i32_const], sleb(nextPtr), [OP.i32_ne, OP.br_if], leb(EXIT + RAW),
+                      C.reloadPinned())   // continuing: the op may have written a pinned register
       ));
       stats.fallbackOps++;
       i++;
@@ -1826,6 +1972,11 @@
       bump('#exit:fallthrough'),
       storeI32Const(p.pcGlobal, p.entryPtr + span * p.stride)
     ));
+    if (C.err.readOnlyWrite >= 0) {
+      stats.fails++;
+      if (stats.fails <= 3) console.error('[bementalJIT] write to read-only pinned r' + C.err.readOnlyWrite, (p.vaddr >>> 0).toString(16));
+      return 0;
+    }
     if (closedSegs !== nSeg - 1) {
       // a label was stepped over — never emit a module with unbalanced blocks
       stats.fails++;
@@ -1889,12 +2040,17 @@
       dispatch = dispatch.concat([OP.local_get], leb(L_START), [OP.br_table], leb(nSeg), tgts, leb(0), [OP.end]);
     }
 
-    var full = [0x0A, 0x02, 0x7F, 0x20, 0x7E, 0x01, 0x7E, 0x01, 0x7F, 0x01, 0x7F, 0x01, 0x7D, 0x01, 0x7C, 0x01, 0x7D, 0x01, 0x7C, 0x01, 0x7F,  // locals: 2xi32, 32xi64 regs, i64 scratch, i32 jump-target, i32 branch-cond, f32+f64 convert scratch (wave 11a), f32+f64 compare operand B (wave 11b), i32 segment start (multi-entry)
-      OP.block, OP.void_]
-      .concat(slotGuard, startPro,
-      [OP.loop, OP.void_])
-      .concat(bump('#block-iter'), dispatch, body,
-      [OP.end, OP.end, OP.end]);
+    var LOCALS = [0x0A, 0x02, 0x7F, 0x20, 0x7E, 0x01, 0x7E, 0x01, 0x7F, 0x01, 0x7F, 0x01, 0x7D, 0x01, 0x7C, 0x01, 0x7D, 0x01, 0x7C, 0x01, 0x7F];  // locals: 2xi32, 32xi64 regs, i64 scratch, i32 jump-target, i32 branch-cond, f32+f64 convert scratch (wave 11a), f32+f64 compare operand B (wave 11b), i32 segment start (multi-entry)
+    var full = RAW
+      // (block $raw  guard  (block $exit  prologue (loop $top ...))  epilogue)
+      // The delay-slot guard sits in $raw so its exit skips the epilogue: it
+      // runs before the prologue, when the pinned locals hold nothing.
+      ? LOCALS.concat([OP.block, OP.void_], slotGuard, [OP.block, OP.void_], startPro, C.reloadPinned(),
+          [OP.loop, OP.void_], bump('#block-iter'), dispatch, body,
+          [OP.end, OP.end], C.storePinned(), [OP.end, OP.end])
+      : LOCALS.concat([OP.block, OP.void_], slotGuard, startPro,
+          [OP.loop, OP.void_], bump('#block-iter'), dispatch, body,
+          [OP.end, OP.end, OP.end]);
 
     // census adds one imported host func "e"."c" (type 1: (i32)->()), which
     // takes function index 0 and pushes the defined block function to 1

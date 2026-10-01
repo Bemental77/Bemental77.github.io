@@ -32,7 +32,7 @@
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-const SRCFILE = process.argv[2] || new URL('../n64/bementalJIT/mips_emit.js', import.meta.url).pathname;
+const SRCFILE = process.argv.slice(2).find((a) => !a.startsWith('--')) || new URL('../n64/bementalJIT/mips_emit.js', import.meta.url).pathname;
 const src = fs.readFileSync(SRCFILE, 'utf8');
 
 // --- synthetic guest layout (byte addresses inside the fake linear memory) ---
@@ -130,9 +130,23 @@ function makeWorld(words, opts = {}) {
       ...sec(10, [1, ...leb(nb.length), ...nb])]));
     table.set(7, new WebAssembly.Instance(nm, {}).exports.f);
   }
+  // table[6] = an interpreter op that WRITES a guest register through reg[]
+  // (reg[incReg] += 1, then PC += STRIDE), installed at the span indices in
+  // opts.opsAt. Pinning's contract: reg[] is current BEFORE the op runs (the
+  // op reads it) and the local is re-synced AFTER (the op wrote it).
+  if (opts.incReg !== undefined) {
+    const ra = leb(REG + opts.incReg * 8);
+    const ib = [0x00, 0x41, 0x00, 0x41, 0x00, 0x29, 0x03, ...ra, 0x42, 0x01, 0x7c, 0x37, 0x03, ...ra,
+                0x41, 0x00, 0x41, 0x00, 0x28, 0x02, ...leb(PCG), 0x41, STRIDE, 0x6a, 0x36, 0x02, ...leb(PCG), 0x0b];
+    const im = new WebAssembly.Module(new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
+      ...sec(1, [1, 0x60, 0, 0]), ...sec(2, [1, 1, 0x65, 1, 0x6d, 0x02, 0x00, 0x00]),
+      ...sec(3, [1, 0]), ...sec(7, [1, 1, 0x66, 0x00, 0x00]), ...sec(10, [1, ...leb(ib.length), ...ib])]));
+    table.set(6, new WebAssembly.Instance(im, { e: { m: mem } }).exports.f);
+  }
 
   for (let i = 0; i < words.length; i++) HEAPU32[(SRC >> 2) + i] = words[i] >>> 0;
   for (let i = 0; i < words.length + 4; i++) HEAPU32[(ENTRY + i * STRIDE) >> 2] = 1;
+  for (const [i, v] of Object.entries(opts.opsAt || {})) HEAPU32[(ENTRY + (+i) * STRIDE) >> 2] = v;
   // recompile_block's calloc'd tail: a span that runs past its page ends on an
   // entry the compile never wrote (see PAGE-END TRUNCATION in the emitter)
   if (opts.nullOpsFrom !== undefined) for (let i = opts.nullOpsFrom; i < words.length + 4; i++) HEAPU32[(ENTRY + i * STRIDE) >> 2] = 0;
@@ -192,9 +206,12 @@ function makeWorld(words, opts = {}) {
   return { mem, table, HEAPU32, REG64, p };
 }
 
-function loadEmitter() {
+// `--pin` runs the WHOLE corpus with register pinning on (window.__jitPin);
+// cases that pin opts.pin themselves. CI should run it both ways.
+const PIN_ALL = process.argv.includes('--pin');
+function loadEmitter(pin) {
   const sb = { WebAssembly, console: { error() {}, log() {}, warn() {} }, Uint32Array, Object, Array, Math, String };
-  sb.window = sb; vm.createContext(sb); vm.runInContext(src, sb);
+  sb.window = sb; sb.__jitPin = !!(pin || PIN_ALL); vm.createContext(sb); vm.runInContext(src, sb);
   return sb.bementalMips;
 }
 
@@ -204,7 +221,7 @@ function T(name, words, { regs = {}, dram = {}, expectRegs = {}, expectDram = {}
                           expectFprI32 = {}, expectFprI64 = {}, expectFprF32 = {}, expectFprF64 = {},
                           expectRefused = false, expectPC = null, expectLastAddr = null, expectCount = null,
                           lastAddr = null, enterAt = 0 }) {
-  const bm = loadEmitter();
+  const bm = loadEmitter(opts.pin);
   const { mem, table, HEAPU32, REG64, p } = makeWorld(words, opts);
   const DV = new DataView(mem.buffer);
   HEAPU32[FCR31A >> 2] = fcr31 >>> 0;
@@ -356,6 +373,14 @@ const tests = [
   // MTC0 runs gen_interrupt inline (Count/Status): its fallback hands back too
   T('MTC0 fallback hands back to the dispatcher', [MTC0(8, 12), I(OPC.ADDIU, 0, 9, 5), 0],
     { expectRegs: { 9: '0x0' }, expectPC: ENTRY + STRIDE }),
+  // ...and the op after it is a LABEL, so the dispatcher's next PC->ops()
+  // re-enters native code instead of interpreting the rest of the span
+  T('the op after an MTC0 fallback is an enterable label', [MTC0(8, 12), I(OPC.ADDIU, 0, 9, 5), 0],
+    { enterAt: 1, expectRegs: { 9: '0x5' }, expectStats: { labelEntries: 1 } }),
+  T('SWL fallback hands back; the next op is an enterable label', [I(0x2a, 4, 8, 0x18), I(OPC.ADDIU, 0, 9, 7), 0],
+    { expectRegs: { 9: '0x0' }, expectPC: ENTRY + STRIDE, expectStats: { labelEntries: 1 } }),
+  T('control: a native SW adds no label after itself', [I(OPC.SW, 4, 8, 0x18), I(OPC.ADDIU, 0, 9, 5), 0],
+    { regs: { 4: HIT_ADDR }, opts: { rdramHit: true }, expectRegs: { 9: '0x5' }, expectStats: { labelEntries: undefined } }),
   T('control: a LOAD slow arm still continues in-block', [I(OPC.LW, 4, 8, 0x18), I(OPC.ADDIU, 0, 9, 5), 0],
     { regs: { 4: SLOW_ADDR }, expectRegs: { 9: '0x5' } }),
   // controls: the fast arm was always correct and must stay so
@@ -940,6 +965,64 @@ function cacheCase(name, mutate, wantHit) {
     if (r2 !== 2n || r3 !== want3) bad.push(`r2=${r2} r3=${r3}`);
   }
   return { name, ok: bad.length === 0, detail: bad.join('; ') };
+}
+// ---- PINNING (2026-10-01): registers referenced inside a native loop live in
+// their locals across the back-edge; reg[] is written on exit / before calls.
+{
+  const ADDIU = (rt, rs, imm) => I(OPC.ADDIU, rs, rt, imm);
+  const BNE = (rs, rt, off) => I(OPC.BNE, rs, rt, off);
+  const LWL = (rt, rs, imm) => I(0x22, rs, rt, imm);
+  // pinning is OPT-IN (window.__jitPin): every case here turns it on
+  const TP = (n, w, c) => T(n, w, { ...c, opts: { ...(c.opts || {}), pin: true } });
+  // 0 r8++ | 1 r11++ <- loop | 2 bne r8,r10,1 | 3 (slot) r8++ | 4 nop
+  const loop = [ADDIU(8, 8, 1), ADDIU(11, 11, 1), BNE(8, 10, -2), ADDIU(8, 8, 1), 0];
+  tests.push(
+    TP('pinning: a counted loop runs natively and writes its pinned registers back on exit', loop,
+      // BNE tests r8 BEFORE its slot increments it: r8 at the branch runs 1..7
+      { regs: { 10: '0x7' }, expectRegs: { 8: '0x8', 11: '0x7', 10: '0x7' }, expectPC: ENTRY + 5 * STRIDE,
+        expectStats: { pinnedBlocks: 1, pinnedRegs: 2 } }),
+    // the gen_interrupt poll on the first back-edge exits RAW — reg[] must
+    // already hold the pinned values (flushAll before the call)
+    TP('pinning: an interrupt exit on the back-edge leaves reg[] current', loop,
+      { regs: { 10: '0x7' }, opts: { nextInt: 0, genIntNoop: true }, expectRegs: { 8: '0x2', 11: '0x1' } }),
+    // a block entered as a DELAY SLOT runs one op and must NOT run the
+    // epilogue: the pinned locals were never loaded (they hold zero)
+    TP('pinning: the delay-slot entry guard exits before the epilogue', loop,
+      { regs: { 8: '0x55', 11: '0x66', 10: '0x7' }, opts: { inDelaySlot: true }, expectRegs: { 8: '0x55', 11: '0x66' } }),
+    // an interpreter op inside the loop READS and WRITES pinned r8 through
+    // reg[]: 0 r8++ | 1 r11++ <- | 2 LWL (op: reg[8]++) | 3 bne r8,r10 | 4 nop
+    TP('pinning: an interpreter op inside the loop sees and updates a pinned register',
+      [ADDIU(8, 8, 1), ADDIU(11, 11, 1), LWL(12, 8, 0), BNE(8, 10, -3), 0, 0],
+      { regs: { 10: '0x7' }, opts: { incReg: 8, opsAt: { 2: 6 }, nextInt: 400 },
+        expectRegs: { 8: '0x7', 11: '0x6' }, expectStats: { pinnedBlocks: 1 } }),
+    // a slow STORE hands back RAW mid-loop: reg[] must hold the value the
+    // loop computed before it
+    TP('pinning: a slow store exit mid-loop leaves reg[] current',
+      [ADDIU(8, 8, 1), ADDIU(11, 11, 1), I(OPC.SW, 4, 11, 0x18), BNE(8, 10, -3), ADDIU(8, 8, 1), 0],
+      { regs: { 4: SLOW_ADDR, 10: '0x7' }, expectRegs: { 8: '0x1', 11: '0x1' }, expectPC: ENTRY + 3 * STRIDE,
+        expectStats: { pinnedBlocks: 1 } }),
+    // a loop exit through an OUT jump (JR inside the loop) stores before jump_to
+    TP('pinning: a JR out of the loop leaves reg[] current',
+      // 0 r8++ | 1 r11++ <- | 2 bne r8,r10,1 | 3 (slot) r8++ | 4 jr $ra | 5 (slot) r11 += 0x10
+      [ADDIU(8, 8, 1), ADDIU(11, 11, 1), BNE(8, 10, -2), ADDIU(8, 8, 1), R(31, 0, 0, 0, 0x08), ADDIU(11, 11, 0x10), 0],
+      { regs: { 10: '0x3', 31: '0x80200000' }, expectRegs: { 8: '0x4', 11: '0x13' }, expectStats: { pinnedBlocks: 1 } }),
+    // an op that WRITES a pinned register and then hands back must exit RAW:
+    // the epilogue would store the stale local over the op's result
+    TP('pinning: a hand-back after an op that wrote a pinned register skips the epilogue',
+      [ADDIU(8, 8, 1), ADDIU(11, 11, 1), MTC0(8, 12), BNE(8, 10, -3), 0, 0],
+      { regs: { 10: '0x7' }, opts: { incReg: 8, opsAt: { 2: 6 } }, expectRegs: { 8: '0x2', 11: '0x1' },
+        expectPC: ENTRY + 3 * STRIDE, expectStats: { pinnedBlocks: 1 } }),
+    // a READ-ONLY pinned register (no native write in the span) is never
+    // stored back, so an interpreter op that changes it in reg[] must win:
+    // 0 r8++ | 1 r11++ <- | 2 LWL r12,0(r10) (op: reg[10]++) | 3 bne r10,r9 | 4 nop
+    TP('pinning: a read-only pinned register follows reg[] across an interpreter op',
+      [ADDIU(8, 8, 1), ADDIU(11, 11, 1), LWL(12, 10, 0), BNE(10, 9, -3), 0, 0],
+      { regs: { 9: '0x5' }, opts: { incReg: 10, opsAt: { 2: 6 }, nextInt: 400 },
+        expectRegs: { 10: '0x5', 11: '0x5', 8: '0x1' }, expectStats: { pinnedBlocks: 1, pinnedRegs: 2 } }),
+    // control: no backward branch, no pins — the pre-pinning shape
+    TP('control: a span with no loop pins nothing', [ADDIU(8, 8, 1), ADDIU(8, 8, 1), 0],
+      { expectRegs: { 8: '0x2' }, expectStats: { pinnedBlocks: undefined } }),
+  );
 }
 tests.push(cacheCase('recompile of an IDENTICAL span re-installs the cached instance (entry + labels)', () => {}, true));
 tests.push(cacheCase('control: one changed page word MISSES the cache', (w) => { w.HEAPU32[(SRC >> 2) + 5] = I(OPC.ADDIU, 0, 3, 9); }, false));

@@ -129,9 +129,38 @@ mergeInto(LibraryManager.library, {
         if (typeof log === 'function') log(msg);
         else if (typeof console !== 'undefined' && console.log) console.log(msg);
       } catch (e) {}
+    } else if (name === 0x1F00) {     // GL_VENDOR
+      // MALI DETECTION FROM THE UNMASKED STRINGS (2026-10-01). findGLVersion()
+      // sets `gl.mali = !stricmp(vendor, "arm")`, but WebGL's GL_VENDOR is the
+      // MASKED string — "WebKit" on Chrome — so gl.mali was false on EVERY
+      // device, including a real Mali-G715 phone whose unmasked renderer reads
+      // "ANGLE (ARM, Mali-G715, OpenGL ES 3.2)". Native Flycast on that phone
+      // sees the driver's own GL_VENDOR, which is "ARM". So: when
+      // WEBGL_debug_renderer_info says the GPU is ARM/Mali, answer exactly
+      // "ARM" (what the native driver says and the one value the stricmp
+      // matches); otherwise keep the masked string, byte-for-byte as before.
+      //
+      // WHAT IT CHANGES: only gl.mali. In the GLES renderer this build runs
+      // (RETRO_ENVIRONMENT_GET_VARIABLE answers false, so the OIT/gl4 renderer
+      // is never selected), gl.mali has no reader — core/rend/gles allocates
+      // GL_DEPTH24_STENCIL8 on GLES3 unconditionally (gltex.cpp). It matters
+      // only to the gl4/OIT path, which picks GL_DEPTH24_STENCIL8 on Mali
+      // instead of GL_DEPTH32F_STENCIL8 — the upstream choice for that GPU.
+      var v = ctx ? (ctx.getParameter(name) || '') : '';
+      try {
+        var dbg = ctx && ctx.getExtension('WEBGL_debug_renderer_info');
+        if (dbg) {
+          var uv = String(ctx.getParameter(dbg.UNMASKED_VENDOR_WEBGL) || '');
+          var ur = String(ctx.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '');
+          if (/\bmali\b/i.test(ur) || /\bmali\b/i.test(uv) || /^\s*arm\s*$/i.test(uv) ||
+              /^ANGLE \(ARM,/i.test(ur)) v = 'ARM';
+        }
+      } catch (e) { /* keep the masked vendor */ }
+      str = v;
     } else {
-      // GL_VENDOR (0x1F00) / GL_RENDERER (0x1F01) are valid WebGL getParameter
-      // pnames and are left exactly as they were — deliberately NOT swapped for
+      // GL_RENDERER (0x1F01) is a valid WebGL getParameter pname and is left
+      // exactly as it was. (GL_VENDOR is handled above.) Historical note — this
+      // used to apply to GL_VENDOR as well, deliberately NOT swapped for
       // the WEBGL_debug_renderer_info unmasked strings. findGLVersion() derives
       // `gl.mali = !stricmp(vendor, "arm")` from GL_VENDOR, and
       // core/rend/gl4/gldraw.cpp switches the depth-stencil format on that flag
