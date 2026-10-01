@@ -17,6 +17,7 @@
        so the page that used to be player 2's whole machine is gone and this
        page is the only page. The file itself still exists because n64/index.html
        has not been converted yet; nothing here routes to it. -->
+  <script src="/lib/cart_audio.js?v=6f95e7c9"></script>
   <script src="/lib/netplay.js?v=7c74eeaa"></script>
   <meta charset="UTF-8" />
   <title>Genesis Wasm</title>
@@ -1133,11 +1134,34 @@
   }
 
   var accum = 0, lastTs = 0;
+  // THE GUEST CLOCK IS NOT THE DISPLAY'S. tick() used to run only from
+  // requestAnimationFrame, so the guest advanced only when the compositor
+  // produced a frame — and a phone's compositor does not promise 60 Hz
+  // (low-power mode runs rAF at 30; a busy GPU or throttled tab delivers ticks
+  // 60-100 ms apart), and each tick past the 100 ms clamp, or past
+  // MAX_CATCHUP_FRAMES, dropped the rest of its time. Measured on the mobile
+  // profile (tools/netplay_device_matrix.mjs, 2026-10-01): rAF at 7-55/s.
+  // SOLO, a timer woken when the next frame is due now also calls tick(), so
+  // the guest keeps the wall clock whenever the CPU has room; rAF still calls
+  // it too. Both use performance.now() against ONE accumulator, so whichever
+  // comes second in a frame period finds no credit: exactly 1.000x, never
+  // faster (gate #9), and a late tick's debt is still dropped, never repaid.
+  // IN A ROOM nothing changes: the timer stands down and tick() keeps the rAF
+  // timestamps the lockstep/rollback pacing was built and measured on.
   function loop(ts) {
     requestAnimationFrame(loop);
+    tick(LS.armed ? ts : performance.now());
+  }
+  function timerTick() {
+    var solo = running && !LS.armed;
+    if (solo) tick(performance.now());
+    setTimeout(timerTick, solo ? Math.max(1, FRAME_MS - accum) : 50);
+  }
+  function tick(ts) {
     if (!running) { lastTs = 0; return; }
     if (!lastTs) { lastTs = ts; accum = 0; return; }
     var d = ts - lastTs; lastTs = ts;
+    if (d < 0) d = 0;
     if (d > 100) d = 100;          // a long stall must not fast-forward the guest
     // ROLLBACK, ADAPTIVE ROOM (lib/netplay.js, the ADAPTIVE ROOM block): the
     // engine may hand back a credit multiplier just under 1 while this console
@@ -1199,6 +1223,7 @@
     // wall-clock milliseconds did not happen for the guest, so they are gone
     // rather than owed.
     if (accum > FRAME_MS) accum = FRAME_MS;
+    sndDrain();
     if (ran && !rejoining) draw();
     if (NET.session) netHudTick(ts);
     if (!lastFpsAt) lastFpsAt = ts;
@@ -1210,34 +1235,39 @@
     }
   }
   requestAnimationFrame(loop);
+  setTimeout(timerTick, 16);
 
   // ── audio ─────────────────────────────────────────────────────────────────
+  // Everything the core queued this tick, once. Runs AFTER loop()'s frames, so
+  // a rollback's re-simulated and a hidden frame's samples have already been
+  // rewound out of the ring (gpx_audio_rewind, rbRunFrame) and are never
+  // played. Drained even when muted so the core's ring never backs up.
+  var audioSink = null;
+  function sndDrain() {
+    if (!running || !wasmReady || !Module._gpx_audio_read) return;
+    for (var k = 0; k < 4; k++) {
+      var got = Module._gpx_audio_read(8192);
+      if (!got) break;
+      if (audioSink && !muted) audioSink.push(new Float32Array(Module.HEAPF32.buffer, Module._gpx_audio_buf(), got * 2), got);
+      if (got < 8192) break;
+    }
+  }
   function initAudio() {
     if (audioCtx) { if (audioCtx.state !== 'running') audioCtx.resume().catch(() => {}); return; }
     var AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return;
     try { audioCtx = new AC({ sampleRate: SND_RATE, latencyHint: 'playback' }); }
     catch (e) { try { audioCtx = new AC(); } catch (e2) { return; } }
-    var sp = audioCtx.createScriptProcessor(SND_BLOCK, 0, 2);
-    // One resampling path for every device. `step` is 1.0 when the context
-    // honoured the 44.1 kHz request and ~0.919 when it forced 48 kHz (some
-    // Safari builds), so a browser that ignores sampleRate gets correct PITCH
-    // rather than a game running a tenth too fast.
-    sp.onaudioprocess = function (ev) {
-      var oL = ev.outputBuffer.getChannelData(0), oR = ev.outputBuffer.getChannelData(1);
-      var n = oL.length;
-      if (!running || muted || !wasmReady) { oL.fill(0); oR.fill(0); return; }
-      var step = SND_RATE / audioCtx.sampleRate;
-      var got = Module._gpx_audio_read(Math.ceil(n * step) + 1);
-      if (!got) { oL.fill(0); oR.fill(0); return; }
-      var buf = new Float32Array(Module.HEAPF32.buffer, Module._gpx_audio_buf(), got * 2);
-      for (var i = 0; i < n; i++) {
-        var idx = Math.min(got - 1, (i * step) | 0);
-        oL[i] = buf[idx * 2];
-        oR[i] = buf[idx * 2 + 1];
-      }
-    };
-    sp.connect(audioCtx.destination);
+    // ⚠ THE SINK NO LONGER PULLS FROM THE CORE. This was a main-thread
+    // ScriptProcessor reading gpx_audio_read() on the AUDIO clock, so every
+    // main-thread task longer than its 46 ms block (an emulated frame on a
+    // phone, a paint, a touch handler) starved the device, and a short read
+    // was padded by HOLDING THE LAST SAMPLE — an audible gap that is not a
+    // zero-hole, so nothing counted it. Now sndDrain() hands every sample the
+    // guest made to an AudioWorklet (lib/cart_audio.js) right after the frames
+    // that made them; the worklet plays them off the main thread and counts
+    // every real gap (window.__cartAudio).
+    audioSink = window.CartAudio ? window.CartAudio.create(audioCtx, { srcRate: SND_RATE, targetMs: 80, maxMs: 400, page: 'genesis' }) : null;
     audioCtx.resume().catch(() => {});
   }
   document.addEventListener('click', function () { if (!muted && audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {}); });

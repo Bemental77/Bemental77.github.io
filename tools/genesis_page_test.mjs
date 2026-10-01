@@ -174,8 +174,12 @@ async function arm(view, label, romIdx) {
     // The ring only fills from retro_run's audio_batch_cb, so a non-zero
     // reading proves the core's sound path ran, not merely that a context
     // exists. Headless Chrome may never drain it, so this asserts production.
-    const aud = await page.evaluate(() => Module._gpx_audio_avail());
-    rec(armName, 'audio-produced', aud > 0, `${aud} stereo frames queued (44100 Hz)`);
+    // The page now drains the ring into its AudioWorklet sink after every tick
+    // (genesis.html sndDrain -> lib/cart_audio.js), so the ring itself reads ~0
+    // in steady state: production is what the sink was HANDED (rxFrames) plus
+    // whatever is still queued in the ring.
+    const aud = await page.evaluate(() => (window.__cartAudio ? window.__cartAudio.rxFrames : 0) + Module._gpx_audio_avail());
+    rec(armName, 'audio-produced', aud > 0, `${aud} stereo frames produced (44100 Hz; sink rx + ring)`);
 
     // ── PORTRAIT IS DELIBERATELY NOT PLAYABLE ─────────────────────────────
     // #rotateHint is a full-screen overlay this page raises while a game is
