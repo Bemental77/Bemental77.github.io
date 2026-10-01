@@ -2298,7 +2298,7 @@ N64Rate.selfTest = function (logFn) {
   // MUST run several times a second — see N64Rate.AUDIO_MAX_GAP_MS.
   setInterval(function () {
     if (!running || !window.Module || !Module._neilGetAudioWritePosition) return;
-    try { rate.audioSample(Module._neilGetAudioWritePosition(), performance.now()); } catch (e) {}
+    try { rate.audioSample((Module._neilGetAudioWritePosition() - AUD_DROPPED + 64000) % 64000, performance.now()); } catch (e) {}
   }, 200);
 
   function paintRate() {
@@ -3814,9 +3814,16 @@ N64Rate.selfTest = function (logFn) {
   // ScriptProcessor path (no AudioWorklet) has no pump to drain, so a re-run
   // there skips from wherever it had read to — a short gap, never a repeat.
   function audioFlushNow() { try { var a = window.myApp; if (a && a.__n64AudioPump) a.__n64AudioPump(); } catch (e) {} }
+  // Samples dropped this way, in ring entries: the rate meter's audio witness
+  // reads the core's write position, and re-simulated / hidden frames move it
+  // without one sample of them being played — so they are subtracted
+  // (MEASURED before this: a rollback room at 0.935x read "speed 1.276x").
+  var AUD_DROPPED = 0;
   function audioDropNow() {
     try {
       var a = window.myApp; if (!a) return;
+      if (window.Module && Module._neilGetAudioWritePosition && typeof a.audioReadPosition === 'number')
+        AUD_DROPPED = (AUD_DROPPED + ((Module._neilGetAudioWritePosition() - a.audioReadPosition + 64000) % 64000)) % 64000;
       if (a.__n64AudioDrop) a.__n64AudioDrop();
       else if (window.Module && Module._neilGetAudioWritePosition) a.audioReadPosition = Module._neilGetAudioWritePosition();
     } catch (e) {}
