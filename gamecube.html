@@ -27,6 +27,7 @@
        shared lobby; it renders nothing at all when Netplay.supported() is false. -->
   <script src="/lib/netplay.js?v=62adf4e4"></script>
   <script src="/lib/netplay-ui.js?v=66f15769"></script>
+  <script src="/lib/mpgames.js"></script>
   <script>
     // NEVER PRESENT AN ENABLED START BEHIND A BROKEN PATH.
     // Measured on a desktop profile with no WebGPU adapter: this page logged
@@ -7625,7 +7626,11 @@ window.GcRate = (function () {
   document.addEventListener('touchstart', function (e) { if (e.target.closest('.faceBtn, .shoulderBtn, .dpadV, .dpadH, .sysBtn, .menuBtn')) {} }, { passive: true });
 
   // ===========================================================================
-  // ONLINE PLAY — REMOVED, AND NOT REPLACED YET. THIS IS DELIBERATE.
+  // ONLINE PLAY ON THE JIT PATH — REMOVED, AND NOT REPLACED YET. THIS IS DELIBERATE.
+  //
+  // (Mario Party 4 HAS online rooms: it runs on the RECOMP engine, which has a real frame
+  // boundary — see THE LOCKSTEP INTERLOCK in the recomp block further down. Everything in this
+  // note is about the OTHER titles, which run on this, the JIT path.)
   //
   // ⚠ STREAMING IS CANCELLED (user directive 2026-09-08: "WE WILL NOT USE
   // STREAMING", "IT WILL BE AS IF MULTIPLAYER ARE ON THE SAME CONSOLE"). What
@@ -7680,16 +7685,25 @@ window.GcRate = (function () {
   // The test seam is KEPT so the standing rigs and the device matrix get a
   // truthful answer instead of a missing symbol, and so nothing can quietly
   // reintroduce streaming without this reading 'none'.
+  // ⚠ THIS USED TO REPORT supported:false / lockstep:false for the whole console, written when
+  // the JIT path was the only one. Mario Party 4's rooms run on the recomp engine (the recomp
+  // block's THE LOCKSTEP INTERLOCK), so the seam now says what a room on this page actually is,
+  // and keeps the JIT-path reason for the titles that still cannot have one.
   window.__gcNet = function () {
+    var g = null; try { g = (typeof window.__gcLockstep === 'function') ? window.__gcLockstep() : null; } catch (e) {}
     return {
-      supported: false,
-      architecture: 'none',
+      supported: !!(window.Netplay && window.Netplay.supported()),
+      architecture: 'lockstep',
       streaming: false,          // cancelled; not reachable from this page
-      lockstep: false,           // not yet possible — see the block comment above
-      why: 'Online play needs a one-emulated-frame boundary this console does not have on its '
-         + 'shipping path: under emscripten dual-core, retro_run advances no guest CPU cycles '
-         + '(DolphinLibretro/Main.cpp:434-464) and the CPU runs free on its own pthread, so a '
-         + 'frame gate would hold the picture while the guests diverged.',
+      lockstep: true,            // on the recomp engine — Mario Party 4 (lib/mpgames.js ROOMABLE)
+      engine: 'recomp',
+      titles: ['Mario Party 4'],
+      gated: !!(g && g.gated), running: !!(g && g.running),
+      why: 'Rooms run on the recomp engine (Mario Party 4), where one frame credit is exactly one '
+         + 'guest frame with the agreed input latched before it. The other titles run on the JIT '
+         + 'path, which has no one-emulated-frame boundary: under emscripten dual-core, retro_run '
+         + 'advances no guest CPU cycles (DolphinLibretro/Main.cpp:434-464) and the CPU runs free '
+         + 'on its own pthread, so a frame gate there would hold the picture while the guests diverged.',
       rom: (function () { var sel = $('romSelect'); return sel ? sel.value : null; })(),
       // The party (the recomp block's room, gamecube.html gcNetParty): the one online path this
       // page has. Null until that block has run; it is a separate script and defines the global.
@@ -8061,7 +8075,7 @@ window.GcRate = (function () {
   // and run the game. Nothing is streamed and nothing but pad bytes crosses the wire.
   // It is mounted HERE, outside engine(), so the button exists on a plain visit before any
   // disc has been fetched; see the GCROOM note inside engine().
-  var GCROOM = { session: null, role: null };
+  var GCROOM = { session: null, role: null, startedByRoom: false };
   // ---- ?np=<CODE>&game=<label>[&join=1]: HANDED OVER FROM THE LOBBY ----------------------
   // multiplayer.html mints ONE code and sends every player to this page with it in the URL;
   // under lockstep the joiner runs a core too, so both sides arrive here. dreamcast.html and
@@ -8135,17 +8149,42 @@ window.GcRate = (function () {
       return 'Start is held on this device (' + (b.getAttribute('data-cap-blocked') || b.title || 'disabled') +
              ') — the room will not press through it';
     if (window.__gcStartedAtMs) return null;                       // already running
+    GCROOM.startedByRoom = true;
     if (mobileUp && typeof PointerEvent === 'function')
       b.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
     else b.click();
     return null;
   }
+  // ⚠ A ROOM IS ALWAYS MARIO PARTY 4, WHATEVER THIS CONSOLE HAD SELECTED. The room's game id is
+  // fixed ('MarioParty4', see the hand-off note above) because the recomp frame gate is the only
+  // one GameCube has. A player who joined by typing a code with Sonic or PSO still selected used
+  // to press Start on THAT disc: it routed to the JIT, no gate ever armed, the barrier waited on
+  // this console forever, and this player sat in a solo game of something else. Select the
+  // room's game before pressing Start — by label, through 'change', exactly as the hand-off does.
+  function gcNetPinRoomGame() {
+    var selects = [document.getElementById('romSelect'), document.getElementById('mobileRomSelect')].filter(Boolean);
+    selects.forEach(function (s) {
+      for (var oi = 0; oi < s.options.length; oi++) {
+        if (s.options[oi].textContent !== 'Mario Party 4') continue;
+        if (s.value !== s.options[oi].value) { s.value = s.options[oi].value; s.dispatchEvent(new Event('change')); }
+        break;
+      }
+    });
+  }
   function gcNetOnReady(session, role) {
     GCROOM.session = session; GCROOM.role = role;
     console.log('[gc-lockstep] room formed, role=' + role + ' — loading the disc on this machine; ' +
                 'the barrier holds frame 0 until every seated player has it');
+    if (!window.__gcStartedAtMs) gcNetPinRoomGame();
     var held = null;
-    try { held = gcNetPressStart(); } catch (e) { held = 'could not start the disc: ' + e; }
+    // ⚠ A CONSOLE THAT ALREADY STARTED SOLO CANNOT JOIN THE ROOM'S FRAME 0. The gate arms only
+    // between the recomp's boot and its first frame credit, so a game already running here can
+    // never be the room's; the barrier would wait on this console with nothing said.
+    var gNow = null; try { gNow = window.__gcLockstep ? window.__gcLockstep() : null; } catch (e) {}
+    if (window.__gcStartedAtMs && !GCROOM.startedByRoom && !(gNow && gNow.gated))
+      held = 'This console already started a solo game, so it cannot join the room at frame 0 — ' +
+             'reload the page and join with the code ' + session.code + '.';
+    else try { held = gcNetPressStart(); } catch (e) { held = 'could not start the disc: ' + e; }
     GCPARTY.held = held;
     if (held) console.log('[gc-lockstep] ' + held);
     gcNetPartySync();
@@ -8280,9 +8319,17 @@ window.GcRate = (function () {
     return rows;
   }
   function gcNetPartySentence(rows, g, bar, code) {
+    // (The common cause, measured: the recomp is built with only four of MP4's overlays — title/
+    // boot, mode select, Party-Mode setup and the first board — so the first minigame or event
+    // scene a board asks for has nothing to run. tools/undelivered.mjs names it.)
+    if (window.__gcTrap) return '⚠ The game stopped at frame ' + window.__gcTrap.at + ' — the Mario Party 4 port reached a part ' +
+                                'of the game it cannot run yet (' + window.__gcTrap.txt.slice(0, 70) + '). Every console in the ' +
+                                'room runs the same frames, so they all stop here; the room did not fail. Reload to play again.';
     if (g && g.running) return 'Playing — everyone started together at frame ' + g.startFrame + '.';
     if (g && g.fault && !g.gated) return '⚠ ' + g.fault;     // a genuine refusal keeps its sentence
     if (GCPARTY.held) return GCPARTY.held;
+    // the room's memory card is being agreed (or failed its check) — say so, not a silent wait
+    if (g && g.card && g.card.why && !g.gated) return g.card.why;
     var seated = rows.filter(function (r) { return r.state !== 'open'; });
     if (seated.length < 2 || (bar && bar.alone))
       return 'Waiting for another player — share the code ' + code + '. Starts by itself once two are in and loaded.';
@@ -8434,6 +8481,19 @@ window.GcRate = (function () {
       }
       var ui = NetplayUI.mount(mountOpts);
       if (ui && ui.supported && typeof ui.setRows === 'function') GCPARTY.ui = ui;   // a cached pre-party component has none
+      // THE PARTY IS OFFERED ONLY FOR A TITLE THAT CAN RUN A ROOM (lib/mpgames.js): Mario Party 4.
+      // Sonic and PSO have multiplayer modes but run on the JIT, which has no frame boundary to
+      // hold a room on; 240pSuite is single-player. Inside a room the room's game is MP4 whatever
+      // the select says (gcNetPinRoomGame), so the control is never taken away from a player who
+      // needs it to Leave.
+      var npb = document.querySelector('.np-btn');
+      if (npb && window.MPGames) {
+        if (!npb.id) npb.id = 'gcPartyBtn';
+        MPGames.gateParty('gamecube', [npb.id], ['romSelect', 'mobileRomSelect'], function (sel) {
+          if (GCROOM.session) return 'Mario Party 4';
+          return sel.selectedIndex >= 0 ? sel.options[sel.selectedIndex].textContent : null;
+        });
+      }
     } catch (e) { console.log('[gc-lockstep] lobby did not mount: ' + e); }
   }
   gcNetMount();
@@ -8670,6 +8730,7 @@ window.GcRate = (function () {
     });
   }
   function cardImport(file) {
+    if (GCCARD.state !== 'idle') { cardSay('not while in a room — every console must keep the card the room agreed'); return; }
     file.arrayBuffer().then(function (buf) {
       if (buf.byteLength !== CARD_BYTES) {
         cardSay('rejected: ' + buf.byteLength + ' bytes — a 251-block .raw is exactly ' + CARD_BYTES);
@@ -8876,6 +8937,8 @@ window.GcRate = (function () {
   }
 
   function stSendState(bytes) {
+    // A state loaded on ONE console of a room forks it from every other console.
+    if (GCLS.armed) return Promise.resolve({ ok: false, msg: 'not while in a room — loading a state on one console would fork the game for everyone' });
     var chk = stCheckContainer(bytes);
     if (!chk.ok) return Promise.resolve(chk);
     return new Promise(function (res) {
@@ -9209,6 +9272,9 @@ window.GcRate = (function () {
     ports: null,         // the seats this machine holds, from the roster
     declared: false,     // setReady() went through — this console's own, automatic, "ready"
     startFrame: -1,      // the engine frame the gate engaged at; -1 until it has
+    buildTag: null,      // the recomp build the worker instantiated (its 'build' message)
+    runMs: 0, waitInputMs: 0, waitWorkerMs: 0, lastStepAt: 0,   // see WHERE THE TIME GOES in gcLsStep
+    wantDeclare: false,  // armed and waiting only for buildTag before declaring
   };
   function gcLsSay(t) { try { console.log('[gc-lockstep] ' + t); } catch (e) {} }
   function gcLsEngine() {
@@ -9223,7 +9289,15 @@ window.GcRate = (function () {
     try { for (var i = 0; i < ls.roster.length; i++) if (ls.roster[i] != null) n++; } catch (e) {}
     return Math.max(1, Math.min(PAD_PORTS, n));
   }
-  function gcLsDisc() { return (window.__romBase || 'MarioParty4'); }
+  // THE DISC TAG THE BARRIER COMPARES: the game, this page's room protocol, the recomp BUILD the
+  // worker actually instantiated (wasm + glue + worker source, hashed by the worker) and the CARD
+  // this console booted (gcLsAgreeCard). Every one of those is something two consoles must share
+  // to run the same simulation, and the barrier refuses a room whose tags differ — by name.
+  var GC_ROOM_PROTO = 2;
+  function gcLsDisc() {
+    return (window.__romBase || 'MarioParty4') + '#p' + GC_ROOM_PROTO +
+           (GCLS.buildTag ? '#b:' + GCLS.buildTag : '') + (GCCARD.key ? '#card:' + GCCARD.key : '');
+  }
 
   // THIS MACHINE'S OWN PADS, KEYED BY THE PORT THE ROOM GAVE IT.
   // The keyboard writes the legacy port-0 cells and the gamepads write gcLsStage (see
@@ -9295,6 +9369,19 @@ window.GcRate = (function () {
   // because a frame that becomes feedable between two rAFs should not wait for the next one.
   function gcLsStep() {
     var ls = gcLsEngine();
+    // LEFT THE ROOM (Leave closed the session): nobody holds this console's frames any more, so
+    // the game is handed back to the solo clock instead of staying frozen behind a gate whose
+    // room no longer exists. Credits the clock earned while gated go back through the model's
+    // backlog clamp (pool.add), so this can never fast-forward the guest (gate #9).
+    if (GCLS.armed && !GCLS.session) {
+      gcLsGate = false; gcLsStage = null;              // pads write the SAB directly again
+      Atomics.store(paceI32, LS_ARMED, 0);
+      GCLS.armed = false; GCLS.running = false; GCLS.pendingAck = -1;
+      var owed = Math.min(gcLsEarned, MAX_BACKLOG); gcLsEarned = 0;
+      if (owed > 0) { Atomics.add(paceI32, 0, owed); Atomics.notify(paceI32, 0); }
+      gcLsSay('left the room — this console plays on by itself from frame ' + Atomics.load(paceI32, PAD_ACK));
+      return;
+    }
     if (!GCLS.armed || !ls) return;
     if (ls.state !== 'running' && ls.state !== 'stalled') {
       if (GCLS.running) {
@@ -9309,38 +9396,41 @@ window.GcRate = (function () {
       GCLS.fedTo = ls.frame;
       GCLS.startFrame = ls.frame;     // the party's "everyone started together at frame N"
       GCLS.ports = (ls.localPorts || []).slice();
-      // THE FINGERPRINT. This page used to drive the frame gate with NOTHING comparing the two
-      // simulations, which is worse than not gating at all: it looks right while each player
-      // watches a different game. recomp_worker.js now publishes a strided FNV-1a over the guest
-      // window (MEM1 only — the recomp's own heap and fiber stacks hold host pointers that differ
-      // between two healthy browsers) every 30 guest frames, keyed on the frame it describes, and
-      // gcLsPumpHash() below hands it to lib/netplay.js.
+      // THE FINGERPRINT. recomp_worker.js sweeps EVERY page of the guest's state — MP4's statics,
+      // heap and fiber stacks, MEM1 and the FST page — over each 60-frame window and publishes the
+      // hash keyed on the frame that closed it; gcLsPumpHash() below hands it to lib/netplay.js.
+      // It covers everything because tools/gc_netplay_det_test.mjs MEASURED that the whole linear
+      // memory is byte-identical across browser processes given the same inputs (the old note
+      // here said the heap held per-browser host pointers; it does not).
       //
-      // ⚠ WHAT IS STILL NOT CLOSED, stated rather than assumed away: the two machines can still
-      // START from different memory cards. Each adopts its own IndexedDB card image before
-      // _main(), and nothing agrees a card set the way dreamcast.html does with contributeCards().
-      // The fingerprint now REPORTS that divergence instead of hiding it, which is the difference
-      // between a known gap and a silent one.
+      // ⚠ AND THE CARD IS AGREED, NOT JUST DETECTED. Every console booted the room's card (the
+      // host's, or one blank card) at the room's card clock — gcLsAgreeCard() — and the barrier
+      // compared that choice inside the disc tag, so the two machines start from the same bytes.
       GCLS.hashSink = true;
       GCLS.hashSeq = -1; GCLS.hashesSent = 0; GCLS.lastHash = null; GCLS.lastHashFrame = -1;
-      GCLS.fault = 'frame-gated and fingerprinted, but the two consoles still adopt their OWN ' +
-                   'memory cards before _main() — a divergence source this gate does not close. ' +
-                   'It is now DETECTED rather than silent.';
-      gcLsSay('⚠ ' + GCLS.fault);
+      GCLS.fault = null;
       gcLsSay('FRAME GATE ENGAGED at frame ' + ls.frame + ' — this core advances only when every seated ' +
               'port has an input for the frame. delay=' + ls.delay + ' frames, ports=' +
               JSON.stringify(ls.roster) + ', mine=' + JSON.stringify(ls.localPorts));
       gcNetPartySync();
     }
+    // WHERE THE TIME GOES, so a room below 1.000x says whether the ROOM held it back or the
+    // MACHINE did. While the clock has earned a frame (gcLsEarned > 0) and none is released, the
+    // wait is attributed to exactly one of: this console's own worker has not latched the last
+    // frame yet (waitWorkerMs — the machine), or the room has no input for the next one yet
+    // (waitInputMs — the gate). Neither accrues while nothing is owed.
+    var nowMs = performance.now(), stepDt = GCLS.lastStepAt ? Math.min(100, nowMs - GCLS.lastStepAt) : 0;
+    GCLS.lastStepAt = nowMs; GCLS.runMs += stepDt;
     // One frame in flight at a time — the pad cells are a single slot (see the header).
     if (GCLS.pendingAck >= 0) {
-      if (Atomics.load(paceI32, PAD_ACK) === GCLS.pendingAck) return;   // not latched yet
+      if (Atomics.load(paceI32, PAD_ACK) === GCLS.pendingAck) { if (gcLsEarned > 0) GCLS.waitWorkerMs += stepDt; return; }   // not latched yet
       GCLS.pendingAck = -1;
     }
     if (gcLsEarned <= 0) return;      // the wall clock has not earned a frame — this is the 1.000x half
     GCLS.bfCalls++;
     var r = ls.beginFrame(gcLsLocalPads());
     if (!r || !r.ready) {
+      GCLS.waitInputMs += stepDt;
       GCLS.bfStall++;
       GCLS.stalling = !!(r && r.reason === 'stall');
       GCLS.stallReason = r ? r.reason : 'the engine returned nothing';
@@ -9381,6 +9471,148 @@ window.GcRate = (function () {
     try { ls.submitHash(f, h >>> 0); }
     catch (e) { gcLsSay('submitHash threw at frame ' + f + ': ' + ((e && e.message) || e)); }
   }
+
+  // ── THE ROOM'S MEMORY CARD ─────────────────────────────────────────────────────────────────
+  // The card is guest state: CARDInit adopts the image from INSIDE _main(), before the first
+  // VIWaitForRetrace, so whatever each console seeds there is part of frame 0. Each console used
+  // to seed ITS OWN IndexedDB card at ITS OWN wall clock (gc_card.c stamps the clock into every
+  // directory entry), so two consoles in one room began from different bytes — the fingerprint
+  // would report that fork; it could not prevent it. This trades the card BEFORE boot instead.
+  //
+  // THE RULE: a GameCube has ONE card in Slot A, so the room plays on ONE card — THE HOST'S (or,
+  // if the host has none saved, one blank card) — at THE HOST'S card clock. The bytes travel
+  // through lib/netplay.js's card exchange (contributeCards), gzipped; every console checks the
+  // raw fingerprint it received against the one the host declared before booting with them.
+  //   * the host contributes its card for its first seat; every other seat — the host's extra
+  //     couch pads and every guest's — contributes an empty placeholder, which is what lets the
+  //     engine's "every occupied port has spoken" assembly complete;
+  //   * the CHOICE (card fingerprint + clock) goes into the disc tag, so the barrier refuses a
+  //     console that booted anything else by name. A seat change re-assembles the engine's set
+  //     but cannot change the choice — it is the host's entry, and the host offers one entry.
+  //   * only the HOST persists what the room writes to it: it is the host's card. A guest's own
+  //     saved card is never overwritten by a room it joined.
+  var GCCARD = { state: 'idle', why: null, key: null, mine: null, persist: true, p: null,
+                 t: null, size: 0, hash: null, beats: 0 };
+  function gcGzip(u8) {
+    var cs = new CompressionStream('gzip'); var w = cs.writable.getWriter();
+    w.write(u8); w.close();
+    return new Response(cs.readable).arrayBuffer().then(function (b) { return new Uint8Array(b); });
+  }
+  function gcGunzip(u8) {
+    var ds = new DecompressionStream('gzip'); var w = ds.writable.getWriter();
+    w.write(u8); w.close();
+    return new Response(ds.readable).arrayBuffer().then(function (b) { return new Uint8Array(b); });
+  }
+  function gcCardFp(u8) {
+    var L = window.Netplay && window.Netplay.Lockstep;
+    if (L && typeof L.cardHash === 'function') return L.cardHash(u8);
+    var h = 0x811c9dc5;
+    for (var i = 0; i < u8.length; i++) h = Math.imul((h ^ u8[i]) >>> 0, 0x01000193) >>> 0;
+    return ('0000000' + (h >>> 0).toString(16)).slice(-8);
+  }
+  // This console's contribution, built once and offered unchanged on every re-offer.
+  function gcCardMine(ls, ownCard) {
+    var ports = (ls.localPorts || []).slice().sort(function (a, b) { return a - b; });
+    var empty = new Uint8Array(0);
+    var rest = ports.slice(1).map(function (p) { return { port: p, size: 0, hash: 'seat', enc: 'none', bytes: empty }; });
+    if (!ls.isHost) return Promise.resolve(ports.map(function (p) { return { port: p, size: 0, hash: 'seat', enc: 'none', bytes: empty }; }));
+    var t = Math.max(0, Math.floor(Date.now() / 1000) - 946684800) >>> 0;   // CARDDir epoch: 2000-01-01
+    if (!ownCard || ownCard.byteLength !== CARD_BYTES)
+      return Promise.resolve([{ port: ports[0], size: 0, hash: 'blank', enc: 'none;t=' + t, bytes: empty }].concat(rest));
+    var raw = new Uint8Array(ownCard.slice(0));
+    var fp = gcCardFp(raw);
+    return gcGzip(raw).then(function (gz) {
+      return [{ port: ports[0], size: raw.length, hash: fp, enc: 'gzip;t=' + t, bytes: gz }].concat(rest);
+    });
+  }
+  // The room's set -> the one card this console boots. Rejects rather than guessing.
+  function gcCardChoose(set) {
+    var ports = Object.keys(set).map(function (p) { return p | 0; }).sort(function (a, b) { return a - b; });
+    if (!ports.length) return Promise.reject(new Error('the room agreed an EMPTY card set'));
+    var e = set[ports[0]];                                  // the lowest seat is the host's
+    var m = /(?:^|;)t=(\d+)/.exec(String(e.enc || ''));
+    if (!m) return Promise.reject(new Error('the host\'s card entry carries no card clock (enc "' + e.enc + '")'));
+    var t = parseInt(m[1], 10) >>> 0;
+    if (!(e.size | 0)) return Promise.resolve({ card: null, cardTime: t, key: 'blank@' + t });
+    if (!/^gzip/.test(String(e.enc))) return Promise.reject(new Error('unknown card encoding "' + e.enc + '"'));
+    return gcGunzip(e.bytes instanceof Uint8Array ? e.bytes : new Uint8Array(e.bytes)).then(function (raw) {
+      if (raw.length !== CARD_BYTES || raw.length !== (e.size | 0))
+        throw new Error('the room\'s card inflated to ' + raw.length + ' bytes, the host declared ' + e.size);
+      var fp = gcCardFp(raw);
+      if (fp !== e.hash) throw new Error('the room\'s card fingerprints ' + fp + ', the host declared ' + e.hash);
+      return { card: raw.buffer, cardTime: t, key: fp + '@' + t };
+    });
+  }
+  // Resolves with { card: ArrayBuffer|null, cardTime } once the room has agreed; never resolves
+  // with a card it could not verify. If the room goes away first, resolves with THIS console's
+  // own card at its own clock — a solo boot is what a console without a room does.
+  function gcLsAgreeCard(ownCard) {
+    if (GCCARD.p) return GCCARD.p;
+    GCCARD.p = new Promise(function (resolve) {
+      GCCARD.state = 'pending'; GCCARD.why = 'Agreeing the memory card with the room — the game boots on the host\'s card.';
+      gcLsSay('in a room — agreeing ONE memory card (the host\'s) and its clock before boot, so every console adopts the same bytes at frame 0');
+      gcNetPartySync();
+      var building = false, done = false, timer = 0;
+      var finish = function (r) { if (done) return; done = true; clearInterval(timer); resolve(r); };
+      var tick = function () {
+        if (done) return;
+        if (!GCLS.session) {
+          GCCARD.state = 'idle'; GCCARD.why = null;
+          gcLsSay('the room went away before the card was agreed — booting this console\'s own card');
+          return finish({ card: ownCard, cardTime: null });
+        }
+        var ls = gcLsEngine();
+        if (!ls && typeof GCLS.session.setReady === 'function') { try { GCLS.session.setReady(false); } catch (e) {} ls = gcLsEngine(); }
+        if (!ls || !ls.localPorts || !ls.localPorts.length) return;      // no seat yet: wait for the roster
+        if (!GCCARD.mine) {
+          if (building) return;
+          building = true;
+          gcCardMine(ls, ownCard).then(function (m) { GCCARD.mine = m; GCCARD.persist = !!ls.isHost; tick(); })
+            .catch(function (e) { building = false; GCCARD.why = '⚠ could not read this console\'s card: ' + ((e && e.message) || e); });
+          return;
+        }
+        if (ls.cards && ls.cardSetHash) {
+          var set = ls.cards;
+          clearInterval(timer); timer = 0;
+          gcCardChoose(set).then(function (c) {
+            GCCARD.state = 'agreed'; GCCARD.why = null; GCCARD.key = c.key; GCCARD.t = c.cardTime;
+            GCCARD.size = c.card ? c.card.byteLength : 0; GCCARD.hash = c.key.split('@')[0];
+            gcLsSay('card agreed: ' + (c.card ? 'the host\'s card ' + GCCARD.hash : 'one BLANK card (the host has none saved)') +
+                    ' at card clock ' + c.cardTime + (GCCARD.persist ? ' — this console persists what the room saves' :
+                    ' — borrowed: this console\'s own saved card is left untouched'));
+            gcNetPartySync();
+            finish(c);
+          }).catch(function (e) {
+            GCCARD.state = 'failed'; GCCARD.why = '⚠ the room\'s memory card failed its check: ' + ((e && e.message) || e) +
+                                                  ' — this console will not boot a card the others may not hold';
+            gcLsSay(GCCARD.why); gcNetPartySync();
+          });
+          return;
+        }
+        // Offer (and re-offer: a contribution sent before a link carried anything is gone) and
+        // ask; both are idempotent and stop the moment the set is here.
+        try { ls.contributeCards(GCCARD.mine); } catch (e) {}
+        // every 2 s, not every tick: the host answers a request by re-broadcasting the whole set
+        if (!ls.isHost && (GCCARD.beats % 4) === 0) try { ls.requestCards(); } catch (e) {}
+        GCCARD.beats++;
+        var waiting = []; try { waiting = ls.cardsWaitingFor() || []; } catch (e) {}
+        GCCARD.why = 'Agreeing the memory card with the room' + (waiting.length && ls.isHost
+          ? ' — waiting for ' + waiting.map(function (w) { return gcNetWho(w.port, false); }).join(' and ') + '.' : '.');
+        gcNetPartySync();
+      };
+      timer = setInterval(tick, 500);
+      tick();
+    });
+    return GCCARD.p;
+  }
+  // A late seat re-assembles the engine's set; keep offering this console's (unchanged) entry
+  // until the room starts, so a joiner's assembly never waits on a console that already booted.
+  setInterval(function () {
+    if (!GCCARD.mine || !GCLS.session) return;
+    var ls = gcLsEngine();
+    if (!ls || ls.state === 'running' || ls.state === 'stalled' || (ls.cards && ls.cardSetHash)) return;
+    try { ls.contributeCards(GCCARD.mine); } catch (e) {}
+  }, 3000);
 
   // ARM BEFORE THE FIRST CREDIT — called from startRecomp() between the boot postMessage and
   // requestAnimationFrame(grantLoop), which is the only window in which "this core has never run
@@ -9425,11 +9657,43 @@ window.GcRate = (function () {
     // ⚠ THIS IS THE ONLY "READY" THERE IS. No button, no click: the instant this core is booted
     // and gated it declares itself (user 2026-09-13 — no "I'm ready" anywhere). It is safe to
     // declare alone because lib/netplay.js's barrier never releases for one seated peer.
-    try { GCLS.declared = !!GCLS.session.setReady(true, gcLsDisc()); }
-    catch (e) { gcLsSay('setReady failed: ' + e); }
+    // ⚠ BUT NOT BEFORE THE WORKER HAS SAID WHICH BUILD IT RUNS: the disc tag carries it, so two
+    // players on different mp4_game.wasm builds are refused at the barrier by name instead of
+    // pairing and forking at the first fingerprint (gcLsDeclare, called again from the 'build'
+    // message if it has not landed yet).
+    GCLS.wantDeclare = true;
+    gcLsDeclare();
     gcNetPartySync();
     setInterval(gcLsStep, 4);   // rAF alone would cap the feed at the display refresh
     return true;
+  }
+  function gcLsDeclare() {
+    if (!GCLS.wantDeclare || GCLS.declared || GCLS.declaring || !GCLS.session || !GCLS.buildTag) return;
+    GCLS.declaring = true;
+    var ls = gcLsEngine(), sess = GCLS.session, pre = Promise.resolve();
+    // THE INPUT DELAY IS THE LINK'S, MEASURED — not the engine's constructor default (3 frames,
+    // which this page used to leave in force on every link). Same choice n64/index.html and
+    // dreamcast.html make: the host pings every peer and takes Lockstep.recommendDelayForRoom's
+    // answer from the worst sample, BEFORE it declares, so the room starts on it. On a LAN that is
+    // the engine's floor of 2 frames.
+    if (ls && ls.isHost && !ls.rollback && typeof sess.rttReport === 'function') {
+      pre = sess.rttReport(600, { samples: 6, frameMs: 1000 / GUEST_HZ }).then(function (rep) {
+        GCLS.rttMs = (rep && rep.worstMs != null) ? Math.round(rep.worstMs) : null;
+        var want = (rep && rep.recommendedDelay != null) ? Math.max(1, Math.min(30, rep.recommendedDelay | 0)) : null;
+        if (want != null && want !== ls.delay) {
+          gcLsSay('input delay ' + ls.delay + ' -> ' + want + ' frames, chosen from the worst measured RTT ' + GCLS.rttMs + ' ms');
+          ls.delay = want;
+        }
+      }).catch(function (e) { gcLsSay('delay choice failed, keeping the default: ' + ((e && e.message) || e)); });
+    }
+    pre.then(function () {
+      GCLS.declaring = false;
+      if (GCLS.declared || !GCLS.session) return;
+      try { GCLS.declared = !!GCLS.session.setReady(true, gcLsDisc()); }
+      catch (e) { gcLsSay('setReady failed: ' + e); }
+      if (GCLS.declared) gcLsSay('declared ready as "' + gcLsDisc() + '"');
+      gcNetPartySync();
+    });
   }
 
   // Test seam. tools/netplay_invariants.mjs and the two-page room test read this; it reports the
@@ -9463,6 +9727,11 @@ window.GcRate = (function () {
       stalling: GCLS.stalling, waitingOn: GCLS.waitingOn.slice(), stallReason: GCLS.stallReason,
       earned: gcLsEarned, guestFrames: (paceI32 ? Atomics.load(paceI32, PAD_ACK) : 0),
       hashSink: GCLS.hashSink, fault: GCLS.fault,
+      // the card every console booted (THE ROOM'S MEMORY CARD) and the tag the barrier compared
+      card: { state: GCCARD.state, why: GCCARD.why, key: GCCARD.key, size: GCCARD.size,
+              persist: GCCARD.persist, beats: GCCARD.beats },
+      buildTag: GCLS.buildTag, disc: gcLsDisc(), wantDeclare: !!GCLS.wantDeclare, rttMs: GCLS.rttMs == null ? null : GCLS.rttMs,
+      runMs: Math.round(GCLS.runMs), waitInputMs: Math.round(GCLS.waitInputMs), waitWorkerMs: Math.round(GCLS.waitWorkerMs),
       // Raw cells, so a rig can tell "the worker never published" apart from
       // "the page never forwarded" — different bugs with one symptom, and the
       // pair that separated them when the first fingerprint silently published
@@ -9739,11 +10008,16 @@ window.GcRate = (function () {
       } else if (e.data.cmd === 'audio') {
         // int16 stereo PCM; e.data.len is BYTES (frames*4), matching pushAudioSamples' contract.
         if (window._gcAudioPushSamples) window._gcAudioPushSamples(new Uint8Array(e.data.buf), e.data.len);
+      } else if (e.data.cmd === 'build') {
+        // The recomp build this worker instantiated — part of the room's disc tag (gcLsDisc).
+        GCLS.buildTag = String(e.data.hash || '');
+        gcLsDeclare();
       } else if (e.data.cmd === 'card') {
         // 2 MiB .raw snapshot: the shim's dirty counter went quiet (or Export asked for one).
         var img = e.data.img;
-        cardIdbPut(img);
-        cardSay('saved ' + (img.byteLength / 1048576).toFixed(1) + ' MB');
+        // A guest in a room is playing on the HOST's card: its own saved card stays its own.
+        if (GCCARD.state === 'agreed' && !GCCARD.persist) cardSay('the room saved to the host\'s card — not stored on this console');
+        else { cardIdbPut(img); cardSay('saved ' + (img.byteLength / 1048576).toFixed(1) + ' MB'); }
         if (pendingExport) { var p = pendingExport; pendingExport = null; p(new Uint8Array(img)); }
       } else if (e.data.cmd === 'stateSaved') {
         if (pendingStateSave) pendingStateSave({ ok: true, buf: e.data.buf, n: e.data.n });
@@ -9766,7 +10040,16 @@ window.GcRate = (function () {
         stSay(e.data.op + ' failed: ' + e.data.txt);
         if (e.data.op === 'save' && pendingStateSave) pendingStateSave({ ok: false, msg: e.data.txt });
         else if (pendingStateLoad) pendingStateLoad({ ok: false, msg: e.data.txt });
-      } else if (e.data.cmd === 'log') console.log(e.data.txt);
+      } else if (e.data.cmd === 'log') {
+        console.log(e.data.txt);
+        // A TRAP IN THE GAME ITSELF (recomp_worker.js 'main stopped: ...') ends this console's game.
+        // In a room every console traps at the same frame (the simulation is the same one), so the
+        // room did not fail — the game did; say that, instead of a party frozen on 'playing'.
+        if (/main stopped: /.test(e.data.txt) && !window.__gcTrap) {
+          window.__gcTrap = { at: Atomics.load(paceI32, PAD_ACK), txt: String(e.data.txt).replace(/^\[recomp-worker\] /, '') };
+          gcNetPartySync();
+        }
+      }
     };
     // ?board=1: the canned frame-exact chain that drives boot -> title -> save dialogs ->
     // mode carousel -> Party Mode -> 1-human count -> char select, where the armed
@@ -9789,13 +10072,25 @@ window.GcRate = (function () {
       card = null;
     }
     cardSay(card ? 'restoring ' + (card.byteLength / 1048576).toFixed(1) + ' MB' : 'none saved yet');
+    // IN A ROOM THE CARD IS THE ROOM'S, agreed before a single guest instruction runs (see THE
+    // ROOM'S MEMORY CARD). Solo, cardTime stays null and the worker uses this machine's clock.
+    var cardTime = null;
+    if (GCLS.session) {
+      hudStatus = 'recomp: agreeing the memory card with the room...';
+      var agreed = await gcLsAgreeCard(card);
+      card = agreed.card; cardTime = agreed.cardTime;
+      cardSay(GCCARD.state === 'agreed'
+        ? (card ? 'room card (the host\'s, ' + GCCARD.hash + ')' : 'room card: one blank card') +
+          (GCCARD.persist ? '' : ' — borrowed, not saved here')
+        : (card ? 'restoring ' + (card.byteLength / 1048576).toFixed(1) + ' MB' : 'none saved yet'));
+    }
     var bootTransfer = parts.concat([fst]);
     if (card) bootTransfer.push(card);
     var rbRaw = q.get('recompbuild') || '';
     var recompBuildDir = /^[A-Za-z0-9_-]+$/.test(rbRaw) ? rbRaw + '/' : '';
     if (rbRaw && !recompBuildDir) console.log('[recomp] ignoring malformed ?recompbuild= (letters, digits, _ and - only)');
     else if (recompBuildDir) console.log('[recomp] CANDIDATE build /gamecube/recomp/' + recompBuildDir + ' — NOT the shipped pair');
-    rw.postMessage({ cmd: 'boot', parts: parts, fst: fst, pace: pace, card: card,
+    rw.postMessage({ cmd: 'boot', parts: parts, fst: fst, pace: pace, card: card, cardTime: cardTime,
                      stage: stageSab,
                      autoboard: q.get('board') === '1',
                      inputScript: boardScript,
