@@ -335,15 +335,29 @@ const tests = [
   // RED before 2026-08-29: rt's load prologue was emitted only inside the
   // fast arm, so the slow arm left the local at zero and the following read
   // of rt saw 0.
-  T('SW slow arm: rt survives into the next op', [I(OPC.SW, 4, 8, 0x18), OR(10, 8, 0)],
-    { regs: { 4: SLOW_ADDR, 8: V }, expectRegs: { 10: V } }),
-  T('SD slow arm: rt survives into the next op', [I(OPC.SD, 4, 8, 0x18), OR(10, 8, 0)],
-    { regs: { 4: SLOW_ADDR, 8: V }, expectRegs: { 10: V } }),
-  T('SB slow arm: rt survives into the next op', [I(OPC.SB, 4, 8, 0x18), OR(10, 8, 0)],
-    { regs: { 4: SLOW_ADDR, 8: V }, expectRegs: { 10: V } }),
+  // 2026-09-30: a store's slow arm now HANDS BACK to the dispatcher (an MI
+  // write can run gen_interrupt and end the frame without moving PC —
+  // mi_controller.c:105), so the next op is not run in-block. What these
+  // pin is unchanged: rt (and, for rs==rt, the address register) must still
+  // hold its value in reg[] when control leaves, and PC must be the next op.
+  T('SW slow arm: rt survives, block hands back at the next op', [I(OPC.SW, 4, 8, 0x18), OR(10, 8, 0)],
+    { regs: { 4: SLOW_ADDR, 8: V }, expectRegs: { 8: V, 10: '0x0' }, expectPC: ENTRY + STRIDE }),
+  T('SD slow arm: rt survives, block hands back at the next op', [I(OPC.SD, 4, 8, 0x18), OR(10, 8, 0)],
+    { regs: { 4: SLOW_ADDR, 8: V }, expectRegs: { 8: V, 10: '0x0' }, expectPC: ENTRY + STRIDE }),
+  T('SB slow arm: rt survives, block hands back at the next op', [I(OPC.SB, 4, 8, 0x18), OR(10, 8, 0)],
+    { regs: { 4: SLOW_ADDR, 8: V }, expectRegs: { 8: V, 10: '0x0' }, expectPC: ENTRY + STRIDE }),
   // rs == rt: the ADDRESS itself was computed from the unassigned local
-  T('SW slow arm, rs==rt', [I(OPC.SW, 8, 8, 0x18), OR(10, 8, 0)], { regs: { 8: V }, expectRegs: { 10: V } }),
-  T('SD slow arm, rs==rt', [I(OPC.SD, 8, 8, 0x18), OR(10, 8, 0)], { regs: { 8: V }, expectRegs: { 10: V } }),
+  T('SW slow arm, rs==rt', [I(OPC.SW, 8, 8, 0x18), OR(10, 8, 0)], { regs: { 8: V }, expectRegs: { 8: V }, expectPC: ENTRY + STRIDE }),
+  T('SD slow arm, rs==rt', [I(OPC.SD, 8, 8, 0x18), OR(10, 8, 0)], { regs: { 8: V }, expectRegs: { 8: V }, expectPC: ENTRY + STRIDE }),
+  // a dirty register written BEFORE the store must be flushed on that exit
+  T('store slow arm flushes a register dirtied earlier in the block',
+    [I(OPC.ADDIU, 9, 9, 1), I(OPC.SW, 4, 8, 0x18), 0],
+    { regs: { 4: SLOW_ADDR, 9: '0x10' }, expectRegs: { 9: '0x11' }, expectPC: ENTRY + 2 * STRIDE }),
+  // MTC0 runs gen_interrupt inline (Count/Status): its fallback hands back too
+  T('MTC0 fallback hands back to the dispatcher', [MTC0(8, 12), I(OPC.ADDIU, 0, 9, 5), 0],
+    { expectRegs: { 9: '0x0' }, expectPC: ENTRY + STRIDE }),
+  T('control: a LOAD slow arm still continues in-block', [I(OPC.LW, 4, 8, 0x18), I(OPC.ADDIU, 0, 9, 5), 0],
+    { regs: { 4: SLOW_ADDR }, expectRegs: { 9: '0x5' } }),
   // controls: the fast arm was always correct and must stay so
   T('SW fast arm control', [I(OPC.SW, 4, 8, 0x18), OR(10, 8, 0)],
     { regs: { 4: HIT_ADDR, 8: V }, expectRegs: { 10: V }, opts: { rdramHit: true } }),
