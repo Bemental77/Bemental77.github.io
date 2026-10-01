@@ -3958,7 +3958,15 @@ N64Rate.selfTest = function (logFn) {
   // ROM: a slot that would leave the core less than N64S_RAW_RESERVE is never
   // taken (rbPick then thins), so the ring is sized to the ROM by construction.
   // Feature-detected; ?rawstate=0 keeps the legacy path (the control arm).
-  var N64S_RAW_RESERVE = 48 * 1048576;
+  // ⚠ A FAILED _malloc DOES NOT RETURN 0 IN THIS BUILD — it ABORTS the runtime
+  // (TOTAL_MEMORY fixed, no growth: emscripten_resize_heap -> abort("OOM")).
+  // MEASURED: allocating until refusal threw Aborted(OOM). So the page never
+  // asks the heap for memory it may not have: it tracks the top of what it
+  // allocated (dlmalloc carves a fresh large block from the top), takes a
+  // slot only while the space above that top keeps N64S_RAW_RESERVE free for
+  // the core's own allocations, and never hands a state buffer back to the
+  // allocator — a freed one goes to a page-side pool and is reused.
+  var N64S_RAW_RESERVE = 64 * 1048576;
   function n64sRawOk() {
     if (N64S.raw != null) return N64S.raw;
     var M = window.Module;
@@ -3973,18 +3981,28 @@ N64Rate.selfTest = function (logFn) {
     return N64S.raw;
   }
   // A state buffer in the wasm heap, or null when it would starve the core.
+  function n64sRawRoom() {
+    var len = window.Module.HEAPU8.length, top = N64S.top || 0;
+    return top ? Math.max(0, len - top - N64S_RAW_RESERVE) : len;
+  }
+  // How many more state buffers this heap can give without risking the core:
+  // the pool, plus what fits above the top while keeping the reserve.
+  function n64sRawCapacity() {
+    return (N64S.pool ? N64S.pool.length : 0) + Math.floor(n64sRawRoom() / N64S.size);
+  }
   function n64sRawAlloc() {
-    var M = window.Module, p = M._malloc(N64S.size);
+    var M = window.Module, v = N64S.pool && N64S.pool.length ? N64S.pool.pop() : null;
+    if (v) { if (v.buffer !== M.HEAPU8.buffer) { var q = v.__ptr; v = M.HEAPU8.subarray(q, q + N64S.size); v.__ptr = q; } N64S.heapBufs++; return v; }
+    if (N64S.top && n64sRawRoom() < N64S.size) return null;
+    var p = M._malloc(N64S.size);
     if (!p) return null;
-    var probe = M._malloc(N64S_RAW_RESERVE);
-    if (!probe) { M._free(p); return null; }
-    M._free(probe);
-    var v = M.HEAPU8.subarray(p, p + N64S.size);
+    N64S.top = Math.max(N64S.top || 0, p + N64S.size);
+    v = M.HEAPU8.subarray(p, p + N64S.size);
     v.__ptr = p; N64S.heapBufs = (N64S.heapBufs | 0) + 1;
     return v;
   }
   function n64sFree(buf) {
-    if (buf && buf.__ptr) { window.Module._free(buf.__ptr); buf.__ptr = 0; N64S.heapBufs--; }
+    if (buf && buf.__ptr) { (N64S.pool || (N64S.pool = [])).push(buf); N64S.heapBufs--; }
   }
   function n64sRawSave(dst) {
     var M = window.Module, t0 = performance.now(), d = dst && dst.__ptr ? dst : null;
@@ -4308,6 +4326,8 @@ N64Rate.selfTest = function (logFn) {
     RB.n = rbSpan(ls);
     n64sRawOk();
     RB.cap = Math.max(2, Math.floor(RB_RING_BUDGET_MB * 1048576 / rbSlotBytes()));
+    if (RB.preCap > 0 && RB.preCap < RB.cap) RB.cap = RB.preCap;
+    rbPublishCap('the ring armed');
     RB.slots = [];
     if (!rbSaveAt(ls, ls.frame | 0)) { RB.fault = N64S.fault || 'the first savestate failed'; return false; }
     RB.ready = true;
@@ -4345,6 +4365,22 @@ N64Rate.selfTest = function (logFn) {
     var st = window.__fbAsync || {}, fb = 0;
     if (st.on) { var c = document.querySelector('canvas'); fb = Math.max(640 * 480, c ? (c.width | 0) * (c.height | 0) : 0) * 4; }
     return (N64S.raw ? N64S.size : N64S.size + N64S_SM) + fb;
+  }
+  // THE WINDOW THIS CONSOLE CAN HOLD, told to the engine (lib/netplay.js
+  // rbMaxWindow, carried in lsready and every 'lsrb'): the host never decides
+  // a window deeper than the smallest console's. `slots` snapshots, one every
+  // K frames, reach back slots*K frames; 4 frames of margin for the snapshot
+  // the next save replaces and the frames between the newest one and now.
+  // Re-published whenever K or the slot capacity changes — a heap that
+  // fragments (fewer slots fit) LOWERS it.
+  function rbPublishCap(why, slots) {
+    var ls = lsEngine(), n = slots != null ? slots : RB.cap;
+    if (!ls || !(n > 0)) return;
+    var c = Math.max(4, n * Math.max(1, RB.k) - 4);
+    if (ls.rbMaxWindow === c) return;
+    ls.rbMaxWindow = c; RB.maxWindow = c;
+    pageLog('[rollback] this console can hold a window of ' + c + ' frames (' + n + ' snapshots x one every ' + RB.k
+          + ' frames) — ' + why);
   }
   function rbGrow(want) {
     var nn = want | 0;
@@ -4391,6 +4427,7 @@ N64Rate.selfTest = function (logFn) {
       try { nb = N64S.raw ? n64sRawAlloc() : new Uint8Array(N64S.size + N64S_SM); } catch (e) { nb = null; }
       if (nb) { s = { frame: -1, buf: nb, fb: null, fp: 0, pin: -1 }; S.push(s); return s; }
       RB.cap = Math.max(S.length, 2);
+      rbPublishCap('the ' + (N64S.raw ? 'wasm heap' : 'browser') + ' held only ' + RB.cap + ' snapshots');
       pageLog('[rollback] the ' + (N64S.raw ? 'wasm heap (shared with the ROM)' : 'browser') + ' holds ' + S.length
             + ' snapshots — past that they are thinned, never refused');
     }
@@ -4511,6 +4548,7 @@ N64Rate.selfTest = function (logFn) {
               + ' ms/frame expected, worst rollback ' + c1.worst.toFixed(1) + ' ms' + (best ? '' : ' (no K fits two fields)');
       pageLog('[rollback] snapshot every ' + RB.k + ' -> ' + nk + ' frames: ' + RB.kWhy);
       RB.k = nk; RB.kChanges++;
+      rbPublishCap('snapshot every ' + nk + ' frames');
       if (window.__n64RbLog) window.__n64RbLog.push(['k', RB.frames, nk]);
     }
   }
@@ -4921,6 +4959,14 @@ N64Rate.selfTest = function (logFn) {
     var ok = n64sSave(a);
     try { window.__n64State.free(a); } catch (e) {}
     if (!ok) { lsRbRefuse(N64S.fault || 'the savestate failed'); return false; }
+    // How many snapshots this console can hold, known now so the engine has
+    // it before Ready (lsready mw).
+    var budget = Math.max(2, Math.floor(RB_RING_BUDGET_MB * 1048576 / rbSlotBytes())), held = budget;
+    // (Raw: the buffer just saved into is back in the pool; nothing is
+    // allocated to find the answer — see N64S_RAW_RESERVE.)
+    if (N64S.raw) held = Math.max(2, Math.min(budget, n64sRawCapacity()));
+    RB.preCap = held;
+    rbPublishCap('measured before Ready', held);
     LS_RB.proven = true; LS_RB.ms = performance.now() - t0;
     pageLog('[rollback] savestate path proven before declaring (' + Math.round(LS_RB.ms) + ' ms' + (N64S.raw ? ', raw API' : ', heap scans included')
           + '): this console is rollback-capable');
@@ -5813,7 +5859,7 @@ N64Rate.selfTest = function (logFn) {
         engine: (function () { try { return ls.rollbackReport(); } catch (e) { return null; } })(),
         page: { ready: RB.ready, slots: RB.n, reach: RB.n, cap: RB.cap, allocated: RB.slots.length, rollbacks: RB.rollbacks,
                 hidden: RB.hidden, stepMs: +(RB.stepMs || 0).toFixed(2), pace: LS.pace || 1,
-                k: RB.k, kFixed: RB.kFixed, kChanges: RB.kChanges, kWhy: RB.kWhy,
+                k: RB.k, kFixed: RB.kFixed, maxWindow: RB.maxWindow || 0, kChanges: RB.kChanges, kWhy: RB.kWhy,
                 runMs: +RB.runEma.toFixed(2), saveMs: +RB.saveEma.toFixed(2), loadMs: +RB.loadEma.toFixed(2),
                 rollbacksPerFrame: +RB.pEma.toFixed(4), depthAvg: RB.rollbacks ? +(RB.depthSum / RB.rollbacks).toFixed(2) : 0,
                 resimFrames: RB.resimFrames, bridgeFrames: RB.bridgeFrames, maxDepth: RB.maxDepth, depthHist: RB.depthHist, loads: RB.loads,
