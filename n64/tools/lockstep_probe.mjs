@@ -56,7 +56,13 @@
 //   --headful        show the windows
 //   --json PATH      also write the full result as JSON
 
-import puppeteer from 'puppeteer';
+import { createRequire } from 'node:module';
+import { existsSync } from 'node:fs';
+// The probe deps first (this box), a local install second.
+let puppeteer;
+try { puppeteer = createRequire(process.env.HOME + '/probe-deps/')('puppeteer'); }
+catch (_e) { puppeteer = (await import('puppeteer')).default; }
+const MAC_CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -718,7 +724,7 @@ async function runPair(browser, log) {
 const log = [];
 const browser = await puppeteer.launch({
   headless: has('headful') ? false : 'new',
-  executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  executablePath: process.env.CHROME_PATH || (existsSync(MAC_CHROME) ? MAC_CHROME : '/opt/pw-browsers/chromium-1194/chrome-linux/chrome'),
   // ⚠ THE BACKGROUND-TAB THROTTLES MUST BE OFF, OR THE RATE IS THE BROWSER'S
   // OPINION AND NOT THE GOVERNOR'S. Both the `bridge` and `attach` arms run TWO
   // tabs, and only one of them can be foreground: Chrome throttles rAF and

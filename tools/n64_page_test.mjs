@@ -24,15 +24,26 @@
 // Invariants pass: /n64/ must NOT pull coi-serviceworker.js and must load every
 // UI dependency from its own origin.
 // Emits one JSON line.
-import puppeteer from 'puppeteer';
+import { createRequire } from 'node:module';
+import fs from 'node:fs';
+// Same resolution as tools/n64_jit_perf_rig.mjs: the probe deps first, a local install second.
+let puppeteer;
+try { puppeteer = createRequire(process.env.HOME + '/probe-deps/')('puppeteer'); }
+catch (_e) { puppeteer = (await import('puppeteer')).default; }
 
 const rom = process.argv[2] || 'mariokart.z64';
 const base = process.env.N64_PAGE_URL || 'http://localhost:8080/n64/';
-const result = { rom, desktop: {}, mobile: {}, ratetest: {}, meter: {}, diag: {}, pace: {}, rafdedupe: {}, invariants: {} };
+const ORIGIN = new URL(base).origin;
+// N64_PASSES=desktop,worker,... runs a subset (default: all). Skipped passes report skipped.
+const PASSES = (process.env.N64_PASSES || '').split(',').map((x) => x.trim()).filter(Boolean);
+const want = (k) => !PASSES.length || PASSES.includes(k);
+const result = { rom, desktop: {}, mobile: {}, ratetest: {}, meter: {}, diag: {}, pace: {}, rafdedupe: {}, worker: {}, workerMobile: {}, invariants: {} };
+const MAC_CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const CHROME = process.env.CHROME_PATH || (fs.existsSync(MAC_CHROME) ? MAC_CHROME : '/opt/pw-browsers/chromium-1194/chrome-linux/chrome');
 
 const browser = await puppeteer.launch({
   headless: 'new',
-  executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  executablePath: CHROME,
   args: ['--autoplay-policy=no-user-gesture-required', '--no-sandbox', '--disable-dev-shm-usage'],
 });
   // [leak-guard] A SIGKILLed parent ORPHANS this browser — verified by test and
@@ -55,7 +66,7 @@ async function newPage(r) {
   // fetched off-origin is a regression of that property.
   page.on('request', (req) => {
     const u = req.url();
-    if (!/^https?:\/\/localhost:8080\//.test(u) && !/^(data|blob):/.test(u)) r.offOrigin.push(u.slice(0, 160));
+    if (!u.startsWith(ORIGIN + '/') && !/^(data|blob):/.test(u)) r.offOrigin.push(u.slice(0, 160));
   });
   return page;
 }
@@ -66,6 +77,7 @@ try {
   // ---------- desktop ----------
   {
     const d = result.desktop;
+    if (!want('desktop')) { d.skipped = true; d.ok = true; } else {
     const page = await newPage(d);
     await page.goto(`${base}?game=${rom}&autostart`, { waitUntil: 'domcontentloaded' });
     await waitRunning(page);
@@ -87,11 +99,13 @@ try {
     }, 'data:image/png;base64,' + shot.toString('base64'));
     d.ok = d.rafAlive && d.status === 'Running.' && d.luminance > 2;
     await page.close();
+    }
   }
 
   // ---------- mobile ----------
   {
     const m = result.mobile;
+    if (!want('mobile')) { m.skipped = true; m.ok = true; } else {
     const page = await newPage(m);
     await page.setViewport({ width: 850, height: 400, hasTouch: true, isMobile: true });
     await page.goto(`${base}?mobile&game=${rom}`, { waitUntil: 'domcontentloaded' });
@@ -163,11 +177,13 @@ try {
     m.ok = !!(m.splashVisible && m.buttonA && m.buttonStart && m.buttonZ && m.stickUp &&
               m.splashDiagVisible && m.splashDiagOpens && /^>> /.test(m.splashDiagVerdict || ''));
     await page.close();
+    }
   }
 
   // ---------- rate-model self-test (?ratetest=1), no emulator ----------
   {
     const t = result.ratetest;
+    if (!want('ratetest')) { t.skipped = true; t.ok = true; } else {
     const page = await newPage(t);
     await page.goto(`${base}?ratetest=1`, { waitUntil: 'domcontentloaded' });
     await page.waitForFunction('window.__n64RateTest', { timeout: 30000 });
@@ -180,11 +196,13 @@ try {
     t.noEmulator = await page.evaluate(() => !window.myApp && !window.Module);
     t.ok = r.fail === 0 && r.pass >= 50 && t.noEmulator && t.pageErrors.length === 0;
     await page.close();
+    }
   }
 
   // ---------- live meter: the wiring ?ratetest=1 structurally cannot reach ----------
   {
     const t = result.meter;
+    if (!want('meter')) { t.skipped = true; t.ok = true; } else {
     const page = await newPage(t);
     await page.goto(`${base}?game=${rom}&autostart`, { waitUntil: 'domcontentloaded' });
     await waitRunning(page);
@@ -219,11 +237,13 @@ try {
     t.headlineOk = /^speed /.test(t.headline) && /shown \//.test(t.headline) && !/^FPS: \d+$/.test(t.headline);
     t.ok = !!(t.regionOk && t.gameRateFound && t.capacityMeasured && t.speedSane && t.witnessesAgree && t.notAhead && t.headlineOk);
     await page.close();
+    }
   }
 
   // ---------- diagnostics panel ----------
   {
     const t = result.diag;
+    if (!want('diag')) { t.skipped = true; t.ok = true; } else {
     const page = await newPage(t);
     await page.goto(`${base}?game=${rom}`, { waitUntil: 'domcontentloaded' });
     await page.waitForFunction('!!document.getElementById("btnDiag")', { timeout: 20000 });
@@ -269,6 +289,7 @@ try {
     t.ok = !!(t.opens && t.verdictPinned && t.hasGpu && t.hasHeapProbe && t.hasEnv &&
               t.hasMilestones && t.gpuAboveTail && t.pinnedSectionPresent &&
               t.heapProbeRan && t.baselineVerdict && t.runningVerdictOk);
+    }
   }
 
   // ---------- pace governor: the LIVE wiring ?ratetest=1 structurally cannot reach ----------
@@ -279,6 +300,7 @@ try {
   // ?pace=0 is a real control arm rather than a label. Gate #9 is re-checked on BOTH arms.
   {
     const t = result.pace;
+    if (!want('pace')) { t.skipped = true; t.ok = true; } else {
     const settle = +(process.env.N64_PACE_MS || 12000);
     const arm = async (query) => {
       const page = await newPage(t);
@@ -388,6 +410,7 @@ try {
               t.notAheadOn && t.notAheadOff && t.meanNotAheadOn && t.meanNotAheadOff &&
               t.overshootBounded && t.owedClamped &&
               (t.decoupledObserved || !t.hadCapacity));
+    }
   }
 
   // ---------- raf-dedupe: `shown` must count ANIMATION FRAMES, not callbacks ----------
@@ -407,6 +430,7 @@ try {
   // pass goes red; nothing else in this file does.
   {
     const t = result.rafdedupe;
+    if (!want('rafdedupe')) { t.skipped = true; t.ok = true; } else {
     const page = await newPage(t);
     await page.goto(`${base}?game=${rom}&autostart`, { waitUntil: 'domcontentloaded' });
     await waitRunning(page);
@@ -443,6 +467,103 @@ try {
     t.why = t.ok ? `shown held at ${t.controlShownPerSec?.toFixed(1)}/s -> ${t.withExtraShownPerSec?.toFixed(1)}/s with 2 extra rAF loops`
                  : `shown moved ${t.controlShownPerSec} -> ${t.withExtraShownPerSec} (${t.inflation}x) when only the number of rAF CALLBACKS changed`;
     await page.close();
+    }
+  }
+
+  // ---------- core worker (?worker=1): the emulator OFF the main thread ----------
+  // n64/N64Wasm/dist/core_worker.js hosts the SAME n64wasm.{js,wasm} in a dedicated Worker
+  // drawing through an OffscreenCanvas. Asserted: it booted and is running, the picture is
+  // on screen, the guest advances, the meter reads it (and gate #9 holds), the main thread
+  // never loaded a second core, and a key press reaches the pad image the worker runs on.
+  {
+    const t = result.worker;
+    if (!want('worker')) { t.skipped = true; t.ok = true; } else {
+    const page = await newPage(t);
+    await page.goto(`${base}?game=${rom}&autostart&worker=1`, { waitUntil: 'domcontentloaded' });
+    await waitRunning(page);
+    await page.waitForFunction('window.__n64Worker && (window.__n64Worker.state().fatal || (window.__n64Worker.state().stat && window.__n64Worker.state().stat.vi > 30))', { timeout: 120000 });
+    await new Promise((r2) => setTimeout(r2, +(process.env.N64_SETTLE_MS || 12000)));
+    const s0 = await page.evaluate(() => window.__n64Worker.state());
+    t.on = s0.on; t.why = s0.why; t.booted = s0.booted; t.fatal = s0.fatal;
+    await new Promise((r2) => setTimeout(r2, 3000));
+    const s1 = await page.evaluate(() => window.__n64Worker.state());
+    t.viAdvanced = (s1.stat && s0.stat) ? s1.stat.vi - s0.stat.vi : null;
+    t.status = await page.evaluate(() => document.getElementById('status').textContent);
+    t.fpsText = await page.evaluate(() => document.getElementById('fps').textContent);
+    const r = await page.evaluate(() => window.__n64Rate || null);
+    t.rate = r && { speed: r.speed, speedFrom: r.speedFrom, viHz: r.viHz, ahead: r.ahead, shown: r.shown, disagree: r.disagree };
+    t.regionOk = !!(r && r.viHz === (rom === 'mariokart.z64' ? 50 : 60));
+    t.notAhead = !!(r && r.ahead === false);
+    // ONE core: the page realm never fetched the emulator; only the worker did.
+    t.mainThreadCore = await page.evaluate(() => ({
+      facade: !!(window.Module && window.Module.__worker), heap: !!(window.Module && window.Module.HEAPU8),
+      fetched: performance.getEntriesByType('resource').filter((e) => /n64wasm\.(js|wasm)/.test(e.name)).map((e) => e.name.split('/').pop()) }));
+    t.oneCore = t.mainThreadCore.facade && !t.mainThreadCore.heap && t.mainThreadCore.fetched.length === 0;
+    // A key press reaches the image the worker runs frames with (Start = 'Enter' by default).
+    await page.keyboard.down('Enter');
+    await new Promise((r2) => setTimeout(r2, 150));
+    const down = await page.evaluate(() => window.__n64Worker.state().sent);
+    await page.keyboard.up('Enter');
+    await new Promise((r2) => setTimeout(r2, 150));
+    const up = await page.evaluate(() => window.__n64Worker.state().sent);
+    t.keyReachesWorker = !!(down && (down[0] & (1 << 6)) && up && !(up[0] & (1 << 6)));
+    const canvas = await page.$('#canvas');
+    const shot = await canvas.screenshot({ path: `/tmp/n64-sweep/page-worker-${rom.replace(/\.z64$/, '')}.png` });
+    t.luminance = await page.evaluate(async (src) => {
+      const img = new Image();
+      await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = src; });
+      const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
+      const x = c.getContext('2d'); x.drawImage(img, 0, 0);
+      const dd = x.getImageData(0, 0, c.width, c.height).data;
+      let sum = 0; for (let i = 0; i < dd.length; i += 4) sum += (dd[i] + dd[i + 1] + dd[i + 2]) / 3;
+      return Math.round(sum / (dd.length / 4));
+    }, 'data:image/png;base64,' + shot.toString('base64'));
+    t.ok = !!(t.on && t.booted && !t.fatal && t.status === 'Running.' && t.viAdvanced > 0 && t.regionOk && t.notAhead &&
+              t.oneCore && t.keyReachesWorker && t.luminance > 2 && t.pageErrors.length === 0);
+    await page.close();
+    }
+  }
+
+  // ---------- core worker, phone shell: the touch overlay reaches the worker ----------
+  {
+    const t = result.workerMobile;
+    if (!want('workerMobile')) { t.skipped = true; t.ok = true; } else {
+    const page = await newPage(t);
+    await page.setViewport({ width: 850, height: 400, hasTouch: true, isMobile: true });
+    await page.goto(`${base}?mobile&game=${rom}&worker=1`, { waitUntil: 'domcontentloaded' });
+    const touch = async (sel, fy, holdMs) => {
+      const el = await page.$(sel); const b = await el.boundingBox();
+      const cdp = await page.target().createCDPSession();
+      const pt = { x: b.x + b.width / 2, y: b.y + b.height * (fy == null ? 0.5 : fy) };
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [pt] });
+      await new Promise((r2) => setTimeout(r2, holdMs || 0));
+      const during = await page.evaluate(() => window.__n64Worker.state().sent);
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      await new Promise((r2) => setTimeout(r2, 400));
+      const after = await page.evaluate(() => window.__n64Worker.state().sent);
+      await cdp.detach();
+      return { during, after };
+    };
+    { const el = await page.$('#mobileSplashStart'); const b = await el.boundingBox();
+      const cdp = await page.target().createCDPSession(); const pt = { x: b.x + b.width / 2, y: b.y + b.height / 2 };
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [pt] });
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] }); await cdp.detach(); }
+    await waitRunning(page);
+    await page.waitForFunction('window.__n64Worker && window.__n64Worker.state().stat && window.__n64Worker.state().stat.vi > 30', { timeout: 120000 });
+    await new Promise((r2) => setTimeout(r2, 3000));
+    t.on = await page.evaluate(() => window.__n64Worker.state().on);
+    const a = await touch('#mobileA', 0.5, 300);
+    t.buttonA = !!(a.during && (a.during[0] & (1 << 4)) && a.after && !(a.after[0] & (1 << 4)));
+    const z = await touch('#mobileZ', 0.5, 300);
+    t.buttonZ = !!(z.during && (z.during[0] & (1 << 7)) && z.after && !(z.after[0] & (1 << 7)));
+    // Stick: the upper part of the disc is UP; axis1 is in the core's own units (down-positive).
+    const st = await touch('#mobileStickDisc', 0.15, 300);
+    t.stickUp = !!(st.during && st.during[2] < -16000 && st.after && st.after[2] === 0);
+    const canvas = await page.$('#mobileScreen canvas');
+    if (canvas) await canvas.screenshot({ path: `/tmp/n64-sweep/page-worker-mobile-${rom.replace(/\.z64$/, '')}.png` }).catch(() => {});
+    t.ok = !!(t.on && t.buttonA && t.buttonZ && t.stickUp && t.pageErrors.length === 0);
+    await page.close();
+    }
   }
 
   // ---------- standing invariants of this page ----------
@@ -460,7 +581,8 @@ try {
     const off = []
       .concat(result.desktop.offOrigin || [], result.mobile.offOrigin || [],
               result.ratetest.offOrigin || [], result.meter.offOrigin || [], result.diag.offOrigin || [],
-              result.pace.offOrigin || [], result.rafdedupe.offOrigin || []);
+              result.pace.offOrigin || [], result.rafdedupe.offOrigin || [],
+              result.worker.offOrigin || [], result.workerMobile.offOrigin || []);
     t.offOriginRequests = [...new Set(off)].slice(0, 8);
     t.noOffOrigin = t.offOriginRequests.length === 0;
     t.ok = !!(t.noCoiServiceWorker && t.vendorSelfHosted && t.noOffOrigin);
@@ -470,10 +592,10 @@ try {
 } finally {
   await browser.close();
 }
-for (const k of ['desktop', 'mobile', 'ratetest', 'meter', 'diag', 'pace', 'rafdedupe']) {
+for (const k of ['desktop', 'mobile', 'ratetest', 'meter', 'diag', 'pace', 'rafdedupe', 'worker', 'workerMobile']) {
   result[k].consoleErrors = (result[k].consoleErrors || []).slice(0, 6);
   result[k].failedRequests = (result[k].failedRequests || []).slice(0, 6);
   delete result[k].offOrigin;   // rolled up into result.invariants
 }
-result.ok = ['desktop', 'mobile', 'ratetest', 'meter', 'diag', 'pace', 'rafdedupe', 'invariants'].every((k) => result[k].ok === true);
+result.ok = ['desktop', 'mobile', 'ratetest', 'meter', 'diag', 'pace', 'rafdedupe', 'worker', 'workerMobile', 'invariants'].every((k) => result[k].ok === true);
 console.log(JSON.stringify(result, null, 1));

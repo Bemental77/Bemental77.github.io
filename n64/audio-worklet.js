@@ -21,6 +21,8 @@
 // Port protocol:
 //   in:  { s: Int16Array }  — stereo interleaved samples to enqueue
 //        { cmd: 'clear' }   — drop the queue (reset to buffering)
+//        { port }           — adopt a MessagePort as a second input speaking
+//                             this same protocol (the core worker's direct feed)
 //   out: { b, u, m, r }     — backlog in Int16 entries, dry/drain events,
 //                             cumulative silenced entries, current ratio;
 //                             sent ~every 32 ms
@@ -72,6 +74,11 @@ class N64AudioProcessor extends AudioWorkletProcessor {
         }
       } else if (d && d.cmd === 'clear') {
         this.writeFrame = 0; this.readPos = 0; this.buffering = true; this.ratio = 1;
+      } else if (d && d.port) {
+        // A SECOND producer port: the page's core worker (n64/N64Wasm/dist/
+        // core_worker.js) feeds samples here directly, so audio never waits on
+        // the page's main thread. Same protocol, same queue.
+        d.port.onmessage = this.port.onmessage;
       }
     };
   }
