@@ -854,7 +854,18 @@
       var m = (r.image[p * pb] | (r.image[p * pb + 1] << 8)) & 0xffff;
       Module._gpx_set_pad(p, m);
     }
+    // A HIDDEN frame here is a returning player catching up in a delay room
+    // (see loop()): not presented, its audio rewound, as in rollback.
+    var lw0 = null;
+    if (hidden) {
+      lw0 = Module._gpx_audio_wpos ? Module._gpx_audio_wpos() : null;
+      if (Module._gpx_set_video_skip) Module._gpx_set_video_skip(1);
+    }
     Module._gpx_run();
+    if (hidden) {
+      if (Module._gpx_set_video_skip) Module._gpx_set_video_skip(0);
+      if (lw0 != null) Module._gpx_audio_rewind(lw0);
+    }
     guestFrames++; window.__genFrames++; LS.frames++;
 
     // The exact masks the core was handed, for a test to assert on rather than
@@ -1139,9 +1150,13 @@
     // ⚠ REJOINING IS NOT SHOWN AS A FAST-FORWARD (gate 9). A console that was
     // away is a rejoin-sized gap behind the room: until it is back, EVERY frame
     // runs hidden, the last picture holds, and the HUD says so.
-    var rejoining = !!(lsE && lsE.rollback && typeof lsE.rbRejoining === 'function' && lsE.rbRejoining());
+    // (In delay lockstep too: a capacity-gated room the engine moved to input
+    // delay takes a returning player back the same way — lib/netplay.js
+    // _dropRoom. The engine answers false/0 wherever that does not apply, and
+    // rbCatchUp() is also the tick mark its cadence rule counts frames in.)
+    var rejoining = !!(lsE && typeof lsE.rbRejoining === 'function' && lsE.rbRejoining());
     if (rejoining) { NET.notice = 'Rejoining the room — catching up…'; NET.noticeUntil = Date.now() + 400; }
-    if (lsE && lsE.rollback && typeof lsE.rbCatchUp === 'function') {
+    if (lsE && typeof lsE.rbCatchUp === 'function') {
       var cu = lsE.rbCatchUp();
       for (var ci = 0; ci < cu; ci++) if (!lsRunFrame(true)) break;
     }
@@ -1975,7 +1990,7 @@
     }
     if (netCapHeld()) return 'This device cannot run the emulator, so the party cannot start it here.';
     if (NET.notice && Date.now() > (NET.noticeUntil || 0)) NET.notice = null;
-    if (netPartyState() === 'playing') return NET.notice ? NET.notice : 'Playing — everyone started together at frame ' + (NET.startedAtFrame | 0) + '.';
+    if (netPartyState() === 'playing') return NET.notice ? NET.notice : NET.modeNote ? NET.modeNote : 'Playing — everyone started together at frame ' + (NET.startedAtFrame | 0) + '.';
     if (netAlone()) return 'Waiting for another player — share the code ' + s.code + '. Starts by itself once two are in and loaded.';
     var who = netPartyRows().filter(function (r) { return r.who && r.state !== 'ready' && r.state !== 'playing'; })
       .map(function (r) { return r.local ? 'this console' : netPortLabel(r.port); });
@@ -2016,7 +2031,7 @@
   }
   function netPartyReset() {
     NET.autoStarted = false; NET.loading = false; NET.loadPct = 0; NET.bar = null;
-    NET.gameIdx = -1; NET.startedAtFrame = 0; NET.notice = null;
+    NET.gameIdx = -1; NET.startedAtFrame = 0; NET.notice = null; NET.modeNote = null;
     if (NET.tick) { clearInterval(NET.tick); NET.tick = 0; }
     netPartyButtons();
   }
@@ -2127,6 +2142,17 @@
         pageLog('[lockstep] ' + e.rejoin.who + ' is back from frame ' + e.rejoin.at);
       }
       if (e && e.window) pageLog('[rollback] window ' + e.window.from + ' -> ' + e.window.to + ' frames' + (e.window.why ? ' — ' + e.window.why : ''));
+      // CAPACITY GATING (lib/netplay.js _capDecide): the room switched between
+      // zero-lag (rollback) and input delay. The engine's sentence names who
+      // and why ("this device is too slow for zero-lag mode; using input delay
+      // to keep full speed") and stays on the status line while it holds.
+      if (e && e.mode) {
+        var mt = String(e.mode.text || '');
+        mt = mt.charAt(0).toUpperCase() + mt.slice(1) + '.';
+        NET.modeNote = e.mode.to === 'delay' ? mt : null;
+        if (e.mode.to !== 'delay') { NET.notice = mt; NET.noticeUntil = Date.now() + 6000; }
+        pageLog('[lockstep] mode -> ' + e.mode.to + ' at frame ' + e.mode.frame + (e.mode.why ? ' — ' + e.mode.why : ''));
+      }
       netRoomRender();
     });
     session.on('room', function () { netRoomRender(); });
