@@ -93,6 +93,10 @@ for (const players of [2, 4]) for (const ow of [0, 50, 100]) for (const slow of 
   const line = `gated ${g.minRate.toFixed(4)}x (${Object.values(g.consoles).map((c) => c.mode + (c.mode === 'delay' ? c.delay : '')).join('/')}, `
     + `slow presents ${sc.presented}) vs delay-lockstep d=${d} ${l.minRate.toFixed(4)}x (slow presents ${lc.presented})  `
     + `switches ${sc.modes.map((m) => m.to + '@' + m.frame).join(',') || 'none'}  desync ${g.desyncs} cmp ${g.compared} truth ${g.truthChecked - g.truthBad}/${g.truthChecked}`;
+  // THE CADENCE (Lockstep._lsCadenceHold): a console switched to delay runs
+  // one frame per display tick again, not three (it presented 0.31-0.33 of its
+  // ticks before the fix, against 0.96 for the same room started in delay).
+  if (sc.mode === 'delay' && !(sc.presented >= 0.7)) bad.push('the slow console presents only ' + sc.presented + ' of its display ticks after the switch (< 0.7)');
   ok(name, !bad.length && g.minRate >= l.minRate - 0.005 && sameEverywhere(g), line + (bad.length ? '\n        ' + bad.join('; ') : ''));
   if (json) console.log(JSON.stringify({ g, l }));
 }
@@ -182,6 +186,45 @@ if (want('switch-without-lsmode')) {
                  outage: { id: who, from: at, to: at + 4000 }, stepMsAt: slowThenFast('G1', 15000) });
   }
   adversarial('away-across-the-switch', cells);
+}
+// ---- a player AWAY 15 s from a room the gate moved to delay lockstep ----------
+// ⚠ The first cut turned drop/rejoin off with the switch: the room failed for
+// everyone ("no input from player 3 for 8s", 0.11x) where the same room without
+// the gate played on at 0.93x. Now the delay room drops the silent player at an
+// agreed frame, plays on, refills it, catches it up hidden and takes it back.
+if (want('away-15s-in-a-delay-room')) {
+  const L = globalThis.Netplay.Lockstep.prototype, decide = L._capDecide;
+  const bad = [];
+  let n = 0, rejoins = 0;
+  const rows = [];
+  // the away player is a fast one, or the slow console itself
+  for (const seed of [1, 2, 3]) for (const [players, away] of [[2, 'G1'], [3, 'G2'], [3, 'G1'], [4, 'G3']]) for (const linkOnly of [false, true]) {
+    // (a 16 ms/step console away 15 s catches up at what is left of its own
+    // capacity, so the room runs long enough for it to be back)
+    const cell = { name: 'away', seed, secs: away === 'G1' ? 90 : 50, players, baseMs: 50, jitterMs: 20, loss: 0.02, runFrac: RUN_FRAC, linkOnly,
+                   outage: { id: away, from: 10000, to: 25000 }, stepMsAt: (id) => id === 'G1' ? 16 : null };
+    const g = simulate(cell);
+    L._capDecide = function () {};
+    let ng;
+    try { ng = simulate(cell); } finally { L._capDecide = decide; }
+    n++;
+    const failed = Object.entries(g.consoles).filter(([, x]) => x.state === 'failed' || x.state === 'desync').map(([k, x]) => k + ': ' + x.error);
+    const back = g.events.some((e) => e.at === 'H' && e.ev === 'rejoin' && e.who);
+    if (back) rejoins++;
+    const tag = `s${seed}/${players}p/${away}-away-15s/${linkOnly ? 'link' : 'tab'}`;
+    rows.push(`${tag} gated ${g.minRate.toFixed(4)}x (${g.consoles.H.mode}) vs ungated ${ng.minRate.toFixed(4)}x`);
+    // gate 9 too: nothing presented above 1.02x, nobody past the room clock
+    const g9 = judge(g).filter((x) => /PRESENTED|credited|past the room clock|did not run the pad/.test(x));
+    if (g9.length) bad.push(`${tag}: ${g9.join('; ')}`);
+    // A two-player delay room drops after LS_DROP_AFTER_MS (6 s) rather than
+    // rollback's 2.5 s (lib/netplay.js): the 3.5 s more it stalls is allowed.
+    const slack = players === 2 ? 3500 / (cell.secs * 1000) + 0.01 : 0.01;
+    if (g.consoles.H.mode !== 'delay' || failed.length || g.desyncs || g.truthBad || !g.truthChecked || !back || g.minRate < ng.minRate - slack) {
+      bad.push(`${tag}: mode ${g.consoles.H.mode} rate ${g.minRate} vs ${ng.minRate} rejoined ${back} desync ${g.desyncs} truth ${g.truthChecked - g.truthBad}/${g.truthChecked} ${failed.join(' | ').slice(0, 160)}`);
+    }
+  }
+  ok('away-15s-in-a-delay-room', !bad.length, `${n} rooms in delay lockstep, a player away 15 s: ${rejoins} taken back, none failed, 0 desyncs, never below the ungated room (two players: but for the 3.5 s longer stall before the drop)`
+     + '\n        ' + (bad.length ? bad.slice(0, 4).join('\n        ') : rows.slice(0, 4).join('\n        ')));
 }
 console.log(`\n[rb-capacity] ${pass}/${pass + fail} passed`);
 process.exit(fail ? 1 : 0);

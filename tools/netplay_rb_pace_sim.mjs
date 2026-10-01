@@ -291,6 +291,7 @@ export function simulate(sc) {
       for (let i = 0; i < k; i++) { const w = runFrame(p, true); if (!w) break; work += w; }
     }
     while (p.accum >= FRAME && ran < 4) { const w = runFrame(p, rejoining); if (!w) break; work += w; p.accum -= FRAME; ran++; }
+    if (globalThis.__simTick) globalThis.__simTick(p, T, ran, work);
     if (p.accum > FRAME) p.accum = FRAME;
     if (ran && !rejoining) p.presented++;
     if (pace < 1) p.pacedTicks++;

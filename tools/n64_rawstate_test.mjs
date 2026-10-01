@@ -19,7 +19,7 @@
 // machine state in it.
 //
 // USAGE (needs `npm run web`, or WEB_ROOT=<hermetic tree> PORT=<n> node tools/devserver.mjs):
-//   bash tools/probe_lock.sh run -- node tools/n64_rawstate_test.mjs [--game "Mario Kart 64"] [--warm 600] [--frames 120] [--reps 3] [--url http://localhost:8080] [--jit off]
+//   bash tools/probe_lock.sh run -- node tools/n64_rawstate_test.mjs [--game "Mario Kart 64"] [--warm 600] [--frames 120] [--reps 3] [--url http://localhost:8080] [--jit off] [--query fbasync=0]
 // Exit code 0 only if every rep is exact and every fast save matches.
 import { createRequire } from 'node:module';
 import { existsSync, writeFileSync } from 'node:fs';
@@ -29,18 +29,18 @@ const puppeteer = require('puppeteer');
 const argv = process.argv.slice(2);
 const flag = (n, d) => { const i = argv.indexOf('--' + n); return i >= 0 && argv[i + 1] != null ? argv[i + 1] : d; };
 const GAME = flag('game', 'Mario Kart 64'), WARM = +flag('warm', '600'), K = +flag('frames', '120'), REPS = +flag('reps', '3');
-const BASE = flag('url', 'http://localhost:8080'), JIT = flag('jit', '');
+const BASE = flag('url', 'http://localhost:8080'), JIT = flag('jit', ''), QX = flag('query', '');
 const CHROME = process.env.CHROME_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
 const browser = await puppeteer.launch({ headless: 'new', executablePath: existsSync(CHROME) ? CHROME : undefined, protocolTimeout: 900000,
   args: ['--no-sandbox', '--disable-dev-shm-usage', '--autoplay-policy=no-user-gesture-required', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'] });
 try { (await import('./browser_leak_guard.js')).default.guard(browser, fileURLToPath(import.meta.url)); } catch (_e) {}
-const out = { game: GAME, warm: WARM, frames: K, reps: REPS, jit: JIT || 'default' };
+const out = { game: GAME, warm: WARM, frames: K, reps: REPS, jit: JIT || 'default', query: QX };
 let pass = false;
 try {
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 900 });
   page.on('pageerror', (e) => { (out.pageErrors = out.pageErrors || []).push(String(e).slice(0, 300)); });
-  const q = `game=${encodeURIComponent(GAME)}&autostart` + (JIT ? `&jit=${JIT}` : '');
+  const q = `game=${encodeURIComponent(GAME)}&autostart` + (JIT ? `&jit=${JIT}` : '') + (QX ? `&${QX}` : '');
   await page.goto(`${BASE}/n64/?${q}`, { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => window.Module && Module._neil_ls_arm && window.myApp && window.myApp.rivetsData
     && window.myApp.rivetsData.beforeEmulatorStarted === false, { timeout: 240000 });

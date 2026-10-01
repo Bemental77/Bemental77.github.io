@@ -509,6 +509,14 @@
     return false;
   }
 
+  // interpreter ops that can call gen_interrupt() while leaving PC at the
+  // next instruction: MTC0 (COP0 rs=4) and every store opcode
+  function mayGenInterrupt(w) {
+    var op = (w >>> 26) & 0x3F;
+    if (op === 0x10) return ((w >>> 21) & 0x1F) === 0x04;
+    return (op >= 0x28 && op <= 0x2E) || op === 0x38 || op === 0x39 || op === 0x3C || op === 0x3D || op === 0x3F;
+  }
+
   function emitCountBatch(p, addr) {
     var val = [OP.i32_const].concat(sleb((addr + 8) | 0),
       loadI32(p.lastAddr), [OP.i32_sub, OP.i32_const, 0x02, OP.i32_shr_u],
@@ -581,7 +589,15 @@
   // fast-arm bytes — the same parameter, for the same reason, as cuGuard's.
   // Omit it only where the caller marks no register dirty while building that
   // arm. See the note above emitLoad.
-  function slowArm(p, C, instrPtr, opsIdx, brDepth, slow, refreshReg, preFlush) {
+  // `exitAlways` (2026-09-30): a slow STORE can reach an MMIO write handler
+  // that runs gen_interrupt itself (mi_controller.c:105) — and gen_interrupt
+  // can END THE FRAME without moving PC (VI_INT -> retro_return ->
+  // stop_stepping). The interpreter then returns to r4300_step, which ends
+  // retro_run; a block that continued ran the next frame's code inside this
+  // one. So a store's slow arm always hands back to the dispatcher (PC is
+  // already the next instruction). Loads keep continuing: no read handler
+  // calls gen_interrupt.
+  function slowArm(p, C, instrPtr, opsIdx, brDepth, slow, refreshReg, preFlush, exitAlways) {
     var flushed = preFlush || C.flushSnapshot();
     if (slow) {
       return [].concat(
@@ -595,8 +611,10 @@
       storeI32Const(p.pcGlobal, instrPtr),
       [OP.i32_const], sleb(opsIdx), [OP.call_indirect, 0x00, 0x00],
       refreshReg >= 0 ? loadI64(p.regBase + refreshReg * 8).concat([OP.local_set], leb(L_REG0 + refreshReg)) : [],
-      loadI32(p.pcGlobal), [OP.i32_const], sleb(instrPtr + p.stride), [OP.i32_ne],
-      [OP.br_if].concat(leb(brDepth)));
+      exitAlways
+        ? [OP.br].concat(leb(brDepth))
+        : [].concat(loadI32(p.pcGlobal), [OP.i32_const], sleb(instrPtr + p.stride), [OP.i32_ne],
+                    [OP.br_if], leb(brDepth)));
   }
 
   // ---- native loads & stores ----
@@ -803,7 +821,7 @@
         // continue-after-fallback: store ops write no guest registers, so
         // both arms join with the cache untouched; snapshot-flush keeps
         // memory current for the interp op (it reads rs/rt from reg[])
-        slowArm(p, C, instrPtr, opsIdx, exitDepth + 1, slow, -1),
+        slowArm(p, C, instrPtr, opsIdx, exitDepth + 1, slow, -1, undefined, true),
       [OP.end]
     );
   }
@@ -1256,7 +1274,7 @@
         fast,
       [OP.else_],
         bump((slow ? 'SLOTSLOW:' : 'SLOW:') + mnem(word)),
-        slowArm(p, C, instrPtr, opsIdx, exitDepth + 2, slow, -1), // inside cu-if + this if
+        slowArm(p, C, instrPtr, opsIdx, exitDepth + 2, slow, -1, undefined, op === 0x39 || op === 0x3D), // inside cu-if + this if; SWC1/SDC1 hand back (see slowArm)
       [OP.end]
     );
     return cuGuard(p, C, nat, instrPtr, opsIdx, exitDepth, word, slow, preFlush);
@@ -1792,8 +1810,13 @@
         C.flushAndInvalidate(),
         storeI32Const(p.pcGlobal, instrPtr),
         [OP.i32_const], sleb(opsIdx), [OP.call_indirect, 0x00, 0x00],
-        loadI32(p.pcGlobal), [OP.i32_const], sleb(nextPtr),
-        [OP.i32_ne, OP.br_if].concat(leb(EXIT))
+        // MTC0 Count/Status run gen_interrupt inline (mips_instructions.def
+        // :672,:698) and any store may hit the MI write handler that does
+        // (mi_controller.c:105): either can end the frame without moving PC,
+        // so those hand back to the dispatcher unconditionally (see slowArm).
+        mayGenInterrupt(word)
+          ? [OP.br].concat(leb(EXIT))
+          : [].concat(loadI32(p.pcGlobal), [OP.i32_const], sleb(nextPtr), [OP.i32_ne, OP.br_if], leb(EXIT))
       ));
       stats.fallbackOps++;
       i++;
