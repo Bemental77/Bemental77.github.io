@@ -323,7 +323,7 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
   // One guest frame. With the takeover live, updated_display = 0 makes
   // one_iter's head run GPUupdateLace1 (the display update) every vblank; the
   // dfxvideo limiter that used to set it is off.
-  var QUIET = false, quietRenders = 0, quietAudio = 0;
+  var QUIET = false, QUIET_AUDIO = false, quietRenders = 0, quietAudio = 0;
   function runFrame() {
     if (TAKE) Module.HEAP32[CORE.updatedDisplay >> 2] = 0;
     _one_iter();
@@ -334,7 +334,7 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
   var origRender = render;
   render = function () { if (QUIET) { quietRenders++; return; } return origRender.apply(this, arguments); };
   var origSendSound = SendSound;
-  SendSound = function () { if (QUIET) { quietAudio++; return; } return origSendSound.apply(this, arguments); };
+  SendSound = function () { if (QUIET_AUDIO) { quietAudio++; return; } return origSendSound.apply(this, arguments); };
 
   // SOLO PACER — an absolute timeline at the disc's rate. Frame n starts at
   // t0 + n/Hz; a frame that finishes early waits for its slot. Falling behind
@@ -406,8 +406,19 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
     h = fnvWords(new Uint32Array(b, o + memMap.m, 0x200000 >> 2), h);
     h = fnvWords(new Uint32Array(b, o + memMap.hw, 0x10000 >> 2), h);
     if (vram_ptr && (vram_ptr & 3) === 0) h = fnvWords(new Uint32Array(b, o + vram_ptr, (1024 * 512 * 2) >> 2), h);
+    // ...and ALL static data: the CPU/GTE registers (psxRegs), the root
+    // counters, the SPU (channels, registers, its 512 KB RAM), the CD-ROM
+    // controller, SIO and both memory-card images (Mcd1Data/Mcd2Data) — so a
+    // divergence there is caught at the next fingerprint, not when it reaches
+    // RAM. [1024, STATIC_END) is .data+.bss; the 64 KB above it is the stack.
+    // Excluded, because they hold HOST values that no guest path reads: the
+    // dfsound timing accumulator (two f64 at 570568, written and read only in
+    // the flush that stamps them with emscripten_get_now).
+    for (var si = 0; si < STATIC_SPANS.length; si += 2) h = fnvWords(new Uint32Array(b, o + STATIC_SPANS[si], (STATIC_SPANS[si + 1] - STATIC_SPANS[si]) >> 2), h);
     return h >>> 0;
   }
+  var STATIC_END = 1129888;   // __heap_base 1195424 (sbrk's initial value) minus the 64 KB stack
+  var STATIC_SPANS = [1024, 570568, 570584, STATIC_END];
   function liveHash() {
     var tmp = { buf: null, len: 0 };
     snapSave(tmp);
@@ -509,7 +520,7 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
             var tl = performance.now();
             snapLoad(RB.slots[si]);
             RB.loadMs += performance.now() - tl;
-            QUIET = true;
+            QUIET = true; QUIET_AUDIO = true;
             try {
               for (var ri = 0; ri < rs.length; ri++) {
                 latchPads(rs[ri].states);
@@ -519,12 +530,19 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
                 rbSaveFrame((rs[ri].frame | 0) + 1);
                 resimRan++;
               }
-            } finally { QUIET = false; }
+            } finally { QUIET = false; QUIET_AUDIO = false; }
             RB.resim += resimRan;
           } else if (rbSlotOf(data.frame | 0) < 0) {
             throw new Error('the ring does not hold the start of frame ' + data.frame);
           }
           latchPads(data.states);
+          // A HIDDEN catch-up frame (the room clock says this console is behind)
+          // is not PRESENTED — no fast-forward on screen — but its audio IS
+          // played: it is guest time nobody has heard yet, and dropping it leaves
+          // the sink that many frames short (a desktop pair measured 32-37
+          // dropouts/min while it was dropped; not all of that is this cause —
+          // see ps1.html's rate notes). Re-simulated frames above are
+          // repeats, so both stay quiet there.
           QUIET = !!data.hidden;
           var tp = performance.now();
           try { runFrame(); creditAudio(); } finally { QUIET = false; }
@@ -537,7 +555,7 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
             var hs = rbSlotOf((hk[hi] | 0) + 1);
             hashes.push({ frame: hk[hi] | 0, hash: hs < 0 ? null : slotHash(RB.slots[hs]) });
           }
-        } catch (e) { err = String((e && e.message) || e); QUIET = false; }
+        } catch (e) { err = String((e && e.message) || e); QUIET = false; QUIET_AUDIO = false; }
         var ms = performance.now() - t0;
         if (ms > RB.maxStepMs) RB.maxStepMs = ms;
         postMessage({ cmd: 'netFrame', frame: data.frame, ran: err ? 0 : 1, resim: resimRan, ms: ms, hashes: hashes, err: err });
