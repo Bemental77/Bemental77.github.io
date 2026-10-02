@@ -25,7 +25,7 @@
        the wire. The file still exists because sibling pages have not been
        converted yet; loading it here would ship a second, contradictory online
        architecture on a page that has one. -->
-  <script src="/lib/netplay.js?v=62adf4e4"></script>
+  <script src="/lib/netplay.js?v=9d05e8a3"></script>
   <script src="/lib/mpgames.js"></script>
   <script>MPGames.gateParty('n64', ['btnNet', 'mobileSplashNet'], ['romSelect', 'mobileRomSelect']);</script>
   <script>
@@ -1623,7 +1623,7 @@ N64Rate.selfTest = function (logFn) {
 </script>
 <script src="/n64/N64Wasm/dist/fbasync.js?v=61174a18"></script>
 <script src="/n64/N64Wasm/dist/jit_params.js?v=bb2930f6"></script>
-<script src="/n64/N64Wasm/dist/room_core.js?v=c40feef9"></script>
+<script src="/n64/N64Wasm/dist/room_core.js?v=66a0c630"></script>
 <script>
 (function () {
   'use strict';
@@ -2445,8 +2445,8 @@ N64Rate.selfTest = function (logFn) {
   // lsDueNow) and takes the pad image this page posts — see the worker's header
   // for why that is the deterministic lockstep path and not SDL's DOM input.
   //
-  // WHEN. THE DEFAULT, for a solo console AND for a room (lockstep, and rollback
-  // with ?rb=1: the room driver and the engine run in the worker too — WORKER
+  // WHEN. THE DEFAULT, for a solo console AND for a room (rollback, the default,
+  // and lockstep: the room driver and the engine run in the worker too — WORKER
   // ROOMS, below), on a browser that can do it — Worker +
   // transferControlToOffscreen + WebGL2 inside a worker (lib/capability.js
   // webgl2Worker, which DOES it) + AudioWorklet. ?worker=0 pins the main-thread
@@ -2456,7 +2456,7 @@ N64Rate.selfTest = function (logFn) {
   // logged. If the worker fails while it boots (no WebGL2 there after all, a
   // core abort before "Starting R4300"), the page reloads ONCE with ?worker=0
   // (wkFallback) and says so in its log.
-  var WK_V = '74370c83';                           // cache-buster for the worker's scripts
+  var WK_V = '43feea77';                           // cache-buster for the worker's scripts
   var WK_DEFAULT = true;                     // the default for a capable console (solo and rooms)
   var WK = { on: false, why: null, w: null, stat: null, statAt: 0, presents0: 0, pendingAudioPort: null,
              evals: {}, evalId: 0, sent: null, composed: 0, posted: 0, fatal: null, booted: false,
@@ -2744,7 +2744,7 @@ N64Rate.selfTest = function (logFn) {
   //   * every call the page or the Session makes on it — receive (in arrival
   //     order), seat, unseat, dropPeer, forgetReady, requestRoster, _rosterSend,
   //     declareReady, fail, stopRosterBeat — and every setting it writes (delay,
-  //     rbHintMs, netFloorDelay) is posted to the worker, ONE postMessage each,
+  //     rbHintMs, netFloorDelay, rttDelay) is posted to the worker, ONE postMessage each,
   //     through one ordered port, where the real engine executes it;
   //   * everything the real engine sends goes back the same way ('lso') into the
   //     Session's own _send, and every event it emits ('lsev') is dispatched to the
@@ -2763,7 +2763,7 @@ N64Rate.selfTest = function (logFn) {
   var WK_ENG_CALLS = ['seat', 'unseat', 'dropPeer', 'forgetReady', 'requestRoster', '_rosterSend', 'declareReady', 'fail',
                       'stopRosterBeat', 'setDelay'];
   var WK_ENG_WORKER_ONLY = ['beginFrame', 'endFrame', 'submitHash', 'takeHashDue', 'rbCatchUp', 'rbPace', 'rbRingFrames', 'wantsHash'];
-  var WK_ENG_SETTINGS = ['delay', 'rbHintMs', 'netFloorDelay'];
+  var WK_ENG_SETTINGS = ['delay', 'rbHintMs', 'netFloorDelay', 'rttDelay'];
   function wkPost(m) { var w = wkEnsureWorker(); w.postMessage(m); }
   function wkAdoptEngine(ls, opts, send) {
     WK.eng = ls; WK.engSend = send;
@@ -4367,9 +4367,12 @@ N64Rate.selfTest = function (logFn) {
       // room does, which is before any core boots.
       try {
         // The HOST's choice wins ('lsgo' rb), so this is what this console
-        // proposes: delay lockstep by default, rollback with ?rb=1 (RB_DEFAULT).
+        // proposes: capacity-gated rollback by default (RB_DEFAULT), delay lockstep with ?rb=0.
+        // rbResume: a capacity-gated room that dropped to input delay can come
+        // back to zero-lag mode — room_core.js rbRearm keeps the start of the
+        // first rollback frame after the delay stretch (lib/netplay.js opts.rbResume).
         if (typeof s.startLockstep === 'function') s.startLockstep({ portCount: 4, padBytes: LS_PAD_BYTES, rollback: RB_WANT ? RB_WINDOW : 0,
-          rollbackOk: true, rbCatchUp: true });
+          rollbackOk: true, rbCatchUp: true, rbResume: true });
       } catch (e) { pageLog('[lockstep] startLockstep threw: ' + ((e && e.message) || e)); }
       s.on('status', onStatus);
       // The host's roster names the ROM the room is on. A joiner loads THAT --
@@ -4693,8 +4696,15 @@ N64Rate.selfTest = function (logFn) {
       // waits for `connected`), so there is a peer to ping by the time this runs.
       try {
         var ls = sess.ls;
-        // Under rollback there is no input delay to size (the engine pins it to 0).
-        if (ls && ls.isHost && !ls.rollback && typeof sess.rttReport === 'function') {
+        // ⚠ A ROLLBACK HOST MEASURES THE LINK TOO. A rollback room runs no input
+        // delay — but a capacity-gated one switches to delay lockstep for a
+        // console that cannot afford rollback (or starts in it), and the delay it
+        // uses then is exactly the one chosen here (rttReport sets ls.rttDelay and
+        // ls.netFloorDelay; lib/netplay.js _capDelay). Skipped, the switch was
+        // sized from input lateness that includes how far the slow console trails
+        // the room: 9-17 frames where this picks 6
+        // (n64/docs/rollback-default/RESULTS.md, causes 1 and 3).
+        if (ls && ls.isHost && typeof sess.rttReport === 'function') {
           // Several round trips per player, at this cartridge's real field
           // period: the engine sizes the delay to the jitter (mean + 2 sd) and,
           // with three or four players, to the host-relayed guest-to-guest path
@@ -4706,9 +4716,11 @@ N64Rate.selfTest = function (logFn) {
           // Clamp matches the engine (Lockstep.recommendDelay answers up to 30): capping at 10 threw the engine's own answer away — see dreamcast.html chooseDelay, "Capping BELOW what the engine supports".
           var want = (rep && rep.recommendedDelay != null)
             ? Math.max(1, Math.min(30, rep.recommendedDelay | 0)) : null;
+          if (want != null && ls.rttDelay !== want) ls.rttDelay = want;
           if (want != null && want !== ls.delay) {
             pageLog('[lockstep] input delay ' + ls.delay + ' -> ' + want + ' frames, chosen from the '
-                  + 'worst measured RTT ' + (rep.worstMs == null ? '?' : Math.round(rep.worstMs)) + ' ms');
+                  + 'worst measured RTT ' + (rep.worstMs == null ? '?' : Math.round(rep.worstMs)) + ' ms'
+                  + (ls.rollback ? ' (a rollback room runs 0; this is the delay it uses if a console cannot afford rollback)' : ''));
             ls.delay = want;
           }
         }
@@ -4867,8 +4879,8 @@ N64Rate.selfTest = function (logFn) {
       worker: !!WK.room,
     };
     for (var k in core) out[k] = core[k];
-    // 'rollback' (delay 0, predict + re-simulate; ?rb=1) or 'lockstep' (delay-based, the
-    // default — RB_DEFAULT) — the HOST's choice, read off the engine.
+    // 'rollback' (delay 0, predict + re-simulate; the default — RB_DEFAULT) or 'lockstep'
+    // (delay-based: ?rb=0, or the capacity gate's switch) — the HOST's choice, read off the engine.
     // The room's own fields: who this console is, the session, and THE PARTY — what the
     // button, the panel and a rig all read. `declared` and `able` are results of doing the
     // thing (setReady was called; the core took _neil_ls_arm); no row carries a peer nonce.

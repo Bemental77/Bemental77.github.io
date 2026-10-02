@@ -377,7 +377,7 @@ function roomLite(ls) {
            portCount: ls.portCount, padBytes: ls.padBytes, lobby: new Map(Array.from(ls.lobby.keys()).map(function (k) { return [k, true]; })),
            dropped: new Map(ls.dropped), _bar: ls._bar || null, error: ls.error, desync: ls.desync, hashEvery: ls.hashEvery,
            _rbConfirmed: ls._rbConfirmed, roomGame: ls.roomGame, rbMaxWindow: ls.rbMaxWindow, rbCapable: ls.rbCapable,
-           rbHintMs: ls.rbHintMs, netFloorDelay: ls.netFloorDelay, rosterEvicted: ls.rosterEvicted, lastAgreedFrame: ls.lastAgreedFrame,
+           rbHintMs: ls.rbHintMs, netFloorDelay: ls.netFloorDelay, rttDelay: ls.rttDelay, rosterEvicted: ls.rosterEvicted, lastAgreedFrame: ls.lastAgreedFrame,
            _hostId: ls._hostId };
 }
 function clonable(x) { try { return JSON.parse(JSON.stringify(x)); } catch (e) { return null; } }
