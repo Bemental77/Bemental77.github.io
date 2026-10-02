@@ -91,7 +91,14 @@ const JSONPATH = flag('json', '/tmp/n64-lockstep.json');
 // step window.Module themselves, so they always pin the MAIN-THREAD core (?worker=0): the
 // worker-hosted core's equivalence to it is n64/tools/n64_worker_probe.mjs --mode exact.
 const XQ = flag('query', '');
-const XQS = XQ ? '&' + XQ : '';
+// ⚠ THE PAIR ARM COMPARES EVERY PRESENTED FRAME, WHICH IS A LOCKSTEP PROPERTY. Since rooms
+// default to capacity-gated ROLLBACK (cdcc625), a presented frame may run on a predicted
+// input and be corrected later, so two consoles legitimately present different states
+// for a few frames: measured 2026-10-02 on HEAD, 3/3 pair runs "FIRST-DIFF" at frames
+// 284-313 (the rollback stretch) with the engines' own fingerprints agreeing 16/16 and no
+// desync. So unless the query names a mode, the pair arm runs delay lockstep (rb=0);
+// rollback exactness is n64/tools/n64_rollback_probe.mjs's job (confirmed states, full hash).
+const XQS = (XQ ? '&' + XQ : '') + (/(^|&)rb=/.test(XQ) ? '' : '&rb=0');
 // --join-query 'k=v' is appended to the JOINER's pair URL only: a MIXED room, e.g. a
 // main-thread host (--query worker=0) with a worker joiner (--join-query worker=1).
 const JQ = flag('join-query', '');

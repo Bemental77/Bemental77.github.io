@@ -84,6 +84,11 @@ const RTT = flag('rtt', '1') !== '0';
 const RTTSEED = flag('rttseed', null);
 const FORCE_RETURN = +flag('force-return', '0');
 const LDELAY = +flag('ldelay', '0'), LFLOOR = +flag('lfloor', '0'), WSLOW = +flag('wslow', '1');
+// --wslow-until S: the slowed worker core gets its own speed back S seconds into the window — a
+//   device whose step later FITS. The gated room must return to rollback on the engine's real
+//   judgement (rbResume; no --force-return), and with --cin every confirmed state after the
+//   return is checked bit for bit like any other.
+const WSLOW_UNTIL = +flag('wslow-until', '0');
 // --expect rollback|any: the room must still be in rollback at the end (default: rollback, the
 //   exactness probe) / may have been switched by the capacity gate (a rate cell's G or L arm).
 // --cin: record every input the ROOM's engine holds (engine.inputs: real inputs only, final once
@@ -277,9 +282,9 @@ try {
         ['_neil_ls_run_frame', '_neil_state_save_raw_fast', '_neil_state_load_raw'].forEach(function (n) {
           var f = M[n]; if (typeof f !== 'function') return;
           M[n] = function () {
-            var t0 = performance.now(), r = f.apply(this, arguments), d = performance.now() - t0, until = performance.now() + d * (R - 1);
+            var R2 = self.__wslow.R, t0 = performance.now(), r = f.apply(this, arguments), d = performance.now() - t0, until = performance.now() + d * (R2 - 1);
             while (performance.now() < until) {}
-            self.__wslow.calls++; self.__wslow.baseMs += d; self.__wslow.addedMs += d * (R - 1);
+            self.__wslow.calls++; self.__wslow.baseMs += d; self.__wslow.addedMs += d * (R2 - 1);
             return r;
           };
           done.push(n);
@@ -338,6 +343,7 @@ try {
     try { cx = n.worker ? await window.__n64Worker.eval(capx + '(self.RM && self.RM.eng)') : (0, eval)(capx)(window.__n64LsEngine); } catch (e) { cx = { err: String(e) }; }
     return { t: performance.now(), frame: n.frame, mode: n.mode, rb: n.rollback, ra: n.runahead, stalls: n.stalls, stallMs: n.stallMs,
              reanchors: n.reanchors, lostMs: n.lostMs, advWaits: n.advWaits, viHz: n.viHz, costAvgMs: n.costAvgMs, fault: n.fault,
+             costOver: n.costOver, costMaxMs: n.costMaxMs,
              engineState: n.engine && n.engine.state, error: n.engine && n.engine.error, ghosts: window.__ghostStat,
              fb: n.fb, lat: n.lat, speed: window.__n64Rate && window.__n64Rate.speed,
              eng: n.engine ? { delay: n.engine.delay, state: n.engine.state, desync: n.engine.desync, mode: n.engine.mode,
@@ -362,6 +368,10 @@ try {
               shown: s.pres && prev.pres ? s.pres.shown - prev.pres.shown : null, ticks: s.pres && prev.pres ? s.pres.frames - prev.pres.frames : null,
               capx: s.capx });
     if (s.rb && s.rb.page) lastRbPage = s.rb.page;
+    if (WSLOW_UNTIL > 0 && i + 1 === WSLOW_UNTIL && out.worker && WSLOW > 1) {
+      await page.evaluate(() => window.__n64Worker.eval('self.__wslow.R = 1'));
+      tl[tl.length - 1].wslowLifted = true; out.wslowLiftedAt = i + 1;
+    }
     // --force-return S (TEST SEAM, never a product path): once the gated room is in delay and
     // S seconds of the window have passed, the HOST engine is told every console can afford
     // rollback (its _capNeedOf answers 0.1, the calm is 1 s) so it schedules the return; once the
@@ -399,7 +409,7 @@ try {
     resimFramesPerFrame: rbZ && rbA ? +((rbZ.resimFrames - rbA.resimFrames) / Math.max(1, z.frame - a.frame)).toFixed(3) : null,
     page: rbZ, engine: z.rb && z.rb.engine, state: z.rb && z.rb.state, runahead: z.ra, advWaits: z.advWaits - a.advWaits,
     stalls: z.stalls - a.stalls, stallMs: z.stallMs - a.stallMs, reanchors: z.reanchors - a.reanchors, lostMs: (z.lostMs || 0) - (a.lostMs || 0),
-    costAvgMs: z.costAvgMs, fb: z.fb, ghosts: z.ghosts, fault: z.fault, engineState: z.engineState, error: z.error,
+    costAvgMs: z.costAvgMs, costOver: (z.costOver || 0) - (a.costOver || 0), costMaxMs: z.costMaxMs, fb: z.fb, ghosts: z.ghosts, fault: z.fault, engineState: z.engineState, error: z.error,
     latFrames: (z.lat && z.lat.samples || []).map((x) => x.frames),
     tappedFrames: Object.keys(room.full).length, confirmedTo: room.confirmed,
   });

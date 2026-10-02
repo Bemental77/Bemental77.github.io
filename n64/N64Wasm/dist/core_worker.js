@@ -198,15 +198,21 @@ function dueNow(now) {
   if (!(CLK.viHz > 0) || !CLK.base) return true;
   return now >= CLK.base + (CLK.frame - CLK.baseFrame) * (1000 / CLK.viHz);
 }
-function tick(src) {
+function tick(src) { if (DBG) return DBG.task('tick:' + src, tickBody)(src); return tickBody(src); }
+function tickBody(src) {
   if (src === 'raf') { SCHED.raf = false; SCHED.rafTicks++; }
   else if (src === 'imm') { SCHED.imm = false; SCHED.immTicks++; }
   else if (src === 'tmr') { SCHED.tmr = false; SCHED.tmrTicks++; }
   if (!paused) {
     CLK.ticks++;
-    if ((!SCHED.coupled || src === 'raf') && due(performance.now())) {
+    var now = performance.now();
+    if ((!SCHED.coupled || src === 'raf') && dueNow(now) && !cbMayDraw(src)) {
+      // yielded: the last field's picture is not pushed yet (THE COMMIT YIELD)
+    } else if ((!SCHED.coupled || src === 'raf') && due(now)) {
       var t0 = performance.now();
       runOneFrame();
+      cbDidDraw(src);
+      pbPresent();
       CLK.presents++; CLK.busyMs += performance.now() - t0;
       // A field the rAF-coupled loop would not have produced: the analog of the
       // main-thread pace governor's catch-up run (the meter's `paced`).
@@ -221,6 +227,8 @@ function tick(src) {
 function schedule() {
   if (paused) return;
   if (!SCHED.coupled && dueNow(performance.now())) {
+    // Yielded (THE COMMIT YIELD): its timer turn runs the field.
+    if (CB.waiting) return;
     if (!SCHED.imm) {
       if (!SCHED.chan) { SCHED.chan = new MessageChannel(); SCHED.chan.port1.onmessage = function () { tick('imm'); }; }
       SCHED.imm = true; SCHED.chan.port2.postMessage(0);
@@ -239,6 +247,100 @@ function schedule() {
   }
 }
 
+// ---- PRESENTATION BY BITMAP: EVERY DRAWN FIELD REACHES THE PAGE ------------------------
+// (See THE COMMIT YIELD below for what the canvas-commit path loses and why.) An ARM (?present=bitmap): with
+// boot.present === 'bitmap' the core draws into an OffscreenCanvas of this worker's own (no
+// placeholder, so nothing is ever committed behind its back), and after every field that
+// drew into the default framebuffer its picture is taken with transferToImageBitmap — a
+// buffer hand-over, no copy — and posted to the page, which puts it on #canvas
+// (ImageBitmapRenderingContext) on ITS OWN animation frames, one picture per frame, in
+// order. The page's main thread is idle (it holds only UI, input and the audio graph), so
+// its frames are the display's; this thread never waits for one — the guest's rate is
+// untouched (gate 9) — and two fields made between two display frames are both shown,
+// the second one frame later, instead of the first being overwritten unseen.
+// Only fields that DREW are taken: a field that draws nothing (Mario Kart draws a picture
+// every second field) leaves the last picture up, exactly as a canvas commit would.
+var PB = { on: false, drew: false, sent: 0, errs: 0, err: null, ms: 0 };
+function pbInstall() {
+  if (!self.WebGL2RenderingContext) return;
+  var P = WebGL2RenderingContext.prototype;
+  var FB = P.FRAMEBUFFER, DFB = P.DRAW_FRAMEBUFFER, bf = P.bindFramebuffer;
+  P.bindFramebuffer = function (t, fb) { if (t === FB || t === DFB) this.__pbFb = fb || null; return bf.apply(this, arguments); };
+  ['drawArrays', 'drawElements', 'drawRangeElements', 'drawArraysInstanced', 'drawElementsInstanced',
+   'clear', 'clearBufferfv', 'clearBufferiv', 'clearBufferuiv', 'clearBufferfi', 'blitFramebuffer'].forEach(function (n) {
+    var f = P[n]; if (typeof f !== 'function') return;
+    P[n] = function () {
+      if (!this.__pbFb && !(RM.R && RM.R.GLSKIP && RM.R.GLSKIP.on)) PB.drew = true;
+      return f.apply(this, arguments);
+    };
+  });
+}
+function pbPresent() {
+  if (!PB.on || !PB.drew) return;
+  PB.drew = false;
+  var bmp = null, t0 = performance.now();
+  try { bmp = BOOT.canvas.transferToImageBitmap(); } catch (e) { PB.errs++; PB.err = String((e && e.message) || e); return; }
+  try { postMessage({ t: 'frame', b: bmp, f: CLK.frame }, [bmp]); PB.sent++; } catch (e) { PB.errs++; PB.err = String((e && e.message) || e); }
+  PB.ms += performance.now() - t0;
+}
+
+// ---- THE COMMIT YIELD: A FIELD DOES NOT DRAW OVER ONE THAT WAS NEVER SHOWN -------------
+// MEASURED on a real phone (Android Chrome 154, Mali-G715, MK64 PAL, a room guest, after
+// the one-field-per-task driver above): 3907 fields, 4042 worker animation frames, but only
+// 2083 of those frames had a new field to show — "14 shown / 25 made". One field per TASK
+// is not one field per COMMIT. In Chrome a worker's placeholder-backed OffscreenCanvas
+// (transferControlToOffscreen) is pushed to the compositor only by that worker's
+// BeginFrame — its animation-frame task, after the rAF callbacks — at most once per
+// display frame. A field that costs about a field period (17.9 ms against PAL's 20 ms) is
+// almost always due again when the last one ends, and its immediate task ran AHEAD of the
+// BeginFrame that had arrived meanwhile: two fields drawn, one push, the first never seen.
+// So when a field is due while the last one's picture is still unpushed, this thread
+// YIELDS ONE TIMER TURN before drawing it: an animation frame already queued runs (and
+// pushes) first; if none was queued, the field runs anyway. It never WAITS for a frame.
+// Inside a rAF callback, a picture drawn before that frame is about to be pushed, so the
+// callback draws nothing over it and the field runs right after the push.
+// MEASURED here (MK64, solo, worker, hermetic snapshot, interleaved; screen = distinct
+// pictures the page's main thread saw / made = the game's own GameFPS):
+//   commit (no yield)   screen/made 0.82-0.85   fields/s 42.3, 42.4 (34.2 under load)
+//   yield               screen/made 0.92-0.99   fields/s 42.1, 41.6 (29.3 under load)
+//   WAIT for the frame  screen/made ~1.00       fields/s 36.8, 33.5 vs 39.1, 37.4 — REJECTED:
+//     the guest lost ~8% of its rate waiting on a 28/s compositor (gate 9).
+//   bitmap (below)      screen/made 0.98-0.99   fields/s 39.1-40.4 vs 42.3 — the per-field
+//     cost rose ~3 ms under SwiftShader, so it is an arm (?present=bitmap), not the default.
+// ?present=commit is the control arm (no yield).
+var CB = { on: true, mode: 'yield', drawn: false, commitThis: false, waiting: false, yielded: false,
+           holds: 0, released: 0, forced: 0, rafDraws: 0, taskDraws: 0, rafSkips: 0 };
+function cbMayDraw(src) {
+  if (!CB.on || !hasRaf) return true;
+  if (src === 'raf') {
+    if (!CB.commitThis) return true;
+    // this frame pushes the picture drawn before it: run the field right after the push
+    CB.rafSkips++;
+    if (!CB.waiting) { CB.waiting = true; setTimeout(function () { if (CB.waiting) cbRelease(); }, 0); }
+    return false;
+  }
+  if (!CB.drawn) return true;
+  if (CB.yielded) { CB.forced++; CB.waiting = false; return true; }
+  CB.yielded = true; CB.holds++;
+  if (!CB.waiting) { CB.waiting = true; setTimeout(function () { if (CB.waiting) cbRelease(); }, 0); }
+  return false;
+}
+function cbDidDraw(src) {
+  CB.yielded = false; CB.waiting = false;
+  if (src === 'raf') { CB.commitThis = true; CB.rafDraws++; }
+  else { CB.drawn = true; CB.taskDraws++; }
+}
+// The yielded field runs now, in an immediate task.
+function cbRelease() {
+  CB.waiting = false;
+  CB.released++;
+  if (RM.on && RM.R && RM.R.LS.armed) { roomKick(); return; }
+  if (!SCHED.imm && !paused) {
+    if (!SCHED.chan) { SCHED.chan = new MessageChannel(); SCHED.chan.port1.onmessage = function () { tick('imm'); }; }
+    SCHED.imm = true; SCHED.chan.port2.postMessage(0);
+  }
+}
+
 // ---- WHAT REACHED THE SCREEN ------------------------------------------------------------
 // The page's `shown` is "animation frames in which a NEW FIELD was drawn" (its
 // observePresents), never callbacks or refreshes. Here the pictures are committed by
@@ -253,6 +355,8 @@ function observePresents() {
   (function obs() {
     self.requestAnimationFrame(obs);
     PRES.frames++;
+    // THE COMMIT YIELD: this frame pushes whatever was drawn before it.
+    CB.commitThis = CB.drawn; CB.drawn = false;
     if (!M || !M._neil_vi_total) return;
     var vi = M._neil_vi_total() >>> 0;
     if (PRES.lastVi >= 0 && vi !== PRES.lastVi) PRES.shown++;
@@ -321,8 +425,11 @@ function postStats() {
          rafTicks: SCHED.rafTicks, immTicks: SCHED.immTicks, tmrTicks: SCHED.tmrTicks,
          paced: SCHED.paced, notOwed: SCHED.notOwed, coupled: SCHED.coupled, owed: Math.max(-2, Math.min(2, owed)),
          shown: PRES.shown, animFrames: PRES.frames, fpsText: fpsText(),
+         pb: PB.on ? { sent: PB.sent, errs: PB.errs, err: PB.err, ms: Math.round(PB.ms) } : null,
+         cb: { mode: CB.mode, yields: CB.holds, released: CB.released, forced: CB.forced,
+               rafDraws: CB.rafDraws, taskDraws: CB.taskDraws, rafSkips: CB.rafSkips },
          audioSent: AUD.sent, audioDropped: AUD.dropped,
-         jitBlocks: js ? js.blocks : null,
+         jitBlocks: js ? js.blocks : null, dbg: DBG ? DBG.report() : undefined,
          fb: self.__fbAsync ? { on: !!self.__fbAsync.on, calls: self.__fbAsync.calls, async: self.__fbAsync.async,
                                 sync: self.__fbAsync.sync, blocked: self.__fbAsync.blocked, decided: self.__fbAsync.decided } : null });
 }
@@ -383,6 +490,11 @@ function roomLite(ls) {
 function clonable(x) { try { return JSON.parse(JSON.stringify(x)); } catch (e) { return null; } }
 function roomPost(m) { try { postMessage(m); } catch (e) { if (m.a !== undefined) m.a = clonable(m.a); if (m.net) m.net = clonable(m.net); try { postMessage(m); } catch (e2) {} } }
 function roomMirror(full) {
+  if (!DBG) return roomMirrorBody(full);
+  var t0 = performance.now(); roomMirrorBody(full); var dt = performance.now() - t0;
+  DBG.mir.n++; DBG.mir.ms += dt; if (dt > DBG.mir.max) DBG.mir.max = dt;
+}
+function roomMirrorBody(full) {
   var ls = RM.eng; if (!ls) return;
   var m = { t: 'lsm', lite: roomLite(ls) };
   if (full && RM.R) {
@@ -428,7 +540,7 @@ function roomIn(d) {
   // forward what Lockstep.filterRelay keeps, to every other guest).
   if (d.rel) { var fwd = null; try { fwd = ls.filterRelay(d.m); } catch (e) { fwd = d.m; } roomPost({ t: 'lsrelay', k: d.k, m: fwd }); }
   // ⚠ KICK THE FEED WHEN AN INPUT ACTUALLY LANDS (the page's watchLockstep receive wrap).
-  if (d.m && d.m.t === 'ls' && RM.R && RM.R.LS.armed && RM.R.lsDriveOk('timer')) { try { RM.R.lsFeed(); } catch (e) {} }
+  if (d.m && d.m.t === 'ls' && RM.R && RM.R.LS.armed) roomFeed('kick');
   roomMirror(performance.now() - RM.mirT > 100);
 }
 function roomCall(d) {
@@ -449,11 +561,19 @@ function roomKick() {
   if (!RM.chan) { RM.chan = new MessageChannel(); RM.chan.port1.onmessage = function () { RM.kicked = false; roomFeed('imm'); }; }
   RM.kicked = true; RM.chan.port2.postMessage(0);
 }
-function roomFeed(src) {
+function roomFeed(src) { if (DBG) return DBG.task('feed:' + src, roomFeedBody)(src); return roomFeedBody(src); }
+function roomDueAt(R) {
+  var L = R.LS;
+  if (!(L.viHz > 0) || !L.baseWall) return -Infinity;
+  return L.baseWall + (L.frame - L.baseFrame) * (1000 / L.viHz / ((L.pace > 0 && L.pace <= 1) ? L.pace : 1));
+}
+function roomFeedBody(src) {
   var R = RM.R; if (!R || !R.LS.armed || !R.lsDriveOk(src === 'raf' ? 'raf' : 'timer')) return;
+  // THE COMMIT YIELD (above): a due frame yields once to an unpushed picture's commit.
+  if (R.LS.running && performance.now() >= roomDueAt(R) && !cbMayDraw(src === 'raf' ? 'raf' : 'task')) return;
   var f0 = R.LS.frame;
   try { R.lsFeed(); } catch (e) { log('[lockstep] feed threw: ' + ((e && e.stack) || e)); }
-  if (R.LS.frame !== f0) CLK.frame = R.LS.frame;
+  if (R.LS.frame !== f0) { CLK.frame = R.LS.frame; cbDidDraw(src === 'raf' ? 'raf' : 'task'); pbPresent(); }
   var now = performance.now();
   if (now - RM.mirT > 100) roomMirror(true);
   if (now - RM.pubT > 400) { RM.pubT = now; if (R.LS.running) R.publishSelf(RM.rtt); }
@@ -500,6 +620,99 @@ function roomWatchContext() {
   c.addEventListener('webglcontextrestored', function () { if (RM.R) RM.R.LS_GL.restored = true; post({ t: 'glrestored' }); });
 }
 
+// ---- ?costdbg=1: WHERE A SLOW FIELD'S TIME WENT (a measurement arm, OFF when shipped) -----
+// A real phone (Mali-G715, MK64 PAL, room guest) logged 902 fields over a field period and one
+// of 620 ms. This splits every field's wall time (one _neil_ls_run_frame) into the up-calls
+// that can be slow inside it — the JIT compiling a block (myApp.jitCompile, a synchronous
+// wasm module per span), shader compile/link and the first use of a program, framebuffer
+// readback, texture and buffer uploads — and the rest ("core": emulation, every other GL
+// call, and any GC that landed there). It also times every WORKER TASK, so a burst outside
+// the field (a rollback, a ring allocation, the room mirror) is seen too. Nothing is wrapped
+// unless the flag is on: the shipped worker runs with none of it.
+var DBG = null;
+function dbgInstall(search) {
+  if (new URLSearchParams(search || '').get('costdbg') !== '1') return;
+  var B = ['jit', 'shader', 'prog', 'read', 'gbsd', 'tex', 'buf', 'sync'];
+  DBG = { b: {}, n: {}, frames: 0, over: 0, overMs: 0, overB: {}, overCore: 0, max: [], tasks: { n: 0, over: 0, max: [] },
+          hist: [0, 0, 0, 0, 0, 0], depth: 0, mir: { n: 0, ms: 0, max: 0 } };
+  B.forEach(function (k) { DBG.b[k] = 0; DBG.n[k] = 0; DBG.overB[k] = 0; });
+  var now = function () { return performance.now(); };
+  function wrap(obj, name, bucket) {
+    var f = obj[name]; if (typeof f !== 'function') return;
+    obj[name] = function () {
+      if (DBG.depth) return f.apply(this, arguments);
+      DBG.depth++; var t0 = now();
+      try { return f.apply(this, arguments); } finally { DBG.b[bucket] += now() - t0; DBG.n[bucket]++; DBG.depth--; }
+    };
+  }
+  if (self.WebGL2RenderingContext) {
+    var P = WebGL2RenderingContext.prototype;
+    ['compileShader', 'getShaderParameter', 'getShaderInfoLog'].forEach(function (n) { wrap(P, n, 'shader'); });
+    ['linkProgram', 'getProgramParameter', 'getProgramInfoLog', 'getUniformLocation', 'getAttribLocation', 'validateProgram'].forEach(function (n) { wrap(P, n, 'prog'); });
+    wrap(P, 'readPixels', 'read'); wrap(P, 'getBufferSubData', 'gbsd');
+    var rp0 = P.readPixels; P.readPixels = function (x, y, w, h) { DBG.rect = w + 'x' + h; return rp0.apply(this, arguments); };
+    ['texImage2D', 'texSubImage2D', 'texStorage2D', 'copyTexImage2D', 'copyTexSubImage2D', 'generateMipmap'].forEach(function (n) { wrap(P, n, 'tex'); });
+    ['bufferData', 'bufferSubData'].forEach(function (n) { wrap(P, n, 'buf'); });
+    ['finish', 'flush', 'clientWaitSync', 'getSyncParameter', 'getError'].forEach(function (n) { wrap(P, n, 'sync'); });
+  }
+  DBG.wrapJit = function () {
+    var f = self.myApp && self.myApp.jitCompile; if (!f || f.__dbg) return;
+    var g = function (p) { var t0 = now(); try { return f(p); } finally { DBG.b.jit += now() - t0; DBG.n.jit++; } };
+    g.__dbg = true; self.myApp.jitCompile = g;
+  };
+  DBG.wrapFrame = function () {
+    var rf = M._neil_ls_run_frame; if (!rf || rf.__dbg) return;
+    var w = function () {
+      var b0 = {}; for (var k in DBG.b) b0[k] = DBG.b[k];
+      var t0 = now();
+      try { return rf.apply(this, arguments); } finally {
+        var dt = now() - t0, per = CLK.viHz > 0 ? 1000 / CLK.viHz : 16.7;
+        DBG.frames++;
+        DBG.hist[dt < per ? 0 : dt < 2 * per ? 1 : dt < 50 ? 2 : dt < 100 ? 3 : dt < 300 ? 4 : 5]++;
+        if (dt > per) {
+          var rec = { f: CLK.frame, ms: +dt.toFixed(1), at: Math.round(t0) }, acc = 0;
+          for (var k2 in DBG.b) { var d = DBG.b[k2] - b0[k2]; DBG.overB[k2] += d; acc += d; if (d >= 1) rec[k2] = +d.toFixed(1); }
+          rec.core = +(dt - acc).toFixed(1);
+          DBG.over++; DBG.overMs += dt; DBG.overCore += dt - acc;
+          DBG.max.push(rec); DBG.max.sort(function (a, b) { return b.ms - a.ms; }); if (DBG.max.length > 24) DBG.max.length = 24;
+        }
+      }
+    };
+    w.__dbg = true; M._neil_ls_run_frame = w;
+  };
+  // Every task this worker runs, by its entry point.
+  DBG.task = function (name, fn) {
+    return function () {
+      var t0 = now();
+      try { return fn.apply(this, arguments); } finally {
+        var dt = now() - t0; DBG.tasks.n++;
+        if (dt > 30) {
+          DBG.tasks.over++;
+          DBG.tasks.max.push({ task: name, ms: +dt.toFixed(1), at: Math.round(t0) });
+          DBG.tasks.max.sort(function (a, b) { return b.ms - a.ms; }); if (DBG.tasks.max.length > 24) DBG.tasks.max.length = 24;
+        }
+      }
+    };
+  };
+  DBG.report = function () {
+    var r = { rect: DBG.rect, frames: DBG.frames, over: DBG.over, overMs: Math.round(DBG.overMs), overCoreMs: Math.round(DBG.overCore), hist: DBG.hist.slice(),
+              all: {}, inOver: {}, max: DBG.max.slice(0, 12), mirror: { n: DBG.mir.n, ms: Math.round(DBG.mir.ms), max: +DBG.mir.max.toFixed(1) }, tasks: { n: DBG.tasks.n, over: DBG.tasks.over, max: DBG.tasks.max.slice(0, 12) } };
+    for (var k in DBG.b) { r.all[k] = [Math.round(DBG.b[k]), DBG.n[k]]; r.inOver[k] = Math.round(DBG.overB[k]); }
+    return r;
+  };
+  // Every 10 s, one line into the page's log — what a player on a real phone can copy out.
+  setInterval(function () {
+    if (!DBG.frames) return;
+    var r = DBG.report(), b = [];
+    for (var k in r.inOver) if (r.inOver[k] >= 1) b.push(k + ' ' + r.inOver[k]);
+    log('[costdbg] fields ' + r.frames + ', over a period ' + r.over + ' (' + r.overMs + ' ms; <P/<2P/<50/<100/<300/300+ ms: '
+        + r.hist.join('/') + '); inside them: ' + b.join(', ') + ', core ' + r.overCoreMs + ' ms. worst: '
+        + r.max.slice(0, 4).map(function (x) { var s = []; for (var q in x) if (q !== 'f' && q !== 'at' && q !== 'ms') s.push(q + ' ' + x[q]); return x.ms + ' ms (' + s.join(' ') + ')'; }).join('; ')
+        + '. slow tasks: ' + r.tasks.max.slice(0, 3).map(function (x) { return x.task + ' ' + x.ms; }).join(', '));
+  }, 10000);
+  log('[costdbg] per-field cost buckets ON (?costdbg=1) — a measurement arm; it wraps GL calls and the JIT up-call');
+}
+
 // ---- boot --------------------------------------------------------------------------------
 function boot(d) {
   BOOT = d;
@@ -517,7 +730,21 @@ function boot(d) {
     if (!probe) { post({ t: 'err', s: 'boot: WebGL2 is not available inside a worker on this browser (OffscreenCanvas getContext("webgl2") returned null)', fatal: true, boot: true }); return; }
     var lose = probe.getExtension('WEBGL_lose_context'); if (lose) lose.loseContext();
   } catch (e) { post({ t: 'err', s: 'boot: WebGL2 in a worker threw: ' + ((e && e.message) || e), fatal: true, boot: true }); return; }
+  if (d.present === 'bitmap') {
+    d.canvas = new OffscreenCanvas(d.cw > 0 ? d.cw : 640, d.ch > 0 ? d.ch : 480);
+    PB.on = true; pbInstall();
+    log('[present] core worker: pictures go to the page as ImageBitmaps, one per drawn field (no canvas commit)');
+  }
   installShims(d.canvas);
+  dbgInstall(d.search);
+  (function () {
+    var gf = new URLSearchParams(d.search || '').get('glflush');
+    if (gf === 'fence' && self.WebGL2RenderingContext) {
+      var P = WebGL2RenderingContext.prototype, fs = P.fenceSync;
+      P.fenceSync = function () { var s = fs.apply(this, arguments); this.flush(); return s; };
+      log('[glflush] arm: flush after every fenceSync');
+    }
+  })();
   importScripts('fbasync.js?v=' + CORE_V, 'jit_params.js?v=' + CORE_V);
   // The SAME readback implementation as the page (fbasync.js), decided from the
   // SAME ROM header with the SAME query string, so this console hands RDRAM the
@@ -568,11 +795,15 @@ function boot(d) {
           // the JIT up-call (recomp.c) and the emitter both spell it `window.`.
           self.window = self;
           try { setupJit(d.jit || 'emit'); } catch (e) { log('[jit] emitter failed to load — bridge stays off: ' + e); }
+          if (DBG) { DBG.wrapJit(); DBG.wrapFrame(); }
           if (d.workerfail === 'main') throw new Error('?workerfail=main — a simulated core failure during boot (rig seam)');
           M.callMain(['custom.v64']);
           post({ t: 'booted' });
           SCHED.coupled = (function () { var pq = new URLSearchParams(d.search || '').get('pace'); return pq === '0' || pq === 'off'; })();
           if (SCHED.coupled) log('[pace] core worker: CONTROL ARM (?pace=0) — one field per animation frame, nothing else');
+          CB.mode = PB.on ? 'bitmap' : (d.present === 'commit' ? 'commit' : 'yield');
+          CB.on = CB.mode === 'yield';
+          if (CB.mode === 'commit') log('[present] core worker: CONTROL ARM (?present=commit) — no commit yield');
           observePresents();
           setInterval(postStats, 100);
           if (roomArmed) roomMainRan();
@@ -585,7 +816,8 @@ function boot(d) {
   }).catch(function (e) { post({ t: 'err', s: 'boot: ' + (e && e.stack || e), fatal: true }); });
 }
 
-onmessage = function (e) {
+onmessage = function (e) { if (DBG && e.data && e.data.t) return DBG.task('msg:' + e.data.t, onMsg)(e); return onMsg(e); };
+function onMsg(e) {
   var d = e.data;
   if (!d || !d.t) return;
   switch (d.t) {
@@ -621,4 +853,4 @@ onmessage = function (e) {
       } catch (er) { post({ t: 'evalr', id: d.id, e: String(er && er.stack || er) }); }
       break;
   }
-};
+}

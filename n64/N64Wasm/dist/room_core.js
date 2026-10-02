@@ -957,6 +957,18 @@
         if (c.worst < safeWorst - 1e-6) { safeWorst = c.worst; safe = k; }
       }
       var nk = best || safe || 1;
+      // HYSTERESIS. A real desktop host (MK64, run 12.7 ms, no K fitting two fields) flipped
+      // K 1 <-> 8 every few seconds: with nothing fitting, `safe` is decided by run vs save,
+      // and EMAs that wander across that line flip it. Every flip frees or allocates 16.8 MB
+      // states and re-publishes the window this console can hold. So K moves only when the
+      // move is worth it: into a K that fits when the current one does not; otherwise when
+      // it cuts the expected cost (or, with nothing fitting, the worst case) by 15%.
+      if (nk !== RB.k && RB.k >= 1) {
+        var cur = rbCostK(RB.k, W, F), nxt = rbCostK(nk, W, F), curFits = cur.worst <= 2 * F;
+        if (best && curFits && nxt.exp > cur.exp * 0.85) nk = RB.k;
+        else if (!best && nxt.worst > cur.worst * 0.85) nk = RB.k;
+        if (nk === RB.k) RB.kHeld = (RB.kHeld | 0) + 1;
+      }
       if (nk !== RB.k) {
         var c1 = rbCostK(nk, W, F);
         RB.kWhy = 'p=' + RB.pEma.toFixed(3) + '/frame depth=' + (RB.depthEma || 0).toFixed(1) + ' run=' + RB.runEma.toFixed(2)
@@ -993,6 +1005,29 @@
       var load = RB.loadEma || save, run = LS.costAvg || RB.runEma || 0, k = RB.k || 1;
       var W = Math.max(2, (ls.rollback | 0) || (ls._capW | 0) || RB_WINDOW);
       return (load + (W + k - 1) * run + Math.ceil(W / k) * save) / W;
+    }
+    // ⚠ THE SAVE COST GOES STALE IN A DELAY STRETCH, AND THE ROOM NEVER CAME BACK. No
+    // snapshot is taken in delay lockstep, so RB.saveEma / RB.loadEma stayed whatever they
+    // were when rollback was last unaffordable — MEASURED (n64_rollback_probe, SM64, the
+    // worker core slowed 6x for 20 s then given its speed back): the frame cost fell to
+    // 3.8 ms, but the published step stayed 22.7 ms on the slow period's saves and loads
+    // and the room sat in delay for the remaining 55 s. So every RB_REMEASURE_MS of a
+    // capacity-gated delay stretch this console times ONE real save into the state scratch
+    // buffer the save path already owns (raw API only: no allocation, no gzip, nothing the
+    // guest can see — a rollback console saves every frame). The load moves with it: a load
+    // is the same 16.8 MB state copy, so the last measured load:save ratio is kept.
+    var RB_REMEASURE_MS = 3000;
+    function rbRemeasure() {
+      var now = performance.now();
+      if (now - (RB.remeasAt || 0) < RB_REMEASURE_MS) return;
+      RB.remeasAt = now;
+      if (!n64sRawOk()) return;
+      var old = RB.saveEma || LS_RB.saveMs || 0, t0 = performance.now();
+      if (!n64sSave(null)) return;
+      var dt = performance.now() - t0;
+      RB.saveEma = RB.saveEma ? RB.saveEma + (dt - RB.saveEma) / 4 : dt;
+      if (RB.loadEma && old > 0) RB.loadEma *= RB.saveEma / old;
+      RB.remeasures = (RB.remeasures | 0) + 1;
     }
     function rbFail(ls, why) {
       LS.fault = why;
@@ -1339,7 +1374,7 @@
         // decide a return to zero-lag mode): without this the step stays what it
         // was at the switch — the very measurement that said it could not afford
         // it — and the room never comes back.
-        if (ls._capGate) { var se = rbStepEstimate(ls); if (se > 0) ls.selfStepMs = se; }
+        if (ls._capGate) { rbRemeasure(); var se = rbStepEstimate(ls); if (se > 0) ls.selfStepMs = se; }
         // ⚠ THE CORE IS IN THIS PAGE AND IS SYNCHRONOUS, so unlike dreamcast.html
         // the fingerprint for the frame just run is available RIGHT NOW and goes
         // straight into endFrame(). That is the shape lib/netplay.js's endFrame
@@ -1607,6 +1642,7 @@
         advWaits: LS.advWaits | 0,
         // what the capacity gate reads from this console, in either mode
         step: { selfStepMs: ls ? +(+ls.selfStepMs || 0).toFixed(2) : null, preReadySaveMs: +(LS_RB.saveMs || 0).toFixed(2),
+                saveEmaMs: +(RB.saveEma || 0).toFixed(2), loadEmaMs: +(RB.loadEma || 0).toFixed(2), remeasures: RB.remeasures | 0,
                 rearms: RB.rearms, stale: RB.stale },
         lat: { samples: LAT.samples.slice(-60), overlapped: LAT.overlapped },
         prerolled: !!LS.prerolled,

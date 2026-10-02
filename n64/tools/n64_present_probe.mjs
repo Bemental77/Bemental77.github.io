@@ -92,7 +92,7 @@ try {
              rate: { speed: r.speed, viSpeed: r.viSpeed, shown: r.shown, made: r.made, gameHz: r.gameHz, windowMs: r.windowMs, duty: r.duty, e2eHwX: r.e2eHwX, lost: r.lost, hwX: r.hwX },
              headline: (document.getElementById('fps') || {}).textContent || '',
              u: window.__audioDbg ? window.__audioDbg.u : null, m: window.__audioDbg ? window.__audioDbg.m : null,
-             worker: !!(ws && ws.on), stat: ws && ws.stat ? ws.stat : null, pace: window.__n64Pace ? window.__n64Pace() : null };
+             worker: !!(ws && ws.on), stat: ws && ws.stat ? ws.stat : null, present: ws ? ws.present || null : null, pace: window.__n64Pace ? window.__n64Pace() : null };
   });
   await page.evaluate(() => { window.__scr.on = true; });
   const a = await snap();
@@ -129,6 +129,11 @@ try {
                         audioSentPerS: d('audioSent') != null ? +(d('audioSent') / coreS).toFixed(0) : null };
   }
   out.headline = b.headline;
+  if (a.present && b.present) out.present = { mode: b.present.mode, in: (b.present.in | 0) - (a.present.in | 0), shown: (b.present.shown | 0) - (a.present.shown | 0),
+                                              dropped: (b.present.dropped | 0) - (a.present.dropped | 0), err: b.present.err || null,
+                                              workerMs: (b.stat && a.stat && b.stat.pb && a.stat.pb) ? b.stat.pb.ms - a.stat.pb.ms : null };
+  if (b.stat) { out.dbg = b.stat.dbg || null; out.fb = b.stat.fb || null;
+    if (a.stat && a.stat.fb && b.stat.fb) out.fbDelta = { async: b.stat.fb.async - a.stat.fb.async, blocked: b.stat.fb.blocked - a.stat.fb.blocked }; }
   out.pace = b.pace;
   out.perSecond = per;
   await page.screenshot({ path: path.join(OUT, `present-${ROM.replace(/\.z64$/, '')}-${(XQ || 'default').replace(/[^a-z0-9]+/gi, '_')}.png`) });
