@@ -42,6 +42,11 @@
 //   bash tools/probe_lock.sh run -- node n64/tools/n64_rollback_probe.mjs \
 //        --players 2|4 --latmin 40 --latmax 100 --secs 30 [--cpu 4] [--mobile] \
 //        [--query 'ra=auto'] [--hash-every 10] [--json PATH]
+// THE ROLLBACK-DEFAULT ARMS (n64/docs/rollback-default/): L = delay lockstep, G = rollback with
+// the product's capacity gate live; both get the product's pre-Ready RTT setup (--rtt, default on):
+//   L: --rbw 0 --query rb=0 --expect any --noref
+//   G: --rbw 8 --query rb=1 --expect any --cin
+// (append &worker=0 to --query for the main-thread realm; --wslow 4 slows the worker's core).
 import { createRequire } from 'node:module';
 import { writeFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -61,6 +66,51 @@ const RBW = +flag('rbw', '8');
 const BASE = flag('url', 'http://localhost:8080');
 const GAME = flag('game', 'Mario Kart 64');
 const QUERY = flag('query', '');
+// --rtt 1 (default): before Ready, the HOST engine gets what the product's chooseDelayThenReady
+//   gives it from its RTT pings (n64/index.html, Session.rttReport): six round trips per ghost,
+//   each drawn from this rig's own link model (two independent one-way draws in [latmin, latmax]),
+//   fed to Lockstep.recommendDelayForRoom / floorDelayForRoom at this cartridge's field period ->
+//   engine.delay, engine.rttDelay (the most a capacity-gated room may switch to) and
+//   engine.netFloorDelay. The __n64LsAttach path skips chooseDelayThenReady, so without this a
+//   lockstep arm would run the engine's default delay and a gated arm would have no RTT. Both arms
+//   get it, as both product rooms do. --rtt 0: the old bare attach. --ldelay D [--lfloor F]: pin
+//   them instead of drawing.
+// --wslow R: in WORKER mode, make the worker core's three heavy exports (_neil_ls_run_frame,
+//   _neil_state_save_raw_fast, _neil_state_load_raw) take R x their own wall time (busy-wait),
+//   because the CDP CPU throttle does not reach workers (n64/docs/worker/README.md).
+const RTT = flag('rtt', '1') !== '0';
+// --rttseed N: draw those pings from a seeded generator, so the two arms of a matched pair get
+//   the SAME link measurement (and so the same delay) — the comparison is then of the arms only.
+const RTTSEED = flag('rttseed', null);
+const FORCE_RETURN = +flag('force-return', '0');
+const LDELAY = +flag('ldelay', '0'), LFLOOR = +flag('lfloor', '0'), WSLOW = +flag('wslow', '1');
+// --expect rollback|any: the room must still be in rollback at the end (default: rollback, the
+//   exactness probe) / may have been switched by the capacity gate (a rate cell's G or L arm).
+// --cin: record every input the ROOM's engine holds (engine.inputs: real inputs only, final once
+//   present, kept LS_KEEP=240 frames) every 50 ms, and run the straight reference with THOSE
+//   inputs instead of __pad(f). __pad(f) at frame f is only the confirmed input at input delay 0;
+//   once a capacity-gated room decides to switch to delay, the local pad sampled at f is put at
+//   f+d (lib/netplay.js _rbPutLocal via beginFrame), so the plain reference compares wrong inputs.
+const CIN = has('cin');
+const EXPECT = flag('expect', 'rollback');
+const CIN_SRC = (engExpr) => `(function () {
+  self.__cin = {}; self.__cinPolls = 0;
+  setInterval(function () {
+    var e = ${engExpr}; if (!e || !e.inputs) return; self.__cinPolls++;
+    e.inputs.forEach(function (mp, f) {
+      if (self.__cin[f]) return;
+      var row = [], any = false;
+      for (var p = 0; p < 4; p++) { var b = mp.get(p); row.push(b ? Array.prototype.slice.call(b) : null); if (b) any = true; }
+      if (any) self.__cin[f] = row;
+    });
+    // a port that arrives later for a frame already recorded
+    e.inputs.forEach(function (mp, f) {
+      var row = self.__cin[f]; if (!row) return;
+      for (var p = 0; p < 4; p++) if (!row[p]) { var b = mp.get(p); if (b) row[p] = Array.prototype.slice.call(b); }
+    });
+  }, 50);
+  return true;
+})()`;
 const JSON_OUT = flag('json', '');
 const NOREF = has('noref');
 const ADAPTIVE = flag('adaptive', '1') !== '0';   // declare rbCatchUp (the adaptive room) on every console
@@ -87,6 +137,7 @@ self.window = self;
 importScripts('__ORIGIN__/lib/netplay.js');
 ${PAD_SRC}
 let cfg = null;
+const W = { inN: 0, inB: 0, outN: 0, outB: 0, inT: {}, outT: {} };   // the page<->ghost traffic (messages, JSON bytes, by type)
 const G = [];                  // ghost engines, ports 1..n-1
 const links = new Map();       // 'from>to' -> { last, q: [{at, m}] }
 function lat() { return cfg.latmin + Math.random() * (cfg.latmax - cfg.latmin); }
@@ -101,7 +152,7 @@ function tick() {
   for (const L of links.values()) {
     while (L.q.length && L.q[0].at <= now) {
       const x = L.q.shift();
-      if (x.to === 'page') postMessage({ t: 'm', m: x.m });
+      if (x.to === 'page') { W.outN++; W.outB += JSON.stringify(x.m).length; W.outT[x.m.t] = (W.outT[x.m.t] || 0) + 1; postMessage({ t: 'm', m: x.m }); }
       else { const g = G.find((e) => e.id === x.to); if (g) g.ls.receive(x.m); }
     }
   }
@@ -140,7 +191,7 @@ onmessage = (e) => {
     for (let i = 1; i < cfg.players; i++) {
       const id = 'g' + i;
       const ls = new Netplay.Lockstep({ host: false, peerId: id, portCount: 4, padBytes: 4, rollback: cfg.rbw,
-        hashEvery: 0, stallBudgetMs: 600000, frameHz: cfg.viHz, rbCatchUp: cfg.adaptive, selfStepMs: 0.05, send: (m) => {
+        hashEvery: 0, stallBudgetMs: 600000, frameHz: cfg.viHz, rbCatchUp: cfg.adaptive, selfStepMs: 0.05, rbResume: true, send: (m) => {
           post(id, 'page', m);
           for (let j = 1; j < cfg.players; j++) if (j !== i) post(id, 'g' + j, m);
         } });
@@ -148,10 +199,11 @@ onmessage = (e) => {
     }
     setInterval(tick, 1);
     postMessage({ t: 'ok' });
-  } else if (d.t === 'm') { for (const g of G) post('page', g.id, d.m); }
+  } else if (d.t === 'm') { W.inN++; W.inB += JSON.stringify(d.m).length; W.inT[d.m.t] = (W.inT[d.m.t] || 0) + 1; for (const g of G) post('page', g.id, d.m); }
   else if (d.t === 'ready') { for (const g of G) g.ls.declareReady(d.disc); }
   else if (d.t === 'stat') postMessage({ t: 'stat', s: G.map((g) => ({ id: g.id, frame: g.ls.frame, state: g.ls.state, frames: g.frames,
-    rollbacks: g.rollbacks, resim: g.resim, hidden: g.hidden, rb: g.ls.rollbackReport ? g.ls.rollbackReport() : null })) });
+    rollbacks: g.rollbacks, resim: g.resim, hidden: g.hidden, rb: g.ls.rollbackReport ? g.ls.rollbackReport() : null,
+    wire: W, holds: { resync: g.ls.stats.resyncHolds | 0, cadence: g.ls.stats.cadenceHolds | 0, stalls: g.ls.stats.stalls | 0, stallMs: Math.round(g.ls.stats.stallMs || 0) } })) });
 };`;
 
 const launch = () => puppeteer.launch({
@@ -185,7 +237,9 @@ try {
     window.__n64RbTap = function (k, buf, fp) { window.__rbFull[k] = { full: window.__n64State.hashFull(buf), fp: fp >>> 0 }; };
     const w = new Worker(URL.createObjectURL(new Blob([src.replace('__ORIGIN__', location.origin)], { type: 'text/javascript' })));
     window.__ghost = w; window.__ghostStat = null;
+    // (the options the page's own startLockstep passes: rollbackOk, rbCatchUp, rbResume)
     window.__n64LsAttach({ host: true, peerId: 'page', portCount: 4, padBytes: 4, rollback: cfg.rbw, hashEvery: cfg.hashEvery, rbCatchUp: cfg.adaptive, frameHz: 50,
+      rollbackOk: true, rbResume: true,
       stallBudgetMs: 600000, send: (m) => w.postMessage({ t: 'm', m }), code: 'RBPRB' });
     w.onmessage = (e) => {
       if (e.data.t === 'm') { window.__n64LsEngine.receive(e.data.m); if (e.data.m.t === 'ls' && window.__n64LsKick) window.__n64LsKick(); }
@@ -216,37 +270,127 @@ try {
       self.__n64RbTap = function (k, buf, fp) { self.__rbFull[k] = { full: self.__n64State.hashFull(buf), fp: fp >>> 0 }; };
       ({ realm: typeof WorkerGlobalScope !== 'undefined' ? 'worker' : 'window', state: !!self.__n64State });`;
     out.workerSeams = await page.evaluate((s2) => window.__n64Worker.eval(s2), src);
+    if (WSLOW > 1) {
+      out.wslowInstall = await page.evaluate((s3) => window.__n64Worker.eval(s3), `(function (R) {
+        var M = self.Module, done = [];
+        self.__wslow = { R: R, calls: 0, baseMs: 0, addedMs: 0 };
+        ['_neil_ls_run_frame', '_neil_state_save_raw_fast', '_neil_state_load_raw'].forEach(function (n) {
+          var f = M[n]; if (typeof f !== 'function') return;
+          M[n] = function () {
+            var t0 = performance.now(), r = f.apply(this, arguments), d = performance.now() - t0, until = performance.now() + d * (R - 1);
+            while (performance.now() < until) {}
+            self.__wslow.calls++; self.__wslow.baseMs += d; self.__wslow.addedMs += d * (R - 1);
+            return r;
+          };
+          done.push(n);
+        });
+        return done;
+      })(${WSLOW})`);
+    }
   }
+  if (!out.worker) {
+    // Presented frames on the main-thread core, with the worker's definition (core_worker.js
+    // observePresents): animation frames in which the core's field counter moved.
+    await page.evaluate(() => {
+      window.__pres = { shown: 0, frames: 0, lastVi: -1 };
+      (function obs() {
+        requestAnimationFrame(obs);
+        const P = window.__pres; P.frames++;
+        const M = window.Module; if (!M || !M._neil_vi_total) return;
+        const vi = M._neil_vi_total() >>> 0;
+        if (P.lastVi >= 0 && vi !== P.lastVi) P.shown++;
+        P.lastVi = vi;
+      })();
+    });
+  }
+  if (CIN) out.cinInstall = out.worker ? await page.evaluate((s) => window.__n64Worker.eval(s), CIN_SRC('self.RM && self.RM.eng'))
+                                       : await page.evaluate((s) => (0, eval)(s), CIN_SRC('window.__n64LsEngine'));
+  if (RTT || LDELAY > 0) out.lsetup = await page.evaluate((cfg) => {
+    const e = window.__n64LsEngine, L = window.Netplay.Lockstep, frameMs = 1000 / 50;   // MK64 is PAL: 50 Hz
+    let d = cfg.ldelay, floor = cfg.lfloor, samples = null;
+    if (!(d > 0)) {
+      samples = {};
+      let st = (cfg.seed == null ? (Math.random() * 4294967296) : +cfg.seed) >>> 0;
+      const rnd = cfg.seed == null ? Math.random : () => {   // mulberry32
+        st = (st + 0x6D2B79F5) >>> 0; let t = st;
+        t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+      const one = () => cfg.latmin + rnd() * (cfg.latmax - cfg.latmin);
+      for (let i = 1; i < cfg.players; i++) { samples['g' + i] = []; for (let k = 0; k < 6; k++) samples['g' + i].push(one() + one()); }
+      d = L.recommendDelayForRoom(samples, frameMs); floor = L.floorDelayForRoom(samples, frameMs);
+    }
+    e.delay = d; e.rttDelay = d; if (floor > 0) e.netFloorDelay = floor;
+    return { delay: d, rttDelay: d, netFloorDelay: floor || 0, samples };
+  }, { ldelay: LDELAY, lfloor: LFLOOR, latmin: LATMIN, latmax: LATMAX, players: PLAYERS, seed: RTTSEED });
   await page.evaluate(() => { window.__n64LsEngine.declareReady('probe'); window.__ghost.postMessage({ t: 'ready', disc: 'probe' }); });
   await page.waitForFunction(() => { const n = window.__n64Net(); return n.running && n.frame > 10; }, { timeout: 120000 });
-  const snap = () => page.evaluate(() => {
+  // what the capacity switch WOULD pick right now, from the host engine's own methods
+  const CAPX_SRC = `(function (e) { if (!e || !e._capWireFloor) return null; var now = e._now();
+    var rows = e._capRows ? e._capRows(now) : [];
+    return { wire: e._capWireFloor(), lateInP99: e._rbLateInP99 ? e._rbLateInP99() : null,
+             peerLi: rows.filter(function (r) { return r.peer !== e.peerId; }).map(function (r) { return r.li; }),
+             wouldPick: e._capDelay ? e._capDelay(rows) : null, need: e._capNeed, window: e.rollback }; })`;
+  const snap = () => page.evaluate(async (capx) => {
     window.__ghost.postMessage({ t: 'stat' });
     const n = window.__n64Net();
+    let cx = null;
+    try { cx = n.worker ? await window.__n64Worker.eval(capx + '(self.RM && self.RM.eng)') : (0, eval)(capx)(window.__n64LsEngine); } catch (e) { cx = { err: String(e) }; }
     return { t: performance.now(), frame: n.frame, mode: n.mode, rb: n.rollback, ra: n.runahead, stalls: n.stalls, stallMs: n.stallMs,
              reanchors: n.reanchors, lostMs: n.lostMs, advWaits: n.advWaits, viHz: n.viHz, costAvgMs: n.costAvgMs, fault: n.fault,
              engineState: n.engine && n.engine.state, error: n.engine && n.engine.error, ghosts: window.__ghostStat,
-             fb: n.fb, lat: n.lat, speed: window.__n64Rate && window.__n64Rate.speed };
-  });
+             fb: n.fb, lat: n.lat, speed: window.__n64Rate && window.__n64Rate.speed,
+             eng: n.engine ? { delay: n.engine.delay, state: n.engine.state, desync: n.engine.desync, mode: n.engine.mode,
+                                hashesCompared: n.engine.hashesCompared, stalls: n.engine.stalls } : null,
+             capx: cx, step: n.step || null,
+             pres: n.worker ? (function () { const p = window.__n64Pace ? window.__n64Pace() : {}; return { shown: p.shown | 0, frames: p.animFrames | 0 }; })()
+                            : (window.__pres ? { shown: window.__pres.shown, frames: window.__pres.frames } : null) };
+  }, CAPX_SRC);
   await sleep(3000);
   const a = await snap();
   const tl = [];
-  let prev = a;
+  let prev = a, lastRbPage = a.rb && a.rb.page;
   for (let i = 0; i < SECS; i++) {
     await sleep(1000);
     const s = await snap();
     const pr = prev.rb && prev.rb.page, sr = s.rb && s.rb.page;
     tl.push({ s: i + 1, rate: +((s.frame - prev.frame) / ((s.t - prev.t) / 1000) / (s.viHz || 50)).toFixed(3),
               rollbacks: sr && pr ? sr.rollbacks - pr.rollbacks : null, resim: sr && pr ? sr.resimFrames - pr.resimFrames : null,
-              ra: s.ra && s.ra.frames, stalls: s.stalls - prev.stalls, adv: s.advWaits - prev.advWaits });
+              ra: s.ra && s.ra.frames, stalls: s.stalls - prev.stalls, adv: s.advWaits - prev.advWaits,
+              mode: s.mode, delay: s.eng && s.eng.delay,
+              lag: (function () { const v = (s.lat && s.lat.samples || []).slice(-10).map((x) => x.frames).sort((x, y) => x - y); return v.length ? v[v.length >> 1] : null; })(),
+              shown: s.pres && prev.pres ? s.pres.shown - prev.pres.shown : null, ticks: s.pres && prev.pres ? s.pres.frames - prev.pres.frames : null,
+              capx: s.capx });
+    if (s.rb && s.rb.page) lastRbPage = s.rb.page;
+    // --force-return S (TEST SEAM, never a product path): once the gated room is in delay and
+    // S seconds of the window have passed, the HOST engine is told every console can afford
+    // rollback (its _capNeedOf answers 0.1, the calm is 1 s) so it schedules the return; once the
+    // room is back in rollback the real judgement is restored. What it exercises is the page's
+    // half of rbResume — room_core.js rbRearm — and with --cin every confirmed state after the
+    // return is checked bit for bit against the straight run like any other.
+    if (FORCE_RETURN > 0 && i + 1 >= FORCE_RETURN) {
+      const src = `(function (e) { if (!e) return 'no engine';
+        if (!e.__frOrig && !e.rollback && e._capGate) { e.__frOrig = e._capNeedOf; e._capNeedOf = function () { return 0.1; };
+          e._capUpCooldown = 1000; e._capDownAt = 0; return 'forced'; }
+        if (e.__frOrig && e.rollback) { e._capNeedOf = e.__frOrig; e.__frOrig = null; e.__frDone = true; return 'restored'; }
+        if (e.__frOrig) { var now = e._now(), rows = e._capRows(now);
+          return 'waiting ' + JSON.stringify({ rows: rows.map(function (r) { return [r.peer, r.st, r.rr, r.rz]; }), seated: e.expectedPeers().length + 1,
+            dropped: e.dropped.size, pend: !!e._pendingDelay, calm: e._capCalmSince ? Math.round(now - e._capCalmSince) : 0, down: Math.round(now - e._capDownAt),
+            cool: e._capUpCooldown, mem: !!e._capMemDown, next: !!e._modeNext, st: e.state, peers: Array.from(e._capPeer.entries()).map(function (x) { return [x[0], x[1].mode, Math.round(now - x[1].at)]; }) }); }
+        return e.__frDone ? 'done' : 'idle'; })`;
+      const r = out.worker ? await page.evaluate((x) => window.__n64Worker.eval(x + '(self.RM && self.RM.eng)'), src)
+                           : await page.evaluate((x) => (0, eval)(x)(window.__n64LsEngine), src);
+      tl[tl.length - 1].forceReturn = r;
+    }
     prev = s;
     if (s.fault || s.engineState === 'failed' || s.engineState === 'desync') break;
   }
   const z = prev, secs = (z.t - a.t) / 1000;
   const rbA = a.rb && a.rb.page, rbZ = z.rb && z.rb.page;
   room = out.worker
-    ? Object.assign(await page.evaluate(() => window.__n64Worker.eval('({ rblog: self.__n64RbLog.slice(0, 4000), full: self.__rbFull })')),
+    ? Object.assign(await page.evaluate(() => window.__n64Worker.eval('({ rblog: self.__n64RbLog.slice(0, 4000), full: self.__rbFull, cin: self.__cin || null, cinPolls: self.__cinPolls | 0 })')),
                     await page.evaluate(() => ({ frame: window.__n64LsEngine.frame, confirmed: window.__n64LsEngine._rbConfirmed })))
-    : await page.evaluate(() => ({ rblog: window.__n64RbLog.slice(0, 4000), full: window.__rbFull, frame: window.__n64LsEngine.frame, confirmed: window.__n64LsEngine._rbConfirmed }));
+    : await page.evaluate(() => ({ rblog: window.__n64RbLog.slice(0, 4000), full: window.__rbFull, frame: window.__n64LsEngine.frame, confirmed: window.__n64LsEngine._rbConfirmed, cin: window.__cin || null, cinPolls: window.__cinPolls | 0 }));
   Object.assign(out, {
     mode: z.mode, roomRate: +((z.frame - a.frame) / secs / (z.viHz || 50)).toFixed(4),
     secsBelow99: tl.filter((x) => x.rate < 0.99).length,
@@ -259,6 +403,27 @@ try {
     latFrames: (z.lat && z.lat.samples || []).map((x) => x.frames),
     tappedFrames: Object.keys(room.full).length, confirmedTo: room.confirmed,
   });
+  // what the rollback-default decision needs, in one place (n64/docs/rollback-default/)
+  const presA = a.pres, presZ = z.pres;
+  out.gate = {
+    modeStart: a.mode, modeEnd: z.mode, delayStart: a.eng && a.eng.delay, delayEnd: z.eng && z.eng.delay,
+    gated: !!(z.eng && z.eng.mode && z.eng.mode.gated), modeHistory: z.eng && z.eng.mode ? z.eng.mode.history : [],
+    need: z.eng && z.eng.mode ? z.eng.mode.need : null, engineDesync: z.eng ? z.eng.desync : null,
+    lastRbPage: lastRbPage ? { rollbacks: lastRbPage.rollbacks, resimFrames: lastRbPage.resimFrames, stepMs: lastRbPage.stepMs, runMs: lastRbPage.runMs,
+                              saveMs: lastRbPage.saveMs, loadMs: lastRbPage.loadMs, k: lastRbPage.k, depthAvg: lastRbPage.depthAvg, frames: lastRbPage.frames } : null,
+    shownPerSec: presA && presZ ? +((presZ.shown - presA.shown) / secs).toFixed(2) : null,
+    ticksPerSec: presA && presZ ? +((presZ.frames - presA.frames) / secs).toFixed(2) : null,
+    presentedShare: presA && presZ && presZ.frames > presA.frames ? +((presZ.shown - presA.shown) / (presZ.frames - presA.frames)).toFixed(3) : null,
+    lagMedianAll: (function () { const v = (z.lat && z.lat.samples || []).map((x) => x.frames).sort((x, y) => x - y); return v.length ? v[v.length >> 1] : null; })(),
+    lsetup: out.lsetup || null,
+    // INPUT LAG THE ROOM ADDS, over the window: the engine's delay each second (0 in rollback —
+    // the definition of room_core.js's own witness); and the seconds spent in rollback.
+    lagAvg: tl.length ? +(tl.reduce((a, x) => a + (x.mode === 'rollback' ? 0 : (x.delay || 0)), 0) / tl.length).toFixed(2) : null,
+    lagEnd: tl.length ? (tl[tl.length - 1].mode === 'rollback' ? 0 : tl[tl.length - 1].delay) : null,
+    rollbackSecs: tl.filter((x) => x.mode === 'rollback').length + '/' + tl.length,
+    step: z.step || null,
+    wslow: out.worker && WSLOW > 1 ? await page.evaluate(() => window.__n64Worker.eval('self.__wslow')) : null,
+  };
   out.timeline = tl;
   await ctxA.close();
 
@@ -291,7 +456,8 @@ try {
     await pb.goto(`${BASE}/n64/?game=${encodeURIComponent(GAME)}&autostart&worker=0${refQ ? '&' + refQ : ''}`, { waitUntil: 'domcontentloaded' });
     await pb.waitForFunction(() => window.__refMain === true, { timeout: 240000 });
     const last = keys[keys.length - 1];
-    const ref = await pb.evaluate(async (padSrc, players, keys, last) => {
+    const ref = await pb.evaluate(async (padSrc, players, keys, last, cin) => {
+      let cinMissing = 0, cinUsed = 0, cinDiffers = 0;
       (0, eval)(padSrc);
       const M = window.Module, want = new Set(keys), res = {};
       const set = (p, b) => {
@@ -303,7 +469,14 @@ try {
       M._neil_ls_run_frame();
       const buf = window.__n64State.alloc();
       for (let f = 0; f <= last; f++) {
-        for (let p = 0; p < 4; p++) set(p, p < players ? window.__pad(f, p) : new Uint8Array(4));
+        for (let p = 0; p < 4; p++) {
+          const sp = p < players ? window.__pad(f, p) : new Uint8Array(4);
+          if (cin) {
+            const row = cin[f], b = row && row[p];
+            if (b) { const u = Uint8Array.from(b); cinUsed++; if (u.join() !== sp.join()) cinDiffers++; set(p, u); }
+            else { if (p < players) cinMissing++; set(p, sp); }
+          } else set(p, sp);
+        }
         M._neil_ls_run_frame();
         if (want.has(f)) {
           window.__n64State.save(buf);
@@ -311,8 +484,10 @@ try {
         }
         if ((f & 63) === 0) await new Promise((r) => setTimeout(r, 0));
       }
+      res.__cin = { used: cinUsed, missing: cinMissing, differsFromPad: cinDiffers };
       return res;
-    }, PAD_SRC.replace('function __pad', 'window.__pad = function'), PLAYERS, keys, last);
+    }, PAD_SRC.replace('function __pad', 'window.__pad = function'), PLAYERS, keys, last, CIN ? room.cin : null);
+    const cinStat = ref.__cin; delete ref.__cin;
     let firstFull = null, firstFp = null, same = 0;
     for (const k of keys) {
       const A = room.full[k], B = ref[k];
@@ -321,7 +496,7 @@ try {
       else if (firstFull == null) firstFull = k;
       if (A.fp !== B.fp && firstFp == null) firstFp = k;
     }
-    out.reference = { compared: keys.length, fullMatch: same, firstFullMismatch: firstFull, firstFpMismatch: firstFp,
+    out.reference = { cin: CIN ? Object.assign({ polls: room.cinPolls, frames: room.cin ? Object.keys(room.cin).length : 0 }, cinStat) : null, compared: keys.length, fullMatch: same, firstFullMismatch: firstFull, firstFpMismatch: firstFp,
       events: (room.rblog || []).filter((e) => (e[0] === 'grow') || (e[1] >= (firstFull == null ? 0 : firstFull) - 25 && e[1] <= (firstFull == null ? 0 : firstFull) + 5)).slice(0, 60),
       mismatches: keys.filter((k) => ref[k] && room.full[k].full !== ref[k].full).slice(0, 12) };
     await ctxB.close();
@@ -335,13 +510,16 @@ const ok = (n, d) => { pass++; console.log('  PASS  ' + n + (d ? '  ' + d : ''))
 const bad = (n, d) => { fail++; console.log('  FAIL  ' + n + (d ? '  ' + d : '')); };
 const R = out.reference;
 if (out.error) bad('rig', out.error);
-if (out.mode !== 'rollback') bad('the room ran ROLLBACK', 'mode=' + out.mode);
-else ok('the room ran ROLLBACK (input delay 0)');
-const rbN = out.page ? out.page.rollbacks : 0;
-if (!R) bad('exactness', 'no reference run (' + (out.tappedFrames || 0) + ' tapped frames)');
+if (EXPECT === 'rollback') {
+  if (out.mode !== 'rollback') bad('the room ran ROLLBACK', 'mode=' + out.mode);
+  else ok('the room ran ROLLBACK (input delay 0)');
+} else console.log('  INFO  mode at the end: ' + out.mode + '; ' + JSON.stringify(out.gate && { lagAvg: out.gate.lagAvg, rollbackSecs: out.gate.rollbackSecs, modeHistory: out.gate.modeHistory }));
+const rbN = (out.gate && out.gate.lastRbPage) ? out.gate.lastRbPage.rollbacks : (out.page ? out.page.rollbacks : 0);
+if (NOREF) console.log('  INFO  --noref: exactness not checked');
+else if (!R) bad('exactness', 'no reference run (' + (out.tappedFrames || 0) + ' tapped frames)');
 else if (!rbN) bad('VOID: no rollback happened, so exactness was not exercised');
 else if (R.firstFullMismatch == null && R.fullMatch === R.compared && R.compared > 0)
-  ok('every confirmed state matches a straight run BIT FOR BIT (full 16.8 MB hash)', `${R.compared} frames compared after ${rbN} rollbacks / ${out.page.resimFrames} re-simulated frames`);
+  ok('every confirmed state matches a straight run BIT FOR BIT (full 16.8 MB hash)', `${R.compared} frames compared after ${rbN} rollbacks`);
 else bad('confirmed state differs from the straight run', JSON.stringify(R));
 if (out.engineState === 'desync' || out.engineState === 'failed' || out.fault) bad('engine state', out.engineState + ' ' + (out.fault || out.error || ''));
 console.log(JSON.stringify(Object.assign({}, out, { timeline: undefined, log: undefined })));

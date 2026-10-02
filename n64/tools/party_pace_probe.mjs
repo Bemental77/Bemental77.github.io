@@ -27,6 +27,11 @@
 //            0.396x SOLO, so any two-core room on this box is CPU-bound and a
 //            local room rate below 1.000x is not by itself a netplay finding.
 //
+// For the rollback-default measurement (n64/docs/rollback-default/) the summary
+// also carries each console's engine mode report (emode: switches, need), the
+// fingerprints compared (hcmp), the realm the room ran in, and the host's input
+// delay each second of the window (modeTl; 0 in rollback).
+//
 // The only page-side instrumentation is a wrap of Netplay.Lockstep's _emit
 // that RECORDS 'delay' events (and counts stall/resume); it changes nothing.
 //
@@ -212,7 +217,8 @@ const sample = (page) => page.evaluate(() => {
       // rollback rooms (?rb=1): the page's and the engine's own counts
       mode: n.mode || null, hashes: n.hashes, disc: n.disc || null, fb: n.fb || null,
       rb: n.rollback ? { page: n.rollback.page, engine: n.rollback.engine, state: n.rollback.state } : null,
-      ra: n.runahead || null, lat: n.lat ? n.lat.samples.map((x) => x.frames) : null },
+      ra: n.runahead || null, lat: n.lat ? n.lat.samples.map((x) => x.frames) : null,
+      emode: n.engine && n.engine.mode, hcmp: n.engine && n.engine.hashesCompared, hsent: n.engine && n.engine.hashesSent, worker: n.worker },
     rate: r && { speed: r.speed, from: r.speedFrom, starved: r.starved, shown: r.shown, made: r.made, lost: r.lost, e2e: r.e2eHwX },
     status: (st && st.textContent) || (s2 && s2.textContent) || '', fpsText: fps ? fps.textContent : null,
     canvas, eng, pp: window.__pp ? { delays: window.__pp.delays.slice(), stalls: window.__pp.stalls, resumes: window.__pp.resumes, rx: window.__pp.rx.slice(0, 20), begins: window.__pp.begins.slice(0, 20) } : null,
@@ -342,6 +348,9 @@ try {
   out.engineDelayHistory = lastH.net.delayHistory;
   out.engHost = lastH.eng; out.engJoin = lastJ.eng;
   out.mode = { host: lastH.net.mode, join: lastJ.net.mode };
+  out.emode = { host: lastH.net.emode, join: lastJ.net.emode }; out.hcmp = { host: lastH.net.hcmp, join: lastJ.net.hcmp, hostSent: lastH.net.hsent, joinSent: lastJ.net.hsent };
+  out.realm = { host: lastH.net.worker, join: lastJ.net.worker };
+  out.modeTl = tl.map((x) => x.delay);
   out.estate = { host: lastH.net.estate, join: lastJ.net.estate };
   out.hashes = { host: lastH.net.hashes, join: lastJ.net.hashes };
   out.disc = { host: lastH.net.disc, join: lastJ.net.disc };

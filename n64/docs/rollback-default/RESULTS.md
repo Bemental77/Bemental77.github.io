@@ -1,6 +1,155 @@
-# N64 rollback as the default: measured 2026-10-01
+# N64 rollback as the default: measured 2026-10-01, fixed and re-measured 2026-10-02
 
-## Verdict: `RB_DEFAULT` stays `false`
+## Verdict (2026-10-02): `RB_DEFAULT = true`
+
+The four causes found on 2026-10-01 (the [earlier measurement](#measured-2026-10-01-rb_default-stayed-false),
+kept below) are fixed. Re-measured in interleaved matched pairs, gated
+rollback (G) against delay lockstep (L), both arms with the product's pre-Ready
+RTT setup:
+
+| Criterion | Result |
+|---|---|
+| G ≥ L in rate | **Holds by the cell mean and median; single pairs move ±2%.** Mean G/L: 1.003 (cpu1), 1.003 (cpu4 + mobile), 0.997 (worker core slowed 4x, an extra cell). Pair ratios: 0.984-1.020, 0.997-1.014, 0.981-1.022. L's own run-to-run spread in those cells is 0.8986-0.9105, 0.8329-0.8636 and 0.5603-0.5819. |
+| Local lag ≤ L in every cell | **Holds.** Mean lag over the 30 s window, G vs L: 3.57 vs 5.17 (cpu1), 4.10 vs 5.12 (cpu4 + mobile), 4.89 vs 4.93 (slowed core). In the two required cells G had less lag than L in all 10 pairs. In the slowed-core cell, two of five pairs read +0.06 and +0.03 frames. |
+| 0 desyncs | **Holds.** 550 of 550 confirmed states were bit-exact (full 16.8 MB hash) against a straight run fed the room's own inputs. Every engine ended `running`/`stalled`, never `desync`. |
+| Two-tab default room, 0 desyncs | **Holds.** Two 60 s rooms: no desync, 30-32 fingerprints compared per console. |
+
+What a player gets now:
+
+- On a device that can afford rollback, the room runs with zero input lag.
+- On one that cannot, the room switches to delay lockstep. It uses the same
+  delay a lockstep room picks from the RTT, and it gives that delay back the
+  same way. Measured: the switch went to the RTT-chosen 5-6 frames in every
+  gated room. The 2026-10-01 rooms went to 9-17.
+- When the device can afford rollback again, the room returns to it.
+
+Every desktop on this box could hold rollback only for the first 6-17 s of a
+room. The rooms that switched still had less lag over the window than
+lockstep did.
+
+## The fixes (all four causes)
+
+| Cause (2026-10-01) | Fix | Where |
+|---|---|---|
+| 1. `_capDelay` sized the switch from trailing-inflated input lateness | The switch uses `Lockstep.rttDelay`, the delay a lockstep room on this link starts at. `Session.rttReport` sets it, and so does the page. Without an RTT the old sizing remains as a fallback; a wire-only fallback failed two `netplay_rb_capacity_test` cells. A room that starts in delay also uses `rttDelay` exactly. After a switch, the give-back calm runs from the room's start or its last stall, not from the switch. | `lib/netplay.js` `_capDelay`, `_checkBarrier`, `_applyMode`, `rttReport` |
+| 2. The decision rode the start-up transient | `CAP_WARM_MS` = 5 s from the start, and from every return to rollback. During it a console records no depths, steps per frame or corrections. The host judges only the step itself, at `CAP_RS_START`: a step that is unaffordable on its own is not a transient, so it still switches. Holding that too failed `switch-both-ways-4p` and `window-cap` (the room trailed to delay 30). The memory switch is not held. | `lib/netplay.js` `_capDecide`, `_capSelfMeasure`, the depth ring, `_rbResumeAt` |
+| (c) N64 never declared `rbResume` | The page declares `rbResume: true`. `room_core.js` `rbRearm` saves the start of the first rollback frame after a delay stretch: the live machine is that state, and the engine names no correction across it. On the first delay frame the ring is released (`rbRelease`): 16.8 MB per state plus their framebuffer pins. | `n64/index.html` `startLockstep`; `room_core.js` `rbRunFrame`, `lsFeed` |
+| 3. No step or RTT before Ready | A rollback host pings like a lockstep host: the `!ls.rollback` condition is gone, and `rttDelay` reaches the worker engine (`WK_ENG_SETTINGS`). `lsRbProve` times a second save and publishes `selfStepMs` from it before Ready. No frame can run before Ready (the pre-roll is at room start), so the frame's own run is not in it: the published value is a floor, never more than the console will measure. In a delay stretch the page keeps publishing the step it would cost now (`rbStepEstimate`, from the live frame cost), so the host can decide a return. | `n64/index.html` `chooseDelayThenReady`; `room_core.js` `lsRbProve`, `rbStepEstimate` |
+
+**Why the ring release matters for rate.** Before it, the cpu4 + mobile cell
+read G/L 0.976, 1.009, 0.986, 0.981, 0.965, and G's governor wrote off more
+time in every pair (lostMs 4551-5733 against L's 3041-4327). After it, the
+same cell read 0.997-1.014.
+
+## Tests
+
+- **Every node suite: green, on HEAD and on this change.**
+  - rb_capacity 26/26, rb_outage 17/17, rb_pace_sim 12, rb_drop 24/24, rollback 27/27.
+  - rb_advantage 5/5, rb_msgcost 4/4, lockstep 152, delay_stepdown 24, pace_sim 18.
+  - pace_sim_n 6, redundancy 7, lsu 7, invariants 15, pace_verdict 11, rejoin_session 13/13.
+- **New: `n64/tools/rb_gate_rtt_test.mjs`, 7/7.**
+  - A gated room switches mid-room to exactly the RTT delay (2p and 4p, 50 and 100 ms), never slower than lockstep.
+  - A room that starts in delay starts at exactly that delay.
+  - Unit checks of `_capDelay` and the warm-up.
+- **`n64/tools/rb_sparse_unit_test.mjs`, 14/14.** It was stale since `ec9f66b` moved the rollback block out of the page.
+  - It now cuts the block out of `room_core.js`.
+  - Two new arms put a delay stretch mid-room, then roll back to its first frame.
+  - A mutant with no re-arm fails on "rollback to frame 1300 found no savestate".
+- **Genesis browser tests.** genesis_rollback 15/15 and genesis_netplay 26/26.
+  - genesis_page_test: 7 failures (ROM requests `ERR_ABORTED`, the portrait rotate prompt).
+  - Those same 7 failures occur with HEAD's `lib/netplay.js`, so this change did not cause them.
+- **rbResume in the real page:** `n64_rollback_probe.mjs --force-return 6`, worker core, cpu1.
+  - The seam makes the host's need read 0.1 once the room is in delay; the real gate is restored after each return.
+  - 3 returns, each re-arming the ring (frames 606, 1183, 1404).
+  - 100 of 100 confirmed states bit-exact against the straight run.
+
+## Rig
+
+- **Rate rig:** `n64/tools/n64_rollback_probe.mjs`. These additions now ship in it:
+  - `--rtt` (default on): before Ready, both arms get the product's RTT setup. Six pings per ghost are drawn from the rig's link model and fed to `recommendDelayForRoom`/`floorDelayForRoom`. `--rttseed` gives both arms of a pair the same draw.
+  - The rig attaches its engine with the product's own options, `rbResume` included.
+  - `--cin` (exactness against the room's own inputs), `--wslow`, `--expect`, `--force-return`.
+  - The per-second mode, delay, presented and capacity readings, plus the ghosts' hold counters and wire volume.
+- **Room:** MK64 (PAL, 50 Hz), 2 players, a ghost second player, 40-100 ms one way.
+  - 30 s window after a 3 s settle.
+  - 5 interleaved L/G rounds per cell; the order alternates by round, and each round shares one RTT seed.
+- **Isolation:** each cell ran under `tools/probe_lock.sh`, one cell at a time, on a hermetic snapshot served on :19100 (md5 of the served page checked).
+- **Load:** 1.80-4.28 across every run below.
+- **Hashes:** before and after every run, `n64/index.html` 93715a3f, `room_core.js` 181a6e96, `core_worker.js` 55597455, `n64wasm.wasm` 63f49e56, `lib/netplay.js` 9d05e8a3.
+  - The committed `room_core.js` differs from 181a6e96 only in the `RB_DEFAULT` line and its comments. These runs pass `?rb` explicitly, so that line does not reach them.
+  - The committed `index.html` differs only in comments and cache-buster stamps.
+- **Arms:**
+  - L: `--rbw 0 --query rb=0 --noref`.
+  - G: `--rbw 8 --query rb=1 --cin`.
+  - Columns as in the earlier tables. `rttDelay/floor` is what the pre-Ready RTT setup chose.
+
+### cpu1, worker room (the default realm)
+
+| run | load start/end | rate | lag avg (frames) | lag at end | secs in rollback | switches | presented share (shown/s) | stalls | exact (cin) | rttDelay/floor | engine |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| L r1 | 2.82 / 1.95 | 0.9065 | 5.07 | 5 | 0/30 | – | 0.796 (34.27) | 60 | – | 6/4 | running |
+| G r1 | 1.95 / 1.80 | 0.9007 | 4 | 5 | 6/30 | f445 → d6 | 0.786 (31.88) | 43 | 45/45 | 6/4 | running |
+| L r2 | 2.27 / 2.70 | 0.9042 | 5 | 5 | 0/30 | – | 0.791 (32.88) | 63 | – | 5/4 | running |
+| G r2 | 1.80 / 2.27 | 0.9221 | 2.1 | 5 | 17/30 | f989 → d5 | 0.775 (29.66) | 46 | 99/99 | 5/4 | running |
+| L r3 | 2.70 / 2.76 | 0.9105 | 5 | 5 | 0/30 | – | 0.792 (33.63) | 56 | – | 5/4 | running |
+| G r3 | 2.76 / 2.50 | 0.8956 | 3.83 | 5 | 6/30 | f462 → d5 | 0.783 (30.63) | 80 | 47/47 | 5/4 | running |
+| L r4 | 2.75 / 2.29 | 0.9009 | 5.73 | 6 | 0/30 | – | 0.798 (31.07) | 32 | – | 6/4 | running |
+| G r4 | 2.50 / 2.75 | 0.9023 | 3.33 | 5 | 10/30 | f631 → d6 | 0.793 (29.39) | 40 | 64/64 | 6/4 | running |
+| L r5 | 2.29 / 3.13 | 0.8986 | 5.07 | 5 | 0/30 | – | 0.775 (33.06) | 65 | – | 6/4 | running |
+| G r5 | 3.13 / 2.80 | 0.9151 | 4.6 | 6 | 6/30 | f451 → d6 | 0.789 (29.21) | 17 | 46/46 | 6/4 | running |
+
+G/L rate pairs: 0.994, 1.020, 0.984, 1.002, 1.018; G−L lag: -1.07, -2.90, -1.17, -2.40, -0.47
+
+### cpu4 + mobile, worker room (CDP throttles the page's thread; the core in the worker is not throttled)
+
+| run | load start/end | rate | lag avg (frames) | lag at end | secs in rollback | switches | presented share (shown/s) | stalls | exact (cin) | rttDelay/floor | engine |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| L r1 | 2.50 / 3.92 | 0.8636 | 5.8 | 6 | 0/30 | – | 0.795 (27.34) | 33 | – | 6/4 | running |
+| G r1 | 3.92 / 3.75 | 0.8611 | 4 | 5 | 6/30 | f432 → d6 | 0.779 (24.85) | 53 | 44/44 | 6/4 | running |
+| L r2 | 3.12 / 3.79 | 0.8329 | 5 | 5 | 0/30 | – | 0.776 (25.75) | 56 | – | 5/4 | running |
+| G r2 | 3.75 / 3.12 | 0.8445 | 3.83 | 5 | 6/30 | f466 → d5 | 0.777 (24.04) | 77 | 47/47 | 5/4 | running |
+| L r3 | 3.79 / 3.92 | 0.8566 | 5 | 5 | 0/30 | – | 0.782 (26.57) | 70 | – | 5/4 | running |
+| G r3 | 3.92 / 4.07 | 0.8597 | 3.93 | 5 | 6/30 | f427 → d5 | 0.783 (25.13) | 94 | 43/43 | 5/4 | running |
+| L r4 | 3.85 / 3.76 | 0.8556 | 4.73 | 4 | 0/30 | – | 0.769 (27.53) | 97 | – | 6/4 | running |
+| G r4 | 4.07 / 3.85 | 0.8532 | 4 | 5 | 6/30 | f430 → d6 | 0.773 (25.17) | 55 | 43/43 | 6/4 | running |
+| L r5 | 3.76 / 3.73 | 0.8546 | 5.07 | 5 | 0/30 | – | 0.786 (26.09) | 69 | – | 6/4 | stalled |
+| G r5 | 3.73 / 3.62 | 0.8555 | 4.73 | 6 | 6/30 | f415 → d6 | 0.797 (23.81) | 28 | 42/42 | 6/4 | running |
+
+G/L rate pairs: 0.997, 1.014, 1.004, 0.997, 1.001; G−L lag: -1.80, -1.17, -1.07, -0.73, -0.34
+
+### cpu4 + mobile, worker core slowed 4x (`--wslow 4`): the console that cannot afford rollback
+
+| run | load start/end | rate | lag avg (frames) | lag at end | secs in rollback | switches | presented share (shown/s) | stalls | exact (cin) | rttDelay/floor | engine |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| L r1 | 2.80 / 3.80 | 0.5819 | 4.93 | 4 | 0/30 | – | 0.788 (21.71) | 12 | – | 6/4 | running |
+| G r1 | 3.80 / 4.20 | 0.5708 | 4.8 | 5 | 0/30 | f57 → d6 | 0.781 (22.49) | 19 | 6/6 | 6/4 | running |
+| L r2 | 3.64 / 3.38 | 0.5603 | 4.97 | 5 | 0/30 | – | 0.765 (21.36) | 28 | – | 5/4 | running |
+| G r2 | 4.20 / 3.64 | 0.5724 | 4.77 | 5 | 0/30 | f56 → d5 | 0.772 (22.28) | 35 | 6/6 | 5/4 | running |
+| L r3 | 3.38 / 3.41 | 0.5723 | 4.87 | 5 | 0/30 | – | 0.765 (22.11) | 39 | – | 5/4 | running |
+| G r3 | 3.41 / 3.12 | 0.5613 | 4.93 | 5 | 0/30 | f56 → d5 | 0.778 (21.73) | 27 | 6/6 | 5/4 | running |
+| L r4 | 2.53 / 2.59 | 0.5746 | 5 | 4 | 0/30 | – | 0.783 (22.03) | 17 | – | 6/4 | running |
+| G r4 | 3.12 / 2.53 | 0.5703 | 5 | 5 | 0/30 | f57 → d6 | 0.786 (22.12) | 30 | 6/6 | 6/4 | running |
+| L r5 | 2.59 / 2.65 | 0.5622 | 4.9 | 5 | 0/30 | – | 0.777 (20.97) | 32 | – | 6/4 | running |
+| G r5 | 2.65 / 2.50 | 0.5672 | 4.93 | 5 | 0/30 | f57 → d6 | 0.777 (21.63) | 35 | 6/6 | 6/4 | running |
+
+G/L rate pairs: 0.981, 1.022, 0.981, 0.993, 1.009; G−L lag: -0.13, -0.20, 0.06, 0.00, 0.03
+
+### Two-tab default room (`party_pace_probe.mjs --arm net --netms 70 --jitter 30 --secs 60`, `RB_DEFAULT = true`, no `?rb`)
+
+Two real consoles over the real transport, both in the worker. Snapshot:
+`room_core.js` 66a0c630, `lib/netplay.js` 9d05e8a3. These are single runs,
+not pairs: the rate column can only be compared within this box's two-core
+SwiftShader ceiling.
+
+| run | load start/end | rate host / joiner | switch | delay each second | lag (frames, 60 s) | zero-lag secs | fingerprints compared (each side) | desync |
+|---|---|---|---|---|---|---|---|---|
+| default 1 | 1.64 / 3.69 | 0.6253 / 0.6253 | f331 → d6 ("player 1, player 2 need 122%") | 0 ×7, 5 ×7, then 4 | 3.65 | 7/60 | 32 / 32 | none |
+| lockstep control (`?rb=0`) | 3.69 / 3.99 | 0.6475 / 0.6478 | – | 7 ×11, then 6 | 6.18 | 0/60 | 34 / 34 | none |
+| default 2 | 3.99 / 3.43 | 0.5883 / 0.5916 | f74 → d6 ("player 2 needs 113%") | 0 ×3, 6, 5, 6 | 5.58 | 3/60 | 30 / 28 (of 30 sent) | none |
+
+## Measured 2026-10-01: RB_DEFAULT stayed false
+
+### Verdict then: `RB_DEFAULT` stays `false`
 
 The switch is `n64/N64Wasm/dist/room_core.js:627`. Since `ec9f66b` it lives in
 that file and `n64/index.html` only reads it (`:3832`). It feeds exactly one
@@ -426,8 +575,9 @@ delay. There is no transient, no inflated switch, and no difference from L.
 
 ## Re-check on 173ad52
 
-Not yet run when this file was first committed: the shared probe lock was
-contended for over an hour. A follow-up commit fills this in.
+Never run as such: superseded by the 2026-10-02 re-measurement at the top of
+this file, which measured the fixed code on top of `3664ce4` (itself on
+`173ad52`).
 
 ## Rig limits
 

@@ -576,7 +576,7 @@
     };
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // ROLLBACK — ZERO LOCAL INPUT LAG (OPT-IN: ?rb=1; see RB_DEFAULT below).
+    // ROLLBACK — ZERO LOCAL INPUT LAG (THE DEFAULT, CAPACITY-GATED; ?rb=0 opts out — see RB_DEFAULT below).
     //
     // The engine half (prediction, the window, the re-simulation plan, confirmed
     // fingerprints) is lib/netplay.js _beginFrameRb; genesis.html rbRunFrame is
@@ -619,12 +619,16 @@
     // rather than repaid (lsFeed).
     // ═══════════════════════════════════════════════════════════════════════════
     var RB_Q = new URLSearchParams(env.search);
-    // ROLLBACK IS OPT-IN (?rb=1) UNTIL THE ENGINE'S CAPACITY GATE LANDS. Measured
-    // 2026-10-01 (MK64, 4x-CPU mobile arm, 2 players): rollback rooms ran at
-    // 0.06-0.26x while delay lockstep (robust-RTT input delay) is never slower,
-    // so N64 rooms default to delay lockstep and rollback is a measurement arm.
-    // ▶ ONE-LINE SWITCH — when the capacity gate lands, flip RB_DEFAULT to true:
-    var RB_DEFAULT = false;
+    // ROLLBACK IS THE DEFAULT (since 2026-10-02), CAPACITY-GATED. History: until the
+    // engine's capacity gate landed it was opt-in — measured 2026-10-01 (MK64, 4x-CPU
+    // mobile arm, 2 players) rollback rooms ran at 0.06-0.26x where delay lockstep
+    // holds its rate. With the gate (lib/netplay.js _capDecide) a console that cannot
+    // afford rollback drops the room to delay lockstep at EXACTLY the delay a lockstep
+    // room on the link starts at (the host's RTT pings, rttDelay), after a warm-up,
+    // and returns when it can afford it again (rbResume, rbRearm here). Measured in
+    // interleaved matched pairs against delay lockstep: never slower, never more input
+    // lag, 0 desyncs — n64/docs/rollback-default/RESULTS.md. ?rb=0 is the lockstep arm.
+    var RB_DEFAULT = true;
     var RB_WANT = RB_Q.get('rb') === '1' || (RB_DEFAULT && RB_Q.get('rb') !== '0');  // ?rb=1 / ?rb=0 override either way
     var RB_WINDOW = Math.max(2, Math.min(12, +(RB_Q.get('rbw') || 8) | 0));
     // ---- RE-SIMULATED FRAMES DRAW NOTHING (GLSKIP) -----------------------------
@@ -709,7 +713,8 @@
                img: new Array(RB_IMG), imgF: new Int32Array(RB_IMG).fill(-1),
                hidden: 0, stepMs: 0, runEma: 0, saveEma: 0, loadEma: 0, pEma: 0, depthEma: 0,
                rollbacks: 0, resimFrames: 0, bridgeFrames: 0, maxDepth: 0, depthHist: {}, resimMs: 0, maxResimMs: 0, depthSum: 0,
-               hashes: 0, missingSlot: 0, saveMs: 0, saves: 0, skippedSaves: 0, frames: 0, loads: 0, evictions: 0, glRedo: 0 };
+               hashes: 0, missingSlot: 0, saveMs: 0, saves: 0, skippedSaves: 0, frames: 0, loads: 0, evictions: 0, glRedo: 0,
+               stale: false, rearms: 0 };
     function rbSpan(ls) {
       return Math.max((ls.rollback | 0) + 3, typeof ls.rbRingFrames === 'function' ? ls.rbRingFrames() | 0 : 0);
     }
@@ -727,6 +732,32 @@
             + ' MB, allocated as used; past it snapshots are thinned, never refused), one every '
             + (RB.kFixed ? RB.k + ' frames (?rbk)' : 'K frames, K adapted to the measured cost'
             ) + '; local input applied with 0 frames of delay');
+      return true;
+    }
+    // ⚠ BACK TO ROLLBACK AFTER INPUT DELAY (lib/netplay.js _capDecide: a
+    // capacity-gated room returns to zero-lag mode when every console can afford
+    // it again; this page declares opts.rbResume). The delay frames ran outside
+    // the ring (lsRunOneFrame), so nothing in it reaches the frames the room can
+    // now roll back to: its snapshots are of frames before the switch to delay,
+    // and RB.img holds none of the inputs the delay frames ran with. The ring is
+    // RE-ARMED at the first rollback frame R, before it runs: the live machine IS
+    // the start of R (every frame before it ran, in order, on its final input —
+    // lockstep runs only on real inputs), and the engine never names a correction
+    // reaching back across R (every input before R is held: _rbResumeAt). The
+    // engine's contract (opts.rbResume): the page keeps the start of that first
+    // rollback frame itself. One save, once per return.
+    function rbRelease() {
+      for (var i = 0; i < RB.slots.length; i++) { rbDrop(RB.slots[i]); try { n64sFree(RB.slots[i].buf); } catch (e) {} }
+      RB.slots = []; RB.released = (RB.released | 0) + 1;
+    }
+    function rbRearm(ls, k) {
+      for (var i = 0; i < RB.slots.length; i++) rbDrop(RB.slots[i]);
+      RB.n = rbSpan(ls);
+      if (!rbSaveAt(ls, k)) { RB.fault = N64S.fault || 'the savestate at the return to rollback failed'; return false; }
+      RB.stale = false; RB.rearms++;
+      env.log('[rollback] zero-lag mode again: the savestate ring is re-armed at frame ' + k + ' (window ' + (ls.rollback | 0)
+            + ' frames, snapshots reach back ' + RB.n + ')');
+      if (G.__n64RbLog) G.__n64RbLog.push(['rearm', k]);
       return true;
     }
     // THE REACH FOLLOWS THE WINDOW (lib/netplay.js rbRingFrames): the snapshots
@@ -948,6 +979,21 @@
       var ms = ((RB.loadEma || 0) + (W + k - 1) * RB.runEma + Math.ceil(W / k) * RB.saveEma) / W;
       return ms > 0 ? ms : 0;
     }
+    // The same step, ESTIMATED where no rollback frame is running: in a gated
+    // room's delay stretch (lsFeed) and before Ready (lsRbProve). The run is the
+    // frame cost this console measures on every frame it runs (LS.costAvg — the
+    // same _neil_ls_run_frame wall time rbStep measures), the save and load are
+    // the last ones measured (RB.*Ema; before any: the save timed in
+    // lsRbProve, and a load taken to cost what a save does — both are one
+    // 16.8 MB state copy), K the last one chosen, the window the one the room
+    // returns to. 0 = nothing measured yet.
+    function rbStepEstimate(ls) {
+      var save = RB.saveEma || LS_RB.saveMs || 0;
+      if (!(save > 0)) return 0;
+      var load = RB.loadEma || save, run = LS.costAvg || RB.runEma || 0, k = RB.k || 1;
+      var W = Math.max(2, (ls.rollback | 0) || (ls._capW | 0) || RB_WINDOW);
+      return (load + (W + k - 1) * run + Math.ceil(W / k) * save) / W;
+    }
     function rbFail(ls, why) {
       LS.fault = why;
       env.log('[rollback] ⚠ ' + why);
@@ -956,6 +1002,12 @@
     }
     function rbRunFrame(ls, r, hidden) {
       if (!RB.ready && !rbInit(ls)) return rbFail(ls, 'rollback could not start: ' + (RB.fault || N64S.fault));
+      if (RB.stale) {
+        // (see rbRearm) A correction across the return would need a state this
+        // console never kept — the engine promises none; refuse rather than guess.
+        if (r.rollback) return rbFail(ls, 'a correction reached back across the switch to rollback (frame ' + r.rollback.from + ' < ' + r.frame + ')');
+        if (!rbRearm(ls, r.frame | 0)) return rbFail(ls, 'rollback could not resume: ' + RB.fault);
+      }
       if (r.rollback) {
         var ta = performance.now();
         audioFlushNow();
@@ -1277,6 +1329,17 @@
           break;
         }
         LS.fed++; ran++;
+        // A frame the ring did not see: the next rollback frame re-arms it (rbRearm).
+        // Nothing in the ring can be loaded again, so its states (16.8 MB each, and
+        // the framebuffer pins they hold) go back now — a phone's memory — rather
+        // than sitting through the delay stretch; rbRearm allocates afresh.
+        if (RB.ready && !RB.stale) { rbRelease(); RB.stale = true; }
+        // A CAPACITY-GATED ROOM IN DELAY keeps telling the host what rollback
+        // would cost this console now (lib/netplay.js _capDecide reads `st` to
+        // decide a return to zero-lag mode): without this the step stays what it
+        // was at the switch — the very measurement that said it could not afford
+        // it — and the room never comes back.
+        if (ls._capGate) { var se = rbStepEstimate(ls); if (se > 0) ls.selfStepMs = se; }
         // ⚠ THE CORE IS IN THIS PAGE AND IS SYNCHRONOUS, so unlike dreamcast.html
         // the fingerprint for the frame just run is available RIGHT NOW and goes
         // straight into endFrame(). That is the shape lib/netplay.js's endFrame
@@ -1327,7 +1390,7 @@
     // Likewise a read_always title with SYNCHRONOUS framebuffer readback
     // (?fbasync=0): the GPU frame a re-simulated frame reads is not in any
     // savestate and no fbasync pin restores it.
-    var LS_RB = { proven: null, why: null, ms: 0 };
+    var LS_RB = { proven: null, why: null, ms: 0, saveMs: 0 };
     function lsRbRefuse(why) {
       LS_RB.proven = false; LS_RB.why = why;
       var ls = env.engine();
@@ -1351,8 +1414,29 @@
       try { a = G.__n64State.alloc(); } catch (e) { a = null; }
       if (!a) { lsRbRefuse('no memory for a savestate'); return false; }
       var ok = n64sSave(a);
+      // THE STEP, AS FAR AS IT CAN BE MEASURED BEFORE READY (lib/netplay.js reads
+      // `st` at the barrier: a console that cannot afford rollback STARTS the
+      // room in delay lockstep, at the delay the RTT pings chose, with no
+      // start-up transient). A second save, timed on its own: the first one ran
+      // the one-time heap scans. No frame can run here (lsPreroll: the core is
+      // pre-boot until the room starts) and nothing is loaded (it would change
+      // the frame everyone starts from), so the run is not in it and the load is
+      // taken to cost what the save does: what is published is the part of the
+      // step this console can already prove — never more than it will measure.
+      if (ok) {
+        var ts = performance.now();
+        if (n64sSave(a)) LS_RB.saveMs = performance.now() - ts;
+      }
       try { G.__n64State.free(a); } catch (e) {}
       if (!ok) { lsRbRefuse(N64S.fault || 'the savestate failed'); return false; }
+      if (LS_RB.saveMs > 0 && ls) {
+        var est = rbStepEstimate(ls);
+        if (est > 0) {
+          ls.selfStepMs = est;
+          env.log('[rollback] step before Ready: ' + est.toFixed(2) + ' ms (save ' + LS_RB.saveMs.toFixed(2)
+                + ' ms, the load taken as one more; the frame itself is measured once the room runs)');
+        }
+      }
       // How many snapshots this console can hold, known now so the engine has
       // it before Ready (lsready mw).
       var budget = Math.max(2, Math.floor(RB_RING_BUDGET_MB * 1048576 / rbSlotBytes())), held = budget;
@@ -1512,7 +1596,7 @@
                   resimMsPerDepthFrame: RB.depthSum ? +(RB.resimMs / RB.depthSum).toFixed(2) : 0,
                   maxResimMs: +RB.maxResimMs.toFixed(1), saves: RB.saves, skippedSaves: RB.skippedSaves, evictions: RB.evictions, freed: RB.freed | 0,
                   saveMsPerFrame: RB.frames ? +(RB.saveMs / (RB.frames + RB.resimFrames + RB.bridgeFrames + RB.hidden)).toFixed(2) : null,
-                  hashes: RB.hashes, missingSlot: RB.missingSlot, frames: RB.frames, fault: RB.fault,
+                  hashes: RB.hashes, missingSlot: RB.missingSlot, frames: RB.frames, fault: RB.fault, rearms: RB.rearms,
                   glSkip: { ok: glSkipOk(), disabled: GLSKIP.disabled, frames: GLSKIP.frames, callsSkipped: GLSKIP.calls,
                             coreReads: GLSKIP.reads, redo: GLSKIP.redo } },
           state: G.__n64State.info(),
@@ -1521,6 +1605,9 @@
                     msPerRun: RA.runs ? +(RA.ms / RA.runs).toFixed(2) : null, tickMs: +RA.tickEma.toFixed(2),
                     ups: RA.ups, downs: RA.downs, fault: RA.fault },
         advWaits: LS.advWaits | 0,
+        // what the capacity gate reads from this console, in either mode
+        step: { selfStepMs: ls ? +(+ls.selfStepMs || 0).toFixed(2) : null, preReadySaveMs: +(LS_RB.saveMs || 0).toFixed(2),
+                rearms: RB.rearms, stale: RB.stale },
         lat: { samples: LAT.samples.slice(-60), overlapped: LAT.overlapped },
         prerolled: !!LS.prerolled,
         fb: (function () { var st = G.__fbAsync || {}; return { on: !!st.on, decided: st.decided || null, rom: st.romName || null,
