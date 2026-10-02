@@ -1623,7 +1623,7 @@ N64Rate.selfTest = function (logFn) {
 </script>
 <script src="/n64/N64Wasm/dist/fbasync.js?v=61174a18"></script>
 <script src="/n64/N64Wasm/dist/jit_params.js?v=bb2930f6"></script>
-<script src="/n64/N64Wasm/dist/room_core.js?v=66a0c630"></script>
+<script src="/n64/N64Wasm/dist/room_core.js?v=a4002432"></script>
 <script>
 (function () {
   'use strict';
@@ -2176,7 +2176,8 @@ N64Rate.selfTest = function (logFn) {
     // Core worker: the pictures are committed by the WORKER, so `shown` is counted there, on
     // its own animation frames, with this page's definition: frames in which the core's field
     // counter moved (core_worker.js observePresents). This page's rAF says nothing about them.
-    if (WK.on) { var pr = WK.stat ? (WK.stat.shown | 0) : 0; shown = pr - WK.presents0; WK.presents0 = pr; }
+    // With bitmap presentation the pictures are put on screen HERE (wkPresentTick): count those.
+    if (WK.on) { var pr = WK.bctx ? (WK.bmpShown | 0) : WK.stat ? (WK.stat.shown | 0) : 0; shown = pr - WK.presents0; WK.presents0 = pr; }
     var pace = pacer.drain();
     paceTotals.paced += pace.paced; paceTotals.denied += pace.denied;
     paceTotals.idle += pace.idle; paceTotals.notOwed += pace.notOwed; paceTotals.ticks += pace.ticks;
@@ -2456,7 +2457,7 @@ N64Rate.selfTest = function (logFn) {
   // logged. If the worker fails while it boots (no WebGL2 there after all, a
   // core abort before "Starting R4300"), the page reloads ONCE with ?worker=0
   // (wkFallback) and says so in its log.
-  var WK_V = '43feea77';                           // cache-buster for the worker's scripts
+  var WK_V = '894d2b51';                           // cache-buster for the worker's scripts
   var WK_DEFAULT = true;                     // the default for a capable console (solo and rooms)
   var WK = { on: false, why: null, w: null, stat: null, statAt: 0, presents0: 0, pendingAudioPort: null,
              evals: {}, evalId: 0, sent: null, composed: 0, posted: 0, fatal: null, booted: false,
@@ -2614,6 +2615,7 @@ N64Rate.selfTest = function (logFn) {
     var d = e.data || {};
     switch (d.t) {
       case 'stat': WK.stat = d; break;
+      case 'frame': wkPresent(d.b); break;
       case 'print':
         pageLog('> ' + d.s);
         if (String(d.s).indexOf('Starting R4300 emulator') !== -1) { running = true; mark('running'); setStatus('Running.'); }
@@ -2698,17 +2700,50 @@ N64Rate.selfTest = function (logFn) {
     w.onerror = function (e) { wkOnMessage({ data: { t: 'err', s: 'worker error: ' + ((e && e.message) || 'unknown'), fatal: true } }); };
     return w;
   }
+  // THE PRESENTER (?present=bitmap): the worker's pictures, in order, one per animation
+  // frame. At most two wait — a third arriving means this page fell a whole picture behind,
+  // and the oldest is dropped (counted) rather than shown late.
+  function wkPresent(b) {
+    if (!b) return;
+    var Q = WK.pq || (WK.pq = []);
+    WK.bmpIn = (WK.bmpIn | 0) + 1;
+    Q.push(b);
+    while (Q.length > 2) { var x = Q.shift(); try { x.close(); } catch (e) {} WK.bmpDropped = (WK.bmpDropped | 0) + 1; }
+    if (!WK.pRaf) { WK.pRaf = true; requestAnimationFrame(wkPresentTick); }
+  }
+  function wkPresentTick() {
+    WK.pRaf = false;
+    var Q = WK.pq, b = Q && Q.shift();
+    if (!b || !WK.bctx) return;
+    var cv = $('canvas');
+    if (cv.width !== b.width || cv.height !== b.height) { cv.width = b.width; cv.height = b.height; }
+    try { WK.bctx.transferFromImageBitmap(b); WK.bmpShown = (WK.bmpShown | 0) + 1; } catch (e) { WK.bmpErr = String((e && e.message) || e); }
+    if (Q.length) { WK.pRaf = true; requestAnimationFrame(wkPresentTick); }
+  }
   function wkBoot(app, bytes, files) {
     var q = new URLSearchParams(location.search);
-    var off = $('canvas').transferControlToOffscreen();
+    // HOW THE WORKER'S PICTURES REACH THE SCREEN (core_worker.js, THE COMMIT YIELD and
+    // PRESENTATION BY BITMAP): by default the canvas goes to the worker and its commits put
+    // the pictures on screen (?present=commit: without the yield, the control arm).
+    // ?present=bitmap is an arm: each drawn field comes back as an ImageBitmap and is shown
+    // here, one per animation frame of this (idle) thread — where the browser has
+    // transferToImageBitmap and ImageBitmapRenderingContext.
+    var cv = $('canvas'), pm = q.get('present'), off = null;
+    WK.bctx = null;
+    if (pm === 'bitmap' && typeof OffscreenCanvas === 'function'
+        && typeof OffscreenCanvas.prototype.transferToImageBitmap === 'function' && typeof ImageBitmapRenderingContext === 'function') {
+      try { WK.bctx = cv.getContext('bitmaprenderer'); } catch (e) { WK.bctx = null; }
+    }
+    if (!WK.bctx) off = cv.transferControlToOffscreen();
     var w = wkEnsureWorker();
     window.Module = wkFacade();
     var buf = (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) ? bytes.buffer : bytes.slice().buffer;
-    w.postMessage({ t: 'boot', canvas: off, rom: buf, files: files, romName: app.rom_name,
+    w.postMessage({ t: 'boot', canvas: off, present: WK.bctx ? 'bitmap' : (pm === 'commit' ? 'commit' : 'yield'), cw: cv.width, ch: cv.height,
+                    rom: buf, files: files, romName: app.rom_name,
                     viHz: (romRegion && romRegion.viHz > 0) ? romRegion.viHz : 0, search: location.search,
                     jit: (q.get('jit') === 'off' || q.has('nojit')) ? 'off' : 'emit', rig: q.get('workerrig') === '1', v: WK_V,
                     room: !!(WK.room && NET.session), workerfail: q.get('workerfail') || null },
-                  [off, buf]);
+                  off ? [off, buf] : [buf]);
     if (WK.pendingAudioPort) { w.postMessage({ t: 'audioPort', port: WK.pendingAudioPort }, [WK.pendingAudioPort]); WK.pendingAudioPort = null; }
     wkWireInput();
     wkCompose();
@@ -2717,7 +2752,9 @@ N64Rate.selfTest = function (logFn) {
   // Rig surface (?workerrig=1): run a snippet inside the worker's realm, where `Module` is the
   // live core. Used by n64/tools/n64_worker_probe.mjs; the worker refuses it without the flag.
   window.__n64Worker = {
-    state: function () { return { on: WK.on, why: WK.why, booted: WK.booted, fatal: WK.fatal, stat: WK.stat, composed: WK.composed, posted: WK.posted, sent: WK.sent ? Array.prototype.slice.call(WK.sent) : null }; },
+    state: function () { return { on: WK.on, why: WK.why, booted: WK.booted, fatal: WK.fatal, stat: WK.stat, composed: WK.composed, posted: WK.posted, sent: WK.sent ? Array.prototype.slice.call(WK.sent) : null,
+                                  present: WK.bctx ? { mode: 'bitmap', in: WK.bmpIn | 0, shown: WK.bmpShown | 0, dropped: WK.bmpDropped | 0, err: WK.bmpErr || null }
+                                                   : { mode: (WK.stat && WK.stat.cb && WK.stat.cb.mode) || 'commit' } }; },
     eval: function (src) {
       return new Promise(function (res, rej) {
         if (!WK.w) return rej(new Error('no core worker'));
