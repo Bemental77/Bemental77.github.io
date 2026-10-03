@@ -191,6 +191,18 @@ union UPECtrlReg
 // and dropped if the guest has reused that RAM.
 extern std::atomic<int> g_efb_ram_outstanding;   // late writes not yet landed (current gen)
 extern std::atomic<u32> g_efb_ram_drop_gen;      // bumped on give-up; older writes are dropped
+// [late-efb across a state LOAD 2026-10-01] A savestate load replaces guest RAM, but a late
+// write whose readback was issued BEFORE the load can land AFTER it (the mapAsync callback is
+// AllowSpontaneous on the device thread; the load runs on the CPU thread). In the HOLD arm a
+// same-generation straggler is written UNGUARDED, so it put the old timeline's EFB bytes into
+// the freshly loaded RAM. Observed 2026-10-01: a City Escape state reloaded mid-gameplay ran
+// 18k never-seen PCs within 10 s, then crawled at 1.4 MHz in the OSReport/OSPanic region with
+// peFrames frozen — the same wild-pointer shape as the eventD wedge above. Each write now
+// carries the load epoch it was issued in; a write from an older epoch is dropped outright
+// (that timeline no longer exists), and the load waits for any callback already inside its
+// RAM write (g_efb_ram_writers, Dekker-ordered against the epoch) before it restores RAM.
+extern std::atomic<u32> g_efb_ram_load_epoch;     // bumped at the start of every state LOAD
+extern std::atomic<int> g_efb_ram_writers;        // late-write callbacks inside their RAM write
 
 class PixelEngineManager
 {
@@ -214,6 +226,8 @@ public:
   // EFB->RAM write has landed, and by the GPU slice every pump (give-up timer).
   void ReleaseHeldTokenFinish();
   void PollHeldTokenFinish();
+  // [late-efb across a state LOAD] call on the CPU thread BEFORE State::DoState(Read).
+  void BeginStateLoad();
   AlphaReadMode GetAlphaReadMode() const { return m_alpha_read.read_mode; }
 
 private:

@@ -334,6 +334,7 @@ void WGPUStagingTexture::ReadTexels(const MathUtil::Rectangle<int>& rect, void* 
       // [efb-ram ordering 2026-10-01] the PE holds its next token/finish until this write
       // has landed (PixelEngine.h); the readback callback decrements and releases.
       p->def_gen = PixelEngine::g_efb_ram_drop_gen.load(std::memory_order_acquire);
+      p->def_epoch = PixelEngine::g_efb_ram_load_epoch.load(std::memory_order_seq_cst);
       PixelEngine::g_efb_ram_outstanding.fetch_add(1, std::memory_order_acq_rel);
       return;
     }

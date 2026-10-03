@@ -95,6 +95,7 @@ struct WGPUEfbEncodePending
   u32 def_hash = 0;            // [late-efb guard] FNV-1a of that RAM when the write was deferred
   double def_t = 0.0;          // [late-efb census] host ms when the write was deferred
   u32 def_gen = 0;             // [efb-ram ordering] PixelEngine::g_efb_ram_drop_gen at deferral
+  u32 def_epoch = 0;           // [late-efb across a load] PixelEngine::g_efb_ram_load_epoch at deferral
   // Registration back-pointer: the callback unregisters itself from the staging
   // before deleting the ctx (else a later ReadTexels would read freed memory).
   // Only dereferenced on the !orphaned path; the staging dtor sets orphaned.

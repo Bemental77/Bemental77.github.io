@@ -32,6 +32,8 @@ namespace PixelEngine
 {
 std::atomic<int> g_efb_ram_outstanding{0};
 std::atomic<u32> g_efb_ram_drop_gen{0};
+std::atomic<u32> g_efb_ram_load_epoch{0};
+std::atomic<int> g_efb_ram_writers{0};
 
 // Arm cell 0x026B3E08: 0 (default) = hold; 0xEFB06A2D = no hold, drop a late write only if the
 // guest rewrote its destination (the fingerprint guard); 0xEFB0A11F = the old unordered
@@ -223,6 +225,25 @@ void PixelEngineManager::PollHeldTokenFinish()
   }
   ReleaseHeldTokenFinish();
 #endif
+}
+
+void PixelEngineManager::BeginStateLoad()
+{
+  // Every late write issued before this point belongs to a timeline the load is about to
+  // replace. Bump the epoch first (seq_cst), then wait out any callback that read the OLD
+  // epoch and is still copying into RAM — it increments g_efb_ram_writers BEFORE it reads the
+  // epoch, so after this loop no old-epoch write can land in the restored RAM. The wait is a
+  // single EncodeEfbToRam (microseconds) and the device thread never waits on this thread.
+  g_efb_ram_load_epoch.fetch_add(1, std::memory_order_seq_cst);
+  while (g_efb_ram_writers.load(std::memory_order_seq_cst) != 0)
+  {
+  }
+  // A token/finish held for those writes belongs to the old timeline too: forget it (the
+  // restored PE state carries its own pending flags) and retire the old generation's count.
+  std::lock_guard lk(m_token_finish_mutex);
+  m_raise_held = false;
+  g_efb_ram_drop_gen.fetch_add(1, std::memory_order_acq_rel);
+  g_efb_ram_outstanding.store(0, std::memory_order_release);
 }
 
 void PixelEngineManager::FlushPendingTokenFinish()

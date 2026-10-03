@@ -338,6 +338,11 @@ protected:
             // Arms (cell 0x026B3E08): 0 = HOLD (default: the PE token/finish waits up to 100 ms
             // for this write, which is then exact); 0xEFB06A2D = no hold, fingerprint guard only;
             // 0xEFB0A11F = the old unordered write; 0xEFB0D0D0 = drop every late write.
+            // [late-efb across a state LOAD 2026-10-01] PixelEngine.h. Writers count is
+            // raised BEFORE the epoch is read (Dekker pairing with BeginStateLoad).
+            PixelEngine::g_efb_ram_writers.fetch_add(1, std::memory_order_seq_cst);
+            const bool old_epoch =
+                c->pending.def_epoch != PixelEngine::g_efb_ram_load_epoch.load(std::memory_order_seq_cst);
             const u32 arm = *reinterpret_cast<volatile u32*>(uintptr_t(0x026B3E08u));
             const bool stale_gen =
                 c->pending.def_gen != PixelEngine::g_efb_ram_drop_gen.load(std::memory_order_acquire);
@@ -347,7 +352,12 @@ protected:
             const bool reused =
                 guarded &&
                 WGPUEfbGuardHash(c->pending.def_dst, c->pending.def_len) != c->pending.def_hash;
-            if (arm == 0xEFB0D0D0u || reused)
+            if (old_epoch)
+            {
+              ++*reinterpret_cast<volatile u32*>(uintptr_t(0x026B3E04u));
+              ++*reinterpret_cast<volatile u32*>(uintptr_t(0x026B3ED8u));  // dropped: pre-load
+            }
+            else if (arm == 0xEFB0D0D0u || reused)
             {
               ++*reinterpret_cast<volatile u32*>(uintptr_t(0x026B3E04u));
             }
@@ -357,6 +367,7 @@ protected:
               c->dst_stride = c->pending.def_stride;
               EncodeEfbToRam(c, mapped);
             }
+            PixelEngine::g_efb_ram_writers.fetch_sub(1, std::memory_order_seq_cst);
             ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3854u));
           }
           else if (!c->pending.orphaned)
