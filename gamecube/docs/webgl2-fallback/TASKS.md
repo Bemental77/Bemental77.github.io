@@ -28,6 +28,7 @@ flags NaN / |x| > 1e7 / out-of-range). Hermetic snapshots, `tools/probe_lock.sh`
 | sample word | `7d9398bf` = 2.45e37 as read; byte-reversed `bf98937d` = -1.19 | — |
 | replay after that frame | stuck: fence age 62 s+ at end of run, presents frozen at 637 | fence max 1.0 s (vtx run) / 1.43 s (clean 300 s run); presents keep advancing |
 | screenshot at end | blank canvas | correct Mario Party 4 title (logo, characters, cube) |
+| 2-console room, no WebGPU, 240 s (`NO_WEBGPU=1 gc_netplay_room_test`) | (028c3db: 0.9979x, 16/16, 0 desyncs) | mean 0.9968x, windows 0.9747-1.0008x, **16/16 PASS, 0 desyncs** (239/239 fingerprints agreed through frame 14340; load up to 10) |
 | clean 300 s run (no instrument) | — | longest main-thread task 0 ms after boot (1,248 ms during boot), guest 59.992/s = 0.9999x, max 5 s window 1.0038x, 8.27 presents/s |
 
 **WebGPU on this box is a different problem.** The same snapshot with `--enable-unsafe-webgpu`
