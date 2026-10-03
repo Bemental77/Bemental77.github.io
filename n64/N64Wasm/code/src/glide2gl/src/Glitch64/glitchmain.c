@@ -260,15 +260,76 @@ static GLuint nf_shader(GLenum type, const char *src)
    return ok ? s : 0;
 }
 
-static int nf_init(void)
-{
-   static const char *vs = "#version 300 es\n"
+/* NF AHEAD (2026-10-03): this program used to be compiled, linked and asked about
+ * (compile status, link status, uniform locations) at the first readback, in the middle
+ * of a field — 6.5 ms at MK64's field 39 here, mostly waiting for the compile. Now
+ * shader_prewarm (glitch64_combiner.c) starts it at boot with nothing asked
+ * (nf_warm_start), neil_shader_warm_step asks once its link is complete (nf_warm_poll,
+ * COMPLETION_STATUS_KHR), and nf_init only creates the objects. Same sources, same
+ * program, same uniform values; a first readback before the answers are in asks then,
+ * as before. */
+static const char *nf_vs_text = "#version 300 es\n"
       "void main(){vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));gl_Position=vec4(p*2.0-1.0,0.0,1.0);}\n";
-   static const char *fs = "#version 300 es\n"
+static const char *nf_fs_text = "#version 300 es\n"
       "precision highp float; precision highp int; precision highp isampler2D; precision highp sampler2D;\n"
       "uniform sampler2D src; uniform isampler2D xs; uniform isampler2D ys; out vec4 o;\n"
       "void main(){ivec2 d=ivec2(gl_FragCoord.xy);"
       "o=texelFetch(src,ivec2(texelFetch(xs,ivec2(d.x,0),0).r,texelFetch(ys,ivec2(d.y,0),0).r),0);}\n";
+static const char *nf_vs_src(void) { return nf_vs_text; }
+static const char *nf_fs_src(void) { return nf_fs_text; }
+static GLuint nf_pend, nf_pv, nf_pf;
+static int nf_started, nf_asked;
+static GLint nf_loc[3] = { -1, -1, -1 };
+int neil_shader_warm_complete(GLuint prog);
+void nf_warm_start(void)
+{
+   GLuint v, f;
+   if (!neil_native_fbread || nf_prog || nf_started)
+      return;
+   v = glCreateShader(GL_VERTEX_SHADER);   { const char *t = nf_vs_src(); glShaderSource(v, 1, &t, NULL); } glCompileShader(v);
+   f = glCreateShader(GL_FRAGMENT_SHADER); { const char *t = nf_fs_src(); glShaderSource(f, 1, &t, NULL); } glCompileShader(f);
+   nf_pend = glCreateProgram();
+   glAttachShader(nf_pend, v); glAttachShader(nf_pend, f);
+   glLinkProgram(nf_pend);
+   nf_pv = v; nf_pf = f; nf_started = 1; nf_asked = 0;
+}
+/* the questions nf_init asked: 1 = the program is usable (nf_prog set) */
+static int nf_ask(void)
+{
+   GLint ok = 0;
+   nf_asked = 1;
+   glGetShaderiv(nf_pv, GL_COMPILE_STATUS, &ok); if (!ok) return 0;
+   glGetShaderiv(nf_pf, GL_COMPILE_STATUS, &ok); if (!ok) return 0;
+   glGetProgramiv(nf_pend, GL_LINK_STATUS, &ok); if (!ok) return 0;
+   nf_loc[0] = glGetUniformLocation(nf_pend, "src");
+   nf_loc[1] = glGetUniformLocation(nf_pend, "xs");
+   nf_loc[2] = glGetUniformLocation(nf_pend, "ys");
+   nf_prog = nf_pend;
+   return 1;
+}
+int nf_warm_poll(void)
+{
+   if (!nf_started || nf_asked)
+      return 1;
+   if (!neil_shader_warm_complete(nf_pend))
+      return 0;
+   nf_ask();
+   return 1;
+}
+
+static int nf_init(void)
+{
+   if (nf_started)
+   {
+      if (!nf_asked) nf_ask();
+      if (!nf_prog) return 0;
+      glGenVertexArrays(1, &nf_vao);
+      glGenFramebuffers(1, &nf_fbo);
+      glGenTextures(1, &nf_src); glGenTextures(1, &nf_dst); glGenTextures(1, &nf_xs); glGenTextures(1, &nf_ys);
+      return 1;
+   }
+   {
+   const char *vs = nf_vs_src(), *fs = nf_fs_src();
    GLint ok = 0;
    GLuint v = nf_shader(GL_VERTEX_SHADER, vs), f = nf_shader(GL_FRAGMENT_SHADER, fs);
    if (!v || !f) return 0;
@@ -281,6 +342,7 @@ static int nf_init(void)
    glGenFramebuffers(1, &nf_fbo);
    glGenTextures(1, &nf_src); glGenTextures(1, &nf_dst); glGenTextures(1, &nf_xs); glGenTextures(1, &nf_ys);
    return 1;
+   }
 }
 
 static void nf_params(void)
@@ -305,7 +367,7 @@ static int nf_ready(const int32_t *sx, int nx, const int32_t *sy, int ny, int sr
       return 0;
    for (i = 0; i < nx; i++) if (sx[i] < 0 || sx[i] >= srcw) return 0;
    for (i = 0; i < ny; i++) if (sy[i] < 0 || sy[i] >= srch) return 0;
-   if (!nf_prog && !nf_init()) { nf_failed = 1; return 0; }
+   if (!nf_vao && !nf_init()) { nf_failed = 1; return 0; }   /* NF AHEAD: nf_prog may be set before the objects are */
 
    n = nx > ny ? nx : ny;
    if (nf_cap < nx * ny || !nf_tmp)
@@ -440,9 +502,18 @@ static uint16_t *nf_sample(GLuint src, int srcw, int srch, int copy, int bypass,
    glUseProgram(nf_prog);
    if (!nf_unis)
    {  /* sampler units: program state, set once */
+      if (nf_asked)
+      {  /* NF AHEAD: the locations were asked for with the program */
+         glUniform1i(nf_loc[0], 0);
+         glUniform1i(nf_loc[1], 1);
+         glUniform1i(nf_loc[2], 2);
+      }
+      else
+      {
       glUniform1i(glGetUniformLocation(nf_prog, "src"), 0);
       glUniform1i(glGetUniformLocation(nf_prog, "xs"), 1);
       glUniform1i(glGetUniformLocation(nf_prog, "ys"), 2);
+      }
       nf_unis = 1;
    }
    glBindVertexArray(nf_vao);

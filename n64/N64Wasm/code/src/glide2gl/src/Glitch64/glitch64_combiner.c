@@ -531,8 +531,12 @@ static void shader_find_uniforms(shader_program_key *shader)
 typedef struct { char *src; uint32_t h; GLuint prog; int used; int asked; shader_program_key locs; } warm_prog_t;
 static warm_prog_t *warm_progs;
 static int warm_n, warm_cap, warm_adopted, sess_compiled;
-/* fields left before neil_shader_warm_step asks GL about the prewarmed programs (see ASKED AHEAD) */
+/* neil_shader_warm_step still has programs to ask about (see ASKED AHEAD) */
 static int warm_ask_in = -1;
+static int warm_next;          /* the first prewarmed program not asked about yet */
+static int warm_parallel;      /* KHR_parallel_shader_compile is on: COMPLETION_STATUS_KHR can be polled */
+void nf_warm_start(void);      /* glitchmain.c: the readback program, compiled and linked, nothing asked */
+int  nf_warm_poll(void);       /* ...and asked about once complete; 1 = nothing left to ask */
 static char **sess_src;
 static uint32_t *sess_h;
 static int *sess_k;            /* programs made from it (two combiner keys can build one text) */
@@ -609,6 +613,10 @@ static void shader_prewarm(void)
 
    for (i = 0; i < warm_n; i++) free(warm_progs[i].src);   /* a new context: the old objects are gone */
    warm_n = 0;
+   warm_next = 0;
+   /* the native-size readback program (glitchmain.c nf_*): compiled now too, asked later */
+   nf_warm_start();
+   warm_ask_in = 1;
    f = fopen("/n64_shaders.bin", "rb");
    if (!f)
       return;
@@ -622,7 +630,7 @@ static void shader_prewarm(void)
    fclose(f);
    buf[n] = 0;
 #ifdef __EMSCRIPTEN__
-   EM_ASM({ try { if (typeof GLctx !== 'undefined' && GLctx) GLctx.getExtension('KHR_parallel_shader_compile'); } catch (e) {} });
+   warm_parallel = EM_ASM_INT({ try { return (typeof GLctx !== 'undefined' && GLctx && GLctx.getExtension('KHR_parallel_shader_compile')) ? 1 : 0; } catch (e) { return 0; } });
 #endif
    for (q = buf, end = buf + n; q < end; q += strlen(q) + 1)
    {
@@ -657,7 +665,6 @@ static void shader_prewarm(void)
       if (warm_progs[warm_n].src) warm_n++;
    }
    free(buf);
-   warm_ask_in = warm_n ? 8 : -1;
    printf("[shader] prewarm: %d programs compiled ahead (/n64_shaders.bin)\n", warm_n);
 }
 
@@ -669,29 +676,50 @@ static void shader_prewarm(void)
  * Measured in the MK64 race (n64_field_cost_probe --clock, frame 2555, the
  * first use of a prewarmed program): 29.7 ms of the field's 38.4 ms was two
  * getProgramParameter calls — the heaviest field of the race, in every run.
- * So the same questions are asked once, a few fields after boot (all programs
- * in one field, so the queue drains once), and the answers kept: adoption then
- * asks GL nothing. The answers are the ones adoption would have got — a
- * program's link status and uniform locations never change after its link —
- * and adoption still logs a failed link (here), uses the program as before,
- * and binds it exactly as before, so every draw and pixel is unchanged. */
+ * So the same questions are asked ahead, between fields' display lists, and the
+ * answers kept: adoption then asks GL nothing. The answers are the ones adoption
+ * would have got — a program's link status and uniform locations never change
+ * after its link — and adoption still logs a failed link (here), uses the
+ * program as before, and binds it exactly as before, so every draw and pixel is
+ * unchanged.
+ * NEVER WAITING FOR A COMPILE (2026-10-03): asking all of them in one field
+ * waited for every compile to finish (13-14 ms at field 7 here; the live site's
+ * ?costdbg=1 bench showed 'prog' bursts of 37 and 63 ms at the title). With
+ * KHR_parallel_shader_compile a program's COMPLETION_STATUS_KHR answers at once
+ * whether its link is done, so each field end asks only about programs that are
+ * complete, in list order, and stops at the first one that is not: no field ever
+ * waits for a compile. (Without the extension a program counts as complete and
+ * is asked about at once, as before.) The readback program (glitchmain.c nf_*)
+ * is compiled with the list and asked about the same way. */
+static int warm_complete(GLuint prog)
+{
+   GLint done = 1;
+   if (!warm_parallel) return 1;
+   glGetProgramiv(prog, 0x91B1 /* GL_COMPLETION_STATUS_KHR */, &done);
+   return done != 0;
+}
+int neil_shader_warm_complete(GLuint prog) { return warm_complete(prog); }
 void neil_shader_warm_step(void)
 {
-   int i;
-   if (warm_ask_in < 0 || --warm_ask_in > 0)
+   int nf_done;
+   if (warm_ask_in < 0)
       return;
-   warm_ask_in = -1;
-   for (i = 0; i < warm_n; i++)
+   for (; warm_next < warm_n; warm_next++)
    {
-      warm_prog_t *w = &warm_progs[i];
+      warm_prog_t *w = &warm_progs[warm_next];
       if (w->used || w->asked)
          continue;
+      if (!warm_complete(w->prog))
+         break;                          /* still compiling: ask at a later field end */
       memset(&w->locs, 0, sizeof(w->locs));
       w->locs.program_object = w->prog;
       check_link(w->prog);
       shader_find_uniforms(&w->locs);
       w->asked = 1;
    }
+   nf_done = nf_warm_poll();
+   if (warm_next >= warm_n && nf_done)
+      warm_ask_in = -1;
 }
 
 /* the program glide is about to compile from fragment_shader, if it was prewarmed */
