@@ -91,6 +91,45 @@ let parts = [], fstBuf = null;
 // away, and a cumulative table makes the split layout DATA rather than an assumption.
 let partStarts = [], discBytes = 0;
 
+// ---- AN OVERLAY THIS BUILD DOES NOT CARRY: STOP, AND SAY WHICH ---------------------------
+// mp4_game.wasm carries only the overlays build_wasm.sh AOT-compiles (OVL_BOOT, MODESEL, MENT,
+// W01 as of 7040471c). For any other overlay the game's own objdll.c omDLLLink runs its
+// ORIGINAL path: HuDvdDataReadDirect reads the big-endian .rel off the disc, OSLink (a host
+// import — it is never compiled in) is called, and then `dll->module->prolog` — a big-endian
+// PowerPC address read natively — is called through the function table. MEASURED on the
+// shipped binary with tools/gc_netplay_det.html script=mash3: seed 3 reached OVL 95 (w10Dll)
+// at frame 3,097 and trapped `table index is out of bounds` in omWatchOverlayProc; the board
+// harness's seed 4 trapped `null function` the same way at frame 12,737. Which trap you get
+// depends on whatever garbage the pointer decodes to — and a garbage index that happens to be
+// IN range calls some random function and corrupts state silently.
+//
+// OSLink is reached ONLY on that path, so it is the exact, deterministic point to stop: before
+// the garbage call, with the overlay named. The REL that was just read is the one being linked
+// (omDLLLink does nothing else between HuDvdDataReadDirect and OSLink), so the disc offset of
+// the last DVD read, looked up in the FST, names it. Every console in a room stops on the same
+// frame for the same reason — it is a pure function of the guest state.
+let lastDvdOff = -1, fstFiles = null;
+function fstNameAt(off) {
+  if (off < 0 || !fstBuf) return null;
+  if (!fstFiles) {
+    fstFiles = [];
+    const d = new DataView(fstBuf.buffer, fstBuf.byteOffset, fstBuf.byteLength);
+    const n = d.getUint32(8, false), strtab = n * 12;
+    const name = (o) => { let s = ''; for (let i = strtab + o; i < fstBuf.length && fstBuf[i]; i++) s += String.fromCharCode(fstBuf[i]); return s; };
+    const walk = (i, end, prefix) => {
+      while (i < end) {
+        const w0 = d.getUint32(i * 12, false), a = d.getUint32(i * 12 + 4, false), b = d.getUint32(i * 12 + 8, false);
+        const nm = name(w0 & 0xFFFFFF);
+        if (w0 >>> 24) { walk(i + 1, b, prefix + nm + '/'); i = b; }
+        else { fstFiles.push({ path: prefix + nm, off: a, size: b }); i++; }
+      }
+    };
+    try { walk(1, n, ''); } catch (e) { fstFiles = []; }
+  }
+  for (const f of fstFiles) if (off >= f.off && off < f.off + f.size) return f.path;
+  return null;
+}
+
 function buildPartIndex(list) {
   partStarts = new Array(list.length);
   let acc = 0;
@@ -1094,6 +1133,7 @@ function stateServiceCmd() {
 
 function serveDvdRead(mem, dv, block, addr, length, offset, cbIdx) {
   block >>>= 0; addr >>>= 0; length >>>= 0; offset >>>= 0;
+  lastDvdOff = offset;
   cacheDirty = true;
   const dst = new Uint8Array(mem.buffer, addr, length);
   let done = 0;
@@ -1210,11 +1250,20 @@ async function boot(msg) {
     while (e < lim && u8[e]) e++;
     return new TextDecoder().decode(u8.subarray(ptr >>> 0, e));
   };
+  // OVERLAY TRANSITIONS ARE EXEMPT from the rate limit: they are a handful per scene, and once a
+  // board or a minigame has spent the 500 lines they were the one thing a stopped run could not
+  // say — WHICH part of the game it was in (2026-10-01: a trap in instDll's InstPlayerMain was
+  // only attributable from the stack, the "Start New OVL 3" line had been suppressed).
+  const OVL_FMT = /Start New OVL|objdll> AOT|objdll>Already Loaded|objdll>Link DLL/;
   function osReport(fmtPtr, vaPtr) {
-    if (osReportN >= OSREPORT_MAX) return;
-    if (++osReportN === OSREPORT_MAX) { log('OSReport: rate limit reached (' + OSREPORT_MAX + ' lines), further reports suppressed'); return; }
     let fmt, out = '';
-    try { fmt = cstr(fmtPtr); } catch (e) { log('OSReport: unreadable format @0x' + (fmtPtr >>> 0).toString(16)); return; }
+    if (osReportN >= OSREPORT_MAX) {
+      try { fmt = cstr(fmtPtr); } catch (e) { return; }
+      if (!OVL_FMT.test(fmt)) return;
+    } else {
+      if (++osReportN === OSREPORT_MAX) { log('OSReport: rate limit reached (' + OSREPORT_MAX + ' lines), further reports suppressed (overlay transitions excepted)'); return; }
+      try { fmt = cstr(fmtPtr); } catch (e) { log('OSReport: unreadable format @0x' + (fmtPtr >>> 0).toString(16)); return; }
+    }
     const d = dv();
     let va = vaPtr >>> 0;
     const i32 = () => { const v = d.getInt32(va, true); va += 4; return v; };
@@ -1350,7 +1399,7 @@ async function boot(msg) {
   // be miscounted as stubbed (loud and wrong-in-the-safe-direction) rather than silently missed.
   const HANDLED = new Set(['OSReport', 'OSPanic', 'OSInit', 'OSGetTime', '__OSGetSystemTime',
     'OSGetTick', 'DVDInit', 'DVDReadAbsAsyncPrio', 'DVDReadAbsAsyncForBS', 'VIGetRetraceCount',
-    'VIWaitForRetrace']);
+    'VIWaitForRetrace', 'OSLink']);
 
   // SPIN DETECTOR. A guest that loops without ever reaching VIWaitForRetrace freezes this worker
   // with nothing said — and a loop that polls a host import (OSGetTime is derived from viRetrace,
@@ -1396,6 +1445,15 @@ async function boot(msg) {
           Module._OSSetArenaHi(0x81800000); return 0;
         case 'OSGetTime': case '__OSGetSystemTime': return BigInt(viRetrace) * 675000n + BigInt(tbNow());
         case 'OSGetTick': return (viRetrace * 675000 + tbNow()) >>> 0;
+        case 'OSLink': {
+          // See AN OVERLAY THIS BUILD DOES NOT CARRY above: returning would let objdll.c call a
+          // big-endian PowerPC prolog address through the wasm table.
+          const dll = fstNameAt(lastDvdOff) || ('(unknown — last DVD read at 0x' + (lastDvdOff >>> 0).toString(16) + ')');
+          postMessage({ cmd: 'ovlMissing', dll, frame: viRetrace });
+          throw new Error('overlay ' + dll + ' is not built into this recomp (mp4_game.wasm AOT-compiles only the '
+                          + 'overlays gamecube/recomp/build_wasm.sh lists) — stopped at frame ' + viRetrace
+                          + ' before calling its prolog');
+        }
         case 'DVDInit': { const f = Module.___DVDFSInit; if (f) f(); return 0; }
         case 'DVDReadAbsAsyncPrio':
         case 'DVDReadAbsAsyncForBS': return serveDvdRead(mem(), dv(), a[0], a[1], a[2], a[3], a[4]);
@@ -1407,6 +1465,28 @@ async function boot(msg) {
           if (pos > 0) {
             const base = Module._gx_fifo_base();
             const fb = new Uint8Array(mem().buffer.slice(base, base + pos));
+            // A FULL-IMAGE FRAME STARTS FROM EMPTY CACHES (2026-10-03). The mem1 image below is
+            // RAW guest memory, and guest memory holds every f32 vertex/texcoord array
+            // LITTLE-endian; only the bridge's own array regions carry them big-endian, which is
+            // what Dolphin's vertex loader reads. Dolphin applies mem1 first and this frame's
+            // regions over it, so after a full image an array is right only if THIS frame
+            // re-sends it. The caches used to be cleared AFTER this frame's discovery, so every
+            // array already known from an earlier frame was not re-sent and stayed raw-LE in
+            // Dolphin for the whole frame. MEASURED on Mario Party 4's title (the first frame
+            // after the fade-in, a DVD-read frame): 100 draws, every one with positions/UVs that
+            // are byte-reversed floats (bytes bf 98 93 7d = -1.192 read as 2.45e37), and 0 bad
+            // draws in every other frame. Those triangles cost SwiftShader ~488 s of GPU time
+            // on the WebGL2 fallback (on a hardware GPU the same draws would be visual garbage).
+            // Clearing first makes discovery treat every binding of this frame as new, so its
+            // arrays (swapped), DLs and textures (incl. static assets, which the raw image
+            // carries as zeros) go out in this frame's regions on top of the image — the same
+            // state a save-state restore starts from. cacheDirty set later in this frame (dirty-
+            // ring overflow / a jumbo range) stays set and takes the full image next frame.
+            const fullSync = cacheDirty || testFullMem;
+            if (fullSync) {
+              cacheDirty = false;
+              knownDLs.clear(); knownArrays.clear(); knownTex.clear(); f32Arrays.length = 0;
+            }
             const newDLs = [], touched = new Map();
             try { walkStream(mem(), fb, 0, pos, 0, newDLs, touched) } catch (e) { log('walk threw: ' + e.message); }
             const regions = [];
@@ -1524,11 +1604,7 @@ async function boot(msg) {
               if (Module.___recomp_dirty_reset) Module.___recomp_dirty_reset();
             }
             let mem1Snap = null;
-            if (cacheDirty || testFullMem) {
-              cacheDirty = false;
-              knownDLs.clear(); knownArrays.clear(); knownTex.clear(); f32Arrays.length = 0;
-              mem1Snap = mem().buffer.slice(0x80000000, 0x81800000);
-            }
+            if (fullSync) mem1Snap = mem().buffer.slice(0x80000000, 0x81800000);
             if (!sentPrologue) { sentPrologue = true;
               if (!mem1Snap) mem1Snap = mem().buffer.slice(0x80000000, 0x81800000);
             }
@@ -1643,6 +1719,15 @@ async function boot(msg) {
     log('memcard: shim exports missing — build_wasm.sh EXPORTED_FUNCTIONS is stale, saves are OFF');
   }
   if (msg.autoboard && Module.___recomp_autoboard_arm) { Module.___recomp_autoboard_arm(1); log('AUTOBOARD armed'); }
+  // AUTOTEST (gc_autoboard.c): {board, mg} — the same firing point as AUTOBOARD, sending the game
+  // to board `board` or straight into minigame `mg` with four COMs. A test harness's device for
+  // reaching every overlay without a person; nothing on the shipped page sends it.
+  if (msg.autotest && Module.___recomp_autotest_set) {
+    Module.___recomp_autotest_set((msg.autotest.board | 0) | (msg.autotest.allcom ? 0x100 : 0),
+                                  msg.autotest.mg == null ? -1 : msg.autotest.mg | 0);
+    log('AUTOTEST armed: board ' + (msg.autotest.board | 0) + (msg.autotest.allcom ? ' (all four COM)' : '') +
+        ', minigame ' + (msg.autotest.mg == null ? '-' : msg.autotest.mg));
+  }
   if (msg.inputScript) { inputScript = msg.inputScript; log('input script: ' + Object.keys(inputScript).length + ' entries'); }
   if (msg.peekAddrs) peekAddrs = msg.peekAddrs;
   if (msg.testFullMem) { testFullMem = true; log('TESTFULLMEM: full mem1 every frame'); }

@@ -399,20 +399,36 @@ function makeRecordingGL(rec, fallback) {
     //     for safety when small. Large vertex streams (> INLINE_SUBDATA_MAX) fall back to
     //     the zero-copy descriptor, which the diagnosis observed correct (real high heap
     //     offset, sensible float data).
+    // [2026-10-03] VERTEX AND INDEX STREAMS ARE SNAPSHOTTED AT ANY SIZE (up to INLINE_STREAM_MAX).
+    // "Large vertex streams stay zero-copy" does not hold: Dolphin's GLES stream buffer stages
+    // draws at a FIXED heap address — Mario Party 4's title frame recorded two different meshes
+    // (239,104 B and 131,584 B) as zero-copy uploads from the SAME source offset, 432,076,360 —
+    // so a consumer that replays draw k after the producer has staged draw k+1 uploads draw
+    // k+1's bytes for draw k. The title screen on the old path showed exactly that: spiky
+    // garbage geometry over the logo on every large mesh.
+    const INLINE_STREAM_MAX = 4 << 20;  // bytes; a single record must stay well inside the ring
     const inlineTarget = target === 0x8A11 || target === 0x8893 || target === 0x8892;
     const inline = srcView && srcView.buffer && inlineTarget &&
-                   n > 4 && n <= INLINE_SUBDATA_MAX;
+                   n > 4 && n <= (target === 0x8A11 ? INLINE_SUBDATA_MAX : INLINE_STREAM_MAX);
     if (inline) {
       const words = (n + 3) >> 2;
       const need = 3 + words;
       if (need > rec.scratch.length) { const bigger = new Int32Array(need + 64); bigger.set(rec.scratch); rec.scratch = bigger; }
       const w = rec.scratch;
       w[0] = target; w[1] = dstOff; w[2] = n;
-      const src8 = new Uint8Array(srcView.buffer, off, n);
-      for (let i = 0; i < words; i++) {
-        let v = 0; const base = i << 2;
-        for (let b = 0; b < 4; b++) { const k = base + b; if (k < n) v |= src8[k] << (b << 3); }
-        w[3 + i] = v;
+      const whole = n >> 2;
+      if ((off & 3) === 0) {
+        // aligned: one bulk copy of the whole words (the per-byte packer below is ~50x slower)
+        w.set(new Int32Array(srcView.buffer, off, whole), 3);
+      } else {
+        const src8a = new Uint8Array(srcView.buffer, off, whole << 2);
+        new Uint8Array(w.buffer, w.byteOffset + 12, whole << 2).set(src8a);
+      }
+      if (n & 3) {
+        const src8 = new Uint8Array(srcView.buffer, off, n);
+        let v = 0;
+        for (let k = whole << 2, b = 0; k < n; k++, b++) v |= src8[k] << (b << 3);
+        w[3 + whole] = v;
       }
       // [PROFILE] snapshotted bufferSubData bytes, split by target.
       if (self.__glprof) {

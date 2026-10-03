@@ -65,6 +65,7 @@ void set_depth_shader(void);
 #define GL_GLEXT_PROTOTYPES
 // #include <glsm/glsmsym.h>
 #include <GL/glew.h>
+#include "gl_shadow.h"   /* drops GL calls that cannot change state — see the header */
 
 void init_textures(void);
 void free_textures(void);
@@ -78,7 +79,7 @@ void init_combiner(void);
 void updateCombiner(int i);
 void updateCombinera(int i);
 void check_compile(GLuint shader);
-void check_link(GLuint program);
+int check_link(GLuint program);
 void free_combiners(void);
 void compile_shader(void);
 void set_copy_shader(void);

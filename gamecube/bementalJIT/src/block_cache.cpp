@@ -455,6 +455,15 @@ namespace powerpc {
                                                   u32 mem_pages);
 }
 
+// [unwrap default 2026-10-01] Bind block-module imports (and the chain-loop entry) to
+// the RAW wasm exports instead of emscripten's Asyncify export wrappers. Decided by a
+// matched pair — see the policy note at the use site and
+// gamecube/docs/guest-rate-witness/TASKS.md.
+#ifndef BEM_UNWRAP_DEFAULT
+#define BEM_UNWRAP_DEFAULT 0
+#endif
+static constexpr int kBemUnwrapDefault = BEM_UNWRAP_DEFAULT;
+
 int compile_raw(const u8* bytes, std::size_t size) {
 #ifdef __EMSCRIPTEN__
     const int ret = EM_ASM_INT({
@@ -489,8 +498,23 @@ int compile_raw(const u8* bytes, std::size_t size) {
                     console.log('[bemental] bootstrap: pthread-side bemental_imports init');
                 }
             }
+            // [unwrap policy 2026-10-01] Re-bind when the policy cell changes
+            // mid-session, so one browser session can host interleaved arms
+            // (each arm then reloads a savestate, which clears every compiled
+            // block, so every block of the new arm binds to the new policy).
+            // The rebind path does NOT repeat the warm-up calls below — two of
+            // them WRITE guest RAM at EA 0, which is harmless at the first
+            // compile (IPL) and not harmless in a running game.
+            if (!Module.bemental_imports_need_upgrade && Module._bem_uw_applied !== undefined
+                && (HEAPU32[0x026B3930 >> 2] >>> 0) !== Module._bem_uw_applied) {
+                Module.bemental_imports_need_upgrade = true;
+                Module._bem_rawmap = null;
+                Module._bem_chain_fn = null;
+            }
             if (Module.bemental_imports_need_upgrade) {
                 try {
+                  if (!Module._bem_warmed) {
+                    Module._bem_warmed = 1;
                     Module._dolphin_read8(0);
                     Module._dolphin_read16(0);
                     Module._dolphin_read32(0);
@@ -500,6 +524,7 @@ int compile_raw(const u8* bytes, std::size_t size) {
                     Module._dolphin_check_exc(0);
                     Module._dolphin_break_block(0, 0);
                     Module._dolphin_hle_check(0);
+                  }
                     // Skip dolphin_interp(0,0) — it calls SingleStepInner
                     // which is not safe to invoke at random.
                     // Skip dolphin_hle_fire(0, 0) — it would actually
@@ -570,8 +595,19 @@ int compile_raw(const u8* bytes, std::size_t size) {
                     // re-arm it for measurement (cell chosen above the DSP
                     // guest-clock block at 0x026B3918-3928 and below the flush
                     // census at 0x026B3A00; repo-wide grep shows no other use).
-                    const bem_unwrap_on =
-                        (HEAPU32[0x026B3930 >> 2] >>> 0) !== 0;
+                    // [unwrap policy 2026-10-01] cell 0x026B3930:
+                    //   0 (browser-zeroed / never written) -> the compiled-in
+                    //     default, $2 (kBemUnwrapDefault, defined above compile_raw);
+                    //   0x0FF0A55E -> forced OFF (the control arm of a matched pair
+                    //     on ONE binary);
+                    //   any other nonzero -> ON (the pre-flip opt-in still works).
+                    // Census cell 0x026B3ED0 is the arm-difference proof, written
+                    // below: bit31 = policy evaluated, bit16 = raw map non-empty,
+                    // low byte = imports actually bound to raw exports, bit8 = the
+                    // chain-loop entry unwrapped (chain_dispatch_raw).
+                    const bem_uw_cell = HEAPU32[0x026B3930 >> 2] >>> 0;
+                    const bem_unwrap_on = (bem_uw_cell === 0) ? ($2 !== 0)
+                                                              : (bem_uw_cell !== 0x0FF0A55E);
                     if (!Module._bem_rawmap) {
                         Module._bem_rawmap = new Map();
                         try {
@@ -580,8 +616,11 @@ int compile_raw(const u8* bytes, std::size_t size) {
                             }
                         } catch (er) { }
                     }
+                    let bem_n_unwrapped = 0;
                     const bemraw = function(f) {
-                        return (typeof f === 'function' && Module._bem_rawmap.get(f)) || f;
+                        const r = (typeof f === 'function' && Module._bem_rawmap.get(f)) || f;
+                        if (r !== f) bem_n_unwrapped++;
+                        return r;
                     };
                     if (Module.bemental_imports && Module.bemental_imports.env) {
                         const e = Module.bemental_imports.env;
@@ -639,6 +678,9 @@ int compile_raw(const u8* bytes, std::size_t size) {
                     // "direct" bindings were asyncify JS closures the whole time.
                     // Report the unwrap directly instead — it is the fact we care
                     // about and it cannot silently degrade to true.
+                    HEAPU32[0x026B3ED0 >> 2] = (0x80000000 | (Module._bem_rawmap.size ? 0x10000 : 0)
+                        | (HEAPU32[0x026B3ED0 >> 2] & 0x200) | (bem_n_unwrapped & 0xFF)) >>> 0;
+                    Module._bem_uw_applied = bem_uw_cell;
                     console.log('[bemental] direct-binding upgrade complete'
                         + ' (asyncify rawmap=' + Module._bem_rawmap.size
                         + ' unwrapped=' + (bemraw(Module._dolphin_read32) !== Module._dolphin_read32)
@@ -700,7 +742,7 @@ int compile_raw(const u8* bytes, std::size_t size) {
             }
             return -1;
         }
-    }, bytes, (int)size);
+    }, bytes, (int)size, kBemUnwrapDefault);
     return ret;
 #else
     (void)bytes; (void)size;
@@ -1148,6 +1190,54 @@ s32 bem_chain_loop_c(u32 pc, u32 max, u32* final_pc, u32* trap_pc,
 }
 #endif
 
+#ifdef __EMSCRIPTEN__
+// [membrane EM_JS 2026-10-01] The per-chain host crossing as an EM_JS import
+// instead of EM_ASM_INT. chain_dispatch_raw runs once per chain — every CoreTiming
+// slice end, cache miss and exception service — and EM_ASM_INT pays, per call,
+// emscripten's generic marshalling: _emscripten_asm_const_int -> runEmAsmFunction ->
+// readEmAsmArgs (walks the signature string and re-reads every arg out of linear
+// memory, calling growMemViews() — and through it the SharedArrayBuffer `buffer`
+// getter — on each read) -> ASM_CONSTS[code](...args). A CPU profile of the JIT
+// thread (SAB, 2026-10-01) put readEmAsmArgs + growMemViews + `get buffer` at
+// 4.7% of busy samples, 98% of them under JitWasm::Run's chain dispatch. An EM_JS
+// function is a plain JS import with the six i32 args passed directly. Identical
+// body, identical trap protocol; only the call path changes.
+// Selector cell 0x026B3ED4: 0 (browser-zeroed) = BEM_CHAIN_EMJS_DEFAULT,
+// 0x0FF0E5A5 = force the EM_ASM path (matched-pair control on ONE binary),
+// any other nonzero = EM_JS.
+EM_JS(int, bem_chain_try_js, (u32 pc, u32 max, u32* final_pc, u32* trap_pc,
+                              const u32* exc, const s32* dc), {
+    try {
+        let f = Module._bem_chain_fn;
+        if (!f) {
+            const m = Module._bem_rawmap;
+            f = (m && m.size && m.get(Module._bem_chain_loop_c)) || Module._bem_chain_loop_c;
+            if (m) {
+                Module._bem_chain_fn = f;
+                if (f !== Module._bem_chain_loop_c) HEAPU32[0x026B3ED0 >> 2] |= 0x100;
+            }
+        }
+        if (!Module._bem_emjs_seen) {   // arm-difference proof: census bit 9
+            Module._bem_emjs_seen = 1;
+            HEAPU32[0x026B3ED0 >> 2] |= 0x200;
+        }
+        return f(pc, max, final_pc, trap_pc, exc, dc) | 0;
+    } catch (e) {
+        if (Module.bemental_traps === undefined) Module.bemental_traps = 0;
+        Module.bemental_traps++;
+        if (Module.bemental_traps <= 16) {
+            console.error('[bemental] C-dispatch trap #' + Module.bemental_traps
+                + ' msg=' + (e && e.message ? e.message : String(e)));
+        }
+        HEAP32[trap_pc >> 2] = HEAP32[final_pc >> 2] | 0;
+        return 0;
+    }
+});
+#endif
+#ifndef BEM_CHAIN_EMJS_DEFAULT
+#define BEM_CHAIN_EMJS_DEFAULT 0
+#endif
+
 s32 chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_pc,
                        const u32* exceptions_addr, const s32* downcount_addr) {
     // Snapshot Exceptions for the in-WASM chaining bail check: each chained
@@ -1160,9 +1250,32 @@ s32 chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_p
     // guarded by ONE EM_ASM try/catch for WASM-trap recovery. g_bem_cdispatch_
     // enabled=0 falls back to the legacy per-block JS dispatch loop below.
     if (g_bem_cdispatch_enabled) {
+        {
+            const u32 sel = *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3ED4u));
+            const bool emjs = (sel == 0u) ? (BEM_CHAIN_EMJS_DEFAULT != 0) : (sel != 0x0FF0E5A5u);
+            if (emjs)
+                return bem_chain_try_js(initial_pc, max_iters, final_pc, trap_pc,
+                                        exceptions_addr, downcount_addr);
+        }
         return EM_ASM_INT({
             try {
-                return Module._bem_chain_loop_c($0, $1, $2, $3, $4, $5) | 0;
+                // [unwrap 2026-10-01] Module._bem_chain_loop_c is the Asyncify
+                // export WRAPPER (rest-args alloc + exportCallStack push/pop +
+                // try/finally + maybeStopUnwind) — paid once per chain, i.e. per
+                // CoreTiming slice and per cache miss. Same reverse map and same
+                // policy as compile_raw's import binding (the map is EMPTY when the
+                // policy is off, so this resolves back to the wrapper). Cached only
+                // once the map exists (it is built by the first compile_raw).
+                let f = Module._bem_chain_fn;
+                if (!f) {
+                    const m = Module._bem_rawmap;
+                    f = (m && m.size && m.get(Module._bem_chain_loop_c)) || Module._bem_chain_loop_c;
+                    if (m) {
+                        Module._bem_chain_fn = f;
+                        if (f !== Module._bem_chain_loop_c) HEAPU32[0x026B3ED0 >> 2] |= 0x100;
+                    }
+                }
+                return f($0, $1, $2, $3, $4, $5) | 0;
             } catch (e) {
                 // A block trapped. bem_chain_loop_c wrote *final_pc ($2) before
                 // the trapping call; surface it as trap_pc ($3) so JitWasm::Run
@@ -1915,8 +2028,16 @@ void BlockCache::stash_block(u32 pc, const BlockEmitInputs& in) {
 // there is no miss path at all, because a batched block is reached through the
 // SAME wasmTable slot it always had.
 // ---------------------------------------------------------------------------
+// [batch default 2026-10-01] The K used when the page wrote nothing (cell 0). A page
+// value always wins, so the matched-pair CONTROL is ?bjit_batch=1 (K < 2 = OFF, one
+// module per block, byte-identical to the pre-batch build) and the treatment is any
+// K >= 2. NOTE ?bjit_batch=0 now means "the default", not OFF.
+#ifndef BEM_BI_K_DEFAULT
+#define BEM_BI_K_DEFAULT 0u
+#endif
 void BlockCache::batch_note(u32 pc) {
-    const uint32_t k = bem_cc_get(BEM_BI_K);
+    const uint32_t raw = bem_cc_get(BEM_BI_K);
+    const uint32_t k = raw ? raw : static_cast<uint32_t>(BEM_BI_K_DEFAULT);
     bem_cc_set(BEM_BI_K_ECHO, k);
     if (k < 2u) return;                 // OFF: today's one module per block
     m_batch_pcs.push_back(pc);

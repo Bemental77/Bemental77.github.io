@@ -38,7 +38,7 @@ const src = fs.readFileSync(SRCFILE, 'utf8');
 // --- synthetic guest layout (byte addresses inside the fake linear memory) ---
 const SRC = 0x10000, ENTRY = 0x20000, STRIDE = 32;
 const REG = 0x40000, HI = 0x40100, LO = 0x40108;
-const PCG = 0x40200, LASTADDR = 0x40204, NEXTINT = 0x40208, SKIPJ = 0x40210, JTA = 0x40214;
+const PCG = 0x40200, LASTADDR = 0x40204, NEXTINT = 0x40208, SKIPJ = 0x40210, JTA = 0x40214, ACTUALA = 0x40218;
 const COUNT = 0x62000 + 9 * 4;                 // &g_cp0_regs[CP0_COUNT_REG]
 const TBL = 0x1000000;                 // 8 dispatch tables, 0x10000 u32 each
 const INVALID = 0x300000, BLOCKS = 0x400000, DRAM = 0x800000;
@@ -168,6 +168,15 @@ function makeWorld(words, opts = {}) {
     HEAPU32[(CP1D >> 2) + i] = FPRSTORE + i * 8;
   }
   HEAPU32[CP0ST >> 2] = opts.cu1 === false ? 0 : 0x20000000;      // CP0 Status CU1
+  // invalid_code[]: every page a DATA page (1) — the common case for a store — unless the case
+  // models a code page (opts.codePages: [page, ...] stay 0, blocks[page] a block of compiled ops).
+  // A store into a code page is CHECK_MEMORY's cold exit (mips_emit.js checkMemoryBytes).
+  new Uint8Array(mem.buffer).fill(1, INVALID, INVALID + 0x100000);
+  for (const pg of opts.codePages || []) {
+    new Uint8Array(mem.buffer)[INVALID + pg] = 0;
+    HEAPU32[(BLOCKS >> 2) + pg] = 0x500000 + pg * 16; HEAPU32[(0x500000 + pg * 16) >> 2] = 0x510000;
+    for (let k = 0; k < 1024; k++) HEAPU32[(0x510000 + k * STRIDE) >> 2] = 5;   // every op compiled (not NOTCOMPILED 0x99)
+  }
   for (const [i, v] of Object.entries(opts.cp0 || {})) HEAPU32[(CP0REGS >> 2) + (+i)] = v >>> 0;
 
   const t = (n) => TBL + n * 0x40000;
@@ -196,6 +205,23 @@ function makeWorld(words, opts = {}) {
     fcr31: opts.noFcr31 ? 0 : FCR31A,
     delaySlot: opts.noDelaySlot ? 0 : DELAYSLOT,
   };
+  // JUMP_TO IN-MODULE (mips_emit.js jtHelper): opts.actual = { pages: { page: mirrorInvalid } }
+  // gives the emitter &actual and models each listed page as VALID (invalid_code 0), with a
+  // precomp block whose entry k holds addr = page base + 4k; its KSEG1/KSEG0 mirror page gets
+  // invalid_code `mirrorInvalid`. jump_to_func stays table[1] (the PC += STRIDE stub), so a case
+  // can tell which path ran.
+  if (opts.actual) {
+    p.actualPtr = ACTUALA;
+    HEAPU32[ACTUALA >> 2] = 0xdead0000;
+    let n = 0;
+    for (const [pgs, mir] of Object.entries(opts.actual.pages || {})) {
+      const pg = +pgs, blk = 0x5a0000 + n * 0x8000, st = 0x700000 + n * 16; n++;
+      new Uint8Array(mem.buffer)[INVALID + pg] = 0;
+      new Uint8Array(mem.buffer)[INVALID + ((pg ^ 0x20000) >>> 0)] = mir;
+      HEAPU32[(BLOCKS >> 2) + pg] = st; HEAPU32[st >> 2] = blk; HEAPU32[(st >> 2) + 1] = (pg * 4096) >>> 0; HEAPU32[(st >> 2) + 2] = (pg * 4096 + 4096) >>> 0;
+      for (let k = 0; k < 1024; k++) HEAPU32[(blk + k * STRIDE + 4) >> 2] = (pg * 4096 + k * 4) >>> 0;
+    }
+  }
   // entryOff: the span starts `entryOff` words into the page (words[] is the
   // whole page), the way recompile_block hands over any entry past offset 0
   if (opts.entryOff) {
@@ -209,9 +235,17 @@ function makeWorld(words, opts = {}) {
 // `--pin` runs the WHOLE corpus with register pinning on (window.__jitPin);
 // cases that pin opts.pin themselves. CI should run it both ways.
 const PIN_ALL = process.argv.includes('--pin');
-function loadEmitter(pin) {
+// `--nocold` runs the WHOLE corpus with every slow arm inline (?jitcold=0, mips_emit.js COLD
+// PATHS); cases that set opts.noCold do so themselves. CI should run it both ways.
+const NOCOLD_ALL = process.argv.includes('--nocold');
+const CHAIN_ALL = process.argv.includes('--chain');
+function loadEmitter(pin, noCold, cold, chain) {
   const sb = { WebAssembly, console: { error() {}, log() {}, warn() {} }, Uint32Array, Object, Array, Math, String };
-  sb.window = sb; sb.__jitPin = !!(pin || PIN_ALL); vm.createContext(sb); vm.runInContext(src, sb);
+  sb.window = sb; sb.__jitPin = !!(pin || (PIN_ALL && pin !== false));   // pin === false: this case opts out of --pin
+  // CHAINING is off unless asked for: a chained exit runs the stub op at PC, which the
+  // corpus's exit expectations (PC, regs) do not model; `--chain` runs everything chained
+  sb.__fbAsync = { jitCold: !(noCold || (NOCOLD_ALL && !cold)), jitChain: !!(chain || CHAIN_ALL) };
+  vm.createContext(sb); vm.runInContext(src, sb);
   return sb.bementalMips;
 }
 
@@ -220,8 +254,9 @@ function T(name, words, { regs = {}, dram = {}, expectRegs = {}, expectDram = {}
                           fprF32 = {}, fprF64 = {}, fprI32 = {}, fprI64 = {}, fcr31 = 0, expectFcr31 = null,
                           expectFprI32 = {}, expectFprI64 = {}, expectFprF32 = {}, expectFprF64 = {},
                           expectRefused = false, expectPC = null, expectLastAddr = null, expectCount = null,
-                          lastAddr = null, enterAt = 0 }) {
-  const bm = loadEmitter(opts.pin);
+                          lastAddr = null, enterAt = 0, skipJump = 0, expectInvalid = {},
+                          expectActual = null, expectJTA = null }) {
+  const bm = loadEmitter(opts.pin, opts.noCold, opts.cold, opts.chain);
   const { mem, table, HEAPU32, REG64, p } = makeWorld(words, opts);
   const DV = new DataView(mem.buffer);
   HEAPU32[FCR31A >> 2] = fcr31 >>> 0;
@@ -233,6 +268,7 @@ function T(name, words, { regs = {}, dram = {}, expectRegs = {}, expectDram = {}
   for (const [r, v] of Object.entries(regs)) REG64[(REG >> 3) + (+r)] = BigInt.asUintN(64, BigInt(v));
   for (const [a, v] of Object.entries(dram)) HEAPU32[(DRAM + (+a)) >> 2] = v >>> 0;
   if (lastAddr !== null) HEAPU32[LASTADDR >> 2] = lastAddr >>> 0;
+  if (skipJump) HEAPU32[SKIPJ >> 2] = skipJump >>> 0;
   const idx = bm.compileSpan(p, { HEAPU32, wasmTable: table, wasmMemory: mem });
   // A refusal is a RESULT, not a failure: the delay-slot guard cannot be
   // emitted without &delay_slot, and an unguarded block corrupts the guest, so
@@ -280,6 +316,18 @@ function T(name, words, { regs = {}, dram = {}, expectRegs = {}, expectDram = {}
   if (expectFcr31 !== null) {
     const got = '0x' + (HEAPU32[FCR31A >> 2] >>> 0).toString(16);
     if (got !== expectFcr31) bad.push(`FCR31=${got} want ${expectFcr31}`);
+  }
+  for (const [pg, want] of Object.entries(expectInvalid)) {
+    const got = new Uint8Array(mem.buffer)[INVALID + (+pg)];
+    if (got !== want) bad.push(`invalid_code[0x${(+pg).toString(16)}]=${got} want ${want}`);
+  }
+  if (expectActual !== null) {
+    const got = '0x' + (HEAPU32[ACTUALA >> 2] >>> 0).toString(16);
+    if (got !== expectActual) bad.push(`actual=${got} want ${expectActual}`);
+  }
+  if (expectJTA !== null) {
+    const got = '0x' + (HEAPU32[JTA >> 2] >>> 0).toString(16);
+    if (got !== expectJTA) bad.push(`jump_to_address=${got} want ${expectJTA}`);
   }
   if (expectPC !== null) {
     const got = HEAPU32[PCG >> 2] >>> 0;
@@ -381,8 +429,12 @@ const tests = [
     { expectRegs: { 9: '0x0' }, expectPC: ENTRY + STRIDE, expectStats: { labelEntries: 1 } }),
   T('control: a native SW adds no label after itself', [I(OPC.SW, 4, 8, 0x18), I(OPC.ADDIU, 0, 9, 5), 0],
     { regs: { 4: HIT_ADDR }, opts: { rdramHit: true }, expectRegs: { 9: '0x5' }, expectStats: { labelEntries: undefined } }),
-  T('control: a LOAD slow arm still continues in-block', [I(OPC.LW, 4, 8, 0x18), I(OPC.ADDIU, 0, 9, 5), 0],
-    { regs: { 4: SLOW_ADDR }, expectRegs: { 9: '0x5' } }),
+  T('control (?jitcold=0): a LOAD slow arm still continues in-block', [I(OPC.LW, 4, 8, 0x18), I(OPC.ADDIU, 0, 9, 5), 0],
+    { regs: { 4: SLOW_ADDR }, expectRegs: { 9: '0x5' }, opts: { noCold: true } }),
+  // COLD PATHS: the slow arm is out of line and returns to the dispatcher after its op, with
+  // PC at the next instruction (the stub op advanced it) and nothing after it run
+  T('cold: a LOAD slow arm hands back at the next instruction', [I(OPC.LW, 4, 8, 0x18), I(OPC.ADDIU, 0, 9, 5), 0],
+    { regs: { 4: SLOW_ADDR }, expectRegs: { 9: '0x0' }, expectPC: ENTRY + STRIDE, opts: { cold: true } }),
   // controls: the fast arm was always correct and must stay so
   T('SW fast arm control', [I(OPC.SW, 4, 8, 0x18), OR(10, 8, 0)],
     { regs: { 4: HIT_ADDR, 8: V }, expectRegs: { 10: V }, opts: { rdramHit: true } }),
@@ -825,6 +877,76 @@ const tests = [
     { regs: { 5: '0x7', 6: '0x7' }, lastAddr: 0x80100000,
       opts: { inDelaySlot: true },
       expectLastAddr: '0x80100000', expectCount: '0x0', expectRegs: { 8: '0x0' } }),
+  // ---- skip_jump (2026-10-03: SKIP_JUMP AT ENTRY in the emitter) ----
+  // skip_jump != 0 (an exception was taken in a delay slot) makes DECLARE_JUMP behave as NOT
+  // taken. It cannot change while native code runs, so the emitter tests it once, at entry: a
+  // block entered with it set runs its entry's ORIGINAL interpreter op (the stub: PC += stride)
+  // and returns, exactly as for a delay-slot entry — no native branch, no last_addr/Count write.
+  // RED against an emitter that drops the test (the branch is taken natively: r10 = 0x33).
+  T('skip_jump set at entry: the block runs its entry op only',
+    [I(OPC.BEQ, 5, 6, 3), I(OPC.ADDIU, 0, 9, 2), I(OPC.ADDIU, 0, 8, 0x11), 0, I(OPC.ADDIU, 0, 10, 0x33), 0],
+    { regs: { 5: '0x7', 6: '0x7' }, lastAddr: 0x80100000, skipJump: 0x80100004,
+      expectRegs: { 8: '0x0', 9: '0x0', 10: '0x0' }, expectPC: ENTRY + STRIDE,
+      expectLastAddr: '0x80100000', expectCount: '0x0' }),
+  T('control: skip_jump clear, the same BEQ is taken in-span',
+    [I(OPC.BEQ, 5, 6, 3), I(OPC.ADDIU, 0, 9, 2), I(OPC.ADDIU, 0, 8, 0x11), 0, I(OPC.ADDIU, 0, 10, 0x33), 0],
+    { regs: { 5: '0x7', 6: '0x7' }, lastAddr: 0x80100000,
+      expectRegs: { 8: '0x0', 9: '0x2', 10: '0x33' }, expectPC: ENTRY + 6 * STRIDE,
+      expectLastAddr: '0x80100010', expectCount: '0x4' }),
+  T('skip_jump set at a LABEL entry: that label\'s op only',
+    [I(OPC.ADDIU, 0, 1, 3), I(OPC.ADDIU, 2, 2, 1), I(OPC.ADDIU, 1, 1, 0xffff), I(OPC.BNE, 1, 0, 0xfffd), 0, I(OPC.ADDIU, 0, 3, 7), 0],
+    { enterAt: 1, regs: { 1: '0x2' }, lastAddr: 0x80100000, skipJump: 0x80100010,
+      expectRegs: { 1: '0x2', 2: '0x0', 3: '0x0' }, expectPC: ENTRY + 2 * STRIDE,
+      expectLastAddr: '0x80100000', expectCount: '0x0' }),
+  T('skip_jump set at entry of a pinned loop: the guard runs before the prologue',
+    [I(OPC.ADDIU, 0, 1, 3), I(OPC.ADDIU, 2, 2, 1), I(OPC.ADDIU, 1, 1, 0xffff), I(OPC.BNE, 1, 0, 0xfffd), I(OPC.ADDIU, 3, 3, 1), 0, 0],
+    { opts: { pin: true }, regs: { 1: '0x9', 2: '0x4' }, lastAddr: 0x80100000, skipJump: 0x80100010,
+      expectRegs: { 1: '0x9', 2: '0x4', 3: '0x0' }, expectPC: ENTRY + STRIDE, expectLastAddr: '0x80100000' }),
+  T('skip_jump set at entry of a J-out block: no jump_to, entry op only',
+    [JOUT(0x80200000), I(OPC.ADDIU, 0, 9, 2), I(OPC.ADDIU, 0, 8, 0x11), 0],
+    { lastAddr: 0x80100000, skipJump: 0x80100004, opts: { pageLen: 1024 },
+      expectRegs: { 8: '0x0', 9: '0x0' }, expectPC: ENTRY + STRIDE, expectLastAddr: '0x80100000', expectCount: '0x0' }),
+  // ---- JUMP_TO IN-MODULE (2026-10-03): the module does jump_to_func's common case ----
+  // A J out of the page into a VALID page: actual = blocks[page], PC = block + (t - start)/4,
+  // last_addr = that entry's addr, and jump_to_func (the stub, which would add one STRIDE)
+  // never runs. RED on an emitter without the helper: it calls the stub (PC = ENTRY + STRIDE).
+  // (cold paths on in every mode: a module of its own carries the helper only with them)
+  T('jump_to in-module: J out into a valid page sets actual and PC like jump_to_func',
+    [JOUT(0x80200040), I(OPC.ADDIU, 0, 9, 2), 0],
+    { opts: { cold: true, actual: { pages: { 0x80200: 0 } }, pageLen: 1024 }, lastAddr: 0x80100000,
+      expectRegs: { 9: '0x2' }, expectActual: '0x700000', expectPC: 0x5a0000 + 16 * STRIDE,
+      expectLastAddr: '0x80200040', expectInvalid: { 0x80200: 0, 0xa0200: 0 } }),
+  T('jump_to in-module: a JR $ra into a valid KSEG1 page',
+    [R(31, 0, 0, 0, 0x08), I(OPC.ADDIU, 0, 9, 3), 0],
+    { regs: { 31: '0xffffffffa0200008' }, opts: { cold: true, actual: { pages: { 0xa0200: 0 } }, pageLen: 1024 }, lastAddr: 0x80100000,
+      expectRegs: { 9: '0x3' }, expectActual: '0x700000', expectPC: 0x5a0000 + 2 * STRIDE, expectLastAddr: '0xa0200008' }),
+  // the mirror line of update_invalid_addr: an invalid KSEG1 twin invalidates the page, and the
+  // page to (re)initialise is jump_to_func's (the stub ran: PC moved one STRIDE from ENTRY)
+  T('jump_to in-module: an invalid mirror page marks the target invalid and calls jump_to_func',
+    [JOUT(0x80200040), 0, 0],
+    { opts: { cold: true, actual: { pages: { 0x80200: 1 } }, pageLen: 1024 }, lastAddr: 0x80100000,
+      expectActual: '0xdead0000', expectJTA: '0x80200040', expectInvalid: { 0x80200: 1, 0xa0200: 1 } }),
+  T('jump_to in-module: a TLB-mapped target is jump_to_func\'s',
+    [R(8, 0, 0, 0, 0x08), 0, 0],
+    { regs: { 8: '0x400040' }, opts: { cold: true, actual: { pages: { 0x80200: 0 } }, pageLen: 1024 }, lastAddr: 0x80100000,
+      expectActual: '0xdead0000', expectJTA: '0x400040' }),
+  // ---- CHECK_MEMORY on a CODE page (invalid_code 0, every op compiled) ----
+  // The store is done, the probe marks the page invalid, and the block continues.
+  T('store into a CODE page: stored, page marked invalid, block continues',
+    [I(OPC.ADDIU, 0, 9, 5), I(OPC.SW, 4, 9, 0x18), I(OPC.ADDIU, 0, 10, 7), 0],
+    { regs: { 4: HIT_ADDR }, opts: { rdramHit: true, codePages: [0x100] },
+      expectRegs: { 9: '0x5', 10: '0x7' }, expectDram: { 0x100018: '0x5' }, expectPC: ENTRY + 4 * STRIDE,
+      expectInvalid: { 0x100: 1 } }),
+  T('control: the same store into a DATA page leaves invalid_code alone',
+    [I(OPC.ADDIU, 0, 9, 5), I(OPC.SW, 4, 9, 0x18), I(OPC.ADDIU, 0, 10, 7), 0],
+    { regs: { 4: HIT_ADDR }, opts: { rdramHit: true },
+      expectRegs: { 9: '0x5', 10: '0x7' }, expectDram: { 0x100018: '0x5' }, expectPC: ENTRY + 4 * STRIDE,
+      expectInvalid: { 0x100: 1 } }),
+  T('a delay-slot store into a CODE page marks it and completes its branch',
+    [I(OPC.BEQ, 0, 0, 3), I(OPC.SW, 4, 9, 0x18), I(OPC.ADDIU, 0, 10, 7), 0, I(OPC.ADDIU, 0, 11, 3), 0],
+    { regs: { 4: HIT_ADDR, 9: '0x6' }, opts: { rdramHit: true, codePages: [0x100] }, lastAddr: 0x80100000,
+      expectRegs: { 10: '0x0', 11: '0x3' }, expectDram: { 0x100018: '0x6' }, expectPC: ENTRY + 6 * STRIDE,
+      expectInvalid: { 0x100: 1 } }),
   T('control: the SAME branch with delay_slot clear DOES move last_addr',
     [I(OPC.BEQ, 5, 6, 2), 0, I(OPC.ADDIU, 0, 8, 0x11), 0, 0],
     { regs: { 5: '0x7', 6: '0x7' }, lastAddr: 0x80100000,
@@ -1027,6 +1149,104 @@ function cacheCase(name, mutate, wantHit) {
 tests.push(cacheCase('recompile of an IDENTICAL span re-installs the cached instance (entry + labels)', () => {}, true));
 tests.push(cacheCase('control: one changed page word MISSES the cache', (w) => { w.HEAPU32[(SRC >> 2) + 5] = I(OPC.ADDIU, 0, 3, 9); }, false));
 tests.push(cacheCase('control: one changed precomp op MISSES the cache', (w) => { w.HEAPU32[(ENTRY + 2 * STRIDE) >> 2] = 2; }, false));
+
+// ---- BATCHED MODULES (2026-10-03): the compile worker emits a batch of offers as ONE module
+// (mips_emit.js emitBatch). Each span's code must run exactly as from its own module: the same
+// span is emitted alone (compileSpan) and as the SECOND span of a two-span batch, and both are
+// run from the entry and from a label (wrapper -> body by function index, the shared segment
+// global, the shared CHECK_MEMORY helper at index 0), through a slow store (cold arm) and a
+// CHECK_MEMORY probe of a code page.
+function batchCase(name, enterAt, slow) {
+  // 0 r9++ | 1 r8++ <- label | 2 sw r8,0x18(r4) | 3 bne r8,r10,1 | 4 (slot) r11++ | 5 nop
+  const words = [I(OPC.ADDIU, 9, 9, 1), I(OPC.ADDIU, 8, 8, 1), I(OPC.SW, 4, 8, 0x18), I(OPC.BNE, 8, 10, 0xfffd), I(OPC.ADDIU, 11, 11, 1), 0, 0];
+  const seed = (w) => {
+    w.REG64[(REG >> 3) + 4] = BigInt.asUintN(64, BigInt(slow ? SLOW_ADDR : HIT_ADDR));
+    w.REG64[(REG >> 3) + 10] = 5n;
+    w.HEAPU32[PCG >> 2] = ENTRY + enterAt * STRIDE;
+  };
+  const read = (w) => [8, 9, 10, 11].map((r) => w.REG64[(REG >> 3) + r]).join(',') + ' pc=' + w.HEAPU32[PCG >> 2] + ' dram=' + w.HEAPU32[(DRAM + 0x100018) >> 2] + ' inv=' + new Uint8Array(w.mem.buffer)[INVALID + 0x100];
+  const opts = { rdramHit: !slow };
+  // (a) alone
+  const bmA = loadEmitter(false, false, true);       // cold paths, like the batch's jobs
+  const wa = makeWorld(words, opts); seed(wa);
+  const ia = bmA.compileSpan(wa.p, { HEAPU32: wa.HEAPU32, wasmTable: wa.table, wasmMemory: wa.mem });
+  // a code page under the store: CHECK_MEMORY must mark it (blocks[0x100] -> a block whose op is not NOTCOMPILED)
+  const codePage = (w) => { w.HEAPU32[(BLOCKS >> 2) + 0x100] = 0x500000; w.HEAPU32[0x500000 >> 2] = 0x510000; w.HEAPU32[(0x510000 + (0x18 >> 2) * STRIDE) >> 2] = 5; new Uint8Array(w.mem.buffer)[INVALID + 0x100] = 0; };
+  codePage(wa);
+  const fa = enterAt ? wa.HEAPU32[(ENTRY + enterAt * STRIDE) >> 2] : ia;   // the entry is installed by the core (recomp.c), labels by the emitter
+  try { wa.table.get(fa)(); } catch (e) { return { name, ok: false, detail: 'alone trapped ' + e }; }
+  // (b) second span of a batch, from offer-shaped jobs (asyncOffer)
+  const bmB = loadEmitter();
+  const wb = makeWorld(words, opts); seed(wb);
+  const p = wb.p, pageN = words.length;
+  const job = (id) => ({ id, p: Object.assign({}, p), w0: SRC >> 2, words: wb.HEAPU32.slice(SRC >> 2, (SRC >> 2) + pageN + 1),
+                         ops: wb.HEAPU32.slice(0, 0).constructor.from({ length: p.span + 2 }, (_, k) => wb.HEAPU32[(ENTRY + k * STRIDE) >> 2]),
+                         flags: { noFP: false, noLabels: false, pin: false, cold: true }, tableBase: wb.table.length });
+  const r = bmB.emitBatch([job(1), job(2)]);
+  if (!r.bytes || r.items.some((it) => !it.ok)) return { name, ok: false, detail: 'batch failed ' + JSON.stringify(r.items.map((it) => it.err || it.ok)) };
+  const inst = new WebAssembly.Instance(new WebAssembly.Module(r.bytes), { e: { t: wb.table, m: wb.mem } });
+  // LABELS BY PC (cold paths, nfn 1): a label is entered through the body itself, PC at the label
+  const it2 = r.items[1], fn = (enterAt && it2.nfn !== 1) ? inst.exports['s' + it2.k + '_' + it2.labels.indexOf(enterAt)] : inst.exports['s' + it2.k];
+  if (!fn) return { name, ok: false, detail: 'no export for entry ' + enterAt + ' labels ' + JSON.stringify(it2.labels) };
+  codePage(wb);
+  try { fn(); } catch (e) { return { name, ok: false, detail: 'batch trapped ' + e }; }
+  const A = read(wa), B = read(wb);
+  return { name, ok: ia > 0 && A === B, detail: `alone ${A} | batch ${B}` };
+}
+tests.push(batchCase('batch: a span runs as from its own module (entry, fast store, code-page probe)', 0, false));
+tests.push(batchCase('batch: entering at a label (by PC: the body is installed at the label)', 1, false));
+tests.push(batchCase('batch: a slow store takes its cold arm and hands back', 0, true));
+
+// ---- CHAINING (2026-10-03): at an exit where nothing that can end the frame ran, the block
+// tail-calls PC->ops itself. Differential: the same span compiled with chaining OFF and ON,
+// run from the same state. A chained exit must leave EXACTLY what the unchained one left plus
+// one run of the op at PC (the harness's stub: PC += STRIDE, nothing else); an exit after a
+// taken interrupt poll, a gen_interrupt in a jump_to tail or a fallback that may run
+// gen_interrupt (MTC0) must NOT chain (extra = 0): the dispatcher has to check the frame flags.
+// `jitAtPC`: every precomp entry still holding the interpreter stub (table[1]) is given a
+// copy of it at a JIT-range slot (at or above the table length at the first compile), so a
+// chained exit finds a JIT block there; without it the op at PC is an interpreter op, which
+// is never chained into.
+function chainCase(name, words, { regs = {}, opts = {}, extra, jitAtPC = true }) {
+  const run = (chain) => {
+    const bm = loadEmitter(false, false, false, chain);
+    const w = makeWorld(words, opts);
+    for (const [r, v] of Object.entries(regs)) w.REG64[(REG >> 3) + (+r)] = BigInt.asUintN(64, BigInt(v));
+    const idx = bm.compileSpan(w.p, { HEAPU32: w.HEAPU32, wasmTable: w.table, wasmMemory: w.mem });
+    if (!(idx > 0)) return { err: 'emit failed' };
+    if (jitAtPC) {
+      const js = w.table.grow(1);
+      w.table.set(js, w.table.get(1));
+      for (let k = 0; k < words.length + 4; k++) if (w.HEAPU32[(ENTRY + k * STRIDE) >> 2] === 1) w.HEAPU32[(ENTRY + k * STRIDE) >> 2] = js;
+    }
+    try { w.table.get(idx)(); } catch (e) { return { err: 'trapped ' + e }; }
+    const r = []; for (let k = 0; k < 32; k++) r.push(w.REG64[(REG >> 3) + k]);
+    return { pc: w.HEAPU32[PCG >> 2], regs: r.join(','), count: w.HEAPU32[COUNT >> 2], last: w.HEAPU32[LASTADDR >> 2], chains: bm.stats };
+  };
+  const off = run(false), on = run(true);
+  if (off.err || on.err) return { name, ok: false, detail: `off ${off.err || 'ok'} on ${on.err || 'ok'}` };
+  const ok = on.pc - off.pc === extra * STRIDE && on.regs === off.regs && on.count === off.count && on.last === off.last;
+  return { name, ok, detail: `pc off ${off.pc} on ${on.pc} (want +${extra * STRIDE}) regs ${on.regs === off.regs ? 'eq' : 'NE'} count ${off.count}/${on.count}` };
+}
+tests.push(chainCase('chain: the fall-through exit runs PC->ops once, nothing else changes',
+  [I(OPC.ADDIU, 0, 9, 5), I(OPC.ADDIU, 9, 10, 1), 0], { extra: 1 }));
+tests.push(chainCase('chain: an in-span branch exit with the poll NOT due chains',
+  [I(OPC.BEQ, 0, 0, 0x10), I(OPC.ADDIU, 0, 8, 0x11), I(OPC.ADDIU, 0, 9, 0x22), 0], { extra: 1 }));
+tests.push(chainCase('chain: an in-span branch exit with the poll DUE does not chain',
+  [I(OPC.BEQ, 0, 0, 0x10), I(OPC.ADDIU, 0, 8, 0x11), I(OPC.ADDIU, 0, 9, 0x22), 0], { opts: { nextInt: 0 }, extra: 0 }));
+tests.push(chainCase('chain: a gen_interrupt that leaves PC alone does not chain',
+  [I(OPC.ADDIU, 2, 2, 1), I(OPC.BNE, 2, 3, 0xfffe), 0, I(OPC.ADDIU, 0, 4, 9), 0],
+  { regs: { 3: '0x5' }, opts: { nextInt: 0, genIntNoop: true }, extra: 0 }));
+tests.push(chainCase('chain: a J_OUT tail (jump_to, poll not due) chains',
+  [JOUT(0x80200000), 0, I(OPC.ADDIU, 0, 11, 1), 0], { extra: 1 }));
+tests.push(chainCase('chain: a J_OUT tail whose gen_interrupt ran does not chain',
+  [JOUT(0x80200000), 0, I(OPC.ADDIU, 0, 11, 1), 0], { opts: { nextInt: 0, genIntNoop: true }, extra: 0 }));
+tests.push(chainCase('chain: an MTC0 fallback (may run gen_interrupt) hands back without chaining',
+  [MTC0(8, 12), I(OPC.ADDIU, 0, 9, 5), 0], { extra: 0 }));
+tests.push(chainCase('chain: never INTO an interpreter op (NOTCOMPILED/FIN_BLOCK nest PC->ops)',
+  [I(OPC.ADDIU, 0, 9, 5), I(OPC.ADDIU, 9, 10, 1), 0], { extra: 0, jitAtPC: false }));
+tests.push(chainCase('chain: into a label entry (its wrapper tail-calls the body)',
+  [I(OPC.ADDIU, 0, 9, 5), I(OPC.BEQ, 0, 0, 0x10), 0, 0], { extra: 1 }));
 
 let fail = 0;
 for (const t of tests) {

@@ -113,6 +113,50 @@ constexpr u32 BEM_MIPS_FLAG_CELL = 0x026B39B8u;   // 0 = OFF (browser-zeroed)
 bool bem_mips_census_on();
 
 // ---------------------------------------------------------------------------
+// [gpu-synced idle skip 2026-10-01] Native Dolphin's CoreTiming::Idle() with
+// MAIN_SYNC_ON_SKIP_IDLE (the default) calls Fifo::FlushGpu() BEFORE it zeroes
+// downcount: "When the FIFO is processing data we must not advance because in
+// this way the VI will be desynchronized" (dolphin-src Core/CoreTiming.cpp,
+// CoreTimingManager::Idle). Our idle skip is the emitted `downcount = 0` in the
+// block prologue, and FlushGpu is a no-op here (the spawned gpu_thread parks;
+// Fifo.cpp RunGpuLoopSlice note), so every idle skip in this build jumps the
+// clock with the GPU possibly still behind.
+//
+// GATED mode replaces the unconditional `downcount = 0` of a LEAF-INLINE
+// (non-contiguous, spliced) idle block with
+//     if (fifo.CPReadWriteDistance == 0) downcount = 0      // GPU caught up: skip
+//     else                               downcount -= charge // GPU behind: spin as today
+// i.e. the non-blocking form of native's "wait for the GPU, then skip": while
+// the GPU is behind, the loop executes exactly as the unspliced build does.
+//   BEM_GPUIDLE_MODE_CELL  W  policy, read at EMIT time (JitWasm::TryCompileBlock
+//                             splices on it, so set it before the blocks compile):
+//                               0 (browser-zeroed / never written) = the compiled-in
+//                                 default BEM_GPUIDLE_DEFAULT;
+//                               BEM_GPUIDLE_KILL = forced OFF (matched-pair control);
+//                               any other nonzero = ON.
+//   BEM_GPUIDLE_DIST_CELL  W  host address of fifo.CPReadWriteDistance,
+//                             published by JitWasm before every compile
+//   BEM_GPUIDLE_SKIP_CELL  R  gated idle executions that skipped (GPU idle)
+//   BEM_GPUIDLE_SPIN_CELL  R  gated idle executions that spun (GPU behind)
+// [CELLS MOVED 2026-10-01] These first sat at 0x026B3B7C..0x026B3B88, which is
+// inside BemStageTimer's f64 block 0x026B3B40..0x026B3B97 (BemStageTimer.h kMsBase,
+// 11 x f64) — and BemStage::Publish() rewrites that whole block UNCONDITIONALLY on
+// every recomp_render_fifo (EmscriptenWorker.cpp). 0x026B3EC0..0x026B3ECC is past
+// the late-EFB census (0x026B3E00..0x026B3E9F, ring at 0x026B3E10 x16 x8 B) and
+// matches no 0x026B3xxx literal anywhere in the tree.
+constexpr u32 BEM_GPUIDLE_MODE_CELL = 0x026B3EC0u;
+constexpr u32 BEM_GPUIDLE_DIST_CELL = 0x026B3EC4u;
+constexpr u32 BEM_GPUIDLE_SKIP_CELL = 0x026B3EC8u;
+constexpr u32 BEM_GPUIDLE_SPIN_CELL = 0x026B3ECCu;
+constexpr u32 BEM_GPUIDLE_KILL      = 0x6D1E0FF0u;
+#ifndef BEM_GPUIDLE_DEFAULT
+#define BEM_GPUIDLE_DEFAULT 0
+#endif
+// True when the gated splice is in force for blocks compiled now (live JIT only:
+// g_bem_lc_base == 0 means an offline tool, which must not read SAB cells).
+bool bem_gpuidle_on();
+
+// ---------------------------------------------------------------------------
 // [op-census 2026-09-01] Emit-phase marks — the OFFLINE executed-op instrument.
 //
 // WHY: every op-level number in this tree so far is a STATIC emitted-op count

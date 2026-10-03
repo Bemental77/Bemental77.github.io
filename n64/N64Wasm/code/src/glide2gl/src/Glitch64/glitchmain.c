@@ -236,8 +236,18 @@ void grFbPrefetch(void)
       if (f && f.prefetch) f.prefetch();
    });
 }
+/* fbasync.js hands a read the one-call-offset copy unless told to stand aside */
+static void nf_bypass(int on)
+{
+   EM_ASM({
+      var g = (typeof globalThis !== 'undefined') ? globalThis : self;
+      var f = g.__fbAsync;
+      if (f) f.bypass = !!$0;
+   }, on);
+}
 #else
 void grFbPrefetch(void) {}
+static void nf_bypass(int on) { (void)on; }
 #endif
 
 static GLuint nf_shader(GLenum type, const char *src)
@@ -283,19 +293,19 @@ static void nf_params(void)
    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
 }
 
-uint16_t *grLfbReadSampled(const int32_t *sx, int nx, const int32_t *sy, int ny)
+/* The sampling pass, split so the lazy copy (Glide64/lazy_fb.c) can run its two
+ * halves at different times: nf_ready() checks and sizes, nf_sample() runs the
+ * texelFetch pass from ANY window-sized texture holding the frame and reads
+ * the native-size result back. grLfbReadSampled (below) is the eager path:
+ * window -> nf_src, then nf_sample(nf_src) — the same commands as before. */
+static int nf_ready(const int32_t *sx, int nx, const int32_t *sy, int ny, int srcw, int srch)
 {
-   static const GLenum caps[] = { GL_BLEND, GL_DEPTH_TEST, GL_SCISSOR_TEST, GL_CULL_FACE, GL_STENCIL_TEST, GL_DITHER,
-                                  GL_POLYGON_OFFSET_FILL, GL_SAMPLE_ALPHA_TO_COVERAGE, GL_SAMPLE_COVERAGE, GL_RASTERIZER_DISCARD };
-   GLboolean was[10], mask[4];
-   GLint prog, active, tex[4], smp[4], dfb, rfb, vao, vp[4], pack, packAlign;
    int i, n;
-
    if (!neil_native_fbread || nf_failed || nx <= 0 || ny <= 0)
-      return NULL;
-   for (i = 0; i < nx; i++) if (sx[i] < 0 || sx[i] >= width) return NULL;
-   for (i = 0; i < ny; i++) if (sy[i] < 0 || sy[i] >= height) return NULL;
-   if (!nf_prog && !nf_init()) { nf_failed = 1; return NULL; }
+      return 0;
+   for (i = 0; i < nx; i++) if (sx[i] < 0 || sx[i] >= srcw) return 0;
+   for (i = 0; i < ny; i++) if (sy[i] < 0 || sy[i] >= srch) return 0;
+   if (!nf_prog && !nf_init()) { nf_failed = 1; return 0; }
 
    n = nx > ny ? nx : ny;
    if (nf_cap < nx * ny || !nf_tmp)
@@ -305,7 +315,7 @@ uint16_t *grLfbReadSampled(const int32_t *sx, int nx, const int32_t *sy, int ny)
       nf_rgba = (uint8_t*)malloc((size_t)nf_cap * 4);
       nf_565  = (uint16_t*)malloc((size_t)nf_cap * 2);
       nf_tmp  = (int32_t*)malloc((size_t)(nf_cap > n ? nf_cap : n) * 4);
-      if (!nf_rgba || !nf_565 || !nf_tmp) { nf_failed = 1; return NULL; }
+      if (!nf_rgba || !nf_565 || !nf_tmp) { nf_failed = 1; return 0; }
    }
    if (nf_lcap < n || !nf_lx || !nf_ly)
    {
@@ -313,8 +323,23 @@ uint16_t *grLfbReadSampled(const int32_t *sx, int nx, const int32_t *sy, int ny)
       nf_lx = (int32_t*)malloc((size_t)n * 4);
       nf_ly = (int32_t*)malloc((size_t)n * 4);
       nf_lcap = n; nf_lnx = nf_lny = -1;
-      if (!nf_lx || !nf_ly) { nf_failed = 1; return NULL; }
+      if (!nf_lx || !nf_ly) { nf_failed = 1; return 0; }
    }
+   return 1;
+}
+
+/* the sampling pass from `src` (srcw x srch, holding the window's pixels as
+ * the bound read framebuffer had them) and the read-back; `copy` first copies
+ * the window into src (the eager path). bypass: the read must reach GL as is
+ * (fbasync.js would otherwise hand over its one-call-offset copy). */
+static uint16_t *nf_sample(GLuint src, int srcw, int srch, int copy, int bypass,
+      const int32_t *sx, int nx, const int32_t *sy, int ny)
+{
+   static const GLenum caps[] = { GL_BLEND, GL_DEPTH_TEST, GL_SCISSOR_TEST, GL_CULL_FACE, GL_STENCIL_TEST, GL_DITHER,
+                                  GL_POLYGON_OFFSET_FILL, GL_SAMPLE_ALPHA_TO_COVERAGE, GL_SAMPLE_COVERAGE, GL_RASTERIZER_DISCARD };
+   GLboolean was[10], mask[4];
+   GLint prog, active, tex[4], smp[4], dfb, rfb, vao, vp[4], pack, packAlign;
+   int i;
 
    /* ---- save ---- */
    glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
@@ -349,16 +374,19 @@ uint16_t *grLfbReadSampled(const int32_t *sx, int nx, const int32_t *sy, int ny)
     * reads (the bound read framebuffer, origin 0,0, width x height) ---- */
    glActiveTexture(GL_TEXTURE0);
    glBindSampler(0, 0);
-   glBindTexture(GL_TEXTURE_2D, nf_src);
-   if (nf_src_w != width || nf_src_h != height)
+   glBindTexture(GL_TEXTURE_2D, src);
+   if (copy)
    {
-      nf_params();
-      /* RGB8: the window has no alpha (alpha:false), and a copy may not add one */
-      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
-      nf_src_w = width; nf_src_h = height;
-      nf_verify = NF_VERIFY;
+      if (nf_src_w != width || nf_src_h != height)
+      {
+         nf_params();
+         /* RGB8: the window has no alpha (alpha:false), and a copy may not add one */
+         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+         nf_src_w = width; nf_src_h = height;
+         nf_verify = NF_VERIFY;
+      }
+      glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width, height);
    }
-   glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width, height);
 
    /* ---- the sample positions: window column per N64 column, and GL row
     * (bottom-origin) per N64 row (top-origin), as R32I lookup rows ---- */
@@ -366,7 +394,7 @@ uint16_t *grLfbReadSampled(const int32_t *sx, int nx, const int32_t *sy, int ny)
     * are the same every frame unless the VI/window geometry changes): a
     * texture re-specified while the previous frame's pass may still read it
     * costs a copy or a stall on a tile-based GPU. */
-   for (i = 0; i < ny; i++) nf_tmp[i] = height - 1 - sy[i];
+   for (i = 0; i < ny; i++) nf_tmp[i] = srch - 1 - sy[i];
    glActiveTexture(GL_TEXTURE1);
    glBindSampler(1, 0);
    glBindTexture(GL_TEXTURE_2D, nf_xs);
@@ -422,7 +450,9 @@ uint16_t *grLfbReadSampled(const int32_t *sx, int nx, const int32_t *sy, int ny)
 
    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+   if (bypass) nf_bypass(1);
    glReadPixels(0, 0, nx, ny, GL_RGBA, GL_UNSIGNED_BYTE, nf_rgba);
+   if (bypass) nf_bypass(0);
 
    /* ---- restore ---- */
    glBindVertexArray(vao);
@@ -452,6 +482,63 @@ uint16_t *grLfbReadSampled(const int32_t *sx, int nx, const int32_t *sy, int ny)
    for (i = 0; i < nx * ny; i++)
       nf_565[i] = ((nf_rgba[i*4+0] >> 3) << 11) | ((nf_rgba[i*4+1] >> 2) << 5) | (nf_rgba[i*4+2] >> 3);
    return nf_565;
+}
+
+uint16_t *grLfbReadSampled(const int32_t *sx, int nx, const int32_t *sy, int ny)
+{
+   if (!nf_ready(sx, nx, sy, ny, width, height))
+      return NULL;
+   return nf_sample(nf_src, width, height, 1, 0, sx, nx, sy, ny);
+}
+
+/* ---- the lazy copy's two halves (Glide64/lazy_fb.c) ---- */
+
+/* the samples are usable for a window of this size, and the pass exists */
+int grLfbSampleable(const int32_t *sx, int nx, const int32_t *sy, int ny)
+{
+   return nf_ready(sx, nx, sy, ny, width, height);
+}
+
+/* Copy the window (the bound read framebuffer, origin 0,0, width x height —
+ * the pixels grLfbReadSampled copies) into `tex`, (re)sizing it to the window.
+ * GPU-side only: nothing is read back. *w/*h: the size it now holds. */
+int grLfbCaptureWindow(GLuint *tex, int *w, int *h)
+{
+   GLint active, bound;
+   if (!*tex)
+   {
+      glGenTextures(1, tex);
+      if (!*tex) return 0;
+      *w = *h = 0;
+   }
+   glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+   glActiveTexture(GL_TEXTURE0);
+   glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+   glBindTexture(GL_TEXTURE_2D, *tex);
+   if (*w != width || *h != height)
+   {
+      nf_params();
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+      *w = width; *h = height;
+   }
+   glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width, height);
+   glBindTexture(GL_TEXTURE_2D, bound);
+   glActiveTexture(active);
+   return 1;
+}
+
+/* The deferred half: the sampling pass from a captured window and the read
+ * back, exactly as grLfbReadSampled would have run it on that frame. */
+uint16_t *grLfbSampleFrom(GLuint tex, int w, int h, const int32_t *sx, int nx, const int32_t *sy, int ny)
+{
+   if (!nf_ready(sx, nx, sy, ny, w, h))
+      return NULL;
+   return nf_sample(tex, w, h, 0, 1, sx, nx, sy, ny);
+}
+
+void grLfbDeleteCapture(GLuint tex)
+{
+   if (tex) glDeleteTextures(1, &tex);
 }
 
 int32_t grLfbReadRegion( int32_t src_buffer,

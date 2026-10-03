@@ -1419,7 +1419,10 @@ self.onmessage = function (e) {
           + ' | ms/f prep=' + (__recompT.prep / _n).toFixed(2) + ' fifo=' + (__recompT.fifo / _n).toFixed(2)
           + ' present=' + (__recompT.present / _n).toFixed(2) + ' | regKB/f=' + (__recompT.regB / _n / 1024).toFixed(1)
           + ' fifoKB/f=' + (__recompT.fifoB / _n / 1024).toFixed(1) + ' skipped=' + __recompT.skip
-          + ' ackHeld=' + __recompHeldAcks.length + ' refused=' + __recompRefused() });
+          + ' ackHeld=' + __recompHeldAcks.length + ' refused=' + __recompRefused()
+          // [gpu-frame-bound 2026-10-03] frames the WGPU backend dropped / kept while the GPU was
+          // behind (WGPUGfx.cpp ShowImage; cells 0x026B3538 / 0x026B353C)
+          + ' gpuDrop=' + (Module.HEAPU32[0x026B3538 >> 2] >>> 0) + ' gpuKeptBehind=' + (Module.HEAPU32[0x026B353C >> 2] >>> 0) });
         __recompT = { prep: 0, fifo: 0, present: 0, n: 0, regB: 0, fifoB: 0, skip: __recompT.skip };
       }
       break;

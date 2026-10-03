@@ -21,6 +21,7 @@
  */
 
 #include <stdint.h>
+#include <string.h>
 #include <stddef.h>
 #include <encodings/crc32.h>
 
@@ -79,12 +80,59 @@ static const uint32_t crc32_table[256] = {
   0x2d02ef8dL
 };
 
+/* SLICING-BY-8 (2026-10-03). The same CRC-32 (the table above, reflected,
+ * pre/post inverted), eight bytes per step instead of one: identical results
+ * for every input (checked against the byte-at-a-time loop on random buffers,
+ * lengths and alignments). glide's texture cache checksums every texture it
+ * looks up with this (Glide64/TexCache.c textureCRC), and that lookup was the
+ * largest single item in the core thread's profile of an MK64 race (8.3% of
+ * its busy time) after the emulator loop itself. Little-endian loads: wasm is
+ * little-endian. */
+static uint32_t crc32_t8[8][256];
+static int crc32_t8_ready;
+
+static void crc32_t8_init(void)
+{
+   unsigned i, k;
+   for (i = 0; i < 256; i++)
+      crc32_t8[0][i] = (uint32_t)crc32_table[i];
+   for (k = 1; k < 8; k++)
+      for (i = 0; i < 256; i++)
+         crc32_t8[k][i] = (crc32_t8[k - 1][i] >> 8) ^ crc32_t8[0][crc32_t8[k - 1][i] & 0xff];
+   crc32_t8_ready = 1;
+}
+
 uint32_t encoding_crc32(uint32_t crc, const uint8_t *buf, size_t len)
 {
    crc = crc ^ 0xffffffff;
 
+   if (!crc32_t8_ready)
+      crc32_t8_init();
+
+   while (len && ((uintptr_t)buf & 3))
+   {
+      crc = crc32_t8[0][(crc ^ (*buf++)) & 0xff] ^ (crc >> 8);
+      len--;
+   }
+   while (len >= 8)
+   {
+      uint32_t a, b;
+      memcpy(&a, buf, 4);
+      memcpy(&b, buf + 4, 4);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+      a = ((a & 0xff) << 24) | ((a & 0xff00) << 8) | ((a >> 8) & 0xff00) | (a >> 24);
+      b = ((b & 0xff) << 24) | ((b & 0xff00) << 8) | ((b >> 8) & 0xff00) | (b >> 24);
+#endif
+      a ^= crc;
+      crc = crc32_t8[7][a & 0xff] ^ crc32_t8[6][(a >> 8) & 0xff] ^
+            crc32_t8[5][(a >> 16) & 0xff] ^ crc32_t8[4][a >> 24] ^
+            crc32_t8[3][b & 0xff] ^ crc32_t8[2][(b >> 8) & 0xff] ^
+            crc32_t8[1][(b >> 16) & 0xff] ^ crc32_t8[0][b >> 24];
+      buf += 8;
+      len -= 8;
+   }
    while (len--)
-      crc = crc32_table[(crc ^ (*buf++)) & 0xff] ^ (crc >> 8);
+      crc = crc32_t8[0][(crc ^ (*buf++)) & 0xff] ^ (crc >> 8);
 
    return crc ^ 0xffffffff;
 }

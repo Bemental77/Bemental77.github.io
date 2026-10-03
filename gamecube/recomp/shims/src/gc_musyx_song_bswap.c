@@ -104,6 +104,14 @@ static int already_seen(const void *p) {
     return 0;
 }
 
+/* An ARR-relative offset as a header stores it: past the five fixed words, inside 4 MB. */
+static int arr_off_plausible(u32 v) { return v >= 0x14u && v < 0x00400000u; }
+static int songs_already_le;
+static void forget_one(const void *p) {
+    for (int i = 0; i < seen_n; i++) if (seen[i] == p) { seen[i] = seen[--seen_n]; return; }
+}
+int __recomp_msm_song_already_le(void) { return songs_already_le; }
+
 /* Called from gc_musyx_bswap.c's msmFioRead hook AFTER the bytes have landed: any song base
  * inside the overwritten range is fresh big-endian data again and must be swapped on next play.
  * Covers both routes — a song read into a reused songBuf, and a group blob reloaded at the same
@@ -205,7 +213,26 @@ void __recomp_bswap_msm_song(void *buf, u32 size) {
     if (!arr) return;
     if (size == 0) size = SONG_SIZE_UNKNOWN_CAP;
     if (size < ARR_HDR_MIN) return;
-    if (already_seen(arr)) return;
+    /* [2026-10-03] THE BYTES DECIDE FIRST, the identity table second. seen[] can only say "this
+     * base was swapped once", and it goes wrong in ways that are each a silent double swap: it
+     * holds SEEN_MAX bases and stops RECORDING when full (a long party fills it — every minigame
+     * and board adds songs), and an entry is only invalidated when msmFioRead lands bytes on it.
+     * MEASURED on the page, all-COM board: four turns, then `memory access out of bounds` in
+     * seqStartPlay (the tracktab[i] load, i.e. arr + a big-endian tTab) <- msmMusPlay <-
+     * BoardMusStart <- ExecShop. tTab and pTab are small ARR-relative offsets (tTab 0x14..0x58,
+     * just past the header; pTab inside the blob): read natively they are small only once the
+     * song is little-endian, and a big-endian one reads as 0x18000000-class garbage. So a header
+     * that is plainly LE is never swapped again, a header that is plainly BE is always swapped
+     * (whatever seen[] says), and only a header that reads plausibly both ways — which needs
+     * tTab's low byte to be 0 — falls back to the identity rule. */
+    {
+        u32 t0 = rd32(arr + ARR_TTAB), p0 = rd32(arr + ARR_PTAB);
+        int le = arr_off_plausible(t0) && arr_off_plausible(p0);
+        int be = arr_off_plausible(bsw32(t0)) && arr_off_plausible(bsw32(p0));
+        if (le && !be) { songs_already_le++; (void)already_seen(arr); return; }
+        if (be && !le) { forget_one(arr); (void)already_seen(arr); }
+        else if (already_seen(arr)) return;
+    }
     dedup_n = 0;
 
     /* 1. the five ALWAYS-header words first — every later step needs their native values. */
@@ -256,12 +283,22 @@ void __recomp_bswap_msm_song(void *buf, u32 size) {
     }
 
     /* 3. mTrack (tempo track): MTRACK_DATA{u32 time; u32 bpm}, ends at time == 0xFFFFFFFF
-     *    (seq.h:110-114, seq.c:514). */
+     *    (seq.h:110-114, seq.c:514).
+     *    THE TERMINATOR IS FOUR BYTES. seq.c:512 reads only `time` of the record that ends the
+     *    track, and the song's data ends right after it — the next u32 is somebody else's. This
+     *    loop used to swap the terminator's "bpm" word too. MEASURED (all-COM w01, frame 39181):
+     *    a song whose mTrack is at 0x2F6C ends at 0x2F80, and the group blob puts the NEXT song
+     *    exactly there, so its tTab was swapped by its neighbour (0x18000000 -> 0x18) while its
+     *    pTab stayed big-endian; when that song was played its own swap turned tTab back to
+     *    0x18000000 and seqStartPlay's tracktab[i] load ran off the end of memory (shop music,
+     *    ExecShop <- BoardMusStart <- msmMusPlay). Swap `time`, stop on -1, and only then `bpm`. */
     if (mTrack && mTrack < size) {
         o = mTrack;
-        while (o + 8 <= size) {
-            sw32(arr + o); sw32(arr + o + 4);
+        while (o + 4 <= size) {
+            sw32(arr + o);
             if (rd32(arr + o) == 0xFFFFFFFFu) break;
+            if (o + 8 > size) break;
+            sw32(arr + o + 4);
             o += 8;
         }
     }

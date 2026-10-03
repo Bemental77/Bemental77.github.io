@@ -18,6 +18,7 @@
        the functional SAB/worker test. Does not replace __gcGpu, which stays the page's
        own render-path authority. -->
   <script src="/lib/capability.js?v=e25dca87"></script>
+  <script src="/lib/bench.js?v=d181b61c"></script><!-- ?bench=1 real-device benchmark; inert without it -->
   <script src="/lib/xboxinput.js"></script>
   <!-- Online co-op. BOTH HALVES RUN THE GAME NOW. The old shape — "THE HOST HALF
        ONLY lives on this page: the guest runs on gamecube_multiplayer.html … a
@@ -791,6 +792,19 @@ window.GcRate = (function () {
     // Out-of-band credits (stPoke unblocks a parked worker so it can service a savestate
     // command). Routed through the model so `granted` — and therefore emulated time — stays
     // consistent; it deliberately ignores MAX_BACKLOG because its whole job is to unstick.
+    // Credits the BACKSTOP CLOCK (a worker; see THE GUEST CLOCK MUST NOT STOP WITH THIS THREAD)
+    // already added to the pool while this thread could not run. They ARE wall-clock-earned
+    // emulated time, so they count as granted; the clock re-latches at t so the same gap is not
+    // integrated twice, and it is not a stall (the guest was running through it).
+    m.absorbExternal = function (n, t) {
+      if (n > 0) {
+        drainCredits();
+        m.granted += n;
+        for (var i = 0; i < n; i++) creditQ.push(t);
+      }
+      m.lastT = t; m.credAcc = 0;
+    };
+
     m.pokeCredits = function (n, t) {
       drainCredits();
       pool.add(n); m.granted += n;
@@ -2998,13 +3012,36 @@ window.GcRate = (function () {
         // is broken on macOS). Default = double-buffered, composited, scanned out
         // through the normal renderer-compositor queue — the path that never crashed.
         var _mtGl = null;
+        // [present mode 2026-10-03] On a SOFTWARE compositor (SwiftShader & co. — chrome://gpu
+        // "Compositing: Software only") every drawn WebGL canvas is read back SYNCHRONOUSLY on
+        // this thread at the next rendering update, and that readback waits for all queued GPU
+        // work: it is what produced the 18-450 s long tasks (see MAIN-THREAD PRESENT in
+        // render-worker.js). There the replay context goes on an OffscreenCanvas the compositor
+        // never sees, and finished frames are painted into #canvas with a 2D putImageData after an
+        // async (fenced) readback. With a real GPU the canvas is composited directly as before.
+        // ?mtpresent=readback|direct overrides the detection.
+        var _mtAttrs = { alpha: false, depth: true, stencil: true, antialias: false,
+                         preserveDrawingBuffer: false, premultipliedAlpha: false,
+                         failIfMajorPerformanceCaveat: false };
+        var _mtMode = (/[?&]mtpresent=(readback|direct)\b/.exec(location.search) || [])[1] || null;
+        var _mtRenderer = '?';
+        if (!_mtMode) {
+          try {
+            var _pc = new OffscreenCanvas(1, 1).getContext('webgl2');
+            var _dbg = _pc && _pc.getExtension('WEBGL_debug_renderer_info');
+            _mtRenderer = _pc ? String(_pc.getParameter(_dbg ? _dbg.UNMASKED_RENDERER_WEBGL : _pc.RENDERER)) : '?';
+            var _lose = _pc && _pc.getExtension('WEBGL_lose_context'); if (_lose) _lose.loseContext();
+          } catch (e) {}
+          _mtMode = /SwiftShader|llvmpipe|softpipe|Basic Render|Software/i.test(_mtRenderer) ? 'readback' : 'direct';
+        }
+        var _mtGlCanvas = _rwCanvas;
         try {
-          _mtGl = _rwCanvas && _rwCanvas.getContext ? _rwCanvas.getContext('webgl2', {
-            alpha: false, depth: true, stencil: true, antialias: false,
-            preserveDrawingBuffer: false, premultipliedAlpha: false,
-            failIfMajorPerformanceCaveat: false,
-          }) : null;
+          if (_mtMode === 'readback' && typeof OffscreenCanvas === 'function') {
+            _mtGlCanvas = new OffscreenCanvas(_rwCanvas.width, _rwCanvas.height);
+          } else _mtMode = 'direct';
+          _mtGl = _mtGlCanvas && _mtGlCanvas.getContext ? _mtGlCanvas.getContext('webgl2', _mtAttrs) : null;
         } catch (e) { pageLog('[mtgl] getContext(webgl2) threw: ' + (e && e.message)); }
+        pageLog('[mtgl] present mode ' + _mtMode + ' (renderer ' + _mtRenderer + ')');
         if (_mtGl && !(typeof _mtGl.isContextLost === 'function' && _mtGl.isContextLost())) {
           // Write the GL descriptor ONLY once the main-thread WebGL2 context
           // exists. The C++ recorder-install gate (EmscriptenWorker load_iso)
@@ -3020,7 +3057,7 @@ window.GcRate = (function () {
           // Context-loss → fall back to software present (paintFrame2D). The
           // software path already exists; flip the flag so a later context loss
           // routes the worker's video_cb pixel path back to the 2D canvas.
-          _rwCanvas.addEventListener('webglcontextlost', function (ev) {
+          _mtGlCanvas.addEventListener('webglcontextlost', function (ev) {
             ev.preventDefault();
             pageLog('[mtgl] WebGL2 context LOST — routing to software present');
             window.__gcSoftwareRender = true; window.__gcRenderWorker = false;
@@ -3034,7 +3071,7 @@ window.GcRate = (function () {
           _mtScript.onload = function () {
             try {
               var ok = window.__gcStartMainThreadReplay && window.__gcStartMainThreadReplay({
-                gl: _mtGl, canvas: _rwCanvas, memory: sharedMemory,
+                gl: _mtGl, canvas: _mtGlCanvas, display: _rwCanvas, mode: _mtMode, memory: sharedMemory,
                 ringByteOff: window.__gcGl.ringOff, ringWords: window.__gcGl.ringWords,
                 ctrlByteOff: window.__gcGl.ctrlOff,
               });
@@ -8640,6 +8677,7 @@ window.GcRate = (function () {
   // A hidden tab gets no rAF, so no credits and no emulated time: that is the "a long hide is a
   // pause, not a fast-forward" rule working. It must not ALSO read as the guest falling behind.
   document.addEventListener('visibilitychange', function () {
+    if (document.hidden) Atomics.store(paceI32, 241, 0);   // BK_EN: a hidden tab is a pause
     rate.setHidden(document.hidden, performance.now());
   });
 
@@ -9648,6 +9686,7 @@ window.GcRate = (function () {
       return false;
     }
     gcLsGate = true;                                   // credits stop reaching the SAB
+    Atomics.store(paceI32, 241, 0);                    // and so does the backstop clock (BK_EN)
     Atomics.store(paceI32, LS_ARMED, 1);               // the worker stops folding local input in
     gcLsStage = gcLsFreshStage();
     GCLS.armed = true; GCLS.running = false; GCLS.pendingAck = -1; GCLS.fault = null;
@@ -9767,8 +9806,46 @@ window.GcRate = (function () {
   // against TARGET and both callers share ONE monotonic clock (the rAF timestamp is no longer
   // used — a frame-start time older than the last timer tick would re-count the overlap). A
   // hidden tab still pauses: the timer skips while document.hidden, exactly as rAF stops.
+  // ── THE GUEST CLOCK MUST NOT STOP WITH THIS THREAD ─────────────────────────────────────────
+  // rate.grant() runs here, and this thread can be blocked for a long time by work that has
+  // nothing to do with the guest. MEASURED (2026-10-03, no-WebGPU fallback, SwiftShader): with
+  // the GL stream replayed on this thread, the 3D scenes produced 18-33 s long tasks, almost all
+  // of it native time waiting on the GPU process ((program) 168 s of a 220 s profile), and the
+  // guest got NO credits for those seconds — Party Mode sat in mentDll for four minutes of wall
+  // time. That is a slowdown of the GAME, which gate #9 forbids: guest rate and presented rate
+  // are independent knobs, and a slow renderer may only cost presents.
+  // So a backstop: a tiny worker that watches this thread's heartbeat (BK_HB, bumped on every
+  // grant) and, only while it has not moved for BK_GAP_MS, adds credits to the SAB pool at
+  // exactly TARGET per second of ITS OWN wall clock (backlog-capped like grant()). When this
+  // thread comes back, grantNow absorbs them (rate.absorbExternal) before integrating, so every
+  // credit is counted once and emulated time is wall time either way. Solo only: in a room the
+  // frame gate is the room's (gcLsGate) and credits must be paired with agreed inputs; a hidden
+  // tab is a pause by design; freerun needs no credits. BK_EN carries that decision, written on
+  // every grant.
+  var BK_HB = 240, BK_EN = 241, BK_GRANTED = 242, BK_GAP_MS = 60;
+  var bkAbsorbed = 0, bkWorker = null;
+  function bkStart() {
+    if (bkWorker || typeof Worker !== 'function') return;
+    var src = 'onmessage=function(e){var a=new Int32Array(e.data.sab),T=e.data.target,MAXB=e.data.maxb,GAP=e.data.gap;' +
+      'var hb=Atomics.load(a,' + BK_HB + '),seen=performance.now(),acc=0,last=0;' +
+      'for(;;){Atomics.wait(a,255,0,4);var now=performance.now(),h=Atomics.load(a,' + BK_HB + ');' +
+      'if(h!==hb){hb=h;seen=now;last=0;acc=0;continue;}' +
+      'if(!Atomics.load(a,' + BK_EN + ')||Atomics.load(a,' + LS_ARMED + ')||now-seen<GAP){last=0;acc=0;continue;}' +
+      'if(!last){last=seen;}acc+=(now-last)*T/1000;last=now;var g=Math.floor(acc);if(g<=0)continue;acc-=g;' +
+      'var room=MAXB-Atomics.load(a,0);if(g>room)g=room;if(g<=0){continue;}' +
+      'Atomics.add(a,0,g);Atomics.add(a,' + BK_GRANTED + ',g);Atomics.notify(a,0);}};';
+    try {
+      bkWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+      bkWorker.postMessage({ sab: pace, target: TARGET, maxb: MAX_BACKLOG, gap: BK_GAP_MS });
+    } catch (e) { bkWorker = null; console.log('[recomp-live] backstop clock unavailable: ' + e); }
+  }
   function grantNow() {
-    if (rw && !document.hidden) rate.grant(performance.now());
+    var t = performance.now();
+    var g = Atomics.load(paceI32, BK_GRANTED), d = g - bkAbsorbed;
+    if (d > 0) { bkAbsorbed = g; rate.absorbExternal(d, t); }
+    Atomics.store(paceI32, BK_EN, (TARGET > 0 && !gcLsGate && !document.hidden && !Atomics.load(paceI32, 5)) ? 1 : 0);
+    Atomics.add(paceI32, BK_HB, 1);
+    if (rw && !document.hidden) rate.grant(t);
   }
   var grantTimer = 0;
   var rafSinceDraw = true, lastDrawAt = 0;
@@ -9776,7 +9853,7 @@ window.GcRate = (function () {
     rafSinceDraw = true;
     grantNow();
     if (GCLS.armed) gcLsStep();
-    if (!grantTimer) grantTimer = setInterval(grantNow, 8);
+    if (!grantTimer) { grantTimer = setInterval(grantNow, 8); bkStart(); }
     requestAnimationFrame(grantLoop);
   }
 
@@ -9948,6 +10025,59 @@ window.GcRate = (function () {
       }
       if (origOnWorkerMsg) origOnWorkerMsg(e);
     };
+    // ---- THE GAME STOPPED: SAY SO, AND OFFER THE WAY ON ------------------------------------
+    // A trap in the recomp ends this console's game (in a room, every console's, on the same
+    // frame). Without this the solo player saw a frozen picture and nothing else: the reason was
+    // only in the console log and the party panel. Solo, the way on is the JIT engine, which
+    // runs every part of the disc (it restarts the game — the two engines share no state); in a
+    // room there is none, because a room runs only on this engine.
+    function gcRecompStopBanner(trap) {
+      try {
+        if (document.getElementById('gcRecompStop')) return;
+        var miss = window.__gcOvlMissing;
+        var inRoom = !!(GCLS && GCLS.session);
+        var why = miss
+          ? 'it reached a part of the game this build of the fast engine does not contain yet (' + String(miss.dll).replace(/^dll\//, '') + ')'
+          : 'the fast engine hit an error (' + String(trap.txt).replace(/^main stopped: /, '').slice(0, 90) + ')';
+        var d = document.createElement('div');
+        d.id = 'gcRecompStop';
+        d.setAttribute('role', 'alert');
+        d.style.cssText = 'position:fixed;left:50%;top:16px;transform:translateX(-50%);z-index:9999;max-width:min(92vw,560px);' +
+          'background:#1b1b1f;color:#eee;border:1px solid #c0392b;border-radius:10px;padding:14px 16px;font:14px/1.45 system-ui,sans-serif;' +
+          'box-shadow:0 8px 30px rgba(0,0,0,.5)';
+        var t = document.createElement('div');
+        t.textContent = 'Mario Party 4 stopped at frame ' + trap.at + ': ' + why + '.' +
+          (inRoom ? ' Every console in the room stopped on the same frame — the room did not fail.' : '');
+        d.appendChild(t);
+        var row = document.createElement('div');
+        row.style.cssText = 'margin-top:10px;display:flex;gap:8px;flex-wrap:wrap';
+        function btn(label, fn) {
+          var b = document.createElement('button'); b.textContent = label; b.onclick = fn;
+          b.style.cssText = 'padding:8px 12px;border-radius:7px;border:1px solid #555;background:#2c2c33;color:#fff;cursor:pointer;font:inherit';
+          row.appendChild(b); return b;
+        }
+        function toJit() { var u = new URL(location.href); u.searchParams.set('recomp', '0'); location.href = u.toString(); }
+        if (!inRoom) btn('Restart on the JIT engine (runs the whole game)', toJit);
+        btn('Reload', function () { location.reload(); });
+        d.appendChild(row);
+        document.body.appendChild(d);
+        // SOLO + A MISSING OVERLAY: route to the JIT engine on its own. A missing overlay is not a
+        // bug this engine can recover from (the game asked for code this build does not contain),
+        // and the JIT runs every part of the disc. A short countdown with a Stay button, so a player
+        // reading the reason is not yanked away; ?recompstay=1 disables it (for test rigs).
+        if (miss && !inRoom && new URL(location.href).searchParams.get('recompstay') !== '1') {
+          var left = 8, cd = document.createElement('div');
+          cd.style.cssText = 'margin-top:8px;opacity:.8';
+          d.appendChild(cd);
+          var timer = setInterval(function () {
+            if (--left <= 0) { clearInterval(timer); toJit(); return; }
+            cd.textContent = 'Switching to the JIT engine in ' + left + ' s…';
+          }, 1000);
+          cd.textContent = 'Switching to the JIT engine in ' + left + ' s…';
+          btn('Stay here', function () { clearInterval(timer); cd.textContent = ''; });
+        }
+      } catch (err) { console.log('[recomp-live] stop banner failed: ' + err); }
+    }
     rw.onmessage = function (e) {
       if (e.data.cmd === 'frame') {
         // This message marks the END of the guest's production of frame n. rate.frame() does
@@ -9968,10 +10098,19 @@ window.GcRate = (function () {
         // Floor: a draw at least every 250 ms even if rAF is starved outright (measured: rAF at
         // 0/s for minutes with this thread idle while SwiftShader's GPU process was saturated),
         // so the picture never freezes — 4 draws/s is the most a starved pipeline is offered.
+        // [2026-10-03] AND NEVER AHEAD OF THE GPU: __gcRwBusy() (render-worker.js) is true while
+        // the replay has a frame the GPU has not finished, or one already sent that has not
+        // reached it. Drawing another would only queue it — and every queued frame is GPU work
+        // some synchronous wait eventually pays for (it was the 18-450 s long tasks). Such a
+        // frame is dropped here, at the source, like the rAF cap above: state applied, no draw.
         var _fnow = performance.now();
-        var _pg = !!window.__gcMtGl && !rafSinceDraw && (_fnow - lastDrawAt) < 250;
+        var _mt = !!window.__gcMtGl, _rwb = _mt && typeof window.__gcRwBusy === 'function' && window.__gcRwBusy();
+        var _pg = _mt && (_rwb || (!rafSinceDraw && (_fnow - lastDrawAt) < 250));
         var skipRender = rate.frame(e.data.n, _fnow, _pg);
-        if (!skipRender) { rafSinceDraw = false; lastDrawAt = _fnow; }
+        if (!skipRender) {
+          rafSinceDraw = false; lastDrawAt = _fnow;
+          if (_mt && typeof window.__gcRwNoteSent === 'function') window.__gcRwNoteSent();
+        }
         var tr = [e.data.fifo].concat(e.data.regions.map(function (r) { return r.bytes; }));
         if (e.data.mem1) tr.push(e.data.mem1);
         dolphin_worker.postMessage({ cmd: 'recompFrame', n: e.data.n, fifo: e.data.fifo,
@@ -10042,27 +10181,46 @@ window.GcRate = (function () {
         else if (pendingStateLoad) pendingStateLoad({ ok: false, msg: e.data.txt });
       } else if (e.data.cmd === 'log') {
         console.log(e.data.txt);
+        // WHICH PART OF THE GAME: the game's own overlay transitions (objman "Start New OVL n",
+        // exempt from the worker's OSReport rate limit), kept as a trail and echoed under the
+        // [recomp-live] prefix that rigs already collect — a board, a minigame and its results
+        // are each one overlay, so this is the record of a played turn.
+        var _ovm = /Start New OVL (\d+)/.exec(e.data.txt);
+        if (_ovm) {
+          var _ovf = Atomics.load(paceI32, PAD_ACK);
+          (window.__gcOvlTrail = window.__gcOvlTrail || []).push([_ovf, +_ovm[1]]);
+          console.log('[recomp-live] overlay ' + _ovm[1] + ' entered at frame ' + _ovf);
+        }
         // A TRAP IN THE GAME ITSELF (recomp_worker.js 'main stopped: ...') ends this console's game.
         // In a room every console traps at the same frame (the simulation is the same one), so the
         // room did not fail — the game did; say that, instead of a party frozen on 'playing'.
         if (/main stopped: /.test(e.data.txt) && !window.__gcTrap) {
           window.__gcTrap = { at: Atomics.load(paceI32, PAD_ACK), txt: String(e.data.txt).replace(/^\[recomp-worker\] /, '') };
           gcNetPartySync();
+          gcRecompStopBanner(window.__gcTrap);
         }
+      } else if (e.data.cmd === 'ovlMissing') {
+        // recomp_worker.js stops at OSLink and names the overlay the game asked for (AN OVERLAY
+        // THIS BUILD DOES NOT CARRY); the 'main stopped' log line that follows raises the banner.
+        window.__gcOvlMissing = { dll: e.data.dll, frame: e.data.frame };
       }
     };
     // ?board=1: the canned frame-exact chain that drives boot -> title -> save dialogs ->
     // mode carousel -> Party Mode -> 1-human count -> char select, where the armed
     // autoboard shortcut commits the default config and enters the board (OVL_W01).
+    // [2026-10-03] The old chain was thirteen presses keyed to one build's screen timing; on the
+    // 2026-10 builds it no longer reached character select (MEASURED in gamecube/recomp/
+    // ovl_test.html: 7040471c and the all-overlay build both sat in mentDll for 20,000 frames).
+    // Start on the title, then A every 24 frames until the hook has had time to fire, takes every
+    // default and does not depend on WHEN a screen appears (the hook fired and w01 started at
+    // frame 3060 on the all-overlay build). The presses stop at 3400 so the board is the
+    // player's. ?boardcom=1 makes all four players COMs (the board, its minigame instructions and
+    // the minigames then play themselves — the rig's way to watch whole turns on this page).
     var boardScript = null;
-    if (q.get('board') === '1') {
-      boardScript = {};
-      var chain = [[1000, [0x1000,0,0,0]], [1300, [0x100,0,0,0]], [1600, [0,8,0,0]],
-                   [1700, [0x100,0,0,0]], [2100, [0x100,0,0,0]], [2500, [0x100,0,0,0]],
-                   [3400, [0x100,0,0,0]], [3800, [0x100,0,0,0]], [4300, [0x100,0,0,0]],
-                   [4400, [0,0,-80,0]], [4450, [0,0,-80,0]], [4500, [0,0,-80,0]],
-                   [4650, [0x100,0,0,0]]];
-      for (var ci = 0; ci < chain.length; ci++) boardScript[chain[ci][0]] = chain[ci][1];
+    var boardCom = q.get('boardcom') === '1';
+    if (q.get('board') === '1' || boardCom) {
+      boardScript = { 1000: [0x1000, 0, 0, 0] };
+      for (var bf = 1300; bf <= 3400; bf += 24) boardScript[bf] = [0x100, 0, 0, 0];
     }
     // Persisted memory card, if any. It MUST ride the boot message: the worker writes it into
     // the shim's image buffer before Module._main(), and CARDInit adopts it from inside main.
@@ -10092,7 +10250,8 @@ window.GcRate = (function () {
     else if (recompBuildDir) console.log('[recomp] CANDIDATE build /gamecube/recomp/' + recompBuildDir + ' — NOT the shipped pair');
     rw.postMessage({ cmd: 'boot', parts: parts, fst: fst, pace: pace, card: card, cardTime: cardTime,
                      stage: stageSab,
-                     autoboard: q.get('board') === '1',
+                     autoboard: q.get('board') === '1' && !boardCom,
+                     autotest: boardCom ? { board: 0, mg: null, allcom: true } : null,
                      inputScript: boardScript,
                      peekAddrs: (q.get('peek') || '').split(',').filter(Boolean).map(function (s) { return parseInt(s, 16); }),
                      testFullMem: q.get('fullmem') === '1',
@@ -10108,8 +10267,12 @@ window.GcRate = (function () {
                      // the shipped one (the recomp link is not byte-reproducible, so "just
                      // swap it back" is not a clean undo). Restricted to [A-Za-z0-9_-] so the
                      // parameter cannot walk out of the recomp directory.
-                     glueUrl: '/gamecube/recomp/' + recompBuildDir + 'mp4_game.js',
-                     wasmUrl: '/gamecube/recomp/' + recompBuildDir + 'mp4_game.wasm' }, bootTransfer);
+                     // ?b= is the shipped pair's identity (first 8 hex of mp4_game.wasm's md5) —
+                     // BUMP IT WITH EVERY NEW PAIR. The worker itself is fetched ?v=<now>, but these
+                     // two were plain URLs, so a cached old .wasm could meet a new .js glue (a torn
+                     // pair: "Import #0 env: module is not an object or function").
+                     glueUrl: '/gamecube/recomp/' + recompBuildDir + 'mp4_game.js?b=921a7bc1',
+                     wasmUrl: '/gamecube/recomp/' + recompBuildDir + 'mp4_game.wasm?b=921a7bc1' }, bootTransfer);
     bootSent = true;    // from here on, Save/Load/Export belong to THIS worker, not dolphin
     // ⚠ BEFORE THE FIRST CREDIT AND NOT ONE LINE LATER. This is the only moment at which "this
     // core has never run a frame" is still true; grantLoop below is what starts the guest.

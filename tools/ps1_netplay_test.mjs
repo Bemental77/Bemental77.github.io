@@ -31,6 +31,13 @@
 //   bash tools/probe_lock.sh run -- node tools/ps1_netplay_test.mjs
 //
 // FLAGS  --headful  --keep  --seconds N (default 8)  --url BASE  --cold
+//        --slow-guest R  the GUEST's emulator worker runs R x slower from the
+//                  start of the run (wasmpsx_worker.js 'netSlow', rig-only) —
+//                  a device that cannot afford rollback: the capacity gate must
+//                  move the room to input delay, at the same frame on both;
+//        --slow-until S  ...and gets its speed back S s into the run: the room
+//                  must come back to rollback (ps1.html declares rbResume) with
+//                  the guest's savestate ring re-armed
 import { createRequire } from 'module';
 import { execSync } from 'child_process';
 import fs from 'node:fs';
@@ -48,6 +55,8 @@ const CHROME = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Conte
 // Monster Rancher 2, is 451 MB and every other disc is larger. Two peers stream
 // it, so the smallest is the honest default for a gate; --rom N picks another.
 const ROM = parseInt(flag('rom', '3'), 10);
+const SLOW = +flag('slow-guest', '1');
+const SLOW_UNTIL = +flag('slow-until', '0');
 
 // ⚠ EVERY waitForFunction HERE MUST POLL ON A TIMER, NOT ON rAF. Puppeteer's
 // default `polling: 'raf'` runs the predicate inside requestAnimationFrame, and
@@ -84,8 +93,15 @@ async function openWindowPage(browser) {
   throw new Error('could not open a separate browser window for a peer');
 }
 
-async function openPeer(browser, tag) {
+async function openPeer(browser, tag, captureWorker) {
   const page = await openWindowPage(browser);
+  // --slow-guest: keep a handle on the page's emulator worker (the page holds
+  // it in a closure) so the rig can send it 'netSlow'. Nothing else changes.
+  if (captureWorker) await page.evaluateOnNewDocument(() => {
+    const W = window.Worker; window.__rigWorkers = [];
+    window.Worker = function (u, o) { const w = new W(u, o); if (/wasmpsx_worker/.test(String(u))) window.__rigWorkers.push(w); return w; };
+    window.Worker.prototype = W.prototype;
+  });
   const errs = [];
   page.on('pageerror', (e) => errs.push(String((e && e.message) || e)));
   page.on('console', (m) => { if (m.type() === 'error') errs.push('console: ' + m.text()); });
@@ -131,7 +147,7 @@ const maskAt = (img, port) => (img ? ((img[port * 2] | (img[port * 2 + 1] << 8))
     // ⚠ SAME BROWSER, DELIBERATELY. `local` signalling is a BroadcastChannel on
     // one origin in one browser; two processes cannot see each other on it.
     const A = await openPeer(browser, 'A');
-    const B = await openPeer(browser, 'B');
+    const B = await openPeer(browser, 'B', SLOW > 1);
 
     // ⚠ PROVE BOTH PEERS CAN ACTUALLY RENDER BEFORE MEASURING ANYTHING. If one
     // is hidden it feeds no frames, and every later assertion becomes a
@@ -329,7 +345,23 @@ const maskAt = (img, port) => (img ? ((img[port * 2] | (img[port * 2 + 1] << 8))
     });
 
     // ---- 6. RUN A WHILE, THEN CHECK THEY STAYED TOGETHER ------------------
-    await sleep(SECONDS * 1000);
+    const slowSet = (r) => B.page.evaluate((r2) => { (window.__rigWorkers || []).forEach((w) => w.postMessage({ cmd: 'netSlow', r: r2 })); return (window.__rigWorkers || []).length; }, r);
+    if (SLOW > 1) {
+      const nW = await slowSet(SLOW);
+      console.log(`  INFO  slow-guest  the guest's worker runs ${SLOW}x slower (workers reached: ${nW})`);
+      // A timeline every 5 s: each console's mode, published step, frames.
+      const t0 = Date.now();
+      let lifted = !(SLOW_UNTIL > 0 && SLOW_UNTIL < SECONDS), lastF = null;
+      while (Date.now() - t0 < SECONDS * 1000) {
+        await sleep(Math.min(5000, SECONDS * 1000 - (Date.now() - t0)));
+        const el = (Date.now() - t0) / 1000;
+        if (!lifted && el >= SLOW_UNTIL) { await slowSet(1); lifted = true; console.log(`  INFO  slow-guest  speed given back at ${Math.round(el)} s`); }
+        const tl = await Promise.all([A, B].map((p) => p.page.evaluate(() => { const n = window.__ps1Net(), g = n.capGate || {}; return { f: n.frame, m: g.mode, st: g.selfStepMs, d: n.delay, re: g.rearms }; })));
+        const fps = lastF ? tl.map((x, i) => ((x.f - lastF[i].f) / ((Date.now() - lastF[i].t) / 1000)).toFixed(1)) : ['-', '-'];
+        lastF = tl.map((x) => ({ f: x.f, t: Date.now() }));
+        console.log(`  TL ${el.toFixed(0).padStart(4)}s  host ${tl[0].m} st=${tl[0].st} d=${tl[0].d} ${fps[0]}f/s · guest ${tl[1].m} st=${tl[1].st} d=${tl[1].d} ${fps[1]}f/s re=${tl[1].re}`);
+      }
+    } else await sleep(SECONDS * 1000);
     // ⚠ SAMPLED AS CLOSE TO SIMULTANEOUSLY AS THIS RIG CAN MANAGE. Reading the
     // peers one after the other puts a real gap between samples, and at 60 fps
     // even 30 ms is ~2 frames of apparent drift the cores did not have.
@@ -389,6 +421,28 @@ const maskAt = (img, port) => (img ? ((img[port * 2] | (img[port * 2 + 1] << 8))
     for (const [tag, d, x] of [['host', da, xa], ['guest', db, xb]]) {
       console.log(`  INFO  ${tag}  rate=${x.toFixed(4)}x  svcAvg=${d.svcAvgMs}ms svcMax=${d.svcMaxMs}ms `
         + `n=${d.svcCount}  capHits=${d.capHits} gateStalls=${d.gateStalls} delay=${d.delay}`);
+      // The capacity gate (lib/netplay.js _capDecide, opts.rbResume): every
+      // switch the room made, and the page's re-arms of its savestate ring.
+      const g = d.capGate;
+      if (g) console.log(`  INFO  ${tag}  capGate mode=${g.mode} step=${g.selfStepMs}ms save=${g.saveMs}ms rearms=${g.rearms} `
+        + `remeasures=${g.remeasures} switches=${JSON.stringify((g.switches || []).map((s) => s.frame + ':' + s.to + (s.to === 'delay' ? '(' + s.delay + ')' : '')))}`);
+    }
+    // ---- 9. THE CAPACITY GATE, BOTH WAYS (--slow-guest / --slow-until) -----
+    if (SLOW > 1) {
+      const sw = (d) => ((d.capGate && d.capGate.switches) || []).map((s) => s.frame + ':' + s.to);
+      const swA = sw(da), swB = sw(db);
+      const toDelay = swA.filter((x) => /:delay$/.test(x));
+      ok('slow-guest-moves-the-room-to-input-delay', toDelay.length > 0 && JSON.stringify(swA) === JSON.stringify(swB),
+         `host ${JSON.stringify(swA)} guest ${JSON.stringify(swB)} — the same switches at the same frames on both consoles`);
+      if (SLOW_UNTIL > 0) {
+        const back = swA.filter((x) => /:rollback$/.test(x));
+        ok('a-recovered-guest-brings-the-room-back-to-rollback',
+           back.length > 0 && JSON.stringify(swA) === JSON.stringify(swB) && +back[back.length - 1].split(':')[0] > +toDelay[0].split(':')[0],
+           `host ${JSON.stringify(swA)} guest ${JSON.stringify(swB)}; mode now ${da.capGate && da.capGate.mode}/${db.capGate && db.capGate.mode}`);
+        ok('the-savestate-ring-was-re-armed-on-every-console',
+           !!(da.capGate && db.capGate && da.capGate.rearms >= back.length && db.capGate.rearms >= back.length && back.length > 0),
+           `rearms host=${da.capGate && da.capGate.rearms} guest=${db.capGate && db.capGate.rearms} for ${back.length} return(s)`);
+      }
     }
     const svcBound = (d) => d.svcAvgMs != null && d.svcAvgMs >= d.frameBudgetMs * 0.85;
     console.log('  INFO  verdict  ' + (svcBound(da) || svcBound(db)

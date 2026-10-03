@@ -222,6 +222,7 @@ void mp3_task(struct hle_t* hle, unsigned int index, uint32_t address)
 
     writePtr = readPtr = address;
     /* Just do that for efficiency... may remove and use directly later anyway */
+    LFB_TOUCH(readPtr, 8);
     memcpy(hle->mp3_buffer + 0xCE8, hle->dram + readPtr, 8);
     /* This must be a header byte or whatnot */
     readPtr += 8;
@@ -231,6 +232,7 @@ void mp3_task(struct hle_t* hle, unsigned int index, uint32_t address)
        uint32_t inPtr, outPtr;
 
        /* DMA: 0xCF0 <- RDRAM[s5] : 0x180 */
+       LFB_TOUCH(readPtr, 0x180);
        memcpy(hle->mp3_buffer + 0xCF0, hle->dram + readPtr, 0x180);
        inPtr  = 0xCF0; /* s7 */
        outPtr = 0xE70; /* s3 */
@@ -249,6 +251,7 @@ void mp3_task(struct hle_t* hle, unsigned int index, uint32_t address)
           outPtr += 0x40;
        }
        /* --------------- Inner Loop End -------------------- */
+       LFB_TOUCH(writePtr, 0x180);
        memcpy(hle->dram + writePtr, hle->mp3_buffer + 0xe70, 0x180);
        writePtr += 0x180;
        readPtr  += 0x180;

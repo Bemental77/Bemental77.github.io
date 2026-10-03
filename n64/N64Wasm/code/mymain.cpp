@@ -18,6 +18,9 @@
 #include <SDL_image.h>
 #include <SDL_opengl.h>
 #endif
+/* the frontend's own GL (text overlay) goes through glide's call shadow too,
+ * so the shadow stays true across frames: src/glide2gl/src/Glitch64/gl_shadow.h */
+#include "src/glide2gl/src/Glitch64/gl_shadow.h"
 
 #include <fstream>
 #include <string>
@@ -204,6 +207,44 @@ static void apply_vbo_mode(void)
     printf("[gl] vertex streaming: %s (mode %d)\n",
            !vbuf_use_vbo ? "client-side arrays" : vbuf_orphan ? "one VBO, orphaned per draw" : "one VBO, overwritten per draw",
            g_vbo_mode);
+}
+
+/* GL CALL SHADOW (src/glide2gl/src/Glitch64/gl_shadow.c): glide's calls that
+ * would re-set GL state to the value it already has are not sent. On by
+ * default; neil_set_gl_shadow before main(), else the page's ?glshadow=0
+ * (published by fbasync.js in both realms, like ?vbo=) is the A/B arm and
+ * kill switch. Not guest-visible either way: GL ends up in the same state. */
+extern "C" void gls_set_enabled(int on);
+extern "C" void vbo_set_merge(int on);
+static int g_gl_merge = 1;
+extern "C" void neil_set_gl_merge(int on) { g_gl_merge = on ? 1 : 0; vbo_set_merge(g_gl_merge); }
+extern "C" void gls_stats(unsigned *sent, unsigned *dropped);
+static int g_gl_shadow = 1, g_gl_shadow_set = 0;
+extern "C" void neil_set_gl_shadow(int on) { g_gl_shadow = on ? 1 : 0; g_gl_shadow_set = 1; gls_set_enabled(g_gl_shadow); }
+extern "C" unsigned neil_gl_shadow_sent(void) { unsigned s = 0; gls_stats(&s, 0); return s; }
+extern "C" unsigned neil_gl_shadow_dropped(void) { unsigned d = 0; gls_stats(0, &d); return d; }
+static void apply_gl_shadow(void)
+{
+#ifdef __EMSCRIPTEN__
+    if (!g_gl_shadow_set)
+    {
+        int q = EM_ASM_INT({
+            var g = (typeof globalThis !== 'undefined') ? globalThis : self;
+            var f = g.__fbAsync;
+            return (f && f.glShadow === false) ? 0 : 1;
+        });
+        g_gl_shadow = q;
+    }
+    g_gl_merge = EM_ASM_INT({
+        var g = (typeof globalThis !== 'undefined') ? globalThis : self;
+        var f = g.__fbAsync;
+        return (f && f.glMerge === false) ? 0 : 1;
+    });
+#endif
+    gls_set_enabled(g_gl_shadow);
+    vbo_set_merge(g_gl_merge);
+    printf("[gl] call shadow: %s; draw merging: %s\n", g_gl_shadow ? "on" : "off (?glshadow=0)",
+           g_gl_merge ? "on" : "off (?glmerge=0)");
 }
 
 void connectGamepad()
@@ -807,6 +848,7 @@ int main(int argc, char* argv[])
     readConfig();
     readCheats();
     apply_vbo_mode();
+    apply_gl_shadow();
 
     FILE* f = fopen(rom_name, "rb");
     fseek(f, 0, SEEK_END);

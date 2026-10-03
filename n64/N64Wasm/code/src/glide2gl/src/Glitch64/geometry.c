@@ -125,7 +125,44 @@ extern bool pilotwingsFix;
 FILE* fp;
 
 
+/* DRAW MERGING. A single triangle (a 3-vertex fan, glide's usual draw) that
+ * the code below would send on its own is held back instead, and the next
+ * such triangles are appended to it for as long as NO GL call reaches GL in
+ * between (gl_shadow.h GLS_PRE: every call that is sent, and every wrapped GL
+ * entry point, first draws what is held). The held triangles then go out as
+ * ONE glDrawArrays(GL_TRIANGLES): the same triangles, each with the same three
+ * vertices in the same order (a 3-vertex fan is the triangle v0 v1 v2), drawn
+ * in the same order with the same state. GL rasterises the primitives of one
+ * draw in order, so every pixel is the one the separate draws produced.
+ * MK64's race, HEAD core, frames 1900-2000: 114 of 152 draws per field had
+ * nothing between them and the draw before. Off with ?glmerge=0 (the A/B arm
+ * and kill switch, read by mymain.cpp), and never for Pilotwings, whose
+ * shadow fix inspects the first vertex of a draw. */
+int vbuf_merge_pending = 0;
+static int vbuf_merge_on = 1;
+void vbo_set_merge(int on) { vbo_merge_flush(); vbuf_merge_on = on ? 1 : 0; }
+
+static void vbo_draw_prim(GLenum prim);
+
+void vbo_merge_flush(void)
+{
+   if (!vbuf_merge_pending)
+      return;
+   vbuf_merge_pending = 0;      /* first: the draw's own GL calls must not come back here */
+   vbo_draw_prim(GL_TRIANGLES);
+}
+
 void vbo_draw(void)
+{
+   if (vbuf_merge_pending)
+   {
+      vbo_merge_flush();
+      return;
+   }
+   vbo_draw_prim(vbuf_primitive);
+}
+
+static void vbo_draw_prim(GLenum prim)
 {
    if (!vbuf_length || vbuf_drawing)
       return;
@@ -156,12 +193,12 @@ void vbo_draw(void)
          else
             glBufferSubData(GL_ARRAY_BUFFER, 0, vbuf_length * sizeof(VBufVertex), vbuf_data);
 
-         glDrawArrays(vbuf_primitive, 0, vbuf_length);
+         glDrawArrays(prim, 0, vbuf_length);
          glBindBuffer(GL_ARRAY_BUFFER, 0);
       }
       else
       {
-         glDrawArrays(vbuf_primitive, 0, vbuf_length); //NEIL - this is literally where it draws everything
+         glDrawArrays(prim, 0, vbuf_length); //NEIL - this is literally where it draws everything
       }
    }
 
@@ -173,6 +210,23 @@ void vbo_draw(void)
 
 static void vbo_append(GLenum mode, GLsizei count, void *pointers)
 {
+   /* a single triangle the code below would draw by itself at once: hold it */
+   if (vbuf_merge_on && !pilotwingsFix && mode == GL_TRIANGLE_FAN && count == 3 && vbuf_primitive != GL_TRIANGLES)
+   {
+      if (vbuf_merge_pending && vbuf_length + 3 > VERTEX_BUFFER_SIZE)
+         vbo_merge_flush();
+      while (count--)
+      {
+         memcpy(&vbuf_data[vbuf_length++], pointers, sizeof(VBufVertex));
+         pointers = (char*)pointers + sizeof(VERTEX);
+      }
+      vbuf_primitive     = mode;  /* what the immediate draw left behind */
+      vbuf_merge_pending = 1;
+      return;
+   }
+   if (vbuf_merge_pending)
+      vbo_merge_flush();
+
    if (vbuf_length + count > VERTEX_BUFFER_SIZE)
      vbo_draw();
 
@@ -205,6 +259,8 @@ void vbo_enable(void)
    if (vbuf_enabled)
       return;
 
+   /* the attribute set-up below is GL state the held triangles were queued under */
+   vbo_merge_flush();
    vbuf_drawing = true;
 
    if (vbuf_vbo)

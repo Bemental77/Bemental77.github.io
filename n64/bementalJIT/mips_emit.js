@@ -49,14 +49,45 @@
   function leb(n) { var o = []; n >>>= 0; do { var b = n & 0x7f; n >>>= 7; o.push(n ? b | 0x80 : b); } while (n); return o; }
   function sleb(n) { var o = [], more = true; n |= 0; while (more) { var b = n & 0x7f; n >>= 7; if ((n === 0 && !(b & 0x40)) || (n === -1 && (b & 0x40))) more = false; else b |= 0x80; o.push(b); } return o; }
   function section(id, content) { return [id].concat(leb(content.length), content); }
+  // A module's bytes written straight into one Uint8Array: `parts` is a list of byte arrays
+  // (plain arrays or Uint8Arrays) and of { id, chunks } sections whose content is the chunks
+  // in order. The bytes are exactly those of the concat-based assembly it replaces (header,
+  // then each section as [id, leb(len), content]); it only skips building them as JS arrays
+  // first — for a 32-span batch module that was ~200 KB of number arrays concatenated and
+  // copied twice, a quarter of the compile worker's time (FAST EMIT, emitBatch).
+  // (a plain loop: TypedArray.set from a JS array converts element by element, slower here)
+  function packCopy(out, o, c) { for (var j = 0, n = c.length; j < n; j++) out[o + j] = c[j]; return o + n; }
+  // FNV-1a over a Uint32Array's first n words (the recompile key's bucket hash). Out of
+  // compileSpan, which is too large to be optimized, so the loop runs as optimized code.
+  function keyHash(a, n) { var h = 0x811c9dc5 | 0; for (var i = 0; i < n; i++) h = Math.imul(h ^ a[i], 16777619); return h; }
+  function packModule(parts) {
+    var total = 0, i, k, c, n;
+    for (i = 0; i < parts.length; i++) {
+      var pt = parts[i];
+      if (pt.chunks) {
+        for (n = 0, k = 0; k < pt.chunks.length; k++) n += pt.chunks[k].length;
+        pt.len = n; pt.head = [pt.id].concat(leb(n));
+        total += pt.head.length + n;
+      } else total += pt.length;
+    }
+    var out = new Uint8Array(total), o = 0;
+    for (i = 0; i < parts.length; i++) {
+      var q = parts[i];
+      if (q.chunks) {
+        out.set(q.head, o); o += q.head.length;
+        for (k = 0; k < q.chunks.length; k++) { c = q.chunks[k]; o = packCopy(out, o, c); }
+      } else o = packCopy(out, o, q);
+    }
+    return out;
+  }
 
   var OP = {
     block: 0x02, loop: 0x03, if_: 0x04, else_: 0x05, end: 0x0B,
-    br: 0x0C, br_if: 0x0D, call: 0x10, call_indirect: 0x11,
+    br: 0x0C, br_if: 0x0D, call: 0x10, call_indirect: 0x11, return_call_indirect: 0x13,
     local_get: 0x20, local_set: 0x21,
     i32_load: 0x28, i64_load: 0x29, i32_load8_u: 0x2D, i32_store: 0x36, i64_store: 0x37, i32_store8: 0x3A,
     i32_const: 0x41, i64_const: 0x42,
-    i32_eqz: 0x45, i32_eq: 0x46, i32_ne: 0x47, i32_le_u: 0x4D,
+    i32_eqz: 0x45, i32_eq: 0x46, i32_ne: 0x47, i32_le_u: 0x4D, i32_ge_u: 0x4F,
     i64_eq: 0x51, i64_ne: 0x52, i64_lt_s: 0x53, i64_lt_u: 0x54, i64_gt_s: 0x55, i64_le_s: 0x57, i64_ge_s: 0x59,
     i32_add: 0x6A, i32_sub: 0x6B, i32_mul: 0x6C, i32_and: 0x71, i32_or: 0x72, i32_xor: 0x73, i32_shl: 0x74, i32_shr_s: 0x75, i32_shr_u: 0x76,
     i32_extend8_s: 0xC0, i32_extend16_s: 0xC1,
@@ -96,6 +127,12 @@
   // on entry and on every backward in-span branch (br_table at $top). A NEW
   // local appended after every existing group, so no index above moves.
   var L_START = 41;
+  // COLD PATHS (2026-10-03): the index of the out-of-line handler a cold arm jumps to
+  // (see COLD PATHS in compileSpan). A new local after every existing group.
+  var L_COLD = 42;
+  // LEAN CODE (2026-10-03): the Count value a branch tail just stored (emitCountBatch tees it), read
+  // back by that tail's interrupt poll instead of a reload. Locals 42 and 43 are always declared now.
+  var L_CNT = 43;
   // RAW (2026-10-01): 1 while compiling a block that has pinned registers.
   // Its body is then wrapped as (block $raw (block $exit ...) epilogue), and
   // every exit that follows an interpreter/core call — where reg[] is already
@@ -310,6 +347,14 @@
     for (var r = 0; r < 32; r++) {
       if (this.dirty[r]) out = out.concat(storeI64(this.regBase + r * 8, [OP.local_get].concat(leb(L_REG0 + r))));
     }
+    out.regs = this.dirtyRegs();          // the same set, for a cold handler (see COLD PATHS)
+    return out;
+  };
+  // every register whose local is ahead of reg[] right now (pinned ones included): exactly the
+  // stores flushSnapshot / flushAll would emit at this point
+  RegCache.prototype.dirtyRegs = function () {
+    var out = [];
+    for (var r = 0; r < 32; r++) if (this.dirty[r]) out.push(r);
     return out;
   };
   // Emit ONLY the load prologue for reg r (leaves NOTHING on the stack) and
@@ -618,11 +663,19 @@
     out[rt] = true;
   }
 
+  // Count += ((addr + 8 - last_addr) >> 2) * count_per_op, the value also left in L_CNT for the
+  // poll that follows on every path (emitTailPoll). LEAN CODE: count_per_op 1 or 2 is a single
+  // shift — exact because the difference is always a multiple of 4: addr + 8 is a word address
+  // and every writer of last_addr stores a word address (PC->addr, an EPC through jump_to, the
+  // reset vector 0xa4000040, skip_jump = PC->addr, or a constant this emitter bakes), so
+  // ((d >> 2) * 2) == (d >> 1) and ((d >> 2) * 1) == (d >> 2).
   function emitCountBatch(p, addr) {
+    var scale = (p.cpo === 1) ? [OP.i32_const, 0x02, OP.i32_shr_u]
+      : (p.cpo === 2) ? [OP.i32_const, 0x01, OP.i32_shr_u]
+      : [OP.i32_const, 0x02, OP.i32_shr_u, OP.i32_const].concat(sleb(p.cpo), [OP.i32_mul]);
     var val = [OP.i32_const].concat(sleb((addr + 8) | 0),
-      loadI32(p.lastAddr), [OP.i32_sub, OP.i32_const, 0x02, OP.i32_shr_u],
-      [OP.i32_const], sleb(p.cpo), [OP.i32_mul],
-      loadI32(p.count), [OP.i32_add]);
+      loadI32(p.lastAddr), [OP.i32_sub], scale,
+      loadI32(p.count), [OP.i32_add, OP.local_tee], leb(L_CNT));
     return storeI32(p.count, val);
   }
 
@@ -631,8 +684,20 @@
   // The CACHE must be clean across gen_interrupt — it runs exception
   // delivery and can hand control to arbitrary guest code after we exit.
   function emitTailPoll(p, C, finalAddr, finalPtr, exitDepth) {
+    if (COLD) {
+      var flushRegs = C.dirtyRegs();
+      C.flushAll();                       // same compile-state effect as the inline arm
+      return storeI32Const(p.lastAddr, finalAddr | 0).concat(
+        loadI32(p.nextInt), [OP.local_get], leb(L_CNT), [OP.i32_le_u],      // L_CNT: emitCountBatch's Count
+        [OP.if_, OP.void_],
+          coldJump([].concat(
+            bump('#gen_interrupt'),
+            storeI32Const(p.pcGlobal, finalPtr),
+            [OP.i32_const], sleb(p.genInt), [OP.call_indirect, 0x00, 0x00]), exitDepth + 1, flushRegs),
+        [OP.end]);
+    }
     return storeI32Const(p.lastAddr, finalAddr | 0).concat(
-      loadI32(p.nextInt), loadI32(p.count), [OP.i32_le_u],
+      loadI32(p.nextInt), [OP.local_get], leb(L_CNT), [OP.i32_le_u],      // L_CNT: emitCountBatch's Count
       [OP.if_, OP.void_],
       bump('#gen_interrupt'),
       C.flushAll(),                       // compile-state: dirty cleared on BOTH arms (flush emits stores only here, but the arm not taken loses nothing: dirty was already current)
@@ -659,20 +724,164 @@
   // set by jump_to); poll gen_interrupt (PC already correct, no recheck —
   // the block exits regardless). targetBytes pushes the i32 target.
   function emitOutJumpTail(p, targetBytes, exitDepth, C) {
+    if (COLD) {
+      // LEAN CODE: the gen_interrupt arm is a cold handler (no registers: the caller flushed,
+      // and the pinned ones are written back first thing below); the block returns after it
+      // either way, so `call $h; return` is the arm, and CHAINING's fall-through is unchanged
+      return [].concat(
+        C.storePinned(),
+        jumpToBytes(p, targetBytes),
+        storeI32(p.lastAddr, loadI32(p.pcGlobal).concat([OP.i32_load, 0x02], leb(p.addrOff))),
+        loadI32(p.nextInt), loadI32(p.count), [OP.i32_le_u],
+        [OP.if_, OP.void_],
+          coldJump([].concat(bump('#gen_interrupt'), [OP.i32_const], sleb(p.genInt), [OP.call_indirect, 0x00, 0x00]), exitDepth + 1, []),
+        [OP.end],
+        bump('#exit:jump_to'),
+        chainOr(exitDepth));
+    }
     return [].concat(
       C.storePinned(),              // the caller's C.flush() left only pinned registers unwritten
-      storeI32(p.jumpToAddr, targetBytes),
-      [OP.i32_const], sleb(p.jumpToFunc), [OP.call_indirect, 0x00, 0x00],
+      jumpToBytes(p, targetBytes),
       storeI32(p.lastAddr, loadI32(p.pcGlobal).concat([OP.i32_load, 0x02], leb(p.addrOff))),
       loadI32(p.nextInt), loadI32(p.count), [OP.i32_le_u],
       [OP.if_, OP.void_],
         bump('#gen_interrupt'),
         [OP.i32_const], sleb(p.genInt), [OP.call_indirect, 0x00, 0x00],
+        CHAIN && !RAW ? [OP.br].concat(leb(exitDepth + 1)) : [],     // gen_interrupt ran: back to the dispatcher
       [OP.end],
       bump('#exit:jump_to'),
-      [OP.br].concat(leb(exitDepth + RAW))
+      chainOr(exitDepth)
     );
   }
+
+  // ---- CHAINING (2026-10-03) ----
+  // WHY. Every block exit returned to r4300_step, which checks retro_stop_stepping() and
+  // getVI_Count() and calls PC->ops() — the dispatch loop (mainLoopInner, where r4300_step is
+  // inlined) was 8.8% of the core thread's self time in an MK64 race profile.
+  // WHAT. At the exits where nothing that can end the frame has run on the path — a jump_to
+  // tail, an in-span branch exit or the fall-through, each after its interrupt poll was NOT
+  // taken — the block tail-calls PC->ops() itself (return_call_indirect: the callee returns to
+  // r4300_step, which then checks as it would have). EXACT: r4300_step leaves its loop when
+  // stop_stepping && VI_Count > 0; stop_stepping is only ever set (retro_return) and VI_Count
+  // only ever incremented (interrupt.c) inside gen_interrupt or the calls that may run it, and
+  // every path through one of those (a taken interrupt poll, a store's slow arm, a fallback
+  // op that mayGenInterrupt) still hands back to the dispatcher. So on a chained path both
+  // flags are what they were when r4300_step called this block — and it called it, so its
+  // check then said "continue"; the skipped check would have said the same. Off when the
+  // browser has no wasm tail calls (feature-tested) and under register pinning (RAW: the
+  // epilogue must run first).
+  // OFF BY DEFAULT — opt in with ?jitchain=1 (fbasync.js). PRICED 2026-10-03 at half a core
+  // (n64_field_cost_probe --clock --nodbg --wcpu 0.5, MK64 race 1900-3000, interleaved
+  // H K K H H K, load 4.0-5.2): HEAD 10.24 / 10.35 / 9.60 ms per field, chained 9.03 / 9.76 /
+  // 10.81 — inside the rig's noise, so like PINNING it does not ship on until a quieter
+  // measurement shows a gain. Off, the emitted bytes are identical to the unchained emitter's.
+  var CHAIN = false;              // per compile: chaining on for this span
+  var chainOK = null;             // wasm tail calls supported (tested once per realm)
+  function chainOn() {
+    if (EMIT_ONLY) return EMIT_ONLY.chain === true;
+    var g = (typeof globalThis !== 'undefined') ? globalThis : self, f = g.__fbAsync;
+    if (!(f && f.jitChain === true)) return false;     // opt-in: ?jitchain=1
+    if (chainOK === null) {
+      try {
+        // (module (type (func)) (table 1 funcref) (func (return_call_indirect (type 0) (i32.const 0))))
+        chainOK = WebAssembly.validate(new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, 1, 4, 1, 0x60, 0, 0,
+          3, 2, 1, 0, 4, 4, 1, 0x70, 0, 1, 10, 9, 1, 7, 0, 0x41, 0, 0x13, 0, 0, 0x0b]));
+      } catch (e) { chainOK = false; }
+    }
+    return chainOK;
+  }
+  // the exit at a `br exitD` to $exit: a tail call of PC->ops when chaining, else that br
+  // ONLY INTO A JIT BLOCK (an op at or above the core's table length). An interpreter op is
+  // left to the dispatcher: NOTCOMPILED, FIN_BLOCK and the jump ops call PC->ops() from inside
+  // their own frame, so a chain through them would nest a C frame per hop (measured: "Maximum
+  // call stack size exceeded" in MK64's boot). Label wrappers tail-call their body for the
+  // same reason (see the wrappers below).
+  function chainOr(exitD) {
+    if (!CHAIN || RAW || !TABLE_BASE) return [OP.br].concat(leb(exitD + RAW));
+    return [].concat(loadI32(p_chain.pcGlobal), [OP.i32_load, 0x02, 0x00], [OP.local_set], leb(L_ADDR),
+                     [OP.local_get], leb(L_ADDR), [OP.i32_const], sleb(TABLE_BASE), [OP.i32_ge_u],
+                     [OP.if_, OP.void_],
+                       bump('#chain'),
+                       [OP.local_get], leb(L_ADDR), [OP.return_call_indirect, 0x00, 0x00],
+                     [OP.end],
+                     [OP.br].concat(leb(exitD + RAW)));
+  }
+  var p_chain = null;             // the compile's params (chainOr needs pcGlobal)
+
+  // ---- COLD PATHS (2026-10-03) ----
+  // WHY. Measured with tools/n64_emit_unit_test.mjs's harness driving MANY distinct emitted
+  // spans round-robin (the shape of a game's frame, unlike one hot loop): 1500 spans x 150
+  // instructions ran at 26-45 ns per guest instruction against 2.3-2.8 ns for 10 such spans —
+  // the same code, ten times slower, because the emitted code does not fit the CPU's caches.
+  // The MK64 race measures exactly that: ~400k guest instructions in a heavy field at 15-19 ns
+  // each (n64_field_cost_probe --attr). Most of every span's bytes are arms that almost never
+  // run — each load/store/FP op's slow arm (flush the dirty registers, call the interpreter op),
+  // each branch's gen_interrupt arm, CHECK_MEMORY's code-page probe — interleaved with the hot
+  // path, so the hot path is spread over many more cache lines than it needs. With the slow arms
+  // removed the 1500-span case ran 17.6 ns, and with CHECK_MEMORY's inner probe also removed
+  // 6.3 ns (diagnostic arms, not shippable — this is what they priced).
+  // WHAT. A cold arm is moved out of the hot path, and its body — what the arm did inline, ending
+  // in a return to the dispatcher — runs out of line: since 2026-10-03 (LEAN CODE) as a call of
+  // its own function (see COLD CALLS at coldJump; the first shape, `L_COLD = k; br $cold` into
+  // one br_table at the end of the body, cost TurboFan a phi move per live local at every arm).
+  // CHECK_MEMORY's code-page probe becomes a call to one helper function per module. With cold
+  // paths, label entries need no wrapper functions either (LABELS BY PC, at the multi-entry
+  // dispatch). The one behavioural difference: a slow LOAD used to
+  // continue in-block after its interpreter op; it now returns to the dispatcher, which runs
+  // PC->ops for the next instruction — the same instruction the block would have run next, with
+  // reg[] complete (every register was flushed before the op). Exact either way; it costs a
+  // dispatch only on the rare off-RDRAM access.
+  // ?jitcold=0 (fbasync.js publishes it in both realms) keeps every arm inline (and the label
+  // wrappers): A/B arm, kill switch.
+  var COLD = null;           // per-compile handler list while compileSpan runs with cold paths on
+  function coldOn() {
+    var g = (typeof globalThis !== 'undefined') ? globalThis : self, f = g.__fbAsync;
+    if (EMIT_ONLY) return EMIT_ONLY.cold !== false;
+    return !(f && f.jitCold === false);
+  }
+  // pinning (see PINNING in compileSpan): window.__jitPin, or ?jitpin=1 (fbasync.js publishes it)
+  function pinOn() {
+    if (typeof window !== 'undefined' && window.__jitPin) return true;
+    if (EMIT_ONLY) return false;
+    var g = (typeof globalThis !== 'undefined') ? globalThis : self, f = g.__fbAsync;
+    return !!(f && f.jitPin);
+  }
+  // COLD CALLS (LEAN CODE, 2026-10-03). A cold arm is `local.get <its dirty registers>; call $h;
+  // return`, and $h — one function per arm, appended to the module after the span's functions
+  // (COLD_FN0 + k) — stores those registers to reg[] in register order, then runs `tail`, and
+  // returns; the block then returns to the dispatcher. Same effects, in the same order, as the
+  // arm had inline. WHY NOT A SHARED br TARGET (the first COLD PATHS shape, `L_COLD = k; br $cold`
+  // into one br_table of handlers at the end of the body): in TurboFan that merge point makes
+  // every local any handler reads a phi, so EVERY cold arm's site materialised all of them into
+  // fixed registers — 8-10 moves (zeroing the locals not yet assigned on that path) before its
+  // jmp, laid into the hot path of every load, store and branch (measured: a 20-instruction MK64
+  // span's body was 3136 bytes of machine code). A call passes only that arm's own registers,
+  // and a handler that never runs is never even compiled (V8 compiles wasm functions lazily).
+  // `exitD` is kept for the call sites' symmetry with the inline arms; a call needs no depth.
+  var COLD_FN0 = 0;          // function index of this span's first cold handler
+  function coldJump(tail, exitD, regs) {
+    var k = COLD.length;
+    COLD.push({ regs: regs, tail: tail });
+    var site = [];
+    for (var q = 0; q < regs.length; q++) { site.push(OP.local_get); app(site, leb(L_REG0 + regs[q])); }
+    site.push(OP.call); app(site, leb(COLD_FN0 + k)); site.push(OP.return_);
+    return site;
+  }
+  // the handler function's bytes: param q is register regs[q] (i64)
+  function coldHandlerFn(h, regBase) {
+    if (h.raw) return h.raw;               // a prebuilt helper (LABELS BY PC's guard)
+    var f = [0x00];
+    for (var q = 0; q < h.regs.length; q++) app(f, storeI64(regBase + h.regs[q] * 8, [OP.local_get].concat(leb(q))));
+    app(f, h.tail); f.push(OP.end);
+    return f;
+  }
+  // a handler's type index: 0 = ()->(), 1 = (i32)->() (CHECK_MEMORY's helper / census), 1 + n = (i64 x n)->()
+  function coldType(h) { return h.raw ? h.type : (h.regs.length ? 1 + h.regs.length : 0); }
+  var TYPE_SEC = (function () {
+    var t = [].concat(leb(34), [0x60, 0x00, 0x00], [0x60, 0x01, 0x7F, 0x00]);
+    for (var n = 1; n <= 32; n++) { t.push(0x60); app(t, leb(n)); for (var q = 0; q < n; q++) t.push(0x7E); t.push(0x00); }
+    return section(1, t);
+  })();
 
   // The slow (non-RDRAM / CU1-clear) arm of a native memory or FP op.
   //
@@ -701,6 +910,12 @@
   // calls gen_interrupt.
   function slowArm(p, C, instrPtr, opsIdx, brDepth, slow, refreshReg, preFlush, exitAlways) {
     var flushed = preFlush || C.flushSnapshot();
+    if (COLD) {
+      // out of line, and always back to the dispatcher (see COLD PATHS)
+      return coldJump([].concat(
+        storeI32Const(p.pcGlobal, slow ? slow.ptr : instrPtr),
+        [OP.i32_const], sleb(slow ? slow.opsIdx : opsIdx), [OP.call_indirect, 0x00, 0x00]), brDepth, flushed.regs);
+    }
     if (slow) {
       return [].concat(
         flushed,
@@ -750,6 +965,18 @@
   // so the slow arm flushes only what was dirty on ENTRY to this instruction.
   // That is exact and costs nothing (unlike emitStore's C.ensure hoist, which
   // is still right there because a store READS rt).
+  // LEAN CODE (2026-10-03): the effective address `rs + imm` into L_ADDR, LEFT ON THE STACK as
+  // well (local.tee) for the dispatch-table index that always follows; no add for imm == 0.
+  function effAddr(C, rs, imm) {
+    return C.read(rs).concat([OP.i32_wrap_i64], imm ? [OP.i32_const].concat(sleb(imm), [OP.i32_add]) : [], [OP.local_tee, L_ADDR]);
+  }
+  // consumes the effective address effAddr left on the stack: 1 when the live dispatch table
+  // does NOT route this 64 KB page to read/write_rdram* — the slow arm's condition
+  // (`hit`: the inverse, 1 when it does — the inline slow arm's if/else shape, ?jitcold=0)
+  function tblCheck(tableBase, cmpVal, hit) {
+    return [OP.i32_const, 0x10, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl, OP.i32_load, 0x02].concat(
+      leb(tableBase), [OP.i32_const], sleb(cmpVal), [hit ? OP.i32_eq : OP.i32_ne]);
+  }
   function emitLoad(word, instrPtr, p, C, opsIdx, exitDepth, slow) {
     var op = (word >>> 26) & 0x3F;
     if (op !== 0x20 && op !== 0x21 && op !== 0x23 && op !== 0x24 && op !== 0x25 && op !== 0x27 && op !== 0x37) return null;
@@ -770,14 +997,16 @@
     else { tableBase = p.readmemH; cmpVal = p.rdRdramH; }
     var shiftB = [OP.local_get, L_ADDR, OP.i32_const, 0x03, OP.i32_and, OP.i32_const, 0x03, OP.i32_xor, OP.i32_const, 0x03, OP.i32_shl];
     var shiftH = [OP.local_get, L_ADDR, OP.i32_const, 0x02, OP.i32_and, OP.i32_const, 0x02, OP.i32_xor, OP.i32_const, 0x03, OP.i32_shl];
+    // `val` consumes the loaded dram word from the stack (LEAN CODE: it used to be parked in
+    // L_WORD and read straight back; the sub-word shift reads only L_ADDR)
     var val;
     switch (op) {
-      case 0x23: val = [OP.local_get, L_WORD, OP.i64_extend_i32_s]; break;
-      case 0x27: val = [OP.local_get, L_WORD, OP.i64_extend_i32_u]; break;
-      case 0x24: val = [OP.local_get, L_WORD].concat(shiftB, [OP.i32_shr_u, OP.i32_const], sleb(0xFF), [OP.i32_and, OP.i64_extend_i32_u]); break;
-      case 0x20: val = [OP.local_get, L_WORD].concat(shiftB, [OP.i32_shr_u, OP.i32_const], sleb(0xFF), [OP.i32_and, OP.i32_extend8_s, OP.i64_extend_i32_s]); break;
-      case 0x25: val = [OP.local_get, L_WORD].concat(shiftH, [OP.i32_shr_u, OP.i32_const], sleb(0xFFFF), [OP.i32_and, OP.i64_extend_i32_u]); break;
-      case 0x21: val = [OP.local_get, L_WORD].concat(shiftH, [OP.i32_shr_u, OP.i32_const], sleb(0xFFFF), [OP.i32_and, OP.i32_extend16_s, OP.i64_extend_i32_s]); break;
+      case 0x23: val = [OP.i64_extend_i32_s]; break;
+      case 0x27: val = [OP.i64_extend_i32_u]; break;
+      case 0x24: val = shiftB.concat([OP.i32_shr_u, OP.i32_const], sleb(0xFF), [OP.i32_and, OP.i64_extend_i32_u]); break;
+      case 0x20: val = shiftB.concat([OP.i32_shr_u, OP.i32_const], sleb(0xFF), [OP.i32_and, OP.i32_extend8_s, OP.i64_extend_i32_s]); break;
+      case 0x25: val = shiftH.concat([OP.i32_shr_u, OP.i32_const], sleb(0xFFFF), [OP.i32_and, OP.i64_extend_i32_u]); break;
+      case 0x21: val = shiftH.concat([OP.i32_shr_u, OP.i32_const], sleb(0xFFFF), [OP.i32_and, OP.i32_extend16_s, OP.i64_extend_i32_s]); break;
     }
     // ORDER MATTERS — the same emit-call-order trap documented on emitStore.
     // fastBytes calls C.writeFromStack(rt), which marks rt loaded; if the
@@ -785,7 +1014,7 @@
     // ubiquitous pointer chase) the read would collapse to a bare local.get
     // of a local that is only assigned INSIDE the fast arm, computing the
     // effective address from wasm's zero-init. Read rs FIRST, always.
-    var addrBytes = C.read(rs).concat([OP.i32_wrap_i64, OP.i32_const], sleb(imm), [OP.i32_add, OP.local_set, L_ADDR]);
+    var addrBytes = effAddr(C, rs, imm);
     // LD (wave 9): readd() reads the word at `a` as the HIGH half and the word
     // at `a+4` as the LOW half (m64p_memory.c:127-133,
     // *value = ((uint64_t)w[0] << 32) | w[1]) — the identical shape LDC1
@@ -801,13 +1030,22 @@
           C.writeFromStack(rt))
       : [].concat(
           [OP.local_get, L_ADDR, OP.i32_const], sleb(0xFFFFFC), [OP.i32_and],
-          [OP.i32_load, 0x02], leb(p.dramBase), [OP.local_set, L_WORD],
+          [OP.i32_load, 0x02], leb(p.dramBase),
           val, C.writeFromStack(rt)); // join: rt loaded+dirty (slow arm refreshes the local; its redundant flush is benign)
+    if (COLD) {
+      // LEAN CODE: the slow arm never continues in-block (a cold handler returns), so the fast
+      // arm needs no if/else around it — `if (table != rdram) cold; fast`. Compile-state:
+      // the fast arm is the only path that reaches what follows, as it was the only continuing one.
+      return [].concat(
+        addrBytes, tblCheck(tableBase, cmpVal),
+        [OP.if_, OP.void_],
+          bump((slow ? 'SLOTSLOW:' : 'SLOW:') + mnem(word)),
+          slowArm(p, C, instrPtr, opsIdx, exitDepth + 1, slow, rt, preFlush),
+        [OP.end],
+        fastBytes);
+    }
     return [].concat(
-      addrBytes,
-      [OP.local_get, L_ADDR, OP.i32_const, 0x10, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl],
-      [OP.i32_load, 0x02], leb(tableBase),
-      [OP.i32_const], sleb(cmpVal), [OP.i32_eq],
+      addrBytes, tblCheck(tableBase, cmpVal, true),
       [OP.if_, OP.void_],
         fastBytes,
       [OP.else_],
@@ -826,6 +1064,15 @@
   // page block instr at (a&0xFFF)/4 has ops != NOTCOMPILED, mark the page
   // invalid; blocks[x] dereferenced only under invalid_code[x]==0.
   function checkMemoryBytes(p) {
+    if (COLD) {
+      // the code-page probe (ops != NOTCOMPILED) is a call to the module's helper (chkHelper)
+      return [].concat(
+        [OP.local_get, L_ADDR, OP.i32_const, 0x0C, OP.i32_shr_u],
+        [OP.i32_load8_u, 0x00], leb(p.invalidCode),
+        [OP.i32_eqz, OP.if_, OP.void_],
+          [OP.local_get, L_ADDR, OP.call], leb(CHK_FN),
+        [OP.end]);
+    }
     return [].concat(
       [OP.local_get, L_ADDR, OP.i32_const, 0x0C, OP.i32_shr_u],
       [OP.i32_load8_u, 0x00], leb(p.invalidCode),
@@ -842,6 +1089,61 @@
         [OP.end],
       [OP.end]
     );
+  }
+
+  // ---- JUMP_TO IN-MODULE (2026-10-03) ----
+  // Every _OUT exit (JAL / J / JR to another page, a register jump) stored the target in
+  // jump_to_address and called the core's jump_to_func through the table — ~15k calls in a
+  // heavy MK64 field, jump_to_func + update_invalid_addr 4.2% of the field in a profile. The
+  // common case is a few loads, so the module does it itself, in one helper (type (i32)->(),
+  // the target): for a KSEG0/KSEG1 target with skip_jump clear it runs update_invalid_addr's
+  // two mirror lines, and when the page is valid sets actual = blocks[page] and
+  // PC = actual->block + ((addr - actual->start) >> 2) — exactly the statements of
+  // jump_to_func (cached_interp.c) on that path, in the same order. Everything else (skip_jump
+  // set, a TLB-mapped target, a page to (re)initialise) calls jump_to_func as before, which
+  // repeats the mirror lines harmlessly (they are idempotent) and does the rest. Needs &actual
+  // (p.actualPtr, a core that stamps 'N64L'); without it the exits call jump_to_func.
+  var JT_FN = -1;            // the helper's function index in the module being compiled, -1 = none
+  function jtHelper(p) {
+    var slow = [].concat(storeI32(p.jumpToAddr, [OP.local_get, 0x00]),
+      [OP.i32_const], sleb(p.jumpToFunc), [OP.call_indirect, 0x00, 0x00], [OP.return_]);
+    var pg = [OP.local_get, 0x00, OP.i32_const, 0x0C, OP.i32_shr_u];
+    var pgX = [OP.local_get, 0x00, OP.i32_const].concat(sleb(0x20000000), [OP.i32_xor, OP.i32_const, 0x0C, OP.i32_shr_u]);
+    return [0x01, 0x01, 0x7F].concat(
+      loadI32(p.skipJump),
+      [OP.local_get, 0x00, OP.i32_const], sleb(0x80000000 | 0), [OP.i32_sub, OP.i32_const], sleb(0x40000000), [OP.i32_ge_u, OP.i32_or],
+      [OP.if_, OP.void_], slow, [OP.end],
+      pg, [OP.i32_load8_u, 0x00], leb(p.invalidCode), [OP.if_, OP.void_], pgX, [OP.i32_const, 0x01, OP.i32_store8, 0x00], leb(p.invalidCode), [OP.end],
+      pgX, [OP.i32_load8_u, 0x00], leb(p.invalidCode), [OP.if_, OP.void_], pg, [OP.i32_const, 0x01, OP.i32_store8, 0x00], leb(p.invalidCode), [OP.end],
+      pg, [OP.i32_load8_u, 0x00], leb(p.invalidCode), [OP.if_, OP.void_], slow, [OP.end],
+      storeI32(p.actualPtr, [].concat(pg, [OP.i32_const, 0x02, OP.i32_shl, OP.i32_load, 0x02], leb(p.blocksBase), [OP.local_tee, 0x01])),
+      storeI32(p.pcGlobal, [].concat(
+        [OP.local_get, 0x01, OP.i32_load, 0x02, 0x00],
+        [OP.local_get, 0x00, OP.local_get, 0x01, OP.i32_load, 0x02, 0x04, OP.i32_sub, OP.i32_const, 0x02, OP.i32_shr_u],
+        [OP.i32_const], sleb(p.stride), [OP.i32_mul, OP.i32_add])),
+      [OP.end]);
+  }
+  // the bytes that do jump_to(target) at an _OUT exit: targetBytes push the i32 target
+  function jumpToBytes(p, targetBytes) {
+    if (JT_FN >= 0) return targetBytes.concat([OP.call], leb(JT_FN));
+    return storeI32(p.jumpToAddr, targetBytes).concat([OP.i32_const], sleb(p.jumpToFunc), [OP.call_indirect, 0x00, 0x00]);
+  }
+
+  // the helper's body (one i32 param: the address): CHECK_MEMORY past invalid_code[a>>12] == 0
+  var CHK_FN = 0;            // its function index in the module being compiled
+  function chkHelper(p) {
+    return [0x00].concat(
+      [OP.local_get, 0x00, OP.i32_const, 0x0C, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl],
+      [OP.i32_load, 0x02], leb(p.blocksBase),
+      [OP.i32_load, 0x02, 0x00],
+      [OP.local_get, 0x00, OP.i32_const], sleb(0xFFF), [OP.i32_and, OP.i32_const, 0x02, OP.i32_shr_u, OP.i32_const], sleb(p.stride), [OP.i32_mul, OP.i32_add],
+      [OP.i32_load, 0x02, 0x00],
+      [OP.i32_const], sleb(p.notCompiled), [OP.i32_ne],
+      [OP.if_, OP.void_],
+        [OP.local_get, 0x00, OP.i32_const, 0x0C, OP.i32_shr_u, OP.i32_const, 0x01],
+        [OP.i32_store8, 0x00], leb(p.invalidCode),
+      [OP.end],
+      [OP.end]);
   }
 
   // SW/SB/SH: fast path writes the host-endian u32 dram array with the
@@ -872,7 +1174,7 @@
     // top a bare local.get of that same not-yet-initialised local, computing
     // the effective address from 0. `ensure(rt)` hoists the load to the top,
     // and rs is now read BEFORE rt in emit-call order so it owns the prologue.
-    var addrBytes = C.read(rs).concat([OP.i32_wrap_i64, OP.i32_const], sleb(imm), [OP.i32_add, OP.local_set, L_ADDR]);
+    var addrBytes = effAddr(C, rs, imm);    // leaves the address on the stack for tblCheck
     var rtPre = C.ensure(rt);
     var shiftB = [OP.local_get, L_ADDR, OP.i32_const, 0x03, OP.i32_and, OP.i32_const, 0x03, OP.i32_xor, OP.i32_const, 0x03, OP.i32_shl];
     var shiftH = [OP.local_get, L_ADDR, OP.i32_const, 0x02, OP.i32_and, OP.i32_const, 0x02, OP.i32_xor, OP.i32_const, 0x03, OP.i32_shl];
@@ -899,10 +1201,10 @@
       var sh = isByte ? shiftB : shiftH;
       // w = dram[word]; merged = (w & ~(mask<<s)) | (((u32)rt & mask) << s)
       storeBytes = [].concat(
-        wordAddr, [OP.i32_load, 0x02], leb(p.dramBase), [OP.local_set, L_WORD],
         wordAddr,
+        wordAddr, [OP.i32_load, 0x02], leb(p.dramBase),
         // (w & ~(mask<<s))
-        [OP.local_get, L_WORD, OP.i32_const], sleb(maskC), sh, [OP.i32_shl, OP.i32_const], sleb(-1), [OP.i32_xor, OP.i32_and],
+        [OP.i32_const], sleb(maskC), sh, [OP.i32_shl, OP.i32_const], sleb(-1), [OP.i32_xor, OP.i32_and],
         // ((rt & mask) << s)
         C.read(rt), [OP.i32_wrap_i64, OP.i32_const], sleb(maskC), [OP.i32_and], sh, [OP.i32_shl],
         [OP.i32_or],
@@ -910,11 +1212,19 @@
       );
     }
     var checkMemory = checkMemoryBytes(p);
+    if (COLD) {
+      // LEAN CODE: as emitLoad — `if (table != rdram) cold; fast` (the cold arm never continues)
+      return [].concat(
+        addrBytes, rtPre, tblCheck(tableBase, cmpVal),
+        [OP.if_, OP.void_],
+          bump((slow ? 'SLOTSLOW:' : 'SLOW:') + mnem(word)),
+          slowArm(p, C, instrPtr, opsIdx, exitDepth + 1, slow, -1, undefined, true),
+        [OP.end],
+        storeBytes,
+        checkMemory);
+    }
     return [].concat(
-      addrBytes, rtPre,
-      [OP.local_get, L_ADDR, OP.i32_const, 0x10, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl],
-      [OP.i32_load, 0x02], leb(tableBase),
-      [OP.i32_const], sleb(cmpVal), [OP.i32_eq],
+      addrBytes, rtPre, tblCheck(tableBase, cmpVal, true),
       [OP.if_, OP.void_],
         storeBytes,
         checkMemory,
@@ -943,6 +1253,19 @@
   // and only then handing control to the interpreter. flushSnapshot() does not
   // mutate compile-state, so capturing it early is free and always safe.
   function cuGuard(p, C, nativeBytes, instrPtr, opsIdx, exitDepth, word, slow, preFlush) {
+    if (COLD) {
+      return [].concat(
+        loadI32(p.cp0Status), [OP.i32_const], sleb(0x20000000), [OP.i32_and],
+        [OP.if_, OP.void_],
+          nativeBytes,
+        [OP.else_],
+          coldJump([].concat(
+            bump((slow ? 'SLOTCU1MISS:' : 'CU1MISS:') + mnem(word)),
+            storeI32Const(p.pcGlobal, slow ? slow.ptr : instrPtr),
+            [OP.i32_const], sleb(slow ? slow.opsIdx : opsIdx), [OP.call_indirect, 0x00, 0x00]), exitDepth + 1, preFlush.regs),
+        [OP.end]
+      );
+    }
     return [].concat(
       loadI32(p.cp0Status), [OP.i32_const], sleb(0x20000000), [OP.i32_and],
       [OP.if_, OP.void_],
@@ -1343,8 +1666,7 @@
     var preFlush = C.flushSnapshot();
     var base = (word >>> 21) & 0x1F, ft = (word >>> 16) & 0x1F;
     var imm = sext16(word & 0xFFFF);
-    var ea = C.read(base).concat([OP.i32_wrap_i64, OP.i32_const], sleb(imm), [OP.i32_add, OP.local_set, L_ADDR]);
-    var tblIdx = [OP.local_get, L_ADDR, OP.i32_const, 0x10, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl];
+    var ea = effAddr(C, base, imm);          // leaves the address on the stack for tblCheck
     var wordOff = [OP.local_get, L_ADDR, OP.i32_const].concat(sleb(0xFFFFFC), [OP.i32_and]);
     var word4Off = [OP.local_get, L_ADDR, OP.i32_const, 0x04, OP.i32_add, OP.i32_const].concat(sleb(0xFFFFFC), [OP.i32_and]);
     var fast, tableBase, cmpVal;
@@ -1368,10 +1690,17 @@
         word4Off, [OP.local_get].concat(leb(L_I64S), [OP.i32_wrap_i64]), [OP.i32_store, 0x02], leb(p.dramBase),
         checkMemoryBytes(p));
     }
-    var nat = [].concat(
-      ea,
-      tblIdx, [OP.i32_load, 0x02], leb(tableBase),
-      [OP.i32_const], sleb(cmpVal), [OP.i32_eq],
+    var nat = COLD
+      // LEAN CODE: as emitLoad — `if (table != rdram) cold; fast` (the cold arm never continues)
+      ? [].concat(
+          ea, tblCheck(tableBase, cmpVal),
+          [OP.if_, OP.void_],
+            bump((slow ? 'SLOTSLOW:' : 'SLOW:') + mnem(word)),
+            slowArm(p, C, instrPtr, opsIdx, exitDepth + 2, slow, -1, undefined, op === 0x39 || op === 0x3D), // inside cu-if + this if
+          [OP.end],
+          fast)
+      : [].concat(
+      ea, tblCheck(tableBase, cmpVal, true),
       [OP.if_, OP.void_],
         fast,
       [OP.else_],
@@ -1463,12 +1792,355 @@
   // MK64 race window under a 4x throttle (110 compiles in 700 frames).
   function app(dst, src) { for (var q = 0; q < src.length; q++) dst.push(src[q]); }
 
+  // ---- COMPILE BUDGET (2026-10-02) ----
+  // A scene load asks for hundreds of new spans inside one field; on the
+  // user's phone (Mali-G715, ?costdbg=1) a single field then spent 80-325 ms
+  // compiling, and the field IS the frame. So at most JIT_BUDGET spans are
+  // emitted and compiled per field (cache hits do not count); the rest stay on
+  // the cached interpreter for now and are QUEUED. At the end of every
+  // retro_run (libretronew.c calls frameEnd) the budget is refilled and the
+  // queue is compiled oldest first, again at most JIT_BUDGET.
+  // Deterministic: the budget counts spans, never time, so every console
+  // defers the same requests at the same points. And exact either way: a
+  // compiled span and the interpreter it replaces are the same machine (the
+  // hashed 27-ROM sweeps), and a queued span is only installed if its entry
+  // still holds the very interpreter op it held when offered, in the same
+  // valid page — compileSpan then compiles the words in memory NOW, with the
+  // recompile key computed from them, so a page that changed meanwhile is
+  // compiled as it is (or, if it was invalidated, left to NOTCOMPILED).
+  // ?jitbudget=N sets it (published by fbasync.js in both realms); 0 = no
+  // budget, the old behaviour, and the A/B arm.
+  var JIT_BUDGET = null, budgetLeft = 0, deferQ = [], deferSet = new Set(), draining = false;
+  function jitBudget() {
+    if (JIT_BUDGET === null) {
+      var g = (typeof globalThis !== 'undefined') ? globalThis : self, f = g.__fbAsync;
+      JIT_BUDGET = (f && typeof f.jitBudget === 'number' && f.jitBudget >= 0) ? f.jitBudget : 6;
+      budgetLeft = JIT_BUDGET;
+    }
+    return JIT_BUDGET;
+  }
+  function frameEnd() {
+    ASYNC.frameEnds++;
+    if (ASYNC.ready.length) asyncInstallReady();
+    asyncFlush();
+    if (!jitBudget()) return;
+    budgetLeft = JIT_BUDGET;
+    var M = (typeof globalThis !== 'undefined' ? globalThis : self).Module;
+    if (!deferQ.length || !M) return;
+    var U = M.HEAPU32;
+    draining = true;
+    try {
+      while (deferQ.length && budgetLeft > 0) {
+        var d = deferQ.shift(); deferSet.delete(d.p.entryPtr);
+        var p = d.p, page = (p.vaddr >>> 12);
+        // the same page, still valid, its entry still the interpreter op it was
+        var bp = U[(p.blocksBase >> 2) + page];
+        if (!bp || U[bp >> 2] !== d.blk || U[(bp >> 2) + 1] !== (p.blockStart >>> 0) || U[(bp >> 2) + 2] !== (p.blockEnd >>> 0)) { stats.deferStale = (stats.deferStale || 0) + 1; continue; }
+        if (M.HEAPU8[p.invalidCode + page]) { stats.deferStale = (stats.deferStale || 0) + 1; continue; }
+        if (U[p.entryPtr >> 2] !== d.op || d.op === p.notCompiled) { stats.deferStale = (stats.deferStale || 0) + 1; continue; }
+        var idx = compileSpan(p, M);
+        if (idx > 0 && U[p.entryPtr >> 2] === d.op) { U[p.entryPtr >> 2] = idx; stats.deferInstalled = (stats.deferInstalled || 0) + 1; }
+      }
+    } finally { draining = false; }
+  }
+
+  // ---- OFF-THREAD EMISSION (2026-10-03) ----
+  // Where a span's compile time goes, measured in the MK64 boot+race window
+  // (n64/tools/n64_field_cost_probe.mjs, HEAD, this box): 1591 compiles took
+  // 5265 ms in the core's thread, of which the WebAssembly.Module compile was
+  // 460 ms and instantiation 92 ms — the other ~90% is THIS FILE's JS building
+  // the bytes. A budget can spread that but not remove it (one big span is
+  // tens of ms by itself on a phone). So the bytes are built in a second worker
+  // (jit_compile_worker.js runs this same file with EMIT_ONLY set): the core's
+  // thread copies the span's inputs — the 4 KB page's words and the span's
+  // precomp ops fields, which is everything compileSpan bakes into a module
+  // (see RECOMPILE CACHE below) — posts them, and returns 0, so the span runs
+  // on the cached interpreter meanwhile. The compiled module comes back as a
+  // WebAssembly.Module and is installed at the next field end (frameEnd), and
+  // only if every input it was built from still holds: the page's words, every
+  // ops field (init_block resets them to NOTCOMPILED on invalidation), the
+  // page's precomp block (same array, same bounds), and the page still valid.
+  // Exact: the module is the one compileSpan would have built from the same
+  // words in this thread (the same function runs on a copy of them; a read
+  // outside the copy fails the job instead of guessing), and a compiled span
+  // and the interpreter it replaces are the same machine — the property
+  // rollback's re-simulation already rests on (the code cache is kept across
+  // a state load), proven by the differential harness and the rollback probe.
+  // So WHEN a module lands moves time only, never what the guest computes.
+  // Off: ?jitasync=0 (published by fbasync.js in both realms), census mode,
+  // no Worker, or a core that never calls frameEnd — then the per-field budget
+  // above applies.
+  var EMIT_ONLY = null;          // set in the compile worker: compileSpan stops after emitting
+  var TABLE_BASE = 0;            // the core's table length before any JIT slot (see NO COMPILED CODE UNDER A SPAN)
+  var ASYNC = { on: null, w: null, nextId: 1, pending: new Map(), ready: [], outbox: [], frameEnds: 0, M: null,
+                offered: 0, installed: 0, stale: 0, failed: 0, maxInstallMs: 0, reoffered: 0, retry: 0, modules: 0 };
+  function asyncOn(Module) {
+    if (EMIT_ONLY) return false;
+    if (ASYNC.on === false) return false;
+    if (!ASYNC.frameEnds) return false;          // this core calls frameEnd: installs can happen
+    if (ASYNC.on === true) return true;
+    var g = (typeof globalThis !== 'undefined') ? globalThis : self, f = g.__fbAsync;
+    if ((f && f.jitAsync === false) || census.on || typeof Worker !== 'function' || typeof g.__n64JitWorkerUrl !== 'string') { ASYNC.on = false; return false; }
+    try {
+      ASYNC.w = new Worker(g.__n64JitWorkerUrl);
+      ASYNC.w.onmessage = function (e) {
+        var d = e.data, list = Array.isArray(d) ? d : [d];
+        for (var k = 0; k < list.length; k++) {
+          var x = list[k];
+          if (x && x.batch) {
+            // one module for the whole batch: every item points at the shared holder
+            var Bh = { mod: x.mod || null, bytes: x.bytes || null, inst: null };
+            for (var q = 0; q < x.items.length; q++) { if (x.items[q].ok) x.items[q].B = Bh; ASYNC.ready.push(x.items[q]); }
+          } else ASYNC.ready.push(x);
+        }
+      };
+      ASYNC.w.onerror = function (e) {
+        // a worker that fails leaves everything it was asked for on the interpreter;
+        // from now on spans compile in this thread again
+        ASYNC.on = false; ASYNC.pending.clear(); stats.asyncWorkerError = String((e && e.message) || e).slice(0, 160);
+      };
+      ASYNC.M = Module;
+      ASYNC.on = true;
+    } catch (e) { ASYNC.on = false; stats.asyncWorkerError = String((e && e.message) || e).slice(0, 160); }
+    return ASYNC.on;
+  }
+  function jitFlags() {
+    return { noFP: !!(typeof window !== 'undefined' && window.__jitNoFP), noLabels: !!(typeof window !== 'undefined' && window.__jitNoLabels),
+             pin: pinOn(), cold: coldOn(), chain: chainOn() };
+  }
+  function asyncOffer(p, U, span, pageW0, pageN, keyArr) {
+    var page = p.vaddr >>> 12, bp = U[(p.blocksBase >> 2) + page];
+    var nOps = span + 2, ops = new Uint32Array(nOps);
+    for (var k = 0; k < nOps; k++) ops[k] = U[(p.entryPtr + k * p.stride) >> 2];
+    var words = U.slice(pageW0, pageW0 + pageN + 1);    // the page, and the word after it
+    var id = ASYNC.nextId++;
+    var job = { id: id, p: Object.assign({}, p), w0: pageW0, words: words, ops: ops, flags: jitFlags(), tableBase: TABLE_BASE };
+    ASYNC.pending.set(id, { p: job.p, w0: pageW0, words: words, ops: ops, bp: bp, blk: bp ? U[bp >> 2] : 0, keyArr: keyArr, tries: ASYNC.retry | 0 });
+    // batched: one message per field end (or per 32 offers) — a scene load offers hundreds
+    // of spans inside one field, and a message each cost more than the copy itself
+    ASYNC.outbox.push(job);
+    if (ASYNC.outbox.length >= 32) asyncFlush();
+    ASYNC.offered++;
+  }
+  function asyncFlush() {
+    if (!ASYNC.outbox.length || !ASYNC.w) return;
+    var b = ASYNC.outbox; ASYNC.outbox = [];
+    ASYNC.w.postMessage(b);
+  }
+  function asyncStale(why) { var w = ASYNC.staleWhy || (ASYNC.staleWhy = {}); w[why] = (w[why] | 0) + 1; return false; }
+  // r.maxW / r.maxO: the furthest word / ops field the emitter read (everything it baked in)
+  function asyncStillHolds(M, j, r) {
+    var U = M.HEAPU32, p = j.p, page = p.vaddr >>> 12, k;
+    var nw = (r && r.maxW >= 0) ? r.maxW + 1 : j.words.length, no = (r && r.maxO >= 0) ? r.maxO + 1 : j.ops.length;
+    // the ops of the span's own entries (j.ops holds span + 2): the one after the span is read
+    // only by the null-ops refusal, never baked — it is typically NOTCOMPILED when offered and
+    // compiled by the time the module lands, which made 309 of 314 MK64 race spans stale
+    if (no > j.ops.length - 2) no = j.ops.length - 2;
+    if (M.HEAPU8[p.invalidCode + page]) return asyncStale('invalid');
+    var bp = U[(p.blocksBase >> 2) + page];
+    if (!bp || bp !== j.bp || U[bp >> 2] !== j.blk || U[(bp >> 2) + 1] !== (p.blockStart >>> 0) || U[(bp >> 2) + 2] !== (p.blockEnd >>> 0)) return asyncStale('block');
+    for (k = 0; k < nw; k++) if (U[j.w0 + k] !== j.words[k]) return asyncStale(k === j.words.length - 1 ? 'wordAfterPage' : 'words');
+    // An instruction of the span whose op is now a JIT slot (another span's entry or label,
+    // installed since — overlapping spans of one page) is fine: this module's fallback there
+    // calls the interpreter op it was built with, which is what a span compiled before that
+    // install (the synchronous path) does.
+    for (k = 0; k < no; k++) {
+      var cur = U[(p.entryPtr + k * p.stride) >> 2];
+      if (cur === j.ops[k]) continue;
+      if (k > 0 && TABLE_BASE && cur >= TABLE_BASE && j.ops[k] < TABLE_BASE) continue;
+      return asyncStale(k === 0 ? 'entryOp' : 'ops');
+    }
+    return true;
+  }
+  function asyncInstallReady() {
+    var M = ASYNC.M || ((typeof globalThis !== 'undefined' ? globalThis : self).Module);
+    var t0 = (typeof performance !== 'undefined') ? performance.now() : 0;
+    // at most ~2 ms of installing per field end (an instantiate is ~0.05-0.1 ms here; a scene
+    // load can bring back hundreds at once): the rest waits for the next field end
+    var q = ASYNC.ready, i;
+    for (i = 0; i < q.length; i++) {
+      if (t0 && i > 0 && (i & 7) === 0 && performance.now() - t0 > 2) break;
+      var r = q[i], j = ASYNC.pending.get(r.id);
+      if (!j) continue;
+      ASYNC.pending.delete(r.id);
+      if (!r.ok) { ASYNC.failed++; if (r.err && !stats.asyncLastErr) stats.asyncLastErr = r.err; continue; }
+      if (!asyncStillHolds(M, j, r)) {
+        ASYNC.stale++;
+        // The page is still valid and the entry still holds the interpreter op it was offered
+        // with, but a word or ops field it was built from moved (a data word in a code page):
+        // offer it again from memory as it is NOW, as a recompile would. Otherwise it would stay
+        // on the interpreter until the page happened to be recompiled.
+        var pv = j.p, U0 = M.HEAPU32;
+        if (!M.HEAPU8[pv.invalidCode + (pv.vaddr >>> 12)] && U0[pv.entryPtr >> 2] === j.ops[0] && (j.tries | 0) < 3) {
+          ASYNC.reoffered++;
+          ASYNC.retry = j.tries ? j.tries + 1 : 1;
+          var ri = compileSpan(pv, M);
+          ASYNC.retry = 0;
+          if (ri > 0 && U0[pv.entryPtr >> 2] === j.ops[0]) U0[pv.entryPtr >> 2] = ri;   // a cache hit: installed at once
+        }
+        continue;
+      }
+      try {
+        var fns = [], wk;
+        if (r.B) {
+          // a batched module: instantiated once, at its first install
+          var Bh = r.B;
+          if (!Bh.inst) {
+            Bh.inst = new WebAssembly.Instance(Bh.mod || new WebAssembly.Module(Bh.bytes), { e: { t: M.wasmTable, m: M.wasmMemory } });
+            ASYNC.modules++;
+          }
+          fns.push(Bh.inst.exports['s' + r.k]);
+          // LABELS BY PC (nfn 1): every label's slot holds the body itself
+          for (wk = 1; wk < r.labels.length; wk++) fns.push(r.nfn === 1 ? fns[0] : Bh.inst.exports['s' + r.k + '_' + wk]);
+        } else {
+          var mod = r.mod || new WebAssembly.Module(r.bytes);
+          var inst = new WebAssembly.Instance(mod, { e: { t: M.wasmTable, m: M.wasmMemory, c: censusBump } });
+          ASYNC.modules++;
+          fns.push(inst.exports.f);
+          for (wk = 1; wk < r.labels.length; wk++) fns.push(inst.exports['f' + wk] || fns[0]);   // no wrapper: LABELS BY PC
+        }
+        var p = j.p, U = M.HEAPU32;
+        U[p.entryPtr >> 2] = installSlot(M, p.vaddr >>> 0, fns[0]);   // what recomp.c does with a nonzero return
+        for (wk = 1; wk < r.labels.length; wk++) {
+          var lptr = p.entryPtr + r.labels[wk] * p.stride;
+          if (U[lptr >> 2] !== r.labelOps[wk]) continue;
+          U[lptr >> 2] = installSlot(M, (p.vaddr + r.labels[wk] * 4) >>> 0, fns[wk]);
+          stats.labelEntries = (stats.labelEntries || 0) + 1;
+        }
+        stats.blocks++;
+        cachePut(j.keyArr, fns, r.labels, r.labelOps);
+        ASYNC.installed++;
+      } catch (e) {
+        ASYNC.failed++; stats.fails++;
+        if (stats.fails <= 3) console.error('[bementalJIT] async install failed:', e, 'vaddr', (j.p.vaddr >>> 0).toString(16));
+      }
+    }
+    ASYNC.ready = q.slice(i);           // (no message can arrive during this loop)
+    if (t0) { var d = performance.now() - t0; if (d > ASYNC.maxInstallMs) ASYNC.maxInstallMs = d; }
+  }
+  // the compile worker's side: run compileSpan on a copy of the inputs
+  function emitJob(job, batchCtx) {
+    var p = job.p, miss = 0, w0 = job.w0, words = job.words, ops = job.ops, base = p.entryPtr >>> 0, stride = p.stride;
+    var maxW = -1, maxO = -1;                 // the furthest copied word / ops field it read
+    var H = new Proxy({}, { get: function (t, key) {
+      var i = +key;
+      if (i !== i) return undefined;
+      var wi = i - w0;
+      if (wi >= 0 && wi < words.length) { if (wi > maxW) maxW = wi; return words[wi]; }
+      var off = i * 4 - base;
+      if (off >= 0 && off % stride === 0 && off / stride < ops.length) { if (off / stride > maxO) maxO = off / stride; return ops[off / stride]; }
+      miss++;
+      return 0;
+    } });
+    window.__jitNoFP = job.flags.noFP; window.__jitNoLabels = job.flags.noLabels; window.__jitPin = job.flags.pin;
+    EMIT_ONLY = { out: null, tableBase: job.tableBase | 0, cold: job.flags.cold !== false, chain: job.flags.chain === true,
+                  batch: !!batchCtx, fnBase: batchCtx ? batchCtx.fnBase : 0, jt: !!(batchCtx && batchCtx.jt), part: null };
+    TABLE_BASE = job.tableBase | 0;
+    var idx = 0;
+    // FAST EMIT: compileSpan reads the page and the span's ops straight from the copies where it can
+    var fast = { words: words, w0: w0, ops: ops, base: base,
+                 seen: function (w, o) { if (w > maxW) maxW = w; if (o > maxO) maxO = o; } };
+    try { idx = compileSpan(p, { HEAPU32: H, fast: fast }); } catch (e) { return { id: job.id, ok: false, err: String((e && e.message) || e).slice(0, 200) }; }
+    var out = EMIT_ONLY.out, part = EMIT_ONLY.part;
+    EMIT_ONLY = null;
+    if (batchCtx) {
+      if (!idx || !part) return { id: job.id, ok: false, err: idx ? 'no module' : 'refused' };
+      if (miss) return { id: job.id, ok: false, err: 'read outside the copied inputs (' + miss + ')' };
+      return { id: job.id, ok: true, part: part, labels: part.labels, labelOps: part.labelOps, nfn: part.nfn, maxW: maxW, maxO: maxO };
+    }
+    if (!idx || !out) return { id: job.id, ok: false, err: idx ? 'no module' : 'refused' };
+    if (miss) return { id: job.id, ok: false, err: 'read outside the copied inputs (' + miss + ')' };
+    return { id: job.id, ok: true, bytes: out.bytes, labels: out.labels, labelOps: out.labelOps, maxW: maxW, maxO: maxO };
+  }
+  // ---- BATCHED MODULES (2026-10-03) ----
+  // WHY. One wasm module per span made the MK64 race a chain of ~1660 modules, and calling
+  // across MANY DISTINCT MODULES is what is slow — not the code inside them. Measured with a
+  // wasm dispatcher (the r4300_step shape) chaining 21-instruction emitted spans (the MK64
+  // race's mean: ~19k JIT dispatches for ~400k instructions in a heavy field): 1600 spans in
+  // 1600 modules ran 23-25 ns per guest instruction (~500 ns per dispatch) — the race's own
+  // 15-19 ns — against 1.1 ns for 4000 instances of ONE module, and 10 ns for the same 1600
+  // spans as functions of ONE module. Each V8 module is its own code space and jump table, so
+  // every dispatch into a new module lands on new pages.
+  // WHAT. The compile worker receives offers in batches (asyncFlush: up to 32, or every field
+  // end) and now emits each batch as ONE module: one shared CHECK_MEMORY helper (function 0),
+  // then every span's body and label wrappers, one global (the multi-entry segment hand-off —
+  // a wrapper sets it and its body consumes it at entry, so spans can share it), exports
+  // "s<k>" / "s<k>_<w>". Each span is still validated and installed on its own
+  // (asyncStillHolds): a stale span's functions are simply never installed. The code is byte
+  // for byte what the span's own module held, but for function indices.
+  function emitBatch(jobs) {
+    // JUMP_TO IN-MODULE: the batch's helper sits at function 1 when the core gave &actual
+    var jt = !!(jobs.length && jobs[0].p.actualPtr);
+    var items = [], parts = [], fnBase = jt ? 2 : 1, p0 = null, t0 = (typeof performance !== 'undefined') ? performance.now() : 0;
+    for (var bj = 0; bj < jobs.length; bj++) {
+      var job = jobs[bj];
+      if (!!job.p.actualPtr !== jt) { items.push({ id: job.id, ok: false, err: 'mixed &actual in one batch' }); continue; }
+      var r = emitJob(job, { batch: true, fnBase: fnBase, jt: jt });
+      if (!r.ok) { items.push(r); continue; }
+      r.k = parts.length;
+      parts.push({ fnBase: fnBase, part: r.part });
+      fnBase += r.part.funcs.length;
+      if (!p0) p0 = job.p;
+      delete r.part;
+      items.push(r);
+    }
+    if (!parts.length) return { batch: true, items: items, bytes: null };
+    var funcs = jt ? [chkHelper(p0), jtHelper(p0)] : [chkHelper(p0)], types = jt ? [1, 1] : [1], k, w;
+    for (k = 0; k < parts.length; k++) for (w = 0; w < parts[k].part.funcs.length; w++) { funcs.push(parts[k].part.funcs[w]); types.push(parts[k].part.types[w]); }
+    var exps = [], nExp = 0;
+    var name = function (t) { var a = t.split('').map(function (ch) { return ch.charCodeAt(0); }); return leb(a.length).concat(a); };
+    // every list is built in place: a batch is ~100 KB of code, and concat-per-item is quadratic
+    for (k = 0; k < parts.length; k++) {
+      var fb = parts[k].fnBase, nf = parts[k].part.nfn;   // the body and its wrappers, if any (not the cold handlers)
+      app(exps, name('s' + k)); exps.push(0x00); app(exps, leb(fb)); nExp++;
+      for (w = 1; w < nf; w++) { app(exps, name('s' + k + '_' + w)); exps.push(0x00); app(exps, leb(fb + w)); nExp++; }
+    }
+    var fdecl = leb(funcs.length);
+    for (k = 0; k < types.length; k++) app(fdecl, leb(types[k]));
+    // FAST EMIT: the code section is the functions' own arrays, written once into the module
+    var code = [leb(funcs.length)];
+    for (k = 0; k < funcs.length; k++) { code.push(leb(funcs[k].length)); code.push(funcs[k]); }
+    var bytes = packModule([[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00],
+      TYPE_SEC,
+      section(2, [].concat(leb(2), [1, 0x65, 1, 0x74, 0x01, 0x70, 0x00, 0x00], [1, 0x65, 1, 0x6D, 0x02, 0x00, 0x00])),
+      section(3, fdecl),
+      section(6, [0x01, 0x7F, 0x01, OP.i32_const, 0x00, OP.end]),
+      { id: 7, chunks: [leb(nExp), exps] },
+      { id: 10, chunks: code }]);
+    return { batch: true, items: items, bytes: bytes, spans: parts.length, ms: t0 ? performance.now() - t0 : 0 };
+  }
+  function installSlot(Module, vkey, fn) {
+    var sidx = slotByVaddr[vkey];
+    if (sidx !== undefined) {
+      Module.wasmTable.set(sidx, fn);
+      stats.slotReuses++;
+    } else {
+      sidx = Module.wasmTable.length;
+      Module.wasmTable.grow(1);
+      Module.wasmTable.set(sidx, fn);
+      slotByVaddr[vkey] = sidx;
+      stats.distinctSlots++;
+    }
+    return sidx;
+  }
+  // fns: the span's entry function and its label wrappers, in label order
+  function cachePut(keyArr, fns, labels, labelOps) {
+    var kh = 0x811c9dc5 | 0;
+    for (var kq = 0; kq < keyArr.length; kq++) kh = Math.imul(kh ^ keyArr[kq], 16777619);
+    if (spanCacheN >= SPAN_CACHE_MAX) { spanCache.clear(); spanCacheN = 0; }
+    var nb = spanCache.get(kh);
+    if (!nb) { nb = []; spanCache.set(kh, nb); }
+    nb.push({ key: keyArr, fns: fns, labels: labels, labelOps: labelOps });
+    spanCacheN++;
+  }
+
   function compileSpan(p, Module) {
     // resolved once, on the first compile — the page sets window.__jitCensus
     // before loading this script, and it must stay constant for the session
     // (it decides each module's import/type shape)
     if (census.on === null) census.on = !!(typeof window !== 'undefined' && window.__jitCensus);
     RAW = 0;
+    COLD = null;
     var HEAPU32 = Module.HEAPU32;
     var C = new RegCache(p.reg);
     p.regBase = p.reg;
@@ -1550,6 +2222,31 @@
         return 0;
       }
     }
+    // ---- NO COMPILED CODE UNDER A SPAN (2026-10-03) ----
+    // Every fallback path bakes the op it finds in the span's precomp entries as the
+    // INTERPRETER op to call for that one instruction. recompile_block hands the bridge a
+    // page whose ops are all fresh interpreter ops, but a span compiled LATER — off-thread
+    // (OFF-THREAD EMISSION re-offers a span whose page moved), or drained from the budget
+    // queue — can find another span's entry or label already holding a JIT block there.
+    // Baking that would make a "one instruction" fallback run a whole block (and recurse:
+    // measured, "Maximum call stack size exceeded" from a JIT module). Interpreter ops are
+    // functions of the core's own table; JIT blocks are slots appended after it, so any op at
+    // or above the table's length at the first compile is not an interpreter op: refuse.
+    // ONLY THE SPAN'S OWN ENTRIES (2026-10-03): index `span` — the instruction after the span
+    // — is never baked into a module (a branch at span-1 is emitted as a 'span-end' fallback of
+    // its own op; the fall-through exit stores the POINTER &block[span], not its op). It is
+    // very often the entry of the NEXT function, already a JIT block, and checking it refused
+    // 177 MK64 race spans outright (every jitOpReject measured was at index == span), among
+    // them the game's hottest loops, which then ran on the cached interpreter for good.
+    if (!TABLE_BASE) TABLE_BASE = EMIT_ONLY ? (EMIT_ONLY.tableBase | 0) : (Module.wasmTable ? Module.wasmTable.length : 0);
+    if (TABLE_BASE) {
+      for (var gj = 0; gj < span; gj++) {
+        if (HEAPU32[(p.entryPtr + gj * p.stride) >> 2] >= TABLE_BASE) {
+          stats.jitOpRejects = (stats.jitOpRejects || 0) + 1;
+          return 0;
+        }
+      }
+    }
 
     // ---- MULTI-ENTRY SPANS (2026-09-30) ----
     // The core installs a JIT block as ONE instruction's ops: the span ENTRY
@@ -1608,25 +2305,38 @@
     // key is exactly that, compared IN FULL on a hit (the hash only picks the
     // bucket), and a hit re-installs the very same instance — identical code,
     // no byte generation, no wasm compile.
-    var keyLen = 6 + pageN + span + 1;
+    // (the ops of the span's own entries only: index `span` is not baked — see above)
+    var keyLen = 6 + pageN + span;
     var keyArr = new Uint32Array(keyLen);
     keyArr[0] = p.vaddr >>> 0; keyArr[1] = p.entryPtr >>> 0; keyArr[2] = span; keyArr[3] = p.blockStart >>> 0;
     keyArr[4] = p.blockEnd >>> 0; keyArr[5] = p.srcPtr >>> 0;
     var kh = 0x811c9dc5 | 0, kq;
-    for (kq = 0; kq < pageN; kq++) keyArr[6 + kq] = HEAPU32[pageW0 + kq];
-    for (kq = 0; kq <= span; kq++) keyArr[6 + pageN + kq] = HEAPU32[(p.entryPtr + kq * p.stride) >> 2];
-    for (kq = 0; kq < keyLen; kq++) kh = Math.imul(kh ^ keyArr[kq], 16777619);
-    var bucket = spanCache.get(kh);
+    // FAST EMIT: in the compile worker HEAPU32 is a Proxy over the copied inputs (emitJob), and
+    // these two loops (the whole page, every span op) went through its trap per word. When the
+    // copies cover both ranges they are read directly — the same words, the same furthest-read
+    // marks (Module.fast.seen) — and otherwise through HEAPU32 as before.
+    var FP = Module.fast, fw = FP ? pageW0 - FP.w0 : -1;
+    if (FP && fw >= 0 && fw + pageN <= FP.words.length && (p.entryPtr >>> 0) === FP.base && span <= FP.ops.length &&
+        (((p.entryPtr >>> 2) - FP.w0) >= FP.words.length || (((p.entryPtr + (span - 1) * p.stride) >>> 2) - FP.w0) < 0)) {
+      for (kq = 0; kq < pageN; kq++) keyArr[6 + kq] = FP.words[fw + kq];
+      for (kq = 0; kq < span; kq++) keyArr[6 + pageN + kq] = FP.ops[kq];
+      FP.seen(pageN ? fw + pageN - 1 : -1, span - 1);
+    } else {
+      for (kq = 0; kq < pageN; kq++) keyArr[6 + kq] = HEAPU32[pageW0 + kq];
+      for (kq = 0; kq < span; kq++) keyArr[6 + pageN + kq] = HEAPU32[(p.entryPtr + kq * p.stride) >> 2];
+    }
+    kh = keyHash(keyArr, keyLen);
+    var bucket = EMIT_ONLY ? null : spanCache.get(kh);
     if (bucket) {
       for (var bi = 0; bi < bucket.length; bi++) {
         var ce = bucket[bi], same = ce.key.length === keyLen;
         for (kq = 0; same && kq < keyLen; kq++) same = ce.key[kq] === keyArr[kq];
         if (!same) continue;
-        var hidx = installSlot(p.vaddr >>> 0, ce.inst.exports.f);
+        var hidx = installSlot(Module, p.vaddr >>> 0, ce.fns[0]);
         for (var hk = 1; hk < ce.labels.length; hk++) {
           var hptr = p.entryPtr + ce.labels[hk] * p.stride;
           if (HEAPU32[hptr >> 2] !== ce.labelOps[hk]) continue;
-          HEAPU32[hptr >> 2] = installSlot((p.vaddr + ce.labels[hk] * 4) >>> 0, ce.inst.exports['f' + hk]);
+          HEAPU32[hptr >> 2] = installSlot(Module, (p.vaddr + ce.labels[hk] * 4) >>> 0, ce.fns[hk]);
           stats.labelEntries = (stats.labelEntries || 0) + 1;
         }
         stats.cacheHits = (stats.cacheHits || 0) + 1;
@@ -1634,8 +2344,28 @@
       }
     }
 
+    // built off this thread (OFF-THREAD EMISSION above): the interpreter runs it meanwhile
+    if (!draining && asyncOn(Module)) {
+      asyncOffer(p, HEAPU32, span, pageW0, pageN, keyArr);
+      stats.asyncOffered = (stats.asyncOffered || 0) + 1;
+      return 0;
+    }
+    // over this field's compile budget: run it on the interpreter, compile later
+    if (!EMIT_ONLY && jitBudget() && !draining) {
+      if (budgetLeft <= 0) {
+        if (!deferSet.has(p.entryPtr) && deferQ.length < 4096) {
+          var pageBp = HEAPU32[(p.blocksBase >> 2) + (p.vaddr >>> 12)];
+          deferQ.push({ p: Object.assign({}, p), op: HEAPU32[p.entryPtr >> 2], blk: pageBp ? HEAPU32[pageBp >> 2] : 0 });
+          deferSet.add(p.entryPtr);
+        }
+        stats.deferred = (stats.deferred || 0) + 1;
+        return 0;
+      }
+      budgetLeft--;
+    } else if (draining) budgetLeft--;
+
     for (var li = 0; li < pageN; li++) {
-      var lw = HEAPU32[pageW0 + li];
+      var lw = keyArr[6 + li];             // = HEAPU32[pageW0 + li], read just above (FAST EMIT)
       var la = (pageA0 + li * 4) >>> 0;
       var ld0 = decodeBranch(lw, la, p);
       if (!ld0) continue;
@@ -1684,7 +2414,7 @@
     // 27-ROM hashed sweep, but its matched pairs on MK64 were inside the rig's
     // noise (4x CPU: 0.979 and 1.056 against the unpinned emitter, opposite
     // signs) — so it does not ship on until a quiet-box pair shows a gain.
-    if (typeof window !== 'undefined' && window.__jitPin) {
+    if (pinOn()) {
       var refs = new Int32Array(32);
       for (var pb = 0; pb + 1 < span; pb++) {
         var pd = decodeBranch(HEAPU32[srcW + pb], (p.vaddr + pb * 4) >>> 0, p);
@@ -1706,6 +2436,19 @@
       stats.pinnedBlocks = (stats.pinnedBlocks || 0) + 1;
       stats.pinnedRegs = (stats.pinnedRegs || 0) + nPins;
     }
+    // COLD PATHS: handlers collected while the body is emitted; the helper sits after the
+    // body function and its label wrappers
+    COLD = coldOn() ? [] : null;
+    // LABELS BY PC (with cold paths): no wrapper functions — see the multi-entry dispatch below
+    var PCL = !!COLD && nSeg > 1;
+    var NFN = COLD ? 1 : nSeg;          // the span's own functions: the body (and, without PCL, its wrappers)
+    CHAIN = chainOn(); p_chain = p;
+    CHK_FN = (EMIT_ONLY && EMIT_ONLY.batch) ? 0 : (census.on ? 1 : 0) + NFN;   // a batch module puts the helper first
+    // JUMP_TO IN-MODULE: a batch module that has the helper puts it second (emitBatch decides
+    // for the batch); a module of its own has it after CHK_FN, with cold paths on only
+    JT_FN = (EMIT_ONLY && EMIT_ONLY.batch) ? (EMIT_ONLY.jt ? 1 : -1) : ((COLD && p.actualPtr) ? CHK_FN + 1 : -1);
+    // cold handlers follow the span's own functions (and, in a module of its own, the helpers)
+    COLD_FN0 = (EMIT_ONLY && EMIT_ONLY.batch) ? EMIT_ONLY.fnBase + NFN : CHK_FN + (JT_FN >= 0 ? 2 : 1);
     var seg = 0;
     EXIT = nSeg; TOP = nSeg - 1;       // segment 0's depths (1 / 0 when nSeg == 1)
     var closedSegs = 0;
@@ -1756,9 +2499,11 @@
           // an over-reporting one is worse than none: restore them around the
           // probe and let the real emission below do the counting.
           var cvt0 = stats.nativeFPCvt, cmp0 = stats.nativeFPCmp;
+          var coldN0 = COLD ? COLD.length : 0;
           var probed = emitSlotNative(slotWord, p.entryPtr + (i + 1) * p.stride, p, probeC,
                                       HEAPU32[(p.entryPtr + (i + 1) * p.stride) >> 2], 0,
                                       { ptr: instrPtr, opsIdx: HEAPU32[instrPtr >> 2] });
+          if (COLD) COLD.length = coldN0;     // the probe's bytes are discarded: so are its handlers
           stats.nativeFPCvt = cvt0; stats.nativeFPCmp = cmp0;
           if (probed !== null) { br = dec; brOut = isOut; slotMem = true; }
           else brReason = 'slot:' + mnem(slotWord);
@@ -1782,7 +2527,16 @@
         // argument slowArm() makes for a faulting delay slot, only stronger
         // (there, the link register had already been written).
         var cu1Prefix = [];
-        if (br.cu1) {
+        if (br.cu1 && COLD) {
+          cu1Prefix = [].concat(
+            loadI32(p.cp0Status), [OP.i32_const], sleb(0x20000000), [OP.i32_and], [OP.i32_eqz],
+            [OP.if_, OP.void_],
+              coldJump([].concat(
+                bump('CU1MISS:' + mnem(word)),
+                storeI32Const(p.pcGlobal, instrPtr),
+                [OP.i32_const], sleb(HEAPU32[instrPtr >> 2]), [OP.call_indirect, 0x00, 0x00]), EXIT + 1, C.dirtyRegs()),
+            [OP.end]);
+        } else if (br.cu1) {
           cu1Prefix = [].concat(
             loadI32(p.cp0Status), [OP.i32_const], sleb(0x20000000), [OP.i32_and], [OP.i32_eqz],
             [OP.if_, OP.void_],
@@ -1817,10 +2571,10 @@
           if (tOrd > seg) return poll.concat(bump('#fwd'), [OP.br], leb(tOrd - seg - 1 + nest));
           if (tOrd >= 0) {
             return poll.concat(bump('#backedge'),
-              nSeg > 1 ? [OP.i32_const].concat(sleb(tOrd), [OP.local_set], leb(L_START)) : [],
+              nSeg > 1 ? [OP.i32_const].concat(sleb(PCL ? targetIdx : tOrd), [OP.local_set], leb(L_START)) : [],   // PCL: the dispatch is by span index
               [OP.br], leb(topD));
           }
-          return poll.concat(bump('#exit:branch'), storeI32Const(p.pcGlobal, targetPtr), [OP.br], leb(exitD));
+          return poll.concat(bump('#exit:branch'), storeI32Const(p.pcGlobal, targetPtr), chainOr(exitD));
         }
         // delay-slot bytes at a given $exit depth. ALU slots emit inline as
         // before; memory/FP slots emit their native fast arm and bail the
@@ -1833,16 +2587,11 @@
             ? emitSlotNative(slotWord2, slotPtr, p, Cx, slotOpsIdx, exitD, slowSpec)
             : emitAlu(slotWord2, Cx);
         }
+        // skip_jump is tested ONCE, at the block's entry (SKIP_JUMP AT ENTRY, at the delay-slot
+        // guard below): it cannot change while native code runs, so every native branch is a
+        // plain taken tail. (The name is kept for the three call sites.)
         function skipJumpSplit(Cx, exitD, topD) {
-          // if (skip_jump == 0) take else behave-as-not-taken-and-exit
-          return loadI32(p.skipJump).concat([OP.i32_eqz, OP.if_, OP.void_],
-            takenTail(Cx, exitD + 1, topD + 1),
-            [OP.else_],
-              emitTailPoll(p, Cx, fallAddr, fallPtr, exitD + 1),
-              bump('#exit:skip_jump'),
-              storeI32Const(p.pcGlobal, fallPtr),
-              [OP.br].concat(leb(exitD + 1)),
-            [OP.end]);
+          return takenTail(Cx, exitD, topD);
         }
         if (br.cond === null) {
           // unconditional: J/JAL/JR/JALR — capture, link, slot, count, flush, split
@@ -1861,14 +2610,18 @@
           // stack across the slot: a memory delay slot emits its own
           // if/else and can br out of the block, and stack residue across
           // those is needless risk
+          // LEAN CODE: an ALU slot is straight-line stack code (no if, no br), so there the
+          // condition simply stays on the stack underneath it — no L_COND round trip
+          var condPark = slotMem ? [OP.local_set].concat(leb(L_COND)) : [];
+          var condTake = slotMem ? [OP.local_get].concat(leb(L_COND)) : [];
           app(body, [].concat(
             cu1Prefix,
-            br.cond(C), [OP.local_set], leb(L_COND),
+            br.cond(C), condPark,
             linkBytes,
             emitSlot(C, EXIT),
             emitCountBatch(p, addr),
             C.flush(),
-            [OP.local_get], leb(L_COND),
+            condTake,
             [OP.if_, OP.void_],
               skipJumpSplit(C, EXIT + 1, TOP + 1),
             [OP.else_],
@@ -1970,7 +2723,8 @@
     app(body, [].concat(
       C.flush(),
       bump('#exit:fallthrough'),
-      storeI32Const(p.pcGlobal, p.entryPtr + span * p.stride)
+      storeI32Const(p.pcGlobal, p.entryPtr + span * p.stride),
+      CHAIN && !RAW ? chainOr(EXIT) : []
     ));
     if (C.err.readOnlyWrite >= 0) {
       stats.fails++;
@@ -2013,9 +2767,22 @@
     // instruction, so run the ENTRY instruction's ORIGINAL interpreter op and
     // return. That is exact — it is literally what `PC->ops()` would have done
     // — and it costs one i32 load per block entry.
+    // ---- SKIP_JUMP AT ENTRY (LEAN CODE, 2026-10-03) ----
+    // DECLARE_JUMP takes a branch only `if (take_jump && !skip_jump)`. skip_jump is set ONLY by an
+    // exception taken while delay_slot is set (exception.c:109,:143) and cleared ONLY by
+    // gen_interrupt (interrupt.c:596-608, which that same exception made due by zeroing
+    // next_interrupt). Native code never runs with delay_slot set (this guard), its interpreter
+    // fallbacks for non-branch ops run with delay_slot clear, and a branch op that falls back
+    // sets and clears it inside its own call (its slot's exception, then its poll). So while a
+    // block's native code runs, skip_jump holds the value it had at the block's entry — and
+    // every native branch used to re-test it (a load, a test, and a second copy of the
+    // not-taken tail laid into the hot path of EVERY branch). Tested here instead: a block
+    // entered with skip_jump set does what it does as a delay slot — runs its entry
+    // instruction's ORIGINAL interpreter op and returns — so until gen_interrupt clears it the
+    // guest advances on the interpreter, one instruction per dispatch, exactly as without a JIT.
     var entryOps = labelOps[0];
     var slotGuard = [].concat(
-      loadI32(p.delaySlot),
+      loadI32(p.delaySlot), loadI32(p.skipJump), [OP.i32_or],
       [OP.if_, OP.void_],
         // census bucket so the guard's REACH is measurable on a real ROM
         // rather than assumed — a guard that never fires and a guard that
@@ -2032,7 +2799,52 @@
     // the body reads the global into L_START and resets it to 0, so a direct
     // dispatcher call of label 0 always starts at segment 0.
     var startPro = [], dispatch = [];
-    if (nSeg > 1) {
+    var coldList = COLD;
+    if (PCL) {
+      // ---- LABELS BY PC (LEAN CODE, 2026-10-03) ----
+      // Every label used to get a WRAPPER function (its own delay-slot guard, the module global
+      // set to k, a call of the body) — ~23k tiny functions in the MK64 race, each a separate
+      // piece of machine code, and every label entry paid two prologues and two guards. The core
+      // always calls an op as `PC->ops()` (r4300_step, DECLARE_JUMP's slot, FIN_BLOCK,
+      // NOTCOMPILED, a chained exit), so the body can tell which label it was entered at from
+      // PC itself: idx = (PC - entryPtr) / stride, exactly (stride = odd << tz, so the division
+      // is a shift and a multiply by the odd part's inverse mod 2^32). Each label's table slot
+      // now holds the BODY, and its dispatch br_table is indexed by span index (backward
+      // branches set L_START to the target's index). The guard calls the entered label's own
+      // original op through a cold helper ($g, a br_table over idx). An index that is not a
+      // label cannot occur: a slot holds this body only while this span's install put it there,
+      // and only into the slots of its own entry and labels, whose op fields are the very
+      // precomp entries PC points at — it would trap rather than run the wrong code.
+      var stz = 0; while (!((p.stride >>> stz) & 1) && stz < 31) stz++;
+      var sodd = p.stride >>> stz, sinv = sodd;
+      for (var ni = 0; ni < 5; ni++) sinv = Math.imul(sinv, 2 - Math.imul(sodd, sinv));
+      var maxL = labels[nSeg - 1];
+      startPro = [].concat(loadI32(p.pcGlobal), [OP.i32_const], sleb(p.entryPtr | 0), [OP.i32_sub],
+        stz ? [OP.i32_const].concat(sleb(stz), [OP.i32_shr_u]) : [], [OP.i32_const], sleb(sinv), [OP.i32_mul],
+        [OP.local_set], leb(L_START));
+      // $g(idx): run label idx's ORIGINAL interpreter op (any other idx: none — see above)
+      var gFn = [0x00];
+      for (var gb = 0; gb < nSeg; gb++) gFn.push(OP.block, OP.void_);
+      gFn.push(OP.block, OP.void_, OP.local_get, 0x00, OP.br_table); app(gFn, leb(maxL + 1));
+      for (var gi = 0; gi <= maxL; gi++) app(gFn, leb(labelOrd[gi] >= 0 ? labelOrd[gi] + 1 : 0));
+      app(gFn, [0x00, OP.end, OP.return_]);
+      for (gb = 0; gb < nSeg; gb++) { gFn.push(OP.end); app(gFn, [OP.i32_const].concat(sleb(labelOps[gb]), [OP.call_indirect, 0x00, 0x00, OP.return_])); }
+      gFn.push(OP.end);
+      var gIdx = COLD_FN0 + coldList.length;
+      coldList.push({ raw: gFn, type: 1 });
+      slotGuard = [].concat(
+        loadI32(p.delaySlot), loadI32(p.skipJump), [OP.i32_or],
+        [OP.if_, OP.void_],
+          bump('#delayslot-entry'),
+          [OP.local_get], leb(L_START), [OP.call], leb(gIdx),
+          [OP.return_],                  // before any prologue: nothing to write back
+        [OP.end]);
+      // (block x nSeg (block $bad br_table) unreachable) — label ordinal k sits at depth k + 1
+      for (var db = 0; db <= nSeg; db++) dispatch.push(OP.block, OP.void_);
+      dispatch.push(OP.local_get); app(dispatch, leb(L_START)); dispatch.push(OP.br_table); app(dispatch, leb(maxL + 1));
+      for (var di = 0; di <= maxL; di++) app(dispatch, leb(labelOrd[di] >= 0 ? labelOrd[di] + 1 : 0));
+      app(dispatch, [0x00, OP.end, 0x00, OP.end]);   // default: $bad, then `unreachable`; the last end closes ordinal 0's block
+    } else if (nSeg > 1) {
       startPro = [OP.global_get, 0x00, OP.local_set].concat(leb(L_START), [OP.i32_const, 0x00, OP.global_set, 0x00]);
       for (var bb = 0; bb < nSeg; bb++) dispatch.push(OP.block, OP.void_);
       var tgts = [];
@@ -2041,74 +2853,82 @@
     }
 
     var LOCALS = [0x0A, 0x02, 0x7F, 0x20, 0x7E, 0x01, 0x7E, 0x01, 0x7F, 0x01, 0x7F, 0x01, 0x7D, 0x01, 0x7C, 0x01, 0x7D, 0x01, 0x7C, 0x01, 0x7F];  // locals: 2xi32, 32xi64 regs, i64 scratch, i32 jump-target, i32 branch-cond, f32+f64 convert scratch (wave 11a), f32+f64 compare operand B (wave 11b), i32 segment start (multi-entry)
+    COLD = null;
+    LOCALS = [0x0B].concat(LOCALS.slice(1), [0x02, 0x7F]);   // + i32 L_COLD (used with cold paths) + i32 L_CNT
+    // PCL: the entry index comes from PC, before the guard (which needs it)
+    var pre = PCL ? startPro : [], mid = PCL ? [] : startPro;
     var full = RAW
       // (block $raw  guard  (block $exit  prologue (loop $top ...))  epilogue)
       // The delay-slot guard sits in $raw so its exit skips the epilogue: it
       // runs before the prologue, when the pinned locals hold nothing.
-      ? LOCALS.concat([OP.block, OP.void_], slotGuard, [OP.block, OP.void_], startPro, C.reloadPinned(),
+      ? LOCALS.concat(pre, [OP.block, OP.void_], slotGuard, [OP.block, OP.void_], mid, C.reloadPinned(),
           [OP.loop, OP.void_], bump('#block-iter'), dispatch, body,
           [OP.end, OP.end], C.storePinned(), [OP.end, OP.end])
-      : LOCALS.concat([OP.block, OP.void_], slotGuard, startPro,
+      : LOCALS.concat(pre, [OP.block, OP.void_], slotGuard, mid,
           [OP.loop, OP.void_], bump('#block-iter'), dispatch, body,
           [OP.end, OP.end, OP.end]);
+
+    if (coldList) stats.coldArms = (stats.coldArms || 0) + coldList.length;
 
     // census adds one imported host func "e"."c" (type 1: (i32)->()), which
     // takes function index 0 and pushes the defined block function to 1
     var cen = !!census.on;
-    var bodyFn = cen ? 1 : 0;
+    var batch = !!(EMIT_ONLY && EMIT_ONLY.batch);
+    var bodyFn = batch ? EMIT_ONLY.fnBase : (cen ? 1 : 0);
     var funcs = [full];
-    for (var wk = 1; wk < nSeg; wk++) {
+    for (var wk = 1; wk < NFN; wk++) {
       funcs.push([0x00].concat(            // no locals
-        loadI32(p.delaySlot), [OP.if_, OP.void_],
+        loadI32(p.delaySlot), loadI32(p.skipJump), [OP.i32_or], [OP.if_, OP.void_],   // see SKIP_JUMP AT ENTRY
           bump('#delayslot-entry'),
           [OP.i32_const], sleb(labelOps[wk]), [OP.call_indirect, 0x00, 0x00],
           [OP.return_],
         [OP.end],
         [OP.i32_const], sleb(wk), [OP.global_set, 0x00],
-        [OP.call], leb(bodyFn),
+        // CHAINING: a tail call, so a chain into a label leaves no wrapper frame behind
+        CHAIN ? [0x12] : [OP.call], leb(bodyFn),
         [OP.end]));
     }
-    var typeSec = section(1, cen
-      ? [].concat(leb(2), [0x60, 0x00, 0x00], [0x60, 0x01, 0x7F, 0x00])
-      : [].concat(leb(1), [0x60, 0x00, 0x00]));
+    var ftypes = funcs.map(function () { return 0; });
+    if (batch) {
+      // BATCHED MODULES: this span's functions go into the module emitBatch assembles
+      // (cold handlers last, at COLD_FN0 = fnBase + nSeg)
+      if (coldList) for (var hb2 = 0; hb2 < coldList.length; hb2++) { funcs.push(coldHandlerFn(coldList[hb2], p.reg)); ftypes.push(coldType(coldList[hb2])); }
+      EMIT_ONLY.part = { funcs: funcs, types: ftypes, labels: labels, labelOps: labelOps, nfn: NFN };
+      return 1;
+    }
+    if (coldList) {
+      funcs.push(chkHelper(p)); ftypes.push(1);   // CHK_FN: after the body and its wrappers
+      if (JT_FN >= 0) { funcs.push(jtHelper(p)); ftypes.push(1); }   // JT_FN = CHK_FN + 1
+      for (var hb1 = 0; hb1 < coldList.length; hb1++) { funcs.push(coldHandlerFn(coldList[hb1], p.reg)); ftypes.push(coldType(coldList[hb1])); }   // COLD_FN0 = CHK_FN + 1
+    }
+    var typeSec = TYPE_SEC;
     var importSec = section(2, [].concat(leb(cen ? 3 : 2),
       [1, 0x65, 1, 0x74, 0x01, 0x70, 0x00, 0x00],
       [1, 0x65, 1, 0x6D, 0x02, 0x00, 0x00],
       cen ? [1, 0x65, 1, 0x63, 0x00, 0x01] : []));
-    var fdecl = leb(nSeg);
-    for (wk = 0; wk < nSeg; wk++) fdecl = fdecl.concat(leb(0));
+    var fdecl = leb(funcs.length);
+    for (wk = 0; wk < ftypes.length; wk++) app(fdecl, leb(ftypes[wk]));
     var funcSec = section(3, fdecl);
     var globalSec = nSeg > 1 ? section(6, [0x01, 0x7F, 0x01, OP.i32_const, 0x00, OP.end]) : [];
     // exports: "f" = label 0 (the body), "f<k>" = wrapper k
-    var exps = leb(nSeg).concat([1, 0x66, 0x00], leb(bodyFn));
-    for (wk = 1; wk < nSeg; wk++) {
+    var exps = leb(NFN).concat([1, 0x66, 0x00], leb(bodyFn));
+    for (wk = 1; wk < NFN; wk++) {
       var nm = ('f' + wk).split('').map(function (ch) { return ch.charCodeAt(0); });
       exps = exps.concat(leb(nm.length), nm, [0x00], leb(bodyFn + wk));
     }
     var exportSec = section(7, exps);
-    var code = leb(nSeg);
-    for (wk = 0; wk < nSeg; wk++) code = code.concat(leb(funcs[wk].length), funcs[wk]);
-    var codeSec = section(10, code);
-    var bytes = new Uint8Array([0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00]
-      .concat(typeSec, importSec, funcSec, globalSec, exportSec, codeSec));
-    function installSlot(vkey, fn) {
-      var sidx = slotByVaddr[vkey];
-      if (sidx !== undefined) {
-        Module.wasmTable.set(sidx, fn);
-        stats.slotReuses++;
-      } else {
-        sidx = Module.wasmTable.length;
-        Module.wasmTable.grow(1);
-        Module.wasmTable.set(sidx, fn);
-        slotByVaddr[vkey] = sidx;
-        stats.distinctSlots++;
-      }
-      return sidx;
-    }
+    // in place: `code = code.concat(...)` per function re-copied the body for every label
+    // wrapper after it — 34.6 ms of a 292-instruction span's 35 ms emit (92 wrappers)
+    // (FAST EMIT: written straight into the module's bytes, see packModule)
+    var code = [leb(funcs.length)];
+    for (wk = 0; wk < funcs.length; wk++) { code.push(leb(funcs[wk].length)); code.push(funcs[wk]); }
+    var bytes = packModule([[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00],
+      typeSec, importSec, funcSec, globalSec, exportSec, { id: 10, chunks: code }]);
+    if (EMIT_ONLY) { EMIT_ONLY.out = { bytes: bytes, labels: labels, labelOps: labelOps }; return 1; }
     try {
       var mod = new WebAssembly.Module(bytes);
       var inst = new WebAssembly.Instance(mod, { e: { t: Module.wasmTable, m: Module.wasmMemory, c: censusBump } });
-      var idx = installSlot(p.vaddr >>> 0, inst.exports.f);
+      var idx = installSlot(Module, p.vaddr >>> 0, inst.exports.f);
       // Label entries: written straight into block[label].ops, the same field
       // recomp.c:2583 writes for the entry. init_block resets every one of
       // them to NOTCOMPILED on invalidation (cached_interp.c jump_to_func ->
@@ -2118,15 +2938,13 @@
       for (wk = 1; wk < nSeg; wk++) {
         var lptr = p.entryPtr + labels[wk] * p.stride;
         if (HEAPU32[lptr >> 2] !== labelOps[wk]) continue;
-        HEAPU32[lptr >> 2] = installSlot((p.vaddr + labels[wk] * 4) >>> 0, inst.exports['f' + wk]);
+        HEAPU32[lptr >> 2] = installSlot(Module, (p.vaddr + labels[wk] * 4) >>> 0, inst.exports['f' + wk] || inst.exports.f);
         stats.labelEntries = (stats.labelEntries || 0) + 1;
       }
       stats.blocks++;
-      if (spanCacheN >= SPAN_CACHE_MAX) { spanCache.clear(); spanCacheN = 0; }
-      var nb = spanCache.get(kh);
-      if (!nb) { nb = []; spanCache.set(kh, nb); }
-      nb.push({ key: keyArr, inst: inst, labels: labels, labelOps: labelOps });
-      spanCacheN++;
+      var fns1 = [inst.exports.f];
+      for (wk = 1; wk < nSeg; wk++) fns1.push(inst.exports['f' + wk] || inst.exports.f);
+      cachePut(keyArr, fns1, labels, labelOps);
       return idx;
     } catch (e) {
       stats.fails++;
@@ -2143,5 +2961,6 @@
     out.sort(function (a, b) { return b[1] - a[1]; });
     return out;
   }
-  window.bementalMips = { compileSpan: compileSpan, stats: stats, census: censusDump, censusOn: function () { return !!census.on; } };
+  window.bementalMips = { compileSpan: compileSpan, frameEnd: frameEnd, stats: stats, census: censusDump, censusOn: function () { return !!census.on; },
+                         async: ASYNC, emitJob: emitJob, emitBatch: emitBatch };
 })();

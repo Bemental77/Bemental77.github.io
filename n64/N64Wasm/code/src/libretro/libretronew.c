@@ -67,7 +67,12 @@ int InitGfx(void);
 #if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
 int glide64InitGfx(void);
 void gles2n64_reset(void);
+void gls_reset(void);   /* glide's GL call shadow: src/glide2gl/src/Glitch64/gl_shadow.c */
+void gls_reset_objects(void);
+void vbo_merge_flush(void);   /* triangles glide's draw merging still holds (geometry.c) */
+void neil_shader_warm_step(void);   /* glitch64_combiner.c ASKED AHEAD */
 #endif
+#include "../mupen64plus-core/src/main/lfb_hook.h"   /* glide's lazy framebuffer copy */
 
 #if defined(HAVE_PARALLEL)
 #include "../mupen64plus-video-paraLLEl/parallel.h"
@@ -749,6 +754,8 @@ static void context_reset(void)
         static bool first_init = true;
         printf("context_reset.\n");
         glsm_ctl(GLSM_CTL_STATE_CONTEXT_RESET, NULL);
+        gls_reset();   /* a new context: nothing the GL call shadow knew is true of it */
+        gls_reset_objects();   /* ...not even of its objects (gl_shadow.c OBJECT STATE ACROSS FRAMES) */
 
         if (first_init)
         {
@@ -1346,7 +1353,13 @@ static void glsm_exit(void)
     if (gfx_plugin == GFX_PARALLEL)
         return;
 #endif
+    vbo_merge_flush();   /* nothing glide drew may stay held past the frame */
     glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);
+    /* the unbind disabled every vertex array, unbound every texture and reset
+     * blend/depth through its own GL calls: what the frontend draws after it
+     * (mymain.cpp's text and overlay go through glide's call shadow too) must
+     * not trust anything the shadow learned during the frame */
+    gls_reset();
 #endif
 }
 
@@ -1364,6 +1377,11 @@ static void glsm_enter(void)
         return;
 #endif
     glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
+    /* glsm's bind (and every GL call made between two retro_runs: the frontend,
+     * the page's and the worker's JS) sets state glide's call shadow never saw:
+     * it forgets everything, so nothing learned in one frame is trusted in the
+     * next (src/glide2gl/src/Glitch64/gl_shadow.h) */
+    gls_reset();
 #endif
 }
 #endif
@@ -1426,12 +1444,26 @@ void retro_run(void)
         case GFX_RICE:
 #if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
             glsm_exit();
+            /* glide's prewarmed programs: their link status and uniform locations are
+             * asked once, a few fields after boot, never in the middle of a display list
+             * (glitch64_combiner.c ASKED AHEAD) */
+            if (gfx_plugin == GFX_GLIDE64)
+               neil_shader_warm_step();
 #endif
             break;
         case GFX_PARALLEL:
         case GFX_ANGRYLION:
             break;
         }
+#ifdef __EMSCRIPTEN__
+        /* the JIT's compile budget (bementalJIT mips_emit.js frameEnd): refill
+         * it and compile what this field queued — at the same point of every
+         * field on every console */
+        EM_ASM({
+           var g = (typeof globalThis !== 'undefined') ? globalThis : self;
+           if (g.bementalMips && g.bementalMips.frameEnd) g.bementalMips.frameEnd();
+        });
+#endif
     } 
     //while (emu_step_render());
 }
@@ -1458,6 +1490,7 @@ int savestates_save_m64p(unsigned char *data, size_t size);
 bool neil_serialize()
 {
     printf("save state\n");
+    lfb_materialize_all();   /* a state on disk holds every framebuffer copy */
     if (savestates_save_m64p(savestate_buffer, sizeof(savestate_buffer)))
     {
         gzFile fi = gzopen("savestate.gz", "wb");
@@ -1557,6 +1590,7 @@ bool neil_export_fla()
 bool neil_unserialize()
 {
     printf("load state\n");
+    lfb_drop_all();          /* RDRAM is about to be replaced */
     gzFile fi = gzopen("savestate.gz", "rb");
     gzread(fi, savestate_buffer, sizeof(savestate_buffer));
     gzclose(fi);
@@ -1570,6 +1604,8 @@ bool neil_unserialize()
 
 void neil_reset()
 {
+    lfb_materialize_all();   /* the copies the guest could still see are real */
+    lfb_drop_all();
     retro_reset_new();
 }
 

@@ -346,6 +346,67 @@ void write_rdramFBd(void)
     writed(write_rdram_fb, &g_dev.dp, address, cpu_dword);
 }
 
+/* ---- glide's LAZY FRAMEBUFFER COPY (main/lfb_hook.h, Glide64/lazy_fb.c) ----
+ * While a pending copy covers a 64 KB page of RDRAM, that page's eight
+ * handlers (in kseg0 and kseg1) are these: they make the touched bytes
+ * current (lfb_touch), then run the handler the page had. The JIT's native
+ * loads and stores compare the table entry with read_rdram / write_rdram (any width) at
+ * run time (bementalJIT mips_emit.js), so they take their slow arm — this —
+ * on such a page, and their fast arm everywhere else. */
+#include "../main/lfb_hook.h"
+static void (*lfb_sv_r[4][2][128])(void);   /* [b h w d][kseg0, kseg1][page] */
+static void (*lfb_sv_w[4][2][128])(void);
+static int lfb_pgref[128];
+#define LFB_SEG(a) (((a) >> 29) & 1)
+#define LFB_PG(a)  (((a) >> 16) & 0x7F)
+static void read_rdramLFBb(void) { lfb_touch(address & 0x7FFFFF, 1); lfb_sv_r[0][LFB_SEG(address)][LFB_PG(address)](); }
+static void read_rdramLFBh(void) { lfb_touch(address & 0x7FFFFF, 2); lfb_sv_r[1][LFB_SEG(address)][LFB_PG(address)](); }
+static void read_rdramLFB(void)  { lfb_touch(address & 0x7FFFFF, 4); lfb_sv_r[2][LFB_SEG(address)][LFB_PG(address)](); }
+static void read_rdramLFBd(void) { lfb_touch(address & 0x7FFFFF, 8); lfb_sv_r[3][LFB_SEG(address)][LFB_PG(address)](); }
+static void write_rdramLFBb(void) { lfb_touch(address & 0x7FFFFF, 1); lfb_sv_w[0][LFB_SEG(address)][LFB_PG(address)](); }
+static void write_rdramLFBh(void) { lfb_touch(address & 0x7FFFFF, 2); lfb_sv_w[1][LFB_SEG(address)][LFB_PG(address)](); }
+static void write_rdramLFB(void)  { lfb_touch(address & 0x7FFFFF, 4); lfb_sv_w[2][LFB_SEG(address)][LFB_PG(address)](); }
+static void write_rdramLFBd(void) { lfb_touch(address & 0x7FFFFF, 8); lfb_sv_w[3][LFB_SEG(address)][LFB_PG(address)](); }
+
+void lfb_page_ref(unsigned p, int delta)
+{
+   int was, seg;
+   if (p >= 128)
+      return;
+   was = lfb_pgref[p];
+   lfb_pgref[p] += delta;
+   if (lfb_pgref[p] < 0)
+      lfb_pgref[p] = 0;
+   for (seg = 0; seg < 2; seg++)
+   {
+      unsigned r = (seg ? 0xA000u : 0x8000u) + p;
+      if (was == 0 && lfb_pgref[p] > 0)
+      {
+         lfb_sv_r[0][seg][p] = readmemb[r]; lfb_sv_r[1][seg][p] = readmemh[r];
+         lfb_sv_r[2][seg][p] = readmem[r];  lfb_sv_r[3][seg][p] = readmemd[r];
+         lfb_sv_w[0][seg][p] = writememb[r]; lfb_sv_w[1][seg][p] = writememh[r];
+         lfb_sv_w[2][seg][p] = writemem[r];  lfb_sv_w[3][seg][p] = writememd[r];
+         readmemb[r] = read_rdramLFBb; readmemh[r] = read_rdramLFBh;
+         readmem[r]  = read_rdramLFB;  readmemd[r] = read_rdramLFBd;
+         writememb[r] = write_rdramLFBb; writememh[r] = write_rdramLFBh;
+         writemem[r]  = write_rdramLFB;  writememd[r] = write_rdramLFBd;
+      }
+      else if (was > 0 && lfb_pgref[p] == 0)
+      {
+         readmemb[r] = lfb_sv_r[0][seg][p]; readmemh[r] = lfb_sv_r[1][seg][p];
+         readmem[r]  = lfb_sv_r[2][seg][p]; readmemd[r] = lfb_sv_r[3][seg][p];
+         writememb[r] = lfb_sv_w[0][seg][p]; writememh[r] = lfb_sv_w[1][seg][p];
+         writemem[r]  = lfb_sv_w[2][seg][p]; writememd[r] = lfb_sv_w[3][seg][p];
+      }
+   }
+}
+
+/* the tables were rebuilt (power-on): nothing of ours is installed in them */
+void lfb_pages_forget(void)
+{
+   memset(lfb_pgref, 0, sizeof(lfb_pgref));
+}
+
 
 static void read_rdramreg(void)
 {
@@ -1171,6 +1232,9 @@ void poweron_memory(void)
    memset(saved_readmem, 0, 0x10000*sizeof(saved_readmem[0]));
    memset(saved_writemem, 0, 0x10000*sizeof(saved_writemem[0]));
 #endif
+
+   lfb_drop_all();          /* RDRAM is powered on: no lazy copy survives it */
+   lfb_pages_forget();
 
    /* clear mappings */
    for (i = 0; i < 0x10000; ++i)

@@ -14,6 +14,7 @@
        lets tools/device_matrix.mjs ask every page the same questions. Loaded before <base>
        so its own absolute paths are unambiguous. -->
   <script src="/lib/capability.js?v=e25dca87"></script>
+  <script src="/lib/bench.js?v=d181b61c"></script><!-- ?bench=1 real-device benchmark; inert without it -->
   <script src="/lib/xboxinput.js"></script>
   <!-- ONLINE PLAY — DETERMINISTIC LOCKSTEP. Inert unless Netplay.supported(),
        and it does nothing at all without ?np=<code> in the URL, which is what
@@ -1621,7 +1622,7 @@ N64Rate.selfTest = function (logFn) {
   return { pass: pass, fail: fail, lines: lines, summary: summary };
 };
 </script>
-<script src="/n64/N64Wasm/dist/fbasync.js?v=61174a18"></script>
+<script src="/n64/N64Wasm/dist/fbasync.js?v=a23cd08f"></script>
 <script src="/n64/N64Wasm/dist/jit_params.js?v=bb2930f6"></script>
 <script src="/n64/N64Wasm/dist/room_core.js?v=a4002432"></script>
 <script>
@@ -2457,7 +2458,7 @@ N64Rate.selfTest = function (logFn) {
   // logged. If the worker fails while it boots (no WebGL2 there after all, a
   // core abort before "Starting R4300"), the page reloads ONCE with ?worker=0
   // (wkFallback) and says so in its log.
-  var WK_V = '894d2b51';                           // cache-buster for the worker's scripts
+  var WK_V = '9478d755';                           // cache-buster for the worker's scripts
   var WK_DEFAULT = true;                     // the default for a capable console (solo and rooms)
   var WK = { on: false, why: null, w: null, stat: null, statAt: 0, presents0: 0, pendingAudioPort: null,
              evals: {}, evalId: 0, sent: null, composed: 0, posted: 0, fatal: null, booted: false,
@@ -3228,8 +3229,10 @@ N64Rate.selfTest = function (logFn) {
       }, 2000);
     }
     if (mode === 'emit') {
-      var s = document.createElement('script');
-      s.src = '/n64/bementalJIT/mips_emit.js?v=' + Date.now();
+      var s = document.createElement('script'), jv = Date.now();
+      // the emitter's off-thread half runs the same file (mips_emit.js OFF-THREAD EMISSION)
+      window.__n64JitWorkerUrl = '/n64/bementalJIT/jit_compile_worker.js?v=' + jv;
+      s.src = '/n64/bementalJIT/mips_emit.js?v=' + jv;
       s.onload = enable;
       s.onerror = function () { pageLog('[jit] emitter failed to load — bridge stays off'); };
       document.head.appendChild(s);

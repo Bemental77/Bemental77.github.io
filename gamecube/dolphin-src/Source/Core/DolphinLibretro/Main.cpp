@@ -39,6 +39,7 @@
 #include "Core/PatchEngine.h"
 #include "Core/State.h"
 #include "Core/System.h"
+#include "VideoCommon/PixelEngine.h"  // [late-efb across a state LOAD] BeginStateLoad
 #include "DolphinLibretro/Audio.h"
 #include "DolphinLibretro/Input.h"
 #include "DolphinLibretro/Common/Options.h"
@@ -567,6 +568,9 @@ bool retro_unserialize(const void* data, size_t size)
     ar->SetPassthrough(false);
 
   Core::RunOnCPUThread(Core::System::GetInstance(), [&] {
+    // [late-efb across a state LOAD 2026-10-01] retire every late EFB->RAM write issued
+    // before this load BEFORE any guest RAM is restored (VideoCommon/PixelEngine.h).
+    Core::System::GetInstance().GetPixelEngine().BeginStateLoad();
     PointerWrap p((u8**)&data, size, PointerWrap::Mode::Read);
     State::DoState(Core::System::GetInstance(), p);
   }, true);

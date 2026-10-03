@@ -59,6 +59,8 @@ typedef struct cheat
     struct list_head list;
 } cheat_t;
 
+#include "lfb_hook.h"
+
 /* Local variables */
 static LIST_HEAD(active_cheats);
 extern unsigned int frame_dupe;
@@ -66,26 +68,31 @@ extern unsigned int frame_dupe;
 /* Private functions */
 static uint16_t read_address_16bit(unsigned int address)
 {
+    LFB_TOUCH(address, 2);   /* glide's lazy framebuffer copy: these bytes first */
     return *(uint16_t*)(((uint8_t*)g_dev.ri.rdram.dram + ((address & 0xFFFFFF)^S16)));
 }
 
 static uint8_t read_address_8bit(unsigned int address)
 {
+    LFB_TOUCH(address, 1);   /* glide's lazy framebuffer copy: these bytes first */
     return *(unsigned char *)(((unsigned char*)g_dev.ri.rdram.dram + ((address & 0xFFFFFF)^S8)));
 }
 
 static void update_address_16bit(unsigned int address, unsigned short new_value)
 {
+    LFB_TOUCH(address, 2);   /* glide's lazy framebuffer copy: these bytes first */
     *(uint16_t *)(((uint8_t*)g_dev.ri.rdram.dram + ((address & 0xFFFFFF)^S16))) = new_value;
 }
 
 static void update_address_8bit(unsigned int address, unsigned char new_value)
 {
+    LFB_TOUCH(address, 1);   /* glide's lazy framebuffer copy: these bytes first */
      *(uint8_t *)(((uint8_t*)g_dev.ri.rdram.dram + ((address & 0xFFFFFF)^S8))) = new_value;
 }
 
 static int address_equal_to_8bit(unsigned int address, unsigned char value)
 {
+    LFB_TOUCH(address, 1);   /* glide's lazy framebuffer copy: these bytes first */
     unsigned char value_read;
     value_read = *(unsigned char *)(((unsigned char*)g_dev.ri.rdram.dram + ((address & 0xFFFFFF)^S8)));
     return value_read == value;
@@ -93,6 +100,7 @@ static int address_equal_to_8bit(unsigned int address, unsigned char value)
 
 static int address_equal_to_16bit(unsigned int address, unsigned short value)
 {
+    LFB_TOUCH(address, 2);   /* glide's lazy framebuffer copy: these bytes first */
     unsigned short value_read;
     value_read = *(unsigned short *)(((unsigned char*)g_dev.ri.rdram.dram + ((address & 0xFFFFFF)^S16)));
     return value_read == value;

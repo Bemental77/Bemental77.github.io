@@ -12,6 +12,11 @@
 //        --warm N (600) --rom BASE (MonsterRancher2) --mb N (89)
 //        --broken  negative control: rollbacks that do not correct; MUST fail
 //        --budget B  the undo ring's log budget in bytes (1 = trim to the frontier every step)
+//        --switch-every S  alternate S rollback frames with S delay-lockstep frames
+//                  (a capacity-gated room going to input delay and back: the ring
+//                  re-armed at every return, a timed save every --remeasure-every
+//                  delay frames) — the page side of lib/netplay.js opts.rbResume
+//        --url BASE  (http://localhost:8080)
 // Env: CHROME_PATH
 import os from 'node:os';
 import fs from 'node:fs';
@@ -26,6 +31,7 @@ const opts = {
   frames: +arg('frames', 1800), every: +arg('every', 30), maxLag: +arg('max-lag', 6), ring: +arg('ring', 12),
   warm: +arg('warm', 600), bytes: (+arg('mb', 89)) * 1048576,
   broken: argv.includes('--broken'), budget: +arg('budget', 0),
+  switchEvery: +arg('switch-every', 0), remeasureEvery: +arg('remeasure-every', 10),
   url: '/ps1/ps1Wasm/roms/' + arg('rom', 'MonsterRancher2') + '.bin.partaa.gz',
 };
 const md5 = (f) => { try { return crypto.createHash('md5').update(fs.readFileSync(f)).digest('hex'); } catch (e) { return 'missing'; } };
@@ -41,7 +47,7 @@ let result;
 try {
   const page = await browser.newPage();
   page.on('pageerror', (e) => console.log('[pageerror]', String(e).slice(0, 300)));
-  await page.goto('http://localhost:8080/tools/ps1_rollback_harness.html', { waitUntil: 'load' });
+  await page.goto(arg('url', 'http://localhost:8080') + '/tools/ps1_rollback_harness.html', { waitUntil: 'load' });
   await page.evaluate((o) => window.__start(o), opts);
   let last = '';
   for (;;) {

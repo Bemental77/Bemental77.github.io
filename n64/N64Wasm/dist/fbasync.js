@@ -20,6 +20,27 @@
 //   ?vbo=-1|0|1|2    the core's vertex streaming mode, read by the core at main()
 //                    (mymain.cpp apply_vbo_mode) from G.__fbAsync.vboMode: this file
 //                    is the one both realms install before main() runs. Default 1.
+//   ?glshadow=0      the core sends every GL call glide makes, including those that
+//                    re-set state to its current value (mymain.cpp apply_gl_shadow,
+//                    from G.__fbAsync.glShadow) — the A/B arm and kill switch of
+//                    the call shadow (src/glide2gl/src/Glitch64/gl_shadow.c). Default on.
+//   ?fblazy=0        a read_always title's frame is copied into RDRAM at the end of every
+//                    display list again, instead of when something can see it (the core's
+//                    Glide64/lazy_fb.c reads st.lazy) — the A/B arm and kill switch. With
+//                    the lazy copy the core issues no readPixels per frame; snapshot /
+//                    restore / release below carry its queue (neil_lfb_*) for rollback.
+//   ?jitbudget=N     at most N new JIT spans compiled per field, the rest queued and
+//                    compiled at field ends (bementalJIT mips_emit.js frameEnd);
+//                    0 = no budget (the A/B arm). Default 6.
+//   ?jitasync=0      the JIT builds every module in the core's own thread again, under the
+//                    per-field budget (bementalJIT mips_emit.js OFF-THREAD EMISSION) — the
+//                    A/B arm and kill switch. Default: built in jit_compile_worker.js.
+//   ?jitcold=0       the JIT keeps every slow arm inline in the span again (bementalJIT
+//                    mips_emit.js COLD PATHS) — the A/B arm and kill switch.
+//   ?jitchain=1      JIT blocks tail-call the next JIT block where that is exact (bementalJIT
+//                    mips_emit.js CHAINING). OFF by default: unpriced (inside the rig's noise).
+//   ?glmerge=0       every glide triangle is its own draw again (geometry.c draw
+//                    merging, mymain.cpp apply_gl_shadow) — A/B arm, kill switch.
 (function (root) {
   root.__n64InstallFbAsync = function (G, search) {
     if (G.__fbAsync) return G.__fbAsync;   // once per realm
@@ -32,6 +53,14 @@
                        calls: 0, async: 0, sync: 0, blocked: 0, invalidations: 0, pinned: 0, pool: 0,
                        prefetchOn: FB_PREFETCH, prefetched: 0, prefetchBlocked: 0, early: 0,
                        vboMode: FB_Q.has('vbo') ? +FB_Q.get('vbo') : undefined,
+                       glShadow: FB_Q.get('glshadow') !== '0',
+                       glMerge: FB_Q.get('glmerge') !== '0',
+                       lazy: FB_Q.get('fblazy') !== '0',
+                       jitBudget: FB_Q.has('jitbudget') ? Math.max(0, +FB_Q.get('jitbudget') | 0) : undefined,
+                       jitAsync: FB_Q.get('jitasync') !== '0',
+                       jitCold: FB_Q.get('jitcold') !== '0',
+                       jitPin: FB_Q.get('jitpin') === '1',
+                       jitChain: FB_Q.get('jitchain') === '1',
                        seq: FB_WITNESS ? [] : null };
   // Glide64_Ini.c's read_always = 1 branches, by the name each one tests
   // (HAVE_HWFBE is not defined in this build, so the #ifndef branches apply).
@@ -139,6 +168,9 @@
           if (p) { p.refs++; st.pinned++; }
           out.push([ctxs[c], p]);
         }
+        // the core's lazy framebuffer copies (Glide64/lazy_fb.c): queue + previous capture
+        var M = G.Module;
+        out.lfb = (M && typeof M._neil_lfb_snapshot === 'function') ? M._neil_lfb_snapshot() : -1;
         return out;
       };
       st.restore = function (snap) {
@@ -149,11 +181,15 @@
           if (p) p.refs++;
           fb.pending = p;
         }
+        var M = G.Module;
+        if (M && typeof M._neil_lfb_restore === 'function') M._neil_lfb_restore(snap.lfb == null ? -1 : snap.lfb);
         st.restores = (st.restores | 0) + 1;
       };
       st.release = function (snap) {
         if (!snap) return;
         for (var i = 0; i < snap.length; i++) if (snap[i][1]) { unref(snap[i][1]); st.pinned--; }
+        var M = G.Module;
+        if (snap.lfb >= 0 && M && typeof M._neil_lfb_release === 'function') { M._neil_lfb_release(snap.lfb); snap.lfb = -1; }
       };
       var hookCore = function () {
         var M = G.Module;

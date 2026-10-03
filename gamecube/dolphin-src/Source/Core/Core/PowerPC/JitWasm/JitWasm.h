@@ -97,6 +97,13 @@ private:
   // m_block_inst_counts holds CYCLES (downcount), not lengths — this map
   // is the only source of block extents.
   std::map<u32, u32> m_block_guest_end;
+
+  // [LEAF-INLINE exactness 2026-10-01] Guest span [lo, hi) of the pure leaf that was
+  // spliced INTO a block, keyed by that block's start_pc. m_block_guest_end only
+  // covers the caller's own contiguous words, so without this an icbi over the
+  // leaf's code would leave the spliced copy running stale. Small (one entry per
+  // spliced block — ~20 on SAB), so InvalidateICacheRange scans it linearly.
+  std::unordered_map<u32, std::pair<u32, u32>> m_li_leaf_span;
 };
 
 #endif  // __EMSCRIPTEN__

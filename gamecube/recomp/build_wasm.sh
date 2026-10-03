@@ -9,13 +9,19 @@
 # Env: DECOMP (decomp root), BUILD (staging dir). Not the emulator build — this is
 # the recomp toolchain, so the canonical dolphin build-flow gate does not apply.
 #
-# CANONICAL FULL-BOOT BUILD (what gamecube/recomp/mp4_game.{js,wasm} is built from —
-# a bare invocation omits the AOT overlays and the live path WEDGES at the first
-# overlay switch, ~f1033 after Start; cost a debug detour 2026-08-26):
+# CANONICAL FULL-BOOT BUILD (what gamecube/recomp/mp4_game.{js,wasm} is built from):
 #
-#   RECOMP_MODESEL=1 RECOMP_MENT=1 RECOMP_W01=1 RECOMP_MUSYX=1 RECOMP_PROFILING_FUNCS=1 \
-#     bash gamecube/recomp/build_wasm.sh
-# (bootDll is on by default; RECOMP_*DIAG vars are temporary diagnostics, keep OFF.)
+#   RECOMP_MUSYX=1 RECOMP_PROFILING_FUNCS=1 bash gamecube/recomp/build_wasm.sh
+#
+# Every overlay the decomp has source for (93 of the 99 USA entries in ovl_table.h; the other six,
+# m300/m302/m303/m330/m333 and msetupdll, have no source and no omOvlCall in src/ names them —
+# msetupdll appears only in audio.c's sound-group table) is AOT-compiled in by ovl_build.py — RECOMP_OVERLAYS=all is the
+# default. The old RECOMP_MODESEL/RECOMP_MENT/RECOMP_W01 switches are gone (the four-overlay
+# build is why a party stopped at its first minigame). Use a FRESH BUILD dir or this box's
+# rsync-less staging (see step 1). DECOMP falls back to ~/mp4decomp (src/ include/ +
+# extern/musyx submodule); the generated .inc assets come from the disc (gen_inc_assets.py).
+# Coverage rig: gamecube/recomp/ovl_test.mjs (every board and minigame, DET=1 for lockstep).
+# (RECOMP_*DIAG vars are temporary diagnostics, keep OFF.)
 #
 # RECOMP_MUSYX=1 IS NOW PART OF THAT LINE — THE AUDIO BUILD SHIPS (2026-09-02).
 #   gamecube/recomp/mp4_game.{js,wasm} md5 00f457ce…/fd341d95… replaced the silent
@@ -65,6 +71,10 @@
 # opt-in and is the only guest-rate witness on the recomp path.
 set -u
 DECOMP="${DECOMP:-$HOME/gc_refs/marioparty4}"
+# A box without the full decomp build uses the src/+include/ checkout at ~/mp4decomp (with the
+# extern/musyx submodule initialised for RECOMP_MUSYX). Its generated asset headers are made from
+# the disc by gen_inc_assets.py below.
+if [ ! -d "$DECOMP/src" ] && [ -d "$HOME/mp4decomp/src" ]; then DECOMP="$HOME/mp4decomp"; fi
 RECOMP="$(cd "$(dirname "$0")" && pwd)"
 BUILD="${BUILD:-/tmp/gc_recomp_build}"
 source "$HOME/emsdk-upstream/emsdk_env.sh" >/dev/null 2>&1
@@ -72,16 +82,26 @@ source "$HOME/emsdk-upstream/emsdk_env.sh" >/dev/null 2>&1
 echo "[recomp] decomp=$DECOMP  build=$BUILD"
 mkdir -p "$BUILD"
 # 1. stage a writable copy of decomp source + headers
+# Without rsync the fallback must REPLACE the staged trees: `cp -R src $BUILD/src` into an existing
+# $BUILD/src nests a pristine copy at $BUILD/src/src and leaves the previous run's EDITED files in
+# place, so every perl edit below is applied a second time (MEASURED 2026-10-03 on a box with no
+# rsync: objdll.c carried the overlay hook twice, board/player.c two __recomp_roll_r3 bodies).
 rsync -a --delete "$DECOMP/src" "$DECOMP/include" "$BUILD/" 2>/dev/null || {
-  cp -R "$DECOMP/src" "$BUILD/src"; cp -R "$DECOMP/include" "$BUILD/include"; }
+  rm -rf "$BUILD/src" "$BUILD/include"; cp -R "$DECOMP/src" "$BUILD/src"; cp -R "$DECOMP/include" "$BUILD/include"; }
 # Authoritative include dirs from the decomp's OWN build (build.ninja): the REAL MusyX
 # headers (SND_GROUPID/SND_SONGID/... — not absent, vendored here) and the GENERATED
 # header dir carrying every .inc binary asset (coveropen_en.inc, refMapData0.inc, …)
 # plus macros.inc. Mirroring the decomp's real build config is the authoritative fix
 # (vs my ad-hoc -I flags + wrong musyx stub). extern/musyx/include has a musyx/ subdir.
 mkdir -p "$BUILD/extern/musyx"
-rsync -a "$DECOMP/extern/musyx/include" "$BUILD/extern/musyx/" 2>/dev/null || cp -R "$DECOMP/extern/musyx/include" "$BUILD/extern/musyx/include"
-rsync -a --delete "$DECOMP/build/GMPE01_01/include/" "$BUILD/gen/" 2>/dev/null || { mkdir -p "$BUILD/gen"; cp -R "$DECOMP/build/GMPE01_01/include/." "$BUILD/gen/"; }
+rsync -a --delete "$DECOMP/extern/musyx/include" "$BUILD/extern/musyx/" 2>/dev/null || { rm -rf "$BUILD/extern/musyx/include"; cp -R "$DECOMP/extern/musyx/include" "$BUILD/extern/musyx/include"; }
+if [ -d "$DECOMP/build/GMPE01_01/include" ]; then
+  rsync -a --delete "$DECOMP/build/GMPE01_01/include/" "$BUILD/gen/" 2>/dev/null || { mkdir -p "$BUILD/gen"; cp -R "$DECOMP/build/GMPE01_01/include/." "$BUILD/gen/"; }
+else
+  # No decomp build products: slice the 20 asset .inc headers out of the disc (gen_inc_assets.py).
+  mkdir -p "$BUILD/gen"
+  python3 "$RECOMP/gen_inc_assets.py" "$BUILD/gen" || { echo "[recomp] FATAL: gen_inc_assets.py failed" >&2; exit 1; }
+fi
 # [audio, RECOMP_MUSYX=1 — OPT-IN, OFF by default] Stage the MusyX SOURCE too, not just its
 # headers. MP4's whole audio engine is `extern/musyx` (33 library .c files per its own
 # CMakeLists) + the 6 `src/msm/*.c` wrappers; with neither compiled, all 36 msm* entry points
@@ -103,6 +123,17 @@ if [ -n "${RECOMP_MUSYX:-}" ]; then
 fi
 # 2. overlay portable shims (portable OSFastCast replaces the inline-asm header, etc.)
 cp -R "$RECOMP/shims/." "$BUILD/include/" 2>/dev/null || true
+# DECOMP GENERATIONS. This script was written against the decomp as it stood in Aug 2026 (gen 1:
+# OVL_<NAME> overlay enum, AnimData/HsfHeader/HsfObjectData types, snake_case locals such as
+# read_stat/dir_data). The decomp since renamed most of that (gen 2, e.g. mariopartyrd/marioparty4
+# 147b165 of 2026-06-04: DLL_<name>, ANIMDATA/HSFHEADER/HSFMESH, readStat/dirBuf). The game it
+# compiles is the same byte-matching game; only spellings moved. Every source edit below that
+# depends on a spelling now carries both, and the shims select theirs with RECOMP_DECOMP_GEN.
+# MEASURED before this: on a gen-2 tree 12 of 60 edits silently matched nothing (the data.c,
+# armem.c, LoadHSF, sprite and esprite endianness hooks among them) and three shims failed to
+# compile — a build that "succeeds" and cannot load a single model.
+if grep -q 'ANIMDATA' "$BUILD/include/game/animdata.h" 2>/dev/null; then DECOMP_GEN=2; else DECOMP_GEN=1; fi
+echo "[recomp] decomp generation $DECOMP_GEN"
 # [audio, RECOMP_MUSYX=1] The source fixes MusyX + the msm layer need under emcc -std=gnu89.
 # Verified 2026-09-01: with these + the existing shims/dolphin/os/OSFastCast.h overlay, ALL 33
 # library TUs from extern/musyx/CMakeLists.txt AND all 6 src/msm/*.c wrappers compile
@@ -117,6 +148,17 @@ if [ -n "${RECOMP_MUSYX:-}" ]; then
   #      includes both — hw_dspctrl.c does, via dolphin/os/OSCache.h. `long` is 32-bit on
   #      wasm32 so aligning the PC branch to the decomp's spelling is ABI-identical.
   perl -0pi -e 's/typedef signed int s32;\ntypedef unsigned int u32;/typedef signed long s32;\ntypedef unsigned long u32;/' "$BUILD/extern/musyx/include/musyx/musyx.h" 2>/dev/null || true
+  #      [musyx adc8df9, 2026-05] the newer submodule spells that branch `#include <stdint.h>` +
+  #      int8_t..uint64_t typedefs, and <stdint.h> resolves to the decomp's own include/stdint.h,
+  #      which defines only uintptr_t -> every MusyX TU fails (`unknown type name 'int8_t'`,
+  #      MEASURED 2026-10-03: 6 of 39 audio objects built). Same fix, spelled for that layout:
+  #      the decomp's dolphin/types.h types (s32/u32 = long, s64 = long long).
+  perl -0pi -e 's/#include <stdint.h>\ntypedef int8_t s8;\ntypedef int16_t s16;\ntypedef int32_t s32;\ntypedef int64_t s64;\ntypedef uint8_t u8;\ntypedef uint16_t u16;\ntypedef uint32_t u32;\ntypedef uint64_t u64;/typedef signed char s8;\ntypedef signed short s16;\ntypedef signed long s32;\ntypedef signed long long s64;\ntypedef unsigned char u8;\ntypedef unsigned short u16;\ntypedef unsigned long u32;\ntypedef unsigned long long u64;/' "$BUILD/extern/musyx/include/musyx/musyx.h" 2>/dev/null || true
+fi
+# [2026-10-01] (c) RUNS IN EVERY BUILD, not only RECOMP_MUSYX: these are correct prototypes either
+# way, and with every overlay compiled in, a SILENT build has callers of the same msm* host
+# import with different implicit signatures (sreset.c vs selmenuDll: msmMusSetMasterVolume
+# (i32)->i32 vs (i32)->void), which wasm-ld refuses for an undefined import.
   #  (c) signature reconciliation. Compiling the msm layer IN turns nine previously-harmless
   #      implicit declarations into wasm-ld `function signature mismatch` warnings (measured:
   #      0 -> 9 on the first RECOMP_MUSYX link). Same mwcc decl!=def class as sig_fixes.json:
@@ -138,6 +180,7 @@ if [ -n "${RECOMP_MUSYX:-}" ]; then
   #      compile AND behave identically; a plain void prototype makes sreset.c fail to compile.
   perl -0pi -e 's/void msmSysCheckInit\(void\)\s*\{\s*\n\s*sndIsInstalled\(\);\s*\n\}/s32 msmSysCheckInit(void)\n{\n    return sndIsInstalled();\n}/s' "$BUILD/src/msm/msmsys.c" 2>/dev/null || true
   perl -0pi -e 's/void msmSysCheckInit\(void\);/s32 msmSysCheckInit(void);/' "$BUILD/include/msm/msmsys.h" 2>/dev/null || true
+if [ -n "${RECOMP_MUSYX:-}" ]; then
   #      SAME mwcc-r3 CLASS, AND IT WAS THE WHOLE REASON NOTHING EVER SOUNDED. synth_adsr.c:106
   #      declares `u32 adsrSetup(ADSR_VARS*)` and its body is `adsr->state = 0;
   #      salChangeADSRState(adsr);` with NO return. On PPC that is not a bug: salChangeADSRState
@@ -200,6 +243,26 @@ perl -0pi -e 's{^(?=(?:BOOL CheckBallCoinDone|void TakeBallStar|void ExecTakeBal
 #     (a __CARDStart un-static transform used to live here; deleted 2026-08-28 as DEAD — skip_unit
 #      below excludes the whole src/dolphin/card/ tree, so CARDBios.c is never compiled. The card
 #      SDK is replaced wholesale by shims/src/gc_card.c.)
+#     [decomp gen2] include/ctype.h declares isalpha/isdigit/... `__attribute__((weak))` (its
+#     DECL_WEAK, for MSL's matching build). A WEAK reference does not pull a definition out of an
+#     archive, MSL is not compiled here, so wasm-ld leaves isalpha undefined-weak and turns every
+#     call into a trap: MEASURED, `unreachable` in MakeObjectName (hsfload.c `isalpha(name[1])`)
+#     <- Hu3DModelObjMtxGet <- instDll's InstPlayerMain, the first minigame instruction screen.
+#     Strong declarations bind them to libc's (identical for the ASCII names the game passes).
+perl -0pi -e 's/DECL_WEAK (int (?:is|to)\w+\(int __c\);)/$1/g' "$BUILD/include/ctype.h" 2>/dev/null || true
+#     [decomp gen2] bowser.h declares `void BoardBowserExec`, bowser.c defines `s32` (its body returns
+#     nothing; board/main.c ignores the value). Declare it as defined.
+perl -0pi -e 's/^void BoardBowserExec\(s32 player, s32 space\);/s32 BoardBowserExec(s32 player, s32 space);/m' "$BUILD/include/game/board/bowser.h" 2>/dev/null || true
+#     [2026-10-03] CALLBACK SIGNATURES. wasm's call_indirect checks the callee's exact type and traps
+#     (`null function or function signature mismatch`) on any difference; PowerPC does not care, and
+#     the matching decomp keeps every mwcc-era mismatch (a `void f(void)` stored where the caller passes
+#     arguments or reads a result). Found with -Wcast-function-type-strict + a scan for `(void*)fn`
+#     launders across src/game and all 93 overlays; each fix gives the callee the type its CALLER
+#     uses, with the value PowerPC would have produced (see the overlay block for the rest).
+#     board/boo.c: BallRenderHook is `void(void)` but runs as an HU3DMODELHOOK (model, mtx) — the Boo
+#     ball's render hook, so the first Boo event on a board would trap. It reads neither argument.
+perl -0pi -e 's/static void BallRenderHook\(void\)/static void BallRenderHook(HU3DMODEL *__m, Mtx __mtx)/g' "$BUILD/src/game/board/boo.c" 2>/dev/null || true
+[ "$(grep -c 'BallRenderHook(HU3DMODEL \*__m, Mtx __mtx)' "$BUILD/src/game/board/boo.c")" = 2 ] || { echo "[recomp] FATAL: boo.c BallRenderHook signature edit did not apply" >&2; exit 1; }
 #     omAddObjEx: canonicalize the header prototype's 6th param to the definition's fn-ptr type:
 perl -0pi -e 's/(omObjData \*omAddObjEx\(Process \*objman_process, s16 prio, u16 mdlcnt, u16 mtncnt, s16 group, )omObjFunc func(\);)/${1}void (*func)(omObjData *)${2}/' "$BUILD/include/game/object.h" 2>/dev/null || true
 #     HuSetVecF: mapspace.c carries a WRONG local prototype (double args); the definition
@@ -262,17 +325,38 @@ perl -0pi -e 's/(void __DVDFSInit\(\) \{)/$1\n\t__DVDLongFileNameFlag = 1;/' "$B
 #     synchronously to the software ring, consumed later by Dolphin), so the draw is "done" as
 #     soon as it is emitted -> skip the wait (else it spins forever on OSSleepThread).
 perl -0pi -e 's/while \(!DrawDone\) \{\s*OSSleepThread\(&FinishQueue\);\s*\}/DrawDone = 1;/s' "$BUILD/src/dolphin/gx/GXMisc.c" 2>/dev/null || true
-#     [AOT-overlay, REL_ENDIANNESS_PLAN.md step 3] objdll.c omDLLLink: dispatch OVL_BOOT to the
-#     statically-compiled bootDll _prolog (executor.c) instead of HuDvdDataReadDirect(.rel from
-#     disc) + OSLink (no-op import) + calling the big-endian garbage module->prolog pointer (the
-#     current spin). bootDll is compiled into the wasm by step 1. Gated with the step-1 compile.
-if [ -z "${RECOMP_NO_BOOTDLL:-}" ]; then
-perl -0pi -e 's{(dll->name = dllFile->name;\n)}{$1\tif(overlay == OVL_BOOT){extern s32 _prolog(void); dll->module = 0; dll->bss = 0; if(flag==1){OSReport("objdll> AOT bootDll _prolog\\n"); dll->ret = _prolog();} return dll;}\n}' "$BUILD/src/game/objdll.c" 2>/dev/null || true
-#     AOT overlays have dll->module==0, so omDLLUnlink's epilog call + OSUnlink + module free would
-#     null-deref when the overlay is killed (title -> OVL_MODESEL switch). Guard the module accesses.
-perl -0pi -e 's/(\(\(DLLEpilog\)dll_ptr->module->epilog\)\(\);)/if(dll_ptr->module) $1/' "$BUILD/src/game/objdll.c" 2>/dev/null || true
+#     [AOT overlays, 2026-10-01 — TABLE-DRIVEN] objdll.c is where the game links an overlay. Every
+#     overlay compiled into this module (ovl_build.py; RECOMP_OVERLAYS, default all) is dispatched
+#     through ONE generated table (BUILD/ovl/ovl_table.c, consulted via shims/src/gc_ovl_dispatch.c)
+#     instead of HuDvdDataReadDirect(.rel) + OSLink + calling the big-endian PowerPC prolog address
+#     read out of the REL header. It replaces four hand-written `if(overlay == OVL_X)` cases (the
+#     reason the shipped binary carried only four overlays) and adds the two things they lacked:
+#       * FRESH STATICS on every link (data restored, bss zeroed) and bss zeroed again on the
+#         "Already Loaded" restart — what OSLink and objdll.c's memset do on hardware. Without it
+#         the second entry into an overlay ran on the previous visit's statics: MEASURED, the
+#         LoadHSF out-of-bounds trap on re-entering mentDll (ovl_build.py has the trace).
+#       * The "Already Loaded" path (omDLLStart, dllno>=0 && !flag) and omDLLEnd's stay-resident
+#         epilog both dereferenced dll->module, which is 0 for an AOT overlay — in wasm a read of
+#         address 0 does not trap, it returns the C statics at the bottom of linear memory, and
+#         memset(dll->bss=0, 0, <that>) would then zero them. Both are routed to the table now.
+#     An overlay that is NOT in the table still takes the original path and stops, named, at the
+#     OSLink host import (recomp_worker.js AN OVERLAY THIS BUILD DOES NOT CARRY).
+#     Anchors are lines both decomp generations share (verified on the 2026 tree; the gen1 tree is
+#     the one these hooks replaced, whose own anchors were the same lines).
+perl -0pi -e 's{\A}{extern long __recomp_ovl_find(short);\nextern void __recomp_ovl_fresh(long);\nextern void __recomp_ovl_bss(long);\nextern long __recomp_ovl_prolog(long);\nextern void __recomp_ovl_epilog(long);\nextern const char *__recomp_ovl_name(long);\nextern void __recomp_ovl_bind(void *, long);\nextern long __recomp_ovl_of(void *);\nextern void __recomp_ovl_unbind(void *);\n}' "$BUILD/src/game/objdll.c" 2>/dev/null || true
+perl -0pi -e 's{(dll->name = dllFile->name;\n)}{$1\t{ long __ri = __recomp_ovl_find(overlay); if(__ri >= 0){ dll->module = 0; dll->bss = 0; __recomp_ovl_bind(dll, __ri); __recomp_ovl_fresh(__ri); if(flag==1){OSReport("objdll> AOT %s prolog\\n", __recomp_ovl_name(__ri)); dll->ret = __recomp_ovl_prolog(__ri);} return dll; } }\n}' "$BUILD/src/game/objdll.c" 2>/dev/null || true
+perl -0pi -e 's{(omDllData \*dll = omDLLinfoTbl\[dllno\];\n)}{$1\t\t{ long __ri = __recomp_ovl_of(dll); if(__ri >= 0){ OSReport("objdll>Already Loaded AOT %s\\n", __recomp_ovl_name(__ri)); __recomp_ovl_bss(__ri); dll->ret = __recomp_ovl_prolog(__ri); return dllno; } }\n}' "$BUILD/src/game/objdll.c" 2>/dev/null || true
+perl -0pi -e 's/(\(\(DLLEpilog\)dll->module->epilog\)\(\);)/if(dll->module) $1 else __recomp_ovl_epilog(__recomp_ovl_of(dll));/' "$BUILD/src/game/objdll.c" 2>/dev/null || true
+perl -0pi -e 's/(\(\(DLLEpilog\)dll_ptr->module->epilog\)\(\);)/if(dll_ptr->module) $1 else __recomp_ovl_epilog(__recomp_ovl_of(dll_ptr));/' "$BUILD/src/game/objdll.c" 2>/dev/null || true
 perl -0pi -e 's/(if\(OSUnlink\(&dll_ptr->module->info\) != TRUE\))/if(dll_ptr->module \&\& OSUnlink(&dll_ptr->module->info) != TRUE)/' "$BUILD/src/game/objdll.c" 2>/dev/null || true
 perl -0pi -e 's/(HuMemDirectFree\(dll_ptr->module\);)/if(dll_ptr->module) $1/' "$BUILD/src/game/objdll.c" 2>/dev/null || true
+perl -0pi -e 's/(\n(\s*)HuMemDirectFree\(dll_ptr\);)/\n$2__recomp_ovl_unbind(dll_ptr);$1/' "$BUILD/src/game/objdll.c" 2>/dev/null || true
+for mark in '__recomp_ovl_find(overlay)' '__recomp_ovl_of(dll); if' 'else __recomp_ovl_epilog(__recomp_ovl_of(dll));' \
+            'else __recomp_ovl_epilog(__recomp_ovl_of(dll_ptr));' 'if(dll_ptr->module) HuMemDirectFree' '__recomp_ovl_unbind(dll_ptr);'; do
+  if ! grep -qF "$mark" "$BUILD/src/game/objdll.c"; then
+    echo "[recomp] FATAL: objdll.c overlay hook did not apply: $mark" >&2; exit 1
+  fi
+done
 #     [step 4] bootDll NintendoDataDecode: the compiled-in nintendoData.inc is BIG-ENDIAN; the
 #     size + decode_type header u32s are read natively (LE-wrong). Byte-swap them (HuDecodeData
 #     reads the compressed body byte-by-byte per data.c:587, so only the 2 header reads need it).
@@ -280,23 +364,6 @@ perl -0pi -e 's/(u32 size = )\*src\+\+;/${1}__builtin_bswap32(*src++);/; s/(int 
 #     [step 5] byte-swap the decoded BE AnimData sprite tree to LE once at decode time, so
 #     HuSprAnimRead + the sprite render path read correct offsets/counts (shims/src/gc_anim_bswap.c).
 perl -0pi -e 's/(HuDecodeData\(src, dst, size, decode_type\);)/$1\n\t\t{ extern void __recomp_bswap_animtree(void*); __recomp_bswap_animtree(dst); }/' "$BUILD/src/REL/bootDll/main.c" 2>/dev/null || true
-fi
-#     [AOT-overlay, generalized] dispatch OVL_MODESEL to the statically-compiled, symbol-namespaced
-#     modesel_prolog (shims/src/gc_ovl_dispatch.c -> modesel_ObjectSetup), same trick as OVL_BOOT.
-#     Inserted after the OVL_BOOT case. Gated with the modesel compile below.
-if [ -n "${RECOMP_MODESEL:-}" ]; then
-perl -0pi -e 's{(if\(overlay == OVL_BOOT\)\{.*?return dll;\}\n)}{$1\tif(overlay == OVL_MODESEL){extern s32 modesel_prolog(void); dll->module = 0; dll->bss = 0; if(flag==1){OSReport("objdll> AOT modesel_prolog\\n"); dll->ret = modesel_prolog();} return dll;}\n}s' "$BUILD/src/game/objdll.c" 2>/dev/null || true
-fi
-#     [AOT-overlay] OVL_MENT (Party-Mode entry/setup, the overlay the mode carousel calls into)
-#     — same static dispatch; ment_prolog (gc_ovl_dispatch.c) runs fn_mt1_144, mentDll's real
-#     init (its own _prolog minus the empty ctor walk). Gated with the ment compile below.
-if [ -n "${RECOMP_MENT:-}" ]; then
-perl -0pi -e 's{(if\(overlay == OVL_MODESEL\)\{.*?return dll;\}\n)}{$1\tif(overlay == OVL_MENT){extern s32 ment_prolog(void); dll->module = 0; dll->bss = 0; if(flag==1){OSReport("objdll> AOT ment_prolog\\n"); dll->ret = ment_prolog();} return dll;}\n}s' "$BUILD/src/game/objdll.c" 2>/dev/null || true
-fi
-#     [AOT-overlay] OVL_W01 — the first BOARD (Toad's Midway Madness), the 120fps target scene.
-if [ -n "${RECOMP_W01:-}" ]; then
-perl -0pi -e 's{(if\(overlay == OVL_MENT\)\{.*?return dll;\}\n)}{$1\tif(overlay == OVL_W01){extern s32 w01_prolog(void); dll->module = 0; dll->bss = 0; if(flag==1){OSReport("objdll> AOT w01_prolog\\n"); dll->ret = w01_prolog();} return dll;}\n}s' "$BUILD/src/game/objdll.c" 2>/dev/null || true
-fi
 if [ -n "${RECOMP_MSDIAG:-}" ]; then
 perl -0pi -e 's/(void BootExec\(void\)\s*\n\{)/$1\n    OSReport("MK-OMOVL evt=%d init=%d\\n", omovlevtno, SystemInitF);/' "$BUILD/src/REL/bootDll/main.c" 2>/dev/null || true
 fi
@@ -309,6 +376,23 @@ fi
 perl -0pi -e 's/(read_stat->file = PTR_OFFSET\(read_stat->dir, )\*temp_ptr(\);)/${1}__builtin_bswap32(*temp_ptr)${2}/;
               s/(read_stat->raw_len = )\*temp_ptr\+\+;/${1}__builtin_bswap32(*temp_ptr); temp_ptr++;/;
               s/(read_stat->comp_type = )\*temp_ptr\+\+;/${1}__builtin_bswap32(*temp_ptr); temp_ptr++;/;' "$BUILD/src/game/data.c" 2>/dev/null || true
+#     [decomp gen2] the same three reads in the 2026 decomp's spelling (read_stat->readStat,
+#     file->fileDataP, raw_len->rawLen, comp_type->decodeType, temp_ptr->ptr). See DECOMP GENERATIONS.
+perl -0pi -e 's/(readStat->fileDataP = PTR_OFFSET\(readStat->dirP, )\*ptr(\);)/${1}__builtin_bswap32(*ptr)${2}/;
+              s/(readStat->rawLen = )\*ptr\+\+;/${1}__builtin_bswap32(*ptr); ptr++;/;
+              s/(readStat->decodeType = )\*ptr\+\+;/${1}__builtin_bswap32(*ptr); ptr++;/;' "$BUILD/src/game/data.c" 2>/dev/null || true
+#     [general asset endianness, 2026-10-01] The SHORT read path: HuDataReadNumHeapShortForce
+#     (data.c) reads only the directory header + the one sub-file it needs straight off the disc,
+#     and parses that big-endian header natively — file count, the file's offset, the next file's
+#     offset — then HuDataDecodeIt reads the sub-file's rawLen/decodeType natively when the header
+#     is 4-aligned (its unaligned branch assembles bytes big-endian, which is right either way).
+#     Reached only from overlays: instDll's instruction picture (instDll main.c:218) and mgmodedll
+#     free play — so the four-overlay build never hit it. MEASURED on the all-overlay build: w02's
+#     first minigame instruction screen asked DVDReadAsyncPrio for 0xE8B90000 bytes. Swap all five.
+perl -0pi -e 's/(fileNumMax = )\*fileData;/${1}(s32)__builtin_bswap32((u32)*fileData);/;
+              s/(\n\s*fileOfs = )\*dataHdr;/${1}(s32)__builtin_bswap32((u32)*dataHdr);/;
+              s/(dataOfs = )\(\*dataHdr\)-readOfs;/${1}(s32)__builtin_bswap32((u32)*dataHdr)-readOfs;/;
+              s/(\n(\s*)s32 \*data = buf;\n\s*)rawLen = \*data\+\+;\n\s*decodeType = \*data\+\+;/${1}rawLen = (s32)__builtin_bswap32((u32)*data); data++;\n$2decodeType = (s32)__builtin_bswap32((u32)*data); data++;/;' "$BUILD/src/game/data.c" 2>/dev/null || true
 #     [ARAM-archive endianness] HuAR_ARAMtoMRAMFileRead (armem.c) is the ARAM twin of GetFileInfo:
 #     it walks the ARAM-staged archive's BIG-ENDIAN offset table (preLoadBuf entry pair) and the
 #     sub-file's raw_len/comp_type header with native reads -> size 0x2c030020 alloc error at
@@ -319,6 +403,12 @@ perl -0pi -e 's/count = dir_data\[0\];/count = (s32)__builtin_bswap32((u32)dir_d
               s/size = \(dir_data\[1\] - count \+ 0x3F\)/size = ((s32)__builtin_bswap32((u32)dir_data[1]) - count + 0x3F)/;
               s/dst = HuMemDirectMallocNum\(heap, \(dir_data\[0\] \+ 1\) & ~1, num\);/dst = HuMemDirectMallocNum(heap, ((s32)__builtin_bswap32((u32)dir_data[0]) + 1) & ~1, num);/;
               s/HuDecodeData\(&dir_data\[2\], dst, dir_data\[0\], dir_data\[1\]\);/HuDecodeData(\&dir_data[2], dst, (s32)__builtin_bswap32((u32)dir_data[0]), (s32)__builtin_bswap32((u32)dir_data[1]));/;' "$BUILD/src/game/armem.c" 2>/dev/null || true
+#     [decomp gen2] same five reads, dir_data -> dirBuf.
+perl -0pi -e 's/count = dirBuf\[0\];/count = (s32)__builtin_bswap32((u32)dirBuf[0]);/;
+              s/if \(dirBuf\[1\] - count < 0\) \{/if ((s32)__builtin_bswap32((u32)dirBuf[1]) - count < 0) {/;
+              s/size = \(dirBuf\[1\] - count \+ 0x3F\)/size = ((s32)__builtin_bswap32((u32)dirBuf[1]) - count + 0x3F)/;
+              s/dst = HuMemDirectMallocNum\(heap, \(dirBuf\[0\] \+ 1\) & ~1, num\);/dst = HuMemDirectMallocNum(heap, ((s32)__builtin_bswap32((u32)dirBuf[0]) + 1) & ~1, num);/;
+              s/HuDecodeData\(&dirBuf\[2\], dst, dirBuf\[0\], dirBuf\[1\]\);/HuDecodeData(\&dirBuf[2], dst, (s32)__builtin_bswap32((u32)dirBuf[0]), (s32)__builtin_bswap32((u32)dirBuf[1]));/;' "$BUILD/src/game/armem.c" 2>/dev/null || true
 #     [DIAG, gated] FONTDIAG: print every 320-wide HuSprTexLoad (anim/bmp/data ptrs) — the
 #     board-font barcode forensics (FIFO SETIMAGE base diverges from the only header in RAM).
 if [ -n "${RECOMP_FONTDIAG:-}" ]; then
@@ -328,7 +418,7 @@ fi
 #     screen, board, characters) with native LE loads -> garbage counts/offsets -> OOB. Swap the
 #     whole file BE->LE once at LoadHSF entry, before FileLoad reads the header. Covers all 21 HSF
 #     sections + nested cenv/motion/strip data (shims/src/gc_hsf_bswap.c, built by wf_a2d55c6d).
-perl -0pi -e 's/(HsfData \*LoadHSF\(void \*data\)\s*\{)/$1\n    { extern void __recomp_bswap_hsf(void*); __recomp_bswap_hsf(data); }/' "$BUILD/src/game/hsfload.c" 2>/dev/null || true
+perl -0pi -e 's/((?:HsfData|HSFDATA) \*LoadHSF\(void \*data\)\s*\{)/$1\n    { extern void __recomp_bswap_hsf(void*); __recomp_bswap_hsf(data); }/' "$BUILD/src/game/hsfload.c" 2>/dev/null || true
 if [ -n "${RECOMP_MSGDIAG:-}" ]; then
 perl -0pi -e 's{(data = HuDvdDataReadWait\(&file, HEAP_DVD, 0, 0, HuDVDReadAsyncCallBack, FALSE\);)}{OSReport("HDDR start=%d len=%d dir=%d\\n", (int)file.startAddr, (int)file.length, (int)DirDataSize); $1}' "$BUILD/src/game/dvd.c" 2>/dev/null || true
 fi
@@ -358,7 +448,7 @@ perl -0pi -e 's/(BOOL HuTHPEndCheck\(void\)\s*\n\{)/$1\n    return 1;/' "$BUILD/
 #     THPViewSprFunc is the per-frame sprite draw fn for the video (HuSprFuncCreate) — with the movie
 #     skipped it reads a non-existent decoded frame -> the `unreachable` fiber trap. No-op it (the THP
 #     sprite stays valid but draws nothing) so the demo can advance.
-perl -0pi -e 's/(static void THPViewSprFunc\(HuSprite \*arg0\)\s*\n\{)/$1\n    return;/' "$BUILD/src/game/thpmain.c" 2>/dev/null || true
+perl -0pi -e 's/(static void THPViewSprFunc\((?:HuSprite|HUSPRITE) \*arg0\)\s*\n\{)/$1\n    return;/' "$BUILD/src/game/thpmain.c" 2>/dev/null || true
 #     [input inject] the recomp has no VI-retrace interrupt firing PadReadVSync, so HuPadBtnDown
 #     never gets real input. Deliver host buttons: OR __recomp_inject_btn[p] (set by the host via
 #     ___recomp_set_pad) into HuPadBtnDown[p] at HuPadRead's end (shims/src/gc_input.c).
@@ -409,11 +499,13 @@ perl -0pi -e 's/(void main\(void\)\s*\n\{)/$1\n    __OSBusClock = 162000000u; __
 #     read so the fresh blob is byte-swapped ONCE (shims/src/gc_anim_bswap.c) before HuSprAnimRead.
 #     Fixes ALL disc sprites (title bg/copyright/press-start, game sprites); the bootDll logo doesn't
 #     use this macro so it is unaffected (no double-swap).
-perl -0pi -e 's/#define HuSprAnimReadFile\(data_id\) \(HuSprAnimRead\((HuDataSelHeapReadNum\(\(data_id\), MEMORY_DEFAULT_NUM, HEAP_DATA\))\)\)/extern void *__recomp_bswap_animtree_ret(void *);\n#define HuSprAnimReadFile(data_id) (HuSprAnimRead(__recomp_bswap_animtree_ret($1)))/' "$BUILD/include/game/sprite.h" 2>/dev/null || true
+perl -0pi -e 's/#define HuSprAnimReadFile\(data_id\) \(HuSprAnimRead\((HuDataSelHeapReadNum\(\(data_id\), (?:MEMORY_DEFAULT_NUM, HEAP_DATA|HU_MEMNUM_OVL, HEAP_MODEL)\))\)\)/extern void *__recomp_bswap_animtree_ret(void *);\n#define HuSprAnimReadFile(data_id) (HuSprAnimRead(__recomp_bswap_animtree_ret($1)))/' "$BUILD/include/game/sprite.h" 2>/dev/null || true
 #     esprite.c espEntry reads the SAME fresh disc AnimData but calls HuSprAnimRead directly
 #     (not via the macro) -> BE blob parsed natively -> garbage-size mallocs (0x2c030020) +
 #     HuMemMemoryAlloc free-list spin when the modesel menu creates its sprites. Wrap it too.
 perl -0pi -e 's/(var_r30->unk08 = HuSprAnimRead\()(temp_r26)(\);)/{ extern void *__recomp_bswap_animtree_ret(void *); $1__recomp_bswap_animtree_ret($2)$3 }/' "$BUILD/src/game/esprite.c" 2>/dev/null || true
+#     [decomp gen2] espEntry's read is spelled `animFree->anim = HuSprAnimRead(data);` there.
+perl -0pi -e 's/(animFree->anim = HuSprAnimRead\()(data)(\);)/{ extern void *__recomp_bswap_animtree_ret(void *); $1__recomp_bswap_animtree_ret($2)$3 }/' "$BUILD/src/game/esprite.c" 2>/dev/null || true
 #     board/space.c manually relocates AnimData blobs (data->bmp = base + ofs) WITHOUT going
 #     through HuSprAnimRead — the auto-swap hook never runs, the BE offsets produce wild
 #     pointers, and bmp->dataSize feeds an OOB memcpy (the first w01 BoardCreate trap).
@@ -457,13 +549,13 @@ perl -0pi -e 's/spaceCnt\[layer\] = \*\(u32 \*\)data;/spaceCnt[layer] = __builti
 #     HuMemMemoryAlloc ring spin). Hook HuSprAnimRead's ENTRY with the auto-detecting swap
 #     (BE/LE plausibility vote, gc_anim_bswap.c) — pre-swapped/relocated trees vote LE and
 #     pass through, so the older per-site swaps stay harmless.
-perl -0pi -e 's/(AnimData \*HuSprAnimRead\(void \*data\)\n\{)/$1\n    { extern void *__recomp_bswap_animtree_auto(void *); data = __recomp_bswap_animtree_auto(data); }/' "$BUILD/src/game/sprman.c" 2>/dev/null || true
+perl -0pi -e 's/((?:AnimData|ANIMDATA) \*HuSprAnimRead\(void \*data\)\n\{)/$1\n    { extern void *__recomp_bswap_animtree_auto(void *); data = __recomp_bswap_animtree_auto(data); }/' "$BUILD/src/game/sprman.c" 2>/dev/null || true
 #     [static-anim double-relocation] The already-relocated sentinel (anim->bank & 0xFFFF0000)
 #     never trips for a STATIC .inc tree at a low wasm address (base+bankOfs < 0x10000), so a
 #     shared asset's second HuSprAnimRead relocated it TWICE (bank = ofs + 2*base — the
 #     title/board noise-texture bind at masked 0x173cbd20). Statics relocate once per address
 #     via the shim registry; heap trees keep the retail sentinel (sound at 0x80xxxxxx).
-perl -0pi -e 's/(    AnimData \*anim = \(AnimData \*\)data;\n)(    if\(\(u32\)anim->bank & 0xFFFF0000\) \{)/$1    if ((u32)data < 0x80000000u) { extern int __recomp_animreloc_once(void*); if (!__recomp_animreloc_once(data)) { anim->useNum++; return anim; } }\n$2/' "$BUILD/src/game/sprman.c" 2>/dev/null || true
+perl -0pi -e 's/(    (?:AnimData|ANIMDATA) \*anim = \((?:AnimData|ANIMDATA) \*\)data;\n)(    if\(\(u32\)anim->bank & 0xFFFF0000\) \{)/$1    if ((u32)data < 0x80000000u) { extern int __recomp_animreloc_once(void*); if (!__recomp_animreloc_once(data)) { anim->useNum++; return anim; } }\n$2/' "$BUILD/src/game/sprman.c" 2>/dev/null || true
 #     [DIAG, gated] on the allocator's error path, call a host import so the probe's JS stub can
 #     print the wasm caller chain (retaddr tags are all zeroed by the malloc.c mflr bake, so the
 #     in-game "Call" tag is useless). Error-path only — no hot-path cost; gated to keep the
@@ -532,6 +624,15 @@ fi
 #     these register writes only need a valid target. Prototype prepended; see
 #     gamecube/recomp/shims/src/gc_mmio_scratch.c. Behavior-preserving for frame emission.
 perl -0pi -e 's/\A/extern void *__recomp_reg_base(unsigned);\n/; s/(__\w+Reg\s*=\s*)OSPhysicalToUncached(\(0xC00[0-9A-Fa-f]+\))/${1}__recomp_reg_base$2/g' "$BUILD/src/dolphin/gx/GXInit.c" 2>/dev/null || true
+#     [2026-10-03] RAM through the UNCACHED mirror. On hardware 0xC0000000+x is main RAM at
+#     0x80000000+x with the cache bypassed; here guest RAM exists once, at its cached address, and
+#     nothing models the cache, so the mirror is the same bytes. OSCachedToUncached /
+#     OSUncachedToCached become the identity. MEASURED before: m415Dll main.c fn_1_1960
+#     `memcpy(bmp->data, OSCachedToUncached(Hu3DShadowData.buf), size*size)` read 0xC0xxxxxx, past
+#     the wasm memory ceiling -> `memory access out of bounds` on that minigame's first frame. (The
+#     MMIO window, OSPhysicalToUncached(0xC00xxxx), is a different thing and is handled above.)
+perl -0pi -e 's/(#define OSCachedToUncached\(caddr\) )\(\(void \*\)\(\(u8 \*\)\(caddr\) \+ \(OS_BASE_UNCACHED - OS_BASE_CACHED\)\)\)/${1}((void *)(caddr))/; s/(#define OSUncachedToCached\(ucaddr\) )\(\(void \*\)\(\(u8 \*\)\(ucaddr\) - \(OS_BASE_UNCACHED - OS_BASE_CACHED\)\)\)/${1}((void *)(ucaddr))/' "$BUILD/include/dolphin/os.h" 2>/dev/null || true
+grep -q 'define OSCachedToUncached(caddr) ((void \*)(caddr))' "$BUILD/include/dolphin/os.h" || { echo "[recomp] FATAL: OSCachedToUncached identity edit did not apply" >&2; exit 1; }
 
 # 3d. AUDIO / ARAM-DSP NEUTRALIZATION. The compiled-in SDK ARAM driver (ar.c) dereferences
 #     __DSPRegs, a hardcoded pointer macro `((vu16*)0xCC005000)` (hw_regs.h:226, the
@@ -677,7 +778,17 @@ for fx in fixes:
             nt,ch=truncate_calls(s,name,ar)
             if ch: s=nt; open(f,"w",errors="surrogateescape").write(s)
         if proto in s: continue                                                        # already injected
-        if declpat.search(s): continue                                                 # already has a prototype
+        dm=declpat.search(s)
+        if dm:
+            # [decomp gen2] a LOCAL prototype that disagrees with the definition (board/space.c
+            # carries `extern void BoardMushroomExec(s32 player, s32 space); // wrong` against a
+            # one-argument definition) is replaced by the canonical one, or the arity truncation
+            # above leaves calls that no longer match their own file's declaration.
+            d=' '.join(dm.group(0).split())
+            first=d.split()[0] if d.split() else ''
+            if not isdef and (first=='extern' or re.match(TYPE+'$',first)) and ' '.join(proto.split())!=d.replace('extern ','',1):
+                s=s[:dm.start()]+proto+s[dm.end():]; open(f,"w",errors="surrogateescape").write(s)
+            continue                                                                   # has a prototype
         if hdr and ('"%s"'%hdr in s or '<%s>'%hdr in s): continue                       # includes declaring header
         if isdef: continue                                                             # def file
         incs=list(re.finditer(r'(?m)^#include[^\n]*\n',s)); ins=incs[-1].end() if incs else 0
@@ -708,7 +819,7 @@ CFLAGS=( -c -std=gnu89 -O2 -Wno-everything -Wno-error -Wno-implicit-function-dec
         -Wno-incompatible-function-pointer-types -Wno-incompatible-pointer-types
         -Wno-builtin-requires-header -fno-builtin
         -Wreturn-type -Wreturn-mismatch
-        -DVERSION=0 -fdeclspec ${RECOMP_HSFDIAG:+-DRECOMP_HSFDIAG}
+        -DVERSION=0 -DRECOMP_DECOMP_GEN=$DECOMP_GEN -fdeclspec ${RECOMP_HSFDIAG:+-DRECOMP_HSFDIAG}
         -I "$BUILD/include" -I "$BUILD/gen" -I "$BUILD/extern/musyx/include" -I "$BUILD/src" )
 # NOTE: implicit-declaration signature mismatches (a bounded finite set surfaced at
 # link) are resolved in port-completion by adding the missing per-unit includes; the
@@ -812,92 +923,163 @@ if [ -n "${RECOMP_MUSYX:-}" ]; then
   done
   echo "[recomp] RECOMP_MUSYX: $musyx_ok MusyX/msm/audio-host objects built"
 fi
-# [AOT-overlay, REL_ENDIANNESS_PLAN.md step 1] Compile the bootDll boot-logo overlay INTO the
-# DOL module (only its 3 units: executor.c shared prolog + bootDll/main.c + language.c). All 78
-# of bootDll's DOL calls bind by plain symbol name to functions already in the wasm, so this
-# sidesteps runtime OSLink + the disc read + the big-endian relocation/prolog-ptr spin. The
-# other ~92 RELs stay skipped (they share auto-named fn_* symbols that collide when flat-linked).
-if [ -z "${RECOMP_NO_BOOTDLL:-}" ]; then
-  compile_one "$BUILD/src/REL/executor.c"
-  compile_one "$BUILD/src/REL/bootDll/main.c"
-  compile_one "$BUILD/src/REL/bootDll/language.c"
+# [AOT overlays, 2026-10-01] EVERY OVERLAY, ONE PROCEDURE (gamecube/recomp/ovl_build.py).
+# RECOMP_OVERLAYS = 'all' (default) or a space-separated list of src/REL directory names, e.g.
+#   RECOMP_OVERLAYS="bootDll modeseldll mentDll w01Dll"   (the set the 7040471c binary carried)
+# The legacy RECOMP_MODESEL/RECOMP_MENT/RECOMP_W01 switches are no longer needed and are ignored;
+# RECOMP_NO_BOOTDLL=1 still drops bootDll from the list.
+# The per-overlay SOURCE fixes below are kept verbatim from the hand-written blocks they came
+# from (missing #includes that turned into int-return signature mismatches); their symbol
+# namespacing (fn_1_ -> fn_ms1_ etc.) is gone because ovl_build.py namespaces every global an
+# overlay defines, mechanically, with no source edits.
+RECOMP_OVERLAYS="${RECOMP_OVERLAYS:-all}"
+if [ -n "${RECOMP_NO_BOOTDLL:-}" ]; then
+  if [ "$RECOMP_OVERLAYS" = all ]; then
+    RECOMP_OVERLAYS="$(cd "$BUILD/src/REL" && for d in */; do d=${d%/}; [ "$d" != bootDll ] && printf '%s ' "$d"; done)"
+  else RECOMP_OVERLAYS="$(printf '%s\n' $RECOMP_OVERLAYS | grep -vx bootDll | tr '\n' ' ')"; fi
 fi
-# [AOT-overlay, generalized] Compile the mode-select overlay INTO the module with its entry symbols
-# NAMESPACED (only ObjectSetup + lbl_1_bss_4 collide with the DOL/bootDll — measured via llvm-nm).
-# modesel_prolog (gc_ovl_dispatch.c) calls modesel_ObjectSetup. Toward gameplay: title->OVL_MODESEL.
-if [ -n "${RECOMP_MODESEL:-}" ]; then
-  MSNS="-DObjectSetup=modesel_ObjectSetup -D__OSBusClock=__ms_busclk -D__OSCoreClock=__ms_coreclk"
-  for u in modesel main datalist filesel; do
-    # (a) modesel implicit-declares esp*/HuTHP*/msm*/BoardStatusKill/Hu3D*2Dto3D (missing #includes)
-    #     -> wrong signatures -> 14 sig-mismatches that regress the title. Add the declaring headers.
-    perl -0pi -e 's{\A}{#include "game/esprite.h"\n#include "game/thpmain.h"\n#include "msm/msmsys.h"\n#include "game/board/ui.h"\n#include "game/hsfex.h"\n}' "$BUILD/src/REL/modeseldll/$u.c" 2>/dev/null || true
-    # (b) the decomp's auto-named module-1 symbols (fn_1_*/lbl_1_*) collide with bootDll (also a
-    #     "module 1" REL). Namespace ALL of modesel's to fn_ms1_*/lbl_ms1_* (these are REL-internal;
-    #     DOL calls use real names like Hu*/om*/esp*, so this only renames modesel's own symbols).
-    perl -0pi -e 's/\bfn_1_/fn_ms1_/g; s/\blbl_1_/lbl_ms1_/g' "$BUILD/src/REL/modeseldll/$u.c" 2>/dev/null || true
+#   modeseldll: implicit-declares esp*/HuTHP*/msm*/BoardStatusKill/Hu3D*2Dto3D -> 14 sig-mismatches
+#   that regressed the title; and fn_1_1EC0's prototype is commented out in modeseldll.h, so
+#   modesel.c/filesel.c implicit-declare it int(int) vs the real void(s16).
+for u in modesel main datalist filesel; do
+  perl -0pi -e 's{\A}{#include "game/esprite.h"\n#include "game/thpmain.h"\n#include "msm/msmsys.h"\n#include "game/board/ui.h"\n#include "game/hsfex.h"\n}' "$BUILD/src/REL/modeseldll/$u.c" 2>/dev/null || true
+done
+perl -0pi -e 's{^// (void fn_1_1EC0\(s16 view\);)}{$1}m' "$BUILD/include/REL/modeseldll.h" 2>/dev/null || true
+#   mentDll: implicit-declares the HuAud* family + Hu3D3Dto2D -> 11 int-return sig mismatches.
+perl -0pi -e 's{\A}{#include "game/audio.h"\n#include "game/hsfex.h"\n}' "$BUILD/src/REL/mentDll/main.c" 2>/dev/null || true
+#   w01Dll: CoasterHostComKeySet declared extern at :160, defined static at :2645 (clang errors);
+#   Hu3DMtxRotGet/Hu3DMtxTransGet + BoardPlayerMoveBetween/BoardCameraPosCalcFuncSet undeclared.
+perl -0pi -e 's/^extern (void CoasterHostComKeySet\(s32 playerNo\);)/static $1/m' "$BUILD/src/REL/w01Dll/main.c" 2>/dev/null || true
+perl -0pi -e 's{\A}{#include "game/hsfex.h"\n}' "$BUILD/src/REL/w01Dll/main.c" 2>/dev/null || true
+#   (gen1 declared neither board function in a header; gen2 declares both, and a second, differently
+#   spelled prototype is a hard `conflicting types` error — so add each only where none exists.)
+grep -q 'BoardPlayerMoveBetween' "$BUILD"/include/game/board/*.h 2>/dev/null ||
+  perl -0pi -e 's{\A}{extern void BoardPlayerMoveBetween(s32, s32, s32);\n}' "$BUILD/src/REL/w01Dll/main.c" 2>/dev/null || true
+grep -q 'BoardCameraPosCalcFuncSet' "$BUILD"/include/game/board/*.h 2>/dev/null ||
+  perl -0pi -e 's{\A}{extern void BoardCameraPosCalcFuncSet(void (*)(void *));\n}' "$BUILD/src/REL/w01Dll/main.c" 2>/dev/null || true
+#   Overlays the four hand-written blocks never reached. Each fix below is what the PowerPC binary
+#   on the disc does, read off the REL's own call site (tools: a REL relocation walk + the eight
+#   instructions before the `bl`), not a guess at what the C "meant":
+#   * mwcc accepts a call with FEWER arguments than the prototype; the callee then reads whatever
+#     the caller left in r4/r5. clang refuses. m404Dll main.c `espEntry(x)` (the decomp keeps the
+#     3-argument form under NON_MATCHING): the REL computes r4 = idx<<2 (`rlwinm r4,r0,2,0,29`
+#     from the same lha that indexes lbl_1_data_86C) and leaves r5 from the previous call; prio is
+#     overwritten by espPriSet(255) on the next line, bank r5 is unknowable -> 0 (NON_MATCHING's).
+perl -0pi -e 's/espEntry\(lbl_1_data_86C\[var_r27->unk_02\[5\]\]\);/espEntry(lbl_1_data_86C[var_r27->unk_02[5]], var_r27->unk_02[5] << 2, 0);/' "$BUILD/src/REL/m404Dll/main.c" 2>/dev/null || true
+#     m447dll main.c `HuAudSeqFadeOut(arg0->unk70)` ("Bug: takes two arguments" — the decomp's own
+#     note): r4 is the previous callee's leftover. The same file's other fade of the same music
+#     handle passes `li r4,1000` (REL sec1+0x728); use that.
+perl -0pi -e 's/HuAudSeqFadeOut\(arg0->unk70\);/HuAudSeqFadeOut(arg0->unk70, 1000);/' "$BUILD/src/REL/m447dll/main.c" 2>/dev/null || true
+#   * a STRUCT passed where `void *` is expected: mwcc passes the struct's ADDRESS (m413Dll's
+#     memset(lbl_1_bss_B8, 0, sizeof lbl_1_bss_B8) is `lis/addi r3,<lbl_1_bss_B8>` + `li r5,48` in
+#     the REL — the global itself, no copy). clang refuses; pass the address explicitly.
+perl -0pi -e 's/memset\(lbl_1_bss_48, 0, sizeof\(UnkM406Struct5\)\);/memset(\&lbl_1_bss_48, 0, sizeof(UnkM406Struct5));/' "$BUILD/src/REL/m406Dll/map.c" 2>/dev/null || true
+perl -0pi -e 's/memset\(lbl_1_bss_B8, 0, sizeof\(lbl_1_bss_B8\)\);/memset(\&lbl_1_bss_B8, 0, sizeof(lbl_1_bss_B8));/' "$BUILD/src/REL/m413Dll/main.c" 2>/dev/null || true
+#   * mwcc LVALUE CASTS, `(T)lv = v` = store v into lv viewed as T. Same bytes as *(T*)&(lv) = v
+#     (pointer-to-pointer casts only, here), which clang accepts.
+perl -0pi -e 's/\((Vec|GXColor|HuVec2f)\*\)\*arg0 = /*($1**)&(*arg0) = /g' "$BUILD/src/REL/m438Dll/fire.c" 2>/dev/null || true
+perl -0pi -e 's/= \(void\*\) (board\w+)(\s*)(?==)/= *(void**)&($1)$2/g' "$BUILD/src/REL/w06Dll/main.c" 2>/dev/null || true
+#   * selmenuDll declares two msm functions `static` with types that disagree with game/msm.h
+#     (a matching-decomp device); here they are host imports in a silent build or real functions
+#     with the msm.h types in an audio build, and either way the static declarations are wrong.
+perl -0pi -e 's/^static s8 \*msmSeGetIndexPtr\(s16 datano\);\n//m; s/^static void msmMusSetMasterVolume\(s32 value\);\n//m' "$BUILD/src/REL/selmenuDll/main.c" 2>/dev/null || true
+#   * DECLARATION != DEFINITION. wasm-ld turns each such call into an `unreachable` stub (the link
+#     prints `function signature mismatch`), so the game traps the first time it reaches one. What
+#     mwcc's code actually passed/returned, read off the disc:
+#     - m420dll main.c `frand(); fn_1_8934();` against `void fn_1_8934(u32 seed)`: the REL is
+#       `bl frand; bl fn_1_8934` (sec1+0x1fc/0x200) — the seed IS frand()'s r3.
+perl -0pi -e 's/frand\(\);(\s*)fn_1_8934\(\);/fn_1_8934(frand());/' "$BUILD/src/REL/m420dll/main.c" 2>/dev/null || true
+perl -0pi -e 's/void fn_1_8934\(void\);/void fn_1_8934(u32 seed);/' "$BUILD/include/REL/m420dll.h" 2>/dev/null || true
+#     - w03Dll main.c tests `fn_1_12C8() != 0` against statue.c's `void fn_1_12C8(void)`, whose
+#       last call is BoardRollDispSet(1). PPC returns whatever r3 holds: BoardRollDispSet leaves
+#       r3 = its argument (1) when there is no roll object (beq straight to its epilogue,
+#       0x80068908), else UpdateRollSprite's r3, which is the roll sprite group id — its last
+#       callee is HuSprPosSet/HuSprAttrSet, neither of which writes r3 (0x8000e960, 0x8000e808).
+#       player.c gains a reader for exactly that value and fn_1_12C8 returns it.
+perl -0pi -e 's/(void BoardRollDispSet\(s32 arg0\)\n\{)/s32 __recomp_roll_r3(void);\n$1/; s/\z/\ns32 __recomp_roll_r3(void) { return rollObj ? (s32)omObjGetWork(rollObj, bitcopy3)->unk_04 : 1; }\n/' "$BUILD/src/game/board/player.c" 2>/dev/null || true
+perl -0pi -e 's/void fn_1_12C8\(void\)\n\{(.*?)\n    BoardRollDispSet\(1\);\n\}/s32 fn_1_12C8(void)\n{$1\n    BoardRollDispSet(1);\n    { extern s32 __recomp_roll_r3(void); return __recomp_roll_r3(); }\n}/s' "$BUILD/src/REL/w03Dll/statue.c" 2>/dev/null || true
+#   * CALLBACK SIGNATURES (see the boo.c note above). Every edit is verified below.
+#     - mentDll / mpexDll / ztardll declare their per-object callback slot VARIADIC,
+#       `void (*)(OMOBJ *, ...)`, and every call site passes exactly (object, &its-own-struct). In
+#       wasm a variadic call passes (object, pointer-to-a-varargs-buffer), so a callee declared
+#       (OMOBJ *, Struct *) received the BUFFER's address, not the struct's, and a callee of any other
+#       arity trapped. The slot becomes what the callers pass: (OMOBJ *, void *).
+perl -0pi -e 's/typedef void \(\*MentDllUnkFunc\)\(OMOBJ \*, \.\.\.\);/typedef void (*MentDllUnkFunc)(OMOBJ *, void *);/' "$BUILD/src/REL/mentDll/main.c" 2>/dev/null || true
+perl -0pi -e 's/typedef void \(\*MpexDllUnkFunc2\)\(OMOBJ \*, \.\.\.\);/typedef void (*MpexDllUnkFunc2)(OMOBJ *, void *);/' "$BUILD/src/REL/mpexDll/charsel.c" "$BUILD/src/REL/mpexDll/mpex.c" 2>/dev/null || true
+perl -0pi -e 's/typedef void \(\*ZtarUnkFunc\)\(OMOBJ \*, \.\.\.\);/typedef void (*ZtarUnkFunc)(OMOBJ *, void *);/' "$BUILD/src/REL/ztardll/select.c" 2>/dev/null || true
+#       mentDll fn_1_81A8 is defined with a third parameter nobody passes and it never reads.
+perl -0pi -e 's/void fn_1_81A8\(OMOBJ \*arg0, void \*arg1, void \*arg2\)/void fn_1_81A8(OMOBJ *arg0, void *arg1)/g' "$BUILD/src/REL/mentDll/main.c" 2>/dev/null || true
+#       mpexDll charsel fn_1_157C4 and fn_1_15D48 are `void(void)` in that slot: give it the slot's parameters (unused).
+perl -0pi -e 's/void (fn_1_157C4|fn_1_15D48)\(void\)/void $1(OMOBJ *__o, void *__p)/g' "$BUILD/src/REL/mpexDll/charsel.c" 2>/dev/null || true
+#     - m435 / m436: `arg0->objFunc = (void *)fn` where fn returns s32 (the decomp: "must return s32
+#       to match"). omMain calls objFunc as void(OMOBJ *) and ignores any result, so a void(OMOBJ *)
+#       thunk that calls fn is exactly the call omMain makes on hardware.
+for spec in m435Dll:fn_1_B1F4 m436Dll:fn_1_62C4; do
+  d=${spec%%:*}; f=${spec##*:}
+  # the thunk goes directly after fn's definition (fn is defined before every use, in both files)
+  perl -0pi -e "s/objFunc = \(void ?\*\) ?${f};/objFunc = __recomp_obj_${f};/g; s/(\ns32 ${f}\(OMOBJ ?\* ?arg0\)\s*\{.*?\n\}\n)/\$1static void __recomp_obj_${f}(OMOBJ *o) { ${f}(o); }\n/s" "$BUILD/src/REL/$d/main.c" 2>/dev/null || true
+done
+#     - w02: HuPrcDestructorSet2(proc, (void *)fn) with fn returning s32; the destructor is called as
+#       void(void). Same thunk shape.
+for f in fn_1_94AC fn_1_BE74; do
+  for u in $(grep -l "(void \*)${f})" "$BUILD"/src/REL/w02Dll/*.c 2>/dev/null); do
+    perl -0pi -e "s/HuPrcDestructorSet2\(([^,;]+), \(void \*\)${f}\)/HuPrcDestructorSet2(\$1, __recomp_dtor_${f})/g; s/\\z/\nstatic void __recomp_dtor_${f}(void) { ${f}(); }\n/; s/(\n#include [^\n]*\n)(?!.*\n#include )/\$1static void __recomp_dtor_${f}(void);\n/s" "$u"
   done
-  # (b2) the shared extern decls live in include/REL/modeseldll.h (included ONLY by these 4
-  #      units — verified) and must be namespaced with them, or the renamed uses go undeclared.
-  perl -0pi -e 's/\bfn_1_/fn_ms1_/g; s/\blbl_1_/lbl_ms1_/g' "$BUILD/include/REL/modeseldll.h" 2>/dev/null || true
-  # (b3) fn_1_1EC0's prototype is commented out in the header, so modesel.c/filesel.c
-  #      implicit-declare it int(int) vs the real void(s16) def (main.c) -> sig mismatch.
-  #      Un-comment it (real-type prototype from the definition, the sig_fixes pattern).
-  perl -0pi -e 's{^// (void fn_ms1_1EC0\(s16 view\);)}{$1}m' "$BUILD/include/REL/modeseldll.h" 2>/dev/null || true
-  for u in modesel main datalist filesel; do
-    o="$BUILD/obj/$(printf '%s' "src/REL/modeseldll/$u.c" | tr '/' '_' | tr -c 'A-Za-z0-9_.-' '_').o"
-    if emcc "${CFLAGS[@]}" $MSNS "$BUILD/src/REL/modeseldll/$u.c" -o "$o" 2>/tmp/ce_ms.txt; then ok=$((ok+1));
-    else fail=$((fail+1)); echo "  modeseldll/$u.c: $(grep -m1 'error:' /tmp/ce_ms.txt | sed 's|.*error: ||')"; fi
+  grep -qF "__recomp_dtor_${f})" "$BUILD"/src/REL/w02Dll/*.c || { echo "[recomp] FATAL: w02 destructor ${f} not rewritten" >&2; exit 1; }
+done
+#     - w05 mg_coin: fn_1_9B74 (void) is the board's post-turn hook, which BoardPlayerPostTurnHookExec
+#       calls as s32() and CLEARS when it returns non-zero (board/player.c:1002). PowerPC returns r3,
+#       which is the value of the hook's last call, BoardModelAttrReset; return exactly that.
+perl -0pi -e 's/void fn_1_9B74\(void\)\n\{(.*?)\n    BoardModelAttrReset\(([^;]*)\);\n\}/s32 fn_1_9B74(void)\n{$1\n    return BoardModelAttrReset($2);\n}/s; s/^void fn_1_9B74\(void\);/s32 fn_1_9B74(void);/m' "$BUILD/src/REL/w05Dll/mg_coin.c" 2>/dev/null || true
+perl -0pi -e 's/^void fn_1_9B74\(void\);/s32 fn_1_9B74(void);/m' "$BUILD/include/REL/w05Dll.h" 2>/dev/null || true
+#     - w20: two EMPTY void functions registered as BoardSpaceEventFunc, s32(void). The empty body leaves
+#       r3 as the caller left it; 0 ("no event") is what an empty event handler means.
+perl -0pi -e 's/void fn_1_494\(void\);/s32 fn_1_494(void);/; s/void fn_1_4A8\(void\);/s32 fn_1_4A8(void);/; s/void fn_1_494\(void\) \{ \}/s32 fn_1_494(void) { return 0; }/; s/void fn_1_4A8\(void\) \{ \}/s32 fn_1_4A8(void) { return 0; }/' "$BUILD/src/REL/w20Dll/main.c" 2>/dev/null || true
+#     - w03: fn_1_2930(s32) is a PRE-turn hook, called as s32() with no argument (board/player.c:834);
+#       it never reads the argument.
+perl -0pi -e 's/s32 fn_1_2930\(s32 arg0\)/s32 fn_1_2930(void)/g' "$BUILD/src/REL/w03Dll/main.c" "$BUILD/src/REL/w03Dll/statue.c" 2>/dev/null || true
+#     - m418: the sequencer copies void(s32)/s32(s32) step functions into void(void)/s32(void) slots and
+#       calls them with no argument (sequence.c fn_1_AE8C). None of the 16+ step functions reads its
+#       argument; the slots take the step functions' own types and the calls pass 0.
+perl -0pi -e 's/M418DllFunc unk10;\n(\s*)M418DllRetFunc unk14;/M418DllInFunc unk10;\n$1M418DllInRetFunc unk14;/' "$BUILD/include/REL/m418Dll.h" 2>/dev/null || true
+perl -0pi -e 's/\(M418DllFunc\)(arg0->unk4\[arg0->unk0\]\.unk0)/$1/; s/\(M418DllRetFunc\)(arg0->unk4\[arg0->unk0\]\.unk4)/$1/' "$BUILD/src/REL/m418Dll/sequence.c" 2>/dev/null || true
+perl -0pi -e 's/(lbl_1_bss_(?:50|38|20)\.unk10)\(\);/$1(0);/g; s/(lbl_1_bss_(?:50|38|20)\.unk14)\(\);/$1(0);/g' "$BUILD/src/REL/m418Dll/main.c" 2>/dev/null || true
+for chk in "mentDll/main.c:typedef void (*MentDllUnkFunc)(OMOBJ *, void *);" "mpexDll/charsel.c:typedef void (*MpexDllUnkFunc2)(OMOBJ *, void *);" \
+           "mpexDll/mpex.c:typedef void (*MpexDllUnkFunc2)(OMOBJ *, void *);" "ztardll/select.c:typedef void (*ZtarUnkFunc)(OMOBJ *, void *);" \
+           "mentDll/main.c:void fn_1_81A8(OMOBJ *arg0, void *arg1)" "mpexDll/charsel.c:void fn_1_157C4(OMOBJ *__o, void *__p)" "mpexDll/charsel.c:void fn_1_15D48(OMOBJ *__o, void *__p)" \
+           "m435Dll/main.c:objFunc = __recomp_obj_fn_1_B1F4;" "m436Dll/main.c:objFunc = __recomp_obj_fn_1_62C4;" \
+           "m435Dll/main.c:static void __recomp_obj_fn_1_B1F4(OMOBJ *o) { fn_1_B1F4(o); }" "m436Dll/main.c:static void __recomp_obj_fn_1_62C4(OMOBJ *o) { fn_1_62C4(o); }" "w05Dll/mg_coin.c:return BoardModelAttrReset(" \
+           "w20Dll/main.c:s32 fn_1_4A8(void) { return 0; }" "w03Dll/statue.c:s32 fn_1_2930(void)" "w03Dll/main.c:s32 fn_1_2930(void);" "w20Dll/main.c:s32 fn_1_494(void) { return 0; }" \
+           "m418Dll/sequence.c:arg0->unk10 = arg0->unk4[arg0->unk0].unk0;" "m418Dll/main.c:lbl_1_bss_50.unk14(0);"; do
+  f="$BUILD/src/REL/${chk%%:*}"; pat="${chk#*:}"
+  grep -qF -- "$pat" "$f" 2>/dev/null || { echo "[recomp] FATAL: callback-signature edit did not apply: $chk" >&2; exit 1; }
+done
+grep -q 'M418DllInFunc unk10;' "$BUILD/include/REL/m418Dll.h" || { echo "[recomp] FATAL: m418Dll.h slot edit did not apply" >&2; exit 1; }
+if grep -q '(void \*)fn_1_62C4' "$BUILD/src/REL/m436Dll/main.c"; then echo "[recomp] FATAL: m436 second objFunc site not rewritten" >&2; exit 1; fi
+#   * ADJACENCY INDEXING. m449/m458 address a player pair as `(&lbl_1_bss_54)[i]` / `(&lbl_1_bss_BC)[i]`,
+#     relying on mwcc placing each bss symbol at the offset in its name, so [1] is lbl_1_bss_58 /
+#     lbl_1_bss_C0. clang and wasm-ld do not lay variables out by name: MEASURED, m458 trapped
+#     `memory access out of bounds` in fn_1_5014 (`spC[i] = (&lbl_1_bss_BC)[i]->data`) on its first
+#     frames, [1] being whatever the linker put after BC. Each pair becomes a real two-element array
+#     with the two names as its elements, which is exactly the layout the code assumes.
+perl -0pi -e 's/OMOBJ \*lbl_1_bss_C0;\nOMOBJ \*lbl_1_bss_BC;\n/OMOBJ *__recomp_m458_pair_BC[2];\n#define lbl_1_bss_BC (__recomp_m458_pair_BC[0])\n#define lbl_1_bss_C0 (__recomp_m458_pair_BC[1])\n/' "$BUILD/src/REL/m458Dll/main.c" 2>/dev/null || true
+perl -0pi -e 's/OMOBJ \*lbl_1_bss_58;\nOMOBJ \*lbl_1_bss_54;\n/OMOBJ *__recomp_m449_pair_54[2];\n#define lbl_1_bss_54 (__recomp_m449_pair_54[0])\n#define lbl_1_bss_58 (__recomp_m449_pair_54[1])\n/' "$BUILD/src/REL/m449Dll/main.c" 2>/dev/null || true
+grep -qF '#define lbl_1_bss_C0 (__recomp_m458_pair_BC[1])' "$BUILD/src/REL/m458Dll/main.c" && grep -qF '#define lbl_1_bss_58 (__recomp_m449_pair_54[1])' "$BUILD/src/REL/m449Dll/main.c" ||
+  { echo "[recomp] FATAL: m449/m458 player-pair edit did not apply" >&2; exit 1; }
+if grep -rqE '\(&lbl_1_(bss|data)_[0-9A-F]+\)\[' "$BUILD"/src/REL/*/*.c "$BUILD"/src/game; then
+  for f in $(grep -rlE '\(&lbl_1_(bss|data)_[0-9A-F]+\)\[' "$BUILD"/src/REL/*/*.c "$BUILD"/src/game); do
+    for v in $(grep -oE '\(&lbl_1_(bss|data)_[0-9A-F]+\)\[' "$f" | sort -u | sed -E 's/\(&(lbl_1_\w+)\)\[/\1/'); do
+      grep -qE "#define $v \(__recomp_" "$f" || { echo "[recomp] FATAL: unhandled adjacency index (&$v)[] in $f" >&2; exit 1; }
+    done
   done
-  echo "[recomp] modesel overlay AOT-compiled (namespaced)"
 fi
-# [AOT-overlay] Compile OVL_MENT (mentDll: common.c + main.c) INTO the module, namespaced
-# fn_1_->fn_mt1_ / lbl_1_->lbl_mt1_ (module-1 auto names collide with bootDll AND modesel's
-# pre-rename names; the shared extern decls live in include/REL/mentDll.h — namespaced with
-# them, the modeseldll.h lesson). mentDll ships its OWN _prolog/_epilog (common.c) walking
-# _ctors/_dtors link-time arrays that do not exist under emcc — neutralize them; entry is
-# gc_ovl_dispatch.c ment_prolog -> fn_mt1_144 (the real init behind the empty ctor walk).
-if [ -n "${RECOMP_MENT:-}" ]; then
-  MTNS="-D__OSBusClock=__mt_busclk -D__OSCoreClock=__mt_coreclk"
-  # main.c implicit-declares the HuAud* family + Hu3D3Dto2D (missing #includes) -> 11
-  # int-return sig mismatches against the real void definitions. Add the declaring headers.
-  perl -0pi -e 's{\A}{#include "game/audio.h"\n#include "game/hsfex.h"\n}' "$BUILD/src/REL/mentDll/main.c" 2>/dev/null || true
-  for u in common main; do
-    perl -0pi -e 's/\bfn_1_/fn_mt1_/g; s/\blbl_1_/lbl_mt1_/g' "$BUILD/src/REL/mentDll/$u.c" 2>/dev/null || true
-  done
-  perl -0pi -e 's/\bfn_1_/fn_mt1_/g; s/\blbl_1_/lbl_mt1_/g' "$BUILD/include/REL/mentDll.h" 2>/dev/null || true
-  perl -0pi -e 's/\bs32 _prolog\(void\)\s*\{.*?\n\}/static s32 ment_prolog_unused(void){return 0;}/s; s/\bvoid _epilog\(void\)\s*\{.*?\n\}/static void ment_epilog_unused(void){}/s' "$BUILD/src/REL/mentDll/common.c" 2>/dev/null || true
-  for u in common main; do
-    o="$BUILD/obj/$(printf '%s' "src/REL/mentDll/$u.c" | tr '/' '_' | tr -c 'A-Za-z0-9_.-' '_').o"
-    if emcc "${CFLAGS[@]}" $MTNS "$BUILD/src/REL/mentDll/$u.c" -o "$o" 2>/tmp/ce_mt.txt; then ok=$((ok+1));
-    else fail=$((fail+1)); echo "  mentDll/$u.c: $(grep -m1 'error:' /tmp/ce_mt.txt | sed 's|.*error: ||')"; fi
-  done
-  echo "[recomp] ment overlay AOT-compiled (namespaced)"
-fi
-# [AOT-overlay] Compile OVL_W01 (w01Dll: main.c + mg_coin.c + mg_item.c) INTO the module,
-# namespaced fn_1_->fn_w1_ / lbl_1_->lbl_w1_ (units + include/REL/w01Dll.h). Entry is
-# gc_ovl_dispatch.c w01_prolog -> BoardObjectSetup(BoardCreate, BoardDestroy) — the whole
-# board engine (src/game/board/*) is already compiled into the DOL; the overlay only carries
-# the board-specific create/destroy + its two minigames.
-if [ -n "${RECOMP_W01:-}" ]; then
-  W1NS="-D__OSBusClock=__w1_busclk -D__OSCoreClock=__w1_coreclk"
-  # main.c declares CoasterHostComKeySet extern at :160 but defines it static at :2645 (mwcc
-  # tolerated; clang errors) — align the early declaration with the file-local definition.
-  perl -0pi -e 's/^extern (void CoasterHostComKeySet\(s32 playerNo\);)/static $1/m' "$BUILD/src/REL/w01Dll/main.c" 2>/dev/null || true
-  # main.c implicit-declares Hu3DMtxRotGet/Hu3DMtxTransGet (hsfex.h) + BoardPlayerMoveBetween /
-  # BoardCameraPosCalcFuncSet (no header declares them) -> 4 int-return sig mismatches. Prepend
-  # the header + real-type prototypes (from the definitions; func-ptr param as void(*)(void*),
-  # ABI-identical on wasm32 and typedef-independent since this lands before the includes).
-  perl -0pi -e 's{\A}{#include "game/hsfex.h"\nextern void BoardPlayerMoveBetween(s32, s32, s32);\nextern void BoardCameraPosCalcFuncSet(void (*)(void *));\n}' "$BUILD/src/REL/w01Dll/main.c" 2>/dev/null || true
-  for u in main mg_coin mg_item; do
-    perl -0pi -e 's/\bfn_1_/fn_w1_/g; s/\blbl_1_/lbl_w1_/g' "$BUILD/src/REL/w01Dll/$u.c" 2>/dev/null || true
-  done
-  perl -0pi -e 's/\bfn_1_/fn_w1_/g; s/\blbl_1_/lbl_w1_/g' "$BUILD/include/REL/w01Dll.h" 2>/dev/null || true
-  for u in main mg_coin mg_item; do
-    o="$BUILD/obj/$(printf '%s' "src/REL/w01Dll/$u.c" | tr '/' '_' | tr -c 'A-Za-z0-9_.-' '_').o"
-    if emcc "${CFLAGS[@]}" $W1NS "$BUILD/src/REL/w01Dll/$u.c" -o "$o" 2>/tmp/ce_w1.txt; then ok=$((ok+1));
-    else fail=$((fail+1)); echo "  w01Dll/$u.c: $(grep -m1 'error:' /tmp/ce_w1.txt | sed 's|.*error: ||')"; fi
-  done
-  echo "[recomp] w01 overlay AOT-compiled (namespaced)"
+#   the compile flags ovl_build.py uses: exactly this script's CFLAGS
+mkdir -p "$BUILD/ovl"; printf '%s\n' "${CFLAGS[@]}" > "$BUILD/ovl/cflags.txt"
+if EMCC="$(command -v emcc)" LLVM_NM="$(dirname "$(command -v emcc)")/../bin/llvm-nm" \
+     python3 "$RECOMP/ovl_build.py" "$BUILD" "$RECOMP" "$RECOMP_OVERLAYS" > "$BUILD/ovl/build.log" 2>&1; then
+  cat "$BUILD/ovl/build.log"
+else
+  cat "$BUILD/ovl/build.log"; echo "[recomp] FATAL: ovl_build.py failed" >&2; exit 1
 fi
 echo "[recomp] wasm objects: $ok built, $fail failed"
 echo "[recomp] object bytes: $(cat "$BUILD"/obj/*.o 2>/dev/null | wc -c)"
@@ -945,17 +1127,36 @@ if [ -n "${RECOMP_MUSYX:-}" ]; then
   AUDIO_EXPORTS=",___recomp_audio_pump,___recomp_audio_base,___recomp_audio_stat,___recomp_musyx_active_voices,___recomp_musyx_stat,___recomp_audio_selftest,___recomp_msm_bswap_unknowns,___recomp_musyx_aram_stat"
   AUDIO_INITMEM=67108864
 fi
-if emcc "$BUILD"/obj/*.o -o "$BUILD/mp4_game.js" \
+# UNDEFINED WEAK FUNCTIONS TRAP. wasm-ld does not warn about a weak reference with no definition
+# anywhere; it compiles every call to it into `unreachable`. MEASURED once already (isalpha, see
+# the ctype.h fix above), so it is a gate now: name them and stop.
+NMBIN="$(dirname "$(command -v emcc)")/../bin/llvm-nm"
+if [ -x "$NMBIN" ]; then
+  WEAKU="$("$NMBIN" "$BUILD"/obj/*.o $(cat "$BUILD/ovl/link_order.txt" 2>/dev/null) 2>/dev/null | awk '$1=="w"{print $2}' | sort -u)"
+  DEFS="$("$NMBIN" --defined-only "$BUILD"/obj/*.o $(cat "$BUILD/ovl/link_order.txt" 2>/dev/null) 2>/dev/null | awk 'NF==3{print $3}' | sort -u)"
+  MISSING="$(comm -23 <(printf '%s\n' "$WEAKU") <(printf '%s\n' "$DEFS") | grep -v '^$' | tr '\n' ' ')"
+  if [ -n "$MISSING" ]; then
+    echo "[recomp] FATAL: weak references with no definition (every call would trap): $MISSING" >&2; exit 1
+  fi
+fi
+# The overlay objects are linked AFTER the DOL objects and IN ovl_build.py's order: each overlay's
+# objects sit between its two marker objects, which is what makes its statics one range.
+OVL_OBJS=(); if [ -s "$BUILD/ovl/link_order.txt" ]; then while IFS= read -r l; do [ -n "$l" ] && OVL_OBJS+=("$l"); done < "$BUILD/ovl/link_order.txt"; fi
+if emcc "$BUILD"/obj/*.o "${OVL_OBJS[@]}" -o "$BUILD/mp4_game.js" -Wl,--Map="$BUILD/mp4_game.map" \
      -sERROR_ON_UNDEFINED_SYMBOLS=0 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2176mb -sINITIAL_MEMORY=$AUDIO_INITMEM \
      -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=32768 ${RECOMP_PROFILING_FUNCS:+--profiling-funcs} \
      -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node,web,worker -sINVOKE_RUN=0 \
-     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_pad,___recomp_pad_witness,___recomp_set_inject_btn,___recomp_set_inject_dstk,___recomp_set_inject_stkx,___recomp_set_inject_stky,_HuMemHeapPtrGet,___recomp_dirty_base,___recomp_dirty_count,___recomp_dirty_overflow,___recomp_dirty_reset,___recomp_autoboard_arm,___recomp_aram_base,___recomp_static_top,___recomp_card_base,___recomp_card_size,___recomp_card_seq,___recomp_card_adopt,___recomp_card_slots,___recomp_card_time"$AUDIO_EXPORTS" \
+     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_pad,___recomp_pad_witness,___recomp_set_inject_btn,___recomp_set_inject_dstk,___recomp_set_inject_stkx,___recomp_set_inject_stky,_HuMemHeapPtrGet,___recomp_dirty_base,___recomp_dirty_count,___recomp_dirty_overflow,___recomp_dirty_reset,___recomp_autoboard_arm,___recomp_autotest_set,___recomp_aram_base,___recomp_static_top,___recomp_card_base,___recomp_card_size,___recomp_card_seq,___recomp_card_adopt,___recomp_card_slots,___recomp_card_time"$AUDIO_EXPORTS" \
      -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAP32,HEAPU32,wasmMemory,wasmExports \
      -Wl,--no-entry -Wl,--no-gc-sections -Wl,--allow-undefined -Wl,--allow-multiple-definition -O2 2>"$BUILD/link.txt"; then
-  echo "[recomp] LINKED: $BUILD/mp4_game.js + $BUILD/mp4_game.wasm ($(stat -f%z "$BUILD/mp4_game.wasm" 2>/dev/null) bytes)"
+  echo "[recomp] LINKED: $BUILD/mp4_game.js + $BUILD/mp4_game.wasm ($(wc -c < "$BUILD/mp4_game.wasm" | tr -d " ") bytes)"
   echo "[recomp] file: $(file "$BUILD/mp4_game.wasm" 2>/dev/null | sed 's|.*: ||')"
   echo "[recomp] asyncify present: $(grep -c -a 'asyncify' "$BUILD/mp4_game.wasm" 2>/dev/null) | fiber_swap import: $(wasm-objdump -j Import -x "$BUILD/mp4_game.wasm" 2>/dev/null | grep -c emscripten_fiber_swap)"
   echo "[recomp] wasm signature mismatches: $(grep -c 'signature mismatch' "$BUILD/link.txt")"
+  if [ -s "$BUILD/ovl/link_order.txt" ]; then
+    python3 "$RECOMP/ovl_build.py" --verify-map "$BUILD/mp4_game.map" || { echo "[recomp] FATAL: overlay static ranges are not contiguous in the link" >&2; exit 1; }
+  fi
 else
   echo "[recomp] link errors (top):"; grep -m8 -iE "error|duplicate|undefined" "$BUILD/link.txt" | sed -E "s/'[^']*'/X/g" | sort -u | head -8
+  exit 1
 fi

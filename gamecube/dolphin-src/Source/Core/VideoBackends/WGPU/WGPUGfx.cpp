@@ -404,7 +404,56 @@ void WGPUGfx::SubmitFrame()
       wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(m_encoder);
     m_encoder = nullptr;
+    // [gpu-frame-bound] Part of this frame has now run (or will): dropping the rest would leave
+    // the EFB half-drawn for the next frame, so the frame is kept from here on. ShowImage
+    // re-arms this after its own frame-end submit.
+    m_frame_droppable = false;
   }
+  // XFB copies recorded so far are real now.
+  for (::WGPUTexture t : m_frame_xfb_targets)
+    m_dropped_xfb.erase(std::remove(m_dropped_xfb.begin(), m_dropped_xfb.end(), t),
+                        m_dropped_xfb.end());
+  m_frame_xfb_targets.clear();
+}
+
+// [gpu-frame-bound 2026-10-03] Release this frame's encoder without submitting it: none of its
+// work ever reaches the GPU. Only called when m_frame_droppable says nothing outside the EFB/XFB
+// consumes it and no part of it was submitted, so the EFB is left exactly as the last kept frame
+// left it (which, on GC, ends with its copy-clear: the state the dropped frame started from).
+void WGPUGfx::DropPendingFrame()
+{
+  bem_wgpu_flush_pending_uploads();  // keep the upload coalescer's bookkeeping consistent
+  EndRenderPass();
+  if (m_encoder)
+  {
+    wgpuCommandEncoderRelease(m_encoder);
+    m_encoder = nullptr;
+  }
+  for (::WGPUTexture t : m_frame_xfb_targets)
+    if (std::find(m_dropped_xfb.begin(), m_dropped_xfb.end(), t) == m_dropped_xfb.end())
+      m_dropped_xfb.push_back(t);
+  m_frame_xfb_targets.clear();
+  if (m_dropped_xfb.size() > 64)  // XFB entries are few; never let a stale list grow
+    m_dropped_xfb.erase(m_dropped_xfb.begin(), m_dropped_xfb.end() - 64);
+  ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3538u));  // frames dropped
+}
+
+void WGPUGfx::InheritDroppedXfb(::WGPUTexture src, ::WGPUTexture dst)
+{
+  if (!dst)
+    return;
+  m_dropped_xfb.erase(std::remove(m_dropped_xfb.begin(), m_dropped_xfb.end(), dst),
+                      m_dropped_xfb.end());
+  if (IsDroppedXfb(src))
+    m_dropped_xfb.push_back(dst);
+}
+
+bool WGPUGfx::IsDroppedXfb(::WGPUTexture t) const
+{
+  if (!t || std::find(m_frame_xfb_targets.begin(), m_frame_xfb_targets.end(), t) !=
+                m_frame_xfb_targets.end())
+    return false;  // rewritten in the frame being submitted now
+  return std::find(m_dropped_xfb.begin(), m_dropped_xfb.end(), t) != m_dropped_xfb.end();
 }
 
 void WGPUGfx::SetFramebuffer(AbstractFramebuffer* framebuffer)
@@ -1212,8 +1261,13 @@ void WGPUGfx::ReadbackAndPresent(::WGPUTexture src_texture, u32 origin_x, u32 or
   ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3504u));  // [present-diag TEMP]
   if (!m_device || !m_queue || !src_texture || width == 0 || height == 0)
     return;
-  if (m_readback_in_flight >= 3)  // [pipeline] cap depth; each readback owns a fresh buffer
+  if (m_readback_in_flight >= kMaxReadbacksInFlight)  // [pipeline] cap depth
+  {
+    // [gpu-frame-bound] never carry this frame's recorded work into the next one
+    EndRenderPass();
+    SubmitFrame();
     return;
+  }
 
   // Flush any pending render-pass/encoder work (e.g. the EFB clear) before the copy.
   EndRenderPass();
@@ -1499,8 +1553,31 @@ void WGPUGfx::ShowImage(const AbstractTexture* source_texture,
       + ' rect=' + $1 + 'x' + $2}); }, (int)(source_texture != nullptr), (int)w, (int)h);
   }
 
-  if (present_src)
+  // [gpu-frame-bound 2026-10-03] The frame boundary. Every frame's work leaves the encoder here:
+  // submitted (and read back when there is room), or, when the GPU already has
+  // kMaxReadbacksInFlight presented frames it has not finished and this frame's work is all
+  // still droppable, dropped. So at most kMaxReadbacksInFlight frames of droppable work are ever
+  // queued on the GPU, however slow it is, and the guest never waits on it. A dropped frame is
+  // simply not presented: the readback that would have shown it is never issued.
+  if (m_readback_in_flight >= kMaxReadbacksInFlight)
+  {
+    if (m_frame_droppable && m_encoder)
+      DropPendingFrame();
+    else
+    {
+      EndRenderPass();
+      SubmitFrame();
+      ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B353Cu));  // kept while behind
+    }
+  }
+  else if (present_src && !IsDroppedXfb(present_src))
     ReadbackAndPresent(present_src, ox, oy, w, h);
+  else
+  {
+    EndRenderPass();
+    SubmitFrame();
+  }
+  m_frame_droppable = true;
 
   // [WGPU-PROF — gated 2026-07-14] The whole avg/60 frame-breakdown block (+ its get_now calls) is
   // behind BEMENTAL_WGPU_PROF: the CPU profile measured get_now at 5.4% of the JIT thread (per-draw

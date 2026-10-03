@@ -780,6 +780,19 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
     if (states && typeof padStatus1 !== 'undefined' && padStatus1) Module.HEAPU8.set(new Uint8Array(states), padStatus1);
   }
 
+  // RIG-ONLY: a SLOWER DEVICE, on demand ('netSlow' {r}; inert until sent).
+  // The CDP CPU throttle never reaches a worker, so a test that needs one
+  // console's emulator to be r times slower — and then to recover — asks for
+  // it here: every gated frame's work (netStep, netRbStep) is followed, INSIDE
+  // the time those report, by (r-1) times its own duration of busy-waiting.
+  // The guest computes exactly what it did; only the host's clock moves.
+  // tools/ps1_netplay_test.mjs --slow-guest R --slow-until S.
+  var SLOW_R = 1;
+  function slowBurn(t0) {
+    if (SLOW_R <= 1) return;
+    var now = performance.now(), until = now + (now - t0) * (SLOW_R - 1);
+    while (performance.now() < until) {}
+  }
   var origMain = main_onmessage;
   main_onmessage = function (event) {
     var data = event.data;
@@ -800,8 +813,30 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
           // A hidden frame (a returning player catching up in an input-delay
           // room) is neither presented nor heard.
           QUIET = QUIET_AUDIO = !!data.hidden;
+          // ⚠ THE SAVE COST GOES STALE IN A DELAY STRETCH (n64 room_core.js hit
+          // it: the room sat in delay for 55 s on the slow period's saves). With
+          // `remeasure` (ps1.html, every RB_REMEASURE_MS of a delay stretch of a
+          // room whose ring was armed) this frame is bracketed by ONE real undo
+          // save exactly as a rollback step takes it: the shadow is re-taken
+          // before the frame (untimed — the ring is stale anyway and is re-armed
+          // by netRbInit before the next rollback frame), then the frame's
+          // commit is timed. Nothing the guest can see: the undo ring is host
+          // memory outside [SNAP_LO, sbrk).
+          var remeasure = !!data.remeasure && TAKE && n === 1 && RB.live >= 0, svMs = -1;
+          if (remeasure) urInit(data.frame | 0);
+          var tr0 = performance.now();
           try { for (var i = 0; i < n; i++) { runFrame(); creditAudio(); } } finally { QUIET = QUIET_AUDIO = false; }
-          postMessage({ cmd: 'netFrame', frame: data.frame, ran: n });
+          slowBurn(tr0);
+          var runMs = (performance.now() - tr0) / n;
+          if (remeasure) {
+            var ts0 = performance.now(); urCommit(); svMs = performance.now() - ts0;
+            UR.logs.forEach(urRelease); UR.logs.clear(); UR.oldest = -1;
+            RB.remeasures = (RB.remeasures | 0) + 1;
+          }
+          // What one frame's run cost, so a page in an input-delay room can keep
+          // its rollback step estimate current (ps1.html rbOnDelayFrame) — the
+          // capacity gate takes a room back to rollback only on a fresh one.
+          postMessage({ cmd: 'netFrame', frame: data.frame, ran: n, runMs: runMs, sv: svMs });
         } catch (e) {
           postMessage({ cmd: 'netFrame', frame: data.frame, ran: 0, err: String(e) });
         }
@@ -844,7 +879,7 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
       // The live state after the last frame IS the saved start of the next, so
       // no load happens unless there is something to re-simulate.
       case 'netRbStep': {
-        var t0 = performance.now(), err = null, resimRan = 0, hashes = [];
+        var t0 = performance.now(), err = null, resimRan = 0, hashes = [], sv0 = RB.saveMs;
         try {
           if (data.ring) rbGrow(data.ring | 0);
           if (typeof data.keepFrom === 'number') {
@@ -898,10 +933,14 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
           }
           if (hk.length) { th = performance.now() - th; if (th > RB.maxHashMs) RB.maxHashMs = th; }
         } catch (e) { err = String((e && e.message) || e); QUIET = false; QUIET_AUDIO = false; }
+        slowBurn(t0);
         var ms = performance.now() - t0;
         if (ms > RB.maxStepMs) RB.maxStepMs = ms;
         RB.hist[ms < 8 ? 0 : ms < 12 ? 1 : ms < 17 ? 2 : ms < 33 ? 3 : ms < 67 ? 4 : 5]++;
-        postMessage({ cmd: 'netFrame', frame: data.frame, ran: err ? 0 : 1, resim: resimRan, ms: ms, hashes: hashes, err: err, bytes: RB.lastBytes,
+        // `sv`: this step's savestate cost per frame — the part of a rollback
+        // step a delay frame does not pay (ps1.html adds it back to a delay
+        // frame's run to estimate the rollback step it would cost).
+        postMessage({ cmd: 'netFrame', frame: data.frame, ran: err ? 0 : 1, resim: resimRan, ms: ms, sv: (RB.saveMs - sv0) / (resimRan + 1), hashes: hashes, err: err, bytes: RB.lastBytes,
           logBytes: UR.logPages * PAGE, held: UR.oldest >= 0 ? UR.frame - UR.oldest : 0 });
         break;
       }
@@ -915,7 +954,7 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
           gpuPal: Module.HEAP32[CORE.palFlag >> 2], gpuStat: Module.HEAP32[CORE.gpuStat >> 2] >>> 0, vmode: VMODE, vmodeSwitches: vmodeSwitches,
           ringBytes: urBytes(), shadowBytes: UR.cap, budget: RB.budget, maxLogBytes: UR.maxLogPages * PAGE, held: UR.oldest >= 0 ? UR.frame - UR.oldest : 0, cmpHow: UR.how, checkFails: UR.check ? UR.checkFails : null, logPages: UR.logPages, poolPages: UR.pool.length,
           pagesPerSave: UR.saves ? UR.pages / UR.saves : 0, maxPagesPerSave: UR.maxPages, cmpMsAvg: UR.saves ? UR.cmpMs / UR.saves : 0,
-          paceFrames: paceFrames, paceDrops: paceDrops, calls: schedCalls });
+          paceFrames: paceFrames, paceDrops: paceDrops, calls: schedCalls, remeasures: RB.remeasures | 0 });
         break;
       }
       // Rig-only: a full-guest fingerprint of the LIVE state (same regions as
@@ -957,6 +996,11 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
         break;
       }
 
+      case 'netSlow': {
+        SLOW_R = Math.max(1, +data.r || 1);
+        postMessage({ cmd: 'print', txt: '[rig] netSlow: every gated frame now costs ' + SLOW_R + 'x its own time' });
+        break;
+      }
       case 'netHash': {
         var r = stateHash();
         postMessage({ cmd: 'netHashResult', frame: data.frame, hash: r.hash, len: r.len, head: r.head || null, err: r.err || null });

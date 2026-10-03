@@ -37,6 +37,7 @@
 #include <cstdlib>  // [WS-1 STEP-3] getenv/atoi for BEM_FP_RESIDENT_LOOP toggle
 #include <cstring>  // [AOT A1] std::memcmp for the asset magic
 #include <unordered_map>  // [AOT A1] the prebuilt-block registry
+#include <algorithm>      // [LEAF-INLINE exactness] std::min/std::max over the spliced pcs
 #include <vector>
 
 #include <emscripten.h>
@@ -53,6 +54,7 @@
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
+#include "VideoCommon/CommandProcessor.h"
 #include "VideoCommon/Fifo.h"  // [dc 2026-07-21] DrainFifoOnCpuThread — CPU-side GX FIFO decode
 
 #include "bementalJIT/types.h"
@@ -473,6 +475,7 @@ void JitWasm::ClearCache()
   m_wasm_cache.clear();
   m_block_inst_counts.clear();
   m_block_guest_end.clear();
+  m_li_leaf_span.clear();
   CachedInterpreter::ClearCache();
 }
 
@@ -481,6 +484,7 @@ void JitWasm::EvictBlock(u32 pc)
   m_wasm_cache.evict(pc);
   m_block_inst_counts.erase(pc);
   m_block_guest_end.erase(pc);
+  m_li_leaf_span.erase(pc);
 }
 
 void JitWasm::InvalidateICacheRange(u32 lo, u32 hi)
@@ -497,11 +501,31 @@ void JitWasm::InvalidateICacheRange(u32 lo, u32 hi)
       m_wasm_cache.evict(it->first);
       m_block_inst_counts.erase(it->first);
       m_block_is_idle.erase(it->first);
+      m_li_leaf_span.erase(it->first);
       it = m_block_guest_end.erase(it);
     }
     else
     {
       ++it;
+    }
+  }
+  // [LEAF-INLINE exactness 2026-10-01] A spliced block also depends on its leaf's
+  // words, which can sit anywhere in the address space (the leaf is a `bl` target,
+  // not a neighbour). Evict any caller whose inlined leaf overlaps [lo, hi).
+  for (auto li = m_li_leaf_span.begin(); li != m_li_leaf_span.end();)
+  {
+    if (li->second.first < hi && li->second.second > lo)
+    {
+      const u32 caller = li->first;
+      m_wasm_cache.evict(caller);
+      m_block_inst_counts.erase(caller);
+      m_block_is_idle.erase(caller);
+      m_block_guest_end.erase(caller);
+      li = m_li_leaf_span.erase(li);
+    }
+    else
+    {
+      ++li;
     }
   }
 }
@@ -1128,7 +1152,15 @@ bool JitWasm::TryCompileBlock(u32 start_pc, u32 ctx_ptr, u32 mem1_base,
     // DEFAULT IS NOW OFF: the splice fires ONLY when the cell holds the magic, so
     // a worker booted with nothing written there does not splice. See the
     // kLeafInlineArmCell block above for the black-world evidence.
-    if (li_candidate && *AotCell(kLeafInlineArmCell) == kLeafInlineArmMagic)
+    // [gpu-synced idle skip 2026-10-01] bem_gpuidle_on() (ppc_emit.h) also
+    // arms the splice; the emitter then gates the spliced idle block's
+    // downcount=0 on the GX FIFO being drained (native CoreTiming::Idle's
+    // SyncOnSkipIdle). Publish the FIFO distance address it compares.
+    const bool li_gated = bemental::powerpc::bem_gpuidle_on();
+    if (li_gated)
+      *AotCell(bemental::powerpc::BEM_GPUIDLE_DIST_CELL) = static_cast<u32>(reinterpret_cast<uintptr_t>(
+          &m_system.GetCommandProcessor().GetFifo().CPReadWriteDistance));
+    if (li_candidate && (li_gated || *AotCell(kLeafInlineArmCell) == kLeafInlineArmMagic))
     {
       struct LeafFetchCtx { Memory::MemoryManager* mem; };
       LeafFetchCtx lfc{&mem};
@@ -1216,14 +1248,30 @@ bool JitWasm::TryCompileBlock(u32 start_pc, u32 ctx_ptr, u32 mem1_base,
   // Guest span for icbi range-eviction (InvalidateICacheRange).
   // [LEAF-INLINE] li_guest_end is the CONTIGUOUS caller-stream extent, which
   // for a spliced block runs PAST the `bl` (decoding resumed at the return
-  // site) — so it must be used instead of start_pc + count*4. KNOWN GAP: the
-  // inlined callee's own address range is not covered by this single
-  // [start, end) record, so a guest that rewrites the leaf body would not
-  // evict this block. GameCube titles do not self-modify text in practice
-  // (no SMC has been observed in this project's traces) and the exposure is
-  // bounded to <= kLeafInlineMaxOps words per spliced block; it is recorded
-  // here rather than left implicit.
+  // site) — so it must be used instead of start_pc + count*4. The inlined
+  // callee's own address range is NOT covered by this single [start, end)
+  // record; m_li_leaf_span below carries it (this was a recorded KNOWN GAP
+  // until 2026-10-01).
   m_block_guest_end[start_pc] = li_count > 0 ? li_guest_end : start_pc + count * 4u;
+  // [LEAF-INLINE exactness 2026-10-01] record the
+  // inlined leaf's own span so InvalidateICacheRange evicts this block when the
+  // leaf's code is rewritten. The leaf's ops are exactly the spliced pcs that fall
+  // outside the caller's contiguous [start_pc, li_guest_end).
+  m_li_leaf_span.erase(start_pc);
+  if (li_count > 0)
+  {
+    u32 leaf_lo = 0xFFFFFFFFu, leaf_hi = 0u;
+    for (u32 i = 0; i < li_count; ++i)
+    {
+      const u32 p = li_pcs[i];
+      if (p >= start_pc && p < li_guest_end)
+        continue;
+      leaf_lo = std::min(leaf_lo, p);
+      leaf_hi = std::max(leaf_hi, p + 4u);
+    }
+    if (leaf_hi > leaf_lo)
+      m_li_leaf_span[start_pc] = {leaf_lo, leaf_hi};
+  }
 
   // STEP 2 (region wiring, side-channel — NO dispatch change yet): accumulate
   // this block's bare BODY (no module wrapper) into its region so a later

@@ -1,5 +1,156 @@
 # WebGL2 fallback for devices with NO WebGPU (the Xbox case)
 
+## ★★★ 2026-10-03 (latest) — WebGPU "PRESENT STALLED" on MP4: a REAL bug (unbounded GPU queue), FIXED in `27c1326`
+
+**It was not a stuck promise.** A snapshot-only wrapper on `GPUBuffer.mapAsync` / `GPUQueue.submit`
+(one `onSubmittedWorkDone` per submit) in `dolphin_worker_emcc.js`, plus page-side SAB counters, on HEAD
+`c104601c` (`--enable-unsafe-webgpu`, adapter = SwiftShader): every mapAsync and every submit resolved,
+in submit order; the device thread's event loop never stalled (max gap 500-518 ms on a 500 ms timer).
+
+**What was queued was the bug.** At the readback cap (3 in flight) `ReadbackAndPresent` returned
+BEFORE `SubmitFrame`, so an unpresented frame's draws stayed in the open encoder and the next frame's
+were appended. Presents were capped; GPU work was not. Per-stage timeline, HEAD:
+
+| stage | observed |
+|---|---|
+| JIT boot (t 16-39 s) | 443 ShowImage presents, **5** readbacks issued, 13 submits |
+| submit #1 @16.1 s (5 draws, 53 new pipelines) | done @34.5 s (18.4 s) |
+| submit #5 @17.5 s (4 draws, 1 pipeline) | done @52.6 s |
+| submit #7.. (~400 boot draws in one encoder) | **not done 155 s later** |
+| recomp takeover t≈40 s | 2 frames sent, their acks held behind the readbacks queued behind #7 → acks=0 forever |
+| page | `outstanding`=2 → 4,731 later frames skipped as backpressure; 3 published in 180 s |
+
+**Fix** (`WGPUGfx::ShowImage` is the frame boundary): every frame's work leaves the encoder there.
+With `kMaxReadbacksInFlight` presented frames unfinished on the GPU, a frame whose work is all
+unsubmitted and has no consumer outside the EFB/XFB is DROPPED (encoder released unsubmitted); else
+submitted. A non-XFB EFB copy, or any mid-frame submit (ring wrap, EFB→RAM, texture copy), keeps it.
+A dropped frame's XFB targets are never read back (also through a stitched container copy). Nothing
+waits. Counters: `0x026B3538` dropped, `0x026B353C` kept while behind (also on `[recompLive]`).
+
+Matched arms, hermetic snapshots, `tools/probe_lock.sh`, ROM_IDX=0, 180 s, load 4.6-5.6:
+
+| | HEAD `c104601c` | fix `1a44c650` |
+|---|---|---|
+| published (seqlock) | **3** | **26** (0.19/s), 457 boot frames dropped, 7 kept |
+| guest, 5 s windows after takeover | 0.9990-1.0014x, cum 1.0000x | 0.9998-1.0010x, cum 1.0001x |
+| longest main-thread task | 63 ms (boot) | 112 ms (boot), 0 after |
+| screenshot t=170 s | black | MP4 title, correct |
+
+**What remains on this box is SwiftShader, not a hang:** with the queue bounded, a 278-draw frame with
+7 new pipelines took 72 s and 107-draw title frames take 5-8 s each (~70 ms per uber-shader draw on
+the CPU rasterizer). The WGPU backend only has Dolphin's UBER shaders; the WebGL2 path uses specialised
+shaders and does 8.25 presents/s on the same box. Chrome only hands out a SwiftShader WebGPU adapter
+behind `--enable-unsafe-webgpu`: **`PROBE_VANILLA_WEBGPU=1` on this box gets NO adapter and runs the
+WebGL2 fallback** ("adapter/device UNAVAILABLE"), so it is the no-WebGPU arm here, not a WebGPU one.
+Open (not done, needs an owner decision against the "WebGPU is the product" directive): route a
+software/fallback WebGPU adapter (`adapter.info.isFallbackAdapter`, architecture `swiftshader`) to
+the WebGL2 fallback. Also open: a game that makes non-XFB EFB copies EVERY frame is never dropped, so
+on a GPU slower than the stream its queue can still grow.
+
+No-WebGPU arm (`PROBE_VANILLA_WEBGPU=1`, fix snapshot, 300 s, load 5.2-5.5): 028c3db's gains hold —
+longest task 1,187 ms during boot and none after t≈60 s, guest cum 1.0003x (windows 0.9943-1.0051x),
+8.25 presents/s (render-worker `completed` 249→2228 over t 60-300 s), title on screen.
+
+2-console room, **WebGPU arm** (`gc_netplay_room_test.mjs` default = `--enable-unsafe-webgpu`), fix
+snapshot (served wasm `1a44c650…`, md5 unchanged through the run), 240 s, load 6.1-8.7: **16/16 PASS,
+0 desyncs** (238/238 whole-state fingerprints agreed through frame 14280), mean 0.9941x/0.9942x,
+windows 0.9539-1.0012x (the low windows are the first 60 s, held-for-room 17-30%; 0.999-1.001x after).
+
+## ★★★ 2026-10-03 (later) — THE 488 s TITLE FRAME: byte-reversed vertex arrays from the recomp's full-image sync. FIXED
+
+**Cause (recomp_worker.js, VIWaitForRetrace frame sync).** After any DVD read (or a dirty-ring
+overflow / jumbo range) the next frame ships a full 24 MiB mem1 image. That image is RAW guest
+memory, where every f32 vertex/texcoord array is LITTLE-endian; only the bridge's own array regions
+carry them byte-swapped to the big-endian layout Dolphin's vertex loader reads. Dolphin applies the
+image first and the frame's regions over it (`worker_funcs.js` `recompFrame`), so after an image an
+array is right only if THAT frame re-sends it. The address caches (`knownArrays`/`knownDLs`/
+`knownTex`/`f32Arrays`) were cleared AFTER the frame's discovery, so every array already known from
+an earlier frame was not re-sent and stayed raw-LE in Dolphin for one frame. The next frame re-sent
+everything, which is why it was exactly one frame. Not the replay, not gl-record.js, not Dolphin's
+vertex loader: the bytes Dolphin was handed were wrong.
+
+**Fix:** clear the caches BEFORE discovery on a full-image frame (`fullSync`), so every binding of
+that frame counts as new and its arrays (swapped), DLs and textures go out in its regions on top of
+the image. Commit `c1d858e`.
+
+**Instrument:** a temporary vertex check appended to a SNAPSHOT copy of `render-worker.js` only
+(shadows every buffer upload, decodes each `drawElements`'s attribute 0 under its declared layout,
+flags NaN / |x| > 1e7 / out-of-range). Hermetic snapshots, `tools/probe_lock.sh`, SwiftShader,
+`--disable-features=WebGPUService,Dawn`, load 2-7.
+
+| | HEAD 028c3db | fix c1d858e |
+|---|---|---|
+| bad draws | **100 of 21,979, all in present 969** (the first title frame after the fade-in); 0 in every other frame. Sizes: 54 ≤300 idx, 17 in 301-1000, 29 >1000; max |pos| 3.4e38 | **0 of 59,770** over 1,603 presents (200 s) |
+| sample word | `7d9398bf` = 2.45e37 as read; byte-reversed `bf98937d` = -1.19 | — |
+| replay after that frame | stuck: fence age 62 s+ at end of run, presents frozen at 637 | fence max 1.0 s (vtx run) / 1.43 s (clean 300 s run); presents keep advancing |
+| screenshot at end | blank canvas | correct Mario Party 4 title (logo, characters, cube) |
+| 2-console room, no WebGPU, 240 s (`NO_WEBGPU=1 gc_netplay_room_test`) | (028c3db: 0.9979x, 16/16, 0 desyncs) | mean 0.9968x, windows 0.9747-1.0008x, **16/16 PASS, 0 desyncs** (239/239 fingerprints agreed through frame 14340; load up to 10) |
+| clean 300 s run (no instrument) | — | longest main-thread task 0 ms after boot (1,248 ms during boot), guest 59.992/s = 0.9999x, max 5 s window 1.0038x, 8.27 presents/s |
+
+**WebGPU on this box is a different problem.** The same snapshot with `--enable-unsafe-webgpu`
+(SwiftShader adapter) still publishes 3 frames in 180 s and reports PRESENT STALLED at **t≈44 s**,
+identical to the pre-fix run (`publishedTotal 3` both). That is two minutes before the title frame,
+so it is not this bug. Earlier text guessing that the WebGPU software-adapter stall was "the same
+scene" is not supported. On a hardware-GPU WebGPU device the same bad frame would have drawn one
+frame of garbage triangles (Dolphin's RAM is shared by both backends), and the fix covers that too.
+
+## ★★★ 2026-10-03 — THE MAIN-THREAD FREEZE: it was the browser's canvas commit, not our GL calls
+
+Mario Party 4 (recomp engine), `--disable-features=WebGPUService,Dawn`, this box = SwiftShader,
+chrome://gpu **"Compositing: Software only"**. Hermetic snapshots, `tools/probe_lock.sh`, load 2-6.
+
+**Where the main thread blocked.** Long tasks of 172 s, 194 s, 291 s, 380 s (four HEAD runs) plus
+~200 ms tasks several times a second. A main-thread CPU profile across one is **98.5% `(program)`**
+(native, no JS on the stack); timing every replayed GL call found none over 100 ms, and the periodic
+`getError` measured 0-2 ms at every sync. With a software compositor, a drawn WebGL canvas is read
+back **synchronously on the main thread at the next rendering update**, and that readback waits for
+all GPU work queued before it. The old replay queued up to 8 frames per turn with nothing asking
+whether the GPU had finished any.
+
+**Fix (render-worker.js MAIN-THREAD PRESENT, gamecube.html present gate):**
+1. One frame in flight: `fenceSync` after each present, next frame only after `getSyncParameter`
+   reads SIGNALED; the page drops frames at the source (`window.__gcRwBusy()` → `skipRender`).
+2. Software compositor (renderer string SwiftShader/llvmpipe/…; `?mtpresent=` overrides): the
+   context lives on an `OffscreenCanvas`, each present reads into a per-slot PIXEL_PACK buffer behind
+   the fence, copied out (`getBufferSubData`) only after it signals and painted with `putImageData`.
+   Direct mode + fence alone still blocked 448 s (the commit readback), so this is required.
+3. No periodic `getError` (`?glerr=1` restores it).
+
+| (480 s runs unless noted) | HEAD 453cce5 | fix |
+|---|---|---|
+| longest main-thread task | 172,177 ms (and 194/291/380 s) | 0 ms after boot (final code, 300 s; 1.27 s during boot); 55 ms over a 900 s run (that build also carried the since-removed nudge) |
+| guest rate (PAD_ACK frames / wall) | 0.9441x, a 5 s window at **1.29x** (catch-up) | 0.9997x (final, 300 s) / 59.997/s (900 s), max 5 s window 1.0027-1.0033 |
+| 2-console room, no WebGPU, 240 s (gc_netplay_room_test NO_WEBGPU=1) | mean **0.1245x**, FAIL, 0 desyncs | mean 0.9979x, max window 1.0010x, 16/16 PASS, 0 desyncs |
+| rAF/s | 10 | 59.9 |
+| presents shown/s, steady | 6.47 | 8.05 (after the title frame below retired) |
+
+**~~Still open~~ FIXED in c1d858e (see the section above) — one SwiftShader frame cost minutes.** The first title frame after the fade-in took
+**488.8 s** of GPU time in the 900 s fix run (on HEAD the frozen page came back after ~172-198 s;
+the fix keeps the page and the guest live through it, but the picture waits). Bisected by skipping
+draws: keeping only draws of ≤300 indices → no stall (9 fps); ≤1000 → stall. A captured 372-index
+draw (prog 634, stride 32, attribs pos@0/normal@12/uv@24 as floats) decodes to positions like
+`1.3e35, -4.3e4` while the "normal" words read like plausible positions — the vertex data does not
+match the declared layout, i.e. huge triangles. Not established whether the mismatch is in Dolphin's
+GLES vertex path or the replay. On a real GPU this would be visual garbage, not minutes.
+⚠ Things measured NOT to help that frame: flushing while waiting, an empty fence/flush "nudge"
+(one lucky run, 0 of 3 repeats), replaying the frame's trailing commands. Letting the next frame
+through a stuck fence (1-3 s thresholds, up to 4 tracked) blocked the main thread 446-451 s in 4/4
+runs — further GL calls wait in Chrome's command transport behind the stuck GPU.
+
+**WebGPU on this box (~1 frame/s reported): not a presentation-path wait.** Same title scene,
+`--enable-unsafe-webgpu` (adapter = SwiftShader): main-thread longest task 61 ms, guest 60.007/s,
+but only 3 frames published in 180 s; the page's backpressure held 1-2 frames outstanding and
+skipped the other 8,354 (correct behaviour: acks wait for each frame's readback), the capture
+worker polled idle (captureMs 4), and SwiftShader's four worker threads ran at 50-75% each. The
+limit is GPU execution on the software rasterizer, on the same scene that costs the WebGL2 path
+minutes — whether that work is legitimate or inflated by bad vertex data (above) is not settled.
+
+**Also fixed — the vertex-stream race (gl-record.js).** Vertex/index uploads over 64 KiB were
+zero-copy descriptors read at replay time, but Dolphin stages every draw at the same heap address
+(two different meshes, 239,104 B and 131,584 B, both from offset 432,076,360 in one frame), so a
+late replay drew the next draw's vertices: HEAD's title screen shows spiky garbage on large meshes,
+runs with the snapshot fix show a clean title. Snapshotted at record time now (≤4 MiB per record).
+
 ## ★★ ROOT CAUSE FOUND AND FIXED 2026-09-05 — it was ONE predicate, and it disabled
 ## ALL rendering on any backend that is not WGPU
 

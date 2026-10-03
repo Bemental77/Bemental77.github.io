@@ -210,6 +210,25 @@ function makeSnapshot() {
     }
     console.log(`  snapshot worker replaced from WITNESS_WORKER_DIR=${wd}`);
   }
+  // WITNESS_PAGE_REV=<rev>: serve gamecube.html and the dolphin_worker.js shim from a git
+  // revision instead of the working tree. Without it the snapshot SYMLINKS gamecube.html, so
+  // a sibling agent's half-finished page edit lands inside a measured cell (2026-10-01: two
+  // agents, one editing the page while the other measured the JIT).
+  // The page's own workers are pinned with it: gamecube/render-worker.js (the present
+  // worker, loaded by gamecube.html since 98eb972) and gpu-worker.js are SYMLINKED into the
+  // snapshot otherwise, and a sibling owns render-worker.js and edits it in the working tree.
+  const rev = process.env.WITNESS_PAGE_REV;
+  if (rev) {
+    const pin = ['gamecube.html', 'gamecube/dolphin_libretro/dolphin_worker.js',
+                 'gamecube/render-worker.js', 'gamecube/gpu-worker.js'];
+    for (const [rel, dst] of pin.map((rel) => [rel, path.join(snap, rel)])) {
+      const r = spawnSync('git', ['show', `${rev}:${rel}`], { cwd: REPO, maxBuffer: 64 << 20 });
+      if (r.status !== 0) { console.log(`  WITNESS_PAGE_REV: git show ${rev}:${rel} failed`); process.exit(2); }
+      try { fs.unlinkSync(dst); } catch (_e) { /* absent */ }
+      fs.writeFileSync(dst, r.stdout);
+    }
+    console.log(`  snapshot page + worker shim pinned to git ${rev}`);
+  }
   return { root: snap, frozen: true };
 }
 
@@ -235,7 +254,7 @@ function runCell(cell) {
   // screenshot mandatory evidence for any "I measured scene X" claim.
   const shotAt = cell.ms - 12000;
   const env = [
-    'PROBE_HEADLESS=0',
+    `PROBE_HEADLESS=${process.env.PROBE_HEADLESS ?? '0'}`,
     `ROM_IDX=${cell.rom}`,
     `PROBE_DURATION_MS=${cell.ms}`,
     'PROBE_SCENE_RATE=5000',
@@ -344,6 +363,44 @@ function analyse(cell, io) {
   // with the idle-skipped time removed. Only meaningful when the meter is armed.
   if (out.idleSkipFrac && out.executedMHz) out.executedVsGekko = r4(out.executedMHz.med / 486);
   out.pageNativeHz = steady.map((r) => (r.rate && r.rate.nativeHz) || null).filter(Boolean).pop() || null;
+
+  // ---- [thread-cpu 2026-10-01] the rate PER CPU-SECOND of the busiest worker thread ----
+  // The probe now records /proc schedstat per renderer thread per window (row.thr =
+  // [tid, comm, runMs, waitMs] top-4). Sibling agents' browsers load this box without
+  // taking the probe lock, so a wall-clock rate mixes the lever's effect with how much
+  // CPU the JIT thread was GIVEN. The JIT thread is identified as the DedicatedWorker
+  // with the most run time over the steady window. runFrac = on-CPU / wall, waitFrac =
+  // runnable-but-queued / wall (pure contention). gPerRun = W1 per JIT CPU-second and
+  // execPerRun = executed MHz per JIT CPU-second: the contention-robust readings of the
+  // same two quantities. A thread that BLOCKS (sleeps on a futex) is neither running nor
+  // waiting, so gPerRun over-reads a GPU-wait-bound window; read it next to runFrac.
+  const withThr = steady.filter((r) => Array.isArray(r.thr) && r.thr.length && r.dw > 0);
+  if (withThr.length) {
+    const tot = new Map();
+    for (const r of withThr) for (const [tid, comm, run] of r.thr) {
+      if (comm !== 'DedicatedWorker') continue;
+      tot.set(tid, (tot.get(tid) || 0) + run);
+    }
+    const jit = [...tot.entries()].sort((a, b) => b[1] - a[1])[0];
+    if (jit) {
+      out.jitTid = jit[0];
+      const per = withThr.map((r) => {
+        const e = r.thr.find((x) => x[0] === jit[0]);
+        if (!e) return null;
+        const wallMs = r.dw * 1000;
+        return { runFrac: e[2] / wallMs, waitFrac: e[3] / wallMs,
+                 gPerRun: (r.gAi != null && e[2] > 0) ? r.gAi * wallMs / e[2] : null,
+                 execPerRun: (r.execMHz > 0 && e[2] > 0) ? r.execMHz * wallMs / e[2] : null,
+                 gpuCores: r.gpuRunMs != null ? r.gpuRunMs / wallMs : null };
+      }).filter(Boolean);
+      const ag = (k) => { const a = per.map((p) => p[k]).filter((v) => v != null && Number.isFinite(v)); return a.length ? { n: a.length, p10: r4(pct(a, 0.1)), med: r4(pct(a, 0.5)), p90: r4(pct(a, 0.9)) } : null; };
+      out.jitRunFrac = ag('runFrac');
+      out.jitWaitFrac = ag('waitFrac');
+      out.gPerRun = ag('gPerRun');
+      out.execPerRunMHz = ag('execPerRun');
+      out.gpuCores = ag('gpuCores');
+    }
+  }
 
   // ---- W4 as a RATE, not just a liveness flag -------------------------------
   // retraceCount is bumped by the GUEST's VI retrace ISR, once per VI field.
@@ -454,6 +511,7 @@ function report(results) {
     console.log(r.W4_applies
       ? `      W4 guest-side: GlobalCounter ${f(r.W4_guestGCPerS)}/s  retraceCount ${f(r.W4_retracePerS)}/s`
       : '      W4 guest-side: N/A — the symbols are MP4\'s; this disc has no known guest counter');
+    if (r.jitRunFrac) console.log(`      JIT thread ${r.jitTid}: run ${r.jitRunFrac.med} wait ${r.jitWaitFrac.med} of wall  =>  W1 per JIT-CPU-s ${r.gPerRun ? r.gPerRun.med : '--'}  exec MHz per JIT-CPU-s ${r.execPerRunMHz ? r.execPerRunMHz.med : '--'}  gpu-process ${r.gpuCores ? r.gpuCores.med : '--'} cores`);
     console.log(`      load before: ${r.upBefore}`);
     console.log(`      load after : ${r.upAfter}`);
     console.log(`      wasm md5 ${r.wasmBefore} -> ${r.wasmAfter}${r.wasmBefore !== r.wasmAfter ? '  !! CHANGED — VOID' : ''}`);

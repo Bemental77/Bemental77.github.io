@@ -130,6 +130,14 @@ extern "C" {
 //
 // With lc_base unset — offline tools, small test heaps — the window is not mapped,
 // the read is skipped, and the answer is OFF, which is also the shipping default.
+bool bem_gpuidle_on() {
+    if (g_bem_lc_base == 0u) return false;
+    const u32 v = *reinterpret_cast<volatile uint32_t*>(
+        static_cast<uintptr_t>(BEM_GPUIDLE_MODE_CELL));
+    if (v == 0u) return BEM_GPUIDLE_DEFAULT != 0;
+    return v != BEM_GPUIDLE_KILL;
+}
+
 bool bem_mips_census_on() {
     return g_bem_lc_base != 0u &&
            *reinterpret_cast<volatile uint32_t*>(
@@ -1088,7 +1096,64 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     const u32 charge = stats.numCycles ? stats.numCycles : (u32)count;
     BEM_EMIT_MARK(BEM_MARK_BLOCK_BEGIN, start_pc);
     {
-        if (idle_block) {
+        // [gpu-synced idle skip 2026-10-01] see ppc_emit.h BEM_GPUIDLE_*. Only a
+        // spliced (non-contiguous) idle block, and only while the policy is on.
+        // Everything else is the byte-identical unconditional skip below.
+        const bool gpuidle_gated =
+            idle_block && block.m_noncontiguous && bem_gpuidle_on();
+        const u32 gpuidle_dist = gpuidle_gated
+            ? *reinterpret_cast<volatile uint32_t*>(
+                  static_cast<uintptr_t>(BEM_GPUIDLE_DIST_CELL))
+            : 0u;
+        // The spin arm is a REAL execution of the loop body, so it charges cycles
+        // exactly like a non-idle block and feeds the [mips] executed meter
+        // exactly like one; without that the meter books every spin as skipped
+        // and the witness's idle-skip share over-reads.
+        auto emit_spin_charge = [&]() {
+            b.op_i32_const((s32)ctx_ptr);
+            b.op_i32_const((s32)ctx_ptr);
+            b.op_i32_load(ppc_off::DOWNCOUNT);
+            b.op_i32_const((s32)charge);
+            b.op_i32_sub();
+            b.op_i32_store(ppc_off::DOWNCOUNT);
+            if (bem_mips_census_on()) {
+                b.op_i32_const((s32)BEM_MIPS_EXEC_CELL);
+                b.op_i32_const((s32)BEM_MIPS_EXEC_CELL);
+                b.op_i32_load(0);
+                b.op_i32_const((s32)charge);
+                b.op_i32_add();
+                b.op_i32_store(0);
+            }
+        };
+        if (gpuidle_gated && gpuidle_dist != 0u) {
+            b.op_i32_const((s32)gpuidle_dist);
+            b.op_i32_load(0);
+            b.op_i32_eqz();
+            b.op_if(BLOCK_TYPE_VOID);
+                b.op_i32_const((s32)ctx_ptr);
+                b.op_i32_const(0);
+                b.op_i32_store(ppc_off::DOWNCOUNT);
+                b.op_i32_const((s32)BEM_GPUIDLE_SKIP_CELL);
+                b.op_i32_const((s32)BEM_GPUIDLE_SKIP_CELL);
+                b.op_i32_load(0);
+                b.op_i32_const(1);
+                b.op_i32_add();
+                b.op_i32_store(0);
+            b.op_else();
+                emit_spin_charge();
+                b.op_i32_const((s32)BEM_GPUIDLE_SPIN_CELL);
+                b.op_i32_const((s32)BEM_GPUIDLE_SPIN_CELL);
+                b.op_i32_load(0);
+                b.op_i32_const(1);
+                b.op_i32_add();
+                b.op_i32_store(0);
+            b.op_end();
+        } else if (gpuidle_gated) {
+            // Policy on but the FIFO-distance address is not published yet: never
+            // skip a spliced block blind (that is the naive splice that blackened
+            // City Escape). Execute it like any other block.
+            emit_spin_charge();
+        } else if (idle_block) {
             b.op_i32_const((s32)ctx_ptr);
             b.op_i32_const(0);
             b.op_i32_store(ppc_off::DOWNCOUNT);
