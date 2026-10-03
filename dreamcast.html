@@ -1018,6 +1018,18 @@
       fps: safe(() => lastFps, 0), fields: safe(() => lastCalls, 0),
       iters: safe(() => lastIps, 0), pc: safe(() => lastPc, 0),
       guestX: safe(() => guestRateX(), 0),
+      // The AICA witness for the last heartbeat (1.000 = hardware), the raw
+      // SH4-clock ratio, and whether that heartbeat spanned a clock jump.
+      aicaX: safe(() => aicaRateX(), 0),
+      clkX: safe(() => clkRateX(), 0),
+      clkJump: safe(() => lastClkJump, false), clkJumps: safe(() => clkJumps, 0),
+      // hb counts heartbeats so a poller can take each window exactly once;
+      // restoring/hbSinceRestore say whether a savestate restore (the fresh-boot
+      // seed included) is pending or was just applied — a measurement window
+      // should open only once restoring is false and hbSinceRestore >= 2.
+      hb: safe(() => hbSeq, 0),
+      restoring: safe(() => !!(seedArmed || autoloadArmed || loadsInFlight > 0), false),
+      hbSinceRestore: safe(() => hbSinceRestore, 0),
       framesEver: safe(() => framesEverFlowed, false),
       distinctEver: safe(() => distinctEverFlowed, false),
       coi: !!self.crossOriginIsolated,
@@ -2806,6 +2818,18 @@
         lastFps = d.fps; lastHw = d.hw; lastCalls = d.calls;
         lastClk = d.kcyc; lastPc = d.pc >>> 0;
         lastIstnrm = d.istnrm >>> 0; lastIstext = d.istext >>> 0;
+        lastAwr = d.awr | 0; lastAdrop = d.adrop | 0;
+        hbSeq++; hbSinceRestore++;
+        {
+          // See THE CLOCK-DISCONTINUITY GUARD at HW_AICA_HZ.
+          const ax = aicaRateX(), kx = clkRateX();
+          lastClkJump = ax > 0 && kx > 0 && (kx > ax * 2 || kx < ax * 0.5);
+          if (lastClkJump) {
+            clkJumps++;
+            pageLog('[page] clock jump: sched ratio ' + kx.toFixed(3) + 'x vs AICA ' + ax.toFixed(3) +
+                    'x over one heartbeat (savestate/rewind) — guestX reports AICA for this window');
+          }
+        }
         paintFpsBar();
         // Liveness bookkeeping for the stall detector (see checkStall). `calls`
         // is video_cb per second INCLUDING duplicate-frame sentinels, so a core
@@ -2837,8 +2861,9 @@
         // the old fixed timer failed ~50% of the time and silently cold-booted.
         if (autoloadArmed && d.calls > 0) {
           autoloadArmed = false;
+          loadsInFlight++;
           autoloadPromise.then((buf) => {
-            if (!buf) return;   // already logged; normal boot stands
+            if (!buf) { loadsInFlight = Math.max(0, loadsInFlight - 1); return; }   // already logged; normal boot stands
             pageLog('[page] autoload: fetched ' + buf.byteLength + ' B, restoring');
             worker.postMessage({ cmd: 'loadState', data: buf }, [buf]);
           });
@@ -2861,8 +2886,9 @@
         // invisible until two people had already lost an evening.
         if (seedArmed && d.calls > 0 && !NET.session) {
           seedArmed = false;
+          loadsInFlight++;
           seedPromise.then((buf) => {
-            if (!buf) return;   // fetchSeedState already logged why; cold boot stands
+            if (!buf) { loadsInFlight = Math.max(0, loadsInFlight - 1); return; }   // fetchSeedState already logged why; cold boot stands
             seedLabel = '✓ Ready — serial and access key already entered';
             pageLog('[seed] applying ' + buf.byteLength + ' B');
             worker.postMessage({ cmd: 'loadState', data: buf }, [buf]);
@@ -2876,6 +2902,7 @@
         facts.guestRecovered = 'rewound ' + d.ageS + ' s after: ' + d.why +
           (d.nochainMs ? ' (block chaining off for ' + Math.round(d.nochainMs / 1000) + ' s)' : '');
         mark('guest-recovered');
+        hbSinceRestore = 0;   // a rewind is a restore: the next heartbeat spans a clock jump
         rebaseStallClocks();
         showToast('The game hit an emulator fault and was rewound ' + Math.round(d.ageS) + ' s — carry on', false);
         break;
@@ -2913,6 +2940,9 @@
         break;
       case 'stateLoaded': {
         const lbl = seedLabel; seedLabel = null;
+        // The heartbeat that spans this load carries the clock jump; a meter
+        // that wants a clean window waits for hbSinceRestore >= 2.
+        loadsInFlight = Math.max(0, loadsInFlight - 1); hbSinceRestore = 0;
         // ⚠ HAND THE ROOM SEED THE CORE'S OWN ANSWER, NEVER "we posted it".
         // CLAUDE.md gate #10: a savestate that fails to restore SILENTLY COLD
         // BOOTS and still produces a plausible-looking result. This ack is
@@ -4941,11 +4971,12 @@
     const ok = await new Promise((resolve) => {
       const t = setTimeout(() => {
         if (!pendingSeedAck) return;   // already answered
-        pendingSeedAck = null; resolve('timeout');
+        pendingSeedAck = null; loadsInFlight = Math.max(0, loadsInFlight - 1); resolve('timeout');
       }, SEED_ROOM_MS);
       pendingSeedAck = (v) => { clearTimeout(t); resolve(v); };
       seedLabel = '✓ Ready — serial and access key already entered';
       pageLog('[seed] applying ' + buf.byteLength + ' B at frame 0, before the barrier');
+      loadsInFlight++;
       worker.postMessage({ cmd: 'loadState', data: buf, frame: 0 }, [buf]);
     });
     if (ok === 'timeout') {
@@ -5298,6 +5329,7 @@
     if (!booted) { pageLog('[page] Start the game before loading'); return; }
     if (!savedState) { pageLog('[page] no saved state yet — click Save State first'); return; }
     pageLog('[page] loading state ' + savedState.byteLength + ' B…');
+    loadsInFlight++;
     worker.postMessage({ cmd: 'loadState', data: savedState });  // structured-clone copy; savedState kept
   });
 
@@ -5363,14 +5395,38 @@
   const HW_SH4_HZ = 200e6;   // must match SH4_HZ in dreamcast/flycast_libretro/flycast_worker.js
   let lastFps = 0, lastHw = 0, lastCalls = 0, lastIps = 0;
   let lastClk = 0, lastPc = 0, lastIstnrm = 0, lastIstext = 0;
+  // ---- THE CLOCK-DISCONTINUITY GUARD (2026-10-03) --------------------------
+  // lastClk is the worker's Δsh4_sched_now64()/s over one heartbeat window
+  // (EmscriptenWorker.cpp, fps_last_sched). That counter is NOT continuous: a
+  // savestate restore deserializes sh4_sched_ffb (sh4_sched.cpp:263), so the
+  // window that spans a load reports the whole jump as one second's rate.
+  // Measured: the fresh-boot SEED restore on PSO moved it ~24.9e9 cycles and the
+  // page published guestX=80.543x for that one heartbeat while the AICA witness
+  // read 0.4x — and lib/bench.js averaged it into a live "guest 3.5719x".
+  // The governor was never fooled (it rebases on lead > 250 ms), only the meter.
+  //
+  // The cross-check is the AICA production rate the same heartbeat already
+  // carries (awr + adrop = stereo frames/s the core PRODUCED, written or
+  // dropped): AICA_TICK = 4535 SH4 cycles, so 44101.43 frames/s IS 1.000x, and
+  // those counters are plain monotonic production totals that a deserialize
+  // does not move. Per-window the two disagree by up to ~15% (audio is pushed
+  // per retro_run, so batches straddle window edges), so the test is a 2x
+  // band — the same band the Node probe uses to flag discontinuous windows.
+  const HW_AICA_HZ = 44101.43;   // 200e6 / 4535
+  let lastAwr = 0, lastAdrop = 0, lastClkJump = false, clkJumps = 0;
+  let hbSeq = 0, hbSinceRestore = 0, loadsInFlight = 0;
   // Liveness, for the stall detector. Written by the 'fps' handler above.
   let framesEverFlowed = false, distinctEverFlowed = false;
   let lastTelemetryAt = 0, lastCallsAt = 0, lastDistinctAt = 0;
   // Pump duty-cycle window (ms per ~1 s), from the shim's 'ips' message.
   let lastBusyMs = 0, lastPacedMs = 0, lastWallMs = 0, lastGoverned = 1;
   const fpsEl = $('fpsBar');
-  function guestMHz()   { return lastClk * 1024 / 1e6; }
-  function guestRateX() { return (lastClk * 1024) / HW_SH4_HZ; }   // 1.000 = exactly hardware
+  function aicaRateX()  { return (lastAwr + lastAdrop) / HW_AICA_HZ; }   // the witness
+  function clkRateX()   { return (lastClk * 1024) / HW_SH4_HZ; }
+  // 1.000 = exactly hardware. The SH4-clock ratio, except on a window the guard
+  // above flagged as spanning a clock jump, where it is the AICA ratio.
+  function guestRateX() { return lastClkJump ? aicaRateX() : clkRateX(); }
+  function guestMHz()   { return guestRateX() * HW_SH4_HZ / 1e6; }
   function dutyFrac()   { return lastWallMs > 0 ? Math.min(1, lastBusyMs / lastWallMs) : 0; }
   function headroomX()  { const d = dutyFrac(); return d > 0 ? guestRateX() / d : 0; }
   // Measured emulation cost of ONE PRODUCED FRAME: busy ms per wall second
