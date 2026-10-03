@@ -458,6 +458,18 @@ protected:
     if (!entry || !entry->texture || !g_framebuffer_manager)
       return;
 
+    // [gpu-frame-bound 2026-10-03] (WGPUGfx.h kMaxReadbacksInFlight) An XFB copy only feeds the
+    // present, so its frame may still be dropped when the GPU is behind — record the dst so a
+    // dropped one is never read back. Any other EFB copy is a texture later frames may sample:
+    // the frame that produced it must really run.
+    if (WGPUGfx* fgfx = WGPUGfx::GetInstance())
+    {
+      if (entry->is_xfb_copy && !is_depth_copy)
+        fgfx->NoteXfbCopyTarget(static_cast<WGPUTexture*>(entry->texture.get())->GetTexture());
+      else
+        fgfx->MarkFrameKept();
+    }
+
     if (is_depth_copy)
     {
       ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3524u));

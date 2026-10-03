@@ -35,6 +35,28 @@ public:
   // Present readbacks issued but not yet completed by the GPU (recomp backpressure ticket).
   u32 GetReadbacksInFlight() const { return static_cast<u32>(m_readback_in_flight); }
 
+  // [gpu-frame-bound 2026-10-03] GPU WORK IN FLIGHT IS BOUNDED, NOT JUST READBACKS.
+  // The present readback cap (kMaxReadbacksInFlight) used to be the only limit: at the cap
+  // ReadbackAndPresent returned BEFORE SubmitFrame, so the frame's draws stayed in the open
+  // encoder and the next frame's were appended to them. A frame that was not presented was
+  // still rendered, and every one of them reached the GPU in the next submit. On a GPU slower
+  // than the stream the queue grew by (stream - GPU) frames per second, without limit.
+  // Measured, MP4 on a software WebGPU adapter: submit #7 held ~400 draws of boot frames and
+  // had not completed 155 s later; the recomp's first frame waited behind it, so its ack never
+  // came and the page published 3 frames in 180 s.
+  // Now, at a frame boundary with the GPU behind, a frame whose work is still entirely in the
+  // open encoder and has no consumer outside the EFB/XFB is DROPPED (its encoder is released
+  // unsubmitted). Anything that gives the frame's GPU work a consumer marks it kept:
+  static constexpr int kMaxReadbacksInFlight = 3;
+  // An EFB copy into a texture (non-XFB): later frames may sample it, so it must be real.
+  void MarkFrameKept() { m_frame_droppable = false; }
+  // An XFB copy's destination: if its frame is dropped the texture never received the pixels,
+  // so ShowImage must not read it back until a submitted copy writes it again.
+  void NoteXfbCopyTarget(::WGPUTexture t) { if (t) m_frame_xfb_targets.push_back(t); }
+  // A texture-to-texture copy (an XFB container stitched from copies) inherits its source's
+  // dropped state, so a container built from a dropped XFB is not read back either.
+  void InheritDroppedXfb(::WGPUTexture src, ::WGPUTexture dst);
+
   // [WGPU-PROF — TEMP] texture-upload accumulation: WGPUTexture::Load adds, ShowImage reads+resets.
   static double s_prof_tex_load_ms;
   static int s_prof_tex_loads;
@@ -262,6 +284,12 @@ private:
   WGPUBuffer m_readback_buffer = nullptr;
   size_t m_readback_capacity = 0;
   int m_readback_in_flight = 0;  // [pipeline] readbacks in flight (cap 3)
+  // [gpu-frame-bound 2026-10-03] see kMaxReadbacksInFlight.
+  bool m_frame_droppable = true;                    // nothing since the last ShowImage forces it
+  std::vector<::WGPUTexture> m_frame_xfb_targets;   // XFB copy dsts recorded since then
+  std::vector<::WGPUTexture> m_dropped_xfb;         // dsts whose last write was dropped
+  void DropPendingFrame();
+  bool IsDroppedXfb(::WGPUTexture t) const;
   // [staging ring STEP 4 2026-07-09] persistent readback-buffer pool (<=3, matches the
   // in-flight cap) — replaces per-frame wgpuDeviceCreateBuffer/Release churn. Buffers return
   // to the pool from the map callback (unmapped => reusable); pool flushes on size change.

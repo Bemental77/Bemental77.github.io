@@ -147,6 +147,7 @@ void WGPUTexture::CopyRectangleFromTexture(const AbstractTexture* src,
   // A copy cannot run with a render pass open; flush the in-flight frame first.
   gfx->EndRenderPass();
   gfx->SubmitFrame();
+  gfx->InheritDroppedXfb(src_texture->GetTexture(), m_texture);  // [gpu-frame-bound]
 
   WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(device, nullptr);
 
