@@ -3012,13 +3012,36 @@ window.GcRate = (function () {
         // is broken on macOS). Default = double-buffered, composited, scanned out
         // through the normal renderer-compositor queue — the path that never crashed.
         var _mtGl = null;
+        // [present mode 2026-10-03] On a SOFTWARE compositor (SwiftShader & co. — chrome://gpu
+        // "Compositing: Software only") every drawn WebGL canvas is read back SYNCHRONOUSLY on
+        // this thread at the next rendering update, and that readback waits for all queued GPU
+        // work: it is what produced the 18-450 s long tasks (see MAIN-THREAD PRESENT in
+        // render-worker.js). There the replay context goes on an OffscreenCanvas the compositor
+        // never sees, and finished frames are painted into #canvas with a 2D putImageData after an
+        // async (fenced) readback. With a real GPU the canvas is composited directly as before.
+        // ?mtpresent=readback|direct overrides the detection.
+        var _mtAttrs = { alpha: false, depth: true, stencil: true, antialias: false,
+                         preserveDrawingBuffer: false, premultipliedAlpha: false,
+                         failIfMajorPerformanceCaveat: false };
+        var _mtMode = (/[?&]mtpresent=(readback|direct)\b/.exec(location.search) || [])[1] || null;
+        var _mtRenderer = '?';
+        if (!_mtMode) {
+          try {
+            var _pc = new OffscreenCanvas(1, 1).getContext('webgl2');
+            var _dbg = _pc && _pc.getExtension('WEBGL_debug_renderer_info');
+            _mtRenderer = _pc ? String(_pc.getParameter(_dbg ? _dbg.UNMASKED_RENDERER_WEBGL : _pc.RENDERER)) : '?';
+            var _lose = _pc && _pc.getExtension('WEBGL_lose_context'); if (_lose) _lose.loseContext();
+          } catch (e) {}
+          _mtMode = /SwiftShader|llvmpipe|softpipe|Basic Render|Software/i.test(_mtRenderer) ? 'readback' : 'direct';
+        }
+        var _mtGlCanvas = _rwCanvas;
         try {
-          _mtGl = _rwCanvas && _rwCanvas.getContext ? _rwCanvas.getContext('webgl2', {
-            alpha: false, depth: true, stencil: true, antialias: false,
-            preserveDrawingBuffer: false, premultipliedAlpha: false,
-            failIfMajorPerformanceCaveat: false,
-          }) : null;
+          if (_mtMode === 'readback' && typeof OffscreenCanvas === 'function') {
+            _mtGlCanvas = new OffscreenCanvas(_rwCanvas.width, _rwCanvas.height);
+          } else _mtMode = 'direct';
+          _mtGl = _mtGlCanvas && _mtGlCanvas.getContext ? _mtGlCanvas.getContext('webgl2', _mtAttrs) : null;
         } catch (e) { pageLog('[mtgl] getContext(webgl2) threw: ' + (e && e.message)); }
+        pageLog('[mtgl] present mode ' + _mtMode + ' (renderer ' + _mtRenderer + ')');
         if (_mtGl && !(typeof _mtGl.isContextLost === 'function' && _mtGl.isContextLost())) {
           // Write the GL descriptor ONLY once the main-thread WebGL2 context
           // exists. The C++ recorder-install gate (EmscriptenWorker load_iso)
@@ -3034,7 +3057,7 @@ window.GcRate = (function () {
           // Context-loss → fall back to software present (paintFrame2D). The
           // software path already exists; flip the flag so a later context loss
           // routes the worker's video_cb pixel path back to the 2D canvas.
-          _rwCanvas.addEventListener('webglcontextlost', function (ev) {
+          _mtGlCanvas.addEventListener('webglcontextlost', function (ev) {
             ev.preventDefault();
             pageLog('[mtgl] WebGL2 context LOST — routing to software present');
             window.__gcSoftwareRender = true; window.__gcRenderWorker = false;
@@ -3048,7 +3071,7 @@ window.GcRate = (function () {
           _mtScript.onload = function () {
             try {
               var ok = window.__gcStartMainThreadReplay && window.__gcStartMainThreadReplay({
-                gl: _mtGl, canvas: _rwCanvas, memory: sharedMemory,
+                gl: _mtGl, canvas: _mtGlCanvas, display: _rwCanvas, mode: _mtMode, memory: sharedMemory,
                 ringByteOff: window.__gcGl.ringOff, ringWords: window.__gcGl.ringWords,
                 ctrlByteOff: window.__gcGl.ctrlOff,
               });
@@ -10075,10 +10098,19 @@ window.GcRate = (function () {
         // Floor: a draw at least every 250 ms even if rAF is starved outright (measured: rAF at
         // 0/s for minutes with this thread idle while SwiftShader's GPU process was saturated),
         // so the picture never freezes — 4 draws/s is the most a starved pipeline is offered.
+        // [2026-10-03] AND NEVER AHEAD OF THE GPU: __gcRwBusy() (render-worker.js) is true while
+        // the replay has a frame the GPU has not finished, or one already sent that has not
+        // reached it. Drawing another would only queue it — and every queued frame is GPU work
+        // some synchronous wait eventually pays for (it was the 18-450 s long tasks). Such a
+        // frame is dropped here, at the source, like the rAF cap above: state applied, no draw.
         var _fnow = performance.now();
-        var _pg = !!window.__gcMtGl && !rafSinceDraw && (_fnow - lastDrawAt) < 250;
+        var _mt = !!window.__gcMtGl, _rwb = _mt && typeof window.__gcRwBusy === 'function' && window.__gcRwBusy();
+        var _pg = _mt && (_rwb || (!rafSinceDraw && (_fnow - lastDrawAt) < 250));
         var skipRender = rate.frame(e.data.n, _fnow, _pg);
-        if (!skipRender) { rafSinceDraw = false; lastDrawAt = _fnow; }
+        if (!skipRender) {
+          rafSinceDraw = false; lastDrawAt = _fnow;
+          if (_mt && typeof window.__gcRwNoteSent === 'function') window.__gcRwNoteSent();
+        }
         var tr = [e.data.fifo].concat(e.data.regions.map(function (r) { return r.bytes; }));
         if (e.data.mem1) tr.push(e.data.mem1);
         dolphin_worker.postMessage({ cmd: 'recompFrame', n: e.data.n, fifo: e.data.fifo,

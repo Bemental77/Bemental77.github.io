@@ -147,24 +147,23 @@ let texScratch = new Uint8Array(1 << 20);   // 1MB; grows on demand
 // path), so reusing it across uploads within a frame is race-free. This severs the
 // backlog at its source, so the heavy per-frame getError() sync can be dropped.
 function texHeapSrc(off, req) {
-  if (req > texScratch.length) texScratch = new Uint8Array(req + 4096);
+  if (req > texScratch.length) texScratch = new Uint8Array((req + 4096) & ~3);
   texScratch.set(heapU8.subarray(off, off + req));
   return texScratch.subarray(0, req);
 }
+let _body0 = 0;   // ring-relative word index of the body of the command being executed (drainOnce)
 function texInlinePayload(a, lenWordIdx) {
   const n = a(lenWordIdx);                   // byte length
-  if (n > texScratch.length) texScratch = new Uint8Array(n + 4096);
+  if (((n + 3) & ~3) > texScratch.length) texScratch = new Uint8Array((n + 4096) & ~3);
   const words = (n + 3) >> 2;
-  const base = lenWordIdx + 1;
-  const u8 = texScratch;
-  for (let i = 0; i < words; i++) {
-    const v = a(base + i);
-    const bo = i << 2;
-    u8[bo] = v & 0xff;
-    u8[bo + 1] = (v >> 8) & 0xff;
-    u8[bo + 2] = (v >> 16) & 0xff;
-    u8[bo + 3] = (v >> 24) & 0xff;
-  }
+  // Bulk copy straight out of the ring (at most two segments across the wrap). Vertex streams
+  // now travel inline at any size (gl-record.js INLINE_STREAM_MAX), so a per-word decode
+  // through a(k) would be the hottest loop on this thread.
+  const dst = new Int32Array(texScratch.buffer, 0, texScratch.length >> 2);
+  const start = (_body0 + lenWordIdx + 1) % ringCap;
+  const first = Math.min(words, ringCap - start);
+  dst.set(ring.subarray(ringStore + start, ringStore + start + first), 0);
+  if (first < words) dst.set(ring.subarray(ringStore, ringStore + (words - first)), first);
   return n;                                  // bytes written to texScratch[0..n)
 }
 
@@ -384,7 +383,7 @@ function exec(opcode, a, nWords) {
         // the heap source into the owned texScratch (texHeapSrc). Never hand texSubImage a
         // live heapU8 (SAB) view — it detaches on heap growth before the deferred GPU read.
         // _req==0 means unknown fmt/type (texReqBytes can't size it) → keep the raw heap
-        // path as a last resort (rare; covered by the periodic getError insurance).
+        // path as a last resort (rare).
         const _req = texReqBytes(a(5), a(6), a(7), a(8), a(9));
         if (nWords > 11) {
           const n = texInlinePayload(a, 11);
@@ -493,73 +492,184 @@ function readIntArr(a, base) {
   return out;
 }
 
-// How often the main-thread replay forces a GPU sync (getError round-trip). This
-// synchronous round-trip BLOCKS the main thread on the GPU; at every-4-frames it was
-// the dominant cost capping the replay near ~3fps. With every SAB-view upload now
-// eager-copied into owned memory (texHeapSrc), the heap-growth-detach backlog the sync
-// was draining no longer forms, so this drops to a rare error-report heartbeat (~1/sec
-// at native) rather than a per-frame brake. flush() every frame still keeps the driver
-// moving without blocking.
-// [2026-09-05] 240, raised from 8. The comment below records why 8 was chosen: at the
-// then-unthrottled ~46 fps present rate a 64-frame backlog overran the ANGLE-Metal command
-// buffer. Two things have changed since, and both remove that reasoning.
-//   1. The texScratch EAGER-COPY (see texHeapSrc) already "severs the backlog at its source,
-//      so the heavy per-frame getError() sync can be dropped" — this file's own words. It was
-//      never actually dropped.
-//   2. This path presents nowhere near 46 fps, so the per-frame backlog the 8 was sized
-//      against is far smaller.
-// MEASURED, SAB / no WebGPU / ?hwRender=1, composited screenshots:
-//   GETERR_EVERY=8    every sample 4.5% non-black / 6 colours (sampling lands mid-frame)
-//   GETERR_EVERY=240  29.4%/167, 43%/86, 29.4%/167, 29.4%/167   glErrors=0
-//   getError removed  29.4%/167, 42.4%/179, 29.4%/167, 29.4%/167  glErrors=0
-// and frames at equal elapsed went from ~80 to ~350 with the sync removed. 240 captures that
-// while KEEPING a periodic drain, so the driver still gets a reclaim point — removing it
-// outright would rely entirely on (1) with no safety valve.
-// ⚠ NOT a stability claim. The historical failure is specific — "texSubImage3D:
-// ArrayBufferView not big enough" then a frozen black canvas — and clearing it needs repeated
-// long runs, headless AND headful, on more than one GPU. This is one machine.
-const GETERR_EVERY = 240;
-                          // backlog overran the ANGLE-Metal command buffer — drain the GPU far more often.
+// ── MAIN-THREAD PRESENT: NEVER WAIT ON THE GPU (2026-10-03) ──────────────────────────────────
+// WHERE THE PAGE ACTUALLY BLOCKED. Mario Party 4 / no WebGPU / SwiftShader: long tasks of 194 s,
+// 290 s and 380 s (three runs), and ~200 ms tasks several times a second between them. A main-
+// thread CPU profile of one such window is 98.5% `(program)` — native time with NO JavaScript on
+// the stack — and timing every replayed GL call found none above 100 ms (getError measured
+// 0-2 ms at every one of its syncs). So the wait was not in this file's calls at all: it was the
+// browser's own CANVAS COMMIT. chrome://gpu on that box reads "Compositing: Software only", and
+// with a software compositor every WebGL canvas that was drawn since the last frame is READ BACK
+// SYNCHRONOUSLY on the main thread when the page updates its rendering (a glReadPixels of the
+// drawing buffer). A synchronous readback waits for every GPU command queued before it. Nothing
+// here ever asked whether the GPU had finished the last frame, so whole seconds of SwiftShader
+// work queued up behind each commit, and one commit waited out minutes of it.
+//
+// THE RULES THIS PATH NOW KEEPS:
+//   1. ONE frame is in flight on the GPU. Every present ends in a fenceSync; the next
+//      frame is not replayed until that fence reads SIGNALED (getSyncParameter is a cached,
+//      non-blocking read in Chrome, refreshed between tasks). Frames the GPU cannot keep up with
+//      are dropped at the SOURCE: window.__gcRwBusy() tells the page, which marks them skipRender
+//      (their RAM state still lands, so the guest is untouched — only presents are dropped).
+//      MEASURED on SwiftShader (Mario Party 4 title fade-in, 900 s run): one frame took 488.8 s
+//      of GPU time; this thread's longest task over the whole run was 55 ms after boot, the guest
+//      held 59.997 frames/s, and once that frame retired presents ran at 8.05/s. That frame's
+//      draws carry vertex data that decodes as positions like 1.3e35 under the declared float
+//      layout (see
+//      gamecube/docs/webgl2-fallback/TASKS.md) — huge triangles that cost a software rasterizer
+//      minutes. Neither flushing nor issuing extra commands while waiting shortened it.
+//      NEVER MORE WORK BEHIND A STUCK FRAME. Letting the next frame through when a fence looked
+//      stuck (tried with a 1-3 s threshold and up to 4 frames tracked) blocked this thread for
+//      446-451 s in four of four runs: once the GPU is genuinely behind, further GL calls wait in
+//      Chrome's command transport for it. So it is one frame in flight, full stop; a frame the
+//      GPU is still drawing costs presents, never this thread.
+//   2. On a SOFTWARE compositor the WebGL canvas is never composited at all ('readback' mode):
+//      the context lives on an OffscreenCanvas, each present reads the frame into a PIXEL_PACK
+//      buffer behind the fence, and only once the fence has signaled is it copied out
+//      (getBufferSubData on finished data does not wait for the GPU) and painted to #canvas with
+//      a 2D putImageData. So the commit has nothing of ours to wait for.
+//   3. On a GPU compositor ('direct') the WebGL canvas is composited as before — that commit is
+//      a mailbox handoff, not a readback — and rule 1 alone bounds the GPU queue.
+//   4. No periodic getError: it was a synchronous round trip kept as a "drain" for an ANGLE-Metal
+//      backlog that rule 1 now prevents by construction. ?glerr=1 restores it for debugging.
+let rwMode = 'direct';                // 'direct' | 'readback' (set by startMainThreadReplay)
+const RW_MAX_INFLIGHT = 1;
+let rwFences = [];                    // in-flight frames, oldest first: { sync, at, slot }
+let rwPbos = [], rwBuf = null, rwImg = null, rwCtx2d = null, rwW = 0, rwH = 0;
+let rwSentReplayed = -1, rwSentAt = 0;  // a frame the page sent that has not reached the ring yet
+const RW_GLERR = (typeof location !== 'undefined') && /[?&]glerr=1\b/.test(location.search);
+const rwStats = { replayed: 0, completed: 0, superseded: 0, fenceMaxMs: 0, readbackMaxMs: 0, sent: 0 };
+if (typeof self !== 'undefined') self.__rwStats = rwStats;
+
+function rwFreeSlot() {
+  for (let k = 0; k < RW_MAX_INFLIGHT; k++) if (!rwFences.some((f) => f.slot === k)) return k;
+  return 0;
+}
+function rwIssueReadback(slot) {
+  const g = gl;
+  const prevRead = g.getParameter(g.READ_FRAMEBUFFER_BINDING);
+  const prevPack = g.getParameter(g.PIXEL_PACK_BUFFER_BINDING);
+  const pr = g.getParameter(g.PACK_ROW_LENGTH), psr = g.getParameter(g.PACK_SKIP_ROWS);
+  const psp = g.getParameter(g.PACK_SKIP_PIXELS), pa = g.getParameter(g.PACK_ALIGNMENT);
+  g.bindFramebuffer(g.READ_FRAMEBUFFER, null);
+  g.bindBuffer(g.PIXEL_PACK_BUFFER, rwPbos[slot]);
+  if (pr) g.pixelStorei(g.PACK_ROW_LENGTH, 0);
+  if (psr) g.pixelStorei(g.PACK_SKIP_ROWS, 0);
+  if (psp) g.pixelStorei(g.PACK_SKIP_PIXELS, 0);
+  if (pa !== 4) g.pixelStorei(g.PACK_ALIGNMENT, 4);
+  g.readPixels(0, 0, rwW, rwH, g.RGBA, g.UNSIGNED_BYTE, 0);
+  if (pr) g.pixelStorei(g.PACK_ROW_LENGTH, pr);
+  if (psr) g.pixelStorei(g.PACK_SKIP_ROWS, psr);
+  if (psp) g.pixelStorei(g.PACK_SKIP_PIXELS, psp);
+  if (pa !== 4) g.pixelStorei(g.PACK_ALIGNMENT, pa);
+  g.bindBuffer(g.PIXEL_PACK_BUFFER, prevPack);
+  g.bindFramebuffer(g.READ_FRAMEBUFFER, prevRead);
+}
+function rwFinishReadback(slot) {
+  const g = gl, t0 = performance.now();
+  const prevPack = g.getParameter(g.PIXEL_PACK_BUFFER_BINDING);
+  g.bindBuffer(g.PIXEL_PACK_BUFFER, rwPbos[slot]);
+  // This slot's fence has signaled and no later readback targets this buffer (one buffer per
+  // in-flight slot), so the copy-out has no GPU work to wait for.
+  g.getBufferSubData(g.PIXEL_PACK_BUFFER, 0, rwBuf);
+  g.bindBuffer(g.PIXEL_PACK_BUFFER, prevPack);
+  // readPixels rows are bottom-up; ImageData is top-down.
+  const row = rwW * 4, dst = rwImg.data;
+  for (let y = 0; y < rwH; y++) dst.set(rwBuf.subarray((rwH - 1 - y) * row, (rwH - y) * row), y * row);
+  rwCtx2d.putImageData(rwImg, 0, 0);
+  const dt = performance.now() - t0;
+  if (dt > rwStats.readbackMaxMs) rwStats.readbackMaxMs = dt;
+}
+// Non-blocking: retire (and, in readback mode, paint) every in-flight frame whose fence has
+// signaled, oldest first. Fences signal in submission order.
+function rwPollFence() {
+  while (rwFences.length) {
+    const f = rwFences[0];
+    if (gl.getSyncParameter(f.sync, gl.SYNC_STATUS) !== gl.SIGNALED) break;
+    gl.deleteSync(f.sync); rwFences.shift();
+    const dt = performance.now() - f.at;
+    if (dt > rwStats.fenceMaxMs) rwStats.fenceMaxMs = dt;
+    if (rwMode === 'readback') {
+      try { rwFinishReadback(f.slot); } catch (e) { reportGlError('readback', '' + (e && e.message ? e.message : e)); }
+    }
+    rwStats.completed++;
+    rwCountFps();
+  }
+  return rwFences.length === 0;
+}
+// May the next frame be replayed now? Only when nothing is in flight (see rule 1).
+function rwCanReplay() { return rwFences.length === 0; }
+// The page's source-side frame gate (gamecube.html, recomp 'frame' handler): true while drawing
+// another frame would only queue it behind one the GPU has not finished — or behind one already
+// sent that has not reached the ring yet (bounded at 1 s, so a frame that never presents cannot
+// hold presents down).
+function rwBusy() {
+  if (!started) return false;
+  if (!rwCanReplay()) return true;
+  if (Atomics.load(ring, HDR_HEAD) !== Atomics.load(ring, HDR_TAIL)) return true;
+  if (rwSentReplayed === rwStats.replayed && (performance.now() - rwSentAt) < 1000) return true;
+  return false;
+}
+function rwNoteSent() { rwSentReplayed = rwStats.replayed; rwSentAt = performance.now(); rwStats.sent++; }
+// Introspection for rigs: what the present path is waiting on right now.
+function rwState() {
+  return { mode: rwMode, started: started, lost: !!(gl && gl.isContextLost && gl.isContextLost()),
+           inflight: rwFences.length, fenceAgeMs: rwFences.length ? performance.now() - rwFences[0].at : 0,
+           ringPending: started ? (Atomics.load(ring, HDR_HEAD) - Atomics.load(ring, HDR_TAIL)) : 0,
+           sentPending: rwSentReplayed === rwStats.replayed, sinceSentMs: performance.now() - rwSentAt,
+           stats: Object.assign({}, rwStats) };
+}
+if (typeof self !== 'undefined') { self.__gcRwBusy = rwBusy; self.__gcRwNoteSent = rwNoteSent; self.__gcRwState = rwState; }
+
 let _fpsFrames = 0, _fpsLastMs = 0;   // main-thread [fps] metric (probe parses these)
+function rwCountFps() {
+  // Emit the same '[fps]' line the software path logs so the probe's fps metric works on this
+  // path too. It counts frames the GPU has FINISHED (and, in readback mode, painted) — not
+  // frames merely replayed into a queue.
+  _fpsFrames++;
+  const now = performance.now();
+  if (_fpsLastMs === 0) _fpsLastMs = now;
+  else if (now - _fpsLastMs > 1000) {
+    const fps = _fpsFrames * 1000 / (now - _fpsLastMs);
+    try {
+      const fe = (typeof document !== 'undefined') ? document.getElementById('fps') : null;
+      if (fe) fe.textContent = 'FPS: ' + fps.toFixed(1);
+    } catch (e) {}
+    self.__mtglTotalFrames = (self.__mtglTotalFrames || 0) + _fpsFrames;
+    console.log('[fps] ' + fps.toFixed(2) + ' @t=' + (now / 1000).toFixed(0) +
+                's totalFrames=' + self.__mtglTotalFrames + ' [mtgl ' + rwMode + ']');
+    _fpsFrames = 0; _fpsLastMs = now;
+  }
+}
 function present() {
   framesPainted++;
   if (MODE === 'main') {
-    // [main-thread WebGL2 replay] The default canvas swap presents the just-drawn
-    // backbuffer automatically when this rAF turn yields — present() is a NO-OP
-    // for display. No transferToImageBitmap, no postMessage, no worker GPU surface:
-    // the macOS-Metal overlay/SharedImage-teardown path (crbug 948249) never forms.
-    //
-    // We MUST periodically force the driver to CONSUME the queued commands. A bare
-    // glFlush() (async hint) is too weak: on ANGLE-Metal the command buffer + the
-    // zero-copy upload source views it still references pile up until the GPU
-    // process faults at ~frame 40 (observed: `texSubImage3D: ArrayBufferView not
-    // big enough` then a frozen black canvas — the "renders black" symptom).
-    // getError() forces a real client→server→client round-trip that DRAINS the
-    // queue and lets the driver reclaim resources. Doing it EVERY frame bounds the
-    // work but blocks the main thread on the GPU each frame (jams page compositing /
-    // CDP). glFlush() every frame (cheap, non-blocking) keeps the driver moving;
-    // a getError() sync every GETERR_EVERY frames caps the in-flight backlog. This
-    // pair + one-frame-per-rAF pacing runs the full probe with no GPU-process death.
+    rwStats.replayed++;
+    // Past the in-flight bound (only ctrlService's full drain or the JIT backlog path can get
+    // here) the oldest frame is superseded: its fence is dropped unread, newest wins.
+    if (rwFences.length >= RW_MAX_INFLIGHT) {
+      const old = rwFences.shift();
+      gl.deleteSync(old.sync); rwStats.superseded++;
+      // Its readback may still be pending on the GPU, and a readPixels into a buffer the GPU is
+      // still writing WAITS for it — MEASURED: present() blocked this thread 100-128 ms per frame,
+      // and once 450 s, reusing such a buffer. So the slot gets a fresh buffer; the old one is
+      // freed by GL once the GPU is done with it.
+      if (rwMode === 'readback') {
+        const prevPack = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
+        gl.deleteBuffer(rwPbos[old.slot]);
+        rwPbos[old.slot] = gl.createBuffer();
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, rwPbos[old.slot]);
+        gl.bufferData(gl.PIXEL_PACK_BUFFER, rwW * rwH * 4, gl.STREAM_READ);
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, prevPack);
+      }
+    }
+    const slot = rwFreeSlot();
+    if (rwMode === 'readback') rwIssueReadback(slot);
+    rwFences.push({ sync: gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0), at: performance.now(), slot: slot });
     gl.flush();
-    if ((framesPainted % GETERR_EVERY) === 0) {
+    if (RW_GLERR && (framesPainted % 240) === 0) {
       const _glerr = gl.getError();
       if (_glerr !== 0) reportGlError('present', 'GL error ' + _glerr);
-    }
-    // Emit the same '[fps]' line the software path logs so the probe's fps metric
-    // works on this path too (it counts present opcodes = one per real frame swap).
-    _fpsFrames++;
-    const now = (typeof performance !== 'undefined') ? performance.now() : Date.now();
-    if (_fpsLastMs === 0) _fpsLastMs = now;
-    else if (now - _fpsLastMs > 1000) {
-      const fps = _fpsFrames * 1000 / (now - _fpsLastMs);
-      try {
-        const fe = (typeof document !== 'undefined') ? document.getElementById('fps') : null;
-        if (fe) fe.textContent = 'FPS: ' + fps.toFixed(1);
-      } catch (e) {}
-      self.__mtglTotalFrames = (self.__mtglTotalFrames || 0) + _fpsFrames;
-      console.log('[fps] ' + fps.toFixed(2) + ' @t=' + (now / 1000).toFixed(0) +
-                  's totalFrames=' + self.__mtglTotalFrames + ' [mtgl]');
-      _fpsFrames = 0; _fpsLastMs = now;
     }
     return;
   }
@@ -609,6 +719,7 @@ function drainOnce(stopAtPresent) {
     const nWords = ring[ringStore + ((tail + 1) % ringCap)];
     const body0 = tail + 2;
     const a = (k) => ring[ringStore + ((body0 + k) % ringCap)];
+    _body0 = body0;
     _hitPresent = false;
     try { exec(opcode, a, nWords); } catch (e) {
       reportGlError(opcode, '' + (e && e.message ? e.message : e));
@@ -638,44 +749,40 @@ function _scheduleDrain() {
 function drainLoop() {
   if (MODE === 'main') {
     const _t0 = performance.now();
-    // CATCH-UP: the worker runs ~5x ahead and the page drained FIFO one-frame-per-turn, replaying the
-    // OLDEST queued frame and falling further behind every turn (worker n=384 vs page ~80). Drain up
-    // to CATCHUP_MAX completed frames toward the LATEST this turn, bounded by an 8ms wall-clock budget
-    // so the ANGLE-Metal command buffer + zero-copy upload views still recycle (present() flushes each
-    // sub-frame). If the ~frame-40 'ArrayBufferView not big enough' fault returns, lower CATCHUP_MAX.
-    const CATCHUP_MAX = 8;
-    const _budget = _t0 + 8;
+    // ONE FRAME IN FLIGHT (see MAIN-THREAD PRESENT above). The old loop replayed up to 8 queued
+    // frames per turn toward the newest, all of them into the GPU queue, with nothing asking
+    // whether the GPU had finished any of them. Now: finish (and, in readback mode, paint) the
+    // in-flight frame once its fence has signaled, and only then replay the next one. Stale
+    // frames are dropped before they are drawn (the page's skipRender gate), so there is no
+    // backlog here to catch up on.
     let drained = 0;
-    while (drainOnce(true)) {
-      drained++;
-      if (drained >= CATCHUP_MAX || performance.now() >= _budget) break;
-    }
+    // The JIT engine has no source-side gate (only the recomp's frame relay asks __gcRwBusy), so
+    // its producer can run ahead and fill the ring; past a quarter of it, replay without waiting
+    // (the newer present supersedes the in-flight one) so the producer is never stalled on it.
+    rwPollFence();
+    if ((rwCanReplay() || (Atomics.load(ring, HDR_HEAD) - Atomics.load(ring, HDR_TAIL)) > (ringCap >> 2)) && drainOnce(true)) drained = 1;
     const _t1 = performance.now();
     if (ctrl) ctrlServiceMain();   // setup-time uniform queries (capped at 12ms/turn)
     const _t2 = performance.now();
-    // [mainprof TEMP 2026-06-26] replay = catch-up GL replay time this turn; gap = scheduler interval
-    // (should collapse toward ~ms off MessageChannel); drained = frames advanced this turn (rises >1
-    // once catch-up lands). REMOVE after measuring.
     const _replay = _t1 - _t0, _gap = _mpLast ? (_t0 - _mpLast) : 0;
     if (_replay > _mpMaxReplay) _mpMaxReplay = _replay;
     if (_gap > _mpMaxGap) _mpMaxGap = _gap;
     if (drained > _mpMaxDrained) _mpMaxDrained = drained;
-    // Logged once per 16 presented frames. It used to log on EVERY turn while framesPainted sat on
-    // a multiple of 16 — i.e. on every 4 ms poll while the ring was empty, hundreds of console
-    // lines a second on the main thread during exactly the stalls it exists to describe.
-    if ((framesPainted >> 4) !== _mpLastLogged) {
-      _mpLastLogged = framesPainted >> 4;
-      console.log('[mainprof] f=' + framesPainted +
+    // Logged once per 64 presented frames, never on an idle poll.
+    if ((framesPainted >> 6) !== _mpLastLogged) {
+      _mpLastLogged = framesPainted >> 6;
+      console.log('[mainprof] f=' + framesPainted + ' mode=' + rwMode +
         ' replay(now/max)=' + _replay.toFixed(1) + '/' + _mpMaxReplay.toFixed(1) + 'ms' +
         ' gap(now/max)=' + _gap.toFixed(1) + '/' + _mpMaxGap.toFixed(1) + 'ms' +
-        ' drained(now/max)=' + drained + '/' + _mpMaxDrained);
+        ' completed=' + rwStats.completed + ' superseded=' + rwStats.superseded +
+        ' fenceMax=' + rwStats.fenceMaxMs.toFixed(0) + 'ms readbackMax=' + rwStats.readbackMaxMs.toFixed(1) + 'ms');
       _mpMaxReplay = 0; _mpMaxGap = 0; _mpMaxDrained = 0;
     }
     _mpLast = _t2;
-    // Re-pump immediately while catching up (full rate, not rAF-throttled); back off briefly when the
-    // ring is empty so we don't tight-spin a core waiting for the worker's next frame.
-    if (drained > 0) _scheduleDrain();
-    else setTimeout(_scheduleDrain, 4);
+    // A partial frame still in the ring (no present yet) is picked up on the next turn; an
+    // in-flight fence is polled every 2 ms (its status only refreshes between tasks anyway).
+    if (rwCanReplay() && Atomics.load(ring, HDR_HEAD) !== Atomics.load(ring, HDR_TAIL)) _scheduleDrain();
+    else setTimeout(_scheduleDrain, rwFences.length ? 2 : 4);
   } else {
     drainOnce(false);
     setTimeout(drainLoop, 16);
@@ -743,8 +850,26 @@ function startMainThreadReplay(opts) {
   ringCap = ring[HDR_CAPACITY];
   ringStore = HDR_WORDS;
   if (opts.ctrlByteOff) { ctrlByteOff = opts.ctrlByteOff; ctrl = new Int32Array(wasmMem.buffer, ctrlByteOff, 256); }
+  // 'readback': the context is on an OffscreenCanvas the compositor never sees, and frames are
+  // painted to opts.display (a 2D canvas) once the GPU has finished them. See MAIN-THREAD PRESENT.
+  if (opts.mode === 'readback' && opts.display) {
+    rwW = gl.drawingBufferWidth; rwH = gl.drawingBufferHeight;
+    rwCtx2d = opts.display.getContext('2d', { alpha: false });
+    if (!rwCtx2d) { log('[mtgl] readback mode: no 2D context on the display canvas'); return false; }
+    const prevPack = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
+    for (let k = 0; k < RW_MAX_INFLIGHT; k++) {
+      rwPbos[k] = gl.createBuffer();
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, rwPbos[k]);
+      gl.bufferData(gl.PIXEL_PACK_BUFFER, rwW * rwH * 4, gl.STREAM_READ);
+    }
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, prevPack);
+    rwBuf = new Uint8Array(rwW * rwH * 4);
+    rwImg = rwCtx2d.createImageData(rwW, rwH);
+    rwMode = 'readback';
+  } else rwMode = 'direct';
   started = true;
-  log('[mtgl] main-thread WebGL2 replay started (ringCap=' + ringCap + ' words)');
+  log('[mtgl] main-thread WebGL2 replay started (ringCap=' + ringCap + ' words, present=' + rwMode +
+      (rwMode === 'readback' ? ' ' + rwW + 'x' + rwH : '') + ')');
   drainLoop();
   return true;
 }

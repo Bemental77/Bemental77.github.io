@@ -1,5 +1,62 @@
 # WebGL2 fallback for devices with NO WebGPU (the Xbox case)
 
+## ★★★ 2026-10-03 — THE MAIN-THREAD FREEZE: it was the browser's canvas commit, not our GL calls
+
+Mario Party 4 (recomp engine), `--disable-features=WebGPUService,Dawn`, this box = SwiftShader,
+chrome://gpu **"Compositing: Software only"**. Hermetic snapshots, `tools/probe_lock.sh`, load 2-6.
+
+**Where the main thread blocked.** Long tasks of 172 s, 194 s, 291 s, 380 s (four HEAD runs) plus
+~200 ms tasks several times a second. A main-thread CPU profile across one is **98.5% `(program)`**
+(native, no JS on the stack); timing every replayed GL call found none over 100 ms, and the periodic
+`getError` measured 0-2 ms at every sync. With a software compositor, a drawn WebGL canvas is read
+back **synchronously on the main thread at the next rendering update**, and that readback waits for
+all GPU work queued before it. The old replay queued up to 8 frames per turn with nothing asking
+whether the GPU had finished any.
+
+**Fix (render-worker.js MAIN-THREAD PRESENT, gamecube.html present gate):**
+1. One frame in flight: `fenceSync` after each present, next frame only after `getSyncParameter`
+   reads SIGNALED; the page drops frames at the source (`window.__gcRwBusy()` → `skipRender`).
+2. Software compositor (renderer string SwiftShader/llvmpipe/…; `?mtpresent=` overrides): the
+   context lives on an `OffscreenCanvas`, each present reads into a per-slot PIXEL_PACK buffer behind
+   the fence, copied out (`getBufferSubData`) only after it signals and painted with `putImageData`.
+   Direct mode + fence alone still blocked 448 s (the commit readback), so this is required.
+3. No periodic `getError` (`?glerr=1` restores it).
+
+| (480 s runs unless noted) | HEAD 453cce5 | fix |
+|---|---|---|
+| longest main-thread task | 172,177 ms (and 194/291/380 s) | 0 ms after boot (final code, 300 s; 1.27 s during boot); 55 ms over a 900 s run (that build also carried the since-removed nudge) |
+| guest rate (PAD_ACK frames / wall) | 0.9441x, a 5 s window at **1.29x** (catch-up) | 0.9997x (final, 300 s) / 59.997/s (900 s), max 5 s window 1.0027-1.0033 |
+| 2-console room, no WebGPU, 240 s (gc_netplay_room_test NO_WEBGPU=1) | mean **0.1245x**, FAIL, 0 desyncs | mean 0.9979x, max window 1.0010x, 16/16 PASS, 0 desyncs |
+| rAF/s | 10 | 59.9 |
+| presents shown/s, steady | 6.47 | 8.05 (after the title frame below retired) |
+
+**Still open — one SwiftShader frame costs minutes.** The first title frame after the fade-in took
+**488.8 s** of GPU time in the 900 s fix run (on HEAD the frozen page came back after ~172-198 s;
+the fix keeps the page and the guest live through it, but the picture waits). Bisected by skipping
+draws: keeping only draws of ≤300 indices → no stall (9 fps); ≤1000 → stall. A captured 372-index
+draw (prog 634, stride 32, attribs pos@0/normal@12/uv@24 as floats) decodes to positions like
+`1.3e35, -4.3e4` while the "normal" words read like plausible positions — the vertex data does not
+match the declared layout, i.e. huge triangles. Not established whether the mismatch is in Dolphin's
+GLES vertex path or the replay. On a real GPU this would be visual garbage, not minutes.
+⚠ Things measured NOT to help that frame: flushing while waiting, an empty fence/flush "nudge"
+(one lucky run, 0 of 3 repeats), replaying the frame's trailing commands. Letting the next frame
+through a stuck fence (1-3 s thresholds, up to 4 tracked) blocked the main thread 446-451 s in 4/4
+runs — further GL calls wait in Chrome's command transport behind the stuck GPU.
+
+**WebGPU on this box (~1 frame/s reported): not a presentation-path wait.** Same title scene,
+`--enable-unsafe-webgpu` (adapter = SwiftShader): main-thread longest task 61 ms, guest 60.007/s,
+but only 3 frames published in 180 s; the page's backpressure held 1-2 frames outstanding and
+skipped the other 8,354 (correct behaviour: acks wait for each frame's readback), the capture
+worker polled idle (captureMs 4), and SwiftShader's four worker threads ran at 50-75% each. The
+limit is GPU execution on the software rasterizer, on the same scene that costs the WebGL2 path
+minutes — whether that work is legitimate or inflated by bad vertex data (above) is not settled.
+
+**Also fixed — the vertex-stream race (gl-record.js).** Vertex/index uploads over 64 KiB were
+zero-copy descriptors read at replay time, but Dolphin stages every draw at the same heap address
+(two different meshes, 239,104 B and 131,584 B, both from offset 432,076,360 in one frame), so a
+late replay drew the next draw's vertices: HEAD's title screen shows spiky garbage on large meshes,
+runs with the snapshot fix show a clean title. Snapshotted at record time now (≤4 MiB per record).
+
 ## ★★ ROOT CAUSE FOUND AND FIXED 2026-09-05 — it was ONE predicate, and it disabled
 ## ALL rendering on any backend that is not WGPU
 

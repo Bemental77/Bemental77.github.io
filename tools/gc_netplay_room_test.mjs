@@ -40,6 +40,7 @@
 //              host walks (Start, then A) while the others mash.
 //   MOBILE=i,j those tabs emulate a phone (the mobile shell; the room presses the splash's Start).
 //   CONTROL=1  the MATCHED CONTROL for the rate: the same tabs and input, solo, no room.
+//   NO_WEBGPU=1 every browser without WebGPU (device matrix no-webgpu arm): the WebGL2 fallback.
 // Every window prints the room rate per console AND where the time went: held for the ROOM's
 // input (the other console's frames had not arrived) vs held for this console's OWN worker.
 import { createRequire } from 'node:module';
@@ -78,6 +79,7 @@ const HOST_CARD = process.env.HOST_CARD ? fs.readFileSync(process.env.HOST_CARD)
 // the room reaches is only interpretable next to what this box gives the same load without a gate
 // (CLAUDE.md gate #10: report the machine load; ratios are the durable part).
 const CONTROL = process.env.CONTROL === '1';
+const NO_WEBGPU = process.env.NO_WEBGPU === '1';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let pass = 0, fail = 0;
 const ok = (n, d) => { pass++; console.log(`  PASS  ${n}${d ? ' — ' + d : ''}`); };
@@ -110,8 +112,13 @@ async function launch() {
     executablePath: CHROME, headless: process.env.HEADLESS === '0' ? false : 'new',
     userDataDir: dir || undefined,
     args: ['--no-sandbox', '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
-           '--disable-backgrounding-occluded-windows', '--disable-features=IntensiveWakeUpThrottling',
-           '--enable-unsafe-webgpu', '--js-flags=--max-old-space-size=4096', '--disk-cache-size=1'],
+           '--disable-backgrounding-occluded-windows',
+           // NO_WEBGPU=1: the device matrix's no-webgpu arm (tools/device_matrix.mjs — the one spelling
+           // measured to remove the adapter while leaving WebGL2), so the room runs the WebGL2 fallback.
+           // One --disable-features list: a second copy of the switch replaces the first.
+           NO_WEBGPU ? '--disable-features=IntensiveWakeUpThrottling,WebGPUService,Dawn'
+                     : '--disable-features=IntensiveWakeUpThrottling',
+           ...(NO_WEBGPU ? [] : ['--enable-unsafe-webgpu']), '--js-flags=--max-old-space-size=4096', '--disk-cache-size=1'],
   });
   if (guard) try { guard.guard(b, 'gc_netplay_room_test'); } catch (e) {}
   browsers.push(b); if (dir) dirs.push(dir);
