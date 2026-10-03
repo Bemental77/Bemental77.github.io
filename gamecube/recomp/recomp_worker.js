@@ -1465,6 +1465,28 @@ async function boot(msg) {
           if (pos > 0) {
             const base = Module._gx_fifo_base();
             const fb = new Uint8Array(mem().buffer.slice(base, base + pos));
+            // A FULL-IMAGE FRAME STARTS FROM EMPTY CACHES (2026-10-03). The mem1 image below is
+            // RAW guest memory, and guest memory holds every f32 vertex/texcoord array
+            // LITTLE-endian; only the bridge's own array regions carry them big-endian, which is
+            // what Dolphin's vertex loader reads. Dolphin applies mem1 first and this frame's
+            // regions over it, so after a full image an array is right only if THIS frame
+            // re-sends it. The caches used to be cleared AFTER this frame's discovery, so every
+            // array already known from an earlier frame was not re-sent and stayed raw-LE in
+            // Dolphin for the whole frame. MEASURED on Mario Party 4's title (the first frame
+            // after the fade-in, a DVD-read frame): 100 draws, every one with positions/UVs that
+            // are byte-reversed floats (bytes bf 98 93 7d = -1.192 read as 2.45e37), and 0 bad
+            // draws in every other frame. Those triangles cost SwiftShader ~488 s of GPU time
+            // on the WebGL2 fallback and the same frame stalls WebGPU on a software adapter.
+            // Clearing first makes discovery treat every binding of this frame as new, so its
+            // arrays (swapped), DLs and textures (incl. static assets, which the raw image
+            // carries as zeros) go out in this frame's regions on top of the image — the same
+            // state a save-state restore starts from. cacheDirty set later in this frame (dirty-
+            // ring overflow / a jumbo range) stays set and takes the full image next frame.
+            const fullSync = cacheDirty || testFullMem;
+            if (fullSync) {
+              cacheDirty = false;
+              knownDLs.clear(); knownArrays.clear(); knownTex.clear(); f32Arrays.length = 0;
+            }
             const newDLs = [], touched = new Map();
             try { walkStream(mem(), fb, 0, pos, 0, newDLs, touched) } catch (e) { log('walk threw: ' + e.message); }
             const regions = [];
@@ -1582,11 +1604,7 @@ async function boot(msg) {
               if (Module.___recomp_dirty_reset) Module.___recomp_dirty_reset();
             }
             let mem1Snap = null;
-            if (cacheDirty || testFullMem) {
-              cacheDirty = false;
-              knownDLs.clear(); knownArrays.clear(); knownTex.clear(); f32Arrays.length = 0;
-              mem1Snap = mem().buffer.slice(0x80000000, 0x81800000);
-            }
+            if (fullSync) mem1Snap = mem().buffer.slice(0x80000000, 0x81800000);
             if (!sentPrologue) { sentPrologue = true;
               if (!mem1Snap) mem1Snap = mem().buffer.slice(0x80000000, 0x81800000);
             }
