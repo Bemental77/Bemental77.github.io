@@ -10235,8 +10235,12 @@ window.GcRate = (function () {
                      // the shipped one (the recomp link is not byte-reproducible, so "just
                      // swap it back" is not a clean undo). Restricted to [A-Za-z0-9_-] so the
                      // parameter cannot walk out of the recomp directory.
-                     glueUrl: '/gamecube/recomp/' + recompBuildDir + 'mp4_game.js',
-                     wasmUrl: '/gamecube/recomp/' + recompBuildDir + 'mp4_game.wasm' }, bootTransfer);
+                     // ?b= is the shipped pair's identity (first 8 hex of mp4_game.wasm's md5) —
+                     // BUMP IT WITH EVERY NEW PAIR. The worker itself is fetched ?v=<now>, but these
+                     // two were plain URLs, so a cached old .wasm could meet a new .js glue (a torn
+                     // pair: "Import #0 env: module is not an object or function").
+                     glueUrl: '/gamecube/recomp/' + recompBuildDir + 'mp4_game.js?b=921a7bc1',
+                     wasmUrl: '/gamecube/recomp/' + recompBuildDir + 'mp4_game.wasm?b=921a7bc1' }, bootTransfer);
     bootSent = true;    // from here on, Save/Load/Export belong to THIS worker, not dolphin
     // ⚠ BEFORE THE FIRST CREDIT AND NOT ONE LINE LATER. This is the only moment at which "this
     // core has never run a frame" is still true; grantLoop below is what starts the guest.
