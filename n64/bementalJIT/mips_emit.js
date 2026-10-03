@@ -52,11 +52,11 @@
 
   var OP = {
     block: 0x02, loop: 0x03, if_: 0x04, else_: 0x05, end: 0x0B,
-    br: 0x0C, br_if: 0x0D, call: 0x10, call_indirect: 0x11,
+    br: 0x0C, br_if: 0x0D, call: 0x10, call_indirect: 0x11, return_call_indirect: 0x13,
     local_get: 0x20, local_set: 0x21,
     i32_load: 0x28, i64_load: 0x29, i32_load8_u: 0x2D, i32_store: 0x36, i64_store: 0x37, i32_store8: 0x3A,
     i32_const: 0x41, i64_const: 0x42,
-    i32_eqz: 0x45, i32_eq: 0x46, i32_ne: 0x47, i32_le_u: 0x4D,
+    i32_eqz: 0x45, i32_eq: 0x46, i32_ne: 0x47, i32_le_u: 0x4D, i32_ge_u: 0x4F,
     i64_eq: 0x51, i64_ne: 0x52, i64_lt_s: 0x53, i64_lt_u: 0x54, i64_gt_s: 0x55, i64_le_s: 0x57, i64_ge_s: 0x59,
     i32_add: 0x6A, i32_sub: 0x6B, i32_mul: 0x6C, i32_and: 0x71, i32_or: 0x72, i32_xor: 0x73, i32_shl: 0x74, i32_shr_s: 0x75, i32_shr_u: 0x76,
     i32_extend8_s: 0xC0, i32_extend16_s: 0xC1,
@@ -684,11 +684,66 @@
       [OP.if_, OP.void_],
         bump('#gen_interrupt'),
         [OP.i32_const], sleb(p.genInt), [OP.call_indirect, 0x00, 0x00],
+        CHAIN && !RAW ? [OP.br].concat(leb(exitDepth + 1)) : [],     // gen_interrupt ran: back to the dispatcher
       [OP.end],
       bump('#exit:jump_to'),
-      [OP.br].concat(leb(exitDepth + RAW))
+      chainOr(exitDepth)
     );
   }
+
+  // ---- CHAINING (2026-10-03) ----
+  // WHY. Every block exit returned to r4300_step, which checks retro_stop_stepping() and
+  // getVI_Count() and calls PC->ops() — the dispatch loop (mainLoopInner, where r4300_step is
+  // inlined) was 8.8% of the core thread's self time in an MK64 race profile.
+  // WHAT. At the exits where nothing that can end the frame has run on the path — a jump_to
+  // tail, an in-span branch exit or the fall-through, each after its interrupt poll was NOT
+  // taken — the block tail-calls PC->ops() itself (return_call_indirect: the callee returns to
+  // r4300_step, which then checks as it would have). EXACT: r4300_step leaves its loop when
+  // stop_stepping && VI_Count > 0; stop_stepping is only ever set (retro_return) and VI_Count
+  // only ever incremented (interrupt.c) inside gen_interrupt or the calls that may run it, and
+  // every path through one of those (a taken interrupt poll, a store's slow arm, a fallback
+  // op that mayGenInterrupt) still hands back to the dispatcher. So on a chained path both
+  // flags are what they were when r4300_step called this block — and it called it, so its
+  // check then said "continue"; the skipped check would have said the same. Off when the
+  // browser has no wasm tail calls (feature-tested) and under register pinning (RAW: the
+  // epilogue must run first).
+  // OFF BY DEFAULT — opt in with ?jitchain=1 (fbasync.js). PRICED 2026-10-03 at half a core
+  // (n64_field_cost_probe --clock --nodbg --wcpu 0.5, MK64 race 1900-3000, interleaved
+  // H K K H H K, load 4.0-5.2): HEAD 10.24 / 10.35 / 9.60 ms per field, chained 9.03 / 9.76 /
+  // 10.81 — inside the rig's noise, so like PINNING it does not ship on until a quieter
+  // measurement shows a gain. Off, the emitted bytes are identical to the unchained emitter's.
+  var CHAIN = false;              // per compile: chaining on for this span
+  var chainOK = null;             // wasm tail calls supported (tested once per realm)
+  function chainOn() {
+    if (EMIT_ONLY) return EMIT_ONLY.chain === true;
+    var g = (typeof globalThis !== 'undefined') ? globalThis : self, f = g.__fbAsync;
+    if (!(f && f.jitChain === true)) return false;     // opt-in: ?jitchain=1
+    if (chainOK === null) {
+      try {
+        // (module (type (func)) (table 1 funcref) (func (return_call_indirect (type 0) (i32.const 0))))
+        chainOK = WebAssembly.validate(new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, 1, 4, 1, 0x60, 0, 0,
+          3, 2, 1, 0, 4, 4, 1, 0x70, 0, 1, 10, 9, 1, 7, 0, 0x41, 0, 0x13, 0, 0, 0x0b]));
+      } catch (e) { chainOK = false; }
+    }
+    return chainOK;
+  }
+  // the exit at a `br exitD` to $exit: a tail call of PC->ops when chaining, else that br
+  // ONLY INTO A JIT BLOCK (an op at or above the core's table length). An interpreter op is
+  // left to the dispatcher: NOTCOMPILED, FIN_BLOCK and the jump ops call PC->ops() from inside
+  // their own frame, so a chain through them would nest a C frame per hop (measured: "Maximum
+  // call stack size exceeded" in MK64's boot). Label wrappers tail-call their body for the
+  // same reason (see the wrappers below).
+  function chainOr(exitD) {
+    if (!CHAIN || RAW || !TABLE_BASE) return [OP.br].concat(leb(exitD + RAW));
+    return [].concat(loadI32(p_chain.pcGlobal), [OP.i32_load, 0x02, 0x00], [OP.local_set], leb(L_ADDR),
+                     [OP.local_get], leb(L_ADDR), [OP.i32_const], sleb(TABLE_BASE), [OP.i32_ge_u],
+                     [OP.if_, OP.void_],
+                       bump('#chain'),
+                       [OP.local_get], leb(L_ADDR), [OP.return_call_indirect, 0x00, 0x00],
+                     [OP.end],
+                     [OP.br].concat(leb(exitD + RAW)));
+  }
+  var p_chain = null;             // the compile's params (chainOr needs pcGlobal)
 
   // ---- COLD PATHS (2026-10-03) ----
   // WHY. Measured with tools/n64_emit_unit_test.mjs's harness driving MANY distinct emitted
@@ -1684,7 +1739,7 @@
   }
   function jitFlags() {
     return { noFP: !!(typeof window !== 'undefined' && window.__jitNoFP), noLabels: !!(typeof window !== 'undefined' && window.__jitNoLabels),
-             pin: pinOn(), cold: coldOn() };
+             pin: pinOn(), cold: coldOn(), chain: chainOn() };
   }
   function asyncOffer(p, U, span, pageW0, pageN, keyArr) {
     var page = p.vaddr >>> 12, bp = U[(p.blocksBase >> 2) + page];
@@ -1810,7 +1865,7 @@
       return 0;
     } });
     window.__jitNoFP = job.flags.noFP; window.__jitNoLabels = job.flags.noLabels; window.__jitPin = job.flags.pin;
-    EMIT_ONLY = { out: null, tableBase: job.tableBase | 0, cold: job.flags.cold !== false,
+    EMIT_ONLY = { out: null, tableBase: job.tableBase | 0, cold: job.flags.cold !== false, chain: job.flags.chain === true,
                   batch: !!batchCtx, fnBase: batchCtx ? batchCtx.fnBase : 0, part: null };
     TABLE_BASE = job.tableBase | 0;
     var idx = 0;
@@ -2197,6 +2252,7 @@
     // COLD PATHS: handlers collected while the body is emitted; the helper sits after the
     // body function and its label wrappers
     COLD = coldOn() ? [] : null;
+    CHAIN = chainOn(); p_chain = p;
     CHK_FN = (EMIT_ONLY && EMIT_ONLY.batch) ? 0 : (census.on ? 1 : 0) + nSeg;   // a batch module puts the helper first
     var seg = 0;
     EXIT = nSeg; TOP = nSeg - 1;       // segment 0's depths (1 / 0 when nSeg == 1)
@@ -2325,7 +2381,7 @@
               nSeg > 1 ? [OP.i32_const].concat(sleb(tOrd), [OP.local_set], leb(L_START)) : [],
               [OP.br], leb(topD));
           }
-          return poll.concat(bump('#exit:branch'), storeI32Const(p.pcGlobal, targetPtr), [OP.br], leb(exitD));
+          return poll.concat(bump('#exit:branch'), storeI32Const(p.pcGlobal, targetPtr), chainOr(exitD));
         }
         // delay-slot bytes at a given $exit depth. ALU slots emit inline as
         // before; memory/FP slots emit their native fast arm and bail the
@@ -2475,7 +2531,8 @@
     app(body, [].concat(
       C.flush(),
       bump('#exit:fallthrough'),
-      storeI32Const(p.pcGlobal, p.entryPtr + span * p.stride)
+      storeI32Const(p.pcGlobal, p.entryPtr + span * p.stride),
+      CHAIN && !RAW ? chainOr(EXIT) : []
     ));
     if (C.err.readOnlyWrite >= 0) {
       stats.fails++;
@@ -2594,7 +2651,8 @@
           [OP.return_],
         [OP.end],
         [OP.i32_const], sleb(wk), [OP.global_set, 0x00],
-        [OP.call], leb(bodyFn),
+        // CHAINING: a tail call, so a chain into a label leaves no wrapper frame behind
+        CHAIN ? [0x12] : [OP.call], leb(bodyFn),
         [OP.end]));
     }
     if (batch) {

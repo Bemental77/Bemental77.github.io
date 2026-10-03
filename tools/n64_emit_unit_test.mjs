@@ -212,10 +212,13 @@ const PIN_ALL = process.argv.includes('--pin');
 // `--nocold` runs the WHOLE corpus with every slow arm inline (?jitcold=0, mips_emit.js COLD
 // PATHS); cases that set opts.noCold do so themselves. CI should run it both ways.
 const NOCOLD_ALL = process.argv.includes('--nocold');
-function loadEmitter(pin, noCold, cold) {
+const CHAIN_ALL = process.argv.includes('--chain');
+function loadEmitter(pin, noCold, cold, chain) {
   const sb = { WebAssembly, console: { error() {}, log() {}, warn() {} }, Uint32Array, Object, Array, Math, String };
-  sb.window = sb; sb.__jitPin = !!(pin || PIN_ALL);
-  if (noCold || (NOCOLD_ALL && !cold)) sb.__fbAsync = { jitCold: false };
+  sb.window = sb; sb.__jitPin = !!(pin || (PIN_ALL && pin !== false));   // pin === false: this case opts out of --pin
+  // CHAINING is off unless asked for: a chained exit runs the stub op at PC, which the
+  // corpus's exit expectations (PC, regs) do not model; `--chain` runs everything chained
+  sb.__fbAsync = { jitCold: !(noCold || (NOCOLD_ALL && !cold)), jitChain: !!(chain || CHAIN_ALL) };
   vm.createContext(sb); vm.runInContext(src, sb);
   return sb.bementalMips;
 }
@@ -226,7 +229,7 @@ function T(name, words, { regs = {}, dram = {}, expectRegs = {}, expectDram = {}
                           expectFprI32 = {}, expectFprI64 = {}, expectFprF32 = {}, expectFprF64 = {},
                           expectRefused = false, expectPC = null, expectLastAddr = null, expectCount = null,
                           lastAddr = null, enterAt = 0 }) {
-  const bm = loadEmitter(opts.pin, opts.noCold, opts.cold);
+  const bm = loadEmitter(opts.pin, opts.noCold, opts.cold, opts.chain);
   const { mem, table, HEAPU32, REG64, p } = makeWorld(words, opts);
   const DV = new DataView(mem.buffer);
   HEAPU32[FCR31A >> 2] = fcr31 >>> 0;
@@ -1082,6 +1085,57 @@ function batchCase(name, enterAt, slow) {
 tests.push(batchCase('batch: a span runs as from its own module (entry, fast store, code-page probe)', 0, false));
 tests.push(batchCase('batch: entering through a label wrapper (shared segment global)', 1, false));
 tests.push(batchCase('batch: a slow store takes its cold arm and hands back', 0, true));
+
+// ---- CHAINING (2026-10-03): at an exit where nothing that can end the frame ran, the block
+// tail-calls PC->ops itself. Differential: the same span compiled with chaining OFF and ON,
+// run from the same state. A chained exit must leave EXACTLY what the unchained one left plus
+// one run of the op at PC (the harness's stub: PC += STRIDE, nothing else); an exit after a
+// taken interrupt poll, a gen_interrupt in a jump_to tail or a fallback that may run
+// gen_interrupt (MTC0) must NOT chain (extra = 0): the dispatcher has to check the frame flags.
+// `jitAtPC`: every precomp entry still holding the interpreter stub (table[1]) is given a
+// copy of it at a JIT-range slot (at or above the table length at the first compile), so a
+// chained exit finds a JIT block there; without it the op at PC is an interpreter op, which
+// is never chained into.
+function chainCase(name, words, { regs = {}, opts = {}, extra, jitAtPC = true }) {
+  const run = (chain) => {
+    const bm = loadEmitter(false, false, false, chain);
+    const w = makeWorld(words, opts);
+    for (const [r, v] of Object.entries(regs)) w.REG64[(REG >> 3) + (+r)] = BigInt.asUintN(64, BigInt(v));
+    const idx = bm.compileSpan(w.p, { HEAPU32: w.HEAPU32, wasmTable: w.table, wasmMemory: w.mem });
+    if (!(idx > 0)) return { err: 'emit failed' };
+    if (jitAtPC) {
+      const js = w.table.grow(1);
+      w.table.set(js, w.table.get(1));
+      for (let k = 0; k < words.length + 4; k++) if (w.HEAPU32[(ENTRY + k * STRIDE) >> 2] === 1) w.HEAPU32[(ENTRY + k * STRIDE) >> 2] = js;
+    }
+    try { w.table.get(idx)(); } catch (e) { return { err: 'trapped ' + e }; }
+    const r = []; for (let k = 0; k < 32; k++) r.push(w.REG64[(REG >> 3) + k]);
+    return { pc: w.HEAPU32[PCG >> 2], regs: r.join(','), count: w.HEAPU32[COUNT >> 2], last: w.HEAPU32[LASTADDR >> 2], chains: bm.stats };
+  };
+  const off = run(false), on = run(true);
+  if (off.err || on.err) return { name, ok: false, detail: `off ${off.err || 'ok'} on ${on.err || 'ok'}` };
+  const ok = on.pc - off.pc === extra * STRIDE && on.regs === off.regs && on.count === off.count && on.last === off.last;
+  return { name, ok, detail: `pc off ${off.pc} on ${on.pc} (want +${extra * STRIDE}) regs ${on.regs === off.regs ? 'eq' : 'NE'} count ${off.count}/${on.count}` };
+}
+tests.push(chainCase('chain: the fall-through exit runs PC->ops once, nothing else changes',
+  [I(OPC.ADDIU, 0, 9, 5), I(OPC.ADDIU, 9, 10, 1), 0], { extra: 1 }));
+tests.push(chainCase('chain: an in-span branch exit with the poll NOT due chains',
+  [I(OPC.BEQ, 0, 0, 0x10), I(OPC.ADDIU, 0, 8, 0x11), I(OPC.ADDIU, 0, 9, 0x22), 0], { extra: 1 }));
+tests.push(chainCase('chain: an in-span branch exit with the poll DUE does not chain',
+  [I(OPC.BEQ, 0, 0, 0x10), I(OPC.ADDIU, 0, 8, 0x11), I(OPC.ADDIU, 0, 9, 0x22), 0], { opts: { nextInt: 0 }, extra: 0 }));
+tests.push(chainCase('chain: a gen_interrupt that leaves PC alone does not chain',
+  [I(OPC.ADDIU, 2, 2, 1), I(OPC.BNE, 2, 3, 0xfffe), 0, I(OPC.ADDIU, 0, 4, 9), 0],
+  { regs: { 3: '0x5' }, opts: { nextInt: 0, genIntNoop: true }, extra: 0 }));
+tests.push(chainCase('chain: a J_OUT tail (jump_to, poll not due) chains',
+  [JOUT(0x80200000), 0, I(OPC.ADDIU, 0, 11, 1), 0], { extra: 1 }));
+tests.push(chainCase('chain: a J_OUT tail whose gen_interrupt ran does not chain',
+  [JOUT(0x80200000), 0, I(OPC.ADDIU, 0, 11, 1), 0], { opts: { nextInt: 0, genIntNoop: true }, extra: 0 }));
+tests.push(chainCase('chain: an MTC0 fallback (may run gen_interrupt) hands back without chaining',
+  [MTC0(8, 12), I(OPC.ADDIU, 0, 9, 5), 0], { extra: 0 }));
+tests.push(chainCase('chain: never INTO an interpreter op (NOTCOMPILED/FIN_BLOCK nest PC->ops)',
+  [I(OPC.ADDIU, 0, 9, 5), I(OPC.ADDIU, 9, 10, 1), 0], { extra: 0, jitAtPC: false }));
+tests.push(chainCase('chain: into a label entry (its wrapper tail-calls the body)',
+  [I(OPC.ADDIU, 0, 9, 5), I(OPC.BEQ, 0, 0, 0x10), 0, 0], { extra: 1 }));
 
 let fail = 0;
 for (const t of tests) {

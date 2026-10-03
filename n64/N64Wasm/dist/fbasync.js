@@ -37,6 +37,8 @@
 //                    A/B arm and kill switch. Default: built in jit_compile_worker.js.
 //   ?jitcold=0       the JIT keeps every slow arm inline in the span again (bementalJIT
 //                    mips_emit.js COLD PATHS) — the A/B arm and kill switch.
+//   ?jitchain=1      JIT blocks tail-call the next JIT block where that is exact (bementalJIT
+//                    mips_emit.js CHAINING). OFF by default: unpriced (inside the rig's noise).
 //   ?glmerge=0       every glide triangle is its own draw again (geometry.c draw
 //                    merging, mymain.cpp apply_gl_shadow) — A/B arm, kill switch.
 (function (root) {
@@ -58,6 +60,7 @@
                        jitAsync: FB_Q.get('jitasync') !== '0',
                        jitCold: FB_Q.get('jitcold') !== '0',
                        jitPin: FB_Q.get('jitpin') === '1',
+                       jitChain: FB_Q.get('jitchain') === '1',
                        seq: FB_WITNESS ? [] : null };
   // Glide64_Ini.c's read_always = 1 branches, by the name each one tests
   // (HAVE_HWFBE is not defined in this build, so the #ifndef branches apply).
