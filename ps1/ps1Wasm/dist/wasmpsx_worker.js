@@ -780,6 +780,19 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
     if (states && typeof padStatus1 !== 'undefined' && padStatus1) Module.HEAPU8.set(new Uint8Array(states), padStatus1);
   }
 
+  // RIG-ONLY: a SLOWER DEVICE, on demand ('netSlow' {r}; inert until sent).
+  // The CDP CPU throttle never reaches a worker, so a test that needs one
+  // console's emulator to be r times slower — and then to recover — asks for
+  // it here: every gated frame's work (netStep, netRbStep) is followed, INSIDE
+  // the time those report, by (r-1) times its own duration of busy-waiting.
+  // The guest computes exactly what it did; only the host's clock moves.
+  // tools/ps1_netplay_test.mjs --slow-guest R --slow-until S.
+  var SLOW_R = 1;
+  function slowBurn(t0) {
+    if (SLOW_R <= 1) return;
+    var now = performance.now(), until = now + (now - t0) * (SLOW_R - 1);
+    while (performance.now() < until) {}
+  }
   var origMain = main_onmessage;
   main_onmessage = function (event) {
     var data = event.data;
@@ -813,6 +826,7 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
           if (remeasure) urInit(data.frame | 0);
           var tr0 = performance.now();
           try { for (var i = 0; i < n; i++) { runFrame(); creditAudio(); } } finally { QUIET = QUIET_AUDIO = false; }
+          slowBurn(tr0);
           var runMs = (performance.now() - tr0) / n;
           if (remeasure) {
             var ts0 = performance.now(); urCommit(); svMs = performance.now() - ts0;
@@ -919,6 +933,7 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
           }
           if (hk.length) { th = performance.now() - th; if (th > RB.maxHashMs) RB.maxHashMs = th; }
         } catch (e) { err = String((e && e.message) || e); QUIET = false; QUIET_AUDIO = false; }
+        slowBurn(t0);
         var ms = performance.now() - t0;
         if (ms > RB.maxStepMs) RB.maxStepMs = ms;
         RB.hist[ms < 8 ? 0 : ms < 12 ? 1 : ms < 17 ? 2 : ms < 33 ? 3 : ms < 67 ? 4 : 5]++;
@@ -981,6 +996,11 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
         break;
       }
 
+      case 'netSlow': {
+        SLOW_R = Math.max(1, +data.r || 1);
+        postMessage({ cmd: 'print', txt: '[rig] netSlow: every gated frame now costs ' + SLOW_R + 'x its own time' });
+        break;
+      }
       case 'netHash': {
         var r = stateHash();
         postMessage({ cmd: 'netHashResult', frame: data.frame, hash: r.hash, len: r.len, head: r.head || null, err: r.err || null });
