@@ -101,7 +101,12 @@ const ROOT = process.env.PROBE_ROOT
 // EADDRINUSE before it served a byte. startServer() now walks forward to the
 // next free port and the page URL is built from the port it actually got.
 let PORT = parseInt(process.env.PROBE_PORT || '8790', 10);
-const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+// CHROME_PATH overrides (same env var as tools/bench_page_test.mjs); the macOS
+// default is kept for the box this was written on. On Linux without it, the
+// probe died at launch with ENOENT before measuring anything.
+const CHROME = process.env.CHROME_PATH ||
+  (process.platform === 'darwin' ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+                                 : '/opt/pw-browsers/chromium-1194/chrome-linux/chrome');
 
 // --- argv ---
 let DURATION_MS = parseInt(process.env.PROBE_DURATION_MS || '30000', 10);

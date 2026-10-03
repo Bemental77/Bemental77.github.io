@@ -18,6 +18,9 @@
        have seated one person. The core now carries five ports and the second
        one is proven live; see the note above runFrame(). -->
   <script src="/lib/netplay.js?v=9d05e8a3"></script>
+  <!-- the console half of rollback netplay (savestate ring, canonical step,
+       re-simulation); tools/snes_rollback_probe.mjs runs this same file -->
+  <script src="/snes/snes_rollback.js?v=016de924"></script>
   <script src="/lib/mpgames.js"></script>
   <script>MPGames.gateParty('snes', ['btnNet', 'mobileSplashNet'], ['romSelect', 'mobileRomSelect']);</script>
   <meta charset="UTF-8" />
@@ -364,6 +367,15 @@
 (function () {
   'use strict';
   const CORE_DIR = '/snes/snesWasm/';
+  // ⚠ THE CORE IS VERSIONED, JS AND WASM TOGETHER. The site sends
+  // cache-control: max-age=600, and this core's glue names its wasm exports by
+  // minified letter — so a device holding the OLD snes9x_2005.wasm against the
+  // NEW .js (or the reverse) does not degrade, it fails to instantiate. The
+  // rollback rebuild added exports (saveStateInto, audioWpos, audioRewind),
+  // which renamed every letter after them. CORE_V is the wasm's md5 prefix;
+  // change the core, change this, and both files are fetched at a URL no cache
+  // has seen.
+  const CORE_V = '1ea11e9a';
   const ROMS = [
     { label: 'SimCity', url: '/snes/snesWasm/roms/simcity.smc' }
   ];
@@ -457,7 +469,7 @@
   var gpState = [{}, {}];
 
   window.Module = {
-    locateFile: (p) => CORE_DIR + p,
+    locateFile: (p) => CORE_DIR + p + '?v=' + CORE_V,
     print: (t) => console.log('[snes]', t),
     printErr: (t) => console.warn('[snes]', t),
     onRuntimeInitialized: function () {
@@ -636,6 +648,7 @@
     frames: 0,           // gated frames this core has run
     hashEvery: 60,
     hashes: 0,
+    hidden: 0,           // frames run without presenting them (catch-up / rejoin)
     stalling: false, waitingOn: [], stallReason: null,
     fault: null,         // why this machine is NOT frame-gated, in words
   };
@@ -738,6 +751,8 @@
   function lsDisarm(why) {
     if (!LS.armed) return;
     LS.armed = false; LS.running = false;
+    // The savestate ring belongs to the room; ~529 KB a slot goes back.
+    if (SRB) { try { SRB.free(); } catch (e) {} SRB = null; }
     LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
     // A leaver's pad must not stay held down on this machine's port 2.
     try {
@@ -763,6 +778,14 @@
     pageLog('[lockstep] ARMED before the first frame — this core advances only when every seated '
       + 'port has an input for the frame, so no console runs a frame the others did not. '
       + 'ports=' + JSON.stringify(ls.roster) + ' mine=' + JSON.stringify(ls.localPorts));
+    // A core without the rollback exports (an old cached build) must not
+    // declare it can rewind: the host would then run rollback, this console
+    // could not serve it, and the room would fail at its first frame. Withdrawn
+    // here, before Ready is declared, the room uses input delay instead.
+    if (!snesRbCapable()) {
+      ls.rbCapable = false; ls.rollback = 0;
+      pageLog('[rollback] ⚠ this core has no rollback exports — this console declares input delay only');
+    }
     // "My core is booted and holding at frame 0, on this game." Nobody runs
     // frame 0 until EVERY seated peer has said this, about the SAME game —
     // the engine compares the string and refuses a room that does not agree.
@@ -785,7 +808,9 @@
   // Returns true if a frame actually ran. A false return STALLS the guest: the
   // accumulator keeps its credit and the console simply does not advance, which
   // is what "wait for the other player" has to mean when nothing may be guessed.
-  function lsRunFrame() {
+  // `hidden`: a catch-up frame the engine granted (ls.rbCatchUp, or every frame
+  // of a rejoin) — run, never presented, its audio dropped. See tick().
+  function lsRunFrame(hidden) {
     var ls = lsEngine();
     if (!ls) { lsDisarm('the session went away'); return false; }
     if (ls.state !== 'running' && ls.state !== 'stalled') {
@@ -811,7 +836,14 @@
       // The room's state stays on the HUD and on the Party button.
       if (typeof netClose === 'function') { netClose(); pageLog('[net] the game started — party panel closed'); }
     }
-    var r = ls.beginFrame(lsLocalPads());
+    // THE RING FOLLOWS THE WINDOW. An adaptive room's host re-sizes the rollback
+    // window from what the link measures (lib/netplay.js rbRingFrames); the
+    // ring must hold it BEFORE the frame that could reach that deep.
+    var R = snesRb();
+    if (ls.rollback && R && R.RB.slots && typeof ls.rbRingFrames === 'function' && R.RB.n < ls.rbRingFrames()) {
+      if (!R.grow(ls.rbRingFrames())) { LS.fault = 'rollback could not grow its ring: ' + R.RB.fault; try { ls.fail(LS.fault); } catch (e) {} return false; }
+    }
+    var r = ls.beginFrame(lsLocalPads(), hidden ? { hidden: true } : undefined);
     if (!r || !r.ready) {
       LS.stalling = !!(r && r.reason === 'stall');
       LS.stallReason = r ? r.reason : 'the engine returned nothing';
@@ -819,6 +851,11 @@
       return false;
     }
     LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
+    var hid = !!(hidden || r.hidden);
+    // The HOST decided lockstep or rollback ('lsgo' carries it; a capacity-gated
+    // room may switch at an agreed frame) — never this page's query string,
+    // which only says what THIS console would propose.
+    if (ls.rollback) return lsRbFrame(ls, r, hid);
 
     // EVERY SEATED PORT IS WRITTEN, EVERY FRAME, FROM THE ONE AGREED IMAGE.
     // ⚠ Including this machine's own: the local pad goes round through the
@@ -833,8 +870,23 @@
       Module._setJoypadInputPort(p, m);
       if (p === 0) last = m;
     }
+    // A HIDDEN frame here is a returning player catching up (a capacity-gated
+    // room in input delay takes a player back this way too): its audio is
+    // dropped, and tick() presents nothing while rejoining.
+    var w0 = (hid && Module._audioWpos) ? Module._audioWpos() : -1;
+    var t0 = performance.now();
     Module._mainLoop();
-    frameCount++; guestFrames++; window.__snesFrames++; LS.frames++;
+    var runMs = performance.now() - t0;
+    if (w0 >= 0) Module._audioRewind(w0);
+    // What a ROLLBACK step would cost this console (the run + the save/load
+    // share), published as ls.selfStepMs, so the host of a capacity-gated room
+    // in input delay can see the headroom for zero lag again (opts.rbResume);
+    // marks the ring stale, so the next rollback frame re-arms it.
+    // Only in a capacity-gated room (or once the ring exists): a plain lockstep
+    // room has no use for the estimate, and the save it re-times every 3 s is
+    // the one off-schedule call this page would otherwise make.
+    if (R && (ls._capGate || R.RB.armed)) R.onDelayFrame(ls, runMs);
+    lsCountFrame(hid);
     window.__snesMask = last;
 
     // The exact masks the core was handed for every port, for a test to assert
@@ -849,19 +901,89 @@
     // desync detector would then be silently dead while everything looked fine,
     // which is the worst failure this file can have.
     var every = (ls.hashEvery == null) ? LS.hashEvery : (ls.hashEvery | 0);
+    var want = (typeof ls.wantsHash === 'function') ? ls.wantsHash(r.frame) : (every > 0 && (r.frame % every) === 0);
     var h = null;
-    if (every > 0 && (r.frame % every) === 0) { h = lsFingerprint(); if (h != null) LS.hashes++; }
+    if (want) { h = lsFingerprint(); if (h != null) LS.hashes++; }
     ls.endFrame(h);
     return true;
   }
 
-  function runFrame() {
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ROLLBACK — ZERO LOCAL INPUT LAG. The default for a room (?rb=0 makes this
+  // console propose delay lockstep instead). The engine half is lib/netplay.js
+  // _beginFrameRb: a remote port with no input yet is PREDICTED, the local pad
+  // runs on the frame it was sampled, and a late input that contradicts the
+  // guess rewinds this console to the earliest wrong frame. The console half —
+  // the savestate ring, the canonical load -> run -> save step, re-simulation,
+  // the audio of re-simulated frames dropped — is snes/snes_rollback.js, a
+  // separate file so tools/snes_rollback_probe.mjs proves the code that ships:
+  // two real engines and two real cores over a lossy, jittery simulated link,
+  // every confirmed fingerprint equal to a core that never guessed, and the
+  // --broken control (rollbacks that skip re-simulation) failing.
+  //
+  // WHY THE CORE WAS REBUILT FOR IT (snes/snesWasm/source/exports.c): a
+  // loadState was not faithful — the noise generator, the CPU event schedule
+  // and every sound channel's decode state came back different — so a console
+  // that rolled back would have forked from one that did not. The rebuilt load
+  // matches a straight run byte-for-byte; the header of snes_rollback.js has
+  // the measurements.
+  //
+  // COST: a rollback step is the run (~1 ms) plus ~0.1-0.2 ms of save + load
+  // (two memcpy passes over a 529 KB blob, into a slot allocated once).
+  //
+  // ⚠ GATE 9. A re-simulation re-runs frames the guest already lived through
+  // on a guess; nothing is presented and no accumulator credit is spent on it.
+  // One NEW frame per credit, exactly as in lockstep.
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ⚠ A HIDDEN FRAME IS NOT COUNTED AS A FRAME OF THE GUEST'S PICTURE. It is a
+  // frame the ROOM already ran that this console is behind on (a catch-up
+  // after a stall, or a rejoin): never presented, its audio dropped, and never
+  // past the room clock, which itself runs at 1.000x. Counted into
+  // __snesFrames / the guest readout, a console coming out of a stall read
+  // 1.026x over the next 3 s (tools/snes_netplay_test.mjs, guest throttled to
+  // 1/40 CPU and released) — a catch-up, not a fast-forward, but a reading
+  // that cannot tell the two apart. They are counted apart, in LS.hidden
+  // (__snesNet().hiddenFrames).
+  function lsCountFrame(hid) {
+    LS.frames++;
+    if (hid) { LS.hidden++; return; }
+    frameCount++; guestFrames++; window.__snesFrames++;
+  }
+  var RB_WINDOW = 8;   // the STARTING window; the host's wins ('lsgo') and an adaptive room re-sizes it
+  var SRB = null;
+  // The core can serve rollback only if it is the rebuilt one: a cached old
+  // snes9x_2005.js has no saveStateInto/audioWpos (CORE_V should prevent that,
+  // and this keeps the room honest if it ever does not).
+  function snesRbCapable() {
+    return !!(window.SnesRollback && wasmReady && Module._saveStateInto && Module._audioWpos && Module._audioRewind);
+  }
+  function snesRb() {
+    if (!SRB && snesRbCapable()) SRB = SnesRollback.create(Module, { frameHz: SNES_HZ, log: pageLog });
+    return SRB;
+  }
+  function lsRbFrame(ls, r, hid) {
+    var R = snesRb();
+    if (!R) {
+      LS.fault = 'this console\'s core cannot run rollback (an old cached snes9x_2005.js?) — reload the page';
+      try { ls.fail(LS.fault); } catch (e) {}
+      return false;
+    }
+    if (!R.runFrame(ls, r, hid)) { LS.fault = R.RB.fault || 'rollback step failed'; return false; }
+    lsCountFrame(hid);
+    var pb = ls.padBytes | 0;
+    window.__snesMask = (r.image[0] | (r.image[1] << 8)) & 0xffff;
+    window.__snesLsImage = Array.prototype.slice.call(r.image.subarray(0, ls.portCount * pb));
+    LS.hashes = R.RB.hashes;
+    return true;
+  }
+
+  function runFrame(hidden) {
     // ⚠ WITH NO ROOM, BOTH PORTS ARE LOCAL. LS.armed is false and this is the
     // two-people-on-one-couch path: Player 1's mask into port 0, Player 2's into
     // port 1, one _mainLoop(). With nobody on the second pad padMask(1) is 0,
     // which is byte-for-byte what an empty controller port does — so a solo
     // player sees exactly what shipped before.
-    if (LS.armed) return lsRunFrame();
+    if (LS.armed) return lsRunFrame(hidden);
     var m = padMask(0), m2 = padMask(1);
     Module._setJoypadInput(m);
     Module._setJoypadInputPort(1, m2);
@@ -917,7 +1039,22 @@
     var d = ts - lastTs; lastTs = ts;
     if (d < 0) d = 0;
     if (d > 100) d = 100;          // a long stall must not fast-forward the guest
-    accum += d;
+    // ROLLBACK, ADAPTIVE ROOM (lib/netplay.js, the ADAPTIVE ROOM block), as
+    // genesis.html does it: the engine may hand back a credit multiplier just
+    // under 1 while this console leads a peer that cannot close the gap, and
+    // grants HIDDEN catch-up frames when this console is behind the room —
+    // frames the room has already run, never past its clock, never presented.
+    var lsE = (LS.armed && LS.running) ? lsEngine() : null;
+    accum += d * ((lsE && lsE.rollback && typeof lsE.rbPace === 'function') ? lsE.rbPace() : 1);
+    // ⚠ REJOINING IS NOT SHOWN AS A FAST-FORWARD (gate 9). A console that was
+    // away is a rejoin-sized gap behind the room: until it is back, EVERY frame
+    // runs hidden and the last picture holds. (The engine answers false/0
+    // wherever that does not apply.)
+    var rejoining = !!(lsE && typeof lsE.rbRejoining === 'function' && lsE.rbRejoining());
+    if (lsE && typeof lsE.rbCatchUp === 'function') {
+      var cu = lsE.rbCatchUp();
+      for (var ci = 0; ci < cu; ci++) if (!lsRunFrame(true)) break;
+    }
     var ran = 0;
     // ⚠ A STALLED FRAME MUST NOT SPEND ITS CREDIT. runFrame() returns false when
     // the frame gate is holding this console because some seated port's input for
@@ -930,8 +1067,10 @@
     // for a stall that outlives several ticks.
     var stalled = false;
     while (accum >= FRAME_MS && ran < MAX_CATCHUP_FRAMES) {
-      if (!runFrame()) { stalled = true; break; }
-      sndPoll();
+      if (!runFrame(rejoining)) { stalled = true; break; }
+      // A hidden frame's samples were rewound out of the ring; only a frame
+      // that is presented feeds the speaker (sndPoll's 600-per-frame model).
+      if (!rejoining) sndPoll();
       accum -= FRAME_MS; ran++;
     }
     // ⚠ NOT ONLY WHEN STALLED — the same defect that shipped on Genesis. This
@@ -947,7 +1086,7 @@
     // wall-clock milliseconds did not happen for the guest.
     if (accum > FRAME_MS) accum = FRAME_MS;
     if (NET.session) netHudTick(ts);
-    if (ran) draw();
+    if (ran && !rejoining) draw();
     if (!lastFpsAt) lastFpsAt = ts;
     if (ts - lastFpsAt >= 1000) {
       var secs = (ts - lastFpsAt) / 1000;
@@ -1501,6 +1640,10 @@
 
   var NET = {
     session: null,     // the live Netplay.Session, or null
+    // ROLLBACK (zero local input lag) unless the URL says ?rb=0, which makes
+    // this console propose delay lockstep instead. The HOST's choice wins.
+    rbWant: new URLSearchParams(location.search).get('rb') !== '0',
+    modeNote: null,    // a capacity-gated room in input delay says why, on the HUD
     role: null,        // 'host' | 'guest'
     leaving: false,    // WHO hung up, so the notice can say
     handoff: null,     // what ?np=… carried — { code, game, host, join } — or null
@@ -1838,8 +1981,16 @@
       rows.push('<span class="warn">party · ' + netPartyState()
         + (netAlone() ? ' — waiting for another player' : NET.loading ? ' — loading the game' : ' — the game loads by itself') + '</span>');
     } else {
-      rows.push('<span class="mode">LOCKSTEP</span> frame ' + ls.frame
-        + ' · delay ' + ls.delay + ' (' + Math.round(ls.delay * FRAME_MS) + ' ms)');
+      if (ls.rollback) {
+        var rr = SRB ? SRB.report() : null;
+        rows.push('<span class="mode">ROLLBACK</span> frame ' + ls.frame + ' · zero input lag · window ' + ls.rollback);
+        if (rr) rows.push('rollbacks ' + rr.rollbacks + ' · re-simulated ' + rr.resimFrames + ' (max depth ' + rr.maxDepth + ') · step '
+          + rr.stepMs.toFixed(2) + ' ms');
+      } else {
+        rows.push('<span class="mode">LOCKSTEP</span> frame ' + ls.frame
+          + ' · delay ' + ls.delay + ' (' + Math.round(ls.delay * FRAME_MS) + ' ms)');
+        if (NET.modeNote) rows.push('<span class="warn">' + NET.modeNote.replace(/[<>&]/g, '') + '</span>');
+      }
       rows.push('ports ' + ls.portCount + ' · mine ' + JSON.stringify(ls.localPorts)
         + ' · fingerprints ' + LS.hashes);
       if (LS.stalling) {
@@ -1872,7 +2023,20 @@
     $('netDesync').classList.remove('on');
     session.on('status', netOnStatus);
     session.on('desync', netOnDesync);
-    session.on('lockstep', function (e) { if (e && e.barrier) NET.bar = e.barrier; netRoomRender(); });
+    session.on('lockstep', function (e) {
+      if (e && e.barrier) NET.bar = e.barrier;
+      if (e && e.window) pageLog('[rollback] window ' + e.window.from + ' -> ' + e.window.to + ' frames' + (e.window.why ? ' — ' + e.window.why : ''));
+      // CAPACITY-GATED ROLLBACK (lib/netplay.js _capDecide): the host may switch
+      // the room between zero lag (rollback) and input delay at an agreed
+      // frame, so that no console ever runs slower because rollback was chosen.
+      if (e && e.mode) {
+        var mt = String(e.mode.text || '');
+        mt = mt.charAt(0).toUpperCase() + mt.slice(1) + '.';
+        NET.modeNote = e.mode.to === 'delay' ? mt : null;
+        pageLog('[lockstep] mode -> ' + e.mode.to + ' at frame ' + e.mode.frame + (e.mode.why ? ' — ' + e.mode.why : '') + ' (' + mt + ')');
+      }
+      netRoomRender();
+    });
     session.on('room', function () { netRoomRender(); });
     // The host's roster names the ROM the room is on. A joiner loads THAT — not
     // whatever its picker held — so the two agree at the barrier.
@@ -1884,8 +2048,22 @@
     // built with THIS console's numbers rather than lib/netplay.js's Dreamcast
     // defaults (4 ports, 64-byte pads). A SNES pad is a 16-bit mask, so two
     // bytes carry it exactly and the per-frame image is 4 bytes rather than 256.
+    // ROLLBACK, AS THE ROOM'S DEFAULT. rollback: the window this console
+    // proposes (0 with ?rb=0); the HOST's choice wins, and the host runs
+    // rollback only if every seated console declares it can (lsready `rb`).
+    // rollbackOk: this page CAN run rollback even when it does not propose it
+    // (withdrawn at Ready if the loaded core turns out to be an old one —
+    // lsArmBeforeFreerun). rbCatchUp: this page runs the engine's hidden
+    // catch-up frames, applies rbPace(), and grows its ring to rbRingFrames(),
+    // so the host may run an ADAPTIVE room. rbResume: this page re-arms its
+    // ring when a capacity-gated room comes back to rollback after a stretch of
+    // input delay, and keeps its step estimate current meanwhile — so a console
+    // that was only briefly too busy gets zero lag back. frameHz: the room
+    // clock's frame period.
     try {
-      session.startLockstep({ portCount: SNES_PORTS, padBytes: LS_PAD_BYTES, hashEvery: LS.hashEvery });
+      session.startLockstep({ portCount: SNES_PORTS, padBytes: LS_PAD_BYTES, hashEvery: LS.hashEvery,
+                              rollback: NET.rbWant ? RB_WINDOW : 0, rollbackOk: true, rbCatchUp: true, rbResume: true,
+                              frameHz: SNES_HZ });
     } catch (e) {
       pageLog('[lockstep] ⚠ startLockstep failed: ' + ((e && e.message) || e));
     }
@@ -2129,7 +2307,25 @@
       // carried no ?np=, so a rig can see what the page PARSED, not only what it
       // did about it.
       handoff: NET.handoff,
-      mode: 'lockstep',            // there is no other mode on this page
+      mode: 'lockstep',            // the ARCHITECTURE (every player runs their own core); see netMode for the room's mode
+      // 'lockstep' or 'rollback' — decided by the HOST's 'lsgo' (and switched by a
+      // capacity-gated room), read off the engine.
+      netMode: (ls && ls.rollback) ? 'rollback' : 'lockstep',
+      rbWant: NET.rbWant,
+      rbCapable: snesRbCapable(),
+      delay: ls ? (ls.rollback ? 0 : ls.delay) : null,
+      rollback: (ls && ls.rollback) ? {
+        window: ls.rollback,
+        engine: (typeof ls.rollbackReport === 'function') ? ls.rollbackReport() : null,
+        page: SRB ? SRB.report() : null,
+      } : null,
+      // THE CAPACITY GATE, readable in EITHER mode (the `rollback` block above is
+      // null while a gated room runs input delay): the switches the engine made,
+      // the step this console publishes, and the page's side of opts.rbResume.
+      capGate: ls ? { on: !!ls._capGate, mode: ls.rollback ? 'rollback' : 'delay', selfStepMs: +(+ls.selfStepMs || 0).toFixed(2),
+                      ring: SRB ? SRB.report() : null,
+                      switches: (ls.modeHistory || []).map(function (m) { return { frame: m.frame, to: m.to, delay: m.delay, window: m.window, kind: m.kind, mine: m.mine, text: m.text }; }) } : null,
+      hiddenFrames: LS.hidden,
       // ⚠ `live` MEANS "THE EMULATOR IS ACTUALLY PRODUCING FRAMES", and it is
       // not netplay state at all. tools/mobile_chrome_test.mjs uses it as the
       // witness that arms its orientation cell — without it that cell VOIDs and
@@ -2175,7 +2371,7 @@
   initCanvas();
   setStatus('Loading core…');
   var s = document.createElement('script');
-  s.src = '/snes/snesWasm/snes9x_2005.js';
+  s.src = CORE_DIR + 'snes9x_2005.js?v=' + CORE_V;
   s.onerror = function () {
     setStatus('Core failed to load.');
     // ⚠ THE PATH GOES TO THE LOG, NOT TO THE PLAYER. This read
