@@ -28,6 +28,7 @@
 #include "vi/vi_controller.h"
 
 #include <string.h>
+#include "main/lfb_hook.h"   /* glide's lazy framebuffer copy: LFB_TOUCH before RDRAM is used */
 
 enum
 {
@@ -93,6 +94,7 @@ static unsigned int get_dma_duration(struct ai_controller* ai)
 
 static void do_dma(struct ai_controller* ai, const struct ai_dma* dma)
 {
+   LFB_TOUCH(dma->address, dma->length + 8);
    /* lazy initialization of sample format */
    if (ai->samples_format_changed)
    {
@@ -183,6 +185,7 @@ int read_ai_regs(void* opaque, uint32_t address, uint32_t* value)
 		   //should never read greater than the fifo length
 		   unsigned int diff =ai->fifo[0].length - ai->last_read;
 		   unsigned char *p = (unsigned char*)&ai->ri->rdram.dram[ai->fifo[0].address / 4];
+		   LFB_TOUCH(ai->fifo[0].address + diff, ai->last_read - *value);
 		   ai->push_audio_samples(&ai->backend,p + diff,ai->last_read - *value);
 			 
 		 }
@@ -241,6 +244,7 @@ void ai_end_of_dma_event(struct ai_controller* ai)
    {
       unsigned int diff = ai->fifo[0].length - ai->last_read;
       unsigned char *p = (unsigned char*)&ai->ri->rdram.dram[ai->fifo[0].address/4];
+      LFB_TOUCH(ai->fifo[0].address + diff, ai->last_read);
       ai->push_audio_samples(&ai->backend,
          p + diff, ai->last_read);
    } 

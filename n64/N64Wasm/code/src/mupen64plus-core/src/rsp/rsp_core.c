@@ -32,6 +32,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include "main/lfb_hook.h"   /* glide's lazy framebuffer copy: LFB_TOUCH before RDRAM is used */
 
 static void dma_sp_write(struct rsp_core* sp, unsigned length, unsigned count, unsigned skip)
 {
@@ -42,6 +43,7 @@ static void dma_sp_write(struct rsp_core* sp, unsigned length, unsigned count, u
     unsigned char *spmem  = (unsigned char*)sp->mem + (sp->regs[SP_MEM_ADDR_REG] & 0x1000);
     unsigned char *dram   = (unsigned char*)sp->ri->rdram.dram;
 
+    LFB_TOUCH(dramaddr, count * (length + skip));
     for(j = 0; j < count; j++)
     {
         for(i = 0; i < length; i++)
@@ -63,6 +65,7 @@ static void dma_sp_read(struct rsp_core* sp, unsigned length, unsigned count, un
     unsigned char *spmem  = (unsigned char*)sp->mem + (sp->regs[SP_MEM_ADDR_REG] & 0x1000);
     unsigned char *dram   = (unsigned char*)sp->ri->rdram.dram;
 
+    LFB_TOUCH(dramaddr, count * (length + skip));
     for(j = 0; j < count; j++)
     {
         for(i = 0; i < length; i++)

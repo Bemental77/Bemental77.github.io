@@ -5,6 +5,7 @@
 #include "Util.h"
 
 #include "../../Graphics/RDP/gDP_state.h"
+#include "lazy_fb.h"
 
 void apply_shading(void *data);
 
@@ -576,6 +577,7 @@ void glide64gDPLoadBlock( uint32_t tile, uint32_t ul_s, uint32_t ul_t,
       cnt = (sizeof(g_gdp.tmem) >> 3) - (g_gdp.tile[tile].tmem);
    }
 
+   LFB_TOUCH(g_gdp.ti_address, ((uint32_t)cnt << 4) + 16);   /* a texture loaded from a lazily copied frame */
    if (g_gdp.ti_size == G_IM_SIZ_32b)
       LoadBlock32b(tile, ul_s, ul_t, lr_s, dxt);
    else
@@ -640,6 +642,7 @@ void glide64gDPLoadTile(uint32_t tile, uint32_t ul_s, uint32_t ul_t,
    if (offs >= BMASK)
       return;
 
+   LFB_TOUCH(offs, line_n * (height + 1) * 2 + 16);   /* a texture loaded from a lazily copied frame */
    if (g_gdp.ti_size == G_IM_SIZ_32b)
    {
       LoadTile32b(tile, ul_s, ul_t, width, height);
@@ -699,6 +702,9 @@ void glide64gDPFillRectangle(uint32_t ul_x, uint32_t ul_y, uint32_t lr_x, uint32
             zi_width_in_dwords = gDP.colorImage.width >> 1;
             ul_x >>= 1;
             lr_x >>= 1;
+            if (lr_y > ul_y && lr_x > ul_x)   /* the depth image is written here: a queued frame under it first */
+               LFB_TOUCH(gDP.colorImage.address + 4 * (ul_y * zi_width_in_dwords + ul_x),
+                     4 * ((lr_y - 1 - ul_y) * zi_width_in_dwords + (lr_x - ul_x)));
             dst = (uint32_t*)(gfx_info.RDRAM + gDP.colorImage.address);
             dst += ul_y * zi_width_in_dwords;
             for (y = ul_y; y < lr_y; y++)

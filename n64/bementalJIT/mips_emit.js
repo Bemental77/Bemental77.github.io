@@ -1463,6 +1463,221 @@
   // MK64 race window under a 4x throttle (110 compiles in 700 frames).
   function app(dst, src) { for (var q = 0; q < src.length; q++) dst.push(src[q]); }
 
+  // ---- COMPILE BUDGET (2026-10-02) ----
+  // A scene load asks for hundreds of new spans inside one field; on the
+  // user's phone (Mali-G715, ?costdbg=1) a single field then spent 80-325 ms
+  // compiling, and the field IS the frame. So at most JIT_BUDGET spans are
+  // emitted and compiled per field (cache hits do not count); the rest stay on
+  // the cached interpreter for now and are QUEUED. At the end of every
+  // retro_run (libretronew.c calls frameEnd) the budget is refilled and the
+  // queue is compiled oldest first, again at most JIT_BUDGET.
+  // Deterministic: the budget counts spans, never time, so every console
+  // defers the same requests at the same points. And exact either way: a
+  // compiled span and the interpreter it replaces are the same machine (the
+  // hashed 27-ROM sweeps), and a queued span is only installed if its entry
+  // still holds the very interpreter op it held when offered, in the same
+  // valid page — compileSpan then compiles the words in memory NOW, with the
+  // recompile key computed from them, so a page that changed meanwhile is
+  // compiled as it is (or, if it was invalidated, left to NOTCOMPILED).
+  // ?jitbudget=N sets it (published by fbasync.js in both realms); 0 = no
+  // budget, the old behaviour, and the A/B arm.
+  var JIT_BUDGET = null, budgetLeft = 0, deferQ = [], deferSet = new Set(), draining = false;
+  function jitBudget() {
+    if (JIT_BUDGET === null) {
+      var g = (typeof globalThis !== 'undefined') ? globalThis : self, f = g.__fbAsync;
+      JIT_BUDGET = (f && typeof f.jitBudget === 'number' && f.jitBudget >= 0) ? f.jitBudget : 6;
+      budgetLeft = JIT_BUDGET;
+    }
+    return JIT_BUDGET;
+  }
+  function frameEnd() {
+    ASYNC.frameEnds++;
+    if (ASYNC.ready.length) asyncInstallReady();
+    asyncFlush();
+    if (!jitBudget()) return;
+    budgetLeft = JIT_BUDGET;
+    var M = (typeof globalThis !== 'undefined' ? globalThis : self).Module;
+    if (!deferQ.length || !M) return;
+    var U = M.HEAPU32;
+    draining = true;
+    try {
+      while (deferQ.length && budgetLeft > 0) {
+        var d = deferQ.shift(); deferSet.delete(d.p.entryPtr);
+        var p = d.p, page = (p.vaddr >>> 12);
+        // the same page, still valid, its entry still the interpreter op it was
+        var bp = U[(p.blocksBase >> 2) + page];
+        if (!bp || U[bp >> 2] !== d.blk || U[(bp >> 2) + 1] !== (p.blockStart >>> 0) || U[(bp >> 2) + 2] !== (p.blockEnd >>> 0)) { stats.deferStale = (stats.deferStale || 0) + 1; continue; }
+        if (M.HEAPU8[p.invalidCode + page]) { stats.deferStale = (stats.deferStale || 0) + 1; continue; }
+        if (U[p.entryPtr >> 2] !== d.op || d.op === p.notCompiled) { stats.deferStale = (stats.deferStale || 0) + 1; continue; }
+        var idx = compileSpan(p, M);
+        if (idx > 0 && U[p.entryPtr >> 2] === d.op) { U[p.entryPtr >> 2] = idx; stats.deferInstalled = (stats.deferInstalled || 0) + 1; }
+      }
+    } finally { draining = false; }
+  }
+
+  // ---- OFF-THREAD EMISSION (2026-10-03) ----
+  // Where a span's compile time goes, measured in the MK64 boot+race window
+  // (n64/tools/n64_field_cost_probe.mjs, HEAD, this box): 1591 compiles took
+  // 5265 ms in the core's thread, of which the WebAssembly.Module compile was
+  // 460 ms and instantiation 92 ms — the other ~90% is THIS FILE's JS building
+  // the bytes. A budget can spread that but not remove it (one big span is
+  // tens of ms by itself on a phone). So the bytes are built in a second worker
+  // (jit_compile_worker.js runs this same file with EMIT_ONLY set): the core's
+  // thread copies the span's inputs — the 4 KB page's words and the span's
+  // precomp ops fields, which is everything compileSpan bakes into a module
+  // (see RECOMPILE CACHE below) — posts them, and returns 0, so the span runs
+  // on the cached interpreter meanwhile. The compiled module comes back as a
+  // WebAssembly.Module and is installed at the next field end (frameEnd), and
+  // only if every input it was built from still holds: the page's words, every
+  // ops field (init_block resets them to NOTCOMPILED on invalidation), the
+  // page's precomp block (same array, same bounds), and the page still valid.
+  // Exact: the module is the one compileSpan would have built from the same
+  // words in this thread (the same function runs on a copy of them; a read
+  // outside the copy fails the job instead of guessing), and a compiled span
+  // and the interpreter it replaces are the same machine — the property
+  // rollback's re-simulation already rests on (the code cache is kept across
+  // a state load), proven by the differential harness and the rollback probe.
+  // So WHEN a module lands moves time only, never what the guest computes.
+  // Off: ?jitasync=0 (published by fbasync.js in both realms), census mode,
+  // no Worker, or a core that never calls frameEnd — then the per-field budget
+  // above applies.
+  var EMIT_ONLY = null;          // set in the compile worker: compileSpan stops after emitting
+  var ASYNC = { on: null, w: null, nextId: 1, pending: new Map(), ready: [], outbox: [], frameEnds: 0, M: null,
+                offered: 0, installed: 0, stale: 0, failed: 0, maxInstallMs: 0 };
+  function asyncOn(Module) {
+    if (EMIT_ONLY) return false;
+    if (ASYNC.on === false) return false;
+    if (!ASYNC.frameEnds) return false;          // this core calls frameEnd: installs can happen
+    if (ASYNC.on === true) return true;
+    var g = (typeof globalThis !== 'undefined') ? globalThis : self, f = g.__fbAsync;
+    if ((f && f.jitAsync === false) || census.on || typeof Worker !== 'function' || typeof g.__n64JitWorkerUrl !== 'string') { ASYNC.on = false; return false; }
+    try {
+      ASYNC.w = new Worker(g.__n64JitWorkerUrl);
+      ASYNC.w.onmessage = function (e) { var d = e.data; if (Array.isArray(d)) { for (var k = 0; k < d.length; k++) ASYNC.ready.push(d[k]); } else ASYNC.ready.push(d); };
+      ASYNC.w.onerror = function (e) {
+        // a worker that fails leaves everything it was asked for on the interpreter;
+        // from now on spans compile in this thread again
+        ASYNC.on = false; ASYNC.pending.clear(); stats.asyncWorkerError = String((e && e.message) || e).slice(0, 160);
+      };
+      ASYNC.M = Module;
+      ASYNC.on = true;
+    } catch (e) { ASYNC.on = false; stats.asyncWorkerError = String((e && e.message) || e).slice(0, 160); }
+    return ASYNC.on;
+  }
+  function jitFlags() {
+    return { noFP: !!(typeof window !== 'undefined' && window.__jitNoFP), noLabels: !!(typeof window !== 'undefined' && window.__jitNoLabels),
+             pin: !!(typeof window !== 'undefined' && window.__jitPin) };
+  }
+  function asyncOffer(p, U, span, pageW0, pageN, keyArr) {
+    var page = p.vaddr >>> 12, bp = U[(p.blocksBase >> 2) + page];
+    var nOps = span + 2, ops = new Uint32Array(nOps);
+    for (var k = 0; k < nOps; k++) ops[k] = U[(p.entryPtr + k * p.stride) >> 2];
+    var words = U.slice(pageW0, pageW0 + pageN + 1);    // the page, and the word after it
+    var id = ASYNC.nextId++;
+    var job = { id: id, p: Object.assign({}, p), w0: pageW0, words: words, ops: ops, flags: jitFlags() };
+    ASYNC.pending.set(id, { p: job.p, w0: pageW0, words: words, ops: ops, bp: bp, blk: bp ? U[bp >> 2] : 0, keyArr: keyArr });
+    // batched: one message per field end (or per 32 offers) — a scene load offers hundreds
+    // of spans inside one field, and a message each cost more than the copy itself
+    ASYNC.outbox.push(job);
+    if (ASYNC.outbox.length >= 32) asyncFlush();
+    ASYNC.offered++;
+  }
+  function asyncFlush() {
+    if (!ASYNC.outbox.length || !ASYNC.w) return;
+    var b = ASYNC.outbox; ASYNC.outbox = [];
+    ASYNC.w.postMessage(b);
+  }
+  function asyncStillHolds(M, j) {
+    var U = M.HEAPU32, p = j.p, page = p.vaddr >>> 12, k;
+    if (M.HEAPU8[p.invalidCode + page]) return false;
+    var bp = U[(p.blocksBase >> 2) + page];
+    if (!bp || bp !== j.bp || U[bp >> 2] !== j.blk || U[(bp >> 2) + 1] !== (p.blockStart >>> 0) || U[(bp >> 2) + 2] !== (p.blockEnd >>> 0)) return false;
+    for (k = 0; k < j.words.length; k++) if (U[j.w0 + k] !== j.words[k]) return false;
+    for (k = 0; k < j.ops.length; k++) if (U[(p.entryPtr + k * p.stride) >> 2] !== j.ops[k]) return false;
+    return true;
+  }
+  function asyncInstallReady() {
+    var M = ASYNC.M || ((typeof globalThis !== 'undefined' ? globalThis : self).Module);
+    var t0 = (typeof performance !== 'undefined') ? performance.now() : 0;
+    // at most ~2 ms of installing per field end (an instantiate is ~0.05-0.1 ms here; a scene
+    // load can bring back hundreds at once): the rest waits for the next field end
+    var q = ASYNC.ready, i;
+    for (i = 0; i < q.length; i++) {
+      if (t0 && i > 0 && (i & 7) === 0 && performance.now() - t0 > 2) break;
+      var r = q[i], j = ASYNC.pending.get(r.id);
+      if (!j) continue;
+      ASYNC.pending.delete(r.id);
+      if (!r.ok) { ASYNC.failed++; if (r.err && !stats.asyncLastErr) stats.asyncLastErr = r.err; continue; }
+      if (!asyncStillHolds(M, j)) { ASYNC.stale++; continue; }
+      try {
+        var mod = r.mod || new WebAssembly.Module(r.bytes);
+        var inst = new WebAssembly.Instance(mod, { e: { t: M.wasmTable, m: M.wasmMemory, c: censusBump } });
+        var p = j.p, U = M.HEAPU32;
+        U[p.entryPtr >> 2] = installSlot(M, p.vaddr >>> 0, inst.exports.f);   // what recomp.c does with a nonzero return
+        for (var wk = 1; wk < r.labels.length; wk++) {
+          var lptr = p.entryPtr + r.labels[wk] * p.stride;
+          if (U[lptr >> 2] !== r.labelOps[wk]) continue;
+          U[lptr >> 2] = installSlot(M, (p.vaddr + r.labels[wk] * 4) >>> 0, inst.exports['f' + wk]);
+          stats.labelEntries = (stats.labelEntries || 0) + 1;
+        }
+        stats.blocks++;
+        cachePut(j.keyArr, inst, r.labels, r.labelOps);
+        ASYNC.installed++;
+      } catch (e) {
+        ASYNC.failed++; stats.fails++;
+        if (stats.fails <= 3) console.error('[bementalJIT] async install failed:', e, 'vaddr', (j.p.vaddr >>> 0).toString(16));
+      }
+    }
+    ASYNC.ready = q.slice(i);           // (no message can arrive during this loop)
+    if (t0) { var d = performance.now() - t0; if (d > ASYNC.maxInstallMs) ASYNC.maxInstallMs = d; }
+  }
+  // the compile worker's side: run compileSpan on a copy of the inputs
+  function emitJob(job) {
+    var p = job.p, miss = 0, w0 = job.w0, words = job.words, ops = job.ops, base = p.entryPtr >>> 0, stride = p.stride;
+    var H = new Proxy({}, { get: function (t, key) {
+      var i = +key;
+      if (i !== i) return undefined;
+      var wi = i - w0;
+      if (wi >= 0 && wi < words.length) return words[wi];
+      var off = i * 4 - base;
+      if (off >= 0 && off % stride === 0 && off / stride < ops.length) return ops[off / stride];
+      miss++;
+      return 0;
+    } });
+    window.__jitNoFP = job.flags.noFP; window.__jitNoLabels = job.flags.noLabels; window.__jitPin = job.flags.pin;
+    EMIT_ONLY = { out: null };
+    var idx = 0;
+    try { idx = compileSpan(p, { HEAPU32: H }); } catch (e) { return { id: job.id, ok: false, err: String((e && e.message) || e).slice(0, 200) }; }
+    var out = EMIT_ONLY.out;
+    EMIT_ONLY = null;
+    if (!idx || !out) return { id: job.id, ok: false, err: idx ? 'no module' : 'refused' };
+    if (miss) return { id: job.id, ok: false, err: 'read outside the copied inputs (' + miss + ')' };
+    return { id: job.id, ok: true, bytes: out.bytes, labels: out.labels, labelOps: out.labelOps };
+  }
+  function installSlot(Module, vkey, fn) {
+    var sidx = slotByVaddr[vkey];
+    if (sidx !== undefined) {
+      Module.wasmTable.set(sidx, fn);
+      stats.slotReuses++;
+    } else {
+      sidx = Module.wasmTable.length;
+      Module.wasmTable.grow(1);
+      Module.wasmTable.set(sidx, fn);
+      slotByVaddr[vkey] = sidx;
+      stats.distinctSlots++;
+    }
+    return sidx;
+  }
+  function cachePut(keyArr, inst, labels, labelOps) {
+    var kh = 0x811c9dc5 | 0;
+    for (var kq = 0; kq < keyArr.length; kq++) kh = Math.imul(kh ^ keyArr[kq], 16777619);
+    if (spanCacheN >= SPAN_CACHE_MAX) { spanCache.clear(); spanCacheN = 0; }
+    var nb = spanCache.get(kh);
+    if (!nb) { nb = []; spanCache.set(kh, nb); }
+    nb.push({ key: keyArr, inst: inst, labels: labels, labelOps: labelOps });
+    spanCacheN++;
+  }
+
   function compileSpan(p, Module) {
     // resolved once, on the first compile — the page sets window.__jitCensus
     // before loading this script, and it must stay constant for the session
@@ -1616,23 +1831,43 @@
     for (kq = 0; kq < pageN; kq++) keyArr[6 + kq] = HEAPU32[pageW0 + kq];
     for (kq = 0; kq <= span; kq++) keyArr[6 + pageN + kq] = HEAPU32[(p.entryPtr + kq * p.stride) >> 2];
     for (kq = 0; kq < keyLen; kq++) kh = Math.imul(kh ^ keyArr[kq], 16777619);
-    var bucket = spanCache.get(kh);
+    var bucket = EMIT_ONLY ? null : spanCache.get(kh);
     if (bucket) {
       for (var bi = 0; bi < bucket.length; bi++) {
         var ce = bucket[bi], same = ce.key.length === keyLen;
         for (kq = 0; same && kq < keyLen; kq++) same = ce.key[kq] === keyArr[kq];
         if (!same) continue;
-        var hidx = installSlot(p.vaddr >>> 0, ce.inst.exports.f);
+        var hidx = installSlot(Module, p.vaddr >>> 0, ce.inst.exports.f);
         for (var hk = 1; hk < ce.labels.length; hk++) {
           var hptr = p.entryPtr + ce.labels[hk] * p.stride;
           if (HEAPU32[hptr >> 2] !== ce.labelOps[hk]) continue;
-          HEAPU32[hptr >> 2] = installSlot((p.vaddr + ce.labels[hk] * 4) >>> 0, ce.inst.exports['f' + hk]);
+          HEAPU32[hptr >> 2] = installSlot(Module, (p.vaddr + ce.labels[hk] * 4) >>> 0, ce.inst.exports['f' + hk]);
           stats.labelEntries = (stats.labelEntries || 0) + 1;
         }
         stats.cacheHits = (stats.cacheHits || 0) + 1;
         return hidx;
       }
     }
+
+    // built off this thread (OFF-THREAD EMISSION above): the interpreter runs it meanwhile
+    if (!draining && asyncOn(Module)) {
+      asyncOffer(p, HEAPU32, span, pageW0, pageN, keyArr);
+      stats.asyncOffered = (stats.asyncOffered || 0) + 1;
+      return 0;
+    }
+    // over this field's compile budget: run it on the interpreter, compile later
+    if (!EMIT_ONLY && jitBudget() && !draining) {
+      if (budgetLeft <= 0) {
+        if (!deferSet.has(p.entryPtr) && deferQ.length < 4096) {
+          var pageBp = HEAPU32[(p.blocksBase >> 2) + (p.vaddr >>> 12)];
+          deferQ.push({ p: Object.assign({}, p), op: HEAPU32[p.entryPtr >> 2], blk: pageBp ? HEAPU32[pageBp >> 2] : 0 });
+          deferSet.add(p.entryPtr);
+        }
+        stats.deferred = (stats.deferred || 0) + 1;
+        return 0;
+      }
+      budgetLeft--;
+    } else if (draining) budgetLeft--;
 
     for (var li = 0; li < pageN; li++) {
       var lw = HEAPU32[pageW0 + li];
@@ -2091,24 +2326,11 @@
     var codeSec = section(10, code);
     var bytes = new Uint8Array([0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00]
       .concat(typeSec, importSec, funcSec, globalSec, exportSec, codeSec));
-    function installSlot(vkey, fn) {
-      var sidx = slotByVaddr[vkey];
-      if (sidx !== undefined) {
-        Module.wasmTable.set(sidx, fn);
-        stats.slotReuses++;
-      } else {
-        sidx = Module.wasmTable.length;
-        Module.wasmTable.grow(1);
-        Module.wasmTable.set(sidx, fn);
-        slotByVaddr[vkey] = sidx;
-        stats.distinctSlots++;
-      }
-      return sidx;
-    }
+    if (EMIT_ONLY) { EMIT_ONLY.out = { bytes: bytes, labels: labels, labelOps: labelOps }; return 1; }
     try {
       var mod = new WebAssembly.Module(bytes);
       var inst = new WebAssembly.Instance(mod, { e: { t: Module.wasmTable, m: Module.wasmMemory, c: censusBump } });
-      var idx = installSlot(p.vaddr >>> 0, inst.exports.f);
+      var idx = installSlot(Module, p.vaddr >>> 0, inst.exports.f);
       // Label entries: written straight into block[label].ops, the same field
       // recomp.c:2583 writes for the entry. init_block resets every one of
       // them to NOTCOMPILED on invalidation (cached_interp.c jump_to_func ->
@@ -2118,15 +2340,11 @@
       for (wk = 1; wk < nSeg; wk++) {
         var lptr = p.entryPtr + labels[wk] * p.stride;
         if (HEAPU32[lptr >> 2] !== labelOps[wk]) continue;
-        HEAPU32[lptr >> 2] = installSlot((p.vaddr + labels[wk] * 4) >>> 0, inst.exports['f' + wk]);
+        HEAPU32[lptr >> 2] = installSlot(Module, (p.vaddr + labels[wk] * 4) >>> 0, inst.exports['f' + wk]);
         stats.labelEntries = (stats.labelEntries || 0) + 1;
       }
       stats.blocks++;
-      if (spanCacheN >= SPAN_CACHE_MAX) { spanCache.clear(); spanCacheN = 0; }
-      var nb = spanCache.get(kh);
-      if (!nb) { nb = []; spanCache.set(kh, nb); }
-      nb.push({ key: keyArr, inst: inst, labels: labels, labelOps: labelOps });
-      spanCacheN++;
+      cachePut(keyArr, inst, labels, labelOps);
       return idx;
     } catch (e) {
       stats.fails++;
@@ -2143,5 +2361,6 @@
     out.sort(function (a, b) { return b[1] - a[1]; });
     return out;
   }
-  window.bementalMips = { compileSpan: compileSpan, stats: stats, census: censusDump, censusOn: function () { return !!census.on; } };
+  window.bementalMips = { compileSpan: compileSpan, frameEnd: frameEnd, stats: stats, census: censusDump, censusOn: function () { return !!census.on; },
+                         async: ASYNC, emitJob: emitJob };
 })();

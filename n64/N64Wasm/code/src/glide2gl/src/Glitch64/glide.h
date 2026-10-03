@@ -5,6 +5,9 @@
 #include <boolean.h>
 // #include <glsm/glsmsym.h>
 #include <GL/glew.h>
+/* every GL call glide makes goes through the call shadow, including the macros
+ * below that expand in the Glide64 sources (gl_shadow.h) */
+#include "gl_shadow.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -506,6 +509,10 @@ grLfbLock( int32_t type, int32_t buffer, int32_t writeMode,
 #define grLfbUnlock(type, buffer) (true)
 
 uint16_t *grLfbReadSampled(const int32_t *sx, int nx, const int32_t *sy, int ny);
+int grLfbSampleable(const int32_t *sx, int nx, const int32_t *sy, int ny);
+int grLfbCaptureWindow(GLuint *tex, int *w, int *h);
+uint16_t *grLfbSampleFrom(GLuint tex, int w, int h, const int32_t *sx, int nx, const int32_t *sy, int ny);
+void grLfbDeleteCapture(GLuint tex);
 void grFbPrefetch(void);
 void glide_viewport_note(GLint x, GLint y, GLsizei w, GLsizei h);
 extern int neil_native_fbread;

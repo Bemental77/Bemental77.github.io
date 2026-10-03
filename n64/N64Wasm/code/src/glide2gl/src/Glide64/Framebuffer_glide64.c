@@ -55,6 +55,7 @@
 #include "../Glitch64/glide.h"
 #include "GlideExtensions.h"
 #include "rdp.h"
+#include "lazy_fb.h"
 
 #define ZLUT_SIZE 0x40000
 
@@ -506,6 +507,7 @@ static int SetupFBtoScreenCombiner(uint32_t texture_size, uint32_t opaque)
 
 static void DrawDepthBufferToScreen256(FB_TO_SCREEN_INFO *fb_info)
 {
+   lfb_materialize_all();   /* reads or writes the colour image in RDRAM */
    uint32_t h, w, x, y, tex_size;
    uint32_t w_tail, h_tail, tex_adr;
    int tmu;
@@ -572,6 +574,7 @@ static void DrawDepthBufferToScreen256(FB_TO_SCREEN_INFO *fb_info)
 
 static void DrawDepthBufferToScreen(FB_TO_SCREEN_INFO *fb_info)
 {
+   lfb_materialize_all();   /* reads or writes the colour image in RDRAM */
    uint32_t x, y;
    int tmu;
    float ul_x, ul_y, lr_x, lr_y, lr_u, lr_v, zero;
@@ -656,6 +659,7 @@ static void DrawRE2Video(FB_TO_SCREEN_INFO *fb_info, float scale)
 
 static void DrawRE2Video256(FB_TO_SCREEN_INFO *fb_info)
 {
+   lfb_materialize_all();   /* reads or writes the colour image in RDRAM */
    uint32_t h, w;
    int tmu;
    GrTexInfo t_info;
@@ -700,6 +704,7 @@ static void DrawRE2Video256(FB_TO_SCREEN_INFO *fb_info)
 
 static void DrawFrameBufferToScreen256(FB_TO_SCREEN_INFO *fb_info)
 {
+   lfb_materialize_all();   /* reads or writes the colour image in RDRAM */
   uint32_t w, h, x, y, width, height, width256, height256, tex_size, *src32;
   uint32_t tex_adr, w_tail, h_tail, bound, c32, idx;
   uint8_t r, g, b, a, *image;
@@ -799,6 +804,7 @@ static void DrawFrameBufferToScreen256(FB_TO_SCREEN_INFO *fb_info)
 
 static bool DrawFrameBufferToScreen(FB_TO_SCREEN_INFO *fb_info)
 {
+   lfb_materialize_all();   /* reads or writes the colour image in RDRAM */
    uint32_t x, y, width, height, texwidth;
    uint8_t *image;
    int tmu;
@@ -920,6 +926,7 @@ static bool DrawFrameBufferToScreen(FB_TO_SCREEN_INFO *fb_info)
 
 void copyWhiteToRDRAM(void)
 {
+   lfb_materialize_all();   /* reads or writes the colour image in RDRAM */
    uint32_t y, x;
    if(g_gdp.fb_width == 0)
       return;
@@ -946,6 +953,7 @@ void copyWhiteToRDRAM(void)
 
 void DrawWholeFrameBufferToScreen(void)
 {
+   lfb_materialize_all();   /* reads or writes the colour image in RDRAM */
   FB_TO_SCREEN_INFO fb_info;
   static uint32_t toScreenCI = 0;
 
@@ -978,6 +986,11 @@ void CopyFrameBuffer(int32_t buffer)
 {
    uint32_t height = 0;
    uint32_t width  = gDP.colorImage.width;//*gfx_info.VI_WIDTH_REG;
+   /* the end-of-list copy of a read_always title may be queued instead of
+    * made (lazy_fb.c); every other copy is made now, after anything queued */
+   int lazy_try = lfb_ref_call;
+   if (!lazy_try)
+      lfb_eager();
 
    if (fb_emulation_enabled && !(settings.hacks&hack_PPL))
    {
@@ -995,6 +1008,8 @@ void CopyFrameBuffer(int32_t buffer)
    if (rdp.scale_x < 1.1f)
    {
       uint16_t * ptr_src = (uint16_t*)glide64_frameBuffer;
+      if (lazy_try)
+         lfb_eager();
       if (grLfbReadRegion(buffer,
                (uint32_t)rdp.offset_x,
                (uint32_t)rdp.offset_y,//rdp.ci_upper_bound,
@@ -1081,9 +1096,18 @@ void CopyFrameBuffer(int32_t buffer)
          {
             for (x = 0; x < x_end; x++) nf_sx[x] = (int)(x*scale_x + rdp.offset_x);
             for (y = 0; y < y_end; y++) nf_sy[y] = (int)(y * scale_y + rdp.offset_y);
+            if (lazy_try)
+            {
+               if (lfb_queue(nf_sx, x_end, nf_sy, y_end, gDP.colorImage.address, (int)width,
+                        x_start, y_start, g_gdp.fb_size > G_IM_SIZ_16b, read_alpha))
+                  return;                 /* queued: written when something can see it */
+               lazy_try = 0;              /* lfb_queue made the copy eager */
+            }
             samp = grLfbReadSampled(nf_sx, x_end, nf_sy, y_end);
          }
       }
+      if (lazy_try)
+         lfb_eager();
 
       if (!samp && grLfbLock (GR_LFB_READ_ONLY,
                buffer,
@@ -1245,6 +1269,7 @@ part_framebuffer part_framebuf;
 
 void DrawPartFrameBufferToScreen(void)
 {
+   lfb_materialize_all();   /* reads or writes the colour image in RDRAM */
    FB_TO_SCREEN_INFO fb_info;
 
    fb_info.addr   = gDP.colorImage.address;

@@ -113,7 +113,10 @@ self.myApp = {
 function setupJit(mode) {
   if (mode === 'off') { log('[jit] disabled by query flag'); return; }
   if (!M.addFunction || !M._neil_set_jit_bridge || !M.wasmTable) { log('[jit] bridge unavailable in this core build'); return; }
-  importScripts('/n64/bementalJIT/mips_emit.js?v=' + Date.now());   // as the page does: the emitter moves independently
+  var jv = Date.now();
+  // the emitter's off-thread half runs the same file (mips_emit.js OFF-THREAD EMISSION)
+  self.__n64JitWorkerUrl = '/n64/bementalJIT/jit_compile_worker.js?v=' + jv;
+  importScripts('/n64/bementalJIT/mips_emit.js?v=' + jv);   // as the page does: the emitter moves independently
   var wrapped = 0;
   self.myApp.jitCompile = function (paramsPtr) {
     var p = self.__n64JitParams(M, paramsPtr);
@@ -152,6 +155,9 @@ function audioPump() {
 // ---- THE FRAME CLOCK (see the header) --------------------------------------------------
 var CLK = { viHz: 0, base: 0, baseFrame: 0, frame: 0, lostMs: 0, reanchors: 0, presents: 0, ticks: 0, busyMs: 0 };
 function applyPads() {
+  // rig seam (?workerrig=clock only: a rig's eval installs it): the pads as a function of the
+  // field, so a measured run on the SHIPPED clock follows one guest trajectory
+  if (self.__n64PadOverride) for (var q = 0; q < 4; q++) { var o = self.__n64PadOverride(CLK.frame, q); PADS[q * 3] = o[0]; PADS[q * 3 + 1] = o[1]; PADS[q * 3 + 2] = o[2]; }
   for (var p = 0; p < 4; p++) M._neil_ls_set_pad(p, PADS[p * 3], PADS[p * 3 + 1], -PADS[p * 3 + 2]);
 }
 function runOneFrame() {
@@ -206,11 +212,16 @@ function tickBody(src) {
   if (!paused) {
     CLK.ticks++;
     var now = performance.now();
-    if ((!SCHED.coupled || src === 'raf') && dueNow(now) && !cbMayDraw(src)) {
+    if ((!SCHED.coupled || src === 'raf') && dueNow(now) && !gqReady()) {
+      // held: the GPU is GQ.max fields behind (THE GPU QUEUE GUARD); a timer turn retries
+      if (!GQ.timer) { GQ.timer = true; setTimeout(function () { GQ.timer = false; tick('gq'); }, 1); }
+      return;
+    } else if ((!SCHED.coupled || src === 'raf') && dueNow(now) && !cbMayDraw(src)) {
       // yielded: the last field's picture is not pushed yet (THE COMMIT YIELD)
     } else if ((!SCHED.coupled || src === 'raf') && due(now)) {
       var t0 = performance.now();
       runOneFrame();
+      gqAfterField();
       cbDidDraw(src);
       pbPresent();
       CLK.presents++; CLK.busyMs += performance.now() - t0;
@@ -245,6 +256,54 @@ function schedule() {
     if (CLK.viHz > 0 && CLK.base) wait = Math.max(0, CLK.base + (CLK.frame - CLK.baseFrame) * (1000 / CLK.viHz) - performance.now());
     SCHED.tmr = true; setTimeout(function () { tick('tmr'); }, wait);
   }
+}
+
+// ---- THE GPU QUEUE GUARD: THE GPU IS NEVER MORE THAN A FEW FIELDS BEHIND ----------------
+// Until glide's framebuffer copy went lazy (Glide64/lazy_fb.c), a read_always title read the
+// previous frame back every display list (fbasync.js getBufferSubData), and that wait was the
+// one thing that kept this thread from running ahead of the GPU: 6-8 ms a field on the user's
+// phone, 20-70 ms here under SwiftShader. Without it nothing bounds the GPU's queue, and a GPU
+// slower than the guest's field rate falls behind WITHOUT LIMIT — measured here (MK64 race,
+// n64_field_cost_probe --finish): a fence set after a field signalled 3.4 s later on average,
+// i.e. what reached the screen was 3.4 s old (input lag), and the WebGL call that finally hit
+// the full command buffer took 0.3-2.5 s.
+// So a fence is set after every field, and a field does not START while more than GQ.max
+// fences are unsignalled: this thread yields (a 1 ms timer turn; the GPU and every other task
+// run meanwhile) instead of queueing more. On a GPU that keeps up the fences are signalled
+// when the next field is due and nothing ever waits. The guest is untouched — the frame clock
+// still decides WHEN a field is owed, and time lost to a slow GPU is lost (gate 9), exactly as
+// it was while the readback waited. A sync object only changes state between tasks, so the
+// status read here is free. After 250 ms of holding the field runs anyway (a lost context, a
+// driver that never signals). ?gpuq=0 is the A/B arm and kill switch; ?gpuq=N sets the depth.
+var GQ = { on: true, max: 2, fences: [], held: 0, heldMs: 0, holdFrom: 0, forced: 0, gl: null, timer: false };
+function gqGl() {
+  if (GQ.gl) return GQ.gl;
+  var g = M && M.ctx;
+  if (g && typeof g.fenceSync === 'function') GQ.gl = g;
+  return GQ.gl;
+}
+function gqAfterField() {
+  if (!GQ.on) return;
+  var gl = gqGl(); if (!gl) return;
+  var f = null;
+  try { f = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0); } catch (e) { f = null; }
+  if (f) GQ.fences.push(f);
+  if (GQ.fences.length > 64) { try { gl.deleteSync(GQ.fences.shift()); } catch (e) {} }
+}
+// may a field start now? false = hold it (the caller retries from a later task)
+function gqReady() {
+  if (!GQ.on || !GQ.fences.length) return true;
+  var gl = gqGl(); if (!gl) return true;
+  while (GQ.fences.length) {
+    var st = gl.getSyncParameter(GQ.fences[0], gl.SYNC_STATUS);
+    if (st !== gl.SIGNALED) break;
+    gl.deleteSync(GQ.fences.shift());
+  }
+  if (GQ.fences.length <= GQ.max) { if (GQ.holdFrom) { GQ.heldMs += performance.now() - GQ.holdFrom; GQ.holdFrom = 0; } return true; }
+  var now = performance.now();
+  if (!GQ.holdFrom) { GQ.holdFrom = now; GQ.held++; }
+  if (now - GQ.holdFrom > 250) { GQ.forced++; GQ.heldMs += now - GQ.holdFrom; GQ.holdFrom = 0; return true; }
+  return false;
 }
 
 // ---- PRESENTATION BY BITMAP: EVERY DRAWN FIELD REACHES THE PAGE ------------------------
@@ -570,10 +629,13 @@ function roomDueAt(R) {
 function roomFeedBody(src) {
   var R = RM.R; if (!R || !R.LS.armed || !R.lsDriveOk(src === 'raf' ? 'raf' : 'timer')) return;
   // THE COMMIT YIELD (above): a due frame yields once to an unpushed picture's commit.
+  // THE GPU QUEUE GUARD (above): a due frame waits while the GPU is GQ.max fields behind;
+  // the 4 ms feed timer and rAF retry it
+  if (R.LS.running && performance.now() >= roomDueAt(R) && !gqReady()) return;
   if (R.LS.running && performance.now() >= roomDueAt(R) && !cbMayDraw(src === 'raf' ? 'raf' : 'task')) return;
   var f0 = R.LS.frame;
   try { R.lsFeed(); } catch (e) { log('[lockstep] feed threw: ' + ((e && e.stack) || e)); }
-  if (R.LS.frame !== f0) { CLK.frame = R.LS.frame; cbDidDraw(src === 'raf' ? 'raf' : 'task'); pbPresent(); }
+  if (R.LS.frame !== f0) { CLK.frame = R.LS.frame; cbDidDraw(src === 'raf' ? 'raf' : 'task'); pbPresent(); gqAfterField(); }
   var now = performance.now();
   if (now - RM.mirT > 100) roomMirror(true);
   if (now - RM.pubT > 400) { RM.pubT = now; if (R.LS.running) R.publishSelf(RM.rtt); }
@@ -634,7 +696,8 @@ function dbgInstall(search) {
   if (new URLSearchParams(search || '').get('costdbg') !== '1') return;
   var B = ['jit', 'shader', 'prog', 'read', 'gbsd', 'tex', 'buf', 'sync'];
   DBG = { b: {}, n: {}, frames: 0, over: 0, overMs: 0, overB: {}, overCore: 0, max: [], tasks: { n: 0, over: 0, max: [] },
-          hist: [0, 0, 0, 0, 0, 0], depth: 0, mir: { n: 0, ms: 0, max: 0 } };
+          hist: [0, 0, 0, 0, 0, 0], depth: 0, mir: { n: 0, ms: 0, max: 0 },
+          ring: new Float32Array(4096), ringN: 0 };   // every field's wall ms: mean / p99 / max per report
   B.forEach(function (k) { DBG.b[k] = 0; DBG.n[k] = 0; DBG.overB[k] = 0; });
   var now = function () { return performance.now(); };
   function wrap(obj, name, bucket) {
@@ -668,6 +731,8 @@ function dbgInstall(search) {
       try { return rf.apply(this, arguments); } finally {
         var dt = now() - t0, per = CLK.viHz > 0 ? 1000 / CLK.viHz : 16.7;
         DBG.frames++;
+        DBG.ring[DBG.ringN++ & 4095] = dt;
+        if (self.__rigFields) self.__rigFields.push(CLK.frame, dt);
         DBG.hist[dt < per ? 0 : dt < 2 * per ? 1 : dt < 50 ? 2 : dt < 100 ? 3 : dt < 300 ? 4 : 5]++;
         if (dt > per) {
           var rec = { f: CLK.frame, ms: +dt.toFixed(1), at: Math.round(t0) }, acc = 0;
@@ -694,16 +759,37 @@ function dbgInstall(search) {
       }
     };
   };
+  // the distribution of the last n fields (n <= 4096): mean, p50, p99, max
+  DBG.dist = function (n) {
+    n = Math.min(n || 4096, DBG.ringN, 4096);
+    if (!n) return null;
+    var a = new Float32Array(n), sum = 0;
+    for (var i = 0; i < n; i++) { a[i] = DBG.ring[(DBG.ringN - 1 - i) & 4095]; sum += a[i]; }
+    a.sort();
+    return { n: n, mean: +(sum / n).toFixed(2), p50: +a[n >> 1].toFixed(2), p99: +a[Math.min(n - 1, Math.floor(n * 0.99))].toFixed(2), max: +a[n - 1].toFixed(1) };
+  };
   DBG.report = function () {
-    var r = { rect: DBG.rect, frames: DBG.frames, over: DBG.over, overMs: Math.round(DBG.overMs), overCoreMs: Math.round(DBG.overCore), hist: DBG.hist.slice(),
+    var r = { rect: DBG.rect, frames: DBG.frames, dist: DBG.lastDist || null, over: DBG.over, overMs: Math.round(DBG.overMs), overCoreMs: Math.round(DBG.overCore), hist: DBG.hist.slice(),
               all: {}, inOver: {}, max: DBG.max.slice(0, 12), mirror: { n: DBG.mir.n, ms: Math.round(DBG.mir.ms), max: +DBG.mir.max.toFixed(1) }, tasks: { n: DBG.tasks.n, over: DBG.tasks.over, max: DBG.tasks.max.slice(0, 12) } };
     for (var k in DBG.b) { r.all[k] = [Math.round(DBG.b[k]), DBG.n[k]]; r.inOver[k] = Math.round(DBG.overB[k]); }
     return r;
   };
   // Every 10 s, one line into the page's log — what a player on a real phone can copy out.
+  var lastN = 0;
   setInterval(function () {
     if (!DBG.frames) return;
-    var r = DBG.report(), b = [];
+    var d = DBG.dist(DBG.ringN - lastN), b = [], x = [];
+    DBG.lastDist = d;              // what the page's stats (every 100 ms) carry: sorted once per 10 s
+    lastN = DBG.ringN;
+    var r = DBG.report();
+    // what the frame-cost levers did (lazy framebuffer copy, off-thread JIT, shader prewarm)
+    try {
+      if (M && M._neil_lfb_stats) { var lp = M._malloc(32); M._neil_lfb_stats(lp); var L = M.HEAPU32.subarray(lp >> 2, (lp >> 2) + 8); x.push('fb copies queued ' + L[0] + ' made ' + L[1] + ' skipped ' + L[2]); M._free(lp); }
+      if (self.bementalMips && self.bementalMips.async) { var A = self.bementalMips.async; x.push('jit off-thread ' + (A.on ? 'on' : 'off') + ' ' + A.installed + '/' + A.offered + ' installed'); }
+      x.push('gpu queue guard ' + (GQ.on ? 'held ' + GQ.held + 'x ' + Math.round(GQ.heldMs) + ' ms, forced ' + GQ.forced + ', ' + GQ.fences.length + ' outstanding' : 'off'));
+      if (M && M._neil_shader_stats) { var sp = M._malloc(16); M._neil_shader_stats(sp); var Q = M.HEAP32.subarray(sp >> 2, (sp >> 2) + 4); x.push('shaders prewarmed ' + Q[0] + ' used ' + Q[1] + ' compiled ' + Q[2]); M._free(sp); }
+    } catch (e) {}
+    if (d) log('[costdbg] last ' + d.n + ' fields: mean ' + d.mean + ' ms, p50 ' + d.p50 + ', p99 ' + d.p99 + ', max ' + d.max + ' (period ' + (CLK.viHz > 0 ? (1000 / CLK.viHz).toFixed(1) : '?') + ' ms). ' + x.join('; '));
     for (var k in r.inOver) if (r.inOver[k] >= 1) b.push(k + ' ' + r.inOver[k]);
     log('[costdbg] fields ' + r.frames + ', over a period ' + r.over + ' (' + r.overMs + ' ms; <P/<2P/<50/<100/<300/300+ ms: '
         + r.hist.join('/') + '); inside them: ' + b.join(', ') + ', core ' + r.overCoreMs + ' ms. worst: '
@@ -713,9 +799,85 @@ function dbgInstall(search) {
   log('[costdbg] per-field cost buckets ON (?costdbg=1) — a measurement arm; it wraps GL calls and the JIT up-call');
 }
 
+// ---- SHADER PREWARM LIST (glitch64_combiner.c SHADER PREWARM) ------------------------------
+// Every fragment source glide made a program from in this session is stored per ROM in the
+// same IndexedDB as the saves (key '<rom>.glsl'), merged with the list shipped for the title
+// (dist/shaders/<internal name>.glsl, when there is one); the next boot writes the union to
+// /n64_shaders.bin before main() and glide compiles and links all of them ahead, with no
+// query, so a display list never waits for a compile it has seen before. Pixels are
+// unchanged by construction: a program is adopted only for the identical source text.
+// ?shaderwarm=0 is the A/B arm and kill switch (nothing loaded, nothing stored).
+var SHD = { boot: null, saved: 0, off: false, n: 0 };
+function shdSplit(u8) {
+  var out = [], i0 = 0;
+  if (!u8) return out;
+  for (var i = 0; i < u8.length; i++) if (u8[i] === 0) { if (i > i0) out.push(u8.subarray(i0, i)); i0 = i + 1; }
+  return out;
+}
+function shdLoad(d) {
+  SHD.off = new URLSearchParams(d.search || '').get('shaderwarm') === '0';
+  if (SHD.off) return Promise.resolve(null);
+  var name = (self.__fbAsync && self.__fbAsync.romName) || '';
+  var mine = idbGet(d.romName + '.glsl').catch(function () { return null; });
+  var shipped = name ? fetch('shaders/' + encodeURIComponent(name.replace(/[^A-Za-z0-9 _-]/g, '_')) + '.glsl?v=' + (d.v || ''))
+    .then(function (r) { return r.ok ? r.arrayBuffer() : null; }).catch(function () { return null; }) : Promise.resolve(null);
+  return Promise.all([mine, shipped]).then(function (a) {
+    var out = shdMerge([a[0] && new Uint8Array(a[0].buffer ? a[0].buffer.slice(a[0].byteOffset, a[0].byteOffset + a[0].byteLength) : a[0]),
+                        a[1] && new Uint8Array(a[1])]);
+    SHD.n = out ? shdSplit(out).length : 0;
+    SHD.saved = a[0] ? a[0].byteLength : 0;
+    if (out) log('[shader] prewarm list: ' + SHD.n + ' programs (' + (a[0] ? 'stored' : 'none stored') + (a[1] ? ' + shipped' : '') + ')');
+    return out;
+  }).catch(function () { return null; });
+}
+// Union of lists of NUL-terminated sources; a text listed k times stands for k programs (two
+// combiner keys can build one text), so each text appears max(k) times in the result.
+function shdMerge(lists) {
+  var td = new TextDecoder(), cnt = new Map(), bytes = new Map(), order = [];
+  lists.forEach(function (u8) {
+    if (!u8) return;
+    var here = new Map();
+    shdSplit(u8).forEach(function (p) {
+      var k = td.decode(p);
+      here.set(k, (here.get(k) || 0) + 1);
+      if (!bytes.has(k)) { bytes.set(k, p); order.push(k); }
+    });
+    here.forEach(function (n, k) { if (n > (cnt.get(k) || 0)) cnt.set(k, n); });
+  });
+  var total = 0;
+  order.forEach(function (k) { total += (bytes.get(k).length + 1) * cnt.get(k); });
+  if (!total) return null;
+  var out = new Uint8Array(total), o = 0;
+  order.forEach(function (k) { for (var n = cnt.get(k); n > 0; n--) { out.set(bytes.get(k), o); o += bytes.get(k).length + 1; } });
+  return out;
+}
+function shdSave() {
+  if (SHD.off || !M || typeof M._neil_shader_dump !== 'function' || !BOOT) return;
+  var n = M._neil_shader_dump(0, 0) | 0;
+  if (n <= 0) return;
+  // the stored list is the union of what this session used and what was stored before
+  var ptr = M._malloc(n);
+  if (!ptr) return;
+  try {
+    M._neil_shader_dump(ptr, n);
+    var merged = shdMerge([M.HEAPU8.slice(ptr, ptr + n), SHD.boot]);
+    if (!merged || merged.length <= SHD.saved) return;
+    SHD.saved = merged.length;
+    idbPut(BOOT.romName + '.glsl', merged).catch(function () {});
+  } finally { M._free(ptr); }
+}
+
 // ---- boot --------------------------------------------------------------------------------
 function boot(d) {
   BOOT = d;
+  // ?workerrig=clock: the rig seam (eval) with the frame clock RUNNING as shipped — a
+  // measurement of what a player gets, driven by a pad function (applyPads)
+  BOOT.rigClock = new URLSearchParams(d.search || '').get('workerrig') === 'clock';
+  (function () {
+    var gq = new URLSearchParams(d.search || '').get('gpuq');
+    if (gq === '0') { GQ.on = false; log('[gpuq] CONTROL ARM (?gpuq=0): no GPU queue guard'); }
+    else if (gq && +gq > 0) GQ.max = Math.min(16, +gq | 0);
+  })();
   CORE_V = d.v || '';
   CLK.viHz = d.viHz > 0 ? d.viHz : 0;
   // BOOT PREFLIGHT, so a browser that cannot do this fails HERE — before the 512 MB heap,
@@ -755,10 +917,11 @@ function boot(d) {
     self.__fbDecide(rom);
     log('[fb] ' + (self.__fbAsync.romName || '?') + ': readback ' + (self.__fbAsync.on ? 'ASYNC' : 'sync') + ' — ' + self.__fbAsync.decided + ' (core worker)');
   } catch (e) { log('[fb] readback decision failed: ' + e); }
+  var shaderList = shdLoad(d);
   fetch('assets.zip').then(function (r) {
     if (!r.ok) throw new Error('assets.zip HTTP ' + r.status);
     return r.arrayBuffer();
-  }).then(function (assets) {
+  }).then(function (assets) { return shaderList.then(function (sl) { SHD.boot = sl; return assets; }); }).then(function (assets) {
     self.Module = {
       canvas: d.canvas,
       print: function (s) {
@@ -779,6 +942,7 @@ function boot(d) {
           var files = d.files || {};
           for (var name in files) M.FS.writeFile(name, files[name]);
           M.FS.writeFile('custom.v64', rom);
+          if (SHD.boot && SHD.boot.length) M.FS.writeFile('/n64_shaders.bin', SHD.boot);   // glide prewarms these (glitch64_combiner.c)
           // THE FRAME GATE, before main(): see THE FRAME CLOCK in the header. In a room the
           // room driver arms it (room_core.js lsArmBeforeBoot: the gate, every-frame
           // fingerprints, the latched start frame) — the same call, at the same point, as
@@ -806,6 +970,7 @@ function boot(d) {
           if (CB.mode === 'commit') log('[present] core worker: CONTROL ARM (?present=commit) — no commit yield');
           observePresents();
           setInterval(postStats, 100);
+          setInterval(shdSave, 15000);
           if (roomArmed) roomMainRan();
           else if (!d.rig) schedule();
           else log('[worker] rig mode: the frame clock is NOT running; frames advance only on request');
@@ -845,7 +1010,7 @@ function onMsg(e) {
       }, function (err) { post({ t: 'toast', s: 'Load failed: ' + err, bad: true }); });
       break;
     case 'eval':
-      if (!BOOT || !BOOT.rig) { post({ t: 'evalr', id: d.id, e: 'eval is available only with ?workerrig=1' }); break; }
+      if (!BOOT || !(BOOT.rig || BOOT.rigClock)) { post({ t: 'evalr', id: d.id, e: 'eval is available only with ?workerrig=1 or ?workerrig=clock' }); break; }
       try {
         var v = (0, eval)(d.src);
         Promise.resolve(v).then(function (r) { post({ t: 'evalr', id: d.id, v: r }); },

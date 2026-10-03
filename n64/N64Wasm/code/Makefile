@@ -10,10 +10,12 @@ CFILES := src/glide2gl/src/Glide64/Combine.c \
     src/glide2gl/src/Glide64/Glide64_UCode.c \
     src/glide2gl/src/Glide64/glide64_util.c \
     src/glide2gl/src/Glide64/glidemain.c \
+    src/glide2gl/src/Glide64/lazy_fb.c \
     src/glide2gl/src/Glide64/MiClWr.c \
     src/glide2gl/src/Glide64/TexCache.c \
     src/glide2gl/src/Glide64/TexLoad.c \
     src/glide2gl/src/Glitch64/geometry.c \
+    src/glide2gl/src/Glitch64/gl_shadow.c \
     src/glide2gl/src/Glitch64/glitch64_combiner.c \
     src/glide2gl/src/Glitch64/glitch64_textures.c \
     src/glide2gl/src/Glitch64/glitchmain.c \
@@ -221,6 +223,9 @@ n64wasm.js: $(FILES)
     '_neil_state_size','_neil_state_save_raw','_neil_state_save_raw_fast','_neil_state_load_raw', \
     '_neil_state_last_load_mode','_neil_state_last_load_pages','_neil_state_m64p_region', \
     '_neil_set_native_fbread','_neil_native_fbread_failed','_neil_set_vbo_mode', \
+    '_neil_set_gl_shadow','_neil_gl_shadow_sent','_neil_gl_shadow_dropped','_neil_set_gl_merge', \
+    '_neil_lfb_snapshot','_neil_lfb_restore','_neil_lfb_release','_neil_lfb_flush','_neil_lfb_stats','_neil_lfb_pending', \
+    '_neil_shader_dump','_neil_shader_stats', \
     '_malloc','_free']" \
 	-s INVOKE_RUN=0 \
     && sed -i "s/locateFile(\"n64wasm.wasm\")/locateFile(\"n64wasm.wasm?v=$$(md5sum n64wasm.wasm | cut -c1-8)\")/" n64wasm.js \

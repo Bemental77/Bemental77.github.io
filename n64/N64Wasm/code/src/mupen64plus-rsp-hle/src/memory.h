@@ -30,6 +30,7 @@
 #include <retro_inline.h>
 
 #include "hle_internal.h"
+#include "../../mupen64plus-core/src/main/lfb_hook.h"   /* glide's lazy framebuffer copy */
 
 #ifdef MSB_FIRST
 #define S 0
@@ -90,17 +91,19 @@ void store_u32(unsigned char* buffer, unsigned address, const uint32_t* src, siz
 #define dmem_store_u16(hle, src, address, count) store_u16((hle)->dmem, (address) & 0xfff, (src), (count))
 #define dmem_store_u32(hle, src, address, count) store_u32((hle)->dmem, (address) & 0xfff, (src), (count))
 
-/* convenient functions DRAM access */
-#define dram_u8(hle, address)    (u8((hle)->dram, (address) & 0xffffff))
-#define dram_u16(hle, address)   (u16((hle)->dram, (address) & 0xffffff))
-#define dram_u32(hle, address)   (u32((hle)->dram, (address) & 0xffffff))
+/* convenient functions DRAM access. Each one first makes the bytes it covers
+ * current: glide's lazy framebuffer copy may still owe them
+ * (mupen64plus-core/src/main/lfb_hook.h). */
+#define dram_u8(hle, address)    (lfb_touch_e((address), 1), u8((hle)->dram, (address) & 0xffffff))
+#define dram_u16(hle, address)   (lfb_touch_e((address), 2), u16((hle)->dram, (address) & 0xffffff))
+#define dram_u32(hle, address)   (lfb_touch_e((address), 4), u32((hle)->dram, (address) & 0xffffff))
 
-#define dram_load_u8(hle, dst, address, count)   load_u8((dst), (hle)->dram, (address) & 0xffffff, (count))
-#define dram_load_u16(hle, dst, address, count)  load_u16((dst), (hle)->dram, (address) & 0xffffff, (count))
-#define dram_load_u32(hle, dst, address, count)  load_u32((dst), (hle)->dram, (address) & 0xffffff, (count))
-#define dram_store_u8(hle, src, address, count)  store_u8((hle)->dram,  (address) & 0xffffff, (src), (count))
-#define dram_store_u16(hle, src, address, count) store_u16((hle)->dram, (address) & 0xffffff, (src), (count))
-#define dram_store_u32(hle, src, address, count) store_u32((hle)->dram, (address) & 0xffffff, (src), (count))
+#define dram_load_u8(hle, dst, address, count)   (lfb_touch_e((address), (uint32_t)(count)), load_u8((dst), (hle)->dram, (address) & 0xffffff, (count)))
+#define dram_load_u16(hle, dst, address, count)  (lfb_touch_e((address), 2u * (uint32_t)(count)), load_u16((dst), (hle)->dram, (address) & 0xffffff, (count)))
+#define dram_load_u32(hle, dst, address, count)  (lfb_touch_e((address), 4u * (uint32_t)(count)), load_u32((dst), (hle)->dram, (address) & 0xffffff, (count)))
+#define dram_store_u8(hle, src, address, count)  (lfb_touch_e((address), (uint32_t)(count)), store_u8((hle)->dram,  (address) & 0xffffff, (src), (count)))
+#define dram_store_u16(hle, src, address, count) (lfb_touch_e((address), 2u * (uint32_t)(count)), store_u16((hle)->dram, (address) & 0xffffff, (src), (count)))
+#define dram_store_u32(hle, src, address, count) (lfb_touch_e((address), 4u * (uint32_t)(count)), store_u32((hle)->dram, (address) & 0xffffff, (src), (count)))
 
 #endif
 

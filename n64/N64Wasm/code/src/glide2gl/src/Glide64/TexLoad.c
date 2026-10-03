@@ -7,6 +7,7 @@
 
 #include "../../Graphics/RDP/gDP_state.h"
 #include "../../Graphics/image_convert.h"
+#include "lazy_fb.h"
 
 #define ALOWORD(x)   (*((uint16_t*)&x))   // low word
 
@@ -649,7 +650,9 @@ static uint32_t Load16bYUV(uintptr_t dst, uintptr_t src,
                            int wid_64, int height, int line, int real_width, int tile)
 {
     uint16_t i;
-    uint32_t *mb =(uint32_t*)(gfx_info.RDRAM+rdp.addr[g_gdp.tile[tile].tmem]); //pointer to the macro block
+    uint32_t *mb;
+    lfb_materialize_all();
+    mb =(uint32_t*)(gfx_info.RDRAM+rdp.addr[g_gdp.tile[tile].tmem]); //pointer to the macro block
     uint16_t *tex =(uint16_t*)dst;
 
     for (i = 0; i < 128; i++)

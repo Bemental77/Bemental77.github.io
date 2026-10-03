@@ -82,6 +82,7 @@
 #include "r4300/interrupt.h"
 #include "pi/pi_controller.h"
 #include "libretro_memory.h"
+#include "../mupen64plus-core/src/main/lfb_hook.h"
 
 /* savestates.c */
 extern size_t savestates_m64p_last_len;
@@ -393,6 +394,11 @@ int neil_state_load_raw(const unsigned char* src)
       savestates_keep_code_cache = 0;
    }
    savestates_skip_tlb_luts = lut_same;
+
+   /* RDRAM is replaced: glide's queued framebuffer copies belong to the old
+    * one. A rollback puts back the snapshot's own queue (fbasync.js restore ->
+    * neil_lfb_restore) right after this returns. */
+   lfb_drop_all();
 
    /* jump_to_func() is a no-op while skip_jump is set; the loader's jump to
     * the saved PC must land, and the saved value is restored below. */

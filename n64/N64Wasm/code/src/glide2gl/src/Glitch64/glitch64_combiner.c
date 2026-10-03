@@ -32,6 +32,10 @@
 #include "../../libretro/libretro_private.h"
 
 #include "../../Graphics/RDP/RDP_state.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+#include <stdio.h>
 
 float glide64_pow(float a, float b);
 
@@ -423,7 +427,7 @@ void check_compile(GLuint shader)
    }
 }
 
-void check_link(GLuint program)
+int check_link(GLuint program)
 {
    GLint success;
    glGetProgramiv(program,GL_LINK_STATUS,&success);
@@ -435,6 +439,7 @@ void check_link(GLuint program)
       if (log_cb)
          log_cb(RETRO_LOG_ERROR, log);
    }
+   return success ? 1 : 0;
 }
 
 static void append_shader_program(shader_program_key *shader)
@@ -506,13 +511,182 @@ static void shader_find_uniforms(shader_program_key *shader)
    shader->alphaRef_location       = glGetUniformLocation(prog, "alphaRef");
 }
 
+/* ---- SHADER PREWARM (2026-10-03) ----
+ * A combiner glide has not seen before costs a fragment shader compile and a
+ * program link right there, in the middle of the display list, and the next
+ * GL query (the link status, the uniform locations) waits for both: 50-130 ms
+ * in one field on the user's phone (?costdbg=1, Mali-G715), 14 ms here under
+ * SwiftShader, a scene change asking for several at once.
+ * So every fragment source a program of this session is made from is kept
+ * (neil_shader_dump: the page's worker stores them per ROM in IndexedDB), and
+ * the next boot hands them back as /n64_shaders.bin before main(): right after
+ * init_combiner they are all compiled and linked with NO query (with
+ * KHR_parallel_shader_compile, off the GL thread), so by the time a display
+ * list asks for one, the program is ready. A program is ADOPTED only when the
+ * source glide has just built for it is byte-for-byte a prewarmed one — the
+ * same text, the same vertex shader, the same attribute bindings — so every
+ * draw uses exactly the program it would have compiled itself, and every pixel
+ * (and every byte a readback puts in RDRAM) is what it was. A boot without the
+ * file compiles as before. */
+typedef struct { char *src; uint32_t h; GLuint prog; int used; } warm_prog_t;
+static warm_prog_t *warm_progs;
+static int warm_n, warm_cap, warm_adopted, sess_compiled;
+static char **sess_src;
+static uint32_t *sess_h;
+static int *sess_k;            /* programs made from it (two combiner keys can build one text) */
+static int sess_n, sess_cap;
+
+static uint32_t src_hash(const char *s)
+{
+   uint32_t h = 2166136261u;
+   while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+   return h;
+}
+
+/* every source a program of this session was made from, with how many programs */
+static void sess_note(const char *src)
+{
+   int i;
+   uint32_t h = src_hash(src);
+   for (i = 0; i < sess_n; i++)
+      if (sess_h[i] == h && !strcmp(sess_src[i], src))
+      {
+         sess_k[i]++;
+         return;
+      }
+   if (sess_n == sess_cap)
+   {
+      int nc = sess_cap ? sess_cap * 2 : 64;
+      char **a = (char**)realloc(sess_src, sizeof(char*) * nc);
+      uint32_t *b;
+      int *c;
+      if (!a) return;
+      sess_src = a;
+      b = (uint32_t*)realloc(sess_h, sizeof(uint32_t) * nc);
+      if (!b) return;
+      sess_h = b;
+      c = (int*)realloc(sess_k, sizeof(int) * nc);
+      if (!c) return;
+      sess_k = c;
+      sess_cap = nc;
+   }
+   sess_src[sess_n] = strdup(src);
+   if (!sess_src[sess_n]) return;
+   sess_k[sess_n] = 1;
+   sess_h[sess_n++] = h;
+}
+
+/* bytes the session's sources need as NUL-terminated strings, each repeated
+ * once per program made from it; written to dst when cap is enough. The
+ * page's worker stores them (core_worker.js). */
+int neil_shader_dump(char *dst, int cap)
+{
+   int i, k, total = 0;
+   for (i = 0; i < sess_n; i++) total += ((int)strlen(sess_src[i]) + 1) * sess_k[i];
+   if (dst && cap >= total)
+   {
+      char *o = dst;
+      for (i = 0; i < sess_n; i++)
+         for (k = 0; k < sess_k[i]; k++) { size_t l = strlen(sess_src[i]) + 1; memcpy(o, sess_src[i], l); o += l; }
+   }
+   return total;
+}
+
+/* [prewarmed, adopted, compiled here, sources noted] */
+void neil_shader_stats(int *out)
+{
+   out[0] = warm_n; out[1] = warm_adopted; out[2] = sess_compiled; out[3] = sess_n;
+}
+
+static void shader_prewarm(void)
+{
+   FILE *f;
+   long n;
+   char *buf, *q, *end;
+   int i;
+
+   for (i = 0; i < warm_n; i++) free(warm_progs[i].src);   /* a new context: the old objects are gone */
+   warm_n = 0;
+   f = fopen("/n64_shaders.bin", "rb");
+   if (!f)
+      return;
+   fseek(f, 0, SEEK_END);
+   n = ftell(f);
+   fseek(f, 0, SEEK_SET);
+   if (n <= 0 || n > (8 << 20)) { fclose(f); return; }
+   buf = (char*)malloc((size_t)n + 1);
+   if (!buf) { fclose(f); return; }
+   if (fread(buf, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(buf); return; }
+   fclose(f);
+   buf[n] = 0;
+#ifdef __EMSCRIPTEN__
+   EM_ASM({ try { if (typeof GLctx !== 'undefined' && GLctx) GLctx.getExtension('KHR_parallel_shader_compile'); } catch (e) {} });
+#endif
+   for (q = buf, end = buf + n; q < end; q += strlen(q) + 1)
+   {
+      size_t l = strlen(q);
+      GLuint frag, prog;
+      if (l == 0 || l > 8000 || strncmp(q, fragment_shader_header, strlen(fragment_shader_header)))
+         continue;                      /* not a source this build would make */
+      if (warm_n == warm_cap)
+      {
+         int nc = warm_cap ? warm_cap * 2 : 64;
+         warm_prog_t *a = (warm_prog_t*)realloc(warm_progs, sizeof(*a) * nc);
+         if (!a) break;
+         warm_progs = a; warm_cap = nc;
+      }
+      frag = glCreateShader(GL_FRAGMENT_SHADER);
+      glShaderSource(frag, 1, (const GLchar**)&q, NULL);
+      glCompileShader(frag);
+      prog = glCreateProgram();
+      glAttachShader(prog, vertex_shader_object);
+      glAttachShader(prog, frag);
+      glBindAttribLocation(prog, POSITION_ATTR,   "aPosition");
+      glBindAttribLocation(prog, COLOUR_ATTR,     "aColor");
+      glBindAttribLocation(prog, TEXCOORD_0_ATTR, "aMultiTexCoord0");
+      glBindAttribLocation(prog, TEXCOORD_1_ATTR, "aMultiTexCoord1");
+      glBindAttribLocation(prog, FOG_ATTR,        "aFog");
+      glLinkProgram(prog);              /* nothing is asked of it until it is adopted */
+      warm_progs[warm_n].src  = strdup(q);
+      warm_progs[warm_n].h    = src_hash(q);
+      warm_progs[warm_n].prog = prog;
+      warm_progs[warm_n].used = 0;
+      if (warm_progs[warm_n].src) warm_n++;
+   }
+   free(buf);
+   printf("[shader] prewarm: %d programs compiled ahead (/n64_shaders.bin)\n", warm_n);
+}
+
+/* the program glide is about to compile from fragment_shader, if it was prewarmed */
+static int warm_adopt(shader_program_key *shader)
+{
+   int i;
+   uint32_t h;
+   if (!warm_n)
+      return 0;
+   h = src_hash(fragment_shader);
+   for (i = 0; i < warm_n; i++)
+   {
+      if (warm_progs[i].used || warm_progs[i].h != h || strcmp(warm_progs[i].src, fragment_shader))
+         continue;
+      warm_progs[i].used = 1;
+      shader->program_object = warm_progs[i].prog;
+      check_link(shader->program_object);
+      glUseProgram(shader->program_object);
+      shader_find_uniforms(shader);
+      append_shader_program(shader);
+      warm_adopted++;
+      return 1;
+   }
+   return 0;
+}
+
 static void finish_shader_program_setup(shader_program_key *shader)
 {
    GLuint fragshader = glCreateShader(GL_FRAGMENT_SHADER);
 
    glShaderSource(fragshader, 1, (const GLchar**)&fragment_shader, NULL);
    glCompileShader(fragshader);
-   check_compile(fragshader);
 
    shader->program_object = glCreateProgram();
    glAttachShader(shader->program_object, vertex_shader_object);
@@ -521,7 +695,10 @@ static void finish_shader_program_setup(shader_program_key *shader)
    shader_bind_attributes(shader);
 
    glLinkProgram(shader->program_object);
-   check_link(shader->program_object);
+   /* one wait for compile + link (asking for the compile status first made it two) */
+   if (!check_link(shader->program_object))
+      check_compile(fragshader);
+   sess_compiled++;
    glUseProgram(shader->program_object);
 
    shader_find_uniforms(shader);
@@ -574,6 +751,8 @@ void init_combiner(void)
    fog_enabled = 0;
    chroma_enabled = 0;
    dither_enabled = 0;
+
+   shader_prewarm();
 }
 
 static void compile_chroma_shader(void)
@@ -739,7 +918,9 @@ void compile_shader(void)
 
    strcat(fragment_shader, fragment_shader_end);
 
-   finish_shader_program_setup(&shader);
+   sess_note(fragment_shader);
+   if (!warm_adopt(&shader))
+      finish_shader_program_setup(&shader);
 
    update_uniforms(&shader);
 }

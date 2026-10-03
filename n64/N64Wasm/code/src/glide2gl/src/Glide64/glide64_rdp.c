@@ -56,6 +56,7 @@
 #include "../../Graphics/RDP/RDP_state.h"
 #include "../../Graphics/RDP/gDP_state.h"
 #include "../../Graphics/RSP/RSP_state.h"
+#include "lazy_fb.h"
 
 /* angrylion's macro, helps to cut overflowed values. */
 #define SIGN16(x) (int16_t)(x)
@@ -468,7 +469,11 @@ void glide64ProcessDList(void)
   if(settings.hacks & hack_OOT && !frame_dupe)
     copyWhiteToRDRAM(); /* Subscreen delay fix */
   else if (settings.frame_buffer & fb_ref)
+  {
+    lfb_ref_call = 1;          /* this copy may be made lazily (lazy_fb.c) */
     CopyFrameBuffer (GR_BUFFER_BACKBUFFER);
+    lfb_ref_call = 0;
+  }
 
   if ((settings.hacks&hack_TGR2) && rdp.vi_org_reg != *gfx_info.VI_ORIGIN_REG && CI_SET)
   {
@@ -480,6 +485,7 @@ void glide64ProcessDList(void)
 static void colorimage_yoshis_story_memrect(uint16_t ul_x, uint16_t ul_y, 
       uint16_t lr_x, uint16_t lr_y, uint16_t tileno)
 {
+   lfb_materialize_all();   /* reads/writes the colour image in RDRAM */
   uint32_t y;
   uint32_t off_x     = ((__RDP.w2 & 0xFFFF0000) >> 16) >> 5;
   uint32_t off_y     = ((__RDP.w2 & 0x0000FFFF) >> 5);
@@ -501,6 +507,7 @@ static void colorimage_yoshis_story_memrect(uint16_t ul_x, uint16_t ul_y,
 
 static void colorimage_palette_modification(void)
 {
+   lfb_materialize_all();   /* reads/writes the colour image in RDRAM */
    unsigned i;
 
    uint8_t envr        = (uint8_t)(g_gdp.env_color.r * 0.0039215689f * 31.0f);
@@ -519,6 +526,7 @@ static void colorimage_palette_modification(void)
 
 static void colorimage_zbuffer_copy(uint32_t w0, uint32_t w1)
 {
+   lfb_materialize_all();   /* reads/writes the colour image in RDRAM */
    unsigned x;
    uint16_t      ul_x = (uint16_t)((w1 & 0x00FFF000) >> 14);
    uint16_t      lr_x = (uint16_t)((w0 & 0x00FFF000) >> 14) + 1;
@@ -1125,6 +1133,7 @@ void load_palette (uint32_t addr, uint16_t start, uint16_t count)
    uint16_t *dpal = (uint16_t*)(rdp.pal_8 + start);
    uint16_t end   = start+count;
 
+   LFB_TOUCH(addr, (uint32_t)count * 2 + 4);
    for (i=start; i<end; i++)
    {
       *(dpal++) = *(uint16_t *)(gfx_info.RDRAM + (addr^2));
@@ -1259,7 +1268,9 @@ static void rdp_settextureimage(uint32_t w0, uint32_t w1)
    {
       if (g_gdp.ti_format == G_IM_FMT_RGBA)
       {
-         uint16_t * t               = (uint16_t*)(gfx_info.RDRAM + gSP.DMAOffsets.tex_offset);
+         uint16_t * t;
+         lfb_materialize_all();
+         t                          = (uint16_t*)(gfx_info.RDRAM + gSP.DMAOffsets.tex_offset);
          gSP.DMAOffsets.tex_shift   = t[gSP.DMAOffsets.tex_count ^ 1];
          g_gdp.ti_address          += gSP.DMAOffsets.tex_shift;
       }

@@ -30,6 +30,7 @@
 #include "../ri/ri_controller.h"
 
 #include <string.h>
+#include "main/lfb_hook.h"   /* glide's lazy framebuffer copy: LFB_TOUCH before RDRAM is used */
 
 enum
 {
@@ -42,6 +43,7 @@ enum
 
 static void dma_si_write(struct si_controller* si)
 {
+   LFB_TOUCH(si->regs[SI_DRAM_ADDR_REG], PIF_RAM_SIZE + 8);
    int i;
 
    if (si->regs[SI_PIF_ADDR_WR64B_REG] != 0x1FC007C0)
@@ -70,6 +72,7 @@ static void dma_si_write(struct si_controller* si)
 
 static void dma_si_read(struct si_controller* si)
 {
+   LFB_TOUCH(si->regs[SI_DRAM_ADDR_REG], PIF_RAM_SIZE + 8);
    int i;
 
    if (si->regs[SI_PIF_ADDR_RD64B_REG] != 0x1FC007C0)

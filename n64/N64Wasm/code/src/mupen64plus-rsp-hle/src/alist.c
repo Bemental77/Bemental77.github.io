@@ -32,6 +32,7 @@
 #include "hle_external.h"
 #include "hle_internal.h"
 #include "memory.h"
+#include "../../mupen64plus-core/src/main/lfb_hook.h"   /* glide's lazy framebuffer copy */
 
 struct ramp_t
 {
@@ -134,6 +135,7 @@ void alist_load(struct hle_t* hle, uint16_t dmem, uint32_t address, uint16_t cou
     dmem    &= ~3;
     address &= ~7;
     count = align(count, 8);
+    LFB_TOUCH(address, count);
     memcpy(hle->alist_buffer + dmem, hle->dram + address, count);
 }
 
@@ -143,6 +145,7 @@ void alist_save(struct hle_t* hle, uint16_t dmem, uint32_t address, uint16_t cou
     dmem    &= ~3;
     address &= ~7;
     count = align(count, 8);
+    LFB_TOUCH(address, count);
     memcpy(hle->dram + address, hle->alist_buffer + dmem, count);
 }
 
@@ -259,6 +262,7 @@ void alist_envmix_exp(
     int16_t* const wr       = (int16_t*)(hle->alist_buffer + dmem_wr);
     uint32_t ptr            = 0;
     short *save_buffer      = (short*)((uint8_t*)hle->dram + address);
+    LFB_TOUCH(address, 0x80);   /* the envmixer's saved state (lazy framebuffer copy) */
 
     if (init)
     {
@@ -360,6 +364,7 @@ void alist_envmix_ge(
     int16_t* const wl       = (int16_t*)(hle->alist_buffer + dmem_wl);
     int16_t* const wr       = (int16_t*)(hle->alist_buffer + dmem_wr);
     short *save_buffer      = (short*)((uint8_t*)hle->dram + address);
+    LFB_TOUCH(address, 0x80);   /* the envmixer's saved state (lazy framebuffer copy) */
 
     if (init)
     {
@@ -432,6 +437,7 @@ void alist_envmix_lin(
     size_t k;
     struct ramp_t ramps[2];
     short *save_buffer = (short*)((uint8_t*)hle->dram + address);
+    LFB_TOUCH(address, 0x80);   /* the envmixer's saved state (lazy framebuffer copy) */
 
     const int16_t * const in = (int16_t*)(hle->alist_buffer + dmemi);
     int16_t* const dl = (int16_t*)(hle->alist_buffer + dmem_dl);
@@ -808,6 +814,10 @@ void alist_filter(
 
    int16_t* in1 = (int16_t*)(hle->dram + address);
    int16_t* in2 = (int16_t*)(hle->alist_buffer + dmem);
+
+   LFB_TOUCH(lut_address[0], 16);   /* lazy framebuffer copy: bytes read/written below */
+   LFB_TOUCH(lut_address[1], 16);
+   LFB_TOUCH(address, 16);
 
    for (x = 0; x < 8; ++x)
    {
