@@ -30,6 +30,7 @@
 //            | {cmd:'stateError', op, txt}
 
 let Module = null, viRetrace = 0;
+let buildMsg = null;
 // ---- THE TIMEBASE DURING A BUSY-WAIT ------------------------------------------------------
 // The guest clock is viRetrace * 675000 (675,000 ticks of the 40.5 MHz timebase = exactly 1/60 s),
 // so it moves only at a retrace. A guest that BUSY-WAITS on it — `while (OSGetTick() - t0 < n);`,
@@ -219,7 +220,7 @@ const log = (txt) => postMessage({ cmd: 'log', txt: '[recomp-worker] ' + txt });
 // VIWaitForRetrace, right after viRetrace++, so the sample count is a function of EMULATED
 // time alone (gate #9). The carry keeps 60 consecutive retraces at exactly AUDIO_RATE
 // samples (533,533,534,... ) instead of truncating 533.33 and drifting 20 samples/second flat.
-function pumpAudio() {
+function pumpAudio(quiet) {
   audioAcc += AUDIO_RATE;
   const n = (audioAcc / 60) | 0;
   audioAcc -= n * 60;
@@ -267,7 +268,9 @@ function pumpAudio() {
       if (audioPhase > 2 * Math.PI) audioPhase -= 2 * Math.PI;
     }
   }
-  if (!pcm) return;
+  // quiet: a re-simulated or hidden frame (THE ROLLBACK RING). The mixer above still ran — it is
+  // guest state — but its samples were already played once (or belong to a catch-up nobody hears).
+  if (!pcm || quiet) return;
   postMessage({ cmd: 'audio', buf: pcm.buffer, len: pcm.byteLength }, [pcm.buffer]);
 }
 
@@ -723,9 +726,10 @@ function applyPads() {
 
 // Mirror the game's own pad state (and any watched MEM1 windows) into the pace SAB. Called once
 // per frame, after the guest has run. Cheap: 176 B + up to 4×64 B of copying.
-function publishPeek() {
+function publishPeek(quiet) {
   if (!Module || !paceI32 || paceI32.length < PACE_I32_CELLS) return;
   const buf = Module.wasmMemory.buffer;
+  if (quiet) { if (Module.___recomp_pad_witness) Module.___recomp_pad_witness(); return; }
   if (Module.___recomp_pad_witness) {
     const at = Module.___recomp_pad_witness() >>> 0;      // fills the block, returns its address
     if (at && at + WIT_CELLS * 4 <= buf.byteLength)
@@ -799,6 +803,9 @@ function fpPageAddr(i) {
 
 function publishFingerprint(frame) {
   if (!Module || !paceI32 || paceI32.length <= FP_INJECT) return;
+  // A rollback-capable room fingerprints at the ring's frame boundary instead (rbFpStep): there a
+  // frame can be re-run, and only a CONFIRMED frame's hash may go to the room.
+  if (rbI32 && rbI32[RBC.FP_EVERY] > 0) { fpLive = false; return; }
   // Only a ROOM consumes it, and the page sets LS_ARMED before the first credit — so a room
   // sweeps from frame 1 and a solo game pays nothing for it.
   if (!Atomics.load(paceI32, LS_ARMED)) { fpLive = false; return; }
@@ -884,7 +891,9 @@ const MEM1_LO = 0x80000000, MEM1_HI = 0x81800000;
 // below MEM1, found by scanning (sbrk's pointer is not exported).
 function lowTopScan() {
   const zh = zeroHash();
-  for (let p = (MEM1_LO / HPAGE) - 1; p >= 0; p--)
+  // Below the rollback ring's logging region (rb_instrument.js RB.LO): its bitmap, log and undo
+  // slots are not guest state and differ between a console that rolled back and one that did not.
+  for (let p = (RB_LO / HPAGE) - 1; p >= 0; p--)
     if (stateHash(p * HPAGE, (p + 1) * HPAGE, 0) !== zh) return (p + 1) * HPAGE;
   return 0;
 }
@@ -908,6 +917,7 @@ function detFrame(frame) {
     if ((frame % det.pageEvery) === 0) {
       const pages = new Uint32Array(n);
       for (let p = 0; p < n; p++) {
+        if (p * HPAGE >= RB_LO && p * HPAGE < MEM1_LO) { pages[p] = 0; continue; }   // the rollback ring's region
         const h = stateHash(p * HPAGE, (p + 1) * HPAGE, 0);
         pages[p] = h === zeroHash() ? 0 : (h >>> 0) || 1;
       }
@@ -950,6 +960,7 @@ function detFrame(frame) {
     det.rows = []; det.hashMs = 0;
   }
   if (frame >= det.until) {
+    if (rb.on) postMessage({ cmd: 'rbStats', s: rbStats() });
     postMessage({ cmd: 'detDone', frame });
     for (;;) Atomics.wait(paceI32, 255, 0, 1000);   // park: the run is over, burn no CPU
   }
@@ -981,6 +992,7 @@ function stateSnapshot() {
   const nPages = Math.ceil(memSize / ST_PAGE);
   const idx = [];
   for (let p = 0; p < nPages; p++) {
+    if (p * ST_PAGE >= RB_LO && p * ST_PAGE < MEM1_LO) continue;   // the rollback ring's region: not guest state
     const s = p * perPage, e = Math.min(s + perPage, u32.length);
     for (let i = s; i < e; i++) if (u32[i] !== 0) { idx.push(p); break; }
   }
@@ -1067,6 +1079,8 @@ function stateApply(u8) {
   f32Arrays.length = 0;
   cacheDirty = true; sentPrologue = false;
   if (Module.___recomp_dirty_reset) Module.___recomp_dirty_reset();
+  // Every undo record describes the timeline this load just replaced: start the ring again here.
+  if (rb.armed) { rb.rearm = true; rb.carry.length = 0; rb.pendRaw.length = 0; }
   log('state: restored f' + viRetrace + ' (' + hdr.pages + ' pages, sp=0x' + (hdr.sp >>> 0).toString(16) + ')');
 }
 
@@ -1131,9 +1145,413 @@ function stateServiceCmd() {
   }
 }
 
+// ---- THE ROLLBACK RING ----------------------------------------------------------------------
+// A rollback room applies this console's input on the frame it was sampled (zero added input
+// lag), PREDICTS every other port, and when a late input contradicts a guess, rewinds to the first
+// wrong frame and re-runs up to the present with the real inputs (lib/netplay.js _beginFrameRb is
+// the engine half; gamecube.html gcLsStep the page half). This is the console half.
+//
+// THE STATE OF EVERY FRAME START, CHEAPLY. The whole guest is ~64 MB (MP4's C statics + heap +
+// fiber stacks below MEM1, MEM1, the FST page): a full copy measured 13 ms each way. Instead the
+// module is INSTRUMENTED at load (gamecube/recomp/rb_instrument.js): the first write to any 4 KiB
+// page in a frame copies the page's prior bytes into an undo slot and logs (page, slot). At each
+// frame start (rbFrameStart — the VI pump point, the same root-context point the save states use,
+// see SAVE STATES) the log becomes the finished frame's UNDO record. Rewinding to frame f copies
+// every record back, newest first, down to f. The JS-side state the guest's next frames depend on
+// (the clock, the busy-wait clock, the audio carry, the fingerprint sweep, the GX decoder shadow)
+// is captured per frame start beside it (rbCapture).
+//
+// FRAME NUMBERING. `rb.w` is the worker frame index: the number of PRESENTED frames latched so far
+// (PAD_ACK). Frame w's start is the moment just before its input is latched. A re-simulated frame
+// does not bump PAD_ACK. The page converts engine frames to worker frames (gcLsStep, rbOff).
+//
+// THE PAGE'S CELLS (boot msg `rbSab`, an Int32Array shared with gamecube.html):
+const RBC = {
+  ARM_GEN: 1,      // page bumps: (re)start the ring at the next frame start (room start; back from delay)
+  STOP_GEN: 2,     // page bumps: stop the ring and free it (the console left the room)
+  REQ_GEN: 4,      // page bumps with REQ_FROM set: before the next presented frame, rewind to REQ_FROM
+  REQ_FROM: 5,     //   and re-simulate up to it, taking each frame's input from the RING below
+  DONE_GEN: 7,     // worker: the last request it carried out
+  KEEP: 8,         // page: the earliest frame a rollback can still name; older records are freed
+  FP_EVERY: 9,     // page: >0 = fingerprint at the ring's frame starts, one sweep per this many frames
+  FP_ALIGN: 10,    // page: a sweep closes at the start of frame w when (w - FP_ALIGN) % FP_EVERY == 0
+  FP_SEQ: 11,      // worker: bumped after an FP_RING entry is written
+  HIDDEN: 12,      // page: the next presented frame is a hidden catch-up frame (no audio, no draw)
+  FAULT: 13,       // worker: nonzero = the ring failed (1 restore out of reach, 2 log overflow hit,
+                   //   3 stack-context mismatch, 4 missing re-simulation input); text via 'log'
+  BUDGET: 14,      // page: soft cap on undo slots in use (4 KiB each); 0 = none
+  FP_RING: 16,     // 16 entries of (frame w, hash, gen) — cells 16..63
+  S_ROLLBACKS: 64, S_RESIM: 65, S_STEP_US: 66, S_STEPS: 67, S_SAVE_US: 68, S_HELD: 69,
+  S_SLOTS: 70, S_MAXDEPTH: 71, S_RESTORE_US: 72, S_OVERFLOWS: 73, S_W: 74, S_BASE: 75, S_TOUCHES: 76,
+  S_ARMED: 77, S_GEN: 78,
+  RING: 256, RING_N: 256, RING_S: 17,   // per-frame inputs: [w, 4 x (btn, dstk, stkx, stky)]
+};
+const RB_LO = 0x60000000;          // = rb_instrument.js RB.LO (no scan or snapshot looks at or above it)
+let RBI = null;                    // rb_instrument.js, once loaded
+let rbI32 = null;
+const rb = {
+  on: false,          // the module is instrumented and the ring may be armed
+  why: null,          // why it is not (for the page's rbCapable)
+  armed: false, armGen: 0, rearm: false,
+  w: 0,               // the frame whose start is next (= PAD_ACK outside a re-simulation)
+  base: 0,            // the oldest frame start still restorable
+  recs: new Map(),    // w -> { js, undo: {pg, sl} | null, ship }
+  gen: 0,             // the last rollback request carried out
+  resimming: false, resimUntil: 0, resimCount: 0,
+  presentHidden: false,
+  carry: [], pendRaw: [],
+  test: null,         // DETERMINISM-RIG MODE (boot msg rbTest): the worker drives its own rollbacks
+  busyAt: 0, stepResim: 0, slotsUsed: 0,
+  fault: 0,
+};
+// The fingerprint sweep the ring runs (see THE STATE FINGERPRINT); its state is part of rbCapture.
+const rbFp = { low: FP_LOW_MIN, next: 0, acc: 0, maxNz: -1, live: false };
+
+function rbView() { return Module.wasmMemory.buffer; }
+function rbFault(code, txt) {
+  if (rb.fault) return;
+  rb.fault = code;
+  if (rbI32) Atomics.store(rbI32, RBC.FAULT, code);
+  log('ROLLBACK RING FAULT ' + code + ': ' + txt);
+}
+// Log pages a JS write is about to change (the instrumented module logs its own).
+function rbTouchRange(addr, len) {
+  if (!rb.armed || !len) return;
+  const m8 = new Uint8Array(rbView()), t = Module.wasmExports.__rb_touch, B = RBI.RB.BITMAP;
+  const e = ((addr + len - 1) >>> 12);
+  for (let pg = addr >>> 12; pg <= e; pg++) if (!m8[B + pg]) t(pg);
+}
+function rbCtrl() { return new Int32Array(rbView(), RBI.RB.CTRL, 8); }
+function rbFreeSlots(sl) {
+  if (!sl || !sl.length) return;
+  const c = rbCtrl(), F = new Int32Array(rbView(), RBI.RB.FREE, RBI.RB.SLOTCAP);
+  let top = c[RBI.RB.C_FREETOP >> 2];
+  for (let i = 0; i < sl.length; i++) F[top++] = sl[i];
+  c[RBI.RB.C_FREETOP >> 2] = top;
+  rb.slotsUsed -= sl.length;
+}
+function rbPoolInit() {
+  const R = RBI.RB, F = new Int32Array(rbView(), R.FREE, R.SLOTCAP), c = rbCtrl();
+  for (let i = 0; i < R.SLOTCAP; i++) F[i] = R.SLOTS + (R.SLOTCAP - 1 - i) * 4096;   // LIFO: lowest first
+  c[R.C_ENABLED >> 2] = 0; c[R.C_LOGN >> 2] = 0; c[R.C_LOGCAP >> 2] = R.LOGCAP;
+  c[R.C_FREETOP >> 2] = R.SLOTCAP; c[R.C_OVERFLOW >> 2] = 0; c[R.C_TOUCHES >> 2] = 0;
+  rb.slotsUsed = 0;
+}
+function rbCapture() {
+  return {
+    vi: viRetrace, tbE: tbExtra, tbR: tbReads, tbS: tbSpinAcc,
+    aA: audioAcc, aP: audioPhase, aS: audioStallFrames, dvd: lastDvdOff,
+    vcdLo, vcdHi, tlut: tlutSrc, vatA: vatA.slice(), aB: arrayBase.slice(), aSt: arrayStride.slice(), tx: texImg0.slice(),
+    cp: new Map(gxShadow.cp), xf: new Map(gxShadow.xf), bp: new Map(gxShadow.bp),
+    fp: [rbFp.low, rbFp.next, rbFp.acc, rbFp.maxNz, rbFp.live],
+    sp: Module.wasmExports.emscripten_stack_get_current() >>> 0,
+  };
+}
+function rbRestoreJs(j) {
+  viRetrace = j.vi; tbExtra = j.tbE; tbReads = j.tbR; tbSpinAcc = j.tbS;
+  audioAcc = j.aA; audioPhase = j.aP; audioStallFrames = j.aS; lastDvdOff = j.dvd;
+  vcdLo = j.vcdLo; vcdHi = j.vcdHi; tlutSrc = j.tlut;
+  for (let i = 0; i < 8; i++) { vatA[i] = j.vatA[i]; texImg0[i] = j.tx[i]; }
+  for (let i = 0; i < 16; i++) { arrayBase[i] = j.aB[i]; arrayStride[i] = j.aSt[i]; }
+  gxShadow.cp = new Map(j.cp); gxShadow.xf = new Map(j.xf); gxShadow.bp = new Map(j.bp);
+  rbFp.low = j.fp[0]; rbFp.next = j.fp[1]; rbFp.acc = j.fp[2]; rbFp.maxNz = j.fp[3]; rbFp.live = j.fp[4];
+}
+// (Re)start the ring at the start of frame w. Nothing is copied: from here on, first writes log.
+function rbArm(w) {
+  const R = RBI.RB, m8 = new Uint8Array(rbView()), c = rbCtrl();
+  for (const r of rb.recs.values()) if (r.undo) rbFreeSlots(r.undo.sl);
+  rb.recs.clear();
+  // The log of a frame in progress (an arm while armed) is dropped with its slots.
+  const n = c[R.C_LOGN >> 2];
+  if (n) { const L = new Int32Array(rbView(), R.LOG, n * 2), sl = new Int32Array(n); for (let k = 0; k < n; k++) sl[k] = L[2 * k + 1]; rbFreeSlots(sl); }
+  m8.fill(0, R.BITMAP, R.BITMAP + (m8.length >>> 12));
+  c[R.C_LOGN >> 2] = 0; c[R.C_OVERFLOW >> 2] = 0; c[R.C_ENABLED >> 2] = 1;
+  rb.armed = true; rb.rearm = false; rb.base = w; rb.w = w;
+  rb.recs.set(w, { js: rbCapture(), undo: null, ship: null });
+  rb.carry.length = 0; rb.pendRaw.length = 0;
+  if (rbI32) { Atomics.store(rbI32, RBC.S_ARMED, 1); Atomics.store(rbI32, RBC.S_BASE, w); }
+}
+// The start of frame w: the frame w-1 that just ran becomes an undo record.
+function rbSavePoint(w) {
+  const t0 = performance.now();
+  const R = RBI.RB, c = rbCtrl(), m8 = new Uint8Array(rbView());
+  const n = c[R.C_LOGN >> 2], ov = c[R.C_OVERFLOW >> 2];
+  const pg = new Int32Array(n), sl = new Int32Array(n);
+  if (n) {
+    const L = new Int32Array(rbView(), R.LOG, n * 2);
+    for (let k = 0; k < n; k++) { pg[k] = L[2 * k]; sl[k] = L[2 * k + 1]; m8[R.BITMAP + pg[k]] = 0; }
+  }
+  c[R.C_LOGN >> 2] = 0;
+  rb.slotsUsed += n;
+  const prev = rb.recs.get(w - 1);
+  if (prev) prev.undo = { pg, sl }; else rbFreeSlots(sl);
+  if (ov) {
+    // A first write the log could not take: the record of frame w-1 is incomplete, so no frame at
+    // or before it can be restored. Every page it marked but did not log must log again.
+    c[R.C_OVERFLOW >> 2] = 0;
+    m8.fill(0, R.BITMAP, R.BITMAP + (m8.length >>> 12));
+    if (rbI32) Atomics.add(rbI32, RBC.S_OVERFLOWS, 1);
+    for (const [k, r] of rb.recs) if (k < w) { if (r.undo) rbFreeSlots(r.undo.sl); rb.recs.delete(k); }
+    rb.base = w;
+    log('rollback ring: the undo log overflowed in frame ' + (w - 1) + ' (' + rb.slotsUsed + ' slots held) — nothing before frame ' + w + ' can be rewound');
+  }
+  rb.recs.set(w, { js: rbCapture(), undo: null, ship: null });
+  // Free what no rollback can reach: before the page's KEEP, and past the hard depth.
+  let keep = w - 600;
+  if (rbI32) {
+    keep = Math.max(keep, Math.min(w, Atomics.load(rbI32, RBC.KEEP) | 0));
+    // never free the base of a rewind the page has asked for and this frame start has not served
+    if (!rb.resimming && (Atomics.load(rbI32, RBC.REQ_GEN) | 0) !== rb.gen) keep = Math.min(keep, Atomics.load(rbI32, RBC.REQ_FROM) | 0);
+  }
+  if (rb.test) keep = Math.max(keep, rb.test.keep);
+  while (rb.base < keep) {
+    const r = rb.recs.get(rb.base);
+    if (r) { if (r.undo) rbFreeSlots(r.undo.sl); rb.recs.delete(rb.base); }
+    rb.base++;
+  }
+  if (rbI32) {
+    rbI32[RBC.S_SAVE_US] += Math.round((performance.now() - t0) * 1000);
+    rbI32[RBC.S_HELD] = w - rb.base; rbI32[RBC.S_SLOTS] = rb.slotsUsed; rbI32[RBC.S_W] = w; rbI32[RBC.S_BASE] = rb.base;
+    rbI32[RBC.S_TOUCHES] = c[R.C_TOUCHES >> 2];
+  }
+}
+// Rewind from the start of frame g (rb.w, its save point just taken) to the start of frame f.
+function rbRestore(f) {
+  const g = rb.w, t0 = performance.now();
+  if (f < rb.base || f >= g || !rb.recs.get(f)) {
+    rbFault(1, 'rollback to frame ' + f + ' is out of reach (ring holds ' + rb.base + '..' + g + ')');
+    return false;
+  }
+  const brk = rb.test ? rb.test.broken : null;
+  const m8 = new Uint8Array(rbView());
+  const raw = [];
+  let full = false;
+  for (let k = g - 1; k >= f; k--) {
+    const r = rb.recs.get(k);
+    if (!r || !r.undo) { rbFault(1, 'frame ' + k + ' has no undo record'); return false; }
+    const { pg, sl } = r.undo;
+    if (brk !== 'noundo') for (let i = 0; i < pg.length; i++) m8.copyWithin(pg[i] * 4096, sl[i] >>> 0, (sl[i] >>> 0) + 4096);
+    rbFreeSlots(sl);
+    r.undo = null;
+    if (r.ship === 'full') full = true; else if (r.ship) for (const x of r.ship) raw.push(x);
+  }
+  for (let k = f + 1; k <= g; k++) rb.recs.delete(k);
+  const js = rb.recs.get(f).js;
+  const sp = Module.wasmExports.emscripten_stack_get_current() >>> 0;
+  if (js.sp !== sp) { rbFault(3, 'shadow-stack pointer at frame start differs (0x' + js.sp.toString(16) + ' vs 0x' + sp.toString(16) + ')'); return false; }
+  if (brk !== 'nojs') rbRestoreJs(js);
+  else { const keepVi = viRetrace; rbRestoreJs(js); viRetrace = keepVi; tbExtra = 0; }
+  // THE RENDERER: everything the abandoned frames sent Dolphin is from a timeline that no longer
+  // exists. Drop every cache entry over those ranges and re-send them raw at the next presented
+  // frame (gx re-discovers arrays/DLs/textures on top, swapped where they must be).
+  if (full) { cacheDirty = true; rb.pendRaw.length = 0; rb.carry.length = 0; }
+  else {
+    for (const [a0, n0] of raw) {
+      const ofs = a0, ds = n0;
+      for (const [ka, e2] of knownDLs) { const kOfs = ka & 0x01FFFFFF; if (kOfs < ofs + ds && kOfs + e2.size > ofs) knownDLs.delete(ka); }
+      for (const e3 of knownDLs.values()) e3.keys.clear();
+      for (const [k2, kn] of knownArrays) { const kOfs = parseInt(k2, 10) & 0x01FFFFFF; if (kOfs < ofs + ds && kOfs + kn > ofs) knownArrays.delete(k2); }
+      for (const [tb, tv] of knownTex) { const kOfs = tb & 0x01FFFFFF; if (kOfs < ofs + ds && kOfs + tv.size > ofs) knownTex.delete(tb); }
+      for (let fi = f32Arrays.length - 1; fi >= 0; fi--) if (f32Arrays[fi].b < ofs + ds && f32Arrays[fi].e > ofs) f32Arrays.splice(fi, 1);
+      if (ofs >= 0 && ofs + ds <= 0x01800000) rb.pendRaw.push([ofs, ds]);
+    }
+  }
+  if (rbI32) {
+    Atomics.add(rbI32, RBC.S_ROLLBACKS, 1);
+    rbI32[RBC.S_RESTORE_US] += Math.round((performance.now() - t0) * 1000);
+    if (g - f > rbI32[RBC.S_MAXDEPTH]) rbI32[RBC.S_MAXDEPTH] = g - f;
+  }
+  return true;
+}
+function rbNoteShip(full, regions) {
+  if (!rb.armed) return;
+  const rec = rb.recs.get(rb.w - 1);
+  if (rec) rec.ship = full ? 'full' : regions.map((r) => [r.addr, r.bytes.byteLength]);
+}
+// One step of the ring's fingerprint sweep, at the start of frame w (see THE STATE FINGERPRINT;
+// same pages, same hash). A sweep closes at the start of frame w when (w - ALIGN) % EVERY == 0 and
+// is published keyed on w, with the generation of the last rollback carried out — the page submits
+// it only once the frame is confirmed, and never one computed before a rollback that changed it.
+function rbFpStep(w) {
+  const every = rbI32 ? rbI32[RBC.FP_EVERY] | 0 : 0;
+  if (every <= 0) return;
+  const align = rbI32[RBC.FP_ALIGN] | 0;
+  const phase = (((w - align - 1) % every) + every) % every;
+  if (phase === 0) { rbFp.next = 0; rbFp.acc = 0x811c9dc5; rbFp.maxNz = -1; rbFp.live = true; }
+  if (!rbFp.live) return;
+  const highPages = (Module.wasmMemory.buffer.byteLength - MEM1_LO) / HPAGE;
+  const total = rbFp.low + highPages, zh = zeroHash();
+  const end = Math.ceil(total * (phase + 1) / every);
+  for (; rbFp.next < end; rbFp.next++) {
+    const i = rbFp.next, a = i < rbFp.low ? i * HPAGE : MEM1_LO + (i - rbFp.low) * HPAGE;
+    const h = stateHash(a, a + HPAGE, 0);
+    if (i < rbFp.low && h !== zh) rbFp.maxNz = i;
+    rbFp.acc = Math.imul((rbFp.acc ^ h) >>> 0, 0x01000193) >>> 0;
+  }
+  if (phase !== every - 1) return;
+  let h = rbFp.acc;
+  const inject = Atomics.load(paceI32, FP_INJECT) | 0;
+  if (inject) h = Math.imul((h ^ inject) >>> 0, 0x01000193) >>> 0;
+  const seq = Atomics.load(rbI32, RBC.FP_SEQ) | 0, o = RBC.FP_RING + (seq & 15) * 3;
+  Atomics.store(rbI32, o, w); Atomics.store(rbI32, o + 1, h | 0); Atomics.store(rbI32, o + 2, rb.gen);
+  Atomics.store(rbI32, RBC.FP_SEQ, (seq + 1) | 0);
+  Atomics.store(paceI32, FP_DIAG, total);
+  rbFp.low = Math.max(FP_LOW_MIN, rbFp.maxNz + 1 + FP_LOW_MARGIN);
+  if (rb.test) rb.test.fps.push([w, h >>> 0]);
+}
+// Latch one frame's pads directly (a re-simulated frame: no PAD_ACK, no SAB slot).
+function rbApplyInput(v) {
+  const setPad = Module.___recomp_set_pad;
+  for (let p = 0; p < PAD_PORTS; p++) {
+    const o = p * 4;
+    if (setPad) setPad(p, v[o] | 0, v[o + 1] | 0, v[o + 2] | 0, v[o + 3] | 0);
+    else if (p === 0) {
+      if (Module.___recomp_set_inject_btn) Module.___recomp_set_inject_btn(v[0] | 0);
+      if (Module.___recomp_set_inject_dstk) Module.___recomp_set_inject_dstk(v[1] | 0);
+      if (Module.___recomp_set_inject_stkx) Module.___recomp_set_inject_stkx(v[2] | 0);
+      if (Module.___recomp_set_inject_stky) Module.___recomp_set_inject_stky(v[3] | 0);
+    }
+  }
+}
+function rbRingInput(w) {
+  const o = RBC.RING + (w % RBC.RING_N) * RBC.RING_S;
+  if ((Atomics.load(rbI32, o) | 0) !== (w | 0)) { rbFault(4, 'no re-simulation input for frame ' + w + ' (slot holds ' + Atomics.load(rbI32, o) + ')'); return null; }
+  const v = new Int32Array(16);
+  for (let i = 0; i < 16; i++) v[i] = Atomics.load(rbI32, o + 1 + i);
+  return v;
+}
+// The page measures what one rollback step costs this console (ls.selfStepMs): the worker's busy
+// time per presented frame — guest frame, ship, ring bookkeeping, any re-simulation — per frame run.
+function rbBusyEnd() {
+  if (!rbI32 || !rb.busyAt) return;
+  rbI32[RBC.S_STEP_US] += Math.round((performance.now() - rb.busyAt) * 1000);
+  rbI32[RBC.S_STEPS] += 1 + rb.stepResim;
+  rb.busyAt = 0; rb.stepResim = 0;
+}
+function rbBusyStart() { if (rb.armed) rb.busyAt = performance.now(); }
+
+// THE DETERMINISM RIG's driver (boot msg rbTest; tools/gc_rollback_det_test.mjs). There is no room:
+// port 0's input stream is the scripted one, and it "arrives" D frames late (D seeded, 1..dMax).
+// Every frame not yet known is PREDICTED as the last known input repeated — the engine's own rule
+// (lib/netplay.js _rbPredict) — and when a frame's real input turns out to differ from what it ran
+// on, the worker rewinds to it and re-simulates exactly as a room would. The rig compares the final
+// state of every frame with a console that never guessed. broken: 'nocorrect' re-simulates with
+// the same wrong guesses, 'nojs' skips the JS-side state, 'noundo' skips the memory restore — each
+// must FAIL the comparison, or the comparison proves nothing.
+function rbTrue(w) { const s = inputScript && inputScript[w + 2]; const v = new Int32Array(16); if (s) { v[0] = s[0]; v[1] = s[1]; v[2] = s[2]; v[3] = s[3]; } return v; }
+function rbSame(a, b) { for (let i = 0; i < 16; i++) if ((a[i] | 0) !== (b[i] | 0)) return false; return true; }
+function rbTestStep(g) {
+  const T = rb.test;
+  let r = T.seed >>> 0 || 1;
+  r ^= r << 13; r >>>= 0; r ^= r >>> 17; r ^= r << 5; r >>>= 0; T.seed = r;
+  const D = 1 + (r % T.dMax);
+  const K = Math.max(T.known, g - D);
+  let from = -1;
+  for (let k = T.known + 1; k <= K; k++) {
+    if (k >= g) break;
+    const ran = T.pred.get(k);
+    if (ran && !rbSame(ran, rbTrue(k)) && from < 0) from = k;
+  }
+  T.known = Math.max(T.known, Math.min(K, g - 1));
+  T.keep = Math.max(0, T.known - 2);
+  for (const k of T.pred.keys()) if (k < T.keep - 4) T.pred.delete(k);
+  return from;
+}
+function rbTestInput(k) {
+  const T = rb.test;
+  if (k <= T.known) return rbTrue(k);
+  return T.known >= 0 ? rbTrue(T.known) : new Int32Array(16);   // predicted: the last known input, repeated
+}
+
+function rbStats() {
+  const g = (k) => (rbI32 ? rbI32[k] | 0 : 0);
+  return { on: rb.on, armed: rb.armed, w: rb.w, base: rb.base, rollbacks: g(RBC.S_ROLLBACKS), resimFrames: g(RBC.S_RESIM),
+           maxDepth: g(RBC.S_MAXDEPTH), saveUs: g(RBC.S_SAVE_US), restoreUs: g(RBC.S_RESTORE_US), stepUs: g(RBC.S_STEP_US),
+           steps: g(RBC.S_STEPS), slots: rb.slotsUsed, overflows: g(RBC.S_OVERFLOWS), touches: g(RBC.S_TOUCHES), fault: rb.fault,
+           broken: rb.test ? rb.test.broken : null };
+}
+// rbFrameStart — called at every frame start while the module is instrumented. Returns true when
+// it latched a frame's input itself (a re-simulated frame), false to let applyPads latch the
+// presented frame.
+function rbFrameStart() {
+  const w = rb.w;
+  if (rb.fault) return false;
+  if (rbI32 && !rb.resimming && (Atomics.load(rbI32, RBC.STOP_GEN) | 0) !== (rb.stopGen | 0)) {
+    rb.stopGen = Atomics.load(rbI32, RBC.STOP_GEN) | 0;
+    if (rb.armed) {
+      for (const r of rb.recs.values()) if (r.undo) rbFreeSlots(r.undo.sl);
+      rb.recs.clear(); rbArm(w); rbCtrl()[RBI.RB.C_ENABLED >> 2] = 0;
+      for (const r of rb.recs.values()) if (r.undo) rbFreeSlots(r.undo.sl);
+      rb.recs.clear(); rb.armed = false; rb.armGen = Atomics.load(rbI32, RBC.ARM_GEN) | 0;
+      Atomics.store(rbI32, RBC.S_ARMED, 0); Atomics.store(rbI32, RBC.FP_EVERY, 0);
+      log('rollback ring: stopped at frame ' + w + ' (the console left the room)');
+    }
+    return false;
+  }
+  const armReq = rbI32 && (Atomics.load(rbI32, RBC.ARM_GEN) | 0) !== rb.armGen;
+  if (!rb.resimming && (armReq || rb.rearm || (rb.test && !rb.armed))) {
+    if (armReq) rb.armGen = Atomics.load(rbI32, RBC.ARM_GEN) | 0;
+    rbArm(w);
+    rbFpStep(w);
+  } else if (rb.armed) {
+    rbSavePoint(w);
+    rbFpStep(w);
+  } else return false;
+  if (rb.resimming) {
+    if (w < rb.resimUntil) {
+      const v = rb.test ? rb.test.resimInput(w) : rbRingInput(w);
+      if (!v) { rb.resimming = false; return false; }
+      rbApplyInput(v);
+      rb.w = w + 1; rb.stepResim++;
+      if (rbI32) rbI32[RBC.S_RESIM]++;
+      return true;
+    }
+    rb.resimming = false;
+    if (rbI32) { Atomics.store(rbI32, RBC.DONE_GEN, rb.gen); Atomics.store(rbI32, RBC.S_GEN, rb.gen); }
+  } else {
+    let from = -1, gen = rb.gen;
+    if (rb.test) { from = rbTestStep(w); if (from >= 0) gen = rb.gen + 1; }
+    else if (rbI32) {
+      const rg = Atomics.load(rbI32, RBC.REQ_GEN) | 0;
+      if (rg !== rb.gen) { gen = rg; from = Atomics.load(rbI32, RBC.REQ_FROM) | 0; if (from >= w) { rb.gen = gen; Atomics.store(rbI32, RBC.DONE_GEN, gen); from = -1; } }
+    }
+    if (from >= 0) {
+      if (!rbRestore(from)) return false;
+      rb.gen = gen;
+      rb.resimming = true; rb.resimUntil = w; rb.resimCount++;
+      rbFpStep(from);                         // the restored sweep state re-runs its step for `from`
+      let v;
+      if (rb.test) {
+        const T = rb.test;
+        const brk = T.broken === 'nocorrect';
+        T.resimInput = (k) => { const x = brk ? (T.pred.get(k) || rbTestInput(k)) : rbTestInput(k); T.pred.set(k, x); return x; };
+        v = T.resimInput(from);
+      } else v = rbRingInput(from);
+      if (!v) { rb.resimming = false; return false; }
+      rbApplyInput(v);
+      rb.w = from + 1; rb.stepResim++;
+      if (rbI32) rbI32[RBC.S_RESIM]++;
+      return true;
+    }
+  }
+  // The presented frame. The rig latches its prediction here; a room's page wrote the SAB slot.
+  rb.presentHidden = !!(rbI32 && Atomics.load(rbI32, RBC.HIDDEN));
+  if (rb.test) {
+    const x = rbTestInput(w);
+    rb.test.pred.set(w, x);
+    rbApplyInput(x);
+    Atomics.add(paceI32, PAD_ACK, 1); Atomics.notify(paceI32, PAD_ACK);
+    rb.w = w + 1;
+    return true;
+  }
+  return false;
+}
+
 function serveDvdRead(mem, dv, block, addr, length, offset, cbIdx) {
   block >>>= 0; addr >>>= 0; length >>>= 0; offset >>>= 0;
   lastDvdOff = offset;
+  // JS writes guest memory here, which the instrumented module cannot see: log the pages first.
+  rbTouchRange(addr, length); rbTouchRange(block, 36);
   cacheDirty = true;
   const dst = new Uint8Array(mem.buffer, addr, length);
   let done = 0;
@@ -1181,9 +1599,16 @@ async function boot(msg) {
     bh = fnv(bh, new Uint8Array(glueTxt));
     const selfTxt = await (await fetch(String(self.location.href).split('?')[0])).arrayBuffer();
     bh = fnv(bh, new Uint8Array(selfTxt));
-    postMessage({ cmd: 'build', hash: ('0000000' + (bh >>> 0).toString(16)).slice(-8),
-                  bytes: wasmBinary.byteLength + glueTxt.byteLength + selfTxt.byteLength });
-  } catch (e) { postMessage({ cmd: 'build', hash: 'unhashed', error: String((e && e.message) || e) }); }
+    let rbBytes = 0;
+    if (msg.rb || msg.rbTest) {
+      // THE ROLLBACK RING's instrumenter is part of the guest a room runs (it rewrites the module),
+      // so it is part of the build identity too.
+      const rbTxt = await (await fetch(new URL('rb_instrument.js' + self.location.search, self.location.href).href)).arrayBuffer();
+      bh = fnv(bh, new Uint8Array(rbTxt)); rbBytes = rbTxt.byteLength;
+    }
+    buildMsg = { cmd: 'build', hash: ('0000000' + (bh >>> 0).toString(16)).slice(-8),
+                 bytes: wasmBinary.byteLength + glueTxt.byteLength + selfTxt.byteLength + rbBytes };
+  } catch (e) { buildMsg = { cmd: 'build', hash: 'unhashed', error: String((e && e.message) || e) }; }
   // Static-texture boundary = end of the wasm's INITIALIZED data segments (~0x25204): every
   // compiled-in .inc texture/TLUT lives below it, every real guest-RAM texture above it
   // (lowest observed 0x2bf800). NOT __data_end/__heap_base — those include BSS (the 16MB
@@ -1211,7 +1636,38 @@ async function boot(msg) {
     return maxEnd;
   })(new Uint8Array(wasmBinary));
   log('static data end: 0x' + staticTop.toString(16));
-  const wasmModule = await WebAssembly.compile(wasmBinary);
+  // THE ROLLBACK RING (see its block): in a room — and only there — the module is instrumented to
+  // log its own first writes per frame. A solo game never pays for it. If the rewrite or its
+  // compile fails, the room is told this console cannot roll back (its page then declares
+  // rbCapable false and the room runs input delay) rather than failing.
+  let modBytes = wasmBinary;
+  if (msg.rb || msg.rbTest) {
+    try {
+      const t0 = performance.now();
+      importScripts(new URL('rb_instrument.js' + self.location.search, self.location.href).href);
+      RBI = self.RbInstrument;
+      const r = RBI.rbInstrument(new Uint8Array(wasmBinary));
+      if (!WebAssembly.validate(r.bytes)) throw new Error('the instrumented module does not validate');
+      modBytes = r.bytes;
+      rb.on = true;
+      log('rollback ring: module instrumented in ' + (performance.now() - t0).toFixed(0) + ' ms (' + r.stats.stores +
+          ' stores, ' + r.stats.copies + ' memory.copy, ' + r.stats.fills + ' memory.fill; ' +
+          (wasmBinary.byteLength / 1048576).toFixed(1) + ' -> ' + (r.bytes.length / 1048576).toFixed(1) + ' MB)');
+    } catch (e) {
+      rb.on = false; rb.why = 'the module could not be instrumented for rollback: ' + ((e && e.message) || e);
+      log('rollback ring: OFF — ' + rb.why);
+      modBytes = wasmBinary;
+    }
+  } else rb.why = 'solo (not instrumented)';
+  if (msg.rbSab) rbI32 = new Int32Array(msg.rbSab);
+  let wasmModule;
+  try { wasmModule = await WebAssembly.compile(modBytes); }
+  catch (e) {
+    if (modBytes === wasmBinary) throw e;
+    log('rollback ring: OFF — the instrumented module failed to compile (' + ((e && e.message) || e) + ')');
+    rb.on = false; rb.why = 'instrumented module failed to compile';
+    wasmModule = await WebAssembly.compile(wasmBinary);
+  }
   const isEmscriptenProvided = (name) =>
     name.startsWith('emscripten_') || name.startsWith('__asyncify') || name.startsWith('asyncify_') ||
     name.startsWith('__wasm') || name.startsWith('invoke_') || name === 'memory' ||
@@ -1460,9 +1916,14 @@ async function boot(msg) {
         case 'VIGetRetraceCount': return viRetrace;
         case 'VIWaitForRetrace': {
           spinN = 0; spinTally = null; tbReads = 0;
+          // A RE-SIMULATED frame (THE ROLLBACK RING): the guest re-runs a frame it already lived
+          // once on a guess. It is shipped to nobody now — its renderer state is CARRIED into the
+          // next presented frame — its audio is not played twice, and it spends no credit.
+          const resim = rb.resimming;
+          const hiddenNow = rb.presentHidden && !resim;
           if (det && det.leftAt) det.lastGuestUs = (performance.now() - det.leftAt) * 1000;
           const pos = Module._gx_fifo_pos ? Module._gx_fifo_pos() : 0;
-          if (pos > 0) {
+          shipFrame: if (pos > 0) {
             const base = Module._gx_fifo_base();
             const fb = new Uint8Array(mem().buffer.slice(base, base + pos));
             // A FULL-IMAGE FRAME STARTS FROM EMPTY CACHES (2026-10-03). The mem1 image below is
@@ -1482,8 +1943,10 @@ async function boot(msg) {
             // carries as zeros) go out in this frame's regions on top of the image — the same
             // state a save-state restore starts from. cacheDirty set later in this frame (dirty-
             // ring overflow / a jumbo range) stays set and takes the full image next frame.
-            const fullSync = cacheDirty || testFullMem;
+            const wantFull = cacheDirty || testFullMem;
+            const fullSync = wantFull && !resim;
             if (fullSync) {
+              rb.carry.length = 0; rb.pendRaw.length = 0;   // the full image supersedes anything carried
               cacheDirty = false;
               knownDLs.clear(); knownArrays.clear(); knownTex.clear(); f32Arrays.length = 0;
             }
@@ -1603,6 +2066,28 @@ async function boot(msg) {
               }
               if (Module.___recomp_dirty_reset) Module.___recomp_dirty_reset();
             }
+            if (resim) {
+              // Carried, not posted: the next PRESENTED frame ships them ahead of its own regions, in
+              // order. A frame that wanted the full image leaves cacheDirty set, so the next
+              // presented frame takes it (and that supersedes the carry).
+              if (!wantFull) for (const r of regions) rb.carry.push(r);
+              rbNoteShip(wantFull, regions);
+              break shipFrame;
+            }
+            if (rb.pendRaw.length || rb.carry.length) {
+              // THE FIRST PRESENTED FRAME AFTER A ROLLBACK: (1) every range a frame the rollback
+              // abandoned had sent, re-read from the corrected timeline (raw; the caches over those
+              // ranges were dropped, so swapped arrays and DLs are re-discovered and re-sent on top);
+              // (2) what the re-simulated frames produced, in order; (3) this frame's own regions.
+              const pre = [];
+              for (const [a0, n0] of rb.pendRaw) pre.push({ addr: a0, bytes: new Uint8Array(mem().buffer.slice(0x80000000 + a0, 0x80000000 + a0 + n0)) });
+              for (const r of rb.carry) pre.push(r);
+              rb.pendRaw.length = 0; rb.carry.length = 0;
+              regions.unshift(...pre);
+            }
+            // What this frame shipped, so a rollback that abandons it re-sends exactly those ranges
+            // from the corrected timeline (rbRestore).
+            rbNoteShip(fullSync, regions);
             let mem1Snap = null;
             if (fullSync) mem1Snap = mem().buffer.slice(0x80000000, 0x81800000);
             if (!sentPrologue) { sentPrologue = true;
@@ -1616,7 +2101,7 @@ async function boot(msg) {
             fifo.set(pro, 0); fifo.set(fb, pro.length);
             const transfers = [fifo.buffer, ...regions.map((r) => r.bytes.buffer)];
             if (mem1Snap) transfers.push(mem1Snap);
-            postMessage({ cmd: 'frame', n: viRetrace, fifo: fifo.buffer, mem1: mem1Snap,
+            postMessage({ cmd: 'frame', n: viRetrace, fifo: fifo.buffer, mem1: mem1Snap, hidden: hiddenNow,
                           regions: regions.map((r) => ({ addr: r.addr, bytes: r.bytes.buffer })) }, transfers);
           }
           if (Module._gx_fifo_reset) Module._gx_fifo_reset();
@@ -1627,19 +2112,21 @@ async function boot(msg) {
           // character select). Now FOUR PORTS: see the PAD_* block at the top of this file.
           // Cells 1/2/3/4/8/9 remain live as a PORT-0 ALIAS so the existing keyboard listeners
           // and gamecube/recomp/recomp_probe.mjs keep working unchanged.
-          publishPeek();
+          // ___recomp_pad_witness() WRITES its block in guest memory, so it runs on a re-simulated frame
+          // too (or that frame's state would differ from the one it replays); only the publish is skipped.
+          publishPeek(resim);
           viRetrace++;
           // The fingerprint is keyed on the GUEST FRAME, and viRetrace IS that
           // clock here (gamecube.html derives the guest rate from it). Published
           // after the increment so the number names the frame just completed.
           publishFingerprint(viRetrace);
-          pumpAudio();
+          pumpAudio(resim || hiddenNow);
           cardPoll();
           // Periodic host-import census. main() never returns to the worker event loop (see the
           // SAVE STATES note), so this frame hook is the only place a running census can be
           // emitted. Every 1800 frames = every 30 s of EMULATED time; one postMessage per 30 s
           // is far below the per-frame traffic already on this path.
-          if ((viRetrace % 1800) === 0) reportImportCensus('frame ' + viRetrace);
+          if (!resim && (viRetrace % 1800) === 0) reportImportCensus('frame ' + viRetrace);
           // DETERMINISM MODE — at this one fixed point of every frame (after the frame's audio and
           // card bookkeeping, before the credit wait and the next frame's input latch).
           if (det) detFrame(viRetrace);
@@ -1656,14 +2143,23 @@ async function boot(msg) {
                   + ' knownArrTotal=' + knownArrays.size + ' knownDLs=' + knownDLs.size + ' f32ivs=' + f32Arrays.length);
             }
           }
-          // pacing: consume one frame credit; block until the page grants more (uncapped=freerun)
-          if (!Atomics.load(paceI32, 5)) {
-            while (Atomics.load(paceI32, 0) <= 0) Atomics.wait(paceI32, 0, 0, 500);
-            Atomics.sub(paceI32, 0, 1);
+          // pacing: consume one frame credit; block until the page grants more (uncapped=freerun).
+          // A re-simulated frame spends none: it is guest time already credited once (gate #9).
+          if (!resim) {
+            rbBusyEnd();
+            if (!Atomics.load(paceI32, 5)) {
+              while (Atomics.load(paceI32, 0) <= 0) Atomics.wait(paceI32, 0, 0, 500);
+              Atomics.sub(paceI32, 0, 1);
+            }
+            rbBusyStart();
+            // savestate command cell — LAST, so the frame is fully shipped, the FIFO reset and
+            // the pacing credit consumed before a snapshot is taken or memory is overwritten.
+            stateServiceCmd();
           }
-          // savestate command cell — LAST, so the frame is fully shipped, the FIFO reset and
-          // the pacing credit consumed before a snapshot is taken or memory is overwritten.
-          stateServiceCmd();
+          // THE ROLLBACK RING's frame boundary: log this frame's start, and — if the room asked —
+          // rewind and re-run. When it starts or continues a re-simulation it has latched that
+          // frame's input itself, and the guest goes straight back to running.
+          if (rb.on && rbFrameStart()) { if (det) det.leftAt = performance.now(); return 0; }
           // ⚠ THE INPUT LATCH IS *AFTER* THE CREDIT WAIT, AND THAT ORDER IS LOAD-BEARING.
           // This is the whole lockstep primitive: one credit granted == one guest frame run with
           // exactly the pad bytes that were in the SAB when it was granted. Latching before the
@@ -1675,6 +2171,7 @@ async function boot(msg) {
           // __recomp_inject_* lives — latching first would hand the guest bytes a restore then
           // discards.
           applyPads();
+          rb.w = Atomics.load(paceI32, PAD_ACK);
           if (det) det.leftAt = performance.now();
           return 0;
         }
@@ -1689,12 +2186,50 @@ async function boot(msg) {
   const instantiateWasm = (info, receive) => {
     info.env ??= {};
     for (const name of hostNames) info.env[name] = stub(name);
-    WebAssembly.instantiate(wasmModule, info).then((inst) => receive(inst, wasmModule));
+    // The glue's own writes into linear memory, which the instrumented module cannot see: the fiber
+    // switch stores into both fiber structs (32 bytes each: stack ptr, entry, asyncify data), and
+    // fd_write stores the byte count. Log those pages first (THE ROLLBACK RING).
+    if (rb.on) {
+      const fsw = info.env.emscripten_fiber_swap;
+      if (fsw) info.env.emscripten_fiber_swap = (o, n) => { rbTouchRange(o >>> 0, 32); rbTouchRange(n >>> 0, 32); return fsw(o, n); };
+      const fdw = info.env.fd_write || (info.wasi_snapshot_preview1 && info.wasi_snapshot_preview1.fd_write);
+      if (fdw) {
+        const w2 = (fd, iov, cnt, pnum) => { rbTouchRange(pnum >>> 0, 4); return fdw(fd, iov, cnt, pnum); };
+        if (info.env.fd_write) info.env.fd_write = w2;
+        if (info.wasi_snapshot_preview1 && info.wasi_snapshot_preview1.fd_write) info.wasi_snapshot_preview1.fd_write = w2;
+      }
+    }
+    WebAssembly.instantiate(wasmModule, info).then((inst) => {
+      // The instrumented module reads its page bitmap (just below 0x80000000) on EVERY store —
+      // the constructors' too, which run before boot() grows the memory below. Grow it first.
+      if (rb.on) {
+        const m = inst.exports.memory, want = 0x82000000 / 65536;
+        if (m && m.buffer.byteLength / 65536 < want) m.grow(want - m.buffer.byteLength / 65536);
+      }
+      receive(inst, wasmModule);
+    });
     return {};
   };
   const createModule = (await import(msg.glueUrl)).default;
   Module = await createModule({ instantiateWasm, noInitialRun: true });
   if (Module.wasmMemory.buffer.byteLength < 0x82000000) Module._emscripten_resize_heap(0x82000000);
+  if (rb.on) {
+    if (!Module.wasmExports.__rb_touch) { rb.on = false; rb.why = 'no __rb_touch export'; }
+    else {
+      rbPoolInit();
+      if (msg.rbTest) {
+        rb.test = { dMax: Math.max(1, msg.rbTest.dMax | 0 || 7), seed: (msg.rbTest.seed >>> 0) || 1, broken: msg.rbTest.broken || null,
+                    known: -1, keep: 0, pred: new Map(), fps: [], resimInput: null };
+        if (!rbI32) rbI32 = new Int32Array(new SharedArrayBuffer(32768));
+        log('rollback ring: DETERMINISM RIG — port 0 input arrives up to ' + rb.test.dMax + ' frames late and is predicted until it does' +
+            (rb.test.broken ? '; BROKEN CONTROL: ' + rb.test.broken : ''));
+      }
+    }
+  }
+  // The build identity AND whether this console can roll back, together and before main(): the
+  // page puts the first in the room's disc tag and the second in its Ready (rbCapable), and must
+  // never declare a capability the worker then turns out not to have.
+  if (buildMsg) { buildMsg.rb = { ok: rb.on, why: rb.on ? null : rb.why }; postMessage(buildMsg); }
   // MEMORY CARD — must happen BEFORE _main(): CARDInit (inside main, via HuCardInit) adopts
   // whatever bytes sit in the image buffer, and formats a blank card if they don't validate.
   if (Module.___recomp_card_base && Module.___recomp_card_size) {
