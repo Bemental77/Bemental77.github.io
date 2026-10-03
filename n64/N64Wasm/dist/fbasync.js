@@ -35,6 +35,8 @@
 //   ?jitasync=0      the JIT builds every module in the core's own thread again, under the
 //                    per-field budget (bementalJIT mips_emit.js OFF-THREAD EMISSION) — the
 //                    A/B arm and kill switch. Default: built in jit_compile_worker.js.
+//   ?jitcold=0       the JIT keeps every slow arm inline in the span again (bementalJIT
+//                    mips_emit.js COLD PATHS) — the A/B arm and kill switch.
 //   ?glmerge=0       every glide triangle is its own draw again (geometry.c draw
 //                    merging, mymain.cpp apply_gl_shadow) — A/B arm, kill switch.
 (function (root) {
@@ -54,6 +56,8 @@
                        lazy: FB_Q.get('fblazy') !== '0',
                        jitBudget: FB_Q.has('jitbudget') ? Math.max(0, +FB_Q.get('jitbudget') | 0) : undefined,
                        jitAsync: FB_Q.get('jitasync') !== '0',
+                       jitCold: FB_Q.get('jitcold') !== '0',
+                       jitPin: FB_Q.get('jitpin') === '1',
                        seq: FB_WITNESS ? [] : null };
   // Glide64_Ini.c's read_always = 1 branches, by the name each one tests
   // (HAVE_HWFBE is not defined in this build, so the #ifndef branches apply).

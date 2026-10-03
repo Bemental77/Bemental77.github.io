@@ -96,6 +96,9 @@
   // on entry and on every backward in-span branch (br_table at $top). A NEW
   // local appended after every existing group, so no index above moves.
   var L_START = 41;
+  // COLD PATHS (2026-10-03): the index of the out-of-line handler a cold arm jumps to
+  // (see COLD PATHS in compileSpan). A new local after every existing group.
+  var L_COLD = 42;
   // RAW (2026-10-01): 1 while compiling a block that has pinned registers.
   // Its body is then wrapped as (block $raw (block $exit ...) epilogue), and
   // every exit that follows an interpreter/core call — where reg[] is already
@@ -631,6 +634,19 @@
   // The CACHE must be clean across gen_interrupt — it runs exception
   // delivery and can hand control to arbitrary guest code after we exit.
   function emitTailPoll(p, C, finalAddr, finalPtr, exitDepth) {
+    if (COLD) {
+      var flushB = C.flushAll();          // same compile-state effect as the inline arm
+      return storeI32Const(p.lastAddr, finalAddr | 0).concat(
+        loadI32(p.nextInt), loadI32(p.count), [OP.i32_le_u],
+        [OP.if_, OP.void_],
+          coldJump([].concat(
+            bump('#gen_interrupt'),
+            flushB,
+            storeI32Const(p.pcGlobal, finalPtr),
+            [OP.i32_const], sleb(p.genInt), [OP.call_indirect, 0x00, 0x00],
+            [OP.return_]), exitDepth + 1),
+        [OP.end]);
+    }
     return storeI32Const(p.lastAddr, finalAddr | 0).concat(
       loadI32(p.nextInt), loadI32(p.count), [OP.i32_le_u],
       [OP.if_, OP.void_],
@@ -674,6 +690,48 @@
     );
   }
 
+  // ---- COLD PATHS (2026-10-03) ----
+  // WHY. Measured with tools/n64_emit_unit_test.mjs's harness driving MANY distinct emitted
+  // spans round-robin (the shape of a game's frame, unlike one hot loop): 1500 spans x 150
+  // instructions ran at 26-45 ns per guest instruction against 2.3-2.8 ns for 10 such spans —
+  // the same code, ten times slower, because the emitted code does not fit the CPU's caches.
+  // The MK64 race measures exactly that: ~400k guest instructions in a heavy field at 15-19 ns
+  // each (n64_field_cost_probe --attr). Most of every span's bytes are arms that almost never
+  // run — each load/store/FP op's slow arm (flush the dirty registers, call the interpreter op),
+  // each branch's gen_interrupt arm, CHECK_MEMORY's code-page probe — interleaved with the hot
+  // path, so the hot path is spread over many more cache lines than it needs. With the slow arms
+  // removed the 1500-span case ran 17.6 ns, and with CHECK_MEMORY's inner probe also removed
+  // 6.3 ns (diagnostic arms, not shippable — this is what they priced).
+  // WHAT. A cold arm is emitted as `L_COLD = k; br $cold` (6 bytes), and its body — byte for
+  // byte what the arm did inline, ending in a return to the dispatcher — is laid out after the
+  // span's body, behind one br_table on L_COLD. CHECK_MEMORY's code-page probe becomes a call to
+  // one helper function per module. The one behavioural difference: a slow LOAD used to
+  // continue in-block after its interpreter op; it now returns to the dispatcher, which runs
+  // PC->ops for the next instruction — the same instruction the block would have run next, with
+  // reg[] complete (every register was flushed before the op). Exact either way; it costs a
+  // dispatch only on the rare off-RDRAM access.
+  // ?jitcold=0 (fbasync.js publishes it in both realms) keeps every arm inline: A/B arm, kill switch.
+  var COLD = null;           // per-compile handler list while compileSpan runs with cold paths on
+  function coldOn() {
+    var g = (typeof globalThis !== 'undefined') ? globalThis : self, f = g.__fbAsync;
+    if (EMIT_ONLY) return EMIT_ONLY.cold !== false;
+    return !(f && f.jitCold === false);
+  }
+  // pinning (see PINNING in compileSpan): window.__jitPin, or ?jitpin=1 (fbasync.js publishes it)
+  function pinOn() {
+    if (typeof window !== 'undefined' && window.__jitPin) return true;
+    if (EMIT_ONLY) return false;
+    var g = (typeof globalThis !== 'undefined') ? globalThis : self, f = g.__fbAsync;
+    return !!(f && f.jitPin);
+  }
+  // `handler` runs at the module's top level and must end in a return. `exitD` is the depth a
+  // `br` at this very position would use to reach $exit (RAW is added here, as for every exit).
+  function coldJump(handler, exitD) {
+    var k = COLD.length;
+    COLD.push(handler);
+    return [OP.i32_const].concat(sleb(k), [OP.local_set], leb(L_COLD), [OP.br], leb(exitD + RAW + 1));
+  }
+
   // The slow (non-RDRAM / CU1-clear) arm of a native memory or FP op.
   //
   // Normally it runs THIS instruction's interpreter op and CONTINUES in-block,
@@ -701,6 +759,14 @@
   // calls gen_interrupt.
   function slowArm(p, C, instrPtr, opsIdx, brDepth, slow, refreshReg, preFlush, exitAlways) {
     var flushed = preFlush || C.flushSnapshot();
+    if (COLD) {
+      // out of line, and always back to the dispatcher (see COLD PATHS)
+      return coldJump([].concat(
+        flushed,
+        storeI32Const(p.pcGlobal, slow ? slow.ptr : instrPtr),
+        [OP.i32_const], sleb(slow ? slow.opsIdx : opsIdx), [OP.call_indirect, 0x00, 0x00],
+        [OP.return_]), brDepth);
+    }
     if (slow) {
       return [].concat(
         flushed,
@@ -826,6 +892,15 @@
   // page block instr at (a&0xFFF)/4 has ops != NOTCOMPILED, mark the page
   // invalid; blocks[x] dereferenced only under invalid_code[x]==0.
   function checkMemoryBytes(p) {
+    if (COLD) {
+      // the code-page probe (ops != NOTCOMPILED) is a call to the module's helper (chkHelper)
+      return [].concat(
+        [OP.local_get, L_ADDR, OP.i32_const, 0x0C, OP.i32_shr_u],
+        [OP.i32_load8_u, 0x00], leb(p.invalidCode),
+        [OP.i32_eqz, OP.if_, OP.void_],
+          [OP.local_get, L_ADDR, OP.call], leb(CHK_FN),
+        [OP.end]);
+    }
     return [].concat(
       [OP.local_get, L_ADDR, OP.i32_const, 0x0C, OP.i32_shr_u],
       [OP.i32_load8_u, 0x00], leb(p.invalidCode),
@@ -842,6 +917,23 @@
         [OP.end],
       [OP.end]
     );
+  }
+
+  // the helper's body (one i32 param: the address): CHECK_MEMORY past invalid_code[a>>12] == 0
+  var CHK_FN = 0;            // its function index in the module being compiled
+  function chkHelper(p) {
+    return [0x00].concat(
+      [OP.local_get, 0x00, OP.i32_const, 0x0C, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl],
+      [OP.i32_load, 0x02], leb(p.blocksBase),
+      [OP.i32_load, 0x02, 0x00],
+      [OP.local_get, 0x00, OP.i32_const], sleb(0xFFF), [OP.i32_and, OP.i32_const, 0x02, OP.i32_shr_u, OP.i32_const], sleb(p.stride), [OP.i32_mul, OP.i32_add],
+      [OP.i32_load, 0x02, 0x00],
+      [OP.i32_const], sleb(p.notCompiled), [OP.i32_ne],
+      [OP.if_, OP.void_],
+        [OP.local_get, 0x00, OP.i32_const, 0x0C, OP.i32_shr_u, OP.i32_const, 0x01],
+        [OP.i32_store8, 0x00], leb(p.invalidCode),
+      [OP.end],
+      [OP.end]);
   }
 
   // SW/SB/SH: fast path writes the host-endian u32 dram array with the
@@ -943,6 +1035,21 @@
   // and only then handing control to the interpreter. flushSnapshot() does not
   // mutate compile-state, so capturing it early is free and always safe.
   function cuGuard(p, C, nativeBytes, instrPtr, opsIdx, exitDepth, word, slow, preFlush) {
+    if (COLD) {
+      return [].concat(
+        loadI32(p.cp0Status), [OP.i32_const], sleb(0x20000000), [OP.i32_and],
+        [OP.if_, OP.void_],
+          nativeBytes,
+        [OP.else_],
+          coldJump([].concat(
+            bump((slow ? 'SLOTCU1MISS:' : 'CU1MISS:') + mnem(word)),
+            preFlush,
+            storeI32Const(p.pcGlobal, slow ? slow.ptr : instrPtr),
+            [OP.i32_const], sleb(slow ? slow.opsIdx : opsIdx), [OP.call_indirect, 0x00, 0x00],
+            [OP.return_]), exitDepth + 1),
+        [OP.end]
+      );
+    }
     return [].concat(
       loadI32(p.cp0Status), [OP.i32_const], sleb(0x20000000), [OP.i32_and],
       [OP.if_, OP.void_],
@@ -1544,7 +1651,7 @@
   var EMIT_ONLY = null;          // set in the compile worker: compileSpan stops after emitting
   var TABLE_BASE = 0;            // the core's table length before any JIT slot (see NO COMPILED CODE UNDER A SPAN)
   var ASYNC = { on: null, w: null, nextId: 1, pending: new Map(), ready: [], outbox: [], frameEnds: 0, M: null,
-                offered: 0, installed: 0, stale: 0, failed: 0, maxInstallMs: 0, reoffered: 0, retry: 0 };
+                offered: 0, installed: 0, stale: 0, failed: 0, maxInstallMs: 0, reoffered: 0, retry: 0, modules: 0 };
   function asyncOn(Module) {
     if (EMIT_ONLY) return false;
     if (ASYNC.on === false) return false;
@@ -1554,7 +1661,17 @@
     if ((f && f.jitAsync === false) || census.on || typeof Worker !== 'function' || typeof g.__n64JitWorkerUrl !== 'string') { ASYNC.on = false; return false; }
     try {
       ASYNC.w = new Worker(g.__n64JitWorkerUrl);
-      ASYNC.w.onmessage = function (e) { var d = e.data; if (Array.isArray(d)) { for (var k = 0; k < d.length; k++) ASYNC.ready.push(d[k]); } else ASYNC.ready.push(d); };
+      ASYNC.w.onmessage = function (e) {
+        var d = e.data, list = Array.isArray(d) ? d : [d];
+        for (var k = 0; k < list.length; k++) {
+          var x = list[k];
+          if (x && x.batch) {
+            // one module for the whole batch: every item points at the shared holder
+            var Bh = { mod: x.mod || null, bytes: x.bytes || null, inst: null };
+            for (var q = 0; q < x.items.length; q++) { if (x.items[q].ok) x.items[q].B = Bh; ASYNC.ready.push(x.items[q]); }
+          } else ASYNC.ready.push(x);
+        }
+      };
       ASYNC.w.onerror = function (e) {
         // a worker that fails leaves everything it was asked for on the interpreter;
         // from now on spans compile in this thread again
@@ -1567,7 +1684,7 @@
   }
   function jitFlags() {
     return { noFP: !!(typeof window !== 'undefined' && window.__jitNoFP), noLabels: !!(typeof window !== 'undefined' && window.__jitNoLabels),
-             pin: !!(typeof window !== 'undefined' && window.__jitPin) };
+             pin: pinOn(), cold: coldOn() };
   }
   function asyncOffer(p, U, span, pageW0, pageN, keyArr) {
     var page = p.vaddr >>> 12, bp = U[(p.blocksBase >> 2) + page];
@@ -1593,6 +1710,10 @@
   function asyncStillHolds(M, j, r) {
     var U = M.HEAPU32, p = j.p, page = p.vaddr >>> 12, k;
     var nw = (r && r.maxW >= 0) ? r.maxW + 1 : j.words.length, no = (r && r.maxO >= 0) ? r.maxO + 1 : j.ops.length;
+    // the ops of the span's own entries (j.ops holds span + 2): the one after the span is read
+    // only by the null-ops refusal, never baked — it is typically NOTCOMPILED when offered and
+    // compiled by the time the module lands, which made 309 of 314 MK64 race spans stale
+    if (no > j.ops.length - 2) no = j.ops.length - 2;
     if (M.HEAPU8[p.invalidCode + page]) return asyncStale('invalid');
     var bp = U[(p.blocksBase >> 2) + page];
     if (!bp || bp !== j.bp || U[bp >> 2] !== j.blk || U[(bp >> 2) + 1] !== (p.blockStart >>> 0) || U[(bp >> 2) + 2] !== (p.blockEnd >>> 0)) return asyncStale('block');
@@ -1638,18 +1759,33 @@
         continue;
       }
       try {
-        var mod = r.mod || new WebAssembly.Module(r.bytes);
-        var inst = new WebAssembly.Instance(mod, { e: { t: M.wasmTable, m: M.wasmMemory, c: censusBump } });
+        var fns = [], wk;
+        if (r.B) {
+          // a batched module: instantiated once, at its first install
+          var Bh = r.B;
+          if (!Bh.inst) {
+            Bh.inst = new WebAssembly.Instance(Bh.mod || new WebAssembly.Module(Bh.bytes), { e: { t: M.wasmTable, m: M.wasmMemory } });
+            ASYNC.modules++;
+          }
+          fns.push(Bh.inst.exports['s' + r.k]);
+          for (wk = 1; wk < r.labels.length; wk++) fns.push(Bh.inst.exports['s' + r.k + '_' + wk]);
+        } else {
+          var mod = r.mod || new WebAssembly.Module(r.bytes);
+          var inst = new WebAssembly.Instance(mod, { e: { t: M.wasmTable, m: M.wasmMemory, c: censusBump } });
+          ASYNC.modules++;
+          fns.push(inst.exports.f);
+          for (wk = 1; wk < r.labels.length; wk++) fns.push(inst.exports['f' + wk]);
+        }
         var p = j.p, U = M.HEAPU32;
-        U[p.entryPtr >> 2] = installSlot(M, p.vaddr >>> 0, inst.exports.f);   // what recomp.c does with a nonzero return
-        for (var wk = 1; wk < r.labels.length; wk++) {
+        U[p.entryPtr >> 2] = installSlot(M, p.vaddr >>> 0, fns[0]);   // what recomp.c does with a nonzero return
+        for (wk = 1; wk < r.labels.length; wk++) {
           var lptr = p.entryPtr + r.labels[wk] * p.stride;
           if (U[lptr >> 2] !== r.labelOps[wk]) continue;
-          U[lptr >> 2] = installSlot(M, (p.vaddr + r.labels[wk] * 4) >>> 0, inst.exports['f' + wk]);
+          U[lptr >> 2] = installSlot(M, (p.vaddr + r.labels[wk] * 4) >>> 0, fns[wk]);
           stats.labelEntries = (stats.labelEntries || 0) + 1;
         }
         stats.blocks++;
-        cachePut(j.keyArr, inst, r.labels, r.labelOps);
+        cachePut(j.keyArr, fns, r.labels, r.labelOps);
         ASYNC.installed++;
       } catch (e) {
         ASYNC.failed++; stats.fails++;
@@ -1660,7 +1796,7 @@
     if (t0) { var d = performance.now() - t0; if (d > ASYNC.maxInstallMs) ASYNC.maxInstallMs = d; }
   }
   // the compile worker's side: run compileSpan on a copy of the inputs
-  function emitJob(job) {
+  function emitJob(job, batchCtx) {
     var p = job.p, miss = 0, w0 = job.w0, words = job.words, ops = job.ops, base = p.entryPtr >>> 0, stride = p.stride;
     var maxW = -1, maxO = -1;                 // the furthest copied word / ops field it read
     var H = new Proxy({}, { get: function (t, key) {
@@ -1674,15 +1810,74 @@
       return 0;
     } });
     window.__jitNoFP = job.flags.noFP; window.__jitNoLabels = job.flags.noLabels; window.__jitPin = job.flags.pin;
-    EMIT_ONLY = { out: null, tableBase: job.tableBase | 0 };
+    EMIT_ONLY = { out: null, tableBase: job.tableBase | 0, cold: job.flags.cold !== false,
+                  batch: !!batchCtx, fnBase: batchCtx ? batchCtx.fnBase : 0, part: null };
     TABLE_BASE = job.tableBase | 0;
     var idx = 0;
     try { idx = compileSpan(p, { HEAPU32: H }); } catch (e) { return { id: job.id, ok: false, err: String((e && e.message) || e).slice(0, 200) }; }
-    var out = EMIT_ONLY.out;
+    var out = EMIT_ONLY.out, part = EMIT_ONLY.part;
     EMIT_ONLY = null;
+    if (batchCtx) {
+      if (!idx || !part) return { id: job.id, ok: false, err: idx ? 'no module' : 'refused' };
+      if (miss) return { id: job.id, ok: false, err: 'read outside the copied inputs (' + miss + ')' };
+      return { id: job.id, ok: true, part: part, labels: part.labels, labelOps: part.labelOps, maxW: maxW, maxO: maxO };
+    }
     if (!idx || !out) return { id: job.id, ok: false, err: idx ? 'no module' : 'refused' };
     if (miss) return { id: job.id, ok: false, err: 'read outside the copied inputs (' + miss + ')' };
     return { id: job.id, ok: true, bytes: out.bytes, labels: out.labels, labelOps: out.labelOps, maxW: maxW, maxO: maxO };
+  }
+  // ---- BATCHED MODULES (2026-10-03) ----
+  // WHY. One wasm module per span made the MK64 race a chain of ~1660 modules, and calling
+  // across MANY DISTINCT MODULES is what is slow — not the code inside them. Measured with a
+  // wasm dispatcher (the r4300_step shape) chaining 21-instruction emitted spans (the MK64
+  // race's mean: ~19k JIT dispatches for ~400k instructions in a heavy field): 1600 spans in
+  // 1600 modules ran 23-25 ns per guest instruction (~500 ns per dispatch) — the race's own
+  // 15-19 ns — against 1.1 ns for 4000 instances of ONE module, and 10 ns for the same 1600
+  // spans as functions of ONE module. Each V8 module is its own code space and jump table, so
+  // every dispatch into a new module lands on new pages.
+  // WHAT. The compile worker receives offers in batches (asyncFlush: up to 32, or every field
+  // end) and now emits each batch as ONE module: one shared CHECK_MEMORY helper (function 0),
+  // then every span's body and label wrappers, one global (the multi-entry segment hand-off —
+  // a wrapper sets it and its body consumes it at entry, so spans can share it), exports
+  // "s<k>" / "s<k>_<w>". Each span is still validated and installed on its own
+  // (asyncStillHolds): a stale span's functions are simply never installed. The code is byte
+  // for byte what the span's own module held, but for function indices.
+  function emitBatch(jobs) {
+    var items = [], parts = [], fnBase = 1, p0 = null, t0 = (typeof performance !== 'undefined') ? performance.now() : 0;
+    for (var bj = 0; bj < jobs.length; bj++) {
+      var job = jobs[bj];
+      var r = emitJob(job, { batch: true, fnBase: fnBase });
+      if (!r.ok) { items.push(r); continue; }
+      r.k = parts.length;
+      parts.push({ fnBase: fnBase, part: r.part });
+      fnBase += r.part.funcs.length;
+      if (!p0) p0 = job.p;
+      delete r.part;
+      items.push(r);
+    }
+    if (!parts.length) return { batch: true, items: items, bytes: null };
+    var funcs = [chkHelper(p0)], types = [1], k, w;
+    for (k = 0; k < parts.length; k++) for (w = 0; w < parts[k].part.funcs.length; w++) { funcs.push(parts[k].part.funcs[w]); types.push(0); }
+    var exps = [], nExp = 0;
+    var name = function (t) { var a = t.split('').map(function (ch) { return ch.charCodeAt(0); }); return leb(a.length).concat(a); };
+    // every list is built in place: a batch is ~100 KB of code, and concat-per-item is quadratic
+    for (k = 0; k < parts.length; k++) {
+      var fb = parts[k].fnBase, nf = parts[k].part.funcs.length;
+      app(exps, name('s' + k)); exps.push(0x00); app(exps, leb(fb)); nExp++;
+      for (w = 1; w < nf; w++) { app(exps, name('s' + k + '_' + w)); exps.push(0x00); app(exps, leb(fb + w)); nExp++; }
+    }
+    var fdecl = leb(funcs.length);
+    for (k = 0; k < types.length; k++) app(fdecl, leb(types[k]));
+    var code = leb(funcs.length);
+    for (k = 0; k < funcs.length; k++) { app(code, leb(funcs[k].length)); app(code, funcs[k]); }
+    var bytes = new Uint8Array([0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00].concat(
+      section(1, [].concat(leb(2), [0x60, 0x00, 0x00], [0x60, 0x01, 0x7F, 0x00])),
+      section(2, [].concat(leb(2), [1, 0x65, 1, 0x74, 0x01, 0x70, 0x00, 0x00], [1, 0x65, 1, 0x6D, 0x02, 0x00, 0x00])),
+      section(3, fdecl),
+      section(6, [0x01, 0x7F, 0x01, OP.i32_const, 0x00, OP.end]),
+      section(7, leb(nExp).concat(exps)),
+      section(10, code)));
+    return { batch: true, items: items, bytes: bytes, spans: parts.length, ms: t0 ? performance.now() - t0 : 0 };
   }
   function installSlot(Module, vkey, fn) {
     var sidx = slotByVaddr[vkey];
@@ -1698,13 +1893,14 @@
     }
     return sidx;
   }
-  function cachePut(keyArr, inst, labels, labelOps) {
+  // fns: the span's entry function and its label wrappers, in label order
+  function cachePut(keyArr, fns, labels, labelOps) {
     var kh = 0x811c9dc5 | 0;
     for (var kq = 0; kq < keyArr.length; kq++) kh = Math.imul(kh ^ keyArr[kq], 16777619);
     if (spanCacheN >= SPAN_CACHE_MAX) { spanCache.clear(); spanCacheN = 0; }
     var nb = spanCache.get(kh);
     if (!nb) { nb = []; spanCache.set(kh, nb); }
-    nb.push({ key: keyArr, inst: inst, labels: labels, labelOps: labelOps });
+    nb.push({ key: keyArr, fns: fns, labels: labels, labelOps: labelOps });
     spanCacheN++;
   }
 
@@ -1714,6 +1910,7 @@
     // (it decides each module's import/type shape)
     if (census.on === null) census.on = !!(typeof window !== 'undefined' && window.__jitCensus);
     RAW = 0;
+    COLD = null;
     var HEAPU32 = Module.HEAPU32;
     var C = new RegCache(p.reg);
     p.regBase = p.reg;
@@ -1805,9 +2002,15 @@
     // measured, "Maximum call stack size exceeded" from a JIT module). Interpreter ops are
     // functions of the core's own table; JIT blocks are slots appended after it, so any op at
     // or above the table's length at the first compile is not an interpreter op: refuse.
+    // ONLY THE SPAN'S OWN ENTRIES (2026-10-03): index `span` — the instruction after the span
+    // — is never baked into a module (a branch at span-1 is emitted as a 'span-end' fallback of
+    // its own op; the fall-through exit stores the POINTER &block[span], not its op). It is
+    // very often the entry of the NEXT function, already a JIT block, and checking it refused
+    // 177 MK64 race spans outright (every jitOpReject measured was at index == span), among
+    // them the game's hottest loops, which then ran on the cached interpreter for good.
     if (!TABLE_BASE) TABLE_BASE = EMIT_ONLY ? (EMIT_ONLY.tableBase | 0) : (Module.wasmTable ? Module.wasmTable.length : 0);
     if (TABLE_BASE) {
-      for (var gj = 0; gj < scanEnd; gj++) {
+      for (var gj = 0; gj < span; gj++) {
         if (HEAPU32[(p.entryPtr + gj * p.stride) >> 2] >= TABLE_BASE) {
           stats.jitOpRejects = (stats.jitOpRejects || 0) + 1;
           return 0;
@@ -1872,13 +2075,14 @@
     // key is exactly that, compared IN FULL on a hit (the hash only picks the
     // bucket), and a hit re-installs the very same instance — identical code,
     // no byte generation, no wasm compile.
-    var keyLen = 6 + pageN + span + 1;
+    // (the ops of the span's own entries only: index `span` is not baked — see above)
+    var keyLen = 6 + pageN + span;
     var keyArr = new Uint32Array(keyLen);
     keyArr[0] = p.vaddr >>> 0; keyArr[1] = p.entryPtr >>> 0; keyArr[2] = span; keyArr[3] = p.blockStart >>> 0;
     keyArr[4] = p.blockEnd >>> 0; keyArr[5] = p.srcPtr >>> 0;
     var kh = 0x811c9dc5 | 0, kq;
     for (kq = 0; kq < pageN; kq++) keyArr[6 + kq] = HEAPU32[pageW0 + kq];
-    for (kq = 0; kq <= span; kq++) keyArr[6 + pageN + kq] = HEAPU32[(p.entryPtr + kq * p.stride) >> 2];
+    for (kq = 0; kq < span; kq++) keyArr[6 + pageN + kq] = HEAPU32[(p.entryPtr + kq * p.stride) >> 2];
     for (kq = 0; kq < keyLen; kq++) kh = Math.imul(kh ^ keyArr[kq], 16777619);
     var bucket = EMIT_ONLY ? null : spanCache.get(kh);
     if (bucket) {
@@ -1886,11 +2090,11 @@
         var ce = bucket[bi], same = ce.key.length === keyLen;
         for (kq = 0; same && kq < keyLen; kq++) same = ce.key[kq] === keyArr[kq];
         if (!same) continue;
-        var hidx = installSlot(Module, p.vaddr >>> 0, ce.inst.exports.f);
+        var hidx = installSlot(Module, p.vaddr >>> 0, ce.fns[0]);
         for (var hk = 1; hk < ce.labels.length; hk++) {
           var hptr = p.entryPtr + ce.labels[hk] * p.stride;
           if (HEAPU32[hptr >> 2] !== ce.labelOps[hk]) continue;
-          HEAPU32[hptr >> 2] = installSlot(Module, (p.vaddr + ce.labels[hk] * 4) >>> 0, ce.inst.exports['f' + hk]);
+          HEAPU32[hptr >> 2] = installSlot(Module, (p.vaddr + ce.labels[hk] * 4) >>> 0, ce.fns[hk]);
           stats.labelEntries = (stats.labelEntries || 0) + 1;
         }
         stats.cacheHits = (stats.cacheHits || 0) + 1;
@@ -1968,7 +2172,7 @@
     // 27-ROM hashed sweep, but its matched pairs on MK64 were inside the rig's
     // noise (4x CPU: 0.979 and 1.056 against the unpinned emitter, opposite
     // signs) — so it does not ship on until a quiet-box pair shows a gain.
-    if (typeof window !== 'undefined' && window.__jitPin) {
+    if (pinOn()) {
       var refs = new Int32Array(32);
       for (var pb = 0; pb + 1 < span; pb++) {
         var pd = decodeBranch(HEAPU32[srcW + pb], (p.vaddr + pb * 4) >>> 0, p);
@@ -1990,6 +2194,10 @@
       stats.pinnedBlocks = (stats.pinnedBlocks || 0) + 1;
       stats.pinnedRegs = (stats.pinnedRegs || 0) + nPins;
     }
+    // COLD PATHS: handlers collected while the body is emitted; the helper sits after the
+    // body function and its label wrappers
+    COLD = coldOn() ? [] : null;
+    CHK_FN = (EMIT_ONLY && EMIT_ONLY.batch) ? 0 : (census.on ? 1 : 0) + nSeg;   // a batch module puts the helper first
     var seg = 0;
     EXIT = nSeg; TOP = nSeg - 1;       // segment 0's depths (1 / 0 when nSeg == 1)
     var closedSegs = 0;
@@ -2040,9 +2248,11 @@
           // an over-reporting one is worse than none: restore them around the
           // probe and let the real emission below do the counting.
           var cvt0 = stats.nativeFPCvt, cmp0 = stats.nativeFPCmp;
+          var coldN0 = COLD ? COLD.length : 0;
           var probed = emitSlotNative(slotWord, p.entryPtr + (i + 1) * p.stride, p, probeC,
                                       HEAPU32[(p.entryPtr + (i + 1) * p.stride) >> 2], 0,
                                       { ptr: instrPtr, opsIdx: HEAPU32[instrPtr >> 2] });
+          if (COLD) COLD.length = coldN0;     // the probe's bytes are discarded: so are its handlers
           stats.nativeFPCvt = cvt0; stats.nativeFPCmp = cmp0;
           if (probed !== null) { br = dec; brOut = isOut; slotMem = true; }
           else brReason = 'slot:' + mnem(slotWord);
@@ -2066,7 +2276,18 @@
         // argument slowArm() makes for a faulting delay slot, only stronger
         // (there, the link register had already been written).
         var cu1Prefix = [];
-        if (br.cu1) {
+        if (br.cu1 && COLD) {
+          cu1Prefix = [].concat(
+            loadI32(p.cp0Status), [OP.i32_const], sleb(0x20000000), [OP.i32_and], [OP.i32_eqz],
+            [OP.if_, OP.void_],
+              coldJump([].concat(
+                bump('CU1MISS:' + mnem(word)),
+                C.flushSnapshot(),
+                storeI32Const(p.pcGlobal, instrPtr),
+                [OP.i32_const], sleb(HEAPU32[instrPtr >> 2]), [OP.call_indirect, 0x00, 0x00],
+                [OP.return_]), EXIT + 1),
+            [OP.end]);
+        } else if (br.cu1) {
           cu1Prefix = [].concat(
             loadI32(p.cp0Status), [OP.i32_const], sleb(0x20000000), [OP.i32_and], [OP.i32_eqz],
             [OP.if_, OP.void_],
@@ -2325,6 +2546,9 @@
     }
 
     var LOCALS = [0x0A, 0x02, 0x7F, 0x20, 0x7E, 0x01, 0x7E, 0x01, 0x7F, 0x01, 0x7F, 0x01, 0x7D, 0x01, 0x7C, 0x01, 0x7D, 0x01, 0x7C, 0x01, 0x7F];  // locals: 2xi32, 32xi64 regs, i64 scratch, i32 jump-target, i32 branch-cond, f32+f64 convert scratch (wave 11a), f32+f64 compare operand B (wave 11b), i32 segment start (multi-entry)
+    var coldList = COLD;
+    COLD = null;
+    if (coldList) LOCALS = [0x0B].concat(LOCALS.slice(1), [0x01, 0x7F]);   // + i32 L_COLD
     var full = RAW
       // (block $raw  guard  (block $exit  prologue (loop $top ...))  epilogue)
       // The delay-slot guard sits in $raw so its exit skips the epilogue: it
@@ -2336,10 +2560,31 @@
           [OP.loop, OP.void_], bump('#block-iter'), dispatch, body,
           [OP.end, OP.end, OP.end]);
 
+    if (coldList) {
+      // (block $cold <body> return) — every normal exit returns inside it, so only a cold arm's
+      // `br $cold` reaches what follows: the handlers: one br_table on L_COLD, each handler
+      // ending in a return (nothing falls out of the last one)
+      // built in place (the body is tens of KB: no slice/concat copies of it)
+      var fullC = LOCALS.concat([OP.block, OP.void_]);
+      for (var fi = LOCALS.length; fi < full.length - 1; fi++) fullC.push(full[fi]);   // the body without the function's end
+      fullC.push(OP.return_, OP.end);
+      if (coldList.length) {
+        for (var hc = 0; hc < coldList.length; hc++) fullC.push(OP.block, OP.void_);
+        fullC.push(OP.local_get); app(fullC, leb(L_COLD)); fullC.push(OP.br_table); app(fullC, leb(coldList.length));
+        for (hc = 0; hc < coldList.length; hc++) app(fullC, leb(hc));
+        app(fullC, leb(0)); fullC.push(OP.end);
+        for (hc = 0; hc < coldList.length; hc++) { app(fullC, coldList[hc]); if (hc + 1 < coldList.length) fullC.push(OP.end); }
+      }
+      fullC.push(OP.end);
+      full = fullC;
+      stats.coldArms = (stats.coldArms || 0) + coldList.length;
+    }
+
     // census adds one imported host func "e"."c" (type 1: (i32)->()), which
     // takes function index 0 and pushes the defined block function to 1
     var cen = !!census.on;
-    var bodyFn = cen ? 1 : 0;
+    var batch = !!(EMIT_ONLY && EMIT_ONLY.batch);
+    var bodyFn = batch ? EMIT_ONLY.fnBase : (cen ? 1 : 0);
     var funcs = [full];
     for (var wk = 1; wk < nSeg; wk++) {
       funcs.push([0x00].concat(            // no locals
@@ -2352,15 +2597,22 @@
         [OP.call], leb(bodyFn),
         [OP.end]));
     }
-    var typeSec = section(1, cen
+    if (batch) {
+      // BATCHED MODULES: this span's functions go into the module emitBatch assembles
+      EMIT_ONLY.part = { funcs: funcs, labels: labels, labelOps: labelOps };
+      return 1;
+    }
+    if (coldList) funcs.push(chkHelper(p));     // CHK_FN: after the body and its wrappers
+    var typeSec = section(1, (cen || coldList)
       ? [].concat(leb(2), [0x60, 0x00, 0x00], [0x60, 0x01, 0x7F, 0x00])
       : [].concat(leb(1), [0x60, 0x00, 0x00]));
     var importSec = section(2, [].concat(leb(cen ? 3 : 2),
       [1, 0x65, 1, 0x74, 0x01, 0x70, 0x00, 0x00],
       [1, 0x65, 1, 0x6D, 0x02, 0x00, 0x00],
       cen ? [1, 0x65, 1, 0x63, 0x00, 0x01] : []));
-    var fdecl = leb(nSeg);
+    var fdecl = leb(funcs.length);
     for (wk = 0; wk < nSeg; wk++) fdecl = fdecl.concat(leb(0));
+    if (coldList) fdecl = fdecl.concat(leb(1));
     var funcSec = section(3, fdecl);
     var globalSec = nSeg > 1 ? section(6, [0x01, 0x7F, 0x01, OP.i32_const, 0x00, OP.end]) : [];
     // exports: "f" = label 0 (the body), "f<k>" = wrapper k
@@ -2370,8 +2622,10 @@
       exps = exps.concat(leb(nm.length), nm, [0x00], leb(bodyFn + wk));
     }
     var exportSec = section(7, exps);
-    var code = leb(nSeg);
-    for (wk = 0; wk < nSeg; wk++) code = code.concat(leb(funcs[wk].length), funcs[wk]);
+    // in place: `code = code.concat(...)` per function re-copied the body for every label
+    // wrapper after it — 34.6 ms of a 292-instruction span's 35 ms emit (92 wrappers)
+    var code = leb(funcs.length);
+    for (wk = 0; wk < funcs.length; wk++) { app(code, leb(funcs[wk].length)); app(code, funcs[wk]); }
     var codeSec = section(10, code);
     var bytes = new Uint8Array([0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00]
       .concat(typeSec, importSec, funcSec, globalSec, exportSec, codeSec));
@@ -2393,7 +2647,9 @@
         stats.labelEntries = (stats.labelEntries || 0) + 1;
       }
       stats.blocks++;
-      cachePut(keyArr, inst, labels, labelOps);
+      var fns1 = [inst.exports.f];
+      for (wk = 1; wk < nSeg; wk++) fns1.push(inst.exports['f' + wk]);
+      cachePut(keyArr, fns1, labels, labelOps);
       return idx;
     } catch (e) {
       stats.fails++;
@@ -2411,5 +2667,5 @@
     return out;
   }
   window.bementalMips = { compileSpan: compileSpan, frameEnd: frameEnd, stats: stats, census: censusDump, censusOn: function () { return !!census.on; },
-                         async: ASYNC, emitJob: emitJob };
+                         async: ASYNC, emitJob: emitJob, emitBatch: emitBatch };
 })();

@@ -209,9 +209,14 @@ function makeWorld(words, opts = {}) {
 // `--pin` runs the WHOLE corpus with register pinning on (window.__jitPin);
 // cases that pin opts.pin themselves. CI should run it both ways.
 const PIN_ALL = process.argv.includes('--pin');
-function loadEmitter(pin) {
+// `--nocold` runs the WHOLE corpus with every slow arm inline (?jitcold=0, mips_emit.js COLD
+// PATHS); cases that set opts.noCold do so themselves. CI should run it both ways.
+const NOCOLD_ALL = process.argv.includes('--nocold');
+function loadEmitter(pin, noCold, cold) {
   const sb = { WebAssembly, console: { error() {}, log() {}, warn() {} }, Uint32Array, Object, Array, Math, String };
-  sb.window = sb; sb.__jitPin = !!(pin || PIN_ALL); vm.createContext(sb); vm.runInContext(src, sb);
+  sb.window = sb; sb.__jitPin = !!(pin || PIN_ALL);
+  if (noCold || (NOCOLD_ALL && !cold)) sb.__fbAsync = { jitCold: false };
+  vm.createContext(sb); vm.runInContext(src, sb);
   return sb.bementalMips;
 }
 
@@ -221,7 +226,7 @@ function T(name, words, { regs = {}, dram = {}, expectRegs = {}, expectDram = {}
                           expectFprI32 = {}, expectFprI64 = {}, expectFprF32 = {}, expectFprF64 = {},
                           expectRefused = false, expectPC = null, expectLastAddr = null, expectCount = null,
                           lastAddr = null, enterAt = 0 }) {
-  const bm = loadEmitter(opts.pin);
+  const bm = loadEmitter(opts.pin, opts.noCold, opts.cold);
   const { mem, table, HEAPU32, REG64, p } = makeWorld(words, opts);
   const DV = new DataView(mem.buffer);
   HEAPU32[FCR31A >> 2] = fcr31 >>> 0;
@@ -381,8 +386,12 @@ const tests = [
     { expectRegs: { 9: '0x0' }, expectPC: ENTRY + STRIDE, expectStats: { labelEntries: 1 } }),
   T('control: a native SW adds no label after itself', [I(OPC.SW, 4, 8, 0x18), I(OPC.ADDIU, 0, 9, 5), 0],
     { regs: { 4: HIT_ADDR }, opts: { rdramHit: true }, expectRegs: { 9: '0x5' }, expectStats: { labelEntries: undefined } }),
-  T('control: a LOAD slow arm still continues in-block', [I(OPC.LW, 4, 8, 0x18), I(OPC.ADDIU, 0, 9, 5), 0],
-    { regs: { 4: SLOW_ADDR }, expectRegs: { 9: '0x5' } }),
+  T('control (?jitcold=0): a LOAD slow arm still continues in-block', [I(OPC.LW, 4, 8, 0x18), I(OPC.ADDIU, 0, 9, 5), 0],
+    { regs: { 4: SLOW_ADDR }, expectRegs: { 9: '0x5' }, opts: { noCold: true } }),
+  // COLD PATHS: the slow arm is out of line and returns to the dispatcher after its op, with
+  // PC at the next instruction (the stub op advanced it) and nothing after it run
+  T('cold: a LOAD slow arm hands back at the next instruction', [I(OPC.LW, 4, 8, 0x18), I(OPC.ADDIU, 0, 9, 5), 0],
+    { regs: { 4: SLOW_ADDR }, expectRegs: { 9: '0x0' }, expectPC: ENTRY + STRIDE, opts: { cold: true } }),
   // controls: the fast arm was always correct and must stay so
   T('SW fast arm control', [I(OPC.SW, 4, 8, 0x18), OR(10, 8, 0)],
     { regs: { 4: HIT_ADDR, 8: V }, expectRegs: { 10: V }, opts: { rdramHit: true } }),
@@ -1027,6 +1036,52 @@ function cacheCase(name, mutate, wantHit) {
 tests.push(cacheCase('recompile of an IDENTICAL span re-installs the cached instance (entry + labels)', () => {}, true));
 tests.push(cacheCase('control: one changed page word MISSES the cache', (w) => { w.HEAPU32[(SRC >> 2) + 5] = I(OPC.ADDIU, 0, 3, 9); }, false));
 tests.push(cacheCase('control: one changed precomp op MISSES the cache', (w) => { w.HEAPU32[(ENTRY + 2 * STRIDE) >> 2] = 2; }, false));
+
+// ---- BATCHED MODULES (2026-10-03): the compile worker emits a batch of offers as ONE module
+// (mips_emit.js emitBatch). Each span's code must run exactly as from its own module: the same
+// span is emitted alone (compileSpan) and as the SECOND span of a two-span batch, and both are
+// run from the entry and from a label (wrapper -> body by function index, the shared segment
+// global, the shared CHECK_MEMORY helper at index 0), through a slow store (cold arm) and a
+// CHECK_MEMORY probe of a code page.
+function batchCase(name, enterAt, slow) {
+  // 0 r9++ | 1 r8++ <- label | 2 sw r8,0x18(r4) | 3 bne r8,r10,1 | 4 (slot) r11++ | 5 nop
+  const words = [I(OPC.ADDIU, 9, 9, 1), I(OPC.ADDIU, 8, 8, 1), I(OPC.SW, 4, 8, 0x18), I(OPC.BNE, 8, 10, 0xfffd), I(OPC.ADDIU, 11, 11, 1), 0, 0];
+  const seed = (w) => {
+    w.REG64[(REG >> 3) + 4] = BigInt.asUintN(64, BigInt(slow ? SLOW_ADDR : HIT_ADDR));
+    w.REG64[(REG >> 3) + 10] = 5n;
+    w.HEAPU32[PCG >> 2] = ENTRY + enterAt * STRIDE;
+  };
+  const read = (w) => [8, 9, 10, 11].map((r) => w.REG64[(REG >> 3) + r]).join(',') + ' pc=' + w.HEAPU32[PCG >> 2] + ' dram=' + w.HEAPU32[(DRAM + 0x100018) >> 2] + ' inv=' + new Uint8Array(w.mem.buffer)[INVALID + 0x100];
+  const opts = { rdramHit: !slow };
+  // (a) alone
+  const bmA = loadEmitter();
+  const wa = makeWorld(words, opts); seed(wa);
+  const ia = bmA.compileSpan(wa.p, { HEAPU32: wa.HEAPU32, wasmTable: wa.table, wasmMemory: wa.mem });
+  // a code page under the store: CHECK_MEMORY must mark it (blocks[0x100] -> a block whose op is not NOTCOMPILED)
+  const codePage = (w) => { w.HEAPU32[(BLOCKS >> 2) + 0x100] = 0x500000; w.HEAPU32[0x500000 >> 2] = 0x510000; w.HEAPU32[(0x510000 + (0x18 >> 2) * STRIDE) >> 2] = 5; };
+  codePage(wa);
+  const fa = enterAt ? wa.HEAPU32[(ENTRY + enterAt * STRIDE) >> 2] : ia;   // the entry is installed by the core (recomp.c), labels by the emitter
+  try { wa.table.get(fa)(); } catch (e) { return { name, ok: false, detail: 'alone trapped ' + e }; }
+  // (b) second span of a batch, from offer-shaped jobs (asyncOffer)
+  const bmB = loadEmitter();
+  const wb = makeWorld(words, opts); seed(wb);
+  const p = wb.p, pageN = words.length;
+  const job = (id) => ({ id, p: Object.assign({}, p), w0: SRC >> 2, words: wb.HEAPU32.slice(SRC >> 2, (SRC >> 2) + pageN + 1),
+                         ops: wb.HEAPU32.slice(0, 0).constructor.from({ length: p.span + 2 }, (_, k) => wb.HEAPU32[(ENTRY + k * STRIDE) >> 2]),
+                         flags: { noFP: false, noLabels: false, pin: false, cold: true }, tableBase: wb.table.length });
+  const r = bmB.emitBatch([job(1), job(2)]);
+  if (!r.bytes || r.items.some((it) => !it.ok)) return { name, ok: false, detail: 'batch failed ' + JSON.stringify(r.items.map((it) => it.err || it.ok)) };
+  const inst = new WebAssembly.Instance(new WebAssembly.Module(r.bytes), { e: { t: wb.table, m: wb.mem } });
+  const it2 = r.items[1], fn = enterAt ? inst.exports['s' + it2.k + '_' + it2.labels.indexOf(enterAt)] : inst.exports['s' + it2.k];
+  if (!fn) return { name, ok: false, detail: 'no export for entry ' + enterAt + ' labels ' + JSON.stringify(it2.labels) };
+  codePage(wb);
+  try { fn(); } catch (e) { return { name, ok: false, detail: 'batch trapped ' + e }; }
+  const A = read(wa), B = read(wb);
+  return { name, ok: ia > 0 && A === B, detail: `alone ${A} | batch ${B}` };
+}
+tests.push(batchCase('batch: a span runs as from its own module (entry, fast store, code-page probe)', 0, false));
+tests.push(batchCase('batch: entering through a label wrapper (shared segment global)', 1, false));
+tests.push(batchCase('batch: a slow store takes its cold arm and hands back', 0, true));
 
 let fail = 0;
 for (const t of tests) {

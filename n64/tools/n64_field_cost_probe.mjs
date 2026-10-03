@@ -59,6 +59,13 @@ const CLOCK = argv.includes('--clock');
 // cost is then read from the core's own retro_run timer (_neil_frame_cost_ms, mymain.cpp
 // timed_retro_run) by the pad function, which runs once before every field.
 const NODBG = argv.includes('--nodbg');
+// --attr (with --clock --nodbg): per field, where the time went — the core's RSP task timers
+// (_neil_attr: 0 gfx task = glide's display list, 1 audio task = HLE alist, 2 other tasks) when the
+// build exports them (a DIAGNOSTIC core only: the shipped core exports none of _neil_attr /
+// _neil_idle / _neil_count, so on it --attr reports the WebGL time alone), and the time inside every WebGL call (the prototype wrapped, so the
+// GL time is a part of the gfx time). Attribution only, never a rate (the wrappers cost time).
+const ATTR = argv.includes('--attr');
+const ATTR_NOGLT = argv.includes('--attr-nogl-timer');   // the core's timers only: WebGL calls not wrapped
 // --profile: a CPU profile of the CORE WORKER over the measured window (attribution only —
 // a profiled run is never a rate: CLAUDE.md #10)
 const PROFILE = argv.includes('--profile');
@@ -73,6 +80,10 @@ const LOGMAX = +flag('logmax', '60');
 const TRACEGL = flag('tracegl', '');
 const GLCENSUS = argv.includes('--glcensus');
 const FINISH = argv.includes('--finish');
+// --evalend FILE: a worker-realm expression (the file's text) evaluated after the measured
+// window; its JSON-able value lands in res.evalEnd (an inspection seam, e.g. JIT state)
+const EVALEND = flag('evalend', '');
+const EVALSTART = flag('evalstart', '');   // the same, evaluated once right after boot (clock mode)
 const CHROME = process.env.CHROME_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
 // --wcpu F: every DedicatedWorker thread of this browser (the core worker, the JIT's compile
 // worker) is held to F of one core by a cgroup v1 cpu quota — the phone stand-in. A CDP CPU
@@ -303,7 +314,9 @@ const browser = await puppeteer.launch({
   headless: 'new', executablePath: fs.existsSync(CHROME) ? CHROME : undefined, protocolTimeout: 1800000,
   args: ['--no-sandbox', '--disable-dev-shm-usage', '--autoplay-policy=no-user-gesture-required',
          '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows',
-         '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist', '--window-size=1280,900'],
+         '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist', '--window-size=1280,900']
+         // --jsflags F: V8 flags for a DIAGNOSTIC arm only (a web page cannot set them: CLAUDE.md #11)
+         .concat(flag('jsflags', '') ? ['--js-flags=' + flag('jsflags', '')] : []),
 });
 try { require(path.join(path.dirname(__filename), '../../tools/browser_leak_guard.js')).guard(browser, __filename); } catch (_e) {}
 let CG = null;
@@ -332,12 +345,29 @@ try {
       self.__rigFields = [];
       if (${NODBG}) {
         // the core's own per-retro_run timer: its delta, read before field f, is field f-1's cost
-        let lastMs = null, lastN = null;
+        let lastMs = null, lastN = null, lastA = null;
         const M = self.Module;
+        const ATTR = ${ATTR};
+        if (ATTR && ${ATTR_NOGLT}) self.__glT = { ms: 0, n: 0 };
+        if (ATTR && !self.__glT) {
+          self.__glT = { ms: 0, n: 0 };
+          const P = WebGL2RenderingContext.prototype;
+          for (const nm of Object.getOwnPropertyNames(P)) {
+            let d; try { d = Object.getOwnPropertyDescriptor(P, nm); } catch (e) { continue; }
+            if (!d || typeof d.value !== 'function' || nm === 'constructor') continue;
+            const fn = d.value;
+            P[nm] = function () { const t = performance.now(); try { return fn.apply(this, arguments); } finally { self.__glT.ms += performance.now() - t; self.__glT.n++; } };
+          }
+        }
+        const attrNow = () => ATTR ? [M._neil_attr ? M._neil_attr(0) : 0, M._neil_attr ? M._neil_attr(1) : 0, M._neil_attr ? M._neil_attr(2) : 0, self.__glT.ms, self.__glT.n, M._neil_count ? M._neil_count() : 0, M._neil_idle ? M._neil_idle() : 0, M._neil_attr ? M._neil_attr(4) : 0, M._neil_attr ? M._neil_attr(5) : 0, M._neil_attr ? M._neil_attr(6) : 0].concat(M._neil_attr ? [3,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21].map((k) => M._neil_attr(k)) : []).concat(self.bementalMips && self.bementalMips.async ? [self.bementalMips.async.installed, self.bementalMips.async.pending.size, self.bementalMips.async.ready.length] : []) : null;
+        self.__rigAttr = [];
         self.__rigCost = function (f) {
-          const ms = M._neil_frame_cost_ms(), n = M._neil_frame_cost_n() >>> 0;
-          if (lastN !== null && n === lastN + 1) self.__rigFields.push(f - 1, ms - lastMs);
-          lastMs = ms; lastN = n;
+          const ms = M._neil_frame_cost_ms(), n = M._neil_frame_cost_n() >>> 0, a = attrNow();
+          if (lastN !== null && n === lastN + 1) {
+            self.__rigFields.push(f - 1, ms - lastMs);
+            if (a) { const d = a.map((x, i) => x - lastA[i]); if (d[5] < 0) d[5] += 4294967296; if (a.length > 27) { d[27] = a[27]; d[28] = a[28]; } self.__rigAttr.push(d); }
+          }
+          lastMs = ms; lastN = n; lastA = a;
         };
       }
       self.__n64PadOverride = function (f, q) {
@@ -347,6 +377,7 @@ try {
         return [m, Math.round(ax * 32000), Math.round(ay * 32000)];
       };
       return CLK.frame; })()`);
+    if (EVALSTART) res.evalStart = await page.evaluate((src) => window.__n64Worker.eval(src), fs.readFileSync(EVALSTART, 'utf8'));
     const tMark = {};
     let profOnC = false;
     for (;;) {
@@ -377,9 +408,18 @@ try {
       res.profileBusyMs = Math.round(tot / 1000);
       res.profileTop = [...self.entries()].filter(([k]) => k !== '(idle) ').sort((a, b) => b[1] - a[1]).slice(0, 50).map(([k, v]) => [k, +(100 * v / tot).toFixed(2)]);
     }
-    const o = await page.evaluate(() => window.__n64Worker.eval(`(() => { const a = self.__rigFields; self.__n64PadOverride = null; return { a: Array.from(a), per: 1000 / CLK.viHz, lost: CLK.lostMs, reanchors: CLK.reanchors, presents: CLK.presents }; })()`));
-    const dt = [];
-    for (let i = 0; i < o.a.length; i += 2) if (o.a[i] >= FROM && o.a[i] < FRAMES) dt.push(+o.a[i + 1].toFixed(2));
+    const o = await page.evaluate(() => window.__n64Worker.eval(`(() => { const a = self.__rigFields; self.__n64PadOverride = null; return { a: Array.from(a), at: self.__rigAttr || [], per: 1000 / CLK.viHz, lost: CLK.lostMs, reanchors: CLK.reanchors, presents: CLK.presents }; })()`));
+    const dt = [], at = [];
+    for (let i = 0; i < o.a.length; i += 2) if (o.a[i] >= FROM && o.a[i] < FRAMES) { dt.push(+o.a[i + 1].toFixed(2)); if (o.at.length) at.push(o.at[i >> 1]); }
+    if (at.length) {
+      // mean ms per field of each part, over all fields and over the heaviest tenth
+      const parts = (rows, ds) => { const s = [0, 0, 0, 0, 0, 0]; rows.forEach((r, k) => { s[0] += ds[k]; for (let j = 0; j < 5; j++) s[j + 1] += r[j]; });
+        const n = rows.length || 1; return { total: +(s[0] / n).toFixed(2), gfx: +(s[1] / n).toFixed(2), audio: +(s[2] / n).toFixed(2), otherTask: +(s[3] / n).toFixed(2), gl: +(s[4] / n).toFixed(2), glCalls: Math.round(s[5] / n), cpuEtc: +((s[0] - s[1] - s[2] - s[3]) / n).toFixed(2) }; };
+      const idx = dt.map((x, i) => i).sort((a, b) => dt[b] - dt[a]);
+      const top = idx.slice(0, Math.max(1, Math.floor(dt.length / 10)));
+      res.attr = { all: parts(at, dt), heavy10: parts(top.map((i) => at[i]), top.map((i) => dt[i])) };
+      res.attrRows = at.map((r, i) => [dt[i]].concat(r.map((x) => +x.toFixed(2))));
+    }
     res.per = o.per;
     const sum = dt.reduce((a, b) => a + b, 0);
     res.fields = dt.length;
@@ -391,10 +431,11 @@ try {
       const M = self.Module, o = {};
       try { if (M._neil_lfb_stats) { const p = M._malloc(32); M._neil_lfb_stats(p); o.lfb = Array.from(M.HEAPU32.subarray(p >> 2, (p >> 2) + 8)); M._free(p); } } catch (e) {}
       if (self.DBG) { o.dbg = self.DBG.report(); o.dbg.dist = self.DBG.dist(4096); }
-      if (self.bementalMips && self.bementalMips.async) { const A = self.bementalMips.async; o.jitAsync = { on: A.on, offered: A.offered, installed: A.installed, stale: A.stale }; }
+      if (self.bementalMips && self.bementalMips.async) { const A = self.bementalMips.async; o.jitAsync = { on: A.on, offered: A.offered, installed: A.installed, stale: A.stale, failed: A.failed, pending: A.pending ? A.pending.size : undefined, ready: A.ready ? A.ready.length : undefined, modules: A.modules }; }
       const F = self.__fbAsync; if (F) o.fb = { on: F.on, calls: F.calls, async: F.async, sync: F.sync, blocked: F.blocked, prefetchBlocked: F.prefetchBlocked };
       if (typeof GQ !== 'undefined') o.gq = { on: GQ.on, max: GQ.max, held: GQ.held, heldMs: Math.round(GQ.heldMs), forced: GQ.forced, out: GQ.fences.length };
       return o; })()`));
+    if (EVALEND) { try { res.evalEnd = await page.evaluate((src) => window.__n64Worker.eval(src), fs.readFileSync(EVALEND, 'utf8')); } catch (e) { res.evalEndErr = String(e.message || e).slice(0, 300); } }
     const ib = res.stats.dbg && res.stats.dbg.inOver;
     res.bucketsInOver = ib; res.worst = res.stats.dbg && res.stats.dbg.max;
     res.load.push(load1());
