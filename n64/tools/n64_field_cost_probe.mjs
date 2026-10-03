@@ -55,6 +55,10 @@ const UNPACED = argv.includes('--unpaced');
 // slots, the 1.000x governor, exactly what a player gets); the rig only installs the pad
 // function and reads every field's cost back. Reports the achieved guest rate too.
 const CLOCK = argv.includes('--clock');
+// --nodbg (with --clock): no ?costdbg=1 — the SHIPPED worker, nothing wrapped. Each field's
+// cost is then read from the core's own retro_run timer (_neil_frame_cost_ms, mymain.cpp
+// timed_retro_run) by the pad function, which runs once before every field.
+const NODBG = argv.includes('--nodbg');
 // --profile: a CPU profile of the CORE WORKER over the measured window (attribution only —
 // a profiled run is never a rate: CLAUDE.md #10)
 const PROFILE = argv.includes('--profile');
@@ -315,7 +319,7 @@ try {
   if (CPU > 1) {
     page.on('workercreated', async (w) => { try { await w.client.send('Emulation.setCPUThrottlingRate', { rate: CPU }); res.throttled = (res.throttled || 0) + 1; } catch (e) { res.throttleErr = String(e.message || e).slice(0, 120); } });
   }
-  const qs = 'worker=1&workerrig=' + (CLOCK ? 'clock' : '1') + '&costdbg=1' + (XQ ? '&' + XQ : '');
+  const qs = 'worker=1&workerrig=' + (CLOCK ? 'clock' : '1') + (CLOCK && NODBG ? '' : '&costdbg=1') + (XQ ? '&' + XQ : '');
   await page.goto(`${BASE}/n64/?game=${encodeURIComponent(ROM)}&autostart&${qs}`, { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => { const s = window.__n64Worker && window.__n64Worker.state(); return s && (s.booted || s.fatal); }, { timeout: 240000 });
   const st = await page.evaluate(() => window.__n64Worker.state());
@@ -326,7 +330,18 @@ try {
     await page.evaluate((src) => window.__n64Worker.eval(src), `(() => {
       const plan = ${PLANJ};
       self.__rigFields = [];
+      if (${NODBG}) {
+        // the core's own per-retro_run timer: its delta, read before field f, is field f-1's cost
+        let lastMs = null, lastN = null;
+        const M = self.Module;
+        self.__rigCost = function (f) {
+          const ms = M._neil_frame_cost_ms(), n = M._neil_frame_cost_n() >>> 0;
+          if (lastN !== null && n === lastN + 1) self.__rigFields.push(f - 1, ms - lastMs);
+          lastMs = ms; lastN = n;
+        };
+      }
       self.__n64PadOverride = function (f, q) {
+        if (q === 0 && self.__rigCost) self.__rigCost(f);
         let m = 0, ax = 0, ay = 0;
         for (const [f0, f1, ports, mask, x, y] of plan) if (f >= f0 && f < f1 && ports.indexOf(q) >= 0) { m |= mask; if (x) ax = x; if (y) ay = y; }
         return [m, Math.round(ax * 32000), Math.round(ay * 32000)];

@@ -292,7 +292,11 @@ function gqAfterField() {
 }
 // may a field start now? false = hold it (the caller retries from a later task)
 function gqReady() {
-  if (!GQ.on || !GQ.fences.length) return true;
+  // within the depth nothing is asked of GL: fences are retired only when there are too many
+  if (!GQ.on || GQ.fences.length <= GQ.max) {
+    if (GQ.holdFrom) { GQ.heldMs += performance.now() - GQ.holdFrom; GQ.holdFrom = 0; }
+    return true;
+  }
   var gl = gqGl(); if (!gl) return true;
   while (GQ.fences.length) {
     var st = gl.getSyncParameter(GQ.fences[0], gl.SYNC_STATUS);
