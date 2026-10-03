@@ -53,7 +53,9 @@ function prewarm(mod, jobs) {
   var tb = jobs[0].tableBase | 0;
   try {
     if (!warm.mem || warm.ds !== p.delaySlot) {
-      warm.mem = new WebAssembly.Memory({ initial: ((p.delaySlot + 8) >>> 16) + 1 });
+      // the entry guard reads skip_jump as well as delay_slot (mips_emit.js SKIP_JUMP AT ENTRY):
+      // both must be inside the scratch memory
+      warm.mem = new WebAssembly.Memory({ initial: ((Math.max(p.delaySlot, p.skipJump >>> 0) + 8) >>> 16) + 1 });
       new Uint32Array(warm.mem.buffer)[p.delaySlot >> 2] = 1;
       warm.ds = p.delaySlot;
     }

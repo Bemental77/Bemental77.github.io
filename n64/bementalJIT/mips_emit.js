@@ -99,6 +99,9 @@
   // COLD PATHS (2026-10-03): the index of the out-of-line handler a cold arm jumps to
   // (see COLD PATHS in compileSpan). A new local after every existing group.
   var L_COLD = 42;
+  // LEAN CODE (2026-10-03): the Count value a branch tail just stored (emitCountBatch tees it), read
+  // back by that tail's interrupt poll instead of a reload. Locals 42 and 43 are always declared now.
+  var L_CNT = 43;
   // RAW (2026-10-01): 1 while compiling a block that has pinned registers.
   // Its body is then wrapped as (block $raw (block $exit ...) epilogue), and
   // every exit that follows an interpreter/core call — where reg[] is already
@@ -313,6 +316,14 @@
     for (var r = 0; r < 32; r++) {
       if (this.dirty[r]) out = out.concat(storeI64(this.regBase + r * 8, [OP.local_get].concat(leb(L_REG0 + r))));
     }
+    out.regs = this.dirtyRegs();          // the same set, for a cold handler (see COLD PATHS)
+    return out;
+  };
+  // every register whose local is ahead of reg[] right now (pinned ones included): exactly the
+  // stores flushSnapshot / flushAll would emit at this point
+  RegCache.prototype.dirtyRegs = function () {
+    var out = [];
+    for (var r = 0; r < 32; r++) if (this.dirty[r]) out.push(r);
     return out;
   };
   // Emit ONLY the load prologue for reg r (leaves NOTHING on the stack) and
@@ -621,11 +632,19 @@
     out[rt] = true;
   }
 
+  // Count += ((addr + 8 - last_addr) >> 2) * count_per_op, the value also left in L_CNT for the
+  // poll that follows on every path (emitTailPoll). LEAN CODE: count_per_op 1 or 2 is a single
+  // shift — exact because the difference is always a multiple of 4: addr + 8 is a word address
+  // and every writer of last_addr stores a word address (PC->addr, an EPC through jump_to, the
+  // reset vector 0xa4000040, skip_jump = PC->addr, or a constant this emitter bakes), so
+  // ((d >> 2) * 2) == (d >> 1) and ((d >> 2) * 1) == (d >> 2).
   function emitCountBatch(p, addr) {
+    var scale = (p.cpo === 1) ? [OP.i32_const, 0x02, OP.i32_shr_u]
+      : (p.cpo === 2) ? [OP.i32_const, 0x01, OP.i32_shr_u]
+      : [OP.i32_const, 0x02, OP.i32_shr_u, OP.i32_const].concat(sleb(p.cpo), [OP.i32_mul]);
     var val = [OP.i32_const].concat(sleb((addr + 8) | 0),
-      loadI32(p.lastAddr), [OP.i32_sub, OP.i32_const, 0x02, OP.i32_shr_u],
-      [OP.i32_const], sleb(p.cpo), [OP.i32_mul],
-      loadI32(p.count), [OP.i32_add]);
+      loadI32(p.lastAddr), [OP.i32_sub], scale,
+      loadI32(p.count), [OP.i32_add, OP.local_tee], leb(L_CNT));
     return storeI32(p.count, val);
   }
 
@@ -635,20 +654,19 @@
   // delivery and can hand control to arbitrary guest code after we exit.
   function emitTailPoll(p, C, finalAddr, finalPtr, exitDepth) {
     if (COLD) {
-      var flushB = C.flushAll();          // same compile-state effect as the inline arm
+      var flushRegs = C.dirtyRegs();
+      C.flushAll();                       // same compile-state effect as the inline arm
       return storeI32Const(p.lastAddr, finalAddr | 0).concat(
-        loadI32(p.nextInt), loadI32(p.count), [OP.i32_le_u],
+        loadI32(p.nextInt), [OP.local_get], leb(L_CNT), [OP.i32_le_u],      // L_CNT: emitCountBatch's Count
         [OP.if_, OP.void_],
           coldJump([].concat(
             bump('#gen_interrupt'),
-            flushB,
             storeI32Const(p.pcGlobal, finalPtr),
-            [OP.i32_const], sleb(p.genInt), [OP.call_indirect, 0x00, 0x00],
-            [OP.return_]), exitDepth + 1),
+            [OP.i32_const], sleb(p.genInt), [OP.call_indirect, 0x00, 0x00]), exitDepth + 1, flushRegs),
         [OP.end]);
     }
     return storeI32Const(p.lastAddr, finalAddr | 0).concat(
-      loadI32(p.nextInt), loadI32(p.count), [OP.i32_le_u],
+      loadI32(p.nextInt), [OP.local_get], leb(L_CNT), [OP.i32_le_u],      // L_CNT: emitCountBatch's Count
       [OP.if_, OP.void_],
       bump('#gen_interrupt'),
       C.flushAll(),                       // compile-state: dirty cleared on BOTH arms (flush emits stores only here, but the arm not taken loses nothing: dirty was already current)
@@ -675,6 +693,22 @@
   // set by jump_to); poll gen_interrupt (PC already correct, no recheck —
   // the block exits regardless). targetBytes pushes the i32 target.
   function emitOutJumpTail(p, targetBytes, exitDepth, C) {
+    if (COLD) {
+      // LEAN CODE: the gen_interrupt arm is a cold handler (no registers: the caller flushed,
+      // and the pinned ones are written back first thing below); the block returns after it
+      // either way, so `call $h; return` is the arm, and CHAINING's fall-through is unchanged
+      return [].concat(
+        C.storePinned(),
+        storeI32(p.jumpToAddr, targetBytes),
+        [OP.i32_const], sleb(p.jumpToFunc), [OP.call_indirect, 0x00, 0x00],
+        storeI32(p.lastAddr, loadI32(p.pcGlobal).concat([OP.i32_load, 0x02], leb(p.addrOff))),
+        loadI32(p.nextInt), loadI32(p.count), [OP.i32_le_u],
+        [OP.if_, OP.void_],
+          coldJump([].concat(bump('#gen_interrupt'), [OP.i32_const], sleb(p.genInt), [OP.call_indirect, 0x00, 0x00]), exitDepth + 1, []),
+        [OP.end],
+        bump('#exit:jump_to'),
+        chainOr(exitDepth));
+    }
     return [].concat(
       C.storePinned(),              // the caller's C.flush() left only pinned registers unwritten
       storeI32(p.jumpToAddr, targetBytes),
@@ -757,15 +791,19 @@
   // path, so the hot path is spread over many more cache lines than it needs. With the slow arms
   // removed the 1500-span case ran 17.6 ns, and with CHECK_MEMORY's inner probe also removed
   // 6.3 ns (diagnostic arms, not shippable — this is what they priced).
-  // WHAT. A cold arm is emitted as `L_COLD = k; br $cold` (6 bytes), and its body — byte for
-  // byte what the arm did inline, ending in a return to the dispatcher — is laid out after the
-  // span's body, behind one br_table on L_COLD. CHECK_MEMORY's code-page probe becomes a call to
-  // one helper function per module. The one behavioural difference: a slow LOAD used to
+  // WHAT. A cold arm is moved out of the hot path, and its body — what the arm did inline, ending
+  // in a return to the dispatcher — runs out of line: since 2026-10-03 (LEAN CODE) as a call of
+  // its own function (see COLD CALLS at coldJump; the first shape, `L_COLD = k; br $cold` into
+  // one br_table at the end of the body, cost TurboFan a phi move per live local at every arm).
+  // CHECK_MEMORY's code-page probe becomes a call to one helper function per module. With cold
+  // paths, label entries need no wrapper functions either (LABELS BY PC, at the multi-entry
+  // dispatch). The one behavioural difference: a slow LOAD used to
   // continue in-block after its interpreter op; it now returns to the dispatcher, which runs
   // PC->ops for the next instruction — the same instruction the block would have run next, with
   // reg[] complete (every register was flushed before the op). Exact either way; it costs a
   // dispatch only on the rare off-RDRAM access.
-  // ?jitcold=0 (fbasync.js publishes it in both realms) keeps every arm inline: A/B arm, kill switch.
+  // ?jitcold=0 (fbasync.js publishes it in both realms) keeps every arm inline (and the label
+  // wrappers): A/B arm, kill switch.
   var COLD = null;           // per-compile handler list while compileSpan runs with cold paths on
   function coldOn() {
     var g = (typeof globalThis !== 'undefined') ? globalThis : self, f = g.__fbAsync;
@@ -779,13 +817,42 @@
     var g = (typeof globalThis !== 'undefined') ? globalThis : self, f = g.__fbAsync;
     return !!(f && f.jitPin);
   }
-  // `handler` runs at the module's top level and must end in a return. `exitD` is the depth a
-  // `br` at this very position would use to reach $exit (RAW is added here, as for every exit).
-  function coldJump(handler, exitD) {
+  // COLD CALLS (LEAN CODE, 2026-10-03). A cold arm is `local.get <its dirty registers>; call $h;
+  // return`, and $h — one function per arm, appended to the module after the span's functions
+  // (COLD_FN0 + k) — stores those registers to reg[] in register order, then runs `tail`, and
+  // returns; the block then returns to the dispatcher. Same effects, in the same order, as the
+  // arm had inline. WHY NOT A SHARED br TARGET (the first COLD PATHS shape, `L_COLD = k; br $cold`
+  // into one br_table of handlers at the end of the body): in TurboFan that merge point makes
+  // every local any handler reads a phi, so EVERY cold arm's site materialised all of them into
+  // fixed registers — 8-10 moves (zeroing the locals not yet assigned on that path) before its
+  // jmp, laid into the hot path of every load, store and branch (measured: a 20-instruction MK64
+  // span's body was 3136 bytes of machine code). A call passes only that arm's own registers,
+  // and a handler that never runs is never even compiled (V8 compiles wasm functions lazily).
+  // `exitD` is kept for the call sites' symmetry with the inline arms; a call needs no depth.
+  var COLD_FN0 = 0;          // function index of this span's first cold handler
+  function coldJump(tail, exitD, regs) {
     var k = COLD.length;
-    COLD.push(handler);
-    return [OP.i32_const].concat(sleb(k), [OP.local_set], leb(L_COLD), [OP.br], leb(exitD + RAW + 1));
+    COLD.push({ regs: regs, tail: tail });
+    var site = [];
+    for (var q = 0; q < regs.length; q++) { site.push(OP.local_get); app(site, leb(L_REG0 + regs[q])); }
+    site.push(OP.call); app(site, leb(COLD_FN0 + k)); site.push(OP.return_);
+    return site;
   }
+  // the handler function's bytes: param q is register regs[q] (i64)
+  function coldHandlerFn(h, regBase) {
+    if (h.raw) return h.raw;               // a prebuilt helper (LABELS BY PC's guard)
+    var f = [0x00];
+    for (var q = 0; q < h.regs.length; q++) app(f, storeI64(regBase + h.regs[q] * 8, [OP.local_get].concat(leb(q))));
+    app(f, h.tail); f.push(OP.end);
+    return f;
+  }
+  // a handler's type index: 0 = ()->(), 1 = (i32)->() (CHECK_MEMORY's helper / census), 1 + n = (i64 x n)->()
+  function coldType(h) { return h.raw ? h.type : (h.regs.length ? 1 + h.regs.length : 0); }
+  var TYPE_SEC = (function () {
+    var t = [].concat(leb(34), [0x60, 0x00, 0x00], [0x60, 0x01, 0x7F, 0x00]);
+    for (var n = 1; n <= 32; n++) { t.push(0x60); app(t, leb(n)); for (var q = 0; q < n; q++) t.push(0x7E); t.push(0x00); }
+    return section(1, t);
+  })();
 
   // The slow (non-RDRAM / CU1-clear) arm of a native memory or FP op.
   //
@@ -817,10 +884,8 @@
     if (COLD) {
       // out of line, and always back to the dispatcher (see COLD PATHS)
       return coldJump([].concat(
-        flushed,
         storeI32Const(p.pcGlobal, slow ? slow.ptr : instrPtr),
-        [OP.i32_const], sleb(slow ? slow.opsIdx : opsIdx), [OP.call_indirect, 0x00, 0x00],
-        [OP.return_]), brDepth);
+        [OP.i32_const], sleb(slow ? slow.opsIdx : opsIdx), [OP.call_indirect, 0x00, 0x00]), brDepth, flushed.regs);
     }
     if (slow) {
       return [].concat(
@@ -871,6 +936,18 @@
   // so the slow arm flushes only what was dirty on ENTRY to this instruction.
   // That is exact and costs nothing (unlike emitStore's C.ensure hoist, which
   // is still right there because a store READS rt).
+  // LEAN CODE (2026-10-03): the effective address `rs + imm` into L_ADDR, LEFT ON THE STACK as
+  // well (local.tee) for the dispatch-table index that always follows; no add for imm == 0.
+  function effAddr(C, rs, imm) {
+    return C.read(rs).concat([OP.i32_wrap_i64], imm ? [OP.i32_const].concat(sleb(imm), [OP.i32_add]) : [], [OP.local_tee, L_ADDR]);
+  }
+  // consumes the effective address effAddr left on the stack: 1 when the live dispatch table
+  // does NOT route this 64 KB page to read/write_rdram* — the slow arm's condition
+  // (`hit`: the inverse, 1 when it does — the inline slow arm's if/else shape, ?jitcold=0)
+  function tblCheck(tableBase, cmpVal, hit) {
+    return [OP.i32_const, 0x10, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl, OP.i32_load, 0x02].concat(
+      leb(tableBase), [OP.i32_const], sleb(cmpVal), [hit ? OP.i32_eq : OP.i32_ne]);
+  }
   function emitLoad(word, instrPtr, p, C, opsIdx, exitDepth, slow) {
     var op = (word >>> 26) & 0x3F;
     if (op !== 0x20 && op !== 0x21 && op !== 0x23 && op !== 0x24 && op !== 0x25 && op !== 0x27 && op !== 0x37) return null;
@@ -891,14 +968,16 @@
     else { tableBase = p.readmemH; cmpVal = p.rdRdramH; }
     var shiftB = [OP.local_get, L_ADDR, OP.i32_const, 0x03, OP.i32_and, OP.i32_const, 0x03, OP.i32_xor, OP.i32_const, 0x03, OP.i32_shl];
     var shiftH = [OP.local_get, L_ADDR, OP.i32_const, 0x02, OP.i32_and, OP.i32_const, 0x02, OP.i32_xor, OP.i32_const, 0x03, OP.i32_shl];
+    // `val` consumes the loaded dram word from the stack (LEAN CODE: it used to be parked in
+    // L_WORD and read straight back; the sub-word shift reads only L_ADDR)
     var val;
     switch (op) {
-      case 0x23: val = [OP.local_get, L_WORD, OP.i64_extend_i32_s]; break;
-      case 0x27: val = [OP.local_get, L_WORD, OP.i64_extend_i32_u]; break;
-      case 0x24: val = [OP.local_get, L_WORD].concat(shiftB, [OP.i32_shr_u, OP.i32_const], sleb(0xFF), [OP.i32_and, OP.i64_extend_i32_u]); break;
-      case 0x20: val = [OP.local_get, L_WORD].concat(shiftB, [OP.i32_shr_u, OP.i32_const], sleb(0xFF), [OP.i32_and, OP.i32_extend8_s, OP.i64_extend_i32_s]); break;
-      case 0x25: val = [OP.local_get, L_WORD].concat(shiftH, [OP.i32_shr_u, OP.i32_const], sleb(0xFFFF), [OP.i32_and, OP.i64_extend_i32_u]); break;
-      case 0x21: val = [OP.local_get, L_WORD].concat(shiftH, [OP.i32_shr_u, OP.i32_const], sleb(0xFFFF), [OP.i32_and, OP.i32_extend16_s, OP.i64_extend_i32_s]); break;
+      case 0x23: val = [OP.i64_extend_i32_s]; break;
+      case 0x27: val = [OP.i64_extend_i32_u]; break;
+      case 0x24: val = shiftB.concat([OP.i32_shr_u, OP.i32_const], sleb(0xFF), [OP.i32_and, OP.i64_extend_i32_u]); break;
+      case 0x20: val = shiftB.concat([OP.i32_shr_u, OP.i32_const], sleb(0xFF), [OP.i32_and, OP.i32_extend8_s, OP.i64_extend_i32_s]); break;
+      case 0x25: val = shiftH.concat([OP.i32_shr_u, OP.i32_const], sleb(0xFFFF), [OP.i32_and, OP.i64_extend_i32_u]); break;
+      case 0x21: val = shiftH.concat([OP.i32_shr_u, OP.i32_const], sleb(0xFFFF), [OP.i32_and, OP.i32_extend16_s, OP.i64_extend_i32_s]); break;
     }
     // ORDER MATTERS — the same emit-call-order trap documented on emitStore.
     // fastBytes calls C.writeFromStack(rt), which marks rt loaded; if the
@@ -906,7 +985,7 @@
     // ubiquitous pointer chase) the read would collapse to a bare local.get
     // of a local that is only assigned INSIDE the fast arm, computing the
     // effective address from wasm's zero-init. Read rs FIRST, always.
-    var addrBytes = C.read(rs).concat([OP.i32_wrap_i64, OP.i32_const], sleb(imm), [OP.i32_add, OP.local_set, L_ADDR]);
+    var addrBytes = effAddr(C, rs, imm);
     // LD (wave 9): readd() reads the word at `a` as the HIGH half and the word
     // at `a+4` as the LOW half (m64p_memory.c:127-133,
     // *value = ((uint64_t)w[0] << 32) | w[1]) — the identical shape LDC1
@@ -922,13 +1001,22 @@
           C.writeFromStack(rt))
       : [].concat(
           [OP.local_get, L_ADDR, OP.i32_const], sleb(0xFFFFFC), [OP.i32_and],
-          [OP.i32_load, 0x02], leb(p.dramBase), [OP.local_set, L_WORD],
+          [OP.i32_load, 0x02], leb(p.dramBase),
           val, C.writeFromStack(rt)); // join: rt loaded+dirty (slow arm refreshes the local; its redundant flush is benign)
+    if (COLD) {
+      // LEAN CODE: the slow arm never continues in-block (a cold handler returns), so the fast
+      // arm needs no if/else around it — `if (table != rdram) cold; fast`. Compile-state:
+      // the fast arm is the only path that reaches what follows, as it was the only continuing one.
+      return [].concat(
+        addrBytes, tblCheck(tableBase, cmpVal),
+        [OP.if_, OP.void_],
+          bump((slow ? 'SLOTSLOW:' : 'SLOW:') + mnem(word)),
+          slowArm(p, C, instrPtr, opsIdx, exitDepth + 1, slow, rt, preFlush),
+        [OP.end],
+        fastBytes);
+    }
     return [].concat(
-      addrBytes,
-      [OP.local_get, L_ADDR, OP.i32_const, 0x10, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl],
-      [OP.i32_load, 0x02], leb(tableBase),
-      [OP.i32_const], sleb(cmpVal), [OP.i32_eq],
+      addrBytes, tblCheck(tableBase, cmpVal, true),
       [OP.if_, OP.void_],
         fastBytes,
       [OP.else_],
@@ -1019,7 +1107,7 @@
     // top a bare local.get of that same not-yet-initialised local, computing
     // the effective address from 0. `ensure(rt)` hoists the load to the top,
     // and rs is now read BEFORE rt in emit-call order so it owns the prologue.
-    var addrBytes = C.read(rs).concat([OP.i32_wrap_i64, OP.i32_const], sleb(imm), [OP.i32_add, OP.local_set, L_ADDR]);
+    var addrBytes = effAddr(C, rs, imm);    // leaves the address on the stack for tblCheck
     var rtPre = C.ensure(rt);
     var shiftB = [OP.local_get, L_ADDR, OP.i32_const, 0x03, OP.i32_and, OP.i32_const, 0x03, OP.i32_xor, OP.i32_const, 0x03, OP.i32_shl];
     var shiftH = [OP.local_get, L_ADDR, OP.i32_const, 0x02, OP.i32_and, OP.i32_const, 0x02, OP.i32_xor, OP.i32_const, 0x03, OP.i32_shl];
@@ -1046,10 +1134,10 @@
       var sh = isByte ? shiftB : shiftH;
       // w = dram[word]; merged = (w & ~(mask<<s)) | (((u32)rt & mask) << s)
       storeBytes = [].concat(
-        wordAddr, [OP.i32_load, 0x02], leb(p.dramBase), [OP.local_set, L_WORD],
         wordAddr,
+        wordAddr, [OP.i32_load, 0x02], leb(p.dramBase),
         // (w & ~(mask<<s))
-        [OP.local_get, L_WORD, OP.i32_const], sleb(maskC), sh, [OP.i32_shl, OP.i32_const], sleb(-1), [OP.i32_xor, OP.i32_and],
+        [OP.i32_const], sleb(maskC), sh, [OP.i32_shl, OP.i32_const], sleb(-1), [OP.i32_xor, OP.i32_and],
         // ((rt & mask) << s)
         C.read(rt), [OP.i32_wrap_i64, OP.i32_const], sleb(maskC), [OP.i32_and], sh, [OP.i32_shl],
         [OP.i32_or],
@@ -1057,11 +1145,19 @@
       );
     }
     var checkMemory = checkMemoryBytes(p);
+    if (COLD) {
+      // LEAN CODE: as emitLoad — `if (table != rdram) cold; fast` (the cold arm never continues)
+      return [].concat(
+        addrBytes, rtPre, tblCheck(tableBase, cmpVal),
+        [OP.if_, OP.void_],
+          bump((slow ? 'SLOTSLOW:' : 'SLOW:') + mnem(word)),
+          slowArm(p, C, instrPtr, opsIdx, exitDepth + 1, slow, -1, undefined, true),
+        [OP.end],
+        storeBytes,
+        checkMemory);
+    }
     return [].concat(
-      addrBytes, rtPre,
-      [OP.local_get, L_ADDR, OP.i32_const, 0x10, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl],
-      [OP.i32_load, 0x02], leb(tableBase),
-      [OP.i32_const], sleb(cmpVal), [OP.i32_eq],
+      addrBytes, rtPre, tblCheck(tableBase, cmpVal, true),
       [OP.if_, OP.void_],
         storeBytes,
         checkMemory,
@@ -1098,10 +1194,8 @@
         [OP.else_],
           coldJump([].concat(
             bump((slow ? 'SLOTCU1MISS:' : 'CU1MISS:') + mnem(word)),
-            preFlush,
             storeI32Const(p.pcGlobal, slow ? slow.ptr : instrPtr),
-            [OP.i32_const], sleb(slow ? slow.opsIdx : opsIdx), [OP.call_indirect, 0x00, 0x00],
-            [OP.return_]), exitDepth + 1),
+            [OP.i32_const], sleb(slow ? slow.opsIdx : opsIdx), [OP.call_indirect, 0x00, 0x00]), exitDepth + 1, preFlush.regs),
         [OP.end]
       );
     }
@@ -1505,8 +1599,7 @@
     var preFlush = C.flushSnapshot();
     var base = (word >>> 21) & 0x1F, ft = (word >>> 16) & 0x1F;
     var imm = sext16(word & 0xFFFF);
-    var ea = C.read(base).concat([OP.i32_wrap_i64, OP.i32_const], sleb(imm), [OP.i32_add, OP.local_set, L_ADDR]);
-    var tblIdx = [OP.local_get, L_ADDR, OP.i32_const, 0x10, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl];
+    var ea = effAddr(C, base, imm);          // leaves the address on the stack for tblCheck
     var wordOff = [OP.local_get, L_ADDR, OP.i32_const].concat(sleb(0xFFFFFC), [OP.i32_and]);
     var word4Off = [OP.local_get, L_ADDR, OP.i32_const, 0x04, OP.i32_add, OP.i32_const].concat(sleb(0xFFFFFC), [OP.i32_and]);
     var fast, tableBase, cmpVal;
@@ -1530,10 +1623,17 @@
         word4Off, [OP.local_get].concat(leb(L_I64S), [OP.i32_wrap_i64]), [OP.i32_store, 0x02], leb(p.dramBase),
         checkMemoryBytes(p));
     }
-    var nat = [].concat(
-      ea,
-      tblIdx, [OP.i32_load, 0x02], leb(tableBase),
-      [OP.i32_const], sleb(cmpVal), [OP.i32_eq],
+    var nat = COLD
+      // LEAN CODE: as emitLoad — `if (table != rdram) cold; fast` (the cold arm never continues)
+      ? [].concat(
+          ea, tblCheck(tableBase, cmpVal),
+          [OP.if_, OP.void_],
+            bump((slow ? 'SLOTSLOW:' : 'SLOW:') + mnem(word)),
+            slowArm(p, C, instrPtr, opsIdx, exitDepth + 2, slow, -1, undefined, op === 0x39 || op === 0x3D), // inside cu-if + this if
+          [OP.end],
+          fast)
+      : [].concat(
+      ea, tblCheck(tableBase, cmpVal, true),
       [OP.if_, OP.void_],
         fast,
       [OP.else_],
@@ -1823,13 +1923,14 @@
             ASYNC.modules++;
           }
           fns.push(Bh.inst.exports['s' + r.k]);
-          for (wk = 1; wk < r.labels.length; wk++) fns.push(Bh.inst.exports['s' + r.k + '_' + wk]);
+          // LABELS BY PC (nfn 1): every label's slot holds the body itself
+          for (wk = 1; wk < r.labels.length; wk++) fns.push(r.nfn === 1 ? fns[0] : Bh.inst.exports['s' + r.k + '_' + wk]);
         } else {
           var mod = r.mod || new WebAssembly.Module(r.bytes);
           var inst = new WebAssembly.Instance(mod, { e: { t: M.wasmTable, m: M.wasmMemory, c: censusBump } });
           ASYNC.modules++;
           fns.push(inst.exports.f);
-          for (wk = 1; wk < r.labels.length; wk++) fns.push(inst.exports['f' + wk]);
+          for (wk = 1; wk < r.labels.length; wk++) fns.push(inst.exports['f' + wk] || fns[0]);   // no wrapper: LABELS BY PC
         }
         var p = j.p, U = M.HEAPU32;
         U[p.entryPtr >> 2] = installSlot(M, p.vaddr >>> 0, fns[0]);   // what recomp.c does with a nonzero return
@@ -1875,7 +1976,7 @@
     if (batchCtx) {
       if (!idx || !part) return { id: job.id, ok: false, err: idx ? 'no module' : 'refused' };
       if (miss) return { id: job.id, ok: false, err: 'read outside the copied inputs (' + miss + ')' };
-      return { id: job.id, ok: true, part: part, labels: part.labels, labelOps: part.labelOps, maxW: maxW, maxO: maxO };
+      return { id: job.id, ok: true, part: part, labels: part.labels, labelOps: part.labelOps, nfn: part.nfn, maxW: maxW, maxO: maxO };
     }
     if (!idx || !out) return { id: job.id, ok: false, err: idx ? 'no module' : 'refused' };
     if (miss) return { id: job.id, ok: false, err: 'read outside the copied inputs (' + miss + ')' };
@@ -1912,12 +2013,12 @@
     }
     if (!parts.length) return { batch: true, items: items, bytes: null };
     var funcs = [chkHelper(p0)], types = [1], k, w;
-    for (k = 0; k < parts.length; k++) for (w = 0; w < parts[k].part.funcs.length; w++) { funcs.push(parts[k].part.funcs[w]); types.push(0); }
+    for (k = 0; k < parts.length; k++) for (w = 0; w < parts[k].part.funcs.length; w++) { funcs.push(parts[k].part.funcs[w]); types.push(parts[k].part.types[w]); }
     var exps = [], nExp = 0;
     var name = function (t) { var a = t.split('').map(function (ch) { return ch.charCodeAt(0); }); return leb(a.length).concat(a); };
     // every list is built in place: a batch is ~100 KB of code, and concat-per-item is quadratic
     for (k = 0; k < parts.length; k++) {
-      var fb = parts[k].fnBase, nf = parts[k].part.funcs.length;
+      var fb = parts[k].fnBase, nf = parts[k].part.nfn;   // the body and its wrappers, if any (not the cold handlers)
       app(exps, name('s' + k)); exps.push(0x00); app(exps, leb(fb)); nExp++;
       for (w = 1; w < nf; w++) { app(exps, name('s' + k + '_' + w)); exps.push(0x00); app(exps, leb(fb + w)); nExp++; }
     }
@@ -1926,7 +2027,7 @@
     var code = leb(funcs.length);
     for (k = 0; k < funcs.length; k++) { app(code, leb(funcs[k].length)); app(code, funcs[k]); }
     var bytes = new Uint8Array([0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00].concat(
-      section(1, [].concat(leb(2), [0x60, 0x00, 0x00], [0x60, 0x01, 0x7F, 0x00])),
+      TYPE_SEC,
       section(2, [].concat(leb(2), [1, 0x65, 1, 0x74, 0x01, 0x70, 0x00, 0x00], [1, 0x65, 1, 0x6D, 0x02, 0x00, 0x00])),
       section(3, fdecl),
       section(6, [0x01, 0x7F, 0x01, OP.i32_const, 0x00, OP.end]),
@@ -2252,8 +2353,13 @@
     // COLD PATHS: handlers collected while the body is emitted; the helper sits after the
     // body function and its label wrappers
     COLD = coldOn() ? [] : null;
+    // LABELS BY PC (with cold paths): no wrapper functions — see the multi-entry dispatch below
+    var PCL = !!COLD && nSeg > 1;
+    var NFN = COLD ? 1 : nSeg;          // the span's own functions: the body (and, without PCL, its wrappers)
     CHAIN = chainOn(); p_chain = p;
-    CHK_FN = (EMIT_ONLY && EMIT_ONLY.batch) ? 0 : (census.on ? 1 : 0) + nSeg;   // a batch module puts the helper first
+    CHK_FN = (EMIT_ONLY && EMIT_ONLY.batch) ? 0 : (census.on ? 1 : 0) + NFN;   // a batch module puts the helper first
+    // cold handlers follow the span's own functions (and, in a module of its own, the helper)
+    COLD_FN0 = (EMIT_ONLY && EMIT_ONLY.batch) ? EMIT_ONLY.fnBase + NFN : CHK_FN + 1;
     var seg = 0;
     EXIT = nSeg; TOP = nSeg - 1;       // segment 0's depths (1 / 0 when nSeg == 1)
     var closedSegs = 0;
@@ -2338,10 +2444,8 @@
             [OP.if_, OP.void_],
               coldJump([].concat(
                 bump('CU1MISS:' + mnem(word)),
-                C.flushSnapshot(),
                 storeI32Const(p.pcGlobal, instrPtr),
-                [OP.i32_const], sleb(HEAPU32[instrPtr >> 2]), [OP.call_indirect, 0x00, 0x00],
-                [OP.return_]), EXIT + 1),
+                [OP.i32_const], sleb(HEAPU32[instrPtr >> 2]), [OP.call_indirect, 0x00, 0x00]), EXIT + 1, C.dirtyRegs()),
             [OP.end]);
         } else if (br.cu1) {
           cu1Prefix = [].concat(
@@ -2378,7 +2482,7 @@
           if (tOrd > seg) return poll.concat(bump('#fwd'), [OP.br], leb(tOrd - seg - 1 + nest));
           if (tOrd >= 0) {
             return poll.concat(bump('#backedge'),
-              nSeg > 1 ? [OP.i32_const].concat(sleb(tOrd), [OP.local_set], leb(L_START)) : [],
+              nSeg > 1 ? [OP.i32_const].concat(sleb(PCL ? targetIdx : tOrd), [OP.local_set], leb(L_START)) : [],   // PCL: the dispatch is by span index
               [OP.br], leb(topD));
           }
           return poll.concat(bump('#exit:branch'), storeI32Const(p.pcGlobal, targetPtr), chainOr(exitD));
@@ -2394,16 +2498,11 @@
             ? emitSlotNative(slotWord2, slotPtr, p, Cx, slotOpsIdx, exitD, slowSpec)
             : emitAlu(slotWord2, Cx);
         }
+        // skip_jump is tested ONCE, at the block's entry (SKIP_JUMP AT ENTRY, at the delay-slot
+        // guard below): it cannot change while native code runs, so every native branch is a
+        // plain taken tail. (The name is kept for the three call sites.)
         function skipJumpSplit(Cx, exitD, topD) {
-          // if (skip_jump == 0) take else behave-as-not-taken-and-exit
-          return loadI32(p.skipJump).concat([OP.i32_eqz, OP.if_, OP.void_],
-            takenTail(Cx, exitD + 1, topD + 1),
-            [OP.else_],
-              emitTailPoll(p, Cx, fallAddr, fallPtr, exitD + 1),
-              bump('#exit:skip_jump'),
-              storeI32Const(p.pcGlobal, fallPtr),
-              [OP.br].concat(leb(exitD + 1)),
-            [OP.end]);
+          return takenTail(Cx, exitD, topD);
         }
         if (br.cond === null) {
           // unconditional: J/JAL/JR/JALR — capture, link, slot, count, flush, split
@@ -2422,14 +2521,18 @@
           // stack across the slot: a memory delay slot emits its own
           // if/else and can br out of the block, and stack residue across
           // those is needless risk
+          // LEAN CODE: an ALU slot is straight-line stack code (no if, no br), so there the
+          // condition simply stays on the stack underneath it — no L_COND round trip
+          var condPark = slotMem ? [OP.local_set].concat(leb(L_COND)) : [];
+          var condTake = slotMem ? [OP.local_get].concat(leb(L_COND)) : [];
           app(body, [].concat(
             cu1Prefix,
-            br.cond(C), [OP.local_set], leb(L_COND),
+            br.cond(C), condPark,
             linkBytes,
             emitSlot(C, EXIT),
             emitCountBatch(p, addr),
             C.flush(),
-            [OP.local_get], leb(L_COND),
+            condTake,
             [OP.if_, OP.void_],
               skipJumpSplit(C, EXIT + 1, TOP + 1),
             [OP.else_],
@@ -2575,9 +2678,22 @@
     // instruction, so run the ENTRY instruction's ORIGINAL interpreter op and
     // return. That is exact — it is literally what `PC->ops()` would have done
     // — and it costs one i32 load per block entry.
+    // ---- SKIP_JUMP AT ENTRY (LEAN CODE, 2026-10-03) ----
+    // DECLARE_JUMP takes a branch only `if (take_jump && !skip_jump)`. skip_jump is set ONLY by an
+    // exception taken while delay_slot is set (exception.c:109,:143) and cleared ONLY by
+    // gen_interrupt (interrupt.c:596-608, which that same exception made due by zeroing
+    // next_interrupt). Native code never runs with delay_slot set (this guard), its interpreter
+    // fallbacks for non-branch ops run with delay_slot clear, and a branch op that falls back
+    // sets and clears it inside its own call (its slot's exception, then its poll). So while a
+    // block's native code runs, skip_jump holds the value it had at the block's entry — and
+    // every native branch used to re-test it (a load, a test, and a second copy of the
+    // not-taken tail laid into the hot path of EVERY branch). Tested here instead: a block
+    // entered with skip_jump set does what it does as a delay slot — runs its entry
+    // instruction's ORIGINAL interpreter op and returns — so until gen_interrupt clears it the
+    // guest advances on the interpreter, one instruction per dispatch, exactly as without a JIT.
     var entryOps = labelOps[0];
     var slotGuard = [].concat(
-      loadI32(p.delaySlot),
+      loadI32(p.delaySlot), loadI32(p.skipJump), [OP.i32_or],
       [OP.if_, OP.void_],
         // census bucket so the guard's REACH is measurable on a real ROM
         // rather than assumed — a guard that never fires and a guard that
@@ -2594,7 +2710,52 @@
     // the body reads the global into L_START and resets it to 0, so a direct
     // dispatcher call of label 0 always starts at segment 0.
     var startPro = [], dispatch = [];
-    if (nSeg > 1) {
+    var coldList = COLD;
+    if (PCL) {
+      // ---- LABELS BY PC (LEAN CODE, 2026-10-03) ----
+      // Every label used to get a WRAPPER function (its own delay-slot guard, the module global
+      // set to k, a call of the body) — ~23k tiny functions in the MK64 race, each a separate
+      // piece of machine code, and every label entry paid two prologues and two guards. The core
+      // always calls an op as `PC->ops()` (r4300_step, DECLARE_JUMP's slot, FIN_BLOCK,
+      // NOTCOMPILED, a chained exit), so the body can tell which label it was entered at from
+      // PC itself: idx = (PC - entryPtr) / stride, exactly (stride = odd << tz, so the division
+      // is a shift and a multiply by the odd part's inverse mod 2^32). Each label's table slot
+      // now holds the BODY, and its dispatch br_table is indexed by span index (backward
+      // branches set L_START to the target's index). The guard calls the entered label's own
+      // original op through a cold helper ($g, a br_table over idx). An index that is not a
+      // label cannot occur: a slot holds this body only while this span's install put it there,
+      // and only into the slots of its own entry and labels, whose op fields are the very
+      // precomp entries PC points at — it would trap rather than run the wrong code.
+      var stz = 0; while (!((p.stride >>> stz) & 1) && stz < 31) stz++;
+      var sodd = p.stride >>> stz, sinv = sodd;
+      for (var ni = 0; ni < 5; ni++) sinv = Math.imul(sinv, 2 - Math.imul(sodd, sinv));
+      var maxL = labels[nSeg - 1];
+      startPro = [].concat(loadI32(p.pcGlobal), [OP.i32_const], sleb(p.entryPtr | 0), [OP.i32_sub],
+        stz ? [OP.i32_const].concat(sleb(stz), [OP.i32_shr_u]) : [], [OP.i32_const], sleb(sinv), [OP.i32_mul],
+        [OP.local_set], leb(L_START));
+      // $g(idx): run label idx's ORIGINAL interpreter op (any other idx: none — see above)
+      var gFn = [0x00];
+      for (var gb = 0; gb < nSeg; gb++) gFn.push(OP.block, OP.void_);
+      gFn.push(OP.block, OP.void_, OP.local_get, 0x00, OP.br_table); app(gFn, leb(maxL + 1));
+      for (var gi = 0; gi <= maxL; gi++) app(gFn, leb(labelOrd[gi] >= 0 ? labelOrd[gi] + 1 : 0));
+      app(gFn, [0x00, OP.end, OP.return_]);
+      for (gb = 0; gb < nSeg; gb++) { gFn.push(OP.end); app(gFn, [OP.i32_const].concat(sleb(labelOps[gb]), [OP.call_indirect, 0x00, 0x00, OP.return_])); }
+      gFn.push(OP.end);
+      var gIdx = COLD_FN0 + coldList.length;
+      coldList.push({ raw: gFn, type: 1 });
+      slotGuard = [].concat(
+        loadI32(p.delaySlot), loadI32(p.skipJump), [OP.i32_or],
+        [OP.if_, OP.void_],
+          bump('#delayslot-entry'),
+          [OP.local_get], leb(L_START), [OP.call], leb(gIdx),
+          [OP.return_],                  // before any prologue: nothing to write back
+        [OP.end]);
+      // (block x nSeg (block $bad br_table) unreachable) — label ordinal k sits at depth k + 1
+      for (var db = 0; db <= nSeg; db++) dispatch.push(OP.block, OP.void_);
+      dispatch.push(OP.local_get); app(dispatch, leb(L_START)); dispatch.push(OP.br_table); app(dispatch, leb(maxL + 1));
+      for (var di = 0; di <= maxL; di++) app(dispatch, leb(labelOrd[di] >= 0 ? labelOrd[di] + 1 : 0));
+      app(dispatch, [0x00, OP.end, 0x00, OP.end]);   // default: $bad, then `unreachable`; the last end closes ordinal 0's block
+    } else if (nSeg > 1) {
       startPro = [OP.global_get, 0x00, OP.local_set].concat(leb(L_START), [OP.i32_const, 0x00, OP.global_set, 0x00]);
       for (var bb = 0; bb < nSeg; bb++) dispatch.push(OP.block, OP.void_);
       var tgts = [];
@@ -2603,39 +2764,22 @@
     }
 
     var LOCALS = [0x0A, 0x02, 0x7F, 0x20, 0x7E, 0x01, 0x7E, 0x01, 0x7F, 0x01, 0x7F, 0x01, 0x7D, 0x01, 0x7C, 0x01, 0x7D, 0x01, 0x7C, 0x01, 0x7F];  // locals: 2xi32, 32xi64 regs, i64 scratch, i32 jump-target, i32 branch-cond, f32+f64 convert scratch (wave 11a), f32+f64 compare operand B (wave 11b), i32 segment start (multi-entry)
-    var coldList = COLD;
     COLD = null;
-    if (coldList) LOCALS = [0x0B].concat(LOCALS.slice(1), [0x01, 0x7F]);   // + i32 L_COLD
+    LOCALS = [0x0B].concat(LOCALS.slice(1), [0x02, 0x7F]);   // + i32 L_COLD (used with cold paths) + i32 L_CNT
+    // PCL: the entry index comes from PC, before the guard (which needs it)
+    var pre = PCL ? startPro : [], mid = PCL ? [] : startPro;
     var full = RAW
       // (block $raw  guard  (block $exit  prologue (loop $top ...))  epilogue)
       // The delay-slot guard sits in $raw so its exit skips the epilogue: it
       // runs before the prologue, when the pinned locals hold nothing.
-      ? LOCALS.concat([OP.block, OP.void_], slotGuard, [OP.block, OP.void_], startPro, C.reloadPinned(),
+      ? LOCALS.concat(pre, [OP.block, OP.void_], slotGuard, [OP.block, OP.void_], mid, C.reloadPinned(),
           [OP.loop, OP.void_], bump('#block-iter'), dispatch, body,
           [OP.end, OP.end], C.storePinned(), [OP.end, OP.end])
-      : LOCALS.concat([OP.block, OP.void_], slotGuard, startPro,
+      : LOCALS.concat(pre, [OP.block, OP.void_], slotGuard, mid,
           [OP.loop, OP.void_], bump('#block-iter'), dispatch, body,
           [OP.end, OP.end, OP.end]);
 
-    if (coldList) {
-      // (block $cold <body> return) — every normal exit returns inside it, so only a cold arm's
-      // `br $cold` reaches what follows: the handlers: one br_table on L_COLD, each handler
-      // ending in a return (nothing falls out of the last one)
-      // built in place (the body is tens of KB: no slice/concat copies of it)
-      var fullC = LOCALS.concat([OP.block, OP.void_]);
-      for (var fi = LOCALS.length; fi < full.length - 1; fi++) fullC.push(full[fi]);   // the body without the function's end
-      fullC.push(OP.return_, OP.end);
-      if (coldList.length) {
-        for (var hc = 0; hc < coldList.length; hc++) fullC.push(OP.block, OP.void_);
-        fullC.push(OP.local_get); app(fullC, leb(L_COLD)); fullC.push(OP.br_table); app(fullC, leb(coldList.length));
-        for (hc = 0; hc < coldList.length; hc++) app(fullC, leb(hc));
-        app(fullC, leb(0)); fullC.push(OP.end);
-        for (hc = 0; hc < coldList.length; hc++) { app(fullC, coldList[hc]); if (hc + 1 < coldList.length) fullC.push(OP.end); }
-      }
-      fullC.push(OP.end);
-      full = fullC;
-      stats.coldArms = (stats.coldArms || 0) + coldList.length;
-    }
+    if (coldList) stats.coldArms = (stats.coldArms || 0) + coldList.length;
 
     // census adds one imported host func "e"."c" (type 1: (i32)->()), which
     // takes function index 0 and pushes the defined block function to 1
@@ -2643,9 +2787,9 @@
     var batch = !!(EMIT_ONLY && EMIT_ONLY.batch);
     var bodyFn = batch ? EMIT_ONLY.fnBase : (cen ? 1 : 0);
     var funcs = [full];
-    for (var wk = 1; wk < nSeg; wk++) {
+    for (var wk = 1; wk < NFN; wk++) {
       funcs.push([0x00].concat(            // no locals
-        loadI32(p.delaySlot), [OP.if_, OP.void_],
+        loadI32(p.delaySlot), loadI32(p.skipJump), [OP.i32_or], [OP.if_, OP.void_],   // see SKIP_JUMP AT ENTRY
           bump('#delayslot-entry'),
           [OP.i32_const], sleb(labelOps[wk]), [OP.call_indirect, 0x00, 0x00],
           [OP.return_],
@@ -2655,27 +2799,30 @@
         CHAIN ? [0x12] : [OP.call], leb(bodyFn),
         [OP.end]));
     }
+    var ftypes = funcs.map(function () { return 0; });
     if (batch) {
       // BATCHED MODULES: this span's functions go into the module emitBatch assembles
-      EMIT_ONLY.part = { funcs: funcs, labels: labels, labelOps: labelOps };
+      // (cold handlers last, at COLD_FN0 = fnBase + nSeg)
+      if (coldList) for (var hb2 = 0; hb2 < coldList.length; hb2++) { funcs.push(coldHandlerFn(coldList[hb2], p.reg)); ftypes.push(coldType(coldList[hb2])); }
+      EMIT_ONLY.part = { funcs: funcs, types: ftypes, labels: labels, labelOps: labelOps, nfn: NFN };
       return 1;
     }
-    if (coldList) funcs.push(chkHelper(p));     // CHK_FN: after the body and its wrappers
-    var typeSec = section(1, (cen || coldList)
-      ? [].concat(leb(2), [0x60, 0x00, 0x00], [0x60, 0x01, 0x7F, 0x00])
-      : [].concat(leb(1), [0x60, 0x00, 0x00]));
+    if (coldList) {
+      funcs.push(chkHelper(p)); ftypes.push(1);   // CHK_FN: after the body and its wrappers
+      for (var hb1 = 0; hb1 < coldList.length; hb1++) { funcs.push(coldHandlerFn(coldList[hb1], p.reg)); ftypes.push(coldType(coldList[hb1])); }   // COLD_FN0 = CHK_FN + 1
+    }
+    var typeSec = TYPE_SEC;
     var importSec = section(2, [].concat(leb(cen ? 3 : 2),
       [1, 0x65, 1, 0x74, 0x01, 0x70, 0x00, 0x00],
       [1, 0x65, 1, 0x6D, 0x02, 0x00, 0x00],
       cen ? [1, 0x65, 1, 0x63, 0x00, 0x01] : []));
     var fdecl = leb(funcs.length);
-    for (wk = 0; wk < nSeg; wk++) fdecl = fdecl.concat(leb(0));
-    if (coldList) fdecl = fdecl.concat(leb(1));
+    for (wk = 0; wk < ftypes.length; wk++) app(fdecl, leb(ftypes[wk]));
     var funcSec = section(3, fdecl);
     var globalSec = nSeg > 1 ? section(6, [0x01, 0x7F, 0x01, OP.i32_const, 0x00, OP.end]) : [];
     // exports: "f" = label 0 (the body), "f<k>" = wrapper k
-    var exps = leb(nSeg).concat([1, 0x66, 0x00], leb(bodyFn));
-    for (wk = 1; wk < nSeg; wk++) {
+    var exps = leb(NFN).concat([1, 0x66, 0x00], leb(bodyFn));
+    for (wk = 1; wk < NFN; wk++) {
       var nm = ('f' + wk).split('').map(function (ch) { return ch.charCodeAt(0); });
       exps = exps.concat(leb(nm.length), nm, [0x00], leb(bodyFn + wk));
     }
@@ -2701,12 +2848,12 @@
       for (wk = 1; wk < nSeg; wk++) {
         var lptr = p.entryPtr + labels[wk] * p.stride;
         if (HEAPU32[lptr >> 2] !== labelOps[wk]) continue;
-        HEAPU32[lptr >> 2] = installSlot(Module, (p.vaddr + labels[wk] * 4) >>> 0, inst.exports['f' + wk]);
+        HEAPU32[lptr >> 2] = installSlot(Module, (p.vaddr + labels[wk] * 4) >>> 0, inst.exports['f' + wk] || inst.exports.f);
         stats.labelEntries = (stats.labelEntries || 0) + 1;
       }
       stats.blocks++;
       var fns1 = [inst.exports.f];
-      for (wk = 1; wk < nSeg; wk++) fns1.push(inst.exports['f' + wk]);
+      for (wk = 1; wk < nSeg; wk++) fns1.push(inst.exports['f' + wk] || inst.exports.f);
       cachePut(keyArr, fns1, labels, labelOps);
       return idx;
     } catch (e) {
