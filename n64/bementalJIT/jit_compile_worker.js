@@ -23,12 +23,12 @@ function one(job) {
   if (!r.ok) return r;
   var mod = null;
   try { mod = new WebAssembly.Module(r.bytes); } catch (er) { return { id: r.id, ok: false, err: 'compile: ' + ((er && er.message) || er) }; }
-  return { id: r.id, ok: true, labels: r.labels, labelOps: r.labelOps, mod: mod, bytes: r.bytes };
+  return { id: r.id, ok: true, labels: r.labels, labelOps: r.labelOps, maxW: r.maxW, maxO: r.maxO, mod: mod, bytes: r.bytes };
 }
 function send(out) {
   if (!out.length) return;
   if (moduleCloneOk) {
-    var withMods = out.map(function (o) { return o.ok ? { id: o.id, ok: true, labels: o.labels, labelOps: o.labelOps, mod: o.mod } : o; });
+    var withMods = out.map(function (o) { return o.ok ? { id: o.id, ok: true, labels: o.labels, labelOps: o.labelOps, maxW: o.maxW, maxO: o.maxO, mod: o.mod } : o; });
     try { self.postMessage(withMods); return; } catch (er) { moduleCloneOk = false; }   // a browser that cannot clone a Module
   }
   var tr = [];

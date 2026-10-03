@@ -339,7 +339,7 @@ try {
       if (!tMark.from && st.f >= FROM) tMark.from = st;
       if (PROFILE && !profOnC && st.f >= FROM && coreWorker) {
         await coreWorker.client.send('Profiler.enable');
-        await coreWorker.client.send('Profiler.setSamplingInterval', { interval: 200 });
+        await coreWorker.client.send('Profiler.setSamplingInterval', { interval: 500 });
         await coreWorker.client.send('Profiler.start');
         profOnC = true;
       }
@@ -393,7 +393,7 @@ try {
     const to = Math.min(FRAMES, f + CH);
     if (PROFILE && !profOn && f >= FROM && coreWorker) {
       await coreWorker.client.send('Profiler.enable');
-      await coreWorker.client.send('Profiler.setSamplingInterval', { interval: 200 });
+      await coreWorker.client.send('Profiler.setSamplingInterval', { interval: 500 });
       await coreWorker.client.send('Profiler.start');
       profOn = true;
     }
@@ -445,7 +445,7 @@ try {
     if (self.DBG) o.dbg = self.DBG.report();
     if (self.__wmWrap) o.wasm = self.__wmWrap;
     if (self.__glc) o.glCensus = self.__glc.n;
-    if (self.bementalMips && self.bementalMips.async) { const A = self.bementalMips.async; o.jitAsync = { on: A.on, offered: A.offered, installed: A.installed, stale: A.stale, failed: A.failed, pending: A.pending.size, maxInstallMs: +A.maxInstallMs.toFixed(2) }; }
+    if (self.bementalMips && self.bementalMips.async) { const A = self.bementalMips.async; o.jitAsync = { on: A.on, offered: A.offered, installed: A.installed, stale: A.stale, staleWhy: A.staleWhy, reoffered: A.reoffered, failed: A.failed, pending: A.pending.size, maxInstallMs: +A.maxInstallMs.toFixed(2) }; }
     o.md5hint = (self.Module && self.Module.__wasmV) || null;
     return o; })()`));
   if (res.stats && res.stats.shaderDump) { fs.writeFileSync(path.join(OUT, `${TAG}.glsl`), Buffer.from(res.stats.shaderDump, 'base64')); delete res.stats.shaderDump; }

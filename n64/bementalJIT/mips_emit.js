@@ -1542,8 +1542,9 @@
   // no Worker, or a core that never calls frameEnd — then the per-field budget
   // above applies.
   var EMIT_ONLY = null;          // set in the compile worker: compileSpan stops after emitting
+  var TABLE_BASE = 0;            // the core's table length before any JIT slot (see NO COMPILED CODE UNDER A SPAN)
   var ASYNC = { on: null, w: null, nextId: 1, pending: new Map(), ready: [], outbox: [], frameEnds: 0, M: null,
-                offered: 0, installed: 0, stale: 0, failed: 0, maxInstallMs: 0 };
+                offered: 0, installed: 0, stale: 0, failed: 0, maxInstallMs: 0, reoffered: 0, retry: 0 };
   function asyncOn(Module) {
     if (EMIT_ONLY) return false;
     if (ASYNC.on === false) return false;
@@ -1574,8 +1575,8 @@
     for (var k = 0; k < nOps; k++) ops[k] = U[(p.entryPtr + k * p.stride) >> 2];
     var words = U.slice(pageW0, pageW0 + pageN + 1);    // the page, and the word after it
     var id = ASYNC.nextId++;
-    var job = { id: id, p: Object.assign({}, p), w0: pageW0, words: words, ops: ops, flags: jitFlags() };
-    ASYNC.pending.set(id, { p: job.p, w0: pageW0, words: words, ops: ops, bp: bp, blk: bp ? U[bp >> 2] : 0, keyArr: keyArr });
+    var job = { id: id, p: Object.assign({}, p), w0: pageW0, words: words, ops: ops, flags: jitFlags(), tableBase: TABLE_BASE };
+    ASYNC.pending.set(id, { p: job.p, w0: pageW0, words: words, ops: ops, bp: bp, blk: bp ? U[bp >> 2] : 0, keyArr: keyArr, tries: ASYNC.retry | 0 });
     // batched: one message per field end (or per 32 offers) — a scene load offers hundreds
     // of spans inside one field, and a message each cost more than the copy itself
     ASYNC.outbox.push(job);
@@ -1587,13 +1588,25 @@
     var b = ASYNC.outbox; ASYNC.outbox = [];
     ASYNC.w.postMessage(b);
   }
-  function asyncStillHolds(M, j) {
+  function asyncStale(why) { var w = ASYNC.staleWhy || (ASYNC.staleWhy = {}); w[why] = (w[why] | 0) + 1; return false; }
+  // r.maxW / r.maxO: the furthest word / ops field the emitter read (everything it baked in)
+  function asyncStillHolds(M, j, r) {
     var U = M.HEAPU32, p = j.p, page = p.vaddr >>> 12, k;
-    if (M.HEAPU8[p.invalidCode + page]) return false;
+    var nw = (r && r.maxW >= 0) ? r.maxW + 1 : j.words.length, no = (r && r.maxO >= 0) ? r.maxO + 1 : j.ops.length;
+    if (M.HEAPU8[p.invalidCode + page]) return asyncStale('invalid');
     var bp = U[(p.blocksBase >> 2) + page];
-    if (!bp || bp !== j.bp || U[bp >> 2] !== j.blk || U[(bp >> 2) + 1] !== (p.blockStart >>> 0) || U[(bp >> 2) + 2] !== (p.blockEnd >>> 0)) return false;
-    for (k = 0; k < j.words.length; k++) if (U[j.w0 + k] !== j.words[k]) return false;
-    for (k = 0; k < j.ops.length; k++) if (U[(p.entryPtr + k * p.stride) >> 2] !== j.ops[k]) return false;
+    if (!bp || bp !== j.bp || U[bp >> 2] !== j.blk || U[(bp >> 2) + 1] !== (p.blockStart >>> 0) || U[(bp >> 2) + 2] !== (p.blockEnd >>> 0)) return asyncStale('block');
+    for (k = 0; k < nw; k++) if (U[j.w0 + k] !== j.words[k]) return asyncStale(k === j.words.length - 1 ? 'wordAfterPage' : 'words');
+    // An instruction of the span whose op is now a JIT slot (another span's entry or label,
+    // installed since — overlapping spans of one page) is fine: this module's fallback there
+    // calls the interpreter op it was built with, which is what a span compiled before that
+    // install (the synchronous path) does.
+    for (k = 0; k < no; k++) {
+      var cur = U[(p.entryPtr + k * p.stride) >> 2];
+      if (cur === j.ops[k]) continue;
+      if (k > 0 && TABLE_BASE && cur >= TABLE_BASE && j.ops[k] < TABLE_BASE) continue;
+      return asyncStale(k === 0 ? 'entryOp' : 'ops');
+    }
     return true;
   }
   function asyncInstallReady() {
@@ -1608,7 +1621,22 @@
       if (!j) continue;
       ASYNC.pending.delete(r.id);
       if (!r.ok) { ASYNC.failed++; if (r.err && !stats.asyncLastErr) stats.asyncLastErr = r.err; continue; }
-      if (!asyncStillHolds(M, j)) { ASYNC.stale++; continue; }
+      if (!asyncStillHolds(M, j, r)) {
+        ASYNC.stale++;
+        // The page is still valid and the entry still holds the interpreter op it was offered
+        // with, but a word or ops field it was built from moved (a data word in a code page):
+        // offer it again from memory as it is NOW, as a recompile would. Otherwise it would stay
+        // on the interpreter until the page happened to be recompiled.
+        var pv = j.p, U0 = M.HEAPU32;
+        if (!M.HEAPU8[pv.invalidCode + (pv.vaddr >>> 12)] && U0[pv.entryPtr >> 2] === j.ops[0] && (j.tries | 0) < 3) {
+          ASYNC.reoffered++;
+          ASYNC.retry = j.tries ? j.tries + 1 : 1;
+          var ri = compileSpan(pv, M);
+          ASYNC.retry = 0;
+          if (ri > 0 && U0[pv.entryPtr >> 2] === j.ops[0]) U0[pv.entryPtr >> 2] = ri;   // a cache hit: installed at once
+        }
+        continue;
+      }
       try {
         var mod = r.mod || new WebAssembly.Module(r.bytes);
         var inst = new WebAssembly.Instance(mod, { e: { t: M.wasmTable, m: M.wasmMemory, c: censusBump } });
@@ -1634,25 +1662,27 @@
   // the compile worker's side: run compileSpan on a copy of the inputs
   function emitJob(job) {
     var p = job.p, miss = 0, w0 = job.w0, words = job.words, ops = job.ops, base = p.entryPtr >>> 0, stride = p.stride;
+    var maxW = -1, maxO = -1;                 // the furthest copied word / ops field it read
     var H = new Proxy({}, { get: function (t, key) {
       var i = +key;
       if (i !== i) return undefined;
       var wi = i - w0;
-      if (wi >= 0 && wi < words.length) return words[wi];
+      if (wi >= 0 && wi < words.length) { if (wi > maxW) maxW = wi; return words[wi]; }
       var off = i * 4 - base;
-      if (off >= 0 && off % stride === 0 && off / stride < ops.length) return ops[off / stride];
+      if (off >= 0 && off % stride === 0 && off / stride < ops.length) { if (off / stride > maxO) maxO = off / stride; return ops[off / stride]; }
       miss++;
       return 0;
     } });
     window.__jitNoFP = job.flags.noFP; window.__jitNoLabels = job.flags.noLabels; window.__jitPin = job.flags.pin;
-    EMIT_ONLY = { out: null };
+    EMIT_ONLY = { out: null, tableBase: job.tableBase | 0 };
+    TABLE_BASE = job.tableBase | 0;
     var idx = 0;
     try { idx = compileSpan(p, { HEAPU32: H }); } catch (e) { return { id: job.id, ok: false, err: String((e && e.message) || e).slice(0, 200) }; }
     var out = EMIT_ONLY.out;
     EMIT_ONLY = null;
     if (!idx || !out) return { id: job.id, ok: false, err: idx ? 'no module' : 'refused' };
     if (miss) return { id: job.id, ok: false, err: 'read outside the copied inputs (' + miss + ')' };
-    return { id: job.id, ok: true, bytes: out.bytes, labels: out.labels, labelOps: out.labelOps };
+    return { id: job.id, ok: true, bytes: out.bytes, labels: out.labels, labelOps: out.labelOps, maxW: maxW, maxO: maxO };
   }
   function installSlot(Module, vkey, fn) {
     var sidx = slotByVaddr[vkey];
@@ -1763,6 +1793,25 @@
                        ' of ' + span + ' (vaddr 0x' + (p.vaddr >>> 0).toString(16) + ')');
         }
         return 0;
+      }
+    }
+    // ---- NO COMPILED CODE UNDER A SPAN (2026-10-03) ----
+    // Every fallback path bakes the op it finds in the span's precomp entries as the
+    // INTERPRETER op to call for that one instruction. recompile_block hands the bridge a
+    // page whose ops are all fresh interpreter ops, but a span compiled LATER — off-thread
+    // (OFF-THREAD EMISSION re-offers a span whose page moved), or drained from the budget
+    // queue — can find another span's entry or label already holding a JIT block there.
+    // Baking that would make a "one instruction" fallback run a whole block (and recurse:
+    // measured, "Maximum call stack size exceeded" from a JIT module). Interpreter ops are
+    // functions of the core's own table; JIT blocks are slots appended after it, so any op at
+    // or above the table's length at the first compile is not an interpreter op: refuse.
+    if (!TABLE_BASE) TABLE_BASE = EMIT_ONLY ? (EMIT_ONLY.tableBase | 0) : (Module.wasmTable ? Module.wasmTable.length : 0);
+    if (TABLE_BASE) {
+      for (var gj = 0; gj < scanEnd; gj++) {
+        if (HEAPU32[(p.entryPtr + gj * p.stride) >> 2] >= TABLE_BASE) {
+          stats.jitOpRejects = (stats.jitOpRejects || 0) + 1;
+          return 0;
+        }
       }
     }
 
