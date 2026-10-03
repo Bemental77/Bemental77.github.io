@@ -1,5 +1,42 @@
 # WebGL2 fallback for devices with NO WebGPU (the Xbox case)
 
+## ★★★ 2026-10-03 (later) — THE 488 s TITLE FRAME: byte-reversed vertex arrays from the recomp's full-image sync. FIXED
+
+**Cause (recomp_worker.js, VIWaitForRetrace frame sync).** After any DVD read (or a dirty-ring
+overflow / jumbo range) the next frame ships a full 24 MiB mem1 image. That image is RAW guest
+memory, where every f32 vertex/texcoord array is LITTLE-endian; only the bridge's own array regions
+carry them byte-swapped to the big-endian layout Dolphin's vertex loader reads. Dolphin applies the
+image first and the frame's regions over it (`worker_funcs.js` `recompFrame`), so after an image an
+array is right only if THAT frame re-sends it. The address caches (`knownArrays`/`knownDLs`/
+`knownTex`/`f32Arrays`) were cleared AFTER the frame's discovery, so every array already known from
+an earlier frame was not re-sent and stayed raw-LE in Dolphin for one frame. The next frame re-sent
+everything, which is why it was exactly one frame. Not the replay, not gl-record.js, not Dolphin's
+vertex loader: the bytes Dolphin was handed were wrong.
+
+**Fix:** clear the caches BEFORE discovery on a full-image frame (`fullSync`), so every binding of
+that frame counts as new and its arrays (swapped), DLs and textures go out in its regions on top of
+the image. Commit `c1d858e`.
+
+**Instrument:** a temporary vertex check appended to a SNAPSHOT copy of `render-worker.js` only
+(shadows every buffer upload, decodes each `drawElements`'s attribute 0 under its declared layout,
+flags NaN / |x| > 1e7 / out-of-range). Hermetic snapshots, `tools/probe_lock.sh`, SwiftShader,
+`--disable-features=WebGPUService,Dawn`, load 2-7.
+
+| | HEAD 028c3db | fix c1d858e |
+|---|---|---|
+| bad draws | **100 of 21,979, all in present 969** (the first title frame after the fade-in); 0 in every other frame. Sizes: 54 ≤300 idx, 17 in 301-1000, 29 >1000; max |pos| 3.4e38 | **0 of 59,770** over 1,603 presents (200 s) |
+| sample word | `7d9398bf` = 2.45e37 as read; byte-reversed `bf98937d` = -1.19 | — |
+| replay after that frame | stuck: fence age 62 s+ at end of run, presents frozen at 637 | fence max 1.0 s (vtx run) / 1.43 s (clean 300 s run); presents keep advancing |
+| screenshot at end | blank canvas | correct Mario Party 4 title (logo, characters, cube) |
+| clean 300 s run (no instrument) | — | longest main-thread task 0 ms after boot (1,248 ms during boot), guest 59.992/s = 0.9999x, max 5 s window 1.0038x, 8.27 presents/s |
+
+**WebGPU on this box is a different problem.** The same snapshot with `--enable-unsafe-webgpu`
+(SwiftShader adapter) still publishes 3 frames in 180 s and reports PRESENT STALLED at **t≈44 s**,
+identical to the pre-fix run (`publishedTotal 3` both). That is two minutes before the title frame,
+so it is not this bug. Earlier text guessing that the WebGPU software-adapter stall was "the same
+scene" is not supported. On a hardware-GPU WebGPU device the same bad frame would have drawn one
+frame of garbage triangles (Dolphin's RAM is shared by both backends), and the fix covers that too.
+
 ## ★★★ 2026-10-03 — THE MAIN-THREAD FREEZE: it was the browser's canvas commit, not our GL calls
 
 Mario Party 4 (recomp engine), `--disable-features=WebGPUService,Dawn`, this box = SwiftShader,
@@ -30,7 +67,7 @@ whether the GPU had finished any.
 | rAF/s | 10 | 59.9 |
 | presents shown/s, steady | 6.47 | 8.05 (after the title frame below retired) |
 
-**Still open — one SwiftShader frame costs minutes.** The first title frame after the fade-in took
+**~~Still open~~ FIXED in c1d858e (see the section above) — one SwiftShader frame cost minutes.** The first title frame after the fade-in took
 **488.8 s** of GPU time in the 900 s fix run (on HEAD the frozen page came back after ~172-198 s;
 the fix keeps the page and the guest live through it, but the picture waits). Bisected by skipping
 draws: keeping only draws of ≤300 indices → no stall (9 fps); ≤1000 → stall. A captured 372-index

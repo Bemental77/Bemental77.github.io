@@ -1476,7 +1476,7 @@ async function boot(msg) {
             // after the fade-in, a DVD-read frame): 100 draws, every one with positions/UVs that
             // are byte-reversed floats (bytes bf 98 93 7d = -1.192 read as 2.45e37), and 0 bad
             // draws in every other frame. Those triangles cost SwiftShader ~488 s of GPU time
-            // on the WebGL2 fallback and the same frame stalls WebGPU on a software adapter.
+            // on the WebGL2 fallback (on a hardware GPU the same draws would be visual garbage).
             // Clearing first makes discovery treat every binding of this frame as new, so its
             // arrays (swapped), DLs and textures (incl. static assets, which the raw image
             // carries as zeros) go out in this frame's regions on top of the image — the same
