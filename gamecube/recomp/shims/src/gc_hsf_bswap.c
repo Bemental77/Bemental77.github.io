@@ -36,6 +36,28 @@
 #include <stdint.h>
 #include <string.h>
 
+// DECOMP GENERATIONS (see build_wasm.sh). The 2026 decomp renamed every HSF type to upper case
+// (HsfHeader -> HSFHEADER, ...), folded HsfObjectData into the object as `mesh`, and renamed
+// a set of fields. The ON-DISC layout is the game's and did not change, so this file is one
+// swapper with the field names spelled per generation: HSF_F(gen1_name, gen2_name).
+// Every renamed field was matched by OFFSET against the gen2 header, e.g. HsfAttribute unk28/
+// unk2C/unk30/unk34 are the HuVec2f scale (0x28) and trans (0x30); HsfCluster unk14[] is weight[32]
+// at 0x14; HsfMesh vertexShapeCnt/clusterCnt/cenvCnt are shapeNum/clusterNum/cenvNum.
+#if defined(RECOMP_DECOMP_GEN) && RECOMP_DECOMP_GEN >= 2
+typedef HSFHEADER HsfHeader;       typedef HSFSECTION HsfSection;     typedef HSFSCENE HsfScene;
+typedef HSFBUFFER HsfBuffer;       typedef HSFMATERIAL HsfMaterial;   typedef HSFATTRIBUTE HsfAttribute;
+typedef HSFFACE HsfFace;           typedef HSFOBJECT HsfObject;       typedef HSFMESH HsfObjectData;
+typedef HSFBITMAP HsfBitmap;       typedef HSFPALETTE HsfPalette;     typedef HSFMOTION HsfMotion;
+typedef HSFTRACK HsfTrack;         typedef HSFBITMAPKEY HsfBitmapKey; typedef HSFCENV HsfCenv;
+typedef HSFCENVSINGLE HsfCenvSingle; typedef HSFCENVDUAL HsfCenvDual; typedef HSFCENVDUALWEIGHT HsfCenvDualWeight;
+typedef HSFCENVMULTI HsfCenvMulti; typedef HSFCENVMULTIWEIGHT HsfCenvMultiWeight;
+typedef HSFSKELETON HsfSkeleton;   typedef HSFPART HsfPart;           typedef HSFCLUSTER HsfCluster;
+typedef HSFSHAPE HsfShape;         typedef HSFMAPATTR HsfMapAttr;     typedef HSFMATRIX HsfMatrix;
+#define HSF_F(gen1, gen2) gen2
+#else
+#define HSF_F(gen1, gen2) gen1
+#endif
+
 // [DIAG] trace which section is being swapped (define HSF_BSWAP_TRACE to enable); the harness
 // records the __gc_trace IDs, so the LAST id before an OOB names the culprit section. Disabled now
 // that the swapper is validated (all 21 sections complete; the vertex/normal/st stride bug is fixed).
@@ -173,8 +195,8 @@ void __recomp_bswap_hsf(void *data)
         HsfScene *s = (HsfScene *)(base + h->scene.ofs);
         for (i = 0; i < h->scene.count; i++) {
             sw32f(&s[i].fogType);         // enum -> 32-bit
-            bswf32(&s[i].start);
-            bswf32(&s[i].end);
+            bswf32(&s[i].HSF_F(start, fogStart));
+            bswf32(&s[i].HSF_F(end, fogEnd));
             /* color is 4 x u8 -> no swap */
         }
     }
@@ -200,7 +222,7 @@ void __recomp_bswap_hsf(void *data)
             /* unk4[4] : u8[4] -> no swap */
             m[i].pass = bsw16(m[i].pass); // u16
             /* vtxMode u8; litColor[3] u8; color[3] u8; shadowColor[3] u8 -> no swap */
-            bswf32(&m[i].hilite_scale);
+            bswf32(&m[i].HSF_F(hilite_scale, hiliteScale));
             bswf32(&m[i].unk18);
             bswf32(&m[i].invAlpha);
             bswf32(&m[i].unk20[0]);
@@ -208,8 +230,8 @@ void __recomp_bswap_hsf(void *data)
             bswf32(&m[i].refAlpha);
             bswf32(&m[i].unk2C);
             m[i].flags    = bsw32(m[i].flags);
-            m[i].numAttrs = bsw32(m[i].numAttrs);
-            sw32f(&m[i].attrs);           // symbol-index (stored as s32*) -> 32-bit
+            m[i].HSF_F(numAttrs, attrNum) = bsw32(m[i].HSF_F(numAttrs, attrNum));
+            sw32f(&m[i].HSF_F(attrs, attr));           // symbol-index (stored as s32*) -> 32-bit
         }
         // The material 'attrs' arrays live in the symbol section (swapped there); no extra data
         // is appended after the HsfMaterial[] array in the material section itself.
@@ -221,23 +243,23 @@ void __recomp_bswap_hsf(void *data)
         HsfAttribute *a = (HsfAttribute *)(base + h->attribute.ofs);
         for (i = 0; i < h->attribute.count; i++) {
             sw32f(&a[i].name);            // char* offset (may be -1 sentinel; swap is symmetric)
-            sw32f(&a[i].unk04);           // pointer field
+            sw32f(&a[i].HSF_F(unk04, animWorkP));           // pointer field
             /* unk8[4] u8 */
-            bswf32(&a[i].unk0C);
+            bswf32(&a[i].HSF_F(unk0C, kColor));
             /* unk10[4] u8 */
-            bswf32(&a[i].unk14);
+            bswf32(&a[i].HSF_F(unk14, nbtTpLvl));
             /* unk18[8] u8 */
             bswf32(&a[i].unk20);
             /* unk24[4] u8 */
-            bswf32(&a[i].unk28);
-            bswf32(&a[i].unk2C);
-            bswf32(&a[i].unk30);
-            bswf32(&a[i].unk34);
+            bswf32(&a[i].HSF_F(unk28, scale.x));
+            bswf32(&a[i].HSF_F(unk2C, scale.y));
+            bswf32(&a[i].HSF_F(unk30, trans.x));
+            bswf32(&a[i].HSF_F(unk34, trans.y));
             /* unk38[44] u8 */
-            a[i].wrap_s = bsw32(a[i].wrap_s);
-            a[i].wrap_t = bsw32(a[i].wrap_t);
+            a[i].HSF_F(wrap_s, wrapS) = bsw32(a[i].HSF_F(wrap_s, wrapS));
+            a[i].HSF_F(wrap_t, wrapT) = bsw32(a[i].HSF_F(wrap_t, wrapT));
             /* unk6C[12] u8 */
-            a[i].unk78 = bsw32(a[i].unk78);
+            a[i].HSF_F(unk78, maxLod) = bsw32(a[i].HSF_F(unk78, maxLod));
             a[i].flag  = bsw32(a[i].flag);
             sw32f(&a[i].bitmap);          // bitmap index/offset (SearchBitmapPtr consumes it) -> 32-bit
         }
@@ -355,7 +377,7 @@ void __recomp_bswap_hsf(void *data)
             o[i].flags = bsw32(o[i].flags);
             (void)type;
             {
-                HsfObjectData *d = &o[i].data;
+                HsfObjectData *d = &o[i].HSF_F(data, mesh);
                 sw32f(&d->parent);
                 d->childrenCount = bsw32(d->childrenCount);
                 sw32f(&d->children);            // offset/symbol-index array base
@@ -379,11 +401,11 @@ void __recomp_bswap_hsf(void *data)
                 sw32f(&d->material);
                 sw32f(&d->attribute);
                 /* unk120[2] u8 ; shapeType u8 ; unk123 u8 -> no swap */
-                d->vertexShapeCnt = bsw32(d->vertexShapeCnt);
-                sw32f(&d->vertexShape);
-                d->clusterCnt = bsw32(d->clusterCnt);
+                d->HSF_F(vertexShapeCnt, shapeNum) = bsw32(d->HSF_F(vertexShapeCnt, shapeNum));
+                sw32f(&d->HSF_F(vertexShape, shape));
+                d->HSF_F(clusterCnt, clusterNum) = bsw32(d->HSF_F(clusterCnt, clusterNum));
                 sw32f(&d->cluster);
-                d->cenvCnt = bsw32(d->cenvCnt);
+                d->HSF_F(cenvCnt, cenvNum) = bsw32(d->HSF_F(cenvCnt, cenvNum));
                 sw32f(&d->cenv);
                 // file[0]/file[1]: ABSOLUTE byte offsets (from file base — unlike the section-
                 // relative pools) to PRISTINE COPIES of this mesh's vertex/normal arrays, used
@@ -397,7 +419,7 @@ void __recomp_bswap_hsf(void *data)
                 {
                     u32 f0 = sw32f(&d->file[0]);
                     u32 f1 = sw32f(&d->file[1]);
-                    if (type == 2 && d->cenvCnt != 0) {
+                    if (type == 2 && d->HSF_F(cenvCnt, cenvNum) != 0) {
                         s32 vidx = (s32)(u32)d->vertex;
                         s32 nidx = (s32)(u32)d->normal;
                         if (f0 && vidx >= 0 && vidx < h->vertex.count) {
@@ -466,7 +488,7 @@ void __recomp_bswap_hsf(void *data)
             sw32f(&mo[i].name);
             mo[i].numTracks = (s32)bsw32((u32)mo[i].numTracks);   // store swapped value back
             sw32f(&mo[i].track);                                  // offset (relocated later)
-            bswf32(&mo[i].len);
+            bswf32(&mo[i].HSF_F(len, maxTime));
         }
         {
             s32 nTracks = mo[0].numTracks;                        // already swapped above
@@ -485,9 +507,9 @@ void __recomp_bswap_hsf(void *data)
                 // (hsfmotion.c:683,691,700,726,747,899,906,954,961,772) -> per-u16 swap, or the
                 // two halves get transposed. Dispatch on the (unswapped) track type byte.
                 if (tr[j].type == HSF_TRACK_CLUSTER_WEIGHT) {
-                    tr[j].unk04 = (s32)bsw32((u32)tr[j].unk04);   // single 32-bit index
+                    tr[j].HSF_F(unk04, clusterWeight) = (s32)bsw32((u32)tr[j].HSF_F(unk04, clusterWeight));   // single 32-bit index
                 } else {
-                    tr[j].param   = (s16)bsw16((u16)tr[j].param);   // low u16
+                    tr[j].HSF_F(param, attrIdx)   = (s16)bsw16((u16)tr[j].HSF_F(param, attrIdx));   // low u16
                     tr[j].channel = bsw16(tr[j].channel);           // high u16
                 }
                 tr[j].curveType    = bsw16(tr[j].curveType);
@@ -540,36 +562,36 @@ void __recomp_bswap_hsf(void *data)
                 for (j = 0; j < (s32)c[i].singleCount; j++) {
                     sg[j].target    = bsw32(sg[j].target);
                     sg[j].pos       = bsw16(sg[j].pos);
-                    sg[j].posCnt    = bsw16(sg[j].posCnt);
+                    sg[j].HSF_F(posCnt, posNum)    = bsw16(sg[j].HSF_F(posCnt, posNum));
                     sg[j].normal    = bsw16(sg[j].normal);
-                    sg[j].normalCnt = bsw16(sg[j].normalCnt);
+                    sg[j].HSF_F(normalCnt, normalNum) = bsw16(sg[j].HSF_F(normalCnt, normalNum));
                 }
                 // HsfCenvDual: { u32 target1; u32 target2; u32 weightCnt; HsfCenvDualWeight *weight(ofs) }
                 HsfCenvDual *du = (HsfCenvDual *)(data_base + (u32)c[i].dualData);
                 for (j = 0; j < (s32)c[i].dualCount; j++) {
                     du[j].target1   = bsw32(du[j].target1);
                     du[j].target2   = bsw32(du[j].target2);
-                    u32 wcnt        = bsw32(du[j].weightCnt); du[j].weightCnt = wcnt;
+                    u32 wcnt        = bsw32(du[j].HSF_F(weightCnt, weightNum)); du[j].HSF_F(weightCnt, weightNum) = wcnt;
                     u32 wofs        = sw32f(&du[j].weight);
                     // HsfCenvDualWeight: { f32 weight; u16 pos; u16 posCnt; u16 normal; u16 normalCnt }
                     HsfCenvDualWeight *w = (HsfCenvDualWeight *)(weight_base + wofs);
                     for (k = 0; k < (s32)wcnt; k++) {
                         bswf32(&w[k].weight);
                         w[k].pos       = bsw16(w[k].pos);
-                        w[k].posCnt    = bsw16(w[k].posCnt);
+                        w[k].HSF_F(posCnt, posNum)    = bsw16(w[k].HSF_F(posCnt, posNum));
                         w[k].normal    = bsw16(w[k].normal);
-                        w[k].normalCnt = bsw16(w[k].normalCnt);
+                        w[k].HSF_F(normalCnt, normalNum) = bsw16(w[k].HSF_F(normalCnt, normalNum));
                     }
                 }
                 // HsfCenvMulti: { u32 weightCnt; u16 pos; u16 posCnt; u16 normal; u16 normalCnt;
                 //   HsfCenvMultiWeight *weight(ofs) }
                 HsfCenvMulti *mu = (HsfCenvMulti *)(data_base + (u32)c[i].multiData);
                 for (j = 0; j < (s32)c[i].multiCount; j++) {
-                    u32 wcnt        = bsw32(mu[j].weightCnt); mu[j].weightCnt = wcnt;
+                    u32 wcnt        = bsw32(mu[j].HSF_F(weightCnt, weightNum)); mu[j].HSF_F(weightCnt, weightNum) = wcnt;
                     mu[j].pos       = bsw16(mu[j].pos);
-                    mu[j].posCnt    = bsw16(mu[j].posCnt);
+                    mu[j].HSF_F(posCnt, posNum)    = bsw16(mu[j].HSF_F(posCnt, posNum));
                     mu[j].normal    = bsw16(mu[j].normal);
-                    mu[j].normalCnt = bsw16(mu[j].normalCnt);
+                    mu[j].HSF_F(normalCnt, normalNum) = bsw16(mu[j].HSF_F(normalCnt, normalNum));
                     u32 wofs        = sw32f(&mu[j].weight);
                     // HsfCenvMultiWeight: { u32 target; f32 value }
                     HsfCenvMultiWeight *w = (HsfCenvMultiWeight *)(weight_base + wofs);
@@ -602,7 +624,7 @@ void __recomp_bswap_hsf(void *data)
         unsigned char *data_base = (unsigned char *)&pt[h->part.count];
         for (i = 0; i < h->part.count; i++) {
             sw32f(&pt[i].name);
-            u32 cnt = bsw32(pt[i].count); pt[i].count = cnt;
+            u32 cnt = bsw32(pt[i].HSF_F(count, num)); pt[i].HSF_F(count, num) = cnt;
             u32 vofs = sw32f(&pt[i].vertex);
             u16 *vtx = (u16 *)data_base + vofs;        // u16 element index (hsfload.c:825)
             for (j = 0; j < (s32)cnt; j++) vtx[j] = bsw16(vtx[j]);
@@ -620,15 +642,15 @@ void __recomp_bswap_hsf(void *data)
             sw32f(&cl[i].name[1]);
             sw32f(&cl[i].targetName);       // union with s32 target -> 32-bit either way
             sw32f(&cl[i].part);             // part index/offset (SearchPartPtr consumes it)
-            bswf32(&cl[i].unk10);
-            bswf32(&cl[i].unk14[0]);
+            bswf32(&cl[i].HSF_F(unk10, index));
+            bswf32(&cl[i].HSF_F(unk14, weight)[0]);
             /* unk18[124] u8 ; adjusted u8 ; unk95 u8 -> no swap */
             cl[i].type      = bsw16(cl[i].type);
-            cl[i].vertexCnt = bsw32(cl[i].vertexCnt);
+            cl[i].HSF_F(vertexCnt, vertexNum) = bsw32(cl[i].HSF_F(vertexCnt, vertexNum));
             // Fix C: the weight array REALLY extends past unk14[0] into the unk18[124] bytes
             // (read up to vertexCnt floats per frame, ClusterExec.c:56/67) — swap the rest.
-            { s32 wn = (s32)cl[i].vertexCnt; if (wn > 32) wn = 32;
-              for (j = 1; j < wn; j++) bswf32(&cl[i].unk14[j]); }
+            { s32 wn = (s32)cl[i].HSF_F(vertexCnt, vertexNum); if (wn > 32) wn = 32;
+              for (j = 1; j < wn; j++) bswf32(&cl[i].HSF_F(unk14, weight)[j]); }
             sw32f(&cl[i].vertex);           // symbol-index array base
         }
     }
@@ -641,8 +663,8 @@ void __recomp_bswap_hsf(void *data)
         HsfShape *sh = (HsfShape *)(base + h->shape.ofs);
         for (i = 0; i < h->shape.count; i++) {
             sw32f(&sh[i].name);
-            sh[i].count16[0] = bsw16(sh[i].count16[0]);
-            sh[i].count16[1] = bsw16(sh[i].count16[1]);
+            sh[i].HSF_F(count16, num16)[0] = bsw16(sh[i].HSF_F(count16, num16)[0]);
+            sh[i].HSF_F(count16, num16)[1] = bsw16(sh[i].HSF_F(count16, num16)[1]);
             sw32f(&sh[i].vertex);           // symbol-index array base
         }
     }

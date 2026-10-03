@@ -64,10 +64,25 @@ extern void *calloc(size_t, size_t);
 #define GC_FIBER_ASYNCIFY_STACK  32768     // Asyncify (spill) stack per context
 #define GC_FIBER_MAX             2048       // MP4 lives well under this
 
+// ---- THE C STACK MUST BE 16-BYTE ALIGNED -----------------------------------------------------
+// clang's wasm32 code generation ASSUMES __stack_pointer is 16-aligned: a function subtracts a
+// multiple of 16 from it and then addresses its locals with OR, not ADD — `sp | 4`, `sp | (i<<2)`
+// (MEASURED in ovl_m403dll__scene.o fn_1_6FE8: `local2 = sp | 4`, `sp | (r4 << 2)` for sp8[r4]).
+// emscripten_fiber_init puts the stack top at c_stack + size, and this file used to hand it a
+// bare malloc() block — 8-aligned on this allocator — so on every fiber the top was 8 mod 16 and
+// every OR-addressed local aliased another: `sp | 8 == sp`, so m403's store to sp8[2] landed on
+// sp8[0] and sp8[2] stayed whatever the stack held. MEASURED at the trap: sp = 0x027b8998,
+// sp8 = { 0x8084..., 4, 5, 2, 1, 3 } (0 lost, one guest pointer in its place) -> unk0C[garbage]
+// -> `memory access out of bounds` in m403 and m415 (and silent wrong locals anywhere else a
+// function's frame happened to be OR-addressed). Every fiber stack now comes from stack_alloc:
+// base rounded up to 16 and the size a multiple of 16, so base+size is 16-aligned.
+#define GC_STACK_ALIGN 16u
+
 typedef struct gc_ctx {
     emscripten_fiber_t fiber;
     void (*entry)(void);        // process body (NULL for the root/scheduler ctx)
-    void  *c_stack;             // owned wasm shadow stack (NULL for root)
+    void  *c_stack_raw;         // the malloc() block behind c_stack (what free() takes)
+    void  *c_stack;             // owned wasm shadow stack (NULL for root), 16-aligned
     void  *asyncify_stack;      // owned Asyncify stack
     int    is_root;
 } gc_ctx;
@@ -99,10 +114,16 @@ static int g_pending_status = 0;   // status a resumed gclongjmp returns
 // free the stack it is standing on; park it here and free it on the next swap,
 // when execution is provably off that stack.
 extern void free(void *);
+static size_t stack_alloc(gc_ctx *c, size_t size) {
+    size = (size + GC_STACK_ALIGN - 1) & ~(size_t)(GC_STACK_ALIGN - 1);
+    c->c_stack_raw = malloc(size + GC_STACK_ALIGN);
+    c->c_stack = (void *)(((size_t)c->c_stack_raw + GC_STACK_ALIGN - 1) & ~(size_t)(GC_STACK_ALIGN - 1));
+    return size;
+}
 static gc_ctx *g_dead = NULL;
 static void reap_dead(void) {
     if (g_dead && g_dead != g_current) {
-        if (g_dead->c_stack) free(g_dead->c_stack);
+        if (g_dead->c_stack_raw) free(g_dead->c_stack_raw);
         if (g_dead->asyncify_stack) free(g_dead->asyncify_stack);
         free(g_dead);
         g_dead = NULL;
@@ -135,17 +156,20 @@ static void ensure_root(void) {
 static void gc_fiber_trampoline(void *arg) {
     gc_ctx *c = (gc_ctx *)arg;
     g_stat_enter++;             // a fresh process body is about to START on its fiber
-    c->entry();                 // Hu bodies are infinite while(1)+HuPrcVSleep loops
-    // If a body ever falls off the end (most end via HuPrcEnd -> gclongjmp(&pjb,2),
-    // which swaps away and never returns here), behave like terminate: hand status
-    // 2 to the scheduler so HuPrcCall frees the heap (process.c:236). We swap to
-    // root; the scheduler's baked `ret = gclongjmp(...)` then sees 2.
-    g_pending_status = 2;
-    gc_ctx *from = c;
-    g_current = &g_root;
-    g_dead = from;              // reaped on the next swap (we are still on its stack)
-    emscripten_fiber_swap(&from->fiber, &g_root.fiber);
-    __builtin_trap();           // never resumed
+    // A BODY THAT RETURNS RUNS AGAIN — that is what the PowerPC does, and anything else frees a
+    // live process. HuPrcCreate sets process->jump.lr = func (process.c:82-83, baked into
+    // __gc_fiber_fabricate here), so the body is entered with LR == func: its epilogue's blr
+    // branches straight back to its own first instruction, on the same stack. It never reaches
+    // the scheduler. This used to "behave like terminate" (status 2) instead, but only
+    // gcTerminateProcess UNLINKS a process; the scheduler's case 2 just frees its heap
+    // (process.c HuPrcCall), so the process stayed in the list with a freed heap and a reaped
+    // fiber, and the next dispatch resumed freed memory. MEASURED (m445, frame 7171, with a magic
+    // word on every context): `reap 0x27d82f0` then `BAD target 0x27d82f0 magic dead key
+    // 0x802dc4b0 status 1 from <root>` — surfacing as `null function or function signature
+    // mismatch` in dynCall_vi when the freed fiber's entry slot had been reused.
+    // Every real exit goes through HuPrcEnd -> gcTerminateProcess -> gclongjmp(&pjb, 2), which
+    // swaps away from this loop for good.
+    for (;;) c->entry();
 }
 
 // ---- HuPrcCreate fabrication hook (replaces process.c:81-83 via perl bake) ----
@@ -159,8 +183,7 @@ void __gc_fiber_fabricate(void *jmpbuf, void (*func)(void), unsigned game_stack_
     g_stat_fabricate++;
     gc_ctx *c = (gc_ctx *)calloc(1, sizeof(gc_ctx));
     c->entry = func;
-    size_t cstk = game_stack_size < 65536u ? 65536u : (size_t)game_stack_size;
-    c->c_stack        = malloc(cstk);
+    size_t cstk = stack_alloc(c, game_stack_size < 65536u ? 65536u : (size_t)game_stack_size);
     c->asyncify_stack = malloc(GC_FIBER_ASYNCIFY_STACK);
     emscripten_fiber_init(&c->fiber, gc_fiber_trampoline, c,
                           c->c_stack, cstk,
@@ -183,16 +206,16 @@ void __gc_fiber_retarget(void *jmpbuf, void (*func)(void)) {
     ensure_root();
     gc_ctx *old = bind_lookup(jmpbuf);
     if (old && old != &g_root && old != g_current) {
-        if (old->c_stack) free(old->c_stack);
+        if (old->c_stack_raw) free(old->c_stack_raw);
         if (old->asyncify_stack) free(old->asyncify_stack);
         free(old);
     }
     gc_ctx *c = (gc_ctx *)calloc(1, sizeof(gc_ctx));
     c->entry = func;
-    c->c_stack        = malloc(65536u);
+    size_t cstk = stack_alloc(c, 65536u);
     c->asyncify_stack = malloc(GC_FIBER_ASYNCIFY_STACK);
     emscripten_fiber_init(&c->fiber, gc_fiber_trampoline, c,
-                          c->c_stack, 65536u,
+                          c->c_stack, cstk,
                           c->asyncify_stack, GC_FIBER_ASYNCIFY_STACK);
     bind_set(jmpbuf, c);
 }

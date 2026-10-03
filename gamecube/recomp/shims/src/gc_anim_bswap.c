@@ -14,6 +14,12 @@
 //                      palData/data u32-offset  (NOTE: 16-bit pixel/palette DATA is not swapped
 //                      here — geometry draws; per-texel color endianness is a follow-on.)
 #include "game/animdata.h"
+// DECOMP GENERATIONS (build_wasm.sh): the 2026 decomp spells these ANIMDATA/ANIMBANK/...; the
+// layout (offsets in the comment above) is the disc format and is unchanged.
+#if defined(RECOMP_DECOMP_GEN) && RECOMP_DECOMP_GEN >= 2
+typedef ANIMDATA AnimData; typedef ANIMBANK AnimBankData; typedef ANIMFRAME AnimFrameData;
+typedef ANIMPAT AnimPatData; typedef ANIMLAYER AnimLayerData; typedef ANIMBMP AnimBmpData;
+#endif
 
 static u16 bsw16(u16 v) { return (u16)((v >> 8) | (v << 8)); }
 static u32 bsw32(u32 v) { return (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24); }

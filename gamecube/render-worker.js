@@ -620,7 +620,7 @@ function drainOnce(stopAtPresent) {
   return false;
 }
 
-let _mpLast = 0, _mpMaxReplay = 0, _mpMaxGap = 0, _mpMaxDrained = 0;   // [mainprof TEMP 2026-06-26]
+let _mpLast = 0, _mpMaxReplay = 0, _mpMaxGap = 0, _mpMaxDrained = 0, _mpLastLogged = -1;   // [mainprof TEMP 2026-06-26]
 // [decoupled drain 2026-06-26] Drive the drain off a MessageChannel macrotask instead of
 // requestAnimationFrame. Measured: rAF was firing at ~1Hz on this foreground page (gating present
 // FAR below the worker's production rate) while the main thread sat idle. MessageChannel is not
@@ -660,7 +660,11 @@ function drainLoop() {
     if (_replay > _mpMaxReplay) _mpMaxReplay = _replay;
     if (_gap > _mpMaxGap) _mpMaxGap = _gap;
     if (drained > _mpMaxDrained) _mpMaxDrained = drained;
-    if ((framesPainted & 15) === 0) {
+    // Logged once per 16 presented frames. It used to log on EVERY turn while framesPainted sat on
+    // a multiple of 16 — i.e. on every 4 ms poll while the ring was empty, hundreds of console
+    // lines a second on the main thread during exactly the stalls it exists to describe.
+    if ((framesPainted >> 4) !== _mpLastLogged) {
+      _mpLastLogged = framesPainted >> 4;
       console.log('[mainprof] f=' + framesPainted +
         ' replay(now/max)=' + _replay.toFixed(1) + '/' + _mpMaxReplay.toFixed(1) + 'ms' +
         ' gap(now/max)=' + _gap.toFixed(1) + '/' + _mpMaxGap.toFixed(1) + 'ms' +

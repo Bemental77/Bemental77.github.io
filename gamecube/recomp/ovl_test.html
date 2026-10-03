@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MP4 overlay rig</title>
+<!-- The Mario Party 4 recomp worker alone (no renderer, no lobby), driven to a chosen overlay and
+     run until it stops, so each overlay compiled into mp4_game.wasm can be PROVEN with a run.
+     Driven by gamecube/recomp/ovl_test.mjs; usable by hand.
+     Query: frames=N  script=board|mash|amash|none  allcom=1  seed=S  board=0..5  mg=<mgInfoTbl index>  det=1
+            wasm=<url> glue=<url>  (defaults: this directory's mp4_game.{wasm,js})
+     The board chain (the same frame-keyed presses as gamecube.html ?board=1) reaches Party-Mode
+     character select, where the AUTOBOARD/AUTOTEST hook (shims/src/gc_autoboard.c) fires and
+     sends the game to board `board`, or with mg= straight into that minigame with four COMs. -->
+<script src="/coi-serviceworker.js"></script>
+<style>body{background:#111;color:#ddd;font:13px monospace;margin:16px}</style>
+</head><body>
+<div id="out">booting…</div>
+<script>
+(function () {
+  'use strict';
+  var q = new URLSearchParams(location.search);
+  var FRAMES = parseInt(q.get('frames') || '12000', 10);
+  var SCRIPT = q.get('script') || 'board';
+  var SEED = parseInt(q.get('seed') || '1', 10) >>> 0;
+  var BOARD = q.has('board') ? parseInt(q.get('board'), 10) : null;
+  var MG = q.has('mg') ? parseInt(q.get('mg'), 10) : null;
+  var out = document.getElementById('out');
+  var DET = q.get('det') === '1';
+  // det=1: the worker's DETERMINISM MODE (recomp_worker.js) hashes the whole guest every frame
+  // (LOW statics+heap, MEM1, HIGH); rows are [frame, hLow, hMem1, hHigh, guestUs, changed].
+  var R = window.__ovl = { log: [], ovls: [], vi: 0, done: false, error: null, missing: null, rows: [] };
+  function say(t) { out.textContent = t; }
+  if (!window.crossOriginIsolated) { say('waiting for cross-origin isolation (coi reload)'); return; }
+
+  function script() {
+    if (SCRIPT === 'none') return null;
+    var s = {};
+    if (SCRIPT === 'amash') {
+      // Start on the title, then A alone, one press every 24 frames: dismisses every text window and takes
+      // every default (Party Mode, the human count, the board) without depending on WHEN a screen
+      // appears. The frame-keyed chain below was tuned to one build's timing and does not reach
+      // character select on the 2026-10 builds (measured: neither 7040471c nor the all-overlay
+      // build reached it in 20,000 frames), which is where AUTOBOARD/AUTOTEST fire.
+      s[1000] = [0x1000, 0, 0, 0];                              // Start on the title
+      for (var af = 1300; af < FRAMES + 2; af += 24) s[af] = [0x100, 0, 0, 0];
+      // startat=A-B: also a lone START between A presses in frames [A,B] — what a human presses on
+      // a minigame instruction screen (instDll main.c:294 takes exactly PAD_BUTTON_START).
+      var sa = /^(\d+)-(\d+)$/.exec(q.get('startat') || '');
+      if (sa) for (var sf = +sa[1]; sf <= +sa[2]; sf += 24) s[sf + 12] = [0x1000, 0, 0, 0];
+      return s;
+    }
+    var chain = [[1000, [0x1000,0,0,0]], [1300, [0x100,0,0,0]], [1600, [0,8,0,0]],
+                 [1700, [0x100,0,0,0]], [2100, [0x100,0,0,0]], [2500, [0x100,0,0,0]],
+                 [3400, [0x100,0,0,0]], [3800, [0x100,0,0,0]], [4300, [0x100,0,0,0]],
+                 [4400, [0,0,-80,0]], [4450, [0,0,-80,0]], [4500, [0,0,-80,0]],
+                 [4650, [0x100,0,0,0]]];
+    for (var i = 0; i < chain.length; i++) s[chain[i][0]] = chain[i][1];
+    if (SCRIPT === 'mash') {
+      // A-heavy seeded masher after the chain: advances dice, dialogs and result screens.
+      var x = SEED || 1;
+      var rnd = function () { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; return x; };
+      var BTN = [0x100, 0x100, 0x100, 0x200, 0x0, 0x0, 0x800, 0x400, 0x40, 0x20];
+      for (var f = 4700; f < FRAMES + 2; f++) {
+        var r = rnd();
+        if ((r & 7) < 2) s[f] = [BTN[(r >>> 3) % BTN.length], (r >>> 8) & 0xf, ((r >>> 12) & 0xff) - 128, ((r >>> 20) & 0xff) - 128];
+      }
+    }
+    return s;
+  }
+
+  function inflate(url) {
+    return fetch(url).then(function (r) {
+      if (!r.ok) throw new Error(url + ' ' + r.status);
+      return new Response(r.body.pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
+    });
+  }
+  var sfx = ['aa', 'ab', 'ac', 'ad', 'ae', 'af'];
+  say('fetching disc');
+  Promise.all([Promise.all(sfx.map(function (s) { return inflate('/gamecube/roms/MarioParty4.bin.part' + s + '.gz'); })),
+               fetch('/gamecube/recomp/mp4_fst_trimmed.bin').then(function (r) { return r.arrayBuffer(); })])
+  .then(function (pf) {
+    var parts = pf[0], fst = pf[1];
+    var pace = new SharedArrayBuffer(1024), pi = new Int32Array(pace);
+    Atomics.store(pi, 5, 1);                                   // free-run: no wall-clock pacing
+    var w = new Worker('/gamecube/recomp/recomp_worker.js?v=' + Date.now());
+    w.onmessage = function (e) {
+      var d = e.data;
+      if (d.cmd === 'log') {
+        R.log.push(d.txt); if (R.log.length > 4000) R.log.splice(0, 1000);
+        var m = /Start New OVL (\d+)/.exec(d.txt);
+        if (m) R.ovls.push([R.vi, +m[1]]);
+        if (/main stopped|boot failed/.test(d.txt) && !R.error) R.error = d.txt;
+      } else if (d.cmd === 'ovlMissing') { R.missing = d; }
+      else if (d.cmd === 'det') { var rw = new Int32Array(d.rows); for (var k = 0; k < rw.length; k++) R.rows.push(rw[k]); R.vi = rw.length ? rw[rw.length - 6] : R.vi; }
+      else if (d.cmd === 'detDone') { R.done = true; R.vi = d.frame; w.terminate(); say('det done at frame ' + d.frame); }
+      else if (d.cmd === 'frame') {
+        R.vi = d.n;
+        if (!DET && !R.done && d.n >= FRAMES) { R.done = true; w.terminate(); say('reached frame ' + d.n); }
+        else if ((d.n % 300) === 0) say('frame ' + d.n + '  ovl ' + (R.ovls.length ? R.ovls[R.ovls.length - 1][1] : '-'));
+      }
+    };
+    w.onerror = function (e) { R.error = 'worker error: ' + (e.message || e); };
+    w.postMessage({ cmd: 'boot', parts: parts, fst: fst, pace: pace, card: null, cardTime: 700000000,
+                    autoboard: SCRIPT !== 'none' && BOARD === null && MG === null,
+                    autotest: (BOARD !== null || MG !== null) ? { board: BOARD || 0, mg: MG, allcom: q.get('allcom') === '1' } : null,
+                    det: DET ? { until: FRAMES, pageEvery: 1 << 30, hash: true } : undefined,
+                    inputScript: script(), peekAddrs: [], testFullMem: false, audioTest: false, xfShadowAll: true,
+                    glueUrl: q.get('glue') || '/gamecube/recomp/mp4_game.js',
+                    wasmUrl: q.get('wasm') || '/gamecube/recomp/mp4_game.wasm' },
+                  parts.concat([fst]));
+    say('booted, running to frame ' + FRAMES);
+  }).catch(function (e) { R.error = String(e && e.stack || e); say('FAILED: ' + R.error); });
+})();
+</script>
+</body></html>
