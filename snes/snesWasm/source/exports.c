@@ -367,12 +367,46 @@ unsigned int getStateSaveSize(void){
           sizeof(SA1) + sizeof(s7r) + sizeof(rtc_f9);
 }
 
+/* ROLLBACK NETPLAY (snes.html, snes/snes_rollback.js) takes a savestate EVERY
+   emulated frame, so saveState()'s calloc of ~529 KB per call (and the free the
+   page owes for it) is replaced there by saveStateInto(), which serializes into
+   a slot the page allocated once. saveState() is now a thin wrapper over it and
+   produces byte-for-byte the blob it always did. Returns false (writing nothing)
+   when no game runs or `size` is not getStateSaveSize(). */
+#define SNES_NOISE_TAG 0x4e534531u /* "NSE1": ICPU.UNUSED2 holds so.noise_gen */
+static void saveStateWrite(unsigned char *data);
+EMSCRIPTEN_KEEPALIVE
+bool saveStateInto(unsigned char *data, unsigned int size){
+    if(!runGameFlag || !data || size != getStateSaveSize())return false;
+    saveStateWrite(data);
+    return true;
+}
+
 EMSCRIPTEN_KEEPALIVE
 unsigned char *saveState(void){
     if(!runGameFlag)return NULL;
-    int32_t i;
     unsigned char *data = (unsigned char*)calloc(getStateSaveSize(), sizeof(unsigned char));
     if(!data)return NULL;
+    saveStateWrite(data);
+    return data;
+}
+
+/* THE AUDIO RING'S WRITE POSITION. It is page-side plumbing, not guest state,
+   so no savestate carries it: a rollback that re-simulates N frames would push
+   N x 600 samples of a repeat into the ring. The page reads the position before
+   re-simulating and puts it back after, dropping exactly those samples (the
+   genesis core's gpx_audio_wpos / gpx_audio_rewind, same contract). */
+EMSCRIPTEN_KEEPALIVE
+unsigned int audioWpos(void){
+    return outToExternalBufferSamplePos;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void audioRewind(unsigned int pos){
+    outToExternalBufferSamplePos = pos % 4096;
+}
+
+static void saveStateWrite(unsigned char *data){
    uint8_t* buffer = (uint8_t*)data;
 #ifdef LAGFIX
    S9xPackStatus();
@@ -387,6 +421,17 @@ unsigned char *saveState(void){
    buffer += sizeof(unsigned int);
    memcpy(buffer, &CPU, sizeof(CPU));
    buffer += sizeof(CPU);
+#ifndef USE_BLARGG_APU
+   /* The DSP noise generator (so.noise_gen) is guest state that no field of
+      the blob carried: loadState reset it to 1 (S9xResetAPU -> S9xResetSound),
+      and the mixer writes noise samples into SoundData.channels[].sample, which
+      IS in the blob. Rollback (snes/snes_rollback.js) needs a load to be
+      faithful, so it rides in SICPU's two never-read words, tagged so a blob
+      saved before this change (both 0) loads exactly as it always did. The
+      layout and size are unchanged, so every existing savestate still loads. */
+   ICPU.UNUSED2 = (uint32_t) so.noise_gen;
+   ICPU.UNUSED3 = SNES_NOISE_TAG;
+#endif
    memcpy(buffer, &ICPU, sizeof(ICPU));
    buffer += sizeof(ICPU);
    memcpy(buffer, &PPU, sizeof(PPU));
@@ -423,8 +468,6 @@ unsigned char *saveState(void){
    memcpy(buffer, &s7r, sizeof(s7r));
    buffer += sizeof(s7r);
    memcpy(buffer, &rtc_f9, sizeof(rtc_f9));
-
-   return data;
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -441,6 +484,18 @@ bool loadState(const unsigned char* data, unsigned int size){
 #endif
    uint32_t sa1_old_flags = SA1.Flags;
    SSA1 sa1_state;
+   /* A FAITHFUL LOAD (rollback netplay re-simulates from these blobs and must
+      land exactly where a console that never rolled back is): the CPU event
+      schedule and the sound channels are put back EXACTLY as saved after the
+      fix-ups below recompute them. Measured before this, load-then-save was
+      not the identity (545 bytes moved: CPU.WhichEvent/NextEvent, every
+      channel's needs_decode/envxx), and a run that loaded before each frame
+      left a straight run on its first frame. */
+   SCPUState cpu_saved;
+   memcpy(&cpu_saved, buffer, sizeof(cpu_saved));
+#ifndef USE_BLARGG_APU
+   const uint8_t* sound_saved;
+#endif
    S9xReset();
    memcpy(&CPU, buffer, sizeof(CPU));
    buffer += sizeof(CPU);
@@ -472,6 +527,7 @@ bool loadState(const unsigned char* data, unsigned int size){
    memcpy(IAPU.RAM, buffer, 0x10000);
    buffer += 0x10000;
    memcpy(&SoundData, buffer, sizeof(SoundData));
+   sound_saved = buffer;
    buffer += sizeof(SoundData);
 #else
    S9xAPULoadState(buffer);
@@ -508,6 +564,13 @@ bool loadState(const unsigned char* data, unsigned int size){
 #ifndef USE_BLARGG_APU
    S9xAPUUnpackStatus();
    S9xFixSoundAfterSnapshotLoad();
+   /* The fix-up set needs_decode on every channel (re-decoding a BRR block
+      runs its filter on history that already advanced) and rebuilt envxx from
+      envx (dropping its low bits). Its other work — filter taps, echo enable —
+      lands outside SoundData and stays. SoundData itself goes back as saved. */
+   memcpy(&SoundData, sound_saved, sizeof(SoundData));
+   if (ICPU.UNUSED3 == SNES_NOISE_TAG)
+      so.noise_gen = (int32_t) ICPU.UNUSED2;
 #endif
    ICPU.ShiftedPB = ICPU.Registers.PB << 16;
    ICPU.ShiftedDB = ICPU.Registers.DB << 16;
@@ -515,5 +578,9 @@ bool loadState(const unsigned char* data, unsigned int size){
    S9xUnpackStatus();
    S9xFixCycles();
    S9xReschedule();
+   /* S9xReschedule derives the next event from V_Counter; the saved one is
+      what the running machine actually had scheduled. */
+   CPU.WhichEvent = cpu_saved.WhichEvent;
+   CPU.NextEvent  = cpu_saved.NextEvent;
    return true;
 }
