@@ -68,6 +68,7 @@ int InitGfx(void);
 int glide64InitGfx(void);
 void gles2n64_reset(void);
 void gls_reset(void);   /* glide's GL call shadow: src/glide2gl/src/Glitch64/gl_shadow.c */
+void gls_reset_objects(void);
 void vbo_merge_flush(void);   /* triangles glide's draw merging still holds (geometry.c) */
 void neil_shader_warm_step(void);   /* glitch64_combiner.c ASKED AHEAD */
 #endif
@@ -754,6 +755,7 @@ static void context_reset(void)
         printf("context_reset.\n");
         glsm_ctl(GLSM_CTL_STATE_CONTEXT_RESET, NULL);
         gls_reset();   /* a new context: nothing the GL call shadow knew is true of it */
+        gls_reset_objects();   /* ...not even of its objects (gl_shadow.c OBJECT STATE ACROSS FRAMES) */
 
         if (first_init)
         {

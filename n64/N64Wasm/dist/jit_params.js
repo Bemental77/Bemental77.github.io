@@ -39,6 +39,10 @@
       // A core too old to carry it yields 0, and the emitter then refuses to
       // compile any span at all rather than install an unsafe block.
       delaySlot: (H[q + 44] === 0x4E36344B) ? H[q + 45] : 0,
+      // &actual (cached_interp.c's current precomp block), behind ITS OWN magic at index 47
+      // ('N64L'): only a core that stamps it carries index 46. Without it the emitter keeps
+      // calling the core's jump_to_func (mips_emit.js JUMP_TO IN-MODULE).
+      actualPtr: (H[q + 44] === 0x4E36344B && H[q + 47] === 0x4E36344C) ? H[q + 46] : 0,
     };
   };
 })(typeof window !== 'undefined' ? window : self);

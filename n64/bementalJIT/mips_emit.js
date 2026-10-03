@@ -730,8 +730,7 @@
       // either way, so `call $h; return` is the arm, and CHAINING's fall-through is unchanged
       return [].concat(
         C.storePinned(),
-        storeI32(p.jumpToAddr, targetBytes),
-        [OP.i32_const], sleb(p.jumpToFunc), [OP.call_indirect, 0x00, 0x00],
+        jumpToBytes(p, targetBytes),
         storeI32(p.lastAddr, loadI32(p.pcGlobal).concat([OP.i32_load, 0x02], leb(p.addrOff))),
         loadI32(p.nextInt), loadI32(p.count), [OP.i32_le_u],
         [OP.if_, OP.void_],
@@ -742,8 +741,7 @@
     }
     return [].concat(
       C.storePinned(),              // the caller's C.flush() left only pinned registers unwritten
-      storeI32(p.jumpToAddr, targetBytes),
-      [OP.i32_const], sleb(p.jumpToFunc), [OP.call_indirect, 0x00, 0x00],
+      jumpToBytes(p, targetBytes),
       storeI32(p.lastAddr, loadI32(p.pcGlobal).concat([OP.i32_load, 0x02], leb(p.addrOff))),
       loadI32(p.nextInt), loadI32(p.count), [OP.i32_le_u],
       [OP.if_, OP.void_],
@@ -1091,6 +1089,44 @@
         [OP.end],
       [OP.end]
     );
+  }
+
+  // ---- JUMP_TO IN-MODULE (2026-10-03) ----
+  // Every _OUT exit (JAL / J / JR to another page, a register jump) stored the target in
+  // jump_to_address and called the core's jump_to_func through the table — ~15k calls in a
+  // heavy MK64 field, jump_to_func + update_invalid_addr 4.2% of the field in a profile. The
+  // common case is a few loads, so the module does it itself, in one helper (type (i32)->(),
+  // the target): for a KSEG0/KSEG1 target with skip_jump clear it runs update_invalid_addr's
+  // two mirror lines, and when the page is valid sets actual = blocks[page] and
+  // PC = actual->block + ((addr - actual->start) >> 2) — exactly the statements of
+  // jump_to_func (cached_interp.c) on that path, in the same order. Everything else (skip_jump
+  // set, a TLB-mapped target, a page to (re)initialise) calls jump_to_func as before, which
+  // repeats the mirror lines harmlessly (they are idempotent) and does the rest. Needs &actual
+  // (p.actualPtr, a core that stamps 'N64L'); without it the exits call jump_to_func.
+  var JT_FN = -1;            // the helper's function index in the module being compiled, -1 = none
+  function jtHelper(p) {
+    var slow = [].concat(storeI32(p.jumpToAddr, [OP.local_get, 0x00]),
+      [OP.i32_const], sleb(p.jumpToFunc), [OP.call_indirect, 0x00, 0x00], [OP.return_]);
+    var pg = [OP.local_get, 0x00, OP.i32_const, 0x0C, OP.i32_shr_u];
+    var pgX = [OP.local_get, 0x00, OP.i32_const].concat(sleb(0x20000000), [OP.i32_xor, OP.i32_const, 0x0C, OP.i32_shr_u]);
+    return [0x01, 0x01, 0x7F].concat(
+      loadI32(p.skipJump),
+      [OP.local_get, 0x00, OP.i32_const], sleb(0x80000000 | 0), [OP.i32_sub, OP.i32_const], sleb(0x40000000), [OP.i32_ge_u, OP.i32_or],
+      [OP.if_, OP.void_], slow, [OP.end],
+      pg, [OP.i32_load8_u, 0x00], leb(p.invalidCode), [OP.if_, OP.void_], pgX, [OP.i32_const, 0x01, OP.i32_store8, 0x00], leb(p.invalidCode), [OP.end],
+      pgX, [OP.i32_load8_u, 0x00], leb(p.invalidCode), [OP.if_, OP.void_], pg, [OP.i32_const, 0x01, OP.i32_store8, 0x00], leb(p.invalidCode), [OP.end],
+      pg, [OP.i32_load8_u, 0x00], leb(p.invalidCode), [OP.if_, OP.void_], slow, [OP.end],
+      storeI32(p.actualPtr, [].concat(pg, [OP.i32_const, 0x02, OP.i32_shl, OP.i32_load, 0x02], leb(p.blocksBase), [OP.local_tee, 0x01])),
+      storeI32(p.pcGlobal, [].concat(
+        [OP.local_get, 0x01, OP.i32_load, 0x02, 0x00],
+        [OP.local_get, 0x00, OP.local_get, 0x01, OP.i32_load, 0x02, 0x04, OP.i32_sub, OP.i32_const, 0x02, OP.i32_shr_u],
+        [OP.i32_const], sleb(p.stride), [OP.i32_mul, OP.i32_add])),
+      [OP.end]);
+  }
+  // the bytes that do jump_to(target) at an _OUT exit: targetBytes push the i32 target
+  function jumpToBytes(p, targetBytes) {
+    if (JT_FN >= 0) return targetBytes.concat([OP.call], leb(JT_FN));
+    return storeI32(p.jumpToAddr, targetBytes).concat([OP.i32_const], sleb(p.jumpToFunc), [OP.call_indirect, 0x00, 0x00]);
   }
 
   // the helper's body (one i32 param: the address): CHECK_MEMORY past invalid_code[a>>12] == 0
@@ -1998,7 +2034,7 @@
     } });
     window.__jitNoFP = job.flags.noFP; window.__jitNoLabels = job.flags.noLabels; window.__jitPin = job.flags.pin;
     EMIT_ONLY = { out: null, tableBase: job.tableBase | 0, cold: job.flags.cold !== false, chain: job.flags.chain === true,
-                  batch: !!batchCtx, fnBase: batchCtx ? batchCtx.fnBase : 0, part: null };
+                  batch: !!batchCtx, fnBase: batchCtx ? batchCtx.fnBase : 0, jt: !!(batchCtx && batchCtx.jt), part: null };
     TABLE_BASE = job.tableBase | 0;
     var idx = 0;
     // FAST EMIT: compileSpan reads the page and the span's ops straight from the copies where it can
@@ -2033,10 +2069,13 @@
   // (asyncStillHolds): a stale span's functions are simply never installed. The code is byte
   // for byte what the span's own module held, but for function indices.
   function emitBatch(jobs) {
-    var items = [], parts = [], fnBase = 1, p0 = null, t0 = (typeof performance !== 'undefined') ? performance.now() : 0;
+    // JUMP_TO IN-MODULE: the batch's helper sits at function 1 when the core gave &actual
+    var jt = !!(jobs.length && jobs[0].p.actualPtr);
+    var items = [], parts = [], fnBase = jt ? 2 : 1, p0 = null, t0 = (typeof performance !== 'undefined') ? performance.now() : 0;
     for (var bj = 0; bj < jobs.length; bj++) {
       var job = jobs[bj];
-      var r = emitJob(job, { batch: true, fnBase: fnBase });
+      if (!!job.p.actualPtr !== jt) { items.push({ id: job.id, ok: false, err: 'mixed &actual in one batch' }); continue; }
+      var r = emitJob(job, { batch: true, fnBase: fnBase, jt: jt });
       if (!r.ok) { items.push(r); continue; }
       r.k = parts.length;
       parts.push({ fnBase: fnBase, part: r.part });
@@ -2046,7 +2085,7 @@
       items.push(r);
     }
     if (!parts.length) return { batch: true, items: items, bytes: null };
-    var funcs = [chkHelper(p0)], types = [1], k, w;
+    var funcs = jt ? [chkHelper(p0), jtHelper(p0)] : [chkHelper(p0)], types = jt ? [1, 1] : [1], k, w;
     for (k = 0; k < parts.length; k++) for (w = 0; w < parts[k].part.funcs.length; w++) { funcs.push(parts[k].part.funcs[w]); types.push(parts[k].part.types[w]); }
     var exps = [], nExp = 0;
     var name = function (t) { var a = t.split('').map(function (ch) { return ch.charCodeAt(0); }); return leb(a.length).concat(a); };
@@ -2405,8 +2444,11 @@
     var NFN = COLD ? 1 : nSeg;          // the span's own functions: the body (and, without PCL, its wrappers)
     CHAIN = chainOn(); p_chain = p;
     CHK_FN = (EMIT_ONLY && EMIT_ONLY.batch) ? 0 : (census.on ? 1 : 0) + NFN;   // a batch module puts the helper first
-    // cold handlers follow the span's own functions (and, in a module of its own, the helper)
-    COLD_FN0 = (EMIT_ONLY && EMIT_ONLY.batch) ? EMIT_ONLY.fnBase + NFN : CHK_FN + 1;
+    // JUMP_TO IN-MODULE: a batch module that has the helper puts it second (emitBatch decides
+    // for the batch); a module of its own has it after CHK_FN, with cold paths on only
+    JT_FN = (EMIT_ONLY && EMIT_ONLY.batch) ? (EMIT_ONLY.jt ? 1 : -1) : ((COLD && p.actualPtr) ? CHK_FN + 1 : -1);
+    // cold handlers follow the span's own functions (and, in a module of its own, the helpers)
+    COLD_FN0 = (EMIT_ONLY && EMIT_ONLY.batch) ? EMIT_ONLY.fnBase + NFN : CHK_FN + (JT_FN >= 0 ? 2 : 1);
     var seg = 0;
     EXIT = nSeg; TOP = nSeg - 1;       // segment 0's depths (1 / 0 when nSeg == 1)
     var closedSegs = 0;
@@ -2856,6 +2898,7 @@
     }
     if (coldList) {
       funcs.push(chkHelper(p)); ftypes.push(1);   // CHK_FN: after the body and its wrappers
+      if (JT_FN >= 0) { funcs.push(jtHelper(p)); ftypes.push(1); }   // JT_FN = CHK_FN + 1
       for (var hb1 = 0; hb1 < coldList.length; hb1++) { funcs.push(coldHandlerFn(coldList[hb1], p.reg)); ftypes.push(coldType(coldList[hb1])); }   // COLD_FN0 = CHK_FN + 1
     }
     var typeSec = TYPE_SEC;

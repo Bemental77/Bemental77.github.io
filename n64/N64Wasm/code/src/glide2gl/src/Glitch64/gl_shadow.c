@@ -14,6 +14,19 @@
 
 static int      gls_on = 1;
 static uint32_t gls_ep = 1;
+/* OBJECT STATE ACROSS FRAMES (2026-10-03): texture parameters and uniform values belong to
+ * the texture / program object, not to the context's bindings, and nothing outside this
+ * file ever changes them for glide's objects: glsm's per-frame bind/unbind sets bindings,
+ * capabilities, blend and depth (forgotten at every frame, gls_reset) but never a texture
+ * parameter or a uniform; every glTexParameteri / glUniform* glide (Glitch64) and the
+ * frontend (mymain.cpp) make comes through here (they include gl_shadow.h, and use only
+ * the shadowed variants); the page's and the worker's JS make neither call. So the
+ * (texture, pname) and (program, location) caches carry their own epoch, gls_oep, which a
+ * frame does NOT renew: only a new context, the kill switch, or a table past half full
+ * does (gls_reset_objects). A relink or delete forgets that object's entries, as before.
+ * In the MK64 race the per-frame renewal re-sent ~280 texture parameters and ~1300 uniforms
+ * a 30 fps frame whose values had not changed since the frame before. */
+static uint32_t gls_oep = 1;
 static unsigned gls_sent, gls_dropped, gls_resets;
 /* slots claimed in this epoch; past half of a table the epoch is renewed, so
  * chains stay short however many textures/programs come and go in a session */
@@ -49,9 +62,10 @@ static struct { uint32_t ep; GLuint tex; uint8_t p; uint8_t known; GLint v; } gl
 static struct { uint32_t ep; GLuint prog; GLint loc; uint8_t type; uint8_t known; uint32_t w[4]; } gls_uni[GLS_UNI];
 
 void gls_forget_fixed(void);
-void gls_reset(void) { gls_ep++; if (!gls_ep) gls_ep = 1; gls_texp_used = gls_uni_used = 0; gls_resets++; gls_forget_fixed(); }
+void gls_reset(void) { gls_ep++; if (!gls_ep) gls_ep = 1; gls_resets++; gls_forget_fixed(); }
+void gls_reset_objects(void) { gls_oep++; if (!gls_oep) gls_oep = 1; gls_texp_used = gls_uni_used = 0; }
 void gls_sync_active(void);
-void gls_set_enabled(int on) { gls_sync_active(); gls_on = on ? 1 : 0; gls_reset(); }
+void gls_set_enabled(int on) { gls_sync_active(); gls_on = on ? 1 : 0; gls_reset(); gls_reset_objects(); }
 void gls_forget_fixed(void) { gls_fixed_ep++; if (!gls_fixed_ep) gls_fixed_ep = 1; }
 int  gls_enabled(void) { return gls_on; }
 void gls_stats(unsigned *sent, unsigned *dropped) { if (sent) *sent = gls_sent; if (dropped) *dropped = gls_dropped; }
@@ -84,7 +98,7 @@ static int gls_texp_slot(GLuint tex, int p, int *fresh)
    int k;
    for (k = 0; k < GLS_PROBE; k++, i = (i + 1) & (GLS_TEXP - 1))
    {
-      if (gls_texp[i].ep != gls_ep) { *fresh = 1; return (int)i; }
+      if (gls_texp[i].ep != gls_oep) { *fresh = 1; return (int)i; }
       if (gls_texp[i].tex == tex && gls_texp[i].p == p) { *fresh = 0; return (int)i; }
    }
    return -1;
@@ -146,9 +160,9 @@ void gls_TexParameteri(GLenum target, GLenum pname, GLint param)
    GLS_PRE(); glTexParameteri(target, pname, param); gls_sent++;
    if (s >= 0)
    {
-      gls_texp[s].ep = gls_ep; gls_texp[s].tex = tex; gls_texp[s].p = (uint8_t)p;
+      gls_texp[s].ep = gls_oep; gls_texp[s].tex = tex; gls_texp[s].p = (uint8_t)p;
       gls_texp[s].known = 1; gls_texp[s].v = param;
-      if (fresh && ++gls_texp_used > GLS_TEXP / 2) gls_reset();
+      if (fresh && ++gls_texp_used > GLS_TEXP / 2) gls_reset_objects();
    }
 }
 
@@ -185,7 +199,7 @@ static void gls_forget_program(GLuint program)
 {
    int i;
    for (i = 0; i < GLS_UNI; i++)
-      if (gls_uni[i].ep == gls_ep && gls_uni[i].prog == program) gls_uni[i].known = 0;
+      if (gls_uni[i].ep == gls_oep && gls_uni[i].prog == program) gls_uni[i].known = 0;
 }
 
 void gls_LinkProgram(GLuint program)
@@ -213,7 +227,7 @@ static int gls_uni_same(GLint loc, uint8_t type, const uint32_t *w, int n, int *
    i = gls_hash(prog, (uint32_t)loc) & (GLS_UNI - 1);
    for (k = 0; k < GLS_PROBE; k++, i = (i + 1) & (GLS_UNI - 1))
    {
-      if (gls_uni[i].ep != gls_ep) { *slot = (int)i; return 0; }
+      if (gls_uni[i].ep != gls_oep) { *slot = (int)i; return 0; }
       if (gls_uni[i].prog == prog && gls_uni[i].loc == loc)
       {
          *slot = (int)i;
@@ -227,12 +241,12 @@ static void gls_uni_put(int s, GLint loc, uint8_t type, const uint32_t *w, int n
 {
    int fresh;
    if (s < 0) return;
-   fresh = gls_uni[s].ep != gls_ep;
-   gls_uni[s].ep = gls_ep; gls_uni[s].prog = gls_prog.v; gls_uni[s].loc = loc;
+   fresh = gls_uni[s].ep != gls_oep;
+   gls_uni[s].ep = gls_oep; gls_uni[s].prog = gls_prog.v; gls_uni[s].loc = loc;
    gls_uni[s].type = type; gls_uni[s].known = 1;
    memset(gls_uni[s].w, 0, sizeof(gls_uni[s].w));
    memcpy(gls_uni[s].w, w, (size_t)n * 4);
-   if (fresh && ++gls_uni_used > GLS_UNI / 2) gls_reset();
+   if (fresh && ++gls_uni_used > GLS_UNI / 2) gls_reset_objects();
 }
 
 void gls_Uniform1i(GLint loc, GLint v0)

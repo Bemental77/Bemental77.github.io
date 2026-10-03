@@ -2490,7 +2490,7 @@ void recompile_block(const uint32_t *source, struct precomp_block *block, uint32
       void gen_interrupt(void); /* interrupt.h not included in this TU */
       uint32_t jit_entry_i = (func & UINT32_C(0xFFF)) / 4;
       struct precomp_instr* jit_entry = block->block + jit_entry_i;
-      static uint32_t jit_params[46];
+      static uint32_t jit_params[48];
       int jit_idx;
       jit_params[0] = func;                                        /* entry vaddr */
       jit_params[1] = (uint32_t)(uintptr_t)jit_entry;              /* entry precomp_instr* */
@@ -2564,6 +2564,13 @@ void recompile_block(const uint32_t *source, struct precomp_block *block, uint32
        * Count. The emitter needs to see the flag to refuse that entry, so
        * export it. Measured on conker.z64 (n64/docs/jit/TASKS.md). */
       jit_params[45] = (uint32_t)(uintptr_t)&g_dev.r4300.delay_slot;
+      /* &actual (cached_interp.c): jump_to_func sets it to the page's precomp block
+       * before it sets PC, and FIN_BLOCK / NOTCOMPILED read it. With it the emitter can
+       * do jump_to_func's common case itself (mips_emit.js JUMP_TO IN-MODULE) and still
+       * leave the core exactly as the C function would. Index 47 is its own version
+       * magic: a page reading a 46-entry block gets no &actual and keeps the C call. */
+      jit_params[46] = (uint32_t)(uintptr_t)&actual;
+      jit_params[47] = UINT32_C(0x4E36344C);                       /* 'N64L' — &actual is valid */
       jit_idx = EM_ASM_INT({
          return (typeof window !== 'undefined' && window.myApp && window.myApp.jitCompile)
             ? (window.myApp.jitCompile($0) | 0) : 0;

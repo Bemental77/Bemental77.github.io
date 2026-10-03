@@ -24,8 +24,11 @@
  * — runs outside retro_run or touches state this file does not shadow
  * (pack buffer, read framebuffer, pixel store). gls_reset() runs right after
  * glsm's bind at the start of every retro_run (libretronew.c glsm_enter), so
- * nothing learned in one frame is trusted in the next; glsm itself calls GL
- * directly, never through this file.
+ * no BINDING or capability learned in one frame is trusted in the next; glsm
+ * itself calls GL directly, never through this file. Texture parameters and
+ * uniform values are object state none of those touch, so they are kept
+ * across frames (gl_shadow.c OBJECT STATE ACROSS FRAMES; gls_reset_objects()
+ * forgets them: a new context, the kill switch).
  *
  * Kill switch: gls_set_enabled(0) (_neil_set_gl_shadow(0) / page ?glshadow=0)
  * sends every call, as before.
@@ -40,6 +43,7 @@ extern "C" {
 #endif
 
 void gls_reset(void);
+void gls_reset_objects(void);   /* texture parameters + uniforms: see gl_shadow.c */
 void gls_set_enabled(int on);
 int  gls_enabled(void);
 void gls_stats(unsigned *sent, unsigned *dropped);

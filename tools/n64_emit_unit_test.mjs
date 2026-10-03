@@ -38,7 +38,7 @@ const src = fs.readFileSync(SRCFILE, 'utf8');
 // --- synthetic guest layout (byte addresses inside the fake linear memory) ---
 const SRC = 0x10000, ENTRY = 0x20000, STRIDE = 32;
 const REG = 0x40000, HI = 0x40100, LO = 0x40108;
-const PCG = 0x40200, LASTADDR = 0x40204, NEXTINT = 0x40208, SKIPJ = 0x40210, JTA = 0x40214;
+const PCG = 0x40200, LASTADDR = 0x40204, NEXTINT = 0x40208, SKIPJ = 0x40210, JTA = 0x40214, ACTUALA = 0x40218;
 const COUNT = 0x62000 + 9 * 4;                 // &g_cp0_regs[CP0_COUNT_REG]
 const TBL = 0x1000000;                 // 8 dispatch tables, 0x10000 u32 each
 const INVALID = 0x300000, BLOCKS = 0x400000, DRAM = 0x800000;
@@ -205,6 +205,23 @@ function makeWorld(words, opts = {}) {
     fcr31: opts.noFcr31 ? 0 : FCR31A,
     delaySlot: opts.noDelaySlot ? 0 : DELAYSLOT,
   };
+  // JUMP_TO IN-MODULE (mips_emit.js jtHelper): opts.actual = { pages: { page: mirrorInvalid } }
+  // gives the emitter &actual and models each listed page as VALID (invalid_code 0), with a
+  // precomp block whose entry k holds addr = page base + 4k; its KSEG1/KSEG0 mirror page gets
+  // invalid_code `mirrorInvalid`. jump_to_func stays table[1] (the PC += STRIDE stub), so a case
+  // can tell which path ran.
+  if (opts.actual) {
+    p.actualPtr = ACTUALA;
+    HEAPU32[ACTUALA >> 2] = 0xdead0000;
+    let n = 0;
+    for (const [pgs, mir] of Object.entries(opts.actual.pages || {})) {
+      const pg = +pgs, blk = 0x5a0000 + n * 0x8000, st = 0x700000 + n * 16; n++;
+      new Uint8Array(mem.buffer)[INVALID + pg] = 0;
+      new Uint8Array(mem.buffer)[INVALID + ((pg ^ 0x20000) >>> 0)] = mir;
+      HEAPU32[(BLOCKS >> 2) + pg] = st; HEAPU32[st >> 2] = blk; HEAPU32[(st >> 2) + 1] = (pg * 4096) >>> 0; HEAPU32[(st >> 2) + 2] = (pg * 4096 + 4096) >>> 0;
+      for (let k = 0; k < 1024; k++) HEAPU32[(blk + k * STRIDE + 4) >> 2] = (pg * 4096 + k * 4) >>> 0;
+    }
+  }
   // entryOff: the span starts `entryOff` words into the page (words[] is the
   // whole page), the way recompile_block hands over any entry past offset 0
   if (opts.entryOff) {
@@ -237,7 +254,8 @@ function T(name, words, { regs = {}, dram = {}, expectRegs = {}, expectDram = {}
                           fprF32 = {}, fprF64 = {}, fprI32 = {}, fprI64 = {}, fcr31 = 0, expectFcr31 = null,
                           expectFprI32 = {}, expectFprI64 = {}, expectFprF32 = {}, expectFprF64 = {},
                           expectRefused = false, expectPC = null, expectLastAddr = null, expectCount = null,
-                          lastAddr = null, enterAt = 0, skipJump = 0, expectInvalid = {} }) {
+                          lastAddr = null, enterAt = 0, skipJump = 0, expectInvalid = {},
+                          expectActual = null, expectJTA = null }) {
   const bm = loadEmitter(opts.pin, opts.noCold, opts.cold, opts.chain);
   const { mem, table, HEAPU32, REG64, p } = makeWorld(words, opts);
   const DV = new DataView(mem.buffer);
@@ -302,6 +320,14 @@ function T(name, words, { regs = {}, dram = {}, expectRegs = {}, expectDram = {}
   for (const [pg, want] of Object.entries(expectInvalid)) {
     const got = new Uint8Array(mem.buffer)[INVALID + (+pg)];
     if (got !== want) bad.push(`invalid_code[0x${(+pg).toString(16)}]=${got} want ${want}`);
+  }
+  if (expectActual !== null) {
+    const got = '0x' + (HEAPU32[ACTUALA >> 2] >>> 0).toString(16);
+    if (got !== expectActual) bad.push(`actual=${got} want ${expectActual}`);
+  }
+  if (expectJTA !== null) {
+    const got = '0x' + (HEAPU32[JTA >> 2] >>> 0).toString(16);
+    if (got !== expectJTA) bad.push(`jump_to_address=${got} want ${expectJTA}`);
   }
   if (expectPC !== null) {
     const got = HEAPU32[PCG >> 2] >>> 0;
@@ -880,6 +906,30 @@ const tests = [
     [JOUT(0x80200000), I(OPC.ADDIU, 0, 9, 2), I(OPC.ADDIU, 0, 8, 0x11), 0],
     { lastAddr: 0x80100000, skipJump: 0x80100004, opts: { pageLen: 1024 },
       expectRegs: { 8: '0x0', 9: '0x0' }, expectPC: ENTRY + STRIDE, expectLastAddr: '0x80100000', expectCount: '0x0' }),
+  // ---- JUMP_TO IN-MODULE (2026-10-03): the module does jump_to_func's common case ----
+  // A J out of the page into a VALID page: actual = blocks[page], PC = block + (t - start)/4,
+  // last_addr = that entry's addr, and jump_to_func (the stub, which would add one STRIDE)
+  // never runs. RED on an emitter without the helper: it calls the stub (PC = ENTRY + STRIDE).
+  // (cold paths on in every mode: a module of its own carries the helper only with them)
+  T('jump_to in-module: J out into a valid page sets actual and PC like jump_to_func',
+    [JOUT(0x80200040), I(OPC.ADDIU, 0, 9, 2), 0],
+    { opts: { cold: true, actual: { pages: { 0x80200: 0 } }, pageLen: 1024 }, lastAddr: 0x80100000,
+      expectRegs: { 9: '0x2' }, expectActual: '0x700000', expectPC: 0x5a0000 + 16 * STRIDE,
+      expectLastAddr: '0x80200040', expectInvalid: { 0x80200: 0, 0xa0200: 0 } }),
+  T('jump_to in-module: a JR $ra into a valid KSEG1 page',
+    [R(31, 0, 0, 0, 0x08), I(OPC.ADDIU, 0, 9, 3), 0],
+    { regs: { 31: '0xffffffffa0200008' }, opts: { cold: true, actual: { pages: { 0xa0200: 0 } }, pageLen: 1024 }, lastAddr: 0x80100000,
+      expectRegs: { 9: '0x3' }, expectActual: '0x700000', expectPC: 0x5a0000 + 2 * STRIDE, expectLastAddr: '0xa0200008' }),
+  // the mirror line of update_invalid_addr: an invalid KSEG1 twin invalidates the page, and the
+  // page to (re)initialise is jump_to_func's (the stub ran: PC moved one STRIDE from ENTRY)
+  T('jump_to in-module: an invalid mirror page marks the target invalid and calls jump_to_func',
+    [JOUT(0x80200040), 0, 0],
+    { opts: { cold: true, actual: { pages: { 0x80200: 1 } }, pageLen: 1024 }, lastAddr: 0x80100000,
+      expectActual: '0xdead0000', expectJTA: '0x80200040', expectInvalid: { 0x80200: 1, 0xa0200: 1 } }),
+  T('jump_to in-module: a TLB-mapped target is jump_to_func\'s',
+    [R(8, 0, 0, 0, 0x08), 0, 0],
+    { regs: { 8: '0x400040' }, opts: { cold: true, actual: { pages: { 0x80200: 0 } }, pageLen: 1024 }, lastAddr: 0x80100000,
+      expectActual: '0xdead0000', expectJTA: '0x400040' }),
   // ---- CHECK_MEMORY on a CODE page (invalid_code 0, every op compiled) ----
   // The store is done, the probe marks the page invalid, and the block continues.
   T('store into a CODE page: stored, page marked invalid, block continues',
