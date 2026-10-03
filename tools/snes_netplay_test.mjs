@@ -454,6 +454,16 @@ async function openPeer(browser, tag, role) {
       const f1 = window.__snesFrames | 0, t1 = performance.now();
       return ((f1 - f0) / ((t1 - t0) / 1000)) / hz;
     });
+    // ---- 6b. THE ROOM RUNS ROLLBACK: zero added input lag ---------------
+    // snes.html proposes rollback by default (?rb=0 opts out); the host decides
+    // ('lsgo'). Read off the ENGINE, not a page flag: mode, delay 0, and the
+    // page's own ring having actually served rollbacks.
+    const modeOf = (p) => p.page.evaluate(() => { const n = window.__snesNet(); return { mode: n.netMode, delay: n.delay, engDelay: n.engine && n.engine.delay,
+      rb: n.rollback && n.rollback.page ? { rollbacks: n.rollback.page.rollbacks, resim: n.rollback.page.resimFrames, step: n.rollback.page.stepMs, fault: n.rollback.page.fault } : null,
+      hidden: n.hiddenFrames }; });
+    const [ma, mb] = await Promise.all([modeOf(A), modeOf(B)]);
+    ok('the-room-runs-rollback-with-zero-delay', ma.mode === 'rollback' && mb.mode === 'rollback' && ma.delay === 0 && mb.delay === 0 && !!ma.rb && !!mb.rb && !ma.rb.fault && !mb.rb.fault,
+       `host ${JSON.stringify(ma)} guest ${JSON.stringify(mb)}`);
     const [xa, xb] = await Promise.all([rate(A), rate(B)]);
     // ⚠ BOUNDED ON BOTH SIDES. `<= 1.02` alone is satisfied by a WEDGED console
     // reading 0.0000x, and an earlier run of this test duly reported two frozen
