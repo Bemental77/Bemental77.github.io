@@ -1,5 +1,61 @@
 # WebGL2 fallback for devices with NO WebGPU (the Xbox case)
 
+## ★★★ 2026-10-03 (latest) — WebGPU "PRESENT STALLED" on MP4: a REAL bug (unbounded GPU queue), FIXED in `27c1326`
+
+**It was not a stuck promise.** A snapshot-only wrapper on `GPUBuffer.mapAsync` / `GPUQueue.submit`
+(one `onSubmittedWorkDone` per submit) in `dolphin_worker_emcc.js`, plus page-side SAB counters, on HEAD
+`c104601c` (`--enable-unsafe-webgpu`, adapter = SwiftShader): every mapAsync and every submit resolved,
+in submit order; the device thread's event loop never stalled (max gap 500-518 ms on a 500 ms timer).
+
+**What was queued was the bug.** At the readback cap (3 in flight) `ReadbackAndPresent` returned
+BEFORE `SubmitFrame`, so an unpresented frame's draws stayed in the open encoder and the next frame's
+were appended. Presents were capped; GPU work was not. Per-stage timeline, HEAD:
+
+| stage | observed |
+|---|---|
+| JIT boot (t 16-39 s) | 443 ShowImage presents, **5** readbacks issued, 13 submits |
+| submit #1 @16.1 s (5 draws, 53 new pipelines) | done @34.5 s (18.4 s) |
+| submit #5 @17.5 s (4 draws, 1 pipeline) | done @52.6 s |
+| submit #7.. (~400 boot draws in one encoder) | **not done 155 s later** |
+| recomp takeover t≈40 s | 2 frames sent, their acks held behind the readbacks queued behind #7 → acks=0 forever |
+| page | `outstanding`=2 → 4,731 later frames skipped as backpressure; 3 published in 180 s |
+
+**Fix** (`WGPUGfx::ShowImage` is the frame boundary): every frame's work leaves the encoder there.
+With `kMaxReadbacksInFlight` presented frames unfinished on the GPU, a frame whose work is all
+unsubmitted and has no consumer outside the EFB/XFB is DROPPED (encoder released unsubmitted); else
+submitted. A non-XFB EFB copy, or any mid-frame submit (ring wrap, EFB→RAM, texture copy), keeps it.
+A dropped frame's XFB targets are never read back (also through a stitched container copy). Nothing
+waits. Counters: `0x026B3538` dropped, `0x026B353C` kept while behind (also on `[recompLive]`).
+
+Matched arms, hermetic snapshots, `tools/probe_lock.sh`, ROM_IDX=0, 180 s, load 4.6-5.6:
+
+| | HEAD `c104601c` | fix `1a44c650` |
+|---|---|---|
+| published (seqlock) | **3** | **26** (0.19/s), 457 boot frames dropped, 7 kept |
+| guest, 5 s windows after takeover | 0.9990-1.0014x, cum 1.0000x | 0.9998-1.0010x, cum 1.0001x |
+| longest main-thread task | 63 ms (boot) | 112 ms (boot), 0 after |
+| screenshot t=170 s | black | MP4 title, correct |
+
+**What remains on this box is SwiftShader, not a hang:** with the queue bounded, a 278-draw frame with
+7 new pipelines took 72 s and 107-draw title frames take 5-8 s each (~70 ms per uber-shader draw on
+the CPU rasterizer). The WGPU backend only has Dolphin's UBER shaders; the WebGL2 path uses specialised
+shaders and does 8.25 presents/s on the same box. Chrome only hands out a SwiftShader WebGPU adapter
+behind `--enable-unsafe-webgpu`: **`PROBE_VANILLA_WEBGPU=1` on this box gets NO adapter and runs the
+WebGL2 fallback** ("adapter/device UNAVAILABLE"), so it is the no-WebGPU arm here, not a WebGPU one.
+Open (not done, needs an owner decision against the "WebGPU is the product" directive): route a
+software/fallback WebGPU adapter (`adapter.info.isFallbackAdapter`, architecture `swiftshader`) to
+the WebGL2 fallback. Also open: a game that makes non-XFB EFB copies EVERY frame is never dropped, so
+on a GPU slower than the stream its queue can still grow.
+
+No-WebGPU arm (`PROBE_VANILLA_WEBGPU=1`, fix snapshot, 300 s, load 5.2-5.5): 028c3db's gains hold —
+longest task 1,187 ms during boot and none after t≈60 s, guest cum 1.0003x (windows 0.9943-1.0051x),
+8.25 presents/s (render-worker `completed` 249→2228 over t 60-300 s), title on screen.
+
+2-console room, **WebGPU arm** (`gc_netplay_room_test.mjs` default = `--enable-unsafe-webgpu`), fix
+snapshot (served wasm `1a44c650…`, md5 unchanged through the run), 240 s, load 6.1-8.7: **16/16 PASS,
+0 desyncs** (238/238 whole-state fingerprints agreed through frame 14280), mean 0.9941x/0.9942x,
+windows 0.9539-1.0012x (the low windows are the first 60 s, held-for-room 17-30%; 0.999-1.001x after).
+
 ## ★★★ 2026-10-03 (later) — THE 488 s TITLE FRAME: byte-reversed vertex arrays from the recomp's full-image sync. FIXED
 
 **Cause (recomp_worker.js, VIWaitForRetrace frame sync).** After any DVD read (or a dirty-ring
