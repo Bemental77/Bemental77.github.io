@@ -19,6 +19,18 @@
 // Every `every` frames, B fingerprints its CONFIRMED end state (the slot after
 // frame k: psxM + psxH + VRAM) and A fingerprints its live state after the
 // same frame. Any mismatch is a desync.
+//
+// opts.switchEvery = S (frames; 0 = off): B ALTERNATES S frames of rollback
+// with S frames of DELAY LOCKSTEP, the way a capacity-gated room does when it
+// switches to input delay and back (lib/netplay.js _capDecide, opts.rbResume).
+// Rollback -> delay: the last rollback frame before the switch runs on real
+// inputs only, with every correction made (the engine's _rbModeHold). Delay
+// frames run through 'netStep' on the true pads — the undo ring sees none of
+// them — and every opts.remeasureEvery-th one carries `remeasure` (one real
+// undo save timed around it, ps1.html RB_REMEASURE_MS). Delay -> rollback:
+// every input before the first rollback frame R is held (_rbResumeAt), and the
+// ring is RE-ARMED at R ('netRbInit', ps1.html rbFeedOne). B's fingerprints in
+// a delay stretch are live ones, taken exactly like A's.
 const logEl = document.getElementById('log');
 const lines = [];
 function log(s) { lines.push(s); logEl.textContent = lines.slice(-60).join('\n'); if (window.__state) window.__state.progress = s; }
@@ -135,11 +147,35 @@ window.__run = async function (opts) {
   const pendingHash = [];            // confirmed frames to fingerprint on B
   let confirmedTo = WARM - 1;
 
+  const SW = opts.switchEvery | 0, REM = (opts.remeasureEvery | 0) || 10;
+  const phaseOf = (f) => SW > 0 ? (Math.floor((f - WARM) / SW) & 1) : 0;   // 0 rollback, 1 delay
+  let switches = 0, rearms = 0, delayFrames = 0, remeasured = 0, svMs = [];
+  const bHashLive = async (f) => { const bh = await ask(B, 'netLiveHashResult', { cmd: 'netLiveHash' }); checks.push({ frame: f, b: bh.hash, live: true }); };
   for (let f = WARM; f < WARM + N; f++) {
+    if (phaseOf(f) === 1) {
+      // ---- DELAY LOCKSTEP: true pads, no ring, every frame final ----
+      if (phaseOf(f - 1) === 0) switches++;
+      const rm = (delayFrames % REM) === 0;
+      const tb = padBuf(truthImg(f));
+      const rd = await ask(B, 'netFrame', { cmd: 'netStep', frame: f, count: 1, states: tb, remeasure: rm }, [tb]);
+      if (rd.err) return { ok: false, reason: 'B delay step ' + f + ': ' + rd.err, checks };
+      if (typeof rd.sv === 'number' && rd.sv >= 0) { remeasured++; svMs.push(rd.sv); }
+      delayFrames++;
+      known = f; confirmedTo = f; used.clear();
+      if ((f - WARM) % EVERY === EVERY - 1) await bHashLive(f);
+    } else {
+    if (f > WARM && phaseOf(f - 1) === 1) {
+      // ---- BACK TO ROLLBACK: re-arm the ring at f (every input before f held) ----
+      switches++; rearms++;
+      const ri = await ask(B, 'netRbReady', { cmd: 'netRbInit', frame: f, ring: RING, budget: opts.budget || 0 });
+      if (!ri.ok) return { ok: false, reason: 'rearm at ' + f + ': ' + ri.err };
+      known = f - 1; confirmedTo = f - 1;
+    }
     // remote input arrives with random lateness
     const lag = Math.floor(rand() * (MAXLAG + 1));
     const newKnown = Math.max(known, f - 1 - lag);
-    known = newKnown;
+    // the last rollback frame before a switch to delay runs on real inputs only
+    known = (SW > 0 && phaseOf(f + 1) === 1) ? f : newKnown;
     // earliest wrong frame among those run
     let from = -1;
     for (let k = confirmedTo + 1; k < f; k++) {
@@ -174,6 +210,9 @@ window.__run = async function (opts) {
       if (h.hash == null) { missing++; continue; }
       checks.push({ frame: h.frame, b: h.hash });
     }
+    // frame f itself is final before a switch to delay: its end state is B's live state now
+    if (SW > 0 && phaseOf(f + 1) === 1) { confirmedTo = f; if ((f - WARM) % EVERY === EVERY - 1) await bHashLive(f); }
+    }
     // A: straight truth
     const ta = padBuf(truthImg(f));
     await ask(A, 'netFrame', { cmd: 'netStep', frame: f, count: 1, states: ta }, [ta]);
@@ -195,6 +234,8 @@ window.__run = async function (opts) {
     ok: mismatches === 0 && compared > 0 && missing === 0,
     frames: N, warm: WARM, maxLag: MAXLAG, ring: RING,
     compared, mismatches, missing, rollbacks, resimFrames, maxDepth,
+    switchEvery: SW, switches, rearms, delayFrames, remeasured, comparedAcrossRearm: checks.filter(c => c.a !== undefined && !c.live && SW > 0 && Math.floor((c.frame - WARM) / SW) >= 2).length,
+    remeasureSvMs: svMs.length ? { p50: pct(svMs, .5), max: pct(svMs, 1), n: svMs.length } : null,
     snapBytes: bench.bytes, snapSaveMs: { p50: pct(bench.saveMs, .5), p90: pct(bench.saveMs, .9) }, snapLoadMs: { p50: pct(bench.loadMs, .5), p90: pct(bench.loadMs, .9) }, snapRoundTripIdentical: bench.same,
     stepMs: { p50: pct(stepMs, .5), p90: pct(stepMs, .9), p99: pct(stepMs, .99), max: pct(stepMs, 1), n: stepMs.length },
     resimStepMs: { p50: pct(resimStepMs, .5), p90: pct(resimStepMs, .9), p99: pct(resimStepMs, .99), max: pct(resimStepMs, 1), n: resimStepMs.length },

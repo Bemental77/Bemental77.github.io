@@ -84,7 +84,8 @@
 //   --arms a,b,c,d,drelay,e,ct      (default a,b,c,d,drelay; e is the 10-min soak; ct: the
 //                  joiner's emulator WORKER held to --worker-cpu of one core by a
 //                  cgroup cpu quota, default 0.35 — a CPU-throttled peer the CDP
-//                  throttle cannot make, since it never reaches a worker)
+//                  throttle cannot make, since it never reaches a worker);
+//                  --worker-cpu-until S lifts it S s into the measured window
 //   NPDM_MIN_FREE_GB=N  lower the disk gate (default 3; a cell needs N + 1.2 GB)
 //   --seconds N    measured seconds per cell (default 60)
 //   --soak N       seconds for arm e (default 600)
@@ -150,6 +151,9 @@ const SOLO_S = +flag('solo-seconds', '40');
 // time at 50 Hz — unaffordable — while a delay-lockstep frame (the core run
 // only, ~5.5 ms) still fits its 20 ms (~16 ms).
 const WORKER_CPU = +flag('worker-cpu', '0.35');
+// ...and, with --worker-cpu-until S, for the first S seconds of the measured
+// window only: the device recovers, and the room may return to rollback.
+const WORKER_CPU_UNTIL = +flag('worker-cpu-until', '0');
 // Solo results from an EARLIER run (its matrix.json), so a cell can be judged
 // against a solo baseline without re-measuring it every time.
 const BASELINE = {}, BASELINE_PAIR = {}, BASELINE_MOBILE = {}, BASELINE_N = {};
@@ -908,6 +912,17 @@ async function runCell(cid, aid, attempt) {
             try { const { profile } = await t.c.send('Profiler.stop'); fs.writeFileSync(path.join(OUT, `${t.name}.cpuprofile`), JSON.stringify(profile)); } catch (e) {}
           }));
         }
+        // Arm ct with --worker-cpu-until S: the throttled device recovers S s
+        // into the measured window (its quota is lifted) — a page that declares
+        // rbResume must get zero-lag mode back after the gate's calm.
+        if (WORKER_CPU_UNTIL > 0 && !cell.throttleLifted && el >= WORKER_CPU_UNTIL) {
+          cell.throttleLifted = { atS: Math.round(el), who: [] };
+          for (const P of PS) if (P.cg && P.cg.dir) {
+            try { P.cg.statAtLift = workerThrottleStat(P); fs.writeFileSync(path.join(P.cg.dir, 'cpu.cfs_quota_us'), '-1'); cell.throttleLifted.who.push(P.role); }
+            catch (e) { cell.throttleLifted.err = String(e.message || e).slice(0, 120); }
+          }
+          say(`  [${tag}] worker throttle LIFTED at ${Math.round(el)} s on ${cell.throttleLifted.who.join(',') || 'nobody'}`);
+        }
         if (MID_EVAL && !cell.midEval && el >= seconds / 2) {
           cell.midEval = { atS: Math.round(el), js: MID_EVAL, res: await Promise.all(PS.map((P) => P.page.evaluate(MID_EVAL).then((r) => String(r)).catch((e) => 'ERR ' + e.message))) };
         }
@@ -954,7 +969,7 @@ async function runCell(cid, aid, attempt) {
         }, m).catch((e) => ({ collectError: String(e.message || e) }));
         d.errors = P.errors.slice(); d.errorStacks = (P.errorStacks || []).slice(0, 4); d.consoleErrors = P.consoleErrors.slice(0, 20); d.consoleErrorCount = P.consoleErrors.length;
         d.throttled = P.throttled; d.throttleRejected = P.throttleRejected; d.throttleProof = P.throttleProof || null;
-        if (P.cg) d.workerThrottle = { frac: P.cg.frac, err: P.cg.err || null, threads: (P.cg.threads || []).slice(0, 16), stat: workerThrottleStat(P) };
+        if (P.cg) d.workerThrottle = { frac: P.cg.frac, err: P.cg.err || null, threads: (P.cg.threads || []).slice(0, 16), stat: workerThrottleStat(P), statAtLift: P.cg.statAtLift || null };
         d.device = P.device;
         cell.players[P.role] = d;
       }
@@ -1168,6 +1183,18 @@ function analysePlayer(d, peerRole) {
   r.delayChanges = (d.delays || []).map((x) => `${x.from}->${x.to}@f${x.at}`);
   r.delayNow = d.report ? d.report.delay : null;
   r.latFrames = (d.lat || []).map((x) => x.frames);
+  // THE CAPACITY GATE'S MODE OVER TIME (a gated room: rollback <-> delay), as
+  // runs of consecutive seconds, each with the engine rate it delivered — so
+  // "the gate moved the room to delay and back to rollback, at 1.000x in
+  // both" is read off one line, not reconstructed from the per-second rows.
+  r.capModes = [];
+  for (const w of W) {
+    const m = w.cap && w.cap.mode ? w.cap.mode : '-';
+    const last = r.capModes[r.capModes.length - 1];
+    if (last && last.mode === m) { last.s++; last.xs += w.x; } else r.capModes.push({ mode: m, s: 1, xs: w.x });
+  }
+  for (const c of r.capModes) { c.x = +(c.xs / c.s).toFixed(4); delete c.xs; }
+  r.latByMode = { rollback: (d.lat || []).filter((x) => x.rollback).map((x) => x.frames), delay: (d.lat || []).filter((x) => !x.rollback).map((x) => x.frames) };
   r.desync = !!(d.report && d.report.desync) || (d.desyncs || []).length > 0 || (d.report && d.report.state === 'desync');
   r.hashesCompared = d.report ? d.report.hashesCompared : null;
   const a = d.audio || {};
@@ -1322,7 +1349,7 @@ if (flag('rejudge', '')) {
         say(`  => ${cell.void ? 'VOID (load ' + maxLoad + ')' : (v.pass ? 'PASS' : (v.nonRateFailures.length === 0 && (v.boxLimited || v.deviceLimited) ? (v.boxLimited ? 'BOX-LIMITED' : 'DEVICE-LIMITED') : 'FAIL'))} ${v.deviceLimited ? '[device: ' + v.deviceLimited + '] ' : ''}${v.boxLimited ? '[box: ' + v.boxLimited + '] ' : ''}${v.why.join(' · ')}`);
         if (cell.analysis) for (const k of Object.keys(cell.analysis)) {
           const a = cell.analysis[k]; if (!a) continue;
-          say(`     ${k.padEnd(6)} engine ${a.engineX}x (5s ${a.minWin5}..${a.maxWin5}) witness ${a.witnessX} fc ${a.frameCounterX} · stalls ${a.stalls}/${a.stallMs}ms on ${JSON.stringify(a.waitedOn)} · delay ${a.delayNow} [${a.delayChanges.join(' ')}] · lat ${JSON.stringify(a.latFrames)} · audio ${JSON.stringify(a.audio)} · hashes ${a.hashesCompared} · relay ${a.relay} · err ${a.errors}/${a.consoleErrors}`);
+          say(`     ${k.padEnd(6)} engine ${a.engineX}x (5s ${a.minWin5}..${a.maxWin5}) witness ${a.witnessX} fc ${a.frameCounterX} · stalls ${a.stalls}/${a.stallMs}ms on ${JSON.stringify(a.waitedOn)} · delay ${a.delayNow} [${a.delayChanges.join(' ')}] · lat ${JSON.stringify(a.latFrames)} · modes ${(a.capModes || []).map((c) => c.mode + ' ' + c.s + 's@' + c.x + 'x').join(' -> ') || '-'} · audio ${JSON.stringify(a.audio)} · hashes ${a.hashesCompared} · relay ${a.relay} · err ${a.errors}/${a.consoleErrors}`);
           const shots = (cell.shots && cell.shots[k]) || [];
           say(`     ${k.padEnd(6)} canvas ${shots.map((s) => (s.showing ? 'OK' : 'BLANK') + '(' + s.litFrac + '/' + s.colours + ')').join(' ')}`);
         }

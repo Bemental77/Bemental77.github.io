@@ -874,7 +874,7 @@
       case 'setUI': break;
       case 'workerReady': _onWorkerReady(); break;
       case 'render': { var _t0 = performance.now(); if (_perfLastRenderMs) { var _gap = _t0 - _perfLastRenderMs; _perfGapSum += _gap; if (_gap > _perfGapMax) _perfGapMax = _gap; _perfGapCount++; } _perfLastRenderMs = _t0; var v = data.vram; Module.HEAPU8.set(v, vram_ptr); pcsx_worker.postMessage({ cmd: 'return_vram', vram: v }, [v.buffer]); Module._render(data.x, data.y, data.sx, data.sy, data.dx, data.dy, data.rgb24); renderFrames++; var _t1 = performance.now(); var _proc = _t1 - _t0; _perfProcSum += _proc; if (_proc > _perfProcMax) _perfProcMax = _proc; var now = _t1; if (now - lastFpsLog > 1000) { var _gapAvg = _perfGapCount ? (_perfGapSum / _perfGapCount).toFixed(1) : '?'; var _procAvg = renderFrames ? (_perfProcSum / renderFrames).toFixed(2) : '?'; fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now - lastFpsLog)).toFixed(1) + ' | gap avg=' + _gapAvg + 'ms max=' + _perfGapMax.toFixed(0) + 'ms | proc avg=' + _procAvg + 'ms max=' + _perfProcMax.toFixed(1) + 'ms'; renderFrames = 0; lastFpsLog = now; _perfGapSum = 0; _perfGapMax = 0; _perfGapCount = 0; _perfProcSum = 0; _perfProcMax = 0; } break; }
-      case 'renderTick': { var _t0 = performance.now(); if (_perfLastRenderMs) { var _gap = _t0 - _perfLastRenderMs; _perfGapSum += _gap; if (_gap > _perfGapMax) _perfGapMax = _gap; _perfGapCount++; } _perfLastRenderMs = _t0; if (!vramSabI32 || !vramSabBytes) break; var rx,ry,rsx,rsy,rdx,rdy,rrgb,ok=false; for (var attempt=0; attempt<8; attempt++) { var s0 = Atomics.load(vramSabI32, 0); if (s0 & 1) continue; rx=Atomics.load(vramSabI32,1); ry=Atomics.load(vramSabI32,2); rsx=Atomics.load(vramSabI32,3); rsy=Atomics.load(vramSabI32,4); rdx=Atomics.load(vramSabI32,5); rdy=Atomics.load(vramSabI32,6); rrgb=Atomics.load(vramSabI32,7); Module.HEAPU8.set(vramSabBytes, vram_ptr); var s1 = Atomics.load(vramSabI32, 0); if (s1 === s0) { ok = true; break; } } if (!ok) break; Module._render(rx,ry,rsx,rsy,rdx,rdy,rrgb); renderFrames++; var _t1 = performance.now(); var _proc = _t1 - _t0; _perfProcSum += _proc; if (_proc > _perfProcMax) _perfProcMax = _proc; var now2 = _t1; if (now2 - lastFpsLog > 1000) { var _gapAvg2 = _perfGapCount ? (_perfGapSum / _perfGapCount).toFixed(1) : '?'; var _procAvg2 = renderFrames ? (_perfProcSum / renderFrames).toFixed(2) : '?'; fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now2 - lastFpsLog)).toFixed(1) + ' | gap avg=' + _gapAvg2 + 'ms max=' + _perfGapMax.toFixed(0) + 'ms | proc avg=' + _procAvg2 + 'ms max=' + _perfProcMax.toFixed(1) + 'ms [SAB]'; renderFrames = 0; lastFpsLog = now2; _perfGapSum = 0; _perfGapMax = 0; _perfGapCount = 0; _perfProcSum = 0; _perfProcMax = 0; } break; }
+      case 'renderTick': RT_PENDING = true; break;
       case 'return_states': states_arrs.push(data.states); break;
       case 'netFrame': lsOnWorkerFrame(data); break;
       case 'coreRate': {
@@ -1402,6 +1402,10 @@
     // ---- rollback (the worker holds the savestate ring) ------------------
     rbInit: false, rbRing: 0, rollbacks: 0, resimFrames: 0, maxDepth: 0, rbHashes: 0,
     rbMissing: 0, stepMsSum: 0, stepMsCount: 0, stepMsMax: 0, hidden: 0, stepMsEwma: 0,
+    // ---- a capacity-gated room's input-delay stretch (see rbOnDelayFrame) --
+    // rbStale: delay frames ran since the ring was armed, so the next rollback
+    // frame re-arms it; saveMsEwma: the savestate share of a rollback step.
+    rbStale: false, rbRearms: 0, saveMsEwma: 0, delaySteps: 0, remeasureAt: 0, remeasures: 0,
     // ---- the rollback room's timeline (rbTimelineTick) --------------------
     tlOn: false, tlT0: 0, tlF0: 0, tlDropped: 0, tlRepaid: 0, tlAhead: 0, tlDebtTicks: 0, tlMutedHidden: 0,
     // ---- the undo ring's memory budget (rbBudgetBytes) ----------------------
@@ -1529,7 +1533,7 @@
     }
     LS.armed = true; LS.running = false; LS.fault = null;
     LS.workerFrame = 0; LS.fedTo = 0; LS.inFlight = 0; LS.frames = 0; LS.hashes = 0;
-    LS.accum = 0; LS.lastTs = 0; LS.rbInit = false; LS.tlOn = false;
+    LS.accum = 0; LS.lastTs = 0; LS.rbInit = false; LS.rbStale = false; LS.remeasureAt = 0; LS.tlOn = false;
     pageLog('[lockstep] ARMED before the first frame — this core advances only when every seated '
       + 'port has an input for the frame. ports=' + JSON.stringify(ls.roster)
       + ' mine=' + JSON.stringify(ls.localPorts));
@@ -1649,7 +1653,16 @@
     // directly would land them a different number of frames earlier here than
     // there — a desync by construction, and exactly the shortcut the old relay
     // took.
-    pcsx_worker.postMessage({ cmd: 'netStep', frame: r.frame, count: 1, states: states.buffer, hidden: !!(hidden || r.hidden) }, [states.buffer]);
+    // remeasure: every RB_REMEASURE_MS of a delay stretch, one real undo save
+    // is timed around this frame (wasmpsx_worker.js netStep), so the step this
+    // console publishes follows the device and not the period that ended in
+    // the switch to delay (rbOnDelayFrame).
+    var nowF = performance.now(), remeasure = false;
+    if (LS.rbInit && nowF - LS.remeasureAt >= RB_REMEASURE_MS) { remeasure = true; LS.remeasureAt = nowF; }
+    pcsx_worker.postMessage({ cmd: 'netStep', frame: r.frame, count: 1, states: states.buffer, hidden: !!(hidden || r.hidden), remeasure: remeasure }, [states.buffer]);
+    // The worker's undo ring saw none of this frame: a later rollback frame
+    // re-arms it (rbFeedOne).
+    if (LS.rbInit) LS.rbStale = true;
     LS.pend.push(performance.now());
     LS.inFlight++;
     LS.fedTo = r.frame + 1;
@@ -1754,6 +1767,22 @@
       pcsx_worker.postMessage({ cmd: 'netRbInit', frame: r.rollback ? r.rollback.from : r.frame, ring: ring, budget: LS.rbLogBudget });
       LS.rbInit = true; LS.rbRing = ring;
       ls.frameHz = PS1_HW_HZ;     // the room clock's frame period (lib/netplay.js _frameMs)
+    } else if (LS.rbStale) {
+      // ⚠ BACK TO ROLLBACK AFTER INPUT DELAY (the capacity gate, lib/netplay.js
+      // _capDecide, with opts.rbResume). The delay frames ran outside the ring,
+      // so it is re-armed here: the live machine IS the start of this frame —
+      // every frame before it ran, in message order, before this one — and the
+      // engine names no correction reaching back across the switch (every input
+      // before it was held: _rbResumeAt). One full shadow copy, once.
+      if (r.rollback) {
+        LS.fault = 'a correction reached back across the switch to rollback (frame ' + r.rollback.from + ' < ' + r.frame + ')';
+        pageLog('[rollback] ⚠ ' + LS.fault);
+        try { ls.fail(LS.fault); } catch (e) {}
+        return false;
+      }
+      pcsx_worker.postMessage({ cmd: 'netRbInit', frame: r.frame, ring: ring, budget: LS.rbLogBudget });
+      LS.rbStale = false; LS.rbRearms++; LS.rbRing = ring;
+      pageLog('[rollback] zero-lag mode again: savestate ring re-armed at frame ' + r.frame);
     }
     var resim = [], transfer = [];
     if (r.rollback) {
@@ -1803,6 +1832,7 @@
     if (typeof d.bytes === 'number') LS.rbBytes = d.bytes;
     if (typeof d.logBytes === 'number') { LS.rbLogBytes = d.logBytes; if (d.logBytes > LS.rbLogBytesMax) LS.rbLogBytesMax = d.logBytes; }
     if (typeof d.held === 'number') LS.rbHeld = d.held;
+    if (typeof d.sv === 'number' && d.sv >= 0) LS.saveMsEwma = LS.saveMsEwma ? LS.saveMsEwma + (d.sv - LS.saveMsEwma) / 32 : d.sv;
     if (typeof d.ms === 'number') {
       LS.stepMsSum += d.ms; LS.stepMsCount++;
       if (d.ms > LS.stepMsMax) LS.stepMsMax = d.ms;
@@ -1850,7 +1880,28 @@
     LAT.pending = null;
   }
 
+  // A DELAY frame of a capacity-gated room: no savestate is taken, so the
+  // rollback step it stands for is its run plus the save share last measured
+  // in rollback (or, never measured, a third of the run — the ratio rooms on
+  // the rig's box showed: ~2 ms of ~6). Published as ls.selfStepMs, the same
+  // estimate rollback frames keep, so the host can see this console has the
+  // headroom for zero-lag mode again (opts.rbResume).
+  var RB_REMEASURE_MS = 3000;
+  function rbOnDelayFrame(d) {
+    var ls = lsEngine();
+    // A remeasured save (d.sv >= 0) moves the save share fast: it is the
+    // device NOW, and the old value is from before the delay stretch.
+    if (typeof d.sv === 'number' && d.sv >= 0) {
+      LS.remeasures++;
+      LS.saveMsEwma = LS.saveMsEwma ? LS.saveMsEwma + (d.sv - LS.saveMsEwma) / 4 : d.sv;
+    }
+    var per = d.runMs + (LS.saveMsEwma > 0 ? LS.saveMsEwma : d.runMs / 3);
+    LS.delaySteps++;
+    LS.stepMsEwma = LS.stepMsEwma ? LS.stepMsEwma + (per - LS.stepMsEwma) / 32 : per;
+    if (ls) ls.selfStepMs = +LS.stepMsEwma.toFixed(2);
+  }
   function lsOnWorkerFrame(d) {
+    if (d && typeof d.runMs === 'number' && !d.err) rbOnDelayFrame(d);
     if (d && (d.hashes || d.err || typeof d.ms === 'number')) rbOnWorkerFrame(d);
     var t0 = LS.pend.shift();
     if (t0 != null) {
@@ -2007,7 +2058,19 @@
     if (ran > Math.ceil(d / FRAME_MS)) LS.tlRepaid += ran - Math.ceil(d / FRAME_MS);
     if (due > 0) LS.tlDebtTicks++;
   }
-  (function lsRaf(ts) { requestAnimationFrame(lsRaf); lsTick(ts || 0); })(0);
+  // ═══ THE PICTURE IS DRAWN ON THE DISPLAY TICK, ONCE ═══════════════════════
+  // The worker posts 'renderTick' after every frame it presents, and the
+  // picture lives in ONE shared buffer (the newest frame). Drawing it in the
+  // message handler drew it once per message: a main thread that fell behind
+  // (a busy box, a phone) found two or three ticks queued and copied the same
+  // 2 MB of VRAM, converted it and putImageData'd it two or three times — the
+  // very time a rollback room's frame feed (lsTick) needs. Now a tick only
+  // marks the picture new, and the rAF callback draws it once, right after this
+  // tick's frames are fed. Nothing a player sees changes: the compositor only
+  // ever showed the last of them.
+  var RT_PENDING = false;
+  function renderTickNow() { var _t0 = performance.now(); if (_perfLastRenderMs) { var _gap = _t0 - _perfLastRenderMs; _perfGapSum += _gap; if (_gap > _perfGapMax) _perfGapMax = _gap; _perfGapCount++; } _perfLastRenderMs = _t0; if (!vramSabI32 || !vramSabBytes) return; var rx,ry,rsx,rsy,rdx,rdy,rrgb,ok=false; for (var attempt=0; attempt<8; attempt++) { var s0 = Atomics.load(vramSabI32, 0); if (s0 & 1) continue; rx=Atomics.load(vramSabI32,1); ry=Atomics.load(vramSabI32,2); rsx=Atomics.load(vramSabI32,3); rsy=Atomics.load(vramSabI32,4); rdx=Atomics.load(vramSabI32,5); rdy=Atomics.load(vramSabI32,6); rrgb=Atomics.load(vramSabI32,7); Module.HEAPU8.set(vramSabBytes, vram_ptr); var s1 = Atomics.load(vramSabI32, 0); if (s1 === s0) { ok = true; break; } } if (!ok) return; Module._render(rx,ry,rsx,rsy,rdx,rdy,rrgb); renderFrames++; var _t1 = performance.now(); var _proc = _t1 - _t0; _perfProcSum += _proc; if (_proc > _perfProcMax) _perfProcMax = _proc; var now2 = _t1; if (now2 - lastFpsLog > 1000) { var _gapAvg2 = _perfGapCount ? (_perfGapSum / _perfGapCount).toFixed(1) : '?'; var _procAvg2 = renderFrames ? (_perfProcSum / renderFrames).toFixed(2) : '?'; fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now2 - lastFpsLog)).toFixed(1) + ' | gap avg=' + _gapAvg2 + 'ms max=' + _perfGapMax.toFixed(0) + 'ms | proc avg=' + _procAvg2 + 'ms max=' + _perfProcMax.toFixed(1) + 'ms [SAB]'; renderFrames = 0; lastFpsLog = now2; _perfGapSum = 0; _perfGapMax = 0; _perfGapCount = 0; _perfProcSum = 0; _perfProcMax = 0; } }
+  (function lsRaf(ts) { requestAnimationFrame(lsRaf); try { lsTick(ts || 0); } finally { if (RT_PENDING) { RT_PENDING = false; renderTickNow(); } } })(0);
   // The worker's own rollback numbers (ring bytes, step-phase maxima), for the seam.
   setInterval(function () { if (LS.armed && LS.rbInit && pcsx_worker) { try { pcsx_worker.postMessage({ cmd: 'netRbStats' }); } catch (e) {} } }, 2000);
 
@@ -2351,8 +2414,12 @@
       // clock nobody waits on). rollbackOk: this page CAN run rollback even
       // with ?rb=0 (it only declines to propose it); an engine that asks every
       // console before choosing rollback reads it, an older one ignores it.
+      // rbResume: this page re-arms its savestate ring when a capacity-gated
+      // room comes back to rollback after a stretch of input delay (rbFeedOne),
+      // and keeps its step estimate current meanwhile (rbOnDelayFrame) — so a
+      // console that was only briefly too busy gets zero lag back.
       session.startLockstep({ portCount: PS1_PORTS, padBytes: LS_PAD_BYTES, hashEvery: LS.hashEvery,
-                              rollback: NET.rbWant ? RB_WINDOW : 0, rbCatchUp: true, rollbackOk: true,
+                              rollback: NET.rbWant ? RB_WINDOW : 0, rbCatchUp: true, rollbackOk: true, rbResume: true,
                               frameHz: PS1_HW_HZ, selfStepMs: LS.stepMsEwma || 0 });
     } catch (e) {
       pageLog('[lockstep] ⚠ startLockstep failed: ' + ((e && e.message) || e));
@@ -2600,9 +2667,18 @@
                 missingSlot: LS.rbMissing, ring: LS.rbRing,
                 stepMsAvg: LS.stepMsCount ? +(LS.stepMsSum / LS.stepMsCount).toFixed(2) : null, stepMsMax: +LS.stepMsMax.toFixed(2),
                 timeline: { dropped: LS.tlDropped, repaid: LS.tlRepaid, ahead: LS.tlAhead, debtTicks: LS.tlDebtTicks, mutedHidden: LS.tlMutedHidden },
+                rearms: LS.rbRearms, saveMs: +(LS.saveMsEwma || 0).toFixed(2), delaySteps: LS.delaySteps, remeasures: LS.remeasures,
                 budget: { bytes: LS.rbBudget, logBudget: LS.rbLogBudget, logBytes: LS.rbLogBytes, logBytesMax: LS.rbLogBytesMax, held: LS.rbHeld, memStalls: LS.rbMemStalls },
                 worker: window.__ps1RbWorker || null },
       } : null,
+      // THE CAPACITY GATE, readable in EITHER mode (the `rollback` block above
+      // is null while a gated room runs input delay): the switches the engine
+      // made, the step this console publishes, and the page's side of
+      // opts.rbResume — ring re-arms, delay frames estimated, saves re-timed.
+      capGate: ls ? { on: !!ls._capGate, mode: ls.rollback ? 'rollback' : 'delay', selfStepMs: +(+ls.selfStepMs || 0).toFixed(2),
+                      rearms: LS.rbRearms, saveMs: +(LS.saveMsEwma || 0).toFixed(2), delaySteps: LS.delaySteps, remeasures: LS.remeasures,
+                      ringArmed: LS.rbInit, ringStale: LS.rbStale,
+                      switches: (ls.modeHistory || []).map(function (m) { return { frame: m.frame, to: m.to, delay: m.delay, window: m.window, kind: m.kind, mine: m.mine, text: m.text }; }) } : null,
       // Local input lag in frames, per change of this console's own pad.
       lat: { samples: LAT.samples.slice(-50), overlapped: LAT.overlapped },
       core: CORE_RATE,
