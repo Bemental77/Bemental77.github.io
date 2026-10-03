@@ -219,7 +219,11 @@ function startServer() {
            // page's setCacheEnabled scope) always load the freshly-linked build.
            // Otherwise new bridge code silently never runs on the proxy-main pthread.
            '--disk-cache-size=1', '--disable-application-cache', '--disable-back-forward-cache',
-           '--disable-dev-shm-usage'],
+           '--disable-dev-shm-usage',
+           // [extra args 2026-10-01] PROBE_CHROME_EXTRA_ARGS="--a --b=c" appends raw Chrome
+           // switches (e.g. --disable-gpu-watchdog for a SwiftShader rendering run whose
+           // GPU process is otherwise lost ~100 s in on a loaded box).
+           ...(process.env.PROBE_CHROME_EXTRA_ARGS || '').split(/\s+/).filter(Boolean)],
     protocolTimeout: 600000,
     dumpio: !!process.env.PROBE_DUMPIO,  // pipe Chrome stdout/stderr (GPU crash reason)
   });
@@ -579,9 +583,18 @@ function startServer() {
   //      absent on an older binary, in which case ok is 'unknown', never 'true')
   //   2. PROBE_RESTORE_WITNESS=1, below: a page-side CoreTiming/guest-RAM
   //      discontinuity witness that needs no worker cooperation at all.
+  // [segmented arms 2026-10-01] PROBE_LOAD_STATE_REPEAT_MS="t1,t2,..." reloads the SAME
+  // state at each extra time. A state load replaces CoreTiming and guest RAM and clears
+  // every compiled block (JitWasm::ClearCache via DoState), so with the emit-time policy
+  // cells poked just before each reload (PROBE_POKE) one browser session hosts several
+  // scene-matched arms, interleaved, under ONE probe-lock hold — the box this was built
+  // on shares the lock with other agents' campaigns and a cell waited 22+ min for it.
+  // Each reload prints its own `PROBE_LOAD_STATE @<t>ms (repeat k)` line with the ack.
   if (process.env.PROBE_LOAD_STATE) {
-    const loadAt = parseInt(process.env.PROBE_LOAD_STATE_MS || '25000', 10);
-    setTimeout(async () => {
+    const loadTimes = [parseInt(process.env.PROBE_LOAD_STATE_MS || '25000', 10)]
+      .concat((process.env.PROBE_LOAD_STATE_REPEAT_MS || '').split(',').map((x) => parseInt(x, 10))
+        .filter((x) => Number.isFinite(x) && x > 0));
+    loadTimes.forEach((loadAt, k) => setTimeout(async () => {
       try {
         const r = await page.evaluate(async () => {
           if (typeof window.__probeLoadStateFromGz !== 'function') return 'no-hook';
@@ -593,9 +606,9 @@ function startServer() {
           window.__restoreAt = performance.now();
           return 'handed ' + buf.byteLength + ' gz bytes to the worker; worker ack ok=' + ok;
         });
-        console.log('[probe] PROBE_LOAD_STATE @' + loadAt + 'ms -> ' + r);
-      } catch (e) { console.log('[probe] PROBE_LOAD_STATE failed (restore did NOT happen): ' + e.message); }
-    }, loadAt);
+        console.log('[probe] PROBE_LOAD_STATE @' + loadAt + 'ms' + (k ? ' (repeat ' + k + ')' : '') + ' -> ' + r);
+      } catch (e) { console.log('[probe] PROBE_LOAD_STATE' + (k ? ' (repeat ' + k + ')' : '') + ' failed (restore did NOT happen): ' + e.message); }
+    }, loadAt));
   }
 
   // ---- [restore witness] worker-independent proof that DoState really ran ---
@@ -1271,8 +1284,73 @@ function startServer() {
     const _srPer = parseInt(process.env.PROBE_SCENE_RATE, 10) || 5000;
     let _srPrev = null;
     const _srRows = [];
+    // [thread-cpu 2026-10-01] Per-thread CPU accounting from /proc schedstat, so a
+    // window's guest rate can be read PER CPU-SECOND OF THE JIT THREAD as well as per
+    // wall second. Why: this box is shared with sibling agents' browsers that the
+    // probe lock does not serialize (load 10-13 measured during a GC campaign), and a
+    // wall-clock rate then mixes the lever's effect with how much CPU the thread was
+    // GIVEN. schedstat separates the two exactly: run_ns = time on a CPU, wait_ns =
+    // time RUNNABLE but queued behind other processes. Linux-only, read from node
+    // (outside the page), so it cannot perturb the guest. Rows gain `thr` (top-4
+    // renderer threads by run time this window: [tid, comm, runMs, waitMs]),
+    // `rendRunMs` and `gpuRunMs`. Absent /proc => fields absent, nothing else changes.
+    const _bpid = (() => { try { return browser.process().pid; } catch (_e) { return 0; } })();
+    const _thrSnap = () => {
+      if (!_bpid) return null;
+      try {
+        const kids = new Map();
+        for (const d of fs.readdirSync('/proc')) {
+          if (!/^\d+$/.test(d)) continue;
+          try {
+            const st = fs.readFileSync('/proc/' + d + '/stat', 'utf8');
+            const ppid = +st.slice(st.lastIndexOf(')') + 2).split(' ')[1];
+            if (!kids.has(ppid)) kids.set(ppid, []);
+            kids.get(ppid).push(+d);
+          } catch (_e) { /* raced an exit */ }
+        }
+        const desc = []; const q = [_bpid];
+        while (q.length) { const p = q.pop(); for (const c of (kids.get(p) || [])) { desc.push(c); q.push(c); } }
+        const out = { thr: {}, gpu: 0 };
+        for (const pid of desc) {
+          let cmd = '';
+          try { cmd = fs.readFileSync('/proc/' + pid + '/cmdline', 'utf8'); } catch (_e) { continue; }
+          const isRend = cmd.includes('--type=renderer'), isGpu = cmd.includes('--type=gpu-process');
+          if (!isRend && !isGpu) continue;
+          let tids = [];
+          try { tids = fs.readdirSync('/proc/' + pid + '/task'); } catch (_e) { continue; }
+          for (const tid of tids) {
+            try {
+              const ss = fs.readFileSync('/proc/' + pid + '/task/' + tid + '/schedstat', 'utf8').trim().split(/\s+/);
+              const run = +ss[0], wait = +ss[1];
+              if (isGpu) { out.gpu += run; continue; }
+              const comm = fs.readFileSync('/proc/' + pid + '/task/' + tid + '/comm', 'utf8').trim();
+              out.thr[tid] = { run, wait, comm };
+            } catch (_e) { /* thread exited */ }
+          }
+        }
+        return out;
+      } catch (_e) { return null; }
+    };
+    // [vtx-nan 2026-10-01] PROBE_VTX_NAN=1 samples the vertex loader's first output
+    // dword (0x026B3580 = m_vertex_cpu[0], position.x; written per CommitBuffer by
+    // WGPUVertexManager) every 250 ms and counts IEEE-754 NaN patterns per scene-rate
+    // window (rows gain vtxN / vtxNaN). sab-citye-black-world §F12a recorded quiet NaN
+    // there in 6/6 samples of every BLACK-world run and 0/29 in rendering runs, at one
+    // sample per ~20 s; this is the same witness at 80x the density. It needs no
+    // present path, so it works where the canvas cannot (SwiftShader, device lost).
+    let _vtxN = 0, _vtxNaN = 0;
+    if (process.env.PROBE_VTX_NAN === '1') {
+      setInterval(async () => {
+        try {
+          const v = await page.evaluate(() => window.sharedMemory
+            ? (new Uint32Array(window.sharedMemory.buffer)[0x026B3580 >> 2] >>> 0) : null);
+          if (v != null) { _vtxN++; if (((v >>> 23) & 0xff) === 0xff && (v & 0x7fffff) !== 0) _vtxNaN++; }
+        } catch (_e) { /* page closing */ }
+      }, 250);
+    }
     const _srTimer = setInterval(async () => {
       try {
+        const _th = _thrSnap();
         const s = await page.evaluate(() => {
           const o = { t: performance.now() };
           try {
@@ -1425,6 +1503,7 @@ function startServer() {
           return o;
         });
         if (!s) return;
+        s.th = _th;
         if (_srPrev) {
           const dw = (s.t - _srPrev.t) / 1000;
           if (dw > 0) {
@@ -1463,6 +1542,24 @@ function startServer() {
               bpDn: (s.bpN || 0) - (_srPrev.bpN || 0), bpDms: (s.bpMs || 0) - (_srPrev.bpMs || 0),
               rate: s.rate || null };
             row.head = s.head || null;
+            if (process.env.PROBE_VTX_NAN === '1') { row.vtxN = _vtxN; row.vtxNaN = _vtxNaN; _vtxN = 0; _vtxNaN = 0; }
+            // [thread-cpu 2026-10-01] per-window schedstat deltas (see _thrSnap).
+            if (s.th && _srPrev.th) {
+              const ds = [];
+              let rend = 0;
+              for (const tid of Object.keys(s.th.thr)) {
+                const a = s.th.thr[tid];
+                const p = _srPrev.th.thr[tid];
+                const dr = a.run - (p ? p.run : 0), dwt = a.wait - (p ? p.wait : 0);
+                if (dr < 0) continue;
+                rend += dr;
+                ds.push([+tid, a.comm, +(dr / 1e6).toFixed(1), +(dwt / 1e6).toFixed(1)]);
+              }
+              ds.sort((x, y) => y[2] - x[2]);
+              row.thr = ds.slice(0, 4);
+              row.rendRunMs = +(rend / 1e6).toFixed(1);
+              row.gpuRunMs = +((s.th.gpu - (_srPrev.th.gpu || 0)) / 1e6).toFixed(1);
+            }
             // ---- [witness] the guest-rate truth row -------------------------
             // Four witnesses over ONE window. W1/W2/W3 are three different code
             // paths onto CoreTiming's global_timer; W4 is guest-EXECUTED and is
@@ -2144,7 +2241,21 @@ function startServer() {
             leafInline: (A[0x026B3B60 >> 2] >>> 0) + '/' + (A[0x026B3B64 >> 2] >>> 0)
               + '/' + (A[0x026B3B68 >> 2] >>> 0) + '/' + (A[0x026B3B70 >> 2] >>> 0)
               + ' lastIdlePc=' + (A[0x026B3B6C >> 2] >>> 0).toString(16)
-              + ' arm=' + (A[0x026B3B74 >> 2] >>> 0).toString(16),
+              + ' arm=' + (A[0x026B3B74 >> 2] >>> 0).toString(16)
+              // [gpu-synced idle skip 2026-10-01] ppc_emit.h BEM_GPUIDLE_*: policy cell
+              // (0 = compiled-in default, 6d1e0ff0 = forced off), then gated idle
+              // executions that SKIPPED (FIFO drained) / SPUN (GPU behind). A nonzero
+              // skip or spin count is the proof the gated splice is live.
+              + ' gpuIdle=' + (A[0x026B3EC0 >> 2] >>> 0).toString(16) + ':' + (A[0x026B3EC8 >> 2] >>> 0)
+              + '/' + (A[0x026B3ECC >> 2] >>> 0)
+              // [unwrap 2026-10-01] block_cache.cpp census 0x026B3ED0: bit31 policy
+              // evaluated, bit16 raw map non-empty, bit8 chain-loop entry unwrapped,
+              // low byte = imports bound to raw exports. Policy cell 0x026B3930.
+              + ' unwrap=' + (A[0x026B3ED0 >> 2] >>> 0).toString(16)
+              + '(cell ' + (A[0x026B3930 >> 2] >>> 0).toString(16) + ')'
+              // [membrane EM_JS 2026-10-01] chain-dispatch selector 0x026B3ED4
+              // (0 = compiled-in default, ff0e5a5 = forced EM_ASM path).
+              + ' chainSel=' + (A[0x026B3ED4 >> 2] >>> 0).toString(16),
             // [late-efb guard 2026-10-01] late EFB->RAM writes / dropped (guest reused the RAM, or arm 0x026B3E08) /
             // last 16 destinations as guest offsets (host ptr - mem1 base) + bytes.
             lateEfb: (A[0x026B3E00 >> 2] >>> 0) + '/' + (A[0x026B3E04 >> 2] >>> 0) + ' arm='
@@ -2154,7 +2265,10 @@ function startServer() {
                   const b = A[0x02500020 >> 2] >>> 0;
                   return p ? ((p - b) >>> 0).toString(16) + '+' + n.toString(16) : '-';
                 }).join(' ') + '] latSumMs=' + (A[0x026B3E90 >> 2] >>> 0) + ' latMaxMs=' + (A[0x026B3E94 >> 2] >>> 0)
-              + ' peHold=' + (A[0x026B3E98 >> 2] >>> 0) + ' peGiveUp=' + (A[0x026B3E9C >> 2] >>> 0),
+              + ' peHold=' + (A[0x026B3E98 >> 2] >>> 0) + ' peGiveUp=' + (A[0x026B3E9C >> 2] >>> 0)
+              // [late-efb across a state LOAD 2026-10-01] late writes dropped because a state
+              // load replaced the timeline they were issued in (PixelEngine.h BeginStateLoad).
+              + ' preLoadDrop=' + (A[0x026B3ED8 >> 2] >>> 0),
             // [xf-word-loss PM37] producer first-word split: n(1.0) / n(0) / n(other) / lastOther
             // [m00-hunt PM37] runtime lanes at 0x800bb8f4: fbps1 / faps0 / result / hits
             xfi: (A[0x026B37B4 >> 2] >>> 0).toString(16) + '/'
