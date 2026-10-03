@@ -49,6 +49,37 @@
   function leb(n) { var o = []; n >>>= 0; do { var b = n & 0x7f; n >>>= 7; o.push(n ? b | 0x80 : b); } while (n); return o; }
   function sleb(n) { var o = [], more = true; n |= 0; while (more) { var b = n & 0x7f; n >>= 7; if ((n === 0 && !(b & 0x40)) || (n === -1 && (b & 0x40))) more = false; else b |= 0x80; o.push(b); } return o; }
   function section(id, content) { return [id].concat(leb(content.length), content); }
+  // A module's bytes written straight into one Uint8Array: `parts` is a list of byte arrays
+  // (plain arrays or Uint8Arrays) and of { id, chunks } sections whose content is the chunks
+  // in order. The bytes are exactly those of the concat-based assembly it replaces (header,
+  // then each section as [id, leb(len), content]); it only skips building them as JS arrays
+  // first — for a 32-span batch module that was ~200 KB of number arrays concatenated and
+  // copied twice, a quarter of the compile worker's time (FAST EMIT, emitBatch).
+  // (a plain loop: TypedArray.set from a JS array converts element by element, slower here)
+  function packCopy(out, o, c) { for (var j = 0, n = c.length; j < n; j++) out[o + j] = c[j]; return o + n; }
+  // FNV-1a over a Uint32Array's first n words (the recompile key's bucket hash). Out of
+  // compileSpan, which is too large to be optimized, so the loop runs as optimized code.
+  function keyHash(a, n) { var h = 0x811c9dc5 | 0; for (var i = 0; i < n; i++) h = Math.imul(h ^ a[i], 16777619); return h; }
+  function packModule(parts) {
+    var total = 0, i, k, c, n;
+    for (i = 0; i < parts.length; i++) {
+      var pt = parts[i];
+      if (pt.chunks) {
+        for (n = 0, k = 0; k < pt.chunks.length; k++) n += pt.chunks[k].length;
+        pt.len = n; pt.head = [pt.id].concat(leb(n));
+        total += pt.head.length + n;
+      } else total += pt.length;
+    }
+    var out = new Uint8Array(total), o = 0;
+    for (i = 0; i < parts.length; i++) {
+      var q = parts[i];
+      if (q.chunks) {
+        out.set(q.head, o); o += q.head.length;
+        for (k = 0; k < q.chunks.length; k++) { c = q.chunks[k]; o = packCopy(out, o, c); }
+      } else o = packCopy(out, o, q);
+    }
+    return out;
+  }
 
   var OP = {
     block: 0x02, loop: 0x03, if_: 0x04, else_: 0x05, end: 0x0B,
@@ -1970,7 +2001,10 @@
                   batch: !!batchCtx, fnBase: batchCtx ? batchCtx.fnBase : 0, part: null };
     TABLE_BASE = job.tableBase | 0;
     var idx = 0;
-    try { idx = compileSpan(p, { HEAPU32: H }); } catch (e) { return { id: job.id, ok: false, err: String((e && e.message) || e).slice(0, 200) }; }
+    // FAST EMIT: compileSpan reads the page and the span's ops straight from the copies where it can
+    var fast = { words: words, w0: w0, ops: ops, base: base,
+                 seen: function (w, o) { if (w > maxW) maxW = w; if (o > maxO) maxO = o; } };
+    try { idx = compileSpan(p, { HEAPU32: H, fast: fast }); } catch (e) { return { id: job.id, ok: false, err: String((e && e.message) || e).slice(0, 200) }; }
     var out = EMIT_ONLY.out, part = EMIT_ONLY.part;
     EMIT_ONLY = null;
     if (batchCtx) {
@@ -2024,15 +2058,16 @@
     }
     var fdecl = leb(funcs.length);
     for (k = 0; k < types.length; k++) app(fdecl, leb(types[k]));
-    var code = leb(funcs.length);
-    for (k = 0; k < funcs.length; k++) { app(code, leb(funcs[k].length)); app(code, funcs[k]); }
-    var bytes = new Uint8Array([0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00].concat(
+    // FAST EMIT: the code section is the functions' own arrays, written once into the module
+    var code = [leb(funcs.length)];
+    for (k = 0; k < funcs.length; k++) { code.push(leb(funcs[k].length)); code.push(funcs[k]); }
+    var bytes = packModule([[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00],
       TYPE_SEC,
       section(2, [].concat(leb(2), [1, 0x65, 1, 0x74, 0x01, 0x70, 0x00, 0x00], [1, 0x65, 1, 0x6D, 0x02, 0x00, 0x00])),
       section(3, fdecl),
       section(6, [0x01, 0x7F, 0x01, OP.i32_const, 0x00, OP.end]),
-      section(7, leb(nExp).concat(exps)),
-      section(10, code)));
+      { id: 7, chunks: [leb(nExp), exps] },
+      { id: 10, chunks: code }]);
     return { batch: true, items: items, bytes: bytes, spans: parts.length, ms: t0 ? performance.now() - t0 : 0 };
   }
   function installSlot(Module, vkey, fn) {
@@ -2237,9 +2272,21 @@
     keyArr[0] = p.vaddr >>> 0; keyArr[1] = p.entryPtr >>> 0; keyArr[2] = span; keyArr[3] = p.blockStart >>> 0;
     keyArr[4] = p.blockEnd >>> 0; keyArr[5] = p.srcPtr >>> 0;
     var kh = 0x811c9dc5 | 0, kq;
-    for (kq = 0; kq < pageN; kq++) keyArr[6 + kq] = HEAPU32[pageW0 + kq];
-    for (kq = 0; kq < span; kq++) keyArr[6 + pageN + kq] = HEAPU32[(p.entryPtr + kq * p.stride) >> 2];
-    for (kq = 0; kq < keyLen; kq++) kh = Math.imul(kh ^ keyArr[kq], 16777619);
+    // FAST EMIT: in the compile worker HEAPU32 is a Proxy over the copied inputs (emitJob), and
+    // these two loops (the whole page, every span op) went through its trap per word. When the
+    // copies cover both ranges they are read directly — the same words, the same furthest-read
+    // marks (Module.fast.seen) — and otherwise through HEAPU32 as before.
+    var FP = Module.fast, fw = FP ? pageW0 - FP.w0 : -1;
+    if (FP && fw >= 0 && fw + pageN <= FP.words.length && (p.entryPtr >>> 0) === FP.base && span <= FP.ops.length &&
+        (((p.entryPtr >>> 2) - FP.w0) >= FP.words.length || (((p.entryPtr + (span - 1) * p.stride) >>> 2) - FP.w0) < 0)) {
+      for (kq = 0; kq < pageN; kq++) keyArr[6 + kq] = FP.words[fw + kq];
+      for (kq = 0; kq < span; kq++) keyArr[6 + pageN + kq] = FP.ops[kq];
+      FP.seen(pageN ? fw + pageN - 1 : -1, span - 1);
+    } else {
+      for (kq = 0; kq < pageN; kq++) keyArr[6 + kq] = HEAPU32[pageW0 + kq];
+      for (kq = 0; kq < span; kq++) keyArr[6 + pageN + kq] = HEAPU32[(p.entryPtr + kq * p.stride) >> 2];
+    }
+    kh = keyHash(keyArr, keyLen);
     var bucket = EMIT_ONLY ? null : spanCache.get(kh);
     if (bucket) {
       for (var bi = 0; bi < bucket.length; bi++) {
@@ -2279,7 +2326,7 @@
     } else if (draining) budgetLeft--;
 
     for (var li = 0; li < pageN; li++) {
-      var lw = HEAPU32[pageW0 + li];
+      var lw = keyArr[6 + li];             // = HEAPU32[pageW0 + li], read just above (FAST EMIT)
       var la = (pageA0 + li * 4) >>> 0;
       var ld0 = decodeBranch(lw, la, p);
       if (!ld0) continue;
@@ -2829,11 +2876,11 @@
     var exportSec = section(7, exps);
     // in place: `code = code.concat(...)` per function re-copied the body for every label
     // wrapper after it — 34.6 ms of a 292-instruction span's 35 ms emit (92 wrappers)
-    var code = leb(funcs.length);
-    for (wk = 0; wk < funcs.length; wk++) { app(code, leb(funcs[wk].length)); app(code, funcs[wk]); }
-    var codeSec = section(10, code);
-    var bytes = new Uint8Array([0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00]
-      .concat(typeSec, importSec, funcSec, globalSec, exportSec, codeSec));
+    // (FAST EMIT: written straight into the module's bytes, see packModule)
+    var code = [leb(funcs.length)];
+    for (wk = 0; wk < funcs.length; wk++) { code.push(leb(funcs[wk].length)); code.push(funcs[wk]); }
+    var bytes = packModule([[0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00],
+      typeSec, importSec, funcSec, globalSec, exportSec, { id: 10, chunks: code }]);
     if (EMIT_ONLY) { EMIT_ONLY.out = { bytes: bytes, labels: labels, labelOps: labelOps }; return 1; }
     try {
       var mod = new WebAssembly.Module(bytes);

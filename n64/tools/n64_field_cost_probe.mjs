@@ -80,6 +80,9 @@ const LOGMAX = +flag('logmax', '60');
 const TRACEGL = flag('tracegl', '');
 const GLCENSUS = argv.includes('--glcensus');
 const FINISH = argv.includes('--finish');
+// --dumpdt (with --clock): every measured field's cost, in order, lands in res.dtFields as [frame, ms]
+// pairs — so the heavy fields can be named and studied, not only counted
+const DUMPDT = argv.includes('--dumpdt');
 // --evalend FILE: a worker-realm expression (the file's text) evaluated after the measured
 // window; its JSON-able value lands in res.evalEnd (an inspection seam, e.g. JIT state)
 const EVALEND = flag('evalend', '');
@@ -421,6 +424,7 @@ try {
       res.attrRows = at.map((r, i) => [dt[i]].concat(r.map((x) => +x.toFixed(2))));
     }
     res.per = o.per;
+    if (DUMPDT) { res.dtFields = []; for (let i = 0; i < o.a.length; i += 2) if (o.a[i] >= FROM && o.a[i] < FRAMES) res.dtFields.push([o.a[i], +o.a[i + 1].toFixed(3)]); }
     const sum = dt.reduce((a, b) => a + b, 0);
     res.fields = dt.length;
     res.ms = { mean: +(sum / dt.length).toFixed(2), p50: q(dt, 0.5), p90: q(dt, 0.9), p99: q(dt, 0.99), max: Math.max(...dt),

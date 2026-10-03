@@ -69,6 +69,7 @@ int glide64InitGfx(void);
 void gles2n64_reset(void);
 void gls_reset(void);   /* glide's GL call shadow: src/glide2gl/src/Glitch64/gl_shadow.c */
 void vbo_merge_flush(void);   /* triangles glide's draw merging still holds (geometry.c) */
+void neil_shader_warm_step(void);   /* glitch64_combiner.c ASKED AHEAD */
 #endif
 #include "../mupen64plus-core/src/main/lfb_hook.h"   /* glide's lazy framebuffer copy */
 
@@ -1441,6 +1442,11 @@ void retro_run(void)
         case GFX_RICE:
 #if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
             glsm_exit();
+            /* glide's prewarmed programs: their link status and uniform locations are
+             * asked once, a few fields after boot, never in the middle of a display list
+             * (glitch64_combiner.c ASKED AHEAD) */
+            if (gfx_plugin == GFX_GLIDE64)
+               neil_shader_warm_step();
 #endif
             break;
         case GFX_PARALLEL:

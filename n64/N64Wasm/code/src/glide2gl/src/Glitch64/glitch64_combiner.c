@@ -528,9 +528,11 @@ static void shader_find_uniforms(shader_program_key *shader)
  * draw uses exactly the program it would have compiled itself, and every pixel
  * (and every byte a readback puts in RDRAM) is what it was. A boot without the
  * file compiles as before. */
-typedef struct { char *src; uint32_t h; GLuint prog; int used; } warm_prog_t;
+typedef struct { char *src; uint32_t h; GLuint prog; int used; int asked; shader_program_key locs; } warm_prog_t;
 static warm_prog_t *warm_progs;
 static int warm_n, warm_cap, warm_adopted, sess_compiled;
+/* fields left before neil_shader_warm_step asks GL about the prewarmed programs (see ASKED AHEAD) */
+static int warm_ask_in = -1;
 static char **sess_src;
 static uint32_t *sess_h;
 static int *sess_k;            /* programs made from it (two combiner keys can build one text) */
@@ -651,10 +653,45 @@ static void shader_prewarm(void)
       warm_progs[warm_n].h    = src_hash(q);
       warm_progs[warm_n].prog = prog;
       warm_progs[warm_n].used = 0;
+      warm_progs[warm_n].asked = 0;
       if (warm_progs[warm_n].src) warm_n++;
    }
    free(buf);
+   warm_ask_in = warm_n ? 8 : -1;
    printf("[shader] prewarm: %d programs compiled ahead (/n64_shaders.bin)\n", warm_n);
+}
+
+/* ---- ASKED AHEAD (2026-10-03) ----
+ * Adopting a prewarmed program still asked GL two things in the middle of the
+ * display list: its link status, and (emscripten's glGetUniformLocation, on a
+ * program's first lookup) its uniform table. Each is a synchronous round trip
+ * that waits for the GPU process to work through everything queued before it.
+ * Measured in the MK64 race (n64_field_cost_probe --clock, frame 2555, the
+ * first use of a prewarmed program): 29.7 ms of the field's 38.4 ms was two
+ * getProgramParameter calls — the heaviest field of the race, in every run.
+ * So the same questions are asked once, a few fields after boot (all programs
+ * in one field, so the queue drains once), and the answers kept: adoption then
+ * asks GL nothing. The answers are the ones adoption would have got — a
+ * program's link status and uniform locations never change after its link —
+ * and adoption still logs a failed link (here), uses the program as before,
+ * and binds it exactly as before, so every draw and pixel is unchanged. */
+void neil_shader_warm_step(void)
+{
+   int i;
+   if (warm_ask_in < 0 || --warm_ask_in > 0)
+      return;
+   warm_ask_in = -1;
+   for (i = 0; i < warm_n; i++)
+   {
+      warm_prog_t *w = &warm_progs[i];
+      if (w->used || w->asked)
+         continue;
+      memset(&w->locs, 0, sizeof(w->locs));
+      w->locs.program_object = w->prog;
+      check_link(w->prog);
+      shader_find_uniforms(&w->locs);
+      w->asked = 1;
+   }
 }
 
 /* the program glide is about to compile from fragment_shader, if it was prewarmed */
@@ -671,9 +708,31 @@ static int warm_adopt(shader_program_key *shader)
          continue;
       warm_progs[i].used = 1;
       shader->program_object = warm_progs[i].prog;
-      check_link(shader->program_object);
-      glUseProgram(shader->program_object);
-      shader_find_uniforms(shader);
+      if (warm_progs[i].asked)
+      {
+         /* ASKED AHEAD: the link status was checked and the locations found already */
+         const shader_program_key *L = &warm_progs[i].locs;
+         glUseProgram(shader->program_object);
+         shader->vertexOffset_location    = L->vertexOffset_location;
+         shader->textureSizes_location    = L->textureSizes_location;
+         shader->fogModeEndScale_location = L->fogModeEndScale_location;
+         shader->texture0_location        = L->texture0_location;
+         shader->texture1_location        = L->texture1_location;
+         shader->exactSizes_location      = L->exactSizes_location;
+         shader->constant_color_location  = L->constant_color_location;
+         shader->ccolor0_location         = L->ccolor0_location;
+         shader->ccolor1_location         = L->ccolor1_location;
+         shader->chroma_color_location    = L->chroma_color_location;
+         shader->lambda_location          = L->lambda_location;
+         shader->fogColor_location        = L->fogColor_location;
+         shader->alphaRef_location        = L->alphaRef_location;
+      }
+      else
+      {
+         check_link(shader->program_object);
+         glUseProgram(shader->program_object);
+         shader_find_uniforms(shader);
+      }
       append_shader_program(shader);
       warm_adopted++;
       return 1;
