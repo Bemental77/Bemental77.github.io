@@ -365,6 +365,9 @@ int maxAudioBufferQueue = 0;
 int currentMaxAudioBufferQueue = 0;
 char toast_message[250];
 int toastCounter = 0;
+/* the toast's remaining swaps travel with a frame-skip snapshot (lazy_fb.c GLIDE'S RDP): a re-run
+ * swaps again, and would otherwise end a toast early */
+extern "C" int *neil_toast_counter_ptr(void) { return &toastCounter; }
 
 SDL_Window* WindowOpenGL;
 void mainLoop();

@@ -324,9 +324,18 @@ int depth_buffer_fog;
 
 extern bool frame_dupe;
 
+extern uint32_t g_cp0_regs[];   /* r4300/cp0_private.h */
 void glide64ProcessDList(void)
 {
   uint32_t dlist_start, dlist_length, a;
+
+  /* GLIDE'S NOISE FOLLOWS THE GUEST, NOT THE HOST (frame skip, core_worker.js). Glide draws its
+   * noise texture (TexCache.c) and a combiner colour (Combine.c) from rand(), whose state was the
+   * host's: a field re-run after a frame-skip read-back, or after a rollback, drew different noise
+   * from a run that never re-ran, although the guest did exactly the same. Seeded here from the
+   * guest's CP0 Count (index 9, CP0_COUNT_REG) at the start of every display list, the noise of a
+   * list is a function of the machine state alone. The guest never sees it. */
+  srand(g_cp0_regs[9] ^ 0x9E3779B9u);
 
   no_dlist            = false;
   update_screen_count = 0;

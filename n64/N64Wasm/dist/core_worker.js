@@ -187,7 +187,7 @@ function applyPads() {
 }
 function runOneFrame() {
   applyPads();
-  M._neil_ls_run_frame();
+  fsField();
   CLK.frame++;
   audioPump();
 }
@@ -247,7 +247,10 @@ function tickBody(src) {
       var t0 = performance.now();
       runOneFrame();
       gqAfterField();
-      cbDidDraw(src);
+      // a field that drew nothing (skipped, or a game that draws every second field) left no
+      // picture to push, so the next field need not yield to its commit (frame skip on only:
+      // the A/B arms keep the old rule)
+      if (!FSK.on || FSK.lastDrew) cbDidDraw(src); else { CB.yielded = false; CB.waiting = false; }
       pbPresent();
       CLK.presents++; CLK.busyMs += performance.now() - t0;
       // A field the rAF-coupled loop would not have produced: the analog of the
@@ -318,6 +321,11 @@ function schedule() {
 // than capMs (the age is this thread's own clock). ?gpuqms=N sets the bound (a larger N trades
 // shown pictures for guest speed on a GPU that cannot do both); ?gpuq=N is the old fixed depth
 // (the A/B arm); ?gpuq=0 no guard (control arm).
+// SUPERSEDED AS THE SOLO DEFAULT (2026-10-04) by THE RENDER-LEVEL FRAME SKIP below: a quarter of a
+// second of queued pictures is a quarter of a second of input lag. Solo, the guard is now only the
+// backstop of the frame skip (a field that cannot skip is held at more than GQ.max = 2 pictures on
+// the GPU); ?gpuq / ?gpuqms without ?fskip measure the guards above alone. Rooms keep the guard as
+// it was (a room's frames go through room_core.js, which has rollback's own snapshots).
 var GQ = { on: true, max: 2, capMs: 250, fences: [], times: [], held: 0, heldMs: 0, holdFrom: 0, forced: 0, gl: null, timer: false, lastAge: 0 };
 function gqGl() {
   if (GQ.gl) return GQ.gl;
@@ -326,7 +334,7 @@ function gqGl() {
   return GQ.gl;
 }
 function gqAfterField() {
-  if (!GQ.on) return;
+  if (!GQ.on || (FSK.on && !RM.on)) return;   // frame skip on (solo): the guard counts FS's own fences (pictures)
   var gl = gqGl(); if (!gl) return;
   var f = null;
   try { f = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0); } catch (e) { f = null; }
@@ -342,6 +350,16 @@ function gqWithin(now) {
 // may a field start now? false = hold it (the caller retries from a later task)
 function gqReady() {
   var now = performance.now();
+  if (GQ.on && FSK.on && !RM.on) {
+    // FRAME SKIP ON: a field that cannot skip (THE RENDER-LEVEL FRAME SKIP — its snapshots all
+    // in use, or skipping suspended after a re-run) is held while more than GQ.max pictures are
+    // on the GPU: the old depth guard, the backstop that keeps the picture's lag small.
+    fsPoll(now);
+    if (FSK.fq.length <= GQ.max || fsCanSkip()) { if (GQ.holdFrom) { GQ.heldMs += now - GQ.holdFrom; GQ.holdFrom = 0; } return true; }
+    if (!GQ.holdFrom) { GQ.holdFrom = now; GQ.held++; }
+    if (now - GQ.holdFrom > 250) { GQ.forced++; GQ.heldMs += now - GQ.holdFrom; GQ.holdFrom = 0; return true; }
+    return false;
+  }
   // within the bound nothing is asked of GL: fences are retired only when the answer matters
   if (!GQ.on || gqWithin(now)) {
     if (GQ.holdFrom) { GQ.heldMs += now - GQ.holdFrom; GQ.holdFrom = 0; }
@@ -358,6 +376,299 @@ function gqReady() {
   if (now - GQ.holdFrom > 250) { GQ.forced++; GQ.heldMs += now - GQ.holdFrom; GQ.holdFrom = 0; return true; }
   return false;
 }
+
+// ---- THE RENDER-LEVEL FRAME SKIP: THE SCREEN SHOWS THE NEWEST FIELD, THE GUEST RUNS AT 1.000x --
+// The GPU QUEUE GUARD above trades one of two things for the other when the GPU cannot keep up:
+// hold the guest (depth 2: 0.66-0.72x and ~100 underruns in 30 s here) or let pictures queue
+// (250 ms: 0.99x, but a picture reached the screen up to a quarter of a second after the input
+// that made it — input lag). Real emulators do neither: they SKIP RENDERING the fields the GPU has
+// no time for. So does this, by default (?fskip=0 turns it off, ?fskip=N allows N pictures on the
+// GPU before skipping, default 1):
+//   * After every field that drew into the window a fence is set (FSK.fq). A field STARTS normally
+//     — its CPU work, its audio, its pad input are never delayed — but when FSK.depth pictures are
+//     still unfinished on the GPU, it runs with its draw and clear calls INTO THE WINDOW swallowed
+//     (every other GL call still runs: textures, buffers, programs, draws into framebuffer objects,
+//     so glide's GL objects are exactly what they would have been). The window keeps the last
+//     picture; the next field the GPU has room for draws the newest one. Only fields that were
+//     expected to draw are skipped (a field that drew two fields ago: Mario Kart draws every
+//     second field), so a field with no picture never pays the snapshot below.
+//   * THE GUEST IS BIT-IDENTICAL, skipping or not. A draw changes nothing the CPU can see EXCEPT
+//     through a read-back of the window, so every read-back is watched: glide's lazy framebuffer
+//     copy (Glide64/lazy_fb.c FRAME SKIP) marks a capture taken in a skipped field BLANK and counts
+//     a taint the moment one is materialised into RDRAM; any other read of the window (a
+//     glReadPixels the page did not issue) while the window holds a skipped field counts one too.
+//     Before a skipped field the machine is saved (the raw in-heap savestate rollback uses,
+//     neil_state_save_raw_fast, with fbasync's pending copy and the lazy queue: fbasync.js
+//     st.snapshot); on a taint, after the field that read, the oldest snapshot still needed is
+//     restored and every field since is run again with the pads it ran with, drawing — so the
+//     bytes the guest observed are those of a run that never skipped (its audio is the re-run's;
+//     the copies already sent are not sent again). Snapshots are released as soon as nothing can
+//     reach their field's pixels (neil_fs_oldest: no blank capture live, the window redrawn). A
+//     re-run suspends skipping for a while (doubling), so a title that reads its frames back every
+//     list (glide's frame-buffer-emulation titles) stops skipping instead of re-running.
+//   * When a field cannot skip (all FSK.maxSnaps snapshots held, skipping suspended), the guard
+//     holds it at more than GQ.max (2) pictures on the GPU: the depth guard is the backstop, so the
+//     picture's lag stays small in every case.
+// THE LATENCY WITNESS (always on; fsReport, the stats' `fs`): every field that drew carries the
+// time its pad input was applied (tIn), the time it ended, the time its fence read signalled (polled
+// every 4 ms while one is outstanding, and at every task and animation frame) and the animation
+// frame that committed it. present = max(commit frame, fence signalled); a picture overwritten
+// before any frame committed it was never on screen and is counted apart. lat = present - tIn
+// (this field's input to its picture), age = present - tIn of the first field since the previous
+// picture (the oldest input the picture is the first to show: a skipped field's input waits for
+// the next picture), gpu = signalled - tIn.
+var FSK = { on: true, depth: 1, maxSnaps: 6, snapEvery: 8, force: 0, skipping: false, serial: 0, lastDrew: false, drewNow: false, swNow: 0,
+           hist: 0, stale: false, fq: [], pend: [], snaps: [], pool: [], bufs: 0, size: 0, top: 0, raw: null,
+           pads: null, curPads: new Int32Array(12), setPad: null, taintSeen: 0, jsTaint: 0, ageTIn: 0, pollT: 0,
+           fields: 0, drawn: 0, skipped: 0, skipNoDraw: 0, snapsTaken: 0, snapMs: 0, maxSnapMs: 0, redo: 0, redoFields: 0,
+           redoMs: 0, redoFieldsAll: 0, staleS: 0, repairs: 0, lost: 0, suspendUntil: 0, backoff: 64, held: 0, presented: 0, overwritten: 0, noHeap: 0,
+           lat: new Float32Array(4096), age: new Float32Array(4096), gpu: new Float32Array(4096), latN: 0, why: '' };
+var FS_RESERVE = 64 * 1048576;    // heap kept free above the snapshots (room_core.js N64S_RAW_RESERVE)
+var FS_MAXAGE = 16;               // a snapshot older than this many fields is resolved by a re-run now (?fskipage=N)
+function fsInstall(search) {
+  var q = new URLSearchParams(search || '').get('fskip');
+  if (q === '0') { FSK.on = false; FSK.why = 'off (?fskip=0)'; }
+  else if (q && /^force:\d+$/.test(q)) { FSK.force = Math.max(2, +q.slice(6)); FSK.why = 'rig: skip all but 1 of ' + FSK.force + ' fields'; }
+  else if (q && +q > 0) FSK.depth = Math.min(4, +q | 0);
+  // rig seams: ?fskip=force:K skips all but 1 of K fields whatever the GPU does (exactness rigs);
+  // ?fsrerun=A:B snapshots field A (nothing skipped) and re-runs A..B at B (a re-run alone);
+  // ?fskipage=N moves FS_MAXAGE; ?fskiplog=1 logs every re-run
+  FSK.logRe = new URLSearchParams(search || '').get('fskiplog') === '1';
+  var qx = new URLSearchParams(search || '').get('fsrerun'); if (qx) { FSK.snapAt = +qx.split(':')[0]; FSK.rerunAt = [+qx.split(':')[1]]; FS_MAXAGE = 1e9; }
+  var qa = new URLSearchParams(search || '').get('fskipage'); if (qa && +qa > 0) FS_MAXAGE = +qa;
+  var qs = new URLSearchParams(search || '').get('fskipsnap'); if (qs && +qs >= 1) FSK.snapEvery = +qs | 0;
+  if (!self.WebGL2RenderingContext) { FSK.on = false; FSK.why = 'no WebGL2'; }
+}
+// the window's draw calls (after ?present=bitmap's wrappers, so a swallowed draw is not a picture)
+function fsWrap() {
+  if (!self.WebGL2RenderingContext) return;
+  var P = WebGL2RenderingContext.prototype, FB = P.FRAMEBUFFER, DFB = P.DRAW_FRAMEBUFFER, bf = P.bindFramebuffer;
+  P.bindFramebuffer = function (t, fb) { if (t === FB || t === DFB) this.__fsFb = fb || null; return bf.apply(this, arguments); };
+  ['drawArrays', 'drawElements', 'drawRangeElements', 'drawArraysInstanced', 'drawElementsInstanced',
+   'clear', 'clearBufferfv', 'clearBufferiv', 'clearBufferuiv', 'clearBufferfi', 'blitFramebuffer'].forEach(function (n) {
+    var f = P[n]; if (typeof f !== 'function') return;
+    P[n] = function () {
+      if (this.__fsFb) return f.apply(this, arguments);            // an offscreen target: never skipped
+      if (FSK.skipping) { FSK.swNow++; return; }
+      FSK.drewNow = true;
+      return f.apply(this, arguments);
+    };
+  });
+}
+// after fbasync.js: the outermost readPixels, so it sees every read the core makes
+function fsInstallRead() {
+  if (!self.WebGL2RenderingContext) return;
+  var P = WebGL2RenderingContext.prototype, rp = P.readPixels;
+  P.readPixels = function () {
+    var st = self.__fbAsync;
+    // a read the core makes (not glide's lazy copy, which reads its own capture: lazy_fb.c
+    // counts those; not a rig's picture) while the window holds a skipped field's picture
+    if (!(st && st.bypass) && (FSK.skipping || FSK.stale)) FSK.jsTaint++;
+    return rp.apply(this, arguments);
+  };
+}
+function fsCoreReady() {
+  if (FSK.raw !== null) return FSK.raw;
+  FSK.raw = !!(M && typeof M._neil_fs_set === 'function' && typeof M._neil_fs_taints === 'function' && typeof M._neil_fs_oldest === 'function'
+              && typeof M._neil_state_save_raw_fast === 'function' && typeof M._neil_state_load_raw === 'function' && typeof M._malloc === 'function');
+  if (!FSK.raw) { if (FSK.on) FSK.why = 'this core build has no frame-skip exports'; return false; }
+  FSK.size = M._neil_state_size() >>> 0;
+  // glide's RDP state (lazy_fb.c GLIDE'S RDP) rides at the end of each snapshot buffer
+  FSK.gsize = typeof M._neil_gl_state_size === 'function' ? (M._neil_gl_state_size() + 7) & ~7 : 0;
+  FSK.pads = []; for (var i = 0; i < 64; i++) FSK.pads.push(new Int32Array(12));
+  // the pad image every field ran with, as the core received it (a re-run replays it)
+  var sp = M._neil_ls_set_pad;
+  FSK.setPad = sp;
+  M._neil_ls_set_pad = function (p, a, b, c) { if (p >= 0 && p < 4) { FSK.curPads[p * 3] = a; FSK.curPads[p * 3 + 1] = b; FSK.curPads[p * 3 + 2] = c; } return sp(p, a, b, c); };
+  return true;
+}
+// may the next field skip? (a snapshot it can use is held, or there is room for one)
+function fsSnapFresh(s) { return FSK.snaps.length && s - FSK.snaps[FSK.snaps.length - 1].s < FSK.snapEvery; }
+function fsCanSkip() {
+  return FSK.on && !RM.on && fsCoreReady() && FSK.serial >= FSK.suspendUntil && (fsSnapFresh(FSK.serial + 1) || FSK.snaps.length < FSK.maxSnaps);
+}
+function fsAlloc() {
+  if (FSK.pool.length) return FSK.pool.pop();
+  if (FSK.bufs >= FSK.maxSnaps) return 0;
+  var n = FSK.size + FSK.gsize, p = M._malloc(n);
+  if (!p) { FSK.noHeap++; return 0; }
+  if (M.HEAPU8.length - (p + n) < FS_RESERVE && p + n > FSK.top) { M._free(p); FSK.noHeap++; return 0; }
+  FSK.top = Math.max(FSK.top, p + n); FSK.bufs++;
+  return p;
+}
+function fsSnap(s) {
+  var p = fsAlloc(); if (!p) return false;
+  var t0 = performance.now();
+  if (!(M._neil_state_save_raw_fast(p) | 0)) { FSK.pool.push(p); return false; }
+  if (FSK.gsize) M._neil_gl_state_save(p + FSK.size);
+  var fbs = self.__fbAsync && self.__fbAsync.snapshot ? self.__fbAsync.snapshot() : null;
+  // glide's rand() (lazy_fb.c): a re-run must draw the same noise a run that never re-ran draws
+  FSK.snaps.push({ p: p, fbs: fbs, s: s, rlo: M._neil_rand_lo ? M._neil_rand_lo() >>> 0 : 0, rhi: M._neil_rand_hi ? M._neil_rand_hi() >>> 0 : 0 });
+  var dt = performance.now() - t0;
+  FSK.snapsTaken++; FSK.snapMs += dt; if (dt > FSK.maxSnapMs) FSK.maxSnapMs = dt;
+  return true;
+}
+function fsDrop(i) {
+  var S = FSK.snaps.splice(i, 1)[0];
+  if (S.fbs && self.__fbAsync && self.__fbAsync.release) self.__fbAsync.release(S.fbs);
+  FSK.pool.push(S.p);
+}
+// Snapshots no field still needs: a re-run must start at or before the oldest skipped field whose
+// blank capture can still reach RDRAM, and — while the window holds a skipped field's picture — at
+// or before that field. So the newest snapshot at or before that field is kept, every older one
+// dropped; with nothing reachable, all of them.
+function fsRelease(s) {
+  if (!FSK.snaps.length) return;
+  var old = M._neil_fs_oldest() | 0, keep = Infinity;
+  if (FSK.snapAt) return;
+  if (old >= 0) keep = old;
+  if (FSK.stale) keep = Math.min(keep, FSK.staleS);
+  if (keep === Infinity) { while (FSK.snaps.length) fsDrop(0); return; }
+  while (FSK.snaps.length > 1 && FSK.snaps[1].s <= keep) fsDrop(0);
+  // A blank capture nothing supersedes keeps its snapshot, and a re-run from it grows with every
+  // field: resolved here, while it is still short.
+  if (FSK.snaps.length && s - FSK.snaps[0].s > FS_MAXAGE) { FSK.repairs++; fsRedo(s, false); }
+}
+// Restore the oldest snapshot and run every field since again, drawing. `s` is the field that
+// just ran (its audio is not pumped yet). The guest ends exactly where a run that never skipped
+// would be: the same state, the same RDRAM bytes observed.
+function fsRedo(s, backoff, pumped) {
+  var S = FSK.snaps[0], t0 = performance.now();
+  if (!S) { FSK.lost++; log('[fskip] ⚠ a read-back of a skipped field with no snapshot held — this field is not exact; skipping OFF'); FSK.on = false; return; }
+  var wp = M._neilGetAudioWritePosition ? function () { AUD.read = M._neilGetAudioWritePosition(); } : function () {};
+  wp();                                   // this field's audio: made again below
+  if (!(M._neil_state_load_raw(S.p) | 0)) { FSK.lost++; log('[fskip] ⚠ snapshot restore refused — skipping OFF'); FSK.on = false; return; }
+  if (S.fbs && self.__fbAsync && self.__fbAsync.restore) self.__fbAsync.restore(S.fbs);
+  if (M._neil_rand_set) M._neil_rand_set(S.rlo, S.rhi);
+  if (FSK.gsize) M._neil_gl_state_load(S.p + FSK.size);
+  FSK.stale = false; FSK.skipping = false; M._neil_fs_set(0, S.s);
+  for (var k = S.s; k <= s; k++) {
+    var pd = FSK.pads[k & 63];
+    for (var q = 0; q < 4; q++) FSK.setPad(q, pd[q * 3], pd[q * 3 + 1], pd[q * 3 + 2]);
+    FSK.drewNow = false;
+    M._neil_ls_run_frame();
+    if (k < s || pumped) wp();            // sent the first time already
+  }
+  FSK.taintSeen = M._neil_fs_taints() >>> 0; FSK.jsTaint = 0;
+  while (FSK.snaps.length) fsDrop(0);
+  FSK.redo++; FSK.redoFields += s - S.s; FSK.redoFieldsAll += s - S.s; FSK.redoMs += performance.now() - t0;
+  if (FSK.logRe) log('[fskip] re-run fields ' + S.s + '..' + s + (backoff ? ' (read-back)' : ' (snapshot age)'));
+  if (backoff) {
+    FSK.suspendUntil = s + FSK.backoff; FSK.backoff = Math.min(FSK.backoff * 2, 1 << 24);
+    log('[fskip] a read-back reached a skipped field: re-ran ' + (s - S.s + 1) + ' fields drawing (' + (performance.now() - t0).toFixed(1) + ' ms); skipping resumes in ' + (FSK.suspendUntil - s) + ' fields');
+  }
+}
+// Between fields, before anything that writes or replaces the machine as a whole (a savestate to
+// file materialises every queued copy; a reset or a load makes every snapshot stale): blank
+// captures are made real by a re-run first, and no snapshot outlives the machine it was taken of.
+function fsResolve() {
+  if (FSK.snaps.length && M && (M._neil_fs_oldest() | 0) >= 0) { FSK.repairs++; fsRedo(FSK.serial, false, true); }
+  fsDropAll();
+}
+function fsDropAll() { while (FSK.snaps.length) fsDrop(0); FSK.stale = false; }
+// ONE FIELD. Replaces a bare _neil_ls_run_frame for the solo clock (runOneFrame) and the rigs.
+function fsField() {
+  var s = ++FSK.serial, ready = fsCoreReady(), now = performance.now();
+  FSK.fields++;
+  if (ready) FSK.pads[s & 63].set(FSK.curPads);
+  fsPoll(now);
+  var skip = false;
+  if (FSK.force) skip = (s % FSK.force) !== 0 && fsCanSkip();
+  else if (FSK.on && FSK.fq.length >= FSK.depth) { FSK.held++; skip = (FSK.hist & 2) !== 0 && fsCanSkip(); }
+  // A snapshot is needed only for the first skipped field after the newest one: a re-run from an
+  // older snapshot re-runs a later skipped field too (every field's pads are kept). So one is taken
+  // at most every FSK.snapEvery fields — a fast save copies ~9 MB, 3-5 ms here (?fskipsnap=N).
+  if (skip && !fsSnapFresh(s) && !fsSnap(s)) skip = false;
+  if (FSK.snapAt === s) fsSnap(s);     // rig: a snapshot with no skip (?fsrerun=A:B)
+  if (!FSK.ageTIn) FSK.ageTIn = now;
+  FSK.skipping = skip; FSK.drewNow = false; FSK.swNow = 0;
+  if (ready) M._neil_fs_set(skip ? 1 : 0, s);
+  try { M._neil_ls_run_frame(); }
+  finally { FSK.skipping = false; if (ready) M._neil_fs_set(0, s); }
+  var sw = FSK.swNow;
+  if (skip) { FSK.skipped++; if (sw) { FSK.stale = true; FSK.staleS = s; } else FSK.skipNoDraw++; }
+  else if (FSK.drewNow) FSK.stale = false;
+  if (ready && ((M._neil_fs_taints() >>> 0) !== FSK.taintSeen || FSK.jsTaint)) {
+    FSK.taintSeen = M._neil_fs_taints() >>> 0; FSK.jsTaint = 0;
+    fsRedo(s, true);
+    sw = 0;
+  }
+  if (ready && FSK.rerunAt && FSK.rerunAt.indexOf(s) >= 0 && FSK.snaps.length) { FSK.repairs++; fsRedo(s, false); sw = 0; }
+  if (ready) { var r0 = FSK.redo + FSK.repairs; fsRelease(s); if (FSK.redo + FSK.repairs !== r0) sw = 0; }
+  FSK.hist = ((FSK.hist << 1) | ((FSK.drewNow || sw) ? 1 : 0)) & 0xff;
+  FSK.lastDrew = FSK.drewNow;
+  if (FSK.drewNow) fsFence(now);
+}
+self.__n64RigField = function () { fsField(); };   // the rigs step the guest through the same field
+function fsFence(tIn) {
+  FSK.drawn++;
+  var gl = M && M.ctx, f = null, e = { f: CLK.frame, tIn: tIn, tAge: FSK.ageTIn || tIn, tEnd: performance.now(), tGpu: 0, tCommit: 0, sy: null };
+  FSK.ageTIn = 0;
+  try { f = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0); } catch (x) { f = null; }
+  e.sy = f;
+  if (f) FSK.fq.push(e); else e.tGpu = e.tEnd;
+  FSK.pend.push(e);
+  if (FSK.pend.length > 64) FSK.pend.shift();
+  if (FSK.fq.length > 64) { var o = FSK.fq.shift(); try { gl.deleteSync(o.sy); } catch (x) {} o.tGpu = o.tGpu || performance.now(); }
+  if (!FSK.pollT && FSK.fq.length) FSK.pollT = setInterval(function () { fsPoll(performance.now()); fsFinish(); }, 4);
+}
+// fences read signalled since the last look (a sync object changes state only between tasks)
+function fsPoll(now) {
+  var gl = M && M.ctx;
+  while (FSK.fq.length) {
+    var e = FSK.fq[0], st;
+    try { st = gl.getSyncParameter(e.sy, gl.SYNC_STATUS); } catch (x) { st = gl.SIGNALED; }
+    if (st !== gl.SIGNALED) break;
+    try { gl.deleteSync(e.sy); } catch (x) {}
+    e.sy = null; e.tGpu = now; FSK.fq.shift();
+  }
+  if (!FSK.fq.length && FSK.pollT) { clearInterval(FSK.pollT); FSK.pollT = 0; }
+}
+// on this thread's animation frame: the newest picture drawn before it is committed now
+function fsCommit(now) {
+  fsPoll(now);
+  var newest = -1;
+  for (var i = 0; i < FSK.pend.length; i++) if (!FSK.pend[i].tCommit && FSK.pend[i].tEnd <= now) newest = i;
+  if (newest < 0) return false;
+  for (var j = 0; j < newest; j++) if (!FSK.pend[j].tCommit) { FSK.pend[j].tCommit = -1; FSK.overwritten++; }
+  FSK.pend[newest].tCommit = now;
+  fsFinish();
+  return true;
+}
+function fsFinish() {
+  while (FSK.pend.length) {
+    var e = FSK.pend[0];
+    if (e.tCommit < 0) { FSK.pend.shift(); continue; }
+    if (!e.tCommit || !e.tGpu) break;
+    var pres = Math.max(e.tCommit, e.tGpu), k = FSK.latN++ & 4095;
+    FSK.lat[k] = pres - e.tIn; FSK.age[k] = pres - e.tAge; FSK.gpu[k] = e.tGpu - e.tIn;
+    if (FSK.series) FSK.series.push(Math.round(e.tIn), Math.round(pres - e.tIn), e.f);
+    FSK.presented++;
+    FSK.pend.shift();
+  }
+}
+function fsDist(a) {
+  var n = Math.min(FSK.latN, 4096); if (!n) return null;
+  var b = new Float32Array(n), sum = 0;
+  for (var i = 0; i < n; i++) { b[i] = a[(FSK.latN - 1 - i) & 4095]; sum += b[i]; }
+  b.sort();
+  return { n: n, mean: +(sum / n).toFixed(1), p50: +b[n >> 1].toFixed(1), p90: +b[Math.floor(n * 0.9)].toFixed(1),
+           p99: +b[Math.min(n - 1, Math.floor(n * 0.99))].toFixed(1), max: +b[n - 1].toFixed(1) };
+}
+function fsReport() {
+  return { on: FSK.on, why: FSK.why, depth: FSK.depth, force: FSK.force, fields: FSK.fields, drawn: FSK.drawn, skipped: FSK.skipped,
+           skipNoDraw: FSK.skipNoDraw, held: FSK.held, snaps: FSK.snapsTaken, snapMs: FSK.snapsTaken ? +(FSK.snapMs / FSK.snapsTaken).toFixed(2) : 0,
+           maxSnapMs: +FSK.maxSnapMs.toFixed(1), redo: FSK.redo, redoFields: FSK.redoFields, redoMs: Math.round(FSK.redoMs), repairs: FSK.repairs,
+           lost: FSK.lost, noHeap: FSK.noHeap, presented: FSK.presented, overwritten: FSK.overwritten, onGpu: FSK.fq.length, snapsHeld: FSK.snaps.length,
+           lat: fsDist(FSK.lat), age: fsDist(FSK.age), gpu: fsDist(FSK.gpu) };
+}
+// a measurement window: counters and the latency rings from now
+function fsReset() {
+  ['fields', 'drawn', 'skipped', 'skipNoDraw', 'held', 'snapsTaken', 'snapMs', 'maxSnapMs', 'redo', 'redoFields', 'redoMs', 'repairs',
+   'presented', 'overwritten', 'latN'].forEach(function (k) { FSK[k] = 0; });
+}
+// the field counter the meters read: a re-run's extra fields are not guest time
+function viTotal() { return ((M._neil_vi_total() >>> 0) - FSK.redoFieldsAll) >>> 0; }
 
 // ---- PRESENTATION BY BITMAP: EVERY DRAWN FIELD REACHES THE PAGE ------------------------
 // (See THE COMMIT YIELD below for what the canvas-commit path loses and why.) An ARM (?present=bitmap): with
@@ -470,8 +781,11 @@ function observePresents() {
     // THE COMMIT YIELD: this frame pushes whatever was drawn before it.
     CB.commitThis = CB.drawn; CB.drawn = false;
     if (!M || !M._neil_vi_total) return;
-    var vi = M._neil_vi_total() >>> 0;
-    if (PRES.lastVi >= 0 && vi !== PRES.lastVi) PRES.shown++;
+    var pic = fsCommit(performance.now());
+    var vi = viTotal();
+    // frame skip on: a frame shows something new only if a field DREW since the last one (a
+    // skipped field moves the field counter and leaves the picture as it was)
+    if (FSK.on ? pic : (PRES.lastVi >= 0 && vi !== PRES.lastVi)) PRES.shown++;
     PRES.lastVi = vi;
   })();
 }
@@ -530,7 +844,7 @@ function postStats() {
   var owed = 0;
   if (CLK.viHz > 0 && CLK.base) owed = (STAT.last - (CLK.base + (CLK.frame - CLK.baseFrame) * (1000 / CLK.viHz))) / (1000 / CLK.viHz);
   post({ t: 'stat', at: performance.timeOrigin + performance.now(),
-         vi: M._neil_vi_total() >>> 0, costMs: M._neil_frame_cost_ms(), costN: M._neil_frame_cost_n() >>> 0,
+         vi: viTotal(), costMs: M._neil_frame_cost_ms(), costN: M._neil_frame_cost_n() >>> 0,
          apos: M._neilGetAudioWritePosition() | 0, audDropped: RM.R ? (RM.R.AUDX.dropped | 0) : 0,
          frame: CLK.frame, presents: CLK.presents, ticks: CLK.ticks,
          lostMs: CLK.lostMs, reanchors: CLK.reanchors, busyMs: CLK.busyMs,
@@ -541,6 +855,7 @@ function postStats() {
          cb: { mode: CB.mode, yields: CB.holds, released: CB.released, forced: CB.forced,
                rafDraws: CB.rafDraws, taskDraws: CB.taskDraws, rafSkips: CB.rafSkips },
          audioSent: AUD.sent, audioDropped: AUD.dropped,
+         fs: { on: FSK.on, skipped: FSK.skipped, drawn: FSK.drawn, presented: FSK.presented, redo: FSK.redo, onGpu: FSK.fq.length },
          jitBlocks: js ? js.blocks : null, dbg: DBG ? DBG.report() : undefined,
          fb: self.__fbAsync ? { on: !!self.__fbAsync.on, calls: self.__fbAsync.calls, async: self.__fbAsync.async,
                                 sync: self.__fbAsync.sync, blocked: self.__fbAsync.blocked, decided: self.__fbAsync.decided } : null });
@@ -622,6 +937,7 @@ function roomMirrorBody(full) {
 function roomNew(d) {
   if (RM.eng) { log('[lockstep] ⚠ a second engine was asked for — ignored'); return; }
   roomInstall(d);
+  if (M) fsResolve();                    // the room's own snapshots take over from here
   if (!self.Netplay) importScripts(d.npSrc || ('/lib/netplay.js?v=' + CORE_V));
   RM.on = true; RM.role = d.role || null;
   var o = d.opts || {};
@@ -926,12 +1242,19 @@ function boot(d) {
   // ?workerrig=clock: the rig seam (eval) with the frame clock RUNNING as shipped — a
   // measurement of what a player gets, driven by a pad function (applyPads)
   BOOT.rigClock = new URLSearchParams(d.search || '').get('workerrig') === 'clock';
+  fsInstall(d.search);
   (function () {
     var gq = new URLSearchParams(d.search || '').get('gpuq');
     var gqms = new URLSearchParams(d.search || '').get('gpuqms');
     if (gq === '0') { GQ.on = false; log('[gpuq] CONTROL ARM (?gpuq=0): no GPU queue guard'); }
     else if (gq && +gq > 0) { GQ.max = Math.min(16, +gq | 0); GQ.capMs = 0; log('[gpuq] fixed depth ' + GQ.max + ' (?gpuq)'); }
     if (gqms !== null && +gqms >= 0) GQ.capMs = Math.min(2000, +gqms);
+    // THE RENDER-LEVEL FRAME SKIP is the default; its backstop is the depth guard (GQ.max 2
+    // pictures). Naming a guard arm (?gpuq / ?gpuqms) without ?fskip measures that guard alone.
+    var fq = new URLSearchParams(d.search || '').get('fskip');
+    if (fq === null && (gq !== null || gqms !== null)) { FSK.on = false; FSK.why = 'off: a guard arm (?gpuq/?gpuqms) without ?fskip'; }
+    if (FSK.on) { GQ.max = 2; log('[fskip] render-level frame skip ON: at most ' + FSK.depth + ' picture(s) on the GPU before a field skips its draws' + (FSK.force ? ' — ' + FSK.why : '')); }
+    else log('[fskip] ' + FSK.why);
   })();
   CORE_V = d.v || '';
   CLK.viHz = d.viHz > 0 ? d.viHz : 0;
@@ -952,6 +1275,7 @@ function boot(d) {
     PB.on = true; pbInstall();
     log('[present] core worker: pictures go to the page as ImageBitmaps, one per drawn field (no canvas commit)');
   }
+  fsWrap();
   installShims(d.canvas);
   dbgInstall(d.search);
   (function () {
@@ -967,6 +1291,7 @@ function boot(d) {
   // SAME ROM header with the SAME query string, so this console hands RDRAM the
   // same bytes at the same guest point as a main-thread one would.
   self.__n64InstallFbAsync(self, d.search || '');
+  fsInstallRead();
   var rom = new Uint8Array(d.rom);
   try {
     self.__fbDecide(rom);
@@ -1015,6 +1340,7 @@ function boot(d) {
           self.window = self;
           try { setupJit(d.jit || 'emit'); } catch (e) { log('[jit] emitter failed to load — bridge stays off: ' + e); }
           if (DBG) { DBG.wrapJit(); DBG.wrapFrame(); }
+          fsCoreReady();          // the pad recorder, before any field (a re-run replays every field's pads)
           if (d.workerfail === 'main') throw new Error('?workerfail=main — a simulated core failure during boot (rig seam)');
           M.callMain(['custom.v64']);
           post({ t: 'booted' });
@@ -1054,12 +1380,13 @@ function onMsg(e) {
     case 'lspads': if (d.p && d.p.length === 4) RM.pads = d.p; break;
     case 'lsdisarm': roomDisarm(d.why); break;
     case 'glwant': if (RM.R) { RM.R.LS_GL.want = d.n; RM.R.LS_GL.said = ''; RM.R.LS_GL.reads = 0; RM.R.LS_GL.lit = 0; } break;
-    case 'reset': if (M) { M._neil_reset(); post({ t: 'toast', s: 'Reset' }); } break;
-    case 'saveState': if (M) M._neil_serialize(); break;
+    case 'reset': if (M) { fsDropAll(); M._neil_reset(); post({ t: 'toast', s: 'Reset' }); } break;
+    case 'saveState': if (M) { fsResolve(); M._neil_serialize(); } break;
     case 'loadState':
       idbGet(BOOT.romName).then(function (bytes) {
         if (!bytes) { post({ t: 'toast', s: 'No saved state for this game', bad: true }); return; }
         M.FS.writeFile('/savestate.gz', bytes);
+        fsDropAll();
         M._neil_unserialize();
         post({ t: 'toast', s: 'State loaded' });
       }, function (err) { post({ t: 'toast', s: 'Load failed: ' + err, bad: true }); });

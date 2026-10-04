@@ -52,12 +52,14 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include "Gfx_1.3.h"
 #include "../../../Graphics/image_convert.h"
 #include "../Glitch64/glide.h"
 #include "rdp.h"
 #include "lazy_fb.h"
 #include "../../../mupen64plus-core/src/main/lfb_hook.h"
+#include "../../../Graphics/RDP/gDP_state.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #endif
@@ -73,6 +75,8 @@ typedef struct
    int32_t *sx, *sy;
    int      cap_xy;           /* allocated length of sx / sy */
    int      refs;
+   int      blank;            /* taken in a field whose draws were skipped (FRAME SKIP, below) */
+   uint32_t bserial;          /* the frame-skip serial of the field it was taken in */
 } lfb_cap_t;
 
 typedef struct
@@ -203,12 +207,98 @@ static void reg_write(const lfb_reg_t *r, const uint16_t *samp)
    }
 }
 
+/* ---- FRAME SKIP (n64/N64Wasm/dist/core_worker.js THE RENDER-LEVEL FRAME SKIP) ----------
+ * When the GPU is behind, the worker runs a field with its draw and clear calls swallowed
+ * (every other GL call still runs). The guest is untouched — EXCEPT through a read-back: the
+ * capture this file takes at the end of such a field's display list holds a window nobody drew.
+ * So a capture taken while neil_fs_skip is set is marked BLANK, and materialising one (the guest
+ * or a device is about to observe bytes that should have come from it) counts a TAINT. The
+ * worker reads the count after every field, and on a taint it restores the machine from before
+ * the oldest skipped field still able to reach RDRAM and re-runs every field since, drawing — so
+ * the bytes the guest observes are exactly those of a run that never skipped. neil_fs_oldest()
+ * names that field: the smallest serial among BLANK captures the live queue (or the one-call
+ * offset's prev_cap) still references — rollback snapshots' references do not count, they are
+ * not the running machine. A blank capture superseded or dropped before anything looked is gone
+ * for good, and its field's snapshot is released. */
+int      neil_fs_skip;
+uint32_t neil_fs_serial;
+static uint32_t fs_taint;
+void neil_fs_set(int skip, uint32_t serial) { neil_fs_skip = skip ? 1 : 0; neil_fs_serial = serial; }
+uint32_t neil_fs_taints(void) { return fs_taint; }
+/* the serial of the oldest skipped field whose blank capture can still be observed; -1 none */
+int neil_fs_oldest(void)
+{
+   int i, best = -1;
+   uint32_t b = 0;
+   if (prev_cap >= 0 && caps[prev_cap].blank) { b = caps[prev_cap].bserial; best = 0; }
+   for (i = 0; i < nregs; i++)
+   {
+      lfb_cap_t *c = &caps[regs[i].cap];
+      if (c->blank && (best < 0 || (int32_t)(c->bserial - b) < 0)) { b = c->bserial; best = 0; }
+   }
+   return best < 0 ? -1 : (int)(b & 0x7FFFFFFF);
+}
+
+/* rand()/srand(): musl's own generator (system/lib/libc/musl/src/prng/rand.c, the same LCG and
+ * the same values), defined here so its state can travel with a frame-skip snapshot. Glide draws
+ * its noise texture (TexCache.c) and a combiner colour (Combine.c) from rand(); a re-run of fields
+ * calls it again, and without restoring the state every later noise picture would differ from a
+ * run that never re-ran (the guest itself never sees it). */
+static uint64_t neil_rand_seed;
+void srand(unsigned s) { neil_rand_seed = s - 1; }
+int rand(void)
+{
+   neil_rand_seed = 6364136223846793005ULL * neil_rand_seed + 1;
+   return (int)(neil_rand_seed >> 33);
+}
+uint32_t neil_rand_lo(void) { return (uint32_t)neil_rand_seed; }
+uint32_t neil_rand_hi(void) { return (uint32_t)(neil_rand_seed >> 32); }
+void neil_rand_set(uint32_t lo, uint32_t hi) { neil_rand_seed = ((uint64_t)hi << 32) | lo; }
+
+/* THE HOST'S SIDE OF A FRAME-SKIP SNAPSHOT. A re-run (core_worker.js fsRedo) restores the machine,
+ * but some state that decides what a field DRAWS is the host's, and a re-run would start from where
+ * the fields being re-run left it:
+ *   - glide's RDP: on the console the RDP's registers and TMEM persist from one display list to the
+ *     next (a texture or palette loaded once, drawn with frames later); glide keeps them in g_gdp,
+ *     gDP (the 8-bit palette's CRC), gSP and the first part of `rdp` (tiles, palette, the TMEM
+ *     address map, colours, modes, lights, matrices) — up to its first pointer (vtx1); what follows
+ *     is buffers and the texture cache, which is keyed by content and left as it is;
+ *   - the frontend's toast (mymain.cpp toastCounter), counted in swaps: MEASURED (MK64 2P title,
+ *     ?fsrerun=269:286, no field skipped), a re-run swapped 17 more times and the toast left the
+ *     picture 17 fields early — the only picture difference a re-run made in 1800 fields.
+ * The guest never sees any of it; a re-run's pictures are then those of a run that never re-ran. */
+#define GLS_RDP offsetof(struct RDP, vtx1)
+int *neil_toast_counter_ptr(void);   /* mymain.cpp: the frontend's toast, counted in swaps */
+int neil_gl_state_size(void) { return (int)(sizeof(g_gdp) + sizeof(gDP) + sizeof(gSP) + GLS_RDP + sizeof(int)); }
+void neil_gl_state_save(uint8_t *dst)
+{
+   memcpy(dst, &g_gdp, sizeof(g_gdp)); dst += sizeof(g_gdp);
+   memcpy(dst, &gDP, sizeof(gDP));     dst += sizeof(gDP);     /* palette CRCs, tiles */
+   memcpy(dst, &gSP, sizeof(gSP));     dst += sizeof(gSP);     /* its pointers point into gDP: static */
+   memcpy(dst, &rdp, GLS_RDP);         dst += GLS_RDP;
+   memcpy(dst, neil_toast_counter_ptr(), sizeof(int));
+}
+void neil_gl_state_load(const uint8_t *src)
+{
+   /* rdp.tex_ctr is an EPOCH, not state: a vertex's UVs are reused while its stamp equals it
+    * (glide64_util.c uv_calculated), so it only ever grows — put back, an old value could equal a
+    * stamp left by the fields being re-run. */
+   uint32_t ctr = rdp.tex_ctr;
+   memcpy(&g_gdp, src, sizeof(g_gdp)); src += sizeof(g_gdp);
+   memcpy(&gDP, src, sizeof(gDP));     src += sizeof(gDP);
+   memcpy(&gSP, src, sizeof(gSP));     src += sizeof(gSP);
+   memcpy(&rdp, src, GLS_RDP);         src += GLS_RDP;
+   memcpy(neil_toast_counter_ptr(), src, sizeof(int));
+   rdp.tex_ctr = ctr + 1;
+}
+
 /* write queue entry i into RDRAM and retire it */
 static void materialise(int i)
 {
    lfb_reg_t r = regs[i];
    lfb_cap_t *c = &caps[r.cap];
    const uint16_t *samp;
+   if (c->blank) fs_taint++;
    reg_remove(i);
    lfb_busy++;
    samp = grLfbSampleFrom(c->tex, c->w, c->h, c->sx, c->nx, c->sy, c->ny);
@@ -335,6 +425,8 @@ int lfb_queue(const int32_t *sx, int nx, const int32_t *sy, int ny,
       if (!a || !b) { caps[cur].refs = 0; goto eager; }
       caps[cur].cap_xy = n;
    }
+   caps[cur].blank = neil_fs_skip;
+   caps[cur].bserial = neil_fs_serial;
    memcpy(caps[cur].sx, sx, sizeof(int32_t) * nx);
    memcpy(caps[cur].sy, sy, sizeof(int32_t) * ny);
    caps[cur].nx = nx; caps[cur].ny = ny;
