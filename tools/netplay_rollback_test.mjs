@@ -50,11 +50,16 @@ const padFor = (port, f) => {
 };
 
 function runRoom({ latencyMs, jitterMs = 0, rollback, guestRollback = rollback, delay = 2,
-                   guestStartMs = 40, seconds = SECONDS, dropGuestAtMs = 0, unique = false, noRewind = false }) {
+                   guestStartMs = 40, seconds = SECONDS, dropGuestAtMs = 0, unique = false, noRewind = false,
+                   edge = false, edgeBytes = null }) {
   // unique: every frame's pad is distinct (b[1] = f), so the frame a sampled pad
   // lands on is unambiguous — the latency arm. (Every remote frame then
   // mispredicts, so that arm is also the worst case for rollback work.)
-  const pad = unique ? (p, f) => { const b = padFor(p, f); b[1] = (f & 0x7f) | (p << 7); return b; } : padFor;
+  // edge: byte 0 is a ONE-FRAME EDGE (a press on exactly one frame, every 9th/13th frame), byte 1
+  // a held level that changes every 29 frames — GameCube's btn/dstk vs stick.
+  const pad = unique ? (p, f) => { const b = padFor(p, f); b[1] = (f & 0x7f) | (p << 7); return b; }
+            : edge ? (p, f) => { const b = new Uint8Array(2); b[0] = (f % (p ? 13 : 9)) === 0 ? 1 + ((f >> 3) & 7) : 0; b[1] = (Math.floor(f / 29) * 41 + p) & 0xff; return b; }
+            : padFor;
   let now = 0;
   const q = [];   // { at, to, msg }  — ordered per direction (a DataChannel is ordered)
   const lastAt = { H: 0, G: 0 };
@@ -69,7 +74,8 @@ function runRoom({ latencyMs, jitterMs = 0, rollback, guestRollback = rollback, 
   // itself — the host runs rollback only for consoles that declare it
   // (lsready rb); `noRewind` is a page that cannot.
   const mk = (id, host, rb) => new L({ peerId: id, host, portCount: 2, padBytes: 2, delay, hashEvery: 30,
-                                       rollback: rb, rollbackOk: !(noRewind && !host), stallBudgetMs: 0, send: send(host ? 'G' : 'H'), now: () => now });
+                                       rollback: rb, rollbackOk: !(noRewind && !host), stallBudgetMs: 0, send: send(host ? 'G' : 'H'), now: () => now,
+                                       rbEdgeBytes: edgeBytes || undefined });
   const E = { H: mk('H', true, rollback), G: mk('G', false, guestRollback) };
   E.H.seat('H', 1); E.H.seat('G', 1);
   const con = {};
@@ -218,6 +224,26 @@ for (const latencyMs of [0, 50, 100]) {
   const early = [...con.H.submitted].filter((k) => k > E.H._rbConfirmed).length + [...con.G.submitted].filter((k) => k > E.G._rbConfirmed).length;
   ok(`only-confirmed-frames-are-fingerprinted@${latencyMs}ms`, early === 0,
      `${early} hashes submitted for frames past the confirmed frontier`);
+}
+
+// ---- ONE-FRAME EDGES ARE NEVER PREDICTED TO RECUR (opts.rbEdgeBytes) ------
+// The same edge-carrying pads, with and without the page naming its edge byte: a prediction that
+// repeats the last known input whole predicts every press to happen again on the next frame, so
+// each remote press costs a second correction; zeroing the edge byte in the prediction removes it.
+// Both arms must still end every confirmed frame in the state of a straight run of the true inputs.
+{
+  const res = {};
+  for (const [name, eb] of [['whole', null], ['edge', [0]]]) {
+    const R = runRoom({ latencyMs: 50, rollback: WINDOW, seconds: 20, edge: true, edgeBytes: eb });
+    const H = R.E.H.report().rollback, G = R.E.G.report().rollback;
+    let st = 0x811c9dc5, bad = 0, checked = 0;
+    const upto = Math.min(R.E.H._rbConfirmed, R.E.G._rbConfirmed), ref = new Map();
+    for (let k = 0; k <= upto; k++) { st = step(st, R.truth(k), k); ref.set(k, st); }
+    for (const id of ['H', 'G']) for (const [k, v] of R.con[id].stateAfter) if (ref.has(k)) { checked++; if (ref.get(k) !== v) bad++; }
+    res[name] = { rb: H.rollbacks + G.rollbacks, resim: H.resimFrames + G.resimFrames, bad, checked };
+  }
+  ok('edge-bytes-are-not-predicted-to-recur', res.edge.rb < res.whole.rb * 0.7 && res.edge.bad === 0 && res.whole.bad === 0 && res.edge.checked > 20,
+     `20 s at 50 ms: ${res.whole.rb} corrections / ${res.whole.resim} re-simulated frames repeating the last input whole -> ${res.edge.rb} / ${res.edge.resim} with the edge byte zeroed in predictions; confirmed states vs a straight run: ${res.whole.bad}/${res.whole.checked} and ${res.edge.bad}/${res.edge.checked} wrong`);
 }
 
 // ---- a guest whose page CANNOT rewind: the host falls back to input delay --
