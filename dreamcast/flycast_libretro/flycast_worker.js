@@ -510,11 +510,16 @@
   // replaces the governor's own read.
   // ---------------------------------------------------------------------------
   let paceBusyMs = 0, pacePacedMs = 0, paceWindowStart = 0;
+  // Governor accounting per 1 s window, sent with 'ips': guest ms DROPPED
+  // (debt beyond CATCHUP_MAX_MS, given up rather than repaid), how many times,
+  // and the deepest lag seen. A healthy worker reports 0 dropped.
+  let paceDropMs = 0, paceDrops = 0, paceMaxLagMs = 0;
   function resetPace() {
     paceBaseWall = 0; paceBaseCyc = 0;
     // A rebase (uncap toggle, reset, savestate load) starts a fresh duty
     // window too — a duty number straddling two arms describes neither.
     paceBusyMs = 0; pacePacedMs = 0; paceWindowStart = performance.now();
+    paceDropMs = 0; paceDrops = 0; paceMaxLagMs = 0;
   }
   // ---------------------------------------------------------------------------
   // LOCKSTEP PUMP (2026-09-08). Online play used to mean ONE emulator: the host
@@ -645,11 +650,83 @@
   // precisely the thing that must never happen (CLAUDE.md gate #9). The kick is
   // now idempotent: a tick already on its way absorbs any further request.
   let pumpQueued = false;
+  let pumpTaskEnd = 0;     // performance.now() when the last pump task returned
+  let pumpWaitAsked = 0;   // timer wait asked for across that gap (not render hold)
   function pumpKick(ms) {
     if (pumpQueued) return;
     pumpQueued = true;
+    pumpWaitAsked = ms > 1 ? ms : 0;   // a timer's own wait is not render hold
     if (ms > 1) setTimeout(() => pumpChannel.port2.postMessage(0), ms);
     else pumpChannel.port2.postMessage(0);
+  }
+  // ---------------------------------------------------------------------------
+  // THE GOVERNOR'S SLEEP, AND THE TIME NOBODY WAS COUNTING (2026-10-04).
+  // dreamcast/docs/governor-pacing/TASKS.md has the runs.
+  //
+  // 1. The pace delay was a setTimeout. In PSO's Pioneer 2 on this box the
+  //    governor asked for 132-255 ms of sleep per second and got 424-782 ms
+  //    (~14 ms asked, ~55 ms delivered, per sleep). Every late wake left the
+  //    guest 25-76 ms behind and the one-field behind-rebase dropped it: 3-8
+  //    drops, 59-313 ms of guest time per second, 0.66-0.93x.
+  //
+  // 2. The wake was late because THIS THREAD WAS NOT FREE — so on this box the
+  //    drops were a symptom, not the cause (replacing the timer alone left the
+  //    rate unchanged: 0.74-0.96x, never one sleep). After every task
+  //    that renders a frame, the thread is held ~27 ms (624-772 ms per second,
+  //    measured between pumpTick returning and the next task starting, with
+  //    every other message handler at ~1 ms/s) while the GPU process takes the
+  //    frame: SwiftShader's four raster threads ran at ~70% each while this
+  //    worker's thread ran 30%. A timer cannot fire inside that hold, and
+  //    neither can a zero-delay MessageChannel hop. `busy` (time inside
+  //    run_iter) never saw it, so `duty` read 23-37% and `headroom` 2.2-3.6x
+  //    on a worker that was in fact saturated by render backpressure.
+  //
+  // So: (a) the hold is now MEASURED (paceHeldMs: wall time between this
+  // pump's own task ending and its next task starting, minus any sleep it
+  // asked for) and the page counts it as occupied time; (b) the sleep is a
+  // deadline, not a duration — the frame task ends first (so the frame
+  // presents at once, never held behind a sleep), the next task waits out
+  // only what is LEFT of the deadline with Atomics.wait (sub-ms wake; the
+  // render hold already spent part of it), then hops through the queue so a
+  // pad message that arrived meanwhile runs BEFORE the frame, exactly as it
+  // did with the timer. Atomics needs a SharedArrayBuffer, which this worker
+  // cannot run without; the timer is the fallback.
+  // ---------------------------------------------------------------------------
+  let sleepCell = null;
+  try { sleepCell = new Int32Array(new SharedArrayBuffer(4)); } catch (_) { sleepCell = null; }
+  let paceSleptMs = 0;     // wall time the pace sleeps actually took (vs pacePacedMs asked)
+  let paceHeldMs = 0;      // wall time this thread was held between pump tasks (render backpressure)
+  let paceSleepUntil = 0;
+  const sleepChannel = new MessageChannel();
+  sleepChannel.port1.onmessage = function () {
+    const a = performance.now();
+    noteHeld(a);
+    const rem = paceSleepUntil - a;
+    if (rem > 0.25) {
+      try { Atomics.wait(sleepCell, 0, 0, rem); } catch (_) { sleepCell = null; }
+    }
+    const b = performance.now();
+    paceSleptMs += b - a;
+    pumpTaskEnd = b; pumpWaitAsked = 0;
+    pumpQueued = false;
+    pumpKick(0);
+  };
+  function noteHeld(now) {
+    if (pumpTaskEnd) {
+      const held = now - pumpTaskEnd - pumpWaitAsked;
+      if (held > 0) paceHeldMs += held;
+      pumpTaskEnd = 0;
+    }
+  }
+  function pumpSleep(ms) {
+    if (pumpQueued) return;
+    if (sleepCell) {
+      pumpQueued = true;               // absorbs any other kick until the sleep hands over
+      paceSleepUntil = performance.now() + ms;
+      sleepChannel.port2.postMessage(0);
+    } else {
+      pumpKick(ms);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -926,7 +1003,12 @@
   }
 
   function pumpTick() {
+    noteHeld(performance.now());
+    try { pumpTick_(); } finally { pumpTaskEnd = performance.now(); }
+  }
+  function pumpTick_() {
     pumpQueued = false;
+    pumpWaitAsked = 0;
     if (!freerun) return;
     const Module = self.Module;
     if (runIterSuspended()) {
@@ -1069,17 +1151,40 @@
       const cyc = Module._flycast_guest_cycles();
       if (!paceBaseWall) { paceBaseWall = nowW; paceBaseCyc = cyc; }
       const lead = (cyc - paceBaseCyc) / SH4_HZ * 1000 - (nowW - paceBaseWall);
-      // ⚠ BEHIND IS REBASED AT ONE FRAME, NOT AT 250 ms. The old window let the
-      // core repay up to a quarter-second of debt at full speed — a sprint, which
-      // CLAUDE.md gate #9 forbids. Measured with tools/netplay_device_matrix.mjs
-      // (the page's own SH4-clock witness, guestX): the throttled-phone SOLO run
-      // peaked at 1.18x for a second and 1.032x over five
-      // (/tmp/npdm/after1 dc:mobile), and two-player rooms read 1.020-1.030x
-      // five-second windows after every dip. Behind by more than a frame now
-      // means those milliseconds did not happen for the guest; ahead is still
-      // waited out exactly as before.
-      if (lead < -BEHIND_REBASE_MS || lead > 250) { paceBaseWall = nowW; paceBaseCyc = cyc; }
-      else delay = Math.max(0, Math.min(50, lead));
+      // THE CONTRACT: the guest clock tracks the wall clock from the anchor —
+      // never AHEAD of it (ahead is waited out), and never left behind it while
+      // the worker has time to spare (behind is repaid, by running the next
+      // frame with no sleep, until the guest is level with the wall clock and
+      // not one cycle past it). Long-run rate = exactly 1.000x.
+      //
+      // History. A 250 ms window used to be repaid; edf596e cut it to one field
+      // (17 ms) after the throttled-phone matrix read 1.18x one-second windows,
+      // and above 17 ms the debt was thrown away, so any late frame or late
+      // wake past one field became guest time lost for good, on a worker that
+      // might have had the capacity to repay it (dreamcast/tools/
+      // governor_sim.mjs: a late timer alone took a worker with 3x headroom to
+      // 0.75x). Repaying a debt is not a sprint: the guest only reaches the
+      // wall clock it should already have been at. A sprint is guest time PAST
+      // the wall clock, and that cannot happen here — a frame that ends ahead
+      // sleeps. A one-second window that follows a late one can read above
+      // 1.000x by at most the debt it repays (<= CATCHUP_MAX_MS, so <= 1.10x
+      // vs the 1.18x the 250 ms window allowed); the cumulative guest clock
+      // never passes the wall clock.
+      //
+      // Bounded: only CATCHUP_MAX_MS of debt is carried. Beyond it (background
+      // tab, level load, a device that cannot do 1.000x at all) the EXCESS is
+      // dropped — the base moves just enough to leave CATCHUP_MAX_MS owed — so
+      // a stall can never be followed by a long fast-forward, and a device
+      // without headroom runs at its capacity, as before.
+      if (lead > 250) { paceBaseWall = nowW; paceBaseCyc = cyc; }   // state jump (unserialize)
+      else if (lead < -CATCHUP_MAX_MS) {
+        const drop = -lead - CATCHUP_MAX_MS;
+        paceBaseWall += drop; paceDropMs += drop; paceDrops++;
+        if (-lead > paceMaxLagMs) paceMaxLagMs = -lead;
+      } else {
+        if (-lead > paceMaxLagMs) paceMaxLagMs = -lead;
+        delay = Math.max(0, Math.min(50, lead));
+      }
     } else {
       // uncap: TRUE free-run (lever-11 rig fix, 2026-08-28). The historical
       // `FRAME_MS - elapsed` limiter here silently capped "uncapped" probes
@@ -1092,14 +1197,16 @@
     }
     // Only the delay we ASKED for counts as given-back time. setTimeout
     // overshoot lands in the unattributed remainder, so headroom stays a floor.
-    if (delay > 1) { pacePacedMs += delay; pumpKick(delay); }
+    if (delay > 1) { pacePacedMs += delay; pumpSleep(delay); }
     else pumpKick(0);
   }
 
   // Serialize the full emulator state and hand the bytes to the page. MUST be
   // called only at a clean asyncify boundary (from pumpTick, or when not
   // free-running) — see the pendingSave note above.
-  var BEHIND_REBASE_MS = 17;     // one 60 Hz field: jitter below it is absorbed, debt above it is dropped
+  // Debt the governor repays rather than drops: six 60 Hz fields. One late
+  // frame or a late wake is well inside it; a background tab or a load is not.
+  var CATCHUP_MAX_MS = 100;
   function doSaveState() {
     const Module = self.Module;
     try {
@@ -1137,8 +1244,13 @@
                       busyMs: Math.round(paceBusyMs),
                       pacedMs: Math.round(pacePacedMs),
                       wallMs: Math.round(wallMs),
+                      sleptMs: Math.round(paceSleptMs),
+                      heldMs: Math.round(paceHeldMs),
+                      dropMs: Math.round(paceDropMs), drops: paceDrops,
+                      maxLagMs: Math.round(paceMaxLagMs),
                       governed: uncap ? 0 : 1 });
         paceWindowStart = nowW; paceBusyMs = 0; pacePacedMs = 0;
+        paceSleptMs = 0; paceHeldMs = 0; paceDropMs = 0; paceDrops = 0; paceMaxLagMs = 0;
         freerunIters = 0;
         vmuPoll();   // card snapshots ride the existing 1 Hz tick
         lazyPoll();
