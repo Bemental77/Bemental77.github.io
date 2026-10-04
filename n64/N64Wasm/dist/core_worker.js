@@ -437,7 +437,7 @@ var FSK = { on: true, depth: 1, maxSnaps: 6, snapEvery: 8, force: 0, skipping: f
            hist: 0, stale: false, fq: [], pend: [], snaps: [], pool: [], bufs: 0, size: 0, top: 0, raw: null,
            pads: null, curPads: new Int32Array(12), setPad: null, taintSeen: 0, jsTaint: 0, ageTIn: 0, pollT: 0,
            fields: 0, drawn: 0, skipped: 0, skipNoDraw: 0, snapsTaken: 0, snapMs: 0, maxSnapMs: 0, redo: 0, redoFields: 0,
-           redoMs: 0, redoFieldsAll: 0, staleS: 0, repairs: 0, lost: 0, suspendUntil: 0, backoff: 64, held: 0, presented: 0, overwritten: 0, noHeap: 0,
+           redoMs: 0, redoFieldsAll: 0, audDrop: 0, staleS: 0, repairs: 0, lost: 0, suspendUntil: 0, backoff: 64, held: 0, presented: 0, overwritten: 0, noHeap: 0,
            lat: new Float32Array(4096), age: new Float32Array(4096), gpu: new Float32Array(4096), latN: 0, why: '' };
 var FS_RESERVE = 64 * 1048576;    // heap kept free above the snapshots (room_core.js N64S_RAW_RESERVE)
 var FS_MAXAGE = 16;               // a snapshot older than this many fields is resolved by a re-run now (?fskipage=N)
@@ -551,7 +551,13 @@ function fsRelease(s) {
 function fsRedo(s, backoff, pumped) {
   var S = FSK.snaps[0], t0 = performance.now();
   if (!S) { FSK.lost++; log('[fskip] ⚠ a read-back of a skipped field with no snapshot held — this field is not exact; skipping OFF'); FSK.on = false; return; }
-  var wp = M._neilGetAudioWritePosition ? function () { AUD.read = M._neilGetAudioWritePosition(); } : function () {};
+  // Audio a re-run drops unplayed is counted (FSK.audDrop, mod the 64000-entry ring) and the
+  // page's audio witness subtracts it, as it does a rollback's (stat audDropped): MEASURED before
+  // this, a 1 s window with one re-run read 1.21-1.36x on a guest the field clock had at 1.000x.
+  var wp = M._neilGetAudioWritePosition ? function () {
+    var w = M._neilGetAudioWritePosition();
+    FSK.audDrop = (FSK.audDrop + ((w - AUD.read + 64000) % 64000)) % 64000; AUD.read = w;
+  } : function () {};
   wp();                                   // this field's audio: made again below
   if (!(M._neil_state_load_raw(S.p) | 0)) { FSK.lost++; log('[fskip] ⚠ snapshot restore refused — skipping OFF'); FSK.on = false; return; }
   if (S.fbs && self.__fbAsync && self.__fbAsync.restore) self.__fbAsync.restore(S.fbs);
@@ -861,7 +867,7 @@ function postStats() {
   if (CLK.viHz > 0 && CLK.base) owed = (STAT.last - (CLK.base + (CLK.frame - CLK.baseFrame) * (1000 / CLK.viHz))) / (1000 / CLK.viHz);
   post({ t: 'stat', at: performance.timeOrigin + performance.now(),
          vi: viTotal(), costMs: M._neil_frame_cost_ms(), costN: M._neil_frame_cost_n() >>> 0,
-         apos: M._neilGetAudioWritePosition() | 0, audDropped: RM.R ? (RM.R.AUDX.dropped | 0) : 0,
+         apos: M._neilGetAudioWritePosition() | 0, audDropped: ((RM.R ? (RM.R.AUDX.dropped | 0) : 0) + FSK.audDrop) % 64000,
          frame: CLK.frame, presents: CLK.presents, ticks: CLK.ticks,
          lostMs: CLK.lostMs, reanchors: CLK.reanchors, busyMs: CLK.busyMs,
          rafTicks: SCHED.rafTicks, immTicks: SCHED.immTicks, tmrTicks: SCHED.tmrTicks,
