@@ -1205,6 +1205,11 @@ const RBC = {
   // per-phase time (µs) and counts, presented vs re-simulated frames: the guest's own run, and the
   // VI pump (FIFO walk + regions + audio + ring bookkeeping) up to the credit wait
   S_GP_US: 80, S_VP_US: 81, S_NP: 82, S_GR_US: 83, S_VR_US: 84, S_NR: 85,
+  // ...and the frame-start bookkeeping (rbQuiescent) apart from the guest's run: the fingerprint
+  // step on presented / re-simulated frame starts, and the whole frame-start time (save point +
+  // restore + fingerprint), which S_GP_US/S_GR_US no longer include (they used to, so a rewind's
+  // restore was counted twice in the page's step price: once in the guest run, once on its own).
+  S_FPP_US: 86, S_FPR_US: 87, S_Q_US: 88, S_FP_HIT: 89, S_FP_MISS: 90, S_FP_BAD: 91,
   RING: 256, RING_N: 256, RING_S: 17,   // per-frame inputs: [w, 4 x (btn, dstk, stkx, stky)]
 };
 const RB_LO = 0x60000000;          // = rb_instrument.js RB.LO (no scan or snapshot looks at or above it)
@@ -1223,10 +1228,25 @@ const rb = {
   carry: [], pendRaw: [],
   test: null,         // DETERMINISM-RIG MODE (boot msg rbTest): the worker drives its own rollbacks
   busyAt: 0, stepResim: 0, slotsUsed: 0,
+  qUs: 0,             // time spent in rbQuiescent since the last VI (taken out of the guest run)
   fault: 0,
 };
 // The fingerprint sweep the ring runs (see THE STATE FINGERPRINT); its state is part of rbCapture.
 const rbFp = { low: FP_LOW_MIN, next: 0, acc: 0, maxNz: -1, live: false };
+// THE SWEEP'S PAGE-HASH CACHE. A 64 KiB page's hash is a pure function of its bytes, and while the
+// ring is armed EVERY write to the guest is logged at 4 KiB granularity (the instrumented module's
+// own stores, and every JS write through rbTouchRange) — so a page none of whose 4 KiB pages was
+// logged since its hash was taken still has that hash. rbSavePoint drops the entry of every page a
+// finished frame logged, rbRestore of every page it copied back, and arming / an overflowed log /
+// stopping drop them all. The sweep then hashes only what changed (a frame logs ~100 4 KiB pages
+// of the ~1,400 64 KiB pages swept), on presented and re-simulated frame starts alike — it used
+// to re-hash 1/60 of the whole guest (~1.4 MB, ~0.4 ms) on every one of them.
+const rbFpCache = { h: new Int32Array(0x82000000 / 65536), ok: new Uint8Array(0x82000000 / 65536) };
+function rbFpDrop(pg, sl) { const ok = rbFpCache.ok; for (let i = 0; i < pg.length; i++) ok[pg[i] >>> 4] = 0; }
+function rbFpDropAll() { rbFpCache.ok.fill(0); }
+// Rig seams (boot msg): rbFpNoCache hashes every page as before; rbFpVerify hashes every page AND
+// checks each cached hash against it (S_FP_BAD counts disagreements — a write the log missed).
+let rbFpNoCache = false, rbFpVerify = false;
 
 function rbView() { return Module.wasmMemory.buffer; }
 function rbFault(code, txt) {
@@ -1280,6 +1300,7 @@ function rbArm(w) {
   if (n) { const L = new Int32Array(rbView(), R.LOG, n * 2), sl = new Int32Array(n); for (let k = 0; k < n; k++) sl[k] = L[2 * k + 1]; rbFreeSlots(sl); }
   m8.fill(0, R.BITMAP, R.BITMAP + (m8.length >>> 12));
   c[R.C_LOGN >> 2] = 0; c[R.C_OVERFLOW >> 2] = 0; c[R.C_ENABLED >> 2] = 1;
+  rbFpDropAll();                     // nothing before the arm was logged
   rb.armed = true; rb.rearm = false; rb.base = w; rb.w = w;
   rb.lastRec = { js: rbCapture(), undo: null, ship: null };
   rb.recs.set(w, rb.lastRec);
@@ -1298,6 +1319,7 @@ function rbSavePoint(w) {
   }
   c[R.C_LOGN >> 2] = 0;
   rb.slotsUsed = R.SLOTCAP - c[R.C_FREETOP >> 2];
+  rbFpDrop(pg);
   const prev = rb.lastRec;
   if (prev && !prev.undo) prev.undo = { pg, sl }; else rbFreeSlots(sl);
   if (ov) {
@@ -1305,6 +1327,7 @@ function rbSavePoint(w) {
     // or before it can be restored. Every page it marked but did not log must log again.
     c[R.C_OVERFLOW >> 2] = 0;
     m8.fill(0, R.BITMAP, R.BITMAP + (m8.length >>> 12));
+    rbFpDropAll();                   // a page was written without being logged
     if (rbI32) Atomics.add(rbI32, RBC.S_OVERFLOWS, 1);
     for (const [k, r] of rb.recs) if (k < w) { if (r.undo) rbFreeSlots(r.undo.sl); rb.recs.delete(k); }
     rb.base = w;
@@ -1349,6 +1372,7 @@ function rbRestore(f) {
     if (!r || !r.undo) { rbFault(1, 'frame ' + k + ' has no undo record'); return false; }
     const { pg, sl } = r.undo;
     if (brk !== 'noundo') for (let i = 0; i < pg.length; i++) m8.copyWithin(pg[i] * 4096, sl[i] >>> 0, (sl[i] >>> 0) + 4096);
+    rbFpDrop(pg);
     rbFreeSlots(sl);
     r.undo = null;
     if (r.ship === 'full') full = true; else if (r.ship) for (const x of r.ship) raw.push(x);
@@ -1364,14 +1388,9 @@ function rbRestore(f) {
   if (full) { cacheDirty = true; rb.pendRaw.length = 0; rb.carry.length = 0; }
   else {
     if (raw.length) for (const e3 of knownDLs.values()) e3.keys.clear();   // array bindings live in DL bodies
-    for (const [a0, n0] of raw) {
-      const ofs = a0, ds = n0;
-      for (const [ka, e2] of knownDLs) { const kOfs = ka & 0x01FFFFFF; if (kOfs < ofs + ds && kOfs + e2.size > ofs) knownDLs.delete(ka); }
-      for (const [k2, kn] of knownArrays) { const kOfs = parseInt(k2, 10) & 0x01FFFFFF; if (kOfs < ofs + ds && kOfs + kn > ofs) knownArrays.delete(k2); }
-      for (const [tb, tv] of knownTex) { const kOfs = tb & 0x01FFFFFF; if (kOfs < ofs + ds && kOfs + tv.size > ofs) knownTex.delete(tb); }
-      for (let fi = f32Arrays.length - 1; fi >= 0; fi--) if (f32Arrays[fi].b < ofs + ds && f32Arrays[fi].e > ofs) f32Arrays.splice(fi, 1);
-      if (ofs >= 0 && ofs + ds <= 0x01800000) rb.pendRaw.push([ofs, ds]);
-    }
+    const M = rbMergeRanges(raw);
+    rbDropDLs(M); rbDropBindings(M);
+    for (const [ofs, ds] of raw) if (ofs >= 0 && ofs + ds <= 0x01800000) rb.pendRaw.push([ofs, ds]);
   }
   if (rbI32) {
     Atomics.add(rbI32, RBC.S_ROLLBACKS, 1);
@@ -1379,6 +1398,37 @@ function rbRestore(f) {
     if (g - f > rbI32[RBC.S_MAXDEPTH]) rbI32[RBC.S_MAXDEPTH] = g - f;
   }
   return true;
+}
+// THE RENDERER CACHES OVER A SET OF RANGES, IN ONE PASS. A rewind (rbRestore) and a re-simulated
+// frame (rbResimDrain) both drop every cache entry that overlaps a set of guest ranges. Done range
+// by range that was O(ranges x entries), with a parseInt per knownArrays key per range — most of
+// a rewind's cost (MEASURED in a 2-player room: ~0.9 ms per rewind, of which the page copies are
+// ~0.1 ms). Here the ranges are merged once and each cache is walked once, with a binary search
+// per entry; the entries dropped are exactly the same.
+function rbMergeRanges(list) {
+  if (!list.length) return null;
+  const a = list.map((r) => [r[0], r[0] + r[1]]).sort((x, y) => x[0] - y[0]);
+  const m = [a[0]];
+  for (let i = 1; i < a.length; i++) { const t = m[m.length - 1]; if (a[i][0] <= t[1]) { if (a[i][1] > t[1]) t[1] = a[i][1]; } else m.push(a[i]); }
+  const lo = new Float64Array(m.length), hi = new Float64Array(m.length);
+  for (let i = 0; i < m.length; i++) { lo[i] = m[i][0]; hi[i] = m[i][1]; }
+  return { lo, hi, n: m.length };
+}
+// does [b, e) overlap a merged range? (strict overlap, as the per-range tests: kOfs < ofs+ds && kOfs+size > ofs)
+function rbOverlaps(M, b, e) {
+  let l = 0, h = M.n - 1, k = -1;
+  while (l <= h) { const mid = (l + h) >> 1; if (M.lo[mid] < e) { k = mid; l = mid + 1; } else h = mid - 1; }
+  return k >= 0 && M.hi[k] > b;
+}
+function rbDropDLs(M) {
+  if (!M) return;
+  for (const [ka, e2] of knownDLs) { const kOfs = ka & 0x01FFFFFF; if (rbOverlaps(M, kOfs, kOfs + e2.size)) knownDLs.delete(ka); }
+}
+function rbDropBindings(M) {
+  if (!M) return;
+  for (const [k2, kn] of knownArrays) { const kOfs = parseInt(k2, 10) & 0x01FFFFFF; if (rbOverlaps(M, kOfs, kOfs + kn)) knownArrays.delete(k2); }
+  for (const [tb, tv] of knownTex) { const kOfs = tb & 0x01FFFFFF; if (rbOverlaps(M, kOfs, kOfs + tv.size)) knownTex.delete(tb); }
+  for (let fi = f32Arrays.length - 1; fi >= 0; fi--) if (rbOverlaps(M, f32Arrays[fi].b, f32Arrays[fi].e)) f32Arrays.splice(fi, 1);
 }
 // The dirty-range ring of a re-simulated frame (the same rules as the presented path: restages drop
 // the caches over their range, a walked DL written over is forgotten), noted as ranges only.
@@ -1388,21 +1438,20 @@ function rbResimDrain() {
   if (Module.___recomp_dirty_overflow && Module.___recomp_dirty_overflow()) cacheDirty = true;
   else if (dn > 0) {
     const dvw = new DataView(Module.wasmMemory.buffer, Module.___recomp_dirty_base() >>> 0, dn * 8);
+    const all = [], rst = [];
     for (let di = 0; di < dn; di++) {
       const da = dvw.getUint32(di * 8, true), dsRaw = dvw.getUint32(di * 8 + 4, true);
       const restage = !!(dsRaw & 0x80000000), ds = dsRaw & 0x7FFFFFFF;
       if (da < 0x80000000 || da + ds > 0x81800000) continue;
       if (ds > 0x100000) { cacheDirty = true; continue; }
       const ofs = da - 0x80000000;
-      for (const [ka, e2] of knownDLs) { const kOfs = ka & 0x01FFFFFF; if (kOfs < ofs + ds && kOfs + e2.size > ofs) knownDLs.delete(ka); }
-      if (restage) {
-        for (const e3 of knownDLs.values()) e3.keys.clear();
-        for (const [k2, kn] of knownArrays) { const kOfs = parseInt(k2, 10) & 0x01FFFFFF; if (kOfs < ofs + ds && kOfs + kn > ofs) knownArrays.delete(k2); }
-        for (const [tb, tv] of knownTex) { const kOfs = tb & 0x01FFFFFF; if (kOfs < ofs + ds && kOfs + tv.size > ofs) knownTex.delete(tb); }
-        for (let fi = f32Arrays.length - 1; fi >= 0; fi--) if (f32Arrays[fi].b < ofs + ds && f32Arrays[fi].e > ofs) f32Arrays.splice(fi, 1);
-      }
+      all.push([ofs, ds]); if (restage) rst.push([ofs, ds]);
       rb.carry.push([ofs, ds]); noted.push({ addr: ofs, bytes: { byteLength: ds } });
     }
+    // (batched: every range's DLs, then — if any range was a restage — the bindings of the
+    // restaged ranges; the same entries the range-by-range loop dropped)
+    rbDropDLs(rbMergeRanges(all));
+    if (rst.length) { for (const e3 of knownDLs.values()) e3.keys.clear(); rbDropBindings(rbMergeRanges(rst)); }
   }
   if (Module.___recomp_dirty_reset) Module.___recomp_dirty_reset();
   rbNoteShip(false, noted);
@@ -1419,6 +1468,11 @@ function rbNoteShip(full, regions) {
 function rbFpStep(w) {
   const every = rbI32 ? rbI32[RBC.FP_EVERY] | 0 : 0;
   if (every <= 0) return;
+  const t0 = performance.now();
+  rbFpStepRun(w, every);
+  rbI32[rb.resimming ? RBC.S_FPR_US : RBC.S_FPP_US] += Math.round((performance.now() - t0) * 1000);
+}
+function rbFpStepRun(w, every) {
   const align = rbI32[RBC.FP_ALIGN] | 0;
   const phase = (((w - align - 1) % every) + every) % every;
   if (phase === 0) { rbFp.next = 0; rbFp.acc = 0x811c9dc5; rbFp.maxNz = -1; rbFp.live = true; }
@@ -1426,12 +1480,22 @@ function rbFpStep(w) {
   const highPages = (Module.wasmMemory.buffer.byteLength - MEM1_LO) / HPAGE;
   const total = rbFp.low + highPages, zh = zeroHash();
   const end = Math.ceil(total * (phase + 1) / every);
+  let hit = 0, miss = 0;
   for (; rbFp.next < end; rbFp.next++) {
     const i = rbFp.next, a = i < rbFp.low ? i * HPAGE : MEM1_LO + (i - rbFp.low) * HPAGE;
-    const h = stateHash(a, a + HPAGE, 0);
+    const k = a >>> 16;
+    let h;
+    if (rbFpCache.ok[k] && !rbFpNoCache) {
+      h = rbFpCache.h[k]; hit++;
+      if (rbFpVerify) {
+        const h2 = stateHash(a, a + HPAGE, 0);
+        if (h2 !== h) { if (rbI32) rbI32[RBC.S_FP_BAD]++; if (!rbFpVerify.said) { rbFpVerify.said = true; log('rollback ring: FINGERPRINT CACHE STALE at page 0x' + a.toString(16) + ' (frame start ' + w + ') — a write the undo log did not see'); } h = h2; rbFpCache.h[k] = h; }
+      }
+    } else { h = stateHash(a, a + HPAGE, 0); rbFpCache.h[k] = h; rbFpCache.ok[k] = 1; miss++; }
     if (i < rbFp.low && h !== zh) rbFp.maxNz = i;
     rbFp.acc = Math.imul((rbFp.acc ^ h) >>> 0, 0x01000193) >>> 0;
   }
+  if (rbI32) { rbI32[RBC.S_FP_HIT] += hit; rbI32[RBC.S_FP_MISS] += miss; }
   if (phase !== every - 1) return;
   let h = rbFp.acc;
   const inject = Atomics.load(paceI32, FP_INJECT) | 0;
@@ -1544,6 +1608,8 @@ function rbStats() {
            steps: g(RBC.S_STEPS), slots: rb.slotsUsed, overflows: g(RBC.S_OVERFLOWS), touches: g(RBC.S_TOUCHES), fault: rb.fault,
            broken: rb.test ? rb.test.broken : null,
            ranWrong: rb.test && rb.test.ran ? [...rb.test.ran].filter(([k, v]) => k <= rb.test.known && !rbSame(Int32Array.from(v.concat(new Array(12).fill(0))), rbTrue(k))).slice(0, 20).map(([k, v]) => [k, v, Array.from(rbTrue(k).slice(0, 4))]) : null,
+           fpHit: g(RBC.S_FP_HIT), fpMiss: g(RBC.S_FP_MISS), fpBad: g(RBC.S_FP_BAD), fpUsP: g(RBC.S_FPP_US), fpUsR: g(RBC.S_FPR_US), qUs: g(RBC.S_Q_US),
+           gpUs: g(RBC.S_GP_US), np: g(RBC.S_NP), grUs: g(RBC.S_GR_US), nr: g(RBC.S_NR),
            known: rb.test ? rb.test.known : null, selfChecks: rb.test ? rb.test.chkN | 0 : 0, selfCheckFails: rb.test ? rb.test.chkBad | 0 : 0 };
 }
 // ⚠ THE FRAME BOUNDARY IS THE FIBER SCHEDULER'S QUIESCENT POINT, NOT THE VI CALL.
@@ -1608,6 +1674,11 @@ function rbLatch(resim) {
 // of the root after a VI is a frame boundary.
 function rbQuiescent(target) {
   if (!rb.on || !rb.viSeen || target !== rb.root || rb.fault) return;
+  const t0 = rbI32 ? performance.now() : 0;
+  rbQuiescentRun(target);
+  if (t0) { const us = (performance.now() - t0) * 1000; rb.qUs += us; rbI32[RBC.S_Q_US] += Math.round(us); }
+}
+function rbQuiescentRun(target) {
   rb.viSeen = false;
   const w = rb.w + 1;
   rb.w = w; rb.qOk = true;
@@ -2036,7 +2107,8 @@ async function boot(msg) {
           const hiddenNow = rb.presentHidden && !resim;
           if (rb.on) rbVi(resim);
           const tVi = rbI32 && rb.armed ? performance.now() : 0;
-          if (tVi && rb.tLeft) { rbI32[resim ? RBC.S_GR_US : RBC.S_GP_US] += Math.round((tVi - rb.tLeft) * 1000); rbI32[resim ? RBC.S_NR : RBC.S_NP]++; }
+          if (tVi && rb.tLeft) { rbI32[resim ? RBC.S_GR_US : RBC.S_GP_US] += Math.max(0, Math.round((tVi - rb.tLeft) * 1000 - rb.qUs)); rbI32[resim ? RBC.S_NR : RBC.S_NP]++; }
+          rb.qUs = 0;
           if (det && det.leftAt) det.lastGuestUs = (performance.now() - det.leftAt) * 1000;
           const pos = Module._gx_fifo_pos ? Module._gx_fifo_pos() : 0;
           shipFrame: if (pos > 0) {
@@ -2347,11 +2419,16 @@ async function boot(msg) {
     if (!Module.wasmExports.__rb_touch) { rb.on = false; rb.why = 'no __rb_touch export'; }
     else {
       rbPoolInit();
+      rbFpVerify = !!(msg.rbFpVerify || (msg.rbTest && msg.rbTest.fpverify));
+      rbFpNoCache = !!(msg.rbFpNoCache || (msg.rbTest && msg.rbTest.fpnocache));
       if (msg.rbTest) {
         rb.test = { dMax: Math.max(1, msg.rbTest.dMax | 0 || 7), seed: (msg.rbTest.seed >>> 0) || 1, broken: msg.rbTest.broken || null,
                     selfcheck: msg.rbTest.selfcheck | 0, oracle: !!msg.rbTest.oracle,
                     known: -1, keep: 0, pred: new Map(), fps: [], resimInput: null };
         if (!rbI32) rbI32 = new Int32Array(new SharedArrayBuffer(32768));
+        // rbTest.fp = N: run the ring's fingerprint sweep (one per N frames) as a room does, so the
+        // rig prices it and — with fpverify — checks every cached page hash against a fresh one.
+        if (msg.rbTest.fp > 0) { rbI32[RBC.FP_EVERY] = msg.rbTest.fp | 0; rbI32[RBC.FP_ALIGN] = 0; }
         log('rollback ring: DETERMINISM RIG — port 0 input arrives up to ' + rb.test.dMax + ' frames late and is predicted until it does' +
             (rb.test.broken ? '; BROKEN CONTROL: ' + rb.test.broken : ''));
       }

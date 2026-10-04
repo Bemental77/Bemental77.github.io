@@ -47,6 +47,10 @@ const PORT = parseInt(process.env.PORT || '18911', 10);
 const WEB_ROOT = process.env.WEB_ROOT || REPO;
 const OUT = process.env.OUT || path.join(os.tmpdir(), 'gc_rollback_det.json');
 const MARGIN = DMAX + 6;
+// FP: the rollback arm runs the ring's fingerprint sweep every FP frames, as a room does; FPVERIFY=1
+// re-hashes every page the sweep's cache answered and counts disagreements (must be 0).
+const FP = parseInt(process.env.FP || '60', 10);
+const FPVERIFY = process.env.FPVERIFY !== '0';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let pass = 0, fail = 0;
 const ok = (n, d) => { pass++; console.log(`  PASS  ${n}${d ? ' — ' + d : ''}`); };
@@ -103,7 +107,7 @@ async function runArm(name, extra) {
   return R;
 }
 
-const arms = [['ref', ''], ['rb', `&rbtest=1&rbdmax=${DMAX}&rbseed=${SEED}${process.env.RBEXTRA || ''}`]]
+const arms = [['ref', ''], ['rb', `&rbtest=1&rbdmax=${DMAX}&rbseed=${SEED}&rbfp=${FP}${FPVERIFY ? '&rbfpverify=1' : ''}${process.env.RBEXTRA || ''}`]]
   .concat(BROKEN.map((k) => ['broken-' + k, `&rbtest=1&rbdmax=${DMAX}&rbseed=${SEED}&rbbroken=${k}`]));
 const results = await Promise.all(arms.map(([n, e]) => runArm(n, e)));
 const md5After = await servedMd5();
@@ -124,6 +128,9 @@ for (const r of results) {
   { const g = []; for (let i = 0; i + W <= r.rows.length; i += W) if (r.rows[i] > 30 && r.rows[i + 4] > 0) g.push(r.rows[i + 4] / 1000);
     g.sort((a, b) => a - b); const q = (x) => g.length ? g[Math.min(g.length - 1, Math.floor(x * g.length))].toFixed(3) : '-';
     console.log(`      guest compute per frame (ms, frame > 30, every run incl. re-simulated): p50 ${q(0.5)} p90 ${q(0.9)} p99 ${q(0.99)}`); }
+  if (r.rb && r.rb.np) console.log(`      worker: guest run ${(r.rb.gpUs / 1000 / r.rb.np).toFixed(3)} ms/presented frame, ${(r.rb.grUs / 1000 / Math.max(1, r.rb.nr)).toFixed(3)} ms/re-simulated frame (frame-start work excluded); ` +
+                                  `frame start ${(r.rb.qUs / 1000 / (r.rb.np + r.rb.nr)).toFixed(3)} ms (fingerprint ${(r.rb.fpUsP / 1000 / r.rb.np).toFixed(3)} presented / ${(r.rb.fpUsR / 1000 / Math.max(1, r.rb.nr)).toFixed(3)} re-simulated); ` +
+                                  `fingerprint cache ${r.rb.fpHit} hits / ${r.rb.fpMiss} misses, ${r.rb.fpBad} stale`);
   for (const t of r.log) console.log(`      ${t.slice(0, 220)}`);
   report.arms.push({ name: r.name, done: r.done, error: r.error, rb: r.rb, rows: r.rows.length / W });
 }
@@ -153,6 +160,11 @@ function cmp(i) {
   return { compared, differ, first, pageDiffs, frames };
 }
 const rbArm = results[1];
+if (FP > 0 && FPVERIFY) {
+  (rbArm.rb && rbArm.rb.fpHit > 1000 && rbArm.rb.fpBad === 0)
+    ? ok('the-fingerprint-page-cache-is-never-stale', `${rbArm.rb.fpHit} cached page hashes re-checked against a fresh hash: all equal (${rbArm.rb.fpMiss} hashed)`)
+    : bad('the-fingerprint-page-cache-is-never-stale', JSON.stringify(rbArm.rb && { hit: rbArm.rb.fpHit, miss: rbArm.rb.fpMiss, bad: rbArm.rb.fpBad }));
+}
 const c1 = cmp(1);
 report.rb = c1;
 const rolled = rbArm.rb && rbArm.rb.rollbacks;

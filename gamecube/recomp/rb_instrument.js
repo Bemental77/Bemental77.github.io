@@ -27,8 +27,8 @@
 // The worker calls the exported __rb_touch for those pages BEFORE the JS write (recomp_worker.js
 // THE ROLLBACK RING). Data segments are written at instantiation, before any logging is armed.
 //
-// NOTHING ELSE CHANGES. No import is added (that would renumber every function), three functions
-// and two types are APPENDED, one export is added, and every instruction that is not a store or a
+// NOTHING ELSE CHANGES. No import is added (that would renumber every function), four functions
+// and three types are APPENDED, one export is added, and every instruction that is not a store or a
 // bulk-memory op is copied byte for byte. The guest's own memory is bit-identical to the
 // uninstrumented module's at every point (the rig compares them: tools/gc_rollback_det_test.mjs);
 // the only bytes that differ are the logging region below MEM1, which no fingerprint covers.
@@ -132,6 +132,17 @@
     return { locals: [[2, 0x7f]], code: c };
   }
 
+  // rb_touchn(ea, size): the slow path of a store — touch the page of its first byte and of its
+  // last byte, each only if not yet logged this frame.
+  function touchnBody(touchIdx) {
+    const c = [];
+    c.push(LOCAL_GET, 0, I32_CONST, RB.PAGE_SHIFT, 0x76, LOCAL_TEE, 2);
+    c.push(0x2d, ...ma(0, RB.BITMAP), 0x45, 0x04, 0x40, LOCAL_GET, 2, 0x10); uleb(c, touchIdx); c.push(0x0b);
+    c.push(LOCAL_GET, 0, LOCAL_GET, 1, 0x6a, I32_CONST, 1, 0x6b, I32_CONST, RB.PAGE_SHIFT, 0x76, LOCAL_TEE, 3);
+    c.push(0x2d, ...ma(0, RB.BITMAP), 0x45, 0x04, 0x40, LOCAL_GET, 3, 0x10); uleb(c, touchIdx); c.push(0x0b);
+    c.push(0x0b);
+    return { locals: [[2, 0x7f]], code: c };
+  }
   // ---- the instrumenter ----------------------------------------------------------------------
   // Store opcodes: [bytes written, value type of the stored operand]
   const STORE = { 0x36: [4, 0x7f], 0x37: [8, 0x7e], 0x38: [4, 0x7d], 0x39: [8, 0x7c],
@@ -178,8 +189,8 @@
     const fS = sec(3); if (!fS) throw new Error('no function section');
     p = fS.start; const nFuncs = rd(); const funcType = new Uint32Array(nFuncs);
     for (let i = 0; i < nFuncs; i++) funcType[i] = rd();
-    const touchIdx = nImpFuncs + nFuncs, copyIdx = touchIdx + 1, fillIdx = touchIdx + 2;
-    const tTouch = nTypes, tBulk = nTypes + 1;
+    const touchIdx = nImpFuncs + nFuncs, copyIdx = touchIdx + 1, fillIdx = touchIdx + 2, touchnIdx = touchIdx + 3;
+    const tTouch = nTypes, tBulk = nTypes + 1, tTouchn = nTypes + 2;
 
     // ---- code: rewrite every body
     const cS = sec(10); if (!cS) throw new Error('no code section');
@@ -234,18 +245,27 @@
           const me = p;
           const [size, vt] = STORE[op];
           flush(at);
+          // ONE CHECK, ONE BRANCH. The fast path is: the page of the first byte is already logged
+          // AND the store does not cross into the next page ((ea & 0xFFF) <= 4096 - size, which
+          // with size <= 8 means it stays inside one page). Anything else — a first write, or a
+          // store straddling two pages (misaligned: legal in wasm whatever the align hint says,
+          // so the hint is never trusted) — calls rb_touchn(ea, size), which logs exactly the
+          // pages the store touches. It used to be two independent bitmap checks per multi-byte
+          // store (first byte, last byte): two loads and two branches on every store.
           const c = [];
           c.push(LOCAL_SET); uleb(c, L_V[vt]);
           c.push(LOCAL_TEE); uleb(c, L_A);
           if (off) { c.push(I32_CONST); sleb32(c, off | 0); c.push(0x6a); }
-          c.push(I32_CONST, RB.PAGE_SHIFT, 0x76, LOCAL_TEE); uleb(c, L_PG);
-          c.push(0x2d, ...ma(0, RB.BITMAP), 0x45, 0x04, 0x40, LOCAL_GET); uleb(c, L_PG); c.push(0x10); uleb(c, touchIdx); c.push(0x0b);
+          c.push(LOCAL_TEE); uleb(c, L_PG);                                   // ea
+          c.push(I32_CONST, RB.PAGE_SHIFT, 0x76, 0x2d, ...ma(0, RB.BITMAP));   // bitmap[ea >>> 12] (0/1)
           if (size > 1) {
-            c.push(LOCAL_GET); uleb(c, L_A);
-            c.push(I32_CONST); sleb32(c, (off + size - 1) | 0);
-            c.push(0x6a, I32_CONST, RB.PAGE_SHIFT, 0x76, LOCAL_TEE); uleb(c, L_PG);
-            c.push(0x2d, ...ma(0, RB.BITMAP), 0x45, 0x04, 0x40, LOCAL_GET); uleb(c, L_PG); c.push(0x10); uleb(c, touchIdx); c.push(0x0b);
+            c.push(LOCAL_GET); uleb(c, L_PG);
+            c.push(I32_CONST); sleb32(c, 0xFFF); c.push(0x71);                 // ea & 0xFFF
+            c.push(I32_CONST); sleb32(c, 4096 - size); c.push(0x4d);          // <= 4096 - size (0/1)
+            c.push(0x71);                                                       // and
           }
+          c.push(0x45, 0x04, 0x40, LOCAL_GET); uleb(c, L_PG);
+          c.push(I32_CONST, size, 0x10); uleb(c, touchnIdx); c.push(0x0b);
           c.push(LOCAL_GET); uleb(c, L_A);
           c.push(LOCAL_GET); uleb(c, L_V[vt]);
           body.arr(c);
@@ -297,6 +317,7 @@
     code.arr(enc(touchBody()));
     code.arr(enc(bulkBody(touchIdx, false)));
     code.arr(enc(bulkBody(touchIdx, true)));
+    code.arr(enc(touchnBody(touchIdx)));
 
     // ---- reassemble
     const out = new Sink(code.n + (u8.length - (cS.end - cS.start)) + 4096);
@@ -305,16 +326,17 @@
     for (const s of sections) {
       if (s.id === 1) {
         const pl = new Sink(s.end - s.start + 16);
-        pl.uleb(nTypes + 2);
+        pl.uleb(nTypes + 3);
         p = s.start; rd(); pl.bytes(u8, p, s.end);
         pl.arr([0x60, 1, 0x7f, 0]);              // touch: (i32) -> ()
         pl.arr([0x60, 3, 0x7f, 0x7f, 0x7f, 0]);  // bulk: (i32 i32 i32) -> ()
+        pl.arr([0x60, 2, 0x7f, 0x7f, 0]);        // touchn: (i32 i32) -> ()
         emitSec(1, pl.out());
       } else if (s.id === 3) {
         const pl = new Sink(s.end - s.start + 16);
-        pl.uleb(nFuncs + 3);
+        pl.uleb(nFuncs + 4);
         p = s.start; rd(); pl.bytes(u8, p, s.end);
-        pl.uleb(tTouch); pl.uleb(tBulk); pl.uleb(tBulk);
+        pl.uleb(tTouch); pl.uleb(tBulk); pl.uleb(tBulk); pl.uleb(tTouchn);
         emitSec(3, pl.out());
       } else if (s.id === 7) {
         const pl = new Sink(s.end - s.start + 32);
@@ -326,7 +348,7 @@
         emitSec(7, pl.out());
       } else if (s.id === 10) {
         const pl = new Sink(code.n + 8);
-        pl.uleb(nFuncs + 3); pl.bytes(code.b, 0, code.n);
+        pl.uleb(nFuncs + 4); pl.bytes(code.b, 0, code.n);
         emitSec(10, pl.out());
       } else {
         out.bytes(u8, s.hdr, s.end);            // copied verbatim, header included
