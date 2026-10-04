@@ -300,20 +300,25 @@ function schedule() {
 // After 250 ms of holding the field runs anyway (a lost context, a driver that never signals).
 //
 // THE BOUND IS A TIME, NOT A DEPTH (2026-10-04). It was "more than 2 fences outstanding". On
-// this box's SwiftShader that held the guest to 0.71x (MK64 race, worker threads at half a core:
-// held ~1150x, 31 s of a 55 s window) while with no guard at all the guest held 1.000x and the
-// queue did not grow without limit (it settled at ~20 fields): a GPU that keeps up, but only with
-// many frames in flight, was treated as one that does not. Measured per bound (fps of guest /
-// hardware, fence latency p50 / p99, two runs each): depth 2 0.71x 73/136 ms; 250 ms 0.89-0.92x
-// 187-217/343-355; 500 ms 0.96-0.97x 298-333/576-578; 1000 ms 1.00x 397-446/934-967; none 1.00x
-// 368-567/1040-1409. What must never happen is the queue growing WITHOUT LIMIT (a GPU slower than
-// the guest: seconds of lag, a WebGL call that blocks for seconds). So a field is held only when
-// the oldest unsignalled fence is older than GQ.capMs (1000): a GPU that keeps up within that is
-// never waited for, whatever its depth; one that falls behind is held at ~1 s of lag at most.
-// Below 3 outstanding nothing is ever held, and nothing is asked of GL while the oldest fence is
-// younger than capMs (the age is this thread's own clock). ?gpuqms=N sets the bound;
-// ?gpuq=N is the old fixed-depth guard (the A/B arm); ?gpuq=0 no guard (control arm).
-var GQ = { on: true, max: 2, capMs: 1000, fences: [], times: [], held: 0, heldMs: 0, holdFrom: 0, forced: 0, gl: null, timer: false, lastAge: 0 };
+// this box's SwiftShader that held the guest to 0.66-0.72x with ~100 audio underruns in 30 s while
+// with no guard the guest held 1.000x and the queue did not grow without limit. But the GPU's time
+// is one budget: every field it renders is time it does not spend compositing, so a deeper queue
+// buys guest speed with pictures that reach the screen. MEASURED, solo MK64, full CPU
+// (n64_present_probe, 30 s, two runs each): guest speed / pictures that changed ON SCREEN per
+// second / worklet underruns —
+//   depth 2 (before)   0.66-0.72x   13.0-14.1   94-109
+//   100 ms             0.80-0.91x   11.2        39-58
+//   250 ms             0.99x        6.8-7.3     4-10      <- shipped
+//   1000 ms            0.99-1.00x   4.9-5.1     0
+// and in the field-cost rig (MK64 race, worker threads at half a core) 250 ms held 0.89-0.92x,
+// 1000 ms 1.00x, depth 2 0.71x. 250 ms keeps the guest (and its audio) at ~1.000x wherever the CPU
+// allows it, and bounds what a slow GPU can add to the picture's lag at a quarter of a second.
+// So a field is held only when the oldest unsignalled fence is older than GQ.capMs (250); below 3
+// outstanding nothing is ever held, and nothing is asked of GL while the oldest fence is younger
+// than capMs (the age is this thread's own clock). ?gpuqms=N sets the bound (a larger N trades
+// shown pictures for guest speed on a GPU that cannot do both); ?gpuq=N is the old fixed depth
+// (the A/B arm); ?gpuq=0 no guard (control arm).
+var GQ = { on: true, max: 2, capMs: 250, fences: [], times: [], held: 0, heldMs: 0, holdFrom: 0, forced: 0, gl: null, timer: false, lastAge: 0 };
 function gqGl() {
   if (GQ.gl) return GQ.gl;
   var g = M && M.ctx;
