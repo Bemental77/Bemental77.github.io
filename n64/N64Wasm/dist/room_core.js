@@ -168,12 +168,19 @@
       // re-anchoring: the guest resumes at exactly 1.000x from here, and the
       // seconds lost stay lost — which is correct, because every machine in the
       // room lost them.
-      if (now - due > Math.max(period * 2, LS_REPAY_MS)) {
+      // ONLY THE PART OLDER THAN THE ALLOWANCE IS DISCARDED (2026-10-04). Lateness up to
+      // two periods has always been run off back to back (the loop below runs every frame
+      // due); it re-anchored at `now` and dropped the allowance too, so a frame 34 ms late
+      // lost 34 ms where 33 ms lost nothing — two periods more per stall than this rule,
+      // invisible as a slow frame. Now the schedule keeps exactly the allowance: the burst
+      // after any stall is the burst after a 2-period one (3 frames), never more.
+      var keep = Math.max(period * 2, LS_REPAY_MS);
+      if (now - due > keep) {
         // The debt being discarded is time this console LOST WITHOUT WAITING — a
         // frame that ran late on this device. Counted, and published to the room
         // (ls.selfLostMs), so a late-running device is named as such.
-        LS.lostMs = (LS.lostMs || 0) + (now - due);
-        LS.baseWall = now; LS.baseFrame = LS.frame; LS.reanchors++;
+        LS.lostMs = (LS.lostMs || 0) + (now - due - keep);
+        LS.baseWall = now - keep; LS.baseFrame = LS.frame; LS.reanchors++;
       }
       return true;
     }
@@ -1765,6 +1772,20 @@
       // allocated to find the answer — see N64S_RAW_RESERVE.)
       if (N64S.raw) held = Math.max(2, Math.min(budget, n64sRawCapacity()));
       RB.preCap = held;
+      // THE RING'S FIRST SLOTS ARE WRITTEN NOW, BEFORE READY, NOT BY THE ROOM'S FIRST FRAMES. A
+      // slot is fresh heap and the first save into it page-faults all of it: MEASURED (this box,
+      // SM64, 21.4 MB raw state) 18.2-19.2 ms into a fresh buffer against 2.6-3.0 ms into the same
+      // one again. The ring starts one snapshot a frame (K=1) across its whole reach, so the first
+      // ~13 frames of every room each cost 17-31 ms of saving (core_worker tick timing: save
+      // 17.0-31.5 ms a frame) and the 1.000x governor, which never repays a late frame, dropped
+      // 170-370 ms per console. Written here, unpaced, they go back to the pool rbPick takes from:
+      // the slots the first frames would allocate anyway (never more than `held`), nothing more.
+      if (N64S.raw) {
+        var tw = performance.now(), warm = [], wb;
+        for (var wi = Math.min(held, RB_WINDOW + 6); wi > 0 && (wb = n64sRawAlloc()); wi--) { wb.fill(0); warm.push(wb); }
+        for (wi = 0; wi < warm.length; wi++) n64sFree(warm[wi]);
+        env.log('[rollback] ' + warm.length + ' ring slots written ahead (' + Math.round(performance.now() - tw) + ' ms, before Ready)');
+      }
       rbPublishCap('measured before Ready', held);
       LS_RB.proven = true; LS_RB.ms = performance.now() - t0;
       env.log('[rollback] savestate path proven before declaring (' + Math.round(LS_RB.ms) + ' ms' + (N64S.raw ? ', raw API' : ', heap scans included')
