@@ -460,6 +460,7 @@ try {
     latFrames: (z.lat && z.lat.samples || []).map((x) => x.frames),
     tappedFrames: Object.keys(room.full).length, confirmedTo: room.confirmed,
     fskip: z.fskip,     // room_core.js RFS: the room's frame skip (skipped / re-runs / lost)
+    fsReruns: (room.rblog || []).filter((e) => e[0] === 'fsrerun').slice(0, 60),
   });
   // what the rollback-default decision needs, in one place (n64/docs/rollback-default/)
   const presA = a.pres, presZ = z.pres;

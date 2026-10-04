@@ -711,6 +711,21 @@
     //   * Run-ahead (opt-in, ?ra) presents its last hidden frame: no skipping while it runs.
     // ?rfskip=0 is the arm (the room guard as it was); the worker's ?fskip=0 turns both off and
     // ?fskip=force:K forces it (all but 1 of K presented frames, every re-sim / hidden frame).
+    // MEASURED (this box: 4 vCPU, SwiftShader; hermetic snapshots, probe lock held, interleaved,
+    // load 0.8-5.2). n64_rollback_probe, MK64, a 2-player room with a ghost player, 30 s, two runs
+    // each; rate = engine frames / wall / 50 Hz; latency = a presented picture's tick -> its fence
+    // signalled / committed, p50 / p99 ms:
+    //                          rate            lost in 30 s     latency p50 / p99
+    //   rollback  HEAD guard    0.876-0.899x    13.9-14.5 s      (no witness)
+    //             ?rfskip=0     0.879x, 0.880x  13.6-14.4 s      414-454 / 973-980
+    //             frame skip    0.977-0.985x    2.5-2.6 s        213-236 / 710-980
+    //   delay     HEAD guard    0.888-0.890x    2.4 s            (no witness)
+    //             ?rfskip=0     0.877-0.898x    2.5-2.8 s        196-199 / 381-394
+    //             frame skip    0.953-0.970x    0.6-0.8 s        93-104 / 331-374
+    // lib/bench.js room (SM64, the loopback room: both consoles on this one box), 30 s:
+    // HEAD 0.808x, 0.868x -> frame skip 0.990x, 0.991x. What is left is not the GPU: it is the
+    // re-runs (8-12 in 30 s in the rollback room, ~1 s together; a blank capture that outlives 16
+    // frames on a GPU this far behind) and the CPU two consoles share.
     var RFS = { on: !!env.fs && RB_Q.get('rfskip') !== '0', why: null, skipped: 0, hiddenSkipped: 0, resimSkipped: 0,
                 reruns: 0, rerunFrames: 0, rerunMs: 0, maxRerunMs: 0, repairs: 0, readbacks: 0, lost: 0,
                 suspendUntil: -1, backoff: 64, need: Infinity, stale: false, staleS: -1, inRerun: false, inResim: false,
@@ -768,10 +783,15 @@
       if (t === 'read') RFS.readbacks++;
       return rfsRerun(ls, k, t === 'read' ? 'read-back' : 'blank capture');
     }
-    // resave: the start of k+1 was saved already (rfsSettle runs after the frame's own save)
+    // resave: the start of k+1 was saved already (rfsSettle runs after the frame's own save).
+    // (TRIED AND REJECTED: an age repair that draws only up to its oldest frame + 4 and re-runs the
+    // rest skipping again. MEASURED, MK64 rollback rooms, forced: re-runs 9 -> 14 and 8 -> 13, their
+    // total time 1037 -> 1253 ms and 447 -> 829 ms — the frames it skipped again left a stale window
+    // that needed its own repair a few frames later.)
     function rfsRerun(ls, k, why, resave) {
       var from = Math.min(RFS.need, RFS.stale ? RFS.staleS : Infinity, RFS.curSkip ? RFS.cur : Infinity, k);
       var s = rbAtOrBelow(from), j, t0 = performance.now(), M = G.Module;
+      RFS.dbgNeed = RFS.need; RFS.dbgStale = RFS.stale ? RFS.staleS : -1;
       if (!s) { RFS.lost++; return 'a frame-skip re-run to frame ' + from + ' found no snapshot at or before it'; }
       for (j = s.frame; j <= k; j++) if (RB.imgF[j % RB_IMG] !== j) { RFS.lost++; return 'a frame-skip re-run: the input frame ' + j + ' ran with is no longer held'; }
       RFS.inRerun = true;
@@ -794,7 +814,7 @@
       RFS.need = Infinity; rfsNote();
       var ms = performance.now() - t0;
       RFS.reruns++; RFS.rerunFrames += k - s.frame + 1; RFS.rerunMs += ms; if (ms > RFS.maxRerunMs) RFS.maxRerunMs = ms;
-      if (G.__n64RbLog) G.__n64RbLog.push(['fsrerun', k, s.frame, why]);
+      if (G.__n64RbLog) G.__n64RbLog.push(['fsrerun', k, s.frame, why, from, RFS.dbgNeed, RFS.dbgStale]);
       if (why === 'read-back') {
         RFS.suspendUntil = k + RFS.backoff; RFS.backoff = Math.min(RFS.backoff * 2, 1 << 24);
         env.log('[fskip] room: a read-back reached a skipped frame: re-ran frames ' + s.frame + '..' + k + ' drawing ('

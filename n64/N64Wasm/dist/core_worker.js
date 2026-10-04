@@ -1125,6 +1125,13 @@ function roomWatchContext() {
 }
 
 // ---- ?costdbg=1: WHERE A SLOW FIELD'S TIME WENT (a measurement arm, OFF when shipped) -----
+// THE ~25-32 ms "core" FIELDS AT THE START (bench, solo: SM64 at t=3.7-3.8 s, MK64 at t=5.6 s after
+// Start, 2 of 2 runs each) ARE V8 COMPILING THE CORE'S OWN WASM FUNCTIONS THE FIRST TIME THEY RUN
+// (lazy compilation): with Chrome's --js-flags=--no-wasm-lazy-compilation both are gone (2 of 2),
+// while MK64's at t=16 s and t=30.6 s stay (the attract loop's heavy fields). A page cannot set V8
+// flags, and the guest loses nothing to them (solo 0.998-1.000x on the field clock in the same
+// runs: the frame clock's two-period allowance absorbs a 30 ms field).
+
 // A real phone (Mali-G715, MK64 PAL, room guest) logged 902 fields over a field period and one
 // of 620 ms. This splits every field's wall time (one _neil_ls_run_frame) into the up-calls
 // that can be slow inside it — the JIT compiling a block (myApp.jitCompile, a synchronous
