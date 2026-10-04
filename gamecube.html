@@ -7446,7 +7446,41 @@ window.GcRate = (function () {
     setTimeout(pollController, 10);
     [$('btnSave'), $('btnLoad'), $('btnExport'), $('btnImport'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
   }
-  var started = false; async function startEmulator() { if (started) return; started = true;
+  // NO START BEFORE SharedArrayBuffer EXISTS (2026-10-04). On a visitor's FIRST load the page is
+  // not yet cross-origin isolated: coi-serviceworker.js registers its worker and reloads ~0.5-1 s
+  // later (twice when it finds an "updated" worker). Until then SharedArrayBuffer is not even
+  // DEFINED, while Start is already enabled (the capability gate waits on async probes). A Start
+  // pressed in that window — a fast click, or ?bench=1&benchauto=1, which presses it as soon as it
+  // is visible — ran the whole boot on a page that was about to be thrown away, and the recomp
+  // routing's engine() died on `new SharedArrayBuffer(1024)` (live prod b67c3f1:
+  // "ReferenceError: SharedArrayBuffer is not defined at engine (gamecube.html:8698)", then
+  // dolphin's var_setup DataCloneError). Nothing may start until the buffer exists: hold here, let
+  // the isolation reload replace this document, and say so if it never comes. The test is the
+  // FUNCTIONAL one (the constructor exists), not crossOriginIsolated — see lib/capability.js
+  // coi/functional-sab-overrides-false-flag.
+  var _gcIsoWait = null;
+  function gcAwaitIsolation() {
+    if (_gcIsoWait) return;
+    var t0 = Date.now();
+    var reloadExpected = !!(window.isSecureContext && navigator.serviceWorker);
+    console.warn('[gc-start] Start held: SharedArrayBuffer is not available yet (crossOriginIsolated=' +
+                 window.crossOriginIsolated + ')' + (reloadExpected ? ' — waiting for the isolation reload' : ''));
+    setStatus(reloadExpected ? 'Preparing the page (enabling cross-origin isolation)…'
+                             : 'This page needs SharedArrayBuffer, which this browser has not enabled here.');
+    _gcIsoWait = setInterval(function () {
+      if (typeof SharedArrayBuffer === 'function') {   // isolated in place (rare) — start for real
+        clearInterval(_gcIsoWait); _gcIsoWait = null; startEmulator(); return;
+      }
+      if (Date.now() - t0 > 15000) {
+        clearInterval(_gcIsoWait); _gcIsoWait = null;
+        console.warn('[gc-start] no isolation after 15 s — the emulator cannot start on this page load');
+        setStatus('Cross-origin isolation did not activate, so the emulator cannot start. Reload the page to try again.');
+      }
+    }, 100);
+  }
+  var started = false; async function startEmulator() { if (started) return;
+    if (typeof SharedArrayBuffer !== 'function') { gcAwaitIsolation(); return; }
+    started = true;
     // XBOX: stick drives the GAME from here, not Edge's cursor (lib/xboxinput.js).
     try { window.XboxInput && XboxInput.offerGameControls('gamecube start'); } catch (e) {}
     // Baseline for the present watchdog's boot window (gcPresentHealth): "no first frame after
@@ -8648,6 +8682,15 @@ window.GcRate = (function () {
   }
 
   function engine() {
+  // Every channel below (pace, staging, rollback ring) is a SharedArrayBuffer. On a page that is
+  // not isolated yet (the first load, before coi-serviceworker's reload) the constructor is not
+  // defined; startEmulator holds Start in that window, and this is the second guard for the
+  // ?recomp=1 path, which engages at load without waiting for Start.
+  if (typeof SharedArrayBuffer !== 'function') {
+    console.warn('[recomp-live] not engaging: SharedArrayBuffer is not available on this page load ' +
+                 '(crossOriginIsolated=' + window.crossOriginIsolated + ')');
+    return;
+  }
   // [rate-split 2026-08-28] THE GUEST CLOCK AND THE REPORTED RATE ARE TWO KNOBS. They used to
   // be one, which is the bug: the credit grant IS emulated time (each pumped frame advances
   // the recomp's frame-driven clock by exactly 1/GUEST_HZ), so "raise the fps" literally meant
