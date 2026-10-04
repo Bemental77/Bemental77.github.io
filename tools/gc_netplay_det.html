@@ -44,7 +44,7 @@
       var y = SEED || 1;
       var rnd3 = function () { y ^= y << 13; y >>>= 0; y ^= y >>> 17; y ^= y << 5; y >>>= 0; return y; };
       var B3 = [0x1000, 0x100, 0x100, 0x100, 0x200, 0x400, 0x800, 0x40, 0x20, 0x10, 0, 0];
-      for (var g = 600; g < FRAMES + 2; g++) {
+      for (var g = parseInt(q.get('mashfrom') || '600', 10); g < FRAMES + 2; g++) {
         var r3 = rnd3();
         if ((r3 & 3) === 0) s[g] = [B3[(r3 >>> 2) % B3.length], (r3 >>> 8) & 0xf, ((r3 >>> 12) & 0x7f) - 64, ((r3 >>> 20) & 0x7f) - 64];
       }
@@ -94,6 +94,7 @@
         R.pageMeta[d.frame] = { lowTop: d.lowTop, memSize: d.memSize, nonZeroPages: d.nonZeroPages,
                                 snapBytes: d.snapBytes, snapMs: d.snapMs, restoreMs: d.restoreMs };
       } else if (d.cmd === 'rbStats') { R.rb = d.s;
+      } else if (d.cmd === 'detDump') { R.dump = { frame: d.frame, sp: d.sp, hex: Array.from(new Uint8Array(d.bytes), function (b) { return (b < 16 ? '0' : '') + b.toString(16); }).join('') };
       } else if (d.cmd === 'detDone') { R.done = true; R.doneAt = performance.now(); say('done at frame ' + d.frame); }
       else if (d.cmd === 'card') { R.card = new Uint8Array(d.img); R.cardSeq = d.seq; }   // the game's own save, as a fixture
       else if (d.cmd === 'log') { R.log.push(d.txt); if (/main stopped|boot failed|ROLLBACK RING FAULT/.test(d.txt)) R.error = d.txt; }
@@ -110,13 +111,15 @@
                     cardTime: CT === 'wall' ? null : (parseInt(CT, 10) >>> 0),
                     autoboard: SCRIPT !== 'none' && SCRIPT !== 'mash3', inputScript: script(),
                     spinAudio: q.has('spinaudio') ? q.get('spinaudio') === '1' : undefined,
-                    det: { until: FRAMES, pageEvery: parseInt(q.get('pageevery') || '300', 10), hash: q.get('hash') !== '0' },
+                    det: { until: FRAMES, pageEvery: parseInt(q.get('pageevery') || '300', 10), hash: q.get('hash') !== '0',
+                           watch: q.get('watch') ? parseInt(q.get('watch'), 16) : 0,
+                           dump: q.get('dump') ? { a: parseInt(q.get('dump').split('@')[0], 16), f: parseInt(q.get('dump').split('@')[1], 10) } : null },
                     peekAddrs: [], testFullMem: false, audioTest: false, xfShadowAll: true,
                     // rbtest=1: THE ROLLBACK RING's determinism arm (recomp_worker.js rbTest) — port 0's
                     // input arrives up to rbdmax frames late, is predicted, and wrong guesses are rewound
                     // and re-simulated. rbbroken=nocorrect|nojs|noundo is the control that must fail.
                     rbTest: q.get('rbtest') === '1' ? { dMax: parseInt(q.get('rbdmax') || '7', 10), seed: parseInt(q.get('rbseed') || '7', 10),
-                                                       broken: q.get('rbbroken') || null } : null,
+                                                       broken: q.get('rbbroken') || null, selfcheck: parseInt(q.get('rbselfcheck') || '0', 10), oracle: q.get('rboracle') === '1' } : null,
                     glueUrl: '/gamecube/recomp/mp4_game.js', wasmUrl: '/gamecube/recomp/mp4_game.wasm' },
                   parts.concat([fst]));
     if (PACE === 'hw') {
