@@ -225,7 +225,7 @@ n64wasm.js: $(FILES)
     '_neil_set_native_fbread','_neil_native_fbread_failed','_neil_set_vbo_mode', \
     '_neil_set_gl_shadow','_neil_gl_shadow_sent','_neil_gl_shadow_dropped','_neil_set_gl_merge', \
     '_neil_lfb_snapshot','_neil_lfb_restore','_neil_lfb_release','_neil_lfb_flush','_neil_lfb_stats','_neil_lfb_pending', \
-    '_neil_shader_dump','_neil_shader_stats', \
+    '_neil_shader_dump','_neil_shader_stats','_neil_fs_set','_neil_fs_taints','_neil_fs_oldest','_neil_rand_lo','_neil_rand_hi','_neil_rand_set','_neil_gl_state_size','_neil_gl_state_save','_neil_gl_state_load', \
     '_malloc','_free']" \
 	-s INVOKE_RUN=0 \
     && sed -i "s/locateFile(\"n64wasm.wasm\")/locateFile(\"n64wasm.wasm?v=$$(md5sum n64wasm.wasm | cut -c1-8)\")/" n64wasm.js \

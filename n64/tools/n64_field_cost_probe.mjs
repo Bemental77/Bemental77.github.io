@@ -75,6 +75,18 @@ const NOPIC = argv.includes('--nopic');       // no picture readback per field (
 // arms then compare what RDRAM holds once every copy owed is made: a lazy arm against the
 // eager one (?fblazy=0, or a core without the lazy copy).
 const RDHASH = +flag('rdhash', '0');
+// --statehash N: every N measured fields, the RAW MACHINE STATE (neil_state_save_raw: RDRAM as the
+// guest has observed it, every register, RSP memory, the TLB, the event queue, save memory — the
+// trailer's fast-save bookkeeping words left out, as room_core.js n64sHashFull) and the lazy copy
+// queue's pending ranges are hashed WITHOUT flushing anything: two arms that differ only in which
+// fields drew (frame skip) must agree on it exactly at every checkpoint.
+const STATEHASH = +flag('statehash', '0');
+// --glhash: every measured field, a hash of glide's RDP state (lazy_fb.c neil_gl_state_save: g_gdp,
+// gDP, gSP, rdp up to its pointers) — where two arms' pictures differ, where glide's state did
+const GLHASH = argv.includes('--glhash');
+// --glrec F: every WebGL call made during field F (name and scalar arguments; typed arrays hashed) —
+// res.glrec, so two arms' command streams can be diffed (diagnostic)
+const GLREC = +flag('glrec', '-1');
 const LOGRE = new RegExp(flag('logre', '\\[(gl|lfb|fb|jit|shader)\\]'));
 const LOGMAX = +flag('logmax', '60');
 const TRACEGL = flag('tracegl', '');
@@ -169,12 +181,33 @@ function plan(name, frames) {
 const PLAN = plan(PLAN_NAME, FRAMES);
 
 // Runs in the worker realm. Steps frames [from, to), paced, one field per task.
-const RUN = function (from, to, plan, measureFrom, shots, paced, nopic, rdhash, TRACEGL, GLCENSUS, finish) {
+const RUN = function (from, to, plan, measureFrom, shots, paced, nopic, rdhash, TRACEGL, GLCENSUS, finish, statehash, glhash, glrec) {
   const M = self.Module, D = self.DBG || null;
   const per = 1000 / ((self.CLK && self.CLK.viHz > 0) ? self.CLK.viHz : 60);
   const gl = M.ctx;
   const FB = self.__fbAsync;
-  const out = { from, to, dt: [], gw: [], fp: [], pic: [], bk: [], shots: {}, per, rd: [] };
+  const out = { from, to, dt: [], gw: [], fp: [], pic: [], bk: [], shots: {}, per, rd: [], sh: [], gh: [] };
+  const glHash = () => {
+    if (!M._neil_gl_state_size) return -1;
+    const n = M._neil_gl_state_size();
+    if (!self.__glBuf) self.__glBuf = M._malloc(n + 8);
+    M._neil_gl_state_save(self.__glBuf);
+    const u = M.HEAPU8; let h = 0x811c9dc5 | 0;
+    for (let i = self.__glBuf; i < self.__glBuf + n; i++) h = Math.imul(h ^ u[i], 16777619);
+    return h >>> 0;
+  };
+  const stHash = () => {
+    if (!M._neil_state_save_raw) return -1;
+    const n = M._neil_state_size() >>> 0;
+    if (!self.__stBuf) self.__stBuf = M._malloc(n);
+    if (!self.__stBuf || !(M._neil_state_save_raw(self.__stBuf) | 0)) return -2;
+    const R = M._neil_state_m64p_region ? M._neil_state_m64p_region() >>> 0 : 16789504;
+    const w = M.HEAPU32, i0 = self.__stBuf >> 2, skip0 = i0 + ((R + 16) >> 2), skip1 = i0 + ((R + 28) >> 2), i1 = i0 + (n >> 2);
+    let h = 0x811c9dc5 | 0;
+    for (let i = i0; i < i1; i++) { if (i >= skip0 && i < skip1) continue; h = Math.imul(h ^ w[i], 16777619); }
+    if (M._neil_lfb_pending) { const p = M._malloc(256); const k = M._neil_lfb_pending(p, 16); for (let j = 0; j < Math.min(k, 16) * 2; j++) h = Math.imul(h ^ M.HEAPU32[(p >> 2) + j], 16777619); h = Math.imul(h ^ k, 16777619); M._free(p); }
+    return h >>> 0;
+  };
   // RDRAM itself (8 MiB at the JIT bridge's dramBase), so two core builds compare
   const rdHash = () => {
     const P = self.__n64CorePtrs;
@@ -233,6 +266,17 @@ const RUN = function (from, to, plan, measureFrom, shots, paced, nopic, rdhash, 
       P[nm] = function () { if (self.__glc.on) self.__glc.n[nm] = (self.__glc.n[nm] || 0) + 1; return f.apply(this, arguments); };
     }
   }
+  if (glrec >= 0 && !self.__glr) {
+    self.__glr = { on: false, log: [] };
+    const P = WebGL2RenderingContext.prototype;
+    const fmt = (a) => { if (a == null || typeof a !== 'object') return String(a); if (ArrayBuffer.isView(a)) { let h = 0x811c9dc5 | 0; const u = new Uint8Array(a.buffer, a.byteOffset, a.byteLength); for (let i = 0; i < u.length; i++) h = Math.imul(h ^ u[i], 16777619); return 'buf' + u.length + ':' + (h >>> 0).toString(16); } return a.constructor ? a.constructor.name : 'obj'; };
+    for (const nm of Object.getOwnPropertyNames(P)) {
+      let d; try { d = Object.getOwnPropertyDescriptor(P, nm); } catch (e) { continue; }
+      if (!d || typeof d.value !== 'function' || nm === 'constructor') continue;
+      const fn = d.value;
+      P[nm] = function () { if (self.__glr.on && self.__glr.log.length < 20000) self.__glr.log.push(nm + '(' + Array.from(arguments).map(fmt).join(',') + ')'); return fn.apply(this, arguments); };
+    }
+  }
   if (!self.__drawN) {
     self.__drawN = { n: 0 };
     const P = WebGL2RenderingContext.prototype;
@@ -256,10 +300,14 @@ const RUN = function (from, to, plan, measureFrom, shots, paced, nopic, rdhash, 
       const b0 = D ? Object.assign({}, D.b) : null;
       const d0 = self.__drawN.n;
       if (self.__glc) self.__glc.on = meas;
+      if (self.__glr) self.__glr.on = f === glrec;
       const t0 = performance.now();
-      M._neil_ls_run_frame();
+      // the worker's own field (core_worker.js THE RENDER-LEVEL FRAME SKIP), so a skipping arm is
+      // stepped exactly as the shipped clock steps it
+      if (self.__n64RigField) self.__n64RigField(); else M._neil_ls_run_frame();
       const dt = performance.now() - t0;
       if (self.__glc) self.__glc.on = false;
+      if (self.__glr) self.__glr.on = false;
       // --finish: the GPU's own time for this field — glFinish right after it, timed apart
       let gw = 0;
       if (finish) {
@@ -281,9 +329,14 @@ const RUN = function (from, to, plan, measureFrom, shots, paced, nopic, rdhash, 
 
         out.fp.push(M._neil_last_fp() >>> 0);
         if (rdhash && ((f + 1) % rdhash) === 0) out.rd.push([f + 1, rdHash()]);
+        if (statehash && ((f + 1) % statehash) === 0) out.sh.push([f + 1, stHash()]);
+        if (glhash) out.gh.push(glHash());
         if (D) { const r = {}; for (const k in D.b) { const d = D.b[k] - b0[k]; if (d >= 0.05) r[k] = +d.toFixed(2); } out.bk.push(r); }
         const sh = shots.indexOf(f + 1) >= 0;
-        if ((nopic || self.__drawN.n === d0) && !sh) out.pic.push(null);
+        // a picture is hashed only for a field that drew INTO THE WINDOW (frame skip: a skipped
+        // field drew nothing, and two arms compare pictures only where both have one)
+        const drew = self.FSK ? self.FSK.lastDrew : self.__drawN.n !== d0;
+        if ((nopic || !drew) && !sh) out.pic.push(null);
         else {
           const p = picture(sh);
           if (sh) { out.shots[f + 1] = p; out.pic.push(p.h); } else out.pic.push(p);
@@ -313,6 +366,31 @@ function png(W, H, rgba) {
   return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ih), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
 }
 
+// --clock: a screen witness on the page's RAW requestAnimationFrame (n64_present_probe.mjs): the
+// pictures that changed ON SCREEN (the placeholder canvas, 96x72 hash), and the worklet's underruns.
+const SCREEN_PRE = `(() => {
+  const raf = window.requestAnimationFrame.bind(window);
+  const S = window.__scr = { on: false, frames: 0, changes: 0, last: -1, err: null };
+  let cv = null, cx = null;
+  (function f() {
+    raf(f);
+    if (!S.on) return;
+    try {
+      const src = document.getElementById('canvas');
+      if (!src) return;
+      if (!cv) { cv = document.createElement('canvas'); cv.width = 96; cv.height = 72; cx = cv.getContext('2d', { willReadFrequently: true }); }
+      cx.drawImage(src, 0, 0, 96, 72);
+      const d = cx.getImageData(0, 0, 96, 72).data;
+      let h = 0x811c9dc5 | 0;
+      for (let i = 0; i < d.length; i += 4) h = Math.imul(h ^ (d[i] | (d[i + 1] << 8) | (d[i + 2] << 16)), 16777619);
+      S.frames++;
+      if (h !== S.last) { S.changes++; S.last = h; }
+    } catch (e) { S.err = String(e && e.message || e).slice(0, 200); }
+  })();
+})();`;
+const pageSnap = (page) => page.evaluate(() => ({ t: performance.now(), scr: window.__scr ? window.__scr.changes : null, scrF: window.__scr ? window.__scr.frames : null,
+  u: window.__audioDbg ? window.__audioDbg.u : null }));
+
 const browser = await puppeteer.launch({
   headless: 'new', executablePath: fs.existsSync(CHROME) ? CHROME : undefined, protocolTimeout: 1800000,
   args: ['--no-sandbox', '--disable-dev-shm-usage', '--autoplay-policy=no-user-gesture-required',
@@ -335,6 +413,7 @@ try {
   if (CPU > 1) {
     page.on('workercreated', async (w) => { try { await w.client.send('Emulation.setCPUThrottlingRate', { rate: CPU }); res.throttled = (res.throttled || 0) + 1; } catch (e) { res.throttleErr = String(e.message || e).slice(0, 120); } });
   }
+  if (CLOCK) await page.evaluateOnNewDocument(SCREEN_PRE);
   const qs = 'worker=1&workerrig=' + (CLOCK ? 'clock' : '1') + (CLOCK && NODBG ? '' : '&costdbg=1') + (XQ ? '&' + XQ : '');
   await page.goto(`${BASE}/n64/?game=${encodeURIComponent(ROM)}&autostart&${qs}`, { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => { const s = window.__n64Worker && window.__n64Worker.state(); return s && (s.booted || s.fatal); }, { timeout: 240000 });
@@ -385,14 +464,26 @@ try {
     let profOnC = false;
     for (;;) {
       const st = await page.evaluate(() => window.__n64Worker.eval('({ f: CLK.frame, t: performance.now() })'));
-      if (!tMark.from && st.f >= FROM) tMark.from = st;
+      if (!tMark.from && st.f >= FROM) {
+        tMark.from = st;
+        // the measured window starts here: the worker's frame-skip counters and latency rings, the
+        // screen witness and the underrun count
+        await page.evaluate(() => window.__n64Worker.eval('typeof fsReset === "function" ? (fsReset(), FSK.series = [], 1) : 0'));
+        await page.evaluate(() => { if (window.__scr) window.__scr.on = true; });
+        tMark.page0 = await pageSnap(page);
+      }
       if (PROFILE && !profOnC && st.f >= FROM && coreWorker) {
         await coreWorker.client.send('Profiler.enable');
         await coreWorker.client.send('Profiler.setSamplingInterval', { interval: 500 });
         await coreWorker.client.send('Profiler.start');
         profOnC = true;
       }
-      if (st.f >= FRAMES) { tMark.to = st; break; }
+      if (st.f >= FRAMES) {
+        tMark.to = st;
+        tMark.page1 = await pageSnap(page);
+        res.fs = await page.evaluate(() => window.__n64Worker.eval('typeof fsReport === "function" ? Object.assign(fsReport(), { series: FSK.series || null }) : null'));
+        break;
+      }
       await new Promise((r) => setTimeout(r, 1000));
     }
     if (profOnC) {
@@ -431,6 +522,13 @@ try {
                overPeriod: dt.filter((x) => x > o.per).length, over14: dt.filter((x) => x > 14).length, over2P: dt.filter((x) => x > 2 * o.per).length };
     res.rate = +(((tMark.to.f - tMark.from.f) / ((tMark.to.t - tMark.from.t) / 1000)) * o.per / 1000).toFixed(4);
     res.clockLostMs = o.lost; res.reanchors = o.reanchors;
+    if (tMark.page0 && tMark.page1) {
+      const ws = (tMark.page1.t - tMark.page0.t) / 1000;
+      res.windowS = +ws.toFixed(2);
+      res.screenPerS = tMark.page1.scr != null ? +((tMark.page1.scr - tMark.page0.scr) / ws).toFixed(2) : null;
+      res.underruns = (tMark.page1.u != null && tMark.page0.u != null) ? tMark.page1.u - tMark.page0.u : null;
+    }
+    if (res.fs && res.windowS) res.presentsPerS = +(res.fs.presented / ((tMark.to.t - tMark.from.t) / 1000)).toFixed(2);
     res.stats = await page.evaluate(() => window.__n64Worker.eval(`(() => {
       const M = self.Module, o = {};
       try { if (M._neil_lfb_stats) { const p = M._malloc(32); M._neil_lfb_stats(p); o.lfb = Array.from(M.HEAPU32.subarray(p >> 2, (p >> 2) + 8)); M._free(p); } } catch (e) {}
@@ -445,7 +543,7 @@ try {
     res.load.push(load1());
     throw { clockDone: true };
   }
-  const all = { dt: [], gw: [], fp: [], pic: [], bk: [], rd: [] };
+  const all = { dt: [], gw: [], fp: [], pic: [], bk: [], rd: [], sh: [], gh: [] };
   const CH = 100;
   const t0 = Date.now();
   let profOn = false;
@@ -457,10 +555,10 @@ try {
       await coreWorker.client.send('Profiler.start');
       profOn = true;
     }
-    const src = `(${RUN.toString()})(${f}, ${to}, ${JSON.stringify(PLAN)}, ${FROM}, ${JSON.stringify(SHOTS)}, ${!UNPACED}, ${NOPIC}, ${RDHASH}, ${JSON.stringify(TRACEGL)}, ${GLCENSUS}, ${FINISH})`;
+    const src = `(${RUN.toString()})(${f}, ${to}, ${JSON.stringify(PLAN)}, ${FROM}, ${JSON.stringify(SHOTS)}, ${!UNPACED}, ${NOPIC}, ${RDHASH}, ${JSON.stringify(TRACEGL)}, ${GLCENSUS}, ${FINISH}, ${STATEHASH}, ${GLHASH}, ${GLREC})`;
     const o = await page.evaluate((s) => window.__n64Worker.eval(s), src);
     res.per = o.per;
-    all.dt.push(...o.dt); all.gw.push(...o.gw); all.rd.push(...o.rd); all.fp.push(...o.fp); all.pic.push(...o.pic); all.bk.push(...o.bk);
+    all.dt.push(...o.dt); all.gw.push(...o.gw); all.rd.push(...o.rd); all.sh.push(...o.sh); all.gh.push(...o.gh); all.fp.push(...o.fp); all.pic.push(...o.pic); all.bk.push(...o.bk);
     for (const k in o.shots) {
       const s = o.shots[k];
       fs.writeFileSync(path.join(OUT, `${TAG}-f${k}.png`), png(s.W, s.H, Buffer.from(s.b64, 'base64')));
@@ -493,7 +591,8 @@ try {
   res.bucketsPerField.core = +(res.ms.mean - Object.values(bt).reduce((s, x) => s + x, 0) / dt.length).toFixed(3);
   const worst = dt.map((x, i) => [x, i]).sort((a, b) => b[0] - a[0]).slice(0, 10);
   res.worst = worst.map(([x, i]) => Object.assign({ f: FROM + i, ms: x }, all.bk[i]));
-  res.fp = all.fp; res.pic = all.pic; res.rd = all.rd;
+  res.fp = all.fp; res.pic = all.pic; res.rd = all.rd; res.sh = all.sh; res.gh = all.gh;
+  res.fs = await page.evaluate(() => window.__n64Worker.eval('typeof fsReport === "function" ? fsReport() : null'));
   res.stats = await page.evaluate(() => window.__n64Worker.eval(`(() => {
     const M = self.Module, o = {};
     try { if (M._neil_lfb_stats) { const p = M._malloc(32); M._neil_lfb_stats(p); o.lfb = Array.from(M.HEAPU32.subarray(p >> 2, (p >> 2) + 8)); M._free(p); } } catch (e) { o.lfbErr = String(e); }
@@ -505,6 +604,7 @@ try {
     if (self.DBG) o.dbg = self.DBG.report();
     if (self.__wmWrap) o.wasm = self.__wmWrap;
     if (self.__glc) o.glCensus = self.__glc.n;
+    if (self.__glr) o.glrec = self.__glr.log;
     if (self.bementalMips && self.bementalMips.async) { const A = self.bementalMips.async; o.jitAsync = { on: A.on, offered: A.offered, installed: A.installed, stale: A.stale, staleWhy: A.staleWhy, reoffered: A.reoffered, failed: A.failed, pending: A.pending.size, maxInstallMs: +A.maxInstallMs.toFixed(2) }; }
     o.md5hint = (self.Module && self.Module.__wasmV) || null;
     return o; })()`));
@@ -513,5 +613,6 @@ try {
 } catch (e) { if (!(e && e.clockDone)) res.fault = String(e && e.stack || e).slice(0, 600); }
 finally { if (CG) { throttleEnd(CG); res.wcpu = { frac: CG.frac, tids: CG.tids && CG.tids.length, err: CG.err, stat: CG.stat }; } await browser.close(); }
 fs.writeFileSync(path.join(OUT, `${TAG}.json`), JSON.stringify(res));
-const brief = Object.assign({}, res); delete brief.fp; delete brief.pic;
+const brief = Object.assign({}, res); delete brief.fp; delete brief.pic; delete brief.sh; delete brief.gh;
+if (brief.fs) { brief.fs = Object.assign({}, brief.fs); delete brief.fs.series; }
 console.log(JSON.stringify(brief));

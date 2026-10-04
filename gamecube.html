@@ -18,7 +18,7 @@
        the functional SAB/worker test. Does not replace __gcGpu, which stays the page's
        own render-path authority. -->
   <script src="/lib/capability.js?v=e25dca87"></script>
-  <script src="/lib/bench.js?v=e8393e94"></script><!-- ?bench=1 real-device benchmark; inert without it -->
+  <script src="/lib/bench.js?v=ef8f095f"></script><!-- ?bench=1 real-device benchmark; inert without it -->
   <script src="/lib/xboxinput.js"></script>
   <!-- Online co-op. BOTH HALVES RUN THE GAME NOW. The old shape — "THE HOST HALF
        ONLY lives on this page: the guest runs on gamecube_multiplayer.html … a
@@ -709,6 +709,7 @@ window.GcRate = (function () {
       guestHz: guestHz, target: target, maxDtMs: MAX_DT_MS, maxBacklog: MAX_BACKLOG,
       // credit clock
       granted: 0, credAcc: 0, lastT: 0, stallMs: 0, hiddenAt: 0, lostCredits: 0,
+      gapMaxMs: 0, absorbN: 0,
       // stream bookkeeping
       framesSeen: 0, rendered: 0, outstanding: 0, dropped: 0, staleAcks: 0,
       // cumulative-speed span
@@ -771,6 +772,7 @@ window.GcRate = (function () {
       var dt = t - m.lastT;
       m.lastT = t;
       if (dt < 0) dt = 0;
+      if (dt > m.gapMaxMs) m.gapMaxMs = dt;
       // A stall longer than MAX_DT_MS is DROPPED, never repaid as a sprint. The dropped wall
       // time is remembered so the cumulative speed denominator can exclude it: we were not
       // running, so it is not time the guest failed to keep up with.
@@ -796,12 +798,18 @@ window.GcRate = (function () {
     // already added to the pool while this thread could not run. They ARE wall-clock-earned
     // emulated time, so they count as granted; the clock re-latches at t so the same gap is not
     // integrated twice, and it is not a stall (the guest was running through it).
-    m.absorbExternal = function (n, t) {
+    // `shared` (the page's case since 2026-10-04): the backstop advanced the SAME integrator this
+    // model reads back before its next grant (lastT + credAcc live in the pace SAB), so the clock
+    // must NOT be re-latched here. Re-latching at t threw away the fractional credit AND the wall
+    // time between the backstop's last tick and t — ~1 credit per main-thread stall, measured.
+    m.absorbExternal = function (n, t, shared) {
       if (n > 0) {
         drainCredits();
         m.granted += n;
         for (var i = 0; i < n; i++) creditQ.push(t);
       }
+      m.absorbN++;
+      if (shared) return;
       m.lastT = t; m.credAcc = 0;
     };
 
@@ -2123,6 +2131,52 @@ window.GcRate = (function () {
          }
          return true;
        })(), 'identical plan for qLen 0..6');
+
+    // 26 — ONE INTEGRATOR (2026-10-04). The page's backstop clock (a worker) grants while this
+    // thread is stalled; the hand-off must lose no wall time in either direction. Simulated with
+    // the page's protocol: the model's lastT/credAcc are the shared integrator, the backstop
+    // integrates from them after BK_GAP_MS of silence (its arithmetic is copied from bkStart's
+    // worker source), and grantNow absorbs with shared=true and resumes from the shared state.
+    // A fast guest drains the pool every tick, so every credit lost is guest time lost.
+    // Control: the OLD hand-off (backstop starts when it NOTICES the silence, its own fraction;
+    // absorbExternal re-latches lastT=t, credAcc=0) under the identical stall pattern.
+    function oneIntegrator(shared) {
+      var level = 0, pool = { load: function () { return level; }, add: function (n) { level += n; }, reset: function () { level = 0; } };
+      var mm = makeModel({ guestHz: 60, target: 60, pool: pool });
+      var shT = 0, shAcc = 0, mainAt = 0, bkGranted = 0, bkAbsorbed = 0, consumed = 0;
+      var bkSeen = 0, bkLast = 0, bkAcc = 0;                 // the OLD backstop's private integrator
+      var END = 10000, GAP = 60;
+      for (var t = 0; t <= END; t += 1) {
+        var stalled = (t % 800) >= 500 && (t % 800) < 650 && t < END - 200;   // 12 stalls of 150 ms
+        if (!stalled && t % 8 === 0) {                       // grantNow
+          var d = bkGranted - bkAbsorbed;
+          if (d > 0) { bkAbsorbed = bkGranted; mm.absorbExternal(d, t, shared); }
+          if (shared && mm.lastT && shT > 0) { mm.lastT = shT; mm.credAcc = shAcc; }
+          if (!(mm.lastT > t)) mm.grant(t);
+          if (shared && mm.lastT) { shT = mm.lastT; shAcc = mm.credAcc; }
+          mainAt = t; bkSeen = 0;
+        }
+        if (t % 4 === 2 && mainAt && t - mainAt >= GAP) {    // the backstop's poll
+          var g = 0;
+          if (shared) {
+            var dt = t - shT; if (dt > 0) { var acc = shAcc + dt * 60 / 1000; g = Math.floor(acc); acc -= g; shT = t; shAcc = acc; }
+          } else {
+            if (!bkSeen) { bkSeen = mainAt + 2; bkLast = 0; bkAcc = 0; }   // noticed one poll late
+            if (!bkLast) bkLast = bkSeen; bkAcc += (t - bkLast) * 60 / 1000; bkLast = t; g = Math.floor(bkAcc); bkAcc -= g;
+          }
+          var room = 8 - level; if (g > room) g = room;
+          if (g > 0) { level += g; bkGranted += g; }
+        }
+        if (level > 0) { consumed += level; level = 0; }     // a guest with headroom
+      }
+      return { consumed: consumed, owed: Math.floor(END * 60 / 1000) };
+    }
+    var oi = oneIntegrator(true), oc = oneIntegrator(false);
+    ck('26a one integrator: 12 main-thread stalls covered by the backstop lose no guest time',
+       Math.abs(oi.consumed - oi.owed) <= 1, 'consumed=' + oi.consumed + ' wall-owed=' + oi.owed);
+    ck('26b ...and never run ahead of the wall clock', oi.consumed <= oi.owed + 1, 'consumed=' + oi.consumed);
+    ck('26c control: the OLD two-integrator hand-off loses time on the same stalls',
+       oc.consumed < oc.owed - 5, 'old consumed=' + oc.consumed + ' of ' + oc.owed);
 
     var summary = 'RATETEST ' + (fail === 0 ? 'ALL PASS' : 'FAILURES') + ' — ' + pass + ' passed, ' + fail + ' failed';
     log(summary);
@@ -10202,39 +10256,100 @@ window.GcRate = (function () {
   // guest got NO credits for those seconds — Party Mode sat in mentDll for four minutes of wall
   // time. That is a slowdown of the GAME, which gate #9 forbids: guest rate and presented rate
   // are independent knobs, and a slow renderer may only cost presents.
-  // So a backstop: a tiny worker that watches this thread's heartbeat (BK_HB, bumped on every
-  // grant) and, only while it has not moved for BK_GAP_MS, adds credits to the SAB pool at
-  // exactly TARGET per second of ITS OWN wall clock (backlog-capped like grant()). When this
-  // thread comes back, grantNow absorbs them (rate.absorbExternal) before integrating, so every
-  // credit is counted once and emulated time is wall time either way. Solo only: in a room the
-  // frame gate is the room's (gcLsGate) and credits must be paired with agreed inputs; a hidden
-  // tab is a pause by design; freerun needs no credits. BK_EN carries that decision, written on
-  // every grant.
-  var BK_HB = 240, BK_EN = 241, BK_GRANTED = 242, BK_GAP_MS = 60;
+  // So a backstop: a tiny worker that, only while this thread has not granted for BK_GAP_MS, adds
+  // credits to the SAB pool at exactly TARGET per second (backlog-capped like grant()). When this
+  // thread comes back, grantNow absorbs them (rate.absorbExternal) so every credit is counted once.
+  // Solo only: in a room the frame gate is the room's (gcLsGate) and credits must be paired with
+  // agreed inputs; a hidden tab is a pause by design; freerun needs no credits. BK_EN carries that
+  // decision, written on every grant.
+  //
+  // ── ONE INTEGRATOR, NOT TWO (2026-10-04) ──────────────────────────────────────────────────
+  // The backstop used to run its OWN integrator: it started from the moment it NOTICED the
+  // heartbeat stop (up to one 4 ms poll after this thread's last grant), and on the hand-back
+  // grantNow re-latched this thread's clock at "now" with credAcc = 0. Each hand-off therefore
+  // threw away both integrators' fractional credit plus the wall time on either side of the
+  // seam: ~1 credit per main-thread stall. MEASURED on MP4 solo (headless SwiftShader): one
+  // re-latch discarded 0.82-0.85 of a credit by itself, and the solo bench read 0.9772-0.9965x
+  // on a guest whose pool sat at 0 (parked, i.e. headroom) every sampled second.
+  // Now the integrator's state — integrated-until (absolute ms: timeOrigin + now, comparable
+  // across threads) and the fractional credit — lives in the pace SAB behind a tiny spin lock,
+  // and whichever thread advances the clock resumes EXACTLY where the other stopped. Credits
+  // are therefore floor(wall-clock integral) whichever thread granted them: never more (no
+  // thread integrates past its own now, nor re-integrates the other's span), never less.
+  // Short lag is still repaid from the backlog (MAX_BACKLOG credits, ~133 ms); only a stall past
+  // MAX_DT_MS or a backlog overflow is dropped, and both are COUNTED (__gcPace below).
+  //   IT_LOCK   spin lock around the integrator (critical section: a few loads and stores)
+  //   BK_LOST   credits the backstop could not place because the backlog was full
+  //   BK_DROPMS wall ms the backstop dropped under the same MAX_DT_MS rule grant() applies
+  //   f64 @992  [0] integrated-until (abs ms)  [1] fractional credit  [2] this thread's last grant
+  var BK_HB = 240, BK_EN = 241, BK_GRANTED = 242, IT_LOCK = 243, BK_LOST = 244, BK_DROPMS = 245, BK_GAP_MS = 60;
+  var paceF64 = new Float64Array(pace, 992, 3);      // cells 248-253; 254/255 untouched
   var bkAbsorbed = 0, bkWorker = null;
   function bkStart() {
     if (bkWorker || typeof Worker !== 'function') return;
-    var src = 'onmessage=function(e){var a=new Int32Array(e.data.sab),T=e.data.target,MAXB=e.data.maxb,GAP=e.data.gap;' +
-      'var hb=Atomics.load(a,' + BK_HB + '),seen=performance.now(),acc=0,last=0;' +
-      'for(;;){Atomics.wait(a,255,0,4);var now=performance.now(),h=Atomics.load(a,' + BK_HB + ');' +
-      'if(h!==hb){hb=h;seen=now;last=0;acc=0;continue;}' +
-      'if(!Atomics.load(a,' + BK_EN + ')||Atomics.load(a,' + LS_ARMED + ')||now-seen<GAP){last=0;acc=0;continue;}' +
-      'if(!last){last=seen;}acc+=(now-last)*T/1000;last=now;var g=Math.floor(acc);if(g<=0)continue;acc-=g;' +
-      'var room=MAXB-Atomics.load(a,0);if(g>room)g=room;if(g<=0){continue;}' +
-      'Atomics.add(a,0,g);Atomics.add(a,' + BK_GRANTED + ',g);Atomics.notify(a,0);}};';
+    var src = 'onmessage=function(e){var a=new Int32Array(e.data.sab),f=new Float64Array(e.data.sab,992,3),' +
+      'T=e.data.target,MAXB=e.data.maxb,GAP=e.data.gap,MAXDT=e.data.maxdt;' +
+      'for(;;){Atomics.wait(a,255,0,4);' +
+      'if(!Atomics.load(a,' + BK_EN + ')||Atomics.load(a,' + LS_ARMED + '))continue;' +
+      'var now=performance.timeOrigin+performance.now();' +
+      'if(!(f[2]>0)||!(f[0]>0)||now-f[2]<GAP)continue;' +
+      'if(Atomics.compareExchange(a,' + IT_LOCK + ',0,1)!==0)continue;' +
+      'var g=0;if(now-f[2]>=GAP&&Atomics.load(a,' + BK_EN + ')){var dt=now-f[0];if(dt>0){' +
+      'if(dt>MAXDT){Atomics.add(a,' + BK_DROPMS + ',Math.round(dt-MAXDT));dt=MAXDT;}' +
+      'var acc=f[1]+dt*T/1000;g=Math.floor(acc);acc-=g;var room=MAXB-Atomics.load(a,0);if(room<0)room=0;' +
+      'if(g>room){Atomics.add(a,' + BK_LOST + ',g-room);g=room;}' +
+      'if(g>0){Atomics.add(a,0,g);Atomics.add(a,' + BK_GRANTED + ',g);}f[0]=now;f[1]=acc;}}' +
+      'Atomics.store(a,' + IT_LOCK + ',0);if(g>0)Atomics.notify(a,0);}};';
     try {
       bkWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
-      bkWorker.postMessage({ sab: pace, target: TARGET, maxb: MAX_BACKLOG, gap: BK_GAP_MS });
+      bkWorker.postMessage({ sab: pace, target: TARGET, maxb: MAX_BACKLOG, gap: BK_GAP_MS, maxdt: MAX_DT_MS });
     } catch (e) { bkWorker = null; console.log('[recomp-live] backstop clock unavailable: ' + e); }
   }
+  var paceT0 = 0, paceB = null;                       // the ledger's anchor: first credit after boot/restore
   function grantNow() {
-    var t = performance.now();
-    var g = Atomics.load(paceI32, BK_GRANTED), d = g - bkAbsorbed;
-    if (d > 0) { bkAbsorbed = g; rate.absorbExternal(d, t); }
-    Atomics.store(paceI32, BK_EN, (TARGET > 0 && !gcLsGate && !document.hidden && !Atomics.load(paceI32, 5)) ? 1 : 0);
+    var t = performance.now(), org = performance.timeOrigin;
+    // The backstop's critical section is a handful of loads and stores; if it is mid-section
+    // (or was preempted inside it) skip this tick — the 8 ms timer comes straight back.
+    var got = false;
+    for (var i = 0; i < 64 && !got; i++) got = Atomics.compareExchange(paceI32, IT_LOCK, 0, 1) === 0;
+    if (!got) return;
+    try {
+      var g = Atomics.load(paceI32, BK_GRANTED), d = g - bkAbsorbed;
+      if (d > 0) { bkAbsorbed = g; rate.absorbExternal(d, t, true); }
+      Atomics.store(paceI32, BK_EN, (TARGET > 0 && !gcLsGate && !document.hidden && !Atomics.load(paceI32, 5)) ? 1 : 0);
+      // Resume the ONE integrator from wherever it got to, whichever thread advanced it. A model
+      // with no clock yet (first grant, or just restored) keeps its own latch instead.
+      if (rate.lastT && paceF64[0] > 0) { rate.lastT = paceF64[0] - org; rate.credAcc = paceF64[1]; }
+      // Never integrate a span the other thread already covered (its clock may read a hair ahead).
+      if (rw && !document.hidden && !(rate.lastT > t)) {
+        var g0 = rate.granted, lt0 = rate.lastT;
+        var b0 = paceT0 ? null : { g: g0, l: rate.lostCredits + Atomics.load(paceI32, BK_LOST), s: rate.stallMs + Atomics.load(paceI32, BK_DROPMS) };
+        rate.grant(t);
+        // the ledger is anchored where its first grant's integration began (the previous latch)
+        if (!paceT0 && rate.granted > g0) { paceT0 = lt0; paceB = b0; }
+      }
+      if (rate.lastT) { paceF64[0] = rate.lastT + org; paceF64[1] = rate.credAcc; }
+      paceF64[2] = org + t;
+    } finally { Atomics.store(paceI32, IT_LOCK, 0); }
     Atomics.add(paceI32, BK_HB, 1);
-    if (rw && !document.hidden) rate.grant(t);
   }
+  // PACING LEDGER (cheap; read by rigs). `leak` is the integrator's honesty check: wall-clock
+  // credits since the first grant, up to where the integrator has got, minus everything it
+  // accounted for (granted by either thread, clamped by the backlog, dropped as a stall, still
+  // fractional). 0 means not one credit of wall time went missing. Solo only, no savestate
+  // pokes (a poke grants credits the clock did not earn; a restore re-anchors the ledger).
+  window.__gcPace = function () {
+    var T = TARGET / 1000;
+    var bkLost = Atomics.load(paceI32, BK_LOST), bkDrop = Atomics.load(paceI32, BK_DROPMS);
+    var upTo = paceF64[0] - performance.timeOrigin, unabsorbed = Atomics.load(paceI32, BK_GRANTED) - bkAbsorbed;
+    var acct = paceB ? (rate.granted + unabsorbed - paceB.g) + (rate.lostCredits + bkLost - paceB.l)
+                       + (rate.stallMs + bkDrop - paceB.s) * T + paceF64[1] : 0;
+    return { t: performance.now(), granted: rate.granted, consumed: rate.consumed(), pool: Atomics.load(paceI32, 0),
+      lost: rate.lostCredits + bkLost, stallMs: rate.stallMs + bkDrop, gapMaxMs: rate.gapMaxMs,
+      bk: Atomics.load(paceI32, BK_GRANTED), absorbN: rate.absorbN, padAck: Atomics.load(paceI32, PAD_ACK),
+      leak: paceT0 ? +((upTo - paceT0) * T - acct).toFixed(4) : null,
+      outstanding: rate.outstanding, dropped: rate.dropped, rendered: rate.rendered };
+  };
   var grantTimer = 0;
   var rafSinceDraw = true, lastDrawAt = 0;
   function grantLoop() {
@@ -10570,7 +10685,7 @@ window.GcRate = (function () {
         // that spans frames (a jumped frame index otherwise reads as a huge bogus multiplier
         // for the rest of the session), AND the standing credit pool, which is emulated time
         // owed to a run that no longer exists (?ratetest=1 tests 7 and 14).
-        rate.restore(e.data.n, performance.now());
+        rate.restore(e.data.n, performance.now()); paceT0 = 0; paceB = null;
         stSay('worker restored at frame ' + e.data.n + '; renderer resync forced');
         if (pendingStateLoad) pendingStateLoad({ ok: true, n: e.data.n });
       } else if (e.data.cmd === 'stateError') {
