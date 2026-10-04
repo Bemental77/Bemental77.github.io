@@ -167,10 +167,19 @@ uint32_t grTexCalcMemRequired(int32_t lodmax,
    return 0;
 }
 
-static int grTexFormat2GLPackedFmt(GrTexInfo *info, int fmt, int * gltexfmt, int * glpixfmt, int * glpackfmt)
+/* THE CONVERSION COVERS THE TEXTURE, NOT THE SCREEN (2026-10-04). size_tex was `width * height`
+ * — glitchmain.c's WINDOW size (640x480), not the texture's: every download converted 307,201
+ * texels in place in TexCache's 16 MB scratch buffer, whatever the texture's size (a 32x32 icon
+ * included). That loop was grTexSource's self time in a CPU profile of every MK64 scene-change
+ * field (fields 319, 1033, 1206, 1244: 40-100 ms at a full core, ~150 downloads each). The texels
+ * of the texture itself are converted exactly as before (every format converts index i from source
+ * bytes at or after i, running down from the top, so where it starts above the texture does not
+ * change a texel inside it); what is no longer written is scratch memory past the texture, which
+ * the upload below never reads. tw*th is the size glTexImage2D is given. */
+static int grTexFormat2GLPackedFmt(GrTexInfo *info, int fmt, int * gltexfmt, int * glpixfmt, int * glpackfmt, int tw, int th)
 {
    int factor        = -1;
-   unsigned size_tex = width * height;
+   unsigned size_tex = (unsigned)tw * (unsigned)th;
 
    if (fmt == GR_TEXFMT_ALPHA_INTENSITY_44)
    {
@@ -242,7 +251,7 @@ static int grTexFormat2GLPackedFmt(GrTexInfo *info, int fmt, int * gltexfmt, int
    {
       // VP fixed the texture conversions to be more accurate, also swapped
       // the for i/j loops so that is is less likely to break the memory cache
-      unsigned size_tex = width * height;
+      unsigned size_tex = (unsigned)tw * (unsigned)th;
       switch(info->format)
       {
          case GR_TEXFMT_ALPHA_8:
@@ -379,7 +388,7 @@ void grTexSource( int32_t tmu,
    else
       height = width >> info->aspectRatioLog2;
 
-   factor = grTexFormat2GLPackedFmt(info, info->format, &gltexfmt, &glpixfmt, &glpackfmt);
+   factor = grTexFormat2GLPackedFmt(info, info->format, &gltexfmt, &glpixfmt, &glpackfmt, width, height);
 
    remove_tex(startAddress+1, startAddress+1+(width * height * factor));
 
