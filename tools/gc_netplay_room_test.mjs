@@ -239,7 +239,7 @@ const shared = SEPARATE ? null : await launch();
 for (let i = 0; i < PLAYERS; i++) {
   const p = await (SEPARATE ? await launch() : shared).newPage();
   const who = i === 0 ? 'host' : 'p' + (i + 1);
-  p.on('console', (m) => { const t = m.text(); if (/gc-lockstep|desync|DIVERG|recomp-live\] (failed|REFUS)|SPIN|main stopped/i.test(t)) console.log(`  [${who}] ${t.slice(0, 220)}`); });
+  p.on('console', (m) => { const t = m.text(); if (/gc-lockstep|desync|DIVERG|recomp-live\] (failed|REFUS)|SPIN|main stopped|RING FAULT|rollback ring: (OFF|the undo)/i.test(t)) console.log(`  [${who}] ${t.slice(0, 220)}`); });
   p.on('pageerror', (e) => console.log(`  [${who}] PAGEERROR ${String(e).slice(0, 220)}`));
   // MOBILE=<i,j>: those tabs emulate a phone (viewport, touch, UA) — gamecube.html then runs its
   // MOBILE SHELL and the room has to press the splash's Start (a pointerdown handler, not a
