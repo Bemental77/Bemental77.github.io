@@ -1061,10 +1061,13 @@
     // map, colours, combiner modes, lights, matrices), the frontend's toast (counted in swaps), and
     // the libc rand() glide draws its noise and a combiner colour from (lazy_fb.c, the same image
     // the solo frame-skip re-run restores: core_worker.js fsSnap/fsRedo). A load put the MACHINE
-    // back and left all of that where the replaced timeline had taken it, so a rollback room's
-    // pictures differed from a straight run's (6 of 6 titles, skipping off), and a title that reads its
-    // pictures back into RDRAM could take them into the guest. (The DK64 rollback-room desync at frame
-    // 1247-1252 was NOT this: it was the heap — see N64S_RAW_RESERVE.)
+    // back and left all of that where the replaced timeline had taken it, which a frame that draws
+    // with RDP state an earlier display list set up would see. ⚠ NOT OBSERVED: the "6 of 6 titles'
+    // pictures differ" that motivated this was the rig (the straight reference showed the frontend's
+    // toast on frames the room no longer did); with the rig fixed, ?rbgls=0 kept every picture of
+    // Snap, Star Fox, Banjo-Tooie and MK64 identical too (2026-10-04, 212-479 frames each). Kept
+    // because it is cheap (27 KB, ~0.035 ms a save or load) and the toast's timing follows it.
+    // (The DK64 rollback-room desync at 1247-1252 was the heap — see N64S_RAW_RESERVE.)
     // So each snapshot keeps that image too (neil_gl_state_save, ~KBs: a memcpy beside the 9 MB
     // fast save) and every load puts it back. ?rbgls=0 is the arm (the machine only, as before).
     var RBGL = { on: RB_Q.get('rbgls') !== '0', size: -1, ptr: 0, saves: 0, loads: 0, ms: 0 };
