@@ -77,6 +77,7 @@ static int g_counting = 0;
 static constexpr int kPcCap = 131072;
 static uint64_t* g_pccnt = nullptr;
 static int g_top_pcs = 0;
+static u32 g_mask_unsound = 0;   // shadow-mask bits whose ps[] lanes are not widened singles
 static const char* g_dump_dir = nullptr;   // --dump-dir: <pc>.wasm + <pc>.marks per compile
 
 // marks from the emitter (g_bem_emit_mark_cb), flat [tag, off, ...]
@@ -179,6 +180,34 @@ static bool compile_at(u32 start_pc) {
 static uint64_t fnv64(const u8* p, std::size_t n, uint64_t h = 1469598103934665603ull) {
     for (std::size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
     return h;
+}
+
+// Interpreter_FPUtils.h ConvertToDouble / ConvertToSingle (the PEM pair the
+// emitter's widen/narrow implement) — for the shadow-mask soundness check.
+static uint64_t pem_c2d(u32 value) {
+    uint64_t x = value, exp = (x >> 23) & 0xff, frac = x & 0x007fffff;
+    if (exp > 0 && exp < 255) {
+        uint64_t y = !(exp >> 7), z = y << 61 | y << 60 | y << 59;
+        return ((x & 0xc0000000ull) << 32) | z | ((x & 0x3fffffff) << 29);
+    } else if (exp == 0 && frac != 0) {
+        exp = 1023 - 126;
+        do { frac <<= 1; exp -= 1; } while ((frac & 0x00800000) == 0);
+        return ((x & 0x80000000ull) << 32) | (exp << 52) | ((frac & 0x007fffff) << 29);
+    }
+    uint64_t y = exp >> 7, z = y << 61 | y << 60 | y << 59;
+    return ((x & 0xc0000000ull) << 32) | z | ((x & 0x3fffffff) << 29);
+}
+static u32 pem_c2s(uint64_t x) {
+    const u32 exp = (u32)((x >> 52) & 0x7ff);
+    if (exp > 896 || (x & ~0x8000000000000000ull) == 0)
+        return (u32)(((x >> 32) & 0xc0000000) | ((x >> 29) & 0x3fffffff));
+    if (exp >= 874) {
+        u32 t = (u32)(0x80000000 | ((x & 0xFFFFFFFFFFFFFull) >> 21));
+        t = t >> (905 - exp);
+        t |= (u32)((x >> 32) & 0x80000000);
+        return t;
+    }
+    return (u32)(((x >> 32) & 0xc0000000) | ((x >> 29) & 0x3fffffff));
 }
 
 static std::vector<u8> read_file(const char* path) {
@@ -306,7 +335,19 @@ int main(int argc, char** argv) {
             uint64_t h = fnv64(g_ctx + 0x000, 0x0C);
             h = fnv64(g_ctx + 0x014, ppc_off::DOWNCOUNT - 0x014, h);
             h = fnv64(g_ctx + 0x2F4, 0x1340 - 0x2F4, h);
-            std::fprintf(tf, "%ld %08x %016llx %d\n", s, epc, (unsigned long long)h, dc);
+            // + the FPR shadow-mask cell (fpr_reg_cache.cpp BEM_SINGLE_MASK_CELL):
+            // outside ctx and MEM1, but later blocks' singles speculation reads it.
+            const u32 smask = *reinterpret_cast<volatile u32*>((uintptr_t)0x026B33E0u);
+            // Soundness of the hint: a set bit claims ps[i] holds a widened
+            // single in BOTH lanes, i.e. widen(narrow(lane)) == lane.
+            for (u32 i = 0; i < 32; ++i) {
+                if (!((smask >> i) & 1u)) continue;
+                for (u32 l = 0; l < 2; ++l) {
+                    uint64_t v; std::memcpy(&v, g_ctx + 0xA0 + 16 * i + 8 * l, 8);
+                    if (pem_c2d(pem_c2s(v)) != v) ++g_mask_unsound;
+                }
+            }
+            std::fprintf(tf, "%ld %08x %016llx %d %08x\n", s, epc, (unsigned long long)h, dc, smask);
         }
         if (halted) break;
         park_ring[s & 31] = epc;
@@ -342,7 +383,8 @@ int main(int argc, char** argv) {
         "\"ops_other\":%llu,\"ops_epilogue\":%llu,\"loads\":%llu,\"stores\":%llu,\"import_calls\":%llu,"
         "\"indirect_calls\":%llu,\"consts\":%llu,\"locals\":%llu,\"control\":%llu,"
         "\"terminal_loads\":%llu,\"ops_per_guest_instr\":%.3f,\"instrs_per_entry\":%.3f,"
-        "\"mmioR\":%d,\"mmioW\":%d,\"wpar_import\":%d,\"drains\":%d,\"interp\":%d}",
+        "\"mmioR\":%d,\"mmioW\":%d,\"wpar_import\":%d,\"drains\":%d,\"interp\":%d,"
+        "\"mask_unsound\":%u}",
         mode.c_str(), s, stop, stop_pc, (unsigned long long)guest_cycles, g_compiles,
         g_compile_fail, host_chains, blocks_via_host, (unsigned long long)mem_hash,
         (unsigned long long)ctx_hash, (unsigned long long)g_cnt[12],
@@ -354,7 +396,8 @@ int main(int argc, char** argv) {
         (unsigned long long)g_cnt[9], (unsigned long long)g_cnt[10], (unsigned long long)g_cnt[11],
         (unsigned long long)g_cnt[14], gi > 0 ? ops / gi : 0.0,
         g_cnt[13] ? gi / (double)g_cnt[13] : 0.0,
-        js_stat("mmioR"), js_stat("mmioW"), js_stat("wpar"), js_stat("drains"), js_stat("interp"));
+        js_stat("mmioR"), js_stat("mmioW"), js_stat("wpar"), js_stat("drains"), js_stat("interp"),
+        g_mask_unsound);
     std::printf("%s\n", buf);
     if (json_out) { std::FILE* jf = std::fopen(json_out, "w"); if (jf) { std::fprintf(jf, "%s\n", buf); std::fclose(jf); } }
     std::fprintf(stderr, "[replay] slice-end PCs (top):");

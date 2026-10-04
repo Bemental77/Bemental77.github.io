@@ -67,6 +67,8 @@ constexpr u32 BEM_LEVER_STATIC_CHAIN = 1u << 10;
 // RegCache::Bind(Write) skips the first-touch load of a GPR the current op
 // does not read (CodeOp::regsIn).
 constexpr u32 BEM_LEVER_WRITE_NOLOAD = 1u << 11;
+// FPRRegCache::Flush batches its constant shadow-mask set/clear RMWs into one.
+constexpr u32 BEM_LEVER_FLUSH_MASK_BATCH = 1u << 12;
 
 bool bem_lever_on(u32 bit);
 

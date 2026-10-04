@@ -235,6 +235,16 @@ RCFprPair FPRRegCache::BindSingleWrite(u32 preg) {
 
 // Flush dirty lanes back to PowerPCState.
 void FPRRegCache::Flush(u32 ctx_ptr, BitSet32 preg_mask, u8 lane_mask) {
+    // [BEM_LEVER_FLUSH_MASK_BATCH 2026-10-04] The per-FPR constant set/clear
+    // RMWs of BEM_SINGLE_MASK_CELL below touch DISTINCT bits, so they commute;
+    // with the lever they are accumulated and emitted as ONE
+    // `cell = (cell & ~clear) | set` after the loop (6 ops per flush instead of
+    // 6 per stored FPR). The runtime-verified value_unknown RMW stays inline:
+    // it reads and writes only its own bit, so its result is the same whether
+    // the batched bits land before or after it. Nothing reads the cell between
+    // the stores of one Flush.
+    const bool batch_mask = g_bem_lc_base && bem_lever_on(BEM_LEVER_FLUSH_MASK_BATCH);
+    u32 batch_set = 0u, batch_clear = 0u;
     for (u32 i = 0; i < 32; ++i) {
         if (!preg_mask[i]) continue;
         // [single-spec PM26] latch BEFORE the promote — EmitPromoteToDouble
@@ -266,7 +276,12 @@ void FPRRegCache::Flush(u32 ctx_ptr, BitSet32 preg_mask, u8 lane_mask) {
         // SET. (A genuine double that round-trips f32-exactly IS losslessly
         // narrowable, so keeping the bit for it is correct by definition.)
         if ((st0 || st1) && g_bem_lc_base) {
-            if (value_single && lane_mask == FPR_LANE_BOTH) {
+            if (batch_mask && value_single && lane_mask == FPR_LANE_BOTH) {
+                batch_set |= (1u << i);
+            } else if (batch_mask && !m_state[i].value_unknown &&
+                       !(value_single && lane_mask == FPR_LANE_BOTH)) {
+                batch_clear |= (1u << i);
+            } else if (value_single && lane_mask == FPR_LANE_BOTH) {
                 m_wb.op_i32_const((s32)BEM_SINGLE_MASK_CELL);
                 m_wb.op_i32_const((s32)BEM_SINGLE_MASK_CELL);
                 m_wb.op_i32_load(0);
@@ -322,6 +337,20 @@ void FPRRegCache::Flush(u32 ctx_ptr, BitSet32 preg_mask, u8 lane_mask) {
                 m_wb.op_i32_store(0);
             }
         }
+    }
+    if (batch_set | batch_clear) {
+        m_wb.op_i32_const((s32)BEM_SINGLE_MASK_CELL);
+        m_wb.op_i32_const((s32)BEM_SINGLE_MASK_CELL);
+        m_wb.op_i32_load(0);
+        if (batch_clear) {
+            m_wb.op_i32_const((s32)~batch_clear);
+            m_wb.op_i32_and();
+        }
+        if (batch_set) {
+            m_wb.op_i32_const((s32)batch_set);
+            m_wb.op_i32_or();
+        }
+        m_wb.op_i32_store(0);
     }
 }
 
