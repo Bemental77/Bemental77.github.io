@@ -48,7 +48,7 @@
 //   G: --rbw 8 --query rb=1 --expect any --cin
 // (append &worker=0 to --query for the main-thread realm; --wslow 4 slows the worker's core).
 import { createRequire } from 'node:module';
-import { writeFileSync, existsSync } from 'node:fs';
+import { writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 const require = createRequire(process.env.HOME + '/probe-deps/');
 const puppeteer = require('puppeteer');
@@ -98,6 +98,17 @@ const WSLOW_UNTIL = +flag('wslow-until', '0');
 //   f+d (lib/netplay.js _rbPutLocal via beginFrame), so the plain reference compares wrong inputs.
 const CIN = has('cin');
 const EXPECT = flag('expect', 'rollback');
+// --lsexact: a DELAY-LOCKSTEP room's exactness — room_core.js taps the state after every 10th frame
+//   (the same __n64RbTap seam), so a room with no rollback is not VOID (the frame-skip arms: a
+//   delay frame that skipped its draws must leave the same machine as a straight run).
+const LSEXACT = has('lsexact');
+// --pics PATH: hash the window after every PRESENTED frame that drew (core worker only), keep the
+//   ones that stayed true — a frame no later rollback reached back to (from <= f): its picture is of
+//   the frame's final state — and write { frame: hash } to PATH. --picsref PATH: compare against such
+//   a file from another run (the frame-skip arms: a skipped room's drawn pictures against a room that
+//   draws every frame), frame for frame where both have one.
+const PICS = flag('pics', ''), PICSREF = flag('picsref', '');
+const PICDUMP = flag('picdump', '').split(',').filter(Boolean).map(Number);   // diagnostic: raw RGBA of these frames into the --json
 const CIN_SRC = (engExpr) => `(function () {
   self.__cin = {}; self.__cinPolls = 0;
   setInterval(function () {
@@ -229,7 +240,7 @@ try {
   page.setDefaultTimeout(240000);
   if (MOBILE) await page.emulate({ userAgent: ANDROID_UA, viewport: { width: 915, height: 412, deviceScaleFactor: 2, isMobile: true, hasTouch: true, isLandscape: true } });
   else await page.setViewport({ width: 1280, height: 900 });
-  page.on('console', (m) => { const t = m.text(); if (/lockstep|rollback|runahead|\[state\]|\[fb\]|error|⚠/i.test(t)) log.push('[A] ' + t.slice(0, 300)); });
+  page.on('console', (m) => { const t = m.text(); if (/lockstep|rollback|runahead|fskip|\[state\]|\[fb\]|error|⚠/i.test(t)) log.push('[A] ' + t.slice(0, 300)); });
   page.on('pageerror', (e) => log.push('[A] PAGEERROR ' + e.message));
   await page.goto(`${BASE}/n64/?game=${encodeURIComponent(GAME)}&rbw=${RBW}&workerrig=1${QUERY ? '&' + QUERY : ''}`, { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => !!window.__n64LsAttach && !!window.Netplay, { timeout: 60000 });
@@ -273,6 +284,38 @@ try {
       self.__n64PadOverride = function (f, p) { return self.__pad(f, p); };
       self.__rbFull = {}; self.__n64RbLog = [];
       self.__n64RbTap = function (k, buf, fp) { self.__rbFull[k] = { full: self.__n64State.hashFull(buf), fp: fp >>> 0 }; };
+      ${(PICS || PICSREF) ? `(function () {
+        var px = null, toastSeen = true;
+        self.__n64PicTap = function (f) {
+          // the frontend's toast (mymain.cpp toastCounter, 60 swaps) is HOST state that a rollback's
+          // re-simulated frames count down too, so in a rollback room its last frame lands at a
+          // different frame on every run (MEASURED: two rooms with no frame skip differed at 6
+          // consecutive drawn frames, the toast's end) — frames that may show it are not compared
+          // (the counter is the last int of glide's host-state image, lazy_fb.c neil_gl_state_save)
+          var Mm = self.Module, tc = 0, was = toastSeen;
+          if (Mm._neil_gl_state_size) {
+            var gn = Mm._neil_gl_state_size(), gp = self.__gsp || (self.__gsp = Mm._malloc(gn));
+            Mm._neil_gl_state_save(gp); var U = Mm.HEAPU8, o = gp + gn - 4;
+            tc = U[o] | (U[o + 1] << 8) | (U[o + 2] << 16) | (U[o + 3] << 24);
+          }
+          toastSeen = tc > 0;
+          if (tc > 0 || was) return;
+          if (!self.FSK || !self.FSK.lastDrew) return;
+          var gl = self.Module.ctx, FB = self.__fbAsync, W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
+          if (!px || px.length !== W * H * 4) px = new Uint8Array(W * H * 4);
+          if (FB) FB.bypass = true;
+          try {
+            var rfb = gl.getParameter(gl.READ_FRAMEBUFFER_BINDING), pb = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
+            gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null); gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+            gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, px);
+            gl.bindFramebuffer(gl.READ_FRAMEBUFFER, rfb); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pb);
+          } finally { if (FB) FB.bypass = false; }
+          var h = 2166136261 >>> 0;
+          for (var i = 0; i < px.length; i += 4) { h = Math.imul(h ^ px[i], 16777619); h = Math.imul(h ^ px[i + 1], 16777619); h = Math.imul(h ^ px[i + 2], 16777619); }
+          self.__n64RbLog.push(['pic', f, h >>> 0]);
+          if (${JSON.stringify(PICDUMP)}.indexOf(f) >= 0) { var str = ''; for (var q = 0; q < px.length; q += 0x8000) str += String.fromCharCode.apply(null, px.subarray(q, q + 0x8000)); (self.__picDump = self.__picDump || {})[f + ':' + self.__n64RbLog.length] = { W: W, H: H, b64: btoa(str) }; }
+        };
+      })();` : ''}
       ({ realm: typeof WorkerGlobalScope !== 'undefined' ? 'worker' : 'window', state: !!self.__n64State });`;
     out.workerSeams = await page.evaluate((s2) => window.__n64Worker.eval(s2), src);
     if (WSLOW > 1) {
@@ -348,11 +391,14 @@ try {
              fb: n.fb, lat: n.lat, speed: window.__n64Rate && window.__n64Rate.speed,
              eng: n.engine ? { delay: n.engine.delay, state: n.engine.state, desync: n.engine.desync, mode: n.engine.mode,
                                 hashesCompared: n.engine.hashesCompared, stalls: n.engine.stalls } : null,
-             capx: cx, step: n.step || null,
+             capx: cx, step: n.step || null, fskip: n.fskip || null,
              pres: n.worker ? (function () { const p = window.__n64Pace ? window.__n64Pace() : {}; return { shown: p.shown | 0, frames: p.animFrames | 0 }; })()
                             : (window.__pres ? { shown: window.__pres.shown, frames: window.__pres.frames } : null) };
   }, CAPX_SRC);
   await sleep(3000);
+  // THE LATENCY WITNESS over the window (core_worker.js fsReport: per presented picture, the tick
+  // that ran its frame -> its fence signalled / the animation frame that committed it)
+  if (out.worker) await page.evaluate(() => window.__n64Worker.eval('typeof fsReset === "function" ? (fsReset(), 1) : 0'));
   const a = await snap();
   const tl = [];
   let prev = a, lastRbPage = a.rb && a.rb.page;
@@ -396,9 +442,10 @@ try {
     if (s.fault || s.engineState === 'failed' || s.engineState === 'desync') break;
   }
   const z = prev, secs = (z.t - a.t) / 1000;
+  if (out.worker) out.fsLat = await page.evaluate(() => window.__n64Worker.eval('typeof fsReport === "function" ? (function (r) { return { presented: r.presented, overwritten: r.overwritten, lat: r.lat, gpu: r.gpu }; })(fsReport()) : null'));
   const rbA = a.rb && a.rb.page, rbZ = z.rb && z.rb.page;
   room = out.worker
-    ? Object.assign(await page.evaluate(() => window.__n64Worker.eval('({ rblog: self.__n64RbLog.slice(0, 4000), full: self.__rbFull, cin: self.__cin || null, cinPolls: self.__cinPolls | 0 })')),
+    ? Object.assign(await page.evaluate((pics) => window.__n64Worker.eval('({ rblog: self.__n64RbLog.slice(0, 4000), pics: ' + (pics ? '(function (L) { var o = {}, minFrom = Infinity; for (var i = L.length - 1; i >= 0; i--) { var e = L[i]; if (e[0] === "rb") minFrom = Math.min(minFrom, e[2]); else if (e[0] === "pic" && e[1] < minFrom) o[e[1]] = e[2]; } return o; })(self.__n64RbLog)' : 'null') + ', full: self.__rbFull, cin: self.__cin || null, cinPolls: self.__cinPolls | 0 })'), !!(PICS || PICSREF)),
                     await page.evaluate(() => ({ frame: window.__n64LsEngine.frame, confirmed: window.__n64LsEngine._rbConfirmed })))
     : await page.evaluate(() => ({ rblog: window.__n64RbLog.slice(0, 4000), full: window.__rbFull, frame: window.__n64LsEngine.frame, confirmed: window.__n64LsEngine._rbConfirmed, cin: window.__cin || null, cinPolls: window.__cinPolls | 0 }));
   Object.assign(out, {
@@ -412,6 +459,7 @@ try {
     costAvgMs: z.costAvgMs, costOver: (z.costOver || 0) - (a.costOver || 0), costMaxMs: z.costMaxMs, fb: z.fb, ghosts: z.ghosts, fault: z.fault, engineState: z.engineState, error: z.error,
     latFrames: (z.lat && z.lat.samples || []).map((x) => x.frames),
     tappedFrames: Object.keys(room.full).length, confirmedTo: room.confirmed,
+    fskip: z.fskip,     // room_core.js RFS: the room's frame skip (skipped / re-runs / lost)
   });
   // what the rollback-default decision needs, in one place (n64/docs/rollback-default/)
   const presA = a.pres, presZ = z.pres;
@@ -435,6 +483,18 @@ try {
     wslow: out.worker && WSLOW > 1 ? await page.evaluate(() => window.__n64Worker.eval('self.__wslow')) : null,
   };
   out.timeline = tl;
+  if (PICDUMP.length && out.worker) out.picDump = await page.evaluate(() => window.__n64Worker.eval('self.__picDump || null'));
+  if (room.pics) {
+    // a frame the room had not confirmed when the window closed may still have been predicted wrong
+    if (out.mode === 'rollback' && typeof room.confirmed === 'number') for (const f in room.pics) if (+f > room.confirmed) delete room.pics[f];
+    out.pics = { kept: Object.keys(room.pics).length };
+    if (PICS) writeFileSync(PICS, JSON.stringify(room.pics));
+    if (PICSREF && existsSync(PICSREF)) {
+      const ref = JSON.parse(readFileSync(PICSREF, 'utf8')); let both = 0, same = 0; const diff = [];
+      for (const f in room.pics) if (f in ref) { both++; if (ref[f] === room.pics[f]) same++; else if (diff.length < 12) diff.push(+f); }
+      out.pics.compared = both; out.pics.same = same; out.pics.firstDiffs = diff;
+    }
+  }
   await ctxA.close();
 
   // ======================= B. THE STRAIGHT REFERENCE ========================
@@ -466,7 +526,25 @@ try {
     await pb.goto(`${BASE}/n64/?game=${encodeURIComponent(GAME)}&autostart&worker=0${refQ ? '&' + refQ : ''}`, { waitUntil: 'domcontentloaded' });
     await pb.waitForFunction(() => window.__refMain === true, { timeout: 240000 });
     const last = keys[keys.length - 1];
-    const ref = await pb.evaluate(async (padSrc, players, keys, last, cin) => {
+    const picKeys = room.pics ? Object.keys(room.pics).map(Number).filter((f) => f <= last) : [];
+    const ref = await pb.evaluate(async (padSrc, players, keys, last, cin, picKeys) => {
+      // the room's kept pictures, from the straight run (same inputs, every frame drawn)
+      const picWant = new Set(picKeys), pics = {};
+      let px = null;
+      const picture = () => {
+        const M = window.Module, gl = M.ctx, FB = window.__fbAsync, W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
+        if (!px || px.length !== W * H * 4) px = new Uint8Array(W * H * 4);
+        if (FB) FB.bypass = true;
+        try {
+          const rfb = gl.getParameter(gl.READ_FRAMEBUFFER_BINDING), pb = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
+          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null); gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+          gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, px);
+          gl.bindFramebuffer(gl.READ_FRAMEBUFFER, rfb); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pb);
+        } finally { if (FB) FB.bypass = false; }
+        let h = 2166136261 >>> 0;
+        for (let i = 0; i < px.length; i += 4) { h = Math.imul(h ^ px[i], 16777619); h = Math.imul(h ^ px[i + 1], 16777619); h = Math.imul(h ^ px[i + 2], 16777619); }
+        return h >>> 0;
+      };
       let cinMissing = 0, cinUsed = 0, cinDiffers = 0;
       (0, eval)(padSrc);
       const M = window.Module, want = new Set(keys), res = {};
@@ -488,6 +566,7 @@ try {
           } else set(p, sp);
         }
         M._neil_ls_run_frame();
+        if (picWant.has(f)) pics[f] = picture();
         if (want.has(f)) {
           window.__n64State.save(buf);
           res[f] = { full: window.__n64State.hashFull(buf), fp: M._neil_last_fp() >>> 0 };
@@ -495,8 +574,15 @@ try {
         if ((f & 63) === 0) await new Promise((r) => setTimeout(r, 0));
       }
       res.__cin = { used: cinUsed, missing: cinMissing, differsFromPad: cinDiffers };
+      res.__pics = pics;
       return res;
-    }, PAD_SRC.replace('function __pad', 'window.__pad = function'), PLAYERS, keys, last, CIN ? room.cin : null);
+    }, PAD_SRC.replace('function __pad', 'window.__pad = function'), PLAYERS, keys, last, CIN ? room.cin : null, picKeys);
+    if (room.pics) {
+      const rp = ref.__pics; let both = 0, same = 0; const diff = [];
+      for (const f in rp) { both++; if (rp[f] === room.pics[f]) same++; else if (diff.length < 12) diff.push(+f); }
+      out.picsStraight = { compared: both, same, firstDiffs: diff };
+    }
+    delete ref.__pics;
     const cinStat = ref.__cin; delete ref.__cin;
     let firstFull = null, firstFp = null, same = 0;
     for (const k of keys) {
@@ -527,11 +613,25 @@ if (EXPECT === 'rollback') {
 const rbN = (out.gate && out.gate.lastRbPage) ? out.gate.lastRbPage.rollbacks : (out.page ? out.page.rollbacks : 0);
 if (NOREF) console.log('  INFO  --noref: exactness not checked');
 else if (!R) bad('exactness', 'no reference run (' + (out.tappedFrames || 0) + ' tapped frames)');
-else if (!rbN) bad('VOID: no rollback happened, so exactness was not exercised');
+else if (!rbN && !LSEXACT) bad('VOID: no rollback happened, so exactness was not exercised');
 else if (R.firstFullMismatch == null && R.fullMatch === R.compared && R.compared > 0)
-  ok('every confirmed state matches a straight run BIT FOR BIT (full 16.8 MB hash)', `${R.compared} frames compared after ${rbN} rollbacks`);
+  ok('every confirmed state matches a straight run BIT FOR BIT (full 16.8 MB hash)', `${R.compared} frames compared after ${rbN} rollbacks`
+     + (out.fskip ? `; frame skip: ${out.fskip.skipped} presented + ${out.fskip.resimSkipped} re-sim + ${out.fskip.hiddenSkipped} hidden skipped, ${out.fskip.reruns} re-runs`
+        + (out.fskip.linearFs ? `, delay frames ${out.fskip.linear} (${out.fskip.linearFs.skipped} skipped, ${out.fskip.linearFs.redo} re-runs)` : '') : ''));
 else bad('confirmed state differs from the straight run', JSON.stringify(R));
 if (out.engineState === 'desync' || out.engineState === 'failed' || out.fault) bad('engine state', out.engineState + ' ' + (out.fault || out.error || ''));
+if (out.picsStraight) {
+  const P = out.picsStraight;
+  if (!(P.compared > 0)) bad('pictures vs the straight run', 'nothing compared');
+  else if (P.same === P.compared) ok('every kept picture matches the straight run (same inputs, every frame drawn)', `${P.compared} frames`);
+  else bad('pictures differ from the straight run', JSON.stringify(P));
+}
+if (PICSREF) {
+  const P = out.pics;
+  if (!P || !(P.compared > 0)) bad('pictures', 'nothing compared ' + JSON.stringify(P));
+  else if (P.same === P.compared) ok('every drawn picture that stayed true matches the reference run', `${P.compared} frames compared (${P.kept} kept here)`);
+  else bad('pictures differ from the reference run', JSON.stringify(P));
+}
 console.log(JSON.stringify(Object.assign({}, out, { timeline: undefined, log: undefined })));
 if (JSON_OUT) writeFileSync(JSON_OUT, JSON.stringify(out, null, 1));
 console.log(`\n[n64-rollback] ${pass} passed, ${fail} failed`);
