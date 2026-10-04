@@ -1840,7 +1840,9 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
                      BitSet32(assumed.m_val | selfloop_pw.m_val), params.cmp_fuse);
             emitted_native = true;
         } else {
+            rc.SetOpReads(op.regsIn.m_val);   // [WRITE_NOLOAD] this op's GPR reads
             emitted_native = dispatch_op(b, rc, frc, op, params);
+            rc.SetOpReads(0xFFFFFFFFu);
             params.defer_pc = 0;   // [MEM_SLOWARM] consumed by this op only
         }
 

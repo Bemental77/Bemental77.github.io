@@ -6,6 +6,7 @@
 // require the Dolphin u64 CR-encoding helpers and are deferred to
 // Phase 4.5 so per-byte oracle parity is preserved against the live tree.
 
+#include "lever_gate.h"
 #include "jit_integer.h"
 
 #include "bementalJIT/types.h"
@@ -35,6 +36,14 @@ static bool emit_oe_fallback_if_set(WasmModuleBuilder& wb, RegCache& rc,
                                     FPRRegCache& frc, const CodeOp& op,
                                     u32 ctx_ptr) {
     if (!GekkoOperands::OE(op.inst)) return false;
+    // [pc-sync 2026-10-04] the [pc-sync A4 2026-06-28] sweep missed this site:
+    // integer OE ops are not canEndBlock/FL_LOADSTORE/FL_USE_FPU, so no pre-op
+    // pc store is emitted, and dolphin_interp's `if (ppc_state.pc != pc)
+    // return;` guard (dolphin_jit_wimports.cpp) then SILENTLY SKIPS the op.
+    // Store pc first, exactly as emit_fallback / emit_mftb do.
+    wb.op_i32_const((s32)ctx_ptr);
+    wb.op_i32_const((s32)op.address);
+    wb.op_i32_store(ppc_off::PC);
     rc.Flush(ctx_ptr);
     frc.Flush(ctx_ptr);
     wb.op_i32_const((s32)op.inst);
@@ -748,9 +757,22 @@ void emit_srawx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Cod
         wb.op_i32_store8(ppc_off::XER_CA);
     wb.op_else();
         // Bit-5 case — fallback to interp. Reuse WIMPORT_INTERP=6.
+        // [pc-sync 2026-10-04] pc first, or the interp guard skips the op (see
+        // emit_oe_fallback_if_set).
+        wb.op_i32_const((s32)ctx_ptr);
+        wb.op_i32_const((s32)op.address);
+        wb.op_i32_store(ppc_off::PC);
         wb.op_i32_const((s32)inst);
         wb.op_i32_const((s32)op.address);
         wb.op_call(/*WIMPORT_INTERP=*/6);
+        // [pc-sync 2026-10-04] The interp wrote gpr[ra] in ctx; pull it into
+        // ra's local so the MarkDirty below flushes the interp's result at
+        // block exit. Without this the exit flush wrote the local's PRE-op
+        // value over it (moot while the missing pc store above made the interp
+        // skip the op; a real bug once it runs).
+        wb.op_i32_const((s32)ctx_ptr);
+        wb.op_i32_load(ppc_off::gpr(GekkoOperands::RA(inst)));
+        wb.op_local_set(rc_ra.local_idx());
     wb.op_end();
 
     // The Flush before the if cleared dirty for rc_ra; the IF arm above
@@ -938,6 +960,11 @@ void emit_subfmex(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const C
     // would clobber what the interpreter just wrote with the stale local
     // value. Matches the pattern used by other interp-fallback sites in
     // this file (e.g. the invalid-TBR path in emit_mftb).
+    // [pc-sync 2026-10-04] + the pc store the A4 sweep missed (see
+    // emit_oe_fallback_if_set): without it the interp guard skipped subfme.
+    wb.op_i32_const((s32)ctx_ptr);
+    wb.op_i32_const((s32)op.address);
+    wb.op_i32_store(ppc_off::PC);
     rc.Flush(ctx_ptr);
     wb.op_i32_const((s32)op.inst);
     wb.op_i32_const((s32)op.address);

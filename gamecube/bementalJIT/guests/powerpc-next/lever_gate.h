@@ -64,6 +64,9 @@ constexpr u32 BEM_LEVER_PROMOTE_SIMD = 1u << 9;
 // Block terminal: chain to the terminator's STATIC b/bc successors through
 // compile-time-constant dispatch buckets (PC compare first).
 constexpr u32 BEM_LEVER_STATIC_CHAIN = 1u << 10;
+// RegCache::Bind(Write) skips the first-touch load of a GPR the current op
+// does not read (CodeOp::regsIn).
+constexpr u32 BEM_LEVER_WRITE_NOLOAD = 1u << 11;
 
 bool bem_lever_on(u32 bit);
 

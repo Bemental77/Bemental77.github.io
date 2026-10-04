@@ -6,6 +6,7 @@
 // Status: wired through jit_load_store / jit_integer / jit_branch /
 // jit_compare / jit_system_registers / ppc_emit (build_block_next).
 
+#include "lever_gate.h"
 #include "reg_cache.h"
 
 #include "bementalJIT/types.h"
@@ -102,6 +103,23 @@ RCWasmLocal RegCache::Bind(u32 preg, RCMode mode) {
         // bugs of this class are gone.
         s.local_idx = m_local_base + preg;
         s.assigned  = true;
+        // [BEM_LEVER_WRITE_NOLOAD 2026-10-04] A pure-Write bind of a reg the
+        // current op does NOT read (not in CodeOp::regsIn) skips the first-touch
+        // load — Jit64 parity: RCMode::Write binds there never load the old
+        // value. The 2026-06-11 case above (RMW emitters binding dest BEFORE src
+        // with dest == src) is unaffected: there dest IS in regsIn, so the load
+        // stays. The local is defined by the op before any read or flush of it
+        // (an op that architecturally overwrites a reg it does not read cannot
+        // depend on the old value; the integer-load slow-arm flush reads the
+        // pre-Bind snapshot, where this reg is unassigned and so not flushed).
+        // Measured on SAB (block_replay): 530k of 4.58M executed wasm loads.
+        if (mode == RCMode::Write && !((m_op_reads >> preg) & 1u) &&
+            bem_lever_on(BEM_LEVER_WRITE_NOLOAD)) {
+            s.loaded = true;
+            s.dirty  = true;
+            s.is_imm = false;
+            return RCWasmLocal(this, s.local_idx, preg, mode);
+        }
         // m_lazy_ctx_ptr stamped by OnBlockEntry; 0 = mis-wiring,
         // would emit OOB load (wasm trap) which surfaces the bug.
         m_wb.op_i32_const((s32)m_lazy_ctx_ptr);
