@@ -1964,6 +1964,13 @@
   // ?jitcorpus=0 (fbasync.js publishes nothing for it; core_worker.js does not load one) = off.
   var WARM = { corpus: null, capture: null, started: false, ids: new Map(), offered: 0, cached: 0, dropped: null };
   var WARM_PER_SPAN = { vaddr: 1, entryPtr: 1, span: 1, srcPtr: 1, blockStart: 1, blockEnd: 1 };
+  // A REJECTED CORPUS IS SAID OUT LOUD. The param block holds host addresses (statics, table
+  // indices), so a core rebuild that moves the core's static data rejects every shipped corpus —
+  // cb0d31a did, and nothing said so (warm.dropped only). Regenerate with n64/tools/n64_jit_corpus.mjs.
+  function warmSayDropped(why) {
+    var g = (typeof globalThis !== 'undefined') ? globalThis : self, s = '[jit] ⚠ span corpus REJECTED (' + why + ') — made for another core build; regenerate it (n64/tools/n64_jit_corpus.mjs)';
+    try { if (typeof g.log === 'function') g.log(s); else console.warn(s); } catch (e) {}
+  }
   function warmCheck(C, live) {
     var k;
     for (k in C.static) if (C.static[k] !== live.p[k]) return 'param ' + k;
@@ -1985,6 +1992,7 @@
         // nothing it compiled was ever put where a span could find it: dropped, and the corpus is
         // judged again against the live block, as without an early start
         E.ok = false; E.why = why; E.held = []; WARM.ids.clear();
+        warmSayDropped('early start: ' + why);
         WARM.corpus = E.C; WARM.started = false; WARM.offered = 0;
       } else {
         E.ok = true;
@@ -1997,7 +2005,7 @@
     C = WARM.corpus; WARM.corpus = null;
     if (WARM.started || !C) return; WARM.started = true;
     if (early) WARM.early = { ok: null, C: C, flags: live.flags, tableBase: live.tableBase, held: [], why: null, at: Date.now() };
-    else { why = warmCheck(C, live); if (why) { WARM.dropped = why; return; } }
+    else { why = warmCheck(C, live); if (why) { WARM.dropped = why; warmSayDropped(why); return; } }
     var out = [];
     for (var i = 0; i < C.jobs.length; i++) {
       var cj = C.jobs[i], pp = Object.assign({}, live.p), w = C.pages[cj.pg];

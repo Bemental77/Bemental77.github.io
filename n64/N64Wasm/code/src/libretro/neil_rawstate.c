@@ -149,7 +149,10 @@ static int g_last_load_pages;     /* pages invalidated by the last selective loa
 static int g_tlb_same_by_content; /* loads whose TLB generation differed but whose TLB did not */
 static int g_tlb_remapped;        /* loads whose TLB did differ, taken selectively (mode 3) */
 static int g_tlb_remapped_pages;  /* virtual pages the last such load invalidated */
-static unsigned char g_phys_chg[RDRAM_MAX_SIZE >> 12]; /* pages the last load found changed */
+/* pages the last load found changed — ON THE HEAP, allocated at the first load: a 2 KiB static
+ * here moved the core's statics 4 KiB up, and the JIT's span corpora (dist/jit/) are keyed by those
+ * host addresses (mips_emit.js A SHIPPED SPAN CORPUS) — every shipped corpus was rejected */
+static unsigned char* g_phys_chg;
 
 #define ALIGN8(x) (((x) + 7u) & ~7u)
 
@@ -388,7 +391,7 @@ static int invalidate_changed_code_pages(const unsigned char* img)
       {
          invalid_code[0x80000 + p] = 1;
          invalid_code[0xA0000 + p] = 1;
-         g_phys_chg[p] = 1;
+         if (g_phys_chg) g_phys_chg[p] = 1;
          n++;
       }
    }
@@ -465,7 +468,10 @@ int neil_state_load_raw(const unsigned char* src)
       lut_same = 1;
       g_tlb_same_by_content++;
    }
-   memset(g_phys_chg, 0, sizeof(g_phys_chg));
+   if (!g_phys_chg)
+      g_phys_chg = (unsigned char*)malloc(RDRAM_MAX_SIZE >> 12);
+   if (g_phys_chg)
+      memset(g_phys_chg, 0, RDRAM_MAX_SIZE >> 12);
    if (lut_same && g_dram_off_ok == 1)
    {
       g_last_load_pages = invalidate_changed_code_pages(src + NEIL_M64P_DRAM_OFF);
@@ -473,7 +479,7 @@ int neil_state_load_raw(const unsigned char* src)
       savestates_keep_code_cache = 1;
    }
    else if (!lut_same && h.nonce == instance_nonce() && g_dram_off_ok == 1 && neil_m64p_lut_off
-         && neil_m64p_lut_off + 2u * sizeof(tlb_LUT_r) <= NEIL_M64P_REGION && !neil_remap_off)
+         && neil_m64p_lut_off + 2u * sizeof(tlb_LUT_r) <= NEIL_M64P_REGION && !neil_remap_off && g_phys_chg)
    {
       g_last_load_pages = invalidate_changed_code_pages(src + NEIL_M64P_DRAM_OFF);
       g_tlb_remapped_pages = invalidate_remapped_pages(src);
