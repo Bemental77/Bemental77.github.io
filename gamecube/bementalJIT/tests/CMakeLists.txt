@@ -186,6 +186,31 @@ if(BEMENTAL_GUEST_POWERPC)
         target_compile_options(test_fma_exact PRIVATE "-pthread")
     endif()
 
+    # [mem-slowarm 2026-10-04] Host-observed ctx.PC / gpr[] at the slow-arm
+    # memory imports under BEM_LEVER_MEM_SLOWARM. `node test_mem_slowarm.js`.
+    if(BEMENTAL_GUEST_POWERPC_NEXT)
+        add_executable(test_mem_slowarm test_mem_slowarm.cpp)
+        target_link_libraries(test_mem_slowarm PRIVATE
+            bementalJIT bementalJITPowerPCNext bementalJITPowerPC)
+        target_include_directories(test_mem_slowarm PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+        set_target_properties(test_mem_slowarm PROPERTIES SUFFIX ".html")
+        target_link_options(test_mem_slowarm PRIVATE
+            "SHELL:-s EXIT_RUNTIME=1"
+            "SHELL:-s EXPORTED_RUNTIME_METHODS=['HEAPU8','HEAP8','HEAP16','HEAPU16','HEAP32','HEAPU32','HEAPF32','HEAPF64']"
+            "SHELL:-pthread"
+            "SHELL:-s PTHREAD_POOL_SIZE=0"
+            "SHELL:-s INITIAL_MEMORY=67108864"
+            "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+            "SHELL:-s MAXIMUM_MEMORY=67108864"
+            "SHELL:-s ALLOW_TABLE_GROWTH=1"
+            "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
+        )
+        target_compile_options(test_mem_slowarm PRIVATE "-pthread")
+    endif()
+
     # [simd-bswap 2026-08-29] Bit-exactness gate for the SIMD byte-swap on the
     # adjacent-word-pair memory ops (psq_l/psq_st FLOAT pair, lfd, stfd). Uses a
     # real host buffer as mem1_base so the FASTMEM arms — the only arms the

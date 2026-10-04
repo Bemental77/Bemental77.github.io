@@ -392,6 +392,30 @@ static void emit_lc_addr(WasmModuleBuilder& wb, LoadStoreParams params) {
 // region test only ever executes on the ALREADY-SLOW arm, so RAM fast hits
 // pay nothing. Result carried through LOCAL_TMP_VAL (bswap scratch is
 // sequential-safe; callers that keep a live value there must re-load after).
+// [BEM_LEVER_MEM_SLOWARM 2026-10-04] see LoadStoreParams::defer_pc. Stack-
+// neutral; touches no local (Flush emits const/local.get/store only), so it is
+// safe at any point of a slow arm, including between an import's argument
+// pushes and its call.
+static void emit_host_call_prep(WasmModuleBuilder& wb, const LoadStoreParams& params) {
+    if (params.host_rc && params.host_rc_snap) {
+        // Emit EXACTLY the stores the elided common-path rc.Flush would have
+        // emitted: same compile-time state (snapshotted at that point), and the
+        // runtime locals are unchanged since (nothing between the snapshot and a
+        // slow arm writes a GPR local except a lazy Bind(rt) load of a reg the
+        // snapshot holds unassigned, which Flush therefore skips). Compile-time
+        // state is restored afterwards, so the regs stay dirty for later flushes.
+        const RegCache::StateSnapshot cur = params.host_rc->SaveState();
+        params.host_rc->RestoreState(*params.host_rc_snap);
+        params.host_rc->Flush(params.ctx_ptr);
+        params.host_rc->RestoreState(cur);
+    }
+    if (params.defer_pc) {
+        wb.op_i32_const((s32)params.ctx_ptr);
+        wb.op_i32_const((s32)params.defer_pc);
+        wb.op_i32_store(ppc_off::PC);
+    }
+}
+
 static void emit_slowmem_load_value(WasmModuleBuilder& wb,
                                     LoadStoreParams params, LoadWidth width) {
     if (params.lc_base) {
@@ -421,6 +445,7 @@ static void emit_slowmem_load_value(WasmModuleBuilder& wb,
             }
             wb.op_local_set(LOCAL_TMP_VAL);
         wb.op_else();
+            emit_host_call_prep(wb, params);
             wb.op_local_get(LOCAL_TMP_EA);
             wb.op_call(read_import_for_width(width));
             if (width == LoadWidth::S16) {
@@ -434,6 +459,7 @@ static void emit_slowmem_load_value(WasmModuleBuilder& wb,
         wb.op_local_get(LOCAL_TMP_VAL);
         return;
     }
+    emit_host_call_prep(wb, params);
     wb.op_local_get(LOCAL_TMP_EA);
     wb.op_call(read_import_for_width(width));
     if (width == LoadWidth::S16) {
@@ -656,6 +682,7 @@ static void emit_gp_append(WasmModuleBuilder& wb, LoadStoreParams params,
     wb.op_i32_const((s32)GP_PIPE_SIZE);
     wb.op_i32_ge_u();
     wb.op_if(BLOCK_TYPE_VOID);
+        emit_host_call_prep(wb, params);
         wb.op_i32_const(0);
         wb.op_i32_const(0);
         wb.op_call(WIMPORT_GATHER_DRAIN);
@@ -670,12 +697,14 @@ static void emit_gp_or_import_store(WasmModuleBuilder& wb, LoadStoreParams param
         wb.op_if(BLOCK_TYPE_VOID);
             emit_gp_append(wb, params, width, src_local);
         wb.op_else();
+            emit_host_call_prep(wb, params);
             wb.op_local_get(LOCAL_TMP_EA);
             wb.op_local_get(src_local);
             wb.op_call(write_import_for_width(width));
         wb.op_end();
         return;
     }
+    emit_host_call_prep(wb, params);
     wb.op_local_get(LOCAL_TMP_EA);
     wb.op_local_get(src_local);
     wb.op_call(write_import_for_width(width));
@@ -791,6 +820,7 @@ static void emit_slowmem_store(WasmModuleBuilder& wb, LoadStoreParams params,
         wb.op_end();
         return;
     }
+    emit_host_call_prep(wb, params);
     wb.op_local_get(LOCAL_TMP_EA);
     wb.op_local_get(src_local);
     wb.op_call(write_import_for_width(width));
@@ -815,7 +845,17 @@ static void emit_load_common(WasmModuleBuilder& wb, RegCache& rc,
     // gpr(31) slot mid-load, surfacing as __init_hardware's mtlr r31; blr
     // returning to PC=0 (caller-saved r31 = 0 after function return).
     emit_fastmem_guard(wb, params, load_width_bytes(width));
-    rc.Flush(params.ctx_ptr);  // stack-neutral — guard stays on top
+    // [BEM_LEVER_MEM_SLOWARM] the slow arms' host calls re-emit this flush from
+    // THIS compile-time state (snapshot taken before Bind(rt) below, which keeps
+    // the 2026-05-31 flush-before-Bind ordering for the stores the host sees).
+    RegCache::StateSnapshot host_snap;
+    if (bem_lever_on(BEM_LEVER_MEM_SLOWARM)) {
+        host_snap = rc.SaveState();
+        params.host_rc = &rc;
+        params.host_rc_snap = &host_snap;
+    } else {
+        rc.Flush(params.ctx_ptr);  // stack-neutral — guard stays on top
+    }
     // [flush-narrow 2026-07-13] NO frc.Flush here. This is the INTEGER load path
     // (rt is a GPR); the slow arm's host handler (MMU/MMIO — dolphin_read*) reads
     // guest gpr[] (e.g. ExpansionInterface gpr[3..5]) but NEVER ps[]/FPRs, and
@@ -882,7 +922,15 @@ static void emit_store_common(WasmModuleBuilder& wb, RegCache& rc,
     const u32 rs_local = rc_rs.local_idx();
 
     emit_fastmem_guard(wb, params, store_width_bytes(width));
-    rc.Flush(params.ctx_ptr);
+    // [BEM_LEVER_MEM_SLOWARM] see emit_load_common.
+    RegCache::StateSnapshot host_snap;
+    if (bem_lever_on(BEM_LEVER_MEM_SLOWARM)) {
+        host_snap = rc.SaveState();
+        params.host_rc = &rc;
+        params.host_rc_snap = &host_snap;
+    } else {
+        rc.Flush(params.ctx_ptr);
+    }
     // [flush-narrow 2026-07-13] NO frc.Flush — INTEGER store path (rs is a GPR).
     // The slow arm's host WRITE handler (dolphin_write*: MMU / GPFifo / DSP mailbox
     // / EXI) reads the value from gpr and inspects gpr[], never ps[]/FPRs; FPRs are
@@ -999,6 +1047,8 @@ void emit_load_d(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     // guarded if/else (BAT/TLB races on MMU enable would otherwise
     // require yet another const-address gate).
     if (op.has_const_ea && is_mmio_const_addr(op.const_ea)) {
+        emit_host_call_prep(wb, params);   // [MEM_SLOWARM] deferred pre-op PC (no rc: host_rc unset)
+        params.defer_pc = 0;
         // CRITICAL: Flush dirty regcache BEFORE Bind(rt, Write). Binding rt
         // first marks its wasm-local as the canonical source; the subsequent
         // Flush inside emit_const_mmio_load would then write rt's stale local
@@ -1055,6 +1105,8 @@ void emit_store_d(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     // store ordering required by DVDInterface DICR.TSTART/DICMDBUF[0],
     // AudioInterface, etc.
     if (op.has_const_ea && is_mmio_const_addr(op.const_ea)) {
+        emit_host_call_prep(wb, params);   // [MEM_SLOWARM] deferred pre-op PC (no rc: host_rc unset)
+        params.defer_pc = 0;
         // [gp-const-ea 2026-09-01] WRITE-GATHER-PIPE CARVE-OUT. WPAR (0xCC008000)
         // sits inside the 0xCC000000..0xCC03FFFF const-MMIO window, so a store
         // whose EA the analyst folded — `lis rX,0xCC01` then `sth rY,-0x8000(rX)`,

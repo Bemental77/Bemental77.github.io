@@ -604,6 +604,21 @@ static void emit_fallback(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     frc.ReloadAll(ctx_ptr);
 }
 
+// [BEM_LEVER_MEM_SLOWARM] true iff dispatch_op routes `inst` to emit_load_d /
+// emit_store_d / emit_load_x / emit_store_x (the cases below, verbatim).
+static bool IsIntegerLoadStoreCommon(u32 inst) {
+    const u32 opcd = GekkoOperands::OPCD(inst);
+    if ((opcd >= 32 && opcd <= 45)) return true;
+    if (opcd != 31) return false;
+    switch (GekkoOperands::SUBOP10(inst)) {
+    case 23: case 55: case 87: case 119: case 279: case 311: case 343: case 375:
+    case 151: case 183: case 215: case 247: case 407: case 439:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                  const CodeOp& op, LoadStoreParams params) {
     const u32 inst  = op.inst;
@@ -1571,9 +1586,25 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
         // THP IDCT loop) — a norm-shaving cut, applies to all FP-heavy code.
         const bool fpu_needs_pc =
             op.opinfo && (op.opinfo->flags & FL_USE_FPU) && !first_fp_found;
-        if (is_terminator || op.canEndBlock || op.canCauseException ||
-            fpu_needs_pc ||
-            (op.opinfo && (op.opinfo->flags & FL_LOADSTORE)))
+        // [BEM_LEVER_MEM_SLOWARM 2026-10-04] An integer load/store routed to
+        // emit_load_d/_x / emit_store_d/_x whose ONLY reason for the pre-op PC
+        // store is FL_LOADSTORE (the slow arm's host handler may read ctx.PC)
+        // defers it into those host calls (emit_host_call_prep). Every other
+        // reader of a mid-block ctx.PC writes its own: emit_fallback, the
+        // FP-unavailable bail (fpu_needs_pc, kept), terminators (is_terminator,
+        // kept), canEndBlock ops (kept); no DSI is raised in the MMU-off config.
+        params.defer_pc = 0;
+        if (!is_terminator && !op.canEndBlock && !fpu_needs_pc && op.opinfo &&
+            (op.opinfo->flags & (FL_PROGRAMEXCEPTION | FL_FLOAT_EXCEPTION |
+                                 FL_FLOAT_DIV | FL_USE_FPU)) == 0 &&
+            IsIntegerLoadStoreCommon(op.inst) &&
+            bem_lever_on(BEM_LEVER_MEM_SLOWARM)) {
+            params.defer_pc = op.address;
+        }
+        if (params.defer_pc == 0u &&
+            (is_terminator || op.canEndBlock || op.canCauseException ||
+             fpu_needs_pc ||
+             (op.opinfo && (op.opinfo->flags & FL_LOADSTORE))))
         {
             b.op_i32_const((s32)ctx_ptr);
             b.op_i32_const((s32)op.address);
@@ -1742,6 +1773,7 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             emitted_native = true;
         } else {
             emitted_native = dispatch_op(b, rc, frc, op, params);
+            params.defer_pc = 0;   // [MEM_SLOWARM] consumed by this op only
         }
 
         // [PM55 EA-CSE] KEEP the last-EA cache only when this op preserves the

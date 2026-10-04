@@ -41,6 +41,10 @@ constexpr u32 BEM_LEVER_STFS_SINGLE = 1u << 4;
 // emit_psq_convert_to_double (the NaN-exact f32->f64 widen) as a typed `if`
 // instead of a `select`, so the Inf/NaN splice arm only runs when taken.
 constexpr u32 BEM_LEVER_WIDEN_BRANCH = 1u << 5;
+// Integer load/store (emit_load_common / emit_store_common): the pre-op ctx.PC
+// store and the GPR flush move from the common path into the slow arms' host
+// calls (LoadStoreParams::defer_pc / host_rc).
+constexpr u32 BEM_LEVER_MEM_SLOWARM = 1u << 6;
 
 bool bem_lever_on(u32 bit);
 
