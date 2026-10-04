@@ -9338,6 +9338,9 @@ window.GcRate = (function () {
     get role() { return GCROOM.role; },
     pendingAck: -1,      // PAD_ACK value the in-flight image is waiting to pass; -1 = idle
     fedTo: 0, framesFed: 0,
+    // frames this console released in each mode (presented + hidden; not re-simulated): the room
+    // test's 'time in rollback vs delay'. Unsafe boot frames (held for real inputs) count apart.
+    modeFrames: { rollback: 0, delay: 0, lockstep: 0, unsafe: 0 },
     bfCalls: 0, bfStall: 0,
     stalling: false, waitingOn: [], stallReason: null,
     fault: null,         // why this machine is NOT frame-gated, in words
@@ -9371,8 +9374,9 @@ window.GcRate = (function () {
   var RBC = { ARM_GEN: 1, STOP_GEN: 2, UNSAFE: 3, VI_AT: 6, REQ_GEN: 4, REQ_FROM: 5, DONE_GEN: 7, KEEP: 8, FP_EVERY: 9, FP_ALIGN: 10, FP_SEQ: 11,
               HIDDEN: 12, FAULT: 13, FP_RING: 16, S_ROLLBACKS: 64, S_RESIM: 65, S_STEP_US: 66, S_STEPS: 67, S_SAVE_US: 68,
               S_HELD: 69, S_SLOTS: 70, S_MAXDEPTH: 71, S_RESTORE_US: 72, S_OVERFLOWS: 73, S_W: 74, S_BASE: 75, S_TOUCHES: 76,
-              S_ARMED: 77, S_GEN: 78, RING: 256, RING_N: 256, RING_S: 17 };
+              S_ARMED: 77, S_GEN: 78, S_FPR_US: 87, RING: 256, RING_N: 256, RING_S: 17 };
   var rbSab = new SharedArrayBuffer(32768);
+  var RB_STEP_WIN = 8;   // half-second windows in the step price's median (see gcRbPoll)
   var RBP = {
     i32: new Int32Array(rbSab),
     workerOk: null,      // the worker instrumented its module (its 'build' message) — null until it says
@@ -9387,6 +9391,7 @@ window.GcRate = (function () {
     fpSeq: 0, fpLost: 0, staleHashes: 0,
     catchUp: 0, hidden: 0, unsafeFrames: 0, unsafeWaits: 0, rollbacks: 0, resimFrames: 0, maxDepth: 0, rearms: 0, memStalls: 0,
     stepUs0: 0, steps0: 0, stepMs: 0, statAt: 0, faulted: false,
+    stepHist: [],        // the per-half-second step prices (ms), newest last — see gcRbPoll
     // THE DEVICE BUDGET for undo pages (4 KiB each) held at once. A frame typically logs a few
     // hundred; a scene load can log thousands. Over budget, the console waits (like a window
     // stall) until the room's inputs arrive and the KEEP point frees pages. navigator.deviceMemory
@@ -9486,18 +9491,31 @@ window.GcRate = (function () {
     // paid in every mode, delay included, so it is not part of what rollback ADDS; it used to be
     // averaged in, and a boot full of disc reads read as a 155% need and dropped the room to delay.
     // Before any re-simulation: the presented frames' guest run + save, the same quantities.
+    // The worker's guest-run counters (80/83) EXCLUDE the frame-start work (save point, restore,
+    // fingerprint step: recomp_worker.js S_Q_US) — they used to include it, so a rewind's restore
+    // was priced twice (inside the first re-simulated frame's run and again on its own) and so was
+    // every save. A re-simulated frame's own fingerprint step (S_FPR_US) is part of its cost.
+    // ⚠ PRICED ON A ROBUST WINDOW, NOT AN EXPONENTIAL MEAN. A scene load re-simulated is a burst
+    // (MEASURED, 2-player room: the per-window step went 2-3 ms -> 12-17 ms for a few seconds at a
+    // board load) that an EMA carried into three consecutive host decisions and dropped the room
+    // to input delay for 10-40 s of calm-down. The price is the MEDIAN of the last RB_STEP_WIN
+    // half-second windows: a device that is slow is slow in every window and moves the median
+    // within RB_STEP_WIN/2 windows; a burst shorter than that does not move it.
     var now = performance.now();
     if (now - RBP.statAt >= 500) {
       RBP.statAt = now;
       var c = { gp: Atomics.load(I, 80), np: Atomics.load(I, 82), gr: Atomics.load(I, 83), vr: Atomics.load(I, 84),
-                nr: Atomics.load(I, 85), sv: Atomics.load(I, RBC.S_SAVE_US), rs: Atomics.load(I, RBC.S_RESTORE_US) };
+                nr: Atomics.load(I, 85), sv: Atomics.load(I, RBC.S_SAVE_US), rs: Atomics.load(I, RBC.S_RESTORE_US),
+                fr: Atomics.load(I, RBC.S_FPR_US) };
       var p0 = RBP.stat0 || c, per = null;
       var dnp = c.np - p0.np, dnr = c.nr - p0.nr, dsv = (c.sv - p0.sv) / Math.max(1, dnp + dnr);
-      if (dnr > 0) per = ((c.gr - p0.gr) + (c.vr - p0.vr) + (c.rs - p0.rs)) / dnr + dsv;
+      if (dnr > 0) per = ((c.gr - p0.gr) + (c.vr - p0.vr) + (c.rs - p0.rs) + (c.fr - p0.fr)) / dnr + dsv;
       else if (dnp > 0) per = (c.gp - p0.gp) / dnp + dsv;
       if (per != null && RBP.stat0) {
         per /= 1000;
-        RBP.stepMs = RBP.stepMs ? RBP.stepMs + (per - RBP.stepMs) / 8 : per;
+        RBP.stepHist.push(+per.toFixed(2)); if (RBP.stepHist.length > 40) RBP.stepHist.shift();
+        var win = RBP.stepHist.slice(-RB_STEP_WIN).sort(function (x, y) { return x - y; });
+        RBP.stepMs = win[(win.length - 1) >> 1];
         ls.selfStepMs = +RBP.stepMs.toFixed(2);
       }
       RBP.stat0 = c;
@@ -9509,7 +9527,7 @@ window.GcRate = (function () {
     var mode = null; try { mode = ls && typeof ls.modeReport === 'function' ? ls.modeReport() : null; } catch (e) {}
     return {
       scheme: RBP.scheme, workerOk: RBP.workerOk, workerWhy: RBP.workerWhy, window: ls ? ls.rollback | 0 : null,
-      capGate: !!(ls && ls._capGate), selfStepMs: RBP.stepMs ? +RBP.stepMs.toFixed(2) : 0, mode: mode,
+      capGate: !!(ls && ls._capGate), selfStepMs: RBP.stepMs ? +RBP.stepMs.toFixed(2) : 0, stepHist: RBP.stepHist.slice(-40), mode: mode,
       page: { rollbacks: RBP.rollbacks, resimFrames: RBP.resimFrames, maxDepth: RBP.maxDepth, hidden: RBP.hidden,
               rearms: RBP.rearms, memStalls: RBP.memStalls, unsafeFrames: RBP.unsafeFrames, unsafeWaits: RBP.unsafeWaits, staleHashes: RBP.staleHashes, fpLost: RBP.fpLost, due: RBP.due.length, off: RBP.off },
       worker: { armed: !!g(RBC.S_ARMED), w: g(RBC.S_W), base: g(RBC.S_BASE), held: g(RBC.S_HELD), rollbacks: g(RBC.S_ROLLBACKS),
@@ -9519,7 +9537,12 @@ window.GcRate = (function () {
                 pagesLogged: g(RBC.S_TOUCHES), fault: g(RBC.FAULT), gen: g(RBC.S_GEN),
                 // ms per frame: the guest's own run and the VI pump, presented vs re-simulated frames
                 guestMsPresented: +(g(80) / 1000 / Math.max(1, g(82))).toFixed(3), viMsPresented: +(g(81) / 1000 / Math.max(1, g(82))).toFixed(3),
-                guestMsResim: +(g(83) / 1000 / Math.max(1, g(85))).toFixed(3), viMsResim: +(g(84) / 1000 / Math.max(1, g(85))).toFixed(3) },
+                guestMsResim: +(g(83) / 1000 / Math.max(1, g(85))).toFixed(3), viMsResim: +(g(84) / 1000 / Math.max(1, g(85))).toFixed(3),
+                // frame-start work (save + restore + fingerprint), and the fingerprint's share and page cache
+                qMsPerFrame: +(g(88) / 1000 / Math.max(1, g(82) + g(85))).toFixed(3),
+                fpMsPresented: +(g(86) / 1000 / Math.max(1, g(82))).toFixed(3), fpMsResim: +(g(87) / 1000 / Math.max(1, g(85))).toFixed(3),
+                fpHit: g(89), fpMiss: g(90), fpStale: g(91),
+                restoreMsPerRewind: +(g(RBC.S_RESTORE_US) / 1000 / Math.max(1, g(RBC.S_ROLLBACKS))).toFixed(3) },
       engine: eng,
     };
   }
@@ -9814,6 +9837,7 @@ window.GcRate = (function () {
     else gcLsEarned--;
     Atomics.add(paceI32, 0, 1); Atomics.notify(paceI32, 0);   // exactly one frame
     GCLS.fedTo = r.frame + 1; GCLS.framesFed++;
+    GCLS.modeFrames[unsafe ? 'unsafe' : ls.rollback > 0 ? 'rollback' : (RBP.scheme ? 'delay' : 'lockstep')]++;
     ls.endFrame(null);
     if (RBP.scheme) {
       if (ls.rollback > 0 && typeof ls.takeHashDue === 'function') { var due = ls.takeHashDue(); for (var di = 0; di < due.length; di++) RBP.due.push(due[di]); }
@@ -10116,7 +10140,7 @@ window.GcRate = (function () {
       // the local-input-lag witness (gcLatWitness): frames between sampling this console's pad and
       // the frame the room runs it on
       lat: { samples: GCLAT.samples.slice(-50), overlapped: GCLAT.overlapped },
-      framesFed: GCLS.framesFed, bfCalls: GCLS.bfCalls, bfStall: GCLS.bfStall,
+      framesFed: GCLS.framesFed, modeFrames: Object.assign({}, GCLS.modeFrames), bfCalls: GCLS.bfCalls, bfStall: GCLS.bfStall,
       stalling: GCLS.stalling, waitingOn: GCLS.waitingOn.slice(), stallReason: GCLS.stallReason,
       earned: gcLsEarned, guestFrames: (paceI32 ? Atomics.load(paceI32, PAD_ACK) : 0),
       hashSink: GCLS.hashSink, fault: GCLS.fault,
@@ -10617,6 +10641,8 @@ window.GcRate = (function () {
                      // THE ROLLBACK RING: in a room the worker instruments the module so every frame
                      // start in the window can be rewound; solo, nothing changes.
                      rb: !!GCLS.session, rbSab: rbSab,
+                     // ?rbfpverify=1 (a rig seam): re-check every cached fingerprint page hash (recomp_worker.js rbFpVerify)
+                     rbFpVerify: q.get('rbfpverify') === '1',
                      autoboard: q.get('board') === '1' && !boardCom,
                      autotest: boardCom ? { board: 0, mg: null, allcom: true } : null,
                      inputScript: boardScript,

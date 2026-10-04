@@ -233,7 +233,8 @@ const HCODE = Array.from({ length: 5 }, () => CODE_ALPHA[Math.floor(Math.random(
 const URL_BASE = (SEPARATE && !CONTROL)
   ? `${ORIGIN}/gamecube.html?np=${HCODE}&game=${encodeURIComponent('Mario Party 4')}&signal=ws&wsbroker=${encodeURIComponent(broker.url)}&v=${Date.now()}`
   : `${ORIGIN}/gamecube.html?net=local&v=${Date.now()}`;
-const URL_EXTRA = (CHAIN ? '&board=1' : '') + (RB ? '' : '&rb=0');
+// PAGE_QUERY: extra query parameters for every page (e.g. '&rbfpverify=1', a rig seam).
+const URL_EXTRA = (CHAIN ? '&board=1' : '') + (RB ? '' : '&rb=0') + (process.env.PAGE_QUERY || '');
 const pages = [];
 const shared = SEPARATE ? null : await launch();
 for (let i = 0; i < PLAYERS; i++) {
@@ -442,6 +443,8 @@ const ports = last.map((g) => (g.ports || [])[0]);
 for (let i = 0; i < PLAYERS; i++) await (CHAIN ? startChainMasher : startMasher)(pages[i].p, i);
 const tRun = Date.now();
 let prev = await Promise.all(pages.map(({ p }) => snap(p)));
+const runStart = prev.slice();
+const lastEng = prev.map((g) => (g && g.rollback && g.rollback.engine) || null);   // the engine report is null in delay windows
 let prevAt = Date.now();
 let desyncs = [], minRate = Infinity, maxRate = 0, stallWins = 0, maxCompared = 0;
 const WIN = 15000;
@@ -459,7 +462,13 @@ while (Date.now() - tRun < RUN_MS) {
                 frames: now.map((g) => g.guestFrames), compared: now.map((g) => g.hashesCompared),
                 agreed: now.map((g) => g.lastAgreedFrame), stalls: now.map((g) => g.bfStall), delay: now[0].delay,
                 desync: now.map((g) => g.desync), waitInput: wIn.map((v) => +v.toFixed(3)), waitWorker: wWk.map((v) => +v.toFixed(3)), ovl,
-                mode: now.map((g) => g.mode), rb: now.map((g) => g.rollback && g.rollback.worker ? [g.rollback.page.rollbacks, g.rollback.page.resimFrames, g.rollback.worker.slots, g.rollback.selfStepMs] : null) };
+                mode: now.map((g) => g.mode), rb: now.map((g) => g.rollback && g.rollback.worker ? [g.rollback.page.rollbacks, g.rollback.page.resimFrames, g.rollback.worker.slots, g.rollback.selfStepMs] : null),
+                // the engine's view: rollbacks and mean depth THIS window, input lateness p99, lag/lead vs the room clock, the gate's need
+                eng: now.map((g, i) => { const e = g.rollback && g.rollback.engine, e0 = lastEng[i], m = g.rollback && g.rollback.mode; if (e) lastEng[i] = e;
+                  if (!e) return m ? { need: m.need } : null;
+                  const dr = e.rollbacks - (e0 ? e0.rollbacks : 0), dd = e.depthSum - (e0 ? e0.depthSum : 0);
+                  return { rbs: +(dr / dt).toFixed(1), depth: dr ? +(dd / dr).toFixed(1) : 0, maxDepth: e.maxDepth, lateP99: e.lateP99, lag: e.lag, lead: e.lead, rtt: e.rttFrames, need: m ? m.need : null }; }),
+                mf: now.map((g, i) => { const a = g.modeFrames || {}, b0 = prev[i].modeFrames || {}; const o = {}; for (const k of Object.keys(a)) if (a[k] - (b0[k] | 0)) o[k] = a[k] - (b0[k] | 0); return o; }) };
   report.windows.push(row);
   // the GAME stopping (a recomp trap) is not the ROOM failing — say which it is
   if (rates.every((r) => r === 0) && now.every((g) => !g.desync)) {
@@ -474,6 +483,8 @@ while (Date.now() - tRun < RUN_MS) {
               `compared ${row.compared.join('/')}  agreed≤f${row.agreed.join('/')}  delay ${row.delay}  ` +
               `held-for-room ${wIn.map((v) => (v * 100).toFixed(0) + '%').join('/')} held-for-own-worker ${wWk.map((v) => (v * 100).toFixed(0) + '%').join('/')}  ovl ${ovl}  load ${row.load.toFixed(1)}` +
               `  mode ${row.mode.join('/')}  rollbacks/resim/slots/stepMs ${row.rb.map((x) => x ? x.join('/') : '-').join(' ')}` +
+              `  eng ${row.eng.map((e) => e ? (e.rbs != null ? `${e.rbs}rb/s d${e.depth} late${e.lateP99} lag${e.lag} lead${e.lead} rtt${e.rtt}` : '') + ` need${e.need}` : '-').join(' | ')}` +
+              `  frames ${row.mf.map((m) => JSON.stringify(m)).join(' ')}` +
               (desyncs.length ? '  DESYNC ' + JSON.stringify(desyncs) : ''));
   prev = now;
   if (desyncs.length) break;
@@ -490,11 +501,13 @@ if (RB) {
   const tot = rbs.reduce((a, r) => a + ((r.worker && r.worker.rollbacks) | 0), 0);
   const resim = rbs.reduce((a, r) => a + ((r.worker && r.worker.resimFrames) | 0), 0);
   console.log('  rollback rings: ' + rbs.map((r, i) => r.worker ? `${pages[i].who}: ${r.worker.rollbacks} rewinds / ${r.worker.resimFrames} re-simulated (max depth ${r.worker.maxDepth}), ` +
-              `step ${r.selfStepMs} ms (presented guest ${r.worker.guestMsPresented} + pump ${r.worker.viMsPresented}, re-simulated guest ${r.worker.guestMsResim} + pump ${r.worker.viMsResim}), ` +
+              `step ${r.selfStepMs} ms (presented guest ${r.worker.guestMsPresented} + pump ${r.worker.viMsPresented}, re-simulated guest ${r.worker.guestMsResim} + pump ${r.worker.viMsResim}; ` +
+              `frame start ${r.worker.qMsPerFrame} ms/frame, fingerprint ${r.worker.fpMsPresented}/${r.worker.fpMsResim} ms (cache ${r.worker.fpHit} hit / ${r.worker.fpMiss} miss / ${r.worker.fpStale} stale), restore ${r.worker.restoreMsPerRewind} ms/rewind), ` +
               `modes ${JSON.stringify(r.mode && r.mode.history ? r.mode.history.slice(-4) : r.mode)}, ${r.worker.slots} undo pages held (peak budget ${r.worker.budget}), window ${r.window}, hidden ${r.page.hidden}, stale hashes ${r.page.staleHashes}, mem stalls ${r.page.memStalls}` : `${pages[i].who}: -`).join(' · '));
-  (fin.every((g) => g.mode === 'rollback') && tot > 0 && resim >= tot && rbs.every((r) => r.worker && !r.worker.fault && !r.worker.overflows))
-    ? ok('the-rollback-rings-rewound-and-re-simulated-without-a-fault', `${tot} rewinds, ${resim} re-simulated frames across ${PLAYERS} consoles, no ring fault, no log overflow`)
+  (fin.every((g) => g.mode === 'rollback') && tot > 0 && resim >= tot && rbs.every((r) => r.worker && !r.worker.fault && !r.worker.overflows && !r.worker.fpStale))
+    ? ok('the-rollback-rings-rewound-and-re-simulated-without-a-fault', `${tot} rewinds, ${resim} re-simulated frames across ${PLAYERS} consoles, no ring fault, no log overflow, no stale fingerprint page`)
     : bad('the-rollback-rings-rewound-and-re-simulated-without-a-fault', JSON.stringify(rbs.map((r) => r.worker)));
+  console.log('  step price history (ms per half second, last 20 s): ' + rbs.map((r, i) => `${pages[i].who} ${JSON.stringify(r.stepHist || [])}`).join(' · '));
   const lat = [].concat(...fin.map((g) => (g.lat && g.lat.samples) || []));
   const rbLat = lat.filter((x) => x.mode === 'rollback');
   (rbLat.length >= 5 && rbLat.every((x) => x.frames === 0))
@@ -523,6 +536,19 @@ report.meanRate = meanRate; report.minRate = minRate; report.maxRate = maxRate;
   report.waitShare = { input: tot('waitInputMs'), worker: tot('waitWorkerMs') };
   console.log(`  where the room's time went (whole run, per console): held for the ROOM's input ${report.waitShare.input.map((v) => (v * 100).toFixed(1) + '%').join('/')}, ` +
               `held for the console's OWN worker ${report.waitShare.worker.map((v) => (v * 100).toFixed(1) + '%').join('/')}`);
+}
+{
+  // TIME IN ROLLBACK VS DELAY, per console: frames released in each mode, over the whole room
+  // (boot included) and over the long run only (from the first window's snapshot).
+  const share = (mf) => { const t = Object.values(mf || {}).reduce((a, v) => a + v, 0) || 1; const o = {}; for (const k of Object.keys(mf || {})) o[k] = +(mf[k] / t).toFixed(4); return o; };
+  const sub = (a, b0) => { const o = {}; for (const k of Object.keys(a || {})) o[k] = (a[k] | 0) - ((b0 && b0[k]) | 0); return o; };
+  report.modeShare = fin.map((g) => share(g.modeFrames));
+  report.modeShareRun = fin.map((g, i) => share(sub(g.modeFrames, runStart[i] && runStart[i].modeFrames)));
+  report.modeFrames = fin.map((g) => g.modeFrames);
+  console.log(`  time in each mode (frames released, whole room incl. boot): ${fin.map((g, i) => pages[i].who + ' ' + JSON.stringify(g.modeFrames) + ' = ' + JSON.stringify(report.modeShare[i])).join(' · ')}`);
+  console.log(`  time in each mode (the long run only): ${report.modeShareRun.map((m, i) => pages[i].who + ' ' + JSON.stringify(m)).join(' · ')}`);
+  const eng = fin.map((g) => g.rollback && g.rollback.engine);
+  console.log(`  engine: ${eng.map((e, i) => e ? `${pages[i].who} ${e.rollbacks} rollbacks, mean depth ${e.meanDepth}, max ${e.maxDepth}, late p99 ${e.lateP99}, window ${e.window} (peak ${e.windowPeak}), catch-up ${e.catchUpFrames}, advantage waits ${e.advantageWaits}, window stalls ${e.windowStalls}` : pages[i].who + ' -').join(' · ')}`);
 }
 console.log(`  room rate: mean ${meanRate.map((r) => r.toFixed(4) + 'x').join(' ')}, windows min ${minRate.toFixed(4)}x max ${maxRate.toFixed(4)}x over ${report.windows.length} windows of ${WIN / 1000}s (load ${load()})`);
 (meanRate.every((r) => r >= 0.97))

@@ -119,7 +119,8 @@
                     // input arrives up to rbdmax frames late, is predicted, and wrong guesses are rewound
                     // and re-simulated. rbbroken=nocorrect|nojs|noundo is the control that must fail.
                     rbTest: q.get('rbtest') === '1' ? { dMax: parseInt(q.get('rbdmax') || '7', 10), seed: parseInt(q.get('rbseed') || '7', 10),
-                                                       broken: q.get('rbbroken') || null, selfcheck: parseInt(q.get('rbselfcheck') || '0', 10), oracle: q.get('rboracle') === '1' } : null,
+                                                       broken: q.get('rbbroken') || null, selfcheck: parseInt(q.get('rbselfcheck') || '0', 10), oracle: q.get('rboracle') === '1',
+                                                       fp: parseInt(q.get('rbfp') || '0', 10), fpverify: q.get('rbfpverify') === '1', fpnocache: q.get('rbfpnocache') === '1' } : null,
                     glueUrl: '/gamecube/recomp/mp4_game.js', wasmUrl: '/gamecube/recomp/mp4_game.wasm' },
                   parts.concat([fst]));
     if (PACE === 'hw') {
