@@ -70,6 +70,10 @@ int savestates_keep_code_cache = 0;
  * holds identical bytes. 0 (the default) = the shipped behaviour. */
 int savestates_skip_tlb_luts = 0;
 extern uint32_t neil_tlb_gen; /* r4300/tlb.c */
+/* Where the TLB lookup tables and the 32 TLB entries sit in the m64p stream
+ * (fixed: every field before them has a fixed size), recorded by every save
+ * for neil_rawstate.c's content check (0 = no save yet in this instance). */
+size_t neil_m64p_lut_off = 0, neil_m64p_tlbe_off = 0, neil_m64p_tlbe_len = 0;
 
 #define GETARRAY(buff, type, count) \
     (to_little_endian_buffer(buff, sizeof(type),count), \
@@ -327,6 +331,40 @@ int savestates_load_m64p(const unsigned char *data, size_t size)
    return 1;
 }
 
+/* the 32 TLB entries exactly as savestates_save_m64p writes them; returns the bytes written */
+size_t neil_tlbe_serialize(unsigned char *out)
+{
+   unsigned char *curr = out;
+   int i;
+   for (i = 0; i < 32; i++)
+   {
+      PUTDATA(curr, short, tlb_e[i].mask);
+      PUTDATA(curr, short, 0);
+      PUTDATA(curr, unsigned int, tlb_e[i].vpn2);
+      PUTDATA(curr, char, tlb_e[i].g);
+      PUTDATA(curr, unsigned char, tlb_e[i].asid);
+      PUTDATA(curr, short, 0);
+      PUTDATA(curr, unsigned int, tlb_e[i].pfn_even);
+      PUTDATA(curr, char, tlb_e[i].c_even);
+      PUTDATA(curr, char, tlb_e[i].d_even);
+      PUTDATA(curr, char, tlb_e[i].v_even);
+      PUTDATA(curr, char, 0);
+      PUTDATA(curr, unsigned int, tlb_e[i].pfn_odd);
+      PUTDATA(curr, char, tlb_e[i].c_odd);
+      PUTDATA(curr, char, tlb_e[i].d_odd);
+      PUTDATA(curr, char, tlb_e[i].v_odd);
+      PUTDATA(curr, char, tlb_e[i].r);
+
+      PUTDATA(curr, unsigned int, tlb_e[i].start_even);
+      PUTDATA(curr, unsigned int, tlb_e[i].end_even);
+      PUTDATA(curr, unsigned int, tlb_e[i].phys_even);
+      PUTDATA(curr, unsigned int, tlb_e[i].start_odd);
+      PUTDATA(curr, unsigned int, tlb_e[i].end_odd);
+      PUTDATA(curr, unsigned int, tlb_e[i].phys_odd);
+   }
+   return (size_t)(curr - out);
+}
+
 int savestates_save_m64p(unsigned char *data, size_t size)
 {
    unsigned char outbuf[4];
@@ -502,6 +540,7 @@ int savestates_save_m64p(unsigned char *data, size_t size)
    PUTDATA(curr, unsigned int, g_dev.pi.flashram.erase_offset);
    PUTDATA(curr, unsigned int, g_dev.pi.flashram.write_pointer);
 
+   neil_m64p_lut_off = (size_t)(curr - (unsigned char*)data);
    if (savestates_skip_tlb_luts)
    {
       /* raw fast save: the destination already holds these exact bytes */
@@ -528,6 +567,7 @@ int savestates_save_m64p(unsigned char *data, size_t size)
    PUTDATA(curr, uint32_t, *r4300_cp1_fcr0());
    PUTDATA(curr, uint32_t, *r4300_cp1_fcr31());
 
+   neil_m64p_tlbe_off = (size_t)(curr - (unsigned char*)data);
    for (i = 0; i < 32; i++)
    {
       PUTDATA(curr, short, tlb_e[i].mask);
@@ -554,6 +594,7 @@ int savestates_save_m64p(unsigned char *data, size_t size)
       PUTDATA(curr, unsigned int, tlb_e[i].end_odd);
       PUTDATA(curr, unsigned int, tlb_e[i].phys_odd);
    }
+   neil_m64p_tlbe_len = (size_t)(curr - (unsigned char*)data) - neil_m64p_tlbe_off;
    PUTDATA(curr, uint32_t, *r4300_pc());
 
    PUTDATA(curr, unsigned int, *r4300_next_interrupt());

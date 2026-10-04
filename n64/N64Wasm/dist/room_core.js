@@ -908,6 +908,35 @@
                rollbacks: 0, resimFrames: 0, bridgeFrames: 0, maxDepth: 0, depthHist: {}, resimMs: 0, maxResimMs: 0, depthSum: 0,
                hashes: 0, missingSlot: 0, saveMs: 0, saves: 0, skippedSaves: 0, frames: 0, loads: 0, evictions: 0, glRedo: 0,
                stale: false, rearms: 0 };
+    // ⚠ THE PRICE OF A STEP IS A TRIMMED MEAN, NOT AN EMA SEEDED BY ITS FIRST SAMPLE.
+    // MEASURED (n64_room_mode_probe, the bench's loopback room, SM64, 3/3 runs on 1923e52): every
+    // run left rollback for delay at frame ~460 with ZERO rollbacks. The first load the console ever
+    // made was a frame-skip age repair (rfsRerun) from a snapshot taken before the guest rewrote its
+    // TLB, so the loader wiped the whole code cache (neil_state_last_load_mode 2): 49.5 ms inside
+    // the load, 187 ms for the re-run. loadEma took that ONE sample as its value, the published step
+    // went 4.1 -> 13.4-19.0 ms (load / W of it), the host read 83-99% and switched — and in delay the
+    // estimate kept the same load, so the room never came back. The run price had the same flaw at
+    // the start: the first frames (JIT compiling) cost 10-15 ms and seeded runEma, which decays /32.
+    // So each part of the step is the mean of its last N samples with the top eighth dropped: a
+    // spike the room pays in either mode (a compile, a GC) is not a rollback cost, while a device
+    // that is slow on most frames is priced as slow within N samples. And what is not a step at all
+    // is not sampled: a load that wiped the code cache (counted in RB.wipes — a guest TLB rewrite
+    // between the snapshot and now, rare), the frames re-run after one, and frame-skip re-runs.
+    function rbEst(n) { return { a: new Float64Array(n), n: 0, i: 0, v: 0, dirty: false }; }
+    function rbEstPush(e, x) { if (!(x >= 0) || !isFinite(x)) return; e.a[e.i] = x; e.i = (e.i + 1) % e.a.length; if (e.n < e.a.length) e.n++; e.dirty = true; }
+    function rbEstGet(e) {
+      if (!e.dirty) return e.v;
+      e.dirty = false;
+      if (!e.n) return (e.v = 0);
+      var b = Array.prototype.slice.call(e.a, 0, e.n).sort(function (x, y) { return x - y; });
+      var m = e.n - Math.floor(e.n / 8), t = 0;
+      for (var i = 0; i < m; i++) t += b[i];
+      return (e.v = t / m);
+    }
+    function rbEstSeed(e, x) { e.n = 0; e.i = 0; e.dirty = true; if (x > 0) rbEstPush(e, x); }
+    // resave: the saves rbRemeasure times in a delay stretch, one every RB_REMEASURE_MS — few, so a
+    // short ring of their own (a 32-deep one would keep a slow period's saves for 96 s)
+    var RBE = { run: rbEst(64), save: rbEst(32), load: rbEst(16), resave: rbEst(4) };
     function rbSpan(ls) {
       return Math.max((ls.rollback | 0) + 3, typeof ls.rbRingFrames === 'function' ? ls.rbRingFrames() | 0 : 0);
     }
@@ -948,6 +977,13 @@
       RB.n = rbSpan(ls);
       if (!rbSaveAt(ls, k)) { RB.fault = N64S.fault || 'the savestate at the return to rollback failed'; return false; }
       RB.stale = false; RB.rearms++;
+      // the ring's prices restart from what the delay stretch measured (rbRemeasure), not from the
+      // samples taken before the switch — the very ones that said this console could not afford it
+      if (RBE.resave.n) {
+        rbEstSeed(RBE.save, rbEstGet(RBE.resave)); RB.saveEma = rbEstGet(RBE.save);
+        rbEstSeed(RBE.load, RB.loadEma); RB.loadEma = rbEstGet(RBE.load);
+        rbEstSeed(RBE.resave, 0);
+      }
       env.log('[rollback] zero-lag mode again: the savestate ring is re-armed at frame ' + k + ' (window ' + (ls.rollback | 0)
             + ' frames, snapshots reach back ' + RB.n + ')');
       if (G.__n64RbLog) G.__n64RbLog.push(['rearm', k]);
@@ -1111,7 +1147,7 @@
       rbglSave(s);
       var dt = performance.now() - t0;
       RB.saveMs += dt; RB.saves++;
-      RB.saveEma = RB.saveEma ? RB.saveEma + (dt - RB.saveEma) / 16 : dt;
+      rbEstPush(RBE.save, dt); RB.saveEma = rbEstGet(RBE.save);
       var st = G.__fbAsync;
       if (st && st.on && st.snapshot) s.fb = st.snapshot();
       try { s.fp = G.Module._neil_last_fp() >>> 0; } catch (e) { s.fp = 0; }
@@ -1135,8 +1171,18 @@
       var st = G.__fbAsync;
       if (st && st.on && st.restore) st.restore(s.fb);
       if (RFS.on) rfsNote();     // a load can bring back a blank capture the replaced timeline superseded
-      var dt = performance.now() - t0;
-      RB.loadEma = RB.loadEma ? RB.loadEma + (dt - RB.loadEma) / 8 : dt;
+      var dt = performance.now() - t0, M = G.Module;
+      // a load that had to wipe the code cache (the guest rewrote its TLB since the snapshot) is not
+      // what a rollback costs; nor are the frames re-run after it (they recompile): RB.cold
+      if (M && typeof M._neil_state_last_load_mode === 'function' && M._neil_state_last_load_mode() === 2) {
+        RB.wipes = (RB.wipes | 0) + 1; RB.wipeMs = (RB.wipeMs || 0) + dt; RB.cold = true;
+      } else {
+        // ...and one sample is at most 4 saves: a load is the same state copy plus an 8 MB compare of
+        // the code pages (measured 2.3-2.7x a save); past that it is a transient (a first touch, a GPU
+        // wait), which the trimmed mean would take as the price until 8 loads exist — and a room that
+        // rarely corrects may never make 8
+        rbEstPush(RBE.load, RB.saveEma > 0 ? Math.min(dt, 4 * RB.saveEma) : dt); RB.loadEma = rbEstGet(RBE.load);
+      }
       RB.loads++;
       return true;
     }
@@ -1170,8 +1216,8 @@
       var tc = rfsTaintCheck(ls, k);
       if (tc !== true) { N64S.fault = tc; return false; }
       var dt = performance.now() - t0;
-      RB.runEma = RB.runEma ? RB.runEma + (dt - RB.runEma) / 32 : dt;
-      if (present) lsFrameDone(image, dt);
+      if (!present && !RFS.inRerun && !RB.cold) { rbEstPush(RBE.run, dt); RB.runEma = rbEstGet(RBE.run); }
+      if (present) { RB.cold = false; lsFrameDone(image, dt); }
       if (!rbWantSave(ls, k + 1, present)) { RB.skippedSaves++; return true; }
       return rbSaveAt(ls, k + 1);
     }
@@ -1251,6 +1297,15 @@
       var ms = ((RB.loadEma || 0) + (W + k - 1) * RB.runEma + Math.ceil(W / k) * RB.saveEma) / W;
       return ms > 0 ? ms : 0;
     }
+    // ls.selfPresentMs — what a PRESENTED rollback frame costs this console: the frame and its share
+    // of the snapshots (one every K frames, plus the after-state of every fingerprinted frame, which
+    // every console saves whatever its K: rbWantSave). lib/netplay.js prices presented frames at this
+    // and re-simulated ones at selfStepMs (_capMean). Measured parts only; the run is 0 before Ready.
+    function rbPresentMs(ls) {
+      var save = RB.saveEma || LS_RB.saveMs || 0, run = RB.runEma || LS.costAvg || 0, k = RB.k || 1, he = ls.hashEvery | 0;
+      var ms = run + save * Math.min(1, 1 / k + (he > 0 ? 1 / he : 0));
+      return ms > 0 ? ms : 0;
+    }
     // The same step, ESTIMATED where no rollback frame is running: in a gated
     // room's delay stretch (lsFeed) and before Ready (lsRbProve). The run is the
     // frame cost this console measures on every frame it runs (LS.costAvg — the
@@ -1262,7 +1317,7 @@
     function rbStepEstimate(ls) {
       var save = RB.saveEma || LS_RB.saveMs || 0;
       if (!(save > 0)) return 0;
-      var load = RB.loadEma || save, run = LS.costAvg || RB.runEma || 0, k = RB.k || 1;
+      var load = RB.loadEma || save, run = RB.runEma || LS.costAvg || 0, k = RB.k || 1;
       var W = Math.max(2, (ls.rollback | 0) || (ls._capW | 0) || RB_WINDOW);
       return (load + (W + k - 1) * run + Math.ceil(W / k) * save) / W;
     }
@@ -1285,7 +1340,7 @@
       var old = RB.saveEma || LS_RB.saveMs || 0, t0 = performance.now();
       if (!n64sSave(null)) return;
       var dt = performance.now() - t0;
-      RB.saveEma = RB.saveEma ? RB.saveEma + (dt - RB.saveEma) / 4 : dt;
+      rbEstPush(RBE.resave, dt); RB.saveEma = rbEstGet(RBE.resave);
       if (RB.loadEma && old > 0) RB.loadEma *= RB.saveEma / old;
       RB.remeasures = (RB.remeasures | 0) + 1;
     }
@@ -1348,7 +1403,7 @@
       var fsr = rfsSettle(ls, false);
       if (fsr !== true) return rbFail(ls, fsr);
       RB.stepMs = rbStepMs(ls);
-      if (RB.stepMs) ls.selfStepMs = RB.stepMs;
+      if (RB.stepMs) { ls.selfStepMs = RB.stepMs; ls.selfPresentMs = rbPresentMs(ls); }
       ls.endFrame(null);
       // FINGERPRINTS OF CONFIRMED FRAMES ONLY: the state after k is the snapshot
       // of k+1, which every console saves whatever its K (rbWantSave).
@@ -1471,6 +1526,7 @@
       // inside one frame (the whole mainLoopInner — emulation AND the GL it
       // issues). cap = field period / mean cost; published to the room.
       LS.costAvg = LS.costAvg ? LS.costAvg + 0.02 * (dt - LS.costAvg) : dt;
+      rbEstPush(RBE.run, dt); RB.runEma = rbEstGet(RBE.run);
       // Frames that alone cost more than a field period — a burst this device
       // cannot absorb inside the governor's two-period allowance if it repeats.
       if (LS.viHz > 0 && dt > 1000 / LS.viHz) { LS.costOver = (LS.costOver || 0) + 1; if (dt > (LS.costMax || 0)) LS.costMax = dt; }
@@ -1663,7 +1719,7 @@
         // decide a return to zero-lag mode): without this the step stays what it
         // was at the switch — the very measurement that said it could not afford
         // it — and the room never comes back.
-        if (ls._capGate) { rbRemeasure(); var se = rbStepEstimate(ls); if (se > 0) ls.selfStepMs = se; }
+        if (ls._capGate) { rbRemeasure(); var se = rbStepEstimate(ls); if (se > 0) { ls.selfStepMs = se; ls.selfPresentMs = rbPresentMs(ls); } }
         // ⚠ THE CORE IS IN THIS PAGE AND IS SYNCHRONOUS, so unlike dreamcast.html
         // the fingerprint for the frame just run is available RIGHT NOW and goes
         // straight into endFrame(). That is the shape lib/netplay.js's endFrame
@@ -1763,7 +1819,7 @@
       if (LS_RB.saveMs > 0 && ls) {
         var est = rbStepEstimate(ls);
         if (est > 0) {
-          ls.selfStepMs = est;
+          ls.selfStepMs = est; ls.selfPresentMs = rbPresentMs(ls);
           env.log('[rollback] step before Ready: ' + est.toFixed(2) + ' ms (save ' + LS_RB.saveMs.toFixed(2)
                 + ' ms, the load taken as one more; the frame itself is measured once the room runs)');
         }
@@ -1938,7 +1994,8 @@
                   k: RB.k, kFixed: RB.kFixed, maxWindow: RB.maxWindow || 0, kChanges: RB.kChanges, kWhy: RB.kWhy,
                   runMs: +RB.runEma.toFixed(2), saveMs: +RB.saveEma.toFixed(2), loadMs: +RB.loadEma.toFixed(2),
                   rollbacksPerFrame: +RB.pEma.toFixed(4), depthAvg: RB.rollbacks ? +(RB.depthSum / RB.rollbacks).toFixed(2) : 0,
-                  resimFrames: RB.resimFrames, bridgeFrames: RB.bridgeFrames, maxDepth: RB.maxDepth, depthHist: RB.depthHist, loads: RB.loads,
+                  resimFrames: RB.resimFrames, bridgeFrames: RB.bridgeFrames, maxDepth: RB.maxDepth, depthHist: RB.depthHist, loads: RB.loads, wipes: RB.wipes | 0, wipeMs: Math.round(RB.wipeMs || 0),
+                  tlbSameByContent: (function () { try { return G.Module._neil_state_tlb_same_by_content ? G.Module._neil_state_tlb_same_by_content() : null; } catch (e) { return null; } })(),
                   resimMsTotal: Math.round(RB.resimMs), resimMsPerRollback: RB.rollbacks ? +(RB.resimMs / RB.rollbacks).toFixed(2) : 0,
                   resimMsPerDepthFrame: RB.depthSum ? +(RB.resimMs / RB.depthSum).toFixed(2) : 0,
                   maxResimMs: +RB.maxResimMs.toFixed(1), saves: RB.saves, skippedSaves: RB.skippedSaves, evictions: RB.evictions, freed: RB.freed | 0,
@@ -1955,7 +2012,7 @@
                     ups: RA.ups, downs: RA.downs, fault: RA.fault },
         advWaits: LS.advWaits | 0,
         // what the capacity gate reads from this console, in either mode
-        step: { selfStepMs: ls ? +(+ls.selfStepMs || 0).toFixed(2) : null, preReadySaveMs: +(LS_RB.saveMs || 0).toFixed(2),
+        step: { selfStepMs: ls ? +(+ls.selfStepMs || 0).toFixed(2) : null, selfPresentMs: ls ? +(+ls.selfPresentMs || 0).toFixed(2) : null, preReadySaveMs: +(LS_RB.saveMs || 0).toFixed(2),
                 saveEmaMs: +(RB.saveEma || 0).toFixed(2), loadEmaMs: +(RB.loadEma || 0).toFixed(2), remeasures: RB.remeasures | 0,
                 rearms: RB.rearms, stale: RB.stale },
         lat: { samples: LAT.samples.slice(-60), overlapped: LAT.overlapped },
