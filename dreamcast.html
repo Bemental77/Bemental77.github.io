@@ -17,7 +17,7 @@
        module generalises; it does not replace this page's own probeWebGL2 or its
        [glinfo] pinning, which remain the authority on what the WORKER's context got. -->
   <script src="/lib/capability.js?v=e25dca87"></script>
-  <script src="/lib/bench.js?v=d181b61c"></script><!-- ?bench=1 real-device benchmark; inert without it -->
+  <script src="/lib/bench.js?v=e8393e94"></script><!-- ?bench=1 real-device benchmark; inert without it -->
   <script src="/lib/xboxinput.js"></script>
   <!-- Block-gzip disc reader. Shared with the flycast worker shim, which
        importScripts()es this same file, so the eager and lazy paths cannot
@@ -2914,7 +2914,16 @@
         lastIps = d.ips;
         if (d.wallMs !== undefined) {
           lastBusyMs = d.busyMs | 0; lastPacedMs = d.pacedMs | 0; lastWallMs = d.wallMs | 0;
+          lastHeldMs = d.heldMs | 0;   // older shims: 0 (undefined | 0)
           lastGoverned = d.governed === undefined ? 1 : (d.governed | 0);
+        }
+        // Governor accounting (2026-10-03): guest ms the governor DROPPED
+        // rather than repaid, and the pace sleep asked vs delivered. Summed
+        // until the next heartbeat line prints them.
+        if (d.dropMs !== undefined) {
+          govDropMs += d.dropMs | 0; govDrops += d.drops | 0;
+          govAskMs += d.pacedMs | 0; govSleptMs += d.sleptMs | 0;
+          if ((d.maxLagMs | 0) > govMaxLag) govMaxLag = d.maxLagMs | 0;
         }
         paintFpsBar();
         break;
@@ -5420,6 +5429,14 @@
   let lastTelemetryAt = 0, lastCallsAt = 0, lastDistinctAt = 0;
   // Pump duty-cycle window (ms per ~1 s), from the shim's 'ips' message.
   let lastBusyMs = 0, lastPacedMs = 0, lastWallMs = 0, lastGoverned = 1;
+  // Wall time the worker thread was HELD between its own tasks — the browser
+  // taking each rendered frame (render backpressure; on SwiftShader it is the
+  // GPU process rasterizing). It is not inside run_iter, so it was never in
+  // `busy`, and duty/headroom read 23-37% / 2.2-3.6x on a worker that could
+  // not run one more frame (dreamcast/docs/governor-pacing/TASKS.md). It is
+  // occupied time: the worker can do nothing else in it.
+  let lastHeldMs = 0;
+  let govDropMs = 0, govDrops = 0, govAskMs = 0, govSleptMs = 0, govMaxLag = 0;
   const fpsEl = $('fpsBar');
   function aicaRateX()  { return (lastAwr + lastAdrop) / HW_AICA_HZ; }   // the witness
   function clkRateX()   { return (lastClk * 1024) / HW_SH4_HZ; }
@@ -5427,7 +5444,9 @@
   // above flagged as spanning a clock jump, where it is the AICA ratio.
   function guestRateX() { return lastClkJump ? aicaRateX() : clkRateX(); }
   function guestMHz()   { return guestRateX() * HW_SH4_HZ / 1e6; }
-  function dutyFrac()   { return lastWallMs > 0 ? Math.min(1, lastBusyMs / lastWallMs) : 0; }
+  function dutyFrac()   { return lastWallMs > 0 ? Math.min(1, (lastBusyMs + lastHeldMs) / lastWallMs) : 0; }
+  function cpuFrac()    { return lastWallMs > 0 ? Math.min(1, lastBusyMs / lastWallMs) : 0; }
+  function heldFrac()   { return lastWallMs > 0 ? Math.min(1, lastHeldMs / lastWallMs) : 0; }
   function headroomX()  { const d = dutyFrac(); return d > 0 ? guestRateX() / d : 0; }
   // Measured emulation cost of ONE PRODUCED FRAME: busy ms per wall second
   // divided by frames produced in that second. Window-independent (both sides
@@ -5526,7 +5545,7 @@
       ' <span class="k">presented</span> ' + presTxt + ' ' + sep +
       ' <span class="k">headroom</span> ' + headTxt + ' ' + sep +
       ' <span class="sub">pump ' + lastIps + ' it/s, busy ' +
-      Math.round(dutyFrac() * 100) + '%, paced ' +
+      Math.round(dutyFrac() * 100) + '% (render hold ' + Math.round(heldFrac() * 100) + '%), paced ' +
       (lastWallMs > 0 ? Math.round(lastPacedMs / lastWallMs * 100) : 0) + '%</span>' +
       ' <span class="sub">pc 0x' + lastPc.toString(16) + '</span>';
   }
@@ -5771,10 +5790,15 @@
               ' governed=' + (guestIsGoverned() ? 1 : 0) +
               ' presented=' + lastFps + '/s' +
               ' duty=' + Math.round(dutyFrac() * 100) + '%' +
+              ' (emu ' + Math.round(cpuFrac() * 100) + '% + render-hold ' + Math.round(heldFrac() * 100) + '%)' +
               ' cost=' + f1(frameCostMs()) + 'ms/f' +
               ' headroom=' + f1(headroomX()) + 'x' +
               ' capacity=' + Math.round(capacityFps()) + 'fps' +
-              ' arms=' + (activeArms.join(',') || 'none'));
+              ' arms=' + (activeArms.join(',') || 'none') +
+              // gov: guest ms dropped (should be 0 with headroom), deepest lag,
+              // pace sleep asked/delivered — the time the governor gave back.
+              ' gov=drop' + govDropMs + 'ms/' + govDrops + ' lag' + govMaxLag + 'ms sleep' + govAskMs + '/' + govSleptMs + 'ms');
+      govDropMs = 0; govDrops = 0; govAskMs = 0; govSleptMs = 0; govMaxLag = 0;
     }
     checkStall();
     // Keep a force-shown log's pinned verdict current — the counters and the
