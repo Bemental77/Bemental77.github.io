@@ -88,6 +88,10 @@
 extern size_t savestates_m64p_last_len;
 extern int savestates_keep_code_cache;
 extern int savestates_skip_tlb_luts;
+extern size_t neil_m64p_lut_off, neil_m64p_tlbe_off, neil_m64p_tlbe_len;
+size_t neil_tlbe_serialize(unsigned char *out);
+extern uint32_t tlb_LUT_r[0x100000];
+extern uint32_t tlb_LUT_w[0x100000];
 /* r4300/tlb.c */
 extern uint32_t neil_tlb_gen;
 /* r4300/interrupt.c */
@@ -142,6 +146,7 @@ static uint32_t g_nonce;          /* identifies THIS running instance */
 static int g_dram_off_ok = -1;    /* -1 unknown, 1 verified, 0 layout mismatch */
 static int g_last_load_mode;      /* 0 none, 1 selective, 2 full wipe */
 static int g_last_load_pages;     /* pages invalidated by the last selective load */
+static int g_tlb_same_by_content; /* loads whose TLB generation differed but whose TLB did not */
 
 #define ALIGN8(x) (((x) + 7u) & ~7u)
 
@@ -199,6 +204,37 @@ int neil_state_size(void)
 int neil_state_last_load_mode(void) { return g_last_load_mode; }
 int neil_state_last_load_pages(void) { return g_last_load_pages; }
 int neil_state_m64p_region(void) { return (int)NEIL_M64P_REGION; }
+int neil_state_tlb_same_by_content(void) { return g_tlb_same_by_content; }
+
+/* THE TLB GENERATION IS A PROOF OF SAMENESS, NOT OF DIFFERENCE. It is bumped by
+ * EVERY write of a TLB entry, the same value rewritten included, so a state
+ * saved before such a write fails the generation test though the TLB it holds
+ * is byte-identical to the live one — and the loader then wiped the whole code
+ * cache. MEASURED (n64_room_mode_probe, SM64 loopback room): the room's first
+ * load (a frame-skip repair from frame 357, run at 375) took the full wipe —
+ * 30-49.5 ms inside the load and a 112-187 ms re-run that recompiled
+ * everything. So when the generations differ, the bytes decide: both 4 MiB
+ * lookup tables and the 32 entries (serialized exactly as the saver writes
+ * them) compared with the live ones — ~8 MiB of memcmp, paid only on such a
+ * load. Equal bytes are the same mapping, so the selective path is exactly as
+ * valid as when the generation matched. */
+static int tlb_content_same(const unsigned char* src)
+{
+   unsigned char cur[32 * 64];
+   size_t n;
+   if (!neil_m64p_lut_off || !neil_m64p_tlbe_off || !neil_m64p_tlbe_len || neil_m64p_tlbe_len > sizeof(cur))
+      return 0;
+   if (neil_m64p_tlbe_off + neil_m64p_tlbe_len > NEIL_M64P_REGION)
+      return 0;
+   n = neil_tlbe_serialize(cur);
+   if (n != neil_m64p_tlbe_len || memcmp(src + neil_m64p_tlbe_off, cur, n) != 0)
+      return 0;
+   if (memcmp(src + neil_m64p_lut_off, tlb_LUT_r, sizeof(tlb_LUT_r)) != 0)
+      return 0;
+   if (memcmp(src + neil_m64p_lut_off + sizeof(tlb_LUT_r), tlb_LUT_w, sizeof(tlb_LUT_w)) != 0)
+      return 0;
+   return 1;
+}
 
 static int save_raw(unsigned char* dst, int fast)
 {
@@ -381,6 +417,11 @@ int neil_state_load_raw(const unsigned char* src)
 
    /* ---- code cache: selective when the TLB is provably unchanged ---- */
    lut_same = (h.nonce == instance_nonce() && h.tlb_gen == neil_tlb_gen);
+   if (!lut_same && h.nonce == instance_nonce() && tlb_content_same(src))
+   {
+      lut_same = 1;
+      g_tlb_same_by_content++;
+   }
    if (lut_same && g_dram_off_ok == 1)
    {
       g_last_load_pages = invalidate_changed_code_pages(src + NEIL_M64P_DRAM_OFF);
