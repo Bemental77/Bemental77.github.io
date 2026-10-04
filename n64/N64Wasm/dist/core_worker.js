@@ -417,6 +417,22 @@ function gqReady() {
 // (this field's input to its picture), age = present - tIn of the first field since the previous
 // picture (the oldest input the picture is the first to show: a skipped field's input waits for
 // the next picture), gpu = signalled - tIn.
+// MEASURED (n64_field_cost_probe --clock --nodbg, solo MK64 1P Luigi Raceway race, fields
+// 1900-3000 on the shipped clock, hermetic snapshot, probe lock held, arms interleaved A B C / C B A,
+// load 1.8-4.8, two runs each; latency p50 / p99 in ms, pictures committed per second, worklet
+// underruns in the 22 s window):
+//   full CPU         guest rate      latency p50 / p99    presents/s   underruns
+//   depth 2 guard    0.694-0.699x    99-101 / 146-155     17.1-17.3    106-110
+//   250 ms guard     0.914-0.942x    163-181 / 352-357     8.6-9.4       2-8
+//   frame skip       1.000x          61-67 / 138-170      12.1-12.6      0      <- default
+//   half a core (worker threads, --wcpu 0.5)
+//   depth 2 guard    0.672-0.694x    101-103 / 141-153    16.7-17.3    113-130
+//   250 ms guard     0.905-0.938x    179-193 / 339-356     8.9-9.1       2-9
+//   frame skip       0.997-1.000x    69-72 / 145-212      11.6-11.8      0
+// With one picture on the GPU, latency == the fence of that picture: what is left is this box's
+// software GPU (SwiftShader, 4 vCPUs) drawing ONE MK64 picture after a ~5 ms field (max 225-349 ms
+// in heavy stretches) — nothing queues ahead of it. ?fskip=2 (earlier build, same rig): 1.000x, p50
+// 99-103 ms, 14.7-17.1 presents/s — throughput bought with a second picture of lag.
 var FSK = { on: true, depth: 1, maxSnaps: 6, snapEvery: 8, force: 0, skipping: false, serial: 0, lastDrew: false, drewNow: false, swNow: 0,
            hist: 0, stale: false, fq: [], pend: [], snaps: [], pool: [], bufs: 0, size: 0, top: 0, raw: null,
            pads: null, curPads: new Int32Array(12), setPad: null, taintSeen: 0, jsTaint: 0, ageTIn: 0, pollT: 0,
@@ -551,7 +567,7 @@ function fsRedo(s, backoff, pumped) {
   }
   FSK.taintSeen = M._neil_fs_taints() >>> 0; FSK.jsTaint = 0;
   while (FSK.snaps.length) fsDrop(0);
-  FSK.redo++; FSK.redoFields += s - S.s; FSK.redoFieldsAll += s - S.s; FSK.redoMs += performance.now() - t0;
+  FSK.redo++; FSK.redoFields += s - S.s + 1; FSK.redoFieldsAll += s - S.s + 1; FSK.redoMs += performance.now() - t0;
   if (FSK.logRe) log('[fskip] re-run fields ' + S.s + '..' + s + (backoff ? ' (read-back)' : ' (snapshot age)'));
   if (backoff) {
     FSK.suspendUntil = s + FSK.backoff; FSK.backoff = Math.min(FSK.backoff * 2, 1 << 24);
@@ -783,9 +799,9 @@ function observePresents() {
     if (!M || !M._neil_vi_total) return;
     var pic = fsCommit(performance.now());
     var vi = viTotal();
-    // frame skip on: a frame shows something new only if a field DREW since the last one (a
-    // skipped field moves the field counter and leaves the picture as it was)
-    if (FSK.on ? pic : (PRES.lastVi >= 0 && vi !== PRES.lastVi)) PRES.shown++;
+    // frame skip on (solo): a frame shows something new only if a field DREW since the last one
+    // (a skipped field moves the field counter and leaves the picture as it was)
+    if ((FSK.on && !RM.on) ? pic : (PRES.lastVi >= 0 && vi !== PRES.lastVi)) PRES.shown++;
     PRES.lastVi = vi;
   })();
 }
