@@ -324,8 +324,8 @@ function schedule() {
 // SUPERSEDED AS THE SOLO DEFAULT (2026-10-04) by THE RENDER-LEVEL FRAME SKIP below: a quarter of a
 // second of queued pictures is a quarter of a second of input lag. Solo, the guard is now only the
 // backstop of the frame skip (a field that cannot skip is held at more than GQ.max = 2 pictures on
-// the GPU); ?gpuq / ?gpuqms without ?fskip measure the guards above alone. Rooms keep the guard as
-// it was (a room's frames go through room_core.js, which has rollback's own snapshots).
+// the GPU); ?gpuq / ?gpuqms without ?fskip measure the guards above alone. Rooms skip too
+// (room_core.js RFS, with ?rfskip=0 the arm that keeps a room on the guard as it was).
 var GQ = { on: true, max: 2, capMs: 250, fences: [], times: [], held: 0, heldMs: 0, holdFrom: 0, forced: 0, gl: null, timer: false, lastAge: 0 };
 function gqGl() {
   if (GQ.gl) return GQ.gl;
@@ -334,7 +334,7 @@ function gqGl() {
   return GQ.gl;
 }
 function gqAfterField() {
-  if (!GQ.on || (FSK.on && !RM.on)) return;   // frame skip on (solo): the guard counts FS's own fences (pictures)
+  if (!GQ.on || (FSK.on && (!RM.on || roomFs()))) return;   // frame skip on: the guard counts FS's own fences (pictures)
   var gl = gqGl(); if (!gl) return;
   var f = null;
   try { f = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0); } catch (e) { f = null; }
@@ -350,12 +350,13 @@ function gqWithin(now) {
 // may a field start now? false = hold it (the caller retries from a later task)
 function gqReady() {
   var now = performance.now();
-  if (GQ.on && FSK.on && !RM.on) {
+  if (GQ.on && FSK.on && (!RM.on || roomFs())) {
     // FRAME SKIP ON: a field that cannot skip (THE RENDER-LEVEL FRAME SKIP — its snapshots all
     // in use, or skipping suspended after a re-run) is held while more than GQ.max pictures are
-    // on the GPU: the old depth guard, the backstop that keeps the picture's lag small.
+    // on the GPU: the old depth guard, the backstop that keeps the picture's lag small. In a room
+    // the question is room_core.js's (RFS: the ring, or this file's machinery in delay lockstep).
     fsPoll(now);
-    if (FSK.fq.length <= GQ.max || fsCanSkip()) { if (GQ.holdFrom) { GQ.heldMs += now - GQ.holdFrom; GQ.holdFrom = 0; } return true; }
+    if (FSK.fq.length <= GQ.max || (RM.on ? roomFsCanSkip() : fsCanSkip())) { if (GQ.holdFrom) { GQ.heldMs += now - GQ.holdFrom; GQ.holdFrom = 0; } return true; }
     if (!GQ.holdFrom) { GQ.holdFrom = now; GQ.held++; }
     if (now - GQ.holdFrom > 250) { GQ.forced++; GQ.heldMs += now - GQ.holdFrom; GQ.holdFrom = 0; return true; }
     return false;
@@ -437,7 +438,7 @@ var FSK = { on: true, depth: 1, maxSnaps: 6, snapEvery: 8, force: 0, skipping: f
            hist: 0, stale: false, fq: [], pend: [], snaps: [], pool: [], bufs: 0, size: 0, top: 0, raw: null,
            pads: null, curPads: new Int32Array(12), setPad: null, taintSeen: 0, jsTaint: 0, ageTIn: 0, pollT: 0,
            fields: 0, drawn: 0, skipped: 0, skipNoDraw: 0, snapsTaken: 0, snapMs: 0, maxSnapMs: 0, redo: 0, redoFields: 0,
-           redoMs: 0, redoFieldsAll: 0, staleS: 0, repairs: 0, lost: 0, suspendUntil: 0, backoff: 64, held: 0, presented: 0, overwritten: 0, noHeap: 0,
+           redoMs: 0, redoFieldsAll: 0, audDrop: 0, staleS: 0, repairs: 0, lost: 0, suspendUntil: 0, backoff: 64, held: 0, presented: 0, overwritten: 0, noHeap: 0,
            lat: new Float32Array(4096), age: new Float32Array(4096), gpu: new Float32Array(4096), latN: 0, why: '' };
 var FS_RESERVE = 64 * 1048576;    // heap kept free above the snapshots (room_core.js N64S_RAW_RESERVE)
 var FS_MAXAGE = 16;               // a snapshot older than this many fields is resolved by a re-run now (?fskipage=N)
@@ -466,7 +467,7 @@ function fsWrap() {
     P[n] = function () {
       if (this.__fsFb) return f.apply(this, arguments);            // an offscreen target: never skipped
       if (FSK.skipping) { FSK.swNow++; return; }
-      FSK.drewNow = true;
+      FSK.drewNow = true; FSK.tickAny = true; FSK.tickDrew = true;
       return f.apply(this, arguments);
     };
   });
@@ -501,7 +502,7 @@ function fsCoreReady() {
 // may the next field skip? (a snapshot it can use is held, or there is room for one)
 function fsSnapFresh(s) { return FSK.snaps.length && s - FSK.snaps[FSK.snaps.length - 1].s < FSK.snapEvery; }
 function fsCanSkip() {
-  return FSK.on && !RM.on && fsCoreReady() && FSK.serial >= FSK.suspendUntil && (fsSnapFresh(FSK.serial + 1) || FSK.snaps.length < FSK.maxSnaps);
+  return FSK.on && (!RM.on || FSK.roomLinear) && fsCoreReady() && FSK.serial >= FSK.suspendUntil && (fsSnapFresh(FSK.serial + 1) || FSK.snaps.length < FSK.maxSnaps);
 }
 function fsAlloc() {
   if (FSK.pool.length) return FSK.pool.pop();
@@ -551,7 +552,13 @@ function fsRelease(s) {
 function fsRedo(s, backoff, pumped) {
   var S = FSK.snaps[0], t0 = performance.now();
   if (!S) { FSK.lost++; log('[fskip] ⚠ a read-back of a skipped field with no snapshot held — this field is not exact; skipping OFF'); FSK.on = false; return; }
-  var wp = M._neilGetAudioWritePosition ? function () { AUD.read = M._neilGetAudioWritePosition(); } : function () {};
+  // Audio a re-run drops unplayed is counted (FSK.audDrop, mod the 64000-entry ring) and the
+  // page's audio witness subtracts it, as it does a rollback's (stat audDropped): MEASURED before
+  // this, a 1 s window with one re-run read 1.21-1.36x on a guest the field clock had at 1.000x.
+  var wp = M._neilGetAudioWritePosition ? function () {
+    var w = M._neilGetAudioWritePosition();
+    FSK.audDrop = (FSK.audDrop + ((w - AUD.read + 64000) % 64000)) % 64000; AUD.read = w;
+  } : function () {};
   wp();                                   // this field's audio: made again below
   if (!(M._neil_state_load_raw(S.p) | 0)) { FSK.lost++; log('[fskip] ⚠ snapshot restore refused — skipping OFF'); FSK.on = false; return; }
   if (S.fbs && self.__fbAsync && self.__fbAsync.restore) self.__fbAsync.restore(S.fbs);
@@ -617,7 +624,7 @@ function fsField() {
 }
 self.__n64RigField = function () { fsField(); };   // the rigs step the guest through the same field
 function fsFence(tIn) {
-  FSK.drawn++;
+  FSK.drawn++; FSK.tickDrew = false;
   var gl = M && M.ctx, f = null, e = { f: CLK.frame, tIn: tIn, tAge: FSK.ageTIn || tIn, tEnd: performance.now(), tGpu: 0, tCommit: 0, sy: null };
   FSK.ageTIn = 0;
   try { f = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0); } catch (x) { f = null; }
@@ -799,9 +806,9 @@ function observePresents() {
     if (!M || !M._neil_vi_total) return;
     var pic = fsCommit(performance.now());
     var vi = viTotal();
-    // frame skip on (solo): a frame shows something new only if a field DREW since the last one
-    // (a skipped field moves the field counter and leaves the picture as it was)
-    if ((FSK.on && !RM.on) ? pic : (PRES.lastVi >= 0 && vi !== PRES.lastVi)) PRES.shown++;
+    // frame skip on (solo, and a room with RFS): a frame shows something new only if a field DREW
+    // since the last one (a skipped field moves the field counter and leaves the picture as it was)
+    if ((FSK.on && (!RM.on || roomFs())) ? pic : (PRES.lastVi >= 0 && vi !== PRES.lastVi)) PRES.shown++;
     PRES.lastVi = vi;
   })();
 }
@@ -861,7 +868,7 @@ function postStats() {
   if (CLK.viHz > 0 && CLK.base) owed = (STAT.last - (CLK.base + (CLK.frame - CLK.baseFrame) * (1000 / CLK.viHz))) / (1000 / CLK.viHz);
   post({ t: 'stat', at: performance.timeOrigin + performance.now(),
          vi: viTotal(), costMs: M._neil_frame_cost_ms(), costN: M._neil_frame_cost_n() >>> 0,
-         apos: M._neilGetAudioWritePosition() | 0, audDropped: RM.R ? (RM.R.AUDX.dropped | 0) : 0,
+         apos: M._neilGetAudioWritePosition() | 0, audDropped: ((RM.R ? (RM.R.AUDX.dropped | 0) : 0) + FSK.audDrop) % 64000,
          frame: CLK.frame, presents: CLK.presents, ticks: CLK.ticks,
          lostMs: CLK.lostMs, reanchors: CLK.reanchors, busyMs: CLK.busyMs,
          rafTicks: SCHED.rafTicks, immTicks: SCHED.immTicks, tmrTicks: SCHED.tmrTicks,
@@ -916,10 +923,49 @@ function roomInstall(d) {
     onArmGl: roomWatchContext,
     onArmKeys: function () {},
     oneFramePerTask: true,
-    kick: roomKick
+    kick: roomKick,
+    fs: ROOM_FS
   });
   return RM.R;
 }
+// ---- THE RENDER-LEVEL FRAME SKIP IN A ROOM: this file's half (room_core.js RFS has the rest) ----
+// room_core.js decides which of a room's frames skip and re-runs from its own snapshot ring on a
+// read-back; what is this realm's — the GPU's queue (FSK.fq), the window draws swallowed (fsWrap),
+// the lazy copy's taint counter, the read-back watch, and the whole solo machinery for delay
+// lockstep's frames (which never rewind) — is reached through these.
+var ROOM_FS = {
+  ok: function () { return FSK.on && !!M && fsCoreReady(); },
+  force: function () { return FSK.force | 0; },
+  behind: function () { fsPoll(performance.now()); return FSK.fq.length >= FSK.depth; },
+  expect: function () { return (FSK.hist & 2) !== 0; },
+  begin: function (skip, k) {
+    FSK.skipping = !!skip; FSK.drewNow = false; FSK.swNow = 0;
+    if (fsCoreReady()) M._neil_fs_set(skip ? 1 : 0, (k | 0) & 0x7FFFFFFF);
+  },
+  end: function (present) {
+    FSK.skipping = false;
+    if (FSK.raw) M._neil_fs_set(0, 0);
+    var r = { drew: FSK.drewNow, sw: FSK.swNow };
+    FSK.fields++;
+    if (present) { FSK.hist = ((FSK.hist << 1) | ((r.drew || r.sw) ? 1 : 0)) & 0xff; FSK.lastDrew = r.drew; if (!FSK.ageTIn) FSK.ageTIn = performance.now(); }
+    return r;
+  },
+  stale: function (v) { FSK.stale = !!v; },
+  // 'read' (a core glReadPixels of a skipped picture), 'blank' (a blank capture materialised), or false
+  taint: function () {
+    if (!FSK.raw) return false;
+    var t = M._neil_fs_taints() >>> 0, js = FSK.jsTaint, b = t !== FSK.taintSeen;
+    FSK.taintSeen = t; FSK.jsTaint = 0;
+    return js ? 'read' : (b ? 'blank' : false);
+  },
+  linear: function () { FSK.roomLinear = true; try { fsField(); } finally { FSK.roomLinear = false; } },
+  linearCanSkip: function () { FSK.roomLinear = true; try { return fsCanSkip(); } finally { FSK.roomLinear = false; } },
+  settleLinear: function () { fsResolve(); },
+  // the solo machinery's counters (delay lockstep's frames run through it)
+  report: function () { return { skipped: FSK.skipped, drawn: FSK.drawn, redo: FSK.redo, redoFields: FSK.redoFields, repairs: FSK.repairs, lost: FSK.lost, snaps: FSK.snapsTaken }; }
+};
+function roomFs() { return !!(FSK.on && RM.R && RM.R.RFS && RM.R.RFS.on); }
+function roomFsCanSkip() { try { return !!(RM.R && RM.R.rfsCanSkip && RM.R.rfsCanSkip()); } catch (e) { return false; } }
 // Every clonable field the page's Session and panel read off `session.ls` synchronously.
 function roomLite(ls) {
   return { state: ls.state, frame: ls.frame, roster: ls.roster.slice(), localPorts: ls.localPorts.slice(), delay: ls.delay,
@@ -1018,9 +1064,20 @@ function roomFeedBody(src) {
   // the 4 ms feed timer and rAF retry it
   if (R.LS.running && performance.now() >= roomDueAt(R) && !gqReady()) return;
   if (R.LS.running && performance.now() >= roomDueAt(R) && !cbMayDraw(src === 'raf' ? 'raf' : 'task')) return;
-  var f0 = R.LS.frame;
+  var f0 = R.LS.frame, tIn = performance.now(), rfs = roomFs();
+  FSK.tickAny = false;
   try { R.lsFeed(); } catch (e) { log('[lockstep] feed threw: ' + ((e && e.stack) || e)); }
-  if (R.LS.frame !== f0) { CLK.frame = R.LS.frame; cbDidDraw(src === 'raf' ? 'raf' : 'task'); pbPresent(); gqAfterField(); }
+  if (R.LS.frame !== f0) {
+    CLK.frame = R.LS.frame;
+    // a tick whose frames drew nothing into the window (skipped, or a game drawing every second
+    // field) left no picture to push: the next one need not yield to its commit (RFS only)
+    if (!rfs || FSK.tickAny) cbDidDraw(src === 'raf' ? 'raf' : 'task'); else { CB.yielded = false; CB.waiting = false; }
+    pbPresent(); gqAfterField();
+  }
+  // the GPU's queue is counted in pictures — a fence after a tick that drew (a delay frame run
+  // through fsField has set its own). With ?rfskip=0 (the guard arm) it is THE LATENCY WITNESS
+  // only (fsReport: tIn = the tick's start, where the room sampled the pad).
+  if (FSK.on && FSK.tickDrew && fsCoreReady()) fsFence(tIn);
   var now = performance.now();
   if (now - RM.mirT > 100) roomMirror(true);
   if (now - RM.pubT > 400) { RM.pubT = now; if (R.LS.running) R.publishSelf(RM.rtt); }
@@ -1068,6 +1125,13 @@ function roomWatchContext() {
 }
 
 // ---- ?costdbg=1: WHERE A SLOW FIELD'S TIME WENT (a measurement arm, OFF when shipped) -----
+// THE ~25-32 ms "core" FIELDS AT THE START (bench, solo: SM64 at t=3.7-3.8 s, MK64 at t=5.6 s after
+// Start, 2 of 2 runs each) ARE V8 COMPILING THE CORE'S OWN WASM FUNCTIONS THE FIRST TIME THEY RUN
+// (lazy compilation): with Chrome's --js-flags=--no-wasm-lazy-compilation both are gone (2 of 2),
+// while MK64's at t=16 s and t=30.6 s stay (the attract loop's heavy fields). A page cannot set V8
+// flags, and the guest loses nothing to them (solo 0.998-1.000x on the field clock in the same
+// runs: the frame clock's two-period allowance absorbs a 30 ms field).
+
 // A real phone (Mali-G715, MK64 PAL, room guest) logged 902 fields over a field period and one
 // of 620 ms. This splits every field's wall time (one _neil_ls_run_frame) into the up-calls
 // that can be slow inside it — the JIT compiling a block (myApp.jitCompile, a synchronous

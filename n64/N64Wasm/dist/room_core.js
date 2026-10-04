@@ -677,6 +677,169 @@
       return !GLSKIP.disabled && !st.on && !st.readAlways;
     }
 
+    // ---- THE RENDER-LEVEL FRAME SKIP, IN A ROOM (core worker only: env.fs) ------
+    // Solo, a field that starts while the GPU still holds FSK.depth pictures runs with its draws
+    // into the WINDOW swallowed (core_worker.js THE RENDER-LEVEL FRAME SKIP) instead of the guard
+    // holding the guest. A room held the guest instead (the depth guard), so a room on a slow GPU
+    // ran slow — and every console of it with it. Here a room's frames skip the same way:
+    //   * WHICH FRAMES. The PRESENTED frame skips when the GPU is behind and the frame is expected
+    //     to draw (the solo rule, env.fs.behind/expect). A frame that is never shown — a rollback's
+    //     re-simulated frame, a hidden catch-up frame — skips whenever the GPU is behind. (Re-sims
+    //     of a title without framebuffer readback already draw nothing: GLSKIP, above; this covers
+    //     the read_always titles GLSKIP must leave drawing — Mario Kart 64, Pokemon Snap, DK64.)
+    //   * THE GUEST IS BIT-IDENTICAL, so the room's determinism is untouched. A skipped frame
+    //     changes guest state only if its pixels are read back: glide's lazy copy marks a capture
+    //     taken in a skipped frame BLANK and counts a TAINT when one is materialised (lazy_fb.c
+    //     FRAME SKIP; neil_fs_set gets the ENGINE FRAME as the serial), and a core glReadPixels
+    //     while the window holds a skipped frame's picture counts one too (core_worker.js
+    //     fsInstallRead). On a taint, right after the frame that read and BEFORE anything is
+    //     saved, fingerprinted or presented from it, the room's own snapshot ring re-runs:
+    //     the newest snapshot at or before the oldest frame whose blank capture was live
+    //     (RFS.need: neil_fs_oldest() sampled after every frame and every load — a load can
+    //     bring back a capture the replaced timeline had superseded), every frame since re-run
+    //     drawing with the input it ran with (RB.img), exactly as a rollback re-simulates.
+    //     A re-run replays the same guest, so it materialises the same captures at the same
+    //     points — drawn, this time.
+    //   * A re-run always has a snapshot: the ring never frees the one at or before the oldest frame
+    //     a re-run may start at (rbPick, rfsHold), and a blank capture older than 16 frames
+    //     (?fskipage=N, solo's FS_MAXAGE) is resolved by a re-run at once (rfsSettle), while it is
+    //     short. A re-run caused by a read-back suspends skipping for a while (doubling), as solo.
+    //   * DELAY LOCKSTEP has no ring: its frames run through the worker's solo machinery
+    //     (env.fs.linear = fsField: its own snapshots, one per 8 frames, and every frame's pads),
+    //     which is exact for a guest that never rewinds. Switching mode settles the old machinery
+    //     first (rfsSettle / env.fs.settleLinear), so no blank capture crosses into the other.
+    //   * Run-ahead (opt-in, ?ra) presents its last hidden frame: no skipping while it runs.
+    // ?rfskip=0 is the arm (the room guard as it was); the worker's ?fskip=0 turns both off and
+    // ?fskip=force:K forces it (all but 1 of K presented frames, every re-sim / hidden frame).
+    // MEASURED (this box: 4 vCPU, SwiftShader; hermetic snapshots, probe lock held, interleaved,
+    // load 0.8-5.2). n64_rollback_probe, MK64, a 2-player room with a ghost player, 30 s, two runs
+    // each; rate = engine frames / wall / 50 Hz; latency = a presented picture's tick -> its fence
+    // signalled / committed, p50 / p99 ms:
+    //                          rate            lost in 30 s     latency p50 / p99
+    //   rollback  HEAD guard    0.876-0.899x    13.9-14.5 s      (no witness)
+    //             ?rfskip=0     0.879x, 0.880x  13.6-14.4 s      414-454 / 973-980
+    //             frame skip    0.977-0.985x    2.5-2.6 s        213-236 / 710-980
+    //   delay     HEAD guard    0.888-0.890x    2.4 s            (no witness)
+    //             ?rfskip=0     0.877-0.898x    2.5-2.8 s        196-199 / 381-394
+    //             frame skip    0.953-0.970x    0.6-0.8 s        93-104 / 331-374
+    // lib/bench.js room (SM64, the loopback room: both consoles on this one box), 30 s:
+    // HEAD 0.808x, 0.868x -> frame skip 0.990x, 0.991x. What is left is not the GPU: it is the
+    // re-runs (8-12 in 30 s in the rollback room, ~1 s together; a blank capture that outlives 16
+    // frames on a GPU this far behind) and the CPU two consoles share.
+    var RFS = { on: !!env.fs && RB_Q.get('rfskip') !== '0', why: null, skipped: 0, hiddenSkipped: 0, resimSkipped: 0,
+                reruns: 0, rerunFrames: 0, rerunMs: 0, maxRerunMs: 0, repairs: 0, readbacks: 0, lost: 0,
+                suspendUntil: -1, backoff: 64, need: Infinity, stale: false, staleS: -1, inRerun: false, inResim: false,
+                head: -1, cur: -1, curSkip: false, linear: 0 };
+    if (!RFS.on) RFS.why = env.fs ? 'off (?rfskip=0)' : 'not in this realm (main-thread core)';
+    function rfsLive() { return RFS.on && !!env.fs && env.fs.ok(); }
+    function rfsOldest() { var M = G.Module; return (M && M._neil_fs_oldest) ? (M._neil_fs_oldest() | 0) : -1; }
+    function rfsNote() { var o = rfsOldest(); if (o >= 0 && o < RFS.need) RFS.need = o; }
+    // the most a blank capture may age, in frames, before it is resolved (solo's FS_MAXAGE). The
+    // ring keeps the snapshot a re-run would start from however far back that is (rbPick: rfsHold).
+    var RFS_MAXAGE = Math.max(2, +(RB_Q.get('fskipage') || 16) | 0);
+    function rfsMaxAge() { return RFS_MAXAGE; }
+    // the oldest frame a re-run may have to start at, or Infinity
+    function rfsHold() { return (RFS.on && RB.ready) ? Math.min(RFS.need, RFS.stale ? RFS.staleS : Infinity) : Infinity; }
+    // kind: 'present' | 'hidden' | 'resim'. May frame k skip at all (a snapshot to re-run from,
+    // not suspended)? And should it (the GPU is behind)?
+    function rfsAble(kind, k) {
+      if (!rfsLive() || RFS.inRerun || RA.frames > 0 || !RB.ready || RB.stale || k < RFS.suspendUntil) return false;
+      if (kind === 'resim' && glSkipOk()) return false;           // GLSKIP covers it
+      return !!rbAtOrBelow(k);                                    // a re-run needs a snapshot at or before k
+    }
+    function rfsWant(kind, k) {
+      if (!rfsAble(kind, k)) return false;
+      var f = env.fs.force();
+      if (kind === 'present') return f ? (k % f) !== 0 : (env.fs.behind() && env.fs.expect());
+      return f ? true : env.fs.behind();
+    }
+    // Around one neil_ls_run_frame of the ring (rbStep).
+    function rfsBegin(kind, k) {
+      var skip = rfsWant(kind, k);
+      RFS.cur = k; RFS.curSkip = skip;
+      if (env.fs && RFS.on) env.fs.begin(skip, k);
+      return skip;
+    }
+    function rfsEnd(kind, k, skip, present) {
+      if (!env.fs || !RFS.on) return;
+      var r = env.fs.end(present);
+      if (skip) {
+        if (kind === 'present') RFS.skipped++; else if (kind === 'hidden') RFS.hiddenSkipped++; else RFS.resimSkipped++;
+        // (as solo: the newest skipped frame — a re-run redraws it over the last picture drawn)
+        if (r.sw) { RFS.stale = true; RFS.staleS = k; }
+      } else if (r.drew) RFS.stale = false;
+      env.fs.stale(RFS.stale);
+      rfsNote();
+      if (k > RFS.head) RFS.head = k;
+    }
+    // A taint right after frame k ran: re-run from the snapshot the oldest reachable blank
+    // capture needs, through k, drawing. Returns false when it could not (the room fails then:
+    // this console's guest is no longer the room's).
+    function rfsTaintCheck(ls, k) {
+      if (!env.fs || !RFS.on) return true;
+      var t = env.fs.taint();
+      if (!t) return true;
+      if (RFS.inRerun) { RFS.lost++; return 'a read-back reached a skipped frame DURING a frame-skip re-run (frame ' + k + ')'; }
+      if (t === 'read') RFS.readbacks++;
+      return rfsRerun(ls, k, t === 'read' ? 'read-back' : 'blank capture');
+    }
+    // resave: the start of k+1 was saved already (rfsSettle runs after the frame's own save).
+    // (TRIED AND REJECTED: an age repair that draws only up to its oldest frame + 4 and re-runs the
+    // rest skipping again. MEASURED, MK64 rollback rooms, forced: re-runs 9 -> 14 and 8 -> 13, their
+    // total time 1037 -> 1253 ms and 447 -> 829 ms — the frames it skipped again left a stale window
+    // that needed its own repair a few frames later.)
+    function rfsRerun(ls, k, why, resave) {
+      var from = Math.min(RFS.need, RFS.stale ? RFS.staleS : Infinity, RFS.curSkip ? RFS.cur : Infinity, k);
+      var s = rbAtOrBelow(from), j, t0 = performance.now(), M = G.Module;
+      RFS.dbgNeed = RFS.need; RFS.dbgStale = RFS.stale ? RFS.staleS : -1;
+      if (!s) { RFS.lost++; return 'a frame-skip re-run to frame ' + from + ' found no snapshot at or before it'; }
+      for (j = s.frame; j <= k; j++) if (RB.imgF[j % RB_IMG] !== j) { RFS.lost++; return 'a frame-skip re-run: the input frame ' + j + ' ran with is no longer held'; }
+      RFS.inRerun = true;
+      // the re-run redraws: the window holds no skipped picture from here (as solo's fsRedo)
+      RFS.stale = false; env.fs.stale(false);
+      try {
+        // what real frames made goes out first (not inside a re-simulation: its audio is dropped anyway)
+        if (!RFS.inResim) audioFlushNow();
+        rbDropAbove(s.frame);
+        if (!rbLoadSlot(s)) return 'frame-skip re-run load failed: ' + N64S.fault;
+        for (j = s.frame; j < k; j++) if (!rbStep(ls, j, RB.img[j % RB_IMG], false, false)) return 'frame-skip re-run save failed: ' + N64S.fault;
+        lsApplyImage(RB.img[k % RB_IMG]);
+        env.fs.begin(false, k);
+        try { M._neil_ls_run_frame(); } finally { env.fs.end(false); }
+        if (!RFS.inResim) audioDropNow();
+        if (env.fs.taint()) { RFS.lost++; return 'a read-back reached a skipped frame DURING a frame-skip re-run (frame ' + k + ')'; }
+        if (resave && !rbSaveAt(ls, k + 1)) return 'frame-skip re-run save failed: ' + N64S.fault;
+      } finally { RFS.inRerun = false; }
+      RFS.stale = false; env.fs.stale(false); RFS.curSkip = false;
+      RFS.need = Infinity; rfsNote();
+      var ms = performance.now() - t0;
+      RFS.reruns++; RFS.rerunFrames += k - s.frame + 1; RFS.rerunMs += ms; if (ms > RFS.maxRerunMs) RFS.maxRerunMs = ms;
+      if (G.__n64RbLog) G.__n64RbLog.push(['fsrerun', k, s.frame, why, from, RFS.dbgNeed, RFS.dbgStale]);
+      if (why === 'read-back') {
+        RFS.suspendUntil = k + RFS.backoff; RFS.backoff = Math.min(RFS.backoff * 2, 1 << 24);
+        env.log('[fskip] room: a read-back reached a skipped frame: re-ran frames ' + s.frame + '..' + k + ' drawing ('
+              + ms.toFixed(1) + ' ms); skipping resumes in ' + (RFS.suspendUntil - k) + ' frames');
+      }
+      return true;
+    }
+    // After a frame the room presents (or hides): what can still be reached is recomputed, and a
+    // blank capture about to outlive the ring is resolved now. Also before the ring goes away
+    // (a switch to delay lockstep, leaving the room) — `all` resolves whatever is left.
+    function rfsSettle(ls, all) {
+      if (!env.fs || !RFS.on || !RB.ready || RB.stale || RFS.head < 0) return true;
+      RFS.need = Infinity; rfsNote();
+      var from = Math.min(RFS.need, RFS.stale ? RFS.staleS : Infinity);
+      if (from === Infinity || (!all && RFS.head - from <= rfsMaxAge())) return true;
+      RFS.repairs++; RFS.curSkip = false;
+      return rfsRerun(ls, RFS.head, all ? 'settle' : 'age', true);
+    }
+    function rfsReport() {
+      return { on: RFS.on, live: rfsLive(), why: RFS.why, skipped: RFS.skipped, hiddenSkipped: RFS.hiddenSkipped, resimSkipped: RFS.resimSkipped,
+               reruns: RFS.reruns, rerunFrames: RFS.rerunFrames, rerunMs: Math.round(RFS.rerunMs), maxRerunMs: +RFS.maxRerunMs.toFixed(1),
+               repairs: RFS.repairs, readbacks: RFS.readbacks, lost: RFS.lost, linear: RFS.linear, suspendedUntil: RFS.suspendUntil,
+               linearFs: env.fs && env.fs.report ? env.fs.report() : null };
+    }
+
     // ---- SPARSE SNAPSHOTS ------------------------------------------------------
     // A save is a 16.8 MB savestates_save_m64p into the core's buffer plus a
     // 16.8 MB copy out of the heap (n64sSave) — the largest fixed cost of a
@@ -828,7 +991,8 @@
     }
     // Which slot the start of frame k is written to (see SPARSE SNAPSHOTS).
     function rbPick(k) {
-      var S = RB.slots, i, s, anchor = null, H = k - RB.n, free = [];
+      // the anchor is also never newer than the frame a frame-skip re-run may start at (RFS)
+      var S = RB.slots, i, s, anchor = null, H = Math.min(k - RB.n, rfsHold()), free = [];
       for (i = 0; i < S.length; i++) if (S[i].frame === k) return S[i];
       for (i = 0; i < S.length; i++) { s = S[i]; if (s.frame >= 0 && s.frame <= H && (!anchor || s.frame > anchor.frame)) anchor = s; }
       for (i = 0; i < S.length; i++) { s = S[i]; if (s.frame < 0 || (anchor && s.frame < anchor.frame)) free.push(s); }
@@ -891,6 +1055,7 @@
       if (!n64sLoad(s.buf)) return false;
       var st = G.__fbAsync;
       if (st && st.on && st.restore) st.restore(s.fb);
+      if (RFS.on) rfsNote();     // a load can bring back a blank capture the replaced timeline superseded
       var dt = performance.now() - t0;
       RB.loadEma = RB.loadEma ? RB.loadEma + (dt - RB.loadEma) / 8 : dt;
       RB.loads++;
@@ -900,15 +1065,21 @@
     // neil_ls_run_frame, and — when the schedule wants it — the start of the
     // next frame saved. `present` frames also carry the page's own bookkeeping
     // (capacity, the test seams); a re-simulated or hidden one carries none.
-    function rbStep(ls, k, image, present, skipGl) {
+    // `kind` ('present' | 'hidden' | 'resim', default by `present`) decides the FRAME SKIP (RFS).
+    function rbStep(ls, k, image, present, skipGl, kind) {
       var M = G.Module, j = k % RB_IMG, h = RB.img[j];
       if (!h || h.length !== image.length) h = RB.img[j] = new Uint8Array(image.length);
       if (h !== image) h.set(image);
       RB.imgF[j] = k;
       lsApplyImage(h);
       var t0 = performance.now();
-      if (skipGl) { GLSKIP.on = true; GLSKIP.frames++; }
-      try { M._neil_ls_run_frame(); } finally { GLSKIP.on = false; }
+      kind = kind || (present ? 'present' : 'resim');
+      var fsk = rfsBegin(kind, k);
+      if (skipGl && !fsk) { GLSKIP.on = true; GLSKIP.frames++; }
+      try { M._neil_ls_run_frame(); } finally { GLSKIP.on = false; rfsEnd(kind, k, fsk, present); }
+      // a skipped frame's pixels reached the guest: re-run before anything is saved or shown
+      var tc = rfsTaintCheck(ls, k);
+      if (tc !== true) { N64S.fault = tc; return false; }
       var dt = performance.now() - t0;
       RB.runEma = RB.runEma ? RB.runEma + (dt - RB.runEma) / 32 : dt;
       if (present) lsFrameDone(image, dt);
@@ -1041,13 +1212,20 @@
         // (see rbRearm) A correction across the return would need a state this
         // console never kept — the engine promises none; refuse rather than guess.
         if (r.rollback) return rbFail(ls, 'a correction reached back across the switch to rollback (frame ' + r.rollback.from + ' < ' + r.frame + ')');
+        // delay frames ran through the worker's own frame-skip machinery: settle it first, so no
+        // blank capture is live in the state the ring re-arms at (RFS)
+        if (env.fs && RFS.on) env.fs.settleLinear();
         if (!rbRearm(ls, r.frame | 0)) return rbFail(ls, 'rollback could not resume: ' + RB.fault);
       }
       if (r.rollback) {
         var ta = performance.now();
         audioFlushNow();
-        var rr = rbResim(ls, r.rollback, glSkipOk());
-        if (rr === 'redo') rr = rbResim(ls, r.rollback, false);
+        RFS.inResim = true;
+        var rr;
+        try {
+          rr = rbResim(ls, r.rollback, glSkipOk());
+          if (rr === 'redo') rr = rbResim(ls, r.rollback, false);
+        } finally { RFS.inResim = false; }
         if (rr !== true) return rbFail(ls, rr);
         audioDropNow();
         var d = r.rollback.depth | 0, ms = performance.now() - ta;
@@ -1064,7 +1242,9 @@
         // bookkeeping — so the speakers stay at 1.000x (gate 9). The governor's
         // schedule moves with it (baseFrame), so it is never repaid as a sprint.
         audioFlushNow();
-        var okh = rbStep(ls, r.frame, r.image, false, false);
+        RFS.inResim = true;
+        var okh;
+        try { okh = rbStep(ls, r.frame, r.image, false, false, 'hidden'); } finally { RFS.inResim = false; }
         audioDropNow();
         if (!okh) return rbFail(ls, 'savestate failed: ' + N64S.fault);
         RB.hidden++; LS.frame++; LS.baseFrame++;
@@ -1075,6 +1255,9 @@
         RB.pEma += ((r.rollback ? 1 : 0) - RB.pEma) / 128;
         rbAdaptK(ls);
       }
+      // FRAME SKIP: a blank capture about to outlive the ring is resolved now (RFS)
+      var fsr = rfsSettle(ls, false);
+      if (fsr !== true) return rbFail(ls, fsr);
       RB.stepMs = rbStepMs(ls);
       if (RB.stepMs) ls.selfStepMs = RB.stepMs;
       ls.endFrame(null);
@@ -1141,6 +1324,7 @@
         try { M._neil_ls_run_frame(); } finally { GLSKIP.on = false; }
       }
       var ok = rbLoadSlot(base);
+      if (env.fs && RFS.on) env.fs.taint();     // what hidden frames read is undone with them
       audioDropNow();
       if (!ok) { RA.fault = N64S.fault; RA.frames = 0; RA.fixed = 0; env.log('[runahead] ⚠ restore failed, run-ahead OFF: ' + N64S.fault); return; }
       RA.runs++; RA.hiddenFrames += n; RA.ms += performance.now() - t0;
@@ -1208,13 +1392,20 @@
       // two consoles compares EVERY frame, not the frames two independent polls happened to hit.
       FPR.f[FPR.n % FPR_N] = LS.frame; FPR.v[FPR.n % FPR_N] = LS.lastFp; FPR.n++;
       latWitness();
+      // TEST SEAM (n64/tools/n64_rollback_probe.mjs --pics): the engine frame this picture is of,
+      // for a rig to hash the window. Absent unless a rig sets it.
+      if (G.__n64PicTap) { try { G.__n64PicTap(LS.lastPresentFrame | 0); } catch (e) {} }
     }
     function lsRunOneFrame(img) {
       var M = G.Module;
       if (!M || !M._neil_ls_run_frame) return false;
       lsApplyImage(img);
       var _t0 = performance.now();
-      M._neil_ls_run_frame();
+      // FRAME SKIP (RFS): delay lockstep never rewinds, so its frames go through the worker's own
+      // machinery (fsField: skip, snapshot, re-run on a read-back) — exact before lsFrameDone
+      // fingerprints the frame
+      if (env.fs && RFS.on && env.fs.linear) { RFS.linear++; env.fs.linear(); }
+      else M._neil_ls_run_frame();
       lsFrameDone(img, performance.now() - _t0);
       return true;
     }
@@ -1358,6 +1549,8 @@
           if (env.oneFramePerTask) { env.kick(); break; }
           continue;
         }
+        // the ring goes away below: no blank capture may need it afterwards (RFS)
+        if (RB.ready && !RB.stale) { var fss = rfsSettle(ls, true); if (fss !== true) { rbFail(ls, fss); break; } }
         if (!lsRunOneFrame(r.image)) {
           LS.fault = 'this build of the core has no _neil_ls_run_frame — rebuild n64/N64Wasm/code';
           env.log('[lockstep] ⚠ ' + LS.fault);
@@ -1387,6 +1580,13 @@
         var wantHash = (typeof ls.wantsHash === 'function') ? ls.wantsHash() : true;
         if (wantHash && LS.lastFp) { ls.endFrame(LS.lastFp, [LS.lastFp]); LS.hashes++; }
         else ls.endFrame(null);
+        // TEST SEAM (n64/tools/n64_rollback_probe.mjs, a delay-lockstep room): the state after
+        // every 10th frame, for a rig to hash in full against a straight run — the check a
+        // rollback room gets from its confirmed snapshots. Absent unless a rig sets it.
+        if (G.__n64RbTap && ((r.frame | 0) % 10) === 0) {
+          var tb = N64S.tapBuf || (N64S.tapBuf = n64sRawOk() ? n64sRawAlloc() : new Uint8Array(N64S.size + N64S_SM));
+          if (tb && n64sSave(tb)) { try { G.__n64RbTap(r.frame | 0, tb, LS.lastFp); } catch (e) {} }
+        }
         if (++guard > 240) { env.log('[lockstep] ⚠ feed loop hit its 240-frame bound — not sprinting the guest'); break; }
         if (env.oneFramePerTask) { env.kick(); break; }     // see the rollback branch above
       }
@@ -1544,6 +1744,8 @@
     // single-player from exactly the frame it was holding.
     function lsDisarm(why) {
       if (!LS.armed) return;
+      // the solo frame skip takes over from here and has no snapshot of the room's frames (RFS)
+      try { if (RB.ready && !RB.stale) rfsSettle(env.engine() || {}, true); } catch (e) {}
       LS.armed = false; LS.running = false;
       LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
       try { if (G.Module && G.Module._neil_ls_arm) G.Module._neil_ls_arm(0); } catch (e) {}
@@ -1645,6 +1847,7 @@
                 saveEmaMs: +(RB.saveEma || 0).toFixed(2), loadEmaMs: +(RB.loadEma || 0).toFixed(2), remeasures: RB.remeasures | 0,
                 rearms: RB.rearms, stale: RB.stale },
         lat: { samples: LAT.samples.slice(-60), overlapped: LAT.overlapped },
+        fskip: rfsReport(),
         prerolled: !!LS.prerolled,
         fb: (function () { var st = G.__fbAsync || {}; return { on: !!st.on, decided: st.decided || null, rom: st.romName || null,
                calls: st.calls, async: st.async, sync: st.sync, blocked: st.blocked, pinned: st.pinned, restores: st.restores | 0 }; })(),
@@ -1689,7 +1892,8 @@
       lsFeed: lsFeed, lsDriveOk: lsDriveOk, lsDueNow: lsDueNow, lsLocalPads: lsLocalPads, lsApplyImage: lsApplyImage,
       lsArmBeforeBoot: lsArmBeforeBoot, lsDisarm: lsDisarm, lsPreroll: lsPreroll,
       lsRbProve: lsRbProve, lsRbRefuse: lsRbRefuse, lsSelfCap: lsSelfCap, lsGlWitness: lsGlWitness,
-      glSkipOk: glSkipOk, audioFlushNow: audioFlushNow, audioDropNow: audioDropNow,
+      glSkipOk: glSkipOk, audioFlushNow: audioFlushNow, RFS: RFS, rfsReport: rfsReport,
+      rfsCanSkip: function () { var ls = env.engine(); return !!(ls && LS.running && (ls.rollback ? rfsAble('present', (LS.lastPresentFrame | 0) + 1) : (env.fs && env.fs.linearCanSkip && env.fs.linearCanSkip()))); }, audioDropNow: audioDropNow,
       publishSelf: publishSelf, netReport: netReport
     };
     return R;
