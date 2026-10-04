@@ -112,7 +112,13 @@ if(BEMENTAL_GUEST_POWERPC)
             "SHELL:-s EXIT_RUNTIME=1"
             "SHELL:-pthread"
             "SHELL:-s PTHREAD_POOL_SIZE=0"
-            "SHELL:-s INITIAL_MEMORY=33554432"
+            # 64MB (not 32): BlockCache::compile reads the cache-cap SAB cells
+            # (block_cache.cpp bem_cc_get(BEM_CC_CAP) = 0x026B3xxx, ~40.5MB)
+            # unconditionally since 2026-08-29, so a 32MB heap traps on the
+            # FIRST compile ("memory access out of bounds" in bem_cc_get) and
+            # the suite never reaches a single case. Same reason test_gekko_next
+            # is 64MB.
+            "SHELL:-s INITIAL_MEMORY=67108864"
             "SHELL:-s ALLOW_MEMORY_GROWTH=1"
             "SHELL:-s MAXIMUM_MEMORY=67108864"
             "SHELL:-s ALLOW_TABLE_GROWTH=1"

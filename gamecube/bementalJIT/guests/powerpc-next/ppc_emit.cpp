@@ -1809,6 +1809,10 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // exits the loop (only br re-iterates), so the not-taken and bail paths
     // land here naturally and run the unchanged epilogue below.
     if (resident_loop_arm) b.op_end();
+    // [executed-op census 2026-10-04] split the block epilogue (gather drain +
+    // dirty flushes) out of the LAST guest op's span. Mark-only: the callback is
+    // null in every shipping build and is handed no builder.
+    BEM_EMIT_MARK(BEM_MARK_EPILOGUE, start_pc);
 
     // Epilogue: drain gather-pipe (so GPU FIFO sees CP_INT/PE_TOKEN/PE_FINISH
     // after stw-to-0xCC008000 family stores), flush dirty GPR locals, then

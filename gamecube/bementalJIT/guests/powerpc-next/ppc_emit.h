@@ -178,6 +178,7 @@ enum BemEmitMarkTag : u32 {
     BEM_MARK_OP          = 2,   // before one guest instruction's emit; pc = op.address
     BEM_MARK_TERM_BEGIN  = 3,   // before emit_chain_or_return (the per-edge tax)
     BEM_MARK_BLOCK_END   = 4,   // after emit_chain_or_return
+    BEM_MARK_EPILOGUE    = 5,   // after the last guest op: gather drain + flushes
 };
 using BemEmitMarkFn = void(*)(u32 tag, u32 pc, u32 byte_off);
 extern BemEmitMarkFn g_bem_emit_mark_cb;
