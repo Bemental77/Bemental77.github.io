@@ -18,7 +18,7 @@
        the functional SAB/worker test. Does not replace __gcGpu, which stays the page's
        own render-path authority. -->
   <script src="/lib/capability.js?v=e25dca87"></script>
-  <script src="/lib/bench.js?v=d181b61c"></script><!-- ?bench=1 real-device benchmark; inert without it -->
+  <script src="/lib/bench.js?v=e8393e94"></script><!-- ?bench=1 real-device benchmark; inert without it -->
   <script src="/lib/xboxinput.js"></script>
   <!-- Online co-op. BOTH HALVES RUN THE GAME NOW. The old shape — "THE HOST HALF
        ONLY lives on this page: the guest runs on gamecube_multiplayer.html … a
@@ -7736,6 +7736,9 @@ window.GcRate = (function () {
       engine: 'recomp',
       titles: ['Mario Party 4'],
       gated: !!(g && g.gated), running: !!(g && g.running),
+      // The room's mode on this console: 'rollback' (zero added input lag — the recomp worker's
+      // rollback ring), 'delay' (a capacity-gated room dropped to input delay) or 'lockstep'.
+      mode: g ? g.mode : null, delay: g ? g.delay : null,
       why: 'Rooms run on the recomp engine (Mario Party 4), where one frame credit is exactly one '
          + 'guest frame with the agreed input latched before it. The other titles run on the JIT '
          + 'path, which has no one-emulated-frame boundary: under emscripten dual-core, retro_run '
@@ -8113,6 +8116,38 @@ window.GcRate = (function () {
   // It is mounted HERE, outside engine(), so the button exists on a plain visit before any
   // disc has been fetched; see the GCROOM note inside engine().
   var GCROOM = { session: null, role: null, startedByRoom: false };
+  // ---- THE ROOM'S ENGINE IS A ROLLBACK ENGINE (zero added input lag) ----------------------
+  // A room used to run the engine's DEFAULT — delay lockstep, input delay sized from the RTT
+  // pings (2 frames on a LAN): every player's own press reached their own game 2+ frames late.
+  // MEASURED on live caseybement.com 2026-10-03 with ?bench=1: room "mode delay, delay 2". The
+  // recomp engine now keeps a rewindable ring of frame starts (recomp_worker.js THE ROLLBACK
+  // RING), so the room is built the way ps1.html and n64/index.html build theirs:
+  //   rollback    this console proposes a window of GC_RB_WINDOW frames (?rb=0: it proposes
+  //               none); the HOST's choice wins ('lsgo'), and the host runs rollback only if
+  //               EVERY console declared it can (rbCapable — set false at Ready if this console's
+  //               worker could not instrument its module, gcLsDeclare).
+  //   rbCatchUp   this page runs the engine's hidden catch-up frames and grows nothing it cannot
+  //               (the ring is the worker's and follows the engine's KEEP), so the host may run
+  //               an ADAPTIVE room: the window follows the measured link.
+  //   rbResume    a capacity-gated room that had to drop to input delay comes back to zero lag:
+  //               the page re-arms the ring at the first rollback frame (gcLsStep).
+  // The engine has to exist with these BEFORE the first peer is seated (lib/netplay.js
+  // _ensureLockstep would otherwise build it with the defaults), so it is built at onSession.
+  var GC_RB_WINDOW = 8;
+  function gcNetEngineOpts(sess) {
+    if (!sess) return;
+    var want = true;
+    try { want = new URLSearchParams(location.search).get('rb') !== '0'; } catch (e) {}
+    var o = { portCount: 4, padBytes: 64, hashEvery: 60, rollback: want ? GC_RB_WINDOW : 0,
+              rbCatchUp: true, rollbackOk: true, rbResume: true, frameHz: 60 };
+    try {
+      if (!sess.ls && typeof sess.startLockstep === 'function') sess.startLockstep(o);
+      else if (sess.ls) {
+        var ls = sess.ls;
+        ls.rollback = o.rollback; ls.rbCatchUpOn = true; ls.rbCapable = true; ls.rbResume = true; ls.frameHz = 60;
+      }
+    } catch (e) { console.log('[gc-lockstep] could not build the room engine with rollback: ' + ((e && e.message) || e)); }
+  }
   // ---- ?np=<CODE>&game=<label>[&join=1]: HANDED OVER FROM THE LOBBY ----------------------
   // multiplayer.html mints ONE code and sends every player to this page with it in the URL;
   // under lockstep the joiner runs a core too, so both sides arrive here. dreamcast.html and
@@ -8507,7 +8542,7 @@ window.GcRate = (function () {
     try {
       var mountOpts = {
         game: 'MarioParty4', transport: gcNetTransport(),
-        onSession: function (sess, role) { GCROOM.session = sess; GCROOM.role = role; gcNetWatch(sess); },
+        onSession: function (sess, role) { GCROOM.session = sess; GCROOM.role = role; gcNetEngineOpts(sess); gcNetWatch(sess); },
         onReady: gcNetOnReady,
       };
       if (handoff) {
@@ -9315,6 +9350,179 @@ window.GcRate = (function () {
     wantDeclare: false,  // armed and waiting only for buildTag before declaring
   };
   function gcLsSay(t) { try { console.log('[gc-lockstep] ' + t); } catch (e) {} }
+  // ── THE ROLLBACK RING, PAGE HALF ───────────────────────────────────────────────────────────
+  // recomp_worker.js THE ROLLBACK RING keeps every frame start in the window rewindable; this half
+  // feeds it. In a ROLLBACK room (the host decided, 'lsgo'): beginFrame() returns the present
+  // frame's image with THIS console's pad on the frame it was sampled (zero added input lag) and
+  // every other port predicted; when a late input contradicts a guess it also returns a plan —
+  // rewind to `from`, re-run from..f-1 with these images — and the page hands the plan to the
+  // worker in the ring cells below, then releases the present frame as usual. The worker carries
+  // the plan out at the present frame's start, before latching it, inside the same credit.
+  //   ⚠ GATE 9: a re-simulated frame spends no credit; exactly one NEW frame runs per credit the
+  //     wall clock earned (gcLsEarned), as in delay lockstep. Hidden catch-up frames (rbCatchUp —
+  //     frames the room has already run, at most one per display tick unless rejoining) are
+  //     never drawn and never heard.
+  //   FINGERPRINTS OF CONFIRMED FRAMES ONLY. In a rollback-capable room the worker sweeps the
+  //     whole guest at its frame starts and publishes (frame, hash, generation of the last rewind
+  //     it carried out). A hash goes to the room only once its frame is CONFIRMED
+  //     (ls.takeHashDue) and only if no rewind the page has since issued reaches back to it.
+  // Engine frame e and worker frame w (PAD_ACK) differ by a constant fixed when the gate engages:
+  // e = w + RBP.off.
+  var RBC = { ARM_GEN: 1, STOP_GEN: 2, UNSAFE: 3, VI_AT: 6, REQ_GEN: 4, REQ_FROM: 5, DONE_GEN: 7, KEEP: 8, FP_EVERY: 9, FP_ALIGN: 10, FP_SEQ: 11,
+              HIDDEN: 12, FAULT: 13, FP_RING: 16, S_ROLLBACKS: 64, S_RESIM: 65, S_STEP_US: 66, S_STEPS: 67, S_SAVE_US: 68,
+              S_HELD: 69, S_SLOTS: 70, S_MAXDEPTH: 71, S_RESTORE_US: 72, S_OVERFLOWS: 73, S_W: 74, S_BASE: 75, S_TOUCHES: 76,
+              S_ARMED: 77, S_GEN: 78, RING: 256, RING_N: 256, RING_S: 17 };
+  var rbSab = new SharedArrayBuffer(32768);
+  var RBP = {
+    i32: new Int32Array(rbSab),
+    workerOk: null,      // the worker instrumented its module (its 'build' message) — null until it says
+    workerWhy: null,
+    scheme: false,       // this room is rollback-capable: the ring's fingerprints, frame starts logged
+    off: 0,              // engine frame - worker frame
+    gen: 0, armGen: 0, stopGen: 0,
+    stale: false,        // delay frames ran since the ring was armed (a capacity-gated room)
+    issued: [],          // [gen, engine frame `from`] of every rewind issued, newest last
+    due: [],             // engine frames whose fingerprint the engine wants (takeHashDue)
+    fps: new Map(),      // engine frame -> { h, gen } as published by the worker
+    fpSeq: 0, fpLost: 0, staleHashes: 0,
+    catchUp: 0, hidden: 0, unsafeFrames: 0, unsafeWaits: 0, rollbacks: 0, resimFrames: 0, maxDepth: 0, rearms: 0, memStalls: 0,
+    stepUs0: 0, steps0: 0, stepMs: 0, statAt: 0, faulted: false,
+    // THE DEVICE BUDGET for undo pages (4 KiB each) held at once. A frame typically logs a few
+    // hundred; a scene load can log thousands. Over budget, the console waits (like a window
+    // stall) until the room's inputs arrive and the KEEP point frees pages. navigator.deviceMemory
+    // where reported (GB, rounded down), 128 MB where not.
+    budget: (function () { var dm = 0; try { dm = +navigator.deviceMemory || 0; } catch (e) {} var mb = !dm ? 128 : dm >= 8 ? 256 : dm >= 4 ? 128 : dm >= 2 ? 64 : 48; return mb * 256; })(),
+  };
+  function gcRbCells(image, i32, o) {
+    for (var p = 0; p < PAD_PORTS; p++) {
+      var b = p * LS_PAD_BYTES;
+      var sx = image[b + 4] | 0; if (sx > 127) sx -= 256;
+      var sy = image[b + 5] | 0; if (sy > 127) sy -= 256;
+      i32[o + p * 4] = (image[b] | 0) | ((image[b + 1] | 0) << 8);
+      i32[o + p * 4 + 1] = image[b + 2] | 0;
+      i32[o + p * 4 + 2] = sx;
+      i32[o + p * 4 + 3] = sy;
+    }
+  }
+  // The plan from beginFrame: each re-simulated frame's agreed image into its ring slot (tag last),
+  // then the request. The worker refuses a slot whose tag is not the frame it wants.
+  function gcRbRing(frame, image) {
+    var I = RBP.i32, w = frame - RBP.off;
+    var o = RBC.RING + (((w % RBC.RING_N) + RBC.RING_N) % RBC.RING_N) * RBC.RING_S;
+    var tmp = new Int32Array(16); gcRbCells(image, tmp, 0);
+    for (var k = 0; k < 16; k++) Atomics.store(I, o + 1 + k, tmp[k]);
+    Atomics.store(I, o, w);
+  }
+  function gcRbIssue(ls, plan) {
+    var I = RBP.i32;
+    for (var i = 0; i < plan.frames.length; i++) gcRbRing(plan.frames[i].frame, plan.frames[i].image);
+    Atomics.store(I, RBC.REQ_FROM, plan.from - RBP.off);
+    RBP.gen++;
+    Atomics.store(I, RBC.REQ_GEN, RBP.gen);
+    RBP.issued.push([RBP.gen, plan.from]);
+    if (RBP.issued.length > 512) RBP.issued.splice(0, RBP.issued.length - 512);
+    RBP.rollbacks++; RBP.resimFrames += plan.frames.length;
+    if (plan.depth > RBP.maxDepth) RBP.maxDepth = plan.depth;
+  }
+  function gcRbArm() {
+    RBP.armGen++;
+    Atomics.store(RBP.i32, RBC.ARM_GEN, RBP.armGen);
+  }
+  // A published hash for engine frame k is from the corrected timeline unless a rewind issued
+  // AFTER it was computed (a newer generation) reaches back to k.
+  function gcRbValid(k, gen) {
+    for (var i = RBP.issued.length - 1; i >= 0; i--) {
+      var it = RBP.issued[i];
+      if (it[0] <= gen) break;
+      if (it[1] <= k) return false;
+    }
+    return true;
+  }
+  function gcRbPoll(ls) {
+    var I = RBP.i32;
+    // the worker's own failure ends the room loudly rather than letting it fork silently
+    var fault = Atomics.load(I, RBC.FAULT);
+    if (fault && !RBP.faulted) {
+      RBP.faulted = true;
+      GCLS.fault = 'the rollback ring failed in the recomp worker (code ' + fault + ' — see the console)';
+      gcLsSay('⚠ ' + GCLS.fault);
+      try { if (typeof ls.fail === 'function') ls.fail(GCLS.fault); } catch (e) {}
+      gcNetPartySync();
+      return;
+    }
+    // fingerprints: drain the worker's ring of published sweeps
+    var seq = Atomics.load(I, RBC.FP_SEQ) | 0;
+    if (((seq - RBP.fpSeq) | 0) > 16) { RBP.fpLost += ((seq - RBP.fpSeq) | 0) - 16; RBP.fpSeq = (seq - 16) | 0; }
+    while (RBP.fpSeq !== seq) {
+      var o = RBC.FP_RING + (RBP.fpSeq & 15) * 3;
+      var w = Atomics.load(I, o), h = Atomics.load(I, o + 1) >>> 0, g = Atomics.load(I, o + 2) | 0;
+      RBP.fps.set(w - 1 + RBP.off, { h: h, gen: g });
+      RBP.fpSeq = (RBP.fpSeq + 1) | 0;
+    }
+    var rbNow = ls.rollback > 0;
+    var submit = function (k, e) {
+      try { if (ls.submitHash(k, e.h)) { GCLS.hashesSent++; GCLS.lastHash = ('0000000' + e.h.toString(16)).slice(-8); GCLS.lastHashFrame = k; } }
+      catch (err) { gcLsSay('submitHash threw at frame ' + k + ': ' + ((err && err.message) || err)); }
+      RBP.fps.delete(k);
+    };
+    if (rbNow) {
+      for (var i = RBP.due.length - 1; i >= 0; i--) {
+        var k = RBP.due[i], e = RBP.fps.get(k);
+        if (e && gcRbValid(k, e.gen)) { submit(k, e); RBP.due.splice(i, 1); }
+        else if (e) RBP.staleHashes++;
+        else if (k < ls.frame - 600) RBP.due.splice(i, 1);
+      }
+    } else {
+      // delay frames are final the moment they run: no rewind can reach them
+      RBP.due.length = 0;
+      RBP.fps.forEach(function (e, k) { if (k <= ls.frame - 1 && gcRbValid(k, e.gen)) submit(k, e); });
+    }
+    RBP.fps.forEach(function (e, k) { if (k < ls.frame - 900) RBP.fps.delete(k); });
+    // WHAT ONE ROLLBACK STEP COSTS THIS CONSOLE (the capacity gate's input, lib/netplay.js
+    // _capDecide; N64's definition: the load, the run, the save of one frame of a re-simulation).
+    // Measured on the re-simulated frames themselves: their guest run + their (renderer-free) VI
+    // pump + the rewinds' restores, per re-simulated frame, plus the per-frame save. A presented
+    // frame's renderer pump (FIFO walk, region copies, a full 24 MB image on a disc-read frame) is
+    // paid in every mode, delay included, so it is not part of what rollback ADDS; it used to be
+    // averaged in, and a boot full of disc reads read as a 155% need and dropped the room to delay.
+    // Before any re-simulation: the presented frames' guest run + save, the same quantities.
+    var now = performance.now();
+    if (now - RBP.statAt >= 500) {
+      RBP.statAt = now;
+      var c = { gp: Atomics.load(I, 80), np: Atomics.load(I, 82), gr: Atomics.load(I, 83), vr: Atomics.load(I, 84),
+                nr: Atomics.load(I, 85), sv: Atomics.load(I, RBC.S_SAVE_US), rs: Atomics.load(I, RBC.S_RESTORE_US) };
+      var p0 = RBP.stat0 || c, per = null;
+      var dnp = c.np - p0.np, dnr = c.nr - p0.nr, dsv = (c.sv - p0.sv) / Math.max(1, dnp + dnr);
+      if (dnr > 0) per = ((c.gr - p0.gr) + (c.vr - p0.vr) + (c.rs - p0.rs)) / dnr + dsv;
+      else if (dnp > 0) per = (c.gp - p0.gp) / dnp + dsv;
+      if (per != null && RBP.stat0) {
+        per /= 1000;
+        RBP.stepMs = RBP.stepMs ? RBP.stepMs + (per - RBP.stepMs) / 8 : per;
+        ls.selfStepMs = +RBP.stepMs.toFixed(2);
+      }
+      RBP.stat0 = c;
+    }
+  }
+  function gcRbReport(ls) {
+    var I = RBP.i32, g = function (k) { return Atomics.load(I, k) | 0; };
+    var eng = null; try { eng = ls && ls.rollback ? ls.rollbackReport() : null; } catch (e) {}
+    var mode = null; try { mode = ls && typeof ls.modeReport === 'function' ? ls.modeReport() : null; } catch (e) {}
+    return {
+      scheme: RBP.scheme, workerOk: RBP.workerOk, workerWhy: RBP.workerWhy, window: ls ? ls.rollback | 0 : null,
+      capGate: !!(ls && ls._capGate), selfStepMs: RBP.stepMs ? +RBP.stepMs.toFixed(2) : 0, mode: mode,
+      page: { rollbacks: RBP.rollbacks, resimFrames: RBP.resimFrames, maxDepth: RBP.maxDepth, hidden: RBP.hidden,
+              rearms: RBP.rearms, memStalls: RBP.memStalls, unsafeFrames: RBP.unsafeFrames, unsafeWaits: RBP.unsafeWaits, staleHashes: RBP.staleHashes, fpLost: RBP.fpLost, due: RBP.due.length, off: RBP.off },
+      worker: { armed: !!g(RBC.S_ARMED), w: g(RBC.S_W), base: g(RBC.S_BASE), held: g(RBC.S_HELD), rollbacks: g(RBC.S_ROLLBACKS),
+                resimFrames: g(RBC.S_RESIM), maxDepth: g(RBC.S_MAXDEPTH), slots: g(RBC.S_SLOTS), budget: RBP.budget,
+                saveMsTotal: Math.round(g(RBC.S_SAVE_US) / 1000), restoreMsTotal: Math.round(g(RBC.S_RESTORE_US) / 1000),
+                stepMsTotal: Math.round(g(RBC.S_STEP_US) / 1000), steps: g(RBC.S_STEPS), overflows: g(RBC.S_OVERFLOWS),
+                pagesLogged: g(RBC.S_TOUCHES), fault: g(RBC.FAULT), gen: g(RBC.S_GEN),
+                // ms per frame: the guest's own run and the VI pump, presented vs re-simulated frames
+                guestMsPresented: +(g(80) / 1000 / Math.max(1, g(82))).toFixed(3), viMsPresented: +(g(81) / 1000 / Math.max(1, g(82))).toFixed(3),
+                guestMsResim: +(g(83) / 1000 / Math.max(1, g(85))).toFixed(3), viMsResim: +(g(84) / 1000 / Math.max(1, g(85))).toFixed(3) },
+      engine: eng,
+    };
+  }
   function gcLsEngine() {
     var s = GCLS.session;
     if (!s) return null;
@@ -9403,6 +9611,32 @@ window.GcRate = (function () {
     }
   }
 
+  // ---- LOCAL INPUT LAG, AS THE ROOM APPLIES IT (test witness) ------------------------------
+  // When this console's own pad changes, note the engine frame it was sampled for; when an image
+  // the engine hands back carries the new pad at this console's port, the difference is the input
+  // lag the ROOM adds, in frames: `delay` under lockstep, 0 under rollback (the pad lands on the
+  // frame it was sampled for). The game's own lag frames come on top of it either way.
+  var GCLAT = { pending: null, last: null, samples: [], overlapped: 0 };
+  function gcLatKey(b) { return b ? (b[0] | 0) + ',' + (b[1] | 0) + ',' + (b[2] | 0) : null; }
+  function gcLatNote(ls, pads) {
+    var port = ls.localPorts && ls.localPorts.length ? ls.localPorts[0] : null;
+    if (port == null) return;
+    var key = gcLatKey(pads[port]);
+    if (key === null || key === GCLAT.last) return;
+    GCLAT.last = key;
+    if (key === '0,0,0') return;                  // a release is not a press
+    if (GCLAT.pending) GCLAT.overlapped++;
+    GCLAT.pending = { key: key, port: port, frame: ls.frame | 0, t: performance.now() };
+  }
+  function gcLatWitness(ls, r) {
+    var P = GCLAT.pending; if (!P || !r || !r.image) return;
+    var o = P.port * LS_PAD_BYTES;
+    if (gcLatKey([r.image[o], r.image[o + 1], r.image[o + 2]]) !== P.key) return;
+    GCLAT.samples.push({ frames: (r.frame | 0) - P.frame, ms: +(performance.now() - P.t).toFixed(1), mode: ls.rollback > 0 ? 'rollback' : 'delay' });
+    if (GCLAT.samples.length > 200) GCLAT.samples.shift();
+    GCLAT.pending = null;
+  }
+
   // ONE STEP = AT MOST ONE GUEST FRAME. Called from the rAF grant loop and from a short timer,
   // because a frame that becomes feedable between two rAFs should not wait for the next one.
   function gcLsStep() {
@@ -9414,6 +9648,7 @@ window.GcRate = (function () {
     if (GCLS.armed && !GCLS.session) {
       gcLsGate = false; gcLsStage = null;              // pads write the SAB directly again
       Atomics.store(paceI32, LS_ARMED, 0);
+      if (RBP.scheme) { RBP.scheme = false; RBP.stopGen++; Atomics.store(RBP.i32, RBC.HIDDEN, 0); Atomics.store(RBP.i32, RBC.STOP_GEN, RBP.stopGen); }
       GCLS.armed = false; GCLS.running = false; GCLS.pendingAck = -1;
       var owed = Math.min(gcLsEarned, MAX_BACKLOG); gcLsEarned = 0;
       if (owed > 0) { Atomics.add(paceI32, 0, owed); Atomics.notify(paceI32, 0); }
@@ -9447,8 +9682,27 @@ window.GcRate = (function () {
       GCLS.hashSink = true;
       GCLS.hashSeq = -1; GCLS.hashesSent = 0; GCLS.lastHash = null; GCLS.lastHashFrame = -1;
       GCLS.fault = null;
-      gcLsSay('FRAME GATE ENGAGED at frame ' + ls.frame + ' — this core advances only when every seated ' +
-              'port has an input for the frame. delay=' + ls.delay + ' frames, ports=' +
+      // A ROLLBACK-CAPABLE ROOM (the host chose rollback, or a capacity-gated room that may switch
+      // between rollback and delay): arm the worker's ring at the room's frame 0 and fingerprint
+      // at its frame starts, aligned so a sweep closes after every engine frame k with
+      // k % hashEvery == 0 — the frames ls.takeHashDue() names. The choice is the room's, so it
+      // is the same on every console.
+      RBP.off = (ls.frame | 0) - Atomics.load(paceI32, PAD_ACK);
+      RBP.scheme = !!(RBP.workerOk && (ls.rollback > 0 || ls._capGate));
+      if (RBP.scheme) {
+        var every = Math.max(1, ls.hashEvery | 0 || 60);
+        Atomics.store(RBP.i32, RBC.FP_ALIGN, (((1 - RBP.off) % every) + every) % every);
+        Atomics.store(RBP.i32, RBC.FP_EVERY, every);
+        Atomics.store(RBP.i32, RBC.KEEP, 0);
+        gcRbArm();
+        RBP.stale = false;
+      }
+      var modeTxt = ls.rollback > 0
+        ? 'ROLLBACK, window ' + ls.rollback + ' frames: this console applies its own input with 0 frames of delay, ' +
+          'predicts the others and re-simulates when a prediction was wrong' + (ls._capGate ? ' (capacity-gated: input delay if this device cannot afford it)' : '')
+        : 'this core advances only when every seated port has an input for the frame. delay=' + ls.delay + ' frames' +
+          (RBP.scheme ? ' (capacity-gated room starting in input delay)' : (RBP.workerOk === false ? ' (this console cannot roll back: ' + RBP.workerWhy + ')' : ''));
+      gcLsSay('FRAME GATE ENGAGED at frame ' + ls.frame + ' — ' + modeTxt + ', ports=' +
               JSON.stringify(ls.roster) + ', mine=' + JSON.stringify(ls.localPorts));
       gcNetPartySync();
     }
@@ -9464,25 +9718,107 @@ window.GcRate = (function () {
       if (Atomics.load(paceI32, PAD_ACK) === GCLS.pendingAck) { if (gcLsEarned > 0) GCLS.waitWorkerMs += stepDt; return; }   // not latched yet
       GCLS.pendingAck = -1;
     }
-    if (gcLsEarned <= 0) return;      // the wall clock has not earned a frame — this is the 1.000x half
+    if (RBP.scheme) { gcRbPoll(ls); if (RBP.faulted) return; }
+    // A hidden catch-up frame (the engine's rbCatchUp, granted once per display tick in grantLoop;
+    // every frame while it says the console is REJOINING) runs without a wall-clock credit — it is
+    // a frame the room has already run — and is never drawn or heard.
+    var rejoining = RBP.scheme && typeof ls.rbRejoining === 'function' && ls.rbRejoining();
+    var hidden = RBP.scheme && (RBP.catchUp > 0 || rejoining);
+    if (!hidden && gcLsEarned <= 0) return;      // the wall clock has not earned a frame — this is the 1.000x half
+    // THE RING'S MEMORY BUDGET IS A WINDOW LIMIT, NOT A FAILURE: over it, wait like a window stall
+    // until the room's inputs move the KEEP point on and the worker frees pages.
+    if (RBP.scheme && ls.rollback > 0 && Atomics.load(RBP.i32, RBC.S_SLOTS) > RBP.budget) {
+      RBP.memStalls++; GCLS.stallReason = 'memory budget'; GCLS.waitInputMs += stepDt;
+      try { if (typeof ls._rbTick === 'function') ls._rbTick(ls._now()); } catch (e) {}
+      return;
+    }
+    // AN UNSAFE FRAME START (recomp_worker.js rbViContext: MP4's boot calls VIWaitForRetrace from
+    // sites outside its main loop, with live locals a rewind cannot restore). Such a frame runs on
+    // REAL inputs only: wait until the worker has reached the frame start and said which kind it
+    // is; if unsafe, the engine's image must carry no prediction (every port's input for the frame
+    // is in) before it is released — exactly a delay-0 lockstep frame.
+    // ONCE THE RING HAS SEEN A LONG RUN OF RESTORE POINTS (MP4's main loop: the scheduler runs every
+    // frame), the wait is skipped — it costs a worker frame of latency per frame, which a busy main
+    // thread pays as lost frames. Should a frame start ever turn out not to be one after all, a rewind
+    // to it is refused by the worker (fault 1) and the room fails loudly, never silently.
+    var unsafe = false;
+    if (RBP.scheme && ls.rollback > 0) {
+      var wNext = Atomics.load(paceI32, PAD_ACK), viAt = Atomics.load(RBP.i32, RBC.VI_AT) | 0;
+      if (viAt === wNext) {
+        unsafe = (Atomics.load(RBP.i32, RBC.UNSAFE) | 0) === wNext;
+        if (unsafe) RBP.safeRun = 0; else if (RBP.safeSeen !== wNext) { RBP.safeSeen = wNext; RBP.safeRun = (RBP.safeRun | 0) + 1; }
+      } else if ((RBP.safeRun | 0) < 120) { GCLS.waitWorkerMs += stepDt; return; }
+    }
     GCLS.bfCalls++;
-    var r = ls.beginFrame(gcLsLocalPads());
+    var pads = gcLsLocalPads();
+    gcLatNote(ls, pads);
+    var r = ls.beginFrame(pads, hidden ? { hidden: true } : undefined);
+    if (unsafe && r && r.ready && (r.predicted || r.rollback)) {
+      if (r.rollback) {
+        GCLS.fault = 'a correction (frame ' + r.rollback.from + ') arrived at a frame start the recomp cannot rewind from';
+        gcLsSay('⚠ ' + GCLS.fault); try { ls.fail(GCLS.fault); } catch (e) {}
+        return;
+      }
+      RBP.unsafeWaits++; GCLS.waitInputMs += stepDt; GCLS.stallReason = 'boot frame: waiting for every input';
+      return;                          // asked again next step; the engine re-uses this frame's own pad
+    }
+    if (unsafe) RBP.unsafeFrames++;
     if (!r || !r.ready) {
       GCLS.waitInputMs += stepDt;
       GCLS.bfStall++;
       GCLS.stalling = !!(r && r.reason === 'stall');
       GCLS.stallReason = r ? r.reason : 'the engine returned nothing';
       GCLS.waitingOn = (r && r.waitingOn) ? r.waitingOn.slice() : [];
-      return;                          // STALL. Never predict.
+      // ROLLBACK TIME SYNC (a room that is not adaptive): the engine withholds ONE frame because
+      // this console is ahead. That is a slowdown, the direction gate 9 allows — the credit is
+      // spent, not banked, or the next step would simply run the frame and undo the wait.
+      if (r && r.reason === 'advantage' && gcLsEarned > 0) gcLsEarned--;
+      if (hidden) RBP.catchUp = 0;     // a catch-up that was not ready is re-measured, never owed twice
+      return;                          // STALL. Lockstep never predicts; rollback stalls only at its window.
     }
     GCLS.stalling = false; GCLS.waitingOn = []; GCLS.stallReason = null;
+    gcLatWitness(ls, r);
+    if (RBP.scheme) {
+      if (ls.rollback > 0) {
+        // BACK TO ROLLBACK AFTER INPUT DELAY (the capacity gate, lib/netplay.js _capDecide, with
+        // opts.rbResume): the ring is re-armed at the start of this frame — the live machine IS
+        // that start — and the engine names no correction reaching back across the switch
+        // (_rbResumeAt). One that did would be out of the ring: fail loudly.
+        // The ring kept logging through the delay stretch (KEEP held it at the present frame), so the
+        // start of this first rollback frame is already in it — re-arming would put it out of reach,
+        // because the worker can only arm at the NEXT frame boundary (MEASURED: a 4-player room
+        // faulted 2 frames after the capacity gate returned it to rollback, before this).
+        if (RBP.stale) { RBP.stale = false; RBP.rearms++; gcLsSay('zero-lag mode again at frame ' + r.frame + ' — the ring was kept through the input-delay stretch'); }
+        // The worker carries a plan out at the next frame boundary, re-simulating through THIS frame
+        // too (it latches this frame's input before it gets there), so this image goes in the ring.
+        gcRbRing(r.frame, r.image);
+        if (r.rollback) gcRbIssue(ls, r.rollback);
+        // the earliest frame start a rollback can still name: one past the engine's frontier
+        // ...and never fewer frame starts than the engine's ring contract (rbRingFrames(): the deepest
+        // window this room has run, plus margin — a drop/undrop or a window change may reach that far).
+        var keep = r.frame;
+        try { if (typeof ls._rbFront === 'function') keep = Math.min(r.frame, (ls._rbFront() | 0) + 1); } catch (e) {}
+        try { if (typeof ls.rbRingFrames === 'function') keep = Math.min(keep, r.frame - (ls.rbRingFrames() | 0)); } catch (e) {}
+        if (r.rollback) keep = Math.min(keep, r.rollback.from);   // the plan just issued still needs its base
+        Atomics.store(RBP.i32, RBC.KEEP, keep - RBP.off);
+      } else {
+        // A DELAY frame of a capacity-gated room: final as it runs; nothing to keep behind it.
+        RBP.stale = true;
+        Atomics.store(RBP.i32, RBC.KEEP, r.frame - RBP.off);
+      }
+      Atomics.store(RBP.i32, RBC.HIDDEN, hidden ? 1 : 0);
+    }
     gcLsWriteImage(r.image);
     GCLS.pendingAck = Atomics.load(paceI32, PAD_ACK);
-    gcLsEarned--;
+    if (hidden) { RBP.catchUp = Math.max(0, RBP.catchUp - 1); RBP.hidden++; rate.granted++; }
+    else gcLsEarned--;
     Atomics.add(paceI32, 0, 1); Atomics.notify(paceI32, 0);   // exactly one frame
     GCLS.fedTo = r.frame + 1; GCLS.framesFed++;
     ls.endFrame(null);
-    gcLsPumpHash(ls);
+    if (RBP.scheme) {
+      if (ls.rollback > 0 && typeof ls.takeHashDue === 'function') { var due = ls.takeHashDue(); for (var di = 0; di < due.length; di++) RBP.due.push(due[di]); }
+      gcRbPoll(ls);
+    } else gcLsPumpHash(ls);
   }
 
   // Hand the recomp's newest fingerprint to the engine. Reads the publish
@@ -9715,11 +10051,21 @@ window.GcRate = (function () {
     // dreamcast.html make: the host pings every peer and takes Lockstep.recommendDelayForRoom's
     // answer from the worst sample, BEFORE it declares, so the room starts on it. On a LAN that is
     // the engine's floor of 2 frames.
-    if (ls && ls.isHost && !ls.rollback && typeof sess.rttReport === 'function') {
+    // CAN THIS CONSOLE ROLL BACK? Only if its worker instrumented the module (the 'build' message
+    // carries it). A console that cannot says so at Ready and the host runs the room on input
+    // delay instead — a room that rolled back on a console without the ring would fork.
+    if (ls && RBP.workerOk === false && ls.rbCapable) {
+      ls.rbCapable = false;
+      gcLsSay('this console declares itself NOT rollback-capable — ' + RBP.workerWhy + '; the room runs input delay');
+    }
+    // The host measures the link either way: in a rollback room the RTT sizes the delay a
+    // capacity-gated room would fall back to (Session.rttReport sets ls.rttDelay); in a lockstep
+    // room it IS the delay.
+    if (ls && ls.isHost && typeof sess.rttReport === 'function') {
       pre = sess.rttReport(600, { samples: 6, frameMs: 1000 / GUEST_HZ }).then(function (rep) {
         GCLS.rttMs = (rep && rep.worstMs != null) ? Math.round(rep.worstMs) : null;
         var want = (rep && rep.recommendedDelay != null) ? Math.max(1, Math.min(30, rep.recommendedDelay | 0)) : null;
-        if (want != null && want !== ls.delay) {
+        if (want != null && want !== ls.delay && !ls.rollback) {
           gcLsSay('input delay ' + ls.delay + ' -> ' + want + ' frames, chosen from the worst measured RTT ' + GCLS.rttMs + ' ms');
           ls.delay = want;
         }
@@ -9762,6 +10108,14 @@ window.GcRate = (function () {
       role: GCLS.role, ports: ls ? (ls.localPorts || []).slice() : null,
       roster: ls ? (ls.roster || []).slice() : null,
       state: ls ? ls.state : null, frame: ls ? ls.frame : null, delay: ls ? ls.delay : null,
+      // THE ROOM'S MODE as this console runs it: 'rollback' (0 frames of added input lag),
+      // 'delay' (a capacity-gated room dropped to input delay) or 'lockstep' (a room some console
+      // could not roll back in).
+      mode: ls ? (ls.rollback > 0 ? 'rollback' : (RBP.scheme ? 'delay' : 'lockstep')) : null,
+      rollback: RBP.scheme || RBP.workerOk != null ? gcRbReport(ls) : null,
+      // the local-input-lag witness (gcLatWitness): frames between sampling this console's pad and
+      // the frame the room runs it on
+      lat: { samples: GCLAT.samples.slice(-50), overlapped: GCLAT.overlapped },
       framesFed: GCLS.framesFed, bfCalls: GCLS.bfCalls, bfStall: GCLS.bfStall,
       stalling: GCLS.stalling, waitingOn: GCLS.waitingOn.slice(), stallReason: GCLS.stallReason,
       earned: gcLsEarned, guestFrames: (paceI32 ? Atomics.load(paceI32, PAD_ACK) : 0),
@@ -9852,6 +10206,12 @@ window.GcRate = (function () {
   function grantLoop() {
     rafSinceDraw = true;
     grantNow();
+    // ONCE PER DISPLAY TICK: the hidden catch-up frames the room grants this console (lib/netplay.js
+    // rbCatchUp counts its calls as ticks), run by gcLsStep before any credited frame.
+    if (GCLS.running && RBP.scheme) {
+      var lsC = gcLsEngine();
+      if (lsC && typeof lsC.rbCatchUp === 'function') { try { var cu = lsC.rbCatchUp() | 0; if (cu > 0) RBP.catchUp = Math.min(8, RBP.catchUp + cu); } catch (e) {} }
+    }
     if (GCLS.armed) gcLsStep();
     if (!grantTimer) { grantTimer = setInterval(grantNow, 8); bkStart(); }
     requestAnimationFrame(grantLoop);
@@ -10106,7 +10466,8 @@ window.GcRate = (function () {
         var _fnow = performance.now();
         var _mt = !!window.__gcMtGl, _rwb = _mt && typeof window.__gcRwBusy === 'function' && window.__gcRwBusy();
         var _pg = _mt && (_rwb || (!rafSinceDraw && (_fnow - lastDrawAt) < 250));
-        var skipRender = rate.frame(e.data.n, _fnow, _pg);
+        // A hidden catch-up frame (THE ROLLBACK RING) applies its state and is never drawn.
+        var skipRender = rate.frame(e.data.n, _fnow, _pg || !!e.data.hidden);
         if (!skipRender) {
           rafSinceDraw = false; lastDrawAt = _fnow;
           if (_mt && typeof window.__gcRwNoteSent === 'function') window.__gcRwNoteSent();
@@ -10148,7 +10509,10 @@ window.GcRate = (function () {
         // int16 stereo PCM; e.data.len is BYTES (frames*4), matching pushAudioSamples' contract.
         if (window._gcAudioPushSamples) window._gcAudioPushSamples(new Uint8Array(e.data.buf), e.data.len);
       } else if (e.data.cmd === 'build') {
-        // The recomp build this worker instantiated — part of the room's disc tag (gcLsDisc).
+        // The recomp build this worker instantiated — part of the room's disc tag (gcLsDisc) — and
+        // whether it can keep a rollback ring (THE ROLLBACK RING, page half).
+        RBP.workerOk = !!(e.data.rb && e.data.rb.ok);
+        RBP.workerWhy = (e.data.rb && e.data.rb.why) || (e.data.rb ? null : 'this worker build has no rollback ring');
         GCLS.buildTag = String(e.data.hash || '');
         gcLsDeclare();
       } else if (e.data.cmd === 'card') {
@@ -10250,6 +10614,9 @@ window.GcRate = (function () {
     else if (recompBuildDir) console.log('[recomp] CANDIDATE build /gamecube/recomp/' + recompBuildDir + ' — NOT the shipped pair');
     rw.postMessage({ cmd: 'boot', parts: parts, fst: fst, pace: pace, card: card, cardTime: cardTime,
                      stage: stageSab,
+                     // THE ROLLBACK RING: in a room the worker instruments the module so every frame
+                     // start in the window can be rewound; solo, nothing changes.
+                     rb: !!GCLS.session, rbSab: rbSab,
                      autoboard: q.get('board') === '1' && !boardCom,
                      autotest: boardCom ? { board: 0, mg: null, allcom: true } : null,
                      inputScript: boardScript,

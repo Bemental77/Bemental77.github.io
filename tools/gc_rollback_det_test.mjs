@@ -21,7 +21,7 @@
 // Usage (hermetic snapshot; CLAUDE.md gates on torn pairs and probe serialization):
 //   WEB_ROOT=<snapshot> PROBE_CHROME=/opt/pw-browsers/chromium-1194/chrome-linux/chrome \
 //   NODE_PATH=/root/probe-deps/node_modules bash tools/probe_lock.sh run -- node tools/gc_rollback_det_test.mjs
-// Env: FRAMES (default 3000)  SCRIPT (mash3)  DMAX (7)  SEED (7)  BROKEN (nocorrect)  PAGE_EVERY (600)
+// Env: FRAMES (default 3000)  SCRIPT (mash3)  MASHFROM (600: input from the title; 1: from boot)  DMAX (7)  SEED (7)  BROKEN (nocorrect)  PAGE_EVERY (600)
 //      PORT (18911)  WEB_ROOT  OUT
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -42,6 +42,7 @@ const DMAX = parseInt(process.env.DMAX || '7', 10);
 const SEED = parseInt(process.env.SEED || '7', 10);
 const BROKEN = (process.env.BROKEN || 'nocorrect').split(',').filter(Boolean);
 const PAGE_EVERY = parseInt(process.env.PAGE_EVERY || '600', 10);
+const MASHFROM = parseInt(process.env.MASHFROM || '600', 10);   // mash3: the first frame with input
 const PORT = parseInt(process.env.PORT || '18911', 10);
 const WEB_ROOT = process.env.WEB_ROOT || REPO;
 const OUT = process.env.OUT || path.join(os.tmpdir(), 'gc_rollback_det.json');
@@ -78,7 +79,7 @@ async function runArm(name, extra) {
   if (guard) try { guard.guard(b, 'gc_rollback_det_test'); } catch (e) {}
   const p = await b.newPage();
   p.on('pageerror', (e) => console.log(`  [${name}] PAGEERROR ${String(e).slice(0, 200)}`));
-  const url = `${ORIGIN}/tools/gc_netplay_det.html?frames=${FRAMES}&pace=free&script=${SCRIPT}&pageevery=${PAGE_EVERY}&arm=${name}${extra}`;
+  const url = `${ORIGIN}/tools/gc_netplay_det.html?frames=${FRAMES}&pace=free&script=${SCRIPT}&pageevery=${PAGE_EVERY}&mashfrom=${MASHFROM}&arm=${name}${extra}`;
   await p.goto(url, { waitUntil: 'load', timeout: 120000 });
   const t0 = Date.now();
   let st = null, lastSay = 0, lastFrame = -1, lastMoveAt = Date.now(), stalled = null;
@@ -102,7 +103,7 @@ async function runArm(name, extra) {
   return R;
 }
 
-const arms = [['ref', ''], ['rb', `&rbtest=1&rbdmax=${DMAX}&rbseed=${SEED}`]]
+const arms = [['ref', ''], ['rb', `&rbtest=1&rbdmax=${DMAX}&rbseed=${SEED}${process.env.RBEXTRA || ''}`]]
   .concat(BROKEN.map((k) => ['broken-' + k, `&rbtest=1&rbdmax=${DMAX}&rbseed=${SEED}&rbbroken=${k}`]));
 const results = await Promise.all(arms.map(([n, e]) => runArm(n, e)));
 const md5After = await servedMd5();
@@ -120,6 +121,9 @@ for (const r of results) {
               (r.rb ? `; ring: ${r.rb.rollbacks} rollbacks, ${r.rb.resimFrames} re-simulated frames, max depth ${r.rb.maxDepth}, ` +
                       `save ${(r.rb.saveUs / 1000 / Math.max(1, r.frames)).toFixed(3)} ms/frame, restore ${(r.rb.restoreUs / 1000 / Math.max(1, r.rb.rollbacks)).toFixed(3)} ms/rollback, ` +
                       `${r.rb.touches} pages logged (${(r.rb.touches / Math.max(1, r.frames + r.rb.resimFrames)).toFixed(1)}/frame), slots held at end ${r.rb.slots}, overflows ${r.rb.overflows}, fault ${r.rb.fault}` : ''));
+  { const g = []; for (let i = 0; i + W <= r.rows.length; i += W) if (r.rows[i] > 30 && r.rows[i + 4] > 0) g.push(r.rows[i + 4] / 1000);
+    g.sort((a, b) => a - b); const q = (x) => g.length ? g[Math.min(g.length - 1, Math.floor(x * g.length))].toFixed(3) : '-';
+    console.log(`      guest compute per frame (ms, frame > 30, every run incl. re-simulated): p50 ${q(0.5)} p90 ${q(0.9)} p99 ${q(0.99)}`); }
   for (const t of r.log) console.log(`      ${t.slice(0, 220)}`);
   report.arms.push({ name: r.name, done: r.done, error: r.error, rb: r.rb, rows: r.rows.length / W });
 }
@@ -128,13 +132,14 @@ results.every((r) => r.done && !r.error) ? ok('every-arm-ran-to-the-end', `${FRA
 const ref = maps[0];
 const upto = FRAMES - MARGIN;
 function cmp(i) {
-  let compared = 0, differ = 0, first = null;
+  let compared = 0, differ = 0, first = null; const frames = [];
   for (const [f, v] of ref) {
     if (f > upto) continue;
     const w = maps[i].get(f); if (!w) continue;
     compared++;
     if (v[0] !== w[0] || v[1] !== w[1] || v[2] !== w[2]) {
       differ++;
+      if (frames.length < 40) frames.push(f);
       if (!first) first = { frame: f, low: v[0] !== w[0], mem1: v[1] !== w[1], high: v[2] !== w[2], a: v.map(hex), b: w.map(hex) };
     }
   }
@@ -145,7 +150,7 @@ function cmp(i) {
     const d = []; for (let k = 0; k < Math.min(A.length, B.length); k++) if (A[k] !== B[k]) d.push(k);
     pageDiffs.push({ frame: +f, differ: d.length, pages: d.slice(0, 12).map((k) => '0x' + (k * 65536).toString(16)) });
   }
-  return { compared, differ, first, pageDiffs };
+  return { compared, differ, first, pageDiffs, frames };
 }
 const rbArm = results[1];
 const c1 = cmp(1);
@@ -157,7 +162,7 @@ const rolled = rbArm.rb && rbArm.rb.rollbacks;
   ? ok('a-console-that-guessed-and-rewound-EQUALS-one-that-never-guessed',
        `${c1.compared} frames: LOW + MEM1 + HIGH identical on every one; every 64 KiB page identical at ${c1.pageDiffs.length} checkpoints (${c1.pageDiffs.map((x) => 'f' + x.frame).join(' ')})`)
   : bad('a-console-that-guessed-and-rewound-EQUALS-one-that-never-guessed',
-        `${c1.differ} of ${c1.compared} frames differ; first ${JSON.stringify(c1.first)}; pages ${JSON.stringify(c1.pageDiffs.filter((x) => x.differ).slice(0, 3))}`);
+        `${c1.differ} of ${c1.compared} frames differ (${c1.frames.join(',')}); first ${JSON.stringify(c1.first)}; pages ${JSON.stringify(c1.pageDiffs.filter((x) => x.differ).slice(0, 3))}`);
 for (let i = 2; i < results.length; i++) {
   const c = cmp(i);
   report['broken_' + results[i].name] = c;

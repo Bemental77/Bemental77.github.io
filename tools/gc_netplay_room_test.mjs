@@ -20,6 +20,10 @@
 //      of MP4's own HuPadBtnDown (the pad witness), and never on someone else's;
 //   7. the party panel says what is true: every row 'playing', the room's sentence;
 //   8. LAST, the detector fires: perturb one console's fingerprint and every console names it.
+//   9. THE MODE: every console runs ROLLBACK with 0 frames of added input delay (the recomp worker's
+//      rollback ring — gamecube.html THE ROLLBACK RING), the rings actually rewound and
+//      re-simulated, and the local-input-lag witness reads 0 frames. RB=0 expects input delay
+//      instead (the page's ?rb=0 arm).
 //
 // Usage (hermetic snapshot, see CLAUDE.md gate #10/#11 on torn pairs):
 //   WEB_ROOT=<snapshot> PROBE_CHROME=/opt/pw-browsers/chromium-1194/chrome-linux/chrome \
@@ -80,6 +84,7 @@ const HOST_CARD = process.env.HOST_CARD ? fs.readFileSync(process.env.HOST_CARD)
 // (CLAUDE.md gate #10: report the machine load; ratios are the durable part).
 const CONTROL = process.env.CONTROL === '1';
 const NO_WEBGPU = process.env.NO_WEBGPU === '1';
+const RB = process.env.RB !== '0';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let pass = 0, fail = 0;
 const ok = (n, d) => { pass++; console.log(`  PASS  ${n}${d ? ' — ' + d : ''}`); };
@@ -228,13 +233,13 @@ const HCODE = Array.from({ length: 5 }, () => CODE_ALPHA[Math.floor(Math.random(
 const URL_BASE = (SEPARATE && !CONTROL)
   ? `${ORIGIN}/gamecube.html?np=${HCODE}&game=${encodeURIComponent('Mario Party 4')}&signal=ws&wsbroker=${encodeURIComponent(broker.url)}&v=${Date.now()}`
   : `${ORIGIN}/gamecube.html?net=local&v=${Date.now()}`;
-const URL_EXTRA = CHAIN ? '&board=1' : '';
+const URL_EXTRA = (CHAIN ? '&board=1' : '') + (RB ? '' : '&rb=0');
 const pages = [];
 const shared = SEPARATE ? null : await launch();
 for (let i = 0; i < PLAYERS; i++) {
   const p = await (SEPARATE ? await launch() : shared).newPage();
   const who = i === 0 ? 'host' : 'p' + (i + 1);
-  p.on('console', (m) => { const t = m.text(); if (/gc-lockstep|desync|DIVERG|recomp-live\] (failed|REFUS)|SPIN|main stopped/i.test(t)) console.log(`  [${who}] ${t.slice(0, 220)}`); });
+  p.on('console', (m) => { const t = m.text(); if (/gc-lockstep|desync|DIVERG|recomp-live\] (failed|REFUS)|SPIN|main stopped|RING FAULT|rollback ring: (OFF|the undo)/i.test(t)) console.log(`  [${who}] ${t.slice(0, 220)}`); });
   p.on('pageerror', (e) => console.log(`  [${who}] PAGEERROR ${String(e).slice(0, 220)}`));
   // MOBILE=<i,j>: those tabs emulate a phone (viewport, touch, UA) — gamecube.html then runs its
   // MOBILE SHELL and the room has to press the splash's Start (a pointerdown handler, not a
@@ -413,6 +418,18 @@ if (!released) {
   for (const { p, who } of pages) await p.screenshot({ path: path.join(SHOTS, `gc-room-${who}.png`) }).catch(() => {});
   await finish(1);
 }
+// ---- 9a. the mode the room actually runs -----------------------------------------------------
+report.mode = last.map((g) => ({ mode: g.mode, delay: g.delay, window: g.rollback && g.rollback.window, capGate: g.rollback && g.rollback.capGate,
+                                 workerOk: g.rollback && g.rollback.workerOk }));
+if (RB) {
+  last.every((g) => g.mode === 'rollback' && g.delay === 0)
+    ? ok('every-console-runs-ROLLBACK-with-zero-added-input-delay', last.map((g, i) => `${pages[i].who}: ${g.mode}, delay ${g.delay}, window ${g.rollback.window}${g.rollback.capGate ? ' (capacity-gated)' : ''}`).join(' · '))
+    : bad('every-console-runs-ROLLBACK-with-zero-added-input-delay', JSON.stringify(report.mode));
+} else {
+  last.every((g) => g.mode !== 'rollback' && g.delay > 0)
+    ? ok('the-rb0-arm-runs-input-delay', last.map((g) => `${g.mode} ${g.delay}`).join(' · '))
+    : bad('the-rb0-arm-runs-input-delay', JSON.stringify(report.mode));
+}
 const ports = last.map((g) => (g.ports || [])[0]);
 (new Set(ports).size === PLAYERS && ports.every((x) => x >= 0))
   ? ok('every-console-holds-its-own-port', ports.map((pt, i) => `${pages[i].who}=${pt}`).join(' '))
@@ -441,7 +458,8 @@ while (Date.now() - tRun < RUN_MS) {
   const row = { t: Math.round((Date.now() - tRun) / 1000), load: os.loadavg()[0], rates: rates.map((r) => +r.toFixed(4)),
                 frames: now.map((g) => g.guestFrames), compared: now.map((g) => g.hashesCompared),
                 agreed: now.map((g) => g.lastAgreedFrame), stalls: now.map((g) => g.bfStall), delay: now[0].delay,
-                desync: now.map((g) => g.desync), waitInput: wIn.map((v) => +v.toFixed(3)), waitWorker: wWk.map((v) => +v.toFixed(3)), ovl };
+                desync: now.map((g) => g.desync), waitInput: wIn.map((v) => +v.toFixed(3)), waitWorker: wWk.map((v) => +v.toFixed(3)), ovl,
+                mode: now.map((g) => g.mode), rb: now.map((g) => g.rollback && g.rollback.worker ? [g.rollback.page.rollbacks, g.rollback.page.resimFrames, g.rollback.worker.slots, g.rollback.selfStepMs] : null) };
   report.windows.push(row);
   // the GAME stopping (a recomp trap) is not the ROOM failing — say which it is
   if (rates.every((r) => r === 0) && now.every((g) => !g.desync)) {
@@ -455,6 +473,7 @@ while (Date.now() - tRun < RUN_MS) {
   console.log(`  [run t=${row.t}s] rate ${rates.map((r) => r.toFixed(3) + 'x').join(' ')}  frames ${row.frames.join('/')}  ` +
               `compared ${row.compared.join('/')}  agreed≤f${row.agreed.join('/')}  delay ${row.delay}  ` +
               `held-for-room ${wIn.map((v) => (v * 100).toFixed(0) + '%').join('/')} held-for-own-worker ${wWk.map((v) => (v * 100).toFixed(0) + '%').join('/')}  ovl ${ovl}  load ${row.load.toFixed(1)}` +
+              `  mode ${row.mode.join('/')}  rollbacks/resim/slots/stepMs ${row.rb.map((x) => x ? x.join('/') : '-').join(' ')}` +
               (desyncs.length ? '  DESYNC ' + JSON.stringify(desyncs) : ''));
   prev = now;
   if (desyncs.length) break;
@@ -463,7 +482,25 @@ const mashN = await Promise.all(pages.map(({ p }) => p.evaluate(() => { clearInt
 const fin = await Promise.all(pages.map(({ p }) => snap(p)));
 const runS = (Date.now() - tRun) / 1000;
 report.final = fin.map((g) => ({ guestFrames: g.guestFrames, hashesSent: g.hashesSent, hashesCompared: g.hashesCompared,
-                                 lastAgreedFrame: g.lastAgreedFrame, desync: g.desync, bfStall: g.bfStall, delay: g.delay, fpDiag: g.fpDiag }));
+                                 lastAgreedFrame: g.lastAgreedFrame, desync: g.desync, bfStall: g.bfStall, delay: g.delay, fpDiag: g.fpDiag,
+                                 mode: g.mode, rollback: g.rollback, lat: g.lat }));
+// ---- 9b. the rollback rings worked, and the room added no input lag ---------------------------
+if (RB) {
+  const rbs = fin.map((g) => g.rollback || {});
+  const tot = rbs.reduce((a, r) => a + ((r.worker && r.worker.rollbacks) | 0), 0);
+  const resim = rbs.reduce((a, r) => a + ((r.worker && r.worker.resimFrames) | 0), 0);
+  console.log('  rollback rings: ' + rbs.map((r, i) => r.worker ? `${pages[i].who}: ${r.worker.rollbacks} rewinds / ${r.worker.resimFrames} re-simulated (max depth ${r.worker.maxDepth}), ` +
+              `step ${r.selfStepMs} ms (presented guest ${r.worker.guestMsPresented} + pump ${r.worker.viMsPresented}, re-simulated guest ${r.worker.guestMsResim} + pump ${r.worker.viMsResim}), ` +
+              `modes ${JSON.stringify(r.mode && r.mode.history ? r.mode.history.slice(-4) : r.mode)}, ${r.worker.slots} undo pages held (peak budget ${r.worker.budget}), window ${r.window}, hidden ${r.page.hidden}, stale hashes ${r.page.staleHashes}, mem stalls ${r.page.memStalls}` : `${pages[i].who}: -`).join(' · '));
+  (fin.every((g) => g.mode === 'rollback') && tot > 0 && resim >= tot && rbs.every((r) => r.worker && !r.worker.fault && !r.worker.overflows))
+    ? ok('the-rollback-rings-rewound-and-re-simulated-without-a-fault', `${tot} rewinds, ${resim} re-simulated frames across ${PLAYERS} consoles, no ring fault, no log overflow`)
+    : bad('the-rollback-rings-rewound-and-re-simulated-without-a-fault', JSON.stringify(rbs.map((r) => r.worker)));
+  const lat = [].concat(...fin.map((g) => (g.lat && g.lat.samples) || []));
+  const rbLat = lat.filter((x) => x.mode === 'rollback');
+  (rbLat.length >= 5 && rbLat.every((x) => x.frames === 0))
+    ? ok('zero-added-input-lag-a-press-runs-on-the-frame-it-was-sampled-for', `${rbLat.length} presses across ${PLAYERS} consoles, every one 0 frames (the game's own lag frames come on top, as on hardware)`)
+    : bad('zero-added-input-lag-a-press-runs-on-the-frame-it-was-sampled-for', JSON.stringify(lat.slice(0, 20)));
+}
 desyncs.length
   ? bad('ZERO-desyncs-over-the-long-run', JSON.stringify(desyncs))
   : ok('ZERO-desyncs-over-the-long-run', `${runS.toFixed(0)}s of play with ${mashN.join('/')} button presses; ` +
