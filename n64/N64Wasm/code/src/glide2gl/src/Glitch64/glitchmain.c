@@ -403,11 +403,33 @@ static uint16_t *nf_sample(GLuint src, int srcw, int srch, int copy, int bypass,
    GLint prog, active, tex[4], smp[4], dfb, rfb, vao, vp[4], pack, packAlign;
    int i;
 
+   /* ---- will this pass (re)specify anything? (each sets nf_verify below) ---- */
+   /* THE CHECK IS ABOUT THIS PASS ONLY — DECIDED BEFORE IT, NOT HALFWAY THROUGH. Errors raised
+    * before the pass are drained first; but that drain looked at nf_verify on entry, and a pass
+    * that re-specifies (a size, a lookup row) raises nf_verify only in the middle, so it then
+    * verified without having drained — and glide's own GL calls leave errors lying around all the
+    * time (glTexParameteri with no texture bound: INVALID_OPERATION, several per field in DK64). The
+    * pass was declared failed (nf_failed, for good), the lazy copy turned eager, and the bytes the
+    * guest reads back changed hands (lazy_fb.c lfb_to_eager). Whether a pass re-specifies depends
+    * on the rows the LAST pass uploaded — host state a rollback does not put back — so a room that
+    * rolled back re-uploaded where a straight run did not: MEASURED (n64_state_exact_probe, DK64, a
+    * one-frame mispredicted rollback at frames 938-941): the room's materialisations failed at frame
+    * 1077 (the straight run's succeeded), lazy copying stopped, and the full state left the straight
+    * run's at 1173 — the DK64 rollback-room desync at 1180-1250. Now the re-specification is known
+    * before the first command and the drain covers it. */
+   for (i = 0; i < ny; i++) nf_tmp[i] = srch - 1 - sy[i];
+   {
+      int respec = (copy && (nf_src_w != width || nf_src_h != height))
+         || nf_lnx != nx || memcmp(nf_lx, sx, (size_t)nx * 4)
+         || nf_lny != ny || memcmp(nf_ly, nf_tmp, (size_t)ny * 4)
+         || nf_dst_w != nx || nf_dst_h != ny;
+      if (nf_verify > 0 || respec)
+         while (glGetError() != GL_NO_ERROR) {}   /* not ours: the check below is about THIS pass only */
+   }
+
    /* ---- save ---- */
    glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
-   if (nf_verify > 0)
-      while (glGetError() != GL_NO_ERROR) {}   /* not ours: the check below is about THIS pass only */
    for (i = 0; i < 4; i++)
    {
       glActiveTexture(GL_TEXTURE0 + i);
@@ -456,7 +478,6 @@ static uint16_t *nf_sample(GLuint src, int srcw, int srch, int copy, int bypass,
     * are the same every frame unless the VI/window geometry changes): a
     * texture re-specified while the previous frame's pass may still read it
     * costs a copy or a stall on a tile-based GPU. */
-   for (i = 0; i < ny; i++) nf_tmp[i] = srch - 1 - sy[i];
    glActiveTexture(GL_TEXTURE1);
    glBindSampler(1, 0);
    glBindTexture(GL_TEXTURE_2D, nf_xs);

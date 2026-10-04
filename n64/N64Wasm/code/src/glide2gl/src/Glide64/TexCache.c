@@ -360,8 +360,16 @@ static void GetTexInfo (int id, int tile)
       modfactor = cmb.modfactor_1;
    }
 
+   /* A CACHE HIT IS EXACT. Glide accepted a cached texture whose modulation colours matched only in
+    * their high nibbles (0xF0F0F0F0 unless CI) and whose factor was within 8, so WHICH texture a frame
+    * drew depended on which near-colour happened to be cached first: on the cache's history, not on
+    * the frame. A rollback (or any re-simulation) gives the cache another history — frames later
+    * thrown away loaded their own near-colour textures — and the same frame then drew other pixels
+    * (and a title that reads its pictures back takes them into RDRAM). Now a hit is only a texture
+    * this exact frame would have built: the same pixels whatever came before. The cost: a fade that
+    * moves a modulation colour converts a texture per step instead of reusing one per 16 steps. */
    node = (NODE*)cachelut[crc>>16];
-   mod_mask = (g_gdp.tile[tile].format == G_IM_FMT_CI) ? 0xFFFFFFFF : 0xF0F0F0F0;
+   mod_mask = 0xFFFFFFFF;
    while (node)
    {
       if (node->crc == crc)
@@ -379,7 +387,7 @@ static void GetTexInfo (int id, int tile)
                      (cache->mod_color&mod_mask) == (modcolor&mod_mask) &&
                      (cache->mod_color1&mod_mask) == (modcolor1&mod_mask) &&
                      (cache->mod_color2&mod_mask) == (modcolor2&mod_mask) &&
-                     abs((int)(cache->mod_factor - modfactor)) < 8))
+                     cache->mod_factor == modfactor))
             {
                FRDP (" | | | |- Texture found in cache (tmu=%d).\n", node->tmu);
                tex_found[id][node->tmu] = node->number;
@@ -1117,6 +1125,7 @@ static void LoadTex(int id, int tmu)
    cache->mod        = mod;
    cache->mod_color  = modcolor;
    cache->mod_color1 = modcolor1;
+   cache->mod_color2 = modcolor2;   /* compared by every lookup; a reused slot kept the old one */
    cache->mod_factor = modfactor;
 
    result = 0;	// keep =0 so it doesn't mess up on the first split

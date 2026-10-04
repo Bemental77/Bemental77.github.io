@@ -357,7 +357,26 @@
     // slot only while the space above that top keeps N64S_RAW_RESERVE free for
     // the core's own allocations, and never hands a state buffer back to the
     // allocator — a freed one goes to a page-side pool and is reused.
-    var N64S_RAW_RESERVE = 64 * 1048576;
+    // ⚠ THE RESERVE IS COUNTED ON THE HEAP THE ALLOCATOR SEES, AND IT IS THE CORE'S GROWTH (2026-10-04).
+    // It was counted from the top of the page's OWN buffers, which misses everything the core carves
+    // above them, and 64 MB was less than the core goes on to allocate: MEASURED (n64_state_exact_probe,
+    // a straight run, neil_heap_brk every 100 frames) Donkey Kong 64 starts at a break of 257-269 MB and
+    // grows to 337 MB by frame ~1800, then holds (+80 MB, jit=off alike: the core, not the JIT). A
+    // rollback room's ring took the heap down to the old reserve, the core's next malloc found nothing
+    // — Aborted(OOM) inside frame ~1247 (the build has no heap growth; malloc aborts, never NULL) — and
+    // the room ran that frame again from a half-run machine: the DK64 rollback-room desync at
+    // 1247-1252, in every arm, with or without a single rollback. Now a slot is taken only while the
+    // heap the allocator can still give (neil_heap_brk / neil_heap_free_below) keeps N64S_RAW_RESERVE
+    // for the core, and a frame the core aborts in ends the room instead of being run again (rbStep).
+    var N64S_RAW_RESERVE = 128 * 1048576;
+    // What the core can still allocate: above the break, plus the free chunks below it. null: a core
+    // without the exports (the old accounting then applies).
+    function n64sHeapFree() {
+      var M = G.Module;
+      if (!M || typeof M._neil_heap_brk !== 'function' || typeof M._neil_heap_free_below !== 'function') return null;
+      var above = M.HEAPU8.length - (M._neil_heap_brk() >>> 0);
+      return { above: above, total: above + (M._neil_heap_free_below() >>> 0) };
+    }
     function n64sRawOk() {
       if (N64S.raw != null) return N64S.raw;
       var M = G.Module;
@@ -373,6 +392,10 @@
     }
     // A state buffer in the wasm heap, or null when it would starve the core.
     function n64sRawRoom() {
+      var hf = n64sHeapFree();
+      // a new slot comes from above the break (dlmalloc carves a block that large from the top), and
+      // what is left must keep the reserve: free chunks below the break count for the core, not for us
+      if (hf) return Math.max(0, Math.min(hf.above, hf.total - N64S_RAW_RESERVE));
       var len = G.Module.HEAPU8.length, top = N64S.top || 0;
       return top ? Math.max(0, len - top - N64S_RAW_RESERVE) : len;
     }
@@ -384,7 +407,7 @@
     function n64sRawAlloc() {
       var M = G.Module, v = N64S.pool && N64S.pool.length ? N64S.pool.pop() : null;
       if (v) { if (v.buffer !== M.HEAPU8.buffer) { var q = v.__ptr; v = M.HEAPU8.subarray(q, q + N64S.size); v.__ptr = q; } N64S.heapBufs++; return v; }
-      if (N64S.top && n64sRawRoom() < N64S.size) return null;
+      if ((N64S.top || n64sHeapFree()) && n64sRawRoom() < N64S.size) return null;
       var p = M._malloc(N64S.size);
       if (!p) return null;
       N64S.top = Math.max(N64S.top || 0, p + N64S.size);
@@ -1024,13 +1047,58 @@
       if (best) { rbDrop(best); RB.evictions++; }
       return best;
     }
+    // ---- GLIDE'S HOST STATE TRAVELS WITH EVERY SNAPSHOT (RBGL) --------------------
+    // The raw state is the MACHINE; what a frame DRAWS also depends on state glide keeps on the
+    // host and carries from one display list to the next: its RDP (g_gdp: tiles, TMEM, modes;
+    // gDP: the palette CRCs; gSP; `rdp` up to its first pointer — tiles, palette, the TMEM address
+    // map, colours, combiner modes, lights, matrices), the frontend's toast (counted in swaps), and
+    // the libc rand() glide draws its noise and a combiner colour from (lazy_fb.c, the same image
+    // the solo frame-skip re-run restores: core_worker.js fsSnap/fsRedo). A load put the MACHINE
+    // back and left all of that where the replaced timeline had taken it, so a rollback room's
+    // pictures differed from a straight run's (6 of 6 titles, skipping off), and a title that reads its
+    // pictures back into RDRAM could take them into the guest. (The DK64 rollback-room desync at frame
+    // 1247-1252 was NOT this: it was the heap — see N64S_RAW_RESERVE.)
+    // So each snapshot keeps that image too (neil_gl_state_save, ~KBs: a memcpy beside the 9 MB
+    // fast save) and every load puts it back. ?rbgls=0 is the arm (the machine only, as before).
+    var RBGL = { on: RB_Q.get('rbgls') !== '0', size: -1, ptr: 0, saves: 0, loads: 0, ms: 0 };
+    function rbglOk() {
+      if (RBGL.size >= 0) return RBGL.size > 0;
+      var M = G.Module;
+      RBGL.size = 0;
+      if (RBGL.on && M && typeof M._neil_gl_state_size === 'function' && typeof M._neil_gl_state_save === 'function'
+          && typeof M._neil_gl_state_load === 'function' && typeof M._malloc === 'function') {
+        var n = M._neil_gl_state_size() | 0, p = n > 0 ? M._malloc(n) : 0;
+        if (p) { RBGL.size = n; RBGL.ptr = p; }
+      }
+      return RBGL.size > 0;
+    }
+    function rbglSave(s) {
+      if (!rbglOk()) { s.gl = null; return; }
+      var M = G.Module, t0 = performance.now();
+      M._neil_gl_state_save(RBGL.ptr);
+      if (!s.gl || s.gl.length !== RBGL.size) s.gl = new Uint8Array(RBGL.size);
+      s.gl.set(M.HEAPU8.subarray(RBGL.ptr, RBGL.ptr + RBGL.size));
+      s.rlo = M._neil_rand_lo ? M._neil_rand_lo() >>> 0 : 0; s.rhi = M._neil_rand_hi ? M._neil_rand_hi() >>> 0 : 0;
+      s.glOk = true;
+      RBGL.saves++; RBGL.ms += performance.now() - t0;
+    }
+    function rbglLoad(s) {
+      if (!s.glOk || !rbglOk()) return;
+      var M = G.Module, t0 = performance.now();
+      M.HEAPU8.set(s.gl, RBGL.ptr);
+      M._neil_gl_state_load(RBGL.ptr);
+      if (M._neil_rand_set) M._neil_rand_set(s.rlo, s.rhi);
+      RBGL.loads++; RBGL.ms += performance.now() - t0;
+    }
     // Save the state at the START of frame k (i.e. after frame k-1 ran).
     function rbSaveAt(ls, k) {
       var s = rbPick(k);
       if (!s) { N64S.fault = 'out of memory for the rollback snapshots'; return false; }
       rbDrop(s);
       var t0 = performance.now();
+      s.glOk = false;
       if (!n64sSave(s.buf)) return false;
+      rbglSave(s);
       var dt = performance.now() - t0;
       RB.saveMs += dt; RB.saves++;
       RB.saveEma = RB.saveEma ? RB.saveEma + (dt - RB.saveEma) / 16 : dt;
@@ -1053,6 +1121,7 @@
     function rbLoadSlot(s) {
       var t0 = performance.now();
       if (!n64sLoad(s.buf)) return false;
+      rbglLoad(s);
       var st = G.__fbAsync;
       if (st && st.on && st.restore) st.restore(s.fb);
       if (RFS.on) rfsNote();     // a load can bring back a blank capture the replaced timeline superseded
@@ -1076,7 +1145,17 @@
       kind = kind || (present ? 'present' : 'resim');
       var fsk = rfsBegin(kind, k);
       if (skipGl && !fsk) { GLSKIP.on = true; GLSKIP.frames++; }
-      try { M._neil_ls_run_frame(); } finally { GLSKIP.on = false; rfsEnd(kind, k, fsk, present); }
+      try { M._neil_ls_run_frame(); }
+      catch (e) {
+        // THE CORE ABORTED INSIDE THE FRAME (Aborted(OOM), a trap): the machine is half-run and no
+        // snapshot holds it. Running the frame again — what the next tick did — runs it on top of
+        // the half: never. The room ends, saying why.
+        N64S.fault = 'the core aborted inside frame ' + k + ': ' + ((e && e.message) || e);
+        return false;
+      }
+      finally { GLSKIP.on = false; rfsEnd(kind, k, fsk, present); }
+      // TEST SEAM (n64/tools/n64_rollback_probe.mjs --ranlog): frame k has just run (again). Absent unless a rig sets it.
+      if (G.__n64RanTap) { try { G.__n64RanTap(k, kind); } catch (e) {} }
       // a skipped frame's pixels reached the guest: re-run before anything is saved or shown
       var tc = rfsTaintCheck(ls, k);
       if (tc !== true) { N64S.fault = tc; return false; }
@@ -1246,11 +1325,11 @@
         var okh;
         try { okh = rbStep(ls, r.frame, r.image, false, false, 'hidden'); } finally { RFS.inResim = false; }
         audioDropNow();
-        if (!okh) return rbFail(ls, 'savestate failed: ' + N64S.fault);
+        if (!okh) return rbFail(ls, 'frame failed: ' + N64S.fault);
         RB.hidden++; LS.frame++; LS.baseFrame++;
         if (G.__n64RbLog) G.__n64RbLog.push(['hidden', r.frame]);
       } else {
-        if (!rbStep(ls, r.frame, r.image, true, false)) return rbFail(ls, 'savestate failed: ' + N64S.fault);
+        if (!rbStep(ls, r.frame, r.image, true, false)) return rbFail(ls, 'frame failed: ' + N64S.fault);
         RB.frames++;
         RB.pEma += ((r.rollback ? 1 : 0) - RB.pEma) / 128;
         rbAdaptK(ls);
@@ -1404,8 +1483,14 @@
       // FRAME SKIP (RFS): delay lockstep never rewinds, so its frames go through the worker's own
       // machinery (fsField: skip, snapshot, re-run on a read-back) — exact before lsFrameDone
       // fingerprints the frame
-      if (env.fs && RFS.on && env.fs.linear) { RFS.linear++; env.fs.linear(); }
-      else M._neil_ls_run_frame();
+      try {
+        if (env.fs && RFS.on && env.fs.linear) { RFS.linear++; env.fs.linear(); }
+        else M._neil_ls_run_frame();
+      } catch (e) {
+        // the core aborted inside the frame (see rbStep): the room ends rather than run it again
+        LS.abort = 'the core aborted inside a frame: ' + ((e && e.message) || e);
+        return false;
+      }
       lsFrameDone(img, performance.now() - _t0);
       return true;
     }
@@ -1552,8 +1637,9 @@
         // the ring goes away below: no blank capture may need it afterwards (RFS)
         if (RB.ready && !RB.stale) { var fss = rfsSettle(ls, true); if (fss !== true) { rbFail(ls, fss); break; } }
         if (!lsRunOneFrame(r.image)) {
-          LS.fault = 'this build of the core has no _neil_ls_run_frame — rebuild n64/N64Wasm/code';
+          LS.fault = LS.abort || 'this build of the core has no _neil_ls_run_frame — rebuild n64/N64Wasm/code';
           env.log('[lockstep] ⚠ ' + LS.fault);
+          if (LS.abort) { try { ls.fail(LS.fault); } catch (e) {} }
           break;
         }
         LS.fed++; ran++;
@@ -1835,7 +1921,9 @@
                   saveMsPerFrame: RB.frames ? +(RB.saveMs / (RB.frames + RB.resimFrames + RB.bridgeFrames + RB.hidden)).toFixed(2) : null,
                   hashes: RB.hashes, missingSlot: RB.missingSlot, frames: RB.frames, fault: RB.fault, rearms: RB.rearms,
                   glSkip: { ok: glSkipOk(), disabled: GLSKIP.disabled, frames: GLSKIP.frames, callsSkipped: GLSKIP.calls,
-                            coreReads: GLSKIP.reads, redo: GLSKIP.redo } },
+                            coreReads: GLSKIP.reads, redo: GLSKIP.redo },
+                  glState: { on: RBGL.on, bytes: RBGL.size, saves: RBGL.saves, loads: RBGL.loads,
+                             msPerOp: (RBGL.saves + RBGL.loads) ? +(RBGL.ms / (RBGL.saves + RBGL.loads)).toFixed(4) : null } },
           state: G.__n64State.info(),
         } : null,
         runahead: { frames: RA.frames, fixed: RA.fixed, runs: RA.runs, hiddenFrames: RA.hiddenFrames,

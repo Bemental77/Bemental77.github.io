@@ -60,6 +60,7 @@
 #include "lazy_fb.h"
 #include "../../../mupen64plus-core/src/main/lfb_hook.h"
 #include "../../../Graphics/RDP/gDP_state.h"
+#include "../../../Graphics/RSP/RSP_state.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #endif
@@ -268,14 +269,40 @@ void neil_rand_set(uint32_t lo, uint32_t hi) { neil_rand_seed = ((uint64_t)hi <<
  *     picture 17 fields early — the only picture difference a re-run made in 1800 fields.
  * The guest never sees any of it; a re-run's pictures are then those of a run that never re-ran. */
 #define GLS_RDP offsetof(struct RDP, vtx1)
+/* THE RDP COMMAND LIST IN FLIGHT, AND THE DISPLAY-LIST INTERPRETER (2026-10-04, by inspection). A
+ * list the game hands the RDP directly (DPC_START/END: glide64ProcessRDPList) is executed command by
+ * command, and a command the list cuts in half waits in __RDP.cmd_data (cmd_cur..cmd_ptr) for the
+ * next list to complete it: host state the machine's snapshot does not hold. After a load the next
+ * list would complete the half command the REPLACED timeline was holding — a draw or a full sync
+ * (the DP interrupt: gdp_full_sync) appearing or going missing. Not observed in the 11-title rollback
+ * sweep (the DK64 desync was the heap: room_core.js N64S_RAW_RESERVE); carried because it is cheap.
+ * The half command (at most one command: the loop runs every complete one; GLS_RDPQ words is many
+ * times the longest) and the interpreter's registers (__RSP, w2/w3) travel with the image, at their
+ * own ring positions. */
+#define GLS_RDPQ 256
 int *neil_toast_counter_ptr(void);   /* mymain.cpp: the frontend's toast, counted in swaps */
-int neil_gl_state_size(void) { return (int)(sizeof(g_gdp) + sizeof(gDP) + sizeof(gSP) + GLS_RDP + sizeof(int)); }
+int neil_gl_state_size(void)
+{
+   return (int)(sizeof(g_gdp) + sizeof(gDP) + sizeof(gSP) + GLS_RDP + sizeof(int)
+         + sizeof(__RSP) + 5 * sizeof(uint32_t) + GLS_RDPQ * sizeof(uint32_t));
+}
 void neil_gl_state_save(uint8_t *dst)
 {
+   uint32_t hdr[5], i, n;
    memcpy(dst, &g_gdp, sizeof(g_gdp)); dst += sizeof(g_gdp);
    memcpy(dst, &gDP, sizeof(gDP));     dst += sizeof(gDP);     /* palette CRCs, tiles */
    memcpy(dst, &gSP, sizeof(gSP));     dst += sizeof(gSP);     /* its pointers point into gDP: static */
    memcpy(dst, &rdp, GLS_RDP);         dst += GLS_RDP;
+   memcpy(dst, &__RSP, sizeof(__RSP)); dst += sizeof(__RSP);
+   n = (__RDP.cmd_ptr - __RDP.cmd_cur) & MAXCMD_MASK;
+   if (n > GLS_RDPQ) n = GLS_RDPQ;     /* never: less than one command is ever left over */
+   hdr[0] = __RDP.w2; hdr[1] = __RDP.w3; hdr[2] = __RDP.cmd_ptr; hdr[3] = __RDP.cmd_cur; hdr[4] = n;
+   memcpy(dst, hdr, sizeof(hdr));      dst += sizeof(hdr);
+   for (i = 0; i < n; i++)
+      memcpy(dst + 4 * i, &__RDP.cmd_data[(__RDP.cmd_cur + i) & MAXCMD_MASK], 4);
+   if (n < GLS_RDPQ) memset(dst + 4 * n, 0, 4 * (GLS_RDPQ - n));
+   dst += 4 * GLS_RDPQ;
+   /* the toast stays the LAST int of the image: n64_rollback_probe --pics reads it there */
    memcpy(dst, neil_toast_counter_ptr(), sizeof(int));
 }
 void neil_gl_state_load(const uint8_t *src)
@@ -283,11 +310,17 @@ void neil_gl_state_load(const uint8_t *src)
    /* rdp.tex_ctr is an EPOCH, not state: a vertex's UVs are reused while its stamp equals it
     * (glide64_util.c uv_calculated), so it only ever grows — put back, an old value could equal a
     * stamp left by the fields being re-run. */
-   uint32_t ctr = rdp.tex_ctr;
+   uint32_t ctr = rdp.tex_ctr, hdr[5], i;
    memcpy(&g_gdp, src, sizeof(g_gdp)); src += sizeof(g_gdp);
    memcpy(&gDP, src, sizeof(gDP));     src += sizeof(gDP);
    memcpy(&gSP, src, sizeof(gSP));     src += sizeof(gSP);
    memcpy(&rdp, src, GLS_RDP);         src += GLS_RDP;
+   memcpy(&__RSP, src, sizeof(__RSP)); src += sizeof(__RSP);
+   memcpy(hdr, src, sizeof(hdr));      src += sizeof(hdr);
+   __RDP.w2 = hdr[0]; __RDP.w3 = hdr[1]; __RDP.cmd_ptr = hdr[2] & MAXCMD_MASK; __RDP.cmd_cur = hdr[3] & MAXCMD_MASK;
+   for (i = 0; i < hdr[4] && i < GLS_RDPQ; i++)
+      memcpy(&__RDP.cmd_data[(__RDP.cmd_cur + i) & MAXCMD_MASK], src + 4 * i, 4);
+   src += 4 * GLS_RDPQ;
    memcpy(neil_toast_counter_ptr(), src, sizeof(int));
    rdp.tex_ctr = ctr + 1;
 }

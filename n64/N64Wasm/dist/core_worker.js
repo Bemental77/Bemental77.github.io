@@ -440,7 +440,10 @@ var FSK = { on: true, depth: 1, maxSnaps: 6, snapEvery: 8, force: 0, skipping: f
            fields: 0, drawn: 0, skipped: 0, skipNoDraw: 0, snapsTaken: 0, snapMs: 0, maxSnapMs: 0, redo: 0, redoFields: 0,
            redoMs: 0, redoFieldsAll: 0, audDrop: 0, staleS: 0, repairs: 0, lost: 0, suspendUntil: 0, backoff: 64, held: 0, presented: 0, overwritten: 0, noHeap: 0,
            lat: new Float32Array(4096), age: new Float32Array(4096), gpu: new Float32Array(4096), latN: 0, why: '' };
-var FS_RESERVE = 64 * 1048576;    // heap kept free above the snapshots (room_core.js N64S_RAW_RESERVE)
+// heap kept free for the core's own growth, counted on the heap the allocator sees (room_core.js
+// N64S_RAW_RESERVE: Donkey Kong 64 grows its break by 80 MB after boot; a malloc that does not fit
+// ABORTS this build, so the check is made BEFORE asking)
+var FS_RESERVE = 128 * 1048576;
 var FS_MAXAGE = 16;               // a snapshot older than this many fields is resolved by a re-run now (?fskipage=N)
 function fsInstall(search) {
   var q = new URLSearchParams(search || '').get('fskip');
@@ -507,7 +510,12 @@ function fsCanSkip() {
 function fsAlloc() {
   if (FSK.pool.length) return FSK.pool.pop();
   if (FSK.bufs >= FSK.maxSnaps) return 0;
-  var n = FSK.size + FSK.gsize, p = M._malloc(n);
+  var n = FSK.size + FSK.gsize;
+  if (typeof M._neil_heap_brk === 'function' && typeof M._neil_heap_free_below === 'function') {
+    var above = M.HEAPU8.length - (M._neil_heap_brk() >>> 0), total = above + (M._neil_heap_free_below() >>> 0);
+    if (above < n || total - n < FS_RESERVE) { FSK.noHeap++; return 0; }
+  }
+  var p = M._malloc(n);
   if (!p) { FSK.noHeap++; return 0; }
   if (M.HEAPU8.length - (p + n) < FS_RESERVE && p + n > FSK.top) { M._free(p); FSK.noHeap++; return 0; }
   FSK.top = Math.max(FSK.top, p + n); FSK.bufs++;
