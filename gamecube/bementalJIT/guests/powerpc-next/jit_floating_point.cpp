@@ -375,6 +375,53 @@ void emit_fp_arith_single(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     const u32 sub5 = GekkoOperands::SUBOP5(op.inst);
     const u32 arg2 = (sub5 == 25) ? fc : fb;
 
+    // [BEM_LEVER_FP_SINGLE_ARITH 2026-10-04] Single-resident inputs: compute
+    // from the f32 lanes and leave the result Single (v128 splat), instead of
+    // promoting both inputs to the i64 pair (2 x 2 NaN-exact widens) and
+    // widening the result (another 2). EXACT vs the arm below:
+    //  * a Single lane x widens to f64.promote_f32(x) — equal to the scalar
+    //    arm's ConvertToDouble(x) for every non-NaN x (exhaustively checked
+    //    2026-10-04: all 4,278,190,080 f32 with exp != 255, 0 mismatches) and
+    //    for Inf. A NaN operand yields a NaN result whose payload the wasm spec
+    //    leaves nondeterministic in BOTH arms (the scalar arm's NaN ladder is
+    //    compiled out at the native default — the gate below), so the claim is
+    //    bit-exactness for every non-NaN result;
+    //  * Force25Bit(c) == c for an f32-valued c (fraction bits 0..28 zero, so
+    //    the round bit 27 is zero) — the fmuls rounding step is the identity;
+    //  * the f64 op and the ForceSingle stages (runtime-FPSCR.NI pre-cast
+    //    flush, demote, NI post-cast flush) are the SAME emitted sequence;
+    //  * Fill(ConvertToDouble(bits)) in both lanes and a Single splat of bits
+    //    are one value in two representations (ConvertToSingle(ConvertToDouble
+    //    (x)) == x on all 2^32 x), and Single marks value_single, which the
+    //    result IS (ForceSingle'd, both lanes).
+    // Taken only with the NaN ladder compiled out (g_bem_accurate_nans == 0,
+    // the native default), where the scalar arm returns the raw IEEE result.
+    if (bem_lever_on(BEM_LEVER_FP_SINGLE_ARITH) && !g_bem_accurate_nans &&
+        frc.IsSingle(fa) && frc.IsSingle(arg2)) {
+        auto a = frc.BindSingleRead(fa);
+        auto c = frc.BindSingleRead(arg2);
+        auto d = frc.BindSingleWrite(fd);
+        wb.op_local_get(a.v128_idx);
+        wb.op_f32x4_extract_lane(0);
+        wb.op_f64_promote_f32();
+        wb.op_local_get(c.v128_idx);
+        wb.op_f32x4_extract_lane(0);
+        wb.op_f64_promote_f32();
+        switch (sub5) {
+        case 18: wb.op_f64_div(); break;
+        case 20: wb.op_f64_sub(); break;
+        case 21: wb.op_f64_add(); break;
+        case 25: wb.op_f64_mul(); break;
+        default: break;
+        }
+        emit_force_single_bits(wb, ctx_ptr);   // -> f32 bits in LOCAL_FP_T0
+        wb.op_local_get(LOCAL_FP_T0);
+        wb.op_f32_reinterpret_i32();
+        wb.op_f32x4_splat();
+        wb.op_local_set(d.v128_idx);
+        return;
+    }
+
     auto fa_pair   = frc.Bind(fa,   FPRMode::Read,  FPR_LANE_PS0);
     auto arg2_pair = frc.Bind(arg2, FPRMode::Read,  FPR_LANE_PS0);
     auto fd_pair   = frc.Bind(fd,   FPRMode::Write, FPR_LANE_BOTH);
@@ -385,8 +432,28 @@ void emit_fp_arith_single(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     wb.op_local_get(fa_pair.ps0_idx);
     wb.op_f64_reinterpret_i64();
     wb.op_local_set(LOCAL_FMA_A);
-    wb.op_local_get(arg2_pair.ps0_idx);
-    if (sub5 == 25) emit_force25bit(wb);  // [C3] Force25Bit(frC) for fmuls
+    if (sub5 == 25 && bem_lever_on(BEM_LEVER_FP_SINGLE_ARITH)) {
+        // [BEM_LEVER_FP_SINGLE_ARITH] Force25Bit(c) is the identity on an
+        // f32-valued c (see above), so test that (7 ops) and run the 25-op
+        // rounding only when it fails. A NaN c fails x==x and takes the full
+        // Force25Bit, exactly as before.
+        wb.op_local_get(arg2_pair.ps0_idx);
+        wb.op_f64_reinterpret_i64();
+        wb.op_f32_demote_f64();
+        wb.op_f64_promote_f32();
+        wb.op_local_get(arg2_pair.ps0_idx);
+        wb.op_f64_reinterpret_i64();
+        wb.op_f64_eq();
+        wb.op_if(WASM_TYPE_I64);
+            wb.op_local_get(arg2_pair.ps0_idx);
+        wb.op_else();
+            wb.op_local_get(arg2_pair.ps0_idx);
+            emit_force25bit(wb);              // [C3] Force25Bit(frC) for fmuls
+        wb.op_end();
+    } else {
+        wb.op_local_get(arg2_pair.ps0_idx);
+        if (sub5 == 25) emit_force25bit(wb);  // [C3] Force25Bit(frC) for fmuls
+    }
     wb.op_f64_reinterpret_i64();
     wb.op_local_set(LOCAL_FMA_B);
     // raw op

@@ -48,6 +48,12 @@ constexpr u32 BEM_LEVER_MEM_SLOWARM = 1u << 6;
 // Fastmem accesses fold the MEM1 base into the memarg offset, and integer
 // loads commit straight into rt (no LOCAL_TMP_FPVAL park + copy).
 constexpr u32 BEM_LEVER_FASTMEM_LEAN = 1u << 7;
+// Scalar fadds/fsubs/fmuls/fdivs on Single-resident inputs stay Single; fmuls
+// skips Force25Bit for an f32-valued Double c.
+constexpr u32 BEM_LEVER_FP_SINGLE_ARITH = 1u << 8;
+// FPRRegCache::EmitPromoteToDouble widens both lanes with one
+// f64x2.promote_low_f32x4 when no lane is Inf/NaN.
+constexpr u32 BEM_LEVER_PROMOTE_SIMD = 1u << 9;
 
 bool bem_lever_on(u32 bit);
 

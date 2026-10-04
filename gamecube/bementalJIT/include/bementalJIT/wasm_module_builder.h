@@ -672,6 +672,7 @@ public:
 	// [ps_muls simd 2026-10-04] f64x2 lane arithmetic (WebAssembly SIMD spec
 	// opcode table: f64x2.lt 0x49, f64x2.abs 0xEC, f64x2.mul 0xF2).
 	void op_f64x2_lt()           { emitByte(V128_PREFIX); emitLEB128(0x49u); }
+	void op_i32x4_eq()           { emitByte(V128_PREFIX); emitLEB128(0x37u); }   // spec opcode 0x37
 	void op_f64x2_abs()          { emitByte(V128_PREFIX); emitLEB128(0xECu); }
 	void op_f64x2_mul()          { emitByte(V128_PREFIX); emitLEB128(0xF2u); }
 	// v128.const with both i64 lanes equal; 16 literal bytes, each lane LE.

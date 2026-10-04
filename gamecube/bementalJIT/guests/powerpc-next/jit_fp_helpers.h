@@ -145,7 +145,20 @@ inline void emit_force25bit(WasmModuleBuilder& wb) {
 // wasm build (GenericCPUDetect.cpp -> default false), so the post-cast
 // Common::FlushToZero(x) path is live when NI=1. Verified 0 mismatches / 5e7.
 // ===========================================================================
+// [BEM_LEVER_FP_SINGLE_ARITH 2026-10-04] stages 1-3 of emit_force_single_i64
+// (NI pre-cast flush, demote, NI post-cast flush) WITHOUT the final widen:
+// f64 VALUE on stack -> f32 result bits left in LOCAL_FP_T0, stack empty.
+// emit_force_single_i64 is now this followed by emit_psq_convert_to_double, so
+// the two can never drift apart.
+inline void emit_force_single_bits(WasmModuleBuilder& wb, u32 ctx_ptr);
+
 inline void emit_force_single_i64(WasmModuleBuilder& wb, u32 ctx_ptr) {
+    emit_force_single_bits(wb, ctx_ptr);
+    // widen back (NaN-payload-exact via ConvertToDouble); result i64 on stack
+    emit_psq_convert_to_double(wb);
+}
+
+inline void emit_force_single_bits(WasmModuleBuilder& wb, u32 ctx_ptr) {
     wb.op_i64_reinterpret_f64();
     wb.op_local_set(LOCAL_FP_I64_A);
     // T1 = FPSCR & 4 (NI)
@@ -198,8 +211,6 @@ inline void emit_force_single_i64(WasmModuleBuilder& wb, u32 ctx_ptr) {
         wb.op_end();
     }
     wb.op_end();
-    // widen back (NaN-payload-exact via ConvertToDouble); result i64 on stack
-    emit_psq_convert_to_double(wb);
 }
 
 // ForceSingle + Fill(both lanes). f64 VALUE on stack -> writes both lanes.

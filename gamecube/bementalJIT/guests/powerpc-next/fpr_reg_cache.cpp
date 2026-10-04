@@ -13,6 +13,7 @@
 #include "bementalJIT/wasm_module_builder.h"
 #include "code_op.h"
 #include "ppc_offsets.h"
+#include "lever_gate.h"
 
 namespace bemental::powerpc {
 
@@ -70,13 +71,41 @@ void FPRRegCache::OnBlockEntry(const CodeBlock& block, u32 wasm_local_base,
 // (matches the interpreter's ps[] f64 write). Sets repr=Double, lanes dirty.
 void FPRRegCache::EmitPromoteToDouble(u32 preg) {
     PregState& s = m_state[preg];
-    for (u8 lane = 0; lane < 2; ++lane) {
+    auto scalar_widen_both = [&]() {
+        for (u8 lane = 0; lane < 2; ++lane) {
+            m_wb.op_local_get(s.v128_local_idx);
+            m_wb.op_f32x4_extract_lane(lane);
+            m_wb.op_i32_reinterpret_f32();
+            m_wb.op_local_set(LOCAL_PSQ_T0);
+            emit_psq_convert_to_double(m_wb);           // -> i64 f64-bits
+            m_wb.op_local_set(lane == 0 ? s.ps0_local_idx : s.ps1_local_idx);
+        }
+    };
+    if (bem_lever_on(BEM_LEVER_PROMOTE_SIMD)) {
+        // [BEM_LEVER_PROMOTE_SIMD 2026-10-04] When neither lane has exponent
+        // 255, ConvertToDouble(x) == f64.promote_f32(x) (exhaustively checked
+        // over all 4,278,190,080 such f32, 0 mismatches), so both lanes come out
+        // of one f64x2.promote_low_f32x4. Any Inf/NaN lane takes the unchanged
+        // scalar NaN-exact widen. Same lane values either way.
         m_wb.op_local_get(s.v128_local_idx);
-        m_wb.op_f32x4_extract_lane(lane);
-        m_wb.op_i32_reinterpret_f32();
-        m_wb.op_local_set(LOCAL_PSQ_T0);
-        emit_psq_convert_to_double(m_wb);           // -> i64 f64-bits
-        m_wb.op_local_set(lane == 0 ? s.ps0_local_idx : s.ps1_local_idx);
+        m_wb.op_v128_const_i32_splat(0x7F800000u);
+        m_wb.op_v128_and();
+        m_wb.op_v128_const_i32_splat(0x7F800000u);
+        m_wb.op_i32x4_eq();                         // lane: exp == 255
+        m_wb.op_i64x2_extract_lane(0);              // lanes 0..1 of the mask
+        m_wb.op_i64_eqz();
+        m_wb.op_if(/*VOID*/);
+        for (u8 lane = 0; lane < 2; ++lane) {
+            m_wb.op_local_get(s.v128_local_idx);
+            m_wb.op_f64x2_promote_low_f32x4();
+            m_wb.op_i64x2_extract_lane(lane);
+            m_wb.op_local_set(lane == 0 ? s.ps0_local_idx : s.ps1_local_idx);
+        }
+        m_wb.op_else();
+        scalar_widen_both();
+        m_wb.op_end();
+    } else {
+        scalar_widen_both();
     }
     s.repr = FPRPrec::Double;
     s.v128_dirty = false;
