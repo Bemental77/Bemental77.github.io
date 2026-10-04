@@ -139,9 +139,14 @@ function setupJit(mode) {
 // THE SHIPPED SPAN CORPUS (mips_emit.js A SHIPPED SPAN CORPUS): dist/jit/<internal name>.json.gz,
 // when the title has one, decoded here and handed to the emitter, which uses it only if it was
 // made with this session's param block, flags and table base. ?jitcorpus=0 = none (the A/B arm).
+// THE CORPUS'S STATE, told to the page ('jitwarm': loading -> compiling -> done | none): a room's
+// page holds its start-barrier declaration until the corpus has compiled (n64/index.html
+// chooseDelayThenReady, bounded), so the compiling is done in the handshake, not in the room.
+function jitWarmSay(st, x) { if (self.__jwSaid === st) return; self.__jwSaid = st; post({ t: 'jitwarm', s: st, x: x || null }); }
 function jitCorpusLoad() {
   var d = BOOT || {}, name = (self.__fbAsync && self.__fbAsync.romName) || '';
-  if (!name || new URLSearchParams(d.search || '').get('jitcorpus') === '0' || typeof DecompressionStream !== 'function') return;
+  if (!name || new URLSearchParams(d.search || '').get('jitcorpus') === '0' || typeof DecompressionStream !== 'function') { jitWarmSay('none'); return; }
+  jitWarmSay('loading');
   var u32 = function (b64) {
     var bin = atob(b64), u8 = new Uint8Array(bin.length);
     for (var i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
@@ -150,13 +155,28 @@ function jitCorpusLoad() {
   fetch('jit/' + encodeURIComponent(name.replace(/[^A-Za-z0-9 _-]/g, '_')) + '.json.gz?v=' + (d.v || ''))
     .then(function (r) { return r.ok ? new Response(r.body.pipeThrough(new DecompressionStream('gzip'))).json() : null; })
     .then(function (c) {
-      if (!c || c.v !== 1 || !self.bementalMips || !self.bementalMips.warmCorpus) return;
+      if (!c || c.v !== 1 || !self.bementalMips || !self.bementalMips.warmCorpus) { jitWarmSay('none'); return; }
       var C = { static: c.static, flags: c.flags, tableBase: c.tableBase, pages: [], jobs: [] };
       c.pages.forEach(function (pg) { C.pages.push({ w0: pg[0], words: u32(pg[1]) }); });
       c.jobs.forEach(function (j) { C.jobs.push({ vaddr: j[0], entryPtr: j[1], span: j[2], srcPtr: j[3], blockStart: j[4], blockEnd: j[5], pg: j[6], ops: u32(j[7]) }); });
       self.bementalMips.warmCorpus(C);
       log('[jit] span corpus: ' + C.jobs.length + ' spans, ' + C.pages.length + ' pages (' + name + ')');
-    }).catch(function (e) { log('[jit] span corpus not loaded: ' + ((e && e.message) || e)); });
+      // AN EARLY START (mips_emit.js): compiled while no frame has run — a room's core waits for
+      // its barrier armed — instead of under the room's first seconds. ?jitearly=0 is the arm.
+      if (new URLSearchParams(d.search || '').get('jitearly') !== '0' && self.bementalMips.warmEarly && self.bementalMips.warmEarly(M)) {
+        log('[jit] span corpus: compiling before the first frame');
+        jitWarmSay('compiling');
+        var B = self.bementalMips, t0 = performance.now(), pt = setInterval(function () {
+          if (B.async.frameEnds || (!B.warm.ids.size && !B.async.ready.length)) {
+            clearInterval(pt);
+            var x = { ms: Math.round(performance.now() - t0), offered: B.warm.offered, back: B.warm.offered - B.warm.ids.size, frames: B.async.frameEnds };
+            log('[jit] span corpus: ' + x.back + ' of ' + x.offered + ' spans compiled before the first frame in ' + x.ms + ' ms' + (x.frames ? ' (the guest started first)' : ''));
+            jitWarmSay('done', x); return;
+          }
+          B.warmPump(3);
+        }, 8);
+      } else jitWarmSay('none');
+    }).catch(function (e) { log('[jit] span corpus not loaded: ' + ((e && e.message) || e)); jitWarmSay('none'); });
 }
 
 // ---- audio: the core's resampled ring -> the AudioWorklet, directly ----------------------
@@ -450,12 +470,15 @@ var FSK = { on: true, depth: 1, maxSnaps: 6, snapEvery: 8, force: 0, skipping: f
            pads: null, curPads: new Int32Array(12), setPad: null, taintSeen: 0, jsTaint: 0, ageTIn: 0, pollT: 0,
            fields: 0, drawn: 0, skipped: 0, skipNoDraw: 0, snapsTaken: 0, snapMs: 0, maxSnapMs: 0, redo: 0, redoFields: 0,
            redoMs: 0, redoFieldsAll: 0, audDrop: 0, staleS: 0, repairs: 0, lost: 0, suspendUntil: 0, backoff: 64, held: 0, presented: 0, overwritten: 0, noHeap: 0,
-           lat: new Float32Array(4096), age: new Float32Array(4096), gpu: new Float32Array(4096), latN: 0, why: '' };
+           lat: new Float32Array(4096), age: new Float32Array(4096), gpu: new Float32Array(4096), latN: 0, why: '',
+           staleIdle: 0, idleRepairs: 0, gaps: new Int32Array(16), gapN: 0, gapRun: 0 };
 // heap kept free for the core's own growth, counted on the heap the allocator sees (room_core.js
 // N64S_RAW_RESERVE: Donkey Kong 64 grows its break by 80 MB after boot; a malloc that does not fit
 // ABORTS this build, so the check is made BEFORE asking)
 var FS_RESERVE = 128 * 1048576;
 var FS_MAXAGE = 16;               // a snapshot older than this many fields is resolved by a re-run now (?fskipage=N)
+var FS_IDLE = 3;                  // ?fskipidle=N (0 = off): a stale window past the title's cadence is resolved now
+function fsGapMax() { var m = 0; for (var i = 0; i < 16; i++) if (FSK.gaps[i] > m) m = FSK.gaps[i]; return m; }
 function fsInstall(search) {
   var q = new URLSearchParams(search || '').get('fskip');
   if (q === '0') { FSK.on = false; FSK.why = 'off (?fskip=0)'; }
@@ -468,6 +491,7 @@ function fsInstall(search) {
   var qx = new URLSearchParams(search || '').get('fsrerun'); if (qx) { FSK.snapAt = +qx.split(':')[0]; FSK.rerunAt = [+qx.split(':')[1]]; FS_MAXAGE = 1e9; }
   var qa = new URLSearchParams(search || '').get('fskipage'); if (qa && +qa > 0) FS_MAXAGE = +qa;
   var qs = new URLSearchParams(search || '').get('fskipsnap'); if (qs && +qs >= 1) FSK.snapEvery = +qs | 0;
+  var qi = new URLSearchParams(search || '').get('fskipidle'); if (qi != null && +qi >= 0) FS_IDLE = +qi | 0;
   if (!self.WebGL2RenderingContext) { FSK.on = false; FSK.why = 'no WebGL2'; }
 }
 // the window's draw calls (after ?present=bitmap's wrappers, so a swallowed draw is not a picture)
@@ -586,7 +610,11 @@ function fsRelease(s) {
   while (FSK.snaps.length > 1 && FSK.snaps[1].s <= keep) fsDrop(0);
   // A blank capture nothing supersedes keeps its snapshot, and a re-run from it grows with every
   // field: resolved here, while it is still short.
-  if (FSK.snaps.length && s - FSK.snaps[0].s > FS_MAXAGE) { FSK.repairs++; fsRedo(s, false); }
+  if (FSK.snaps.length && s - FSK.snaps[0].s > FS_MAXAGE) { FSK.repairs++; fsRedo(s, false); return; }
+  // ...and a window the game stopped drawing into (no blank capture, only the stale picture) is
+  // resolved as soon as the title's cadence says it will not clear itself (room_core.js THE WINDOW
+  // THE GAME STOPPED DRAWING INTO; ?fskipidle=0 = the age repair alone)
+  if (FS_IDLE > 0 && FSK.snaps.length && FSK.stale && old < 0 && FSK.staleIdle >= Math.max(FS_IDLE, fsGapMax() + 2)) { FSK.repairs++; FSK.idleRepairs++; fsRedo(s, false); }
 }
 // Restore the oldest snapshot and run every field since again, drawing. `s` is the field that
 // just ran (its audio is not pumped yet). The guest ends exactly where a run that never skipped
@@ -651,8 +679,11 @@ function fsField() {
   try { M._neil_ls_run_frame(); }
   finally { FSK.skipping = false; if (ready) M._neil_fs_set(0, s); }
   var sw = FSK.swNow;
-  if (skip) { FSK.skipped++; if (sw) { FSK.stale = true; FSK.staleS = s; } else FSK.skipNoDraw++; }
-  else if (FSK.drewNow) FSK.stale = false;
+  if (skip) { FSK.skipped++; if (sw) { FSK.stale = true; FSK.staleS = s; FSK.staleIdle = 0; } else { FSK.skipNoDraw++; if (FSK.stale) FSK.staleIdle++; } }
+  else if (FSK.drewNow) { FSK.stale = false; FSK.staleIdle = 0; }
+  else if (FSK.stale) FSK.staleIdle++;
+  // the title's cadence (room_core.js rfsGapMax): the longest picture-less run between pictures
+  if (FSK.drewNow || sw) { FSK.gaps[FSK.gapN++ & 15] = FSK.gapRun; FSK.gapRun = 0; } else FSK.gapRun++;
   if (ready && ((M._neil_fs_taints() >>> 0) !== FSK.taintSeen || FSK.jsTaint)) {
     FSK.taintSeen = M._neil_fs_taints() >>> 0; FSK.jsTaint = 0;
     fsRedo(s, true);
@@ -723,7 +754,7 @@ function fsDist(a) {
 function fsReport() {
   return { on: FSK.on, why: FSK.why, depth: FSK.depth, force: FSK.force, fields: FSK.fields, drawn: FSK.drawn, skipped: FSK.skipped,
            skipNoDraw: FSK.skipNoDraw, held: FSK.held, snaps: FSK.snapsTaken, snapMs: FSK.snapsTaken ? +(FSK.snapMs / FSK.snapsTaken).toFixed(2) : 0,
-           maxSnapMs: +FSK.maxSnapMs.toFixed(1), redo: FSK.redo, redoFields: FSK.redoFields, redoMs: Math.round(FSK.redoMs), repairs: FSK.repairs,
+           maxSnapMs: +FSK.maxSnapMs.toFixed(1), redo: FSK.redo, redoFields: FSK.redoFields, redoMs: Math.round(FSK.redoMs), repairs: FSK.repairs, idleRepairs: FSK.idleRepairs,
            lost: FSK.lost, noHeap: FSK.noHeap, presented: FSK.presented, overwritten: FSK.overwritten, onGpu: FSK.fq.length, snapsHeld: FSK.snaps.length,
            lat: fsDist(FSK.lat), age: fsDist(FSK.age), gpu: fsDist(FSK.gpu) };
 }

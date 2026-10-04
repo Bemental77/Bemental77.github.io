@@ -144,9 +144,12 @@ struct neil_raw_hdr
 
 static uint32_t g_nonce;          /* identifies THIS running instance */
 static int g_dram_off_ok = -1;    /* -1 unknown, 1 verified, 0 layout mismatch */
-static int g_last_load_mode;      /* 0 none, 1 selective, 2 full wipe */
+static int g_last_load_mode;      /* 0 none, 1 selective, 2 full wipe, 3 selective across a TLB rewrite */
 static int g_last_load_pages;     /* pages invalidated by the last selective load */
 static int g_tlb_same_by_content; /* loads whose TLB generation differed but whose TLB did not */
+static int g_tlb_remapped;        /* loads whose TLB did differ, taken selectively (mode 3) */
+static int g_tlb_remapped_pages;  /* virtual pages the last such load invalidated */
+static unsigned char g_phys_chg[RDRAM_MAX_SIZE >> 12]; /* pages the last load found changed */
 
 #define ALIGN8(x) (((x) + 7u) & ~7u)
 
@@ -202,9 +205,14 @@ int neil_state_size(void)
 /* how the last load treated the code cache (diagnostics for the page/tests):
  * 1 = selective (only changed code pages), 2 = full wipe, 0 = none yet */
 int neil_state_last_load_mode(void) { return g_last_load_mode; }
+/* the rig's arm for mode 3 (neil_state_set_remap(0): every TLB-changing load wipes, as before) */
+static int neil_remap_off;
+void neil_state_set_remap(int on) { neil_remap_off = on ? 0 : 1; }
 int neil_state_last_load_pages(void) { return g_last_load_pages; }
 int neil_state_m64p_region(void) { return (int)NEIL_M64P_REGION; }
 int neil_state_tlb_same_by_content(void) { return g_tlb_same_by_content; }
+int neil_state_tlb_remapped(void) { return g_tlb_remapped; }
+int neil_state_tlb_remapped_pages(void) { return g_tlb_remapped_pages; }
 
 /* THE TLB GENERATION IS A PROOF OF SAMENESS, NOT OF DIFFERENCE. It is bumped by
  * EVERY write of a TLB entry, the same value rewritten included, so a state
@@ -380,6 +388,41 @@ static int invalidate_changed_code_pages(const unsigned char* img)
       {
          invalid_code[0x80000 + p] = 1;
          invalid_code[0xA0000 + p] = 1;
+         g_phys_chg[p] = 1;
+         n++;
+      }
+   }
+   return (int)n;
+}
+
+/* A LOAD ACROSS A TLB REWRITE NEED NOT WIPE THE CODE CACHE (mode 3). MEASURED (the
+ * bench's loopback room, SM64, host worker): a frame-skip repair loaded a state
+ * from before the guest rewrote its TLB (frames ~357-360) and the loader wiped
+ * everything — memset(invalid_code, 1): a 150 ms tick, 134-168 ms lost, every
+ * page of the re-run recompiled. The cache is keyed by VIRTUAL page, and a
+ * TLB rewrite only changes what the TLB-mapped virtual pages (below 0x80000000,
+ * at or above 0xC0000000) translate to — which is exactly what TLBWrite itself
+ * invalidates at run time. So the loader does what a TLB write does, for every
+ * mapped page at once: a virtual page whose translation (tlb_LUT_r, live vs the
+ * state's) differs is invalidated; one that translates the same is kept unless
+ * the physical page behind it changed (the KSEG0/KSEG1 pages are handled by
+ * invalidate_changed_code_pages, as on the TLB-unchanged path). Then the LUTs
+ * ARE loaded (not skipped). Pages never compiled (invalid already) are skipped. */
+static int invalidate_remapped_pages(const unsigned char* src)
+{
+   const uint32_t* lr = (const uint32_t*)(src + neil_m64p_lut_off);
+   uint32_t i, n = 0;
+   for (i = 0; i < 0x100000; i++)
+   {
+      uint32_t a, b;
+      if (i == 0x80000) { i = 0xBFFFF; continue; }     /* KSEG0/KSEG1: not translated */
+      if (invalid_code[i])
+         continue;
+      a = tlb_LUT_r[i];
+      memcpy(&b, lr + i, 4);
+      if (a != b || (a && (a & 0x1FFFFFFF) < RDRAM_MAX_SIZE && g_phys_chg[(a & 0x1FFFFFFF) >> 12]))
+      {
+         invalid_code[i] = 1;
          n++;
       }
    }
@@ -422,10 +465,21 @@ int neil_state_load_raw(const unsigned char* src)
       lut_same = 1;
       g_tlb_same_by_content++;
    }
+   memset(g_phys_chg, 0, sizeof(g_phys_chg));
    if (lut_same && g_dram_off_ok == 1)
    {
       g_last_load_pages = invalidate_changed_code_pages(src + NEIL_M64P_DRAM_OFF);
       g_last_load_mode = 1;
+      savestates_keep_code_cache = 1;
+   }
+   else if (!lut_same && h.nonce == instance_nonce() && g_dram_off_ok == 1 && neil_m64p_lut_off
+         && neil_m64p_lut_off + 2u * sizeof(tlb_LUT_r) <= NEIL_M64P_REGION && !neil_remap_off)
+   {
+      g_last_load_pages = invalidate_changed_code_pages(src + NEIL_M64P_DRAM_OFF);
+      g_tlb_remapped_pages = invalidate_remapped_pages(src);
+      g_last_load_pages += g_tlb_remapped_pages;
+      g_tlb_remapped++;
+      g_last_load_mode = 3;
       savestates_keep_code_cache = 1;
    }
    else

@@ -1624,7 +1624,7 @@ N64Rate.selfTest = function (logFn) {
 </script>
 <script src="/n64/N64Wasm/dist/fbasync.js?v=a23cd08f"></script>
 <script src="/n64/N64Wasm/dist/jit_params.js?v=bb2930f6"></script>
-<script src="/n64/N64Wasm/dist/room_core.js?v=8bffda7e"></script>
+<script src="/n64/N64Wasm/dist/room_core.js?v=3b7fd7cb"></script>
 <script>
 (function () {
   'use strict';
@@ -2458,7 +2458,7 @@ N64Rate.selfTest = function (logFn) {
   // logged. If the worker fails while it boots (no WebGL2 there after all, a
   // core abort before "Starting R4300"), the page reloads ONCE with ?worker=0
   // (wkFallback) and says so in its log.
-  var WK_V = '8bffda7e';                           // cache-buster for the worker's scripts
+  var WK_V = '3b7fd7cb';                           // cache-buster for the worker's scripts
   var WK_DEFAULT = true;                     // the default for a capable console (solo and rooms)
   var WK = { on: false, why: null, w: null, stat: null, statAt: 0, presents0: 0, pendingAudioPort: null,
              evals: {}, evalId: 0, sent: null, composed: 0, posted: 0, fatal: null, booted: false,
@@ -2624,6 +2624,7 @@ N64Rate.selfTest = function (logFn) {
       case 'log': pageLog(d.s); break;
       case 'toast': if (d.bad) toast(d.s, true); break;
       case 'booted': WK.booted = true; mark('worker-booted'); break;
+      case 'jitwarm': WK.jitWarm = d.s; WK.jitWarmX = d.x; break;
       case 'evalr': { var cb = WK.evals[d.id]; delete WK.evals[d.id]; if (cb) cb(d); break; }
       // ---- WORKER ROOMS (below): the engine's traffic, events and mirror ----
       case 'lso': if (WK.engSend) { try { WK.engSend(d.m); } catch (er) {} } break;
@@ -4765,6 +4766,19 @@ N64Rate.selfTest = function (logFn) {
           }
         }
       } catch (e) { pageLog('[lockstep] delay choice failed, keeping the default: ' + ((e && e.message) || e)); }
+      // ⚠ THE TITLE'S JIT CORPUS COMPILES IN THE HANDSHAKE, NOT IN THE ROOM (core_worker.js
+      // 'jitwarm'). MEASURED (the bench's loopback room, SM64, host worker): the corpus compiled
+      // through the room's first ~3.6 s (frames 1-216) beside the other console's, under the scene
+      // loads where the room lost its start-up time; begun at boot it had ~0.5 s before the barrier
+      // released. So this console declares ready once its corpus is in (or there is none), at most
+      // JW_MAX_MS later — the room starts that much later, and runs its first seconds at speed.
+      try {
+        var JW_MAX_MS = 6000, jw0 = performance.now();
+        while (WK.room && (WK.jitWarm === 'loading' || WK.jitWarm === 'compiling') && performance.now() - jw0 < JW_MAX_MS)
+          await new Promise(function (r) { setTimeout(r, 25); });
+        if (WK.room && WK.jitWarm) pageLog('[jit] corpus before the room: ' + WK.jitWarm + ' (waited ' + Math.round(performance.now() - jw0) + ' ms'
+              + (WK.jitWarmX ? ', ' + WK.jitWarmX.back + '/' + WK.jitWarmX.offered + ' spans in ' + WK.jitWarmX.ms + ' ms' : '') + ')');
+      } catch (e) {}
       try {
         if (typeof sess.setReady === 'function') { sess.setReady(true, lsDiscTag()); NET.declared = true; }
         else pageLog('[net] this build has no start barrier yet (session.setReady is missing)');

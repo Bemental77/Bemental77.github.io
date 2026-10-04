@@ -222,6 +222,7 @@ n64wasm.js: $(FILES)
     '_neil_fp_always','_neil_last_fp', \
     '_neil_state_size','_neil_state_save_raw','_neil_state_save_raw_fast','_neil_state_load_raw', \
     '_neil_state_last_load_mode','_neil_state_last_load_pages','_neil_state_m64p_region','_neil_state_tlb_same_by_content', \
+    '_neil_state_tlb_remapped','_neil_state_tlb_remapped_pages','_neil_state_set_remap', \
     '_neil_set_native_fbread','_neil_native_fbread_failed','_neil_set_vbo_mode', \
     '_neil_set_gl_shadow','_neil_gl_shadow_sent','_neil_gl_shadow_dropped','_neil_set_gl_merge', \
     '_neil_lfb_snapshot','_neil_lfb_restore','_neil_lfb_release','_neil_lfb_flush','_neil_lfb_stats','_neil_lfb_pending', \

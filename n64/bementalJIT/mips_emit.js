@@ -1896,6 +1896,11 @@
     if (ASYNC.on === false) return false;
     if (!ASYNC.frameEnds) return false;          // this core calls frameEnd: installs can happen
     if (ASYNC.on === true) return true;
+    return asyncMake(Module);
+  }
+  // the compile worker, made once (asyncOn at the first offer, or warmEarly before any frame)
+  function asyncMake(Module) {
+    if (ASYNC.on !== null) return ASYNC.on;
     var g = (typeof globalThis !== 'undefined') ? globalThis : self, f = g.__fbAsync;
     if ((f && f.jitAsync === false) || census.on || typeof Worker !== 'function' || typeof g.__n64JitWorkerUrl !== 'string') { ASYNC.on = false; return false; }
     try {
@@ -1932,7 +1937,7 @@
     var words = U.slice(pageW0, pageW0 + pageN + 1);    // the page, and the word after it
     var id = ASYNC.nextId++;
     var job = { id: id, p: Object.assign({}, p), w0: pageW0, words: words, ops: ops, flags: jitFlags(), tableBase: TABLE_BASE };
-    if (WARM.corpus) warmStart(job);
+    if (WARM.corpus || (WARM.early && WARM.early.ok === null)) warmStart(job);
     if (WARM.capture) WARM.capture.push({ p: job.p, w0: pageW0, words: words, ops: ops, flags: job.flags, tableBase: TABLE_BASE });
     ASYNC.pending.set(id, { p: job.p, w0: pageW0, words: words, ops: ops, bp: bp, blk: bp ? U[bp >> 2] : 0, keyArr: keyArr, tries: ASYNC.retry | 0 });
     // batched: one message per field end (or per 32 offers) — a scene load offers hundreds
@@ -1959,15 +1964,40 @@
   // ?jitcorpus=0 (fbasync.js publishes nothing for it; core_worker.js does not load one) = off.
   var WARM = { corpus: null, capture: null, started: false, ids: new Map(), offered: 0, cached: 0, dropped: null };
   var WARM_PER_SPAN = { vaddr: 1, entryPtr: 1, span: 1, srcPtr: 1, blockStart: 1, blockEnd: 1 };
-  function warmStart(live) {
-    var C = WARM.corpus; WARM.corpus = null;
-    if (WARM.started) return; WARM.started = true;
-    var k, why = null;
-    for (k in C.static) if (C.static[k] !== live.p[k]) { why = 'param ' + k; break; }
-    if (!why) for (k in live.p) if (!WARM_PER_SPAN[k] && !(k in C.static)) { why = 'param ' + k + ' not in corpus'; break; }
-    if (!why && JSON.stringify(C.flags) !== JSON.stringify(live.flags)) why = 'flags';
-    if (!why && (C.tableBase | 0) !== (live.tableBase | 0)) why = 'tableBase';
-    if (why) { WARM.dropped = why; return; }
+  function warmCheck(C, live) {
+    var k;
+    for (k in C.static) if (C.static[k] !== live.p[k]) return 'param ' + k;
+    for (k in live.p) if (!WARM_PER_SPAN[k] && !(k in C.static)) return 'param ' + k + ' not in corpus';
+    if (JSON.stringify(C.flags) !== JSON.stringify(live.flags)) return 'flags';
+    if ((C.tableBase | 0) !== (live.tableBase | 0)) return 'tableBase';
+    return null;
+  }
+  function warmStart(live, early) {
+    var E = WARM.early, C, why, k;
+    if (E && E.ok === null && !early) {
+      // THE FIRST REAL OFFER JUDGES AN EARLY START (warmEarly): the jobs it sent were built from
+      // the corpus's own static fields, so they are exactly the jobs this would build if — and only
+      // if — the corpus matches the live block, and the flags and table base it assumed are live
+      why = warmCheck(E.C, live)
+         || (JSON.stringify(E.flags) !== JSON.stringify(live.flags) ? 'flags changed since the early start' : null)
+         || ((E.tableBase | 0) !== (live.tableBase | 0) ? 'table base changed since the early start' : null);
+      if (why) {
+        // nothing it compiled was ever put where a span could find it: dropped, and the corpus is
+        // judged again against the live block, as without an early start
+        E.ok = false; E.why = why; E.held = []; WARM.ids.clear();
+        WARM.corpus = E.C; WARM.started = false; WARM.offered = 0;
+      } else {
+        E.ok = true;
+        var M = ASYNC.M || ((typeof globalThis !== 'undefined' ? globalThis : self).Module);
+        for (var h = 0; h < E.held.length; h++) { try { warmCache(E.held[h][0], E.held[h][1]); } catch (e) { stats.warmErr = String((e && e.message) || e).slice(0, 160); } }
+        E.held = []; E.C = null;
+        return;
+      }
+    }
+    C = WARM.corpus; WARM.corpus = null;
+    if (WARM.started || !C) return; WARM.started = true;
+    if (early) WARM.early = { ok: null, C: C, flags: live.flags, tableBase: live.tableBase, held: [], why: null, at: Date.now() };
+    else { why = warmCheck(C, live); if (why) { WARM.dropped = why; return; } }
     var out = [];
     for (var i = 0; i < C.jobs.length; i++) {
       var cj = C.jobs[i], pp = Object.assign({}, live.p), w = C.pages[cj.pg];
@@ -1987,10 +2017,16 @@
   // a corpus module back from the worker: into the recompile cache, nowhere else
   function warmPut(M, r, key) {
     if (!r.ok) return;
-    var kh = keyHash(key, key.length), b = spanCache.get(kh);
-    if (b) for (var i = 0; i < b.length; i++) if (keyEq(b[i].key, key, key.length)) return;   // compiled live meanwhile
     var Bh = r.B;
+    // instantiating runs no guest code and changes nothing a span can see: done as it lands,
+    // early-started or not (warmPump does it before the first frame)
     if (!Bh.inst) { Bh.inst = new WebAssembly.Instance(Bh.mod || new WebAssembly.Module(Bh.bytes), { e: { t: M.wasmTable, m: M.wasmMemory } }); ASYNC.modules++; }
+    if (WARM.early && WARM.early.ok === null) { WARM.early.held.push([r, key]); return; }
+    warmCache(r, key);
+  }
+  function warmCache(r, key) {
+    var kh = keyHash(key, key.length), b = spanCache.get(kh), Bh = r.B;
+    if (b) for (var i = 0; i < b.length; i++) if (keyEq(b[i].key, key, key.length)) return;   // compiled live meanwhile
     var fns = [Bh.inst.exports['s' + r.k]];
     for (var wk = 1; wk < r.labels.length; wk++) fns.push(r.nfn === 1 ? fns[0] : Bh.inst.exports['s' + r.k + '_' + wk]);
     cachePut(key, fns, r.labels, r.labelOps);
@@ -1999,6 +2035,34 @@
   // corpus = { static, flags, tableBase, pages: [{ w0, words: Uint32Array }], jobs: [{ vaddr, entryPtr,
   // span, srcPtr, blockStart, blockEnd, pg, ops: Uint32Array }] } (core_worker.js decodes the file)
   function warmCorpus(c) { if (!WARM.started && c && c.jobs && c.jobs.length) WARM.corpus = c; }
+  // ---- AN EARLY START (2026-10-04): THE CORPUS COMPILES BEFORE THE FIRST FRAME ----
+  // MEASURED (the bench's loopback room, SM64, host core worker): the corpus started at the first
+  // offer — room frame 1 — and its 1555 jobs were compiling until frame ~216, under the title's
+  // scene loads (frames 157 and 359: 26-208 ms fields, the room's start-up loss) and beside the
+  // other console's own corpus compile, on a box both consoles share. A room's core is armed before
+  // it runs a frame and then waits for the barrier, so that wait can do the compiling. Here the
+  // jobs are sent at once, built from the corpus's static fields and the table base and flags as
+  // they are now; what comes back is instantiated (warmPump, between tasks while no frame has run;
+  // frameEnd afterwards) but put in the recompile cache only once the FIRST REAL OFFER has shown
+  // the live block equal to the corpus and the flags and table base unchanged (warmStart) — what
+  // a start at the first offer checks before sending anything. If not, all of it is dropped and
+  // the corpus is judged as before. A span is still installed only on a full key match.
+  function warmEarly(Module) {
+    if (WARM.started || !WARM.corpus || EMIT_ONLY || census.on || !Module || !Module.wasmTable) return false;
+    if (!asyncMake(Module)) return false;
+    ASYNC.M = ASYNC.M || Module;
+    var tb = TABLE_BASE || Module.wasmTable.length;
+    warmStart({ p: Object.assign({}, WARM.corpus.static), flags: jitFlags(), tableBase: tb }, true);
+    return !!WARM.early;
+  }
+  // install what the compile worker has sent back, for up to `ms` (only before the first frame:
+  // after it, frameEnd does this at every field end)
+  function warmPump(ms) {
+    if (ASYNC.frameEnds || !ASYNC.ready.length) return ASYNC.ready.length;
+    var t0 = performance.now();
+    while (ASYNC.ready.length && performance.now() - t0 < ms) { var n = ASYNC.ready.length; asyncInstallReady(); if (ASYNC.ready.length === n) break; }
+    return ASYNC.ready.length;
+  }
   function asyncFlush() {
     if (!ASYNC.outbox.length || !ASYNC.w) return;
     var b = ASYNC.outbox; ASYNC.outbox = [];
@@ -3036,5 +3100,6 @@
     return out;
   }
   window.bementalMips = { compileSpan: compileSpan, frameEnd: frameEnd, stats: stats, census: censusDump, censusOn: function () { return !!census.on; },
-                         async: ASYNC, emitJob: emitJob, emitBatch: emitBatch, warm: WARM, warmCorpus: warmCorpus };
+                         async: ASYNC, emitJob: emitJob, emitBatch: emitBatch, warm: WARM, warmCorpus: warmCorpus,
+                         warmEarly: warmEarly, warmPump: warmPump };
 })();

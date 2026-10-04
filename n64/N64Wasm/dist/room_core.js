@@ -759,7 +759,8 @@
     var RFS = { on: !!env.fs && RB_Q.get('rfskip') !== '0', why: null, skipped: 0, hiddenSkipped: 0, resimSkipped: 0,
                 reruns: 0, rerunFrames: 0, rerunMs: 0, maxRerunMs: 0, repairs: 0, readbacks: 0, lost: 0,
                 suspendUntil: -1, backoff: 64, need: Infinity, stale: false, staleS: -1, inRerun: false, inResim: false,
-                head: -1, cur: -1, curSkip: false, linear: 0 };
+                head: -1, cur: -1, curSkip: false, linear: 0, staleIdle: 0, idleRepairs: 0, gaps: new Int32Array(16), gapN: 0, gapRun: 0 };
+    function rfsGapMax() { var m = 0; for (var i = 0; i < 16; i++) if (RFS.gaps[i] > m) m = RFS.gaps[i]; return m; }
     if (!RFS.on) RFS.why = env.fs ? 'off (?rfskip=0)' : 'not in this realm (main-thread core)';
     function rfsLive() { return RFS.on && !!env.fs && env.fs.ok(); }
     function rfsOldest() { var M = G.Module; return (M && M._neil_fs_oldest) ? (M._neil_fs_oldest() | 0) : -1; }
@@ -768,6 +769,21 @@
     // ring keeps the snapshot a re-run would start from however far back that is (rbPick: rfsHold).
     var RFS_MAXAGE = Math.max(2, +(RB_Q.get('fskipage') || 16) | 0);
     function rfsMaxAge() { return RFS_MAXAGE; }
+    // ---- THE WINDOW THE GAME STOPPED DRAWING INTO: resolved while it is short ----
+    // MEASURED (diag on the bench's loopback room, SM64, 2 runs on 5256d31, host worker): EVERY
+    // room frame-skip repair was an AGE repair with NO blank capture live — the window alone was
+    // stale: a presented frame skipped its draws (357; 2522-2524) and then the game drew nothing
+    // into the window for 15-17 frames (a scene transition), so nothing cleared it, and at 16 frames
+    // the repair re-ran 18-20 frames from a snapshot in one tick: 111.6 ms (lost 63) and 184.4 ms
+    // (lost 138 — the TLB had changed in between, so the load wiped the code cache and every re-run
+    // frame recompiled; the core now keeps it, neil_rawstate.c mode 3). A stale window clears itself
+    // at the next frame that draws; presented frames that draw nothing past the title's own cadence
+    // (the longest gap between its pictures lately, +2; at least RFS_STALE_IDLE) say it will not
+    // soon. So the repair runs THEN — the same exact re-run, from the same snapshot, a few frames
+    // long instead of 16+. ?fskipidle=0 is the arm (the age repair alone, as before). (MEASURED with
+    // a flat 3: SM64's attract demo drops to 20 fps and the repair fired 6 more times in 30 s, each
+    // 25-75 ms, at windows that would have cleared themselves.)
+    var RFS_STALE_IDLE = Math.max(0, +(RB_Q.get('fskipidle') != null ? RB_Q.get('fskipidle') : 3) | 0);
     // the oldest frame a re-run may have to start at, or Infinity
     function rfsHold() { return (RFS.on && RB.ready) ? Math.min(RFS.need, RFS.stale ? RFS.staleS : Infinity) : Infinity; }
     // kind: 'present' | 'hidden' | 'resim'. May frame k skip at all (a snapshot to re-run from,
@@ -796,8 +812,16 @@
       if (skip) {
         if (kind === 'present') RFS.skipped++; else if (kind === 'hidden') RFS.hiddenSkipped++; else RFS.resimSkipped++;
         // (as solo: the newest skipped frame — a re-run redraws it over the last picture drawn)
-        if (r.sw) { RFS.stale = true; RFS.staleS = k; }
-      } else if (r.drew) RFS.stale = false;
+        if (r.sw) { RFS.stale = true; RFS.staleS = k; RFS.staleIdle = 0; }
+        else if (RFS.stale && kind === 'present') RFS.staleIdle++;
+      } else if (r.drew) { RFS.stale = false; RFS.staleIdle = 0; }
+      else if (RFS.stale && kind === 'present') RFS.staleIdle++;
+      // the title's own cadence: the longest run of presented frames without a picture between two
+      // with one (drawn or skipped with draws), over the last 16 pictures — a 30 fps game 1, 20 fps 2
+      if (kind === 'present') {
+        if (r.drew || r.sw) { RFS.gaps[RFS.gapN++ & 15] = RFS.gapRun; RFS.gapRun = 0; }
+        else RFS.gapRun++;
+      }
       env.fs.stale(RFS.stale);
       rfsNote();
       if (k > RFS.head) RFS.head = k;
@@ -820,7 +844,7 @@
     // that needed its own repair a few frames later.)
     function rfsRerun(ls, k, why, resave) {
       var from = Math.min(RFS.need, RFS.stale ? RFS.staleS : Infinity, RFS.curSkip ? RFS.cur : Infinity, k);
-      var s = rbAtOrBelow(from), j, t0 = performance.now(), M = G.Module;
+      var s = rbAtOrBelow(from), j, t0 = performance.now(), M = G.Module, s0 = s ? s.frame : -1;
       RFS.dbgNeed = RFS.need; RFS.dbgStale = RFS.stale ? RFS.staleS : -1;
       if (!s) { RFS.lost++; return 'a frame-skip re-run to frame ' + from + ' found no snapshot at or before it'; }
       for (j = s.frame; j <= k; j++) if (RB.imgF[j % RB_IMG] !== j) { RFS.lost++; return 'a frame-skip re-run: the input frame ' + j + ' ran with is no longer held'; }
@@ -843,8 +867,8 @@
       RFS.stale = false; env.fs.stale(false); RFS.curSkip = false;
       RFS.need = Infinity; rfsNote();
       var ms = performance.now() - t0;
-      RFS.reruns++; RFS.rerunFrames += k - s.frame + 1; RFS.rerunMs += ms; if (ms > RFS.maxRerunMs) RFS.maxRerunMs = ms;
-      if (G.__n64RbLog) G.__n64RbLog.push(['fsrerun', k, s.frame, why, from, RFS.dbgNeed, RFS.dbgStale]);
+      RFS.reruns++; RFS.rerunFrames += k - s0 + 1; RFS.rerunMs += ms; if (ms > RFS.maxRerunMs) RFS.maxRerunMs = ms;
+      if (G.__n64RbLog) G.__n64RbLog.push(['fsrerun', k, s0, why, from, RFS.dbgNeed, RFS.dbgStale, +ms.toFixed(1)]);
       if (why === 'read-back') {
         RFS.suspendUntil = k + RFS.backoff; RFS.backoff = Math.min(RFS.backoff * 2, 1 << 24);
         env.log('[fskip] room: a read-back reached a skipped frame: re-ran frames ' + s.frame + '..' + k + ' drawing ('
@@ -859,14 +883,17 @@
       if (!env.fs || !RFS.on || !RB.ready || RB.stale || RFS.head < 0) return true;
       RFS.need = Infinity; rfsNote();
       var from = Math.min(RFS.need, RFS.stale ? RFS.staleS : Infinity);
-      if (from === Infinity || (!all && RFS.head - from <= rfsMaxAge())) return true;
+      // (see THE WINDOW THE GAME STOPPED DRAWING INTO, above)
+      var idle = !all && RFS_STALE_IDLE > 0 && RFS.stale && RFS.need === Infinity && RFS.staleIdle >= Math.max(RFS_STALE_IDLE, rfsGapMax() + 2);
+      if (from === Infinity || (!all && !idle && RFS.head - from <= rfsMaxAge())) return true;
       RFS.repairs++; RFS.curSkip = false;
-      return rfsRerun(ls, RFS.head, all ? 'settle' : 'age', true);
+      if (idle) RFS.idleRepairs++;
+      return rfsRerun(ls, RFS.head, all ? 'settle' : idle ? 'idle' : 'age', true);
     }
     function rfsReport() {
       return { on: RFS.on, live: rfsLive(), why: RFS.why, skipped: RFS.skipped, hiddenSkipped: RFS.hiddenSkipped, resimSkipped: RFS.resimSkipped,
                reruns: RFS.reruns, rerunFrames: RFS.rerunFrames, rerunMs: Math.round(RFS.rerunMs), maxRerunMs: +RFS.maxRerunMs.toFixed(1),
-               repairs: RFS.repairs, readbacks: RFS.readbacks, lost: RFS.lost, linear: RFS.linear, suspendedUntil: RFS.suspendUntil,
+               repairs: RFS.repairs, idleRepairs: RFS.idleRepairs, readbacks: RFS.readbacks, lost: RFS.lost, linear: RFS.linear, suspendedUntil: RFS.suspendUntil,
                linearFs: env.fs && env.fs.report ? env.fs.report() : null };
     }
 
@@ -1996,6 +2023,7 @@
                   rollbacksPerFrame: +RB.pEma.toFixed(4), depthAvg: RB.rollbacks ? +(RB.depthSum / RB.rollbacks).toFixed(2) : 0,
                   resimFrames: RB.resimFrames, bridgeFrames: RB.bridgeFrames, maxDepth: RB.maxDepth, depthHist: RB.depthHist, loads: RB.loads, wipes: RB.wipes | 0, wipeMs: Math.round(RB.wipeMs || 0),
                   tlbSameByContent: (function () { try { return G.Module._neil_state_tlb_same_by_content ? G.Module._neil_state_tlb_same_by_content() : null; } catch (e) { return null; } })(),
+                  tlbRemapped: (function () { try { return G.Module._neil_state_tlb_remapped ? G.Module._neil_state_tlb_remapped() : null; } catch (e) { return null; } })(),
                   resimMsTotal: Math.round(RB.resimMs), resimMsPerRollback: RB.rollbacks ? +(RB.resimMs / RB.rollbacks).toFixed(2) : 0,
                   resimMsPerDepthFrame: RB.depthSum ? +(RB.resimMs / RB.depthSum).toFixed(2) : 0,
                   maxResimMs: +RB.maxResimMs.toFixed(1), saves: RB.saves, skippedSaves: RB.skippedSaves, evictions: RB.evictions, freed: RB.freed | 0,
