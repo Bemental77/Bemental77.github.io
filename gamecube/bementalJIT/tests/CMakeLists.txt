@@ -159,6 +159,33 @@ if(BEMENTAL_GUEST_POWERPC)
         target_compile_options(test_gekko_next PRIVATE "-pthread")
     endif()
 
+    # [exact-fma 2026-10-04] Randomized + constructed-tie differential of the
+    # single-precision fma family (fmadds/fmsubs/fnmadds/fnmsubs, ps_madd,
+    # ps_nmsub, ps_madds0/1) against a std::fma transcription of
+    # NI_madd_msub<single>. Runs under plain node: `node test_fma_exact.js`.
+    if(BEMENTAL_GUEST_POWERPC_NEXT)
+        add_executable(test_fma_exact test_fma_exact.cpp)
+        target_link_libraries(test_fma_exact PRIVATE
+            bementalJIT bementalJITPowerPCNext bementalJITPowerPC)
+        target_include_directories(test_fma_exact PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+        set_target_properties(test_fma_exact PROPERTIES SUFFIX ".html")
+        target_link_options(test_fma_exact PRIVATE
+            "SHELL:-s EXIT_RUNTIME=1"
+            "SHELL:-s EXPORTED_RUNTIME_METHODS=['HEAPU8','HEAP8','HEAP16','HEAPU16','HEAP32','HEAPU32','HEAPF32','HEAPF64']"
+            "SHELL:-pthread"
+            "SHELL:-s PTHREAD_POOL_SIZE=0"
+            "SHELL:-s INITIAL_MEMORY=67108864"
+            "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+            "SHELL:-s MAXIMUM_MEMORY=67108864"
+            "SHELL:-s ALLOW_TABLE_GROWTH=1"
+            "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
+        )
+        target_compile_options(test_fma_exact PRIVATE "-pthread")
+    endif()
+
     # [simd-bswap 2026-08-29] Bit-exactness gate for the SIMD byte-swap on the
     # adjacent-word-pair memory ops (psq_l/psq_st FLOAT pair, lfd, stfd). Uses a
     # real host buffer as mem1_base so the FASTMEM arms — the only arms the

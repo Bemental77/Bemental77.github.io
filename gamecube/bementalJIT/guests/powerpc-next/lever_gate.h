@@ -1,0 +1,47 @@
+// lever_gate.h — emit-time kill switches for the 2026-10-04 exact op-count levers.
+//
+// Every lever behind this gate is ON by default and is claimed BIT-EXACT against
+// the emitted code it replaces (each lever's comment names its proof). The kill
+// cell exists so ONE binary hosts both arms of a runtime matched pair: write the
+// lever's bit into the cell BEFORE the blocks compile (the read is at EMIT time,
+// like BEM_MIPS_FLAG_CELL / BEM_GPUIDLE_MODE_CELL) and those blocks are emitted
+// exactly as before the lever landed.
+//
+//   BEM_LEVER_KILL_CELL  W  0 (browser-zeroed) = every lever ON; bit set = that
+//                           lever OFF. 0x026B3EE0 matched no 0x026B3xxx literal
+//                           (hex, decimal 40582880 or >>2 index 0x9ACFB8) anywhere
+//                           in the tree when it was taken (grep, 2026-10-04); the
+//                           neighbours are the chain selector 0x026B3ED4 and the
+//                           pre-load-drop census 0x026B3ED8.
+//
+// With g_bem_lc_base == 0 (unit tests, small heaps) the cell is not read and every
+// lever is ON — the tests exercise the shipping arm.
+#pragma once
+
+#include "bementalJIT/types.h"
+
+namespace bemental::powerpc {
+
+constexpr u32 BEM_LEVER_KILL_CELL = 0x026B3EE0u;
+
+// Single-precision fused multiply-add fast arm (emit_single_fma_lane): exact
+// tie-corrected arm for f32-valued a/c, and the scalar op59 family routed to it.
+constexpr u32 BEM_LEVER_FMA_SINGLE = 1u << 0;
+// (bit 1 reserved: a double-precision fma fast arm for f32-valued a/c was
+// built and DROPPED 2026-10-04 — SAB's op63 fma sites are Newton-Raphson
+// refinements on full-precision doubles, so the guard never passed and only
+// added ops: fnmsub 369 -> 392 executed ops/occurrence in block_replay.)
+// ps_muls0/ps_muls1 f64x2 arm when both inputs are Single-resident.
+constexpr u32 BEM_LEVER_PS_MULS_SIMD = 1u << 2;
+// lfd/lfdu/stfs/stfsu/stfsx without the mid-block frc.Flush (the flush-narrow
+// already applied to lfs/psq_l/psq_st and the integer paths).
+constexpr u32 BEM_LEVER_FPMEM_NOFLUSH = 1u << 3;
+// stfs/stfsu/stfsx of a Single-resident FPR stores its f32 lane bits directly.
+constexpr u32 BEM_LEVER_STFS_SINGLE = 1u << 4;
+// emit_psq_convert_to_double (the NaN-exact f32->f64 widen) as a typed `if`
+// instead of a `select`, so the Inf/NaN splice arm only runs when taken.
+constexpr u32 BEM_LEVER_WIDEN_BRANCH = 1u << 5;
+
+bool bem_lever_on(u32 bit);
+
+}  // namespace bemental::powerpc

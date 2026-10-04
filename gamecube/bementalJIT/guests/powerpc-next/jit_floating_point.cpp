@@ -427,6 +427,23 @@ void emit_fp_fma_single(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, c
     auto fc_pair = frc.Bind(fc, FPRMode::Read,  FPR_LANE_PS0);
     auto fd_pair = frc.Bind(fd, FPRMode::Write, FPR_LANE_BOTH);
 
+    // [exact-fma lever 2026-10-04] Route through emit_single_fma_lane, the
+    // per-lane body the paired family already uses: its slow arm is THIS
+    // function's sequence verbatim (emit_fma_stage force25 -> emit_fma_core
+    // single -> emit_nan_fixup_fma -> emit_force_single_i64 -> nan-safe negate)
+    // and its fast arm is exact by construction (see the lever comment there).
+    // The lane reads a/b/c before it writes d in BOTH arms, so fd==fa/fb/fc
+    // aliasing is safe; the Fill into ps1 matches the tail below.
+    // fmadds measured 366-487 executed wasm ops per occurrence on SAB City
+    // Escape (block_replay count mode) through the full pipeline.
+    if (bem_lever_on(BEM_LEVER_FMA_SINGLE)) {
+        emit_single_fma_lane(wb, fa_pair.ps0_idx, fc_pair.ps0_idx, fb_pair.ps0_idx,
+                             fd_pair.ps0_idx, subtract, negate, ctx_ptr);
+        wb.op_local_get(fd_pair.ps0_idx);
+        wb.op_local_set(fd_pair.ps1_idx);
+        return;
+    }
+
     // Stage a, Force25Bit(c) (for the multiply), original c (for the NaN
     // ladder), b. single=true adds the NI_madd_msub tie-correction.
     emit_fma_stage(wb, fa_pair.ps0_idx, fc_pair.ps0_idx, fb_pair.ps0_idx,

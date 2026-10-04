@@ -34,7 +34,7 @@
 //
 // Usage: node block_replay.js <state_dir> <mode> <max_slices> [--slice N]
 //        [--cell 0xADDR=0xVAL]... [--trace-out FILE] [--stop-park]
-//        [--json FILE]
+//        [--json FILE] [--top-pcs N] [--dump-dir DIR]
 
 #include "guests/powerpc-next/ppc_emit.h"
 #include "guests/powerpc-next/ppc_analyst.h"
@@ -45,6 +45,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <map>
 #include <string>
 #include <vector>
@@ -72,6 +73,11 @@ static u8* g_ctx = nullptr;
 alignas(64) static u8 g_gp_buf[1024];
 alignas(8) static uint64_t g_cnt[16 + 512];
 static int g_counting = 0;
+// per-guest-PC executed ops: [2*id] ops, [2*id+1] occurrences (id assigned in JS)
+static constexpr int kPcCap = 131072;
+static uint64_t* g_pccnt = nullptr;
+static int g_top_pcs = 0;
+static const char* g_dump_dir = nullptr;   // --dump-dir: <pc>.wasm + <pc>.marks per compile
 
 // marks from the emitter (g_bem_emit_mark_cb), flat [tag, off, ...]
 static std::vector<int32_t> g_marks;
@@ -138,6 +144,23 @@ static bool compile_at(u32 start_pc) {
     std::vector<u8> bytes = build_block_next(start_pc, insts.data(), (u32)insts.size(), ctx_ptr,
                                              mem1_base, kRamMask, kRamSize, &cycles);
     if (bytes.empty()) { ++g_compile_fail; return false; }
+    if (g_dump_dir) {
+        // Same shape as op_census's output so its readers apply. The UNinstrumented
+        // bytes: what the live build would emit for this block in this state.
+        char path[512];
+        std::snprintf(path, sizeof path, "%s/%08x.wasm", g_dump_dir, start_pc);
+        if (std::FILE* f = std::fopen(path, "wb")) { std::fwrite(bytes.data(), 1, bytes.size(), f); std::fclose(f); }
+        std::snprintf(path, sizeof path, "%s/%08x.marks", g_dump_dir, start_pc);
+        if (std::FILE* f = std::fopen(path, "w")) {
+            std::fprintf(f, "# block pc=%08x n_insts=%u cycles=%u module_bytes=%zu\n", start_pc,
+                         (u32)insts.size(), cycles, bytes.size());
+            for (u32 i = 0; i < insts.size(); ++i)
+                std::fprintf(f, "inst %08x %08x\n", start_pc + 4u * i, insts[i]);
+            for (std::size_t i = 0; i + 2 < g_marks.size(); i += 3)
+                std::fprintf(f, "mark %d %08x %d\n", g_marks[i], (u32)g_marks[i + 2], g_marks[i + 1]);
+            std::fclose(f);
+        }
+    }
     const u8* use = bytes.data();
     std::size_t n = bytes.size();
     if (g_counting) {
@@ -187,6 +210,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--trace-out") && i + 1 < argc) trace_out = argv[++i];
         else if (!std::strcmp(argv[i], "--json") && i + 1 < argc) json_out = argv[++i];
         else if (!std::strcmp(argv[i], "--stop-park")) stop_park = true;
+        else if (!std::strcmp(argv[i], "--top-pcs") && i + 1 < argc) g_top_pcs = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--dump-dir") && i + 1 < argc) g_dump_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--cell") && i + 1 < argc) {
             const char* s = argv[++i];
             const char* eq = std::strchr(s, '=');
@@ -231,6 +256,11 @@ int main(int argc, char** argv) {
     set_ctx32(0x10, (u32)(uintptr_t)g_gp_buf);
     set_ctx32(ppc_off::EXCEPTIONS, 0u);
     install_imports();
+    if (g_counting && g_top_pcs > 0) {
+        g_pccnt = (uint64_t*)aligned_alloc(64, sizeof(uint64_t) * 2 * kPcCap);
+        std::memset(g_pccnt, 0, sizeof(uint64_t) * 2 * kPcCap);
+        EM_ASM({ Module.bemReplaySetPcTable($0 >>> 0, $1); }, g_pccnt, kPcCap);
+    }
 
     BlockCache cache;
     g_cache = &cache;
@@ -336,6 +366,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "\n");
     }
     if (g_counting) EM_ASM({ Module.bemReplayPrintClasses($0, $1); }, g_cnt, 48);
+    if (g_pccnt) EM_ASM({ Module.bemReplayPrintPcs($0, $1 >>> 0); }, g_top_pcs, g_mem1);
     EM_ASM({
         const st = Module.__replay;
         console.error('[replay] host-interp fallbacks served: ' + JSON.stringify(st.fallbackOps));

@@ -172,6 +172,31 @@
     }
     return i;
   }
+  const PCT = { base: 0, cap: 0, ids: new Map(), pcs: [] };
+  Module.bemReplaySetPcTable = function (base, cap) { PCT.base = base >>> 0; PCT.cap = cap; };
+  // Top-N guest PCs by executed ops: pc, mnemonic, occurrences, ops, ops/occ.
+  Module.bemReplayPrintPcs = function (topn, mem1) {
+    const b32 = PCT.base >> 2;
+    const U = (i) => HEAPU32[b32 + 2 * i] + 4294967296 * HEAPU32[b32 + 2 * i + 1];
+    const rows = [];
+    let tot = 0;
+    for (let id = 0; id < PCT.pcs.length; id++) {
+      const ops = U(2 * id), occ = U(2 * id + 1);
+      tot += ops;
+      rows.push([PCT.pcs[id], occ, ops]);
+    }
+    rows.sort((a, b) => b[2] - a[2]);
+    let out = '[replay] top guest PCs by executed ops (op spans only; ' + PCT.pcs.length + ' pcs, ' + tot + ' ops)\n';
+    out += '  pc        word      mnem          occ        ops   ops%  ops/occ\n';
+    for (const [pc, occ, ops] of rows.slice(0, topn)) {
+      const a = mem1 + (pc & 0x01FFFFFF);
+      const w = ((HEAPU8[a] << 24) | (HEAPU8[a + 1] << 16) | (HEAPU8[a + 2] << 8) | HEAPU8[a + 3]) >>> 0;
+      out += '  ' + pc.toString(16).padStart(8, '0') + '  ' + w.toString(16).padStart(8, '0') + '  ' +
+             mnem(w).padEnd(10) + String(occ).padStart(9) + String(ops).padStart(11) +
+             (100 * ops / tot).toFixed(2).padStart(7) + (occ ? (ops / occ).toFixed(1) : '-').padStart(9) + '\n';
+    }
+    console.error(out);
+  };
   Module.bemReplayClasses = () => classNames.slice();
   Module.bemReplayPrintClasses = function (cellPtr, topn) {
     const b32 = cellPtr >> 2;
@@ -214,12 +239,14 @@
     // emission order by binary search over a sorted copy).
     const mk = [];
     const opClassAt = new Map();      // off -> class index (OP marks)
+    const opPcAt = new Map();         // off -> guest pc (OP marks)
     for (let i = 0; i < marks.length; i += 3) {
       mk.push([marks[i + 1], marks[i]]);
       if (marks[i] === 2 && memBase) {
         const a = memBase + ((marks[i + 2] >>> 0) & 0x01FFFFFF);
         const w = ((HEAPU8[a] << 24) | (HEAPU8[a + 1] << 16) | (HEAPU8[a + 2] << 8) | HEAPU8[a + 3]) >>> 0;
         opClassAt.set(marks[i + 1], classOf(mnem(w)));
+        opPcAt.set(marks[i + 1], marks[i + 2] >>> 0);
       }
     }
     mk.sort((a, b) => a[0] - b[0] || 0);
@@ -233,6 +260,17 @@
       if (r < 0) return 4;
       const t = mk[r][1];
       return t === 0 ? 0 : t === 1 ? 1 : t === 2 ? 2 : t === 3 ? 3 : t === 5 ? 15 : 4;
+    }
+    // [per-PC 2026-10-04] guest PC of the latest mark <= off when that mark is
+    // an OP mark (else -1). Each distinct PC gets a stable id; the segment's
+    // op count goes to pcCells[2*id] and one occurrence to pcCells[2*id+1] at
+    // the op's head. Recompiles of the same PC share the id.
+    function opPcFor(off) {
+      let lo = 0, hi = mk.length - 1, r = -1;
+      while (lo <= hi) { const m = (lo + hi) >> 1; if (mk[m][0] <= off) { r = m; lo = m + 1; } else hi = m - 1; }
+      if (r < 0 || mk[r][1] !== 2) return -1;
+      const pc = opPcAt.get(mk[r][0]);
+      return pc === undefined ? -1 : pc;
     }
     function opClassFor(off) {         // class of the latest OP mark <= off, if the
       let lo = 0, hi = mk.length - 1, r = -1;   // latest mark IS an OP mark
@@ -278,6 +316,15 @@
         if (from === 0 && f === 0) c[13] = 1;   // function entry = one block entry
         void ph;
         for (let k = 0; k < NCNT; k++) if (c[k]) emitAdd(out, cellBase, k, c[k]);
+        const opc = PCT.base ? opPcFor(head) : -1;
+        if (opc >= 0) {
+          let id = PCT.ids.get(opc);
+          if (id === undefined && PCT.pcs.length < PCT.cap) { id = PCT.pcs.length; PCT.pcs.push(opc); PCT.ids.set(opc, id); }
+          if (id !== undefined) {
+            emitAdd(out, PCT.base, 2 * id, to - from);
+            if (c[12]) emitAdd(out, PCT.base, 2 * id + 1, 1);
+          }
+        }
         if (oc >= 0) {
           emitAdd(out, cellBase, 16 + oc, to - from);
           if (c[12]) emitAdd(out, cellBase, 272 + oc, 1);

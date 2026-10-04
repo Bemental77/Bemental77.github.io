@@ -14,6 +14,7 @@
 // to this. For now, callable for test_analyst-style harnesses.
 
 #include "ppc_emit.h"
+#include "lever_gate.h"
 
 #include <cstdio>   // std::snprintf (export-name gen) — transitive under emscripten, explicit for native AOT builds
 #include "bementalJIT/types.h"
@@ -142,6 +143,13 @@ bool bem_mips_census_on() {
     return g_bem_lc_base != 0u &&
            *reinterpret_cast<volatile uint32_t*>(
                static_cast<uintptr_t>(BEM_MIPS_FLAG_CELL)) != 0u;
+}
+
+// [exact levers 2026-10-04] see lever_gate.h. Kill semantics: 0 = ON.
+bool bem_lever_on(u32 bit) {
+    if (g_bem_lc_base == 0u) return true;
+    return (*reinterpret_cast<volatile uint32_t*>(
+                static_cast<uintptr_t>(BEM_LEVER_KILL_CELL)) & bit) == 0u;
 }
 
 // [promote/fusion ARM 2026-09-04 — gamecube/docs/wasm-tier] WHY THIS EXISTS.

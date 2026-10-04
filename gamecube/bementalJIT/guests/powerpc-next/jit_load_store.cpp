@@ -33,6 +33,7 @@
 #include "ppc_analyst.h"
 #include "ppc_offsets.h"
 #include "reg_cache.h"
+#include "lever_gate.h"
 
 // [psq-gqr-spec PM48] "big SAB present" gate + emit-time live-GQR read.
 // Defined in block_cache.cpp; same pattern as jit_paired.cpp / fpr_reg_cache.cpp.
@@ -1381,6 +1382,39 @@ void emit_convert_to_single(WasmModuleBuilder& wb, u32 ps0_local) {
     wb.op_select();  // cond ? denorm : fast
 }
 
+// [stfs levers 2026-10-04] The f32 value an stfs-family store writes, parked in
+// LOCAL_TMP_FPVAL, plus the flushes that precede it. Lever-off reproduces the
+// pre-lever sequence byte for byte (Bind -> rc.Flush -> frc.Flush -> convert).
+//  * BEM_LEVER_STFS_SINGLE: a Single-resident rs holds the f32 bits x in v128
+//    lane 0, and the Double path would store ConvertToSingle(ConvertToDouble(x))
+//    (EmitPromoteToDouble's widen is the PEM ConvertToDouble; emit_convert_to_single
+//    is Dolphin's ConvertToSingle). That round trip is the identity on ALL 2^32
+//    inputs — checked exhaustively 2026-10-04 against the two functions
+//    transcribed from Interpreter_FPUtils.h:541-610 (0 mismatches) — so the lane
+//    bits ARE the stored value, and rs stays Single (no promote, no widen).
+//  * BEM_LEVER_FPMEM_NOFLUSH: drop the mid-block frc.Flush — the flush-narrow
+//    already taken for lfs/psq_l/psq_st and the integer paths (see
+//    emit_load_common): the slow arm's host WRITE handler reads gpr[] (hence
+//    rc.Flush stays) but never ps[], no DSI is raised in the MMU-off config
+//    (PM55), and every exception/HLE/fallback/exit point flushes FPRs itself.
+static void emit_stfs_value(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
+                            LoadStoreParams params, u32 rs) {
+    const bool noflush = bem_lever_on(BEM_LEVER_FPMEM_NOFLUSH);
+    if (noflush && bem_lever_on(BEM_LEVER_STFS_SINGLE) && frc.IsSingle(rs)) {
+        auto v = frc.BindSingleRead(rs);
+        rc.Flush(params.ctx_ptr);   // host WRITE32 (slow arm) may read gpr[]
+        wb.op_local_get(v.v128_idx);
+        wb.op_i32x4_extract_lane(0);
+        wb.op_local_set(LOCAL_TMP_FPVAL);
+        return;
+    }
+    auto rs_pair = frc.Bind(rs, FPRMode::Read, FPR_LANE_PS0);
+    rc.Flush(params.ctx_ptr);   // host WRITE32 (slow arm) may read gpr[]
+    if (!noflush) frc.Flush(params.ctx_ptr);
+    emit_convert_to_single(wb, rs_pair.ps0_idx);   // single bits -> stack
+    wb.op_local_set(LOCAL_TMP_FPVAL);
+}
+
 // stfsx fS, rA, rB — store f32 from ps0(rs) at EA, PEM ConvertToSingle
 // semantics (2026-06-11: native emit replaces the interp-fallback stub;
 // the conversion lives in emit_convert_to_single above).
@@ -1394,8 +1428,6 @@ void emit_stfsx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     emit_ea_x_stack(wb, rc, ra, rb);
     wb.op_local_set(LOCAL_TMP_EA);
 
-    auto rs_pair = frc.Bind(rs, FPRMode::Read, FPR_LANE_PS0);
-
     // [perf] fastmem fast-arm (was unconditional WIMPORT_WRITE32 — every
     // RAM-resident f32 store crossed wasm->JS). WPAR (0xCC008000) and all MMIO
     // are rejected by the region classifier so GP/MMIO writes still take the
@@ -1407,11 +1439,8 @@ void emit_stfsx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     // scale_x=1.0 -> temp.m00=0 -> group matrices collapse -> the MP4 black
     // canvas. Post-flush the ps0 local is still valid (a Single-repr rs was
     // just PROMOTED, which rebuilds the pair locals), so converting here reads
-    // the identical value.
-    rc.Flush(params.ctx_ptr);   // host WRITE32 (slow arm) may read gpr[]
-    frc.Flush(params.ctx_ptr);
-    emit_convert_to_single(wb, rs_pair.ps0_idx);   // single bits -> stack
-    wb.op_local_set(LOCAL_TMP_FPVAL);
+    // the identical value. (emit_stfs_value keeps that order.)
+    emit_stfs_value(wb, rc, frc, params, rs);
 
     emit_fastmem_guard(wb, params, 4);
     wb.op_if(BLOCK_TYPE_VOID);
@@ -1435,18 +1464,13 @@ void emit_stfs(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
 
     emit_ea_d_form(wb, rc, ra, simm);  // EA -> LOCAL_TMP_EA
 
-    auto rs_pair = frc.Bind(rs, FPRMode::Read, FPR_LANE_PS0);
-
     // [perf] fastmem fast-arm — see emit_stfsx. stfs is the highest-frequency
     // FP store the guest makes; this removes the per-store wasm->JS crossing
     // for RAM-resident f32s (matrix/vertex data), MMIO still slow-pathed.
     // [m00-hunt FIX PM37 2026-07-23] flushes FIRST — see emit_stfsx: parking
     // across frc.Flush let its value-unknown check (slot 98 == LOCAL_TMP_FPVAL)
     // destroy the store value. THE MP4 black-canvas root fix.
-    rc.Flush(params.ctx_ptr);   // host WRITE32 (slow arm) may read gpr[]
-    frc.Flush(params.ctx_ptr);
-    emit_convert_to_single(wb, rs_pair.ps0_idx);   // single bits -> stack
-    wb.op_local_set(LOCAL_TMP_FPVAL);
+    emit_stfs_value(wb, rc, frc, params, rs);
 
     emit_fastmem_guard(wb, params, 4);
     wb.op_if(BLOCK_TYPE_VOID);
@@ -1483,7 +1507,11 @@ void emit_lfd(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     emit_ea_d_form(wb, rc, ra, simm);  // EA -> LOCAL_TMP_EA
 
     rc.Flush(params.ctx_ptr);
-    frc.Flush(params.ctx_ptr);
+    // [BEM_LEVER_FPMEM_NOFLUSH 2026-10-04] flush-narrow (emit_stfs_value note):
+    // the host READ handler never reads ps[]. Measured on SAB's 0x800ed368
+    // matrix epilogue: lfd f14 cost 228 executed ops with a few Single FPRs live
+    // and 1316 once ps_muls kept the chain Single — the flush promoted them all.
+    if (!bem_lever_on(BEM_LEVER_FPMEM_NOFLUSH)) frc.Flush(params.ctx_ptr);
 
     // Bind rt for Write — only ps0 lane (lfd does NOT splat to ps1; ps1 is
     // preserved per scalar-FP semantics, unlike lfsx/lfs which DO splat).
@@ -1591,6 +1619,48 @@ static void emit_psq_l_float_pair_simd(WasmModuleBuilder& wb, LoadStoreParams pa
 // Non-static: also used by jit_floating_point.cpp (op59 singles / frsp)
 // to widen the ForceSingle result back to the f64 register format.
 void emit_psq_convert_to_double(WasmModuleBuilder& wb) {
+    // [BEM_LEVER_WIDEN_BRANCH 2026-10-04] Same two values, same predicate, but
+    // chosen by a typed `if` instead of a `select`, so only the taken arm runs:
+    // the 16-op splice is needed only for exp == 255 (Inf/NaN), the 4-op promote
+    // for everything else. `select(a, b, c)` == `if (c) a else b` when neither
+    // arm has side effects (both are pure local/const arithmetic), so this is
+    // the identical function of LOCAL_PSQ_T0. This widen runs at the end of every
+    // scalar single op (emit_force_single_i64), on every lfs/psq_l, and twice per
+    // Single-FPR promote/flush — 25 executed ops each before, 10 after.
+    if (bem_lever_on(BEM_LEVER_WIDEN_BRANCH)) {
+        wb.op_local_get(LOCAL_PSQ_T0);
+        wb.op_i32_const(0x7F800000);
+        wb.op_i32_and();
+        wb.op_i32_const(0x7F800000);
+        wb.op_i32_eq();                       // exp == 255
+        wb.op_if(WASM_TYPE_I64);
+        {
+            wb.op_local_get(LOCAL_PSQ_T0);
+            wb.op_i64_extend_i32_u();
+            wb.op_i64_const((s64)0xC0000000ll);
+            wb.op_i64_and();
+            wb.op_i64_const(32);
+            wb.op_i64_shl();
+            wb.op_i64_const(0x3800000000000000ll);  // 0x7 << 59
+            wb.op_i64_or();
+            wb.op_local_get(LOCAL_PSQ_T0);
+            wb.op_i64_extend_i32_u();
+            wb.op_i64_const(0x3FFFFFFFll);
+            wb.op_i64_and();
+            wb.op_i64_const(29);
+            wb.op_i64_shl();
+            wb.op_i64_or();
+        }
+        wb.op_else();
+        {
+            wb.op_local_get(LOCAL_PSQ_T0);
+            wb.op_f32_reinterpret_i32();
+            wb.op_f64_promote_f32();
+            wb.op_i64_reinterpret_f64();
+        }
+        wb.op_end();
+        return;
+    }
     // splice value (exp==255 arm)
     wb.op_local_get(LOCAL_PSQ_T0);
     wb.op_i64_extend_i32_u();
