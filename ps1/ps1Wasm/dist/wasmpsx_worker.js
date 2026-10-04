@@ -583,7 +583,7 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
   // byte-identical to the shadow. Bytes above sbrk (free memory) behave as
   // they did with full slots: a heap that grows extends the shadow from live.
   var PAGE = 4096, PAGE_W = 1024;
-  var UR = { sh: null, sh32: null, top: 0, cap: 0, list: 0, mem: null, simd: null, frame: -1, fs: [], logs: new Map(), pool: [], poolCap: 1024,
+  var UR = { stepCmpMs: 0, stepPages: 0, sh: null, sh32: null, top: 0, cap: 0, list: 0, mem: null, simd: null, frame: -1, fs: [], logs: new Map(), pool: [], poolCap: 1024,
              saves: 0, pages: 0, maxPages: 0, logPages: 0, cmpMs: 0, oldest: -1, maxLogPages: 0, check: /[?&]urcheck=1/.test(q), checkFails: 0, how: 'js' };
   // THE COMPARE IS THE COST. Reading 6.86 MB twice per frame in JS is ~1.7 ms
   // (node, Int32Array, early exit per page) — against 0.5 ms for the old
@@ -697,6 +697,7 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
       pages = Array.prototype.slice.call(new Int32Array(UR.mem.buffer, UR.list, n));
       if (UR.check) { var jp = urDiffJs(new Int32Array(heap.buffer), lim >> 2, []); if (jp.join() !== pages.join()) UR.checkFails++; }
     } else pages = urDiffJs(new Int32Array(heap.buffer), lim >> 2, []);
+    UR.stepCmpMs += performance.now() - t0; UR.stepPages += pages.length;
     var sh = UR.sh, bufs = [];
     for (var k = 0; k < pages.length; k++) {
       var p = pages[k], o = p << 12, b = UR.pool.pop() || new Uint8Array(PAGE);
@@ -879,7 +880,8 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
       // The live state after the last frame IS the saved start of the next, so
       // no load happens unless there is something to re-simulate.
       case 'netRbStep': {
-        var t0 = performance.now(), err = null, resimRan = 0, hashes = [], sv0 = RB.saveMs;
+        var t0 = performance.now(), err = null, resimRan = 0, hashes = [], sv0 = RB.saveMs, ld = 0, rr = 0, tp = 0, th = 0;
+        var hb0 = Module.HEAPU8.length, top0 = UR.top, cap0 = UR.cap; UR.stepCmpMs = 0; UR.stepPages = 0;
         try {
           if (data.ring) rbGrow(data.ring | 0);
           if (typeof data.keepFrom === 'number') {
@@ -893,7 +895,7 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
             if (!urCanReach(rs[0].frame | 0)) throw new Error('no savestate for frame ' + rs[0].frame + ' (ring ' + RB.n + ')');
             var tl = performance.now();
             urRestore(rs[0].frame | 0);
-            tl = performance.now() - tl;
+            tl = performance.now() - tl; ld = tl;
             RB.loadMs += tl; if (tl > RB.maxLoadMs) RB.maxLoadMs = tl;
             QUIET = true; QUIET_AUDIO = true;
             try {
@@ -901,7 +903,8 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
                 latchPads(rs[ri].states);
                 var tr = performance.now();
                 runFrame(); creditAudio();
-                RB.runMs += performance.now() - tr;
+                tr = performance.now() - tr; rr += tr;
+                RB.runMs += tr;
                 rbSaveFrame((rs[ri].frame | 0) + 1);
                 resimRan++;
               }
@@ -920,18 +923,18 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
           // of wall clock (ps1.html rbTimelineTick). Re-simulated frames above
           // are repeats, so they always stay quiet.
           QUIET = !!data.hidden; QUIET_AUDIO = !!data.quietAudio;
-          var tp = performance.now();
+          tp = performance.now();
           try { runFrame(); creditAudio(); } finally { QUIET = false; QUIET_AUDIO = false; }
           tp = performance.now() - tp;
           RB.runMs += tp; if (tp > RB.maxRunMs) RB.maxRunMs = tp;
           rbSaveFrame((data.frame | 0) + 1);
           RB.live = (data.frame | 0) + 1;
           RB.steps++;
-          var hk = data.hash || [], th = performance.now();
+          var hk = data.hash || []; th = performance.now();
           for (var hi = 0; hi < hk.length; hi++) {
             hashes.push({ frame: hk[hi] | 0, hash: urHashAt((hk[hi] | 0) + 1) });
           }
-          if (hk.length) { th = performance.now() - th; if (th > RB.maxHashMs) RB.maxHashMs = th; }
+          if (hk.length) { th = performance.now() - th; if (th > RB.maxHashMs) RB.maxHashMs = th; } else th = 0;
         } catch (e) { err = String((e && e.message) || e); QUIET = false; QUIET_AUDIO = false; }
         slowBurn(t0);
         var ms = performance.now() - t0;
@@ -940,7 +943,18 @@ var Module=typeof Module!="undefined"?Module:{};var ENVIRONMENT_IS_WEB=!!globalT
         // `sv`: this step's savestate cost per frame — the part of a rollback
         // step a delay frame does not pay (ps1.html adds it back to a delay
         // frame's run to estimate the rollback step it would cost).
+        // `part`: where THIS step's wall time went — run (the presented frame's
+        // _one_iter), resimRun / load (re-simulation and the undo restore),
+        // save (every undo commit in the step; cmp = its dirty-page compare,
+        // pages = pages logged), hash, and grew (heap / shadow / pool growth,
+        // '' when none). So a burst in a room names its own cause. First use
+        // (2026-10-04, MR2 loopback room, headless SwiftShader, 4 vCPU): of
+        // 36-105 frames over 16.7 ms per run, 0-1 had a re-simulation and
+        // 34-102 were `run`-dominated with ordinary saves and grew '' — the
+        // core's own frame stretched 1.5-3x by CPU contention, not ring work.
         postMessage({ cmd: 'netFrame', frame: data.frame, ran: err ? 0 : 1, resim: resimRan, ms: ms, sv: (RB.saveMs - sv0) / (resimRan + 1), hashes: hashes, err: err, bytes: RB.lastBytes,
+          part: { run: tp, resimRun: rr, load: ld, save: RB.saveMs - sv0, cmp: UR.stepCmpMs, pages: UR.stepPages, hash: th,
+                  grew: (Module.HEAPU8.length !== hb0 ? 'heap ' : '') + (UR.top !== top0 ? 'shadow ' : '') + (UR.cap !== cap0 ? 'cap' : '') },
           logBytes: UR.logPages * PAGE, held: UR.oldest >= 0 ? UR.frame - UR.oldest : 0 });
         break;
       }

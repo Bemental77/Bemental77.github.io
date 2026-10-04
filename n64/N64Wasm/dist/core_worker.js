@@ -132,6 +132,31 @@ function setupJit(mode) {
   };
   M._neil_set_jit_bridge(1);
   log('[jit] bridge enabled (emit) — in the core worker');
+  // ?jitcapture=1: record every offer from the first (n64/tools/n64_jit_corpus.mjs makes a corpus of them)
+  if (new URLSearchParams((BOOT && BOOT.search) || '').get('jitcapture') === '1' && self.bementalMips && self.bementalMips.warm) self.bementalMips.warm.capture = [];
+  jitCorpusLoad();
+}
+// THE SHIPPED SPAN CORPUS (mips_emit.js A SHIPPED SPAN CORPUS): dist/jit/<internal name>.json.gz,
+// when the title has one, decoded here and handed to the emitter, which uses it only if it was
+// made with this session's param block, flags and table base. ?jitcorpus=0 = none (the A/B arm).
+function jitCorpusLoad() {
+  var d = BOOT || {}, name = (self.__fbAsync && self.__fbAsync.romName) || '';
+  if (!name || new URLSearchParams(d.search || '').get('jitcorpus') === '0' || typeof DecompressionStream !== 'function') return;
+  var u32 = function (b64) {
+    var bin = atob(b64), u8 = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return new Uint32Array(u8.buffer);
+  };
+  fetch('jit/' + encodeURIComponent(name.replace(/[^A-Za-z0-9 _-]/g, '_')) + '.json.gz?v=' + (d.v || ''))
+    .then(function (r) { return r.ok ? new Response(r.body.pipeThrough(new DecompressionStream('gzip'))).json() : null; })
+    .then(function (c) {
+      if (!c || c.v !== 1 || !self.bementalMips || !self.bementalMips.warmCorpus) return;
+      var C = { static: c.static, flags: c.flags, tableBase: c.tableBase, pages: [], jobs: [] };
+      c.pages.forEach(function (pg) { C.pages.push({ w0: pg[0], words: u32(pg[1]) }); });
+      c.jobs.forEach(function (j) { C.jobs.push({ vaddr: j[0], entryPtr: j[1], span: j[2], srcPtr: j[3], blockStart: j[4], blockEnd: j[5], pg: j[6], ops: u32(j[7]) }); });
+      self.bementalMips.warmCorpus(C);
+      log('[jit] span corpus: ' + C.jobs.length + ' spans, ' + C.pages.length + ' pages (' + name + ')');
+    }).catch(function (e) { log('[jit] span corpus not loaded: ' + ((e && e.message) || e)); });
 }
 
 // ---- audio: the core's resampled ring -> the AudioWorklet, directly ----------------------
@@ -213,7 +238,7 @@ function tickBody(src) {
     CLK.ticks++;
     var now = performance.now();
     if ((!SCHED.coupled || src === 'raf') && dueNow(now) && !gqReady()) {
-      // held: the GPU is GQ.max fields behind (THE GPU QUEUE GUARD); a timer turn retries
+      // held: the GPU is too far behind (THE GPU QUEUE GUARD); a timer turn retries
       if (!GQ.timer) { GQ.timer = true; setTimeout(function () { GQ.timer = false; tick('gq'); }, 1); }
       return;
     } else if ((!SCHED.coupled || src === 'raf') && dueNow(now) && !cbMayDraw(src)) {
@@ -267,15 +292,28 @@ function schedule() {
 // n64_field_cost_probe --finish): a fence set after a field signalled 3.4 s later on average,
 // i.e. what reached the screen was 3.4 s old (input lag), and the WebGL call that finally hit
 // the full command buffer took 0.3-2.5 s.
-// So a fence is set after every field, and a field does not START while more than GQ.max
-// fences are unsignalled: this thread yields (a 1 ms timer turn; the GPU and every other task
-// run meanwhile) instead of queueing more. On a GPU that keeps up the fences are signalled
-// when the next field is due and nothing ever waits. The guest is untouched — the frame clock
-// still decides WHEN a field is owed, and time lost to a slow GPU is lost (gate 9), exactly as
-// it was while the readback waited. A sync object only changes state between tasks, so the
-// status read here is free. After 250 ms of holding the field runs anyway (a lost context, a
-// driver that never signals). ?gpuq=0 is the A/B arm and kill switch; ?gpuq=N sets the depth.
-var GQ = { on: true, max: 2, fences: [], held: 0, heldMs: 0, holdFrom: 0, forced: 0, gl: null, timer: false };
+// So a fence is set after every field, and a field does not START while the GPU is too far
+// behind: this thread yields (a 1 ms timer turn; the GPU and every other task run meanwhile)
+// instead of queueing more. The guest is untouched — the frame clock still decides WHEN a field
+// is owed, and time lost to a slow GPU is lost (gate 9), exactly as it was while the readback
+// waited. A sync object only changes state between tasks, so the status read here is free.
+// After 250 ms of holding the field runs anyway (a lost context, a driver that never signals).
+//
+// THE BOUND IS A TIME, NOT A DEPTH (2026-10-04). It was "more than 2 fences outstanding". On
+// this box's SwiftShader that held the guest to 0.71x (MK64 race, worker threads at half a core:
+// held ~1150x, 31 s of a 55 s window) while with no guard at all the guest held 1.000x and the
+// queue did not grow without limit (it settled at ~20 fields): a GPU that keeps up, but only with
+// many frames in flight, was treated as one that does not. Measured per bound (fps of guest /
+// hardware, fence latency p50 / p99, two runs each): depth 2 0.71x 73/136 ms; 250 ms 0.89-0.92x
+// 187-217/343-355; 500 ms 0.96-0.97x 298-333/576-578; 1000 ms 1.00x 397-446/934-967; none 1.00x
+// 368-567/1040-1409. What must never happen is the queue growing WITHOUT LIMIT (a GPU slower than
+// the guest: seconds of lag, a WebGL call that blocks for seconds). So a field is held only when
+// the oldest unsignalled fence is older than GQ.capMs (1000): a GPU that keeps up within that is
+// never waited for, whatever its depth; one that falls behind is held at ~1 s of lag at most.
+// Below 3 outstanding nothing is ever held, and nothing is asked of GL while the oldest fence is
+// younger than capMs (the age is this thread's own clock). ?gpuqms=N sets the bound;
+// ?gpuq=N is the old fixed-depth guard (the A/B arm); ?gpuq=0 no guard (control arm).
+var GQ = { on: true, max: 2, capMs: 1000, fences: [], times: [], held: 0, heldMs: 0, holdFrom: 0, forced: 0, gl: null, timer: false, lastAge: 0 };
 function gqGl() {
   if (GQ.gl) return GQ.gl;
   var g = M && M.ctx;
@@ -287,24 +325,30 @@ function gqAfterField() {
   var gl = gqGl(); if (!gl) return;
   var f = null;
   try { f = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0); } catch (e) { f = null; }
-  if (f) GQ.fences.push(f);
-  if (GQ.fences.length > 64) { try { gl.deleteSync(GQ.fences.shift()); } catch (e) {} }
+  if (f) { GQ.fences.push(f); GQ.times.push(performance.now()); }
+  if (GQ.fences.length > 256) { try { gl.deleteSync(GQ.fences.shift()); } catch (e) {} GQ.times.shift(); }
+}
+// within the bound? (the fixed-depth arm: within GQ.max fences; the time bound: at most GQ.max
+// fences, or the oldest no older than GQ.capMs)
+function gqWithin(now) {
+  if (GQ.fences.length <= GQ.max) return true;
+  return GQ.capMs > 0 && now - GQ.times[0] <= GQ.capMs;
 }
 // may a field start now? false = hold it (the caller retries from a later task)
 function gqReady() {
-  // within the depth nothing is asked of GL: fences are retired only when there are too many
-  if (!GQ.on || GQ.fences.length <= GQ.max) {
-    if (GQ.holdFrom) { GQ.heldMs += performance.now() - GQ.holdFrom; GQ.holdFrom = 0; }
+  var now = performance.now();
+  // within the bound nothing is asked of GL: fences are retired only when the answer matters
+  if (!GQ.on || gqWithin(now)) {
+    if (GQ.holdFrom) { GQ.heldMs += now - GQ.holdFrom; GQ.holdFrom = 0; }
     return true;
   }
   var gl = gqGl(); if (!gl) return true;
   while (GQ.fences.length) {
     var st = gl.getSyncParameter(GQ.fences[0], gl.SYNC_STATUS);
     if (st !== gl.SIGNALED) break;
-    gl.deleteSync(GQ.fences.shift());
+    gl.deleteSync(GQ.fences.shift()); GQ.lastAge = now - GQ.times.shift();
   }
-  if (GQ.fences.length <= GQ.max) { if (GQ.holdFrom) { GQ.heldMs += performance.now() - GQ.holdFrom; GQ.holdFrom = 0; } return true; }
-  var now = performance.now();
+  if (gqWithin(now)) { if (GQ.holdFrom) { GQ.heldMs += now - GQ.holdFrom; GQ.holdFrom = 0; } return true; }
   if (!GQ.holdFrom) { GQ.holdFrom = now; GQ.held++; }
   if (now - GQ.holdFrom > 250) { GQ.forced++; GQ.heldMs += now - GQ.holdFrom; GQ.holdFrom = 0; return true; }
   return false;
@@ -633,7 +677,7 @@ function roomDueAt(R) {
 function roomFeedBody(src) {
   var R = RM.R; if (!R || !R.LS.armed || !R.lsDriveOk(src === 'raf' ? 'raf' : 'timer')) return;
   // THE COMMIT YIELD (above): a due frame yields once to an unpushed picture's commit.
-  // THE GPU QUEUE GUARD (above): a due frame waits while the GPU is GQ.max fields behind;
+  // THE GPU QUEUE GUARD (above): a due frame waits while the GPU is too far behind;
   // the 4 ms feed timer and rAF retry it
   if (R.LS.running && performance.now() >= roomDueAt(R) && !gqReady()) return;
   if (R.LS.running && performance.now() >= roomDueAt(R) && !cbMayDraw(src === 'raf' ? 'raf' : 'task')) return;
@@ -879,8 +923,10 @@ function boot(d) {
   BOOT.rigClock = new URLSearchParams(d.search || '').get('workerrig') === 'clock';
   (function () {
     var gq = new URLSearchParams(d.search || '').get('gpuq');
+    var gqms = new URLSearchParams(d.search || '').get('gpuqms');
     if (gq === '0') { GQ.on = false; log('[gpuq] CONTROL ARM (?gpuq=0): no GPU queue guard'); }
-    else if (gq && +gq > 0) GQ.max = Math.min(16, +gq | 0);
+    else if (gq && +gq > 0) { GQ.max = Math.min(16, +gq | 0); GQ.capMs = 0; log('[gpuq] fixed depth ' + GQ.max + ' (?gpuq)'); }
+    if (gqms !== null && +gqms >= 0) GQ.capMs = Math.min(2000, +gqms);
   })();
   CORE_V = d.v || '';
   CLK.viHz = d.viHz > 0 ? d.viHz : 0;
