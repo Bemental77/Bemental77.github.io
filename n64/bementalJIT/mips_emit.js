@@ -60,6 +60,23 @@
   // FNV-1a over a Uint32Array's first n words (the recompile key's bucket hash). Out of
   // compileSpan, which is too large to be optimized, so the loop runs as optimized code.
   function keyHash(a, n) { var h = 0x811c9dc5 | 0; for (var i = 0; i < n; i++) h = Math.imul(h ^ a[i], 16777619); return h; }
+  // THE OFFER PATH OUT OF compileSpan (2026-10-04). Before a span is offered to the compile worker,
+  // compileSpan scans its ops (null ops, JIT slots), builds the recompile key (the whole 4 KB page's
+  // words + the span's ops) and compares it against the cache bucket — on the CORE's thread, ~150
+  // times in one MK64 scene-change field (fields 1206/1242/1244: compileSpan's own frames, keyHash,
+  // asyncOffer were most of a 30-60 ms field in a CPU profile). compileSpan is too large to be
+  // optimized, so those per-word loops ran unoptimized. They are these small functions now, with the
+  // same reads in the same order and the same results; the page's words, contiguous in the heap, are
+  // one typed-array copy where HEAPU32 is the heap itself (in the compile worker it is a Proxy over
+  // the copied inputs, read word by word as before).
+  function opsZeroAt(U, base, stride, n) { for (var g = 0; g < n; g++) if (U[(base + g * stride) >> 2] === 0) return g; return -1; }
+  function opsAnyAtOrAbove(U, base, stride, n, tb) { for (var g = 0; g < n; g++) if (U[(base + g * stride) >> 2] >= tb) return true; return false; }
+  function keyFillWords(k, off, U, w0, n) {
+    if (U instanceof Uint32Array) { k.set(U.subarray(w0, w0 + n), off); return; }
+    for (var q = 0; q < n; q++) k[off + q] = U[w0 + q];
+  }
+  function keyFillOps(k, off, U, base, stride, n) { for (var q = 0; q < n; q++) k[off + q] = U[(base + q * stride) >> 2]; }
+  function keyEq(a, b, n) { if (a.length !== n) return false; for (var q = 0; q < n; q++) if (a[q] !== b[q]) return false; return true; }
   function packModule(parts) {
     var total = 0, i, k, c, n;
     for (i = 0; i < parts.length; i++) {
@@ -2211,16 +2228,14 @@
       stats.pageTruncated = (stats.pageTruncated || 0) + 1;
     }
     if (span <= 0) return 0;
-    var scanEnd = span + 1;
-    for (var g = 0; g < scanEnd; g++) {
-      if (HEAPU32[(p.entryPtr + g * p.stride) >> 2] === 0) {
-        stats.nullOpsRejects = (stats.nullOpsRejects || 0) + 1;
-        if (stats.nullOpsRejects === 1 && typeof console !== 'undefined') {
-          console.warn('[jit] span rejected: precomp_instr.ops == 0 at index ' + g +
-                       ' of ' + span + ' (vaddr 0x' + (p.vaddr >>> 0).toString(16) + ')');
-        }
-        return 0;
+    var g = opsZeroAt(HEAPU32, p.entryPtr, p.stride, span + 1);
+    if (g >= 0) {
+      stats.nullOpsRejects = (stats.nullOpsRejects || 0) + 1;
+      if (stats.nullOpsRejects === 1 && typeof console !== 'undefined') {
+        console.warn('[jit] span rejected: precomp_instr.ops == 0 at index ' + g +
+                     ' of ' + span + ' (vaddr 0x' + (p.vaddr >>> 0).toString(16) + ')');
       }
+      return 0;
     }
     // ---- NO COMPILED CODE UNDER A SPAN (2026-10-03) ----
     // Every fallback path bakes the op it finds in the span's precomp entries as the
@@ -2239,13 +2254,9 @@
     // 177 MK64 race spans outright (every jitOpReject measured was at index == span), among
     // them the game's hottest loops, which then ran on the cached interpreter for good.
     if (!TABLE_BASE) TABLE_BASE = EMIT_ONLY ? (EMIT_ONLY.tableBase | 0) : (Module.wasmTable ? Module.wasmTable.length : 0);
-    if (TABLE_BASE) {
-      for (var gj = 0; gj < span; gj++) {
-        if (HEAPU32[(p.entryPtr + gj * p.stride) >> 2] >= TABLE_BASE) {
-          stats.jitOpRejects = (stats.jitOpRejects || 0) + 1;
-          return 0;
-        }
-      }
+    if (TABLE_BASE && opsAnyAtOrAbove(HEAPU32, p.entryPtr, p.stride, span, TABLE_BASE)) {
+      stats.jitOpRejects = (stats.jitOpRejects || 0) + 1;
+      return 0;
     }
 
     // ---- MULTI-ENTRY SPANS (2026-09-30) ----
@@ -2322,16 +2333,15 @@
       for (kq = 0; kq < span; kq++) keyArr[6 + pageN + kq] = FP.ops[kq];
       FP.seen(pageN ? fw + pageN - 1 : -1, span - 1);
     } else {
-      for (kq = 0; kq < pageN; kq++) keyArr[6 + kq] = HEAPU32[pageW0 + kq];
-      for (kq = 0; kq < span; kq++) keyArr[6 + pageN + kq] = HEAPU32[(p.entryPtr + kq * p.stride) >> 2];
+      keyFillWords(keyArr, 6, HEAPU32, pageW0, pageN);
+      keyFillOps(keyArr, 6 + pageN, HEAPU32, p.entryPtr, p.stride, span);
     }
     kh = keyHash(keyArr, keyLen);
     var bucket = EMIT_ONLY ? null : spanCache.get(kh);
     if (bucket) {
       for (var bi = 0; bi < bucket.length; bi++) {
-        var ce = bucket[bi], same = ce.key.length === keyLen;
-        for (kq = 0; same && kq < keyLen; kq++) same = ce.key[kq] === keyArr[kq];
-        if (!same) continue;
+        var ce = bucket[bi];
+        if (!keyEq(ce.key, keyArr, keyLen)) continue;
         var hidx = installSlot(Module, p.vaddr >>> 0, ce.fns[0]);
         for (var hk = 1; hk < ce.labels.length; hk++) {
           var hptr = p.entryPtr + ce.labels[hk] * p.stride;

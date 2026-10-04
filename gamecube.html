@@ -26,7 +26,7 @@
        machine boots the disc and the room exchanges nothing but pad bytes
        (tools/no_streaming_test.mjs machine-checks that). netplay-ui.js is the
        shared lobby; it renders nothing at all when Netplay.supported() is false. -->
-  <script src="/lib/netplay.js?v=9d05e8a3"></script>
+  <script src="/lib/netplay.js?v=b3a53305"></script>
   <script src="/lib/netplay-ui.js?v=66f15769"></script>
   <script src="/lib/mpgames.js"></script>
   <script>
@@ -8139,12 +8139,17 @@ window.GcRate = (function () {
     var want = true;
     try { want = new URLSearchParams(location.search).get('rb') !== '0'; } catch (e) {}
     var o = { portCount: 4, padBytes: 64, hashEvery: 60, rollback: want ? GC_RB_WINDOW : 0,
-              rbCatchUp: true, rollbackOk: true, rbResume: true, frameHz: 60 };
+              rbCatchUp: true, rollbackOk: true, rbResume: true, frameHz: 60,
+              // the pad image's one-frame edges (gcLsLocalPads: btn lo/hi = HuPadBtnDown, dstk =
+              // HuPadDStkRep); bytes 4/5 are the HELD stick. A prediction never repeats an edge.
+              // ?rbedge=0 (a rig seam, the matched control): predict by repeating the last input whole
+              rbEdgeBytes: (function () { try { if (new URLSearchParams(location.search).get('rbedge') === '0') return []; } catch (e) {} return [0, 1, 2]; })() };
     try {
       if (!sess.ls && typeof sess.startLockstep === 'function') sess.startLockstep(o);
       else if (sess.ls) {
         var ls = sess.ls;
         ls.rollback = o.rollback; ls.rbCatchUpOn = true; ls.rbCapable = true; ls.rbResume = true; ls.frameHz = 60;
+        ls.rbEdgeBytes = o.rbEdgeBytes.slice();
       }
     } catch (e) { console.log('[gc-lockstep] could not build the room engine with rollback: ' + ((e && e.message) || e)); }
   }
@@ -9613,7 +9618,12 @@ window.GcRate = (function () {
       b[4] = sx & 0xFF; b[5] = sy & 0xFF;
       out[port] = b;
     }
-    gcLsStage = gcLsFreshStage();   // edges are one frame's worth; holds are re-sampled each poll
+    // Edges are one frame's worth. The stick is a HELD LEVEL (gcPadStick: stored, cleared on release),
+    // so it carries into the next frame: a gamepad re-samples it once per rAF, and when two room
+    // frames were released between two polls the second used to read a centred stick — a held
+    // stick blinked to 0 for a frame, and every remote console mispredicted both edges of the blink.
+    var nx = gcLsFreshStage(); nx.stkx = stage.stkx.slice(); nx.stky = stage.stky.slice();
+    gcLsStage = nx;
     return out;
   }
 
