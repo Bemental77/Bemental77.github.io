@@ -49,7 +49,8 @@ const SAMPLE = () => {
            need: m.need, pending: m.pending, hist: (m.history || []).map((h) => [h.frame, h.to, h.delay, h.why]),
            st: n.step ? n.step.selfStepMs : null, sp: n.step ? n.step.selfPresentMs : null, saveEma: n.step ? n.step.saveEmaMs : null, loadEma: n.step ? n.step.loadEmaMs : null,
            run: pg.runMs, save: pg.saveMs, load: pg.loadMs, k: pg.k, win: rr.window != null ? rr.window : (e.rollback ? e.rollback.window : null),
-           wipes: pg.wipes, tlbSame: pg.tlbSameByContent, rb: pg.rollbacks, resim: pg.resimFrames, bridge: pg.bridgeFrames, cost: n.costAvgMs, delay: e.delay, state: e.state };
+           wipes: pg.wipes, tlbSame: pg.tlbSameByContent, rb: pg.rollbacks, resim: pg.resimFrames, bridge: pg.bridgeFrames, cost: n.costAvgMs, delay: e.delay, state: e.state,
+           fsR: n.fskip ? n.fskip.reruns : null, fsMs: n.fskip ? n.fskip.rerunMs : null, fsMax: n.fskip ? n.fskip.maxRerunMs : null, fsRep: n.fskip ? n.fskip.repairs : null, fsIdle: n.fskip ? n.fskip.idleRepairs : null };
 };
 
 const all = [];
@@ -79,6 +80,7 @@ for (let run = 0; run < RUNS; run++) {
             lostMs: Math.round((h.lost || 0) - (prev.lost || 0)), stallMs: Math.round((h.stallMs || 0) - (prev.stallMs || 0)),
             need: h.need, st: h.st, sp: h.sp, run: h.run, save: h.save, load: h.load, k: h.k, win: h.win, delay: h.delay, cost: h.cost != null ? +(+h.cost).toFixed(2) : null,
             wipes: h.wipes, tlbSame: h.tlbSame, rb: (h.rb || 0) - (prev.rb || 0), resim: (h.resim || 0) - (prev.resim || 0),
+            fsR: (h.fsR || 0) - (prev.fsR || 0), fsMs: (h.fsMs || 0) - (prev.fsMs || 0), fsMax: h.fsMax, fsIdle: h.fsIdle,
             g: g && !g.err ? { mode: g.mode, st: g.st, sp: g.sp, run: g.run, save: g.save, load: g.load, k: g.k, cost: g.cost != null ? +(+g.cost).toFixed(2) : null } : null };
           out.rows.push(row); console.log(JSON.stringify(row));
         }
@@ -135,6 +137,12 @@ for (let run = 0; run < RUNS; run++) {
   const n = R.length;
   out.summary = { run, secs: n, rollbackS: R.filter((r) => r.mode === 'rollback').length, delayS: R.filter((r) => r.mode !== 'rollback').length,
     speed: n ? +(R.reduce((a, r) => a + r.speed, 0) / n).toFixed(4) : null, lostMs: R.reduce((a, r) => a + r.lostMs, 0),
+    stallMs: R.reduce((a, r) => a + r.stallMs, 0),
+    // ALL rows (the start-up transient included — the measured window above drops the first 3)
+    lostAllMs: out.rows.reduce((a, r) => a + r.lostMs + r.stallMs, 0), lostFirst5Ms: out.rows.slice(0, 5).reduce((a, r) => a + r.lostMs + r.stallMs, 0),
+    worstSecMs: Math.max(0, ...out.rows.map((r) => r.lostMs + r.stallMs)), lossySecs: out.rows.filter((r) => r.lostMs + r.stallMs > 0).length,
+    fsReruns: out.rows.reduce((a, r) => a + (r.fsR || 0), 0), fsRerunMs: out.rows.reduce((a, r) => a + (r.fsMs || 0), 0),
+    fsMaxRerunMs: Math.max(0, ...out.rows.map((r) => r.fsMax || 0)),
     needMax: Math.max(0, ...R.map((r) => r.need || 0)), switches: out.switches.length,
     bench: out.result && out.result.room ? { speed: out.result.room.speed, mode: out.result.room.mode, mean: out.result.room.ms && out.result.room.ms.mean } : null };
   console.log('SUMMARY ' + JSON.stringify(out.summary));

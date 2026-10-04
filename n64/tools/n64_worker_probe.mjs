@@ -148,7 +148,11 @@ async function exactArm(browser, arm, frames, every, tag) {
   await page.setViewport({ width: 1280, height: 900 });
   const errs = [], logs = [];
   page.on('pageerror', (e) => errs.push(String(e.message).slice(0, 300)));
-  page.on('console', (m) => { if (m.type() === 'error') errs.push('console: ' + m.text().slice(0, 200)); });
+  // glide's ReadSpecialSettings is an informational stderr line; the emsdk 6.0.2 glue prints stderr
+  // with console.error, so on the main-thread arm it read as an error and every exact run (HEAD
+  // included, fingerprints and states identical) reported FAIL
+  const BENIGN = /^ReadSpecialSettings: /;
+  page.on('console', (m) => { if (m.type() === 'error' && !BENIGN.test(m.text())) errs.push('console: ' + m.text().slice(0, 200)); });
   const W = arm === 'W';
   if (!W) await page.evaluateOnNewDocument(PRE_MAIN);
   const q = (W ? 'worker=1&workerrig=1' : 'worker=0') + (XQ ? '&' + XQ : '');
