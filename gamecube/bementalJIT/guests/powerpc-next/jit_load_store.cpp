@@ -335,23 +335,40 @@ static u32 write_import_for_width(StoreWidth w) {
 // ---------------------------------------------------------------------------
 // Fast-path load: leaves loaded+swapped value on the stack.
 // ---------------------------------------------------------------------------
-static void emit_fastmem_load_value(WasmModuleBuilder& wb,
-                                    LoadStoreParams params, LoadWidth width) {
+// [BEM_LEVER_FASTMEM_LEAN 2026-10-04] Push the fastmem host address of
+// LOCAL_TMP_EA and return the memarg offset the access must use. Lever-off:
+// pushes (EA & mask) + base and returns 0 (the pre-lever 5 ops). Lever-on:
+// pushes (EA & mask) and returns base, so the add happens in the access's
+// immediate offset. Same effective address: the wasm spec computes
+// operand + offset without wrapping, (EA & mask) + base < 2^32 for any real
+// config (mask 0x01FFFFFF, base a heap pointer < 2^31), and in-bounds for the
+// same addresses, so the access and its trap behaviour are unchanged.
+static u32 emit_fastmem_host_addr(WasmModuleBuilder& wb, const LoadStoreParams& params) {
     wb.op_local_get(LOCAL_TMP_EA);
     wb.op_i32_const((s32)params.mem1_mask);
     wb.op_i32_and();
+    if (bem_lever_on(BEM_LEVER_FASTMEM_LEAN) &&
+        (u64)params.mem1_base + (u64)params.mem1_mask < 0x100000000ull) {
+        return params.mem1_base;
+    }
     wb.op_i32_const((s32)params.mem1_base);
     wb.op_i32_add();
+    return 0u;
+}
+
+static void emit_fastmem_load_value(WasmModuleBuilder& wb,
+                                    LoadStoreParams params, LoadWidth width) {
+    const u32 moff = emit_fastmem_host_addr(wb, params);
     switch (width) {
     case LoadWidth::U8:
-        wb.op_i32_load8_u(0);
+        wb.op_i32_load8_u(moff);
         break;
     case LoadWidth::U16:
-        wb.op_i32_load16_u(0);
+        wb.op_i32_load16_u(moff);
         emit_bswap_i16(wb);
         break;
     case LoadWidth::S16:
-        wb.op_i32_load16_u(0);
+        wb.op_i32_load16_u(moff);
         emit_bswap_i16(wb);
         // sign-extend 16-bit → 32
         wb.op_i32_const(16);
@@ -360,7 +377,7 @@ static void emit_fastmem_load_value(WasmModuleBuilder& wb,
         wb.op_i32_shr_s();
         break;
     case LoadWidth::U32:
-        wb.op_i32_load(0);
+        wb.op_i32_load(moff);
         emit_bswap_i32(wb);
         break;
     }
@@ -474,23 +491,19 @@ static void emit_slowmem_load_value(WasmModuleBuilder& wb,
 // source. Stack-neutral.
 static void emit_fastmem_store(WasmModuleBuilder& wb, LoadStoreParams params,
                                StoreWidth width, u32 src_local) {
-    wb.op_local_get(LOCAL_TMP_EA);
-    wb.op_i32_const((s32)params.mem1_mask);
-    wb.op_i32_and();
-    wb.op_i32_const((s32)params.mem1_base);
-    wb.op_i32_add();
+    const u32 moff = emit_fastmem_host_addr(wb, params);   // [FASTMEM_LEAN]
     wb.op_local_get(src_local);
     switch (width) {
     case StoreWidth::U8:
-        wb.op_i32_store8(0);
+        wb.op_i32_store8(moff);
         break;
     case StoreWidth::U16:
         emit_bswap_i16(wb);
-        wb.op_i32_store16(0);
+        wb.op_i32_store16(moff);
         break;
     case StoreWidth::U32:
         emit_bswap_i32(wb);
-        wb.op_i32_store(0);
+        wb.op_i32_store(moff);
         break;
     }
 }
@@ -879,14 +892,21 @@ static void emit_load_common(WasmModuleBuilder& wb, RegCache& rc,
     // (free for integer loads — only psq/scalar-FP use slot 98) instead of
     // committing to rt_local here; the RT commit is gated on !DSI below to
     // match Interpreter_LoadStore.cpp lbz:46 / lbzu:56-60.
+    // [BEM_LEVER_FASTMEM_LEAN] both arms write rt_local directly instead of
+    // parking in LOCAL_TMP_FPVAL and copying after the join (the park existed
+    // for the !DSI-gated commit PM55 deleted). Each arm is a full definition of
+    // the same value; the slow arm's host-call prep reads rt only through the
+    // pre-Bind snapshot, i.e. before this write, exactly as before.
+    const bool lean_commit = bem_lever_on(BEM_LEVER_FASTMEM_LEAN);
+    const u32 commit_local = lean_commit ? rt_local : LOCAL_TMP_FPVAL;
     emit_fastmem_load_value(wb, params, width);
-    wb.op_local_set(LOCAL_TMP_FPVAL);
+    wb.op_local_set(commit_local);
 
     wb.op_else();
 
     // ---- slow path ----
     emit_slowmem_load_value(wb, params, width);
-    wb.op_local_set(LOCAL_TMP_FPVAL);
+    wb.op_local_set(commit_local);
 
     wb.op_end();
 
@@ -904,8 +924,10 @@ static void emit_load_common(WasmModuleBuilder& wb, RegCache& rc,
     // the commit if always taken — ~9 dead ops per load. Deleting it is
     // behaviorally identical (nothing was ever suppressed). Native-exact
     // DSI (slow-arm self-exit + a host raise) is the deferred Stage B pair.
-    wb.op_local_get(LOCAL_TMP_FPVAL);
-    wb.op_local_set(rt_local);
+    if (!lean_commit) {
+        wb.op_local_get(LOCAL_TMP_FPVAL);
+        wb.op_local_set(rt_local);
+    }
     if (update && ra != 0) {
         auto rc_ra = rc.Bind(ra, RCMode::Write);
         wb.op_local_get(LOCAL_TMP_EA);
@@ -1260,12 +1282,7 @@ static void emit_fastmem_lfd_body(WasmModuleBuilder& wb, LoadStoreParams params,
         // v128.load64_zero + BSWAP64 shuffle + i64x2.extract_lane is the same
         // i64, in 6 ops. Verified byte-for-byte vs the scalar form (simd2.mjs
         // t2/t3: 11 22 33 44 55 66 77 88 -> 88 77 66 55 44 33 22 11).
-        wb.op_local_get(LOCAL_TMP_EA);
-        wb.op_i32_const((s32)params.mem1_mask);
-        wb.op_i32_and();
-        wb.op_i32_const((s32)params.mem1_base);
-        wb.op_i32_add();
-        wb.op_v128_load64_zero(0, /*align=*/2);
+        wb.op_v128_load64_zero(emit_fastmem_host_addr(wb, params), /*align=*/2);   // [FASTMEM_LEAN]
         emit_v128_shuffle_self(wb, BSWAP64_SHUFFLE);
         wb.op_i64x2_extract_lane(0);
         wb.op_local_set(ps0_idx);
@@ -1647,12 +1664,7 @@ static constexpr u32 LOCAL_PSQ_F64 = 100;
 // the end of emit_psq_l is untouched. 33 ops -> 15.
 // Precondition: EA in LOCAL_TMP_EA, inside the 8-byte fastmem guard's if-arm.
 static void emit_psq_l_float_pair_simd(WasmModuleBuilder& wb, LoadStoreParams params) {
-    wb.op_local_get(LOCAL_TMP_EA);
-    wb.op_i32_const((s32)params.mem1_mask);
-    wb.op_i32_and();
-    wb.op_i32_const((s32)params.mem1_base);
-    wb.op_i32_add();
-    wb.op_v128_load64_zero(0, /*align=*/2);   // [w0,w1,0,0], words still guest-BE
+    wb.op_v128_load64_zero(emit_fastmem_host_addr(wb, params), /*align=*/2);   // [w0,w1,0,0], words still guest-BE [FASTMEM_LEAN]
     emit_v128_shuffle_self(wb, BSWAP32X2_SHUFFLE);
     wb.op_local_tee(LOCAL_PSQ_V);
     wb.op_i32x4_extract_lane(0);

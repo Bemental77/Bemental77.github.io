@@ -45,6 +45,9 @@ constexpr u32 BEM_LEVER_WIDEN_BRANCH = 1u << 5;
 // store and the GPR flush move from the common path into the slow arms' host
 // calls (LoadStoreParams::defer_pc / host_rc).
 constexpr u32 BEM_LEVER_MEM_SLOWARM = 1u << 6;
+// Fastmem accesses fold the MEM1 base into the memarg offset, and integer
+// loads commit straight into rt (no LOCAL_TMP_FPVAL park + copy).
+constexpr u32 BEM_LEVER_FASTMEM_LEAN = 1u << 7;
 
 bool bem_lever_on(u32 bit);
 
