@@ -88,9 +88,32 @@ function sendBatch(r) {
   var tr = r.bytes ? [r.bytes.buffer] : [];
   self.postMessage([{ batch: true, items: r.items, bytes: r.bytes, spans: r.spans, ms: r.ms }], tr);
 }
+// ONE BATCH PER TASK. Batches run back to back, each in its own task (a message that arrives
+// meanwhile queues behind the batch in progress). A throw in one batch answers its jobs as failed
+// instead of leaving the queue wedged. (MEASURED 2026-10-04 and NOT shipped: resting this worker
+// — a 35% duty cycle, or compiling only in the core's idle time between fields — lowered its
+// contention with the core under the rig's shared half-core quota but delayed the race start's
+// ~390 spans, which then ran longer on the interpreter: MK64 race-start fields over 20 ms, fields
+// 1200-1400, n64_field_cost_probe --clock --nodbg --wcpu 0.5: no rest 22 / 21, duty 0.35 39 / 43;
+// no gate 30 / 29, idle-time gate 34 / 37.)
+// A shipped corpus's jobs ({ warm: [...] }, mips_emit.js A SHIPPED SPAN CORPUS) wait behind
+// every real offer: a batch of them runs only when no offer is queued.
+var queue = [], low = [], busy = false;
+function pump() {
+  if (!queue.length && !low.length) { busy = false; return; }
+  busy = true;
+  var jobs = queue.length ? queue.shift() : low.shift();
+  try { sendBatch(batch(jobs)); }
+  catch (er) {
+    var msg = 'emit: ' + ((er && er.message) || er);
+    self.postMessage([{ batch: true, items: jobs.map(function (j) { return { id: j.id, ok: false, err: msg }; }), bytes: null }]);
+  }
+  setTimeout(pump, 0);
+}
 self.onmessage = function (e) {
+  if (e.data && e.data.warm) { low.push(e.data.warm); if (!busy) pump(); return; }
   var jobs = Array.isArray(e.data) ? e.data : [e.data];
-  if (self.bementalMips.emitBatch) { sendBatch(batch(jobs)); return; }
+  if (self.bementalMips.emitBatch) { queue.push(jobs); if (!busy) pump(); return; }
   // answers go back every ~8 ms of work, so a big batch does not hold the first ones
   var out = [], t = performance.now();
   for (var i = 0; i < jobs.length; i++) {

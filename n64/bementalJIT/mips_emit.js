@@ -1932,6 +1932,8 @@
     var words = U.slice(pageW0, pageW0 + pageN + 1);    // the page, and the word after it
     var id = ASYNC.nextId++;
     var job = { id: id, p: Object.assign({}, p), w0: pageW0, words: words, ops: ops, flags: jitFlags(), tableBase: TABLE_BASE };
+    if (WARM.corpus) warmStart(job);
+    if (WARM.capture) WARM.capture.push({ p: job.p, w0: pageW0, words: words, ops: ops, flags: job.flags, tableBase: TABLE_BASE });
     ASYNC.pending.set(id, { p: job.p, w0: pageW0, words: words, ops: ops, bp: bp, blk: bp ? U[bp >> 2] : 0, keyArr: keyArr, tries: ASYNC.retry | 0 });
     // batched: one message per field end (or per 32 offers) — a scene load offers hundreds
     // of spans inside one field, and a message each cost more than the copy itself
@@ -1939,6 +1941,64 @@
     if (ASYNC.outbox.length >= 32) asyncFlush();
     ASYNC.offered++;
   }
+  // ---- A SHIPPED SPAN CORPUS (2026-10-04) ----
+  // A scene load offers hundreds of spans at once (MK64's race start: ~390 in three fields), and
+  // until each module lands its span runs on the cached interpreter — the race start's fields
+  // over budget at half a core. But WHAT a session compiles is the same from run to run: the
+  // recompile key (RECOMPILE CACHE: the span's addresses, its page's words, its ops fields) of
+  // every MK64 1P race span was identical across two runs (1355 of 1355), and the precomp blocks
+  // land at the same host addresses. So a title can ship the inputs of the spans a session
+  // offered (dist/jit/<internal name>.json.gz, n64/tools/n64_jit_corpus.mjs makes them): at the
+  // first offer of a session, if every session-static field of the param block, the emitter
+  // flags and the table base are the ones the corpus was made with, its jobs go to the compile
+  // worker at LOW priority (behind every real offer), and each module that comes back is only
+  // put in the recompile cache — installed nowhere. A span is installed from it only when the
+  // core offers it and compileSpan's key, built from memory AS IT IS, equals the corpus key in
+  // full: the same inputs, so the same module compileSpan would build (exact, as every cache
+  // hit). A corpus that matches nothing costs its compile time in the worker and nothing else.
+  // ?jitcorpus=0 (fbasync.js publishes nothing for it; core_worker.js does not load one) = off.
+  var WARM = { corpus: null, capture: null, started: false, ids: new Map(), offered: 0, cached: 0, dropped: null };
+  var WARM_PER_SPAN = { vaddr: 1, entryPtr: 1, span: 1, srcPtr: 1, blockStart: 1, blockEnd: 1 };
+  function warmStart(live) {
+    var C = WARM.corpus; WARM.corpus = null;
+    if (WARM.started) return; WARM.started = true;
+    var k, why = null;
+    for (k in C.static) if (C.static[k] !== live.p[k]) { why = 'param ' + k; break; }
+    if (!why) for (k in live.p) if (!WARM_PER_SPAN[k] && !(k in C.static)) { why = 'param ' + k + ' not in corpus'; break; }
+    if (!why && JSON.stringify(C.flags) !== JSON.stringify(live.flags)) why = 'flags';
+    if (!why && (C.tableBase | 0) !== (live.tableBase | 0)) why = 'tableBase';
+    if (why) { WARM.dropped = why; return; }
+    var out = [];
+    for (var i = 0; i < C.jobs.length; i++) {
+      var cj = C.jobs[i], pp = Object.assign({}, live.p), w = C.pages[cj.pg];
+      for (k in WARM_PER_SPAN) pp[k] = cj[k];
+      var id = ASYNC.nextId++, pageN = w.words.length - 1, span = cj.span;
+      var key = new Uint32Array(6 + pageN + span);
+      key[0] = pp.vaddr >>> 0; key[1] = pp.entryPtr >>> 0; key[2] = span; key[3] = pp.blockStart >>> 0;
+      key[4] = pp.blockEnd >>> 0; key[5] = pp.srcPtr >>> 0;
+      key.set(w.words.subarray(0, pageN), 6); key.set(cj.ops.subarray(0, span), 6 + pageN);
+      WARM.ids.set(id, key);
+      out.push({ id: id, p: pp, w0: w.w0, words: w.words, ops: cj.ops, flags: live.flags, tableBase: live.tableBase });
+      if (out.length === 32) { ASYNC.w.postMessage({ warm: out }); out = []; }
+      WARM.offered++;
+    }
+    if (out.length) ASYNC.w.postMessage({ warm: out });
+  }
+  // a corpus module back from the worker: into the recompile cache, nowhere else
+  function warmPut(M, r, key) {
+    if (!r.ok) return;
+    var kh = keyHash(key, key.length), b = spanCache.get(kh);
+    if (b) for (var i = 0; i < b.length; i++) if (keyEq(b[i].key, key, key.length)) return;   // compiled live meanwhile
+    var Bh = r.B;
+    if (!Bh.inst) { Bh.inst = new WebAssembly.Instance(Bh.mod || new WebAssembly.Module(Bh.bytes), { e: { t: M.wasmTable, m: M.wasmMemory } }); ASYNC.modules++; }
+    var fns = [Bh.inst.exports['s' + r.k]];
+    for (var wk = 1; wk < r.labels.length; wk++) fns.push(r.nfn === 1 ? fns[0] : Bh.inst.exports['s' + r.k + '_' + wk]);
+    cachePut(key, fns, r.labels, r.labelOps);
+    WARM.cached++;
+  }
+  // corpus = { static, flags, tableBase, pages: [{ w0, words: Uint32Array }], jobs: [{ vaddr, entryPtr,
+  // span, srcPtr, blockStart, blockEnd, pg, ops: Uint32Array }] } (core_worker.js decodes the file)
+  function warmCorpus(c) { if (!WARM.started && c && c.jobs && c.jobs.length) WARM.corpus = c; }
   function asyncFlush() {
     if (!ASYNC.outbox.length || !ASYNC.w) return;
     var b = ASYNC.outbox; ASYNC.outbox = [];
@@ -1976,9 +2036,13 @@
     // load can bring back hundreds at once): the rest waits for the next field end
     var q = ASYNC.ready, i;
     for (i = 0; i < q.length; i++) {
-      if (t0 && i > 0 && (i & 7) === 0 && performance.now() - t0 > 2) break;
+      if (t0 && i > 0 && performance.now() - t0 > 2) break;   // every item: one may instantiate a whole batch module
       var r = q[i], j = ASYNC.pending.get(r.id);
-      if (!j) continue;
+      if (!j) {
+        var wkey = WARM.ids.get(r.id);
+        if (wkey) { WARM.ids.delete(r.id); try { warmPut(M, r, wkey); } catch (e) { stats.warmErr = String((e && e.message) || e).slice(0, 160); } }
+        continue;
+      }
       ASYNC.pending.delete(r.id);
       if (!r.ok) { ASYNC.failed++; if (r.err && !stats.asyncLastErr) stats.asyncLastErr = r.err; continue; }
       if (!asyncStillHolds(M, j, r)) {
@@ -2972,5 +3036,5 @@
     return out;
   }
   window.bementalMips = { compileSpan: compileSpan, frameEnd: frameEnd, stats: stats, census: censusDump, censusOn: function () { return !!census.on; },
-                         async: ASYNC, emitJob: emitJob, emitBatch: emitBatch };
+                         async: ASYNC, emitJob: emitJob, emitBatch: emitBatch, warm: WARM, warmCorpus: warmCorpus };
 })();
