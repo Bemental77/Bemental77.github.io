@@ -61,6 +61,9 @@ constexpr u32 BEM_LEVER_FP_SINGLE_ARITH = 1u << 8;
 // FPRRegCache::EmitPromoteToDouble widens both lanes with one
 // f64x2.promote_low_f32x4 when no lane is Inf/NaN.
 constexpr u32 BEM_LEVER_PROMOTE_SIMD = 1u << 9;
+// Block terminal: chain to the terminator's STATIC b/bc successors through
+// compile-time-constant dispatch buckets (PC compare first).
+constexpr u32 BEM_LEVER_STATIC_CHAIN = 1u << 10;
 
 bool bem_lever_on(u32 bit);
 

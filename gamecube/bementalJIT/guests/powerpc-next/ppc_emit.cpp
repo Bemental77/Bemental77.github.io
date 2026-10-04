@@ -282,7 +282,9 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
                           const u32* direct_fidx,
                           u32 n_direct,
                           u16 tag_sym,
-                          u16 slot_sym) {
+                          u16 slot_sym,
+                          const u32* static_pcs,
+                          u32 n_static) {
     if (!g_bem_chain_enabled) {
         b.op_i32_const((s32)ctx_ptr);
         b.op_i32_load(ppc_off::PC);
@@ -335,6 +337,58 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
         emit_exit_census(b, 0x026B34DCu);   // [census] service_bail
         b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
     b.op_end();
+
+    // [BEM_LEVER_STATIC_CHAIN 2026-10-04] Static successors (the terminator's
+    // b/bc targets, known at emit): for each candidate t, `if (PC == t)` runs the
+    // generic path below SPECIALIZED to PC == t — the vector-page guard is
+    // compile-time false for t >= 0x4000 (candidates below that are not
+    // specialized), and the dispatch bucket ((t >> 2) & MASK) * 4 is a
+    // compile-time constant, so the tag/slot loads use constant addresses
+    // (emit_addr_const keeps the AOT reloc symbol, offset as addend). Same
+    // loads, same compares, same return_call_indirect operand and the same
+    // host return as the generic code computes for that PC. Any PC that is not
+    // a candidate falls through to the unchanged generic path. Only for plain
+    // per-block bodies (no merged region, no region gen, no table override).
+    if (n_static && static_pcs && !merged && region_gen < 0 && !tag_addr_ovr &&
+        !slot_addr_ovr && bem_lever_on(BEM_LEVER_STATIC_CHAIN)) {
+        b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC);
+        b.op_local_set(LOCAL_TMP_B_CHAIN);
+        for (u32 si = 0; si < n_static; ++si) {
+            const u32 t = static_pcs[si];
+            if (t < 0x4000u) continue;
+            bool dup = false;
+            for (u32 sj = 0; sj < si; ++sj) dup |= (static_pcs[sj] == t);
+            if (dup) continue;
+            const u32 off = ((t >> 2) & BEM_DISP_MASK_NEXT) * 4u;
+            b.op_local_get(LOCAL_TMP_B_CHAIN);
+            b.op_i32_const((s32)t); b.op_i32_eq();
+            b.op_if(BLOCK_TYPE_VOID);
+                emit_addr_const(b, tag_addr + off, tag_sym, off); b.op_i32_load(0);
+                b.op_i32_const((s32)t); b.op_i32_eq();
+                b.op_if(BLOCK_TYPE_VOID);
+                    emit_addr_const(b, slot_addr + off, slot_sym, off); b.op_i32_load(0);
+                    b.op_local_tee(LOCAL_TMP_A_CHAIN);
+                    b.op_i32_const(0); b.op_i32_ge_s();
+                    b.op_if(BLOCK_TYPE_VOID);
+                        if (BEM_PM51_CENSUS && g_bem_lc_base) {
+                            b.op_i32_const((s32)0x026B38D8u);
+                            b.op_i32_const((s32)0x026B38D8u);
+                            b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
+                        }
+                        b.op_local_get(LOCAL_TMP_A_CHAIN);
+                        b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
+                    b.op_end();
+                b.op_end();
+                if (BEM_PM51_CENSUS && g_bem_lc_base) {
+                    b.op_i32_const((s32)0x026B38DCu);
+                    b.op_i32_const((s32)0x026B38DCu);
+                    b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
+                }
+                emit_exit_census(b, 0x026B34F0u);   // [census] host_return (terminal fallback)
+                b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
+            b.op_end();
+        }
+    }
 
     // [vector-page guard 2026-07-09, INVARIANT-KEYED 2026-07-09-pm] Never tail-chain
     // INTO an exception vector (pc < 0x4000) WHEN THE CARRIED MSR HAS IR SET (0x20).
@@ -2015,10 +2069,26 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             }
         }
     }
+    // [BEM_LEVER_STATIC_CHAIN] the terminator's static successors (same target
+    // arithmetic as emit_bx / emit_bcx and the PM54d candidate list above).
+    u32 static_pcs[2]; u32 n_static = 0u;
+    if (n_ops > 0) {
+        const CodeOp& term = buffer[n_ops - 1];
+        const u32 opcd = term.inst >> 26;
+        if (opcd == 18u) {
+            const u32 li = GekkoOperands::LI(term.inst);
+            static_pcs[n_static++] = GekkoOperands::AA(term.inst) ? li : (term.address + li);
+        } else if (opcd == 16u) {
+            const s32 bd = GekkoOperands::BD(term.inst);
+            static_pcs[n_static++] = GekkoOperands::AA(term.inst) ? (u32)bd
+                                                                   : (u32)((s32)term.address + bd);
+            static_pcs[n_static++] = term.address + 4u;
+        }
+    }
     BEM_EMIT_MARK(BEM_MARK_TERM_BEGIN, start_pc);
     emit_chain_or_return(b, ctx_ptr, chain_tag_addr, chain_slot_addr, merged,
                          region_gen, direct_pcs, direct_fidx, n_direct,
-                         chain_tag_sym, chain_slot_sym);
+                         chain_tag_sym, chain_slot_sym, static_pcs, n_static);
     BEM_EMIT_MARK(BEM_MARK_BLOCK_END, start_pc);
     };  // emit_arm
 
