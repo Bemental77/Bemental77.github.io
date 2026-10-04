@@ -8,11 +8,15 @@
 // exactly as before the lever landed.
 //
 //   BEM_LEVER_KILL_CELL  W  0 (browser-zeroed) = every lever ON; bit set = that
-//                           lever OFF. 0x026B3EE0 matched no 0x026B3xxx literal
-//                           (hex, decimal 40582880 or >>2 index 0x9ACFB8) anywhere
-//                           in the tree when it was taken (grep, 2026-10-04); the
-//                           neighbours are the chain selector 0x026B3ED4 and the
-//                           pre-load-drop census 0x026B3ED8.
+//                           lever OFF. The env var BJIT_LEVER_KILL (page query
+//                           ?bjit_lever_kill=0x3ff, threaded by gamecube.html's
+//                           ?bjit_* -> Module.ENV pass) is OR'd in, read once.
+//   BEM_LEVER_CENSUS_CELL R 0x80000000 | the effective mask (arm proof).
+// 0x026B3EE0..0x026B3EFC matched no 0x026B3xxx literal (hex, decimal or >>2
+// index form) anywhere in the tree when taken (grep, 2026-10-04), and no range
+// writer covers them (late-EFB ring ends 0x026B3E90, DSP diag ring 0x026B3210);
+// the neighbours are the chain selector 0x026B3ED4 and the pre-load-drop census
+// 0x026B3ED8.
 //
 // With g_bem_lc_base == 0 (unit tests, small heaps) the cell is not read and every
 // lever is ON — the tests exercise the shipping arm.
@@ -23,6 +27,9 @@
 namespace bemental::powerpc {
 
 constexpr u32 BEM_LEVER_KILL_CELL = 0x026B3EE0u;
+// R  0x80000000 | the effective kill mask (cell | BJIT_LEVER_KILL env), rewritten
+//    on every lever query; 0 = no block has been emitted under the gate yet.
+constexpr u32 BEM_LEVER_CENSUS_CELL = 0x026B3EE4u;
 
 // Single-precision fused multiply-add fast arm (emit_single_fma_lane): exact
 // tie-corrected arm for f32-valued a/c, and the scalar op59 family routed to it.

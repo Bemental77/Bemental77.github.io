@@ -15,6 +15,7 @@
 
 #include "ppc_emit.h"
 #include "lever_gate.h"
+#include <cstdlib>
 
 #include <cstdio>   // std::snprintf (export-name gen) — transitive under emscripten, explicit for native AOT builds
 #include "bementalJIT/types.h"
@@ -146,10 +147,23 @@ bool bem_mips_census_on() {
 }
 
 // [exact levers 2026-10-04] see lever_gate.h. Kill semantics: 0 = ON.
+// The kill mask is the cell OR the BJIT_LEVER_KILL environment value, read once
+// (gamecube.html threads every ?bjit_* query parameter into the worker's
+// Module.ENV, so `?bjit_lever_kill=0x3ff` selects the all-OFF control arm with
+// no page change). The effective mask is published once, at the first emit, to
+// BEM_LEVER_CENSUS_CELL as 0x80000000 | mask — the arm-difference proof a
+// matched pair should read back before trusting a delta.
 bool bem_lever_on(u32 bit) {
     if (g_bem_lc_base == 0u) return true;
-    return (*reinterpret_cast<volatile uint32_t*>(
-                static_cast<uintptr_t>(BEM_LEVER_KILL_CELL)) & bit) == 0u;
+    static const u32 s_env_kill = []() -> u32 {
+        const char* v = std::getenv("BJIT_LEVER_KILL");
+        return v ? (u32)std::strtoul(v, nullptr, 0) : 0u;
+    }();
+    const u32 kill = s_env_kill | *reinterpret_cast<volatile uint32_t*>(
+                                      static_cast<uintptr_t>(BEM_LEVER_KILL_CELL));
+    *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(BEM_LEVER_CENSUS_CELL)) =
+        0x80000000u | kill;
+    return (kill & bit) == 0u;
 }
 
 // [promote/fusion ARM 2026-09-04 — gamecube/docs/wasm-tier] WHY THIS EXISTS.
