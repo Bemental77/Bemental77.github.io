@@ -44,7 +44,9 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
                           const u32* direct_fidx = nullptr,
                           u32 n_direct = 0u,
                           u16 tag_sym = (u16)BEM_RSYM_NONE,
-                          u16 slot_sym = (u16)BEM_RSYM_NONE);
+                          u16 slot_sym = (u16)BEM_RSYM_NONE,
+                          const u32* static_pcs = nullptr,
+                          u32 n_static = 0u);
 
 
 // Unconditional. LK=1 sets LR = next_pc; LK=0 doesn't touch LR.

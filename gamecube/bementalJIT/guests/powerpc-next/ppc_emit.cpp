@@ -14,6 +14,8 @@
 // to this. For now, callable for test_analyst-style harnesses.
 
 #include "ppc_emit.h"
+#include "lever_gate.h"
+#include <cstdlib>
 
 #include <cstdio>   // std::snprintf (export-name gen) — transitive under emscripten, explicit for native AOT builds
 #include "bementalJIT/types.h"
@@ -144,6 +146,26 @@ bool bem_mips_census_on() {
                static_cast<uintptr_t>(BEM_MIPS_FLAG_CELL)) != 0u;
 }
 
+// [exact levers 2026-10-04] see lever_gate.h. Kill semantics: 0 = ON.
+// The kill mask is the cell OR the BJIT_LEVER_KILL environment value, read once
+// (gamecube.html threads every ?bjit_* query parameter into the worker's
+// Module.ENV, so `?bjit_lever_kill=0x3ff` selects the all-OFF control arm with
+// no page change). The effective mask is published once, at the first emit, to
+// BEM_LEVER_CENSUS_CELL as 0x80000000 | mask — the arm-difference proof a
+// matched pair should read back before trusting a delta.
+bool bem_lever_on(u32 bit) {
+    if (g_bem_lc_base == 0u) return true;
+    static const u32 s_env_kill = []() -> u32 {
+        const char* v = std::getenv("BJIT_LEVER_KILL");
+        return v ? (u32)std::strtoul(v, nullptr, 0) : 0u;
+    }();
+    const u32 kill = s_env_kill | *reinterpret_cast<volatile uint32_t*>(
+                                      static_cast<uintptr_t>(BEM_LEVER_KILL_CELL));
+    *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(BEM_LEVER_CENSUS_CELL)) =
+        0x80000000u | kill;
+    return (kill & bit) == 0u;
+}
+
 // [promote/fusion ARM 2026-09-04 — gamecube/docs/wasm-tier] WHY THIS EXISTS.
 //
 // The whole region-promotion + run-fusion machinery in block_cache.cpp
@@ -260,7 +282,9 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
                           const u32* direct_fidx,
                           u32 n_direct,
                           u16 tag_sym,
-                          u16 slot_sym) {
+                          u16 slot_sym,
+                          const u32* static_pcs,
+                          u32 n_static) {
     if (!g_bem_chain_enabled) {
         b.op_i32_const((s32)ctx_ptr);
         b.op_i32_load(ppc_off::PC);
@@ -313,6 +337,58 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
         emit_exit_census(b, 0x026B34DCu);   // [census] service_bail
         b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
     b.op_end();
+
+    // [BEM_LEVER_STATIC_CHAIN 2026-10-04] Static successors (the terminator's
+    // b/bc targets, known at emit): for each candidate t, `if (PC == t)` runs the
+    // generic path below SPECIALIZED to PC == t — the vector-page guard is
+    // compile-time false for t >= 0x4000 (candidates below that are not
+    // specialized), and the dispatch bucket ((t >> 2) & MASK) * 4 is a
+    // compile-time constant, so the tag/slot loads use constant addresses
+    // (emit_addr_const keeps the AOT reloc symbol, offset as addend). Same
+    // loads, same compares, same return_call_indirect operand and the same
+    // host return as the generic code computes for that PC. Any PC that is not
+    // a candidate falls through to the unchanged generic path. Only for plain
+    // per-block bodies (no merged region, no region gen, no table override).
+    if (n_static && static_pcs && !merged && region_gen < 0 && !tag_addr_ovr &&
+        !slot_addr_ovr && bem_lever_on(BEM_LEVER_STATIC_CHAIN)) {
+        b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC);
+        b.op_local_set(LOCAL_TMP_B_CHAIN);
+        for (u32 si = 0; si < n_static; ++si) {
+            const u32 t = static_pcs[si];
+            if (t < 0x4000u) continue;
+            bool dup = false;
+            for (u32 sj = 0; sj < si; ++sj) dup |= (static_pcs[sj] == t);
+            if (dup) continue;
+            const u32 off = ((t >> 2) & BEM_DISP_MASK_NEXT) * 4u;
+            b.op_local_get(LOCAL_TMP_B_CHAIN);
+            b.op_i32_const((s32)t); b.op_i32_eq();
+            b.op_if(BLOCK_TYPE_VOID);
+                emit_addr_const(b, tag_addr + off, tag_sym, off); b.op_i32_load(0);
+                b.op_i32_const((s32)t); b.op_i32_eq();
+                b.op_if(BLOCK_TYPE_VOID);
+                    emit_addr_const(b, slot_addr + off, slot_sym, off); b.op_i32_load(0);
+                    b.op_local_tee(LOCAL_TMP_A_CHAIN);
+                    b.op_i32_const(0); b.op_i32_ge_s();
+                    b.op_if(BLOCK_TYPE_VOID);
+                        if (BEM_PM51_CENSUS && g_bem_lc_base) {
+                            b.op_i32_const((s32)0x026B38D8u);
+                            b.op_i32_const((s32)0x026B38D8u);
+                            b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
+                        }
+                        b.op_local_get(LOCAL_TMP_A_CHAIN);
+                        b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
+                    b.op_end();
+                b.op_end();
+                if (BEM_PM51_CENSUS && g_bem_lc_base) {
+                    b.op_i32_const((s32)0x026B38DCu);
+                    b.op_i32_const((s32)0x026B38DCu);
+                    b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
+                }
+                emit_exit_census(b, 0x026B34F0u);   // [census] host_return (terminal fallback)
+                b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
+            b.op_end();
+        }
+    }
 
     // [vector-page guard 2026-07-09, INVARIANT-KEYED 2026-07-09-pm] Never tail-chain
     // INTO an exception vector (pc < 0x4000) WHEN THE CARRIED MSR HAS IR SET (0x20).
@@ -594,6 +670,21 @@ static void emit_fallback(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
 
     rc.ReloadAll(ctx_ptr);
     frc.ReloadAll(ctx_ptr);
+}
+
+// [BEM_LEVER_MEM_SLOWARM] true iff dispatch_op routes `inst` to emit_load_d /
+// emit_store_d / emit_load_x / emit_store_x (the cases below, verbatim).
+static bool IsIntegerLoadStoreCommon(u32 inst) {
+    const u32 opcd = GekkoOperands::OPCD(inst);
+    if ((opcd >= 32 && opcd <= 45)) return true;
+    if (opcd != 31) return false;
+    switch (GekkoOperands::SUBOP10(inst)) {
+    case 23: case 55: case 87: case 119: case 279: case 311: case 343: case 375:
+    case 151: case 183: case 215: case 247: case 407: case 439:
+        return true;
+    default:
+        return false;
+    }
 }
 
 bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
@@ -1563,9 +1654,25 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
         // THP IDCT loop) — a norm-shaving cut, applies to all FP-heavy code.
         const bool fpu_needs_pc =
             op.opinfo && (op.opinfo->flags & FL_USE_FPU) && !first_fp_found;
-        if (is_terminator || op.canEndBlock || op.canCauseException ||
-            fpu_needs_pc ||
-            (op.opinfo && (op.opinfo->flags & FL_LOADSTORE)))
+        // [BEM_LEVER_MEM_SLOWARM 2026-10-04] An integer load/store routed to
+        // emit_load_d/_x / emit_store_d/_x whose ONLY reason for the pre-op PC
+        // store is FL_LOADSTORE (the slow arm's host handler may read ctx.PC)
+        // defers it into those host calls (emit_host_call_prep). Every other
+        // reader of a mid-block ctx.PC writes its own: emit_fallback, the
+        // FP-unavailable bail (fpu_needs_pc, kept), terminators (is_terminator,
+        // kept), canEndBlock ops (kept); no DSI is raised in the MMU-off config.
+        params.defer_pc = 0;
+        if (!is_terminator && !op.canEndBlock && !fpu_needs_pc && op.opinfo &&
+            (op.opinfo->flags & (FL_PROGRAMEXCEPTION | FL_FLOAT_EXCEPTION |
+                                 FL_FLOAT_DIV | FL_USE_FPU)) == 0 &&
+            IsIntegerLoadStoreCommon(op.inst) &&
+            bem_lever_on(BEM_LEVER_MEM_SLOWARM)) {
+            params.defer_pc = op.address;
+        }
+        if (params.defer_pc == 0u &&
+            (is_terminator || op.canEndBlock || op.canCauseException ||
+             fpu_needs_pc ||
+             (op.opinfo && (op.opinfo->flags & FL_LOADSTORE))))
         {
             b.op_i32_const((s32)ctx_ptr);
             b.op_i32_const((s32)op.address);
@@ -1733,7 +1840,10 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
                      BitSet32(assumed.m_val | selfloop_pw.m_val), params.cmp_fuse);
             emitted_native = true;
         } else {
+            rc.SetOpReads(op.regsIn.m_val);   // [WRITE_NOLOAD] this op's GPR reads
             emitted_native = dispatch_op(b, rc, frc, op, params);
+            rc.SetOpReads(0xFFFFFFFFu);
+            params.defer_pc = 0;   // [MEM_SLOWARM] consumed by this op only
         }
 
         // [PM55 EA-CSE] KEEP the last-EA cache only when this op preserves the
@@ -1809,6 +1919,10 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // exits the loop (only br re-iterates), so the not-taken and bail paths
     // land here naturally and run the unchanged epilogue below.
     if (resident_loop_arm) b.op_end();
+    // [executed-op census 2026-10-04] split the block epilogue (gather drain +
+    // dirty flushes) out of the LAST guest op's span. Mark-only: the callback is
+    // null in every shipping build and is handed no builder.
+    BEM_EMIT_MARK(BEM_MARK_EPILOGUE, start_pc);
 
     // Epilogue: drain gather-pipe (so GPU FIFO sees CP_INT/PE_TOKEN/PE_FINISH
     // after stw-to-0xCC008000 family stores), flush dirty GPR locals, then
@@ -1957,10 +2071,26 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             }
         }
     }
+    // [BEM_LEVER_STATIC_CHAIN] the terminator's static successors (same target
+    // arithmetic as emit_bx / emit_bcx and the PM54d candidate list above).
+    u32 static_pcs[2]; u32 n_static = 0u;
+    if (n_ops > 0) {
+        const CodeOp& term = buffer[n_ops - 1];
+        const u32 opcd = term.inst >> 26;
+        if (opcd == 18u) {
+            const u32 li = GekkoOperands::LI(term.inst);
+            static_pcs[n_static++] = GekkoOperands::AA(term.inst) ? li : (term.address + li);
+        } else if (opcd == 16u) {
+            const s32 bd = GekkoOperands::BD(term.inst);
+            static_pcs[n_static++] = GekkoOperands::AA(term.inst) ? (u32)bd
+                                                                   : (u32)((s32)term.address + bd);
+            static_pcs[n_static++] = term.address + 4u;
+        }
+    }
     BEM_EMIT_MARK(BEM_MARK_TERM_BEGIN, start_pc);
     emit_chain_or_return(b, ctx_ptr, chain_tag_addr, chain_slot_addr, merged,
                          region_gen, direct_pcs, direct_fidx, n_direct,
-                         chain_tag_sym, chain_slot_sym);
+                         chain_tag_sym, chain_slot_sym, static_pcs, n_static);
     BEM_EMIT_MARK(BEM_MARK_BLOCK_END, start_pc);
     };  // emit_arm
 

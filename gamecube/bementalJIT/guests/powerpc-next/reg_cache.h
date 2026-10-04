@@ -129,6 +129,12 @@ public:
     u32  GetLocalIdx(u32 preg)  const { return m_state[preg].local_idx; }
     bool IsDirty(u32 preg)      const { return m_state[preg].dirty; }
 
+    // [BEM_LEVER_WRITE_NOLOAD 2026-10-04] GPRs the CURRENT guest op reads
+    // (CodeOp::regsIn), set by emit_block_body_into around each op's dispatch
+    // and all-ones (= every reg may be read, the conservative pre-lever rule)
+    // everywhere else. See RegCache::Bind.
+    void SetOpReads(u32 mask) { m_op_reads = mask; }
+
 private:
     // Per-PPC-GPR state inside a block.
     struct PregState {
@@ -157,6 +163,7 @@ private:
 
     WasmModuleBuilder& m_wb;
     PregState m_state[32]{};
+    u32 m_op_reads = 0xFFFFFFFFu;
     u32 m_local_base = 0;
     u32 m_if_depth   = 0;
     // Stamped once per block by OnBlockEntry. Used by Bind()'s lazy-load

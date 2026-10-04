@@ -108,7 +108,15 @@ function branchTarget(inst, pc) {
 }
 
 // ---- rank the histogram ---------------------------------------------------
-const segs = JSON.parse(fs.readFileSync(HIST, 'utf8')).filter(s => s && s.hist);
+// Two artifact shapes. The legacy one is a bare array of segments whose hist
+// keys are 256-byte bucket bases. Since pc-census (2026-09-04) the probe writes
+// {bucket:<width>, segs:[...]} and, at the default width 4, every key is the
+// EXACT sampled PC. Exact PCs get their own path below (exactManifest): the
+// sample is attributed to the ONE block containing it instead of being split
+// evenly across every entry recovered in a 256-byte window.
+const histRaw = JSON.parse(fs.readFileSync(HIST, 'utf8'));
+const BUCKET = Array.isArray(histRaw) ? 256 : (histRaw.bucket || 256);
+const segs = (Array.isArray(histRaw) ? histRaw : histRaw.segs).filter(s => s && s.hist);
 const weight = new Map();
 let total = 0;
 for (const s of segs) {
@@ -120,6 +128,68 @@ for (const s of segs) {
 }
 const ranked = [...weight.entries()].sort((a, b) => b[1] - a[1]).slice(0, TOPN);
 console.error(`[manifest] ${weight.size} buckets, ${total} samples (seg>=${SEG_MIN}); taking top ${ranked.length}`);
+
+// ---- exact-PC attribution (bucket width 4) -------------------------------
+// The sampler records ctx.PC, which a block writes at its entry (the
+// predecessor's terminal) and before its loads/stores/branches — so a sample
+// always names an instruction INSIDE the executing block. Its block entry is
+// the nearest PC at or below it that is either a branch target in the scanned
+// window or follows a non-coalescable terminator (the same JitWasm.cpp
+// decode rule as the 256B path). The weight is the sample count of the block,
+// with nothing split by assumption. TOPN ranks BLOCKS here, not buckets.
+function blockStartFor(pc) {
+  const lo = Math.max(0, pc - 64 * 4);
+  const targets = new Set();
+  for (let q = lo - 1024; q < pc + 1024; q += 4) {
+    const w = read32(q >>> 0);
+    if (w === null) continue;
+    const t = branchTarget(w, q >>> 0);
+    if (t !== null && t > lo && t <= pc) targets.add(t);
+  }
+  let start = pc;
+  for (let q = pc; q > lo; q -= 4) {
+    if (targets.has(q)) return q;
+    const prev = read32((q - 4) >>> 0);
+    if (prev === null) return q;
+    if (isTerminator(prev) && !isForwardCond(prev)) return q;
+    start = q - 4;
+  }
+  return start >>> 0;
+}
+if (BUCKET <= 4) {
+  const blockW = new Map();
+  let skipped = 0;
+  for (const [pc, n] of weight) {
+    if (read32(pc) === null) { skipped += n; continue; }
+    const st = blockStartFor(pc);
+    blockW.set(st, (blockW.get(st) || 0) + n);
+  }
+  const top = [...blockW.entries()].sort((a, b) => b[1] - a[1]).slice(0, TOPN);
+  const man = [], wts = [];
+  let covered = 0;
+  for (const [pc, n] of top) {
+    const words = [];
+    for (let i = 0; i < 64; ++i) {
+      const w = read32(pc + i * 4);
+      if (w === null) break;
+      words.push(w);
+      if (isTerminator(w) && !isForwardCond(w)) break;
+    }
+    if (!words.length) continue;
+    covered += n;
+    man.push(pc.toString(16).padStart(8, '0') + ' ' +
+             words.map(w => w.toString(16).padStart(8, '0')).join(' '));
+    // Same 4-column shape as the bucket path; a block is its own "bucket".
+    wts.push(pc.toString(16).padStart(8, '0') + ' ' + n.toFixed(4) + ' ' +
+             pc.toString(16).padStart(8, '0') + ' 1');
+  }
+  fs.writeFileSync(OUT, man.join('\n') + '\n');
+  fs.writeFileSync(OUT + '.weights', wts.join('\n') + '\n');
+  console.error(`[manifest] exact-PC mode: ${blockW.size} blocks, top ${man.length} cover ` +
+                `${covered}/${total} samples (${(100 * covered / total).toFixed(1)}%); ` +
+                `${skipped} samples outside DOL text`);
+  process.exit(0);
+}
 
 // ---- recover block entries inside each hot bucket --------------------------
 const manifest = [];

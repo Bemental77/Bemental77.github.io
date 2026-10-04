@@ -37,7 +37,7 @@ Usage: op_census_report.py <census_dir> <manifest.weights>
 """
 import os, re, subprocess, sys, collections
 
-TAG = {0: 'prologue', 1: 'body', 2: 'op', 3: 'terminal', 4: 'end'}
+TAG = {0: 'prologue', 1: 'body', 2: 'op', 3: 'terminal', 4: 'end', 5: 'epilogue'}
 
 # --------------------------------------------------------------------------
 # Guest-opcode naming. BEM_MARK_OP (ppc_emit.cpp:1370) carries op.address, and
@@ -264,7 +264,7 @@ def main():
     print('SAMPLE-WEIGHTED EXECUTED-OP BUDGET  (d0 = unconditional; '
           'cond = behind an op_if, UPPER BOUND only)')
     print(f'{"phase":<12}{"d0 ops":>10}{"share":>9}{"cond ops":>11}{"cond share":>12}')
-    for k in ('prologue', 'body', 'op', 'terminal'):
+    for k in ('prologue', 'body', 'op', 'epilogue', 'terminal'):
         if not phase_d0[k] and not phase_cond[k]:
             continue
         print(f'{k:<12}{phase_d0[k] / w_total:>10.1f}{phase_d0[k] / tot_d0 * 100:>8.1f}%'

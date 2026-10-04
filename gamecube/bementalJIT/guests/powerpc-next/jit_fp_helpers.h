@@ -20,6 +20,7 @@
 #include "fpr_reg_cache.h"
 #include "jit_load_store.h"   // emit_psq_convert_to_double (NaN-exact widen)
 #include "ppc_offsets.h"
+#include "lever_gate.h"
 
 // [fprf-gate PM46] Dolphin's bFPRF half of the FPRF gate (Config MAIN_FPRF,
 // default false). Published by JitWasm::Init; defined in block_cache.cpp.
@@ -144,7 +145,20 @@ inline void emit_force25bit(WasmModuleBuilder& wb) {
 // wasm build (GenericCPUDetect.cpp -> default false), so the post-cast
 // Common::FlushToZero(x) path is live when NI=1. Verified 0 mismatches / 5e7.
 // ===========================================================================
+// [BEM_LEVER_FP_SINGLE_ARITH 2026-10-04] stages 1-3 of emit_force_single_i64
+// (NI pre-cast flush, demote, NI post-cast flush) WITHOUT the final widen:
+// f64 VALUE on stack -> f32 result bits left in LOCAL_FP_T0, stack empty.
+// emit_force_single_i64 is now this followed by emit_psq_convert_to_double, so
+// the two can never drift apart.
+inline void emit_force_single_bits(WasmModuleBuilder& wb, u32 ctx_ptr);
+
 inline void emit_force_single_i64(WasmModuleBuilder& wb, u32 ctx_ptr) {
+    emit_force_single_bits(wb, ctx_ptr);
+    // widen back (NaN-payload-exact via ConvertToDouble); result i64 on stack
+    emit_psq_convert_to_double(wb);
+}
+
+inline void emit_force_single_bits(WasmModuleBuilder& wb, u32 ctx_ptr) {
     wb.op_i64_reinterpret_f64();
     wb.op_local_set(LOCAL_FP_I64_A);
     // T1 = FPSCR & 4 (NI)
@@ -197,8 +211,6 @@ inline void emit_force_single_i64(WasmModuleBuilder& wb, u32 ctx_ptr) {
         wb.op_end();
     }
     wb.op_end();
-    // widen back (NaN-payload-exact via ConvertToDouble); result i64 on stack
-    emit_psq_convert_to_double(wb);
 }
 
 // ForceSingle + Fill(both lanes). f64 VALUE on stack -> writes both lanes.
@@ -979,6 +991,123 @@ inline void emit_single_fma_lane(WasmModuleBuilder& wb, u32 a_local, u32 c_local
         wb.op_f64_reinterpret_i64();
         wb.op_f64_eq();
     };
+    // [exact-fma lever 2026-10-04] THE PM24 ARM BELOW IS NOT EXACT. Dolphin's
+    // own motivating case (Interpreter_FPUtils.h:356-370, Mario Strikers
+    // Charged: a=0x42480000 c=0xbc88cc38 b=0x1b1c72a0 — all three f32-valued,
+    // so PM24's guard ADMITS it) gives 0xbf55bf18 through f64.mul+f64.add+
+    // demote, against the correct 0xbf55bf17 (checked 2026-10-04 with exact
+    // rationals). The exact product does NOT make fused == unfused for the
+    // SINGLE family: NI_madd_msub<single> tie-corrects the f64 result before
+    // ForceSingle rounds it (Interpreter_FPUtils.h:425-487), and PM24 skipped
+    // that step. A 2^-24-rare tie is why 7.9e8 random vectors missed it.
+    //
+    // The replacement arm is Dolphin's procedure transcribed with each
+    // std::fma replaced by an EXACT equivalent: for f32-valued a and c,
+    // Force25Bit(c) == c (low 29 fraction bits are zero, so bit 27 is zero)
+    // and a*c has <= 48 significant bits with an exponent far inside f64's
+    // normal range (|a*c| in [2^-298, 2^256]), so f64.mul(a, c) == a*c EXACTLY
+    // and therefore
+    //     std::fma(a, c_round, X) == f64.add(a*c, X)   for every X.
+    // Both fma calls in NI_madd_msub<single> (the result and delta_a) take
+    // that form, so the arm below is bit-identical to Dolphin for every b —
+    // b need not be f32-valued, which also widens the arm's reach. NaN results
+    // still demote to the full pipeline (NaN ladder / FPSCR byte-identical).
+    if (bem_lever_on(BEM_LEVER_FMA_SINGLE)) {
+        push_f32_roundtrip_ok(a_local);
+        push_f32_roundtrip_ok(c_local);
+        wb.op_i32_and();
+        wb.op_local_set(LOCAL_FP_T1);
+        wb.op_local_get(LOCAL_FP_T1);
+        wb.op_if(/*VOID*/);
+        {
+            // P = a*c (exact)
+            wb.op_local_get(a_local);
+            wb.op_f64_reinterpret_i64();
+            wb.op_local_get(c_local);
+            wb.op_f64_reinterpret_i64();
+            wb.op_f64_mul();
+            wb.op_local_set(LOCAL_FMA_P);
+            // B0 = b_sign = sub ? -b : b   (Interpreter_FPUtils.h:416)
+            wb.op_local_get(b_local);
+            wb.op_f64_reinterpret_i64();
+            if (sub) wb.op_f64_neg();
+            wb.op_local_set(LOCAL_FMA_B0);
+            // RES = fma(a, c_round, b_sign) == P + B0
+            wb.op_local_get(LOCAL_FMA_P);
+            wb.op_local_get(LOCAL_FMA_B0);
+            wb.op_f64_add();
+            wb.op_local_tee(LOCAL_FMA_RES);
+            wb.op_local_get(LOCAL_FMA_RES);
+            wb.op_f64_ne();                          // 1 iff NaN result
+            wb.op_if(/*VOID*/);
+            {
+                wb.op_i32_const(0);
+                wb.op_local_set(LOCAL_FP_T1);        // demote to the full pipeline
+            }
+            wb.op_else();
+            {
+                // if ((bits(RES) & D_MASK) == EVEN_TIE)   (:425-431)
+                wb.op_local_get(LOCAL_FMA_RES);
+                wb.op_i64_reinterpret_f64();
+                wb.op_i64_const(0x000000001fffffffll);
+                wb.op_i64_and();
+                wb.op_i64_const(0x0000000010000000ll);
+                wb.op_i64_xor();
+                wb.op_i64_eqz();
+                wb.op_if(/*VOID*/);
+                {
+                    // a_prime = b_sign - RES                       (:445)
+                    wb.op_local_get(LOCAL_FMA_B0);
+                    wb.op_local_get(LOCAL_FMA_RES);
+                    wb.op_f64_sub();
+                    wb.op_local_set(LOCAL_FMA_W0);
+                    // b_prime = RES + a_prime                      (:446)
+                    wb.op_local_get(LOCAL_FMA_RES);
+                    wb.op_local_get(LOCAL_FMA_W0);
+                    wb.op_f64_add();
+                    wb.op_local_set(LOCAL_FMA_W1);
+                    // error = fma(a, c_round, a_prime) + (b_sign - b_prime)
+                    //       = (P + a_prime) + (b_sign - b_prime)   (:447-449)
+                    wb.op_local_get(LOCAL_FMA_P);
+                    wb.op_local_get(LOCAL_FMA_W0);
+                    wb.op_f64_add();
+                    wb.op_local_get(LOCAL_FMA_B0);
+                    wb.op_local_get(LOCAL_FMA_W1);
+                    wb.op_f64_sub();
+                    wb.op_f64_add();
+                    wb.op_local_tee(LOCAL_FMA_W2);
+                    wb.op_f64_const(0.0);
+                    wb.op_f64_ne();
+                    wb.op_if(/*VOID*/);
+                    {
+                        // (error > 0) == (RES > 0) ? bits+1 : bits-1   (:480-483)
+                        wb.op_local_get(LOCAL_FMA_RES);
+                        wb.op_i64_reinterpret_f64();
+                        wb.op_i64_const(1);
+                        wb.op_i64_add();
+                        wb.op_local_get(LOCAL_FMA_RES);
+                        wb.op_i64_reinterpret_f64();
+                        wb.op_i64_const(1);
+                        wb.op_i64_sub();
+                        wb.op_local_get(LOCAL_FMA_W2);
+                        wb.op_f64_const(0.0);
+                        wb.op_f64_gt();
+                        wb.op_local_get(LOCAL_FMA_RES);
+                        wb.op_f64_const(0.0);
+                        wb.op_f64_gt();
+                        wb.op_i32_eq();
+                        wb.op_select();
+                        wb.op_f64_reinterpret_i64();
+                        wb.op_local_set(LOCAL_FMA_RES);
+                    }
+                    wb.op_end();
+                }
+                wb.op_end();
+            }
+            wb.op_end();
+        }
+        wb.op_end();
+    } else {
     push_f32_roundtrip_ok(a_local);
     push_f32_roundtrip_ok(c_local);
     wb.op_i32_and();
@@ -1008,6 +1137,7 @@ inline void emit_single_fma_lane(WasmModuleBuilder& wb, u32 a_local, u32 c_local
         wb.op_end();
     }
     wb.op_end();
+    }  // [exact-fma lever] end of the lever-off (legacy PM24) guard arm
     wb.op_local_get(LOCAL_FP_T1);
     wb.op_if(/*VOID*/);
     {

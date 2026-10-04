@@ -197,8 +197,15 @@ function due(now) {
   if (!CLK.base) { CLK.base = now; CLK.baseFrame = CLK.frame; return true; }
   var d = CLK.base + (CLK.frame - CLK.baseFrame) * period;
   if (now < d) return false;
-  // TIME LOST IS NEVER REPAID (gate #9): debt older than two periods is discarded.
-  if (now - d > period * 2) { CLK.lostMs += now - d; CLK.base = now; CLK.baseFrame = CLK.frame; CLK.reanchors++; }
+  // TIME LOST IS NEVER REPAID (gate #9): debt older than two periods is discarded — the part
+  // older than two periods, not all of it. Up to two periods of lateness the clock has always
+  // run the owed fields back to back (a 33 ms gap, 3 fields at once); the excess beyond that is
+  // what is lost. It discarded ALL of it, so a gap of 34 ms lost 34 ms where 33 ms lost nothing:
+  // every stall a hair past two periods (a frame-skip re-run, a cold first save or load, a shader
+  // compile) cost two periods more than the rule says, and none of it shows as a slow frame. The
+  // largest burst is unchanged (3 fields back to back, as after any 2-period gap), so the guest is
+  // never ahead of its schedule and over any span runs no field sooner than before (gate 9).
+  if (now - d > period * 2) { CLK.lostMs += now - d - period * 2; CLK.base = now - period * 2; CLK.baseFrame = CLK.frame; CLK.reanchors++; }
   return true;
 }
 // THE DRIVER. ONE FIELD PER TASK, NEVER A BATCH. An OffscreenCanvas from
@@ -259,7 +266,11 @@ function tickBody(src) {
       // Counters ride on the frames themselves when fields are being made, so a long field
       // cannot starve the page's meter (its audio integrator drops any interval > 1 s).
       if (performance.now() - STAT.last >= 50) postStats();
-    } else SCHED.notOwed++;
+    } else {
+      SCHED.notOwed++;
+      // a turn before the field is owed: warm the next snapshot buffer (fsWarmStep), if there is room
+      if (CLK.viHz > 0 && CLK.base) fsWarmStep(CLK.base + (CLK.frame - CLK.baseFrame) * (1000 / CLK.viHz) - performance.now());
+    }
   } else CLK.base = 0;     // resume re-anchors: a pause is not debt
   schedule();
 }
@@ -440,7 +451,10 @@ var FSK = { on: true, depth: 1, maxSnaps: 6, snapEvery: 8, force: 0, skipping: f
            fields: 0, drawn: 0, skipped: 0, skipNoDraw: 0, snapsTaken: 0, snapMs: 0, maxSnapMs: 0, redo: 0, redoFields: 0,
            redoMs: 0, redoFieldsAll: 0, audDrop: 0, staleS: 0, repairs: 0, lost: 0, suspendUntil: 0, backoff: 64, held: 0, presented: 0, overwritten: 0, noHeap: 0,
            lat: new Float32Array(4096), age: new Float32Array(4096), gpu: new Float32Array(4096), latN: 0, why: '' };
-var FS_RESERVE = 64 * 1048576;    // heap kept free above the snapshots (room_core.js N64S_RAW_RESERVE)
+// heap kept free for the core's own growth, counted on the heap the allocator sees (room_core.js
+// N64S_RAW_RESERVE: Donkey Kong 64 grows its break by 80 MB after boot; a malloc that does not fit
+// ABORTS this build, so the check is made BEFORE asking)
+var FS_RESERVE = 128 * 1048576;
 var FS_MAXAGE = 16;               // a snapshot older than this many fields is resolved by a re-run now (?fskipage=N)
 function fsInstall(search) {
   var q = new URLSearchParams(search || '').get('fskip');
@@ -506,12 +520,40 @@ function fsCanSkip() {
 }
 function fsAlloc() {
   if (FSK.pool.length) return FSK.pool.pop();
+  if (FSW.p) { var w = FSW.p; FSW.p = 0; return w; }     // the spare being warmed (fsWarmStep), part-warm
   if (FSK.bufs >= FSK.maxSnaps) return 0;
-  var n = FSK.size + FSK.gsize, p = M._malloc(n);
+  var n = FSK.size + FSK.gsize;
+  if (typeof M._neil_heap_brk === 'function' && typeof M._neil_heap_free_below === 'function') {
+    var above = M.HEAPU8.length - (M._neil_heap_brk() >>> 0), total = above + (M._neil_heap_free_below() >>> 0);
+    if (above < n || total - n < FS_RESERVE) { FSK.noHeap++; return 0; }
+  }
+  var p = M._malloc(n);
   if (!p) { FSK.noHeap++; return 0; }
   if (M.HEAPU8.length - (p + n) < FS_RESERVE && p + n > FSK.top) { M._free(p); FSK.noHeap++; return 0; }
   FSK.top = Math.max(FSK.top, p + n); FSK.bufs++;
   return p;
+}
+// ---- A WARM SPARE: NO FIELD PAYS FOR THE FIRST TOUCH OF A SNAPSHOT BUFFER ------------------
+// A snapshot buffer is fresh heap: the first save into it page-faults all 21.4 MB of it. MEASURED
+// (this box, SwiftShader, SM64, worker eval): a fast save into a fresh _malloc 18.2-19.2 ms, into
+// the same buffer again 2.6-3.0 ms; writing the fresh buffer once 16.5-19.3 ms. So the field that
+// took a new buffer cost ~20 ms more than its neighbours (fsSnap's maxSnapMs 19.8-25.6 ms against a
+// 3.2 ms mean), and the frame clock never repays time a late field loses (gate 9). Here the pages
+// are written ahead, 4 MB (~3 ms) at a time and only in a turn with 6 ms or more before the next
+// field is owed: one spare beyond the buffers in use, never more than FSK.maxSnaps in all. The cost
+// is the heap of one snapshot a title that never skips would not have taken.
+var FSW = { p: 0, n: 0, done: 0, warmed: 0, ms: 0 };
+function fsWarmStep(slack) {
+  if (!FSK.on || !(slack >= 6) || FSK.pool.length || !fsCoreReady()) return;
+  if (!FSW.p) {
+    if (FSK.bufs >= FSK.maxSnaps) return;
+    var p = fsAlloc(); if (!p) return;
+    FSW.p = p; FSW.n = FSK.size + FSK.gsize; FSW.done = 0;
+  }
+  var t0 = performance.now(), end = Math.min(FSW.n, FSW.done + (4 << 20));
+  M.HEAPU8.fill(0, FSW.p + FSW.done, FSW.p + end);
+  FSW.done = end; FSW.ms += performance.now() - t0;
+  if (FSW.done >= FSW.n) { FSK.pool.push(FSW.p); FSW.p = 0; FSW.warmed++; }
 }
 function fsSnap(s) {
   var p = fsAlloc(); if (!p) return false;
@@ -1079,6 +1121,8 @@ function roomFeedBody(src) {
   // only (fsReport: tIn = the tick's start, where the room sampled the pad).
   if (FSK.on && FSK.tickDrew && fsCoreReady()) fsFence(tIn);
   var now = performance.now();
+  // delay lockstep runs its frames through fsField's snapshots: warm the next one in a quiet turn
+  if (R.LS.frame === f0 && R.LS.running && RM.eng && !RM.eng.rollback) fsWarmStep(roomDueAt(R) - now);
   if (now - RM.mirT > 100) roomMirror(true);
   if (now - RM.pubT > 400) { RM.pubT = now; if (R.LS.running) R.publishSelf(RM.rtt); }
 }

@@ -66,6 +66,17 @@ struct LoadStoreParams {
     // deferring cmp sets it; the immediately-following conditional branch reads
     // it to emit a direct operand compare. Inert when BEM_LAZY_CR is false.
     CmpFuse* cmp_fuse = nullptr;
+    // [BEM_LEVER_MEM_SLOWARM 2026-10-04] host-call state materialized in the
+    // host-call arm only. defer_pc != 0: ppc_emit elided this op's pre-op
+    // `ctx.PC = op.address` store (an integer load/store whose ONLY reason for
+    // it was FL_LOADSTORE); host_rc/host_rc_snap != null: emit_load_common /
+    // emit_store_common skipped the common-path rc.Flush. emit_host_call_prep
+    // re-emits both, from the snapshotted compile-time state, immediately before
+    // every host import the slow arms make — so the host observes byte-identical
+    // ctx.PC and gpr[] at every call, while the in-wasm fast arms pay neither.
+    u32 defer_pc = 0;
+    RegCache* host_rc = nullptr;
+    const RegCache::StateSnapshot* host_rc_snap = nullptr;
 };
 
 // WASM import indices. Match the existing live-tree contract in

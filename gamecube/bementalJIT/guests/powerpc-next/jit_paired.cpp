@@ -333,6 +333,11 @@ void emit_ps_sel(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Co
 // form (11 ops, stays in v128 domain): mask = (bits & ~sign) <u 0x00800000;
 // result = bitselect(bits & sign, bits, mask). Lanes 2-3 flush too — inert,
 // only lanes 0-1 are ever consumed by the paired emitters.
+// [ps_muls simd 2026-10-04] op-local v128 scratch: local 152, the same slot
+// jit_load_store.cpp names LOCAL_PSQ_V (group 9 of every build_* local
+// declaration). Never live across two guest ops.
+static constexpr u32 LOCAL_PS_V128_TMP = 152;
+
 static void emit_v128_ni_flush(WasmModuleBuilder& wb, u32 v128_local, u32 ctx_ptr) {
     // [ni-flush-gate PM60] default off = raw IEEE result (native gets FTZ free
     // via host MXCSR; wasm can't, so we'd pay this per-op). Stack-neutral: the
@@ -601,6 +606,85 @@ void emit_ps_muls(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const C
     const u32 fc   = GekkoOperands::FC(inst);
     const u32 sub5 = GekkoOperands::SUBOP5(inst);
     const u8  c_lane = (sub5 == 12) ? FPR_LANE_PS0 : FPR_LANE_PS1;
+
+    // [ps_muls simd lever 2026-10-04] Both inputs Single-resident: one f64x2
+    // multiply instead of 4 NaN-exact widens + Force25Bit + 2 x (mul + ForceSingle
+    // + widen). Measured 196-266 executed wasm ops per ps_muls0 on SAB's
+    // 0x800ed368 matrix block (block_replay), whose ps_madds then ALSO fell to
+    // their scalar arms because ps_muls' i64 output breaks the Single chain.
+    // EXACT vs the scalar arm below, lane by lane, for non-NaN results:
+    //  * a Single-resident value is f32-valued, so Force25Bit(c) == c (fraction
+    //    bits 0..28 are zero, so the round bit 27 is zero) and a*c is EXACT in
+    //    f64 (<= 48 significant bits, |a*c| in [2^-298, 2^256]); f64x2.mul is
+    //    therefore exactly the scalar f64.mul's value;
+    //  * ForceSingle is reproduced stage for stage (emit_force_single_i64): the
+    //    NI pre-cast flush on the f64 value, the demote (f32x4.demote_f64x2_zero
+    //    is f32.demote_f64 per lane), the NI post-cast f32-denormal flush — both
+    //    flushes gated on the RUNTIME FPSCR.NI exactly like the scalar arm (NOT
+    //    on g_bem_ni_flush, which only the f32x4 arms consult);
+    //  * the scalar arm's NaN ladder is a no-op at the native default
+    //    (g_bem_accurate_nans == 0, emit_nan_fixup_2op returns early), so the arm
+    //    is only taken when that ladder is compiled out.
+    // The Single result in lanes 0..1 is what the scalar arm's widened i64 pair
+    // re-demotes to (ConvertToDouble is the exact inverse on f32 bits).
+    if (bem_lever_on(BEM_LEVER_PS_MULS_SIMD) && !g_bem_accurate_nans &&
+        frc.IsSingle(fa) && frc.IsSingle(fc)) {
+        auto a = frc.BindSingleRead(fa);
+        auto c = frc.BindSingleRead(fc);
+        auto d = frc.BindSingleWrite(fd);
+        const u8 c_idx = (c_lane == FPR_LANE_PS0) ? 0u : 1u;
+        wb.op_local_get(a.v128_idx);
+        wb.op_f64x2_promote_low_f32x4();         // {a.ps0, a.ps1} as f64
+        wb.op_local_get(c.v128_idx);
+        wb.op_f32x4_extract_lane(c_idx);
+        wb.op_f64_promote_f32();
+        wb.op_f64x2_splat();                     // {c, c}
+        wb.op_f64x2_mul();                       // exact products
+        wb.op_local_set(LOCAL_PS_V128_TMP);
+        // T1 = FPSCR & 4 (NI), read once for both stages (the scalar arm reads
+        // it per lane; nothing between the two reads can write FPSCR).
+        wb.op_i32_const((s32)ctx_ptr);
+        wb.op_i32_load(ppc_off::FPSCR);
+        wb.op_i32_const(4);
+        wb.op_i32_and();
+        wb.op_local_set(LOCAL_FP_T1);
+        wb.op_local_get(LOCAL_FP_T1);
+        wb.op_if();                              // NI pre-cast flush (f64 domain)
+        {
+            wb.op_local_get(LOCAL_PS_V128_TMP);
+            wb.op_v128_const_i64_splat(0x8000000000000000ull);
+            wb.op_v128_and();                    // signed zero candidate
+            wb.op_local_get(LOCAL_PS_V128_TMP);
+            wb.op_local_get(LOCAL_PS_V128_TMP);
+            wb.op_f64x2_abs();
+            wb.op_v128_const_i64_splat(0x3810000000000000ull);  // 2^-126
+            wb.op_f64x2_lt();                    // |x| < smallest normal single
+            wb.op_v128_bitselect();
+            wb.op_local_set(LOCAL_PS_V128_TMP);
+        }
+        wb.op_end();
+        wb.op_local_get(LOCAL_PS_V128_TMP);
+        wb.op_f32x4_demote_f64x2_zero();
+        wb.op_local_set(d.v128_idx);
+        wb.op_local_get(LOCAL_FP_T1);
+        wb.op_if();                              // NI post-cast f32 flush
+        {
+            wb.op_local_get(d.v128_idx);
+            wb.op_v128_const_i32_splat(0x80000000u);
+            wb.op_v128_and();
+            wb.op_local_get(d.v128_idx);
+            wb.op_local_get(d.v128_idx);
+            wb.op_v128_const_i32_splat(0x7FFFFFFFu);
+            wb.op_v128_and();
+            wb.op_v128_const_i32_splat(0x00800000u);
+            wb.op_i32x4_lt_u();
+            wb.op_v128_bitselect();
+            wb.op_local_set(d.v128_idx);
+        }
+        wb.op_end();
+        emit_fprf_single_from_v128(wb, d.v128_idx, ctx_ptr, !op.fprf_discardable);
+        return;
+    }
 
     auto fa_pair = frc.Bind(fa, FPRMode::Read,  FPR_LANE_BOTH);
     auto fc_pair = frc.Bind(fc, FPRMode::Read,  c_lane);

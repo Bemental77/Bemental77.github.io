@@ -108,6 +108,13 @@ const LSEXACT = has('lsexact');
 //   a file from another run (the frame-skip arms: a skipped room's drawn pictures against a room that
 //   draws every frame), frame for frame where both have one.
 const PICS = flag('pics', ''), PICSREF = flag('picsref', '');
+// --dumpat F1,F2,... --dumpdir DIR: diagnostic — write the room's raw state after each listed tapped frame
+//   and the straight run's at the same frames to DIR/room_F.bin, DIR/ref_F.bin (16.8 MB each), for a
+//   field-by-field diff (n64/tools/n64_state_diff.mjs).
+const DUMPAT = flag('dumpat', '').split(',').filter(Boolean).map(Number), DUMPDIR = flag('dumpdir', '');
+// --ranlog PATH (diagnostic, core worker): after every frame the room runs (again), the lazy framebuffer
+//   queue, glide's readback-failed flag and the CPU fingerprint, last run wins: { frame: [...] } -> PATH
+const RANLOG = flag('ranlog', '');
 const PICDUMP = flag('picdump', '').split(',').filter(Boolean).map(Number);   // diagnostic: raw RGBA of these frames into the --json
 const CIN_SRC = (engExpr) => `(function () {
   self.__cin = {}; self.__cinPolls = 0;
@@ -138,8 +145,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // page seam, the ghosts and the reference run. Buttons change every 8 / 23
 // frames, the stick every 6 — a repeat-last prediction is wrong several times
 // a second per remote port.
+// --ghostconst (diagnostic): the ghost players hold a constant (empty) pad, so the room's predictions are
+//   right and it (almost) never rolls back — what a rollback room does per frame, without its loads
+const GHOSTCONST = has('ghostconst');
 const PAD_SRC = `function __pad(f, p) {
   var b = new Uint8Array(4), m = 0;
+  if (${GHOSTCONST ? 'p > 0' : 'false'}) return b;
   if ((((f >> 3) + p) & 1) === 1) m |= (1 << 4);          // A
   if (((f + 5 * p) % 23) < 11) m |= (1 << 3);             // right
   if ((f % 97) === 40 + p) m |= (1 << 6);                  // Start, now and then
@@ -249,8 +260,31 @@ try {
     // eslint-disable-next-line no-eval
     (0, eval)(padSrc);
     window.__n64PadOverride = function (f, p) { return window.__pad(f, p); };
-    window.__rbFull = {}; window.__n64RbLog = [];
-    window.__n64RbTap = function (k, buf, fp) { window.__rbFull[k] = { full: window.__n64State.hashFull(buf), fp: fp >>> 0 }; };
+    window.__rbFull = {}; window.__n64RbLog = []; window.__dumpAt = cfg.dumpAt;
+    if (cfg.ranlog) {
+      window.__ranlog = {};
+      window.__n64RanTap = function (k, kind) {
+        const M = window.Module; if (!window.__rlq) { window.__rlq = M._malloc(256); window.__rls = M._malloc(32); }
+        const lq = window.__rlq, ls = window.__rls;
+        const n = M._neil_lfb_pending(lq, 16), q = Array.from(M.HEAPU32.subarray(lq >> 2, (lq >> 2) + 2 * Math.min(n, 16))).map((x) => x.toString(16)).join(',');
+        M._neil_lfb_stats(ls); const st = Array.from(M.HEAPU32.subarray(ls >> 2, (ls >> 2) + 8));
+        window.__ranlog[k] = [q, M._neil_native_fbread_failed(), M._neil_last_fp() >>> 0, kind, st.join('.'), window.__fbAsync ? window.__fbAsync.calls : -1];
+        window.__clF = k;
+        if (window.__callLog && k >= 1237 && k <= 1248) window.__callLog.push([k, 'TAP', kind, new Error().stack.split('\n').slice(2, 6).join(' <- ').replace(/https?:[^ )]*\//g, '')]);
+        if (!window.__clOn) {
+          // every call into the core's exports while frames 1238..1248 run, with its arguments
+          window.__clOn = true; window.__callLog = [];
+          for (const name of Object.keys(M)) {
+            if (!/^_/.test(name) || typeof M[name] !== 'function' || /^_(neil_lfb_pending|neil_lfb_stats|neil_native_fbread_failed|malloc|free)$/.test(name)) continue;
+            const f = M[name];
+            M[name] = function () { if (window.__clF >= 1237 && window.__clF <= 1248 && window.__callLog.length < 20000) window.__callLog.push([window.__clF, name, Array.from(arguments).join(','), name === '_neil_ls_run_frame' ? new Error().stack.split('\n').slice(2, 6).join(' <- ').replace(/https?:[^ )]*\//g, '') : '']);
+              try { return f.apply(this, arguments); } catch (e) { if (window.__callLog.length < 20000) window.__callLog.push([window.__clF, 'THROW ' + name, String(e && e.message || e), String(e && e.stack || '').split('\n').slice(0, 12).join(' <- ').replace(/https?:[^ )]*\//g, '')]); throw e; } };
+          }
+        }
+      };
+    }
+    window.__n64RbTap = function (k, buf, fp) { window.__rbFull[k] = { full: window.__n64State.hashFull(buf), fp: fp >>> 0 };
+      if (window.__dumpAt && window.__dumpAt.indexOf(k) >= 0) (window.__rbDump = window.__rbDump || {})[k] = buf.slice(); };
     const w = new Worker(URL.createObjectURL(new Blob([src.replace('__ORIGIN__', location.origin)], { type: 'text/javascript' })));
     window.__ghost = w; window.__ghostStat = null;
     // (the options the page's own startLockstep passes: rollbackOk, rbCatchUp, rbResume)
@@ -265,7 +299,7 @@ try {
     const eng = window.__n64LsEngine;
     eng.seat('page', 1);
     for (let i = 1; i < cfg.players; i++) eng.seat('g' + i, 1);
-  }, { players: PLAYERS, rbw: RBW, hashEvery: HASH_EVERY, latmin: LATMIN, latmax: LATMAX, adaptive: ADAPTIVE }, GHOST_SRC, PAD_SRC.replace('function __pad', 'window.__pad = function'));
+  }, { ranlog: !!RANLOG, dumpAt: DUMPDIR ? DUMPAT : [], players: PLAYERS, rbw: RBW, hashEvery: HASH_EVERY, latmin: LATMIN, latmax: LATMAX, adaptive: ADAPTIVE }, GHOST_SRC, PAD_SRC.replace('function __pad', 'window.__pad = function'));
   await page.evaluate((want) => {
     for (const id of ['romSelect', 'mobileRomSelect']) {
       const sel = document.getElementById(id); if (!sel) continue;
@@ -283,7 +317,16 @@ try {
     const src = PAD_SRC.replace('function __pad', 'self.__pad = function') + `;
       self.__n64PadOverride = function (f, p) { return self.__pad(f, p); };
       self.__rbFull = {}; self.__n64RbLog = [];
-      self.__n64RbTap = function (k, buf, fp) { self.__rbFull[k] = { full: self.__n64State.hashFull(buf), fp: fp >>> 0 }; };
+      self.__n64RbTap = function (k, buf, fp) { self.__rbFull[k] = { full: self.__n64State.hashFull(buf), fp: fp >>> 0 };
+        if (${JSON.stringify(DUMPAT)}.indexOf(k) >= 0) (self.__rbDump = self.__rbDump || {})[k] = buf.slice(); };
+      ${RANLOG ? `(function () {
+        var M = self.Module, lq = M._malloc(256), ls = M._malloc(32); self.__ranlog = {};
+        self.__n64RanTap = function (k, kind) {
+          var n = M._neil_lfb_pending(lq, 16), q = Array.from(M.HEAPU32.subarray(lq >> 2, (lq >> 2) + 2 * Math.min(n, 16))).map(function (x) { return x.toString(16); }).join(',');
+          M._neil_lfb_stats(ls); var st = Array.from(M.HEAPU32.subarray(ls >> 2, (ls >> 2) + 8));
+          self.__ranlog[k] = [q, M._neil_native_fbread_failed(), M._neil_last_fp() >>> 0, kind, st.join('.'), self.__fbAsync ? self.__fbAsync.calls : -1];
+        };
+      })();` : ''}
       ${(PICS || PICSREF) ? `(function () {
         var px = null, toastSeen = true;
         self.__n64PicTap = function (f) {
@@ -448,6 +491,20 @@ try {
     ? Object.assign(await page.evaluate((pics) => window.__n64Worker.eval('({ rblog: self.__n64RbLog.slice(0, 4000), pics: ' + (pics ? '(function (L) { var o = {}, minFrom = Infinity; for (var i = L.length - 1; i >= 0; i--) { var e = L[i]; if (e[0] === "rb") minFrom = Math.min(minFrom, e[2]); else if (e[0] === "pic" && e[1] < minFrom) o[e[1]] = e[2]; } return o; })(self.__n64RbLog)' : 'null') + ', full: self.__rbFull, cin: self.__cin || null, cinPolls: self.__cinPolls | 0 })'), !!(PICS || PICSREF)),
                     await page.evaluate(() => ({ frame: window.__n64LsEngine.frame, confirmed: window.__n64LsEngine._rbConfirmed })))
     : await page.evaluate(() => ({ rblog: window.__n64RbLog.slice(0, 4000), full: window.__rbFull, frame: window.__n64LsEngine.frame, confirmed: window.__n64LsEngine._rbConfirmed, cin: window.__cin || null, cinPolls: window.__cinPolls | 0 }));
+  const b64 = (u8) => { let str = ''; for (let q = 0; q < u8.length; q += 0x8000) str += String.fromCharCode.apply(null, u8.subarray(q, q + 0x8000)); return btoa(str); };
+  if (RANLOG && out.worker) writeFileSync(RANLOG, await page.evaluate(() => window.__n64Worker.eval('JSON.stringify({ ran: self.__ranlog || {}, seq: (self.__fbAsync && self.__fbAsync.seq) || null })')));
+  else if (RANLOG) writeFileSync(RANLOG, await page.evaluate(() => JSON.stringify({ ran: window.__ranlog || {}, seq: (window.__fbAsync && window.__fbAsync.seq) || null, calls: window.__callLog || null })));
+  if (DUMPAT.length && DUMPDIR) {
+    for (const k of DUMPAT) {
+      const s64 = out.worker
+        ? await page.evaluate((k2, src) => window.__n64Worker.eval('(function (u8) { if (!u8) return null; ' + src + ' return b64(u8); })(self.__rbDump && self.__rbDump[' + k2 + '])'), k, 'var b64 = ' + b64.toString() + ';')
+        : await page.evaluate((k2, src) => { const u8 = window.__rbDump && window.__rbDump[k2]; if (!u8) return null; const f = (0, eval)('(' + src + ')'); return f(u8); }, k, b64.toString());
+      if (s64) writeFileSync(DUMPDIR + '/room_' + k + '.bin', Buffer.from(s64, 'base64'));
+    }
+  }
+  // --cin: the input each held frame LAST ran with on the room's core (room_core.js RB.img) — the
+  // confirmed timeline's — checked against the engine's final inputs below
+  if (CIN && out.worker) room.ranWith = await page.evaluate(() => window.__n64Worker.eval('(function (R) { var o = {}; if (!R || !R.RB) return o; for (var j = 0; j < R.RB.imgF.length; j++) { var f = R.RB.imgF[j], im = R.RB.img[j]; if (f >= 0 && im) o[f] = Array.prototype.slice.call(im); } return o; })(self.RM && self.RM.R)'));
   Object.assign(out, {
     mode: z.mode, roomRate: +((z.frame - a.frame) / secs / (z.viHz || 50)).toFixed(4),
     secsBelow99: tl.filter((x) => x.rate < 0.99).length,
@@ -528,7 +585,7 @@ try {
     await pb.waitForFunction(() => window.__refMain === true, { timeout: 240000 });
     const last = keys[keys.length - 1];
     const picKeys = room.pics ? Object.keys(room.pics).map(Number).filter((f) => f <= last) : [];
-    const ref = await pb.evaluate(async (padSrc, players, keys, last, cin, picKeys) => {
+    const ref = await pb.evaluate(async (padSrc, players, keys, last, cin, picKeys, dumpAt, picDumpF) => {
       // the room's kept pictures, from the straight run (same inputs, every frame drawn)
       const picWant = new Set(picKeys), pics = {};
       let px = null;
@@ -567,17 +624,35 @@ try {
           } else set(p, sp);
         }
         M._neil_ls_run_frame();
-        if (picWant.has(f)) pics[f] = picture();
+        (window.__refCalls = window.__refCalls || {})[f] = window.__fbAsync ? window.__fbAsync.calls : -1;
+        // the frontend's toast, as the room side reads it (the last int of glide's host-state image):
+        // a frame that may show it is not compared on either side
+        let toastNow = false;
+        if (picWant.size && M._neil_gl_state_size) {
+          const gn = M._neil_gl_state_size(), gp = window.__gsp || (window.__gsp = M._malloc(gn));
+          M._neil_gl_state_save(gp); const o = gp + gn - 4, U = M.HEAPU8;
+          toastNow = (U[o] | (U[o + 1] << 8) | (U[o + 2] << 16) | (U[o + 3] << 24)) > 0;
+        }
+        const toastHid = toastNow || window.__toastWas; window.__toastWas = toastNow;
+        if (picWant.has(f) && !toastHid) { pics[f] = picture(); if (picDumpF.indexOf(f) >= 0) { let str = ''; for (let q = 0; q < px.length; q += 0x8000) str += String.fromCharCode.apply(null, px.subarray(q, q + 0x8000)); (window.__picDumpRef = window.__picDumpRef || {})[f] = { W: window.Module.ctx.drawingBufferWidth, H: window.Module.ctx.drawingBufferHeight, b64: btoa(str) }; } }
         if (want.has(f)) {
           window.__n64State.save(buf);
           res[f] = { full: window.__n64State.hashFull(buf), fp: M._neil_last_fp() >>> 0 };
+          if (dumpAt.indexOf(f) >= 0) (window.__refDump = window.__refDump || {})[f] = buf.slice();
         }
         if ((f & 63) === 0) await new Promise((r) => setTimeout(r, 0));
       }
       res.__cin = { used: cinUsed, missing: cinMissing, differsFromPad: cinDiffers };
       res.__pics = pics;
       return res;
-    }, PAD_SRC.replace('function __pad', 'window.__pad = function'), PLAYERS, keys, last, CIN ? room.cin : null, picKeys);
+    }, PAD_SRC.replace('function __pad', 'window.__pad = function'), PLAYERS, keys, last, CIN ? room.cin : null, picKeys, DUMPDIR ? DUMPAT : [], PICDUMP);
+    if (PICDUMP.length) out.picDumpRef = await pb.evaluate(() => window.__picDumpRef || null);
+    if (DUMPAT.length && DUMPDIR) {
+      for (const k of DUMPAT) {
+        const s64 = await pb.evaluate((k2, src) => { const u8 = window.__refDump && window.__refDump[k2]; if (!u8) return null; const b64 = (0, eval)('(' + src + ')'); return b64(u8); }, k, b64.toString());
+        if (s64) writeFileSync(DUMPDIR + '/ref_' + k + '.bin', Buffer.from(s64, 'base64'));
+      }
+    }
     if (room.pics) {
       const rp = ref.__pics; let both = 0, same = 0; const diff = [];
       for (const f in rp) { both++; if (rp[f] === room.pics[f]) same++; else if (diff.length < 12) diff.push(+f); }
@@ -585,6 +660,17 @@ try {
     }
     delete ref.__pics;
     const cinStat = ref.__cin; delete ref.__cin;
+    if (room.ranWith && room.cin) {
+      // did each frame last run with its final input? (a frame that did not and was never rolled
+      // back is a missed correction — this console's guest is not the room's)
+      const bad = []; let checked = 0;
+      for (const f in room.ranWith) {
+        const row = room.cin[f]; if (!row || +f > (room.confirmed | 0)) continue;
+        const im = room.ranWith[f]; checked++;
+        for (let p = 0; p < PLAYERS; p++) { const b = row[p]; if (!b) continue; if (b.join() !== im.slice(p * 4, p * 4 + 4).join()) { if (bad.length < 20) bad.push([+f, p, im.slice(p * 4, p * 4 + 4), b]); } }
+      }
+      out.ranWithFinal = { checked, wrong: bad };
+    }
     let firstFull = null, firstFp = null, same = 0;
     for (const k of keys) {
       const A = room.full[k], B = ref[k];
@@ -595,7 +681,10 @@ try {
     }
     out.reference = { cin: CIN ? Object.assign({ polls: room.cinPolls, frames: room.cin ? Object.keys(room.cin).length : 0 }, cinStat) : null, compared: keys.length, fullMatch: same, firstFullMismatch: firstFull, firstFpMismatch: firstFp,
       events: (room.rblog || []).filter((e) => (e[0] === 'grow') || (e[1] >= (firstFull == null ? 0 : firstFull) - 25 && e[1] <= (firstFull == null ? 0 : firstFull) + 5)).slice(0, 60),
-      mismatches: keys.filter((k) => ref[k] && room.full[k].full !== ref[k].full).slice(0, 12) };
+      mismatches: keys.filter((k) => ref[k] && room.full[k].full !== ref[k].full).slice(0, 12),
+      // the rollbacks that re-simulated the frames before the first mismatch (they may run later)
+      rbInto: firstFull == null ? [] : (room.rblog || []).filter((e) => (e[0] === 'rb' || e[0] === 'fsrerun') && e[2] <= firstFull && e[1] >= firstFull - 10).slice(0, 40) };
+    if (RANLOG) writeFileSync(RANLOG + '.ref', await pb.evaluate(() => JSON.stringify({ calls: window.__refCalls || {}, seq: (window.__fbAsync && window.__fbAsync.seq) || null })));
     await ctxB.close();
   }
 } catch (e) { out.error = e.message; }

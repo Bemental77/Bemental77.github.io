@@ -456,6 +456,18 @@ static unsigned int g_vi_total = 0; /* VIs since boot, counted regardless of ena
 void neil_diff_enable(int v) { g_diff_enabled = v; g_diff_n = 0; }
 int neil_diff_count(void) { return g_diff_n; }
 unsigned int neil_vi_total(void) { return g_vi_total; }
+
+/* THE HEAP AS THE ALLOCATOR SEES IT (n64/N64Wasm/dist/room_core.js n64sRawRoom). The wasm heap is a
+ * fixed 512 MB that never grows, and a malloc that does not fit ABORTS the runtime (no NULL). The
+ * page keeps rollback snapshots in it, so it must know how much the core can still allocate: the
+ * space above the break (sbrk) plus the free chunks below it. Counting only from the top of its OWN
+ * buffers it missed everything the core had carved above them, and a rollback room of Donkey
+ * Kong 64 ran the core out of heap at frame ~1247 (Aborted(OOM) inside a frame, which the room
+ * then re-ran from a half-run machine: the "DK64 rollback desync"). */
+#include <malloc.h>
+#include <unistd.h>
+unsigned int neil_heap_brk(void) { return (unsigned int)(uintptr_t)sbrk(0); }
+unsigned int neil_heap_free_below(void) { struct mallinfo mi = mallinfo(); return (unsigned int)mi.fordblks; }
 unsigned int neil_diff_get(int i) { return (i >= 0 && i < g_diff_n) ? g_diff_buf[i] : 0; }
 
 /* LOCKSTEP: the SAME architectural-state checksum, but readable for the frame

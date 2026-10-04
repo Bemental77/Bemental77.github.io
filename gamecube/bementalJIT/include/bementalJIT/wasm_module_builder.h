@@ -669,6 +669,18 @@ public:
 	void op_f32x4_sub()          { emitByte(V128_PREFIX); emitLEB128(0xE5u); }
 	void op_f32x4_mul()          { emitByte(V128_PREFIX); emitLEB128(0xE6u); }
 	void op_f32x4_div()          { emitByte(V128_PREFIX); emitLEB128(0xE7u); }
+	// [ps_muls simd 2026-10-04] f64x2 lane arithmetic (WebAssembly SIMD spec
+	// opcode table: f64x2.lt 0x49, f64x2.abs 0xEC, f64x2.mul 0xF2).
+	void op_f64x2_lt()           { emitByte(V128_PREFIX); emitLEB128(0x49u); }
+	void op_i32x4_eq()           { emitByte(V128_PREFIX); emitLEB128(0x37u); }   // spec opcode 0x37
+	void op_f64x2_abs()          { emitByte(V128_PREFIX); emitLEB128(0xECu); }
+	void op_f64x2_mul()          { emitByte(V128_PREFIX); emitLEB128(0xF2u); }
+	// v128.const with both i64 lanes equal; 16 literal bytes, each lane LE.
+	void op_v128_const_i64_splat(u64 v) {
+		emitByte(V128_PREFIX); emitLEB128(0x0Cu);
+		for (int lane = 0; lane < 2; ++lane)
+			for (int b = 0; b < 8; ++b) emitByte((u8)((v >> (8 * b)) & 0xFFu));
+	}
 	void op_f64x2_promote_low_f32x4() { emitByte(V128_PREFIX); emitLEB128(0x5Fu); }  // low 2 f32 -> f64x2
 	void op_f32x4_demote_f64x2_zero() { emitByte(V128_PREFIX); emitLEB128(0x5Eu); }  // f64x2 -> low 2 f32
 	// relaxed-SIMD fused multiply-add: (a,b,c) -> a*b+c, fused on FMA hardware
