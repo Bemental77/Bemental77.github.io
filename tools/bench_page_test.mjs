@@ -6,6 +6,7 @@
 //   npm run web            (port 8080, CLAUDE.md gate #2)
 //   node tools/browser_leak_guard.js reap && uptime
 //   node tools/bench_page_test.mjs [--pages n64,ps1] [--sec 10] [--room 0|1] [--q costdbg=1] [--headful]
+//                                  [--chrome-args "--enable-unsafe-webgpu"]
 //
 // Also checks the inert path: WITHOUT ?bench=1 the page must have no
 // window.__bench, no #benchPanel, and an unwrapped window.Worker.
@@ -43,7 +44,10 @@ function checkWindow(tag, w, room) {
 
 const browser = await puppeteer.launch({
   executablePath: CHROME, headless: HEADFUL ? false : 'new',
-  args: ['--no-sandbox', '--autoplay-policy=no-user-gesture-required', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--window-size=1280,900'],
+  args: ['--no-sandbox', '--autoplay-policy=no-user-gesture-required', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--window-size=1280,900',
+    // --chrome-args "--enable-unsafe-webgpu": the gamecube recomp hand-off race only shows when
+    // the WGPU renderer publishes frames before the takeover, i.e. with WebGPU on.
+    ...flag('chrome-args', '').split(' ').filter(Boolean)],
 });
 try { (await import('./browser_leak_guard.js')).default.guard(browser, 'bench_page_test'); } catch (_e) {}
 const results = {};
