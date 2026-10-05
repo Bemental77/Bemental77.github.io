@@ -2931,6 +2931,7 @@
         // rather than repaid, and the pace sleep asked vs delivered. Summed
         // until the next heartbeat line prints them.
         if (d.dropMs !== undefined) {
+          if (LS.running) lsLookTune(d.dropMs | 0);
           govDropMs += d.dropMs | 0; govDrops += d.drops | 0;
           govAskMs += d.pacedMs | 0; govSleptMs += d.sleptMs | 0;
           if ((d.maxLagMs | 0) > govMaxLag) govMaxLag = d.maxLagMs | 0;
@@ -6019,6 +6020,9 @@
     workerStall: false,  // the CORE's own gate says it has no input for its frame
     fault: null,         // why this machine is NOT frame-gated, in words
     engagedAt: 0,
+    // THE QUEUE DEPTH THIS ROOM IS USING NOW (lsLookTune): starts at 2, steps
+    // down to LSQ.lookahead once depth 1 has proven free, back up if it is not.
+    look: 0, lookHot: 0, lookCalm: 0, lookUps: 0, lookDowns: 0, lookDownAt: 0, lookLatched: false,
     // THE FRAME COUNTER AT THE TWO MOMENTS A RIG CAN ASK ABOUT. Both are
     // framesRun — frames the CORE reported completing under lockstep — read
     // when the gate armed and when the barrier released. A room that started
@@ -6042,6 +6046,9 @@
   //     worker carries a stall as a bounded debt instead of rebasing its
   //     governor (flycast_worker.js, THE GUEST RATE); it was 2 only because a
   //     one-frame queue un-paced the rebasing governor (1.51-1.56x, lsFeed).
+  //     ⚠ 1 IS EARNED, NOT ASSUMED — see lsLookTune: a room starts at 2 and steps
+  //     down to 1 after 15 s without a dropped frame, and a console whose worker
+  //     DROPS guest time at depth 1 goes back to 2 (?lslook=N pins the depth).
   //   minDelay: the engine's delay floor for THIS console (lib/netplay.js
   //     Lockstep opts.minDelay; other consoles keep 2).
   //   spare: frames added to ceil(one-way / frame) when the host sizes the
@@ -6055,7 +6062,7 @@
   const LSQ = (() => {
     const q = new URLSearchParams(location.search);
     const int = (k, lo, hi, d) => { const v = q.get(k); if (v == null || v === '') return d; const n = parseInt(v, 10); return isFinite(n) ? Math.max(lo, Math.min(hi, n)) : d; };
-    return { lookahead: int('lslook', 1, 4, 1), minDelay: int('lsmindelay', 1, 2, 1),
+    return { lookahead: int('lslook', 1, 4, 1), lookPinned: q.has('lslook'), minDelay: int('lsmindelay', 1, 2, 1),
              forceDelay: int('lsdelay', 1, 30, 0), repay: q.get('lsrepay') !== '0',
              spare: int('lsspare', 0, 4, 0),
              // OFF by default: measured at ~2 ms RTT it gave back 18 ms more
@@ -6358,7 +6365,7 @@
     // top of a frame no longer un-paces it — the defect this paragraph names is
     // fixed, and the frame of input lag it cost is given back. ?lslook=2 is the
     // old depth.
-    const lookahead = LSQ.lookahead;
+    const lookahead = LS.look || lsLookStart();
     // held until just before the worker's next frame (lsOnWorkerFrame); a call
     // from rAF or from an arriving input before then waits for the timer
     if (LS.feedNotBefore && _now() < LS.feedNotBefore) { lsDiagTick(ls, null); return; }
@@ -6396,6 +6403,56 @@
       if (++fed > 240) { pageLog('[lockstep] ⚠ feed loop hit its 240-frame bound — not sprinting the guest'); break; }
     }
     lsDiagTick(ls, null);
+  }
+
+  // ---- THE QUEUE DEPTH FOLLOWS WHAT IT COSTS THIS CONSOLE (2026-10-05) ------
+  // Depth 1 (LSQ.lookahead) gives the player a frame of input lag back, but it
+  // puts a page round trip on EVERY frame: the worker finishes N, the page
+  // hears it, samples the pad, asks the engine and posts N+1, and only then
+  // does the worker start N+1. Where the page's thread is busy, that hop is
+  // guest time the worker cannot get back — it parks, the stall is repaid up
+  // to CATCHUP_MAX_MS and the rest is DROPPED (gov=drop, flycast_worker.js).
+  // MEASURED, bench room (one tab, two consoles, the joiner an iframe on the
+  // SAME main thread), headless Chrome without --use-angle=swiftshader, where
+  // the room is render-bound (render-hold 50-65%): depth 1 read 0.69-0.80x
+  // (10 runs), depth 2 on the same build 0.90/0.93x, a94321d (depth 2) 0.90-
+  // 0.98x; with --use-angle=swiftshader depth 1 holds 1.000x and drops 0 ms.
+  // So depth 1 is EARNED, not assumed: a room starts at 2, and 15 windows (1 s
+  // each, from the worker's governor) in a row without a dropped frame step it
+  // down to 1. A window that drops >= 100 ms of guest time at depth 1 raises it
+  // back to 2 (depth 1 on the render-bound arm dropped 220-560 ms per window;
+  // on the other arm 0-13 ms once the room settled), and a raise within 30 s of
+  // a step-down keeps 2 for the rest of the room. The first 2.5 s after the
+  // gate engages are not judged: EVERY room start drops 150-340 ms in its first
+  // window or two, on both arms, at either depth. (Starting at 1 and raising on
+  // the first bad window read 0.980-0.994x on the render-bound arm: the second
+  // or two at depth 1 before the raise were in the measured window.) Input lag only — beginFrame alone decides which
+  // frame a pad lands on, so the depth is this console's own business and can
+  // never desync a room. ?lslook=N pins it (an arm).
+  const LOOK_DROP_MS = 100, LOOK_HOT = 1, LOOK_CALM = 15, LOOK_LATCH_MS = 30000, LOOK_SETTLE_MS = 2500;
+  // the depth a room starts at: 2, unless ?lslook pinned one (or it is already >= 2)
+  function lsLookStart() { return (LSQ.lookPinned || LSQ.lookahead >= 2) ? LSQ.lookahead : LSQ.lookahead + 1; }
+  function lsLookTune(dropMs) {
+    if (LSQ.lookPinned || LSQ.lookahead >= 2) return;
+    if (!(LS.engagedAt > 0) || _now() - LS.engagedAt < LOOK_SETTLE_MS) return;
+    if (!LS.look) LS.look = lsLookStart();
+    if (LS.look <= LSQ.lookahead) {
+      LS.lookHot = dropMs >= LOOK_DROP_MS ? LS.lookHot + 1 : 0;
+      if (LS.lookHot < LOOK_HOT) return;
+      LS.look = LSQ.lookahead + 1; LS.lookHot = 0; LS.lookCalm = 0; LS.lookUps++;
+      if (LS.lookDownAt && _now() - LS.lookDownAt < LOOK_LATCH_MS) LS.lookLatched = true;
+      pageLog('[lockstep] queue depth ' + LSQ.lookahead + ' -> ' + LS.look + ': the worker dropped ' + dropMs +
+              ' ms of guest time in 1 s waiting on this page' +
+              (LS.lookLatched ? ' — again within ' + (LOOK_LATCH_MS / 1000) + ' s of trying ' + LSQ.lookahead + ', so ' + LS.look + ' stays' : ''));
+      lsFeed();
+      return;
+    }
+    if (LS.lookLatched) return;
+    LS.lookCalm = dropMs > 0 ? 0 : LS.lookCalm + 1;
+    if (LS.lookCalm < LOOK_CALM) return;
+    LS.look = LSQ.lookahead; LS.lookCalm = 0; LS.lookDowns++; LS.lookDownAt = _now();
+    pageLog('[lockstep] queue depth ' + (LSQ.lookahead + 1) + ' -> ' + LS.look + ': ' + LOOK_CALM + ' s without a dropped frame' +
+            (LS.lookDowns === 1 && !LS.lookUps ? ' — depth ' + LS.look + ' earned' : ''));
   }
 
   // ---- what the worker tells us --------------------------------------------
@@ -6656,6 +6713,8 @@
     LS.hashEvery = 60;
     worker.postMessage({ cmd: 'lockstep', on: 1, frame: 0, hashEvery: LS.hashEvery, repay: LSQ.repay ? 1 : 0 });
     LS.armed = true; LS.running = false; LS.workerFrame = 0; LS.fedTo = 0; LS.framesRun = 0;
+    LS.look = lsLookStart(); LS.lookHot = 0; LS.lookCalm = 0; LS.lookUps = 0; LS.lookDowns = 0;
+    LS.lookDownAt = 0; LS.lookLatched = false;
     LS.armedAtFrame = LS.framesRun; LS.releasedAtFrame = null;
     LS.fault = null;
     pageLog('[lockstep] ARMED before the first free-run frame — the pump will park on an empty queue at ' +
@@ -7771,6 +7830,7 @@
       stalling: LS.stalling, waitingOn: LS.waitingOn.slice(), stallReason: LS.stallReason,
       workerStall: LS.workerStall,
       hashesFed: LS.hashesFed, hashSink: LS.hashSink,
+      look: LS.look || lsLookStart(), lookUps: LS.lookUps, lookDowns: LS.lookDowns, lookLatched: LS.lookLatched,
       controllers: LS.playersAck, normalize: LS.normalizeAck,
       fault: LS.fault,
     },

@@ -217,7 +217,7 @@ engine behaves exactly as before.
 
 | arm | effect |
 |---|---|
-| `?lslook=N` | worker queue depth (default 1) |
+| `?lslook=N` | pins the worker queue depth (default: starts at 2, earns 1 — see below) |
 | `?lsmindelay=N` | engine floor, 1 or 2 (default 1) |
 | `?lsdelay=N` | host forces the room's delay |
 | `?lsspare=N` | frames added to `ceil(one-way / frame)` (default 0) |
@@ -233,3 +233,58 @@ engine behaves exactly as before.
   because no frame has run yet. That is conservative by 2x for a 30 fps title
   like PSO; at ~85 ms RTT it picked 4 where 2 frames of PSO would cover the
   path.
+
+## Follow-up: depth 1 is earned, not assumed (2026-10-05, after prod 89746cb)
+
+The live bench room on prod 20dd57b / ae86b6e / 89746cb read 0.678-0.695x with
+295-328 slow seconds, where a94321d had read 0.9996x. The cause was depth 1.
+
+- **The bench room puts both consoles on one main thread.** The joiner is a
+  same-origin iframe (`lib/bench.js` roomMain), so both pages share it.
+- **Depth 1 puts a page round trip on every frame.** Where that thread is
+  busy, the worker parks, repays up to 100 ms, and drops the rest
+  (`gov=drop`).
+- **This condition is reached with headless Chrome WITHOUT
+  `--use-angle=swiftshader`.** The live harness runs that way. The room is
+  render-bound there (render-hold 50-65%, drops 220-560 ms in each 1 s
+  window).
+- **With that flag, every arm passes.** `bench_page_test` and the soak rig
+  pass it, which is why the original measurements above did not see this.
+  With the flag, depth 1 holds 1.000x and drops 0 ms.
+
+Matched A/B, prod-mirror snapshots, probe lock held, load 1.5-6 on 4 cores.
+Room speed / slow seconds:
+
+| arm (no `--use-angle`) | room |
+|---|---|
+| a94321d (depth 2) | 0.908/0, 0.924/0, 0.896/0, 0.940/0, 0.982/0 |
+| 20dd57b, ae86b6e, 89746cb (depth 1) | 0.69-0.80, 38-391 over (13 runs, live included) |
+| 89746cb with `lslook` default 2 | 0.902/0, 0.933/40 |
+| 89746cb with `lsmindelay` default 2 | 0.745/136, 0.800/0 |
+| 89746cb with `lsrepay=0` | 0.697/222, 0.713/191 |
+| fix: start at 1, raise on a drop | 0.994/0, 0.990/0, 0.980/0 |
+| **fix as shipped: start at 2, earn 1** | **0.986/0, 0.994/0, 0.961/0** |
+
+With `--use-angle=swiftshader`, the fix as shipped read 1.0002/0, 1.0002/0
+and 1.0001/0. Both consoles stepped down to depth 1 at about 17 s.
+
+**THE RULE (`dreamcast.html` lsLookTune):**
+
+- A room starts at depth 2.
+- After 15 windows in a row without a dropped frame, it steps down to depth 1.
+  Each window is the worker's 1 s governor report.
+- A window that drops 100 ms or more at depth 1 raises the depth back to 2.
+- A raise within 30 s of a step-down keeps depth 2 for the rest of the room.
+- The first 2.5 s after the gate engages are not judged. Every room start
+  drops 150-340 ms there, on both arms.
+- The depth only changes input lag. `beginFrame` alone decides which frame a
+  pad lands on, so it cannot desync a room.
+- The witness is `__dcNet().lockstep.look` (also `lookUps`, `lookDowns` and
+  `lookLatched`), and the page logs each change.
+
+**What is NOT fixed.** On the render-bound arm, even depth 2 does not hold
+1.000 +/- 0.005. That includes a94321d itself, 0.90-0.98x today. It is the
+box's rasterizer capacity for two consoles, not the queue.
+
+**Neither the floor nor the governor was the cause.** The `md2` arm (delay
+floor 2) and the `repay0` arm (the old rebase) both stayed at 0.70-0.80x.
