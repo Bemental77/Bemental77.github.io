@@ -406,6 +406,19 @@ const maskAt = (img, port) => (img ? ((img[port * 2] | (img[port * 2 + 1] << 8))
     ok('guest-rate-is-actually-running', xa >= 0.5 && xb >= 0.5,
        `host ${xa.toFixed(4)}x, guest ${xb.toFixed(4)}x — below this a "compliant" reading is just a stall`);
 
+    // ---- 7b. NEVER PAST ITS OWN WALL CLOCK (lib/netplay.js ownClock) -------
+    // A hidden catch-up frame runs with no wall time paid for it. In a rollback
+    // room two consoles used to catch up to EACH OTHER in turn and ratchet ahead
+    // of real time together; the engine now grants one only to a console that
+    // is behind its own clock. `lead` = frames begun since this console's first
+    // frame attempt minus wall frames elapsed (frameHz), at the last frame.
+    {
+      const [ea, eb] = await Promise.all([A, B].map((p) => p.page.evaluate(() => { const n = window.__ps1Net(); return n.engine && n.engine.ownClock; })));
+      const fmt = (o) => o ? `lead ${o.lead} (max ${o.leadMax}) rate ${o.rate} catch-up ${o.granted}/refused ${o.refused}` : 'n/a';
+      ok('never-past-its-own-wall-clock', !!(ea && eb) && ea.lead < 2 && eb.lead < 2 && ea.leadMax < 2 && eb.leadMax < 2,
+         `host ${fmt(ea)} · guest ${fmt(eb)}`);
+    }
+
     // ---- 8. WHY IS IT NOT 1.000x? ATTRIBUTE IT, DO NOT GUESS -------------
     // A rate below 1.000x has three candidate causes with OPPOSITE fixes, so
     // the page records which one is happening rather than leaving it to be

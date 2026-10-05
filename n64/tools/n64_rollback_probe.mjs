@@ -433,7 +433,7 @@ try {
              engineState: n.engine && n.engine.state, error: n.engine && n.engine.error, ghosts: window.__ghostStat,
              fb: n.fb, lat: n.lat, speed: window.__n64Rate && window.__n64Rate.speed,
              eng: n.engine ? { delay: n.engine.delay, state: n.engine.state, desync: n.engine.desync, mode: n.engine.mode,
-                                hashesCompared: n.engine.hashesCompared, stalls: n.engine.stalls } : null,
+                                hashesCompared: n.engine.hashesCompared, stalls: n.engine.stalls, ownClock: n.engine.ownClock || null } : null,
              capx: cx, step: n.step || null, fskip: n.fskip || null,
              pres: n.worker ? (function () { const p = window.__n64Pace ? window.__n64Pace() : {}; return { shown: p.shown | 0, frames: p.animFrames | 0 }; })()
                             : (window.__pres ? { shown: window.__pres.shown, frames: window.__pres.frames } : null) };
@@ -516,6 +516,7 @@ try {
     costAvgMs: z.costAvgMs, costOver: (z.costOver || 0) - (a.costOver || 0), costMaxMs: z.costMaxMs, fb: z.fb, ghosts: z.ghosts, fault: z.fault, engineState: z.engineState, error: z.error,
     latFrames: (z.lat && z.lat.samples || []).map((x) => x.frames),
     tappedFrames: Object.keys(room.full).length, confirmedTo: room.confirmed,
+    ownClock: (z.eng && z.eng.ownClock) || (z.rb && z.rb.engine && z.rb.engine.ownClock) || null,
     fskip: z.fskip,     // room_core.js RFS: the room's frame skip (skipped / re-runs / lost)
     fsReruns: (room.rblog || []).filter((e) => e[0] === 'fsrerun').slice(0, 60),
   });
@@ -721,6 +722,16 @@ if (PICSREF) {
   if (!P || !(P.compared > 0)) bad('pictures', 'nothing compared ' + JSON.stringify(P));
   else if (P.same === P.compared) ok('every drawn picture that stayed true matches the reference run', `${P.compared} frames compared (${P.kept} kept here)`);
   else bad('pictures differ from the reference run', JSON.stringify(P));
+}
+// NEVER PAST ITS OWN WALL CLOCK (lib/netplay.js ownClock: frames begun since the console's first
+// frame attempt minus wall frames elapsed at its frameHz) — the page's engine and every ghost's.
+{
+  const oc = [['page', out.ownClock]].concat((out.ghosts || []).map((g) => [g.id, g.rb && g.rb.ownClock]));
+  const have = oc.filter((x) => x[1]);
+  const txt = oc.map(([w, o]) => `${w} ${o ? `${o.lead} (max ${o.leadMax}) rate ${o.rate} catch-up ${o.granted}/refused ${o.refused}` : 'n/a'}`).join(' · ');
+  if (!have.length) console.log('  INFO  own wall clock: not reported (' + txt + ')');
+  else if (have.every(([, o]) => o.lead < 2 && o.leadMax < 2)) ok('never past its own wall clock', txt);
+  else bad('never past its own wall clock', txt);
 }
 console.log(JSON.stringify(Object.assign({}, out, { timeline: undefined, log: undefined })));
 if (JSON_OUT) writeFileSync(JSON_OUT, JSON.stringify(out, null, 1));
