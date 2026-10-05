@@ -18,7 +18,7 @@
        the functional SAB/worker test. Does not replace __gcGpu, which stays the page's
        own render-path authority. -->
   <script src="/lib/capability.js?v=e25dca87"></script>
-  <script src="/lib/bench.js?v=0345735c"></script><!-- ?bench=1 real-device benchmark; inert without it -->
+  <script src="/lib/bench.js?v=8464cadf"></script><!-- ?bench=1 real-device benchmark; inert without it -->
   <script src="/lib/xboxinput.js"></script>
   <!-- Online co-op. BOTH HALVES RUN THE GAME NOW. The old shape — "THE HOST HALF
        ONLY lives on this page: the guest runs on gamecube_multiplayer.html … a
@@ -9794,9 +9794,10 @@ window.GcRate = (function () {
   // window.__gcRoomRender() reports it.
   var ROOM_SLOW_RENDER_MS = 250;
   var ROOM_YIELD = q.get('roomyield') !== '0';
-  var RRY = { q: [], ema: 0, lastAck: 0, yielded: 0, sent: 0, blind: 0 };
+  var RRY = { q: [], ema: 0, lastAck: 0, yielded: 0, sent: 0, blind: 0, hold: 0, held: 0, holds: 0 };
   window.__gcRoomRender = function () {
-    return { on: ROOM_YIELD, drawMsEma: +RRY.ema.toFixed(1), slow: RRY.ema >= ROOM_SLOW_RENDER_MS, yielded: RRY.yielded, blind: RRY.blind, sent: RRY.sent };
+    return { on: ROOM_YIELD, drawMsEma: +RRY.ema.toFixed(1), slow: RRY.ema >= ROOM_SLOW_RENDER_MS, yielded: RRY.yielded, blind: RRY.blind, sent: RRY.sent,
+             shipHold: ROOM_SHIP_HOLD, holding: !!RRY.hold, held: RRY.held, holds: RRY.holds };
   };
   function gcRoomRenderSent(t) { RRY.q.push(t); RRY.sent++; if (RRY.q.length > 8) RRY.q.shift(); }
   function gcRoomRenderAck(t) {
@@ -9816,6 +9817,7 @@ window.GcRate = (function () {
   // reach the renderer before it does — the joiner console drew its frame 5 that way while the
   // host's yield was already holding. (The rest of that 11-17 s first ack was not the frame: it
   // was the renderer's pre-room backlog — see READY MEANS THE RENDERER HAS CAUGHT UP.)
+  function gcRoomRenderIdleMs() { return Math.min(30000, Math.max(10000, 20 * RRY.ema)); }
   function gcRoomRenderYield(t) {
     if (!ROOM_YIELD || !gcLsGate || !(GCLS.running || GCLS.armed)) return false;
     if (!RRY.lastAck) {
@@ -9823,9 +9825,35 @@ window.GcRate = (function () {
       return false;
     }
     if (RRY.ema < ROOM_SLOW_RENDER_MS) return false;
-    var idle = Math.min(30000, Math.max(10000, 20 * RRY.ema));
-    if (rate.outstanding >= 1 || t - RRY.lastAck < idle) { RRY.yielded++; return true; }
+    if (rate.outstanding >= 1 || t - RRY.lastAck < gcRoomRenderIdleMs()) { RRY.yielded++; return true; }
     return false;
+  }
+  // ── A FRAME THE RENDERER WILL NOT DRAW IS NOT SHIPPED TO IT (2026-10-05) ─────────────────
+  // The yield above stops the DRAWS; it did not stop the worker from building and sending every
+  // frame's renderer state, and on a scene load that is most of the frame. MEASURED (live
+  // caseybement.com prod 20dd57b, headless SwiftShader, the live harness's flags, probe lock,
+  // 9 runs): 3 rooms read a slow window (8-10 over), at MP4 frames 344, 730 and 733 — the frame
+  // after a DVD read, on BOTH consoles at once. Nothing else differed: the GPU process sampled
+  // 1-2% through every room (no draw, no boot backlog: drainMs 14.8-34.4 s, 0 frames in flight
+  // at release), the HTTP cache was warm (transferSize 0), the yield held as designed (sent 1-2).
+  // Per-frame timers in recomp_worker.js put frame 725 at guest 6-25 ms + SHIP 66-129 ms (the
+  // 24 MiB full image 24-41 ms, 1519 re-sent bindings 29-44 ms, walk 9-26 ms) and frame 344 at
+  // guest 57-79 + ship 23-45 ms; whether a run trips is then just where the stall lands against
+  // the bench's 250 ms poll. So while the yield would skip the next frames, the page holds the
+  // worker's shipping (SHIP_HOLD in the pace SAB): the worker still walks the FIFO (register
+  // shadow) but copies and posts nothing, and the first frame after the hold is a full,
+  // self-contained image. The hold lifts SHIP_LEAD_MS before a keep-alive is due, so that full
+  // image lands (state applied, not drawn) a few frames ahead of the picture. A renderer that
+  // keeps up never holds past its first ack. ?roomhold=0 is the matched control.
+  var ROOM_SHIP_HOLD = ROOM_YIELD && q.get('roomhold') !== '0';
+  var SHIP_HOLD = 210, SHIP_LEAD_MS = 150;     // recomp_worker.js SHIP_HOLD
+  function gcRoomShipHold(t) {
+    var hold = 0;
+    if (ROOM_SHIP_HOLD && gcLsGate && (GCLS.running || GCLS.armed) && !window.__gcMtGl) {
+      if (!RRY.lastAck) hold = rate.outstanding >= 1 ? 1 : 0;
+      else if (RRY.ema >= ROOM_SLOW_RENDER_MS) hold = (rate.outstanding >= 1 || t - RRY.lastAck < gcRoomRenderIdleMs() - SHIP_LEAD_MS) ? 1 : 0;
+    }
+    if (hold !== RRY.hold) { RRY.hold = hold; if (hold) RRY.holds++; try { Atomics.store(paceI32, SHIP_HOLD, hold); } catch (e) {} }
   }
   function gcLsStep() {
     var ls = gcLsEngine();
@@ -10739,6 +10767,13 @@ window.GcRate = (function () {
       } catch (err) { console.log('[recomp-live] stop banner failed: ' + err); }
     }
     rw.onmessage = function (e) {
+      if (e.data.cmd === 'frame' && e.data.held) {
+        // SHIP_HOLD (gcRoomShipHold): the worker sent nothing for this frame — no draw, no state.
+        var _hnow = performance.now();
+        rate.frame(e.data.n, _hnow, true); RRY.yielded++; RRY.held++;
+        gcRoomShipHold(_hnow);
+        return;
+      }
       if (e.data.cmd === 'frame') {
         // This message marks the END of the guest's production of frame n. rate.frame() does
         // the capability accounting (subtracting the time the worker sat parked on the credit
@@ -10768,6 +10803,7 @@ window.GcRate = (function () {
         var _pg = _mt && (_rwb || (!rafSinceDraw && (_fnow - lastDrawAt) < 250));
         // A hidden catch-up frame (THE ROLLBACK RING) applies its state and is never drawn.
         var skipRender = rate.frame(e.data.n, _fnow, _pg || (!_mt && gcRoomRenderYield(_fnow)) || !!e.data.hidden);
+        if (!_mt) gcRoomShipHold(_fnow);
         if (!skipRender) {
           gcRoomRenderSent(_fnow);
           rafSinceDraw = false; lastDrawAt = _fnow;
