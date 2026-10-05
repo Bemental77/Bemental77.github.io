@@ -695,9 +695,21 @@
   //
   // ⚠ THE GUEST RATE IS NOT A KNOB HERE. The governor still paces the core to
   // 1.000x the real SH4 clock; lockstep can only make the guest run SLOWER than
-  // that (a stall), never faster. In particular a stall is NOT repaid: the
-  // governor is rebased while gated, so the core never sprints to catch up.
-  // Time lost to a stall stays lost, which is correct — both machines lost it.
+  // that (a stall), never faster.
+  //
+  // A STALL IS A DEBT, LIKE ANY LATE FRAME (2026-10-05; N64's 2f3da51 rule).
+  // This used to REBASE the governor on every gated tick (`paceBaseWall = 0`),
+  // so time lost to a stall stayed lost for good — and worse, a stall on EVERY
+  // frame (a one-frame page queue: the worker finishes N before the page hands
+  // it N+1) rebased it every frame, the governor never saw a lead to sleep off,
+  // and the room ran as fast as the inputs arrived: 1.51-1.56x measured
+  // (dreamcast.html lsFeed comment). Now the base is KEPT while gated. When the
+  // input lands, the ordinary governor below sees the guest behind the wall
+  // clock and repays up to CATCHUP_MAX_MS (100 ms) by running the next frames
+  // with no sleep, never one cycle past the wall clock; anything beyond the cap
+  // is dropped and counted (gov=drop). Over any span since the anchor the guest
+  // still runs no faster than the wall clock. ?lsrepay=0 (page) is the control
+  // arm: the old rebase-on-stall.
   //
   // ⚠ AND IT NEVER GUESSES. A missing input stalls. Substituting a plausible
   // pad value would fork the two machines silently and permanently.
@@ -753,6 +765,7 @@
   let lsHashEvery = 60;
   let lsPendingHash = -1;           // frame whose fingerprint is owed, -1 = none
   let lsStallSince = 0, lsStallSpin = 0;
+  let lsRepay = true;               // a stall is a bounded debt (above); false = the old rebase
   const lsStats = { frames: 0, stalls: 0, stallMs: 0, maxStallMs: 0, queued: 0, dropped: 0 };
 
   // The fingerprint. Every word is a COMMITTED SH4/Holly field read through
@@ -1198,9 +1211,12 @@
           lsStallSince = performance.now(); lsStallSpin = 0; lsStats.stalls++;
           postMessage({ cmd: 'lsStall', f: lsFrame, on: 1 });
         }
-        // The governor must not remember this gap: rebasing here is what stops
-        // the core sprinting through the backlog when input arrives.
-        paceBaseWall = 0; paceBaseCyc = 0;
+        // The governor KEEPS its base across the gap: the stall is owed and the
+        // governor repays at most CATCHUP_MAX_MS of it, never ahead of the wall
+        // clock (see THE GUEST RATE above). A queue that empties every frame no
+        // longer un-paces the core, because nothing here forgets the lead.
+        // ?lsrepay=0 is the control arm (the old rebase, so a stall is lost).
+        if (!lsRepay) { paceBaseWall = 0; paceBaseCyc = 0; }
         // Re-check immediately for the first few tries — most stalls are a
         // fraction of a frame and a 4 ms timer clamp would turn every one of
         // them into 4 ms of added latency. Fall back to a timer after that so a
@@ -1265,6 +1281,7 @@
     }
     const t0 = performance.now();
     fsBegin(t0, lockstep);
+    let lsAckF = -1;
     try {
       Module._emscripten_run_iter();
       if (!runIterSuspended()) fsEnd();
@@ -1273,8 +1290,11 @@
         const f = lsFrame++;
         lsStats.frames++;
         // The page needs to know a frame completed so it can produce the input
-        // for f + delay. It is the frame clock for the whole session.
-        postMessage({ cmd: 'lsFrame', f });
+        // for f + delay. It is the frame clock for the whole session. Posted
+        // below, once the governor has decided WHEN the next frame starts, so
+        // the ack carries that moment (`due`, epoch ms) and the page can sample
+        // its pad as late as the worker allows (dreamcast.html lsOnWorkerFrame).
+        lsAckF = f;
         // The fingerprint is deferred to the NEXT tick's clean boundary — see
         // lsWords(). Reading it here can catch a suspended frame.
         if (lsHashEvery > 0 && (f % lsHashEvery) === 0) lsPendingHash = f;
@@ -1355,6 +1375,7 @@
       // pinned at 59/s in both). Perf probes must see the CPU, not the rig.
       delay = 0;
     }
+    if (lsAckF >= 0) postMessage({ cmd: 'lsFrame', f: lsAckF, due: performance.timeOrigin + t1 + (delay > 1 ? delay : 0) });
     // Only the delay we ASKED for counts as given-back time. setTimeout
     // overshoot lands in the unattributed remainder, so headroom stays a floor.
     if (delay > 1) { pacePacedMs += delay; pumpSleep(delay); }
@@ -1466,12 +1487,14 @@
         lsPendingHash = -1;
         lsStallSince = 0;
         lsHashEvery = data.hashEvery == null ? 60 : (data.hashEvery | 0);
+        lsRepay = data.repay == null ? true : !!data.repay;
         lsStats.frames = 0; lsStats.stalls = 0; lsStats.stallMs = 0;
         lsStats.maxStallMs = 0; lsStats.queued = 0; lsStats.dropped = 0;
         resetPace();
         postMessage({ cmd: 'print', txt: '[lockstep] ' + (on
           ? 'ON — the core advances one frame per delivered input pair, governor still 1.000x'
-          : 'OFF — free-run governor resumed') + ' frame=' + lsFrame + ' hashEvery=' + lsHashEvery });
+          : 'OFF — free-run governor resumed') + ' frame=' + lsFrame + ' hashEvery=' + lsHashEvery +
+          (on ? ' stall=' + (lsRepay ? 'repaid (<=' + CATCHUP_MAX_MS + ' ms debt)' : 'REBASED (?lsrepay=0 control arm)') : '') });
         postMessage({ cmd: 'lsState', on: lockstep ? 1 : 0, f: lsFrame });
         // Kick the pump so an ON while already free-running takes effect at once.
         if (freerun) pumpKick(0);

@@ -29,7 +29,7 @@
        emulator is never told any of this is happening — it sees a second pad on
        the same machine. Everything below is guarded on Netplay.supported(): a
        browser without RTCPeerConnection never sees the button at all. -->
-  <script src="/lib/netplay.js?v=b09ed598"></script>
+  <script src="/lib/netplay.js?v=bb8ad140"></script>
   <script>
     // NEVER PRESENT AN ENABLED START BEHIND A BROKEN PATH. Gates BOTH Start
     // controls (#btnStart and the mobile splash's #mobileSplashStart — the phone
@@ -2986,7 +2986,7 @@
       // frame f, so the page may build f+1. Everything else here is truth for
       // the panel; none of it is allowed to be inferred.
       case 'lsFrame':
-        lsOnWorkerFrame(d.f);
+        lsOnWorkerFrame(d.f, d.due);
         break;
       case 'lsHash':
         lsOnWorkerHash(d);
@@ -6032,6 +6032,36 @@
     // fixes. Counting is free; the LOGGING below is not, and is query-gated.
     bfCalls: 0, bfStall: 0, bfSkipped: 0,
   };
+  // ---- THE ROOM'S INPUT-LAG KNOBS (2026-10-05) ------------------------------
+  // A pad sampled when this page feeds frame G is scheduled for frame G+delay,
+  // and the page feeds G when the worker finishes G-lookahead. So the press
+  // reaches the guest (delay + lookahead - 1) frames after it is sampled, and
+  // that SAME span is all the time a peer's input has to cross the wire — the
+  // two terms are interchangeable for the network and both are input lag.
+  //   lookahead: frames queued in this console's own worker (lsFeed). 1 since the
+  //     worker carries a stall as a bounded debt instead of rebasing its
+  //     governor (flycast_worker.js, THE GUEST RATE); it was 2 only because a
+  //     one-frame queue un-paced the rebasing governor (1.51-1.56x, lsFeed).
+  //   minDelay: the engine's delay floor for THIS console (lib/netplay.js
+  //     Lockstep opts.minDelay; other consoles keep 2).
+  //   spare: frames added to ceil(one-way / frame) when the host sizes the
+  //     delay (lsChooseDelay); 0 here, the engine's own answer carries 1.
+  //   feedDue / feedMarginMs (OFF by default): the pad is sampled feedMarginMs
+  //     before the worker's next frame starts, not when the previous one ended
+  //     (lsOnWorkerFrame).
+  // Arms (measurement only): ?lslook=N, ?lsmindelay=N, ?lsdelay=N (host: force
+  // the room's delay), ?lsrepay=0 (worker: the old rebase-on-stall),
+  // ?lsspare=N, ?lsfeed=due (sample late), ?lsmargin=MS.
+  const LSQ = (() => {
+    const q = new URLSearchParams(location.search);
+    const int = (k, lo, hi, d) => { const v = q.get(k); if (v == null || v === '') return d; const n = parseInt(v, 10); return isFinite(n) ? Math.max(lo, Math.min(hi, n)) : d; };
+    return { lookahead: int('lslook', 1, 4, 1), minDelay: int('lsmindelay', 1, 2, 1),
+             forceDelay: int('lsdelay', 1, 30, 0), repay: q.get('lsrepay') !== '0',
+             spare: int('lsspare', 0, 4, 0),
+             // OFF by default: measured at ~2 ms RTT it gave back 18 ms more
+             // (p50 37 ms vs 55) but read 0.997x, and the room must hold 1.000x
+             feedDue: q.get('lsfeed') === 'due', feedMarginMs: int('lsmargin', 0, 30, 4) };
+  })();
 
   // ---- ?lsdiag=1 — WHY A ROOM STARVED, ARMED FROM THE QUERY STRING --------
   // SHIPS OFF. A stall on a slow path is a timing fault, and per-frame console
@@ -6299,6 +6329,12 @@
     // {cmd:'input'} with the current pad every rAF and the worker uses whatever
     // it last received, with no per-frame queue at all.
     //
+    // [FIXED 2026-10-05 — the paragraph below is the history; the depth is now
+    // LSQ.lookahead = 1, because the worker keeps its governor's base across a
+    // stall (flycast_worker.js). Measured with ?lsrepay=0 (the old rebase) at
+    // depth 1 / delay 1: 1.0146-1.0162x at ~2 ms RTT and 1.030-1.032x at
+    // ~45 ms; with the debt kept, 1.0000-1.0009x on the same arms
+    // (dreamcast/docs/room-input-lag/TASKS.md).]
     // So 2 is the floor, and it is a floor imposed by the WORKER'S GOVERNOR,
     // not by the protocol: it is the smallest depth that leaves the worker
     // holding frame N+1 while it runs frame N, which is what keeps the queue
@@ -6317,7 +6353,15 @@
     // frames — 2 s at Gauntlet's 30 fps — on every button. The engine already
     // holds `delay` frames of every peer's input, so feeding 2 ahead never
     // waits on the network any more than feeding 30 ahead would.
-    const lookahead = 2;
+    // ⚠ NOW 1 (LSQ above): the worker keeps its governor's base across a stall
+    // (a bounded debt, never ahead of the wall clock), so an empty queue at the
+    // top of a frame no longer un-paces it — the defect this paragraph names is
+    // fixed, and the frame of input lag it cost is given back. ?lslook=2 is the
+    // old depth.
+    const lookahead = LSQ.lookahead;
+    // held until just before the worker's next frame (lsOnWorkerFrame); a call
+    // from rAF or from an arriving input before then waits for the timer
+    if (LS.feedNotBefore && _now() < LS.feedNotBefore) { lsDiagTick(ls, null); return; }
     let fed = 0;
     if ((LS.fedTo - LS.workerFrame) >= lookahead) { LS.bfSkipped++; lsDiagTick(ls, null); }
     while ((LS.fedTo - LS.workerFrame) < lookahead) {
@@ -6355,10 +6399,33 @@
   }
 
   // ---- what the worker tells us --------------------------------------------
-  function lsOnWorkerFrame(f) {
+  // ⚠ ?lsfeed=due — THE PAD SAMPLED AS LATE AS THE WORKER ALLOWS (an arm, OFF).
+  // The ack arrives the moment frame f ends; the worker then sleeps (its 1.000x
+  // governor) until `due`, the epoch time frame f+1 starts. A pad sampled at the
+  // ack waits out that sleep for nothing — it is the same frame either way — so
+  // the feed is held until LSQ.feedMarginMs before `due`. It is input lag given
+  // back (and the engine's stall clock then measures a wait the WORKER would
+  // feel, not one inside its sleep). Exact: which frame a pad lands on is still
+  // decided by beginFrame alone. If the hold is late the worker parks on an
+  // empty queue and its governor repays the gap (flycast_worker.js, a stall is
+  // a debt). Measured at ~2 ms RTT, delay 1: input lag p50 37 ms vs 55 ms at
+  // the ack, but 0.9972-0.9975x with 91-97 ms dropped per console in 36 s —
+  // a late timer costs the worker guest time — so the default feeds at the ack.
+  function lsOnWorkerFrame(f, due) {
     LS.workerFrame = (f | 0) + 1;
     LS.framesRun++;
     LS.workerStall = false;
+    LS.feedNotBefore = 0;
+    if (LSQ.feedDue && typeof due === 'number' && due > 0) {
+      const at = due - performance.timeOrigin - LSQ.feedMarginMs;
+      const wait = at - _now();
+      if (wait > 1) {
+        LS.feedNotBefore = at;
+        if (LS.feedTimer) clearTimeout(LS.feedTimer);
+        LS.feedTimer = setTimeout(() => { LS.feedTimer = 0; lsFeed(); }, wait);
+        return;
+      }
+    }
     lsFeed();
   }
   function lsOnWorkerHash(d) {
@@ -6436,7 +6503,18 @@
       // does not run.
       const relayFloor = (sess.relay && sess.relay.active && sess.relay.delayFrames)
         ? (sess.relay.delayFrames | 0) : 0;
-      let want = r && r.recommendedDelay != null ? Math.max(1, Math.min(30, r.recommendedDelay | 0)) : null;
+      // ⚠ NO SPARE FRAME ON THIS CONSOLE (2026-10-05). The engine's answer is
+      // ceil(one-way / frame) + 1. Here the +1 is dropped (LSQ.spare, default 0):
+      // with a one-frame worker queue and a governor that repays a stall, a
+      // frame of delay is a whole frame of wire time, and the budget the engine
+      // sizes from (Lockstep.rttBudget) already carries the jitter margin.
+      // Measured (room_desync_soak.mjs --noram, PSO, two Chrome processes): at
+      // ~2 ms RTT delay 1 held 1.000x with no raise; at 20-28 ms it held
+      // 1.000x and the engine's own pace check raised it to 2 after ~20 s
+      // without losing guest time. If the link cannot carry the choice, that
+      // check (lib/netplay.js _paceTick) raises it, as on every console.
+      const lsDc = (n) => Math.max(LSQ.minDelay, Math.min(30, (n | 0) - 1 + LSQ.spare));
+      let want = r && r.recommendedDelay != null ? lsDc(r.recommendedDelay) : null;
       // ⚠ THREE OR FOUR PLAYERS: A GUEST'S INPUT REACHES ANOTHER GUEST IN TWO HOPS.
       // Every guest links only to the host, which forwards frame traffic
       // (lib/netplay.js RELAYED), so guest A's pad for frame F reaches guest B
@@ -6449,11 +6527,13 @@
       try {
         const rtts = r && r.peers ? Object.keys(r.peers).map((k) => r.peers[k]).filter((v) => v != null).sort((a, b) => b - a) : [];
         if (rtts.length >= 2 && window.Netplay && Netplay.Lockstep && Netplay.Lockstep.recommendDelay) {
-          const two = Math.max(1, Math.min(30, Netplay.Lockstep.recommendDelay(rtts[0] + rtts[1], 1000 / 60) | 0));
+          const two = lsDc(Netplay.Lockstep.recommendDelay(rtts[0] + rtts[1], 1000 / 60));
           if (want == null || two > want) want = two;
         }
       } catch (e) {}
       if (relayFloor > 0) want = Math.min(30, Math.max(want || 0, relayFloor));
+      // ?lsdelay=N — MEASUREMENT ARM: the host forces the room's delay.
+      if (LSQ.forceDelay > 0) { pageLog('[lockstep] ?lsdelay=' + LSQ.forceDelay + ' forces the delay (measured choice was ' + want + ')'); want = LSQ.forceDelay; }
       if (want == null || want === ls.delay) return ls.delay;
       const was = ls.delay;
       ls.delay = want;
@@ -6574,7 +6654,7 @@
     // than assumed away.
     worker.postMessage({ cmd: 'lsNormalize' });
     LS.hashEvery = 60;
-    worker.postMessage({ cmd: 'lockstep', on: 1, frame: 0, hashEvery: LS.hashEvery });
+    worker.postMessage({ cmd: 'lockstep', on: 1, frame: 0, hashEvery: LS.hashEvery, repay: LSQ.repay ? 1 : 0 });
     LS.armed = true; LS.running = false; LS.workerFrame = 0; LS.fedTo = 0; LS.framesRun = 0;
     LS.armedAtFrame = LS.framesRun; LS.releasedAtFrame = null;
     LS.fault = null;
@@ -7479,6 +7559,8 @@
     // chosen before they can read their own code.
     const s2 = new Netplay.Session({
       game: roomGame, host: true, code, transport: netTransport(),
+      // this console's delay floor (LSQ): 1 frame, not the engine's default 2
+      lockstep: { minDelay: LSQ.minDelay },
     });
     NET.session = s2;
     // ⚠ THE LOAD IS ARMED AT ROOM OPEN AND FIRES ON THE FIRST SEAT — no press.
@@ -7527,7 +7609,7 @@
     // below. The real guard is unaffected and is the only one that could ever be
     // trusted: the START BARRIER compares what each machine ACTUALLY LOADED, not
     // what it intended, and refuses to start a room whose discs differ.
-    const s = new Netplay.Session({ host: false, code, transport: netTransport() });
+    const s = new Netplay.Session({ host: false, code, transport: netTransport(), lockstep: { minDelay: LSQ.minDelay } });
     NET.session = s;
     NET.loadWhenSeated = false;   // a joiner's load is fired by 'room-game', not by a seat
     NET.declared = false; NET.declaredTag = null; NET.declaring = false; NET.bar = null; NET.loadHeld = null;

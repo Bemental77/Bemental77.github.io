@@ -67,6 +67,18 @@
 //                   depend on the rig's own instrument
 //   --script none|walk   input script (default walk: both players press)
 //   --name N        output under /tmp/dc-soak/<N>.{log,json,*.png}
+//   --owd MS[:J]    SIMULATED LINK: every RTCDataChannel.send on BOTH pages is
+//                   delivered MS ms later (+ uniform 0..J ms jitter, order kept),
+//                   so RTT = 2 x MS (+ jitter). The pings the host sizes the
+//                   delay from cross the same delayed channel.
+//   ALSO MEASURED (2026-10-05, dreamcast/docs/room-input-lag/TASKS.md):
+//     * input lag per console: the wall time from the moment the page SAMPLES
+//       its local pad for frame F (the engine's beginFrame that schedules F)
+//       to the moment that console's worker STARTS run_iter for F. Same epoch
+//       clock (timeOrigin + now) on page and worker.
+//     * room speed from the guest cycle counter against wall time at the hash
+//       checkpoints (after a 5 guest-s warm-up), per console.
+//     * the engine's slack (minLead / meanLead), stalls, delay.
 //   --keep-profiles
 // VERDICTS  IN SYNC · DESYNC · REFUSED (the worker's anchor guard stopped a
 //   console that would have forked) · CORE CRASH · FROZEN · VOID. A fork needs
@@ -111,6 +123,8 @@ const QHOST = flag('qhost', '');
 const QJOIN = flag('qjoin', '');
 const PREROLL_ISK_AFTER = /noidleskip/.test(QBOTH + QJOIN) ? 0 : 1;
 const KEEP_PROFILES = has('keep-profiles');
+const OWD = String(flag('owd', '0')).split(':');
+const OWD_MS = Math.max(0, +OWD[0] || 0), OWD_JIT = Math.max(0, +OWD[1] || 0);
 // --save-at S: the HOST clicks the page's own Save State button at guest second
 // S (and --load-at S clicks Load State). One console doing it alone is the
 // question: retro_serialize runs emu.stop()/emu.start(), which is exactly the
@@ -120,6 +134,11 @@ const LOAD_AT = flag('load-at', null) == null ? null : +flag('load-at', '0');
 // --nohook: no worker hook at all (no RAM detector, no preroll). The A/B that
 // proves the rig's own instrument is not what a result depends on.
 const NOHOOK = has('nohook');
+// --noram: hook the worker (input lag, speed) but take NO 16 MB RAM hash. The
+// hash costs 34-44 ms of the worker every 60 frames, which the other console
+// sees as a stall; a timing measurement must not carry it. The verdict then
+// rests on the engine's fingerprints, as with --nohook.
+const NORAM = has('noram');
 const BOOT_MS = +flag('bootms', '420000');
 const CHROME = process.env.CHROME_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
 const OUT = '/tmp/dc-soak';
@@ -127,6 +146,7 @@ fs.mkdirSync(OUT, { recursive: true });
 const LOG = path.join(OUT, NAME + '.log');
 const logStream = fs.createWriteStream(LOG, { flags: 'w' });
 const T0 = Date.now();
+let SOAK_T0 = 0;   // set when the soak proper starts (after the room runs)
 const say = (s) => { const l = `[${((Date.now() - T0) / 1000).toFixed(1).padStart(7)}s] ${s}`; console.log(l); logStream.write(l + '\n'); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const J = (v) => { try { return JSON.stringify(v); } catch (e) { return String(v); } };
@@ -153,7 +173,20 @@ async function servedMd5() {
 
 // ---- the in-page preload: engine + desync capture ---------------------------
 const PRELOAD = `(() => {
-  const M = window.__soak = { desyncs: [], engine: null, frames: 0 };
+  const M = window.__soak = { desyncs: [], engine: null, frames: 0, samples: [] };
+  const OWD_MS = ${OWD_MS}, OWD_JIT = ${OWD_JIT};
+  if (OWD_MS > 0 || OWD_JIT > 0) {
+    const send0 = RTCDataChannel.prototype.send;
+    RTCDataChannel.prototype.send = function (d) {
+      const ch = this, now = performance.now();
+      let v = d;
+      if (d instanceof ArrayBuffer) v = d.slice(0);
+      else if (ArrayBuffer.isView(d)) v = new Uint8Array(d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength));
+      const at = Math.max(ch.__owdLast || 0, now + OWD_MS + Math.random() * OWD_JIT);
+      ch.__owdLast = at;
+      setTimeout(() => { try { if (ch.readyState === 'open') send0.call(ch, v); } catch (e) {} }, Math.max(0, at - now));
+    };
+  }
   const hook = () => {
     const L = window.Netplay && window.Netplay.Lockstep;
     if (!L) return false;
@@ -165,7 +198,19 @@ const PRELOAD = `(() => {
       return emit.call(this, ev, a);
     };
     const begin = L.prototype.beginFrame;
-    L.prototype.beginFrame = function (pads) { M.engine = this; return begin.call(this, pads); };
+    L.prototype.beginFrame = function (pads, opt) {
+      M.engine = this;
+      // the call that SCHEDULES this console's local pad (lib/netplay.js beginFrame)
+      try {
+        const f = this.frame;
+        if (!this.rollback && (this.state === 'running' || this.state === 'stalled') &&
+            this._scheduledTo <= f && (f + this.delay) > this._queuedTo) {
+          M.samples.push({ F: f + this.delay, t: performance.timeOrigin + performance.now(), d: this.delay });
+          if (M.samples.length > 30000) M.samples.splice(0, 10000);
+        }
+      } catch (e) {}
+      return begin.call(this, pads, opt);
+    };
     return true;
   };
   if (!hook()) { const iv = setInterval(() => { if (hook()) clearInterval(iv); }, 10); }
@@ -180,7 +225,12 @@ function workerHookSrc(prerollN) {
   if (!M || typeof M._emscripten_run_iter !== 'function' || typeof M._sh4_mem_read32 !== 'function') return { ok: false, err: 'Module not ready' };
   if (self.__soak) return { ok: true, again: true };
   const S = self.__soak = { rows: [], err: null, base: -1, cands: null, locMs: 0, verifyBad: 0, hashMs: 0, hashN: 0,
-                            prerollWant: ${prerollN | 0}, preroll: null, queued: 0 };
+                            prerollWant: ${prerollN | 0}, preroll: null, queued: 0, starts: [], lastStart: 0 };
+  // run_iter START time per lockstep frame (input-lag measurement): the pump
+  // calls self.Module._emscripten_run_iter() by property, and posts 'lsFrame'
+  // with that frame's number right after it returns.
+  { const ri = M._emscripten_run_iter;
+    M._emscripten_run_iter = function () { S.lastStart = performance.timeOrigin + performance.now(); return ri.apply(this, arguments); }; }
   const RAM = 0x8c000000, RAM_SZ = 16 << 20, WORDS = RAM_SZ >>> 2;
   const rd = (a) => M._sh4_mem_read32(a >>> 0) >>> 0;
   const flagPtr = (typeof M._flycast_run_iter_flag_ptr === 'function') ? (M._flycast_run_iter_flag_ptr() >>> 0) : 0;
@@ -225,6 +275,7 @@ function workerHookSrc(prerollN) {
     return best;
   }
   function ramHash() {
+    if (${NORAM ? 'true' : 'false'}) return null;
     if (S.base < 0) S.base = locate();
     if (S.base < 0) return null;
     // re-verify 64 random words every time — a stale pointer must not pass
@@ -242,13 +293,17 @@ function workerHookSrc(prerollN) {
   const prevPost = self.postMessage;
   self.postMessage = function (msg, transfer) {
     try {
+      if (msg && msg.cmd === 'lsFrame') {
+        S.starts.push(msg.f | 0, S.lastStart);
+        if (S.starts.length > 60000) S.starts.splice(0, 20000);
+      }
       if (msg && msg.cmd === 'lsHash') {
         const t0 = performance.now();
         const ram = ramHash();
         const dt = performance.now() - t0;
         S.hashMs += dt; S.hashN++;
         let burns = null; try { burns = M._flycast_ctx_snapshot(90) >>> 0; } catch (e) {}
-        S.rows.push({ f: msg.f, h: msg.h >>> 0, ram, cyc: M._flycast_guest_cycles(), burns, w: msg.w ? Array.from(msg.w) : null });
+        S.rows.push({ f: msg.f, h: msg.h >>> 0, ram, cyc: M._flycast_guest_cycles(), t: performance.timeOrigin + t0, burns, w: msg.w ? Array.from(msg.w) : null });
         if (S.rows.length > 20000) S.rows.shift();
       }
     } catch (e) { S.err = 'hash threw: ' + (e && e.message || e); }
@@ -328,10 +383,20 @@ async function launch(role) {
   try { (await import(pathToFileURL(path.join(REPO, 'tools', 'browser_leak_guard.js')).href)).default.guard(browser, fileURLToPath(import.meta.url)); } catch (e) {}
   const page = (await browser.pages())[0] || await browser.newPage();
   await page.setViewport({ width: 1280, height: 800 });
-  const P = { role, browser, page, dir, errors: [], log: [], worker: null };
+  const P = { role, browser, page, dir, errors: [], log: [], worker: null, gov: { beats: 0, dropMs: 0, drops: 0, maxLag: 0, at: [], soakDropMs: 0, soakBeats: 0 } };
   page.on('pageerror', (e) => P.errors.push(String((e && e.message) || e).slice(0, 300)));
   page.on('console', (m) => {
     const t = m.text();
+    // the heartbeat's governor term: guest ms the worker DROPPED (debt past its
+    // repay cap) — time a console lost for good, per 2 s window
+    const gv = /gov=drop(\d+)ms\/(\d+) lag(\d+)ms/.exec(t);
+    if (gv) {
+      P.gov.beats++; P.gov.dropMs += +gv[1]; P.gov.drops += +gv[2]; P.gov.maxLag = Math.max(P.gov.maxLag, +gv[3]);
+      // when, against the soak's own clock (null = before the room ran), so a
+      // drop at the room's start is told apart from one in the steady state
+      if (+gv[1] > 0 && P.gov.at.length < 40) P.gov.at.push([SOAK_T0 ? +((Date.now() - SOAK_T0) / 1000).toFixed(1) : null, +gv[1]]);
+      if (SOAK_T0) { P.gov.soakDropMs += +gv[1]; P.gov.soakBeats++; }
+    }
     if (/desync|lockstep\] (ARMED|FRAME GATE|frame gate|⚠)|\[seed\]|\[vmu\]|normalize|watchdog|threw|REFUS|recover|setidleskip|idle-skip|\[shard\]|determinism|anchor frame|REFUSING|state saved|saveState|state load|stateLoaded|Save State|Load State/i.test(t) && P.log.length < 4000)
       P.log.push(((Date.now() - T0) / 1000).toFixed(1) + ' ' + t.slice(0, 400));
   });
@@ -487,6 +552,7 @@ try {
     const f0 = await hostFrame();
     const gsec = async () => { const f = await hostFrame(); return f == null ? null : (f - f0) / GFPS; };
     say(`ROOM RUNNING — soaking ${SOAK} guest s (wall cap ${MAXWALL} s)`);
+    SOAK_T0 = Date.now();
     // ---- the input script: pseudo-random but reproducible; both players press ----
     let seed = 12345;
     const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
@@ -565,13 +631,41 @@ try {
     // ---- collect ----
     const fin = await st();
     RESULT.final = fin;
-    const rowsOf = async (P) => NOHOOK ? '{"rows":[]}' : withTimeout(wEval(P.worker, 'JSON.stringify({ rows: self.__soak.rows, err: self.__soak.err, base: self.__soak.base, verifyBad: self.__soak.verifyBad, hashMs: self.__soak.hashMs, hashN: self.__soak.hashN, preroll: self.__soak.preroll, cands: self.__soak.cands })').catch((e) => JSON.stringify({ err: e.message })), 60000, '{"err":"timeout"}');
+    const rowsOf = async (P) => NOHOOK ? '{"rows":[]}' : withTimeout(wEval(P.worker, 'JSON.stringify({ rows: self.__soak.rows, err: self.__soak.err, base: self.__soak.base, verifyBad: self.__soak.verifyBad, hashMs: self.__soak.hashMs, hashN: self.__soak.hashN, preroll: self.__soak.preroll, cands: self.__soak.cands, starts: self.__soak.starts })').catch((e) => JSON.stringify({ err: e.message })), 60000, '{"err":"timeout"}');
     const RH = JSON.parse(await rowsOf(H)), RJ = JSON.parse(await rowsOf(G));
     const engine = await Promise.all(PS.map((P) => P.page.evaluate(() => {
       const M = window.__soak; const e = M && M.engine; let rep = null; try { rep = e ? e.report() : null; } catch (x) {}
-      return { desyncs: M ? M.desyncs : null, error: e ? (e.error || null) : null, report: rep ? { state: rep.state, error: rep.error || null, frame: rep.frame, delay: rep.delay, desync: rep.desync, hashesCompared: rep.hashesCompared, hashesSent: rep.hashesSent, lastAgreedFrame: rep.lastAgreedFrame, stalls: rep.stalls, inputsSent: rep.inputsSent, inputsReceived: rep.inputsReceived } : null,
+      return { desyncs: M ? M.desyncs : null, error: e ? (e.error || null) : null, report: rep ? { state: rep.state, error: rep.error || null, frame: rep.frame, delay: rep.delay, desync: rep.desync, hashesCompared: rep.hashesCompared, hashesSent: rep.hashesSent, lastAgreedFrame: rep.lastAgreedFrame, stalls: rep.stalls, inputsSent: rep.inputsSent, inputsReceived: rep.inputsReceived,
+                                 stallMs: rep.stallMs, maxStallMs: rep.maxStallMs, minLead: rep.minLead, meanLead: rep.meanLead, delayHistory: rep.delayHistory } : null,
+               samples: M ? M.samples : [],
                probe: window.__dcProbe ? (({ guestX, fps, phase }) => ({ guestX, fps, phase }))(window.__dcProbe()) : null };
     }).catch((e) => ({ err: e.message }))));
+    // ---- input lag + room speed (see header) ----
+    const lagOf = (samples, starts) => {
+      const st = new Map(); for (let i = 0; i + 1 < (starts || []).length; i += 2) st.set(starts[i], starts[i + 1]);
+      const xs = [], byD = {};
+      for (const sm of (samples || [])) { const t = st.get(sm.F); if (t == null || !(t > 0)) continue; const v = t - sm.t; xs.push(v); (byD[sm.d] = byD[sm.d] || []).push(v); }
+      const q = (a, p) => { if (!a.length) return null; const b = a.slice().sort((x, y) => x - y); return +b[Math.min(b.length - 1, Math.floor(b.length * p))].toFixed(1); };
+      const sum = (a) => ({ n: a.length, mean: a.length ? +(a.reduce((x, y) => x + y, 0) / a.length).toFixed(1) : null, p50: q(a, 0.5), p95: q(a, 0.95), max: q(a, 1) });
+      const out = sum(xs); out.byDelay = {}; for (const k in byD) out.byDelay[k] = sum(byD[k]);
+      return out;
+    };
+    const speedOf = (rows) => {
+      const r = (rows || []).filter((x) => x.t > 0);
+      if (r.length < 3) return null;
+      const warm = r.findIndex((x) => (x.cyc - r[0].cyc) / 200e6 >= 5);
+      const a = r[warm > 0 ? warm : 0], b = r[r.length - 1];
+      if (!(b.t > a.t)) return null;
+      return { speed: +(((b.cyc - a.cyc) / 200e6) / ((b.t - a.t) / 1000)).toFixed(4), guestS: +((b.cyc - a.cyc) / 200e6).toFixed(1), wallS: +((b.t - a.t) / 1000).toFixed(1), fromF: a.f, toF: b.f };
+    };
+    RESULT.inputLag = { host: lagOf(engine[0] && engine[0].samples, RH.starts), joiner: lagOf(engine[1] && engine[1].samples, RJ.starts) };
+    RESULT.roomSpeed = { host: speedOf(RH.rows), joiner: speedOf(RJ.rows) };
+    for (const e of engine) if (e) delete e.samples;
+    say('INPUTLAG host ' + J(RESULT.inputLag.host) + ' · joiner ' + J(RESULT.inputLag.joiner));
+    say('SPEED   host ' + J(RESULT.roomSpeed.host) + ' · joiner ' + J(RESULT.roomSpeed.joiner) + (OWD_MS || OWD_JIT ? ' · owd ' + OWD_MS + '+' + OWD_JIT + ' ms' : ''));
+    RESULT.owd = { ms: OWD_MS, jitter: OWD_JIT };
+    RESULT.gov = { host: H.gov, joiner: G.gov };
+    say('GOV     host ' + J(H.gov) + ' · joiner ' + J(G.gov));
     RESULT.engine = { host: engine[0], joiner: engine[1] };
     for (const [k, e] of Object.entries(RESULT.engine)) for (const d of ((e && e.desyncs) || []).slice(0, 2))
       say(`DESYNC  ${k}: ${J(d).slice(0, 1600)}`);
@@ -599,13 +693,14 @@ try {
     say('RAM     ' + J(RESULT.ramDetector));
     const engDesync = (RESULT.engine.host.desyncs || []).length + (RESULT.engine.joiner.desyncs || []).length;
     const hc = Math.min((RESULT.engine.host.report || {}).hashesCompared || 0, (RESULT.engine.joiner.report || {}).hashesCompared || 0);
-    const sound = (NOHOOK || compared >= 10) && hc >= 10 && !RESULT.prerollVoid;
+    const sound = (NOHOOK || NORAM || compared >= 10) && hc >= 10 && !RESULT.prerollVoid;
     // A divergence needs no minimum sample — one mismatch is a fork. "In sync"
     // does: it is only a claim over enough compared checkpoints.
     const forked = !RESULT.prerollVoid && (engDesync || ramBad || wBad);
     RESULT.verdict = (RESULT.refused && !forked) ? `REFUSED by the anchor guard, no fork: ${J(RESULT.refused.filter((x) => x.line).map((x) => x.role + ': ' + x.line.slice(0, 200)))}`
       : forked ? `DESYNC (engine events ${engDesync}, RAM mismatches ${ramBad}/${compared}, first RAM @f${firstRam ? firstRam.f : '-'}, fingerprint mismatches ${wBad})`
       : !sound ? `VOID (compared ram=${compared} engine=${hc}${RESULT.prerollVoid ? ', preroll missed' : ''})`
+      : NORAM ? `IN SYNC over ${hc} engine fingerprints (--noram: no RAM detector), guest ${g && g.toFixed(1)} s`
       : `IN SYNC over ${compared} RAM checkpoints (to frame ${RESULT.ramDetector.lastFrame}) and ${hc} engine fingerprints, guest ${g && g.toFixed(1)} s`;
     say('VERDICT ' + RESULT.verdict);
     if (forked) exitCode = 1; else if (RESULT.refused) exitCode = 0; else if (!sound) exitCode = 3;
