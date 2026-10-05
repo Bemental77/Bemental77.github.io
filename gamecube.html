@@ -9769,6 +9769,47 @@ window.GcRate = (function () {
 
   // ONE STEP = AT MOST ONE GUEST FRAME. Called from the rAF grant loop and from a short timer,
   // because a frame that becomes feedable between two rAFs should not wait for the next one.
+  // ── A ROOM ON A SOFTWARE WEBGPU ADAPTER: THE GUESTS COME FIRST (2026-10-05) ────────────────
+  // On a software WebGPU adapter (SwiftShader: headless Chrome with --enable-unsafe-webgpu, no
+  // GPU) one MP4 frame costs the GPU process SECONDS of its four rasterizer threads, and in a room
+  // that is the CPU both consoles' guests run on. MEASURED (MP4 bench room, two consoles in one
+  // tab, 4 cores, 100 ms /proc samples): the rasterizer threads held ~250-300% of the box while
+  // each console presented 0.2-0.4 pictures/s, and the two recomp workers got 38-48% of a core
+  // each. MP4's loading frame ~725 — ~30 ms on an idle box (tools/gc_netplay_det.html, pace=free),
+  // 66-83 ms in solo — took 97-186 ms in the room, and a 250 ms window around it read 8-10 frames
+  // (25-36 ms each): the bench's "slow window", 3-10 frames over budget in 12 of 16 WebGPU runs.
+  // With the room drawing NOTHING the rasterizer threads went idle, the workers got 85-100%, and
+  // the same frame took 61-65 ms (0 over). Halving the draws (one in flight, idle as long as the
+  // last took) was not enough (140-155 ms / 9 over, then 70-90 ms / 1 over): one draw is seconds
+  // of rasterizer work, so any draw that overlaps a loading frame slows it.
+  // So in a room on the WORKER renderer (the main-thread WebGL2 fallback paces itself — one frame
+  // in flight, rAF-capped, render-worker.js never waits on the GPU — and holds 0 over without
+  // this), once the measured draw latency (frame sent -> its recompAck, which worker_funcs.js holds
+  // until the frame's GPU work has run) says a frame costs >= ROOM_SLOW_RENDER_MS, the room draws
+  // only a keep-alive picture: one in flight at most, and none until the renderer has been idle
+  // 20x its last frame's cost (clamped 10-30 s; GPU duty <= 5%). No real GPU comes near 250 ms for
+  // an MP4 frame, so this never engages there; on a software adapter it costs presents that were a
+  // slideshow anyway, and never the guest (gate #9: a slow renderer may only cost presents).
+  // Skipped frames still apply their RAM state. ?roomyield=0 is the matched control;
+  // window.__gcRoomRender() reports it.
+  var ROOM_SLOW_RENDER_MS = 250;
+  var ROOM_YIELD = q.get('roomyield') !== '0';
+  var RRY = { q: [], ema: 0, lastAck: 0, yielded: 0, sent: 0 };
+  window.__gcRoomRender = function () {
+    return { on: ROOM_YIELD, drawMsEma: +RRY.ema.toFixed(1), slow: RRY.ema >= ROOM_SLOW_RENDER_MS, yielded: RRY.yielded, sent: RRY.sent };
+  };
+  function gcRoomRenderSent(t) { RRY.q.push(t); RRY.sent++; if (RRY.q.length > 8) RRY.q.shift(); }
+  function gcRoomRenderAck(t) {
+    var t0 = RRY.q.shift(); RRY.lastAck = t;
+    if (t0 == null) return;
+    var dt = t - t0; RRY.ema = RRY.ema ? RRY.ema * 0.75 + dt * 0.25 : dt;
+  }
+  function gcRoomRenderYield(t) {
+    if (!ROOM_YIELD || !gcLsGate || !GCLS.running || RRY.ema < ROOM_SLOW_RENDER_MS) return false;
+    var idle = Math.min(30000, Math.max(10000, 20 * RRY.ema));
+    if (rate.outstanding >= 1 || t - RRY.lastAck < idle) { RRY.yielded++; return true; }
+    return false;
+  }
   function gcLsStep() {
     var ls = gcLsEngine();
     // LEFT THE ROOM (Leave closed the session): nobody holds this console's frames any more, so
@@ -10560,7 +10601,9 @@ window.GcRate = (function () {
         // whose in-flight acks belong to the discarded timeline. rate.ack() absorbs those
         // instead of driving `outstanding` negative, which would disable backpressure outright
         // and stop the render-busy segment ever reopening (?ratetest=1 test 7a).
-        rate.ack(performance.now());
+        var _at = performance.now();
+        rate.ack(_at);
+        gcRoomRenderAck(_at);
         return;
       }
       if (e.data && e.data.cmd === 'recompGate') {
@@ -10659,8 +10702,9 @@ window.GcRate = (function () {
         var _mt = !!window.__gcMtGl, _rwb = _mt && typeof window.__gcRwBusy === 'function' && window.__gcRwBusy();
         var _pg = _mt && (_rwb || (!rafSinceDraw && (_fnow - lastDrawAt) < 250));
         // A hidden catch-up frame (THE ROLLBACK RING) applies its state and is never drawn.
-        var skipRender = rate.frame(e.data.n, _fnow, _pg || !!e.data.hidden);
+        var skipRender = rate.frame(e.data.n, _fnow, _pg || (!_mt && gcRoomRenderYield(_fnow)) || !!e.data.hidden);
         if (!skipRender) {
+          gcRoomRenderSent(_fnow);
           rafSinceDraw = false; lastDrawAt = _fnow;
           if (_mt && typeof window.__gcRwNoteSent === 'function') window.__gcRwNoteSent();
         }
