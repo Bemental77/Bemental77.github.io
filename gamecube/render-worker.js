@@ -280,8 +280,19 @@ function ctrlService() {
   // Replay all ring commands up to the published HEAD first, so the program this
   // query targets is already created+linked on our context before we resolve.
   drainOnce();
+  // RW_LINK_WAIT (main-thread replay): the drain stopped at a parked useProgram, or the query's
+  // program is still linking — answering now would block this thread on the link. Not yet.
+  if (rwDeferred) return false;
   const op = ctrl[CTRL_OPCODE];
   const progId = ctrl[CTRL_PROGRAM];
+  if (rwLinkPending.size && rwLinkPending.has(progId) && !rwLinkReady(progId)) { rwLinkStats.ctrlWaits++; return false; }
+  // ...and the query itself is a synchronous round trip that waits for every command this context
+  // queued before it — on SwiftShader, behind the other console's work too (one GPU-process
+  // thread serves both). MEASURED after the link wait: getUniformBlockIndex 355 ms in one task.
+  // So it is asked only once a fence placed after this drain has signaled (the producer is blocked
+  // on this very query, so nothing new is queued meanwhile); no new fence while no GL command has
+  // been issued since the last one signaled.
+  if (!rwCtrlFenceReady()) { rwLinkStats.ctrlWaits++; return false; }
   const prog = obj(progId);
   try {
     if (op === CTRL_GET_UNIFORM_LOC) {
@@ -362,7 +373,12 @@ function exec(opcode, a, nWords) {
     case 11: g.activeTexture(a(0)); break;
     case 12: g.bindTexture(a(0), obj(a(1))); break;
     case 13: setObj(a(0), g.createQuery()); break;
-    case 14: g.useProgram(obj(a(0))); break;
+    case 14:
+      // A program linked since it was last used: its first useProgram makes Chrome fetch the link
+      // status SYNCHRONOUSLY (see RW_LINK_WAIT). In the steady drain, wait for the link to finish
+      // off this thread instead — the command stays in the ring and is retried on a later turn.
+      if (rwLinkPending.size && rwLinkPending.has(a(0)) && !rwLinkReady(a(0))) { _deferCmd = true; break; }
+      g.useProgram(obj(a(0))); break;
     case 15: g.blitFramebuffer(a(0), a(1), a(2), a(3), a(4), a(5), a(6), a(7), a(8), a(9)); break;
     case 16: g.bindVertexArray(obj(a(0))); break;
     case 17: g.blendEquationSeparate(a(0), a(1)); break;
@@ -416,7 +432,7 @@ function exec(opcode, a, nWords) {
     case 40: setObj(a(0), g.createFramebuffer()); break;
     case 41: g.drawBuffers(readIntArr(a, 0)); break;
     case 42: setObj(a(0), g.createProgram()); break;
-    case 43: g.linkProgram(obj(a(0))); break;
+    case 43: g.linkProgram(obj(a(0))); rwNoteLink(a(0)); break;
     case 44: g.deleteShader(obj(a(0))); break;
     case 45: g.uniformBlockBinding(obj(a(0)), a(1), a(2)); break;
     case 46: // texSubImage2D: nWords==9 → zero-copy; nWords>9 → INLINE snapshot.
@@ -458,7 +474,7 @@ function exec(opcode, a, nWords) {
     case 51: setObj(a(0), g.createSampler()); break;
     case 52: g.texStorage2D(a(0), a(1), a(2), a(3), a(4)); break;
     case 53: g.vertexAttribIPointer(a(0), a(1), a(2), a(3), a(4)); break;
-    case 54: g.pixelStorei(a(0), a(1)); break;
+    case 54: g.pixelStorei(a(0), a(1)); if (a(0) in rwPack) rwPack[a(0)] = a(1); break;   // shadowed: see rwIssueReadback
     case 56: present(); _hitPresent = true; break;
     // Object deletes — free the REAL GL object on this (canvas-owning) context
     // AND clear the objs[] slot so the JS wrapper can be GC'd and the id table's
@@ -472,7 +488,7 @@ function exec(opcode, a, nWords) {
     case 61: { const o = obj(a(0)); if (o) g.deleteSampler(o);      objs[a(0)] = null; break; }
     case 62: { const o = obj(a(0)); if (o) g.deleteRenderbuffer(o); objs[a(0)] = null; break; }
     case 63: { const o = obj(a(0)); if (o) g.deleteQuery(o);        objs[a(0)] = null; break; }
-    case 64: { const o = obj(a(0)); if (o) g.deleteProgram(o);      objs[a(0)] = null; break; }
+    case 64: { const lw = rwLinkPending.get(a(0)); if (lw) { if (lw.sync) gl.deleteSync(lw.sync); rwLinkPending.delete(a(0)); } const o = obj(a(0)); if (o) g.deleteProgram(o);      objs[a(0)] = null; break; }
     default: break; // unknown/reserved opcode: skip (nWords lets us resync)
   }
 }
@@ -545,12 +561,27 @@ function rwFreeSlot() {
   for (let k = 0; k < RW_MAX_INFLIGHT; k++) if (!rwFences.some((f) => f.slot === k)) return k;
   return 0;
 }
+// ⚠ THE PACK PARAMETERS ARE SHADOWED HERE, NEVER READ BACK (2026-10-05). getParameter() of
+// PACK_ROW_LENGTH / PACK_ALIGNMENT is NOT answered from a client-side cache in Chrome: it is a
+// synchronous round trip that waits for every GL command queued before it — i.e. for the GPU to
+// finish drawing the frame this present is about to read back. MEASURED (MP4, no WebGPU,
+// SwiftShader, bench room = two consoles on one main thread): per console 476 readbacks spent
+// 12.3 s in getParameter(PACK_ROW_LENGTH) (max 615 ms) + 1.9 s in getParameter(PACK_ALIGNMENT)
+// (max 432 ms on the other console); READ_FRAMEBUFFER_BINDING / PIXEL_PACK_BUFFER_BINDING /
+// PACK_SKIP_* read 0-1 ms. Those were the room's main-thread long tasks: the room's frame gate
+// runs on this thread, so every one of them was guest time the room did not release ("slow
+// window" in lib/bench.js). Rule 1 above (never wait on the GPU) is what this restores.
+// The only writers of these four are exec case 54 (the replayed stream) and this file's own
+// save/restore below, so a shadow written there is exact; it is seeded once, at start, from the
+// context itself (a one-time sync before any frame is in flight).
+const PACK_KEYS = [0x0D02 /* PACK_ROW_LENGTH */, 0x0D03 /* PACK_SKIP_ROWS */, 0x0D04 /* PACK_SKIP_PIXELS */, 0x0D05 /* PACK_ALIGNMENT */];
+const rwPack = { 0x0D02: 0, 0x0D03: 0, 0x0D04: 0, 0x0D05: 4 };
+function rwPackSeed() { for (const k of PACK_KEYS) { const v = gl.getParameter(k); if (typeof v === 'number') rwPack[k] = v; } }
 function rwIssueReadback(slot) {
   const g = gl;
-  const prevRead = g.getParameter(g.READ_FRAMEBUFFER_BINDING);
-  const prevPack = g.getParameter(g.PIXEL_PACK_BUFFER_BINDING);
-  const pr = g.getParameter(g.PACK_ROW_LENGTH), psr = g.getParameter(g.PACK_SKIP_ROWS);
-  const psp = g.getParameter(g.PACK_SKIP_PIXELS), pa = g.getParameter(g.PACK_ALIGNMENT);
+  const prevRead = g.getParameter(g.READ_FRAMEBUFFER_BINDING);   // client-side state: 0-1 ms
+  const prevPack = g.getParameter(g.PIXEL_PACK_BUFFER_BINDING);  // client-side state: 0-1 ms
+  const pr = rwPack[0x0D02], psr = rwPack[0x0D03], psp = rwPack[0x0D04], pa = rwPack[0x0D05];
   g.bindFramebuffer(g.READ_FRAMEBUFFER, null);
   g.bindBuffer(g.PIXEL_PACK_BUFFER, rwPbos[slot]);
   if (pr) g.pixelStorei(g.PACK_ROW_LENGTH, 0);
@@ -708,7 +739,72 @@ function present() {
 // `texSubImage3D: ArrayBufferView not big enough` then a frozen black canvas).
 // ctrlService passes false so setup-time queries still drain the whole ring.
 let _hitPresent = false;
+// ── RW_LINK_WAIT: A NEW SHADER'S FIRST USE MUST NOT BLOCK THIS THREAD (2026-10-05) ───────────
+// Blink's useProgram() checks the program's link status, and right after linkProgram() that is a
+// synchronous round trip to the GPU process: it waits for the link AND for everything queued before
+// it (on SwiftShader the GPU process is one thread serving every context on the page). MEASURED
+// (MP4 bench room, two consoles on one main thread, no WebGPU, SwiftShader), after the readback
+// fix above: useProgram was 861 ms of the 1198 ms of main-thread long tasks in the room window,
+// incl. one 338 ms task — Dolphin links a program whenever a scene needs a new TEV configuration.
+// So in the steady drain (main-thread replay only) a freshly linked program is not used until a
+// fence placed right after its link has signaled — and, where KHR_parallel_shader_compile is
+// exposed, until COMPLETION_STATUS_KHR reads true (both are non-blocking reads) — and until a
+// second fence covering every command queued since has signaled, because the link-status fetch is
+// a round trip behind all of them (rwCtrlFenceReady). Until then the
+// useProgram stays in the ring and this frame's replay resumes on a later turn: the cost lands on
+// presents (the page's skipRender gate sees a busy renderer), never on the guest — rule 1 above.
+// ctrlService (a setup query from the dolphin worker, which blocks on the answer) follows the same
+// rule: its drain stops at a parked useProgram and a query on a still-linking program is not
+// answered yet — both are retried on a later turn; only the dolphin WORKER waits meanwhile.
+const RW_LINK_WAIT = !(typeof location !== 'undefined' && /[?&]rwlinkwait=0\b/.test(location.search));
+const rwLinkPending = new Map();      // program id -> fence placed after its linkProgram
+let rwParallelExt = null, _deferCmd = false, rwDeferred = false;
+const rwLinkStats = { links: 0, held: 0, heldMs: 0, deferredTurns: 0, ctrlWaits: 0, waitMaxMs: 0 };
+if (typeof self !== 'undefined') self.__rwLinkStats = rwLinkStats;
+let rwGlEpoch = 0, rwCtrlFence = null, rwCtrlFenceEpoch = -1, rwCtrlSyncedEpoch = -1;
+function rwCtrlFenceReady() {
+  if (MODE !== 'main' || !RW_LINK_WAIT) return true;
+  if (rwCtrlSyncedEpoch === rwGlEpoch) return true;
+  if (rwCtrlFence && rwCtrlFenceEpoch !== rwGlEpoch) { gl.deleteSync(rwCtrlFence); rwCtrlFence = null; }
+  if (!rwCtrlFence) { rwCtrlFence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0); rwCtrlFenceEpoch = rwGlEpoch; gl.flush(); return false; }
+  if (gl.getSyncParameter(rwCtrlFence, gl.SYNC_STATUS) !== gl.SIGNALED) return false;
+  gl.deleteSync(rwCtrlFence); rwCtrlFence = null; rwCtrlSyncedEpoch = rwGlEpoch;
+  return true;
+}
+function rwNoteLink(id) {
+  if (MODE !== 'main' || !RW_LINK_WAIT) return;
+  const old = rwLinkPending.get(id); if (old && old.sync) gl.deleteSync(old.sync);
+  rwLinkPending.set(id, { sync: gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0), at: performance.now() });
+  gl.flush();
+  rwLinkStats.links++;
+}
+function rwLinkReady(id) {
+  const w = rwLinkPending.get(id), now = performance.now();
+  let ready = true;
+  if (w.sync) {
+    if (gl.getSyncParameter(w.sync, gl.SYNC_STATUS) !== gl.SIGNALED) ready = false;
+    else { gl.deleteSync(w.sync); w.sync = null; }
+  }
+  const p = obj(id);
+  if (ready && p && rwParallelExt && gl.getProgramParameter(p, rwParallelExt.COMPLETION_STATUS_KHR) === false) ready = false;
+  // the link status fetch is itself a round trip behind everything queued since the link: wait
+  // for a fence covering that too (rwCtrlFenceReady), so it returns at once
+  if (ready && !rwCtrlFenceReady()) ready = false;
+  if (!ready) { if (!w.held) { w.held = now; rwLinkStats.held++; } return false; }
+  rwLinkPending.delete(id);
+  // how long a frame's replay was actually held (first deferral -> ready), not link -> first use
+  if (w.held) { const dt = now - w.held; rwLinkStats.heldMs += dt; if (dt > rwLinkStats.waitMaxMs) rwLinkStats.waitMaxMs = dt; }
+  return true;
+}
+// True while the next ring command is a useProgram parked by RW_LINK_WAIT (its fence/status is
+// only refreshed between tasks, so drainLoop polls it on a timer rather than a hot loop).
+function rwLinkHeld() {
+  if (!rwLinkPending.size) return false;
+  const tail = Atomics.load(ring, HDR_TAIL);
+  return ring[ringStore + (tail % ringCap)] === 14 && rwLinkPending.has(ring[ringStore + ((tail + 2) % ringCap)]);
+}
 function drainOnce(stopAtPresent) {
+  rwDeferred = false;
   syncHeap();   // pick up any ALLOW_MEMORY_GROWTH growth before reading uploads
   let tail = Atomics.load(ring, HDR_TAIL);
   for (;;) {
@@ -721,9 +817,12 @@ function drainOnce(stopAtPresent) {
     const a = (k) => ring[ringStore + ((body0 + k) % ringCap)];
     _body0 = body0;
     _hitPresent = false;
+    _deferCmd = false;
     try { exec(opcode, a, nWords); } catch (e) {
       reportGlError(opcode, '' + (e && e.message ? e.message : e));
     }
+    if (!_deferCmd) rwGlEpoch++;
+    if (_deferCmd) { _deferCmd = false; rwDeferred = true; rwLinkStats.deferredTurns++; return false; }   // RW_LINK_WAIT: retried next turn
     tail = tail + 2 + nWords;
     Atomics.store(ring, HDR_TAIL, tail);
     if (stopAtPresent && _hitPresent) return true;   // one frame this turn; yield
@@ -781,7 +880,7 @@ function drainLoop() {
     _mpLast = _t2;
     // A partial frame still in the ring (no present yet) is picked up on the next turn; an
     // in-flight fence is polled every 2 ms (its status only refreshes between tasks anyway).
-    if (rwCanReplay() && Atomics.load(ring, HDR_HEAD) !== Atomics.load(ring, HDR_TAIL)) _scheduleDrain();
+    if (rwCanReplay() && Atomics.load(ring, HDR_HEAD) !== Atomics.load(ring, HDR_TAIL) && !rwLinkHeld()) _scheduleDrain();
     else setTimeout(_scheduleDrain, rwFences.length ? 2 : 4);
   } else {
     drainOnce(false);
@@ -804,7 +903,8 @@ function ctrlServiceMain() {
   const _deadline = performance.now() + 12;
   let n = 0;
   while (Atomics.load(ctrl, CTRL_FUTEX) === 1 && n < 4096) {
-    ctrlService(); n++;
+    if (ctrlService() === false) break;   // RW_LINK_WAIT: retried next turn
+    n++;
     if (performance.now() >= _deadline) break;
   }
   if (n > 0) {
@@ -845,6 +945,7 @@ function startMainThreadReplay(opts) {
     return false;
   }
   reacquireHeap(opts.memory);
+  try { rwParallelExt = RW_LINK_WAIT ? gl.getExtension('KHR_parallel_shader_compile') : null; } catch (e) { rwParallelExt = null; }
   ringByteOff = opts.ringByteOff; ringWordsTotal = 4 + (opts.ringWords | 0);
   ring = new Int32Array(wasmMem.buffer, ringByteOff, ringWordsTotal);
   ringCap = ring[HDR_CAPACITY];
@@ -856,6 +957,7 @@ function startMainThreadReplay(opts) {
     rwW = gl.drawingBufferWidth; rwH = gl.drawingBufferHeight;
     rwCtx2d = opts.display.getContext('2d', { alpha: false });
     if (!rwCtx2d) { log('[mtgl] readback mode: no 2D context on the display canvas'); return false; }
+    rwPackSeed();
     const prevPack = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
     for (let k = 0; k < RW_MAX_INFLIGHT; k++) {
       rwPbos[k] = gl.createBuffer();
