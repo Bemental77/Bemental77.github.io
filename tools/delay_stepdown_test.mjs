@@ -265,5 +265,18 @@ const bad=(n,d)=>{fail++;console.log('  FAIL  '+n+' — '+d);};
     ? ok('a-repeated-lsgo-does-not-restart-a-stalled-guest', `stalled at frame ${gb}, still ${G.frame}`)
     : bad('a-repeated-lsgo-does-not-restart-a-stalled-guest', `${gs}@${gb} -> ${G.state}@${G.frame}`);
 }
+// THE FLOOR IS PER CONSOLE (opts.minDelay, 2026-10-05). dreamcast.html passes 1;
+// every other console keeps the old floor of 2, so a default engine must not move.
+{
+  const D = new L({ peerId:'H', host:true, localPorts:[0], portCount:4, padBytes:8, send:()=>{}, now:()=>now });
+  const one = new L({ peerId:'H', host:true, localPorts:[0], portCount:4, padBytes:8, minDelay:1, send:()=>{}, now:()=>now });
+  D.delay = 1; D.begin(); one.delay = 1; one.begin();
+  (D.minDelay === 2 && D._delayFloor === 2 && one.minDelay === 1 && one._delayFloor === 1)
+    ? ok('the-delay-floor-is-the-consoles-own', `default floor ${D._delayFloor}, minDelay:1 floor ${one._delayFloor}`)
+    : bad('the-delay-floor-is-the-consoles-own', `default ${D.minDelay}/${D._delayFloor}, one ${one.minDelay}/${one._delayFloor}`);
+  const big = new L({ peerId:'H', host:true, localPorts:[0], portCount:4, padBytes:8, minDelay:9, send:()=>{}, now:()=>now });
+  (big.minDelay === 2) ? ok('minDelay-is-clamped-to-1-or-2', 'minDelay:9 -> ' + big.minDelay)
+                       : bad('minDelay-is-clamped-to-1-or-2', 'minDelay:9 -> ' + big.minDelay);
+}
 console.log(`\n[delay] ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

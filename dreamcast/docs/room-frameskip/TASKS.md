@@ -127,6 +127,12 @@ over, room 1.0000 / 0 over, desync false over 12 hashes, 21/21 pass.
 
 ## Input delay: 2 stays
 
+> **Superseded 2026-10-05 (`room-input-lag/TASKS.md`).** The worker now keeps
+> a stall as a bounded debt instead of rebasing its governor. The page queues
+> one frame, and the Dreamcast floor is 1. At ~2 ms RTT the room runs at delay
+> 1, and input lag (sample to run_iter start) went from p50 122 ms to 55 ms
+> at 1.000x.
+
 - The engine floors the delay at 2 (`lib/netplay.js` `_delayFloor`,
   `_capDelay`, `recommendDelay`). At PSO's 30 frames/s that is 67 ms of input
   latency, and delay 1 would give back 33 ms.
