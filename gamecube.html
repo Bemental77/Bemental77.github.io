@@ -9794,9 +9794,9 @@ window.GcRate = (function () {
   // window.__gcRoomRender() reports it.
   var ROOM_SLOW_RENDER_MS = 250;
   var ROOM_YIELD = q.get('roomyield') !== '0';
-  var RRY = { q: [], ema: 0, lastAck: 0, yielded: 0, sent: 0 };
+  var RRY = { q: [], ema: 0, lastAck: 0, yielded: 0, sent: 0, blind: 0 };
   window.__gcRoomRender = function () {
-    return { on: ROOM_YIELD, drawMsEma: +RRY.ema.toFixed(1), slow: RRY.ema >= ROOM_SLOW_RENDER_MS, yielded: RRY.yielded, sent: RRY.sent };
+    return { on: ROOM_YIELD, drawMsEma: +RRY.ema.toFixed(1), slow: RRY.ema >= ROOM_SLOW_RENDER_MS, yielded: RRY.yielded, blind: RRY.blind, sent: RRY.sent };
   };
   function gcRoomRenderSent(t) { RRY.q.push(t); RRY.sent++; if (RRY.q.length > 8) RRY.q.shift(); }
   function gcRoomRenderAck(t) {
@@ -9804,8 +9804,25 @@ window.GcRate = (function () {
     if (t0 == null) return;
     var dt = t - t0; RRY.ema = RRY.ema ? RRY.ema * 0.75 + dt * 0.25 : dt;
   }
+  // ── UNMEASURED IS NOT FAST (2026-10-05, live prod 3e4e160) ─────────────────────────────────
+  // The yield keys off a MEASURED draw latency, and the first measurement is the first recompAck.
+  // Until it arrives the EMA reads 0, and the room used to draw as if the GPU were fast: on the
+  // live harness every run put a SECOND frame in flight ~100 ms after the first (sent=2), whose ack
+  // then came back 11.5-17.6 s later. So in a room a renderer that has not yet acked a single
+  // frame gets ONE frame in flight: the first ack is the measurement, nothing more is committed to
+  // the GPU before it. A hardware GPU acks in a frame or two, so this costs it at most a present at
+  // the room's start; ?roomyield=0 still disables all of it.
+  // ARMED, NOT ONLY RUNNING: GCLS.running flips inside gcLsStep, and the first released frames can
+  // reach the renderer before it does — the joiner console drew its frame 5 that way while the
+  // host's yield was already holding. (The rest of that 11-17 s first ack was not the frame: it
+  // was the renderer's pre-room backlog — see READY MEANS THE RENDERER HAS CAUGHT UP.)
   function gcRoomRenderYield(t) {
-    if (!ROOM_YIELD || !gcLsGate || !GCLS.running || RRY.ema < ROOM_SLOW_RENDER_MS) return false;
+    if (!ROOM_YIELD || !gcLsGate || !(GCLS.running || GCLS.armed)) return false;
+    if (!RRY.lastAck) {
+      if (rate.outstanding >= 1) { RRY.yielded++; RRY.blind++; return true; }
+      return false;
+    }
+    if (RRY.ema < ROOM_SLOW_RENDER_MS) return false;
     var idle = Math.min(30000, Math.max(10000, 20 * RRY.ema));
     if (rate.outstanding >= 1 || t - RRY.lastAck < idle) { RRY.yielded++; return true; }
     return false;
@@ -10214,6 +10231,53 @@ window.GcRate = (function () {
     setInterval(gcLsStep, 4);   // rAF alone would cap the feed at the display refresh
     return true;
   }
+  // ── READY MEANS THE RENDERER HAS CAUGHT UP (2026-10-05, live prod 3e4e160) ───────────────────
+  // Before the room, each console booted on the JIT core, whose WGPU renderer drew every boot frame.
+  // On a software adapter that work runs seconds per frame BEHIND the guest: WGPUGfx keeps up to
+  // kMaxReadbacksInFlight presented frames (plus frames "kept while behind") queued on the GPU, and
+  // the JIT stopping at the recomp takeover does not take them back. MEASURED (MP4 bench room,
+  // headless SwiftShader, the live harness's flags, 0.5 s per-thread samples of the GPU process,
+  // with BOTH consoles drawing nothing in the room): the GPU process's main thread ran ~100% and
+  // SwiftShader's raster threads 150-250% for the room's first ~17 s, the renderer counters showed no
+  // new draw at all (0x026B352C flat since before the room) while publishes kept completing
+  // (0x026B3518 +2 at 16.3 s and 18.2 s) — the pre-room backlog draining — and frame 725 (12.1 s
+  // in) still read a "room: slow window" (28.5-42.6 ms, 6-9 frames over, 3 of 4 runs). With the
+  // bench_page_test flags the same backlog happened to drain before the barrier released, which is
+  // why those runs read clean. So a console declares ready only once its renderer has no
+  // readback in flight (0x026B3504 ReadbackAndPresent issued - 0x026B3508 map callbacks fired,
+  // WGPUGfx.cpp): readbacks complete in queue order, so none in flight means the GPU has run
+  // everything up to the last presented frame. Every console holds its own declaration, so the
+  // barrier releases with every renderer idle and the guests start on a quiet machine. A hardware
+  // GPU is at 0 already; the wait is capped at READY_DRAIN_MAX_MS and reported either way.
+  // AFTER (same rig): each console found 3 boot frames in flight and declared 21.3 / 22.6 s later;
+  // through the room the GPU process sampled idle, frame 725's worker wait fell to +52 ms, and the
+  // room read 0 over in 4/4 runs (max 17.9-20.1 ms) against 2 of 3 HEAD runs over (9/9 frames).
+  // __gcLockstep().drainMs reports the wait.
+  var READY_DRAIN_MAX_MS = 60000;
+  function gcLsRendererInFlight() {
+    try {
+      if (!sharedMemory || window.__gcMtGl) return 0;
+      var A = new Uint32Array(sharedMemory.buffer);
+      var n = ((Atomics.load(A, 0x026B3504 >> 2) >>> 0) - (Atomics.load(A, 0x026B3508 >> 2) >>> 0)) >>> 0;
+      return n > 64 ? 0 : n;            // not these cells on this binary: never wait on garbage
+    } catch (e) { return 0; }
+  }
+  function gcLsRendererDrained() {
+    var t0 = performance.now();
+    return new Promise(function (res) {
+      (function poll() {
+        var n = gcLsRendererInFlight(), dt = performance.now() - t0;
+        if (n === 0 || dt >= READY_DRAIN_MAX_MS || !GCLS.session) {
+          GCLS.drainMs = Math.round(dt);
+          if (dt >= 250) gcLsSay((n === 0 ? 'renderer caught up' : 'renderer STILL ' + n + ' frame(s) behind') +
+                                 ' after ' + (dt / 1000).toFixed(1) + ' s — declaring ready now');
+          return res();
+        }
+        if (!GCLS.drainSaid) { GCLS.drainSaid = true; gcLsSay('renderer has ' + n + ' boot frame(s) still on the GPU — declaring ready once they have run, so the room starts on an idle machine'); }
+        setTimeout(poll, 100);
+      })();
+    });
+  }
   function gcLsDeclare() {
     if (!GCLS.wantDeclare || GCLS.declared || GCLS.declaring || !GCLS.session || !GCLS.buildTag) return;
     GCLS.declaring = true;
@@ -10243,6 +10307,7 @@ window.GcRate = (function () {
         }
       }).catch(function (e) { gcLsSay('delay choice failed, keeping the default: ' + ((e && e.message) || e)); });
     }
+    pre = Promise.all([pre, gcLsRendererDrained()]);
     pre.then(function () {
       GCLS.declaring = false;
       if (GCLS.declared || !GCLS.session) return;
@@ -10296,7 +10361,7 @@ window.GcRate = (function () {
       card: { state: GCCARD.state, why: GCCARD.why, key: GCCARD.key, size: GCCARD.size,
               persist: GCCARD.persist, beats: GCCARD.beats },
       buildTag: GCLS.buildTag, disc: gcLsDisc(), wantDeclare: !!GCLS.wantDeclare, rttMs: GCLS.rttMs == null ? null : GCLS.rttMs,
-      runMs: Math.round(GCLS.runMs), waitInputMs: Math.round(GCLS.waitInputMs), waitWorkerMs: Math.round(GCLS.waitWorkerMs),
+      drainMs: GCLS.drainMs == null ? null : GCLS.drainMs, runMs: Math.round(GCLS.runMs), waitInputMs: Math.round(GCLS.waitInputMs), waitWorkerMs: Math.round(GCLS.waitWorkerMs),
       // Raw cells, so a rig can tell "the worker never published" apart from
       // "the page never forwarded" — different bugs with one symptom, and the
       // pair that separated them when the first fingerprint silently published
