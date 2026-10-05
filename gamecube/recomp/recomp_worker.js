@@ -645,6 +645,8 @@ const PAD_ACK = 33, LS_ARMED = 34;
 // / 733). While held: the FIFO is walked (register shadow), nothing is copied, a { held } frame
 // is posted, and cacheDirty is set so the first frame shipped after the hold is a full,
 // self-contained image. The guest is untouched — only what the renderer is sent (gate #9).
+// Value 2 holds ONLY a frame that would carry the full image (gamecube.html: the main-thread
+// WebGL2 fallback defers it to the first frame it will draw — THE MAIN-THREAD WebGL2 FALLBACK).
 const SHIP_HOLD = 210;
 let shipHeld = 0;
 
@@ -2137,7 +2139,9 @@ async function boot(msg) {
             // the prologue of the next shipped frame is built from it — but nothing is copied or
             // posted, and the next frame that IS shipped carries the full image (cacheDirty), which
             // is self-contained by construction (A FULL-IMAGE FRAME STARTS FROM EMPTY CACHES).
-            if (paceI32 && Atomics.load(paceI32, SHIP_HOLD) === 1) {
+            // 2 = hold only a frame that would carry the full image (the main-thread fallback's deferral).
+            const shipHold = paceI32 ? Atomics.load(paceI32, SHIP_HOLD) : 0;
+            if (shipHold === 1 || (shipHold === 2 && (cacheDirty || !sentPrologue) && !testFullMem)) {
               try { walkStream(mem(), fb, 0, pos, 0, [], new Map()); } catch (e) { log('walk threw: ' + e.message); }
               texBound.clear(); pairSeen.clear();
               if (Module.___recomp_dirty_reset) Module.___recomp_dirty_reset();

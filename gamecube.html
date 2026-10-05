@@ -9794,7 +9794,7 @@ window.GcRate = (function () {
   // window.__gcRoomRender() reports it.
   var ROOM_SLOW_RENDER_MS = 250;
   var ROOM_YIELD = q.get('roomyield') !== '0';
-  var RRY = { q: [], ema: 0, lastAck: 0, yielded: 0, sent: 0, blind: 0, hold: 0, held: 0, holds: 0 };
+  var RRY = { q: [], ema: 0, lastAck: 0, yielded: 0, sent: 0, blind: 0, hold: 0, held: 0, holds: 0, pendSince: 0 };
   window.__gcRoomRender = function () {
     return { on: ROOM_YIELD, drawMsEma: +RRY.ema.toFixed(1), slow: RRY.ema >= ROOM_SLOW_RENDER_MS, yielded: RRY.yielded, blind: RRY.blind, sent: RRY.sent,
              shipHold: ROOM_SHIP_HOLD, holding: !!RRY.hold, held: RRY.held, holds: RRY.holds };
@@ -9847,10 +9847,26 @@ window.GcRate = (function () {
   // keeps up never holds past its first ack. ?roomhold=0 is the matched control.
   var ROOM_SHIP_HOLD = ROOM_YIELD && q.get('roomhold') !== '0';
   var SHIP_HOLD = 210, SHIP_LEAD_MS = 150;     // recomp_worker.js SHIP_HOLD
-  function gcRoomShipHold(t) {
+  // ── THE MAIN-THREAD WebGL2 FALLBACK: DEFER THE FULL IMAGE TO A FRAME THAT WILL BE DRAWN ──────
+  // That renderer draws at most one frame per display tick and none while its replay is busy (the
+  // _pg gate at the recomp 'frame' handler) — in a room ~3.5 pictures/s — so the yield and the hold
+  // above stay off and every frame ships. MEASURED (bench_page_test's no-WebGPU flags, prod mirror,
+  // per-frame worker timers): the room's slow window is the same frame 725 there (2 of 3 rooms
+  // over, 8 frames, 30.9-31.0 ms), its ship 59-140 ms on both consoles at once. So value 2 asks
+  // for less: the worker holds a frame only if it would carry the FULL image (cacheDirty: the
+  // frames after a DVD read). In a room on this renderer the page keeps 2 set, so the load frame
+  // itself is never the one that ships it; once a held frame is seen, it releases the hold at the
+  // first frame it would draw at least MT_DEFER_MS later — a different delay per local port, since
+  // the consoles of a loopback room share one display tick and would otherwise ship together. The
+  // picture waits that long after a scene load; the guest never does (gate #9).
+  // (Measured releasing at the first drawable frame instead: 1 of 5 rooms still over — both
+  // consoles' first drawable frame was 725 itself.)
+  function gcMtDeferMs() { return 150 + 300 * (((GCLS.ports && GCLS.ports[0]) | 0) & 3); }
+  function gcRoomShipHold(t, mtSkipNext) {
     var hold = 0;
-    if (ROOM_SHIP_HOLD && gcLsGate && (GCLS.running || GCLS.armed) && !window.__gcMtGl) {
-      if (!RRY.lastAck) hold = rate.outstanding >= 1 ? 1 : 0;
+    if (ROOM_SHIP_HOLD && gcLsGate && (GCLS.running || GCLS.armed)) {
+      if (window.__gcMtGl) hold = (RRY.pendSince && !mtSkipNext && t - RRY.pendSince >= gcMtDeferMs()) ? 0 : 2;
+      else if (!RRY.lastAck) hold = rate.outstanding >= 1 ? 1 : 0;
       else if (RRY.ema >= ROOM_SLOW_RENDER_MS) hold = (rate.outstanding >= 1 || t - RRY.lastAck < gcRoomRenderIdleMs() - SHIP_LEAD_MS) ? 1 : 0;
     }
     if (hold !== RRY.hold) { RRY.hold = hold; if (hold) RRY.holds++; try { Atomics.store(paceI32, SHIP_HOLD, hold); } catch (e) {} }
@@ -10529,8 +10545,13 @@ window.GcRate = (function () {
   };
   var grantTimer = 0;
   var rafSinceDraw = true, lastDrawAt = 0;
+  function gcMtSkipNext(t) {   // would the main-thread fallback skip a frame arriving now? (the _pg gate)
+    var b = typeof window.__gcRwBusy === 'function' && window.__gcRwBusy();
+    return !!(b || (!rafSinceDraw && (t - lastDrawAt) < 230));
+  }
   function grantLoop() {
     rafSinceDraw = true;
+    if (window.__gcMtGl && RRY.pendSince) gcRoomShipHold(performance.now(), gcMtSkipNext(performance.now()));
     grantNow();
     // ONCE PER DISPLAY TICK: the hidden catch-up frames the room grants this console (lib/netplay.js
     // rbCatchUp counts its calls as ticks), run by gcLsStep before any credited frame.
@@ -10771,7 +10792,8 @@ window.GcRate = (function () {
         // SHIP_HOLD (gcRoomShipHold): the worker sent nothing for this frame — no draw, no state.
         var _hnow = performance.now();
         rate.frame(e.data.n, _hnow, true); RRY.yielded++; RRY.held++;
-        gcRoomShipHold(_hnow);
+        if (!RRY.pendSince) RRY.pendSince = _hnow;
+        gcRoomShipHold(_hnow, window.__gcMtGl ? gcMtSkipNext(_hnow) : false);
         return;
       }
       if (e.data.cmd === 'frame') {
@@ -10803,12 +10825,13 @@ window.GcRate = (function () {
         var _pg = _mt && (_rwb || (!rafSinceDraw && (_fnow - lastDrawAt) < 250));
         // A hidden catch-up frame (THE ROLLBACK RING) applies its state and is never drawn.
         var skipRender = rate.frame(e.data.n, _fnow, _pg || (!_mt && gcRoomRenderYield(_fnow)) || !!e.data.hidden);
-        if (!_mt) gcRoomShipHold(_fnow);
         if (!skipRender) {
           gcRoomRenderSent(_fnow);
           rafSinceDraw = false; lastDrawAt = _fnow;
           if (_mt && typeof window.__gcRwNoteSent === 'function') window.__gcRwNoteSent();
         }
+        RRY.pendSince = 0;                 // a shipped frame: nothing is pending behind the hold
+        gcRoomShipHold(_fnow, _mt ? gcMtSkipNext(_fnow) : false);
         var tr = [e.data.fifo].concat(e.data.regions.map(function (r) { return r.bytes; }));
         if (e.data.mem1) tr.push(e.data.mem1);
         dolphin_worker.postMessage({ cmd: 'recompFrame', n: e.data.n, fifo: e.data.fifo,
