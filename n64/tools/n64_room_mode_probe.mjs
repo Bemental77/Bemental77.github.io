@@ -45,7 +45,7 @@ const SAMPLE = () => {
   let n = null; try { n = window.__n64Net && window.__n64Net(); } catch (e) { return { err: String(e) }; }
   if (!n) return null;
   const e = n.engine || {}, m = e.mode || {}, pg = (n.rollback && n.rollback.page) || {}, rr = (n.rollback && n.rollback.engine) || {};
-  return { t: performance.timeOrigin + performance.now(), mode: n.mode, frame: n.frame, lost: n.lostMs, stallMs: n.stallMs,
+  return { t: performance.timeOrigin + performance.now(), mode: n.mode, frame: n.frame, lost: n.lostMs, stallMs: n.stallMs, repaid: n.repaidMs, rean: n.reanchors, adv: n.advWaits,
            need: m.need, pending: m.pending, hist: (m.history || []).map((h) => [h.frame, h.to, h.delay, h.why]),
            st: n.step ? n.step.selfStepMs : null, sp: n.step ? n.step.selfPresentMs : null, saveEma: n.step ? n.step.saveEmaMs : null, loadEma: n.step ? n.step.loadEmaMs : null,
            run: pg.runMs, save: pg.saveMs, load: pg.loadMs, k: pg.k, win: rr.window != null ? rr.window : (e.rollback ? e.rollback.window : null),
@@ -78,6 +78,7 @@ for (let run = 0; run < RUNS; run++) {
           const dt = (h.t - prev.t) / 1000;
           const row = { t: Math.round((Date.now() - t0) / 1000), mode: h.mode, speed: +((h.frame - prev.frame) / dt / 60).toFixed(4),
             lostMs: Math.round((h.lost || 0) - (prev.lost || 0)), stallMs: Math.round((h.stallMs || 0) - (prev.stallMs || 0)),
+            repaidMs: Math.round((h.repaid || 0) - (prev.repaid || 0)), rean: (h.rean || 0) - (prev.rean || 0), adv: (h.adv || 0) - (prev.adv || 0),
             need: h.need, st: h.st, sp: h.sp, run: h.run, save: h.save, load: h.load, k: h.k, win: h.win, delay: h.delay, cost: h.cost != null ? +(+h.cost).toFixed(2) : null,
             wipes: h.wipes, tlbSame: h.tlbSame, rb: (h.rb || 0) - (prev.rb || 0), resim: (h.resim || 0) - (prev.resim || 0),
             fsR: (h.fsR || 0) - (prev.fsR || 0), fsMs: (h.fsMs || 0) - (prev.fsMs || 0), fsMax: h.fsMax, fsIdle: h.fsIdle,
@@ -137,7 +138,7 @@ for (let run = 0; run < RUNS; run++) {
   const n = R.length;
   out.summary = { run, secs: n, rollbackS: R.filter((r) => r.mode === 'rollback').length, delayS: R.filter((r) => r.mode !== 'rollback').length,
     speed: n ? +(R.reduce((a, r) => a + r.speed, 0) / n).toFixed(4) : null, lostMs: R.reduce((a, r) => a + r.lostMs, 0),
-    stallMs: R.reduce((a, r) => a + r.stallMs, 0),
+    stallMs: R.reduce((a, r) => a + r.stallMs, 0), repaidMs: R.reduce((a, r) => a + (r.repaidMs || 0), 0),
     // ALL rows (the start-up transient included — the measured window above drops the first 3)
     lostAllMs: out.rows.reduce((a, r) => a + r.lostMs + r.stallMs, 0), lostFirst5Ms: out.rows.slice(0, 5).reduce((a, r) => a + r.lostMs + r.stallMs, 0),
     worstSecMs: Math.max(0, ...out.rows.map((r) => r.lostMs + r.stallMs)), lossySecs: out.rows.filter((r) => r.lostMs + r.stallMs > 0).length,

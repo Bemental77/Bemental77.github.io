@@ -1624,7 +1624,7 @@ N64Rate.selfTest = function (logFn) {
 </script>
 <script src="/n64/N64Wasm/dist/fbasync.js?v=a23cd08f"></script>
 <script src="/n64/N64Wasm/dist/jit_params.js?v=bb2930f6"></script>
-<script src="/n64/N64Wasm/dist/room_core.js?v=3b7fd7cb"></script>
+<script src="/n64/N64Wasm/dist/room_core.js?v=bb883d8c"></script>
 <script>
 (function () {
   'use strict';
@@ -2458,7 +2458,7 @@ N64Rate.selfTest = function (logFn) {
   // logged. If the worker fails while it boots (no WebGL2 there after all, a
   // core abort before "Starting R4300"), the page reloads ONCE with ?worker=0
   // (wkFallback) and says so in its log.
-  var WK_V = '0f65f890';                           // cache-buster for the worker's scripts
+  var WK_V = '666db0ab';                           // cache-buster for the worker's scripts
   var WK_DEFAULT = true;                     // the default for a capable console (solo and rooms)
   var WK = { on: false, why: null, w: null, stat: null, statAt: 0, presents0: 0, pendingAudioPort: null,
              evals: {}, evalId: 0, sent: null, composed: 0, posted: 0, fatal: null, booted: false,
@@ -2630,6 +2630,7 @@ N64Rate.selfTest = function (logFn) {
       case 'lso': if (WK.engSend) { try { WK.engSend(d.m); } catch (er) {} } break;
       case 'lsev': wkRoomEvent(d); break;
       case 'lsm': wkRoomMirror(d); break;
+      case 'lsf': WK.roomFrame = d; break;
       case 'lsrelay': {
         var L = WK.relL.get(d.k); WK.relL.delete(d.k);
         if (d.m && NET.session && typeof NET.session._relay === 'function') { try { NET.session._relay(d.m, L); } catch (er) {} }
@@ -2871,7 +2872,7 @@ N64Rate.selfTest = function (logFn) {
   function wkRoomMirror(d) {
     wkApplyLite(d.lite);
     if (d.net) {
-      WK.roomNet = d.net;
+      WK.roomNet = d.net; WK.roomNetAt = d.at || 0;
       window.__n64LsImage = d.net.image || null;
       var g = d.net.gl;
       if (g) { LS_GL.reads = g.reads; LS_GL.lit = g.lit; LS_GL.lost = LS_GL.lost || g.lost; LS_GL.restored = LS_GL.restored || g.restored; LS_GL.err = g.err; }
@@ -4933,6 +4934,8 @@ N64Rate.selfTest = function (logFn) {
       worker: !!WK.room,
     };
     for (var k in core) out[k] = core[k];
+    // the frame as of the worker's last tick ('lsf'), not as of its last full report (<= 100 ms old)
+    if (WK.room && WK.roomFrame && WK.roomFrame.at >= (WK.roomNetAt || 0) && out.frame != null) { out.frame = WK.roomFrame.f; out.lastFp = WK.roomFrame.fp; out.frameAt = WK.roomFrame.at; }
     // 'rollback' (delay 0, predict + re-simulate; the default — RB_DEFAULT) or 'lockstep'
     // (delay-based: ?rb=0, or the capacity gate's switch) — the HOST's choice, read off the engine.
     // The room's own fields: who this console is, the session, and THE PARTY — what the

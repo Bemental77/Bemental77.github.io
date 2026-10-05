@@ -9,7 +9,8 @@
 //     ?workerrig=clock eval seam, which changes nothing else). Two clocks that agree make the
 //     reading a property of the guest, not of the meter.
 //   * the worker's wall time: inside fields (busyMs), what the 1.000x governor wrote off
-//     (lostMs / reanchors: time a field was owed and none ran), the GPU guard (GQ held ms),
+//     (lostMs / reanchors: time a field was owed and none ran, beyond the repayment cap), what it
+//     repaid (repaidMs: owed fields run back on schedule, never ahead of it), the GPU guard (GQ held ms),
 //     the commit yield (CB holds / forced), frame-skip re-runs (FSK.redoMs), and the remainder
 //     — the pace wait (no field owed).
 // solo: the bench's solo window. room: the bench's loopback room (both consoles on this box),
@@ -75,6 +76,7 @@ try {
     var cnt = self.__cntPtr ? M.HEAPU32[self.__cntPtr >>> 2] >>> 0 : null;
     return { t: performance.timeOrigin + performance.now(), vi: viTotal(), w: w, cnt: cnt, gq: typeof GQ !== 'undefined' ? GQ.heldMs || 0 : null,
              cbH: CB.holds, cbF: CB.forced, redoMs: FSK.redoMs || 0, redo: FSK.redo, lost: CLK.lostMs, rean: CLK.reanchors, busy: CLK.busyMs,
+             repaid: typeof REPAY !== 'undefined' ? REPAY.repaidMs : null, lsRepaid: RM && RM.R ? (RM.R.LS.repaidMs || 0) : null,
              ticks: CLK.ticks, notOwed: SCHED.notOwed, raf: SCHED.rafTicks, imm: SCHED.immTicks, tmr: SCHED.tmrTicks, frame: CLK.frame,
              room: !!(RM && RM.R), lsFrame: RM && RM.R ? RM.R.LS.frame : null, lsLost: RM && RM.R ? (RM.R.LS.lostMs || 0) : null,
              lsStallMs: RM && RM.R ? (RM.R.LS.stallMs || 0) : null, lsRean: RM && RM.R ? (RM.R.LS.reanchors | 0) : null,
@@ -117,11 +119,11 @@ try {
         witness: (v.w != null && prev.w != null) ? +(((v.w - prev.w) >>> 0) / dt / WITHZ).toFixed(4) : null,
         count: (v.cnt != null && prev.cnt != null) ? +(((v.cnt - prev.cnt) >>> 0) / dt / (789000 * hz)).toFixed(4) : null,
         cntPerField: (v.cnt != null && prev.cnt != null && d('vi') > 0) ? Math.round(((v.cnt - prev.cnt) >>> 0) / d('vi')) : null,
-        busyMs: +(d('busy') || 0).toFixed(1), lostMs: +(d('lost') || 0).toFixed(1), rean: d('rean'), gqMs: d('gq') == null ? null : +d('gq').toFixed(1),
+        busyMs: +(d('busy') || 0).toFixed(1), lostMs: +(d('lost') || 0).toFixed(1), repaidMs: +(d('repaid') || 0).toFixed(1), rean: d('rean'), gqMs: d('gq') == null ? null : +d('gq').toFixed(1),
         cbHolds: d('cbH'), cbForced: d('cbF'), redoMs: +(d('redoMs') || 0).toFixed(1), ticks: d('ticks'), notOwed: d('notOwed'),
         raf: d('raf'), imm: d('imm'), tmr: d('tmr') };
       if (v.room) Object.assign(row, { room: +(d('lsFrame') / dt / hz).toFixed(4), lsLostMs: +(d('lsLost') || 0).toFixed(1), lsRean: d('lsRean'),
-        lsStallMs: +(d('lsStallMs') || 0).toFixed(1), lsAdv: d('lsAdv'), mode: v.mode, rbk: d('rbk'), resim: d('resim'),
+        lsStallMs: +(d('lsStallMs') || 0).toFixed(1), lsRepaidMs: +(d('lsRepaid') || 0).toFixed(1), lsAdv: d('lsAdv'), mode: v.mode, rbk: d('rbk'), resim: d('resim'),
         saveMs: v.rbSaveMs != null ? +(d('rbSaveMs')).toFixed(1) : null, ring: v.rbN, costOver: d('costOver'), costMax: v.costMax != null ? +v.costMax.toFixed(1) : null });
       row.paceWaitMs = +((dt * 1000) - row.busyMs - (row.gqMs || 0) - row.redoMs).toFixed(1);
       out.rows.push(row); console.log(JSON.stringify(row));
@@ -146,7 +148,8 @@ out.summary = {
   room: R.length && R[0].room != null ? +(R.reduce((a, r) => a + (r.room || 0) * r.dt, 0) / secs).toFixed(4) : null,
   perSecondMs: secs ? { busy: +(sum('busyMs') / secs).toFixed(1), lost: +(sum('lostMs') / secs).toFixed(1), gq: +(sum('gqMs') / secs).toFixed(1),
                         redo: +(sum('redoMs') / secs).toFixed(1), paceWait: +(sum('paceWaitMs') / secs).toFixed(1),
-                        lsLost: +(sum('lsLostMs') / secs).toFixed(1), lsStall: +(sum('lsStallMs') / secs).toFixed(1) } : null,
+                        lsLost: +(sum('lsLostMs') / secs).toFixed(1), lsStall: +(sum('lsStallMs') / secs).toFixed(1),
+                        repaid: +(sum('repaidMs') / secs).toFixed(1), lsRepaid: +(sum('lsRepaidMs') / secs).toFixed(1) } : null,
   reanchors: sum('rean'), cbForced: sum('cbForced'),
   bench: out.result ? { solo: out.result.solo && { speed: out.result.solo.speed, ms: out.result.solo.ms, over: out.result.solo.over },
                         room: out.result.room && { speed: out.result.room.speed, mode: out.result.room.mode, ms: out.result.room.ms } } : null,
