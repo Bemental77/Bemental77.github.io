@@ -562,14 +562,23 @@ for (let i = 0; i < PLAYERS; i++) {
   const bit = PRESS[i], port = ports[i];
   await pages[i].p.evaluate((b) => { window.__hold = setInterval(() => window.__gcPad.edge(0, b, 0), 8); }, bit);
   let w = null, hit = false;
+  const seen = [0, 0, 0, 0];
+  await host.evaluate(() => window.__gcPad.witness());   // clear the accumulated row first
   for (let k = 0; k < 80 && !hit; k++) {
     await sleep(100);
     w = await host.evaluate(() => window.__gcPad.witness());
-    hit = !!w && (w.btnDown[port] & bit) === bit;
+    // btnDownSeen (gamecube.html __gcPad.witness): HuPadBtnDown OR-ed over every frame the host's
+    // game ran since the last read, re-simulated ones included. The newest frame alone cannot show
+    // a REMOTE press while the host leads that console: its port is a prediction with the edge
+    // bytes zeroed, and the press lands on the frames the correction re-simulates (3 of 20 runs
+    // failed this check that way, each with 0 desyncs; all 3 were the runs where the host led).
+    const seenNow = (w && w.btnDownSeen) || [0, 0, 0, 0];
+    for (let q = 0; q < 4; q++) seen[q] |= seenNow[q];
+    hit = !!w && (((w.btnDown[port] | seen[port]) & bit) === bit);
   }
   await pages[i].p.evaluate(() => clearInterval(window.__hold));
-  const leaked = w ? ports.filter((q) => q !== port && (w.btnDown[q] & bit) === bit) : [];
-  witness.push({ who: pages[i].who, port, bit, hit, leaked, btnDown: w && w.btnDown.map(hex) });
+  const leaked = w ? ports.filter((q) => q !== port && (((w.btnDown[q] | seen[q]) & bit) === bit)) : [];
+  witness.push({ who: pages[i].who, port, bit, hit, leaked, btnDown: w && w.btnDown.map(hex), seen: seen.map(hex) });
   await sleep(300);
 }
 report.witness = witness;

@@ -740,15 +740,30 @@ function applyPads() {
   Atomics.notify(paceI32, PAD_ACK);
 }
 
+// WIT_SEEN: the game's HuPadBtnDown, OR-ed over EVERY frame it ran since the page last read it —
+// presented AND re-simulated (gamecube.html __gcPad.witness() reads and clears it). The mirrored
+// row above is the NEWEST frame only, and in a rollback room the newest frame of a console that
+// leads its peer carries that peer's input as a PREDICTION with the edge bytes zeroed
+// (rbEdgeBytes): the press reaches the game on the frames the correction re-simulates, never on
+// the newest one. MEASURED (tools/gc_netplay_room_test.mjs, 20 runs): the port-1 button check
+// failed in exactly the 3 runs where the host led p2 (lead 0.55-1.45 frames) and passed in all 17
+// where it trailed — with 0 desyncs in every run, i.e. the host's game had applied every p2 press.
+const WIT_SEEN = 212;               // 4 cells, one per port
+function witSeen(buf, at) {
+  if (!at || at + 16 > buf.byteLength) return;
+  const dv = new DataView(buf, at, 16);
+  for (let p = 0; p < 4; p++) { const v = dv.getInt32(p * 4, true); if (v) Atomics.or(paceI32, WIT_SEEN + p, v); }
+}
+
 // Mirror the game's own pad state (and any watched MEM1 windows) into the pace SAB. Called once
 // per frame, after the guest has run. Cheap: 176 B + up to 4×64 B of copying.
 function publishPeek(quiet) {
   if (!Module || !paceI32 || paceI32.length < PACE_I32_CELLS) return;
   const buf = Module.wasmMemory.buffer;
-  if (quiet) { if (Module.___recomp_pad_witness) rb.witAt = Module.___recomp_pad_witness() >>> 0; return; }
+  if (quiet) { if (Module.___recomp_pad_witness) { rb.witAt = Module.___recomp_pad_witness() >>> 0; witSeen(buf, rb.witAt); } return; }
   if (Module.___recomp_pad_witness) {
     const at = Module.___recomp_pad_witness() >>> 0;      // fills the block, returns its address
-    rb.witAt = at;
+    rb.witAt = at; witSeen(buf, at);
     if (at && at + WIT_CELLS * 4 <= buf.byteLength)
       new Uint8Array(paceI32.buffer).set(new Uint8Array(buf, at, WIT_CELLS * 4), WIT_BASE * 4);
   }
