@@ -1023,6 +1023,8 @@
       aicaX: safe(() => aicaRateX(), 0),
       clkX: safe(() => clkRateX(), 0),
       clkJump: safe(() => lastClkJump, false), clkJumps: safe(() => clkJumps, 0),
+      // render-level frame skip, last 1 s window: {on, frames, drawn, skipped, forced, taints, reads, why}
+      fskip: safe(() => lastFs, null),
       // hb counts heartbeats so a poller can take each window exactly once;
       // restoring/hbSinceRestore say whether a savestate restore (the fresh-boot
       // seed included) is pending or was just applied — a measurement window
@@ -2674,6 +2676,13 @@
           // default in the shim; these are the A/B arms.
           if (qs.has('norecover'))    worker.postMessage({ cmd: 'recover', on: 0 });
           else if (qs.has('recoverchain')) worker.postMessage({ cmd: 'recover', on: 1, keepChain: 1 });
+          // Render-level frame skip (flycast_worker.js FSK): ON by default in the
+          // shim. ?fskip=0 off, ?fskip=N pictures on the GPU, ?fskip=force:K the
+          // exactness arm. window.__DC_FSKIP is the same seam for a rig that
+          // cannot put a query on a page it does not open (the bench room's
+          // iframe player).
+          const fq = qs.get('fskip') != null ? qs.get('fskip') : (typeof window.__DC_FSKIP === 'string' ? window.__DC_FSKIP : null);
+          if (fq != null) worker.postMessage({ cmd: 'fskip', mode: fq });
         }
         if (new URLSearchParams(location.search).has('nofastmem')) {
           worker.postMessage({ cmd: 'memfast', on: 0 });
@@ -2917,6 +2926,7 @@
           lastHeldMs = d.heldMs | 0;   // older shims: 0 (undefined | 0)
           lastGoverned = d.governed === undefined ? 1 : (d.governed | 0);
         }
+        if (d.fs) lastFs = d.fs;
         // Governor accounting (2026-10-03): guest ms the governor DROPPED
         // rather than repaid, and the pace sleep asked vs delivered. Summed
         // until the next heartbeat line prints them.
@@ -5436,6 +5446,10 @@
   // not run one more frame (dreamcast/docs/governor-pacing/TASKS.md). It is
   // occupied time: the worker can do nothing else in it.
   let lastHeldMs = 0;
+  // Render-level frame skip, last 1 s window (flycast_worker.js FSK): frames
+  // run, pictures drawn, frames whose picture was skipped because the GPU still
+  // held the previous one. The guest ran every one of them.
+  let lastFs = null;
   let govDropMs = 0, govDrops = 0, govAskMs = 0, govSleptMs = 0, govMaxLag = 0;
   const fpsEl = $('fpsBar');
   function aicaRateX()  { return (lastAwr + lastAdrop) / HW_AICA_HZ; }   // the witness
@@ -5489,6 +5503,7 @@
     autoload:    'auto-restore /state.bin',
     noseed:      'boot seed disabled',
     arm7selftest:'ARM7 self-test',
+    fskip:       'render frame skip changed from its default',
   };
   const activeArms = (() => {
     const q = new URLSearchParams(location.search);
@@ -5797,7 +5812,10 @@
               ' arms=' + (activeArms.join(',') || 'none') +
               // gov: guest ms dropped (should be 0 with headroom), deepest lag,
               // pace sleep asked/delivered — the time the governor gave back.
-              ' gov=drop' + govDropMs + 'ms/' + govDrops + ' lag' + govMaxLag + 'ms sleep' + govAskMs + '/' + govSleptMs + 'ms');
+              ' gov=drop' + govDropMs + 'ms/' + govDrops + ' lag' + govMaxLag + 'ms sleep' + govAskMs + '/' + govSleptMs + 'ms' +
+              // fskip: pictures drawn / frames skipped in the last 1 s (the guest ran them all)
+              ' fskip=' + (lastFs ? (lastFs.on ? 'on' : 'off') + ' drawn' + lastFs.drawn + '/skipped' + lastFs.skipped +
+                                    (lastFs.taints ? ' TAINT' + lastFs.taints : '') : 'n/a'));
       govDropMs = 0; govDrops = 0; govAskMs = 0; govSleptMs = 0; govMaxLag = 0;
     }
     checkStall();

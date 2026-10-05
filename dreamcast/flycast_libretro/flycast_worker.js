@@ -98,6 +98,163 @@
   } catch (_) { /* diagnostics only — never take the boot down */ }
 
   // ---------------------------------------------------------------------------
+  // RENDER-LEVEL FRAME SKIP (2026-10-05) — the screen shows the newest frame
+  // the GPU has room for; the GUEST never waits on the GPU.
+  //
+  // dreamcast/docs/governor-pacing/TASKS.md measured the cost this removes: after
+  // every task that renders, this thread is HELD ~27 ms while the GPU process
+  // takes the frame (624-772 ms of every second in PSO's Pioneer 2 on a
+  // SwiftShader box), and that hold, not emulation, is what kept the guest
+  // under 1.000x. In a room two consoles share ONE GPU process, so each one's
+  // frames also hold the other. Real emulators skip RENDERING the frames the
+  // GPU has no time for; so does N64 here (n64 core_worker.js fsWrap, cee706f /
+  // a222501). Same rule:
+  //   * after a frame that drew into the window a fence is set; a frame that
+  //     STARTS while FSK.depth (1) such pictures are still unfinished on the
+  //     GPU runs with its draw/clear/blit calls swallowed. Every other GL call
+  //     still runs (texture + buffer uploads, programs, state), so the core's
+  //     GL objects are exactly what they would have been, and the window keeps
+  //     the last picture;
+  //   * which draws: into the window (framebuffer null) and into any FBO that
+  //     was NOT (re)attached during this frame. Flycast's libretro GL renderer
+  //     draws the scene into its post-processor FBO and then one quad into the
+  //     window (gles.cpp renderFrame: postProcessor.getFramebuffer /
+  //     postProcessor.render) — both persistent targets, both skipped. A
+  //     render-to-texture pass builds a NEW framebuffer every time (gltex.cpp
+  //     BindRTT: gl.rtt.framebuffer.reset(); make_unique<GlFramebuffer>) and
+  //     draws into it in the same frame, so an RTT is never skipped and every
+  //     texture a later picture samples is the one a run without skipping makes.
+  //
+  // THE GUEST CANNOT TELL. A draw reaches guest state only through a read-back
+  // (gltex.cpp ReadRTTBuffer with RenderToTextureBuffer on, writeFramebufferToVRAM
+  // with EmulateFramebuffer on — both read targets this rule never skips, and
+  // both options are at their default here, since the bridge answers no core
+  // variable). Still, every read-back is WATCHED: a readPixels / copyTex* /
+  // blit that reads a target holding a skipped frame counts a taint, and any
+  // core read of a persistent target turns skipping OFF for the session (the
+  // title reads its frames back; a Dreamcast load cannot repair a frame — it
+  // flushes the JIT and is not exact, dreamcast/docs/rollback/TASKS.md — so
+  // there is no re-run as on N64; the arm reports it instead).
+  // ?fskip=0 (page) turns it off; ?fskip=N allows N pictures on the GPU;
+  // ?fskip=force:K skips all but 1 of every K frames whatever the GPU does
+  // (the exactness arm: a room with one peer forced and the other off must
+  // compare its fingerprints clean).
+  // ---------------------------------------------------------------------------
+  const FSK = self.__dcFsk = {
+    on: true, depth: 0, force: 0, why: '', skipping: false, serial: 0,
+    drewNow: false, winStale: false, gl: null, fences: [], skipSince: 0,
+    frames: 0, drawn: 0, skipped: 0, swallowed: 0, forcedDraw: 0, taints: 0, reads: 0, disabled: null,
+  };
+  try {
+    const W2 = self.WebGL2RenderingContext;
+    const P = W2 && W2.prototype;
+    if (P && !P.__dcFsWrap) {
+      const FB = P.FRAMEBUFFER, DFB = P.DRAW_FRAMEBUFFER, RFB = P.READ_FRAMEBUFFER;
+      const bf = P.bindFramebuffer;
+      P.bindFramebuffer = function (t, fb) {
+        if (t === FB || t === DFB) this.__fsDraw = fb || null;
+        if (t === FB || t === RFB) this.__fsRead = fb || null;
+        return bf.apply(this, arguments);
+      };
+      // An attachment made during this frame makes that framebuffer this
+      // frame's own (an RTT target): never skipped.
+      ['framebufferTexture2D', 'framebufferRenderbuffer', 'framebufferTextureLayer'].forEach(function (n) {
+        const f = P[n]; if (typeof f !== 'function') return;
+        P[n] = function (t) {
+          const fb = (t === RFB) ? this.__fsRead : this.__fsDraw;
+          if (fb) fb.__fsFresh = FSK.serial;
+          return f.apply(this, arguments);
+        };
+      });
+      const stale = function (fb) { return fb ? !!fb.__fsStale : FSK.winStale; };
+      // A read of a persistent target is a title that reads its frames back:
+      // skipping ends there. A read of a target holding a skipped frame is a taint.
+      const noteRead = function (ctx, src, what) {
+        if (src && src.__fsFresh === FSK.serial) return;   // this frame's RTT: always drawn
+        FSK.reads++;
+        if (stale(src) || FSK.skipping) FSK.taints++;
+        if (!FSK.disabled) {
+          FSK.disabled = what + ' of ' + (src ? 'a framebuffer object' : 'the window') +
+                         (FSK.taints ? ' while it held a SKIPPED frame (taint)' : '');
+          FSK.skipping = false;
+          try { postMessage({ cmd: 'print', txt: '[fskip] OFF for this session: the core issued a ' + FSK.disabled +
+                                ' — this title reads its frames back, so no frame is skipped from here on' }); } catch (_) {}
+        }
+      };
+      const drawWrap = function (n, isBlit) {
+        const f = P[n]; if (typeof f !== 'function') return;
+        P[n] = function () {
+          if (isBlit) noteRead(this, this.__fsRead, 'blitFramebuffer');
+          const fb = this.__fsDraw;
+          if (FSK.skipping && !(fb && fb.__fsFresh === FSK.serial)) {
+            FSK.swallowed++;
+            if (fb) fb.__fsStale = true; else FSK.winStale = true;
+            return;
+          }
+          if (fb) fb.__fsStale = false;
+          else { FSK.winStale = false; FSK.drewNow = true; FSK.gl = this; }
+          return f.apply(this, arguments);
+        };
+      };
+      ['drawArrays', 'drawElements', 'drawRangeElements', 'drawArraysInstanced', 'drawElementsInstanced',
+       'clear', 'clearBufferfv', 'clearBufferiv', 'clearBufferuiv', 'clearBufferfi'].forEach(function (n) { drawWrap(n, false); });
+      drawWrap('blitFramebuffer', true);
+      ['readPixels', 'copyTexImage2D', 'copyTexSubImage2D', 'copyTexSubImage3D'].forEach(function (n) {
+        const f = P[n]; if (typeof f !== 'function') return;
+        P[n] = function () { noteRead(this, this.__fsRead, n); return f.apply(this, arguments); };
+      });
+      P.__dcFsWrap = true;
+    } else if (!P) { FSK.on = false; FSK.why = 'no WebGL2'; }
+  } catch (e) { FSK.on = false; FSK.why = 'wrap failed: ' + e; }
+  // Start of a new retro_run (a clean asyncify boundary): retire finished
+  // pictures, then decide whether this frame draws.
+  // HOW MANY PICTURES MAY BE ON THE GPU before a frame skips its draws, when the
+  // page did not say (?fskip=N). Measured, PSO Pioneer 2 lobby, SwiftShader,
+  // bench 20 s windows (dreamcast/docs/room-frameskip/TASKS.md): solo depth 1
+  // drew 9-11 pictures/s, depth 2 13-16, depth 3 15-18, all at 1.000x / 0 over;
+  // in a two-console room depth 1 held 0.998-1.000x while depth 2 read
+  // 0.996/0.996 and depth 3 0.993 (each console drew 6-9/s at any depth — the
+  // GPU is the limit there). So: 2 alone, 1 in a room.
+  function fsDepth(inRoom) { return FSK.depth > 0 ? FSK.depth : (inRoom ? 1 : 2); }
+  function fsBegin(now, inRoom) {
+    FSK.serial++;
+    const gl = FSK.gl;
+    if (gl) {
+      try {
+        while (FSK.fences.length && gl.getSyncParameter(FSK.fences[0], gl.SYNC_STATUS) === gl.SIGNALED) gl.deleteSync(FSK.fences.shift());
+      } catch (_) { FSK.fences.length = 0; }
+    }
+    let skip = false;
+    if (FSK.on && !FSK.disabled) {
+      if (FSK.force) skip = (FSK.serial % FSK.force) !== 0;
+      else skip = FSK.fences.length >= fsDepth(inRoom);
+      // Backstop: never leave the window unrefreshed for more than 250 ms on a
+      // fence that does not signal (the picture would look frozen).
+      if (skip && !FSK.force) {
+        if (!FSK.skipSince) FSK.skipSince = now;
+        else if (now - FSK.skipSince > 250) { skip = false; FSK.forcedDraw++; }
+      }
+    }
+    if (!skip) FSK.skipSince = 0;
+    FSK.skipping = skip;
+    FSK.frames++;
+    if (skip) FSK.skipped++;
+  }
+  // End of a retro_run that completed: fence the picture it drew.
+  function fsEnd() {
+    if (!FSK.drewNow) return;
+    FSK.drewNow = false;
+    FSK.drawn++;
+    const gl = FSK.gl;
+    if (!gl || !FSK.on) return;
+    try {
+      const s = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+      if (s) { FSK.fences.push(s); gl.flush(); }
+      while (FSK.fences.length > 8) gl.deleteSync(FSK.fences.shift());
+    } catch (_) {}
+  }
+
+  // ---------------------------------------------------------------------------
   // Reuse SAB primitives from the gamecube tree — they're not gamecube-specific.
   // (importScripts is fine in classic-mode workers; module-mode would need
   // top-level await which the emcc factory output doesn't support today.)
@@ -1016,6 +1173,7 @@
       pumpKick(4);
       return;
     }
+    fsEnd();   // a frame that finished inside an asyncify resume: fence its picture now
     // Clean asyncify boundary (run_iter is NOT suspended): the only safe point to
     // serialize. Saving from the message handler while a frame is asyncify-suspended
     // corrupts the frame, so the next run_iter unwinds and the pump freezes — which
@@ -1106,8 +1264,10 @@
       }
     }
     const t0 = performance.now();
+    fsBegin(t0, lockstep);
     try {
       Module._emscripten_run_iter();
+      if (!runIterSuspended()) fsEnd();
       freerunIters++;
       if (lockstep) {
         const f = lsFrame++;
@@ -1230,6 +1390,7 @@
     }
   }
 
+  const fsLast = { frames: 0, drawn: 0, skipped: 0 };
   function setFreerun(on) {
     if (on && !freerun) {
       freerun = true;
@@ -1248,7 +1409,14 @@
                       heldMs: Math.round(paceHeldMs),
                       dropMs: Math.round(paceDropMs), drops: paceDrops,
                       maxLagMs: Math.round(paceMaxLagMs),
-                      governed: uncap ? 0 : 1 });
+                      governed: uncap ? 0 : 1,
+                      // render-level frame skip, this window: frames run, frames
+                      // whose picture was drawn, frames skipped (FSK above)
+                      fs: { on: FSK.on && !FSK.disabled ? 1 : 0, frames: FSK.frames - fsLast.frames,
+                            drawn: FSK.drawn - fsLast.drawn, skipped: FSK.skipped - fsLast.skipped,
+                            forced: FSK.forcedDraw, taints: FSK.taints, reads: FSK.reads,
+                            why: FSK.disabled || FSK.why || '' } });
+        fsLast.frames = FSK.frames; fsLast.drawn = FSK.drawn; fsLast.skipped = FSK.skipped;
         paceWindowStart = nowW; paceBusyMs = 0; pacePacedMs = 0;
         paceSleptMs = 0; paceHeldMs = 0; paceDropMs = 0; paceDrops = 0; paceMaxLagMs = 0;
         freerunIters = 0;
@@ -1952,7 +2120,13 @@
           Module._free(ptr);
           // A preceding Save typically stopped the pump (asyncify unwind). Resume
           // it from the restored state so Load actually continues the game.
-          if (ok && !freerun) { freerun = true; pumpKick(0); }
+          // ⚠ THROUGH setFreerun, NOT `freerun = true`. A room's seed is loaded
+          // BEFORE the page sends 'freerun' (seedBeforeFrameZero), and setting
+          // the flag directly here made that later setFreerun(true) a no-op —
+          // so the 1 s stats tick never started in ANY seeded room: no 'ips'
+          // (the room heartbeat read iters=0/s duty=0%, blind to the render
+          // hold), and no vmuPoll/lazyPoll either.
+          if (ok && !freerun) setFreerun(true);
           // The retained crash snapshot belongs to the timeline just replaced;
           // take a fresh one at the next clean boundary.
           if (ok) recoverAt = 0;
@@ -1980,6 +2154,17 @@
         postMessage({ cmd: 'print', txt: '[recover] ' + (recoverOn ? 'ON' : 'OFF') +
           (recoverOn ? ' (snapshot every ' + (RECOVER_EVERY_MS / 1000) + ' s; on a guest crash rewind' +
             (recoverKeepChain ? ', chaining LEFT ON' : ' and run ' + (RECOVER_NOCHAIN_MS / 1000) + ' s with chaining off') + ')' : '') });
+        break;
+      }
+
+      // Render-level frame skip arms (FSK above). {mode:'0'} off, {mode:'N'}
+      // N pictures on the GPU, {mode:'force:K'} the exactness arm.
+      case 'fskip': {
+        const m = String(data.mode == null ? '' : data.mode);
+        if (m === '0') { FSK.on = false; FSK.why = 'off (?fskip=0)'; FSK.skipping = false; }
+        else if (/^force:\d+$/.test(m)) { FSK.on = true; FSK.force = Math.max(2, +m.slice(6)); FSK.why = 'rig: all but 1 of ' + FSK.force + ' frames skipped'; }
+        else if (+m > 0) { FSK.on = true; FSK.depth = Math.min(4, +m | 0); }
+        postMessage({ cmd: 'print', txt: '[fskip] ' + (FSK.on ? (FSK.force ? FSK.why : 'ON, depth ' + (FSK.depth || '2 solo / 1 in a room')) : FSK.why) });
         break;
       }
 
