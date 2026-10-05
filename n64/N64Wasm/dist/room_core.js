@@ -136,12 +136,19 @@
     // header and is never defaulted — with an unreadable header this returns true
     // and the room runs at whatever rate the feed achieves, which is stated in the
     // report rather than hidden behind a guessed 60.
-    // ?lsrepay=MS — A MEASUREMENT ARM, OFF BY DEFAULT. How much debt a console may
-    // run back to its 1.000x schedule (never ahead of it) after a stall or a late
-    // frame. The shipped value is two field periods (below); gate #9 governs any
-    // change to the default. Exists so the cost of NOT repaying can be measured
-    // on the real page (n64/tools/party_ghost_probe.mjs --query lsrepay=400).
-    var LS_REPAY_MS = Math.max(0, +(new URLSearchParams(env.search).get('lsrepay') || 0) || 0);
+    // ?lsrepay=MS — HOW MUCH DEBT A CONSOLE RUNS BACK to its 1.000x schedule (never
+    // ahead of it) after a stall or a late frame. SHIPPED AT 250 ms since 2026-10-05
+    // (it was 0: only two periods were kept). A frame never runs before its slot
+    // (baseWall + n x period), so the guest is never ahead of the wall clock; what the
+    // old rule did was drop every stall's excess for good (the live bench's loopback
+    // room was reported at 0.9888x with 0 frames over budget: each loss is invisible
+    // as a slow frame). A hidden catch-up frame of a console that owes it advances the
+    // schedule like a credited one (rbRunFrame), so a debt is never paid twice. Past the two-period allowance the owed frames are spaced at least
+    // LS_REPAY_GAP x period apart (a catch-up at most 2x, a few frames long), so a
+    // repayment is never a burst. ?lsrepay=0 is the CONTROL ARM (the old rule).
+    var LS_REPAY_Q = new URLSearchParams(env.search).get('lsrepay');
+    var LS_REPAY_MS = (LS_REPAY_Q != null && LS_REPAY_Q !== '' && +LS_REPAY_Q >= 0) ? +LS_REPAY_Q : 250;
+    var LS_REPAY_GAP = 0.5;
     // ?lsdrive=raf|timer|all — WHICH DRIVERS may run a lockstep frame. A
     // measurement arm; 'all' (rAF + 4 ms timer + input-arrival kick) is the
     // shipped default.
@@ -181,7 +188,14 @@
         // (ls.selfLostMs), so a late-running device is named as such.
         LS.lostMs = (LS.lostMs || 0) + (now - due - keep);
         LS.baseWall = now - keep; LS.baseFrame = LS.frame; LS.reanchors++;
+        due = now - keep;
       }
+      // REPAYING (beyond the two-period allowance): one owed frame per LS_REPAY_GAP x period
+      if (now - due > period * 2 && keep > period * 2) {
+        if (LS.lastDue && now - LS.lastDue < period * LS_REPAY_GAP) { LS.repayHeld = (LS.repayHeld | 0) + 1; return false; }
+        LS.repaidMs = (LS.repaidMs || 0) + period;
+      }
+      LS.lastDue = now;
       return true;
     }
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1418,7 +1432,18 @@
         try { okh = rbStep(ls, r.frame, r.image, false, false, 'hidden'); } finally { RFS.inResim = false; }
         audioDropNow();
         if (!okh) return rbFail(ls, 'frame failed: ' + N64S.fault);
-        RB.hidden++; LS.frame++; LS.baseFrame++;
+        // ...UNLESS THIS CONSOLE OWES THE FRAME ITSELF (?lsrepay, the default): when its own
+        // wall-clock schedule already has this frame's slot in the past, the hidden frame IS
+        // the repayment — it advances the schedule like a credited frame, so the debt is not
+        // paid twice (a host whose worker stalled 120 ms every 1.5 s ran the room at 1.039x:
+        // its own repayment AND the room's catch-up). A hidden frame beyond its own schedule
+        // (it started later than the room) stays free, as before.
+        var hOwed = false;
+        if (LS_REPAY_MS && LS.baseWall && LS.viHz > 0) {
+          var hPer = 1000 / LS.viHz / ((LS.pace > 0 && LS.pace <= 1) ? LS.pace : 1);
+          hOwed = performance.now() >= LS.baseWall + (LS.frame - LS.baseFrame) * hPer;
+        }
+        RB.hidden++; LS.frame++; if (!hOwed) LS.baseFrame++; else LS.hiddenOwed = (LS.hiddenOwed | 0) + 1;
         if (G.__n64RbLog) G.__n64RbLog.push(['hidden', r.frame]);
       } else {
         if (!rbStep(ls, r.frame, r.image, true, false)) return rbFail(ls, 'frame failed: ' + N64S.fault);
@@ -1696,9 +1721,10 @@
             LS.advWaits = (LS.advWaits | 0) + 1;
             break;
           }
-          // A stall must not be repaid. Re-anchoring the governor here is what
-          // stops the core sprinting to "catch up" when the input finally lands —
-          // time lost to a stall stays lost, which is correct: everybody lost it.
+          // A stall is repaid like any late frame (up to LS_REPAY_MS, spaced, never
+          // ahead of this console's own wall-clock schedule): the console it waited on
+          // repays its own lateness too, so the room returns to 1.000x instead of
+          // keeping every stall. ?lsrepay=0 (the control arm) re-anchors here as before.
           if (!LS_REPAY_MS) LS.baseWall = 0;
           break;
         }
@@ -2072,7 +2098,7 @@
         waitingOn: LS.waitingOn.slice(),
         stalls: LS.stalls,
         stallMs: Math.round(LS.stallMs),
-        reanchors: LS.reanchors,
+        reanchors: LS.reanchors, repaidMs: Math.round(LS.repaidMs || 0), repayHeld: LS.repayHeld | 0, hiddenOwed: LS.hiddenOwed | 0,
         fault: LS.fault,
         engine: rep,
         viTotal: (function () {

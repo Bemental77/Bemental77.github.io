@@ -24,9 +24,10 @@
 // path every rollback/lockstep rig already proves exact, and it means the
 // worker, not SDL's DOM event plumbing, decides what input a frame sees. The
 // schedule is the room's 1.000x governor (lsDueNow in n64/index.html): a frame
-// runs when its wall-clock slot has arrived, debt older than two field periods
-// is discarded rather than sprinted back (CLAUDE.md gate #9 — never faster than
-// the hardware), and the field rate comes from the ROM header, never a default.
+// runs when its wall-clock slot has arrived and never before it (CLAUDE.md gate
+// #9 — never faster than the hardware); a field that ran late stays owed (up to
+// 250 ms, repaid at most 2x) so the guest returns to its exact schedule, and the
+// field rate comes from the ROM header, never a default.
 //
 // Message protocol (page -> worker):
 //   {t:'boot', canvas, rom, files, romName, viHz, search, jit, rig}
@@ -198,7 +199,7 @@ function audioPump() {
 }
 
 // ---- THE FRAME CLOCK (see the header) --------------------------------------------------
-var CLK = { viHz: 0, base: 0, baseFrame: 0, frame: 0, lostMs: 0, reanchors: 0, presents: 0, ticks: 0, busyMs: 0 };
+var CLK = { viHz: 0, base: 0, baseFrame: 0, frame: 0, lostMs: 0, reanchors: 0, presents: 0, ticks: 0, busyMs: 0, lastRun: 0 };
 function applyPads() {
   // rig seam (?workerrig=clock only: a rig's eval installs it): the pads as a function of the
   // field, so a measured run on the SHIPPED clock follows one guest trajectory
@@ -211,21 +212,42 @@ function runOneFrame() {
   CLK.frame++;
   audioPump();
 }
+// LOST TIME IS REPAID — AND THE GUEST STILL NEVER RUNS AHEAD OF THE WALL CLOCK (2026-10-05).
+// Field n's slot is base + n x period, anchored when the clock started. A field never runs
+// before its slot, so over ANY span since the anchor the guest has lived through no more fields
+// than the wall clock allows (gate 9: never faster than the hardware). What changed is what a
+// late field does to the anchor. It used to keep at most two periods of lateness and DISCARD the
+// rest (CLK.lostMs): every stall past 33 ms — a scene load's 17-29 ms field next to a re-run, a
+// frame-skip repair, a GC, a compile — left the guest permanently behind the wall clock, and none
+// of it shows as a slow frame (the live bench was reported at 0.9956x solo with 0 frames over
+// budget). MEASURED (n64_wall_account --mode solo --stall MS:EVERY, the worker blocked MS ms every
+// EVERY ms; SM64, hermetic snapshots, probe lock, load 1.4-1.8): 50:1000 read 0.9866x on the old
+// rule and 0.9997x here; 120:1500 read 0.9467x and 1.0002x (CP0 Count agrees). Now lateness up to REPAY.capMs (250 ms: every stall measured on the bench is under
+// 80 ms) stays OWED: the fields are run as soon as their slot has passed, so the guest returns to
+// its exact 1.000x schedule. Only lateness beyond the cap (a long freeze, a tab that was frozen, a
+// debugger) is discarded and counted, as before — a catch-up is never longer than a moment.
+// GENTLY: past the two-period allowance (which has always run back to back), the owed fields are
+// run no closer than REPAY.gap x period apart (0.5: a catch-up is at most 2x, and short — a
+// 60 ms stall is repaid in ~4 fields), never as a burst of dozens in one go.
+// ?repay=MS sets the cap; ?repay=0 is the CONTROL ARM (the old discard-beyond-two-periods rule).
+var REPAY = { capMs: 250, gap: 0.5, repaidMs: 0, held: 0 };
+function slotOf() { return CLK.base + (CLK.frame - CLK.baseFrame) * (1000 / CLK.viHz); }
+// the earliest time the next field may run (its slot, or later while a debt is being repaid)
+function nextAt(now) {
+  var period = 1000 / CLK.viHz, d = slotOf();
+  if (now - d > period * 2 && CLK.lastRun && REPAY.capMs > period * 2) return Math.max(d, CLK.lastRun + period * REPAY.gap);
+  return d;
+}
 function due(now) {
   if (!(CLK.viHz > 0)) return true;
   var period = 1000 / CLK.viHz;
   if (!CLK.base) { CLK.base = now; CLK.baseFrame = CLK.frame; return true; }
-  var d = CLK.base + (CLK.frame - CLK.baseFrame) * period;
+  var d = slotOf();
   if (now < d) return false;
-  // TIME LOST IS NEVER REPAID (gate #9): debt older than two periods is discarded — the part
-  // older than two periods, not all of it. Up to two periods of lateness the clock has always
-  // run the owed fields back to back (a 33 ms gap, 3 fields at once); the excess beyond that is
-  // what is lost. It discarded ALL of it, so a gap of 34 ms lost 34 ms where 33 ms lost nothing:
-  // every stall a hair past two periods (a frame-skip re-run, a cold first save or load, a shader
-  // compile) cost two periods more than the rule says, and none of it shows as a slow frame. The
-  // largest burst is unchanged (3 fields back to back, as after any 2-period gap), so the guest is
-  // never ahead of its schedule and over any span runs no field sooner than before (gate 9).
-  if (now - d > period * 2) { CLK.lostMs += now - d - period * 2; CLK.base = now - period * 2; CLK.baseFrame = CLK.frame; CLK.reanchors++; }
+  var keep = Math.max(period * 2, REPAY.capMs);
+  if (now - d > keep) { CLK.lostMs += now - d - keep; CLK.base = now - keep; CLK.baseFrame = CLK.frame; CLK.reanchors++; d = slotOf(); }
+  if (now < nextAt(now)) { REPAY.held++; return false; }
+  if (now - d > period * 2) REPAY.repaidMs += period;
   return true;
 }
 // THE DRIVER. ONE FIELD PER TASK, NEVER A BATCH. An OffscreenCanvas from
@@ -254,7 +276,7 @@ var SCHED = { raf: false, imm: false, tmr: false, chan: null, rafTicks: 0, immTi
               paced: 0, notOwed: 0, coupled: false };
 function dueNow(now) {
   if (!(CLK.viHz > 0) || !CLK.base) return true;
-  return now >= CLK.base + (CLK.frame - CLK.baseFrame) * (1000 / CLK.viHz);
+  return now >= nextAt(now);
 }
 function tick(src) { if (DBG) return DBG.task('tick:' + src, tickBody)(src); return tickBody(src); }
 function tickBody(src) {
@@ -272,6 +294,7 @@ function tickBody(src) {
       // yielded: the last field's picture is not pushed yet (THE COMMIT YIELD)
     } else if ((!SCHED.coupled || src === 'raf') && due(now)) {
       var t0 = performance.now();
+      CLK.lastRun = t0;
       runOneFrame();
       gqAfterField();
       // a field that drew nothing (skipped, or a game that draws every second field) left no
@@ -312,7 +335,7 @@ function schedule() {
   if (hasRaf && !SCHED.raf) { SCHED.raf = true; self.requestAnimationFrame(function () { tick('raf'); }); }
   if (!SCHED.tmr && !(SCHED.coupled && hasRaf)) {
     var wait = 8;
-    if (CLK.viHz > 0 && CLK.base) wait = Math.max(0, CLK.base + (CLK.frame - CLK.baseFrame) * (1000 / CLK.viHz) - performance.now());
+    if (CLK.viHz > 0 && CLK.base) { var nw = performance.now(); wait = Math.max(0, nextAt(nw) - nw); }
     SCHED.tmr = true; setTimeout(function () { tick('tmr'); }, wait);
   }
 }
@@ -943,7 +966,7 @@ function postStats() {
          vi: viTotal(), costMs: M._neil_frame_cost_ms(), costN: M._neil_frame_cost_n() >>> 0,
          apos: M._neilGetAudioWritePosition() | 0, audDropped: ((RM.R ? (RM.R.AUDX.dropped | 0) : 0) + FSK.audDrop) % 64000,
          frame: CLK.frame, presents: CLK.presents, ticks: CLK.ticks,
-         lostMs: CLK.lostMs, reanchors: CLK.reanchors, busyMs: CLK.busyMs,
+         lostMs: CLK.lostMs, reanchors: CLK.reanchors, busyMs: CLK.busyMs, repaidMs: REPAY.repaidMs, repayHeld: REPAY.held,
          rafTicks: SCHED.rafTicks, immTicks: SCHED.immTicks, tmrTicks: SCHED.tmrTicks,
          paced: SCHED.paced, notOwed: SCHED.notOwed, coupled: SCHED.coupled, owed: Math.max(-2, Math.min(2, owed)),
          shown: PRES.shown, animFrames: PRES.frames, fpsText: fpsText(),
@@ -1065,6 +1088,7 @@ function roomMirrorBody(full) {
     for (var k in L) if (k !== 'paceHist') c[k] = L[k];
     m.LS = c;
     m.net = RM.R.netReport();
+    m.at = performance.timeOrigin + performance.now();
     m.rb = { proven: RM.R.LS_RB.proven, why: RM.R.LS_RB.why };
   }
   roomPost(m);
@@ -1146,6 +1170,13 @@ function roomFeedBody(src) {
     // field) left no picture to push: the next one need not yield to its commit (RFS only)
     if (!rfs || FSK.tickAny) cbDidDraw(src === 'raf' ? 'raf' : 'task'); else { CB.yielded = false; CB.waiting = false; }
     pbPresent(); gqAfterField();
+    // THE ROOM'S FRAME, AS IT HAPPENS: the full report ('lsm') is posted at most every 100 ms,
+    // and a rate read off its frame against the reader's own clock (the bench's room speed,
+    // Δframe / Δwall) was off by up to ±100 ms at each end of a window — ±0.5% over the bench's
+    // 20 s, the whole pass band. A few bytes per tick, so __n64Net().frame is never older than
+    // the tick that changed it. The fingerprint rides with it: a rig pairs (frame, lastFp), and a
+    // fresh frame beside a 100 ms-old fingerprint is a false "first diff" (lockstep_probe pair).
+    post({ t: 'lsf', f: R.LS.frame, fp: R.LS.lastFp, at: performance.timeOrigin + performance.now() });
   }
   // the GPU's queue is counted in pictures — a fence after a tick that drew (a delay frame run
   // through fsField has set its own). With ?rfskip=0 (the guard arm) it is THE LATENCY WITNESS
@@ -1397,6 +1428,7 @@ function boot(d) {
   // ?workerrig=clock: the rig seam (eval) with the frame clock RUNNING as shipped — a
   // measurement of what a player gets, driven by a pad function (applyPads)
   BOOT.rigClock = new URLSearchParams(d.search || '').get('workerrig') === 'clock';
+  var rq = new URLSearchParams(d.search || '').get('repay'); if (rq != null && rq !== '' && +rq >= 0) REPAY.capMs = +rq;
   fsInstall(d.search);
   (function () {
     var gq = new URLSearchParams(d.search || '').get('gpuq');
