@@ -634,6 +634,22 @@ const PAD_PORTS = 4, PAD_BASE = 16, PAD_STRIDE = 4;
 //             machine's own input a frame early and only on this machine.
 const PAD_ACK = 33, LS_ARMED = 34;
 
+// ── SHIP_HOLD: A RENDERER THAT WILL NOT DRAW IS NOT SENT FRAMES (2026-10-05) ────────────────
+// Non-zero = the page has said the next frames will not be drawn (a room on a software
+// renderer, gamecube.html gcRoomShipHold). Shipping a frame is NOT free: a frame after a DVD read
+// ships the FULL image — a 24 MiB copy of MEM1 plus every binding re-discovered and re-sent.
+// MEASURED (MP4 bench room, headless SwiftShader, both consoles in one tab, per-frame timers in
+// this worker): frame 725 = guest 6-25 ms + ship 66-129 ms (slice 24-41 ms, 1519 regions /
+// 5.2 MiB 29-44 ms, walk 9-26 ms); frame 344 = guest 57-79 + ship 23-45 ms. Both consoles pay it
+// on the same frame, and that is the room's "slow window" (3 of 9 live runs, at frames 344 / 730
+// / 733). While held: the FIFO is walked (register shadow), nothing is copied, a { held } frame
+// is posted, and cacheDirty is set so the first frame shipped after the hold is a full,
+// self-contained image. The guest is untouched — only what the renderer is sent (gate #9).
+// Value 2 holds ONLY a frame that would carry the full image (gamecube.html: the main-thread
+// WebGL2 fallback defers it to the first frame it will draw — THE MAIN-THREAD WebGL2 FALLBACK).
+const SHIP_HOLD = 210;
+let shipHeld = 0;
+
 // ── GUEST-STATE WITNESS WINDOW ──────────────────────────────────────────────────────────────
 // A postMessage cannot reach this worker once _main() runs (see the SAVE STATES block), and the
 // guest's state lives in THIS worker's wasm instance — so the page has no way to read what the
@@ -724,15 +740,30 @@ function applyPads() {
   Atomics.notify(paceI32, PAD_ACK);
 }
 
+// WIT_SEEN: the game's HuPadBtnDown, OR-ed over EVERY frame it ran since the page last read it —
+// presented AND re-simulated (gamecube.html __gcPad.witness() reads and clears it). The mirrored
+// row above is the NEWEST frame only, and in a rollback room the newest frame of a console that
+// leads its peer carries that peer's input as a PREDICTION with the edge bytes zeroed
+// (rbEdgeBytes): the press reaches the game on the frames the correction re-simulates, never on
+// the newest one. MEASURED (tools/gc_netplay_room_test.mjs, 20 runs): the port-1 button check
+// failed in exactly the 3 runs where the host led p2 (lead 0.55-1.45 frames) and passed in all 17
+// where it trailed — with 0 desyncs in every run, i.e. the host's game had applied every p2 press.
+const WIT_SEEN = 212;               // 4 cells, one per port
+function witSeen(buf, at) {
+  if (!at || at + 16 > buf.byteLength) return;
+  const dv = new DataView(buf, at, 16);
+  for (let p = 0; p < 4; p++) { const v = dv.getInt32(p * 4, true); if (v) Atomics.or(paceI32, WIT_SEEN + p, v); }
+}
+
 // Mirror the game's own pad state (and any watched MEM1 windows) into the pace SAB. Called once
 // per frame, after the guest has run. Cheap: 176 B + up to 4×64 B of copying.
 function publishPeek(quiet) {
   if (!Module || !paceI32 || paceI32.length < PACE_I32_CELLS) return;
   const buf = Module.wasmMemory.buffer;
-  if (quiet) { if (Module.___recomp_pad_witness) rb.witAt = Module.___recomp_pad_witness() >>> 0; return; }
+  if (quiet) { if (Module.___recomp_pad_witness) { rb.witAt = Module.___recomp_pad_witness() >>> 0; witSeen(buf, rb.witAt); } return; }
   if (Module.___recomp_pad_witness) {
     const at = Module.___recomp_pad_witness() >>> 0;      // fills the block, returns its address
-    rb.witAt = at;
+    rb.witAt = at; witSeen(buf, at);
     if (at && at + WIT_CELLS * 4 <= buf.byteLength)
       new Uint8Array(paceI32.buffer).set(new Uint8Array(buf, at, WIT_CELLS * 4), WIT_BASE * 4);
   }
@@ -2118,6 +2149,24 @@ async function boot(msg) {
             if (resim) { rbResimDrain(); break shipFrame; }
             const base = Module._gx_fifo_base();
             const fb = new Uint8Array(mem().buffer.slice(base, base + pos));
+            // HELD BY THE PAGE (SHIP_HOLD): see the note at SHIP_HOLD. The FIFO is still walked —
+            // the walk is what keeps the register shadow (CP/XF/BP, array bindings) current, and
+            // the prologue of the next shipped frame is built from it — but nothing is copied or
+            // posted, and the next frame that IS shipped carries the full image (cacheDirty), which
+            // is self-contained by construction (A FULL-IMAGE FRAME STARTS FROM EMPTY CACHES).
+            // 2 = hold only a frame that would carry the full image (the main-thread fallback's deferral).
+            const shipHold = paceI32 ? Atomics.load(paceI32, SHIP_HOLD) : 0;
+            if (shipHold === 1 || (shipHold === 2 && (cacheDirty || !sentPrologue) && !testFullMem)) {
+              try { walkStream(mem(), fb, 0, pos, 0, [], new Map()); } catch (e) { log('walk threw: ' + e.message); }
+              texBound.clear(); pairSeen.clear();
+              if (Module.___recomp_dirty_reset) Module.___recomp_dirty_reset();
+              cacheDirty = true;
+              rb.carry.length = 0; rb.pendRaw.length = 0;   // the full image after the hold supersedes them
+              rbNoteShip(true, []);
+              shipHeld++;
+              postMessage({ cmd: 'frame', n: viRetrace, held: true, hidden: hiddenNow });
+              break shipFrame;
+            }
             // A FULL-IMAGE FRAME STARTS FROM EMPTY CACHES (2026-10-03). The mem1 image below is
             // RAW guest memory, and guest memory holds every f32 vertex/texcoord array
             // LITTLE-endian; only the bridge's own array regions carry them big-endian, which is
