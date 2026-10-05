@@ -26,7 +26,7 @@
        machine boots the disc and the room exchanges nothing but pad bytes
        (tools/no_streaming_test.mjs machine-checks that). netplay-ui.js is the
        shared lobby; it renders nothing at all when Netplay.supported() is false. -->
-  <script src="/lib/netplay.js?v=bb8ad140"></script>
+  <script src="/lib/netplay.js?v=9c60975f"></script>
   <script src="/lib/netplay-ui.js?v=66f15769"></script>
   <script src="/lib/mpgames.js"></script>
   <script>
@@ -9973,11 +9973,17 @@ window.GcRate = (function () {
     // of guestFrames - (now - release) x 60 on each page): +10.9 / +11.2 and +18.1 / +17.3 frames
     // at the end of the run against 10 / 32 and 24 / 23 hidden frames run, mean rate 1.0008x /
     // 1.0014x; the test's first 15 s window read 1.019-1.022x in 3 of 8 runs (one FAIL at 1.0218x),
-    // either arm of ?roomhold. The leapfrog is lib/netplay.js rbCatchUp's to fix; this page only
-    // refuses to be the one that runs past real time: a hidden frame runs only while this console
-    // is at least a frame behind its own clock since the room released it, counting the credits it
-    // already holds (gcLsEarned) as frames it will run — a hidden frame on top of banked credits is
-    // a frame past real time once those credits are spent.
+    // either arm of ?roomhold. A hidden frame runs only while this console is at least a frame
+    // behind its own clock since the room released it, counting the credits it already holds
+    // (gcLsEarned) as frames it will run — a hidden frame on top of banked credits is a frame past
+    // real time once those credits are spent.
+    // ENGINE-SIDE NOW TOO: lib/netplay.js rbCatchUp grants a hidden frame only to a console behind
+    // its OWN wall clock (_ocAllow), for every page. With THIS guard disabled the engine alone held
+    // the 240 s room at -1.42 / -1.09 frames at the end (max +0.79, the release), mean 0.9999x —
+    // against +8.68 / +8.58 (ratcheting, max +9.59 at 210 s), mean 1.0005x, with neither. Kept: it
+    // counts frames the WORKER completed and its exact credits, where the engine counts frames fed
+    // and bounds the credits; with both on it still refused 10 of the engine's 29 grants to p2 in
+    // one 240 s run (cuRefused).
     if (hidden && GCLS.clockT0 &&
         (Atomics.load(paceI32, PAD_ACK) - GCLS.clockF0) + Math.max(0, gcLsEarned) + 1 > (performance.now() - GCLS.clockT0) * GUEST_HZ / 1000) {
       RBP.catchUp = 0; RBP.cuRefused = (RBP.cuRefused | 0) + 1; hidden = false;

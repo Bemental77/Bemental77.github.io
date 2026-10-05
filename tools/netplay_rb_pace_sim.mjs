@@ -377,7 +377,10 @@ export function simulate(sc) {
       rollbacks: rb.rollbacks, maxDepth: rb.maxDepth, resim: p.resim, catchUp: rb.catchUpFrames || 0,
       windowChanges: rb.windowChanges || 0, holeNaks: rb.holeNaks || 0, compared: rep.hashesCompared, maxTickWork: +p.maxTickWork.toFixed(1),
       lag: p.lagBad + '/' + p.lagN, rejoinTicks: p.rejoinTicks, pacedTicks: p.pacedTicks, old: p.old,
-      mode: ls.rollback ? 'rollback' : 'delay', delay: ls.delay, modes: p.modes };
+      mode: ls.rollback ? 'rollback' : 'delay', delay: ls.delay, modes: p.modes,
+      // lib/netplay.js ownClock(): frames past THIS console's own wall clock
+      // (since its first frame attempt) — max over the run and at the end.
+      ownClock: typeof ls.ownClock === 'function' ? ls.ownClock() : null };
   }
   // ---- the straight run: every fingerprinted state vs the TRUE inputs -----
   // True input for (frame, port): the owner's pad sampled on its first try,
@@ -477,6 +480,7 @@ if (process.argv[1] && process.argv[1].endsWith('netplay_rb_pace_sim.mjs')) {
     console.log(`  ${bad.length ? (info ? 'INFO' : 'FAIL') : 'PASS'}  ${name.padEnd(20)} room ${r.minRate.toFixed(4)}x (presented max 5s ${r.maxWin5s.toFixed(4)}x, vs room clock <=${r.aheadMax.toFixed(2)}f)`
       + `  window ${c.map((x) => x.window + '/' + x.windowPeak).join(' ')}  stalls ${c.map((x) => x.stalls).join('/')}`
       + `  catch-up ${c.map((x) => x.catchUp).join('/')}  depth<=${Math.max(...c.map((x) => x.maxDepth))}`
+      + (c[0].ownClock ? `  own-clock lead max/end ${c.map((x) => x.ownClock.leadMax + '/' + x.ownClock.lead).join(' ')}` : '')
       + `  presented ${c.map((x) => x.presented).join('/')}  lag ${r.lagBad}/${r.lagN}  desync ${r.desyncs} cmp ${r.compared} truth ${r.truthChecked - r.truthBad}/${r.truthChecked}`
       + (bad.length ? '\n        ' + bad.join('; ') : ''));
     if (argv.includes('--json')) console.log(JSON.stringify(r));

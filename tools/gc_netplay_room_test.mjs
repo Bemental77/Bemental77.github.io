@@ -382,6 +382,20 @@ seatedAll === PLAYERS ? ok('room-seats-every-player', `${seatedAll}/${PLAYERS} s
 
 // ---- boot: the room presses Start on every console; wait for the barrier --------------------
 const snap = (p) => p.evaluate(() => (window.__gcLockstep ? window.__gcLockstep() : null)).catch((e) => ({ err: String(e).slice(0, 120) }));
+// NEVER PAST ITS OWN WALL CLOCK: a sampler on each page, independent of lib/netplay.js — from the
+// moment THAT page's room releases (running), every 15 ms: guest frames run since then minus wall
+// frames elapsed (x 60). A hidden catch-up frame that is not repaying lost time shows here as a lead.
+await Promise.all(pages.map(({ p }) => p.evaluate(() => {
+  const S = window.__ownLead = { t0: 0, f0: 0, lead: null, max: -Infinity, maxAt: 0 };
+  S.timer = setInterval(() => {
+    const g = window.__gcLockstep && window.__gcLockstep(); if (!g) return;
+    const now = performance.now();
+    if (!S.t0) { if (g.running) { S.t0 = now; S.f0 = g.guestFrames; } return; }
+    const lead = (g.guestFrames - S.f0) - (now - S.t0) * 60 / 1000;
+    S.lead = lead; if (lead > S.max) { S.max = lead; S.maxAt = (now - S.t0) / 1000; }
+  }, 15);
+}).catch(() => {})));
+const ownLead = () => Promise.all(pages.map(({ p }) => p.evaluate(() => { const S = window.__ownLead; return S && S.t0 ? { lead: +S.lead.toFixed(2), max: +S.max.toFixed(2), maxAt: +S.maxAt.toFixed(1), s: +((performance.now() - S.t0) / 1000).toFixed(1) } : null; }).catch(() => null)));
 const t0 = Date.now();
 let ranEarly = null, released = false, last = [];
 let armedAt = new Array(PLAYERS).fill(null);
@@ -490,7 +504,20 @@ while (Date.now() - tRun < RUN_MS) {
   if (desyncs.length) break;
 }
 const mashN = await Promise.all(pages.map(({ p }) => p.evaluate(() => { clearInterval(window.__mash.timer); return window.__mash.n; })));
+const own = await ownLead();
 const fin = await Promise.all(pages.map(({ p }) => snap(p)));
+report.ownLead = own;
+report.ownClock = fin.map((g) => (g && g.rollback && g.rollback.engine && g.rollback.engine.ownClock) || null);
+{
+  const txt = own.map((o, i) => `${pages[i].who} ${o ? `${o.lead} (max ${o.max} at ${o.maxAt}s of ${o.s}s)` : 'n/a'}`).join(' · ');
+  // page.cuRefused: hidden frames the engine granted that gamecube.html gcLsStep's own guard still refused.
+  const eng = report.ownClock.map((o, i) => `${pages[i].who} ${o ? `${o.lead} (max ${o.leadMax}) rate ${o.rate} catch-up ${o.granted}/refused ${o.refused}` : 'n/a'}`
+    + ` page-refused ${fin[i] && fin[i].rollback && fin[i].rollback.page ? fin[i].rollback.page.cuRefused : 'n/a'}`).join(' · ');
+  console.log(`  own wall clock — page sampler (guest frames - wall x 60): ${txt}\n  own wall clock — engine (lib/netplay.js ownClock): ${eng}`);
+  (own.every((o) => o && o.lead < 2 && o.max < 2))
+    ? ok('never-past-its-own-wall-clock', txt)
+    : bad('never-past-its-own-wall-clock', txt);
+}
 const runS = (Date.now() - tRun) / 1000;
 report.final = fin.map((g) => ({ guestFrames: g.guestFrames, hashesSent: g.hashesSent, hashesCompared: g.hashesCompared,
                                  lastAgreedFrame: g.lastAgreedFrame, desync: g.desync, bfStall: g.bfStall, delay: g.delay, fpDiag: g.fpDiag,

@@ -256,6 +256,12 @@ for (const cell of CELLS) {
      `${lagRb.filter((x) => x.d === 0).length}/${lagRb.length} rollback frames ran the local pad on the frame it was sampled` + (lagHand.length ? `; switch hand-over frames (counted apart): ${lagHand.length}, max lag ${Math.max(...lagHand.map((x) => x.d))}` : ''));
   ok(`${cell}: never faster than 1.000x`, con.H.maxPerTick <= 2 && con.G.maxPerTick <= 2 && H.frame <= SECS * HZ + 2 && G.frame <= SECS * HZ + 2,
      `frames ${H.frame}/${G.frame} vs ${(SECS * HZ).toFixed(0)} at 1.000x; max new frames per tick ${con.H.maxPerTick}/${con.G.maxPerTick}; hidden ${con.H.hiddenRan}/${con.G.hiddenRan}`);
+  // lib/netplay.js ownClock(): how far past ITS OWN wall clock (since its first frame attempt)
+  // each console ever began a frame — a hidden catch-up frame is only honest for a console that
+  // is behind real time, never for one merely behind its peer (the 2-console leapfrog).
+  const oc = { H: H.ownClock, G: G.ownClock };
+  ok(`${cell}: never past its own wall clock`, oc.H && oc.G && oc.H.leadMax < 2 && oc.G.leadMax < 2 && oc.H.lead < 2 && oc.G.lead < 2,
+     `own-clock lead max/end host ${oc.H && oc.H.leadMax}/${oc.H && oc.H.lead} guest ${oc.G && oc.G.leadMax}/${oc.G && oc.G.lead}; rate ${oc.H && oc.H.rate}/${oc.G && oc.G.rate}; catch-up granted ${oc.H && oc.H.granted}/${oc.G && oc.G.granted}, refused ${oc.H && oc.H.refused}/${oc.G && oc.G.refused}`);
   ok(`${cell}: no fault, no desync`, !con.H.faults.length && !con.G.faults.length && !desync && H.state !== 'failed' && G.state !== 'failed',
      `faults ${JSON.stringify(results[cell].faults)} desync ${desync}`);
   if (cell === 'switch') {
