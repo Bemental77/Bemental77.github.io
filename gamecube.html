@@ -8366,7 +8366,7 @@ window.GcRate = (function () {
   // does not publish per-seat; both are fed from public events (see gcNetWatch)
   // so no drawing code has to reach into lib/netplay.js for them. `pressed` is
   // the witness for which shell gcNetPressStart() actually fired — see there.
-  var GCPARTY = { ui: null, loadPct: 0, said: null, held: null, rows: null, timer: 0,
+  var GCPARTY = { ui: null, loadPct: 0, said: null, held: null, rows: null, timer: 0, stale: null, staleCheck: false,
                   blips: {}, peerLoad: 0, pressed: null };
   var GC_BLIP_MS = 15000;      // > lib/netplay.js:378 DISCONNECT_GRACE_MS (12000)
   // ⚠ NEVER A NONCE ON SCREEN. A peer is 'host' (port 0) or 'player'; the roster holds
@@ -8490,6 +8490,7 @@ window.GcRate = (function () {
     if (window.__gcTrap) return '⚠ The game stopped at frame ' + window.__gcTrap.at + ' — the Mario Party 4 port reached a part ' +
                                 'of the game it cannot run yet (' + window.__gcTrap.txt.slice(0, 70) + '). Every console in the ' +
                                 'room runs the same frames, so they all stop here; the room did not fail. Reload to play again.';
+    if (GCPARTY.stale) return GCPARTY.stale;                 // refused for an out-of-date page (gcLsRoomFailed)
     if (g && g.running) return 'Playing — everyone started together at frame ' + g.startFrame + '.';
     if (g && g.fault && !g.gated) return '⚠ ' + g.fault;     // a genuine refusal keeps its sentence
     if (GCPARTY.held) return GCPARTY.held;
@@ -8513,7 +8514,7 @@ window.GcRate = (function () {
     var ui = GCPARTY.ui, s = GCROOM.session;
     if (s && ui && ui.session !== s) {
       GCROOM.session = GCROOM.role = null;
-      GCPARTY.said = GCPARTY.held = GCPARTY.rows = null;
+      GCPARTY.said = GCPARTY.held = GCPARTY.rows = GCPARTY.stale = null; GCPARTY.staleCheck = false;
       GCPARTY.blips = {}; GCPARTY.peerLoad = 0; GCPARTY.pressed = null;
       ui.setRows(null);
       return null;
@@ -8624,6 +8625,9 @@ window.GcRate = (function () {
       GCPARTY.blips[e.peer] = Date.now() + GC_BLIP_MS;
     });
     sess.on('peer-left', function (e) { if (e && e.peer) delete GCPARTY.blips[e.peer]; });
+    // A ROOM REFUSED FOR AN OUT-OF-DATE PAGE SAYS SO (gcLsRoomFailed): host and guests alike see the
+    // lockstep fail ('lsx' on a guest, the barrier's own fail() on the host).
+    sess.on('lockstep', function (e) { if (e && e.state === 'failed') setTimeout(function () { gcLsRoomFailed(sess, e.detail); }, 0); });
     sess.on('peer-joined', function (e) { if (e && e.peer) delete GCPARTY.blips[e.peer]; });
     if (!GCPARTY.timer) GCPARTY.timer = setInterval(gcNetPartySync, 1000);
   }
@@ -9697,6 +9701,64 @@ window.GcRate = (function () {
   function gcLsDisc() {
     return (window.__romBase || 'MarioParty4') + '#p' + GC_ROOM_PROTO +
            (GCLS.buildTag ? '#b:' + GCLS.buildTag : '') + (GCCARD.key ? '#card:' + GCCARD.key : '');
+  }
+  // ── A ROOM REFUSED FOR AN OUT-OF-DATE PAGE SAYS SO, ON EVERY CONSOLE (2026-10-06) ──────────
+  // The barrier compares the disc tags above, and a console whose page loaded an older recomp build
+  // (a cached page within Pages' max-age, open across a deploy) differs only in '#b:'. The engine's
+  // words for that were "different game: everyone must load \"MarioParty4#p2#b:…#card:…\"" — on the
+  // HOST only in a panel that had already closed, and on the guest nowhere at all: the party sentence
+  // read "Everyone is loaded — starting." over a room held at frame 0 for good. Now, when a room fails
+  // and the tags differ ONLY in the build, each console asks the server what the build is now
+  // (the same files, the same FNV-1a, cache: 'no-store') and says whose page is stale and what to do.
+  function gcLsTagParts(d) { var m = /#b:([^#]*)/.exec(String(d || '')); return { b: m ? m[1] : '', rest: String(d || '').replace(/#b:[^#]*/, '') }; }
+  function gcLsBuildMismatch(sess, detail) {
+    var mine = gcLsDisc(), me = gcLsTagParts(mine), others = [];
+    var bar = gcNetBar(sess), discs = (bar && bar.discs) || {};
+    for (var p in discs) if (discs[p] !== mine) others.push({ peer: p, tag: discs[p] });
+    if (!others.length && detail) {               // no barrier picture (an older engine): the refusal's own words
+      var re = /"([^"]*#b:[^"]*)"/g, m;
+      while ((m = re.exec(String(detail)))) if (m[1] !== mine) others.push({ peer: null, tag: m[1] });
+    }
+    if (!others.length || !me.b) return null;
+    for (var i = 0; i < others.length; i++) {
+      var o = gcLsTagParts(others[i].tag);
+      if (o.rest !== me.rest || !o.b || o.b === me.b) return null;   // a real difference, not only the build
+    }
+    return { mine: me.b, theirs: others.map(function (x) { return gcLsTagParts(x.tag).b; }) };
+  }
+  function gcLsBuildNow() {                       // = recomp_worker.js THE BUILD IDENTITY, from the server, now
+    var U = GCLS.buildUrls;
+    if (!U) return Promise.reject(new Error('no build urls'));
+    var get = function (u) { return fetch(u.split('?')[0], { cache: 'no-store' }).then(function (r) { if (!r.ok) throw new Error(u + ' ' + r.status); return r.arrayBuffer(); }); };
+    return Promise.all([get(U.wasm), get(U.glue), get(U.worker)].concat(U.rb ? [get(U.rb)] : [])).then(function (bufs) {
+      var h = 0x811c9dc5;
+      for (var k = 0; k < bufs.length; k++) { var u8 = new Uint8Array(bufs[k]); for (var i = 0; i < u8.length; i++) h = Math.imul((h ^ u8[i]) >>> 0, 0x01000193) >>> 0; }
+      return ('0000000' + (h >>> 0).toString(16)).slice(-8);
+    });
+  }
+  function gcLsStaleSay(t) {
+    GCPARTY.stale = t; GCPARTY.said = null;
+    gcLsSay(t); setStatus(t); hudStatus = t;
+    try { if (GCPARTY.ui) { GCPARTY.ui.say(t, true); if (GCPARTY.ui.open) GCPARTY.ui.open(); } } catch (e) {}
+    gcNetPartySync();
+  }
+  function gcLsRoomFailed(sess, detail) {
+    if (GCPARTY.stale || GCPARTY.staleCheck) return;
+    var mm = gcLsBuildMismatch(sess, detail);
+    if (!mm) return;
+    var code = sess && sess.code ? ' with the code ' + sess.code : '';
+    GCPARTY.staleCheck = true;
+    gcLsStaleSay('⚠ The consoles in this room are running different versions of the game page (build ' + mm.mine +
+                 ' here, ' + mm.theirs.join(', ') + ' there) — checking which one is out of date…');
+    gcLsBuildNow().then(function (now) {
+      if (now !== mm.mine) gcLsStaleSay('⚠ This page is out of date — the game was updated after it loaded (build ' + mm.mine +
+        ', current ' + now + '), so the room refused it. Reload the page (Ctrl+Shift+R, or pull down to refresh on a phone), then rejoin' + code + '.');
+      else gcLsStaleSay('⚠ The other player\'s page is out of date (build ' + mm.theirs.join(', ') + '; this console runs the current ' + now +
+        '), so the room refused it. They need to reload their page (Ctrl+Shift+R, or pull down to refresh on a phone) and rejoin' + code + '.');
+    }, function () {
+      gcLsStaleSay('⚠ The consoles in this room are running different versions of the game page (build ' + mm.mine + ' here, ' +
+        mm.theirs.join(', ') + ' there), so the room refused to start. Everyone reload the page (Ctrl+Shift+R, or pull down to refresh on a phone) and rejoin' + code + '.');
+    });
   }
 
   // THIS MACHINE'S OWN PADS, KEYED BY THE PORT THE ROOM GAVE IT.
@@ -11045,6 +11107,8 @@ window.GcRate = (function () {
                      stage: stageSab,
                      // packed regions + a pooled mem1 image (A FULL-IMAGE FRAME MUST NOT STALL THE GUEST)
                      shipPool: q.get('shippool') !== '0',
+                     // raw regions a full-image frame's mem1 image already carries are not re-sent (?shipdedup=0: control)
+                     shipDedup: q.get('shipdedup') !== '0',
                      // THE ROLLBACK RING: in a room the worker instruments the module so every frame
                      // start in the window can be rewound; solo, nothing changes.
                      rb: !!GCLS.session, rbSab: rbSab,
@@ -11071,7 +11135,10 @@ window.GcRate = (function () {
                      // BUMP IT WITH EVERY NEW PAIR. The worker itself is fetched ?v=<now>, but these
                      // two were plain URLs, so a cached old .wasm could meet a new .js glue (a torn
                      // pair: "Import #0 env: module is not an object or function").
-                     glueUrl: '/gamecube/recomp/' + recompBuildDir + 'mp4_game.js?b=921a7bc1',
+                     glueUrl: (GCLS.buildUrls = { glue: '/gamecube/recomp/' + recompBuildDir + 'mp4_game.js?b=921a7bc1',
+                                                  wasm: '/gamecube/recomp/' + recompBuildDir + 'mp4_game.wasm?b=921a7bc1',
+                                                  worker: '/gamecube/recomp/recomp_worker.js',
+                                                  rb: GCLS.session ? '/gamecube/recomp/rb_instrument.js' : null }).glue,
                      wasmUrl: '/gamecube/recomp/' + recompBuildDir + 'mp4_game.wasm?b=921a7bc1' }, bootTransfer);
     bootSent = true;    // from here on, Save/Load/Export belong to THIS worker, not dolphin
     // ⚠ BEFORE THE FIRST CREDIT AND NOT ONE LINE LATER. This is the only moment at which "this
