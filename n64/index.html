@@ -13,8 +13,8 @@
        Publishes window.__cap in the SAME shape on all three emulator pages, which is what
        lets tools/device_matrix.mjs ask every page the same questions. Loaded before <base>
        so its own absolute paths are unambiguous. -->
-  <script src="/lib/capability.js?v=e25dca87"></script>
-  <script src="/lib/bench.js?v=e533021b"></script><!-- ?bench=1 real-device benchmark; inert without it -->
+  <script src="/lib/capability.js?v=6461f930"></script>
+  <script src="/lib/bench.js?v=54d9bf5e"></script><!-- ?bench=1 real-device benchmark; inert without it -->
   <script src="/lib/xboxinput.js"></script>
   <!-- ONLINE PLAY — DETERMINISTIC LOCKSTEP. Inert unless Netplay.supported(),
        and it does nothing at all without ?np=<code> in the URL, which is what
@@ -1622,7 +1622,7 @@ N64Rate.selfTest = function (logFn) {
   return { pass: pass, fail: fail, lines: lines, summary: summary };
 };
 </script>
-<script src="/n64/N64Wasm/dist/glcompat.js?v=7939955f"></script>
+<script src="/n64/N64Wasm/dist/glcompat.js?v=6de08228"></script>
 <script src="/n64/N64Wasm/dist/fbasync.js?v=f3425fa3"></script>
 <script src="/n64/N64Wasm/dist/jit_params.js?v=bb2930f6"></script>
 <script src="/n64/N64Wasm/dist/room_core.js?v=39369d15"></script>
@@ -1891,7 +1891,8 @@ N64Rate.selfTest = function (logFn) {
   function glLine() {
     if (glFacts.skipped) return '[gl] probe skipped (?noglprobe)';
     var core = window.__n64GL ? '\n[gl] core context: ' + (window.__n64GL.decided || 'not created yet')
-      + (window.__n64GL.tries.length ? '  (' + window.__n64GL.tries.join(', ') + ')' : '') : '';
+      + (window.__n64GL.tries.length ? '  (' + window.__n64GL.tries.join(', ') + ')' : '')
+      + (window.__n64GL.nfOk !== undefined ? '\n[gl] WebGL1 native-sampling self-test: ' + (window.__n64GL.nfOk ? 'pass' : 'FAIL') + ' — ' + window.__n64GL.nfWhy : '') : '';
     if (!glFacts.webgl2) return '[gl] WebGL2 = NO' + (glFacts.webgl2Relaxed ? ' (but granted with relaxed attributes)' : '')
       + (glFacts.webgl1 ? '  WebGL1 = yes  gpu=' + glFacts.renderer + '  ' + glFacts.version + '\n[gl] ' + glFacts.ext1 : ' (no WebGL at all)')
       + (glFacts.error ? ' err=' + glFacts.error : '') + core;
@@ -2478,7 +2479,7 @@ N64Rate.selfTest = function (logFn) {
   // logged. If the worker fails while it boots (no WebGL2 there after all, a
   // core abort before "Starting R4300"), the page reloads ONCE with ?worker=0
   // (wkFallback) and says so in its log.
-  var WK_V = 'ef4ccb03';                           // cache-buster for the worker's scripts
+  var WK_V = 'f026a538';                           // cache-buster for the worker's scripts
   var WK_DEFAULT = true;                     // the default for a capable console (solo and rooms)
   var WK = { on: false, why: null, w: null, stat: null, statAt: 0, presents0: 0, pendingAudioPort: null,
              evals: {}, evalId: 0, sent: null, composed: 0, posted: 0, fatal: null, booted: false,
@@ -4038,7 +4039,11 @@ N64Rate.selfTest = function (logFn) {
       if (/same game|different game/.test(raw)) {
         var tags = (raw.match(/"[^"]*"/g) || []).map(function (q) { return q.slice(1, -1); });
         var base = tags.map(function (t) { return t.split(' \u00b7 ')[0]; });
-        if (tags.length > 1 && base.every(function (b) { return b === base[0]; })) {
+        if (tags.length > 1 && base.every(function (b) { return b === base[0]; }) && tags.some(function (t) { return t.indexOf('nf-eager') >= 0; })) {
+          text = 'everyone picked ' + base[0] + ', but one console\'s graphics (WebGL1 without the frame read-back pass this game needs) '
+               + 'would run it differently from the others, so this room cannot stay in sync. That console can play this game solo, '
+               + 'or the room can pick a game that does not read the screen back';
+        } else if (tags.length > 1 && base.every(function (b) { return b === base[0]; })) {
           text = 'everyone picked ' + base[0] + ', but not every console is running the same version of this page — '
                + 'every player should reload the page (on a phone: close the tab and reopen it) and join again';
         }
@@ -4184,6 +4189,16 @@ N64Rate.selfTest = function (logFn) {
   function lsDiscTag() {
     var st = window.__fbAsync || {}, t = String(NET.game || '');
     if (st.on || st.readAlways) t += ' \u00b7 fb-' + (st.on ? 'async' : 'sync');
+    //   * a console whose WebGL1 cannot run glide's native sampling pass (glcompat.js
+    //     nfSelfTest): its read-back copies would be eager and its RDRAM would fork from
+    //     everyone else's. It declares itself, so a mixed room is refused at the barrier
+    //     instead of diverging silently. A WebGL1 console that passes (the measured case)
+    //     declares nothing extra and is the same console as a WebGL2 one.
+    try {
+      var g1 = window.__n64GL;
+      if ((st.on || st.readAlways) && g1 && (g1.v === 1 || g1.want === 1 || g1.probe().v === 1)
+          && g1.nfSelfTest() === false) t += ' \u00b7 nf-eager';
+    } catch (e) {}
     //   * the room protocol: 'r1' = frame 0 follows one neutral pre-roll frame
     //     (lsPreroll) and the console can roll back. A console that differs in
     //     either would start the room one frame apart from the others.

@@ -11,9 +11,31 @@ Living record of what is MEASURED on Edge for Xbox. Each entry names its evidenc
   stick reaches the game.
 - `gamepadInputEmulation` exists only on Xbox/Edge. Desktop test rigs can prove the page
   ASKS for the right mode, but only hardware proves the shell honours it.
-- **Open (reported 2026-10-06):** on `/n64/`, Edge showed a "use pointer game controls"
-  prompt the user did not ask for. Suspect: the page requesting a mode change or pointer
-  lock without a user gesture. Being fixed.
+- **Reported 2026-10-06, fixed:** on `/n64/`, a "use pointer game controls" prompt the user
+  did not ask for. What could raise it, checked one by one (`lib/xboxinput.js`):
+  - `gamepadInputEmulation = 'gamepad'` is written ONLY by the card's "Use game controls"
+    button, by LB+RB, or by resume/visibility while a game the visitor accepted is running —
+    never at load, never without a click (`npm run matrix` asserts `preStartWrites === 0`).
+  - **The site's OWN card** ("Use game controls?" / "Use game controls" / "Keep pointer" — the
+    words in the report) was raised from each page's start path, and a room link AUTOSTARTS,
+    so it appeared with no action by the visitor. It was also shown where
+    `gamepadInputEmulation` does not exist and its button switches nothing.
+    Fix: offered only when the shell can switch (`'gamepadInputEmulation' in navigator`); an
+    offer made without user activation (`navigator.userActivation.hasBeenActive`) is held and
+    asked on the visitor's next click/keypress; a menu click before any game asks nothing.
+  - **Edge's own affordance** (offered when a page USES the Gamepad API): `xboxinput.js` called
+    `navigator.getGamepads()` every animation frame FROM PAGE LOAD, on purpose, and registered
+    `gamepadconnected` at load. That poll is gone. On a console UA, `getGamepads()` answers `[]`
+    without touching the real API, and `gamepadconnected` listeners are queued, until the page
+    has user activation (on Xbox the A button is a click). Measured before (matrix, console arm,
+    rig activation ON): snes/gba called `getGamepads()` 51-60 times at load; gamecube, ps1, gba
+    and dreamcast added `gamepadconnected` listeners at load. After: 0 of each on all six pages
+    before the visitor acts (only a TRUSTED click/key releases them — a page's own synthetic
+    keydown released them on four pages until that was checked).
+  - `requestPointerLock`, the Keyboard Lock API and fullscreen: none is called at load on any
+    page; the matrix counts all of them from the first byte (`window.__grab`).
+  - Which of the two prompts the screenshot showed is not provable without the hardware; both
+    triggers are removed.
 
 ## Graphics: WebGL2 may be missing
 
@@ -25,12 +47,23 @@ Reported 2026-10-06 on `/n64/?np=DHRNN&game=Mario Kart 64`:
 | Gate | blocked Start |
 | With `&nogate=1` | `Load failed: Cannot read properties of undefined (reading 'getParameter')` |
 
-- **Impact:** N64 needs WebGL2 today, so it does not run on this browser.
-- **Fix in progress:** a WebGL1 fallback for N64, the crash fixed so it degrades instead of
-  throwing, the gate relaxed to what N64 can actually run on, and a "WebGL1-only" arm in
-  `npm run matrix`.
-- **Not yet captured:** the Xbox's `edge://gpu` page, which would show which WebGL
-  versions and extensions it really has.
+- **Fixed (4760036, deployed):** the N64 core falls back to WebGL1 (`n64/N64Wasm/dist/glcompat.js`):
+  the .wasm is unchanged (only the glue: MIN_WEBGL_VERSION=1), the core's GLSL 3.00 overlay and
+  native-sampling shaders get GLSL 1.00 equivalents, and the GLES3 state they touch is answered
+  without GL errors. The gate requires `webgl` (1 or 2), not `webgl2`. No WebGL at all now reads
+  "this device gave no WebGL context …" instead of the `getParameter` TypeError.
+- **Same console as WebGL2:** MEASURED, `n64_worker_probe --query-m webgl=1` (WebGL1 main thread vs
+  WebGL2 worker), MK64 / DK64 / Pokémon Snap, 900 frames: 900/900 CPU fingerprints and 30/30
+  FULL-state hashes identical. Before the sampling pass ran on WebGL1, RDRAM differed from frame 60
+  (eager vs lazy framebuffer copies). If a device's WebGL1 cannot run that pass (a self-test at
+  the room barrier), the console declares `· nf-eager` and a mixed room is refused with a reason —
+  never a silent fork.
+- **Speed (WebGL1 arm, SwiftShader):** solo 1.0000/1.0005x, loopback room 1.0004/0.9996x, 0 frames
+  over budget, 0 bursts (bench, 2 interleaved pairs with WebGL2, which read identically).
+- **Still unknown:** whether Xbox Edge grants WebGL2 inside a worker. Chrome's `--disable-webgl2`
+  refuses it on a `<canvas>` but still grants it on an OffscreenCanvas (MEASURED), so the rig
+  cannot answer for the Xbox. The probe now records every rung (webgl2 with/without attributes,
+  relaxed, WebGL1, worker), so the next "Copy debug" from the Xbox will say.
 
 ## Pages that draw with Canvas 2D
 
