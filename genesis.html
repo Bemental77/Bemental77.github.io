@@ -3,6 +3,7 @@
 <head>
   <script src="/lib/debugreport.js?v=94ec9928"></script>
   <script src="/lib/capability.js?v=e25dca87"></script>
+  <script src="/lib/bench.js?v=e533021b"></script><!-- ?bench=1 real-device benchmark; inert without it -->
   <script src="/lib/xboxinput.js"></script>
   <!-- ONLINE CO-OP — LOCKSTEP, AND NOTHING ELSE. Inert unless
        Netplay.supported(). The room is formed ON THIS PAGE (see the ONLINE
@@ -17,8 +18,8 @@
        so the page that used to be player 2's whole machine is gone and this
        page is the only page. The file itself still exists because n64/index.html
        has not been converted yet; nothing here routes to it. -->
-  <script src="/lib/cart_audio.js?v=6f95e7c9"></script>
-  <script src="/lib/netplay.js?v=fca3c5ea"></script>
+  <script src="/lib/cart_audio.js?v=a77bd483"></script>
+  <script src="/lib/netplay.js?v=c0642f6f"></script>
   <meta charset="UTF-8" />
   <title>Genesis Wasm</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -1256,7 +1257,14 @@
     if (audioCtx) { if (audioCtx.state !== 'running') audioCtx.resume().catch(() => {}); return; }
     var AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return;
-    try { audioCtx = new AC({ sampleRate: SND_RATE, latencyHint: 'playback' }); }
+    // ⚠ 'interactive', NOT 'playback'. 'playback' asks the OS for a deep output
+    // buffer: on a phone guest (Android Chrome 154, Mali-G715 — the Genesis room
+    // in docs/devices/xbox-edge.md) it measured outputLatency 216 ms, so the
+    // sound trailed the picture by ~0.2 s. The glitch-proofing it bought is the
+    // AudioWorklet's job now (lib/cart_audio.js: its own cushion, off the main
+    // thread, every gap counted in window.__cartAudio); n64/index.html has run
+    // 'interactive' all along.
+    try { audioCtx = new AC({ sampleRate: SND_RATE, latencyHint: 'interactive' }); }
     catch (e) { try { audioCtx = new AC(); } catch (e2) { return; } }
     // ⚠ THE SINK NO LONGER PULLS FROM THE CORE. This was a main-thread
     // ScriptProcessor reading gpx_audio_read() on the AUDIO clock, so every

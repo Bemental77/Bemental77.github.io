@@ -4,7 +4,7 @@
 <head>
   <script src="/lib/debugreport.js?v=94ec9928"></script>
   <script src="/lib/capability.js?v=e25dca87"></script>
-  <script src="/lib/bench.js?v=b6dbb11b"></script><!-- ?bench=1 real-device benchmark; inert without it -->
+  <script src="/lib/bench.js?v=e533021b"></script><!-- ?bench=1 real-device benchmark; inert without it -->
   <script src="/lib/xboxinput.js"></script>
   <!-- ⚠ NO NETPLAY SCRIPTS ARE LOADED HERE, ON PURPOSE.
        /lib/netplay-host.js is the host half of STREAMING — it captures this
@@ -26,7 +26,7 @@
        is revertible by editing a single line — see lib/asset_base.js. -->
   <script src="/lib/asset_base.js?v=27d8c0a4"></script>
     <script src="/lib/audiodiag.js"></script>
-    <script src="/lib/cart_audio.js?v=6f95e7c9"></script>
+    <script src="/lib/cart_audio.js?v=a77bd483"></script>
     <!-- UI deps are SELF-HOSTED, same rationale as n64/vendor/: this page must not
          depend on five third-party CDNs staying reachable to render at all, and a
          sibling page's coi-serviceworker isolates this origin for every later visit.
@@ -1272,7 +1272,7 @@
          gate now covers this page's runtime assets too. -->
     <script src="/gba/gbaWasm/dist/settings.js"></script>
     <script src="/gba/gbaWasm/dist/romlist.js"></script>
-    <script src="/gba/gbaWasm/dist/script.js?v=caee350c"></script>
+    <script src="/gba/gbaWasm/dist/script.js?v=968fe52d"></script>
   <script>
     // The page's liveness seam. It is NOT a netplay seam any more and does not
     // pretend to be one: `supported:false` with a reason in words is the honest
