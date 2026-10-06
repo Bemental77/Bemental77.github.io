@@ -1382,9 +1382,17 @@ void mainLoopInner()
             drawTextOpenGL(fps_text, 0, 0, fontcolorWhite, FONTSIZE_24);
         }
 
+        /* THE CORE'S OWN TOAST IS NOT DRAWN (2026-10-06). "Saving SRAM..." (libretronew.c
+         * neil_export_save_memory, on every save-memory write) went through drawTextOpenGL on each
+         * of 60 swaps: a fresh texture, SDL_ttf + FreeType rasterizing (hinting bytecode) and
+         * harfbuzz shaping inside the frame. MEASURED (SM64 field 158, its EEPROM write, CPU profile
+         * at 50 us): ~10 ms of a 28 ms field (SM64 field 158: 23.2-23.6 -> 11.4-11.8 ms without it).
+         * The write itself is unchanged and still announced ("writing game.savememory", which the
+         * worker turns into an IndexedDB store). toastCounter still counts down, so the GL state a
+         * frame-skip snapshot carries (lazy_fb.c) is unchanged; only the overlay pixels of the
+         * toast frames differ. */
         if (toastCounter > 0)
         {
-            drawTextOpenGL(toast_message, 0, 30, fontcolorWhite, FONTSIZE_24);
             toastCounter--;
         }
         
