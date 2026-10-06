@@ -17,7 +17,7 @@
        module generalises; it does not replace this page's own probeWebGL2 or its
        [glinfo] pinning, which remain the authority on what the WORKER's context got. -->
   <script src="/lib/capability.js?v=e25dca87"></script>
-  <script src="/lib/bench.js?v=8464cadf"></script><!-- ?bench=1 real-device benchmark; inert without it -->
+  <script src="/lib/bench.js?v=b6dbb11b"></script><!-- ?bench=1 real-device benchmark; inert without it -->
   <script src="/lib/xboxinput.js"></script>
   <!-- Block-gzip disc reader. Shared with the flycast worker shim, which
        importScripts()es this same file, so the eager and lazy paths cannot
@@ -29,7 +29,7 @@
        emulator is never told any of this is happening — it sees a second pad on
        the same machine. Everything below is guarded on Netplay.supported(): a
        browser without RTCPeerConnection never sees the button at all. -->
-  <script src="/lib/netplay.js?v=9c60975f"></script>
+  <script src="/lib/netplay.js?v=fca3c5ea"></script>
   <script>
     // NEVER PRESENT AN ENABLED START BEHIND A BROKEN PATH. Gates BOTH Start
     // controls (#btnStart and the mobile splash's #mobileSplashStart — the phone

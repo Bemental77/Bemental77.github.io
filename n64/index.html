@@ -14,7 +14,7 @@
        lets tools/device_matrix.mjs ask every page the same questions. Loaded before <base>
        so its own absolute paths are unambiguous. -->
   <script src="/lib/capability.js?v=e25dca87"></script>
-  <script src="/lib/bench.js?v=8464cadf"></script><!-- ?bench=1 real-device benchmark; inert without it -->
+  <script src="/lib/bench.js?v=b6dbb11b"></script><!-- ?bench=1 real-device benchmark; inert without it -->
   <script src="/lib/xboxinput.js"></script>
   <!-- ONLINE PLAY — DETERMINISTIC LOCKSTEP. Inert unless Netplay.supported(),
        and it does nothing at all without ?np=<code> in the URL, which is what
@@ -26,7 +26,7 @@
        the wire. The file still exists because sibling pages have not been
        converted yet; loading it here would ship a second, contradictory online
        architecture on a page that has one. -->
-  <script src="/lib/netplay.js?v=9c60975f"></script>
+  <script src="/lib/netplay.js?v=fca3c5ea"></script>
   <script src="/lib/mpgames.js"></script>
   <script>MPGames.gateParty('n64', ['btnNet', 'mobileSplashNet'], ['romSelect', 'mobileRomSelect']);</script>
   <script>
@@ -1624,7 +1624,7 @@ N64Rate.selfTest = function (logFn) {
 </script>
 <script src="/n64/N64Wasm/dist/fbasync.js?v=a23cd08f"></script>
 <script src="/n64/N64Wasm/dist/jit_params.js?v=bb2930f6"></script>
-<script src="/n64/N64Wasm/dist/room_core.js?v=bb883d8c"></script>
+<script src="/n64/N64Wasm/dist/room_core.js?v=cab66b1f"></script>
 <script>
 (function () {
   'use strict';
@@ -2458,7 +2458,7 @@ N64Rate.selfTest = function (logFn) {
   // logged. If the worker fails while it boots (no WebGL2 there after all, a
   // core abort before "Starting R4300"), the page reloads ONCE with ?worker=0
   // (wkFallback) and says so in its log.
-  var WK_V = '666db0ab';                           // cache-buster for the worker's scripts
+  var WK_V = 'ef39401c';                           // cache-buster for the worker's scripts
   var WK_DEFAULT = true;                     // the default for a capable console (solo and rooms)
   var WK = { on: false, why: null, w: null, stat: null, statAt: 0, presents0: 0, pendingAudioPort: null,
              evals: {}, evalId: 0, sent: null, composed: 0, posted: 0, fatal: null, booted: false,

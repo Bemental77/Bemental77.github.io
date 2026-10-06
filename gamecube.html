@@ -18,7 +18,7 @@
        the functional SAB/worker test. Does not replace __gcGpu, which stays the page's
        own render-path authority. -->
   <script src="/lib/capability.js?v=e25dca87"></script>
-  <script src="/lib/bench.js?v=8464cadf"></script><!-- ?bench=1 real-device benchmark; inert without it -->
+  <script src="/lib/bench.js?v=b6dbb11b"></script><!-- ?bench=1 real-device benchmark; inert without it -->
   <script src="/lib/xboxinput.js"></script>
   <!-- Online co-op. BOTH HALVES RUN THE GAME NOW. The old shape — "THE HOST HALF
        ONLY lives on this page: the guest runs on gamecube_multiplayer.html … a
@@ -26,7 +26,7 @@
        machine boots the disc and the room exchanges nothing but pad bytes
        (tools/no_streaming_test.mjs machine-checks that). netplay-ui.js is the
        shared lobby; it renders nothing at all when Netplay.supported() is false. -->
-  <script src="/lib/netplay.js?v=9c60975f"></script>
+  <script src="/lib/netplay.js?v=fca3c5ea"></script>
   <script src="/lib/netplay-ui.js?v=66f15769"></script>
   <script src="/lib/mpgames.js"></script>
   <script>
@@ -8740,6 +8740,29 @@ window.GcRate = (function () {
   // as this engine had one controller.
   var pace = new SharedArrayBuffer(1024);
   var paceI32 = new Int32Array(pace);
+  // A FULL-IMAGE FRAME MUST NOT STALL THE GUEST (recomp_worker.js SHIP_ACK): the worker reuses a
+  // pooled SharedArrayBuffer (a mem1 image, a packed region payload) only once the renderer has
+  // copied it out. dolphin_worker handles its messages in order and applies a recompFrame's RAM
+  // while handling it, and it answers {cmd:'recompStats'} at once — so a recompStats sent right
+  // after a frame is a FENCE: its reply proves every buffer forwarded before it was consumed.
+  // Drawn-frame acks would prove the same but arrive only after GPU work, and a slow renderer
+  // skips most frames (never acked): measured 0 acks in the first 555 frames on a SwiftShader run.
+  // Two exceptions: while dolphin's takeover gate is HOLDING frames (worker_funcs.js
+  // __recompGate) it keeps views of them until 'released', so no fence goes out before that; and
+  // a fence in flight across a savestate restore names a discarded pool, so it releases nothing.
+  // Nothing else on this page sends recompStats. ?shippool=0 is the control (the old ship).
+  var SHIP_ACK_CELL = 216;
+  var SHIPQ = { pend: 0, fenced: [], released: false };
+  function shipFence(seq) {
+    if (!seq) return;
+    if (!SHIPQ.released) { SHIPQ.pend = Math.max(SHIPQ.pend, seq); return; }
+    SHIPQ.fenced.push(seq);
+    dolphin_worker.postMessage({ cmd: 'recompStats' });
+  }
+  function shipFenceReply() {
+    var seq = SHIPQ.fenced.length ? SHIPQ.fenced.shift() : 0;
+    if (seq > Atomics.load(paceI32, SHIP_ACK_CELL)) Atomics.store(paceI32, SHIP_ACK_CELL, seq);
+  }
   if (TARGET === 0) Atomics.store(paceI32, 5, 1);   // uncapped
   var rw = null;
 
@@ -10752,10 +10775,12 @@ window.GcRate = (function () {
         gcRoomRenderAck(_at);
         return;
       }
+      if (e.data && e.data.cmd === 'recompStats') { shipFenceReply(); return; }   // SHIPQ's fence
       if (e.data && e.data.cmd === 'recompGate') {
         // [vi-timing-gate 2026-09-30] the takeover is held until Dolphin's emulated hardware
         // exists (worker_funcs.js __recompGate): say so on the HUD instead of a silent pause.
         gateAt = Date.now(); gateState = e.data.state;
+        if (e.data.state === 'released' && !SHIPQ.released) { SHIPQ.released = true; var _sp = SHIPQ.pend; SHIPQ.pend = 0; shipFence(_sp); }
         if (e.data.state === 'ready') { stopJit(); dolphin_worker.postMessage({ cmd: 'recompGateGo' }); return; }
         var gs = (e.data.ms || 0) / 1000;
         gateStatus = e.data.state === 'released' ? ''
@@ -10864,11 +10889,20 @@ window.GcRate = (function () {
         }
         RRY.pendSince = 0;                 // a shipped frame: nothing is pending behind the hold
         gcRoomShipHold(_fnow, _mt ? gcMtSkipNext(_fnow) : false);
-        var tr = [e.data.fifo].concat(e.data.regions.map(function (r) { return r.bytes; }));
-        if (e.data.mem1) tr.push(e.data.mem1);
+        // A FULL-IMAGE FRAME MUST NOT STALL THE GUEST (recomp_worker.js, boot msg shipPool): the
+        // regions may be views into one packed buffer (transfer it once), and that buffer and the
+        // mem1 image may be pooled SharedArrayBuffers, which are shared, never transferred. A pooled
+        // buffer is reusable once a fence posted after this frame comes back (SHIPQ).
+        var tr = [e.data.fifo];
+        for (var _ri = 0; _ri < e.data.regions.length; _ri++) {
+          var _rb = e.data.regions[_ri].bytes, _rbuf = _rb instanceof ArrayBuffer ? _rb : _rb.buffer;
+          if (!(_rbuf instanceof SharedArrayBuffer) && tr.indexOf(_rbuf) < 0) tr.push(_rbuf);
+        }
+        if (e.data.mem1 && !(e.data.mem1 instanceof SharedArrayBuffer)) tr.push(e.data.mem1);
         dolphin_worker.postMessage({ cmd: 'recompFrame', n: e.data.n, fifo: e.data.fifo,
                                      mem1: e.data.mem1, regions: e.data.regions,
                                      skipRender: skipRender }, tr);
+        shipFence(e.data.poolSeq);
       } else if (e.data.cmd === 'audioRate') {
         // [recomp audio 2026-09-01] The recomp path had NO audio wiring at all: recomp_worker.js
         // posted seven message types and none of them was sound, so MP4 — which routes to the
@@ -10929,6 +10963,9 @@ window.GcRate = (function () {
         // for the rest of the session), AND the standing credit pool, which is emulated time
         // owed to a run that no longer exists (?ratetest=1 tests 7 and 14).
         rate.restore(e.data.n, performance.now()); paceT0 = 0; paceB = null;
+        // the worker starts a new pool: fences in flight name the old one and release nothing
+        for (var _fi = 0; _fi < SHIPQ.fenced.length; _fi++) SHIPQ.fenced[_fi] = 0;
+        SHIPQ.pend = 0; Atomics.store(paceI32, SHIP_ACK_CELL, 0);
         stSay('worker restored at frame ' + e.data.n + '; renderer resync forced');
         if (pendingStateLoad) pendingStateLoad({ ok: true, n: e.data.n });
       } else if (e.data.cmd === 'stateError') {
@@ -11006,6 +11043,8 @@ window.GcRate = (function () {
     else if (recompBuildDir) console.log('[recomp] CANDIDATE build /gamecube/recomp/' + recompBuildDir + ' — NOT the shipped pair');
     rw.postMessage({ cmd: 'boot', parts: parts, fst: fst, pace: pace, card: card, cardTime: cardTime,
                      stage: stageSab,
+                     // packed regions + a pooled mem1 image (A FULL-IMAGE FRAME MUST NOT STALL THE GUEST)
+                     shipPool: q.get('shippool') !== '0',
                      // THE ROLLBACK RING: in a room the worker instruments the module so every frame
                      // start in the window can be rewound; solo, nothing changes.
                      rb: !!GCLS.session, rbSab: rbSab,

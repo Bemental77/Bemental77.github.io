@@ -873,7 +873,8 @@
         for (j = s.frame; j < k; j++) if (!rbStep(ls, j, RB.img[j % RB_IMG], false, false)) return 'frame-skip re-run save failed: ' + N64S.fault;
         lsApplyImage(RB.img[k % RB_IMG]);
         env.fs.begin(false, k);
-        try { M._neil_ls_run_frame(); } finally { env.fs.end(false); }
+        G.__n64FieldKind = 'repair';
+        try { M._neil_ls_run_frame(); } finally { G.__n64FieldKind = null; env.fs.end(false); }
         if (!RFS.inResim) audioDropNow();
         if (env.fs.taint()) { RFS.lost++; return 'a read-back reached a skipped frame DURING a frame-skip re-run (frame ' + k + ')'; }
         if (resave && !rbSaveAt(ls, k + 1)) return 'frame-skip re-run save failed: ' + N64S.fault;
@@ -1242,6 +1243,7 @@
       kind = kind || (present ? 'present' : 'resim');
       var fsk = rfsBegin(kind, k);
       if (skipGl && !fsk) { GLSKIP.on = true; GLSKIP.frames++; }
+      G.__n64FieldKind = RFS.inRerun ? 'repair' : kind;    // (core_worker.js WHY A FIELD WAS SLOW)
       try { M._neil_ls_run_frame(); }
       catch (e) {
         // THE CORE ABORTED INSIDE THE FRAME (Aborted(OOM), a trap): the machine is half-run and no
@@ -1250,7 +1252,7 @@
         N64S.fault = 'the core aborted inside frame ' + k + ': ' + ((e && e.message) || e);
         return false;
       }
-      finally { GLSKIP.on = false; rfsEnd(kind, k, fsk, present); }
+      finally { G.__n64FieldKind = null; GLSKIP.on = false; rfsEnd(kind, k, fsk, present); }
       // TEST SEAM (n64/tools/n64_rollback_probe.mjs --ranlog): frame k has just run (again). Absent unless a rig sets it.
       if (G.__n64RanTap) { try { G.__n64RanTap(k, kind); } catch (e) {} }
       // a skipped frame's pixels reached the guest: re-run before anything is saved or shown
@@ -1517,7 +1519,8 @@
       for (var j = 0; j < n; j++) {
         lsApplyImage(img);
         if (skip && j < n - 1) { GLSKIP.on = true; GLSKIP.frames++; }
-        try { M._neil_ls_run_frame(); } finally { GLSKIP.on = false; }
+        G.__n64FieldKind = 'runahead';
+        try { M._neil_ls_run_frame(); } finally { G.__n64FieldKind = null; GLSKIP.on = false; }
       }
       var ok = rbLoadSlot(base);
       if (env.fs && RFS.on) env.fs.taint();     // what hidden frames read is undone with them
