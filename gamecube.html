@@ -8366,7 +8366,7 @@ window.GcRate = (function () {
   // does not publish per-seat; both are fed from public events (see gcNetWatch)
   // so no drawing code has to reach into lib/netplay.js for them. `pressed` is
   // the witness for which shell gcNetPressStart() actually fired — see there.
-  var GCPARTY = { ui: null, loadPct: 0, said: null, held: null, rows: null, timer: 0, stale: null, staleCheck: false,
+  var GCPARTY = { ui: null, loadPct: 0, said: null, held: null, rows: null, timer: 0, stale: null, staleCheck: false, onFail: null,
                   blips: {}, peerLoad: 0, pressed: null };
   var GC_BLIP_MS = 15000;      // > lib/netplay.js:378 DISCONNECT_GRACE_MS (12000)
   // ⚠ NEVER A NONCE ON SCREEN. A peer is 'host' (port 0) or 'player'; the roster holds
@@ -8627,7 +8627,8 @@ window.GcRate = (function () {
     sess.on('peer-left', function (e) { if (e && e.peer) delete GCPARTY.blips[e.peer]; });
     // A ROOM REFUSED FOR AN OUT-OF-DATE PAGE SAYS SO (gcLsRoomFailed): host and guests alike see the
     // lockstep fail ('lsx' on a guest, the barrier's own fail() on the host).
-    sess.on('lockstep', function (e) { if (e && e.state === 'failed') setTimeout(function () { gcLsRoomFailed(sess, e.detail); }, 0); });
+    // gcLsRoomFailed lives inside engine() (it reads GCLS); engine() publishes it as GCPARTY.onFail.
+    sess.on('lockstep', function (e) { if (e && e.state === 'failed' && GCPARTY.onFail) setTimeout(function () { GCPARTY.onFail(sess, e.detail); }, 0); });
     sess.on('peer-joined', function (e) { if (e && e.peer) delete GCPARTY.blips[e.peer]; });
     if (!GCPARTY.timer) GCPARTY.timer = setInterval(gcNetPartySync, 1000);
   }
@@ -9738,7 +9739,8 @@ window.GcRate = (function () {
   }
   function gcLsStaleSay(t) {
     GCPARTY.stale = t; GCPARTY.said = null;
-    gcLsSay(t); setStatus(t); hudStatus = t;
+    gcLsSay(t); hudStatus = t;
+    ['status', 'mobileStatus'].forEach(function (id) { var el = document.getElementById(id); if (el) el.textContent = t; });   // the page's status line (setStatus is another script's)
     try { if (GCPARTY.ui) { GCPARTY.ui.say(t, true); if (GCPARTY.ui.open) GCPARTY.ui.open(); } } catch (e) {}
     gcNetPartySync();
   }
@@ -9760,6 +9762,7 @@ window.GcRate = (function () {
         mm.theirs.join(', ') + ' there), so the room refused to start. Everyone reload the page (Ctrl+Shift+R, or pull down to refresh on a phone) and rejoin' + code + '.');
     });
   }
+  GCPARTY.onFail = gcLsRoomFailed;
 
   // THIS MACHINE'S OWN PADS, KEYED BY THE PORT THE ROOM GAVE IT.
   // The keyboard writes the legacy port-0 cells and the gamepads write gcLsStage (see

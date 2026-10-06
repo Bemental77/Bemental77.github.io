@@ -1021,6 +1021,15 @@
       // The AICA witness for the last heartbeat (1.000 = hardware), the raw
       // SH4-clock ratio, and whether that heartbeat spanned a clock jump.
       aicaX: safe(() => aicaRateX(), 0),
+      // the worker-clock length of the window aicaX covers (0: unknown / older shim)
+      hbMs: safe(() => lastHbMs, 0),
+      // the worker's last 1 s pump window, ms: emu (inside run_iter), render-hold,
+      // gate (parked on the lockstep gate), sleep asked, wall, governor drop, and
+      // `ahead`: the furthest past the wall clock any frame STARTED (<= ~1 ms
+      // means the guest never ran ahead of 1.000x in that window)
+      pace: safe(() => ({ emu: lastBusyMs, held: lastHeldMs, gate: lastGateMs, paced: lastPacedMs,
+                          wall: lastWallMs, drop: lastPaceDrop, seq: lastPaceSeq,
+                          ahead: lastPaceAhead }), null),
       clkX: safe(() => clkRateX(), 0),
       clkJump: safe(() => lastClkJump, false), clkJumps: safe(() => clkJumps, 0),
       // render-level frame skip, last 1 s window: {on, frames, drawn, skipped, forced, taints, reads, why}
@@ -2682,7 +2691,10 @@
           // cannot put a query on a page it does not open (the bench room's
           // iframe player).
           const fq = qs.get('fskip') != null ? qs.get('fskip') : (typeof window.__DC_FSKIP === 'string' ? window.__DC_FSKIP : null);
-          if (fq != null) worker.postMessage({ cmd: 'fskip', mode: fq });
+          // ?fskiplag=MS: a frame that starts more than MS behind the wall clock
+          // skips its picture (default 17 in the shim; 0 = that rule off).
+          const fl = qs.get('fskiplag') != null ? qs.get('fskiplag') : (typeof window.__DC_FSKIPLAG === 'string' ? window.__DC_FSKIPLAG : null);
+          if (fq != null || fl != null) worker.postMessage({ cmd: 'fskip', mode: fq == null ? '' : fq, lagMs: fl == null ? null : +fl });
         }
         if (new URLSearchParams(location.search).has('nofastmem')) {
           worker.postMessage({ cmd: 'memfast', on: 0 });
@@ -2828,6 +2840,7 @@
         lastClk = d.kcyc; lastPc = d.pc >>> 0;
         lastIstnrm = d.istnrm >>> 0; lastIstext = d.istext >>> 0;
         lastAwr = d.awr | 0; lastAdrop = d.adrop | 0;
+        if (typeof d.wt === 'number') { lastHbMs = lastHbWt ? d.wt - lastHbWt : 0; lastHbWt = d.wt; }
         hbSeq++; hbSinceRestore++;
         {
           // See THE CLOCK-DISCONTINUITY GUARD at HW_AICA_HZ.
@@ -2924,14 +2937,19 @@
         if (d.wallMs !== undefined) {
           lastBusyMs = d.busyMs | 0; lastPacedMs = d.pacedMs | 0; lastWallMs = d.wallMs | 0;
           lastHeldMs = d.heldMs | 0;   // older shims: 0 (undefined | 0)
+          lastGateMs = d.gateMs | 0;   // parked on the lockstep gate (waiting on the page/peer)
           lastGoverned = d.governed === undefined ? 1 : (d.governed | 0);
         }
         if (d.fs) lastFs = d.fs;
         // Governor accounting (2026-10-03): guest ms the governor DROPPED
         // rather than repaid, and the pace sleep asked vs delivered. Summed
         // until the next heartbeat line prints them.
+        lastPaceSeq++; lastPaceDrop = d.dropMs | 0; lastPaceAhead = +d.aheadMs || 0;
         if (d.dropMs !== undefined) {
-          if (LS.running) lsLookTune(d.dropMs | 0);
+          // overMs: debt beyond the governor's repay cap — the quantity this rule
+          // was measured on (equal to dropMs today; kept apart so a change to the
+          // worker's drop rule cannot silently retune this one). Older shims: dropMs.
+          if (LS.running) lsLookTune(d.overMs !== undefined ? d.overMs | 0 : d.dropMs | 0);
           govDropMs += d.dropMs | 0; govDrops += d.drops | 0;
           govAskMs += d.pacedMs | 0; govSleptMs += d.sleptMs | 0;
           if ((d.maxLagMs | 0) > govMaxLag) govMaxLag = d.maxLagMs | 0;
@@ -5446,7 +5464,10 @@
   // `busy`, and duty/headroom read 23-37% / 2.2-3.6x on a worker that could
   // not run one more frame (dreamcast/docs/governor-pacing/TASKS.md). It is
   // occupied time: the worker can do nothing else in it.
-  let lastHeldMs = 0;
+  let lastHeldMs = 0, lastGateMs = 0, lastPaceDrop = 0, lastPaceSeq = 0, lastPaceAhead = 0;
+  // The worker's clock at the end of the last two heartbeat windows (fps.wt):
+  // hbMs is the true length of the window aicaX describes.
+  let lastHbWt = 0, lastHbMs = 0;
   // Render-level frame skip, last 1 s window (flycast_worker.js FSK): frames
   // run, pictures drawn, frames whose picture was skipped because the GPU still
   // held the previous one. The guest ran every one of them.
@@ -5505,6 +5526,7 @@
     noseed:      'boot seed disabled',
     arm7selftest:'ARM7 self-test',
     fskip:       'render frame skip changed from its default',
+    fskiplag:    'frame-skip lag threshold changed from its default',
   };
   const activeArms = (() => {
     const q = new URLSearchParams(location.search);
@@ -5807,6 +5829,7 @@
               ' presented=' + lastFps + '/s' +
               ' duty=' + Math.round(dutyFrac() * 100) + '%' +
               ' (emu ' + Math.round(cpuFrac() * 100) + '% + render-hold ' + Math.round(heldFrac() * 100) + '%)' +
+              (lastGateMs ? ' gate-wait=' + Math.round(lastWallMs > 0 ? lastGateMs * 100 / lastWallMs : 0) + '%' : '') +
               ' cost=' + f1(frameCostMs()) + 'ms/f' +
               ' headroom=' + f1(headroomX()) + 'x' +
               ' capacity=' + Math.round(capacityFps()) + 'fps' +
@@ -5816,6 +5839,7 @@
               ' gov=drop' + govDropMs + 'ms/' + govDrops + ' lag' + govMaxLag + 'ms sleep' + govAskMs + '/' + govSleptMs + 'ms' +
               // fskip: pictures drawn / frames skipped in the last 1 s (the guest ran them all)
               ' fskip=' + (lastFs ? (lastFs.on ? 'on' : 'off') + ' drawn' + lastFs.drawn + '/skipped' + lastFs.skipped +
+                                    (lastFs.lagSkips ? ' (behind' + lastFs.lagSkips + ')' : '') +
                                     (lastFs.taints ? ' TAINT' + lastFs.taints : '') : 'n/a'));
       govDropMs = 0; govDrops = 0; govAskMs = 0; govSleptMs = 0; govMaxLag = 0;
     }
