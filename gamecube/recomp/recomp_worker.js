@@ -366,6 +366,28 @@ function attrList(vat) {
   return list;
 }
 
+// Bytes per vertex of a draw on `vat` = the sum of attrList(vat)'s sizes, without building the
+// list: a full-image frame re-walks every DL body (the caches start empty), and MP4's frame 725
+// is ~1519 bindings deep — one allocated attribute list per draw was garbage the guest's VI paid
+// for. Memoised per VAT on the three registers it reads; attrList stays the reference.
+const pvLo = new Int32Array(8), pvHi = new Int32Array(8), pvVa = new Int32Array(8), pvSz = new Array(8).fill(null);   // pvSz may hold NaN, exactly as attrList's sum would
+function pvAdd(t, directSz) { return t === 1 ? directSz : t === 2 ? 1 : t === 3 ? 2 : 0; }
+function perVertSize(vat) {
+  const va = vatA[vat];
+  if (pvSz[vat] !== null && pvLo[vat] === (vcdLo | 0) && pvHi[vat] === (vcdHi | 0) && pvVa[vat] === (va | 0)) return pvSz[vat];
+  let s = 0;
+  if (vcdLo & 1) s++;
+  for (let i = 0; i < 8; i++) if (vcdLo & (1 << (1 + i))) s++;
+  s += pvAdd((vcdLo >> 9) & 3, (((va & 1) ? 3 : 2)) * FMT_SZ[(va >> 1) & 7]);
+  s += pvAdd((vcdLo >> 11) & 3, ((((va >> 9) & 1) ? 9 : 3)) * FMT_SZ[(va >> 10) & 7]);
+  s += pvAdd((vcdLo >> 13) & 3, COL_SZ[(va >> 14) & 7]);
+  s += pvAdd((vcdLo >> 15) & 3, COL_SZ[(va >> 18) & 7]);
+  for (let i = 0; i < 8; i++)
+    s += pvAdd((vcdHi >> (2 * i)) & 3, i === 0 ? (((va >> 21) & 1) ? 2 : 1) * FMT_SZ[(va >> 22) & 7] : 8);
+  pvLo[vat] = vcdLo | 0; pvHi[vat] = vcdHi | 0; pvVa[vat] = va | 0; pvSz[vat] = s;
+  return s;
+}
+
 // Walk one GX stream (frame or DL body): update reg shadows, collect new DLs, and for
 // indexed draws track max index per bound array. buf = Uint8Array, guest = whether offsets
 // are guest addresses (DL bodies) — used only for labels.
@@ -469,10 +491,7 @@ function walkStream(mem, buf, start, end, depth, newDLs, touched) {
     else if (op >= 0x80 && op <= 0xBF) {
       const vat = op & 7, n = rdU16(p); p += 2;
       // array extents come from the clip heuristic now (fixture parity) — draws just skip
-      const attrs = attrList(vat);
-      let perVert = 0;
-      for (const a2 of attrs) perVert += a2.sz;
-      p += n * perVert;
+      p += n * perVertSize(vat);
       if (p > end) { log('DRAW OVERRUN in walk'); return; }
     }
     else { log('walk: unknown op 0x' + op.toString(16) + ' at +0x' + (p - 1).toString(16)); return; }
@@ -522,16 +541,15 @@ function swap4InPlace(out) {
   }
 }
 const f32Arrays = [];   // [{b, e}] guest-phys intervals of known f32 (stride 8/12) arrays
+// Returns a VIEW of guest memory and whether the shipped copy is byte-swapped (packRegions).
 function regionBytes(mem, base, stride, count) {
-  const src = new Uint8Array(mem.buffer, 0x80000000 + (base & 0x01FFFFFF), count);
-  const out = new Uint8Array(count);
-  out.set(src);
-  if (stride === 8 || stride === 12) {
-    swap4InPlace(out);
+  const out = new Uint8Array(mem.buffer, 0x80000000 + (base & 0x01FFFFFF), count);
+  const swap = stride === 8 || stride === 12;
+  if (swap) {
     const b = base & 0x01FFFFFF;
     f32Arrays.push({ b, e: b + count });
   }
-  return out;
+  return { bytes: out, swap };
 }
 
 // ---- SAVE STATES ------------------------------------------------------------------------
@@ -649,6 +667,91 @@ const PAD_ACK = 33, LS_ARMED = 34;
 // WebGL2 fallback defers it to the first frame it will draw — THE MAIN-THREAD WebGL2 FALLBACK).
 const SHIP_HOLD = 210;
 let shipHeld = 0;
+
+// ── A FULL-IMAGE FRAME MUST NOT STALL THE GUEST (2026-10-05) ────────────────────────────────
+// Solo draws every frame, so SHIP_HOLD never applies there and every full-image frame (the frame
+// after a DVD read — cacheDirty) is shipped synchronously, at this worker's VI, before the guest
+// may run its next frame. MEASURED (MP4 solo bench, prod mirror, headless, per-frame timers in a
+// scratch copy): frame 725 = walk 15-18 ms + 1519 region slices 22-26 ms + the 24 MiB mem1 slice
+// 27-41 ms + postMessage 8 ms; frames 41/42/344/555 = the mem1 slice alone, 33-50 ms. A fresh
+// 24 MiB ArrayBuffer per image is page-faulted in as it is copied, and 1519 regions are 1519
+// ArrayBuffers allocated here and 1519 transferables detached at the post. The bytes are
+// unchanged; only where they are put changes:
+//   * mem1 goes into a REUSED SharedArrayBuffer (at most MEM1_POOL_MAX), already faulted in, so
+//     the image is one memcpy; it is shared with, not transferred to, the renderer. A buffer is
+//     reused only once the page has proven the renderer copied it out (SHIP_ACK, below; the page
+//     fences dolphin_worker's in-order message queue — gamecube.html SHIPQ). No buffer free: the
+//     old slice.
+//   * every region of a frame is copied into ONE buffer (regions become views into it) — a pooled
+//     SharedArrayBuffer, under the same rule, when the payload is large — so the post transfers
+//     at most 2 buffers, not 1521. Byte swaps are applied to the packed copy (word-wise; same
+//     bytes as swap4InPlace on a per-region copy).
+// MEASURED after (same rig, 6 runs): frame 725 ship 30-64 ms, frames 344/555 under 10 ms when a
+// pooled buffer is free; no guest stall over 70 ms at any full-image frame.
+// Both only when the page says it understands them (boot msg shipPool): an older cached page
+// would put a SharedArrayBuffer / a view into its transfer list, which throws.
+const SHIP_ACK = 216;                // page: the highest poolSeq the renderer has consumed
+let shipPool = false;
+let poolSeq = 0, shipSeq = 0;        // poolSeq: last seq handed out; shipSeq: the highest in this frame
+const mem1Pool = [];                 // { sab, seq } — 24 MiB images
+const regPool = [];                  // { sab, seq } — packed region payloads over REG_POOL_MIN
+const MEM1_POOL_MAX = 3, REG_POOL_MAX = 3, REG_POOL_MIN = 0x100000, REG_POOL_CAP = 0x800000;
+// A pooled buffer of at least `size` bytes the renderer is done with, or null.
+function poolTake(pool, max, size) {
+  if (!shipPool || !paceI32) return null;
+  const acked = Atomics.load(paceI32, SHIP_ACK);
+  let e = null;
+  for (const x of pool) if (x.seq <= acked && x.sab.byteLength >= size && (!e || x.sab.byteLength < e.sab.byteLength)) e = x;
+  if (!e) {
+    let i = -1;
+    if (pool.length >= max) {        // full: replace a free one that is too small, if any
+      for (let k = 0; k < pool.length; k++) if (pool[k].seq <= acked) { i = k; break; }
+      if (i < 0) return null;
+    }
+    // Sized up (a region payload grows from scene to scene) and written once now, so later reuse
+    // is a plain copy into memory that is already faulted in.
+    try { e = { sab: new SharedArrayBuffer(Math.max(size, REG_POOL_CAP) + 0xFFFF & ~0xFFFF), seq: 0 }; } catch (er) { return null; }
+    new Uint8Array(e.sab).fill(0);
+    if (i >= 0) pool[i] = e; else pool.push(e);
+  }
+  e.seq = ++poolSeq; shipSeq = e.seq;
+  return e.sab;
+}
+function mem1Image() {
+  const src = new Uint8Array(Module.wasmMemory.buffer, 0x80000000, 0x01800000);
+  const sab = poolTake(mem1Pool, MEM1_POOL_MAX, 0x01800000);
+  if (!sab) return src.slice().buffer;
+  new Uint8Array(sab, 0, 0x01800000).set(src);
+  return sab;
+}
+// A region is { addr, bytes, swap }: `bytes` is a VIEW of guest memory until packRegions copies
+// it out (no guest code runs between the two), `swap` = byte-swap it in the copy (f32 arrays).
+function regView(src, len) { return new Uint8Array(Module.wasmMemory.buffer, src, len); }
+function packRegions(regions) {
+  if (!regions.length) return;
+  if (!shipPool) {
+    for (const r of regions) { r.bytes = r.bytes.slice(); if (r.swap) swap4InPlace(r.bytes); }
+    return;
+  }
+  let total = 0;
+  for (const r of regions) total += (r.bytes.byteLength + 3) & ~3;   // 4-aligned: swaps run on words
+  const sab = total >= REG_POOL_MIN ? poolTake(regPool, REG_POOL_MAX, total) : null;
+  const buf = sab || new ArrayBuffer(total);
+  const out = new Uint8Array(buf), w32 = new Uint32Array(buf, 0, buf.byteLength >>> 2);
+  let o = 0;
+  for (const r of regions) {
+    const n = r.bytes.byteLength;
+    out.set(r.bytes, o);
+    if (r.swap) {                    // = swap4InPlace on the copy: every whole word, a tail as is
+      for (let k = o >>> 2, e = k + (n >>> 2); k < e; k++) {
+        const x = w32[k];
+        w32[k] = (x << 24) | ((x & 0xFF00) << 8) | ((x >>> 8) & 0xFF00) | (x >>> 24);
+      }
+    }
+    r.bytes = out.subarray(o, o + n);
+    o += (n + 3) & ~3;
+  }
+}
 
 // ── GUEST-STATE WITNESS WINDOW ──────────────────────────────────────────────────────────────
 // A postMessage cannot reach this worker once _main() runs (see the SAVE STATES block), and the
@@ -1121,6 +1224,9 @@ function stateApply(u8) {
   knownDLs.clear(); knownArrays.clear(); knownTex.clear(); texBound.clear(); pairSeen.clear();
   f32Arrays.length = 0;
   cacheDirty = true; sentPrologue = false;
+  // The page drops its ack bookkeeping on stateRestored (acks in flight belong to the discarded
+  // timeline), so no pooled image can be proven consumed any more: start a new pool.
+  mem1Pool.length = 0; regPool.length = 0;
   if (Module.___recomp_dirty_reset) Module.___recomp_dirty_reset();
   // Every undo record describes the timeline this load just replaced: start the ring again here.
   if (rb.armed) { rb.rearm = true; rb.carry.length = 0; rb.pendRaw.length = 0; }
@@ -1799,6 +1905,7 @@ async function boot(msg) {
   buildPartIndex(parts);   // real per-part byteLengths -> serveDvdRead's map (note at :37-53)
   fstBuf = new Uint8Array(msg.fst);
   paceI32 = new Int32Array(msg.pace);
+  shipPool = !!msg.shipPool && typeof SharedArrayBuffer !== 'undefined';
   if (msg.stage) stageSab = msg.stage;   // savestate load transport (see the SAVE STATES block)
 
   const wasmBinary = await (await fetch(msg.wasmUrl)).arrayBuffer();
@@ -2195,9 +2302,7 @@ async function boot(msg) {
             try { walkStream(mem(), fb, 0, pos, 0, newDLs, touched) } catch (e) { log('walk threw: ' + e.message); }
             const regions = [];
             for (const d of newDLs)
-              regions.push({ addr: d.addr & 0x01FFFFFF,
-                             bytes: new Uint8Array(mem().buffer.slice(0x80000000 + (d.addr & 0x01FFFFFF),
-                                                                      0x80000000 + (d.addr & 0x01FFFFFF) + d.size)) });
+              regions.push({ addr: d.addr & 0x01FFFFFF, bytes: regView(0x80000000 + (d.addr & 0x01FFFFFF), d.size) });
             // texture regions BEFORE arrays: both are raw guest slices except arrays are
             // byte-swapped — on any residual overlap the swapped array copy must win
             // (apply order is list order on the dolphin side).
@@ -2215,7 +2320,7 @@ async function boot(msg) {
               if (!kt || size > kt.size) {
                 knownTex.set(base, { size, lastSync: viRetrace });
                 const src = (staticTop && ofs + size <= staticTop) ? ofs : 0x80000000 + ofs;
-                regions.push({ addr: ofs, bytes: new Uint8Array(mem().buffer.slice(src, src + size)) });
+                regions.push({ addr: ofs, bytes: regView(src, size) });
               }
             }
             texBound.clear();
@@ -2246,7 +2351,8 @@ async function boot(msg) {
                   const ext = Math.min(next - b2, 0x40000, 0x01800000 - b2);
                   if (ext <= 0) continue;
                   knownArrays.set((pr.base >>> 0) + '|' + (pr.stride >>> 0), ext);
-                  regions.push({ addr: b2, bytes: regionBytes(mem(), pr.base, pr.stride, ext) });
+                  const rgb = regionBytes(mem(), pr.base, pr.stride, ext);
+                  regions.push({ addr: b2, bytes: rgb.bytes, swap: rgb.swap });
                   if (peekAddrs && peekAddrs.some((pa) => Math.abs(pa - b2) < 0x2000))
                     log('pairSync f' + viRetrace + ' base=0x' + b2.toString(16) + ' stride=' + pr.stride + ' ext=' + ext);
                 }
@@ -2296,13 +2402,13 @@ async function boot(msg) {
                     for (let fi = f32Arrays.length - 1; fi >= 0; fi--)
                       if (f32Arrays[fi].b < ofs + ds && f32Arrays[fi].e > ofs) f32Arrays.splice(fi, 1);
                   }
-                  const by = new Uint8Array(mem().buffer.slice(da, da + ds));
                   // dirty range inside a known f32 vertex/texcoord array (skinning/morph
                   // writes are LE floats) -> swap for Dolphin; anything else (glyph
                   // textures, DLs, misc buffers) is byte-exact -> raw
+                  let sw = false;
                   for (const iv of f32Arrays)
-                    if (ofs >= iv.b && ofs + ds <= iv.e) { swap4InPlace(by); break; }
-                  regions.push({ addr: ofs, bytes: by });
+                    if (ofs >= iv.b && ofs + ds <= iv.e) { sw = true; break; }
+                  regions.push({ addr: ofs, bytes: regView(da, ds), swap: sw });
                 }
               }
               if (Module.___recomp_dirty_reset) Module.___recomp_dirty_reset();
@@ -2313,11 +2419,11 @@ async function boot(msg) {
               // ranges were dropped, so swapped arrays and DLs are re-discovered and re-sent on top);
               // (2) what the re-simulated frames produced, in order; (3) this frame's own regions.
               const pre = [];
-              for (const [a0, n0] of rb.pendRaw) pre.push({ addr: a0, bytes: new Uint8Array(mem().buffer.slice(0x80000000 + a0, 0x80000000 + a0 + n0)) });
+              for (const [a0, n0] of rb.pendRaw) pre.push({ addr: a0, bytes: regView(0x80000000 + a0, n0) });
               for (const [a0, n0] of rb.carry) {
-                const by = new Uint8Array(mem().buffer.slice(0x80000000 + a0, 0x80000000 + a0 + n0));
-                for (const iv of f32Arrays) if (a0 >= iv.b && a0 + n0 <= iv.e) { swap4InPlace(by); break; }
-                pre.push({ addr: a0, bytes: by });
+                let sw = false;
+                for (const iv of f32Arrays) if (a0 >= iv.b && a0 + n0 <= iv.e) { sw = true; break; }
+                pre.push({ addr: a0, bytes: regView(0x80000000 + a0, n0), swap: sw });
               }
               rb.pendRaw.length = 0; rb.carry.length = 0;
               regions.unshift(...pre);
@@ -2325,21 +2431,26 @@ async function boot(msg) {
             // What this frame shipped, so a rollback that abandons it re-sends exactly those ranges
             // from the corrected timeline (rbRestore).
             rbNoteShip(fullSync, regions);
+            // Copy every region out of guest memory (A FULL-IMAGE FRAME MUST NOT STALL THE GUEST).
+            shipSeq = 0;
+            packRegions(regions);
             let mem1Snap = null;
-            if (fullSync) mem1Snap = mem().buffer.slice(0x80000000, 0x81800000);
-            if (!sentPrologue) { sentPrologue = true;
-              if (!mem1Snap) mem1Snap = mem().buffer.slice(0x80000000, 0x81800000);
-            }
+            if (fullSync || !sentPrologue) mem1Snap = mem1Image();
+            sentPrologue = true;
             // Prepend the rolling register shadow to EVERY frame (~1.5KB): each frame is then
             // fully self-contained, so the renderer may skip backlogged frames without the
             // decoder losing persistent CP/XF/BP state carried only by a skipped frame.
             const pro = buildPrologue();
             const fifo = new Uint8Array(pro.length + fb.length);
             fifo.set(pro, 0); fifo.set(fb, pro.length);
-            const transfers = [fifo.buffer, ...regions.map((r) => r.bytes.buffer)];
-            if (mem1Snap) transfers.push(mem1Snap);
-            postMessage({ cmd: 'frame', n: viRetrace, fifo: fifo.buffer, mem1: mem1Snap, hidden: hiddenNow,
-                          regions: regions.map((r) => ({ addr: r.addr, bytes: r.bytes.buffer })) }, transfers);
+            // Packed (shipPool): every region is a view into ONE buffer, transferred once; the mem1
+            // image may be a pooled SharedArrayBuffer, which is shared, never transferred.
+            const transfers = [fifo.buffer];
+            const isSab = (b) => typeof SharedArrayBuffer !== 'undefined' && b instanceof SharedArrayBuffer;
+            for (const r of regions) if (!isSab(r.bytes.buffer) && transfers.indexOf(r.bytes.buffer) < 0) transfers.push(r.bytes.buffer);
+            if (mem1Snap && !isSab(mem1Snap)) transfers.push(mem1Snap);
+            postMessage({ cmd: 'frame', n: viRetrace, fifo: fifo.buffer, mem1: mem1Snap, poolSeq: shipSeq, hidden: hiddenNow,
+                          regions: regions.map((r) => ({ addr: r.addr, bytes: shipPool ? r.bytes : r.bytes.buffer })) }, transfers);
           }
           if (Module._gx_fifo_reset) Module._gx_fifo_reset();
           // input from the pace SAB (page keyboard/gamepad): buttons/d-pad are one-shot edges
