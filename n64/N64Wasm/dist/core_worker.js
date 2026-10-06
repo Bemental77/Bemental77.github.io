@@ -497,7 +497,7 @@ var FSK = { on: true, depth: 1, maxSnaps: 6, snapEvery: 8, force: 0, skipping: f
            fields: 0, drawn: 0, skipped: 0, skipNoDraw: 0, snapsTaken: 0, snapMs: 0, maxSnapMs: 0, redo: 0, redoFields: 0,
            redoMs: 0, redoFieldsAll: 0, audDrop: 0, staleS: 0, repairs: 0, lost: 0, suspendUntil: 0, backoff: 64, held: 0, presented: 0, overwritten: 0, noHeap: 0,
            lat: new Float32Array(4096), age: new Float32Array(4096), gpu: new Float32Array(4096), latN: 0, why: '',
-           staleIdle: 0, idleRepairs: 0, gaps: new Int32Array(16), gapN: 0, gapRun: 0 };
+           staleIdle: 0, idleRepairs: 0, gaps: new Int32Array(16), gapN: 0, gapRun: 0, late: true, lateSkips: 0, drewAt: 0 };
 // heap kept free for the core's own growth, counted on the heap the allocator sees (room_core.js
 // N64S_RAW_RESERVE: Donkey Kong 64 grows its break by 80 MB after boot; a malloc that does not fit
 // ABORTS this build, so the check is made BEFORE asking)
@@ -518,12 +518,13 @@ function fsInstall(search) {
   var qa = new URLSearchParams(search || '').get('fskipage'); if (qa && +qa > 0) FS_MAXAGE = +qa;
   var qs = new URLSearchParams(search || '').get('fskipsnap'); if (qs && +qs >= 1) FSK.snapEvery = +qs | 0;
   var qi = new URLSearchParams(search || '').get('fskipidle'); if (qi != null && +qi >= 0) FS_IDLE = +qi | 0;
+  if (new URLSearchParams(search || '').get('fskiplate') === '0') FSK.late = false;
   if (!self.WebGL2RenderingContext) { FSK.on = false; FSK.why = 'no WebGL2'; }
 }
 // the window's draw calls (after ?present=bitmap's wrappers, so a swallowed draw is not a picture)
-function fsWrap() {
-  if (!self.WebGL2RenderingContext) return;
-  var P = WebGL2RenderingContext.prototype, FB = P.FRAMEBUFFER, DFB = P.DRAW_FRAMEBUFFER, bf = P.bindFramebuffer;
+function fsWrap() { self.__n64GLProtos(self).forEach(fsWrapP); }
+function fsWrapP(P) {
+  var FB = P.FRAMEBUFFER, DFB = P.DRAW_FRAMEBUFFER, bf = P.bindFramebuffer;
   P.bindFramebuffer = function (t, fb) { if (t === FB || t === DFB) this.__fsFb = fb || null; return bf.apply(this, arguments); };
   ['drawArrays', 'drawElements', 'drawRangeElements', 'drawArraysInstanced', 'drawElementsInstanced',
    'clear', 'clearBufferfv', 'clearBufferiv', 'clearBufferuiv', 'clearBufferfi', 'blitFramebuffer'].forEach(function (n) {
@@ -537,9 +538,9 @@ function fsWrap() {
   });
 }
 // after fbasync.js: the outermost readPixels, so it sees every read the core makes
-function fsInstallRead() {
-  if (!self.WebGL2RenderingContext) return;
-  var P = WebGL2RenderingContext.prototype, rp = P.readPixels;
+function fsInstallRead() { self.__n64GLProtos(self).forEach(fsInstallReadP); }
+function fsInstallReadP(P) {
+  var rp = P.readPixels;
   P.readPixels = function () {
     var st = self.__fbAsync;
     // a read the core makes (not glide's lazy copy, which reads its own capture: lazy_fb.c
@@ -697,6 +698,7 @@ function fsField() {
   var skip = false;
   if (FSK.force) skip = (s % FSK.force) !== 0 && fsCanSkip();
   else if (FSK.on && FSK.fq.length >= FSK.depth) { FSK.held++; skip = (FSK.hist & 2) !== 0 && fsCanSkip(); }
+  if (!skip && !FSK.force && fsLate(now)) { skip = fsCanSkip(); if (skip) FSK.lateSkips++; }
   // A snapshot is needed only for the first skipped field after the newest one: a re-run from an
   // older snapshot re-runs a later skipped field too (every field's pads are kept). So one is taken
   // at most every FSK.snapEvery fields — a fast save copies ~9 MB, 3-5 ms here (?fskipsnap=N).
@@ -724,9 +726,21 @@ function fsField() {
   FSK.lastDrew = FSK.drewNow;
   if (FSK.drewNow) fsFence(now);
 }
+// A FIELD RUN WHILE THE CLOCK IS MORE THAN TWO PERIODS BEHIND ITS SLOT IS NOT PRESENTED (the solo
+// half of room_core.js A CONSOLE BEHIND ITS OWN WALL CLOCK, where the measurement is): on Chrome's
+// default renderer (headless ANGLE on Vulkan/SwiftShader) the canvas's presentation blocked this
+// thread outside JS for 13-81 ms at a time, so a catch-up that presented every field it ran could
+// not repay; the bench's solo read 0.974-0.992x in 4 of 10 runs at load 5-7. A picture is still drawn
+// at least every 100 ms; the frame clock (due/nextAt) is untouched, so no field runs before its slot.
+// Solo clock only (a room's delay-lockstep frames come through here with RM.on). ?fskiplate=0 = the arm.
+function fsLate(now) {
+  if (!FSK.on || !FSK.late || RM.on || !(CLK.viHz > 0) || !CLK.base) return false;
+  if (now - slotOf() <= 2000 / CLK.viHz) return false;
+  return now - FSK.drewAt <= 100;
+}
 self.__n64RigField = function () { fsField(); };   // the rigs step the guest through the same field
 function fsFence(tIn) {
-  FSK.drawn++; FSK.tickDrew = false;
+  FSK.drawn++; FSK.tickDrew = false; FSK.drewAt = performance.now();
   var gl = M && M.ctx, f = null, e = { f: CLK.frame, tIn: tIn, tAge: FSK.ageTIn || tIn, tEnd: performance.now(), tGpu: 0, tCommit: 0, sy: null };
   FSK.ageTIn = 0;
   try { f = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0); } catch (x) { f = null; }
@@ -809,9 +823,8 @@ function viTotal() { return ((M._neil_vi_total() >>> 0) - FSK.redoFieldsAll) >>>
 // Only fields that DREW are taken: a field that draws nothing (Mario Kart draws a picture
 // every second field) leaves the last picture up, exactly as a canvas commit would.
 var PB = { on: false, drew: false, sent: 0, errs: 0, err: null, ms: 0 };
-function pbInstall() {
-  if (!self.WebGL2RenderingContext) return;
-  var P = WebGL2RenderingContext.prototype;
+function pbInstall() { self.__n64GLProtos(self).forEach(pbInstallP); }
+function pbInstallP(P) {
   var FB = P.FRAMEBUFFER, DFB = P.DRAW_FRAMEBUFFER, bf = P.bindFramebuffer;
   P.bindFramebuffer = function (t, fb) { if (t === FB || t === DFB) this.__pbFb = fb || null; return bf.apply(this, arguments); };
   ['drawArrays', 'drawElements', 'drawRangeElements', 'drawArraysInstanced', 'drawElementsInstanced',
@@ -1325,8 +1338,7 @@ function dbgInstall(search) {
       try { return f.apply(this, arguments); } finally { DBG.b[bucket] += now() - t0; DBG.n[bucket]++; DBG.depth--; }
     };
   }
-  if (self.WebGL2RenderingContext) {
-    var P = WebGL2RenderingContext.prototype;
+  if (self.__n64GLProtos) self.__n64GLProtos(self).forEach(function (P) {
     ['compileShader', 'getShaderParameter', 'getShaderInfoLog'].forEach(function (n) { wrap(P, n, 'shader'); });
     ['linkProgram', 'getProgramParameter', 'getProgramInfoLog', 'getUniformLocation', 'getAttribLocation', 'validateProgram'].forEach(function (n) { wrap(P, n, 'prog'); });
     wrap(P, 'readPixels', 'read'); wrap(P, 'getBufferSubData', 'gbsd');
@@ -1334,7 +1346,7 @@ function dbgInstall(search) {
     ['texImage2D', 'texSubImage2D', 'texStorage2D', 'copyTexImage2D', 'copyTexSubImage2D', 'generateMipmap'].forEach(function (n) { wrap(P, n, 'tex'); });
     ['bufferData', 'bufferSubData'].forEach(function (n) { wrap(P, n, 'buf'); });
     ['finish', 'flush', 'clientWaitSync', 'getSyncParameter', 'getError'].forEach(function (n) { wrap(P, n, 'sync'); });
-  }
+  });
   DBG.wrapJit = function () {
     var f = self.myApp && self.myApp.jitCompile; if (!f || f.__dbg) return;
     var g = function (p) { var t0 = now(); try { return f(p); } finally { DBG.b.jit += now() - t0; DBG.n.jit++; } };
@@ -1514,11 +1526,16 @@ function boot(d) {
   // back at once (the core's own canvas is never touched, so its context attributes are the
   // core's). ?workerfail=boot|main is a rig seam that simulates a failure at either point.
   if (d.workerfail === 'boot') { post({ t: 'err', s: 'boot: ?workerfail=boot — a simulated boot failure (rig seam)', fatal: true, boot: true }); return; }
+  // WebGL1 is enough (glcompat.js: the core falls back to it where WebGL2 is missing — Edge on
+  // Xbox, 2026-10-06), so the preflight asks for EITHER and records which.
   try {
-    var probe = (typeof OffscreenCanvas === 'function') ? new OffscreenCanvas(1, 1).getContext('webgl2') : null;
-    if (!probe) { post({ t: 'err', s: 'boot: WebGL2 is not available inside a worker on this browser (OffscreenCanvas getContext("webgl2") returned null)', fatal: true, boot: true }); return; }
-    var lose = probe.getExtension('WEBGL_lose_context'); if (lose) lose.loseContext();
-  } catch (e) { post({ t: 'err', s: 'boot: WebGL2 in a worker threw: ' + ((e && e.message) || e), fatal: true, boot: true }); return; }
+    importScripts('glcompat.js?v=' + (d.v || ''));
+    self.__n64InstallGLCompat(self, d.search || '');
+    var glp = (typeof OffscreenCanvas === 'function') ? self.__n64GL.probe() : { v: 0 };
+    if (!glp.v) { post({ t: 'err', s: 'boot: no WebGL inside a worker on this browser (OffscreenCanvas getContext("webgl2") and ("webgl") both returned null)', fatal: true, boot: true }); return; }
+    log('[gl] core worker: WebGL' + glp.v + (glp.v === 1 ? ' — WebGL2 is ' + (self.__n64GL.want === 1 ? 'pinned off (?webgl=1)' : 'not available here') + '; the core runs its GLES2 paths' : ''));
+    if (glp.v === 1 && FSK.on) { FSK.on = false; FSK.why = 'off: WebGL1 has no fences, so the GPU queue cannot be measured'; log('[fskip] ' + FSK.why); }
+  } catch (e) { post({ t: 'err', s: 'boot: WebGL in a worker threw: ' + ((e && e.message) || e), fatal: true, boot: true }); return; }
   if (d.present === 'bitmap') {
     d.canvas = new OffscreenCanvas(d.cw > 0 ? d.cw : 640, d.ch > 0 ? d.ch : 480);
     PB.on = true; pbInstall();

@@ -724,6 +724,35 @@ function mem1Image() {
   new Uint8Array(sab, 0, 0x01800000).set(src);
   return sab;
 }
+// ── A FULL-IMAGE FRAME DOES NOT RE-SEND THE IMAGE (2026-10-06) ──────────────────────────────
+// Dolphin applies a frame's mem1 image first and its regions over it, in list order
+// (worker_funcs.js 'recompFrame', __recompStage). On a full-image frame the regions are this
+// frame's DLs, textures, arrays and dirty ranges (the rollback carry is empty: the image
+// supersedes it), and most of them are RAW slices of guest memory at their own address — byte for
+// byte what the image already holds there, since no guest code runs between the region views and
+// the image copy. Such a region changes nothing unless an EARLIER region wrote different bytes
+// over part of its range (a byte-swapped f32 array, or a static texture sourced from low wasm
+// memory), in which case its raw bytes restore the image's and it must stay. What stays: every
+// swapped region, every region not sourced from guest memory at its own address (the static
+// .inc textures, whose guest window holds zeros), and every raw region an earlier such region
+// overlaps. MP4 frame 725: 1519 regions / 5.2 MiB copied, packed and applied for nothing.
+// ?shipdedup=0 (boot msg shipDedup:false) is the control.
+let shipDedup = true;
+function dropImageDuplicates(regions) {
+  const diff = [];                   // [lo, hi) ranges an earlier kept region made differ from the image
+  let w = 0;
+  for (let i = 0; i < regions.length; i++) {
+    const r = regions[i], n = r.bytes.byteLength, lo = r.addr, hi = lo + n;
+    const raw = !r.swap && r.bytes.buffer === Module.wasmMemory.buffer && r.bytes.byteOffset === 0x80000000 + lo;
+    if (raw) {
+      let hit = false;
+      for (let k = 0; k < diff.length; k += 2) if (diff[k] < hi && diff[k + 1] > lo) { hit = true; break; }
+      if (!hit) continue;            // the image already holds exactly these bytes here
+    } else if (n) diff.push(lo, hi);
+    regions[w++] = r;
+  }
+  regions.length = w;
+}
 // A region is { addr, bytes, swap }: `bytes` is a VIEW of guest memory until packRegions copies
 // it out (no guest code runs between the two), `swap` = byte-swap it in the copy (f32 arrays).
 function regView(src, len) { return new Uint8Array(Module.wasmMemory.buffer, src, len); }
@@ -1906,6 +1935,7 @@ async function boot(msg) {
   fstBuf = new Uint8Array(msg.fst);
   paceI32 = new Int32Array(msg.pace);
   shipPool = !!msg.shipPool && typeof SharedArrayBuffer !== 'undefined';
+  shipDedup = msg.shipDedup !== false;   // A FULL-IMAGE FRAME DOES NOT RE-SEND THE IMAGE
   if (msg.stage) stageSab = msg.stage;   // savestate load transport (see the SAVE STATES block)
 
   const wasmBinary = await (await fetch(msg.wasmUrl)).arrayBuffer();
@@ -1919,7 +1949,11 @@ async function boot(msg) {
     let bh = fnv(0x811c9dc5, new Uint8Array(wasmBinary));
     const glueTxt = await (await fetch(msg.glueUrl)).arrayBuffer();
     bh = fnv(bh, new Uint8Array(glueTxt));
-    const selfTxt = await (await fetch(String(self.location.href).split('?')[0])).arrayBuffer();
+    // THE BYTES THAT ARE RUNNING, not whatever the HTTP cache holds for the bare URL. The page loads
+    // this worker as recomp_worker.js?v=<now> (always fresh), but this fetch used to strip the query:
+    // a console that had fetched the bare URL in the last max-age (600 s on Pages) hashed the OLD
+    // worker while running the new one, and the room barrier refused it as a different build.
+    const selfTxt = await (await fetch(String(self.location.href))).arrayBuffer();
     bh = fnv(bh, new Uint8Array(selfTxt));
     let rbBytes = 0;
     if (msg.rb || msg.rbTest) {
@@ -2431,11 +2465,13 @@ async function boot(msg) {
             // What this frame shipped, so a rollback that abandons it re-sends exactly those ranges
             // from the corrected timeline (rbRestore).
             rbNoteShip(fullSync, regions);
+            const withImage = fullSync || !sentPrologue;
+            if (withImage && shipDedup) dropImageDuplicates(regions);
             // Copy every region out of guest memory (A FULL-IMAGE FRAME MUST NOT STALL THE GUEST).
             shipSeq = 0;
             packRegions(regions);
             let mem1Snap = null;
-            if (fullSync || !sentPrologue) mem1Snap = mem1Image();
+            if (withImage) mem1Snap = mem1Image();
             sentPrologue = true;
             // Prepend the rolling register shadow to EVERY frame (~1.5KB): each frame is then
             // fully self-contained, so the renderer may skip backlogged frames without the

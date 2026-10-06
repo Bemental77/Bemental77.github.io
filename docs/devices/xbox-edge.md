@@ -58,15 +58,97 @@ Reported 2026-10-06 on `/n64/?np=DHRNN&game=Mario Kart 64`:
 | Startup | one 257 ms long frame at load (capability probe) | before play; not in-game |
 | Errors | 0 | ✔ |
 
-**Follow-ups from this report:**
+**Follow-ups from this report (worked 2026-10-06):**
 
-1. **Audio latency.** `genesis.html` and `snes.html` create their AudioContext with
-   `latencyHint: 'playback'` (`genesis.html:1259`, `snes.html:1128`); N64 uses
-   `'interactive'`. On this phone that gave 216 ms of output latency. Fix: use
-   `'interactive'`.
-2. **Stalls.** The room still stalls about once every 7 s, waiting on the host's inputs.
-   Over 110 s that is 376 ms lost, against a zero-slowdown rule. Under investigation:
-   whether the rollback window or the input redundancy should absorb these.
+1. **Audio latency — fixed.** `genesis.html`, `snes.html` and `gba` (`gba/gbaWasm/dist/script.js`)
+   created their AudioContext with `latencyHint: 'playback'`; all three now ask for
+   `'interactive'`, as N64 always did. `dreamcast.html`, `gamecube.html` and `ps1.html` pass no
+   hint, which is the spec's `'interactive'` default. Measured in headless Chrome 141 on this
+   box (not the phone): `'playback'` base 21.3 ms / output 64 ms → `'interactive'` base 10.0 ms
+   / output 32 ms. The audio cushion (`lib/cart_audio.js`, 80 ms target) is unchanged, and it did
+   not underrun: `node tools/bench_page_test.mjs --pages snes,genesis --sec 20` → 54 pass, 0 fail,
+   **0 underruns** in all four windows (solo + loopback room, both pages). `?bench=1` now
+   reports `audio: { baseLatencyMs, outputLatencyMs, underruns, missingMs, backlogMs }` per
+   window, and Genesis is in the bench. **Not yet measured on the phone itself:** the 216 ms
+   figure needs a fresh "Copy debug" from that device to confirm what `'interactive'` gives there.
+2. **Stalls — cause found and fixed in `lib/netplay.js` (f538fe0).** The room's numbers were
+   reproduced without a browser (`tools/netplay_rb_pace_sim.mjs rb-2p-127rtt`: 58 ms + 0–20 ms
+   jitter each way, a 2% heavy tail of up to +60 ms, 2% loss, 110 s → 16 stalls, 451 ms).
+   It was not the host's pacing and not the own-clock rule. Four causes:
+   - **The window was sized from the wrong number.** The "late p99 9 / max 10" in the report
+     is lateness *when an input arrives*. The window is checked on every frame, and between
+     two arrivals the frontier keeps ageing. The host's acknowledgement (which a guest's window
+     is also measured against) is sent with every other input message, and a lost message
+     doubles the gap. Every stall after the start sat at `frame − frontier = window + 1` while
+     the arrival maximum read `window − 2`. Each frame now also records the frontier's age, and
+     a window stall grows the window at once.
+   - **A direct room started at 8 frames.** Only relay rooms told the engine the path; a P2P
+     room started at the page's 8-frame window and stalled until reports grew it (15 of 16 sim
+     stalls were in the first 3 s). The host now pings each guest in the lobby
+     (`Session._lobbyPing`), and the first window covers the **round trip**.
+   - **A phone lost its margin.** The 3-frame jitter margin was cut to 1 for a 4 ms/step
+     device, which turned jitter into stalls. Now it is cut only when a full-window
+     re-simulation would take more than 4 display ticks.
+   - Shrinking the window now requires that the smaller window covers the worst sample, not the
+     p99. Two-player rooms send 4 frames of input redundancy instead of 3.
+   - "Waiting on port 0" is not evidence about the host. A guest's stall always names the
+     host's port, including when what it waits on is the host's acknowledgement.
+
+   **Measured, before → after:**
+
+   | Rig | Before (2b3adee engine) | After |
+   |---|---|---|
+   | sim `rb-2p-127rtt`, seed 11, 110 s | 16 stalls / 451 ms | 0 |
+   | sim, 10 seeds × 3 cells (127 ms; phone guest at 4 ms/step; 5% loss) | — | 0 stalls in 27 of 30; the other 3: one lost `lsgo` delaying a start (2 seeds), one 34 ms stall at 5% loss |
+   | two browsers, `netplay_device_matrix --arms r127`, Genesis (Sonic 3), 110 s | joiner 33 stalls / 845 ms (21 after the first 3 s) | 2 + 2 stalls (87 / 227 ms), **all in the first 2 s of play**; 0 after |
+   | same, SNES (SimCity) | joiner 15 stalls / 462 ms (11 after 3 s) | 3 / 128 ms: 2 in the first 2 s, 1 × 15 ms at 68 s |
+
+   All runs: rollback, delay 0, 0.998–1.001x, 0 desyncs (111–112 hashes compared in the
+   browser cells), own-clock lead max ≤ 1.1 frames in the sim. Box load 8.8–10.9 during the
+   browser cells (shared box), and the disk gate was lowered (`NPDM_MIN_FREE_GB=2`, 4.1 GB free).
+   **Still open:** the stalls in the first ~2 s of the browser rooms. Both consoles stall at the
+   same frame there (host on the guest's input, guest on the host's acknowledgement). That fits
+   the two emulators' start-up hitches on a shared 4-core box. It is not proven, and a real
+   two-device room has to show whether those stalls happen there too.
+
+   **Cross-console suites after the engine change (netplay.js c0642f6f):** Node:
+   netplay_rollback 28/28, rb_capacity 26/26, lockstep 152/152, delay_stepdown 26/26,
+   rb_advantage, rb_drop, rb_outage, redundancy, pace_verdict, rejoin_session, rb_msgcost 4/4
+   (2p 79.6 B/frame against 80.0 before adaptive rooms), rb_pace_sim 15/15, snes_rollback_probe
+   19/19. Browser: ps1_netplay_test 26/26, gc_rollback_det_test 7/7, N64 lockstep_probe GATE
+   PASS. gc_netplay_room_test (600 s) **passed 20/20 on one run and failed 19/20 on another**:
+   `never-past-its-own-wall-clock`, host page-sampler lead max 2.95 at 0.6 s (engine ownClock
+   leadMax 2.58), against a 2-frame bar. The old engine passed in the one run it got (max 1.16).
+   On the failing run the room opened at a 23-frame window on a ~0 ms loopback link, because
+   the lobby pings were answered while both pages were still loading. A suspected mechanism,
+   not a proven one: a wider opening window lets the page's opening credit burst through,
+   where an 8-frame window used to stall it. Open, needs more runs.
+
+   **Follow-up (dd5308d).** gc_netplay_room_test, 60 s runs, interleaved f538 → old → fix × 4,
+   load 4.2–6.7. Lead max per run, page sampler host/p2 (engine ownClock host/p2):
+
+   | Run | f538fe0 (window 19–22) | 2b3adee (window 8) | dd5308d fix (window 22–25) |
+   |---|---|---|---|
+   | 1 | 1.51 / 0.91 (0.84 / 0.14) | 1.08 / 1.25 (0.41 / 0.71) | 0.63 / 1.23 (0.34 / 0.21) |
+   | 2 | 0.83 / 0.69 (0.29 / 0.18) | 1.01 / 0.73 (0.41 / 0.23) | 0.42 / 0.20 (0.67 / −0.41) |
+   | 3 | 1.86 / 1.41 (1.64 / 0.54) | 0.52 / 1.62 (0.62 / 0.35) | 1.73 / 0.98 (0.54 / −0.15) |
+   | 4 | 1.32 / 1.50 (0.89 / 0.02) | 1.06 / 1.45 (0.50 / 0.27) | 0.84 / 1.97 (0.30 / 0.55) |
+
+   All 12 runs: 20/20, every lead under 2. The 2.95 did not reproduce in 4 more f538 runs. One
+   difference remains: in the wide-window arms the page sampler's peaks fall mid-room (13–55 s,
+   up to 1.97) rather than at the release. The engine's own clock stays ≤ 0.67 on the fix arm.
+   The fix does not depend on reproducing it. `OC_CAP`: no frame, credited or hidden, begins
+   while the engine's ownClock lead exceeds 1.5. The sim case that read 2.1 (a lost `lsgo`)
+   now reads 1.50, and the full 600 s gc room on the fix reads max 0.30 / 1.33 (engine 0.34 /
+   0.02), 20/20.
+   `RB_START_EXTRA`: +4 frames on the first window. In the sim, 30 seeds × 110 s go from 7 stalls
+   to 0. In the r127 two-browser rig (fixed engine, single runs, load 8.3–9.2): Genesis host 0,
+   joiner 3 stalls / 68 ms; SNES host 0, joiner 2 / 51 ms (frame 65, plus one 15 ms stall at
+   86 s). Down from 33 / 845 ms and 15 / 462 ms before the change. The start-up stalls (frames
+   48–65) persist at a 22–24 frame window, which means 370+ ms of lateness: a page hitch, not the
+   link. Pre-warming would have to happen in the pages.
+   Suites on dd5308d: all Node suites pass; ps1_netplay 26/26, gc_rollback_det 7/7,
+   gc_netplay_room 20/20 (600 s), N64 lockstep_probe GATE PASS.
 
 ## How to add an entry
 

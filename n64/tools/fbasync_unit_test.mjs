@@ -41,6 +41,10 @@ const root = path.resolve(path.dirname(__filename), '../..');
 const src = fs.readFileSync(path.join(root, 'n64/N64Wasm/dist/fbasync.js'), 'utf8');
 if (src.indexOf('__n64InstallFbAsync') < 0) { console.error('n64/N64Wasm/dist/fbasync.js does not define __n64InstallFbAsync'); process.exit(2); }
 const shim = src + "\n;window.__n64InstallFbAsync(window, '?fbasync=1&fbwitness=1');";
+// --webgl1: the same contract on a WebGL1 context (no pack buffers, no fences — the n64 core's
+// fallback where WebGL2 is missing, n64/N64Wasm/dist/glcompat.js). Every frame-offset assertion
+// is the same; the two that measure GPU timing at the read point (fences) do not apply.
+const W1 = process.argv.includes('--webgl1');
 
 // protocolTimeout: the three regimes run in ONE evaluate, and the busy ones draw a
 // deliberately heavy shader on SwiftShader — under load that outlasts puppeteer's
@@ -56,17 +60,18 @@ try {
   const errs = []; page.on('pageerror', (e) => errs.push(e.message));
   await page.goto('about:blank');
   await page.evaluate(shim);
-  const res = await page.evaluate(async () => {
+  const res = await page.evaluate(async (W1) => {
     const W = 640, H = 480;
     const c = document.createElement('canvas'); c.width = W; c.height = H; document.body.appendChild(c);
-    const gl = c.getContext('webgl2', { antialias: false, preserveDrawingBuffer: false });
+    const gl = c.getContext(W1 ? 'webgl' : 'webgl2', { antialias: false, preserveDrawingBuffer: false });
+    if (W1 && (typeof WebGL2RenderingContext === 'function' && gl instanceof WebGL2RenderingContext)) throw new Error('not a WebGL1 context');
     const col = (k) => [(k * 37) & 255, (k * 11 + 5) & 255, (k * 3 + 7) & 255];
     // A heavy pass that leaves the pixels EXACTLY the clear colour: the loop's
     // result can never reach the step threshold, but the compiler cannot know.
     const vs = '#version 300 es\nvoid main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);gl_Position=vec4(p*2.0-1.0,0,1);}';
     const fs = '#version 300 es\nprecision highp float;uniform vec4 u;uniform float n;out vec4 o;void main(){float a=0.0;for(float i=0.0;i<n;i+=1.0){a+=sin(gl_FragCoord.x*i+a)*cos(gl_FragCoord.y+i);}o=u+vec4(step(1e30,abs(a)));}';
     const sh = (t, s) => { const x = gl.createShader(t); gl.shaderSource(x, s); gl.compileShader(x); return x; };
-    const prog = gl.createProgram(); gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(prog);
+    const prog = gl.createProgram(); if (!W1) { gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(prog); }
     const HEAP = new Uint8Array(W * H * 4 + 8192), IDX = 4096;
     const st = window.__fbAsync;
     const frame = (k, heavy) => {
@@ -74,7 +79,7 @@ try {
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, W, H);
       gl.clearColor(r / 255, g / 255, b / 255, 1); gl.clear(gl.COLOR_BUFFER_BIT);
-      if (heavy) {
+      if (heavy && !W1) {
         gl.useProgram(prog); gl.uniform4f(gl.getUniformLocation(prog, 'u'), r / 255, g / 255, b / 255, 1);
         gl.uniform1f(gl.getUniformLocation(prog, 'n'), 400); gl.drawArrays(gl.TRIANGLES, 0, 3);
       }
@@ -158,7 +163,8 @@ try {
     R.glError = gl.getError();
     R.seqLen = st.seq.length;
     return R;
-  });
+  }, W1);
+  console.log('[fbasync-unit] context: ' + (W1 ? 'WebGL1 (--webgl1)' : 'WebGL2'));
   for (const k of ['idle', 'busy', 'prefetch']) {
     const r = res[k];
     r.wrong.length === 0
@@ -166,10 +172,12 @@ try {
       : bad(`${k}: wrong frame handed over`, JSON.stringify(r.wrong.slice(0, 5)));
   }
   const fi = res.idle.blocked / Math.max(1, res.idle.async), fb = res.busy.blocked / Math.max(1, res.busy.async);
-  (fb - fi >= 0.5)
+  if (W1) ok('WebGL1: no fences — the read-point timing check does not apply (the copy is synchronous by construction)');
+  else (fb - fi >= 0.5)
     ? ok('the two regimes really differ at the read point', `fence unsignalled: idle ${(fi * 100).toFixed(0)}% vs busy ${(fb * 100).toFixed(0)}%`)
     : bad('VOID: the regimes did not differ at the read point, so this proves nothing about GPU timing', `idle ${(fi * 100).toFixed(0)}% vs busy ${(fb * 100).toFixed(0)}%`);
-  (res.prefetch.early === res.prefetch.async && res.prefetch.async === res.prefetch.n - 1 && res.busy.early === 0)
+  if (W1) ok('WebGL1: no prefetch accounting — every copy is already on the CPU side');
+  else (res.prefetch.early === res.prefetch.async && res.prefetch.async === res.prefetch.n - 1 && res.busy.early === 0)
     ? ok('prefetch: every async hand-over came from the early read; none without it', `prefetch ${res.prefetch.early}/${res.prefetch.async}, busy ${res.busy.early}`)
     : bad('prefetch was not exercised as claimed', JSON.stringify({ prefetch: [res.prefetch.early, res.prefetch.async], busy: res.busy.early }));
   (res.rectSwitchOwn && res.rectSwitchNext && res.lastInvalidation === 'rect')

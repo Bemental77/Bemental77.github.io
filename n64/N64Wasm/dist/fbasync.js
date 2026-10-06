@@ -89,9 +89,17 @@
     else { st.on = !!hit; st.decided = hit ? 'read_always title (' + hit + ')' : 'off — glide does not read this title back every frame'; }
     return st.on;
   };
-  if (G.WebGL2RenderingContext) {
+  // ⚠ BOTH CONTEXT CLASSES (2026-10-06). The core runs on WebGL1 where WebGL2 is missing
+  // (glcompat.js). A WebGL1 context has no pixel-pack buffers and no fences, so there the
+  // "copy" is the synchronous readPixels into a CPU-side buffer — and THE OFFSET IS THE SAME:
+  // the core is handed the PREVIOUS call's bytes, exactly as on WebGL2. That is what keeps a
+  // WebGL1 console and a WebGL2 console the same console in a room (the mode is part of the
+  // disc tag); only the cost differs (it waits, as the old synchronous read did).
+  // isW1(gl): no pack buffers on this context.
+  var W1C = G.WebGLRenderingContext;
+  var isW1 = function (gl) { return !!(W1C && gl instanceof W1C); };
+  if (G.WebGL2RenderingContext || G.WebGLRenderingContext) {
     (function () {
-      var P = WebGL2RenderingContext.prototype, orig = P.readPixels;
       var st = G.__fbAsync, ctxs = [], hooked = false;
       // A pack buffer: { gl, buf, bytes, key, fence, refs }. refs counts the
       // owners — "pending" (the next call hands it over) and every snapshot
@@ -102,6 +110,7 @@
       };
       var unref = function (b) {
         if (!b || --b.refs > 0) return;
+        if (b.w1) { var fb1 = fbOf(b.gl); if (fb1.pool.length < 16) { fb1.pool.push(b); st.pool = fb1.pool.length; } return; }
         if (b.fence) { try { b.gl.deleteSync(b.fence); } catch (e) {} b.fence = null; }
         var fb = fbOf(b.gl);
         if (fb.pool.length < 16) { fb.pool.push(b); st.pool = fb.pool.length; }
@@ -110,6 +119,7 @@
       var acquire = function (gl, bytes, key) {
         var fb = fbOf(gl), b = null;
         for (var i = 0; i < fb.pool.length; i++) if (fb.pool[i].bytes === bytes) { b = fb.pool.splice(i, 1)[0]; break; }
+        if (!b && isW1(gl)) b = { gl: gl, w1: true, buf: null, cpu: new Uint8Array(bytes), bytes: bytes, key: key, fence: null, refs: 0 };
         if (!b) {
           b = { gl: gl, buf: gl.createBuffer(), bytes: bytes, key: key, fence: null, refs: 0 };
           gl.bindBuffer(gl.PIXEL_PACK_BUFFER, b.buf);
@@ -209,8 +219,11 @@
         for (var i = from; i < from + bytes; i += 61) hsh = Math.imul(hsh ^ u8[i], 16777619) >>> 0;
         if (st.seq.length < 40000) st.seq.push([st.calls, hsh, mode, blocked ? 1 : 0]);
       };
+      var hookRead = function (P) {
+      var orig = P.readPixels;
+      if (typeof orig !== 'function') return;
       P.readPixels = function (x, y, w, h, format, type, dst, dstIndex) {
-        var gl = this;
+        var gl = this, w1 = isW1(gl);
         if (!st.on && !st.seq) return orig.apply(gl, arguments);
         // ⚠ A ZERO-AREA READ IS NOT A READ. DK64's first readback is (0,480,
         // 640x0). Taken through a pack buffer it created a 0-byte
@@ -223,7 +236,7 @@
         st.calls++;
         if (!hooked) hookCore();
         if (st.bypass || arguments.length < 7 || !dst || typeof dst !== 'object' || !dst.buffer ||
-            format !== gl.RGBA || type !== gl.UNSIGNED_BYTE || gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING)) {
+            format !== gl.RGBA || type !== gl.UNSIGNED_BYTE || (!w1 && gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING))) {
           st.sync++; return orig.apply(gl, arguments);
         }
         var bytes = w * h * 4;
@@ -256,6 +269,15 @@
         }
         // 2. start this call's copy into a free pack buffer — no wait
         var cur = acquire(gl, bytes, key);
+        if (cur.w1) {
+          // WebGL1: the copy is made now, synchronously, into the buffer's CPU side.
+          orig.call(gl, x, y, w, h, format, type, cur.cpu);
+          cur.cpuOk = true;
+          if (!prev) { dstView.set(cur.cpu); st.sync++; if (u8) witness(x, y, w, h, u8, dstByte, bytes, 0, false); fb.pending = cur; return; }
+          unref(prev); fb.pending = cur; st.async++;
+          if (u8) witness(x, y, w, h, u8, dstByte, bytes, 1, false);
+          return;
+        }
         gl.bindBuffer(gl.PIXEL_PACK_BUFFER, cur.buf);
         orig.call(gl, x, y, w, h, format, type, 0);
         cur.fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
@@ -276,6 +298,9 @@
         st.async++;
         if (u8) witness(x, y, w, h, u8, dstByte, bytes, 1, blocked);
       };
+      };
+      if (G.WebGL2RenderingContext) hookRead(G.WebGL2RenderingContext.prototype);
+      if (G.WebGLRenderingContext) hookRead(G.WebGLRenderingContext.prototype);
     })();
   }
     return G.__fbAsync;

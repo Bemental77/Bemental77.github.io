@@ -14,7 +14,7 @@
        lets tools/device_matrix.mjs ask every page the same questions. Loaded before <base>
        so its own absolute paths are unambiguous. -->
   <script src="/lib/capability.js?v=e25dca87"></script>
-  <script src="/lib/bench.js?v=b6dbb11b"></script><!-- ?bench=1 real-device benchmark; inert without it -->
+  <script src="/lib/bench.js?v=e533021b"></script><!-- ?bench=1 real-device benchmark; inert without it -->
   <script src="/lib/xboxinput.js"></script>
   <!-- ONLINE PLAY — DETERMINISTIC LOCKSTEP. Inert unless Netplay.supported(),
        and it does nothing at all without ?np=<code> in the URL, which is what
@@ -26,7 +26,7 @@
        the wire. The file still exists because sibling pages have not been
        converted yet; loading it here would ship a second, contradictory online
        architecture on a page that has one. -->
-  <script src="/lib/netplay.js?v=fca3c5ea"></script>
+  <script src="/lib/netplay.js?v=bb106f86"></script>
   <script src="/lib/mpgames.js"></script>
   <script>MPGames.gateParty('n64', ['btnNet', 'mobileSplashNet'], ['romSelect', 'mobileRomSelect']);</script>
   <script>
@@ -1622,9 +1622,10 @@ N64Rate.selfTest = function (logFn) {
   return { pass: pass, fail: fail, lines: lines, summary: summary };
 };
 </script>
-<script src="/n64/N64Wasm/dist/fbasync.js?v=a23cd08f"></script>
+<script src="/n64/N64Wasm/dist/glcompat.js?v=7939955f"></script>
+<script src="/n64/N64Wasm/dist/fbasync.js?v=f3425fa3"></script>
 <script src="/n64/N64Wasm/dist/jit_params.js?v=bb2930f6"></script>
-<script src="/n64/N64Wasm/dist/room_core.js?v=cab66b1f"></script>
+<script src="/n64/N64Wasm/dist/room_core.js?v=39369d15"></script>
 <script>
 (function () {
   'use strict';
@@ -1800,6 +1801,9 @@ N64Rate.selfTest = function (logFn) {
   // witness bypasses it.
   // The implementation lives in /n64/N64Wasm/dist/fbasync.js (shared with the
   // worker-hosted core, core_worker.js) — one implementation for both realms.
+  // THE CORE'S GL CONTEXT: WebGL2, or WebGL1 where WebGL2 is missing (Edge on Xbox, 2026-10-06).
+  // Installed before main() can run, in this realm; the core worker installs its own copy.
+  window.__n64InstallGLCompat(window, location.search);
   window.__n64InstallFbAsync(window, location.search);
   // NATIVE-RESOLUTION READBACK (core: glitchmain.c grLfbReadSampled). On a
   // read_always title the core now point-samples the frame ON THE GPU and
@@ -1828,7 +1832,20 @@ N64Rate.selfTest = function (logFn) {
       var gl = c.getContext('webgl2', { alpha: false, antialias: false, depth: true, stencil: false });
       glFacts.webgl2 = !!gl;
       if (!gl) {
-        glFacts.webgl1 = !!(c.getContext('webgl') || c.getContext('experimental-webgl'));
+        // a FRESH canvas: one that returned a context stays bound to that kind
+        var c1 = document.createElement('canvas'); c1.width = c1.height = 1;
+        var c2 = document.createElement('canvas'); c2.width = c2.height = 1;
+        glFacts.webgl2Relaxed = !!c2.getContext('webgl2', { failIfMajorPerformanceCaveat: false });
+        var g1 = c1.getContext('webgl', { failIfMajorPerformanceCaveat: false }) || c1.getContext('experimental-webgl');
+        glFacts.webgl1 = !!g1;
+        if (g1) {
+          var dbg1 = g1.getExtension('WEBGL_debug_renderer_info');
+          glFacts.renderer = dbg1 ? g1.getParameter(dbg1.UNMASKED_RENDERER_WEBGL) : g1.getParameter(g1.RENDERER);
+          glFacts.version = g1.getParameter(g1.VERSION);
+          glFacts.ext1 = ['OES_vertex_array_object', 'OES_element_index_uint', 'WEBGL_depth_texture', 'OES_texture_float']
+            .map(function (n) { return n + '=' + (g1.getExtension(n) ? 'y' : 'n'); }).join(' ');
+          var l1 = g1.getExtension('WEBGL_lose_context'); if (l1) l1.loseContext();
+        }
         return;
       }
       var dbg = gl.getExtension('WEBGL_debug_renderer_info');
@@ -1873,13 +1890,16 @@ N64Rate.selfTest = function (logFn) {
   var VENDOR_DEPS = { jQuery: () => !!window.jQuery, rivets: () => !!window.rivets, toastr: () => !!window.toastr, FileSaver: () => !!window.saveAs };
   function glLine() {
     if (glFacts.skipped) return '[gl] probe skipped (?noglprobe)';
-    if (!glFacts.webgl2) return '[gl] WebGL2 = NO' + (glFacts.webgl1 ? ' (WebGL1 present)' : ' (no WebGL at all)')
-      + (glFacts.error ? ' err=' + glFacts.error : '');
+    var core = window.__n64GL ? '\n[gl] core context: ' + (window.__n64GL.decided || 'not created yet')
+      + (window.__n64GL.tries.length ? '  (' + window.__n64GL.tries.join(', ') + ')' : '') : '';
+    if (!glFacts.webgl2) return '[gl] WebGL2 = NO' + (glFacts.webgl2Relaxed ? ' (but granted with relaxed attributes)' : '')
+      + (glFacts.webgl1 ? '  WebGL1 = yes  gpu=' + glFacts.renderer + '  ' + glFacts.version + '\n[gl] ' + glFacts.ext1 : ' (no WebGL at all)')
+      + (glFacts.error ? ' err=' + glFacts.error : '') + core;
     return '[gl] WebGL2 = yes  gpu=' + glFacts.vendor + ' / ' + glFacts.renderer
       + '\n[gl] limits maxTex=' + glFacts.maxTex + ' maxRb=' + glFacts.maxRb + ' texUnits=' + glFacts.maxTexUnits
       + ' maxViewport=' + glFacts.maxViewport
       + '\n[gl] colour+depth FBO completes = ' + (glFacts.fboComplete ? 'yes' : 'NO')
-      + '  glError=' + glFacts.glError + '  ' + glFacts.version;
+      + '  glError=' + glFacts.glError + '  ' + glFacts.version + core;
   }
   function envLine() {
     var n = navigator, yn = (v) => (v ? 'yes' : 'NO');
@@ -1901,8 +1921,8 @@ N64Rate.selfTest = function (logFn) {
   // the part that survives a screenshot.
   function verdictLine() {
     if (glFacts.skipped) return '>> GPU PROBE SKIPPED (?noglprobe) — no GPU evidence in this report.';
-    if (!glFacts.webgl2) return '>> NO WEBGL2 ON THIS DEVICE. The N64 core is linked MIN_WEBGL_VERSION=2 '
-      + '(N64Wasm/code/Makefile:187) and cannot start without it. This is almost certainly the whole story.';
+    if (!glFacts.webgl2 && !glFacts.webgl1 && !glFacts.webgl2Relaxed) return '>> NO WEBGL AT ALL ON THIS DEVICE (neither WebGL2 nor WebGL1). '
+      + 'The N64 picture cannot be drawn without one. This is almost certainly the whole story.';
     if (glFacts.fboComplete === false) return '>> WEBGL2 PRESENT BUT A COLOUR+DEPTH FRAMEBUFFER DOES NOT COMPLETE. '
       + 'glide2gl renders through exactly that; expect a black or garbage picture.';
     if (counters.glContextLost) return '>> WEBGL CONTEXT WAS LOST (' + counters.glContextLost + 'x). '
@@ -2458,7 +2478,7 @@ N64Rate.selfTest = function (logFn) {
   // logged. If the worker fails while it boots (no WebGL2 there after all, a
   // core abort before "Starting R4300"), the page reloads ONCE with ?worker=0
   // (wkFallback) and says so in its log.
-  var WK_V = 'ef39401c';                           // cache-buster for the worker's scripts
+  var WK_V = 'ef4ccb03';                           // cache-buster for the worker's scripts
   var WK_DEFAULT = true;                     // the default for a capable console (solo and rooms)
   var WK = { on: false, why: null, w: null, stat: null, statAt: 0, presents0: 0, pendingAudioPort: null,
              evals: {}, evalId: 0, sent: null, composed: 0, posted: 0, fatal: null, booted: false,
@@ -2478,8 +2498,11 @@ N64Rate.selfTest = function (logFn) {
     if (!cv || typeof cv.transferControlToOffscreen !== 'function') return 'this browser cannot hand a canvas to a worker (no transferControlToOffscreen)';
     if (typeof AudioWorkletNode !== 'function') return 'no AudioWorklet — the worker feeds audio only through one';
     try {
+      // WebGL1 inside the worker is enough (glcompat.js); refuse only when the worker can have
+      // neither — and the worker's own boot preflight still falls back to this thread if it lied.
+      var wo = window.__cap && window.__cap.webgl2 && window.__cap.webgl2.workerOffscreen;
       if (window.Capability && Capability.REQ && Capability.REQ.webgl2Worker && window.__cap && window.__cap.webgl2
-          && !Capability.REQ.webgl2Worker.has(window.__cap)) return 'WebGL2 inside a worker is not available: ' + Capability.REQ.webgl2Worker.why(window.__cap);
+          && !Capability.REQ.webgl2Worker.has(window.__cap) && !(wo && wo.tested && wo.webgl1)) return 'no WebGL inside a worker: ' + Capability.REQ.webgl2Worker.why(window.__cap);
     } catch (e) {}
     return null;
   }
@@ -3293,12 +3316,27 @@ N64Rate.selfTest = function (logFn) {
       // extractRomName keeps the extension ('mariokart.z64'), so match it
       // exactly or saves made on the old page would orphan.
       window.myApp.rom_name = rom.file;
+      // NO GL CONTEXT MEANS NO PICTURE — say so instead of letting the core die on its first GL
+      // call. Reported 2026-10-06 on Edge for Xbox with ?nogate=1: emscripten's context creation
+      // returned 0 and the core's glGetString read GLctx.getParameter off undefined:
+      //   "Load failed: Cannot read properties of undefined (reading 'getParameter')".
+      // The core now falls back to WebGL1 (glcompat.js), so this fires only on a device with no
+      // WebGL of any version. (A worker-hosted core checks the same thing in its boot preflight.)
+      if (!WK.on && window.__n64GL && !window.__n64GL.probe().v) {
+        throw new Error('this device gave no WebGL context (neither WebGL2 nor WebGL1), so the N64 picture cannot be drawn. '
+          + 'Turn on hardware acceleration in the browser settings, or try another browser.');
+      }
       await window.myApp.LoadEmulator(bytes);
       mark('LoadEmulator-returned');
       [$('btnSave'), $('btnLoad'), $('btnExport'), $('btnImport'), $('btnMute'), $('btnReset'), $('btnFull'), $('mSave'), $('mLoad'), $('mExport'), $('mImport'), $('mMute'), $('mReset'), $('mFull')].forEach(b => b && (b.disabled = false));
     } catch (e) {
       pageLog('[rom] load failed: ' + e);
-      setStatus('Load failed: ' + (e.message || e));
+      var msg = String((e && e.message) || e);
+      // A raw GL TypeError is not an explanation: name the GL context the core got (or did not).
+      if (/getParameter|GLctx|getExtension|of null \(reading 'get/.test(msg) && window.__n64GL) {
+        msg = 'the graphics context failed (' + (window.__n64GL.decided || 'no context') + '). Turn on hardware acceleration, or try another browser.';
+      }
+      setStatus('Load failed: ' + msg);
       toast('Load failed', true);
     }
   }

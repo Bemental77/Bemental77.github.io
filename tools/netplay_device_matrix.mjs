@@ -254,6 +254,11 @@ const ARMS = {
   c: { id: 'c', what: 'desktop host + mobile-emulated 4x-throttled JOINER', host: DESKTOP, join: MOBILE },
   d: { id: 'd', what: 'desktop pair, P2P link 100 ms one-way; 2% loss (reliable channel: +200 ms retransmit, head-of-line; unreliable channel: dropped)',
        host: DESKTOP, join: DESKTOP, p2p: { delayMs: 100, lossFrac: 0.02, rtxMs: 200 } },
+  // THE REPORTED ROOM (docs/devices/xbox-edge.md, 2026-10-06): a direct P2P link
+  // at RTT 127 ms with jitter — 53.5 ms + 0-20 ms each way (mean 63.5) — and 2%
+  // loss. The rule here is ZERO stalls (the stalls line), not only the rate.
+  r127: { id: 'r127', what: 'desktop pair, P2P RTT ~127 ms (53.5 + 0-20 ms jitter each way); 2% loss',
+          host: DESKTOP, join: DESKTOP, p2p: { delayMs: 53.5, jitterMs: 20, lossFrac: 0.02, rtxMs: 200 } },
   drelay: { id: 'drelay', what: 'desktop pair, room forced onto RELAY mode; broker 100 ms one-way + 2% loss',
             host: DESKTOP, join: DESKTOP, relay: true, broker: { delayMs: 100, loss: 0.02 } },
   e: { id: 'e', what: 'desktop pair, soak', host: DESKTOP, join: DESKTOP, soak: true },
@@ -537,13 +542,14 @@ function preloadSrc(cfg) {
       if (unreliable) {
         M.p2p.unreliable = (M.p2p.unreliable || 0) + 1;
         if (Math.random() < CFG.p2p.lossFrac) { M.p2p.lost = (M.p2p.lost || 0) + 1; return; }
-        const at = now() + CFG.p2p.delayMs;
-        setTimeout(() => { try { if (ch.readyState === 'open') send.call(ch, data); } catch (e) {} }, CFG.p2p.delayMs);
+        // jitterMs: uniform extra one-way delay per message (unordered: may reorder).
+        const d = CFG.p2p.delayMs + Math.random() * (CFG.p2p.jitterMs || 0);
+        setTimeout(() => { try { if (ch.readyState === 'open') send.call(ch, data); } catch (e) {} }, d);
         return;
       }
       const rtx = Math.random() < CFG.p2p.lossFrac;
       if (rtx) M.p2p.rtx++;
-      const at = Math.max(now() + CFG.p2p.delayMs + (rtx ? CFG.p2p.rtxMs : 0), q.last);
+      const at = Math.max(now() + CFG.p2p.delayMs + Math.random() * (CFG.p2p.jitterMs || 0) + (rtx ? CFG.p2p.rtxMs : 0), q.last);
       q.last = at;
       M.p2p.delayed++;
       setTimeout(() => { try { if (ch.readyState === 'open') send.call(ch, data); } catch (e) {} }, Math.max(0, at - now()));

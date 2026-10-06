@@ -694,8 +694,9 @@
     // is shown) skip too: their state is discarded whatever they read.
     var GLSKIP = { on: false, disabled: RB_Q.get('rbgl') === '1' ? 'pinned off (?rbgl=1)' : null,
                    taint: false, reads: 0, calls: 0, frames: 0, redo: 0 };
-    if (G.WebGL2RenderingContext) (function () {
-      var P = WebGL2RenderingContext.prototype;
+    // ⚠ BOTH CONTEXT CLASSES: the core runs on WebGL1 where WebGL2 is missing (glcompat.js), and
+    // a readback this hook did not see would leave GLSKIP skipping draws whose pixels reach RDRAM.
+    [G.WebGL2RenderingContext, G.WebGLRenderingContext].forEach(function (C) { if (C) (function (P) {
       ['drawArrays', 'drawElements', 'drawArraysInstanced', 'drawElementsInstanced', 'drawRangeElements',
        'clear', 'clearBufferfv', 'clearBufferiv', 'clearBufferuiv', 'clearBufferfi', 'blitFramebuffer'].forEach(function (n) {
         var f = P[n];
@@ -715,7 +716,7 @@
         }
         return rp.apply(this, arguments);
       };
-    })();
+    })(C.prototype); });
     function glSkipOk() {
       var st = G.__fbAsync || {};
       return !GLSKIP.disabled && !st.on && !st.readAlways;
@@ -773,7 +774,8 @@
     var RFS = { on: !!env.fs && RB_Q.get('rfskip') !== '0', why: null, skipped: 0, hiddenSkipped: 0, resimSkipped: 0,
                 reruns: 0, rerunFrames: 0, rerunMs: 0, maxRerunMs: 0, repairs: 0, readbacks: 0, lost: 0,
                 suspendUntil: -1, backoff: 64, need: Infinity, stale: false, staleS: -1, inRerun: false, inResim: false,
-                head: -1, cur: -1, curSkip: false, linear: 0, staleIdle: 0, idleRepairs: 0, gaps: new Int32Array(16), gapN: 0, gapRun: 0 };
+                head: -1, cur: -1, curSkip: false, linear: 0, staleIdle: 0, idleRepairs: 0, gaps: new Int32Array(16), gapN: 0, gapRun: 0,
+                lateSkips: 0, drewAt: 0 };
     function rfsGapMax() { var m = 0; for (var i = 0; i < 16; i++) if (RFS.gaps[i] > m) m = RFS.gaps[i]; return m; }
     if (!RFS.on) RFS.why = env.fs ? 'off (?rfskip=0)' : 'not in this realm (main-thread core)';
     function rfsLive() { return RFS.on && !!env.fs && env.fs.ok(); }
@@ -810,8 +812,33 @@
     function rfsWant(kind, k) {
       if (!rfsAble(kind, k)) return false;
       var f = env.fs.force();
-      if (kind === 'present') return f ? (k % f) !== 0 : (env.fs.behind() && env.fs.expect());
+      if (kind === 'present') return f ? (k % f) !== 0 : ((env.fs.behind() && env.fs.expect()) || rfsLate());
       return f ? true : env.fs.behind();
+    }
+    // ---- A CONSOLE BEHIND ITS OWN WALL CLOCK DOES NOT PRESENT EVERY FRAME OF THE CATCH-UP ----
+    // MEASURED (2026-10-06, bench loopback room, SM64, Chrome's default renderer = headless ANGLE on
+    // Vulkan/SwiftShader; hermetic snapshot, probe lock, load 3.5-4.4; every worker task timed):
+    // in the slow seconds the core worker sat OWED a frame and ran NO JavaScript for 13-81 ms at a
+    // time, ~25 times a second (~500 ms/s, 5-6% of it JS) — not the core (its frames 3-7 ms), not
+    // the commit yield or the repay spacing (their timers did not fire: the thread was blocked
+    // outside JS, in the canvas's presentation). Under --use-angle=swiftshader: no such gap over
+    // 10.4 ms. One late frame (a 47-77 ms block) put the room past the two-period allowance; the
+    // catch-up then presented every frame it ran, which is what the blocked presentation could not
+    // take, so it repaid at ~1.05x instead of up to 2x, the debt sat at the 250 ms cap for seconds
+    // and every further block past the cap was lost for good (0.74-0.89x seconds, 47-58 ms lost).
+    // So a presented frame run while this console is more than two periods behind its schedule
+    // skips its draws (the frame skip above: the guest is bit-identical, a read-back re-runs), except
+    // that a picture is still drawn at least every RFS_LATE_SHOW ms. With nothing to present the
+    // catch-up runs at the repay rule's own pace (gate 9 untouched: no frame runs before its slot).
+    // Same box, same arm: room 0.9926-0.9963x with 47-85 ms lost -> 0.9996x, 0 lost.
+    // ?fskiplate=0 is the arm (every catch-up frame presented, as before).
+    var RFS_LATE = RB_Q.get('fskiplate') !== '0', RFS_LATE_SHOW = 100;
+    function rfsLate() {
+      if (!RFS_LATE || !(LS.viHz > 0) || !LS.baseWall) return false;
+      var period = 1000 / LS.viHz / ((LS.pace > 0 && LS.pace <= 1) ? LS.pace : 1), now = performance.now();
+      if (now - (LS.baseWall + (LS.frame - LS.baseFrame) * period) <= period * 2) return false;
+      if (now - RFS.drewAt > RFS_LATE_SHOW) return false;
+      RFS.lateSkips++; return true;
     }
     // Around one neil_ls_run_frame of the ring (rbStep).
     function rfsBegin(kind, k) {
@@ -828,7 +855,7 @@
         // (as solo: the newest skipped frame — a re-run redraws it over the last picture drawn)
         if (r.sw) { RFS.stale = true; RFS.staleS = k; RFS.staleIdle = 0; }
         else if (RFS.stale && kind === 'present') RFS.staleIdle++;
-      } else if (r.drew) { RFS.stale = false; RFS.staleIdle = 0; }
+      } else if (r.drew) { RFS.stale = false; RFS.staleIdle = 0; if (kind === 'present') RFS.drewAt = performance.now(); }
       else if (RFS.stale && kind === 'present') RFS.staleIdle++;
       // the title's own cadence: the longest run of presented frames without a picture between two
       // with one (drawn or skipped with draws), over the last 16 pictures — a 30 fps game 1, 20 fps 2
@@ -908,7 +935,7 @@
     function rfsReport() {
       return { on: RFS.on, live: rfsLive(), why: RFS.why, skipped: RFS.skipped, hiddenSkipped: RFS.hiddenSkipped, resimSkipped: RFS.resimSkipped,
                reruns: RFS.reruns, rerunFrames: RFS.rerunFrames, rerunMs: Math.round(RFS.rerunMs), maxRerunMs: +RFS.maxRerunMs.toFixed(1),
-               repairs: RFS.repairs, idleRepairs: RFS.idleRepairs, readbacks: RFS.readbacks, lost: RFS.lost, linear: RFS.linear, suspendedUntil: RFS.suspendUntil,
+               repairs: RFS.repairs, idleRepairs: RFS.idleRepairs, lateSkips: RFS.lateSkips, readbacks: RFS.readbacks, lost: RFS.lost, linear: RFS.linear, suspendedUntil: RFS.suspendUntil,
                linearFs: env.fs && env.fs.report ? env.fs.report() : null };
     }
 
@@ -2007,15 +2034,16 @@
       // context the core already created (getContext returns the existing one —
       // safe here because a frame has just run, so it exists).
       var M = G.Module, gl = M && M.ctx;
-      if (!gl) { try { gl = env.canvas().getContext('webgl2'); } catch (e) { gl = null; } }
+      if (!gl) { try { gl = env.canvas().getContext((G.__n64GL && G.__n64GL.v === 1) ? 'webgl' : 'webgl2'); } catch (e) { gl = null; } }
       if (!gl || typeof gl.readPixels !== 'function') return;
       if (gl.isContextLost && gl.isContextLost()) { LS_GL.lost = true; return; }
       try {
         var W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
         if (!(W > 8 && H > 8)) return;
-        var rfb = gl.getParameter(gl.READ_FRAMEBUFFER_BINDING);
-        var ppb = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
-        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+        var RFB = gl.READ_FRAMEBUFFER || gl.FRAMEBUFFER;                       // WebGL1: one binding
+        var rfb = gl.getParameter(gl.READ_FRAMEBUFFER_BINDING || gl.FRAMEBUFFER_BINDING);
+        var ppb = gl.PIXEL_PACK_BUFFER_BINDING ? gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING) : null;
+        gl.bindFramebuffer(RFB, null);
         if (ppb) gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
         var px = new Uint8Array(4 * 16), lit = false;
         // One 16-pixel row through the middle third of the picture.
@@ -2023,7 +2051,7 @@
         try { gl.readPixels((W >> 1) - 8, H >> 1, 16, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); }
         finally { if (G.__fbAsync) G.__fbAsync.bypass = false; }
         for (var i = 0; i < px.length; i += 4) if (px[i] + px[i + 1] + px[i + 2] > 24) { lit = true; break; }
-        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, rfb);
+        gl.bindFramebuffer(RFB, rfb);
         if (ppb) gl.bindBuffer(gl.PIXEL_PACK_BUFFER, ppb);
         LS_GL.reads++; if (lit) LS_GL.lit++;
       } catch (e) { LS_GL.err = (e && e.message) || String(e); }

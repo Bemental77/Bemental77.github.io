@@ -3,7 +3,7 @@
 <head>
   <script src="/lib/debugreport.js?v=94ec9928"></script>
   <script src="/lib/capability.js?v=e25dca87"></script>
-  <script src="/lib/bench.js?v=b6dbb11b"></script><!-- ?bench=1 real-device benchmark; inert without it -->
+  <script src="/lib/bench.js?v=e533021b"></script><!-- ?bench=1 real-device benchmark; inert without it -->
   <script src="/lib/xboxinput.js"></script>
   <!-- THE LOCKSTEP ENGINE, AND ONLY IT.
        /lib/netplay-host.js and /lib/netplay-guest.js are the two halves of
@@ -17,7 +17,7 @@
        returned a hardcoded 0 for every port but 0 — so a room could only ever
        have seated one person. The core now carries five ports and the second
        one is proven live; see the note above runFrame(). -->
-  <script src="/lib/netplay.js?v=fca3c5ea"></script>
+  <script src="/lib/netplay.js?v=bb106f86"></script>
   <!-- the console half of rollback netplay (savestate ring, canonical step,
        re-simulation); tools/snes_rollback_probe.mjs runs this same file -->
   <script src="/snes/snes_rollback.js?v=016de924"></script>
@@ -32,7 +32,7 @@
        no -pthread, no -sSHARED_MEMORY), so cross-origin isolation buys this page
        nothing. Same reasoning as gba.html and n64/index.html. -->
   <script src="/lib/wakelock.js"></script>
-  <script src="/lib/cart_audio.js?v=6f95e7c9"></script>
+  <script src="/lib/cart_audio.js?v=a77bd483"></script>
   <style>
     html, body { margin: 0; padding: 0; height: 100%; background: #111; color: #ddd; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     body { overflow: hidden; }
@@ -1125,7 +1125,14 @@
     if (audioCtx) { if (audioCtx.state !== 'running') audioCtx.resume().catch(() => {}); return; }
     var AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return;
-    try { audioCtx = new AC({ sampleRate: SND_RATE, latencyHint: 'playback' }); }
+    // ⚠ 'interactive', NOT 'playback'. 'playback' asks the OS for a deep output
+    // buffer: on a phone guest (Android Chrome 154, Mali-G715 — the Genesis room
+    // in docs/devices/xbox-edge.md) it measured outputLatency 216 ms, so the
+    // sound trailed the picture by ~0.2 s. The glitch-proofing it bought is the
+    // AudioWorklet's job now (lib/cart_audio.js: its own cushion, off the main
+    // thread, every gap counted in window.__cartAudio); n64/index.html has run
+    // 'interactive' all along.
+    try { audioCtx = new AC({ sampleRate: SND_RATE, latencyHint: 'interactive' }); }
     catch (e) { try { audioCtx = new AC(); } catch (e2) { return; } }
     // ⚠ THE SINK NO LONGER PULLS FROM THE CORE. This used to be a main-thread
     // ScriptProcessor whose callback called _getSoundBuffer() on the AUDIO
