@@ -1314,6 +1314,12 @@
       // write-off only moves the base forward), worst per 1 s window.
       if (-lagNow > paceAheadMs) paceAheadMs = -lagNow;
     }
+    // ⚠ The lag counts in a room even when the frame had to WAIT for its input.
+    // Exempting such frames (they are late because of the room, not this
+    // console's pictures) was measured and rejected: at queue depth 1 almost
+    // every frame waits on this page's own hop, so nothing skipped, and both
+    // consoles dropped 65-264 ms in the second after the step to depth 1
+    // (bench room 0.9877-0.9953, 3 runs).
     fsBegin(t0, lockstep, lagNow);
     let lsAckF = -1;
     try {
@@ -1400,8 +1406,17 @@
       // (debt beyond the cap) for the page's queue-depth rule.
       if (lead > 250) { paceBaseWall = nowW; paceBaseCyc = cyc; }   // state jump (unserialize)
       else if (lead < -CATCHUP_MAX_MS) {
-        const drop = -lead;
-        paceBaseWall += drop; paceDropMs += drop; paceDrops++; paceOverMs += drop - CATCHUP_MAX_MS;
+        // ⚠ NOT IN A ROOM. There the frame clock is the inputs: a console whose
+        // debt passes the cap is almost always one held by a peer that is on
+        // schedule, and moving its whole base would put it BEHIND that peer's
+        // schedule — it then becomes the console the room waits for. Measured:
+        // a 212 ms write-off at a room's start left the two anchors 40-100 ms
+        // apart for the rest of the room, and a later 105 ms one on the other
+        // console cost that window 0.5% (bench room 0.9949). In a room only the
+        // excess is dropped, as before; the room cannot sprint past a peer that
+        // is itself paced to the wall clock.
+        const drop = lockstep ? -lead - CATCHUP_MAX_MS : -lead;
+        paceBaseWall += drop; paceDropMs += drop; paceDrops++; paceOverMs += -lead - CATCHUP_MAX_MS;
         if (-lead > paceMaxLagMs) paceMaxLagMs = -lead;
       } else {
         if (-lead > paceMaxLagMs) paceMaxLagMs = -lead;
