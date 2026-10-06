@@ -144,6 +144,7 @@
     on: true, depth: 0, force: 0, why: '', skipping: false, serial: 0,
     drewNow: false, winStale: false, gl: null, fences: [], skipSince: 0,
     frames: 0, drawn: 0, skipped: 0, swallowed: 0, forcedDraw: 0, taints: 0, reads: 0, disabled: null,
+    lagMs: 17, lagSkips: 0,
   };
   try {
     const W2 = self.WebGL2RenderingContext;
@@ -216,7 +217,21 @@
   // 0.996/0.996 and depth 3 0.993 (each console drew 6-9/s at any depth — the
   // GPU is the limit there). So: 2 alone, 1 in a room.
   function fsDepth(inRoom) { return FSK.depth > 0 ? FSK.depth : (inRoom ? 1 : 2); }
-  function fsBegin(now, inRoom) {
+  // ⚠ A PICTURE THAT THE GUEST CANNOT AFFORD IS NOT DRAWN (2026-10-06).
+  // The fence rule above only sees a picture still RASTERING. Without
+  // --use-angle=swiftshader (stock headless Chrome, and the live bench) the
+  // fences signal at once, yet every drawn frame holds this thread 24-25 ms
+  // solo and ~44 ms per console in a two-console room while the frame is
+  // handed off (paceHeldMs; dreamcast/docs/room-frameskip/TASKS.md, "the
+  // present is slow"). Measured there: emu ~40% + render-hold ~55% of every
+  // second, 22-27 pictures/s solo at 0.98-0.99x, 11-14/s per console in the
+  // room at 0.76-0.81x, the governor dropping 100-460 ms a second. So the
+  // governor's own debt decides too: a frame that starts more than FSK.lagMs
+  // behind the wall clock skips its picture, and the time a draw would have
+  // held goes to catching the guest up. A device with headroom is never
+  // behind (it sleeps), so it never skips on this rule. ?fskiplag=MS (page)
+  // moves the threshold; 0 turns this rule off.
+  function fsBegin(now, inRoom, lagMs) {
     FSK.serial++;
     const gl = FSK.gl;
     if (gl) {
@@ -227,7 +242,10 @@
     let skip = false;
     if (FSK.on && !FSK.disabled) {
       if (FSK.force) skip = (FSK.serial % FSK.force) !== 0;
-      else skip = FSK.fences.length >= fsDepth(inRoom);
+      else {
+        skip = FSK.fences.length >= fsDepth(inRoom);
+        if (!skip && FSK.lagMs > 0 && lagMs > FSK.lagMs) { skip = true; FSK.lagSkips++; }
+      }
       // Backstop: never leave the window unrefreshed for more than 250 ms on a
       // fence that does not signal (the picture would look frozen).
       if (skip && !FSK.force) {
@@ -483,6 +501,10 @@
       coreReady = true;
       maybePostReady();
     }
+    // The heartbeat's window ends at the video_cb that posts it, so the worker's
+    // clock here is the window's end: the page weights each window's rates by
+    // its true length (wt deltas) instead of averaging unequal windows.
+    else if (msg && msg.cmd === 'fps') msg.wt = performance.now();
     if (transfer) _origPostMessage(msg, transfer);
     else _origPostMessage(msg);
   };
@@ -670,13 +692,13 @@
   // Governor accounting per 1 s window, sent with 'ips': guest ms DROPPED
   // (debt beyond CATCHUP_MAX_MS, given up rather than repaid), how many times,
   // and the deepest lag seen. A healthy worker reports 0 dropped.
-  let paceDropMs = 0, paceDrops = 0, paceMaxLagMs = 0;
+  let paceDropMs = 0, paceDrops = 0, paceMaxLagMs = 0, paceOverMs = 0, paceAheadMs = 0;
   function resetPace() {
     paceBaseWall = 0; paceBaseCyc = 0;
     // A rebase (uncap toggle, reset, savestate load) starts a fresh duty
     // window too — a duty number straddling two arms describes neither.
     paceBusyMs = 0; pacePacedMs = 0; paceWindowStart = performance.now();
-    paceDropMs = 0; paceDrops = 0; paceMaxLagMs = 0;
+    paceDropMs = 0; paceDrops = 0; paceMaxLagMs = 0; paceOverMs = 0; paceAheadMs = 0;
   }
   // ---------------------------------------------------------------------------
   // LOCKSTEP PUMP (2026-09-08). Online play used to mean ONE emulator: the host
@@ -705,9 +727,10 @@
   // and the room ran as fast as the inputs arrived: 1.51-1.56x measured
   // (dreamcast.html lsFeed comment). Now the base is KEPT while gated. When the
   // input lands, the ordinary governor below sees the guest behind the wall
-  // clock and repays up to CATCHUP_MAX_MS (100 ms) by running the next frames
-  // with no sleep, never one cycle past the wall clock; anything beyond the cap
-  // is dropped and counted (gov=drop). Over any span since the anchor the guest
+  // clock and repays a debt of up to CATCHUP_MAX_MS (100 ms) by running the next
+  // frames with no sleep, never one cycle past the wall clock; a debt past the
+  // cap is written off whole and counted (gov=drop; 2026-10-06, see the
+  // governor). Over any span since the anchor the guest
   // still runs no faster than the wall clock. ?lsrepay=0 (page) is the control
   // arm: the old rebase-on-stall.
   //
@@ -866,6 +889,7 @@
   try { sleepCell = new Int32Array(new SharedArrayBuffer(4)); } catch (_) { sleepCell = null; }
   let paceSleptMs = 0;     // wall time the pace sleeps actually took (vs pacePacedMs asked)
   let paceHeldMs = 0;      // wall time this thread was held between pump tasks (render backpressure)
+  let paceGateMs = 0;      // wall time between pump tasks while parked on the lockstep gate (no input yet)
   let paceSleepUntil = 0;
   const sleepChannel = new MessageChannel();
   sleepChannel.port1.onmessage = function () {
@@ -884,7 +908,9 @@
   function noteHeld(now) {
     if (pumpTaskEnd) {
       const held = now - pumpTaskEnd - pumpWaitAsked;
-      if (held > 0) paceHeldMs += held;
+      // A gap the pump spent PARKED on the lockstep gate is waiting on the page
+      // or a peer, not render backpressure: counted apart (paceGateMs).
+      if (held > 0) { if (lsStallSince) paceGateMs += held; else paceHeldMs += held; }
       pumpTaskEnd = 0;
     }
   }
@@ -1212,7 +1238,7 @@
           postMessage({ cmd: 'lsStall', f: lsFrame, on: 1 });
         }
         // The governor KEEPS its base across the gap: the stall is owed and the
-        // governor repays at most CATCHUP_MAX_MS of it, never ahead of the wall
+        // governor repays it if it is at most CATCHUP_MAX_MS, never ahead of the wall
         // clock (see THE GUEST RATE above). A queue that empties every frame no
         // longer un-paces the core, because nothing here forgets the lead.
         // ?lsrepay=0 is the control arm (the old rebase, so a stall is lost).
@@ -1280,7 +1306,15 @@
       }
     }
     const t0 = performance.now();
-    fsBegin(t0, lockstep);
+    let lagNow = 0;
+    if (paceBaseWall && !uncap) {
+      try { lagNow = (t0 - paceBaseWall) - (Module._flycast_guest_cycles() - paceBaseCyc) / SH4_HZ * 1000; } catch (_) { lagNow = 0; }
+      // The witness that the guest never runs ahead: how far past the wall
+      // clock a frame ever STARTS (the governor sleeps a lead off first, and a
+      // write-off only moves the base forward), worst per 1 s window.
+      if (-lagNow > paceAheadMs) paceAheadMs = -lagNow;
+    }
+    fsBegin(t0, lockstep, lagNow);
     let lsAckF = -1;
     try {
       Module._emscripten_run_iter();
@@ -1351,15 +1385,23 @@
       // vs the 1.18x the 250 ms window allowed); the cumulative guest clock
       // never passes the wall clock.
       //
-      // Bounded: only CATCHUP_MAX_MS of debt is carried. Beyond it (background
-      // tab, level load, a device that cannot do 1.000x at all) the EXCESS is
-      // dropped — the base moves just enough to leave CATCHUP_MAX_MS owed — so
-      // a stall can never be followed by a long fast-forward, and a device
-      // without headroom runs at its capacity, as before.
+      // Bounded: only a debt up to CATCHUP_MAX_MS is carried. A debt that
+      // passes it (background tab, level load, a boot-seed restore, a device
+      // that cannot do 1.000x at all) is written off WHOLE — the base moves to
+      // the wall clock (2026-10-06). It used to keep CATCHUP_MAX_MS owed and
+      // drop only the excess, so every stall past the cap was followed by a
+      // 100 ms repayment sprint: a 1.10x second, measured right after the boot
+      // seed in the bench's solo window (aicaX 1.062-1.113 in the window after
+      // a 114-315 ms drop), which is how a solo window could read 1.0015-1.0034
+      // with the governor at headroom. A stall that big is already guest time
+      // lost; repaying an arbitrary last 100 ms of it only puts the guest ahead
+      // of 1.000x in the next window. Debt under the cap (a late frame, a late
+      // wake, a lockstep hop) is still repaid. `overMs` keeps the old figure
+      // (debt beyond the cap) for the page's queue-depth rule.
       if (lead > 250) { paceBaseWall = nowW; paceBaseCyc = cyc; }   // state jump (unserialize)
       else if (lead < -CATCHUP_MAX_MS) {
-        const drop = -lead - CATCHUP_MAX_MS;
-        paceBaseWall += drop; paceDropMs += drop; paceDrops++;
+        const drop = -lead;
+        paceBaseWall += drop; paceDropMs += drop; paceDrops++; paceOverMs += drop - CATCHUP_MAX_MS;
         if (-lead > paceMaxLagMs) paceMaxLagMs = -lead;
       } else {
         if (-lead > paceMaxLagMs) paceMaxLagMs = -lead;
@@ -1411,7 +1453,7 @@
     }
   }
 
-  const fsLast = { frames: 0, drawn: 0, skipped: 0 };
+  const fsLast = { frames: 0, drawn: 0, skipped: 0, lagSkips: 0 };
   function setFreerun(on) {
     if (on && !freerun) {
       freerun = true;
@@ -1428,18 +1470,21 @@
                       wallMs: Math.round(wallMs),
                       sleptMs: Math.round(paceSleptMs),
                       heldMs: Math.round(paceHeldMs),
-                      dropMs: Math.round(paceDropMs), drops: paceDrops,
+                      gateMs: Math.round(paceGateMs),
+                      dropMs: Math.round(paceDropMs), drops: paceDrops, overMs: Math.round(paceOverMs),
+                      aheadMs: +paceAheadMs.toFixed(2),
                       maxLagMs: Math.round(paceMaxLagMs),
                       governed: uncap ? 0 : 1,
                       // render-level frame skip, this window: frames run, frames
                       // whose picture was drawn, frames skipped (FSK above)
                       fs: { on: FSK.on && !FSK.disabled ? 1 : 0, frames: FSK.frames - fsLast.frames,
                             drawn: FSK.drawn - fsLast.drawn, skipped: FSK.skipped - fsLast.skipped,
+                            lagSkips: FSK.lagSkips - fsLast.lagSkips, lagMs: FSK.lagMs,
                             forced: FSK.forcedDraw, taints: FSK.taints, reads: FSK.reads,
                             why: FSK.disabled || FSK.why || '' } });
-        fsLast.frames = FSK.frames; fsLast.drawn = FSK.drawn; fsLast.skipped = FSK.skipped;
+        fsLast.frames = FSK.frames; fsLast.drawn = FSK.drawn; fsLast.skipped = FSK.skipped; fsLast.lagSkips = FSK.lagSkips;
         paceWindowStart = nowW; paceBusyMs = 0; pacePacedMs = 0;
-        paceSleptMs = 0; paceHeldMs = 0; paceDropMs = 0; paceDrops = 0; paceMaxLagMs = 0;
+        paceSleptMs = 0; paceHeldMs = 0; paceGateMs = 0; paceDropMs = 0; paceDrops = 0; paceMaxLagMs = 0; paceOverMs = 0; paceAheadMs = 0;
         freerunIters = 0;
         vmuPoll();   // card snapshots ride the existing 1 Hz tick
         lazyPoll();
@@ -2187,6 +2232,7 @@
         if (m === '0') { FSK.on = false; FSK.why = 'off (?fskip=0)'; FSK.skipping = false; }
         else if (/^force:\d+$/.test(m)) { FSK.on = true; FSK.force = Math.max(2, +m.slice(6)); FSK.why = 'rig: all but 1 of ' + FSK.force + ' frames skipped'; }
         else if (+m > 0) { FSK.on = true; FSK.depth = Math.min(4, +m | 0); }
+        if (data.lagMs != null && isFinite(+data.lagMs)) FSK.lagMs = Math.max(0, Math.min(100, +data.lagMs));
         postMessage({ cmd: 'print', txt: '[fskip] ' + (FSK.on ? (FSK.force ? FSK.why : 'ON, depth ' + (FSK.depth || '2 solo / 1 in a room')) : FSK.why) });
         break;
       }
