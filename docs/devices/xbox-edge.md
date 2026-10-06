@@ -29,7 +29,9 @@ Living record of what is MEASURED on Edge for Xbox. Each entry names its evidenc
     without touching the real API, and `gamepadconnected` listeners are queued, until the page
     has user activation (on Xbox the A button is a click). Measured before (matrix, console arm,
     rig activation ON): snes/gba called `getGamepads()` 51-60 times at load; gamecube, ps1, gba
-    and dreamcast added `gamepadconnected` listeners at load.
+    and dreamcast added `gamepadconnected` listeners at load. After: 0 of each on all six pages
+    before the visitor acts (only a TRUSTED click/key releases them — a page's own synthetic
+    keydown released them on four pages until that was checked).
   - `requestPointerLock`, the Keyboard Lock API and fullscreen: none is called at load on any
     page; the matrix counts all of them from the first byte (`window.__grab`).
   - Which of the two prompts the screenshot showed is not provable without the hardware; both
