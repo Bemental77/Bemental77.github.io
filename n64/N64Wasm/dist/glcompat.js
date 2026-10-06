@@ -35,6 +35,7 @@
 //   ?webgl=1     use WebGL1 even where WebGL2 exists — the arm that runs the fallback on any machine
 //   ?webgl=2     WebGL2 only (no fallback) — the old behaviour, a control arm
 //   ?gllog=1     on a WebGL1 context, log the first 40 GL errors with the call that raised them
+//   ?nfselftest=fail  rig seam: report that the native sampling pass cannot run here (a room then refuses a mix)
 (function (root) {
   root.__n64InstallGLCompat = function (G, search) {
     if (G.__n64GL) return G.__n64GL;
@@ -317,6 +318,69 @@
           };
         });
       }
+    };
+    // ---- CAN THIS DEVICE'S WebGL1 RUN THE NATIVE SAMPLING PASS? (a room must never silently fork) ----
+    // A WebGL1 console holds the same machine as a WebGL2 one ONLY because the sampling pass runs on
+    // it too (MEASURED: n64_worker_probe --query-m webgl=1, MK64 / DK64 / Pokemon Snap, 900 frames,
+    // all 30 full-state hashes identical). If the pass could not run here (a GLSL ES 1.00 compiler that
+    // refuses it, no highp, a driver bug), glide would fall back to eager copies and the RDRAM would
+    // differ from a WebGL2 console's. So the page asks BEFORE the room's barrier: the very GL calls the
+    // core makes (the core's own GLSL 3.00 sources through the translation above, R32I rows, a draw,
+    // a read-back) on a throwaway WebGL1 canvas, checked against the known answer. A console that
+    // fails declares a different disc tag (n64/index.html lsDiscTag ' · nf-eager'), so a mixed room
+    // is REFUSED at the barrier with a reason instead of diverging. Cached; only ever run when the
+    // core is (or would be) on WebGL1.
+    st.nfSelfTest = function () {
+      if (st.nfOk !== undefined) return st.nfOk;
+      if (Q.get('nfselftest') === 'fail') { st.nfOk = false; st.nfWhy = 'forced (?nfselftest=fail — rig seam)'; return st.nfOk; }
+      var gl = null;
+      try {
+        var c = G.document ? G.document.createElement('canvas') : new OffscreenCanvas(4, 4);
+        c.width = 4; c.height = 4;
+        gl = c.getContext('webgl', { alpha: false, antialias: false, depth: false, failIfMajorPerformanceCaveat: false });
+        if (!gl || isW2(gl)) { st.nfOk = null; st.nfWhy = 'no WebGL1 context to test on'; return st.nfOk; }
+        installW1();
+        gl.getExtension('OES_vertex_array_object');
+        var VS = '#version 300 es\nvoid main(){vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));gl_Position=vec4(p*2.0-1.0,0.0,1.0);}\n';
+        var FS = '#version 300 es\nprecision highp float; precision highp int; precision highp isampler2D; precision highp sampler2D;\n'
+               + 'uniform sampler2D src; uniform isampler2D xs; uniform isampler2D ys; out vec4 o;\n'
+               + 'void main(){ivec2 d=ivec2(gl_FragCoord.xy);o=texelFetch(src,ivec2(texelFetch(xs,ivec2(d.x,0),0).r,texelFetch(ys,ivec2(d.y,0),0).r),0);}\n';
+        var sh = function (t, s) { var x = gl.createShader(t); gl.shaderSource(x, s); gl.compileShader(x); return gl.getShaderParameter(x, gl.COMPILE_STATUS) ? x : null; };
+        var v = sh(gl.VERTEX_SHADER, VS), f = sh(gl.FRAGMENT_SHADER, FS);
+        if (!v || !f) { st.nfOk = false; st.nfWhy = 'the sampling shaders do not compile'; return st.nfOk; }
+        var p = gl.createProgram(); gl.attachShader(p, v); gl.attachShader(p, f); gl.linkProgram(p);
+        if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { st.nfOk = false; st.nfWhy = 'the sampling program does not link'; return st.nfOk; }
+        var W = 7, H = 5, src = new Uint8Array(W * H * 3);
+        for (var i = 0; i < W * H; i++) { src[i * 3] = (i * 37) & 255; src[i * 3 + 1] = (i * 11 + 5) & 255; src[i * 3 + 2] = (i * 3 + 200) & 255; }
+        var tex = function (unit) { var t = gl.createTexture(); gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t);
+          [[gl.TEXTURE_MIN_FILTER, gl.NEAREST], [gl.TEXTURE_MAG_FILTER, gl.NEAREST], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]
+            .forEach(function (q) { gl.texParameteri(gl.TEXTURE_2D, q[0], q[1]); }); return t; };
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        tex(0); gl.texImage2D(gl.TEXTURE_2D, 0, 0x8051 /* RGB8 */, W, H, 0, gl.RGB, gl.UNSIGNED_BYTE, src);
+        var xs = new Int32Array([6, 0, 3, 5]), ys = new Int32Array([4, 0, 2]);
+        tex(1); gl.texImage2D(gl.TEXTURE_2D, 0, 0x8235, xs.length, 1, 0, 0x8D94, 0x1404, xs);
+        tex(2); gl.texImage2D(gl.TEXTURE_2D, 0, 0x8235, ys.length, 1, 0, 0x8D94, 0x1404, ys);
+        tex(3); gl.texImage2D(gl.TEXTURE_2D, 0, 0x8058 /* RGBA8 */, xs.length, ys.length, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+        var dst = gl.getParameter(gl.TEXTURE_BINDING_2D); gl.bindTexture(gl.TEXTURE_2D, null);
+        var fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, dst, 0);
+        gl.viewport(0, 0, xs.length, ys.length);
+        gl.useProgram(p);
+        gl.uniform1i(gl.getUniformLocation(p, 'src'), 0); gl.uniform1i(gl.getUniformLocation(p, 'xs'), 1); gl.uniform1i(gl.getUniformLocation(p, 'ys'), 2);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        var out = new Uint8Array(xs.length * ys.length * 4);
+        gl.readPixels(0, 0, xs.length, ys.length, gl.RGBA, gl.UNSIGNED_BYTE, out);
+        var bad = 0;
+        for (var y = 0; y < ys.length; y++) for (var x = 0; x < xs.length; x++) {
+          var s = (ys[y] * W + xs[x]) * 3, o = (y * xs.length + x) * 4;
+          if (out[o] !== src[s] || out[o + 1] !== src[s + 1] || out[o + 2] !== src[s + 2]) bad++;
+        }
+        var err = gl.getError();
+        st.nfOk = bad === 0 && err === 0;
+        st.nfWhy = st.nfOk ? 'the sampling pass runs and samples exactly' : (bad + ' of ' + (xs.length * ys.length) + ' samples wrong, glError ' + err);
+      } catch (e) { st.nfOk = false; st.nfWhy = 'threw: ' + String((e && e.message) || e).slice(0, 120); }
+      finally { try { var l = gl && gl.getExtension('WEBGL_lose_context'); if (l) l.loseContext(); } catch (e) {} }
+      return st.nfOk;
     };
     if (G.HTMLCanvasElement) wrapProto(G.HTMLCanvasElement.prototype);
     if (typeof G.OffscreenCanvas === 'function') wrapProto(G.OffscreenCanvas.prototype);

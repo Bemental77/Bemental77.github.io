@@ -95,7 +95,16 @@ const JSON_ONLY = argv.includes('--json');
 const xboxStickOk = (a) => {
   const x = a.xboxInput || {};
   const o = x.offered || {};
+  const na = x.noAction || {};
   return x.libLoaded === true && x.preStartWrites === 0 && x.preStartWanted === 'mouse'
+      // no card before the visitor acts; the deferred offer appears on the first input
+      && !!na.pre && na.pre.acted === false && na.pre.shown === false && !!na.pre.pending
+      // nothing that can make the shell ask the visitor anything, before they act: pointer lock,
+      // keyboard lock, fullscreen never; on a CONSOLE UA no Gamepad API use either (that is what
+      // makes Edge on Xbox offer its controls prompt — lib/xboxinput.js holds it until an action)
+      && !!na.pre.grabs && na.pre.grabs.pointerLock === 0 && na.pre.grabs.keyboardLock === 0 && na.pre.grabs.fullscreen === 0
+      && (!a.consoleUA || (na.pre.grabs.getGamepads === 0 && na.pre.grabs.padListener === 0))
+      && !!na.post && na.post.shown === true
       // The page must ASK ("Use game controls?") with the pointer still alive, and focus
       // the button so a pad's A can answer it without any pointing.
       && o.shown === true && o.focused === true && o.writesWhileAsking === 0
@@ -108,6 +117,7 @@ const xboxStickDetail = (a) => {
   const o = x.offered || {};
   return `stick{lib=${x.libLoaded} preStartWrites=${x.preStartWrites} (MUST be 0 — a cursor `
        + `is the only way to press Start on a console) `
+       + `noAction{pre=${JSON.stringify((x.noAction || {}).pre)} post=${JSON.stringify((x.noAction || {}).post)}} `
        + `asks{shown=${o.shown} focused=${o.focused} writesWhileAsking=${o.writesWhileAsking}} `
        + `exercised=[${x.exercised}] `
        + `twoWay=${x.watchSurvivesPointer}/${x.backToGame} (the escape hatch must not be `
@@ -130,7 +140,7 @@ const PAGES = [
   // THE PORTABILITY REFERENCE. N64Wasm is single-threaded: no SAB, no COI, no
   // WebGPU, no worker. If an arm breaks this page, the arm broke something
   // universal — which makes it the control for every other row.
-  { id: 'n64', url: '/n64/', spec: { wasm: 'required', webgl2: 'required' } },
+  { id: 'n64', url: '/n64/', spec: { wasm: 'required', webgl: 'required' } },  // webgl = 1 or 2 (2026-10-06: the core falls back to WebGL1)
   // ps1 and snes are here for the CONSOLE arm specifically.  Both carried the same
   // `xbox`-in-isMobile defect as the three above, and neither was covered by any
   // console-aware harness: tools/legacy_emu_page_test.mjs does cover them, but it
@@ -357,6 +367,22 @@ const ARMS = [
       return { ok: wg && gl,
                detail: `webgpu.adapter ${b.cap?.webgpu?.adapter}->${a.cap?.webgpu?.adapter}, `
                      + `webgl2.ok ${b.cap?.webgl2?.ok}->${a.cap?.webgl2?.ok} (BOTH must flip true->false)` };
+    },
+  },
+  {
+    id: 'webgl1-only',
+    what: 'WebGL1 but NO WebGL2 — Edge on Xbox (2026-10-06: getContext("webgl2", {depth,stencil}) '
+        + 'returned null and the gate blocked N64, whose core runs on WebGL1). '
+        + '--disable-webgl2 is the flag that does it; --disable-es3-apis was MEASURED to be a no-op '
+        + '(webgl2 still granted, Chrome 140), so it would be a placebo arm.',
+    args: ['--disable-webgl2'],
+    // TWO HALVES: WebGL2 must go away, AND WebGL1 must stay — otherwise this is no-gpu in disguise.
+    proof: (b, a) => {
+      const gone = b.cap?.webgl2?.ok === true && a.cap?.webgl2?.ok === false;
+      const kept = a.cap?.webgl2?.webgl1 === true;
+      return { ok: gone && kept,
+               detail: `webgl2.ok ${b.cap?.webgl2?.ok}->${a.cap?.webgl2?.ok} (must flip true->false), `
+                     + `webgl1 now ${a.cap?.webgl2?.webgl1} (must be TRUE, or this is the no-gpu arm)` };
     },
   },
   {
@@ -648,6 +674,33 @@ async function runCell(arm, pg) {
         get() { return window.__gie.value; },
         set(v) { window.__gie.value = v; window.__gie.writes.push(v); },
       });
+   
+      // LOAD-TIME GRABS (2026-10-06): an Xbox showed an unasked-for controls prompt. Count every
+      // API that can make a browser shell ask the visitor something, from the first byte of the
+      // page, so a page that grabs pointer/keyboard/gamepad/fullscreen without an action fails.
+      const g = window.__grab = { pointerLock: 0, keyboardLock: 0, getGamepads: 0, padListener: 0, fullscreen: 0 };
+      // A FRESH VISITOR. Headless Chrome under this rig reports navigator.userActivation.hasBeenActive
+      // = true before anything was pressed (MEASURED: every cell of the first run), which would make
+      // the "nothing before the visitor acts" checks vacuous. So activation is modelled: false until
+      // a TRUSTED keydown/pointerdown/mousedown/click reaches the page (the rig's own keyboard.press).
+      const act = { v: false };
+      const ua = { get hasBeenActive() { return act.v; }, get isActive() { return act.v; } };
+      try { Object.defineProperty(Navigator.prototype, 'userActivation', { configurable: true, get() { return ua; } }); } catch (e) {}
+      ['keydown', 'pointerdown', 'mousedown', 'click'].forEach((t) => {
+        try { window.addEventListener(t, (e) => { if (e.isTrusted) act.v = true; }, true); } catch (e) {}
+      });
+      const wrap = (o, k, n) => { try { const f = o && o[k]; if (typeof f !== 'function') return;
+        o[k] = function () { g[n]++; return f.apply(this, arguments); }; } catch (e) {} };
+      wrap(Element.prototype, 'requestPointerLock', 'pointerLock');
+      wrap(Element.prototype, 'requestFullscreen', 'fullscreen');
+      wrap(Element.prototype, 'webkitRequestFullscreen', 'fullscreen');
+      wrap(Navigator.prototype, 'getGamepads', 'getGamepads');
+      try { if (navigator.keyboard) wrap(Object.getPrototypeOf(navigator.keyboard), 'lock', 'keyboardLock'); } catch (e) {}
+      const ael = EventTarget.prototype.addEventListener;
+      EventTarget.prototype.addEventListener = function (t) {
+        if (t === 'gamepadconnected' || t === 'gamepaddisconnected') g.padListener++;
+        return ael.apply(this, arguments);
+      };
     });
 
     // PROBE ON THE REAL PAGE. An earlier matrix probed about:blank and got
@@ -846,6 +899,29 @@ async function runCell(arm, pg) {
     // wiring without booting a game AND catches the one-way-escape-hatch regression.
     // ⚠ It ends on release() deliberately: 'mouse' with the watch torn down is the page's
     // correct resting state, so this diagnostic leaves nothing behind (gate #8).
+    // ⚠ NO OFFER WITHOUT A USER ACTION (2026-10-06, real Xbox report: an unasked-for
+    // "Use game controls?" card on an autostarting room link). An offer made before the
+    // visitor has done anything must NOT show — it stays pending — and must show on the
+    // first real input. Both halves are asserted; a placebo here would be a card that
+    // never shows at all, which `offered.shown` below still catches.
+    const preAction = await page.evaluate(() => {
+      try {
+        const lib = window.XboxInput; if (!lib) return null;
+        const ua = navigator.userActivation;
+        const acted = !!(ua && ua.hasBeenActive);
+        const grabs = Object.assign({}, window.__grab || {});
+        lib.offerGameControls('matrix probe offer (no user action)');
+        const el = document.getElementById('xboxInputPrompt');
+        return { acted, grabs, shown: !!(el && el.style.display !== 'none'), pending: lib.report().offerPending || null };
+      } catch (e) { return { error: String(e).slice(0, 120) }; }
+    }).catch(() => null);
+    try { await page.keyboard.press('Shift'); } catch (e) {}
+    const afterAction = await page.evaluate(() => {
+      const el = document.getElementById('xboxInputPrompt');
+      const shown = !!(el && el.style.display !== 'none');
+      if (el) el.style.display = 'none';   // leave nothing behind (gate #8)
+      return { shown, acted: !!(navigator.userActivation && navigator.userActivation.hasBeenActive) };
+    }).catch(() => null);
     out.xboxInput = await page.evaluate(() => {
       try {
         const spy = window.__gie || { writes: [] };
@@ -882,6 +958,8 @@ async function runCell(arm, pg) {
                  releasedWanted: d.wanted, watchStopped: d.armed === false };
       } catch (e) { return { libLoaded: false, error: String(e).slice(0, 120) }; }
     }).catch(() => null);
+    if (out.xboxInput) out.xboxInput.noAction = { pre: preAction, post: afterAction };
+    out.consoleUA = /\bXbox\b|\bPlayStation\b|\bNintendo\b/.test(arm.ua || '');
 
     out.dcInput = await page.evaluate(() => {
       try {
