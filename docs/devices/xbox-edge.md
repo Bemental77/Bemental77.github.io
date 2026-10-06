@@ -124,6 +124,32 @@ Reported 2026-10-06 on `/n64/?np=DHRNN&game=Mario Kart 64`:
    not a proven one: a wider opening window lets the page's opening credit burst through,
    where an 8-frame window used to stall it. Open, needs more runs.
 
+   **Follow-up (dd5308d).** gc_netplay_room_test, 60 s runs, interleaved f538 → old → fix × 4,
+   load 4.2–6.7. Lead max per run, page sampler host/p2 (engine ownClock host/p2):
+
+   | Run | f538fe0 (window 19–22) | 2b3adee (window 8) | dd5308d fix (window 22–25) |
+   |---|---|---|---|
+   | 1 | 1.51 / 0.91 (0.84 / 0.14) | 1.08 / 1.25 (0.41 / 0.71) | 0.63 / 1.23 (0.34 / 0.21) |
+   | 2 | 0.83 / 0.69 (0.29 / 0.18) | 1.01 / 0.73 (0.41 / 0.23) | 0.42 / 0.20 (0.67 / −0.41) |
+   | 3 | 1.86 / 1.41 (1.64 / 0.54) | 0.52 / 1.62 (0.62 / 0.35) | 1.73 / 0.98 (0.54 / −0.15) |
+   | 4 | 1.32 / 1.50 (0.89 / 0.02) | 1.06 / 1.45 (0.50 / 0.27) | 0.84 / 1.97 (0.30 / 0.55) |
+
+   All 12 runs: 20/20, every lead under 2. The 2.95 did not reproduce in 4 more f538 runs. One
+   difference remains: in the wide-window arms the page sampler's peaks fall mid-room (13–55 s,
+   up to 1.97) rather than at the release. The engine's own clock stays ≤ 0.67 on the fix arm.
+   The fix does not depend on reproducing it. `OC_CAP`: no frame, credited or hidden, begins
+   while the engine's ownClock lead exceeds 1.5. The sim case that read 2.1 (a lost `lsgo`)
+   now reads 1.50, and the full 600 s gc room on the fix reads max 0.30 / 1.33 (engine 0.34 /
+   0.02), 20/20.
+   `RB_START_EXTRA`: +4 frames on the first window. In the sim, 30 seeds × 110 s go from 7 stalls
+   to 0. In the r127 two-browser rig (fixed engine, single runs, load 8.3–9.2): Genesis host 0,
+   joiner 3 stalls / 68 ms; SNES host 0, joiner 2 / 51 ms (frame 65, plus one 15 ms stall at
+   86 s). Down from 33 / 845 ms and 15 / 462 ms before the change. The start-up stalls (frames
+   48–65) persist at a 22–24 frame window, which means 370+ ms of lateness: a page hitch, not the
+   link. Pre-warming would have to happen in the pages.
+   Suites on dd5308d: all Node suites pass; ps1_netplay 26/26, gc_rollback_det 7/7,
+   gc_netplay_room 20/20 (600 s), N64 lockstep_probe GATE PASS.
+
 ## How to add an entry
 
 On the device, open the page and press "Copy debug" (or add `?bench=1` and press
