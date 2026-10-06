@@ -3,7 +3,7 @@
 <head>
   <script src="/lib/debugreport.js?v=94ec9928"></script>
   <script src="/lib/capability.js?v=e25dca87"></script>
-  <script src="/lib/bench.js?v=8464cadf"></script><!-- ?bench=1 real-device benchmark; inert without it -->
+  <script src="/lib/bench.js?v=b6dbb11b"></script><!-- ?bench=1 real-device benchmark; inert without it -->
   <script src="/lib/xboxinput.js"></script>
   <!-- ONLINE PLAY IS DETERMINISTIC LOCKSTEP. Only /lib/netplay.js is loaded.
        /lib/netplay-host.js is the host half of STREAMING and is deliberately
@@ -426,7 +426,77 @@
   var Module = window.Module = { preRun: [], postRun: [], locateFile: f => '/ps1/ps1Wasm/dist/' + f, print: t => pageLog(String(t)), printErr: t => pageLog('[err] ' + String(t)), canvas: $('canvas'), keyboardListeningElement: $('canvas'), setStatus: setStatus, totalDependencies: 0, monitorRunDependencies: () => {} };
   var img_data32;
   window.my_SDL_LockSurface = function (surf) { var s = Module.SDL.surfaces[surf]; s.locked++; if (s.locked > 1) return 0; if (!s.buffer) { s.buffer = Module._malloc(s.width * s.height * 4); Module.HEAP32[(surf + 20) >> 2] = s.buffer; } Module.HEAP32[(surf + 20) >> 2] = s.buffer; if (!s.image) s.image = s.ctx.getImageData(0, 0, s.width, s.height); return 0; };
-  window.my_SDL_UnlockSurface = function (surf) { var s = Module.SDL.surfaces[surf]; if (!s.locked || --s.locked > 0) return; var src = s.buffer >> 2; if (!img_data32) img_data32 = new Uint32Array(s.image.data.buffer); img_data32.set(Module.HEAP32.subarray(src, src + img_data32.length)); s.ctx.putImageData(s.image, 0, 0); };
+  // ═══ ONE CANVAS UPLOAD PER PICTURE, ON AN OPAQUE CANVAS ═══════════════════
+  // dfxvideo presents a picture in two canvas operations (draw.c DoBufferSwap):
+  // the frame is converted into an OFF-SCREEN 640x480 surface (BlitSDL32 ->
+  // the putImageData below), and emscripten SDL then drawImage()s its
+  // DisplayMode rect, scaled, onto the on-screen canvas (SDL_BlitScaled ->
+  // SDL.blitSurface). Each is a separate accelerated-canvas flush in the GPU
+  // process. MEASURED (headless Chrome 141, SwiftShader, 4 vCPU — the bench
+  // box; a static 640x480 canvas updated 12.5x/s, MR2's picture rate): that
+  // pair costs 81-88% of a core in the GPU process, an opaque canvas with
+  // one putImageData 41-43%, and the cost hardly moves with the canvas's
+  // on-screen size (160x120: 70%, 1200x900: 91%) — it is per SUBMISSION, not
+  // per pixel. In a rollback room on that box (bench room phase: this page +
+  // the joiner iframe), the GPU process's raster threads averaged 131% of the
+  // 4 cores and BOTH consoles' workers waited ~18% of wall time for a core;
+  // every room frame over budget was a frame whose own guest run stretched
+  // 3-4x (p50 5 ms -> 15-25 ms) under that contention, on ONE console only —
+  // the same guest frame cost 5 ms on the other — not re-simulation and not
+  // the savestate (re-sims: 1 per 20 s room; save p50 1.5 ms).
+  // So the picture now goes to the on-screen canvas in ONE putImageData: the
+  // off-screen surface is never uploaded, and the blit scales the converted
+  // frame straight out of the wasm heap. Nearest-neighbour, which is what the
+  // page's own `image-rendering: pixelated` asks of the browser; the stock
+  // blit was a bilinear drawImage. ?present=sdl keeps the stock two-step path
+  // (the A/B arm). Presentation copies OUT of guest memory only: nothing the
+  // guest — or a room's determinism — can see. MEASURED after (same box):
+  // solo, the GPU process's raster threads 85-89% -> 37-41% of a core; bench
+  // room phase, 6 interleaved pairs vs the stock path, frames over budget
+  // 3+7+2+3+3+1 = 19 -> 0+1+0+1+1+0 = 3.
+  var PRESENT = { direct: !/[?&]present=sdl\b/.test(location.search), xs: null, ctx: null, img: null, d32: null, mx: null, my: null, key: '', pics: 0, fallbacks: 0 };
+  window.__ps1Present = PRESENT;   // diagnostics (pics presented, fallbacks to the stock path)
+  try { if (PRESENT.direct) $('canvas').getContext('2d', { alpha: false }); } catch (e) {}
+  function presentInstall() {
+    if (PRESENT.ctx) return true;
+    var S = Module.SDL, scr = S && S.screen && S.surfaces[S.screen];
+    if (!scr || !scr.ctx || typeof scr.ctx.drawImage !== 'function') return false;
+    var ctx = scr.ctx, orig = ctx.drawImage;
+    ctx.drawImage = function (src, sx, sy, sw, sh, dx, dy, dw, dh) {
+      var xs = PRESENT.xs;
+      if (xs && src === xs.canvas && arguments.length === 9) {
+        if (presentDirect(xs, ctx, sx, sy, sw, sh, dx, dy, dw, dh)) return;
+        PRESENT.fallbacks++; presentStock(xs);
+      }
+      return orig.apply(this, arguments);
+    };
+    PRESENT.ctx = ctx;
+    return true;
+  }
+  function presentStock(s) { var src = s.buffer >> 2; if (!img_data32) img_data32 = new Uint32Array(s.image.data.buffer); img_data32.set(Module.HEAP32.subarray(src, src + img_data32.length)); s.ctx.putImageData(s.image, 0, 0); }
+  function presentDirect(xs, ctx, sx, sy, sw, sh, dx, dy, dw, dh) {
+    dx = Math.round(dx); dy = Math.round(dy); dw = Math.round(dw); dh = Math.round(dh);
+    if (!(dw > 0 && dh > 0 && sw > 0 && sh > 0) || dx < 0 || dy < 0 || dx + dw > ctx.canvas.width || dy + dh > ctx.canvas.height || !xs.buffer) return false;
+    if (!PRESENT.img || PRESENT.img.width !== dw || PRESENT.img.height !== dh) { PRESENT.img = ctx.createImageData(dw, dh); PRESENT.d32 = new Uint32Array(PRESENT.img.data.buffer); PRESENT.key = ''; }
+    var key = sx + ',' + sy + ',' + sw + ',' + sh + ',' + dw + ',' + dh + ',' + xs.width;
+    if (key !== PRESENT.key) {
+      var mx = new Int32Array(dw), my = new Int32Array(dh), W = xs.width, H = xs.height, i, v;
+      for (i = 0; i < dw; i++) { v = Math.floor(sx + (i + 0.5) * sw / dw); mx[i] = v < 0 ? 0 : v >= W ? W - 1 : v; }
+      for (i = 0; i < dh; i++) { v = Math.floor(sy + (i + 0.5) * sh / dh); my[i] = (v < 0 ? 0 : v >= H ? H - 1 : v) * W; }
+      PRESENT.mx = mx; PRESENT.my = my; PRESENT.key = key;
+    }
+    var h32 = Module.HEAP32, base = xs.buffer >> 2, d = PRESENT.d32, cx = PRESENT.mx, cy = PRESENT.my, o = 0, prev = -1;
+    for (var y = 0; y < dh; y++, o += dw) {
+      var r = cy[y];
+      if (r === prev) { d.copyWithin(o, o - dw, o); continue; }
+      prev = r; r += base;
+      for (var x = 0; x < dw; x++) d[o + x] = h32[r + cx[x]];
+    }
+    ctx.putImageData(PRESENT.img, dx, dy);
+    PRESENT.pics++;
+    return true;
+  }
+  window.my_SDL_UnlockSurface = function (surf) { var s = Module.SDL.surfaces[surf]; if (!s.locked || --s.locked > 0) return; if (PRESENT.direct && surf !== Module.SDL.screen && presentInstall()) { PRESENT.xs = s; return; } presentStock(s); };
   var padStatus1, padStatus2, vram_ptr; window.cout_print = t => pageLog(String(t)); var pcsx_worker = null; var SoundFeedStreamData; var states_arrs = []; var audioMuted = false; var audioDraining = false; var pendingSaveResolve = null; var pendingLoadResolve = null;
   function getAudioCtx() { try { return (Module && Module.preCreatedAudioContext) || (Module && Module.SDL && Module.SDL.audioContext) || null; } catch (e) { return null; } }
   function resumeAudio() { if (audioMuted) return; var ctx = getAudioCtx(); if (ctx && ctx.state === 'suspended') { ctx.resume().catch(() => {}); } if (AS.ctx && AS.ctx !== ctx && AS.ctx.state === 'suspended') { AS.ctx.resume().catch(() => {}); } }
