@@ -1894,7 +1894,11 @@
   function asyncOn(Module) {
     if (EMIT_ONLY) return false;
     if (ASYNC.on === false) return false;
-    if (!ASYNC.frameEnds) return false;          // this core calls frameEnd: installs can happen
+    // (2026-10-06) no longer `if (!ASYNC.frameEnds) return false`: that sent every span of the
+    // session's FIRST field through the budgeted synchronous compile below, inside the field. An
+    // offer made before the first frameEnd simply waits for it, as every other one waits for the
+    // field end; a core that never calls frameEnd installs nothing either way (the budget is
+    // refilled only there too).
     if (ASYNC.on === true) return true;
     return asyncMake(Module);
   }
@@ -1916,15 +1920,36 @@
           } else ASYNC.ready.push(x);
         }
       };
-      ASYNC.w.onerror = function (e) {
-        // a worker that fails leaves everything it was asked for on the interpreter;
-        // from now on spans compile in this thread again
-        ASYNC.on = false; ASYNC.pending.clear(); stats.asyncWorkerError = String((e && e.message) || e).slice(0, 160);
-      };
+      ASYNC.w.onerror = function (e) { asyncWorkerLost(e); };
       ASYNC.M = Module;
       ASYNC.on = true;
     } catch (e) { ASYNC.on = false; stats.asyncWorkerError = String((e && e.message) || e).slice(0, 160); }
     return ASYNC.on;
+  }
+  // A COMPILE WORKER THAT DIES IS REPLACED (2026-10-06). It used to switch the session to the
+  // synchronous compile — every span after it built and compiled inside the core's field, the
+  // budget's 6 per field and 6 more at its end. Now a new worker is made (at most 3 times) and what
+  // the dead one still owed is asked of it again: the real offers from their saved inputs (the same
+  // job), the corpus's jobs through relocPump. Only a worker that cannot be made at all leaves the
+  // synchronous path as the last resort (a browser without Worker has always had it).
+  function asyncWorkerLost(e) {
+    stats.asyncWorkerError = String((e && e.message) || e).slice(0, 160);
+    ASYNC.restarts = (ASYNC.restarts | 0) + 1;
+    try { if (ASYNC.w) ASYNC.w.terminate(); } catch (er) {}
+    ASYNC.w = null; ASYNC.on = null;
+    if (ASYNC.restarts > 3 || !asyncMake(ASYNC.M)) { ASYNC.on = false; ASYNC.pending.clear(); return; }
+    ASYNC.pending.forEach(function (j, id) {
+      ASYNC.outbox.push({ id: id, p: j.p, w0: j.w0, words: j.words, ops: j.ops, flags: j.flags || jitFlags(), tableBase: TABLE_BASE });
+    });
+    asyncFlush();
+    var R = RELOC;
+    if (R.C && R.sent) {
+      var list = [];
+      for (var i = 0; i < R.sent.length; i++) {
+        if (R.sent[i] === R.sent[i] && R.done[i] !== R.sent[i]) { WARM.ids.delete(R.sentId[i]); R.idJob.delete(R.sentId[i]); R.sent[i] = NaN; list.push(i); }
+      }
+      if (list.length) relocSend(list, false);
+    }
   }
   function jitFlags() {
     return { noFP: !!(typeof window !== 'undefined' && window.__jitNoFP), noLabels: !!(typeof window !== 'undefined' && window.__jitNoLabels),
@@ -1939,7 +1964,7 @@
     var job = { id: id, p: Object.assign({}, p), w0: pageW0, words: words, ops: ops, flags: jitFlags(), tableBase: TABLE_BASE };
     if (WARM.corpus || (WARM.early && WARM.early.ok === null)) warmStart(job);
     if (WARM.capture) WARM.capture.push({ p: job.p, w0: pageW0, words: words, ops: ops, flags: job.flags, tableBase: TABLE_BASE });
-    ASYNC.pending.set(id, { p: job.p, w0: pageW0, words: words, ops: ops, bp: bp, blk: bp ? U[bp >> 2] : 0, keyArr: keyArr, tries: ASYNC.retry | 0 });
+    ASYNC.pending.set(id, { p: job.p, w0: pageW0, words: words, ops: ops, bp: bp, blk: bp ? U[bp >> 2] : 0, keyArr: keyArr, tries: ASYNC.retry | 0, flags: job.flags });
     // batched: one message per field end (or per 32 offers) — a scene load offers hundreds
     // of spans inside one field, and a message each cost more than the copy itself
     ASYNC.outbox.push(job);
@@ -1962,7 +1987,7 @@
   // full: the same inputs, so the same module compileSpan would build (exact, as every cache
   // hit). A corpus that matches nothing costs its compile time in the worker and nothing else.
   // ?jitcorpus=0 (fbasync.js publishes nothing for it; core_worker.js does not load one) = off.
-  var WARM = { corpus: null, capture: null, started: false, ids: new Map(), offered: 0, cached: 0, dropped: null };
+  var WARM = { corpus: null, capture: null, started: false, ids: new Map(), offered: 0, cached: 0, dropped: null, heldQ: [], heldT: 0 };
   var WARM_PER_SPAN = { vaddr: 1, entryPtr: 1, span: 1, srcPtr: 1, blockStart: 1, blockEnd: 1 };
   // A REJECTED CORPUS IS SAID OUT LOUD. The param block holds host addresses (statics, table
   // indices), so a core rebuild that moves the core's static data rejects every shipped corpus —
@@ -1995,10 +2020,18 @@
         warmSayDropped('early start: ' + why);
         WARM.corpus = E.C; WARM.started = false; WARM.offered = 0;
       } else {
+        // NOT CACHED HERE (2026-10-06). This runs inside the core's field — the JIT up-call of the
+        // first real offer — and E.held is everything the early start has compiled so far: up to
+        // the whole corpus (1555 SM64 spans), each a page-sized key hashed twice. MEASURED (bench
+        // loopback room, SwiftShader, ?costdbg=1): the field that judged it spent 51-55 ms in the
+        // up-call, against 4-5 ms of guest work; and a corpus that arrives late (a slow network:
+        // the early start begins with frames already running) is judged at the next scene load's
+        // offer. The held modules go into the recompile cache from a task of their own instead
+        // (warmHeldPump, ~2 ms a task, between fields). A hit only moves time, never what runs.
         E.ok = true;
-        var M = ASYNC.M || ((typeof globalThis !== 'undefined' ? globalThis : self).Module);
-        for (var h = 0; h < E.held.length; h++) { try { warmCache(E.held[h][0], E.held[h][1]); } catch (e) { stats.warmErr = String((e && e.message) || e).slice(0, 160); } }
+        WARM.heldQ = (WARM.heldQ || []).concat(E.held);
         E.held = []; E.C = null;
+        warmHeldKick();
         return;
       }
     }
@@ -2014,7 +2047,9 @@
     for (var i = 0; i < C.jobs.length; i++) all.push(i);
     relocSend(all, false);
     // an early start runs while no frame does (and its caller waits on warm.ids): built now
-    if (early) { clearTimeout(RELOC.pumpT); RELOC.pumpT = 0; while (RELOC.q.length) relocPump(); }
+    // (only while no frame has run: a corpus that arrives once the guest runs is built 64 jobs a task
+    // by relocPump, between fields — all 1555 at once is ~60 ms of one worker task)
+    if (early && !ASYNC.frameEnds) { clearTimeout(RELOC.pumpT); RELOC.pumpT = 0; while (RELOC.q.length) relocPump(); }
   }
   // one corpus job, built for a block that sits `d` bytes from where the corpus saw it
   function relocJob(i, d) {
@@ -2141,6 +2176,17 @@
     for (var wk = 1; wk < r.labels.length; wk++) fns.push(r.nfn === 1 ? fns[0] : Bh.inst.exports['s' + r.k + '_' + wk]);
     cachePut(key, fns, r.labels, r.labelOps);
     WARM.cached++;
+  }
+  // the early start's held modules, into the recompile cache between fields (see warmStart)
+  function warmHeldKick() { if (!WARM.heldT && WARM.heldQ && WARM.heldQ.length) WARM.heldT = setTimeout(warmHeldPump, 0); }
+  function warmHeldPump() {
+    WARM.heldT = 0;
+    var q = WARM.heldQ, t0 = performance.now(), n = 0;
+    while (q && q.length && (n < 8 || performance.now() - t0 < 2)) {
+      var h = q.shift(); n++;
+      try { warmCache(h[0], h[1]); } catch (e) { stats.warmErr = String((e && e.message) || e).slice(0, 160); }
+    }
+    warmHeldKick();
   }
   // corpus = { static, flags, tableBase, pages: [{ w0, words: Uint32Array }], jobs: [{ vaddr, entryPtr,
   // span, srcPtr, blockStart, blockEnd, pg, ops: Uint32Array }] } (core_worker.js decodes the file)

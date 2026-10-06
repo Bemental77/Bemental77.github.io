@@ -717,6 +717,16 @@ function poolTake(pool, max, size) {
   e.seq = ++poolSeq; shipSeq = e.seq;
   return e.sab;
 }
+// The pools' first buffers, faulted in at boot (A SCENE LOAD MUST NOT PAY FOR FIRST-TOUCH PAGE
+// FAULTS): two mem1 images (frames 41 and 42 ship back to back, before the first fence returns)
+// and one region buffer. seq 0 = free; poolTake hands them out exactly as it would its own.
+function shipPoolPrewarm() {
+  if (!shipPool || !paceI32) return;
+  try {
+    while (mem1Pool.length < 2) { const b = new SharedArrayBuffer(0x01800000); new Uint8Array(b).fill(0); mem1Pool.push({ sab: b, seq: 0 }); }
+    if (!regPool.length) { const b = new SharedArrayBuffer(REG_POOL_CAP); new Uint8Array(b).fill(0); regPool.push({ sab: b, seq: 0 }); }
+  } catch (e) { log('ship pool prewarm failed: ' + ((e && e.message) || e)); }
+}
 function mem1Image() {
   const src = new Uint8Array(Module.wasmMemory.buffer, 0x80000000, 0x01800000);
   const sab = poolTake(mem1Pool, MEM1_POOL_MAX, 0x01800000);
@@ -2697,6 +2707,24 @@ async function boot(msg) {
   new Uint8Array(Module.wasmMemory.buffer).set(fst, 0x81C00000);
   d.setUint32(0x80000038, 0x81C00000, true);
   d.setUint32(0x8000003C, fst.length, true);
+  // A SCENE LOAD MUST NOT PAY FOR FIRST-TOUCH PAGE FAULTS (2026-10-06). MEASURED (MP4 solo, prod
+  // mirror, SwiftShader arm, per-frame timers in a scratch copy): frame 344's guest time was 55 ms,
+  // 47.5 ms of it inside serveDvdRead's 12 reads (5.2 MiB) — and of that, touching each destination
+  // page once took 41.7 ms while the copy itself took 1.0 ms (the source pages 4.4 ms). The game's
+  // arena had never been written there, so every 4 KiB page of the read faulted in, inside the
+  // frame. Frame 41's reads paid 15.3 ms the same way. The same is true of the ship pool: the first
+  // 24 MiB mem1 image (frames 0 and 42) and the first packed-region buffer (frame 41, or frame 725
+  // once full-image frames stopped re-sending the image) were allocated and zero-filled inside a
+  // frame. All of it is now paid here, once, before main(): every page of the MEM1 window is
+  // written with the value it already holds (no guest state changes), and the pools get their
+  // first buffers. ?prefault=0 (boot msg prefault:false) is the control.
+  if (msg.prefault !== false) {
+    const t0 = performance.now();
+    const m8 = new Uint8Array(Module.wasmMemory.buffer, 0x80000000, 0x01800000);
+    for (let i = 0; i < m8.length; i += 4096) m8[i] = m8[i];
+    shipPoolPrewarm();
+    log('prefault: MEM1 window + ship pool (' + mem1Pool.length + ' images, ' + regPool.length + ' region buffers) in ' + (performance.now() - t0).toFixed(1) + ' ms');
+  }
   log('module up (' + hostNames.length + ' host stubs, ' + parts.length + ' disc parts, ' +
       discBytes + 'B image); running main()');
   // Boot census: every unmodelled import is 'never called' at this point, so this line is the

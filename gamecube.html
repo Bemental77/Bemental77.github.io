@@ -11112,6 +11112,8 @@ window.GcRate = (function () {
                      shipPool: q.get('shippool') !== '0',
                      // raw regions a full-image frame's mem1 image already carries are not re-sent (?shipdedup=0: control)
                      shipDedup: q.get('shipdedup') !== '0',
+                     // the MEM1 window and the ship pool are faulted in before main() (?prefault=0: control)
+                     prefault: q.get('prefault') !== '0',
                      // THE ROLLBACK RING: in a room the worker instruments the module so every frame
                      // start in the window can be rewound; solo, nothing changes.
                      rb: !!GCLS.session, rbSab: rbSab,
