@@ -192,10 +192,13 @@ class MyClass {
             return;
         }
         try {
-            // 'playback' tells the browser to prefer glitch-free output over low latency.
-            // This is better for games than the near-zero latencyHint which caused
-            // the ScriptProcessor to compete with touch events on mobile.
-            this.audioContext = new AudioContext({ latencyHint: 'playback', sampleRate: 48000 });
+            // 'interactive', NOT 'playback' (it used to be 'playback', chosen when a
+            // main-thread ScriptProcessor competed with touch events). 'playback'
+            // asks the OS for a deep output buffer: on a phone (genesis.html's room,
+            // docs/devices/xbox-edge.md) it measured outputLatency 216 ms — sound
+            // ~0.2 s behind the picture. The AudioWorklet sink (lib/cart_audio.js)
+            // now holds the cushion off the main thread and counts every gap.
+            this.audioContext = new AudioContext({ latencyHint: 'interactive', sampleRate: 48000 });
             if (window.AudioDiag) {
                 window.AudioDiag.install('gba', { ctxRate: this.audioContext.sampleRate, srcRate: GBA_SRC_RATE });
                 window.AudioDiag.observeContext(this.audioContext);
