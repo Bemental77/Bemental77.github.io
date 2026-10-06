@@ -147,6 +147,9 @@ function jitWarmSay(st, x) { if (self.__jwSaid === st) return; self.__jwSaid = s
 function jitCorpusLoad() {
   var d = BOOT || {}, name = (self.__fbAsync && self.__fbAsync.romName) || '';
   if (!name || new URLSearchParams(d.search || '').get('jitcorpus') === '0' || typeof DecompressionStream !== 'function') { jitWarmSay('none'); return; }
+  // ?jitreloc=0: the corpus only at the block addresses it was captured at (mips_emit.js A CORPUS
+  // THAT FOLLOWS THE HEAP) — the A/B arm
+  if (new URLSearchParams(d.search || '').get('jitreloc') === '0') self.__jitRelocOff = true;
   jitWarmSay('loading');
   var u32 = function (b64) {
     var bin = atob(b64), u8 = new Uint8Array(bin.length);
@@ -658,13 +661,16 @@ function fsRedo(s, backoff, pumped) {
   if (M._neil_rand_set) M._neil_rand_set(S.rlo, S.rhi);
   if (FSK.gsize) M._neil_gl_state_load(S.p + FSK.size);
   FSK.stale = false; FSK.skipping = false; M._neil_fs_set(0, S.s);
-  for (var k = S.s; k <= s; k++) {
-    var pd = FSK.pads[k & 63];
-    for (var q = 0; q < 4; q++) FSK.setPad(q, pd[q * 3], pd[q * 3 + 1], pd[q * 3 + 2]);
-    FSK.drewNow = false;
-    M._neil_ls_run_frame();
-    if (k < s || pumped) wp();            // sent the first time already
-  }
+  FSK.inRedo = true;                     // (WHY A FIELD WAS SLOW: these fields are a repair)
+  try {
+    for (var k = S.s; k <= s; k++) {
+      var pd = FSK.pads[k & 63];
+      for (var q = 0; q < 4; q++) FSK.setPad(q, pd[q * 3], pd[q * 3 + 1], pd[q * 3 + 2]);
+      FSK.drewNow = false;
+      M._neil_ls_run_frame();
+      if (k < s || pumped) wp();            // sent the first time already
+    }
+  } finally { FSK.inRedo = false; }
   FSK.taintSeen = M._neil_fs_taints() >>> 0; FSK.jsTaint = 0;
   while (FSK.snaps.length) fsDrop(0);
   FSK.redo++; FSK.redoFields += s - S.s + 1; FSK.redoFieldsAll += s - S.s + 1; FSK.redoMs += performance.now() - t0;
@@ -955,6 +961,62 @@ function fpsText() {
   return t;
 }
 
+// ---- WHY A FIELD WAS SLOW (always on: two clock reads per field, a few counter reads) --------
+// The bench (lib/bench.js) counts a field window over budget from the core's own retro_run timer
+// and, without ?costdbg=1, had nothing to name the cause with: its bursts read "unknown". Every
+// _neil_ls_run_frame call — the solo clock's field, a frame-skip re-run, a room's presented,
+// hidden or re-simulated frame — is timed here, and one that took longer than a field period is
+// recorded with what happened inside it: the JIT up-call's own time (myApp.jitCompile), how many
+// spans the core met for the first time (compiled ahead from the shipped corpus = cache hits, or
+// left on the cached interpreter until the compile worker answers = offers), and which caller ran
+// it (self.__n64FieldKind: 'repair' = a frame-skip re-run, 'resim' / 'hidden' / 'runahead' in a
+// room — room_core.js sets it). The records ride on the stat stream ('slow', at most 8 per post,
+// the worst kept) and the bench names its bursts from them. Nothing here changes what runs.
+var SLOW = { q: [], jitMs: 0, jitN: 0, n: 0, wrapped: false };
+function slowWhy(r) {
+  var k = r.kind, parts = [];
+  if (k === 'repair') parts.push('frame-skip repair (re-run)');
+  else if (k === 'resim') parts.push('rollback re-simulation');
+  else if (k === 'hidden' || k === 'runahead') parts.push('room catch-up frame (' + k + ')');
+  if (r.jit >= 0.4 * r.ms) parts.push('JIT compile ' + r.jit + ' ms (' + r.offers + ' spans)');
+  else if (r.offers >= 4) parts.push('new code on the interpreter: ' + r.offers + ' spans waiting for the JIT' + (r.hits ? ', ' + r.hits + ' precompiled' : '') + ' (scene load)');
+  else if (r.hits >= 8) parts.push('scene load: ' + r.hits + ' new spans entered (precompiled)');
+  else parts.push('core: no new code, JIT or repair in it (guest work, GC or the host)');
+  return parts.join('; ');
+}
+function slowInstall() {
+  if (SLOW.wrapped || !M || typeof M._neil_ls_run_frame !== 'function') return;
+  SLOW.wrapped = true;
+  if (self.myApp && typeof self.myApp.jitCompile === 'function') {
+    var jc = self.myApp.jitCompile;
+    self.myApp.jitCompile = function (pp) { var t0 = performance.now(); try { return jc(pp); } finally { SLOW.jitMs += performance.now() - t0; SLOW.jitN++; } };
+  }
+  var rf = M._neil_ls_run_frame;
+  M._neil_ls_run_frame = function () {
+    var st = self.bementalMips ? self.bementalMips.stats : null;
+    var h0 = st ? (st.cacheHits | 0) : 0, o0 = st ? (st.asyncOffered | 0) : 0, j0 = SLOW.jitMs, n0 = SLOW.jitN, t0 = performance.now();
+    try { return rf.apply(this, arguments); } finally {
+      var dt = performance.now() - t0, hz = CLK.viHz > 0 ? CLK.viHz : (RM.R && RM.R.LS.viHz > 0 ? RM.R.LS.viHz : 60);
+      SLOW.n++;
+      if (dt > 1000 / hz) {
+        var r = { f: CLK.frame, ms: +dt.toFixed(1), at: performance.timeOrigin + t0, jit: +(SLOW.jitMs - j0).toFixed(1), calls: SLOW.jitN - n0,
+                  hits: st ? (st.cacheHits | 0) - h0 : 0, offers: st ? (st.asyncOffered | 0) - o0 : 0,
+                  kind: self.__n64FieldKind || (FSK.inRedo ? 'repair' : 'run') };
+        if (RM.R && RM.R.LS) r.f = RM.R.LS.frame | 0;
+        r.why = slowWhy(r);
+        SLOW.q.push(r);
+        if (SLOW.q.length > 64) { SLOW.q.sort(function (a, b) { return b.ms - a.ms; }); SLOW.q.length = 32; }
+      }
+    }
+  };
+}
+function slowTake() {
+  if (!SLOW.q.length) return undefined;
+  var q = SLOW.q; SLOW.q = [];
+  if (q.length > 8) { q.sort(function (a, b) { return b.ms - a.ms; }); q.length = 8; }
+  return q;
+}
+
 var STAT = { last: 0 };
 function postStats() {
   if (!M || !M._neil_vi_total) return;
@@ -975,7 +1037,7 @@ function postStats() {
                rafDraws: CB.rafDraws, taskDraws: CB.taskDraws, rafSkips: CB.rafSkips },
          audioSent: AUD.sent, audioDropped: AUD.dropped,
          fs: { on: FSK.on, skipped: FSK.skipped, drawn: FSK.drawn, presented: FSK.presented, redo: FSK.redo, onGpu: FSK.fq.length },
-         jitBlocks: js ? js.blocks : null, dbg: DBG ? DBG.report() : undefined,
+         jitBlocks: js ? js.blocks : null, dbg: DBG ? DBG.report() : undefined, slow: slowTake(),
          fb: self.__fbAsync ? { on: !!self.__fbAsync.on, calls: self.__fbAsync.calls, async: self.__fbAsync.async,
                                 sync: self.__fbAsync.sync, blocked: self.__fbAsync.blocked, decided: self.__fbAsync.decided } : null });
 }
@@ -1527,6 +1589,7 @@ function boot(d) {
           self.window = self;
           try { setupJit(d.jit || 'emit'); } catch (e) { log('[jit] emitter failed to load — bridge stays off: ' + e); }
           if (DBG) { DBG.wrapJit(); DBG.wrapFrame(); }
+          slowInstall();          // WHY A FIELD WAS SLOW (outermost: the field's whole wall time)
           fsCoreReady();          // the pad recorder, before any field (a re-run replays every field's pads)
           if (d.workerfail === 'main') throw new Error('?workerfail=main — a simulated core failure during boot (rig seam)');
           M.callMain(['custom.v64']);

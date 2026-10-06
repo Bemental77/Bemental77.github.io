@@ -111,7 +111,11 @@ function pump() {
   setTimeout(pump, 0);
 }
 self.onmessage = function (e) {
-  if (e.data && e.data.warm) { low.push(e.data.warm); if (!busy) pump(); return; }
+  // (mips_emit.js A CORPUS THAT FOLLOWS THE HEAP) the corpus jobs still queued were built for a
+  // block address that turned out wrong: dropped; the right ones follow. `front`: a page the core
+  // has just entered goes ahead of the rest of the corpus.
+  if (e.data && e.data.warmDrop) { low = []; return; }
+  if (e.data && e.data.warm) { if (e.data.front) low.unshift(e.data.warm); else low.push(e.data.warm); if (!busy) pump(); return; }
   var jobs = Array.isArray(e.data) ? e.data : [e.data];
   if (self.bementalMips.emitBatch) { queue.push(jobs); if (!busy) pump(); return; }
   // answers go back every ~8 ms of work, so a big batch does not hold the first ones

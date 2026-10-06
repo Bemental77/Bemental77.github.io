@@ -2006,21 +2006,123 @@
     if (WARM.started || !C) return; WARM.started = true;
     if (early) WARM.early = { ok: null, C: C, flags: live.flags, tableBase: live.tableBase, held: [], why: null, at: Date.now() };
     else { why = warmCheck(C, live); if (why) { WARM.dropped = why; warmSayDropped(why); return; } }
-    var out = [];
-    for (var i = 0; i < C.jobs.length; i++) {
-      var cj = C.jobs[i], pp = Object.assign({}, live.p), w = C.pages[cj.pg];
-      for (k in WARM_PER_SPAN) pp[k] = cj[k];
-      var id = ASYNC.nextId++, pageN = w.words.length - 1, span = cj.span;
-      var key = new Uint32Array(6 + pageN + span);
-      key[0] = pp.vaddr >>> 0; key[1] = pp.entryPtr >>> 0; key[2] = span; key[3] = pp.blockStart >>> 0;
-      key[4] = pp.blockEnd >>> 0; key[5] = pp.srcPtr >>> 0;
-      key.set(w.words.subarray(0, pageN), 6); key.set(cj.ops.subarray(0, span), 6 + pageN);
-      WARM.ids.set(id, key);
-      out.push({ id: id, p: pp, w0: w.w0, words: w.words, ops: cj.ops, flags: live.flags, tableBase: live.tableBase });
+    relocInit(C, live);
+    // a start at a real offer knows where the heap put that offer's block: the corpus goes out
+    // already re-targeted to it (A CORPUS THAT FOLLOWS THE HEAP)
+    if (!early && live.p && live.p.entryPtr) relocObserve(live.p, true);
+    var all = [];
+    for (var i = 0; i < C.jobs.length; i++) all.push(i);
+    relocSend(all, false);
+    // an early start runs while no frame does (and its caller waits on warm.ids): built now
+    if (early) { clearTimeout(RELOC.pumpT); RELOC.pumpT = 0; while (RELOC.q.length) relocPump(); }
+  }
+  // one corpus job, built for a block that sits `d` bytes from where the corpus saw it
+  function relocJob(i, d) {
+    var R = RELOC, C = R.C, cj = C.jobs[i], pp = Object.assign({}, R.live.p), w = C.pages[cj.pg], k;
+    for (k in WARM_PER_SPAN) pp[k] = cj[k];
+    pp.entryPtr = (cj.entryPtr + d) >>> 0;
+    var id = ASYNC.nextId++, pageN = w.words.length - 1, span = cj.span;
+    // THE KEY OF A SPAN THAT RUNS PAST ITS PAGE (2026-10-05): compileSpan ends such a span at the
+    // page end (PAGE-END TRUNCATION) and keys it by the TRUNCATED length; the corpus records the
+    // span as offered. Keyed by the offered length, all 48 such SM64 spans (fields 158-392 of a
+    // run where every other offer was answered from the corpus) missed a module the cache held.
+    var pageLen = ((cj.blockEnd - cj.blockStart) >>> 0) >>> 2, entryInPage = ((cj.vaddr - cj.blockStart) >>> 0) >>> 2;
+    if (pageLen > 0 && entryInPage < pageLen && span > pageLen - entryInPage) span = pageLen - entryInPage;
+    var key = new Uint32Array(6 + pageN + span);
+    key[0] = pp.vaddr >>> 0; key[1] = pp.entryPtr >>> 0; key[2] = span; key[3] = pp.blockStart >>> 0;
+    key[4] = pp.blockEnd >>> 0; key[5] = pp.srcPtr >>> 0;
+    key.set(w.words.subarray(0, pageN), 6); key.set(cj.ops.subarray(0, span), 6 + pageN);
+    WARM.ids.set(id, key);
+    R.idJob.set(id, i); R.sent[i] = d; R.sentId[i] = id;
+    WARM.offered++;
+    return { id: id, p: pp, w0: w.w0, words: w.words, ops: cj.ops, flags: R.live.flags, tableBase: R.live.tableBase };
+  }
+  // jobs `list` (corpus indices), each for the block delta its page is known (or predicted) at.
+  // NOT built here: building a job copies its page and posting it clones that — ~40 us a job, so a
+  // whole corpus is tens of ms, and relocObserve runs INSIDE the core's field (the JIT up-call).
+  // MEASURED: a heap move at SM64 field 324 rebuilt 789 spans in the field — 37.1 ms, 33.2 of them
+  // in the up-call. So the indices are queued and a task of their own, between fields, builds
+  // and posts them (at most RELOC_CHUNK per task); `front` (the page the core just entered) first.
+  var RELOC_CHUNK = 64;
+  function relocSend(list, front) {
+    var R = RELOC;
+    if (front) R.q = list.concat(R.q || []); else R.q = (R.q || []).concat(list);
+    if (!R.pumpT) R.pumpT = setTimeout(relocPump, 0);
+  }
+  function relocPump() {
+    var R = RELOC, out = [], n = 0;
+    R.pumpT = 0;
+    if (!R.C || !ASYNC.w) { R.q = []; return; }
+    while (R.q.length && n < RELOC_CHUNK) {
+      var i = R.q.shift(), d = relocTarget(i);
+      if (R.done[i] === d || R.sent[i] === d) continue;
+      out.push(relocJob(i, d)); n++;
       if (out.length === 32) { ASYNC.w.postMessage({ warm: out }); out = []; }
-      WARM.offered++;
     }
     if (out.length) ASYNC.w.postMessage({ warm: out });
+    if (R.q.length) R.pumpT = setTimeout(relocPump, 1);
+  }
+  function relocTarget(i) { var R = RELOC, vp = R.C.jobs[i].vaddr >>> 12; return R.seen.has(vp) ? R.seen.get(vp) : R.pred; }
+  // ---- A CORPUS THAT FOLLOWS THE HEAP (2026-10-05) ----
+  // A corpus key holds the span's ENTRY POINTER — the host address of its precomp block, which
+  // the core mallocs the first time it runs code in that page — and the module bakes it in. The
+  // corpus was captured with nothing else taking heap in its first fields, but a session does: the
+  // frame skip's snapshot buffers (core_worker.js, 21.4 MB each, at a moment the GPU decides) and a
+  // room's ring (before Ready) are mallocs too, and every block the core makes after one sits that
+  // many bytes higher. MEASURED (SM64, rig, the same 400 fields): with ?fskip=0 every offer matched
+  // the corpus; with frame skip on, 252 of 281 offers were absent from the cache — every one the
+  // corpus held at exactly +21,426,496 B (one snapshot buffer) — and fields 360-362 ran their new
+  // code on the interpreter (20.5 / 10.2 / 9.3 ms against 10.7 / 8.1 / 7.4). So the block a page
+  // got is READ at the core's first offer in it (entryPtr less the span's index x stride is the
+  // block), the corpus's jobs for that page are rebuilt for that block, and every page not yet
+  // seen is predicted to have moved by the newest delta (blocks are carved one after another, so
+  // a buffer taken before one is taken before the next): when the prediction changes, the worker's
+  // queued corpus jobs are dropped and the rest go out again for the new place. Nothing is
+  // installed on a guess: a module is still used only when its key — built from memory as it is —
+  // equals the live one in full. ?jitreloc=0 (core_worker.js) = the corpus at its own addresses only.
+  var RELOC = { C: null, live: null, pg: null, seen: null, pred: 0, sent: null, sentId: null, done: null, idJob: null,
+                moves: 0, pages: 0, resent: 0, said: 0, q: [], pumpT: 0 };
+  function relocOff() { var g = (typeof globalThis !== 'undefined') ? globalThis : self; return !!g.__jitRelocOff; }
+  function relocInit(C, live) {
+    var R = RELOC, n = C.jobs.length, stride = C.static.stride >>> 0;
+    R.C = C; R.live = { p: Object.assign({}, live.p), flags: live.flags, tableBase: live.tableBase };
+    R.pg = new Map(); R.seen = new Map(); R.pred = 0; R.idJob = new Map();
+    R.sent = new Float64Array(n).fill(NaN); R.sentId = new Float64Array(n).fill(NaN); R.done = new Float64Array(n).fill(NaN);
+    for (var i = 0; i < n; i++) {
+      var cj = C.jobs[i], vp = cj.vaddr >>> 12, base = (cj.entryPtr - ((cj.vaddr & 0xFFF) >>> 2) * stride) | 0, g = R.pg.get(vp);
+      if (!g) R.pg.set(vp, g = { base: base, jobs: [] });
+      g.jobs.push(i);
+    }
+  }
+  // The core's offer in page vaddr>>>12: where did its block land, against the corpus?
+  function relocObserve(p, quiet) {
+    var R = RELOC;
+    if (!R.C || relocOff()) return;
+    var vp = p.vaddr >>> 12;
+    if (R.seen.has(vp)) return;
+    var g = R.pg.get(vp);
+    if (!g || !(p.stride > 0)) return;
+    var d = ((p.entryPtr - ((p.vaddr & 0xFFF) >>> 2) * p.stride) - g.base) | 0;
+    R.seen.set(vp, d); R.pages++;
+    if (quiet) { R.pred = d; return; }
+    if (d === R.pred) { relocSend(g.jobs.slice(), true); return; }
+    // THE HEAP MOVED: what the worker still has queued was built for the old place
+    R.pred = d; R.moves++;
+    if (ASYNC.w) ASYNC.w.postMessage({ warmDrop: true });
+    for (var i = 0; i < R.sent.length; i++) {
+      if (R.sent[i] === R.sent[i] && R.done[i] !== R.sent[i]) { WARM.ids.delete(R.sentId[i]); R.idJob.delete(R.sentId[i]); R.sent[i] = NaN; }
+    }
+    var list = g.jobs.slice(), redo = 0;
+    for (var j = 0; j < R.C.jobs.length; j++) if ((R.C.jobs[j].vaddr >>> 12) !== vp) list.push(j);
+    for (var q = 0; q < list.length; q++) { var t = relocTarget(list[q]); if (R.done[list[q]] !== t) redo++; }
+    R.q = [];
+    relocSend(list, false);
+    R.resent += redo;
+    if (R.said++ < 4) {
+      var gl = (typeof globalThis !== 'undefined') ? globalThis : self, msg = '[jit] span corpus: the heap moved ' + d + ' B under it (a buffer was taken before this block) — '
+        + redo + ' spans to rebuild for the new place';
+      try { if (typeof gl.log === 'function') gl.log(msg); else console.log(msg); } catch (e) {}
+    }
   }
   // a corpus module back from the worker: into the recompile cache, nowhere else
   function warmPut(M, r, key) {
@@ -2112,6 +2214,7 @@
       var r = q[i], j = ASYNC.pending.get(r.id);
       if (!j) {
         var wkey = WARM.ids.get(r.id);
+        if (wkey && RELOC.idJob) { var ji = RELOC.idJob.get(r.id); if (ji !== undefined) { RELOC.idJob.delete(r.id); RELOC.done[ji] = RELOC.sent[ji]; } }
         if (wkey) { WARM.ids.delete(r.id); try { warmPut(M, r, wkey); } catch (e) { stats.warmErr = String((e && e.message) || e).slice(0, 160); } }
         continue;
       }
@@ -2294,6 +2397,7 @@
     if (census.on === null) census.on = !!(typeof window !== 'undefined' && window.__jitCensus);
     RAW = 0;
     COLD = null;
+    if (RELOC.C && !EMIT_ONLY) relocObserve(p);
     var HEAPU32 = Module.HEAPU32;
     var C = new RegCache(p.reg);
     p.regBase = p.reg;
@@ -3109,5 +3213,5 @@
   }
   window.bementalMips = { compileSpan: compileSpan, frameEnd: frameEnd, stats: stats, census: censusDump, censusOn: function () { return !!census.on; },
                          async: ASYNC, emitJob: emitJob, emitBatch: emitBatch, warm: WARM, warmCorpus: warmCorpus,
-                         warmEarly: warmEarly, warmPump: warmPump };
+                         warmEarly: warmEarly, warmPump: warmPump, reloc: RELOC };
 })();
