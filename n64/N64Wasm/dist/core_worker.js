@@ -316,6 +316,8 @@ function tickBody(src) {
       SCHED.notOwed++;
       // a turn before the field is owed: warm the next snapshot buffer (fsWarmStep), if there is room
       if (CLK.viHz > 0 && CLK.base) fsWarmStep(CLK.base + (CLK.frame - CLK.baseFrame) * (1000 / CLK.viHz) - performance.now());
+      // and the heap above the break (THE HEAP ABOVE THE BREAK)
+      if (CLK.viHz > 0 && CLK.base) heapWarmStep(CLK.base + (CLK.frame - CLK.baseFrame) * (1000 / CLK.viHz) - performance.now());
     }
   } else CLK.base = 0;     // resume re-anchors: a pause is not debt
   schedule();
@@ -594,6 +596,42 @@ function fsAlloc() {
 // field is owed: one spare beyond the buffers in use, never more than FSK.maxSnaps in all. The cost
 // is the heap of one snapshot a title that never skips would not have taken.
 var FSW = { p: 0, n: 0, done: 0, warmed: 0, ms: 0 };
+// ---- THE HEAP ABOVE THE BREAK IS WRITTEN BEFORE A FIELD TAKES IT (2026-10-06) -------------------
+// A scene load's new code costs the core fresh heap inside the field: init_block (recomp.c) gives
+// every 4 KiB code page the guest enters for the first time a 169 KB precomp array (1281 x 132 B),
+// and its kseg1 alias one more — SM64's room field 359 enters 39 new pages, 78 arrays, 13 MB, all
+// carved from the top of the heap and first written right there (memset + the per-instruction loop).
+// MEASURED (layout-neutral instrumented core: a JS hook at init_block's entry and exit; prod mirror,
+// SwiftShader, bench loopback room): the same 78 calls into the same addresses cost 9.3-11.1 ms with
+// the corpus on hand before the room, and 137 ms when the corpus arrived 3 s late — while the compile
+// worker builds it, every first touch of a fresh page in this process is ~13x slower — which is the
+// live site's "scene load: 87 new spans entered (precompiled) [field 359, 82-127 ms]": the live
+// network delivers the corpus late. init_block itself is not the cost; the page faults are.
+// So the pages a field will take are written ahead, in turns with no field owed: the heap from the
+// break up to HW.lead above it. Bytes above the break belong to no one (dlmalloc takes them only by
+// moving the break, and a fresh page already reads 0), so writing 0 there changes nothing any code
+// can see — not the heap's layout (the JIT corpus's addresses follow it), not a byte of guest state.
+// Only the faults move: to boot (before frame 0) and to quiet turns, 2 MB / 3 ms at most a turn.
+// ?heapwarm=0 is the CONTROL ARM; ?heapwarm=MB sets the lead.
+var HW = { on: true, lead: 32 << 20, to: 0, bytes: 0, ms: 0, maxMs: 0, steps: 0, boot: 0 };
+function hwOk() { return HW.on && M && M.HEAPU8 && typeof M._neil_heap_brk === 'function'; }
+function heapWarm(maxBytes, maxMs) {
+  if (!hwOk()) return 0;
+  var H = M.HEAPU8, brk = M._neil_heap_brk() >>> 0, end = Math.min(H.length, brk + HW.lead);
+  var from = Math.max(HW.to, brk), done = 0, t0 = performance.now();
+  if (from >= end) return 0;
+  while (from < end && done < maxBytes) {
+    var e = Math.min(end, from + (256 << 10));
+    H.fill(0, from, e);
+    done += e - from; from = e;
+    if (performance.now() - t0 >= maxMs) break;
+  }
+  HW.to = from; HW.bytes += done; HW.steps++;
+  var dt = performance.now() - t0; HW.ms += dt; if (dt > HW.maxMs) HW.maxMs = dt;
+  return done;
+}
+// a turn with `slack` ms before the next field is owed
+function heapWarmStep(slack) { if (slack >= 5) heapWarm(2 << 20, Math.min(3, slack - 2)); }
 function fsWarmStep(slack) {
   if (!FSK.on || !(slack >= 6) || FSK.pool.length || !fsCoreReady()) return;
   if (!FSW.p) {
@@ -1260,6 +1298,8 @@ function roomFeedBody(src) {
   var now = performance.now();
   // delay lockstep runs its frames through fsField's snapshots: warm the next one in a quiet turn
   if (R.LS.frame === f0 && R.LS.running && RM.eng && !RM.eng.rollback) fsWarmStep(roomDueAt(R) - now);
+  // THE HEAP ABOVE THE BREAK, in a tick that ran no frame (lockstep or rollback)
+  if (R.LS.frame === f0 && R.LS.running) heapWarmStep(roomDueAt(R) - performance.now());
   if (now - RM.mirT > 100) roomMirror(true);
   if (now - RM.pubT > 400) { RM.pubT = now; if (R.LS.running) R.publishSelf(RM.rtt); }
 }
@@ -1278,6 +1318,9 @@ function roomMainRan() {
   // main() has returned on a gated core: the same point the page's callMain wrapper marks
   // (declareWhenMainReturns). The rollback path is proven HERE, before the page declares.
   try { R.lsRbProve(); } catch (e) { R.lsRbRefuse('the savestate check threw: ' + ((e && e.message) || e)); }
+  // the rollback check has taken the room's state slots from the top of the heap: the lead again,
+  // above the new break, before the room's frame 0 (THE HEAP ABOVE THE BREAK)
+  heapWarm(HW.lead, Infinity);
   log('[lockstep] main() has run — the core is booted and gated in the core worker; declaring now');
   roomDrivers();
   roomMirror(true);
@@ -1611,6 +1654,13 @@ function boot(d) {
           if (d.workerfail === 'main') throw new Error('?workerfail=main — a simulated core failure during boot (rig seam)');
           M.callMain(['custom.v64']);
           post({ t: 'booted' });
+          (function () {
+            var hq = new URLSearchParams(d.search || '').get('heapwarm');
+            if (hq === '0' || hq === 'off') { HW.on = false; log('[heap] CONTROL ARM (?heapwarm=0) — fresh heap is first written inside the field that takes it'); }
+            else if (hq != null && +hq > 0) HW.lead = Math.min(256, +hq) << 20;
+            var t0 = performance.now(); HW.boot = heapWarm(HW.lead, Infinity);
+            if (HW.on) log('[heap] ' + (HW.boot / 1048576).toFixed(0) + ' MB above the break written before frame 0 (' + (performance.now() - t0).toFixed(1) + ' ms) — a field never takes a fresh page (THE HEAP ABOVE THE BREAK)');
+          })();
           SCHED.coupled = (function () { var pq = new URLSearchParams(d.search || '').get('pace'); return pq === '0' || pq === 'off'; })();
           if (SCHED.coupled) log('[pace] core worker: CONTROL ARM (?pace=0) — one field per animation frame, nothing else');
           CB.mode = PB.on ? 'bitmap' : (d.present === 'commit' ? 'commit' : 'yield');
