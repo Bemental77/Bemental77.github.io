@@ -694,8 +694,9 @@
     // is shown) skip too: their state is discarded whatever they read.
     var GLSKIP = { on: false, disabled: RB_Q.get('rbgl') === '1' ? 'pinned off (?rbgl=1)' : null,
                    taint: false, reads: 0, calls: 0, frames: 0, redo: 0 };
-    if (G.WebGL2RenderingContext) (function () {
-      var P = WebGL2RenderingContext.prototype;
+    // ⚠ BOTH CONTEXT CLASSES: the core runs on WebGL1 where WebGL2 is missing (glcompat.js), and
+    // a readback this hook did not see would leave GLSKIP skipping draws whose pixels reach RDRAM.
+    [G.WebGL2RenderingContext, G.WebGLRenderingContext].forEach(function (C) { if (C) (function (P) {
       ['drawArrays', 'drawElements', 'drawArraysInstanced', 'drawElementsInstanced', 'drawRangeElements',
        'clear', 'clearBufferfv', 'clearBufferiv', 'clearBufferuiv', 'clearBufferfi', 'blitFramebuffer'].forEach(function (n) {
         var f = P[n];
@@ -715,7 +716,7 @@
         }
         return rp.apply(this, arguments);
       };
-    })();
+    })(C.prototype); });
     function glSkipOk() {
       var st = G.__fbAsync || {};
       return !GLSKIP.disabled && !st.on && !st.readAlways;
@@ -2033,15 +2034,16 @@
       // context the core already created (getContext returns the existing one —
       // safe here because a frame has just run, so it exists).
       var M = G.Module, gl = M && M.ctx;
-      if (!gl) { try { gl = env.canvas().getContext('webgl2'); } catch (e) { gl = null; } }
+      if (!gl) { try { gl = env.canvas().getContext((G.__n64GL && G.__n64GL.v === 1) ? 'webgl' : 'webgl2'); } catch (e) { gl = null; } }
       if (!gl || typeof gl.readPixels !== 'function') return;
       if (gl.isContextLost && gl.isContextLost()) { LS_GL.lost = true; return; }
       try {
         var W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
         if (!(W > 8 && H > 8)) return;
-        var rfb = gl.getParameter(gl.READ_FRAMEBUFFER_BINDING);
-        var ppb = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
-        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+        var RFB = gl.READ_FRAMEBUFFER || gl.FRAMEBUFFER;                       // WebGL1: one binding
+        var rfb = gl.getParameter(gl.READ_FRAMEBUFFER_BINDING || gl.FRAMEBUFFER_BINDING);
+        var ppb = gl.PIXEL_PACK_BUFFER_BINDING ? gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING) : null;
+        gl.bindFramebuffer(RFB, null);
         if (ppb) gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
         var px = new Uint8Array(4 * 16), lit = false;
         // One 16-pixel row through the middle third of the picture.
@@ -2049,7 +2051,7 @@
         try { gl.readPixels((W >> 1) - 8, H >> 1, 16, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); }
         finally { if (G.__fbAsync) G.__fbAsync.bypass = false; }
         for (var i = 0; i < px.length; i += 4) if (px[i] + px[i + 1] + px[i + 2] > 24) { lit = true; break; }
-        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, rfb);
+        gl.bindFramebuffer(RFB, rfb);
         if (ppb) gl.bindBuffer(gl.PIXEL_PACK_BUFFER, ppb);
         LS_GL.reads++; if (lit) LS_GL.lit++;
       } catch (e) { LS_GL.err = (e && e.message) || String(e); }

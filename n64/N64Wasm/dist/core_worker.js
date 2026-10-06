@@ -522,9 +522,9 @@ function fsInstall(search) {
   if (!self.WebGL2RenderingContext) { FSK.on = false; FSK.why = 'no WebGL2'; }
 }
 // the window's draw calls (after ?present=bitmap's wrappers, so a swallowed draw is not a picture)
-function fsWrap() {
-  if (!self.WebGL2RenderingContext) return;
-  var P = WebGL2RenderingContext.prototype, FB = P.FRAMEBUFFER, DFB = P.DRAW_FRAMEBUFFER, bf = P.bindFramebuffer;
+function fsWrap() { self.__n64GLProtos(self).forEach(fsWrapP); }
+function fsWrapP(P) {
+  var FB = P.FRAMEBUFFER, DFB = P.DRAW_FRAMEBUFFER, bf = P.bindFramebuffer;
   P.bindFramebuffer = function (t, fb) { if (t === FB || t === DFB) this.__fsFb = fb || null; return bf.apply(this, arguments); };
   ['drawArrays', 'drawElements', 'drawRangeElements', 'drawArraysInstanced', 'drawElementsInstanced',
    'clear', 'clearBufferfv', 'clearBufferiv', 'clearBufferuiv', 'clearBufferfi', 'blitFramebuffer'].forEach(function (n) {
@@ -538,9 +538,9 @@ function fsWrap() {
   });
 }
 // after fbasync.js: the outermost readPixels, so it sees every read the core makes
-function fsInstallRead() {
-  if (!self.WebGL2RenderingContext) return;
-  var P = WebGL2RenderingContext.prototype, rp = P.readPixels;
+function fsInstallRead() { self.__n64GLProtos(self).forEach(fsInstallReadP); }
+function fsInstallReadP(P) {
+  var rp = P.readPixels;
   P.readPixels = function () {
     var st = self.__fbAsync;
     // a read the core makes (not glide's lazy copy, which reads its own capture: lazy_fb.c
@@ -823,9 +823,8 @@ function viTotal() { return ((M._neil_vi_total() >>> 0) - FSK.redoFieldsAll) >>>
 // Only fields that DREW are taken: a field that draws nothing (Mario Kart draws a picture
 // every second field) leaves the last picture up, exactly as a canvas commit would.
 var PB = { on: false, drew: false, sent: 0, errs: 0, err: null, ms: 0 };
-function pbInstall() {
-  if (!self.WebGL2RenderingContext) return;
-  var P = WebGL2RenderingContext.prototype;
+function pbInstall() { self.__n64GLProtos(self).forEach(pbInstallP); }
+function pbInstallP(P) {
   var FB = P.FRAMEBUFFER, DFB = P.DRAW_FRAMEBUFFER, bf = P.bindFramebuffer;
   P.bindFramebuffer = function (t, fb) { if (t === FB || t === DFB) this.__pbFb = fb || null; return bf.apply(this, arguments); };
   ['drawArrays', 'drawElements', 'drawRangeElements', 'drawArraysInstanced', 'drawElementsInstanced',
@@ -1339,8 +1338,7 @@ function dbgInstall(search) {
       try { return f.apply(this, arguments); } finally { DBG.b[bucket] += now() - t0; DBG.n[bucket]++; DBG.depth--; }
     };
   }
-  if (self.WebGL2RenderingContext) {
-    var P = WebGL2RenderingContext.prototype;
+  if (self.__n64GLProtos) self.__n64GLProtos(self).forEach(function (P) {
     ['compileShader', 'getShaderParameter', 'getShaderInfoLog'].forEach(function (n) { wrap(P, n, 'shader'); });
     ['linkProgram', 'getProgramParameter', 'getProgramInfoLog', 'getUniformLocation', 'getAttribLocation', 'validateProgram'].forEach(function (n) { wrap(P, n, 'prog'); });
     wrap(P, 'readPixels', 'read'); wrap(P, 'getBufferSubData', 'gbsd');
@@ -1348,7 +1346,7 @@ function dbgInstall(search) {
     ['texImage2D', 'texSubImage2D', 'texStorage2D', 'copyTexImage2D', 'copyTexSubImage2D', 'generateMipmap'].forEach(function (n) { wrap(P, n, 'tex'); });
     ['bufferData', 'bufferSubData'].forEach(function (n) { wrap(P, n, 'buf'); });
     ['finish', 'flush', 'clientWaitSync', 'getSyncParameter', 'getError'].forEach(function (n) { wrap(P, n, 'sync'); });
-  }
+  });
   DBG.wrapJit = function () {
     var f = self.myApp && self.myApp.jitCompile; if (!f || f.__dbg) return;
     var g = function (p) { var t0 = now(); try { return f(p); } finally { DBG.b.jit += now() - t0; DBG.n.jit++; } };
@@ -1528,11 +1526,16 @@ function boot(d) {
   // back at once (the core's own canvas is never touched, so its context attributes are the
   // core's). ?workerfail=boot|main is a rig seam that simulates a failure at either point.
   if (d.workerfail === 'boot') { post({ t: 'err', s: 'boot: ?workerfail=boot — a simulated boot failure (rig seam)', fatal: true, boot: true }); return; }
+  // WebGL1 is enough (glcompat.js: the core falls back to it where WebGL2 is missing — Edge on
+  // Xbox, 2026-10-06), so the preflight asks for EITHER and records which.
   try {
-    var probe = (typeof OffscreenCanvas === 'function') ? new OffscreenCanvas(1, 1).getContext('webgl2') : null;
-    if (!probe) { post({ t: 'err', s: 'boot: WebGL2 is not available inside a worker on this browser (OffscreenCanvas getContext("webgl2") returned null)', fatal: true, boot: true }); return; }
-    var lose = probe.getExtension('WEBGL_lose_context'); if (lose) lose.loseContext();
-  } catch (e) { post({ t: 'err', s: 'boot: WebGL2 in a worker threw: ' + ((e && e.message) || e), fatal: true, boot: true }); return; }
+    importScripts('glcompat.js?v=' + (d.v || ''));
+    self.__n64InstallGLCompat(self, d.search || '');
+    var glp = (typeof OffscreenCanvas === 'function') ? self.__n64GL.probe() : { v: 0 };
+    if (!glp.v) { post({ t: 'err', s: 'boot: no WebGL inside a worker on this browser (OffscreenCanvas getContext("webgl2") and ("webgl") both returned null)', fatal: true, boot: true }); return; }
+    log('[gl] core worker: WebGL' + glp.v + (glp.v === 1 ? ' — WebGL2 is ' + (self.__n64GL.want === 1 ? 'pinned off (?webgl=1)' : 'not available here') + '; the core runs its GLES2 paths' : ''));
+    if (glp.v === 1 && FSK.on) { FSK.on = false; FSK.why = 'off: WebGL1 has no fences, so the GPU queue cannot be measured'; log('[fskip] ' + FSK.why); }
+  } catch (e) { post({ t: 'err', s: 'boot: WebGL in a worker threw: ' + ((e && e.message) || e), fatal: true, boot: true }); return; }
   if (d.present === 'bitmap') {
     d.canvas = new OffscreenCanvas(d.cw > 0 ? d.cw : 640, d.ch > 0 ? d.ch : 480);
     PB.on = true; pbInstall();

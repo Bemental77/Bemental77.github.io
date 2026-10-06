@@ -192,6 +192,14 @@ all: n64wasm.js
 # calledRun is NOT recoverable this way: 6.0.2 guards it behind #if ASSERTIONS
 # and never assigns it to Module (src/postamble.js:117-120). Anything gating on
 # Module.calledRun must be changed instead -- see tools/n64_boot_test.mjs.
+# WEBGL1 FALLBACK (2026-10-06): MIN_WEBGL_VERSION=1 MAX_WEBGL_VERSION=2 makes the JS glue choose
+# WebGL2 or WebGL1 at run time (was MIN_WEBGL_VERSION=2 — the core could not start without WebGL2,
+# which Edge on Xbox does not give). glide2gl is GLES2 code ("#version 100" shaders). The .wasm
+# is BYTE-IDENTICAL either way (2630440f): only the glue changes, so JIT corpora are untouched.
+# ../dist/glcompat.js walks the context ladder (webgl2 -> relaxed -> webgl) and sets
+# attrs.majorVersion = 1 when it lands on WebGL1; GL_WORKAROUND_SAFARI_GETCONTEXT_BUG=0 because
+# that workaround wraps getContext and nulls a context whose class differs from the name asked for
+# (glcompat.js does the same class check itself).
 # THE WASM URL CARRIES THE WASM'S OWN HASH (the sed after emcc). The pages version
 # n64wasm.js (the worker imports it as n64wasm.js?v=WK_V), but the JS fetched the
 # binary as a bare "n64wasm.wasm", so for as long as an HTTP cache held the old one
@@ -205,7 +213,8 @@ n64wasm.js: $(FILES)
     -lGL \
     -s TOTAL_MEMORY=536870912 \
 	--use-preload-plugins \
-	-s MIN_WEBGL_VERSION=2 \
+	-s MIN_WEBGL_VERSION=1 -s MAX_WEBGL_VERSION=2 \
+	-s GL_WORKAROUND_SAFARI_GETCONTEXT_BUG=0 \
 	-s FULL_ES3=1 \
 	-s ASSERTIONS=0 \
 	-O3 \

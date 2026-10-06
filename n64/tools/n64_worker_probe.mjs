@@ -57,6 +57,10 @@ const ROM = flag('rom', 'mariokart.z64');
 const BASE = flag('url', 'http://localhost:18500');
 const OUT = flag('out', path.join(os.tmpdir(), 'n64-worker-probe'));
 const XQ = flag('query', '');
+// --query-m / --query-w: an extra query for ONE arm only (exact mode). The cross-renderer check:
+// --query-m webgl=1 puts the main-thread core on WebGL1 (n64/N64Wasm/dist/glcompat.js) against a
+// WebGL2 worker core — the same console only if every GL-dependent byte that reaches RDRAM agrees.
+const XQM = flag('query-m', ''), XQW = flag('query-w', '');
 const CHROME = process.env.CHROME_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
 fs.mkdirSync(OUT, { recursive: true });
 const load1 = () => { try { return +fs.readFileSync('/proc/loadavg', 'utf8').split(' ')[0]; } catch { return null; } };
@@ -86,7 +90,7 @@ function defaultPlan(frames) {
 const PLAN = defaultPlan(+flag('frames', '900'));
 
 // Runs in EITHER realm (page window or the core worker's self): frames [from, to).
-const RUN = function (from, to, plan, every, last) {
+const RUN = function (from, to, plan, every, last, flush) {
   const G = (typeof window !== 'undefined' && window.Module && !window.Module.__worker) ? window : self;
   const M = G.Module;
   if (!G.__wkp) {
@@ -96,6 +100,10 @@ const RUN = function (from, to, plan, every, last) {
   }
   const S = G.__wkp, out = { fp: [], st: [], ms: 0 };
   const hashState = () => {
+    // --flush: materialise every lazy framebuffer copy first (lazy_fb.c neil_lfb_flush), so the hash
+    // covers what the guest CAN observe. A lazy console and an eager one (a WebGL1 console: no
+    // native sampling pass, so no lazy copy) differ only in RDRAM nothing has observed yet.
+    if (flush && M._neil_lfb_flush) M._neil_lfb_flush();
     M.HEAPU8.fill(0, S.ptr, S.ptr + S.n);
     if (!(M._neil_state_save_raw_fast(S.ptr) | 0)) return -1;
     // Every byte EXCEPT the trailer header's nonce / tlb_gen / hid_epoch (region+16..+28):
@@ -155,7 +163,7 @@ async function exactArm(browser, arm, frames, every, tag) {
   page.on('console', (m) => { if (m.type() === 'error' && !BENIGN.test(m.text())) errs.push('console: ' + m.text().slice(0, 200)); });
   const W = arm === 'W';
   if (!W) await page.evaluateOnNewDocument(PRE_MAIN);
-  const q = (W ? 'worker=1&workerrig=1' : 'worker=0') + (XQ ? '&' + XQ : '');
+  const q = (W ? 'worker=1&workerrig=1' : 'worker=0') + (XQ ? '&' + XQ : '') + ((W ? XQW : XQM) ? '&' + (W ? XQW : XQM) : '');
   await page.goto(`${BASE}/n64/?game=${encodeURIComponent(ROM)}&autostart&${q}`, { waitUntil: 'domcontentloaded' });
   if (W) {
     await page.waitForFunction(() => { const s = window.__n64Worker && window.__n64Worker.state(); return s && (s.booted || s.fatal); }, { timeout: 240000 });
@@ -170,7 +178,7 @@ async function exactArm(browser, arm, frames, every, tag) {
   const CH = 30;
   for (let f = 0; f < frames; f += CH) {
     const to = Math.min(frames, f + CH);
-    const src = `(${RUN.toString()})(${f}, ${to}, ${JSON.stringify(PLAN)}, ${every}, ${frames})`;
+    const src = `(${RUN.toString()})(${f}, ${to}, ${JSON.stringify(PLAN)}, ${every}, ${frames}, ${argv.includes('--flush')})`;
     const o = W ? await page.evaluate((s) => window.__n64Worker.eval(s), src) : await page.evaluate(src);
     res.fp.push(...o.fp); res.st.push(...o.st); res.ms += o.ms;
   }
@@ -180,8 +188,8 @@ async function exactArm(browser, arm, frames, every, tag) {
       const u = M.HEAPU8.subarray(S.ptr, S.ptr + S.n); let s = ''; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); return btoa(s); })()`;
     res.dump = W ? await page.evaluate((s) => window.__n64Worker.eval(s), dsrc) : await page.evaluate(dsrc);
   }
-  res.where = W ? await page.evaluate(() => window.__n64Worker.eval('({ realm: typeof WorkerGlobalScope !== "undefined" ? "worker" : "window", jit: self.__jitStats ? self.__jitStats() : null, fb: self.__fbAsync ? { on: self.__fbAsync.on, calls: self.__fbAsync.calls, async: self.__fbAsync.async } : null })'))
-                : await page.evaluate(() => ({ realm: 'window', jit: window.__jitStats ? window.__jitStats() : null, fb: window.__fbAsync ? { on: window.__fbAsync.on, calls: window.__fbAsync.calls, async: window.__fbAsync.async } : null }));
+  res.where = W ? await page.evaluate(() => window.__n64Worker.eval('({ realm: typeof WorkerGlobalScope !== "undefined" ? "worker" : "window", jit: self.__jitStats ? self.__jitStats() : null, fb: self.__fbAsync ? { on: self.__fbAsync.on, calls: self.__fbAsync.calls, async: self.__fbAsync.async } : null, gl: self.__n64GL ? self.__n64GL.decided : null })'))
+                : await page.evaluate(() => ({ realm: 'window', jit: window.__jitStats ? window.__jitStats() : null, fb: window.__fbAsync ? { on: window.__fbAsync.on, calls: window.__fbAsync.calls, async: window.__fbAsync.async } : null, gl: window.__n64GL ? window.__n64GL.decided : null }));
   await sleep(300);
   await page.screenshot({ path: path.join(OUT, `exact-${tag}-${arm}.png`) });
   await ctx.close();
@@ -191,7 +199,7 @@ async function exactArm(browser, arm, frames, every, tag) {
 async function modeExact() {
   const frames = +flag('frames', '900'), every = +flag('every', '30');
   const browser = await launch();
-  const out = { mode: 'exact', rom: ROM, frames, every, query: XQ, load: [load1()] };
+  const out = { mode: 'exact', rom: ROM, frames, every, query: XQ, queryM: XQM, queryW: XQW, load: [load1()] };
   try {
     // --arms M,W (default) | M,M | W,W — the same-realm pairs are the determinism CONTROL:
     // a difference there is the rig or the state, not the worker.
