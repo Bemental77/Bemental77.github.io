@@ -111,7 +111,11 @@ export function simulate(sc) {
   const latency = (from, to) => {
     const g = from === 'H' ? to : from;
     const base = typeof sc.baseMs === 'function' ? sc.baseMs(T, g) : (sc.baseMs || 0);
-    return Math.max(0, base + rnd() * (sc.jitterMs || 0));
+    // sc.spike { p, ms }: a heavy tail on top of the uniform jitter — a phone's
+    // Wi-Fi / radio occasionally holds a packet for tens of ms (the uniform
+    // model alone never produces the tail a real link's p99 comes from).
+    const spike = sc.spike && rnd() < sc.spike.p ? rnd() * sc.spike.ms : 0;
+    return Math.max(0, base + rnd() * (sc.jitterMs || 0) + spike);
   };
   const outage = (id) => (sc.outages || (sc.outage ? [sc.outage] : [])).some((o) => o.id === id && T >= o.from && T < o.to);
   // One hop. `m` is already a private copy.
@@ -183,6 +187,17 @@ export function simulate(sc) {
     else if (sc.readyStepMs) opts.selfStepMs = 0;
     if (sc.rbResume) opts.rbResume = true;
     if (host && sc.hintMs) opts.rbHintMs = sc.hintMs;
+    // sc.pingHint: the Session's lobby pings (Session._lobbyPing) — five round
+    // trips to every guest over THIS link model before the start, sized like
+    // the product does (Lockstep.rttBudget, halved to one way).
+    if (host && sc.pingHint) {
+      let worst = 0;
+      for (const g of ids) if (g !== 'H') {
+        const xs = []; for (let i = 0; i < 5; i++) xs.push(latency('H', g) + latency(g, 'H'));
+        worst = Math.max(worst, Lockstep.rttBudget(xs) || 0);
+      }
+      opts.rbHintMs = Math.max(opts.rbHintMs || 0, worst / 2);
+    }
     // sc.maxWindow: { id: frames } — the deepest window that console's ring can
     // hold (opts.rbMaxWindow, published in lsready/lsrb as `mw`).
     if (sc.maxWindow && sc.maxWindow[id]) opts.rbMaxWindow = sc.maxWindow[id];
@@ -348,7 +363,7 @@ export function simulate(sc) {
   }
   // ---- verdicts -----------------------------------------------------------
   const warm = (sc.warmSecs == null ? 5 : sc.warmSecs) * 1000;
-  const out = { name: sc.name, players: n, consoles: {} };
+  const out = { name: sc.name, players: n, consoles: {}, zeroStall: !!sc.zeroStall };
   let minRate = Infinity, maxWin = 0, lagBad = 0, lagN = 0, desyncs = 0, compared = 0;
   for (const id of ids) {
     const p = P[id], ls = p.ls, rep = ls.report(), rb = rep.rollback || {};
@@ -373,7 +388,7 @@ export function simulate(sc) {
     compared += rep.hashesCompared || 0;
     out.consoles[id] = { rate: +rate.toFixed(4), max5s: +mw.toFixed(4), presented: +(p.presented / ((T - (p.beganAt || 0)) / FRAME)).toFixed(4),
       frames: p.frames, hidden: p.hidden, aheadOfRoomClock: +p.aheadMax.toFixed(2), state: ls.state, error: ls.error || null,
-      window: ls.rollback, windowPeak: ls._rbWinPeak || ls.rollback, stalls: rb.windowStalls, advWaits: rb.advantageWaits,
+      window: ls.rollback, windowPeak: ls._rbWinPeak || ls.rollback, stalls: rb.windowStalls, stallMs: Math.round(ls.stats.stallMs || 0), advWaits: rb.advantageWaits,
       rollbacks: rb.rollbacks, maxDepth: rb.maxDepth, resim: p.resim, catchUp: rb.catchUpFrames || 0,
       windowChanges: rb.windowChanges || 0, holeNaks: rb.holeNaks || 0, compared: rep.hashesCompared, maxTickWork: +p.maxTickWork.toFixed(1),
       lag: p.lagBad + '/' + p.lagN, rejoinTicks: p.rejoinTicks, pacedTicks: p.pacedTicks, old: p.old,
@@ -441,6 +456,14 @@ CELLS['rb-4p-50ms-phone'] = { players: 4, baseMs: 50, jitterMs: 20, loss: 0.02, 
 // worse (presented 0.75 -> 0.56 at 2p/100); slowing the others (rbPace < 1) was
 // a visible sustained slowdown and is gone.
 CELLS['rb-4p-100ms-phone'] = { players: 4, baseMs: 100, jitterMs: 30, loss: 0.02, stepMs: { G3: 6 }, info: true };
+// THE REPORTED ROOM (docs/devices/xbox-edge.md, 2026-10-06): a phone guest on a
+// direct P2P link, RTT 127 ms (9 frames), late inputs p99 9 / max 10 frames, a
+// 12-14 frame window — and still 15 stalls in 110 s, 359 ms of them on the host.
+// 58 ms + up to 20 ms of jitter each way, a 2% heavy tail of up to 60 ms more,
+// 2% loss. The rule is ZERO stalls once the room is running (judge, `zeroStall`).
+CELLS['rb-2p-127rtt'] = { pingHint: true, players: 2, baseMs: 58, jitterMs: 20, spike: { p: 0.02, ms: 60 }, loss: 0.02, zeroStall: true };
+CELLS['rb-2p-127rtt-phone'] = { pingHint: true, players: 2, baseMs: 58, jitterMs: 20, spike: { p: 0.02, ms: 60 }, loss: 0.02, stepMs: { G1: 4 }, zeroStall: true };
+CELLS['rb-2p-127rtt-lossy'] = { pingHint: true, players: 2, baseMs: 58, jitterMs: 30, spike: { p: 0.03, ms: 80 }, loss: 0.05, zeroStall: true };
 // the room with display ticks that hitch (a 60 ms stall on 1% of ticks)
 CELLS['rb-2p-100ms-hitchy'] = { players: 2, baseMs: 100, jitterMs: 30, loss: 0.02, hiccup: { p: 0.01, ms: 60 } };
 
@@ -460,6 +483,11 @@ export function judge(r) {
   if (!(r.compared > 0)) bad.push('no fingerprints compared');
   if (r.truthBad || !(r.truthChecked > 0)) bad.push(r.truthBad + '/' + r.truthChecked + ' fingerprinted states differ from a straight run');
   for (const id in r.consoles) if (r.consoles[id].state === 'failed') bad.push(id + ' failed: ' + r.consoles[id].error);
+  // ZERO SLOWDOWN: a room whose inputs arrive within the window never stalls.
+  if (r.zeroStall) for (const id in r.consoles) {
+    const c = r.consoles[id];
+    if (c.stalls) bad.push(id + ' stalled ' + c.stalls + 'x (' + c.stallMs + ' ms) in a room the window covers');
+  }
   return bad;
 }
 
