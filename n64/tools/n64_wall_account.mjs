@@ -42,7 +42,10 @@ const STALL = flag('stall', '').split(':').map(Number);
 const CHROME = '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const args = ['--no-sandbox', '--autoplay-policy=no-user-gesture-required', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--window-size=1280,900'];
+// --angle default: Chrome's own ANGLE backend (headless: Vulkan on SwiftShader) instead of --use-angle=swiftshader — the
+//   bench's second renderer arm, whose room read 0.988-0.998x where SwiftShader-GL read 1.000x
+const args = ['--no-sandbox', '--autoplay-policy=no-user-gesture-required', '--enable-unsafe-swiftshader', '--window-size=1280,900'];
+if (flag('angle', 'swiftshader') !== 'default') args.push('--use-angle=swiftshader');
 if (PROD) { args.push('--ignore-certificate-errors'); if (process.env.HTTPS_PROXY) args.push('--proxy-server=' + process.env.HTTPS_PROXY); }
 const browser = await puppeteer.launch({ executablePath: CHROME, headless: 'new', args, protocolTimeout: 600000 });
 try { (await import('../../tools/browser_leak_guard.js')).default.guard(browser, 'n64_wall_account'); } catch (_e) {}
