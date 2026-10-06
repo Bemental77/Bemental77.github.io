@@ -282,6 +282,11 @@ and 1.0001/0. Both consoles stepped down to depth 1 at about 17 s.
 - The witness is `__dcNet().lockstep.look` (also `lookUps`, `lookDowns` and
   `lookLatched`), and the page logs each change.
 
+> **Superseded 2026-10-06** (`room-frameskip/TASKS.md`, the follow-up section). The
+> render-bound arm now holds 1.000x: a frame that starts more than 17 ms behind the wall
+> clock skips its picture. Default-arm bench room 0.9976-1.0021 over 5 runs, 0 over,
+> delay 1, depth 1 earned at about 17 s.
+
 **What is NOT fixed.** On the render-bound arm, even depth 2 does not hold
 1.000 +/- 0.005. That includes a94321d itself, 0.90-0.98x today. It is the
 box's rasterizer capacity for two consoles, not the queue.

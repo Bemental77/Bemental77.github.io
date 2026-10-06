@@ -2947,8 +2947,8 @@
         lastPaceSeq++; lastPaceDrop = d.dropMs | 0; lastPaceAhead = +d.aheadMs || 0;
         if (d.dropMs !== undefined) {
           // overMs: debt beyond the governor's repay cap — the quantity this rule
-          // was measured on (the worker now writes a past-the-cap debt off whole,
-          // so dropMs counts the whole of it). Older shims: dropMs.
+          // was measured on (equal to dropMs today; kept apart so a change to the
+          // worker's drop rule cannot silently retune this one). Older shims: dropMs.
           if (LS.running) lsLookTune(d.overMs !== undefined ? d.overMs | 0 : d.dropMs | 0);
           govDropMs += d.dropMs | 0; govDrops += d.drops | 0;
           govAskMs += d.pacedMs | 0; govSleptMs += d.sleptMs | 0;
