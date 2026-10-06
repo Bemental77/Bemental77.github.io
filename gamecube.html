@@ -8743,7 +8743,9 @@ window.GcRate = (function () {
   // the lockstep state FINGERPRINT (seq, frame, hash). Rounded up
   // so adding a cell does not mean re-deriving a size in two files. It was 64 bytes for as long
   // as this engine had one controller.
-  var pace = new SharedArrayBuffer(1024);
+  // 4096 bytes since 2026-10-06: cells 256-1023 are the worker's frame-timing ring (recomp_worker.js
+  // THE GUEST CLOCK'S OWN STALL RECORD), read through window.__gcFrameTiming.
+  var pace = new SharedArrayBuffer(4096);
   var paceI32 = new Int32Array(pace);
   // A FULL-IMAGE FRAME MUST NOT STALL THE GUEST (recomp_worker.js SHIP_ACK): the worker reuses a
   // pooled SharedArrayBuffer (a mem1 image, a packed region payload) only once the renderer has
@@ -10493,6 +10495,25 @@ window.GcRate = (function () {
     return true;
   };
 
+  // THE GUEST CLOCK'S OWN STALL RECORD (recomp_worker.js): every frame start, timed by the worker
+  // itself. __gcFrameTiming(since) returns the entries after `since` (a previous result's n; at most
+  // the ring's 256 back) as [frame, interval ms, busy ms] — interval = how long the guest clock stood
+  // on the frame before it, busy = how long that frame kept the guest's thread busy — and the
+  // running counts: over = intervals over two frame periods, busyOver = busy over one. null before
+  // the recomp has a pace SAB (or on a worker without the ring).
+  window.__gcFrameTiming = function (since) {
+    if (!paceI32 || paceI32.length < 1024) return null;
+    var n = Atomics.load(paceI32, 220), from = Math.max(since == null ? n : since, n - 256, 0), out = [];
+    for (var k = from; k < n; k++) {
+      var i = 256 + 3 * (k % 256);
+      out.push([Atomics.load(paceI32, i), Atomics.load(paceI32, i + 1) / 1000, Atomics.load(paceI32, i + 2) / 1000]);
+    }
+    // an entry the worker overwrote while it was being read is not reported
+    var n2 = Atomics.load(paceI32, 220), lost = Math.max(0, n2 - 256 - from);
+    if (lost) out.splice(0, lost);
+    return { n: n, from: from + lost, entries: out, over: Atomics.load(paceI32, 221), busyOver: Atomics.load(paceI32, 222),
+             periodMs: 1000 / 60 };
+  };
   window.__gcLockstep = function () {
     var ls = gcLsEngine();
     return {
@@ -10569,6 +10590,11 @@ window.GcRate = (function () {
   // guest got NO credits for those seconds — Party Mode sat in mentDll for four minutes of wall
   // time. That is a slowdown of the GAME, which gate #9 forbids: guest rate and presented rate
   // are independent knobs, and a slow renderer may only cost presents.
+  // [2026-10-06] BK_GAP_MS was 60, and a stall shorter than that was nobody's to cover: the guest
+  // parked on an empty pool for the whole stall. MEASURED (MP4 solo, prod mirror, the worker's own
+  // frame-timing ring): frames whose clock stood 35-50 ms with the worker busy only 0-6 ms of it —
+  // waiting on a credit this thread was too busy to grant — in most runs. At 20 ms (more than two of
+  // this thread's 8 ms ticks missed) the backstop takes over before the guest misses a second frame.
   // So a backstop: a tiny worker that, only while this thread has not granted for BK_GAP_MS, adds
   // credits to the SAB pool at exactly TARGET per second (backlog-capped like grant()). When this
   // thread comes back, grantNow absorbs them (rate.absorbExternal) so every credit is counted once.
@@ -10595,7 +10621,7 @@ window.GcRate = (function () {
   //   BK_LOST   credits the backstop could not place because the backlog was full
   //   BK_DROPMS wall ms the backstop dropped under the same MAX_DT_MS rule grant() applies
   //   f64 @992  [0] integrated-until (abs ms)  [1] fractional credit  [2] this thread's last grant
-  var BK_HB = 240, BK_EN = 241, BK_GRANTED = 242, IT_LOCK = 243, BK_LOST = 244, BK_DROPMS = 245, BK_GAP_MS = 60;
+  var BK_HB = 240, BK_EN = 241, BK_GRANTED = 242, IT_LOCK = 243, BK_LOST = 244, BK_DROPMS = 245, BK_GAP_MS = 20;
   var paceF64 = new Float64Array(pace, 992, 3);      // cells 248-253; 254/255 untouched
   var bkAbsorbed = 0, bkWorker = null;
   function bkStart() {
@@ -11114,6 +11140,15 @@ window.GcRate = (function () {
                      shipDedup: q.get('shipdedup') !== '0',
                      // the MEM1 window and the ship pool are faulted in before main() (?prefault=0: control)
                      prefault: q.get('prefault') !== '0',
+                     // a full image / a big region payload goes out in a plain buffer faulted in ahead of time (?spares=0: control)
+                     spares: q.get('spares') !== '0',
+                     // the ship code (walk, discovery, pack) runs on a synthetic frame before main() so it is optimized
+                     // before the first 3D scene needs it (?shipwarm=0: control)
+                     shipWarm: q.get('shipwarm') !== '0',
+                     // the guest's own thread runs the backstop clock's step while it waits (recomp_worker.js
+                     // THE GUEST'S OWN THREAD IS A BACKSTOP CLOCK TOO), once this thread has missed
+                     // more than one of its 8 ms grants (12 ms); ?selfgrant=0: control
+                     bk: q.get('selfgrant') !== '0' ? { target: TARGET, maxb: MAX_BACKLOG, gap: 12, maxdt: MAX_DT_MS } : null,
                      // THE ROLLBACK RING: in a room the worker instruments the module so every frame
                      // start in the window can be rewound; solo, nothing changes.
                      rb: !!GCLS.session, rbSab: rbSab,
