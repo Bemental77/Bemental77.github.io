@@ -497,7 +497,7 @@ var FSK = { on: true, depth: 1, maxSnaps: 6, snapEvery: 8, force: 0, skipping: f
            fields: 0, drawn: 0, skipped: 0, skipNoDraw: 0, snapsTaken: 0, snapMs: 0, maxSnapMs: 0, redo: 0, redoFields: 0,
            redoMs: 0, redoFieldsAll: 0, audDrop: 0, staleS: 0, repairs: 0, lost: 0, suspendUntil: 0, backoff: 64, held: 0, presented: 0, overwritten: 0, noHeap: 0,
            lat: new Float32Array(4096), age: new Float32Array(4096), gpu: new Float32Array(4096), latN: 0, why: '',
-           staleIdle: 0, idleRepairs: 0, gaps: new Int32Array(16), gapN: 0, gapRun: 0 };
+           staleIdle: 0, idleRepairs: 0, gaps: new Int32Array(16), gapN: 0, gapRun: 0, late: true, lateSkips: 0, drewAt: 0 };
 // heap kept free for the core's own growth, counted on the heap the allocator sees (room_core.js
 // N64S_RAW_RESERVE: Donkey Kong 64 grows its break by 80 MB after boot; a malloc that does not fit
 // ABORTS this build, so the check is made BEFORE asking)
@@ -518,6 +518,7 @@ function fsInstall(search) {
   var qa = new URLSearchParams(search || '').get('fskipage'); if (qa && +qa > 0) FS_MAXAGE = +qa;
   var qs = new URLSearchParams(search || '').get('fskipsnap'); if (qs && +qs >= 1) FSK.snapEvery = +qs | 0;
   var qi = new URLSearchParams(search || '').get('fskipidle'); if (qi != null && +qi >= 0) FS_IDLE = +qi | 0;
+  if (new URLSearchParams(search || '').get('fskiplate') === '0') FSK.late = false;
   if (!self.WebGL2RenderingContext) { FSK.on = false; FSK.why = 'no WebGL2'; }
 }
 // the window's draw calls (after ?present=bitmap's wrappers, so a swallowed draw is not a picture)
@@ -697,6 +698,7 @@ function fsField() {
   var skip = false;
   if (FSK.force) skip = (s % FSK.force) !== 0 && fsCanSkip();
   else if (FSK.on && FSK.fq.length >= FSK.depth) { FSK.held++; skip = (FSK.hist & 2) !== 0 && fsCanSkip(); }
+  if (!skip && !FSK.force && fsLate(now)) { skip = fsCanSkip(); if (skip) FSK.lateSkips++; }
   // A snapshot is needed only for the first skipped field after the newest one: a re-run from an
   // older snapshot re-runs a later skipped field too (every field's pads are kept). So one is taken
   // at most every FSK.snapEvery fields — a fast save copies ~9 MB, 3-5 ms here (?fskipsnap=N).
@@ -724,9 +726,21 @@ function fsField() {
   FSK.lastDrew = FSK.drewNow;
   if (FSK.drewNow) fsFence(now);
 }
+// A FIELD RUN WHILE THE CLOCK IS MORE THAN TWO PERIODS BEHIND ITS SLOT IS NOT PRESENTED (the solo
+// half of room_core.js A CONSOLE BEHIND ITS OWN WALL CLOCK, where the measurement is): on Chrome's
+// default renderer (headless ANGLE on Vulkan/SwiftShader) the canvas's presentation blocked this
+// thread outside JS for 13-81 ms at a time, so a catch-up that presented every field it ran could
+// not repay; the bench's solo read 0.974-0.992x in 4 of 10 runs at load 5-7. A picture is still drawn
+// at least every 100 ms; the frame clock (due/nextAt) is untouched, so no field runs before its slot.
+// Solo clock only (a room's delay-lockstep frames come through here with RM.on). ?fskiplate=0 = the arm.
+function fsLate(now) {
+  if (!FSK.on || !FSK.late || RM.on || !(CLK.viHz > 0) || !CLK.base) return false;
+  if (now - slotOf() <= 2000 / CLK.viHz) return false;
+  return now - FSK.drewAt <= 100;
+}
 self.__n64RigField = function () { fsField(); };   // the rigs step the guest through the same field
 function fsFence(tIn) {
-  FSK.drawn++; FSK.tickDrew = false;
+  FSK.drawn++; FSK.tickDrew = false; FSK.drewAt = performance.now();
   var gl = M && M.ctx, f = null, e = { f: CLK.frame, tIn: tIn, tAge: FSK.ageTIn || tIn, tEnd: performance.now(), tGpu: 0, tCommit: 0, sy: null };
   FSK.ageTIn = 0;
   try { f = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0); } catch (x) { f = null; }
