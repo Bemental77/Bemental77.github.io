@@ -111,6 +111,19 @@ Reported 2026-10-06 on `/n64/?np=DHRNN&game=Mario Kart 64`:
    the two emulators' start-up hitches on a shared 4-core box. It is not proven, and a real
    two-device room has to show whether those stalls happen there too.
 
+   **Cross-console suites after the engine change (netplay.js c0642f6f):** Node:
+   netplay_rollback 28/28, rb_capacity 26/26, lockstep 152/152, delay_stepdown 26/26,
+   rb_advantage, rb_drop, rb_outage, redundancy, pace_verdict, rejoin_session, rb_msgcost 4/4
+   (2p 79.6 B/frame against 80.0 before adaptive rooms), rb_pace_sim 15/15, snes_rollback_probe
+   19/19. Browser: ps1_netplay_test 26/26, gc_rollback_det_test 7/7, N64 lockstep_probe GATE
+   PASS. gc_netplay_room_test (600 s) **passed 20/20 on one run and failed 19/20 on another**:
+   `never-past-its-own-wall-clock`, host page-sampler lead max 2.95 at 0.6 s (engine ownClock
+   leadMax 2.58), against a 2-frame bar. The old engine passed in the one run it got (max 1.16).
+   On the failing run the room opened at a 23-frame window on a ~0 ms loopback link, because
+   the lobby pings were answered while both pages were still loading. A suspected mechanism,
+   not a proven one: a wider opening window lets the page's opening credit burst through,
+   where an 8-frame window used to stall it. Open, needs more runs.
+
 ## How to add an entry
 
 On the device, open the page and press "Copy debug" (or add `?bench=1` and press
