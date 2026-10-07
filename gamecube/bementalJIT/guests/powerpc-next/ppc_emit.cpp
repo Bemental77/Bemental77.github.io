@@ -349,6 +349,11 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
     // host return as the generic code computes for that PC. Any PC that is not
     // a candidate falls through to the unchanged generic path. Only for plain
     // per-block bodies (no merged region, no region gen, no table override).
+    // [BEM_LEVER_PROBE_DIET 2026-10-07] see lever_gate.h. Plain per-block
+    // bodies only (the merged / region-gen slots are gen-PACKED, where the sign
+    // and gen tests are real).
+    const bool diet = !merged && region_gen < 0 && !tag_addr_ovr && !slot_addr_ovr &&
+                      bem_lever_on(BEM_LEVER_PROBE_DIET);
     if (n_static && static_pcs && !merged && region_gen < 0 && !tag_addr_ovr &&
         !slot_addr_ovr && bem_lever_on(BEM_LEVER_STATIC_CHAIN)) {
         b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC);
@@ -367,6 +372,10 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
                 b.op_i32_const((s32)t); b.op_i32_eq();
                 b.op_if(BLOCK_TYPE_VOID);
                     emit_addr_const(b, slot_addr + off, slot_sym, off); b.op_i32_load(0);
+                    if (diet) {
+                        // tag hit => slot is a live table index (lever_gate.h).
+                        b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
+                    } else {
                     b.op_local_tee(LOCAL_TMP_A_CHAIN);
                     b.op_i32_const(0); b.op_i32_ge_s();
                     b.op_if(BLOCK_TYPE_VOID);
@@ -378,6 +387,7 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
                         b.op_local_get(LOCAL_TMP_A_CHAIN);
                         b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
                     b.op_end();
+                    }
                 b.op_end();
                 if (BEM_PM51_CENSUS && g_bem_lc_base) {
                     b.op_i32_const((s32)0x026B38DCu);
@@ -481,14 +491,25 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
     // bucket byte-offset = ((PC>>2) & MASK) * 4 ; PC is ALREADY in TMP_A (teed by
     // the vector-page guard above — see its note), byteoff goes to TMP_B.
     b.op_local_get(LOCAL_TMP_A_CHAIN);
+    if (diet) {
+        // ((PC >> 2) & M) * 4 == (PC & ~3) & (M << 2) == PC & (M << 2).
+        b.op_i32_const((s32)(BEM_DISP_MASK_NEXT << 2)); b.op_i32_and();
+    } else {
     b.op_i32_const(2); b.op_i32_shr_u();
     b.op_i32_const((s32)BEM_DISP_MASK_NEXT); b.op_i32_and();
     b.op_i32_const(4); b.op_i32_mul();
+    }
     b.op_local_tee(LOCAL_TMP_B_CHAIN);
     // tag hit?  g_bem_disp_tag[bucket] == PC
     emit_addr_const(b, tag_addr, tag_sym); b.op_i32_add(); b.op_i32_load(0);
     b.op_local_get(LOCAL_TMP_A_CHAIN); b.op_i32_eq();
     b.op_if(BLOCK_TYPE_VOID);
+    if (diet) {
+        // tag hit => slot is a live table index (lever_gate.h).
+        emit_addr_const(b, slot_addr, slot_sym); b.op_local_get(LOCAL_TMP_B_CHAIN);
+        b.op_i32_add(); b.op_i32_load(0);
+        b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
+    } else {
         // slot = g_bem_disp_slot[bucket]; if slot >= 0 → dispatch
         emit_addr_const(b, slot_addr, slot_sym); b.op_local_get(LOCAL_TMP_B_CHAIN);
         b.op_i32_add(); b.op_i32_load(0);
@@ -565,6 +586,7 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
             }
         }
         b.op_end();
+    }   // !diet
     b.op_end();
 
     if (merged) {

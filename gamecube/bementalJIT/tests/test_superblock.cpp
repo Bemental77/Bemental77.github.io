@@ -171,21 +171,34 @@ static u64 fnv(const u8* p, std::size_t n, u64 h) {
 }
 
 // One arm: run from PC_A with downcount dc0 until the first slice end or PC_D.
-static Obs run_arm(bool follow, s32 dc0) {
+// evict_pcs: run once to PC_D, evict those blocks (BlockCache::evict, the SMC /
+// deopt path), reset ctx + RAM, and run again on the SAME cache. Every probe
+// into an evicted block must miss (host return + recompile), never call it.
+static Obs run_arm(bool follow, s32 dc0, const std::vector<u32>& evict_pcs = {}) {
     u8* ctx = (u8*)std::calloc(1, CTX_BYTES + 0x100);
     const u32 ctx_ptr = (u32)(uintptr_t)ctx;
     auto w32 = [&](u32 off, u32 v) { std::memcpy(ctx + off, &v, 4); };
     auto r32 = [&](u32 off) { u32 v; std::memcpy(&v, ctx + off, 4); return v; };
-    for (u32 i = 0; i < 32; ++i) w32(ppc_off::gpr(i), 0xAAAA0000u + i);
-    w32(ppc_off::gpr(7), 0x80500000u);
-    w32(ppc_off::MSR, 0x2000u);
-    w32(ppc_off::PC, PC_A);
-    w32(ppc_off::NPC, PC_A);
-    w32(ppc_off::DOWNCOUNT, (u32)dc0);
-    ram_reset();
+    auto reset = [&]() {
+        std::memset(ctx, 0, CTX_BYTES);
+        for (u32 i = 0; i < 32; ++i) w32(ppc_off::gpr(i), 0xAAAA0000u + i);
+        w32(ppc_off::gpr(7), 0x80500000u);
+        w32(ppc_off::MSR, 0x2000u);
+        w32(ppc_off::PC, PC_A);
+        w32(ppc_off::NPC, PC_A);
+        w32(ppc_off::DOWNCOUNT, (u32)dc0);
+        ram_reset();
+    };
+    reset();
     Obs o;
     {
         BlockCache cache;
+        for (int pass = 0; pass < (evict_pcs.empty() ? 1 : 2); ++pass) {
+        if (pass == 1) {
+            for (u32 e : evict_pcs) cache.evict(e);
+            reset();
+            o.compiles = 0;
+        }
         for (int guard = 0; guard < 4096; ++guard) {
             const u32 pc = r32(ppc_off::PC);
             if (pc == PC_D) break;
@@ -221,6 +234,8 @@ static Obs run_arm(bool follow, s32 dc0) {
                 std::printf("[FAIL] compile at %08x\n", pc); o.pc = 0xDEAD; break;
             }
             ++o.compiles;
+        }
+        if (o.pc == 0xDEAD) break;
         }
     }
     if (o.pc != 0xDEAD) {
@@ -294,6 +309,23 @@ int main() {
     {
         const Obs b = run_arm(true, 100000);
         expect(b.pc == PC_D, "superblock run reaches D");
+    }
+    // Eviction: re-running after evicting blocks that other blocks chain to
+    // (statically: C from R's `b C`; at runtime: R from F's blr) must miss,
+    // recompile exactly the evicted blocks, and end in the same state. A probe
+    // that trusts a bucket without its tag compare calls a freed table slot.
+    for (int f = 0; f < 2; ++f) {
+        const Obs ref = run_arm(f == 1, 100000);
+        const std::vector<u32> ev = f ? std::vector<u32>{PC_A}
+                                      : std::vector<u32>{0x8040000Cu, PC_C};
+        const Obs b = run_arm(f == 1, 100000, ev);
+        char what[128];
+        std::snprintf(what, sizeof what, "%s: evict + rerun = same state, %u recompiles",
+                      f ? "superblock" : "plain", b.compiles);
+        const bool ok = b.pc == ref.pc && b.dc == ref.dc && b.ctx_hash == ref.ctx_hash &&
+                        b.ram == ref.ram && b.compiles == (u32)ev.size();
+        expect(ok, what);
+        std::printf("[%s] %s\n", ok ? "PASS" : "FAIL", what);
     }
 
     std::printf("[%s] TOTAL %d/%d checks\n", fails ? "FAIL" : "PASS", checks - fails, checks);

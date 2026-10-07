@@ -80,6 +80,12 @@ constexpr u32 BEM_LEVER_TAKEN_CHAIN = 1u << 13;
 // the block boundary it replaces. Read by the DECODER's caller (JitWasm::
 // TryCompileBlock, block_replay compile_at), not by the emitter.
 constexpr u32 BEM_LEVER_FOLLOW = 1u << 14;
+// Dispatch-probe diet for plain per-block bodies (emit_chain_or_return, static
+// and runtime-PC probes): bucket byte offset as PC & (MASK << 2) — equal to
+// ((PC >> 2) & MASK) * 4 for EVERY u32 PC — and no `slot >= 0` test after a tag
+// hit (every g_bem_disp_tag writer stores a table index >= 0 to the slot in the
+// same step; every release/clear resets tag and slot together).
+constexpr u32 BEM_LEVER_PROBE_DIET = 1u << 15;
 
 bool bem_lever_on(u32 bit);
 
