@@ -974,9 +974,9 @@ function shipWarmUp(budgetMs) {
       // every other synthetic frame starts from empty caches (a full-image frame), the rest find
       // everything already known (a steady frame)
       if ((it++ & 1) === 0) { knownDLs.clear(); knownArrays.clear(); knownTex.clear(); f32Arrays.length = 0; }
-      const newDLs = [], regions = [];
+      const newDLs = (it % 3) === 2 ? null : [], regions = [];   // a shipped walk collects new DLs; a full-image or held one does not
       walkStream(M, fb, 0, fb.length, 0, newDLs, null);
-      for (const d of newDLs) regions.push({ addr: d.addr & 0x01FFFFFF, bytes: regView(0x80000000 + (d.addr & 0x01FFFFFF), d.size) });
+      if (newDLs) for (const d of newDLs) regions.push({ addr: d.addr & 0x01FFFFFF, bytes: regView(0x80000000 + (d.addr & 0x01FFFFFF), d.size) });
       discoverTextures(regions);
       discoverArrays(regions);
       dropImageDuplicates(regions);
@@ -1106,7 +1106,18 @@ function drainDirty(regions) {
   }
 }
 
+// ── A FRAME'S POST WAITS FOR THE GUEST'S NEXT IDLE MOMENT (2026-10-07) ──────────────────────
+// Everything a frame ships is COPIED out of guest memory before the guest may run on; the
+// postMessage that hands it to the page is not, and on a full-image frame it is not free (it
+// transfers the 24 MiB image buffer): MEASURED 0.2-8.4 ms inside MP4 frame 725 (prod mirror, both
+// arms), a frame that runs 22-34 ms and is scored over budget at 33.3. So the message is posted
+// when this thread is about to park on its credit — at once, on every frame that leaves idle time,
+// which is nearly all of them — and otherwise at the start of the next frame's ship, in order. The
+// renderer receives a heavy frame up to one frame later; the guest never waits for the post.
+let shipPending = null;
+function shipFlush() { if (shipPending) { const m = shipPending; shipPending = null; postMessage(m[0], m[1]); } }
 function shipFrame(pos, resim, hiddenNow) {
+  shipFlush();
   const mem = () => Module.wasmMemory;
   // A re-simulated frame does no renderer work: no FIFO walk, no region copies. Only the
   // game's own dirty ranges (DCStoreRange) are noted, to be re-read and sent with the next
@@ -1124,7 +1135,11 @@ function shipFrame(pos, resim, hiddenNow) {
   // 2 = hold only a frame that would carry the full image (the main-thread fallback's deferral).
   const shipHold = paceI32 ? Atomics.load(paceI32, SHIP_HOLD) : 0;
   if (shipHold === 1 || (shipHold === 2 && (cacheDirty || !sentPrologue) && !testFullMem)) {
-    try { walkStream(mem(), fb, 0, pos, 0, [], new Map()); } catch (e) { log('walk threw: ' + e.message); }
+    // newDLs/touched null: what a held frame finds is discarded below, and these are the argument kinds
+    // the ship's own walk and shipWarmUp compile it for. MEASURED with ([], new Map()) here: a room's
+    // first held frame of the title (MP4 frame 725, 1296 new display lists) walked for 10-31 ms where
+    // the warm, shipped walk of the same frame takes 0.5-1.7 ms.
+    try { walkStream(mem(), fb, 0, pos, 0, null, null); } catch (e) { log('walk threw: ' + e.message); }
     texBound.clear(); pairSeenClear();
     if (Module.___recomp_dirty_reset) Module.___recomp_dirty_reset();
     cacheDirty = true;
@@ -1227,8 +1242,8 @@ function shipFrame(pos, resim, hiddenNow) {
   const isSab = (b) => typeof SharedArrayBuffer !== 'undefined' && b instanceof SharedArrayBuffer;
   for (const r of regions) if (!isSab(r.bytes.buffer) && transfers.indexOf(r.bytes.buffer) < 0) transfers.push(r.bytes.buffer);
   if (mem1Snap && !isSab(mem1Snap)) transfers.push(mem1Snap);
-  postMessage({ cmd: 'frame', n: viRetrace, fifo: fifo.buffer, mem1: mem1Snap, poolSeq: shipSeq, hidden: hiddenNow,
-                regions: regions.map((r) => ({ addr: r.addr, bytes: shipPool ? r.bytes : r.bytes.buffer })) }, transfers);
+  shipPending = [{ cmd: 'frame', n: viRetrace, fifo: fifo.buffer, mem1: mem1Snap, poolSeq: shipSeq, hidden: hiddenNow,
+                   regions: regions.map((r) => ({ addr: r.addr, bytes: shipPool ? r.bytes : r.bytes.buffer })) }, transfers];
 }
 
 // ── GUEST-STATE WITNESS WINDOW ──────────────────────────────────────────────────────────────
@@ -1688,7 +1703,7 @@ function lowTopScan() {
 let det = null;
 function detFrame(frame) {
   if (det.hash === false) {                 // run-to-a-frame only (e.g. to produce a card image)
-    if (frame >= det.until) { postMessage({ cmd: 'detDone', frame }); for (;;) Atomics.wait(paceI32, 255, 0, 1000); }
+    if (frame >= det.until) { shipFlush(); postMessage({ cmd: 'detDone', frame }); for (;;) Atomics.wait(paceI32, 255, 0, 1000); }
     return;
   }
   const t0 = performance.now();
@@ -1755,7 +1770,7 @@ function detFrame(frame) {
   if (frame >= det.until) {
     if (rb.on) postMessage({ cmd: 'rbStats', s: rbStats() });
     postMessage({ cmd: 'detDone', frame });
-    for (;;) Atomics.wait(paceI32, 255, 0, 1000);   // park: the run is over, burn no CPU
+    shipFlush(); for (;;) Atomics.wait(paceI32, 255, 0, 1000);   // park: the run is over, burn no CPU
   }
 }
 
@@ -2953,7 +2968,7 @@ async function boot(msg) {
               // The guest is about to park on its credit: a short slice of that idle time prepares
               // the next transfer buffer, if one is missing (A FULL IMAGE IS A PLAIN, ALREADY-FAULTED
               // BUFFER). Never when a credit is already waiting — then the guest runs on at once.
-              if (Atomics.load(paceI32, 0) <= 0) spareStep(SPARE_SLICE_MS);
+              if (Atomics.load(paceI32, 0) <= 0) { shipFlush(); spareStep(SPARE_SLICE_MS); }
               while (Atomics.load(paceI32, 0) <= 0) {
                 Atomics.wait(paceI32, 0, 0, bkCfg ? BK_POLL_MS : 500);
                 if (bkCfg && Atomics.load(paceI32, 0) <= 0) { selfGrant(); if (rbI32) roomSelf(); }

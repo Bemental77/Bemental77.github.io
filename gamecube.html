@@ -869,6 +869,13 @@ window.GcRate = (function () {
       m.lastT = t; m.credAcc = 0;
     };
 
+    // Credits the caller has ALREADY put in the pool (the page's lock-free grant adds them the instant
+    // it claims them): counted as granted, each remembering when it opened.
+    m.book = function (n, t) {
+      m.granted += n;
+      for (var i = 0; i < n; i++) creditQ.push(t);
+    };
+
     m.pokeCredits = function (n, t) {
       drainCredits();
       pool.add(n); m.granted += n;
@@ -11001,14 +11008,25 @@ window.GcRate = (function () {
         var dtm = t - rate.lastT;
         if (dtm > rate.gapMaxMs) rate.gapMaxMs = dtm;
         var vt0 = GcRate.itUpTo(Atomics, paceI32, paceF64, TARGET);
-        var c = GcRate.itClaim(Atomics, paceI32, paceF64, now, TARGET, MAX_DT_MS, itOut);
-        if (itOut[1] > 0) rate.stallMs += itOut[1];
+        // Claimed credits go into the pool IMMEDIATELY — no call, no allocation between the claim and
+        // the add. A credit this thread has claimed but not yet added is invisible to the other two
+        // threads (the integrator has moved past it), so a pause landing there would hold it hostage.
+        var c = GcRate.itClaim(Atomics, paceI32, paceF64, now, TARGET, MAX_DT_MS, itOut), c0 = c;
         if (c > 0) {
-          var room = MAX_BACKLOG - rate.pool();
+          var room = MAX_BACKLOG - Atomics.load(paceI32, 0) - (gcLsGate ? gcLsEarned : 0);
           if (room < 0) room = 0;
-          if (c > room) { rate.lostCredits += c - room; c = room; }
-          if (!paceT0) { paceT0 = vt0 - org; paceB = { g: rate.granted, l: rate.lostCredits - (itOut[0] - c) + Atomics.load(paceI32, BK_LOST), s: rate.stallMs - itOut[1] + Atomics.load(paceI32, BK_DROPMS) }; }
-          if (c > 0) rate.pokeCredits(c, t);
+          if (c > room) c = room;
+          if (c > 0) {
+            if (gcLsGate) { gcLsEarned += c; Atomics.store(RBP.i32, RA.EARNED, gcLsEarned); }
+            else { Atomics.add(paceI32, 0, c); Atomics.notify(paceI32, 0); }
+          }
+        }
+        paceF64[2] = now;                 // "everything due has been delivered" (the backstops' silence starts here)
+        if (itOut[1] > 0) rate.stallMs += itOut[1];
+        if (c0 > 0) {
+          rate.lostCredits += c0 - c;
+          if (!paceT0) { paceT0 = vt0 - org; paceB = { g: rate.granted, l: rate.lostCredits - (c0 - c) + Atomics.load(paceI32, BK_LOST), s: rate.stallMs - itOut[1] + Atomics.load(paceI32, BK_DROPMS) }; }
+          if (c > 0) rate.book(c, t);
         }
         rate.lastT = t;
       }
