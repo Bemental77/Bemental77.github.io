@@ -193,6 +193,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const [port, delayMs, loss] = process.argv.slice(2);
   startBroker({ port: +(port || 0), delayMs: +(delayMs || 0), loss: +(loss || 0) }).then((b) => {
     console.log(`[mqtt-ws] listening ${b.url} delay=${b.impair.delayMs}ms loss=${b.impair.loss}`);
-    setInterval(() => console.log('[mqtt-ws] ' + JSON.stringify(b.stats)), 10000).unref();
+    setInterval(() => console.log('[mqtt-ws] ' + JSON.stringify(b.stats)), 2000).unref();
+    // A parent that runs this out of process reads the final numbers off SIGTERM.
+    process.on('SIGTERM', () => { console.log('[mqtt-ws] ' + JSON.stringify(b.stats)); process.exit(0); });
   });
 }

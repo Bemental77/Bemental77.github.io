@@ -274,6 +274,9 @@ const ARMS = {
   // tools/netplay_broker_check.mjs).
   fw: { id: 'fw', what: 'desktop host (open network) + desktop JOINER behind a kernel 443-only firewall (no UDP, no TCP but 443); broker wss on 443 + 8084, 150 ms one-way + 1% loss',
         host: DESKTOP, join: DESKTOP, firewall: true, broker: { delayMs: 150, loss: 0.01 } },
+  // The same firewall with an UNIMPAIRED broker: what the relay path itself costs.
+  fw0: { id: 'fw0', what: 'as fw, broker unimpaired (0 ms, 0% loss)',
+         host: DESKTOP, join: DESKTOP, firewall: true, broker: { delayMs: 0, loss: 0 } },
   // The same firewall with a slower broker: the upper end of what was measured.
   fw300: { id: 'fw300', what: 'as fw, broker 300 ms one-way + 1% loss',
            host: DESKTOP, join: DESKTOP, firewall: true, broker: { delayMs: 300, loss: 0.01 } },
@@ -729,6 +732,33 @@ async function workerThrottleEnd(P) {
   for (let i = 0; i < 20; i++) { try { fs.rmdirSync(P.cg.dir); return; } catch (e) { await sleep(250); } }
 }
 
+// ---- the broker, out of process (see runCell) ------------------------------------
+async function startBrokerProc(impair) {
+  const { spawn } = await import('node:child_process');
+  const child = spawn(process.execPath, [path.join(path.dirname(fileURLToPath(import.meta.url)), 'mqtt_ws_broker.mjs'), '0',
+                                         String(+(impair.delayMs || 0)), String(+(impair.loss || 0))], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const B = { stats: {}, impair: { delayMs: +(impair.delayMs || 0), loss: +(impair.loss || 0) }, setImpair() {}, port: 0, url: null, pid: child.pid };
+  let buf = '';
+  const ready = new Promise((res, rej) => {
+    child.stdout.on('data', (d) => {
+      buf += d;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 1);
+        const m = line.match(/listening (ws:\/\/localhost:(\d+)\/mqtt)/);
+        if (m) { B.url = m[1]; B.port = +m[2]; res(); }
+        const st = line.match(/^\[mqtt-ws\] (\{.*\})$/);
+        if (st) { try { B.stats = JSON.parse(st[1]); } catch (e) {} }
+      }
+    });
+    child.on('exit', () => rej(new Error('broker process exited')));
+    setTimeout(() => rej(new Error('broker process did not start')), 10000);
+  });
+  await ready;
+  B.close = () => new Promise((res) => { child.once('exit', () => res()); try { child.kill('SIGTERM'); } catch (e) { res(); } setTimeout(res, 3000); });
+  return B;
+}
+
 // ---- a player's browser ---------------------------------------------------------
 async function launchPlayer(role, device, cellTag, pre) {
   // pre.fw: this player is BEHIND THE FIREWALL — its browser runs as the
@@ -857,7 +887,17 @@ async function runCell(cid, aid, attempt) {
   const bad = (st) => st.some((x) => x && x.engine && /desync|failed|ended/.test(x.engine.state));
   try {
     cell.uptimeAtLock = uptime();
-    broker = await startBroker({ port: 0 });
+    // ⚠ THE BROKER RUNS IN ITS OWN PROCESS for any arm that routes the room
+    // through it. In-process it shared this rig's event loop, and the rig
+    // decodes PNG screenshots synchronously in JS — every capture held every
+    // relayed message for the length of a decode, which reads in the room as
+    // a 300-400 ms jitter spike that no real broker has. (Measured 2026-10-07:
+    // the synthetic relay room with no screenshots, tools/
+    // netplay_firewall_room_test.mjs, worst stall 34 ms; the same broker in
+    // this process, worst 385 ms.) NPDM_BROKER_INPROC=1 restores the old arm.
+    broker = (A.firewall || A.relay) && process.env.NPDM_BROKER_INPROC !== '1'
+      ? await startBrokerProc(A.broker || {})
+      : await startBroker({ port: 0 });
     if (A.broker) broker.setImpair(A.broker);
     // THE FIREWALL ARMS: TLS fronts at 443 and 8084, kernel rules for the joiner.
     // The hand-off lists the 8084 broker FIRST, so the firewalled side has to
@@ -1051,14 +1091,15 @@ async function runCell(cid, aid, attempt) {
         cell.failState[P.role] = await engineState(P);
       }
     }
-    cell.broker = Object.assign({}, broker.stats, { impair: Object.assign({}, broker.impair) });
+    if (broker.pid) { await broker.close(); broker.closed = true; }   // out of process: SIGTERM prints the final numbers
+    cell.broker = Object.assign({}, broker.stats, { impair: Object.assign({}, broker.impair), outOfProcess: !!broker.pid });
     if (fw) { cell.firewall.counters = fwCounters(); cell.firewall.fronts = Object.assign({}, fronts.stats); }
   } catch (e) {
     cell.error = 'rig error: ' + String(e && e.stack || e).slice(0, 400);
   } finally {
     clearInterval(loadTick);
     for (const P of PS) await closePlayer(P);
-    if (broker) await broker.close().catch(() => {});
+    if (broker && !broker.closed) await broker.close().catch(() => {});
     if (fronts) await fronts.close().catch(() => {});
     if (fw) fw.close();
     cell.uptimeAfter = uptime();
