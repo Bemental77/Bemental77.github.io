@@ -71,6 +71,7 @@ extern int g_bem_gp_dirty;
 extern uint32_t g_bem_aot_count_exits;
 extern uint32_t g_bem_idle_collapse_off;
 }
+namespace bemental::powerpc { extern u32 g_bem_lazy_livein_retries; }
 
 static constexpr u32 kMaxBlockInsts = 64u;      // JitWasm.cpp kMaxBlockInsts
 static constexpr u32 kRamSize = 0x02000000u;    // Memmap: NextPowerOf2(24MB)
@@ -459,7 +460,7 @@ int main(int argc, char** argv) {
         "\"indirect_calls\":%llu,\"consts\":%llu,\"locals\":%llu,\"control\":%llu,"
         "\"terminal_loads\":%llu,\"ops_per_guest_instr\":%.3f,\"instrs_per_entry\":%.3f,"
         "\"mmioR\":%d,\"mmioW\":%d,\"wpar_import\":%d,\"drains\":%d,\"interp\":%d,"
-        "\"mask_unsound\":%u,\"superblocks\":%u,\"seams\":%u,\"gp_hash\":\"%08x\",\"gp_bytes\":%d}",
+        "\"mask_unsound\":%u,\"superblocks\":%u,\"seams\":%u,\"gp_hash\":\"%08x\",\"gp_bytes\":%d,\"lazy_livein_retries\":%u}",
         mode.c_str(), s, stop, stop_pc, (unsigned long long)guest_cycles, g_compiles,
         g_compile_fail, host_chains, blocks_via_host, (unsigned long long)mem_hash,
         (unsigned long long)ctx_hash, (unsigned long long)g_cnt[12],
@@ -472,7 +473,8 @@ int main(int argc, char** argv) {
         (unsigned long long)g_cnt[14], gi > 0 ? ops / gi : 0.0,
         g_cnt[13] ? gi / (double)g_cnt[13] : 0.0,
         js_stat("mmioR"), js_stat("mmioW"), js_stat("wpar"), js_stat("drains"), js_stat("interp"),
-        g_mask_unsound, g_superblocks, g_seams, gp_hash, gp_bytes);
+        g_mask_unsound, g_superblocks, g_seams, gp_hash, gp_bytes,
+        bemental::powerpc::g_bem_lazy_livein_retries);
     std::printf("%s\n", buf);
     if (json_out) { std::FILE* jf = std::fopen(json_out, "w"); if (jf) { std::fprintf(jf, "%s\n", buf); std::fclose(jf); } }
     std::fprintf(stderr, "[replay] slice-end PCs (top):");

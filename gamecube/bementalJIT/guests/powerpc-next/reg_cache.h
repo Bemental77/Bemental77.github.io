@@ -135,6 +135,16 @@ public:
     // everywhere else. See RegCache::Bind.
     void SetOpReads(u32 mask) { m_op_reads = mask; }
 
+    // [BEM_LEVER_LAZY_LIVEIN 2026-10-07] Deferred live-in loads. With
+    // SetDeferred(poison) the prologue emits nothing: live-ins stay
+    // assigned && !loaded until EmitPendingLoads (top of an op, for the op's
+    // regsIn) or a Bind loads them. SetOpDepth records the builder's control
+    // depth at the top of the current op; a deferred load from any other depth
+    // (inside an arm) sets *poison, and the caller rebuilds without the lever.
+    void SetDeferred(bool* poison) { m_poison = poison; }
+    void SetOpDepth(u32 depth) { m_op_depth = depth; }
+    void EmitPendingLoads(u32 ctx_ptr, u32 mask);
+
 private:
     // Per-PPC-GPR state inside a block.
     struct PregState {
@@ -164,6 +174,8 @@ private:
     WasmModuleBuilder& m_wb;
     PregState m_state[32]{};
     u32 m_op_reads = 0xFFFFFFFFu;
+    bool* m_poison = nullptr;   // [LAZY_LIVEIN] non-null = deferred mode
+    u32 m_op_depth = 0;
     u32 m_local_base = 0;
     u32 m_if_depth   = 0;
     // Stamped once per block by OnBlockEntry. Used by Bind()'s lazy-load

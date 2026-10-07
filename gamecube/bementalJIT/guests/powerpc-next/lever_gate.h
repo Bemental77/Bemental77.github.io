@@ -121,6 +121,23 @@ constexpr u32 BEM_LEVER_BRANCH_NOPC = 1u << 20;
 // Builder peephole over the emitted block body: `local.set X; local.get X`
 // with nothing between becomes `local.tee X` (WasmModuleBuilder::op_local_get).
 constexpr u32 BEM_LEVER_SET_GET_TEE = 1u << 21;
+// GPR live-ins are loaded at the top of the first op that reads them
+// (CodeOp::regsIn) instead of all at block entry, so a path that leaves the
+// block (mid-block taken exit, superblock seam bail) before a register's first
+// use never loads it. Plain blocks and superblocks built by build_block_next
+// only; never in a resident (wasm `loop`) body. Any lazy load that would land
+// inside a control arm aborts the build, which is redone with this lever off.
+constexpr u32 BEM_LEVER_LAZY_LIVEIN = 1u << 22;
+// At a flush that leaves the block (epilogue, terminal branch, seam bail,
+// RAS-mispredict exit), a dirty Single FPR whose lanes have no Inf/NaN is
+// written to ps0/ps1 by ONE v128.store of f64x2.promote_low_f32x4 (the
+// BEM_LEVER_PROMOTE_SIMD fast arm's value) instead of two extract_lane +
+// local.set + i64.store pairs; the Inf/NaN arm is unchanged.
+constexpr u32 BEM_LEVER_FPR_EXIT_STORE = 1u << 23;
+// Mid-block conditional branches flush FPRs only inside the taken arm (as an
+// exiting flush); the fall-through keeps Singles resident and dirty. The FPR
+// half of BEM_LEVER_GPR_EXIT_FLUSH.
+constexpr u32 BEM_LEVER_FPR_EXIT_FLUSH = 1u << 24;
 
 bool bem_lever_on(u32 bit);
 

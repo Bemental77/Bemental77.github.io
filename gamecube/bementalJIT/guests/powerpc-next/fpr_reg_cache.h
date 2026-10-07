@@ -116,9 +116,15 @@ public:
     // Flush dirty lanes back to PowerPCState. `preg_mask` selects which
     // FPRs (default all 32). `lane_mask` selects which lanes (default both).
     // Emits one i64.store per dirty lane.
+    // [BEM_LEVER_FPR_EXIT_STORE] exiting = the caller leaves the function (or
+    // restores a snapshot) right after this flush, so no FPR lane LOCAL is read
+    // again: a dirty Single with no Inf/NaN lane is stored straight from
+    // f64x2.promote_low_f32x4 with one v128.store, and its lane locals are
+    // left unloaded (a later Bind would re-load them from ps[]).
     void Flush(u32 ctx_ptr,
                BitSet32 preg_mask = BitSet32(0xFFFFFFFFu),
-               u8 lane_mask = FPR_LANE_BOTH);
+               u8 lane_mask = FPR_LANE_BOTH,
+               bool exiting = false);
 
     // ReloadAll — for every assigned FPR, re-load both lanes from
     // PowerPCState. Used after host-side mutations of ps[] (interp

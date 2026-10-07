@@ -1197,6 +1197,13 @@ static bool psmtxro_hash_match(const CodeBuffer& buffer, u32 n_ops) {
 // builder reuses the EXACT same op emission (13 imports, coalescing, gather/
 // msr gates). The caller declares locals + the module scaffolding. Live
 // per-block path is byte-identical (region_mode defaults false).
+// [BEM_LEVER_LAZY_LIVEIN 2026-10-07] Set only while build_block_next emits (the
+// other entry points keep eager prologue loads); poison = a deferred load landed
+// inside a control arm, so build_block_next redoes the block with it off.
+static bool s_lazy_livein_ok = false;
+static bool s_lazy_livein_poison = false;
+static bool s_lazy_livein_force_off = false;
+
 static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
                                  CodeBuffer& buffer, BlockStats& stats,
                                  u32 count, u32 start_pc, u32 ctx_ptr,
@@ -1548,8 +1555,12 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // point still sees coherent memory via the unchanged dirty flushes.
     RegCache rc(b);
     rc.OnBlockEntry(block, /*wasm_local_base=*/2u, ctx_ptr);
-    if (merged) rc.MarkAllLoaded();
-    else        rc.EmitPrologueLoads(ctx_ptr);
+    const bool lazy_livein = s_lazy_livein_ok && !merged &&
+                             !(int_fused || (fp_resident_loop && with_singles)) &&
+                             bem_lever_on(BEM_LEVER_LAZY_LIVEIN);
+    if (merged)           rc.MarkAllLoaded();
+    else if (lazy_livein) rc.SetDeferred(&s_lazy_livein_poison);
+    else                  rc.EmitPrologueLoads(ctx_ptr);
 
     // FPRRegCache: assign per-PPC-FPR WASM locals (both ps0/ps1 lanes) +
     // emit i64 prologue loads for live-in FPRs (block.m_fpr_inputs).
@@ -1698,7 +1709,7 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
                 const auto sb_rs = rc.SaveState();
                 const auto sb_fs = frc.SaveState();
                 rc.Flush(ctx_ptr);
-                frc.Flush(ctx_ptr);
+                frc.Flush(ctx_ptr, BitSet32(0xFFFFFFFFu), FPR_LANE_BOTH, /*exiting=*/true);
                 b.op_i32_const((s32)ctx_ptr);
                 b.op_i32_const((s32)op.address);
                 b.op_i32_store(ppc_off::PC);
@@ -1724,6 +1735,13 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             }
         }
         BEM_EMIT_MARK(BEM_MARK_OP, op.address);
+        // [BEM_LEVER_LAZY_LIVEIN] this op's deferred live-in reads, at the top
+        // level of the body (after a seam's bail, so a bailing path skips them).
+        // After the OP mark so the census books them to this op's span.
+        if (lazy_livein) {
+            rc.SetOpDepth(b.ctrlDepth());
+            rc.EmitPendingLoads(ctx_ptr, op.regsIn.m_val);
+        }
         const bool is_terminator = (i + 1 == n_ops);
         // [SUPERBLOCK] a mid-list b / bl / blr seam of a follow stream. None of
         // them reads ctx.PC: the b emits nothing, the bl writes LR, and the blr's
@@ -1921,7 +1939,7 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
                 const auto ras_rs = rc.SaveState();
                 const auto ras_fs = frc.SaveState();
                 rc.Flush(ctx_ptr);
-                frc.Flush(ctx_ptr);
+                frc.Flush(ctx_ptr, BitSet32(0xFFFFFFFFu), FPR_LANE_BOTH, /*exiting=*/true);
                 b.op_i32_const((s32)ctx_ptr);
                 b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::lr_off());
                 b.op_i32_const((s32)0xFFFFFFFCu); b.op_i32_and();
@@ -1990,6 +2008,17 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
                      BitSet32(assumed.m_val | selfloop_pw.m_val), params.cmp_fuse);
             emitted_native = true;
         } else {
+            // [BEM_LEVER_FPR_EXIT_STORE] a terminal branch leaves the block: its
+            // own frc.Flush (emit_bx / emit_bcx / emit_bclrx / emit_bcctrx, before
+            // anything that could read an FPR) is done here as an exiting flush.
+            // Not for a merged region (in-function re-dispatch keeps locals), a
+            // resident loop (its terminal re-enters the loop) or a PM47 fast loop
+            // (its epilogue keys on which FPRs are still Single).
+            if (is_terminator && !merged && region_gen < 0 && !resident_loop_arm &&
+                !fast_loop && op.opinfo && op.opinfo->type == OpType::Branch &&
+                bem_lever_on(BEM_LEVER_FPR_EXIT_STORE)) {
+                frc.Flush(ctx_ptr, BitSet32(0xFFFFFFFFu), FPR_LANE_BOTH, /*exiting=*/true);
+            }
             rc.SetOpReads(op.regsIn.m_val);   // [WRITE_NOLOAD] this op's GPR reads
             emitted_native = dispatch_op(b, rc, frc, op, params);
             rc.SetOpReads(0xFFFFFFFFu);
@@ -2196,7 +2225,9 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // dirty bits set), but the call sits structurally where future emit-
     // site conversions will need it. Per step-3 plan: prologue load +
     // epilogue flush form a bit-exact round-trip on FPR memory.
-    frc.Flush(ctx_ptr);
+    // [BEM_LEVER_FPR_EXIT_STORE] the plain epilogue leaves the function; a
+    // merged region re-dispatches in-function with its locals live.
+    frc.Flush(ctx_ptr, BitSet32(0xFFFFFFFFu), FPR_LANE_BOTH, /*exiting=*/!merged);
     rc.Flush(ctx_ptr);
     // Terminal: tail-chain to the successor block in-WASM when it resolves and
     // no service point is pending; otherwise return next-PC to the JS loop.
@@ -2345,7 +2376,47 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     }
 }
 
+static std::vector<u8> build_block_next_impl(u32 start_pc,
+                                 const u32* insts, u32 count,
+                                 u32 ctx_ptr,
+                                 u32 mem1_base, u32 mem1_mask, u32 ram_size,
+                                 u32* out_cycles,
+                                 bool* out_is_idle_loop,
+                                 const u32* instr_pcs,
+                                 u32 build_flags);
+
+// [BEM_LEVER_LAZY_LIVEIN] Emit with deferred live-in loads; if any deferred
+// load had to be placed inside a control arm (an op reading a GPR its regsIn
+// does not list, from inside an if), emit the block again with eager prologue
+// loads. Both emissions are complete, self-contained builds of the same block.
+u32 g_bem_lazy_livein_retries = 0;
 std::vector<u8> build_block_next(u32 start_pc,
+                                 const u32* insts, u32 count,
+                                 u32 ctx_ptr,
+                                 u32 mem1_base, u32 mem1_mask, u32 ram_size,
+                                 u32* out_cycles,
+                                 bool* out_is_idle_loop,
+                                 const u32* instr_pcs,
+                                 u32 build_flags) {
+    s_lazy_livein_ok = !s_lazy_livein_force_off;
+    s_lazy_livein_poison = false;
+    std::vector<u8> bytes = build_block_next_impl(start_pc, insts, count, ctx_ptr, mem1_base,
+                                                  mem1_mask, ram_size, out_cycles,
+                                                  out_is_idle_loop, instr_pcs, build_flags);
+    s_lazy_livein_ok = false;
+    if (s_lazy_livein_poison) {
+        s_lazy_livein_poison = false;
+        ++g_bem_lazy_livein_retries;
+        s_lazy_livein_force_off = true;
+        bytes = build_block_next_impl(start_pc, insts, count, ctx_ptr, mem1_base, mem1_mask,
+                                      ram_size, out_cycles, out_is_idle_loop, instr_pcs,
+                                      build_flags);
+        s_lazy_livein_force_off = false;
+    }
+    return bytes;
+}
+
+static std::vector<u8> build_block_next_impl(u32 start_pc,
                                  const u32* insts, u32 count,
                                  u32 ctx_ptr,
                                  u32 mem1_base, u32 mem1_mask, u32 ram_size,

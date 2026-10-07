@@ -338,15 +338,28 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
     // instead of here AND again there when it is rewritten in between.
     const bool gpr_exit_flush = !is_terminal && !merged && region_gen < 0 &&
                                 bem_lever_on(BEM_LEVER_GPR_EXIT_FLUSH);
+    // [BEM_LEVER_FPR_EXIT_FLUSH 2026-10-07] the same for FPRs: the taken arm
+    // flushes them (an exiting flush: the arm returns or tail-calls), the
+    // fall-through keeps every Single resident and dirty. Mid-block plain bodies
+    // with no caller-owned skip set only.
+    const bool fpr_exit_flush = !is_terminal && !merged && region_gen < 0 &&
+                                fpr_flush_skip.m_val == 0u &&
+                                bem_lever_on(BEM_LEVER_FPR_EXIT_FLUSH);
     if (!gpr_exit_flush) rc.Flush(ctx_ptr);
-    frc.Flush(ctx_ptr, BitSet32(~fpr_flush_skip.m_val));
+    if (!fpr_exit_flush) frc.Flush(ctx_ptr, BitSet32(~fpr_flush_skip.m_val));
+    struct ExitSnap { RegCache::StateSnapshot g{}; FPRRegCache::StateSnapshot f{}; };
     auto taken_gpr_flush_begin = [&]() {
-        RegCache::StateSnapshot snap{};
-        if (gpr_exit_flush) { snap = rc.SaveState(); rc.Flush(ctx_ptr); }
+        ExitSnap snap{};
+        if (gpr_exit_flush) { snap.g = rc.SaveState(); rc.Flush(ctx_ptr); }
+        if (fpr_exit_flush) {
+            snap.f = frc.SaveState();
+            frc.Flush(ctx_ptr, BitSet32(0xFFFFFFFFu), FPR_LANE_BOTH, /*exiting=*/true);
+        }
         return snap;
     };
-    auto taken_gpr_flush_end = [&](const RegCache::StateSnapshot& snap) {
-        if (gpr_exit_flush) rc.RestoreState(snap);
+    auto taken_gpr_flush_end = [&](const ExitSnap& snap) {
+        if (gpr_exit_flush) rc.RestoreState(snap.g);
+        if (fpr_exit_flush) frc.RestoreState(snap.f);
     };
 
     if (bo == 20) {
@@ -450,6 +463,7 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
     // fall back to the interpreter (unchanged behavior). ppc_state.pc is
     // written by interp; these terminals still rely on that path.
     if (gpr_exit_flush) rc.Flush(ctx_ptr);   // the interpreter reads gpr[]
+    if (fpr_exit_flush) frc.Flush(ctx_ptr);
     wb.op_i32_const((s32)inst);
     wb.op_i32_const((s32)op.address);
     wb.op_call(WIMPORT_INTERP);

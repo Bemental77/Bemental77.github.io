@@ -270,6 +270,56 @@ if(BEMENTAL_GUEST_POWERPC)
     )
     set_target_properties(test_peephole_tee PROPERTIES SUFFIX ".js")
 
+    # [lazy-livein 2026-10-07] BEM_LEVER_LAZY_LIVEIN: live-ins loaded at
+    # first use + the in-arm poison check. `node test_lazy_livein.js`.
+    if(BEMENTAL_GUEST_POWERPC_NEXT)
+        add_executable(test_lazy_livein test_lazy_livein.cpp)
+        target_link_libraries(test_lazy_livein PRIVATE
+            bementalJIT bementalJITPowerPCNext bementalJITPowerPC)
+        target_include_directories(test_lazy_livein PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+        set_target_properties(test_lazy_livein PROPERTIES SUFFIX ".html")
+        target_link_options(test_lazy_livein PRIVATE
+            "SHELL:-s EXIT_RUNTIME=1"
+            "SHELL:-s EXPORTED_RUNTIME_METHODS=['HEAPU8','HEAP8','HEAP16','HEAPU16','HEAP32','HEAPU32','HEAPF32','HEAPF64']"
+            "SHELL:-pthread"
+            "SHELL:-s PTHREAD_POOL_SIZE=0"
+            "SHELL:-s INITIAL_MEMORY=67108864"
+            "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+            "SHELL:-s MAXIMUM_MEMORY=67108864"
+            "SHELL:-s ALLOW_TABLE_GROWTH=1"
+            "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
+        )
+        target_compile_options(test_lazy_livein PRIVATE "-pthread")
+    endif()
+
+    # [fpr-exit-store 2026-10-07] BEM_LEVER_FPR_EXIT_STORE: Single FPRs stored
+    # at a block exit by one v128.store. `node test_fpr_exit_store.js`.
+    if(BEMENTAL_GUEST_POWERPC_NEXT)
+        add_executable(test_fpr_exit_store test_fpr_exit_store.cpp)
+        target_link_libraries(test_fpr_exit_store PRIVATE
+            bementalJIT bementalJITPowerPCNext bementalJITPowerPC)
+        target_include_directories(test_fpr_exit_store PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+        set_target_properties(test_fpr_exit_store PROPERTIES SUFFIX ".html")
+        target_link_options(test_fpr_exit_store PRIVATE
+            "SHELL:-s EXIT_RUNTIME=1"
+            "SHELL:-s EXPORTED_RUNTIME_METHODS=['HEAPU8','HEAP8','HEAP16','HEAPU16','HEAP32','HEAPU32','HEAPF32','HEAPF64']"
+            "SHELL:-pthread"
+            "SHELL:-s PTHREAD_POOL_SIZE=0"
+            "SHELL:-s INITIAL_MEMORY=67108864"
+            "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+            "SHELL:-s MAXIMUM_MEMORY=67108864"
+            "SHELL:-s ALLOW_TABLE_GROWTH=1"
+            "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
+        )
+        target_compile_options(test_fpr_exit_store PRIVATE "-pthread")
+    endif()
+
     # [pc-sync 2026-10-04] Inline interp fallbacks store ctx.PC so the
     # dolphin_interp pc guard runs them. `node test_interp_pcsync.js`.
     if(BEMENTAL_GUEST_POWERPC_NEXT)

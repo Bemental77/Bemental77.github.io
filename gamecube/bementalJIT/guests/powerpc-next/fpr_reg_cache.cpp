@@ -234,7 +234,7 @@ RCFprPair FPRRegCache::BindSingleWrite(u32 preg) {
 }
 
 // Flush dirty lanes back to PowerPCState.
-void FPRRegCache::Flush(u32 ctx_ptr, BitSet32 preg_mask, u8 lane_mask) {
+void FPRRegCache::Flush(u32 ctx_ptr, BitSet32 preg_mask, u8 lane_mask, bool exiting) {
     // [BEM_LEVER_FLUSH_MASK_BATCH 2026-10-04] The per-FPR constant set/clear
     // RMWs of BEM_SINGLE_MASK_CELL below touch DISTINCT bits, so they commute;
     // with the lever they are accumulated and emitted as ONE
@@ -258,13 +258,57 @@ void FPRRegCache::Flush(u32 ctx_ptr, BitSet32 preg_mask, u8 lane_mask) {
         const bool value_single = was_single || m_state[i].value_single;
         // [simd-paired] A Single-form FPR must be promoted to f64 before its
         // i64 pair is stored — PowerPCState.ps[] is always f64.
-        if (was_single) {
-            EmitPromoteToDouble(i);   // repr->Double, both lanes dirty
+        bool st0, st1;
+        if (was_single && exiting && lane_mask == FPR_LANE_BOTH &&
+            bem_lever_on(BEM_LEVER_PROMOTE_SIMD) && bem_lever_on(BEM_LEVER_FPR_EXIT_STORE)) {
+            // [BEM_LEVER_FPR_EXIT_STORE 2026-10-07] Same 16 bytes at ps0/ps1 as
+            // EmitPromoteToDouble + two EmitLaneStore: its fast arm writes lane k
+            // of f64x2.promote_low_f32x4(v) to ps<k>, which is exactly the
+            // little-endian layout of one v128.store at ps0 (ps1 = ps0 + 8).
+            // The Inf/NaN arm runs the scalar NaN-exact widen into the lane
+            // locals and stores them, as before.
+            static_assert(ppc_off::ps1(0) == ppc_off::ps0(0) + 8u, "ps0/ps1 adjacent");
+            PregState& st = m_state[i];
+            m_wb.op_local_get(st.v128_local_idx);
+            m_wb.op_v128_const_i32_splat(0x7F800000u);
+            m_wb.op_v128_and();
+            m_wb.op_v128_const_i32_splat(0x7F800000u);
+            m_wb.op_i32x4_eq();
+            m_wb.op_i64x2_extract_lane(0);
+            m_wb.op_i64_eqz();
+            m_wb.op_if(/*VOID*/);
+                m_wb.op_i32_const((s32)ctx_ptr);
+                m_wb.op_local_get(st.v128_local_idx);
+                m_wb.op_f64x2_promote_low_f32x4();
+                m_wb.op_v128_store(ppc_off::ps0(i), /*align=*/3);
+            m_wb.op_else();
+                for (u8 lane = 0; lane < 2; ++lane) {
+                    m_wb.op_local_get(st.v128_local_idx);
+                    m_wb.op_f32x4_extract_lane(lane);
+                    m_wb.op_i32_reinterpret_f32();
+                    m_wb.op_local_set(LOCAL_PSQ_T0);
+                    emit_psq_convert_to_double(m_wb);
+                    m_wb.op_local_set(lane == 0 ? st.ps0_local_idx : st.ps1_local_idx);
+                }
+                EmitLaneStore(ctx_ptr, i, FPR_LANE_PS0);
+                EmitLaneStore(ctx_ptr, i, FPR_LANE_PS1);
+            m_wb.op_end();
+            st.repr = FPRPrec::Double;
+            st.v128_dirty = false;
+            st.ps0_loaded = st.ps1_loaded = false;   // not on the fast arm
+            st.ps0_dirty = st.ps1_dirty = false;
+            st.value_single = true;
+            st.value_unknown = false;
+            st0 = st1 = true;
+        } else {
+            if (was_single) {
+                EmitPromoteToDouble(i);   // repr->Double, both lanes dirty
+            }
+            st0 = (lane_mask & FPR_LANE_PS0) && m_state[i].ps0_dirty;
+            st1 = (lane_mask & FPR_LANE_PS1) && m_state[i].ps1_dirty;
+            if (st0) EmitLaneStore(ctx_ptr, i, FPR_LANE_PS0);
+            if (st1) EmitLaneStore(ctx_ptr, i, FPR_LANE_PS1);
         }
-        const bool st0 = (lane_mask & FPR_LANE_PS0) && m_state[i].ps0_dirty;
-        const bool st1 = (lane_mask & FPR_LANE_PS1) && m_state[i].ps1_dirty;
-        if (st0) EmitLaneStore(ctx_ptr, i, FPR_LANE_PS0);
-        if (st1) EmitLaneStore(ctx_ptr, i, FPR_LANE_PS1);
         // [single-spec PM26] shadow-mask RMW: a full both-lane Single flush
         // marks ps[i] f32-valued; a Double store clears it. [v5 lfd
         // tri-state] value_unknown (lfd-written) instead ANDs a RUNTIME
