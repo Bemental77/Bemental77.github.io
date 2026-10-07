@@ -111,6 +111,13 @@ constexpr u32 BEM_LEVER_BSWAP_SIMD = 1u << 18;
 // and a conditional branch IMMEDIATELY after a cmp of the same field tests the
 // cmp's operands directly (the PM57 CmpFuse, here with the eager store kept).
 constexpr u32 BEM_LEVER_CR_LEAN = 1u << 19;
+// No pre-op ctx.PC store for a branch whose NATIVE emitter writes ctx.PC on
+// every path that leaves the block (b/bl, bc bo=20 / bdnz / bdz / CR-bit
+// forms without LK, bclr bo=20, bcctr without a CTR/CR test): those emitters
+// never read ctx.PC, and every later in-block reader of ctx.PC writes its own
+// first (the BEM_LEVER_MEM_SLOWARM invariant), so the store is dead. Forms that
+// fall back to the interpreter keep it.
+constexpr u32 BEM_LEVER_BRANCH_NOPC = 1u << 20;
 
 bool bem_lever_on(u32 bit);
 

@@ -153,6 +153,27 @@ bool bem_mips_census_on() {
 // no page change). The effective mask is published once, at the first emit, to
 // BEM_LEVER_CENSUS_CELL as 0x80000000 | mask — the arm-difference proof a
 // matched pair should read back before trusting a delta.
+// [BEM_LEVER_BRANCH_NOPC] True iff this branch is one of the forms the native
+// branch emitters handle WITHOUT the interpreter fallback; each of those stores
+// ctx.PC itself on every block-leaving path and never reads it.
+static bool BranchWritesOwnPc(u32 inst) {
+    const u32 opcd = inst >> 26;
+    const u32 bo = (inst >> 21) & 31u;
+    const bool lk = (inst & 1u) != 0u;
+    if (opcd == 18u) return true;                                   // b / bl / ba / bla
+    if (opcd == 16u) {                                              // bc (emit_bcx)
+        if (bo == 20u) return true;
+        if (lk) return false;
+        return bo == 0b10000u || bo == 0b10010u || (bo & 0b10100u) == 0b00100u;
+    }
+    if (opcd == 19u) {
+        const u32 xo = (inst >> 1) & 0x3FFu;
+        if (xo == 16u) return bo == 20u;                            // bclr (emit_bclrx)
+        if (xo == 528u) return (bo & 0x14u) == 0x14u;               // bcctr (emit_bcctrx)
+    }
+    return false;
+}
+
 bool bem_lever_on(u32 bit) {
     if (g_bem_lc_base == 0u) return true;
     static const u32 s_env_kill = []() -> u32 {
@@ -1787,7 +1808,13 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             bem_lever_on(BEM_LEVER_MEM_SLOWARM)) {
             params.defer_pc = op.address;
         }
-        if (params.defer_pc == 0u && !follow_seam &&
+        // [BEM_LEVER_BRANCH_NOPC 2026-10-07] see lever_gate.h; the predicate
+        // mirrors exactly the forms emit_bx / emit_bcx / emit_bclrx / emit_bcctrx
+        // (and emit_bcx_fused, whose caller admits only native forms) emit
+        // natively.
+        const bool branch_owns_pc = BranchWritesOwnPc(op.inst) &&
+                                    bem_lever_on(BEM_LEVER_BRANCH_NOPC);
+        if (params.defer_pc == 0u && !follow_seam && !branch_owns_pc &&
             (is_terminator || op.canEndBlock || op.canCauseException ||
              fpu_needs_pc ||
              (op.opinfo && (op.opinfo->flags & FL_LOADSTORE))))
