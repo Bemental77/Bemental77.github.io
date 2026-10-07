@@ -1828,6 +1828,25 @@
   // ?jitbudget=N sets it (published by fbasync.js in both realms); 0 = no
   // budget, the old behaviour, and the A/B arm.
   var JIT_BUDGET = null, budgetLeft = 0, deferQ = [], deferSet = new Set(), draining = false;
+  // ---- A PAGE'S SOURCE IS PART OF WHAT A MODULE WAS BUILT FROM (2026-10-07) ----
+  // A precomp block belongs to a VIRTUAL page. For a TLB-mapped page (Conker's code runs at
+  // 0x1xxxxxxx) the RDRAM it is compiled from is wherever the TLB points when it is recompiled
+  // (recomp.c: NOTCOMPILED -> fast_mem_access(block->start)), and p.srcPtr says where that was.
+  // A span offered while the page mapped to physical page P1, and installed later, was checked
+  // against P1's words — but by then the guest (TLBWR) or a state load across a TLB rewrite
+  // (neil_rawstate.c mode 3) may have remapped the page to P2 and the core recompiled it from P2:
+  // the page is valid again, its block is the same, P1's words are unchanged and the ops fields
+  // match whenever the two pages' instructions are of the same kinds — so the module built from
+  // P1's code was installed over P2's. MEASURED (Conker, rollback room, n64_rollback_probe
+  // --lsexact): the room's own re-run of a frame from a bit-exact snapshot came out different
+  // (12 of 12 rooms desynced at frames 250-520; ?jitasync=0 and ?jit=off 3/3 exact). So every real
+  // offer records its page's source base here, and nothing built from another base is installed.
+  var PAGE_SRC = Object.create(null);
+  function srcBase(p) {
+    var pageLen = ((p.blockEnd - p.blockStart) >>> 0) >>> 2, eip = ((p.vaddr - p.blockStart) >>> 0) >>> 2;
+    return (pageLen > 0 && eip < pageLen) ? (p.srcPtr - eip * 4) >>> 0 : -1;
+  }
+  function srcHolds(p) { var b = srcBase(p); return b < 0 || PAGE_SRC[p.vaddr >>> 12] === b; }
   function jitBudget() {
     if (JIT_BUDGET === null) {
       var g = (typeof globalThis !== 'undefined') ? globalThis : self, f = g.__fbAsync;
@@ -1855,6 +1874,7 @@
         if (!bp || U[bp >> 2] !== d.blk || U[(bp >> 2) + 1] !== (p.blockStart >>> 0) || U[(bp >> 2) + 2] !== (p.blockEnd >>> 0)) { stats.deferStale = (stats.deferStale || 0) + 1; continue; }
         if (M.HEAPU8[p.invalidCode + page]) { stats.deferStale = (stats.deferStale || 0) + 1; continue; }
         if (U[p.entryPtr >> 2] !== d.op || d.op === p.notCompiled) { stats.deferStale = (stats.deferStale || 0) + 1; continue; }
+        if (!srcHolds(p)) { stats.deferStale = (stats.deferStale || 0) + 1; stats.deferStaleSrc = (stats.deferStaleSrc || 0) + 1; continue; }
         var idx = compileSpan(p, M);
         if (idx > 0 && U[p.entryPtr >> 2] === d.op) { U[p.entryPtr >> 2] = idx; stats.deferInstalled = (stats.deferInstalled || 0) + 1; }
       }
@@ -2234,6 +2254,7 @@
     // compiled by the time the module lands, which made 309 of 314 MK64 race spans stale
     if (no > j.ops.length - 2) no = j.ops.length - 2;
     if (M.HEAPU8[p.invalidCode + page]) return asyncStale('invalid');
+    if (!srcHolds(p)) return asyncStale('source');
     var bp = U[(p.blocksBase >> 2) + page];
     if (!bp || bp !== j.bp || U[bp >> 2] !== j.blk || U[(bp >> 2) + 1] !== (p.blockStart >>> 0) || U[(bp >> 2) + 2] !== (p.blockEnd >>> 0)) return asyncStale('block');
     for (k = 0; k < nw; k++) if (U[j.w0 + k] !== j.words[k]) return asyncStale(k === j.words.length - 1 ? 'wordAfterPage' : 'words');
@@ -2273,7 +2294,7 @@
         // offer it again from memory as it is NOW, as a recompile would. Otherwise it would stay
         // on the interpreter until the page happened to be recompiled.
         var pv = j.p, U0 = M.HEAPU32;
-        if (!M.HEAPU8[pv.invalidCode + (pv.vaddr >>> 12)] && U0[pv.entryPtr >> 2] === j.ops[0] && (j.tries | 0) < 3) {
+        if (!M.HEAPU8[pv.invalidCode + (pv.vaddr >>> 12)] && U0[pv.entryPtr >> 2] === j.ops[0] && (j.tries | 0) < 3 && srcHolds(pv)) {
           ASYNC.reoffered++;
           ASYNC.retry = j.tries ? j.tries + 1 : 1;
           var ri = compileSpan(pv, M);
@@ -2513,6 +2534,8 @@
       span = pageLen - entryInPage;
       stats.pageTruncated = (stats.pageTruncated || 0) + 1;
     }
+    // a real offer (the core's up-call, not a drain or a re-offer of saved params): the page's source now
+    if (!EMIT_ONLY && !draining && !ASYNC.retry) PAGE_SRC[p.vaddr >>> 12] = srcBase(p);
     if (span <= 0) return 0;
     var g = opsZeroAt(HEAPU32, p.entryPtr, p.stride, span + 1);
     if (g >= 0) {

@@ -114,7 +114,23 @@ const PICS = flag('pics', ''), PICSREF = flag('picsref', '');
 const DUMPAT = flag('dumpat', '').split(',').filter(Boolean).map(Number), DUMPDIR = flag('dumpdir', '');
 // --ranlog PATH (diagnostic, core worker): after every frame the room runs (again), the lazy framebuffer
 //   queue, glide's readback-failed flag and the CPU fingerprint, last run wins: { frame: [...] } -> PATH
+//   (+ hist: EVERY run in order as [frame, kind, CPU fingerprint] — a re-run from a snapshot that comes out
+//   different from the run before it is a snapshot/restore miss; jit: the async JIT's install rejections by reason)
 const RANLOG = flag('ranlog', '');
+// --regions (diagnostic): every tapped state is also hashed per 4 KiB chunk (the raw layout's bookkeeping
+//   words skipped as hashFull does), on both sides, and the report names the chunks that differ at the first
+//   mismatching frame — which RDRAM pages / trailer blobs a rollback did not put back.
+const REGIONS = has('regions');
+const REG_SRC = `function __regHash(u8) {
+  var R = 16789504, n = Math.ceil(u8.length / 4096), out = new Array(n);
+  for (var c = 0; c < n; c++) {
+    var a = c * 4096, b = Math.min(u8.length, a + 4096) & ~3, h = 2166136261;
+    var w = new Uint32Array(u8.buffer, u8.byteOffset + a, (b - a) >>> 2);
+    for (var i = 0; i < w.length; i++) { if (a === R && i >= 4 && i < 7) continue; h = Math.imul(h ^ w[i], 16777619) >>> 0; }
+    out[c] = h >>> 0;
+  }
+  return out;
+}`;
 const PICDUMP = flag('picdump', '').split(',').filter(Boolean).map(Number);   // diagnostic: raw RGBA of these frames into the --json
 const CIN_SRC = (engExpr) => `(function () {
   self.__cin = {}; self.__cinPolls = 0;
@@ -317,7 +333,9 @@ try {
     const src = PAD_SRC.replace('function __pad', 'self.__pad = function') + `;
       self.__n64PadOverride = function (f, p) { return self.__pad(f, p); };
       self.__rbFull = {}; self.__n64RbLog = [];
+      ${REGIONS ? REG_SRC.replace('function __regHash', 'self.__regHash = function') + ';' : ''}
       self.__n64RbTap = function (k, buf, fp) { self.__rbFull[k] = { full: self.__n64State.hashFull(buf), fp: fp >>> 0 };
+        if (self.__regHash) self.__rbFull[k].reg = self.__regHash(buf);
         if (${JSON.stringify(DUMPAT)}.indexOf(k) >= 0) (self.__rbDump = self.__rbDump || {})[k] = buf.slice(); };
       ${RANLOG ? `(function () {
         var M = self.Module, lq = M._malloc(256), ls = M._malloc(32); self.__ranlog = {};
@@ -325,6 +343,7 @@ try {
           var n = M._neil_lfb_pending(lq, 16), q = Array.from(M.HEAPU32.subarray(lq >> 2, (lq >> 2) + 2 * Math.min(n, 16))).map(function (x) { return x.toString(16); }).join(',');
           M._neil_lfb_stats(ls); var st = Array.from(M.HEAPU32.subarray(ls >> 2, (ls >> 2) + 8));
           self.__ranlog[k] = [q, M._neil_native_fbread_failed(), M._neil_last_fp() >>> 0, kind, st.join('.'), self.__fbAsync ? self.__fbAsync.calls : -1];
+          (self.__runHist = self.__runHist || []).push([k, kind, M._neil_last_fp() >>> 0]);   // every run, in order
         };
       })();` : ''}
       ${(PICS || PICSREF) ? `(function () {
@@ -361,6 +380,9 @@ try {
       })();` : ''}
       ({ realm: typeof WorkerGlobalScope !== 'undefined' ? 'worker' : 'window', state: !!self.__n64State });`;
     out.workerSeams = await page.evaluate((s2) => window.__n64Worker.eval(s2), src);
+    // --weval SRC (diagnostic): evaluated in the core worker after the seams, before the room starts
+    //   (e.g. 'Module._neil_state_set_remap(0)' — every TLB-changing load takes the full wipe)
+    if (flag('weval', '')) out.weval = await page.evaluate((s4) => window.__n64Worker.eval(s4), flag('weval', ''));
     if (WSLOW > 1) {
       out.wslowInstall = await page.evaluate((s3) => window.__n64Worker.eval(s3), `(function (R) {
         var M = self.Module, done = [];
@@ -492,7 +514,7 @@ try {
                     await page.evaluate(() => ({ frame: window.__n64LsEngine.frame, confirmed: window.__n64LsEngine._rbConfirmed })))
     : await page.evaluate(() => ({ rblog: window.__n64RbLog.slice(0, 4000), full: window.__rbFull, frame: window.__n64LsEngine.frame, confirmed: window.__n64LsEngine._rbConfirmed, cin: window.__cin || null, cinPolls: window.__cinPolls | 0 }));
   const b64 = (u8) => { let str = ''; for (let q = 0; q < u8.length; q += 0x8000) str += String.fromCharCode.apply(null, u8.subarray(q, q + 0x8000)); return btoa(str); };
-  if (RANLOG && out.worker) writeFileSync(RANLOG, await page.evaluate(() => window.__n64Worker.eval('JSON.stringify({ ran: self.__ranlog || {}, seq: (self.__fbAsync && self.__fbAsync.seq) || null })')));
+  if (RANLOG && out.worker) writeFileSync(RANLOG, await page.evaluate(() => window.__n64Worker.eval('JSON.stringify({ ran: self.__ranlog || {}, hist: self.__runHist || [], vlog: self.__vlog || null, jit: self.bementalMips ? { staleWhy: self.bementalMips.async.staleWhy || null, stale: self.bementalMips.async.stale, installed: self.bementalMips.async.installed, deferStaleSrc: self.bementalMips.stats.deferStaleSrc | 0 } : null, log: (self.__n64RbLog || []).slice(0, 20000), seq: (self.__fbAsync && self.__fbAsync.seq) || null })')));
   else if (RANLOG) writeFileSync(RANLOG, await page.evaluate(() => JSON.stringify({ ran: window.__ranlog || {}, seq: (window.__fbAsync && window.__fbAsync.seq) || null, calls: window.__callLog || null })));
   if (DUMPAT.length && DUMPDIR) {
     for (const k of DUMPAT) {
@@ -501,6 +523,15 @@ try {
         : await page.evaluate((k2, src) => { const u8 = window.__rbDump && window.__rbDump[k2]; if (!u8) return null; const f = (0, eval)('(' + src + ')'); return f(u8); }, k, b64.toString());
       if (s64) writeFileSync(DUMPDIR + '/room_' + k + '.bin', Buffer.from(s64, 'base64'));
     }
+  }
+  // --wdump DIR (diagnostic, core worker): every buffer a --weval hook left in self.__wdump { name: Uint8Array } -> DIR/name.bin
+  if (flag('wdump', '') && out.worker) {
+    const names = await page.evaluate(() => window.__n64Worker.eval('Object.keys(self.__wdump || {})'));
+    for (const nm of names || []) {
+      const s64 = await page.evaluate((nm2, src) => window.__n64Worker.eval('(function (u8) { if (!u8) return null; ' + src + ' return b64(u8); })(self.__wdump[' + JSON.stringify(nm2) + '])'), nm, 'var b64 = ' + b64.toString() + ';');
+      if (s64) writeFileSync(flag('wdump', '') + '/' + nm + '.bin', Buffer.from(s64, 'base64'));
+    }
+    out.wdump = names;
   }
   // --cin: the input each held frame LAST ran with on the room's core (room_core.js RB.img) — the
   // confirmed timeline's — checked against the engine's final inputs below
@@ -586,7 +617,7 @@ try {
     await pb.waitForFunction(() => window.__refMain === true, { timeout: 240000 });
     const last = keys[keys.length - 1];
     const picKeys = room.pics ? Object.keys(room.pics).map(Number).filter((f) => f <= last) : [];
-    const ref = await pb.evaluate(async (padSrc, players, keys, last, cin, picKeys, dumpAt, picDumpF) => {
+    const ref = await pb.evaluate(async (padSrc, players, keys, last, cin, picKeys, dumpAt, picDumpF, regSrc) => {
       // the room's kept pictures, from the straight run (same inputs, every frame drawn)
       const picWant = new Set(picKeys), pics = {};
       let px = null;
@@ -639,6 +670,7 @@ try {
         if (want.has(f)) {
           window.__n64State.save(buf);
           res[f] = { full: window.__n64State.hashFull(buf), fp: M._neil_last_fp() >>> 0 };
+          if (regSrc) { if (!window.__regHash) window.__regHash = (0, eval)('(' + regSrc + ')'); res[f].reg = window.__regHash(buf); }
           if (dumpAt.indexOf(f) >= 0) (window.__refDump = window.__refDump || {})[f] = buf.slice();
         }
         if ((f & 63) === 0) await new Promise((r) => setTimeout(r, 0));
@@ -646,7 +678,7 @@ try {
       res.__cin = { used: cinUsed, missing: cinMissing, differsFromPad: cinDiffers };
       res.__pics = pics;
       return res;
-    }, PAD_SRC.replace('function __pad', 'window.__pad = function'), PLAYERS, keys, last, CIN ? room.cin : null, picKeys, DUMPDIR ? DUMPAT : [], PICDUMP);
+    }, PAD_SRC.replace('function __pad', 'window.__pad = function'), PLAYERS, keys, last, CIN ? room.cin : null, picKeys, DUMPDIR ? DUMPAT : [], PICDUMP, REGIONS ? REG_SRC : null);
     if (PICDUMP.length) out.picDumpRef = await pb.evaluate(() => window.__picDumpRef || null);
     if (DUMPAT.length && DUMPDIR) {
       for (const k of DUMPAT) {
@@ -679,6 +711,18 @@ try {
       if (A.full === B.full) same++;
       else if (firstFull == null) firstFull = k;
       if (A.fp !== B.fp && firstFp == null) firstFp = k;
+    }
+    if (REGIONS) {
+      // per mismatching tapped frame (first 6): the 4 KiB chunks that differ, as byte offsets into the raw state
+      out.regionDiffs = [];
+      for (const k of keys) {
+        const A = room.full[k], B = ref[k];
+        if (!B || A.full === B.full || !A.reg || !B.reg) continue;
+        const d = []; for (let c = 0; c < Math.max(A.reg.length, B.reg.length); c++) if (A.reg[c] !== B.reg[c]) d.push(c * 4096);
+        out.regionDiffs.push({ frame: k, n: d.length, chunks: d.slice(0, 400) });
+        if (out.regionDiffs.length >= 6) break;
+      }
+      for (const k of keys) { if (room.full[k]) delete room.full[k].reg; if (ref[k]) delete ref[k].reg; }
     }
     out.reference = { cin: CIN ? Object.assign({ polls: room.cinPolls, frames: room.cin ? Object.keys(room.cin).length : 0 }, cinStat) : null, compared: keys.length, fullMatch: same, firstFullMismatch: firstFull, firstFpMismatch: firstFp,
       events: (room.rblog || []).filter((e) => (e[0] === 'grow') || (e[1] >= (firstFull == null ? 0 : firstFull) - 25 && e[1] <= (firstFull == null ? 0 : firstFull) + 5)).slice(0, 60),
