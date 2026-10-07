@@ -106,6 +106,7 @@ export async function startBroker(opts = {}) {
           if (qos > 0) { pid = body.readUInt16BE(off); off += 2; }
           const payload = body.slice(off);
           stats.publishes++;
+          stats.pubBytes = (stats.pubBytes || 0) + payload.length;   // payload bytes published (the rate a public broker would meter)
           const out = packet(3, 0, Buffer.concat([str(topic), payload]));
           const set = subs.get(topic);
           if (set) for (const s of set) s.deliver(out);
