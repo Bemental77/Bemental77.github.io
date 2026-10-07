@@ -1208,6 +1208,8 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
                                  const void* region_lookup_user = nullptr,
                                  u16 chain_tag_sym = (u16)BEM_RSYM_NONE,
                                  u16 chain_slot_sym = (u16)BEM_RSYM_NONE) {
+    // [BEM_LEVER_SET_GET_TEE 2026-10-07] set/get -> tee peephole for this body.
+    b.setPeepholeTee(bem_lever_on(BEM_LEVER_SET_GET_TEE));
     // IN-BLOCK CYCLE ACCOUNTING (2026-06-12, Jit64 parity: Jit.cpp charges
     // js.downcountAmount at block entry). downcount -= numCycles emitted in
     // the block prologue so the chain dispatcher can run block-to-block

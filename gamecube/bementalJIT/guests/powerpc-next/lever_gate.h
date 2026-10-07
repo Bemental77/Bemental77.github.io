@@ -118,6 +118,9 @@ constexpr u32 BEM_LEVER_CR_LEAN = 1u << 19;
 // first (the BEM_LEVER_MEM_SLOWARM invariant), so the store is dead. Forms that
 // fall back to the interpreter keep it.
 constexpr u32 BEM_LEVER_BRANCH_NOPC = 1u << 20;
+// Builder peephole over the emitted block body: `local.set X; local.get X`
+// with nothing between becomes `local.tee X` (WasmModuleBuilder::op_local_get).
+constexpr u32 BEM_LEVER_SET_GET_TEE = 1u << 21;
 
 bool bem_lever_on(u32 bit);
 

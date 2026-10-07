@@ -464,8 +464,29 @@ public:
 
 	// --- WASM instructions ---
 
-	void op_local_get(u32 idx) { emitByte(wop::local_get); emitLEB128(idx); }
-	void op_local_set(u32 idx) { emitByte(wop::local_set); emitLEB128(idx); }
+	// [set-get-tee peephole, powerpc-next lever bit21 2026-10-07] With the
+	// peephole on, `local.set X` immediately followed by `local.get X` (no
+	// instruction between them) is emitted as `local.tee X`: the same local
+	// write and the same value left on the stack. The set's opcode byte is
+	// rewritten in place (0x21 -> 0x22, same LEB index), so no byte moves and
+	// every recorded offset (marks, branch hints, relocs) stays valid.
+	void op_local_get(u32 idx) {
+		if (m_peep_tee && m_last_set_end == bytes.size() && m_last_set_idx == idx) {
+			bytes[m_last_set_pos] = wop::local_tee;
+			m_last_set_end = (size_t)-1;
+			++m_peep_tee_count;
+			return;
+		}
+		emitByte(wop::local_get); emitLEB128(idx);
+	}
+	void op_local_set(u32 idx) {
+		m_last_set_pos = bytes.size();
+		emitByte(wop::local_set); emitLEB128(idx);
+		m_last_set_end = bytes.size();
+		m_last_set_idx = idx;
+	}
+	void setPeepholeTee(bool on) { m_peep_tee = on; m_last_set_end = (size_t)-1; }
+	u32 peepholeTeeCount() const { return m_peep_tee_count; }
 	void op_global_get(u32 idx) { emitByte(wop::global_get); emitLEB128(idx); }
 	void op_global_set(u32 idx) { emitByte(wop::global_set); emitLEB128(idx); }
 	void op_local_tee(u32 idx) { emitByte(wop::local_tee); emitLEB128(idx); }
@@ -841,6 +862,12 @@ private:
 	std::vector<BranchHint> m_branch_hints;
 	// [AOT v4 reloc] module-lifetime reloc records (see op_i32_const_reloc).
 	std::vector<Reloc> m_relocs;
+	// [set-get-tee peephole] state (see op_local_get).
+	bool m_peep_tee = false;
+	size_t m_last_set_pos = 0;
+	size_t m_last_set_end = (size_t)-1;
+	u32 m_last_set_idx = 0;
+	u32 m_peep_tee_count = 0;
 
 	// Write a u32 as a 5-byte fixed-length LEB128 at a specific position
 	void patchLEB128_5(u32 pos, u32 value) {

@@ -261,6 +261,15 @@ if(BEMENTAL_GUEST_POWERPC)
         target_compile_options(test_cr_lean PRIVATE "-pthread")
     endif()
 
+    # [set-get-tee 2026-10-07] WasmModuleBuilder's set/get -> tee peephole
+    # (BEM_LEVER_SET_GET_TEE), byte-exact. `node test_peephole_tee.js`.
+    add_executable(test_peephole_tee test_peephole_tee.cpp)
+    target_include_directories(test_peephole_tee PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_target_properties(test_peephole_tee PROPERTIES SUFFIX ".js")
+
     # [pc-sync 2026-10-04] Inline interp fallbacks store ctx.PC so the
     # dolphin_interp pc guard runs them. `node test_interp_pcsync.js`.
     if(BEMENTAL_GUEST_POWERPC_NEXT)
