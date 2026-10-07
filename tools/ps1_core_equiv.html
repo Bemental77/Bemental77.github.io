@@ -1,0 +1,144 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ps1 core equivalence harness</title>
+<body>
+<pre id="log">booting…</pre>
+<script>
+// Harness for tools/ps1_core_equiv.mjs. ARE TWO PS1 WORKER BUILDS THE SAME
+// CONSOLE? Two gated workers (A and B, any two wasmpsx_worker.js URLs) boot the
+// same disc bytes by the same path ('netBoot'), then run the same frames with
+// the same scripted pads ('netStep', one frame at a time). Every `every` frames
+// each is asked for a LAYOUT-INDEPENDENT fingerprint of its guest:
+//   'netHash'  -> FNV over psxM (2 MB main RAM) + psxH (64 KB hardware page),
+//                 found through each core's own read LUT (wasmpsx_worker.js
+//                 locateMem), so two builds with different static layouts are
+//                 comparable;
+//   VRAM       -> every `vramEvery` frames, the 1 MB of VRAM read out word by
+//                 word through 'netPeek' at the core's own vram_ptr.
+// liveHash/netRbStep fingerprints are NOT used here: they also cover static
+// data, whose ADDRESSES belong to one build.
+//
+// opts.ports: 2 (48-byte PADSTATE pair, exactly what a two-player room latches)
+// or 4 (96 bytes: PadState[0..3], only meaningful on a core with four).
+// opts.mtA / opts.mtB: multitap slots to plug into A / B before frame 0
+// ('netMultitap' {slots}); 0 = none. A core without the command reports so.
+const logEl = document.getElementById('log');
+const lines = [];
+function log(s) { lines.push(s); logEl.textContent = lines.slice(-60).join('\n'); if (window.__state) window.__state.progress = s; }
+
+function mkWorker(url) {
+  const w = new Worker(url + (url.includes('?') ? '&' : '?') + 'netgate=1&v=' + Date.now());
+  const st = { w, url, ready: false, prints: [], q: [] };
+  w.onmessage = (e) => {
+    const d = e.data;
+    if (d.cmd === 'workerReady') st.ready = true;
+    else if (d.cmd === 'print') st.prints.push(String(d.txt));
+    else if (d.cmd === 'render') st.w.postMessage({ cmd: 'return_vram', vram: d.vram }, [d.vram.buffer]);
+    else if (d.cmd === 'SoundFeedStreamData') st.w.postMessage({ cmd: 'return_pSound', pSound: d.pSound }, [d.pSound.buffer]);
+    else if (d.cmd === 'coreRate') st.coreRate = d;
+    const r = st.q.length && st.q[0].want === d.cmd ? st.q.shift() : null;
+    if (r) r.res(d);
+  };
+  w.onerror = (e) => st.prints.push('WORKER ERROR ' + (e.message || e));
+  return st;
+}
+function ask(st, want, msg, transfer) {
+  return new Promise((res) => { st.q.push({ want, res }); st.w.postMessage(msg, transfer || []); });
+}
+// The same deterministic pad script as tools/ps1_rollback_harness.html, for
+// any number of ports (active-low KeyStatus bytes).
+function truePad(f, port) {
+  let x = Math.imul((f >> 3) + 1 + port * 7919, 2654435761) >>> 0;
+  let b0 = 0xFF, b1 = 0xFF;
+  if (f >= 200 && f < 206) b0 &= ~(1 << 3);
+  if (f >= 400 && f < 406) b1 &= ~(1 << 6);
+  if (f > 500) { b0 &= ~((x & 0xF0)); b1 &= ~((x >>> 8) & 0xF0); }
+  return [b0, b1];
+}
+function padBuf(f, ports) {
+  const a = new Uint8Array(24 * ports);
+  for (let p = 0; p < ports; p++) {
+    const o = p * 24, k = truePad(f, p);
+    a[o + 4] = 0; a[o + 5] = 0x41; a[o + 6] = k[0]; a[o + 7] = k[1];
+    a[o + 8] = 0xFF; a[o + 9] = 0xFF; a[o + 10] = 0x80; a[o + 11] = 0x80; a[o + 12] = 0x80; a[o + 13] = 0x80;
+  }
+  return a.buffer;
+}
+async function fetchDisc(url, maxBytes) {
+  const resp = await fetch(url);
+  const gz = /\.gz$/.test(url);
+  const rd = (gz ? resp.body.pipeThrough(new DecompressionStream('gzip')) : resp.body).getReader();
+  const parts = []; let n = 0;
+  while (n < maxBytes) { const { done, value } = await rd.read(); if (done) break; parts.push(value); n += value.length; }
+  try { rd.cancel(); } catch (e) {}
+  const out = new Uint8Array(Math.min(n, maxBytes)); let o = 0;
+  for (const p of parts) { const t = Math.min(p.length, out.length - o); out.set(p.subarray(0, t), o); o += t; if (o >= out.length) break; }
+  return out;
+}
+async function vramHash(st) {
+  const m = await ask(st, 'netSnapMapResult', { cmd: 'netSnapMap', block: 1 << 20 });
+  const base = m.vram >>> 0; let h = 0x811c9dc5 | 0;
+  for (let c = 0; c < 4; c++) {
+    const addrs = new Array(65536);
+    for (let i = 0; i < 65536; i++) addrs[i] = base + (c * 65536 + i) * 4;
+    const r = await ask(st, 'netPeekResult', { cmd: 'netPeek', addrs });
+    for (const v of r.vals) h = Math.imul(h ^ v, 16777619);
+  }
+  return h >>> 0;
+}
+
+window.__state = { started: false, done: false, result: null, error: null, progress: '' };
+window.__start = function (opts) {
+  if (window.__state.started) return true;
+  window.__state.started = true;
+  run(opts).then((r) => { window.__state.result = r; window.__state.done = true; },
+                 (e) => { window.__state.error = String((e && e.stack) || e); window.__state.done = true; });
+  return true;
+};
+
+async function run(opts) {
+  const N = opts.frames | 0, EVERY = opts.every | 0, VEVERY = opts.vramEvery | 0, PORTS = opts.ports | 0;
+  log('fetching ' + opts.disc);
+  const disc = await fetchDisc(opts.disc, opts.bytes);
+  log('disc bytes ' + disc.length);
+  const A = mkWorker(opts.a), B = mkWorker(opts.b);
+  const t0 = performance.now();
+  while (performance.now() - t0 < 120000 && !(A.ready && B.ready)) await new Promise((r) => setTimeout(r, 50));
+  if (!(A.ready && B.ready)) return { ok: false, reason: 'workers never ready' };
+  const mt = {};
+  for (const [name, st, slots] of [['A', A, opts.mtA | 0], ['B', B, opts.mtB | 0]]) {
+    if (slots) mt[name] = await ask(st, 'netMultitapResult', { cmd: 'netMultitap', slots });
+  }
+  for (const st of [A, B]) {
+    const c = disc.slice();
+    const r = await ask(st, 'netBooted', { cmd: 'netBoot', name: 'disc.bin', buf: c.buffer }, [c.buffer]);
+    if (!r.ok) return { ok: false, reason: 'boot failed: ' + r.err };
+  }
+  log('booted; A=' + JSON.stringify(A.coreRate) + ' B=' + JSON.stringify(B.coreRate));
+  const take = { A: !!(A.coreRate && A.coreRate.take), B: !!(B.coreRate && B.coreRate.take) };
+  const checks = []; let mism = 0, firstMism = null, vchecks = 0, vmism = 0;
+  for (let f = 0; f < N; f++) {
+    const pa = padBuf(f, PORTS), pb = padBuf(f, PORTS);
+    const [ra, rb] = await Promise.all([ask(A, 'netFrame', { cmd: 'netStep', frame: f, count: 1, states: pa }, [pa]),
+                                        ask(B, 'netFrame', { cmd: 'netStep', frame: f, count: 1, states: pb }, [pb])]);
+    if (ra.err || rb.err) return { ok: false, reason: 'step ' + f + ': ' + (ra.err || rb.err) };
+    if ((f + 1) % EVERY === 0) {
+      const [ha, hb] = await Promise.all([ask(A, 'netHashResult', { cmd: 'netHash', frame: f }), ask(B, 'netHashResult', { cmd: 'netHash', frame: f })]);
+      const c = { frame: f, a: ha.hash, b: hb.hash, len: [ha.len, hb.len] };
+      if (VEVERY && (f + 1) % VEVERY === 0) {
+        c.va = await vramHash(A); c.vb = await vramHash(B); vchecks++;
+        if (c.va !== c.vb) vmism++;
+      }
+      checks.push(c);
+      if (c.a !== c.b || c.va !== c.vb) { mism++; if (!firstMism) { firstMism = c; log('*** MISMATCH at frame ' + f + ' ' + JSON.stringify(c)); } }
+      if ((f + 1) % (EVERY * 10) === 0) log('frame ' + (f + 1) + ' checks=' + checks.length + ' mism=' + mism + ' vram=' + vchecks + '/' + vmism);
+    }
+  }
+  const distinct = new Set(checks.map((c) => c.a)).size;
+  return { ok: mism === 0 && checks.length > 0 && take.A && take.B && distinct > 1, frames: N, every: EVERY, ports: PORTS,
+           checks: checks.length, mismatches: mism, vramChecks: vchecks, vramMismatches: vmism, distinctRamHashes: distinct,
+           firstMismatch: firstMism, take, coreRate: { A: A.coreRate, B: B.coreRate }, multitap: mt,
+           last: checks[checks.length - 1], printsA: A.prints.slice(-4), printsB: B.prints.slice(-4) };
+}
+</script>
+</body>
