@@ -382,15 +382,21 @@ static void saveStateWrite(unsigned char *data);
  * that way for pads 4/5. It is refreshed once per frame by S9xUpdateJoypads
  * at V = ScreenHeight + 3, mid-frame, while a frame boundary (and so every
  * savestate rollback takes) is at V = 0. So between V = 0 and V = 227 the
- * running machine holds the PREVIOUS frame's pads, and a console that loaded
- * frame k after simulating k+n held frame k+n-1's instead: a manual read in
- * that window would fork a rolled-back console from one that never rolled
- * back. Not carried before because nothing here read pads 3-5.
+ * running machine holds the PREVIOUS frame's pads — and before this a load
+ * held NONE: loadState's S9xReset -> S9xResetPPU zeroes IPPU.Joypads, so a
+ * manual read in that window after any load saw no buttons where a straight
+ * run saw last frame's. Every console in a rollback room loads before EVERY
+ * frame (snes/snes_rollback.js, the canonical step), so they agreed with each
+ * other either way; this makes a load restore what the hardware held. NOT
+ * measured on a game that reads in that window (none shipped does; the
+ * multitap test ROM reads after the auto-read), so the room probes do not
+ * depend on it — it is defensive.
  *
  * WHERE: five 16-bit words in PPU fields no code reads (ppu.h UNUSED9[6],
  * UNUSED2, UNUSED10[2]), tagged in UNUSED1, so the layout and the size are
  * unchanged and every savestate written before this still loads exactly as it
- * did (tag absent -> IPPU.Joypads left alone, the old behaviour).
+ * did (tag absent -> IPPU.Joypads left as S9xReset leaves them, zero: the
+ * old behaviour).
  * Only the low 16 bits are kept: S9xUpdateJoypads ORs 0xffff0000 into a
  * NONZERO pad for SNES_JOYPAD / SNES_MULTIPLAYER5 and leaves 0 as 0, so the
  * load re-applies exactly that rule. */
