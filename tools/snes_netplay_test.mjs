@@ -235,8 +235,11 @@ async function openPeer(browser, tag, role) {
 
     const na0 = await A.page.evaluate(() => window.__snesNet());
     const nb0 = await B.page.evaluate(() => window.__snesNet());
-    ok('ports-are-the-consoles-own', na0.ports === 2 && nb0.ports === 2,
-       `portCount=${na0.ports}/${nb0.ports} — a SNES has two controller ports on the front`);
+    // FOUR since 2026-10-07: the room can seat players 3-4 behind a Super
+    // Multitap (snes.html SNES_PORTS). Two seated must still be the plain
+    // console — checked below (the-multitap-stays-out-for-two).
+    ok('ports-are-the-rooms-four', na0.ports === 4 && nb0.ports === 4,
+       `portCount=${na0.ports}/${nb0.ports} — two on the console, two more through a multitap when 3+ are in`);
 
     const pa = (na0.localPorts || [])[0], pb = (nb0.localPorts || [])[0];
     ok('each-peer-holds-a-different-port', pa != null && pb != null && pa !== pb,
@@ -307,13 +310,18 @@ async function openPeer(browser, tag, role) {
                roster: Array.from(document.querySelectorAll('#netRoster li')).map((li) => li.textContent.trim()) };
     })));
     ok('the-party-button-is-live',
-       partyNow.every((q) => /^Party · [A-HJ-NP-Z2-9]{5} · 2\/2 · (starting|playing)$/.test(q.party.label)),
+       partyNow.every((q) => /^Party · [A-HJ-NP-Z2-9]{5} · 2\/4 · (starting|playing)$/.test(q.party.label)),
        `#btnNet reads ${JSON.stringify(partyNow.map((q) => q.party.label))}`);
     ok('seats-use-the-vocabulary-and-never-a-nonce',
-       partyNow.every((q) => q.party.rows.length === 2
-         && q.party.rows.every((r) => VOCAB.test(r.state) && (r.port === 0 ? r.who === 'host' : r.who === 'player'))
-         && q.roster.length === 2 && !q.roster.some((t) => /\b[0-9a-f]{16}\b/.test(t))),
+       partyNow.every((q) => q.party.rows.length === 4
+         && q.party.rows.every((r) => VOCAB.test(r.state) && (r.port === 0 ? r.who === 'host' : r.port === 1 ? r.who === 'player' : (r.who == null && r.state === 'open')))
+         && q.roster.length === 4 && !q.roster.some((t) => /\b[0-9a-f]{16}\b/.test(t))),
        `rows=${JSON.stringify(partyNow.map((q) => q.party.rows))} rendered=${JSON.stringify(partyNow.map((q) => q.roster))}`);
+    // TWO SEATED IS THE PLAIN CONSOLE: no multitap, by the page's decision AND
+    // by what the CORE reports (getMultitap reads IPPU.Controller).
+    const mt2 = await Promise.all([A, B].map((p) => p.page.evaluate(() => window.__snesNet().multitap)));
+    ok('the-multitap-stays-out-for-two', mt2.every((m) => m && m.decided && m.on === false && m.core === 0 && m.seated === 2),
+       `multitap ${JSON.stringify(mt2)}`);
     ok('the-status-line-says-everyone-started-together',
        partyNow.every((q) => /^Playing — everyone started together at frame \d+\.$/.test(q.party.barrier)),
        `#netBarrier reads ${JSON.stringify(partyNow.map((q) => q.party.barrier))}`);

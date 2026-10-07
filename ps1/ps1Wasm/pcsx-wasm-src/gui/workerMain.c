@@ -76,8 +76,7 @@ void one_iter()
     psxHu32ref(0x1070) |= 1;
     GPUupdateLace0();
     EM_ASM_({
-
-        setTimeout("pcsx_mainloop()", $0);
+        _scheduleMainLoop($0);
     },
             updated_display / 1000);
 }

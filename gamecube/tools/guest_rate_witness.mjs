@@ -107,6 +107,27 @@ const CELLS = [
   { name: 'sab-ingame-leafon-mips', rom: 1, ms: 150000, query: 'bjit_mips=1&noleafinline=0',
     state: path.join(REPO, 'gamecube/states/sab-citye-gameplay.gcs.gz'), stateMs: 30000,
     note: 'as sab-ingame-mips + the leaf-inline splice ARMED (idle-skip arm of the broken arm)' },
+  // [lever arms 2026-10-07] ONE binary, two emitter arms: ?bjit_lever_kill is
+  // OR'd into BEM_LEVER_KILL_CELL 0x026B3EE0 (lever_gate.h) before any block
+  // compiles. 0x3E000 kills bits 13-17 (taken-exit chain, superblocks, probe
+  // diet, idle taken-only, GPR exit-only flush) and keeps the 2026-10-04 levers
+  // 0-12; pair each against sab-ingame / sab-ingame-mips (the default arm, all
+  // levers on), interleaved. Arm-difference proof: the census cell 0x026B3EE4
+  // reads 0x80000000 | the effective mask. ⚠ UNVERIFIED LIVE: the query reaches
+  // the emitter only through Module.ENV -> getenv on the CPU thread, and
+  // ppc_emit.cpp's fp_resident_loop note records getenv as DEAD there. If the
+  // census reads 0x80000000 on the levoff arm, the arm is a placebo: write
+  // 0x3E000 to 0x026B3EE0 from the page instead. Bits 13 and 16 REMOVE clock-jumps the
+  // old code made during real work (block_replay found 66 heuristic collapses +
+  // 9 idle-block pass-throughs in the replay window), so the ON arm can credit
+  // LESS skipped time: read EXECUTED MHz and the idle-skip share, not CREDITED
+  // alone.
+  { name: 'sab-ingame-levoff', rom: 1, ms: 150000, query: 'bjit_lever_kill=0x3E000',
+    state: path.join(REPO, 'gamecube/states/sab-citye-gameplay.gcs.gz'), stateMs: 30000,
+    note: 'as sab-ingame with levers 13-17 killed (the pre-2026-10-07 emitter)' },
+  { name: 'sab-ingame-levoff-mips', rom: 1, ms: 150000, query: 'bjit_mips=1&bjit_lever_kill=0x3E000',
+    state: path.join(REPO, 'gamecube/states/sab-citye-gameplay.gcs.gz'), stateMs: 30000,
+    note: 'as sab-ingame-mips with levers 13-17 killed (idle-skip arm)' },
   { name: 'pso-cold', rom: 2, ms: 130000, query: '', note: 'PSO cold boot (JIT)' },
   { name: 'pso-cold-mips', rom: 2, ms: 130000, query: 'bjit_mips=1',
     note: 'PSO cold boot + executed-cycle meter armed — THE 1.00x case, arm it or the reading is meaningless' },

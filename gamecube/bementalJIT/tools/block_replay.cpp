@@ -34,11 +34,18 @@
 //
 // Usage: node block_replay.js <state_dir> <mode> <max_slices> [--slice N]
 //        [--cell 0xADDR=0xVAL]... [--trace-out FILE] [--stop-park]
-//        [--json FILE] [--top-pcs N] [--dump-dir DIR]
+//        [--json FILE] [--top-pcs N] [--dump-dir DIR] [--exit-census] [--no-collapse]
+//
+// --no-collapse disables bem_chain_loop_c's busy-poll clock-jump heuristic
+// (block_cache.cpp g_bem_idle_collapse_off). That heuristic keys on WHICH blocks
+// return to the C loop, so any lever that changes the dispatch pattern changes
+// where it fires (and it fires on real work: SAB __GXSetDirtyState). Use it on
+// BOTH arms of a differential so slicing depends on the guest stream alone.
 
 #include "guests/powerpc-next/ppc_emit.h"
 #include "guests/powerpc-next/ppc_analyst.h"
 #include "guests/powerpc-next/ppc_offsets.h"
+#include "guests/powerpc-next/lever_gate.h"
 #include "bementalJIT/block_cache.h"
 
 #include <cstdio>
@@ -61,6 +68,8 @@ extern uint32_t g_bem_accurate_nans;
 extern uint32_t g_bem_ni_flush;
 extern unsigned char g_bem_chain_enabled;
 extern int g_bem_gp_dirty;
+extern uint32_t g_bem_aot_count_exits;
+extern uint32_t g_bem_idle_collapse_off;
 }
 
 static constexpr u32 kMaxBlockInsts = 64u;      // JitWasm.cpp kMaxBlockInsts
@@ -128,10 +137,29 @@ static BlockCache* g_cache = nullptr;
 static u32 g_compiles = 0, g_compile_fail = 0;
 static std::vector<u8> g_ibuf(4u << 20);
 
+static u32 g_superblocks = 0, g_seams = 0;
+static u32 g_follow_cap = 64u;   // --follow-cap N: superblock op cap (segments stay <= 64)
+
 static bool compile_at(u32 start_pc) {
     std::vector<u32> insts;
+    std::vector<u32> pcs;      // non-empty = a superblock (DecodeBlockFollow) stream
+    // [SUPERBLOCK] JitWasm.cpp TryCompileBlock: the follow decoder first, when
+    // the lever is on; a stream with no seam IS the contiguous block, which then
+    // takes the unchanged path below.
+    if (bem_lever_on(BEM_LEVER_FOLLOW)) {
+        u32 fi[512], fp[512], nseams = 0;
+        const std::size_t n = DecodeBlockFollow(
+            start_pc, [](u32 a, void*) -> u32 { return guest_read32(a); }, nullptr,
+            fi, fp, g_follow_cap, &nseams, nullptr, nullptr, 0u, nullptr);
+        if (nseams > 0u) {
+            insts.assign(fi, fi + n);
+            pcs.assign(fp, fp + n);
+            ++g_superblocks;
+            g_seams += nseams;
+        }
+    }
     u32 pc = start_pc;
-    for (u32 i = 0; i < kMaxBlockInsts; ++i) {
+    for (u32 i = 0; pcs.empty() && i < kMaxBlockInsts; ++i) {
         const u32 inst = guest_read32(pc);
         insts.push_back(inst);
         // JitWasm.cpp TryCompileBlock decode rule, verbatim.
@@ -143,7 +171,9 @@ static bool compile_at(u32 start_pc) {
     const u32 ctx_ptr = (u32)(uintptr_t)g_ctx;
     const u32 mem1_base = (u32)(uintptr_t)g_mem1;
     std::vector<u8> bytes = build_block_next(start_pc, insts.data(), (u32)insts.size(), ctx_ptr,
-                                             mem1_base, kRamMask, kRamSize, &cycles);
+                                             mem1_base, kRamMask, kRamSize, &cycles, nullptr,
+                                             pcs.empty() ? nullptr : pcs.data(),
+                                             pcs.empty() ? 0u : BEM_BUILD_FOLLOW);
     if (bytes.empty()) { ++g_compile_fail; return false; }
     if (g_dump_dir) {
         // Same shape as op_census's output so its readers apply. The UNinstrumented
@@ -156,7 +186,7 @@ static bool compile_at(u32 start_pc) {
             std::fprintf(f, "# block pc=%08x n_insts=%u cycles=%u module_bytes=%zu\n", start_pc,
                          (u32)insts.size(), cycles, bytes.size());
             for (u32 i = 0; i < insts.size(); ++i)
-                std::fprintf(f, "inst %08x %08x\n", start_pc + 4u * i, insts[i]);
+                std::fprintf(f, "inst %08x %08x\n", pcs.empty() ? start_pc + 4u * i : pcs[i], insts[i]);
             for (std::size_t i = 0; i + 2 < g_marks.size(); i += 3)
                 std::fprintf(f, "mark %d %08x %d\n", g_marks[i], (u32)g_marks[i + 2], g_marks[i + 1]);
             std::fclose(f);
@@ -233,12 +263,19 @@ int main(int argc, char** argv) {
     const char* trace_out = nullptr;
     const char* json_out = nullptr;
     bool stop_park = false;
+    bool exit_census = false;
+    bool recur_scan = false;
     std::vector<std::pair<u32, u32>> cells;
     for (int i = 4; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--slice") && i + 1 < argc) slice = std::atol(argv[++i]);
         else if (!std::strcmp(argv[i], "--trace-out") && i + 1 < argc) trace_out = argv[++i];
         else if (!std::strcmp(argv[i], "--json") && i + 1 < argc) json_out = argv[++i];
         else if (!std::strcmp(argv[i], "--stop-park")) stop_park = true;
+        else if (!std::strcmp(argv[i], "--exit-census")) exit_census = true;
+        else if (!std::strcmp(argv[i], "--recur-scan")) recur_scan = true;
+        else if (!std::strcmp(argv[i], "--no-collapse")) g_bem_idle_collapse_off = 1u;
+        else if (!std::strcmp(argv[i], "--follow-cap") && i + 1 < argc)
+            g_follow_cap = std::min<u32>(512u, (u32)std::atoi(argv[++i]));
         else if (!std::strcmp(argv[i], "--top-pcs") && i + 1 < argc) g_top_pcs = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--dump-dir") && i + 1 < argc) g_dump_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--cell") && i + 1 < argc) {
@@ -275,6 +312,9 @@ int main(int argc, char** argv) {
     g_bem_chain_enabled = 1u;
     g_hle_hook_query = [](uint32_t) -> bool { return false; };
     g_bem_emit_mark_cb = &mark_cb;
+    // --exit-census: the emitter's per-exit-reason counters (offline diag only;
+    // they ADD ops, so never combine with count mode for an ops figure).
+    if (exit_census) g_bem_aot_count_exits = 1u;
     for (auto& c : cells) {
         *reinterpret_cast<volatile u32*>((uintptr_t)c.first) = c.second;
         std::fprintf(stderr, "[replay] cell 0x%08X = 0x%08X\n", c.first, c.second);
@@ -302,6 +342,22 @@ int main(int argc, char** argv) {
     u32 stop_pc = 0;
     u32 park_ring[32] = {0};
     std::map<u32, u32> end_pcs;
+    // --recur-scan (trace mode): a PROVABLE idle cycle is a slice end whose
+    // (PC, architectural register file) equals an earlier slice end's AND whose
+    // MEM1 is byte-identical AND with no MMIO / gather-pipe write, no host
+    // interpreter call and no drain in between. The replay is deterministic, so
+    // such a state can only repeat forever until something outside the CPU
+    // changes memory: skipping to the next event there is exact. Register-only
+    // recurrences are counted separately (GX command loops write the gather pipe,
+    // not MEM1, so their registers recur while they do real work).
+    struct Recur { long slice; uint64_t mem; int side; };
+    std::map<std::pair<u32, uint64_t>, Recur> recur_seen;
+    std::map<u32, std::pair<u32, u32>> recur_by_pc;   // pc -> (reg-only, provable)
+    auto side_effects = [&]() {
+        return js_stat("mmioW") + js_stat("wpar") + js_stat("drains") + js_stat("interp") +
+               EM_ASM_INT({ let n = 0; const f = Module.__replay.fallbackOps;
+                            for (const k in f) n += f[k] | 0; return n; });
+    };
     for (; s < max_slices; ++s) {
         set_ctx32(ppc_off::DOWNCOUNT, (u32)slice);
         bool halted = false;
@@ -348,6 +404,20 @@ int main(int argc, char** argv) {
                 }
             }
             std::fprintf(tf, "%ld %08x %016llx %d %08x\n", s, epc, (unsigned long long)h, dc, smask);
+            if (recur_scan) {
+                const auto key = std::make_pair(epc, h);
+                const int side = side_effects();
+                auto it = recur_seen.find(key);
+                if (it == recur_seen.end()) {
+                    recur_seen[key] = Recur{s, 0ull, side};
+                } else {
+                    const uint64_t mh = fnv64(g_mem1, kRamSize);
+                    auto& c = recur_by_pc[epc];
+                    if (it->second.mem == mh && it->second.side == side) ++c.second;
+                    else ++c.first;
+                    it->second = Recur{s, mh, side};
+                }
+            }
         }
         if (halted) break;
         park_ring[s & 31] = epc;
@@ -364,10 +434,15 @@ int main(int argc, char** argv) {
     const uint64_t mem_hash = fnv64(g_mem1, kRamSize);
     const uint64_t ctx_hash = fnv64(g_ctx + 0x014, ppc_off::DOWNCOUNT - 0x014,
                                     fnv64(g_ctx + 0x000, 0x0C));
+    // Gather-pipe digest: every byte drained during the run plus the residual
+    // still in the pipe (block_replay_pre.js gpFold). Taken after ctx_hash,
+    // which excludes the gather-pipe pointers it resets.
+    const u32 gp_hash = (u32)EM_ASM_INT({ return Module.bemReplayGpHash(); });
+    const int gp_bytes = js_stat("gpBytes");
     if (tf) {
-        std::fprintf(tf, "END mem1=%016llx ctx=%016llx cycles=%llu\n",
+        std::fprintf(tf, "END mem1=%016llx ctx=%016llx cycles=%llu gp=%08x/%d\n",
                      (unsigned long long)mem_hash, (unsigned long long)ctx_hash,
-                     (unsigned long long)guest_cycles);
+                     (unsigned long long)guest_cycles, gp_hash, gp_bytes);
         std::fclose(tf);
     }
 
@@ -384,7 +459,7 @@ int main(int argc, char** argv) {
         "\"indirect_calls\":%llu,\"consts\":%llu,\"locals\":%llu,\"control\":%llu,"
         "\"terminal_loads\":%llu,\"ops_per_guest_instr\":%.3f,\"instrs_per_entry\":%.3f,"
         "\"mmioR\":%d,\"mmioW\":%d,\"wpar_import\":%d,\"drains\":%d,\"interp\":%d,"
-        "\"mask_unsound\":%u}",
+        "\"mask_unsound\":%u,\"superblocks\":%u,\"seams\":%u,\"gp_hash\":\"%08x\",\"gp_bytes\":%d}",
         mode.c_str(), s, stop, stop_pc, (unsigned long long)guest_cycles, g_compiles,
         g_compile_fail, host_chains, blocks_via_host, (unsigned long long)mem_hash,
         (unsigned long long)ctx_hash, (unsigned long long)g_cnt[12],
@@ -397,7 +472,7 @@ int main(int argc, char** argv) {
         (unsigned long long)g_cnt[14], gi > 0 ? ops / gi : 0.0,
         g_cnt[13] ? gi / (double)g_cnt[13] : 0.0,
         js_stat("mmioR"), js_stat("mmioW"), js_stat("wpar"), js_stat("drains"), js_stat("interp"),
-        g_mask_unsound);
+        g_mask_unsound, g_superblocks, g_seams, gp_hash, gp_bytes);
     std::printf("%s\n", buf);
     if (json_out) { std::FILE* jf = std::fopen(json_out, "w"); if (jf) { std::fprintf(jf, "%s\n", buf); std::fclose(jf); } }
     std::fprintf(stderr, "[replay] slice-end PCs (top):");
@@ -416,6 +491,21 @@ int main(int argc, char** argv) {
         const m = Object.entries(st.mmioAddrs).sort((a, b) => b[1] - a[1]).slice(0, 12);
         console.error('[replay] MMIO (top): ' + JSON.stringify(m));
     });
+    if (recur_scan) {
+        std::fprintf(stderr, "[replay] recur-scan (pc: register-only recurrences / PROVABLE idle recurrences):");
+        for (const auto& kv : recur_by_pc)
+            std::fprintf(stderr, " %08x:%u/%u", kv.first, kv.second.first, kv.second.second);
+        std::fprintf(stderr, "\n");
+    }
+    if (exit_census) {
+        static const struct { u32 cell; const char* name; } kc[] = {
+            {0x026B34D8u, "coalesced_taken_host_return"}, {0x026B34DCu, "service_bail"},
+            {0x026B34E0u, "vector_guard"}, {0x026B34F0u, "terminal_host_return"},
+        };
+        for (const auto& c : kc)
+            std::fprintf(stderr, "[replay] exit-census %-28s %u\n", c.name,
+                         *reinterpret_cast<volatile u32*>((uintptr_t)c.cell));
+    }
     if (js_stat("interp"))
         std::fprintf(stderr, "[replay] first interp fallback pc=0x%08x inst=0x%08x\n",
                      (u32)js_stat("interpPc"), (u32)js_stat("interpInst"));

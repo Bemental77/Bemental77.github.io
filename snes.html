@@ -17,7 +17,7 @@
        returned a hardcoded 0 for every port but 0 — so a room could only ever
        have seated one person. The core now carries five ports and the second
        one is proven live; see the note above runFrame(). -->
-  <script src="/lib/netplay.js?v=bb106f86"></script>
+  <script src="/lib/netplay.js?v=f1c13bf4"></script>
   <!-- the console half of rollback netplay (savestate ring, canonical step,
        re-simulation); tools/snes_rollback_probe.mjs runs this same file -->
   <script src="/snes/snes_rollback.js?v=016de924"></script>
@@ -199,7 +199,7 @@
     #netCodeIn { width: 100%; box-sizing: border-box; min-height: 44px; font: 700 20px/1 ui-monospace, Menlo, monospace;
       letter-spacing: 4px; text-align: center; text-transform: uppercase; background: #0e1013; color: #eee;
       border: 1px solid #555; border-radius: 9px; padding: 11px; }
-    #netGame { width: 100%; box-sizing: border-box; min-height: 44px; background: #0e1013; color: #eee;
+    #netGame, #netSeats { width: 100%; box-sizing: border-box; min-height: 44px; background: #0e1013; color: #eee;
       border: 1px solid #555; border-radius: 9px; padding: 10px 12px; font-size: 15px; }
     .netActions { display: flex; gap: 10px; margin-top: 12px; }
     #netRoster { list-style: none; margin: 6px 0 0; padding: 0; }
@@ -336,6 +336,12 @@
       <div class="netLabel">Share this code</div>
       <div id="netCode">·····</div>
       <div class="netActions"><button id="netCopy" type="button">Copy code</button></div>
+      <div class="netLabel">Start when this many players are in</div>
+      <select id="netSeats">
+        <option value="2">2 players</option>
+        <option value="3">3 players (Super Multitap)</option>
+        <option value="4">4 players (Super Multitap)</option>
+      </select>
     </div>
     <div id="netJoinPane" style="display:none">
       <div class="netLabel">Game the room is playing</div>
@@ -375,7 +381,7 @@
   // which renamed every letter after them. CORE_V is the wasm's md5 prefix;
   // change the core, change this, and both files are fetched at a URL no cache
   // has seen.
-  const CORE_V = '1ea11e9a';
+  const CORE_V = '02dccf42';
   const ROMS = [
     { label: 'SimCity', url: '/snes/snesWasm/roms/simcity.smc' }
   ];
@@ -565,7 +571,7 @@
   // onRuntimeInitialized, and sample the canvas before believing any flag.
   //
   // ── WHAT WAS PROVEN, in live wasm memory and then in a real game ───────────
-  // NO MULTITAP IS INVOLVED — ignore any Super Multitap framing. At runtime
+  // NO MULTITAP IS INVOLVED IN A TWO-PLAYER ROOM (3-4 players: see SNES_PORTS). At runtime
   // IPPU.Controller == SNES_JOYPAD, and ppu.c:2098-2099 ALREADY writes
   // IPPU.Joypads[1] into FillRAM[0x421a]/[0x421b], the standard auto-read
   // registers for port 2, unconditionally. Only S9xReadJoypad was starving it.
@@ -629,12 +635,23 @@
   // and one _mainLoop() advances the frame counters by exactly +1.
   // ═══════════════════════════════════════════════════════════════════════════
 
-  // A SNES has two controller ports on the front of the machine. The core's
-  // Joypads[] array is FIVE wide and this page can address all five, but ports
-  // 3-5 only exist behind a Super Multitap and nothing here puts one in — so the
-  // room seats two and says so, rather than seating five and dropping three
-  // players' inputs on the floor.
-  var SNES_PORTS = 2;
+  // A ROOM SEATS UP TO FOUR. A SNES has two controller ports on the front of
+  // the machine; players 3 and 4 exist only behind a SUPER MULTITAP in port 2,
+  // and the core now has one (exports.c setMultitap — snes9x's own
+  // SNES_MULTIPLAYER5 read path, which init_sfc_setting() never plugged in).
+  // The room's ports are the multitap's pads 1-4: port 0 = the console's port 1,
+  // ports 1-3 = multitap pads 2-4 (with the multitap OUT, port 1 is simply the
+  // console's port 2 — snes9x reads both from Joypads[1]).
+  //
+  // ⚠ THE MULTITAP GOES IN ONLY WHEN THE ROOM SEATS 3 OR MORE (lsMultitapApply).
+  // Some games refuse to run with one plugged in, and a two-player room must be
+  // exactly the console it always was: same adaptor (none), same ports 0/1, and
+  // ports 2/3 unseated and therefore all-zero, which is what Joypads[2..4]
+  // already read. The local couch path (runFrame with no room) still drives
+  // ports 0 and 1 only.
+  var SNES_PORTS = 4;
+  // What lsMultitapApply decided for THIS room (null = not decided yet).
+  var SNES_MT = { on: false, decided: false, seated: 0, refused: null };
 
   // A SNES pad is a 16-bit mask (bits 4..15 used — see BIT), so two bytes carry
   // it exactly. Handed to the engine explicitly rather than left at
@@ -762,6 +779,46 @@
       + 'no longer sharing frames with anybody.');
   }
 
+  // ---- THE SUPER MULTITAP: plugged in from the room's AGREED roster ---------
+  // Every console must make the SAME decision before frame 0, or they are two
+  // different machines from the reset onwards (a multitap game reads its ID bit
+  // at boot). So it is a pure function of what every console holds identically
+  // at this point: the roster the HOST pushed in 'lsgo' (lib/netplay.js — the
+  // room cannot seat anyone after it starts, and a drop leaves the roster as it
+  // was), counted for seats. 3+ seated -> plugged in; 2 -> exactly today's
+  // console. Decided ONCE per boot (a gate that disengages and re-engages, or a
+  // rejoiner that boots fresh and replays from frame 0, reaches the same answer
+  // because the roster cannot change). It is a core SETTING, not a byte of the
+  // savestate: loadState's S9xReset re-derives IPPU.Controller from it, so every
+  // rollback load keeps it (exports.c setMultitap).
+  // Returns false (and fails the room, out loud) only if a 3+ room lands on a
+  // core that cannot plug one in — running on without it would be a desync.
+  function lsMultitapApply(ls) {
+    if (SNES_MT.decided) return true;
+    var seated = 0;
+    for (var p = 0; p < ls.portCount; p++) if (ls.roster[p] != null) seated++;
+    SNES_MT.seated = seated;
+    var want = seated >= 3;
+    if (want) {
+      if (!Module._setMultitap) {
+        LS.fault = 'this room seats ' + seated + ' players, which needs the Super Multitap, and this console\'s core has none (an old cached snes9x_2005.js?) — reload the page';
+        try { ls.fail(LS.fault); } catch (e) {}
+        return false;
+      }
+      var got = Module._setMultitap(1) === 1;
+      // A cart that refuses the adaptor (SuperFX, Sufami Turbo — memmap.c InitROM)
+      // refuses it on EVERY console, so this stays agreed.
+      if (!got) SNES_MT.refused = 'this cartridge does not take a multitap (SuperFX / Sufami Turbo), so players 3-4 are not read';
+      SNES_MT.on = got;
+      pageLog('[multitap] ' + (got ? 'PLUGGED IN — ' + seated + ' players seated; ports 2-4 are multitap pads 2-4'
+                                   : '⚠ ' + SNES_MT.refused));
+    } else {
+      pageLog('[multitap] out — ' + seated + ' players seated, so this is the plain two-port console');
+    }
+    SNES_MT.decided = true;
+    return true;
+  }
+
   // ---- arming, AFTER the ROM is loaded and BEFORE the first frame ------------
   function lsArmBeforeFreerun() {
     if (!NET.session || LS.armed) return false;
@@ -821,6 +878,8 @@
       return false;
     }
     if (!LS.running) {
+      // ⚠ BEFORE THE FIRST FRAME, ONCE PER ROOM: the multitap. See lsMultitapApply.
+      if (!lsMultitapApply(ls)) return false;
       LS.running = true;
       NET.startedAtFrame = ls.frame | 0;   // "everyone started together at frame N"
       pageLog('[lockstep] FRAME GATE ENGAGED at frame ' + ls.frame + ' — delay=' + ls.delay
@@ -1160,6 +1219,12 @@
     Module.HEAPU8.set(bytes, ptr);
     Module._startWithRom(ptr, bytes.length, SND_RATE);
     Module._my_free(ptr);
+    // A multitap a previous ROOM plugged in is a Setting the core keeps across
+    // a re-boot (startWithRom's second path skips init_sfc_setting), so pull it
+    // out: every boot starts on the plain console, and a room plugs it back in
+    // before frame 0 if it seats 3+.
+    if (SNES_MT.on && Module._setMultitap) { Module._setMultitap(0); pageLog('[multitap] pulled out for a fresh boot'); }
+    SNES_MT.on = false; SNES_MT.decided = false; SNES_MT.seated = 0; SNES_MT.refused = null;
     initCanvas();
     lastTs = 0; accum = 0;
     // ⚠ ARM THE FRAME GATE HERE, AND ONLY HERE — AFTER the ROM is loaded and
@@ -1636,13 +1701,15 @@
   // port is written all-zero, which is what a controller nobody is holding does,
   // and is byte-for-byte what single player already did.
   //
-  // ⚠ THE ROOM IS TWO PEOPLE, BECAUSE THE FRONT OF THE CONSOLE IS. Ports 3-5
-  // exist in the core (Joypads[5], and the Super Multitap read path is at
-  // ppu.c:1445/1451) but reaching them needs IPPU.Controller to be
-  // SNES_MULTIPLAYER5, and at runtime it is SNES_JOYPAD — exports.c sets
-  // ControllerOption = SNES_JOYPAD and S9xNextController() advances straight
-  // past MULTIPLAYER5. That is a core change, not a page change, so this room
-  // seats two and says so.
+  // ⚠ THE ROOM SEATS UP TO FOUR, AND THE MULTITAP IS PART OF THE STARTING STATE.
+  // Ports 3-4 are reached through a Super Multitap (snes9x's SNES_MULTIPLAYER5
+  // read path, ppu.c S9xGetCPU $4017), which the core now plugs in on request
+  // (exports.c setMultitap). A multitap game reads the adaptor's ID bit at
+  // boot, so it is decided from the agreed roster before frame 0 and never
+  // after (lsMultitapApply): 3+ seated -> in, 2 -> out, exactly the old console.
+  // Proven in Node by tools/snes_rollback_probe.mjs --players 3|4 against a
+  // never-guessing core, on tools/snes_multitap_rom.mjs (no shipped ROM reads a
+  // multitap — SimCity is one- and two-player).
   // ═══════════════════════════════════════════════════════════════════════════
 
   var NET = {
@@ -1650,6 +1717,9 @@
     // ROLLBACK (zero local input lag) unless the URL says ?rb=0, which makes
     // this console propose delay lockstep instead. The HOST's choice wins.
     rbWant: new URLSearchParams(location.search).get('rb') !== '0',
+    // THE HOST'S "Start when N are in" (2..4; ?seats=N from the lobby, or the
+    // host pane's picker). 2 is the old rule exactly.
+    seatsWant: Math.max(2, Math.min(4, (+new URLSearchParams(location.search).get('seats') | 0) || 2)),
     modeNote: null,    // a capacity-gated room in input delay says why, on the HUD
     role: null,        // 'host' | 'guest'
     leaving: false,    // WHO hung up, so the notice can say
@@ -1897,7 +1967,9 @@
     }
     if (netCapHeld()) return 'This device cannot run the emulator, so the party cannot start it here.';
     if (netPartyState() === 'playing') return 'Playing — everyone started together at frame ' + (NET.startedAtFrame | 0) + '.';
-    if (netAlone()) return 'Waiting for another player — share the code ' + s.code + '. Starts by itself once two are in and loaded.';
+    if (netAlone()) return 'Waiting for another player — share the code ' + s.code + '. Starts by itself once ' + (NET.role === 'host' && NET.seatsWant > 2 ? NET.seatsWant : 'two') + ' are in and loaded.';
+    if (NET.role === 'host' && !running && netSeatedCount() < NET.seatsWant)
+      return netSeatedCount() + ' of ' + NET.seatsWant + ' players are in — share the code ' + s.code + '. Starts by itself once ' + NET.seatsWant + ' are in and loaded.';
     var who = netPartyRows().filter(function (r) { return r.who && r.state !== 'ready' && r.state !== 'playing'; })
       .map(function (r) { return r.local ? 'this console' : netPortLabel(r.port); });
     return 'Starts by itself when everyone is loaded — waiting for ' + (who.length ? who.join(' and ') : 'the room') + '.';
@@ -1919,12 +1991,20 @@
     // the host loads on the FIRST seated joiner — never on room open.
     if (!ls || !(ls.localPorts && ls.localPorts.length)) return;
     if (netSeatedCount() < 2) return;
+    // ⚠ A HOST MAY WAIT FOR MORE THAN TWO. A SNES ROM loads in well under a
+    // second, so "start once two are in" left a third and fourth player no
+    // window to be seated before the room began (lib/netplay.js seat() refuses
+    // anyone once it runs). The host's "Start when N are in" (default 2, which
+    // is exactly the old rule) holds only the HOST's load; joiners load as soon
+    // as they are seated and wait at the barrier, which cannot release until
+    // the host — and everyone seated by then — has declared ready.
+    if (NET.role === 'host' && netSeatedCount() < NET.seatsWant) return;
     // The capability hold is the status line's to explain; a core still
     // fetching is re-asked by the party tick until it is ready.
     if (netCapHeld() || !wasmReady) return;
     NET.autoStarted = true;
     netSyncPickersToRoom();
-    pageLog('[net] two players are seated, so this console loads ' + netGameId() + ' by itself — there is nothing '
+    pageLog('[net] ' + netSeatedCount() + ' players are seated, so this console loads ' + netGameId() + ' by itself — there is nothing '
       + 'to press. LOADING is not RUNNING: the gate is armed between the load and free-run, and the barrier '
       + 'holds frame 0 until everyone is loaded.');
     startFromList();
@@ -1950,7 +2030,9 @@
     var ls = lsEngine();
     if (!NET.session || !ls) { box.style.display = 'none'; return; }
     box.style.display = '';
-    $('netRoomPorts').textContent = ' — this console has ' + ls.portCount + ' controller ports';
+    $('netRoomPorts').textContent = ' — up to ' + ls.portCount + ' players: ports 1-2 on the console, 3-4 through a Super Multitap '
+      + (SNES_MT.decided ? (SNES_MT.on ? '(plugged in)' : SNES_MT.refused ? '(refused by this cartridge)' : '(not needed — two players)')
+                         : '(plugged in only if 3 or more join; it needs a multitap game)');
     ul.innerHTML = '';
     netPartyRows().forEach(function (r) {
       var li = document.createElement('li');
@@ -2231,6 +2313,13 @@
       } catch (e) { toast('Could not copy — read the code out instead', true); }
     });
     $('netOverlay').addEventListener('click', function (e) { if (e.target === $('netOverlay')) netClose(); });
+    // The host's seat count: changing it while waiting re-asks the auto-start.
+    $('netSeats').value = String(NET.seatsWant);
+    $('netSeats').addEventListener('change', function () {
+      NET.seatsWant = Math.max(2, Math.min(4, +$('netSeats').value | 0 || 2));
+      pageLog('[net] the host starts when ' + NET.seatsWant + ' players are in');
+      netRoomRender();
+    });
     netSyncGameList();
 
     // A room the visitor was invited into: snes.html?np=<code>, which
@@ -2355,6 +2444,11 @@
       stalling: LS.stalling,
       waitingOn: LS.waitingOn.slice(),
       ports: ls ? ls.portCount : SNES_PORTS,
+      // THE SUPER MULTITAP: what the page decided, and what the CORE reports
+      // (getMultitap reads IPPU.Controller, not a page flag).
+      multitap: { on: SNES_MT.on, decided: SNES_MT.decided, seated: SNES_MT.seated, refused: SNES_MT.refused,
+                  core: (wasmReady && Module._getMultitap) ? Module._getMultitap() : null },
+      seatsWant: NET.seatsWant,
       roster: ls ? ls.roster.slice() : null,
       localPorts: ls ? ls.localPorts.slice() : null,
       frame: ls ? ls.frame : 0,

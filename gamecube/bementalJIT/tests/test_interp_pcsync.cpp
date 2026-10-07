@@ -11,6 +11,7 @@
 //   addi r3, r0, 5 ; addo r4, r3, r3 ; ori      -> r4 = 10
 //   addi r3, r0, 5 ; subfme r5, r3 ; ori        -> r5 = ~5 + CA - 1 (CA = 0) = -7
 //   addi r3, r0, -8 ; addi r6, r0, 40 ; sraw r7, r3, r6 ; ori  -> r7 = -1
+//   addi r3, r0, 5 ; bcl / bclr-cond / bcctr-cr / bdnz+y   -> interp runs once
 // Run: node test_interp_pcsync.js
 
 #include "bementalJIT/bemental.h"
@@ -77,6 +78,15 @@ int main() {
         {"addo",   {d_form(14, 3, 0, 5), x_form(4, 3, 3, 266, 1), d_form(24, 0, 0, 0)}, 4, 10u},
         {"subfme", {d_form(14, 3, 0, 5), x_form(5, 3, 0, 232, 0), d_form(24, 0, 0, 0)}, 5, (u32)-7},
         {"sraw>=32", {d_form(14, 3, 0, (u32)-8), d_form(14, 6, 0, 40), (31u << 26) | (3u << 21) | (7u << 16) | (6u << 11) | (792u << 1), d_form(24, 0, 0, 0)}, 7, 0xFFFFFFFFu},
+        // [BEM_LEVER_BRANCH_NOPC 2026-10-07] branch forms the native emitters
+        // do NOT handle fall back to the interpreter as the block terminator, so
+        // they must keep their pre-op ctx.PC store (the lever drops it only for
+        // the native forms): bcl (conditional call), a conditional bclr, a
+        // CR-testing bcctr, and a bdnz with the 'y' hint bit set.
+        {"bcl",    {d_form(14, 3, 0, 5), (16u << 26) | (12u << 21) | (2u << 16) | 8u | 1u}, 3, 5u},
+        {"bclr-cc", {d_form(14, 3, 0, 5), (19u << 26) | (12u << 21) | (2u << 16) | (16u << 1)}, 3, 5u},
+        {"bcctr-cr", {d_form(14, 3, 0, 5), (19u << 26) | (4u << 21) | (2u << 16) | (528u << 1)}, 3, 5u},
+        {"bdnz+y", {d_form(14, 3, 0, 5), (16u << 26) | (25u << 21) | 8u}, 3, 5u},
     };
     int fail = 0;
     u32 pc = 0x80500000u;

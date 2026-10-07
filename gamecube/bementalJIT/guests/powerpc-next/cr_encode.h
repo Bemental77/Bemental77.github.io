@@ -65,6 +65,13 @@ void emit_cr_from_signed_pair(WasmModuleBuilder& wb, u32 ctx_ptr,
 void emit_cr_from_unsigned_pair(WasmModuleBuilder& wb, u32 ctx_ptr,
                                 u32 crfd, u32 a_local, u32 b_local);
 
+// [BEM_LEVER_CR_LEAN] cmpi / cmpli: same encoding as the *_pair builders with
+// B a baked immediate. Only valid when bem_cr_lean_on() (the lever-off path
+// keeps the LOCAL_TMP_IMM round trip into the *_pair builders).
+void emit_cr_from_pair_imm(WasmModuleBuilder& wb, u32 ctx_ptr, u32 crfd,
+                           u32 a_local, s32 b_imm, bool is_signed);
+bool bem_cr_lean_on();
+
 // [PM56 lazy-CR] Deferred stores (see cr_shadow.h): park operands+tag+frozen-SO
 // into the shadow and set pending[crfd], instead of building the eager field.
 void emit_defer_cr_reg(WasmModuleBuilder& wb, u32 ctx_ptr, u32 crfd,

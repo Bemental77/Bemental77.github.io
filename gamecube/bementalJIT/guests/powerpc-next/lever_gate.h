@@ -69,6 +69,58 @@ constexpr u32 BEM_LEVER_STATIC_CHAIN = 1u << 10;
 constexpr u32 BEM_LEVER_WRITE_NOLOAD = 1u << 11;
 // FPRRegCache::Flush batches its constant shadow-mask set/clear RMWs into one.
 constexpr u32 BEM_LEVER_FLUSH_MASK_BATCH = 1u << 12;
+// Mid-block coalesced taken exits (emit_coalesced_taken_exit, plain per-block
+// bodies) tail-chain in-WASM to their STATIC target through the same
+// downcount-bail + constant-bucket probe emit_chain_or_return gives a static
+// block terminal, instead of op_return-ing every taken exit to the C loop.
+constexpr u32 BEM_LEVER_TAKEN_CHAIN = 1u << 13;
+// Superblocks: the block decoder follows b / bl / RAS-predicted blr into the
+// next contiguous block (DecodeBlockFollow) and emits the chain as ONE function:
+// GPR/FPR locals stay live across the joins, each join is serviced exactly like
+// the block boundary it replaces. Read by the DECODER's caller (JitWasm::
+// TryCompileBlock, block_replay compile_at), not by the emitter.
+constexpr u32 BEM_LEVER_FOLLOW = 1u << 14;
+// Dispatch-probe diet for plain per-block bodies (emit_chain_or_return, static
+// and runtime-PC probes): bucket byte offset as PC & (MASK << 2) — equal to
+// ((PC >> 2) & MASK) * 4 for EVERY u32 PC — and no `slot >= 0` test after a tag
+// hit (every g_bem_disp_tag writer stores a table index >= 0 to the slot in the
+// same step; every release/clear resets tag and slot together).
+constexpr u32 BEM_LEVER_PROBE_DIET = 1u << 15;
+// Idle-loop skip on the TAKEN back-edge only (Jit64 placement: bcx calls
+// CoreTiming::Idle inside the taken path). An idle-classified block charges its
+// cycles like any block and stores downcount = 0 only when its terminator
+// branches back to the block start; the not-taken exit is an ordinary block exit
+// instead of a clock-jump to the next event. The spinning path ends with the same
+// downcount (0) as before.
+constexpr u32 BEM_LEVER_IDLE_TAKEN = 1u << 16;
+// Mid-block (coalesced) conditional branches flush dirty GPRs only inside the
+// taken arm, which leaves the block; the fall-through keeps them dirty in their
+// wasm locals until the next exit. FPRs keep the head flush (the 2026-07-23
+// FPR keep-dirty attempt measured worse live; see emit_bcx).
+constexpr u32 BEM_LEVER_GPR_EXIT_FLUSH = 1u << 17;
+// Integer/FP-word byte swaps (emit_bswap_i32 / emit_bswap_i16 and the fastmem
+// load/store value paths) through ONE i8x16.shuffle on lane 0 instead of the
+// 11-op scalar rotate/mask sequence: splat (or v128.load32_zero / load16_splat),
+// shuffle, extract (or v128.store32/16_lane). Pure byte permutation; the S16
+// load sign-extends with i16x8.extract_lane_s.
+constexpr u32 BEM_LEVER_BSWAP_SIMD = 1u << 18;
+// Eager CR-field build without the i64 assembly: lo32 and hi32 go out as two
+// i32 stores (the same 8 little-endian bytes as the one i64.store), hi32's
+// LT/NOT-GT bits come from two selects over baked constants, a cmpi/cmpli
+// immediate is a const operand (no LOCAL_TMP_IMM round trip; `a - 0` is `a`),
+// and a conditional branch IMMEDIATELY after a cmp of the same field tests the
+// cmp's operands directly (the PM57 CmpFuse, here with the eager store kept).
+constexpr u32 BEM_LEVER_CR_LEAN = 1u << 19;
+// No pre-op ctx.PC store for a branch whose NATIVE emitter writes ctx.PC on
+// every path that leaves the block (b/bl, bc bo=20 / bdnz / bdz / CR-bit
+// forms without LK, bclr bo=20, bcctr without a CTR/CR test): those emitters
+// never read ctx.PC, and every later in-block reader of ctx.PC writes its own
+// first (the BEM_LEVER_MEM_SLOWARM invariant), so the store is dead. Forms that
+// fall back to the interpreter keep it.
+constexpr u32 BEM_LEVER_BRANCH_NOPC = 1u << 20;
+// Builder peephole over the emitted block body: `local.set X; local.get X`
+// with nothing between becomes `local.tee X` (WasmModuleBuilder::op_local_get).
+constexpr u32 BEM_LEVER_SET_GET_TEE = 1u << 21;
 
 bool bem_lever_on(u32 bit);
 

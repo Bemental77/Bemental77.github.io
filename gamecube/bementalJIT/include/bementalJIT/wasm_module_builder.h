@@ -464,8 +464,29 @@ public:
 
 	// --- WASM instructions ---
 
-	void op_local_get(u32 idx) { emitByte(wop::local_get); emitLEB128(idx); }
-	void op_local_set(u32 idx) { emitByte(wop::local_set); emitLEB128(idx); }
+	// [set-get-tee peephole, powerpc-next lever bit21 2026-10-07] With the
+	// peephole on, `local.set X` immediately followed by `local.get X` (no
+	// instruction between them) is emitted as `local.tee X`: the same local
+	// write and the same value left on the stack. The set's opcode byte is
+	// rewritten in place (0x21 -> 0x22, same LEB index), so no byte moves and
+	// every recorded offset (marks, branch hints, relocs) stays valid.
+	void op_local_get(u32 idx) {
+		if (m_peep_tee && m_last_set_end == bytes.size() && m_last_set_idx == idx) {
+			bytes[m_last_set_pos] = wop::local_tee;
+			m_last_set_end = (size_t)-1;
+			++m_peep_tee_count;
+			return;
+		}
+		emitByte(wop::local_get); emitLEB128(idx);
+	}
+	void op_local_set(u32 idx) {
+		m_last_set_pos = bytes.size();
+		emitByte(wop::local_set); emitLEB128(idx);
+		m_last_set_end = bytes.size();
+		m_last_set_idx = idx;
+	}
+	void setPeepholeTee(bool on) { m_peep_tee = on; m_last_set_end = (size_t)-1; }
+	u32 peepholeTeeCount() const { return m_peep_tee_count; }
 	void op_global_get(u32 idx) { emitByte(wop::global_get); emitLEB128(idx); }
 	void op_global_set(u32 idx) { emitByte(wop::global_set); emitLEB128(idx); }
 	void op_local_tee(u32 idx) { emitByte(wop::local_tee); emitLEB128(idx); }
@@ -646,6 +667,19 @@ public:
 	// wrong byte fails WebAssembly.validate; these round-trip an i64 through a
 	// v128 lane bit-exactly).
 	void op_i64x2_splat()            { emitByte(V128_PREFIX); emitLEB128(0x12u); }               // i64 -> v128
+	// [bswap-simd lever bit18 2026-10-07] scalar byte swaps through one
+	// i8x16.shuffle. Subopcodes per the WebAssembly SIMD spec opcode table:
+	// v128.load16_splat 0x08, i32x4.splat 0x11, i16x8.extract_lane_s 0x18,
+	// i16x8.extract_lane_u 0x19, v128.store16_lane 0x59, v128.store32_lane 0x5A,
+	// v128.load32_zero 0x5C (same table the 0x5B store64_lane / 0x5D load64_zero
+	// entries above were taken from).
+	void op_i32x4_splat()            { emitByte(V128_PREFIX); emitLEB128(0x11u); }               // i32 -> v128
+	void op_i16x8_extract_lane_s(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x18u); emitByte(l); } // -> i32 (sext16)
+	void op_i16x8_extract_lane_u(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x19u); emitByte(l); } // -> i32 (zext16)
+	void op_v128_load16_splat(u32 off, u32 align = 1) { emitByte(V128_PREFIX); emitLEB128(0x08u); emitLEB128(align); emitLEB128(off); }
+	void op_v128_load32_zero(u32 off, u32 align = 2)  { emitByte(V128_PREFIX); emitLEB128(0x5Cu); emitLEB128(align); emitLEB128(off); }
+	void op_v128_store16_lane(u32 off, u8 lane, u32 align = 1) { emitByte(V128_PREFIX); emitLEB128(0x59u); emitLEB128(align); emitLEB128(off); emitByte(lane); }
+	void op_v128_store32_lane(u32 off, u8 lane, u32 align = 2) { emitByte(V128_PREFIX); emitLEB128(0x5Au); emitLEB128(align); emitLEB128(off); emitByte(lane); }
 	void op_i64x2_extract_lane(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x1Du); emitByte(l); }  // -> i64
 	void op_f64x2_extract_lane(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x21u); emitByte(l); }  // -> f64
 	void op_f64x2_replace_lane(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x22u); emitByte(l); }  // (v128,f64) -> v128
@@ -828,6 +862,12 @@ private:
 	std::vector<BranchHint> m_branch_hints;
 	// [AOT v4 reloc] module-lifetime reloc records (see op_i32_const_reloc).
 	std::vector<Reloc> m_relocs;
+	// [set-get-tee peephole] state (see op_local_get).
+	bool m_peep_tee = false;
+	size_t m_last_set_pos = 0;
+	size_t m_last_set_end = (size_t)-1;
+	u32 m_last_set_idx = 0;
+	u32 m_peep_tee_count = 0;
 
 	// Write a u32 as a 5-byte fixed-length LEB128 at a specific position
 	void patchLEB128_5(u32 pos, u32 value) {

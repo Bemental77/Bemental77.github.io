@@ -48,21 +48,15 @@ void CheckFrameRate(void)
      if(dwLaceCnt>=MAXLACE && UseFrameLimit)           // -> if there are many laces without screen toggling,
       {                                                //    do std frame limitation
        if(dwLaceCnt==MAXLACE) bInitCap=TRUE;
-#ifndef EMSCRIPTEN
        FrameCap();
-#endif
       }
     }
-#ifndef EMSCRIPTEN
    else if(UseFrameLimit) FrameCap();
-#endif
    calcfps();                                          // -> calc fps display in skipping mode
   }
  else                                                  // non-skipping mode:
   {
-#ifndef EMSCRIPTEN
    if(UseFrameLimit) FrameCap();                       // -> do it
-#endif
    if(ulKeybits&KEY_SHOWFPS) calcfps();                // -> and calc fps display
   }
 }
@@ -338,9 +332,6 @@ void PCcalcfps(void)
 
 void SetAutoFrameCap(void)
 {
-#ifdef EMSCRIPTEN
- UseFrameLimit=0; return;
-#endif
  if(iFrameLimit==1)
   {
    fFrameRateHz = fFrameRate;

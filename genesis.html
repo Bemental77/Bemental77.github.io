@@ -19,7 +19,7 @@
        page is the only page. The file itself still exists because n64/index.html
        has not been converted yet; nothing here routes to it. -->
   <script src="/lib/cart_audio.js?v=a77bd483"></script>
-  <script src="/lib/netplay.js?v=bb106f86"></script>
+  <script src="/lib/netplay.js?v=f1c13bf4"></script>
   <meta charset="UTF-8" />
   <title>Genesis Wasm</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -256,7 +256,7 @@
     #netCodeIn { width: 100%; box-sizing: border-box; min-height: 44px; font: 700 20px/1 ui-monospace, Menlo, monospace;
       letter-spacing: 4px; text-align: center; text-transform: uppercase; background: #0e1013; color: #eee;
       border: 1px solid #555; border-radius: 9px; padding: 11px; }
-    #netGame { width: 100%; box-sizing: border-box; min-height: 44px; background: #0e1013; color: #eee;
+    #netGame, #netSeats { width: 100%; box-sizing: border-box; min-height: 44px; background: #0e1013; color: #eee;
       border: 1px solid #555; border-radius: 9px; padding: 10px 12px; font-size: 15px; }
     .netActions { display: flex; gap: 10px; margin-top: 12px; }
     #netRoster { list-style: none; margin: 6px 0 0; padding: 0; }
@@ -404,6 +404,12 @@
       <div class="netLabel">Share this code</div>
       <div id="netCode">·····</div>
       <div class="netActions"><button id="netCopy" type="button">Copy code</button></div>
+      <div class="netLabel">Start when this many players are in</div>
+      <select id="netSeats">
+        <option value="2">2 players</option>
+        <option value="3">3 players (multitap game)</option>
+        <option value="4">4 players (multitap game)</option>
+      </select>
     </div>
     <div id="netJoinPane" style="display:none">
       <div class="netLabel">Game the room is playing</div>
@@ -531,7 +537,7 @@
   var gpState = {};   // gamepad-only view, OR-ed in padMask()
 
   window.Module = {
-    locateFile: (p) => CORE_DIR + p + '?v=66b69161',   // core stamp: a cached old .wasm must never pair with a new .js
+    locateFile: (p) => CORE_DIR + p + '?v=f7ce1124',   // core stamp: a cached old .wasm must never pair with a new .js
     print: (t) => console.log('[genesis]', t),
     printErr: (t) => console.warn('[genesis]', t),
     onRuntimeInitialized: function () {
@@ -752,9 +758,40 @@
     LS.armed = false; LS.running = false;
     LS.stalling = false; LS.waitingOn = []; LS.stallReason = null;
     // A leaver's pad must not stay held down on this machine's port B.
-    try { if (wasmReady) for (var p = 0; p < 2; p++) Module._gpx_set_pad(p, 0); } catch (e) {}
+    try { if (wasmReady) for (var p = 0; p < GEN_PORTS; p++) Module._gpx_set_pad(p, 0); } catch (e) {}
     pageLog('[lockstep] frame gate RELEASED — ' + why + '. This console free-runs from here and is '
       + 'no longer sharing frames with anybody.');
+  }
+
+  // ---- THE MULTITAP: plugged in from the room's AGREED roster ---------------
+  // Every console must decide the same thing before frame 0 (a multitap game
+  // probes for its adaptor at boot): genMultitapPlan over the cartridge every
+  // console loaded (the barrier compared it) and the seat count of the roster
+  // the HOST pushed in 'lsgo' — which cannot change once the room runs, and a
+  // drop leaves it as it was. Decided once per boot. Not a byte of the
+  // savestate: a load never re-plugs devices, so every rollback load keeps it.
+  // Returns false (failing the room, out loud) only if the plan needs an
+  // adaptor and this console's core cannot plug one — running on would desync.
+  function lsMultitapApply(ls) {
+    if (GEN_MT.decided) return true;
+    var seated = 0;
+    for (var p = 0; p < ls.portCount; p++) if (ls.roster[p] != null) seated++;
+    var plan = genMultitapPlan(GEN_MT.cart || new Uint8Array(0), seated);
+    GEN_MT.seated = seated; GEN_MT.plan = plan; GEN_MT.why = plan.why;
+    if (plan.kind) {
+      if (!Module._gpx_set_multitap) {
+        LS.fault = 'this room needs a multitap and this console\'s core has none (an old cached genesis_plus_gx.js?) — reload the page';
+        try { ls.fail(LS.fault); } catch (e) {}
+        return false;
+      }
+      GEN_MT.kind = Module._gpx_set_multitap(plan.kind, plan.six) | 0;
+      pageLog('[multitap] ' + (GEN_MT.kind === plan.kind ? 'PLUGGED IN (' + ['', 'EA 4-Way Play', 'Team Player, port A', 'Team Player, port B'][plan.kind] + ') — ' + plan.why
+                                                          : '⚠ the core refused kind ' + plan.kind));
+    } else {
+      pageLog('[multitap] out — ' + plan.why);
+    }
+    GEN_MT.decided = true;
+    return true;
   }
 
   // ---- arming, AFTER the cartridge is loaded and BEFORE the first frame ------
@@ -812,6 +849,8 @@
       return false;
     }
     if (!LS.running) {
+      // ⚠ BEFORE THE FIRST FRAME (and before rbInit saves frame 0), ONCE: the multitap.
+      if (!lsMultitapApply(ls)) return false;
       LS.running = true;
       NET.startedAtFrame = ls.frame | 0;   // "everyone started together at frame N"
       pageLog('[lockstep] FRAME GATE ENGAGED at frame ' + ls.frame + ' — delay=' + ls.delay
@@ -1313,6 +1352,12 @@
     var nPtr = strToHeap(base), ePtr = strToHeap(extOf(name));
     var ok = Module._gpx_load(ptr, bytes.length, nPtr, ePtr);
     Module._gpx_free(ptr); Module._gpx_free(nPtr); Module._gpx_free(ePtr);
+    // A multitap a previous ROOM plugged in survives a re-load in the core
+    // (libretro keeps the port devices), so pull it out: every boot starts on
+    // the plain console. gpx_set_multitap(0) is a no-op if none was in.
+    if (ok && GEN_MT.kind && Module._gpx_set_multitap) { Module._gpx_set_multitap(0, 0); pageLog('[multitap] pulled out for a fresh boot'); }
+    GEN_MT.decided = false; GEN_MT.kind = 0; GEN_MT.seated = 0; GEN_MT.why = null; GEN_MT.plan = null;
+    GEN_MT.cart = ok ? bytes.subarray(0, 0x200).slice() : null;
     if (!ok) {
       setStatus('The core refused this ROM.');
       banner('<b>' + name + ' did not load.</b> Genesis-Plus-GX rejected the image. '
@@ -1757,21 +1802,51 @@
   // is that an unseated port is written all-zero, which is what a controller
   // nobody is holding does, and is byte-for-byte what single player already did.
   //
-  // ⚠ THE ROOM IS TWO PEOPLE, BECAUSE THE CONSOLE IS. A Mega Drive has two
-  // controller ports. The shim keeps pad[8] and serves all eight through
-  // input_state_cb, but the core only POLLS two: reaching four (4-Way Play) or
-  // eight (Team Player) needs retro_set_controller_port_device, which is neither
-  // in gpgx_shim.c nor in build.sh's EXPORTED_FUNCTIONS, so JavaScript cannot
-  // reach it. That is a core rebuild, not a page change, and until it happens
-  // this room seats two and says so rather than seating four and dropping half
-  // the inputs on the floor.
+  // ⚠ THE ROOM SEATS UP TO FOUR; PLAYERS 3-4 NEED A MULTITAP THE GAME TAKES.
+  // A Mega Drive has two controller ports. Players 3-4 exist only behind an
+  // adaptor — Sega's Team Player or EA's 4-Way Play — and the core now plugs
+  // one in on request (gpgx_shim.c gpx_set_multitap -> libretro's
+  // retro_set_controller_port_device; core rebuilt 2026-10-07). Unlike a SNES
+  // multitap, a Mega Drive adaptor CHANGES THE PROTOCOL on port A: a game that
+  // does not speak it reads garbage for Player 1. So it goes in only when the
+  // room seats 3+ AND the cartridge says it takes one (genMultitapPlan: the
+  // header's I/O field carries '4' = Team Player, or the title is in
+  // GEN_MT_GAMES), decided from the agreed roster before frame 0
+  // (lsMultitapApply). Two seated is always the plain console.
+  // Proven in Node by tools/genesis_rollback_probe.mjs --players 3|4 (this
+  // file's rb* functions and genMultitapPlan, run verbatim) against a
+  // never-guessing core, on tools/genesis_multitap_rom.mjs.
   // ═══════════════════════════════════════════════════════════════════════════
 
   // A Mega Drive has two controller ports, and this number is READ FROM THE
   // CORE'S BEHAVIOUR rather than assumed: Genesis-Plus-GX's config_default()
   // makes input.system[0] and input.system[1] gamepads and
   // osd_input_update_internal_bitmasks() polls exactly those two.
-  var GEN_PORTS = 2;
+  var GEN_PORTS = 4;
+  // What lsMultitapApply decided for THIS room, and the loaded cart's header.
+  var GEN_MT = { decided: false, kind: 0, seated: 0, why: null, plan: null, cart: null };
+  // CARTS THAT TAKE AN ADAPTOR BUT DO NOT SAY SO IN THEIR HEADER, keyed by the
+  // header's overseas name (0x150, trimmed). kind 1 = EA 4-Way Play, 2 = Team
+  // Player in port A, 3 = Team Player in port B. EMPTY ON PURPOSE: no shipped
+  // ROM takes one and an entry must be verified against the real cartridge
+  // (a wrong kind breaks Player 1's controls), so nothing is listed unproven.
+  var GEN_MT_GAMES = {};
+
+  // THE PLAN, a pure function of (cartridge bytes, seated count) so every
+  // console reaches the same answer (tools/genesis_rollback_probe.mjs calls
+  // THIS function out of this file). Returns { kind, six, why }.
+  function genMultitapPlan(rom, seated) {
+    if (!(seated >= 3)) return { kind: 0, six: 0, why: seated + ' seated — the plain two-port console' };
+    var txt = function (o, n) { var t = ''; for (var i = 0; i < n && o + i < rom.length; i++) t += String.fromCharCode(rom[o + i]); return t; };
+    var io = txt(0x190, 16), name = txt(0x150, 48).replace(/\s+$/, '');
+    var six = io.indexOf('6') >= 0 ? 1 : 0;
+    if (Object.prototype.hasOwnProperty.call(GEN_MT_GAMES, name)) {
+      var k = GEN_MT_GAMES[name] | 0;
+      return { kind: k, six: six, why: name + ' is listed for ' + (k === 1 ? 'the EA 4-Way Play' : 'a Team Player in port ' + (k === 3 ? 'B' : 'A')) };
+    }
+    if (io.indexOf('4') >= 0) return { kind: 2, six: six, why: 'the cartridge header lists the Team Player (I/O "' + io.trim() + '")' };
+    return { kind: 0, six: 0, why: seated + ' seated, but this cartridge does not take a multitap — players 3-4 are not read' };
+  }
 
   var NET = {
     session: null,     // the live Netplay.Session, or null
@@ -1792,6 +1867,9 @@
     // tools/genesis_rollback_test.mjs proved it two-tab: 0 frames of local lag
     // (lockstep: 3-4), no desync over 18,060 frames at 100 ms one-way, 1.000x.
     rbWant: (function () { try { return new URLSearchParams(location.search).get('rb') !== '0'; } catch (e) { return true; } })(),
+    // THE HOST'S "Start when N are in" (2..4; ?seats=N from the lobby, or the
+    // host pane's picker). 2 is the old rule exactly.
+    seatsWant: (function () { try { return Math.max(2, Math.min(4, (+new URLSearchParams(location.search).get('seats') | 0) || 2)); } catch (e) { return 2; } })(),
     // TEST SEAM (&nplag=MS): hold every incoming frame-input message MS ms
     // before the engine sees it — an injected one-way network delay for the
     // two-tab rigs, whose loopback wire is ~1 ms. Never set by the product.
@@ -2029,7 +2107,9 @@
     if (netCapHeld()) return 'This device cannot run the emulator, so the party cannot start it here.';
     if (NET.notice && Date.now() > (NET.noticeUntil || 0)) NET.notice = null;
     if (netPartyState() === 'playing') return NET.notice ? NET.notice : NET.modeNote ? NET.modeNote : 'Playing — everyone started together at frame ' + (NET.startedAtFrame | 0) + '.';
-    if (netAlone()) return 'Waiting for another player — share the code ' + s.code + '. Starts by itself once two are in and loaded.';
+    if (netAlone()) return 'Waiting for another player — share the code ' + s.code + '. Starts by itself once ' + (NET.role === 'host' && NET.seatsWant > 2 ? NET.seatsWant : 'two') + ' are in and loaded.';
+    if (NET.role === 'host' && !running && netSeatedCount() < NET.seatsWant)
+      return netSeatedCount() + ' of ' + NET.seatsWant + ' players are in — share the code ' + s.code + '. Starts by itself once ' + NET.seatsWant + ' are in and loaded.';
     var who = netPartyRows().filter(function (r) { return r.who && r.state !== 'ready' && r.state !== 'playing'; })
       .map(function (r) { return r.local ? 'this console' : netPortLabel(r.port); });
     return 'Starts by itself when everyone is loaded — waiting for ' + (who.length ? who.join(' and ') : 'the room') + '.';
@@ -2051,12 +2131,16 @@
     // the host loads on the FIRST seated joiner — never on room open.
     if (!ls || !(ls.localPorts && ls.localPorts.length)) return;
     if (netSeatedCount() < 2) return;
+    // ⚠ A HOST MAY WAIT FOR MORE THAN TWO ("Start when N are in", ?seats=N;
+    // default 2 = the old rule exactly). A room that runs seats nobody else, so
+    // without this a third and fourth player had no window to join.
+    if (NET.role === 'host' && netSeatedCount() < NET.seatsWant) return;
     // The capability hold is the status line's to explain; a core still
     // fetching is re-asked by the party tick until it is ready.
     if (netCapHeld() || !wasmReady) return;
     NET.autoStarted = true;
     netSyncPickersToRoom();
-    pageLog('[net] two players are seated, so this console loads ' + netGameId() + ' by itself — there is nothing '
+    pageLog('[net] ' + netSeatedCount() + ' players are seated, so this console loads ' + netGameId() + ' by itself — there is nothing '
       + 'to press. LOADING is not RUNNING: the gate is armed between the load and free-run, and the barrier '
       + 'holds frame 0 until everyone is loaded.');
     startFromList();
@@ -2082,7 +2166,9 @@
     var ls = lsEngine();
     if (!NET.session || !ls) { box.style.display = 'none'; return; }
     box.style.display = '';
-    $('netRoomPorts').textContent = ' — this console has ' + ls.portCount + ' controller ports';
+    $('netRoomPorts').textContent = ' — up to ' + ls.portCount + ' players: ports 1-2 on the console, 3-4 through a multitap '
+      + (GEN_MT.decided ? (GEN_MT.kind ? '(plugged in)' : '(' + (GEN_MT.seated >= 3 ? 'this cartridge does not take one' : 'not needed — two players') + ')')
+                        : '(only if 3 or more join a game that takes one)');
     ul.innerHTML = '';
     netPartyRows().forEach(function (r) {
       var li = document.createElement('li');
@@ -2380,6 +2466,13 @@
       } catch (e) { toast('Could not copy — read the code out instead', true); }
     });
     $('netOverlay').addEventListener('click', function (e) { if (e.target === $('netOverlay')) netClose(); });
+    // The host's seat count: changing it while waiting re-asks the auto-start.
+    $('netSeats').value = String(NET.seatsWant);
+    $('netSeats').addEventListener('change', function () {
+      NET.seatsWant = Math.max(2, Math.min(4, +$('netSeats').value | 0 || 2));
+      pageLog('[net] the host starts when ' + NET.seatsWant + ' players are in');
+      netRoomRender();
+    });
     netSyncGameList();
 
     // A room the visitor was invited into: genesis.html?np=<code>. Bare, that is
@@ -2494,6 +2587,12 @@
       stalling: LS.stalling,
       waitingOn: LS.waitingOn.slice(),
       ports: ls ? ls.portCount : GEN_PORTS,
+      // THE MULTITAP: the page's plan, and what the CORE has plugged in
+      // (gpx_input_system reads input.system[]: 1 = pad, 13 = Team Player,
+      // 14 = 4-Way Play — core/input_hw/input.h).
+      multitap: { decided: GEN_MT.decided, kind: GEN_MT.kind, seated: GEN_MT.seated, why: GEN_MT.why,
+                  core: (wasmReady && Module._gpx_input_system) ? [Module._gpx_input_system(0), Module._gpx_input_system(1)] : null },
+      seatsWant: NET.seatsWant,
       roster: ls ? ls.roster.slice() : null,
       localPorts: ls ? ls.localPorts.slice() : null,
       frame: ls ? ls.frame : 0,
@@ -2522,7 +2621,7 @@
   // absolute literal URLs it can see statically, so a concatenated one is
   // reported UNCHECKED — which is how two runtime assets stayed 404 on the live
   // site while being present in git.
-  s.src = '/genesis/genesisWasm/dist/genesis_plus_gx.js?v=66b69161';
+  s.src = '/genesis/genesisWasm/dist/genesis_plus_gx.js?v=f7ce1124';
   s.onerror = function () {
     setStatus('Core failed to load.');
     // ⚠ THE PATH GOES TO THE LOG, NOT TO THE PLAYER. This read

@@ -128,6 +128,12 @@ struct CodeBlock {
     // [FUSION v2] any per-op pc jump (seal-time fused run). Gates self-loop/
     // int-fusion fast paths and idle classification off for such blocks.
     bool m_noncontiguous   = false;
+    // [SUPERBLOCK 2026-10-07] stream built by DecodeBlockFollow: every mid-list
+    // b/bl/blr seam starts a new SEGMENT (= the block the contiguous decoder
+    // would have compiled at that pc). The emitter services each seam exactly
+    // like the block boundary it replaces (gather drain, downcount bail, the
+    // segment's own downcount charge) and keeps GPR/FPR locals live across it.
+    bool m_follow          = false;
     bool m_memory_exception = false;
 
     BitSet8  m_gqr_used;

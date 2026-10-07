@@ -211,6 +211,65 @@ if(BEMENTAL_GUEST_POWERPC)
         target_compile_options(test_mem_slowarm PRIVATE "-pthread")
     endif()
 
+    # [superblock 2026-10-07] BEM_LEVER_FOLLOW superblocks vs the plain block
+    # chain at every slice end. `node test_superblock.js`.
+    if(BEMENTAL_GUEST_POWERPC_NEXT)
+        add_executable(test_superblock test_superblock.cpp)
+        target_link_libraries(test_superblock PRIVATE
+            bementalJIT bementalJITPowerPCNext bementalJITPowerPC)
+        target_include_directories(test_superblock PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+        set_target_properties(test_superblock PROPERTIES SUFFIX ".html")
+        target_link_options(test_superblock PRIVATE
+            "SHELL:-s EXIT_RUNTIME=1"
+            "SHELL:-s EXPORTED_RUNTIME_METHODS=['HEAPU8','HEAP8','HEAP16','HEAPU16','HEAP32','HEAPU32','HEAPF32','HEAPF64']"
+            "SHELL:-pthread"
+            "SHELL:-s PTHREAD_POOL_SIZE=0"
+            "SHELL:-s INITIAL_MEMORY=67108864"
+            "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+            "SHELL:-s MAXIMUM_MEMORY=67108864"
+            "SHELL:-s ALLOW_TABLE_GROWTH=1"
+            "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
+        )
+        target_compile_options(test_superblock PRIVATE "-pthread")
+    endif()
+
+    # [cr-lean 2026-10-07] BEM_LEVER_CR_LEAN: eager CR field + adjacent
+    # cmp->bc fuse vs the documented encoding. `node test_cr_lean.js`.
+    if(BEMENTAL_GUEST_POWERPC_NEXT)
+        add_executable(test_cr_lean test_cr_lean.cpp)
+        target_link_libraries(test_cr_lean PRIVATE
+            bementalJIT bementalJITPowerPCNext bementalJITPowerPC)
+        target_include_directories(test_cr_lean PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+        set_target_properties(test_cr_lean PROPERTIES SUFFIX ".html")
+        target_link_options(test_cr_lean PRIVATE
+            "SHELL:-s EXIT_RUNTIME=1"
+            "SHELL:-s EXPORTED_RUNTIME_METHODS=['HEAPU8','HEAP8','HEAP16','HEAPU16','HEAP32','HEAPU32','HEAPF32','HEAPF64']"
+            "SHELL:-pthread"
+            "SHELL:-s PTHREAD_POOL_SIZE=0"
+            "SHELL:-s INITIAL_MEMORY=67108864"
+            "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+            "SHELL:-s MAXIMUM_MEMORY=67108864"
+            "SHELL:-s ALLOW_TABLE_GROWTH=1"
+            "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
+        )
+        target_compile_options(test_cr_lean PRIVATE "-pthread")
+    endif()
+
+    # [set-get-tee 2026-10-07] WasmModuleBuilder's set/get -> tee peephole
+    # (BEM_LEVER_SET_GET_TEE), byte-exact. `node test_peephole_tee.js`.
+    add_executable(test_peephole_tee test_peephole_tee.cpp)
+    target_include_directories(test_peephole_tee PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_target_properties(test_peephole_tee PROPERTIES SUFFIX ".js")
+
     # [pc-sync 2026-10-04] Inline interp fallbacks store ctx.PC so the
     # dolphin_interp pc guard runs them. `node test_interp_pcsync.js`.
     if(BEMENTAL_GUEST_POWERPC_NEXT)

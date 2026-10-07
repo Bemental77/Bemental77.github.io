@@ -12,6 +12,7 @@
 #include "bementalJIT/wasm_module_builder.h"
 #include "ppc_offsets.h"
 #include "cr_shadow.h"
+#include "lever_gate.h"
 
 namespace bemental::powerpc {
 
@@ -151,8 +152,65 @@ static void fold_high32_low32_into_i64(WasmModuleBuilder& wb,
     wb.op_i64_or();
 }
 
+// [BEM_LEVER_CR_LEAN 2026-10-07] The same field, bit for bit, in fewer ops.
+//   lo32 -> i32.store cr+0 ; hi32 -> i32.store cr+4 : the 8 bytes the one
+//   i64.store of (hi << 32 | lo) writes (little-endian), with no
+//   extend/shift/or assembly.
+//   hi32 = ((SO byte >> 1) << 27) | (le ? (lt ? 0xC0000001 : 0x80000001) : 1)
+//   — lt implies le, so the nested select yields exactly
+//   1 | lt<<30 | le<<31. 25 ops for cmp/cmpl/cmpi/cmpli (was 30/30/32/32), 23
+//   against an immediate 0, 23 for an Rc=1 result (was 28).
+bool bem_cr_lean_on() { return bem_lever_on(BEM_LEVER_CR_LEAN); }
+
+enum class CrPred { SIGNED, UNSIGNED, VS0 };
+// push_b: pushes operand B (unused for VS0). b_is_zero: B is the constant 0.
+template <typename PushA, typename PushB>
+static void emit_cr_lean(WasmModuleBuilder& wb, u32 ctx_ptr, u32 crfd, CrPred pred,
+                         PushA&& push_a, PushB&& push_b, bool b_is_zero) {
+    // lo32 = a - b (VS0: a)
+    wb.op_i32_const((s32)ctx_ptr);
+    push_a();
+    if (pred != CrPred::VS0 && !b_is_zero) { push_b(); wb.op_i32_sub(); }
+    wb.op_i32_store(ppc_off::cr(crfd));
+    // hi32
+    wb.op_i32_const((s32)ctx_ptr);
+    wb.op_i32_const((s32)ctx_ptr);
+    wb.op_i32_load8_u(ppc_off::XER_SO_OV);
+    wb.op_i32_const(1);
+    wb.op_i32_shr_u();
+    wb.op_i32_const(27);
+    wb.op_i32_shl();
+    auto cmp = [&](bool le) {
+        push_a();
+        if (pred == CrPred::VS0) wb.op_i32_const(0); else push_b();
+        if (pred == CrPred::UNSIGNED) { if (le) wb.op_i32_le_u(); else wb.op_i32_lt_u(); }
+        else                          { if (le) wb.op_i32_le_s(); else wb.op_i32_lt_s(); }
+    };
+    wb.op_i32_const((s32)0xC0000001u);
+    wb.op_i32_const((s32)0x80000001u);
+    cmp(false);
+    wb.op_select();
+    wb.op_i32_const(1);
+    cmp(true);
+    wb.op_select();
+    wb.op_i32_or();
+    wb.op_i32_store(ppc_off::cr(crfd) + 4u);
+}
+
+void emit_cr_from_pair_imm(WasmModuleBuilder& wb, u32 ctx_ptr, u32 crfd,
+                           u32 a_local, s32 b_imm, bool is_signed) {
+    emit_cr_lean(wb, ctx_ptr, crfd, is_signed ? CrPred::SIGNED : CrPred::UNSIGNED,
+                 [&] { wb.op_local_get(a_local); }, [&] { wb.op_i32_const(b_imm); },
+                 b_imm == 0);
+}
+
 void emit_cr_from_signed_local(WasmModuleBuilder& wb, u32 ctx_ptr,
                                u32 crfd, u32 value_local) {
+    if (bem_cr_lean_on()) {
+        emit_cr_lean(wb, ctx_ptr, crfd, CrPred::VS0, [&] { wb.op_local_get(value_local); },
+                     [] {}, false);
+        return;
+    }
     // i64.store wants [i32 addr, i64 value] on the stack.
     wb.op_i32_const((s32)ctx_ptr);
 
@@ -182,6 +240,11 @@ void emit_cr_from_signed_local(WasmModuleBuilder& wb, u32 ctx_ptr,
 
 void emit_cr_from_signed_pair(WasmModuleBuilder& wb, u32 ctx_ptr,
                               u32 crfd, u32 a_local, u32 b_local) {
+    if (bem_cr_lean_on()) {
+        emit_cr_lean(wb, ctx_ptr, crfd, CrPred::SIGNED, [&] { wb.op_local_get(a_local); },
+                     [&] { wb.op_local_get(b_local); }, false);
+        return;
+    }
     // i64.store wants [i32 addr, i64 value] on the stack.
     wb.op_i32_const((s32)ctx_ptr);
 
@@ -214,6 +277,11 @@ void emit_cr_from_signed_pair(WasmModuleBuilder& wb, u32 ctx_ptr,
 
 void emit_cr_from_unsigned_pair(WasmModuleBuilder& wb, u32 ctx_ptr,
                                 u32 crfd, u32 a_local, u32 b_local) {
+    if (bem_cr_lean_on()) {
+        emit_cr_lean(wb, ctx_ptr, crfd, CrPred::UNSIGNED, [&] { wb.op_local_get(a_local); },
+                     [&] { wb.op_local_get(b_local); }, false);
+        return;
+    }
     // i64.store wants [i32 addr, i64 value] on the stack.
     wb.op_i32_const((s32)ctx_ptr);
 

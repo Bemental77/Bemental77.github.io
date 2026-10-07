@@ -408,6 +408,69 @@ void gpx_set_pad(unsigned port, int mask)
       pad[port] = (int16_t)mask;
 }
 
+/* ── the multitap: players 3 and 4 ───────────────────────────────────────────
+ * A Mega Drive has two controller ports. Players 3-4 exist only behind an
+ * adaptor, and Genesis-Plus-GX emulates both kinds (core/input_hw/
+ * gamepad.c wayplay_*, teamplayer.c) behind libretro's
+ * retro_set_controller_port_device() (libretro/libretro.c) — which this shim
+ * never called, so every game saw two plain pads.
+ *   kind 1  EA 4-Way Play   (both ports; EA's games)
+ *   kind 2  Sega Team Player in port A (players 1-4 on the tap)
+ *   kind 3  Sega Team Player in port B (player 1 on port A, 2-5 on the tap)
+ *   kind 0  every adaptor out — the console a fresh page boots
+ *           (bemental_input_defaults, genesis/genesisWasm/tools/
+ *           patch_input_state.py). Only does anything if one was plugged in,
+ *           so a two-player room never touches the input config at all.
+ * six != 0 plugs 6-button pads into the adaptor, else 3-button (the page
+ * follows the cart header's '6', as GPGX's own input_init does).
+ * In every kind, libretro player p (this shim's pad[p]) is the p-th pad the
+ * core enumerates (libretro.c osd_input_update), so room port p drives the
+ * p-th controller of the room: for kinds 1/2, tap pads 1-4; for kind 3, port A
+ * then tap pads 1-3.
+ * It is part of the STARTING state (a multitap game probes for the adaptor at
+ * boot), so genesis.html calls it before frame 0, from the agreed roster, on
+ * every console. It is NOT in the savestate and does not need to be: a load
+ * never re-plugs devices, so every rollback load keeps it.
+ * Returns the kind now plugged in, or -1 (no game / unknown kind). */
+#define GPX_RDEV(n) RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_JOYPAD, n)
+extern int  bemental_input_system(int port);
+extern int  bemental_input_dev(int i);
+extern void bemental_input_defaults(void);
+static int mt_kind = 0;
+
+EMSCRIPTEN_KEEPALIVE
+int gpx_set_multitap(int kind, int six)
+{
+   if (!game_loaded)
+      return -1;
+   switch (kind)
+   {
+      case 0: if (mt_kind) bemental_input_defaults(); break;
+      case 1: retro_set_controller_port_device(0, six ? GPX_RDEV(4) : GPX_RDEV(3)); break;
+      case 2: retro_set_controller_port_device(0, six ? GPX_RDEV(6) : GPX_RDEV(5)); break;
+      case 3: retro_set_controller_port_device(1, six ? GPX_RDEV(6) : GPX_RDEV(5)); break;
+      default: return -1;
+   }
+   mt_kind = kind;
+   return mt_kind;
+}
+
+/* Read-backs for a test: what the CORE has plugged in (input.system[port]:
+ * core/input_hw/input.h SYSTEM_*), and which pad it enumerated at device i
+ * (input.dev[i]: DEVICE_PAD3B = 0, DEVICE_PAD6B = 1, NO_DEVICE = 0xff). */
+EMSCRIPTEN_KEEPALIVE
+int gpx_input_system(int port) { return bemental_input_system(port); }
+EMSCRIPTEN_KEEPALIVE
+int gpx_input_dev(int i) { return bemental_input_dev(i); }
+
+/* Read-back for a test: the 68000's 64 KB of work RAM, where a test ROM
+ * (tools/genesis_multitap_rom.mjs) leaves what the GUEST read off its pads. */
+EMSCRIPTEN_KEEPALIVE
+uint8_t *gpx_wram_ptr(void)
+{
+   return game_loaded ? (uint8_t *)retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM) : NULL;
+}
+
 EMSCRIPTEN_KEEPALIVE
 unsigned gpx_audio_avail(void) { return a_w - a_r; }
 

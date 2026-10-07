@@ -153,6 +153,27 @@ bool bem_mips_census_on() {
 // no page change). The effective mask is published once, at the first emit, to
 // BEM_LEVER_CENSUS_CELL as 0x80000000 | mask — the arm-difference proof a
 // matched pair should read back before trusting a delta.
+// [BEM_LEVER_BRANCH_NOPC] True iff this branch is one of the forms the native
+// branch emitters handle WITHOUT the interpreter fallback; each of those stores
+// ctx.PC itself on every block-leaving path and never reads it.
+static bool BranchWritesOwnPc(u32 inst) {
+    const u32 opcd = inst >> 26;
+    const u32 bo = (inst >> 21) & 31u;
+    const bool lk = (inst & 1u) != 0u;
+    if (opcd == 18u) return true;                                   // b / bl / ba / bla
+    if (opcd == 16u) {                                              // bc (emit_bcx)
+        if (bo == 20u) return true;
+        if (lk) return false;
+        return bo == 0b10000u || bo == 0b10010u || (bo & 0b10100u) == 0b00100u;
+    }
+    if (opcd == 19u) {
+        const u32 xo = (inst >> 1) & 0x3FFu;
+        if (xo == 16u) return bo == 20u;                            // bclr (emit_bclrx)
+        if (xo == 528u) return (bo & 0x14u) == 0x14u;               // bcctr (emit_bcctrx)
+    }
+    return false;
+}
+
 bool bem_lever_on(u32 bit) {
     if (g_bem_lc_base == 0u) return true;
     static const u32 s_env_kill = []() -> u32 {
@@ -349,6 +370,11 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
     // host return as the generic code computes for that PC. Any PC that is not
     // a candidate falls through to the unchanged generic path. Only for plain
     // per-block bodies (no merged region, no region gen, no table override).
+    // [BEM_LEVER_PROBE_DIET 2026-10-07] see lever_gate.h. Plain per-block
+    // bodies only (the merged / region-gen slots are gen-PACKED, where the sign
+    // and gen tests are real).
+    const bool diet = !merged && region_gen < 0 && !tag_addr_ovr && !slot_addr_ovr &&
+                      bem_lever_on(BEM_LEVER_PROBE_DIET);
     if (n_static && static_pcs && !merged && region_gen < 0 && !tag_addr_ovr &&
         !slot_addr_ovr && bem_lever_on(BEM_LEVER_STATIC_CHAIN)) {
         b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC);
@@ -367,6 +393,10 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
                 b.op_i32_const((s32)t); b.op_i32_eq();
                 b.op_if(BLOCK_TYPE_VOID);
                     emit_addr_const(b, slot_addr + off, slot_sym, off); b.op_i32_load(0);
+                    if (diet) {
+                        // tag hit => slot is a live table index (lever_gate.h).
+                        b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
+                    } else {
                     b.op_local_tee(LOCAL_TMP_A_CHAIN);
                     b.op_i32_const(0); b.op_i32_ge_s();
                     b.op_if(BLOCK_TYPE_VOID);
@@ -378,6 +408,7 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
                         b.op_local_get(LOCAL_TMP_A_CHAIN);
                         b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
                     b.op_end();
+                    }
                 b.op_end();
                 if (BEM_PM51_CENSUS && g_bem_lc_base) {
                     b.op_i32_const((s32)0x026B38DCu);
@@ -481,14 +512,25 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
     // bucket byte-offset = ((PC>>2) & MASK) * 4 ; PC is ALREADY in TMP_A (teed by
     // the vector-page guard above — see its note), byteoff goes to TMP_B.
     b.op_local_get(LOCAL_TMP_A_CHAIN);
+    if (diet) {
+        // ((PC >> 2) & M) * 4 == (PC & ~3) & (M << 2) == PC & (M << 2).
+        b.op_i32_const((s32)(BEM_DISP_MASK_NEXT << 2)); b.op_i32_and();
+    } else {
     b.op_i32_const(2); b.op_i32_shr_u();
     b.op_i32_const((s32)BEM_DISP_MASK_NEXT); b.op_i32_and();
     b.op_i32_const(4); b.op_i32_mul();
+    }
     b.op_local_tee(LOCAL_TMP_B_CHAIN);
     // tag hit?  g_bem_disp_tag[bucket] == PC
     emit_addr_const(b, tag_addr, tag_sym); b.op_i32_add(); b.op_i32_load(0);
     b.op_local_get(LOCAL_TMP_A_CHAIN); b.op_i32_eq();
     b.op_if(BLOCK_TYPE_VOID);
+    if (diet) {
+        // tag hit => slot is a live table index (lever_gate.h).
+        emit_addr_const(b, slot_addr, slot_sym); b.op_local_get(LOCAL_TMP_B_CHAIN);
+        b.op_i32_add(); b.op_i32_load(0);
+        b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
+    } else {
         // slot = g_bem_disp_slot[bucket]; if slot >= 0 → dispatch
         emit_addr_const(b, slot_addr, slot_sym); b.op_local_get(LOCAL_TMP_B_CHAIN);
         b.op_i32_add(); b.op_i32_load(0);
@@ -565,6 +607,7 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
             }
         }
         b.op_end();
+    }   // !diet
     b.op_end();
 
     if (merged) {
@@ -1165,6 +1208,8 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
                                  const void* region_lookup_user = nullptr,
                                  u16 chain_tag_sym = (u16)BEM_RSYM_NONE,
                                  u16 chain_slot_sym = (u16)BEM_RSYM_NONE) {
+    // [BEM_LEVER_SET_GET_TEE 2026-10-07] set/get -> tee peephole for this body.
+    b.setPeepholeTee(bem_lever_on(BEM_LEVER_SET_GET_TEE));
     // IN-BLOCK CYCLE ACCOUNTING (2026-06-12, Jit64 parity: Jit.cpp charges
     // js.downcountAmount at block entry). downcount -= numCycles emitted in
     // the block prologue so the chain dispatcher can run block-to-block
@@ -1184,7 +1229,38 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // integer self-loop's back-edge re-charges the same per-iteration cost.
     const bool idle_block = block.m_num_instructions > 0 &&
         buffer.data()[block.m_num_instructions - 1].branchIsIdleLoop;
-    const u32 charge = stats.numCycles ? stats.numCycles : (u32)count;
+    // [SUPERBLOCK 2026-10-07] Segment layout of a DecodeBlockFollow stream. A new
+    // segment starts after every mid-list seam (b / bl / blr). Segment k is the
+    // contiguous block the plain decoder compiles at its first pc, so its charge
+    // is computed exactly as build_block_next computes that block's: the sum of
+    // its ops' num_cycles, or its op count when that sum is 0. The entry charges
+    // segment 0 only; each seam charges its own segment after the plain
+    // terminal's downcount bail (see the seam service in the op loop).
+    const std::size_t n_buf = buffer.size();
+    std::vector<u32> seg_charge(n_buf, 0u);   // nonzero = a segment starts at op i (i > 0)
+    u32 seg0_charge = 0u;
+    if (block.m_follow) {
+        std::size_t s0 = 0;
+        for (std::size_t k = 1; k <= n_buf; ++k) {
+            bool cut = (k == n_buf);
+            if (!cut) {
+                const CodeOp& pv = buffer[k - 1];
+                const u32 nx = buffer[k].address;
+                cut = IsSeamB(pv.inst, pv.address, nx) ||
+                      IsSeamInlineBl(pv.inst, pv.address, nx) || IsPlainBlr(pv.inst);
+            }
+            if (!cut) continue;
+            u32 cyc = 0u;
+            for (std::size_t j = s0; j < k; ++j)
+                if (buffer[j].opinfo) cyc += buffer[j].opinfo->num_cycles;
+            if (cyc == 0u) cyc = (u32)(k - s0);
+            if (s0 == 0) seg0_charge = cyc; else seg_charge[s0] = cyc;
+            s0 = k;
+        }
+    }
+    const u32 charge = block.m_follow ? seg0_charge
+                                      : (stats.numCycles ? stats.numCycles : (u32)count);
+    bool idle_taken = false;   // [BEM_LEVER_IDLE_TAKEN] set in the prologue block below
     BEM_EMIT_MARK(BEM_MARK_BLOCK_BEGIN, start_pc);
     {
         // [gpu-synced idle skip 2026-10-01] see ppc_emit.h BEM_GPUIDLE_*. Only a
@@ -1192,6 +1268,9 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
         // Everything else is the byte-identical unconditional skip below.
         const bool gpuidle_gated =
             idle_block && block.m_noncontiguous && bem_gpuidle_on();
+        // [BEM_LEVER_IDLE_TAKEN] the ungated idle block charges like any block
+        // here; its downcount = 0 moves to the taken back-edge (after the op loop).
+        idle_taken = idle_block && !gpuidle_gated && bem_lever_on(BEM_LEVER_IDLE_TAKEN);
         const u32 gpuidle_dist = gpuidle_gated
             ? *reinterpret_cast<volatile uint32_t*>(
                   static_cast<uintptr_t>(BEM_GPUIDLE_DIST_CELL))
@@ -1244,7 +1323,7 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             // skip a spliced block blind (that is the naive splice that blackened
             // City Escape). Execute it like any other block.
             emit_spin_charge();
-        } else if (idle_block) {
+        } else if (idle_block && !idle_taken) {
             b.op_i32_const((s32)ctx_ptr);
             b.op_i32_const(0);
             b.op_i32_store(ppc_off::DOWNCOUNT);
@@ -1565,6 +1644,10 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // Pure ALU/branch blocks (the overwhelming majority pre-VI_FIELD_BELOW)
     // skip the unconditional wasm→JS crossing.
     bool block_has_store = false;
+    // [SUPERBLOCK] stores in the CURRENT segment: the plain block's epilogue
+    // drains the gather pipe iff that block had a store, so each seam (and the
+    // final epilogue) of a follow stream drains on exactly that condition.
+    bool seg_has_store = false;
     // Jit64 parity (Jit.cpp:1104-1128): the FIRST FL_USE_FPU op in a block
     // gets an MSR.FP bailout check; once it passes, later FP ops in the
     // same block skip it (FP can't be disabled mid-block — mtmsr ends the
@@ -1590,12 +1673,70 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     }
     for (std::size_t i = 0; i < n_ops; ++i) {
         const CodeOp& op = buffer[i];
+        // [SUPERBLOCK] seam service = the block boundary the plain decode has
+        // here, minus the dispatch: (1) the previous block's epilogue gather
+        // drain, (2) its terminal's downcount bail (emit_chain_or_return [a]:
+        // downcount <= 0 -> flush, PC = this segment's pc, return to the host),
+        // (3) this block's prologue charge. The register caches are NOT flushed
+        // on the continue path — that is the cross-block register cache; every
+        // exit arm flushes from a snapshot of the compile-time state.
+        if (block.m_follow && i < n_buf && seg_charge[i] != 0u) {
+            if (seg_has_store) {
+                emit_addr_const(b, (u32)(uintptr_t)&g_bem_gp_dirty, (u16)BEM_RSYM_GP_DIRTY);
+                b.op_i32_load(0);
+                b.op_if(BLOCK_TYPE_VOID);
+                    b.op_i32_const(0);
+                    b.op_i32_const(0);
+                    b.op_call(WIMPORT_GATHER_DRAIN);
+                b.op_end();
+            }
+            seg_has_store = false;
+            b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::DOWNCOUNT);
+            b.op_i32_const(0); b.op_i32_le_s();
+            b.op_if(BLOCK_TYPE_VOID);
+            {
+                const auto sb_rs = rc.SaveState();
+                const auto sb_fs = frc.SaveState();
+                rc.Flush(ctx_ptr);
+                frc.Flush(ctx_ptr);
+                b.op_i32_const((s32)ctx_ptr);
+                b.op_i32_const((s32)op.address);
+                b.op_i32_store(ppc_off::PC);
+                b.op_i32_const((s32)op.address);
+                b.op_return();
+                rc.RestoreState(sb_rs);
+                frc.RestoreState(sb_fs);
+            }
+            b.op_end();
+            b.op_i32_const((s32)ctx_ptr);
+            b.op_i32_const((s32)ctx_ptr);
+            b.op_i32_load(ppc_off::DOWNCOUNT);
+            b.op_i32_const((s32)seg_charge[i]);
+            b.op_i32_sub();
+            b.op_i32_store(ppc_off::DOWNCOUNT);
+            if (bem_mips_census_on()) {
+                b.op_i32_const((s32)BEM_MIPS_EXEC_CELL);
+                b.op_i32_const((s32)BEM_MIPS_EXEC_CELL);
+                b.op_i32_load(0);
+                b.op_i32_const((s32)seg_charge[i]);
+                b.op_i32_add();
+                b.op_i32_store(0);
+            }
+        }
         BEM_EMIT_MARK(BEM_MARK_OP, op.address);
         const bool is_terminator = (i + 1 == n_ops);
+        // [SUPERBLOCK] a mid-list b / bl / blr seam of a follow stream. None of
+        // them reads ctx.PC: the b emits nothing, the bl writes LR, and the blr's
+        // RAS-mismatch exit stores its own PC.
+        const bool follow_seam = block.m_follow && !is_terminator &&
+            (IsSeamB(op.inst, op.address, buffer[i + 1].address) ||
+             IsSeamInlineBl(op.inst, op.address, buffer[i + 1].address) ||
+             IsPlainBlr(op.inst));
         if (op.opinfo) {
             const OpType t = op.opinfo->type;
             if (t == OpType::Store || t == OpType::StoreFP || t == OpType::StorePS) {
                 block_has_store = true;
+                seg_has_store = true;
             }
         }
 
@@ -1669,7 +1810,13 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             bem_lever_on(BEM_LEVER_MEM_SLOWARM)) {
             params.defer_pc = op.address;
         }
-        if (params.defer_pc == 0u &&
+        // [BEM_LEVER_BRANCH_NOPC 2026-10-07] see lever_gate.h; the predicate
+        // mirrors exactly the forms emit_bx / emit_bcx / emit_bclrx / emit_bcctrx
+        // (and emit_bcx_fused, whose caller admits only native forms) emit
+        // natively.
+        const bool branch_owns_pc = BranchWritesOwnPc(op.inst) &&
+                                    bem_lever_on(BEM_LEVER_BRANCH_NOPC);
+        if (params.defer_pc == 0u && !follow_seam && !branch_owns_pc &&
             (is_terminator || op.canEndBlock || op.canCauseException ||
              fpu_needs_pc ||
              (op.opinfo && (op.opinfo->flags & FL_LOADSTORE))))
@@ -1745,7 +1892,10 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
         // this same block. The pre-op set_pc above left PC=op.address for the
         // not-taken arm; the next op's set_pc advances it to the fall-through.
         bool emitted_native;
-        if (!is_terminator && block.m_noncontiguous &&
+        if (follow_seam && IsSeamB(op.inst, op.address, buffer[i + 1].address)) {
+            // [SUPERBLOCK] the `b` falls through to its target by construction.
+            emitted_native = true;
+        } else if (!is_terminator && block.m_noncontiguous &&
             i + 1 < n_ops &&
             IsSeamInlineBl(op.inst, op.address, buffer[i + 1].address)) {
             // [FUSION v3] inline-callee seam: the callee's stream follows at
@@ -1919,6 +2069,19 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // exits the loop (only br re-iterates), so the not-taken and bail paths
     // land here naturally and run the unchanged epilogue below.
     if (resident_loop_arm) b.op_end();
+    // [BEM_LEVER_IDLE_TAKEN] the idle skip, on the taken back-edge only. The
+    // analyzer classified this block idle only if its terminator branches to
+    // start_pc (IsBusyWaitLoop: branchTo == m_address), and its not-taken exit
+    // is terminator + 4 != start_pc, so PC == start_pc <=> the loop was taken.
+    if (idle_taken) {
+        b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC);
+        b.op_i32_const((s32)start_pc); b.op_i32_eq();
+        b.op_if(BLOCK_TYPE_VOID);
+            b.op_i32_const((s32)ctx_ptr);
+            b.op_i32_const(0);
+            b.op_i32_store(ppc_off::DOWNCOUNT);
+        b.op_end();
+    }
     // [executed-op census 2026-10-04] split the block epilogue (gather drain +
     // dirty flushes) out of the LAST guest op's span. Mark-only: the callback is
     // null in every shipping build and is handed no builder.
@@ -1938,7 +2101,7 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // pre-VI_FIELD_BELOW boot) skip the wasm→JS crossing. Conservative —
     // any store could route to MMIO (including the gather-pipe range), so
     // we always drain when stores exist; only fully store-free blocks skip.
-    if (block_has_store) {
+    if (block.m_follow ? seg_has_store : block_has_store) {
         // [perf] Only cross to the host gather-pipe drain (a wasm->JS
         // UpdateGatherPipe flush) when a gather-pipe write is actually
         // pending. g_bem_gp_dirty (bridge) is set by dolphin_write* / interp
@@ -2188,7 +2351,8 @@ std::vector<u8> build_block_next(u32 start_pc,
                                  u32 mem1_base, u32 mem1_mask, u32 ram_size,
                                  u32* out_cycles,
                                  bool* out_is_idle_loop,
-                                 const u32* instr_pcs) {
+                                 const u32* instr_pcs,
+                                 u32 build_flags) {
     PPCAnalyzer pa;
     CodeBlock block;
     BlockStats stats;
@@ -2196,7 +2360,8 @@ std::vector<u8> build_block_next(u32 start_pc,
     CodeBuffer buffer;
     if (instr_pcs) {
         // [FUSION v2] test/fused entry: exact per-op pcs.
-        pa.AnalyzeOps(insts, instr_pcs, count, &block, &buffer);
+        pa.AnalyzeOps(insts, instr_pcs, count, &block, &buffer,
+                      (build_flags & BEM_BUILD_FOLLOW) ? PPCAnalyzer::kAnalyzeFollow : 0u);
     } else {
         // Wrap raw insts[] in a fetch callback for PPCAnalyzer.
         struct FetchCtx { const u32* insts; u32 base_pc; u32 count; };

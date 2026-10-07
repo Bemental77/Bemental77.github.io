@@ -25,6 +25,7 @@
 #include "fpr_reg_cache.h"
 #include "ppc_analyst.h"
 #include "reg_cache.h"
+#include "lever_gate.h"
 
 namespace bemental::powerpc {
 
@@ -43,6 +44,11 @@ void emit_cmpi(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Code
     if (BEM_LAZY_CR) {
         emit_defer_cr_imm(wb, ctx_ptr, crfd, rc_ra.local_idx(), (s32)simm,
                           BEM_CR_CMP_IMM);
+        if (fuse) { fuse->valid = true; fuse->age = 0; fuse->crfd = crfd;
+                    fuse->a_local = rc_ra.local_idx(); fuse->imm = (s32)simm;
+                    fuse->is_imm = true; fuse->is_signed = true; }
+    } else if (bem_cr_lean_on()) {
+        emit_cr_from_pair_imm(wb, ctx_ptr, crfd, rc_ra.local_idx(), (s32)simm, true);
         if (fuse) { fuse->valid = true; fuse->age = 0; fuse->crfd = crfd;
                     fuse->a_local = rc_ra.local_idx(); fuse->imm = (s32)simm;
                     fuse->is_imm = true; fuse->is_signed = true; }
@@ -66,6 +72,11 @@ void emit_cmpli(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Cod
     if (BEM_LAZY_CR) {
         emit_defer_cr_imm(wb, ctx_ptr, crfd, rc_ra.local_idx(), (s32)uimm,
                           BEM_CR_CMP_IMM | BEM_CR_UNSIGNED);
+        if (fuse) { fuse->valid = true; fuse->age = 0; fuse->crfd = crfd;
+                    fuse->a_local = rc_ra.local_idx(); fuse->imm = (s32)uimm;
+                    fuse->is_imm = true; fuse->is_signed = false; }
+    } else if (bem_cr_lean_on()) {
+        emit_cr_from_pair_imm(wb, ctx_ptr, crfd, rc_ra.local_idx(), (s32)uimm, false);
         if (fuse) { fuse->valid = true; fuse->age = 0; fuse->crfd = crfd;
                     fuse->a_local = rc_ra.local_idx(); fuse->imm = (s32)uimm;
                     fuse->is_imm = true; fuse->is_signed = false; }
@@ -94,6 +105,11 @@ void emit_cmp(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
                     fuse->a_local = rc_ra.local_idx(); fuse->b_local = rc_rb.local_idx();
                     fuse->is_imm = false; fuse->is_signed = true; }
     } else {
+        if (fuse && bem_cr_lean_on()) {
+            fuse->valid = true; fuse->age = 0; fuse->crfd = crfd;
+            fuse->a_local = rc_ra.local_idx(); fuse->b_local = rc_rb.local_idx();
+            fuse->is_imm = false; fuse->is_signed = true;
+        }
         emit_cr_from_signed_pair(wb, ctx_ptr, crfd, rc_ra.local_idx(),
                                  rc_rb.local_idx());
     }
@@ -116,6 +132,11 @@ void emit_cmpl(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Code
                     fuse->a_local = rc_ra.local_idx(); fuse->b_local = rc_rb.local_idx();
                     fuse->is_imm = false; fuse->is_signed = false; }
     } else {
+        if (fuse && bem_cr_lean_on()) {
+            fuse->valid = true; fuse->age = 0; fuse->crfd = crfd;
+            fuse->a_local = rc_ra.local_idx(); fuse->b_local = rc_rb.local_idx();
+            fuse->is_imm = false; fuse->is_signed = false;
+        }
         emit_cr_from_unsigned_pair(wb, ctx_ptr, crfd, rc_ra.local_idx(),
                                    rc_rb.local_idx());
     }

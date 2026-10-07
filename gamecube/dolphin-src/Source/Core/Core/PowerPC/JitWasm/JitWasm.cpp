@@ -62,6 +62,7 @@
 
 namespace WGPU { extern double g_prof_advance_ms; }  // [WGPU-PROF — TEMP] defined in WGPUGfx.cpp
 #include "ppc_emit.h"     // bementalJIT/guests/powerpc-next/ppc_emit.h (PUBLIC include dir)
+#include "lever_gate.h"   // BEM_LEVER_FOLLOW (bementalJIT/guests/powerpc-next)
 
 // Compiler-verified anchors for the hand-maintained wasm32 offsets in
 // bementalJIT ppc_offsets.h (EXCEPTIONS / DOWNCOUNT). The emitted blocks'
@@ -514,7 +515,10 @@ void JitWasm::InvalidateICacheRange(u32 lo, u32 hi)
   // not a neighbour). Evict any caller whose inlined leaf overlaps [lo, hi).
   for (auto li = m_li_leaf_span.begin(); li != m_li_leaf_span.end();)
   {
-    if (li->second.first < hi && li->second.second > lo)
+    bool hit = false;
+    for (const auto& sp : li->second)
+      hit = hit || (sp.first < hi && sp.second > lo);
+    if (hit)
     {
       const u32 caller = li->first;
       m_wasm_cache.evict(caller);
@@ -1132,7 +1136,43 @@ bool JitWasm::TryCompileBlock(u32 start_pc, u32 ctx_ptr, u32 mem1_base,
   u32 li_guest_end = start_pc + count * 4u;
   bool li_is_idle = false;
 
-  if (!used_aot)
+  // [SUPERBLOCK 2026-10-07] BEM_LEVER_FOLLOW (lever_gate.h, ON by default; kill
+  // bit 14): decode along static b / bl / RAS-predicted blr into the next
+  // contiguous blocks and emit them as ONE function (ppc_analyst.h
+  // DecodeBlockFollow, ppc_emit.cpp CodeBlock::m_follow). A stream with no seam
+  // IS the contiguous block above and takes the unchanged paths below. Exactness
+  // on the SAB City Escape replay: PC, register file and downcount bit-identical
+  // at every slice end, same MEM1 (block_replay, kill arm vs default arm).
+  u32 sb_insts[kMaxBlockInsts];
+  u32 sb_pcs[kMaxBlockInsts];
+  u32 sb_span_lo[kMaxBlockInsts];
+  u32 sb_span_hi[kMaxBlockInsts];
+  u32 sb_count = 0;
+  u32 sb_nspans = 0;
+  if (!used_aot && bemental::powerpc::bem_lever_on(bemental::powerpc::BEM_LEVER_FOLLOW))
+  {
+    struct SbFetchCtx { Memory::MemoryManager* mem; };
+    SbFetchCtx sfc{&mem};
+    auto sb_fetch = +[](u32 fpc, void* user) -> u32 {
+      return static_cast<SbFetchCtx*>(user)->mem->Read_U32(fpc);
+    };
+    u32 nseams = 0;
+    const u32 n = static_cast<u32>(bemental::powerpc::DecodeBlockFollow(
+        start_pc, sb_fetch, &sfc, sb_insts, sb_pcs, kMaxBlockInsts, &nseams,
+        sb_span_lo, sb_span_hi, kMaxBlockInsts, &sb_nspans));
+    if (nseams > 0u && n > 0u)
+    {
+      bytes = bemental::powerpc::build_block_next(
+          start_pc, sb_insts, n, ctx_ptr, mem1_base, mem1_mask, ram_size, &block_cycles,
+          nullptr, sb_pcs, bemental::powerpc::BEM_BUILD_FOLLOW);
+      if (!bytes.empty())
+        sb_count = n;
+      else
+        block_cycles = 0;
+    }
+  }
+
+  if (!used_aot && sb_count == 0)
   {
     // A `bl` is FL_ENDBLOCK and is never a coalescable forward conditional, so
     // it can only ever be the LAST word of a contiguous block. That makes the
@@ -1252,6 +1292,8 @@ bool JitWasm::TryCompileBlock(u32 start_pc, u32 ctx_ptr, u32 mem1_base,
   // callee's own address range is NOT covered by this single [start, end)
   // record; m_li_leaf_span below carries it (this was a recorded KNOWN GAP
   // until 2026-10-01).
+  // [SUPERBLOCK] the first segment IS the contiguous block (count words); the
+  // appended segments' spans go to m_li_leaf_span below.
   m_block_guest_end[start_pc] = li_count > 0 ? li_guest_end : start_pc + count * 4u;
   // [LEAF-INLINE exactness 2026-10-01] record the
   // inlined leaf's own span so InvalidateICacheRange evicts this block when the
@@ -1270,7 +1312,15 @@ bool JitWasm::TryCompileBlock(u32 start_pc, u32 ctx_ptr, u32 mem1_base,
       leaf_hi = std::max(leaf_hi, p + 4u);
     }
     if (leaf_hi > leaf_lo)
-      m_li_leaf_span[start_pc] = {leaf_lo, leaf_hi};
+      m_li_leaf_span[start_pc] = {{leaf_lo, leaf_hi}};
+  }
+  if (sb_count > 0)
+  {
+    std::vector<std::pair<u32, u32>> spans;
+    for (u32 i = 1; i < sb_nspans; ++i)
+      spans.emplace_back(sb_span_lo[i], sb_span_hi[i]);
+    if (!spans.empty())
+      m_li_leaf_span[start_pc] = std::move(spans);
   }
 
   // STEP 2 (region wiring, side-channel — NO dispatch change yet): accumulate
@@ -1286,6 +1336,11 @@ bool JitWasm::TryCompileBlock(u32 start_pc, u32 ctx_ptr, u32 mem1_base,
     // (NO body emitted at compile, NO accumulate-all). promote_hot re-emits +
     // merges it into the hot region once it has been dispatched enough times,
     // so the merged region stays small (the hot loop), not all ~8900 blocks.
+    // [SUPERBLOCK] not stashed: a region re-emit goes through AnalyzeOps without
+    // the follow flag, so it would compile a DIFFERENT block (no seam service)
+    // than the one running. A superblock is therefore never promoted.
+    if (sb_count > 0)
+      return true;
     bemental::BlockEmitInputs rec;
     rec.start_pc      = start_pc;
     rec.ctx_ptr_const = ctx_ptr;

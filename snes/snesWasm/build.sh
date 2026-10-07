@@ -29,6 +29,14 @@
 # guarded by `#if ASSERTIONS` and never assigned (src/postamble.js). A harness
 # that waits on it will report a booting core as dead. Wait on
 # Module.onRuntimeInitialized instead.
+# ⚠ WHEN emsdk_env.sh PUTS NO emcc ON PATH (a checkout whose vendored emsdk/
+# was never `emsdk activate`d — no emsdk/.emscripten, no emsdk/node), the
+# toolchain is still all there under emsdk/upstream; point emcc at it with a
+# config file instead of activating (2026-10-07, the multitap rebuild):
+#     printf "LLVM_ROOT='$PWD/emsdk/upstream/bin'\nBINARYEN_ROOT='$PWD/emsdk/upstream'\nNODE_JS='$(which node)'\n" > /tmp/em.cfg
+#     EM_CONFIG=/tmp/em.cfg PATH=$PWD/emsdk/upstream/emscripten:$PATH bash snes/snesWasm/build.sh
+# An UNMODIFIED tree built that way reproduced the shipped 1ea11e9a… wasm
+# byte-for-byte, so it is the same toolchain, not a substitute.
 set -e
 cd "$(dirname "$0")"
 emcc -O3 -s WASM=1 \

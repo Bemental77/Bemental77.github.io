@@ -112,6 +112,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { startBroker } from './mqtt_ws_broker.mjs';
+import { startFirewall, startBrokerFronts, fwProfileDir, counters as fwCounters } from './netplay_firewall.mjs';
 
 const require = createRequire(path.join(os.homedir(), 'probe-deps') + '/');
 const puppeteer = require('puppeteer');
@@ -261,6 +262,24 @@ const ARMS = {
           host: DESKTOP, join: DESKTOP, p2p: { delayMs: 53.5, jitterMs: 20, lossFrac: 0.02, rtxMs: 200 } },
   drelay: { id: 'drelay', what: 'desktop pair, room forced onto RELAY mode; broker 100 ms one-way + 2% loss',
             host: DESKTOP, join: DESKTOP, relay: true, broker: { delayMs: 100, loss: 0.02 } },
+  // A PLAYER BEHIND A 443-ONLY FIREWALL (docs/netplay/firewall.md). The JOINER's
+  // browser runs as its own uid behind KERNEL rules (tools/netplay_firewall.mjs):
+  // TCP 443 out, the page, and nothing else — every other TCP port refused, every
+  // UDP datagram dropped. Nothing in the page is shimmed: the room has to find
+  // out for itself that the 8084 broker is unreachable (the hand-off lists it
+  // FIRST) and that WebRTC cannot open, and go to the relay. The broker is the
+  // rig's, served as wss on 443 and 8084 through TLS fronts, impaired to the
+  // shape of the public 443 brokers measured from this sandbox (126-344 ms one
+  // way through its egress proxy, 0-0.6% loss at 60 msg/s; see
+  // tools/netplay_broker_check.mjs).
+  fw: { id: 'fw', what: 'desktop host (open network) + desktop JOINER behind a kernel 443-only firewall (no UDP, no TCP but 443); broker wss on 443 + 8084, 150 ms one-way + 1% loss',
+        host: DESKTOP, join: DESKTOP, firewall: true, broker: { delayMs: 150, loss: 0.01 } },
+  // The same firewall with an UNIMPAIRED broker: what the relay path itself costs.
+  fw0: { id: 'fw0', what: 'as fw, broker unimpaired (0 ms, 0% loss)',
+         host: DESKTOP, join: DESKTOP, firewall: true, broker: { delayMs: 0, loss: 0 } },
+  // The same firewall with a slower broker: the upper end of what was measured.
+  fw300: { id: 'fw300', what: 'as fw, broker 300 ms one-way + 1% loss',
+           host: DESKTOP, join: DESKTOP, firewall: true, broker: { delayMs: 300, loss: 0.01 } },
   e: { id: 'e', what: 'desktop pair, soak', host: DESKTOP, join: DESKTOP, soak: true },
   // A CPU-THROTTLED PEER WHOSE EMULATOR RUNS IN A WORKER (ps1): the CDP throttle
   // never reaches a worker (see MOBILE), so the kernel throttles it — every
@@ -555,6 +574,25 @@ function preloadSrc(cfg) {
       setTimeout(() => { try { if (ch.readyState === 'open') send.call(ch, data); } catch (e) {} }, Math.max(0, at - now()));
     };
   }
+  // ---------------- ICE witness (firewall arms): what this browser could offer ----------------
+  // Read-only: listeners beside lib/netplay.js's own handlers. Which candidate
+  // TYPES were gathered and which states each connection went through is the
+  // per-player half of the firewall arm's proof.
+  if (CFG.ice) {
+    const PC0 = window.RTCPeerConnection;
+    M.ice = { pcs: 0, cands: {}, states: [] };
+    const W0 = function (cfg, ...rest) {
+      const pc = new PC0(cfg, ...rest);
+      const id = ++M.ice.pcs;
+      pc.addEventListener('icecandidate', (e) => { if (e.candidate) { const k = (e.candidate.type || '?') + '/' + (e.candidate.protocol || '?'); M.ice.cands[k] = (M.ice.cands[k] || 0) + 1; } });
+      pc.addEventListener('connectionstatechange', () => { if (M.ice.states.length < 64) M.ice.states.push(id + '@' + Math.round(now() - M.t0) + ':' + pc.connectionState); });
+      pc.addEventListener('icegatheringstatechange', () => { if (M.ice.states.length < 64) M.ice.states.push(id + '@' + Math.round(now() - M.t0) + ':gather-' + pc.iceGatheringState); });
+      return pc;
+    };
+    W0.prototype = PC0.prototype;
+    Object.setPrototypeOf(W0, PC0);
+    window.RTCPeerConnection = W0;
+  }
   if (CFG.relay) {
     const PC = window.RTCPeerConnection;
     const W = function (cfg, ...rest) {
@@ -694,17 +732,49 @@ async function workerThrottleEnd(P) {
   for (let i = 0; i < 20; i++) { try { fs.rmdirSync(P.cg.dir); return; } catch (e) { await sleep(250); } }
 }
 
+// ---- the broker, out of process (see runCell) ------------------------------------
+async function startBrokerProc(impair) {
+  const { spawn } = await import('node:child_process');
+  const child = spawn(process.execPath, [path.join(path.dirname(fileURLToPath(import.meta.url)), 'mqtt_ws_broker.mjs'), '0',
+                                         String(+(impair.delayMs || 0)), String(+(impair.loss || 0))], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const B = { stats: {}, impair: { delayMs: +(impair.delayMs || 0), loss: +(impair.loss || 0) }, setImpair() {}, port: 0, url: null, pid: child.pid };
+  let buf = '';
+  const ready = new Promise((res, rej) => {
+    child.stdout.on('data', (d) => {
+      buf += d;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 1);
+        const m = line.match(/listening (ws:\/\/localhost:(\d+)\/mqtt)/);
+        if (m) { B.url = m[1]; B.port = +m[2]; res(); }
+        const st = line.match(/^\[mqtt-ws\] (\{.*\})$/);
+        if (st) { try { B.stats = JSON.parse(st[1]); } catch (e) {} }
+      }
+    });
+    child.on('exit', () => rej(new Error('broker process exited')));
+    setTimeout(() => rej(new Error('broker process did not start')), 10000);
+  });
+  await ready;
+  B.close = () => new Promise((res) => { child.once('exit', () => res()); try { child.kill('SIGTERM'); } catch (e) { res(); } setTimeout(res, 3000); });
+  return B;
+}
+
 // ---- a player's browser ---------------------------------------------------------
 async function launchPlayer(role, device, cellTag, pre) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `npdm-${cellTag}-${role}-`));
+  // pre.fw: this player is BEHIND THE FIREWALL — its browser runs as the
+  // firewalled uid (tools/netplay_firewall.mjs), so its profile must be theirs.
+  const dir = pre.fw ? fwProfileDir(`npdm-${cellTag}-${role}-`) : fs.mkdtempSync(path.join(os.tmpdir(), `npdm-${cellTag}-${role}-`));
   const browser = await puppeteer.launch({
-    headless: 'new', executablePath: CHROME, userDataDir: dir, protocolTimeout: 240000,
+    headless: 'new', executablePath: pre.fw ? pre.fw.wrapper : CHROME, userDataDir: dir, protocolTimeout: 240000,
+    // ⚠ DEVTOOLS OVER A PIPE behind the firewall: the default is a TCP port on
+    // loopback, and the firewalled uid may not answer on any port but 443.
+    ...(pre.fw ? { pipe: true } : {}),
     args: ['--no-sandbox', '--disable-dev-shm-usage', '--autoplay-policy=no-user-gesture-required',
            '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
            '--disable-backgrounding-occluded-windows',
            '--disable-features=WebRtcHideLocalIpsWithMdns,CalculateNativeWinOcclusion',
            '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist',
-           '--disk-cache-size=104857600', '--window-size=1280,800'],
+           '--disk-cache-size=104857600', '--window-size=1280,800', ...(pre.args || [])],
   });
   try { (await import('./browser_leak_guard.js')).default.guard(browser, __filename); } catch (_e) {}
   const page = (await browser.pages())[0] || await browser.newPage();
@@ -809,7 +879,7 @@ async function runCell(cid, aid, attempt) {
   const fg = freeGB();
   if (fg != null && fg < MIN_FREE_GB + 1.2) { cell.error = `disk: only ${fg.toFixed(2)} GB free`; return cell; }
   await acquireLock(tag);
-  let broker = null;
+  let broker = null, fw = null, fronts = null;
   const PS = [];
   const nPlayers = A.players || 2;
   const loadTick = setInterval(() => { const l = load1(); if (l != null) cell.loads.push(l); }, 10000);
@@ -817,23 +887,46 @@ async function runCell(cid, aid, attempt) {
   const bad = (st) => st.some((x) => x && x.engine && /desync|failed|ended/.test(x.engine.state));
   try {
     cell.uptimeAtLock = uptime();
-    broker = await startBroker({ port: 0 });
+    // ⚠ THE BROKER RUNS IN ITS OWN PROCESS for any arm that routes the room
+    // through it. In-process it shared this rig's event loop, and the rig
+    // decodes PNG screenshots synchronously in JS — every capture held every
+    // relayed message for the length of a decode, which reads in the room as
+    // a 300-400 ms jitter spike that no real broker has. (Measured 2026-10-07:
+    // the synthetic relay room with no screenshots, tools/
+    // netplay_firewall_room_test.mjs, worst stall 34 ms; the same broker in
+    // this process, worst 385 ms.) NPDM_BROKER_INPROC=1 restores the old arm.
+    broker = (A.firewall || A.relay) && process.env.NPDM_BROKER_INPROC !== '1'
+      ? await startBrokerProc(A.broker || {})
+      : await startBroker({ port: 0 });
     if (A.broker) broker.setImpair(A.broker);
+    // THE FIREWALL ARMS: TLS fronts at 443 and 8084, kernel rules for the joiner.
+    // The hand-off lists the 8084 broker FIRST, so the firewalled side has to
+    // find the 443 one by itself.
+    let brokerList = broker.url;
+    if (A.firewall) {
+      fronts = await startBrokerFronts(broker.port);
+      fw = startFirewall({ webPort: +(new URL(BASE).port || 80), chrome: CHROME });
+      brokerList = fronts.urls.p8084 + ',' + fronts.urls.p443;
+      cell.firewall = { brokers: brokerList, resolver: fronts.resolverRule, uid: fw.uid };
+    }
     const pre = { mqtt: mqttSource(), hooks: null };
     const cfg = (role) => ({ role, console: cid, witness: C.witness, frames: C.frames, hz: C.hz, seam: C.seam, aux: C.aux || 'null', ui: C.ui || 'null',
-                             p2p: A.p2p || null, relay: !!A.relay });
+                             p2p: A.p2p || null, relay: !!A.relay, ice: !!A.firewall });
     const code = mkCode();
     cell.code = code;
     cell.nPlayers = nPlayers;
     for (let i = 0; i < nPlayers; i++) {
       const role = i === 0 ? 'host' : (i === 1 ? 'joiner' : 'joiner' + i);
-      PS.push(await launchPlayer(role, i === 0 ? A.host : A.join, tag, Object.assign({}, pre, { hooks: preloadSrc(cfg(role)) })));
+      // --no-proxy-server: Chromium otherwise inherits this sandbox's HTTPS_PROXY
+      // and tunnels the fake broker hosts to the real egress, which refuses them.
+      const fwx = A.firewall ? { args: [`--host-resolver-rules=${fronts.resolverRule}`, '--ignore-certificate-errors', '--no-proxy-server'], fw: i > 0 ? fw : null } : {};
+      PS.push(await launchPlayer(role, i === 0 ? A.host : A.join, tag, Object.assign({}, pre, fwx, { hooks: preloadSrc(cfg(role)) })));
     }
     const H = PS[0];
     cell.prewarm = {};
     for (const P of PS) cell.prewarm[P.role] = await prewarm(P, C);
     const tOpen = Date.now();
-    await H.page.goto(handoffUrl(C, code, 'host', broker.url), { waitUntil: 'domcontentloaded' });
+    await H.page.goto(handoffUrl(C, code, 'host', brokerList), { waitUntil: 'domcontentloaded' });
     // Give the host's relay subscription a head start: a joiner publishing into
     // an empty topic is the "slow host" case, which is not what is measured here.
     for (let i = 0; i < 40; i++) { if (broker.stats.clients >= 1) break; await sleep(250); }
@@ -848,7 +941,7 @@ async function runCell(cid, aid, attempt) {
       admitted++; await sleep(500); return true;
     };
     for (let i = 1; i < PS.length; i++) {
-      await PS[i].page.goto(handoffUrl(C, code, 'join', broker.url), { waitUntil: 'domcontentloaded' });
+      await PS[i].page.goto(handoffUrl(C, code, 'join', brokerList), { waitUntil: 'domcontentloaded' });
       for (let k = 0; k < 60 && admitted < i; k++) { if (!(await tryAdmit())) await sleep(500); }
     }
     cell.admitAtS = +((Date.now() - tOpen) / 1000).toFixed(1);
@@ -959,13 +1052,19 @@ async function runCell(cid, aid, attempt) {
             native = JSON.parse(JSON.stringify(native));
           } catch (x) { native = { err: String(x) }; }
           let sess = null;
-          try { const ss = window.Netplay.sessions; const s = ss[ss.length - 1]; sess = { relay: s.relay ? JSON.parse(JSON.stringify(s.relay)) : null, peerId: s.peerId || null }; } catch (x) {}
+          try {
+            const ss = window.Netplay.sessions; const s = ss[ss.length - 1];
+            sess = { relay: s.relay ? JSON.parse(JSON.stringify(s.relay)) : null, peerId: s.peerId || null,
+                     relayInfo: s.relayInfo ? JSON.parse(JSON.stringify(s.relayInfo())) : null,
+                     sig: s._sig ? { kind: s._sig.kind, url: String(s._sig.url || ''), paths: s._sig.paths ? JSON.parse(JSON.stringify(s._sig.paths)) : null } : null,
+                     chip: (() => { const n = document.getElementById('npRelay'); return n ? n.textContent : null; })() };
+          } catch (x) {}
           return {
             t: performance.now() - M.t0, ready: M.readyFrames - m.ready,
             win: M.win.slice(m.win), stalls: M.stalls.slice(m.stalls), resumes: M.resumes.slice(m.resumes),
             allStalls: M.stalls.length, delays: M.delays.slice(), lat: M.lat.slice(), desyncs: M.desyncs.slice(),
             audio: Object.assign({}, M.audio, { dropoutsInWindow: M.audio.dropouts - m.drop, quantaInWindow: M.audio.quanta - m.aq }),
-            p2p: M.p2p, relayForced: M.relayForced, report: rep ? JSON.parse(JSON.stringify(rep)) : null, native, sess,
+            p2p: M.p2p, relayForced: M.relayForced, ice: M.ice || null, report: rep ? JSON.parse(JSON.stringify(rep)) : null, native, sess,
             peerId: e ? e.peerId : null, localPorts: e ? e.localPorts : null,
             hz: (() => { try { return eval(M.cfg.hz); } catch (x) { return null; } })(),
             // The page's OWN net seam, whole (minus bulky arrays), as evidence.
@@ -992,13 +1091,17 @@ async function runCell(cid, aid, attempt) {
         cell.failState[P.role] = await engineState(P);
       }
     }
-    cell.broker = Object.assign({}, broker.stats, { impair: Object.assign({}, broker.impair) });
+    if (broker.pid) { await broker.close(); broker.closed = true; }   // out of process: SIGTERM prints the final numbers
+    cell.broker = Object.assign({}, broker.stats, { impair: Object.assign({}, broker.impair), outOfProcess: !!broker.pid });
+    if (fw) { cell.firewall.counters = fwCounters(); cell.firewall.fronts = Object.assign({}, fronts.stats); }
   } catch (e) {
     cell.error = 'rig error: ' + String(e && e.stack || e).slice(0, 400);
   } finally {
     clearInterval(loadTick);
     for (const P of PS) await closePlayer(P);
-    if (broker) await broker.close().catch(() => {});
+    if (broker && !broker.closed) await broker.close().catch(() => {});
+    if (fronts) await fronts.close().catch(() => {});
+    if (fw) fw.close();
     cell.uptimeAfter = uptime();
     releaseLock();
   }
@@ -1211,6 +1314,15 @@ function analysePlayer(d, peerRole) {
   r.errors = (d.errors || []).length;
   r.consoleErrors = d.consoleErrorCount || 0;
   r.relay = d.sess && d.sess.relay ? !!d.sess.relay.active : false;
+  if (d.sess && d.sess.relayInfo) {
+    const ri = d.sess.relayInfo;
+    r.relayInfo = { oneWayMs: ri.oneWayMs != null ? Math.round(ri.oneWayMs) : null, delayFrames: ri.delayFrames, rate: ri.rate, why: ri.why, brokers: ri.brokers,
+                    gapSeq: ri.stats && ri.stats.gapSeq, dropAuth: ri.stats && ri.stats.dropAuth, adopted: ri.stats && ri.stats.adopted, sinceMs: ri.sinceMs };
+  }
+  if (d.sess) { r.sig = d.sess.sig ? d.sess.sig.url : null; r.chip = d.sess.chip; }
+  const rb = d.report && d.report.rollback;
+  if (rb) r.rb = { window: rb.window, windowPeak: rb.windowPeak, rollbacks: rb.rollbacks, resimFrames: rb.resimFrames, maxDepth: rb.maxDepth, meanDepth: rb.meanDepth, rttFrames: rb.rttFrames, windowStalls: rb.windowStalls };
+  if (d.ice) r.ice = { cands: d.ice.cands, states: (d.ice.states || []).slice(0, 12) };
   return r;
 }
 function verdict(cell, solo, soloAudio) {
@@ -1255,6 +1367,20 @@ function verdict(cell, solo, soloAudio) {
     if (perMinExcess > allow) why.push(`${name} audio ${a.audio.dropouts} dropouts (${a.audio.perMin}/min; ${perMinExcess.toFixed(1)}/min beyond stalls; allowed ${allow.toFixed(1)}${soloPm != null ? ' = solo ' + soloPm + ' x1.25' : ''})`);
   }
   if (cell.endedEarly) why.push('ended early: ' + cell.endedEarly);
+  // ⚠ THE FIREWALL ARM MUST PROVE IT WAS A FIREWALL. If no UDP datagram was
+  // dropped, no TCP connection refused, or nothing went out on 443, the joiner
+  // was not behind what the arm says — and a room that "worked" proves nothing.
+  if (ARMS[cell.arm] && ARMS[cell.arm].firewall) {
+    const c = (cell.firewall && cell.firewall.counters) || {};
+    const pk = (k) => (c[k] ? c[k].pkts : 0);
+    const proof = { udpDropped: pk('udp'), tcpRefused: pk('tcp-other'), tcp443: pk('tcp443'), front443: cell.firewall && cell.firewall.fronts ? cell.firewall.fronts.p443 : 0,
+                    front8084: cell.firewall && cell.firewall.fronts ? cell.firewall.fronts.p8084 : 0 };
+    if (cell.firewall) cell.firewall.proof = proof;
+    if (!(proof.udpDropped > 0)) why.push('firewall arm-proof: no UDP was dropped — WebRTC was never blocked');
+    if (!(proof.tcpRefused > 0)) why.push('firewall arm-proof: no TCP connection was refused — the 8084 broker was never refused');
+    if (!(proof.tcp443 > 0 && proof.front443 > 0)) why.push('firewall arm-proof: nothing reached the broker on 443');
+    for (const name of roles) { const a = cell.analysis[name]; if (a && !a.relay) why.push(`${name} is NOT on the relay — a direct path opened through the firewall?`); }
+  }
   // Device-limited: a throttled player that cannot do 1.000x SOLO.
   let limited = null;
   for (const [name, dev] of [['host', ARMS[cell.arm].host], ['joiner', ARMS[cell.arm].join]]) {
@@ -1352,13 +1478,15 @@ if (flag('rejudge', '')) {
         cell.verdict = verdict(cell, RESULT.solo[cid + ':mobile'] || BASELINE_MOBILE[cid], (RESULT.solo[cid + ':desktop'] || BASELINE[cid] || {}).audio);
         RESULT.cells.push(cell); save();
         const v = cell.verdict;
-        say(`  => ${cell.void ? 'VOID (load ' + maxLoad + ')' : (v.pass ? 'PASS' : (v.nonRateFailures.length === 0 && (v.boxLimited || v.deviceLimited) ? (v.boxLimited ? 'BOX-LIMITED' : 'DEVICE-LIMITED') : 'FAIL'))} ${v.deviceLimited ? '[device: ' + v.deviceLimited + '] ' : ''}${v.boxLimited ? '[box: ' + v.boxLimited + '] ' : ''}${v.why.join(' · ')}`);
+        say(`  => ${cell.void ? 'VOID (load ' + maxLoad + ')' : (v.pass ? 'PASS' : ((v.nonRateFailures || v.why).length === 0 && (v.boxLimited || v.deviceLimited) ? (v.boxLimited ? 'BOX-LIMITED' : 'DEVICE-LIMITED') : 'FAIL'))} ${v.deviceLimited ? '[device: ' + v.deviceLimited + '] ' : ''}${v.boxLimited ? '[box: ' + v.boxLimited + '] ' : ''}${v.why.join(' · ')}`);
         if (cell.analysis) for (const k of Object.keys(cell.analysis)) {
           const a = cell.analysis[k]; if (!a) continue;
           say(`     ${k.padEnd(6)} engine ${a.engineX}x (5s ${a.minWin5}..${a.maxWin5}) witness ${a.witnessX} fc ${a.frameCounterX} · stalls ${a.stalls}/${a.stallMs}ms on ${JSON.stringify(a.waitedOn)} · delay ${a.delayNow} [${a.delayChanges.join(' ')}] · lat ${JSON.stringify(a.latFrames)} · modes ${(a.capModes || []).map((c) => c.mode + ' ' + c.s + 's@' + c.x + 'x').join(' -> ') || '-'} · audio ${JSON.stringify(a.audio)} · hashes ${a.hashesCompared} · relay ${a.relay} · err ${a.errors}/${a.consoleErrors}`);
+          if (a.relayInfo || a.rb || a.ice) say(`     ${k.padEnd(6)} relay ${JSON.stringify(a.relayInfo || null)} · rb ${JSON.stringify(a.rb || null)} · ice ${JSON.stringify(a.ice || null)} · sig ${a.sig || '-'} · chip ${JSON.stringify(a.chip || null)}`);
           const shots = (cell.shots && cell.shots[k]) || [];
           say(`     ${k.padEnd(6)} canvas ${shots.map((s) => (s.showing ? 'OK' : 'BLANK') + '(' + s.litFrac + '/' + s.colours + ')').join(' ')}`);
         }
+        if (cell.firewall) say(`     firewall ${JSON.stringify(cell.firewall.proof || null)} · brokers ${cell.firewall.brokers} · broker ${JSON.stringify(cell.broker || null)}`);
         if (!cell.void) break;
       }
     }
