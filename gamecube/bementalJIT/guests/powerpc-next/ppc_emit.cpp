@@ -1184,7 +1184,37 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // integer self-loop's back-edge re-charges the same per-iteration cost.
     const bool idle_block = block.m_num_instructions > 0 &&
         buffer.data()[block.m_num_instructions - 1].branchIsIdleLoop;
-    const u32 charge = stats.numCycles ? stats.numCycles : (u32)count;
+    // [SUPERBLOCK 2026-10-07] Segment layout of a DecodeBlockFollow stream. A new
+    // segment starts after every mid-list seam (b / bl / blr). Segment k is the
+    // contiguous block the plain decoder compiles at its first pc, so its charge
+    // is computed exactly as build_block_next computes that block's: the sum of
+    // its ops' num_cycles, or its op count when that sum is 0. The entry charges
+    // segment 0 only; each seam charges its own segment after the plain
+    // terminal's downcount bail (see the seam service in the op loop).
+    const std::size_t n_buf = buffer.size();
+    std::vector<u32> seg_charge(n_buf, 0u);   // nonzero = a segment starts at op i (i > 0)
+    u32 seg0_charge = 0u;
+    if (block.m_follow) {
+        std::size_t s0 = 0;
+        for (std::size_t k = 1; k <= n_buf; ++k) {
+            bool cut = (k == n_buf);
+            if (!cut) {
+                const CodeOp& pv = buffer[k - 1];
+                const u32 nx = buffer[k].address;
+                cut = IsSeamB(pv.inst, pv.address, nx) ||
+                      IsSeamInlineBl(pv.inst, pv.address, nx) || IsPlainBlr(pv.inst);
+            }
+            if (!cut) continue;
+            u32 cyc = 0u;
+            for (std::size_t j = s0; j < k; ++j)
+                if (buffer[j].opinfo) cyc += buffer[j].opinfo->num_cycles;
+            if (cyc == 0u) cyc = (u32)(k - s0);
+            if (s0 == 0) seg0_charge = cyc; else seg_charge[s0] = cyc;
+            s0 = k;
+        }
+    }
+    const u32 charge = block.m_follow ? seg0_charge
+                                      : (stats.numCycles ? stats.numCycles : (u32)count);
     BEM_EMIT_MARK(BEM_MARK_BLOCK_BEGIN, start_pc);
     {
         // [gpu-synced idle skip 2026-10-01] see ppc_emit.h BEM_GPUIDLE_*. Only a
@@ -1565,6 +1595,10 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // Pure ALU/branch blocks (the overwhelming majority pre-VI_FIELD_BELOW)
     // skip the unconditional wasm→JS crossing.
     bool block_has_store = false;
+    // [SUPERBLOCK] stores in the CURRENT segment: the plain block's epilogue
+    // drains the gather pipe iff that block had a store, so each seam (and the
+    // final epilogue) of a follow stream drains on exactly that condition.
+    bool seg_has_store = false;
     // Jit64 parity (Jit.cpp:1104-1128): the FIRST FL_USE_FPU op in a block
     // gets an MSR.FP bailout check; once it passes, later FP ops in the
     // same block skip it (FP can't be disabled mid-block — mtmsr ends the
@@ -1590,12 +1624,70 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     }
     for (std::size_t i = 0; i < n_ops; ++i) {
         const CodeOp& op = buffer[i];
+        // [SUPERBLOCK] seam service = the block boundary the plain decode has
+        // here, minus the dispatch: (1) the previous block's epilogue gather
+        // drain, (2) its terminal's downcount bail (emit_chain_or_return [a]:
+        // downcount <= 0 -> flush, PC = this segment's pc, return to the host),
+        // (3) this block's prologue charge. The register caches are NOT flushed
+        // on the continue path — that is the cross-block register cache; every
+        // exit arm flushes from a snapshot of the compile-time state.
+        if (block.m_follow && i < n_buf && seg_charge[i] != 0u) {
+            if (seg_has_store) {
+                emit_addr_const(b, (u32)(uintptr_t)&g_bem_gp_dirty, (u16)BEM_RSYM_GP_DIRTY);
+                b.op_i32_load(0);
+                b.op_if(BLOCK_TYPE_VOID);
+                    b.op_i32_const(0);
+                    b.op_i32_const(0);
+                    b.op_call(WIMPORT_GATHER_DRAIN);
+                b.op_end();
+            }
+            seg_has_store = false;
+            b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::DOWNCOUNT);
+            b.op_i32_const(0); b.op_i32_le_s();
+            b.op_if(BLOCK_TYPE_VOID);
+            {
+                const auto sb_rs = rc.SaveState();
+                const auto sb_fs = frc.SaveState();
+                rc.Flush(ctx_ptr);
+                frc.Flush(ctx_ptr);
+                b.op_i32_const((s32)ctx_ptr);
+                b.op_i32_const((s32)op.address);
+                b.op_i32_store(ppc_off::PC);
+                b.op_i32_const((s32)op.address);
+                b.op_return();
+                rc.RestoreState(sb_rs);
+                frc.RestoreState(sb_fs);
+            }
+            b.op_end();
+            b.op_i32_const((s32)ctx_ptr);
+            b.op_i32_const((s32)ctx_ptr);
+            b.op_i32_load(ppc_off::DOWNCOUNT);
+            b.op_i32_const((s32)seg_charge[i]);
+            b.op_i32_sub();
+            b.op_i32_store(ppc_off::DOWNCOUNT);
+            if (bem_mips_census_on()) {
+                b.op_i32_const((s32)BEM_MIPS_EXEC_CELL);
+                b.op_i32_const((s32)BEM_MIPS_EXEC_CELL);
+                b.op_i32_load(0);
+                b.op_i32_const((s32)seg_charge[i]);
+                b.op_i32_add();
+                b.op_i32_store(0);
+            }
+        }
         BEM_EMIT_MARK(BEM_MARK_OP, op.address);
         const bool is_terminator = (i + 1 == n_ops);
+        // [SUPERBLOCK] a mid-list b / bl / blr seam of a follow stream. None of
+        // them reads ctx.PC: the b emits nothing, the bl writes LR, and the blr's
+        // RAS-mismatch exit stores its own PC.
+        const bool follow_seam = block.m_follow && !is_terminator &&
+            (IsSeamB(op.inst, op.address, buffer[i + 1].address) ||
+             IsSeamInlineBl(op.inst, op.address, buffer[i + 1].address) ||
+             IsPlainBlr(op.inst));
         if (op.opinfo) {
             const OpType t = op.opinfo->type;
             if (t == OpType::Store || t == OpType::StoreFP || t == OpType::StorePS) {
                 block_has_store = true;
+                seg_has_store = true;
             }
         }
 
@@ -1669,7 +1761,7 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             bem_lever_on(BEM_LEVER_MEM_SLOWARM)) {
             params.defer_pc = op.address;
         }
-        if (params.defer_pc == 0u &&
+        if (params.defer_pc == 0u && !follow_seam &&
             (is_terminator || op.canEndBlock || op.canCauseException ||
              fpu_needs_pc ||
              (op.opinfo && (op.opinfo->flags & FL_LOADSTORE))))
@@ -1745,7 +1837,10 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
         // this same block. The pre-op set_pc above left PC=op.address for the
         // not-taken arm; the next op's set_pc advances it to the fall-through.
         bool emitted_native;
-        if (!is_terminator && block.m_noncontiguous &&
+        if (follow_seam && IsSeamB(op.inst, op.address, buffer[i + 1].address)) {
+            // [SUPERBLOCK] the `b` falls through to its target by construction.
+            emitted_native = true;
+        } else if (!is_terminator && block.m_noncontiguous &&
             i + 1 < n_ops &&
             IsSeamInlineBl(op.inst, op.address, buffer[i + 1].address)) {
             // [FUSION v3] inline-callee seam: the callee's stream follows at
@@ -1938,7 +2033,7 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // pre-VI_FIELD_BELOW boot) skip the wasm→JS crossing. Conservative —
     // any store could route to MMIO (including the gather-pipe range), so
     // we always drain when stores exist; only fully store-free blocks skip.
-    if (block_has_store) {
+    if (block.m_follow ? seg_has_store : block_has_store) {
         // [perf] Only cross to the host gather-pipe drain (a wasm->JS
         // UpdateGatherPipe flush) when a gather-pipe write is actually
         // pending. g_bem_gp_dirty (bridge) is set by dolphin_write* / interp
@@ -2188,7 +2283,8 @@ std::vector<u8> build_block_next(u32 start_pc,
                                  u32 mem1_base, u32 mem1_mask, u32 ram_size,
                                  u32* out_cycles,
                                  bool* out_is_idle_loop,
-                                 const u32* instr_pcs) {
+                                 const u32* instr_pcs,
+                                 u32 build_flags) {
     PPCAnalyzer pa;
     CodeBlock block;
     BlockStats stats;
@@ -2196,7 +2292,8 @@ std::vector<u8> build_block_next(u32 start_pc,
     CodeBuffer buffer;
     if (instr_pcs) {
         // [FUSION v2] test/fused entry: exact per-op pcs.
-        pa.AnalyzeOps(insts, instr_pcs, count, &block, &buffer);
+        pa.AnalyzeOps(insts, instr_pcs, count, &block, &buffer,
+                      (build_flags & BEM_BUILD_FOLLOW) ? PPCAnalyzer::kAnalyzeFollow : 0u);
     } else {
         // Wrap raw insts[] in a fetch callback for PPCAnalyzer.
         struct FetchCtx { const u32* insts; u32 base_pc; u32 count; };

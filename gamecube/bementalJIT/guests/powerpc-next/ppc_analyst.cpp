@@ -99,6 +99,98 @@ bool IsPlainBlr(u32 inst) {
     return GekkoOperands::BO(inst) == 20u;                 // unconditional
 }
 
+bool IsSeamB(u32 inst, u32 pc, u32 next_pc) {
+    if (GekkoOperands::OPCD(inst) != 18u) return false;
+    if (GekkoOperands::LK(inst) || GekkoOperands::AA(inst)) return false;
+    return pc + GekkoOperands::LI(inst) == next_pc;
+}
+
+// The contiguous block decode (JitWasm::TryCompileBlock / block_replay
+// compile_at, verbatim). Returns the op count; *terminated = ended on a
+// terminator rather than the cap.
+static std::size_t DecodeContiguous(u32 pc, u32 (*fetch)(u32, void*), void* user,
+                                    u32* insts, std::size_t cap, bool* terminated) {
+    *terminated = false;
+    for (std::size_t i = 0; i < cap; ++i) {
+        const u32 inst = fetch(pc, user);
+        insts[i] = inst;
+        if (IsBlockTerminator(inst) && !IsForwardConditionalBranch(inst, pc)) {
+            *terminated = true;
+            return i + 1;
+        }
+        pc += 4u;
+    }
+    return cap;
+}
+
+std::size_t DecodeBlockFollow(u32 start_pc, u32 (*fetch)(u32 pc, void* user), void* user,
+                              u32* out_insts, u32* out_pcs, std::size_t cap,
+                              u32* out_nseams, u32* out_span_lo, u32* out_span_hi,
+                              u32 max_spans, u32* out_nspans) {
+    if (out_nseams) *out_nseams = 0u;
+    if (out_nspans) *out_nspans = 0u;
+    if (!fetch || !out_insts || !out_pcs || cap == 0u) return 0u;
+    u32 seg[64];
+    const std::size_t seg_cap = cap < 64u ? cap : 64u;   // the contiguous decode cap
+    u32 ret_stack[kFollowMaxDepth];
+    u32 depth = 0u;
+    std::size_t n = 0u;
+    u32 pc = start_pc;
+    for (;;) {
+        bool terminated = false;
+        const std::size_t len = DecodeContiguous(pc, fetch, user, seg, seg_cap, &terminated);
+        if (n > 0u) {
+            if (n + len > cap) break;
+            bool dup = false;
+            for (std::size_t j = 0; j < len && !dup; ++j)
+                for (std::size_t k = 0; k < n; ++k)
+                    if (out_pcs[k] == pc + 4u * (u32)j) { dup = true; break; }
+            if (dup) break;
+            if (terminated) {
+                const u32 t = seg[len - 1u];
+                const u32 tpc = pc + 4u * (u32)(len - 1u);
+                const u32 op = GekkoOperands::OPCD(t);
+                u32 tgt = 0xFFFFFFFFu;
+                if (op == 18u)
+                    tgt = GekkoOperands::AA(t) ? GekkoOperands::LI(t) : tpc + GekkoOperands::LI(t);
+                else if (op == 16u)
+                    tgt = GekkoOperands::AA(t) ? (u32)GekkoOperands::BD(t)
+                                               : (u32)((s32)tpc + GekkoOperands::BD(t));
+                if (tgt == pc) break;                       // self-loop segment
+            }
+        }
+        if (out_nspans && out_span_lo && out_span_hi && *out_nspans < max_spans) {
+            out_span_lo[*out_nspans] = pc;
+            out_span_hi[*out_nspans] = pc + 4u * (u32)len;
+            ++*out_nspans;
+        }
+        for (std::size_t j = 0; j < len; ++j) {
+            out_insts[n + j] = seg[j];
+            out_pcs[n + j] = pc + 4u * (u32)j;
+        }
+        if (n > 0u && out_nseams) ++*out_nseams;
+        n += len;
+        if (!terminated) break;
+        const u32 t = out_insts[n - 1u];
+        const u32 tpc = out_pcs[n - 1u];
+        u32 next;
+        if (GekkoOperands::OPCD(t) == 18u && !GekkoOperands::AA(t)) {
+            next = tpc + GekkoOperands::LI(t);
+            if (GekkoOperands::LK(t)) {
+                if (depth >= kFollowMaxDepth) break;
+                ret_stack[depth++] = tpc + 4u;
+            }
+        } else if (IsPlainBlr(t) && depth > 0u) {
+            next = ret_stack[--depth];
+        } else {
+            break;
+        }
+        if ((next & 3u) != 0u || next < 0x80000000u || next >= 0x81800000u) break;
+        pc = next;
+    }
+    return n;
+}
+
 bool IsSeamBackwardConditional(u32 inst) {
     if (GekkoOperands::OPCD(inst) != 16u) return false;
     const u32 bo = GekkoOperands::BO(inst);
@@ -410,17 +502,24 @@ u32 PPCAnalyzer::Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer,
 
 // [FUSION v2] exact-list mode: per-op pcs, no fetch.
 u32 PPCAnalyzer::AnalyzeOps(const u32* insts, const u32* pcs, std::size_t n,
-                            CodeBlock* block, CodeBuffer* buffer) const {
+                            CodeBlock* block, CodeBuffer* buffer, u32 flags) const {
     return AnalyzeCore(pcs && n ? pcs[0] : 0u, block, buffer, n,
-                       nullptr, nullptr, insts, pcs);
+                       nullptr, nullptr, insts, pcs, flags);
 }
 
 u32 PPCAnalyzer::AnalyzeCore(u32 address, CodeBlock* block, CodeBuffer* buffer,
                              std::size_t block_size, FetchFn fetch,
                              void* fetch_user,
-                             const u32* pre_insts, const u32* pre_pcs) const {
+                             const u32* pre_insts, const u32* pre_pcs, u32 flags) const {
+    const bool follow = pre_pcs && (flags & kAnalyzeFollow);
     block->m_address          = address;
     block->m_noncontiguous    = false;
+    block->m_follow           = follow;
+    // A follow stream can be pc-contiguous across a seam (`b .+4`, a `bl` to the
+    // next word): it is still a superblock, and every path keyed on
+    // m_noncontiguous (seam arms on; fused self-loops / PM47 off) must treat it
+    // as one.
+    if (follow) block->m_noncontiguous = true;
     block->m_num_instructions = 0;
     block->m_broken           = false;
     block->m_memory_exception = false;
@@ -663,7 +762,8 @@ u32 PPCAnalyzer::AnalyzeCore(u32 address, CodeBlock* block, CodeBuffer* buffer,
             if (pre_pcs && i + 1 < block_size &&
                 (IsSeamBackwardConditional(op.inst) ||
                  IsSeamInlineBl(op.inst, op.address, pre_pcs[i + 1]) ||
-                 IsPlainBlr(op.inst))) {
+                 IsPlainBlr(op.inst) ||
+                 (follow && IsSeamB(op.inst, op.address, pre_pcs[i + 1])))) {
                 // [FUSION v2] mid-list seam conditional of a pre-built fused
                 // stream — emitted as a coalesced mid-block exit; keep
                 // decoding. Any OTHER unexpected mid-list terminator still
@@ -798,8 +898,14 @@ u32 PPCAnalyzer::AnalyzeCore(u32 address, CodeBlock* block, CodeBuffer* buffer,
         // it: the guest still observes exactly one VI retrace per 1/60 emulated
         // second. Identical mechanism, identical accounting, to the idle-skip
         // that already ships for the contiguous `lwz; cmp; b<cond> self` polls.
-        bool eligible = true;
-        if (block->m_noncontiguous) {
+        // [SUPERBLOCK] a follow stream is never classified idle: its first
+        // segment is the contiguous block at start_pc, which ends in a b/bl/blr
+        // (that is why anything was appended), so the plain decode never
+        // classifies that pc idle either; and every self-loop segment is left
+        // out by DecodeBlockFollow. Classifying the merged stream would be a NEW
+        // idle skip (a slice cut the plain path does not make).
+        bool eligible = !block->m_follow;
+        if (eligible && block->m_noncontiguous) {
             const std::size_t n = block->m_num_instructions;
             u32 pending_ret = 0u;   // 0 = not inside an inlined leaf call
             for (std::size_t i = 0; i + 1 < n; ++i) {

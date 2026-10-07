@@ -61,13 +61,17 @@ public:
     // — the caller already cut the list; any OTHER mid-list terminator still
     // truncates conservatively. Sets block->m_noncontiguous when any
     // pcs[i] != pcs[i-1]+4.
+    // flags: kAnalyzeFollow marks a DecodeBlockFollow stream (CodeBlock::
+    // m_follow): a mid-list IsSeamB `b` is a seam too, and the block is never
+    // classified an idle loop (see AnalyzeCore).
+    static constexpr u32 kAnalyzeFollow = 1u;
     u32 AnalyzeOps(const u32* insts, const u32* pcs, std::size_t n,
-                   CodeBlock* block, CodeBuffer* buffer) const;
+                   CodeBlock* block, CodeBuffer* buffer, u32 flags = 0u) const;
 
 private:
     u32 AnalyzeCore(u32 address, CodeBlock* block, CodeBuffer* buffer,
                     std::size_t block_size, FetchFn fetch, void* fetch_user,
-                    const u32* pre_insts, const u32* pre_pcs) const;
+                    const u32* pre_insts, const u32* pre_pcs, u32 flags = 0u) const;
     bool IsBusyWaitLoop(CodeBlock* block, CodeOp* code, std::size_t instructions) const;
     void SetInstructionStats(CodeBlock* block, CodeOp* code, const GekkoOPInfo* opinfo) const;
 
@@ -149,6 +153,45 @@ bool IsSeamBackwardConditional(u32 inst);
 bool IsSeamInlineBl(u32 inst, u32 pc, u32 next_pc);
 // [FUSION v3] plain blr (bclr BO=20, LK=0).
 bool IsPlainBlr(u32 inst);
+// [SUPERBLOCK] mid-list unconditional relative `b` (OPCD 18, LK=0, AA=0) whose
+// target IS the next stream pc: falls through by construction, emits nothing.
+bool IsSeamB(u32 inst, u32 pc, u32 next_pc);
+
+// ---------------------------------------------------------------------------
+// [SUPERBLOCK 2026-10-07] DecodeBlockFollow — superblock decode.
+//
+// Builds a stream out of the blocks the contiguous decoder would compile one
+// after another along STATIC control flow, so the emitter can run them as one
+// wasm function with GPR/FPR wasm locals live across the joins (the cross-block
+// register cache) and no dispatch between them (block merging):
+//
+//   segment 0   = the contiguous block at start_pc (the decode rule of
+//                 JitWasm::TryCompileBlock, verbatim, cap kMaxBlockInsts);
+//   after a segment ending in   b T   (relative, LK=0)  -> segment at T;
+//                               bl T  (relative, LK=1)  -> push pc+4, segment at T;
+//                               blr   with a pushed return R -> segment at R
+//                                     (emitted as the existing software-RAS seam:
+//                                     LR != R exits with PC = LR & ~3).
+// Every appended segment is the WHOLE contiguous block at its pc (never a
+// prefix), so every seam sits exactly on a block boundary of the plain decode
+// and the emitter can service it as that boundary (ppc_emit.cpp m_follow).
+// A segment is NOT appended (the stream ends at the previous segment's
+// terminator, exactly that block's own terminator) when: it would not fit in
+// `cap`; any of its pcs is already in the stream; its terminator branches back
+// to its own first pc (a self-loop: kept a block of its own, so idle-loop
+// classification, fused self-loops and the PM47 fast path still see it); its
+// pc is outside the MEM1 code window or misaligned; or the call depth would
+// exceed kFollowMaxDepth.
+//
+// Returns the op count. *out_nseams = number of appended segments after the
+// first (0 => the stream IS the contiguous block; callers must then use the
+// plain path). out_span_lo/hi[0..*out_nspans) = each segment's guest range
+// [lo, hi), for icbi range eviction (max_spans >= cap is always enough).
+constexpr u32 kFollowMaxDepth = 4u;
+std::size_t DecodeBlockFollow(u32 start_pc, u32 (*fetch)(u32 pc, void* user), void* user,
+                              u32* out_insts, u32* out_pcs, std::size_t cap,
+                              u32* out_nseams, u32* out_span_lo, u32* out_span_hi,
+                              u32 max_spans, u32* out_nspans);
 
 // ---------------------------------------------------------------------------
 // [LEAF-INLINE 2026-09-01] Contiguous-decoder pure-leaf `bl` inlining.

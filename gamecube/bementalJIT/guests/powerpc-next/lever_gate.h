@@ -74,6 +74,12 @@ constexpr u32 BEM_LEVER_FLUSH_MASK_BATCH = 1u << 12;
 // downcount-bail + constant-bucket probe emit_chain_or_return gives a static
 // block terminal, instead of op_return-ing every taken exit to the C loop.
 constexpr u32 BEM_LEVER_TAKEN_CHAIN = 1u << 13;
+// Superblocks: the block decoder follows b / bl / RAS-predicted blr into the
+// next contiguous block (DecodeBlockFollow) and emits the chain as ONE function:
+// GPR/FPR locals stay live across the joins, each join is serviced exactly like
+// the block boundary it replaces. Read by the DECODER's caller (JitWasm::
+// TryCompileBlock, block_replay compile_at), not by the emitter.
+constexpr u32 BEM_LEVER_FOLLOW = 1u << 14;
 
 bool bem_lever_on(u32 bit);
 

@@ -24,6 +24,7 @@
 
 #include <map>
 #include <unordered_map>
+#include <vector>
 #include <unordered_set>
 
 #include "Common/CommonTypes.h"
@@ -103,7 +104,10 @@ private:
   // covers the caller's own contiguous words, so without this an icbi over the
   // leaf's code would leave the spliced copy running stale. Small (one entry per
   // spliced block — ~20 on SAB), so InvalidateICacheRange scans it linearly.
-  std::unordered_map<u32, std::pair<u32, u32>> m_li_leaf_span;
+  // [SUPERBLOCK 2026-10-07] a vector per block: a DecodeBlockFollow superblock
+  // carries one guest span per appended segment (~1.8K superblocks x ~3 spans on
+  // the SAB City Escape replay), all of which an icbi must be able to hit.
+  std::unordered_map<u32, std::vector<std::pair<u32, u32>>> m_li_leaf_span;
 };
 
 #endif  // __EMSCRIPTEN__

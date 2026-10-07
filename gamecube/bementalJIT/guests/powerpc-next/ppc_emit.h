@@ -70,7 +70,13 @@ std::vector<u8> build_block_next(u32 start_pc,
                                  u32 mem1_base, u32 mem1_mask, u32 ram_size,
                                  u32* out_cycles = nullptr,
                                  bool* out_is_idle_loop = nullptr,
-                                 const u32* instr_pcs = nullptr);   // [FUSION v2] exact per-op pcs
+                                 const u32* instr_pcs = nullptr,   // [FUSION v2] exact per-op pcs
+                                 u32 build_flags = 0u);             // BEM_BUILD_* below
+
+// build_flags for build_block_next.
+// BEM_BUILD_FOLLOW: insts/instr_pcs come from DecodeBlockFollow (a superblock;
+// see ppc_analyst.h). Requires instr_pcs.
+constexpr u32 BEM_BUILD_FOLLOW = 1u;
 
 // Compile-time HLE-hook query. Set by the host integrator (JitWasm) to
 // HLE::GetHookByAddress != 0. When set, build_block_next skips the per-op

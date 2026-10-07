@@ -45,6 +45,7 @@
 #include "guests/powerpc-next/ppc_emit.h"
 #include "guests/powerpc-next/ppc_analyst.h"
 #include "guests/powerpc-next/ppc_offsets.h"
+#include "guests/powerpc-next/lever_gate.h"
 #include "bementalJIT/block_cache.h"
 
 #include <cstdio>
@@ -136,10 +137,29 @@ static BlockCache* g_cache = nullptr;
 static u32 g_compiles = 0, g_compile_fail = 0;
 static std::vector<u8> g_ibuf(4u << 20);
 
+static u32 g_superblocks = 0, g_seams = 0;
+static u32 g_follow_cap = 64u;   // --follow-cap N: superblock op cap (segments stay <= 64)
+
 static bool compile_at(u32 start_pc) {
     std::vector<u32> insts;
+    std::vector<u32> pcs;      // non-empty = a superblock (DecodeBlockFollow) stream
+    // [SUPERBLOCK] JitWasm.cpp TryCompileBlock: the follow decoder first, when
+    // the lever is on; a stream with no seam IS the contiguous block, which then
+    // takes the unchanged path below.
+    if (bem_lever_on(BEM_LEVER_FOLLOW)) {
+        u32 fi[512], fp[512], nseams = 0;
+        const std::size_t n = DecodeBlockFollow(
+            start_pc, [](u32 a, void*) -> u32 { return guest_read32(a); }, nullptr,
+            fi, fp, g_follow_cap, &nseams, nullptr, nullptr, 0u, nullptr);
+        if (nseams > 0u) {
+            insts.assign(fi, fi + n);
+            pcs.assign(fp, fp + n);
+            ++g_superblocks;
+            g_seams += nseams;
+        }
+    }
     u32 pc = start_pc;
-    for (u32 i = 0; i < kMaxBlockInsts; ++i) {
+    for (u32 i = 0; pcs.empty() && i < kMaxBlockInsts; ++i) {
         const u32 inst = guest_read32(pc);
         insts.push_back(inst);
         // JitWasm.cpp TryCompileBlock decode rule, verbatim.
@@ -151,7 +171,9 @@ static bool compile_at(u32 start_pc) {
     const u32 ctx_ptr = (u32)(uintptr_t)g_ctx;
     const u32 mem1_base = (u32)(uintptr_t)g_mem1;
     std::vector<u8> bytes = build_block_next(start_pc, insts.data(), (u32)insts.size(), ctx_ptr,
-                                             mem1_base, kRamMask, kRamSize, &cycles);
+                                             mem1_base, kRamMask, kRamSize, &cycles, nullptr,
+                                             pcs.empty() ? nullptr : pcs.data(),
+                                             pcs.empty() ? 0u : BEM_BUILD_FOLLOW);
     if (bytes.empty()) { ++g_compile_fail; return false; }
     if (g_dump_dir) {
         // Same shape as op_census's output so its readers apply. The UNinstrumented
@@ -164,7 +186,7 @@ static bool compile_at(u32 start_pc) {
             std::fprintf(f, "# block pc=%08x n_insts=%u cycles=%u module_bytes=%zu\n", start_pc,
                          (u32)insts.size(), cycles, bytes.size());
             for (u32 i = 0; i < insts.size(); ++i)
-                std::fprintf(f, "inst %08x %08x\n", start_pc + 4u * i, insts[i]);
+                std::fprintf(f, "inst %08x %08x\n", pcs.empty() ? start_pc + 4u * i : pcs[i], insts[i]);
             for (std::size_t i = 0; i + 2 < g_marks.size(); i += 3)
                 std::fprintf(f, "mark %d %08x %d\n", g_marks[i], (u32)g_marks[i + 2], g_marks[i + 1]);
             std::fclose(f);
@@ -250,6 +272,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--stop-park")) stop_park = true;
         else if (!std::strcmp(argv[i], "--exit-census")) exit_census = true;
         else if (!std::strcmp(argv[i], "--no-collapse")) g_bem_idle_collapse_off = 1u;
+        else if (!std::strcmp(argv[i], "--follow-cap") && i + 1 < argc)
+            g_follow_cap = std::min<u32>(512u, (u32)std::atoi(argv[++i]));
         else if (!std::strcmp(argv[i], "--top-pcs") && i + 1 < argc) g_top_pcs = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--dump-dir") && i + 1 < argc) g_dump_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--cell") && i + 1 < argc) {
@@ -398,7 +422,7 @@ int main(int argc, char** argv) {
         "\"indirect_calls\":%llu,\"consts\":%llu,\"locals\":%llu,\"control\":%llu,"
         "\"terminal_loads\":%llu,\"ops_per_guest_instr\":%.3f,\"instrs_per_entry\":%.3f,"
         "\"mmioR\":%d,\"mmioW\":%d,\"wpar_import\":%d,\"drains\":%d,\"interp\":%d,"
-        "\"mask_unsound\":%u}",
+        "\"mask_unsound\":%u,\"superblocks\":%u,\"seams\":%u}",
         mode.c_str(), s, stop, stop_pc, (unsigned long long)guest_cycles, g_compiles,
         g_compile_fail, host_chains, blocks_via_host, (unsigned long long)mem_hash,
         (unsigned long long)ctx_hash, (unsigned long long)g_cnt[12],
@@ -411,7 +435,7 @@ int main(int argc, char** argv) {
         (unsigned long long)g_cnt[14], gi > 0 ? ops / gi : 0.0,
         g_cnt[13] ? gi / (double)g_cnt[13] : 0.0,
         js_stat("mmioR"), js_stat("mmioW"), js_stat("wpar"), js_stat("drains"), js_stat("interp"),
-        g_mask_unsound);
+        g_mask_unsound, g_superblocks, g_seams);
     std::printf("%s\n", buf);
     if (json_out) { std::FILE* jf = std::fopen(json_out, "w"); if (jf) { std::fprintf(jf, "%s\n", buf); std::fclose(jf); } }
     std::fprintf(stderr, "[replay] slice-end PCs (top):");
