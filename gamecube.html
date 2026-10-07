@@ -361,7 +361,7 @@ window.GcRate = (function () {
       var v = At.load(a, 243), vt = A + v * u, dt = now - vt;
       if (dt / per + 1e-9 < 1) return 0;
       var nv = v, drop = 0;
-      if (dt > maxdt) {
+      if (dt > maxdt + per) {          // V is up to one period behind the last integration: only past that is a stall
         nv = Math.round((now - maxdt - A) / u);
         drop = (A + nv * u) - vt; dt = now - (A + nv * u);
       }
@@ -2284,6 +2284,11 @@ window.GcRate = (function () {
     var IE3 = itEnv(); itRelatch(Atomics, IE3.a, IE3.f, 1000, 60);
     itClaim(Atomics, IE3.a, IE3.f, 1010, 60, 100, IE3.out);
     var g3 = itClaim(Atomics, IE3.a, IE3.f, 1400, 60, 100, IE3.out), d3 = IE3.out[1];
+    // a rate whose period is LONGER than maxDtMs (?fps=4: 250 ms) still earns its credits — V trails the
+    // last integration by up to a period, so only time past maxDtMs + one period is a stall
+    var IE4 = itEnv(), s4 = 0; itRelatch(Atomics, IE4.a, IE4.f, 1000, 4);
+    for (var t6 = 1000; t6 <= 11000; t6 += 8) { itClaim(Atomics, IE4.a, IE4.f, t6, 4, 100, IE4.out); s4 += IE4.out[0]; }
+    ck('27d a 4/s clock (period 250 ms > maxDtMs 100) claims every credit: 40 in 10 s', s4 === 40, 'claimed ' + s4);
     ck('27c a 390 ms silence grants at most maxDtMs of credits and reports the rest as dropped',
        g3 === 6 && Math.abs(d3 - 300) < 1, 'granted ' + g3 + ' (6 = floor(100 ms x 60/s)), dropped ' + d3.toFixed(2) + ' ms');
 

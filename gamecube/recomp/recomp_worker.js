@@ -1314,6 +1314,17 @@ const PACE_I32_CELLS = PEEK_BASE + PEEK_WINDOWS * PEEK_CELLS;   // = 144; unchan
 //             credit wait). Over one frame period: FT_BUSY_OVER.
 // FT_N is bumped after the entry is written (the publish barrier); a reader takes the entries it
 // has not seen, up to FT_RING_N back. The page exposes this as window.__gcFrameTiming().
+// ── FRAME 41 IS IN THIS RECORD AND IS NOT A SLOWDOWN A PLAYER CAN SEE (2026-10-07) ───────────
+// MP4's boot runs its title load synchronously inside one frame (BootExec -> CharInit /
+// BootTitleCreate: HuDecodeData, Hu3DModelCreate, first calls into code never run before): 30-127 ms
+// of the GAME's own code at frame 41, on every run, solo and room. MEASURED what a player gets at that
+// moment (prod mirror, default arm, a screenshot every ~50 ms and every PCM block this worker posted):
+// the presented picture is byte-identical from guest frame 10 to frame 83 (the screen before the logo
+// fades in), and every audio block through frame 200 is digital silence (peak 0), so the 69 ms gap in
+// production around frame 41 replaced silence with silence. The guest clock is not slowed either:
+// the credits the wall clock earned during the frame are banked (MAX_BACKLOG, ~133 ms) and frames 42+
+// run back to back until it is caught up, so emulated time stays at 1.000x. lib/bench.js's 2 s warm-up
+// covers it: in 40+ bench runs its `over` never counted frame 41 (solo or room), though this ring has it.
 const FT_N = 220, FT_OVER = 221, FT_BUSY_OVER = 222, FT_RING = 256, FT_RING_N = 256;
 const FT_PERIOD_MS = 1000 / 60;      // = one VIWaitForRetrace (OSGetTime advances 675000 ticks)
 let ftLastT = 0, ftBusyStart = 0, ftBusyMs = 0;
@@ -1366,7 +1377,7 @@ function itClaim(At, a, f, now, T, maxdt, out) {
     var v = At.load(a, 243), vt = A + v * u, dt = now - vt;
     if (dt / per + 1e-9 < 1) return 0;
     var nv = v, drop = 0;
-    if (dt > maxdt) {
+    if (dt > maxdt + per) {          // V is up to one period behind the last integration: only past that is a stall
       nv = Math.round((now - maxdt - A) / u);
       drop = (A + nv * u) - vt; dt = now - (A + nv * u);
     }
