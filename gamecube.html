@@ -10512,7 +10512,10 @@ window.GcRate = (function () {
     var n2 = Atomics.load(paceI32, 220), lost = Math.max(0, n2 - 256 - from);
     if (lost) out.splice(0, lost);
     return { n: n, from: from + lost, entries: out, over: Atomics.load(paceI32, 221), busyOver: Atomics.load(paceI32, 222),
-             periodMs: 1000 / 60 };
+             periodMs: 1000 / 60,
+             // who kept the guest's clock: credits the backstop worker / the guest's own thread granted,
+             // and how often the guest found this thread silent but the integrator's lock held
+             bk: Atomics.load(paceI32, 242), selfGranted: Atomics.load(paceI32, 223), selfLockBusy: Atomics.load(paceI32, 224) };
   };
   window.__gcLockstep = function () {
     var ls = gcLsEngine();
@@ -10652,9 +10655,13 @@ window.GcRate = (function () {
     var got = false;
     for (var i = 0; i < 64 && !got; i++) got = Atomics.compareExchange(paceI32, IT_LOCK, 0, 1) === 0;
     if (!got) return;
+    var absorbN = 0;
     try {
+      // what the backstop clocks granted is absorbed into the model AFTER the lock is released
+      // (absorbExternal with shared=true does not touch the integrator; it allocates, and a GC pause
+      // inside the lock would hold the guest's own thread off the clock)
       var g = Atomics.load(paceI32, BK_GRANTED), d = g - bkAbsorbed;
-      if (d > 0) { bkAbsorbed = g; rate.absorbExternal(d, t, true); }
+      if (d > 0) { bkAbsorbed = g; absorbN = d; }
       Atomics.store(paceI32, BK_EN, (TARGET > 0 && !gcLsGate && !document.hidden && !Atomics.load(paceI32, 5)) ? 1 : 0);
       // Resume the ONE integrator from wherever it got to, whichever thread advanced it. A model
       // with no clock yet (first grant, or just restored) keeps its own latch instead.
@@ -10670,6 +10677,7 @@ window.GcRate = (function () {
       if (rate.lastT) { paceF64[0] = rate.lastT + org; paceF64[1] = rate.credAcc; }
       paceF64[2] = org + t;
     } finally { Atomics.store(paceI32, IT_LOCK, 0); }
+    if (absorbN > 0) rate.absorbExternal(absorbN, t, true);
     Atomics.add(paceI32, BK_HB, 1);
   }
   // PACING LEDGER (cheap; read by rigs). `leak` is the integrator's honesty check: wall-clock

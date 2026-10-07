@@ -1332,13 +1332,16 @@ function ftBusyEnd() { if (ftBusyStart) ftBusyMs = performance.now() - ftBusySta
 // and the page absorbs what was granted here through BK_GRANTED like the backstop's.
 // boot msg `bk` = { target, maxb, gap, maxdt } (absent: the worker waits as before).
 const BK_EN = 241, BK_GRANTED = 242, IT_LOCK = 243, BK_LOST = 244, BK_DROPMS = 245, BK_POLL_MS = 4;
+// counters for rigs (__gcFrameTiming): credits this thread granted, and the times it found the page
+// silent past the gap but the integrator's lock held (the page's thread stopped INSIDE its grant)
+const SG_GRANTED = 223, SG_LOCKBUSY = 224;
 let bkCfg = null, paceF64 = null;
 function selfGrant() {
   const a = paceI32, f = paceF64, c = bkCfg;
   if (!Atomics.load(a, BK_EN) || Atomics.load(a, LS_ARMED)) return;
   const now = performance.timeOrigin + performance.now();
   if (!(f[2] > 0) || !(f[0] > 0) || now - f[2] < c.gap) return;
-  if (Atomics.compareExchange(a, IT_LOCK, 0, 1) !== 0) return;
+  if (Atomics.compareExchange(a, IT_LOCK, 0, 1) !== 0) { Atomics.add(a, SG_LOCKBUSY, 1); return; }
   let g = 0;
   if (now - f[2] >= c.gap && Atomics.load(a, BK_EN)) {
     let dt = now - f[0];
@@ -1348,7 +1351,7 @@ function selfGrant() {
       g = Math.floor(acc); acc -= g;
       let room = c.maxb - Atomics.load(a, 0); if (room < 0) room = 0;
       if (g > room) { Atomics.add(a, BK_LOST, g - room); g = room; }
-      if (g > 0) { Atomics.add(a, 0, g); Atomics.add(a, BK_GRANTED, g); }
+      if (g > 0) { Atomics.add(a, 0, g); Atomics.add(a, BK_GRANTED, g); Atomics.add(a, SG_GRANTED, g); }
       f[0] = now; f[1] = acc;
     }
   }
