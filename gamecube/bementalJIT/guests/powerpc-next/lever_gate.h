@@ -104,6 +104,13 @@ constexpr u32 BEM_LEVER_GPR_EXIT_FLUSH = 1u << 17;
 // shuffle, extract (or v128.store32/16_lane). Pure byte permutation; the S16
 // load sign-extends with i16x8.extract_lane_s.
 constexpr u32 BEM_LEVER_BSWAP_SIMD = 1u << 18;
+// Eager CR-field build without the i64 assembly: lo32 and hi32 go out as two
+// i32 stores (the same 8 little-endian bytes as the one i64.store), hi32's
+// LT/NOT-GT bits come from two selects over baked constants, a cmpi/cmpli
+// immediate is a const operand (no LOCAL_TMP_IMM round trip; `a - 0` is `a`),
+// and a conditional branch IMMEDIATELY after a cmp of the same field tests the
+// cmp's operands directly (the PM57 CmpFuse, here with the eager store kept).
+constexpr u32 BEM_LEVER_CR_LEAN = 1u << 19;
 
 bool bem_lever_on(u32 bit);
 
