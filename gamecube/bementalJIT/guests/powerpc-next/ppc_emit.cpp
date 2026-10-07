@@ -1237,6 +1237,7 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     }
     const u32 charge = block.m_follow ? seg0_charge
                                       : (stats.numCycles ? stats.numCycles : (u32)count);
+    bool idle_taken = false;   // [BEM_LEVER_IDLE_TAKEN] set in the prologue block below
     BEM_EMIT_MARK(BEM_MARK_BLOCK_BEGIN, start_pc);
     {
         // [gpu-synced idle skip 2026-10-01] see ppc_emit.h BEM_GPUIDLE_*. Only a
@@ -1244,6 +1245,9 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
         // Everything else is the byte-identical unconditional skip below.
         const bool gpuidle_gated =
             idle_block && block.m_noncontiguous && bem_gpuidle_on();
+        // [BEM_LEVER_IDLE_TAKEN] the ungated idle block charges like any block
+        // here; its downcount = 0 moves to the taken back-edge (after the op loop).
+        idle_taken = idle_block && !gpuidle_gated && bem_lever_on(BEM_LEVER_IDLE_TAKEN);
         const u32 gpuidle_dist = gpuidle_gated
             ? *reinterpret_cast<volatile uint32_t*>(
                   static_cast<uintptr_t>(BEM_GPUIDLE_DIST_CELL))
@@ -1296,7 +1300,7 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             // skip a spliced block blind (that is the naive splice that blackened
             // City Escape). Execute it like any other block.
             emit_spin_charge();
-        } else if (idle_block) {
+        } else if (idle_block && !idle_taken) {
             b.op_i32_const((s32)ctx_ptr);
             b.op_i32_const(0);
             b.op_i32_store(ppc_off::DOWNCOUNT);
@@ -2036,6 +2040,19 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // exits the loop (only br re-iterates), so the not-taken and bail paths
     // land here naturally and run the unchanged epilogue below.
     if (resident_loop_arm) b.op_end();
+    // [BEM_LEVER_IDLE_TAKEN] the idle skip, on the taken back-edge only. The
+    // analyzer classified this block idle only if its terminator branches to
+    // start_pc (IsBusyWaitLoop: branchTo == m_address), and its not-taken exit
+    // is terminator + 4 != start_pc, so PC == start_pc <=> the loop was taken.
+    if (idle_taken) {
+        b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC);
+        b.op_i32_const((s32)start_pc); b.op_i32_eq();
+        b.op_if(BLOCK_TYPE_VOID);
+            b.op_i32_const((s32)ctx_ptr);
+            b.op_i32_const(0);
+            b.op_i32_store(ppc_off::DOWNCOUNT);
+        b.op_end();
+    }
     // [executed-op census 2026-10-04] split the block epilogue (gather drain +
     // dirty flushes) out of the LAST guest op's span. Mark-only: the callback is
     // null in every shipping build and is handed no builder.

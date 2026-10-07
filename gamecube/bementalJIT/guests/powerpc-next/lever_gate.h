@@ -86,6 +86,13 @@ constexpr u32 BEM_LEVER_FOLLOW = 1u << 14;
 // hit (every g_bem_disp_tag writer stores a table index >= 0 to the slot in the
 // same step; every release/clear resets tag and slot together).
 constexpr u32 BEM_LEVER_PROBE_DIET = 1u << 15;
+// Idle-loop skip on the TAKEN back-edge only (Jit64 placement: bcx calls
+// CoreTiming::Idle inside the taken path). An idle-classified block charges its
+// cycles like any block and stores downcount = 0 only when its terminator
+// branches back to the block start; the not-taken exit is an ordinary block exit
+// instead of a clock-jump to the next event. The spinning path ends with the same
+// downcount (0) as before.
+constexpr u32 BEM_LEVER_IDLE_TAKEN = 1u << 16;
 
 bool bem_lever_on(u32 bit);
 

@@ -1,4 +1,5 @@
-// test_superblock.cpp — BEM_LEVER_FOLLOW superblocks vs the plain block chain.
+// test_superblock.cpp — BEM_LEVER_FOLLOW superblocks vs the plain block chain
+// (+ the dispatch-probe diet's eviction contract and BEM_LEVER_IDLE_TAKEN).
 //
 // A superblock (ppc_analyst.h DecodeBlockFollow + ppc_emit.cpp CodeBlock::
 // m_follow) runs the blocks the contiguous decoder would compile one after
@@ -112,6 +113,7 @@ EM_JS(void, ram_reset, (), {
     Module.__ram = new Map();
     Module.__ram.set(0x80500008, 0x11);
 });
+EM_JS(void, ram_set, (u32 a, u32 v), { Module.__ram.set(a >>> 0, v | 0); });
 EM_JS(int, ram_digest, (), {
     let h = 0x811C9DC5 | 0;
     for (const [a, v] of [...Module.__ram.entries()].sort((x, y) => x[0] - y[0])) {
@@ -326,6 +328,75 @@ int main() {
                         b.ram == ref.ram && b.compiles == (u32)ev.size();
         expect(ok, what);
         std::printf("[%s] %s\n", ok ? "PASS" : "FAIL", what);
+    }
+
+    // ---- BEM_LEVER_IDLE_TAKEN: the idle skip happens on the taken back-edge ----
+    //   P 80400400  lwz   r0, 0(r7)      a poll: Load + Integer + branch to self
+    //     80400404  cmpwi r0, 0           => the analyzer classifies it idle
+    //     80400408  bgt   P
+    //     8040040C  b     D
+    // Poll word 0: the loop falls through at once. That is an ordinary block
+    // exit: the block's cycles are charged and the run continues to D; it must
+    // NOT end the slice with downcount = 0 (a clock-jump to the next event for a
+    // loop that never spun). Poll word 1: the loop is taken; the slice ends at P
+    // with downcount = 0, as it always did.
+    for (int spin = 0; spin < 2; ++spin) {
+        g_code.clear();
+        const u32 P = 0x80400400u;
+        g_code[P]       = d_form(32, 0, 7, 0);
+        g_code[P + 4]   = d_form(11, 0, 0, 0);
+        g_code[P + 8]   = bc_rel(12, 1, P + 8, P);     // bgt cr0 -> P
+        g_code[P + 12]  = b_rel(P + 12, PC_D, false);
+        g_code[PC_D]    = b_rel(PC_D, PC_D, false);
+        {
+            u32 one[3] = {g_code[P], g_code[P + 4], g_code[P + 8]};
+            bool idle = false;
+            u32 cyc = 0;
+            build_block_next(P, one, 3, 0x1000u, 0, 0, 0, &cyc, &idle);
+            expect(idle, "poll block classified idle");
+        }
+        u8* ctx = (u8*)std::calloc(1, CTX_BYTES + 0x100);
+        const u32 ctx_ptr = (u32)(uintptr_t)ctx;
+        auto w32 = [&](u32 off, u32 v) { std::memcpy(ctx + off, &v, 4); };
+        auto r32 = [&](u32 off) { u32 v; std::memcpy(&v, ctx + off, 4); return v; };
+        w32(ppc_off::gpr(7), 0x80500000u);
+        w32(ppc_off::MSR, 0x2000u);
+        w32(ppc_off::PC, P);
+        w32(ppc_off::DOWNCOUNT, 1000u);
+        ram_reset();
+        ram_set(0x80500000u, spin ? 1u : 0u);
+        {
+            BlockCache cache;
+            for (int guard = 0; guard < 64; ++guard) {
+                const u32 pc = r32(ppc_off::PC);
+                if (pc == PC_D) break;
+                u32 final_pc = pc, trap_pc = 0;
+                const s32 n = cache.chain_dispatch(
+                    pc, 4096u, &final_pc, &trap_pc,
+                    reinterpret_cast<const u32*>(ctx + ppc_off::EXCEPTIONS),
+                    reinterpret_cast<const s32*>(ctx + ppc_off::DOWNCOUNT));
+                if (n > 0) {
+                    w32(ppc_off::PC, final_pc);
+                    if ((s32)r32(ppc_off::DOWNCOUNT) <= 0) break;
+                    continue;
+                }
+                u32 w[64]; u32 cnt = 0;
+                for (u32 p2 = pc; cnt < 64; p2 += 4) {
+                    w[cnt++] = fetch(p2, nullptr);
+                    if (IsBlockTerminator(w[cnt - 1]) && !IsForwardConditionalBranch(w[cnt - 1], p2)) break;
+                }
+                std::vector<u8> bytes = build_block_next(pc, w, cnt, ctx_ptr, 0, 0, 0);
+                if (bytes.empty() || cache.compile(pc, bytes.data(), bytes.size()) < 0) break;
+            }
+        }
+        const u32 pc = r32(ppc_off::PC);
+        const s32 dc = (s32)r32(ppc_off::DOWNCOUNT);
+        char what[128];
+        const bool ok = spin ? (pc == P && dc == 0) : (pc == PC_D && dc > 0 && dc < 1000);
+        std::snprintf(what, sizeof what, "idle poll %s: pc=%08x downcount=%d", spin ? "spins" : "falls through", pc, dc);
+        expect(ok, what);
+        std::printf("[%s] %s\n", ok ? "PASS" : "FAIL", what);
+        std::free(ctx);
     }
 
     std::printf("[%s] TOTAL %d/%d checks\n", fails ? "FAIL" : "PASS", checks - fails, checks);

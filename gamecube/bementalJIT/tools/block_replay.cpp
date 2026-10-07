@@ -264,6 +264,7 @@ int main(int argc, char** argv) {
     const char* json_out = nullptr;
     bool stop_park = false;
     bool exit_census = false;
+    bool recur_scan = false;
     std::vector<std::pair<u32, u32>> cells;
     for (int i = 4; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--slice") && i + 1 < argc) slice = std::atol(argv[++i]);
@@ -271,6 +272,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--json") && i + 1 < argc) json_out = argv[++i];
         else if (!std::strcmp(argv[i], "--stop-park")) stop_park = true;
         else if (!std::strcmp(argv[i], "--exit-census")) exit_census = true;
+        else if (!std::strcmp(argv[i], "--recur-scan")) recur_scan = true;
         else if (!std::strcmp(argv[i], "--no-collapse")) g_bem_idle_collapse_off = 1u;
         else if (!std::strcmp(argv[i], "--follow-cap") && i + 1 < argc)
             g_follow_cap = std::min<u32>(512u, (u32)std::atoi(argv[++i]));
@@ -340,6 +342,22 @@ int main(int argc, char** argv) {
     u32 stop_pc = 0;
     u32 park_ring[32] = {0};
     std::map<u32, u32> end_pcs;
+    // --recur-scan (trace mode): a PROVABLE idle cycle is a slice end whose
+    // (PC, architectural register file) equals an earlier slice end's AND whose
+    // MEM1 is byte-identical AND with no MMIO / gather-pipe write, no host
+    // interpreter call and no drain in between. The replay is deterministic, so
+    // such a state can only repeat forever until something outside the CPU
+    // changes memory: skipping to the next event there is exact. Register-only
+    // recurrences are counted separately (GX command loops write the gather pipe,
+    // not MEM1, so their registers recur while they do real work).
+    struct Recur { long slice; uint64_t mem; int side; };
+    std::map<std::pair<u32, uint64_t>, Recur> recur_seen;
+    std::map<u32, std::pair<u32, u32>> recur_by_pc;   // pc -> (reg-only, provable)
+    auto side_effects = [&]() {
+        return js_stat("mmioW") + js_stat("wpar") + js_stat("drains") + js_stat("interp") +
+               EM_ASM_INT({ let n = 0; const f = Module.__replay.fallbackOps;
+                            for (const k in f) n += f[k] | 0; return n; });
+    };
     for (; s < max_slices; ++s) {
         set_ctx32(ppc_off::DOWNCOUNT, (u32)slice);
         bool halted = false;
@@ -386,6 +404,20 @@ int main(int argc, char** argv) {
                 }
             }
             std::fprintf(tf, "%ld %08x %016llx %d %08x\n", s, epc, (unsigned long long)h, dc, smask);
+            if (recur_scan) {
+                const auto key = std::make_pair(epc, h);
+                const int side = side_effects();
+                auto it = recur_seen.find(key);
+                if (it == recur_seen.end()) {
+                    recur_seen[key] = Recur{s, 0ull, side};
+                } else {
+                    const uint64_t mh = fnv64(g_mem1, kRamSize);
+                    auto& c = recur_by_pc[epc];
+                    if (it->second.mem == mh && it->second.side == side) ++c.second;
+                    else ++c.first;
+                    it->second = Recur{s, mh, side};
+                }
+            }
         }
         if (halted) break;
         park_ring[s & 31] = epc;
@@ -454,6 +486,12 @@ int main(int argc, char** argv) {
         const m = Object.entries(st.mmioAddrs).sort((a, b) => b[1] - a[1]).slice(0, 12);
         console.error('[replay] MMIO (top): ' + JSON.stringify(m));
     });
+    if (recur_scan) {
+        std::fprintf(stderr, "[replay] recur-scan (pc: register-only recurrences / PROVABLE idle recurrences):");
+        for (const auto& kv : recur_by_pc)
+            std::fprintf(stderr, " %08x:%u/%u", kv.first, kv.second.first, kv.second.second);
+        std::fprintf(stderr, "\n");
+    }
     if (exit_census) {
         static const struct { u32 cell; const char* name; } kc[] = {
             {0x026B34D8u, "coalesced_taken_host_return"}, {0x026B34DCu, "service_bail"},
