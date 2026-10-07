@@ -329,6 +329,61 @@ window.GcRate = (function () {
 
   var DEF = { guestHz: 60, maxDtMs: 100, maxBacklog: 8 };
 
+  // ---- THE ONE INTEGRATOR, LOCK-FREE (2026-10-07) ----------------------------------------
+  // Three threads advance the guest's wall clock: this page's main thread, the backstop worker
+  // and the guest's own thread (recomp_worker.js selfGrant). Their shared integrator used to sit
+  // behind a spin lock (IT_LOCK) over two Float64 cells (integrated-until, fractional credit), and
+  // a thread that stopped INSIDE the critical section — the page's main thread in a GC pause —
+  // held the other two off the clock. MEASURED (MP4 solo, prod mirror, SwiftShader arm, the
+  // worker's lock-busy counter): 3 of 20 runs parked the guest 34-50 ms on an empty pool with the
+  // guest's own thread polling every 4 ms and finding the lock held each time.
+  // Now the integrator's whole state is ONE Int32 cell, V: the start of the credit currently being
+  // earned, in 1/64ths of a credit period, counted from a fixed anchor A (Float64 cell, written
+  // once). Integrating to `now` CLAIMS g = floor((now - V)/period) credits by moving V forward by
+  // exactly g periods with ONE compareExchange; a thread that loses the race re-reads and retries.
+  // Nothing is ever held: a thread stopped anywhere in here has claimed nothing or has finished
+  // its claim. Credits are still floor(wall-clock integral) whichever thread claims them — V only
+  // moves by whole credits, so no thread can claim a span twice and no span goes unclaimed — and
+  // a span longer than maxDtMs is dropped (V jumps to now - maxDtMs), never repaid as a sprint.
+  // The fraction lives in V itself (now - V), so a hand-off between threads loses none of it.
+  // 1/64 period = 0.26 ms at 60 Hz; an Int32 of them covers 155 hours from the anchor.
+  // `At` is the Atomics object (the self-test injects one that loses a race on purpose); `out`
+  // receives [credits claimed, wall ms dropped]. The text of this function is ALSO the backstop
+  // worker's (gamecube.html bkStart, via toString) and is copied verbatim into recomp_worker.js
+  // itClaim — keep the three identical.
+  var IT_V = 243, IT_SUB = 64;
+  function itClaim(At, a, f, now, T, maxdt, out) {
+    out[0] = 0; out[1] = 0;
+    var A = f[0];
+    if (!(A > 0) || !(T > 0)) return 0;
+    var per = 1000 / T, u = per / 64;
+    for (var spin = 0; spin < 256; spin++) {
+      var v = At.load(a, 243), vt = A + v * u, dt = now - vt;
+      if (dt / per + 1e-9 < 1) return 0;
+      var nv = v, drop = 0;
+      if (dt > maxdt) {
+        nv = Math.round((now - maxdt - A) / u);
+        drop = (A + nv * u) - vt; dt = now - (A + nv * u);
+      }
+      var g = Math.floor(dt / per + 1e-9);
+      if (g < 0) g = 0;
+      nv += g * 64;
+      if (At.compareExchange(a, 243, v, nv) === v) { out[0] = g; out[1] = drop > 0 ? drop : 0; return g; }
+    }
+    return 0;
+  }
+  // Re-latch: the clock restarts at `now` with no credit owed (first grant, a hidden tab coming
+  // back, a restore). Written by the page only, but still with compareExchange so a claim racing
+  // it is either before it (and counted) or after it (and starts from the new anchor point).
+  function itRelatch(At, a, f, now, T) {
+    if (!(T > 0)) return;
+    if (!(f[0] > 0)) { At.store(a, 243, 0); f[0] = now; return; }
+    var u = 1000 / T / 64, nv = Math.round((now - f[0]) / u);
+    for (var spin = 0; spin < 256; spin++) { var v = At.load(a, 243); if (At.compareExchange(a, 243, v, nv) === v) return; }
+  }
+  // integrated-until, absolute ms (the ledger's upper bound)
+  function itUpTo(At, a, f, T) { return f[0] > 0 && T > 0 ? f[0] + At.load(a, 243) * (1000 / T / 64) : 0; }
+
   // ---- the evidence floor under `cap` ----------------------------------------------------
   // [cap-sliver 2026-08-29] Every capacity number here is `observations / observed busy time`.
   // Both terms are reset per 1s window, and NOTHING used to require that a window had actually
@@ -730,6 +785,7 @@ window.GcRate = (function () {
     function renderBusyAt(t) { return m.renderBusyMs + (m.renderBusyFrom ? t - m.renderBusyFrom : 0); }
     function stallAt(t) { return m.stallMs + (m.hiddenAt ? t - m.hiddenAt : 0); }
     m.consumed = consumed;
+    m.pool = poolNow;
     m.renderBusyAt = renderBusyAt;
 
     // ---- exact gate attribution ----------------------------------------------------------
@@ -2178,6 +2234,52 @@ window.GcRate = (function () {
     ck('26c control: the OLD two-integrator hand-off loses time on the same stalls',
        oc.consumed < oc.owed - 5, 'old consumed=' + oc.consumed + ' of ' + oc.owed);
 
+    // 27 — THE LOCK-FREE INTEGRATOR (2026-10-07): itClaim is the code all three threads run.
+    function itEnv() { var b = new ArrayBuffer(1024); return { a: new Int32Array(b), f: new Float64Array(b, 992, 3), out: [0, 0] }; }
+    var IE = itEnv(), itSum = 0, itDrop = 0, seed = 12345;
+    function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+    itRelatch(Atomics, IE.a, IE.f, 1000, 60);
+    for (var it = 1000; it <= 11000; it += 1 + Math.floor(rnd() * 9)) {   // three claimers, interleaved at random
+      var who = Math.floor(rnd() * 3), tt = it + (who === 2 ? -0.5 : 0);   // one reads a clock a hair behind
+      itClaim(Atomics, IE.a, IE.f, tt, 60, 100, IE.out); itSum += IE.out[0]; itDrop += IE.out[1];
+    }
+    itClaim(Atomics, IE.a, IE.f, 11000, 60, 100, IE.out); itSum += IE.out[0];
+    ck('27a lock-free integrator: three threads claiming at random times get exactly floor(wall x 60/s) credits',
+       itSum === 600 && itDrop === 0, 'claimed=' + itSum + ' of 600, dropped ' + itDrop.toFixed(2) + ' ms');
+    // A thread that read V and then stopped (a GC pause) before its compareExchange: the other
+    // threads keep the clock moving the whole time, and when it resumes its exchange fails and
+    // it re-reads — no span is claimed twice, none is lost.
+    var IE2 = itEnv(), sumW = 0, sumP = 0, stallClaims = 0, casLost = 0;
+    itRelatch(Atomics, IE2.a, IE2.f, 1000, 60);
+    for (var t2 = 1000; t2 < 3000; t2 += 4) {
+      if (t2 % 400 >= 376) continue;           // the page is busy elsewhere for 24 ms: a credit is pending
+      if (t2 % 400 === 0) {                    // ...then reads V at t2 and is frozen for 150 ms before its exchange
+        var frozenAt = t2, inner = 0;
+        var AtP = { store: Atomics.store,
+          load: function (a, i) {
+            var v = Atomics.load(a, i);
+            if (frozenAt >= 0) {               // the guest's thread polls every 4 ms through the freeze
+              for (var tw = frozenAt + 4; tw <= frozenAt + 150; tw += 4) { itClaim(Atomics, IE2.a, IE2.f, tw, 60, 100, IE2.out); sumW += IE2.out[0]; inner += IE2.out[0]; }
+              frozenAt = -1;
+            }
+            return v;                          // the value read BEFORE the freeze
+          },
+          compareExchange: function (a, i, e, r) { var x = Atomics.compareExchange(a, i, e, r); if (x !== e) casLost++; return x; } };
+        itClaim(AtP, IE2.a, IE2.f, t2, 60, 100, IE2.out); sumP += IE2.out[0];
+        if (inner >= 8) stallClaims++;
+        t2 += 148;
+      } else { itClaim(Atomics, IE2.a, IE2.f, t2, 60, 100, IE2.out); sumP += IE2.out[0]; }
+    }
+    itClaim(Atomics, IE2.a, IE2.f, 3000, 60, 100, IE2.out); sumP += IE2.out[0];
+    ck('27b a thread frozen between its read and its exchange holds nobody off: the guest\'s thread claimed through every 150 ms freeze, and the total is still the integral',
+       stallClaims === 5 && casLost === 5 && sumW + sumP === 120, 'freezes covered=' + stallClaims + '/5, stale exchanges retried=' + casLost + ', claimed=' + (sumW + sumP) + ' of 120 (guest thread ' + sumW + ')');
+    // a silent span longer than maxDtMs is dropped, never repaid
+    var IE3 = itEnv(); itRelatch(Atomics, IE3.a, IE3.f, 1000, 60);
+    itClaim(Atomics, IE3.a, IE3.f, 1010, 60, 100, IE3.out);
+    var g3 = itClaim(Atomics, IE3.a, IE3.f, 1400, 60, 100, IE3.out), d3 = IE3.out[1];
+    ck('27c a 390 ms silence grants at most maxDtMs of credits and reports the rest as dropped',
+       g3 === 6 && Math.abs(d3 - 300) < 1, 'granted ' + g3 + ' (6 = floor(100 ms x 60/s)), dropped ' + d3.toFixed(2) + ' ms');
+
     var summary = 'RATETEST ' + (fail === 0 ? 'ALL PASS' : 'FAILURES') + ' — ' + pass + ' passed, ' + fail + ' failed';
     log(summary);
     return { pass: pass, fail: fail, lines: lines, summary: summary };
@@ -2191,7 +2293,8 @@ window.GcRate = (function () {
            simulate: simulate, selfTest: selfTest, DEF: DEF,
            makeJitRate: makeJitRate, jitCycles: jitCycles, applyJit: applyJit,
            gapText: gapText, TARGET_FPS: TARGET_FPS, MIN_BUSY_MS: MIN_BUSY_MS,
-           GEKKO_HZ: GEKKO_HZ, CELLS: CELLS };
+           GEKKO_HZ: GEKKO_HZ, CELLS: CELLS,
+           itClaim: itClaim, itRelatch: itRelatch, itUpTo: itUpTo, IT_V: IT_V };
 })();
 </script>
 <script>
@@ -8835,16 +8938,16 @@ window.GcRate = (function () {
     pool: {
       load:  function () { return Atomics.load(paceI32, 0) + gcLsEarned; },
       add:   function (n) {
-        if (gcLsGate) { gcLsEarned += n; return; }
+        if (gcLsGate) { gcLsEarned += n; gcRaMirror(); return; }
         Atomics.add(paceI32, 0, n); Atomics.notify(paceI32, 0);
       },
-      reset: function () { gcLsEarned = 0; Atomics.store(paceI32, 0, 0); }
+      reset: function () { gcLsEarned = 0; gcRaMirror(); Atomics.store(paceI32, 0, 0); }
     }
   });
   // A hidden tab gets no rAF, so no credits and no emulated time: that is the "a long hide is a
   // pause, not a fast-forward" rule working. It must not ALSO read as the guest falling behind.
   document.addEventListener('visibilitychange', function () {
-    if (document.hidden) Atomics.store(paceI32, 241, 0);   // BK_EN: a hidden tab is a pause
+    if (document.hidden) { Atomics.store(paceI32, 241, 0); gcRaOff(); }   // BK_EN: a hidden tab is a pause (and no room frame self-releases)
     rate.setHidden(document.hidden, performance.now());
   });
 
@@ -9556,9 +9659,9 @@ window.GcRate = (function () {
     for (var k = 0; k < 16; k++) Atomics.store(I, o + 1 + k, tmp[k]);
     Atomics.store(I, o, w);
   }
-  function gcRbIssue(ls, plan) {
+  function gcRbIssue(ls, plan, ringDone) {
     var I = RBP.i32;
-    for (var i = 0; i < plan.frames.length; i++) gcRbRing(plan.frames[i].frame, plan.frames[i].image);
+    if (!ringDone) for (var i = 0; i < plan.frames.length; i++) gcRbRing(plan.frames[i].frame, plan.frames[i].image);
     Atomics.store(I, RBC.REQ_FROM, plan.from - RBP.off);
     RBP.gen++;
     Atomics.store(I, RBC.REQ_GEN, RBP.gen);
@@ -9566,6 +9669,185 @@ window.GcRate = (function () {
     if (RBP.issued.length > 512) RBP.issued.splice(0, RBP.issued.length - 512);
     RBP.rollbacks++; RBP.resimFrames += plan.frames.length;
     if (plan.depth > RBP.maxDepth) RBP.maxDepth = plan.depth;
+  }
+  // ── A ROOM'S FRAMES DO NOT WAIT ON THIS THREAD (2026-10-07) ─────────────────────────────────
+  // Every room frame used to be released here, on the main thread, and nowhere else — so any stall of
+  // this thread froze the room. MEASURED (MP4 bench room, prod mirror, 10 + 10 runs on the SwiftShader
+  // and default arms, the worker's frame-timing ring): 26 room frames held the guest clock 34-55 ms
+  // with the worker busy 0.3-10 ms of it, parked on a credit this thread did not release (Blink GC
+  // epilogues of 20-40 ms; SwiftShader holding the cores), 1-3 per room in 15 of 20 runs — one stall
+  // freezes BOTH consoles of a loopback room, which share this thread.
+  // In a ROLLBACK room the worker now releases the frame itself while this thread has been silent
+  // for RA_GAP_MS (recomp_worker.js roomSelf): the image is the engine's own prediction rule applied
+  // to the last image — this console's pad as sampled (nothing new can have been sampled: this thread
+  // samples it) and every other port's last input with its one-frame edges cleared — and the credit
+  // is claimed from the ONE integrator (GcRate.itClaim), exactly as this thread's grant would have.
+  // When this thread comes back it takes the gate back (gcRaReclaim) and RECONCILES (gcRaReconcile):
+  // each frame the worker ran is begun in the engine with exactly the pad it ran on, and the first
+  // frame whose agreed image differs from what ran (a remote input that arrived meanwhile) is
+  // re-simulated by the ordinary rollback ring, folded into the next release's plan (gcRaMergePlan).
+  // The engine stays the truth; frames are begun in it AFTER they ran, so its own clock is never led.
+  // Allowed only within the engine's window, never on a hidden or unsafe frame, never with a mode
+  // switch pending, never in a hidden tab. Delay-lockstep rooms keep the old gate: a frame there
+  // needs every port's REAL input, which only this thread receives. ?roomself=0 is the control.
+  var RA = { MODE: 4864, ALLOW: 4865, GAP: 4866, EARNED: 4867, G: 4868, N: 4869, TAKES: 4870, TOTAL: 4871,
+             WNEXT: 4872, REFUSED: 4874, LOST: 4875, WHY_ALLOW: 4876, WHY_RING: 4877, WHY_UNSAFE: 4878, WHY_W: 4879, GUESS: 4880, LOG: 4896, LOG_N: 16, LOG_S: 17, HB_BYTE: 30720 };
+  // RA_GAP_MS: two of this thread's 4 ms steps missed. The silence is counted from this thread's LAST
+  // STEP, which can be most of a frame before the next credit comes due: at 20 ms a frame whose credit
+  // fell due mid-silence waited out the rest of it plus a 4 ms poll (MEASURED: a 35.8 ms frame with the
+  // worker releasing it 26 ms into a 26 ms silence). RA_CAP: frames per silence, ~133 ms (= MAX_BACKLOG).
+  var RA_GAP_MS = 8, RA_CAP = 8;
+  var GCRA = { on: q.get('roomself') !== '0', f64: new Float64Array(rbSab, RA.HB_BYTE, 2), retro: [], begun: null, plan: null,
+               reclaims: 0, frames: 0, maxRun: 0, mispredicted: 0, waits: 0, races: 0, plans: 0, faults: 0 };
+  Atomics.store(RBP.i32, RA.GAP, RA_GAP_MS);
+  // RIG SEAM (?mtstall=MS,EVERY): once the room runs, this thread busy-waits MS ms every EVERY ms —
+  // the main-thread stall the worker's self-release covers, on demand, for the room/determinism rigs.
+  var MTSTALL = (function () { var v = q.get('mtstall'); if (!v) return null; var p = v.split(','); return { ms: +p[0] || 0, every: Math.max(50, +p[1] || 1000) }; })();
+  function gcRaStallRig() {
+    if (!MTSTALL || GCRA.stallT) return;
+    GCRA.stallT = setInterval(function () { var t = performance.now(); while (performance.now() - t < MTSTALL.ms) {} GCRA.rigStalls = (GCRA.rigStalls | 0) + 1; }, MTSTALL.every);
+  }
+  function gcRaMirror() { try { Atomics.store(RBP.i32, RA.EARNED, gcLsEarned); } catch (e) {} }
+  function gcRaBeat() { if (GCRA.on) { var nw = performance.timeOrigin + performance.now(); GCRA.silentMs = GCRA.f64[0] > 0 ? nw - GCRA.f64[0] : 0; GCRA.f64[0] = nw; } }
+  function gcRaOff() { try { Atomics.store(RBP.i32, RA.ALLOW, 0); } catch (e) {} }
+  // how many frames past r.frame the worker may release by itself
+  function gcRaAllowance(ls, r, no) {
+    var W = GCRA.allowWhy || (GCRA.allowWhy = {});
+    var why = no ? 'hidden/unsafe frame' : RBP.faulted ? 'faulted' : document.hidden ? 'tab hidden' : (RBP.safeRun | 0) < 120 ? 'boot frames' :
+              ls._modeNext ? 'mode switch pending' : ls.state !== 'running' ? 'engine ' + ls.state : typeof ls._rbFront !== 'function' ? 'no frontier' :
+              Atomics.load(RBP.i32, RBC.S_SLOTS) > RBP.budget * 0.75 ? 'ring memory' : null;
+    var a = 0;
+    if (!why) { try { a = ((ls._rbFront() | 0) + (ls.rollback | 0)) - (r.frame | 0); } catch (e) { a = 0; } if (a <= 0) why = 'window'; }
+    if (why) { W[why] = (W[why] | 0) + 1; return 0; }
+    return Math.max(0, Math.min(RA_CAP, RA.LOG_N, a));
+  }
+  // the next frame's image under the engine's rule (lib/netplay.js _rbPredict, rbEdgeBytes [0,1,2]):
+  // the last image with the edge cells (btn, dstk) cleared and the held stick kept
+  function gcRaGuess(image) {
+    var c = new Int32Array(16); gcRbCells(image, c, 0);
+    for (var p = 0; p < PAD_PORTS; p++) { c[p * 4] = 0; c[p * 4 + 1] = 0; }
+    return c;
+  }
+  // inside the release's gate section: stores only
+  function gcRaArm(allow, guess, wnext) {
+    var R = RBP.i32;
+    if (allow > 0 && guess) {
+      for (var k = 0; k < 16; k++) Atomics.store(R, RA.GUESS + k, guess[k]);
+      Atomics.store(R, RA.WNEXT, wnext);
+    }
+    Atomics.store(R, RA.ALLOW, allow > 0 && guess ? allow : 0);
+    Atomics.store(R, RA.MODE, 0);
+  }
+  // Take the worker's frames back; false = it is mid-release (back in one step). The worker stays
+  // ARMED for what is left of its allowance (same guess, the next frame on): reconciling, and whatever
+  // stops this thread next, must not leave the clock with nobody to keep it.
+  function gcRaReclaim() {
+    var R = RBP.i32, m = Atomics.load(R, RA.MODE);
+    if (m === 0) return true;
+    if (m === 2) { Atomics.store(R, RA.MODE, 0); return true; }    // this thread's own, left by a throw
+    for (var i = 0; i < 64 && m === 3; i++) m = Atomics.load(R, RA.MODE);
+    if (m !== 1 || Atomics.compareExchange(R, RA.MODE, 1, 2) !== 1) return false;
+    var n = Atomics.load(R, RA.N), G = Atomics.load(R, RA.G), lost = Atomics.load(R, RA.LOST);
+    for (var k = 0; k < n; k++) {
+      var o = RA.LOG + k * RA.LOG_S, c = new Int32Array(16);
+      for (var j = 0; j < 16; j++) c[j] = Atomics.load(R, o + 1 + j);
+      GCRA.retro.push({ w: Atomics.load(R, o), cells: c });
+    }
+    // the credits it claimed are wall-clock-earned emulated time, as the backstop's are
+    gcLsEarned += G - n; gcRaMirror();
+    Atomics.store(R, RA.N, 0); Atomics.store(R, RA.G, 0); Atomics.store(R, RA.LOST, 0);
+    Atomics.store(R, RA.WNEXT, Atomics.load(R, RA.WNEXT) + n);
+    Atomics.store(R, RA.ALLOW, Math.max(0, Atomics.load(R, RA.ALLOW) - n));
+    Atomics.store(R, RA.MODE, 0);
+    GCRA.reclaims++; GCRA.frames += n; if (n > GCRA.maxRun) GCRA.maxRun = n;
+    if (n > 0 && !GCRA.batch) GCRA.batch = { n: 0, silentMs: Math.round(GCRA.silentMs || 0), from: GCRA.retro[0].w + RBP.off, mis0: GCRA.mispredicted };
+    if (GCRA.batch) GCRA.batch.n += n;
+    if (G > 0) rate.absorbExternal(G, performance.now(), true);
+    if (lost > 0) rate.lostCredits += lost;
+    if (n > 0) GCLS.pendingAck = GCRA.retro[GCRA.retro.length - 1].w;   // its last frame may not be latched yet
+    return true;
+  }
+  function gcRaFault(ls, why) {
+    GCRA.faults++; GCLS.fault = why; gcLsSay('⚠ ' + why);
+    try { if (typeof ls.fail === 'function') ls.fail(why); } catch (e) {}
+    GCRA.retro.length = 0; GCRA.begun = null; GCRA.plan = null;
+  }
+  // a pad object for beginFrame carrying exactly what the worker latched on this console's ports
+  function gcRaPads(ls, cells) {
+    var known = (ls.localPorts && ls.localPorts.length) ? ls.localPorts : (GCLS.role === 'host' ? [0] : []);
+    var out = {};
+    for (var k = 0; k < known.length; k++) {
+      var p = known[k], o = p * 4, b = new Uint8Array(LS_PAD_BYTES);
+      if (p < 0 || p >= PAD_PORTS) continue;
+      b[0] = cells[o] & 0xFF; b[1] = (cells[o] >> 8) & 0xFF; b[2] = cells[o + 1] & 0xFF;
+      b[4] = cells[o + 2] & 0xFF; b[5] = cells[o + 3] & 0xFF;
+      out[p] = b;
+    }
+    return out;
+  }
+  function gcRaNote(from) {
+    if (!GCRA.plan) GCRA.plan = { from: from, map: GCRA.map || new Map() };
+    else if (from < GCRA.plan.from) GCRA.plan.from = from;
+  }
+  // Begin, in the engine, every frame the worker ran. false = the engine is not ready for one yet
+  // (its window, a stall): asked again next step, and nothing new is released before.
+  function gcRaReconcile(ls) {
+    if (!GCRA.map) GCRA.map = new Map();
+    var tmp = new Int32Array(16);
+    while (GCRA.retro.length) {
+      var x = GCRA.retro[0], e = x.w + RBP.off, r;
+      if (GCRA.begun) {
+        if ((GCRA.begun.frame | 0) !== e) { gcRaFault(ls, 'the worker ran frame ' + e + ' while the engine had begun ' + GCRA.begun.frame); return false; }
+        r = GCRA.begun; GCRA.begun = null;
+      } else {
+        if ((ls.frame | 0) !== e) { gcRaFault(ls, 'the worker ran frame ' + e + ' but the engine is at ' + ls.frame); return false; }
+        r = ls.beginFrame(gcRaPads(ls, x.cells));
+        if (!r || !r.ready) { GCRA.waits++; GCLS.stallReason = 'reconciling the worker\'s frames: ' + (r ? r.reason : 'no answer'); return false; }
+      }
+      GCRA.retro.shift();
+      if (r.rollback) {
+        gcRaNote(r.rollback.from);
+        for (var i = 0; i < r.rollback.frames.length; i++) GCRA.map.set(r.rollback.frames[i].frame, r.rollback.frames[i].image);
+      }
+      GCRA.map.set(e, r.image);
+      gcRbCells(r.image, tmp, 0);
+      var same = true;
+      for (var k = 0; k < 16; k++) if ((tmp[k] | 0) !== (x.cells[k] | 0)) { same = false; break; }
+      if (!same) { GCRA.mispredicted++; gcRaNote(e); }
+      gcLatWitness(ls, r);
+      ls.endFrame(null);
+      GCLS.fedTo = e + 1; GCLS.framesFed++; GCLS.modeFrames.rollback++;
+      if (ls.rollback > 0 && typeof ls.takeHashDue === 'function') { var due = ls.takeHashDue(); for (var di = 0; di < due.length; di++) RBP.due.push(due[di]); }
+    }
+    if (!GCRA.plan) GCRA.map.clear();
+    var B = GCRA.batch;
+    if (B) {
+      GCRA.batch = null;
+      gcLsSay('this thread was stopped ' + B.silentMs + ' ms; the worker kept the clock for ' + B.n + ' frame(s) from ' + B.from +
+              ' — agreed in the engine, ' + (GCRA.mispredicted - B.mis0) + ' ran on a guess the room contradicted' +
+              (GCRA.plan ? ', re-simulating from ' + GCRA.plan.from : ''));
+    }
+    return true;
+  }
+  // The re-simulation the next release carries: the engine's own plan, widened back to the first
+  // frame a reconciliation found the worker ran on a wrong guess. Ring slots written here (before the
+  // release takes the gate); the request itself is published inside it.
+  function gcRaMergePlan(r) {
+    var rp = r.rollback, P = GCRA.plan, i;
+    if (!P) {
+      if (!rp) return null;
+      for (i = 0; i < rp.frames.length; i++) gcRbRing(rp.frames[i].frame, rp.frames[i].image);
+      return { from: rp.from, frames: rp.frames, depth: rp.depth };
+    }
+    if (rp) for (i = 0; i < rp.frames.length; i++) P.map.set(rp.frames[i].frame, rp.frames[i].image);
+    var from = rp && rp.from < P.from ? rp.from : P.from, frames = [];
+    for (var e = from; e < r.frame; e++) {
+      var img = P.map.get(e);
+      if (!img) { gcRaFault(gcLsEngine(), 'no agreed image for frame ' + e + ' in a re-simulation from ' + from); return null; }
+      gcRbRing(e, img);
+      frames.push({ frame: e, image: img });
+    }
+    return { from: from, frames: frames, depth: r.frame - from, merged: true };
   }
   function gcRbArm() {
     RBP.armGen++;
@@ -9682,6 +9964,13 @@ window.GcRate = (function () {
                 fpHit: g(89), fpMiss: g(90), fpStale: g(91),
                 restoreMsPerRewind: +(g(RBC.S_RESTORE_US) / 1000 / Math.max(1, g(RBC.S_ROLLBACKS))).toFixed(3) },
       engine: eng,
+      // A ROOM'S FRAMES DO NOT WAIT ON THIS THREAD: how often the worker kept the clock, and what it cost
+      roomSelf: { on: GCRA.on, reclaims: GCRA.reclaims, frames: GCRA.frames, maxRun: GCRA.maxRun, mispredicted: GCRA.mispredicted,
+                  plans: GCRA.plans, waits: GCRA.waits, races: GCRA.races, faults: GCRA.faults, pending: GCRA.retro.length,
+                  takes: g(RA.TAKES), workerFrames: g(RA.TOTAL), refused: g(RA.REFUSED), allow: g(RA.ALLOW), mode: g(RA.MODE), rigStalls: GCRA.rigStalls | 0,
+                  // polls (2 ms) with this thread silent and no frame released, by reason
+                  whyNot: { allow0: g(RA.WHY_ALLOW), ring: g(RA.WHY_RING), unsafe: g(RA.WHY_UNSAFE), wnext: g(RA.WHY_W), cap: g(RA.REFUSED) },
+                  allowWhy: GCRA.allowWhy },
     };
   }
   function gcLsEngine() {
@@ -9969,6 +10258,7 @@ window.GcRate = (function () {
   }
   function gcLsStep() {
     var ls = gcLsEngine();
+    gcRaBeat();
     // LEFT THE ROOM (Leave closed the session): nobody holds this console's frames any more, so
     // the game is handed back to the solo clock instead of staying frozen behind a gate whose
     // room no longer exists. Credits the clock earned while gated go back through the model's
@@ -9978,13 +10268,15 @@ window.GcRate = (function () {
       Atomics.store(paceI32, LS_ARMED, 0);
       if (RBP.scheme) { RBP.scheme = false; RBP.stopGen++; Atomics.store(RBP.i32, RBC.HIDDEN, 0); Atomics.store(RBP.i32, RBC.STOP_GEN, RBP.stopGen); }
       GCLS.armed = false; GCLS.running = false; GCLS.pendingAck = -1;
-      var owed = Math.min(gcLsEarned, MAX_BACKLOG); gcLsEarned = 0;
+      gcRaOff(); gcRaReclaim(); GCRA.retro.length = 0; GCRA.begun = null; GCRA.plan = null;
+      var owed = Math.min(gcLsEarned, MAX_BACKLOG); gcLsEarned = 0; gcRaMirror();
       if (owed > 0) { Atomics.add(paceI32, 0, owed); Atomics.notify(paceI32, 0); }
       gcLsSay('left the room — this console plays on by itself from frame ' + Atomics.load(paceI32, PAD_ACK));
       return;
     }
     if (!GCLS.armed || !ls) return;
     if (ls.state !== 'running' && ls.state !== 'stalled') {
+      gcRaOff();
       if (GCLS.running) {
         GCLS.running = false;
         gcLsSay('frame gate DISENGAGED — engine state ' + ls.state + '; nothing advances until the room is back');
@@ -9997,7 +10289,8 @@ window.GcRate = (function () {
       // THIS CONSOLE'S OWN CLOCK STARTS HERE (see NEVER PAST ITS OWN WALL CLOCK below). Credits the
       // clock earned while the barrier held are dropped, not run as a burst at release: they
       // measured +6.7 frames past real time half a second into every room.
-      GCLS.clockT0 = performance.now(); GCLS.clockF0 = Atomics.load(paceI32, PAD_ACK); gcLsEarned = 0;
+      GCLS.clockT0 = performance.now(); GCLS.clockF0 = Atomics.load(paceI32, PAD_ACK); gcLsEarned = 0; gcRaMirror();
+      gcRaOff(); GCRA.retro.length = 0; GCRA.begun = null; GCRA.plan = null; gcRaStallRig();
       GCLS.fedTo = ls.frame;
       GCLS.startFrame = ls.frame;     // the party's "everyone started together at frame N"
       GCLS.ports = (ls.localPorts || []).slice();
@@ -10045,6 +10338,12 @@ window.GcRate = (function () {
     // (waitInputMs — the gate). Neither accrues while nothing is owed.
     var nowMs = performance.now(), stepDt = GCLS.lastStepAt ? Math.min(100, nowMs - GCLS.lastStepAt) : 0;
     GCLS.lastStepAt = nowMs; GCLS.runMs += stepDt;
+    // THE WORKER MAY HAVE RUN FRAMES WHILE THIS THREAD WAS STOPPED (A ROOM'S FRAMES DO NOT WAIT ON
+    // THIS THREAD): take the gate back, and agree every one of them in the engine before anything new.
+    if (GCRA.on && RBP.scheme) {
+      if (!gcRaReclaim()) { GCLS.waitWorkerMs += stepDt; return; }
+      if (GCRA.retro.length && !gcRaReconcile(ls)) { GCLS.waitInputMs += stepDt; return; }
+    }
     // One frame in flight at a time — the pad cells are a single slot (see the header).
     if (GCLS.pendingAck >= 0) {
       if (Atomics.load(paceI32, PAD_ACK) === GCLS.pendingAck) { if (gcLsEarned > 0) GCLS.waitWorkerMs += stepDt; return; }   // not latched yet
@@ -10104,9 +10403,16 @@ window.GcRate = (function () {
       } else if ((RBP.safeRun | 0) < 120) { GCLS.waitWorkerMs += stepDt; return; }
     }
     GCLS.bfCalls++;
-    var pads = gcLsLocalPads();
-    gcLatNote(ls, pads);
-    var r = ls.beginFrame(pads, hidden ? { hidden: true } : undefined);
+    var r;
+    if (GCRA.begun) {
+      // begun in the engine on an earlier step, whose release the worker pre-empted (it took the
+      // gate while this thread was stopped inside beginFrame) without running a frame: release it now
+      r = GCRA.begun; GCRA.begun = null; hidden = !!r.hidden;
+    } else {
+      var pads = gcLsLocalPads();
+      gcLatNote(ls, pads);
+      r = ls.beginFrame(pads, hidden ? { hidden: true } : undefined);
+    }
     if (unsafe && r && r.ready && (r.predicted || r.rollback)) {
       if (r.rollback) {
         GCLS.fault = 'a correction (frame ' + r.rollback.from + ') arrived at a frame start the recomp cannot rewind from';
@@ -10116,7 +10422,6 @@ window.GcRate = (function () {
       RBP.unsafeWaits++; GCLS.waitInputMs += stepDt; GCLS.stallReason = 'boot frame: waiting for every input';
       return;                          // asked again next step; the engine re-uses this frame's own pad
     }
-    if (unsafe) RBP.unsafeFrames++;
     if (!r || !r.ready) {
       GCLS.waitInputMs += stepDt;
       GCLS.bfStall++;
@@ -10126,12 +10431,44 @@ window.GcRate = (function () {
       // ROLLBACK TIME SYNC (a room that is not adaptive): the engine withholds ONE frame because
       // this console is ahead. That is a slowdown, the direction gate 9 allows — the credit is
       // spent, not banked, or the next step would simply run the frame and undo the wait.
-      if (r && r.reason === 'advantage' && gcLsEarned > 0) gcLsEarned--;
+      if (r && r.reason === 'advantage' && gcLsEarned > 0) { gcLsEarned--; gcRaMirror(); }
       if (hidden) RBP.catchUp = 0;     // a catch-up that was not ready is re-measured, never owed twice
       return;                          // STALL. Lockstep never predicts; rollback stalls only at its window.
     }
+    // Everything this release publishes is prepared BEFORE the gate is taken (A ROOM'S FRAMES DO
+    // NOT WAIT ON THE PAGE'S MAIN THREAD): ring slots are harmless until a request names them, and
+    // the section that holds the gate below only stores into the SABs.
+    var keep = -1, plan = null, guess = null, allow = 0;
+    if (RBP.scheme) {
+      // The worker carries a plan out at the next frame boundary, re-simulating through THIS frame
+      // too (it latches this frame's input before it gets there), so this image goes in the ring.
+      if (ls.rollback > 0 || GCRA.plan) gcRbRing(r.frame, r.image);
+      plan = gcRaMergePlan(r);         // the engine's correction, with any a reconciliation found folded in
+      if (ls.rollback > 0) {
+        // the earliest frame start a rollback can still name: one past the engine's frontier
+        // ...and never fewer frame starts than the engine's ring contract (rbRingFrames(): the deepest
+        // window this room has run, plus margin — a drop/undrop or a window change may reach that far).
+        keep = r.frame;
+        try { if (typeof ls._rbFront === 'function') keep = Math.min(r.frame, (ls._rbFront() | 0) + 1); } catch (e) {}
+        try { if (typeof ls.rbRingFrames === 'function') keep = Math.min(keep, r.frame - (ls.rbRingFrames() | 0)); } catch (e) {}
+      } else {
+        // A DELAY frame of a capacity-gated room: final as it runs; nothing to keep behind it.
+        keep = r.frame;
+      }
+      if (plan) keep = Math.min(keep, plan.from);   // the plan just issued still needs its base
+      if (GCRA.on && ls.rollback > 0) { allow = gcRaAllowance(ls, r, hidden || unsafe); if (allow > 0) guess = gcRaGuess(r.image); }
+    }
+    // ── THE RELEASE: the gate is this thread's for a handful of stores ─────────────────────────
+    if (GCRA.on && RBP.scheme && Atomics.compareExchange(RBP.i32, RA.MODE, 0, 2) !== 0) {
+      // The worker took the gate while this thread was stopped inside beginFrame (its silence passed
+      // GAP): it is running ITS guess of this frame. The frame is begun in the engine and NOT released;
+      // gcRaReconcile compares it with what the worker ran (or this step releases it, if it ran none).
+      GCRA.begun = r; GCRA.races++;
+      return;
+    }
     GCLS.stalling = false; GCLS.waitingOn = []; GCLS.stallReason = null;
     gcLatWitness(ls, r);
+    if (unsafe) RBP.unsafeFrames++;
     if (RBP.scheme) {
       if (ls.rollback > 0) {
         // BACK TO ROLLBACK AFTER INPUT DELAY (the capacity gate, lib/netplay.js _capDecide, with
@@ -10143,29 +10480,18 @@ window.GcRate = (function () {
         // because the worker can only arm at the NEXT frame boundary (MEASURED: a 4-player room
         // faulted 2 frames after the capacity gate returned it to rollback, before this).
         if (RBP.stale) { RBP.stale = false; RBP.rearms++; gcLsSay('zero-lag mode again at frame ' + r.frame + ' — the ring was kept through the input-delay stretch'); }
-        // The worker carries a plan out at the next frame boundary, re-simulating through THIS frame
-        // too (it latches this frame's input before it gets there), so this image goes in the ring.
-        gcRbRing(r.frame, r.image);
-        if (r.rollback) gcRbIssue(ls, r.rollback);
-        // the earliest frame start a rollback can still name: one past the engine's frontier
-        // ...and never fewer frame starts than the engine's ring contract (rbRingFrames(): the deepest
-        // window this room has run, plus margin — a drop/undrop or a window change may reach that far).
-        var keep = r.frame;
-        try { if (typeof ls._rbFront === 'function') keep = Math.min(r.frame, (ls._rbFront() | 0) + 1); } catch (e) {}
-        try { if (typeof ls.rbRingFrames === 'function') keep = Math.min(keep, r.frame - (ls.rbRingFrames() | 0)); } catch (e) {}
-        if (r.rollback) keep = Math.min(keep, r.rollback.from);   // the plan just issued still needs its base
-        Atomics.store(RBP.i32, RBC.KEEP, keep - RBP.off);
-      } else {
-        // A DELAY frame of a capacity-gated room: final as it runs; nothing to keep behind it.
-        RBP.stale = true;
-        Atomics.store(RBP.i32, RBC.KEEP, r.frame - RBP.off);
-      }
+      } else RBP.stale = true;
+      if (plan) gcRbIssue(ls, plan, true);
+      if (plan && (plan.merged || plan.depth > 4)) gcLsSay('re-simulating ' + plan.depth + ' frame(s) from ' + plan.from + (plan.merged ? ' (a reconciliation widened the engine\'s plan' + (r.rollback ? ' from ' + r.rollback.from : '') + ')' : ''));
+      if (plan && plan.merged) { GCRA.plan = null; GCRA.map.clear(); GCRA.plans++; }
+      Atomics.store(RBP.i32, RBC.KEEP, keep - RBP.off);
       Atomics.store(RBP.i32, RBC.HIDDEN, hidden ? 1 : 0);
     }
     gcLsWriteImage(r.image);
     GCLS.pendingAck = Atomics.load(paceI32, PAD_ACK);
     if (hidden) { RBP.catchUp = Math.max(0, RBP.catchUp - 1); RBP.hidden++; rate.granted++; }
-    else gcLsEarned--;
+    else { gcLsEarned--; gcRaMirror(); }
+    if (GCRA.on && RBP.scheme) gcRaArm(allow, guess, GCLS.pendingAck + 1);   // and hand the gate back
     Atomics.add(paceI32, 0, 1); Atomics.notify(paceI32, 0);   // exactly one frame
     GCLS.fedTo = r.frame + 1; GCLS.framesFed++;
     GCLS.modeFrames[unsafe ? 'unsafe' : ls.rollback > 0 ? 'rollback' : (RBP.scheme ? 'delay' : 'lockstep')]++;
@@ -10394,7 +10720,10 @@ window.GcRate = (function () {
     GCLS.wantDeclare = true;
     gcLsDeclare();
     gcNetPartySync();
-    setInterval(gcLsStep, 4);   // rAF alone would cap the feed at the display refresh
+    // rAF alone would cap the feed at the display refresh. The step CLAIMS what the clock owes first
+    // (grantNow), so a step means "everything due was released" — the worker's self-release (A ROOM'S
+    // FRAMES DO NOT WAIT ON THIS THREAD) counts this thread's silence from it.
+    setInterval(function () { grantNow(); gcLsStep(); }, 4);
     return true;
   }
   // ── READY MEANS THE RENDERER HAS CAUGHT UP (2026-10-05, live prod 3e4e160) ───────────────────
@@ -10598,6 +10927,12 @@ window.GcRate = (function () {
   // frame-timing ring): frames whose clock stood 35-50 ms with the worker busy only 0-6 ms of it —
   // waiting on a credit this thread was too busy to grant — in most runs. At 20 ms (more than two of
   // this thread's 8 ms ticks missed) the backstop takes over before the guest misses a second frame.
+  // [2026-10-07] 20 -> 10 ms. The silence is counted from this thread's LAST GRANT, which can be most of a
+  // frame before the next credit falls due, so at 20 ms a credit due mid-silence waited out the rest of
+  // the gap plus a poll: MEASURED (solo, prod mirror, worker frame-timing ring) frames parked 35-50 ms
+  // with the worker busy 0-2 ms and the guest's own thread granting (frames 295, 456, 916, 997 of four
+  // runs). At 10 ms (one 8 ms tick and its jitter) plus the guest thread's 2 ms poll the worst frame is
+  // 16.7 + 10 + 2 ms. A grant by another thread is never extra time: they all claim the ONE integrator.
   // So a backstop: a tiny worker that, only while this thread has not granted for BK_GAP_MS, adds
   // credits to the SAB pool at exactly TARGET per second (backlog-capped like grant()). When this
   // thread comes back, grantNow absorbs them (rate.absorbExternal) so every credit is counted once.
@@ -10620,77 +10955,80 @@ window.GcRate = (function () {
   // thread integrates past its own now, nor re-integrates the other's span), never less.
   // Short lag is still repaid from the backlog (MAX_BACKLOG credits, ~133 ms); only a stall past
   // MAX_DT_MS or a backlog overflow is dropped, and both are COUNTED (__gcPace below).
-  //   IT_LOCK   spin lock around the integrator (critical section: a few loads and stores)
+  //   IT_V      [2026-10-07: replaced the spin lock IT_LOCK] the integrator's whole state, one
+  //             Int32 claimed by compareExchange (GcRate.itClaim — THE ONE INTEGRATOR, LOCK-FREE)
   //   BK_LOST   credits the backstop could not place because the backlog was full
   //   BK_DROPMS wall ms the backstop dropped under the same MAX_DT_MS rule grant() applies
-  //   f64 @992  [0] integrated-until (abs ms)  [1] fractional credit  [2] this thread's last grant
-  var BK_HB = 240, BK_EN = 241, BK_GRANTED = 242, IT_LOCK = 243, BK_LOST = 244, BK_DROPMS = 245, BK_GAP_MS = 20;
+  //   f64 @992  [0] the integrator's anchor A (abs ms, written once)  [1] unused  [2] this thread's last grant
+  var BK_HB = 240, BK_EN = 241, BK_GRANTED = 242, IT_V = GcRate.IT_V, BK_LOST = 244, BK_DROPMS = 245, BK_GAP_MS = 10;
   var paceF64 = new Float64Array(pace, 992, 3);      // cells 248-253; 254/255 untouched
-  var bkAbsorbed = 0, bkWorker = null;
+  var bkAbsorbed = 0, bkWorker = null, itOut = [0, 0];
   function bkStart() {
     if (bkWorker || typeof Worker !== 'function') return;
-    var src = 'onmessage=function(e){var a=new Int32Array(e.data.sab),f=new Float64Array(e.data.sab,992,3),' +
-      'T=e.data.target,MAXB=e.data.maxb,GAP=e.data.gap,MAXDT=e.data.maxdt;' +
+    // GcRate.itClaim's own text, so the backstop runs the exact arithmetic the page does
+    var src = 'var itClaim=' + GcRate.itClaim.toString() + ';' +
+      'onmessage=function(e){var a=new Int32Array(e.data.sab),f=new Float64Array(e.data.sab,992,3),' +
+      'T=e.data.target,MAXB=e.data.maxb,GAP=e.data.gap,MAXDT=e.data.maxdt,o=[0,0];' +
       'for(;;){Atomics.wait(a,255,0,4);' +
       'if(!Atomics.load(a,' + BK_EN + ')||Atomics.load(a,' + LS_ARMED + '))continue;' +
       'var now=performance.timeOrigin+performance.now();' +
       'if(!(f[2]>0)||!(f[0]>0)||now-f[2]<GAP)continue;' +
-      'if(Atomics.compareExchange(a,' + IT_LOCK + ',0,1)!==0)continue;' +
-      'var g=0;if(now-f[2]>=GAP&&Atomics.load(a,' + BK_EN + ')){var dt=now-f[0];if(dt>0){' +
-      'if(dt>MAXDT){Atomics.add(a,' + BK_DROPMS + ',Math.round(dt-MAXDT));dt=MAXDT;}' +
-      'var acc=f[1]+dt*T/1000;g=Math.floor(acc);acc-=g;var room=MAXB-Atomics.load(a,0);if(room<0)room=0;' +
+      'var g=itClaim(Atomics,a,f,now,T,MAXDT,o);if(o[1]>0)Atomics.add(a,' + BK_DROPMS + ',Math.round(o[1]));' +
+      'if(g<=0)continue;var room=MAXB-Atomics.load(a,0);if(room<0)room=0;' +
+      'if(!Atomics.load(a,' + BK_EN + ')||Atomics.load(a,' + LS_ARMED + '))room=0;' +
       'if(g>room){Atomics.add(a,' + BK_LOST + ',g-room);g=room;}' +
-      'if(g>0){Atomics.add(a,0,g);Atomics.add(a,' + BK_GRANTED + ',g);}f[0]=now;f[1]=acc;}}' +
-      'Atomics.store(a,' + IT_LOCK + ',0);if(g>0)Atomics.notify(a,0);}};';
+      'if(g>0){Atomics.add(a,0,g);Atomics.add(a,' + BK_GRANTED + ',g);Atomics.notify(a,0);}}};';
     try {
       bkWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
       bkWorker.postMessage({ sab: pace, target: TARGET, maxb: MAX_BACKLOG, gap: BK_GAP_MS, maxdt: MAX_DT_MS });
     } catch (e) { bkWorker = null; console.log('[recomp-live] backstop clock unavailable: ' + e); }
   }
   var paceT0 = 0, paceB = null;                       // the ledger's anchor: first credit after boot/restore
+  // No lock (GcRate.itClaim): this thread can stop anywhere in here — a GC pause, a long task —
+  // and the backstop and the guest's own thread keep claiming from the same integrator.
   function grantNow() {
-    var t = performance.now(), org = performance.timeOrigin;
-    // The backstop's critical section is a handful of loads and stores; if it is mid-section
-    // (or was preempted inside it) skip this tick — the 8 ms timer comes straight back.
-    var got = false;
-    for (var i = 0; i < 64 && !got; i++) got = Atomics.compareExchange(paceI32, IT_LOCK, 0, 1) === 0;
-    if (!got) return;
-    var absorbN = 0;
-    try {
-      // what the backstop clocks granted is absorbed into the model AFTER the lock is released
-      // (absorbExternal with shared=true does not touch the integrator; it allocates, and a GC pause
-      // inside the lock would hold the guest's own thread off the clock)
-      var g = Atomics.load(paceI32, BK_GRANTED), d = g - bkAbsorbed;
-      if (d > 0) { bkAbsorbed = g; absorbN = d; }
-      Atomics.store(paceI32, BK_EN, (TARGET > 0 && !gcLsGate && !document.hidden && !Atomics.load(paceI32, 5)) ? 1 : 0);
-      // Resume the ONE integrator from wherever it got to, whichever thread advanced it. A model
-      // with no clock yet (first grant, or just restored) keeps its own latch instead.
-      if (rate.lastT && paceF64[0] > 0) { rate.lastT = paceF64[0] - org; rate.credAcc = paceF64[1]; }
-      // Never integrate a span the other thread already covered (its clock may read a hair ahead).
-      if (rw && !document.hidden && !(rate.lastT > t)) {
-        var g0 = rate.granted, lt0 = rate.lastT;
-        var b0 = paceT0 ? null : { g: g0, l: rate.lostCredits + Atomics.load(paceI32, BK_LOST), s: rate.stallMs + Atomics.load(paceI32, BK_DROPMS) };
-        rate.grant(t);
-        // the ledger is anchored where its first grant's integration began (the previous latch)
-        if (!paceT0 && rate.granted > g0) { paceT0 = lt0; paceB = b0; }
+    var t = performance.now(), org = performance.timeOrigin, now = org + t;
+    var g = Atomics.load(paceI32, BK_GRANTED), d = g - bkAbsorbed, absorbN = 0;
+    if (d > 0) { bkAbsorbed = g; absorbN = d; }
+    Atomics.store(paceI32, BK_EN, (TARGET > 0 && !gcLsGate && !document.hidden && !Atomics.load(paceI32, 5)) ? 1 : 0);
+    if (rw && !document.hidden && TARGET > 0) {
+      if (!rate.lastT || !(paceF64[0] > 0)) {
+        // the model's clock starts (first grant, back from a hidden tab, a restore): the ONE
+        // integrator restarts here with nothing owed — exactly the old latch
+        GcRate.itRelatch(Atomics, paceI32, paceF64, now, TARGET);
+        rate.lastT = t;
+      } else {
+        var dtm = t - rate.lastT;
+        if (dtm > rate.gapMaxMs) rate.gapMaxMs = dtm;
+        var vt0 = GcRate.itUpTo(Atomics, paceI32, paceF64, TARGET);
+        var c = GcRate.itClaim(Atomics, paceI32, paceF64, now, TARGET, MAX_DT_MS, itOut);
+        if (itOut[1] > 0) rate.stallMs += itOut[1];
+        if (c > 0) {
+          var room = MAX_BACKLOG - rate.pool();
+          if (room < 0) room = 0;
+          if (c > room) { rate.lostCredits += c - room; c = room; }
+          if (!paceT0) { paceT0 = vt0 - org; paceB = { g: rate.granted, l: rate.lostCredits - (itOut[0] - c) + Atomics.load(paceI32, BK_LOST), s: rate.stallMs - itOut[1] + Atomics.load(paceI32, BK_DROPMS) }; }
+          if (c > 0) rate.pokeCredits(c, t);
+        }
+        rate.lastT = t;
       }
-      if (rate.lastT) { paceF64[0] = rate.lastT + org; paceF64[1] = rate.credAcc; }
-      paceF64[2] = org + t;
-    } finally { Atomics.store(paceI32, IT_LOCK, 0); }
+    }
+    paceF64[2] = now;
     if (absorbN > 0) rate.absorbExternal(absorbN, t, true);
     Atomics.add(paceI32, BK_HB, 1);
   }
   // PACING LEDGER (cheap; read by rigs). `leak` is the integrator's honesty check: wall-clock
   // credits since the first grant, up to where the integrator has got, minus everything it
-  // accounted for (granted by either thread, clamped by the backlog, dropped as a stall, still
-  // fractional). 0 means not one credit of wall time went missing. Solo only, no savestate
-  // pokes (a poke grants credits the clock did not earn; a restore re-anchors the ledger).
+  // accounted for (granted by any thread, clamped by the backlog, dropped as a stall). The
+  // integrator moves only by whole credits or by a drop, so 0 means not one credit of wall time
+  // went missing. Solo only, no savestate pokes (a poke grants credits the clock did not earn; a
+  // restore re-anchors the ledger).
   window.__gcPace = function () {
     var T = TARGET / 1000;
     var bkLost = Atomics.load(paceI32, BK_LOST), bkDrop = Atomics.load(paceI32, BK_DROPMS);
-    var upTo = paceF64[0] - performance.timeOrigin, unabsorbed = Atomics.load(paceI32, BK_GRANTED) - bkAbsorbed;
+    var upTo = GcRate.itUpTo(Atomics, paceI32, paceF64, TARGET) - performance.timeOrigin, unabsorbed = Atomics.load(paceI32, BK_GRANTED) - bkAbsorbed;
     var acct = paceB ? (rate.granted + unabsorbed - paceB.g) + (rate.lostCredits + bkLost - paceB.l)
-                       + (rate.stallMs + bkDrop - paceB.s) * T + paceF64[1] : 0;
+                       + (rate.stallMs + bkDrop - paceB.s) * T : 0;
     return { t: performance.now(), granted: rate.granted, consumed: rate.consumed(), pool: Atomics.load(paceI32, 0),
       lost: rate.lostCredits + bkLost, stallMs: rate.stallMs + bkDrop, gapMaxMs: rate.gapMaxMs,
       bk: Atomics.load(paceI32, BK_GRANTED), absorbN: rate.absorbN, padAck: Atomics.load(paceI32, PAD_ACK),

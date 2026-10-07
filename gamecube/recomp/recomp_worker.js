@@ -1326,37 +1326,130 @@ function ftBusyEnd() { if (ftBusyStart) ftBusyMs = performance.now() - ftBusySta
 // time parked this guest on an empty pool for 36-120 ms at a stretch, six times in 0.3 s (frames
 // 864-881) — the main thread's timers and the backstop's 4 ms polls both late. The one thread that
 // is certainly awake when the guest is waiting is this one, so while it waits it runs the same
-// backstop step itself, on the same shared integrator under the same lock (the arithmetic is the
+// backstop step itself, on the same shared integrator (lock-free since 2026-10-07; the arithmetic is the
 // backstop worker's, copied): credits are still exactly the wall-clock integral, never more —
 // whichever of the three threads advances the clock, the other two resume from where it stopped,
 // and the page absorbs what was granted here through BK_GRANTED like the backstop's.
 // boot msg `bk` = { target, maxb, gap, maxdt } (absent: the worker waits as before).
-const BK_EN = 241, BK_GRANTED = 242, IT_LOCK = 243, BK_LOST = 244, BK_DROPMS = 245, BK_POLL_MS = 4;
-// counters for rigs (__gcFrameTiming): credits this thread granted, and the times it found the page
-// silent past the gap but the integrator's lock held (the page's thread stopped INSIDE its grant)
+const BK_EN = 241, BK_GRANTED = 242, IT_V = 243, BK_LOST = 244, BK_DROPMS = 245, BK_POLL_MS = 2;   // 4 -> 2 ms 2026-10-07: a parked guest is a wakeup per poll, nothing more
+// counters for rigs (__gcFrameTiming): credits this thread granted, and (until 2026-10-07, when the
+// integrator stopped having a lock) the times it found the page's integrator lock held — now always 0
 const SG_GRANTED = 223, SG_LOCKBUSY = 224;
 let bkCfg = null, paceF64 = null;
+// ── THE ONE INTEGRATOR, LOCK-FREE (2026-10-07) ── gamecube.html GcRate.itClaim, VERBATIM (the page's
+// backstop worker runs the same text through toString). The integrator's whole state is ONE Int32
+// (pace cell 243, V) claimed by compareExchange, so no thread — this one, the page's main thread in a
+// GC pause, the backstop — can ever hold the others off the clock. MEASURED before: 3 of 20 SwiftShader
+// solo runs parked this guest 34-50 ms on an empty pool while the page's thread sat inside its grant
+// holding the old spin lock (SG_LOCKBUSY 1 in each).
+function itClaim(At, a, f, now, T, maxdt, out) {
+  out[0] = 0; out[1] = 0;
+  var A = f[0];
+  if (!(A > 0) || !(T > 0)) return 0;
+  var per = 1000 / T, u = per / 64;
+  for (var spin = 0; spin < 256; spin++) {
+    var v = At.load(a, 243), vt = A + v * u, dt = now - vt;
+    if (dt / per + 1e-9 < 1) return 0;
+    var nv = v, drop = 0;
+    if (dt > maxdt) {
+      nv = Math.round((now - maxdt - A) / u);
+      drop = (A + nv * u) - vt; dt = now - (A + nv * u);
+    }
+    var g = Math.floor(dt / per + 1e-9);
+    if (g < 0) g = 0;
+    nv += g * 64;
+    if (At.compareExchange(a, 243, v, nv) === v) { out[0] = g; out[1] = drop > 0 ? drop : 0; return g; }
+  }
+  return 0;
+}const itOut = [0, 0];
 function selfGrant() {
   const a = paceI32, f = paceF64, c = bkCfg;
   if (!Atomics.load(a, BK_EN) || Atomics.load(a, LS_ARMED)) return;
   const now = performance.timeOrigin + performance.now();
   if (!(f[2] > 0) || !(f[0] > 0) || now - f[2] < c.gap) return;
-  if (Atomics.compareExchange(a, IT_LOCK, 0, 1) !== 0) { Atomics.add(a, SG_LOCKBUSY, 1); return; }
-  let g = 0;
-  if (now - f[2] >= c.gap && Atomics.load(a, BK_EN)) {
-    let dt = now - f[0];
-    if (dt > 0) {
-      if (dt > c.maxdt) { Atomics.add(a, BK_DROPMS, Math.round(dt - c.maxdt)); dt = c.maxdt; }
-      let acc = f[1] + dt * c.target / 1000;
-      g = Math.floor(acc); acc -= g;
-      let room = c.maxb - Atomics.load(a, 0); if (room < 0) room = 0;
-      if (g > room) { Atomics.add(a, BK_LOST, g - room); g = room; }
-      if (g > 0) { Atomics.add(a, 0, g); Atomics.add(a, BK_GRANTED, g); Atomics.add(a, SG_GRANTED, g); }
-      f[0] = now; f[1] = acc;
+  let g = itClaim(Atomics, a, f, now, c.target, c.maxdt, itOut);
+  if (itOut[1] > 0) Atomics.add(a, BK_DROPMS, Math.round(itOut[1]));
+  if (g <= 0) return;
+  let room = c.maxb - Atomics.load(a, 0); if (room < 0) room = 0;
+  if (!Atomics.load(a, BK_EN) || Atomics.load(a, LS_ARMED)) room = 0;   // the page closed the gate meanwhile
+  if (g > room) { Atomics.add(a, BK_LOST, g - room); g = room; }
+  if (g > 0) { Atomics.add(a, 0, g); Atomics.add(a, BK_GRANTED, g); Atomics.add(a, SG_GRANTED, g); Atomics.notify(a, 0); }
+}
+
+// ── A ROOM'S FRAMES DO NOT WAIT ON THE PAGE'S MAIN THREAD (2026-10-07) ─────────────────────────
+// In a room every frame is released by gamecube.html gcLsStep — one credit paired with one agreed
+// input image — on the page's main thread, and nothing else may run a frame. Any stall of that
+// thread froze the room. MEASURED (MP4 bench room, prod mirror, 10 + 10 runs on the SwiftShader and
+// default arms, the worker's frame-timing ring): 26 room frames held the guest clock 34-55 ms with
+// this worker busy 0.3-10 ms of it — parked on a credit the page's thread (Blink GC epilogues of
+// 20-40 ms, SwiftShader holding the cores) did not release — 1-3 per room in 15 of 20 runs.
+// In a ROLLBACK room this thread can release the frame itself, because the frame's image is already
+// decided by the engine's own rule: this console's pad as sampled (no new input can have been
+// sampled — the page's thread is the one that samples it, and it is stopped) and every other port
+// predicted as its last input with the one-frame edges cleared (lib/netplay.js _rbPredict). So while
+// the page's frame gate has been silent for GAP ms, the wall clock has earned a frame (the ONE
+// integrator, itClaim — exactly what the page's grant would have claimed) and the page has allowed
+// it (ALLOW: rollback only, within the engine's window, never at a frame start a rewind cannot return
+// to), this thread writes that image into the pad slot, logs it, and adds the one credit itself.
+// When the page's thread comes back it RECONCILES (gcRaReconcile): each logged frame is begun in the
+// engine with exactly the pad it ran on, and any frame whose agreed image differs from what ran — a
+// remote input that arrived in the meantime — is re-simulated from there by the ordinary rollback
+// ring, before the next frame is shown. The engine is the truth; this only lets the guest keep its
+// clock. Gate 9 holds: one frame per credit the wall clock earned, never more (the page's own grant
+// and this one claim the same integrator), and the engine's own clock is never led (frames are begun
+// in it after they ran, never before).
+// THE CELLS (rbSab, after the ring):
+//   MODE  0 the page owns the gate, 1 this thread has taken it (the page reclaims with 1 -> 0),
+//         3 this thread is mid-release (the page waits), 2 the page is mid-release
+//   ALLOW autonomous frames the page allows from WNEXT on (0 = none); GAP the page's silence (ms)
+//   EARNED the page's banked credits (gcLsEarned) at its last change; G credits this thread claimed;
+//   N frames it released (the log length); TAKES / TOTAL / REFUSED counters; LOCAL port mask
+//   GUESS 16 cells: the next frame's image, edges cleared; LOG N x [w, 16 cells]; HB f64: page alive
+const RA = { MODE: 4864, ALLOW: 4865, GAP: 4866, EARNED: 4867, G: 4868, N: 4869, TAKES: 4870, TOTAL: 4871,
+             WNEXT: 4872, REFUSED: 4874, LOST: 4875, WHY_ALLOW: 4876, WHY_RING: 4877, WHY_UNSAFE: 4878, WHY_W: 4879,
+             GUESS: 4880, LOG: 4896, LOG_N: 16, LOG_S: 17, HB_BYTE: 30720 };
+let raF64 = null, raE0 = 0;
+function roomSelf() {
+  const R = rbI32, a = paceI32, c = bkCfg;
+  if (!R || !c || !Atomics.load(a, LS_ARMED)) return;
+  if (!raF64) raF64 = new Float64Array(R.buffer, RA.HB_BYTE, 2);
+  const now = performance.timeOrigin + performance.now();
+  if (!(raF64[0] > 0) || now - raF64[0] < (Atomics.load(R, RA.GAP) || 20)) return;   // the page's gate is alive
+  // the page is silent: count why a frame is NOT self-released (rigs read these; one add per 2 ms poll)
+  const allow = Atomics.load(R, RA.ALLOW);
+  if (allow <= 0) { Atomics.add(R, RA.WHY_ALLOW, 1); return; }
+  if (!rb.armed || rb.resimming || rb.fault) { Atomics.add(R, RA.WHY_RING, 1); return; }
+  // the frame start must be one a rewind can return to (rbVi: UNSAFE === VI_AT marks one that is not)
+  if ((Atomics.load(R, RBC.UNSAFE) | 0) === (Atomics.load(R, RBC.VI_AT) | 0)) { Atomics.add(R, RA.WHY_UNSAFE, 1); return; }
+  const m = Atomics.load(R, RA.MODE);
+  if (m === 0) { if (Atomics.compareExchange(R, RA.MODE, 0, 3) !== 0) return; raE0 = Atomics.load(R, RA.EARNED); Atomics.add(R, RA.TAKES, 1); }
+  else if (m !== 1 || Atomics.compareExchange(R, RA.MODE, 1, 3) !== 1) return;
+  const n = Atomics.load(R, RA.N), w = Atomics.load(a, PAD_ACK);
+  let ran = false;
+  if (w !== Atomics.load(R, RA.WNEXT) + n || n >= allow || n >= RA.LOG_N) Atomics.add(R, n >= allow || n >= RA.LOG_N ? RA.REFUSED : RA.WHY_W, 1);
+  else {
+    let g = itClaim(Atomics, a, paceF64, now, c.target, c.maxdt, itOut);
+    if (itOut[1] > 0) Atomics.add(a, BK_DROPMS, Math.round(itOut[1]));
+    if (g > 0) {
+      let room = c.maxb - (raE0 + Atomics.load(R, RA.G) - n) - Atomics.load(a, 0); if (room < 0) room = 0;
+      if (g > room) { Atomics.add(R, RA.LOST, g - room); g = room; }
+      if (g > 0) Atomics.add(R, RA.G, g);
+    }
+    if (raE0 + Atomics.load(R, RA.G) - n >= 1) {
+      const o = RA.LOG + n * RA.LOG_S;
+      for (let p = 0; p < PAD_PORTS; p++) {
+        const q = RA.GUESS + p * 4, cb = PAD_BASE + p * PAD_STRIDE;
+        for (let k = 0; k < 4; k++) { const v = Atomics.load(R, q + k) | 0; Atomics.store(a, cb + k, v); Atomics.store(R, o + 1 + p * 4 + k, v); }
+      }
+      Atomics.store(R, o, w);
+      Atomics.store(R, RA.N, n + 1);
+      Atomics.add(R, RA.TOTAL, 1);
+      Atomics.add(a, 0, 1);              // exactly one frame, consumed by this thread's own wait loop
+      ran = true;
     }
   }
-  Atomics.store(a, IT_LOCK, 0);
-  if (g > 0) Atomics.notify(a, 0);
+  Atomics.store(R, RA.MODE, 1);
+  return ran;
 }
 
 function applyPads() {
@@ -2863,7 +2956,7 @@ async function boot(msg) {
               if (Atomics.load(paceI32, 0) <= 0) spareStep(SPARE_SLICE_MS);
               while (Atomics.load(paceI32, 0) <= 0) {
                 Atomics.wait(paceI32, 0, 0, bkCfg ? BK_POLL_MS : 500);
-                if (bkCfg && Atomics.load(paceI32, 0) <= 0) selfGrant();
+                if (bkCfg && Atomics.load(paceI32, 0) <= 0) { selfGrant(); if (rbI32) roomSelf(); }
               }
               Atomics.sub(paceI32, 0, 1);
             }
