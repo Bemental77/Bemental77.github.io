@@ -7,17 +7,27 @@ WHY. core/state.c saves the I/O registers (io_reg) but nothing that sits
 BEHIND them: core/input_hw/gamepad.c's per-pad TH state / 6-button counter /
 timeout / TH latency, the EA 4-Way Play select latch, the Master Tap
 flip-flops, core/input_hw/teamplayer.c's Team Player handshake state and read
-counter, and input.pad[] itself — the pads the guest reads, which
-osd_input_update() refreshes only ONCE A FRAME, "just before VINT"
-(core/system.c). A frame boundary (and so every state a rollback loads) is at
-the top of the frame, so from there to the VINT line the running machine holds
-the PREVIOUS frame's pads, and a console that loaded frame k after simulating
-k+n held frame k+n-1's instead. A game that reads its pads only in its VINT
-handler never sees the difference (Sonic 3, X-Men: the 2-player rollback
-probe has always passed); a Team Player / 4-Way Play game that polls the
-adaptor's handshake outside VINT would fork a rolled-back console from one
-that never rolled back. Rollback netplay with 3-4 players (genesis.html, the
-multitap) is load-bearing on this.
+counter, and input.pad[]. With them out of the blob, a load hands the guest
+whatever the LAST SIMULATED frame left in them (or the reset values, where
+state_load resets the ports) instead of what the saved frame had — e.g. a
+Team Player read sequence a game left mid-handshake at the frame boundary.
+
+⚠ WHAT IT DOES NOT DO, MEASURED 2026-10-07 — read before relying on it:
+  * It is NOT what keeps a room exact. genesis.html runs the canonical step
+    (load -> pads -> run -> save) on EVERY console for EVERY frame, so every
+    console sees the same loads; tools/genesis_rollback_probe.mjs passes 3- and
+    4-player rooms (Team Player and 4-Way Play) against a never-guessing
+    reference on a control build WITHOUT this section too.
+  * input.pad[] has no stale window to close: system_frame_gen() starts at
+    V-blank and calls osd_input_update() in its first line, so every frame
+    re-reads the pads before the guest can see them. It is carried anyway,
+    as the value the frame actually ran on.
+  * A load is still not a straight run in Genesis-Plus-GX: on
+    tools/genesis_multitap_rom.mjs, a load before every frame vs no loads
+    differs from frame 1 by ONE main-loop pass (68000 timing within the frame
+    is not fully carried) — with or without this section, adaptor or not.
+It makes the blob carry more of what the guest reads; it is defensive, not
+load-bearing, and the probes above are the claim.
 
 FORMAT. Appended AFTER every other section, including patch_fm_busy_state.py's
 "FMBY" (tag "INPT" + the bytes below), so a state written before this patch

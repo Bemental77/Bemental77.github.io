@@ -5,10 +5,9 @@
 // It is GUEST CODE on the real I/O path — GPGX's io_ctrl.c port handlers,
 // gamepad.c wayplay_*, teamplayer.c — not a peek at the page's variables.
 //
-// Every pass of its main loop (it never waits for V-blank, so it also reads
-// pads in the stretch of a frame BEFORE osd_input_update — the window a
-// rollback load must get right; see genesis/genesisWasm/tools/
-// patch_input_state.py):
+// Every pass of its main loop (it never waits for V-blank, so a frame boundary
+// — and so every savestate a rollback loads — usually falls in the middle of a
+// Team Player handshake or a 4-Way Play select):
 //   EA 4-WAY PLAY: for n = 0..3, port B data <- n<<4 (TL/TR select, UP/DOWN
 //     low = latch), then port A read with TH=1 and TH=0 (3-button protocol).
 //   SEGA TEAM PLAYER on port A: TH=1 TR=1 (counter 0), then 15 writes toggling

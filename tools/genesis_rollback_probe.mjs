@@ -28,8 +28,8 @@
 //   * --broken-mt: consoles without the multitap, reference with it. MUST fail.
 //
 // ROMS: --rom mtap (default for 3+): tools/genesis_multitap_rom.mjs — reads all
-// four pads through BOTH adaptors, continuously (so also in the part of a frame
-// before osd_input_update, the window patch_input_state.py covers). Its header
+// four pads through BOTH adaptors, continuously, so frame boundaries fall
+// mid-handshake. Its header
 // says "J4", so genMultitapPlan picks a Team Player in port A; --kind 1 forces
 // EA 4-Way Play. --rom sonic3 / xmen: the shipped carts (2 players).
 //
@@ -81,9 +81,16 @@ const genMultitapPlan = new Function(PLAN_SRC + '\nreturn genMultitapPlan;')();
 function pageRollback(Module, hz) {
   const LS = { fault: null, frames: 0, hashes: 0 };
   const win = { __genFrames: 0, __genLsImage: null };
-  const f = new Function('Module', 'LS', 'window', 'HW_HZ', 'pageLog', 'latWitness',
+  // ⚠ A FIXED CLOCK FOR THE PAGE CODE. rbStep times itself with performance.now()
+  // and publishes that as ls.selfStepMs, which a capacity-gated room acts on —
+  // so on a loaded box the room could drop to input delay mid-run (this probe
+  // runs rollback rooms only, and did fault that way once at load ~6). Each
+  // call advances 0.5 ms: every step measures 0.5 ms, on every console.
+  let fake = 0;
+  const perf = { now: () => (fake += 0.5) };
+  const f = new Function('Module', 'LS', 'window', 'HW_HZ', 'pageLog', 'latWitness', 'performance',
     'var guestFrames = 0;\n' + RB_SRC + '\nreturn { RB: RB, rbInit: rbInit, rbGrow: rbGrow, rbStep: rbStep, rbSlot: rbSlot, rbHash: rbHash, rbRunFrame: rbRunFrame, rbFree: rbFree };');
-  const api = f(Module, LS, win, hz, () => {}, () => {});
+  const api = f(Module, LS, win, hz, () => {}, () => {}, perf);
   api.LS = LS;
   return api;
 }

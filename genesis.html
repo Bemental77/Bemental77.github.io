@@ -1813,6 +1813,9 @@
   // header's I/O field carries '4' = Team Player, or the title is in
   // GEN_MT_GAMES), decided from the agreed roster before frame 0
   // (lsMultitapApply). Two seated is always the plain console.
+  // Proven in Node by tools/genesis_rollback_probe.mjs --players 3|4 (this
+  // file's rb* functions and genMultitapPlan, run verbatim) against a
+  // never-guessing core, on tools/genesis_multitap_rom.mjs.
   // ═══════════════════════════════════════════════════════════════════════════
 
   // A Mega Drive has two controller ports, and this number is READ FROM THE
