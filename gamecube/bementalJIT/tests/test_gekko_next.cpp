@@ -2498,12 +2498,29 @@ static bool test_ps_merge10_alias_fd_eq_fa() {
 // ===========================================================================
 
 // ---- wasm byte dumper: print the emitted module hex for a given block ----
+// [stall fix 2026-10-07] The hex stream is OPT-IN (env BEM_WASMDUMP=1 under
+// node, or ?wasmdump=1 on the page): streaming it through the headless console
+// took ~15 min per run and the suite timed out inside [wasmdump IDCT_nospec]
+// (134 of 171 cases reported) before reaching its TOTAL line. The byte count
+// is always printed. Gate #8: diagnostics must not ride in the default run.
+static bool wasmdump_on() {
+    if (std::getenv("BEM_WASMDUMP")) return true;
+#ifdef __EMSCRIPTEN__
+    return EM_ASM_INT({
+        return (typeof location !== 'undefined' &&
+                /[?&]wasmdump=1(&|$)/.test(location.search)) ? 1 : 0;
+    }) != 0;
+#else
+    return false;
+#endif
+}
 static void dump_block_wasm(const char* tag, u32 start_pc, const u32* insts,
                             u32 count, u32 ctx_ptr,
                             u32 mem1_base, u32 mem1_mask, u32 ram_size) {
     std::vector<u8> bytes = build_block_next(start_pc, insts, count, ctx_ptr,
                                              mem1_base, mem1_mask, ram_size);
     std::printf("[wasmdump %s] %u bytes\n", tag, (unsigned)bytes.size());
+    if (!wasmdump_on()) return;
     char line[160];
     for (std::size_t i = 0; i < bytes.size(); i += 16) {
         int n = std::snprintf(line, sizeof(line), "[wasmdump %s] %04zx:", tag, i);
