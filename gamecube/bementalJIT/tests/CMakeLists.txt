@@ -320,6 +320,31 @@ if(BEMENTAL_GUEST_POWERPC)
         target_compile_options(test_fpr_exit_store PRIVATE "-pthread")
     endif()
 
+    # [cvt-single 2026-10-07] emit_convert_to_single vs Dolphin ConvertToSingle
+    # (BEM_LEVER_CVT_SINGLE_BRANCH). `node test_cvt_single.js`.
+    if(BEMENTAL_GUEST_POWERPC_NEXT)
+        add_executable(test_cvt_single test_cvt_single.cpp)
+        target_link_libraries(test_cvt_single PRIVATE
+            bementalJIT bementalJITPowerPCNext bementalJITPowerPC)
+        target_include_directories(test_cvt_single PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+        set_target_properties(test_cvt_single PROPERTIES SUFFIX ".html")
+        target_link_options(test_cvt_single PRIVATE
+            "SHELL:-s EXIT_RUNTIME=1"
+            "SHELL:-s EXPORTED_RUNTIME_METHODS=['HEAPU8','HEAP8','HEAP16','HEAPU16','HEAP32','HEAPU32','HEAPF32','HEAPF64']"
+            "SHELL:-pthread"
+            "SHELL:-s PTHREAD_POOL_SIZE=0"
+            "SHELL:-s INITIAL_MEMORY=67108864"
+            "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+            "SHELL:-s MAXIMUM_MEMORY=67108864"
+            "SHELL:-s ALLOW_TABLE_GROWTH=1"
+            "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
+        )
+        target_compile_options(test_cvt_single PRIVATE "-pthread")
+    endif()
+
     # [pc-sync 2026-10-04] Inline interp fallbacks store ctx.PC so the
     # dolphin_interp pc guard runs them. `node test_interp_pcsync.js`.
     if(BEMENTAL_GUEST_POWERPC_NEXT)

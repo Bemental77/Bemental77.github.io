@@ -138,6 +138,9 @@ constexpr u32 BEM_LEVER_FPR_EXIT_STORE = 1u << 23;
 // exiting flush); the fall-through keeps Singles resident and dirty. The FPR
 // half of BEM_LEVER_GPR_EXIT_FLUSH.
 constexpr u32 BEM_LEVER_FPR_EXIT_FLUSH = 1u << 24;
+// emit_convert_to_single (Dolphin ConvertToSingle) as an `if` on the denormal
+// range instead of computing both candidate values and a select.
+constexpr u32 BEM_LEVER_CVT_SINGLE_BRANCH = 1u << 25;
 
 bool bem_lever_on(u32 bit);
 

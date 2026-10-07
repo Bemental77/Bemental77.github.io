@@ -1445,6 +1445,61 @@ void emit_lfsx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
 // uses it as the exact inverse of the PEM widen (round-trip identity incl.
 // NaN payloads + single denormals — f32.demote_f64 would canonicalize NaNs).
 void emit_convert_to_single(WasmModuleBuilder& wb, u32 ps0_local) {
+    if (bem_lever_on(BEM_LEVER_CVT_SINGLE_BRANCH)) {
+        // [BEM_LEVER_CVT_SINGLE_BRANCH 2026-10-07] The same two values as the
+        // select form below, but only the selected one is computed. The select's
+        // condition (exp >= 874) & (exp <= 896) & (magnitude != 0) loses its
+        // third term: exp >= 874 means a non-zero exponent field, so the
+        // magnitude is never 0 there. (exp - 874) <=u 22 is the same range test.
+        // LOCAL_TMP_VAL ends holding exp, as before.
+        wb.op_local_get(ps0_local);
+        wb.op_i64_const(52);
+        wb.op_i64_shr_u();
+        wb.op_i32_wrap_i64();
+        wb.op_i32_const(0x7FF);
+        wb.op_i32_and();
+        wb.op_local_tee(LOCAL_TMP_VAL);
+        wb.op_i32_const(874);
+        wb.op_i32_sub();
+        wb.op_i32_const(896 - 874);
+        wb.op_i32_le_u();
+        wb.op_if(0x7F);   // -> i32
+            wb.op_local_get(ps0_local);
+            wb.op_i64_const(0x000FFFFFFFFFFFFFll);
+            wb.op_i64_and();
+            wb.op_i64_const(21);
+            wb.op_i64_shr_u();
+            wb.op_i32_wrap_i64();
+            wb.op_i32_const((s32)0x80000000u);
+            wb.op_i32_or();
+            wb.op_i32_const(905);
+            wb.op_local_get(LOCAL_TMP_VAL);
+            wb.op_i32_sub();
+            wb.op_i32_shr_u();
+            wb.op_local_get(ps0_local);
+            wb.op_i64_const(32);
+            wb.op_i64_shr_u();
+            wb.op_i32_wrap_i64();
+            wb.op_i32_const((s32)0x80000000u);
+            wb.op_i32_and();
+            wb.op_i32_or();
+        wb.op_else();
+            wb.op_local_get(ps0_local);
+            wb.op_i64_const(32);
+            wb.op_i64_shr_u();
+            wb.op_i32_wrap_i64();
+            wb.op_i32_const((s32)0xC0000000u);
+            wb.op_i32_and();
+            wb.op_local_get(ps0_local);
+            wb.op_i64_const(29);
+            wb.op_i64_shr_u();
+            wb.op_i32_wrap_i64();
+            wb.op_i32_const(0x3FFFFFFF);
+            wb.op_i32_and();
+            wb.op_i32_or();
+        wb.op_end();
+        return;
+    }
     // exp -> LOCAL_TMP_VAL
     wb.op_local_get(ps0_local);
     wb.op_i64_const(52);
