@@ -277,8 +277,34 @@ static u32 store_width_bytes(StoreWidth w) {
 // 42.6->40.6 ns/iter = FLAT (V8 folds the rotr/and) — bswap is NOT a convertible tax.
 // Keep default false (gated instrument).
 static constexpr bool BEM_STRIP_BSWAP = false;
+// [bswap-simd lever bit18 2026-10-07] Lane 0 of a v128 byte-reversed by one
+// i8x16.shuffle. Only lane 0 (bytes 0-3) is ever read back, so the second shuffle
+// operand is an arbitrary constant (V8 sees every index < 16 and treats it as a
+// single-input swizzle). result.byte[i] = a.byte[mask[i]].
+static const u8 BSWAP32_LANE0_SHUFFLE[16] = { 3,2,1,0, 4,5,6,7, 8,9,10,11, 12,13,14,15 };
+static const u8 BSWAP16_LANE0_SHUFFLE[16] = { 1,0,2,3, 4,5,6,7, 8,9,10,11, 12,13,14,15 };
+// v128 (guest bytes in lane 0) on the stack -> v128 with lane 0 byte-reversed. 2 ops.
+static void emit_lane0_swap32(WasmModuleBuilder& wb) {
+    wb.op_v128_const_i32_splat(0);
+    wb.op_i8x16_shuffle(BSWAP32_LANE0_SHUFFLE);
+}
+static void emit_lane0_swap16(WasmModuleBuilder& wb) {
+    wb.op_v128_const_i32_splat(0);
+    wb.op_i8x16_shuffle(BSWAP16_LANE0_SHUFFLE);
+}
+static bool bswap_simd_on() { return !BEM_STRIP_BSWAP && bem_lever_on(BEM_LEVER_BSWAP_SIMD); }
+
 static void emit_bswap_i32(WasmModuleBuilder& wb) {
     if (BEM_STRIP_BSWAP) return;   // value already on the stack; leave it unswapped
+    if (bswap_simd_on()) {
+        // [bswap-simd] 4 ops: splat, const, shuffle, extract. Unlike the scalar
+        // form it does NOT write LOCAL_TMP_VAL (callers only ever treat that
+        // slot as clobbered, never as holding the pre-swap value).
+        wb.op_i32x4_splat();
+        emit_lane0_swap32(wb);
+        wb.op_i32x4_extract_lane(0);
+        return;
+    }
     // [bswap-rotate 2026-07-14] bswap32(x) = (rotr(x,8) & 0xFF00FF00) | (rotl(x,8) & 0x00FF00FF).
     // 11 ops vs the prior 18-op two-stage shl/shr/or form — fires on EVERY 32-bit fastmem
     // load and store, so a load+store pair drops ~36->22 emitted ops. Verified bit-exact
@@ -300,6 +326,14 @@ static void emit_bswap_i32(WasmModuleBuilder& wb) {
 
 static void emit_bswap_i16(WasmModuleBuilder& wb) {
     if (BEM_STRIP_BSWAP) return;
+    if (bswap_simd_on()) {
+        // [bswap-simd] ((x << 8) | ((x >> 8) & 0xFF)) & 0xFFFF == bytes 1,0 of
+        // lane 0 read back as an unsigned 16-bit lane. 4 ops.
+        wb.op_i32x4_splat();
+        emit_lane0_swap16(wb);
+        wb.op_i16x8_extract_lane_u(0);
+        return;
+    }
     wb.op_local_tee(LOCAL_TMP_VAL);
     wb.op_i32_const(8);
     wb.op_i32_shl();
@@ -359,6 +393,23 @@ static u32 emit_fastmem_host_addr(WasmModuleBuilder& wb, const LoadStoreParams& 
 static void emit_fastmem_load_value(WasmModuleBuilder& wb,
                                     LoadStoreParams params, LoadWidth width) {
     const u32 moff = emit_fastmem_host_addr(wb, params);
+    if (width != LoadWidth::U8 && bswap_simd_on()) {
+        // [bswap-simd] the load itself lands in lane 0: load32_zero / load16_splat
+        // read exactly the bytes i32.load / i32.load16_u read (same address, same
+        // width, same trap), then one shuffle + extract. S16 sign-extends in the
+        // extract. U32 4 ops (was 12), U16 4 (was 12), S16 4 (was 16).
+        if (width == LoadWidth::U32) {
+            wb.op_v128_load32_zero(moff);
+            emit_lane0_swap32(wb);
+            wb.op_i32x4_extract_lane(0);
+        } else {
+            wb.op_v128_load16_splat(moff);
+            emit_lane0_swap16(wb);
+            if (width == LoadWidth::S16) wb.op_i16x8_extract_lane_s(0);
+            else                         wb.op_i16x8_extract_lane_u(0);
+        }
+        return;
+    }
     switch (width) {
     case LoadWidth::U8:
         wb.op_i32_load8_u(moff);
@@ -493,6 +544,20 @@ static void emit_fastmem_store(WasmModuleBuilder& wb, LoadStoreParams params,
                                StoreWidth width, u32 src_local) {
     const u32 moff = emit_fastmem_host_addr(wb, params);   // [FASTMEM_LEAN]
     wb.op_local_get(src_local);
+    if (width != StoreWidth::U8 && bswap_simd_on()) {
+        // [bswap-simd] store straight from lane 0: store32_lane / store16_lane
+        // write exactly the bytes i32.store / i32.store16 of the swapped value
+        // write. 5 ops after the address incl. the local.get (was 13).
+        wb.op_i32x4_splat();
+        if (width == StoreWidth::U32) {
+            emit_lane0_swap32(wb);
+            wb.op_v128_store32_lane(moff, 0);
+        } else {
+            emit_lane0_swap16(wb);
+            wb.op_v128_store16_lane(moff, 0);
+        }
+        return;
+    }
     switch (width) {
     case StoreWidth::U8:
         wb.op_i32_store8(moff);

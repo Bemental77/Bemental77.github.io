@@ -312,6 +312,112 @@ static bool test_psq_st_fastmem_no_overrun() {
 }
 
 // ---------------------------------------------------------------------------
+// 9-11. [bswap-simd lever bit18 2026-10-07] the INTEGER fastmem arms: lwz / lhz /
+//    lha / lwzx load through v128.load32_zero / load16_splat + one lane-0
+//    shuffle + extract; stw / sth store through one shuffle + store32/16_lane.
+//    Expected values are the big-endian reading of the bytes, written out by
+//    hand (not produced by the emitter's other arm). Asymmetric bytes so any
+//    permutation error shows; lha of a negative and of a positive halfword so a
+//    sign-extension slip (extract_lane_u for _s, or vice versa) shows; sth from a
+//    register whose HIGH half is non-zero so a store that takes the wrong two
+//    bytes shows; 0x5A guard bytes around every store so a wider store shows.
+// ---------------------------------------------------------------------------
+static u32 enc_d(u32 opcd, u32 rt, u32 ra, s32 d) {
+    return (opcd << 26) | ((rt & 31u) << 21) | ((ra & 31u) << 16) | ((u32)d & 0xFFFFu);
+}
+static u32 enc_x31(u32 rt, u32 ra, u32 rb, u32 xo) {
+    return (31u << 26) | ((rt & 31u) << 21) | ((ra & 31u) << 16) | ((rb & 31u) << 11) | (xo << 1);
+}
+
+static bool test_int_loads_fastmem() {
+    TestEnv env; if (!env.init()) return false;
+    alignas(16) u8 buf[128] = {0};
+    const u8 src[8] = { 0x81, 0x23, 0x45, 0x67, 0xF2, 0x34, 0x7A, 0xBC };
+    std::memcpy(buf, src, 8);
+    env.gpr(1) = GUEST_BASE;
+    env.gpr(9) = 4;
+    for (u32 r = 3; r <= 8; ++r) env.gpr(r) = 0xDEADBEEFu;
+    const u32 insts[] = {
+        enc_d(32, 3, 1, 0),            // lwz  r3, 0(r1)   -> 0x81234567
+        enc_d(40, 4, 1, 4),            // lhz  r4, 4(r1)   -> 0x0000F234
+        enc_d(42, 5, 1, 4),            // lha  r5, 4(r1)   -> 0xFFFFF234
+        enc_d(42, 6, 1, 6),            // lha  r6, 6(r1)   -> 0x00007ABC
+        enc_d(40, 7, 1, 0),            // lhz  r7, 0(r1)   -> 0x00008123
+        enc_x31(8, 1, 9, 23),          // lwzx r8, r1, r9  -> 0xF2347ABC
+    };
+    s32 next = -1;
+    if (!env.dispatch(0x8000B000, insts, 6, &next,
+                      (u32)(uintptr_t)&buf[0], MEM_MASK, sizeof(buf))) return false;
+    const u32 slow = slow_hits_reset();
+    std::printf("[diag int-loads] r3=%08x r4=%08x r5=%08x r6=%08x r7=%08x r8=%08x slow=%u\n",
+                env.gpr(3), env.gpr(4), env.gpr(5), env.gpr(6), env.gpr(7), env.gpr(8), slow);
+    return env.gpr(3) == 0x81234567u && env.gpr(4) == 0x0000F234u &&
+           env.gpr(5) == 0xFFFFF234u && env.gpr(6) == 0x00007ABCu &&
+           env.gpr(7) == 0x00008123u && env.gpr(8) == 0xF2347ABCu &&
+           next == (s32)0x8000B018 && slow == 0u;
+}
+
+static bool test_int_stores_fastmem() {
+    TestEnv env; if (!env.init()) return false;
+    alignas(16) u8 buf[128];
+    std::memset(buf, 0x5A, sizeof(buf));
+    env.gpr(1) = GUEST_BASE;
+    env.gpr(3) = 0x89ABCDEFu;
+    env.gpr(4) = 0xFEDC1234u;        // sth must store 12 34, never FE DC
+    env.gpr(5) = 0x01020304u;
+    env.gpr(9) = 40;
+    const u32 insts[] = {
+        enc_d(36, 3, 1, 16),           // stw  r3, 16(r1)
+        enc_d(44, 4, 1, 26),           // sth  r4, 26(r1)
+        enc_x31(5, 1, 9, 151),         // stwx r5, r1, r9
+    };
+    s32 next = -1;
+    if (!env.dispatch(0x8000C000, insts, 3, &next,
+                      (u32)(uintptr_t)&buf[0], MEM_MASK, sizeof(buf))) return false;
+    u8 want[128];
+    std::memset(want, 0x5A, sizeof(want));
+    const u8 w_stw[4] = { 0x89, 0xAB, 0xCD, 0xEF };
+    const u8 w_sth[2] = { 0x12, 0x34 };
+    const u8 w_stwx[4] = { 0x01, 0x02, 0x03, 0x04 };
+    std::memcpy(want + 16, w_stw, 4);
+    std::memcpy(want + 26, w_sth, 2);
+    std::memcpy(want + 40, w_stwx, 4);
+    const u32 slow = slow_hits_reset();
+    std::printf("[diag int-stores] [16]=%02x %02x %02x %02x [24]=%02x %02x %02x %02x %02x %02x "
+                "[40]=%02x %02x %02x %02x slow=%u\n",
+                buf[16], buf[17], buf[18], buf[19], buf[24], buf[25], buf[26], buf[27],
+                buf[28], buf[29], buf[40], buf[41], buf[42], buf[43], slow);
+    return std::memcmp(buf, want, sizeof(buf)) == 0 && next == (s32)0x8000C00C && slow == 0u;
+}
+
+// Load -> store round trip through a GPR, every width, into a guarded window.
+static bool test_int_roundtrip_fastmem() {
+    TestEnv env; if (!env.init()) return false;
+    alignas(16) u8 buf[128];
+    std::memset(buf, 0x5A, sizeof(buf));
+    const u8 src[8] = { 0xC3, 0x01, 0x7E, 0x99, 0x80, 0x7F, 0x00, 0xFF };
+    std::memcpy(buf, src, 8);
+    env.gpr(1) = GUEST_BASE;
+    const u32 insts[] = {
+        enc_d(32, 3, 1, 0), enc_d(36, 3, 1, 32),   // lwz/stw  bytes 0-3 -> 32
+        enc_d(42, 4, 1, 4), enc_d(44, 4, 1, 36),   // lha/sth  bytes 4-5 -> 36
+        enc_d(40, 5, 1, 6), enc_d(44, 5, 1, 38),   // lhz/sth  bytes 6-7 -> 38
+    };
+    s32 next = -1;
+    if (!env.dispatch(0x8000D000, insts, 6, &next,
+                      (u32)(uintptr_t)&buf[0], MEM_MASK, sizeof(buf))) return false;
+    bool clean = true;
+    for (u32 i = 8; i < 32; ++i) if (buf[i] != 0x5A) clean = false;
+    for (u32 i = 40; i < 128; ++i) if (buf[i] != 0x5A) clean = false;
+    const u32 slow = slow_hits_reset();
+    std::printf("[diag int-roundtrip] [32]=%02x %02x %02x %02x %02x %02x %02x %02x r4=%08x clean=%d slow=%u\n",
+                buf[32], buf[33], buf[34], buf[35], buf[36], buf[37], buf[38], buf[39],
+                env.gpr(4), clean ? 1 : 0, slow);
+    return clean && std::memcmp(buf + 32, src, 8) == 0 && env.gpr(4) == 0xFFFF807Fu &&
+           env.gpr(5) == 0x000000FFu && slow == 0u;
+}
+
+// ---------------------------------------------------------------------------
 // [emitted-op audit] Dump the raw module bytes for MICRO-BLOCKS containing
 // exactly the ops this change touches, so the emitted-op count can be measured
 // (wasm-objdump -d | count instruction lines) rather than hand-counted. Sizing
@@ -360,6 +466,9 @@ static const TestCase kCases[] = {
     {"stfd_fastmem_roundtrip",              &test_stfd_fastmem_roundtrip},
     {"stfd_fastmem_no_overrun",             &test_stfd_fastmem_no_overrun},
     {"psq_st_fastmem_no_overrun",           &test_psq_st_fastmem_no_overrun},
+    {"int_loads_fastmem",                   &test_int_loads_fastmem},
+    {"int_stores_fastmem",                  &test_int_stores_fastmem},
+    {"int_roundtrip_fastmem",               &test_int_roundtrip_fastmem},
 };
 
 int main() {

@@ -369,7 +369,7 @@
         const st = Module.__replay = {
             mmioR: 0, mmioW: 0, otherR: 0, otherW: 0, ramR: 0, ramW: 0,
             interp: 0, interpPc: 0, interpInst: 0, drains: 0, wpar: 0,
-            checkExc: 0, hle: 0, mmioAddrs: {}
+            checkExc: 0, hle: 0, mmioAddrs: {}, gpHash: 0x811C9DC5 | 0, gpBytes: 0
         };
         function phys(a) { return ((a >>> 0) & 0x3E000000) === 0 ? ((a >>> 0) & 0x01FFFFFF) : -1; }
         function noteMmio(a, w) {
@@ -584,9 +584,20 @@
         env.ppc_hle_fire = function (pc, idx) { return 0; };
         env.ppc_msr_updated = function (msr) { };
         // GPFifo::UpdateGatherPipe stand-in: consume whole 32-byte chunks.
+        // Every byte the guest pushed through the gather pipe is folded into
+        // st.gpHash (FNV-1a) as it is drained, so a trace differential also
+        // covers the GX command stream (MEM1/ctx hashes never see it).
+        function gpFold() {
+            const end = HEAP32[(ctx + 0x0C) >> 2] >>> 0;
+            let h = st.gpHash | 0;
+            for (let a = gpbuf >>> 0; a < end; a++) h = Math.imul(h ^ HEAPU8[a], 16777619);
+            st.gpHash = h; st.gpBytes += end - (gpbuf >>> 0);
+            HEAP32[(ctx + 0x0C) >> 2] = gpbuf;
+        }
+        Module.bemReplayGpHash = function () { gpFold(); return st.gpHash | 0; };
         env.ppc_gather_drain = function () {
             st.drains++;
-            HEAP32[(ctx + 0x0C) >> 2] = gpbuf;
+            gpFold();
             HEAP32[gpdirty >> 2] = 0;
         };
       };

@@ -646,6 +646,19 @@ public:
 	// wrong byte fails WebAssembly.validate; these round-trip an i64 through a
 	// v128 lane bit-exactly).
 	void op_i64x2_splat()            { emitByte(V128_PREFIX); emitLEB128(0x12u); }               // i64 -> v128
+	// [bswap-simd lever bit18 2026-10-07] scalar byte swaps through one
+	// i8x16.shuffle. Subopcodes per the WebAssembly SIMD spec opcode table:
+	// v128.load16_splat 0x08, i32x4.splat 0x11, i16x8.extract_lane_s 0x18,
+	// i16x8.extract_lane_u 0x19, v128.store16_lane 0x59, v128.store32_lane 0x5A,
+	// v128.load32_zero 0x5C (same table the 0x5B store64_lane / 0x5D load64_zero
+	// entries above were taken from).
+	void op_i32x4_splat()            { emitByte(V128_PREFIX); emitLEB128(0x11u); }               // i32 -> v128
+	void op_i16x8_extract_lane_s(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x18u); emitByte(l); } // -> i32 (sext16)
+	void op_i16x8_extract_lane_u(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x19u); emitByte(l); } // -> i32 (zext16)
+	void op_v128_load16_splat(u32 off, u32 align = 1) { emitByte(V128_PREFIX); emitLEB128(0x08u); emitLEB128(align); emitLEB128(off); }
+	void op_v128_load32_zero(u32 off, u32 align = 2)  { emitByte(V128_PREFIX); emitLEB128(0x5Cu); emitLEB128(align); emitLEB128(off); }
+	void op_v128_store16_lane(u32 off, u8 lane, u32 align = 1) { emitByte(V128_PREFIX); emitLEB128(0x59u); emitLEB128(align); emitLEB128(off); emitByte(lane); }
+	void op_v128_store32_lane(u32 off, u8 lane, u32 align = 2) { emitByte(V128_PREFIX); emitLEB128(0x5Au); emitLEB128(align); emitLEB128(off); emitByte(lane); }
 	void op_i64x2_extract_lane(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x1Du); emitByte(l); }  // -> i64
 	void op_f64x2_extract_lane(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x21u); emitByte(l); }  // -> f64
 	void op_f64x2_replace_lane(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x22u); emitByte(l); }  // (v128,f64) -> v128

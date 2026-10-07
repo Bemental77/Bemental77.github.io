@@ -98,6 +98,12 @@ constexpr u32 BEM_LEVER_IDLE_TAKEN = 1u << 16;
 // wasm locals until the next exit. FPRs keep the head flush (the 2026-07-23
 // FPR keep-dirty attempt measured worse live; see emit_bcx).
 constexpr u32 BEM_LEVER_GPR_EXIT_FLUSH = 1u << 17;
+// Integer/FP-word byte swaps (emit_bswap_i32 / emit_bswap_i16 and the fastmem
+// load/store value paths) through ONE i8x16.shuffle on lane 0 instead of the
+// 11-op scalar rotate/mask sequence: splat (or v128.load32_zero / load16_splat),
+// shuffle, extract (or v128.store32/16_lane). Pure byte permutation; the S16
+// load sign-extends with i16x8.extract_lane_s.
+constexpr u32 BEM_LEVER_BSWAP_SIMD = 1u << 18;
 
 bool bem_lever_on(u32 bit);
 

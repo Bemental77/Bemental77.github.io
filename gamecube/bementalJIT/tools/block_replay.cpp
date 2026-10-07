@@ -434,10 +434,15 @@ int main(int argc, char** argv) {
     const uint64_t mem_hash = fnv64(g_mem1, kRamSize);
     const uint64_t ctx_hash = fnv64(g_ctx + 0x014, ppc_off::DOWNCOUNT - 0x014,
                                     fnv64(g_ctx + 0x000, 0x0C));
+    // Gather-pipe digest: every byte drained during the run plus the residual
+    // still in the pipe (block_replay_pre.js gpFold). Taken after ctx_hash,
+    // which excludes the gather-pipe pointers it resets.
+    const u32 gp_hash = (u32)EM_ASM_INT({ return Module.bemReplayGpHash(); });
+    const int gp_bytes = js_stat("gpBytes");
     if (tf) {
-        std::fprintf(tf, "END mem1=%016llx ctx=%016llx cycles=%llu\n",
+        std::fprintf(tf, "END mem1=%016llx ctx=%016llx cycles=%llu gp=%08x/%d\n",
                      (unsigned long long)mem_hash, (unsigned long long)ctx_hash,
-                     (unsigned long long)guest_cycles);
+                     (unsigned long long)guest_cycles, gp_hash, gp_bytes);
         std::fclose(tf);
     }
 
@@ -454,7 +459,7 @@ int main(int argc, char** argv) {
         "\"indirect_calls\":%llu,\"consts\":%llu,\"locals\":%llu,\"control\":%llu,"
         "\"terminal_loads\":%llu,\"ops_per_guest_instr\":%.3f,\"instrs_per_entry\":%.3f,"
         "\"mmioR\":%d,\"mmioW\":%d,\"wpar_import\":%d,\"drains\":%d,\"interp\":%d,"
-        "\"mask_unsound\":%u,\"superblocks\":%u,\"seams\":%u}",
+        "\"mask_unsound\":%u,\"superblocks\":%u,\"seams\":%u,\"gp_hash\":\"%08x\",\"gp_bytes\":%d}",
         mode.c_str(), s, stop, stop_pc, (unsigned long long)guest_cycles, g_compiles,
         g_compile_fail, host_chains, blocks_via_host, (unsigned long long)mem_hash,
         (unsigned long long)ctx_hash, (unsigned long long)g_cnt[12],
@@ -467,7 +472,7 @@ int main(int argc, char** argv) {
         (unsigned long long)g_cnt[14], gi > 0 ? ops / gi : 0.0,
         g_cnt[13] ? gi / (double)g_cnt[13] : 0.0,
         js_stat("mmioR"), js_stat("mmioW"), js_stat("wpar"), js_stat("drains"), js_stat("interp"),
-        g_mask_unsound, g_superblocks, g_seams);
+        g_mask_unsound, g_superblocks, g_seams, gp_hash, gp_bytes);
     std::printf("%s\n", buf);
     if (json_out) { std::FILE* jf = std::fopen(json_out, "w"); if (jf) { std::fprintf(jf, "%s\n", buf); std::fclose(jf); } }
     std::fprintf(stderr, "[replay] slice-end PCs (top):");
