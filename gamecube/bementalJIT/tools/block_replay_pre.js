@@ -186,6 +186,11 @@
       rows.push([PCT.pcs[id], occ, ops]);
     }
     rows.sort((a, b) => b[2] - a[2]);
+    // BR_PC_DUMP=<file>: every row (pc occ ops), for offline edge/terminator analysis.
+    if (typeof process !== 'undefined' && process.env && process.env.BR_PC_DUMP) {
+      require('fs').writeFileSync(process.env.BR_PC_DUMP,
+        rows.map((r) => r[0].toString(16).padStart(8, '0') + ' ' + r[1] + ' ' + r[2]).join('\n') + '\n');
+    }
     let out = '[replay] top guest PCs by executed ops (op spans only; ' + PCT.pcs.length + ' pcs, ' + tot + ' ops)\n';
     out += '  pc        word      mnem          occ        ops   ops%  ops/occ\n';
     for (const [pc, occ, ops] of rows.slice(0, topn)) {

@@ -1040,6 +1040,14 @@ void unregister_pc(u64 pc) {
 extern "C" __attribute__((weak)) volatile int g_bem_state_op = 0;
 extern "C" __attribute__((weak)) void bem_service_pending_state(void) {}
 
+// [idle-collapse knob 2026-10-07] nonzero = the busy-poll clock-jump below never
+// fires. No shipping writer (default 0 = unchanged behavior); the offline
+// block-replay harness sets it (--no-collapse) so a differential between two
+// emitter arms compares the guest's instruction stream on IDENTICAL slicing —
+// the heuristic keys on which blocks return to this loop, which an emitter
+// dispatch lever changes by design.
+extern "C" uint32_t g_bem_idle_collapse_off = 0u;
+
 extern "C" EMSCRIPTEN_KEEPALIVE
 s32 bem_chain_loop_c(u32 pc, u32 max, u32* final_pc, u32* trap_pc,
                      const u32* exc_addr, const s32* dc_addr) {
@@ -1169,7 +1177,7 @@ s32 bem_chain_loop_c(u32 pc, u32 max, u32* final_pc, u32* trap_pc,
         // Bounded (jumps to the next event only) and gated on Exceptions==0 + a long streak so
         // real pending work / short forward chains are never skipped; count>64 skips the
         // per-block ring scan for normal short chains.
-        if (count > 64 && dc_addr && (!exc_addr || *exc_addr == 0u)) {
+        if (count > 64 && dc_addr && !g_bem_idle_collapse_off && (!exc_addr || *exc_addr == 0u)) {
             bool in_ring = false;
             for (u32 j = 0; j < 32u; ++j) { if (idle_ring[j] == pc) { in_ring = true; break; } }
             if (in_ring) {

@@ -22,6 +22,7 @@
 #include "common/op_info.h"
 #include "cr_shadow.h"
 #include "ppc_analyst.h"
+#include "lever_gate.h"     // BEM_LEVER_TAKEN_CHAIN
 #include "ppc_emit.h"        // BEM_MIPS_EXEC_CELL + bem_mips_census_on()
 #include "ppc_offsets.h"
 #include "reg_cache.h"
@@ -75,7 +76,7 @@ static inline void emit_exit_census_jb(WasmModuleBuilder& wb, u32 cell) {
 // emit_coalesced_taken_exit — the taken arm of a mid-block (is_terminal=false)
 // forward conditional branch: drain a pending gather-pipe write, then return
 // the just-stored target PC to the dispatcher. PC=target must already be stored.
-static void emit_coalesced_taken_exit(WasmModuleBuilder& wb, u32 ctx_ptr,
+static void emit_coalesced_taken_exit(WasmModuleBuilder& wb, u32 ctx_ptr, u32 target,
                                       const MergedRegionCtx* merged = nullptr,
                                       s32 region_gen = -1,
                                       u32 chain_tag_addr = 0u, u32 chain_slot_addr = 0u,
@@ -103,6 +104,21 @@ static void emit_coalesced_taken_exit(WasmModuleBuilder& wb, u32 ctx_ptr,
     if (merged) {
         emit_chain_or_return(wb, ctx_ptr, chain_tag_addr, chain_slot_addr, merged,
                              region_gen, nullptr, nullptr, 0u, chain_tag_sym, chain_slot_sym);
+    } else if (region_gen < 0 && !chain_tag_addr && !chain_slot_addr &&
+               bem_lever_on(BEM_LEVER_TAKEN_CHAIN)) {
+        // [BEM_LEVER_TAKEN_CHAIN 2026-10-07] Plain per-block body: chain to the
+        // static taken target exactly as a block terminal whose static successor
+        // is `target` would (emit_chain_or_return's BEM_LEVER_STATIC_CHAIN arm:
+        // downcount<=0 -> return PC; else constant-bucket tag/slot probe ->
+        // return_call_indirect; miss -> return PC). The next block the C loop
+        // would have dispatched is the same block, entered with the same ctx
+        // (PC=target stored above, GPR/FPR caches flushed by emit_bcx's head
+        // flush), so guest state is unchanged; only the host round trip goes.
+        // The taken arm is inside a void `if`, and every path out of
+        // emit_chain_or_return returns, so no stack value is left behind.
+        const u32 st[1] = { target };
+        emit_chain_or_return(wb, ctx_ptr, 0u, 0u, nullptr, -1, nullptr, nullptr, 0u,
+                             (u16)BEM_RSYM_NONE, (u16)BEM_RSYM_NONE, st, 1u);
     } else {
         emit_exit_census_jb(wb, 0x026B34D8u);   // [census] only the non-merged op_return path (post-fix: taken collapses)
         wb.op_i32_const((s32)ctx_ptr);
@@ -360,7 +376,7 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
         if (is_bdnz) wb.op_i32_ne(); else wb.op_i32_eq();
         wb.op_if();
             emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, target);
-            if (!is_terminal) emit_coalesced_taken_exit(wb, ctx_ptr, merged, region_gen,
+            if (!is_terminal) emit_coalesced_taken_exit(wb, ctx_ptr, target, merged, region_gen,
                                                         chain_tag_addr, chain_slot_addr,
                                                         chain_tag_sym, chain_slot_sym);
         if (is_terminal) {
@@ -393,7 +409,7 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
             // [coalesce] mid-block: taken drains a pending GP write + returns to
             // the dispatcher; the not-taken arm stores nothing and the block
             // continues with the fall-through instructions.
-            if (!is_terminal) emit_coalesced_taken_exit(wb, ctx_ptr, merged, region_gen,
+            if (!is_terminal) emit_coalesced_taken_exit(wb, ctx_ptr, target, merged, region_gen,
                                                         chain_tag_addr, chain_slot_addr,
                                                         chain_tag_sym, chain_slot_sym);
         if (is_terminal) {

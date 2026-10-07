@@ -69,6 +69,11 @@ constexpr u32 BEM_LEVER_STATIC_CHAIN = 1u << 10;
 constexpr u32 BEM_LEVER_WRITE_NOLOAD = 1u << 11;
 // FPRRegCache::Flush batches its constant shadow-mask set/clear RMWs into one.
 constexpr u32 BEM_LEVER_FLUSH_MASK_BATCH = 1u << 12;
+// Mid-block coalesced taken exits (emit_coalesced_taken_exit, plain per-block
+// bodies) tail-chain in-WASM to their STATIC target through the same
+// downcount-bail + constant-bucket probe emit_chain_or_return gives a static
+// block terminal, instead of op_return-ing every taken exit to the C loop.
+constexpr u32 BEM_LEVER_TAKEN_CHAIN = 1u << 13;
 
 bool bem_lever_on(u32 bit);
 

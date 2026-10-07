@@ -34,7 +34,13 @@
 //
 // Usage: node block_replay.js <state_dir> <mode> <max_slices> [--slice N]
 //        [--cell 0xADDR=0xVAL]... [--trace-out FILE] [--stop-park]
-//        [--json FILE] [--top-pcs N] [--dump-dir DIR]
+//        [--json FILE] [--top-pcs N] [--dump-dir DIR] [--exit-census] [--no-collapse]
+//
+// --no-collapse disables bem_chain_loop_c's busy-poll clock-jump heuristic
+// (block_cache.cpp g_bem_idle_collapse_off). That heuristic keys on WHICH blocks
+// return to the C loop, so any lever that changes the dispatch pattern changes
+// where it fires (and it fires on real work: SAB __GXSetDirtyState). Use it on
+// BOTH arms of a differential so slicing depends on the guest stream alone.
 
 #include "guests/powerpc-next/ppc_emit.h"
 #include "guests/powerpc-next/ppc_analyst.h"
@@ -61,6 +67,8 @@ extern uint32_t g_bem_accurate_nans;
 extern uint32_t g_bem_ni_flush;
 extern unsigned char g_bem_chain_enabled;
 extern int g_bem_gp_dirty;
+extern uint32_t g_bem_aot_count_exits;
+extern uint32_t g_bem_idle_collapse_off;
 }
 
 static constexpr u32 kMaxBlockInsts = 64u;      // JitWasm.cpp kMaxBlockInsts
@@ -233,12 +241,15 @@ int main(int argc, char** argv) {
     const char* trace_out = nullptr;
     const char* json_out = nullptr;
     bool stop_park = false;
+    bool exit_census = false;
     std::vector<std::pair<u32, u32>> cells;
     for (int i = 4; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--slice") && i + 1 < argc) slice = std::atol(argv[++i]);
         else if (!std::strcmp(argv[i], "--trace-out") && i + 1 < argc) trace_out = argv[++i];
         else if (!std::strcmp(argv[i], "--json") && i + 1 < argc) json_out = argv[++i];
         else if (!std::strcmp(argv[i], "--stop-park")) stop_park = true;
+        else if (!std::strcmp(argv[i], "--exit-census")) exit_census = true;
+        else if (!std::strcmp(argv[i], "--no-collapse")) g_bem_idle_collapse_off = 1u;
         else if (!std::strcmp(argv[i], "--top-pcs") && i + 1 < argc) g_top_pcs = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--dump-dir") && i + 1 < argc) g_dump_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--cell") && i + 1 < argc) {
@@ -275,6 +286,9 @@ int main(int argc, char** argv) {
     g_bem_chain_enabled = 1u;
     g_hle_hook_query = [](uint32_t) -> bool { return false; };
     g_bem_emit_mark_cb = &mark_cb;
+    // --exit-census: the emitter's per-exit-reason counters (offline diag only;
+    // they ADD ops, so never combine with count mode for an ops figure).
+    if (exit_census) g_bem_aot_count_exits = 1u;
     for (auto& c : cells) {
         *reinterpret_cast<volatile u32*>((uintptr_t)c.first) = c.second;
         std::fprintf(stderr, "[replay] cell 0x%08X = 0x%08X\n", c.first, c.second);
@@ -416,6 +430,15 @@ int main(int argc, char** argv) {
         const m = Object.entries(st.mmioAddrs).sort((a, b) => b[1] - a[1]).slice(0, 12);
         console.error('[replay] MMIO (top): ' + JSON.stringify(m));
     });
+    if (exit_census) {
+        static const struct { u32 cell; const char* name; } kc[] = {
+            {0x026B34D8u, "coalesced_taken_host_return"}, {0x026B34DCu, "service_bail"},
+            {0x026B34E0u, "vector_guard"}, {0x026B34F0u, "terminal_host_return"},
+        };
+        for (const auto& c : kc)
+            std::fprintf(stderr, "[replay] exit-census %-28s %u\n", c.name,
+                         *reinterpret_cast<volatile u32*>((uintptr_t)c.cell));
+    }
     if (js_stat("interp"))
         std::fprintf(stderr, "[replay] first interp fallback pc=0x%08x inst=0x%08x\n",
                      (u32)js_stat("interpPc"), (u32)js_stat("interpInst"));

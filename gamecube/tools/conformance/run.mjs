@@ -26,10 +26,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import puppeteer from 'puppeteer';
 
-const ROOT = '/Users/caseybement/Bemental77.github.io';
+// Repo root = three levels up from this file (gamecube/tools/conformance/), so the
+// runner works from any checkout. CONFORMANCE_BUILD_DIR points it at a build tree
+// other than build-emcc-test (e.g. a scratch build); its tests/ subdir is served.
+const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../..');
 const testName = process.argv[2] || 'test_diff_next';
 const TIMEOUT_MS = parseInt(process.argv[3] || '300000', 10);
-const TEST_DIR = path.join(ROOT, 'gamecube/bementalJIT/build-emcc-test/tests');
+const TEST_DIR = path.join(process.env.CONFORMANCE_BUILD_DIR ||
+                           path.join(ROOT, 'gamecube/bementalJIT/build-emcc-test'), 'tests');
 const PORT = 8000 + Math.floor(Math.random() * 1000);
 const html = `${testName}.html`;
 
@@ -74,7 +78,10 @@ const HARD_FAIL_RE = /\bLinkError\b|\bRuntimeError\b|\babort\(|\bAborted\b|uncau
         args: ['--no-sandbox', '--enable-features=SharedArrayBuffer', '--disable-dev-shm-usage'],
         protocolTimeout: TIMEOUT_MS + 30000,
     };
-    if (fs.existsSync(SYS_CHROME)) launchOpts.executablePath = SYS_CHROME;
+    // PUPPETEER_EXECUTABLE_PATH (any Chrome/Chromium) wins; then the macOS system
+    // Chrome; then puppeteer's 'chrome' channel.
+    if (process.env.PUPPETEER_EXECUTABLE_PATH) launchOpts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+    else if (fs.existsSync(SYS_CHROME)) launchOpts.executablePath = SYS_CHROME;
     else launchOpts.channel = 'chrome';
 
     let browser;
