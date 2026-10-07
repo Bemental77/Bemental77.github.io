@@ -15,7 +15,7 @@
 //     80400004  li    r4, 7
 //     80400008  bl    F
 //     8040000C  add   r6, r3, r5            <- RAS-predicted return site
-//     80400010  stw   r6, 0(r7)
+//     80400010  addi  r9, r6, 3            (r6, r9 dirty in locals at the bge)
 //     80400014  cmpwi r6, 40
 //     80400018  bge   80400024             (forward conditional: mid-block exit)
 //     8040001C  addi  r6, r6, 1000
@@ -26,7 +26,7 @@
 //     80400108  lwz   r11, 8(r7)
 //     8040010C  add   r5, r5, r11
 //     80400110  [blr | mflr r0; li r12,4; add r0,r0,r12; mtlr r0; blr]  (RAS hit | miss)
-//   C 80400200  addi  r8, r6, 1
+//   C 80400200  add   r8, r6, r9
 //     80400204  stw   r8, 12(r7)
 //     80400208  b     D
 //   D 80400300  b     D                     (self-loop: never appended)
@@ -114,6 +114,7 @@ EM_JS(void, ram_reset, (), {
     Module.__ram.set(0x80500008, 0x11);
 });
 EM_JS(void, ram_set, (u32 a, u32 v), { Module.__ram.set(a >>> 0, v | 0); });
+EM_JS(u32, ram_get, (u32 a), { return (Module.__ram.get(a >>> 0) | 0) >>> 0; });
 EM_JS(int, ram_digest, (), {
     let h = 0x811C9DC5 | 0;
     for (const [a, v] of [...Module.__ram.entries()].sort((x, y) => x[0] - y[0])) {
@@ -133,7 +134,7 @@ static void load_program(bool ras_miss) {
     put(0x80400004u, d_form(14, 4, 0, 7));
     put(0x80400008u, b_rel(0x80400008u, PC_F, true));
     put(0x8040000Cu, x_form(6, 3, 5, 266));                 // add r6,r3,r5
-    put(0x80400010u, d_form(36, 6, 7, 0));                  // stw r6,0(r7)
+    put(0x80400010u, d_form(14, 9, 6, 3));                  // addi r9,r6,3
     put(0x80400014u, d_form(11, 0, 6, 40));                 // cmpwi r6,40
     put(0x80400018u, bc_rel(4, 0, 0x80400018u, 0x80400024u));  // bge
     put(0x8040001Cu, d_form(14, 6, 6, 1000));
@@ -153,13 +154,14 @@ static void load_program(bool ras_miss) {
         put(0x8040011Cu, MTLR0);
         put(0x80400120u, BLR);
     }
-    put(0x80400200u, d_form(14, 8, 6, 1));
+    put(0x80400200u, x_form(8, 6, 9, 266));                 // add r8,r6,r9
     put(0x80400204u, d_form(36, 8, 7, 12));
     put(0x80400208u, b_rel(0x80400208u, PC_D, false));
     put(0x80400300u, b_rel(0x80400300u, PC_D, false));
 }
 
 struct Obs {
+    u32 gpr[32] = {};
     u32 pc = 0;
     s32 dc = 0;
     u64 ctx_hash = 0;
@@ -246,6 +248,7 @@ static Obs run_arm(bool follow, s32 dc0, const std::vector<u32>& evict_pcs = {})
         o.ctx_hash = fnv(ctx + 0x14, ppc_off::DOWNCOUNT - 0x14, 1469598103934665603ull);
         o.ctx_hash = fnv(ctx + 0x2F4, 0x1340 - 0x2F4, o.ctx_hash);
         o.ram = ram_digest();
+        for (u32 i = 0; i < 32; ++i) o.gpr[i] = r32(ppc_off::gpr(i));
     }
     std::free(ctx);
     return o;
@@ -306,11 +309,24 @@ int main() {
                     what, plain_compiles, sb_compiles);
         expect(sb_compiles < plain_compiles, "superblock arm compiled fewer blocks");
     }
-    // The ras-hit run must reach D with the full program's result.
+    // Absolute results, independent of the emitter (both arms above share it,
+    // so an emitter bug common to both would pass the differential): r5 =
+    // (5+7)*7 + 0x11 = 101, r6 = 5 + 101 = 106 (>= 40, so `bge` is TAKEN and the
+    // +1000 path is skipped), r9 = 109, r8 = 215. The taken `bge` leaves the
+    // block with r6 and r9 dirty in locals (no store or host call since they were
+    // written): C reads them from ctx, so r8 = 215 only if that exit flushes them.
     load_program(false);
-    {
-        const Obs b = run_arm(true, 100000);
-        expect(b.pc == PC_D, "superblock run reaches D");
+    for (int f = 0; f < 2; ++f) {
+        const Obs b = run_arm(f == 1, 100000);
+        const bool ok = b.pc == PC_D && b.gpr[5] == 101u && b.gpr[6] == 106u && b.gpr[9] == 109u &&
+                        b.gpr[8] == 215u && b.gpr[11] == 0x11u && ram_get(0x80500000u) == 0u &&
+                        ram_get(0x80500004u) == 0u && ram_get(0x8050000Cu) == 215u;
+        char what[160];
+        std::snprintf(what, sizeof what, "%s: absolute result r5=%u r6=%u r8=%u [0]=%u [4]=%u [12]=%u",
+                      f ? "superblock" : "plain", b.gpr[5], b.gpr[6], b.gpr[8],
+                      ram_get(0x80500000u), ram_get(0x80500004u), ram_get(0x8050000Cu));
+        expect(ok, what);
+        std::printf("[%s] %s\n", ok ? "PASS" : "FAIL", what);
     }
     // Eviction: re-running after evicting blocks that other blocks chain to
     // (statically: C from R's `b C`; at runtime: R from F's blr) must miss,

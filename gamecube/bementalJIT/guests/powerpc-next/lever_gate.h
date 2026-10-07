@@ -93,6 +93,11 @@ constexpr u32 BEM_LEVER_PROBE_DIET = 1u << 15;
 // instead of a clock-jump to the next event. The spinning path ends with the same
 // downcount (0) as before.
 constexpr u32 BEM_LEVER_IDLE_TAKEN = 1u << 16;
+// Mid-block (coalesced) conditional branches flush dirty GPRs only inside the
+// taken arm, which leaves the block; the fall-through keeps them dirty in their
+// wasm locals until the next exit. FPRs keep the head flush (the 2026-07-23
+// FPR keep-dirty attempt measured worse live; see emit_bcx).
+constexpr u32 BEM_LEVER_GPR_EXIT_FLUSH = 1u << 17;
 
 bool bem_lever_on(u32 bit);
 

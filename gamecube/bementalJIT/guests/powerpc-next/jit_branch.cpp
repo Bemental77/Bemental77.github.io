@@ -328,8 +328,26 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
     // [self-loop PM47] fpr_flush_skip (terminal self-loop bcx only): the
     // caller's split epilogue owns those regs — scratch-spill on the
     // self-chain path, full flush otherwise. Keeps them Single + dirty here.
-    rc.Flush(ctx_ptr);
+    // [BEM_LEVER_GPR_EXIT_FLUSH 2026-10-07] a MID-BLOCK branch's taken arm is
+    // the only path that leaves the block, so only it needs memory-coherent
+    // GPRs: it flushes from a snapshot of the compile-time state (restored
+    // after the arm, which always returns / tail-calls). The fall-through keeps
+    // the dirty locals; the next exit (or the epilogue) stores them once. Per
+    // execution the stores can only go down: the taken path stores what the head
+    // flush stored, the fall-through stores each register once at its next exit
+    // instead of here AND again there when it is rewritten in between.
+    const bool gpr_exit_flush = !is_terminal && !merged && region_gen < 0 &&
+                                bem_lever_on(BEM_LEVER_GPR_EXIT_FLUSH);
+    if (!gpr_exit_flush) rc.Flush(ctx_ptr);
     frc.Flush(ctx_ptr, BitSet32(~fpr_flush_skip.m_val));
+    auto taken_gpr_flush_begin = [&]() {
+        RegCache::StateSnapshot snap{};
+        if (gpr_exit_flush) { snap = rc.SaveState(); rc.Flush(ctx_ptr); }
+        return snap;
+    };
+    auto taken_gpr_flush_end = [&](const RegCache::StateSnapshot& snap) {
+        if (gpr_exit_flush) rc.RestoreState(snap);
+    };
 
     if (bo == 20) {
         // "branch always" — equivalent to bx without LK side-effect choice.
@@ -375,10 +393,14 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
         wb.op_i32_const(0);
         if (is_bdnz) wb.op_i32_ne(); else wb.op_i32_eq();
         wb.op_if();
+        {
+            const auto gsnap = taken_gpr_flush_begin();
             emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, target);
             if (!is_terminal) emit_coalesced_taken_exit(wb, ctx_ptr, target, merged, region_gen,
                                                         chain_tag_addr, chain_slot_addr,
                                                         chain_tag_sym, chain_slot_sym);
+            taken_gpr_flush_end(gsnap);
+        }
         if (is_terminal) {
             wb.op_else();
             emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, fallthrough);
@@ -405,6 +427,8 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
             emit_crbit_test(wb, ctx_ptr, bi);
         if (!branch_if_true) wb.op_i32_eqz();        // invert: stack=1 iff taken
         wb.op_if();
+        {
+            const auto gsnap = taken_gpr_flush_begin();
             emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, target);
             // [coalesce] mid-block: taken drains a pending GP write + returns to
             // the dispatcher; the not-taken arm stores nothing and the block
@@ -412,6 +436,8 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
             if (!is_terminal) emit_coalesced_taken_exit(wb, ctx_ptr, target, merged, region_gen,
                                                         chain_tag_addr, chain_slot_addr,
                                                         chain_tag_sym, chain_slot_sym);
+            taken_gpr_flush_end(gsnap);
+        }
         if (is_terminal) {
             wb.op_else();
             emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, fallthrough);
@@ -423,6 +449,7 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
     // Genuinely rare forms (LK conditional calls; exotic CTR+CR combos):
     // fall back to the interpreter (unchanged behavior). ppc_state.pc is
     // written by interp; these terminals still rely on that path.
+    if (gpr_exit_flush) rc.Flush(ctx_ptr);   // the interpreter reads gpr[]
     wb.op_i32_const((s32)inst);
     wb.op_i32_const((s32)op.address);
     wb.op_call(WIMPORT_INTERP);
