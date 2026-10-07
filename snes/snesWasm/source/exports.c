@@ -375,6 +375,95 @@ unsigned int getStateSaveSize(void){
    when no game runs or `size` is not getStateSaveSize(). */
 #define SNES_NOISE_TAG 0x4e534531u /* "NSE1": ICPU.UNUSED2 holds so.noise_gen */
 static void saveStateWrite(unsigned char *data);
+
+/* THE LATCHED PADS ARE GUEST STATE, AND THE BLOB DID NOT CARRY THEM.
+ * IPPU.Joypads[0..4] is what a MANUAL serial read of $4016/$4017 shifts out
+ * (ppu.c S9xGetCPU) — and the Super Multitap's pads 3-5 are reached ONLY
+ * that way for pads 4/5. It is refreshed once per frame by S9xUpdateJoypads
+ * at V = ScreenHeight + 3, mid-frame, while a frame boundary (and so every
+ * savestate rollback takes) is at V = 0. So between V = 0 and V = 227 the
+ * running machine holds the PREVIOUS frame's pads, and a console that loaded
+ * frame k after simulating k+n held frame k+n-1's instead: a manual read in
+ * that window would fork a rolled-back console from one that never rolled
+ * back. Not carried before because nothing here read pads 3-5.
+ *
+ * WHERE: five 16-bit words in PPU fields no code reads (ppu.h UNUSED9[6],
+ * UNUSED2, UNUSED10[2]), tagged in UNUSED1, so the layout and the size are
+ * unchanged and every savestate written before this still loads exactly as it
+ * did (tag absent -> IPPU.Joypads left alone, the old behaviour).
+ * Only the low 16 bits are kept: S9xUpdateJoypads ORs 0xffff0000 into a
+ * NONZERO pad for SNES_JOYPAD / SNES_MULTIPLAYER5 and leaves 0 as 0, so the
+ * load re-applies exactly that rule. */
+#define SNES_JOY_TAG 0x4a /* 'J' */
+static void snesPackJoypads(void){
+   uint16_t w[5];
+   int i;
+   for(i = 0; i < 5; i++) w[i] = (uint16_t)IPPU.Joypads[i];
+   memcpy(&PPU.UNUSED9[0], &w[0], 6);
+   PPU.UNUSED2 = w[3];
+   memcpy(&PPU.UNUSED10[0], &w[4], 2);
+   PPU.UNUSED1 = SNES_JOY_TAG;
+}
+static void snesUnpackJoypads(void){
+   uint16_t w[5];
+   int i;
+   if(PPU.UNUSED1 != SNES_JOY_TAG) return;
+   memcpy(&w[0], &PPU.UNUSED9[0], 6);
+   w[3] = PPU.UNUSED2;
+   memcpy(&w[4], &PPU.UNUSED10[0], 2);
+   for(i = 0; i < 5; i++){
+      uint32_t v = w[i];
+      if(v && (IPPU.Controller == SNES_JOYPAD || IPPU.Controller == SNES_MULTIPLAYER5)) v |= 0xffff0000u;
+      IPPU.Joypads[i] = v;
+   }
+}
+
+/* THE SUPER MULTITAP, ON PORT 2. snes9x has the whole read path (ppu.c
+ * S9xGetCPU $4016/$4017 under IPPU.Controller == SNES_MULTIPLAYER5: the
+ * adaptor's ID bit on a latched $4017, pads 2/3 on data lines 0/1 while
+ * $4201 bit 7 is set, pads 4/5 while it is clear; S9xUpdateJoypads fills
+ * $421C-$421F from pads 3) and Settings.MultiPlayer5 is already true, but
+ * init_sfc_setting() chose ControllerOption = SNES_JOYPAD, so it was never
+ * plugged in. This plugs it in or pulls it out.
+ *
+ * It is a SETTING, not a register: S9xResetPPU re-derives IPPU.Controller from
+ * Settings.ControllerOption, and loadState runs S9xReset(), so a rollback
+ * load keeps whichever adaptor is plugged in and no blob byte has to carry it.
+ * Every console in a room must therefore call this with the same value before
+ * frame 0; snes.html does, from the room's agreed roster.
+ *
+ * Returns 1 when the multitap is now plugged in. A cart that refuses it
+ * (memmap.c InitROM clears MultiPlayer5Master for SuperFX and Sufami Turbo)
+ * returns 0 and stays on a plain pad. With on == 0 this restores exactly
+ * what init_sfc_setting() set. */
+EMSCRIPTEN_KEEPALIVE
+int32_t setMultitap(int32_t on){
+   if(on && runGameFlag && !Settings.MultiPlayer5Master) on = 0;
+   Settings.ControllerOption = on ? SNES_MULTIPLAYER5 : SNES_JOYPAD;
+   IPPU.Controller = on ? SNES_MULTIPLAYER5 : SNES_JOYPAD;
+   return on ? 1 : 0;
+}
+
+/* Read-back for a test: 1 when the core's live controller is the multitap. */
+EMSCRIPTEN_KEEPALIVE
+int32_t getMultitap(void){
+   return IPPU.Controller == SNES_MULTIPLAYER5 ? 1 : 0;
+}
+
+/* Read-back for a test: the console's 128 KB of work RAM, where a test ROM
+ * (tools/snes_multitap_rom.mjs) leaves what the GUEST read off its pads. */
+EMSCRIPTEN_KEEPALIVE
+uint8_t *getWramPtr(void){
+   return Memory.RAM;
+}
+
+/* Read-back for a test: the pad word the CORE latched for port 0..4 (what a
+ * manual serial read shifts out), not what the page wrote. */
+EMSCRIPTEN_KEEPALIVE
+uint32_t getLatchedJoypad(int32_t port){
+   if(port < 0 || port >= 5) return 0;
+   return IPPU.Joypads[port];
+}
 EMSCRIPTEN_KEEPALIVE
 bool saveStateInto(unsigned char *data, unsigned int size){
     if(!runGameFlag || !data || size != getStateSaveSize())return false;
@@ -434,6 +523,7 @@ static void saveStateWrite(unsigned char *data){
 #endif
    memcpy(buffer, &ICPU, sizeof(ICPU));
    buffer += sizeof(ICPU);
+   snesPackJoypads();
    memcpy(buffer, &PPU, sizeof(PPU));
    buffer += sizeof(PPU);
    memcpy(buffer, &DMA, sizeof(DMA));
@@ -572,6 +662,7 @@ bool loadState(const unsigned char* data, unsigned int size){
    if (ICPU.UNUSED3 == SNES_NOISE_TAG)
       so.noise_gen = (int32_t) ICPU.UNUSED2;
 #endif
+   snesUnpackJoypads();
    ICPU.ShiftedPB = ICPU.Registers.PB << 16;
    ICPU.ShiftedDB = ICPU.Registers.DB << 16;
    S9xSetPCBase(ICPU.ShiftedPB + ICPU.Registers.PC);
