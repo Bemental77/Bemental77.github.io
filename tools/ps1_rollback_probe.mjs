@@ -17,6 +17,20 @@
 //                  re-armed at every return, a timed save every --remeasure-every
 //                  delay frames) — the page side of lib/netplay.js opts.rbResume
 //        --url BASE  (http://localhost:8080)
+//        --worker PATH  a worker build to test instead of /ps1/ps1Wasm/dist/wasmpsx_worker.js
+//   THREE AND FOUR PLAYERS (tools/ps1_rollback_harness.html __runN):
+//        --players 3|4  N rollback consoles (console c owns port c and predicts
+//                  every other port, each with its own random lateness) against a
+//                  reference that never guesses; the multitap in port 1 of every
+//                  core; the disc is tools/ps1_multitap_disc.mjs (guest code that
+//                  reads all four slots through the multitap, continuously) unless
+//                  --rom/--disc-file says otherwise. Teeth after the run: each
+//                  port held at rest, and no multitap, MUST change the state.
+//        --broken-mt  the consoles have no multitap, the reference has. MUST fail.
+//        --mt-poke restore  scramble the multitap's state before every step that
+//                  rolls back — MUST pass (a rollback load restores it);
+//        --mt-poke live     ... before steps that do not — MUST fail (it reaches the guest).
+//        --no-teeth  skip the per-port / no-multitap reference runs
 // Env: CHROME_PATH
 import os from 'node:os';
 import fs from 'node:fs';
@@ -33,9 +47,20 @@ const opts = {
   broken: argv.includes('--broken'), budget: +arg('budget', 0),
   switchEvery: +arg('switch-every', 0), remeasureEvery: +arg('remeasure-every', 10),
   url: '/ps1/ps1Wasm/roms/' + arg('rom', 'MonsterRancher2') + '.bin.partaa.gz',
+  worker: arg('worker', null), players: +arg('players', 2),
+  brokenMt: argv.includes('--broken-mt'), mtPoke: arg('mt-poke', null), noTeeth: argv.includes('--no-teeth'),
 };
+if (opts.players > 2) {
+  // The multitap test disc unless a real one is named; it is handed to the page as bytes.
+  if (!argv.includes('--rom')) {
+    const { buildMultitapDisc } = await import(new URL('./ps1_multitap_disc.mjs', import.meta.url).href);
+    opts.discB64 = Buffer.from(buildMultitapDisc()).toString('base64');
+  }
+  if (!argv.includes('--warm')) opts.warm = 240;
+  if (!argv.includes('--frames')) opts.frames = 1200;
+}
 const md5 = (f) => { try { return crypto.createHash('md5').update(fs.readFileSync(f)).digest('hex'); } catch (e) { return 'missing'; } };
-const W = 'ps1/ps1Wasm/dist/wasmpsx_worker.';
+const W = opts.worker && process.env.PS1_WORKER_DIR ? process.env.PS1_WORKER_DIR + '/wasmpsx_worker.' : 'ps1/ps1Wasm/dist/wasmpsx_worker.';
 const before = { js: md5(W + 'js'), wasm: md5(W + 'wasm') };
 
 const browser = await puppeteer.launch({
@@ -58,5 +83,6 @@ try {
   }
 } finally { await browser.close(); }
 const after = { js: md5(W + 'js'), wasm: md5(W + 'wasm') };
+if (opts.discB64) opts.discB64 = '(' + opts.discB64.length + ' base64 chars)';
 console.log(JSON.stringify({ opts, result, md5Before: before, md5After: after, load: os.loadavg().map((x) => +x.toFixed(2)) }, null, 1));
 process.exit(result && result.ok ? 0 : 1);

@@ -47,7 +47,7 @@ if ! command -v emcc >/dev/null; then echo "build.sh: no emcc on PATH (see the h
 V=$(emcc --version | head -1)
 case "$V" in *" 6.0.2"*) ;; *) if [ -z "$PS1_ANY_EMCC" ]; then echo "build.sh: $V is not the vendored 6.0.2 (PS1_ANY_EMCC=1 to build anyway; the layout check in tools/reappend.mjs still guards the result)" >&2; exit 1; fi ;; esac
 B=$(mktemp -d "${TMPDIR:-/tmp}/ps1build.XXXXXX")
-trap 'rm -rf "$B"' EXIT
+trap '[ -n "$PS1_KEEP_BUILD" ] && echo "build dir kept: $B" || rm -rf "$B"' EXIT
 # Build in a scratch copy: pcsx-wasm-src holds tracked artifacts of an older
 # build (wasmpsx_worker.*, pcsx_ww.*) that a make in place would overwrite.
 ( cd "$HERE/pcsx-wasm-src" && tar cf - --exclude=./docs --exclude=./wasmpsx_worker.js --exclude=./wasmpsx_worker.wasm --exclude=./wasmpsx_worker.data --exclude=./pcsx_ww.js --exclude=./pcsx_ww.wasm --exclude='*.o' . ) | ( cd "$B" && tar xf - )

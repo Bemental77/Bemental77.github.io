@@ -134,11 +134,20 @@ async function run(opts) {
       if ((f + 1) % (EVERY * 10) === 0) log('frame ' + (f + 1) + ' checks=' + checks.length + ' mism=' + mism + ' vram=' + vchecks + '/' + vmism);
     }
   }
+  // opts.peekRam: guest main-RAM byte offsets (psxM + off, 32-bit words) to read off both cores at the end.
+  const peek = {};
+  if (opts.peekRam && opts.peekRam.length) {
+    for (const [name, st] of [['A', A], ['B', B]]) {
+      const m = await ask(st, 'netSnapMapResult', { cmd: 'netSnapMap', block: 1 << 20 });
+      const r = await ask(st, 'netPeekResult', { cmd: 'netPeek', addrs: opts.peekRam.map((o) => (m.mem.m >>> 0) + o) });
+      peek[name] = r.vals.map((v) => v >>> 0);
+    }
+  }
   const distinct = new Set(checks.map((c) => c.a)).size;
   return { ok: mism === 0 && checks.length > 0 && take.A && take.B && distinct > 1, frames: N, every: EVERY, ports: PORTS,
            checks: checks.length, mismatches: mism, vramChecks: vchecks, vramMismatches: vmism, distinctRamHashes: distinct,
            firstMismatch: firstMism, take, coreRate: { A: A.coreRate, B: B.coreRate }, multitap: mt,
-           last: checks[checks.length - 1], printsA: A.prints.slice(-4), printsB: B.prints.slice(-4) };
+           last: checks[checks.length - 1], peek, printsA: A.prints.slice(-4), printsB: B.prints.slice(-4) };
 }
 </script>
 </body>

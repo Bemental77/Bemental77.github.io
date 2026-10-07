@@ -36,8 +36,10 @@ const lines = [];
 function log(s) { lines.push(s); logEl.textContent = lines.slice(-60).join('\n'); if (window.__state) window.__state.progress = s; }
 window.__log = () => lines.slice();
 
+// opts.worker overrides the worker URL (a scratch build under test); default: the shipped one.
+let WORKER_URL = '/ps1/ps1Wasm/dist/wasmpsx_worker.js';
 function mkWorker() {
-  const w = new Worker('/ps1/ps1Wasm/dist/wasmpsx_worker.js?netgate=1&v=' + Date.now() + (location.search.length > 1 ? '&' + location.search.slice(1) : ''));
+  const w = new Worker(WORKER_URL + '?netgate=1&v=' + Date.now() + (location.search.length > 1 ? '&' + location.search.slice(1) : ''));
   const st = { w, ready: false, booted: false, prints: [], q: [], frames: 0 };
   w.onmessage = (e) => {
     const d = e.data;
@@ -82,7 +84,8 @@ window.__state = { started: false, done: false, result: null, error: null, progr
 window.__start = function (opts) {
   if (window.__state.started) return true;
   window.__state.started = true;
-  window.__run(opts).then((r) => { window.__state.result = r; window.__state.done = true; },
+  if (opts.worker) WORKER_URL = opts.worker;
+  ((opts.players | 0) > 2 ? window.__runN : window.__run)(opts).then((r) => { window.__state.result = r; window.__state.done = true; },
                           (e) => { window.__state.error = String((e && e.stack) || e); window.__state.done = true; });
   return true;
 };
@@ -241,6 +244,160 @@ window.__run = async function (opts) {
     resimStepMs: { p50: pct(resimStepMs, .5), p90: pct(resimStepMs, .9), p99: pct(resimStepMs, .99), max: pct(resimStepMs, 1), n: resimStepMs.length },
     worker: stats, coreRate: A.coreRate,
     sample: checks.slice(0, 4),
+  };
+};
+
+// ══ THREE AND FOUR PLAYERS: N rollback consoles + a reference that never guesses ══
+// opts.players = N (3|4): the multitap is plugged into port 1 of EVERY core
+// ('netMultitap' {slots: N}) before frame 0, the pad image is the 4-slot one
+// (4 x 24 bytes; a 3-player room's slot D rests), and N consoles run — console
+// c owns port c and PREDICTS every other port (repeat-last-known), each remote
+// port's input arriving with its OWN random lateness 0..maxLag. When newly
+// known input contradicts a frame already run, the console rewinds to the
+// earliest wrong frame and re-simulates ('netRbStep' resim) — exactly the
+// single-remote engine above, per port. Reference A runs the TRUE pads
+// straight through ('netStep'). Every console fingerprints its confirmed
+// frames (urHashAt: psxM + psxH + VRAM + all static data, which includes the
+// pad state g and the multitap's PadMultitap); each must equal A's.
+// TEETH, run after the main pass (fresh single workers, same frames):
+//   * sensitivity, per port p < N: a reference with port p held at rest from
+//     frame `warm` on MUST disagree with A at some checkpoint;
+//   * the multitap is in the loop: a reference with NO multitap MUST disagree.
+// CONTROLS that must FAIL: opts.broken (rollbacks that restore but do not
+// correct), opts.brokenMt (the consoles have no multitap, the reference has),
+// opts.mtPoke === 'live' (the multitap's protocol state is scrambled
+// ('netMtPoke') before steps that do NOT roll back — it reaches the guest).
+// opts.mtPoke === 'restore' scrambles it before every step that DOES roll
+// back, and MUST PASS: the rollback load restores the multitap's state.
+function truePadN(f, port, quiet) {
+  if (port < 0 || (quiet != null && port === quiet.port && f >= quiet.from)) return [0xFF, 0xFF];
+  return truePad(f, port);
+}
+function padBufN(img) {     // img: [[b0,b1] x 4]
+  const a = new Uint8Array(24 * 4);
+  for (let p = 0; p < 4; p++) {
+    const o = p * 24;
+    a[o + 4] = 0; a[o + 5] = 0x41; a[o + 6] = img[p][0]; a[o + 7] = img[p][1];
+    a[o + 8] = 0xFF; a[o + 9] = 0xFF; a[o + 10] = 0x80; a[o + 11] = 0x80; a[o + 12] = 0x80; a[o + 13] = 0x80;
+  }
+  return a.buffer;
+}
+function b64bytes(b64) { const s = atob(b64), u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; }
+
+window.__runN = async function (opts) {
+  const N = opts.frames | 0, EVERY = opts.every | 0, MAXLAG = opts.maxLag | 0, RING = opts.ring | 0, WARM = opts.warm | 0;
+  const P = opts.players | 0, PORTS = 4;
+  const disc = opts.discB64 ? b64bytes(opts.discB64) : await fetchDisc(opts.url, opts.bytes);
+  log('players ' + P + ', disc bytes ' + disc.length + (opts.broken ? ' [BROKEN]' : '') + (opts.brokenMt ? ' [BROKEN-MT]' : '') + (opts.mtPoke ? ' [MT-POKE ' + opts.mtPoke + ']' : ''));
+  const truthImg = (f, quiet) => { const r = []; for (let p = 0; p < PORTS; p++) r.push(truePadN(f, p < P ? p : -1, quiet)); return r; };
+  async function bootCore(slots) {
+    const st = mkWorker();
+    const t0 = performance.now();
+    while (performance.now() - t0 < 120000 && !st.ready) await new Promise(r => setTimeout(r, 50));
+    if (!st.ready) throw new Error('worker never ready');
+    const m = await ask(st, 'netMultitapResult', { cmd: 'netMultitap', slots });
+    if (m.slots !== slots) throw new Error('core refused the multitap: asked ' + slots + ', has ' + m.slots + ' (an old worker?)');
+    const c = disc.slice();
+    const r = await ask(st, 'netBooted', { cmd: 'netBoot', name: 'disc.bin', buf: c.buffer }, [c.buffer]);
+    if (!r.ok) throw new Error('boot failed: ' + r.err);
+    if (!st.coreRate || !st.coreRate.take) throw new Error('takeover not active: ' + JSON.stringify(st.coreRate) + ' ' + st.prints.slice(-4).join(' | '));
+    st.mt = m.slots;
+    return st;
+  }
+  // A straight truth run (optionally with one port quiet / another multitap): hashes at the checkpoints.
+  async function straight(st, quiet, want) {
+    const hs = new Map();
+    for (let f = 0; f < WARM + N; f++) {
+      const b = padBufN(truthImg(f, quiet));
+      await ask(st, 'netFrame', { cmd: 'netStep', frame: f, count: 1, states: b }, [b]);
+      if (f >= WARM && (f - WARM) % EVERY === EVERY - 1) hs.set(f, (await ask(st, 'netLiveHashResult', { cmd: 'netLiveHash' })).hash);
+    }
+    return hs;
+  }
+
+  const A = await bootCore(P);
+  const C = [];
+  for (let c = 0; c < P; c++) C.push(await bootCore(opts.brokenMt ? 0 : P));
+  log('booted A (multitap ' + A.mt + ') + ' + P + ' consoles (multitap ' + C[0].mt + ')');
+  // Warm every core identically on the truth (plain gated frames, one at a time).
+  for (let f = 0; f < WARM; f++) {
+    const all = [A].concat(C).map((st) => { const b = padBufN(truthImg(f)); return ask(st, 'netFrame', { cmd: 'netStep', frame: f, count: 1, states: b }, [b]); });
+    await Promise.all(all);
+  }
+  for (const st of C) {
+    const init = await ask(st, 'netRbReady', { cmd: 'netRbInit', frame: WARM, ring: RING, budget: opts.budget || 0 });
+    if (!init.ok) return { ok: false, reason: 'rbInit: ' + init.err };
+  }
+  let rng = 12345; const rand = () => (rng = Math.imul(rng, 1103515245) + 12345 >>> 0) / 4294967296;
+  const S = C.map((st, c) => ({ st, c, known: Array(PORTS).fill(WARM - 1), used: new Map(), confirmedTo: WARM - 1, pendingHash: [],
+                                rollbacks: 0, resimFrames: 0, maxDepth: 0, pokes: 0, checks: [] }));
+  const predImgC = (s, f) => { const r = []; for (let p = 0; p < PORTS; p++) r.push(p >= P ? [0xFF, 0xFF] : p === s.c ? truePad(f, p) : truePad(Math.min(f, s.known[p]), p)); return r; };
+  const Ahash = new Map(); let mismatches = 0, missing = 0, compared = 0;
+  const stepMs = [];
+  for (let f = WARM; f < WARM + N; f++) {
+    const steps = S.map((s) => {
+      for (let p = 0; p < P; p++) if (p !== s.c) s.known[p] = Math.max(s.known[p], f - 1 - Math.floor(rand() * (MAXLAG + 1)));
+      let from = -1;
+      for (let k = s.confirmedTo + 1; k < f; k++) if (s.used.get(k) !== JSON.stringify(predImgC(s, k))) { from = k; break; }
+      const resim = [];
+      if (from >= 0) {
+        for (let k = from; k < f; k++) {
+          const img = opts.broken ? JSON.parse(s.used.get(k)) : predImgC(s, k);
+          s.used.set(k, JSON.stringify(opts.broken ? predImgC(s, k) : img));
+          resim.push({ frame: k, states: padBufN(img) });
+        }
+        s.rollbacks++; s.resimFrames += resim.length; if (resim.length > s.maxDepth) s.maxDepth = resim.length;
+      }
+      let conf = f - 1; for (let p = 0; p < P; p++) if (p !== s.c) conf = Math.min(conf, s.known[p]);
+      while (s.confirmedTo < conf) { s.confirmedTo++; if ((s.confirmedTo - WARM) % EVERY === EVERY - 1) s.pendingHash.push(s.confirmedTo); }
+      const img = predImgC(s, f); s.used.set(f, JSON.stringify(img));
+      for (const k of s.used.keys()) if (k < s.confirmedTo - 2) s.used.delete(k);
+      const poke = opts.mtPoke === 'restore' ? resim.length > 0 : opts.mtPoke === 'live' ? resim.length === 0 : false;
+      const pk = poke ? ask(s.st, 'netMtPokeResult', { cmd: 'netMtPoke' }).then(() => { s.pokes++; }) : null;
+      const sb = padBufN(img), tr = [sb]; for (const r of resim) tr.push(r.states);
+      const hash = s.pendingHash.splice(0);
+      return Promise.resolve(pk).then(() => ask(s.st, 'netFrame', { cmd: 'netRbStep', frame: f, states: sb, resim, hash, ring: RING, keepFrom: s.confirmedTo + 1 }, tr)).then((rb) => {
+        if (rb.err) throw new Error('console ' + s.c + ' step ' + f + ': ' + rb.err);
+        stepMs.push(rb.ms);
+        for (const h of rb.hashes) { if (h.hash == null) missing++; else s.checks.push({ frame: h.frame, b: h.hash }); }
+      });
+    });
+    const ta = padBufN(truthImg(f));
+    steps.push(ask(A, 'netFrame', { cmd: 'netStep', frame: f, count: 1, states: ta }, [ta]).then(async () => {
+      if ((f - WARM) % EVERY === EVERY - 1) Ahash.set(f, (await ask(A, 'netLiveHashResult', { cmd: 'netLiveHash' })).hash);
+    }));
+    await Promise.all(steps);
+    for (const s of S) for (const c of s.checks) if (c.a === undefined && Ahash.has(c.frame)) {
+      c.a = Ahash.get(c.frame); compared++;
+      if (c.a !== c.b) { mismatches++; if (mismatches <= 5) log('*** MISMATCH console ' + s.c + ' frame ' + c.frame + ' A=' + c.a + ' C=' + c.b); }
+    }
+    if ((f - WARM) % 300 === 0) log('frame ' + f + ' rollbacks=' + S.map(s => s.rollbacks).join('/') + ' compared=' + compared + ' mism=' + mismatches);
+  }
+  const consoleStats = S.map((s) => ({ port: s.c, rollbacks: s.rollbacks, resimFrames: s.resimFrames, maxDepth: s.maxDepth, pokes: s.pokes,
+                                       compared: s.checks.filter(c => c.a !== undefined).length }));
+  for (const st of C) st.w.terminate();
+  // ── teeth ──
+  const teeth = { ports: [], noMultitap: null };
+  if (!opts.noTeeth) {
+    const differs = (hs) => { let d = 0, n = 0; for (const [f, h] of hs) if (Ahash.has(f)) { n++; if (Ahash.get(f) !== h) d++; } return { differ: d, of: n }; };
+    for (let p = 0; p < P; p++) {
+      const st = await bootCore(P);
+      const r = differs(await straight(st, { port: p, from: WARM })); st.w.terminate();
+      teeth.ports.push(Object.assign({ port: p }, r)); log('sensitivity port ' + p + ': ' + r.differ + '/' + r.of + ' checkpoints differ');
+    }
+    const st0 = await bootCore(0);
+    teeth.noMultitap = differs(await straight(st0)); st0.w.terminate();
+    log('no-multitap reference: ' + teeth.noMultitap.differ + '/' + teeth.noMultitap.of + ' checkpoints differ');
+  }
+  const teethOk = opts.noTeeth ? true : teeth.ports.every((t) => t.differ > 0) && teeth.noMultitap.differ > 0;
+  const pct = (a, q) => { if (!a.length) return null; const s = a.slice().sort((x, y) => x - y); return +s[Math.min(s.length - 1, Math.floor(q * s.length))].toFixed(2); };
+  return {
+    ok: mismatches === 0 && missing === 0 && compared > 0 && consoleStats.every((c) => c.compared > 0 && c.rollbacks > 0) && teethOk
+        && (!opts.mtPoke || consoleStats.every((c) => c.pokes > 0)),
+    players: P, frames: N, warm: WARM, maxLag: MAXLAG, ring: RING, compared, mismatches, missing,
+    multitap: { reference: A.mt, consoles: S[0].st.mt }, consoles: consoleStats, teeth, teethOk,
+    stepMs: { p50: pct(stepMs, .5), p99: pct(stepMs, .99), max: pct(stepMs, 1), n: stepMs.length },
+    sample: S[0].checks.slice(0, 3),
   };
 };
 </script>

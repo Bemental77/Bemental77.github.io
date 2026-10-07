@@ -102,7 +102,7 @@ const stackLow = W.heapBase - 65536;
 if (old.STATIC_END > stackLow) bad.push('STATIC_END ' + old.STATIC_END + ' is past the end of static data (' + stackLow + ')');
 const g = sym.get('g');
 if (!g || g[0] + g[1] > old.STATIC_END) bad.push('the pad state g ' + JSON.stringify(g) + ' is not inside the fingerprinted range [1024,' + old.STATIC_END + ')');
-for (const extra of ['mt']) { const s = sym.get(extra); if (s && s[0] + s[1] > old.STATIC_END) bad.push(extra + ' ' + JSON.stringify(s) + ' is not inside the fingerprinted range'); }
+for (const extra of ['PadMultitap']) { const s = sym.get(extra); if (s && s[0] + s[1] > old.STATIC_END) bad.push(extra + ' ' + JSON.stringify(s) + ' is not inside the fingerprinted range'); }
 if (bad.length) fail('the new build is not laid out like the one the block was written for:\n  ' + bad.join('\n  '));
 
 // ── re-point the signature guard ─────────────────────────────────────────────

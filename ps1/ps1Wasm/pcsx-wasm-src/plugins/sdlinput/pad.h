@@ -117,15 +117,48 @@ typedef struct tagPadState {
 	volatile uint8_t	AnalogKeyStatus[ANALOG_TOTAL][4];
 } PADSTATE;
 
+// PadState[0] / [1] are the console's ports 1 and 2. With a MULTITAP in port 1
+// (PadMultitap.slots > 0, decided by the page before frame 0) PadState[0..3]
+// are its slots A-D and port 2 is empty. The page latches the whole array as
+// one contiguous image at get_ptr(-2): 2 x 24 bytes for the plain console, as
+// always, or 4 x 24 with the multitap.
+#define PAD_STATES 4
+
 typedef struct tagGlobalData {
 	CONFIG				cfg;
 
 	uint8_t				Opened;
 	//Display				*Disp;
 
-	PADSTATE			PadState[2];
+	PADSTATE			PadState[PAD_STATES];
 	volatile long		KeyLeftOver;
 } GLOBALDATA;
+
+// THE MULTITAP (SCPH-1070) IN PORT 1 — the protocol of Mednafen's
+// InputDevice_Multitap (psx/input/multitap.cpp; beetle-psx frontio.c), driven
+// byte by byte from sio.c. All of it is plain static data, so the worker's
+// raw-memory rollback snapshot ([1024, sbrk)) carries it with the rest of the
+// machine.
+typedef struct tagMultitap {
+	int32_t				slots;			// pads plugged into it (0 = no multitap: the plain console)
+	uint8_t				dtr;			// port 1 selected with DTR asserted
+	uint8_t				k;				// byte index in this transfer (0 = address)
+	uint8_t				mode;			// MT_IDLE .. MT_CARD
+	uint8_t				sel;			// pass-through slot
+	uint8_t				mc;				// this transfer is a memory-card one
+	uint8_t				full_mode_setting;	// TAP byte bit 0 of the last transfer: next one is "all four"
+	uint8_t				full_mode;		// latched at DTR assert
+	uint8_t				prev_fm_success;
+	uint8_t				fm_err;
+	uint8_t				sb[4][8];		// bytes the host sent each slot last full transfer = its next command
+	uint8_t				fm[4][8];		// each slot's reply in this full transfer
+} MULTITAP;
+
+extern MULTITAP			PadMultitap;
+
+int PADmtSlots(void);
+void PADmtSelect(int dtr);
+int PADmtByte(unsigned char in, unsigned char *out, int *ack);
 
 extern GLOBALDATA		g;
 

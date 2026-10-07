@@ -14,6 +14,7 @@
 //        --frames N (3600) --every N (60) --vram-every N (600) --ports 2|4 (2)
 //        --rom BASE (MonsterRancher2) | --disc URL  --mb N (89)
 //        --mt-a N / --mt-b N  multitap slots plugged into A / B before frame 0 (0)
+//        --peek-ram HEX,HEX..  main-RAM word offsets to print from both cores at the end
 //        --url BASE (http://localhost:8080)
 // Exit 0 only if every compared fingerprint matched, both cores took over the
 // governor, and the RAM fingerprint moved (distinct > 1).
@@ -29,6 +30,7 @@ const opts = {
   frames: +arg('frames', 3600), every: +arg('every', 60), vramEvery: +arg('vram-every', 600), ports: +arg('ports', 2),
   disc: arg('disc', '/ps1/ps1Wasm/roms/' + arg('rom', 'MonsterRancher2') + '.bin.partaa.gz'), bytes: (+arg('mb', 89)) * 1048576,
   mtA: +arg('mt-a', 0), mtB: +arg('mt-b', 0),
+  peekRam: arg('peek-ram', '') ? arg('peek-ram', '').split(',').map((x) => parseInt(x, 16)) : [],
 };
 if (!opts.b) { console.error('--b URL is required'); process.exit(2); }
 

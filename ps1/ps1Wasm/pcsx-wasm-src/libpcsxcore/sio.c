@@ -65,6 +65,14 @@ static unsigned int padst;
 
 char Mcd1Data[MCD_SIZE], Mcd2Data[MCD_SIZE];
 
+// THE MULTITAP lives in the pad plugin (plugins/sdlinput/pad_worker.c, with its
+// state), so that this file's statics — and every address after them — are
+// where they always were. PADmtSlots() == 0 is the plain two-port console, and
+// then none of the multitap paths below are taken.
+int PADmtSlots(void);
+void PADmtSelect(int dtr);
+int PADmtByte(unsigned char in, unsigned char *out, int *ack);
+
 // clk cycle byte
 // 4us * 8bits = (PSXCLK / 1000000) * 32; (linuzappz)
 // TODO: add SioModePrescaler and BaudReg
@@ -83,6 +91,37 @@ void sioWrite8(unsigned char value)
 #ifdef PAD_LOG
 	PAD_LOG("sio write8 %x\n", value);
 #endif
+	if (PADmtSlots())
+	{
+		if ((CtrlReg & 0x2002) == 0x0002)
+		{
+			// Port 1, DTR asserted: the multitap answers. Each byte's reply is read
+			// back once (RX_RDY until sioRead8), and it ACKs (the SIO interrupt)
+			// only where the device would.
+			unsigned char r;
+			int ack;
+			if (PADmtByte(value, &r, &ack))
+			{
+				StatReg |= RX_RDY;
+				buf[0] = r;
+				parp = 0;
+				bufcount = 0;
+				if (ack)
+					SIO_INT();
+				return;
+			}
+			// 0: slot A's memory card — the console's own card path below.
+		}
+		else if ((CtrlReg & 0x2002) == 0x2002 && padst == 0 && mcdst == 0 && value == 0x01)
+		{
+			// Port 2 has no pad while the multitap is in: nothing answers, no ACK.
+			StatReg |= RX_RDY;
+			buf[0] = 0xff;
+			parp = 0;
+			bufcount = 0;
+			return;
+		}
+	}
 	switch (padst)
 	{
 	case 1:
@@ -290,6 +329,8 @@ void sioWriteMode16(unsigned short value)
 void sioWriteCtrl16(unsigned short value)
 {
 	CtrlReg = value & ~RESET_ERR;
+	if (PADmtSlots())
+		PADmtSelect((CtrlReg & 0x2002) == 0x0002);
 	if (value & RESET_ERR)
 		StatReg &= ~IRQ;
 	if ((CtrlReg & SIO_RESET) || (!CtrlReg))
