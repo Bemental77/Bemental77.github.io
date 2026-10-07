@@ -78,9 +78,11 @@ const BROKERS = fronts.urls.p8084 + ',' + fronts.urls.p443;     // the refused o
 const ARGS = ['--no-sandbox', '--disable-dev-shm-usage', '--no-proxy-server', '--ignore-certificate-errors',
               `--host-resolver-rules=${fronts.resolverRule}`, '--disable-background-timer-throttling',
               '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows'];
-const browsers = [];
+const browsers = [], dirs = [];
 const cleanup = async () => {
   for (const b of browsers) { try { await b.close(); } catch (e) {} }
+  // ~83 MB of profile each; this box runs out of disk long before it runs out of CPU.
+  for (const d of dirs) { try { fs.rmSync(d, { recursive: true, force: true }); } catch (e) {} }
   try { await fronts.close(); } catch (e) {}
   try { await broker.close(); } catch (e) {}
   fw.close();
@@ -89,6 +91,7 @@ const cleanup = async () => {
 async function player(role) {
   const behind = role === 'joiner';
   const dir = behind ? fwProfileDir('npfw-room-') : fs.mkdtempSync(path.join(os.tmpdir(), 'npfw-room-'));
+  dirs.push(dir);
   const b = await puppeteer.launch({ headless: 'new', executablePath: behind ? fw.wrapper : CHROME, userDataDir: dir,
                                      args: ARGS, ...(behind ? { pipe: true } : {}), protocolTimeout: SECONDS * 1000 + 120000 });
   try { (await import('./browser_leak_guard.js')).default.guard(b, 'netplay_firewall_room_test'); } catch (e) {}
