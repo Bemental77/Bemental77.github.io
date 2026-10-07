@@ -256,10 +256,15 @@
       note: 'Only Mario Party 4 can run a room on GameCube — the other titles have no frame gate yet.',
       games: [ { key: 'Mario Party 4', label: 'Mario Party 4' } ] },
     { key: 'genesis', name: 'Sega Genesis', page: '/genesis.html', handoff: '/genesis.html?np=', hostFlag: 'host=1',
-      players: 2, note: 'Two players.',
+      // 4 since 2026-10-07: a Team Player / 4-Way Play goes in for 3+ seated on
+      // a cart that takes one (genesis.html genMultitapPlan). Neither listed
+      // game does, so the note says so rather than promising four.
+      players: 4, note: 'Two players. Three or four need a Team Player game — neither game here is one.',
       games: [ 'Sonic the Hedgehog 3', 'X-Men' ].map(function (l) { return { key: l, label: l }; }) },
     { key: 'snes', name: 'Super Nintendo', page: '/snes.html', handoff: '/snes.html?np=', hostFlag: 'host=1',
-      players: 2, note: 'Two players.',
+      // 4 since 2026-10-07: a Super Multitap goes in for 3+ seated
+      // (snes.html lsMultitapApply). SimCity reads two pads, so the note says so.
+      players: 4, note: 'Two players. Three or four need a Super Multitap game — SimCity is not one.',
       games: [ 'SimCity' ].map(function (l) { return { key: l, label: l }; }) },
     { key: 'ps1', name: 'PlayStation', page: '/ps1.html', handoff: '/ps1.html?np=', hostFlag: 'host=1',
       players: 2, note: 'Two players. Only the host has to pick the disc number — everyone loads the same one.',

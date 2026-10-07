@@ -11,8 +11,10 @@
 #      written in C — into dist/genesis_plus_gx.{js,wasm}.
 #
 # The upstream source tree is NOT vendored into this repo (it is ~90 MB). ONE
-# patch is applied, idempotently, by tools/patch_fm_busy_state.py (see it:
-# the YM2612 BUSY timer was not in the savestate, so a loaded state diverged). It is cloned to $GPGX_SRC, default ~/gpgx-src, and pinned by
+# patches are applied, idempotently: tools/patch_fm_busy_state.py (the YM2612
+# BUSY timer was not in the savestate, so a loaded state diverged) and
+# tools/patch_input_state.py (nor were the controller ports — pads latched once a
+# frame, the 4-Way Play latch, the Team Player handshake; 3-4 player rollback). It is cloned to $GPGX_SRC, default ~/gpgx-src, and pinned by
 # GPGX_REV so a rebuild reproduces the shipped binary.
 #
 # Toolchain: the VENDORED emsdk at the repo root (6.0.2 per
@@ -52,6 +54,8 @@ git -C "$GPGX_SRC" log --oneline -1 2>/dev/null || cat "$GPGX_SRC/REV.txt" 2>/de
 
 echo "== patch: carry the YM2612 BUSY timer in savestates (rollback needs exact load) =="
 python3 "$HERE/tools/patch_fm_busy_state.py" "$GPGX_SRC"
+echo "== patch: carry the controller ports (pads, 4-Way Play latch, Team Player) in savestates =="
+python3 "$HERE/tools/patch_input_state.py" "$GPGX_SRC"
 
 echo "== 1/2 build core archive =="
 ( cd "$GPGX_SRC" && emmake make -f Makefile.libretro platform=emscripten -j"$JOBS" )
@@ -105,7 +109,7 @@ emcc -O3 \
   -s EXIT_RUNTIME=0 \
   -s ASSERTIONS=0 \
   -s EXPORTED_RUNTIME_METHODS='["HEAPU8","HEAP16","HEAP32","HEAPU32","HEAPF32"]' \
-  -s EXPORTED_FUNCTIONS='["_gpx_init","_gpx_load","_gpx_run","_gpx_reset","_gpx_video","_gpx_width","_gpx_height","_gpx_frame_is_new","_gpx_fps","_gpx_sample_rate","_gpx_set_pad","_gpx_audio_avail","_gpx_audio_read","_gpx_audio_buf","_gpx_audio_clear","_gpx_audio_wpos","_gpx_audio_rewind","_gpx_set_fast_savestates","_gpx_set_video_skip","_gpx_state_size","_gpx_state_save","_gpx_state_load","_gpx_sram_size","_gpx_sram_ptr","_gpx_alloc","_gpx_free","_gpx_set_log","_malloc","_free"]'
+  -s EXPORTED_FUNCTIONS='["_gpx_init","_gpx_load","_gpx_run","_gpx_reset","_gpx_video","_gpx_width","_gpx_height","_gpx_frame_is_new","_gpx_fps","_gpx_sample_rate","_gpx_set_pad","_gpx_audio_avail","_gpx_audio_read","_gpx_audio_buf","_gpx_audio_clear","_gpx_audio_wpos","_gpx_audio_rewind","_gpx_set_fast_savestates","_gpx_set_video_skip","_gpx_state_size","_gpx_state_save","_gpx_state_load","_gpx_sram_size","_gpx_sram_ptr","_gpx_alloc","_gpx_free","_gpx_set_log","_gpx_set_multitap","_gpx_input_system","_gpx_input_dev","_gpx_wram_ptr","_malloc","_free"]'
 
 # GROWABLE_ARRAYBUFFERS=0 IS A BUG FIX, NOT A TUNING KNOB — MEASURED 2026-09-06.
 # emsdk 6.0.2's default (=1) hands the heap out as a RESIZABLE ArrayBuffer
