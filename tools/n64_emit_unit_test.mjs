@@ -1248,6 +1248,48 @@ tests.push(chainCase('chain: never INTO an interpreter op (NOTCOMPILED/FIN_BLOCK
 tests.push(chainCase('chain: into a label entry (its wrapper tail-calls the body)',
   [I(OPC.ADDIU, 0, 9, 5), I(OPC.BEQ, 0, 0, 0x10), 0, 0], { extra: 1 }));
 
+// ---- A PAGE'S SOURCE (2026-10-07, mips_emit.js A PAGE'S SOURCE IS PART OF WHAT A MODULE WAS BUILT
+// FROM): an off-thread module is installed at a field end only if what it was built from still
+// holds. For a TLB-mapped page that includes WHERE the page is compiled from: a span offered while
+// virtual page V mapped to physical P1, landing after V was remapped to P2 and recompiled from it
+// (same block, page valid, P1's words unchanged, ops of the same kinds), must NOT be installed —
+// it is P1's code. RED on a5f9447^ (installed). Control: with no remap it is installed.
+function asyncSourceCase(name, remap) {
+  const posted = [];
+  const sb = { WebAssembly, console: { error() {}, log() {}, warn() {} }, Uint32Array, Object, Array, Math, String, Map, Set, Proxy, performance: { now: () => 0 } };
+  sb.window = sb; sb.__fbAsync = { jitCold: true, jitChain: false };
+  sb.__n64JitWorkerUrl = 'stub';
+  sb.Worker = function () { this.postMessage = (b) => { for (const j of (Array.isArray(b) ? b : [b])) posted.push(j); }; };
+  vm.createContext(sb); vm.runInContext(src, sb);
+  const bm = sb.bementalMips;
+  const words = [I(OPC.ADDIU, 9, 9, 1), I(OPC.ADDIU, 8, 8, 1), 0, 0];
+  const w = makeWorld(words, {});
+  const M = { HEAPU32: w.HEAPU32, HEAPU8: new Uint8Array(w.mem.buffer), wasmTable: w.table, wasmMemory: w.mem };
+  sb.Module = M;
+  const V = 0x10100000, page = V >>> 12, BP = 0x5c0000, SRC2 = 0x18000;
+  const p1 = Object.assign({}, w.p, { vaddr: V, blockStart: V, blockEnd: V + words.length * 4 });
+  // V is a valid code page whose precomp block (blocks[page] -> { block, start, end }) the span lives in
+  M.HEAPU8[INVALID + page] = 0;
+  w.HEAPU32[(BLOCKS >> 2) + page] = BP; w.HEAPU32[BP >> 2] = ENTRY; w.HEAPU32[(BP >> 2) + 1] = V; w.HEAPU32[(BP >> 2) + 2] = V + words.length * 4;
+  // P2: the same kinds of instruction, other immediates
+  const words2 = [I(OPC.ADDIU, 9, 9, 7), I(OPC.ADDIU, 8, 8, 7), 0, 0];
+  for (let i = 0; i < words2.length; i++) w.HEAPU32[(SRC2 >> 2) + i] = words2[i];
+  if (bm.compileSpan(p1, M) !== 0) return { name, ok: false, detail: 'expected an async offer (0)' };
+  bm.frameEnd();                                       // flushes the offer to the "worker"
+  const job = posted.find((j) => j && j.p && j.p.vaddr === V);
+  if (!job) return { name, ok: false, detail: 'no job posted' };
+  const r = bm.emitJob(job);
+  if (!r.ok) return { name, ok: false, detail: 'emit failed ' + r.err };
+  if (remap) bm.compileSpan(Object.assign({}, p1, { srcPtr: SRC2 }), M);   // the core recompiled V from P2
+  bm.async.ready.push(r);
+  bm.frameEnd();
+  const entry = w.HEAPU32[ENTRY >> 2], installed = entry !== 1;
+  const why = JSON.stringify(bm.async.staleWhy || {});
+  return { name, ok: remap ? (!installed && /"source":1/.test(why)) : installed, detail: `entry op ${entry} staleWhy ${why}` };
+}
+tests.push(asyncSourceCase('async: a span built from P1 is not installed after its TLB page was recompiled from P2', true));
+tests.push(asyncSourceCase('control: with no remap the same off-thread span is installed', false));
+
 let fail = 0;
 for (const t of tests) {
   if (!t.ok) fail++;
