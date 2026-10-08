@@ -132,22 +132,47 @@ const REG_SRC = `function __regHash(u8) {
   return out;
 }`;
 const PICDUMP = flag('picdump', '').split(',').filter(Boolean).map(Number);   // diagnostic: raw RGBA of these frames into the --json
+// THE RECORDER. Every write into the engine's input table goes through Lockstep._put (lib/netplay.js),
+//   so that is hooked: the record is the table's own LAST value for every (frame, port), written at the
+//   moment it is written — nothing to fall out of a retention window, nothing a starved poll can miss,
+//   and a value the engine replaces is replaced here too (the 50 ms poll this replaces kept the FIRST
+//   value it saw and never updated a port once recorded). The poll stays, only to pick up what was in
+//   the table before the hook went in; puts counts the hooked writes, rewrites those that changed a value.
 const CIN_SRC = (engExpr) => `(function () {
-  self.__cin = {}; self.__cinPolls = 0;
-  setInterval(function () {
-    var e = ${engExpr}; if (!e || !e.inputs) return; self.__cinPolls++;
+  self.__cin = {}; self.__cinPolls = 0; self.__cinStat = { puts: 0, rewrites: 0, hooked: false };
+  function rec(f, p, b) {
+    var row = self.__cin[f] || (self.__cin[f] = [null, null, null, null]), v = Array.prototype.slice.call(b);
+    if (row[p] && row[p].join() !== v.join()) self.__cinStat.rewrites++;
+    row[p] = v;
+  }
+  function hook(e) {
+    if (!e || e.__cinHooked || typeof e._put !== 'function') return;
+    var put = e._put; e.__cinHooked = true; self.__cinStat.hooked = true;
+    e._put = function (f, port, bytes) { try { self.__cinStat.puts++; if (port >= 0 && port < 4 && bytes) rec(f, port, bytes); } catch (x) {} return put.apply(this, arguments); };
+  }
+  function poll() {
+    var e = ${engExpr}; if (!e || !e.inputs) return; self.__cinPolls++; hook(e);
     e.inputs.forEach(function (mp, f) {
-      if (self.__cin[f]) return;
-      var row = [], any = false;
-      for (var p = 0; p < 4; p++) { var b = mp.get(p); row.push(b ? Array.prototype.slice.call(b) : null); if (b) any = true; }
-      if (any) self.__cin[f] = row;
+      for (var p = 0; p < 4; p++) { var b = mp.get(p); if (!b) continue; var row = self.__cin[f]; if (!row || !row[p]) rec(f, p, b); }
     });
-    // a port that arrives later for a frame already recorded
-    e.inputs.forEach(function (mp, f) {
-      var row = self.__cin[f]; if (!row) return;
-      for (var p = 0; p < 4; p++) if (!row[p]) { var b = mp.get(p); if (b) row[p] = Array.prototype.slice.call(b); }
-    });
-  }, 50);
+  }
+  poll(); setInterval(poll, 50);
+  return true;
+})()`;
+// THE CORE'S OWN INPUT (core worker, --cin): after every frame the room's core runs (rbStep, again on a
+//   re-simulation), the image it ran with (room_core.js RB.img) — last run wins. Checked frame for frame
+//   against the engine's final input below: the straight reference is given the ENGINE's input, so a frame
+//   the room's core last ran with something else (a missed correction) would otherwise pass unseen.
+const RAN_SRC = `(function () {
+  self.__ranWith = {}; self.__ranN = 0;
+  var prev = self.__n64RanTap;
+  self.__n64RanTap = function (k, kind) {
+    try {
+      var R = self.RM && self.RM.R, RB = R && R.RB;
+      if (RB) for (var j = 0; j < RB.imgF.length; j++) if (RB.imgF[j] === k && RB.img[j]) { self.__ranWith[k] = Array.prototype.slice.call(RB.img[j]); self.__ranN++; break; }
+    } catch (x) {}
+    if (prev) return prev(k, kind);
+  };
   return true;
 })()`;
 const JSON_OUT = flag('json', '');
@@ -418,6 +443,7 @@ try {
   }
   if (CIN) out.cinInstall = out.worker ? await page.evaluate((s) => window.__n64Worker.eval(s), CIN_SRC('self.RM && self.RM.eng'))
                                        : await page.evaluate((s) => (0, eval)(s), CIN_SRC('window.__n64LsEngine'));
+  if (CIN && out.worker) out.ranInstall = await page.evaluate((s) => window.__n64Worker.eval(s), RAN_SRC);
   if (RTT || LDELAY > 0) out.lsetup = await page.evaluate((cfg) => {
     const e = window.__n64LsEngine, L = window.Netplay.Lockstep, frameMs = 1000 / 50;   // MK64 is PAL: 50 Hz
     let d = cfg.ldelay, floor = cfg.lfloor, samples = null;
@@ -535,7 +561,12 @@ try {
   }
   // --cin: the input each held frame LAST ran with on the room's core (room_core.js RB.img) — the
   // confirmed timeline's — checked against the engine's final inputs below
-  if (CIN && out.worker) room.ranWith = await page.evaluate(() => window.__n64Worker.eval('(function (R) { var o = {}; if (!R || !R.RB) return o; for (var j = 0; j < R.RB.imgF.length; j++) { var f = R.RB.imgF[j], im = R.RB.img[j]; if (f >= 0 && im) o[f] = Array.prototype.slice.call(im); } return o; })(self.RM && self.RM.R)'));
+  if (CIN && out.worker) {
+    room.ranWith = await page.evaluate(() => window.__n64Worker.eval('self.__ranWith || null'));
+    room.cinStat = await page.evaluate(() => window.__n64Worker.eval('self.__cinStat || null'));
+    if (!room.ranWith || !Object.keys(room.ranWith).length)   // (no run tap: the ring's images, as before)
+      room.ranWith = await page.evaluate(() => window.__n64Worker.eval('(function (R) { var o = {}; if (!R || !R.RB) return o; for (var j = 0; j < R.RB.imgF.length; j++) { var f = R.RB.imgF[j], im = R.RB.img[j]; if (f >= 0 && im) o[f] = Array.prototype.slice.call(im); } return o; })(self.RM && self.RM.R)'));
+  } else if (CIN) room.cinStat = await page.evaluate(() => window.__cinStat || null);
   Object.assign(out, {
     mode: z.mode, roomRate: +((z.frame - a.frame) / secs / (z.viHz || 50)).toFixed(4),
     secsBelow99: tl.filter((x) => x.rate < 0.99).length,
@@ -635,7 +666,7 @@ try {
         for (let i = 0; i < px.length; i += 4) { h = Math.imul(h ^ px[i], 16777619); h = Math.imul(h ^ px[i + 1], 16777619); h = Math.imul(h ^ px[i + 2], 16777619); }
         return h >>> 0;
       };
-      let cinMissing = 0, cinUsed = 0, cinDiffers = 0;
+      let cinMissing = 0, cinUsed = 0, cinDiffers = 0; const missAt = [], diffAt = [];
       (0, eval)(padSrc);
       const M = window.Module, want = new Set(keys), res = {};
       const set = (p, b) => {
@@ -651,8 +682,8 @@ try {
           const sp = p < players ? window.__pad(f, p) : new Uint8Array(4);
           if (cin) {
             const row = cin[f], b = row && row[p];
-            if (b) { const u = Uint8Array.from(b); cinUsed++; if (u.join() !== sp.join()) cinDiffers++; set(p, u); }
-            else { if (p < players) cinMissing++; set(p, sp); }
+            if (b) { const u = Uint8Array.from(b); cinUsed++; if (u.join() !== sp.join()) { cinDiffers++; if (diffAt.length < 40) diffAt.push([f, p]); } set(p, u); }
+            else { if (p < players) { cinMissing++; if (missAt.length < 40) missAt.push([f, p]); } set(p, sp); }
           } else set(p, sp);
         }
         M._neil_ls_run_frame();
@@ -675,7 +706,7 @@ try {
         }
         if ((f & 63) === 0) await new Promise((r) => setTimeout(r, 0));
       }
-      res.__cin = { used: cinUsed, missing: cinMissing, differsFromPad: cinDiffers };
+      res.__cin = { used: cinUsed, missing: cinMissing, differsFromPad: cinDiffers, missingAt: missAt, differsAt: diffAt };
       res.__pics = pics;
       return res;
     }, PAD_SRC.replace('function __pad', 'window.__pad = function'), PLAYERS, keys, last, CIN ? room.cin : null, picKeys, DUMPDIR ? DUMPAT : [], PICDUMP, REGIONS ? REG_SRC : null);
@@ -696,13 +727,15 @@ try {
     if (room.ranWith && room.cin) {
       // did each frame last run with its final input? (a frame that did not and was never rolled
       // back is a missed correction — this console's guest is not the room's)
-      const bad = []; let checked = 0;
+      const bad = []; let checked = 0, wrongN = 0, noRow = 0;
+      const lastK = keys[keys.length - 1];
       for (const f in room.ranWith) {
-        const row = room.cin[f]; if (!row || +f > (room.confirmed | 0)) continue;
+        if (+f > (room.confirmed | 0) || +f > lastK) continue;
+        const row = room.cin[f]; if (!row) { noRow++; continue; }
         const im = room.ranWith[f]; checked++;
-        for (let p = 0; p < PLAYERS; p++) { const b = row[p]; if (!b) continue; if (b.join() !== im.slice(p * 4, p * 4 + 4).join()) { if (bad.length < 20) bad.push([+f, p, im.slice(p * 4, p * 4 + 4), b]); } }
+        for (let p = 0; p < PLAYERS; p++) { const b = row[p]; if (!b) continue; if (b.join() !== im.slice(p * 4, p * 4 + 4).join()) { wrongN++; if (bad.length < 20) bad.push([+f, p, im.slice(p * 4, p * 4 + 4), b]); } }
       }
-      out.ranWithFinal = { checked, wrong: bad };
+      out.ranWithFinal = { checked, wrongN, noRow, wrong: bad, of: room.ranWith ? Object.keys(room.ranWith).length : 0 };
     }
     let firstFull = null, firstFp = null, same = 0;
     for (const k of keys) {
@@ -724,7 +757,7 @@ try {
       }
       for (const k of keys) { if (room.full[k]) delete room.full[k].reg; if (ref[k]) delete ref[k].reg; }
     }
-    out.reference = { cin: CIN ? Object.assign({ polls: room.cinPolls, frames: room.cin ? Object.keys(room.cin).length : 0 }, cinStat) : null, compared: keys.length, fullMatch: same, firstFullMismatch: firstFull, firstFpMismatch: firstFp,
+    out.reference = { cin: CIN ? Object.assign({ polls: room.cinPolls, frames: room.cin ? Object.keys(room.cin).length : 0, rec: room.cinStat || null }, cinStat) : null, compared: keys.length, fullMatch: same, firstFullMismatch: firstFull, firstFpMismatch: firstFp,
       events: (room.rblog || []).filter((e) => (e[0] === 'grow') || (e[1] >= (firstFull == null ? 0 : firstFull) - 25 && e[1] <= (firstFull == null ? 0 : firstFull) + 5)).slice(0, 60),
       mismatches: keys.filter((k) => ref[k] && room.full[k].full !== ref[k].full).slice(0, 12),
       // the rollbacks that re-simulated the frames before the first mismatch (they may run later)
@@ -749,11 +782,21 @@ const rbN = (out.gate && out.gate.lastRbPage) ? out.gate.lastRbPage.rollbacks : 
 if (NOREF) console.log('  INFO  --noref: exactness not checked');
 else if (!R) bad('exactness', 'no reference run (' + (out.tappedFrames || 0) + ' tapped frames)');
 else if (!rbN && !LSEXACT) bad('VOID: no rollback happened, so exactness was not exercised');
+// --cin: a straight run given anything but the room's own confirmed input proves nothing either way — a
+// mismatch would be the rig's, and a match would be of another trajectory. So an incomplete record is
+// the RIG failing, said as such, and the exactness verdict below it is withheld (neither PASS nor desync).
+else if (CIN && R.cin && R.cin.missing > 0)
+  bad('RIG: the straight run lacked ' + R.cin.missing + ' confirmed inputs — exactness NOT judged (VOID)', JSON.stringify({ missingAt: R.cin.missingAt, rec: R.cin.rec, firstFullMismatch: R.firstFullMismatch }));
 else if (R.firstFullMismatch == null && R.fullMatch === R.compared && R.compared > 0)
   ok('every confirmed state matches a straight run BIT FOR BIT (full 16.8 MB hash)', `${R.compared} frames compared after ${rbN} rollbacks`
      + (out.fskip ? `; frame skip: ${out.fskip.skipped} presented + ${out.fskip.resimSkipped} re-sim + ${out.fskip.hiddenSkipped} hidden skipped, ${out.fskip.reruns} re-runs`
         + (out.fskip.linearFs ? `, delay frames ${out.fskip.linear} (${out.fskip.linearFs.skipped} skipped, ${out.fskip.linearFs.redo} re-runs)` : '') : ''));
 else bad('confirmed state differs from the straight run', JSON.stringify(R));
+if (out.ranWithFinal && out.ranWithFinal.of > 0) {
+  const W = out.ranWithFinal;
+  if (W.wrongN > 0) bad('every confirmed frame last ran on the room\'s core with its final input', JSON.stringify(W));
+  else if (W.checked > 0) ok('every confirmed frame last ran on the room\'s core with its final input', W.checked + ' frames');
+}
 if (out.engineState === 'desync' || out.engineState === 'failed' || out.fault) bad('engine state', out.engineState + ' ' + (out.fault || out.error || ''));
 if (out.picsStraight) {
   const P = out.picsStraight;
