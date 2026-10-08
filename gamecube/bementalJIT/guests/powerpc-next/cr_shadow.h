@@ -101,6 +101,25 @@ struct CmpFuse {
     int32_t  imm       = 0;      // baked immediate (when is_imm)
     bool     is_imm    = false;
     bool     is_signed = true;   // cmp/cmpi signed; cmpl/cmpli unsigned
+    // [BEM_LEVER2_CR_SINK] set by the body loop BEFORE a cmp-family op is
+    // dispatched: 1 = the cmp emits no CR store; its field becomes PENDING
+    // (pend[crfd]) and every exit emitted while it is pending stores it from
+    // the record (the scan in ppc_emit.cpp CrSinkMode proves the operand locals
+    // and XER.SO are unchanged at each such exit). The body loop clears a
+    // field's pending record at the next op that writes the field.
+    // 2 = the same, but an operand GPR is rewritten before a later use, so the
+    // cmp first copies its operand(s) into a snapshot slot (2 i32 locals from
+    // snap_base; CR_SNAP_SLOTS slots) and the record reads those.
+    uint8_t  sink_req  = 0;
+    uint32_t snap_base = 0;      // 0 = no snapshot locals declared (no mode 2)
+    static constexpr uint32_t CR_SNAP_SLOTS = 4;
+    struct PendCr {
+        bool     on = false;
+        uint32_t a_local = 0, b_local = 0;
+        int32_t  imm = 0;
+        bool     is_imm = false, is_signed = true;
+        int8_t   slot = -1;      // snapshot slot in use, -1 = none
+    } pend[8];
 };
 
 }  // namespace bemental::powerpc

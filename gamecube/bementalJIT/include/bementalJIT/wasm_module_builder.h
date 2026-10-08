@@ -712,6 +712,11 @@ public:
 	void op_f64x2_eq()           { emitByte(V128_PREFIX); emitLEB128(0x47u); }   // spec opcode 0x47
 	void op_i64x2_all_true()     { emitByte(V128_PREFIX); emitLEB128(0xC3u); }   // spec opcode 0xC3
 	void op_f64x2_abs()          { emitByte(V128_PREFIX); emitLEB128(0xECu); }
+	// [lever2 2026-10-08] WebAssembly SIMD spec opcode table: i64x2.replace_lane
+	// 0x1E, f64x2.ne 0x48, i64x2.eq 0xD6.
+	void op_i64x2_replace_lane(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x1Eu); emitByte(l); }  // (v128,i64) -> v128
+	void op_f64x2_ne()           { emitByte(V128_PREFIX); emitLEB128(0x48u); }
+	void op_i64x2_eq()           { emitByte(V128_PREFIX); emitLEB128(0xD6u); }
 	void op_f64x2_mul()          { emitByte(V128_PREFIX); emitLEB128(0xF2u); }
 	// v128.const with both i64 lanes equal; 16 literal bytes, each lane LE.
 	void op_v128_const_i64_splat(u64 v) {

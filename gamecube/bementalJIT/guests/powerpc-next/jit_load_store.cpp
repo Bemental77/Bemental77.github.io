@@ -817,6 +817,21 @@ static void emit_gp_or_import_store(WasmModuleBuilder& wb, LoadStoreParams param
     wb.op_call(write_import_for_width(width));
 }
 
+// [BEM_LEVER2_GP_FIRST] true when the in-wasm WPAR arm exists for this build.
+static bool gp_first_on(const LoadStoreParams& params) {
+    return BEM_GP_INWASM_ARM && params.lc_base && bem_lever2_on(BEM_LEVER2_GP_FIRST);
+}
+
+// [BEM_LEVER2_GP_FIRST] GPFifo write of a paired-single pair as ONE 8-byte
+// append (Jit64 psq_st: UnsafeWriteGatherPipe(64)): lane 0's swapped word at
+// ptr, lane 1's at ptr + 4, ptr += 8, one CheckGatherPipe. v128_src != 0: the
+// Single v128 (vector FTZ + one shuffle, as the RAM fast arm); else the two
+// scalar words from emit_word. LOCAL_PSQ_T1 (99) holds the cursor: the same
+// slot the per-word form used as its word stage, dead on this arm.
+template <typename EmitWord>
+static void emit_gp_append_pair(WasmModuleBuilder& wb, LoadStoreParams params,
+                                u32 v128_src, EmitWord emit_word);
+
 // ---------------------------------------------------------------------------
 // [gp-inwasm FP-words 2026-08-29] The same WPAR arm for an FP store that writes
 // ONE or TWO consecutive 32-bit words starting at LOCAL_TMP_EA. psq_st's FLOAT
@@ -886,17 +901,80 @@ static void emit_fp_words_gp_or_import(WasmModuleBuilder& wb, LoadStoreParams pa
     if (BEM_GP_INWASM_ARM && params.lc_base) {
         emit_gp_region_test(wb);
         wb.op_if(BLOCK_TYPE_VOID);
+        if (nwords == 2u && scratch_local == 99u && gp_first_on(params)) {
+            emit_gp_append_pair(wb, params, 0u, emit_word);
+        } else {
             for (u32 i = 0; i < nwords; ++i) {
                 emit_word(i);
                 wb.op_local_set(scratch_local);
                 emit_gp_append(wb, params, StoreWidth::U32, scratch_local);
             }
+        }
         wb.op_else();
             emit_imports();
         wb.op_end();
         return;
     }
     emit_imports();
+}
+
+template <typename EmitWord>
+static void emit_gp_append_pair(WasmModuleBuilder& wb, LoadStoreParams params,
+                                u32 v128_src, EmitWord emit_word) {
+    const u32 ctx = params.ctx_ptr;
+    constexpr u32 CUR = 99u;   // LOCAL_PSQ_T1
+    static const u8 SWAP32X2[16] = { 3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12 };
+    wb.op_i32_const((s32)ctx);
+    wb.op_i32_load(PPCSTATE_GATHER_PIPE_PTR);
+    wb.op_local_tee(CUR);
+    if (v128_src) {
+        emit_ftz_v128(wb, v128_src);
+        wb.op_local_tee(LOCAL_PSQ_V);
+        wb.op_local_get(LOCAL_PSQ_V);
+        wb.op_i8x16_shuffle(SWAP32X2);
+        wb.op_v128_store64_lane(0, /*lane=*/0, /*align=*/0);
+    } else {
+        emit_word(0u);
+        emit_bswap_i32(wb);
+        wb.op_i32_store(0, 0);
+        wb.op_local_get(CUR);
+        emit_word(1u);
+        emit_bswap_i32(wb);
+        wb.op_i32_store(4, 0);
+    }
+    wb.op_i32_const((s32)ctx);
+    wb.op_local_get(CUR);
+    wb.op_i32_const(8);
+    wb.op_i32_add();
+    wb.op_local_tee(CUR);
+    wb.op_i32_store(PPCSTATE_GATHER_PIPE_PTR);
+    emit_gp_dirty_addr_ls(wb);
+    wb.op_i32_const(1);
+    wb.op_i32_store(0);
+    wb.op_local_get(CUR);
+    wb.op_i32_const((s32)ctx);
+    wb.op_i32_load(PPCSTATE_GATHER_PIPE_BASE_PTR);
+    wb.op_i32_sub();
+    wb.op_i32_const((s32)GP_PIPE_SIZE);
+    wb.op_i32_ge_u();
+    wb.op_if(BLOCK_TYPE_VOID);
+        emit_host_call_prep(wb, params);
+        wb.op_i32_const(0);
+        wb.op_i32_const(0);
+        wb.op_call(WIMPORT_GATHER_DRAIN);
+    wb.op_end();
+}
+
+// [BEM_LEVER2_GP_FIRST] `if (WPAR) append else rest()` — see lever_gate.h.
+template <typename Rest>
+static void emit_gp_first_store(WasmModuleBuilder& wb, LoadStoreParams params,
+                                StoreWidth width, u32 src_local, Rest rest) {
+    emit_gp_region_test(wb);
+    wb.op_if(BLOCK_TYPE_VOID);
+        emit_gp_append(wb, params, width, src_local);
+    wb.op_else();
+        rest();
+    wb.op_end();
 }
 
 // Slow-path store. Stack-neutral. [lc-window PM23] locked-L1 EAs get a raw
@@ -1213,12 +1291,16 @@ static void emit_store_d_hoisted(WasmModuleBuilder& wb, RegCache& rc,
         wb.op_i32_const((s32)simm);
         wb.op_i32_add();
         wb.op_local_set(LOCAL_TMP_EA);
-        emit_fastmem_guard(wb, params, store_width_bytes(width));
-        wb.op_if(BLOCK_TYPE_VOID);
-            emit_fastmem_store(wb, params, width, rs_local);
-        wb.op_else();
-            emit_slowmem_store(wb, params, width, rs_local);
-        wb.op_end();
+        auto unhoisted = [&]() {
+            emit_fastmem_guard(wb, params, store_width_bytes(width));
+            wb.op_if(BLOCK_TYPE_VOID);
+                emit_fastmem_store(wb, params, width, rs_local);
+            wb.op_else();
+                emit_slowmem_store(wb, params, width, rs_local);
+            wb.op_end();
+        };
+        if (gp_first_on(params)) emit_gp_first_store(wb, params, width, rs_local, unhoisted);
+        else                     unhoisted();
     wb.op_end();
 }
 
@@ -1357,6 +1439,21 @@ void emit_load_d(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     emit_load_common(wb, rc, frc, params, rt, ra, width, update);
 }
 
+bool IsConstGpCarveStore(const CodeOp& op, u32 lc_base) {
+    const u32 opcd = GekkoOperands::OPCD(op.inst);
+    const bool st = opcd == 36u || opcd == 37u || opcd == 38u || opcd == 39u ||
+                    opcd == 44u || opcd == 45u;
+    return st && op.has_const_ea && is_mmio_const_addr(op.const_ea) &&
+           BEM_GP_CONST_EA_ARM && BEM_GP_INWASM_ARM && lc_base &&
+           (op.const_ea & GP_EA_MASK) == GP_EA_MATCH &&
+           bem_lever_on(BEM_LEVER_SLOWARM_FP_GP);
+}
+
+u32 ConstGpStoreBytes(const CodeOp& op) {
+    const u32 opcd = GekkoOperands::OPCD(op.inst);
+    return (opcd == 38u || opcd == 39u) ? 1u : (opcd == 44u || opcd == 45u) ? 2u : 4u;
+}
+
 void emit_store_d(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                   LoadStoreParams params, const CodeOp& op,
                   StoreWidth width, bool update) {
@@ -1413,6 +1510,68 @@ void emit_store_d(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                 params.host_rc_snap = &host_snap;
             } else {
                 rc.Flush(params.ctx_ptr);
+            }
+            if (gp_defer && params.gp_run) {
+                // [BEM_LEVER2_GP_FIRST] run member: see GpRun. The owner test is
+                // read once by the head; nothing between the members calls the
+                // host on the append path (the drain moved to the last member),
+                // so every member sees the value the head read. On the import
+                // path each member makes its own call, as before.
+                const GpRun& r = *params.gp_run;
+                if (r.head) {
+                    wb.op_i32_const((s32)params.ctx_ptr);
+                    wb.op_i32_load(PPCSTATE_GATHER_PIPE_PTR);
+                    wb.op_local_set(r.p_local);
+                    wb.op_i32_const((s32)GP_CPU_OWNER_CELL);
+                    wb.op_i32_load(0);
+                    wb.op_i32_eqz();
+                    wb.op_local_tee(r.ok_local);
+                } else {
+                    wb.op_local_get(r.ok_local);
+                }
+                wb.op_if(BLOCK_TYPE_VOID);
+                    wb.op_local_get(r.p_local);
+                    wb.op_local_get(src_local);
+                    switch (width) {
+                    case StoreWidth::U8:  wb.op_i32_store8(r.off); break;
+                    case StoreWidth::U16: emit_bswap_i16(wb); wb.op_i32_store16(r.off); break;
+                    case StoreWidth::U32: emit_bswap_i32(wb); wb.op_i32_store(r.off, 0); break;
+                    }
+                    if (r.last) {
+                        wb.op_i32_const((s32)params.ctx_ptr);
+                        wb.op_local_get(r.p_local);
+                        wb.op_i32_const((s32)r.total);
+                        wb.op_i32_add();
+                        wb.op_local_tee(r.p_local);
+                        wb.op_i32_store(PPCSTATE_GATHER_PIPE_PTR);
+                        emit_gp_dirty_addr_ls(wb);
+                        wb.op_i32_const(1);
+                        wb.op_i32_store(0);
+                        wb.op_local_get(r.p_local);
+                        wb.op_i32_const((s32)params.ctx_ptr);
+                        wb.op_i32_load(PPCSTATE_GATHER_PIPE_BASE_PTR);
+                        wb.op_i32_sub();
+                        wb.op_i32_const((s32)GP_PIPE_SIZE);
+                        wb.op_i32_ge_u();
+                        wb.op_if(BLOCK_TYPE_VOID);
+                            emit_host_call_prep(wb, params);
+                            wb.op_i32_const(0);
+                            wb.op_i32_const(0);
+                            wb.op_call(WIMPORT_GATHER_DRAIN);
+                        wb.op_end();
+                    }
+                wb.op_else();
+                    emit_host_call_prep(wb, params);
+                    wb.op_i32_const((s32)op.const_ea);
+                    wb.op_local_get(src_local);
+                    wb.op_call(write_import_for_width(width));
+                wb.op_end();
+                if (update && ra != 0) {
+                    auto rc_ra = rc.Bind(ra, RCMode::Write);
+                    wb.op_i32_const((s32)op.const_ea);
+                    wb.op_local_set(rc_ra.local_idx());
+                }
+                return;
             }
             // The EA is compile-time known, so the runtime region test collapses
             // to its only variable term: does dolphin's own CPU thread still own
@@ -1879,12 +2038,18 @@ void emit_stfs(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         wb.op_else();
             emit_ea_now(wb, hra_local, simm);
     }
-    emit_fastmem_guard(wb, params, 4);
-    wb.op_if(BLOCK_TYPE_VOID);
-    emit_fastmem_store(wb, params, StoreWidth::U32, LOCAL_TMP_FPVAL);
-    wb.op_else();
-    emit_slowmem_store(wb, params, StoreWidth::U32, LOCAL_TMP_FPVAL);
-    wb.op_end();
+    auto unhoisted = [&]() {
+        emit_fastmem_guard(wb, params, 4);
+        wb.op_if(BLOCK_TYPE_VOID);
+        emit_fastmem_store(wb, params, StoreWidth::U32, LOCAL_TMP_FPVAL);
+        wb.op_else();
+        emit_slowmem_store(wb, params, StoreWidth::U32, LOCAL_TMP_FPVAL);
+        wb.op_end();
+    };
+    if (hp && gp_first_on(params))   // [BEM_LEVER2_GP_FIRST]
+        emit_gp_first_store(wb, params, StoreWidth::U32, LOCAL_TMP_FPVAL, unhoisted);
+    else
+        unhoisted();
     if (hp) {
         wb.op_end();
         return;
@@ -2842,6 +3007,10 @@ void emit_psq_st(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                     [&](u32) { emit_store_bits(rs_pair.ps0_idx, 0); });
             wb.op_end();
         } else {
+            auto word = [&](u32 lane) {
+                emit_store_bits(lane == 0u ? rs_pair.ps0_idx : rs_pair.ps1_idx, lane);
+            };
+            auto unhoisted_pair = [&]() {
             emit_fastmem_guard(wb, params, 8);
             wb.op_if(BLOCK_TYPE_VOID);
                 wb.op_local_get(LOCAL_TMP_EA);
@@ -2886,6 +3055,17 @@ void emit_psq_st(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                                         lane);
                     });
             wb.op_end();
+            };
+            if (hp && gp_first_on(params)) {   // [BEM_LEVER2_GP_FIRST]
+                emit_gp_region_test(wb);
+                wb.op_if(BLOCK_TYPE_VOID);
+                    emit_gp_append_pair(wb, params, rs_single ? rs_v128 : 0u, word);
+                wb.op_else();
+                    unhoisted_pair();
+                wb.op_end();
+            } else {
+                unhoisted_pair();
+            }
         }
         if (hp) wb.op_end();   // [BASE_HOIST_FP] close the flag if
     }

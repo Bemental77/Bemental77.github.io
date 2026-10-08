@@ -25,6 +25,7 @@
 #include "hle_prologue.h"
 #include "jit_branch.h"
 #include "jit_compare.h"
+#include "cr_encode.h"   // bem_cr_lean_on (BEM_LEVER2_CR_SINK)
 #include "jit_integer.h"
 #include "jit_floating_point.h"
 #include "jit_load_store.h"
@@ -784,6 +785,157 @@ static bool IsFpLoadStoreD(u32 inst) {
            opcd == 61;
 }
 
+// [BEM_LEVER2_CR_SINK 2026-10-08] cmp / cmpi / cmpl / cmpli (the dispatch_op
+// cases routed to emit_cmp* with the fuse record).
+static bool IsCmpFamily(u32 inst) {
+    const u32 opcd = GekkoOperands::OPCD(inst);
+    if (opcd == 10u || opcd == 11u) return true;
+    if (opcd != 31u) return false;
+    const u32 x = GekkoOperands::SUBOP10(inst);
+    return x == 0u || x == 32u;
+}
+
+// An op the CR sink may step over: dispatch_op emits it natively (the cases
+// below are each a `return true` emitter that never returns from the function
+// and never calls ppc_interp — the only host calls are the memory imports,
+// whose handlers do not read cr[]), it reads and writes no CR field, and it is
+// no block end. FP loads/stores only once the block's MSR.FP bail is behind.
+static bool CrSinkTransparent(const CodeOp& op, bool fp_ok) {
+    if (!op.opinfo || op.canEndBlock || op.crIn.m_val || op.crOut.m_val) return false;
+    const u32 inst = op.inst;
+    const u32 opcd = GekkoOperands::OPCD(inst);
+    const bool rc  = (inst & 1u) != 0u;
+    switch (opcd) {
+    case 7: case 8: case 12: case 14: case 15: case 24: case 25: case 26: case 27:
+        return true;
+    case 20: case 21: case 23:
+        return !rc;
+    case 32: case 33: case 34: case 35: case 36: case 37: case 38: case 39:
+    case 40: case 41: case 42: case 43: case 44: case 45:
+        return true;
+    case 48: case 49: case 50: case 51: case 52: case 53: case 54: case 55:
+    case 56: case 57: case 60: case 61:
+        return fp_ok;
+    case 31:
+        switch (GekkoOperands::SUBOP10(inst)) {
+        case 266: case 40: case 235: case 10: case 8: case 75: case 11: case 491:
+        case 459: case 28: case 60: case 444: case 316: case 124: case 476: case 284:
+        case 412: case 24: case 536: case 792: case 824: case 954: case 922: case 26:
+        case 104: case 138: case 136: case 202: case 200:
+            return !rc;
+        case 23: case 55: case 87: case 119: case 279: case 311: case 343: case 375:
+        case 151: case 183: case 215: case 247: case 407: case 439:
+            return true;
+        case 339: case 467: {   // mfspr / mtspr LR or CTR: one direct ctx access
+            const u32 sf = (inst >> 11) & 0x3FFu;
+            const u32 spr = ((sf >> 5) & 0x1Fu) | ((sf & 0x1Fu) << 5);
+            return spr == 8u || spr == 9u;
+        }
+        default:
+            return false;
+        }
+    default:
+        return false;
+    }
+}
+
+// An integer Rc=1 form of a CrSinkTransparent op: writes cr0 (eagerly, the
+// lean VS0 build) and nothing else of CR.
+static bool CrSinkRcWriter(const CodeOp& op) {
+    if (!op.opinfo || op.canEndBlock || op.crIn.m_val || op.crOut.m_val != 1u) return false;
+    const u32 inst = op.inst;
+    const u32 opcd = GekkoOperands::OPCD(inst);
+    if (opcd == 13u || opcd == 28u || opcd == 29u) return true;   // addic. andi. andis.
+    if (!(inst & 1u)) return false;
+    if (opcd == 20u || opcd == 21u || opcd == 23u) return true;
+    if (opcd != 31u) return false;
+    switch (GekkoOperands::SUBOP10(inst)) {
+    case 266: case 40: case 235: case 28: case 60: case 444: case 316: case 124:
+    case 476: case 284: case 412: case 24: case 536: case 954: case 922: case 26: case 104:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// The mid-block conditional branches emit_bcx(is_terminal=false) emits natively
+// (CR-bit test or bdnz/bdz, no LK) — their taken arm is the exit that stores
+// every pending field.
+static bool CrSinkMidBc(const CodeOp& op) {
+    const u32 inst = op.inst;
+    if (GekkoOperands::OPCD(inst) != 16u || GekkoOperands::LK(inst)) return false;
+    if (!(IsForwardConditionalBranch(inst, op.address) || IsSeamBackwardConditional(inst)))
+        return false;
+    const u32 bo = GekkoOperands::BO(inst);
+    return bo == 0b10000u || bo == 0b10010u || (bo & 0b10100u) == 0b00100u;
+}
+
+// [BEM_LEVER2_CR_SINK] 1 = the cmp at buf[i] may leave its CR field pending;
+// 2 = the same with its operands copied to a snapshot slot; 0 = store it
+// eagerly. Walks forward to the next full writer of the field (a cmp-family op
+// on it, or an Rc=1 integer op for cr0) over only:
+//   * CrSinkTransparent ops (native, no CR access, no exit, no XER.SO write);
+//   * the exits the sink stores the field in: a mid-block conditional bc's
+//     taken arm (emit_bcx), a superblock seam's downcount bail and the
+//     software-RAS mispredict exit at an inlined blr;
+//   * mid-block CR-bit bcs that READ the field (LT/GT/EQ): emit_bcx takes the
+//     bit from the pending record's operands (the adjacent one through the
+//     fuse record, which holds the same operands);
+//   * the no-exit seams (a follow `b`, an inline `bl`: LR store only).
+// Anything else — a reader of SO or of the field outside a bc, an HLE hook, an
+// FP op before the block's MSR.FP bail, the terminator — gives 0. Each use
+// (exit or reader) reads the cmp's operand locals and XER.SO; a use after an op
+// that rewrites ra / rb needs the snapshot (2). The block's last op is never
+// reached, so the field is never pending at the block tail.
+// The producer at buf[i] is a cmp-family op (field CRFD, operands ra / rb) or
+// a CrSinkRcWriter (field 0; its value local is one of the op's own GPRs, so
+// every GPR it reads or writes counts as an operand).
+static u8 CrSinkMode(const CodeBuffer& buf, std::size_t i, const CodeBlock& block,
+                     const std::vector<u32>* seg_charge, bool fp_ok) {
+    const std::size_t n = buf.size();
+    const CodeOp& cmp = buf[i];
+    const bool rc_prod = !IsCmpFamily(cmp.inst);
+    const u32 f  = rc_prod ? 0u : GekkoOperands::CRFD(cmp.inst);
+    u32 opnd = 0u;
+    if (rc_prod) {
+        opnd = cmp.regsIn.m_val | cmp.regsOut.m_val;
+    } else {
+        opnd = 1u << GekkoOperands::RA(cmp.inst);
+        if (GekkoOperands::OPCD(cmp.inst) == 31u) opnd |= 1u << GekkoOperands::RB(cmp.inst);
+    }
+    auto hook = [&](std::size_t k) {
+        return g_hle_hook_query == nullptr || g_hle_hook_query(buf[k].address);
+    };
+    bool clobbered = false;   // an operand GPR has been rewritten since the cmp
+    bool snap = false;        // ... and used after that
+    for (std::size_t j = i + 1; j + 1 < n; ++j) {
+        const CodeOp& op = buf[j];
+        if (hook(j)) return 0u;
+        if (block.m_follow && seg_charge && j < seg_charge->size() && (*seg_charge)[j] != 0u)
+            snap |= clobbered;   // the seam's downcount bail is an exit
+        if (IsCmpFamily(op.inst) && GekkoOperands::CRFD(op.inst) == f) return snap ? 2u : 1u;
+        if (f == 0u && CrSinkRcWriter(op)) return snap ? 2u : 1u;
+        if (CrSinkMidBc(op)) {
+            const u32 bi = GekkoOperands::BI(op.inst);
+            if (op.crIn[f] && bi % 4u == 3u) return 0u;   // SO: from memory
+            snap |= clobbered;   // taken-arm store (and the bit, if it reads f)
+            continue;
+        }
+        if (block.m_follow && IsSeamB(op.inst, op.address, buf[j + 1].address)) continue;
+        if (block.m_noncontiguous && IsSeamInlineBl(op.inst, op.address, buf[j + 1].address))
+            continue;
+        if (block.m_noncontiguous && IsPlainBlr(op.inst)) {
+            snap |= clobbered;
+            continue;
+        }
+        if (!(CrSinkTransparent(op, fp_ok) ||
+              (f != 0u && CrSinkRcWriter(op))))
+            return 0u;
+        if (op.regsOut.m_val & opnd) clobbered = true;
+    }
+    return 0u;
+}
+
 bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                  const CodeOp& op, LoadStoreParams params) {
     const u32 inst  = op.inst;
@@ -1272,6 +1424,11 @@ struct BaseHoistPlan {
     bool poison = false;
 };
 static BaseHoistPlan* s_hoist_plan = nullptr;
+// [BEM_LEVER2_CR_SINK] first of the 2 * CmpFuse::CR_SNAP_SLOTS i32 snapshot
+// locals build_block_next declares (0 = none: no snapshot sinks).
+static u32 s_cr_snap_base = 0u;
+// [BEM_LEVER2_GP_FIRST] the GpRun ok / cursor locals (0 = none: no runs).
+static u32 s_gp_run_base = 0u;
 
 static bool s_hoist_ok = false;       // build_block_next only
 static bool s_hoist_poison = false;
@@ -1790,6 +1947,9 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // the op right after the cmp. Inert when BEM_LAZY_CR is false.
     CmpFuse cmp_fuse;
     params.cmp_fuse = &cmp_fuse;
+    g_bem_rc_sink = nullptr;      // [BEM_LEVER2_CR_SINK] set only around one op's dispatch
+    bool gp_run_active = false;   // [BEM_LEVER2_GP_FIRST] the previous op opened/continued a run
+    u32  gp_run_off = 0u;
 
     // Per-CodeOp dispatch. 2026-05-18 port of JIT64's HandleFunctionHooking
     // (Jit.cpp:1065-1066): JIT64 calls HLE::TryReplaceFunction on EVERY op's
@@ -1923,6 +2083,7 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             {
                 const auto sb_rs = rc.SaveState();
                 const auto sb_fs = frc.SaveState();
+                emit_pending_cr_stores(b, ctx_ptr, &cmp_fuse);   // [BEM_LEVER2_CR_SINK]
                 rc.Flush(ctx_ptr);
                 frc.Flush(ctx_ptr, BitSet32(0xFFFFFFFFu), FPR_LANE_BOTH, /*exiting=*/true);
                 b.op_i32_const((s32)ctx_ptr);
@@ -2135,6 +2296,72 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
         // returns to the dispatcher, not-taken falls through to the next op in
         // this same block. The pre-op set_pc above left PC=op.address for the
         // not-taken arm; the next op's set_pc advances it to the fall-through.
+        // [BEM_LEVER2_GP_FIRST] const-EA gather-pipe store runs (GpRun).
+        GpRun gp_run_rec;
+        params.gp_run = nullptr;
+        if (s_gp_run_base && !merged && region_gen < 0 && !resident_loop_arm &&
+            IsConstGpCarveStore(op, g_bem_lc_base)) {
+            auto member = [&](std::size_t k) {
+                return k < n_ops && IsConstGpCarveStore(buffer[k], g_bem_lc_base) &&
+                       !(g_hle_hook_query == nullptr || g_hle_hook_query(buffer[k].address)) &&
+                       !(block.m_follow && k < n_buf && seg_charge[k] != 0u);
+            };
+            const bool prev = gp_run_active;
+            const u32 so_far = (prev ? gp_run_off : 0u) + ConstGpStoreBytes(op);
+            // Cap a run at 64 bytes: with <= 31 bytes already staged the pipe
+            // then never holds more than 95 before the run's one check
+            // (m_gather_pipe is GATHER_PIPE_SIZE + GATHER_PIPE_EXTRA_SIZE).
+            const bool next = member(i + 1) &&
+                              so_far + ConstGpStoreBytes(buffer[i + 1]) <= 64u;
+            if (prev || next) {
+                gp_run_rec.head = !prev;
+                gp_run_rec.last = !next;
+                gp_run_rec.off = prev ? gp_run_off : 0u;
+                gp_run_rec.total = gp_run_rec.off + ConstGpStoreBytes(op);
+                gp_run_rec.ok_local = s_gp_run_base;
+                gp_run_rec.p_local = s_gp_run_base + 1u;
+                params.gp_run = &gp_run_rec;
+                gp_run_active = next;
+                gp_run_off = gp_run_rec.total;
+            }
+        } else {
+            gp_run_active = false;
+        }
+        // [BEM_LEVER2_CR_SINK] see lever_gate.h / CrSinkMode. A field stops
+        // being pending at the next op that writes it (that op's own store, or
+        // its own sink); a cmp the walk admits leaves its field pending.
+        for (u32 k = 0; k < 8u; ++k)
+            if (op.crOut[k]) cmp_fuse.pend[k].on = false;
+        cmp_fuse.sink_req = 0u;
+        if (IsCmpFamily(op.inst) && !merged && region_gen < 0 && !resident_loop_arm &&
+            bem_cr_lean_on() && bem_lever2_on(BEM_LEVER2_CR_SINK)) {
+            u8 m = CrSinkMode(buffer, i, block, &seg_charge, first_fp_found);
+            if (m == 2u) {   // needs a free snapshot slot
+                cmp_fuse.snap_base = s_cr_snap_base;
+                u32 used = 0u;
+                const u32 crfd = GekkoOperands::CRFD(op.inst);
+                for (u32 k = 0; k < 8u; ++k)
+                    if (k != crfd && cmp_fuse.pend[k].on && cmp_fuse.pend[k].slot >= 0)
+                        used |= 1u << cmp_fuse.pend[k].slot;
+                if (s_cr_snap_base == 0u || used == (1u << CmpFuse::CR_SNAP_SLOTS) - 1u) m = 0u;
+            }
+            cmp_fuse.sink_req = m;
+        }
+        g_bem_rc_sink = nullptr;
+        if (!IsCmpFamily(op.inst) && CrSinkRcWriter(op) && !op.crDiscardable[0] &&
+            !merged && region_gen < 0 && !resident_loop_arm &&
+            bem_cr_lean_on() && bem_lever2_on(BEM_LEVER2_CR_SINK)) {
+            u8 m = CrSinkMode(buffer, i, block, &seg_charge, first_fp_found);
+            if (m == 2u) {
+                cmp_fuse.snap_base = s_cr_snap_base;
+                u32 used = 0u;
+                for (u32 k = 1; k < 8u; ++k)
+                    if (cmp_fuse.pend[k].on && cmp_fuse.pend[k].slot >= 0)
+                        used |= 1u << cmp_fuse.pend[k].slot;
+                if (s_cr_snap_base == 0u || used == (1u << CmpFuse::CR_SNAP_SLOTS) - 1u) m = 0u;
+            }
+            if (m) { cmp_fuse.sink_req = m; g_bem_rc_sink = &cmp_fuse; }
+        }
         bool emitted_native;
         if (follow_seam && IsSeamB(op.inst, op.address, buffer[i + 1].address)) {
             // [SUPERBLOCK] the `b` falls through to its target by construction.
@@ -2164,6 +2391,7 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             {
                 const auto ras_rs = rc.SaveState();
                 const auto ras_fs = frc.SaveState();
+                emit_pending_cr_stores(b, ctx_ptr, &cmp_fuse);   // [BEM_LEVER2_CR_SINK]
                 rc.Flush(ctx_ptr);
                 frc.Flush(ctx_ptr, BitSet32(0xFFFFFFFFu), FPR_LANE_BOTH, /*exiting=*/true);
                 b.op_i32_const((s32)ctx_ptr);
@@ -2259,6 +2487,9 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
                                ? &s_hoist_plan->per_op[i] : nullptr;
             emitted_native = dispatch_op(b, rc, frc, op, params);
             params.hoist = nullptr;
+            params.gp_run = nullptr;
+            g_bem_rc_sink = nullptr;
+            cmp_fuse.sink_req = 0u;
             rc.SetOpReads(0xFFFFFFFFu);
             params.defer_pc = 0;   // [MEM_SLOWARM] consumed by this op only
         }
@@ -2755,7 +2986,11 @@ static std::vector<u8> build_block_next_impl(u32 start_pc,
     // [BEM_LEVER_BASE_HOIST] plan before the locals are declared.
     BaseHoistPlan hoist_plan;
     if (s_hoist_ok) plan_base_hoist(hoist_plan, buffer, mem1_base, mem1_mask, ram_size);
-    const u32 extra_locals = hoist_plan.nlocals;
+    // [BEM_LEVER2_CR_SINK] the CR snapshot slots follow the hoist locals.
+    const bool cr_snap = bem_lever2_on(BEM_LEVER2_CR_SINK);
+    const bool gp_run = bem_lever2_on(BEM_LEVER2_GP_FIRST);
+    const u32 extra_locals = hoist_plan.nlocals + (cr_snap ? 2u * CmpFuse::CR_SNAP_SLOTS : 0u) +
+                             (gp_run ? 2u : 0u);
 
     WasmModuleBuilder b;
     b.emitHeader();
@@ -2841,9 +3076,14 @@ static std::vector<u8> build_block_next_impl(u32 start_pc,
     }
 
     s_hoist_plan = hoist_plan.nlocals ? &hoist_plan : nullptr;
+    s_cr_snap_base = cr_snap ? BASE_HOIST_LOCAL0 + hoist_plan.nlocals : 0u;
+    s_gp_run_base = gp_run ? BASE_HOIST_LOCAL0 + hoist_plan.nlocals +
+                                 (cr_snap ? 2u * CmpFuse::CR_SNAP_SLOTS : 0u) : 0u;
     emit_block_body_into(b, block, buffer, stats, count, start_pc, ctx_ptr,
                          mem1_base, mem1_mask, ram_size);
     s_hoist_plan = nullptr;
+    s_cr_snap_base = 0u;
+    s_gp_run_base = 0u;
     if (hoist_plan.poison) s_hoist_poison = true;
 
     b.endFuncBody();
