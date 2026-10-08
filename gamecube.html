@@ -10838,19 +10838,22 @@ window.GcRate = (function () {
 
   // THE GUEST CLOCK'S OWN STALL RECORD (recomp_worker.js): every frame start, timed by the worker
   // itself. __gcFrameTiming(since) returns the entries after `since` (a previous result's n; at most
-  // the ring's 256 back) as [frame, interval ms, busy ms] — interval = how long the guest clock stood
-  // on the frame before it, busy = how long that frame kept the guest's thread busy — and the
-  // running counts: over = intervals over two frame periods, busyOver = busy over one. null before
-  // the recomp has a pace SAB (or on a worker without the ring).
+  // the ring's 192 back) as [frame, interval ms, busy ms, unsched ms] — interval = how long the guest
+  // clock stood on the frame before it, busy = how long that frame kept the guest's thread busy,
+  // unsched = how late the guest's thread's own 2 ms waits on its credit returned while it was parked
+  // (recomp_worker.js WHEN THE OS DID NOT RUN THIS THREAD) — and the running counts: over =
+  // intervals over two frame periods, busyOver = busy over one. null before the recomp has a pace
+  // SAB (or on a worker without the ring).
   window.__gcFrameTiming = function (since) {
     if (!paceI32 || paceI32.length < 1024) return null;
-    var n = Atomics.load(paceI32, 220), from = Math.max(since == null ? n : since, n - 256, 0), out = [];
+    var N = 192, C = 4;
+    var n = Atomics.load(paceI32, 220), from = Math.max(since == null ? n : since, n - N, 0), out = [];
     for (var k = from; k < n; k++) {
-      var i = 256 + 3 * (k % 256);
-      out.push([Atomics.load(paceI32, i), Atomics.load(paceI32, i + 1) / 1000, Atomics.load(paceI32, i + 2) / 1000]);
+      var i = 256 + C * (k % N);
+      out.push([Atomics.load(paceI32, i), Atomics.load(paceI32, i + 1) / 1000, Atomics.load(paceI32, i + 2) / 1000, Atomics.load(paceI32, i + 3) / 1000]);
     }
     // an entry the worker overwrote while it was being read is not reported
-    var n2 = Atomics.load(paceI32, 220), lost = Math.max(0, n2 - 256 - from);
+    var n2 = Atomics.load(paceI32, 220), lost = Math.max(0, n2 - N - from);
     if (lost) out.splice(0, lost);
     return { n: n, from: from + lost, entries: out, over: Atomics.load(paceI32, 221), busyOver: Atomics.load(paceI32, 222),
              periodMs: 1000 / 60,
