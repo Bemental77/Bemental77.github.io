@@ -209,7 +209,7 @@
     #netCodeIn { width: 100%; box-sizing: border-box; min-height: 44px; font: 700 20px/1 ui-monospace, Menlo, monospace;
       letter-spacing: 4px; text-align: center; text-transform: uppercase; background: #0e1013; color: #eee;
       border: 1px solid #555; border-radius: 9px; padding: 11px; }
-    #netGame { width: 100%; box-sizing: border-box; min-height: 44px; background: #0e1013; color: #eee;
+    #netGame, #netSeats { width: 100%; box-sizing: border-box; min-height: 44px; background: #0e1013; color: #eee;
       border: 1px solid #555; border-radius: 9px; padding: 10px 12px; font-size: 15px; }
     .netActions { display: flex; gap: 10px; margin-top: 12px; }
     #netRoster { list-style: none; margin: 6px 0 0; padding: 0; }
@@ -343,6 +343,12 @@
       <div class="netLabel">Share this code</div>
       <div id="netCode">·····</div>
       <div class="netActions"><button id="netCopy" type="button">Copy code</button></div>
+      <div class="netLabel">Start when this many players are in</div>
+      <select id="netSeats">
+        <option value="2">2 players</option>
+        <option value="3">3 players (multitap)</option>
+        <option value="4">4 players (multitap)</option>
+      </select>
     </div>
     <div id="netJoinPane" style="display:none">
       <div class="netLabel">Game the room is playing</div>
@@ -352,9 +358,10 @@
              spellcheck="false" placeholder="ABC12" inputmode="latin">
       <div class="netActions"><button id="netGo" class="primary" type="button">Join</button></div>
     </div>
-    <!-- One row per CONTROLLER PORT of the console, filled from the engine's own
-         port count — never from a number written here. A PlayStation has two,
-         and this core implements exactly two (there is no multitap in it). -->
+    <!-- One row per PORT of the room, filled from the engine's own port count —
+         never from a number written here. A PlayStation has two; the room has
+         four, the last two behind a multitap that goes in only when 3+ are
+         seated (ps1.html lsMultitapApply). -->
     <div id="netRoom" style="display:none">
       <div class="netLabel">The room <span id="netRoomPorts"></span></div>
       <ul id="netRoster"></ul>
@@ -1001,6 +1008,17 @@
       case 'netRbStatsResult': window.__ps1RbWorker = data; break;
       case 'netAudioSabOk': audioSinkOn(); break;
       case 'netPeekResult': window.__ps1Peek = data; break;
+      case 'netMultitapResult': {
+        // What the CORE now has plugged in (pad_worker.c ps1_multitap), not a page flag.
+        PS1_MT.core = data.slots;
+        if (data.slots !== PS1_MT.slots) {
+          LS.fault = 'this room seats ' + PS1_MT.seated + ' players, which needs the multitap, and this console\'s core answered ' + data.slots
+            + ' (an old cached wasmpsx_worker.js?) — reload the page';
+          pageLog('[multitap] ⚠ ' + LS.fault);
+          try { var lsm = lsEngine(); if (lsm) lsm.fail(LS.fault); } catch (e) {}
+        }
+        break;
+      }
       case 'netSchedStatsResult': case 'netLiveHashResult': case 'netSnapBenchResult': break;
       case 'netHashResult': lsOnWorkerHash(data); break;
       case 'netUngated': pageLog('[lockstep] core handed back to its own scheduler'); break;
@@ -1457,7 +1475,20 @@
   // button reads as held.
   // ═══════════════════════════════════════════════════════════════════════════
 
-  var PS1_PORTS = 2;            // this core has exactly two; there is no multitap
+  // A ROOM SEATS UP TO FOUR. A PlayStation has two controller ports; players 3
+  // and 4 exist only behind a MULTITAP (SCPH-1070) in port 1, and the core now
+  // has one (pad_worker.c ps1_multitap — Mednafen's multitap protocol, driven
+  // from sio.c). The room's ports are the multitap's slots A-D: port 0 = the
+  // console's port 1 / slot A, port 1 = the console's port 2 (multitap out) or
+  // slot B (multitap in), ports 2-3 = slots C-D.
+  //
+  // ⚠ THE MULTITAP GOES IN ONLY WHEN THE ROOM SEATS 3 OR MORE (lsMultitapApply).
+  // A two-player room must be exactly the console it always was: no adaptor,
+  // the pad buffer the same 48 bytes (2 x PADSTATE) at the same place, and
+  // ports 2/3 unseated. The solo path never touches any of this.
+  var PS1_PORTS = 4;
+  // What lsMultitapApply decided for THIS room (decided = before frame 0, once).
+  var PS1_MT = { on: false, decided: false, seated: 0, slots: 0, core: null };
   var LS_PAD_BYTES = 2;         // KeyStatus is 16 bits, so two bytes carry a pad exactly
   var PADSTATE_STRIDE = 24;     // sizeof(PADSTATE), measured: 0x201134 - 0x20111c
   // The console's frame rate, from the DISC: the worker reports Config.PsxType
@@ -1483,6 +1514,9 @@
     // ROLLBACK (zero local input lag) unless the URL says ?rb=0. This is what
     // THIS console proposes; the host's choice arrives in 'lsgo' and wins.
     rbWant: (function () { try { return new URLSearchParams(location.search).get('rb') !== '0'; } catch (e) { return true; } })(),
+    // THE HOST'S "Start when N are in" (2..4; ?seats=N from the lobby, or the
+    // host pane's picker). 2 is the old rule exactly.
+    seatsWant: (function () { try { return Math.max(2, Math.min(4, (+new URLSearchParams(location.search).get('seats') | 0) || 2)); } catch (e) { return 2; } })(),
   };
   var LS = {
     armed: false, running: false, fault: null,
@@ -1581,11 +1615,14 @@
     return out;
   }
 
-  // Build the 48-byte PADSTATE pair the worker memcpy's over &g.PadState[0].
+  // Build the PADSTATE image the worker memcpy's over &g.PadState[0]: the
+  // 48-byte pair (the plain console's two ports — exactly what a two-player
+  // room always sent), or, with the multitap in, all four slots (96 bytes).
   // Constructed from the agreed image ONLY — see the host-clock note above.
   function lsPadBuffer(image, padBytes) {
-    var buf = new Uint8Array(PADSTATE_STRIDE * PS1_PORTS);
-    for (var p = 0; p < PS1_PORTS; p++) {
+    var n = PS1_MT.on ? 4 : 2;
+    var buf = new Uint8Array(PADSTATE_STRIDE * n);
+    for (var p = 0; p < n; p++) {
       var base = p * PADSTATE_STRIDE;
       var k0 = image[p * padBytes], k1 = image[p * padBytes + 1];
       // An unseated port must read as "nothing held", not as zero.
@@ -1620,6 +1657,39 @@
     } catch (e) {}
     pageLog('[lockstep] frame gate RELEASED — ' + why + '. This console free-runs from here and is '
       + 'no longer sharing frames with anybody.');
+  }
+
+  // ---- THE MULTITAP: plugged in from the room's AGREED roster ---------------
+  // Every console must make the SAME decision before frame 0, or they are two
+  // different machines from the reset onwards (a multitap game probes for the
+  // adaptor at boot). So it is a pure function of what every console holds
+  // identically at this point: the roster the HOST pushed in 'lsgo'
+  // (lib/netplay.js — the room seats nobody after it starts, and a drop leaves
+  // the roster as it was), counted for seats. 3+ seated -> a multitap with that
+  // many pads in port 1 (a 3-player room's slot D is empty, as on a real
+  // console with three pads plugged in); 2 -> exactly today's console. Decided
+  // ONCE per boot: a gate that disengages and re-engages, or a rejoiner that
+  // boots fresh and replays from frame 0, reaches the same answer because the
+  // roster cannot change. 'netMultitap' is posted before the first netStep /
+  // netRbInit, and the worker handles messages in order, so the first frame
+  // already runs with it. The multitap's state is plain core memory, so every
+  // rollback load restores it with the rest of the machine.
+  function lsMultitapApply(ls) {
+    if (PS1_MT.decided) return true;
+    var seated = 0;
+    for (var p = 0; p < ls.portCount; p++) if (ls.roster[p] != null) seated++;
+    PS1_MT.seated = seated;
+    PS1_MT.on = seated >= 3;
+    PS1_MT.slots = PS1_MT.on ? seated : 0;
+    PS1_MT.decided = true;
+    if (PS1_MT.on) {
+      pcsx_worker.postMessage({ cmd: 'netMultitap', slots: PS1_MT.slots });
+      pageLog('[multitap] PLUGGED IN — ' + seated + ' players seated; ports 1-' + seated + ' are multitap slots '
+        + 'A-' + 'ABCD'.charAt(seated - 1) + ' in the console\'s port 1, and the console\'s port 2 is empty');
+    } else {
+      pageLog('[multitap] out — ' + seated + ' players seated, so this is the plain two-port console');
+    }
+    return true;
   }
 
   // ---- arming, BEFORE the worker exists --------------------------------------
@@ -1723,6 +1793,8 @@
       return false;
     }
     if (!LS.running) {
+      // ⚠ BEFORE THE FIRST FRAME, ONCE PER ROOM: the multitap. See lsMultitapApply.
+      if (!lsMultitapApply(ls)) return false;
       LS.running = true;
       NET.startedAtFrame = ls.frame | 0;   // "everyone started together at frame N"
       pageLog('[lockstep] FRAME GATE ENGAGED at frame ' + ls.frame + ' — delay=' + ls.delay
@@ -2358,7 +2430,9 @@
     if (netCapHeld()) return 'This device cannot run the emulator, so the party cannot start it here.';
     if (NET.notice && Date.now() > (NET.noticeUntil || 0)) NET.notice = null;
     if (netPartyState() === 'playing') return NET.notice ? NET.notice : NET.modeNote ? NET.modeNote : 'Playing — everyone started together at frame ' + (NET.startedAtFrame | 0) + '.';
-    if (netAlone()) return 'Waiting for another player — share the code ' + s.code + '. Starts by itself once two are in and loaded.';
+    if (netAlone()) return 'Waiting for another player — share the code ' + s.code + '. Starts by itself once ' + (NET.role === 'host' && NET.seatsWant > 2 ? NET.seatsWant : 'two') + ' are in and loaded.';
+    if (NET.role === 'host' && !started && netSeatedCount() < NET.seatsWant)
+      return netSeatedCount() + ' of ' + NET.seatsWant + ' players are in — share the code ' + s.code + '. Starts by itself once ' + NET.seatsWant + ' are in and loaded.';
     var who = netPartyRows().filter(function (r) { return r.who && r.state !== 'ready' && r.state !== 'playing'; })
       .map(function (r) { return r.local ? 'this console' : netPortLabel(r.port); });
     return 'Starts by itself when everyone is loaded — waiting for ' + (who.length ? who.join(' and ') : 'the room') + '.';
@@ -2379,10 +2453,17 @@
     // the host loads on the FIRST seated joiner — never on room open.
     if (!ls || !(ls.localPorts && ls.localPorts.length)) return;
     if (netSeatedCount() < 2) return;
+    // ⚠ A HOST MAY WAIT FOR MORE THAN TWO. The room seats nobody once it runs
+    // (lib/netplay.js), so "start once two are in" leaves a third and fourth
+    // player no window. The host's "Start when N are in" (default 2 — exactly
+    // the old rule) holds only the HOST's load; joiners load as soon as they
+    // are seated and wait at the barrier, which cannot release until the host
+    // — and everyone seated by then — has declared ready.
+    if (NET.role === 'host' && netSeatedCount() < NET.seatsWant) return;
     if (netCapHeld()) return;   // the status line's to explain, not this function's to press through
     NET.autoStarted = true;
     netSyncPickersToRoom();
-    pageLog('[net] two players are seated, so this console loads ' + netGameId() + ' by itself — there is nothing '
+    pageLog('[net] ' + netSeatedCount() + ' players are seated, so this console loads ' + netGameId() + ' by itself — there is nothing '
       + 'to press. LOADING is not RUNNING: the worker is spawned gated (?netgate=1), and the barrier holds '
       + 'frame 0 until everyone is loaded.');
     // The same steps the phone's Start tap takes (the splash away, then
@@ -2411,7 +2492,10 @@
     if (!room || !ul || !s) return;
     room.style.display = '';
     var ports = (ls && ls.portCount) ? ls.portCount : PS1_PORTS;
-    var pl = $('netRoomPorts'); if (pl) pl.textContent = '(' + ports + ' controller ports)';
+    var pl = $('netRoomPorts');
+    if (pl) pl.textContent = '— up to ' + ports + ' players: ports 1-2 on the console, 3-4 through a multitap '
+      + (PS1_MT.decided ? (PS1_MT.on ? '(plugged in: ' + PS1_MT.slots + ' pads)' : '(not needed — two players)')
+                        : '(plugged in only if 3 or more join; it needs a multitap game)');
     ul.innerHTML = '';
     netPartyRows().forEach(function (r) {
       var li = document.createElement('li');
@@ -2702,6 +2786,13 @@
     $('netCopy').addEventListener('click', function () {
       try { navigator.clipboard.writeText($('netCode').textContent.trim()); netStatus('Code copied.', 'good'); } catch (e) {}
     });
+    // The host's seat count: changing it while waiting re-asks the auto-start.
+    $('netSeats').value = String(NET.seatsWant);
+    $('netSeats').addEventListener('change', function () {
+      NET.seatsWant = Math.max(2, Math.min(4, +$('netSeats').value | 0 || 2));
+      pageLog('[net] the host starts when ' + NET.seatsWant + ' players are in');
+      netRoomRender();
+    });
     // An invitation looks like ?np=CODE — ps1_multiplayer.html forwards exactly
     // that parameter here. Bare, it fills the code in and opens the panel on the
     // JOIN side, and the visitor still presses Join themselves.
@@ -2798,6 +2889,7 @@
         code: NET.session ? NET.session.code : null,
         seated: netSeatedCount(),
         ports: ls ? ls.portCount : PS1_PORTS,
+        seatsWant: NET.seatsWant,
         state: NET.session ? netPartyState() : null,
         alone: NET.session ? netAlone() : null,
         declared: !!(rep && rep.declaredReady),
@@ -2829,6 +2921,9 @@
       delay: ls ? ls.delay : null,
       hashEvery: ls ? ls.hashEvery : null,
       portCount: ls ? ls.portCount : PS1_PORTS,
+      // THE MULTITAP: what the page decided, and what the CORE answered
+      // ('netMultitapResult': pad_worker.c ps1_multitap's return).
+      multitap: { on: PS1_MT.on, decided: PS1_MT.decided, seated: PS1_MT.seated, slots: PS1_MT.slots, core: PS1_MT.core },
       roster: ls ? ls.roster : null,
       localPorts: ls ? ls.localPorts : null,
       svcAvgMs: LS.svcCount ? +(LS.svcSum / LS.svcCount).toFixed(2) : null,

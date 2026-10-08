@@ -31,19 +31,29 @@
 // delta required). Everything else is copied unchanged, and the diff is
 // printed so it can be read.
 //
-// USAGE  node reappend.mjs --line1 NEW.js --wasm NEW.wasm --map NEW.map --from dist/wasmpsx_worker.js --out OUT.js
+// USAGE  node reappend.mjs --line1 NEW.js --wasm NEW.wasm --map NEW.map --from dist/wasmpsx_worker.js --out OUT.js [--repoint]
+//
+// --repoint (2026-10-08): a core change that adds static data moves every
+// address after it, so the check above fails by design. With --repoint the
+// block's numbers are instead REWRITTEN to the new build's, by the same
+// formulas the check uses — CORE.* from the map, the STATIC_SPANS hole at
+// in_buffer, STATIC_END = __heap_base - 64 KB (exactly the old block's
+// relation: 1129888 = 1195424 - 65536) — and then every check runs against
+// the rewritten block, so a struct change or a moved pad state still fails.
+// Each rewritten line is printed. Without --repoint nothing changes.
 import fs from 'node:fs';
 
 const argv = process.argv.slice(2);
 const arg = (n) => { const i = argv.indexOf('--' + n); if (i < 0 || i + 1 >= argv.length) throw new Error('--' + n + ' is required'); return argv[i + 1]; };
 const fail = (m) => { console.error('[reappend] FAIL: ' + m); process.exit(1); };
 
+const REPOINT = argv.includes('--repoint');
 const line1 = fs.readFileSync(arg('line1'), 'utf8').replace(/\n+$/, '');
 if (line1.includes('\n')) fail('the new emcc output is not one line');
 const from = fs.readFileSync(arg('from'), 'utf8');
 const nl = from.indexOf('\n');
 if (nl < 0) fail('--from has no appended block');
-const block = from.slice(nl + 1);
+let block = from.slice(nl + 1);
 
 // ── the new binary: data image + __heap_base ─────────────────────────────────
 function wasmImage(file) {
@@ -73,6 +83,25 @@ const at = (name, size) => {
   if (size != null && s[1] !== size) fail(name + ' is ' + s[1] + ' bytes, the block assumes ' + size);
   return s[0];
 };
+
+// ── --repoint: rewrite the block's numbers to the new build's ────────────────
+const blockIn = block;
+if (REPOINT) {
+  const nw = {
+    PsxType: at('Config', 0xd00e) + 53261,
+    UseFrameSkip: at('UseFrameSkip'), UseFrameLimit: at('UseFrameLimit'),
+    updatedDisplay: at('updated_display'), palFlag: at('PSXDisplay', 0x4c) + 40,
+    gpuStat: at('lGPUstatusRet'), sbrk: at('sbrk_val'),
+  };
+  for (const k of Object.keys(nw)) {
+    const re = new RegExp('(\\n\\s*' + k + ': )(\\d+)(,)');
+    if (!re.test(block)) fail('cannot find CORE.' + k + ' in the block');
+    block = block.replace(re, '$1' + nw[k] + '$3');
+  }
+  const inb0 = at('in_buffer', 8);
+  block = block.replace(/(\n\s*var STATIC_SPANS = \[1024, )(\d+), (\d+)(, STATIC_END\];)/, '$1' + inb0 + ', ' + (inb0 + 16) + '$4');
+  block = block.replace(/(\n\s*var STATIC_END = )(\d+)(;)/, '$1' + (W.heapBase - 65536) + '$3');
+}
 
 // ── the block's own numbers ─────────────────────────────────────────────────
 const num = (re, what) => { const m = re.exec(block); if (!m) fail('cannot find ' + what + ' in the block'); return +m[1]; };
@@ -123,7 +152,7 @@ const newSig = sigLine[1].replace(sigLine[2], String(a1)).replace(sigLine[3], St
 const outBlock = block.replace(sigLine[1], newSig);
 
 fs.writeFileSync(arg('out'), line1 + '\n' + outBlock);
-const oldL = block.split('\n'), newL = outBlock.split('\n');
+const oldL = blockIn.split('\n'), newL = outBlock.split('\n');
 let changed = 0;
 for (let i = 0; i < oldL.length; i++) if (oldL[i] !== newL[i]) { changed++; console.log('[reappend] block line ' + (i + 2) + ':\n  - ' + oldL[i].trim() + '\n  + ' + newL[i].trim()); }
 console.log('[reappend] OK — every address the block writes or hashes is unchanged (CORE, STATIC_SPANS, STATIC_END inside static data, g ' + JSON.stringify(g) + '); '

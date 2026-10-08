@@ -40,6 +40,7 @@ FILE *mylogf=NULL;
 #undef PSXCPU_LOG
 #define debugI()
 void execI();
+static __inline void psxExecOp(void);
 
 // Subsets
 void (*psxBSC[64])();
@@ -274,12 +275,157 @@ void psxDelayTest(int reg, u32 bpc) {
 	psxBranchTest();
 }
 
+
+/* ══ IDLE-LOOP FAST-FORWARD (exact) ═══════════════════════════════════════
+ * A game waiting for the next vertical blank spins in a loop until an
+ * interrupt handler changes a word in RAM. While it spins, nothing happens
+ * that the loop itself does not do: no event can fire until psxBranchTest
+ * finds one due, and every one of those is a cycle-count deadline
+ * (`cycle - start >= delta`, see psxBranchTest). So when the loop's passes
+ * are proven to change the machine in a known way per pass, the passes up to
+ * the earliest deadline can be applied at once — the state after them is
+ * bit-for-bit the state running them would have produced, and the branch
+ * tests they would have run would all have found nothing due.
+ * psxEvSeq (r3000a.c) counts every branch test that fired and every
+ * exception; psxIoSeq (psxmem.c) every hardware-register read (a read can
+ * have side effects or depend on the cycle count — the root counters do).
+ * ps1_idle(-1) reads the switch, ps1_idle(0/1) sets it; stats at the
+ * returned pointer: [0] skips, [1] skipped cycles / 1024, [2] unused,
+ * [3] the switch. ⚠ Everything here is guest-deterministic state (it is in
+ * static data, so in the snapshot and the fingerprint): two consoles that ran
+ * the same frames hold the same values. */
+extern u32 psxEvSeq, psxIoSeq;
+static int il_on = 1;
+static u32 il_stats[4], il_frac;
+
+/* the earliest cycle count at which psxBranchTest would do something, as
+ * cycles from now — valid right after a branch test that fired nothing */
+static u32 ilBudget(void) {
+	u32 m = psxNextCounter - (psxRegs.cycle - psxNextsCounter), r, i = psxRegs.interrupt;
+#define IL_T(bit, n) if (i & (bit)) { r = psxRegs.intCycle[(n) + 1] - (psxRegs.cycle - psxRegs.intCycle[n]); if (r < m) m = r; }
+	if (!Config.Sio) IL_T(0x80, 7)
+	IL_T(0x04, 2) IL_T(0x040000, 2 + 16) IL_T(0x01000000, 3 + 24) IL_T(0x02000000, 5 + 24) IL_T(0x04000000, 1 + 24)
+#undef IL_T
+	return m;
+}
+
+/* ── THE PSY-Q VSync() WAIT ──────────────────────────────────────────────────
+ * The one loop handled: libetc's VSync(0) wait (v_wait). It decrements a
+ * timeout counter on the stack every pass, so each pass leaves one RAM word
+ * one lower —
+ *     L: lw   rC,off(rS) ; nop ; addiu rC,rC,-1 ; sw rC,off(rS)
+ *        lw   rC,off(rS) ; nop ; bne  rC,rM,X   ; nop      (rM == -1: timeout)
+ *        ...timeout path...
+ *     X: lui  rC,hi ; lw rC,lo(rC) ; nop ; slt rC,rC,rA    (Vcount < count)
+ *        bne  rC,zero,L ; nop
+ * Measured: on Monster Rancher 2 these 14 instructions are ~60% of all the
+ * guest executes (PC histogram, 1200 frames of the bench room's boot).
+ * A pass from L with the counter at T, Vcount V < rA, and no event due:
+ * stores T-1, does not take the timeout path unless T-1 == -1, reads V,
+ * leaves rC = 1, and costs the same cycles every time. So k passes are
+ * exactly: counter T-k, cycles += k*iter, every register as it is now —
+ * for any k with no timeout among them (k <= T) and no branch test due
+ * (ilBudget). Taken only when the words match this shape
+ * exactly, the counter and Vcount are plain RAM (not the same word, not
+ * hardware), rM really holds -1, and the last two closes were seen to differ
+ * by exactly one pass (counter -1, same registers, same cycles, nothing
+ * fired, no hardware read). */
+static u32 vw_L = 0xffffffff, vw_B, vw_A, vw_V, vw_ok, vw_valid, vw_T, vw_cyc, vw_ev, vw_io;
+static u32 vw_rC, vw_rS, vw_rM, vw_rA, vw_off;
+static u32 vw_gpr[34], vw_w[16];
+static u32 vwWord(u32 a) { u32 *w = (u32 *)PSXM(a); return w ? SWAP32(*w) : 0xffffffff; }
+static int vwMatch(u32 L, u32 B) {
+	u32 w0 = vwWord(L), rC = (w0 >> 16) & 31, rS = (w0 >> 21) & 31, off = w0 & 0xffff, X, w, rM, rA;
+	if ((w0 >> 26) != 0x23 || rC == 0 || rC == rS) return 0;
+	if (vwWord(L + 4) != 0) return 0;
+	if (vwWord(L + 8) != ((0x09u << 26) | (rC << 21) | (rC << 16) | 0xffff)) return 0;
+	if (vwWord(L + 12) != ((0x2bu << 26) | (rS << 21) | (rC << 16) | off)) return 0;
+	if (vwWord(L + 16) != w0 || vwWord(L + 20) != 0) return 0;
+	w = vwWord(L + 24); rM = (w >> 16) & 31;
+	if ((w >> 26) != 0x05 || ((w >> 21) & 31) != rC || rM == rC || rM == rS || vwWord(L + 28) != 0) return 0;
+	X = L + 28 + ((s32)(s16)(w & 0xffff) << 2);
+	if (B != X + 16) return 0;
+	w = vwWord(X); if ((w >> 26) != 0x0f || ((w >> 16) & 31) != rC) return 0;
+	vw_V = (w & 0xffff) << 16;
+	w = vwWord(X + 4); if ((w >> 26) != 0x23 || ((w >> 16) & 31) != rC || ((w >> 21) & 31) != rC) return 0;
+	vw_V += (s32)(s16)(w & 0xffff);
+	if (vwWord(X + 8) != 0) return 0;
+	w = vwWord(X + 12); rA = (w >> 16) & 31;
+	if ((w >> 26) != 0 || (w & 0x3f) != 0x2a || ((w >> 11) & 31) != rC || ((w >> 21) & 31) != rC || rA == rC) return 0;
+	if (vwWord(B) != ((0x05u << 26) | (rC << 21) | (0 << 16) | ((L - (B + 4)) >> 2 & 0xffff))) return 0;
+	if (vwWord(B + 4) != 0) return 0;
+	vw_rC = rC; vw_rS = rS; vw_rM = rM; vw_rA = rA; vw_off = off;
+	for (w = 0; w < 8; w++) vw_w[w] = vwWord(L + 4 * w);
+	for (w = 0; w < 6; w++) vw_w[8 + w] = vwWord(X + 4 * w);
+	return 1;
+}
+/* the loop's code is still the code that was matched */
+static int vwSame(u32 L, u32 B) {
+	u32 i, X = B - 16;
+	for (i = 0; i < 8; i++) if (vwWord(L + 4 * i) != vw_w[i]) return 0;
+	for (i = 0; i < 6; i++) if (vwWord(X + 4 * i) != vw_w[8 + i]) return 0;
+	return 1;
+}
+/* a RAM word's host address, or NULL if `a` is not plain RAM both ways */
+static u32 *vwRam(u32 a) {
+	u32 t = a >> 16;
+	if (t == 0x1f80 || (a & 3) || psxMemRLUT[t] == NULL || psxMemRLUT[t] != psxMemWLUT[t]) return NULL;
+	return (u32 *)(psxMemRLUT[t] + (a & 0xffff));
+}
+/* every taken branch: a pass of the wait takes exactly two (L+24 -> X, B -> L) */
+static __inline void vwEnter(u32 bpc, u32 tar) {
+	if (vw_valid && !((bpc == vw_B && tar == vw_L) || (bpc == vw_L + 24 && tar == vw_B - 16))) vw_valid = 0;
+}
+static __inline void vwClose(u32 bpc, u32 tar) {
+	u32 *pa, *pv, T;
+	if (!il_on || psxRegs.pc != tar) return;
+	if (tar != vw_L || bpc != vw_B) {
+		if (!(tar < bpc && bpc - tar <= 0x100)) return;
+		vw_L = tar; vw_B = bpc; vw_valid = 0;
+		vw_ok = vwMatch(tar, bpc);
+	}
+	if (!vw_ok) return;
+	vw_A = psxRegs.GPR.r[vw_rS] + (s32)(s16)vw_off;
+	pa = vwRam(vw_A); pv = vwRam(vw_V);
+	if (!pa || !pv || pa == pv || psxRegs.GPR.r[vw_rM] != 0xffffffff) { vw_valid = 0; return; }
+	T = SWAP32(*pa);
+	if (vw_valid && vw_ev == psxEvSeq && vw_io == psxIoSeq && T == vw_T - 1 &&
+	    memcmp(vw_gpr, psxRegs.GPR.r, sizeof(vw_gpr)) == 0 &&
+	    (s32)SWAP32(*pv) < (s32)psxRegs.GPR.r[vw_rA]) {
+		u32 iter = psxRegs.cycle - vw_cyc, m = ilBudget();
+		if (iter == 14 * BIAS && m > iter && T != 0xffffffff) {
+			u32 k = (m - 1) / iter;
+			if (k > T) k = T;
+			/* the words are re-read right before a skip: code can be replaced
+			 * (an overlay) between the match and now */
+			if (k && !vwSame(tar, bpc)) { vw_ok = 0; vw_valid = 0; return; }
+			if (k) {
+				psxMemWrite32(vw_A, T - k);
+				psxRegs.cycle += k * iter;
+				T -= k;
+				il_stats[0]++;
+				il_frac += k * iter; il_stats[1] += il_frac >> 10; il_frac &= 1023;
+			}
+		}
+	}
+	memcpy(vw_gpr, psxRegs.GPR.r, sizeof(vw_gpr));
+	vw_T = T; vw_cyc = psxRegs.cycle; vw_ev = psxEvSeq; vw_io = psxIoSeq; vw_valid = 1;
+}
+u32 *ps1_idle(int on) {
+	if (on >= 0) { il_on = on ? 1 : 0; vw_L = 0xffffffff; vw_valid = 0; }
+	il_stats[3] = il_on;
+	return il_stats;
+}
+
 __inline static void doBranch(u32 tar) {
 	u32 *code;
 	u32 tmp;
 
+	u32 bpc = psxRegs.pc - 4;
+
 	branch2 = branch = 1;
 	branchPC = tar;
+	vwEnter(bpc, tar);
 
 	code = (u32 *)PSXM(psxRegs.pc);
 	psxRegs.code = ((code == NULL) ? 0 : SWAP32(*code));
@@ -323,12 +469,13 @@ __inline static void doBranch(u32 tar) {
 			break;
 	}
 
-	psxBSC[psxRegs.code >> 26]();
+	psxExecOp();
 
 	branch = 0;
 	psxRegs.pc = branchPC;
 
 	psxBranchTest();
+	vwClose(bpc, tar);
 }
 
 /*********************************************************
@@ -765,8 +912,99 @@ static void intReset() {
 }
 
 
+/* ══ DIRECT DISPATCH (2026-10-08) ════════════════════════════════════════
+ * The same opcode -> function mapping as the psxBSC / psxSPC / psxREG tables
+ * above (generated from them; the tables are never written), as a switch, so
+ * the compiler can inline the handlers instead of making two call_indirects
+ * per instruction (SPECIAL -> psxSPC). Same functions, same order of effects:
+ * nothing the guest can see changes (tools/ps1_core_equiv.mjs). The tables
+ * stay for the rare paths (load-delay handling, COP dispatch). */
+static __inline void psxExecOp(void) {
+	switch (psxRegs.code >> 26) {
+		case 0x00:
+			switch (psxRegs.code & 0x3f) {
+				case 0x00: psxSLL(); return;
+				case 0x02: psxSRL(); return;
+				case 0x03: psxSRA(); return;
+				case 0x04: psxSLLV(); return;
+				case 0x06: psxSRLV(); return;
+				case 0x07: psxSRAV(); return;
+				case 0x08: psxJR(); return;
+				case 0x09: psxJALR(); return;
+				case 0x0c: psxSYSCALL(); return;
+				case 0x0d: psxBREAK(); return;
+				case 0x10: psxMFHI(); return;
+				case 0x11: psxMTHI(); return;
+				case 0x12: psxMFLO(); return;
+				case 0x13: psxMTLO(); return;
+				case 0x18: psxMULT(); return;
+				case 0x19: psxMULTU(); return;
+				case 0x1a: psxDIV(); return;
+				case 0x1b: psxDIVU(); return;
+				case 0x20: psxADD(); return;
+				case 0x21: psxADDU(); return;
+				case 0x22: psxSUB(); return;
+				case 0x23: psxSUBU(); return;
+				case 0x24: psxAND(); return;
+				case 0x25: psxOR(); return;
+				case 0x26: psxXOR(); return;
+				case 0x27: psxNOR(); return;
+				case 0x2a: psxSLT(); return;
+				case 0x2b: psxSLTU(); return;
+				default: psxNULL(); return;
+			}
+		case 0x01:
+			switch ((psxRegs.code >> 16) & 0x1f) {
+				case 0x00: psxBLTZ(); return;
+				case 0x01: psxBGEZ(); return;
+				case 0x10: psxBLTZAL(); return;
+				case 0x11: psxBGEZAL(); return;
+				default: psxNULL(); return;
+			}
+		case 0x02: psxJ(); return;
+		case 0x03: psxJAL(); return;
+		case 0x04: psxBEQ(); return;
+		case 0x05: psxBNE(); return;
+		case 0x06: psxBLEZ(); return;
+		case 0x07: psxBGTZ(); return;
+		case 0x08: psxADDI(); return;
+		case 0x09: psxADDIU(); return;
+		case 0x0a: psxSLTI(); return;
+		case 0x0b: psxSLTIU(); return;
+		case 0x0c: psxANDI(); return;
+		case 0x0d: psxORI(); return;
+		case 0x0e: psxXORI(); return;
+		case 0x0f: psxLUI(); return;
+		case 0x10: psxCOP0(); return;
+		case 0x12: psxCOP2(); return;
+		case 0x20: psxLB(); return;
+		case 0x21: psxLH(); return;
+		case 0x22: psxLWL(); return;
+		case 0x23: psxLW(); return;
+		case 0x24: psxLBU(); return;
+		case 0x25: psxLHU(); return;
+		case 0x26: psxLWR(); return;
+		case 0x28: psxSB(); return;
+		case 0x29: psxSH(); return;
+		case 0x2a: psxSWL(); return;
+		case 0x2b: psxSW(); return;
+		case 0x2e: psxSWR(); return;
+		case 0x32: gteLWC2(); return;
+		case 0x3a: gteSWC2(); return;
+		case 0x3b: psxHLE(); return;
+		default: psxNULL(); return;
+	}
+}
+
+#ifdef PS1_PCHIST
+u32 ps1_pch[1 << 19];
+u32 *ps1_pchist(void) { return ps1_pch; }
+#endif
 void execI() { 
 	//printf("execI\n");
+#ifdef PS1_PCHIST
+	ps1_pch[(psxRegs.pc & 0x1fffff) >> 2]++;
+#endif
 	u32 *code = (u32 *)PSXM(psxRegs.pc);
 	psxRegs.code = ((code == NULL) ? 0 : SWAP32(*code));
 
@@ -776,7 +1014,7 @@ void execI() {
 	psxRegs.pc += 4;
 	psxRegs.cycle += BIAS;
 
-	psxBSC[psxRegs.code >> 26]();
+	psxExecOp();
 }
 
 #ifdef __EMSCRIPTEN__

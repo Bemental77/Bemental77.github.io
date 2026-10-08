@@ -18,6 +18,11 @@
 //                  delay frames) — the page side of lib/netplay.js opts.rbResume
 //        --url BASE  (http://localhost:8080)
 //        --worker PATH  a worker build to test instead of /ps1/ps1Wasm/dist/wasmpsx_worker.js
+//        --query Q  appended to every worker's URL (e.g. urcheck=1: the worker runs the
+//                  full page compare beside its write-tracked one on every save, and
+//                  any page the tracked one missed FAILS the run — result.trackMiss)
+//        --parts N  boot the whole disc (parts parta{a..}, as ps1.html does) instead of
+//                  its first --mb bytes
 //   THREE AND FOUR PLAYERS (tools/ps1_rollback_harness.html __runN):
 //        --players 3|4  N rollback consoles (console c owns port c and predicts
 //                  every other port, each with its own random lateness) against a
@@ -47,7 +52,7 @@ const opts = {
   broken: argv.includes('--broken'), budget: +arg('budget', 0),
   switchEvery: +arg('switch-every', 0), remeasureEvery: +arg('remeasure-every', 10),
   url: '/ps1/ps1Wasm/roms/' + arg('rom', 'MonsterRancher2') + '.bin.partaa.gz',
-  worker: arg('worker', null), players: +arg('players', 2),
+  worker: arg('worker', null), players: +arg('players', 2), parts: +arg('parts', 0),
   brokenMt: argv.includes('--broken-mt'), mtPoke: arg('mt-poke', null), noTeeth: argv.includes('--no-teeth'),
 };
 if (opts.players > 2) {
@@ -72,7 +77,7 @@ let result;
 try {
   const page = await browser.newPage();
   page.on('pageerror', (e) => console.log('[pageerror]', String(e).slice(0, 300)));
-  await page.goto(arg('url', 'http://localhost:8080') + '/tools/ps1_rollback_harness.html', { waitUntil: 'load' });
+  await page.goto(arg('url', 'http://localhost:8080') + '/tools/ps1_rollback_harness.html' + (arg('query', '') ? '?' + arg('query', '') : ''), { waitUntil: 'load' });
   await page.evaluate((o) => window.__start(o), opts);
   let last = '';
   for (;;) {

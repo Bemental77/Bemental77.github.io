@@ -22,6 +22,7 @@
 */
 
 #include "psxdma.h"
+#include "urdirty.h"
 
 // Dma0/1 in Mdec.c
 // Dma3   in CdRom.c
@@ -64,6 +65,7 @@ void psxDma4(u32 madr, u32 bcr, u32 chcr) { // SPU
 			}
 			size = (bcr >> 16) * (bcr & 0xffff) * 2;
 			SPU_readDMAMem(ptr, size);
+			ur_mark_range(ptr, size * 2);   // halfwords (SPUreadDMAMem)
 			psxCpu->Clear(madr, size);
 			break;
 
@@ -96,6 +98,7 @@ void psxDma2(u32 madr, u32 bcr, u32 chcr) { // GPU
 			}
 			size = (bcr >> 16) * (bcr & 0xffff);
 			GPU_readDataMem(ptr, size);
+			ur_mark_range(ptr, size * 4);
 			psxCpu->Clear(madr, size);
 			break;
 
@@ -156,10 +159,11 @@ void psxDma6(u32 madr, u32 bcr, u32 chcr) {
 		}
 
 		while (bcr--) {
+			UR_MARK(mem);
 			*mem-- = SWAP32((madr - 4) & 0xffffff);
 			madr -= 4;
 		}
-		mem++; *mem = 0xffffff;
+		mem++; *mem = 0xffffff; UR_MARK(mem);
 	}
 #ifdef PSXDMA_LOG
 	else {

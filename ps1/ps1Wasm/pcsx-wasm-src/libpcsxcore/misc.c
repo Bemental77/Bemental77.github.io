@@ -21,6 +21,7 @@
 * Miscellaneous functions, including savestates and CD-ROM loading.
 */
 
+#include "urdirty.h"
 #include "misc.h"
 #include "cdrom.h"
 #include "mdec.h"
@@ -229,7 +230,7 @@ int LoadCdrom() {
 		incTime();
 		READTRACK();
 
-		if (ptr != NULL) memcpy(ptr, buf+12, 2048);
+		if (ptr != NULL) { memcpy(ptr, buf+12, 2048); ur_mark_range(ptr, 2048); }
 
 		tmpHead.t_size -= 2048;
 		tmpHead.t_addr += 2048;
@@ -270,7 +271,7 @@ int LoadCdromFile(const char *filename, EXE_HEADER *head) {
 		incTime();
 		READTRACK();
 
-		memcpy((void *)PSXM(addr), buf + 12, 2048);
+		memcpy((void *)PSXM(addr), buf + 12, 2048); ur_mark_range((void *)PSXM(addr), 2048);
 
 		size -= 2048;
 		addr += 2048;
@@ -423,6 +424,7 @@ int Load(const char *ExePath) {
 				fread(&tmpHead,sizeof(EXE_HEADER),1,tmpFile);
 				fseek(tmpFile, 0x800, SEEK_SET);		
 				fread((void *)PSXM(SWAP32(tmpHead.t_addr)), SWAP32(tmpHead.t_size),1,tmpFile);
+				ur_mark_all();
 				fclose(tmpFile);
 				psxRegs.pc = SWAP32(tmpHead.pc0);
 				psxRegs.GPR.n.gp = SWAP32(tmpHead.gp0);
@@ -445,6 +447,7 @@ int Load(const char *ExePath) {
 							EMU_LOG("Loading %08X bytes from %08X to %08X\n", section_size, ftell(tmpFile), section_address);
 #endif
 							fread(PSXM(section_address), section_size, 1, tmpFile);
+							ur_mark_all();
 							break;
 						case 3: /* register loading (PC only?) */
 							fseek(tmpFile, 2, SEEK_CUR); /* unknown field */
@@ -595,6 +598,7 @@ int LoadState(const char *file) {
 	mdecFreeze(f, 0);
 
 	gzclose(f);
+	ur_mark_all();   // urdirty.h: every span was just overwritten
 
 	return 0;
 }

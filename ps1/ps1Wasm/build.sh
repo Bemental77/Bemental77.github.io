@@ -40,6 +40,11 @@
 # in no source file. tools/reappend.mjs carries it onto the new line 1, refusing
 # unless every hard-coded address in it is still right for the new binary, and
 # re-points only its own signature guard (the `sigs:` line). It prints the diff.
+# A CORE CHANGE THAT ADDS STATIC DATA moves every address after it, and that
+# check then fails by design: PS1_REPOINT=1 rewrites the block's addresses to
+# the new build's from its linker map (tools/reappend.mjs --repoint) and runs
+# every check against the rewritten block. A rebuild of the committed source
+# needs neither: it reproduces dist/ byte for byte.
 set -eo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=${1:-$HERE/dist}
@@ -58,7 +63,7 @@ export SOURCE_DATE_EPOCH=$(date -u -d '2026-04-23 12:00:00' +%s 2>/dev/null || e
   || { tail -30 "$B/build.log" >&2; exit 1; }
 mkdir -p "$OUT"
 node "$HERE/tools/reappend.mjs" --line1 "$B/wasmpsx_worker.js" --wasm "$B/wasmpsx_worker.wasm" --map "$B/wasmpsx_worker.map" \
-  --from "$HERE/dist/wasmpsx_worker.js" --out "$B/out.js"
+  --from "$HERE/dist/wasmpsx_worker.js" --out "$B/out.js" ${PS1_REPOINT:+--repoint}
 cp "$B/wasmpsx_worker.wasm" "$OUT/wasmpsx_worker.wasm"
 cp "$B/wasmpsx_worker.data" "$OUT/wasmpsx_worker.data"
 cp "$B/out.js" "$OUT/wasmpsx_worker.js"

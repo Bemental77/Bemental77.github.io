@@ -17,6 +17,7 @@
 
 #define _IN_SOFT
 
+#include "urdirty.h"
 #include "externals.h"
 #include "soft.h"
 
@@ -1140,6 +1141,8 @@ void FillSoftwareArea(short x0,short y0,short x1,      // FILL AREA (BLK FILL)
  if(x1>1024)       x1=1024;
 
  dx=x1-x0;dy=y1-y0;
+ // urdirty.h: exactly the bytes the loops below write (y0 may be negative)
+ if(dx>0 && dy>0) ur_mark_range(psxVuw + (1024*y0) + x0, ((size_t)(dy-1)*1024 + dx) * 2);
  if(dx&1)
   {
    unsigned short *DSTPtr;

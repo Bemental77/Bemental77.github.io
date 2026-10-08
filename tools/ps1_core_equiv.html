@@ -99,7 +99,16 @@ window.__start = function (opts) {
 async function run(opts) {
   const N = opts.frames | 0, EVERY = opts.every | 0, VEVERY = opts.vramEvery | 0, PORTS = opts.ports | 0;
   log('fetching ' + opts.disc);
-  const disc = await fetchDisc(opts.disc, opts.bytes);
+  let disc;
+  if (opts.parts > 0) {
+    const bufs = []; let tot = 0;
+    for (let i = 0; i < opts.parts; i++) {
+      const b = await fetchDisc(opts.disc.replace(/parta[a-z](\.bin)?(\.gz)?$/, (m) => m.replace(/^parta[a-z]/, 'parta' + String.fromCharCode(97 + i))), 1 << 30);
+      bufs.push(b); tot += b.length;
+    }
+    disc = new Uint8Array(tot); let off = 0;
+    for (const b of bufs) { disc.set(b, off); off += b.length; }
+  } else disc = await fetchDisc(opts.disc, opts.bytes);
   log('disc bytes ' + disc.length);
   const A = mkWorker(opts.a), B = mkWorker(opts.b);
   const t0 = performance.now();

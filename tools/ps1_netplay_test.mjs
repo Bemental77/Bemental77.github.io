@@ -231,9 +231,11 @@ const maskAt = (img, port) => (img ? ((img[port * 2] | (img[port * 2 + 1] << 8))
 
     const na0 = await A.page.evaluate(() => window.__ps1Net());
     const nb0 = await B.page.evaluate(() => window.__ps1Net());
-    ok('ports-are-the-consoles-own', na0.portCount === 2 && nb0.portCount === 2,
-       `portCount=${na0.portCount}/${nb0.portCount} — this core implements exactly two `
-       + `(PADSTATE PadState[2]; there is no multitap in it)`);
+    // FOUR since 2026-10-07: the room can seat players 3-4 behind a multitap in
+    // port 1 (ps1.html PS1_PORTS, pad_worker.c ps1_multitap). Two seated must
+    // still be the plain console — checked below (the-multitap-stays-out-for-two).
+    ok('ports-are-the-rooms-four', na0.portCount === 4 && nb0.portCount === 4,
+       `portCount=${na0.portCount}/${nb0.portCount} — two on the console, two more through a multitap when 3+ are in`);
 
     const pa = (na0.localPorts || [])[0], pb = (nb0.localPorts || [])[0];
     ok('each-peer-holds-a-different-port', pa != null && pb != null && pa !== pb,
@@ -294,13 +296,19 @@ const maskAt = (img, port) => (img ? ((img[port * 2] | (img[port * 2 + 1] << 8))
                hud: (document.getElementById('netHud') || {}).textContent || '' };
     })));
     ok('the-party-button-is-live',
-       partyNow.every((q) => /^Party · [A-HJ-NP-Z2-9]{5} · 2\/2 · (starting|playing)$/.test(q.party.label)),
+       partyNow.every((q) => /^Party · [A-HJ-NP-Z2-9]{5} · 2\/4 · (starting|playing)$/.test(q.party.label)),
        `#btnNet reads ${JSON.stringify(partyNow.map((q) => q.party.label))}`);
     ok('seats-use-the-vocabulary-and-never-a-nonce',
-       partyNow.every((q) => q.party.rows.length === 2
-         && q.party.rows.every((r) => VOCAB.test(r.state) && (r.port === 0 ? r.who === 'host' : r.who === 'player'))
-         && q.roster.length === 2 && !q.roster.some((t) => /\b[0-9a-f]{16}\b/.test(t)) && !/\b[0-9a-f]{16}\b/.test(q.hud)),
+       partyNow.every((q) => q.party.rows.length === 4
+         && q.party.rows.every((r) => VOCAB.test(r.state) && (r.port === 0 ? r.who === 'host' : r.port === 1 ? r.who === 'player' : (r.who == null && r.state === 'open')))
+         && q.roster.length === 4 && !q.roster.some((t) => /\b[0-9a-f]{16}\b/.test(t)) && !/\b[0-9a-f]{16}\b/.test(q.hud)),
        `rows=${JSON.stringify(partyNow.map((q) => q.party.rows))} rendered=${JSON.stringify(partyNow.map((q) => q.roster))}`);
+    // TWO SEATED IS THE PLAIN CONSOLE: the page decided "no multitap" before
+    // frame 0 and never asked the core for one (core === null: no
+    // 'netMultitap' was sent, so the pad image stays the 48-byte pair).
+    const mt2 = await Promise.all([A, B].map((p) => p.page.evaluate(() => window.__ps1Net().multitap)));
+    ok('the-multitap-stays-out-for-two', mt2.every((m) => m && m.decided && m.on === false && m.slots === 0 && m.core === null && m.seated === 2),
+       `multitap ${JSON.stringify(mt2)}`);
     ok('the-status-line-says-everyone-started-together',
        partyNow.every((q) => /^Playing — everyone started together at frame \d+\.$/.test(q.party.barrier)),
        `#netBarrier reads ${JSON.stringify(partyNow.map((q) => q.party.barrier))}`);

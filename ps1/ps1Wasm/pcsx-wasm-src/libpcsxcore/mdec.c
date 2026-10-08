@@ -18,6 +18,7 @@
  *   51 Franklin Street, Fifth Floor, Boston, MA 02111-1307 USA.           *
  ***************************************************************************/
 
+#include "urdirty.h"
 #include "mdec.h"
 
 #define DSIZE			8
@@ -514,6 +515,8 @@ void psxDma1(u32 adr, u32 bcr, u32 chcr) {
 	size = (bcr >> 16) * (bcr & 0xffff);
 
 	image = (u16 *)PSXM(adr);
+	// urdirty.h: the decoder writes `size` 32-bit words of pixels from here
+	if (image) ur_mark_range(image, (size_t)size * 4);
 
 	if (mdec.reg0 & MDEC0_RGB24) { // 15-b decoding
 		// MDECOUTDMA_INT(((size * (1000000 / 9000)) / 4) /** 4*/);
