@@ -298,7 +298,7 @@ if (want('away-15s-in-a-delay-room')) {
 //   relay-at-start   the need is known before the start: the room starts in
 //       delay at that need and stays; no switch, no rollback frame run.
 //   relay-shallow    a relay that needs only 10 frames (<= 12) keeps rollback.
-if (want('relay-mid-room') || want('relay-at-start') || want('relay-shallow')) {
+if (want('relay-mid-room') || want('relay-at-start') || want('relay-30hz') || want('relay-shallow')) {
   const NEED = 23;
   const base0 = { seed: 9, secs: 40, players: 2, baseMs: 190, jitterMs: 40, loss: 0.01, runFrac: RUN_FRAC, rbResume: true };
   if (want('relay-mid-room')) {
@@ -325,6 +325,31 @@ if (want('relay-mid-room') || want('relay-at-start') || want('relay-shallow')) {
     ok('relay-at-start', !bad.length, `room ${r.minRate.toFixed(4)}x  start ${h.modes[0] ? h.modes[0].to + '(' + h.modes[0].delay + ') "' + h.modes[0].text + '"' : 'none'}`
        + `  end ${ends.map((c) => c.mode + (c.mode === 'delay' ? c.delay : '')).join('/')}  desync ${r.desyncs} truth ${r.truthChecked - r.truthBad}/${r.truthChecked}`
        + (bad.length ? '\n        ' + bad.join('; ') : ''));
+  }
+  // relay-30hz   the relay room at a 30 Hz display with hitches (a loaded
+  //     software-GPU box): every console 1.000x and the host not stalling on
+  //     its guest. Both halves were measured short on the device matrix
+  //     (docs/netplay/firewall.md): a delay room's page dropped every tick's
+  //     credit past 100 ms / 4 frames (0.96-0.97x here), and a host that ran
+  //     frame 0 at once sat one one-way ahead of its guest (stalls).
+  if (want('relay-30hz')) {
+    const bad = [], rows = [];
+    for (const seed of [1, 2, 5]) {
+      const r = simulate(Object.assign({ name: 'relay-30hz', seed, relayNeed: 22, hintMs: 180, vsyncMs: 33.4, tickJitterMs: 20, hiccup: { p: 0.04, ms: 70 } },
+                                       base0, { baseMs: 180, secs: 60 }));
+      const b = base(r), h = r.consoles.H;
+      for (const [id, c] of Object.entries(r.consoles)) if (c.rate < 0.995) b.push(id + ' rate ' + c.rate);
+      if (h.lsStalls > 1) b.push('host stalled ' + h.lsStalls + ' times (' + h.stallMs + ' ms)');
+      if (b.length) bad.push('s' + seed + ': ' + b.join('; '));
+      rows.push('s' + seed + ' ' + Object.entries(r.consoles).map(([id, c]) => id + ' ' + c.rate + 'x stalls ' + c.lsStalls).join(' / '));
+    }
+    // the control: the same room with the old 100 ms / 4-frame tick must fall short, or this cell proves nothing
+    const ctl = simulate(Object.assign({ name: 'relay-30hz-ctl', seed: 1, relayNeed: 22, hintMs: 180, vsyncMs: 33.4, tickJitterMs: 20, hiccup: { p: 0.04, ms: 70 }, oldTickCap: true },
+                                       base0, { baseMs: 180, secs: 60 }));
+    const ctlMin = Math.min(...Object.values(ctl.consoles).map((c) => c.rate));
+    if (!(ctlMin < 0.99)) bad.push('control (old tick) read ' + ctlMin + 'x: the cell no longer reproduces the loss');
+    rows.push('control old tick ' + ctlMin + 'x');
+    ok('relay-30hz', !bad.length, rows.join('  |  ') + (bad.length ? '\n        ' + bad.join('\n        ') : ''));
   }
   if (want('relay-shallow')) {
     const r = simulate(Object.assign({ name: 'relay-shallow', relayNeed: 10 }, base0, { baseMs: 40, jitterMs: 10 }));

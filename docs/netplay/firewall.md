@@ -338,6 +338,132 @@ each), and both passed every N64 rep after it. A third arm put back the pre-PR
 mean against 0.979 for current, 4 reps each, at load 3.7-6.0. Every one of those 8 runs
 was under 0.995. So the failing reads were the box's state at the time, not either change.
 
+## Delay rooms that keep the wall clock (2026-10-08, netplay.js `49a04b83`)
+
+### Where a relayed delay room's time went (Genesis)
+
+The matrix now records each page's dropped tick credit by cause (`window.__genTickLoss`),
+the engine's holds (`lsStats`), GameCube's wait attribution (`__gcLockstep()` `gcLs`), and the
+Long Animation Frames over 100 ms with the scripts in them (`native.loaf`; solos: `loaf`).
+Baseline, same code as `8c9e6f80` plus those counters (`/tmp/npdm/base-loss`, load 11.3-11.6):
+
+| Genesis host | ownClock rate | dropped to the 4-frame tick cap | to the 100 ms clamp | waiting on its peer | audio dropouts |
+|---|---|---|---|---|---|
+| `fw` | 0.9572 | 1453 ms (57 ticks) | 1017 ms (25 ticks) | 406 ms | 52 |
+| `fw300` | 0.9452 | 1280 ms (55 ticks) | 916 ms (17 ticks) | 2310 ms | 74 |
+
+- **The room's time was lost in the page's tick, not on the link.** `genesis.html` tick() ran
+  at most 4 frames and 100 ms of wall time a tick and dropped the rest. Solo that is the
+  anti-sprint rule (gate 9). In a delay room on this box the display ticks were late, not
+  stalled: rAF ran 15-45/s, and the long frames were mostly the rAF callback plus 43-147 ms of
+  rendering. Each late tick lost frames that nobody repaid, the room ran at the slower page's
+  rate, and its peer then waited on it.
+- **The audio dropouts are the same loss.** Every lost frame is 16.7 ms of guest audio that was
+  never made. The AudioWorklet resumes a dry spell at half its 80 ms cushion
+  (`lib/cart_audio_worklet.js`), so the cushion never recovers. Across the earlier cells the
+  host's dropouts tracked its own-clock rate: 0.9376 -> 108, 0.9826 -> 23, 0.992 -> 14.
+  The joiner had none at the same rate in some runs because its sink's backlog grew instead.
+- **The host also started one one-way ahead of its guest.** A guest's frame 0 is the moment
+  `lsgo` reaches it. So the host's slack against the guest's inputs was the delay minus
+  (one-way + batching) minus one more one-way, while the guest had that one-way spare. The
+  relay's delay is sized for one one-way, so the host stalled until it had lost that much,
+  and again on later tails. With the tick fixed (`/tmp/npdm/cand-3`) the host still stalled
+  6 / 11 times and ended 10 / 20 frames behind its clock at `fw` / `fw300`; the joiner never
+  stalled.
+
+### The changes
+
+1. **`genesis.html`: a delay-lockstep room runs what its wall clock owes in the tick that owes
+   it.** The tick limit is 250 ms / 15 frames (`ROOM_MAX_TICK_MS`, `ROOM_MAX_CATCHUP_FRAMES`).
+   Solo and rollback keep 100 ms / 4. The end-of-tick clamp still drops any credit left over
+   and any wait, so nothing is banked across ticks.
+2. **`lib/netplay.js`: a relayed delay room's host holds frame 0 for the relay's measured
+   one-way** (`rbHintMs`, at most 600 ms; `_startHoldUntil`). Its own clock starts when the
+   hold ends. The hold applies only to a room that starts in delay because of the relay
+   (`csr`); a direct link's one-way is a few ms and is not held.
+3. **`genesis.html`: a one-frame delay-room catch-up frame keeps its audio** (`keepAudio`).
+   Its picture is still skipped. A rejoin's frames are still dropped.
+4. **The 30-frame relay ceiling (`RELAY_MAX_DELAY`) stays.** With 1 and 2 in place, Genesis
+   `fw300` runs at 30 frames with 3 / 2 stalls (139 / 39 ms) a minute. The ceiling was not the
+   limit; the host's lost one-way and the page's dropped ticks were.
+5. **Tried and reverted: own-clock catch-up in the engine** (hidden frames whenever a console
+   is behind its own wall clock). It got Genesis to 1.000x, but the host stalled 493 / 367 times.
+   The host's own clock runs one one-way ahead of the room's (change 2), so repaying to it ran
+   the host into its guest's input frontier on every tick. That clock is the wrong reference.
+
+`tools/netplay_rb_pace_sim.mjs` models the delay-room tick, a display period (`vsyncMs`) and an
+`oldTickCap` control. `tools/netplay_rb_capacity_test.mjs` adds the cell **`relay-30hz`**: a
+relay room at a 30 Hz display with 70 ms hitches on 4% of ticks. It needs every console at
+>= 0.995x and the host at <= 1 stall, and its old-tick control must read < 0.99x. Results:
+1.000x, 0 stalls, control 0.9676x. On `8c9e6f80` the host stalls 4 times, so the cell FAILs.
+
+### Before / after (`tools/netplay_device_matrix.mjs`, 60 s per cell)
+
+Host / joiner. GameCube is quoted by its guest-clock witness, the others by engine frames.
+Stalls are count / total ms. "Load" is the cell's max 1-min load on this 4-core box. Every relay
+cell carried the firewall proof and had 0 desyncs.
+
+| cell | before: `8c9e6f80` (`rl-all-4`) | before: `8c9e6f80` + counters (`base-loss`) | after (`final-1`) |
+|---|---|---|---|
+| Genesis `fw` | 0.9955 / 0.9966 · stalls 4 / 0 · audio 14 / 1 · load 9.7 | 0.9585 / 0.9607 · 12 / 32 · audio 52 / 29 · load 11.6 | **0.9999 / 0.9996 · 0 / 0 · audio 0 / 0 · PASS** · load 7.3 |
+| Genesis `fw300` | 0.9769 / 0.9788 · 5 / 25 · audio 44 / 16 · load 10.5 | 0.9479 / 0.9501 · 25 / 30 · audio 74 / 32 · load 11.3 | **0.9986 / 0.9991 · 3 (139 ms) / 2 (39 ms) · audio 1 / 2 · PASS** · load 9.1 |
+| PS1 `fw` | 0.9997 / 1.0001 · 1 / 0 · load 7.4 | — | **1.0011 / 1.0004 · 0 / 0 · PASS** · load 5.3 |
+| PS1 `fw300` | 1.0007 / 1.0001 · 80 (2874 ms) / 0 · load 4.0 | — | **1.0001 / 1.0008 · 0 / 0 · PASS** · load 4.0 |
+| GameCube `fw` | 0.9373 / 0.9415 · 38 / 38 (max 484 / 586 ms) · load 14.5 | 0.9713 / 0.9874 · 18 / 1 (max 179 / 592) · load 13.9 | 0.971 / 0.9657 · 19 / 39 (max 215 / 277) · fastest 5 s 1.028x · load 13.0 |
+| GameCube `fw300` | 0.9022 / 0.8702 · 93 / 95 (max 328 / 491) · load 17.3 | 0.9487 / 0.9506 · 37 / 87 (max 370 / 443) · load 13.2 | 0.9643 / 0.97 · 37 / 24 (max 270 / 328) · fastest 5 s 1.028x · load 11.9 |
+
+⚠ **The loads are not matched.** The Genesis "after" cells ran at load 7-9 and `base-loss` at
+11-12. The matched comparison is the simulator's `relay-30hz` cell: the same room reads 0.9676x
+with the old tick and 1.000x with the new one. `cand-3` (tick fix only) ran at load 8.6-9.8,
+the same band as `rl-all-4`: 0.9955 / 0.9977 and 0.9946 / 0.9999, with 6 and 4 host dropouts.
+The PS1 "after" cells ran on a tree that also carried the PS1 room-step work committed as
+`7c6f905` (a ~4x cheaper room step), so the PS1 `fw300` host's 80 -> 0 stalls cannot be put on
+the start hold alone.
+The GameCube "fastest 5 s" FAST-FORWARD verdicts are the page's own witness after a stall. The
+baseline had them too (`base-loss` joiner 1.0286x), before the start hold existed. GameCube does
+not load `genesis.html`, so its only change here is the start hold, which runs nothing.
+
+### GameCube: are the 484-586 ms stalls the box? Yes, as far as one witness shows
+
+- A GameCube relay room's stalls are waits on the other console's inputs while that console's
+  **main thread** is stopped. In a delay room every frame is released there (`gcLsStep`), and
+  inputs are sent from there. GameCube's LoAFs over 150 ms in the room (`base-loss`) ran
+  150-983 ms, and the scripts in them came to only 5-40 ms each.
+- **Witness: two GameCube pages, no room, same box** (`--solo-only --solo pair`,
+  `/tmp/npdm/gc-pair-loaf`, load 9.0-13.6). Each page had 39 / 24 LoAFs of 150 ms or more,
+  totalling 10.9 / 8.0 s over the window, max 725 / 784 ms. Of that, script was 541 / 327 ms
+  and rendering 31 / 152 ms, so about 95% of the time was neither this page's script nor its
+  rendering. Guest rate 0.9905 / 0.9932. One GameCube solo at load 4-5 (`cand-1`): 1.0002x and
+  0 long tasks in the window. A second solo pair at load 6.8-13.3 (`cand-1`): 0.9859 / 0.9843,
+  max long task 620 ms.
+- So the 500-800 ms stops happen with no room at all, whenever two GameCubes share this box.
+  I have not shown what fills them (OS scheduling, V8 GC and GPU-process waits on SwiftShader
+  are the candidates). A solo page rides them out: its worker keeps the clock with 8 frames of
+  backlog. A delay room cannot, because its next frame needs the main thread and the other
+  console's input. That is why the room reads 0.95-0.97 where the pair solo reads 0.985-0.993.
+- **What would close the room's share of it:** let the worker release delay-lockstep frames
+  whose inputs are already all in hand (`lead` was 9-15 frames) without the main thread. This is
+  `recomp_worker.js` roomSelf with a per-frame image ring instead of one guess. Rollback rooms
+  already have this ("A ROOM'S FRAMES DO NOT WAIT ON THIS THREAD"). It would not remove the
+  stall a blacked-out console causes its peer once the peer's slack runs out, because that
+  console's own inputs are also sent from the stopped thread. Not done here:
+  `gamecube/recomp/recomp_worker.js` has another agent's uncommitted work in it.
+
+### Suites (netplay.js `49a04b83`, under `tools/probe_lock.sh`)
+
+Node: `netplay_rollback_test` 28/28, `netplay_rb_capacity_test` 30/30 (adds `relay-30hz`),
+`netplay_lockstep_test` 152/152, `delay_stepdown_test` 26/26, `netplay_rb_pace_sim` 15/15,
+`netplay_pace_sim` 18/18, `netplay_pace_sim_n` 6/6 (load 4-5).
+Browser (2026-10-08 06:42-07:04, load 1.8-8.3): `snes_rollback_probe` 19/19, `ps1_netplay_test` 27/27,
+`gc_rollback_det_test` 7/7, `genesis_netplay_test` 27/27 (guest 1.0012x),
+`genesis_rollback_test --arms lockstep,rollback --lag 50` 15/15, `n64/tools/lockstep_probe.mjs`
+GATE PASS (solo/bridge/pair 2/2), `dreamcast/tools/room_desync_soak.mjs --game pso2 --soak 60
+--url http://localhost:8080` IN SYNC over 32 RAM checkpoints and 32 fingerprints (md5 STABLE).
+`gc_netplay_room_test` (RUN_MS=120000) read **19/1 on its first run** at load 3.3-7.6. Its
+summary was cut off, so which check failed is not known. It read 20/20 on the rerun at load
+6.6-7.0. The GameCube page's only change here is the relay start hold, which a direct room
+does not take.
+
 ## What is NOT shown
 
 - **Real hardware on a real 443-only network.** The firewall is real (kernel), but both
