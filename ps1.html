@@ -572,11 +572,44 @@
       pcsx_worker.postMessage({ cmd: 'netAudioSab', sab: AS.sab, hdrBytes: AS_HDR_BYTES, cap: AS.cap });
     }).catch(function (e) { AS.why = 'addModule: ' + ((e && e.message) || e); pageLog('[audio] SDL sink (the old main-thread path) — ' + AS.why); });
   }
+  // ══ PAUSING EMSCRIPTEN'S SDL AUDIO DOES NOT STOP ITS PUMP — IT SPINS IT ═══
+  // _SDL_PauseAudio(1) clears only the LAST of up to five pending
+  // SDL.audio.caller timers and zeroes numAudioTimersPending; every surviving
+  // timer re-arms itself (pending < 5 again). And a paused pushAudio returns
+  // before advancing nextPlayTime, so queueNewAudioData runs the callback all
+  // five times per tick and the next tick is scheduled at max(0, negative) =
+  // 0 ms. Result: a setTimeout(0) loop on the main thread for the life of the
+  // page, each tick calling dfsound's SOUND_FillAudio five times, and each of
+  // those posting {cmd:'soundBytes', lBytes: 0} (sdl.c:46) to the worker —
+  // which ignores it whenever the ring is on (wasmpsx_worker.js 'soundBytes':
+  // GATE || AR). MEASURED (bench room, MR2, hermetic tree = prod b742176):
+  // 66,820 soundBytes in ~10 s on the host's worker and 54,645 on the
+  // joiner's, ~4,300-6,700 a second each, every one with lBytes 0; a 15 s
+  // trace showed 66,857 tasks on one worker thread, and its over-budget steps
+  // were 22-28 ms of wall for 5-10 ms of thread CPU — the core waiting for a
+  // CPU that this spin (two pages' main thread + two workers woken
+  // continuously) was taking. So once the ring is on — it is never turned
+  // back off — the pump is cut at its root: the callback queue and the
+  // caller become no-ops, which ends every surviving timer chain on its next
+  // tick. ?sdlspin=1 keeps the stock pause (the A/B arm).
+  var SDL_SPIN_AB = /[?&]sdlspin=1\b/.test(location.search);
+  function sdlAudioStop() {
+    var A = Module.SDL && Module.SDL.audio;
+    if (!A) return false;
+    try { if (typeof _SDL_PauseAudio === 'function') _SDL_PauseAudio(1); } catch (e) {}
+    if (SDL_SPIN_AB) return true;
+    A.queueNewAudioData = function () {};
+    A.caller = function () { var a = Module.SDL && Module.SDL.audio; if (a) a.numAudioTimersPending = 0; };
+    AS.sdlStopped = true;
+    return true;
+  }
   // The worker took the ring: stop the SDL pump (its setTimeout chain and its
   // AudioBufferSourceNodes) and make AudioDiag read the ring's counters.
   function audioSinkOn() {
     AS.on = true; AS.why = 'ok';
-    try { if (typeof _SDL_PauseAudio === 'function') _SDL_PauseAudio(1); } catch (e) {}
+    // (SDL_OpenAudio — dfsound SetupSound — has always run by now in practice;
+    // if it has not, stop the pump the moment it exists.)
+    if (!sdlAudioStop()) (function retry(n) { if (!sdlAudioStop() && n > 0) setTimeout(function () { retry(n - 1); }, 500); })(240);
     var ad = window.__audioDiag;
     if (ad) {
       var produced = function () { return (Atomics.load(AS.hdr, 2) >>> 0) + AS.prodBase; };
@@ -592,7 +625,7 @@
     pageLog('[audio] SAB ring -> AudioWorklet sink ON (' + AS.cap + ' frames, target ' + AS_TARGET_MS + ' ms, ctx ' + (AS.ctx ? AS.ctx.sampleRate : '?') + ' Hz) — the main thread is off the audio path');
   }
   window.__ps1AudioSink = function () {
-    return { on: AS.on, why: AS.why, stats: AS.stats, msgs: AS.msgs,
+    return { on: AS.on, why: AS.why, stats: AS.stats, msgs: AS.msgs, sdlStopped: !!AS.sdlStopped,
       produced: AS.hdr ? Atomics.load(AS.hdr, 2) >>> 0 : null, dropped: AS.hdr ? AS.hdr[3] : null,
       fill: AS.hdr ? ((AS.hdr[0] - AS.hdr[1]) | 0) : null, underruns: AS.hdr ? AS.hdr[8] : null, ctxState: AS.ctx ? AS.ctx.state : null };
   };
