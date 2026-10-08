@@ -245,8 +245,26 @@ void FPRRegCache::Flush(u32 ctx_ptr, BitSet32 preg_mask, u8 lane_mask, bool exit
     // the stores of one Flush.
     const bool batch_mask = g_bem_lc_base && bem_lever_on(BEM_LEVER_FLUSH_MASK_BATCH);
     u32 batch_set = 0u, batch_clear = 0u;
-    for (u32 i = 0; i < 32; ++i) {
-        if (!preg_mask[i]) continue;
+    // [BEM_LEVER_SINGLE_EDGE_SIMD 2026-10-08] The FPR_EXIT_STORE regs of this
+    // flush (Single, dirty, exiting, both lanes) share ONE Inf/NaN test: lane k
+    // of reg i is Inf/NaN iff (bits & 0x7FFFFFFF) >=u 0x7F800000, so the
+    // lane-wise unsigned max of the masked v128s reaches 0x7F800000 in lane 0
+    // or 1 iff some reg would have taken its slow arm. None: every reg's single
+    // v128.store (the per-reg fast arm). Some: each reg runs its own unchanged
+    // per-reg test and arms, which store exactly what they stored before.
+    BitSet32 exit_batch(0);
+    // Needs the per-reg code inside the slow arm to emit no runtime mask write:
+    // the batched RMW (emitted after both arms) or no mask cell at all.
+    if ((batch_mask || !g_bem_lc_base) && exiting && lane_mask == FPR_LANE_BOTH &&
+        bem_lever_on(BEM_LEVER_PROMOTE_SIMD) &&
+        bem_lever_on(BEM_LEVER_FPR_EXIT_STORE) && bem_lever_on(BEM_LEVER_SINGLE_EDGE_SIMD)) {
+        for (u32 i = 0; i < 32; ++i)
+            if (preg_mask[i] && m_state[i].repr == FPRPrec::Single &&
+                (m_state[i].v128_dirty || m_force_flush[i]))
+                exit_batch[i] = true;
+        if (exit_batch.Count() < 2) exit_batch = BitSet32(0);
+    }
+    auto flush_one = [&](u32 i) {
         // [single-spec PM26] latch BEFORE the promote — EmitPromoteToDouble
         // flips repr to Double and dirties both lanes, so a post-store repr
         // check would mis-classify the value we just widened from a Single.
@@ -381,6 +399,35 @@ void FPRRegCache::Flush(u32 ctx_ptr, BitSet32 preg_mask, u8 lane_mask, bool exit
                 m_wb.op_i32_store(0);
             }
         }
+    };
+    for (u32 i = 0; i < 32; ++i)
+        if (preg_mask[i] && !exit_batch[i]) flush_one(i);
+    if (exit_batch.m_val) {
+        bool first = true;
+        for (u32 i = 0; i < 32; ++i) {
+            if (!exit_batch[i]) continue;
+            m_wb.op_local_get(m_state[i].v128_local_idx);
+            m_wb.op_v128_const_i32_splat(0x7FFFFFFFu);
+            m_wb.op_v128_and();
+            if (!first) m_wb.op_i32x4_max_u();
+            first = false;
+        }
+        m_wb.op_v128_const_i32_splat(0x7F800000u);
+        m_wb.op_i32x4_ge_u();
+        m_wb.op_i64x2_extract_lane(0);
+        m_wb.op_i64_eqz();
+        m_wb.op_if(/*VOID*/);
+        for (u32 i = 0; i < 32; ++i) {
+            if (!exit_batch[i]) continue;
+            m_wb.op_i32_const((s32)ctx_ptr);
+            m_wb.op_local_get(m_state[i].v128_local_idx);
+            m_wb.op_f64x2_promote_low_f32x4();
+            m_wb.op_v128_store(ppc_off::ps0(i), /*align=*/3);
+        }
+        m_wb.op_else();
+        for (u32 i = 0; i < 32; ++i)
+            if (exit_batch[i]) flush_one(i);   // each reg's own test and arms
+        m_wb.op_end();
     }
     if (batch_set | batch_clear) {
         m_wb.op_i32_const((s32)BEM_SINGLE_MASK_CELL);
@@ -407,10 +454,52 @@ void FPRRegCache::Flush(u32 ctx_ptr, BitSet32 preg_mask, u8 lane_mask, bool exit
 // f32.demote_f64 would not guarantee) and build the v128 [ps0,ps1,ps0,ps0].
 // Compile-time state: repr=Single, v128 NOT dirty (memory already matches),
 // lanes loaded + clean — a block that never writes the FPR flushes nothing.
+// [BEM_LEVER_SINGLE_EDGE_SIMD 2026-10-08] Push 1 iff every lane of the ps[]
+// pairs of `regs` (read from ctx) is a non-NaN double that f32 holds exactly:
+// promote(demote(x)) == x per lane (f64x2.eq, false for NaN). For such x the
+// PEM pair is exact: ConvertToSingle(x) == demote(x) bit for bit (truncation
+// of zero mantissa bits; the denormal arm's shift drops only zero bits) and
+// ConvertToDouble(demote(x)) == x. When `keep` is set, each pair's lanes go to
+// the lane locals and demote(pair) to the reg's v128 local (scratch here).
+void FPRRegCache::EmitSimdExactSingleTest(u32 ctx_ptr, BitSet32 regs, bool keep) {
+    static_assert(ppc_off::ps1(0) == ppc_off::ps0(0) + 8u, "ps0/ps1 adjacent");
+    constexpr u32 LOCAL_V = 152u;   // jit_load_store LOCAL_PSQ_V (v128 scratch)
+    bool first = true;
+    for (u32 i = 0; i < 32; ++i) {
+        if (!regs[i]) continue;
+        PregState& s = m_state[i];
+        m_wb.op_i32_const((s32)ctx_ptr);
+        m_wb.op_v128_load(ppc_off::ps0(i), /*align=*/3);
+        m_wb.op_local_tee(LOCAL_V);
+        if (keep) {
+            m_wb.op_i64x2_extract_lane(0);
+            m_wb.op_local_set(s.ps0_local_idx);
+            m_wb.op_local_get(LOCAL_V);
+            m_wb.op_i64x2_extract_lane(1);
+            m_wb.op_local_set(s.ps1_local_idx);
+            m_wb.op_local_get(LOCAL_V);
+            m_wb.op_f32x4_demote_f64x2_zero();
+            m_wb.op_local_tee(s.v128_local_idx);
+        } else {
+            m_wb.op_f32x4_demote_f64x2_zero();
+        }
+        m_wb.op_f64x2_promote_low_f32x4();
+        m_wb.op_local_get(LOCAL_V);
+        m_wb.op_f64x2_eq();
+        if (!first) m_wb.op_v128_and();
+        first = false;
+    }
+    m_wb.op_i64x2_all_true();
+}
+
 void FPRRegCache::EmitAssumedSingleLoads(u32 ctx_ptr, BitSet32 assumed,
                                          bool fast_loop_mode) {
-    for (u32 i = 0; i < 32; ++i) {
-        if (!assumed[i]) continue;
+    // [BEM_LEVER_SINGLE_EDGE_SIMD] one SIMD exactness test for every assumed
+    // reg; all exact -> each v128 is demote(pair) shuffled to [ps0,ps1,ps0,ps0]
+    // (the bits the PEM path builds); otherwise the PEM path, from the lane
+    // locals the test already loaded. Lever off: the per-reg loop as before.
+    const bool simd = bem_lever_on(BEM_LEVER_SINGLE_EDGE_SIMD) && assumed.m_val != 0u;
+    auto assign = [&](u32 i) {
         PregState& s = m_state[i];
         if (!s.assigned) {
             s.ps0_local_idx  = m_local_base + i;
@@ -418,8 +507,9 @@ void FPRRegCache::EmitAssumedSingleLoads(u32 ctx_ptr, BitSet32 assumed,
             s.v128_local_idx = m_v128_base + i;
             s.assigned = true;
         }
-        EmitLaneLoad(ctx_ptr, i, FPR_LANE_PS0);
-        EmitLaneLoad(ctx_ptr, i, FPR_LANE_PS1);
+    };
+    auto pem_build = [&](u32 i) {   // lanes already in the lane locals
+        PregState& s = m_state[i];
         emit_convert_to_single(m_wb, s.ps0_local_idx);   // f32 bits (i32)
         m_wb.op_f32_reinterpret_i32();
         m_wb.op_f32x4_splat();                           // [ps0,ps0,ps0,ps0]
@@ -427,6 +517,34 @@ void FPRRegCache::EmitAssumedSingleLoads(u32 ctx_ptr, BitSet32 assumed,
         m_wb.op_f32_reinterpret_i32();
         m_wb.op_f32x4_replace_lane(1);                   // [ps0,ps1,ps0,ps0]
         m_wb.op_local_set(s.v128_local_idx);
+    };
+    if (simd) {
+        for (u32 i = 0; i < 32; ++i) if (assumed[i]) assign(i);
+        EmitSimdExactSingleTest(ctx_ptr, assumed, /*keep=*/true);
+        static const u8 kPs01Ps0Ps0[16] = { 0,1,2,3, 4,5,6,7, 0,1,2,3, 0,1,2,3 };
+        m_wb.op_if(/*VOID*/);
+        for (u32 i = 0; i < 32; ++i) {
+            if (!assumed[i]) continue;
+            m_wb.op_local_get(m_state[i].v128_local_idx);
+            m_wb.op_local_get(m_state[i].v128_local_idx);
+            m_wb.op_i8x16_shuffle(kPs01Ps0Ps0);
+            m_wb.op_local_set(m_state[i].v128_local_idx);
+        }
+        m_wb.op_else();
+        for (u32 i = 0; i < 32; ++i) if (assumed[i]) pem_build(i);
+        m_wb.op_end();
+        for (u32 i = 0; i < 32; ++i)   // what EmitLaneLoad records (the test loaded them)
+            if (assumed[i]) { m_state[i].ps0_loaded = true; m_state[i].ps1_loaded = true; }
+    }
+    for (u32 i = 0; i < 32; ++i) {
+        if (!assumed[i]) continue;
+        PregState& s = m_state[i];
+        if (!simd) {
+            assign(i);
+            EmitLaneLoad(ctx_ptr, i, FPR_LANE_PS0);
+            EmitLaneLoad(ctx_ptr, i, FPR_LANE_PS1);
+            pem_build(i);
+        }
         if (fast_loop_mode) {
             // [self-loop PM47] seed the scratch window so a subsequent fast
             // re-entry (flag proves our own arm was the last exit) can rebuild

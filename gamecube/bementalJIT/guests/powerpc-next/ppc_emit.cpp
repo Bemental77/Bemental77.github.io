@@ -174,6 +174,19 @@ static bool BranchWritesOwnPc(u32 inst) {
     return false;
 }
 
+bool bem_lever2_on(u32 bit) {
+    if (g_bem_lc_base == 0u) return true;
+    static const u32 s_env_kill2 = []() -> u32 {
+        const char* v = std::getenv("BJIT_LEVER_KILL2");
+        return v ? (u32)std::strtoul(v, nullptr, 0) : 0u;
+    }();
+    const u32 kill = s_env_kill2 | *reinterpret_cast<volatile uint32_t*>(
+                                       static_cast<uintptr_t>(BEM_LEVER_KILL2_CELL));
+    *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(BEM_LEVER_CENSUS2_CELL)) =
+        0x80000000u | kill;
+    return (kill & bit) == 0u;
+}
+
 bool bem_lever_on(u32 bit) {
     if (g_bem_lc_base == 0u) return true;
     static const u32 s_env_kill = []() -> u32 {
@@ -293,6 +306,77 @@ static inline void emit_exit_census(WasmModuleBuilder& b, u32 cell) {
     b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
 }
 
+// [BEM_LEVER_STATIC_CHAIN] The specialized chain to static successor `t`, given
+// PC == t: constant-bucket tag/slot probe -> return_call_indirect; miss ->
+// return PC to the host. Ends in a return on every path.
+static void emit_static_target_probe(WasmModuleBuilder& b, u32 ctx_ptr, u32 t,
+                                     u32 tag_addr, u32 slot_addr, u16 tag_sym,
+                                     u16 slot_sym, bool diet) {
+    const u32 off = ((t >> 2) & BEM_DISP_MASK_NEXT) * 4u;
+    emit_addr_const(b, tag_addr + off, tag_sym, off); b.op_i32_load(0);
+    b.op_i32_const((s32)t); b.op_i32_eq();
+    b.op_if(BLOCK_TYPE_VOID);
+        emit_addr_const(b, slot_addr + off, slot_sym, off); b.op_i32_load(0);
+        if (diet) {
+            // tag hit => slot is a live table index (lever_gate.h).
+            b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
+        } else {
+        b.op_local_tee(LOCAL_TMP_A_CHAIN);
+        b.op_i32_const(0); b.op_i32_ge_s();
+        b.op_if(BLOCK_TYPE_VOID);
+            if (BEM_PM51_CENSUS && g_bem_lc_base) {
+                b.op_i32_const((s32)0x026B38D8u);
+                b.op_i32_const((s32)0x026B38D8u);
+                b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
+            }
+            b.op_local_get(LOCAL_TMP_A_CHAIN);
+            b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
+        b.op_end();
+        }
+    b.op_end();
+    if (BEM_PM51_CENSUS && g_bem_lc_base) {
+        b.op_i32_const((s32)0x026B38DCu);
+        b.op_i32_const((s32)0x026B38DCu);
+        b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
+    }
+    emit_exit_census(b, 0x026B34F0u);   // [census] host_return (terminal fallback)
+    b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
+}
+
+static void emit_downcount_bail(WasmModuleBuilder& b, u32 ctx_ptr) {
+    b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::DOWNCOUNT);
+    b.op_i32_const(0); b.op_i32_le_s();
+    b.op_if(BLOCK_TYPE_VOID);
+        // [PM51 bail-census — gated; census DONE: 99.66% hit-rate]
+        if (BEM_PM51_CENSUS && g_bem_lc_base) {
+            b.op_i32_const((s32)0x026B38D0u);
+            b.op_i32_const((s32)0x026B38D0u);
+            b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
+        }
+        emit_exit_census(b, 0x026B34DCu);   // [census] service_bail
+        b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
+    b.op_end();
+}
+
+// [BEM_LEVER_KNOWN_PC_CHAIN 2026-10-08] emit_chain_or_return for a plain
+// per-block body at a point where ctx.PC is known to hold the constant `t`
+// (the arm of a terminal branch that just stored it): the downcount bail, then
+// exactly the BEM_LEVER_STATIC_CHAIN arm for `t` without the PC reload and
+// compare that select it. Targets below 0x4000 (vector-page guard) and a
+// disabled chain take the generic emitter.
+void emit_chain_known_pc(WasmModuleBuilder& b, u32 ctx_ptr, u32 t) {
+    if (!g_bem_chain_enabled || t < 0x4000u) {
+        const u32 st[1] = { t };
+        emit_chain_or_return(b, ctx_ptr, 0u, 0u, nullptr, -1, nullptr, nullptr, 0u,
+                             (u16)BEM_RSYM_NONE, (u16)BEM_RSYM_NONE, st, 1u);
+        return;
+    }
+    emit_downcount_bail(b, ctx_ptr);
+    emit_static_target_probe(b, ctx_ptr, t, (u32)(uintptr_t)&g_bem_disp_tag[0],
+                             (u32)(uintptr_t)&g_bem_disp_slot[0], (u16)BEM_RSYM_NONE,
+                             (u16)BEM_RSYM_NONE, bem_lever_on(BEM_LEVER_PROBE_DIET));
+}
+
 // [order 13d] non-static (declared in jit_branch.h) so emit_coalesced_taken_exit
 // can call it; defaults live in the header declaration only.
 void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
@@ -346,18 +430,7 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
     // rfi's EE-flip is caught by the post-rfi WIMPORT_CHECK_EXC added to emit_rfi. The
     // vector-page guard below stays PERMANENT. (void)EXC_SYNC/EXC_MASKABLE/MSR_EE.
     (void)EXC_SYNC; (void)EXC_MASKABLE; (void)MSR_EE;
-    b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::DOWNCOUNT);
-    b.op_i32_const(0); b.op_i32_le_s();
-    b.op_if(BLOCK_TYPE_VOID);
-        // [PM51 bail-census — gated; census DONE: 99.66% hit-rate]
-        if (BEM_PM51_CENSUS && g_bem_lc_base) {
-            b.op_i32_const((s32)0x026B38D0u);
-            b.op_i32_const((s32)0x026B38D0u);
-            b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
-        }
-        emit_exit_census(b, 0x026B34DCu);   // [census] service_bail
-        b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
-    b.op_end();
+    emit_downcount_bail(b, ctx_ptr);
 
     // [BEM_LEVER_STATIC_CHAIN 2026-10-04] Static successors (the terminator's
     // b/bc targets, known at emit): for each candidate t, `if (PC == t)` runs the
@@ -385,38 +458,11 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
             bool dup = false;
             for (u32 sj = 0; sj < si; ++sj) dup |= (static_pcs[sj] == t);
             if (dup) continue;
-            const u32 off = ((t >> 2) & BEM_DISP_MASK_NEXT) * 4u;
             b.op_local_get(LOCAL_TMP_B_CHAIN);
             b.op_i32_const((s32)t); b.op_i32_eq();
             b.op_if(BLOCK_TYPE_VOID);
-                emit_addr_const(b, tag_addr + off, tag_sym, off); b.op_i32_load(0);
-                b.op_i32_const((s32)t); b.op_i32_eq();
-                b.op_if(BLOCK_TYPE_VOID);
-                    emit_addr_const(b, slot_addr + off, slot_sym, off); b.op_i32_load(0);
-                    if (diet) {
-                        // tag hit => slot is a live table index (lever_gate.h).
-                        b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
-                    } else {
-                    b.op_local_tee(LOCAL_TMP_A_CHAIN);
-                    b.op_i32_const(0); b.op_i32_ge_s();
-                    b.op_if(BLOCK_TYPE_VOID);
-                        if (BEM_PM51_CENSUS && g_bem_lc_base) {
-                            b.op_i32_const((s32)0x026B38D8u);
-                            b.op_i32_const((s32)0x026B38D8u);
-                            b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
-                        }
-                        b.op_local_get(LOCAL_TMP_A_CHAIN);
-                        b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
-                    b.op_end();
-                    }
-                b.op_end();
-                if (BEM_PM51_CENSUS && g_bem_lc_base) {
-                    b.op_i32_const((s32)0x026B38DCu);
-                    b.op_i32_const((s32)0x026B38DCu);
-                    b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
-                }
-                emit_exit_census(b, 0x026B34F0u);   // [census] host_return (terminal fallback)
-                b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
+                emit_static_target_probe(b, ctx_ptr, t, tag_addr, slot_addr, tag_sym,
+                                         slot_sym, diet);
             b.op_end();
         }
     }
@@ -728,6 +774,14 @@ static bool IsIntegerLoadStoreCommon(u32 inst) {
     default:
         return false;
     }
+}
+
+// [BEM_LEVER_SLOWARM_FP_GP] true iff dispatch_op routes `inst` to emit_lfs /
+// emit_lfd / emit_stfs / emit_stfd / emit_psq_l / emit_psq_st (D-forms).
+static bool IsFpLoadStoreD(u32 inst) {
+    const u32 opcd = GekkoOperands::OPCD(inst);
+    return (opcd >= 48 && opcd <= 55) || opcd == 56 || opcd == 57 || opcd == 60 ||
+           opcd == 61;
 }
 
 bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
@@ -1202,7 +1256,112 @@ static bool psmtxro_hash_match(const CodeBuffer& buffer, u32 n_ops) {
 // inside a control arm, so build_block_next redoes the block with it off.
 static bool s_lazy_livein_ok = false;
 static bool s_lazy_livein_poison = false;
-static bool s_lazy_livein_force_off = false;
+
+// [BEM_LEVER_BASE_HOIST 2026-10-08] Group plan for one build_block_next body.
+// Set (non-null) only while build_block_next_impl emits; the body consults it
+// in every arm that is neither a merged region nor a resident loop. Members of
+// a group are all emitted at the top level of the body, in op order, and the
+// head is the first of them, so on every path that reaches a member the head
+// has run (mid-block exits only leave). A member found at a different control
+// depth than its head poisons the build, which is redone with the lever off.
+struct BaseHoistPlan {
+    std::vector<BaseHoist> per_op;
+    std::vector<u8> member;
+    std::vector<u32> depth;     // per group
+    u32 nlocals = 0;
+    bool poison = false;
+};
+static BaseHoistPlan* s_hoist_plan = nullptr;
+
+static bool s_hoist_ok = false;       // build_block_next only
+static bool s_hoist_poison = false;
+static constexpr u32 BASE_HOIST_LOCAL0 = 153u;   // locals group 10 (after LOCAL_PSQ_V 152)
+
+static bool base_hoist_member_form(const CodeOp& op) {
+    switch (GekkoOperands::OPCD(op.inst)) {
+    case 32: case 34: case 40: case 42: case 36: case 38: case 44: break;
+    // [BEM_LEVER_BASE_HOIST_FP] lfs / lfd / stfs / stfd / psq_l / psq_st.
+    case 48: case 50: case 52: case 54: case 56: case 60:
+        if (!bem_lever_on(BEM_LEVER_BASE_HOIST_FP)) return false;
+        break;
+    default: return false;
+    }
+    if (GekkoOperands::RA(op.inst) == 0) return false;
+    // A compile-time MMIO EA takes the const-MMIO import path, not emit_*_common.
+    if (op.has_const_ea && op.const_ea >= 0xCC000000u && op.const_ea < 0xCC040000u)
+        return false;
+    return true;
+}
+
+static void plan_base_hoist(BaseHoistPlan& plan, const CodeBuffer& buffer,
+                            u32 mem1_base, u32 mem1_mask, u32 ram_size) {
+    const std::size_t n = buffer.size();
+    plan.per_op.assign(n, BaseHoist{});
+    plan.member.assign(n, 0);
+    plan.depth.clear();
+    plan.nlocals = 0;
+    plan.poison = false;
+    if (!bem_lever_on(BEM_LEVER_BASE_HOIST) || !bem_lever_on(BEM_LEVER_MEM_SLOWARM) ||
+        !bem_lever_on(BEM_LEVER_FASTMEM_LEAN))
+        return;
+    // The window algebra needs mask == ram_size - 1 == 0x01FFFFFF (the
+    // per-access guard's bound check is elided only then), and the memarg
+    // offset base + simm must be a valid u32 for every simm with the
+    // (ra & mask) operand added (FASTMEM_LEAN's fold, widened by 0x8000).
+    if (mem1_mask != 0x01FFFFFFu || ram_size != mem1_mask + 1u) return;
+    if (mem1_base < 0x8000u ||
+        (u64)mem1_base + (u64)mem1_mask + 0x8000ull >= 0x100000000ull) return;
+    std::vector<u32> open[32];
+    std::vector<u32> group_of(n, 0u);
+    auto close = [&](u32 r) {
+        std::vector<u32>& g = open[r];
+        if (g.size() >= 2) {
+            s32 lo = 0, hi = 0;
+            for (u32 i : g) {
+                const u32 w = buffer[i].inst;
+                const u32 opcd = GekkoOperands::OPCD(w);
+                // psq_l / psq_st: 12-bit displacement (emit_psq_l's simm12).
+                const s32 d = (opcd == 56u || opcd == 60u) ? ((s32)(w << 20) >> 20)
+                                                           : (s32)(s16)(w & 0xFFFFu);
+                lo = std::min(lo, d);
+                hi = std::max(hi, d);
+            }
+            const u32 gidx = (u32)plan.depth.size();
+            plan.depth.push_back(0xFFFFFFFFu);
+            const u32 flag = BASE_HOIST_LOCAL0 + plan.nlocals++;
+            const u32 base = g.size() >= 3 ? BASE_HOIST_LOCAL0 + plan.nlocals++ : 0u;
+            for (std::size_t k = 0; k < g.size(); ++k) {
+                BaseHoist& h = plan.per_op[g[k]];
+                h.flag_local = flag;
+                h.base_local = base;
+                h.lo = lo;
+                h.hi = hi;
+                h.head = (k == 0);
+                h.poison = &plan.poison;
+                plan.member[g[k]] = 1;
+                group_of[g[k]] = gidx;   // depth_cell bound once plan.depth stops growing
+            }
+        }
+        g.clear();
+    };
+    for (std::size_t i = 0; i < n; ++i) {
+        const CodeOp& op = buffer[i];
+        // An HLE hook point reloads every GPR from ctx before the op (hooks
+        // write gpr[3..5]); an op without opinfo is not analysed. Both end
+        // every group.
+        if (!op.opinfo || g_hle_hook_query == nullptr || g_hle_hook_query(op.address)) {
+            for (u32 r = 0; r < 32; ++r) close(r);
+        }
+        if (op.opinfo && base_hoist_member_form(op))
+            open[GekkoOperands::RA(op.inst)].push_back((u32)i);
+        for (u32 r = 0; r < 32; ++r)
+            if (op.regsOut[r]) close(r);
+    }
+    for (u32 r = 0; r < 32; ++r) close(r);
+    for (std::size_t i = 0; i < n; ++i)
+        if (plan.member[i])
+            plan.per_op[i].depth_cell = &plan.depth[group_of[i]];
+}
 
 static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
                                  CodeBuffer& buffer, BlockStats& stats,
@@ -1677,6 +1836,62 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // single arm) AND fp_resident_loop's SINGLES arm (with_singles); the double
     // fallback arm (with_singles==false) stays a normal deopt block.
     const bool resident_loop_arm = int_fused || (fp_resident_loop && with_singles);
+    // [BEM_LEVER_BASE_HOIST] the plan is all-or-nothing per arm: every member
+    // of a group (head included) takes the hoisted form, or none does.
+    const bool hoist_arm = s_hoist_plan != nullptr && !merged && region_gen < 0 &&
+                           !resident_loop_arm && s_hoist_plan->per_op.size() == n_ops;
+    // [BEM_LEVER_KNOWN_PC_CHAIN 2026-10-08] see lever_gate.h. The tail below is
+    // the post-loop epilogue of this lambda (idle store, gather drain, exiting
+    // flushes, chain) for a PC known at emit time; it runs once per arm from the
+    // same snapshotted compile-time state.
+    const bool known_pc_term = !merged && region_gen < 0 && !resident_loop_arm &&
+                               !fast_loop && chain_tag_addr == 0u &&
+                               chain_slot_addr == 0u &&
+                               bem_lever_on(BEM_LEVER_STATIC_CHAIN) &&
+                               bem_lever_on(BEM_LEVER_KNOWN_PC_CHAIN);
+    bool term_split_done = false;
+    auto known_pc_tail = [&](u32 t) {
+        const auto rs_snap = rc.SaveState();
+        const auto fs_snap = frc.SaveState();
+        if (idle_taken && t == start_pc) {   // the IDLE_TAKEN test, decided at emit
+            b.op_i32_const((s32)ctx_ptr);
+            b.op_i32_const(0);
+            b.op_i32_store(ppc_off::DOWNCOUNT);
+        }
+        BEM_EMIT_MARK(BEM_MARK_EPILOGUE, start_pc);
+        if (block.m_follow ? seg_has_store : block_has_store) {
+            emit_addr_const(b, (u32)(uintptr_t)&g_bem_gp_dirty, (u16)BEM_RSYM_GP_DIRTY);
+            b.op_i32_load(0);
+            b.op_if(BLOCK_TYPE_VOID);
+                b.op_i32_const(0);
+                b.op_i32_const(0);
+                b.op_call(WIMPORT_GATHER_DRAIN);
+            b.op_end();
+        }
+        frc.Flush(ctx_ptr, BitSet32(0xFFFFFFFFu), FPR_LANE_BOTH, /*exiting=*/true);
+        rc.Flush(ctx_ptr);
+        BEM_EMIT_MARK(BEM_MARK_TERM_BEGIN, start_pc);
+        emit_chain_known_pc(b, ctx_ptr, t);
+        rc.RestoreState(rs_snap);
+        frc.RestoreState(fs_snap);
+    };
+    // Emits the terminator + tail when its form is supported; false = the
+    // caller emits it as before (nothing has been emitted).
+    auto emit_known_pc_terminal = [&](const CodeOp& op) -> bool {
+        const u32 opcd = op.inst >> 26;
+        if (opcd == 18u) {
+            const u32 li = GekkoOperands::LI(op.inst);
+            const u32 t = GekkoOperands::AA(op.inst) ? li : (op.address + li);
+            emit_bx(b, rc, frc, op, ctx_ptr);
+            known_pc_tail(t);
+            return true;
+        }
+        if (bcx_terminal_split_form(op.inst)) {
+            emit_bcx_terminal_split(b, rc, frc, op, ctx_ptr, params.cmp_fuse, known_pc_tail);
+            return true;
+        }
+        return false;
+    };
     BEM_EMIT_MARK(BEM_MARK_BODY_BEGIN, start_pc);
     if (resident_loop_arm) {
         b.op_loop(BLOCK_TYPE_VOID);
@@ -1826,6 +2041,17 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
                                  FL_FLOAT_DIV | FL_USE_FPU)) == 0 &&
             IsIntegerLoadStoreCommon(op.inst) &&
             bem_lever_on(BEM_LEVER_MEM_SLOWARM)) {
+            params.defer_pc = op.address;
+        }
+        // [BEM_LEVER_SLOWARM_FP_GP 2026-10-08] the same deferral for the FP
+        // D-form memory ops. FL_USE_FPU's own reason for the pre-op PC is the
+        // block's first FP op's FP-unavailable bail (fpu_needs_pc, kept); after
+        // it an FP load/store's only reader of ctx.PC is its slow arms' host
+        // imports, each of which now begins with emit_host_call_prep.
+        if (!is_terminator && !op.canEndBlock && !fpu_needs_pc && op.opinfo &&
+            (op.opinfo->flags & (FL_PROGRAMEXCEPTION | FL_FLOAT_EXCEPTION |
+                                 FL_FLOAT_DIV)) == 0 &&
+            IsFpLoadStoreD(op.inst) && bem_lever_on(BEM_LEVER_SLOWARM_FP_GP)) {
             params.defer_pc = op.address;
         }
         // [BEM_LEVER_BRANCH_NOPC 2026-10-07] see lever_gate.h; the predicate
@@ -2020,7 +2246,19 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
                 frc.Flush(ctx_ptr, BitSet32(0xFFFFFFFFu), FPR_LANE_BOTH, /*exiting=*/true);
             }
             rc.SetOpReads(op.regsIn.m_val);   // [WRITE_NOLOAD] this op's GPR reads
+            // [BEM_LEVER_KNOWN_PC_CHAIN] terminal b/bl/bc: the block tail and the
+            // chain go inside each arm, after its constant PC store.
+            if (known_pc_term && is_terminator && emit_known_pc_terminal(op)) {
+                rc.SetOpReads(0xFFFFFFFFu);
+                params.defer_pc = 0;
+                term_split_done = true;
+                break;
+            }
+            // [BEM_LEVER_BASE_HOIST] planned group member (plain bodies only).
+            params.hoist = (hoist_arm && s_hoist_plan->member[i])
+                               ? &s_hoist_plan->per_op[i] : nullptr;
             emitted_native = dispatch_op(b, rc, frc, op, params);
+            params.hoist = nullptr;
             rc.SetOpReads(0xFFFFFFFFu);
             params.defer_pc = 0;   // [MEM_SLOWARM] consumed by this op only
         }
@@ -2098,6 +2336,12 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // exits the loop (only br re-iterates), so the not-taken and bail paths
     // land here naturally and run the unchanged epilogue below.
     if (resident_loop_arm) b.op_end();
+    if (term_split_done) {
+        // Every arm of the split terminal returned or tail-called.
+        b.op_unreachable();
+        BEM_EMIT_MARK(BEM_MARK_BLOCK_END, start_pc);
+        return;
+    }
     // [BEM_LEVER_IDLE_TAKEN] the idle skip, on the taken back-edge only. The
     // analyzer classified this block idle only if its terminator branches to
     // start_pc (IsBusyWaitLoop: branchTo == m_address), and its not-taken exit
@@ -2320,7 +2564,7 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
         // the last writer of every assumed reg — values are singles by
         // construction, no round-trip needed. cond = mask_eq && (flag_eq ||
         // verify_all).
-        auto emit_verify_chain = [&]() {
+        auto emit_verify_chain_pem = [&]() {
             for (u32 i = 0; i < 14; ++i) {
                 if (!assumed[i]) continue;
                 b.op_i32_const((s32)ctx_ptr);
@@ -2340,6 +2584,42 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
                     b.op_i32_and();
                 }
             }
+        };
+        // [BEM_LEVER_SINGLE_EDGE_SIMD 2026-10-08] One SIMD test of every
+        // volatile assumed pair first: promote(demote(x)) == x (f64x2.eq, false
+        // for NaN) in every lane implies the PEM round trip above holds in every
+        // lane (for non-NaN x exact in f32, ConvertToSingle(x) == demote(x) and
+        // ConvertToDouble of it is x), so the verify is 1 and the PEM chain is
+        // skipped; otherwise the PEM chain decides, unchanged. Stack: ANDs onto
+        // the running ok exactly like the PEM chain.
+        const u32 vol_assumed = assumed.m_val & 0x3FFFu;
+        auto emit_verify_chain = [&]() {
+            if (!vol_assumed || !bem_lever_on(BEM_LEVER_SINGLE_EDGE_SIMD)) {
+                emit_verify_chain_pem();
+                return;
+            }
+            static_assert(ppc_off::ps1(0) == ppc_off::ps0(0) + 8u, "ps0/ps1 adjacent");
+            bool first = true;
+            for (u32 i = 0; i < 14; ++i) {
+                if (!assumed[i]) continue;
+                b.op_i32_const((s32)ctx_ptr);
+                b.op_v128_load(ppc_off::ps0(i), /*align=*/3);
+                b.op_local_tee(152u);                    // LOCAL_PSQ_V scratch
+                b.op_f32x4_demote_f64x2_zero();
+                b.op_f64x2_promote_low_f32x4();
+                b.op_local_get(152u);
+                b.op_f64x2_eq();
+                if (!first) b.op_v128_and();
+                first = false;
+            }
+            b.op_i64x2_all_true();
+            b.op_if(/*i32*/ 0x7F);
+                b.op_i32_const(1);
+            b.op_else();
+                b.op_i32_const(1);
+                emit_verify_chain_pem();
+            b.op_end();
+            b.op_i32_and();
         };
         if (fast_loop) {
             b.op_if(/*i32*/ 0x7F);                   // mask_eq ? (...) : 0
@@ -2390,6 +2670,7 @@ static std::vector<u8> build_block_next_impl(u32 start_pc,
 // does not list, from inside an if), emit the block again with eager prologue
 // loads. Both emissions are complete, self-contained builds of the same block.
 u32 g_bem_lazy_livein_retries = 0;
+u32 g_bem_base_hoist_retries = 0;
 std::vector<u8> build_block_next(u32 start_pc,
                                  const u32* insts, u32 count,
                                  u32 ctx_ptr,
@@ -2398,21 +2679,35 @@ std::vector<u8> build_block_next(u32 start_pc,
                                  bool* out_is_idle_loop,
                                  const u32* instr_pcs,
                                  u32 build_flags) {
-    s_lazy_livein_ok = !s_lazy_livein_force_off;
-    s_lazy_livein_poison = false;
-    std::vector<u8> bytes = build_block_next_impl(start_pc, insts, count, ctx_ptr, mem1_base,
-                                                  mem1_mask, ram_size, out_cycles,
-                                                  out_is_idle_loop, instr_pcs, build_flags);
-    s_lazy_livein_ok = false;
-    if (s_lazy_livein_poison) {
+    // [BEM_LEVER_BASE_HOIST] same retry shape: a poisoned plan (a member at
+    // another control depth than its head) rebuilds with the lever off. Each
+    // retry turns one feature off, so this terminates in at most three builds.
+    bool lazy_off = false, hoist_off = false;
+    std::vector<u8> bytes;
+    for (;;) {
+        s_lazy_livein_ok = !lazy_off;
         s_lazy_livein_poison = false;
-        ++g_bem_lazy_livein_retries;
-        s_lazy_livein_force_off = true;
-        bytes = build_block_next_impl(start_pc, insts, count, ctx_ptr, mem1_base, mem1_mask,
-                                      ram_size, out_cycles, out_is_idle_loop, instr_pcs,
-                                      build_flags);
-        s_lazy_livein_force_off = false;
+        s_hoist_ok = !hoist_off;
+        s_hoist_poison = false;
+        bytes = build_block_next_impl(start_pc, insts, count, ctx_ptr, mem1_base,
+                                      mem1_mask, ram_size, out_cycles,
+                                      out_is_idle_loop, instr_pcs, build_flags);
+        s_lazy_livein_ok = false;
+        s_hoist_ok = false;
+        if (s_lazy_livein_poison && !lazy_off) {
+            ++g_bem_lazy_livein_retries;
+            lazy_off = true;
+            continue;
+        }
+        if (s_hoist_poison && !hoist_off) {
+            ++g_bem_base_hoist_retries;
+            hoist_off = true;
+            continue;
+        }
+        break;
     }
+    s_lazy_livein_poison = false;
+    s_hoist_poison = false;
     return bytes;
 }
 
@@ -2456,6 +2751,11 @@ static std::vector<u8> build_block_next_impl(u32 start_pc,
         *out_is_idle_loop = n_ops_positive &&
             buffer.data()[block.m_num_instructions - 1].branchIsIdleLoop;
     }
+
+    // [BEM_LEVER_BASE_HOIST] plan before the locals are declared.
+    BaseHoistPlan hoist_plan;
+    if (s_hoist_ok) plan_base_hoist(hoist_plan, buffer, mem1_base, mem1_mask, ram_size);
+    const u32 extra_locals = hoist_plan.nlocals;
 
     WasmModuleBuilder b;
     b.emitHeader();
@@ -2531,13 +2831,20 @@ static std::vector<u8> build_block_next_impl(u32 start_pc,
         // Group 9 [simd-bswap 2026-08-29]: 1 v128 scratch (local 152) —
         // jit_load_store LOCAL_PSQ_V, the shuffle stage for the paired-single /
         // f64 SIMD byte-swap. APPENDED, so no existing local index moves.
-        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u, 2u, 17u, 32u, 1u };
-        const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I64, WASM_TYPE_I32, WASM_TYPE_F64, WASM_TYPE_I64, WASM_TYPE_F64, WASM_TYPE_V128, WASM_TYPE_V128 };
-        b.emitLocals(9u, counts, types);
+        // Group 10 [BEM_LEVER_BASE_HOIST 2026-10-08]: one i32 flag per planned
+        // base group, plus an i32 ra & mask for each group of >= 3 (locals
+        // 153..), declared only when the plan has any, so a
+        // block without groups keeps the 9-group declaration byte for byte.
+        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u, 2u, 17u, 32u, 1u, extra_locals };
+        const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I64, WASM_TYPE_I32, WASM_TYPE_F64, WASM_TYPE_I64, WASM_TYPE_F64, WASM_TYPE_V128, WASM_TYPE_V128, WASM_TYPE_I32 };
+        b.emitLocals(extra_locals ? 10u : 9u, counts, types);
     }
 
+    s_hoist_plan = hoist_plan.nlocals ? &hoist_plan : nullptr;
     emit_block_body_into(b, block, buffer, stats, count, start_pc, ctx_ptr,
                          mem1_base, mem1_mask, ram_size);
+    s_hoist_plan = nullptr;
+    if (hoist_plan.poison) s_hoist_poison = true;
 
     b.endFuncBody();
     b.endSection();

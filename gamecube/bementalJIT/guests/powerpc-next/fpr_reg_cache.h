@@ -147,6 +147,9 @@ public:
     // the scratch window (0x026B3C00 + preg*16) and land the FAST-REENTRY
     // uniform state instead (v128 valid + DIRTY, lanes UNLOADED) so both entry
     // paths of a self-loop block converge on identical compile-time state.
+    // [BEM_LEVER_SINGLE_EDGE_SIMD] push 1 iff every ps[] lane of `regs` is a
+    // non-NaN double f32 holds exactly (see fpr_reg_cache.cpp).
+    void EmitSimdExactSingleTest(u32 ctx_ptr, BitSet32 regs, bool keep);
     void EmitAssumedSingleLoads(u32 ctx_ptr, BitSet32 assumed,
                                 bool fast_loop_mode = false);
 

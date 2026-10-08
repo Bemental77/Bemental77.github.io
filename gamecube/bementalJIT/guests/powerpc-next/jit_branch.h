@@ -6,6 +6,8 @@
 // CodeOp.canEndBlock true; the per-block epilogue is responsible for
 // the read-PC-and-return after Flush.
 
+#include <functional>
+
 #include "bementalJIT/types.h"
 #include "bementalJIT/region_desc.h"  // [order 13d] BemRelocSym (BEM_RSYM_NONE) for merged-aware branch exits
 #include "code_op.h"
@@ -36,6 +38,20 @@ struct MergedRegionCtx {
 // [order 13d] The block-epilogue chain-or-return cascade (defined in ppc_emit.cpp).
 // Declared here so emit_coalesced_taken_exit (jit_branch.cpp) can route a merged
 // mid-block taken exit through the SAME warm cascade instead of op_return.
+// [BEM_LEVER_KNOWN_PC_CHAIN 2026-10-08] Terminal conditional branch with the
+// block tail emitted INSIDE each arm: `tail(pc)` is called right after the arm
+// stores ctx.PC = pc, at the same compile-time register-cache state in both
+// arms, and must end in a return on every path. Supported forms are exactly the
+// native terminal forms of emit_bcx (bc always, bdnz/bdz without LK, CR-bit
+// forms without LK); bcx_terminal_split_form() says whether `inst` is one.
+// The static-successor chain for a plain body where ctx.PC == t is known
+// (ppc_emit.cpp): downcount bail, then the constant-bucket probe for t.
+void emit_chain_known_pc(WasmModuleBuilder& b, u32 ctx_ptr, u32 t);
+bool bcx_terminal_split_form(u32 inst);
+void emit_bcx_terminal_split(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
+                             const CodeOp& op, u32 ctx_ptr, const CmpFuse* fuse,
+                             const std::function<void(u32)>& tail);
+
 void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
                           u32 tag_addr_ovr = 0u, u32 slot_addr_ovr = 0u,
                           const MergedRegionCtx* merged = nullptr,

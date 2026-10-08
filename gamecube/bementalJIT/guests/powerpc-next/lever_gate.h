@@ -141,7 +141,63 @@ constexpr u32 BEM_LEVER_FPR_EXIT_FLUSH = 1u << 24;
 // emit_convert_to_single (Dolphin ConvertToSingle) as an `if` on the denormal
 // range instead of computing both candidate values and a select.
 constexpr u32 BEM_LEVER_CVT_SINGLE_BRANCH = 1u << 25;
+// Integer D-form loads/stores (lwz/lbz/lhz/lha/stw/stb/sth, no update) that
+// share a base GPR with no write to it in between: the first access of the
+// group computes one range flag for the group's whole displacement span, and
+// every access branches on that flag local (fast arm: (ra & mask) + base +
+// simm) instead of computing EA + its own guard; a false flag runs the access's
+// unhoisted code. build_block_next only, never in a resident loop body.
+constexpr u32 BEM_LEVER_BASE_HOIST = 1u << 26;
+// BEM_LEVER_MEM_SLOWARM for the memory paths it did not cover: the FP D-form
+// loads/stores (lfs/lfsu/lfd/lfdu/stfs/stfsu/stfd/stfdu/psq_l/psq_lu/psq_st/
+// psq_stu) and the compile-time-EA write-gather-pipe store carve-out. Their
+// common-path rc.Flush and (FP: when the op is not the block's first FP op)
+// pre-op ctx.PC store move into the host calls, emitted immediately before
+// each arm's first host import (emit_host_call_prep) from the snapshotted
+// state; the gather-pipe drain inside the append gets the same prep.
+constexpr u32 BEM_LEVER_SLOWARM_FP_GP = 1u << 27;
+// A block terminal b/bl/bc whose arm has just stored a constant ctx.PC runs the
+// block tail (idle store, gather drain, flushes) and the static-successor chain
+// INSIDE that arm, with the chain specialized to the arm's constant (no ctx.PC
+// reload and compare). Plain per-block bodies only. Requires
+// BEM_LEVER_STATIC_CHAIN (the chain it specializes).
+constexpr u32 BEM_LEVER_KNOWN_PC_CHAIN = 1u << 28;
+// BEM_LEVER_BASE_HOIST groups also admit the FP D-form accesses lfs / lfd /
+// stfs / stfd / psq_l / psq_st (no update). Their fast arms branch on the
+// group flag (psq: the FLOAT arm; every other psq arm computes EA itself).
+constexpr u32 BEM_LEVER_BASE_HOIST_FP = 1u << 29;
+// Single-FPR block-edge conversions through SIMD fast paths, each falling back
+// to the unchanged scalar code: (exit) an exiting flush with >= 2
+// BEM_LEVER_FPR_EXIT_STORE registers tests them for Inf/NaN ONCE (lane-wise
+// unsigned max of |bits|) and stores each with one v128.store (needs
+// BEM_LEVER_FLUSH_MASK_BATCH); (entry) the assumed-Single prologue loads and the
+// volatile value-verify test every pair at once for "non-NaN and exact in f32"
+// (promote(demote(x)) == x) and take demote(x) as the PEM ConvertToSingle.
+constexpr u32 BEM_LEVER_SINGLE_EDGE_SIMD = 1u << 30;
+
+// ---- Second kill word (levers 32+) ------------------------------------------
+// BEM_LEVER_KILL_CELL's bit 31 cannot be a lever (BEM_LEVER_CENSUS_CELL uses it
+// as the "published" marker), so levers from 32 on live in a second word with
+// the same protocol: BEM_LEVER_KILL2_CELL W (0 = every lever ON; OR'd with env
+// BJIT_LEVER_KILL2, i.e. page query ?bjit_lever_kill2=...), census at
+// BEM_LEVER_CENSUS2_CELL = 0x80000000 | effective mask. 0x026B3EE8/EEC matched
+// no literal in gamecube/ (hex or decimal form, grep 2026-10-08) and lie in the
+// 0x026B3EE0..0x026B3EFC block lever_gate.h took on 2026-10-04.
+constexpr u32 BEM_LEVER_KILL2_CELL   = 0x026B3EE8u;
+constexpr u32 BEM_LEVER_CENSUS2_CELL = 0x026B3EECu;
+
+// Lever 32 (word 2, bit 0): fcmpu/fcmpo build the CR field as one select over
+// the four baked encodings (LT/GT/EQ/unordered) instead of assembling hi32/lo32
+// bit by bit, and read a Single-repr operand as f64.promote_f32 of its lane 0
+// (the comparison only sees order and NaN-ness, which promote and the PEM widen
+// agree on) instead of promoting the register to Double.
+constexpr u32 BEM_LEVER2_FCMP_SELECT = 1u << 0;
+// (word 2, bits 1-2: tried 2026-10-08 and DROPPED — no pre-op ctx.PC store for
+// pure FP ops measured -0.75%, under the 1% bar; fadds/fsubs/fmuls/fdivs with a
+// Double input leaving a Single result measured -1.1% but changed the shadow
+// single-mask column of the replay trace, so it is not a bit-identical lever.)
 
 bool bem_lever_on(u32 bit);
+bool bem_lever2_on(u32 bit);
 
 }  // namespace bemental::powerpc

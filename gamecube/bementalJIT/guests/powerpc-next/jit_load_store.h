@@ -45,6 +45,28 @@ struct EaCache {
     bool valid = false;
 };
 
+// [BEM_LEVER_BASE_HOIST 2026-10-08] One integer D-form access's share of a
+// base-register range check hoisted to the first access of its group (see
+// plan_base_hoist). A group is >= 2 non-update integer D-form accesses
+// (lwz/lbz/lhz/lha/stw/stb/sth) through the same GPR `ra` with no write to ra
+// in between. The head computes, once,
+//     flag = ((ra + L) | (ra + H)) & 0x3E000000 == 0,  L = min(lo, 0), H = max(hi, 0)
+// over the group's displacement range [lo, hi]; every member then branches on
+// the flag local: true -> the fast access at (ra & mask) + (mem1_base + simm),
+// false -> the member's complete unhoisted code (EA, per-access guard, fast and
+// slow arms), byte-for-byte what it emits without the lever. A group of >= 3
+// also keeps ra & mask in a local (set by the head) so the members' fast arms
+// read it instead of recomputing it.
+struct BaseHoist {
+    u32  flag_local = 0;   // i32 local holding the group's flag
+    u32  base_local = 0;   // 0 = none; else i32 local holding ra & mask (groups of >= 3)
+    s32  lo = 0;           // min(0, every member's simm)
+    s32  hi = 0;           // max(0, every member's simm)
+    bool head = false;     // this access computes the flag
+    u32* depth_cell = nullptr;   // per group: the head's wasm control depth
+    bool* poison = nullptr;      // set when a member runs at another depth
+};
+
 struct LoadStoreParams {
     u32 ctx_ptr   = 0;   // PowerPCState address in host linear memory
     u32 mem1_base = 0;   // host pointer to MEM1 (0 disables fastmem entirely)
@@ -77,6 +99,8 @@ struct LoadStoreParams {
     u32 defer_pc = 0;
     RegCache* host_rc = nullptr;
     const RegCache::StateSnapshot* host_rc_snap = nullptr;
+    // [BEM_LEVER_BASE_HOIST] non-null only for a planned group member.
+    const BaseHoist* hoist = nullptr;
 };
 
 // WASM import indices. Match the existing live-tree contract in

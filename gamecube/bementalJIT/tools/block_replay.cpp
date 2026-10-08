@@ -71,7 +71,7 @@ extern int g_bem_gp_dirty;
 extern uint32_t g_bem_aot_count_exits;
 extern uint32_t g_bem_idle_collapse_off;
 }
-namespace bemental::powerpc { extern u32 g_bem_lazy_livein_retries; }
+namespace bemental::powerpc { extern u32 g_bem_lazy_livein_retries; extern u32 g_bem_base_hoist_retries; }
 
 static constexpr u32 kMaxBlockInsts = 64u;      // JitWasm.cpp kMaxBlockInsts
 static constexpr u32 kRamSize = 0x02000000u;    // Memmap: NextPowerOf2(24MB)
@@ -476,6 +476,8 @@ int main(int argc, char** argv) {
         g_mask_unsound, g_superblocks, g_seams, gp_hash, gp_bytes,
         bemental::powerpc::g_bem_lazy_livein_retries);
     std::printf("%s\n", buf);
+    std::fprintf(stderr, "[replay] base-hoist retries: %u\n",
+                 (unsigned)bemental::powerpc::g_bem_base_hoist_retries);
     if (json_out) { std::FILE* jf = std::fopen(json_out, "w"); if (jf) { std::fprintf(jf, "%s\n", buf); std::fclose(jf); } }
     std::fprintf(stderr, "[replay] slice-end PCs (top):");
     {

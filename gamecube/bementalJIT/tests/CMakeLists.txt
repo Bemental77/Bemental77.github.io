@@ -345,6 +345,32 @@ if(BEMENTAL_GUEST_POWERPC)
         target_compile_options(test_cvt_single PRIVATE "-pthread")
     endif()
 
+    # [levers 26-30 + word-2 bit 0, 2026-10-08] base-range hoist (int + FP),
+    # FP / gather-pipe slow-arm deferral, known-PC chaining, Single exit-store
+    # batch, fcmp select. `node test_levers_2632.js`.
+    if(BEMENTAL_GUEST_POWERPC_NEXT)
+        add_executable(test_levers_2632 test_levers_2632.cpp)
+        target_link_libraries(test_levers_2632 PRIVATE
+            bementalJIT bementalJITPowerPCNext bementalJITPowerPC)
+        target_include_directories(test_levers_2632 PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+        set_target_properties(test_levers_2632 PROPERTIES SUFFIX ".html")
+        target_link_options(test_levers_2632 PRIVATE
+            "SHELL:-s EXIT_RUNTIME=1"
+            "SHELL:-s EXPORTED_RUNTIME_METHODS=['HEAPU8','HEAP8','HEAP16','HEAPU16','HEAP32','HEAPU32','HEAPF32','HEAPF64']"
+            "SHELL:-pthread"
+            "SHELL:-s PTHREAD_POOL_SIZE=0"
+            "SHELL:-s INITIAL_MEMORY=134217728"
+            "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+            "SHELL:-s MAXIMUM_MEMORY=268435456"
+            "SHELL:-s ALLOW_TABLE_GROWTH=1"
+            "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
+        )
+        target_compile_options(test_levers_2632 PRIVATE "-pthread")
+    endif()
+
     # [pc-sync 2026-10-04] Inline interp fallbacks store ctx.PC so the
     # dolphin_interp pc guard runs them. `node test_interp_pcsync.js`.
     if(BEMENTAL_GUEST_POWERPC_NEXT)
