@@ -449,6 +449,86 @@ not load `genesis.html`, so its only change here is the start hold, which runs n
   console's own inputs are also sent from the stopped thread. Not done here:
   `gamecube/recomp/recomp_worker.js` has another agent's uncommitted work in it.
 
+### GameCube: the over-1.02x windows were owed time, repaid too fast (2026-10-08)
+
+**Two causes, both shown.**
+
+1. **The witness was not a 5 s rate.** The rig averaged five of the page's 1 s `producedPerS`
+   readings. The page closes those windows on its own timer, so a main-thread stop at a window
+   edge splits one second's frames into a low reading and a high one. In `final-1`, the host
+   `fw` read 0.830 and then 1.138 while the engine released 60 and 60 frames. A 5 s run that
+   started on the high reading read 1.0278x. Time-weighted over the same spans, the engine's own
+   frame counter came to at most 1.018x. In the `fw300` joiner it was 1.0029x while the witness
+   read 1.0279x. The rig now reads a cumulative guest clock (`__gcPace().clock`: credits consumed,
+   plus frames the backstop or the room worker ran and the page has not yet absorbed). It divides
+   by its own timestamps, and a 5 s window runs to the first sample at least 5000 ms later. One
+   delayed sample had made "five samples" span 4.85 s. GameCube is judged by that clock
+   (`rateBy: 'witness'`). The old reading is kept as `witnessHud*`, with no verdict.
+2. **On the exact clock it was still catch-up past the ceiling.** In a delay room the clock banks
+   up to `MAX_BACKLOG` = 8 credits during a stall, and the step released them as fast as the
+   worker ran: 8 frames inside 5 s is 1.027x. The control (`?roompace=0`, exact clock) shows it.
+   Both `fw` cells FAST-FORWARD: 1.0239 / 1.0206 and 1.0225 / 1.019.
+
+**It is owed time, never past real time.** `__gcLockstep().ownAhead` is frames run since the room
+released, minus wall time x 60, sampled every second. Its maximum on every GameCube room player in
+every run was +0.71 frames. In the relay cells it never rose above -3.
+
+**Fix (`gamecube.html`, PACE_\*).** A delay or lockstep room's release (credited or hidden) must
+keep every window of at least 5 s ending now at <= 61 frames/s. That is <= 305 frames in any 5 s
+(1.0167x) and 61/s over anything longer. The check is O(1): a count of the releases in the last
+5 s, plus the least `C(s) - 61 s` over older release instants. This is the most catch-up the
+ceiling allows: owed time is repaid at up to 1 frame/s past the first 5. A simulator with random
+50-450 ms stalls gives max 1.0167x and costs 0.17% of the rate (0.9445 vs 0.9461).
+
+Rejected, all measured on the matrix:
+- a sliding "304 per trailing 5 s" count does not bound longer windows (1.047x over the next 6 s);
+- a token bucket at 1.01x / depth 2 starved ordinary jitter (relay 0.945x);
+- 1.002x / depth 4 repaid too little (0.959-0.978x).
+
+Rollback frames are **not** paced. Paced, a direct room's joiner lost 12 frames, went into REJOIN,
+and showed a held frame for 10 s.
+
+**Matched pairs**
+
+Interleaved ctl, pace, ctl, pace (`/tmp/npdm/gc-pair-{ctl,pace,ctl2,pace2}`). Rates are host /
+joiner on the exact clock. The parenthesis is the fastest window of at least 5 s.
+
+| cell | control (`roompace=0`) | paced |
+|---|---|---|
+| `fw` | 0.9939 / 0.9895 (**1.0239 / 1.0206 FF**) · 0.985 / 0.9829 (**1.0225 FF** / 1.019) · load 12.0, 13.1 | 0.9884 / 0.9864 (1.0137 / 1.0077) · 0.9872 / 0.9884 (1.0114 / 1.0133) · load 10.2, 12.5 |
+| `fw300` | 0.9767 / 0.9769 (1.0136 / 1.0115) · 0.9844 / 0.9867 (1.0067 / 1.008) · load 11.6, 10.7 | 0.9717 / 0.9737 (1.0131 / 1.005) · 0.98 / 0.9799 (1.0147 / 1.0146) · load 11.7, 12.8 |
+
+- **Ceiling:** the control fast-forwarded in 2 of 4 cells. The paced build did in 0 of 10 relay
+  cells: these 4 plus `gc-pace-after4/5/6`, max 1.0167x. One of those (`after5 fw300`) PASSed
+  outright.
+- **Rate:** within the box's noise. The `fw` means are 0.9878 vs 0.9876; the `fw300` means are
+  0.9812 vs 0.9763. At load 10-13 the matched-pair noise is larger than that.
+- **What still fails** is the 0.99 floor: 0.97-0.99 on both arms. The stalls (0.2-3.8 s per
+  minute, waits on the other console) are what lose the time. No catch-up the ceiling allows can
+  repay them.
+- **Direct (`a`, rollback, unpaced):** host / joiner 0.9997 / 1.0079, fastest 1.0193 / **1.0787**
+  (`gc-pace-after6`, load 10.0), and ownAhead never above +0.49. This is rollback catch-up of owed
+  time. The rig flags it. It is the open item.
+
+**Not done: worker release of delay frames whose inputs are in hand.** This needs:
+- an engine API for a future frame's agreed image (lib/netplay.js has only `_covered(f)`);
+- a per-frame image ring in `recomp_worker.js` roomSelf in place of its one guess;
+- a delay-mode reconcile, because `gcRaReconcile` feeds `beginFrame` the latched pad, which in
+  delay mode is the pad for frame f, not the pad sampled for f + D.
+
+That is not cheap. The stalls it would cover are waits on the *other* console's input, which it
+cannot remove (see above).
+
+Suites on this change (load 1.3-9.5):
+- Node: `netplay_rollback_test` 28/28, `netplay_rb_capacity_test` 30/30, `netplay_lockstep_test`
+  152/152, `delay_stepdown_test` 26/26, `netplay_rb_pace_sim` 15/15, `netplay_pace_sim` 18/18,
+  `netplay_pace_sim_n` 6/6.
+- `gc_rollback_det_test`: 7/7.
+- `gc_netplay_room_test` (RUN_MS=120000): **19/1 on the first run.** The failing check was
+  `never-runs-faster-than-hardware`: the first 15 s window read 1.0205x on p2. That is the rollback
+  start catch-up, which this change does not pace, and the same known flake as the 1.0218x
+  recorded above. The rerun was 20/20 (windows 0.9990-1.0008x, load 6.0-8.5).
+
 ### Suites (netplay.js `49a04b83`, under `tools/probe_lock.sh`)
 
 Node: `netplay_rollback_test` 28/28, `netplay_rb_capacity_test` 30/30 (adds `relay-30hz`),

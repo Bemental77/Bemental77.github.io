@@ -210,7 +210,23 @@ const CONSOLES = {
         // change by minutes; producedPerS is the recomp's per-second guest frame count at the
         // path's pinned GUEST_HZ (60) — gamecube.html's own 'guest = N frames/s' line.
         hz: '((window.__gcRate && window.__gcRate.guestHz) || 60)',
-        witness: '(window.__gcRate && window.__gcRate.producedPerS != null ? window.__gcRate.producedPerS / ((window.__gcRate.guestHz) || 60) : null)', frames: 'null', bootMs: 360000, seam: 'window.__gcNet && window.__gcNet()' },
+        witness: '(window.__gcRate && window.__gcRate.producedPerS != null ? window.__gcRate.producedPerS / ((window.__gcRate.guestHz) || 60) : null)', frames: 'null', bootMs: 360000, seam: 'window.__gcNet && window.__gcNet()',
+        // THE GUEST CLOCK, CUMULATIVE (frames; gamecube.html __gcPace().clock). When a console
+        // publishes one, its witness is computed HERE from deltas over this rig's own sample
+        // timestamps, and the 5-s windows from their endpoints. producedPerS is a 1-s window the
+        // page closes on its own timer, so equal-weighting five of them is not a 5-s rate: a
+        // main-thread stop at a window edge splits one second's frames into a low reading and a
+        // high one (final-1 host fw: 0.830 then 1.138 while the engine released 60 and 60), and a
+        // 5-s run that starts on the high one read 1.0278x where the guest's frames over the same
+        // span time-weighted to <= 1.018x. The old reading is kept as witnessHud* (no verdict).
+        witnessCum: '(window.__gcPace ? window.__gcPace().clock : null)',
+        // JUDGED BY THE GUEST CLOCK, like dc: the engine's ready count is not it on this page. In a
+        // rollback room frames the worker ran while the main thread was stopped are begun in the
+        // engine afterwards, in a burst (gc-pace-after host a: engine 74 'ready' in a second whose
+        // guest clock advanced 62).
+        rateBy: 'witness',
+        // per second: frames ahead of its own clock since release (oa), hidden + worker-run frames, catch-up pace holds
+        aux: '(function(){var g=window.__gcLockstep&&window.__gcLockstep();return g?{oa:g.ownAhead,hid:g.hiddenFrames,self:g.selfFrames,ph:g.catchUpPace&&g.catchUpPace.held,er:g.earned}:null})()' },
   gen: { name: 'Genesis', title: 'Sonic the Hedgehog 3', page: '/genesis.html', game: 'Sonic the Hedgehog 3', hostFlag: '&host=1',
          hz: '((window.Module && window.Module._gpx_fps && window.Module._gpx_fps()) || 59.922751)',
          witness: 'null', frames: '(window.__genFrames|0)', bootMs: 120000, seam: 'window.__genNet && window.__genNet()' },
@@ -486,7 +502,7 @@ function preloadSrc(cfg) {
       t: Math.round(now() - M.t0), ready: M.readyFrames - lastReady, frame: e ? e.frame : null,
       state: e ? e.state : null, delay: e ? e.delay : null,
       stalls: rep ? rep.stalls : null, stallMs: rep ? rep.stallMs : null,
-      witness: ev(CFG.witness), frames: ev(CFG.frames), hz: ev(CFG.hz), aux: ev(CFG.aux || 'null'), ui: ev(CFG.ui || 'null'),
+      witness: ev(CFG.witness), wc: ev(CFG.witnessCum || 'null'), frames: ev(CFG.frames), hz: ev(CFG.hz), aux: ev(CFG.aux || 'null'), ui: ev(CFG.ui || 'null'),
       aq: M.audio.quanta, aDrop: M.audio.dropouts, raf: rafN,
       lt: M.lt.n, ltMs: Math.round(M.lt.ms),
       ad: (() => { const d = window.__audioDiag; return d ? { p: d.framesProduced, c: d.framesConsumed, u: d.underruns == null ? null : d.underruns, uf: d.underrunFrames, df: d.droppedFrames, fill: d.fill } : null; })(),
@@ -925,7 +941,7 @@ async function runCell(cid, aid, attempt) {
       cell.firewall = { brokers: brokerList, resolver: fronts.resolverRule, uid: fw.uid };
     }
     const pre = { mqtt: mqttSource(), hooks: null };
-    const cfg = (role) => ({ role, console: cid, witness: C.witness, frames: C.frames, hz: C.hz, seam: C.seam, aux: C.aux || 'null', ui: C.ui || 'null',
+    const cfg = (role) => ({ role, console: cid, witness: C.witness, witnessCum: C.witnessCum || null, frames: C.frames, hz: C.hz, seam: C.seam, aux: C.aux || 'null', ui: C.ui || 'null',
                              p2p: A.p2p || null, relay: !!A.relay, ice: !!A.firewall });
     const code = mkCode();
     cell.code = code;
@@ -1250,7 +1266,7 @@ async function runSolo(cid, device, count = 1) {
   const loadTick = setInterval(() => { const l = load1(); if (l != null) out.loads.push(l); }, 10000);
   try {
     for (let i = 0; i < count; i++) {
-      Ps.push(await launchPlayer('solo' + i, device, tag, { mqtt: '/*none*/', hooks: preloadSrc({ role: 'solo', console: cid, witness: C.witness, frames: C.soloFrames || C.frames, hz: C.soloHz || C.hz, seam: C.seam }) }));
+      Ps.push(await launchPlayer('solo' + i, device, tag, { mqtt: '/*none*/', hooks: preloadSrc({ role: 'solo', console: cid, witness: C.witness, witnessCum: C.witnessCum || null, frames: C.soloFrames || C.frames, hz: C.soloHz || C.hz, seam: C.seam }) }));
     }
     out.start = await Promise.all(Ps.map((P) => soloBoot(P, C)));
     out.each = await Promise.all(Ps.map((P, i) => soloMeasure(P, C, tag, i)));
@@ -1312,6 +1328,29 @@ function analysePlayer(d, peerRole) {
   let wm = null;
   for (let i = 0; i + 5 <= wit.length; i++) { const v = wit.slice(i, i + 5).reduce((x, y) => x + y, 0) / 5; if (wm == null || v > wm) wm = v; }
   r.witnessMaxWin5 = wm == null ? null : +wm.toFixed(4);
+  // A CUMULATIVE guest clock (CONSOLES[].witnessCum) replaces the per-window reading: exact over
+  // any span this rig sampled, time-weighted by construction. The window reading stays as witnessHud*.
+  const C5 = W.filter((w) => typeof w.wc === 'number' && isFinite(w.wc));
+  if (C5.length >= 6) {
+    r.witnessHudX = r.witnessX; r.witnessHudMax = r.witnessMax; r.witnessHudMaxWin5 = r.witnessMaxWin5;
+    const rateOf = (a, b) => (b.wc - a.wc) / Math.max(1e-3, (b.t - a.t) / 1000) / hz;
+    let mx = null, mn = null, m1 = null;
+    // A 5-s window is 5 s of WALL time, not five samples: a long task that delays one sample makes
+    // five samples span 4.85 s (gc-pace-after host a: 302 frames over 4.853 s read 1.037x). Each
+    // window runs from a sample to the first sample at least 5000 ms later.
+    for (let i = 0, j = 0; i < C5.length; i++) {
+      if (j <= i) j = i + 1;
+      while (j < C5.length && C5[j].t - C5[i].t < 5000) j++;
+      if (j >= C5.length) break;
+      const v = rateOf(C5[i], C5[j]); if (mx == null || v > mx) mx = v; if (mn == null || v < mn) mn = v;
+    }
+    for (let i = 1; i < C5.length; i++) { const v = rateOf(C5[i - 1], C5[i]); if (m1 == null || v > m1) m1 = v; }
+    r.witnessSrc = 'cumulative';
+    r.witnessX = +rateOf(C5[0], C5[C5.length - 1]).toFixed(4);
+    r.witnessMax = m1 == null ? null : +m1.toFixed(4);
+    r.witnessMaxWin5 = mx == null ? null : +mx.toFixed(4);
+    r.witnessMinWin5 = mn == null ? null : +mn.toFixed(4);
+  }
   const fr = W.map((w) => w.frames).filter((x) => typeof x === 'number');
   r.frameCounterX = fr.length >= 2 ? +(((fr[fr.length - 1] - fr[0]) / Math.max(1, W.length - 1)) / hz).toFixed(4) : null;
   r.stalls = d.stalls ? d.stalls.length : null;
