@@ -304,7 +304,10 @@ export function simulate(sc) {
     if (!running) { p.lastTs = 0; return; }
     if (p.beganAt == null) { p.beganAt = T; p.ring.set(ls.frame, p.st); }
     if (!p.lastTs) { p.lastTs = T; p.accum = 0; return; }
-    let d = T - p.lastTs; p.lastTs = T; if (d > 100) d = 100;
+    // genesis.html: a DELAY-lockstep room may run up to 250 ms / 15 frames a
+    // tick of the wall time it owes (ROOM_MAX_TICK_MS); solo and rollback 100 / 4
+    const delayRoom = !ls.rollback && !sc.oldTickCap;
+    let d = T - p.lastTs; p.lastTs = T; if (d > (delayRoom ? 250 : 100)) d = delayRoom ? 250 : 100;
     const pace = typeof ls.rbPace === 'function' ? ls.rbPace() : 1;
     p.accum += d * pace;
     let work = 0, ran = 0;
@@ -316,7 +319,7 @@ export function simulate(sc) {
       const k = ls.rbCatchUp();
       for (let i = 0; i < k; i++) { const w = runFrame(p, true); if (!w) break; work += w; }
     }
-    while (p.accum >= FRAME && ran < 4) { const w = runFrame(p, rejoining); if (!w) break; work += w; p.accum -= FRAME; ran++; }
+    while (p.accum >= FRAME && ran < (delayRoom ? 15 : 4)) { const w = runFrame(p, rejoining); if (!w) break; work += w; p.accum -= FRAME; ran++; }
     if (globalThis.__simTick) globalThis.__simTick(p, T, ran, work);
     if (p.accum > FRAME) p.accum = FRAME;
     if (ran && !rejoining) p.presented++;
@@ -331,7 +334,7 @@ export function simulate(sc) {
     const loop = () => {
       tick(p);
       // rAF: the next vsync after the thread is free, jittered
-      let next = T + FRAME + (rnd() - 0.5) * (sc.tickJitterMs == null ? 4 : sc.tickJitterMs);
+      let next = T + (sc.vsyncMs || FRAME) + (rnd() - 0.5) * (sc.tickJitterMs == null ? 4 : sc.tickJitterMs);
       if (sc.hiccup && rnd() < sc.hiccup.p) next += sc.hiccup.ms;
       if (p.busyUntil > next) next = p.busyUntil + (FRAME - ((p.busyUntil - phase) % FRAME));
       if (T < secs * 1000) q.push(next, loop);
@@ -392,7 +395,7 @@ export function simulate(sc) {
     compared += rep.hashesCompared || 0;
     out.consoles[id] = { rate: +rate.toFixed(4), max5s: +mw.toFixed(4), presented: +(p.presented / ((T - (p.beganAt || 0)) / FRAME)).toFixed(4),
       frames: p.frames, hidden: p.hidden, aheadOfRoomClock: +p.aheadMax.toFixed(2), state: ls.state, error: ls.error || null,
-      window: ls.rollback, windowPeak: ls._rbWinPeak || ls.rollback, stalls: rb.windowStalls, stallMs: Math.round(ls.stats.stallMs || 0), advWaits: rb.advantageWaits,
+      window: ls.rollback, windowPeak: ls._rbWinPeak || ls.rollback, stalls: rb.windowStalls, lsStalls: ls.stats.stalls | 0, cadenceHolds: ls.stats.cadenceHolds | 0, stallMs: Math.round(ls.stats.stallMs || 0), advWaits: rb.advantageWaits,
       rollbacks: rb.rollbacks, maxDepth: rb.maxDepth, resim: p.resim, catchUp: rb.catchUpFrames || 0,
       windowChanges: rb.windowChanges || 0, holeNaks: rb.holeNaks || 0, compared: rep.hashesCompared, maxTickWork: +p.maxTickWork.toFixed(1),
       lag: p.lagBad + '/' + p.lagN, rejoinTicks: p.rejoinTicks, pacedTicks: p.pacedTicks, old: p.old,

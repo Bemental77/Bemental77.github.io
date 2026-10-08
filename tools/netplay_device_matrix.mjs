@@ -408,6 +408,21 @@ function preloadSrc(cfg) {
     new PerformanceObserver((l) => { for (const e of l.getEntries()) { M.lt.n++; M.lt.ms += e.duration; if (e.duration > M.lt.max) M.lt.max = e.duration; if (e.duration > 100) M.lt.over100++; } })
       .observe({ type: 'longtask', buffered: true });
   } catch (e) { M.lt.err = String(e); }
+  // ---------------- WHAT a long main-thread stop was (Long Animation Frames) ----------------
+  // The longtask entry above says only how long; a LoAF names the scripts that ran
+  // in it (source, function, invoker) and how much of it was rendering.
+  M.loaf = [];
+  try {
+    new PerformanceObserver((l) => { for (const e of l.getEntries()) {
+      if (e.duration < 100) continue;
+      const sc = (e.scripts || []).map((x) => ({ src: String(x.sourceURL || '').split('/').pop().split('?')[0] + ':' + (x.sourceFunctionName || '?') + '@' + (x.sourceCharPosition | 0),
+        inv: String(x.invoker || '').slice(0, 60), it: x.invokerType, ms: Math.round(x.duration), fwd: Math.round(x.forcedStyleAndLayoutDuration || 0) }))
+        .sort((p, q) => q.ms - p.ms).slice(0, 4);
+      M.loaf.push({ t: Math.round(e.startTime), ms: Math.round(e.duration), blk: Math.round(e.blockingDuration || 0),
+        render: e.renderStart ? Math.round(e.startTime + e.duration - e.renderStart) : 0, sc });
+      if (M.loaf.length > 300) M.loaf.shift();
+    } }).observe({ type: 'long-animation-frame', buffered: true });
+  } catch (e) { M.loafErr = String(e); }
   // ---------------- lockstep hooks (prototype-level, console-independent) ----------------
   const hook = () => {
     const L = window.Netplay && window.Netplay.Lockstep;
@@ -1048,6 +1063,15 @@ async function runCell(cid, aid, attempt) {
               audioDiag: window.AudioDiag && window.__audioDiag ? window.AudioDiag.report() : undefined,
               n64Rate: window.__n64Rate ? { speed: window.__n64Rate.speed, starved: window.__n64Rate.starved, cap: window.__n64Rate.cap } : undefined,
               gcRate: window.__gcRate ? { path: window.__gcRate.path, speed: window.__gcRate.speed, starved: window.__gcRate.starved, capFps: window.__gcRate.capFps } : undefined,
+              // WHERE A DELAY ROOM'S TIME WENT, per page: Genesis's dropped tick credit by
+              // cause, GameCube's wait attribution (gcLsStep WHERE THE TIME GOES), and the
+              // engine's holds.
+              genTickLoss: window.__genTickLoss || undefined,
+              loaf: M.loaf ? M.loaf.slice() : (M.loafErr || undefined),
+              gcLs: typeof window.__gcLockstep === 'function' ? (() => { const g = window.__gcLockstep() || {}; const r = g.rollback || {};
+                return { runMs: g.runMs, waitInputMs: g.waitInputMs, waitWorkerMs: g.waitWorkerMs, bfCalls: g.bfCalls, bfStall: g.bfStall, earned: g.earned,
+                         cuRefused: (r.page || {}).cuRefused, hidden: (r.page || {}).hidden }; })() : undefined,
+              lsStats: e && e.stats ? { cadenceHolds: e.stats.cadenceHolds | 0, resyncHolds: e.stats.resyncHolds | 0, stalls: e.stats.stalls, stallMs: Math.round(e.stats.stallMs || 0) } : undefined,
             };
             native = JSON.parse(JSON.stringify(native));
           } catch (x) { native = { err: String(x) }; }
@@ -1159,6 +1183,14 @@ async function soloMeasure(P, C, tag, i) {
       out.longTasks = { n: W1.lt - W0.lt, ms: W1.ltMs - W0.ltMs, perMin: mins ? +((W1.lt - W0.lt) / mins).toFixed(1) : null,
                         msPerS: mins ? +((W1.ltMs - W0.ltMs) / (mins * 60)).toFixed(1) : null,
                         max: await P.page.evaluate(() => Math.round(window.__npdm.lt.max)).catch(() => null) };
+      // Long Animation Frames >= 150 ms in the window, and how much of them was
+      // script or rendering (the rest: the thread was not running this page's work).
+      out.loaf = await P.page.evaluate((t0, t1) => {
+        const L = (window.__npdm.loaf || []).filter((x) => x.t >= t0 && x.t <= t1 && x.ms >= 150);
+        const sum = (f) => L.reduce((a, x) => a + f(x), 0);
+        return { n: L.length, ms: sum((x) => x.ms), scriptMs: sum((x) => x.sc.reduce((a, y) => a + y.ms, 0)), renderMs: sum((x) => x.render),
+                 max: L.reduce((a, x) => Math.max(a, x.ms), 0) };
+      }, W0.t, W1.t).catch(() => null);
       if (W0.ca && W1.ca) {
         const s = (W1.t - W0.t) / 1000;
         out.cartAudio = { mode: W1.ca.mode, rxPerS: +((W1.ca.rx - W0.ca.rx) / s).toFixed(1), underruns: W1.ca.u - W0.ca.u,
@@ -1228,7 +1260,7 @@ async function runSolo(cid, device, count = 1) {
     Object.assign(out, { live: out.each.every((e) => e.live), win: worst.win, shot: worst.shot, audio: worst.audio,
                          errors: out.each.flatMap((e) => e.errors), throttleProof: worst.throttleProof,
                          throttled: worst.throttled, throttleRejected: worst.throttleRejected, rafMean: worst.rafMean,
-                         longTasks: worst.longTasks, audioDiag: worst.audioDiag, cartAudio: worst.cartAudio, workerProof: worst.workerProof, workerTargets: worst.workerTargets });
+                         longTasks: worst.longTasks, loaf: worst.loaf, audioDiag: worst.audioDiag, cartAudio: worst.cartAudio, workerProof: worst.workerProof, workerTargets: worst.workerTargets });
   } catch (e) {
     out.error = 'rig error: ' + String(e && e.stack || e).slice(0, 300);
   } finally {
@@ -1463,7 +1495,7 @@ if (flag('rejudge', '')) {
       say(`--- ${cid} SOLO cap, ${dk}${dev.cpu ? ' ' + dev.cpu + 'x' : ''} ---`);
       const s = await runSolo(cid, dev, { pair: 2, trio: 3, quad: 4 }[dk] || 1);
       RESULT.solo[cid + ':' + dk] = s; save();
-      say(`  solo ${cid}/${dk}: live=${s.live} rate=${JSON.stringify(s.rate)} throttleProof=${JSON.stringify(s.throttleProof)} canvas=${s.shot && (s.shot.showing ? 'ok' : 'BLACK')} audio=${s.audio ? s.audio.dropouts + ' drop/' + s.audio.quanta + 'q' : '-'} raf=${s.rafMean} perMin=${s.audio && s.audio.perMin} longTasks=${JSON.stringify(s.longTasks)} audioDiag=${JSON.stringify(s.audioDiag)} cartAudio=${JSON.stringify(s.cartAudio)} workers=${JSON.stringify(s.workerProof)} targets=${JSON.stringify(s.workerTargets)}${s.each && s.each.length > 1 ? ' each=' + s.each.map((e) => e.rate && e.rate.x).join('/') : ''} loads=${s.loads.join(',')} ${s.start ? JSON.stringify(s.start) : ''} ${s.error || ''}`);
+      say(`  solo ${cid}/${dk}: live=${s.live} rate=${JSON.stringify(s.rate)} throttleProof=${JSON.stringify(s.throttleProof)} canvas=${s.shot && (s.shot.showing ? 'ok' : 'BLACK')} audio=${s.audio ? s.audio.dropouts + ' drop/' + s.audio.quanta + 'q' : '-'} raf=${s.rafMean} perMin=${s.audio && s.audio.perMin} longTasks=${JSON.stringify(s.longTasks)} loaf=${JSON.stringify(s.loaf)} audioDiag=${JSON.stringify(s.audioDiag)} cartAudio=${JSON.stringify(s.cartAudio)} workers=${JSON.stringify(s.workerProof)} targets=${JSON.stringify(s.workerTargets)}${s.each && s.each.length > 1 ? ' each=' + s.each.map((e) => e.rate && e.rate.x).join('/') : ''} loads=${s.loads.join(',')} ${s.start ? JSON.stringify(s.start) : ''} ${s.error || ''}`);
     }
     for (const aid of ((SOLO_ONLY || CONSOLES[cid].soloOnly) ? [] : arms)) {
       let cell = null;

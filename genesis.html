@@ -469,6 +469,10 @@
   let HW_HZ = 59.922751;             // replaced by gpx_fps() once a ROM is loaded
   let FRAME_MS = 1000 / HW_HZ;
   const MAX_CATCHUP_FRAMES = 4;
+  // In a delay-lockstep room only (see tick()): a tick may run up to this much
+  // wall time it owes, in frames, before the rest is dropped.
+  const ROOM_MAX_TICK_MS = 250;
+  const ROOM_MAX_CATCHUP_FRAMES = 15;
 
   // Audio: SOUND_FREQUENCY is hardcoded 44100 in the core
   // (Genesis-Plus-GX libretro/libretro.c:204).
@@ -838,7 +842,7 @@
   // is what "wait for the other player" has to mean when nothing may be guessed.
   // `hidden`: a catch-up frame the engine granted (ls.rbCatchUp) — run, never
   // presented, its audio dropped. See loop().
-  function lsRunFrame(hidden) {
+  function lsRunFrame(hidden, keepAudio) {
     var ls = lsEngine();
     if (!ls) { lsDisarm('the session went away'); return false; }
     if (ls.state !== 'running' && ls.state !== 'stalled') {
@@ -897,9 +901,17 @@
     }
     // A HIDDEN frame here is a returning player catching up in a delay room
     // (see loop()): not presented, its audio rewound, as in rollback.
+    // ⚠ EXCEPT A ONE-FRAME CATCH-UP (keepAudio): a frame this console fell
+    // behind the room by (lib/netplay.js _lsCatchUp), i.e. time its page lost to
+    // a late tick or a wait. Its sound is the guest's next 16.7 ms, in order —
+    // dropping it kept the hole that loss opened in the AudioWorklet's cushion,
+    // and the sink resumes a dry spell at only HALF its cushion
+    // (lib/cart_audio_worklet.js), so a loss is not made good by itself. Kept,
+    // it refills the cushion; the speakers still play at exactly 1.000x (the
+    // sink's one fixed ratio), and the picture still skips the frame.
     var lw0 = null;
     if (hidden) {
-      lw0 = Module._gpx_audio_wpos ? Module._gpx_audio_wpos() : null;
+      lw0 = (!keepAudio && Module._gpx_audio_wpos) ? Module._gpx_audio_wpos() : null;
       if (Module._gpx_set_video_skip) Module._gpx_set_video_skip(1);
     }
     Module._gpx_run();
@@ -1202,14 +1214,32 @@
     if (!lastTs) { lastTs = ts; accum = 0; return; }
     var d = ts - lastTs; lastTs = ts;
     if (d < 0) d = 0;
-    if (d > 100) d = 100;          // a long stall must not fast-forward the guest
+    var lsE = (LS.armed && LS.running) ? lsEngine() : null;
+    // ⚠ A DELAY-LOCKSTEP ROOM RUNS WHAT ITS WALL CLOCK OWES, IN THE TICK THAT OWES IT.
+    // Solo and rollback keep the 100 ms / 4-frame tick below. In a delay room
+    // that tick was where the room's time went: MEASURED on the relay
+    // (tools/netplay_device_matrix.mjs gen fw, /tmp/npdm/base-loss, load 11.6)
+    // the host dropped 1453 ms of credit to the 4-frame cap (57 ticks) and
+    // 1017 ms to the 100 ms clamp (25 ticks) against 406 ms waiting on its peer
+    // — ownClock rate 0.9572, 52 audio dropouts, and its joiner then stalled
+    // on it. Those were late display ticks, not stalls: its Long Animation
+    // Frames over 100 ms were mostly the rAF callback plus 43-147 ms of
+    // rendering on this loaded software-GPU box. A
+    // frame owed this tick is not a sprint: it is the time that has already
+    // passed, run once, and the clamp below still drops anything left over
+    // and any wait (gate 9: never banked, never repaid across ticks).
+    var delayRoom = !!(lsE && !lsE.rollback);
+    var tickCap = delayRoom ? ROOM_MAX_TICK_MS : 100, frameCap = delayRoom ? ROOM_MAX_CATCHUP_FRAMES : MAX_CATCHUP_FRAMES;
+    // window.__genTickLoss: credit this tick() dropped, by cause (late tick past the cap, a wait
+    // or a cadence hold, the frame cap) — read by tools/netplay_device_matrix.mjs.
+    var TL = window.__genTickLoss || (window.__genTickLoss = { late: 0, lateN: 0, stall: 0, stallN: 0, cad: 0, cadN: 0, cap: 0, capN: 0, ticks: 0 }); TL.ticks++;
+    if (d > tickCap) { TL.late += d - tickCap; TL.lateN++; d = tickCap; }   // a long stall must not fast-forward the guest
     // ROLLBACK, ADAPTIVE ROOM (lib/netplay.js, the ADAPTIVE ROOM block): the
     // engine may hand back a credit multiplier just under 1 while this console
     // leads a peer that cannot close the gap — a wait spread over a hundred
     // frames instead of a frame missing — and it grants HIDDEN catch-up frames
     // when this console is behind the room: frames the room has already run,
     // never past its clock, never presented.
-    var lsE = (LS.armed && LS.running) ? lsEngine() : null;
     accum += d * ((lsE && lsE.rollback && typeof lsE.rbPace === 'function') ? lsE.rbPace() : 1);
     // ⚠ REJOINING IS NOT SHOWN AS A FAST-FORWARD (gate 9). A console that was
     // away is a rejoin-sized gap behind the room: until it is back, EVERY frame
@@ -1222,7 +1252,7 @@
     if (rejoining) { NET.notice = 'Rejoining the room — catching up…'; NET.noticeUntil = Date.now() + 400; }
     if (lsE && typeof lsE.rbCatchUp === 'function') {
       var cu = lsE.rbCatchUp();
-      for (var ci = 0; ci < cu; ci++) if (!lsRunFrame(true)) break;
+      for (var ci = 0; ci < cu; ci++) if (!lsRunFrame(true, !rejoining)) break;
     }
     var ran = 0;
     // ⚠ A STALLED FRAME MUST NOT SPEND ITS CREDIT. runFrame() returns false when
@@ -1234,7 +1264,7 @@
     // stopped. The `d > 100` clamp above already stops a long wait from
     // accumulating more than one tick's worth.
     var stalled = false;
-    while (accum >= FRAME_MS && ran < MAX_CATCHUP_FRAMES) {
+    while (accum >= FRAME_MS && ran < frameCap) {
       if (!runFrame(rejoining)) { stalled = true; break; }
       accum -= FRAME_MS; ran++;
     }
@@ -1262,6 +1292,7 @@
     // the correct trade and the one the rest of this file already states: those
     // wall-clock milliseconds did not happen for the guest, so they are gone
     // rather than owed.
+    if (accum > FRAME_MS) { var lostMs = accum - FRAME_MS; var why = stalled ? ((lsE && LS.stallReason === 'cadence') ? 'cad' : 'stall') : 'cap'; TL[why] += lostMs; TL[why + 'N']++; }
     if (accum > FRAME_MS) accum = FRAME_MS;
     sndDrain();
     if (ran && !rejoining) draw();
