@@ -14,11 +14,11 @@
 // WHAT THE PROGRAM DOES — continuously, NOT synchronised to V-blank, so frame
 // boundaries fall in the middle of transfers and the multitap's protocol state
 // is live whenever a savestate is taken:
+//   T1..T4 port 1: 0n 42 00 00 00 for n = 1..4 = slots A..D one at a time.
+//   T6 port 1: 01 42 01 00 00 = slot A, with TAP = 1: the NEXT transfer is full.
 //   T0 port 1: 01 42 00 + 32 bytes (4 blocks of 42 00 00 00 00 00 00 00)
-//      = a FULL "all four" read when the previous transfer's TAP byte was 1
-//        (answer 80 5A + four 8-byte slot blocks), else slot A passed through.
-//   T1..T4 port 1: 0n 42 TAP 00 00 for n = 1..4 = slots A..D one at a time
-//      (TAP = 0, except T4 sends TAP = 1, which makes the NEXT T0 a full read).
+//      = a FULL "all four" read (answer 80 5A + four 8-byte slot blocks) — or,
+//        with no multitap, just the port-1 pad.
 //   T5 port 2: 01 42 00 00 00 (with a multitap in port 1, port 2 is empty).
 // Each byte waits for RX ready, reads the reply, waits for the ACK (I_STAT bit
 // 7) with a timeout; no ACK ends the transfer (as on hardware). Every reply
@@ -28,21 +28,21 @@
 // MAIN RAM MAP (guest 0x800F0000 = psxM + 0xF0000), RAM below:
 //   +0x00 u32 loop count     +0x04 u32 checksum    +0x08 u32 V-blanks seen
 //   +0x0C 'MTAP' (program alive)
-//   +0x10 + 0x28*t  record of transfer t (0..5): [0] bytes exchanged,
+//   +0x10 + 0x28*t  record of transfer t (0..6): [0] bytes exchanged,
 //                   [1 + i] reply to byte i
-//   +0x100 u16 x4  slot A..D buttons from the last FULL read (KeyStatus, active-low)
-//   +0x108 u8      reply to T0's command byte (0x80 = it was a full read)
-//   +0x110 u16 x4  slot A..D buttons read one at a time (0xEEEE: no complete reply)
-//   +0x118 u16     port 2 pad buttons (0xEEEE: none)
-//   +0x120 u8 x4   slot A..D ID byte in the last full read (0x41 pad, 0xFF empty)
-//   +0x124 u8 x4   slot A..D ID byte read one at a time (0xEE: nothing answered)
-//   +0x128 u8      port 2 ID byte
+//   +0x140 u16 x4  slot A..D buttons from the last FULL read (KeyStatus, active-low)
+//   +0x148 u8      reply to T0's command byte (0x80 = it was a full read)
+//   +0x150 u16 x4  slot A..D buttons read one at a time (0xEEEE: no complete reply)
+//   +0x158 u16     port 2 pad buttons (0xEEEE: none)
+//   +0x160 u8 x4   slot A..D ID byte in the last full read (0x41 pad, 0xFF empty)
+//   +0x164 u8 x4   slot A..D ID byte read one at a time (0xEE: nothing answered)
+//   +0x168 u8      port 2 ID byte
 //
 // USAGE  import { buildMultitapDisc, RAM } from './ps1_multitap_disc.mjs'
 //        node tools/ps1_multitap_disc.mjs OUT.bin   (writes the raw 2352-byte-sector image)
 export const RAM = {
   base: 0xF0000, loops: 0x00, sum: 0x04, vblanks: 0x08, magic: 0x0C, rec: 0x10, recSize: 0x28,
-  fullBtn: 0x100, fullHdr: 0x108, passBtn: 0x110, port2Btn: 0x118, fullId: 0x120, passId: 0x124, port2Id: 0x128,
+  fullBtn: 0x140, fullHdr: 0x148, passBtn: 0x150, port2Btn: 0x158, fullId: 0x160, passId: 0x164, port2Id: 0x168,
 };
 export const MAGIC = 0x5041544D;   // 'MTAP'
 
@@ -103,9 +103,15 @@ function buildProgram() {
   const a = new Asm(TEXT);
   const send = [];   // [address, bytes]
   const T_FULL = [0x01, 0x42, 0x00]; for (let i = 0; i < 4; i++) T_FULL.push(0x42, 0, 0, 0, 0, 0, 0, 0);
-  const txns = [{ ctrl: 0x1003, bytes: T_FULL }];
-  for (let n = 1; n <= 4; n++) txns.push({ ctrl: 0x1003, bytes: [n, 0x42, n === 4 ? 1 : 0, 0, 0] });
-  txns.push({ ctrl: 0x3003, bytes: [0x01, 0x42, 0x00, 0x00, 0x00] });
+  // Executed in this order; `rec` is the record each lands in. The TAP=1 that
+  // arms the full read rides on slot A (rec 6), which is always plugged in — a
+  // transfer to an EMPTY slot ends at its address byte (no ACK), so a TAP byte
+  // sent there never reaches the multitap, exactly as on hardware.
+  const txns = [];
+  for (let n = 1; n <= 4; n++) txns.push({ rec: n, ctrl: 0x1003, bytes: [n, 0x42, 0, 0, 0] });
+  txns.push({ rec: 6, ctrl: 0x1003, bytes: [0x01, 0x42, 0x01, 0, 0] });
+  txns.push({ rec: 0, ctrl: 0x1003, bytes: T_FULL });
+  txns.push({ rec: 5, ctrl: 0x3003, bytes: [0x01, 0x42, 0x00, 0x00, 0x00] });
   let dp = DATA;
   for (const t of txns) { t.addr = dp; send.push([dp, t.bytes]); dp += (t.bytes.length + 3) & ~3; }
 
@@ -126,11 +132,14 @@ function buildProgram() {
   a.lw(R.t0, 0x1070, R.s0); a.andi(R.t0, R.t0, 1); a.beq(R.t0, R.zero, 'novb');
   a.li(R.t1, -2); a.sw(R.t1, 0x1070, R.s0); a.lw(R.t2, RAM.vblanks, R.s1); a.addiu(R.t2, R.t2, 1); a.sw(R.t2, RAM.vblanks, R.s1);
   a.label('novb');
-  txns.forEach((t, k) => {
+  txns.forEach((t) => {
+    const k = t.rec;
     a.li(R.a1, t.ctrl); a.li(R.a2, t.addr | 0); a.li(R.a3, t.bytes.length); a.addiu(R.s2, R.s1, RAM.rec + RAM.recSize * k);
     a.jal('txn');
     const rec = RAM.rec + RAM.recSize * k;
-    if (k === 0) {
+    if (k === 6) {
+      // only the record
+    } else if (k === 0) {
       a.lbu(R.t0, rec + 2, R.s1); a.sb(R.t0, RAM.fullHdr, R.s1);
       a.li(R.t1, 0x80); a.bne(R.t0, R.t1, 'nofull');
       for (let i = 0; i < 4; i++) {

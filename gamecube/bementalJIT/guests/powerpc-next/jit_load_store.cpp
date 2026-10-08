@@ -390,9 +390,9 @@ static u32 emit_fastmem_host_addr(WasmModuleBuilder& wb, const LoadStoreParams& 
     return 0u;
 }
 
-static void emit_fastmem_load_value(WasmModuleBuilder& wb,
-                                    LoadStoreParams params, LoadWidth width) {
-    const u32 moff = emit_fastmem_host_addr(wb, params);
+// Fast-path load value from the host address already on the stack, at memarg
+// offset `moff`. Leaves the loaded+swapped value on the stack.
+static void emit_fastmem_load_value_at(WasmModuleBuilder& wb, LoadWidth width, u32 moff) {
     if (width != LoadWidth::U8 && bswap_simd_on()) {
         // [bswap-simd] the load itself lands in lane 0: load32_zero / load16_splat
         // read exactly the bytes i32.load / i32.load16_u read (same address, same
@@ -432,6 +432,12 @@ static void emit_fastmem_load_value(WasmModuleBuilder& wb,
         emit_bswap_i32(wb);
         break;
     }
+}
+
+static void emit_fastmem_load_value(WasmModuleBuilder& wb,
+                                    LoadStoreParams params, LoadWidth width) {
+    const u32 moff = emit_fastmem_host_addr(wb, params);
+    emit_fastmem_load_value_at(wb, width, moff);
 }
 
 // [lc-window PM23] Push 1 iff EA is inside the locked-L1 region
@@ -482,6 +488,22 @@ static void emit_host_call_prep(WasmModuleBuilder& wb, const LoadStoreParams& pa
         wb.op_i32_const((s32)params.defer_pc);
         wb.op_i32_store(ppc_off::PC);
     }
+}
+
+// [BEM_LEVER_SLOWARM_FP_GP 2026-10-08] The FP memory ops' common-path
+// rc.Flush, deferred like emit_load_common's: snapshot the compile-time state
+// here (where the flush stood) and let every slow arm's first host import
+// replay it through emit_host_call_prep. Lever off: the eager flush, and
+// params.host_rc stays null, so every prep below emits nothing.
+static void emit_fp_gpr_flush(RegCache& rc, LoadStoreParams& params,
+                              RegCache::StateSnapshot& snap) {
+    if (bem_lever_on(BEM_LEVER_SLOWARM_FP_GP)) {
+        snap = rc.SaveState();
+        params.host_rc = &rc;
+        params.host_rc_snap = &snap;
+        return;
+    }
+    rc.Flush(params.ctx_ptr);
 }
 
 static void emit_slowmem_load_value(WasmModuleBuilder& wb,
@@ -540,9 +562,10 @@ static void emit_slowmem_load_value(WasmModuleBuilder& wb,
 
 // Fast-path store: pops nothing additional; uses src_local as the value
 // source. Stack-neutral.
-static void emit_fastmem_store(WasmModuleBuilder& wb, LoadStoreParams params,
-                               StoreWidth width, u32 src_local) {
-    const u32 moff = emit_fastmem_host_addr(wb, params);   // [FASTMEM_LEAN]
+// Fast-path store of src_local to the host address already on the stack, at
+// memarg offset `moff`. Stack-neutral beyond consuming the address.
+static void emit_fastmem_store_at(WasmModuleBuilder& wb, StoreWidth width,
+                                  u32 src_local, u32 moff) {
     wb.op_local_get(src_local);
     if (width != StoreWidth::U8 && bswap_simd_on()) {
         // [bswap-simd] store straight from lane 0: store32_lane / store16_lane
@@ -571,6 +594,12 @@ static void emit_fastmem_store(WasmModuleBuilder& wb, LoadStoreParams params,
         wb.op_i32_store(moff);
         break;
     }
+}
+
+static void emit_fastmem_store(WasmModuleBuilder& wb, LoadStoreParams params,
+                               StoreWidth width, u32 src_local) {
+    const u32 moff = emit_fastmem_host_addr(wb, params);   // [FASTMEM_LEAN]
+    emit_fastmem_store_at(wb, width, src_local, moff);
 }
 
 // ---------------------------------------------------------------------------
@@ -850,6 +879,7 @@ static void emit_fp_words_gp_or_import(WasmModuleBuilder& wb, LoadStoreParams pa
                 wb.op_i32_add();
             }
             emit_word(i);
+            if (i == 0) emit_host_call_prep(wb, params);   // [FPMEM_SLOWARM]
             wb.op_call(WIMPORT_WRITE32);
         }
     };
@@ -1049,6 +1079,150 @@ static void emit_store_common(WasmModuleBuilder& wb, RegCache& rc,
 }
 
 // ---------------------------------------------------------------------------
+// [BEM_LEVER_BASE_HOIST 2026-10-08] Hoisted base-range check (see BaseHoist in
+// jit_load_store.h and plan_base_hoist in ppc_emit.cpp).
+//
+// WHY THE FAST ARM IS THE SAME ACCESS. The admitted set of the per-access guard
+// ((EA & 0x3E000000) == 0) is four aligned 32 MB windows (bits 25..29 zero:
+// 0x00.., 0x40.., 0x80.., 0xC0..), pairwise >= 0x3E000000 apart. The head's flag
+// says ra+L and ra+H (L <= 0 <= H, H - L < 2^16) are both admitted. Two admitted
+// points that close lie in ONE window W (and ra+L cannot wrap past 2^32 into W:
+// it would have to be >= 0xFFFF0000, which is not admitted), so every
+// ra+simm (L <= simm <= H) and ra itself lie in W. Then
+//   * each member's own guard is true, so the unhoisted code takes its fast
+//     arm too, and
+//   * (ra+simm) & mask == (ra & mask) + simm (mask = 0x01FFFFFF = W's offset
+//     bits), so the unhoisted host address (EA & mask) + base equals the
+//     hoisted (ra & mask) + (base + simm): the same bytes, width and trap.
+// A false flag runs the member's unhoisted code unchanged.
+// Preconditions (checked by the planner): mem1_mask == ram_size - 1 ==
+// 0x01FFFFFF, FASTMEM_LEAN's memarg fold valid with room for +/-0x8000,
+// MEM_SLOWARM on (the slow arm's host prep comes from the snapshot).
+// ---------------------------------------------------------------------------
+static void emit_hoist_head(WasmModuleBuilder& wb, const BaseHoist& h,
+                            const LoadStoreParams& params, u32 ra_local) {
+    if (h.base_local) {
+        wb.op_local_get(ra_local);
+        wb.op_i32_const((s32)params.mem1_mask);
+        wb.op_i32_and();
+        wb.op_local_set(h.base_local);
+    }
+    wb.op_local_get(ra_local);
+    if (h.lo != 0) { wb.op_i32_const(h.lo); wb.op_i32_add(); }
+    wb.op_local_get(ra_local);
+    if (h.hi != 0) { wb.op_i32_const(h.hi); wb.op_i32_add(); }
+    wb.op_i32_or();
+    wb.op_i32_const((s32)0x3E000000u);
+    wb.op_i32_and();
+    wb.op_i32_eqz();
+    wb.op_local_set(h.flag_local);
+}
+
+// Push ra & mask (the fast arm's address operand; the memarg adds base + simm).
+static void emit_hoist_host_base(WasmModuleBuilder& wb, const BaseHoist& h,
+                                 const LoadStoreParams& params, u32 ra_local) {
+    if (h.base_local) { wb.op_local_get(h.base_local); return; }
+    wb.op_local_get(ra_local);
+    wb.op_i32_const((s32)params.mem1_mask);
+    wb.op_i32_and();
+}
+
+static void hoist_depth_check(WasmModuleBuilder& wb, const BaseHoist& h) {
+    if (h.head) *h.depth_cell = wb.ctrlDepth();
+    else if (*h.depth_cell != wb.ctrlDepth() && h.poison) *h.poison = true;
+}
+
+// Member prologue: bind ra (top level), check the depth, and on the head
+// compute the group flag (and base). Returns ra's local.
+static u32 hoist_begin(WasmModuleBuilder& wb, RegCache& rc, const BaseHoist& h,
+                       const LoadStoreParams& params, u32 ra) {
+    auto rc_a = rc.Bind(ra, RCMode::Read);
+    const u32 ra_local = rc_a.local_idx();
+    hoist_depth_check(wb, h);
+    if (h.head) emit_hoist_head(wb, h, params, ra_local);
+    return ra_local;
+}
+
+// The unhoisted EA (emit_ea_d_form, ra != 0, no EA cache) from ra's local.
+static void emit_ea_now(WasmModuleBuilder& wb, u32 ra_local, u32 simm) {
+    wb.op_local_get(ra_local);
+    wb.op_i32_const((s32)simm);
+    wb.op_i32_add();
+    wb.op_local_set(LOCAL_TMP_EA);
+}
+
+static void emit_load_d_hoisted(WasmModuleBuilder& wb, RegCache& rc,
+                                LoadStoreParams params, u32 rt, u32 ra, u32 simm,
+                                LoadWidth width) {
+    const BaseHoist& h = *params.hoist;
+    if (params.ea_cache) params.ea_cache->valid = false;   // TMP_EA not written on the fast arm
+    auto rc_a = rc.Bind(ra, RCMode::Read);
+    const u32 ra_local = rc_a.local_idx();
+    hoist_depth_check(wb, h);
+    if (h.head) emit_hoist_head(wb, h, params, ra_local);
+    // Same compile-time state the unhoisted emit_load_common snapshots (after
+    // the EA's Bind(ra), before Bind(rt, Write)).
+    RegCache::StateSnapshot host_snap = rc.SaveState();
+    params.host_rc = &rc;
+    params.host_rc_snap = &host_snap;
+    auto rc_rt = rc.Bind(rt, RCMode::Write);
+    const u32 rt_local = rc_rt.local_idx();
+    wb.op_local_get(h.flag_local);
+    wb.op_if(BLOCK_TYPE_VOID);
+        emit_hoist_host_base(wb, h, params, ra_local);
+        emit_fastmem_load_value_at(wb, width, params.mem1_base + simm);
+        wb.op_local_set(rt_local);
+    wb.op_else();
+        // The unhoisted body (emit_ea_d_form without the EA cache + the
+        // emit_load_common if/else), from the same register-cache state.
+        wb.op_local_get(ra_local);
+        wb.op_i32_const((s32)simm);
+        wb.op_i32_add();
+        wb.op_local_set(LOCAL_TMP_EA);
+        emit_fastmem_guard(wb, params, load_width_bytes(width));
+        wb.op_if(BLOCK_TYPE_VOID);
+            emit_fastmem_load_value(wb, params, width);
+            wb.op_local_set(rt_local);
+        wb.op_else();
+            emit_slowmem_load_value(wb, params, width);
+            wb.op_local_set(rt_local);
+        wb.op_end();
+    wb.op_end();
+}
+
+static void emit_store_d_hoisted(WasmModuleBuilder& wb, RegCache& rc,
+                                 LoadStoreParams params, u32 rs, u32 ra, u32 simm,
+                                 StoreWidth width) {
+    const BaseHoist& h = *params.hoist;
+    if (params.ea_cache) params.ea_cache->valid = false;
+    auto rc_a = rc.Bind(ra, RCMode::Read);
+    const u32 ra_local = rc_a.local_idx();
+    hoist_depth_check(wb, h);
+    if (h.head) emit_hoist_head(wb, h, params, ra_local);
+    auto rc_rs = rc.Bind(rs, RCMode::Read);
+    const u32 rs_local = rc_rs.local_idx();
+    RegCache::StateSnapshot host_snap = rc.SaveState();
+    params.host_rc = &rc;
+    params.host_rc_snap = &host_snap;
+    wb.op_local_get(h.flag_local);
+    wb.op_if(BLOCK_TYPE_VOID);
+        emit_hoist_host_base(wb, h, params, ra_local);
+        emit_fastmem_store_at(wb, width, rs_local, params.mem1_base + simm);
+    wb.op_else();
+        wb.op_local_get(ra_local);
+        wb.op_i32_const((s32)simm);
+        wb.op_i32_add();
+        wb.op_local_set(LOCAL_TMP_EA);
+        emit_fastmem_guard(wb, params, store_width_bytes(width));
+        wb.op_if(BLOCK_TYPE_VOID);
+            emit_fastmem_store(wb, params, width, rs_local);
+        wb.op_else();
+            emit_slowmem_store(wb, params, width, rs_local);
+        wb.op_end();
+    wb.op_end();
+}
+
+// ---------------------------------------------------------------------------
 // Const-address MMIO routing.
 //
 // Ported from Dolphin Jit64's EmuCodeBlock::WriteToConstAddress
@@ -1175,6 +1349,10 @@ void emit_load_d(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         return;
     }
 
+    if (params.hoist && !update && ra != 0) {   // [BEM_LEVER_BASE_HOIST]
+        emit_load_d_hoisted(wb, rc, params, rt, ra, simm, width);
+        return;
+    }
     emit_ea_d_form(wb, rc, ra, simm, params.ea_cache);   // [PM55 EA-CSE]
     emit_load_common(wb, rc, frc, params, rt, ra, width, update);
 }
@@ -1192,8 +1370,16 @@ void emit_store_d(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     // store ordering required by DVDInterface DICR.TSTART/DICMDBUF[0],
     // AudioInterface, etc.
     if (op.has_const_ea && is_mmio_const_addr(op.const_ea)) {
+        // [BEM_LEVER_SLOWARM_FP_GP] the gather-pipe carve-out below defers the
+        // pre-op PC and the GPR flush into its two host calls (the in-append
+        // drain and the import arm) like the dynamic-EA path's slow arms.
+        const bool gp_carve = BEM_GP_CONST_EA_ARM && BEM_GP_INWASM_ARM && params.lc_base &&
+                              (op.const_ea & GP_EA_MASK) == GP_EA_MATCH;
+        const bool gp_defer = gp_carve && bem_lever_on(BEM_LEVER_SLOWARM_FP_GP);
+        if (!gp_defer) {
         emit_host_call_prep(wb, params);   // [MEM_SLOWARM] deferred pre-op PC (no rc: host_rc unset)
         params.defer_pc = 0;
+        }
         // [gp-const-ea 2026-09-01] WRITE-GATHER-PIPE CARVE-OUT. WPAR (0xCC008000)
         // sits inside the 0xCC000000..0xCC03FFFF const-MMIO window, so a store
         // whose EA the analyst folded — `lis rX,0xCC01` then `sth rY,-0x8000(rX)`,
@@ -1217,11 +1403,17 @@ void emit_store_d(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         // frc.Flush is dropped for the same reason emit_store_common:879-883
         // drops it on the integer store path: the host write handlers read
         // gpr[], never ps[]. rc.Flush is kept.
-        if (BEM_GP_CONST_EA_ARM && BEM_GP_INWASM_ARM && params.lc_base &&
-            (op.const_ea & GP_EA_MASK) == GP_EA_MATCH) {
+        if (gp_carve) {
             auto rc_rs = rc.Bind(rs, RCMode::Read);
             const u32 src_local = rc_rs.local_idx();
-            rc.Flush(params.ctx_ptr);
+            RegCache::StateSnapshot host_snap;
+            if (gp_defer) {
+                host_snap = rc.SaveState();
+                params.host_rc = &rc;
+                params.host_rc_snap = &host_snap;
+            } else {
+                rc.Flush(params.ctx_ptr);
+            }
             // The EA is compile-time known, so the runtime region test collapses
             // to its only variable term: does dolphin's own CPU thread still own
             // the guest? (emit_gp_region_test's second conjunct — the ppc-worker
@@ -1232,6 +1424,7 @@ void emit_store_d(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
             wb.op_if(BLOCK_TYPE_VOID);
                 emit_gp_append(wb, params, width, src_local);
             wb.op_else();
+                emit_host_call_prep(wb, params);   // [FPMEM_SLOWARM] (nothing when not deferred)
                 wb.op_i32_const((s32)op.const_ea);
                 wb.op_local_get(src_local);
                 wb.op_call(write_import_for_width(width));
@@ -1255,6 +1448,10 @@ void emit_store_d(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         return;
     }
 
+    if (params.hoist && !update && ra != 0) {   // [BEM_LEVER_BASE_HOIST]
+        emit_store_d_hoisted(wb, rc, params, rs, ra, simm, width);
+        return;
+    }
     emit_ea_d_form(wb, rc, ra, simm, params.ea_cache);   // [PM55 EA-CSE]
     emit_store_common(wb, rc, frc, params, rs, ra, width, update);
 }
@@ -1352,6 +1549,7 @@ static void emit_fastmem_lfd_body(WasmModuleBuilder& wb, LoadStoreParams params,
         wb.op_i64x2_extract_lane(0);
         wb.op_local_set(ps0_idx);
     wb.op_else();
+        emit_host_call_prep(wb, params);   // [FPMEM_SLOWARM]
         wb.op_local_get(LOCAL_TMP_EA);
         wb.op_call(WIMPORT_READ32);
         wb.op_i64_extend_i32_u();
@@ -1388,6 +1586,7 @@ static void emit_fastmem_stfd_body(WasmModuleBuilder& wb, LoadStoreParams params
         emit_v128_shuffle_self(wb, BSWAP64_SHUFFLE);
         wb.op_v128_store64_lane(0, /*lane=*/0, /*align=*/2);
     wb.op_else();
+        emit_host_call_prep(wb, params);   // [FPMEM_SLOWARM]
         wb.op_local_get(LOCAL_TMP_EA);
         wb.op_local_get(rs_ps0_idx);
         wb.op_i64_const(32);
@@ -1445,6 +1644,61 @@ void emit_lfsx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
 // uses it as the exact inverse of the PEM widen (round-trip identity incl.
 // NaN payloads + single denormals — f32.demote_f64 would canonicalize NaNs).
 void emit_convert_to_single(WasmModuleBuilder& wb, u32 ps0_local) {
+    if (bem_lever_on(BEM_LEVER_CVT_SINGLE_BRANCH)) {
+        // [BEM_LEVER_CVT_SINGLE_BRANCH 2026-10-07] The same two values as the
+        // select form below, but only the selected one is computed. The select's
+        // condition (exp >= 874) & (exp <= 896) & (magnitude != 0) loses its
+        // third term: exp >= 874 means a non-zero exponent field, so the
+        // magnitude is never 0 there. (exp - 874) <=u 22 is the same range test.
+        // LOCAL_TMP_VAL ends holding exp, as before.
+        wb.op_local_get(ps0_local);
+        wb.op_i64_const(52);
+        wb.op_i64_shr_u();
+        wb.op_i32_wrap_i64();
+        wb.op_i32_const(0x7FF);
+        wb.op_i32_and();
+        wb.op_local_tee(LOCAL_TMP_VAL);
+        wb.op_i32_const(874);
+        wb.op_i32_sub();
+        wb.op_i32_const(896 - 874);
+        wb.op_i32_le_u();
+        wb.op_if(0x7F);   // -> i32
+            wb.op_local_get(ps0_local);
+            wb.op_i64_const(0x000FFFFFFFFFFFFFll);
+            wb.op_i64_and();
+            wb.op_i64_const(21);
+            wb.op_i64_shr_u();
+            wb.op_i32_wrap_i64();
+            wb.op_i32_const((s32)0x80000000u);
+            wb.op_i32_or();
+            wb.op_i32_const(905);
+            wb.op_local_get(LOCAL_TMP_VAL);
+            wb.op_i32_sub();
+            wb.op_i32_shr_u();
+            wb.op_local_get(ps0_local);
+            wb.op_i64_const(32);
+            wb.op_i64_shr_u();
+            wb.op_i32_wrap_i64();
+            wb.op_i32_const((s32)0x80000000u);
+            wb.op_i32_and();
+            wb.op_i32_or();
+        wb.op_else();
+            wb.op_local_get(ps0_local);
+            wb.op_i64_const(32);
+            wb.op_i64_shr_u();
+            wb.op_i32_wrap_i64();
+            wb.op_i32_const((s32)0xC0000000u);
+            wb.op_i32_and();
+            wb.op_local_get(ps0_local);
+            wb.op_i64_const(29);
+            wb.op_i64_shr_u();
+            wb.op_i32_wrap_i64();
+            wb.op_i32_const(0x3FFFFFFF);
+            wb.op_i32_and();
+            wb.op_i32_or();
+        wb.op_end();
+        return;
+    }
     // exp -> LOCAL_TMP_VAL
     wb.op_local_get(ps0_local);
     wb.op_i64_const(52);
@@ -1532,18 +1786,25 @@ void emit_convert_to_single(WasmModuleBuilder& wb, u32 ps0_local) {
 //    rc.Flush stays) but never ps[], no DSI is raised in the MMU-off config
 //    (PM55), and every exception/HLE/fallback/exit point flushes FPRs itself.
 static void emit_stfs_value(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
-                            LoadStoreParams params, u32 rs) {
+                            LoadStoreParams& params, u32 rs,
+                            RegCache::StateSnapshot* host_snap = nullptr) {
+    // [FPMEM_SLOWARM] host_snap != null (stfs/stfsu): the GPR flush is deferred
+    // into the slow arm's host import (emit_fp_gpr_flush); null (stfsx): eager.
+    auto gpr_flush = [&]() {
+        if (host_snap) emit_fp_gpr_flush(rc, params, *host_snap);
+        else           rc.Flush(params.ctx_ptr);
+    };
     const bool noflush = bem_lever_on(BEM_LEVER_FPMEM_NOFLUSH);
     if (noflush && bem_lever_on(BEM_LEVER_STFS_SINGLE) && frc.IsSingle(rs)) {
         auto v = frc.BindSingleRead(rs);
-        rc.Flush(params.ctx_ptr);   // host WRITE32 (slow arm) may read gpr[]
+        gpr_flush();   // host WRITE32 (slow arm) may read gpr[]
         wb.op_local_get(v.v128_idx);
         wb.op_i32x4_extract_lane(0);
         wb.op_local_set(LOCAL_TMP_FPVAL);
         return;
     }
     auto rs_pair = frc.Bind(rs, FPRMode::Read, FPR_LANE_PS0);
-    rc.Flush(params.ctx_ptr);   // host WRITE32 (slow arm) may read gpr[]
+    gpr_flush();   // host WRITE32 (slow arm) may read gpr[]
     if (!noflush) frc.Flush(params.ctx_ptr);
     emit_convert_to_single(wb, rs_pair.ps0_idx);   // single bits -> stack
     wb.op_local_set(LOCAL_TMP_FPVAL);
@@ -1596,7 +1857,10 @@ void emit_stfs(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     const u32 ra   = GekkoOperands::RA(inst);
     const u32 simm = GekkoOperands::SIMM_16(inst);
 
-    emit_ea_d_form(wb, rc, ra, simm);  // EA -> LOCAL_TMP_EA
+    const BaseHoist* hp = (params.hoist && !update && ra != 0) ? params.hoist : nullptr;
+    u32 hra_local = 0;
+    if (hp) hra_local = hoist_begin(wb, rc, *hp, params, ra);   // [BASE_HOIST_FP]
+    else    emit_ea_d_form(wb, rc, ra, simm);  // EA -> LOCAL_TMP_EA
 
     // [perf] fastmem fast-arm — see emit_stfsx. stfs is the highest-frequency
     // FP store the guest makes; this removes the per-store wasm->JS crossing
@@ -1604,14 +1868,27 @@ void emit_stfs(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     // [m00-hunt FIX PM37 2026-07-23] flushes FIRST — see emit_stfsx: parking
     // across frc.Flush let its value-unknown check (slot 98 == LOCAL_TMP_FPVAL)
     // destroy the store value. THE MP4 black-canvas root fix.
-    emit_stfs_value(wb, rc, frc, params, rs);
+    RegCache::StateSnapshot host_snap;
+    emit_stfs_value(wb, rc, frc, params, rs, &host_snap);
 
+    if (hp) {
+        wb.op_local_get(hp->flag_local);
+        wb.op_if(BLOCK_TYPE_VOID);
+            emit_hoist_host_base(wb, *hp, params, hra_local);
+            emit_fastmem_store_at(wb, StoreWidth::U32, LOCAL_TMP_FPVAL, params.mem1_base + simm);
+        wb.op_else();
+            emit_ea_now(wb, hra_local, simm);
+    }
     emit_fastmem_guard(wb, params, 4);
     wb.op_if(BLOCK_TYPE_VOID);
     emit_fastmem_store(wb, params, StoreWidth::U32, LOCAL_TMP_FPVAL);
     wb.op_else();
     emit_slowmem_store(wb, params, StoreWidth::U32, LOCAL_TMP_FPVAL);
     wb.op_end();
+    if (hp) {
+        wb.op_end();
+        return;
+    }
 
     if (update && ra != 0) {
         auto rc_ra = rc.Bind(ra, RCMode::Write);
@@ -1638,9 +1915,13 @@ void emit_lfd(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     const u32 ra   = GekkoOperands::RA(inst);
     const u32 simm = GekkoOperands::SIMM_16(inst);
 
-    emit_ea_d_form(wb, rc, ra, simm);  // EA -> LOCAL_TMP_EA
+    const BaseHoist* hp = (params.hoist && !update && ra != 0) ? params.hoist : nullptr;
+    u32 hra_local = 0;
+    if (hp) hra_local = hoist_begin(wb, rc, *hp, params, ra);   // [BASE_HOIST_FP]
+    else    emit_ea_d_form(wb, rc, ra, simm);  // EA -> LOCAL_TMP_EA
 
-    rc.Flush(params.ctx_ptr);
+    RegCache::StateSnapshot host_snap;
+    emit_fp_gpr_flush(rc, params, host_snap);   // [FPMEM_SLOWARM]
     // [BEM_LEVER_FPMEM_NOFLUSH 2026-10-04] flush-narrow (emit_stfs_value note):
     // the host READ handler never reads ps[]. Measured on SAB's 0x800ed368
     // matrix epilogue: lfd f14 cost 228 executed ops with a few Single FPRs live
@@ -1655,6 +1936,20 @@ void emit_lfd(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     // path that was clearing the IDCT constants' mask bits).
     frc.MarkValueUnknown(rt);
 
+    if (hp) {
+        wb.op_local_get(hp->flag_local);
+        wb.op_if(BLOCK_TYPE_VOID);
+            emit_hoist_host_base(wb, *hp, params, hra_local);
+            wb.op_v128_load64_zero(params.mem1_base + simm, /*align=*/2);
+            emit_v128_shuffle_self(wb, BSWAP64_SHUFFLE);
+            wb.op_i64x2_extract_lane(0);
+            wb.op_local_set(rt_pair.ps0_idx);
+        wb.op_else();
+            emit_ea_now(wb, hra_local, simm);
+            emit_fastmem_lfd_body(wb, params, rt_pair.ps0_idx);
+        wb.op_end();
+        return;
+    }
     emit_fastmem_lfd_body(wb, params, rt_pair.ps0_idx);
 
     if (update && ra != 0) {
@@ -1687,15 +1982,33 @@ void emit_stfd(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     const u32 ra   = GekkoOperands::RA(inst);
     const u32 simm = GekkoOperands::SIMM_16(inst);
 
-    emit_ea_d_form(wb, rc, ra, simm);  // EA -> LOCAL_TMP_EA
+    const BaseHoist* hp = (params.hoist && !update && ra != 0) ? params.hoist : nullptr;
+    u32 hra_local = 0;
+    if (hp) hra_local = hoist_begin(wb, rc, *hp, params, ra);   // [BASE_HOIST_FP]
+    else    emit_ea_d_form(wb, rc, ra, simm);  // EA -> LOCAL_TMP_EA
 
     // Read rs's ps0 lane from cache. No frc.Flush needed for the source
     // (we're reading from the local, not memory).
     auto rs_pair = frc.Bind(rs, FPRMode::Read, FPR_LANE_PS0);
 
     // GPR flush — host WRITE32 (slow arm) may dispatch into MMIO that reads gpr[].
-    rc.Flush(params.ctx_ptr);
+    RegCache::StateSnapshot host_snap;
+    emit_fp_gpr_flush(rc, params, host_snap);   // [FPMEM_SLOWARM]
 
+    if (hp) {
+        wb.op_local_get(hp->flag_local);
+        wb.op_if(BLOCK_TYPE_VOID);
+            emit_hoist_host_base(wb, *hp, params, hra_local);
+            wb.op_local_get(rs_pair.ps0_idx);
+            wb.op_i64x2_splat();
+            emit_v128_shuffle_self(wb, BSWAP64_SHUFFLE);
+            wb.op_v128_store64_lane(params.mem1_base + simm, /*lane=*/0, /*align=*/2);
+        wb.op_else();
+            emit_ea_now(wb, hra_local, simm);
+            emit_fastmem_stfd_body(wb, params, rs_pair.ps0_idx);
+        wb.op_end();
+        return;
+    }
     emit_fastmem_stfd_body(wb, params, rs_pair.ps0_idx);
 
     if (update && ra != 0) {
@@ -1728,6 +2041,18 @@ static constexpr u32 LOCAL_PSQ_F64 = 100;
 // two-i32.load + two-emit_bswap_i32 form had, so the shared v128 assembly at
 // the end of emit_psq_l is untouched. 33 ops -> 15.
 // Precondition: EA in LOCAL_TMP_EA, inside the 8-byte fastmem guard's if-arm.
+// Address operand already on the stack, memarg offset moff.
+static void emit_psq_l_float_pair_simd_at(WasmModuleBuilder& wb, u32 moff) {
+    wb.op_v128_load64_zero(moff, /*align=*/2);   // [w0,w1,0,0], words still guest-BE
+    emit_v128_shuffle_self(wb, BSWAP32X2_SHUFFLE);
+    wb.op_local_tee(LOCAL_PSQ_V);
+    wb.op_i32x4_extract_lane(0);
+    wb.op_local_set(LOCAL_PSQ_T0);            // ps0 f32 bits
+    wb.op_local_get(LOCAL_PSQ_V);
+    wb.op_i32x4_extract_lane(1);
+    wb.op_local_set(LOCAL_PSQ_T1);            // ps1 f32 bits
+}
+
 static void emit_psq_l_float_pair_simd(WasmModuleBuilder& wb, LoadStoreParams params) {
     wb.op_v128_load64_zero(emit_fastmem_host_addr(wb, params), /*align=*/2);   // [w0,w1,0,0], words still guest-BE [FASTMEM_LEAN]
     emit_v128_shuffle_self(wb, BSWAP32X2_SHUFFLE);
@@ -1925,8 +2250,15 @@ void emit_psq_l(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     const u32 I  = (inst >> 12) & 7u;
     const u32 simm12 = (u32)(((s32)(inst << 20)) >> 20);
 
-    emit_ea_d_form(wb, rc, ra, simm12);
-    rc.Flush(params.ctx_ptr);
+    // [BEM_LEVER_BASE_HOIST_FP] a planned member skips the eager EA: the
+    // specialized FLOAT arm branches on the group flag, and every other path
+    // computes EA at its start (emit_ea_now) before its first use.
+    const BaseHoist* hp = (params.hoist && !update && ra != 0) ? params.hoist : nullptr;
+    u32 hra_local = 0;
+    if (hp) hra_local = hoist_begin(wb, rc, *hp, params, ra);
+    else    emit_ea_d_form(wb, rc, ra, simm12);
+    RegCache::StateSnapshot host_snap;
+    emit_fp_gpr_flush(rc, params, host_snap);   // [FPMEM_SLOWARM]
     // [flush-narrow 2026-07-23] NO frc.Flush — same rationale as emit_store_common /
     // emit_psq_st: the slow arm's host READ handler (dolphin_read*) reads gpr[] but
     // never ps[]/FPRs, and every exception/HLE/block-exit point re-flushes FPRs
@@ -1961,24 +2293,42 @@ void emit_psq_l(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
             wb.op_if(BLOCK_TYPE_VOID);
             {
                 // exact mirror of the generic FLOAT arm below.
+                if (hp) {   // [BASE_HOIST_FP] flag true: the fast arm, else the unhoisted arm
+                    wb.op_local_get(hp->flag_local);
+                    wb.op_if(BLOCK_TYPE_VOID);
+                        emit_hoist_host_base(wb, *hp, params, hra_local);
+                        if (W) {
+                            emit_fastmem_load_value_at(wb, LoadWidth::U32,
+                                                       params.mem1_base + simm12);
+                            wb.op_local_set(LOCAL_PSQ_T0);
+                        } else {
+                            emit_psq_l_float_pair_simd_at(wb, params.mem1_base + simm12);
+                        }
+                    wb.op_else();
+                        emit_ea_now(wb, hra_local, simm12);
+                }
                 if (W) {
                     emit_fastmem_guard(wb, params, 4);
                     wb.op_if(BLOCK_TYPE_VOID);
                         emit_fastmem_load_value(wb, params, LoadWidth::U32);
                         wb.op_local_set(LOCAL_PSQ_T0);
                     wb.op_else();
+                        emit_host_call_prep(wb, params);   // [FPMEM_SLOWARM]
                         wb.op_local_get(LOCAL_TMP_EA);
                         wb.op_call(WIMPORT_READ32);
                         wb.op_local_set(LOCAL_PSQ_T0);
                     wb.op_end();
+                    if (!hp) {
                     wb.op_i32_const((s32)0x3F800000);
                     wb.op_local_set(LOCAL_PSQ_T1);
+                    }
                 } else {
                     emit_fastmem_guard(wb, params, 8);
                     wb.op_if(BLOCK_TYPE_VOID);
                         // [simd-bswap 2026-08-29] see the generic FLOAT arm below.
                         emit_psq_l_float_pair_simd(wb, params);
                     wb.op_else();
+                        emit_host_call_prep(wb, params);   // [FPMEM_SLOWARM]
                         wb.op_local_get(LOCAL_TMP_EA);
                         wb.op_call(WIMPORT_READ32);
                         wb.op_local_set(LOCAL_PSQ_T0);
@@ -1989,10 +2339,18 @@ void emit_psq_l(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                         wb.op_local_set(LOCAL_PSQ_T1);
                     wb.op_end();
                 }
+                if (hp) {
+                    wb.op_end();   // [BASE_HOIST_FP] close the flag if
+                    if (W) {
+                        wb.op_i32_const((s32)0x3F800000);
+                        wb.op_local_set(LOCAL_PSQ_T1);
+                    }
+                }
             }
             wb.op_else();   // GQR changed — generic body below
         }
     }
+    if (hp) emit_ea_now(wb, hra_local, simm12);   // [BASE_HOIST_FP] generic body's EA
 
     // gqr -> LOCAL_TMP_VAL (ld_type bits 16-18, ld_scale 24-29)
     wb.op_i32_const((s32)params.ctx_ptr);
@@ -2014,6 +2372,7 @@ void emit_psq_l(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                 emit_fastmem_load_value(wb, params, LoadWidth::U32);
                 wb.op_local_set(LOCAL_PSQ_T0);      // ps0 f32 bits
             wb.op_else();
+                emit_host_call_prep(wb, params);   // [FPMEM_SLOWARM]
                 wb.op_local_get(LOCAL_TMP_EA);
                 wb.op_call(WIMPORT_READ32);
                 wb.op_local_set(LOCAL_PSQ_T0);
@@ -2028,6 +2387,7 @@ void emit_psq_l(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                 // two 11-op emit_bswap_i32. 33 ops -> 15.
                 emit_psq_l_float_pair_simd(wb, params);
             wb.op_else();
+                emit_host_call_prep(wb, params);   // [FPMEM_SLOWARM]
                 wb.op_local_get(LOCAL_TMP_EA);
                 wb.op_call(WIMPORT_READ32);
                 wb.op_local_set(LOCAL_PSQ_T0);          // ps0 f32 bits
@@ -2262,7 +2622,13 @@ void emit_psq_st(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     const u32 I  = (inst >> 12) & 7u;
     const u32 simm12 = (u32)(((s32)(inst << 20)) >> 20);
 
-    emit_ea_d_form(wb, rc, ra, simm12);
+    // [BEM_LEVER_BASE_HOIST_FP] a planned member skips the eager EA: the FLOAT
+    // arm branches on the group flag, and every other path computes EA at its
+    // start (emit_ea_now) before its first use.
+    const BaseHoist* hp = (params.hoist && !update && ra != 0) ? params.hoist : nullptr;
+    u32 hra_local = 0;
+    if (hp) hra_local = hoist_begin(wb, rc, *hp, params, ra);
+    else    emit_ea_d_form(wb, rc, ra, simm12);
     // [psq_st raw-f32 2026-07-14] If rs is Single-repr, bind it as the v128 (BindSingleRead) and
     // read the store value straight from the f32 lanes — skip the Bind promote to Double + the
     // f64->single ConvertToSingleFTZ round-trip. NO frc.Flush (same as emit_store_common's
@@ -2275,7 +2641,8 @@ void emit_psq_st(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         rs_v128 = frc.BindSingleRead(rs).v128_idx;
     else
         rs_pair = frc.Bind(rs, FPRMode::Read, W ? FPR_LANE_PS0 : FPR_LANE_BOTH);
-    rc.Flush(params.ctx_ptr);
+    RegCache::StateSnapshot host_snap;
+    emit_fp_gpr_flush(rc, params, host_snap);   // [FPMEM_SLOWARM]
 
     // Push the FTZ'd single store-bits (i32) for lane `lane` (rs_pair.psN_idx is the Double-form
     // i64 local, used only in the !rs_single path).
@@ -2335,6 +2702,7 @@ void emit_psq_st(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
             wb.op_i32_eq();
             wb.op_if(BLOCK_TYPE_VOID);
             {
+                if (hp) emit_ea_now(wb, hra_local, simm12);   // [BASE_HOIST_FP]
                 const u32 srcs[2] = { rs_pair.ps0_idx, rs_pair.ps1_idx };
                 const u32 outs[2] = { LOCAL_PSQ_T0, LOCAL_PSQ_T1 };
                 const u32 nlanes = W ? 1u : 2u;
@@ -2430,6 +2798,33 @@ void emit_psq_st(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         // branch hand-rolls its WIMPORT_WRITE32s instead of calling
         // emit_slowmem_store. Scratch = LOCAL_PSQ_T1 (dead on this arm; it is
         // the FASTMEM arm's host-base slot, and the two arms are exclusive).
+        if (hp) {   // [BASE_HOIST_FP] flag true: the fast arm, else the unhoisted arm
+            const u32 moff = params.mem1_base + simm12;
+            wb.op_local_get(hp->flag_local);
+            wb.op_if(BLOCK_TYPE_VOID);
+                emit_hoist_host_base(wb, *hp, params, hra_local);
+                if (W) {
+                    emit_store_bits(rs_pair.ps0_idx, 0);
+                    emit_bswap_i32(wb);
+                    wb.op_i32_store(moff);
+                } else if (rs_single) {
+                    emit_ftz_v128(wb, rs_v128);
+                    emit_v128_shuffle_self(wb, BSWAP32X2_SHUFFLE);
+                    wb.op_v128_store64_lane(moff, /*lane=*/0, /*align=*/2);
+                } else {
+                    wb.op_local_set(LOCAL_PSQ_T1);          // host base operand
+                    wb.op_local_get(LOCAL_PSQ_T1);
+                    emit_store_bits(rs_pair.ps0_idx, 0);
+                    emit_bswap_i32(wb);
+                    wb.op_i32_store(moff);
+                    wb.op_local_get(LOCAL_PSQ_T1);
+                    emit_store_bits(rs_pair.ps1_idx, 1);
+                    emit_bswap_i32(wb);
+                    wb.op_i32_store(moff + 4u);
+                }
+            wb.op_else();
+                emit_ea_now(wb, hra_local, simm12);
+        }
         if (W) {
             emit_fastmem_guard(wb, params, 4);
             wb.op_if(BLOCK_TYPE_VOID);
@@ -2492,9 +2887,11 @@ void emit_psq_st(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                     });
             wb.op_end();
         }
+        if (hp) wb.op_end();   // [BASE_HOIST_FP] close the flag if
     }
     wb.op_else();
     {
+        if (hp) emit_ea_now(wb, hra_local, simm12);   // [BASE_HOIST_FP]
         wb.op_local_get(LOCAL_TMP_VAL);
         wb.op_i32_const(4);
         wb.op_i32_and();
@@ -2641,9 +3038,38 @@ void emit_lfs(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     const u32 ra   = GekkoOperands::RA(inst);
     const u32 simm = GekkoOperands::SIMM_16(inst);
 
+    if (params.hoist && !update && ra != 0) {   // [BEM_LEVER_BASE_HOIST_FP]
+        const BaseHoist& h = *params.hoist;
+        const u32 ra_local = hoist_begin(wb, rc, h, params, ra);
+        RegCache::StateSnapshot host_snap;
+        emit_fp_gpr_flush(rc, params, host_snap);   // [FPMEM_SLOWARM]
+        wb.op_local_get(h.flag_local);
+        wb.op_if(BLOCK_TYPE_VOID);
+            emit_hoist_host_base(wb, h, params, ra_local);
+            emit_fastmem_load_value_at(wb, LoadWidth::U32, params.mem1_base + simm);
+            wb.op_local_set(LOCAL_TMP_FPVAL);
+        wb.op_else();
+            emit_ea_now(wb, ra_local, simm);
+            emit_fastmem_guard(wb, params, 4);
+            wb.op_if(BLOCK_TYPE_VOID);
+                emit_fastmem_load_value(wb, params, LoadWidth::U32);
+                wb.op_local_set(LOCAL_TMP_FPVAL);
+            wb.op_else();
+                emit_slowmem_load_value(wb, params, LoadWidth::U32);
+                wb.op_local_set(LOCAL_TMP_FPVAL);
+            wb.op_end();
+        wb.op_end();
+        auto rt_s = frc.BindSingleWrite(rt);
+        wb.op_local_get(LOCAL_TMP_FPVAL);
+        wb.op_f32_reinterpret_i32();
+        wb.op_f32x4_splat();
+        wb.op_local_set(rt_s.v128_idx);
+        return;
+    }
     emit_ea_d_form(wb, rc, ra, simm);
     // [lfs-single PM25] rc.Flush only — see emit_lfsx.
-    rc.Flush(params.ctx_ptr);
+    RegCache::StateSnapshot host_snap;
+    emit_fp_gpr_flush(rc, params, host_snap);   // [FPMEM_SLOWARM]
 
     emit_fastmem_lfs_body_single(wb, params, frc, rt);
 

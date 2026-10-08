@@ -111,6 +111,48 @@ void emit_fcmpu(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     // DVD stall). Always write; the interp fallback always did.
     const u32 fa = GekkoOperands::FA(op.inst);
     const u32 fb = GekkoOperands::FB(op.inst);
+    if (bem_lever2_on(BEM_LEVER2_FCMP_SELECT)) {
+        // [BEM_LEVER2_FCMP_SELECT 2026-10-08] The encodings below are the four
+        // values the bitwise assembly underneath produces (hi32 << 32 | lo32):
+        //   LT: fu=0 lt=1 not_gt=1 ne=1 -> 0xC0000001_00000001
+        //   GT: fu=0 lt=0 not_gt=0 ne=1 -> 0x00000001_00000001
+        //   EQ: fu=0 lt=0 not_gt=1 ne=0 -> 0x80000001_00000000
+        //   UN: fu=1 lt=0 not_gt=1 ne=1 -> 0x88000001_00000001
+        // and exactly one of lt / gt / eq / unordered holds (wasm f64 compares
+        // are all false on NaN), so lt ? LT : gt ? GT : eq ? EQ : UN is the same
+        // u64. A Single-repr operand is read as f64.promote_f32(lane 0): for a
+        // non-NaN f32 that is the PEM widen's value, a NaN stays a NaN, and the
+        // compares see nothing else; the register keeps its Single repr.
+        constexpr u32 FA_F64 = 103u, FB_F64 = 104u;   // jit_fp_helpers LOCAL_FMA_* scratch
+        auto push = [&](u32 f) {
+            if (frc.IsSingle(f)) {
+                wb.op_local_get(frc.BindSingleRead(f).v128_idx);
+                wb.op_f32x4_extract_lane(0);
+                wb.op_f64_promote_f32();
+            } else {
+                wb.op_local_get(frc.Bind(f, FPRMode::Read, FPR_LANE_PS0).ps0_idx);
+                wb.op_f64_reinterpret_i64();
+            }
+        };
+        // Bind both before emitting (a Double Bind may load its lane).
+        if (!frc.IsSingle(fa)) (void)frc.Bind(fa, FPRMode::Read, FPR_LANE_PS0);
+        if (!frc.IsSingle(fb)) (void)frc.Bind(fb, FPRMode::Read, FPR_LANE_PS0);
+        wb.op_i32_const((s32)ctx_ptr);
+        wb.op_i64_const((s64)0xC000000100000001ull);   // LT
+        wb.op_i64_const((s64)0x0000000100000001ull);   // GT
+        wb.op_i64_const((s64)0x8000000100000000ull);   // EQ
+        wb.op_i64_const((s64)0x8800000100000001ull);   // unordered
+        push(fa); wb.op_local_tee(FA_F64);
+        push(fb); wb.op_local_tee(FB_F64);
+        wb.op_f64_eq();
+        wb.op_select();
+        wb.op_local_get(FA_F64); wb.op_local_get(FB_F64); wb.op_f64_gt();
+        wb.op_select();
+        wb.op_local_get(FA_F64); wb.op_local_get(FB_F64); wb.op_f64_lt();
+        wb.op_select();
+        wb.op_i64_store(ppc_off::cr(crfd));
+        return;
+    }
     auto fa_pair = frc.Bind(fa, FPRMode::Read, FPR_LANE_PS0);
     auto fb_pair = frc.Bind(fb, FPRMode::Read, FPR_LANE_PS0);
     const u32 A = fa_pair.ps0_idx, B = fb_pair.ps0_idx;

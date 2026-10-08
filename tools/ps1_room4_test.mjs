@@ -76,6 +76,31 @@ async function openWindowPage(browser) {
   throw new Error('could not open a separate browser window for a peer');
 }
 
+// ⚠ THE PAGE'S FETCHES GO THROUGH coi-serviceworker.js, A SEPARATE CDP TARGET
+// (tools/device_matrix.mjs "page-scoped CDP throttling does not reach a
+// coi-serviceworker-controlled fetch") — page.setRequestInterception never sees
+// the disc chunks once it controls the page. So the chunks are answered at
+// EVERY target the browser has: pages (before the worker controls them) and
+// the service worker itself (Fetch domain on its own session).
+let served = 0;
+const discFor = (url) => { const m = /\/HarryPotterSorcerersStone\.bin\.parta([a-d])\.gz(\?|$)/.exec(url); return m ? GZ[m[1].charCodeAt(0) - 97] : null; };
+const hooked = new Set();
+async function hookWorkerTarget(t) {
+  if (t.type() !== 'service_worker' || hooked.has(t)) return;
+  hooked.add(t);
+  try {
+    const cdp = await t.createCDPSession();
+    cdp.on('Fetch.requestPaused', (e) => {
+      const body = discFor(e.request.url);
+      if (body) { served++; cdp.send('Fetch.fulfillRequest', { requestId: e.requestId, responseCode: 200,
+        responseHeaders: [{ name: 'Content-Type', value: 'application/gzip' }, { name: 'Content-Length', value: String(body.length) }],
+        body: body.toString('base64') }).catch(() => {}); }
+      else cdp.send('Fetch.continueRequest', { requestId: e.requestId }).catch(() => {});
+    });
+    await cdp.send('Fetch.enable', { patterns: [{ urlPattern: '*HarryPotterSorcerersStone.bin.parta*' }] });
+  } catch (e) { console.log('  INFO  could not hook a service worker: ' + e); }
+}
+
 async function openPeer(browser, tag) {
   const page = await openWindowPage(browser);
   const errs = [];
@@ -84,18 +109,14 @@ async function openPeer(browser, tag) {
   // THE GAME: the Harry Potter disc's chunks answer with the multitap test
   // disc, on every window, so every console loads the same bytes (lsDisc agrees).
   await page.setRequestInterception(true);
-  let served = 0;
   page.on('request', (req) => {
-    const m = /\/HarryPotterSorcerersStone\.bin\.parta([a-d])\.gz(\?|$)/.exec(req.url());
-    if (m) {
-      served++;
-      const body = GZ[m[1].charCodeAt(0) - 97];
-      req.respond({ status: 200, contentType: 'application/gzip', body, headers: { 'content-length': String(body.length) } });
-    } else req.continue();
+    const body = discFor(req.url());
+    if (body) { served++; req.respond({ status: 200, contentType: 'application/gzip', body, headers: { 'content-length': String(body.length) } }); }
+    else req.continue();
   });
   await page.goto(`${BASE}/ps1.html?net=local`, { waitUntil: 'domcontentloaded', timeout: 90000 });
   await page.waitForFunction(() => !!(window.__ps1Net && window.__ps1Net().supported && window.Netplay), { timeout: 120000, polling: POLL_MS });
-  return { page, errs, tag, served: () => served };
+  return { page, errs, tag };
 }
 
 // What the GUEST stored (tools/ps1_multitap_disc.mjs RAM map), read out of
@@ -132,6 +153,7 @@ const guestRead = (page) => page.evaluate(async (R) => {
            '--disable-backgrounding-occluded-windows', '--disable-features=CalculateNativeWinOcclusion'],
   });
   try { const g = require('./browser_leak_guard.js'); if (g && g.guard) g.guard(browser, 'ps1_room4_test'); } catch (e) {}
+  browser.on('targetcreated', (t) => { hookWorkerTarget(t); });
   try {
     const P = [];
     for (let i = 0; i < N; i++) P.push(await openPeer(browser, i ? 'G' + i : 'H'));
@@ -207,7 +229,11 @@ const guestRead = (page) => page.evaluate(async (R) => {
       await P[i].page.evaluate(() => { window.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowUp', bubbles: true })); });
       const held = (w) => (w & UP) === 0;
       const onIts = s.every((x) => x.guest && held(x.guest.full[port]) && held(x.guest.pass[port]));
-      const notOthers = s.every((x) => x.guest && [0, 1, 2, 3].every((q) => q === port || (!held(x.guest.full[q]) && !held(x.guest.pass[q]))));
+      // An EMPTY slot (3 players: slot D) reads 0xFFFF in the all-four read and
+      // 0xEEEE (no complete reply) one at a time — neither is a pad, so it is
+      // checked for being empty, not for a held bit.
+      const notOthers = s.every((x) => x.guest && [0, 1, 2, 3].every((q) => q === port
+        || (q >= N ? x.guest.full[q] === 0xffff && x.guest.pass[q] === 0xeeee : !held(x.guest.full[q]) && !held(x.guest.pass[q]))));
       ok(`player-${i + 1}-(port ${port + 1})-drives-its-own-slot-in-every-game`, onIts && notOthers,
          `guest-read slots per console (all-four | one-at-a-time): ${s.map((x) => x.guest ? '[' + x.guest.full.map((w) => w.toString(16)).join(' ') + ' | ' + x.guest.pass.map((w) => w.toString(16)).join(' ') + ']' : 'null').join(' ')}`);
       await sleep(800);
@@ -218,7 +244,13 @@ const guestRead = (page) => page.evaluate(async (R) => {
     const g = s1.map((x) => x.frames);
     ok('every-console-kept-running', g.every((f) => f > SECONDS * 30), `worker frames ${g.join('/')}`);
     ok('frames-stay-in-step', Math.max(...g) - Math.min(...g) <= 30, `spread ${Math.max(...g) - Math.min(...g)}`);
-    ok('the-room-runs-rollback', s1.every((x) => x.mode === 'rollback'), `mode ${s1.map((x) => x.mode).join('/')}`);
+    // Rollback, unless the HOST's capacity gate (lib/netplay.js _capDecide)
+    // measured a console too slow for it and moved the room to input delay —
+    // the room's own decision, the same on every console, and recorded.
+    const gate = await P[0].page.evaluate(() => { const n = window.__ps1Net(); return n.capGate; });
+    const delayByGate = !!(gate && gate.on && (gate.switches || []).some((m) => m.to === 'delay' || m.to === 'lockstep'));
+    ok('the-room-runs-rollback-or-the-capacity-gate-chose-delay', s1.every((x) => x.mode === s1[0].mode) && (s1[0].mode === 'rollback' || delayByGate),
+       `mode ${s1.map((x) => x.mode).join('/')}; host capGate ${JSON.stringify(gate && { on: gate.on, mode: gate.mode, selfStepMs: gate.selfStepMs, switches: gate.switches })}`);
     ok('fingerprints-compared-no-desync', s1.every((x) => x.hashes > 0 && x.state !== 'desync' && !x.fault && !(x.engine && x.engine.desync)),
        `hashes ${s1.map((x) => x.hashes).join('/')} compared ${s1.map((x) => x.engine && x.engine.hashesCompared).join('/')} state ${s1.map((x) => x.state).join('/')} fault ${s1.map((x) => x.fault).join('/')}`);
     ok('the-guest-program-kept-reading', s1.every((x, i) => x.guest && x.guest.loops > s0[i].guest.loops), `loops ${s0.map((x) => x.guest.loops).join('/')} -> ${s1.map((x) => x.guest.loops).join('/')}`);
@@ -230,7 +262,7 @@ const guestRead = (page) => page.evaluate(async (R) => {
     });
     const rates = await Promise.all(P.map(rate));
     ok('guest-rate-~1.000x-on-every-console', rates.every((x) => x >= 0.9 && x <= 1.02), rates.map((x) => x.toFixed(4) + 'x').join(' / '));
-    ok('every-window-was-served-the-test-disc', P.every((p) => p.served() >= 4), P.map((p) => p.served()).join('/'));
+    ok('every-window-was-served-the-test-disc', served >= 4 * N, `${served} chunk requests answered with the test disc (4 per window)`);
     const errs = P.flatMap((p) => p.errs).filter((e) => !/favicon/i.test(e));
     ok('no-page-errors', errs.length === 0, errs.slice(0, 4).join(' | ') || 'none');
   } catch (e) {

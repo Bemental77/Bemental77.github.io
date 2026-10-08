@@ -116,9 +116,15 @@ static void emit_coalesced_taken_exit(WasmModuleBuilder& wb, u32 ctx_ptr, u32 ta
         // flush), so guest state is unchanged; only the host round trip goes.
         // The taken arm is inside a void `if`, and every path out of
         // emit_chain_or_return returns, so no stack value is left behind.
+        // [BEM_LEVER_KNOWN_PC_CHAIN 2026-10-08] PC == target was stored just
+        // above, so the static arm needs no ctx.PC reload/compare to select it.
+        if (bem_lever_on(BEM_LEVER_STATIC_CHAIN) && bem_lever_on(BEM_LEVER_KNOWN_PC_CHAIN)) {
+            emit_chain_known_pc(wb, ctx_ptr, target);
+        } else {
         const u32 st[1] = { target };
         emit_chain_or_return(wb, ctx_ptr, 0u, 0u, nullptr, -1, nullptr, nullptr, 0u,
                              (u16)BEM_RSYM_NONE, (u16)BEM_RSYM_NONE, st, 1u);
+        }
     } else {
         emit_exit_census_jb(wb, 0x026B34D8u);   // [census] only the non-merged op_return path (post-fix: taken collapses)
         wb.op_i32_const((s32)ctx_ptr);
@@ -338,15 +344,28 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
     // instead of here AND again there when it is rewritten in between.
     const bool gpr_exit_flush = !is_terminal && !merged && region_gen < 0 &&
                                 bem_lever_on(BEM_LEVER_GPR_EXIT_FLUSH);
+    // [BEM_LEVER_FPR_EXIT_FLUSH 2026-10-07] the same for FPRs: the taken arm
+    // flushes them (an exiting flush: the arm returns or tail-calls), the
+    // fall-through keeps every Single resident and dirty. Mid-block plain bodies
+    // with no caller-owned skip set only.
+    const bool fpr_exit_flush = !is_terminal && !merged && region_gen < 0 &&
+                                fpr_flush_skip.m_val == 0u &&
+                                bem_lever_on(BEM_LEVER_FPR_EXIT_FLUSH);
     if (!gpr_exit_flush) rc.Flush(ctx_ptr);
-    frc.Flush(ctx_ptr, BitSet32(~fpr_flush_skip.m_val));
+    if (!fpr_exit_flush) frc.Flush(ctx_ptr, BitSet32(~fpr_flush_skip.m_val));
+    struct ExitSnap { RegCache::StateSnapshot g{}; FPRRegCache::StateSnapshot f{}; };
     auto taken_gpr_flush_begin = [&]() {
-        RegCache::StateSnapshot snap{};
-        if (gpr_exit_flush) { snap = rc.SaveState(); rc.Flush(ctx_ptr); }
+        ExitSnap snap{};
+        if (gpr_exit_flush) { snap.g = rc.SaveState(); rc.Flush(ctx_ptr); }
+        if (fpr_exit_flush) {
+            snap.f = frc.SaveState();
+            frc.Flush(ctx_ptr, BitSet32(0xFFFFFFFFu), FPR_LANE_BOTH, /*exiting=*/true);
+        }
         return snap;
     };
-    auto taken_gpr_flush_end = [&](const RegCache::StateSnapshot& snap) {
-        if (gpr_exit_flush) rc.RestoreState(snap);
+    auto taken_gpr_flush_end = [&](const ExitSnap& snap) {
+        if (gpr_exit_flush) rc.RestoreState(snap.g);
+        if (fpr_exit_flush) frc.RestoreState(snap.f);
     };
 
     if (bo == 20) {
@@ -450,9 +469,75 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
     // fall back to the interpreter (unchanged behavior). ppc_state.pc is
     // written by interp; these terminals still rely on that path.
     if (gpr_exit_flush) rc.Flush(ctx_ptr);   // the interpreter reads gpr[]
+    if (fpr_exit_flush) frc.Flush(ctx_ptr);
     wb.op_i32_const((s32)inst);
     wb.op_i32_const((s32)op.address);
     wb.op_call(WIMPORT_INTERP);
+}
+
+bool bcx_terminal_split_form(u32 inst) {
+    if (GekkoOperands::OPCD(inst) != 16u) return false;
+    const u32 bo = GekkoOperands::BO(inst);
+    const bool lk = GekkoOperands::LK(inst);
+    if (bo == 20u) return true;
+    if (lk) return false;
+    return bo == 0b10000u || bo == 0b10010u || (bo & 0b10100u) == 0b00100u;
+}
+
+// Same flushes, condition and PC stores as emit_bcx(is_terminal=true) for these
+// forms; the only difference is that each arm continues into tail(its pc).
+void emit_bcx_terminal_split(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
+                             const CodeOp& op, u32 ctx_ptr, const CmpFuse* fuse,
+                             const std::function<void(u32)>& tail) {
+    const u32 inst = op.inst;
+    const u32 bo   = GekkoOperands::BO(inst);
+    rc.Flush(ctx_ptr);
+    frc.Flush(ctx_ptr, BitSet32(0xFFFFFFFFu));
+    if (bo == 20) {
+        const u32 bd   = GekkoOperands::BD(inst);
+        const bool aa  = GekkoOperands::AA(inst);
+        const bool lk  = GekkoOperands::LK(inst);
+        const u32 target = aa ? bd : (op.address + bd);
+        if (lk) emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::lr_off(), op.address + 4);
+        emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, target);
+        tail(target);
+        return;
+    }
+    const u32  bi  = GekkoOperands::BI(inst);
+    const s32  bd  = GekkoOperands::BD(inst);
+    const bool aa  = GekkoOperands::AA(inst);
+    const u32  target      = aa ? (u32)bd : (u32)((s32)op.address + bd);
+    const u32  fallthrough = op.address + 4u;
+    constexpr u32 LOCAL_TMP_A = 0u;
+    if (bo == 0b10000u || bo == 0b10010u) {
+        const bool is_bdnz = (bo == 0b10000u);
+        wb.op_i32_const((s32)ctx_ptr);
+        wb.op_i32_const((s32)ctx_ptr);
+        wb.op_i32_load(ppc_off::ctr_off());
+        wb.op_i32_const(1);
+        wb.op_i32_sub();
+        wb.op_local_tee(LOCAL_TMP_A);
+        wb.op_i32_store(ppc_off::ctr_off());
+        wb.op_local_get(LOCAL_TMP_A);
+        wb.op_i32_const(0);
+        if (is_bdnz) wb.op_i32_ne(); else wb.op_i32_eq();
+    } else {
+        const bool branch_if_true = (bo & 0b01000u) != 0u;
+        const u32 field_idx    = bi / 4u;
+        const u32 bit_in_field = bi % 4u;
+        if (fuse && fuse->valid && fuse->crfd == field_idx && bit_in_field != 3u)
+            emit_crbit_fused(wb, *fuse, bit_in_field);
+        else
+            emit_crbit_test(wb, ctx_ptr, bi);
+        if (!branch_if_true) wb.op_i32_eqz();
+    }
+    wb.op_if();
+        emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, target);
+        tail(target);
+    wb.op_else();
+        emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, fallthrough);
+        tail(fallthrough);
+    wb.op_end();
 }
 
 // ---------------------------------------------------------------------------

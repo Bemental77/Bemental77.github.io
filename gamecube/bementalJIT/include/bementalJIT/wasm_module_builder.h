@@ -707,6 +707,10 @@ public:
 	// opcode table: f64x2.lt 0x49, f64x2.abs 0xEC, f64x2.mul 0xF2).
 	void op_f64x2_lt()           { emitByte(V128_PREFIX); emitLEB128(0x49u); }
 	void op_i32x4_eq()           { emitByte(V128_PREFIX); emitLEB128(0x37u); }   // spec opcode 0x37
+	void op_i32x4_ge_u()         { emitByte(V128_PREFIX); emitLEB128(0x40u); }   // spec opcode 0x40
+	void op_i32x4_max_u()        { emitByte(V128_PREFIX); emitLEB128(0xB9u); }   // spec opcode 0xB9
+	void op_f64x2_eq()           { emitByte(V128_PREFIX); emitLEB128(0x47u); }   // spec opcode 0x47
+	void op_i64x2_all_true()     { emitByte(V128_PREFIX); emitLEB128(0xC3u); }   // spec opcode 0xC3
 	void op_f64x2_abs()          { emitByte(V128_PREFIX); emitLEB128(0xECu); }
 	void op_f64x2_mul()          { emitByte(V128_PREFIX); emitLEB128(0xF2u); }
 	// v128.const with both i64 lanes equal; 16 literal bytes, each lane LE.

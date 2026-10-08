@@ -78,8 +78,44 @@ void RegCache::EmitPrologueLoads(u32 ctx_ptr) {
 // Bind — return a RAII handle for the local backing preg, ensuring its
 // prologue-load has been emitted (lazy fill).
 // ---------------------------------------------------------------------------
+void RegCache::EmitPendingLoads(u32 ctx_ptr, u32 mask) {
+    for (u32 i = 0; i < 32; ++i) {
+        if (!((mask >> i) & 1u)) continue;
+        PregState& s = m_state[i];
+        if (!s.assigned || s.loaded) continue;
+        m_wb.op_i32_const((s32)ctx_ptr);
+        m_wb.op_i32_load(ppc_gpr_off(i));
+        m_wb.op_local_set(s.local_idx);
+        s.loaded = true;
+    }
+}
+
 RCWasmLocal RegCache::Bind(u32 preg, RCMode mode) {
     PregState& s = m_state[preg];
+    if (m_poison && s.assigned && !s.loaded) {
+        // [BEM_LEVER_LAZY_LIVEIN] a deferred live-in not covered by the op's
+        // EmitPendingLoads. A pure write of a reg the op does not read defines
+        // it without the old value (BEM_LEVER_WRITE_NOLOAD's rule, here for a
+        // live-in); anything else loads now, which is only sound at the op's
+        // top-level depth.
+        if (mode == RCMode::Write && !((m_op_reads >> preg) & 1u) &&
+            bem_lever_on(BEM_LEVER_WRITE_NOLOAD)) {
+            s.loaded = true;
+            s.dirty  = true;
+            s.is_imm = false;
+            return RCWasmLocal(this, s.local_idx, preg, mode);
+        }
+        if (m_wb.ctrlDepth() != m_op_depth) *m_poison = true;
+        m_wb.op_i32_const((s32)m_lazy_ctx_ptr);
+        m_wb.op_i32_load(ppc_gpr_off(preg));
+        m_wb.op_local_set(s.local_idx);
+        s.loaded = true;
+        if (mode == RCMode::Write || mode == RCMode::ReadWrite) {
+            s.dirty  = true;
+            s.is_imm = false;
+        }
+        return RCWasmLocal(this, s.local_idx, preg, mode);
+    }
     if (!s.assigned) {
         // Analyzer didn't mark preg as live-in. Previously: silently
         // fabricated u32{0} as the value (s.loaded=true with no load).
