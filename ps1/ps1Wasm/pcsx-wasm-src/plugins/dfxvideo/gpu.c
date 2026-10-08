@@ -30,6 +30,7 @@
 #include "psemu_plugin_defs.h"
 #include "menu.h"
 #include "key.h"
+#include "urdirty.h"
 #include "fps.h"
 #include "swap.h"
 
@@ -337,6 +338,9 @@ long CALLBACK GPUinit()                                // GPU INIT
  psxVuw_eom=psxVuw+1024*iGPUHeight;                    // pre-calc of end of vram
 
  memset(psxVSecure,0x00,(iGPUHeight*2)*1024 + (1024*1024));
+ // urdirty.h: all of VRAM and the security margins around it; every write
+ // path below marks the pages it writes.
+ ur_track(UR_SPAN_VRAM, psxVSecure, (iGPUHeight*2)*1024 + (1024*1024));
  memset(lGPUInfoVals,0x00,16*sizeof(uint32_t));
 
  SetFPSHandler();
@@ -1221,6 +1225,21 @@ const unsigned char primTableCX[256] =
     0,0,0,0,0,0,0,0
 };
 
+// urdirty.h: the VRAM rows of the drawing area, once per clear generation
+// unless the area grew. The cache (generation, first row, last row) is in
+// ur_scratch, NOT in statics: see urdirty.h.
+static void urMarkDrawArea(void)
+{
+ uint32_t *c = ur_scratch;
+ int a = drawY < drawH ? drawY : drawH, b = drawY < drawH ? drawH : drawY;
+ if(a < 0) a = 0;
+ if(b > iGPUHeight - 1) b = iGPUHeight - 1;
+ if(c[0] == ur_gen() && c[3] && a >= (int)c[1] && b <= (int)c[2]) return;
+ if(c[0] != ur_gen() || !c[3]) { c[0] = ur_gen(); c[1] = a; c[2] = b; c[3] = 1; }
+ else { if(a < (int)c[1]) c[1] = a; if(b > (int)c[2]) c[2] = b; }
+ ur_mark_range(psxVub + a * 2048, (size_t)(b - a + 1) * 2048);
+}
+
 void CALLBACK GPUwriteDataMem(uint32_t * pMem, int iSize)
 {
  unsigned char command;
@@ -1251,7 +1270,7 @@ STARTVRAM:
 
        gdata=GETLE32(pMem); pMem++;
 
-       PUTLE16(VRAMWrite.ImagePtr, (unsigned short)gdata); VRAMWrite.ImagePtr++;
+       UR_MARK(VRAMWrite.ImagePtr); PUTLE16(VRAMWrite.ImagePtr, (unsigned short)gdata); VRAMWrite.ImagePtr++;
        if(VRAMWrite.ImagePtr>=psxVuw_eom) VRAMWrite.ImagePtr-=iGPUHeight*1024;
        VRAMWrite.RowsRemaining --;
 
@@ -1269,7 +1288,7 @@ STARTVRAM:
          VRAMWrite.ImagePtr += 1024 - VRAMWrite.Width;
         }
 
-       PUTLE16(VRAMWrite.ImagePtr, (unsigned short)(gdata>>16)); VRAMWrite.ImagePtr++;
+       UR_MARK(VRAMWrite.ImagePtr); PUTLE16(VRAMWrite.ImagePtr, (unsigned short)(gdata>>16)); VRAMWrite.ImagePtr++;
        if(VRAMWrite.ImagePtr>=psxVuw_eom) VRAMWrite.ImagePtr-=iGPUHeight*1024;
        VRAMWrite.RowsRemaining --;
       }
@@ -1332,6 +1351,9 @@ ENDVRAM:
       {
        gpuDataC=gpuDataP=0;
        primFunc[gpuCommand]((unsigned char *)gpuDataM);
+       // a polygon / line / rectangle writes only inside the drawing area
+       // (soft.c clips every one of them to drawY..drawH): mark its rows
+       if(gpuCommand>=0x20 && gpuCommand<0x80) urMarkDrawArea();
        if(dwEmuFixes&0x0001 || dwActFixes&0x0400)      // hack for emulating "gpu busy" in some games
         iFakePrimBusy=4;
       }
@@ -1509,6 +1531,7 @@ long CALLBACK GPUfreeze(uint32_t ulGetFreezeData,GPUFreeze_t * pF)
  lGPUstatusRet=pF->ulStatus;
  memcpy(ulStatusControl,pF->ulControl,256*sizeof(uint32_t));
  memcpy(psxVub,         pF->psxVRam,  1024*iGPUHeight*2);
+ ur_mark_span(UR_SPAN_VRAM);
 
 // RESET TEXTURE STORE HERE, IF YOU USE SOMETHING LIKE THAT
 

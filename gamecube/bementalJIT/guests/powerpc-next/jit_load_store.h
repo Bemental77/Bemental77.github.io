@@ -67,6 +67,21 @@ struct BaseHoist {
     bool* poison = nullptr;      // set when a member runs at another depth
 };
 
+// [BEM_LEVER2_GP_FIRST] a run of >= 2 consecutive const-EA write-gather-pipe
+// integer stores (emit_store_d's carve-out): the head reads the pipe cursor
+// and the CPU-owner test once into two locals; every member appends at
+// cursor + off; the last advances the cursor by `total`, sets the dirty flag
+// and runs the one boundary check.
+struct GpRun {
+    bool head = false, last = false;
+    u32  off = 0, total = 0;
+    u32  ok_local = 0, p_local = 0;
+};
+
+// The ops emit_store_d sends down its const-EA write-gather-pipe carve-out.
+bool IsConstGpCarveStore(const CodeOp& op, u32 lc_base);
+u32  ConstGpStoreBytes(const CodeOp& op);
+
 struct LoadStoreParams {
     u32 ctx_ptr   = 0;   // PowerPCState address in host linear memory
     u32 mem1_base = 0;   // host pointer to MEM1 (0 disables fastmem entirely)
@@ -101,6 +116,8 @@ struct LoadStoreParams {
     const RegCache::StateSnapshot* host_rc_snap = nullptr;
     // [BEM_LEVER_BASE_HOIST] non-null only for a planned group member.
     const BaseHoist* hoist = nullptr;
+    // [BEM_LEVER2_GP_FIRST] non-null only for a member of a const-EA GP run.
+    const GpRun* gp_run = nullptr;
 };
 
 // WASM import indices. Match the existing live-tree contract in

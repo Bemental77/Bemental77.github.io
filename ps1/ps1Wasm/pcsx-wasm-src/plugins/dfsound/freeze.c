@@ -16,6 +16,7 @@
  ***************************************************************************/
 
 #include "stdafx.h"
+#include "urdirty.h"
 
 #define _IN_FREEZE
 
@@ -121,6 +122,7 @@ long CALLBACK SPUfreeze(uint32_t ulFreezeMode,SPUFreeze_t * pF)
  RemoveTimer();                                        // we stop processing while doing the save!
 
  memcpy(spuMem,pF->cSPURam,0x80000);                   // get ram
+ ur_mark_range(spuMem, 0x80000);
  memcpy(regArea,pF->cSPUPort,0x200);
 
  if(pF->xaS.nsamples<=4032)                            // start xa again

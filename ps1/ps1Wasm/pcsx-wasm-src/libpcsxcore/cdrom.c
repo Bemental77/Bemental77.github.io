@@ -21,6 +21,7 @@
 * Handles all CD-ROM registers and functions.
 */
 
+#include "urdirty.h"
 #include "cdrom.h"
 #include "ppf.h"
 
@@ -1100,6 +1101,7 @@ void psxDma3(u32 madr, u32 bcr, u32 chcr) {
 				break;
 			}
 			memcpy(ptr, cdr.pTransfer, cdsize);
+			ur_mark_range(ptr, cdsize);
 			psxCpu->Clear(madr, cdsize / 4);
 			cdr.pTransfer += cdsize;
 			break;

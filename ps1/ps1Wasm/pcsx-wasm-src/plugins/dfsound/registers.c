@@ -16,6 +16,7 @@
  ***************************************************************************/
 
 #include "stdafx.h"
+#include "urdirty.h"
 
 #define _IN_REGISTERS
 
@@ -181,6 +182,7 @@ void CALLBACK SPUwriteRegister(unsigned long reg, unsigned short val)
     //-------------------------------------------------//
     case H_SPUdata:
       spuMem[spuAddr>>1] = val;
+      UR_MARK(&spuMem[spuAddr>>1]);
       spuAddr+=2;
       if(spuAddr>0x7ffff) spuAddr=0;
       break;

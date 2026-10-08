@@ -90,6 +90,19 @@ window.__start = function (opts) {
   return true;
 };
 
+// opts.parts > 0: the WHOLE disc, parts parta{a..} of opts.url concatenated, as
+// ps1.html loads it (Monster Rancher 2's first 89 MB alone never draws a picture).
+async function fetchOptsDisc(opts) {
+  if (!(opts.parts > 0)) return fetchDisc(opts.url, opts.bytes);
+  const bufs = []; let tot = 0;
+  for (let i = 0; i < opts.parts; i++) {
+    const b = await fetchDisc(opts.url.replace(/parta[a-z](?=\.bin|\.gz|$)/, 'parta' + String.fromCharCode(97 + i)), 1 << 30);
+    bufs.push(b); tot += b.length;
+  }
+  const out = new Uint8Array(tot); let o = 0;
+  for (const b of bufs) { out.set(b, o); o += b.length; }
+  return out;
+}
 async function fetchDisc(url, maxBytes) {
   const resp = await fetch(url);
   const ds = resp.body.pipeThrough(new DecompressionStream('gzip'));
@@ -106,7 +119,7 @@ window.__run = async function (opts) {
   const N = opts.frames | 0, EVERY = opts.every | 0, MAXLAG = opts.maxLag | 0, RING = opts.ring | 0, WARM = opts.warm | 0;
   const P2 = opts.p2 !== false;   // is port 2 the "remote" (predicted) one
   log('fetching disc chunk ' + opts.url);
-  const disc = await fetchDisc(opts.url, opts.bytes);
+  const disc = await fetchOptsDisc(opts);
   log('disc bytes ' + disc.length);
   const A = mkWorker(), B = mkWorker();
   const t0 = performance.now();
@@ -234,7 +247,12 @@ window.__run = async function (opts) {
   const pct = (a, p) => { if (!a.length) return null; const s = a.slice().sort((x, y) => x - y); return +s[Math.min(s.length - 1, Math.floor(p * s.length))].toFixed(2); };
   const compared = checks.filter(c => c.a !== undefined).length;
   return {
-    ok: mismatches === 0 && compared > 0 && missing === 0,
+    // trackMiss: with ?urcheck=1 the worker runs the full page compare beside the
+    // write-tracked one on every save and counts what the tracked one missed — any
+    // is a page of a rollback log lost (dist/wasmpsx_worker.js THE CORE TRACKS ITS
+    // OWN WRITES). null when the worker has no tracking or the check is off.
+    ok: mismatches === 0 && compared > 0 && missing === 0 && !(stats.trackMiss > 0),
+    trackMiss: stats.trackMiss, trackMissAt: stats.trackMissAt,
     frames: N, warm: WARM, maxLag: MAXLAG, ring: RING,
     compared, mismatches, missing, rollbacks, resimFrames, maxDepth,
     switchEvery: SW, switches, rearms, delayFrames, remeasured, comparedAcrossRearm: checks.filter(c => c.a !== undefined && !c.live && SW > 0 && Math.floor((c.frame - WARM) / SW) >= 2).length,
@@ -287,7 +305,7 @@ function b64bytes(b64) { const s = atob(b64), u = new Uint8Array(s.length); for 
 window.__runN = async function (opts) {
   const N = opts.frames | 0, EVERY = opts.every | 0, MAXLAG = opts.maxLag | 0, RING = opts.ring | 0, WARM = opts.warm | 0;
   const P = opts.players | 0, PORTS = 4;
-  const disc = opts.discB64 ? b64bytes(opts.discB64) : await fetchDisc(opts.url, opts.bytes);
+  const disc = opts.discB64 ? b64bytes(opts.discB64) : await fetchOptsDisc(opts);
   log('players ' + P + ', disc bytes ' + disc.length + (opts.broken ? ' [BROKEN]' : '') + (opts.brokenMt ? ' [BROKEN-MT]' : '') + (opts.mtPoke ? ' [MT-POKE ' + opts.mtPoke + ']' : ''));
   const truthImg = (f, quiet) => { const r = []; for (let p = 0; p < PORTS; p++) r.push(truePadN(f, p < P ? p : -1, quiet)); return r; };
   async function bootCore(slots) {
@@ -375,6 +393,8 @@ window.__runN = async function (opts) {
   }
   const consoleStats = S.map((s) => ({ port: s.c, rollbacks: s.rollbacks, resimFrames: s.resimFrames, maxDepth: s.maxDepth, pokes: s.pokes,
                                        compared: s.checks.filter(c => c.a !== undefined).length }));
+  for (let i = 0; i < S.length; i++) { const ws = await ask(C[i], 'netRbStatsResult', { cmd: 'netRbStats' }); consoleStats[i].trackMiss = ws.trackMiss; consoleStats[i].trackMissAt = ws.trackMissAt; }
+  const trackMiss = consoleStats.some((c) => c.trackMiss != null) ? consoleStats.reduce((a, c) => a + (c.trackMiss | 0), 0) : null;
   for (const st of C) st.w.terminate();
   // ── teeth ──
   const teeth = { ports: [], noMultitap: null };
@@ -393,7 +413,8 @@ window.__runN = async function (opts) {
   const pct = (a, q) => { if (!a.length) return null; const s = a.slice().sort((x, y) => x - y); return +s[Math.min(s.length - 1, Math.floor(q * s.length))].toFixed(2); };
   return {
     ok: mismatches === 0 && missing === 0 && compared > 0 && consoleStats.every((c) => c.compared > 0 && c.rollbacks > 0) && teethOk
-        && (!opts.mtPoke || consoleStats.every((c) => c.pokes > 0)),
+        && (!opts.mtPoke || consoleStats.every((c) => c.pokes > 0)) && !(trackMiss > 0),
+    trackMiss,
     players: P, frames: N, warm: WARM, maxLag: MAXLAG, ring: RING, compared, mismatches, missing,
     multitap: { reference: A.mt, consoles: S[0].st.mt }, consoles: consoleStats, teeth, teethOk,
     stepMs: { p50: pct(stepMs, .5), p99: pct(stepMs, .99), max: pct(stepMs, 1), n: stepMs.length },

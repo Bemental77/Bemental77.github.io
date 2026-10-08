@@ -12,6 +12,7 @@
 #include "bementalJIT/wasm_module_builder.h"
 #include "ppc_offsets.h"
 #include "cr_shadow.h"
+#include "jit_compare.h"   // [BEM_LEVER2_CR_SINK]
 #include "lever_gate.h"
 
 namespace bemental::powerpc {
@@ -311,8 +312,21 @@ void emit_cr_from_unsigned_pair(WasmModuleBuilder& wb, u32 ctx_ptr,
     wb.op_i64_store(ppc_off::cr(crfd));
 }
 
+CmpFuse* g_bem_rc_sink = nullptr;
+
 void emit_cr0_from_local(WasmModuleBuilder& wb, u32 ctx_ptr,
                          u32 value_local) {
+    if (g_bem_rc_sink && g_bem_rc_sink->sink_req && bem_cr_lean_on()) {
+        // [BEM_LEVER2_CR_SINK] cr0 of an Rc=1 result IS cmpi cr0, value, 0:
+        // emit_cr_lean(VS0) and emit_cr_from_pair_imm(b = 0, signed) emit the
+        // same ops, so the pending record is that cmpi.
+        CmpFuse& f = *g_bem_rc_sink;
+        f.crfd = 0u; f.a_local = value_local; f.b_local = 0u; f.imm = 0;
+        f.is_imm = true; f.is_signed = true;
+        emit_cmp_sink_pend(wb, f);
+        g_bem_rc_sink = nullptr;
+        return;
+    }
     // [PM56 lazy-CR Stage 6a] gated: defer (RC_VS0) when lazy-CR is on, else
     // the eager build (shipping default). See BEM_LAZY_CR in cr_shadow.h.
     if (BEM_LAZY_CR) {

@@ -197,6 +197,48 @@ constexpr u32 BEM_LEVER2_FCMP_SELECT = 1u << 0;
 // Double input leaving a Single result measured -1.1% but changed the shadow
 // single-mask column of the replay trace, so it is not a bit-identical lever.)
 
+// Lever 35 (word 2, bit 3): the value_unknown (lfd-written) shadow-mask
+// round-trip check at an FPR flush, ConvertToDouble(ConvertToSingle(x)) == x
+// per lane, as one f64x2 test over the pair: ok = (promote(demote(v)) == v) |
+// (v is NaN & (bits & 0x1FFFFFFF) == 0). Same bit for every double (proof at
+// the emit site); ~95 -> ~25 executed ops per register.
+constexpr u32 BEM_LEVER2_UNKNOWN_RT_SIMD = 1u << 3;
+
+// Lever 36 (word 2, bit 4): CR-store sinking. A cmp / cmpi / cmpl / cmpli,
+// or an Rc=1 integer op (cr0 = result vs 0), whose field is fully rewritten by
+// a later producer of the same block stream does not store the field; it stays
+// PENDING (CmpFuse::pend) and is stored, from the producer's operand locals, in
+// every exit taken while it is pending: mid-block bc taken arms (CR-bit and
+// bdnz/bdz), superblock seam bails and the inlined-blr RAS exit. A mid-block bc
+// reading LT/GT/EQ of a pending field compares the operands directly. The walk
+// (ppc_emit.cpp CrSinkMode) admits only native ops that read no CR and cannot
+// leave the block (memory imports allowed: their handlers never read cr[]), no
+// SO reader, no HLE hook, no FP op before the MSR.FP bail; an operand rewritten
+// before a later use is first copied to a snapshot local. Every exit therefore
+// stores the same CR bytes as before, and the field is never pending at the
+// block tail (the walk must reach the rewrite before the terminator).
+constexpr u32 BEM_LEVER2_CR_SINK = 1u << 4;
+
+// Lever 37 (word 2, bit 5): op63 fmadd/fmsub/fnmadd/fnmsub (Rc=0) take the
+// Boldo-Melquiond round-to-odd FMA (Dekker product, TwoSum, RO(tl+ul), one RN
+// add; proof at the emit site) when a and c have unbiased exponents in
+// [-480, 480] and b in [-960, 960]; otherwise the unchanged emulation.
+constexpr u32 BEM_LEVER2_FMA_DOUBLE_RO = 1u << 5;
+
+// Lever 38 (word 2, bit 6): gather-pipe-first stores. In a base-hoisted
+// store's flag-false arm (int D-form stores, stfs, psq_st FLOAT pairs) the
+// write-gather-pipe test runs first — its EA set is disjoint from the RAM
+// guard's and the locked-cache window's, so the order of the tests changes no
+// arm's outcome — and a paired-single pair goes into the pipe as ONE 8-byte
+// append with one boundary check (Jit64's psq_st gather-pipe write), instead
+// of two 4-byte appends each followed by a check: the same bytes in the same
+// order, drained before the next guest instruction either way. A run of >= 2
+// adjacent const-EA WPAR integer stores (emit_store_d's carve-out; at most 64
+// bytes) reads the pipe cursor and the CPU-owner test once, appends each store
+// at cursor + its offset, and advances the cursor / sets the dirty flag / runs
+// the boundary check once, at the run's last store (GpRun, jit_load_store.h).
+constexpr u32 BEM_LEVER2_GP_FIRST = 1u << 6;
+
 bool bem_lever_on(u32 bit);
 bool bem_lever2_on(u32 bit);
 

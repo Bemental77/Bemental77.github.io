@@ -371,6 +371,35 @@ if(BEMENTAL_GUEST_POWERPC)
         target_compile_options(test_levers_2632 PRIVATE "-pthread")
     endif()
 
+    # [word-2 levers 3-6, 2026-10-08] value_unknown mask round-trip SIMD, CR
+    # store sinking, round-to-odd double fma, gather-pipe-first stores. Runs
+    # with g_bem_lc_base set, so it is linked like block_replay: GLOBAL_BASE
+    # above the 0x0260_0000.. SAB-cell window. `node test_levers_3538.js`.
+    if(BEMENTAL_GUEST_POWERPC_NEXT)
+        add_executable(test_levers_3538 test_levers_3538.cpp)
+        target_link_libraries(test_levers_3538 PRIVATE
+            bementalJIT bementalJITPowerPCNext bementalJITPowerPC)
+        target_include_directories(test_levers_3538 PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+        set_target_properties(test_levers_3538 PROPERTIES SUFFIX ".html")
+        target_link_options(test_levers_3538 PRIVATE
+            "SHELL:-s EXIT_RUNTIME=1"
+            "SHELL:-s EXPORTED_RUNTIME_METHODS=['HEAPU8','HEAP8','HEAP16','HEAPU16','HEAP32','HEAPU32','HEAPF32','HEAPF64']"
+            "SHELL:-pthread"
+            "SHELL:-s PTHREAD_POOL_SIZE=0"
+            "SHELL:-s GLOBAL_BASE=40894464"
+            "SHELL:-s STACK_SIZE=4194304"
+            "SHELL:-s INITIAL_MEMORY=268435456"
+            "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+            "SHELL:-s MAXIMUM_MEMORY=536870912"
+            "SHELL:-s ALLOW_TABLE_GROWTH=1"
+            "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
+        )
+        target_compile_options(test_levers_3538 PRIVATE "-pthread")
+    endif()
+
     # [pc-sync 2026-10-04] Inline interp fallbacks store ctx.PC so the
     # dolphin_interp pc guard runs them. `node test_interp_pcsync.js`.
     if(BEMENTAL_GUEST_POWERPC_NEXT)

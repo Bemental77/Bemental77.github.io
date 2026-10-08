@@ -23,6 +23,7 @@
 
 // TODO: implement all system calls, count the exact CPU cycles of system calls.
 
+#include "urdirty.h"
 #include "psxbios.h"
 #include "psxhw.h"
 
@@ -2596,6 +2597,7 @@ void psxBiosInit() {
 	psxHu32ref(0x1060) = SWAPu32(0x00000b88);
 
 	hleSoftCall = FALSE;
+	ur_mark_all();   // urdirty.h: this wrote RAM and the BIOS area directly
 }
 
 void psxBiosShutdown() {

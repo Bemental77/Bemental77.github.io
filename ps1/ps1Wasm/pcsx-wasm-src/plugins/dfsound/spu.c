@@ -16,6 +16,7 @@
  ***************************************************************************/
 
 #include "stdafx.h"
+#include "urdirty.h"
 
 #define _IN_SPU
 
@@ -925,6 +926,8 @@ void RemoveStreams(void)
 // SPUINIT: this func will be called first by the main emu
 long CALLBACK SPUinit(void)
 {
+ // urdirty.h: SPU RAM; dma.c, registers.c, reverb.c and freeze.c mark their writes
+ ur_track(UR_SPAN_SPU, spuMem, sizeof(spuMem));
  spuMemC = (unsigned char *)spuMem;                    // just small setup
  memset((void *)&rvb, 0, sizeof(REVERBInfo));
  InitADSR();

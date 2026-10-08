@@ -360,8 +360,25 @@ class RegShadow {
 // k < count <= 0x10000, so every key it can produce is below 0x20000.
 const gxShadow = { cp: new RegShadow(0x100), xf: new RegShadow(0x20000), bp: new RegShadow(0x100) };  // for the takeover prologue
 let sentPrologue = false;
-let cacheDirty = false;   // set on any DVD read: the heap turns over on scene loads, and every
-                          // address-keyed cache (DLs/arrays/textures) is invalid — resnapshot.
+let cacheDirty = false;   // the renderer's copy of guest RAM can no longer be trusted: full image
+// ── A DVD READ RESETS THE CACHES; IT DOES NOT SHIP THE WHOLE OF MEM1 (2026-10-08) ─────────────
+// A DVD read used to set cacheDirty, i.e. ship the full 24 MiB mem1 image next frame. The reason a
+// load needs anything is that the heap turns over on scene loads, so every address-keyed cache
+// (DLs/arrays/textures) may now name different bytes — and that is answered by CLEARING the caches,
+// after which every DL, array and texture the frame binds is discovered again and sent as a region
+// (exactly what a full-image frame already relies on: the raw image carries arrays in the wrong byte
+// order, so "after a full image an array is right only if THIS frame re-sends it"). The image added
+// a 24 MiB copy inside the frame. MEASURED (MP4 solo bench, prod mirror, per-frame timers in a scratch
+// copy, 10 runs): the first frame of the 3D title (725 in most runs) — a full-image frame because of
+// two 18 KB reads — held the guest clock 48.7-94.1 ms and was over budget in 9 of the 10; its image
+// copy alone took 19.8-54.3 ms where it was timed, even into a pre-faulted spare.
+// CHECKED (scratch rig: the renderer's RAM rebuilt from exactly what is shipped — image, then regions
+// in order — compared after every frame with the bytes each cache entry stands for: every known DL
+// and texture raw, every known array word-swapped when f32): frames 0-1500, through the reads at
+// 344/555/725, the image and the no-image builds checked the same 1,184,257 entries and found the
+// same stale bytes frame for frame (one game-animated array at 0x79ea40, there before this change);
+// no stale DL or texture in either.
+let dvdReset = false;
 
 const FMT_SZ = [1, 1, 2, 2, 4];
 const COL_SZ = [2, 3, 4, 2, 3, 4];
@@ -1168,9 +1185,14 @@ function shipFrame(pos, resim, hiddenNow) {
   // ring overflow / a jumbo range) stays set and takes the full image next frame.
   const wantFull = cacheDirty || testFullMem;
   const fullSync = wantFull && !resim;
+  // A DVD READ RESETS THE CACHES: the same clear, no image; what was carried is still sent below
+  const cacheReset = !fullSync && dvdReset;
   if (fullSync) {
     rb.carry.length = 0; rb.pendRaw.length = 0;   // the full image supersedes anything carried
     cacheDirty = false;
+  }
+  if (fullSync || cacheReset) {
+    dvdReset = false;
     knownDLs.clear(); knownArrays.clear(); knownTex.clear(); f32Arrays.length = 0;
   }
   // A new DL's bytes are a raw slice at its own address, and on a full-image frame nothing precedes
@@ -1221,7 +1243,7 @@ function shipFrame(pos, resim, hiddenNow) {
   }
   // What this frame shipped, so a rollback that abandons it re-sends exactly those ranges
   // from the corrected timeline (rbRestore).
-  rbNoteShip(fullSync, regions);
+  rbNoteShip(fullSync || cacheReset, regions);   // a rollback abandoning a cache reset re-sends the image
   const withImage = fullSync || !sentPrologue;
   if (withImage && shipDedup) dropImageDuplicates(regions);
   // Copy every region out of guest memory (A FULL-IMAGE FRAME MUST NOT STALL THE GUEST).
@@ -1325,21 +1347,39 @@ const PACE_I32_CELLS = PEEK_BASE + PEEK_WINDOWS * PEEK_CELLS;   // = 144; unchan
 // the credits the wall clock earned during the frame are banked (MAX_BACKLOG, ~133 ms) and frames 42+
 // run back to back until it is caught up, so emulated time stays at 1.000x. lib/bench.js's 2 s warm-up
 // covers it: in 40+ bench runs its `over` never counted frame 41 (solo or room), though this ring has it.
-const FT_N = 220, FT_OVER = 221, FT_BUSY_OVER = 222, FT_RING = 256, FT_RING_N = 256;
+// ── WHEN THE OS DID NOT RUN THIS THREAD (2026-10-08) ─────────────────────────────────────────
+// A fourth cell per entry: `unsched`, the ms this thread's own timed waits on its credit returned
+// LATE — each wait is capped at BK_POLL_MS (2 ms), so a wait that took 40 ms is 38 ms in which this
+// thread was due to run and the OS did not run it (it could not grant itself the credit the wall
+// clock had earned, nor take one another thread granted). lib/bench.js scores a frame `over` only if
+// its interval minus that time is still past the line, and reports the rest as `unsched`.
+// MEASURED (MP4 bench, prod mirror, the shared 4-vCPU test VM, 10 runs, with per-thread schedstat of
+// every renderer thread, a 1 ms sleeper pinned to each vCPU and one outside Chrome): 30 of the 44
+// "parked on a credit" frames over the line (34-111 ms) had one of this thread's 2 ms waits return
+// late by enough to cover the whole excess. Three shapes, each seen with the witnesses: (a) this
+// thread runnable and not run (run_delay 37-57 ms) on a vCPU whose pinned sleeper stalled alike while
+// the GPU process's main thread (Chrome runs it at nice -8; software rendering here) ran there;
+// (b) asleep past its timer with CPUs partly idle while the sleeper OUTSIDE Chrome stalled the same
+// 45-51 ms, steal +0 — the VM's timer wakeups not delivered; (c) every CPU saturated by other
+// processes (idle +0, the outside sleeper starved up to 448 ms). The other 14 were room frames with
+// this thread awake and no credit released: those stay `over`.
+// The ring is 192 entries of 4 cells (FT_RING..FT_RING + 768 = the end of the 4 KiB pace SAB).
+const FT_N = 220, FT_OVER = 221, FT_BUSY_OVER = 222, FT_RING = 256, FT_RING_N = 192, FT_CELLS = 4;
 const FT_PERIOD_MS = 1000 / 60;      // = one VIWaitForRetrace (OSGetTime advances 675000 ticks)
-let ftLastT = 0, ftBusyStart = 0, ftBusyMs = 0;
+let ftLastT = 0, ftBusyStart = 0, ftBusyMs = 0, ftUnschedMs = 0;
 function ftNote() {
   const t = performance.now();
-  if (ftLastT && paceI32 && paceI32.length >= FT_RING + 3 * FT_RING_N) {
-    const dt = t - ftLastT, n = Atomics.load(paceI32, FT_N), i = FT_RING + 3 * (n % FT_RING_N);
+  if (ftLastT && paceI32 && paceI32.length >= FT_RING + FT_CELLS * FT_RING_N) {
+    const dt = t - ftLastT, n = Atomics.load(paceI32, FT_N), i = FT_RING + FT_CELLS * (n % FT_RING_N);
     Atomics.store(paceI32, i, Atomics.load(paceI32, PAD_ACK));
     Atomics.store(paceI32, i + 1, Math.min(0x7fffffff, Math.round(dt * 1000)));
     Atomics.store(paceI32, i + 2, Math.min(0x7fffffff, Math.round(ftBusyMs * 1000)));
+    Atomics.store(paceI32, i + 3, Math.min(0x7fffffff, Math.round(ftUnschedMs * 1000)));
     if (dt > 2 * FT_PERIOD_MS) Atomics.add(paceI32, FT_OVER, 1);
     if (ftBusyMs > FT_PERIOD_MS) Atomics.add(paceI32, FT_BUSY_OVER, 1);
     Atomics.store(paceI32, FT_N, n + 1);
   }
-  ftLastT = t; ftBusyStart = t; ftBusyMs = 0;
+  ftLastT = t; ftBusyStart = t; ftBusyMs = 0; ftUnschedMs = 0;
 }
 // The presented frame's busy time ends where it parks on its credit (VIWaitForRetrace).
 function ftBusyEnd() { if (ftBusyStart) ftBusyMs = performance.now() - ftBusyStart; }
@@ -2546,7 +2586,7 @@ function serveDvdRead(mem, dv, block, addr, length, offset, cbIdx) {
   lastDvdOff = offset;
   // JS writes guest memory here, which the instrumented module cannot see: log the pages first.
   rbTouchRange(addr, length); rbTouchRange(block, 36);
-  cacheDirty = true;
+  dvdReset = true;           // A DVD READ RESETS THE CACHES (at cacheDirty)
   const dst = new Uint8Array(mem.buffer, addr, length);
   let done = 0;
   while (done < length) {
@@ -2981,7 +3021,10 @@ async function boot(msg) {
               // BUFFER). Never when a credit is already waiting — then the guest runs on at once.
               if (Atomics.load(paceI32, 0) <= 0) { shipFlush(); spareStep(SPARE_SLICE_MS); }
               while (Atomics.load(paceI32, 0) <= 0) {
-                Atomics.wait(paceI32, 0, 0, bkCfg ? BK_POLL_MS : 500);
+                const tw = performance.now(), cap = bkCfg ? BK_POLL_MS : 500;
+                Atomics.wait(paceI32, 0, 0, cap);
+                const late = performance.now() - tw - cap;   // WHEN THE OS DID NOT RUN THIS THREAD
+                if (late > 1) ftUnschedMs += late;
                 if (bkCfg && Atomics.load(paceI32, 0) <= 0) { selfGrant(); if (rbI32) roomSelf(); }
               }
               Atomics.sub(paceI32, 0, 1);

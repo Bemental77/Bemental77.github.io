@@ -21,6 +21,7 @@
 #include "code_op.h"
 #include "common/op_info.h"
 #include "cr_shadow.h"
+#include "jit_compare.h"   // [BEM_LEVER2_CR_SINK] emit_cmp_fuse_cr_store
 #include "ppc_analyst.h"
 #include "lever_gate.h"     // BEM_LEVER_TAKEN_CHAIN
 #include "ppc_emit.h"        // BEM_MIPS_EXEC_CELL + bem_mips_census_on()
@@ -413,6 +414,7 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
         if (is_bdnz) wb.op_i32_ne(); else wb.op_i32_eq();
         wb.op_if();
         {
+            emit_pending_cr_stores(wb, ctx_ptr, fuse);   // [BEM_LEVER2_CR_SINK]
             const auto gsnap = taken_gpr_flush_begin();
             emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, target);
             if (!is_terminal) emit_coalesced_taken_exit(wb, ctx_ptr, target, merged, region_gen,
@@ -440,13 +442,24 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
         // (comes from XER, frozen in shadow.so) — leave it to emit_crbit_test.
         const u32 field_idx    = bi / 4u;
         const u32 bit_in_field = bi % 4u;
-        if (fuse && fuse->valid && fuse->crfd == field_idx && bit_in_field != 3u)
+        const bool fused = fuse && fuse->valid && fuse->crfd == field_idx && bit_in_field != 3u;
+        if (fused) {
             emit_crbit_fused(wb, *fuse, bit_in_field);
-        else
+        } else if (fuse && fuse->pend[field_idx].on && bit_in_field != 3u) {
+            // [BEM_LEVER2_CR_SINK] a later reader of a pending field: the bit
+            // from the pending cmp's operands, exactly as the fused consumer.
+            const CmpFuse::PendCr& p = fuse->pend[field_idx];
+            CmpFuse v;
+            v.a_local = p.a_local; v.b_local = p.b_local; v.imm = p.imm;
+            v.is_imm = p.is_imm; v.is_signed = p.is_signed;
+            emit_crbit_fused(wb, v, bit_in_field);
+        } else {
             emit_crbit_test(wb, ctx_ptr, bi);
+        }
         if (!branch_if_true) wb.op_i32_eqz();        // invert: stack=1 iff taken
         wb.op_if();
         {
+            emit_pending_cr_stores(wb, ctx_ptr, fuse);   // [BEM_LEVER2_CR_SINK]
             const auto gsnap = taken_gpr_flush_begin();
             emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, target);
             // [coalesce] mid-block: taken drains a pending GP write + returns to

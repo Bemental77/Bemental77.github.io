@@ -17,6 +17,7 @@
 
 #define _IN_PRIMDRAW
 
+#include "urdirty.h"
 #include "externals.h"
 #include "gpu.h"
 #include "draw.h"
@@ -644,6 +645,7 @@ void primMoveImage(unsigned char * baseAddr)
     (imageX1+imageSX)>1024)
   {
    int i,j;
+   ur_mark_span(UR_SPAN_VRAM);                         // urdirty.h: wraps; rare
    for(j=0;j<imageSY;j++)
     for(i=0;i<imageSX;i++)
      psxVuw [(1024*((imageY1+j)&iGPUHeightMask))+((imageX1+i)&0x3ff)]=
@@ -654,6 +656,9 @@ void primMoveImage(unsigned char * baseAddr)
    return;
   }
  
+ // urdirty.h: the destination rows (in range: the wrapping case returned above)
+ ur_mark_range(psxVuw + (1024*imageY1), (size_t)imageSY * 2048);
+
  if(imageSX&1)                                         // not dword aligned? slower func
   {
    unsigned short *SRCPtr, *DSTPtr;

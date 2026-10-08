@@ -158,8 +158,8 @@ const OPEN = [
   {
     id: 'eight-players-is-not-reachable',
     what: 'No console here reaches 8 players.',
-    why: 'Dreamcast MAPLE_PORTS is 4 and N64 exposes 4; PS1 tops out at 2 because "multitap" appears ZERO times in that core. Since 2026-10-07 SNES and Genesis rooms seat 4 (snes.html: a Super Multitap via exports.c setMultitap when 3+ are seated; genesis.html: a Team Player / 4-Way Play via gpgx_shim.c gpx_set_multitap for a cart that takes one) — but no room opens more than 4 ports, and a SNES multitap has 4 pads behind it plus port 1 (5 players), a Genesis Team Player in each port 8: the core can, no page asks for it. init_sfc_setting still boots SNES_JOYPAD (the adaptor goes in per room).',
-    evidence: 'grep -ric multitap ps1/ps1Wasm/pcsx-wasm-src -> 0 occurrences at the time of writing; snes exports.c init_sfc_setting sets Settings.ControllerOption = SNES_JOYPAD.',
+    why: 'Dreamcast MAPLE_PORTS is 4 and N64 exposes 4; Since 2026-10-07 PS1 (ps1.html: a multitap in port 1 via pad_worker.c ps1_multitap when 3+ are seated), SNES and Genesis rooms seat 4 (snes.html: a Super Multitap via exports.c setMultitap when 3+ are seated; genesis.html: a Team Player / 4-Way Play via gpgx_shim.c gpx_set_multitap for a cart that takes one) — but no room opens more than 4 ports, and a SNES multitap has 4 pads behind it plus port 1 (5 players), a Genesis Team Player in each port 8: the core can, no page asks for it. init_sfc_setting still boots SNES_JOYPAD (the adaptor goes in per room).',
+    evidence: 'ps1.html PS1_PORTS = 4 (one multitap: 4 slots; a second one in port 2 would make 8, no page asks for it); snes exports.c init_sfc_setting sets Settings.ControllerOption = SNES_JOYPAD.',
     verify: () => /ControllerOption\s*=\s*SNES_JOYPAD/.test(read('snes/snesWasm/source/exports.c')),
   },
 ];

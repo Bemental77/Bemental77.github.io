@@ -32,6 +32,26 @@ namespace bemental::powerpc {
 static constexpr u32 LOCAL_TMP_DIFF = 0;  // shared with LOCAL_TMP_EA
 static constexpr u32 LOCAL_TMP_IMM  = 1;  // shared with LOCAL_TMP_VAL
 
+// [BEM_LEVER2_CR_SINK] the cmp just filled the fuse record and skipped its
+// store: its field is owed to every exit until the next writer of the field.
+// sink_req 2: copy the operand locals into a free snapshot slot first (the
+// caller's walk saw an operand rewritten before a later use).
+void emit_cmp_sink_pend(WasmModuleBuilder& wb, CmpFuse& f) {
+    CmpFuse::PendCr& p = f.pend[f.crfd];
+    p.on = true; p.a_local = f.a_local; p.b_local = f.b_local; p.imm = f.imm;
+    p.is_imm = f.is_imm; p.is_signed = f.is_signed; p.slot = -1;
+    if (f.sink_req != 2u) return;
+    bool used[CmpFuse::CR_SNAP_SLOTS] = {};
+    for (u32 k = 0; k < 8u; ++k)
+        if (k != f.crfd && f.pend[k].on && f.pend[k].slot >= 0) used[f.pend[k].slot] = true;
+    u32 s = 0;
+    while (used[s]) ++s;   // the body loop admits mode 2 only with a free slot
+    p.slot = (int8_t)s;
+    const u32 la = f.snap_base + 2u * s, lb = la + 1u;
+    wb.op_local_get(p.a_local); wb.op_local_set(la); p.a_local = la;
+    if (!p.is_imm) { wb.op_local_get(p.b_local); wb.op_local_set(lb); p.b_local = lb; }
+}
+
 void emit_cmpi(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                u32 ctx_ptr, CmpFuse* fuse) {
     const u32 inst = op.inst;
@@ -48,10 +68,12 @@ void emit_cmpi(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Code
                     fuse->a_local = rc_ra.local_idx(); fuse->imm = (s32)simm;
                     fuse->is_imm = true; fuse->is_signed = true; }
     } else if (bem_cr_lean_on()) {
-        emit_cr_from_pair_imm(wb, ctx_ptr, crfd, rc_ra.local_idx(), (s32)simm, true);
+        const bool sink = fuse && fuse->sink_req != 0u;   // [BEM_LEVER2_CR_SINK]
+        if (!sink)
+            emit_cr_from_pair_imm(wb, ctx_ptr, crfd, rc_ra.local_idx(), (s32)simm, true);
         if (fuse) { fuse->valid = true; fuse->age = 0; fuse->crfd = crfd;
                     fuse->a_local = rc_ra.local_idx(); fuse->imm = (s32)simm;
-                    fuse->is_imm = true; fuse->is_signed = true; }
+                    fuse->is_imm = true; fuse->is_signed = true; if (sink) emit_cmp_sink_pend(wb, *fuse); }
     } else {
         wb.op_i32_const((s32)simm);
         wb.op_local_set(LOCAL_TMP_IMM);
@@ -76,10 +98,12 @@ void emit_cmpli(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Cod
                     fuse->a_local = rc_ra.local_idx(); fuse->imm = (s32)uimm;
                     fuse->is_imm = true; fuse->is_signed = false; }
     } else if (bem_cr_lean_on()) {
-        emit_cr_from_pair_imm(wb, ctx_ptr, crfd, rc_ra.local_idx(), (s32)uimm, false);
+        const bool sink = fuse && fuse->sink_req != 0u;   // [BEM_LEVER2_CR_SINK]
+        if (!sink)
+            emit_cr_from_pair_imm(wb, ctx_ptr, crfd, rc_ra.local_idx(), (s32)uimm, false);
         if (fuse) { fuse->valid = true; fuse->age = 0; fuse->crfd = crfd;
                     fuse->a_local = rc_ra.local_idx(); fuse->imm = (s32)uimm;
-                    fuse->is_imm = true; fuse->is_signed = false; }
+                    fuse->is_imm = true; fuse->is_signed = false; if (sink) emit_cmp_sink_pend(wb, *fuse); }
     } else {
         wb.op_i32_const((s32)uimm);
         wb.op_local_set(LOCAL_TMP_IMM);
@@ -105,11 +129,13 @@ void emit_cmp(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
                     fuse->a_local = rc_ra.local_idx(); fuse->b_local = rc_rb.local_idx();
                     fuse->is_imm = false; fuse->is_signed = true; }
     } else {
+        const bool sink = fuse && fuse->sink_req != 0u && bem_cr_lean_on();
         if (fuse && bem_cr_lean_on()) {
             fuse->valid = true; fuse->age = 0; fuse->crfd = crfd;
             fuse->a_local = rc_ra.local_idx(); fuse->b_local = rc_rb.local_idx();
-            fuse->is_imm = false; fuse->is_signed = true;
+            fuse->is_imm = false; fuse->is_signed = true; if (sink) emit_cmp_sink_pend(wb, *fuse);
         }
+        if (!sink)
         emit_cr_from_signed_pair(wb, ctx_ptr, crfd, rc_ra.local_idx(),
                                  rc_rb.local_idx());
     }
@@ -132,11 +158,13 @@ void emit_cmpl(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Code
                     fuse->a_local = rc_ra.local_idx(); fuse->b_local = rc_rb.local_idx();
                     fuse->is_imm = false; fuse->is_signed = false; }
     } else {
+        const bool sink = fuse && fuse->sink_req != 0u && bem_cr_lean_on();
         if (fuse && bem_cr_lean_on()) {
             fuse->valid = true; fuse->age = 0; fuse->crfd = crfd;
             fuse->a_local = rc_ra.local_idx(); fuse->b_local = rc_rb.local_idx();
-            fuse->is_imm = false; fuse->is_signed = false;
+            fuse->is_imm = false; fuse->is_signed = false; if (sink) emit_cmp_sink_pend(wb, *fuse);
         }
+        if (!sink)
         emit_cr_from_unsigned_pair(wb, ctx_ptr, crfd, rc_ra.local_idx(),
                                    rc_rb.local_idx());
     }
@@ -231,6 +259,19 @@ void emit_cr_logic(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     wb.op_i32_const(31); wb.op_i32_shl(); wb.op_i32_or();
     wb.op_i32_const(1); wb.op_i32_or();                            // marker
     wb.op_i32_store(ppc_off::cr(fd) + 4);
+}
+
+// [BEM_LEVER2_CR_SINK] Every CR store a sunk cmp skipped and still owes: the
+// same lean eager build its emitter would have run, from the pending record.
+void emit_pending_cr_stores(WasmModuleBuilder& wb, u32 ctx_ptr, const CmpFuse* f) {
+    if (!f) return;
+    for (u32 k = 0; k < 8u; ++k) {
+        const CmpFuse::PendCr& p = f->pend[k];
+        if (!p.on) continue;
+        if (p.is_imm)         emit_cr_from_pair_imm(wb, ctx_ptr, k, p.a_local, p.imm, p.is_signed);
+        else if (p.is_signed) emit_cr_from_signed_pair(wb, ctx_ptr, k, p.a_local, p.b_local);
+        else                  emit_cr_from_unsigned_pair(wb, ctx_ptr, k, p.a_local, p.b_local);
+    }
 }
 
 }  // namespace bemental::powerpc

@@ -21,6 +21,7 @@
 * R3000A CPU functions.
 */
 
+#include "urdirty.h"
 #include "r3000a.h"
 #include "cdrom.h"
 #include "mdec.h"
@@ -78,7 +79,13 @@ void psxShutdown() {
 	psxCpu->Shutdown();
 }
 
+// Bumped whenever psxBranchTest fires anything and on every exception: the
+// idle-loop fast-forward (psxinterpreter.c, IDLE-LOOP FAST-FORWARD) treats two
+// passes over a loop as the same pass only if this did not move between them.
+u32 psxEvSeq = 0;
+
 void psxException(u32 code, u32 bd) {
+	psxEvSeq++;
 	// Set the Cause
 	psxRegs.CP0.n.Cause = code;
 
@@ -105,49 +112,58 @@ void psxException(u32 code, u32 bd) {
 	if (!Config.HLE && (((PSXMu32(psxRegs.CP0.n.EPC) >> 24) & 0xfe) == 0x4a)) {
 		// "hokuto no ken" / "Crash Bandicot 2" ... fix
 		PSXMu32ref(psxRegs.CP0.n.EPC)&= SWAPu32(~0x02000000);
+		UR_MARK(&PSXMu32ref(psxRegs.CP0.n.EPC));
 	}
 
 	if (Config.HLE) psxBiosException();
 }
 
 void psxBranchTest() {
-	if ((psxRegs.cycle - psxNextsCounter) >= psxNextCounter)
+	if ((psxRegs.cycle - psxNextsCounter) >= psxNextCounter) {
+		psxEvSeq++;
 		psxRcntUpdate();
+	}
 
 	if (psxRegs.interrupt) {
 		if ((psxRegs.interrupt & 0x80) && !Config.Sio) { // sio
 			if ((psxRegs.cycle - psxRegs.intCycle[7]) >= psxRegs.intCycle[7 + 1]) {
 				psxRegs.interrupt &= ~0x80;
+				psxEvSeq++;
 				sioInterrupt();
 			}
 		}
 		if (psxRegs.interrupt & 0x04) { // cdr
 			if ((psxRegs.cycle - psxRegs.intCycle[2]) >= psxRegs.intCycle[2 + 1]) {
 				psxRegs.interrupt &= ~0x04;
+				psxEvSeq++;
 				cdrInterrupt();
 			}
 		}
 		if (psxRegs.interrupt & 0x040000) { // cdr read
 			if ((psxRegs.cycle - psxRegs.intCycle[2 + 16]) >= psxRegs.intCycle[2 + 16 + 1]) {
 				psxRegs.interrupt &= ~0x040000;
+				psxEvSeq++;
 				cdrReadInterrupt();
 			}
 		}
 		if (psxRegs.interrupt & 0x01000000) { // gpu dma
 			if ((psxRegs.cycle - psxRegs.intCycle[3 + 24]) >= psxRegs.intCycle[3 + 24 + 1]) {
 				psxRegs.interrupt &= ~0x01000000;
+				psxEvSeq++;
 				gpuInterrupt();
 			}
 		}
 		if (psxRegs.interrupt & 0x02000000) { // mdec out dma
 			if ((psxRegs.cycle - psxRegs.intCycle[5 + 24]) >= psxRegs.intCycle[5 + 24 + 1]) {
 				psxRegs.interrupt &= ~0x02000000;
+				psxEvSeq++;
 				mdec1Interrupt();
 			}
 		}
 		if (psxRegs.interrupt & 0x04000000) { // spu dma
 			if ((psxRegs.cycle - psxRegs.intCycle[1 + 24]) >= psxRegs.intCycle[1 + 24 + 1]) {
 				psxRegs.interrupt &= ~0x04000000;
+				psxEvSeq++;
 				spuInterrupt();
 			}
 		}

@@ -21,6 +21,7 @@
 * SIO functions.
 */
 
+#include "urdirty.h"
 #include "sio.h"
 #include <sys/stat.h>
 
@@ -368,10 +369,12 @@ unsigned char sioRead8()
 					{
 					case 0x0002:
 						memcpy(Mcd1Data + (adrL | (adrH << 8)) * 128, &buf[1], 128);
+						ur_mark_range(Mcd1Data + (adrL | (adrH << 8)) * 128, 128);
 						SaveMcd(Config.Mcd1, Mcd1Data, (adrL | (adrH << 8)) * 128, 128);
 						break;
 					case 0x2002:
 						memcpy(Mcd2Data + (adrL | (adrH << 8)) * 128, &buf[1], 128);
+						ur_mark_range(Mcd2Data + (adrL | (adrH << 8)) * 128, 128);
 						SaveMcd(Config.Mcd2, Mcd2Data, (adrL | (adrH << 8)) * 128, 128);
 						break;
 					}
@@ -455,7 +458,7 @@ void LoadMcd(int mcd, char *str)
 				else if (buf.st_size == MCD_SIZE + 3904)
 					fseek(f, 3904, SEEK_SET);
 			}
-			fread(data, 1, MCD_SIZE, f);
+			fread(data, 1, MCD_SIZE, f); ur_mark_range(data, MCD_SIZE);
 			fclose(f);
 		}
 		else
@@ -472,7 +475,7 @@ void LoadMcd(int mcd, char *str)
 			else if (buf.st_size == MCD_SIZE + 3904)
 				fseek(f, 3904, SEEK_SET);
 		}
-		fread(data, 1, MCD_SIZE, f);
+		fread(data, 1, MCD_SIZE, f); ur_mark_range(data, MCD_SIZE);
 		fclose(f);
 	}
 }

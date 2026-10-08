@@ -372,6 +372,44 @@ void FPRRegCache::Flush(u32 ctx_ptr, BitSet32 preg_mask, u8 lane_mask, bool exit
                 m_wb.op_local_get(LOCAL_PSQ_T1);
                 m_wb.op_i32_const((s32)~(1u << i));
                 m_wb.op_i32_and();                              // clear-value
+                if (bem_lever2_on(BEM_LEVER2_UNKNOWN_RT_SIMD)) {
+                    // [BEM_LEVER2_UNKNOWN_RT_SIMD 2026-10-08] The scalar check
+                    // below is CTD(CTS(x)) == x per lane, with the PEM pair.
+                    // CTD's image is {f32 values as doubles} u {exp=0x7FF
+                    // patterns}, so for a NON-NaN x it holds iff f32 holds x
+                    // exactly (CTS of such x truncates only zero bits, incl.
+                    // the denormal arm and +-0 / +-Inf), i.e. iff
+                    // promote(demote(x)) == x as f64 (false for every NaN).
+                    // For a NaN x, CTS keeps bits 63,62 and 58..29 and CTD
+                    // rebuilds bits 61..59 as 1 (they are, exp = 0x7FF) and
+                    // bits 28..0 as 0: equal iff (x & 0x1FFFFFFF) == 0.
+                    // ok = all_lanes( eq(promote(demote(v)), v) |
+                    //                 (ne(v, v) & ((v & 0x1FFFFFFF) == 0)) ).
+                    constexpr u32 LOCAL_V = 152u;   // LOCAL_PSQ_V v128 scratch
+                    m_wb.op_local_get(m_state[i].ps0_local_idx);
+                    m_wb.op_i64x2_splat();
+                    m_wb.op_local_get(m_state[i].ps1_local_idx);
+                    m_wb.op_i64x2_replace_lane(1);
+                    m_wb.op_local_tee(LOCAL_V);
+                    m_wb.op_f32x4_demote_f64x2_zero();
+                    m_wb.op_f64x2_promote_low_f32x4();
+                    m_wb.op_local_get(LOCAL_V);
+                    m_wb.op_f64x2_eq();
+                    m_wb.op_local_get(LOCAL_V);
+                    m_wb.op_local_get(LOCAL_V);
+                    m_wb.op_f64x2_ne();
+                    m_wb.op_local_get(LOCAL_V);
+                    m_wb.op_v128_const_i64_splat(0x1FFFFFFFull);
+                    m_wb.op_v128_and();
+                    m_wb.op_v128_const_i64_splat(0ull);
+                    m_wb.op_i64x2_eq();
+                    m_wb.op_v128_and();
+                    m_wb.op_v128_or();
+                    m_wb.op_i64x2_all_true();
+                    m_wb.op_select();                           // ok ? set : clear
+                    m_wb.op_i32_store(0);
+                    return;
+                }
                 bool first = true;
                 auto lane_roundtrip_ok = [&](u32 lane_local) {
                     // widen(narrow(x)) == x — both directions are the exact

@@ -267,7 +267,9 @@
       players: 4, note: 'Two players. Three or four need a Super Multitap game — SimCity is not one.',
       games: [ 'SimCity' ].map(function (l) { return { key: l, label: l }; }) },
     { key: 'ps1', name: 'PlayStation', page: '/ps1.html', handoff: '/ps1.html?np=', hostFlag: 'host=1',
-      players: 2, note: 'Two players. Only the host has to pick the disc number — everyone loads the same one.',
+      // 4 since 2026-10-07: a multitap goes into port 1 for 3+ seated
+      // (ps1.html lsMultitapApply). None of these discs reads one, so the note says so.
+      players: 4, note: 'Two players. Three or four need a multitap game — none of these discs is one. Only the host has to pick the disc number — everyone loads the same one.',
       games: [
         'Monster Rancher 2', 'Metal Gear Solid (Disc 1)', 'Metal Gear Solid (Disc 2)',
         "Harry Potter & the Sorcerer's Stone", 'Legend of Dragoon (Disc 1)',

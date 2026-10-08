@@ -373,6 +373,13 @@ void emit_fp_fma_double(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, c
     auto fc_pair = frc.Bind(fc, FPRMode::Read,  FPR_LANE_PS0);
     auto fd_pair = frc.Bind(fd, FPRMode::Write, FPR_LANE_PS0);
 
+    const bool ro_fast = bem_lever2_on(BEM_LEVER2_FMA_DOUBLE_RO);
+    if (ro_fast) {
+        emit_fma_double_ro_guard(wb, fa_pair.ps0_idx, fc_pair.ps0_idx, fb_pair.ps0_idx);
+        wb.op_if(WASM_TYPE_F64);
+        emit_fma_double_ro(wb, fa_pair.ps0_idx, fc_pair.ps0_idx, fb_pair.ps0_idx, subtract);
+        wb.op_else();
+    }
     // Stage a, c (double FMA: NO Force25Bit — only the single family rounds c),
     // b. emit_fma_stage keeps A0/C0/B0 (primitive) + A/M2/B (NaN-ladder
     // originals) disjoint, so no re-stage is needed after emit_fma_core.
@@ -380,6 +387,7 @@ void emit_fp_fma_double(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, c
                    /*force25_c=*/false);
     emit_fma_core(wb, subtract, /*single=*/false);  // [C2] round(a*c+(sub?-b:b))
     emit_nan_fixup_fma(wb);          // [C8] NaN ladder (gated on isnan(result), a->b->c)
+    if (ro_fast) wb.op_end();
     // ForceDouble then optional NaN-safe negate (fnmadd/fnmsub).
     emit_force_double_i64(wb, ctx_ptr);
     wb.op_f64_reinterpret_i64();

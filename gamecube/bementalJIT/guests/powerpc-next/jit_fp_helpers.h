@@ -562,6 +562,142 @@ inline void emit_bm_fma_prim(WasmModuleBuilder& wb) {
     wb.op_end();
 }
 
+// ===========================================================================
+// [BEM_LEVER2_FMA_DOUBLE_RO 2026-10-08] Correctly rounded double fma(a, c, b')
+// (b' = sub ? -b : b) by Boldo & Melquiond, "Emulation of a FMA and correctly
+// rounded sums: proved algorithms using rounding to odd" (IEEE TC 57(4), 2008):
+//   (uh, ul) = Dekker ExactMult(a, c)       [Veltkamp split, C = 2^27 + 1]
+//   (th, tl) = TwoSum(b', uh)
+//   v        = RO(tl + ul)                  [round to odd]
+//   z        = RN(th + v)                   = RN(a*c + b')
+// valid in radix 2, precision >= 5, when every operation behaves as it would
+// with an unbounded exponent range. The guard makes that hold:
+//   * a, c in [2^-480, 2^481), b in [2^-960, 2^961) (biased exponents
+//     [543, 1503] and [63, 1983]): no NaN/Inf/zero/subnormal input; the split
+//     (|C*x| < 2^509), the product and every sum stay below 2^990, so nothing
+//     overflows.
+//   * every exact intermediate (a*c, the four Dekker partial products and
+//     their sums, b', TwoSum outputs, tl+ul) is an integer multiple of 2^-1064
+//     (lsb(a)*lsb(c) >= 2^-532 * 2^-532; lsb(b) >= 2^-1012). A multiple of
+//     2^-1064 below 2^-1011 in magnitude has <= 53 significant bits and is
+//     representable (normal or subnormal), so an operation whose exact result
+//     lies below 2^-1011 is exact — the same value as with an unbounded
+//     exponent range — and above 2^-1022 rounding is the unbounded one anyway.
+//     The same holds for the final RN: a result below 2^-1011 is exact.
+// Round-to-odd of x + y: s = RN(x + y) and e = x + y - s exactly (TwoSum); if
+// e != 0 and s's last significand bit is 0, s moves one ulp towards e (bits
+// + 1 when e and s share a sign, - 1 otherwise; e != 0 implies s != 0, and the
+// move across a binade gives the odd neighbour, all-ones significand).
+// Exact zero sum: th = -ul exactly, tl = 0, v = ul, z = +0 — RN's sign rule.
+// No NaN can come out, so the NaN ladder is not needed on this arm.
+// Inputs: the three i64 FPR lane locals. Leaves f64 z on the stack.
+// Scratch: LOCAL_FMA_A0/C0/B0/P/AS/BS/W0/W1/W2/HI/LO/RES, LOCAL_FP_I64_A.
+// ===========================================================================
+// Push i32 1 iff every operand's biased exponent is in range.
+inline void emit_fma_double_ro_guard(WasmModuleBuilder& wb, u32 a_local, u32 c_local,
+                                     u32 b_local) {
+    // ((bits << 1) - (E0 << 53)) <u ((E1 - E0 + 1) << 53)  <=>  E0 <= exp <= E1
+    auto in_range = [&](u32 l, u64 e0, u64 e1) {
+        wb.op_local_get(l);
+        wb.op_i64_const(1);
+        wb.op_i64_shl();
+        wb.op_i64_const((s64)(e0 << 53));
+        wb.op_i64_sub();
+        wb.op_i64_const((s64)((e1 - e0 + 1u) << 53));
+        wb.op_i64_lt_u();
+    };
+    in_range(a_local, 543u, 1503u);
+    in_range(c_local, 543u, 1503u);
+    wb.op_i32_and();
+    in_range(b_local, 63u, 1983u);
+    wb.op_i32_and();
+}
+
+inline void emit_fma_double_ro(WasmModuleBuilder& wb, u32 a_local, u32 c_local,
+                               u32 b_local, bool sub) {
+    const double SPLIT = 134217729.0;   // 2^27 + 1
+    // x -> (hi, lo), x in f64 local `x`
+    auto split = [&](u32 x, u32 hi, u32 lo) {
+        wb.op_local_get(x);
+        wb.op_f64_const(SPLIT);
+        wb.op_f64_mul();
+        wb.op_local_tee(hi);                 // t = C*x
+        wb.op_local_get(hi);
+        wb.op_local_get(x);
+        wb.op_f64_sub();                     // t - x
+        wb.op_f64_sub();                     // hi = t - (t - x)
+        wb.op_local_set(hi);
+        wb.op_local_get(x);
+        wb.op_local_get(hi);
+        wb.op_f64_sub();
+        wb.op_local_set(lo);                 // lo = x - hi
+    };
+    wb.op_local_get(a_local); wb.op_f64_reinterpret_i64(); wb.op_local_set(LOCAL_FMA_A0);
+    wb.op_local_get(c_local); wb.op_f64_reinterpret_i64(); wb.op_local_set(LOCAL_FMA_C0);
+    split(LOCAL_FMA_A0, LOCAL_FMA_AS, LOCAL_FMA_W1);   // ahi, alo
+    split(LOCAL_FMA_C0, LOCAL_FMA_BS, LOCAL_FMA_W2);   // chi, clo
+    // uh = RN(a*c)
+    wb.op_local_get(LOCAL_FMA_A0);
+    wb.op_local_get(LOCAL_FMA_C0);
+    wb.op_f64_mul();
+    wb.op_local_set(LOCAL_FMA_P);
+    // ul = ((ahi*chi - uh) + ahi*clo + alo*chi) + alo*clo
+    wb.op_local_get(LOCAL_FMA_AS); wb.op_local_get(LOCAL_FMA_BS); wb.op_f64_mul();
+    wb.op_local_get(LOCAL_FMA_P);  wb.op_f64_sub();
+    wb.op_local_get(LOCAL_FMA_AS); wb.op_local_get(LOCAL_FMA_W2); wb.op_f64_mul();
+    wb.op_f64_add();
+    wb.op_local_get(LOCAL_FMA_W1); wb.op_local_get(LOCAL_FMA_BS); wb.op_f64_mul();
+    wb.op_f64_add();
+    wb.op_local_get(LOCAL_FMA_W1); wb.op_local_get(LOCAL_FMA_W2); wb.op_f64_mul();
+    wb.op_f64_add();
+    wb.op_local_set(LOCAL_FMA_LO);                     // ul
+    // b'
+    wb.op_local_get(b_local); wb.op_f64_reinterpret_i64();
+    if (sub) wb.op_f64_neg();
+    wb.op_local_set(LOCAL_FMA_B0);
+    // TwoSum(b', uh): th = b' + uh; bb = th - b'; tl = (b' - (th - bb)) + (uh - bb)
+    wb.op_local_get(LOCAL_FMA_B0); wb.op_local_get(LOCAL_FMA_P); wb.op_f64_add();
+    wb.op_local_tee(LOCAL_FMA_HI);                     // th
+    wb.op_local_get(LOCAL_FMA_B0); wb.op_f64_sub();
+    wb.op_local_set(LOCAL_FMA_W0);                     // bb
+    wb.op_local_get(LOCAL_FMA_B0);
+    wb.op_local_get(LOCAL_FMA_HI); wb.op_local_get(LOCAL_FMA_W0); wb.op_f64_sub();
+    wb.op_f64_sub();
+    wb.op_local_get(LOCAL_FMA_P); wb.op_local_get(LOCAL_FMA_W0); wb.op_f64_sub();
+    wb.op_f64_add();
+    wb.op_local_set(LOCAL_FMA_W1);                     // tl
+    // TwoSum(tl, ul): s = tl + ul; bb = s - tl; e = (tl - (s - bb)) + (ul - bb)
+    wb.op_local_get(LOCAL_FMA_W1); wb.op_local_get(LOCAL_FMA_LO); wb.op_f64_add();
+    wb.op_local_tee(LOCAL_FMA_W2);                     // s
+    wb.op_local_get(LOCAL_FMA_W1); wb.op_f64_sub();
+    wb.op_local_set(LOCAL_FMA_W0);                     // bb
+    wb.op_local_get(LOCAL_FMA_W1);
+    wb.op_local_get(LOCAL_FMA_W2); wb.op_local_get(LOCAL_FMA_W0); wb.op_f64_sub();
+    wb.op_f64_sub();
+    wb.op_local_get(LOCAL_FMA_LO); wb.op_local_get(LOCAL_FMA_W0); wb.op_f64_sub();
+    wb.op_f64_add();
+    wb.op_local_set(LOCAL_FMA_RES);                    // e
+    // z = th + RO(s, e)
+    wb.op_local_get(LOCAL_FMA_HI);
+    wb.op_local_get(LOCAL_FMA_W2); wb.op_i64_reinterpret_f64();
+    wb.op_local_tee(LOCAL_FP_I64_A);                   // bits(s)
+    //   delta = ((bits(e) ^ bits(s)) >>s 63) | 1   (+1 same sign, -1 otherwise)
+    wb.op_local_get(LOCAL_FMA_RES); wb.op_i64_reinterpret_f64();
+    wb.op_local_get(LOCAL_FP_I64_A); wb.op_i64_xor();
+    wb.op_i64_const(63); wb.op_i64_shr_s();
+    wb.op_i64_const(1); wb.op_i64_or();
+    wb.op_i64_const(0);
+    //   adjust iff e != 0 and bits(s) even
+    wb.op_local_get(LOCAL_FMA_RES); wb.op_f64_const(0.0); wb.op_f64_ne();
+    wb.op_local_get(LOCAL_FP_I64_A); wb.op_i32_wrap_i64();
+    wb.op_i32_const(1); wb.op_i32_and(); wb.op_i32_eqz();
+    wb.op_i32_and();
+    wb.op_select();
+    wb.op_i64_add();
+    wb.op_f64_reinterpret_i64();                       // v
+    wb.op_f64_add();                                   // z
+}
+
 // emit_fma_core — orchestrates the fused multiply-add.
 // Preconditions: emit_fma_stage already loaded A0=a, C0=c(-for-multiply),
 // B0=raw b, and (for the NaN ladder) A/M2/B = original a/c/b.

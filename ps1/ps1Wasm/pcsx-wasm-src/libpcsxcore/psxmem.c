@@ -24,6 +24,8 @@
 // TODO: Implement caches & cycle penalty.
 
 #include "psxmem.h"
+#include "urdirty.h"
+#include "sio.h"
 #include "r3000a.h"
 #include "psxhw.h"
 #include <sys/mman.h>
@@ -104,6 +106,17 @@ int psxMemInit() {
 	psxMemWLUT[0x1f00] = (u8 *)psxP;
 	psxMemWLUT[0x1f80] = (u8 *)psxH;
 
+	// urdirty.h: main RAM, the parallel-port page, the BIOS image, both LUTs
+	// and the memory cards. The scratchpad + hardware page (psxH) stays fully
+	// compared: psxHu*ref writes it from everywhere.
+	ur_track(UR_SPAN_RAM, psxM, 0x00200000);
+	ur_track(UR_SPAN_PAR, psxP, 0x00010000);   // parallel port: psxMemWrite* only (WLUT 0x1f00)
+	ur_track(UR_SPAN_BIOS, psxR, 0x00080000);
+	ur_track(UR_SPAN_RLUT, psxMemRLUT, 0x10000 * sizeof(void *));
+	ur_track(UR_SPAN_WLUT, psxMemWLUT, 0x10000 * sizeof(void *));
+	ur_track(UR_SPAN_MCD1, Mcd1Data, MCD_SIZE);
+	ur_track(UR_SPAN_MCD2, Mcd2Data, MCD_SIZE);
+
 	return 0;
 }
 
@@ -128,6 +141,10 @@ void psxMemReset() {
 			Config.HLE = FALSE;
 		}
 	} else Config.HLE = TRUE;
+	ur_mark_all();
+	// The HLE BIOS writes RAM, the BIOS area and the memory cards through raw
+	// pointers all over psxbios.c: those spans go back to full comparison.
+	if (Config.HLE) { ur_track_off(UR_SPAN_RAM); ur_track_off(UR_SPAN_BIOS); ur_track_off(UR_SPAN_MCD1); ur_track_off(UR_SPAN_MCD2); }
 }
 
 void psxMemShutdown() {
@@ -137,6 +154,10 @@ void psxMemShutdown() {
 	free(psxMemRLUT);
 	free(psxMemWLUT);
 }
+
+// Bumped on every hardware-register READ (a read can have side effects or
+// depend on the cycle count): see IDLE-LOOP FAST-FORWARD in psxinterpreter.c.
+u32 psxIoSeq = 0;
 
 static int writeok = 1;
 
@@ -149,7 +170,7 @@ u8 psxMemRead8(u32 mem) {
 		if (mem < 0x1f801000)
 			return psxHu8(mem);
 		else
-			return psxHwRead8(mem);
+			{ psxIoSeq++; return psxHwRead8(mem); }
 	} else {
 		p = (char *)(psxMemRLUT[t]);
 		if (p != NULL) {
@@ -176,7 +197,7 @@ u16 psxMemRead16(u32 mem) {
 		if (mem < 0x1f801000)
 			return psxHu16(mem);
 		else
-			return psxHwRead16(mem);
+			{ psxIoSeq++; return psxHwRead16(mem); }
 	} else {
 		p = (char *)(psxMemRLUT[t]);
 		if (p != NULL) {
@@ -202,7 +223,7 @@ u32 psxMemRead32(u32 mem) {
 		if (mem < 0x1f801000)
 			return psxHu32(mem);
 		else
-			return psxHwRead32(mem);
+			{ psxIoSeq++; return psxHwRead32(mem); }
 	} else {
 		p = (char *)(psxMemRLUT[t]);
 		if (p != NULL) {
@@ -234,6 +255,7 @@ void psxMemWrite8(u32 mem, u8 value) {
 			/*if (Config.Debug)
 				DebugCheckBP((mem & 0xffffff) | 0x80000000, W1);*/
 			*(u8 *)(p + (mem & 0xffff)) = value;
+			UR_MARK(p + (mem & 0xffff));
 #ifdef PSXREC
 			psxCpu->Clear((mem & (~3)), 1);
 #endif
@@ -261,6 +283,7 @@ void psxMemWrite16(u32 mem, u16 value) {
 			/*if (Config.Debug)
 				DebugCheckBP((mem & 0xffffff) | 0x80000000, W2);*/
 			*(u16 *)(p + (mem & 0xffff)) = SWAPu16(value);
+			UR_MARK(p + (mem & 0xffff));
 #ifdef PSXREC
 			psxCpu->Clear((mem & (~1)), 1);
 #endif
@@ -289,6 +312,7 @@ void psxMemWrite32(u32 mem, u32 value) {
 			/*if (Config.Debug)
 				DebugCheckBP((mem & 0xffffff) | 0x80000000, W4);*/
 			*(u32 *)(p + (mem & 0xffff)) = SWAPu32(value);
+			UR_MARK(p + (mem & 0xffff));
 #ifdef PSXREC
 			psxCpu->Clear(mem, 1);
 #endif
@@ -312,6 +336,7 @@ void psxMemWrite32(u32 mem, u32 value) {
 						memset(psxMemWLUT + 0x0000, 0, 0x80 * sizeof(void *));
 						memset(psxMemWLUT + 0x8000, 0, 0x80 * sizeof(void *));
 						memset(psxMemWLUT + 0xa000, 0, 0x80 * sizeof(void *));
+						ur_mark_span(UR_SPAN_WLUT);
 						break;
 					case 0x00: case 0x1e988:
 						if (writeok == 1) break;
@@ -319,6 +344,7 @@ void psxMemWrite32(u32 mem, u32 value) {
 						for (i = 0; i < 0x80; i++) psxMemWLUT[i + 0x0000] = (void *)&psxM[(i & 0x1f) << 16];
 						memcpy(psxMemWLUT + 0x8000, psxMemWLUT, 0x80 * sizeof(void *));
 						memcpy(psxMemWLUT + 0xa000, psxMemWLUT, 0x80 * sizeof(void *));
+						ur_mark_span(UR_SPAN_WLUT);
 						break;
 					default:
 #ifdef PSXMEM_LOG

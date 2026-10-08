@@ -1839,8 +1839,12 @@
   // match whenever the two pages' instructions are of the same kinds — so the module built from
   // P1's code was installed over P2's. MEASURED (Conker, rollback room, n64_rollback_probe
   // --lsexact): the room's own re-run of a frame from a bit-exact snapshot came out different
-  // (12 of 12 rooms desynced at frames 250-520; ?jitasync=0 and ?jit=off 3/3 exact). So every real
-  // offer records its page's source base here, and nothing built from another base is installed.
+  // (13 of 13 rooms desynced, first mismatch at frames 250-520; ?jitasync=0 and ?jit=off 3/3 exact
+  // each). So every real offer records its page's source base here, and nothing built from another
+  // base is installed. With it: Conker 9 of 10 rooms exact, 59-240 'source' refusals a room; the
+  // tenth never differed in the CPU at any of its 279 taps (the RAM hash differed at some and matched
+  // again later, with 1001 inputs missing from the rig's recorder under load 17) — not this cause,
+  // left open. The other 11 rollback configs refuse nothing (no TLB-mapped code) and stay exact.
   var PAGE_SRC = Object.create(null);
   function srcBase(p) {
     var pageLen = ((p.blockEnd - p.blockStart) >>> 0) >>> 2, eip = ((p.vaddr - p.blockStart) >>> 0) >>> 2;

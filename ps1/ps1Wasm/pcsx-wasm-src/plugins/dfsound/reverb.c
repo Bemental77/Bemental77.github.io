@@ -149,6 +149,7 @@ INLINE void s_buffer(int iOff,int iVal)                // set_buffer content hel
  while(iOff<rvb.StartAddr) iOff=0x3ffff-(rvb.StartAddr-iOff);
  if(iVal<-32768L) iVal=-32768L;if(iVal>32767L) iVal=32767L;
  *(p+iOff)=(short)iVal;
+ UR_MARK(p+iOff);
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -161,6 +162,7 @@ INLINE void s_buffer1(int iOff,int iVal)                // set_buffer (+1 sample
  while(iOff<rvb.StartAddr) iOff=0x3ffff-(rvb.StartAddr-iOff);
  if(iVal<-32768L) iVal=-32768L;if(iVal>32767L) iVal=32767L;
  *(p+iOff)=(short)iVal;
+ UR_MARK(p+iOff);
 }
 
 ////////////////////////////////////////////////////////////////////////

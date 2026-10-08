@@ -13,6 +13,11 @@
 // Flags: --a URL (/ps1/ps1Wasm/dist/wasmpsx_worker.js)  --b URL (required)
 //        --frames N (3600) --every N (60) --vram-every N (600) --ports 2|4 (2)
 //        --rom BASE (MonsterRancher2) | --disc URL  --mb N (89)
+//        --parts N  boot the WHOLE disc: parts parta{a..} of --disc concatenated,
+//                   as ps1.html loads it (0 = the first part only, capped at --mb).
+//                   ⚠ Monster Rancher 2 truncated to 89 MB never draws a picture
+//                   in 1500 frames (its VRAM does not change at all, measured
+//                   2026-10-08), so a VRAM check on it compares zeros.
 //        --mt-a N / --mt-b N  multitap slots plugged into A / B before frame 0 (0)
 //        --peek-ram HEX,HEX..  main-RAM word offsets to print from both cores at the end
 //        --url BASE (http://localhost:8080)
@@ -30,6 +35,7 @@ const opts = {
   frames: +arg('frames', 3600), every: +arg('every', 60), vramEvery: +arg('vram-every', 600), ports: +arg('ports', 2),
   disc: arg('disc', '/ps1/ps1Wasm/roms/' + arg('rom', 'MonsterRancher2') + '.bin.partaa.gz'), bytes: (+arg('mb', 89)) * 1048576,
   mtA: +arg('mt-a', 0), mtB: +arg('mt-b', 0),
+  parts: +arg('parts', 0),
   peekRam: arg('peek-ram', '') ? arg('peek-ram', '').split(',').map((x) => parseInt(x, 16)) : [],
 };
 if (!opts.b) { console.error('--b URL is required'); process.exit(2); }
