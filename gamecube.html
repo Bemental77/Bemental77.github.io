@@ -8945,6 +8945,63 @@ window.GcRate = (function () {
   // backlog clamp keeps meaning what it meant.
   var gcLsEarned = 0;      // credits the clock has granted that the room has not released
   var gcLsGate = false;    // a room owns the frame gate
+  // ── A ROOM'S CATCH-UP IS PACED (2026-10-08) ───────────────────────────────────────────────────
+  // After a stall (a wait on the other console's input, or this thread stopped) the clock has banked
+  // up to MAX_BACKLOG credits, and the room used to repay them as fast as the worker ran. That is owed
+  // time — MEASURED (tools/netplay_device_matrix.mjs, the page's ownAhead: frames run since the room
+  // released minus wall time x 60) every GameCube room player stayed at or below +0.7 frames of its own
+  // clock — but 8 owed frames repaid inside one 5 s window is 308/300 = 1.027x, and a rollback room's
+  // hidden catch-up frames repaid 15 frames in one second (1.047x over the rig's next 6 s). The
+  // matrix's ceiling is 1.02x over any 5 s window.
+  // So every release of a DELAY or LOCKSTEP room's frame (credited or hidden; the worker's own, should a
+  // rollback stretch hand one over, are charged at gcRaReclaim) must keep EVERY window of at least
+  // PACE_WIN_MS that ends now at or under PACE_RATE = GUEST_HZ x (1 + PACE_EXTRA/300) frames per second:
+  // at most 305 frames in any 5 s and 61/s over anything longer (1.0167x; the rig's +-1 frame of
+  // sampling makes 1.020). For a window starting at s that is C(now) + 1 - C(s) <= PACE_RATE x max(5 s,
+  // now - s), C = releases so far. Inside 5 s it is a count of the releases in the ring; past 5 s it is
+  // C(now) + 1 - PACE_RATE x now <= M, M = the least C(s) - PACE_RATE x s over every s at least 5 s old,
+  // which only changes at a release instant, so M is updated as each release ages out of the ring.
+  // That is the most catch-up the ceiling allows, whatever preceded the window: owed time is repaid at
+  // up to 1 frame/s past a first 5 frames, the rest dropped by the backlog clamp, like a stall past
+  // MAX_DT_MS. MEASURED, all on the device matrix: a sliding "<= 304 per trailing 5 s" count alone does
+  // not bound longer windows (a deficit second lets the next one burst: 1.047x over the next 6 s); a token
+  // bucket bounds them but repays far less (1.01x / depth 2: relay rooms 0.945x and a direct room's host
+  // 45 frames behind, stuck in REJOIN; 1.002x / depth 4: relay rooms 0.959-0.978x, from 0.984-0.991x).
+  // ROLLBACK FRAMES ARE NOT PACED (running ahead is rollback's to do): there a console that loses time
+  // must close the gap to the room or sit in REJOIN behind a held picture. MEASURED with them paced: a
+  // direct room's joiner lost 12 frames, entered REJOIN and showed a held frame for 10 s (981 hidden
+  // frames) while the pace held its banked credits.
+  // A REJOINING console (lib/netplay.js: a rejoin-sized gap behind the room; it shows a held frame, not
+  // play) is exempt; its own-clock guard bounds it. ?roompace=0 = the control.
+  var PACE_ON = q.get('roompace') !== '0', PACE_WIN_MS = 5000, PACE_EXTRA = 5;
+  var PACE_RATE = GUEST_HZ * (1 + PACE_EXTRA / 300) / 1000;          // frames per ms
+  var PACE_N = Math.floor(PACE_WIN_MS * PACE_RATE + 1e-9);             // 305: the most a 5 s window may hold
+  var paceTs = new Float64Array(PACE_N), paceKs = new Float64Array(PACE_N), paceQh = 0, paceQn = 0, paceC = 0, paceM = Infinity;
+  function gcPaceAge(t) {
+    while (paceQn > 0 && paceTs[paceQh] <= t - PACE_WIN_MS) {
+      var v = paceKs[paceQh] - PACE_RATE * paceTs[paceQh]; if (v < paceM) paceM = v;
+      paceQh = (paceQh + 1) % PACE_N; paceQn--;
+    }
+  }
+  // releases the ceiling allows now, at most cap (also what the worker may spend of the banked credits)
+  function gcPaceRoom(t, cap) {
+    if (cap <= 0) return 0; if (!PACE_ON) return cap;
+    gcPaceAge(t);
+    var n = Math.min(cap, PACE_N - paceQn);
+    if (paceM !== Infinity) n = Math.min(n, Math.floor(paceM - paceC + PACE_RATE * t + 1e-9));
+    return n > 0 ? n : 0;
+  }
+  function gcPaceFull(t) { return PACE_ON && gcPaceRoom(t, 1) < 1; }
+  function gcPaceNote(t, n) {
+    gcPaceAge(t);
+    for (var i = 0; i < n; i++) {
+      if (paceQn === PACE_N) {      // over (only the worker can do this, by running ahead of the mirror): age the oldest now
+        var v = paceKs[paceQh] - PACE_RATE * paceTs[paceQh]; if (v < paceM) paceM = v;
+        paceQh = (paceQh + 1) % PACE_N; paceQn--;
+      }
+      var k = (paceQh + paceQn) % PACE_N; paceTs[k] = t; paceKs[k] = paceC; paceQn++; paceC++;
+    }
+  }
   var rate = GcRate.makeModel({
     guestHz: GUEST_HZ, target: TARGET, maxDtMs: MAX_DT_MS, maxBacklog: MAX_BACKLOG,
     pool: {
@@ -9772,6 +9829,7 @@ window.GcRate = (function () {
     Atomics.store(R, RA.ALLOW, Math.max(0, Atomics.load(R, RA.ALLOW) - n));
     Atomics.store(R, RA.MODE, 0);
     GCRA.reclaims++; GCRA.frames += n; if (n > GCRA.maxRun) GCRA.maxRun = n;
+    if (n > 0) gcPaceNote(performance.now(), n);   // the worker's releases count against the ceiling (stamped at reclaim)
     if (n > 0 && !GCRA.batch) GCRA.batch = { n: 0, silentMs: Math.round(GCRA.silentMs || 0), from: GCRA.retro[0].w + RBP.off, mis0: GCRA.mispredicted };
     if (GCRA.batch) GCRA.batch.n += n;
     if (G > 0) rate.absorbExternal(G, performance.now(), true);
@@ -10390,6 +10448,12 @@ window.GcRate = (function () {
       RBP.catchUp = 0; RBP.cuRefused = (RBP.cuRefused | 0) + 1; hidden = false;
     }
     if (!hidden && gcLsEarned <= 0) return;      // the wall clock has not earned a frame — this is the 1.000x half
+    // CATCH-UP IS PACED (see PACE_RATE): the credit stays banked and is spent once the ceiling allows it.
+    if (!(ls.rollback > 0) && !rejoining && gcPaceFull(nowMs)) {
+      if (hidden) RBP.catchUp = 0;     // re-measured next tick, never owed twice
+      GCLS.paceHeld = (GCLS.paceHeld | 0) + 1; GCLS.paceMs = (GCLS.paceMs || 0) + stepDt;
+      return;
+    }
     // THE RING'S MEMORY BUDGET IS A WINDOW LIMIT, NOT A FAILURE: over it, wait like a window stall
     // until the room's inputs move the KEEP point on and the worker frees pages.
     if (RBP.scheme && ls.rollback > 0 && Atomics.load(RBP.i32, RBC.S_SLOTS) > RBP.budget) {
@@ -10505,6 +10569,7 @@ window.GcRate = (function () {
     else { gcLsEarned--; gcRaMirror(); }
     if (GCRA.on && RBP.scheme) gcRaArm(allow, guess, GCLS.pendingAck + 1);   // and hand the gate back
     Atomics.add(paceI32, 0, 1); Atomics.notify(paceI32, 0);   // exactly one frame
+    gcPaceNote(nowMs, 1);
     GCLS.fedTo = r.frame + 1; GCLS.framesFed++;
     GCLS.modeFrames[unsafe ? 'unsafe' : ls.rollback > 0 ? 'rollback' : (RBP.scheme ? 'delay' : 'lockstep')]++;
     ls.endFrame(null);
@@ -10886,8 +10951,14 @@ window.GcRate = (function () {
       // the frame the room runs it on
       lat: { samples: GCLAT.samples.slice(-50), overlapped: GCLAT.overlapped },
       framesFed: GCLS.framesFed, modeFrames: Object.assign({}, GCLS.modeFrames), bfCalls: GCLS.bfCalls, bfStall: GCLS.bfStall,
+      // catch-up pacing (PACE_RATE): steps that held a banked credit because a >= 5 s window was full
+      catchUpPace: { on: PACE_ON, extraPer5s: PACE_EXTRA, held: GCLS.paceHeld | 0, heldMs: Math.round(GCLS.paceMs || 0) },
       stalling: GCLS.stalling, waitingOn: GCLS.waitingOn.slice(), stallReason: GCLS.stallReason,
       earned: gcLsEarned, guestFrames: (paceI32 ? Atomics.load(paceI32, PAD_ACK) : 0),
+      // frames this console's guest is AHEAD of its own wall clock since the room released it
+      // (GCLS.clockT0/clockF0; negative = behind, i.e. owed time). The 'never past its own clock' witness.
+      ownAhead: (GCLS.running && GCLS.clockT0 && paceI32) ? +((Atomics.load(paceI32, PAD_ACK) - GCLS.clockF0) - (performance.now() - GCLS.clockT0) * GUEST_HZ / 1000).toFixed(2) : null,
+      selfFrames: GCRA.frames | 0, hiddenFrames: RBP.hidden | 0,
       hashSink: GCLS.hashSink, fault: GCLS.fault,
       // the card every console booted (THE ROOM'S MEMORY CARD) and the tag the barrier compared
       card: { state: GCCARD.state, why: GCCARD.why, key: GCCARD.key, size: GCCARD.size,
@@ -11055,7 +11126,12 @@ window.GcRate = (function () {
     var upTo = GcRate.itUpTo(Atomics, paceI32, paceF64, TARGET) - performance.timeOrigin, unabsorbed = Atomics.load(paceI32, BK_GRANTED) - bkAbsorbed;
     var acct = paceB ? (rate.granted + unabsorbed - paceB.g) + (rate.lostCredits + bkLost - paceB.l)
                        + (rate.stallMs + bkDrop - paceB.s) * T : 0;
-    return { t: performance.now(), granted: rate.granted, consumed: rate.consumed(), pool: Atomics.load(paceI32, 0),
+    // `clock`: THE GUEST CLOCK in frames, cumulative and readable at any instant — credits consumed, plus
+    // the backstop's not yet absorbed into `granted` and the room worker's not yet reclaimed (both are
+    // frames that already ran). A rig divides its deltas by its OWN timestamps; the 1 s producedPerS
+    // windows are not time-weighted against a rig's samples (see tools/netplay_device_matrix.mjs).
+    var raG = 0; try { raG = Atomics.load(RBP.i32, RA.N) | 0; } catch (e) {}   // frames it RAN (RA.G also counts credits it banked)
+    return { t: performance.now(), granted: rate.granted, consumed: rate.consumed(), clock: rate.consumed() + Math.max(0, unabsorbed) + raG, pool: Atomics.load(paceI32, 0),
       lost: rate.lostCredits + bkLost, stallMs: rate.stallMs + bkDrop, gapMaxMs: rate.gapMaxMs,
       bk: Atomics.load(paceI32, BK_GRANTED), absorbN: rate.absorbN, padAck: Atomics.load(paceI32, PAD_ACK),
       leak: paceT0 ? +((upTo - paceT0) * T - acct).toFixed(4) : null,
