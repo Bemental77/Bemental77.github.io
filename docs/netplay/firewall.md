@@ -228,6 +228,116 @@ then `f1c13bf4` (`f1c13bf4` = `61bcf988` + a null guard for test stand-ins):
 | `n64/tools/lockstep_probe.mjs` | GATE PASS (solo/bridge/pair 2/2 each) |
 | `dreamcast/tools/room_desync_soak.mjs --game pso2 --soak 60` | IN SYNC over 32 RAM checkpoints and 32 engine fingerprints |
 
+## A relayed room is a delay room (2026-10-08, netplay.js `8c9e6f80`)
+
+### Root cause, from the 2026-10-07 cells above
+
+- **Rollback is where relay rooms lost their time.** Genesis `fw`: 134 of the joiner's 159
+  stalls came in the 34 s before the capacity gate moved it to delay; `fw300`: 211 of 218.
+  GameCube never left rollback: the window sat at `ROLLBACK_MAX` (30), `rttFrames` 27.2,
+  `lateP99` 30 (the samples are clipped at the window), 184/284 window stalls. The gate's
+  memory switch (`_capWinShort`) only fires for a console's declared ring (`rbMaxWindow`),
+  and GameCube declares none, so a path that outran the engine's own 30-frame cap was
+  never a reason to switch. The capacity need read 0.052, so the time switch never fired
+  either.
+- **In delay lockstep the residue was the page, not the link.** Genesis host at 0.9427 ran
+  its whole delay stretch with zero stalls of its own and ~20 rAF/s; its joiner's stalls
+  were waits on it. A delay room had no catch-up outside a rejoin, so a tick the page lost
+  was lost for the whole room.
+
+### The changes (`lib/netplay.js`)
+
+1. **`RELAY_RB_NEED_MAX` = 12 frames.** The Session gives the engine the relay's current
+   need (`ls.relayNeed`, set in `_relayHeard`: p90 one-way + two batches + 1). Above 12
+   frames, a capacity-gated room:
+   - **starts in delay** at `max(delay, need)` when the need is known before the barrier
+     (`lsgo` carries `csr: 1` so the guest's note says "relay");
+   - **switches to delay at once** from rollback (`_capDecide`), with no warm-up and no hot
+     streak, at the relay's need (or the wire floor if that is higher). It does not use
+     `_capDelay`, because rollback lateness on the relay is clipped at the window;
+   - **never returns to rollback** while the relay needs more than 12 frames.
+   The mode note is `kind: 'relay'`: "this room is on a relay; using input delay (N
+   frames) ... zero-lag mode cannot cover the relay's round trip".
+2. **A running delay room that moves to the relay** gets its delay raised to the relay's
+   need at an agreed frame (`_scheduleDelay`), instead of waiting for stalls to raise it.
+3. **Delay-lockstep catch-up (`_lsCatchUp`).** A console that is behind the slowest other
+   console (`_rbAtBy`, the `q` frame on its inputs) by 2 or more frames runs ONE hidden
+   frame a tick, up to one short of that console. This applies only while a hidden frame
+   costs at most half a frame of its measured step. It is still bounded by its own wall
+   clock (`rbCatchUp`'s `_ocAllow`), so it never runs ahead of real time. It is the same
+   rule rollback's catch-up (A. EXACT) follows. Rejoin keeps its own faster catch-up.
+
+### Before / after (same rig: `tools/netplay_device_matrix.mjs`, 60 s per cell)
+
+Rates are host / joiner. GameCube is quoted by its guest-clock witness, the others by
+engine frames. "Load" is the cell's max 1-min load on this 4-core box. Every cell had
+0 desyncs and the firewall proof.
+
+| console · arm | before (`61bcf988`, 10-07) | relay → delay (`b76759f1`) | + delay catch-up (`8c9e6f80`) | load (after) |
+|---|---|---|---|---|
+| Genesis `fw` 150 ms | 0.9427 / 0.9463 · stalls 21 / 155 | 0.9865 / 0.9887 · 0 / 16 | **0.9955 / 0.9966 · 0 / 0** (delay 22) | 9.7 |
+| Genesis `fw300` | 0.8218 / 0.8278 · 180 / 213 | 0.9529 / 0.9562 · 6 / 44 | **0.9769 / 0.9788 · 2 / 25** (delay 30) | 10.5 |
+| PS1 `fw` 150 ms | 0.9789 / 0.9859 · 8 / 3 | 0.9878 / 0.9953 · 0 / 47 | **0.9997 / 1.0001 · 1 / 0 — PASS** (delay 27) | 7.4 |
+| PS1 `fw300` | (not run) | 0.987 / 0.9868 · 61 / 67 | **1.0007 / 1.0001 · 62 / 0 — PASS** (delay 30) | 4.0 |
+| GameCube `fw` 150 ms | 0.852 / 0.849 · 184 / 284 (rollback, never left) | 0.9437 / 0.9396 · 26 / 26 | 0.9373 / 0.9415 · 37 / 38 (delay 30) | 14.5 |
+| GameCube `fw300` | (not run) | 0.8968 / 0.9146 · 73 / 56 | 0.9022 / 0.8702 · 89 / 95 (delay 30) | 17.3 |
+
+Runs: `/tmp/npdm/rl-all-2` (middle column) and `/tmp/npdm/rl-all-4` (right), both under
+`tools/probe_lock.sh`, with `NPDM_MIN_FREE_GB` lowered to 2-2.5 because the box had
+3.6-3.8 GB free. The 10-07 column is the table above. No relay cell fast-forwarded: the
+fastest 5-s window was at most 1.0133x (GameCube `fw` engine), and Genesis/PS1 stayed
+at or under 1.0086x.
+
+### What is still short, and why
+
+- **GameCube is limited by this box in delay lockstep, not by the relay.** The direct
+  control in delay lockstep (`--arms a --query '&rb=0'`, `/tmp/npdm/gc-a-rb0`, load 12.9)
+  ran at **0.9718 / 0.963 with 95 / 598 stalls** on a 4-frame delay. The direct rollback
+  control reads ~1.006 because prediction hides the two instances' thread hiccups. Delay
+  lockstep cannot hide a stop longer than its slack: the measured mean lead is 9-15 frames
+  of the 30, and stalls run up to 484-586 ms. At 30 frames the relay is at its ceiling
+  (`RELAY_MAX_DELAY`), so more delay is not available. A GameCube relay room at 1.000x on
+  this box needs a cheaper GameCube frame, or a box that is not running both players.
+- **Genesis `fw300` 0.977x**: a relay that needs more than 30 frames (one-way ~330 ms +
+  batches) runs at the 30-frame ceiling and still stalls on the tail.
+- **Genesis audio dropouts** (13.8 / 43 per minute on the host) remain on the relay arms.
+  They were 90 / 149 per minute before. They are not judged here.
+
+### Suites on `8c9e6f80` (2026-10-08 02:04-02:19, under `tools/probe_lock.sh`, load 2.6-10.2)
+
+Node: `netplay_rollback_test` 28/28, `netplay_rb_capacity_test` 29/29 (adds three cells:
+`relay-mid-room` switches at t=4.0 s to delay 23, `relay-at-start` starts in delay 23
+and runs no rollback frame, `relay-shallow` keeps rollback when the need is 10 frames;
+`away-across-the-switch` now compares switches only up to the frame the slowest console
+reached, because a return to rollback named 2 frames past a console's last frame is
+still in flight, not missed), `netplay_lockstep_test` 152/152, `delay_stepdown_test` 26/26,
+`netplay_rb_pace_sim` 15/15, `netplay_pace_sim` 18/18, `netplay_pace_sim_n` 6/6.
+Browser: `snes_rollback_probe` 19/19, `ps1_netplay_test` 26/26 (needs `CHROME_PATH` on
+this box), `gc_rollback_det_test` 7/7, `gc_netplay_room_test` (RUN_MS=120000) 20/20,
+`n64/tools/lockstep_probe.mjs` GATE PASS, `dreamcast/tools/room_desync_soak.mjs --game
+pso2 --soak 60` IN SYNC over 32 RAM checkpoints and 32 fingerprints. The soak ran against
+the live `:8080` tree, not a hermetic snapshot; its md5s were STABLE.
+
+### Is the prod N64 / Dreamcast direct-room regression real? No.
+
+The PR 238 live bench read N64 room 0.9826 and Dreamcast 0.9814 on the default ANGLE arm.
+Matched pairs, served locally by two `tools/devserver.mjs` roots that differ only in
+`lib/netplay.js` (`8bf4ff1`'s `bb106f86` vs prod's `f1c13bf4`), with a fresh browser per
+run, interleaved ABBA, `?bench=1&benchauto=1&benchsec=20`:
+
+| batch (load) | N64 room old / new | Dreamcast room old / new |
+|---|---|---|
+| 1, 4 reps (4.7-8.1) | 0.9762 0.9919 0.975 0.9939 / 0.9809 0.9971 0.9742 0.9949 | 1.0014 0.99 0.9989 0.9945 / 1.002 0.9992 0.9964 0.9999 |
+| 2, 3 reps after a container restart (3.8-7.0) | 0.9988 1.0 0.9997 / 0.9992 1.0 0.9988 | 0.9997 1.0006 1.0 / 1.0016 0.9946 0.9299* |
+
+\* that run's SOLO read 0.9894 too: the box was disturbed for the whole page, not the room.
+
+The old engine failed N64 exactly as often as the new one did before the restart (2 of 4
+each), and both passed every N64 rep after it. A third arm put back the pre-PR
+`n64/bementalJIT/mips_emit.js`, the only other N64 file PR 238 changed. It read 0.9852
+mean against 0.979 for current, 4 reps each, at load 3.7-6.0. Every one of those 8 runs
+was under 0.995. So the failing reads were the box's state at the time, not either change.
+
 ## What is NOT shown
 
 - **Real hardware on a real 443-only network.** The firewall is real (kernel), but both

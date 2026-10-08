@@ -207,7 +207,10 @@ function adversarial(name, cells) {
   for (const c of cells) {
     const r = simulate(Object.assign({ name, loss: 0.02, rbResume: true, runFrac: RUN_FRAC }, c));
     n++;
-    const seqs = Object.values(r.consoles).map((x) => x.modes.map((m) => m.to + '@' + m.frame).join(','));
+    // (a switch named for a frame some console had not reached when the run
+    // ended is still in flight, not missed: compared up to the slowest console)
+    const reach = Math.min(...Object.values(r.consoles).map((x) => x.frames));
+    const seqs = Object.values(r.consoles).map((x) => x.modes.filter((m) => m.frame <= reach).map((m) => m.to + '@' + m.frame).join(','));
     switches += r.consoles.H.modes.length;
     const failed = Object.entries(r.consoles).filter(([, x]) => x.state === 'failed').map(([k, x]) => k + ': ' + x.error);
     if (!seqs.every((x) => x === seqs[0]) || r.desyncs || r.truthBad || !r.truthChecked || failed.length) {
@@ -283,6 +286,52 @@ if (want('away-15s-in-a-delay-room')) {
   }
   ok('away-15s-in-a-delay-room', !bad.length, `${n} rooms in delay lockstep, a player away 15 s: ${rejoins} taken back, none failed, 0 desyncs, never below the ungated room (two players: but for the 3.5 s longer stall before the drop)`
      + '\n        ' + (bad.length ? bad.slice(0, 4).join('\n        ') : rows.slice(0, 4).join('\n        ')));
+}
+// ---- A RELAYED ROOM IS A DELAY ROOM (lib/netplay.js RELAY_RB_NEED_MAX) ------
+// Every console fast (1.5 ms), 190 ms one way + 40 ms jitter: the path of a
+// room on the 443 MQTT relay (docs/netplay/firewall.md: 372-448 ms relay RTT).
+// On the real relay the gate never moved a GameCube room (window pinned at 30,
+// 0.85x) and moved Genesis only after 34 s of stalls at 0.94x. Now:
+//   relay-mid-room   the Session measures the relay's need (23 frames) 3 s into
+//       a rollback room: the room switches to delay at once, at >= that need, at
+//       the same frame everywhere, said as a relay; never back to rollback.
+//   relay-at-start   the need is known before the start: the room starts in
+//       delay at that need and stays; no switch, no rollback frame run.
+//   relay-shallow    a relay that needs only 10 frames (<= 12) keeps rollback.
+if (want('relay-mid-room') || want('relay-at-start') || want('relay-shallow')) {
+  const NEED = 23;
+  const base0 = { seed: 9, secs: 40, players: 2, baseMs: 190, jitterMs: 40, loss: 0.01, runFrac: RUN_FRAC, rbResume: true };
+  if (want('relay-mid-room')) {
+    globalThis.__simTick = (p, T) => { if (T >= 3000 && !p.ls.relayNeed) p.ls.relayNeed = NEED; };
+    let r;
+    try { r = simulate(Object.assign({ name: 'relay-mid' }, base0)); } finally { delete globalThis.__simTick; }
+    const bad = base(r), h = r.consoles.H, sw = h.modes[0];
+    if (!(sw && sw.to === 'delay' && h.modes.length === 1)) bad.push('switches ' + JSON.stringify(modesOf(r)));
+    if (sw && !(sw.delay >= NEED)) bad.push('switched to delay ' + sw.delay + ' < the relay need ' + NEED);
+    if (sw && !(sw.t < 6000)) bad.push('switched only at t=' + sw.t + ' ms (the need was known at 3000)');
+    if (sw && !/on a relay/.test(sw.text)) bad.push('the switch is not said as a relay: "' + sw.text + '"');
+    if (!sameEverywhere(r)) bad.push('switch frames differ: ' + JSON.stringify(modesOf(r)));
+    ok('relay-mid-room', !bad.length, `room ${r.minRate.toFixed(4)}x  switch ${sw ? sw.to + '(' + sw.delay + ')@' + sw.frame + ' t=' + (sw.t / 1000).toFixed(1) + 's "' + sw.text + '"' : 'none'}`
+       + `  end ${Object.values(r.consoles).map((c) => c.mode + (c.mode === 'delay' ? c.delay : '')).join('/')}  desync ${r.desyncs} truth ${r.truthChecked - r.truthBad}/${r.truthChecked}`
+       + (bad.length ? '\n        ' + bad.join('; ') : ''));
+  }
+  if (want('relay-at-start')) {
+    const r = simulate(Object.assign({ name: 'relay-start', relayNeed: NEED, hintMs: 190 }, base0));
+    const bad = base(r), h = r.consoles.H;
+    const ends = Object.values(r.consoles);
+    if (!ends.every((c) => c.mode === 'delay' && c.delay >= NEED)) bad.push('end ' + ends.map((c) => c.mode + c.delay).join('/'));
+    if (!(h.modes.length === 1 && h.modes[0].to === 'delay' && h.modes[0].frame <= 1)) bad.push('modes ' + JSON.stringify(modesOf(r)));
+    if (ends.some((c) => c.rollbacks > 0)) bad.push('a rollback ran');
+    ok('relay-at-start', !bad.length, `room ${r.minRate.toFixed(4)}x  start ${h.modes[0] ? h.modes[0].to + '(' + h.modes[0].delay + ') "' + h.modes[0].text + '"' : 'none'}`
+       + `  end ${ends.map((c) => c.mode + (c.mode === 'delay' ? c.delay : '')).join('/')}  desync ${r.desyncs} truth ${r.truthChecked - r.truthBad}/${r.truthChecked}`
+       + (bad.length ? '\n        ' + bad.join('; ') : ''));
+  }
+  if (want('relay-shallow')) {
+    const r = simulate(Object.assign({ name: 'relay-shallow', relayNeed: 10 }, base0, { baseMs: 40, jitterMs: 10 }));
+    const bad = base(r);
+    if (Object.values(r.consoles).some((c) => c.modes.length || c.mode !== 'rollback')) bad.push('modes ' + JSON.stringify(modesOf(r)));
+    ok('relay-shallow', !bad.length, `room ${r.minRate.toFixed(4)}x  end ${Object.values(r.consoles).map((c) => c.mode).join('/')}` + (bad.length ? '\n        ' + bad.join('; ') : ''));
+  }
 }
 // ---- THE DEVICE CAP ON THE WINDOW (opts.rbMaxWindow, 'lsrb'/'lsready' mw) ----
 // A path that wants a deep window (150 ms one way: ~27 frames) and a console

@@ -207,6 +207,10 @@ export function simulate(sc) {
     p.ls = old ? new (oldLockstep(sc.oldRef || 'ffc0f52'))(opts) : new Lockstep(opts);
     p.old = !!old;
     if (!sc.readyStepMs) p.ls.selfStepMs = p.stepMs;
+    // sc.relayNeed: the room's path is the MQTT relay and it needs this many
+    // frames of input delay BEFORE the start (Session._relayHeard sets
+    // ls.relayNeed, and ls.delay to it, on every machine).
+    if (sc.relayNeed > 0) { p.ls.relayNeed = sc.relayNeed; p.ls.delay = sc.relayNeed; }
     p.ls.on('mode', (e) => p.modes.push({ t: Math.round(T), frame: e.frame, to: e.to, delay: e.delay, window: e.window, mine: e.mine, text: e.text }));
     // A room just back in rollback drains the delay queue it built: its own
     // pad reaches the frames already on the wire late (by design) until then.
