@@ -29,6 +29,26 @@
 
 const HDR_HEAD = 0, HDR_TAIL = 1, HDR_CAPACITY = 2, HDR_ELEMSIZE = 3, HDR_WORDS = 4;
 
+// [proxy-service 2026-10-12] WHILE THIS THREAD WAITS ON THE REPLAY, RUN THE CALLS PROXIED TO IT.
+// The producer is dolphin_worker's emscripten MAIN runtime thread, which also runs Dolphin's GPU
+// slice (Fifo.cpp RunGpuLoopSlice) and owns MEMFS — so every disc read the CPU thread makes
+// (File::DirectIOFile::OffsetRead -> fd_pread) is PROXIED here and waits until this thread looks
+// at its mailbox. When the replay (SwiftShader on a no-GPU device) is behind, this thread used to
+// busy-spin on a full ring / a ctrl round-trip, servicing nothing: a profile of SAB City Escape on
+// WebGL2 had the CPU thread 31% blocked in proxied fd_pread and this thread 49% in the ring-full
+// spin (Atomics.load head/tail). Now a wait (a) runs the queued proxied calls — exactly what
+// emscripten's own futex wait does on a main thread — and (b) sleeps in short slices instead of
+// spinning, so the spare core goes to SwiftShader and the JIT thread. Re-entrancy-guarded.
+let __svcDepth = 0;
+function serviceProxied() {
+  if (__svcDepth) return;
+  const f = (typeof self !== 'undefined') ? self.__emscripten_check_mailbox : null;
+  if (typeof f !== 'function') return;
+  __svcDepth = 1;
+  try { f(); } catch (e) { /* a proxied call's own failure is reported by its caller */ }
+  finally { __svcDepth = 0; }
+}
+
 // Opcode order — MUST equal render-worker.js METHODS.
 const OP = {
   bindBufferRange: 0, bindFramebuffer: 1, scissor: 2, bufferSubData: 3, colorMask: 4,
@@ -153,7 +173,8 @@ class GLRecorder {
     // Wait for response (FUTEX flips 1 -> 2). Bounded spins keep this safe even
     // if the render-worker is briefly behind.
     while (Atomics.load(c, CTRL_FUTEX) !== 2) {
-      Atomics.wait(c, CTRL_FUTEX, 1, 50);
+      serviceProxied();
+      Atomics.wait(c, CTRL_FUTEX, 1, 1);
     }
     const r = c[CTRL_RESULT] | 0;
     Atomics.store(c, CTRL_FUTEX, 0);
@@ -177,7 +198,7 @@ class GLRecorder {
     c[CTRL_ARG] = index | 0;
     Atomics.store(c, CTRL_FUTEX, 1);
     Atomics.notify(c, CTRL_FUTEX);
-    while (Atomics.load(c, CTRL_FUTEX) !== 2) { Atomics.wait(c, CTRL_FUTEX, 1, 50); }
+    while (Atomics.load(c, CTRL_FUTEX) !== 2) { serviceProxied(); Atomics.wait(c, CTRL_FUTEX, 1, 1); }
     const size = c[CTRL_AU_SIZE] | 0;
     const type = c[CTRL_AU_TYPE] | 0;
     const nameLen = c[CTRL_AU_NAMELEN] | 0;
@@ -216,8 +237,12 @@ class GLRecorder {
         }
         return;
       }
-      // ring full: brief pause; consumer is draining on its own thread.
+      // ring full: the consumer is behind. Service proxied calls, then sleep a short slice
+      // (no notify needed: TAIL moving ends the wait early only if it changed before the call;
+      // the 0.25 ms timeout bounds the added latency on a ring that is a full ring behind).
       __spins++;                                        // [PROFILE]
+      serviceProxied();
+      Atomics.wait(ring, HDR_TAIL, tail, 0.25);
     }
   }
 
