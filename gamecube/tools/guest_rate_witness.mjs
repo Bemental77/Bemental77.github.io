@@ -231,6 +231,16 @@ function makeSnapshot() {
     }
     console.log(`  snapshot worker replaced from WITNESS_WORKER_DIR=${wd}`);
   }
+  // WITNESS_FILES="rel=src[,rel=src]": serve a FROZEN COPY of src at rel (relative to the repo
+  // root, e.g. gamecube/gl-record.js=/tmp/x/gl-record.js) instead of the symlinked live file —
+  // for A/B of runtime-loaded JS (gl-record.js / render-worker.js are importScripts'd, no relink).
+  for (const spec of (process.env.WITNESS_FILES || '').split(',').filter(Boolean)) {
+    const [rel, src] = spec.split('=');
+    const dst = path.join(snap, rel);
+    try { fs.unlinkSync(dst); } catch (_e) { /* absent */ }
+    fs.copyFileSync(src, dst);
+    console.log(`  snapshot ${rel} <- ${src} (md5 ${md5(dst)})`);
+  }
   // WITNESS_PAGE_REV=<rev>: serve gamecube.html and the dolphin_worker.js shim from a git
   // revision instead of the working tree. Without it the snapshot SYMLINKS gamecube.html, so
   // a sibling agent's half-finished page edit lands inside a measured cell (2026-10-01: two

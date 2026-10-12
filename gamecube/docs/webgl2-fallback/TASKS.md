@@ -1,5 +1,46 @@
 # WebGL2 fallback for devices with NO WebGPU (the Xbox case)
 
+## ★★★ 2026-10-12 — SAB's no-GPU guest rate was bound by DISC READS WAITING ON THE GL RECORDER, not the JIT
+
+SAB City Escape (`sab-ingame-mips`, `PROBE_VANILLA_WEBGPU=1` = WebGL2 on SwiftShader, 4-core box,
+worker `f903a162`). Attribution profile (`PROBE_CPU_PROFILE=1`, attribution only — never compared
+to an unprofiled number):
+
+| thread | where its time went |
+|---|---|
+| CPU/JIT (pthread) | **31% blocked in `_fd_pread` proxied to the main runtime thread** (`File::DirectIOFile::OffsetRead` — SAB streams from disc in-level); 2% `Throttle` |
+| dolphin_worker main runtime thread (= Dolphin GPU slice `RunGpuLoopSlice` + MEMFS owner) | `emit` 54% — of which **49% on the two `Atomics.load` lines of the ring-full SPIN** (gl-record.js); `ctrlQuery` 17% (`getUniformBlockIndex` in `CreatePipeline`) |
+
+The chain: SwiftShader replays slower than Dolphin records → the GL ring fills → the recorder spins
+on the main runtime thread → that thread never looks at its mailbox → every CPU-thread disc read
+(MEMFS lives there, so `fd_pread` is proxied) waits out the spin → the guest stalls. The 84%
+idle-skip was never the binding fact; the CPU thread was waiting on the renderer through the disc.
+
+**Fix (gl-record.js `serviceProxied`, JS only, no relink):** while the recorder waits (ring full,
+ctrl round-trips) it runs `__emscripten_check_mailbox()` — what emscripten's own main-thread futex
+wait does — and sleeps 0.25 ms (`Atomics.wait` on TAIL) instead of spinning. Re-entrancy-guarded.
+
+ABBA matched pairs, same frozen worker, one global `probe_lock` hold each, restore proven every cell
+(`ack=true`, discontinuity@36.8 s), guest = CREDITED W1, idle-skip from `?bjit_mips=1`:
+
+| arm | guest (W1) | idle-skip | drawn/s | JIT thread run frac | W1 per JIT-CPU-s | load 1-min |
+|---|---|---|---|---|---|---|
+| base (HEAD gl-record) | 0.7102, 0.7274 | 84.0, 84.3% | 2.1, 2.0 | 0.73, 0.73 | 0.99, 1.04 | 8.9-9.1 |
+| **fix** | **0.9510, 0.9494** | 83.9, 84.6% | 2.8, 2.1 | 0.44, 0.41 | 2.05, 2.27 | 5.4-9.1 |
+| fix (2nd pair, B arm) | 0.9886, 0.9918 | 84.1, 84.3% | 2.8, 2.8 | — | 2.07, 2.12 | 6.5-7.0 |
+
+Guest **+32%** (0.719 → 0.950 mean, same-pair), and the JIT thread needs ~half the CPU per guest
+second (it was burning CPU while its pread waited). A variant that also services the mailbox every
+64 recorded commands was WORSE (0.9601, 0.8943 vs 0.9886, 0.9918) — not shipped.
+
+Regression checks with the fix: MP4 cold boot (recomp, no WebGPU) renders the title (14.2 drawn/s);
+`gc_netplay_room_test NO_WEBGPU=1 RUN_MS=240000` 20/20 PASS, 0 desyncs, room mean 1.0009x/1.0010x.
+
+**Still open:** drawn/s is ~2-3 — SwiftShader replay is the frame-rate bound (gpu-process 1.3-2.4
+cores). `ctrlQuery` (`getUniformBlockIndex` per new pipeline, 16% of the GPU slice) is the next cost
+on the record side. The structural fix for the disc path is to stop proxying reads at all (serve the
+ISO from a SharedArrayBuffer the CPU thread reads directly) — needs a relink.
+
 ## ★★★ 2026-10-03 (latest) — WebGPU "PRESENT STALLED" on MP4: a REAL bug (unbounded GPU queue), FIXED in `27c1326`
 
 **It was not a stuck promise.** A snapshot-only wrapper on `GPUBuffer.mapAsync` / `GPUQueue.submit`
