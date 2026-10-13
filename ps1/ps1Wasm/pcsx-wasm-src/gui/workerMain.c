@@ -51,6 +51,7 @@ static void CreateMemcard(char *filename, char *conf_mcd)
     }
 }
 void execI();
+void psxJitFrame(void);
 #include <emscripten.h>
 extern long updated_display;
 int DoGPUUpdate = 0;
@@ -67,10 +68,7 @@ void one_iter()
         updated_display = -1;
     }
     DoGPUUpdate = 0;    
-    while (!DoGPUUpdate)
-    {
-        execI();
-    }
+    psxJitFrame();   /* while (!DoGPUUpdate) execI(); with compiled blocks (libpcsxcore/psxjit.c) */
     GPU_vBlank(0);
     //setIrq( 0x01 );
     psxHu32ref(0x1070) |= 1;

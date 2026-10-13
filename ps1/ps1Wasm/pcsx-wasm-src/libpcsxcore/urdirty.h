@@ -56,7 +56,17 @@ extern volatile uint32_t *ur_genp;
 extern uint32_t *ur_scratch;   /* UR_SCRATCH_WORDS words */
 #define UR_SCRATCH_WORDS 16
 
-#define UR_MARK(p) (ur_dirty[(uintptr_t)(p) >> UR_PAGE_SHIFT] = 1)
+/* THE JIT'S PAGE FLAGS (psxjit.c, 2026-10-12). The same block holds a second
+ * page table at ur_dirty + UR_JD_OFF that every marker sets too, and that only
+ * the recompiler clears (after re-checking the code it compiled from a page):
+ * the worker clears ur_dirty on every save, so it cannot tell the recompiler
+ * whether a page was written since a block was compiled. After it, the
+ * recompiler's own host-only state (UR_JIT_BYTES at UR_JIT_OFF): like the rest
+ * of this block it is never compared, logged, hashed or restored. */
+#define UR_JD_OFF (UR_PAGES + 4096)
+#define UR_JIT_OFF (UR_JD_OFF + UR_PAGES)
+#define UR_JIT_BYTES (12u << 20)
+#define UR_MARK(p) (ur_dirty[(uintptr_t)(p) >> UR_PAGE_SHIFT] = 1, ur_dirty[UR_JD_OFF + ((uintptr_t)(p) >> UR_PAGE_SHIFT)] = 1)
 void ur_mark_range(const void *p, size_t n);
 /* id: a small constant naming the span (UR_SPAN_*); re-registering replaces it */
 void ur_track(int id, const void *p, size_t n);

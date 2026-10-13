@@ -1058,3 +1058,89 @@ R3000Acpu psxInt = {
 	intClear,
 	intShutdown
 };
+
+/* ══ THE RECOMPILER'S WAY BACK IN (psxjit.c, 2026-10-12) ═════════════════════
+ * Compiled blocks do the plain instructions themselves and hand everything
+ * whose effects live in this file back to it, so there is one definition of
+ * each: the taken-branch tail (psxBranchTest, the VSync-wait fast-forward's
+ * vwEnter/vwClose, branch2/branchPC), the load-delay quirk (a taken branch
+ * whose delay slot loads: psxDelayTest reads the TARGET's first instruction),
+ * and every opcode a block does not do itself. Each is entered with psxRegs
+ * exactly as the interpreter would hold it at that point. */
+
+void psxJitNote(u32 base, u32 budget);
+/* cycles from now until psxBranchTest would do anything (0: something is due
+ * now): the next root-counter update or the earliest pending interrupt (the
+ * same deadlines as ilBudget, and the same tests as psxBranchTest) */
+u32 jitBudget(void) {
+	u32 c = psxRegs.cycle, i = psxRegs.interrupt, d, m;
+	if (c - psxNextsCounter >= psxNextCounter) return 0;
+	m = psxNextCounter - (c - psxNextsCounter);
+#define JB_T(bit, n) if (i & (bit)) { d = c - psxRegs.intCycle[n]; if (d >= psxRegs.intCycle[(n) + 1]) return 0; d = psxRegs.intCycle[(n) + 1] - d; if (d < m) m = d; }
+	if (!Config.Sio) JB_T(0x80, 7)
+	JB_T(0x04, 2) JB_T(0x040000, 2 + 16) JB_T(0x01000000, 3 + 24) JB_T(0x02000000, 5 + 24) JB_T(0x04000000, 1 + 24)
+#undef JB_T
+	return m;
+}
+
+/* a taken branch whose delay slot the block already did: psxRegs.code is the
+ * delay slot, psxRegs.cycle counts it — doBranch from after psxExecOp() */
+/* fl: 1 = JR (psxJumpTest after), 2 = the delay slot was a load that
+ * psxDelayTest found unrelated to the target (psxTestLoadDelay == 0): that path
+ * returns without vwClose */
+void jitTb(u32 bpc, u32 tar, u32 fl) {
+	branch2 = 1;
+	branch = 0;
+	branchPC = tar;
+	vwEnter(bpc, tar);
+	psxRegs.pc = tar;
+	psxBranchTest();
+	if (!(fl & 2)) vwClose(bpc, tar);
+	if (fl & 1) psxJumpTest();
+	psxJitNote(psxRegs.cycle, jitBudget());
+}
+
+/* a taken branch whose delay slot the block leaves to doBranch: psxRegs.pc is
+ * the delay slot, psxRegs.code the branch, the cycle counts the branch */
+void jitDoBr(u32 tar, u32 jr) {
+	doBranch(tar);
+	if (jr) psxJumpTest();
+}
+
+/* one non-branch opcode in psxRegs.code (pc already past it) */
+void jitExec(void) { psxExecOp(); }
+
+u32 jitLWL(u32 addr, u32 rt) {
+	u32 shift = addr & 3;
+	u32 mem = psxMemRead32(addr & ~3);
+	return (rt & LWL_MASK[shift]) | (mem << LWL_SHIFT[shift]);
+}
+u32 jitLWR(u32 addr, u32 rt) {
+	u32 shift = addr & 3;
+	u32 mem = psxMemRead32(addr & ~3);
+	return (rt & LWR_MASK[shift]) | (mem >> LWR_SHIFT[shift]);
+}
+void jitSWL(u32 addr, u32 rt) {
+	u32 shift = addr & 3;
+	u32 mem = psxMemRead32(addr & ~3);
+	psxMemWrite32(addr & ~3, (rt >> SWL_SHIFT[shift]) | (mem & SWL_MASK[shift]));
+}
+void jitSWR(u32 addr, u32 rt) {
+	u32 shift = addr & 3;
+	u32 mem = psxMemRead32(addr & ~3);
+	psxMemWrite32(addr & ~3, (rt << SWR_SHIFT[shift]) | (mem & SWR_MASK[shift]));
+}
+
+/* the addresses of this file's statics a compiled block reads or writes in its
+ * taken-branch fast path (psxjit.c emitBranch: when jitTb would only set them) */
+u32 jitAddr(int i) {
+	switch (i) {
+	case 0: return (u32)(uintptr_t)&branch2;
+	case 1: return (u32)(uintptr_t)&branchPC;
+	case 2: return (u32)(uintptr_t)&vw_valid;
+	case 3: return (u32)(uintptr_t)&il_on;
+	case 4: return (u32)(uintptr_t)&vw_L;
+	case 5: return (u32)(uintptr_t)&vw_B;
+	default: return (u32)(uintptr_t)&vw_ok;
+	}
+}

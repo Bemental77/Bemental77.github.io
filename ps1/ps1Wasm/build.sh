@@ -45,6 +45,15 @@
 # the new build's from its linker map (tools/reappend.mjs --repoint) and runs
 # every check against the rewritten block. A rebuild of the committed source
 # needs neither: it reproduces dist/ byte for byte.
+#
+# ── THE RECOMPILER (2026-10-12) ─────────────────────────────────────────────────
+# libpcsxcore/psxjit.c compiles hot guest code to wasm at run time (header there).
+# Its proofs, all run against the build this script makes:
+#   tools/ps1_core_equiv.mjs (whole MR2 and Harry Potter discs vs the previous
+#   dist: RAM, hardware page and VRAM), tools/ps1_rollback_probe.mjs with
+#   --query urcheck=1 (and urcheck=1&jitstress=1, which installs compiled code at
+#   random times), --players 3/4, --broken / --broken-mt failing. Worker URL
+#   switches: ?jit=0 (interpreter only), ?jitstress=1, ?jitnames=1.
 set -eo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=${1:-$HERE/dist}
