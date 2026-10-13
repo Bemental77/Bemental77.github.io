@@ -360,7 +360,8 @@ class RegShadow {
 // k < count <= 0x10000, so every key it can produce is below 0x20000.
 const gxShadow = { cp: new RegShadow(0x100), xf: new RegShadow(0x20000), bp: new RegShadow(0x100) };  // for the takeover prologue
 let sentPrologue = false;
-let cacheDirty = false;   // the renderer's copy of guest RAM can no longer be trusted: full image
+let imageSent = false;    // the renderer has had the session's one full mem1 image (NO FRAME SHIPS THE 24 MiB IMAGE)
+let cacheDirty = false;   // the renderer's copy of guest RAM can no longer be trusted: reset every cache (no image since 2026-10-12)
 // ── A DVD READ RESETS THE CACHES; IT DOES NOT SHIP THE WHOLE OF MEM1 (2026-10-08) ─────────────
 // A DVD read used to set cacheDirty, i.e. ship the full 24 MiB mem1 image next frame. The reason a
 // load needs anything is that the heap turns over on scene loads, so every address-keyed cache
@@ -427,6 +428,70 @@ function perVertSize(vat) {
   return s;
 }
 
+// ── AN ARRAY IS SENT AS FAR AS IT IS READ, NOT TO THE NEXT THING IN MEMORY (2026-10-12) ─────────
+// A vertex/matrix array's extent used to be only the clip heuristic: from its base to the next known
+// base (another array, a DL, a texture), capped at 256 KiB. MEASURED (MP4 title, frames 725-1500,
+// the renderer's RAM rebuilt from what is shipped and compared with every cache entry each frame): the
+// one entry that ever went stale was the texcoord array 0x79ea40|8: its clip extent ran 20352 bytes,
+// its draws read 464 (58 texcoords, through frame 760), and every stale byte sat 3120-19979 bytes in,
+// in rows 324 bytes apart the game rewrites without a cache flush — data the renderer never reads. Every frame's walk now also records how far the draws
+// and the XF index loads actually reach into each (base, stride) binding — arrUsed, per frame, like
+// pairSeen — and discovery sends min(clip extent, that), rounded up to 32 bytes; a binding no draw of
+// the frame reached keeps the clip extent as before. A later draw that reaches further GROWS the entry
+// (the missing bytes go out as their own region, up to the clip extent recorded at discovery), so the
+// renderer never reads past what it was sent — the same bound as before, since the clip was the cap.
+const arrUsed = new Map();           // per-frame: base * 256 + stride -> bytes read from base
+const arrClip = new Map();           // "base|stride" -> the clip extent at discovery (the growth cap)
+// Draws only raise slotUse[si], the reach into slot si's CURRENT binding; it is noted in arrUsed when
+// that binding changes (a CP base/stride write) and before discovery reads arrUsed (arrFlushSlots):
+// a Map operation per draw on a double key cost the walk of MP4's frame 725 ~3x its time.
+const slotUse = new Float64Array(16);
+let noteReach = true;                // false while a held frame is walked
+function arrFlushSlots() { for (let si = 0; si < 16; si++) if (slotUse[si] > 0) { arrNote(si, slotUse[si]); slotUse[si] = 0; } }
+function arrNote(si, bytes) {
+  const b = arrayBase[si] >>> 0, st = arrayStride[si] >>> 0;
+  if (!b || !st || st > 0xFF) return;   // (the stride register is 8 bits; anything else keeps the clip extent)
+  const k = b * 256 + st, u = arrUsed.get(k);
+  if (u === undefined || bytes > u) arrUsed.set(k, bytes);
+}
+// The INDEXED attributes of a vertex on `vat` as [offset in the vertex, index bytes, array slot, ...]
+// in ixA[vat] (attrList's order and sizes; ixN[vat] = the used length), memoised like perVertSize and,
+// like it, computed without allocating: the VCD changes from one display list to the next, so this is
+// recomputed on most draws of a frame that walks many. (Built on attrList first, a bench room's held
+// frame 725 — 1296 new display lists walked — held the guest 42.5 ms, against 16 ms on HEAD.)
+const ixLo = new Int32Array(8), ixHi = new Int32Array(8), ixVa = new Int32Array(8), ixOk = new Uint8Array(8);
+const ixN = new Int32Array(8), ixA = []; for (let i = 0; i < 8; i++) ixA.push(new Int32Array(64));
+function ixPut(vat, t, directSz, slot, off) {
+  if (t >= 2) { const a = ixA[vat], k = ixN[vat]; a[k] = off; a[k + 1] = t === 2 ? 1 : 2; a[k + 2] = slot; ixN[vat] = k + 3; }
+  return off + pvAdd(t, directSz);
+}
+function idxAttrs(vat) {
+  const va = vatA[vat];
+  if (ixOk[vat] && ixLo[vat] === (vcdLo | 0) && ixHi[vat] === (vcdHi | 0) && ixVa[vat] === (va | 0)) return ixN[vat];
+  ixN[vat] = 0;
+  let off = 0;
+  if (vcdLo & 1) off++;
+  for (let i = 0; i < 8; i++) if (vcdLo & (1 << (1 + i))) off++;
+  off = ixPut(vat, (vcdLo >> 9) & 3, (((va & 1) ? 3 : 2)) * FMT_SZ[(va >> 1) & 7], 0, off);
+  off = ixPut(vat, (vcdLo >> 11) & 3, ((((va >> 9) & 1) ? 9 : 3)) * FMT_SZ[(va >> 10) & 7], 1, off);
+  off = ixPut(vat, (vcdLo >> 13) & 3, COL_SZ[(va >> 14) & 7], 2, off);
+  off = ixPut(vat, (vcdLo >> 15) & 3, COL_SZ[(va >> 18) & 7], 3, off);
+  for (let i = 0; i < 8; i++)
+    off = ixPut(vat, (vcdHi >> (2 * i)) & 3, i === 0 ? (((va >> 21) & 1) ? 2 : 1) * FMT_SZ[(va >> 22) & 7] : 8, 4 + i, off);
+  ixLo[vat] = vcdLo | 0; ixHi[vat] = vcdHi | 0; ixVa[vat] = va | 0; ixOk[vat] = 1;
+  return ixN[vat];
+}
+function drawNote(buf, p, n, vs, ix, len) {
+  for (let a = 0; a < len; a += 3) {
+    const off = p + ix[a], sz = ix[a + 1];
+    let mx = 0;
+    if (sz === 1) { for (let v = 0, q = off; v < n; v++, q += vs) { const i = buf[q]; if (i > mx) mx = i; } }
+    else { for (let v = 0, q = off; v < n; v++, q += vs) { const i = (buf[q] << 8) | buf[q + 1]; if (i > mx) mx = i; } }
+    const si = ix[a + 2], need = (mx + 1) * (arrayStride[si] & 0xFF);
+    if (need > slotUse[si]) slotUse[si] = need;
+  }
+}
+
 // Walk one GX stream (frame or DL body): update reg shadows, collect new DLs, and for
 // indexed draws track max index per bound array. buf = Uint8Array, guest = whether offsets
 // are guest addresses (DL bodies) — used only for labels.
@@ -437,7 +502,7 @@ function rdU32b(buf, o) { return ((buf[o] << 24) | (buf[o + 1] << 16) | (buf[o +
 // re-binds the same pair on almost every draw. psGen moves at every pairSeenClear().
 let psGen = 1;
 const psSlotGen = new Int32Array(16), psSlotB = new Float64Array(16), psSlotS = new Float64Array(16);
-function pairSeenClear() { pairSeen.clear(); psGen++; }
+function pairSeenClear() { pairSeen.clear(); psGen++; arrUsed.clear(); slotUse.fill(0); }
 // A DL whose current binding signature is the one it last matched is already in its keys Set —
 // unless a keys Set was cleared since (dlKeysEpoch moves at every such clear).
 let dlKeysEpoch = 1;
@@ -450,12 +515,17 @@ let memViewU8 = null;
 // guest memory from MEM1 up (offsets are MEM1-relative, so they stay small integers)
 function memView(mem) { if (!memViewU8 || memViewU8.buffer !== mem.buffer) memViewU8 = new Uint8Array(mem.buffer, 0x80000000); return memViewU8; }
 const DL_SIG_CACHE = 8;   // the signatures a DL's entry remembers (Hu3D calls one DL with several)
-function walkStream(mem, buf, start, end, depth, newDLs, touched) {
+// `deadline` (performance.now(); 0 = none) makes the TOP-LEVEL walk resumable: past it, the walk
+// returns the offset of the next command, to be passed back as `start` (THE SHIP STEP RUNS IN THE
+// GUEST'S SLACK). A display list's body is always walked whole. Otherwise it returns `end`.
+let wsTick = 0;
+function walkStream(mem, buf, start, end, depth, newDLs, touched, deadline) {
   let p = start;
   // [perf 2026-08-28] these were closures over `buf`, rebuilt on EVERY call — and walkStream
   // recurses once per display list. [2026-10-06] and the closures that replaced them were not
   // inlined either (a CPU profile of the ship step put 25% of it in them): rdU16b/rdU32b direct.
   while (p < end) {
+    if (deadline !== 0 && ++wsTick >= 32) { wsTick = 0; if (performance.now() >= deadline) return p; }
     const op = buf[p++];
     if (op === 0x00) continue;
     else if (op === 0x08) {
@@ -463,8 +533,13 @@ function walkStream(mem, buf, start, end, depth, newDLs, touched) {
       gxShadow.cp.set(a, v);
       if (a === 0x50) vcdLo = v; else if (a === 0x60) vcdHi = v;
       else if (a >= 0x70 && a <= 0x77) vatA[a - 0x70] = v;
-      else if (a >= 0xA0 && a <= 0xAF) arrayBase[a - 0xA0] = v;
+      else if (a >= 0xA0 && a <= 0xAF) {
+        const si = a - 0xA0;
+        if (slotUse[si] > 0) { arrNote(si, slotUse[si]); slotUse[si] = 0; }   // the reach of the binding it replaces
+        arrayBase[si] = v;
+      }
       else if (a >= 0xB0 && a <= 0xBF) {
+        if (slotUse[a - 0xB0] > 0) { arrNote(a - 0xB0, slotUse[a - 0xB0]); slotUse[a - 0xB0] = 0; }
         arrayStride[a - 0xB0] = v;
         // FIXTURE-PARITY array discovery: every stride write pairs with its slot's current
         // base — collect the pair regardless of DLs. (Index-walk extents missed every
@@ -519,7 +594,12 @@ function walkStream(mem, buf, start, end, depth, newDLs, touched) {
         if (base) texBound.set(base, Math.max(texBound.get(base) || 0, size));
       }
     }
-    else if (op >= 0x20 && op <= 0x38 && (op & 7) === 0) p += 4;
+    else if (op >= 0x20 && op <= 0x38 && (op & 7) === 0) {
+      // XF index load A-D: (length+1) words from array 12-15 at index * stride
+      const v = rdU32b(buf, p); p += 4;
+      const si = 12 + ((op - 0x20) >> 3), need = (v >>> 16) * (arrayStride[si] & 0xFF) + ((((v >>> 12) & 0xF) + 1) << 2);
+      if (need > slotUse[si]) slotUse[si] = need;
+    }
     else if (op === 0x48) continue;
     else if (op === 0x40) {
       const addr = rdU32b(buf, p), size = rdU32b(buf, p + 4); p += 8;
@@ -551,7 +631,7 @@ function walkStream(mem, buf, start, end, depth, newDLs, touched) {
           // new view per DL: a full-image frame walks ~1300 of them.
           const ofs = addr & 0x01FFFFFF, mv = memView(mem);
           if (ofs + size > mv.length) throw new RangeError('DL 0x' + (addr >>> 0).toString(16) + '+' + size + ' runs past guest memory');
-          walkStream(mem, mv, ofs, ofs + size, depth + 1, newDLs, touched);
+          walkStream(mem, mv, ofs, ofs + size, depth + 1, newDLs, touched, 0);
         }
       }
     }
@@ -561,12 +641,16 @@ function walkStream(mem, buf, start, end, depth, newDLs, touched) {
     // already a multiple of 8, so the test is exactly this range check.
     else if (op >= 0x80 && op <= 0xBF) {
       const vat = op & 7, n = rdU16b(buf, p); p += 2;
-      // array extents come from the clip heuristic now (fixture parity) — draws just skip
-      p += n * perVertSize(vat);
+      const vs = perVertSize(vat);
+      // how far this draw reads into each indexed array (AN ARRAY IS SENT AS FAR AS IT IS READ); not in a
+      // held frame's walk, which ships nothing (arrUsed is cleared with it)
+      if (noteReach && n > 0) { const il = idxAttrs(vat); if (il && p + n * vs <= end) drawNote(buf, p, n, vs, ixA[vat], il); }
+      p += n * vs;
       if (p > end) { log('DRAW OVERRUN in walk'); return; }
     }
     else { log('walk: unknown op 0x' + op.toString(16) + ' at +0x' + (p - 1).toString(16)); return; }
   }
+  return end;
 }
 
 // THE PROLOGUE, written straight into the frame's FIFO buffer (it used to be pushed byte by byte
@@ -629,12 +713,15 @@ function swap4InPlace(out) {
 }
 const f32Arrays = [];   // [{b, e}] guest-phys intervals of known f32 (stride 8/12) arrays
 // Returns a VIEW of guest memory and whether the shipped copy is byte-swapped (packRegions).
-function regionBytes(mem, base, stride, count) {
+// `f32Len`: how much of guest memory from `base` to treat as this f32 array when a dirty range is
+// classified (drainDirty) — the clip extent, not just the bytes sent (AN ARRAY IS SENT AS FAR AS IT
+// IS READ: a game that flushes its whole vertex buffer must still have it swapped); 0 = already noted.
+function regionBytes(mem, base, stride, count, f32Len) {
   const out = new Uint8Array(mem.buffer, 0x80000000 + (base & 0x01FFFFFF), count);
   const swap = stride === 8 || stride === 12;
-  if (swap) {
+  if (swap && f32Len > 0) {
     const b = base & 0x01FFFFFF;
-    f32Arrays.push({ b, e: b + count });
+    f32Arrays.push({ b, e: b + f32Len });
   }
   return { bytes: out, swap };
 }
@@ -686,7 +773,7 @@ function regionBytes(mem, base, stride, count) {
 //     region-sync caches. They describe what DOLPHIN has already been sent, and after a
 //     restore dolphin's mirror is a different timeline. Carrying them over is exactly the
 //     "the state loads but the picture never changes" failure, so the restore CLEARS them and
-//     sets cacheDirty + sentPrologue=false, forcing a full mem1 + prologue resend next frame.
+//     sets cacheDirty + sentPrologue=false, forcing a cache reset + prologue resend next frame.
 //   * The disc parts and the FST buffer — same worker, still loaded, byte-identical.
 //   * The pace SAB cells — credits/buttons/stick are live input plumbing owned by the page,
 //     not game state; the page resets its own in-flight bookkeeping on stateRestored.
@@ -810,7 +897,7 @@ function poolTake(pool, max, size) {
 function shipPoolPrewarm() {
   if (!shipPool || !paceI32) return;
   try {
-    while (mem1Pool.length < 1) { const b = new SharedArrayBuffer(0x01800000); new Uint8Array(b).fill(0); mem1Pool.push({ sab: b, seq: 0 }); }
+    // (no mem1 image buffer: the one image of a session goes out in the image spare)
     if (!regPool.length) { const b = new SharedArrayBuffer(REG_POOL_CAP); new Uint8Array(b).fill(0); regPool.push({ sab: b, seq: 0 }); }
   } catch (e) { log('ship pool prewarm failed: ' + ((e && e.message) || e)); }
 }
@@ -824,7 +911,9 @@ function shipPoolPrewarm() {
 // the image now goes out in a SPARE: a plain ArrayBuffer whose pages were faulted in ahead of time
 // — at boot, and afterwards in slices of the time the guest spends parked on its frame credit
 // (spareStep). The SharedArrayBuffer pool stays as the fallback when no spare is ready.
-const SPARE_IMG = 0x01800000, SPARE_WANT = { img: 2, reg: 1 }, SPARE_SLICE_MS = 0.5;
+// Since 2026-10-12 only the session's first frame carries an image (NO FRAME SHIPS THE 24 MiB IMAGE):
+// one image spare, never refilled once that frame has gone out.
+const SPARE_IMG = 0x01800000, SPARE_WANT = { img: 1, reg: 1 }, SPARE_SLICE_MS = 0.5;
 let shipSpares = true;
 const spare = { img: [], reg: [], fill: null, fills: 0 };
 function spareTake(kind, size) {
@@ -838,7 +927,7 @@ function spareTake(kind, size) {
 function spareStep(budgetMs) {
   if (!shipPool || !shipSpares) return false;
   if (!spare.fill) {
-    const kind = spare.img.length < SPARE_WANT.img ? 'img' : spare.reg.length < SPARE_WANT.reg ? 'reg' : null;
+    const kind = (!imageSent || testFullMem) && spare.img.length < SPARE_WANT.img ? 'img' : spare.reg.length < SPARE_WANT.reg ? 'reg' : null;
     if (!kind) return false;
     let ab;
     try { ab = new ArrayBuffer(kind === 'img' ? SPARE_IMG : REG_POOL_CAP); } catch (e) { return false; }
@@ -902,30 +991,49 @@ function swapWords(w32, k, e) {
     w32[k] = (x << 24) | ((x & 0xFF00) << 8) | ((x >>> 8) & 0xFF00) | (x >>> 24);
   }
 }
-function packRegions(regions) {
-  if (!regions.length) return;
-  if (!shipPool) {
-    for (const r of regions) { r.bytes = r.bytes.slice(); if (r.swap) swap4InPlace(r.bytes); }
-    return;
-  }
+// packBegin sizes and takes the one buffer; packStep copies regions into it until `deadline`
+// (performance.now(); Infinity = all), true when every region is out. Between steps the guest may
+// run (THE SHIP STEP RUNS IN THE GUEST'S SLACK) and grow its memory, which detaches every view of the
+// old buffer: so each region's source is kept as an offset and its view is re-made when that happens.
+function packBegin(regions) {
+  const st = { out: null, w32: null, o: 0, i: 0, buf: Module.wasmMemory.buffer };
+  for (const r of regions) { r.src = r.bytes.byteOffset; r.n = r.bytes.byteLength; }
+  if (!regions.length || !shipPool) return st;
   let total = 0;
-  for (const r of regions) total += (r.bytes.byteLength + 3) & ~3;   // 4-aligned: swaps run on words
+  for (const r of regions) total += (r.n + 3) & ~3;   // 4-aligned: swaps run on words
   // A payload of REG_POOL_MIN or more goes out in a spare when one is ready (see A FULL IMAGE IS A
   // PLAIN, ALREADY-FAULTED BUFFER), else in the pooled SharedArrayBuffer as before.
   const big = total >= REG_POOL_MIN;
   const sp = big ? spareTake('reg', total) : null;
   const sab = big && !sp ? poolTake(regPool, REG_POOL_MAX, total) : null;
   const buf = sp || sab || new ArrayBuffer(total);
-  const out = new Uint8Array(buf), w32 = new Uint32Array(buf, 0, buf.byteLength >>> 2);
-  let o = 0;
-  for (const r of regions) {
-    const n = r.bytes.byteLength;
+  st.out = new Uint8Array(buf); st.w32 = new Uint32Array(buf, 0, buf.byteLength >>> 2);
+  return st;
+}
+function packStep(st, regions, deadline) {
+  const B = Module.wasmMemory.buffer;
+  if (B !== st.buf) {                  // the guest's memory grew while the job was suspended
+    st.buf = B;
+    for (let k = st.i; k < regions.length; k++) { const r = regions[k]; if (r.bytes.buffer !== B) r.bytes = new Uint8Array(B, r.src, r.n); }
+  }
+  if (!shipPool) {
+    for (; st.i < regions.length; st.i++) { const r = regions[st.i]; r.bytes = r.bytes.slice(); if (r.swap) swap4InPlace(r.bytes); }
+    return true;
+  }
+  const out = st.out, w32 = st.w32;
+  let o = st.o, i = st.i;
+  while (i < regions.length) {
+    const r = regions[i++], n = r.n;
     out.set(r.bytes, o);
     if (r.swap) swapWords(w32, o >>> 2, (o >>> 2) + (n >>> 2));   // = swap4InPlace on the copy: every whole word, a tail as is
     r.bytes = out.subarray(o, o + n);
     o += (n + 3) & ~3;
+    if ((i & 31) === 0 && performance.now() >= deadline) break;
   }
+  st.o = o; st.i = i;
+  return i >= regions.length;
 }
+function packRegions(regions) { packStep(packBegin(regions), regions, Infinity); }
 
 
 // ── THE SHIP CODE IS COMPILED BEFORE THE GAME NEEDS IT (2026-10-06) ──────────────────────────
@@ -992,7 +1100,7 @@ function shipWarmUp(budgetMs) {
       // everything already known (a steady frame)
       if ((it++ & 1) === 0) { knownDLs.clear(); knownArrays.clear(); knownTex.clear(); f32Arrays.length = 0; }
       const newDLs = (it % 3) === 2 ? null : [], regions = [];   // a shipped walk collects new DLs; a full-image or held one does not
-      walkStream(M, fb, 0, fb.length, 0, newDLs, null);
+      walkStream(M, fb, 0, fb.length, 0, newDLs, null, (it & 1) ? Infinity : 0);
       if (newDLs) for (const d of newDLs) regions.push({ addr: d.addr & 0x01FFFFFF, bytes: regView(0x80000000 + (d.addr & 0x01FFFFFF), d.size) });
       discoverTextures(regions);
       discoverArrays(regions);
@@ -1007,7 +1115,7 @@ function shipWarmUp(budgetMs) {
     vatA.fill(0); arrayBase.fill(0); arrayStride.fill(0); texImg0.fill(0);
     pvLo.fill(0); pvHi.fill(0); pvVa.fill(0); pvSz.fill(null);
     texBound.clear(); pairSeenClear();
-    knownDLs.clear(); knownArrays.clear(); knownTex.clear(); f32Arrays.length = 0;
+    knownDLs.clear(); knownArrays.clear(); knownTex.clear(); f32Arrays.length = 0; arrClip.clear();
     dlKeysEpoch++; xfSortedVer = -1;
   }
   return { it, ms: performance.now() - t0 };
@@ -1033,6 +1141,7 @@ function discoverTextures(regions) {
 }
 function discoverArrays(regions) {
   const mem = () => Module.wasmMemory;
+  arrFlushSlots();
   for (let si = 0; si < 16; si++) {
     const sb = arrayBase[si], ss = arrayStride[si];
     if (sb && ss) pairSeen.set((sb >>> 0) + '|' + (ss >>> 0), { base: sb >>> 0, stride: ss >>> 0 });
@@ -1055,27 +1164,51 @@ function discoverArrays(regions) {
         let lo = 0, hi = clipPts.length;
         while (lo < hi) { const mid = (lo + hi) >>> 1; if (clipPts[mid] > b2) hi = mid; else lo = mid + 1; }
         const next = lo < clipPts.length ? clipPts[lo] : 0x01800000;
-        const ext = Math.min(next - b2, 0x40000, 0x01800000 - b2);
-        if (ext <= 0) continue;
-        knownArrays.set(pr.key, ext);
-        const rgb = regionBytes(mem(), pr.base, pr.stride, ext);
+        const clip = Math.min(next - b2, 0x40000, 0x01800000 - b2);
+        if (clip <= 0) continue;
+        const u = pr.stride <= 0xFF ? arrUsed.get(pr.base * 256 + pr.stride) : undefined;
+        const ext = u !== undefined && u > 0 ? Math.min(clip, (u + 31) & ~31) : clip;
+        knownArrays.set(pr.key, ext); arrClip.set(pr.key, clip);
+        const rgb = regionBytes(mem(), pr.base, pr.stride, ext, clip);
         regions.push({ addr: b2, bytes: rgb.bytes, swap: rgb.swap });
         if (peekAddrs && peekAddrs.some((pa) => Math.abs(pa - b2) < 0x2000))
           log('pairSync f' + viRetrace + ' base=0x' + b2.toString(16) + ' stride=' + pr.stride + ' ext=' + ext);
       }
     }
+    // GROWTH: a known binding read further than it was sent gets the rest, up to its clip extent
+    for (const [k, u] of arrUsed) {
+      const b = Math.floor(k / 256), st = k - b * 256, key = b + '|' + st;
+      const have = knownArrays.get(key);
+      if (have === undefined || u <= have) continue;
+      const b2 = b & 0x01FFFFFF, want = Math.min(arrClip.has(key) ? arrClip.get(key) : have, (u + 31) & ~31);
+      if (want <= have || b2 + want > 0x01800000) continue;
+      knownArrays.set(key, want);
+      const rgb = regionBytes(mem(), b + have, st, want - have, 0);
+      regions.push({ addr: b2 + have, bytes: rgb.bytes, swap: rgb.swap });
+    }
     pairSeenClear();
   }
 }
-function drainDirty(regions) {
-  const mem = () => Module.wasmMemory;
-  if (Module.___recomp_dirty_count) {
-    const dn = Module.___recomp_dirty_count();
-    if (Module.___recomp_dirty_overflow && Module.___recomp_dirty_overflow()) {
-      cacheDirty = true;   // pathological burst (whole-heap flush): full resnapshot next frame
+// The frame's dirty ring, copied out and reset at its VIWaitForRetrace (the guest refills it from its
+// next frame on), for the ship job to process in its turn (THE SHIP STEP RUNS IN THE GUEST'S SLACK).
+function dirtyCapture() {
+  if (!Module.___recomp_dirty_count) return null;
+  const dn = Module.___recomp_dirty_count();
+  const cap = { ov: !!(Module.___recomp_dirty_overflow && Module.___recomp_dirty_overflow()), dn: 0, dvw: null };
+  if (!cap.ov && dn > 0) {
+    const dbase = Module.___recomp_dirty_base() >>> 0;
+    cap.dn = dn; cap.dvw = new DataView(Module.wasmMemory.buffer.slice(dbase, dbase + dn * 8));
+  }
+  if (Module.___recomp_dirty_reset) Module.___recomp_dirty_reset();
+  return cap;
+}
+function drainDirty(regions, cap) {
+  if (cap) {
+    const dn = cap.dn;
+    if (cap.ov) {
+      cacheDirty = true;   // pathological burst (whole-heap flush): every cache reset next frame
     } else if (dn > 0) {
-      const dbase = Module.___recomp_dirty_base() >>> 0;
-      const dvw = new DataView(mem().buffer, dbase, dn * 8);
+      const dvw = cap.dvw;
       for (let di = 0; di < dn; di++) {
         const da = dvw.getUint32(di * 8, true), dsRaw = dvw.getUint32(di * 8 + 4, true);
         const restage = !!(dsRaw & 0x80000000), ds = dsRaw & 0x7FFFFFFF;
@@ -1119,7 +1252,6 @@ function drainDirty(regions) {
         regions.push({ addr: ofs, bytes: regView(da, ds), swap: sw });
       }
     }
-    if (Module.___recomp_dirty_reset) Module.___recomp_dirty_reset();
   }
 }
 
@@ -1131,36 +1263,76 @@ function drainDirty(regions) {
 // when this thread is about to park on its credit — at once, on every frame that leaves idle time,
 // which is nearly all of them — and otherwise at the start of the next frame's ship, in order. The
 // renderer receives a heavy frame up to one frame later; the guest never waits for the post.
-let shipPending = null;
-function shipFlush() { if (shipPending) { const m = shipPending; shipPending = null; postMessage(m[0], m[1]); } }
+// ── THE SHIP STEP RUNS IN THE GUEST'S SLACK, NOT IN ITS FRAME (2026-10-12) ───────────────────
+// A frame's ship (walk the FIFO and every display list it calls, discover the textures and arrays
+// the renderer has not been sent, copy them out) used to run inside VIWaitForRetrace, before the
+// guest could park — so a frame that binds a whole new scene paid for it in its own slot. MEASURED
+// (MP4 solo, HEAD 09f5bc3, a scratch worker with per-phase timers, 7 runs): frame 725, the first frame
+// of the 3D title (1296 display lists, 159 arrays and 64 textures none of which was known before,
+// 1519 regions / 5.2 MiB), held its thread 21.5-47.0 ms (35-47 ms in 3 of the 7): game 3-23 ms, walk
+// 2.5-20 ms, discovery 0.6-10 ms, pack 3-10 ms. The same pipeline replayed on the same frame in
+// place: walk 0.8-7.3 ms, pack 4.6-5.7 ms into the ready buffer.
+// Now VIWaitForRetrace only CAPTURES what cannot wait — a copy of the FIFO (the guest reuses its
+// buffer), the dirty ring's list (reset for the next frame), whether a DVD read happened — and queues
+// the ship as a JOB. Jobs run in order, in slices of SHIP_SLICE_MS, while the guest is parked on its
+// credit; guest memory cannot change while it is parked, so a job that finishes in its own frame's
+// slack (every ordinary frame, by a wide margin) reads exactly what the synchronous ship read. One
+// that does not finish is SUSPENDED when the credit arrives — the guest runs its next frame on time —
+// and goes on in the next frames' slack; only when SHIP_QUEUE_MAX frames are waiting is the oldest
+// finished at once, so the renderer is never more than that many frames behind and a burst of work
+// is spread over that many slacks. Everything a job decides about the caches (the reset, discovery,
+// the dirty ranges) happens when it RUNS, in queue order, so the caches move in exactly the order
+// they did. What a late job copies is NEWER than its frame: every byte the game changed in between
+// it reported through the dirty ring (DCStoreRange/DCFlushRange — the contract the whole incremental
+// ship already rests on), and the later frames send those ranges again, after it. Messages are
+// posted in frame order. Anything that needs the decoder state or is about to rewrite memory — a
+// rollback restore, a re-simulated frame, a savestate, a held frame — finishes every job first
+// (shipFlush).
+const SHIP_SLICE_MS = 1, SHIP_QUEUE_MAX = 3;
+const shipJobs = [];                 // queued frames, oldest first
+const shipPosts = [];                // built messages not yet posted, in order
+const shipFbFree = [];               // FIFO copy buffers to reuse
+function shipPost() { while (shipPosts.length) { const m = shipPosts.shift(); postMessage(m[0], m[1]); } }
+// Every queued job, whole, then every message out (A FRAME'S POST WAITS FOR THE GUEST'S NEXT IDLE
+// MOMENT does not apply: whoever calls this needs the renderer caught up).
+function shipFlush() { while (shipJobs.length) shipJobRun(shipJobs[0], Infinity); shipPost(); }
+// One slice of the queue while the guest is parked; each message goes out as soon as it is built.
+function shipIdle() {
+  const t0 = performance.now(), dl = t0 + SHIP_SLICE_MS;
+  while (shipJobs.length && shipJobRun(shipJobs[0], dl) && performance.now() < dl) { /* next job */ }
+  shipPost();
+  ftBusyMs += performance.now() - t0;   // the ship is this frame's work wherever it runs
+}
 function shipFrame(pos, resim, hiddenNow) {
-  shipFlush();
+  // what an earlier frame built goes out now, before this frame's (in order)
+  shipPost();
   const mem = () => Module.wasmMemory;
   // A re-simulated frame does no renderer work: no FIFO walk, no region copies. Only the
   // game's own dirty ranges (DCStoreRange) are noted, to be re-read and sent with the next
   // presented frame (rbResimDrain); its new bindings are found again by that frame's walk.
-  if (resim) { rbResimDrain(); return; }
+  if (resim) { shipFlush(); rbResimDrain(); return; }
   const base = Module._gx_fifo_base();
-  // A VIEW of the FIFO in guest memory, not a copy: no guest code runs before the frame is posted
-  // (the copy that ships is the one below, after the prologue).
   const fb = new Uint8Array(mem().buffer, base, pos);
   // HELD BY THE PAGE (SHIP_HOLD): see the note at SHIP_HOLD. The FIFO is still walked —
   // the walk is what keeps the register shadow (CP/XF/BP, array bindings) current, and
   // the prologue of the next shipped frame is built from it — but nothing is copied or
-  // posted, and the next frame that IS shipped carries the full image (cacheDirty), which
-  // is self-contained by construction (A FULL-IMAGE FRAME STARTS FROM EMPTY CACHES).
-  // 2 = hold only a frame that would carry the full image (the main-thread fallback's deferral).
+  // posted, and the next frame that IS shipped resets every cache (cacheDirty), which makes it
+  // self-contained by construction (NO FRAME SHIPS THE 24 MiB IMAGE BUT THE SESSION'S FIRST).
+  // 2 = hold only a cache-reset frame (the main-thread fallback's deferral).
   const shipHold = paceI32 ? Atomics.load(paceI32, SHIP_HOLD) : 0;
+  if (shipHold !== 0) shipFlush();     // the hold's walk and its test below need every earlier frame shipped
   if (shipHold === 1 || (shipHold === 2 && (cacheDirty || !sentPrologue) && !testFullMem)) {
     // newDLs/touched null: what a held frame finds is discarded below, and these are the argument kinds
     // the ship's own walk and shipWarmUp compile it for. MEASURED with ([], new Map()) here: a room's
     // first held frame of the title (MP4 frame 725, 1296 new display lists) walked for 10-31 ms where
     // the warm, shipped walk of the same frame takes 0.5-1.7 ms.
-    try { walkStream(mem(), fb, 0, pos, 0, null, null); } catch (e) { log('walk threw: ' + e.message); }
+    noteReach = false;
+    try { walkStream(mem(), fb, 0, pos, 0, null, null, 0); } catch (e) { log('walk threw: ' + e.message); }
+    noteReach = true;
     texBound.clear(); pairSeenClear();
     if (Module.___recomp_dirty_reset) Module.___recomp_dirty_reset();
     cacheDirty = true;
-    rb.carry.length = 0; rb.pendRaw.length = 0;   // the full image after the hold supersedes them
+    rb.carry.length = 0; rb.pendRaw.length = 0;   // the cache reset after the hold re-sends what they named
     rbNoteShip(true, []);
     shipHeld++;
     postMessage({ cmd: 'frame', n: viRetrace, held: true, hidden: hiddenNow });
@@ -1182,90 +1354,142 @@ function shipFrame(pos, resim, hiddenNow) {
   // arrays (swapped), DLs and textures (incl. static assets, which the raw image
   // carries as zeros) go out in this frame's regions on top of the image — the same
   // state a save-state restore starts from. cacheDirty set later in this frame (dirty-
-  // ring overflow / a jumbo range) stays set and takes the full image next frame.
-  const wantFull = cacheDirty || testFullMem;
-  const fullSync = wantFull && !resim;
-  // A DVD READ RESETS THE CACHES: the same clear, no image; what was carried is still sent below
-  const cacheReset = !fullSync && dvdReset;
-  if (fullSync) {
-    rb.carry.length = 0; rb.pendRaw.length = 0;   // the full image supersedes anything carried
-    cacheDirty = false;
-  }
-  if (fullSync || cacheReset) {
-    dvdReset = false;
-    knownDLs.clear(); knownArrays.clear(); knownTex.clear(); f32Arrays.length = 0;
-  }
-  // A new DL's bytes are a raw slice at its own address, and on a full-image frame nothing precedes
-  // them in the list (the rollback carry was just cleared): dropImageDuplicates would drop every one
-  // of them, so with de-duplication on they are not collected at all (MP4 frame 725: 1296 of its 1519).
-  const newDLs = (fullSync && shipDedup) ? null : [], touched = null;
-  try { walkStream(mem(), fb, 0, pos, 0, newDLs, touched) } catch (e) { log('walk threw: ' + e.message); }
-  const regions = [];
-  if (newDLs !== null)
-    for (const d of newDLs)
-      regions.push({ addr: d.addr & 0x01FFFFFF, bytes: regView(0x80000000 + (d.addr & 0x01FFFFFF), d.size) });
-  // texture regions BEFORE arrays: both are raw guest slices except arrays are
-  // byte-swapped — on any residual overlap the swapped array copy must win
-  // (apply order is list order on the dolphin side).
-  // Sync on FIRST sight only (per-frame dynamic updates flow through the
-  // dirty-range ring below — the game's own DCStoreRange calls).
-  // STATIC ASSETS: a bind whose masked base falls below the wasm data-segment end
-  // (__recomp_static_top ~0x25204; lowest real guest texture 0x2bf800) is a
-  // compiled-in .inc asset living in LOW wasm memory — the guest window at that
-  // offset is zeros. Source those bytes from the static, shipped to the same
-  // guest-physical offset (unused low MEM1) so Dolphin's decoder finds them.
-  discoverTextures(regions);
-  // Arrays: fixture-parity clip extents. pairSeen = every (base,stride) bound
-  // this frame (top-level + walked-DL bodies) + the CP shadow's current 16 slots
-  // (bindings persisting from earlier frames). Extent = clip at the nearest
-  // FOLLOWING clip point (any pair base, DL addr, or texture base), cap 256KB —
-  // exactly the DUMPFIX heuristic every clean fixture render used. Sync on first
-  // sight; content updates flow via the dirty ring; restages invalidate.
-  discoverArrays(regions);
-  // dirty-range ring (gc_dirty_ring.c): the game's DCStoreRange/DCFlushRange calls
-  // mark exactly the CPU-written GPU-visible bytes this frame (skinning vertex
-  // writes, glyph textures, minigame arrays). Drain, filter to guest RAM, forward.
-  drainDirty(regions);
-  if (rb.pendRaw.length || rb.carry.length) {
-    // THE FIRST PRESENTED FRAME AFTER A ROLLBACK: (1) every range a frame the rollback
-    // abandoned had sent, re-read from the corrected timeline (raw; the caches over those
-    // ranges were dropped, so swapped arrays and DLs are re-discovered and re-sent on top);
-    // (2) what the re-simulated frames produced, in order; (3) this frame's own regions.
-    const pre = [];
-    for (const [a0, n0] of rb.pendRaw) pre.push({ addr: a0, bytes: regView(0x80000000 + a0, n0) });
-    for (const [a0, n0] of rb.carry) {
-      let sw = false;
-      for (const iv of f32Arrays) if (a0 >= iv.b && a0 + n0 <= iv.e) { sw = true; break; }
-      pre.push({ addr: a0, bytes: regView(0x80000000 + a0, n0), swap: sw });
+  // ring overflow / a jumbo range) stays set and resets the caches next frame.
+  // ── NO FRAME SHIPS THE 24 MiB IMAGE BUT THE SESSION'S FIRST (2026-10-12) ─────────────────────
+  // Every reason that used to ship the image — cacheDirty (a dirty-ring overflow, a jumbo range, the
+  // first frame after a SHIP_HOLD, a rollback that abandoned a reset frame, a savestate restore) —
+  // is now answered the way a DVD read already was (A DVD READ RESETS THE CACHES): clear every
+  // address-keyed cache, so every DL, array and texture this frame binds is discovered again and
+  // sent as a region, and every later binding is sent when it is first seen. That is all the image
+  // ever bought the renderer: the raw image carries arrays in the wrong byte order, so after it an
+  // array was right only if a region re-sent it anyway. The image stays for exactly one frame, the
+  // first one shipped (the renderer's RAM then still holds what Dolphin's own boot left there), and
+  // for the ?testFullMem bisect control. MEASURED before (MP4, prod mirror): a full-image frame's
+  // 24 MiB copy took 17-54 ms of the guest's frame.
+  const fullSync = testFullMem;
+  const withImage = fullSync || !imageSent;
+  if (withImage) imageSent = true;
+  if (fullSync) { shipFlush(); rb.carry.length = 0; rb.pendRaw.length = 0; }   // the full image supersedes anything carried
+  // the oldest of a full queue is finished now (the renderer is at most SHIP_QUEUE_MAX frames behind)
+  while (shipJobs.length >= SHIP_QUEUE_MAX) shipJobRun(shipJobs[0], Infinity);
+  // the FIFO, copied (the guest reuses its buffer from its next frame on; the copy that ships, with
+  // the prologue in front, is made when the job ends)
+  let fbc = shipFbFree.pop();
+  if (!fbc || fbc.length < pos) fbc = new Uint8Array(Math.max(pos, 0x40000));
+  fbc.set(fb);
+  const dvd = dvdReset; dvdReset = false;
+  shipJobs.push({ n: viRetrace, hidden: hiddenNow, fbc, fb: fbc.subarray(0, pos), p: 0, stage: -1, withImage, fullSync, dvd,
+                  full: fullSync, rec: rb.armed ? rb.lastRec : null, dirty: dirtyCapture(), newDLs: null,
+                  regions: null, pack: null, seq: 0 });
+  // whole, now: the session's first frame (and the ?testFullMem control), which carries the image, and
+  // every frame of an uncapped run, which never parks (pace cell 5) and so has no slack to run it in
+  if (withImage || !paceI32 || Atomics.load(paceI32, 5)) shipFlush();
+}
+// Run job `j` (the oldest) until it is done or `deadline` (performance.now()) has passed; true = done.
+function shipJobRun(j, deadline) {
+  const mem = () => Module.wasmMemory;
+  if (j.stage === -1) {
+    // the cache reset, decided in queue order: what an earlier job's dirty ranges, a hold, a restore or
+    // this frame's DVD reads asked for (A FULL-IMAGE FRAME STARTS FROM EMPTY CACHES, NO FRAME SHIPS THE
+    // 24 MiB IMAGE BUT THE SESSION'S FIRST)
+    const reset = j.fullSync || cacheDirty || j.dvd || !sentPrologue;
+    if (reset) {
+      cacheDirty = false;
+      knownDLs.clear(); knownArrays.clear(); knownTex.clear(); f32Arrays.length = 0; arrClip.clear();
     }
-    rb.pendRaw.length = 0; rb.carry.length = 0;
-    regions.unshift(...pre);
+    sentPrologue = true;
+    j.full = reset;
+    // A new DL's bytes are a raw slice at its own address, and on an image frame nothing precedes
+    // them in the list (the rollback carry was just cleared): dropImageDuplicates would drop every one
+    // of them, so with de-duplication on they are not collected at all.
+    j.newDLs = (j.withImage && shipDedup) ? null : [];
+    j.stage = 0;
   }
-  // What this frame shipped, so a rollback that abandons it re-sends exactly those ranges
-  // from the corrected timeline (rbRestore).
-  rbNoteShip(fullSync || cacheReset, regions);   // a rollback abandoning a cache reset re-sends the image
-  const withImage = fullSync || !sentPrologue;
-  if (withImage && shipDedup) dropImageDuplicates(regions);
-  // Copy every region out of guest memory (A FULL-IMAGE FRAME MUST NOT STALL THE GUEST).
-  shipSeq = 0;
-  packRegions(regions);
+  if (j.stage === 0) {
+    // the walk, resumable between top-level commands (a display list's body is walked whole)
+    let p = j.p;
+    try { p = walkStream(mem(), j.fb, p, j.fb.length, 0, j.newDLs, null, deadline); } catch (e) { log('walk threw: ' + e.message); p = j.fb.length; }
+    if (p !== undefined && p < j.fb.length) { j.p = p; return false; }
+    j.stage = 1;
+    if (performance.now() >= deadline) return false;
+  }
+  if (j.stage === 1) {
+    const regions = j.regions = [];
+    if (j.newDLs !== null)
+      for (const d of j.newDLs)
+        regions.push({ addr: d.addr & 0x01FFFFFF, bytes: regView(0x80000000 + (d.addr & 0x01FFFFFF), d.size) });
+    // texture regions BEFORE arrays: both are raw guest slices except arrays are
+    // byte-swapped — on any residual overlap the swapped array copy must win
+    // (apply order is list order on the dolphin side).
+    // Sync on FIRST sight only (per-frame dynamic updates flow through the
+    // dirty-range ring below — the game's own DCStoreRange calls).
+    // STATIC ASSETS: a bind whose masked base falls below the wasm data-segment end
+    // (__recomp_static_top ~0x25204; lowest real guest texture 0x2bf800) is a
+    // compiled-in .inc asset living in LOW wasm memory — the guest window at that
+    // offset is zeros. Source those bytes from the static, shipped to the same
+    // guest-physical offset (unused low MEM1) so Dolphin's decoder finds them.
+    discoverTextures(regions);
+    // Arrays: fixture-parity clip extents. pairSeen = every (base,stride) bound
+    // this frame (top-level + walked-DL bodies) + the CP shadow's current 16 slots
+    // (bindings persisting from earlier frames). Extent = clip at the nearest
+    // FOLLOWING clip point (any pair base, DL addr, or texture base), cap 256KB —
+    // exactly the DUMPFIX heuristic every clean fixture render used. Sync on first
+    // sight; content updates flow via the dirty ring; restages invalidate.
+    discoverArrays(regions);
+    // dirty-range ring (gc_dirty_ring.c): the game's DCStoreRange/DCFlushRange calls
+    // mark exactly the CPU-written GPU-visible bytes this frame (skinning vertex
+    // writes, glyph textures, minigame arrays). Drain, filter to guest RAM, forward.
+    drainDirty(regions, j.dirty);
+    if (rb.pendRaw.length || rb.carry.length) {
+      // THE FIRST PRESENTED FRAME AFTER A ROLLBACK: (1) every range a frame the rollback
+      // abandoned had sent, re-read from the corrected timeline (raw; the caches over those
+      // ranges were dropped, so swapped arrays and DLs are re-discovered and re-sent on top);
+      // (2) what the re-simulated frames produced, in order; (3) this frame's own regions.
+      const pre = [];
+      for (const [a0, n0] of rb.pendRaw) pre.push({ addr: a0, bytes: regView(0x80000000 + a0, n0) });
+      for (const [a0, n0] of rb.carry) {
+        let sw = false;
+        for (const iv of f32Arrays) if (a0 >= iv.b && a0 + n0 <= iv.e) { sw = true; break; }
+        pre.push({ addr: a0, bytes: regView(0x80000000 + a0, n0), swap: sw });
+      }
+      rb.pendRaw.length = 0; rb.carry.length = 0;
+      regions.unshift(...pre);
+    }
+    // What this frame shipped, so a rollback that abandons it re-sends exactly those ranges
+    // from the corrected timeline (rbRestore). Noted on THIS frame's record (j.rec), wherever it runs.
+    rbNoteShip(j.full, regions, j.rec);   // a rollback abandoning a cache reset resets again
+    if (j.withImage && shipDedup) dropImageDuplicates(regions);
+    // Copy every region out of guest memory (A FULL-IMAGE FRAME MUST NOT STALL THE GUEST).
+    shipSeq = 0;
+    j.pack = packBegin(regions);
+    j.seq = shipSeq;
+    j.stage = 2;
+    if (performance.now() >= deadline) return false;
+  }
+  if (j.stage === 2) {
+    if (!packStep(j.pack, j.regions, deadline)) return false;
+    j.stage = 3;
+  }
+  const regions = j.regions;
   let mem1Snap = null;
-  if (withImage) mem1Snap = mem1Image();
-  sentPrologue = true;
+  if (j.withImage) { shipSeq = j.seq; mem1Snap = mem1Image(); j.seq = shipSeq; }   // (a pooled image is fenced like the regions)
   // Prepend the rolling register shadow to EVERY frame (~1.5KB): each frame is then
   // fully self-contained, so the renderer may skip backlogged frames without the
   // decoder losing persistent CP/XF/BP state carried only by a skipped frame.
   const proLen = prologueLen();
-  const fifo = new Uint8Array(proLen + fb.length);
-  writePrologue(fifo, 0); fifo.set(fb, proLen);
+  const fifo = new Uint8Array(proLen + j.fb.length);
+  writePrologue(fifo, 0); fifo.set(j.fb, proLen);
   // Packed (shipPool): every region is a view into ONE buffer, transferred once; the mem1
   // image may be a pooled SharedArrayBuffer, which is shared, never transferred.
   const transfers = [fifo.buffer];
   const isSab = (b) => typeof SharedArrayBuffer !== 'undefined' && b instanceof SharedArrayBuffer;
   for (const r of regions) if (!isSab(r.bytes.buffer) && transfers.indexOf(r.bytes.buffer) < 0) transfers.push(r.bytes.buffer);
   if (mem1Snap && !isSab(mem1Snap)) transfers.push(mem1Snap);
-  shipPending = [{ cmd: 'frame', n: viRetrace, fifo: fifo.buffer, mem1: mem1Snap, poolSeq: shipSeq, hidden: hiddenNow,
-                   regions: regions.map((r) => ({ addr: r.addr, bytes: shipPool ? r.bytes : r.bytes.buffer })) }, transfers];
+  shipPosts.push([{ cmd: 'frame', n: j.n, fifo: fifo.buffer, mem1: mem1Snap, poolSeq: j.seq, hidden: j.hidden,
+                    regions: regions.map((r) => ({ addr: r.addr, bytes: shipPool ? r.bytes : r.bytes.buffer })) }, transfers]);
+  shipJobs.shift();
+  if (shipFbFree.length < SHIP_QUEUE_MAX) shipFbFree.push(j.fbc);
+  return true;
 }
 
 // ── GUEST-STATE WITNESS WINDOW ──────────────────────────────────────────────────────────────
@@ -1843,6 +2067,7 @@ function stateWasmApi() {
 // page is tested for all-zero and only non-zero pages are stored, so untouched address space
 // (the ~2 GiB hole between the C heap and the guest window) costs nothing but the scan.
 function stateSnapshot() {
+  shipFlush();                       // the decoder state below must include the frame in flight
   const w = stateWasmApi();
   const buf = Module.wasmMemory.buffer;          // never cache: ALLOW_MEMORY_GROWTH detaches
   const memSize = buf.byteLength;
@@ -1883,6 +2108,7 @@ function stateSnapshot() {
 }
 
 function stateApply(u8) {
+  shipFlush();                       // a ship in flight must not read the restored memory
   const w = stateWasmApi();
   if (!u8 || u8.length < 16) throw new Error('save state is truncated');
   let magic = '';
@@ -1932,7 +2158,7 @@ function stateApply(u8) {
   gxShadow.xf.clear(); for (const [k, v] of hdr.gxXf) gxShadow.xf.set(k >>> 0, v >>> 0);
   gxShadow.bp.clear(); for (const [k, v] of hdr.gxBp) gxShadow.bp.set(k >>> 0, v >>> 0);
   // RENDERER HANDSHAKE — see the EXCLUDED note above. Everything dolphin has been told about
-  // guest RAM is now wrong, so drop every address-keyed cache and force a full mem1 + prologue
+  // guest RAM is now wrong, so drop every address-keyed cache and force a cache reset + prologue
   // resend on the very next frame.
   knownDLs.clear(); knownArrays.clear(); knownTex.clear(); texBound.clear(); pairSeenClear();
   f32Arrays.length = 0;
@@ -2206,6 +2432,7 @@ function rbSavePoint(w) {
 }
 // Rewind from the start of frame g (rb.w, its save point just taken) to the start of frame f.
 function rbRestore(f) {
+  shipFlush();                       // the ship in flight reads the timeline being abandoned: finish it first
   const g = rb.w, t0 = performance.now();
   if (det && det.watch) log('rewind ' + g + ' -> ' + f);
   if (f < rb.base || f >= g || !rb.recs.get(f)) {
@@ -2306,9 +2533,10 @@ function rbResimDrain() {
   if (Module.___recomp_dirty_reset) Module.___recomp_dirty_reset();
   rbNoteShip(false, noted);
 }
-function rbNoteShip(full, regions) {
+function rbNoteShip(full, regions, rec0) {
   if (!rb.armed) return;
-  const rec = rb.lastRec;            // frame w ships at its VI, inside [Q_w, Q_w+1)
+  // frame w ships at its VI, inside [Q_w, Q_w+1); a ship job that ran later names w's record itself
+  const rec = rec0 !== undefined ? rec0 : rb.lastRec;
   if (rec) rec.ship = full ? 'full' : (rec.ship && rec.ship !== 'full' ? rec.ship : []).concat(regions.map((r) => [r.addr, r.bytes.byteLength]));
 }
 // One step of the ring's fingerprint sweep, at the start of frame w (see THE STATE FINGERPRINT;
@@ -3019,6 +3247,10 @@ async function boot(msg) {
               // The guest is about to park on its credit: a short slice of that idle time prepares
               // the next transfer buffer, if one is missing (A FULL IMAGE IS A PLAIN, ALREADY-FAULTED
               // BUFFER). Never when a credit is already waiting — then the guest runs on at once.
+              // The frame's ship runs here, in slices, for as long as the guest has no credit (THE SHIP
+              // STEP RUNS IN THE GUEST'S SLACK); what is left when the credit comes is finished at the
+              // start of the next VIWaitForRetrace.
+              while (shipJobs.length && Atomics.load(paceI32, 0) <= 0) shipIdle();
               if (Atomics.load(paceI32, 0) <= 0) { shipFlush(); spareStep(SPARE_SLICE_MS); }
               while (Atomics.load(paceI32, 0) <= 0) {
                 const tw = performance.now(), cap = bkCfg ? BK_POLL_MS : 500;

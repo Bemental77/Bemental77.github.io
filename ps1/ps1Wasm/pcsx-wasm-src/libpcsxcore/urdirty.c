@@ -4,7 +4,7 @@
 #include "urdirty.h"
 
 #define UR_INFO_WORDS (4 + 3 * UR_MAX_SPANS)
-#define UR_BLOCK (UR_PAGES + 4096)
+#define UR_BLOCK (UR_JIT_OFF + UR_JIT_BYTES)
 
 unsigned char *ur_dirty;
 static uint32_t *ur_inf;
@@ -35,7 +35,7 @@ void ur_mark_range(const void *p, size_t n) {
 	a = (uintptr_t)p >> UR_PAGE_SHIFT;
 	e = ((uintptr_t)p + n - 1) >> UR_PAGE_SHIFT;
 	if (e >= UR_PAGES) e = UR_PAGES - 1;
-	for (; a <= e; a++) ur_dirty[a] = 1;
+	for (; a <= e; a++) { ur_dirty[a] = 1; ur_dirty[UR_JD_OFF + a] = 1; }
 }
 
 void ur_track(int id, const void *p, size_t n) {

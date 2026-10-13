@@ -27,6 +27,8 @@
 #include "mdec.h"
 #include "gte.h"
 
+void psxJitReset(void);
+
 R3000Acpu *psxCpu = NULL;
 psxRegisters psxRegs;
 
@@ -52,6 +54,7 @@ void psxReset() {
 	psxCpu->Reset();
 
 	psxMemReset();
+	psxJitReset();
 
 	memset(&psxRegs, 0, sizeof(psxRegs));
 
