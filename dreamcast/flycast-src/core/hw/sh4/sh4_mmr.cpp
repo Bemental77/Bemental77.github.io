@@ -665,6 +665,10 @@ void map_p4()
 	addrspace::mapHandler(p4mmr_handler, 0xFF, 0xFF);
 }
 
+#ifdef __EMSCRIPTEN__
+extern "C" u32 g_ser_ram_offset;   // EmscriptenWorker.cpp (rollback ring fingerprint)
+#endif
+
 namespace sh4
 {
 
@@ -686,6 +690,12 @@ void serialize(Serializer& ser)
 	icache.Serialize(ser);
 	ocache.Serialize(ser);
 
+#ifdef __EMSCRIPTEN__
+	// Where main RAM sits in a serialized state, for the rollback ring's
+	// fingerprint (EmscriptenWorker.cpp emscripten_rb_hash): a hash of guest RAM
+	// only, never of bytes the host may lay out differently.
+	{ if (!ser.dryrun() && !ser.rollback()) g_ser_ram_offset = (u32)ser.size(); }
+#endif
 	if (!ser.rollback())
 		mem_b.serialize(ser);
 

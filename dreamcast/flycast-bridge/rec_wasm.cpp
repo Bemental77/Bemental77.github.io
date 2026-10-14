@@ -435,8 +435,24 @@ uint64_t g_chain_hits = 0, g_chain_misses = 0;
 extern "C" {
     extern uint32_t g_ras_pc, g_ras_slot, g_ras_gen;   // lever-5E3 (emitter TU)
 }
+extern "C" { extern volatile uint32_t g_idleskip; }
 extern "C" EMSCRIPTEN_KEEPALIVE int sh4_jit_lookup_idx(uint32_t vaddr) {
     if (!g_chain_enabled) return -1;
+    // THE IDLE-SKIP PCS ARE NEVER CHAINED INTO. The idle-skip check lives only
+    // in the C trampoline (wasm_block_trampoline), so an edge that tail-linked
+    // straight into the frame-wait spin skipped the check and ran the spin body
+    // instead of burning. Whether an edge chains depends on whether its target
+    // was compiled when the edge was LAST resolved — host history — so a
+    // cold-cache run and a warm-cache run of the same frame from the same state
+    // charged different cycles (measured with a credit-pass trace: first
+    // difference at pass 3726, pc 0x8c3c53d8, residual 0 cold vs -4 warm; per-
+    // frame guest cycles 6672302/6673198 cold vs 6672750/6672750 warm). That
+    // made the trajectory depend on what this console happened to have compiled,
+    // which a rollback (or a room whose consoles compiled different code) cannot
+    // allow. A miss here returns the edge to the trampoline, so every arrival at
+    // the spin sees the same check. IC/RAS slots are only ever filled from a hit
+    // here, so they cannot cache these targets either.
+    if (g_idleskip && (vaddr == 0x8c3c53d8u || vaddr == 0x8c3c53e0u || vaddr == 0x8c3c53f8u)) return -1;
     BlockFn fn = jit_lookup(vaddr);
     if (fn) { ++g_chain_hits;
         // Lever-5E3 fill: this resolve IS the prediction's answer. Armed-only
@@ -2655,7 +2671,22 @@ public:
 	// the try region and resurrecting the invokes.
 	__attribute__((noinline)) static void dispatch_slice(Sh4Context* ctx)
 	{
-		while (ctx->CpuRunning) {
+		// A STOP ENDS THE FRAME AT A SLICE BOUNDARY, NEVER MID-SLICE, when the
+		// trajectory must be a pure function of guest state (g_deterministic:
+		// rollback mode). Sh4Executor::Stop() (the PVR present that ends a
+		// frame) only clears CpuRunning; this loop sees it the next time a block
+		// returns to C. A chained edge does not return to C, a cold edge (target
+		// not compiled yet) does — so WHERE the frame ended, and therefore the
+		// guest cycle at which the next frame's pads were applied, depended on
+		// what this console had compiled. Measured: cold vs warm cache from one
+		// state, same pads: frame 0 = 6672302 vs 6672750 cycles (one 448-cycle
+		// slice), credit-pass traces identical up to the cold run's early exit.
+		// Under g_deterministic the loop runs on to the end of the slice in which
+		// the stop landed (the point a fully-chained run reaches), credits it,
+		// and only then exits.
+		bool det_credited = true;   // entry with CpuRunning already false: exit
+		while (ctx->CpuRunning || (g_deterministic && !det_credited)) {
+				det_credited = false;
 
 				++s_dispatch_count;
 				// TEST: periodic IC flush — bounds SMC-staleness when cond/static
@@ -3518,6 +3549,7 @@ public:
 						   (int)sched_next, (int)(sched_now & 0xffffffff));
 					}
 #endif // DEBUG_DISPATCH
+					det_credited = true;
 				}    // end if (ctx->cycle_counter <= 0)
 #ifdef DEBUG_DISPATCH
 				const double tD_inner = emscripten_get_now();

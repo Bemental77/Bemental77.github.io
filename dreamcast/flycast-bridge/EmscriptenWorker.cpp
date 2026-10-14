@@ -1959,6 +1959,29 @@ EMSCRIPTEN_KEEPALIVE void emscripten_set_rollback_mode(int on) {
 // Returns 1 = loaded (keep-code), 2 = loaded (fell back to full flush), 0 = failed.
 // ⚠ Does NOT keep s_autoload_buf (the parity-cert copy): a 27 MB memcpy per
 // rollback is exactly the kind of cost this path exists to remove.
+// The rollback ring's fingerprint of a saved state: FNV-1a over the guest's
+// 16 MB of main RAM inside it (sh4_mmr.cpp records where serialize put it).
+// Guest RAM only, so a byte the host lays out differently between two browsers
+// can never read as a desync; the room's soak rig compares exactly this region.
+extern "C" { u32 g_ser_ram_offset = 0; }
+// where guest RAM starts inside a serialized state (for a rig's independent hash)
+EMSCRIPTEN_KEEPALIVE uint32_t emscripten_rb_ram_offset(void) { return g_ser_ram_offset; }
+EMSCRIPTEN_KEEPALIVE uint32_t emscripten_rb_hash(const uint8_t* buf, size_t size) {
+    if (!buf || !size) return 0;
+    const size_t RAM = 16u << 20;
+    size_t off = g_ser_ram_offset, n = RAM;
+    if (off == 0 || off + n > size) { off = 0; n = size; }
+    const uint8_t* p = buf + off;
+    uint32_t h = 0x811c9dc5u;
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        uint32_t w; memcpy(&w, p + i, 4);
+        h = (h ^ w) * 16777619u;
+    }
+    for (; i < n; i++) h = (h ^ p[i]) * 16777619u;
+    return h;
+}
+
 EMSCRIPTEN_KEEPALIVE
 int emscripten_load_state_rollback(const uint8_t* buf, size_t size) {
     if (!g_loaded || !buf || !size) return 0;
