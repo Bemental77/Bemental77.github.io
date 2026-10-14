@@ -2055,6 +2055,41 @@
             return r.bytes;
           }
 
+          // ⚠ A MISS FETCHES THE RUN BEHIND IT IN THE SAME ROUND TRIP. Measured
+          // on Gauntlet with a 100 ms link (tools/devserver.mjs
+          // DEVSERVER_LATENCY_MS): almost every synchronous miss was a block
+          // the async readahead had ALREADY requested (inflight=1) — the game
+          // reads faster than the readahead lands — so the emulator thread
+          // re-fetched it and waited 110-560 ms, once per 256 KiB block. On
+          // the live site that is each console's load stall, and in a room
+          // the other console's stall too. Now a miss takes the block and up
+          // to MISS_RUN-1 contiguous successors in ONE Range request; the
+          // successors are kept compressed and inflated (~2 ms each) on use.
+          const MISS_RUN = 16;
+          const compCache = new Map();     // key -> compressed member bytes (fetched with a miss)
+          function bgzSpan(loc) {
+            const run = [loc];
+            let n = loc;
+            while (run.length < MISS_RUN) {
+              n = BGZ.next(ix, n);
+              if (!n || n.url !== loc.url || n.partIndex !== loc.partIndex) break;
+              if (n.cFrom !== run[run.length - 1].cTo + 1) break;
+              if (blockCache.has(n.key) || compCache.has(n.key)) break;
+              run.push(n);
+            }
+            if (run.length === 1 || wholeParts.get(loc.partIndex)) return bgzCompressed(loc);
+            const last = run[run.length - 1];
+            const r = httpRange(loc.url, loc.cFrom, last.cTo);
+            if (!r.partial || r.bytes.length !== last.cTo - loc.cFrom + 1) return bgzCompressed(loc);
+            for (let i = 1; i < run.length; i++) {
+              const b = run[i];
+              compCache.set(b.key, r.bytes.subarray(b.cFrom - loc.cFrom, b.cTo - loc.cFrom + 1));
+            }
+            lazyStats.spans = (lazyStats.spans | 0) + 1;
+            while (compCache.size > 4 * MISS_RUN) compCache.delete(compCache.keys().next().value);
+            return r.bytes.subarray(0, loc.cTo - loc.cFrom + 1);
+          }
+
           function bgzReadAhead(loc) {
             if (READAHEAD <= 0) return;
             let n = loc;
@@ -2062,7 +2097,7 @@
               n = BGZ.next(ix, n);
               if (!n) return;
               const L = n, key = L.key;
-              if (blockCache.has(key) || inFlight.has(key)) continue;
+              if (blockCache.has(key) || inFlight.has(key) || compCache.has(key)) continue;
               inFlight.add(key);
               // ASYNC on purpose, and inflated with the NATIVE decompressor:
               // a sync XHR plus a JS inflate here would stall the emulator
@@ -2090,7 +2125,9 @@
               return hit;
             }
             lazyStats.misses++;
-            const out = BGZ.inflateMemberSync(bgzCompressed(loc));
+            const comp = compCache.get(loc.key);
+            if (comp) compCache.delete(loc.key);
+            const out = BGZ.inflateMemberSync(comp || bgzSpan(loc));
             // The index says how long this block must be. A disagreement means
             // the parts and the index came from different data — refuse rather
             // than hand the SH4 a plausible-looking wrong disc.

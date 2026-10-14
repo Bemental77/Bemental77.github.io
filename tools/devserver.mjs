@@ -69,7 +69,17 @@ function resolveSafe(urlPath) {
   return full;
 }
 
+// DEVSERVER_LATENCY_MS=N[:REGEX] — a RIG ARM, never a default: delay every
+// response whose path matches REGEX (default: Range requests) by N ms, so a
+// local run sees the round trip a page served from the live site pays (a
+// streaming disc's synchronous miss is a network round trip there, ~0 here).
+const LAT = (() => { const v = process.env.DEVSERVER_LATENCY_MS; if (!v) return null;
+  const i = v.indexOf(':'); return { ms: +(i < 0 ? v : v.slice(0, i)) || 0, re: i < 0 ? null : new RegExp(v.slice(i + 1)) }; })();
 const server = http.createServer((req, res) => {
+  if (LAT && LAT.ms > 0 && !req.__lat && (LAT.re ? LAT.re.test(req.url || '') : !!req.headers.range)) {
+    req.__lat = true;
+    return void setTimeout(() => server.emit('request', req, res), LAT.ms);
+  }
   const method = req.method || 'GET';
   if (method !== 'GET' && method !== 'HEAD') {
     res.writeHead(405, { Allow: 'GET, HEAD' }); return res.end();

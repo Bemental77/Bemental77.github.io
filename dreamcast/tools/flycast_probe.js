@@ -621,6 +621,7 @@ function classify(text) {
 
   const chromeArgs = [
     '--no-sandbox',
+    ...(process.env.PROBE_BASE && /^https:/.test(process.env.PROBE_BASE) ? ['--ignore-certificate-errors'] : []),
     '--enable-features=SharedArrayBuffer',
     // Headless Chromium throttles RAF/setInterval in non-visible windows,
     // which freezes the page's frameLoop after a few ticks. These three
@@ -811,7 +812,9 @@ function classify(text) {
   });
 
   const start = Date.now();
-  const probeUrl = `http://127.0.0.1:${PORT}/dreamcast.html?diag=1`
+  // PROBE_BASE=https://caseybement.com probes the LIVE site instead of this
+  // tree (the static server above is then unused).
+  const probeUrl = `${process.env.PROBE_BASE || ('http://127.0.0.1:' + PORT)}/dreamcast.html?diag=1`
     + (INTERP_ONLY ? '&interp=1' : '')
     + (NO_FASTMEM ? '&nofastmem=1' : '')
     + (NOIC ? '&noic=1' : '')
