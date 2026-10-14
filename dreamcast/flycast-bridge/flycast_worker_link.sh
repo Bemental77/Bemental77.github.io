@@ -417,6 +417,11 @@ emcc \
 
 echo "linked: $OUT/flycast_worker_emcc.{js,wasm}"
 
+# In-place sed that works on BSD/macOS (`sed -i ''`) AND GNU/Linux (`sed -i`).
+# The bare BSD form made GNU sed read '' as the script and the expression as a
+# FILE NAME, failing every Linux link after the emcc step had already succeeded.
+if sed --version >/dev/null 2>&1; then SEDI=(sed -i); else SEDI=(sed -i ''); fi
+
 # ---------------------------------------------------------------------------
 # Post-build patch: Emscripten 3.1.67 has a bug in pthread_create's
 # transferredCanvasNames handling. The comment at the for-of loop site says
@@ -426,7 +431,7 @@ echo "linked: $OUT/flycast_worker_emcc.{js,wasm}"
 # missing null guard. If the upstream Emscripten ever fixes this, the sed
 # becomes a no-op (won't match) — safe.
 # ---------------------------------------------------------------------------
-sed -i '' 's|// Note that transferredCanvasNames might be null (so we cannot do a for-of loop)\.$|// Note that transferredCanvasNames might be null (so we cannot do a for-of loop).\
+"${SEDI[@]}" 's|// Note that transferredCanvasNames might be null (so we cannot do a for-of loop)\.$|// Note that transferredCanvasNames might be null (so we cannot do a for-of loop).\
   if (!transferredCanvasNames) transferredCanvasNames = [];  // PATCH: Emscripten 3.1.67 missing null guard|' "$OUT/flycast_worker_emcc.js"
 echo "patched: transferredCanvasNames null-guard"
 
@@ -442,7 +447,7 @@ echo "patched: transferredCanvasNames null-guard"
 # ROOT FIX BELONGS UPSTREAM (emscripten glue / a memory-growth-aware GL path);
 # this sed is the port-local durable fix. No-op if the glue shape changes.
 # ---------------------------------------------------------------------------
-sed -i '' 's|GLctx.bufferSubData(target, offset, src.subarray(data, data + size));|GLctx.bufferSubData(target, offset, src.slice(data, data + size));  /* PATCH: growable-heap ArrayBuffer is resizable; WebGL2 needs a non-resizable copy */|' "$OUT/flycast_worker_emcc.js"
+"${SEDI[@]}" 's|GLctx.bufferSubData(target, offset, src.subarray(data, data + size));|GLctx.bufferSubData(target, offset, src.slice(data, data + size));  /* PATCH: growable-heap ArrayBuffer is resizable; WebGL2 needs a non-resizable copy */|' "$OUT/flycast_worker_emcc.js"
 echo "patched: bufferSubData resizable-ArrayBuffer copy"
 
 # Same resizable-ArrayBuffer trap on TEXTURE uploads: emscriptenWebGLGetTexPixelData
@@ -450,7 +455,7 @@ echo "patched: bufferSubData resizable-ArrayBuffer copy"
 # texSubImage2D reject once the heap has grown. Copy to a non-resizable buffer via
 # .slice(). Hardening (matches the bufferSubData fix); fixes any post-growth texture
 # upload that would otherwise silently fail. No-op if the glue shape changes.
-sed -i '' 's|return heap.subarray(toTypedArrayIndex(pixels, heap) >>> 0, toTypedArrayIndex(pixels + bytes, heap) >>> 0);|return heap.slice(toTypedArrayIndex(pixels, heap) >>> 0, toTypedArrayIndex(pixels + bytes, heap) >>> 0);  /* PATCH: growable-heap view is resizable; WebGL2 texImage needs a non-resizable copy */|' "$OUT/flycast_worker_emcc.js"
+"${SEDI[@]}" 's|return heap.subarray(toTypedArrayIndex(pixels, heap) >>> 0, toTypedArrayIndex(pixels + bytes, heap) >>> 0);|return heap.slice(toTypedArrayIndex(pixels, heap) >>> 0, toTypedArrayIndex(pixels + bytes, heap) >>> 0);  /* PATCH: growable-heap view is resizable; WebGL2 texImage needs a non-resizable copy */|' "$OUT/flycast_worker_emcc.js"
 echo "patched: texImage2D resizable-ArrayBuffer copy"
 
 # ---------------------------------------------------------------------------
