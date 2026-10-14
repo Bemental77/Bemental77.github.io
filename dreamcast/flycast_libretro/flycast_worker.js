@@ -903,6 +903,7 @@
           if (k !== from && !rbSave(M, k)) { rbFault('save of re-simulated frame ' + k + ' failed'); return false; }
           lsWritePads(fr.img);
           FSK.serial++; FSK.skipping = !!(FSK.on && !FSK.disabled);
+          if (typeof M._flycast_set_render_skip === 'function') M._flycast_set_render_skip(FSK.skipping ? 1 : 0);
           M._emscripten_run_iter();
           FSK.skipping = false;
           if (runIterSuspended()) { rbFault('re-simulated frame ' + k + ' suspended (asyncify) — cannot re-simulate it in one task'); return false; }
@@ -1456,6 +1457,10 @@
     // consoles dropped 65-264 ms in the second after the step to depth 1
     // (bench room 0.9877-0.9953, 3 runs).
     fsBegin(t0, lockstep, lagNow);
+    // ...and the core skips building the picture this frame will not show
+    // (Renderer_if.cpp flycast_set_render_skip: TA parse, Process, Render — not
+    // guest state, and never a render-to-texture).
+    if (typeof Module._flycast_set_render_skip === 'function') Module._flycast_set_render_skip(FSK.skipping ? 1 : 0);
     let lsAckF = -1;
     try {
       Module._emscripten_run_iter();
