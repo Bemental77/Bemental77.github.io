@@ -173,6 +173,9 @@ static int      g_video_target_h = 0;
 //   [4..7]   uint32 tail (reader = JS audio worklet)
 //   [8..]    int16 stereo samples (capacity * 2 * sizeof(int16))
 static uint8_t* g_audio_ring_base     = nullptr;
+// ROLLBACK (patch 0002): set by emscripten_rb_mute_audio around re-simulated
+// frames; audio_sample_batch_cb then discards the batch.
+static volatile uint32_t g_rb_mute_audio = 0;
 static uint32_t g_audio_ring_capacity = 0;  // in stereo frames
 
 // Audio-path observability (2026-08-28). Before this, BOTH ends of the ring
@@ -987,6 +990,8 @@ static void video_cb(const void* data, unsigned w, unsigned h, size_t pitch) {
 
 static size_t audio_sample_batch_cb(const int16_t* data, size_t frames) {
     if (!data || !frames) return frames;
+    // ROLLBACK (patch 0002): re-simulated frames must not be heard twice.
+    if (g_rb_mute_audio) return frames;
 
     // SAB ring path.
     if (g_audio_ring_base && g_audio_ring_capacity) {
@@ -1533,6 +1538,7 @@ uintptr_t flycast_run_iter_flag_ptr(void) { return (uintptr_t)&s_run_iter_inflig
 extern "C" { extern double g_attr_mainloop_ms, g_attr_retro_ms; }
 // Frame-watchdog run_iter generation (defined in rec_wasm.cpp).
 extern "C" { extern volatile uint32_t g_wd_iter_gen; }
+extern "C" void flycast_rb_reset_host_history(void);   // rec_wasm.cpp, patch 0001
 
 // VMU bridge (defined in core/hw/maple/maple_devs.cpp under __EMSCRIPTEN__,
 // patch 0014). The wasm VMU is in-memory only, so the page owns persistence:
@@ -1606,6 +1612,14 @@ void emscripten_run_iter(void) {
     // run_iter means the previous frame completed — the 2s stuck-frame clock
     // must start over.
     ++g_wd_iter_gen;
+    // ROLLBACK DETERMINISM (patch 0001): host history that steers the guest
+    // (the idle-skip streak) is zeroed at EVERY frame start, so the state at
+    // the start of frame k fully determines frame k. Zeroing it only on load
+    // is not enough for rollback: a re-simulation loads frame k's ring state
+    // and would start with streak 0 where the original run carried k frames
+    // of streak. Measured: with idle-skip OFF, three runs from one anchor are
+    // byte-identical over 7 states; with it ON they diverge at frame 1.
+    flycast_rb_reset_host_history();
     static unsigned long s_call_count = 0;
     ++s_call_count;
     if (s_call_count < 5 || s_call_count % 1000 == 0) {
@@ -1744,6 +1758,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void sh4_import_fnptrs(uint32_t* out) {
 extern "C" void flycast_ic_invalidate(void);
 extern "C" void flycast_lockstep_reset(void);
 extern "C" void flycast_set_ic(int on);
+extern "C" void flycast_rb_reset_host_history(void);   // rec_wasm.cpp, patch 0001
 // Lever-5B sizing instrument (defined in rec_wasm.cpp; read via ctxsnap 81).
 extern "C" { extern volatile uint32_t g_syncsr_count; }
 // Lever-10 sizing instrument (defined in rec_wasm.cpp; read via ctxsnap 89).
@@ -1892,7 +1907,98 @@ int emscripten_load_state(const uint8_t* buf, size_t size) {
     // flycast_ic_invalidate() above does NOT cover this: it is a no-op while
     // g_ic_generation == 0, and it never touches the block table.
     if (ok) flycast_lockstep_reset();
+    // ROLLBACK DETERMINISM (patch 0001): bm_ResetCache above already zeroes
+    // the idle-skip streak through WasmDynarec::reset(); this names the
+    // contract explicitly so a future load path that skips the flush (the
+    // keep-code rollback load, patch 0002) cannot forget it.
+    if (ok) flycast_rb_reset_host_history();
     return ok;
+}
+
+// ===========================================================================
+// ROLLBACK (patch 0002) — dreamcast/docs/rollback/TASKS.md
+// ===========================================================================
+extern "C" bool retro_unserialize_keepcode(const void* data, size_t size);   // libretro.cpp (C linkage)
+extern "C" {
+    uint32_t flycast_rb_snapshot_code_pages(void);   // rec_wasm.cpp
+    uint32_t flycast_rb_invalidate_changed(void);
+    void flycast_set_rollback_mode(int on);
+    void flycast_set_deterministic(int on);
+}
+// Audio produced while re-simulating is DISCARDED: the rollback driver sets
+// g_rb_mute_audio around resim frames; audio_sample_batch_cb returns early
+// (the core is still told every frame was consumed, like the overflow path).
+EMSCRIPTEN_KEEPALIVE void emscripten_rb_mute_audio(int on) { g_rb_mute_audio = on ? 1u : 0u; }
+
+// Cached serialize size. retro_serialize_size() is a FULL dc_serialize into a
+// sizing Serializer (libretro.cpp:2394-2413, plus its own emu.stop/start), so
+// emscripten_save_state pays the serializer twice per save. A rollback peer
+// saves every frame into a preallocated ring and needs the size once.
+EMSCRIPTEN_KEEPALIVE size_t emscripten_state_size(void) {
+    return g_loaded ? retro_serialize_size() : 0;
+}
+// Save into a caller-owned buffer (a ring slot): no malloc, no free, one
+// serializer pass. Returns 1 on success.
+extern "C" bool retro_serialize_lean(void* data, size_t size);   // libretro.cpp (C linkage)
+EMSCRIPTEN_KEEPALIVE int emscripten_save_state_into(uint8_t* buf, size_t cap) {
+    if (!g_loaded || !buf || !cap) return 0;
+    // the lean save (no emu.stop()/start() bracket) — see libretro.cpp
+    return retro_serialize_lean(buf, cap) ? 1 : 0;
+}
+
+// Enter/leave rollback mode: per-block synchronous install (no pending
+// shard spans), stale-hit -> recompile, wall-clock watchdog suspended. Every
+// peer in a rollback room calls this once at ROOM START, before the anchor.
+EMSCRIPTEN_KEEPALIVE void emscripten_set_rollback_mode(int on) {
+    flycast_set_rollback_mode(on ? 1 : 0);
+    flycast_set_deterministic(on ? 1 : 0);
+}
+
+// THE ROLLBACK LOAD. Same machine state as emscripten_load_state; the SH4
+// code cache is kept and only install units whose code bytes changed are
+// dropped. Falls back to the full flush when the precise path cannot prove
+// itself safe (MMU on, a parked/pending span on a changed page).
+// Returns 1 = loaded (keep-code), 2 = loaded (fell back to full flush), 0 = failed.
+// ⚠ Does NOT keep s_autoload_buf (the parity-cert copy): a 27 MB memcpy per
+// rollback is exactly the kind of cost this path exists to remove.
+// The rollback ring's fingerprint of a saved state: FNV-1a over the guest's
+// 16 MB of main RAM inside it (sh4_mmr.cpp records where serialize put it).
+// Guest RAM only, so a byte the host lays out differently between two browsers
+// can never read as a desync; the room's soak rig compares exactly this region.
+extern "C" { u32 g_ser_ram_offset = 0; }
+// where guest RAM starts inside a serialized state (for a rig's independent hash)
+EMSCRIPTEN_KEEPALIVE uint32_t emscripten_rb_ram_offset(void) { return g_ser_ram_offset; }
+EMSCRIPTEN_KEEPALIVE uint32_t emscripten_rb_hash(const uint8_t* buf, size_t size) {
+    if (!buf || !size) return 0;
+    const size_t RAM = 16u << 20;
+    size_t off = g_ser_ram_offset, n = RAM;
+    if (off == 0 || off + n > size) { off = 0; n = size; }
+    const uint8_t* p = buf + off;
+    uint32_t h = 0x811c9dc5u;
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        uint32_t w; memcpy(&w, p + i, 4);
+        h = (h ^ w) * 16777619u;
+    }
+    for (; i < n; i++) h = (h ^ p[i]) * 16777619u;
+    return h;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int emscripten_load_state_rollback(const uint8_t* buf, size_t size) {
+    if (!g_loaded || !buf || !size) return 0;
+    if (flycast_rb_snapshot_code_pages() == 0xFFFFFFFFu) {
+        return emscripten_load_state(buf, size) ? 2 : 0;
+    }
+    if (!retro_unserialize_keepcode(buf, size)) return 0;
+    int rc = 1;
+    if (flycast_rb_invalidate_changed() == 0xFFFFFFFFu) {
+        flycast_lockstep_reset();
+        rc = 2;
+    }
+    flycast_ic_invalidate();
+    flycast_rb_reset_host_history();
+    return rc;
 }
 
 EMSCRIPTEN_KEEPALIVE

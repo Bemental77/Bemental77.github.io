@@ -32,6 +32,7 @@
 #include "hw/sh4/sh4_interpreter.h"
 #include "hw/sh4/dyna/ngen.h"
 #include "hw/sh4/dyna/blockmanager.h"
+#include "hw/sh4/modules/mmu.h"   // mmu_enabled() — rollback keep-code load (patch 0002)
 #include "hw/mem/addrspace.h"
 #include "hw/pvr/pvr_mem.h"
 #include "hw/aica/aica_if.h"
@@ -145,6 +146,8 @@ static constexpr u32 JIT_PROBE_LIMIT = 8;
 static BlockFn  s_block_fn[JIT_TABLE_SIZE];
 static uint32_t s_block_pc[JIT_TABLE_SIZE];   // 0 = empty slot
 static uint32_t s_block_count = 0;            // installed-block tally for diag
+static uint32_t g_compile_calls = 0;          // WasmDynarec::compile() calls (ctx_snapshot 111)
+static uint32_t g_rb_stale_recompiles = 0;    // rollback-mode stale hit -> discard + recompile (ctx_snapshot 112)
 
 static inline u32 jit_hash(u32 vaddr) {
     return (vaddr * 2654435761u) & JIT_TABLE_MASK;
@@ -291,6 +294,17 @@ static uint8_t s_block_stale[JIT_TABLE_SIZE];
 // and every miss re-summed). 0 = not verified this generation; disarmed
 // (gen==0) always verifies — boot behavior unchanged.
 static uint32_t s_block_vgen[JIT_TABLE_SIZE];
+// ROLLBACK KEEP-CODE LOAD (patch 0002). The install UNIT a slot came from:
+// blocks sealed together in one shard tail-link each other with a bare
+// `return_call <idx>` resolved at compile time (bementalJIT wasm_emit.cpp
+// "intra-shard tail-link" — an UNVERIFIED edge, no jit_lookup), so dropping
+// ONE member of a shard while its siblings stay live is unsound: a sibling
+// would still jump into the stale body. Invalidation therefore works on whole
+// units. 0 = per-block install (its own module; no siblings).
+static uint32_t s_block_unit[JIT_TABLE_SIZE];
+static uint32_t s_cur_unit = 0, s_unit_serial = 0;
+// Slot of the last jit_lookup that returned STALE (valid only right after it).
+static uint32_t g_lookup_slot = 0;
 static constexpr u32 SMC_CHUNKS = 1u << 22;   // 16MB >> 2
 static inline void code_pages_mark_block(u32 vaddr, u32 code_bytes) {
     if (!vaddr_in_ram(vaddr) || code_bytes == 0) return;
@@ -350,6 +364,7 @@ static BlockFn jit_lookup(u32 vaddr) {
                     return s_block_fn[slot];
                 if (ram_code_sum(vaddr, s_block_len[slot]) != s_block_sum[slot]) {
                     g_lookup_stale = true;
+                    g_lookup_slot = slot;
                     s_block_vgen[slot] = 0;
                     // Lever-4 F1 dedupe: bump ONLY on the clean->stale
                     // transition. Repeat lookups of a known-stale block add
@@ -385,6 +400,7 @@ static bool jit_register(u32 vaddr, BlockFn fn, u32 code_bytes) {
             s_block_len[slot] = verify ? code_bytes : 0;
             s_block_sum[slot] = verify ? ram_code_sum(vaddr, code_bytes) : 0;
             s_block_stale[slot] = 0;   // fresh snapshot — no longer known-stale
+            s_block_unit[slot] = s_cur_unit;   // patch 0002: install unit
             // Lever-5E1: the sum just computed IS this generation's verification.
             s_block_vgen[slot] = (verify && g_ic_generation) ? g_ic_generation : 0;
             // Build 2 (lever-4): a RE-compile moves this vaddr to a NEW wasmTable
@@ -421,8 +437,24 @@ uint64_t g_chain_hits = 0, g_chain_misses = 0;
 extern "C" {
     extern uint32_t g_ras_pc, g_ras_slot, g_ras_gen;   // lever-5E3 (emitter TU)
 }
+extern "C" { extern volatile uint32_t g_idleskip; }
 extern "C" EMSCRIPTEN_KEEPALIVE int sh4_jit_lookup_idx(uint32_t vaddr) {
     if (!g_chain_enabled) return -1;
+    // THE IDLE-SKIP PCS ARE NEVER CHAINED INTO. The idle-skip check lives only
+    // in the C trampoline (wasm_block_trampoline), so an edge that tail-linked
+    // straight into the frame-wait spin skipped the check and ran the spin body
+    // instead of burning. Whether an edge chains depends on whether its target
+    // was compiled when the edge was LAST resolved — host history — so a
+    // cold-cache run and a warm-cache run of the same frame from the same state
+    // charged different cycles (measured with a credit-pass trace: first
+    // difference at pass 3726, pc 0x8c3c53d8, residual 0 cold vs -4 warm; per-
+    // frame guest cycles 6672302/6673198 cold vs 6672750/6672750 warm). That
+    // made the trajectory depend on what this console happened to have compiled,
+    // which a rollback (or a room whose consoles compiled different code) cannot
+    // allow. A miss here returns the edge to the trampoline, so every arrival at
+    // the spin sees the same check. IC/RAS slots are only ever filled from a hit
+    // here, so they cannot cache these targets either.
+    if (g_idleskip && (vaddr == 0x8c3c53d8u || vaddr == 0x8c3c53e0u || vaddr == 0x8c3c53f8u)) return -1;
     BlockFn fn = jit_lookup(vaddr);
     if (fn) { ++g_chain_hits;
         // Lever-5E3 fill: this resolve IS the prediction's answer. Armed-only
@@ -539,6 +571,20 @@ volatile uint32_t g_syncfpscr_count = 0;
 // really reaches g_idleskip. The earlier "no runtime OFF exists yet" warning
 // here is obsolete.
 volatile uint32_t g_idleskip = 1;
+// ROLLBACK DETERMINISM (patch 0001, dreamcast/docs/rollback/TASKS.md).
+// The idle-skip progress bound's streak used to be a function-static inside
+// wasm_block_trampoline. No savestate carries it and no reset cleared it, so
+// two runs restored from the SAME bytes started with different streaks and
+// executed (or skipped) a different visit of PSO's frame-wait spin — a
+// different number of guest cycles burned before the next event. Hoisted
+// here so WasmDynarec::reset() (every state load, via bm_ResetCache) and
+// flycast_rb_reset_host_history() can zero it.
+static u32 s_isk_streak = 0;
+// Wall-clock guard. While set, the 2 s frame watchdog (dispatch_slice) is
+// suspended exactly as it is for a parity arm: it converts host wall time
+// into guest trajectory (it ends a frame at a wall-dependent dispatch), which
+// no rollback or lockstep peer can reproduce. Set by netplay rooms.
+volatile uint32_t g_deterministic = 0;
 volatile uint32_t g_idleskip_burns = 0;
 // Frame-watchdog run_iter generation (bumped in emscripten_run_iter). The
 // watchdog's old reset heuristic (1M-dispatch gap) assumed a free-running
@@ -680,6 +726,7 @@ static void jit_clear() {
     memset((void*)g_code_map, 0, sizeof(g_code_map));
     memset(s_block_stale, 0, sizeof(s_block_stale));
     memset(s_block_vgen, 0, sizeof(s_block_vgen));
+    memset(s_block_unit, 0, sizeof(s_block_unit));
 }
 
 // Lever-6B: dispatch-loop state hoisted to file scope so the inner loop can
@@ -764,8 +811,10 @@ static std::map<u32, u32> s_unreg_len;
 // must span-INTERPRET a parked pc from live RAM instead, forever — until
 // reset() clears the parks, which is sound because bm_ResetCache refills the
 // WHOLE FPCB with ngen_FailedToFindBlock first (see reset()).
+extern volatile uint32_t g_rb_mode, g_rb_parks;   // patch 0002, defined below
 static inline void park_unregistered(u32 vaddr, u32 code_bytes) {
     s_unreg_len[vaddr] = code_bytes;
+    if (g_rb_mode) ++g_rb_parks;   // patch 0002: history-dependent route — must read 0
 }
 
 // [2026-05-19] Forcing shard ON validated the path engages (124 seals fired in 60s)
@@ -823,6 +872,18 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_lockstep_reset(void) {
 extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_idleskip(int on) {
     g_idleskip = !!on;
 }
+// ROLLBACK DETERMINISM (patch 0001). on=1 suspends the wall-clock frame
+// watchdog (see g_deterministic). Netplay (lockstep or rollback) sets it.
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_deterministic(int on) {
+    g_deterministic = !!on;
+}
+// Zero every piece of HOST history that steers guest execution but is not in
+// the savestate and is not cleared by bm_ResetCache. Called by every load path
+// (emscripten_load_state, emscripten_load_state_rollback). Keep this list in
+// sync with dreamcast/docs/rollback/TASKS.md "sources of non-determinism".
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_rb_reset_host_history(void) {
+    s_isk_streak = 0;
+}
 
 // g_cb_disp_count is defined above at line ~195 inside the extern "C" block;
 // we read it (no forward decl needed) to drive the SHARD_DISPATCH_SEAL
@@ -851,6 +912,7 @@ static void seal_pending_shard() {
     // to prevent (recompile -> blockmanager.cpp:288 -> os_DebugBreak).
 
     if (base_idx > 0) {
+        s_cur_unit = ++s_unit_serial;   // patch 0002: every member stamps this unit
         for (int i = 0; i < count; ++i) {
             BlockFn fn = reinterpret_cast<BlockFn>(
                 static_cast<uintptr_t>(base_idx + i));
@@ -999,6 +1061,7 @@ static void seal_pending_shard() {
 
         // Only the CURRENT shard's bookkeeping is cleared; the parks live in
         // s_unreg_len and survive this (and every later) seal.
+        s_cur_unit = 0;   // patch 0002: later per-block installs are their own unit
         s_pending_shard.clear();
         s_pending_vaddrs.clear();
         s_pending_len.clear();
@@ -1008,6 +1071,7 @@ static void seal_pending_shard() {
 
     // Only the CURRENT shard's bookkeeping is cleared; the probe-limit parks
     // live in s_unreg_len and survive this (and every later) seal.
+    s_cur_unit = 0;   // patch 0002: later per-block installs are their own unit
     s_pending_shard.clear();
     s_pending_vaddrs.clear();
     s_pending_len.clear();
@@ -1021,6 +1085,166 @@ static void seal_pending_shard() {
 extern "C" EMSCRIPTEN_KEEPALIVE void flycast_shard_seal_now(void) {
     if (s_shard_enabled) seal_pending_shard();
 }
+
+// ===========================================================================
+// ROLLBACK KEEP-CODE LOAD (patch 0002) — dreamcast/docs/rollback/TASKS.md
+// ===========================================================================
+// emscripten_load_state flushes EVERY compiled block (bm_ResetCache ->
+// WasmDynarec::reset -> jit_clear), and the frames after a load recompile:
+// measured 47.9 ms load + 691 ms for the next 8 frames, a 1,487 ms p50
+// rollback step against a 33.3 ms frame. A rollback restores a state a few
+// frames old in the SAME scene; its code pages are almost never different
+// from what is resident. So: snapshot the resident code pages before the
+// load, compare after it, and drop only the install units whose code bytes
+// actually changed.
+//
+// ROUTING MUST STAY A PURE FUNCTION OF GUEST STATE, or keeping code trades a
+// cost problem for a determinism one. Two route splits exist today and both
+// charge different guest cycles:
+//   (a) a compiled-but-PENDING shard block span-interprets until its shard
+//       seals — whether a block is pending depends on compile history;
+//   (b) an SMC-stale block INTERPRETS (jit_lookup -> g_lookup_stale), while
+//       a peer that never compiled the old bytes COMPILES the new ones.
+// Rollback mode closes both: it runs with per-block synchronous install
+// (shard off: a block is live from its first execution, so (a) cannot occur)
+// and turns a stale hit into discard + recompile (so (b) routes compiled on
+// every peer). What remains history-dependent is a probe-limit PARK (table
+// occupancy), which is counted in g_rb_parks and must read 0 in the rig.
+volatile uint32_t g_rb_mode = 0;
+volatile uint32_t g_rb_parks = 0;          // parks seen while in rollback mode
+volatile uint32_t g_rb_last_discards = 0;  // blocks dropped by the last keep-code load
+volatile uint32_t g_rb_last_changed_pages = 0;
+volatile uint32_t g_rb_full_flushes = 0;   // keep-code loads that had to fall back
+
+void bm_DiscardBlock(RuntimeBlockInfo* block);   // blockmanager.cpp:310
+static constexpr u32 RB_PAGE_SHIFT = 12;                    // 4 KB
+static constexpr u32 RB_PAGES = 0x01000000u >> RB_PAGE_SHIFT; // 16 MB main RAM
+static uint8_t  s_rb_code_page[RB_PAGES];   // page holds registered code
+static uint8_t  s_rb_changed[RB_PAGES];
+static uint8_t* s_rb_shadow = nullptr;      // 16 MB, code pages only are filled
+
+static inline void rb_mark_span(u32 vaddr, u32 len, uint8_t* map) {
+    if (!vaddr_in_ram(vaddr) || len == 0) return;
+    const u32 lo = (vaddr & 0x00FFFFFFu) >> RB_PAGE_SHIFT;
+    u32 hi = ((vaddr & 0x00FFFFFFu) + len - 1) >> RB_PAGE_SHIFT;
+    if (hi >= RB_PAGES) hi = RB_PAGES - 1;
+    for (u32 p = lo; p <= hi; p++) map[p] = 1;
+}
+static inline bool rb_span_hits(u32 vaddr, u32 len, const uint8_t* map) {
+    if (!vaddr_in_ram(vaddr) || len == 0) return false;
+    const u32 lo = (vaddr & 0x00FFFFFFu) >> RB_PAGE_SHIFT;
+    u32 hi = ((vaddr & 0x00FFFFFFu) + len - 1) >> RB_PAGE_SHIFT;
+    if (hi >= RB_PAGES) hi = RB_PAGES - 1;
+    for (u32 p = lo; p <= hi; p++) if (map[p]) return true;
+    return false;
+}
+
+// Drop one slot from BOTH tables. flycast's FPCA entry goes back to
+// ngen_FailedToFindBlock (bm_DiscardBlock), so the next miss passes
+// bm_AddBlock's verify; our slot keeps its pc (the probe chain stays intact —
+// jit_lookup stops at pc==0, so a hole would orphan every later colliding
+// vaddr) but answers MISS: fn = nullptr with len = 0 skips the sum and is
+// returned as a plain miss, and the recompile's jit_register overwrites this
+// very slot (pc == vaddr branch).
+static void rb_discard_slot(u32 slot) {
+    const u32 v = s_block_pc[slot];
+    if (v == 0 || s_block_fn[slot] == nullptr) return;
+    // NOT bm_GetBlock(): that resolves through blkmap.upper_bound +
+    // containsCode(), and this backend registers every block with
+    // host_code_size = 0, so containsCode is false for all of them. Instead use
+    // the fact compile() relies on: block->code IS the RuntimeBlockInfo*
+    // ("Use the block's own heap address (`blk` itself) as the unique fake code
+    // pointer", WasmDynarec::compile) — so the FPCA entry for v names the block.
+    DynarecCodeEntryPtr c = bm_GetCodeByVAddr(v);   // mmu off (checked by caller)
+    if (c != (DynarecCodeEntryPtr)ngen_FailedToFindBlock)
+        bm_DiscardBlock((RuntimeBlockInfo*)(void*)c);
+    s_block_fn[slot] = nullptr;
+    s_block_len[slot] = 0;
+    s_block_sum[slot] = 0;
+    s_block_stale[slot] = 0;
+    s_block_vgen[slot] = 0;
+    s_block_unit[slot] = 0;
+}
+
+// Drop every slot in `slot`'s install unit (or just `slot` for unit 0).
+static u32 rb_discard_unit_of(u32 slot) {
+    const u32 unit = s_block_unit[slot];
+    if (unit == 0) { rb_discard_slot(slot); return 1; }
+    u32 n = 0;
+    for (u32 i = 0; i < JIT_TABLE_SIZE; i++)
+        if (s_block_unit[i] == unit) { rb_discard_slot(i); n++; }
+    return n;
+}
+
+// Enter/leave rollback mode. Entering FLUSHES once, so every peer starts the
+// mode from the same (empty) table and the same install model.
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_rollback_mode(int on) {
+    if (on) {
+        if (s_shard_enabled) seal_pending_shard();
+        s_shard_enabled = false;
+        g_rb_mode = 1;
+        g_rb_parks = 0;
+        bm_ResetCache();          // -> WasmDynarec::reset(): jit_clear + streak
+    } else {
+        g_rb_mode = 0;
+    }
+}
+
+// STEP 1 of a keep-code load (BEFORE retro_unserialize): record which RAM
+// pages hold resident code and copy exactly those pages aside.
+extern "C" EMSCRIPTEN_KEEPALIVE u32 flycast_rb_snapshot_code_pages(void) {
+    if (!s_rb_shadow) {
+        s_rb_shadow = (uint8_t*)malloc(0x01000000u);
+        if (!s_rb_shadow) return 0xFFFFFFFFu;
+    }
+    if (s_shard_enabled) seal_pending_shard();   // nothing may stay pending
+    memset(s_rb_code_page, 0, sizeof(s_rb_code_page));
+    for (u32 slot = 0; slot < JIT_TABLE_SIZE; slot++)
+        if (s_block_pc[slot] != 0 && s_block_fn[slot] != nullptr)
+            rb_mark_span(s_block_pc[slot], s_block_len[slot] ? s_block_len[slot] : 2, s_rb_code_page);
+    for (const auto& kv : s_unreg_len) rb_mark_span(kv.first, kv.second, s_rb_code_page);
+    u32 n = 0;
+    for (u32 p = 0; p < RB_PAGES; p++)
+        if (s_rb_code_page[p]) {
+            memcpy(s_rb_shadow + (p << RB_PAGE_SHIFT), &mem_b[p << RB_PAGE_SHIFT], 1u << RB_PAGE_SHIFT);
+            n++;
+        }
+    return n;
+}
+
+// STEP 2 (AFTER retro_unserialize): compare, then drop every install unit
+// with a block on a changed page. Returns the number of blocks dropped, or
+// 0xFFFFFFFF when the caller must fall back to the full flush (MMU on, a park
+// or pending span on a changed page, or no shadow).
+extern "C" EMSCRIPTEN_KEEPALIVE u32 flycast_rb_invalidate_changed(void) {
+    g_rb_last_discards = 0;
+    g_rb_last_changed_pages = 0;
+    if (!s_rb_shadow || mmu_enabled()) { ++g_rb_full_flushes; return 0xFFFFFFFFu; }
+    memset(s_rb_changed, 0, sizeof(s_rb_changed));
+    u32 changed = 0;
+    for (u32 p = 0; p < RB_PAGES; p++)
+        if (s_rb_code_page[p] &&
+            memcmp(s_rb_shadow + (p << RB_PAGE_SHIFT), &mem_b[p << RB_PAGE_SHIFT], 1u << RB_PAGE_SHIFT) != 0) {
+            s_rb_changed[p] = 1;
+            changed++;
+        }
+    g_rb_last_changed_pages = changed;
+    if (changed == 0) return 0;
+    for (const auto& kv : s_unreg_len)
+        if (rb_span_hits(kv.first, kv.second, s_rb_changed)) { ++g_rb_full_flushes; return 0xFFFFFFFFu; }
+    for (const auto& kv : s_pending_len)
+        if (rb_span_hits(kv.first, kv.second, s_rb_changed)) { ++g_rb_full_flushes; return 0xFFFFFFFFu; }
+    u32 dropped = 0;
+    for (u32 slot = 0; slot < JIT_TABLE_SIZE; slot++)
+        if (s_block_pc[slot] != 0 && s_block_fn[slot] != nullptr &&
+            rb_span_hits(s_block_pc[slot], s_block_len[slot] ? s_block_len[slot] : 2, s_rb_changed))
+            dropped += rb_discard_unit_of(slot);
+    // Every IC entry and LEVER-12 trace-edge stamp may name a dropped index.
+    if (g_ic_generation) { ++g_ic_generation; ++g_smc_gen_accounted; ++g_smc_mark_counts[4]; }
+    g_rb_last_discards = dropped;
+    return dropped;
+}
+
 
 
 // Runtime-toggleable diagnostic gate. When false, all stats / GDROM /
@@ -1111,6 +1335,9 @@ EMSCRIPTEN_KEEPALIVE uint32_t flycast_ctx_snapshot(uint32_t which) {
         case 15: return g_exit_dyn;         // Lever 1
         case 16: return g_exit_static_xshd; // Lever 2
         case 17: return g_exit_cond_xshd;   // Lever 1/2
+        case 110: return s_block_count;          // fresh block registrations
+        case 111: return g_compile_calls;        // WasmDynarec::compile() calls
+        case 112: return g_rb_stale_recompiles;  // rollback-mode stale -> recompile
         case 18: return (uint32_t)g_chain_hits;
         case 19: return (uint32_t)g_chain_misses;
         // ORDER 21b maple-storm diag (maple_if.cpp). 36/37 to clear the r[] range.
@@ -1233,6 +1460,9 @@ extern void bemental_sh4_set_regcache(int on);
 EMSCRIPTEN_KEEPALIVE void flycast_set_regcache(int on) { bemental_sh4_set_regcache(on); }
 extern void bemental_sh4_set_imm_fastpath(int on);
 EMSCRIPTEN_KEEPALIVE void flycast_set_imm_fastpath(int on) { bemental_sh4_set_imm_fastpath(on); }
+// _flycast_set_sq_fp(0|1): the emitted store-queue store arm (wasm_emit.cpp). Default ON; set before blocks compile.
+extern void bemental_sh4_set_sq_fp(int on);
+EMSCRIPTEN_KEEPALIVE void flycast_set_sq_fp(int on) { bemental_sh4_set_sq_fp(on); }
 // _flycast_set_self_loop(0|1). DEFAULT OFF (ORDER 21b): the in-block self-loop
 // codegen mis-compiles the 0x8c12bc6e memset (correct data, wrong exit state —
 // pins the main thread at the rts, storm never collapses). Self-branches now
@@ -1622,7 +1852,8 @@ static void wasm_block_trampoline()
         // later wait can reach its real execution in fewer than ISK_RUN
         // skips) and it is why there is no per-dispatch reset store on the
         // hot path. The progress bound is unaffected.
-        static u32 s_isk_streak = 0;
+        // s_isk_streak lives at file scope (see g_idleskip) so a state load
+        // can zero it; it was a function-static here.
         constexpr u32 ISK_RUN = 32;
         if (s_isk_streak >= ISK_RUN) { s_isk_streak = 0; goto isk_no_skip; }
         if (s_isk_cb_word && *s_isk_cb_word == 0x8c3c34d0u) {
@@ -1661,6 +1892,15 @@ isk_no_skip:
     // dispatch but a std::async SH4 thread spawned by retro_unserialize's
     // emu.start() under a clobbered ThreadedRendering. Fixed by the
     // un-clobberable re-pin in Emulator::start() (emulator.cpp, WASM-gated).)
+    if (!fn && g_lookup_stale && g_rb_mode) {
+        // ROLLBACK MODE (patch 0002): a stale hit must route the SAME way on
+        // every peer, and a peer that never compiled the old bytes compiles
+        // the new ones. So drop the stale unit and fall into the miss path,
+        // which recompiles from live RAM — instead of interpreting.
+        rb_discard_unit_of(g_lookup_slot);
+        g_lookup_stale = false;
+        ++g_rb_stale_recompiles;
+    }
     if (!fn && g_lookup_stale) {
         // SMC-stale block: interpret one instruction from live RAM instead
         // of recompiling (recompiling desyncs flycast's bm and crashes its
@@ -2084,6 +2324,7 @@ public:
 
 	void compile(RuntimeBlockInfo* block, bool /*smc_checks*/, bool /*optimise*/) override
 	{
+		++g_compile_calls;
 		// Earlier-style 0x8c0133f4 diag dump that lived here was DUPLICATING the
 		// build_block() call done below at the per-block install site (line ~715),
 		// and the duplicate decl of `bytes` triggered a -Wshadow / redefinition
@@ -2410,6 +2651,10 @@ public:
 		// makes the delta start at 0 in BOTH, so the seal schedule is a pure
 		// function of guest execution.
 		s_dispatches_at_last_seal = s_dispatch_count;
+		// ROLLBACK DETERMINISM (patch 0001): the idle-skip streak is host
+		// history no savestate carries. Zero it on every reset so a restore
+		// starts the progress bound from the same phase on every run/peer.
+		s_isk_streak = 0;
 		// And drop the block shadow, so a peer with history and a fresh peer
 		// begin with the SAME (empty) block table and compile in the same
 		// guest order. Safe here specifically because flycast's bm_reset ran
@@ -2436,7 +2681,22 @@ public:
 	// the try region and resurrecting the invokes.
 	__attribute__((noinline)) static void dispatch_slice(Sh4Context* ctx)
 	{
-		while (ctx->CpuRunning) {
+		// A STOP ENDS THE FRAME AT A SLICE BOUNDARY, NEVER MID-SLICE, when the
+		// trajectory must be a pure function of guest state (g_deterministic:
+		// rollback mode). Sh4Executor::Stop() (the PVR present that ends a
+		// frame) only clears CpuRunning; this loop sees it the next time a block
+		// returns to C. A chained edge does not return to C, a cold edge (target
+		// not compiled yet) does — so WHERE the frame ended, and therefore the
+		// guest cycle at which the next frame's pads were applied, depended on
+		// what this console had compiled. Measured: cold vs warm cache from one
+		// state, same pads: frame 0 = 6672302 vs 6672750 cycles (one 448-cycle
+		// slice), credit-pass traces identical up to the cold run's early exit.
+		// Under g_deterministic the loop runs on to the end of the slice in which
+		// the stop landed (the point a fully-chained run reaches), credits it,
+		// and only then exits.
+		bool det_credited = true;   // entry with CpuRunning already false: exit
+		while (ctx->CpuRunning || (g_deterministic && !det_credited)) {
+				det_credited = false;
 
 				++s_dispatch_count;
 				// TEST: periodic IC flush — bounds SMC-staleness when cond/static
@@ -2457,7 +2717,7 @@ public:
 				// parity drift's primary source per the static audit).
 				// SUSPENDED while a parity arm hashes; replay frames run to
 				// natural completion instead.
-				if ((s_dispatch_count & 0x3FFFF) == 0 && !g_parity_hashing) {
+				if ((s_dispatch_count & 0x3FFFF) == 0 && !g_parity_hashing && !g_deterministic) {
 					static double s_wd_start = 0.0;
 					static uint64_t s_wd_last = 0;
 					static uint32_t s_wd_gen = 0;
@@ -3299,6 +3559,7 @@ public:
 						   (int)sched_next, (int)(sched_now & 0xffffffff));
 					}
 #endif // DEBUG_DISPATCH
+					det_credited = true;
 				}    // end if (ctx->cycle_counter <= 0)
 #ifdef DEBUG_DISPATCH
 				const double tD_inner = emscripten_get_now();

@@ -100,6 +100,51 @@ because changing the gate's rules is not a fix. The product cost is real: a
 toaster's room starts with about 10 s at 0.01-0.2x. It is a core cost (JIT
 recompile after `lockstep_normalize`'s flushes) and needs the same rebuild.
 
+## Update 2026-10-14 — core rebuilt, two levers shipped, the gate did not move
+
+The core now rebuilds on this box (upstream `4be8a484` worktree + ported files,
+`verify_core_tree.sh` PASS; dreamcast/docs/rollback/TASKS.md). Shipped:
+
+* **Store-queue stores in-wasm** (`wasm_emit.cpp`, size 4 + fmov.d pair to
+  0xE0-0xE3 -> `ctx->sq_buffer`): slow-path SQ stores 60,287/frame -> 0 in the
+  PSO lobby. A/B arm `_flycast_set_sq_fp(0)`.
+* **Lever 4, the picture nobody sees is not built** (`Renderer_if.cpp`
+  `flycast_set_render_skip`, set by the worker's FSK each frame): TA parse,
+  Process and Render are skipped for a skipped screen frame (never RTT); the
+  frame still ends at the same present, so frame boundaries are unchanged.
+  `[split] rnd` at rate 6.2: **1.2-1.9 %** of run_iter (was 7.7 %).
+
+`tools/toaster_bench.mjs --pages dreamcast --rate 6.2 --reps 3 --ladder 0`
+(the bench's own load reads 14-19 on this 4-core box during every run):
+
+| build | solo speed (3 reps) | room speed (3 reps) |
+|---|---|---|
+| rebuilt baseline (HEAD 54bb7a8, before the levers) | 0.4413 / 0.4191 / 0.4515 | 0.1397 / 0.1555 / 0.1677 |
+| + SQ in-wasm + render skip | 0.4114 / 0.4148 / 0.4012 | 0.1801 / 0.1686 / 0.1735 |
+| same, `--qs dcrb=0` (no rollback arm) | 0.4462 / 0.4443 / 0.4404 | 0.1747 / 0.1656 / 0.1225 |
+
+**No measurable change at 6.2.** Rate-1 probe on Character Select: duty
+90-94 % -> 75-81 %, headroom 1.1x -> 1.2-1.3x — the levers do work where the
+picture is drawn, but the 6.2 frame is not render-bound.
+
+### The 6.2 profile, bench scene (Character Select), after the levers
+
+`toaster_split.mjs 6.2 40 '' --prof 15`, 7,357 samples, 97.7 % busy:
+SH4 70.3 % · ARM7/AICA 21.2 % · PVR 5.5 % · JS 2 %. Top self time:
+`dispatch_slice` 6.2 %, `arm_mainloop_c` 4.1 %, `jit_lookup` 3.6 %,
+`sh4_sched_tick` 1.8 %, TMU/P4 register reads (`readt` + `ReadMem_p4mmr` +
+`read_TMU_TCNT`) 4.4 %, ARM `DoMemOp` 1.5 %; emitted JIT code 48.9 %.
+The ARM7 sound driver's main loop (0x194-0x1d4) polls ~10 handlers per pass
+and never waits, so a self-loop idle skip does not apply; idle-skip burns are
+only ~400-1,100 per frame here (the counter is cumulative — an earlier
+"70K/frame" read was wrong).
+
+### What would pass it (unchanged conclusion, sharper numbers)
+
+Still ~2.2x short. None of these is in place: SH4 dispatch/lookup is ~10 %,
+ARM7 + AICA ~21 % (batching samples per callback, or its own deterministic
+thread), and the emitted code itself ~49 % (codegen, not plumbing).
+
 ## Status
 
 - [x] Split measured: solo at 1 and 6.2, room at 6.2 for 60 s, and a worker

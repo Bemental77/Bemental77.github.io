@@ -38,6 +38,8 @@ u32 g_vram_lin_base = 0;
 u32 g_ocram_lin_base = 0;      // lever-9D: OnChipRAM linear base (set by rec_wasm init)
 u32 g_ccr_addr = 0;            // lever-9D: &CCN_CCR
 bool g_emit_ocram_fp = true;   // lever-9D bisect switch
+// Store-queue store arm (shop_writem size 4 to 0xE0-0xE3). FLYCAST_SQ_FP=0 = off (A/B).
+bool g_emit_sq_fp = []{ const char* e = std::getenv("FLYCAST_SQ_FP"); return !(e && e[0] == '0'); }();
 // Runtime kill-switch for every emitted memory fastpath (immediate-EA bake,
 // area-3 RAM store/load, area-1 swizzle, area-4/5 linear, memset pattern).
 // OFF forces every guest memory access through the sh4_mem_* imports —
@@ -1643,6 +1645,31 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
                     b.op_i32_store(4);
                     emitSmcMarkLocal(b, LOCAL_TMP, 8);
                 b.op_else();
+                    if (g_emit_sq_fp) {
+                        // STORE-QUEUE ARM for the fmov.d pair (see the size-4
+                        // arm below): 0xE0-0xE3 is sq_buffer at ctx+0, mask 63.
+                        emitRawEaSlowArmSet(b, op, cache);
+                        b.op_local_get(LOCAL_TMP);
+                        b.op_i32_const((s32)0xFC000000);
+                        b.op_i32_and();
+                        b.op_i32_const((s32)0xE0000000);
+                        b.op_i32_eq();
+                        b.op_if(0x40);
+                          b.op_local_get(LOCAL_CTX);
+                          b.op_local_get(LOCAL_TMP);
+                          b.op_i32_const(0x38);
+                          b.op_i32_and();
+                          b.op_i32_add();
+                          b.op_local_tee(LOCAL_TMP2);
+                          b.op_local_get(LOCAL_CTX);
+                          b.op_i32_load(op.rs2.reg_offset());
+                          b.op_i32_store(0);
+                          b.op_local_get(LOCAL_TMP2);
+                          b.op_local_get(LOCAL_CTX);
+                          b.op_i32_load(op.rs2.reg_offset() + 4);
+                          b.op_i32_store(4);
+                        b.op_else();
+                    }
                     emitRawEaSlowArmTee(b, op, cache);
                     b.op_local_get(LOCAL_CTX);
                     b.op_i32_load(op.rs2.reg_offset());
@@ -1653,6 +1680,7 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
                     b.op_local_get(LOCAL_CTX);
                     b.op_i32_load(op.rs2.reg_offset() + 4);
                     b.op_call(WIMPORT_WRITE32);
+                    if (g_emit_sq_fp) b.op_end();
                 b.op_end();
                 return true;
             }
@@ -1716,6 +1744,33 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
         // Lever-4: this is the one store the C hooks can't see — mark it.
         emitSmcMarkLocal(b, LOCAL_TMP, op.size);
         b.op_else();
+        // STORE-QUEUE ARM (0xE0000000-0xE3FFFFFF). flycast maps that whole
+        // range straight onto Sh4Context::sq_buffer (sh4_mmr.cpp map_p4:
+        // addrspace::mapBlock(cntx.sq_buffer, 0xE0..0xE3, mask 63)), so a store
+        // there IS `*(u32*)(ctx + (ea & 63)) = v` with no side effect — the
+        // flush is the `pref` that follows. Measured, PSO Pioneer 2 lobby:
+        // 60,287 of the ~67,500 slow-path stores per frame were SQ stores
+        // (the TA submission loop), each a wasm->C import -> WriteMem32 ->
+        // addrspace::writet. sq_buffer is at offset 0 of Sh4Context and is not
+        // a cached guest register, so this cannot alias the RegCache.
+        const bool sqfp = g_emit_sq_fp && op.size == 4;
+        if (sqfp) {
+            emitRawEaSlowArmSet(b, op, cache);   // legacy: recompute + set; fast: no-op
+            b.op_local_get(LOCAL_TMP);
+            b.op_i32_const((s32)0xFC000000);
+            b.op_i32_and();
+            b.op_i32_const((s32)0xE0000000);
+            b.op_i32_eq();
+            b.op_if(0x40);
+              b.op_local_get(LOCAL_CTX);
+              b.op_local_get(LOCAL_TMP);
+              b.op_i32_const(0x3C);
+              b.op_i32_and();
+              b.op_i32_add();
+              emitLoadParamCached(b, op.rs2, cache);
+              b.op_i32_store(0);
+            b.op_else();
+        }
         // NON-area-3 stores → canonical flycast import (sh4_mem_write* ->
         // WriteMem -> pvr_write32p / etc). The former in-wasm area-1 VRAM
         // swizzle store is REMOVED (boot-title-wedge 2026-08-20, bisected
@@ -1789,6 +1844,7 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
         }
         }
         }
+        if (sqfp) b.op_end();                    // close the store-queue if
         b.op_end();                              // close outer area-3 if
         return true;
     }
@@ -4595,6 +4651,9 @@ extern "C" void bemental_sh4_set_mem_fastpaths(int on) {
 }
 extern "C" void bemental_sh4_set_regcache(int on) {
     bemental::sh4::g_emit_regcache = !!on;
+}
+extern "C" void bemental_sh4_set_sq_fp(int on) {
+    bemental::sh4::g_emit_sq_fp = !!on;
 }
 extern "C" void bemental_sh4_set_imm_fastpath(int on) {
     bemental::sh4::g_emit_imm_fastpath = !!on;

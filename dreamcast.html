@@ -29,7 +29,7 @@
        emulator is never told any of this is happening — it sees a second pad on
        the same machine. Everything below is guarded on Netplay.supported(): a
        browser without RTCPeerConnection never sees the button at all. -->
-  <script src="/lib/netplay.js?v=49a04b83"></script>
+  <script src="/lib/netplay.js?v=48908ab8"></script>
   <script>
     // NEVER PRESENT AN ENABLED START BEHIND A BROKEN PATH. Gates BOTH Start
     // controls (#btnStart and the mobile splash's #mobileSplashStart — the phone
@@ -3005,8 +3005,29 @@
       // frame f, so the page may build f+1. Everything else here is truth for
       // the panel; none of it is allowed to be inferred.
       case 'lsFrame':
+        // A rollback frame's ack carries what one step costs this console, which
+        // the host's capacity gate sizes the room by (lib/netplay.js _capMean).
+        if (d.st != null) { const e = lsEngine(); if (e) { e.selfStepMs = +d.st || 0; e.selfPresentMs = +d.sp || 0; } }
         lsOnWorkerFrame(d.f, d.due);
         break;
+      case 'rbHash': {
+        // the fingerprint of a CONFIRMED rollback frame (guest RAM after it)
+        const e = lsEngine();
+        if (e && typeof e.submitHash === 'function' && e.submitHash(d.f | 0, d.h >>> 0, null)) LS.hashesFed++;
+        LS.hashSink = true;
+        break;
+      }
+      case 'rbArmed':
+        pageLog('[rollback] worker ' + (d.ok ? 'ARMED: window ' + d.w + ', ' + d.slots + ' savestates (' + d.mb + ' MB)'
+                                          : 'could NOT arm: ' + d.why));
+        break;
+      case 'rbFault': {
+        LS.fault = 'rollback: ' + d.why;
+        pageLog('[rollback] ⚠ ' + d.why);
+        const e = lsEngine();
+        try { if (e && typeof e.fail === 'function') e.fail(LS.fault); } catch (_) {}
+        break;
+      }
       case 'lsHash':
         lsOnWorkerHash(d);
         break;
@@ -6091,8 +6112,46 @@
              spare: int('lsspare', 0, 4, 0),
              // OFF by default: measured at ~2 ms RTT it gave back 18 ms more
              // (p50 37 ms vs 55) but read 0.997x, and the room must hold 1.000x
-             feedDue: q.get('lsfeed') === 'due', feedMarginMs: int('lsmargin', 0, 30, 4) };
+             feedDue: q.get('lsfeed') === 'due', feedMarginMs: int('lsmargin', 0, 30, 4),
+             // ROLLBACK WINDOW (frames) this console proposes and can hold: its
+             // savestate ring is W+3 states of ~27 MB, so it is also the memory
+             // bound (rbMaxWindow). ?dcrb=0 = delay lockstep only (the control arm).
+             // The HOST's engine decides the room's mode; a room with any console
+             // that cannot run rollback, or cannot afford it (the capacity gate),
+             // runs input delay instead.
+             rbWindow: int('dcrb', 0, 12, 4), rbExplicit: q.has('dcrb'),
+             // TEST ARM: the host never moves the room to input delay on capacity
+             rbForce: q.get('dcrbforce') === '1',
+             // BROKEN-VARIANT CONTROL (a rig's negative arm, never a product
+             // setting): this console's worker IGNORES every re-simulation plan,
+             // i.e. it keeps the frames it ran on a wrong prediction. A room with
+             // one such console must DESYNC; if it does not, the detector is blind.
+             rbBroken: q.get('dcrbbroken') === '1' };
   })();
+  // ROLLBACK IS ON BY DEFAULT ONLY FOR A DISC IT IS PROVEN EXACT ON. The host
+  // proposes the room's mode, so the host's disc decides: a rollback room's
+  // every frame must be a pure function of (state, pads), and that is a
+  // property of the game's code paths, not of the engine. Proven for pso2
+  // (dreamcast/docs/rollback/TASKS.md: REF1 vs RB 59/59, rooms IN SYNC with
+  // 47-59 rollbacks per console, broken control DESYNCs). NOT for gauntlet:
+  // the same rig diverges there within 3 frames of a rollback (keep-code
+  // load during its GD-ROM streaming) and a forced rollback room DESYNCed at
+  // frame 600 — so a Gauntlet room stays delay lockstep, which is IN SYNC.
+  // An explicit ?dcrb=N (N>0) opts any disc in, for testing.
+  const RB_PROVEN = new Set(['pso2']);
+  // The lockstep options every Dreamcast Session is built with. `game` = the
+  // host's disc (a joiner passes nothing: it never picks the room's mode, but
+  // it says it CAN run rollback, so a proven host's room is not refused it).
+  function lsSessionOpts(game) {
+    const o = { minDelay: LSQ.minDelay };
+    if (LSQ.rbWindow > 0) {
+      o.rollbackOk = true; o.rbMaxWindow = LSQ.rbWindow;
+      const proven = game == null || LSQ.rbExplicit || RB_PROVEN.has(game);
+      o.rollback = proven ? LSQ.rbWindow : 0;
+      if (LSQ.rbForce) o.rbNoCap = true;
+    }
+    return o;
+  }
 
   // ---- ?lsdiag=1 — WHY A ROOM STARVED, ARMED FROM THE QUERY STRING --------
   // SHIPS OFF. A stall on a slow path is a timing fault, and per-frame console
@@ -6313,6 +6372,14 @@
         pageLog('[lockstep] ⚠ ' + LS.fault);
       }
       lsDiagWire(ls);
+      // A ROLLBACK ROOM (the host's 'lsgo' said so): arm this worker's ring and
+      // rollback mode BEFORE frame 0 is fed — the same point on every console.
+      if (ls.rollback > 0 && !LS.rbArmed) {
+        LS.rbArmed = true;
+        worker.postMessage({ cmd: 'rbArm', w: ls.rollback, broken: LSQ.rbBroken ? 1 : 0 });
+        pageLog('[rollback] room runs ROLLBACK, window ' + ls.rollback + ' frames — zero local input delay; ' +
+                'a late remote input re-simulates from the frame it changed');
+      }
       pageLog('[lockstep] FRAME GATE ENGAGED at frame ' + ls.frame + ' — this core advances only when every ' +
               'seated port has an input for the frame. delay=' + ls.delay + ' frames (' +
               Math.round(ls.delay * FRAME_MS) + ' ms), ports=' + JSON.stringify(ls.roster) +
@@ -6411,6 +6478,24 @@
       // The old rig's port-1 witness, kept truthful under the new architecture:
       // these are the bytes actually handed to the emulator for that port.
       NET.sentP2 = Array.from(r.image.subarray(64, 76));
+      if (ls.rollback > 0 && LS.rbArmed) {
+        // ROLLBACK FRAME: the plan to re-simulate (if a late input changed a
+        // frame already run) travels with the frame it precedes, and so do the
+        // confirmed frames whose fingerprints the room is owed (takeHashDue).
+        const msg = { cmd: 'lsInput', f: r.frame, states: r.image, rb: 1 };
+        if (r.rollback) {
+          msg.plan = { from: r.rollback.from, frames: r.rollback.frames.map((x) => ({ f: x.frame, states: x.image })) };
+          LS.rbRollbacks = (LS.rbRollbacks | 0) + 1;
+          LS.rbResim = (LS.rbResim | 0) + r.rollback.frames.length;
+        }
+        ls.endFrame(null);
+        const due = (typeof ls.takeHashDue === 'function') ? ls.takeHashDue() : [];
+        if (due.length) msg.hd = due;
+        worker.postMessage(msg);
+        LS.fedTo = r.frame + 1;
+        if (++fed > 240) { pageLog('[lockstep] ⚠ feed loop hit its 240-frame bound — not sprinting the guest'); break; }
+        continue;
+      }
       worker.postMessage({ cmd: 'lsInput', f: r.frame, states: r.image });
       LS.fedTo = r.frame + 1;
       // ⚠ THE PAGE DOES NOT DECIDE WHICH FRAMES ARE FINGERPRINTED, so it does
@@ -6737,6 +6822,7 @@
     LS.hashEvery = 60;
     worker.postMessage({ cmd: 'lockstep', on: 1, frame: 0, hashEvery: LS.hashEvery, repay: LSQ.repay ? 1 : 0 });
     LS.armed = true; LS.running = false; LS.workerFrame = 0; LS.fedTo = 0; LS.framesRun = 0;
+    LS.rbArmed = false; LS.rbRollbacks = 0; LS.rbResim = 0;
     LS.look = lsLookStart(); LS.lookHot = 0; LS.lookCalm = 0; LS.lookUps = 0; LS.lookDowns = 0;
     LS.lookDownAt = 0; LS.lookLatched = false;
     LS.armedAtFrame = LS.framesRun; LS.releasedAtFrame = null;
@@ -7643,7 +7729,7 @@
     const s2 = new Netplay.Session({
       game: roomGame, host: true, code, transport: netTransport(),
       // this console's delay floor (LSQ): 1 frame, not the engine's default 2
-      lockstep: { minDelay: LSQ.minDelay },
+      lockstep: lsSessionOpts(roomGame),
     });
     NET.session = s2;
     // ⚠ THE LOAD IS ARMED AT ROOM OPEN AND FIRES ON THE FIRST SEAT — no press.
@@ -7692,7 +7778,7 @@
     // below. The real guard is unaffected and is the only one that could ever be
     // trusted: the START BARRIER compares what each machine ACTUALLY LOADED, not
     // what it intended, and refuses to start a room whose discs differ.
-    const s = new Netplay.Session({ host: false, code, transport: netTransport(), lockstep: { minDelay: LSQ.minDelay } });
+    const s = new Netplay.Session({ host: false, code, transport: netTransport(), lockstep: lsSessionOpts() });
     NET.session = s;
     NET.loadWhenSeated = false;   // a joiner's load is fired by 'room-game', not by a seat
     NET.declared = false; NET.declaredTag = null; NET.declaring = false; NET.bar = null; NET.loadHeld = null;
@@ -8461,10 +8547,17 @@
     // a state restore flushes the whole SH4 JIT, so one rollback costs
     // hundreds of ms of recompile — far more than a frame. Lockstep is the only
     // mode on every device until the core can restore without that flush.
-    if (d != null) {
-      html += '<br><span class="k">mode</span> delay-based lockstep <span class="k">· rollback ' +
-        '(zero input delay) is not available on the Dreamcast core yet: restoring a state recompiles the ' +
-        'whole CPU cache, which costs far more than one frame</span>';
+    {
+      const e = lsEngine();
+      if (e && e.rollback > 0) {
+        html += '<br><span class="k">mode</span> rollback, window ' + e.rollback + ' frames <span class="k">· zero local ' +
+          'input delay; a late input re-simulates from the frame it changed (' + (LS.rbRollbacks | 0) + ' so far, ' +
+          (LS.rbResim | 0) + ' frames)</span>';
+      } else if (d != null) {
+        html += '<br><span class="k">mode</span> delay-based lockstep <span class="k">· ' +
+          (LSQ.rbWindow > 0 ? 'rollback was not affordable on every console in this room (or one cannot run it), so ' +
+            'inputs are delayed instead' : 'rollback is off on this console (?dcrb=0)') + '</span>';
+      }
     }
     // WHICH PORT THIS PLAYER HOLDS, said in words as well as drawn as a chip —
     // it is which character they get, and a player who has to decode a chip

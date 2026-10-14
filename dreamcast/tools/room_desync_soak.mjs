@@ -297,6 +297,34 @@ function workerHookSrc(prerollN) {
         S.starts.push(msg.f | 0, S.lastStart);
         if (S.starts.length > 60000) S.starts.splice(0, 20000);
       }
+      // A ROLLBACK room fingerprints CONFIRMED frames (the worker posts
+      // 'rbHash' for frame k from its savestate ring: the state after k). The
+      // rig hashes the SAME slot's guest RAM itself, with its own code, so the
+      // RAM detector stays independent of the product's emscripten_rb_hash.
+      if (msg && msg.cmd === 'rbHash' && !${NORAM ? 'true' : 'false'}) {
+        const t0 = performance.now();
+        let ram = null;
+        try {
+          const R = self.__dcRb, p = R ? R.slot((msg.f | 0) + 1) : 0, off = M._emscripten_rb_ram_offset() >>> 0;
+          if (p && off) {
+            const u8 = M.HEAPU8.subarray(p + off, p + off + RAM_SZ);
+            const parts = [], q = u8.length >>> 2;
+            for (let part = 0; part < 4; part++) {
+              let h = 0x811c9dc5 | 0;
+              const end = (part + 1) * (q >>> 2);
+              for (let i = part * (q >>> 2); i < end; i++) {
+                const b = i << 2;
+                h = Math.imul(h ^ (u8[b] | (u8[b + 1] << 8) | (u8[b + 2] << 16) | (u8[b + 3] << 24)), 16777619);
+              }
+              parts.push((h >>> 0).toString(16).padStart(8, '0'));
+            }
+            ram = parts.join('');
+          }
+        } catch (e) { S.err = 'rb hash threw: ' + (e && e.message || e); }
+        S.hashMs += performance.now() - t0; S.hashN++;
+        S.rows.push({ f: msg.f, h: msg.h >>> 0, ram, cyc: M._flycast_guest_cycles(), t: performance.timeOrigin + t0, burns: null, w: null, rb: 1 });
+        if (S.rows.length > 20000) S.rows.shift();
+      }
       if (msg && msg.cmd === 'lsHash') {
         const t0 = performance.now();
         const ram = ramHash();
@@ -397,7 +425,7 @@ async function launch(role) {
       if (+gv[1] > 0 && P.gov.at.length < 40) P.gov.at.push([SOAK_T0 ? +((Date.now() - SOAK_T0) / 1000).toFixed(1) : null, +gv[1]]);
       if (SOAK_T0) { P.gov.soakDropMs += +gv[1]; P.gov.soakBeats++; }
     }
-    if (/desync|lockstep\] (ARMED|FRAME GATE|frame gate|⚠)|\[seed\]|\[vmu\]|normalize|watchdog|threw|REFUS|recover|setidleskip|idle-skip|\[shard\]|determinism|anchor frame|REFUSING|state saved|saveState|state load|stateLoaded|Save State|Load State/i.test(t) && P.log.length < 4000)
+    if (/desync|lockstep\] (ARMED|FRAME GATE|frame gate|⚠)|\[seed\]|\[vmu\]|normalize|watchdog|threw|REFUS|recover|setidleskip|idle-skip|\[shard\]|determinism|anchor frame|REFUSING|state saved|saveState|state load|stateLoaded|Save State|Load State|rollback|rbArm/i.test(t) && P.log.length < 4000)
       P.log.push(((Date.now() - T0) / 1000).toFixed(1) + ' ' + t.slice(0, 400));
   });
   const mq = '/tmp/npdm/mqtt-5.3.4.min.js';
@@ -636,7 +664,9 @@ try {
     const engine = await Promise.all(PS.map((P) => P.page.evaluate(() => {
       const M = window.__soak; const e = M && M.engine; let rep = null; try { rep = e ? e.report() : null; } catch (x) {}
       return { desyncs: M ? M.desyncs : null, error: e ? (e.error || null) : null, report: rep ? { state: rep.state, error: rep.error || null, frame: rep.frame, delay: rep.delay, desync: rep.desync, hashesCompared: rep.hashesCompared, hashesSent: rep.hashesSent, lastAgreedFrame: rep.lastAgreedFrame, stalls: rep.stalls, inputsSent: rep.inputsSent, inputsReceived: rep.inputsReceived,
-                                 stallMs: rep.stallMs, maxStallMs: rep.maxStallMs, minLead: rep.minLead, meanLead: rep.meanLead, delayHistory: rep.delayHistory } : null,
+                                 stallMs: rep.stallMs, maxStallMs: rep.maxStallMs, minLead: rep.minLead, meanLead: rep.meanLead, delayHistory: rep.delayHistory,
+                                 // a ROLLBACK room's own numbers: corrections run, re-simulated frames, deepest one
+                                 rollback: (e && e.rollback && typeof e.rollbackReport === 'function') ? (() => { try { const r = e.rollbackReport(); return { window: r.window, rollbacks: r.rollbacks, resimFrames: r.resimFrames, maxDepth: r.maxDepth, predictedFrames: r.predictedFrames, confirmedFrame: r.confirmedFrame }; } catch (x) { return { err: String(x) }; } })() : null } : null,
                samples: M ? M.samples : [],
                probe: window.__dcProbe ? (({ guestX, fps, phase }) => ({ guestX, fps, phase }))(window.__dcProbe()) : null };
     }).catch((e) => ({ err: e.message }))));

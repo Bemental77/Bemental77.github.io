@@ -245,6 +245,40 @@ extern int vblank_schid;
 // hw/sh4/modules/tmu.cpp
 extern int tmu_sched[3];
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+// ROLLBACK DETERMINISM DIAGNOSTIC (patch 0001, dreamcast/docs/rollback/TASKS.md).
+// Measured on the shipped binary: the first frame after ANY state load is
+// exactly one SH4_TIMESLICE (448 cycles) shorter, the second one slice longer,
+// and the run reconverges after that — while the state saved immediately
+// after the load is byte-identical to the one loaded. So whatever moves the
+// frame end is scheduler state that is NOT serialized. sch_list (all entries,
+// including tmu_sched, which V58+ states no longer carry here), the next id
+// and ffb are dumped so the rig can diff them straight before a save against
+// straight after the load of that save. Layout of `out` (int32):
+//   [0..1] ffb lo/hi, [2] sh4_sched_next, [3] next_id, [4] n,
+//   then n x {tag, start, end}. Returns the number of ints written.
+extern "C" EMSCRIPTEN_KEEPALIVE int sh4_sched_debug_dump(int* out, int max)
+{
+	if (max < 5) return 0;
+	out[0] = (int)(u32)sh4_sched_ffb;
+	out[1] = (int)(u32)(sh4_sched_ffb >> 32);
+	out[2] = Sh4cntx.sh4_sched_next;
+	out[3] = sh4_sched_next_id;
+	int n = 0, w = 5;
+	for (const sched_list& sched : sch_list)
+	{
+		if (w + 3 > max) break;
+		out[w++] = sched.tag;
+		out[w++] = sched.start;
+		out[w++] = sched.end;
+		n++;
+	}
+	out[4] = n;
+	return w;
+}
+#endif
+
 void sh4_sched_serialize(Serializer& ser)
 {
 	ser << sh4_sched_ffb;

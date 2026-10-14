@@ -2466,6 +2466,57 @@ bool retro_unserialize(const void * data, size_t size)
 	}
 }
 
+#ifdef __EMSCRIPTEN__
+// ROLLBACK RING SAVE: dc_serialize alone, at a run_iter boundary. retro_serialize
+// brackets it with emu.stop()/emu.start(), which on this single-threaded build
+// changes nothing the state carries but does real work every call: TermAudio,
+// nvmem::saveFiles (the flash + VMU files rewritten to MEMFS), Event::Pause, then
+// SetMemoryHandlers, setupPtyPipe, memwatch::protect and InitAudio. A rollback
+// console saves EVERY frame, so that bracket was paid 30-60 times a second.
+// Only valid between frames (the SH4 is not executing): the worker calls it from
+// its pump at a clean asyncify boundary, the same place it calls run_iter.
+extern "C" bool retro_serialize_lean(void *data, size_t size)
+{
+	std::lock_guard<std::mutex> lock(mtx_serialization);
+	try {
+		Serializer ser(data, size);
+		dc_serialize(ser);
+		return true;
+	} catch (const Serializer::Exception& e) {
+		ERROR_LOG(SAVESTATE, "Saving state failed: %s", e.what());
+		return false;
+	}
+}
+
+// ROLLBACK KEEP-CODE LOAD (patch 0002): retro_unserialize with the SH4 block
+// cache kept (emulator.cpp emu_loadstate_keepcode). Same stop/start bracket,
+// same audio flush. Called only by EmscriptenWorker.cpp
+// emscripten_load_state_rollback, which does the page-precise invalidation.
+void emu_loadstate_keepcode(Deserializer& deser);
+extern "C" bool retro_unserialize_keepcode(const void * data, size_t size)
+{
+	std::lock_guard<std::mutex> lock(mtx_serialization);
+	if (!first_run)
+		try {
+			emu.stop();
+		} catch (const FlycastException& e) {
+			ERROR_LOG(COMMON, "%s", e.what());
+			return false;
+		}
+	try {
+		Deserializer deser(data, size);
+		emu_loadstate_keepcode(deser);
+		retro_audio_flush_buffer();
+		if (!first_run)
+			emu.start();
+		return true;
+	} catch (const Deserializer::Exception& e) {
+		ERROR_LOG(SAVESTATE, "Loading state failed: %s", e.what());
+		return false;
+	}
+}
+#endif
+
 // Cheats
 void retro_cheat_reset()
 {

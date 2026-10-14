@@ -108,6 +108,14 @@ const NAME = arg('name', 'rb');
 const DIAG = +arg('diag', 0);          // >0: diag mode — N-frame byte diff of D1 vs D2 vs D3, then exit
 const PRE = arg('pre', '');             // JS run once in the worker (M = Module) after warm, before any arm
 const ONLOAD = arg('onload', '');
+// --perframe JS (diag): an expression evaluated in the worker (M = Module) at
+// every diag start-of-frame save; its JSON-able value is printed per frame per
+// arm. For one-off counters a diagnostic build exports.
+const PERFRAME = arg('perframe', '');
+// --keepdiff N: keep byte copies of the REF1 and RB start-of-frame states for
+// hashed frames <= N and print their byte diff, attributed like --diag. Turns
+// "RB diverged at frame k" into WHICH bytes diverged.
+const KEEPDIFF = +arg('keepdiff', '0');
 const REPLAY = arg('replay', '');
 const RELOAD_EACH = argv.includes('--reload-each');
 const RBLOAD = argv.includes('--rbload');   // patch 0002: rollback mode + keep-code load       // diag mode: "FROM,TO" — load mid-run at FROM, re-run to TO, diff vs D2       // JS run in the worker after EVERY state load (M = Module)
@@ -317,6 +325,7 @@ function driverSource(PORT, LAG) {
           keep.push(M.HEAPU8.slice(s.ptr, s.ptr + s.size));
           cyc.push(M._flycast_guest_cycles());
           sch.push(R.schedDump());
+          (R.diagPF[label] = R.diagPF[label] || []).push(R.perFrame());
           R.free(s);
           if (f < frames) await R.frame(image(f));
         }
@@ -354,6 +363,7 @@ function driverSource(PORT, LAG) {
           keep.push(M.HEAPU8.slice(s.ptr, s.ptr + s.size));
           cyc.push(M._flycast_guest_cycles());
           sch.push(R.schedDump());
+          (R.diagPF[label] = R.diagPF[label] || []).push(R.perFrame());
           R.free(s);
           if (f < to) await R.frame(image(f));
         }
@@ -437,6 +447,8 @@ function driverSource(PORT, LAG) {
     // every other divergence: if REF==RB only under this flag, the residue is
     // exactly the load's own effect on the following frame.
     R.reloadEach = false;
+    R.perFrame = function() { return R.perFrameSrc ? (0, eval)('(function(M){return (' + R.perFrameSrc + ');})')(M) : null; };
+    R.diagPF = {};
     R.onLoad = function() { if (R.onLoadSrc) (0, eval)('(function(M){' + R.onLoadSrc + '})')(M); };
 
     R.anchor = null;
@@ -457,6 +469,8 @@ function driverSource(PORT, LAG) {
             const s = R.save(); if (!s) throw new Error('save failed at ' + f);
             saveMs.push(s.ms);
             if ((f % every) === 0) hashes[f] = R.hash(s);
+            if (R.keepLabel && (f % every) === 0 && f <= R.keepUpTo)
+              (R.diagStore[R.keepLabel] = R.diagStore[R.keepLabel] || [])[f] = M.HEAPU8.slice(s.ptr, s.ptr + s.size);
             if (R.reloadEach) { if (R.load(s) < 0) throw new Error('reload failed at ' + f); R.onLoad(); }
             R.free(s);
           }
@@ -539,6 +553,10 @@ function driverSource(PORT, LAG) {
           while (hashedTo + 1 <= knownTo + 1 && hashedTo + 1 <= f) {
             const k = hashedTo + 1;
             if ((k % every) === 0 && ring.get(k)) hashes[k] = R.hash(ring.get(k));
+            if (R.keepLabel && (k % every) === 0 && k <= R.keepUpTo && ring.get(k)) {
+              const rs = ring.get(k);
+              (R.diagStore[R.keepLabel] = R.diagStore[R.keepLabel] || [])[k] = M.HEAPU8.slice(rs.ptr, rs.ptr + rs.size);
+            }
             hashedTo = k;
           }
           // 5. evict what no rollback can reach.
@@ -678,6 +696,7 @@ try {
     report.rbload = true;
   }
   if (RELOAD_EACH) { await wEval(worker, 'self.__rb.reloadEach = true; true'); say('RELOAD-EACH: every frame starts from a load of its own saved state'); report.reloadEach = true; }
+  if (PERFRAME) { await wEval(worker, 'self.__rb.perFrameSrc = ' + JSON.stringify(PERFRAME) + '; true'); say('PERFRAME ' + JSON.stringify(PERFRAME)); }
   if (ONLOAD) { await wEval(worker, 'self.__rb.onLoadSrc = ' + JSON.stringify(ONLOAD) + '; true'); say('ONLOAD hook ' + JSON.stringify(ONLOAD)); report.onload = ONLOAD; }
   if (DIAG > 0) {
     // ---- DIAG MODE: byte-level diff of three straight runs from one anchor ----
@@ -698,6 +717,11 @@ try {
       const c = cyc[L]; const d = [];
       for (let i = 1; i < c.length; i++) d.push(c[i] == null || c[i - 1] == null ? null : c[i] - c[i - 1]);
       say(`DIAG ${L} guest cycles per frame: ${JSON.stringify(d)}`);
+    }
+    if (PERFRAME) {
+      const pf = await wEval(worker, 'self.__rb.diagPF');
+      report.diagPerFrame = pf;
+      for (const L of Object.keys(pf)) say(`DIAG ${L} perframe: ${JSON.stringify(pf[L])}`);
     }
     const sched = await wEval(worker, 'self.__rb.diagSched');
     if (sched.D2 && sched.D2[0]) {
@@ -750,13 +774,26 @@ try {
   const ref0 = await wEval(worker, `self.__rb.straight(${FRAMES}, ${EVERY}, false, true)`);
   say(`REF0 (no per-frame saves) done: frame ms ${JSON.stringify(stat(ref0.frameMs))} last60 ${JSON.stringify(stat(ref0.frameMs.slice(-60)))}`);
   report.ref0 = { frameMs: stat(ref0.frameMs), last60FrameMs: stat(ref0.frameMs.slice(-60)) };
+  if (KEEPDIFF) await wEval(worker, `(self.__rb.keepUpTo = ${KEEPDIFF}, self.__rb.keepLabel = 'REF1', true)`);
   const ref1 = await wEval(worker, `self.__rb.straight(${FRAMES}, ${EVERY}, false)`);
+  if (KEEPDIFF) await wEval(worker, `(self.__rb.keepLabel = null, true)`);
   say(`REF1 done: last60 frame ms ${JSON.stringify(stat(ref1.frameMs.slice(-60)))} frame ms ${JSON.stringify(stat(ref1.frameMs))} save ms ${JSON.stringify(stat(ref1.saveMs))} watchdog=${ref1.watchdog}`);
   const ref2 = await wEval(worker, `self.__rb.straight(${FRAMES}, ${EVERY}, false)`);
   say(`REF2 done: frame ms ${JSON.stringify(stat(ref2.frameMs))} watchdog=${ref2.watchdog}`);
   const noin = await wEval(worker, `self.__rb.straight(${FRAMES}, ${EVERY}, true)`);
   say(`NOINPUT done: watchdog=${noin.watchdog}`);
+  if (KEEPDIFF) await wEval(worker, `(self.__rb.keepLabel = 'RB', true)`);
   const rb = await wEval(worker, `self.__rb.rollback(${FRAMES}, ${EVERY}, ${LAG})`);
+  if (KEEPDIFF) {
+    await wEval(worker, `(self.__rb.keepLabel = null, true)`);
+    const d = await wEval(worker, `(() => { const a = self.__rb.diagStore.REF1 || [], b = self.__rb.diagStore.RB || []; const n = Math.max(a.length, b.length); for (let i = 0; i < n; i++) { a[i] = a[i] || null; b[i] = b[i] || null; } return self.__rb.diagDiff('REF1', 'RB'); })()`);
+    report.keepdiff = d;
+    for (const r of d.frames) {
+      say(`KEEPDIFF REF1vRB f${r.f}: ${r.bytes} B differ in ${r.nRanges} ranges ${JSON.stringify(r.byRegion)}`);
+      if (r.bytes && r === d.frames.find((q) => q.bytes)) for (const g of r.ranges.slice(0, 30)) say(`    ${g.at} len ${g.len}  A=${g.A}  B=${g.B}`);
+    }
+    await wEval(worker, 'self.__rb.diagFree()');
+  }
   const s = rb.stats;
   say(`RB done: rollbacks=${s.rollbacks} resim=${s.resim} maxDepth=${s.maxDepth} mispredicted=${s.mispredicted} predictedFrames=${s.predictedFrames} watchdog=${s.watchdog}`);
 
