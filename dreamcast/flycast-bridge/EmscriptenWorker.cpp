@@ -1939,9 +1939,11 @@ EMSCRIPTEN_KEEPALIVE size_t emscripten_state_size(void) {
 }
 // Save into a caller-owned buffer (a ring slot): no malloc, no free, one
 // serializer pass. Returns 1 on success.
+extern "C" bool retro_serialize_lean(void* data, size_t size);   // libretro.cpp (C linkage)
 EMSCRIPTEN_KEEPALIVE int emscripten_save_state_into(uint8_t* buf, size_t cap) {
     if (!g_loaded || !buf || !cap) return 0;
-    return retro_serialize(buf, cap) ? 1 : 0;
+    // the lean save (no emu.stop()/start() bracket) — see libretro.cpp
+    return retro_serialize_lean(buf, cap) ? 1 : 0;
 }
 
 // Enter/leave rollback mode: per-block synchronous install (no pending
