@@ -146,6 +146,8 @@ static constexpr u32 JIT_PROBE_LIMIT = 8;
 static BlockFn  s_block_fn[JIT_TABLE_SIZE];
 static uint32_t s_block_pc[JIT_TABLE_SIZE];   // 0 = empty slot
 static uint32_t s_block_count = 0;            // installed-block tally for diag
+static uint32_t g_compile_calls = 0;          // WasmDynarec::compile() calls (ctx_snapshot 111)
+static uint32_t g_rb_stale_recompiles = 0;    // rollback-mode stale hit -> discard + recompile (ctx_snapshot 112)
 
 static inline u32 jit_hash(u32 vaddr) {
     return (vaddr * 2654435761u) & JIT_TABLE_MASK;
@@ -1333,6 +1335,9 @@ EMSCRIPTEN_KEEPALIVE uint32_t flycast_ctx_snapshot(uint32_t which) {
         case 15: return g_exit_dyn;         // Lever 1
         case 16: return g_exit_static_xshd; // Lever 2
         case 17: return g_exit_cond_xshd;   // Lever 1/2
+        case 110: return s_block_count;          // fresh block registrations
+        case 111: return g_compile_calls;        // WasmDynarec::compile() calls
+        case 112: return g_rb_stale_recompiles;  // rollback-mode stale -> recompile
         case 18: return (uint32_t)g_chain_hits;
         case 19: return (uint32_t)g_chain_misses;
         // ORDER 21b maple-storm diag (maple_if.cpp). 36/37 to clear the r[] range.
@@ -1455,6 +1460,9 @@ extern void bemental_sh4_set_regcache(int on);
 EMSCRIPTEN_KEEPALIVE void flycast_set_regcache(int on) { bemental_sh4_set_regcache(on); }
 extern void bemental_sh4_set_imm_fastpath(int on);
 EMSCRIPTEN_KEEPALIVE void flycast_set_imm_fastpath(int on) { bemental_sh4_set_imm_fastpath(on); }
+// _flycast_set_sq_fp(0|1): the emitted store-queue store arm (wasm_emit.cpp). Default ON; set before blocks compile.
+extern void bemental_sh4_set_sq_fp(int on);
+EMSCRIPTEN_KEEPALIVE void flycast_set_sq_fp(int on) { bemental_sh4_set_sq_fp(on); }
 // _flycast_set_self_loop(0|1). DEFAULT OFF (ORDER 21b): the in-block self-loop
 // codegen mis-compiles the 0x8c12bc6e memset (correct data, wrong exit state —
 // pins the main thread at the rts, storm never collapses). Self-branches now
@@ -1891,6 +1899,7 @@ isk_no_skip:
         // which recompiles from live RAM — instead of interpreting.
         rb_discard_unit_of(g_lookup_slot);
         g_lookup_stale = false;
+        ++g_rb_stale_recompiles;
     }
     if (!fn && g_lookup_stale) {
         // SMC-stale block: interpret one instruction from live RAM instead
@@ -2315,6 +2324,7 @@ public:
 
 	void compile(RuntimeBlockInfo* block, bool /*smc_checks*/, bool /*optimise*/) override
 	{
+		++g_compile_calls;
 		// Earlier-style 0x8c0133f4 diag dump that lived here was DUPLICATING the
 		// build_block() call done below at the per-block install site (line ~715),
 		// and the duplicate decl of `bytes` triggered a -Wshadow / redefinition
