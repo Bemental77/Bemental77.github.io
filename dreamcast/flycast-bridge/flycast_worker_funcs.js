@@ -149,6 +149,40 @@ var flycast_table_slots = [];   // index → Instance (GC root)
 // arm) versus a codegen failure. Shard installs add ONE instance for N blocks.
 var flycast_live_instances = 0;
 
+// ?jitnames=1 (DIAG, page -> worker URL -> self.__dcJitNames): append a wasm
+// "name" section so a CPU profile names every emitted block function by its
+// guest PC ("pc_8c0123ab") instead of "wasm-function[N]". Export run_i is the
+// block vaddrs[i]. Costs a parse of the export section per install; off by default.
+function flycast_name_module(bytes, vaddrOf) {
+  try {
+    var p = 8, n = bytes.length, exportsMap = [];
+    function leb() { var r = 0, sh = 0, b; do { b = bytes[p++]; r |= (b & 0x7f) << sh; sh += 7; } while (b & 0x80); return r >>> 0; }
+    while (p < n) {
+      var id = bytes[p++], size = leb(), end = p + size;
+      if (id === 7) {
+        var cnt = leb();
+        for (var i = 0; i < cnt; i++) {
+          var nl = leb(), nm = ''; for (var k = 0; k < nl; k++) nm += String.fromCharCode(bytes[p + k]); p += nl;
+          var kind = bytes[p++], idx = leb();
+          if (kind === 0 && /^run(_\d+)?$/.test(nm)) exportsMap.push([idx, nm === 'run' ? 0 : +nm.slice(4)]);
+        }
+      }
+      p = end;
+    }
+    if (!exportsMap.length) return bytes;
+    exportsMap.sort(function (a, b) { return a[0] - b[0]; });
+    var out = [];
+    function wl(v, arr) { do { var b = v & 0x7f; v >>>= 7; if (v) b |= 0x80; arr.push(b); } while (v); }
+    function ws(str, arr) { wl(str.length, arr); for (var i = 0; i < str.length; i++) arr.push(str.charCodeAt(i)); }
+    var sub = []; wl(exportsMap.length, sub);
+    for (var j = 0; j < exportsMap.length; j++) { wl(exportsMap[j][0], sub); ws('pc_' + (vaddrOf(exportsMap[j][1]) >>> 0).toString(16), sub); }
+    var body = []; ws('name', body); body.push(1); wl(sub.length, body); for (var q = 0; q < sub.length; q++) body.push(sub[q]);
+    out.push(0); wl(body.length, out); for (var r = 0; r < body.length; r++) out.push(body[r]);
+    var res = new Uint8Array(bytes.length + out.length); res.set(bytes, 0); res.set(out, bytes.length);
+    return res;
+  } catch (e) { return bytes; }
+}
+
 function flycast_install_block(bytesPtr, len, vaddr) {
   bytesPtr = bytesPtr >>> 0;
   len      = len      >>> 0;
@@ -156,6 +190,7 @@ function flycast_install_block(bytesPtr, len, vaddr) {
   try {
     var src   = HEAPU8.subarray(bytesPtr, bytesPtr + len);
     var bytes = new Uint8Array(src);
+    if (self.__dcJitNames) bytes = flycast_name_module(bytes, function () { return vaddr; });
     var mod   = new WebAssembly.Module(bytes);
     if (!flycast_wasm_imports) {
       flycast_wasm_imports = flycast_build_imports();
@@ -213,6 +248,7 @@ function flycast_install_shard(bytesPtr, len, vaddrsPtr, count) {
   try {
     var src   = HEAPU8.subarray(bytesPtr, bytesPtr + len);
     var bytes = new Uint8Array(src);
+    if (self.__dcJitNames) bytes = flycast_name_module(bytes, function (i) { return HEAPU32[(vaddrsPtr >>> 2) + i]; });
     var mod   = new WebAssembly.Module(bytes);
     if (!flycast_wasm_imports) {
       flycast_wasm_imports = flycast_build_imports();
