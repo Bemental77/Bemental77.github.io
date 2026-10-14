@@ -200,6 +200,13 @@ static int spg_line_sched(int tag, int cycles, int jitter, void *arg)
 				u64 time_span = now - real_times[cpu_time_idx];
 				float cpu_speed = ((float)cycle_span / time_span) / (SH4_MAIN_CLOCK / 100000);
 				SH4FastEnough = cpu_speed >= 85.f;
+#ifdef __EMSCRIPTEN__
+				// ROLLBACK DETERMINISM (patch 0001): SH4FastEnough is HOST WALL
+				// TIME (getTimeMs above) turned into emulator state. Under a
+				// netplay room (g_deterministic, rec_wasm.cpp) it is pinned, so
+				// no consumer can steer anything by how fast this host is.
+				{ extern volatile uint32_t g_deterministic; if (g_deterministic) SH4FastEnough = true; }
+#endif
 			}
 			else {
 				SH4FastEnough = false;

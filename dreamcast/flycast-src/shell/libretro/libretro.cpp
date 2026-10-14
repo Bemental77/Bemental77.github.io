@@ -2466,6 +2466,36 @@ bool retro_unserialize(const void * data, size_t size)
 	}
 }
 
+#ifdef __EMSCRIPTEN__
+// ROLLBACK KEEP-CODE LOAD (patch 0002): retro_unserialize with the SH4 block
+// cache kept (emulator.cpp emu_loadstate_keepcode). Same stop/start bracket,
+// same audio flush. Called only by EmscriptenWorker.cpp
+// emscripten_load_state_rollback, which does the page-precise invalidation.
+void emu_loadstate_keepcode(Deserializer& deser);
+extern "C" bool retro_unserialize_keepcode(const void * data, size_t size)
+{
+	std::lock_guard<std::mutex> lock(mtx_serialization);
+	if (!first_run)
+		try {
+			emu.stop();
+		} catch (const FlycastException& e) {
+			ERROR_LOG(COMMON, "%s", e.what());
+			return false;
+		}
+	try {
+		Deserializer deser(data, size);
+		emu_loadstate_keepcode(deser);
+		retro_audio_flush_buffer();
+		if (!first_run)
+			emu.start();
+		return true;
+	} catch (const Deserializer::Exception& e) {
+		ERROR_LOG(SAVESTATE, "Loading state failed: %s", e.what());
+		return false;
+	}
+}
+#endif
+
 // Cheats
 void retro_cheat_reset()
 {

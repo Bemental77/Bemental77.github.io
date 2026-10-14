@@ -899,6 +899,38 @@ void Emulator::stepRange(u32 from, u32 to)
 	stop();
 }
 
+#ifdef __EMSCRIPTEN__
+// ROLLBACK KEEP-CODE LOAD (patch 0002, dreamcast/docs/rollback/TASKS.md).
+// Emulator::loadstate below minus getSh4Executor()->ResetCache(): the SH4 block
+// cache is KEPT and the wasm bridge (rec_wasm.cpp flycast_rb_invalidate_changed)
+// drops only the install units whose code pages changed. Everything else —
+// ARM7 rec flush, MMU table flush, memwatch reset, sh4_sched_ffts inside
+// dc_deserialize — is kept identical, so the restored MACHINE is the same one
+// the full path restores; only the host-side SH4 code cache survives.
+void emu_loadstate_keepcode(Deserializer& deser)
+{
+	if (!custom_texture.preloaded())
+	{
+		custom_texture.terminate();
+		custom_texture.init();
+	}
+#if FEAT_AREC == DYNAREC_JIT
+	aica::arm::recompiler::flush();
+#endif
+	mmu_flush_table();
+#if FEAT_SHREC != DYNAREC_NONE
+	bm_Reset();
+#endif
+	memwatch::unprotect();
+	memwatch::reset();
+
+	dc_deserialize(deser);
+
+	mmu_set_state();
+	EventManager::event(Event::LoadState);
+}
+#endif
+
 void Emulator::loadstate(Deserializer& deser)
 {
 	if (!custom_texture.preloaded())
