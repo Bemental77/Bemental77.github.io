@@ -805,7 +805,10 @@ async function launchPlayer(role, device, cellTag, pre) {
            '--disable-backgrounding-occluded-windows',
            '--disable-features=WebRtcHideLocalIpsWithMdns,CalculateNativeWinOcclusion',
            '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist',
-           '--disk-cache-size=104857600', '--window-size=1280,800', ...(pre.args || [])],
+           '--disk-cache-size=104857600', '--window-size=1280,800',
+           // --url https://… (the live site): this sandbox's egress proxy re-signs TLS with its
+           // own CA, which Chrome does not trust, so every live run failed ERR_CERT_AUTHORITY_INVALID.
+           ...(/^https:/.test(BASE) ? ['--ignore-certificate-errors'] : []), ...(pre.args || [])],
   });
   try { (await import('./browser_leak_guard.js')).default.guard(browser, __filename); } catch (_e) {}
   const page = (await browser.pages())[0] || await browser.newPage();
