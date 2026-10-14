@@ -83,6 +83,7 @@ EXPORTED_FUNCS='[
   "_sh4_interp_shil_fb",
   "_sh4_jit_lookup_idx",
   "_flycast_set_chain",
+  "_flycast_set_slice_inwasm",
   "_flycast_set_ic",
   "_flycast_set_self_loop",
   "_flycast_set_rte_intc",

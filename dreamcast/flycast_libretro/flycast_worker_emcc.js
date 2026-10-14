@@ -780,7 +780,7 @@ async function createWasm() {
   function receiveInstance(instance, module) {
     wasmExports = instance.exports;
     wasmExports = applySignatureConversions(wasmExports);
-    registerTLSInit(wasmExports["Mh"]);
+    registerTLSInit(wasmExports["Oh"]);
     assignWasmExports(wasmExports);
     // We now have the Wasm module loaded up, keep a reference to the compiled module so we can post it to the workers.
     wasmModule = module;
@@ -10304,121 +10304,121 @@ Module["GL"] = GL;
 var proxiedFunctionTable = [ _proc_exit, exitOnMainThread, pthreadCreateProxied, ___syscall_accept4, ___syscall_bind, ___syscall_connect, ___syscall_faccessat, ___syscall_fcntl64, ___syscall_fstat64, ___syscall_getdents64, ___syscall_getpeername, ___syscall_getsockname, ___syscall_getsockopt, ___syscall_ioctl, ___syscall_listen, ___syscall_lstat64, ___syscall_mkdirat, ___syscall_newfstatat, ___syscall_openat, ___syscall_pipe2, ___syscall_poll, ___syscall_poll_nonblocking, ___syscall_recvfrom, ___syscall_recvmsg, ___syscall_rmdir, ___syscall_sendmsg, ___syscall_sendto, ___syscall_setsockopt, ___syscall_shutdown, ___syscall_socket, ___syscall_stat64, ___syscall_unlinkat, __mmap_js, __munmap_js, _environ_get, _environ_sizes_get, _fd_close, _fd_read, _fd_seek, _fd_write, _getaddrinfo ];
 
 var ASM_CONSTS = {
-  6642216: $0 => {
+  6642264: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] gl ctx already created, handle=" + $0
     });
   },
-  6642311: $0 => {
+  6642359: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] FATAL: emscripten_webgl_create_context failed (handle=" + $0 + ")"
     });
   },
-  6642435: ($0, $1) => {
+  6642483: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] WebGL2 ctx created on main-runtime thread, handle=" + $0 + ", make_current=" + $1
     });
   },
-  6642574: () => {
+  6642622: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] worker_init: retro_init done"
     });
   },
-  6642661: $0 => {
+  6642709: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] run_iter enter #" + $0
     });
   },
-  6642741: $0 => {
+  6642789: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] run_iter exit  #" + $0
     });
   },
-  6642821: () => {
+  6642869: () => {
     postMessage({
       cmd: "print",
       txt: "[parity] from_load requested but no state was loaded"
     });
   },
-  6642913: () => {
+  6642961: () => {
     postMessage({
       cmd: "print",
       txt: "[parity] save_state FAILED"
     });
   },
-  6642979: ($0, $1) => {
+  6643027: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[parity] source=" + (($1 | 0) ? "loaded-state" : "live-capture") + " " + ($0 >>> 0) + " bytes"
     });
   },
-  6643104: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
+  6643152: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
     postMessage({
       cmd: "print",
       txt: "[parity] frames=" + ($0 >>> 0) + " disA=" + ($1 >>> 0).toString(16) + "/" + ($2 >>> 0) + " disB=" + ($3 >>> 0).toString(16) + "/" + ($4 >>> 0) + " armC=" + ($5 >>> 0).toString(16) + "/" + ($6 >>> 0) + " sound=" + ($7 | 0) + " verdict=" + (($7 | 0) ? (($8 | 0) ? "PASS" : "DIVERGED") : "UNSOUND-WINDOW")
     });
   },
-  6643425: ($0, $1, $2) => {
+  6643473: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] video target set buf=" + $0 + " w=" + $1 + " h=" + $2
     });
   },
-  6643536: ($0, $1) => {
+  6643584: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] audio ring addr=" + $0 + " capacity=" + $1 + " frames"
     });
   },
-  6643648: ($0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10) => {
+  6643696: ($0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10) => {
     postMessage({
       cmd: "print",
       txt: "[reios-sc] pc=0x" + ($0 >>> 0).toString(16) + " r4=0x" + ($1 >>> 0).toString(16) + " r5=0x" + ($2 >>> 0).toString(16) + " r6=0x" + ($3 >>> 0).toString(16) + " r7=0x" + ($4 >>> 0).toString(16) + " r0=0x" + ($5 >>> 0).toString(16) + ($6 ? (" (prev x" + ($6 >>> 0) + ")") : "") + ($7 ? (" READ sector=" + ($8 >>> 0) + " n=" + ($9 >>> 0) + " dst=0x" + ($10 >>> 0).toString(16)) : "")
     });
   },
-  6644046: ($0, $1, $2) => {
+  6644094: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[ifb-pc] #" + ($0 | 0) + " pc=0x" + ($1 >>> 0).toString(16) + " op=0x" + (($2 | 0) & 65535).toString(16) + " major=" + ((($2 | 0) >> 12) & 15)
     });
   },
-  6644225: ($0, $1, $2, $3) => {
+  6644273: ($0, $1, $2, $3) => {
     postMessage({
       cmd: "print",
       txt: "[sh4-throw] #" + $0 + " pc=" + ($1 >>> 0).toString(16) + " op=" + ($2 & 65535).toString(16) + " sr=" + ($3 >>> 0).toString(16) + " BL=" + (($3 >>> 28) & 1) + " MD=" + (($3 >>> 30) & 1)
     });
   },
-  6644451: ($0, $1, $2, $3, $4, $5) => {
+  6644499: ($0, $1, $2, $3, $4, $5) => {
     postMessage({
       cmd: "print",
       txt: "[gd-check] id=" + ($0 >>> 0) + " ret=" + ($1 >>> 0) + " err=0x" + ($2 >>> 0).toString(16) + " size=0x" + ($3 >>> 0).toString(16) + " wait=0x" + ($4 >>> 0).toString(16) + ($5 ? (" (prev x" + ($5 >>> 0) + ")") : "")
     });
   },
-  6644691: () => {
+  6644739: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] main pthread entered (idle)"
     });
   },
-  6644777: ($0, $1, $2) => {
+  6644825: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] SET_HW_RENDER captured (ctx_type=" + $0 + ", ver=" + $1 + "." + $2 + ")"
     });
   },
-  6644907: $0 => {
+  6644955: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast.log] " + UTF8ToString($0)
     });
   },
-  6644982: ($0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) => {
+  6645030: ($0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) => {
     postMessage({
       cmd: "fps",
       fps: $0,
@@ -10444,61 +10444,61 @@ var ASM_CONSTS = {
       txt: UTF8ToString($13)
     });
   },
-  6645265: $0 => {
+  6645313: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6645320: $0 => {
+  6645368: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6645375: $0 => {
+  6645423: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6645430: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
+  6645478: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
     postMessage({
       cmd: "print",
       txt: "[stuck-pc] pc=0x" + ($0 >>> 0).toString(16) + " sr=0x" + ($1 >>> 0).toString(16) + " imask=" + (($1 >> 4) & 15) + " pend=0x" + ($2 >>> 0).toString(16) + " istnrm=0x" + ($3 >>> 0).toString(16) + " istext=0x" + ($4 >>> 0).toString(16) + " iml2=0x" + ($5 >>> 0).toString(16) + " iml4=0x" + ($6 >>> 0).toString(16) + " iml6=0x" + ($7 >>> 0).toString(16) + " pr=0x" + ($8 >>> 0).toString(16)
     });
   },
-  6645834: $0 => {
+  6645882: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6645889: $0 => {
+  6645937: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6645944: $0 => {
+  6645992: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6645999: ($0, $1, $2, $3, $4) => {
+  6646047: ($0, $1, $2, $3, $4) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] video_cb #" + $0 + " HW_FRAME_VALID #" + $1 + " commit_frame=" + $2 + " w=" + $3 + " h=" + $4
     });
   },
-  6646150: ($0, $1, $2, $3, $4, $5) => {
+  6646198: ($0, $1, $2, $3, $4, $5) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] video_cb #" + $0 + " data=" + $1 + " w=" + $2 + " h=" + $3 + " pitch=" + $4 + " real_frames=" + $5
     });
   },
-  6646306: ($0, $1, $2, $3) => {
+  6646354: ($0, $1, $2, $3) => {
     var bytes = $2 * $3;
     var src = $0;
     var view = (growMemViews(), HEAPU8).subarray(src >>> 0, src + bytes >>> 0);
@@ -10513,115 +10513,115 @@ var ASM_CONSTS = {
       pitch: $3
     }, [ copy.buffer ]);
   },
-  6646525: $0 => {
+  6646573: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: " + UTF8ToString($0)
     });
   },
-  6646614: $0 => {
+  6646662: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] plugged " + $0 + " controller(s)"
     });
   },
-  6646705: () => {
+  6646753: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: unknown exception during retro_load_game"
     });
   },
-  6646815: $0 => {
+  6646863: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: C-string exception during retro_load_game: " + UTF8ToString($0)
     });
   },
-  6646947: $0 => {
+  6646995: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: std::exception during retro_load_game: " + UTF8ToString($0)
     });
   },
-  6647075: $0 => {
+  6647123: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: retro_load_game returned " + ($0 ? "true" : "false")
     });
   },
-  6647196: ($0, $1) => {
+  6647244: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[maple] vmuDev=" + $0 + " type=" + $1 + " (MDT_SegaVMU=1)"
     });
   },
-  6647295: $0 => {
+  6647343: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6647351: $0 => {
+  6647399: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] disc_type=" + ($0 >>> 0) + " (0=CdRom 1=CdRom_XA 4=GdRom 16=NoDisk)"
     });
   },
-  6647477: ($0, $1, $2, $3, $4) => {
+  6647525: ($0, $1, $2, $3, $4) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] av_info base=" + $0 + "x" + $1 + " max=" + $2 + "x" + $3 + " fps=" + $4
     });
   },
-  6647606: () => {
+  6647654: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] invoking hw_render.context_reset"
     });
   },
-  6647697: () => {
+  6647745: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] hw_render.context_reset returned"
     });
   },
-  6647788: () => {
+  6647836: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] WARNING: hw_render.context_reset not registered"
     });
   },
-  6647894: $0 => {
+  6647942: $0 => {
     postMessage({
       cmd: "print",
       txt: "[parity] arm " + ($0 | 0) + ": restoring..."
     });
   },
-  6647975: ($0, $1, $2) => {
+  6648023: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[parity] arm " + ($0 | 0) + ": restore " + (($1 | 0) ? "ok" : "FAILED") + ", ic=" + ($2 | 0)
     });
   },
-  6648096: $0 => {
+  6648144: $0 => {
     postMessage({
       cmd: "print",
       txt: "[rec_wasm-shard] jit_register probe-limit vaddr=0x" + ($0 >>> 0).toString(16)
     });
   },
-  6648213: ($0, $1, $2) => {
+  6648261: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[rec_wasm-shard] sealed count=" + ($0 | 0) + " base_idx=" + ($1 | 0) + " bytes=" + ($2 | 0)
     });
   },
-  6648338: ($0, $1, $2) => {
+  6648386: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[shardmap] base=" + ($0 | 0) + " i0=" + ($1 | 0) + " v=" + UTF8ToString($2)
     });
   },
-  6648449: ($0, $1, $2, $3) => {
+  6648497: ($0, $1, $2, $3) => {
     var errPtr = $0;
     var errStr = "";
     var i = 0;
@@ -10634,7 +10634,7 @@ var ASM_CONSTS = {
       txt: "[rec_wasm-shard] install_shard FAILED #" + ($1 | 0) + " count=" + ($2 | 0) + " bytes=" + ($3 | 0) + ' err="' + errStr + '" — falling back to per-block installs'
     });
   },
-  6648790: ($0, $1) => {
+  6648838: ($0, $1) => {
     var p = $1 >>> 0;
     var s = "";
     while ((growMemViews(), HEAPU8)[p >>> 0] !== 0 && s.length < 256) {
@@ -10646,7 +10646,7 @@ var ASM_CONSTS = {
       txt: "[rec_wasm-shard] BAD BLOCK vaddr=0x" + ($0 >>> 0).toString(16) + ' err="' + s + '"'
     });
   },
-  6649028: ($0, $1, $2) => {
+  6649076: ($0, $1, $2) => {
     var p = $0 >>> 0;
     var n = $1 | 0;
     var va = $2 >>> 0;
@@ -10666,158 +10666,158 @@ var ASM_CONSTS = {
       txt: "[wasm-dump] END"
     });
   },
-  6649441: ($0, $1) => {
+  6649489: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[rec_wasm-shard] per-block fallback: installed=" + ($0 | 0) + " hard-failed=" + ($1 | 0) + " (hard failures span-interp permanently)"
     });
   },
-  6649609: $0 => {
+  6649657: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6649664: $0 => {
+  6649712: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6649719: ($0, $1, $2) => {
+  6649767: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[vec-ring now] idx=" + ($0 >>> 0) + " spc=0x" + ($1 >>> 0).toString(16) + " vbr=0x" + ($2 >>> 0).toString(16)
     });
   },
-  6649861: ($0, $1, $2) => {
+  6649909: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[keystream #" + ($0 | 0) + "] r0(ks)=0x" + ($1 >>> 0).toString(16) + " r13(i)=" + ($2 >>> 0) + " (INTERP)"
     });
   },
-  665e4: $0 => {
+  6650048: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6650055: $0 => {
+  6650103: $0 => {
     postMessage({
       cmd: "print",
       txt: "[pool INT] state=0x" + ($0 >>> 0).toString(16)
     });
   },
-  6650136: $0 => {
+  6650184: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6650191: ($0, $1, $2, $3) => {
+  6650239: ($0, $1, $2, $3) => {
     postMessage({
       cmd: "print",
       txt: "[interp-escape] pc=0x" + ($0 >>> 0).toString(16) + " spc=0x" + ($1 >>> 0).toString(16) + " sr=0x" + ($2 >>> 0).toString(16) + " pr=0x" + ($3 >>> 0).toString(16)
     });
   },
-  6650382: ($0, $1, $2, $3) => {
+  6650430: ($0, $1, $2, $3) => {
     postMessage({
       cmd: "print",
       txt: "[mem-map] ram=0x" + ($0 >>> 0).toString(16) + " &mem_b[0]=0x" + ($1 >>> 0).toString(16) + " &vram[0]=0x" + ($2 >>> 0).toString(16) + " &aica_ram[0]=0x" + ($3 >>> 0).toString(16)
     });
   },
-  6650591: $0 => {
+  6650639: $0 => {
     postMessage({
       cmd: "print",
       txt: "[decbug entry] pc=0x" + ($0 >>> 0).toString(16)
     });
   },
-  6650673: $0 => {
+  6650721: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6650728: $0 => {
+  6650776: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6650783: $0 => {
+  6650831: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6650838: $0 => {
+  6650886: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6650893: $0 => {
+  6650941: $0 => {
     postMessage({
       cmd: "print",
       txt: "[pool JIT] state=0x" + ($0 >>> 0).toString(16)
     });
   },
-  6650974: $0 => {
+  6651022: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6651029: ($0, $1, $2, $3, $4, $5) => {
+  6651077: ($0, $1, $2, $3, $4, $5) => {
     postMessage({
       cmd: "print",
       txt: "[keystream #" + ($0 | 0) + "] r0(ks)=0x" + ($1 >>> 0).toString(16) + " r2(word)=0x" + ($2 >>> 0).toString(16) + " r13(i)=" + ($3 >>> 0) + " r12(n)=" + ($4 >>> 0) + " r14=0x" + ($5 >>> 0).toString(16)
     });
   },
-  6651255: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
+  6651303: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
     postMessage({
       cmd: "print",
       txt: "[escape-edge] prev_pc=0x" + ($0 >>> 0).toString(16) + " -> wild_pc=0x" + ($1 >>> 0).toString(16) + " spc=0x" + ($2 >>> 0).toString(16) + " ssr=0x" + ($3 >>> 0).toString(16) + " sr=0x" + ($4 >>> 0).toString(16) + " vbr=0x" + ($5 >>> 0).toString(16) + " pend=0x" + ($6 >>> 0).toString(16) + " pr=0x" + ($7 >>> 0).toString(16) + " r15=0x" + ($8 >>> 0).toString(16)
     });
   },
-  6651637: $0 => {
+  6651685: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6651692: $0 => {
+  6651740: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6651747: $0 => {
+  6651795: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6651802: $0 => {
+  6651850: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6651857: ($0, $1, $2) => {
+  6651905: ($0, $1, $2) => {
     var s = "[blockdump] vaddr=0x" + ($0 >>> 0).toString(16) + " size=" + ($1 | 0) + " hex=" + UTF8ToString($2);
     postMessage({
       cmd: "print",
       txt: s
     });
   },
-  6652002: ($0, $1) => {
+  6652050: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[rec_wasm] jit_register probe-limit at vaddr=0x" + ($0 >>> 0).toString(16) + " (probe #" + ($1 | 0) + ")"
     });
   },
-  6652145: ($0, $1, $2, $3, $4, $5) => {
+  6652193: ($0, $1, $2, $3, $4, $5) => {
     var addr = $0;
     var n = $1;
     var hex = "";
@@ -10837,31 +10837,31 @@ var ASM_CONSTS = {
       txt: "[rec_wasm] install_block FAILED #" + ($3 | 0) + " vaddr=0x" + ($4 >>> 0).toString(16) + " bytes=" + ($5 | 0) + ' err="' + errStr + '"' + " first" + n + "=" + hex
     });
   },
-  6652642: ($0, $1, $2, $3, $4, $5) => {
+  6652690: ($0, $1, $2, $3, $4, $5) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] compile RAM-block #" + ($0 | 0) + " vaddr=0x" + ($1 >>> 0).toString(16) + " ops=" + ($2 | 0) + " BlockType=0x" + ($3 >>> 0).toString(16) + " Branch=0x" + ($4 >>> 0).toString(16) + " Next=0x" + ($5 >>> 0).toString(16)
     });
   },
-  6652912: ($0, $1, $2, $3, $4, $5, $6, $7) => {
+  6652960: ($0, $1, $2, $3, $4, $5, $6, $7) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker]   words: " + ($0 >>> 0).toString(16).padStart(4, "0") + " " + ($1 >>> 0).toString(16).padStart(4, "0") + " " + ($2 >>> 0).toString(16).padStart(4, "0") + " " + ($3 >>> 0).toString(16).padStart(4, "0") + " " + ($4 >>> 0).toString(16).padStart(4, "0") + " " + ($5 >>> 0).toString(16).padStart(4, "0") + " " + ($6 >>> 0).toString(16).padStart(4, "0") + " " + ($7 >>> 0).toString(16).padStart(4, "0")
     });
   },
-  6653358: ($0, $1, $2, $3, $4, $5, $6) => {
+  6653406: ($0, $1, $2, $3, $4, $5, $6) => {
     postMessage({
       cmd: "print",
       txt: "[watchdog #" + ($0 | 0) + "] stuck pc=0x" + ($1 >>> 0).toString(16) + " istnrm=0x" + ($2 >>> 0).toString(16) + " istext=0x" + ($3 >>> 0).toString(16) + " pend=0x" + ($4 >>> 0).toString(16) + " sr=0x" + ($5 >>> 0).toString(16) + " pr=0x" + ($6 >>> 0).toString(16)
     });
   },
-  6653622: ($0, $1, $2) => {
+  6653670: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[arm7rec] emitter engaged, first block pc=0x" + ($0 >>> 0).toString(16) + " ops=" + ($1 | 0) + " bytes=" + ($2 | 0)
     });
   },
-  6653770: ($0, $1) => {
+  6653818: ($0, $1) => {
     var p = $1 >>> 0;
     var s = "";
     while ((growMemViews(), HEAPU8)[p >>> 0] !== 0 && s.length < 256) {
@@ -10873,13 +10873,13 @@ var ASM_CONSTS = {
       txt: "[arm7rec] install FAILED pc=0x" + ($0 >>> 0).toString(16) + ' err="' + s + '" — v0 fallback'
     });
   },
-  6654019: ($0, $1, $2, $3) => {
+  6654067: ($0, $1, $2, $3) => {
     postMessage({
       cmd: "print",
       txt: "[arm7st] MISMATCH pc=0x" + ($0 >>> 0).toString(16) + " reg=" + ($1 | 0) + " jit=0x" + ($2 >>> 0).toString(16) + " interp=0x" + ($3 >>> 0).toString(16)
     });
   },
-  6654200: ($0, $1) => {
+  6654248: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[arm7st] blocks=" + ($0 | 0) + " mismatches=" + ($1 | 0)
@@ -10908,7 +10908,7 @@ function wasm_dispatcher_get_last_error(dst, max_len) {
 }
 
 // Imports from the Wasm binary.
-var _flycast_guest_cycles, _flycast_keep_pthread_runtime, __emscripten_thread_free_data, __emscripten_thread_crashed, _emscripten_create_gl_context, _emscripten_worker_init, _emscripten_load_disc, _flycast_run_iter_flag_ptr, _flycast_flash_ptr, _flycast_flash_size, _flycast_flash_gen, _flycast_vmu_ptr, _flycast_vmu_size, _flycast_vmu_gen, _flycast_vmu_ports, _emscripten_run_iter, _flycast_rb_reset_host_history, _emscripten_reset, _flycast_lockstep_reset, _emscripten_get_maple_ptr, _emscripten_set_player_ports, _emscripten_get_player_ports, _emscripten_get_port_polls, _emscripten_save_state, _free, _sh4_import_fnptrs, _sh4_jit_lookup_idx, _sh4_interp_shil_fb, _sh4_interp_ifb, _sh4_mem_write32, _sh4_mem_write16, _sh4_mem_write8, _sh4_mem_read32, _sh4_mem_read16, _sh4_mem_read8, _emscripten_parity_begin, _malloc, _flycast_ic_invalidate, _flycast_set_ic, _flycast_shard_seal_now, _emscripten_parity_tick, _emscripten_load_state, _emscripten_rb_mute_audio, _emscripten_state_size, _emscripten_save_state_into, _emscripten_set_rollback_mode, _flycast_set_rollback_mode, _flycast_set_deterministic, _emscripten_rb_ram_offset, _emscripten_rb_hash, _emscripten_load_state_rollback, _flycast_rb_snapshot_code_pages, _flycast_rb_invalidate_changed, _emscripten_lockstep_normalize, _emscripten_set_video_target, _emscripten_set_audio_ring, _main, _flycast_set_chain, _flycast_set_shard, _flycast_set_idleskip, _flycast_diag_set, _flycast_diag_ifb, _flycast_get_sh4_pc, _flycast_ctx_snapshot, _flycast_set_interp_only, _flycast_interp_step_count, _flycast_set_mem_fastpaths, _flycast_set_regcache, _flycast_set_imm_fastpath, _flycast_set_sq_fp, _flycast_set_self_loop, _flycast_set_rte_intc, _flycast_set_interp_range, _flycast_set_pc_trace_until, _flycast_set_arm7jit, _flycast_set_arm7selftest, _pthread_self, _flycast_set_fog, _flycast_set_modvol, _htons, _htonl, _flycast_set_render_skip, _flycast_render_skips, _sh4_sched_debug_dump, _ntohs, _flycast_ser_sections, __emscripten_tls_init, _emscripten_builtin_memalign, __emscripten_thread_init, ___set_thread_state, __emscripten_run_js_on_main_thread_done, __emscripten_run_js_on_main_thread, __emscripten_thread_exit, __emscripten_check_mailbox, _setThrew, __emscripten_tempret_set, _emscripten_stack_set_limits, __emscripten_stack_restore, __emscripten_stack_alloc, _emscripten_stack_get_current, ___cxa_decrement_exception_refcount, ___cxa_increment_exception_refcount, ___cxa_can_catch, ___cxa_get_exception_ptr, __indirect_function_table, wasmTable;
+var _flycast_guest_cycles, _flycast_keep_pthread_runtime, __emscripten_thread_free_data, __emscripten_thread_crashed, _emscripten_create_gl_context, _emscripten_worker_init, _emscripten_load_disc, _flycast_run_iter_flag_ptr, _flycast_flash_ptr, _flycast_flash_size, _flycast_flash_gen, _flycast_vmu_ptr, _flycast_vmu_size, _flycast_vmu_gen, _flycast_vmu_ports, _emscripten_run_iter, _flycast_rb_reset_host_history, _emscripten_reset, _flycast_lockstep_reset, _emscripten_get_maple_ptr, _emscripten_set_player_ports, _emscripten_get_player_ports, _emscripten_get_port_polls, _emscripten_save_state, _free, _sh4_import_fnptrs, _sh4_slice_end, _sh4_jit_lookup_idx, _sh4_interp_shil_fb, _sh4_interp_ifb, _sh4_mem_write32, _sh4_mem_write16, _sh4_mem_write8, _sh4_mem_read32, _sh4_mem_read16, _sh4_mem_read8, _emscripten_parity_begin, _malloc, _flycast_ic_invalidate, _flycast_set_ic, _flycast_shard_seal_now, _emscripten_parity_tick, _emscripten_load_state, _emscripten_rb_mute_audio, _emscripten_state_size, _emscripten_save_state_into, _emscripten_set_rollback_mode, _flycast_set_rollback_mode, _flycast_set_deterministic, _emscripten_rb_ram_offset, _emscripten_rb_hash, _emscripten_load_state_rollback, _flycast_rb_snapshot_code_pages, _flycast_rb_invalidate_changed, _emscripten_lockstep_normalize, _emscripten_set_video_target, _emscripten_set_audio_ring, _main, _flycast_set_slice_inwasm, _flycast_set_chain, _flycast_set_shard, _flycast_set_idleskip, _flycast_diag_set, _flycast_diag_ifb, _flycast_get_sh4_pc, _flycast_ctx_snapshot, _flycast_set_interp_only, _flycast_interp_step_count, _flycast_set_mem_fastpaths, _flycast_set_regcache, _flycast_set_imm_fastpath, _flycast_set_sq_fp, _flycast_set_self_loop, _flycast_set_rte_intc, _flycast_set_interp_range, _flycast_set_pc_trace_until, _flycast_set_arm7jit, _flycast_set_arm7selftest, _pthread_self, _flycast_set_fog, _flycast_set_modvol, _htons, _htonl, _flycast_set_render_skip, _flycast_render_skips, _sh4_sched_debug_dump, _ntohs, _flycast_ser_sections, __emscripten_tls_init, _emscripten_builtin_memalign, __emscripten_thread_init, ___set_thread_state, __emscripten_run_js_on_main_thread_done, __emscripten_run_js_on_main_thread, __emscripten_thread_exit, __emscripten_check_mailbox, _setThrew, __emscripten_tempret_set, _emscripten_stack_set_limits, __emscripten_stack_restore, __emscripten_stack_alloc, _emscripten_stack_get_current, ___cxa_decrement_exception_refcount, ___cxa_increment_exception_refcount, ___cxa_can_catch, ___cxa_get_exception_ptr, __indirect_function_table, wasmTable;
 
 function assignWasmExports(wasmExports) {
   _flycast_guest_cycles = Module["_flycast_guest_cycles"] = wasmExports["fg"];
@@ -10937,84 +10937,86 @@ function assignWasmExports(wasmExports) {
   _emscripten_save_state = Module["_emscripten_save_state"] = wasmExports["Dg"];
   _free = Module["_free"] = wasmExports["Eg"];
   _sh4_import_fnptrs = Module["_sh4_import_fnptrs"] = wasmExports["Fg"];
-  _sh4_jit_lookup_idx = Module["_sh4_jit_lookup_idx"] = wasmExports["Gg"];
-  _sh4_interp_shil_fb = Module["_sh4_interp_shil_fb"] = wasmExports["Hg"];
-  _sh4_interp_ifb = Module["_sh4_interp_ifb"] = wasmExports["Ig"];
-  _sh4_mem_write32 = Module["_sh4_mem_write32"] = wasmExports["Jg"];
-  _sh4_mem_write16 = Module["_sh4_mem_write16"] = wasmExports["Kg"];
-  _sh4_mem_write8 = Module["_sh4_mem_write8"] = wasmExports["Lg"];
-  _sh4_mem_read32 = Module["_sh4_mem_read32"] = wasmExports["Mg"];
-  _sh4_mem_read16 = Module["_sh4_mem_read16"] = wasmExports["Ng"];
-  _sh4_mem_read8 = Module["_sh4_mem_read8"] = wasmExports["Og"];
-  _emscripten_parity_begin = Module["_emscripten_parity_begin"] = wasmExports["Pg"];
-  _malloc = Module["_malloc"] = wasmExports["Qg"];
-  _flycast_ic_invalidate = Module["_flycast_ic_invalidate"] = wasmExports["Rg"];
-  _flycast_set_ic = Module["_flycast_set_ic"] = wasmExports["Sg"];
-  _flycast_shard_seal_now = Module["_flycast_shard_seal_now"] = wasmExports["Tg"];
-  _emscripten_parity_tick = Module["_emscripten_parity_tick"] = wasmExports["Ug"];
-  _emscripten_load_state = Module["_emscripten_load_state"] = wasmExports["Vg"];
-  _emscripten_rb_mute_audio = Module["_emscripten_rb_mute_audio"] = wasmExports["Wg"];
-  _emscripten_state_size = Module["_emscripten_state_size"] = wasmExports["Xg"];
-  _emscripten_save_state_into = Module["_emscripten_save_state_into"] = wasmExports["Yg"];
-  _emscripten_set_rollback_mode = Module["_emscripten_set_rollback_mode"] = wasmExports["Zg"];
-  _flycast_set_rollback_mode = Module["_flycast_set_rollback_mode"] = wasmExports["_g"];
-  _flycast_set_deterministic = Module["_flycast_set_deterministic"] = wasmExports["$g"];
-  _emscripten_rb_ram_offset = Module["_emscripten_rb_ram_offset"] = wasmExports["ah"];
-  _emscripten_rb_hash = Module["_emscripten_rb_hash"] = wasmExports["bh"];
-  _emscripten_load_state_rollback = Module["_emscripten_load_state_rollback"] = wasmExports["ch"];
-  _flycast_rb_snapshot_code_pages = Module["_flycast_rb_snapshot_code_pages"] = wasmExports["dh"];
-  _flycast_rb_invalidate_changed = Module["_flycast_rb_invalidate_changed"] = wasmExports["eh"];
-  _emscripten_lockstep_normalize = Module["_emscripten_lockstep_normalize"] = wasmExports["fh"];
-  _emscripten_set_video_target = Module["_emscripten_set_video_target"] = wasmExports["gh"];
-  _emscripten_set_audio_ring = Module["_emscripten_set_audio_ring"] = wasmExports["hh"];
-  _main = Module["_main"] = wasmExports["ih"];
-  _flycast_set_chain = Module["_flycast_set_chain"] = wasmExports["jh"];
-  _flycast_set_shard = Module["_flycast_set_shard"] = wasmExports["kh"];
-  _flycast_set_idleskip = Module["_flycast_set_idleskip"] = wasmExports["lh"];
-  _flycast_diag_set = Module["_flycast_diag_set"] = wasmExports["mh"];
-  _flycast_diag_ifb = Module["_flycast_diag_ifb"] = wasmExports["nh"];
-  _flycast_get_sh4_pc = Module["_flycast_get_sh4_pc"] = wasmExports["oh"];
-  _flycast_ctx_snapshot = Module["_flycast_ctx_snapshot"] = wasmExports["ph"];
-  _flycast_set_interp_only = Module["_flycast_set_interp_only"] = wasmExports["qh"];
-  _flycast_interp_step_count = Module["_flycast_interp_step_count"] = wasmExports["rh"];
-  _flycast_set_mem_fastpaths = Module["_flycast_set_mem_fastpaths"] = wasmExports["sh"];
-  _flycast_set_regcache = Module["_flycast_set_regcache"] = wasmExports["th"];
-  _flycast_set_imm_fastpath = Module["_flycast_set_imm_fastpath"] = wasmExports["uh"];
-  _flycast_set_sq_fp = Module["_flycast_set_sq_fp"] = wasmExports["vh"];
-  _flycast_set_self_loop = Module["_flycast_set_self_loop"] = wasmExports["wh"];
-  _flycast_set_rte_intc = Module["_flycast_set_rte_intc"] = wasmExports["xh"];
-  _flycast_set_interp_range = Module["_flycast_set_interp_range"] = wasmExports["yh"];
-  _flycast_set_pc_trace_until = Module["_flycast_set_pc_trace_until"] = wasmExports["zh"];
-  _flycast_set_arm7jit = Module["_flycast_set_arm7jit"] = wasmExports["Ah"];
-  _flycast_set_arm7selftest = Module["_flycast_set_arm7selftest"] = wasmExports["Bh"];
-  _pthread_self = wasmExports["Ch"];
-  _flycast_set_fog = Module["_flycast_set_fog"] = wasmExports["Dh"];
-  _flycast_set_modvol = Module["_flycast_set_modvol"] = wasmExports["Eh"];
-  _htons = wasmExports["Fh"];
-  _htonl = wasmExports["Gh"];
-  _flycast_set_render_skip = Module["_flycast_set_render_skip"] = wasmExports["Hh"];
-  _flycast_render_skips = Module["_flycast_render_skips"] = wasmExports["Ih"];
-  _sh4_sched_debug_dump = Module["_sh4_sched_debug_dump"] = wasmExports["Jh"];
-  _ntohs = wasmExports["Kh"];
-  _flycast_ser_sections = Module["_flycast_ser_sections"] = wasmExports["Lh"];
-  __emscripten_tls_init = wasmExports["Mh"];
-  _emscripten_builtin_memalign = wasmExports["Nh"];
-  __emscripten_thread_init = wasmExports["Oh"];
-  ___set_thread_state = wasmExports["Ph"];
-  __emscripten_run_js_on_main_thread_done = wasmExports["Qh"];
-  __emscripten_run_js_on_main_thread = wasmExports["Rh"];
-  __emscripten_thread_exit = wasmExports["Sh"];
-  __emscripten_check_mailbox = wasmExports["Th"];
-  _setThrew = wasmExports["Uh"];
-  __emscripten_tempret_set = wasmExports["Vh"];
-  _emscripten_stack_set_limits = wasmExports["Wh"];
-  __emscripten_stack_restore = wasmExports["Xh"];
-  __emscripten_stack_alloc = wasmExports["Yh"];
-  _emscripten_stack_get_current = wasmExports["Zh"];
-  ___cxa_decrement_exception_refcount = wasmExports["_h"];
-  ___cxa_increment_exception_refcount = wasmExports["$h"];
-  ___cxa_can_catch = wasmExports["ai"];
-  ___cxa_get_exception_ptr = wasmExports["bi"];
+  _sh4_slice_end = Module["_sh4_slice_end"] = wasmExports["Gg"];
+  _sh4_jit_lookup_idx = Module["_sh4_jit_lookup_idx"] = wasmExports["Hg"];
+  _sh4_interp_shil_fb = Module["_sh4_interp_shil_fb"] = wasmExports["Ig"];
+  _sh4_interp_ifb = Module["_sh4_interp_ifb"] = wasmExports["Jg"];
+  _sh4_mem_write32 = Module["_sh4_mem_write32"] = wasmExports["Kg"];
+  _sh4_mem_write16 = Module["_sh4_mem_write16"] = wasmExports["Lg"];
+  _sh4_mem_write8 = Module["_sh4_mem_write8"] = wasmExports["Mg"];
+  _sh4_mem_read32 = Module["_sh4_mem_read32"] = wasmExports["Ng"];
+  _sh4_mem_read16 = Module["_sh4_mem_read16"] = wasmExports["Og"];
+  _sh4_mem_read8 = Module["_sh4_mem_read8"] = wasmExports["Pg"];
+  _emscripten_parity_begin = Module["_emscripten_parity_begin"] = wasmExports["Qg"];
+  _malloc = Module["_malloc"] = wasmExports["Rg"];
+  _flycast_ic_invalidate = Module["_flycast_ic_invalidate"] = wasmExports["Sg"];
+  _flycast_set_ic = Module["_flycast_set_ic"] = wasmExports["Tg"];
+  _flycast_shard_seal_now = Module["_flycast_shard_seal_now"] = wasmExports["Ug"];
+  _emscripten_parity_tick = Module["_emscripten_parity_tick"] = wasmExports["Vg"];
+  _emscripten_load_state = Module["_emscripten_load_state"] = wasmExports["Wg"];
+  _emscripten_rb_mute_audio = Module["_emscripten_rb_mute_audio"] = wasmExports["Xg"];
+  _emscripten_state_size = Module["_emscripten_state_size"] = wasmExports["Yg"];
+  _emscripten_save_state_into = Module["_emscripten_save_state_into"] = wasmExports["Zg"];
+  _emscripten_set_rollback_mode = Module["_emscripten_set_rollback_mode"] = wasmExports["_g"];
+  _flycast_set_rollback_mode = Module["_flycast_set_rollback_mode"] = wasmExports["$g"];
+  _flycast_set_deterministic = Module["_flycast_set_deterministic"] = wasmExports["ah"];
+  _emscripten_rb_ram_offset = Module["_emscripten_rb_ram_offset"] = wasmExports["bh"];
+  _emscripten_rb_hash = Module["_emscripten_rb_hash"] = wasmExports["ch"];
+  _emscripten_load_state_rollback = Module["_emscripten_load_state_rollback"] = wasmExports["dh"];
+  _flycast_rb_snapshot_code_pages = Module["_flycast_rb_snapshot_code_pages"] = wasmExports["eh"];
+  _flycast_rb_invalidate_changed = Module["_flycast_rb_invalidate_changed"] = wasmExports["fh"];
+  _emscripten_lockstep_normalize = Module["_emscripten_lockstep_normalize"] = wasmExports["gh"];
+  _emscripten_set_video_target = Module["_emscripten_set_video_target"] = wasmExports["hh"];
+  _emscripten_set_audio_ring = Module["_emscripten_set_audio_ring"] = wasmExports["ih"];
+  _main = Module["_main"] = wasmExports["jh"];
+  _flycast_set_slice_inwasm = Module["_flycast_set_slice_inwasm"] = wasmExports["kh"];
+  _flycast_set_chain = Module["_flycast_set_chain"] = wasmExports["lh"];
+  _flycast_set_shard = Module["_flycast_set_shard"] = wasmExports["mh"];
+  _flycast_set_idleskip = Module["_flycast_set_idleskip"] = wasmExports["nh"];
+  _flycast_diag_set = Module["_flycast_diag_set"] = wasmExports["oh"];
+  _flycast_diag_ifb = Module["_flycast_diag_ifb"] = wasmExports["ph"];
+  _flycast_get_sh4_pc = Module["_flycast_get_sh4_pc"] = wasmExports["qh"];
+  _flycast_ctx_snapshot = Module["_flycast_ctx_snapshot"] = wasmExports["rh"];
+  _flycast_set_interp_only = Module["_flycast_set_interp_only"] = wasmExports["sh"];
+  _flycast_interp_step_count = Module["_flycast_interp_step_count"] = wasmExports["th"];
+  _flycast_set_mem_fastpaths = Module["_flycast_set_mem_fastpaths"] = wasmExports["uh"];
+  _flycast_set_regcache = Module["_flycast_set_regcache"] = wasmExports["vh"];
+  _flycast_set_imm_fastpath = Module["_flycast_set_imm_fastpath"] = wasmExports["wh"];
+  _flycast_set_sq_fp = Module["_flycast_set_sq_fp"] = wasmExports["xh"];
+  _flycast_set_self_loop = Module["_flycast_set_self_loop"] = wasmExports["yh"];
+  _flycast_set_rte_intc = Module["_flycast_set_rte_intc"] = wasmExports["zh"];
+  _flycast_set_interp_range = Module["_flycast_set_interp_range"] = wasmExports["Ah"];
+  _flycast_set_pc_trace_until = Module["_flycast_set_pc_trace_until"] = wasmExports["Bh"];
+  _flycast_set_arm7jit = Module["_flycast_set_arm7jit"] = wasmExports["Ch"];
+  _flycast_set_arm7selftest = Module["_flycast_set_arm7selftest"] = wasmExports["Dh"];
+  _pthread_self = wasmExports["Eh"];
+  _flycast_set_fog = Module["_flycast_set_fog"] = wasmExports["Fh"];
+  _flycast_set_modvol = Module["_flycast_set_modvol"] = wasmExports["Gh"];
+  _htons = wasmExports["Hh"];
+  _htonl = wasmExports["Ih"];
+  _flycast_set_render_skip = Module["_flycast_set_render_skip"] = wasmExports["Jh"];
+  _flycast_render_skips = Module["_flycast_render_skips"] = wasmExports["Kh"];
+  _sh4_sched_debug_dump = Module["_sh4_sched_debug_dump"] = wasmExports["Lh"];
+  _ntohs = wasmExports["Mh"];
+  _flycast_ser_sections = Module["_flycast_ser_sections"] = wasmExports["Nh"];
+  __emscripten_tls_init = wasmExports["Oh"];
+  _emscripten_builtin_memalign = wasmExports["Ph"];
+  __emscripten_thread_init = wasmExports["Qh"];
+  ___set_thread_state = wasmExports["Rh"];
+  __emscripten_run_js_on_main_thread_done = wasmExports["Sh"];
+  __emscripten_run_js_on_main_thread = wasmExports["Th"];
+  __emscripten_thread_exit = wasmExports["Uh"];
+  __emscripten_check_mailbox = wasmExports["Vh"];
+  _setThrew = wasmExports["Wh"];
+  __emscripten_tempret_set = wasmExports["Xh"];
+  _emscripten_stack_set_limits = wasmExports["Yh"];
+  __emscripten_stack_restore = wasmExports["Zh"];
+  __emscripten_stack_alloc = wasmExports["_h"];
+  _emscripten_stack_get_current = wasmExports["$h"];
+  ___cxa_decrement_exception_refcount = wasmExports["ai"];
+  ___cxa_increment_exception_refcount = wasmExports["bi"];
+  ___cxa_can_catch = wasmExports["ci"];
+  ___cxa_get_exception_ptr = wasmExports["di"];
   __indirect_function_table = wasmTable = Module["wasmTable"] = wasmExports["lg"];
 }
 
@@ -11669,13 +11671,13 @@ function applySignatureConversions(wasmExports) {
   var makeWrapper_pp = f => a0 => f(a0) >>> 0;
   var makeWrapper_p = f => () => f() >>> 0;
   var makeWrapper_ppp = f => (a0, a1) => f(a0, a1) >>> 0;
-  wasmExports["Qg"] = makeWrapper_pp(wasmExports["Qg"]);
-  wasmExports["Ch"] = makeWrapper_p(wasmExports["Ch"]);
-  wasmExports["Mh"] = makeWrapper_p(wasmExports["Mh"]);
-  wasmExports["Nh"] = makeWrapper_ppp(wasmExports["Nh"]);
-  wasmExports["Yh"] = makeWrapper_pp(wasmExports["Yh"]);
-  wasmExports["Zh"] = makeWrapper_p(wasmExports["Zh"]);
-  wasmExports["bi"] = makeWrapper_pp(wasmExports["bi"]);
+  wasmExports["Rg"] = makeWrapper_pp(wasmExports["Rg"]);
+  wasmExports["Eh"] = makeWrapper_p(wasmExports["Eh"]);
+  wasmExports["Oh"] = makeWrapper_p(wasmExports["Oh"]);
+  wasmExports["Ph"] = makeWrapper_ppp(wasmExports["Ph"]);
+  wasmExports["_h"] = makeWrapper_pp(wasmExports["_h"]);
+  wasmExports["$h"] = makeWrapper_p(wasmExports["$h"]);
+  wasmExports["di"] = makeWrapper_pp(wasmExports["di"]);
   return wasmExports;
 }
 
@@ -11803,15 +11805,17 @@ function flycast_build_imports() {
   var viaTable = null;
   try {
     if (Module._sh4_import_fnptrs && typeof wasmTable !== "undefined" && wasmTable) {
-      var buf = Module._malloc(36);
+      var NIMP = 10;
+      // == WIMPORT_COUNT (bementalJIT/guests/sh4/wasm_emit.h)
+      var buf = Module._malloc(4 * NIMP);
       Module._sh4_import_fnptrs(buf);
       var idx = [];
-      for (var i = 0; i < 9; i++) idx.push(Module.HEAPU32[(buf >> 2) + i]);
+      for (var i = 0; i < NIMP; i++) idx.push(Module.HEAPU32[(buf >> 2) + i]);
       Module._free(buf);
       var fns = [];
-      for (var j = 0; j < 9; j++) fns.push(wasmTable.get(idx[j]));
+      for (var j = 0; j < NIMP; j++) fns.push(wasmTable.get(idx[j]));
       var allFns = true;
-      for (var k = 0; k < 9; k++) if (typeof fns[k] !== "function") {
+      for (var k = 0; k < NIMP; k++) if (typeof fns[k] !== "function") {
         allFns = false;
         break;
       }
@@ -11825,7 +11829,8 @@ function flycast_build_imports() {
           w32: fns[5],
           ifb: fns[6],
           shil: fns[7],
-          lk: fns[8]
+          lk: fns[8],
+          se: fns[9]
         };
       }
     }
@@ -11874,6 +11879,7 @@ function flycast_build_imports() {
       // flycast_install_block grows/populates, so an emitted block's
       // return_call_indirect targets sibling blocks' slots directly.
       sh4_lookup_idx: (viaTable && viaTable.lk) || pick("sh4_jit_lookup_idx"),
+      sh4_slice_end: (viaTable && viaTable.se) || pick("sh4_slice_end"),
       __indirect_function_table: wasmTable
     }
   };
@@ -12193,7 +12199,7 @@ isPthread && flycastWorkerModule();
 
 // --- build-flavor marker — INJECTED by flycast_worker_link.sh, do not hand-edit ---
 if (typeof globalThis !== 'undefined' && globalThis.name !== 'em-pthread') {
-  var __flycastBuildMarker = '[build] flavor=RELEASE defines=none linked=2026-10-14T23:15:11Z (clean — perf, boot depth and wedge behavior are valid)';
+  var __flycastBuildMarker = '[build] flavor=RELEASE defines=none linked=2026-10-14T23:44:36Z (clean — perf, boot depth and wedge behavior are valid)';
   try { console.log(__flycastBuildMarker); } catch (e) {}
   try { postMessage({ cmd: 'print', txt: __flycastBuildMarker }); } catch (e) {}
 }

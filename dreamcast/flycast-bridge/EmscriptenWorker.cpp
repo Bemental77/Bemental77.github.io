@@ -1744,6 +1744,7 @@ extern "C" {
     void sh4_interp_ifb(uint32_t opcode, uint32_t pc);
     void sh4_interp_shil_fb(uint32_t block_vaddr, uint32_t op_idx);
 }
+extern "C" int sh4_slice_end(uint32_t vaddr);   // rec_wasm.cpp: credit a spent slice inside emitted code
 extern "C" EMSCRIPTEN_KEEPALIVE void sh4_import_fnptrs(uint32_t* out) {
     out[0] = (uint32_t)(uintptr_t)&sh4_mem_read8;
     out[1] = (uint32_t)(uintptr_t)&sh4_mem_read16;
@@ -1754,6 +1755,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void sh4_import_fnptrs(uint32_t* out) {
     out[6] = (uint32_t)(uintptr_t)&sh4_interp_ifb;
     out[7] = (uint32_t)(uintptr_t)&sh4_interp_shil_fb;
     out[8] = (uint32_t)(uintptr_t)&sh4_jit_lookup_idx;
+    out[9] = (uint32_t)(uintptr_t)&sh4_slice_end;   // WIMPORT_SLICE_END (rec_wasm.cpp)
 }
 
 // Lever-4: full IC invalidate, defined in rec_wasm.cpp (no-op while disarmed).
