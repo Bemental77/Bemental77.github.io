@@ -54,6 +54,22 @@ Test arms: `?dcrbforce=1` (host never leaves rollback: `opts.rbNoCap`),
 
 ### ⚠ Gauntlet Legends is NOT exact — rollback is on by default only for pso2
 
+**2026-10-14 update — the Gauntlet room "desync" was the FINGERPRINT, not the
+guest.** `room_desync_soak --sechash` hashes every savestate section of the
+confirmed slot on both consoles. At the frame the engine flagged (f1020) every
+section, sh4/RAM included, hashed IDENTICAL on both. Cause:
+`emscripten_rb_hash` located RAM through `g_ser_ram_offset`, which is the LAST
+save's offset; Gauntlet's state is not fixed-length (pvr TA contexts), so an
+older ring slot was hashed through a shifted 16 MB window, and each console's
+last save is a different frame when it hashes. The worker now records each
+slot's RAM offset at its save (`rbSlotOff`) and hashes exactly that window.
+After the fix, forced rollback room (owd 20+10, `?dcrbforce=1`): **IN SYNC**
+over 62 RAM + 62 engine checkpoints to frame 3660, 83/92 rollbacks, depth 4,
+121 guest s. Control `?dcrbbroken=1`: DESYNC at f180, first differing section
+`sh4`. One residual: the `pvr` section differs by 8 bytes from f300 on (a TA
+context held on one console, recycled on the other — render-side, never seen
+in RAM over 3660 frames).
+
 Proven-per-disc, because exactness is a property of the game's code paths:
 `dreamcast.html` `RB_PROVEN = {'pso2'}`; the HOST's disc decides, so a
 Gauntlet room is delay lockstep (`?dcrb=N` opts any disc in, for testing).
