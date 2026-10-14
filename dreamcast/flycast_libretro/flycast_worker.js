@@ -67,6 +67,29 @@
   // into flycast_worker_emcc.js at link time and the core cannot be relinked on
   // the box that owns it; this shim ships as-is.
   // ---------------------------------------------------------------------------
+  // ?glcount=1 (page -> worker URL): DIAG, count every WebGL2 call the core makes and the
+  // wall time inside each, printed every 5 s as calls/s and ms/s — the inventory a GL-stream
+  // offload has to cover (which calls are per-frame, which ones block).
+  try {
+    if (/[?&]glcount=1/.test(self.location.search)) {
+      const P = self.WebGL2RenderingContext.prototype, C = Object.create(null), T = Object.create(null), A = Object.create(null);
+      for (const k of Object.getOwnPropertyNames(P)) {
+        let d; try { d = Object.getOwnPropertyDescriptor(P, k); } catch (_) { continue; }
+        if (!d || typeof d.value !== 'function' || k === 'constructor') continue;
+        const f = d.value;
+        P[k] = function () { const t = performance.now(); if (k === 'getParameter') { const n = 'getParameter:0x' + (arguments[0] >>> 0).toString(16); A[n] = (A[n] | 0) + 1; }
+          try { return f.apply(this, arguments); } finally { C[k] = (C[k] | 0) + 1; T[k] = (T[k] || 0) + performance.now() - t; } };
+      }
+      let t0 = performance.now();
+      setInterval(() => {
+        const dt = (performance.now() - t0) / 1000; t0 = performance.now();
+        const ks = Object.keys(C).sort((a, b) => C[b] - C[a]);
+        postMessage({ cmd: 'print', txt: '[glcount] ' + ks.map((k) => k + '=' + Math.round(C[k] / dt) + '/' + (T[k] / dt).toFixed(1) + 'ms').join(' ') });
+        for (const k of ks) { A[k] = (A[k] | 0) + C[k]; C[k] = 0; T[k] = 0; }
+        postMessage({ cmd: 'print', txt: '[glcount-all] ' + Object.keys(A).filter((k) => A[k] > 0).sort().map((k) => k + '=' + A[k]).join(' ') });
+      }, 5000);
+    }
+  } catch (_) {}
   try {
     const P = self.WebGL2RenderingContext && self.WebGL2RenderingContext.prototype;
     if (P && typeof P.renderbufferStorage === 'function' && !P.__dcDsWatch) {
@@ -146,11 +169,12 @@
     frames: 0, drawn: 0, skipped: 0, swallowed: 0, forcedDraw: 0, taints: 0, reads: 0, disabled: null,
     lagMs: 17, lagSkips: 0,
   };
-  try {
-    const W2 = self.WebGL2RenderingContext;
-    const P = W2 && W2.prototype;
+  // Applied to the real WebGL2 prototype, and to the GL recorder's (GL STREAM
+  // OFFLOAD below) so a recorded frame skips exactly as a direct one does.
+  function fskWrap(P) {
     if (P && !P.__dcFsWrap) {
-      const FB = P.FRAMEBUFFER, DFB = P.DRAW_FRAMEBUFFER, RFB = P.READ_FRAMEBUFFER;
+      const K = self.WebGL2RenderingContext.prototype;
+      const FB = K.FRAMEBUFFER, DFB = K.DRAW_FRAMEBUFFER, RFB = K.READ_FRAMEBUFFER;
       const bf = P.bindFramebuffer;
       P.bindFramebuffer = function (t, fb) {
         if (t === FB || t === DFB) this.__fsDraw = fb || null;
@@ -205,7 +229,11 @@
         P[n] = function () { noteRead(this, this.__fsRead, n); return f.apply(this, arguments); };
       });
       P.__dcFsWrap = true;
-    } else if (!P) { FSK.on = false; FSK.why = 'no WebGL2'; }
+    }
+  }
+  try {
+    const W2 = self.WebGL2RenderingContext;
+    if (W2) fskWrap(W2.prototype); else { FSK.on = false; FSK.why = 'no WebGL2'; }
   } catch (e) { FSK.on = false; FSK.why = 'wrap failed: ' + e; }
   // Start of a new retro_run (a clean asyncify boundary): retire finished
   // pictures, then decide whether this frame draws.
@@ -271,6 +299,231 @@
       while (FSK.fences.length > 8) gl.deleteSync(FSK.fences.shift());
     } catch (_) {}
   }
+
+  // ---------------------------------------------------------------------------
+  // GL STREAM OFFLOAD (?glsplit=1, 2026-10-14) — the core's GL calls are
+  // RECORDED here and REPLAYED by dc_render_worker.js, which owns the canvas.
+  //
+  // A picture presented from this thread held it until the GPU process had
+  // rasterised the frame (render-hold: ~25% of Gauntlet's worker second and
+  // ~50% of PSO Pioneer 2's on a no-GPU box). With the canvas on a second
+  // worker the SH4 keeps running while the picture is rasterised.
+  //   * OffscreenCanvas.getContext('webgl2') on the page's canvas returns a
+  //     GLRec instead: the canvas itself is transferred to the render worker.
+  //   * every call is appended to the current batch; objects are tagged ids;
+  //     data views into the wasm heap are COPIED (the core reuses its buffers);
+  //   * a batch is posted at each frame end (glEndFrame) and before any call
+  //     whose result the core reads; those few (shader/program status, uniform
+  //     locations, readPixels, unknown getters) wait on a shared buffer for the
+  //     render worker's answer. Binding queries are answered locally, limits
+  //     and extensions by a 1x1 query-only context on this thread;
+  //   * fences (FSK) are batch ids: signalled once the render worker has ENDED
+  //     the task that replayed that batch, i.e. once its picture is presented.
+  // Not guest state: the only GL result the guest can see is a read-back,
+  // which is a synchronous replay of the same calls on the same kind of context.
+  // ---------------------------------------------------------------------------
+  let REC = null;
+  function glEndFrame() { if (REC) REC.__post(); }
+  function installGlSplit() {
+    if (/[?&]glsplit=0/.test(self.location.search)) return;   // the control: draw on this thread
+    const K = self.WebGL2RenderingContext && self.WebGL2RenderingContext.prototype;
+    const OC = self.OffscreenCanvas && self.OffscreenCanvas.prototype;
+    if (!K || !OC || typeof SharedArrayBuffer !== 'function') return;
+    let rw = null;
+    try { rw = new Worker('dc_render_worker.js'); } catch (e) {
+      postMessage({ cmd: 'print', txt: '[glsplit] render worker failed to start: ' + e + ' — drawing on this thread' }); return; }
+    rw.onmessage = (e) => { if (e.data && e.data.cmd === 'print') postMessage(e.data); };
+    const ctlSab = new SharedArrayBuffer(16), ctl = new Int32Array(ctlSab);
+    // the render worker proves it can make a WebGL2 context BEFORE the page's
+    // canvas is handed to it (a canvas cannot come back): ctl[3] 1 = yes, -1 = no
+    rw.postMessage({ init: ctlSab });
+    const resSab = new SharedArrayBuffer(16 + (8 << 20));
+    const dec = new TextDecoder();
+    const origGet = OC.getContext;
+    let qctx = null;   // limits / extensions / precision: never draws
+    class GLObj { constructor(id) { this.o = id; } }
+    let nextId = 1, batchId = 0;
+    const L = { tex2d: Object.create(null), unit: 0, ebo: null, abo: null, fbDraw: null, fbRead: null, rb: null, prog: null, vao: null, unpackAlign: 4, unpackRow: 0 };
+    const RecProto = Object.create(null);
+    for (const k of Object.getOwnPropertyNames(K)) { const d = Object.getOwnPropertyDescriptor(K, k); if (d && typeof d.value === 'number') RecProto[k] = d.value; }
+    const ex = (o) => (o instanceof GLObj) ? { o: o.o } : o;
+    // bytes per pixel for texture uploads (format, type)
+    const bpp = (format, type) => {
+      if (type === K.UNSIGNED_SHORT_5_6_5 || type === K.UNSIGNED_SHORT_4_4_4_4 || type === K.UNSIGNED_SHORT_5_5_5_1) return 2;
+      const comp = (format === K.RGBA || format === K.RGBA_INTEGER) ? 4 : (format === K.RGB || format === K.RGB_INTEGER) ? 3 :
+                   (format === K.RG || format === K.RG_INTEGER) ? 2 : 1;
+      const sz = (type === K.UNSIGNED_BYTE || type === K.BYTE) ? 1 : (type === K.UNSIGNED_SHORT || type === K.SHORT || type === K.HALF_FLOAT) ? 2 : 4;
+      if (type === K.UNSIGNED_INT_24_8 || type === K.UNSIGNED_INT_2_10_10_10_REV || type === K.UNSIGNED_INT_10F_11F_11F_REV || type === K.UNSIGNED_INT_5_9_9_9_REV) return 4;
+      if (type === K.FLOAT_32_UNSIGNED_INT_24_8_REV) return 8;
+      return comp * sz;
+    };
+    const imgBytes = (w, h, format, type) => {
+      const b = bpp(format, type), row = (L.unpackRow > 0 ? L.unpackRow : w) * b, a = L.unpackAlign;
+      const stride = Math.ceil(row / a) * a;
+      return h > 0 ? stride * (h - 1) + w * b : 0;
+    };
+    // copy `n` elements of view starting at element `off` (a fresh, unshared array)
+    const cut = (v, off, n) => { const C = v.constructor; return new C(v.buffer.slice(v.byteOffset + off * v.BYTES_PER_ELEMENT, v.byteOffset + (off + n) * v.BYTES_PER_ELEMENT)); };
+    const own = (v) => cut(v, 0, v.length);
+    function GLRec(canvas, attrs) {
+      this.__ops = []; this.__attrs = attrs;
+      this.canvas = { width: canvas.width, height: canvas.height, addEventListener() {}, removeEventListener() {} };
+      this.drawingBufferWidth = canvas.width; this.drawingBufferHeight = canvas.height;
+    }
+    GLRec.prototype = RecProto;
+    const P = RecProto;
+    P.__post = function (syncOp) {
+      if (!this.__ops.length && !syncOp) return;
+      const ops = this.__ops; this.__ops = [];
+      if (syncOp) ops.push(syncOp);
+      batchId++;
+      rw.postMessage({ ops, id: batchId });
+    };
+    P.__sync = function (meth, args) {
+      Atomics.store(ctl, 0, 0);
+      this.__post(['sync', meth].concat(args));
+      // the render worker is a separate thread: block until it answers (rare calls only)
+      for (let spins = 0; Atomics.load(ctl, 0) === 0; spins++) {
+        if (Atomics.wait(ctl, 0, 0, 10000) === 'timed-out') { postMessage({ cmd: 'print', txt: '[glsplit] ⚠ no answer to ' + meth + ' in 10 s' }); return null; }
+      }
+      const h = new Int32Array(resSab, 0, 4), kind = h[0], n = h[1];
+      const bytes = new Uint8Array(resSab, 16, n).slice();
+      if (kind === 2) return bytes;
+      return JSON.parse(dec.decode(bytes));
+    };
+    const rec = (name) => function () { const a = new Array(arguments.length + 1); a[0] = name; for (let i = 0; i < arguments.length; i++) a[i + 1] = ex(arguments[i]); this.__ops.push(a); };
+    // ---- creation / deletion ----
+    for (const k of ['createTexture', 'createBuffer', 'createFramebuffer', 'createRenderbuffer', 'createVertexArray', 'createShader', 'createProgram', 'createSampler', 'createQuery', 'createTransformFeedback']) {
+      P[k] = function (t) { const o = new GLObj(nextId++); this.__ops.push(k === 'createShader' ? ['+s', t, o.o] : ['+', k, o.o]); return o; };
+    }
+    for (const k of ['deleteTexture', 'deleteBuffer', 'deleteFramebuffer', 'deleteRenderbuffer', 'deleteVertexArray', 'deleteShader', 'deleteProgram', 'deleteSampler', 'deleteQuery', 'deleteTransformFeedback']) {
+      P[k] = function (o) { if (o instanceof GLObj) this.__ops.push(['-', k, o.o]); };
+    }
+    // ---- tracked bindings (answered locally) ----
+    P.activeTexture = function (u) { L.unit = u; this.__ops.push(['activeTexture', u]); };
+    P.bindTexture = function (t, o) { if (t === K.TEXTURE_2D) L.tex2d[L.unit] = o || null; this.__ops.push(['bindTexture', t, ex(o)]); };
+    P.bindBuffer = function (t, o) { if (t === K.ELEMENT_ARRAY_BUFFER) L.ebo = o || null; else if (t === K.ARRAY_BUFFER) L.abo = o || null; this.__ops.push(['bindBuffer', t, ex(o)]); };
+    P.bindFramebuffer = function (t, o) { if (t === K.FRAMEBUFFER || t === K.DRAW_FRAMEBUFFER) L.fbDraw = o || null; if (t === K.FRAMEBUFFER || t === K.READ_FRAMEBUFFER) L.fbRead = o || null; this.__ops.push(['bindFramebuffer', t, ex(o)]); };
+    P.bindRenderbuffer = function (t, o) { L.rb = o || null; this.__ops.push(['bindRenderbuffer', t, ex(o)]); };
+    P.useProgram = function (o) { L.prog = o || null; this.__ops.push(['useProgram', ex(o)]); };
+    P.bindVertexArray = function (o) { L.vao = o || null; this.__ops.push(['bindVertexArray', ex(o)]); };
+    P.pixelStorei = function (pn, v) { if (pn === K.UNPACK_ALIGNMENT) L.unpackAlign = v; else if (pn === K.UNPACK_ROW_LENGTH) L.unpackRow = v; this.__ops.push(['pixelStorei', pn, v]); };
+    P.getParameter = function (pn) {
+      switch (pn) {
+        case K.TEXTURE_BINDING_2D: return L.tex2d[L.unit] || null;
+        case K.ACTIVE_TEXTURE: return L.unit || K.TEXTURE0;
+        case K.ELEMENT_ARRAY_BUFFER_BINDING: return L.ebo;
+        case K.ARRAY_BUFFER_BINDING: return L.abo;
+        case K.FRAMEBUFFER_BINDING: return L.fbDraw;
+        case K.READ_FRAMEBUFFER_BINDING: return L.fbRead;
+        case K.RENDERBUFFER_BINDING: return L.rb;
+        case K.CURRENT_PROGRAM: return L.prog;
+        case K.VERTEX_ARRAY_BINDING: return L.vao;
+        case K.UNPACK_ALIGNMENT: return L.unpackAlign;
+      }
+      // limits, strings, precision: the same answer a context on this device gives
+      return qctx.getParameter(pn);
+    };
+    P.getExtension = function (n) { const e = qctx.getExtension(n); if (e) this.__ops.push(['getExtension', n]); return e; };
+    P.getSupportedExtensions = function () { return qctx.getSupportedExtensions(); };
+    P.getShaderPrecisionFormat = function (a, b) { return qctx.getShaderPrecisionFormat(a, b); };
+    P.getContextAttributes = function () { return Object.assign({}, this.__attrs); };
+    P.isContextLost = function () { return false; };
+    P.getError = function () { return 0; };
+    P.flush = function () { this.__ops.push(['flush']); this.__post(); };
+    P.finish = function () { this.__sync('finish', []); };
+    // ---- fences = batch ids ----
+    P.fenceSync = function () { const o = new GLObj(0); o.batch = batchId + 1; return o; };
+    P.getSyncParameter = function (o, pn) { return (o && Atomics.load(ctl, 2) >= o.batch) ? K.SIGNALED : K.UNSIGNALED; };
+    P.clientWaitSync = function (o) { return (o && Atomics.load(ctl, 2) >= o.batch) ? K.ALREADY_SIGNALED : K.TIMEOUT_EXPIRED; };
+    P.deleteSync = function () {};
+    // ---- uploads: copy exactly the bytes the call reads ----
+    P.bufferData = function (t, a, usage, srcOff, len) {
+      if (typeof a === 'number') return void this.__ops.push(['bufferData', t, a, usage]);
+      if (a == null) return void this.__ops.push(['bufferData', t, 0, usage]);
+      const v = ArrayBuffer.isView(a) ? a : new Uint8Array(a);
+      const d = srcOff !== undefined ? cut(v, srcOff | 0, len !== undefined && len > 0 ? len : v.length - (srcOff | 0)) : own(v);
+      this.__ops.push(['bufferData', t, d, usage]);
+    };
+    P.bufferSubData = function (t, dst, a, srcOff, len) {
+      const v = ArrayBuffer.isView(a) ? a : new Uint8Array(a);
+      const d = srcOff !== undefined ? cut(v, srcOff | 0, len !== undefined && len > 0 ? len : v.length - (srcOff | 0)) : own(v);
+      this.__ops.push(['bufferSubData', t, dst, d]);
+    };
+    const texData = (v, off, w, h, f, ty) => {
+      if (v == null || typeof v === 'number') return v;   // null, or a PIXEL_UNPACK_BUFFER offset
+      const n = Math.min(imgBytes(w, h, f, ty), v.byteLength - (off | 0) * v.BYTES_PER_ELEMENT);
+      const u8 = new Uint8Array(v.buffer, v.byteOffset + (off | 0) * v.BYTES_PER_ELEMENT, n);
+      const C = v.constructor, out = new Uint8Array(n); out.set(u8);
+      return (C === Uint8Array) ? out : new C(out.buffer, 0, Math.floor(n / C.BYTES_PER_ELEMENT));
+    };
+    P.texImage2D = function (t, lv, ifmt, w, h, border, f, ty, px, off) {
+      if (arguments.length === 6) return void this.__ops.push(['texImage2D', t, lv, ifmt, w, h, border]);   // (.., format, type, source) image form: unused by the core
+      this.__ops.push(['texImage2D', t, lv, ifmt, w, h, border, f, ty, texData(px, off, w, h, f, ty)]);
+    };
+    P.texSubImage2D = function (t, lv, x, y, w, h, f, ty, px, off) {
+      this.__ops.push(['texSubImage2D', t, lv, x, y, w, h, f, ty, texData(px, off, w, h, f, ty)]);
+    };
+    const vecUni = (name, per) => function (loc, a, off, len) {
+      const v = (off !== undefined) ? cut(a, off | 0, len !== undefined && len > 0 ? len : a.length - (off | 0)) : own(a);
+      this.__ops.push([name, ex(loc), v]);
+    };
+    for (const n of ['uniform1fv', 'uniform2fv', 'uniform3fv', 'uniform4fv', 'uniform1iv', 'uniform2iv', 'uniform3iv', 'uniform4iv', 'uniform1uiv', 'uniform2uiv', 'uniform3uiv', 'uniform4uiv']) P[n] = vecUni(n);
+    for (const n of ['uniformMatrix2fv', 'uniformMatrix3fv', 'uniformMatrix4fv', 'uniformMatrix2x3fv', 'uniformMatrix2x4fv', 'uniformMatrix3x2fv', 'uniformMatrix3x4fv', 'uniformMatrix4x2fv', 'uniformMatrix4x3fv']) {
+      P[n] = function (loc, tr, a, off, len) {
+        const v = (off !== undefined) ? cut(a, off | 0, len !== undefined && len > 0 ? len : a.length - (off | 0)) : own(a);
+        this.__ops.push([n, ex(loc), tr, v]);
+      };
+    }
+    for (const n of ['vertexAttrib1fv', 'vertexAttrib2fv', 'vertexAttrib3fv', 'vertexAttrib4fv', 'clearBufferfv', 'clearBufferiv', 'clearBufferuiv']) {
+      P[n] = function () { const a = Array.prototype.slice.call(arguments).map((x) => ArrayBuffer.isView(x) ? own(x.length > 16 ? x.subarray(0, 4) : x) : ex(x)); a.unshift(n); this.__ops.push(a); };
+    }
+    // ---- answered by the render worker (rare) ----
+    P.shaderSource = function (sh, src) { this.__ops.push(['shaderSource', ex(sh), String(src)]); };
+    for (const n of ['getShaderParameter', 'getProgramParameter', 'getShaderInfoLog', 'getProgramInfoLog', 'getActiveUniform', 'getActiveAttrib', 'getAttribLocation', 'getUniformBlockIndex', 'checkFramebufferStatus', 'getFramebufferAttachmentParameter', 'getRenderbufferParameter', 'getTexParameter', 'getBufferParameter', 'getVertexAttrib', 'getProgramParameter', 'getShaderSource', 'isTexture', 'isBuffer', 'isFramebuffer', 'isProgram', 'isShader', 'getFragDataLocation', 'getInternalformatParameter', 'getIndexedParameter']) {
+      P[n] = function () { return this.__sync(n, Array.prototype.map.call(arguments, ex)); };
+    }
+    P.getUniformLocation = function (prog, name) {
+      const o = new GLObj(nextId++);
+      return this.__sync('getUniformLocation', [ex(prog), String(name), o.o]) ? o : null;
+    };
+    P.readPixels = function (x, y, w, h, f, ty, dst, off) {
+      if (typeof dst === 'number' || dst == null) return void this.__ops.push(['readPixels', x, y, w, h, f, ty, dst]);   // into a PIXEL_PACK buffer
+      const n = (function () { const b = bpp(f, ty), row = w * b, a = 4; return Math.ceil(row / a) * a * (h - 1) + row; })();
+      const got = this.__sync('readPixels', [x, y, w, h, f, ty, n]);
+      if (got instanceof Uint8Array) new Uint8Array(dst.buffer, dst.byteOffset + (off | 0) * dst.BYTES_PER_ELEMENT, Math.min(n, got.length)).set(got.subarray(0, n));
+    };
+    // ---- everything else: streamed, or (if it returns something) answered ----
+    for (const k of Object.getOwnPropertyNames(K)) {
+      const d = Object.getOwnPropertyDescriptor(K, k);
+      if (!d || typeof d.value !== 'function' || k === 'constructor' || Object.prototype.hasOwnProperty.call(P, k)) continue;
+      if (/^(get|is|check|create|delete)/.test(k)) P[k] = function () { return this.__sync(k, Array.prototype.map.call(arguments, ex)); };
+      else P[k] = rec(k);
+    }
+    fskWrap(P);
+    OC.getContext = function (type, attrs) {
+      if (REC || (type !== 'webgl2' && type !== 'experimental-webgl2') || this.width < 64) return origGet.apply(this, arguments);
+      try {
+        for (let t0 = performance.now(); Atomics.load(ctl, 3) === 0 && performance.now() - t0 < 3000;) Atomics.wait(ctl, 3, 0, 100);
+        if (Atomics.load(ctl, 3) !== 1) {
+          postMessage({ cmd: 'print', txt: '[glsplit] the render worker has no WebGL2 context (' + Atomics.load(ctl, 3) + ') — drawing on this thread' });
+          return origGet.apply(this, arguments);
+        }
+        qctx = origGet.call(new OffscreenCanvas(1, 1), 'webgl2', attrs);
+        if (!qctx) return origGet.apply(this, arguments);
+        const w = this.width, h = this.height;
+        rw.postMessage({ canvas: this, attrs: Object.assign({}, attrs), ctl: ctlSab, res: resSab }, [this]);
+        REC = new GLRec({ width: w, height: h }, attrs || {});
+        self.__dcGlSplit = { rec: REC, ctl, batches: () => batchId };
+        postMessage({ cmd: 'print', txt: '[glsplit] ON — the canvas (' + w + 'x' + h + ') is drawn by dc_render_worker.js; this thread records' });
+        return REC;
+      } catch (e) {
+        postMessage({ cmd: 'print', txt: '[glsplit] could not hand the canvas over (' + e + ') — drawing on this thread' });
+        return origGet.apply(this, arguments);
+      }
+    };
+  }
+  try { installGlSplit(); } catch (e) { postMessage({ cmd: 'print', txt: '[glsplit] install failed: ' + e }); }
 
   // ---------------------------------------------------------------------------
   // Reuse SAB primitives from the gamecube tree — they're not gamecube-specific.
@@ -1478,6 +1731,7 @@
       return;
     }
     fsEnd();   // a frame that finished inside an asyncify resume: fence its picture now
+    glEndFrame();
     // Clean asyncify boundary (run_iter is NOT suspended): the only safe point to
     // serialize. Saving from the message handler while a frame is asyncify-suspended
     // corrupts the frame, so the next run_iter unwinds and the pump freezes — which
@@ -1601,7 +1855,7 @@
     let lsAckF = -1;
     try {
       Module._emscripten_run_iter();
-      if (!runIterSuspended()) fsEnd();
+      if (!runIterSuspended()) { fsEnd(); glEndFrame(); }
       freerunIters++;
       if (lockstep) {
         const f = lsFrame++;
