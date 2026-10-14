@@ -1018,6 +1018,10 @@
       fps: safe(() => lastFps, 0), fields: safe(() => lastCalls, 0),
       iters: safe(() => lastIps, 0), pc: safe(() => lastPc, 0),
       guestX: safe(() => guestRateX(), 0),
+      // THE GUEST CLOCK in 59.94 Hz fields, cumulative, as of the room's last frame
+      // (flycast_worker.js wClock; null outside a room). A rig divides deltas by its own
+      // timestamps — the per-heartbeat guestX is not time-weighted against a rig's samples.
+      guestClock: safe(() => (LS.guestClockMs != null ? LS.guestClockMs * 59.94 / 1000 : null), null),
       // The AICA witness for the last heartbeat (1.000 = hardware), the raw
       // SH4-clock ratio, and whether that heartbeat spanned a clock jump.
       aicaX: safe(() => aicaRateX(), 0),
@@ -3008,6 +3012,8 @@
         // A rollback frame's ack carries what one step costs this console, which
         // the host's capacity gate sizes the room by (lib/netplay.js _capMean).
         if (d.st != null) { const e = lsEngine(); if (e) { e.selfStepMs = +d.st || 0; e.selfPresentMs = +d.sp || 0; } }
+        // the worker's cumulative guest clock (ms) at the end of frame f — __dcProbe().guestClock
+        if (typeof d.gk === 'number') LS.guestClockMs = d.gk;
         lsOnWorkerFrame(d.f, d.due);
         break;
       case 'rbHash': {
@@ -6108,7 +6114,7 @@
     const q = new URLSearchParams(location.search);
     const int = (k, lo, hi, d) => { const v = q.get(k); if (v == null || v === '') return d; const n = parseInt(v, 10); return isFinite(n) ? Math.max(lo, Math.min(hi, n)) : d; };
     return { lookahead: int('lslook', 1, 4, 1), lookPinned: q.has('lslook'), minDelay: int('lsmindelay', 1, 2, 1),
-             forceDelay: int('lsdelay', 1, 30, 0), repay: q.get('lsrepay') !== '0',
+             forceDelay: int('lsdelay', 1, 30, 0), repay: q.get('lsrepay') !== '0', pace: q.get('lspace') !== '0',
              spare: int('lsspare', 0, 4, 0),
              // OFF by default: measured at ~2 ms RTT it gave back 18 ms more
              // (p50 37 ms vs 55) but read 0.997x, and the room must hold 1.000x
@@ -6820,7 +6826,7 @@
     // than assumed away.
     worker.postMessage({ cmd: 'lsNormalize' });
     LS.hashEvery = 60;
-    worker.postMessage({ cmd: 'lockstep', on: 1, frame: 0, hashEvery: LS.hashEvery, repay: LSQ.repay ? 1 : 0 });
+    worker.postMessage({ cmd: 'lockstep', on: 1, frame: 0, hashEvery: LS.hashEvery, repay: LSQ.repay ? 1 : 0, pace: LSQ.pace ? 1 : 0 });
     LS.armed = true; LS.running = false; LS.workerFrame = 0; LS.fedTo = 0; LS.framesRun = 0;
     LS.rbArmed = false; LS.rbRollbacks = 0; LS.rbResim = 0;
     LS.look = lsLookStart(); LS.lookHot = 0; LS.lookCalm = 0; LS.lookUps = 0; LS.lookDowns = 0;

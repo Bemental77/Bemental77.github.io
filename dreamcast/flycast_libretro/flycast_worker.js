@@ -529,7 +529,7 @@
   let freerunStatsTimer = 0;
   // Lazy-disc telemetry: how much of the 1.18GB a session actually touches —
   // the number that decides whether streaming is viable on a phone.
-  const lazyStats = { hits: 0, misses: 0, bytes: 0, evicted: 0, ahead: 0 };
+  const lazyStats = { hits: 0, misses: 0, bytes: 0, evicted: 0, ahead: 0, syncN: 0, syncMs: 0, syncMaxMs: 0 };
   let lazyReported = -1;
   function lazyPoll() {
     if (lazyStats.misses === lazyReported) return;
@@ -537,7 +537,9 @@
     postMessage({ cmd: 'print', txt: '[lazydisc] fetched=' +
       ((lazyStats.bytes / 1048576) | 0) + 'MB chunks=' + lazyStats.misses +
       ' cachehits=' + lazyStats.hits + ' readahead=' + lazyStats.ahead +
-      ' evicted=' + lazyStats.evicted });
+      ' evicted=' + lazyStats.evicted + ' sync=' + lazyStats.syncN + '/' + Math.round(lazyStats.syncMs) + 'ms (max ' +
+      Math.round(lazyStats.syncMaxMs) + ') spans=' + (lazyStats.spans | 0) });
+    lazyStats.syncMaxMs = 0;
   }
 
   // VMU change-watch (see the vmuLoad/vmuWatch handlers).
@@ -699,6 +701,55 @@
     // window too — a duty number straddling two arms describes neither.
     paceBusyMs = 0; pacePacedMs = 0; paceWindowStart = performance.now();
     paceDropMs = 0; paceDrops = 0; paceMaxLagMs = 0; paceOverMs = 0; paceAheadMs = 0;
+    winReset();
+  }
+  // ---------------------------------------------------------------------------
+  // A ROOM'S CATCH-UP IS PACED (2026-10-14; gamecube.html PACE_RATE, 4ed89e7).
+  // The governor repays up to CATCHUP_MAX_MS after EACH stall, and keeps the
+  // guest at or behind the wall clock since the anchor. That bounds the
+  // cumulative clock, not a window: a 5-s window that opens while the guest is
+  // owed time and closes after several repayments reads above 1.000x. Measured
+  // live (a024fc6, Gauntlet room, joiner): one 5-s window at 1.0232x by its own
+  // witness, over the 1.02x ceiling.
+  // So in a delay/lockstep room every frame must leave EVERY window of at least
+  // WIN_MS that ends at its end holding at most WIN_RATE guest ms per wall ms
+  // (1 + 5/300 = 1.0167x, the GameCube figure). For a window starting at a
+  // frame end s:  G(next) - G(s) <= WIN_RATE x max(WIN_MS, T - s). Samples
+  // younger than WIN_MS sit in a ring; an aged sample only ever binds through
+  // G(s) - WIN_RATE x s, so only the least of those is kept (winM).
+  // ROLLBACK FRAMES ARE NOT PACED (the GameCube rule: a rollback console that
+  // loses time must close the gap to the room), but they are recorded.
+  // ?lspace=0 (page) is the control arm.
+  // `wClock`: the guest clock, ms, cumulative — the sum of each frame's guest
+  // advance (end-of-frame cycles minus the previous frame's end). A rollback
+  // frame's load + re-simulation nets to one frame between two frame ends, so
+  // it counts once. Posted on every lockstep ack (`gk`) as the rig's witness.
+  // ---------------------------------------------------------------------------
+  const WIN_MS = 5000, WIN_RATE = 1 + 5 / 300, WIN_N = 2048;
+  const winT = new Float64Array(WIN_N), winG = new Float64Array(WIN_N);
+  let winH = 0, winC = 0, winM = Infinity, lsPace = true;
+  let wClock = 0, wPrevCyc = -1, winHeld = 0, winHeldMs = 0;
+  function winReset() { winH = 0; winC = 0; winM = Infinity; }
+  function winAge(t) {
+    while (winC > 0 && winT[winH] <= t - WIN_MS) {
+      const v = winG[winH] - WIN_RATE * winT[winH]; if (v < winM) winM = v;
+      winH = (winH + 1) % WIN_N; winC--;
+    }
+  }
+  function winNote(t, g) {
+    winAge(t);
+    if (winC === WIN_N) { const v = winG[winH] - WIN_RATE * winT[winH]; if (v < winM) winM = v; winH = (winH + 1) % WIN_N; winC--; }
+    const k = (winH + winC) % WIN_N; winT[k] = t; winG[k] = g; winC++;
+  }
+  // the earliest wall time the NEXT frame may END, if it advances the guest gNext ms in all
+  function winEarliestEnd(gNext) {
+    let T = winM === Infinity ? 0 : (gNext - winM) / WIN_RATE;
+    const lim = WIN_RATE * WIN_MS;
+    for (let i = 0; i < winC; i++) {
+      const k = (winH + i) % WIN_N, dg = gNext - winG[k];
+      if (dg > lim) { const e = winT[k] + dg / WIN_RATE; if (e > T) T = e; } else break;   // G rises with i
+    }
+    return T;
   }
   // ---------------------------------------------------------------------------
   // LOCKSTEP PUMP (2026-09-08). Online play used to mean ONE emulator: the host
@@ -1543,6 +1594,9 @@
       // of sprinting or stalling to catch up.
       const nowW = t1;
       const cyc = Module._flycast_guest_cycles();
+      let gF = 0;   // this frame's guest advance, ms
+      if (wPrevCyc >= 0) { const dc = cyc - wPrevCyc; if (dc > 0 && dc < SH4_HZ) { gF = dc / SH4_HZ * 1000; wClock += gF; } }
+      wPrevCyc = cyc;
       if (!paceBaseWall) { paceBaseWall = nowW; paceBaseCyc = cyc; }
       const lead = (cyc - paceBaseCyc) / SH4_HZ * 1000 - (nowW - paceBaseWall);
       // THE CONTRACT: the guest clock tracks the wall clock from the anchor —
@@ -1592,6 +1646,14 @@
         if (-lead > paceMaxLagMs) paceMaxLagMs = -lead;
         delay = Math.max(0, Math.min(50, lead));
       }
+      if (lockstep && lsAckF >= 0) {
+        winNote(nowW, wClock);
+        if (lsPace && !curRb && gF > 0) {
+          // the next frame is assumed to advance as much as this one and to take as long
+          const wait = winEarliestEnd(wClock + gF) - (t1 - t0) - nowW;
+          if (wait > delay) { winHeld++; winHeldMs += wait - Math.max(0, delay); delay = Math.min(wait, 250); }
+        }
+      }
     } else {
       // uncap: TRUE free-run (lever-11 rig fix, 2026-08-28). The historical
       // `FRAME_MS - elapsed` limiter here silently capped "uncapped" probes
@@ -1606,10 +1668,10 @@
       if (curRb) {
         const pm = t1 - t0;
         rbStats.presentMs = rbStats.presentMs ? rbStats.presentMs + (pm - rbStats.presentMs) / 32 : pm;
-        postMessage({ cmd: 'lsFrame', f: lsAckF, due: performance.timeOrigin + t1 + (delay > 1 ? delay : 0),
+        postMessage({ cmd: 'lsFrame', f: lsAckF, due: performance.timeOrigin + t1 + (delay > 1 ? delay : 0), gk: wClock,
                       st: +(rbStats.stepMs || rbStats.presentMs + rbStats.saveMs).toFixed(2),
                       sp: +(rbStats.presentMs + rbStats.saveMs).toFixed(2) });
-      } else postMessage({ cmd: 'lsFrame', f: lsAckF, due: performance.timeOrigin + t1 + (delay > 1 ? delay : 0) });
+      } else postMessage({ cmd: 'lsFrame', f: lsAckF, due: performance.timeOrigin + t1 + (delay > 1 ? delay : 0), gk: wClock });
     }
     // Only the delay we ASKED for counts as given-back time. setTimeout
     // overshoot lands in the unattributed remainder, so headroom stays a floor.
@@ -1727,6 +1789,8 @@
         lsStallSince = 0;
         lsHashEvery = data.hashEvery == null ? 60 : (data.hashEvery | 0);
         lsRepay = data.repay == null ? true : !!data.repay;
+        lsPace = data.pace == null ? true : !!data.pace;
+        winHeld = 0; winHeldMs = 0;
         lsStats.frames = 0; lsStats.stalls = 0; lsStats.stallMs = 0;
         lsStats.maxStallMs = 0; lsStats.queued = 0; lsStats.dropped = 0;
         resetPace();
@@ -1830,7 +1894,8 @@
         postMessage({ cmd: 'lsStats', on: lockstep ? 1 : 0, f: lsFrame,
                       queued: lsQueue.size, frames: lsStats.frames, stalls: lsStats.stalls,
                       stallMs: Math.round(lsStats.stallMs), maxStallMs: Math.round(lsStats.maxStallMs),
-                      accepted: lsStats.queued, dropped: lsStats.dropped });
+                      accepted: lsStats.queued, dropped: lsStats.dropped,
+                      paceOn: lsPace ? 1 : 0, paceHeld: winHeld, paceHeldMs: Math.round(winHeldMs), clock: wClock });
         break;
       }
       // HOW MANY CONTROLLERS TO PRESENT. One per player in the room.
@@ -1934,6 +1999,7 @@
           const wholeParts = new Map();     // partIdx -> Uint8Array (server ignored Range)
 
           function httpRange(url, from, to) {
+            const tq = performance.now();
             const xhr = new XMLHttpRequest();
             xhr.open('GET', url, false);    // sync XHR is legal in a worker
             xhr.setRequestHeader('Range', 'bytes=' + from + '-' + to);
@@ -1941,6 +2007,8 @@
             xhr.send(null);
             if (!(xhr.status >= 200 && xhr.status < 300 || xhr.status === 304))
               throw new Error('disc range fetch failed: ' + url + ' ' + xhr.status);
+            // the emulator thread's wait on the network, the cost a miss puts on the guest
+            const wq = performance.now() - tq; lazyStats.syncN++; lazyStats.syncMs += wq; if (wq > lazyStats.syncMaxMs) lazyStats.syncMaxMs = wq;
             return { bytes: new Uint8Array(xhr.response), partial: xhr.status === 206 };
           }
 

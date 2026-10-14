@@ -139,6 +139,7 @@ const NOHOOK = has('nohook');
 // sees as a stall; a timing measurement must not carry it. The verdict then
 // rests on the engine's fingerprints, as with --nohook.
 const NORAM = has('noram');
+const SECHASH = has('sechash');   // per-savestate-section hashes on every rbHash row (rollback rooms)
 const BOOT_MS = +flag('bootms', '420000');
 const CHROME = process.env.CHROME_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
 const OUT = '/tmp/dc-soak';
@@ -322,7 +323,20 @@ function workerHookSrc(prerollN) {
           }
         } catch (e) { S.err = 'rb hash threw: ' + (e && e.message || e); }
         S.hashMs += performance.now() - t0; S.hashN++;
-        S.rows.push({ f: msg.f, h: msg.h >>> 0, ram, cyc: M._flycast_guest_cycles(), t: performance.timeOrigin + t0, burns: null, w: null, rb: 1 });
+        // --sechash: one FNV per savestate SECTION (core/serialize.cpp SER_MARK order), so a fork is
+        // attributed to its owning subsystem at the first confirmed frame it shows in
+        let sec = null;
+        if (${SECHASH ? 'true' : 'false'}) try {
+          const R = self.__dcRb, p = R ? R.slot((msg.f | 0) + 1) : 0;
+          const sp = M._flycast_ser_sections() >>> 2, n = M.HEAPU32[sp];
+          if (p && n > 0) {
+            const offs = []; for (let i = 1; i <= n; i++) offs.push(M.HEAPU32[sp + i]);
+            const end = M._emscripten_state_size() >>> 0; offs.push(end);
+            sec = [];
+            for (let i = 0; i < n; i++) sec.push(offs[i + 1] > offs[i] ? (M._emscripten_rb_hash(p + offs[i], offs[i + 1] - offs[i]) >>> 0) : 0);
+          }
+        } catch (e) { S.err = 'sec hash threw: ' + (e && e.message || e); }
+        S.rows.push({ f: msg.f, h: msg.h >>> 0, ram, sec, cyc: M._flycast_guest_cycles(), t: performance.timeOrigin + t0, burns: null, w: null, rb: 1 });
         if (S.rows.length > 20000) S.rows.shift();
       }
       if (msg && msg.cmd === 'lsHash') {
@@ -701,18 +715,24 @@ try {
       say(`DESYNC  ${k}: ${J(d).slice(0, 1600)}`);
     // ---- compare the RAM detector ----
     const byF = new Map(); for (const r of (RJ.rows || [])) byF.set(r.f, r);
-    let compared = 0, ramBad = 0, wBad = 0, firstRam = null, firstW = null, nullRam = 0;
+    let compared = 0, ramBad = 0, wBad = 0, firstRam = null, firstW = null, nullRam = 0; const secDiffs = [];
     for (const r of (RH.rows || [])) {
       const o = byF.get(r.f); if (!o) continue;
       if (r.ram == null || o.ram == null) { nullRam++; continue; }
       compared++;
       if (r.ram !== o.ram) { ramBad++; if (firstRam == null) firstRam = { f: r.f, host: r.ram, joiner: o.ram }; }
       if (r.h !== o.h) { wBad++; if (firstW == null) firstW = { f: r.f, host: r.w, joiner: o.w }; }
+      if (r.sec && o.sec) {
+        const NAMES = ['aica', 'sb', 'nvmem', 'gdrom', 'mcfg', 'pvr', 'sh4', 'bba+modem', 'serialize2', 'libGDR', 'naomi', 'tail'];
+        const bad = []; for (let i = 0; i < Math.min(r.sec.length, o.sec.length); i++) if (r.sec[i] !== o.sec[i]) bad.push(NAMES[i] || ('s' + i));
+        if (bad.length && secDiffs.length < 6) secDiffs.push({ f: r.f, sections: bad });
+      }
     }
+    if (secDiffs.length) for (const d of secDiffs) say(`SECTION DIFF @f${d.f}: ${d.sections.join(', ')}`);
     const hr = RH.rows || [];
     if (hr.length > 1 && c0 != null) RESULT.guestSecondsByCycles = +((hr[hr.length - 1].cyc - c0) / 200e6).toFixed(1);
     const burns = hr.length ? { first: hr[0].burns, last: hr[hr.length - 1].burns } : null;
-    RESULT.ramDetector = { compared, ramMismatches: ramBad, fingerprintMismatches: wBad, firstRam, firstW, nullRam,
+    RESULT.ramDetector = { secDiffs, compared, ramMismatches: ramBad, fingerprintMismatches: wBad, firstRam, firstW, nullRam,
                            hostRows: hr.length, joinerRows: (RJ.rows || []).length, lastFrame: hr.length ? hr[hr.length - 1].f : null,
                            hostBase: RH.base, joinerBase: RJ.base, hostCands: RH.cands, joinerCands: RJ.cands,
                            verifyBad: { host: RH.verifyBad, joiner: RJ.verifyBad }, err: { host: RH.err, joiner: RJ.err },
