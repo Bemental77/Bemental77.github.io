@@ -145,6 +145,38 @@ Still ~2.2x short. None of these is in place: SH4 dispatch/lookup is ~10 %,
 ARM7 + AICA ~21 % (batching samples per callback, or its own deterministic
 thread), and the emitted code itself ~49 % (codegen, not plumbing).
 
+## Update 2026-10-14 (later) — the GL stream offload: big solo headroom, neutral on the toaster
+
+`flycast_worker.js` GLRec + `dreamcast/flycast_libretro/dc_render_worker.js`
+(default ON, `?glsplit=0` = control). The core's GL calls are recorded on the
+emulation thread and replayed by a second worker that owns the canvas.
+
+Why: a picture presented from a thread holds that thread until the GPU process
+has rasterised it. Micro-rig (`dcrb-present.mjs`, SwiftShader, 8 ms of CPU work
++ one 200-quad picture per task): drawn on the working thread 41 tasks/s with
+14.7 ms held per picture; drawn by a second worker 122 tasks/s (the no-draw
+ceiling is 124) at the same ~40 pictures/s. The hold grows with raster work
+(2.2 ms at 1 quad, 130 ms at 2000), and a `gl.flush()` before the work does
+not overlap it.
+
+Measured (same box, load 1-5, interleaved, PSO Pioneer 2 lobby state, 1.000x):
+
+| arm | duty | emu | render-hold | pictures/s |
+|---|---|---|---|---|
+| split a / b | 52.5 / 51.0% | 51.3 / 49.4% | 1.2 / 1.6% | 16.1 / 16.5 |
+| control a / b | 87.5 / 86.8% | 38.2 / 37.5% | 49.3 / 49.3% | 12.9 / 13.3 |
+
+Emu time per guest second rises 30% (CPU contention with the now-concurrent
+raster; the recorder itself is ~3% of the worker in a profile). Gauntlet cold
+boot: duty 83% (emu 80.7 + hold 2.3) vs ~98-100%.
+
+What it does NOT move: a two-browser room on this 4-core box (all cores are
+already busy; split 0.907/0.912 and 0.908/0.911 vs control 0.919/0.923 and
+0.920/0.913) and the toaster gate at rate 6.2 (render-hold there is ~3%; solo
+0.576/0.593 vs control 0.577/0.622, room 0.242/0.154 at load 20 vs
+0.248/0.255). Rollback rig 45/45 EXACT, lockstep and forced-rollback PSO soaks
+IN SYNC, Gauntlet room 0 desyncs.
+
 ## Status
 
 - [x] Split measured: solo at 1 and 6.2, room at 6.2 for 60 s, and a worker

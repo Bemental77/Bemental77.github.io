@@ -2346,7 +2346,9 @@
   // The probe fetches the same cache-busted URL the Worker will load, so the
   // worker script itself is normally served from the HTTP cache (49 KB shim).
   // ---------------------------------------------------------------------------
-  const WORKER_URL = '/dreamcast/flycast_libretro/flycast_worker.js?v=' + Date.now();
+  const WORKER_URL = '/dreamcast/flycast_libretro/flycast_worker.js?v=' + Date.now() +
+    (/[?&]glcount=1/.test(location.search) ? '&glcount=1' : '') +   // DIAG: per-call WebGL inventory (worker)
+    (/[?&]glsplit=0/.test(location.search) ? '&glsplit=0' : '');     // ?glsplit=0: control — the core draws on its own thread (flycast_worker.js GLRec)
   const caps = { heapAlloc: false, lazyDisc: false, probed: false };
   const capsPromise = fetch(WORKER_URL).then((r) => {
     if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -5535,6 +5537,7 @@
     recoverchain:'guest-crash rewind keeps chaining ON',
     rteintc:     'legacy per-block RTE UpdateINTC',
     noshard:     'shard dispatch OFF',
+    glsplit:     'GL stream offload changed (?glsplit=0: the core draws on its emulation thread)',
     shard:       'shard dispatch forced ON',
     noarm7jit:   'ARM7 JIT OFF',
     noic:        'inline caches OFF',
