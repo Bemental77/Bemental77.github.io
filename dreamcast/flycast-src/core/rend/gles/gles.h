@@ -662,6 +662,7 @@ struct OpenGLRenderer : Renderer
 
 	bool Present() override
 	{
+		extern int g_rbdbg[8]; g_rbdbg[2]++; if (!frameRendered) g_rbdbg[3]++; if (clearLastFrame) g_rbdbg[4]++;
 		if (!frameRendered || clearLastFrame)
 			return false;
 #ifndef LIBRETRO
