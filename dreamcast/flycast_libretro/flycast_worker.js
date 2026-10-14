@@ -67,7 +67,8 @@
   // into flycast_worker_emcc.js at link time and the core cannot be relinked on
   // the box that owns it; this shim ships as-is.
   // ---------------------------------------------------------------------------
-  self.__dcJitNames = /[?&]jitnames=1/.test(self.location.search);   // DIAG: name emitted blocks by guest PC (flycast_worker_funcs.js)
+  self.__dcJitDump = (/[?&]jitdump=(all|[0-9a-f]+)/.exec(self.location.search) || [])[1] || '';   // DIAG: dump the module holding this block
+  self.__dcJitNames = /[?&]jitnames=1/.test(self.location.search) || !!self.__dcJitDump;   // DIAG: name emitted blocks by guest PC (flycast_worker_funcs.js)
   // ?glcount=1 (page -> worker URL): DIAG, count every WebGL2 call the core makes and the
   // wall time inside each, printed every 5 s as calls/s and ms/s — the inventory a GL-stream
   // offload has to cover (which calls are per-frame, which ones block).

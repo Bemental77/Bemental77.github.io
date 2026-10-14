@@ -779,7 +779,6 @@ async function createWasm() {
   // performing other necessary setup
   function receiveInstance(instance, module) {
     wasmExports = instance.exports;
-    wasmExports = Asyncify.instrumentWasmExports(wasmExports);
     wasmExports = applySignatureConversions(wasmExports);
     registerTLSInit(wasmExports["Mh"]);
     assignWasmExports(wasmExports);
@@ -1191,8 +1190,6 @@ var PThread = {
 
 var onPostRuns = [];
 
-var dynCalls = {};
-
 function establishStackSpace(pthread_ptr) {
   var stackHigh = (growMemViews(), HEAPU32)[(((pthread_ptr) + (48)) >>> 2) >>> 0];
   var stackSize = (growMemViews(), HEAPU32)[(((pthread_ptr) + (52)) >>> 2) >>> 0];
@@ -1239,6 +1236,16 @@ function establishStackSpace(pthread_ptr) {
   }
 }
 
+var wasmTableMirror = [];
+
+var getWasmTableEntry = funcPtr => {
+  var func = wasmTableMirror[funcPtr];
+  if (!func) {
+    /** @suppress {checkTypes} */ wasmTableMirror[funcPtr] = func = wasmTable.get(funcPtr);
+  }
+  return func;
+};
+
 var invokeEntryPoint = (ptr, arg) => {
   // An old thread on this worker may have been canceled without returning the
   // `runtimeKeepaliveCounter` to zero. Reset it now so the new thread won't
@@ -1260,7 +1267,7 @@ var invokeEntryPoint = (ptr, arg) => {
   // *ThreadMain(void *arg) form, or try linking with the Emscripten linker
   // flag -sEMULATE_FUNCTION_POINTER_CASTS to add in emulation for this x86
   // ABI extension.
-  var result = (a1 => dynCall_ii(ptr, a1))(arg);
+  var result = getWasmTableEntry(ptr)(arg);
   function finish(result) {
     // In MINIMAL_RUNTIME the noExitRuntime concept does not apply to
     // pthreads. To exit a pthread with live runtime, use the function
@@ -1330,10 +1337,10 @@ var INT53_MIN = -9007199254740992;
 
 var bigintToI53Checked = num => (num < INT53_MIN || num > INT53_MAX) ? NaN : Number(num);
 
-var ___call_sighandler = function(fp, sig) {
+function ___call_sighandler(fp, sig) {
   fp >>>= 0;
-  return (a1 => dynCall_vi(fp, a1))(sig);
-};
+  return getWasmTableEntry(fp)(sig);
+}
 
 var exceptionCaught = [];
 
@@ -5740,26 +5747,21 @@ var doPollAsync = (fds, nfds, timeout) => {
   return promise;
 };
 
-var ___syscall_poll = function(fds, nfds, timeout) {
+function ___syscall_poll(fds, nfds, timeout) {
   if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(20, 0, 2, fds, nfds, timeout);
-  let innerFunc = () => {
-    fds >>>= 0;
-    try {
-      const isAsyncContext = PThread.currentProxiedOperationCallerThread;
-      if (isAsyncContext) {
-        return doPollAsync(fds, nfds, timeout);
-      }
-      var count = doPoll(fds, nfds, 0, undefined);
-      return count;
-    } catch (e) {
-      if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
-      return -e.errno;
+  fds >>>= 0;
+  try {
+    const isAsyncContext = PThread.currentProxiedOperationCallerThread;
+    if (isAsyncContext) {
+      return doPollAsync(fds, nfds, timeout);
     }
-  };
-  return Asyncify.handleAsync(innerFunc);
-};
-
-___syscall_poll.isAsync = true;
+    var count = doPoll(fds, nfds, 0, undefined);
+    return count;
+  } catch (e) {
+    if (typeof FS == "undefined" || !(e.name === "ErrnoError")) throw e;
+    return -e.errno;
+  }
+}
 
 function ___syscall_poll_nonblocking(fds, nfds) {
   if (ENVIRONMENT_IS_PTHREAD) return proxyToMainThread(21, 0, 1, fds, nfds);
@@ -10103,225 +10105,6 @@ function _llvm_eh_typeid_for(type) {
   return type;
 }
 
-var runAndAbortIfError = func => {
-  try {
-    return func();
-  } catch (e) {
-    abort(e);
-  }
-};
-
-var runtimeKeepalivePop = () => {
-  runtimeKeepaliveCounter -= 1;
-};
-
-var Asyncify = {
-  instrumentWasmImports(imports) {
-    var importPattern = /^(invoke_.*|__asyncjs__.*)$/;
-    for (let [x, original] of Object.entries(imports)) {
-      if (typeof original == "function") {
-        let isAsyncifyImport = original.isAsync || importPattern.test(x);
-      }
-    }
-  },
-  instrumentFunction(original) {
-    var wrapper = (...args) => {
-      Asyncify.exportCallStack.push(original);
-      try {
-        return original(...args);
-      } finally {
-        if (!ABORT) {
-          var top = Asyncify.exportCallStack.pop();
-          Asyncify.maybeStopUnwind();
-        }
-      }
-    };
-    Asyncify.funcWrappers.set(original, wrapper);
-    return wrapper;
-  },
-  instrumentWasmExports(exports) {
-    var ret = {};
-    for (let [x, original] of Object.entries(exports)) {
-      if (typeof original == "function") {
-        var wrapper = Asyncify.instrumentFunction(original);
-        ret[x] = wrapper;
-      } else {
-        ret[x] = original;
-      }
-    }
-    return ret;
-  },
-  State: {
-    Normal: 0,
-    Unwinding: 1,
-    Rewinding: 2,
-    Disabled: 3
-  },
-  state: 0,
-  StackSize: 131072,
-  currData: null,
-  handleSleepReturnValue: 0,
-  exportCallStack: [],
-  callstackFuncToId: new Map,
-  callStackIdToFunc: new Map,
-  funcWrappers: new Map,
-  callStackId: 0,
-  asyncPromiseHandlers: null,
-  sleepCallbacks: [],
-  getCallStackId(func) {
-    if (!Asyncify.callstackFuncToId.has(func)) {
-      var id = Asyncify.callStackId++;
-      Asyncify.callstackFuncToId.set(func, id);
-      Asyncify.callStackIdToFunc.set(id, func);
-    }
-    return Asyncify.callstackFuncToId.get(func);
-  },
-  maybeStopUnwind() {
-    if (Asyncify.currData && Asyncify.state === Asyncify.State.Unwinding && Asyncify.exportCallStack.length === 0) {
-      // We just finished unwinding.
-      // Be sure to set the state before calling any other functions to avoid
-      // possible infinite recursion here (For example in debug pthread builds
-      // the dbg() function itself can call back into WebAssembly to get the
-      // current pthread_self() pointer).
-      Asyncify.state = Asyncify.State.Normal;
-      runtimeKeepalivePush();
-      // Keep the runtime alive so that a re-wind can be done later.
-      runAndAbortIfError(_asyncify_stop_unwind);
-      if (typeof Fibers != "undefined") {
-        Fibers.trampoline();
-      }
-    }
-  },
-  whenDone() {
-    return new Promise((resolve, reject) => {
-      Asyncify.asyncPromiseHandlers = {
-        resolve,
-        reject
-      };
-    });
-  },
-  allocateData() {
-    // An asyncify data structure has three fields:
-    //  0  current stack pos
-    //  4  max stack pos
-    //  8  id of function at bottom of the call stack (callStackIdToFunc[id] == wasm func)
-    // The Asyncify ABI only interprets the first two fields, the rest is for the runtime.
-    // We also embed a stack in the same memory region here, right next to the structure.
-    // This struct is also defined as asyncify_data_t in emscripten/fiber.h
-    var ptr = _malloc(12 + Asyncify.StackSize);
-    Asyncify.setDataHeader(ptr, ptr + 12, Asyncify.StackSize);
-    Asyncify.setDataRewindFunc(ptr);
-    return ptr;
-  },
-  setDataHeader(ptr, stack, stackSize) {
-    (growMemViews(), HEAPU32)[((ptr) >>> 2) >>> 0] = stack;
-    (growMemViews(), HEAPU32)[(((ptr) + (4)) >>> 2) >>> 0] = stack + stackSize;
-  },
-  setDataRewindFunc(ptr) {
-    var bottomOfCallStack = Asyncify.exportCallStack[0];
-    var rewindId = Asyncify.getCallStackId(bottomOfCallStack);
-    (growMemViews(), HEAP32)[(((ptr) + (8)) >>> 2) >>> 0] = rewindId;
-  },
-  getDataRewindFunc(ptr) {
-    var id = (growMemViews(), HEAP32)[(((ptr) + (8)) >>> 2) >>> 0];
-    var func = Asyncify.callStackIdToFunc.get(id);
-    return func;
-  },
-  doRewind(ptr) {
-    var original = Asyncify.getDataRewindFunc(ptr);
-    var func = Asyncify.funcWrappers.get(original);
-    // Once we have rewound and the stack we no longer need to artificially
-    // keep the runtime alive.
-    runtimeKeepalivePop();
-    return callUserCallback(func);
-  },
-  handleSleep(startAsync) {
-    if (ABORT) return;
-    if (Asyncify.state === Asyncify.State.Normal) {
-      // Prepare to sleep. Call startAsync, and see what happens:
-      // if the code decided to call our callback synchronously,
-      // then no async operation was in fact begun, and we don't
-      // need to do anything.
-      var reachedCallback = false;
-      var reachedAfterCallback = false;
-      startAsync((handleSleepReturnValue = 0) => {
-        if (ABORT) return;
-        Asyncify.handleSleepReturnValue = handleSleepReturnValue;
-        reachedCallback = true;
-        if (!reachedAfterCallback) {
-          // We are happening synchronously, so no need for async.
-          return;
-        }
-        Asyncify.state = Asyncify.State.Rewinding;
-        runAndAbortIfError(() => _asyncify_start_rewind(Asyncify.currData));
-        if (typeof MainLoop != "undefined" && MainLoop.func) {
-          MainLoop.resume();
-        }
-        var asyncWasmReturnValue, isError = false;
-        try {
-          asyncWasmReturnValue = Asyncify.doRewind(Asyncify.currData);
-        } catch (err) {
-          asyncWasmReturnValue = err;
-          isError = true;
-        }
-        // Track whether the return value was handled by any promise handlers.
-        var handled = false;
-        if (!Asyncify.currData) {
-          // All asynchronous execution has finished.
-          // `asyncWasmReturnValue` now contains the final
-          // return value of the exported async WASM function.
-          // Note: `asyncWasmReturnValue` is distinct from
-          // `Asyncify.handleSleepReturnValue`.
-          // `Asyncify.handleSleepReturnValue` contains the return
-          // value of the last C function to have executed
-          // `Asyncify.handleSleep()`, whereas `asyncWasmReturnValue`
-          // contains the return value of the exported WASM function
-          // that may have called C functions that
-          // call `Asyncify.handleSleep()`.
-          var asyncPromiseHandlers = Asyncify.asyncPromiseHandlers;
-          if (asyncPromiseHandlers) {
-            Asyncify.asyncPromiseHandlers = null;
-            (isError ? asyncPromiseHandlers.reject : asyncPromiseHandlers.resolve)(asyncWasmReturnValue);
-            handled = true;
-          }
-        }
-        if (isError && !handled) {
-          // If there was an error and it was not handled by now, we have no choice but to
-          // rethrow that error into the global scope where it can be caught only by
-          // `onerror` or `onunhandledpromiserejection`.
-          throw asyncWasmReturnValue;
-        }
-      });
-      reachedAfterCallback = true;
-      if (!reachedCallback) {
-        // A true async operation was begun; start a sleep.
-        Asyncify.state = Asyncify.State.Unwinding;
-        // TODO: reuse, don't alloc/free every sleep
-        Asyncify.currData = Asyncify.allocateData();
-        if (typeof MainLoop != "undefined" && MainLoop.func) {
-          MainLoop.pause();
-        }
-        runAndAbortIfError(() => _asyncify_start_unwind(Asyncify.currData));
-      }
-    } else if (Asyncify.state === Asyncify.State.Rewinding) {
-      // Stop a resume.
-      Asyncify.state = Asyncify.State.Normal;
-      runAndAbortIfError(_asyncify_stop_rewind);
-      _free(Asyncify.currData);
-      Asyncify.currData = null;
-      // Call all sleep callbacks now that the sleep-resume is all done.
-      Asyncify.sleepCallbacks.forEach(callUserCallback);
-    } else {
-      abort(`invalid state: ${Asyncify.state}`);
-    }
-    return Asyncify.handleSleepReturnValue;
-  },
-  handleAsync: startAsync => Asyncify.handleSleep(async wakeUp => {
-    // TODO: add error handling as a second param when handleSleep implements it.
-    wakeUp(await startAsync());
-  })
-};
-
 var getCFunc = ident => {
   var func = Module["_" + ident];
   // closure exported function
@@ -10383,27 +10166,12 @@ var stringToUTF8OnStack = str => {
       }
     }
   }
-  // Data for a previous async operation that was in flight before us.
-  var previousAsync = Asyncify.currData;
   var ret = func(...cArgs);
   function onDone(ret) {
-    runtimeKeepalivePop();
     if (stack !== 0) stackRestore(stack);
     return convertReturnValue(ret);
   }
-  var asyncMode = opts?.async;
-  // Keep the runtime alive through all calls. Note that this call might not be
-  // async, but for simplicity we push and pop in all calls.
-  runtimeKeepalivePush();
-  if (Asyncify.currData != previousAsync) {
-    // This is a new async operation. The wasm is paused and has unwound its stack.
-    // We need to return a Promise that resolves the return value
-    // once the stack is rewound and execution finishes.
-    return Asyncify.whenDone().then(onDone);
-  }
   ret = onDone(ret);
-  // If this is an async ccall, ensure we return a promise
-  if (asyncMode) return Promise.resolve(ret);
   return ret;
 };
 
@@ -11140,7 +10908,7 @@ function wasm_dispatcher_get_last_error(dst, max_len) {
 }
 
 // Imports from the Wasm binary.
-var _flycast_guest_cycles, _flycast_keep_pthread_runtime, __emscripten_thread_free_data, __emscripten_thread_crashed, _emscripten_create_gl_context, _emscripten_worker_init, _emscripten_load_disc, _flycast_run_iter_flag_ptr, _flycast_flash_ptr, _flycast_flash_size, _flycast_flash_gen, _flycast_vmu_ptr, _flycast_vmu_size, _flycast_vmu_gen, _flycast_vmu_ports, _emscripten_run_iter, _flycast_rb_reset_host_history, _emscripten_reset, _flycast_lockstep_reset, _emscripten_get_maple_ptr, _emscripten_set_player_ports, _emscripten_get_player_ports, _emscripten_get_port_polls, _emscripten_save_state, _free, _sh4_import_fnptrs, _sh4_jit_lookup_idx, _sh4_interp_shil_fb, _sh4_interp_ifb, _sh4_mem_write32, _sh4_mem_write16, _sh4_mem_write8, _sh4_mem_read32, _sh4_mem_read16, _sh4_mem_read8, _emscripten_parity_begin, _malloc, _flycast_ic_invalidate, _flycast_set_ic, _flycast_shard_seal_now, _emscripten_parity_tick, _emscripten_load_state, _emscripten_rb_mute_audio, _emscripten_state_size, _emscripten_save_state_into, _emscripten_set_rollback_mode, _flycast_set_rollback_mode, _flycast_set_deterministic, _emscripten_rb_ram_offset, _emscripten_rb_hash, _emscripten_load_state_rollback, _flycast_rb_snapshot_code_pages, _flycast_rb_invalidate_changed, _emscripten_lockstep_normalize, _emscripten_set_video_target, _emscripten_set_audio_ring, _main, _flycast_set_chain, _flycast_set_shard, _flycast_set_idleskip, _flycast_diag_set, _flycast_diag_ifb, _flycast_get_sh4_pc, _flycast_ctx_snapshot, _flycast_set_interp_only, _flycast_interp_step_count, _flycast_set_mem_fastpaths, _flycast_set_regcache, _flycast_set_imm_fastpath, _flycast_set_sq_fp, _flycast_set_self_loop, _flycast_set_rte_intc, _flycast_set_interp_range, _flycast_set_pc_trace_until, _flycast_set_arm7jit, _flycast_set_arm7selftest, _pthread_self, _flycast_set_fog, _flycast_set_modvol, _htons, _htonl, _flycast_set_render_skip, _flycast_render_skips, _sh4_sched_debug_dump, _ntohs, _flycast_ser_sections, __emscripten_tls_init, _emscripten_builtin_memalign, __emscripten_thread_init, ___set_thread_state, __emscripten_run_js_on_main_thread_done, __emscripten_run_js_on_main_thread, __emscripten_thread_exit, __emscripten_check_mailbox, _setThrew, __emscripten_tempret_set, _emscripten_stack_set_limits, __emscripten_stack_restore, __emscripten_stack_alloc, _emscripten_stack_get_current, ___cxa_decrement_exception_refcount, ___cxa_increment_exception_refcount, ___cxa_can_catch, ___cxa_get_exception_ptr, dynCall_vi, dynCall_v, dynCall_iii, dynCall_viiii, dynCall_vii, dynCall_iiiii, dynCall_viii, dynCall_ii, dynCall_i, dynCall_viiiiii, dynCall_iiii, dynCall_d, dynCall_viiiii, dynCall_viffi, dynCall_iiiiiii, dynCall_ji, dynCall_iiji, dynCall_jiiji, dynCall_jiii, dynCall_jii, dynCall_jiiii, dynCall_if, dynCall_fi, dynCall_fff, dynCall_ff, dynCall_fii, dynCall_ffff, dynCall_iff, dynCall_vij, dynCall_viijii, dynCall_vji, dynCall_iiiiii, dynCall_jj, dynCall_iiij, dynCall_jiiiji, dynCall_iiiiiiiiiiii, dynCall_iiiiiiiii, dynCall_vffff, dynCall_vf, dynCall_viiiiiiii, dynCall_viiiiiiiii, dynCall_vff, dynCall_viiiiiii, dynCall_vfi, dynCall_viif, dynCall_vif, dynCall_viff, dynCall_vifff, dynCall_viffff, dynCall_vfff, dynCall_viiiiiiiiii, dynCall_viiiiiiiiiii, dynCall_viifi, dynCall_viij, dynCall_jiji, dynCall_iidiiiii, dynCall_iiiiiiii, dynCall_iiiiiiiiiii, dynCall_iiiiiiiiiiiii, dynCall_fiii, dynCall_diii, dynCall_viiiiiiiiiiiiiii, dynCall_iiiiij, dynCall_iiiiid, dynCall_iiiiijj, dynCall_iiiiiijj, _asyncify_start_unwind, _asyncify_stop_unwind, _asyncify_start_rewind, _asyncify_stop_rewind, __indirect_function_table, wasmTable;
+var _flycast_guest_cycles, _flycast_keep_pthread_runtime, __emscripten_thread_free_data, __emscripten_thread_crashed, _emscripten_create_gl_context, _emscripten_worker_init, _emscripten_load_disc, _flycast_run_iter_flag_ptr, _flycast_flash_ptr, _flycast_flash_size, _flycast_flash_gen, _flycast_vmu_ptr, _flycast_vmu_size, _flycast_vmu_gen, _flycast_vmu_ports, _emscripten_run_iter, _flycast_rb_reset_host_history, _emscripten_reset, _flycast_lockstep_reset, _emscripten_get_maple_ptr, _emscripten_set_player_ports, _emscripten_get_player_ports, _emscripten_get_port_polls, _emscripten_save_state, _free, _sh4_import_fnptrs, _sh4_jit_lookup_idx, _sh4_interp_shil_fb, _sh4_interp_ifb, _sh4_mem_write32, _sh4_mem_write16, _sh4_mem_write8, _sh4_mem_read32, _sh4_mem_read16, _sh4_mem_read8, _emscripten_parity_begin, _malloc, _flycast_ic_invalidate, _flycast_set_ic, _flycast_shard_seal_now, _emscripten_parity_tick, _emscripten_load_state, _emscripten_rb_mute_audio, _emscripten_state_size, _emscripten_save_state_into, _emscripten_set_rollback_mode, _flycast_set_rollback_mode, _flycast_set_deterministic, _emscripten_rb_ram_offset, _emscripten_rb_hash, _emscripten_load_state_rollback, _flycast_rb_snapshot_code_pages, _flycast_rb_invalidate_changed, _emscripten_lockstep_normalize, _emscripten_set_video_target, _emscripten_set_audio_ring, _main, _flycast_set_chain, _flycast_set_shard, _flycast_set_idleskip, _flycast_diag_set, _flycast_diag_ifb, _flycast_get_sh4_pc, _flycast_ctx_snapshot, _flycast_set_interp_only, _flycast_interp_step_count, _flycast_set_mem_fastpaths, _flycast_set_regcache, _flycast_set_imm_fastpath, _flycast_set_sq_fp, _flycast_set_self_loop, _flycast_set_rte_intc, _flycast_set_interp_range, _flycast_set_pc_trace_until, _flycast_set_arm7jit, _flycast_set_arm7selftest, _pthread_self, _flycast_set_fog, _flycast_set_modvol, _htons, _htonl, _flycast_set_render_skip, _flycast_render_skips, _sh4_sched_debug_dump, _ntohs, _flycast_ser_sections, __emscripten_tls_init, _emscripten_builtin_memalign, __emscripten_thread_init, ___set_thread_state, __emscripten_run_js_on_main_thread_done, __emscripten_run_js_on_main_thread, __emscripten_thread_exit, __emscripten_check_mailbox, _setThrew, __emscripten_tempret_set, _emscripten_stack_set_limits, __emscripten_stack_restore, __emscripten_stack_alloc, _emscripten_stack_get_current, ___cxa_decrement_exception_refcount, ___cxa_increment_exception_refcount, ___cxa_can_catch, ___cxa_get_exception_ptr, __indirect_function_table, wasmTable;
 
 function assignWasmExports(wasmExports) {
   _flycast_guest_cycles = Module["_flycast_guest_cycles"] = wasmExports["fg"];
@@ -11247,76 +11015,6 @@ function assignWasmExports(wasmExports) {
   ___cxa_increment_exception_refcount = wasmExports["$h"];
   ___cxa_can_catch = wasmExports["ai"];
   ___cxa_get_exception_ptr = wasmExports["bi"];
-  dynCall_vi = dynCalls["vi"] = wasmExports["ci"];
-  dynCall_v = dynCalls["v"] = wasmExports["di"];
-  dynCall_iii = dynCalls["iii"] = wasmExports["ei"];
-  dynCall_viiii = dynCalls["viiii"] = wasmExports["fi"];
-  dynCall_vii = dynCalls["vii"] = wasmExports["gi"];
-  dynCall_iiiii = dynCalls["iiiii"] = wasmExports["hi"];
-  dynCall_viii = dynCalls["viii"] = wasmExports["ii"];
-  dynCall_ii = dynCalls["ii"] = wasmExports["ji"];
-  dynCall_i = dynCalls["i"] = wasmExports["ki"];
-  dynCall_viiiiii = dynCalls["viiiiii"] = wasmExports["li"];
-  dynCall_iiii = dynCalls["iiii"] = wasmExports["mi"];
-  dynCall_d = dynCalls["d"] = wasmExports["ni"];
-  dynCall_viiiii = dynCalls["viiiii"] = wasmExports["oi"];
-  dynCall_viffi = dynCalls["viffi"] = wasmExports["pi"];
-  dynCall_iiiiiii = dynCalls["iiiiiii"] = wasmExports["qi"];
-  dynCall_ji = dynCalls["ji"] = wasmExports["ri"];
-  dynCall_iiji = dynCalls["iiji"] = wasmExports["si"];
-  dynCall_jiiji = dynCalls["jiiji"] = wasmExports["ti"];
-  dynCall_jiii = dynCalls["jiii"] = wasmExports["ui"];
-  dynCall_jii = dynCalls["jii"] = wasmExports["vi"];
-  dynCall_jiiii = dynCalls["jiiii"] = wasmExports["wi"];
-  dynCall_if = dynCalls["if"] = wasmExports["xi"];
-  dynCall_fi = dynCalls["fi"] = wasmExports["yi"];
-  dynCall_fff = dynCalls["fff"] = wasmExports["zi"];
-  dynCall_ff = dynCalls["ff"] = wasmExports["Ai"];
-  dynCall_fii = dynCalls["fii"] = wasmExports["Bi"];
-  dynCall_ffff = dynCalls["ffff"] = wasmExports["Ci"];
-  dynCall_iff = dynCalls["iff"] = wasmExports["Di"];
-  dynCall_vij = dynCalls["vij"] = wasmExports["Ei"];
-  dynCall_viijii = dynCalls["viijii"] = wasmExports["Fi"];
-  dynCall_vji = dynCalls["vji"] = wasmExports["Gi"];
-  dynCall_iiiiii = dynCalls["iiiiii"] = wasmExports["Hi"];
-  dynCall_jj = dynCalls["jj"] = wasmExports["Ii"];
-  dynCall_iiij = dynCalls["iiij"] = wasmExports["Ji"];
-  dynCall_jiiiji = dynCalls["jiiiji"] = wasmExports["Ki"];
-  dynCall_iiiiiiiiiiii = dynCalls["iiiiiiiiiiii"] = wasmExports["Li"];
-  dynCall_iiiiiiiii = dynCalls["iiiiiiiii"] = wasmExports["Mi"];
-  dynCall_vffff = dynCalls["vffff"] = wasmExports["Ni"];
-  dynCall_vf = dynCalls["vf"] = wasmExports["Oi"];
-  dynCall_viiiiiiii = dynCalls["viiiiiiii"] = wasmExports["Pi"];
-  dynCall_viiiiiiiii = dynCalls["viiiiiiiii"] = wasmExports["Qi"];
-  dynCall_vff = dynCalls["vff"] = wasmExports["Ri"];
-  dynCall_viiiiiii = dynCalls["viiiiiii"] = wasmExports["Si"];
-  dynCall_vfi = dynCalls["vfi"] = wasmExports["Ti"];
-  dynCall_viif = dynCalls["viif"] = wasmExports["Ui"];
-  dynCall_vif = dynCalls["vif"] = wasmExports["Vi"];
-  dynCall_viff = dynCalls["viff"] = wasmExports["Wi"];
-  dynCall_vifff = dynCalls["vifff"] = wasmExports["Xi"];
-  dynCall_viffff = dynCalls["viffff"] = wasmExports["Yi"];
-  dynCall_vfff = dynCalls["vfff"] = wasmExports["Zi"];
-  dynCall_viiiiiiiiii = dynCalls["viiiiiiiiii"] = wasmExports["_i"];
-  dynCall_viiiiiiiiiii = dynCalls["viiiiiiiiiii"] = wasmExports["$i"];
-  dynCall_viifi = dynCalls["viifi"] = wasmExports["aj"];
-  dynCall_viij = dynCalls["viij"] = wasmExports["bj"];
-  dynCall_jiji = dynCalls["jiji"] = wasmExports["cj"];
-  dynCall_iidiiiii = dynCalls["iidiiiii"] = wasmExports["dj"];
-  dynCall_iiiiiiii = dynCalls["iiiiiiii"] = wasmExports["ej"];
-  dynCall_iiiiiiiiiii = dynCalls["iiiiiiiiiii"] = wasmExports["fj"];
-  dynCall_iiiiiiiiiiiii = dynCalls["iiiiiiiiiiiii"] = wasmExports["gj"];
-  dynCall_fiii = dynCalls["fiii"] = wasmExports["hj"];
-  dynCall_diii = dynCalls["diii"] = wasmExports["ij"];
-  dynCall_viiiiiiiiiiiiiii = dynCalls["viiiiiiiiiiiiiii"] = wasmExports["jj"];
-  dynCall_iiiiij = dynCalls["iiiiij"] = wasmExports["kj"];
-  dynCall_iiiiid = dynCalls["iiiiid"] = wasmExports["lj"];
-  dynCall_iiiiijj = dynCalls["iiiiijj"] = wasmExports["mj"];
-  dynCall_iiiiiijj = dynCalls["iiiiiijj"] = wasmExports["nj"];
-  _asyncify_start_unwind = wasmExports["oj"];
-  _asyncify_stop_unwind = wasmExports["pj"];
-  _asyncify_start_rewind = wasmExports["qj"];
-  _asyncify_stop_rewind = wasmExports["rj"];
   __indirect_function_table = wasmTable = Module["wasmTable"] = wasmExports["lg"];
 }
 
@@ -11711,7 +11409,7 @@ function assignWasmImports() {
 function invoke_vi(index, a1) {
   var sp = stackSave();
   try {
-    dynCall_vi(index, a1);
+    getWasmTableEntry(index)(a1);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11722,7 +11420,7 @@ function invoke_vi(index, a1) {
 function invoke_ii(index, a1) {
   var sp = stackSave();
   try {
-    return dynCall_ii(index, a1);
+    return getWasmTableEntry(index)(a1);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11733,7 +11431,7 @@ function invoke_ii(index, a1) {
 function invoke_vii(index, a1, a2) {
   var sp = stackSave();
   try {
-    dynCall_vii(index, a1, a2);
+    getWasmTableEntry(index)(a1, a2);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11744,7 +11442,7 @@ function invoke_vii(index, a1, a2) {
 function invoke_v(index) {
   var sp = stackSave();
   try {
-    dynCall_v(index);
+    getWasmTableEntry(index)();
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11755,7 +11453,7 @@ function invoke_v(index) {
 function invoke_iiiii(index, a1, a2, a3, a4) {
   var sp = stackSave();
   try {
-    return dynCall_iiiii(index, a1, a2, a3, a4);
+    return getWasmTableEntry(index)(a1, a2, a3, a4);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11766,7 +11464,7 @@ function invoke_iiiii(index, a1, a2, a3, a4) {
 function invoke_iii(index, a1, a2) {
   var sp = stackSave();
   try {
-    return dynCall_iii(index, a1, a2);
+    return getWasmTableEntry(index)(a1, a2);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11777,7 +11475,7 @@ function invoke_iii(index, a1, a2) {
 function invoke_viiiiii(index, a1, a2, a3, a4, a5, a6) {
   var sp = stackSave();
   try {
-    dynCall_viiiiii(index, a1, a2, a3, a4, a5, a6);
+    getWasmTableEntry(index)(a1, a2, a3, a4, a5, a6);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11788,7 +11486,7 @@ function invoke_viiiiii(index, a1, a2, a3, a4, a5, a6) {
 function invoke_iiii(index, a1, a2, a3) {
   var sp = stackSave();
   try {
-    return dynCall_iiii(index, a1, a2, a3);
+    return getWasmTableEntry(index)(a1, a2, a3);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11799,7 +11497,7 @@ function invoke_iiii(index, a1, a2, a3) {
 function invoke_d(index) {
   var sp = stackSave();
   try {
-    return dynCall_d(index);
+    return getWasmTableEntry(index)();
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11810,7 +11508,7 @@ function invoke_d(index) {
 function invoke_viiiii(index, a1, a2, a3, a4, a5) {
   var sp = stackSave();
   try {
-    dynCall_viiiii(index, a1, a2, a3, a4, a5);
+    getWasmTableEntry(index)(a1, a2, a3, a4, a5);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11821,7 +11519,7 @@ function invoke_viiiii(index, a1, a2, a3, a4, a5) {
 function invoke_viii(index, a1, a2, a3) {
   var sp = stackSave();
   try {
-    dynCall_viii(index, a1, a2, a3);
+    getWasmTableEntry(index)(a1, a2, a3);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11832,7 +11530,7 @@ function invoke_viii(index, a1, a2, a3) {
 function invoke_viiii(index, a1, a2, a3, a4) {
   var sp = stackSave();
   try {
-    dynCall_viiii(index, a1, a2, a3, a4);
+    getWasmTableEntry(index)(a1, a2, a3, a4);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11843,7 +11541,7 @@ function invoke_viiii(index, a1, a2, a3, a4) {
 function invoke_iiiiii(index, a1, a2, a3, a4, a5) {
   var sp = stackSave();
   try {
-    return dynCall_iiiiii(index, a1, a2, a3, a4, a5);
+    return getWasmTableEntry(index)(a1, a2, a3, a4, a5);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11854,7 +11552,7 @@ function invoke_iiiiii(index, a1, a2, a3, a4, a5) {
 function invoke_i(index) {
   var sp = stackSave();
   try {
-    return dynCall_i(index);
+    return getWasmTableEntry(index)();
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11865,7 +11563,7 @@ function invoke_i(index) {
 function invoke_iiiiiii(index, a1, a2, a3, a4, a5, a6) {
   var sp = stackSave();
   try {
-    return dynCall_iiiiiii(index, a1, a2, a3, a4, a5, a6);
+    return getWasmTableEntry(index)(a1, a2, a3, a4, a5, a6);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11876,7 +11574,7 @@ function invoke_iiiiiii(index, a1, a2, a3, a4, a5, a6) {
 function invoke_iiiiiiii(index, a1, a2, a3, a4, a5, a6, a7) {
   var sp = stackSave();
   try {
-    return dynCall_iiiiiiii(index, a1, a2, a3, a4, a5, a6, a7);
+    return getWasmTableEntry(index)(a1, a2, a3, a4, a5, a6, a7);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11887,7 +11585,7 @@ function invoke_iiiiiiii(index, a1, a2, a3, a4, a5, a6, a7) {
 function invoke_jiiii(index, a1, a2, a3, a4) {
   var sp = stackSave();
   try {
-    return dynCall_jiiii(index, a1, a2, a3, a4);
+    return getWasmTableEntry(index)(a1, a2, a3, a4);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11899,7 +11597,7 @@ function invoke_jiiii(index, a1, a2, a3, a4) {
 function invoke_fiii(index, a1, a2, a3) {
   var sp = stackSave();
   try {
-    return dynCall_fiii(index, a1, a2, a3);
+    return getWasmTableEntry(index)(a1, a2, a3);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11910,7 +11608,7 @@ function invoke_fiii(index, a1, a2, a3) {
 function invoke_diii(index, a1, a2, a3) {
   var sp = stackSave();
   try {
-    return dynCall_diii(index, a1, a2, a3);
+    return getWasmTableEntry(index)(a1, a2, a3);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11921,7 +11619,7 @@ function invoke_diii(index, a1, a2, a3) {
 function invoke_viiiiiii(index, a1, a2, a3, a4, a5, a6, a7) {
   var sp = stackSave();
   try {
-    dynCall_viiiiiii(index, a1, a2, a3, a4, a5, a6, a7);
+    getWasmTableEntry(index)(a1, a2, a3, a4, a5, a6, a7);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11932,7 +11630,7 @@ function invoke_viiiiiii(index, a1, a2, a3, a4, a5, a6, a7) {
 function invoke_iiiiiiiiiiii(index, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11) {
   var sp = stackSave();
   try {
-    return dynCall_iiiiiiiiiiii(index, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+    return getWasmTableEntry(index)(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11943,7 +11641,7 @@ function invoke_iiiiiiiiiiii(index, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11
 function invoke_viiiiiiiiii(index, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10) {
   var sp = stackSave();
   try {
-    dynCall_viiiiiiiiii(index, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10);
+    getWasmTableEntry(index)(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11954,7 +11652,7 @@ function invoke_viiiiiiiiii(index, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10) {
 function invoke_viiiiiiiiiiiiiii(index, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15) {
   var sp = stackSave();
   try {
-    dynCall_viiiiiiiiiiiiiii(index, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15);
+    getWasmTableEntry(index)(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -12269,6 +11967,30 @@ function flycast_name_module(bytes, vaddrOf) {
     var res = new Uint8Array(bytes.length + out.length);
     res.set(bytes, 0);
     res.set(out, bytes.length);
+    // ?jitdump=<hex pc> (DIAG): post the whole named module that holds that block, base64 in chunks
+    if (self.__dcJitDump && !self.__dcJitDumped) {
+      for (var z = 0; z < exportsMap.length; z++) {
+        if (self.__dcJitDump === "all" || (vaddrOf(exportsMap[z][1]) >>> 0).toString(16) === self.__dcJitDump) {
+          if (self.__dcJitDump !== "all") self.__dcJitDumped = true;
+          var bin = "";
+          for (var y = 0; y < res.length; y++) bin += String.fromCharCode(res[y]);
+          var b64 = btoa(bin), CH = 6e3;
+          postMessage({
+            cmd: "print",
+            txt: "[jitdump] begin pc=" + self.__dcJitDump + " bytes=" + res.length + " chunks=" + Math.ceil(b64.length / CH)
+          });
+          for (var c = 0; c < b64.length; c += CH) postMessage({
+            cmd: "print",
+            txt: "[jitdump] " + (c / CH) + " " + b64.slice(c, c + CH)
+          });
+          postMessage({
+            cmd: "print",
+            txt: "[jitdump] end"
+          });
+          break;
+        }
+      }
+    }
     return res;
   } catch (e) {
     return bytes;
@@ -12471,7 +12193,7 @@ isPthread && flycastWorkerModule();
 
 // --- build-flavor marker — INJECTED by flycast_worker_link.sh, do not hand-edit ---
 if (typeof globalThis !== 'undefined' && globalThis.name !== 'em-pthread') {
-  var __flycastBuildMarker = '[build] flavor=RELEASE defines=none linked=2026-10-14T22:38:35Z (clean — perf, boot depth and wedge behavior are valid)';
+  var __flycastBuildMarker = '[build] flavor=RELEASE defines=none linked=2026-10-14T23:15:11Z (clean — perf, boot depth and wedge behavior are valid)';
   try { console.log(__flycastBuildMarker); } catch (e) {}
   try { postMessage({ cmd: 'print', txt: __flycastBuildMarker }); } catch (e) {}
 }

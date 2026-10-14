@@ -177,6 +177,26 @@ already busy; split 0.907/0.912 and 0.908/0.911 vs control 0.919/0.923 and
 0.248/0.255). Rollback rig 45/45 EXACT, lockstep and forced-rollback PSO soaks
 IN SYNC, Gauntlet room 0 desyncs.
 
+## Update 2026-10-14 (later still) — linked without asyncify: -6% emu, toaster solo 0.67x
+
+`flycast_worker_link.sh` now links `-sASYNCIFY=0` by default (`FLYCAST_ASYNCIFY=1`
+= the old instrumented build). Nothing in the shipped paths suspends. The wasm
+shrinks from 8.71 to 6.93 MB.
+
+- PSO Pioneer 2 lobby, three interleaved pairs from hermetic snapshots (load 3.5-5.6):
+  emu per guest second is 501 / 501 / 482 ms with asyncify and 464 / 463 / 469 ms without.
+- Gauntlet cold boot: 767 ms against 807.
+- Toaster rate 6.2, 2 reps at load ~20: solo 0.678 / 0.671 (was 0.576-0.622), room
+  0.259 / 0.273 (was 0.242-0.255).
+- Rollback rig 60/60 EXACT.
+- Soaks IN SYNC: PSO lockstep (61 checkpoints), PSO forced rollback (32), Gauntlet
+  forced rollback (48).
+
+A CPU profile with `?jitnames=1` (emitted blocks named `pc_<vaddr>`) shows the
+emitted SH4 code at 55% of busy time and FLAT: the hottest block is 1.2%, and the
+30th is 0.17%. The remaining dispatcher share is the SH4_TIMESLICE (448) round
+trip, about 446K a guest second.
+
 ## Status
 
 - [x] Split measured: solo at 1 and 6.2, room at 6.2 for 60 s, and a worker

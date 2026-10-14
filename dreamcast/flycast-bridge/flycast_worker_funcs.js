@@ -179,6 +179,20 @@ function flycast_name_module(bytes, vaddrOf) {
     var body = []; ws('name', body); body.push(1); wl(sub.length, body); for (var q = 0; q < sub.length; q++) body.push(sub[q]);
     out.push(0); wl(body.length, out); for (var r = 0; r < body.length; r++) out.push(body[r]);
     var res = new Uint8Array(bytes.length + out.length); res.set(bytes, 0); res.set(out, bytes.length);
+    // ?jitdump=<hex pc> (DIAG): post the whole named module that holds that block, base64 in chunks
+    if (self.__dcJitDump && !self.__dcJitDumped) {
+      for (var z = 0; z < exportsMap.length; z++) {
+        if (self.__dcJitDump === 'all' || (vaddrOf(exportsMap[z][1]) >>> 0).toString(16) === self.__dcJitDump) {
+          if (self.__dcJitDump !== 'all') self.__dcJitDumped = true;
+          var bin = ''; for (var y = 0; y < res.length; y++) bin += String.fromCharCode(res[y]);
+          var b64 = btoa(bin), CH = 6000;
+          postMessage({ cmd: 'print', txt: '[jitdump] begin pc=' + self.__dcJitDump + ' bytes=' + res.length + ' chunks=' + Math.ceil(b64.length / CH) });
+          for (var c = 0; c < b64.length; c += CH) postMessage({ cmd: 'print', txt: '[jitdump] ' + (c / CH) + ' ' + b64.slice(c, c + CH) });
+          postMessage({ cmd: 'print', txt: '[jitdump] end' });
+          break;
+        }
+      }
+    }
     return res;
   } catch (e) { return bytes; }
 }

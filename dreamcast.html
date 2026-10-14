@@ -2348,8 +2348,9 @@
   // ---------------------------------------------------------------------------
   const WORKER_URL = '/dreamcast/flycast_libretro/flycast_worker.js?v=' + Date.now() +
     (/[?&]glcount=1/.test(location.search) ? '&glcount=1' : '') +   // DIAG: per-call WebGL inventory (worker)
-    (/[?&]glsplit=0/.test(location.search) ? '&glsplit=0' : '') +
-    (/[?&]jitnames=1/.test(location.search) ? '&jitnames=1' : '');   // DIAG: emitted blocks named by guest PC in CPU profiles     // ?glsplit=0: control — the core draws on its own thread (flycast_worker.js GLRec)
+    (/[?&]glsplit=0/.test(location.search) ? '&glsplit=0' : '') +   // control: the core draws on its own thread (flycast_worker.js GLRec)
+    (/[?&]jitnames=1/.test(location.search) ? '&jitnames=1' : '') + // DIAG: emitted blocks named by guest PC in CPU profiles
+    ((/[?&]jitdump=(all|[0-9a-f]+)/.exec(location.search) || [''])[0].replace(/^\?/, '&'));   // DIAG: dump the module holding that block
   const caps = { heapAlloc: false, lazyDisc: false, probed: false };
   const capsPromise = fetch(WORKER_URL).then((r) => {
     if (!r.ok) throw new Error('HTTP ' + r.status);
