@@ -312,10 +312,19 @@ banner_flavor
 # proxied-pthread arm; the shim's suspension guards no-op when nothing
 # suspends. If boot/runtime needs a real suspension, the probe will show
 # exactly where — restructure that site instead (charter instruction).
-ASYNCIFY_FLAGS=(-sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=131072 -sASYNCIFY_REMOVE='["sh4_mem_read8","sh4_mem_read16","sh4_mem_read32","sh4_mem_write8","sh4_mem_write16","sh4_mem_write32","sh4_interp_ifb","sh4_interp_shil_fb","sh4_jit_lookup_idx","flycast_ctx_snapshot"]')
-if [ -n "${FLYCAST_NO_ASYNCIFY:-}" ]; then
-  ASYNCIFY_FLAGS=(-sASYNCIFY=0)
-  echo "link: FLYCAST_NO_ASYNCIFY=1 — lever-8 experimental arm (no asyncify instrumentation)"
+#
+# [2026-10-14] DEFAULT IS NOW NO ASYNCIFY. Measured, PSO Pioneer 2 lobby at
+# 1.000x, three interleaved pairs from hermetic snapshots (load 3.5-5.6): emu
+# 501 / 501 / 482 ms per guest second WITH the instrumentation, 464 / 463 / 469
+# without (-6%), and the wasm shrinks 8.71 -> 6.93 MB. Nothing in the shipped
+# paths suspends (no emscripten_sleep / EM_ASYNC_JS in the core or bridge; the
+# shim's runIterSuspended guards never fired in any probe/soak log). Boot,
+# rollback exactness and the room soaks were re-run on this binary.
+# FLYCAST_ASYNCIFY=1 links the old instrumented build (the control arm).
+ASYNCIFY_FLAGS=(-sASYNCIFY=0)
+if [ -n "${FLYCAST_ASYNCIFY:-}" ]; then
+  ASYNCIFY_FLAGS=(-sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=131072 -sASYNCIFY_REMOVE='["sh4_mem_read8","sh4_mem_read16","sh4_mem_read32","sh4_mem_write8","sh4_mem_write16","sh4_mem_write32","sh4_interp_ifb","sh4_interp_shil_fb","sh4_jit_lookup_idx","flycast_ctx_snapshot"]')
+  echo "link: FLYCAST_ASYNCIFY=1 — the old asyncify-instrumented build (control arm)"
 fi
 
 # ---------------------------------------------------------------------------

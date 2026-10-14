@@ -67,6 +67,8 @@
   // into flycast_worker_emcc.js at link time and the core cannot be relinked on
   // the box that owns it; this shim ships as-is.
   // ---------------------------------------------------------------------------
+  self.__dcJitDump = (/[?&]jitdump=(all|[0-9a-f]+)/.exec(self.location.search) || [])[1] || '';   // DIAG: dump the module holding this block
+  self.__dcJitNames = /[?&]jitnames=1/.test(self.location.search) || !!self.__dcJitDump;   // DIAG: name emitted blocks by guest PC (flycast_worker_funcs.js)
   // ?glcount=1 (page -> worker URL): DIAG, count every WebGL2 call the core makes and the
   // wall time inside each, printed every 5 s as calls/s and ms/s — the inventory a GL-stream
   // offload has to cover (which calls are per-frame, which ones block).
@@ -346,7 +348,29 @@
     const L = { tex2d: Object.create(null), unit: 0, ebo: null, abo: null, fbDraw: null, fbRead: null, rb: null, prog: null, vao: null, unpackAlign: 4, unpackRow: 0 };
     const RecProto = Object.create(null);
     for (const k of Object.getOwnPropertyNames(K)) { const d = Object.getOwnPropertyDescriptor(K, k); if (d && typeof d.value === 'number') RecProto[k] = d.value; }
-    const ex = (o) => (o instanceof GLObj) ? { o: o.o } : o;
+    const ex = (o) => o;   // GLObj handles are encoded by OpBuf (tag 1)
+    // ---- the batch encoding: one Float64Array of [name#, argc, (tag, value)*]
+    // plus a side list of blobs (typed arrays, strings), all transferred — a
+    // structured clone of nested arrays cost ~4.7% of this thread (profile).
+    // tags: 0 number, 1 object id, 2 blob, 3 null, 4 boolean
+    const names = new Map(), newNames = [];
+    function OpBuf() { this.f = new Float64Array(1 << 14); this.n = 0; this.blobs = []; this.length = 0; }
+    OpBuf.prototype.grow = function (need) { if (this.n + need <= this.f.length) return; let m = this.f.length * 2; while (m < this.n + need) m *= 2; const g = new Float64Array(m); g.set(this.f.subarray(0, this.n)); this.f = g; };
+    OpBuf.prototype.push = function (a) {
+      const L2 = a.length; this.grow(2 + 2 * L2);
+      const f = this.f; let n = this.n;
+      let id = names.get(a[0]); if (id === undefined) { id = names.size; names.set(a[0], id); newNames.push(a[0]); }
+      f[n++] = id; f[n++] = L2 - 1;
+      for (let i = 1; i < L2; i++) {
+        const x = a[i];
+        if (typeof x === 'number') { f[n++] = 0; f[n++] = x; }
+        else if (x instanceof GLObj) { f[n++] = 1; f[n++] = x.o; }
+        else if (x === null || x === undefined) { f[n++] = 3; f[n++] = 0; }
+        else if (typeof x === 'boolean') { f[n++] = 4; f[n++] = x ? 1 : 0; }
+        else { f[n++] = 2; f[n++] = this.blobs.length; this.blobs.push(x); }
+      }
+      this.n = n; this.length++;
+    };
     // bytes per pixel for texture uploads (format, type)
     const bpp = (format, type) => {
       if (type === K.UNSIGNED_SHORT_5_6_5 || type === K.UNSIGNED_SHORT_4_4_4_4 || type === K.UNSIGNED_SHORT_5_5_5_1) return 2;
@@ -366,7 +390,7 @@
     const cut = (v, off, n) => { const C = v.constructor; return new C(v.buffer.slice(v.byteOffset + off * v.BYTES_PER_ELEMENT, v.byteOffset + (off + n) * v.BYTES_PER_ELEMENT)); };
     const own = (v) => cut(v, 0, v.length);
     function GLRec(canvas, attrs) {
-      this.__ops = []; this.__attrs = attrs;
+      this.__ops = new OpBuf(); this.__attrs = attrs;
       this.canvas = { width: canvas.width, height: canvas.height, addEventListener() {}, removeEventListener() {} };
       this.drawingBufferWidth = canvas.width; this.drawingBufferHeight = canvas.height;
     }
@@ -374,10 +398,14 @@
     const P = RecProto;
     P.__post = function (syncOp) {
       if (!this.__ops.length && !syncOp) return;
-      const ops = this.__ops; this.__ops = [];
+      const ops = this.__ops; this.__ops = new OpBuf();
       if (syncOp) ops.push(syncOp);
       batchId++;
-      rw.postMessage({ ops, id: batchId });
+      const f = ops.f.slice(0, ops.n), xfer = [f.buffer];
+      for (const b of ops.blobs) if (ArrayBuffer.isView(b) && !(b.buffer instanceof SharedArrayBuffer) && xfer.indexOf(b.buffer) < 0) xfer.push(b.buffer);
+      const msg = { f, blobs: ops.blobs, id: batchId };
+      if (newNames.length) { msg.names = newNames.slice(); newNames.length = 0; }
+      rw.postMessage(msg, xfer);
     };
     P.__sync = function (meth, args) {
       Atomics.store(ctl, 0, 0);

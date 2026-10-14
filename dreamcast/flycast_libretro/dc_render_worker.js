@@ -46,6 +46,19 @@ function answer(v) {
   const h = new Int32Array(res, 0, 4); h[0] = kind; h[1] = bytes.length;
   Atomics.store(ctl, 0, 1); Atomics.notify(ctl, 0);
 }
+const NAMES = [];
+function decode(f, blobs) {
+  const ops = []; let i = 0;
+  while (i < f.length) {
+    const name = NAMES[f[i++]], argc = f[i++], op = new Array(argc + 1); op[0] = name;
+    for (let k = 1; k <= argc; k++) {
+      const t = f[i++], v = f[i++];
+      op[k] = t === 0 ? v : t === 1 ? { o: v } : t === 2 ? blobs[v] : t === 3 ? null : !!v;
+    }
+    ops.push(op);
+  }
+  return ops;
+}
 function exec(ops) {
   for (let i = 0; i < ops.length; i++) {
     const op = ops[i], m = op[0];
@@ -104,6 +117,7 @@ onmessage = (e) => {
     postMessage({ cmd: 'print', txt: '[glsplit] render worker owns the canvas: context ' + (gl ? 'OK' : 'FAILED') });
     return;
   }
-  if (d.ops) exec(d.ops);
+  if (d.names) for (const n of d.names) NAMES.push(n);
+  if (d.f) exec(decode(d.f, d.blobs));
   if (d.id) { pendingDone = d.id; ping.port2.postMessage(0); }   // published in the NEXT task: after this one's present
 };
