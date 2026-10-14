@@ -1333,7 +1333,6 @@ void OpenGLRenderer::Term()
 
 bool OpenGLRenderer::Render()
 {
-	{ extern int g_rbdbg[8]; g_rbdbg[5]++; if (gl.rendContext->isRTT) g_rbdbg[6]++; }
 	saveCurrentFramebuffer();
 	renderFrame(gl.rendContext->framebufferWidth, gl.rendContext->framebufferHeight);
 	if (gl.rendContext->isRTT) {

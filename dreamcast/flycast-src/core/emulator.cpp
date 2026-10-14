@@ -1128,18 +1128,13 @@ bool Emulator::render()
 	return rend_single_frame(true); // FIXME stop flag?
 }
 
-#include <emscripten.h>
-int g_rbdbg[8];  // RBDBG temporary
-extern "C" EMSCRIPTEN_KEEPALIVE int* flycast_rbdbg(void) { return g_rbdbg; }
 void Emulator::vblank()
 {
 	EventManager::event(Event::VBlank);
 	runner.execTasks();
-	g_rbdbg[0]++;
 	// Time out if a frame hasn't been rendered for 50 ms
 	if (sh4_sched_now64() - startTime <= 50_sh4ms)
 		return;
-	g_rbdbg[1]++;
 	if (ggpo::active())
 		ggpo::endOfFrame();
 	else if (!config::ThreadedRendering)
