@@ -1,4 +1,109 @@
-# Dreamcast rollback at input delay 0: blocked on the shipped core (measured 2026-10-01)
+# Dreamcast rollback at input delay 0 — SHIPPED in rooms (2026-10-14)
+
+## Status (2026-10-14): rollback runs in rooms, exact, with a capacity fallback
+
+Everything below the line "Second pass" is the history that got here. What is
+true now, all measured on this box (4 cores, load given per row):
+
+| what | result |
+|---|---|
+| core rebuilt from source | upstream `4be8a484` worktree + submodules (libchdr, DreamPicoPort-API, tinygettext, asio) + the 37 ported files; `verify_core_tree.sh` PASS |
+| keep-code restore | `emscripten_load_state_rollback` 8.5–9 ms p50 (was 47.9 ms full flush) |
+| REF1 vs RB (`rollback_measure.mjs --rbload`, 180 f, 26 rollbacks, depth ≤ 4) | **59/59 byte-identical** states; `--keepdiff` 0 B at f0..f12 |
+| broken-variant control (`--onload M._flycast_set_shard(1)`) | DIVERGES at frame 9 |
+| cold vs warm code cache, same state + pads (`--diag --rbload`) | **byte-identical** (was 116 B / one slice apart) |
+| two-browser rollback room, owd 20+10 ms, `?dcrbforce=1` (`room_desync_soak`) | **IN SYNC** 32 RAM + 32 engine checkpoints, delay 0, rollbacks 47–59 per console, max depth 4 |
+| same room, joiner `?dcrbbroken=1` (ignores every plan) | **DESYNC** at frame 120 — the detectors are not blind |
+| default room (capacity gate on) on this box | starts in rollback, the host's gate moves it to delay 2; IN SYNC |
+
+### What it took (each found by measurement, each in the commit that fixed it)
+
+1. Patches 0001 + 0002 applied and compiled (idle-skip streak reset per frame,
+   keep-code load, rollback mode = per-block install + stale-hit recompile).
+2. **SCIF schedule** (`core/hw/sh4/modules/serial.cpp`, now ported):
+   `deserialize()` ended in `updateBaudRate()`, which re-requested the tx/rx
+   event at the moment of the LOAD. It was the only difference between REF1
+   and RB (8 bytes at state offset 0xa55fd9).
+3. **No chain into the idle-skip spin** (`sh4_jit_lookup_idx`): an edge that
+   tail-linked into 0x8c3c53d8 skipped the trampoline's idle-skip check, so a
+   cold and a warm cache charged different cycles (credit-pass trace: first
+   difference at pass 3726, residual 0 vs -4).
+4. **A stop ends the frame at a slice boundary** under `g_deterministic`: the
+   present's `Stop()` was seen at the next return to C, which a chained run
+   reaches later than a cold one (frame 0 = 6672302 vs 6672750 cycles).
+5. The ring save is `dc_serialize` alone (`retro_serialize_lean`): no
+   `emu.stop()/start()` bracket (TermAudio, flash/VMU rewrite, InitAudio …)
+   every frame.
+
+### How a room runs it
+
+`dreamcast.html` builds every Session with `rollback: W` (`?dcrb=N`, default
+4; `?dcrb=0` = delay only), `rollbackOk`, `rbMaxWindow: W`. The HOST's engine
+decides (`lsgo`). In a rollback room each console's worker, before frame 0,
+gets `rbArm` (ring of W+3 states ≈ 26.4 MB each, rollback mode on); every
+frame is `save(slot f) -> pads -> run_iter`, and a late input's plan does
+`keep-code load(slot from) -> re-simulate from..f-1` muted, with the window's
+draws and the PVR work skipped. Fingerprints are of confirmed frames only
+(`takeHashDue` -> `rbHash` = FNV over the guest RAM inside slot k+1). The
+lockstep `lib/netplay.js` capacity gate still applies: a console that cannot
+afford a rollback step moves the room to input delay (that is what this box
+does by default, and what a 1.1x-headroom phone will do).
+
+Test arms: `?dcrbforce=1` (host never leaves rollback: `opts.rbNoCap`),
+`?dcrbbroken=1` (negative control).
+
+### ⚠ Gauntlet Legends is NOT exact — rollback is on by default only for pso2
+
+Proven-per-disc, because exactness is a property of the game's code paths:
+`dreamcast.html` `RB_PROVEN = {'pso2'}`; the HOST's disc decides, so a
+Gauntlet room is delay lockstep (`?dcrb=N` opts any disc in, for testing).
+
+* `rollback_measure.mjs --game gauntlet --warm 300 --rbload --keepdiff 30`
+  (boot / attract, no savestate): REF1 vs RB differ at f3 (1.9 MB), f6 (11 B),
+  f9-f21 (1.6-1.9 MB), and are identical again at f24. The differing ranges sit
+  past the frame-0 state size (offset 0x1a7f883+, the state grows), REF zero
+  where RB holds ARM code / `ENDB` blocks — a GD-ROM-streamed region whose
+  owner is not identified yet. Next step: attribute that offset with the
+  serializer's section order (pvr TA contexts are variable-size, so the tail
+  moves) and re-run.
+* Forced two-browser Gauntlet rollback room (owd 20+10): **DESYNC at frame
+  600** after 11/14 rollbacks. The same room with `?dcrb=0`: **IN SYNC** 29 RAM
+  + 32 engine checkpoints.
+* Also found on Gauntlet and fixed: the ring slot was sized from the frame-0
+  state, and the state outgrew it by frame 3 ("Serializer overflow: current
+  27785287 limit 27785287"). The core archive is built without C++ exception
+  catching, so the overflow surfaced in the worker as a thrown CppException
+  and silently killed the pump (room froze at frame 3). The ring now starts
+  with 4 MB headroom per slot and grows (keeping every slot) on overflow.
+
+### Still open (measured, not fixed)
+
+* **Cost.** A rollback frame here costs run + ~5 ms save; at depth 4 a whole
+  step is ~140–210 ms p50 against a 33 ms frame, so rollback is only
+  affordable with real headroom. The toaster (rate 6.2) cannot run it at all.
+* **Room start in rollback mode compiles 2.3x slower**: per-block install
+  costs 1.48 s for the 6,245 blocks of the first lobby frame vs 0.31 s
+  sharded (+ later seals) — `ctx_snapshot` 110/111. Deterministic batching
+  (compile a miss together with its static successors into one module, every
+  member live before it runs) plus an FPSCR-mode guard on FPU blocks is the
+  fix; not done.
+
+### Commands
+
+```bash
+node tools/browser_leak_guard.js reap && uptime
+# exactness + control
+PUPPETEER_FROM=$HOME/probe-deps/ bash tools/probe_lock.sh run -- node dreamcast/tools/rollback_measure.mjs \
+   --game pso2 --state dreamcast/states/pso2_pioneer2_lobby.state --warm 120 --rbload --frames 180 --every 3 --keepdiff 12 --name rb
+#   ... --onload 'M._flycast_set_shard(1)' --name rb-ctrl          (must DIVERGE)
+# a real room, held in rollback, and its negative control (hermetic snapshot on PORT)
+node dreamcast/tools/room_desync_soak.mjs --url http://localhost:PORT --game pso2 --soak 60 --owd 20:10 --query '&nogate=1&dcrbforce=1' --name rbroom
+node dreamcast/tools/room_desync_soak.mjs --url http://localhost:PORT --game pso2 --soak 40 --owd 20:10 --query '&nogate=1&dcrbforce=1' --qjoin '&dcrbbroken=1' --name rbbroken
+```
+
+---
+
+# History: blocked on the shipped core (measured 2026-10-01)
 
 > **UPDATE 2026-10-01 (second pass).** Three sources of non-determinism are now
 > identified by measurement, and C++ patches for all three are written as files

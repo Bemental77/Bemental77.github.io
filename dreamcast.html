@@ -6119,7 +6119,7 @@
              // The HOST's engine decides the room's mode; a room with any console
              // that cannot run rollback, or cannot afford it (the capacity gate),
              // runs input delay instead.
-             rbWindow: int('dcrb', 0, 12, 4),
+             rbWindow: int('dcrb', 0, 12, 4), rbExplicit: q.has('dcrb'),
              // TEST ARM: the host never moves the room to input delay on capacity
              rbForce: q.get('dcrbforce') === '1',
              // BROKEN-VARIANT CONTROL (a rig's negative arm, never a product
@@ -6128,10 +6128,28 @@
              // one such console must DESYNC; if it does not, the detector is blind.
              rbBroken: q.get('dcrbbroken') === '1' };
   })();
-  // The lockstep options every Dreamcast Session is built with.
-  function lsSessionOpts() {
+  // ROLLBACK IS ON BY DEFAULT ONLY FOR A DISC IT IS PROVEN EXACT ON. The host
+  // proposes the room's mode, so the host's disc decides: a rollback room's
+  // every frame must be a pure function of (state, pads), and that is a
+  // property of the game's code paths, not of the engine. Proven for pso2
+  // (dreamcast/docs/rollback/TASKS.md: REF1 vs RB 59/59, rooms IN SYNC with
+  // 47-59 rollbacks per console, broken control DESYNCs). NOT for gauntlet:
+  // the same rig diverges there within 3 frames of a rollback (keep-code
+  // load during its GD-ROM streaming) and a forced rollback room DESYNCed at
+  // frame 600 — so a Gauntlet room stays delay lockstep, which is IN SYNC.
+  // An explicit ?dcrb=N (N>0) opts any disc in, for testing.
+  const RB_PROVEN = new Set(['pso2']);
+  // The lockstep options every Dreamcast Session is built with. `game` = the
+  // host's disc (a joiner passes nothing: it never picks the room's mode, but
+  // it says it CAN run rollback, so a proven host's room is not refused it).
+  function lsSessionOpts(game) {
     const o = { minDelay: LSQ.minDelay };
-    if (LSQ.rbWindow > 0) { o.rollback = LSQ.rbWindow; o.rollbackOk = true; o.rbMaxWindow = LSQ.rbWindow; if (LSQ.rbForce) o.rbNoCap = true; }
+    if (LSQ.rbWindow > 0) {
+      o.rollbackOk = true; o.rbMaxWindow = LSQ.rbWindow;
+      const proven = game == null || LSQ.rbExplicit || RB_PROVEN.has(game);
+      o.rollback = proven ? LSQ.rbWindow : 0;
+      if (LSQ.rbForce) o.rbNoCap = true;
+    }
     return o;
   }
 
@@ -7711,7 +7729,7 @@
     const s2 = new Netplay.Session({
       game: roomGame, host: true, code, transport: netTransport(),
       // this console's delay floor (LSQ): 1 frame, not the engine's default 2
-      lockstep: lsSessionOpts(),
+      lockstep: lsSessionOpts(roomGame),
     });
     NET.session = s2;
     // ⚠ THE LOAD IS ARMED AT ROOM OPEN AND FIRES ON THE FIRST SEAT — no press.

@@ -839,6 +839,12 @@
     }
     rbSize = M._emscripten_state_size() >>> 0;
     if (!rbSize) { rbFault('emscripten_state_size returned 0'); return false; }
+    // The size is not a bound for the whole session: the serialized state
+    // grows with what the machine holds (measured on Gauntlet Legends: the
+    // frame-0 size was overflowed by frame 3 — "Serializer overflow: current
+    // 27785287 limit 27785287"). Start with headroom; rbSave grows the ring if
+    // it is ever exceeded.
+    rbSize += RB_HEADROOM;
     // slots f-W-1 .. f (a confirmed frame's after-state can be W+1 back) + 1 spare
     rbN = rbW + 3;
     rbSlots = []; rbSlotF = [];
@@ -859,11 +865,36 @@
   function rbSlot(k) { const i = k % rbN; return (rbSlotF && rbSlotF[i] === k) ? rbSlots[i] : 0; }
   // read-only view for a rig (room_desync_soak hashes a confirmed slot itself)
   self.__dcRb = { slot: (k) => rbSlot(k), size: () => rbSize, window: () => rbW, stats: rbStats };
+  const RB_HEADROOM = 4 << 20;
+  // Re-allocate every slot at `size`, keeping what each one holds.
+  function rbGrow(M, size) {
+    const old = rbSize, slots = [];
+    for (let i = 0; i < rbN; i++) {
+      const p = M._malloc(size);
+      if (!p) { for (const q of slots) M._free(q); return false; }
+      M.HEAPU8.copyWithin(p, rbSlots[i], rbSlots[i] + old);
+      M.HEAPU8.fill(0, p + old, p + size);
+      slots.push(p);
+    }
+    for (const q of rbSlots) M._free(q);
+    rbSlots = slots; rbSize = size; rbStats.grows = (rbStats.grows | 0) + 1;
+    postMessage({ cmd: 'print', txt: '[rollback] ring grown ' + (old / 1048576).toFixed(1) + ' -> ' +
+                  (size / 1048576).toFixed(1) + ' MB per state (the serialized state outgrew its slot)' });
+    return true;
+  }
   function rbSave(M, k) {
     const i = k % rbN;
     rbSlotF[i] = -1;
     const t = performance.now();
-    if (!M._emscripten_save_state_into(rbSlots[i], rbSize)) return false;
+    // ⚠ The core's archive is built without C++ exception CATCHING, so a
+    // Serializer overflow inside it surfaces HERE as a thrown CppException, not
+    // as a 0 return. Both mean "the slot is too small".
+    const tryInto = () => { try { return !!M._emscripten_save_state_into(rbSlots[i], rbSize); } catch (_) { return false; } };
+    if (!tryInto()) {
+      let need = 0; try { need = M._emscripten_state_size() >>> 0; } catch (_) {}
+      if (!rbGrow(M, Math.max(need + RB_HEADROOM, rbSize + RB_HEADROOM))) return false;
+      if (!tryInto()) return false;
+    }
     const dt = performance.now() - t;
     rbStats.saveMs = rbStats.saveMs ? rbStats.saveMs + (dt - rbStats.saveMs) / 32 : dt;
     rbSlotF[i] = k;
@@ -1409,7 +1440,10 @@
       lsQueue.delete(lsFrame);
       if (inp.rb) {
         curRb = true;
-        if (!rbFrameStart(Module, lsFrame, inp)) return;   // fault posted; the pump stays parked
+        let rbOk = false;
+        try { rbOk = rbFrameStart(Module, lsFrame, inp); }
+        catch (e) { rbFault('rollback frame ' + lsFrame + ' threw: ' + ((e && e.message) || e)); }
+        if (!rbOk) return;   // fault posted; the pump stays parked
         lsWritePads(inp.img);
       } else lsWritePads(inp);
     }
