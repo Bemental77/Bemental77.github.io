@@ -201,6 +201,10 @@ const CONSOLES = {
         // RENDERS — ~34.5 ms on Gauntlet, not a 59.94 Hz field (dreamcast.html
         // lsChooseDelay notes) — so engine frames/s is not a rate here. The
         // SH4-clock witness (guestX) is.
+        // THE GUEST CLOCK, CUMULATIVE (fields; dreamcast.html __dcProbe().guestClock, the worker's
+        // wClock as of the room's last frame): judged like gc, from deltas over this rig's own
+        // timestamps. guestX is a per-heartbeat window the worker closes on its own timer.
+        witnessCum: '(window.__dcProbe ? window.__dcProbe().guestClock : null)',
         rateBy: 'witness' },
   n64: { name: 'N64', title: 'Mario Kart 64', page: '/n64/', game: 'Mario Kart 64', hostFlag: '',
          hz: '((window.__n64Net && window.__n64Net().viHz) || 60)',

@@ -116,6 +116,8 @@ const PERFRAME = arg('perframe', '');
 // hashed frames <= N and print their byte diff, attributed like --diag. Turns
 // "RB diverged at frame k" into WHICH bytes diverged.
 const KEEPDIFF = +arg('keepdiff', '0');
+// --leansave: every save goes through the rollback ring's lean save (no emu.stop/start)
+const LEANSAVE = argv.includes('--leansave');
 const REPLAY = arg('replay', '');
 const RELOAD_EACH = argv.includes('--reload-each');
 const RBLOAD = argv.includes('--rbload');   // patch 0002: rollback mode + keep-code load       // diag mode: "FROM,TO" — load mid-run at FROM, re-run to TO, diff vs D2       // JS run in the worker after EVERY state load (M = Module)
@@ -191,8 +193,16 @@ function driverSource(PORT, LAG) {
 
     // ---- save / load through the SHIPPED exports ----------------------------
     const pp = M._malloc(4), ps = M._malloc(4);
+    R.leanSize = 0;
     R.save = function() {             // -> { ptr, size, ms } ; caller frees ptr
       const t0 = performance.now();
+      if (${LEANSAVE ? 'true' : 'false'}) {   // --leansave: the product ring's save (emscripten_save_state_into)
+        if (!R.leanSize) R.leanSize = (M._emscripten_state_size() >>> 0) + (8 << 20);
+        const p = M._malloc(R.leanSize);
+        let ok2 = 0; try { ok2 = M._emscripten_save_state_into(p, R.leanSize); } catch (e) { ok2 = 0; }
+        if (!ok2) { M._free(p); return null; }
+        return { ptr: p, size: R.leanSize, ms: performance.now() - t0 };
+      }
       const ok = M._emscripten_save_state(pp, ps);
       const ms = performance.now() - t0;
       if (!ok) return null;
