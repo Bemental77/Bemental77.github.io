@@ -122,6 +122,7 @@ dreamcast/flycast-src/core/deps/DreamPicoPort-API/ext/
 !dreamcast/flycast-src/core/rend/gles/gles.cpp
 !dreamcast/flycast-src/core/rend/gles/gles.h
 !dreamcast/flycast-src/core/rend/gles/gltex.cpp
+!dreamcast/flycast-src/core/serialize.cpp
 !dreamcast/flycast-src/shell/cmake/DetectArchitecture.cmake
 !dreamcast/flycast-src/shell/libretro/libretro.cpp
 # <<< flycast-src ported files — managed block ends <<<
