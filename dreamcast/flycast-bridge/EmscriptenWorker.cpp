@@ -1714,7 +1714,9 @@ int emscripten_save_state(uint8_t** out_buf, size_t* out_size) {
     if (!g_loaded) return 0;
     size_t need = retro_serialize_size();
     if (!need) return 0;
-    uint8_t* buf = (uint8_t*)std::malloc(need);
+    // calloc: retro_serialize writes fewer bytes than the dry-run size, and an
+    // uninitialized tail made two identical states hash differently.
+    uint8_t* buf = (uint8_t*)std::calloc(1, need);
     if (!buf) return 0;
     if (!retro_serialize(buf, need)) {
         std::free(buf);

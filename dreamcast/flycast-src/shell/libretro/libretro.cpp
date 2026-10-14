@@ -2481,6 +2481,10 @@ extern "C" bool retro_serialize_lean(void *data, size_t size)
 	try {
 		Serializer ser(data, size);
 		dc_serialize(ser);
+		// the slot is larger than what was written: zero the rest, so a slot's
+		// bytes are a function of the state alone (the ring hashes/compares them)
+		if (ser.size() < size)
+			memset((u8*)data + ser.size(), 0, size - ser.size());
 		return true;
 	} catch (const Serializer::Exception& e) {
 		ERROR_LOG(SAVESTATE, "Saving state failed: %s", e.what());
