@@ -790,6 +790,136 @@
   let lsRepay = true;               // a stall is a bounded debt (above); false = the old rebase
   const lsStats = { frames: 0, stalls: 0, stallMs: 0, maxStallMs: 0, queued: 0, dropped: 0 };
 
+  // ---------------------------------------------------------------------------
+  // ROLLBACK — ZERO LOCAL INPUT LAG IN A ROOM (dreamcast/docs/rollback/TASKS.md)
+  // ---------------------------------------------------------------------------
+  // The engine half is lib/netplay.js (_beginFrameRb): the local pad lands on
+  // the frame it was sampled, a remote pad not yet heard is PREDICTED, and a
+  // late input that disagrees hands this console a plan {from, frames} to
+  // re-simulate. This is the core half. Every frame of a rollback room:
+  //     save(slot[f])  ->  pads(f)  ->  run_iter
+  // and a plan first does   load(slot[from]) -> for k in from..f-1: [save(slot[k])] pads(k) run_iter
+  // with the audio muted and the window's draws swallowed (only frame f is seen
+  // and heard). THE LOAD KEEPS THE SH4 CODE CACHE (emscripten_load_state_rollback:
+  // only install units whose code pages changed are dropped), and the core runs
+  // in ROLLBACK MODE (emscripten_set_rollback_mode: per-block install, a stale
+  // hit recompiles, a stop ends the frame at a slice boundary, no chain into the
+  // idle-skip spin) so a frame is a pure function of its start state and pads,
+  // whatever this console has compiled. Proven on rollback_measure.mjs: REF1 vs
+  // RB 59/59 byte-identical states over 180 frames / 26 rollbacks, and a cold
+  // vs warm code cache byte-identical (--diag, rbload).
+  // FINGERPRINTS are of CONFIRMED frames only (the engine's takeHashDue): the
+  // state after k is slot[k+1], hashed over guest RAM (emscripten_rb_hash).
+  let rbW = 0;                      // the room's rollback window (frames); 0 = not a rollback room
+  let rbSlots = null, rbSlotF = null, rbSize = 0, rbN = 0;
+  let rbDue = [];                   // confirmed frames whose after-state (slot k+1) is owed to the page
+  let rbBroken = false;             // ?dcrbbroken=1: the negative control — plans are ignored
+  const rbStats = { rollbacks: 0, resim: 0, maxDepth: 0, keep: 0, fallback: 0, hashes: 0, missing: 0,
+                    stepMs: 0, presentMs: 0, saveMs: 0, loadMs: 0, fault: null };
+  function rbFree() {
+    const M = self.Module;
+    try { if (rbSlots && M) for (const p of rbSlots) if (p) M._free(p); } catch (_) {}
+    rbSlots = null; rbSlotF = null; rbN = 0; rbDue = [];
+  }
+  function rbFault(why) {
+    rbStats.fault = why;
+    postMessage({ cmd: 'print', txt: '[rollback] ⚠ ' + why });
+    postMessage({ cmd: 'rbFault', why });
+  }
+  // Arm a rollback room on this worker, BEFORE its frame 0. Every console of the
+  // room does exactly this at the same point, so the mode switch (which flushes
+  // the code cache once) is part of the shared timeline.
+  function rbArm(w) {
+    const M = self.Module;
+    rbFree();
+    rbW = Math.max(1, w | 0);
+    if (typeof M._emscripten_load_state_rollback !== 'function' || typeof M._emscripten_save_state_into !== 'function' ||
+        typeof M._emscripten_set_rollback_mode !== 'function' || typeof M._emscripten_rb_hash !== 'function') {
+      rbFault('this build has no rollback exports — relink'); return false;
+    }
+    rbSize = M._emscripten_state_size() >>> 0;
+    if (!rbSize) { rbFault('emscripten_state_size returned 0'); return false; }
+    // slots f-W-1 .. f (a confirmed frame's after-state can be W+1 back) + 1 spare
+    rbN = rbW + 3;
+    rbSlots = []; rbSlotF = [];
+    for (let i = 0; i < rbN; i++) {
+      const p = M._malloc(rbSize);
+      if (!p) { rbFree(); rbFault('out of memory for a ' + rbN + '-slot rollback ring (' + Math.round(rbN * rbSize / 1048576) + ' MB)'); return false; }
+      M.HEAPU8.fill(0, p, p + rbSize);
+      rbSlots.push(p); rbSlotF.push(-1);
+    }
+    M._emscripten_set_rollback_mode(1);
+    // A rollback frame never takes a live fingerprint (curRb gates it): the
+    // engine asks for CONFIRMED frames itself (takeHashDue). lsHashEvery stays
+    // as it is for the delay frames a capacity-gated room may switch to.
+    postMessage({ cmd: 'print', txt: '[rollback] ARMED — window ' + rbW + ' frames, ring ' + rbN + ' x ' +
+                  (rbSize / 1048576).toFixed(1) + ' MB, rollback mode ON (per-block install, keep-code restore)' });
+    return true;
+  }
+  function rbSlot(k) { const i = k % rbN; return (rbSlotF && rbSlotF[i] === k) ? rbSlots[i] : 0; }
+  // read-only view for a rig (room_desync_soak hashes a confirmed slot itself)
+  self.__dcRb = { slot: (k) => rbSlot(k), size: () => rbSize, window: () => rbW, stats: rbStats };
+  function rbSave(M, k) {
+    const i = k % rbN;
+    rbSlotF[i] = -1;
+    const t = performance.now();
+    if (!M._emscripten_save_state_into(rbSlots[i], rbSize)) return false;
+    const dt = performance.now() - t;
+    rbStats.saveMs = rbStats.saveMs ? rbStats.saveMs + (dt - rbStats.saveMs) / 32 : dt;
+    rbSlotF[i] = k;
+    return true;
+  }
+  // Hash every owed confirmed frame whose after-state is in the ring.
+  function rbHashOwed(M, upTo) {
+    if (!rbDue.length) return;
+    const keep = [];
+    for (const k of rbDue) {
+      if (k + 1 > upTo) { keep.push(k); continue; }
+      const p = rbSlot(k + 1);
+      if (!p) { rbStats.missing++; continue; }
+      postMessage({ cmd: 'rbHash', f: k, h: M._emscripten_rb_hash(p, rbSize) >>> 0 });
+      rbStats.hashes++;
+    }
+    rbDue = keep;
+  }
+  // The start of rollback frame f: re-simulate the plan (if any), then save
+  // slot[f]. Returns false on a fault (posted); the pump then parks.
+  function rbFrameStart(M, f, ent) {
+    if (!rbSlots) { rbFault('a rollback frame arrived but this worker has no ring'); return false; }
+    if (ent.plan && !rbBroken) {
+      const plan = ent.plan, from = plan.from | 0;
+      const src = rbSlot(from);
+      if (!src) { rbFault('rollback to frame ' + from + ' found no savestate for it (frame ' + f + ')'); return false; }
+      const ta = performance.now();
+      const rc = M._emscripten_load_state_rollback(src, rbSize);
+      if (!rc) { rbFault('the rollback load of frame ' + from + ' failed'); return false; }
+      if (rc === 1) rbStats.keep++; else rbStats.fallback++;
+      const tl = performance.now() - ta;
+      rbStats.loadMs = rbStats.loadMs ? rbStats.loadMs + (tl - rbStats.loadMs) / 16 : tl;
+      M._emscripten_rb_mute_audio(1);
+      try {
+        for (const fr of plan.frames) {
+          const k = fr.f | 0;
+          if (k !== from && !rbSave(M, k)) { rbFault('save of re-simulated frame ' + k + ' failed'); return false; }
+          lsWritePads(fr.img);
+          FSK.serial++; FSK.skipping = !!(FSK.on && !FSK.disabled);
+          M._emscripten_run_iter();
+          FSK.skipping = false;
+          if (runIterSuspended()) { rbFault('re-simulated frame ' + k + ' suspended (asyncify) — cannot re-simulate it in one task'); return false; }
+          rbStats.resim++;
+        }
+      } finally { M._emscripten_rb_mute_audio(0); }
+      rbStats.rollbacks++;
+      if (plan.frames.length > rbStats.maxDepth) rbStats.maxDepth = plan.frames.length;
+      const per = (performance.now() - ta) / Math.max(1, plan.frames.length);
+      rbStats.stepMs = rbStats.stepMs ? rbStats.stepMs + (per - rbStats.stepMs) / 16 : per;
+    }
+    if (ent.hd && ent.hd.length) for (const k of ent.hd) rbDue.push(k | 0);
+    if (!rbSave(M, f)) { rbFault('save of frame ' + f + ' failed'); return false; }
+    rbHashOwed(M, f);
+    return true;
+  }
+
   // The fingerprint. Every word is a COMMITTED SH4/Holly field read through
   // flycast_ctx_snapshot, which is already exported by the shipped binary
   // (flycast_worker_link.sh:86) — this needs no core rebuild.
@@ -1201,8 +1331,10 @@
     noteHeld(performance.now());
     try { pumpTick_(); } finally { pumpTaskEnd = performance.now(); }
   }
+  let curRb = false;   // the frame this tick runs is a rollback frame (save before, no live fingerprint)
   function pumpTick_() {
     pumpQueued = false;
+    curRb = false;
     pumpWaitAsked = 0;
     if (!freerun) return;
     const Module = self.Module;
@@ -1274,7 +1406,11 @@
           'it — it starts the room on the same machine as everyone' });
       }
       lsQueue.delete(lsFrame);
-      lsWritePads(inp);
+      if (inp.rb) {
+        curRb = true;
+        if (!rbFrameStart(Module, lsFrame, inp)) return;   // fault posted; the pump stays parked
+        lsWritePads(inp.img);
+      } else lsWritePads(inp);
     }
     // Apply any card scheduled for THIS frame, before the frame runs. Every
     // console reaches this frame with the same bytes, so the write is part of
@@ -1336,7 +1472,7 @@
         lsAckF = f;
         // The fingerprint is deferred to the NEXT tick's clean boundary — see
         // lsWords(). Reading it here can catch a suspended frame.
-        if (lsHashEvery > 0 && (f % lsHashEvery) === 0) lsPendingHash = f;
+        if (lsHashEvery > 0 && !curRb && (f % lsHashEvery) === 0) lsPendingHash = f;
       }
     } catch (err) {
       freerun = false;
@@ -1427,7 +1563,15 @@
       // pinned at 59/s in both). Perf probes must see the CPU, not the rig.
       delay = 0;
     }
-    if (lsAckF >= 0) postMessage({ cmd: 'lsFrame', f: lsAckF, due: performance.timeOrigin + t1 + (delay > 1 ? delay : 0) });
+    if (lsAckF >= 0) {
+      if (curRb) {
+        const pm = t1 - t0;
+        rbStats.presentMs = rbStats.presentMs ? rbStats.presentMs + (pm - rbStats.presentMs) / 32 : pm;
+        postMessage({ cmd: 'lsFrame', f: lsAckF, due: performance.timeOrigin + t1 + (delay > 1 ? delay : 0),
+                      st: +(rbStats.stepMs || rbStats.presentMs + rbStats.saveMs).toFixed(2),
+                      sp: +(rbStats.presentMs + rbStats.saveMs).toFixed(2) });
+      } else postMessage({ cmd: 'lsFrame', f: lsAckF, due: performance.timeOrigin + t1 + (delay > 1 ? delay : 0) });
+    }
     // Only the delay we ASKED for counts as given-back time. setTimeout
     // overshoot lands in the unattributed remainder, so headroom stays a floor.
     if (delay > 1) { pacePacedMs += delay; pumpSleep(delay); }
@@ -1537,6 +1681,7 @@
         lockstep = on;
         if (on) recoverDrop();   // a room never rewinds one console (see recoverFromThrow)
         lsAnchorCheck = on; lsHistoryRefused = null;
+        if (!on && rbSlots) { rbFree(); rbW = 0; try { self.Module._emscripten_set_rollback_mode(0); } catch (_) {} }
         lsQueue.clear();
         lsFrame = data.frame | 0;
         lsPendingHash = -1;
@@ -1558,11 +1703,26 @@
       // One frame's input: the full 256-byte maple image (4 ports x 64 B),
       // exactly the layout case 'input' already uses. Both players' pads are in
       // it, because under lockstep every machine writes every pad.
+      case 'rbArm': {
+        if (runIterSuspended()) { rbFault('rbArm while a frame is asyncify-suspended'); break; }
+        const ok = rbArm(data.w | 0);
+        rbBroken = !!data.broken;
+        if (rbBroken) postMessage({ cmd: 'print', txt: '[rollback] ⚠ BROKEN-VARIANT CONTROL: this worker ignores every re-simulation plan (?dcrbbroken=1) — the room must desync' });
+        postMessage({ cmd: 'rbArmed', ok, w: rbW, slots: rbN, mb: Math.round(rbN * rbSize / 1048576), why: rbStats.fault });
+        break;
+      }
+      case 'rbStats':
+        postMessage({ cmd: 'rbStats', w: rbW, slots: rbN, stats: rbStats });
+        break;
       case 'lsInput': {
         if (!data.states) break;
         const f = data.f | 0;
         if (f < lsFrame) { lsStats.dropped++; break; }   // already run; cannot un-run it
-        lsQueue.set(f, new Uint8Array(data.states));
+        lsQueue.set(f, data.rb ? { img: new Uint8Array(data.states), rb: true,
+                                   plan: data.plan ? { from: data.plan.from | 0,
+                                     frames: data.plan.frames.map((x) => ({ f: x.f | 0, img: new Uint8Array(x.states) })) } : null,
+                                   hd: data.hd || null }
+                                : new Uint8Array(data.states));
         lsStats.queued++;
         // ⚠ ONLY the frame the pump is actually parked on may un-park it.
         // Kicking on EVERY queued input is what let a 480-frame backlog queue
