@@ -306,7 +306,7 @@ function workerHookSrc(prerollN) {
         const t0 = performance.now();
         let ram = null;
         try {
-          const R = self.__dcRb, p = R ? R.slot((msg.f | 0) + 1) : 0, off = M._emscripten_rb_ram_offset() >>> 0;
+          const R = self.__dcRb, p = R ? R.slot((msg.f | 0) + 1) : 0, off = (R && R.ramOff) ? R.ramOff((msg.f | 0) + 1) : (M._emscripten_rb_ram_offset() >>> 0);
           if (p && off) {
             const u8 = M.HEAPU8.subarray(p + off, p + off + RAM_SZ);
             const parts = [], q = u8.length >>> 2;
@@ -328,11 +328,10 @@ function workerHookSrc(prerollN) {
         let sec = null;
         if (${SECHASH ? 'true' : 'false'}) try {
           const R = self.__dcRb, p = R ? R.slot((msg.f | 0) + 1) : 0;
-          const sp = M._flycast_ser_sections() >>> 2, n = M.HEAPU32[sp];
+          R.secOn = true;
+          const offs = R.sec((msg.f | 0) + 1), n = offs ? offs.length - 1 : 0;   // the slot's OWN marks; the last is its end
           if (p && n > 0) {
-            const offs = []; for (let i = 1; i <= n; i++) offs.push(M.HEAPU32[sp + i]);
-            const end = M._emscripten_state_size() >>> 0; offs.push(end);
-            sec = [];
+            sec = []; S.secLen = S.secLen || {}; S.secLen[msg.f | 0] = offs.slice(1).map((v, i) => v - offs[i]);
             for (let i = 0; i < n; i++) sec.push(offs[i + 1] > offs[i] ? (M._emscripten_rb_hash(p + offs[i], offs[i + 1] - offs[i]) >>> 0) : 0);
           }
         } catch (e) { S.err = 'sec hash threw: ' + (e && e.message || e); }
@@ -673,7 +672,7 @@ try {
     // ---- collect ----
     const fin = await st();
     RESULT.final = fin;
-    const rowsOf = async (P) => NOHOOK ? '{"rows":[]}' : withTimeout(wEval(P.worker, 'JSON.stringify({ rows: self.__soak.rows, err: self.__soak.err, base: self.__soak.base, verifyBad: self.__soak.verifyBad, hashMs: self.__soak.hashMs, hashN: self.__soak.hashN, preroll: self.__soak.preroll, cands: self.__soak.cands, starts: self.__soak.starts })').catch((e) => JSON.stringify({ err: e.message })), 60000, '{"err":"timeout"}');
+    const rowsOf = async (P) => NOHOOK ? '{"rows":[]}' : withTimeout(wEval(P.worker, 'JSON.stringify({ rows: self.__soak.rows, err: self.__soak.err, base: self.__soak.base, verifyBad: self.__soak.verifyBad, hashMs: self.__soak.hashMs, hashN: self.__soak.hashN, preroll: self.__soak.preroll, cands: self.__soak.cands, starts: self.__soak.starts, secLen: self.__soak.secLen })').catch((e) => JSON.stringify({ err: e.message })), 60000, '{"err":"timeout"}');
     const RH = JSON.parse(await rowsOf(H)), RJ = JSON.parse(await rowsOf(G));
     const engine = await Promise.all(PS.map((P) => P.page.evaluate(() => {
       const M = window.__soak; const e = M && M.engine; let rep = null; try { rep = e ? e.report() : null; } catch (x) {}
@@ -723,16 +722,17 @@ try {
       if (r.ram !== o.ram) { ramBad++; if (firstRam == null) firstRam = { f: r.f, host: r.ram, joiner: o.ram }; }
       if (r.h !== o.h) { wBad++; if (firstW == null) firstW = { f: r.f, host: r.w, joiner: o.w }; }
       if (r.sec && o.sec) {
-        const NAMES = ['aica', 'sb', 'nvmem', 'gdrom', 'mcfg', 'pvr', 'sh4', 'bba+modem', 'serialize2', 'libGDR', 'naomi', 'tail'];
+        const NAMES = ['aica', 'sb', 'nvmem', 'gdrom', 'mcfg', 'pvr', 'sh4', 'bba+modem', 'serialize2', 'libGDR', 'naomi', 'naomicart', 'reios', 'achievements'];
         const bad = []; for (let i = 0; i < Math.min(r.sec.length, o.sec.length); i++) if (r.sec[i] !== o.sec[i]) bad.push(NAMES[i] || ('s' + i));
-        if (bad.length && secDiffs.length < 6) secDiffs.push({ f: r.f, sections: bad });
+        if (bad.length && secDiffs.length < 6) secDiffs.push({ f: r.f, sections: bad,
+          len: { host: RH.secLen && RH.secLen[r.f], joiner: RJ.secLen && RJ.secLen[r.f] } });
       }
     }
-    if (secDiffs.length) for (const d of secDiffs) say(`SECTION DIFF @f${d.f}: ${d.sections.join(', ')}`);
+    if (secDiffs.length) for (const d of secDiffs) say(`SECTION DIFF @f${d.f}: ${d.sections.join(', ')}  len host ${J(d.len.host)} joiner ${J(d.len.joiner)}`);
     const hr = RH.rows || [];
     if (hr.length > 1 && c0 != null) RESULT.guestSecondsByCycles = +((hr[hr.length - 1].cyc - c0) / 200e6).toFixed(1);
     const burns = hr.length ? { first: hr[0].burns, last: hr[hr.length - 1].burns } : null;
-    RESULT.ramDetector = { secDiffs, compared, ramMismatches: ramBad, fingerprintMismatches: wBad, firstRam, firstW, nullRam,
+    RESULT.ramDetector = { secDiffs, secRows: { host: (RH.rows || []).filter((r) => r.sec).length, joiner: (RJ.rows || []).filter((r) => r.sec).length, lastH: ((RH.rows || []).slice(-1)[0] || {}).sec || null, lastJ: ((RJ.rows || []).slice(-1)[0] || {}).sec || null }, compared, ramMismatches: ramBad, fingerprintMismatches: wBad, firstRam, firstW, nullRam,
                            hostRows: hr.length, joinerRows: (RJ.rows || []).length, lastFrame: hr.length ? hr[hr.length - 1].f : null,
                            hostBase: RH.base, joinerBase: RJ.base, hostCands: RH.cands, joinerCands: RJ.cands,
                            verifyBad: { host: RH.verifyBad, joiner: RJ.verifyBad }, err: { host: RH.err, joiner: RJ.err },

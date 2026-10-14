@@ -862,7 +862,7 @@
   // FINGERPRINTS are of CONFIRMED frames only (the engine's takeHashDue): the
   // state after k is slot[k+1], hashed over guest RAM (emscripten_rb_hash).
   let rbW = 0;                      // the room's rollback window (frames); 0 = not a rollback room
-  let rbSlots = null, rbSlotF = null, rbSize = 0, rbN = 0;
+  let rbSlots = null, rbSlotF = null, rbSlotOff = null, rbSize = 0, rbN = 0;
   let rbDue = [];                   // confirmed frames whose after-state (slot k+1) is owed to the page
   let rbBroken = false;             // ?dcrbbroken=1: the negative control — plans are ignored
   const rbStats = { rollbacks: 0, resim: 0, maxDepth: 0, keep: 0, fallback: 0, hashes: 0, missing: 0,
@@ -898,12 +898,12 @@
     rbSize += RB_HEADROOM;
     // slots f-W-1 .. f (a confirmed frame's after-state can be W+1 back) + 1 spare
     rbN = rbW + 3;
-    rbSlots = []; rbSlotF = [];
+    rbSlots = []; rbSlotF = []; rbSlotOff = [];
     for (let i = 0; i < rbN; i++) {
       const p = M._malloc(rbSize);
       if (!p) { rbFree(); rbFault('out of memory for a ' + rbN + '-slot rollback ring (' + Math.round(rbN * rbSize / 1048576) + ' MB)'); return false; }
       M.HEAPU8.fill(0, p, p + rbSize);
-      rbSlots.push(p); rbSlotF.push(-1);
+      rbSlots.push(p); rbSlotF.push(-1); rbSlotOff.push(0);
     }
     M._emscripten_set_rollback_mode(1);
     // A rollback frame never takes a live fingerprint (curRb gates it): the
@@ -915,7 +915,11 @@
   }
   function rbSlot(k) { const i = k % rbN; return (rbSlotF && rbSlotF[i] === k) ? rbSlots[i] : 0; }
   // read-only view for a rig (room_desync_soak hashes a confirmed slot itself)
-  self.__dcRb = { slot: (k) => rbSlot(k), size: () => rbSize, window: () => rbW, stats: rbStats };
+  // rigs: the section marks (core/serialize.cpp SER_MARK) of the save that filled slot k
+  const rbSlotSec = new Map();
+  self.__dcRb = { slot: (k) => rbSlot(k), size: () => rbSize, window: () => rbW, stats: rbStats,
+                  sec: (k) => rbSlotSec.get(k) || null, secOn: false,
+                  ramOff: (k) => (rbSlotF && rbSlotF[k % rbN] === k) ? rbSlotOff[k % rbN] : 0 };
   const RB_HEADROOM = 4 << 20;
   // Re-allocate every slot at `size`, keeping what each one holds.
   function rbGrow(M, size) {
@@ -949,6 +953,21 @@
     const dt = performance.now() - t;
     rbStats.saveMs = rbStats.saveMs ? rbStats.saveMs + (dt - rbStats.saveMs) / 32 : dt;
     rbSlotF[i] = k;
+    // ⚠ WHERE GUEST RAM SITS IN THIS SLOT. The serialized state is not fixed-
+    // length (pvr's section varies), so RAM's offset differs save to save, and
+    // the core's g_ser_ram_offset is only the LAST save's. Hashing an older slot
+    // through it hashed a shifted 16 MB window — and each console's last save is
+    // a different frame when it hashes, so two identical slots fingerprinted
+    // differently: Gauntlet forced-rollback rooms "desynced" at f600/f1020 with
+    // every savestate section (incl. sh4/RAM) hashing identical on both
+    // consoles (room_desync_soak --sechash). Recorded per slot, right after
+    // the save that set it.
+    rbSlotOff[i] = (typeof M._emscripten_rb_ram_offset === 'function') ? (M._emscripten_rb_ram_offset() >>> 0) : 0;
+    if (self.__dcRb.secOn && typeof M._flycast_ser_sections === 'function') {
+      const sp = M._flycast_ser_sections() >>> 2, n = M.HEAPU32[sp];
+      rbSlotSec.set(k, Array.from(M.HEAPU32.subarray(sp + 1, sp + 1 + n)));
+      if (rbSlotSec.size > 64) rbSlotSec.delete(rbSlotSec.keys().next().value);
+    }
     return true;
   }
   // Hash every owed confirmed frame whose after-state is in the ring.
@@ -959,7 +978,11 @@
       if (k + 1 > upTo) { keep.push(k); continue; }
       const p = rbSlot(k + 1);
       if (!p) { rbStats.missing++; continue; }
-      postMessage({ cmd: 'rbHash', f: k, h: M._emscripten_rb_hash(p, rbSize) >>> 0 });
+      // this slot's own RAM offset: hash exactly its 16 MB (emscripten_rb_hash
+      // hashes a buffer whole when it is no larger than the RAM window)
+      const off = rbSlotOff[(k + 1) % rbN];
+      const h = off ? M._emscripten_rb_hash(p + off, 16 << 20) : M._emscripten_rb_hash(p, rbSize);
+      postMessage({ cmd: 'rbHash', f: k, h: h >>> 0 });
       rbStats.hashes++;
     }
     rbDue = keep;
