@@ -1054,129 +1054,129 @@
 1053:stbi__zbuild_huffman(stbi__zhuffman*, unsigned char const*, int)
 1054:stbi__get8(stbi__context*)
 1055:socket_garbage_collect
-1056:poll
-1057:pico_tree_prev
-1058:pico_tree_lastNode
-1059:pico_source_is_local
-1060:pico_socket_add
-1061:pico_protocol_init
-1062:pico_ipv4_mcast_leave
-1063:pico_ipv4_link_find
-1064:pico_frame_alloc
-1065:pico_discard_segment
-1066:path_basename
-1067:modem::V42Protocol::~V42Protocol()
-1068:mcfg_DestroyDevices(bool)
-1069:maple_ascii_stick::get_device_type()
-1070:loadBios(char const*, Archive*, Archive*, int)
-1071:jit_lookup(unsigned int)
-1072:inflateReset
-1073:hunk_read_into_memory
-1074:huffman_decode_one
-1075:glm::mat<4, 4, float, (glm::qualifier)0> glm::operator*<float, (glm::qualifier)0>(glm::mat<4, 4, float, (glm::qualifier)0> const&, glm::mat<4, 4, float, (glm::qualifier)0> const&)
-1076:gl4GetProgram(bool, bool, bool, bool, bool, unsigned int, bool, unsigned int, bool, bool, bool, bool, int, bool, Pass)
-1077:getc
-1078:getMieDevice()
-1079:free_ctx
-1080:fflush
-1081:elan::setStateParams(PolyParam&, elan::ICHList const*)
-1082:drflac_oggbs__goto_next_page
-1083:dlposix_memalign
-1084:copy_addr
-1085:convert_ioctl_struct
-1086:chd_close
-1087:cResetEvent::~cResetEvent()
-1088:bind
-1089:bemental::sh4::reloadOrInvalidate(WasmModuleBuilder&, bemental::sh4::RegCache&)
-1090:bemental::sh4::emitTailTo(WasmModuleBuilder&, unsigned int)
-1091:asio::detail::read_until_match_op_v2<asio::basic_stream_socket<asio::ip::tcp, asio::any_io_executor>, asio::dynamic_vector_buffer<unsigned char, std::__2::allocator<unsigned char>>, std::__2::pair<asio::buffers_iterator<asio::const_buffers_1, char>, bool> (*)(asio::buffers_iterator<asio::const_buffers_1, char>, asio::buffers_iterator<asio::const_buffers_1, char>), net::modbba::EthSocket::receive()::'lambda'(std::__2::error_code const&, unsigned long)>::operator()(std::__2::error_code, unsigned long, int)
-1092:aica::arm::recompiler::flush()
-1093:aica::arm::(anonymous namespace)::Arm7WasmEmitter::pushNZ()
-1094:_zip_string_get
-1095:_do_futex_wait
-1096:__uflow
-1097:__toread
-1098:__sin
-1099:__cos
-1100:ZSTD_getcBlockSize
-1101:ZSTD_compressBlock_opt2
-1102:ZSTDMT_freeBufferPool
-1103:WasmModuleBuilder::op_i64_shr_u()
-1104:TextureCacheData::Delete()
-1105:Sh4Context::UpdateFPSCR(Sh4Context*)
-1106:Serializer::Serializer(void*, unsigned long, bool)
-1107:OpenArchive(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
-1108:NetworkOutput::output(char const*, unsigned int)
-1109:NaomiCartridge::Serialize(Serializer&) const
-1110:NaomiCartridge::ReadMem(unsigned int, unsigned int)
-1111:NaomiCartridge::Deserialize(Deserializer&)
-1112:ModemEmu::send(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
-1113:MemChip::Load(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
-1114:MapleLink::unregisterLink(int, int)
-1115:FlycastException::FlycastException(char const*)
-1116:CustomTexture::terminate()
-1117:zip_source_rollback_write
-1118:wctomb
-1119:wchar_t* std::__2::find[abi:ne210108]<wchar_t*, wchar_t>(wchar_t*, wchar_t*, wchar_t const&)
-1120:void std::__2::vector<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::allocator<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>>::__assign_with_size[abi:ne210108]<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>*, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>*>(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>*, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>*, long)
-1121:void asio::execution::detail::any_executor_base::query_fn<asio::io_context::basic_executor_type<std::__2::allocator<void>, 0ul>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>>(void*, void const*, void const*)
-1122:void asio::execution::detail::any_executor_base::query_fn<asio::io_context::basic_executor_type<std::__2::allocator<void>, 0ul>, asio::execution::detail::blocking::never_t<0>>(void*, void const*, void const*)
-1123:void asio::detail::reactive_socket_service_base::async_send<asio::const_buffers_1, asio::detail::write_op<asio::basic_stream_socket<asio::ip::tcp, asio::any_io_executor>, asio::mutable_buffers_1, asio::mutable_buffer const*, asio::detail::transfer_all_t, std::__2::__bind<void (TcpSocket::*)(std::__2::error_code const&, unsigned long), std::__2::shared_ptr<TcpSocket>, std::__2::placeholders::__ph<1> const&, std::__2::placeholders::__ph<2> const&>>, asio::any_io_executor>(asio::detail::reactive_socket_service_base::base_implementation_type&, asio::const_buffers_1 const&, int, asio::detail::write_op<asio::basic_stream_socket<asio::ip::tcp, asio::any_io_executor>, asio::mutable_buffers_1, asio::mutable_buffer const*, asio::detail::transfer_all_t, std::__2::__bind<void (TcpSocket::*)(std::__2::error_code const&, unsigned long), std::__2::shared_ptr<TcpSocket>, std::__2::placeholders::__ph<1> const&, std::__2::placeholders::__ph<2> const&>>&, asio::any_io_executor const&)
-1124:updateLightgunCoordinates(unsigned int)
-1125:unsigned short aica::readRegInternal<unsigned short>(unsigned int)
-1126:unsigned long asio::basic_datagram_socket<asio::ip::udp, asio::any_io_executor>::send_to<asio::mutable_buffers_1>(asio::mutable_buffers_1 const&, asio::ip::basic_endpoint<asio::ip::udp> const&)
-1127:unlock
-1128:trinkle
-1129:tcp_discard_all_segments
-1130:tactx_Recycle(TA_context*)
-1131:tactx_Find(unsigned int, bool)
-1132:strtoul
-1133:std::runtime_error::~runtime_error()
-1134:std::logic_error::~logic_error()_8170
-1135:std::__throw_bad_alloc()
-1136:std::__2::vector<aica::arm::ArmOp, std::__2::allocator<aica::arm::ArmOp>>::insert(std::__2::__wrap_iter<aica::arm::ArmOp const*>, aica::arm::ArmOp const&)
-1137:std::__2::vector<N2Matrix, std::__2::allocator<N2Matrix>>::push_back[abi:ne210108](N2Matrix const&)
-1138:std::__2::pair<std::__2::__hash_iterator<std::__2::__hash_node<std::__2::__hash_value_type<unsigned int, memwatch::Page>, void*>*>, bool> std::__2::__hash_table<std::__2::__hash_value_type<unsigned int, memwatch::Page>, std::__2::__unordered_map_hasher<unsigned int, std::__2::pair<unsigned int const, memwatch::Page>, std::__2::hash<unsigned int>, std::__2::equal_to<unsigned int>, true>, std::__2::__unordered_map_equal<unsigned int, std::__2::pair<unsigned int const, memwatch::Page>, std::__2::equal_to<unsigned int>, std::__2::hash<unsigned int>, true>, std::__2::allocator<std::__2::pair<unsigned int const, memwatch::Page>>>::__emplace_unique_key_args<unsigned int, std::__2::piecewise_construct_t const&, std::__2::tuple<unsigned int const&>, std::__2::tuple<>>(unsigned int const&, std::__2::piecewise_construct_t const&, std::__2::tuple<unsigned int const&>&&, std::__2::tuple<>&&)
-1139:std::__2::pair<std::__2::__hash_iterator<std::__2::__hash_node<std::__2::__hash_value_type<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::vector<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::allocator<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>>>, void*>*>, bool> std::__2::__hash_table<std::__2::__hash_value_type<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::vector<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::allocator<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>>>, std::__2::__unordered_map_hasher<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::pair<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const, std::__2::vector<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::allocator<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>>>, std::__2::hash<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>, std::__2::equal_to<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>, true>, std::__2::__unordered_map_equal<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::pair<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const, std::__2::vector<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::allocator<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>>>, std::__2::equal_to<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>, std::__2::hash<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>, true>, std::__2::allocator<std::__2::pair<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const, std::__2::vector<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::allocator<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>>>>>::__emplace_unique_key_args<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::piecewise_construct_t const&, std::__2::tuple<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&>, std::__2::tuple<>>(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&, std::__2::piecewise_construct_t const&, std::__2::tuple<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&>&&, std::__2::tuple<>&&)
-1140:std::__2::moneypunct<wchar_t, false>::do_decimal_point() const
-1141:std::__2::moneypunct<char, false>::do_decimal_point() const
-1142:std::__2::istreambuf_iterator<wchar_t, std::__2::char_traits<wchar_t>>::operator++[abi:ne210108]()
-1143:std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>::operator++[abi:ne210108]()
-1144:std::__2::ios_base::imbue(std::__2::locale const&)
-1145:std::__2::condition_variable::wait(std::__2::unique_lock<std::__2::mutex>&)
-1146:std::__2::basic_stringbuf<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_stringbuf()
-1147:std::__2::basic_stringbuf<char, std::__2::char_traits<char>, std::__2::allocator<char>>::str(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
-1148:std::__2::basic_stringbuf<char, std::__2::char_traits<char>, std::__2::allocator<char>>::str() const
-1149:std::__2::basic_string<wchar_t, std::__2::char_traits<wchar_t>, std::__2::allocator<wchar_t>> const* std::__2::__scan_keyword[abi:ne210108]<std::__2::istreambuf_iterator<wchar_t, std::__2::char_traits<wchar_t>>, std::__2::basic_string<wchar_t, std::__2::char_traits<wchar_t>, std::__2::allocator<wchar_t>> const*, std::__2::ctype<wchar_t>>(std::__2::istreambuf_iterator<wchar_t, std::__2::char_traits<wchar_t>>&, std::__2::istreambuf_iterator<wchar_t, std::__2::char_traits<wchar_t>>, std::__2::basic_string<wchar_t, std::__2::char_traits<wchar_t>, std::__2::allocator<wchar_t>> const*, std::__2::basic_string<wchar_t, std::__2::char_traits<wchar_t>, std::__2::allocator<wchar_t>> const*, std::__2::ctype<wchar_t> const&, unsigned int&, bool)
-1150:std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const* std::__2::__scan_keyword[abi:ne210108]<std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const*, std::__2::ctype<char>>(std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>&, std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const*, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const*, std::__2::ctype<char> const&, unsigned int&, bool)
-1151:std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>::basic_string(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
-1152:std::__2::basic_streambuf<wchar_t, std::__2::char_traits<wchar_t>>::sbumpc[abi:ne210108]()
-1153:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::pbackfail(int)
-1154:std::__2::basic_ostream<char, std::__2::char_traits<char>>::sentry::sentry(std::__2::basic_ostream<char, std::__2::char_traits<char>>&)
-1155:std::__2::array<std::__2::list<std::__2::shared_ptr<MapleLink>, std::__2::allocator<std::__2::shared_ptr<MapleLink>>>, 2ul>::~array()
-1156:std::__2::__tree<std::__2::__value_type<void*, std::__2::shared_ptr<RuntimeBlockInfo>>, std::__2::__map_value_compare<void*, std::__2::pair<void* const, std::__2::shared_ptr<RuntimeBlockInfo>>, std::__2::less<void*>, true>, std::__2::allocator<std::__2::pair<void* const, std::__2::shared_ptr<RuntimeBlockInfo>>>>::destroy(std::__2::__tree_node<std::__2::__value_type<void*, std::__2::shared_ptr<RuntimeBlockInfo>>, void*>*)
-1157:std::__2::__tree<std::__2::__value_type<unsigned int, TextureData>, std::__2::__map_value_compare<unsigned int, std::__2::pair<unsigned int const, TextureData>, std::__2::less<unsigned int>, true>, std::__2::allocator<std::__2::pair<unsigned int const, TextureData>>>::destroy(std::__2::__tree_node<std::__2::__value_type<unsigned int, TextureData>, void*>*)
-1158:std::__2::__tree<std::__2::__value_type<SSAOptimizer::RegValue, unsigned int>, std::__2::__map_value_compare<SSAOptimizer::RegValue, std::__2::pair<SSAOptimizer::RegValue const, unsigned int>, std::__2::less<SSAOptimizer::RegValue>, true>, std::__2::allocator<std::__2::pair<SSAOptimizer::RegValue const, unsigned int>>>::destroy(std::__2::__tree_node<std::__2::__value_type<SSAOptimizer::RegValue, unsigned int>, void*>*)
-1159:std::__2::__tree<SSAOptimizer::RegValue, std::__2::less<SSAOptimizer::RegValue>, std::__2::allocator<SSAOptimizer::RegValue>>::destroy(std::__2::__tree_node<SSAOptimizer::RegValue, void*>*)
-1160:std::__2::__tree<RuntimeBlockInfo*, std::__2::less<RuntimeBlockInfo*>, std::__2::allocator<RuntimeBlockInfo*>>::destroy(std::__2::__tree_node<RuntimeBlockInfo*, void*>*)
-1161:std::__2::__to_chars_result std::__2::__to_chars_integral[abi:ne210108]<unsigned long, 0>(char*, char*, unsigned long, int)
-1162:std::__2::__to_chars_result std::__2::__to_chars_integral[abi:ne210108]<unsigned long long, 0>(char*, char*, unsigned long long, int)
-1163:std::__2::__throw_runtime_error(char const*)
-1164:std::__2::__thread_struct::~__thread_struct()
-1165:std::__2::__num_put_base::__format_float(char*, char const*, unsigned int)
-1166:std::__2::__num_get<wchar_t>::__stage2_float_loop(wchar_t, bool&, char&, char*, char*&, wchar_t, wchar_t, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&, unsigned int*, unsigned int*&, unsigned int&, wchar_t*)
-1167:std::__2::__num_get<char>::__stage2_float_loop(char, bool&, char&, char*, char*&, char, char, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&, unsigned int*, unsigned int*&, unsigned int&, char*)
-1168:std::__2::__itoa::__append8[abi:ne210108](char*, unsigned int)
-1169:std::__2::__deque_iterator<unsigned char, unsigned char*, unsigned char&, unsigned char**, long, 0l> std::__2::deque<unsigned char, std::__2::allocator<unsigned char>>::__insert_bidirectional[abi:ne210108]<unsigned char const*>(std::__2::__deque_iterator<unsigned char, unsigned char const*, unsigned char const&, unsigned char const* const*, long, 0l>, unsigned char const*, unsigned char const*, unsigned long)
-1170:std::__2::__async_assoc_state<void, std::__2::__async_func<Emulator::start()::$_0>>::__on_zero_shared()
-1171:simpleUPnPcommand
-1172:shr
-1173:shl
-1174:shil_param::shil_param(Sh4RegType)
-1175:sh4_sched_tick(int)
-1176:setTileClip(unsigned int, Rect&)
-1177:select
-1178:seal_pending_shard()
+1056:seal_pending_shard()
+1057:poll
+1058:pico_tree_prev
+1059:pico_tree_lastNode
+1060:pico_source_is_local
+1061:pico_socket_add
+1062:pico_protocol_init
+1063:pico_ipv4_mcast_leave
+1064:pico_ipv4_link_find
+1065:pico_frame_alloc
+1066:pico_discard_segment
+1067:path_basename
+1068:modem::V42Protocol::~V42Protocol()
+1069:mcfg_DestroyDevices(bool)
+1070:maple_ascii_stick::get_device_type()
+1071:loadBios(char const*, Archive*, Archive*, int)
+1072:jit_lookup(unsigned int)
+1073:inflateReset
+1074:hunk_read_into_memory
+1075:huffman_decode_one
+1076:glm::mat<4, 4, float, (glm::qualifier)0> glm::operator*<float, (glm::qualifier)0>(glm::mat<4, 4, float, (glm::qualifier)0> const&, glm::mat<4, 4, float, (glm::qualifier)0> const&)
+1077:gl4GetProgram(bool, bool, bool, bool, bool, unsigned int, bool, unsigned int, bool, bool, bool, bool, int, bool, Pass)
+1078:getc
+1079:getMieDevice()
+1080:free_ctx
+1081:fflush
+1082:elan::setStateParams(PolyParam&, elan::ICHList const*)
+1083:drflac_oggbs__goto_next_page
+1084:dlposix_memalign
+1085:copy_addr
+1086:convert_ioctl_struct
+1087:chd_close
+1088:cResetEvent::~cResetEvent()
+1089:bind
+1090:bemental::sh4::reloadOrInvalidate(WasmModuleBuilder&, bemental::sh4::RegCache&)
+1091:bemental::sh4::emitTailTo(WasmModuleBuilder&, unsigned int)
+1092:asio::detail::read_until_match_op_v2<asio::basic_stream_socket<asio::ip::tcp, asio::any_io_executor>, asio::dynamic_vector_buffer<unsigned char, std::__2::allocator<unsigned char>>, std::__2::pair<asio::buffers_iterator<asio::const_buffers_1, char>, bool> (*)(asio::buffers_iterator<asio::const_buffers_1, char>, asio::buffers_iterator<asio::const_buffers_1, char>), net::modbba::EthSocket::receive()::'lambda'(std::__2::error_code const&, unsigned long)>::operator()(std::__2::error_code, unsigned long, int)
+1093:aica::arm::recompiler::flush()
+1094:aica::arm::(anonymous namespace)::Arm7WasmEmitter::pushNZ()
+1095:_zip_string_get
+1096:_do_futex_wait
+1097:__uflow
+1098:__toread
+1099:__sin
+1100:__cos
+1101:ZSTD_getcBlockSize
+1102:ZSTD_compressBlock_opt2
+1103:ZSTDMT_freeBufferPool
+1104:WasmModuleBuilder::op_i64_shr_u()
+1105:TextureCacheData::Delete()
+1106:Sh4Context::UpdateFPSCR(Sh4Context*)
+1107:Serializer::Serializer(void*, unsigned long, bool)
+1108:OpenArchive(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
+1109:NetworkOutput::output(char const*, unsigned int)
+1110:NaomiCartridge::Serialize(Serializer&) const
+1111:NaomiCartridge::ReadMem(unsigned int, unsigned int)
+1112:NaomiCartridge::Deserialize(Deserializer&)
+1113:ModemEmu::send(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
+1114:MemChip::Load(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
+1115:MapleLink::unregisterLink(int, int)
+1116:FlycastException::FlycastException(char const*)
+1117:CustomTexture::terminate()
+1118:zip_source_rollback_write
+1119:wctomb
+1120:wchar_t* std::__2::find[abi:ne210108]<wchar_t*, wchar_t>(wchar_t*, wchar_t*, wchar_t const&)
+1121:void std::__2::vector<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::allocator<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>>::__assign_with_size[abi:ne210108]<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>*, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>*>(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>*, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>*, long)
+1122:void asio::execution::detail::any_executor_base::query_fn<asio::io_context::basic_executor_type<std::__2::allocator<void>, 0ul>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>>(void*, void const*, void const*)
+1123:void asio::execution::detail::any_executor_base::query_fn<asio::io_context::basic_executor_type<std::__2::allocator<void>, 0ul>, asio::execution::detail::blocking::never_t<0>>(void*, void const*, void const*)
+1124:void asio::detail::reactive_socket_service_base::async_send<asio::const_buffers_1, asio::detail::write_op<asio::basic_stream_socket<asio::ip::tcp, asio::any_io_executor>, asio::mutable_buffers_1, asio::mutable_buffer const*, asio::detail::transfer_all_t, std::__2::__bind<void (TcpSocket::*)(std::__2::error_code const&, unsigned long), std::__2::shared_ptr<TcpSocket>, std::__2::placeholders::__ph<1> const&, std::__2::placeholders::__ph<2> const&>>, asio::any_io_executor>(asio::detail::reactive_socket_service_base::base_implementation_type&, asio::const_buffers_1 const&, int, asio::detail::write_op<asio::basic_stream_socket<asio::ip::tcp, asio::any_io_executor>, asio::mutable_buffers_1, asio::mutable_buffer const*, asio::detail::transfer_all_t, std::__2::__bind<void (TcpSocket::*)(std::__2::error_code const&, unsigned long), std::__2::shared_ptr<TcpSocket>, std::__2::placeholders::__ph<1> const&, std::__2::placeholders::__ph<2> const&>>&, asio::any_io_executor const&)
+1125:updateLightgunCoordinates(unsigned int)
+1126:unsigned short aica::readRegInternal<unsigned short>(unsigned int)
+1127:unsigned long asio::basic_datagram_socket<asio::ip::udp, asio::any_io_executor>::send_to<asio::mutable_buffers_1>(asio::mutable_buffers_1 const&, asio::ip::basic_endpoint<asio::ip::udp> const&)
+1128:unlock
+1129:trinkle
+1130:tcp_discard_all_segments
+1131:tactx_Recycle(TA_context*)
+1132:tactx_Find(unsigned int, bool)
+1133:strtoul
+1134:std::runtime_error::~runtime_error()
+1135:std::logic_error::~logic_error()_8170
+1136:std::__throw_bad_alloc()
+1137:std::__2::vector<aica::arm::ArmOp, std::__2::allocator<aica::arm::ArmOp>>::insert(std::__2::__wrap_iter<aica::arm::ArmOp const*>, aica::arm::ArmOp const&)
+1138:std::__2::vector<N2Matrix, std::__2::allocator<N2Matrix>>::push_back[abi:ne210108](N2Matrix const&)
+1139:std::__2::pair<std::__2::__hash_iterator<std::__2::__hash_node<std::__2::__hash_value_type<unsigned int, memwatch::Page>, void*>*>, bool> std::__2::__hash_table<std::__2::__hash_value_type<unsigned int, memwatch::Page>, std::__2::__unordered_map_hasher<unsigned int, std::__2::pair<unsigned int const, memwatch::Page>, std::__2::hash<unsigned int>, std::__2::equal_to<unsigned int>, true>, std::__2::__unordered_map_equal<unsigned int, std::__2::pair<unsigned int const, memwatch::Page>, std::__2::equal_to<unsigned int>, std::__2::hash<unsigned int>, true>, std::__2::allocator<std::__2::pair<unsigned int const, memwatch::Page>>>::__emplace_unique_key_args<unsigned int, std::__2::piecewise_construct_t const&, std::__2::tuple<unsigned int const&>, std::__2::tuple<>>(unsigned int const&, std::__2::piecewise_construct_t const&, std::__2::tuple<unsigned int const&>&&, std::__2::tuple<>&&)
+1140:std::__2::pair<std::__2::__hash_iterator<std::__2::__hash_node<std::__2::__hash_value_type<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::vector<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::allocator<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>>>, void*>*>, bool> std::__2::__hash_table<std::__2::__hash_value_type<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::vector<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::allocator<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>>>, std::__2::__unordered_map_hasher<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::pair<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const, std::__2::vector<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::allocator<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>>>, std::__2::hash<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>, std::__2::equal_to<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>, true>, std::__2::__unordered_map_equal<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::pair<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const, std::__2::vector<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::allocator<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>>>, std::__2::equal_to<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>, std::__2::hash<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>, true>, std::__2::allocator<std::__2::pair<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const, std::__2::vector<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::allocator<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>>>>>::__emplace_unique_key_args<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::piecewise_construct_t const&, std::__2::tuple<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&>, std::__2::tuple<>>(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&, std::__2::piecewise_construct_t const&, std::__2::tuple<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&>&&, std::__2::tuple<>&&)
+1141:std::__2::moneypunct<wchar_t, false>::do_decimal_point() const
+1142:std::__2::moneypunct<char, false>::do_decimal_point() const
+1143:std::__2::istreambuf_iterator<wchar_t, std::__2::char_traits<wchar_t>>::operator++[abi:ne210108]()
+1144:std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>::operator++[abi:ne210108]()
+1145:std::__2::ios_base::imbue(std::__2::locale const&)
+1146:std::__2::condition_variable::wait(std::__2::unique_lock<std::__2::mutex>&)
+1147:std::__2::basic_stringbuf<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_stringbuf()
+1148:std::__2::basic_stringbuf<char, std::__2::char_traits<char>, std::__2::allocator<char>>::str(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
+1149:std::__2::basic_stringbuf<char, std::__2::char_traits<char>, std::__2::allocator<char>>::str() const
+1150:std::__2::basic_string<wchar_t, std::__2::char_traits<wchar_t>, std::__2::allocator<wchar_t>> const* std::__2::__scan_keyword[abi:ne210108]<std::__2::istreambuf_iterator<wchar_t, std::__2::char_traits<wchar_t>>, std::__2::basic_string<wchar_t, std::__2::char_traits<wchar_t>, std::__2::allocator<wchar_t>> const*, std::__2::ctype<wchar_t>>(std::__2::istreambuf_iterator<wchar_t, std::__2::char_traits<wchar_t>>&, std::__2::istreambuf_iterator<wchar_t, std::__2::char_traits<wchar_t>>, std::__2::basic_string<wchar_t, std::__2::char_traits<wchar_t>, std::__2::allocator<wchar_t>> const*, std::__2::basic_string<wchar_t, std::__2::char_traits<wchar_t>, std::__2::allocator<wchar_t>> const*, std::__2::ctype<wchar_t> const&, unsigned int&, bool)
+1151:std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const* std::__2::__scan_keyword[abi:ne210108]<std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const*, std::__2::ctype<char>>(std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>&, std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const*, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const*, std::__2::ctype<char> const&, unsigned int&, bool)
+1152:std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>::basic_string(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
+1153:std::__2::basic_streambuf<wchar_t, std::__2::char_traits<wchar_t>>::sbumpc[abi:ne210108]()
+1154:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::pbackfail(int)
+1155:std::__2::basic_ostream<char, std::__2::char_traits<char>>::sentry::sentry(std::__2::basic_ostream<char, std::__2::char_traits<char>>&)
+1156:std::__2::array<std::__2::list<std::__2::shared_ptr<MapleLink>, std::__2::allocator<std::__2::shared_ptr<MapleLink>>>, 2ul>::~array()
+1157:std::__2::__tree<std::__2::__value_type<void*, std::__2::shared_ptr<RuntimeBlockInfo>>, std::__2::__map_value_compare<void*, std::__2::pair<void* const, std::__2::shared_ptr<RuntimeBlockInfo>>, std::__2::less<void*>, true>, std::__2::allocator<std::__2::pair<void* const, std::__2::shared_ptr<RuntimeBlockInfo>>>>::destroy(std::__2::__tree_node<std::__2::__value_type<void*, std::__2::shared_ptr<RuntimeBlockInfo>>, void*>*)
+1158:std::__2::__tree<std::__2::__value_type<unsigned int, TextureData>, std::__2::__map_value_compare<unsigned int, std::__2::pair<unsigned int const, TextureData>, std::__2::less<unsigned int>, true>, std::__2::allocator<std::__2::pair<unsigned int const, TextureData>>>::destroy(std::__2::__tree_node<std::__2::__value_type<unsigned int, TextureData>, void*>*)
+1159:std::__2::__tree<std::__2::__value_type<SSAOptimizer::RegValue, unsigned int>, std::__2::__map_value_compare<SSAOptimizer::RegValue, std::__2::pair<SSAOptimizer::RegValue const, unsigned int>, std::__2::less<SSAOptimizer::RegValue>, true>, std::__2::allocator<std::__2::pair<SSAOptimizer::RegValue const, unsigned int>>>::destroy(std::__2::__tree_node<std::__2::__value_type<SSAOptimizer::RegValue, unsigned int>, void*>*)
+1160:std::__2::__tree<SSAOptimizer::RegValue, std::__2::less<SSAOptimizer::RegValue>, std::__2::allocator<SSAOptimizer::RegValue>>::destroy(std::__2::__tree_node<SSAOptimizer::RegValue, void*>*)
+1161:std::__2::__tree<RuntimeBlockInfo*, std::__2::less<RuntimeBlockInfo*>, std::__2::allocator<RuntimeBlockInfo*>>::destroy(std::__2::__tree_node<RuntimeBlockInfo*, void*>*)
+1162:std::__2::__to_chars_result std::__2::__to_chars_integral[abi:ne210108]<unsigned long, 0>(char*, char*, unsigned long, int)
+1163:std::__2::__to_chars_result std::__2::__to_chars_integral[abi:ne210108]<unsigned long long, 0>(char*, char*, unsigned long long, int)
+1164:std::__2::__throw_runtime_error(char const*)
+1165:std::__2::__thread_struct::~__thread_struct()
+1166:std::__2::__num_put_base::__format_float(char*, char const*, unsigned int)
+1167:std::__2::__num_get<wchar_t>::__stage2_float_loop(wchar_t, bool&, char&, char*, char*&, wchar_t, wchar_t, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&, unsigned int*, unsigned int*&, unsigned int&, wchar_t*)
+1168:std::__2::__num_get<char>::__stage2_float_loop(char, bool&, char&, char*, char*&, char, char, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&, unsigned int*, unsigned int*&, unsigned int&, char*)
+1169:std::__2::__itoa::__append8[abi:ne210108](char*, unsigned int)
+1170:std::__2::__deque_iterator<unsigned char, unsigned char*, unsigned char&, unsigned char**, long, 0l> std::__2::deque<unsigned char, std::__2::allocator<unsigned char>>::__insert_bidirectional[abi:ne210108]<unsigned char const*>(std::__2::__deque_iterator<unsigned char, unsigned char const*, unsigned char const&, unsigned char const* const*, long, 0l>, unsigned char const*, unsigned char const*, unsigned long)
+1171:std::__2::__async_assoc_state<void, std::__2::__async_func<Emulator::start()::$_0>>::__on_zero_shared()
+1172:simpleUPnPcommand
+1173:shr
+1174:shl
+1175:shil_param::shil_param(Sh4RegType)
+1176:sh4_sched_tick(int)
+1177:setTileClip(unsigned int, Rect&)
+1178:select
 1179:scalbnf
 1180:retro_serialize_size
 1181:reloadCounter(int, long long)

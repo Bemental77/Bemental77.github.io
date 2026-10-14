@@ -788,6 +788,10 @@ static constexpr u64 SHARD_DISPATCH_SEAL = 1000000;  // bumped from 100K — was
 
 static std::vector<RuntimeBlockInfo*> s_pending_shard;
 static u64 s_dispatches_at_last_seal = 0;
+// Interpreted instructions spent on pending (compiled, un-sealed) spans since
+// the last seal; >= SHARD_INTERP_SEAL seals (span_interp_pending).
+static u32 s_pending_interp = 0;
+static constexpr u32 SHARD_INTERP_SEAL = 50000;
 // 6D fix: the pending-vaddr dedup set must live WITH the pending vector —
 // as a function-static it survived seals and bm resets, so recompiled
 // blocks skipped the push forever while fresh RuntimeBlockInfo* churned.
@@ -890,6 +894,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_rb_reset_host_history(void) {
 // fallback so a low-rate boot phase doesn't leave blocks pending forever.
 
 static void seal_pending_shard() {
+    s_pending_interp = 0;
     if (s_pending_shard.empty()) return;
 
     std::vector<u8> bytes = bemental::sh4::build_blocks(s_pending_shard);
@@ -1662,9 +1667,24 @@ static bool span_interp_pending(Sh4Context* ctx, u32 pc)
     // is now recoverable, because find_span resolves the mid-span pc it leaves
     // behind on the next dispatch.
     int guard = (int)((hilim - lo) / 2) + 1024;
+    const int g0 = guard;
     while (ctx->pc >= lo && ctx->pc < hilim &&
            --guard > 0 && ctx->CpuRunning)
         interp_one_step(ctx, ctx->pc);
+    // HOT PENDING CODE IS SEALED NOW, NOT WHEN 4096 BLOCKS HAVE QUEUED. A
+    // compiled-but-pending block runs here in the INTERPRETER (~20-50x the
+    // JIT's cost) until its shard seals, and the only seal triggers were the
+    // 4096-block cap and a 100K-dispatch check made only when ANOTHER block
+    // compiles. A boot or level load (Gauntlet: guest 0.42-0.50x at duty 100%,
+    // span_interp_pending + Sh4Interpreter::Step 6.8% self) spent seconds
+    // interpreting code that was already compiled. Seal once the pending
+    // spans have cost SHARD_INTERP_SEAL interpreted instructions. The count
+    // is a pure function of guest execution and the pending set, the same
+    // class as the dispatch-count trigger, so peers that share a cache
+    // history (every lockstep room starts from a flush) seal at the same point.
+    s_pending_interp += (u32)(g0 - guard);
+    if (s_pending_interp >= SHARD_INTERP_SEAL && !s_pending_shard.empty())
+        seal_pending_shard();
     return true;
 }
 
@@ -2651,6 +2671,7 @@ public:
 		// makes the delta start at 0 in BOTH, so the seal schedule is a pure
 		// function of guest execution.
 		s_dispatches_at_last_seal = s_dispatch_count;
+		s_pending_interp = 0;
 		// ROLLBACK DETERMINISM (patch 0001): the idle-skip streak is host
 		// history no savestate carries. Zero it on every reset so a restore
 		// starts the progress bound from the same phase on every run/peer.
