@@ -6382,7 +6382,7 @@
       // rollback mode BEFORE frame 0 is fed — the same point on every console.
       if (ls.rollback > 0 && !LS.rbArmed) {
         LS.rbArmed = true;
-        worker.postMessage({ cmd: 'rbArm', w: ls.rollback, broken: LSQ.rbBroken ? 1 : 0 });
+        worker.postMessage({ cmd: 'rbArm', w: ls.rollback, broken: LSQ.rbBroken ? 1 : 0, keepMode: new URLSearchParams(location.search).get('dcrbkeepmode') === '1' ? 1 : 0 });
         pageLog('[rollback] room runs ROLLBACK, window ' + ls.rollback + ' frames — zero local input delay; ' +
                 'a late remote input re-simulates from the frame it changed');
       }

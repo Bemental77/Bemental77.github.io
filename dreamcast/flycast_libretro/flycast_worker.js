@@ -970,6 +970,34 @@
     }
     return true;
   }
+  // ---------------------------------------------------------------------------
+  // THE CORE FOLLOWS THE ROOM'S MODE (2026-10-14). rbArm puts the core in
+  // rollback mode (per-block install, shard off, stale hit -> recompile), which
+  // a rollback frame needs for exactness and which costs throughput. A
+  // capacity-gated room that falls back to delay used to KEEP it, so a console
+  // too slow for rollback then ran its delay frames on the slower core too
+  // (Gauntlet, ?dcrb=4 on this box: gate -> delay after 1 s, room 0.786x vs
+  // 0.872x plain delay). Now the first delay frame after a rollback stretch
+  // leaves rollback mode and restores the shard; the first rollback frame
+  // after a delay stretch re-enters it. Both directions flush the code cache,
+  // so routing stays a pure function of guest state: every console switches
+  // at the same frame (the engine's agreed mode epoch), from the same flush.
+  // ?dcrbkeepmode=1 (page) is the control: the old keep-rollback-mode.
+  // ---------------------------------------------------------------------------
+  let rbCoreOn = false, rbKeepMode = false, shardWanted = true;
+  function rbSwitchCore(M, on, f) {
+    try {
+      if (on) M._emscripten_set_rollback_mode(1);   // flushes, shard off
+      else {
+        M._emscripten_set_rollback_mode(0);
+        if (typeof M._flycast_set_shard === 'function') M._flycast_set_shard(shardWanted ? 1 : 0);
+        if (typeof M._flycast_lockstep_reset === 'function') M._flycast_lockstep_reset();
+        if (typeof M._flycast_ic_invalidate === 'function') M._flycast_ic_invalidate();
+      }
+      rbCoreOn = on; rbStats.modeSwitches = (rbStats.modeSwitches | 0) + 1;
+      postMessage({ cmd: 'print', txt: '[rollback] core ' + (on ? 'ENTERS rollback mode' : 'LEAVES rollback mode (shard ' + (shardWanted ? 'on' : 'off') + ')') + ' at frame ' + f });
+    } catch (e) { rbFault('mode switch at frame ' + f + ' threw: ' + ((e && e.message) || e)); }
+  }
   // Hash every owed confirmed frame whose after-state is in the ring.
   function rbHashOwed(M, upTo) {
     if (!rbDue.length) return;
@@ -1512,6 +1540,7 @@
           'it — it starts the room on the same machine as everyone' });
       }
       lsQueue.delete(lsFrame);
+      if (rbSlots && !rbKeepMode && !!inp.rb !== rbCoreOn) rbSwitchCore(Module, !!inp.rb, lsFrame);
       if (inp.rb) {
         curRb = true;
         let rbOk = false;
@@ -1832,6 +1861,7 @@
       case 'rbArm': {
         if (runIterSuspended()) { rbFault('rbArm while a frame is asyncify-suspended'); break; }
         const ok = rbArm(data.w | 0);
+        rbCoreOn = !!ok; rbKeepMode = !!data.keepMode;
         rbBroken = !!data.broken;
         if (rbBroken) postMessage({ cmd: 'print', txt: '[rollback] ⚠ BROKEN-VARIANT CONTROL: this worker ignores every re-simulation plan (?dcrbbroken=1) — the room must desync' });
         postMessage({ cmd: 'rbArmed', ok, w: rbW, slots: rbN, mb: Math.round(rbN * rbSize / 1048576), why: rbStats.fault });
@@ -2610,6 +2640,7 @@
       case 'shard': {
         try {
           if (Module._flycast_set_shard) Module._flycast_set_shard(data.on | 0);
+          shardWanted = !!(data.on | 0);
           postMessage({ cmd: 'print', txt: '[shard] enabled=' + (data.on | 0) });
         } catch (err) {
           postMessage({ cmd: 'print', txt: '[shard] threw: ' + (err && err.message ? err.message : String(err)) });
