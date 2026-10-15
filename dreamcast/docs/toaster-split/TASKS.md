@@ -424,6 +424,82 @@ Exactness, wasm `d31fabe4`:
 - Mixed rollback rooms with the joiner on `tcntfp=0`: PSO 33, Gauntlet 32, IN SYNC.
 - Boots: PSO lobby 1.000x and Gauntlet attract, with screenshots.
 
+## 2026-10-15 — exact fast-forward of PSO's timed wait (?pswff=0 control)
+
+The loop (0x8c38d480..0x8c38d4a8, read in place from a `?peek` dump of the bench scene):
+
+```
+8c38d480 jsr @R13 (8c37b636: R0 = ~[0xffd8000c] = ~TCNT0) ; nop
+8c38d484 mov R0,R5 ; jsr @R10 (8c37b640: R0 = R5 - R4) ; mov.l @R12,R4   (R12 = 8c58d144, the start tick)
+8c38d48a jsr @R9 (8c37b67a: R0 = ((d&127)*100>>7) + (d>>7)*100) ; mov R0,R4
+8c38d48e mov R0,R14 ; if (*0x8c58caf4 == 0) goto 8c38d49e (exit)
+8c38d498 if (R14 <u 0x28870) goto 8c38d480
+```
+
+A pass is 8 blocks, 51 guest cycles (3+9+6+4+3+15+7+4, from flycast's decoder). It
+stores nothing and touches no stack. It reads TCNT0, the start tick and the flag.
+Between two scheduler ticks nothing else can change RAM or deliver an interrupt, so
+a pass differs from the one before only in its TCNT0 value. That value is a pure
+function of guest time (`tmu.cpp`: base - (now() >> shift)). The registers after
+a pass depend only on the last read: R0 = R14 = e(d), R4 = d, R5 = 100,
+R2 = 0x28870, R3 = 0x8c58caf4, MACL = 100*(d>>7), PR = 0x8c38d48e, T = 0.
+
+`pswff_try` (rec_wasm.cpp) applies K passes at the head. The per-pass TCNT values
+come from `tmu_tcnt_model` / `tmu_now_cycles`, new in tmu.cpp, with no side effects.
+The read in pass j happens at now0 + (j-1)*51 + 12. K stops before any of these:
+- the first slice credit that would tick the scheduler (gwff_try's closed form);
+- the pass whose e(d) reaches 0x28870. That pass runs for real, so the guest takes its own exit;
+- any read below zero, where the real read reloads TCNT and raises TUNI0;
+- a wrap of d.
+
+e(d) is monotone over u32, so K is found by bisection. All 8 blocks must be
+compiled and live: `jit_live` is a side-effect-free `jit_lookup`. A pending block
+runs interpreted at a different cycle charge. The first check build without this
+rule mismatched cc in 191 predictions after the restore. Anything else unexpected
+falls back. K is ~87-96 passes in the bench scene (the next event bounds it).
+`?pswff=2` (DIAG) predicts K passes, applies nothing, and compares
+R0-R15/PR/MACL/MACH/T/cc/sched_next at the K-th following head arrival: **327,310
+predictions, 0 mismatches**. The 1-pass version: 1.9M, 0.
+
+The head is unlinked in every arm, the control included (second emitter no-link
+slot). `?pswff=0` compiles the same code and differs only in the apply.
+
+Measured. Bench scene, rate 1, `toaster_split.mjs 1 40`, emu ms per guest second
+(last 30 heartbeats), 4 interleaved pairs, load 3.1-5.6, wasm `25c20ad8`. On / off:
+321.2 / 400.3, 323.6 / 422.0, 341.9 / 415.0, 340.2 / 406.2. Mean **331.7 vs 410.9,
+-19.3%**, and every pair favours on.
+
+Exactness, wasm `25c20ad8`:
+- `?aicahash=1` on vs off, bench scene, 47 windows each (~230 s):
+  - With `?noshard=1`, **47/47 identical**. A build before the final one gave 25/25.
+  - Sharded (the default), 45/47 identical. Audio and AICA state match in all 47.
+    The SH4 RAM hash differs at w=24, the first window after the seed restore,
+    which is the JIT refill. It also differs at w=45. With 4 KB page hashes at
+    w=24/25, the difference is 3 pages: 0x8c00f000, 0x8c58d000 (the loop's start/end
+    ticks) and 0x8c5b9000 (frame-wait words). Both arms re-converge.
+  - A no-op arm (`?pswff=2`, nothing applied) also differed from off at w=24.
+    Before the head was unlinked in every arm, the linkable control differed at w=25.
+  - Cause: outside rollback mode, shard seal points follow dispatch counts.
+    Removing dispatches moves which blocks run interpreted, and those run at a
+    different cycle charge. This is the gwff caveat above. noshard removes it,
+    and rollback mode (per-block install) removes it too.
+- Rollback rig on the PSO lobby: REF1==REF2 61/61, REF==RB 59/59, 0 full-flush fallbacks
+  (809 fast-forwards during warm). On a Character Select state (the bench scene,
+  10,441 fast-forwards / 90.8K passes in warm): 61/61 and 59/59.
+- Soaks IN SYNC. PSO lockstep: 67 RAM checkpoints + 67 fingerprints, 115.8 guest s.
+  PSO forced rollback: 37. Gauntlet forced rollback: 35 RAM + 38 fingerprints.
+- Mixed PSO rollback room (`dcrbforce=1`, joiner `?pswff=0`): **IN SYNC over 37 RAM
+  checkpoints and 37 fingerprints**, while the host applied 34.4M fast-forwarded passes.
+- `verify_core_tree` PASS. Boots: PSO lobby 1.000x and the bench Character Select
+  (bench PASS 1.000x), with screenshots.
+
+Toaster: `tools/toaster_bench.mjs --pages dreamcast --rate 6.2 --reps 2 --ladder 0`,
+run back to back.
+- On (load 4.3 at start, 8.4 at end): solo **0.813 / 0.840**, room 0.287 / 0.303.
+- Off (`--qs pswff=0`, load 8.4 -> 9.1): solo 0.549 / 0.596, room 0.277 / 0.223.
+- The off arm ran at higher load, so this is not a clean pair.
+- Solo on is above every earlier band in this file (0.58-0.68x). It is still 0/2 PASS.
+
 ## Status
 
 - [x] Split measured: solo at 1 and 6.2, room at 6.2 for 60 s, and a worker
