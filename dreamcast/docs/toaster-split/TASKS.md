@@ -785,6 +785,27 @@ PSO forced rollback 33, Gauntlet forced rollback 29 + 32, mixed PSO rollback roo
 joiner on `?armff=0` 33 + 33 (40 / 43 rollbacks). Boots with screenshots: PSO lobby 0.997x,
 Gauntlet intro 1.009x. `verify_core_tree` PASS.
 
+## 2026-10-15 (later) — four more candidates, each measured in-run and null
+
+All with `toaster_split.mjs 6.2 200 '' --ab KNOB:8` (the knob toggled in the worker every
+8 s; the noise floor of this rig is ~1-1.5%), base = g2ff + armff (wasm `e8316176`). None was kept.
+
+| candidate | on | off | verdict |
+|---|---|---|---|
+| b2ff: the G2 bulk copy 0x8c37b2c4 K words at a time (DIAG 16,605 / 0 bad; ~74 words a fast-forward, sound-RAM destination) | 1044.7 | 1045.3 | null |
+| iskloop: the idle-skip burn + credit sequence looped inside the trampoline | 1065.8 | 1052.5 | null (dispatcher overhead is not where idle time goes) |
+| GL recorder: drop redundant activeTexture/bindTexture (glsm re-applies ~130 a frame; 52K of 50-150 ops a post) | busy 1097.9 | 1094.4 | null |
+| pswff head check from 3 literals instead of ~36 ReadMem16 (DIAG 262K / 0 bad) | 1043.2 | 1048.8 | -0.5%, inside the noise |
+
+Also seen: the lazy disc's async readahead never completes in the bench (`readahead=0` in
+[lazydisc]); misses (~0.2/s) inflate synchronously in JS. Small at steady state.
+
+Where the toaster stands (bench scene, rate 6.2): ~1045 ms of emulation per guest second,
+x = 0.90-0.93 over 200 s windows; the 20 s gate cell reads 0.74-0.93 run to run on this box.
+1.000x needs ~950: about 10% more. The remaining split is flat: SH4 emitted code ~46% over
+~2000 pcs, dispatch/scheduler ~15%, AICA/ARM per sample ~12% (armff_go itself 4.5%), JS ~11%.
+Gauntlet's attract is a video decode at 94% executed guest time: ~6x short at 6.2.
+
 ## Status
 
 - [x] Split measured: solo at 1 and 6.2, room at 6.2 for 60 s, and a worker
