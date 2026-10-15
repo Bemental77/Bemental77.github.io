@@ -197,6 +197,88 @@ emitted SH4 code at 55% of busy time and FLAT: the hottest block is 1.2%, and th
 30th is 0.17%. The remaining dispatcher share is the SH4_TIMESLICE (448) round
 trip, about 446K a guest second.
 
+## Tried and rejected 2026-10-15: AICA + ARM7 on their own pthread
+
+The design is in the reflog: local commits acf7c1b..63c7e42, never pushed.
+- The SH4 thread posted sample k at its own guest time T_k and kept running.
+- A pthread ran `arm::run(1)` for that sample.
+- Every SH4 access to AICA space (sb_mem.cpp area 0, the aica_if.cpp G2 DMA) and every
+  savestate first waited for the posted sample.
+- The AICA -> SH4 IRQ level was re-derived on the SH4 thread at T_k+1, at most one sample late.
+
+Semantics were otherwise exact. Measured how often the SH4 touches AICA space:
+
+| scene | accesses/s | distinct sample periods/s with an access |
+|---|---|---|
+| PSO Pioneer 2 lobby | 45.6K | 2.8K (of 44.1K) |
+| Gauntlet | — | ~70 |
+
+So the coupling is loose enough on paper. On this box it lost badly:
+
+| run | without the thread | with the thread |
+|---|---|---|
+| PSO lobby at 1.000x, emu ms per guest second | 442 | 559-733 |
+| toaster rate 6.2, solo | 0.684 | 0.343 |
+
+Instrumented: the AICA thread was busy only ~10% of wall (2.2 us a sample).
+The SH4 still waited at 78% of samples, about 7.6 us each, ~25% of wall in all.
+The cause: a spinning thread gets descheduled while idle, then misses the next
+post. That happens on a box whose four cores are already shared with SwiftShader,
+the render worker and the browser, and under the toaster's duty cycle. A per-sample
+handoff needs a core of its own. A batched handoff (lag L samples) would shift
+SPU-IRQ timing by L samples. It would also still pay a full sync at every SH4 AICA
+access, and with a sleeping thread that sync costs a wake latency. Not pursued.
+
+## Guest-work cut: exact fast-forward of Gauntlet's timed wait (2026-10-15)
+
+Guest-PC histogram (`?pchist=A,B`, weights each PC by the guest cycles it took).
+PSO lobby: 64.6% of guest time is already removed by the frame-wait idle skip.
+Gauntlet attract: 0% was skipped. In the window measured after this change,
+7.9% of guest time sat in one loop at 0x8c032e5a. Another ~6.7% sits in a
+TMU-timed delay (0x8c015db6 -> 0x8c0429c8, which reads TCNT0 and divides);
+that one is not touched yet.
+
+The loop (caller 0x8c032e20) is a timed wait: up to 0x100000 passes of
+`jsr @R13 (0x8c038440) ; mov #7,R4`, then `(*[R15])--`, exit if
+`*[R15+4] != R14`, loop while `*[R15] != 0`. 0x8c038440 calls table entry 7
+of 0x8c35c274, which is the null stub 0x8c036600 (rts; nop). It reads no
+timer. A pass is 6 blocks and 50 guest cycles: 3+17+3+8+12+7, learned from
+flycast's decoder.
+
+`gwff_try` (rec_wasm.cpp) applies K passes in one step at the loop head. K stops
+before the first slice credit that would tick the scheduler, and before the pass
+that takes the counter to zero. The cycle bookkeeping is closed-form (see the
+comment there). It falls back to running the pass on anything unexpected: code
+bytes, the table entry, aliasing, a pending interrupt, the MMU, or block lengths
+not yet learned. The head is excluded from chaining and from intra-shard
+tail-links (`bemental_sh4_set_nolink_pc`), so every arrival is seen. `?gwff=0`
+is the control. The learned cycle table is host history, but the transform is
+exact, so FF vs no-FF produces the same guest state. The mixed-arm room below
+proves this directly.
+
+Measured: K is ~89 passes per fast-forward (the next scheduler event, ~4.5K
+cycles, is the bound), 25.3M passes and 295K fast-forwards in 120 s, the same
+counts in every run. Gauntlet cold-boot attract, 6 interleaved pairs, load
+3.8-5.2, emu ms per guest second, on/off: 744/764, 767/737, 740/764,
+723/749, 740/742, 743/741. Mean 743 vs 750, about -1%, inside the noise. The
+skipped passes were cheap chained blocks. The toaster bench runs PSO, where
+this does not fire.
+
+Exactness, wasm `253ef97a`:
+- Mixed-arm Gauntlet room in rollback mode (`dcrb=4&dcrbforce=1`), host gwff
+  on, joiner `?gwff=0`: IN SYNC over 48 RAM checkpoints and 48 engine
+  fingerprints across 92.3 guest s. The host applied 9.8M fast-forwarded passes
+  inside that span. This is the direct proof: FF and no-FF reach the same state.
+- Rollback rig 60/60 EXACT (PSO lobby). Soaks IN SYNC: PSO lockstep, PSO forced
+  rollback, Gauntlet forced rollback. Gauntlet boots at 0.998x.
+- A mixed-arm room in plain LOCKSTEP (not rollback) DESYNCs at f180. That run
+  is not a test of exactness. The same mixed lockstep room with `?sliceinwasm=0`
+  on the joiner, a knob that is exact by construction, also DESYNCs, while the
+  same-arm Gauntlet lockstep room is IN SYNC (29 checkpoints). Outside rollback
+  mode, block routing (shard seal points, pending-span interpretation) follows
+  host dispatch history, so any knob that changes dispatch counts forks a
+  mixed room. Rooms run one build, so peers share that history.
+
 ## Status
 
 - [x] Split measured: solo at 1 and 6.2, room at 6.2 for 60 s, and a worker

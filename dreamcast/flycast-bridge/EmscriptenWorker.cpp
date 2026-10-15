@@ -3024,3 +3024,30 @@ int main(void) {
     emscripten_exit_with_live_runtime();
     return 0;
 }
+
+// DIAG: disassemble n SH4 instructions at addr (with PC-relative literals) and
+// dump the live GPRs + the 8 words at R15 — for reading a hot loop in place.
+#include "hw/sh4/sh4_opcode_list.h"
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_sh4dis(uint32_t addr, int n) {
+    char line[256];
+    snprintf(line, sizeof line, "[sh4dis] pc=%08x pr=%08x sr=%08x r0-7=%08x %08x %08x %08x %08x %08x %08x %08x", Sh4cntx.pc, Sh4cntx.pr, Sh4cntx.sr.getFull(),
+             Sh4cntx.r[0], Sh4cntx.r[1], Sh4cntx.r[2], Sh4cntx.r[3], Sh4cntx.r[4], Sh4cntx.r[5], Sh4cntx.r[6], Sh4cntx.r[7]);
+    MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt: UTF8ToString($0)}); }, line);
+    snprintf(line, sizeof line, "[sh4dis] r8-15=%08x %08x %08x %08x %08x %08x %08x %08x", Sh4cntx.r[8], Sh4cntx.r[9], Sh4cntx.r[10], Sh4cntx.r[11], Sh4cntx.r[12], Sh4cntx.r[13], Sh4cntx.r[14], Sh4cntx.r[15]);
+    MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt: UTF8ToString($0)}); }, line);
+    std::string st = "[sh4dis] @r15:";
+    for (int i = 0; i < 8; i++) { char b[16]; snprintf(b, sizeof b, " %08x", ReadMem32(Sh4cntx.r[15] + i * 4)); st += b; }
+    MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt: UTF8ToString($0)}); }, st.c_str());
+    for (int j = 0; j < n; j++) {
+        const uint32_t pc = addr + j * 2;
+        const uint16_t op = ReadMem16(pc);
+        char d[256] = {0};
+        if (OpDesc[op]) OpDesc[op]->Disassemble(d, pc, op);
+        std::string t = d; size_t sp = t.find(" ; "); if (sp != std::string::npos) t = t.substr(0, sp);
+        char lit[32] = "";
+        if ((op & 0xF000) == 0xD000) snprintf(lit, sizeof lit, " {=%08x}", ReadMem32((pc & ~3u) + 4 + (op & 0xFF) * 4));
+        if ((op & 0xF000) == 0x9000) snprintf(lit, sizeof lit, " {=%04x}", ReadMem16(pc + 4 + (op & 0xFF) * 2));
+        snprintf(line, sizeof line, "[sh4dis] %08x %04x  %s%s", pc, op, t.c_str(), lit);
+        MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt: UTF8ToString($0)}); }, line);
+    }
+}

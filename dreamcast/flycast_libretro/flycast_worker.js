@@ -2919,6 +2919,14 @@
         break;
       }
 
+      case 'sh4dis': {   // DIAG: disassemble a guest range in place (EmscriptenWorker.cpp flycast_sh4dis)
+        try { if (Module._flycast_sh4dis) Module._flycast_sh4dis(data.addr >>> 0, data.n | 0); } catch (err) { postMessage({ cmd: 'print', txt: '[sh4dis] threw: ' + err }); }
+        break;
+      }
+      case 'pchist': {   // DIAG: guest-time PC histogram (rec_wasm.cpp flycast_pchist)
+        try { if (Module._flycast_pchist) Module._flycast_pchist(data.what | 0); } catch (err) { postMessage({ cmd: 'print', txt: '[pchist] threw: ' + err }); }
+        break;
+      }
       case 'sliceinwasm': {
         try {
           if (Module._flycast_set_slice_inwasm) Module._flycast_set_slice_inwasm(data.on | 0);
@@ -3120,6 +3128,16 @@
                           : 'none — this binary has no per-port VMU accessors') });
         } catch (err) {
           postMessage({ cmd: 'vmuInfo', ports: 0, slots: [], error: String(err && err.message || err) });
+        }
+        break;
+      }
+
+      case 'setgwff': {
+        try {
+          if (Module._flycast_set_gwff) Module._flycast_set_gwff((data.on | 0));
+          postMessage({ cmd: 'print', txt: '[setgwff] g_gwff=' + (data.on | 0) });
+        } catch (err) {
+          postMessage({ cmd: 'print', txt: '[setgwff] threw: ' + (err && err.message ? err.message : String(err)) });
         }
         break;
       }

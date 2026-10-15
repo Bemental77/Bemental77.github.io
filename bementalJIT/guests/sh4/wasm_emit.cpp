@@ -253,6 +253,11 @@ bool g_emit_slice_inwasm = []{
     return !(e && e[0] == '0');
 }();
 static inline bool hopGuard() { return g_emit_hop_guard && !(g_emit_slice_inwasm && g_emit_prologue_trim); }
+// NO-LINK PC (2026-10-15; rec_wasm.cpp gwff_try). A block entry the C
+// trampoline must SEE on every arrival (an exact fast-forward lives there) is
+// never made an intra-shard tail-link or trace target: build_blocks leaves it
+// out of its sibling maps. 0 = none. Compile-time, like the other emit levers.
+u32 g_emit_nolink_pc = 0;
 
 // ---------------------------------------------------------------------------
 // Env-var gates (module-scope, read once at first emit). Both default OFF —
@@ -4627,6 +4632,7 @@ std::vector<u8> build_blocks(const std::vector<RuntimeBlockInfo*>& blocks) {
     vaddr_to_block.reserve(n);
     for (u32 i = 0; i < n; ++i) {
         if (blocks[i] != nullptr) {
+            if (g_emit_nolink_pc && blocks[i]->vaddr == g_emit_nolink_pc) continue;
             vaddr_to_idx[blocks[i]->vaddr] = i;
             vaddr_to_block[blocks[i]->vaddr] = blocks[i];
         }
@@ -4705,6 +4711,9 @@ extern "C" void bemental_sh4_set_hop_guard(int on) {
 }
 extern "C" void bemental_sh4_set_slice_inwasm(int on) {
     bemental::sh4::g_emit_slice_inwasm = !!on;
+}
+extern "C" void bemental_sh4_set_nolink_pc(u32 pc) {
+    bemental::sh4::g_emit_nolink_pc = pc;
 }
 // Single-predicate BET_CLS_COND exit (2026-08-29). DEFAULT ON; bisect switch.
 extern "C" void bemental_sh4_set_cond_merge(int on) {
