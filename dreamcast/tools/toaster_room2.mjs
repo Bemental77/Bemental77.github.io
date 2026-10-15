@@ -16,8 +16,12 @@
 //   * SPEED   — every thread of every RENDERER process (page, workers, audio,
 //     V8 background threads) gets its own cpu cgroup with a quota of 1/R of one
 //     core (cfs period 10 ms): each thread runs at <= 1/R of a core, the same
-//     per-thread slowdown the duty cycle imposes, and like it the GPU and browser
-//     processes are not slowed. Threads are re-scanned every 300 ms.
+//     per-thread slowdown the duty cycle imposes. SINCE 2026-10-15 THE GPU
+//     PROCESS'S THREADS GET THE SAME QUOTA (SwiftShader rasterises there: a no-GPU
+//     device rasterises on its own slow CPU); --gpuoff is the old arm. The browser
+//     process is not slowed. Threads are re-scanned every 300 ms.
+//     Raster proof: RASTER index (a fragment-bound WebGL2 loop, the same as
+//     tools/toaster_bench.mjs) free vs quota must slow >= 0.5 R with the GPU arm on.
 //   * PROOF (printed, and the run is VOID without it): Lighthouse BenchmarkIndex
 //     (tools/toaster_bench.mjs BENCH_SRC) in a dedicated worker of each browser
 //       free      — cpuset only, no quota (median of 5 x 2 s)
@@ -37,7 +41,7 @@
 //
 //   npm run web ; node tools/browser_leak_guard.js reap && uptime
 //   bash tools/probe_lock.sh run -- node dreamcast/tools/toaster_room2.mjs <room|solo|pair> <rate> <sec> [extra-query]
-//        [--jextra Q] [--name N] [--noproof] [--cores 2]
+//        [--jextra Q] [--name N] [--noproof] [--cores 2] [--gpuoff]
 // Output: /tmp/dc-room2/<name>.json (+ screenshots).
 // ============================================================================
 import { createRequire } from 'module'; import fs from 'fs'; import os from 'os'; import path from 'path';
@@ -49,14 +53,14 @@ const guard = (await import(path.join(ROOT, 'tools/browser_leak_guard.js'))).def
 const a = process.argv.slice(2);
 const mode = a[0] || 'room', rate = +a[1] || 6.2, secs = +a[2] || 20, extra = a[3] && !a[3].startsWith('--') ? a[3] : '';
 const fl = (n) => { const i = a.indexOf('--' + n); return i >= 0 ? a[i + 1] : null; };
-const name = fl('name') || `${mode}-${rate}`, NOPROOF = a.includes('--noproof'), CORES = +(fl('cores') || 2);
+const name = fl('name') || `${mode}-${rate}`, NOPROOF = a.includes('--noproof'), CORES = +(fl('cores') || 2), GPUOFF = a.includes('--gpuoff');
 const BASE = process.env.BASE_URL || 'http://localhost:8080';
 const CHROME = process.env.CHROME_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
 const OUTD = '/tmp/dc-room2'; fs.mkdirSync(OUTD, { recursive: true });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const T0 = Date.now(); const ts = () => +((Date.now() - T0) / 1000).toFixed(1);
 const say = (s) => console.log(`[${ts()}s] ${s}`);
-const out = { name, mode, rate, secs, extra, cores: CORES, load0: os.loadavg(), players: {} };
+const out = { name, mode, rate, secs, extra, cores: CORES, gpuThrottle: !GPUOFF, load0: os.loadavg(), players: {} };
 
 // ---- cgroups ---------------------------------------------------------------------------
 const CPU = '/sys/fs/cgroup/cpu', CPUSET = '/sys/fs/cgroup/cpuset';
@@ -79,21 +83,30 @@ function makeDevice(P, cpus) {
   fs.writeFileSync(path.join(set, 'cpuset.cpus'), cpus);
   const top = path.join(CPU, `${TAG}-${P.role}`);
   fs.mkdirSync(top);
-  P.dev = { set, top, cpus, groups: new Map(), quotaOn: false, frac: 1 / rate };
+  P.dev = { set, top, cpus, groups: new Map(), mult: new Map(), quotaOn: false, frac: 1 / rate };
 }
 function deviceScan(P) {
   const bpid = P.browser.process().pid;
   for (const pid of tree(bpid)) {
     let tids = []; try { tids = fs.readdirSync(`/proc/${pid}/task`); } catch (e) { continue; }
     for (const t of tids) { try { fs.writeFileSync(path.join(P.dev.set, 'tasks'), t); } catch (e) {} }   // cpuset: every thread
-    if (ptype(pid) !== 'renderer') continue;
+    const pt = ptype(pid);
+    if (pt !== 'renderer' && (GPUOFF || pt !== 'gpu-process')) continue;
+    // The GPU process is ONE group with a quota of CORES/R cores, all its threads together:
+    // SwiftShader rasterises on several threads in parallel, and a per-thread 1/R cap let 4
+    // threads take 4/R of the device (measured: raster slowed 3.49x at R=6.2). A device R
+    // times slower gives the whole rasterizer CORES/R cores.
+    const gpuG = pt === 'gpu-process' ? path.join(P.dev.top, 'g' + pid) : null;
     for (const t of tids) {
       if (P.dev.groups.has(+t)) continue;
-      const g = path.join(P.dev.top, 't' + t);
+      const g = gpuG || path.join(P.dev.top, 't' + t);
       try {
-        fs.mkdirSync(g);
-        fs.writeFileSync(path.join(g, 'cpu.cfs_period_us'), '10000');
-        fs.writeFileSync(path.join(g, 'cpu.cfs_quota_us'), P.dev.quotaOn ? String(Math.round(10000 * P.dev.frac)) : '-1');
+        if (!fs.existsSync(g)) {
+          fs.mkdirSync(g);
+          fs.writeFileSync(path.join(g, 'cpu.cfs_period_us'), '10000');
+          P.dev.mult.set(g, gpuG ? CORES : 1);
+          fs.writeFileSync(path.join(g, 'cpu.cfs_quota_us'), P.dev.quotaOn ? String(Math.round(10000 * P.dev.frac * P.dev.mult.get(g))) : '-1');
+        }
         fs.writeFileSync(path.join(g, 'tasks'), t);
         P.dev.groups.set(+t, g);
       } catch (e) {}
@@ -102,11 +115,11 @@ function deviceScan(P) {
 }
 function deviceQuota(P, on) {
   P.dev.quotaOn = on;
-  for (const g of P.dev.groups.values()) { try { fs.writeFileSync(path.join(g, 'cpu.cfs_quota_us'), on ? String(Math.round(10000 * P.dev.frac)) : '-1'); } catch (e) {} }
+  for (const g of new Set(P.dev.groups.values())) { try { fs.writeFileSync(path.join(g, 'cpu.cfs_quota_us'), on ? String(Math.round(10000 * P.dev.frac * (P.dev.mult.get(g) || 1))) : '-1'); } catch (e) {} }
 }
 function deviceStat(P) {
   let thr = 0, nrp = 0, nrt = 0;
-  for (const g of P.dev.groups.values()) {
+  for (const g of new Set(P.dev.groups.values())) {
     try { for (const l of fs.readFileSync(path.join(g, 'cpu.stat'), 'utf8').trim().split('\n')) { const [k, v] = l.split(' ');
       if (k === 'nr_periods') nrp += +v; if (k === 'nr_throttled') nrt += +v; if (k === 'throttled_time') thr += +v; } } catch (e) {}
   }
@@ -125,7 +138,7 @@ async function deviceEnd(P) {
   if (!P.dev) return;
   for (let i = 0; i < 20; i++) {
     let left = 0;
-    for (const g of P.dev.groups.values()) { try { fs.rmdirSync(g); } catch (e) { left++; } }
+    for (const g of new Set(P.dev.groups.values())) { try { fs.rmdirSync(g); } catch (e) { left++; } }
     try { fs.rmdirSync(P.dev.top); fs.rmdirSync(P.dev.set); return; } catch (e) {}
     await sleep(250);
   }
@@ -162,15 +175,27 @@ async function benchWorker(P) {
     window.__bw = new Worker(URL.createObjectURL(b)); }, BENCH_SRC);
   await sleep(1200);   // the scanner gives the new thread its group
 }
+const RASTER_SRC = `function computeRasterIndex(duration){
+const c=document.createElement('canvas');c.width=640;c.height=480;const gl=c.getContext('webgl2',{antialias:false,preserveDrawingBuffer:false});if(!gl)return null;
+const sh=(t,src)=>{const s=gl.createShader(t);gl.shaderSource(s,src);gl.compileShader(s);return s;};
+const p=gl.createProgram();
+gl.attachShader(p,sh(gl.VERTEX_SHADER,'#version 300 es\\nvoid main(){vec2 v=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));gl_Position=vec4(v*2.0-1.0,0.0,1.0);}'));
+gl.attachShader(p,sh(gl.FRAGMENT_SHADER,'#version 300 es\\nprecision highp float;uniform float k;out vec4 o;void main(){vec2 q=gl_FragCoord.xy*0.01+k;float a=0.0;for(int i=0;i<48;i++){q=vec2(q.x*q.y+0.13,q.y-q.x*0.71);a+=fract(q.x+q.y);q=fract(q);}o=vec4(a*0.02,q,1.0);}'));
+gl.linkProgram(p);gl.useProgram(p);const u=gl.getUniformLocation(p,'k');const px=new Uint8Array(4);
+const t0=performance.now();let n=0;while(performance.now()-t0<duration){gl.uniform1f(u,n*0.001);gl.drawArrays(gl.TRIANGLES,0,3);gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px);n++;}
+const r=Math.round(n*10000/(performance.now()-t0));const l=gl.getExtension('WEBGL_lose_context');if(l)l.loseContext();return r;}`;
+const rasterRun = (P) => P.page.evaluate(`(${RASTER_SRC})(2000)`);
 const benchRun = (P, ms) => P.page.evaluate((ms) => new Promise((r) => { window.__bw.onmessage = (e) => r(e.data); window.__bw.postMessage(ms); }), ms);
 async function proof(PS) {
   const med = (v) => v.slice().sort((x, y) => x - y)[Math.floor(v.length / 2)];
   const R = {};
   for (const P of PS) await benchWorker(P);
-  for (const P of PS) { deviceQuota(P, false); const v = []; for (let i = 0; i < 5; i++) v.push(await benchRun(P, 2000)); R[P.role] = { free: med(v) }; }
+  for (const P of PS) { deviceQuota(P, false); const v = []; for (let i = 0; i < 5; i++) v.push(await benchRun(P, 2000)); R[P.role] = { free: med(v) };
+    const rv = []; for (let i = 0; i < 3; i++) rv.push(await rasterRun(P)); R[P.role].rasterFree = med(rv); }
   for (const P of PS) deviceQuota(P, true);
   await sleep(300);
-  for (const P of PS) { const v = []; for (let i = 0; i < 3; i++) v.push(await benchRun(P, 2000)); R[P.role].alone = med(v); }
+  for (const P of PS) { const v = []; for (let i = 0; i < 3; i++) v.push(await benchRun(P, 2000)); R[P.role].alone = med(v);
+    const rv = []; for (let i = 0; i < 3; i++) rv.push(await rasterRun(P)); R[P.role].rasterAlone = med(rv); }
   if (PS.length > 1) {
     const tog = await Promise.all(PS.map(async (P) => { const v = []; for (let i = 0; i < 3; i++) v.push(await benchRun(P, 2000)); return med(v); }));
     PS.forEach((P, i) => { R[P.role].together = tog[i]; });
@@ -178,10 +203,11 @@ async function proof(PS) {
   for (const P of PS) {
     const r = R[P.role];
     r.slowdown = +(r.free / r.alone).toFixed(2);
+    r.rasterSlowdown = r.rasterFree && r.rasterAlone ? +(r.rasterFree / r.rasterAlone).toFixed(2) : null;
     if (r.together != null) r.share = +(r.together / r.alone).toFixed(3);
     r.cpuset = cpusetProof(P); r.cg = deviceStat(P);
-    say(`PROOF ${P.role}: BenchmarkIndex free ${r.free} alone ${r.alone} together ${r.together ?? '-'} -> slowdown ${r.slowdown}x (want ~${rate}), share ${r.share ?? '-'} (want ~1), cpus ${JSON.stringify(r.cpuset)}, throttled ${r.cg.nr_throttled}/${r.cg.nr_periods} periods`);
-    r.ok = Math.abs(r.slowdown / rate - 1) <= 0.25 && (r.share == null || r.share >= 0.9) && Object.keys(r.cpuset).length === 1 && r.cg.nr_throttled > 0;
+    say(`PROOF ${P.role}: BenchmarkIndex free ${r.free} alone ${r.alone} together ${r.together ?? '-'} -> slowdown ${r.slowdown}x (want ~${rate}), share ${r.share ?? '-'} (want ~1), cpus ${JSON.stringify(r.cpuset)}, throttled ${r.cg.nr_throttled}/${r.cg.nr_periods} periods; raster free ${r.rasterFree} quota ${r.rasterAlone} -> ${r.rasterSlowdown}x (GPU ${GPUOFF ? 'NOT throttled, --gpuoff' : 'throttled, want >= ' + (0.5 * rate).toFixed(1)})`);
+    r.ok = Math.abs(r.slowdown / rate - 1) <= 0.25 && (r.share == null || r.share >= 0.9) && Object.keys(r.cpuset).length === 1 && r.cg.nr_throttled > 0 && (GPUOFF || (r.rasterSlowdown != null && r.rasterSlowdown >= 0.5 * rate));
   }
   return R;
 }

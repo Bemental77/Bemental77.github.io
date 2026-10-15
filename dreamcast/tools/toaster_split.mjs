@@ -21,7 +21,7 @@
 //   npm run web
 //   node tools/browser_leak_guard.js reap && uptime
 //   bash tools/probe_lock.sh run -- node dreamcast/tools/toaster_split.mjs <rate> <sec> [extra-query] \
-//        [--room] [--prof S --profout F.cpuprofile] [--shot F.png]
+//        [--room] [--prof S --profout F.cpuprofile] [--shot F.png] [--gpuoff]
 //
 // Findings: dreamcast/docs/toaster-split/TASKS.md
 // ============================================================================
@@ -52,7 +52,11 @@ const b = await puppeteer.launch({ executablePath: process.env.CHROME_PATH || '/
   args: ['--no-sandbox', '--autoplay-policy=no-user-gesture-required', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--js-flags=--max-old-space-size=512' + (process.env.TS_JSFLAGS ? ' ' + process.env.TS_JSFLAGS : '')], protocolTimeout: 600000 });
 guard.guard(b, 'dreamcast/tools/toaster_split.mjs');
 let duty = null;
-if (rate > 1) duty = spawn('python3', [path.join(ROOT, 'tools/toaster_duty.py'), String(b.process().pid), String(rate), '2'], { stdio: 'ignore' });
+// The GPU process (SwiftShader) is duty-cycled with the renderers (tools/toaster_duty.py gpu=1,
+// the gate's arm since 2026-10-15); --gpuoff leaves it at full speed (the old, flattering arm).
+const gpuOff = a.includes('--gpuoff');
+if (rate > 1) duty = spawn('python3', [path.join(ROOT, 'tools/toaster_duty.py'), String(b.process().pid), String(rate), '2', '-', gpuOff ? '0' : '1'], { stdio: 'ignore' });
+console.log(`arm: rate ${rate}, GPU process ${rate > 1 ? (gpuOff ? 'NOT throttled (--gpuoff)' : 'throttled') : 'n/a'}`);
 const p = await b.newPage(); const errs = [];
 p.on('pageerror', (e) => errs.push(String(e.message).slice(0, 200)));
 // --dump F: write every [jitdump] module (?jitdump=<pc>|all) to F.<n>.wasm. --census F: at the end, write the
@@ -68,7 +72,7 @@ const settled = (r) => r.booted && !r.rest && r.hbr >= 3 && (!stateF || (stateHb
 p.on('console', (m) => { const t = m.text();
   if (dumpF && /\[jitdump\]/.test(t)) { const body = t.replace(/^.*\[jitdump\] /, '');
     if (/^begin/.test(body)) dumpBuf = []; else if (/^end/.test(body)) { if (dumpBuf) fs.writeFileSync(dumpF + '.' + (dumpN++) + '.wasm', Buffer.from(dumpBuf.join(''), 'base64')); dumpBuf = null; }
-    else if (dumpBuf) dumpBuf.push(body.split(' ')[1] || ''); return; } if (/error|threw|desync/i.test(t)) errs.push(t.slice(0, 200)); if (/\[split\]/.test(t)) console.log('  ' + t.replace(/^.*\[split\]/, '[split]').slice(0, 260)); if (/\[(sh4emit|pchist|pswff|gwff|xff|g2|ctxsnap|setg2|armhist|armcode|armtime|aicatime|armff|setarmff|b2ff|setb2ff|lazydisc|glcount)/.test(t)) console.log('  ' + t.slice(0, /ctxsnap/.test(t) ? 4000 : 520)); if (/\[peek\]/.test(t)) console.log(t); });
+    else if (dumpBuf) dumpBuf.push(body.split(' ')[1] || ''); return; } if (/error|threw|desync/i.test(t)) errs.push(t.slice(0, 200)); if (/\[split\]/.test(t)) console.log('  ' + t.replace(/^.*\[split\]/, '[split]').slice(0, 260)); if (/\[(sh4emit|pchist|pswff|gwff|xff|g2|ctxsnap|setg2|armhist|armcode|armtime|aicatime|armff|setarmff|b2ff|setb2ff|lazydisc|glcount|glinfo|lowrender)/.test(t)) console.log('  ' + t.slice(0, /ctxsnap/.test(t) ? 4000 : 520)); if (/\[peek\]/.test(t)) console.log(t); });
 const code = 'Z' + Math.random().toString(36).slice(2, 6).toUpperCase().replace(/[^A-Z2-9]/g, 'Q');
 await p.goto(room ? `${BASE}/dreamcast.html?bench=1&benchauto=1&benchsec=${secs}&benchphase=room&np=${code}&host=1&net=local&game=pso2${extra}` : `${BASE}/dreamcast.html?bench=1&benchauto=1&benchroom=0&benchsec=${secs}${extra}`, { waitUntil: 'load', timeout: 180000 });
 const rows = []; let profd = false; const t0 = Date.now();

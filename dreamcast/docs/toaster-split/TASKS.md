@@ -881,3 +881,25 @@ Gauntlet attract. Shipped OFF.
   899.1 vs 877.3 (12 s arms) and 805.8 vs 794.7 (30 s arms).
 - A node micro-bench prices a block hop at ~2.4 ns (direct return_call) vs ~3.7 ns (indirect,
   cross-instance), so hop transport itself is small.
+
+## 2026-10-15 (later) — the toaster gate now throttles the GPU process too
+
+Until now `tools/toaster_duty.py` duty-cycled only `--type=renderer` processes. Chrome's GPU
+process runs SwiftShader on the host CPU, so on a no-GPU toaster the rasterizer ran at full
+speed while the emulation was slowed 6.2x. Now it is stopped and continued in the same cycle
+(`gpu=1`, the default; `toaster_bench --gputhrottle 0` / `toaster_split --gpuoff` /
+`toaster_room2 --gpuoff` = the old arm). `toaster_room2` puts the GPU process in ONE cgroup
+with a quota of CORES/R cores (a per-thread 1/R cap let SwiftShader's parallel threads take
+4/R: raster slowed only 3.49x).
+
+Arm-difference proof (new `RASTER_SRC`: a fragment-bound 640x480 WebGL2 loop, one
+triangle and a 1-pixel readPixels a frame, so the score is the rasterizer's throughput).
+`toaster_bench --rate 6.2 --proof-only`, load 1.9:
+
+| context | rate 1 | rate 6.2, GPU throttled | rate 6.2, GPU NOT throttled | slowdown |
+|---|---|---|---|---|
+| raster (frames / 10 s) | 615 | 96 | 459 | **6.41x** vs 1.34x (arm difference 4.78x) |
+| page / worker / nested / SW (BenchmarkIndex) | 2106 / 2110 / 2093 / 1988 | 290 / 269 / 347 / 359 | | 7.26 / 7.84 / 6.04 / 5.54 |
+
+The bench VOIDs the run unless raster slows >= 0.5 R AND the arm difference is >= 1.5x.
+`toaster_room2 solo`: raster 371 free -> 54 under quota (6.87x), BenchmarkIndex 6.36x.

@@ -23,6 +23,7 @@
 //   --gpu swiftshader|default
 //   --throttle duty|cdp   (default duty — see 2. below)
 //   --period 2        duty-cycle period ms
+//   --gputhrottle 1|0 duty-cycle the GPU process too (default 1; 0 = old arm)
 //   --proof-only      run calibration + the arm-difference proofs and exit
 //   --out <file>      JSON (default /tmp/toaster-bench.json)
 //
@@ -42,9 +43,15 @@
 //      So the default (--throttle duty) is tools/toaster_duty.py: a SIGSTOP /
 //      SIGCONT duty cycle on every renderer process of this browser (period
 //      --period 2 ms, runs period/R of each period, SCHED_FIFO). Every thread in
-//      those processes gets 1/R of its throughput. The GPU process is NOT
-//      throttled (SwiftShader rasterizes there on the host CPU), matching CDP's
-//      semantics — this flatters GPU-heavy pages. Quantization: a frame can be
+//      those processes gets 1/R of its throughput. ⚠ SINCE 2026-10-15 THE GPU
+//      PROCESS IS THROTTLED TOO, in the same cycle (--gputhrottle 1, default):
+//      a no-GPU device rasterises on its own slow CPU, and leaving SwiftShader
+//      at full speed (CDP's semantics, and this gate before that date) let it
+//      take ~56% of the box on Gauntlet — every rendering cost was flattered.
+//      PROOF: a raster index (RASTER_SRC, fragment-bound) must slow >= 0.5·R and
+//      must differ >= 1.5x from the same rate with the GPU process left alone
+//      (measured every invocation), else VOID. --gputhrottle 0 = the old arm.
+//      Quantization: a frame can be
 //      stretched by up to one off-slice (period·(1-1/R) ≈ 1.7 ms at R=6.2)
 //      beyond R× its work, which a genuinely slow CPU would not add.
 //      PROOF, every invocation: Lighthouse BenchmarkIndex is timed in the page,
@@ -139,8 +146,13 @@ async function close(b) { try { await b.close(); } catch (_e) {} try { fs.rmSync
 // workers (Chrome 141: "Operation is only supported for pages, not workers").
 // Either way a CDP session is opened on every target (service-worker proof evaluates over it).
 const THROTTLE = flag('throttle', 'duty');
+// --gputhrottle 1 (default since 2026-10-15) | 0: the duty cycle also stops/continues Chrome's
+// GPU process (SwiftShader rasterises there, on the host CPU) at the same rate, in the same
+// cycle. 0 is the old arm (renderers only) — the control, which under-counted rendering: on
+// Gauntlet the unthrottled rasterizer took ~56% of the box (dreamcast/docs/toaster-split).
+const GPU_THROTTLE = flag('gputhrottle', '1') !== '0';
 const DUTY_PERIOD_MS = +flag('period', 2);   // quantization: a frame can stretch by up to one off-slice (period·(1-1/R))
-function throttleAll(browser, rate) {
+function throttleAll(browser, rate, gpu = GPU_THROTTLE) {
   const seen = new Map();   // target -> record
   const TYPES = new Set(['page', 'worker', 'service_worker', 'shared_worker', 'other']);
   const apply = async (t) => {
@@ -158,7 +170,7 @@ function throttleAll(browser, rate) {
   let duty = null, statusFile = null;
   if (THROTTLE === 'duty') {
     statusFile = path.join(browser._udd, '..', path.basename(browser._udd) + '.duty.json');
-    duty = spawn('python3', [path.join(TOOLS_DIR, 'toaster_duty.py'), String(browser.process().pid), String(rate), String(DUTY_PERIOD_MS), statusFile], { stdio: 'ignore' });
+    duty = spawn('python3', [path.join(TOOLS_DIR, 'toaster_duty.py'), String(browser.process().pid), String(rate), String(DUTY_PERIOD_MS), statusFile, gpu ? '1' : '0'], { stdio: 'ignore' });
   }
   const dutyStatus = () => { try { return JSON.parse(fs.readFileSync(statusFile, 'utf8')); } catch (_e) { return null; } };
   return { stop: () => { clearInterval(iv); browser.off('targetcreated', apply); const st = dutyStatus(); if (duty) duty.kill('SIGTERM'); try { fs.rmSync(statusFile, { force: true }); } catch (_e) {} return st; },
@@ -172,14 +184,28 @@ const BENCH_SRC = `function computeBenchmarkIndex(duration){const halfTime=durat
 function gc(){const start=Date.now();let it=0;while(Date.now()-start<halfTime){let s='';for(let j=0;j<10000;j++){s+='a';}if(s.length===1)throw new Error('x');it++;}return Math.round(it/10/((Date.now()-start)/1000));}
 function nogc(){const A=[],B=[];for(let i=0;i<100000;i++){A[i]=B[i]=i;}const start=Date.now();let it=0;while(it%10!==0||Date.now()-start<halfTime){const s=it%2===0?A:B,t=it%2===0?B:A;for(let j=0;j<s.length;j++){t[j]=s[j];}it++;}return Math.round(it/10/((Date.now()-start)/1000));}
 return (gc()+nogc())/2;}`;
+// ---- raster index: what the GPU process (SwiftShader on a no-GPU device) can rasterise ----
+// One 640x480 WebGL2 canvas, a fragment-bound shader (a fixed ALU loop per pixel), one
+// full-screen triangle per frame and a 1-pixel readPixels to wait for it. The submitting JS
+// is a few calls a frame, so the score is the rasterizer's throughput: it moves with the
+// GPU process's speed and barely with the renderer's. Score = frames per 10 s.
+const RASTER_SRC = `function computeRasterIndex(duration){
+const c=document.createElement('canvas');c.width=640;c.height=480;const gl=c.getContext('webgl2',{antialias:false,preserveDrawingBuffer:false});if(!gl)return null;
+const sh=(t,src)=>{const s=gl.createShader(t);gl.shaderSource(s,src);gl.compileShader(s);return s;};
+const p=gl.createProgram();
+gl.attachShader(p,sh(gl.VERTEX_SHADER,'#version 300 es\\nvoid main(){vec2 v=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));gl_Position=vec4(v*2.0-1.0,0.0,1.0);}'));
+gl.attachShader(p,sh(gl.FRAGMENT_SHADER,'#version 300 es\\nprecision highp float;uniform float k;out vec4 o;void main(){vec2 q=gl_FragCoord.xy*0.01+k;float a=0.0;for(int i=0;i<48;i++){q=vec2(q.x*q.y+0.13,q.y-q.x*0.71);a+=fract(q.x+q.y);q=fract(q);}o=vec4(a*0.02,q,1.0);}'));
+gl.linkProgram(p);gl.useProgram(p);const u=gl.getUniformLocation(p,'k');const px=new Uint8Array(4);
+const t0=performance.now();let n=0;while(performance.now()-t0<duration){gl.uniform1f(u,n*0.001);gl.drawArrays(gl.TRIANGLES,0,3);gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px);n++;}
+const r=Math.round(n*10000/(performance.now()-t0));const l=gl.getExtension('WEBGL_lose_context');if(l)l.loseContext();return r;}`;
 const median = (a) => { const s = a.slice().sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
 
 // One browser, one page, contexts: page main thread, dedicated worker, nested
 // worker (spawned by that worker), service worker. Returns score per context at `rate`.
-async function scoreContexts(rate, reps = 3, durMs = 1000) {
+async function scoreContexts(rate, reps = 3, durMs = 1000, opts = {}) {
   const b = await launch();
-  const th = throttleAll(b, rate);
-  const out = { rate, contexts: {} };
+  const th = throttleAll(b, rate, opts.gpu !== undefined ? opts.gpu : GPU_THROTTLE);
+  const out = { rate, gpuThrottled: opts.gpu !== undefined ? opts.gpu : GPU_THROTTLE, contexts: {} };
   try {
     const p = await b.newPage();
     dbg('proof page goto, rate', rate);
@@ -205,6 +231,10 @@ self.onmessage=e=>{if(e.data.who==='nested'){nested.onmessage=m=>postMessage(m.d
       }
       return xs;
     };
+    // raster: the GPU process's throughput (2 s a rep — a frame is tens of ms)
+    { const xs = []; for (let i = 0; i < reps; i++) { xs.push(await p.evaluate(`(${RASTER_SRC})(2000)`)); await sleep(300); }
+      out.contexts.raster = { median: median(xs), all: xs }; }
+    if (opts.only === 'raster') { out.targets = th.records(); return out; }
     for (const who of ['page', 'worker', 'nested']) { dbg('score', who); const xs = await run(who); out.contexts[who] = { median: median(xs), all: xs }; }
     // service worker: evaluate in its own target
     let sw = null;
@@ -245,11 +275,28 @@ async function calibrateAndProve(fixedRate) {
     const slow = a && b ? +(a / b).toFixed(2) : null;
     proof[k] = { score1: a, scoreR: b, slowdown: slow, throttled: slow != null && slow >= 0.5 * rate };
   }
+  // GPU-PROCESS ARM PROOF (raster). With --gputhrottle 1 the raster score must slow by >= 0.5·R
+  // AND the same rate with the GPU process left alone (the control arm, measured here) must read
+  // clearly faster (arm difference >= 1.5x) — else the GPU throttle did nothing and the run is
+  // VOID. With --gputhrottle 0 the raster row is information only.
+  if (proof.raster && THROTTLE === 'duty') {
+    const off = await scoreContexts(rate, 3, 1000, { gpu: !GPU_THROTTLE, only: 'raster' });
+    const o = off.contexts.raster.median, P = proof.raster;
+    const slowOther = o ? +(P.score1 / o).toFixed(2) : null;
+    if (GPU_THROTTLE) {
+      P.gpuOffScoreR = o; P.gpuOffSlowdown = slowOther;
+      P.armDiff = o && P.scoreR ? +(o / P.scoreR).toFixed(2) : null;
+      P.throttled = P.throttled && P.armDiff != null && P.armDiff >= 1.5;
+    } else {
+      P.gpuOnScoreR = o; P.gpuOnSlowdown = slowOther; P.armDiff = o && P.scoreR ? +(P.scoreR / o).toFixed(2) : null;
+      P.throttled = true; P.note = 'GPU process NOT throttled (--gputhrottle 0, control arm): rendering is under-counted';
+    }
+  }
   // V8 reports old-space + young-gen: --max-old-space-size=512 reads 608 MB. Unflagged it is GBs.
   const heapOk = HEAP > 0 ? (r1.heapLimitMB != null && r1.heapLimitMB <= HEAP * 1.25) : null;
   return { rate, refine, lowScore: LOW_SCORE, midScore: MID_SCORE, midRate: +(r1.contexts.page.median / MID_SCORE).toFixed(2),
            scoreAtRate: rR.contexts.page.median, proof, heap: { flagMB: HEAP, jsHeapLimitMB: r1.heapLimitMB, ok: heapOk },
-           targetsAtRate: rR.targets, dutyAtRate: rR.duty, throttleMode: THROTTLE, load: load() };
+           targetsAtRate: rR.targets, dutyAtRate: rR.duty, throttleMode: THROTTLE, gpuThrottle: GPU_THROTTLE, load: load() };
 }
 
 // ---- one bench run ------------------------------------------------------------
@@ -281,7 +328,7 @@ async function benchRun(page, rate) {
   return { page, rate, ok: !!r, pass: r ? r.pass : false, solo: r ? w(r.solo) : { pass: false, error: 'no bench result before the deadline' },
            // a room that was attempted (result published from the room phase) and never ran is a FAIL
            room: r && (r.room ? w(r.room) : (r._phase === 'room' ? { pass: false, error: 'room attempted, never ran' } : null)),
-           renderer, swiftshaderProof: ss, throttleMode: THROTTLE, duty: dutySt, heapMB, workersSeen: maxWorkers,
+           renderer, swiftshaderProof: ss, throttleMode: THROTTLE, gpuThrottle: GPU_THROTTLE, duty: dutySt, heapMB, workersSeen: maxWorkers,
            throttled: { targets: recs.length, ok: recs.filter((x) => x.ok).length, types: [...new Set(recs.map((x) => x.type))], failed: recs.filter((x) => !x.ok).slice(0, 4) },
            errors: errs.slice(0, 3), bursts: r && r.bursts ? r.bursts.slice(0, 3) : null, loadBefore: l0, loadAfter: load(), wallS: Math.round((Date.now() - t0) / 1000) };
 }
