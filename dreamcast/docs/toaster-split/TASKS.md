@@ -747,6 +747,44 @@ Exactness, wasm `3cc30f83`:
   ftrv, 94% of guest time executed, 6.3% burnt). It costs 850-900 ms per guest second at
   rate 1 and runs 0.13-0.5x at rate 6.2: ~6x short, not 1.2x.
 
+## 2026-10-15 (later) — the ARM7 driver loop run block by block in C (?armff=0 control)
+
+PSO's driver loop (0x194..0x1e0, read in place from sound RAM): each pass bumps the
+monitored channel and writes MSLC (0xac0), checks the SH4->ARM queue (0x2100), pops its own
+queue four times (0x1cec / 0xd60), updates one channel from the monitor registers (0x93c,
+groups A/B/C by [0x12060]/[0x12061] = 2/54 here), and checks two flags (0x1c0 / 0x1d8). The
+learned decode cycles put a pass at ~840 cycles, so it is NOT a few passes a sample: a
+sample's 512 cycles end mid-pass. So whole-pass fast-forward never fits; `armff_go`
+(arm7_rec_wasm.cpp) runs those 27 blocks in C instead, from whatever pc the ARM is at,
+exactly as the mainloop would: cycles > 0 and no FIQ before each block, the block's decode
+cycles (+9 for the MLA FALLBACK, r15 = its pc + 8), every input modelled (both branch
+outcomes, conditional ops, flags as the emitter computes them, incl. C from >255
+immediates), accesses through the same arm::readMem/writeMem in program order (MSLC write,
+0x2810 read that clears the loop flag, 0x2814 read). It stops at the first pc outside the
+set (full queue, set flag, active channel) and runs only while EntryPoints holds the block
+compiled from the golden bytes (live mask cached by a compile/flush epoch). Gauntlet's
+driver is different: it never fires there.
+
+- `?armff=2` DIAG: every 64th entry serializes the AICA (ARM regs, sound RAM, AICA regs,
+  channels), runs the blocks in C, serializes, restores, lets the compiled blocks run the
+  same number of blocks and compares byte for byte: **16,385 (bench scene) and 21,505 (PSO
+  lobby) checks, 0 mismatches, 0 lost**.
+- ~400K of the ARM's ~600K blocks a guest second now run in C.
+- In-run A/B (new `toaster_split.mjs --ab NAME:SECS`: toggles the knob in the worker every
+  SECS s and reports emu ms per guest second per arm; run-to-run pairs read +-8% here):
+  rate 6.2, 200 s: armff 1058.7 vs 1104.4 (**-4.1%**); g2ff 1051.1 vs 1150.4 (**-8.6%**).
+  Rate 1: armff 284.4 vs 287.8 (-1.2%), g2ff 299.3 vs 310.5 (-3.6%). The duty cycle makes
+  both worth more at the toaster rate than at rate 1.
+- Toaster 6.2 solo, 2 reps each, load during the reps in brackets: both on 0.901 / 0.925
+  (4.5 / 9.5), armff=0 0.793 / 0.783 (5.1 / 5.4), both off 0.701 / 0.753 (5.9 / 6.6), both
+  on again 0.736 / 0.797 (9.1 / 7.1). Still 0/2 PASS.
+
+Exactness, wasm `e8316176`: rollback rig (PSO lobby, armff applied 1.8M runs inside it)
+REF1==REF2 61/61, REF==RB 59/59, 0 full-flush fallbacks. Soaks IN SYNC: PSO lockstep 64 + 64,
+PSO forced rollback 33, Gauntlet forced rollback 29 + 32, mixed PSO rollback room with the
+joiner on `?armff=0` 33 + 33 (40 / 43 rollbacks). Boots with screenshots: PSO lobby 0.997x,
+Gauntlet intro 1.009x. `verify_core_tree` PASS.
+
 ## Status
 
 - [x] Split measured: solo at 1 and 6.2, room at 6.2 for 60 s, and a worker

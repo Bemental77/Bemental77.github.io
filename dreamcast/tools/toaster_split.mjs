@@ -33,6 +33,13 @@ const guard = (await import(path.join(ROOT, 'tools/browser_leak_guard.js'))).def
 const a = process.argv.slice(2); const rate = +a[0] || 1, secs = +a[1] || 30, extra = a[2] && !a[2].startsWith('--') ? a[2] : '';
 const fl = (n) => { const i = a.indexOf('--' + n); return i >= 0 ? a[i + 1] : null; };
 const prof = +fl('prof') || 0, shot = fl('shot'), room = a.includes('--room');
+// --ab NAME:SECS — an in-run A/B of an EXACT runtime knob: once the seed restore has
+// settled, call Module._flycast_set_NAME(1/0) in the emulation worker, alternating every
+// SECS s, and report emulation ms per guest second for each arm over the heartbeats that
+// lie wholly inside one arm (the first after each switch is dropped). Interleaving at this
+// grain cancels the box's drift, which run-to-run pairs cannot (they read +-8% here).
+const ab = fl('ab'); const [abName, abSecs] = ab ? [ab.split(':')[0], +(ab.split(':')[1] || 5)] : [null, 0];
+let abArm = null, abNext = 0, abSkip = 0, abSess = null; const abAcc = { 1: { e: 0, x: 0, n: 0 }, 0: { e: 0, x: 0, n: 0 } };
 const BASE = process.env.BASE_URL || 'http://localhost:8080';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const udd = fs.mkdtempSync(path.join(os.tmpdir(), 'toaster-split-'));
@@ -43,7 +50,7 @@ let duty = null;
 if (rate > 1) duty = spawn('python3', [path.join(ROOT, 'tools/toaster_duty.py'), String(b.process().pid), String(rate), '2'], { stdio: 'ignore' });
 const p = await b.newPage(); const errs = [];
 p.on('pageerror', (e) => errs.push(String(e.message).slice(0, 200)));
-p.on('console', (m) => { const t = m.text(); if (/error|threw|desync/i.test(t)) errs.push(t.slice(0, 200)); if (/\[split\]/.test(t)) console.log('  ' + t.replace(/^.*\[split\]/, '[split]').slice(0, 260)); if (/\[(pchist|pswff|gwff|xff|g2|ctxsnap|setg2|armhist|armcode|armtime|aicatime)/.test(t)) console.log('  ' + t.slice(0, /ctxsnap/.test(t) ? 4000 : 520)); if (/\[peek\]/.test(t)) console.log(t); });
+p.on('console', (m) => { const t = m.text(); if (/error|threw|desync/i.test(t)) errs.push(t.slice(0, 200)); if (/\[split\]/.test(t)) console.log('  ' + t.replace(/^.*\[split\]/, '[split]').slice(0, 260)); if (/\[(pchist|pswff|gwff|xff|g2|ctxsnap|setg2|armhist|armcode|armtime|aicatime|armff|setarmff)/.test(t)) console.log('  ' + t.slice(0, /ctxsnap/.test(t) ? 4000 : 520)); if (/\[peek\]/.test(t)) console.log(t); });
 const code = 'Z' + Math.random().toString(36).slice(2, 6).toUpperCase().replace(/[^A-Z2-9]/g, 'Q');
 await p.goto(room ? `${BASE}/dreamcast.html?bench=1&benchauto=1&benchsec=${secs}&benchphase=room&np=${code}&host=1&net=local&game=pso2${extra}` : `${BASE}/dreamcast.html?bench=1&benchauto=1&benchroom=0&benchsec=${secs}${extra}`, { waitUntil: 'load', timeout: 180000 });
 const rows = []; let profd = false; const t0 = Date.now();
@@ -51,7 +58,16 @@ while (Date.now() - t0 < (secs + 240 * Math.max(1, rate / 3)) * 1000) {
   await sleep(1000);
   const r = await p.evaluate(() => { const q = window.__dcProbe && window.__dcProbe(); return q && { hb: q.hb, booted: q.booted, aicaX: q.aicaX, fps: q.fps, pace: q.pace, fs: q.fskip, rest: q.restoring, hbr: q.hbSinceRestore, done: !!window.__benchResult, res: window.__benchResult && (window.__benchResult.room || window.__benchResult.solo), j: (() => { try { const f = document.querySelector('iframe'); const q = f && f.contentWindow.__dcProbe && f.contentWindow.__dcProbe(); return q && { x: q.aicaX, pace: q.pace, fs: q.fskip }; } catch (e) { return null; } })() }; }).catch(() => null);
   if (!r) continue;
+  if (abName && r.booted && !r.rest && r.hbr >= 3 && Date.now() >= abNext && !r.done) {
+    const wt = b.targets().find((t) => /worker|other/.test(t.type()) && /flycast_worker\.js/.test(t.url()));
+    if (wt && !abSess) { abSess = await wt.createCDPSession().catch((e) => { console.log('ab session failed ' + e); return null; }); }
+    if (abSess) { abArm = abArm === 1 ? 0 : 1;
+      const ev = await abSess.send('Runtime.evaluate', { expression: `self.Module._flycast_set_${abName}(${abArm}); 1` }).catch((e) => ({ exceptionDetails: String(e) }));
+      if (ev.exceptionDetails) console.log('ab set failed ' + JSON.stringify(ev.exceptionDetails).slice(0, 200));
+      abNext = Date.now() + abSecs * 1000; abSkip = 2; }
+  }
   if (r.booted && (!rows.length || rows[rows.length - 1].hb !== r.hb)) { rows.push(r); const pc = r.pace || {}; const f = r.fs || {};
+    if (abArm !== null) { if (abSkip > 0) abSkip--; else if (+r.aicaX > 0) { const A = abAcc[abArm]; A.e += +pc.emu; A.x += +r.aicaX; A.n++; } }
     console.log(`hb${r.hb} x=${(+r.aicaX).toFixed(3)} fps=${r.fps} emu=${pc.emu} held=${pc.held} gate=${pc.gate} paced=${pc.paced} wall=${pc.wall} drop=${pc.drop} fs=${f.frames}/${f.drawn}/${f.skipped}/${f.lagSkips}` + (r.j && r.j.pace ? ` | J x=${(+r.j.x).toFixed(3)} emu=${r.j.pace.emu} held=${r.j.pace.held} gate=${r.j.pace.gate} paced=${r.j.pace.paced} drop=${r.j.pace.drop}` : '')); }
   if (prof && !profd && r.booted && !r.rest && r.hbr >= 3) {
     profd = true;
@@ -62,6 +78,7 @@ while (Date.now() - t0 < (secs + 240 * Math.max(1, rate / 3)) * 1000) {
   }
   if (r.done) { console.log('RESULT', JSON.stringify(r.res && { speed: r.res.speed, over: r.res.over, frames: r.res.frames, ms: r.res.ms })); break; }
 }
+if (abName) for (const k of [1, 0]) { const A = abAcc[k]; console.log(`AB ${abName}=${k} emu/guest-s=${A.x ? (A.e / A.x).toFixed(1) : 'n/a'} heartbeats=${A.n}`); }
 if (shot) await p.screenshot({ path: shot }).catch(() => {});
 console.log('errors', JSON.stringify(errs.slice(0, 5)), 'load', os.loadavg().map((x) => x.toFixed(2)).join(' '));
 if (duty) duty.kill('SIGTERM'); await b.close(); fs.rmSync(udd, { recursive: true, force: true });
