@@ -10921,25 +10921,31 @@ var ASM_CONSTS = {
       txt: "[flycast-worker]   words: " + ($0 >>> 0).toString(16).padStart(4, "0") + " " + ($1 >>> 0).toString(16).padStart(4, "0") + " " + ($2 >>> 0).toString(16).padStart(4, "0") + " " + ($3 >>> 0).toString(16).padStart(4, "0") + " " + ($4 >>> 0).toString(16).padStart(4, "0") + " " + ($5 >>> 0).toString(16).padStart(4, "0") + " " + ($6 >>> 0).toString(16).padStart(4, "0") + " " + ($7 >>> 0).toString(16).padStart(4, "0")
     });
   },
-  6655034: ($0, $1) => {
+  6655034: ($0, $1, $2, $3) => {
+    postMessage({
+      cmd: "print",
+      txt: "[ctx-tripwire] FATAL: a cached guest-memory base is stale: RAM baked 0x" + ($0 >>> 0).toString(16) + " live 0x" + ($1 >>> 0).toString(16) + ", VRAM baked 0x" + ($2 >>> 0).toString(16) + " live 0x" + ($3 >>> 0).toString(16) + " (see addrspace.cpp termMappings)."
+    });
+  },
+  6655326: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[ctx-tripwire] FATAL: the SH4 executor caches context 0x" + ($0 >>> 0).toString(16) + " but p_sh4rcb->cntx is 0x" + ($1 >>> 0).toString(16) + " — a stale Sh4RCB pointer (see addrspace.cpp termMappings). Guest state is garbage."
     });
   },
-  6655298: ($0, $1, $2, $3, $4, $5, $6) => {
+  6655590: ($0, $1, $2, $3, $4, $5, $6) => {
     postMessage({
       cmd: "print",
       txt: "[watchdog #" + ($0 | 0) + "] stuck pc=0x" + ($1 >>> 0).toString(16) + " istnrm=0x" + ($2 >>> 0).toString(16) + " istext=0x" + ($3 >>> 0).toString(16) + " pend=0x" + ($4 >>> 0).toString(16) + " sr=0x" + ($5 >>> 0).toString(16) + " pr=0x" + ($6 >>> 0).toString(16)
     });
   },
-  6655562: ($0, $1, $2) => {
+  6655854: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[arm7rec] emitter engaged, first block pc=0x" + ($0 >>> 0).toString(16) + " ops=" + ($1 | 0) + " bytes=" + ($2 | 0)
     });
   },
-  6655710: ($0, $1) => {
+  6656002: ($0, $1) => {
     var p = $1 >>> 0;
     var s = "";
     while ((growMemViews(), HEAPU8)[p >>> 0] !== 0 && s.length < 256) {
@@ -10951,13 +10957,13 @@ var ASM_CONSTS = {
       txt: "[arm7rec] install FAILED pc=0x" + ($0 >>> 0).toString(16) + ' err="' + s + '" — v0 fallback'
     });
   },
-  6655959: ($0, $1, $2, $3) => {
+  6656251: ($0, $1, $2, $3) => {
     postMessage({
       cmd: "print",
       txt: "[arm7st] MISMATCH pc=0x" + ($0 >>> 0).toString(16) + " reg=" + ($1 | 0) + " jit=0x" + ($2 >>> 0).toString(16) + " interp=0x" + ($3 >>> 0).toString(16)
     });
   },
-  6656140: ($0, $1) => {
+  6656432: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[arm7st] blocks=" + ($0 | 0) + " mismatches=" + ($1 | 0)
@@ -11162,7 +11168,7 @@ function assignWasmImports() {
     /** @export */ of: __tzset_js,
     /** @export */ Gf: _clock_time_get,
     /** @export */ S: _emscripten_asm_const_int,
-    /** @export */ h: _emscripten_asm_const_int_sync_on_main_thread,
+    /** @export */ g: _emscripten_asm_const_int_sync_on_main_thread,
     /** @export */ R: _emscripten_check_blocking_allowed,
     /** @export */ Q: _emscripten_date_now,
     /** @export */ P: _emscripten_exit_with_live_runtime,
@@ -11473,7 +11479,7 @@ function assignWasmImports() {
     /** @export */ D: invoke_jiiii,
     /** @export */ l: invoke_v,
     /** @export */ n: invoke_vi,
-    /** @export */ g: invoke_vii,
+    /** @export */ h: invoke_vii,
     /** @export */ q: invoke_viii,
     /** @export */ z: invoke_viiii,
     /** @export */ C: invoke_viiiii,
@@ -12281,7 +12287,7 @@ isPthread && flycastWorkerModule();
 
 // --- build-flavor marker — INJECTED by flycast_worker_link.sh, do not hand-edit ---
 if (typeof globalThis !== 'undefined' && globalThis.name !== 'em-pthread') {
-  var __flycastBuildMarker = '[build] flavor=RELEASE defines=none linked=2026-10-15T03:34:48Z (clean — perf, boot depth and wedge behavior are valid)';
+  var __flycastBuildMarker = '[build] flavor=RELEASE defines=none linked=2026-10-15T03:51:14Z (clean — perf, boot depth and wedge behavior are valid)';
   try { console.log(__flycastBuildMarker); } catch (e) {}
   try { postMessage({ cmd: 'print', txt: __flycastBuildMarker }); } catch (e) {}
 }

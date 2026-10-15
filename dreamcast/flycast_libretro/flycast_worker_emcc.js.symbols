@@ -3,8 +3,8 @@
 2:invoke_iii
 3:__cxa_throw
 4:__resumeException
-5:invoke_vii
-6:emscripten_asm_const_int_sync_on_main_thread
+5:emscripten_asm_const_int_sync_on_main_thread
+6:invoke_vii
 7:__cxa_find_matching_catch_3
 8:__cxa_begin_catch
 9:__cxa_end_catch
