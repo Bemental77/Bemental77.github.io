@@ -30,6 +30,7 @@
 #include "hw/sh4/sh4_interrupts.h"
 #include "hw/sh4/sh4_mem.h"
 #include "hw/sh4/sh4_interpreter.h"
+#include "hw/sh4/sh4_opcode_list.h"   // DIAG pchist disassembly
 #include "hw/sh4/dyna/ngen.h"
 #include "hw/sh4/dyna/blockmanager.h"
 #include "hw/sh4/modules/mmu.h"   // mmu_enabled() — rollback keep-code load (patch 0002)
@@ -56,6 +57,7 @@
 #include <cstdlib>
 #include <map>
 #include <string>
+#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -437,7 +439,7 @@ uint64_t g_chain_hits = 0, g_chain_misses = 0;
 extern "C" {
     extern uint32_t g_ras_pc, g_ras_slot, g_ras_gen;   // lever-5E3 (emitter TU)
 }
-extern "C" { extern volatile uint32_t g_idleskip; }
+extern "C" { extern volatile uint32_t g_idleskip; extern volatile uint32_t g_gwff; }
 extern "C" EMSCRIPTEN_KEEPALIVE int sh4_jit_lookup_idx(uint32_t vaddr) {
     if (!g_chain_enabled) return -1;
     // THE IDLE-SKIP PCS ARE NEVER CHAINED INTO. The idle-skip check lives only
@@ -455,6 +457,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE int sh4_jit_lookup_idx(uint32_t vaddr) {
     // the spin sees the same check. IC/RAS slots are only ever filled from a hit
     // here, so they cannot cache these targets either.
     if (g_idleskip && (vaddr == 0x8c3c53d8u || vaddr == 0x8c3c53e0u || vaddr == 0x8c3c53f8u)) return -1;
+    // Same rule for the Gauntlet wait-loop head (gwff_try lives in the trampoline).
+    if (g_gwff && vaddr == 0x8c032e5au) return -1;
     BlockFn fn = jit_lookup(vaddr);
     if (fn) { ++g_chain_hits;
         // Lever-5E3 fill: this resolve IS the prediction's answer. Armed-only
@@ -494,6 +498,10 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_ic(int on) {
     }
 }
 extern "C" void bemental_sh4_set_slice_inwasm(int on);
+extern "C" { volatile uint32_t g_gwff = 1; }    // Gauntlet wait-loop fast-forward (gwff_try)
+static volatile uint32_t g_gwff_runs = 0;      // fast-forwards applied
+static volatile uint32_t g_gwff_passes = 0;    // passes applied (wraps)
+static volatile uint32_t g_gwff_fallbacks = 0; // head arrivals that ran the pass for real
 void bm_ResetCache();
 // Slice end inside emitted code (sh4_slice_end). COMPILE-time: set before blocks build.
 extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_slice_inwasm(int on) {
@@ -593,6 +601,89 @@ static u32 s_isk_streak = 0;
 // no rollback or lockstep peer can reproduce. Set by netplay rooms.
 volatile uint32_t g_deterministic = 0;
 volatile uint32_t g_idleskip_burns = 0;
+// DIAG (idle-share sizing, 2026-10-15): guest-time PC histogram. Every
+// credited slice attributes the guest cycles since the previous slice
+// boundary to the PC the slice ended at (block entry); idle-skip burns are
+// attributed to their PC separately. flycast_pchist(1) arms, (2) prints the top.
+static bool g_pch_on = false;
+static constexpr u32 PCH_N = 1u << 14;
+static u32 g_pch_pc[PCH_N]; static u64 g_pch_cyc[PCH_N], g_pch_burn[PCH_N];
+static u64 g_pch_last = 0, g_pch_total = 0, g_pch_burnt = 0;
+static inline u64* pch_slot(u32 pc, bool burn) {
+	u32 h = (pc * 2654435761u) & (PCH_N - 1);
+	for (u32 i = 0; i < 64; i++, h = (h + 1) & (PCH_N - 1)) {
+		if (g_pch_pc[h] == pc || g_pch_pc[h] == 0) { g_pch_pc[h] = pc; return burn ? &g_pch_burn[h] : &g_pch_cyc[h]; }
+	}
+	return nullptr;
+}
+static const u32* g_pch_arm_ptr = nullptr;   // &arm_Reg[R15_ARM_NEXT], resolved when the histogram arms
+static u32 g_pcha_pc[4096]; static u32 g_pcha_n[4096]; static u32 g_pcha_total = 0;
+static inline void pcha_sample() {
+	if (!g_pch_arm_ptr) return;
+	const u32 apc = *g_pch_arm_ptr;
+	u32 h = (apc * 2654435761u) & 4095;
+	for (u32 i = 0; i < 32; i++, h = (h + 1) & 4095)
+		if (g_pcha_pc[h] == apc || g_pcha_n[h] == 0) { g_pcha_pc[h] = apc; g_pcha_n[h]++; g_pcha_total++; return; }
+}
+static inline void pch_sample(u32 pc) {
+	const u64 now = sh4_sched_now64();
+	const u64 d = now - g_pch_last; g_pch_last = now;
+	if (d > 2000000) return;   // state jump
+	g_pch_total += d;
+	if (u64* c = pch_slot(pc, false)) *c += d;
+	pcha_sample();
+}
+static inline void pch_burn(u32 pc, u64 cyc) {
+	g_pch_burnt += cyc; g_pch_total += cyc; g_pch_last += cyc;
+	if (u64* c = pch_slot(pc, true)) *c += cyc;
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_pchist(int what) {
+	if (what == 1) { memset(g_pcha_n, 0, sizeof g_pcha_n); g_pcha_total = 0; memset(g_pch_pc, 0, sizeof g_pch_pc); memset(g_pch_cyc, 0, sizeof g_pch_cyc); memset(g_pch_burn, 0, sizeof g_pch_burn);
+	                 g_pch_total = g_pch_burnt = 0; g_pch_last = sh4_sched_now64(); g_pch_on = true; return; }
+	if (what != 2) { g_pch_on = false; return; }
+	std::vector<u32> idx;
+	for (u32 i = 0; i < PCH_N; i++) if (g_pch_pc[i]) idx.push_back(i);
+	std::sort(idx.begin(), idx.end(), [](u32 a, u32 b) { return g_pch_cyc[a] + g_pch_burn[a] > g_pch_cyc[b] + g_pch_burn[b]; });
+	char line[512];
+	snprintf(line, sizeof line, "[pchist] total=%llu cyc (%.2f guest s) burnt=%llu (%.2f%%) pcs=%u",
+	         (unsigned long long)g_pch_total, g_pch_total / 200e6, (unsigned long long)g_pch_burnt,
+	         g_pch_total ? 100.0 * g_pch_burnt / g_pch_total : 0.0, (unsigned)idx.size());
+	MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt: UTF8ToString($0)}); }, line);
+	{
+		std::vector<u32> ai; for (u32 i = 0; i < 4096; i++) if (g_pcha_n[i]) ai.push_back(i);
+		std::sort(ai.begin(), ai.end(), [](u32 a, u32 b) { return g_pcha_n[a] > g_pcha_n[b]; });
+		snprintf(line, sizeof line, "[pchist-arm] samples=%u distinct=%u (ARM7 PC where each sample's run stopped)", g_pcha_total, (unsigned)ai.size());
+		MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt: UTF8ToString($0)}); }, line);
+		for (size_t k = 0; k < ai.size() && k < 12; k++) {
+			const u32 apc = g_pcha_pc[ai[k]];
+			std::string w; char b2[16];
+			for (int j = -4; j < 8; j++) { snprintf(b2, sizeof b2, "%08x ", *(u32*)&aica::aica_ram[(apc + j * 4) & ARAM_MASK]); w += b2; }
+			snprintf(line, sizeof line, "[pchist-arm] %5.2f%% pc=%06x words[-4..7]: %s", 100.0 * g_pcha_n[ai[k]] / std::max(1u, g_pcha_total), apc, w.c_str());
+			MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt: UTF8ToString($0)}); }, line);
+		}
+	}
+	for (size_t k = 0; k < idx.size() && k < 40; k++) {
+		const u32 i = idx[k], pc = g_pch_pc[i];
+		std::string dis;
+		for (u32 j = 0; j < 12; j++) {
+			u16 op = 0; try { op = ReadMem16(pc + j * 2); } catch (...) {}
+			char d[256] = {0}; if (OpDesc[op]) OpDesc[op]->Disassemble(d, pc + j * 2, op);
+			// keep only the mnemonic (drop the live register dump the disassembler appends)
+			std::string t = d; size_t sp = t.find(" ; "); if (sp != std::string::npos) t = t.substr(0, sp);
+			for (const char* q = "R0123456789"; false;) (void)q;
+			{ size_t k2 = t.find(" R"); while (k2 != std::string::npos && t.find('=', k2) != std::string::npos && t.find('=', k2) < t.find(' ', k2 + 1)) { t = t.substr(0, k2); break; } }
+			dis += t;
+			if ((op & 0xF000) == 0xD000) {   // mov.l @(disp,PC),Rn: show the literal
+				const u32 la = ((pc + j * 2) & ~3u) + 4 + (op & 0xFF) * 4; u32 lv = 0; try { lv = ReadMem32(la); } catch (...) {}
+				char lb[24]; snprintf(lb, sizeof lb, " {=%08x}", lv); dis += lb;
+			}
+			dis += " ; ";
+		}
+		snprintf(line, sizeof line, "[pchist] %5.2f%% exec %5.2f%% burn pc=%08x  %s",
+		         100.0 * g_pch_cyc[i] / g_pch_total, 100.0 * g_pch_burn[i] / g_pch_total, pc, dis.substr(0, 380).c_str());
+		MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt: UTF8ToString($0)}); }, line);
+	}
+}
 // Frame-watchdog run_iter generation (bumped in emscripten_run_iter). The
 // watchdog's old reset heuristic (1M-dispatch gap) assumed a free-running
 // dispatch rate; below ~500K disp/s (capped pacing, or idleskip) the reset
@@ -1416,6 +1507,9 @@ EMSCRIPTEN_KEEPALIVE uint32_t flycast_ctx_snapshot(uint32_t which) {
         case 81: return g_syncsr_count;           // lever-5B sizing: shop_sync_sr C-fallback fires
         case 89: return g_syncfpscr_count;        // lever-10 sizing: shop_sync_fpscr C-fallback fires
         case 90: return g_idleskip_burns;         // lever-11 v0: frame-wait-spin slice burns
+        case 140: return g_gwff_runs;             // Gauntlet wait-loop fast-forwards
+        case 141: return g_gwff_passes;           // passes they applied
+        case 142: return g_gwff_fallbacks;        // head arrivals run for real
         case 82: return (u32)g_attr_mainloop_ms;  // lever-5 attribution: SH4 mainloop wall (ms total)
         case 83: return (u32)g_attr_retro_ms;     // lever-5 attribution: whole retro_run wall (ms total)
         // lever-12 mainloop split (cumulative; the heartbeat carries the
@@ -1695,6 +1789,130 @@ static bool span_interp_pending(Sh4Context* ctx, u32 pc)
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// GAUNTLET WAIT-LOOP FAST-FORWARD (2026-10-15). Gauntlet Legends' timed wait
+// (caller 0x8c032e20) spins up to 0x100000 passes of
+//     8c032e5a jsr @R13(=0x8c038440) ; mov #7,R4
+//     8c032e5e (*[R15])-- ; if (*[R15+4] != R14) exit ; if (*[R15]) goto 8c032e5a
+// where 0x8c038440 calls table entry 7 of 0x8c35c274 — the null stub
+// 0x8c036600 (rts; nop) — and returns 0. A pass touches no device and reads
+// no timer: its only effects are a counter decrement, three stack words that
+// are rewritten with the same values every pass, a fixed register file, and
+// guest time. The exit flag changes only through an interrupt or a scheduled
+// event, and both are delivered at slice credits, so between two scheduler
+// ticks every pass is the same step.
+//
+// gwff_try applies K passes at once, at the head 0x8c032e5a, where K stops
+// short of (a) the first slice credit that would tick the scheduler and (b) the
+// pass that takes the counter to zero (that one runs for real, so the guest
+// takes its own exit). Exactness argument for the cycle accounting: blocks
+// drain their guest_cycles at entry and credit 448-cycle slices when the
+// counter is <= 0 at a block entry. With T_j the uncredited counter at the
+// j-th block entry, the credits made by then are max(0, ceil((1-T_j)/448)),
+// which only depends on the LAST entry (T falls monotonically). Credits that
+// do not tick the scheduler do nothing but cc += 448, sched_next -= 448 (and
+// SRdecode, a no-op on an unchanged SR with nothing pending). So the state
+// after K passes is closed-form. Anything unexpected — code bytes, the table
+// entry, the stack layout, pointers aliasing what a pass writes, a pending
+// interrupt, the MMU, an unlearned block length — falls back to running the
+// pass. The per-block cycles are learned at compile time from flycast's own
+// decoder (only when the bytes compiled are exactly the expected ones), so
+// they are a pure function of these bytes, never host history.
+// ?gwff=0 (flycast_set_gwff(0)) is the control.
+// ---------------------------------------------------------------------------
+// (g_gwff and its counters are defined near bemental_sh4_set_slice_inwasm.)
+extern "C" void bemental_sh4_set_nolink_pc(u32 pc);
+static const u32 GW_ADDR[6] = { 0x8c032e5au, 0x8c038440u, 0x8c036600u, 0x8c03845au, 0x8c032e5eu, 0x8c032e6eu };
+static const u32 GW_SIZE[6] = { 4u, 0x1au, 4u, 8u, 0x10u, 8u };
+static u32 s_gw_cyc[6] = { 0, 0, 0, 0, 0, 0 };
+static const u16 GW_CODE_A[14] = { 0x4d0b,0xe407,0x63f2,0x6232,0x72ff,0x2322,0x53f1,0x6232,0x32e0,0x8b03,0x61f2,0x6312,0x2338,0x8bf1 };
+static const u16 GW_CODE_B[17] = { 0x4f22,0x7ff8,0x6243,0xd30e,0x4208,0x2f42,0x4200,0x323c,0x6423,0x1f21,0x6122,0x410b,0x5441,0x7f08,0x4f26,0x000b,0xe000 };
+static bool gwff_code_ok() {
+    for (u32 i = 0; i < 14; i++) if (ReadMem16(0x8c032e5au + i * 2) != GW_CODE_A[i]) return false;
+    for (u32 i = 0; i < 17; i++) if (ReadMem16(0x8c038440u + i * 2) != GW_CODE_B[i]) return false;
+    if (ReadMem32(0x8c038480u) != 0x8c35c274u) return false;    // mov.l literal: table base
+    if (ReadMem32(0x8c036600u) != 0x0009000bu) return false;    // rts ; nop
+    if (ReadMem32(0x8c35c2acu) != 0x8c036600u) return false;    // table entry 7 -> the stub
+    return true;
+}
+static void gwff_learn(const RuntimeBlockInfo* b) {
+    for (int i = 0; i < 6; i++) {
+        if (b->vaddr != GW_ADDR[i]) continue;
+        const u32 c = (b->sh4_code_size == GW_SIZE[i] && gwff_code_ok()) ? b->guest_cycles : 0u;
+        if (c != s_gw_cyc[i]) {
+            s_gw_cyc[i] = c;
+            MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt:'[gwff] learn 0x' + ($0>>>0).toString(16) +
+                ' size=' + ($1|0) + ' cycles=' + ($2|0)}); }, (int)b->vaddr, (int)b->sh4_code_size, (int)c);
+        }
+        return;
+    }
+}
+static inline bool gw_overlap(u32 a, u32 alen, u32 b, u32 blen) { return a < b + blen && b < a + alen; }
+static inline bool gw_ram(u32 a) { return (a & 3u) == 0 && a >= 0x8c000000u && a < 0x8d000000u; }
+extern volatile uint32_t g_slice_credited;
+// Returns true if it applied K >= 1 passes (pc stays at the head).
+static bool gwff_try(Sh4Context* ctx) {
+    u32 C = 0;
+    for (int i = 0; i < 6; i++) { if (!s_gw_cyc[i]) return false; C += s_gw_cyc[i]; }
+    if (ctx->interrupt_pend || !ctx->CpuRunning || g_parity_hashing || mmu_enabled()) return false;
+    if (ctx->r[13] != 0x8c038440u) return false;
+    const u32 sp = ctx->r[15];
+    if (!gw_ram(sp - 12) || !gw_ram(sp + 4)) return false;
+    if (!gwff_code_ok()) return false;
+    const u32 ctrp = ReadMem32(sp), flgp = ReadMem32(sp + 4);
+    if (!gw_ram(ctrp) || !gw_ram(flgp) || ctrp == flgp) return false;
+    // nothing a pass writes may alias anything a pass reads
+    struct R { u32 a, n; } const fixed[] = { {0x8c032e5au, 28}, {0x8c038440u, 0x44}, {0x8c036600u, 4},
+                                             {0x8c35c2acu, 8}, {flgp, 4}, {sp, 8} };
+    for (const R& r : fixed) {
+        if (gw_overlap(sp - 12, 12, r.a, r.n)) return false;
+        if (gw_overlap(ctrp, 4, r.a, r.n)) return false;
+    }
+    const u32 flag = ReadMem32(flgp);
+    if (flag != ctx->r[14]) return false;
+    const u32 cnt = ReadMem32(ctrp);
+    if (cnt < 2u) return false;
+    const int sn = Sh4cntx.sh4_sched_next;
+    if (sn < 0) return false;
+    const long long M = sn / SH4_TIMESLICE;          // credits that cannot tick
+    const long long cc0 = ctx->cycle_counter;
+    const long long P = (long long)C - s_gw_cyc[5];  // a pass's cycles before F's entry
+    const long long num = cc0 - P - 1 + (long long)SH4_TIMESLICE * M;
+    if (num < 0) return false;
+    long long K = 1 + num / C;
+    if (K > (long long)cnt - 1) K = (long long)cnt - 1;
+    if (K < 1) return false;
+    const long long TF = cc0 - (K - 1) * (long long)C - P;   // uncredited cc at pass K's F entry
+    const long long m = TF > 0 ? 0 : (1 - TF + SH4_TIMESLICE - 1) / SH4_TIMESLICE;
+    if (m > M) return false;                         // (cannot happen; belt and braces)
+    // apply
+    WriteMem32(sp - 4, 0x8c032e5eu);                 // sts.l PR (jsr return) in 0x8c038440
+    WriteMem32(sp - 12, 7u);                         // [R15'] = R4 (= 7, A's delay slot)
+    WriteMem32(sp - 8, 0x8c35c2acu);                 // [R15'+4] = &table[7]
+    WriteMem32(ctrp, cnt - (u32)K);
+    ctx->r[0] = 0;
+    ctx->r[1] = ctrp;
+    ctx->r[2] = flag;
+    ctx->r[3] = cnt - (u32)K;
+    ctx->r[4] = ReadMem32(0x8c35c2b0u);              // table[7].arg, loaded in B's delay slot
+    ctx->pr = 0x8c032e5eu;
+    ctx->sr.T = 0;                                   // F: tst R3,R3 with R3 != 0
+    ctx->cycle_counter = (int)(cc0 - K * (long long)C + (long long)SH4_TIMESLICE * m);
+    Sh4cntx.sh4_sched_next = (int)(sn - (long long)SH4_TIMESLICE * m);
+    if (m) g_slice_credited = 1;
+    if (g_pch_on) pch_burn(0x8c032e5au, (u64)(K * C));
+    ++g_gwff_runs;
+    g_gwff_passes += (u32)K;
+    if ((g_gwff_runs & 16383u) == 1u)
+        MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt:'[gwff] runs=' + ($0>>>0) + ' passes=' + ($1>>>0) +
+            ' fallbacks=' + ($2>>>0) + ' lastK=' + ($3|0)}); }, (int)g_gwff_runs, (int)g_gwff_passes, (int)g_gwff_fallbacks, (int)K);
+    return true;
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_gwff(int on) {
+    g_gwff = !!on;
+    bemental_sh4_set_nolink_pc(on ? 0x8c032e5au : 0u);
+}
+
 static void wasm_block_trampoline()
 {
 #ifdef DEBUG_DISPATCH
@@ -1902,6 +2120,7 @@ static void wasm_block_trampoline()
             // tick.
             const int due = Sh4cntx.sh4_sched_next;
             if (due > SH4_TIMESLICE) {
+                if (g_pch_on) pch_burn(pc, (u64)(due + 1));
                 Sh4cntx.sh4_sched_next -= (due + 1);   // -> -1: event now due
                 sh4_sched_tick(due + 1);
                 ++g_dbg_sched_ticks;
@@ -1912,6 +2131,10 @@ static void wasm_block_trampoline()
         }
     }
 isk_no_skip:
+    if (g_gwff && pc == 0x8c032e5au) {
+        if (gwff_try(ctx)) return;
+        ++g_gwff_fallbacks;
+    }
 
     BlockFn fn = jit_lookup(pc);
     // (The lever-4 D1 post-restore bracket logs that lived here were STRIPPED
@@ -2345,6 +2568,7 @@ volatile uint32_t g_slice_credited = 0;   // sh4_slice_end credited since the di
 static inline int credit_slices(Sh4Context* ctx) {
 	int any = 0;
 	do {
+		if (g_pch_on) pch_sample(ctx->pc);
 			ctx->cycle_counter += SH4_TIMESLICE;
 			// DIAGNOSTIC (boot-title-wedge, strip after verdict):
 			// suppress interrupt VECTORING while pc is inside the
@@ -2481,11 +2705,13 @@ public:
 		this->sh4ctx = &sh4ctx;
 		this->codeBuffer = &codeBuffer;
 		INFO_LOG(DYNAREC, "[rec_wasm] init");
+		bemental_sh4_set_nolink_pc(g_gwff ? 0x8c032e5au : 0u);
 	}
 
 	void compile(RuntimeBlockInfo* block, bool /*smc_checks*/, bool /*optimise*/) override
 	{
 		++g_compile_calls;
+		if (g_gwff) gwff_learn(block);
 		// Earlier-style 0x8c0133f4 diag dump that lived here was DUPLICATING the
 		// build_block() call done below at the per-block install site (line ~715),
 		// and the duplicate decl of `bytes` triggered a -Wshadow / redefinition

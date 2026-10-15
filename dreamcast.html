@@ -2672,6 +2672,17 @@
           // is the escape hatch (?shard=1 kept as an explicit-on for older
           // builds). Sent before any compiles either way.
           const qs = new URLSearchParams(location.search);
+          // ?sh4dis=T:addr:n,... (DIAG): disassemble guest ranges at T s after ready
+          if (qs.has('sh4dis')) for (const it of String(qs.get('sh4dis')).split(',')) {
+            const [t, a, n] = it.split(':');
+            setTimeout(() => worker.postMessage({ cmd: 'sh4dis', addr: parseInt(a, 16) >>> 0, n: +n || 16 }), (+t || 60) * 1000);
+          }
+          // ?pchist=A,B (DIAG): arm the guest-time PC histogram A s after ready, print it B s later
+          if (qs.has('pchist')) {
+            const [pa, pb] = String(qs.get('pchist')).split(',').map((x) => +x || 0);
+            setTimeout(() => worker.postMessage({ cmd: 'pchist', what: 1 }), (pa || 40) * 1000);
+            setTimeout(() => worker.postMessage({ cmd: 'pchist', what: 2 }), ((pa || 40) + (pb || 20)) * 1000);
+          }
           if (qs.get('sliceinwasm') === '0') worker.postMessage({ cmd: 'sliceinwasm', on: 0 });   // control: spent slices return to the dispatcher
           if (qs.has('noshard'))    worker.postMessage({ cmd: 'shard', on: 0 });
           else if (qs.has('shard')) worker.postMessage({ cmd: 'shard', on: 1 });
@@ -2768,6 +2779,9 @@
             const _isk = new URLSearchParams(location.search);
             if (_isk.has('noidleskip')) worker.postMessage({ cmd: 'setidleskip', on: 0 });
             else if (_isk.has('idleskip')) worker.postMessage({ cmd: 'setidleskip', on: 1 });
+            // ?gwff=0 — the control for the Gauntlet wait-loop fast-forward
+            // (rec_wasm.cpp gwff_try; default ON in the worker).
+            if (_isk.get('gwff') === '0') worker.postMessage({ cmd: 'setgwff', on: 0 });
           }
           // Monomorphic inline-cache: COLD-ARM at boot (lever-4 task 5). The
           // per-write SMC map makes arming safe through the SMC-heavy boot —
@@ -5531,6 +5545,7 @@
   const ARM_DESC = {
     uncap:       'GUEST UNGOVERNED — the game runs FASTER than hardware',
     noidleskip:  'idle-skip OFF',
+    gwff:        'Gauntlet wait fast-forward OFF',
     idleskip:    'idle-skip forced ON',
     interp:      'SH4 interpreter',
     interpAt:    'SH4 interpreter after N s',
