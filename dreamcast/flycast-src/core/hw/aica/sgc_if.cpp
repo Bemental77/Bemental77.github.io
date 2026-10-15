@@ -27,9 +27,15 @@
 #include "hw/gdrom/gdrom_if.h"
 #include "cfg/option.h"
 #include "serialize.h"
+#include "hw/sh4/sh4_sched.h"
+#include "hw/sh4/sh4_mem.h"
 
 #include <algorithm>
+#include <vector>
 #include <cmath>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 #undef FAR
 
@@ -382,6 +388,12 @@ struct ChannelCommonData
 #pragma pack(pop)
 
 
+// [wasm port, 2026-10-15] ?aicafast=0 is the control: the per-sample AICA
+// path takes upstream's route (64-channel scan, a mutex per output sample, and
+// an ffts per reschedule inside sh4_sched_tick). Every arm is exact.
+bool g_aica_fast = true;
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_aicafast(int on) { g_aica_fast = !!on; }
+
 enum EGState
 {
 	EG_Attack = 0,
@@ -417,6 +429,10 @@ enum PCMSType
 struct ChannelEx
 {
 	static ChannelEx Chans[64];
+	// [wasm port, 2026-10-15] Bit n set <=> Chans[n].enabled. Kept in BOTH
+	// arms (enable/disable/deserialize are its only writers, as they are the
+	// only writers of `enabled`), so ?aicafast=0 can flip at any sample.
+	static u64 enMask;
 
 	ChannelCommonData* ccd;
 
@@ -595,6 +611,7 @@ struct ChannelEx
 	void disable()
 	{
 		enabled = false;
+		enMask &= ~(1ull << ChannelNumber);
 		SetAegState(EG_Release);
 		AEG.SetValue(0x3FF);
 		CA = 0;
@@ -603,6 +620,7 @@ struct ChannelEx
 	void enable()
 	{
 		enabled = true;
+		enMask |= 1ull << ChannelNumber;
 	}
 
 	SampleType InterpolateSample()
@@ -734,6 +752,24 @@ struct ChannelEx
 		// (/tmp/dcx-worker.cpuprofile, 2026-08-28, 25s heavy scene). Per
 		// channel the emitted loop body was ~63 wasm instructions plus the
 		// callee's early-out; this cuts the disabled case to a load + branch.
+		if (g_aica_fast)
+		{
+			// [wasm port, 2026-10-15] Visit only the enabled channels, in the
+			// same ascending order. PSO's lobby keeps 2-2.4 of 64 enabled per
+			// sample and Gauntlet ~1 (?aicatime=1), so the 64-entry scan above
+			// was most of StepAll. EXACT: the mask is re-read after every
+			// channel, above the one just stepped, so a Step that disables a
+			// channel (only ever itself: AegStep release end, StreamStep loop
+			// end) is seen exactly as the scan would see it.
+			u64 m = enMask;
+			while (m)
+			{
+				const int i = __builtin_ctzll(m);
+				Chans[i].Step(mixl, mixr);
+				m = i == 63 ? 0 : enMask & (~0ull << (i + 1));
+			}
+			return;
+		}
 		for (ChannelEx& channel : Chans)
 			if (channel.enabled)
 				channel.Step(mixl, mixr);
@@ -1487,6 +1523,7 @@ static void staticinitialise()
 static OnLoad staticInit(staticinitialise);
 
 ChannelEx ChannelEx::Chans[64];
+u64 ChannelEx::enMask;
 
 #define Chans ChannelEx::Chans
 
@@ -1574,14 +1611,108 @@ constexpr int CDDA_SIZE = 2352 / 2;
 static s16 cdda_sector[CDDA_SIZE];
 static u32 cdda_index = CDDA_SIZE;
 
+#ifdef __EMSCRIPTEN__
+// DIAG (?aicatime=1): where AICA_Sample's time goes, per guest second, printed
+// every 5 guest seconds of samples. Four clock reads a sample (perturbs; use
+// only for the split, never for a rate).
+static bool s_aicatime = false;
+static double s_at_ch, s_at_dsp, s_at_rest;
+static u64 s_at_en, s_at_feg, s_at_dspon;
+static u32 s_at_n;
+extern int g_sched_time_on;   // sh4_sched.cpp: ?aicatime=2 times every sh4_sched_tick
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_aicatime(int on) {
+	g_sched_time_on = on == 2;
+	s_aicatime = on == 1; s_at_ch = s_at_dsp = s_at_rest = 0; s_at_en = s_at_feg = s_at_dspon = 0; s_at_n = 0;
+}
+static void aicatime_report()
+{
+	u32 prog = 0;
+	for (u32 i = 0; i < 128; i++)
+		if (DSPData->MPRO[i * 4] | DSPData->MPRO[i * 4 + 1] | DSPData->MPRO[i * 4 + 2] | DSPData->MPRO[i * 4 + 3])
+			prog++;
+	MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt:'[aicatime] ch=' + ($0).toFixed(1) + ' dsp=' + ($1).toFixed(1) + ' rest=' + ($2).toFixed(1)
+		+ ' ms/guest-s  en/sample=' + ($3).toFixed(2) + ' feg/sample=' + ($4).toFixed(2) + ' dspOn=' + ($5).toFixed(3) + ' prog=' + $6 + ' dspcfg=' + $7}); },
+		s_at_ch / 5.0, s_at_dsp / 5.0, s_at_rest / 5.0, (double)s_at_en / s_at_n, (double)s_at_feg / s_at_n, (double)s_at_dspon / s_at_n,
+		prog, (int)config::DSPEnabled);
+	s_at_ch = s_at_dsp = s_at_rest = 0; s_at_en = s_at_feg = s_at_dspon = 0; s_at_n = 0;
+}
+#endif
+
+#ifdef __EMSCRIPTEN__
+// DIAG (?aicahash=1): the exactness witness for ?aicafast. At every 5 guest
+// seconds of SH4 time (sh4_sched_now64, which savestates carry) it prints a
+// hash of the stereo samples output in that window, of the whole AICA state
+// (aica::serialize: ARM7 regs, DSP, timers, sound RAM, registers, all 64
+// channels), of SH4 main RAM, and the scheduler's next event; and checks the
+// enabled-channel mask against the channels. Two runs from one savestate,
+// ?aicafast=1 and =0, must print identical lines.
+static bool s_aicahash = false;
+static u64 s_ah_audio = 0xcbf29ce484222325ull, s_ah_n = 0, s_ah_win = ~0ull;
+static std::vector<u8> s_ah_buf;
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_aicahash(int on) { s_aicahash = !!on; s_ah_win = ~0ull; }
+static inline u64 ah_mix(u64 h, const u8* p, size_t n)
+{
+	size_t i = 0;
+	for (; i + 8 <= n; i += 8) { u64 w; memcpy(&w, p + i, 8); h = (h ^ w) * 0x100000001b3ull; h ^= h >> 29; }
+	for (; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull;
+	return h;
+}
+static void aicahash_sample(s32 l, s32 r)
+{
+	const u64 now = sh4_sched_now64();
+	const u64 win = now / (5ull * SH4_MAIN_CLOCK);
+	if (s_ah_win == ~0ull) { s_ah_win = win; s_ah_audio = 0xcbf29ce484222325ull; s_ah_n = 0; }
+	if (win != s_ah_win)
+	{
+		Serializer sz; aica::serialize(sz);
+		s_ah_buf.resize(sz.size());
+		Serializer ser(s_ah_buf.data(), s_ah_buf.size()); aica::serialize(ser);
+		const u64 ha = ah_mix(0xcbf29ce484222325ull, s_ah_buf.data(), ser.size());
+		const u64 hr = ah_mix(0xcbf29ce484222325ull, &mem_b[0], RAM_SIZE);
+		u64 mask = 0;
+		for (int i = 0; i < 64; i++) if (ChannelEx::Chans[i].enabled) mask |= 1ull << i;
+		const bool mok = mask == ChannelEx::enMask;
+		char line[256];
+		snprintf(line, sizeof(line), "[aicahash] w=%llu n=%llu audio=%016llx aica=%016llx ram=%016llx en=%016llx mask=%s fast=%d",
+			(unsigned long long)s_ah_win, (unsigned long long)s_ah_n, (unsigned long long)s_ah_audio, (unsigned long long)ha,
+			(unsigned long long)hr, (unsigned long long)mask, mok ? "ok" : "BAD", (int)g_aica_fast);
+		MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt: UTF8ToString($0)}); }, line);
+		s_ah_win = win; s_ah_audio = 0xcbf29ce484222325ull; s_ah_n = 0;
+	}
+	s_ah_audio = (s_ah_audio ^ (u32)l) * 0x100000001b3ull;
+	s_ah_audio = (s_ah_audio ^ (u32)r) * 0x100000001b3ull;
+	s_ah_n++;
+}
+#endif
+
 void AICA_Sample()
 {
 	SampleType mixl,mixr;
 	mixl = 0;
 	mixr = 0;
+#ifdef __EMSCRIPTEN__
+	double at0 = 0, at1 = 0, at2 = 0;
+	if (s_aicatime) {
+		at0 = emscripten_get_now();
+		for (const ChannelEx& c : ChannelEx::Chans)
+			if (c.enabled) { s_at_en++; if (c.FEG.active) s_at_feg++; }
+		if (config::DSPEnabled && !dsp::state.stopped) s_at_dspon++;
+	}
+#endif
 	memset(dsp::state.MIXS, 0, sizeof(dsp::state.MIXS));
 
 	ChannelEx::StepAll(mixl,mixr);
+#ifdef __EMSCRIPTEN__
+	if (s_aicatime) at1 = emscripten_get_now();
+	struct AtEnd { double *a0, *a1, *a2; ~AtEnd() {
+		if (!s_aicatime) return;
+		const double t3 = emscripten_get_now();
+		s_at_ch += *a1 - *a0;
+		if (*a2 != 0) { s_at_dsp += *a2 - *a1; s_at_rest += t3 - *a2; }
+		else s_at_rest += t3 - *a1;
+		if (++s_at_n == 5 * 44100) aicatime_report();
+	} } atEnd{&at0, &at1, &at2};
+#endif
 	
 	//OK , generated all Channels  , now DSP/ect + final mix ;p
 	//CDDA EXTS input
@@ -1608,6 +1739,9 @@ void AICA_Sample()
 	if (config::DSPEnabled)
 	{
 		dsp::step();
+#ifdef __EMSCRIPTEN__
+		if (s_aicatime) at2 = emscripten_get_now();
+#endif
 
 		for (int i = 0; i < 16; i++)
 			VolumePan(*(s16*)&DSPData->EFREG[i], dsp_out_vol[i].EFSDL, dsp_out_vol[i].EFPAN, mixl, mixr);
@@ -1655,6 +1789,9 @@ void AICA_Sample()
 	mixl = std::clamp(mixl, -32768, 32767);
 	mixr = std::clamp(mixr, -32768, 32767);
 
+#ifdef __EMSCRIPTEN__
+	if (s_aicahash) aicahash_sample(mixl, mixr);
+#endif
 	WriteSample(mixr, mixl);
 }
 
@@ -1745,6 +1882,10 @@ void deserialize(Deserializer& deser)
 		deser >> channel.lfo.state;
 		channel.UpdateLFO(true);
 		deser >> channel.enabled;
+		if (channel.enabled)
+			ChannelEx::enMask |= 1ull << channel.ChannelNumber;
+		else
+			ChannelEx::enMask &= ~(1ull << channel.ChannelNumber);
 		channel.quiet = false;
 	}
 	beep.deserialize(deser);

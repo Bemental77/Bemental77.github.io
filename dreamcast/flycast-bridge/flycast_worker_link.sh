@@ -83,7 +83,7 @@ EXPORTED_FUNCS='[
   "_sh4_interp_shil_fb",
   "_sh4_jit_lookup_idx",
   "_flycast_set_chain",
-  "_flycast_set_slice_inwasm","_flycast_set_gwff","_flycast_set_jitfail","_flycast_set_armhist","_flycast_set_armtime","_flycast_set_armmemfp","_flycast_set_divinline",
+  "_flycast_set_slice_inwasm","_flycast_set_gwff","_flycast_set_jitfail","_flycast_set_armhist","_flycast_set_armtime","_flycast_set_armmemfp","_flycast_set_divinline","_flycast_set_aicatime","_flycast_set_aicafast","_flycast_set_aicahash","_flycast_set_tcntfp",
   "_flycast_pchist",
   "_flycast_sh4dis",
   "_flycast_set_ic",

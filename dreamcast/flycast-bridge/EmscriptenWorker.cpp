@@ -2335,8 +2335,24 @@ uint32_t sh4_mem_read16(uint32_t addr) {
     return v;
 }
 
+// [2026-10-15] TMU TCNTn reads straight to the handler (?tcntfp=0 = control).
+// PSO's bench scene (toaster gate) polls TCNT0 ~500K times a guest second in a
+// timed wait (0x8c38d480..0x8c38d4a8 -> 0x8c37b636), and every read walked
+// readt -> RF32[] -> ReadMem_p4mmr -> the TMU bank -> read_TMU_TCNT. EXACT:
+// with the MMU off ReadMem32 IS addrspace::read32 and page 0xFF is the p4mmr
+// handler, so this calls the very handler that route ends in, with the same
+// guest-visible effect (the underflow reload). MMU on -> the normal route.
+extern "C" u32 tmu_tcnt_read_direct(u32 ch);   // core/hw/sh4/modules/tmu.cpp
+static bool g_tcnt_fp = true;
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_tcntfp(int on) { g_tcnt_fp = !!on; }
+
 EMSCRIPTEN_KEEPALIVE
 uint32_t sh4_mem_read32(uint32_t addr) {
+    {
+        const uint32_t off = addr - 0xFFD8000Cu;   // TCNT0 / TCNT1 (+12) / TCNT2 (+24)
+        if (off <= 24 && off % 12 == 0 && g_tcnt_fp && ReadMem32 == &addrspace::read32)
+            return tmu_tcnt_read_direct(off / 12);
+    }
 #ifdef DEBUG_DISPATCH
     g_cb_mem_read_calls.fetch_add(1, std::memory_order_relaxed);
 #endif
