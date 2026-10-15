@@ -389,3 +389,33 @@ REF==RB is expected to need the source-3 fix first. Once `DIAG SCHED` has named
 the field, serialize it (or restore it after `dc_deserialize`), then re-run the
 last two lines. Integrate into `dreamcast.html` only when REF==RB holds, with
 `--rbload` and a whole-step cost under one frame.
+
+## A failed JIT install is now a declared room event (2026-10-15)
+
+Same build, same room anchor: the compile and seal history follows guest
+execution only. Compile is synchronous (`new WebAssembly.Module`/`Instance`),
+and seals trigger on dispatch and interpreted-instruction counts. The one
+exception is an install the HOST refuses: the module/instance creation throws,
+for example from memory or table growth on a small device. That block is parked
+and span-interpreted on that console only. The two routes charge different guest
+cycles, so the room forks without any warning.
+
+Now (`rec_wasm.cpp` `install_*_tries`, `jit_declare_park`):
+1. Every install is tried `INSTALL_TRIES` = 3 times. A transient refusal then
+   ends on the same compiled route as everyone else.
+2. A block that fails every try is parked as before, and also counted in
+   `g_jit_hard_parks`. That count is lockstep fingerprint word 14 (`jitParks`,
+   `lsWords` in `flycast_worker.js`, `ctx_snapshot(144)`). It is zeroed at the
+   room anchor (`flycast_lockstep_reset`).
+3. The console prints `[jit-park] ⚠ ... declared desync`.
+
+`?jitfailinject=N` poisons the Nth block compiled after the next JIT reset.
+`&jitfailonce=1` makes only its first install attempt fail.
+
+| Gauntlet lockstep room, joiner query | result |
+|---|---|
+| `jitfailinject=500` | block 0x8c0437f6 refused 3x as part of a shard, then 3x on its own; parked. DESYNC declared at the FIRST fingerprint (frame 60). The joiner's word 14 = 1 vs host 0. Words 3/9/11 had already diverged too. |
+| `jitfailinject=500&jitfailonce=1` | the shard's first install refused, the retry installed it. IN SYNC over 29 RAM checkpoints and 32 fingerprints. |
+
+Not done: a resync after a declared desync. There is no state-transfer path
+yet, so the room stops, saying why, where it used to drift.
