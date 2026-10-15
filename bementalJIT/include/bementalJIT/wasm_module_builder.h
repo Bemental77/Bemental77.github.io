@@ -575,6 +575,10 @@ public:
 	void op_i64_shl()   { emitByte(wop::i64_shl); }
 	void op_i64_shr_s() { emitByte(wop::i64_shr_s); }
 	void op_i64_shr_u() { emitByte(wop::i64_shr_u); }
+	void op_i64_div_s() { emitByte(0x7F); }
+	void op_i64_div_u() { emitByte(0x80); }
+	void op_i64_rem_u() { emitByte(0x82); }
+	void op_i64_lt_s()  { emitByte(0x53); }
 	void op_i64_const(s64 val) {
 		emitByte(wop::i64_const);
 		// signed LEB128 for i64

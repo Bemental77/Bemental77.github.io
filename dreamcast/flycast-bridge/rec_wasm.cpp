@@ -508,6 +508,13 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_slice_inwasm(int on) {
     bemental_sh4_set_slice_inwasm(on);
     bm_ResetCache();   // blocks compiled under the other setting must not survive the switch
 }
+// div32u/s/p2 inline in emitted code (wasm_emit.cpp emitDiv32Inline);
+// default OFF (the C fallback); ?divinline=1 arms it. COMPILE-time.
+extern "C" void bemental_sh4_set_div_inline(int on);
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_divinline(int on) {
+    bemental_sh4_set_div_inline(on);
+    bm_ResetCache();
+}
 extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_chain(int on) {
     g_chain_enabled = !!on;
 }
@@ -537,6 +544,7 @@ volatile uint32_t g_syncsr_count = 0;
 // sh4_interp_shil_fb; each fire = flushAll + import + UpdateFPSCR + reload,
 // and the containing block is fusion-excluded). Read via ctxsnap 89.
 volatile uint32_t g_syncfpscr_count = 0;
+volatile uint32_t g_div32_count = 0;      // shop_div32u/s/p2 C-fallback fires (ctxsnap 146)
 // Lever-11: PSO frame-wait-spin slice burn. DEFAULT ON, same shape as the
 // lever-6 shard default (dreamcast.html sends `shard on:0` for ?noshard=1
 // against a wasm that defaults ON). Burns counted via ctxsnap 90.
@@ -971,6 +979,9 @@ static void jit_declare_park(u32 vaddr) {
             'declared desync (fingerprint word jitParks=' + ($2>>>0) + ').'}); }, (int)vaddr, INSTALL_TRIES, (int)g_jit_hard_parks);
     }
 }
+// The ARM7 backend's install failure is the same class: its fallback (the v0
+// span interpreter) does not slice cycles like the compiled block.
+extern "C" void flycast_jit_declare_park_arm(uint32_t pc) { jit_declare_park(pc); }
 extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_jitfail(int n, int once) {
     g_jitfail_inject_n = (u32)n; g_jitfail_once = !!once;
 }
@@ -1572,6 +1583,7 @@ EMSCRIPTEN_KEEPALIVE uint32_t flycast_ctx_snapshot(uint32_t which) {
         case 89: return g_syncfpscr_count;        // lever-10 sizing: shop_sync_fpscr C-fallback fires
         case 90: return g_idleskip_burns;         // lever-11 v0: frame-wait-spin slice burns
         case 143: return g_jit_retry_saves;       // installs saved by a retry
+        case 146: return g_div32_count;           // div32 C-fallback fires
         case 144: return g_jit_hard_parks;        // installs that failed every retry (fingerprint word)
         case 140: return g_gwff_runs;             // Gauntlet wait-loop fast-forwards
         case 141: return g_gwff_passes;           // passes they applied

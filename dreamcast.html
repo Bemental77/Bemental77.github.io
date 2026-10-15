@@ -2683,6 +2683,15 @@
             setTimeout(() => worker.postMessage({ cmd: 'pchist', what: 1 }), (pa || 40) * 1000);
             setTimeout(() => worker.postMessage({ cmd: 'pchist', what: 2 }), ((pa || 40) + (pb || 20)) * 1000);
           }
+          // ?armhist=A,B (DIAG): ARM7 cycles by block pc, armed A s after ready, printed B s later
+          if (qs.has('armhist')) {
+            const [ha, hb] = String(qs.get('armhist')).split(',').map((x) => +x || 0);
+            setTimeout(() => worker.postMessage({ cmd: 'armhist', on: 1 }), (ha || 40) * 1000);
+            setTimeout(() => worker.postMessage({ cmd: 'armhist', on: 0 }), ((ha || 40) + (hb || 20)) * 1000);
+          }
+          if (qs.get('armtime') === '1') worker.postMessage({ cmd: 'armtime', on: 1 });   // DIAG: ARM mainloop ms per guest second
+          if (qs.has('divinline')) worker.postMessage({ cmd: 'divinline', on: qs.get('divinline') === '1' ? 1 : 0 });   // ARM: ?divinline=1 = SH4 div32 inline (default: the C fallback)
+          if (qs.get('armmemfp') === '0') worker.postMessage({ cmd: 'armmemfp', on: 0 });   // control: ARM7 sound-RAM accesses call DoMemOp
           if (qs.get('sliceinwasm') === '0') worker.postMessage({ cmd: 'sliceinwasm', on: 0 });   // control: spent slices return to the dispatcher
           if (qs.has('noshard'))    worker.postMessage({ cmd: 'shard', on: 0 });
           else if (qs.has('shard')) worker.postMessage({ cmd: 'shard', on: 1 });
@@ -5548,6 +5557,8 @@
   const ARM_DESC = {
     uncap:       'GUEST UNGOVERNED — the game runs FASTER than hardware',
     noidleskip:  'idle-skip OFF',
+    armmemfp:    'ARM7 inline sound-RAM access OFF',
+    divinline:   'SH4 inline div32 changed',
     gwff:        'Gauntlet wait fast-forward OFF',
     jitfailinject: 'TEST: injected JIT install failure',
     idleskip:    'idle-skip forced ON',

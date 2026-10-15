@@ -279,6 +279,65 @@ Exactness, wasm `253ef97a`:
   host dispatch history, so any knob that changes dispatch counts forks a
   mixed room. Rooms run one build, so peers share that history.
 
+## 2026-10-15 (later) — ARM7 spin drop rejected, tier-up priced, ARM sound-RAM inline shipped
+
+All on this box, PSO = Pioneer 2 lobby state, Gauntlet = cold-boot attract, rate 1, load 3-6,
+emu = ms of emulation per guest second (mean of the settled heartbeats).
+
+**ARM7 pure-spin drop: not worth building.** `?armhist=A,B` (new DIAG, `arm7_rec_wasm.cpp`)
+counts ARM cycles by block start pc and dumps the hot code for an offline disassembly.
+The detector (same block, identical register file + mode/enable state, no store and no
+read outside sound RAM in between, inside one sample) found nothing after boot in either
+game. PSO's driver does real work at 22.6 MHz (top blocks 0x1cec 26%, 0x9d0 11%, 0x93c 8%:
+channel-update loops that store). Gauntlet's main loop scans 64 bytes for != 0xff
+(0x4afc/0x4b08, 41%) then a 32-bit mask (0x4b54/0x4b5c, 32%). Each pass stores, and one
+pass is longer than a sample's 512 cycles. The drop code was removed. Only the histogram stays.
+
+**V8 tier-up is ~8% of emulation, and a page cannot buy it back by merging functions.**
+
+| arm | emu (ms per guest s) |
+|---|---|
+| default | 477 / 462 / 472 |
+| `--js-flags --no-liftoff` | 434 / 430 |
+| `--wasm-tiering-budget=20000` | 433 |
+
+So the whole gap is functions still running in Liftoff. Most of them are the long tail of
+emitted SH4 blocks: each runs a few times a frame and never spends its budget. Tried: put
+32 (or 4) shard members in one wasm function behind a br_table, so their exits share one
+budget. With TurboFan forced on both arms, that code is 20% slower (496 / 488 vs 411 / 409).
+At the default tier it is no better (469 / 466 vs 460 / 444). Reverted. A page has no way
+to ask for TurboFan. The lever is real but has no mechanism yet.
+
+**Shipped: ARM7 sound-RAM loads and stores inline** (`emitMemOp`, `?armmemfp=0` is the
+control). Every LDR/STR used to be a call_indirect into `DoMemOp`. Measured with
+`?armtime=1` (new DIAG: ARM mainloop wall time per guest second), PSO, two interleaved pairs:
+68.4 / 68.3 ms with the change vs 75.2 / 74.4 without, about 1.5% of emulation. In the same
+set, block-end chaining (each block calling `EntryPoints[pc]` itself) bought nothing:
+67.8 / 65.3 with it off. Not kept.
+
+- Exact: rollback rig REF1==REF2 61/61, REF==RB 59/59.
+- Soaks IN SYNC: PSO lockstep 74 checkpoints, PSO forced rollback 32, Gauntlet forced
+  rollback 32.
+- Mixed-arm Gauntlet rollback room (joiner `armmemfp=0`): IN SYNC, 32 checkpoints.
+- Toaster rate 6.2, load 15-16: solo 0.652 / 0.606, room 0.247 / 0.216. That is the same
+  band as before. 1.5% is inside the bench's noise.
+
+**div32 sized** (ctxsnap 146, `div32=` in `[ctxsnap]`): PSO lobby ~18.6K C-fallback fires a
+guest second, Gauntlet ~100K (its TMU delay loop). Also counted: sync_fpscr 2.3K / 6.3K and IFB
+3.3K / 1K. Each fire is flushAll + an import call + a reload.
+
+**div32 inline: exact, no gain, shipped OFF** (`emitDiv32Inline`, `?divinline=1` arms it).
+Mixed-arm rollback rooms with the joiner on the C fallback stayed IN SYNC (Gauntlet 32
+checkpoints, PSO 32). Emulation per guest second, on vs off: Gauntlet 838/824/836 vs
+835/845/851, PSO lobby 502/498 vs 494/484. That is inside the noise.
+
+Toaster-rate profile, this build (rate 6.2, 15 s, 7,449 samples, worker 98% busy):
+- emitted code 53.8% (SH4 ~47.5, ARM ~6.2)
+- AicaUpdate inclusive 18.6% (ARM mainloop inclusive 10.6)
+- dispatch_slice 3.9 + jit_lookup 2.4 + credit_slices 1.5 + sh4_sched_tick 1.3
+- P4/TMU reads (readt + ReadMem_p4mmr) 3.0
+- JS glue ~4
+
 ## Status
 
 - [x] Split measured: solo at 1 and 6.2, room at 6.2 for 60 s, and a worker
