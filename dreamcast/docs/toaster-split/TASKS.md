@@ -624,6 +624,69 @@ Toaster gate, `tools/toaster_bench.mjs --pages dreamcast --rate 6.2 --reps 2 --l
 in sync). Before (84811cd): solo 0.813 / 0.840, room 0.287 / 0.303; the same bench at 10:30
 today read room 0.277 / 0.223. Still 0/2 PASS.
 
+## 2026-10-15 (later) — the room toaster as two devices (`dreamcast/tools/toaster_room2.mjs`)
+
+The gate's room cell runs both players in one browser under one duty cycle, so they take
+each other's on-slices. The new rig gives each player its own browser and its own device:
+- **cpuset**: the whole process tree is pinned, player A to cpus 0-1 and B to 2-3.
+- **per-thread quota**: every renderer thread gets its own cpu cgroup at 1/6.2 of a core,
+  the duty cycle's per-thread slowdown. GPU/browser processes are not slowed, as before.
+- The signalling is the shipped one (MQTT broker + WebRTC), as in room_desync_soak.
+
+Proof before every run (BenchmarkIndex in a worker of each browser, a run is VOID without it):
+
+| run | slowdown A / B (want 6.2 +-25%) | together/alone A / B (want ~1) | cpus allowed (all threads) |
+|---|---|---|---|
+| pair | 6.63 / 6.12 | 1.079 / 1.036 | 0-1 / 2-3 |
+| room | 6.94 / 6.64 | 1.053 / 1.016 | 0-1 / 2-3 |
+| room | 6.99 / 6.66 | 1.024 / 1.000 | 0-1 / 2-3 |
+
+The throttled share was 1211-1223 of 1317-1369 cgroup periods. One earlier room run was
+VOID: 7.54x on a 1 s free score; the free score is now a median of 5 x 2 s.
+
+Rate 6.2, 20-heartbeat window (lib/bench.js's rule), load 0.4-3.2:
+
+| cell | x (A or host / B or joiner) |
+|---|---|
+| solo | 0.844 (bench), 0.796, 0.789 |
+| pair of solos | 0.731 / 0.753 (bench) |
+| room (delay 2, in sync) | 0.819 / 0.825, 0.825 / 0.824, 0.819 / 0.822, 0.696 / 0.706 |
+
+**On two real-shaped devices, the room runs at solo speed.** On one shared box it read
+0.35-0.39x; the gap came from sharing a box, not from rooms. The steady coupling term is now
+inside the noise (gate wait 0-100 ms/s). Every room started in delay through the step estimate
+(87-92 ms declared).
+
+### The up-switch, exercised (`?dcstepfake=HI,LO,F`, test arm)
+
+A console with the arm declares HI ms at Ready and reports LO from frame F on, whatever it
+measured. That makes a room that started in delay get moved up to rollback by the host's gate.
+PSO soak (hermetic snapshot, owd 20+10, `dcstepfake=200,1,300` on both):
+- The room started in delay, and both consoles logged "moved to ROLLBACK at frame 651".
+- Each armed its ring held (`enter:0`) and entered rollback mode at frame 651. The refill
+  after ENTER was 1.2-1.5 s with batching.
+- 25 / 30 rollbacks, depth 4. **IN SYNC** over 34 RAM checkpoints and 34 fingerprints.
+- The same room with the joiner on `dcrbbroken=1` **DESYNCs** (first RAM mismatch at f1380),
+  so the detectors work across the switch.
+
+### Lockstep coupling on the two-device toaster: not measurable
+
+Three interleaved room/solo pairs, `toaster_room2.mjs`, rate 6.2, 40 s, load 2-5. Every
+proof passed.
+
+| pair | room host / joiner, window | solo, window (bench) | room steady | solo steady |
+|---|---|---|---|---|
+| 1 | 0.829 / 0.827 | 0.799 (0.815) | 0.891 / 0.883 | 0.823 |
+| 2 | 0.710 / 0.709 | 0.818 (0.874) | 0.833 / 0.827 | 0.916 |
+| 3 | 0.782 / 0.779 | 0.814 (0.821) | 0.815 / 0.815 | 0.818 |
+
+Means: window room 0.773 vs solo 0.810 (-5%); steady room 0.844 vs solo 0.852 (-1%). The run
+to run spread of each arm is 0.71-0.83 and 0.82-0.92. Gate wait in the room is 1-49 ms/s.
+The -15 to -25% "coupling" measured on one shared box was the two consoles competing for one
+duty-cycled CPU, not the lockstep. There is no coupling lever to take: on two devices a
+toaster room runs at solo speed. What keeps both short of 1.000x is the solo work itself
+(~2.2x over budget at 6.2, the levers above).
+
 ## Status
 
 - [x] Split measured: solo at 1 and 6.2, room at 6.2 for 60 s, and a worker

@@ -17,7 +17,7 @@
        module generalises; it does not replace this page's own probeWebGL2 or its
        [glinfo] pinning, which remain the authority on what the WORKER's context got. -->
   <script src="/lib/capability.js?v=6461f930"></script>
-  <script src="/lib/bench.js?v=6672f808"></script><!-- ?bench=1 real-device benchmark; inert without it -->
+  <script src="/lib/bench.js?v=d1826e5a"></script><!-- ?bench=1 real-device benchmark; inert without it -->
   <script src="/lib/xboxinput.js"></script>
   <!-- Block-gzip disc reader. Shared with the flycast worker shim, which
        importScripts()es this same file, so the eager and lazy paths cannot
@@ -3051,6 +3051,10 @@
         // A rollback frame's ack carries what one step costs this console, which
         // the host's capacity gate sizes the room by (lib/netplay.js _capMean).
         if (d.st != null) { const e = lsEngine(); if (e) { e.selfStepMs = +d.st || 0; e.selfPresentMs = +d.sp || 0; } }
+        // TEST ARM ?dcstepfake=HI,LO,F: from frame F on this console reports a step of LO ms whatever it
+        // measured (the declare at Ready reported HI), so a capacity-gated room that STARTED in delay
+        // is moved UP to rollback by the host's gate — the path that arms the ring mid-room.
+        if (LSQ.stepFake && d.f >= LSQ.stepFake[2]) { const e = lsEngine(); if (e) { e.selfStepMs = LSQ.stepFake[1]; e.selfPresentMs = 0; } }
         // the worker's cumulative guest clock (ms) at the end of frame f — __dcProbe().guestClock
         if (typeof d.gk === 'number') LS.guestClockMs = d.gk;
         lsOnWorkerFrame(d.f, d.due);
@@ -3134,6 +3138,7 @@
         // frame's ack replaces it with the measured cost ('lsFrame' st).
         // ?dcstepest=0 = declare nothing, the control.
         if (d.ok && d.ms > 0 && LSQ.stepEst) LS.stepEstMs = Math.round(d.ms * DC_STEP_PER_NORMALIZE * 10) / 10;
+        if (LSQ.stepFake) LS.stepEstMs = LSQ.stepFake[0];   // TEST ARM ?dcstepfake (see 'lsFrame')
         pageLog('[lockstep] determinism normalize ' + (d.ok ? 'OK' : 'FAILED') +
                 (d.ms != null ? ' in ' + d.ms + ' ms' : '') + (d.error ? ' — ' + d.error : ''));
         break;
@@ -6202,7 +6207,9 @@
              // one such console must DESYNC; if it does not, the detector is blind.
              rbBroken: q.get('dcrbbroken') === '1',
              // the rollback-step estimate declared at Ready ('lsNormalize'); ?dcstepest=0 = the control
-             stepEst: q.get('dcstepest') !== '0' };
+             stepEst: q.get('dcstepest') !== '0',
+             // TEST ARM (never a product setting): ?dcstepfake=HI,LO,F — declare HI ms at Ready, report LO from frame F
+             stepFake: /^\d+(\.\d+)?,\d+(\.\d+)?,\d+$/.test(q.get('dcstepfake') || '') ? q.get('dcstepfake').split(',').map(Number) : null };
   })();
   // ROLLBACK IS ON BY DEFAULT ONLY FOR A DISC IT IS PROVEN EXACT ON. The host
   // proposes the room's mode, so the host's disc decides: a rollback room's
