@@ -978,6 +978,113 @@ static bool tryEmitReadmImmediate(WasmModuleBuilder& b, const shil_opcode& op,
 }
 
 // PORTED FROM rec_x64.cpp:971-1053 (GenWriteMemImmediate).
+
+// ---------------------------------------------------------------------------
+// div32u / div32s / div32p2 inline (2026-10-15). DEFAULT OFF, ?divinline=1 arms it.
+// Exact (mixed-arm rollback rooms, joiner on the C fallback, IN SYNC on Gauntlet
+// at ~100K divs a guest second and on PSO), but no measured gain: Gauntlet
+// 838/824/836 vs 835/845/851 ms of emulation per guest second, PSO lobby
+// 502/498 vs 494/484. Kept as an arm, not as the default.
+// The decoder folds the SH4 32-step div1 sequence into these SHIL ops. They
+// used to flush the register cache, call sh4_interp_shil_fb and reload; the
+// arithmetic below is that function's, operation for operation
+// (EmscriptenWorker.cpp, after shil_canonical.h:547-651). All inputs are read
+// before rd/rd2 are written. Temporaries live in LOCAL_TMP..TMP4 and the
+// block's i64 scratch, and nothing is loaded or stored inside an `if` arm.
+// ---------------------------------------------------------------------------
+bool g_emit_div_inline = false;
+static void emitDiv32Inline(WasmModuleBuilder& b, const shil_opcode& op, RegCache& cache)
+{
+    const u32 t64 = cache.tmp64Local();
+    if (op.op == shop_div32p2) {
+        emitLoadParamCached(b, op.rs1, cache); b.op_local_set(LOCAL_TMP);    // a
+        emitLoadParamCached(b, op.rs2, cache); b.op_local_set(LOCAL_TMP2);   // b
+        emitLoadParamCached(b, op.rs3, cache); b.op_local_set(LOCAL_TMP3);   // T
+        b.op_local_get(LOCAL_TMP3); b.op_i32_const(0); b.op_i32_lt_s();
+        b.op_if();
+          // T & 0x80000000: if (b > 0) a--; if (T & 1) a += b;
+          b.op_local_get(LOCAL_TMP);
+          b.op_local_get(LOCAL_TMP2); b.op_i32_const(0); b.op_i32_gt_s();
+          b.op_i32_sub();
+          b.op_local_set(LOCAL_TMP);
+          b.op_local_get(LOCAL_TMP3); b.op_i32_const(1); b.op_i32_and();
+          b.op_if();
+            b.op_local_get(LOCAL_TMP); b.op_local_get(LOCAL_TMP2); b.op_i32_add(); b.op_local_set(LOCAL_TMP);
+          b.op_end();
+        b.op_else();
+          // if (!(T & 1)) a -= b;
+          b.op_local_get(LOCAL_TMP3); b.op_i32_const(1); b.op_i32_and(); b.op_i32_eqz();
+          b.op_if();
+            b.op_local_get(LOCAL_TMP); b.op_local_get(LOCAL_TMP2); b.op_i32_sub(); b.op_local_set(LOCAL_TMP);
+          b.op_end();
+        b.op_end();
+        emitPreStore(b, op.rd, cache);
+        b.op_local_get(LOCAL_TMP);
+        emitPostStore(b, op.rd, cache);
+        return;
+    }
+    const bool sgn = op.op == shop_div32s;
+    // t64 = (r3 << 32) | r1   (r3 sign-extended for div32s)
+    emitLoadParamCached(b, op.rs3, cache);
+    b.op_local_tee(LOCAL_TMP4);
+    if (sgn) b.op_i64_extend_i32_s(); else b.op_i64_extend_i32_u();
+    b.op_i64_const(32); b.op_i64_shl();
+    emitLoadParamCached(b, op.rs1, cache);
+    b.op_i64_extend_i32_u();
+    b.op_i64_or();
+    b.op_local_set(t64);
+    emitLoadParamCached(b, op.rs2, cache);
+    b.op_local_set(LOCAL_TMP);                                                // r2
+    if (sgn) {   // if (dividend < 0) dividend++;
+        b.op_local_get(t64);
+        b.op_local_get(t64); b.op_i64_const(0); b.op_i64_lt_s(); b.op_i64_extend_i32_u();
+        b.op_i64_add();
+        b.op_local_set(t64);
+    }
+    b.op_local_get(LOCAL_TMP);
+    b.op_if();
+      b.op_local_get(t64);
+      b.op_local_get(LOCAL_TMP);
+      if (sgn) { b.op_i64_extend_i32_s(); b.op_i64_div_s(); }
+      else     { b.op_i64_extend_i32_u(); b.op_i64_div_u(); }
+      b.op_i32_wrap_i64();
+      b.op_local_set(LOCAL_TMP2);                                             // quo
+      if (!sgn) {
+          b.op_local_get(t64); b.op_local_get(LOCAL_TMP); b.op_i64_extend_i32_u(); b.op_i64_rem_u();
+          b.op_i32_wrap_i64(); b.op_local_set(LOCAL_TMP3);                    // rem
+      }
+    b.op_else();
+      b.op_i32_const(0); b.op_local_set(LOCAL_TMP2);
+      if (!sgn) { b.op_local_get(t64); b.op_i32_wrap_i64(); b.op_local_set(LOCAL_TMP3); }
+    b.op_end();
+    if (sgn) {
+        // rem = (s32)(dividend - quo * r2)   (quo * r2 in s32)
+        b.op_local_get(t64); b.op_i32_wrap_i64();
+        b.op_local_get(LOCAL_TMP2); b.op_local_get(LOCAL_TMP); b.op_i32_mul();
+        b.op_i32_sub();
+        b.op_local_set(LOCAL_TMP3);
+        // if ((r3 ^ r2) & 0x80000000) quo--; else if (r3 < 0) rem--;
+        b.op_local_get(LOCAL_TMP4); b.op_local_get(LOCAL_TMP); b.op_i32_xor();
+        b.op_i32_const(0); b.op_i32_lt_s();
+        b.op_if();
+          b.op_local_get(LOCAL_TMP2); b.op_i32_const(1); b.op_i32_sub(); b.op_local_set(LOCAL_TMP2);
+        b.op_else();
+          b.op_local_get(LOCAL_TMP3);
+          b.op_local_get(LOCAL_TMP4); b.op_i32_const(0); b.op_i32_lt_s();
+          b.op_i32_sub();
+          b.op_local_set(LOCAL_TMP3);
+        b.op_end();
+    }
+    emitPreStore(b, op.rd, cache);
+    b.op_local_get(LOCAL_TMP2);
+    emitPostStore(b, op.rd, cache);
+    if (op.rd2.is_reg()) {
+        emitPreStore(b, op.rd2, cache);
+        b.op_local_get(LOCAL_TMP3);
+        emitPostStore(b, op.rd2, cache);
+    }
+}
+
 static bool tryEmitWriteMemImmediate(WasmModuleBuilder& b, const shil_opcode& op,
                                      RuntimeBlockInfo* block, RegCache& cache) {
     u32 addr;
@@ -2642,6 +2749,8 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
     case shop_div32u:
     case shop_div32s:
     case shop_div32p2:
+        if (g_emit_div_inline) { emitDiv32Inline(b, op, cache); return true; }
+        [[fallthrough]];
     case shop_fsca:
     case shop_illegal:
     case shop_debug_1:
@@ -4708,6 +4817,9 @@ extern "C" void bemental_sh4_set_prologue_trim(int on) {
 }
 extern "C" void bemental_sh4_set_hop_guard(int on) {
     bemental::sh4::g_emit_hop_guard = !!on;
+}
+extern "C" void bemental_sh4_set_div_inline(int on) {
+    bemental::sh4::g_emit_div_inline = !!on;
 }
 extern "C" void bemental_sh4_set_slice_inwasm(int on) {
     bemental::sh4::g_emit_slice_inwasm = !!on;

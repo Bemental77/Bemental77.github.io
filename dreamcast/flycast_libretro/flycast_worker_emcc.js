@@ -780,7 +780,7 @@ async function createWasm() {
   function receiveInstance(instance, module) {
     wasmExports = instance.exports;
     wasmExports = applySignatureConversions(wasmExports);
-    registerTLSInit(wasmExports["Vh"]);
+    registerTLSInit(wasmExports["Wh"]);
     assignWasmExports(wasmExports);
     // We now have the Wasm module loaded up, keep a reference to the compiled module so we can post it to the workers.
     wasmModule = module;
@@ -11010,7 +11010,7 @@ function wasm_dispatcher_get_last_error(dst, max_len) {
 }
 
 // Imports from the Wasm binary.
-var _flycast_guest_cycles, _flycast_keep_pthread_runtime, __emscripten_thread_free_data, __emscripten_thread_crashed, _emscripten_create_gl_context, _emscripten_worker_init, _emscripten_load_disc, _flycast_run_iter_flag_ptr, _flycast_flash_ptr, _flycast_flash_size, _flycast_flash_gen, _flycast_vmu_ptr, _flycast_vmu_size, _flycast_vmu_gen, _flycast_vmu_ports, _emscripten_run_iter, _flycast_rb_reset_host_history, _emscripten_reset, _flycast_lockstep_reset, _emscripten_get_maple_ptr, _emscripten_set_player_ports, _emscripten_get_player_ports, _emscripten_get_port_polls, _emscripten_save_state, _free, _sh4_import_fnptrs, _sh4_slice_end, _sh4_jit_lookup_idx, _sh4_interp_shil_fb, _sh4_interp_ifb, _sh4_mem_write32, _sh4_mem_write16, _sh4_mem_write8, _sh4_mem_read32, _sh4_mem_read16, _sh4_mem_read8, _emscripten_parity_begin, _malloc, _flycast_ic_invalidate, _flycast_set_ic, _flycast_shard_seal_now, _emscripten_parity_tick, _emscripten_load_state, _emscripten_rb_mute_audio, _emscripten_state_size, _emscripten_save_state_into, _emscripten_set_rollback_mode, _flycast_set_rollback_mode, _flycast_set_deterministic, _emscripten_rb_ram_offset, _emscripten_rb_hash, _emscripten_load_state_rollback, _flycast_rb_snapshot_code_pages, _flycast_rb_invalidate_changed, _emscripten_lockstep_normalize, _emscripten_set_video_target, _emscripten_set_audio_ring, _flycast_sh4dis, _main, _flycast_set_slice_inwasm, _flycast_set_chain, _flycast_pchist, _flycast_set_jitfail, _flycast_set_shard, _flycast_set_idleskip, _flycast_diag_set, _flycast_diag_ifb, _flycast_get_sh4_pc, _flycast_ctx_snapshot, _flycast_set_interp_only, _flycast_interp_step_count, _flycast_set_mem_fastpaths, _flycast_set_regcache, _flycast_set_imm_fastpath, _flycast_set_sq_fp, _flycast_set_self_loop, _flycast_set_rte_intc, _flycast_set_interp_range, _flycast_set_pc_trace_until, _flycast_set_gwff, _flycast_set_arm7jit, _flycast_set_arm7selftest, _flycast_set_armmemfp, _flycast_set_armhist, _flycast_set_armtime, _pthread_self, _flycast_set_fog, _flycast_set_modvol, _htons, _htonl, _flycast_set_render_skip, _flycast_render_skips, _sh4_sched_debug_dump, _ntohs, _flycast_ser_sections, __emscripten_tls_init, _emscripten_builtin_memalign, __emscripten_thread_init, ___set_thread_state, __emscripten_run_js_on_main_thread_done, __emscripten_run_js_on_main_thread, __emscripten_thread_exit, __emscripten_check_mailbox, _setThrew, __emscripten_tempret_set, _emscripten_stack_set_limits, __emscripten_stack_restore, __emscripten_stack_alloc, _emscripten_stack_get_current, ___cxa_decrement_exception_refcount, ___cxa_increment_exception_refcount, ___cxa_can_catch, ___cxa_get_exception_ptr, __indirect_function_table, wasmTable;
+var _flycast_guest_cycles, _flycast_keep_pthread_runtime, __emscripten_thread_free_data, __emscripten_thread_crashed, _emscripten_create_gl_context, _emscripten_worker_init, _emscripten_load_disc, _flycast_run_iter_flag_ptr, _flycast_flash_ptr, _flycast_flash_size, _flycast_flash_gen, _flycast_vmu_ptr, _flycast_vmu_size, _flycast_vmu_gen, _flycast_vmu_ports, _emscripten_run_iter, _flycast_rb_reset_host_history, _emscripten_reset, _flycast_lockstep_reset, _emscripten_get_maple_ptr, _emscripten_set_player_ports, _emscripten_get_player_ports, _emscripten_get_port_polls, _emscripten_save_state, _free, _sh4_import_fnptrs, _sh4_slice_end, _sh4_jit_lookup_idx, _sh4_interp_shil_fb, _sh4_interp_ifb, _sh4_mem_write32, _sh4_mem_write16, _sh4_mem_write8, _sh4_mem_read32, _sh4_mem_read16, _sh4_mem_read8, _emscripten_parity_begin, _malloc, _flycast_ic_invalidate, _flycast_set_ic, _flycast_shard_seal_now, _emscripten_parity_tick, _emscripten_load_state, _emscripten_rb_mute_audio, _emscripten_state_size, _emscripten_save_state_into, _emscripten_set_rollback_mode, _flycast_set_rollback_mode, _flycast_set_deterministic, _emscripten_rb_ram_offset, _emscripten_rb_hash, _emscripten_load_state_rollback, _flycast_rb_snapshot_code_pages, _flycast_rb_invalidate_changed, _emscripten_lockstep_normalize, _emscripten_set_video_target, _emscripten_set_audio_ring, _flycast_sh4dis, _main, _flycast_set_slice_inwasm, _flycast_set_divinline, _flycast_set_chain, _flycast_pchist, _flycast_set_jitfail, _flycast_set_shard, _flycast_set_idleskip, _flycast_diag_set, _flycast_diag_ifb, _flycast_get_sh4_pc, _flycast_ctx_snapshot, _flycast_set_interp_only, _flycast_interp_step_count, _flycast_set_mem_fastpaths, _flycast_set_regcache, _flycast_set_imm_fastpath, _flycast_set_sq_fp, _flycast_set_self_loop, _flycast_set_rte_intc, _flycast_set_interp_range, _flycast_set_pc_trace_until, _flycast_set_gwff, _flycast_set_arm7jit, _flycast_set_arm7selftest, _flycast_set_armmemfp, _flycast_set_armhist, _flycast_set_armtime, _pthread_self, _flycast_set_fog, _flycast_set_modvol, _htons, _htonl, _flycast_set_render_skip, _flycast_render_skips, _sh4_sched_debug_dump, _ntohs, _flycast_ser_sections, __emscripten_tls_init, _emscripten_builtin_memalign, __emscripten_thread_init, ___set_thread_state, __emscripten_run_js_on_main_thread_done, __emscripten_run_js_on_main_thread, __emscripten_thread_exit, __emscripten_check_mailbox, _setThrew, __emscripten_tempret_set, _emscripten_stack_set_limits, __emscripten_stack_restore, __emscripten_stack_alloc, _emscripten_stack_get_current, ___cxa_decrement_exception_refcount, ___cxa_increment_exception_refcount, ___cxa_can_catch, ___cxa_get_exception_ptr, __indirect_function_table, wasmTable;
 
 function assignWasmExports(wasmExports) {
   _flycast_guest_cycles = Module["_flycast_guest_cycles"] = wasmExports["fg"];
@@ -11073,59 +11073,60 @@ function assignWasmExports(wasmExports) {
   _flycast_sh4dis = Module["_flycast_sh4dis"] = wasmExports["jh"];
   _main = Module["_main"] = wasmExports["kh"];
   _flycast_set_slice_inwasm = Module["_flycast_set_slice_inwasm"] = wasmExports["lh"];
-  _flycast_set_chain = Module["_flycast_set_chain"] = wasmExports["mh"];
-  _flycast_pchist = Module["_flycast_pchist"] = wasmExports["nh"];
-  _flycast_set_jitfail = Module["_flycast_set_jitfail"] = wasmExports["oh"];
-  _flycast_set_shard = Module["_flycast_set_shard"] = wasmExports["ph"];
-  _flycast_set_idleskip = Module["_flycast_set_idleskip"] = wasmExports["qh"];
-  _flycast_diag_set = Module["_flycast_diag_set"] = wasmExports["rh"];
-  _flycast_diag_ifb = Module["_flycast_diag_ifb"] = wasmExports["sh"];
-  _flycast_get_sh4_pc = Module["_flycast_get_sh4_pc"] = wasmExports["th"];
-  _flycast_ctx_snapshot = Module["_flycast_ctx_snapshot"] = wasmExports["uh"];
-  _flycast_set_interp_only = Module["_flycast_set_interp_only"] = wasmExports["vh"];
-  _flycast_interp_step_count = Module["_flycast_interp_step_count"] = wasmExports["wh"];
-  _flycast_set_mem_fastpaths = Module["_flycast_set_mem_fastpaths"] = wasmExports["xh"];
-  _flycast_set_regcache = Module["_flycast_set_regcache"] = wasmExports["yh"];
-  _flycast_set_imm_fastpath = Module["_flycast_set_imm_fastpath"] = wasmExports["zh"];
-  _flycast_set_sq_fp = Module["_flycast_set_sq_fp"] = wasmExports["Ah"];
-  _flycast_set_self_loop = Module["_flycast_set_self_loop"] = wasmExports["Bh"];
-  _flycast_set_rte_intc = Module["_flycast_set_rte_intc"] = wasmExports["Ch"];
-  _flycast_set_interp_range = Module["_flycast_set_interp_range"] = wasmExports["Dh"];
-  _flycast_set_pc_trace_until = Module["_flycast_set_pc_trace_until"] = wasmExports["Eh"];
-  _flycast_set_gwff = Module["_flycast_set_gwff"] = wasmExports["Fh"];
-  _flycast_set_arm7jit = Module["_flycast_set_arm7jit"] = wasmExports["Gh"];
-  _flycast_set_arm7selftest = Module["_flycast_set_arm7selftest"] = wasmExports["Hh"];
-  _flycast_set_armmemfp = Module["_flycast_set_armmemfp"] = wasmExports["Ih"];
-  _flycast_set_armhist = Module["_flycast_set_armhist"] = wasmExports["Jh"];
-  _flycast_set_armtime = Module["_flycast_set_armtime"] = wasmExports["Kh"];
-  _pthread_self = wasmExports["Lh"];
-  _flycast_set_fog = Module["_flycast_set_fog"] = wasmExports["Mh"];
-  _flycast_set_modvol = Module["_flycast_set_modvol"] = wasmExports["Nh"];
-  _htons = wasmExports["Oh"];
-  _htonl = wasmExports["Ph"];
-  _flycast_set_render_skip = Module["_flycast_set_render_skip"] = wasmExports["Qh"];
-  _flycast_render_skips = Module["_flycast_render_skips"] = wasmExports["Rh"];
-  _sh4_sched_debug_dump = Module["_sh4_sched_debug_dump"] = wasmExports["Sh"];
-  _ntohs = wasmExports["Th"];
-  _flycast_ser_sections = Module["_flycast_ser_sections"] = wasmExports["Uh"];
-  __emscripten_tls_init = wasmExports["Vh"];
-  _emscripten_builtin_memalign = wasmExports["Wh"];
-  __emscripten_thread_init = wasmExports["Xh"];
-  ___set_thread_state = wasmExports["Yh"];
-  __emscripten_run_js_on_main_thread_done = wasmExports["Zh"];
-  __emscripten_run_js_on_main_thread = wasmExports["_h"];
-  __emscripten_thread_exit = wasmExports["$h"];
-  __emscripten_check_mailbox = wasmExports["ai"];
-  _setThrew = wasmExports["bi"];
-  __emscripten_tempret_set = wasmExports["ci"];
-  _emscripten_stack_set_limits = wasmExports["di"];
-  __emscripten_stack_restore = wasmExports["ei"];
-  __emscripten_stack_alloc = wasmExports["fi"];
-  _emscripten_stack_get_current = wasmExports["gi"];
-  ___cxa_decrement_exception_refcount = wasmExports["hi"];
-  ___cxa_increment_exception_refcount = wasmExports["ii"];
-  ___cxa_can_catch = wasmExports["ji"];
-  ___cxa_get_exception_ptr = wasmExports["ki"];
+  _flycast_set_divinline = Module["_flycast_set_divinline"] = wasmExports["mh"];
+  _flycast_set_chain = Module["_flycast_set_chain"] = wasmExports["nh"];
+  _flycast_pchist = Module["_flycast_pchist"] = wasmExports["oh"];
+  _flycast_set_jitfail = Module["_flycast_set_jitfail"] = wasmExports["ph"];
+  _flycast_set_shard = Module["_flycast_set_shard"] = wasmExports["qh"];
+  _flycast_set_idleskip = Module["_flycast_set_idleskip"] = wasmExports["rh"];
+  _flycast_diag_set = Module["_flycast_diag_set"] = wasmExports["sh"];
+  _flycast_diag_ifb = Module["_flycast_diag_ifb"] = wasmExports["th"];
+  _flycast_get_sh4_pc = Module["_flycast_get_sh4_pc"] = wasmExports["uh"];
+  _flycast_ctx_snapshot = Module["_flycast_ctx_snapshot"] = wasmExports["vh"];
+  _flycast_set_interp_only = Module["_flycast_set_interp_only"] = wasmExports["wh"];
+  _flycast_interp_step_count = Module["_flycast_interp_step_count"] = wasmExports["xh"];
+  _flycast_set_mem_fastpaths = Module["_flycast_set_mem_fastpaths"] = wasmExports["yh"];
+  _flycast_set_regcache = Module["_flycast_set_regcache"] = wasmExports["zh"];
+  _flycast_set_imm_fastpath = Module["_flycast_set_imm_fastpath"] = wasmExports["Ah"];
+  _flycast_set_sq_fp = Module["_flycast_set_sq_fp"] = wasmExports["Bh"];
+  _flycast_set_self_loop = Module["_flycast_set_self_loop"] = wasmExports["Ch"];
+  _flycast_set_rte_intc = Module["_flycast_set_rte_intc"] = wasmExports["Dh"];
+  _flycast_set_interp_range = Module["_flycast_set_interp_range"] = wasmExports["Eh"];
+  _flycast_set_pc_trace_until = Module["_flycast_set_pc_trace_until"] = wasmExports["Fh"];
+  _flycast_set_gwff = Module["_flycast_set_gwff"] = wasmExports["Gh"];
+  _flycast_set_arm7jit = Module["_flycast_set_arm7jit"] = wasmExports["Hh"];
+  _flycast_set_arm7selftest = Module["_flycast_set_arm7selftest"] = wasmExports["Ih"];
+  _flycast_set_armmemfp = Module["_flycast_set_armmemfp"] = wasmExports["Jh"];
+  _flycast_set_armhist = Module["_flycast_set_armhist"] = wasmExports["Kh"];
+  _flycast_set_armtime = Module["_flycast_set_armtime"] = wasmExports["Lh"];
+  _pthread_self = wasmExports["Mh"];
+  _flycast_set_fog = Module["_flycast_set_fog"] = wasmExports["Nh"];
+  _flycast_set_modvol = Module["_flycast_set_modvol"] = wasmExports["Oh"];
+  _htons = wasmExports["Ph"];
+  _htonl = wasmExports["Qh"];
+  _flycast_set_render_skip = Module["_flycast_set_render_skip"] = wasmExports["Rh"];
+  _flycast_render_skips = Module["_flycast_render_skips"] = wasmExports["Sh"];
+  _sh4_sched_debug_dump = Module["_sh4_sched_debug_dump"] = wasmExports["Th"];
+  _ntohs = wasmExports["Uh"];
+  _flycast_ser_sections = Module["_flycast_ser_sections"] = wasmExports["Vh"];
+  __emscripten_tls_init = wasmExports["Wh"];
+  _emscripten_builtin_memalign = wasmExports["Xh"];
+  __emscripten_thread_init = wasmExports["Yh"];
+  ___set_thread_state = wasmExports["Zh"];
+  __emscripten_run_js_on_main_thread_done = wasmExports["_h"];
+  __emscripten_run_js_on_main_thread = wasmExports["$h"];
+  __emscripten_thread_exit = wasmExports["ai"];
+  __emscripten_check_mailbox = wasmExports["bi"];
+  _setThrew = wasmExports["ci"];
+  __emscripten_tempret_set = wasmExports["di"];
+  _emscripten_stack_set_limits = wasmExports["ei"];
+  __emscripten_stack_restore = wasmExports["fi"];
+  __emscripten_stack_alloc = wasmExports["gi"];
+  _emscripten_stack_get_current = wasmExports["hi"];
+  ___cxa_decrement_exception_refcount = wasmExports["ii"];
+  ___cxa_increment_exception_refcount = wasmExports["ji"];
+  ___cxa_can_catch = wasmExports["ki"];
+  ___cxa_get_exception_ptr = wasmExports["li"];
   __indirect_function_table = wasmTable = Module["wasmTable"] = wasmExports["lg"];
 }
 
@@ -11781,12 +11782,12 @@ function applySignatureConversions(wasmExports) {
   var makeWrapper_p = f => () => f() >>> 0;
   var makeWrapper_ppp = f => (a0, a1) => f(a0, a1) >>> 0;
   wasmExports["Rg"] = makeWrapper_pp(wasmExports["Rg"]);
-  wasmExports["Lh"] = makeWrapper_p(wasmExports["Lh"]);
-  wasmExports["Vh"] = makeWrapper_p(wasmExports["Vh"]);
-  wasmExports["Wh"] = makeWrapper_ppp(wasmExports["Wh"]);
-  wasmExports["fi"] = makeWrapper_pp(wasmExports["fi"]);
-  wasmExports["gi"] = makeWrapper_p(wasmExports["gi"]);
-  wasmExports["ki"] = makeWrapper_pp(wasmExports["ki"]);
+  wasmExports["Mh"] = makeWrapper_p(wasmExports["Mh"]);
+  wasmExports["Wh"] = makeWrapper_p(wasmExports["Wh"]);
+  wasmExports["Xh"] = makeWrapper_ppp(wasmExports["Xh"]);
+  wasmExports["gi"] = makeWrapper_pp(wasmExports["gi"]);
+  wasmExports["hi"] = makeWrapper_p(wasmExports["hi"]);
+  wasmExports["li"] = makeWrapper_pp(wasmExports["li"]);
   return wasmExports;
 }
 
@@ -12308,7 +12309,7 @@ isPthread && flycastWorkerModule();
 
 // --- build-flavor marker — INJECTED by flycast_worker_link.sh, do not hand-edit ---
 if (typeof globalThis !== 'undefined' && globalThis.name !== 'em-pthread') {
-  var __flycastBuildMarker = '[build] flavor=RELEASE defines=none linked=2026-10-15T05:25:36Z (clean — perf, boot depth and wedge behavior are valid)';
+  var __flycastBuildMarker = '[build] flavor=RELEASE defines=none linked=2026-10-15T06:17:20Z (clean — perf, boot depth and wedge behavior are valid)';
   try { console.log(__flycastBuildMarker); } catch (e) {}
   try { postMessage({ cmd: 'print', txt: __flycastBuildMarker }); } catch (e) {}
 }

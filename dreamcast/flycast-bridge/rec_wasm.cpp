@@ -508,6 +508,13 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_slice_inwasm(int on) {
     bemental_sh4_set_slice_inwasm(on);
     bm_ResetCache();   // blocks compiled under the other setting must not survive the switch
 }
+// div32u/s/p2 inline in emitted code (wasm_emit.cpp emitDiv32Inline);
+// default OFF (the C fallback); ?divinline=1 arms it. COMPILE-time.
+extern "C" void bemental_sh4_set_div_inline(int on);
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_divinline(int on) {
+    bemental_sh4_set_div_inline(on);
+    bm_ResetCache();
+}
 extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_chain(int on) {
     g_chain_enabled = !!on;
 }

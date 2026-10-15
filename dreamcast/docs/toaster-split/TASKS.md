@@ -326,6 +326,11 @@ set, block-end chaining (each block calling `EntryPoints[pc]` itself) bought not
 guest second, Gauntlet ~100K (its TMU delay loop). Also counted: sync_fpscr 2.3K / 6.3K and IFB
 3.3K / 1K. Each fire is flushAll + an import call + a reload.
 
+**div32 inline: exact, no gain, shipped OFF** (`emitDiv32Inline`, `?divinline=1` arms it).
+Mixed-arm rollback rooms with the joiner on the C fallback stayed IN SYNC (Gauntlet 32
+checkpoints, PSO 32). Emulation per guest second, on vs off: Gauntlet 838/824/836 vs
+835/845/851, PSO lobby 502/498 vs 494/484. That is inside the noise.
+
 Toaster-rate profile, this build (rate 6.2, 15 s, 7,449 samples, worker 98% busy):
 - emitted code 53.8% (SH4 ~47.5, ARM ~6.2)
 - AicaUpdate inclusive 18.6% (ARM mainloop inclusive 10.6)

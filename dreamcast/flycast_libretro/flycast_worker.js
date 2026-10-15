@@ -3136,6 +3136,13 @@
         break;
       }
 
+      case 'divinline': {   // rec_wasm.cpp flycast_set_divinline (1 = div32 inline; default 0 = the C fallback)
+        try {
+          if (Module._flycast_set_divinline) Module._flycast_set_divinline(data.on | 0);
+          postMessage({ cmd: 'print', txt: '[divinline] ' + ((data.on | 0) ? 'ON (div32 inline)' : 'OFF (div32 calls the C fallback, the default)') });
+        } catch (err) { postMessage({ cmd: 'print', txt: '[divinline] threw: ' + err }); }
+        break;
+      }
       case 'armmemfp': {   // arm7_rec_wasm.cpp flycast_set_armmemfp (0 = control: every ARM load/store calls DoMemOp)
         try {
           if (Module._flycast_set_armmemfp) Module._flycast_set_armmemfp(data.on | 0);
