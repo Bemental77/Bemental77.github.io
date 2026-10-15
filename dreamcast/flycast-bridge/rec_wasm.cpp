@@ -3917,6 +3917,21 @@ public:
 		Sh4Context* ctx = sh4ctx;
 		Sh4Interpreter::Instance = Sh4Recompiler::Instance;
 		ctx->restoreHostRoundingMode();
+		// TRIPWIRE (2026-10-15): the executor's cached context must still be
+		// the live Sh4RCB's. It was not when initMappings() re-allocated the
+		// RCB under a cached pointer (addrspace.cpp termMappings) — boot then
+		// ran a zeroed context from pc=0, which reads as a REIOS reboot loop
+		// and appeared or vanished with unrelated layout changes. Say so.
+		if (ctx != &Sh4cntx) {
+			static bool s_said = false;
+			if (!s_said) {
+				s_said = true;
+				MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt:'[ctx-tripwire] FATAL: the SH4 executor caches context 0x' +
+					($0>>>0).toString(16) + ' but p_sh4rcb->cntx is 0x' + ($1>>>0).toString(16) +
+					' — a stale Sh4RCB pointer (see addrspace.cpp termMappings). Guest state is garbage.'}); },
+					(int)(uintptr_t)ctx, (int)(uintptr_t)&Sh4cntx);
+			}
+		}
 
 		// Lever-5 attribution (strip after verdict): accumulate this
 		// invocation's wall into the SH4 bucket on ANY exit path.

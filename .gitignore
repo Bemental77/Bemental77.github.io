@@ -100,6 +100,7 @@ dreamcast/flycast-src/core/deps/DreamPicoPort-API/ext/
 !dreamcast/flycast-src/core/hw/maple/maple_cfg.cpp
 !dreamcast/flycast-src/core/hw/maple/maple_devs.cpp
 !dreamcast/flycast-src/core/hw/maple/maple_if.cpp
+!dreamcast/flycast-src/core/hw/mem/addrspace.cpp
 !dreamcast/flycast-src/core/hw/pvr/Renderer_if.cpp
 !dreamcast/flycast-src/core/hw/pvr/spg.cpp
 !dreamcast/flycast-src/core/hw/sh4/dyna/blockmanager.cpp
