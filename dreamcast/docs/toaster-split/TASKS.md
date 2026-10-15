@@ -669,6 +669,24 @@ PSO soak (hermetic snapshot, owd 20+10, `dcstepfake=200,1,300` on both):
 - The same room with the joiner on `dcrbbroken=1` **DESYNCs** (first RAM mismatch at f1380),
   so the detectors work across the switch.
 
+### Lockstep coupling on the two-device toaster: not measurable
+
+Three interleaved room/solo pairs, `toaster_room2.mjs`, rate 6.2, 40 s, load 2-5. Every
+proof passed.
+
+| pair | room host / joiner, window | solo, window (bench) | room steady | solo steady |
+|---|---|---|---|---|
+| 1 | 0.829 / 0.827 | 0.799 (0.815) | 0.891 / 0.883 | 0.823 |
+| 2 | 0.710 / 0.709 | 0.818 (0.874) | 0.833 / 0.827 | 0.916 |
+| 3 | 0.782 / 0.779 | 0.814 (0.821) | 0.815 / 0.815 | 0.818 |
+
+Means: window room 0.773 vs solo 0.810 (-5%); steady room 0.844 vs solo 0.852 (-1%). The run
+to run spread of each arm is 0.71-0.83 and 0.82-0.92. Gate wait in the room is 1-49 ms/s.
+The -15 to -25% "coupling" measured on one shared box was the two consoles competing for one
+duty-cycled CPU, not the lockstep. There is no coupling lever to take: on two devices a
+toaster room runs at solo speed. What keeps both short of 1.000x is the solo work itself
+(~2.2x over budget at 6.2, the levers above).
+
 ## Status
 
 - [x] Split measured: solo at 1 and 6.2, room at 6.2 for 60 s, and a worker
