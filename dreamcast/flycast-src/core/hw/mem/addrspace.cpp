@@ -387,30 +387,37 @@ bool reserve()
 	return true;
 }
 
-static void termMappings(bool keepRcb = false)
+// Sizes of the fallback buffers as last allocated (0 = not allocated).
+static size_t s_ramSz, s_vramSz, s_aramSz, s_eramSz;
+
+static void termMappings(bool keep = false)
 {
 	if (ram_base == nullptr)
 	{
-		// WASM port (2026-10-15): the Sh4RCB is NOT reallocated between
-		// setPlatform() calls. Emulator::init() runs setPlatform -> initMappings
-		// and THEN the SH4 executor's Init(), which caches &p_sh4rcb->cntx
-		// (Sh4Interpreter::ctx, its cycle/cache models, the dynarec's sh4ctx).
-		// loadGame() then runs setPlatform again; freeing and re-allocating the
-		// RCB here left every one of those pointers dangling unless the
-		// allocator happened to hand back the same block. Whether it did
-		// depended on the heap layout, so a 12 KB shift in static data made
-		// every boot reset a freed context and run the live one from pc=0 (the
-		// REIOS reboot loop). The RCB's size does not depend on the platform,
-		// so keep it; release() still frees it.
-		if (!keepRcb) {
-			free_pages(p_sh4rcb);
-			p_sh4rcb = nullptr;
-		}
+		// WASM port (2026-10-15): the fallback buffers are NOT reallocated
+		// between setPlatform() calls. Emulator::init() runs setPlatform ->
+		// initMappings and THEN the SH4 executor's Init(), which caches
+		// &p_sh4rcb->cntx (Sh4Interpreter::ctx, its cycle/cache models, the
+		// dynarec's sh4ctx). loadGame() then runs setPlatform again; freeing and
+		// re-allocating here left every cached pointer dangling unless the
+		// allocator handed back the same block. Whether it did depended on the
+		// heap layout: a 12 KB shift in static data made every boot reset a freed
+		// context and run the live one from pc=0 (the REIOS reboot loop). The RCB
+		// never changes size, so it is always kept. mem_b / vram / aica_ram /
+		// Elan RAM are the same class of pointer (the bridge and the JIT cache
+		// their bases), so they are kept too while their size is unchanged and
+		// are only reallocated when a platform switch changes it. release()
+		// still frees everything.
+		if (keep)
+			return;
+		free_pages(p_sh4rcb);
+		p_sh4rcb = nullptr;
 		mem_b.free();
 		vram.free();
 		aica::aica_ram.free();
 		free_pages(elan::RAM);
 		elan::RAM = nullptr;
+		s_ramSz = s_vramSz = s_aramSz = s_eramSz = 0;
 	}
 }
 
@@ -422,7 +429,8 @@ void initMappings()
 	{
 		WARN_LOG(VMEM, "Warning! nvmem is DISABLED (due to failure or not being built-in");
 
-		// Allocate it all and initialize it. (The RCB is kept across calls; see termMappings.)
+		// Allocate it all and initialize it. (Kept across calls while the size
+		// is unchanged; see termMappings.)
 		if (p_sh4rcb == nullptr)
 			p_sh4rcb = (Sh4RCB*)malloc_pages(sizeof(Sh4RCB));
 #if FEAT_SHREC != DYNAREC_NONE
@@ -430,10 +438,14 @@ void initMappings()
 #endif
 		memset(&p_sh4rcb->cntx, 0, sizeof(p_sh4rcb->cntx));
 
-		mem_b.alloc(RAM_SIZE);
-		vram.alloc(VRAM_SIZE);
-		aica::aica_ram.alloc(ARAM_SIZE);
-		elan::RAM = (u8*)malloc_pages(elan::ERAM_SIZE);
+		if (s_ramSz != RAM_SIZE) { if (s_ramSz) mem_b.free(); mem_b.alloc(RAM_SIZE); s_ramSz = RAM_SIZE; }
+		if (s_vramSz != VRAM_SIZE) { if (s_vramSz) vram.free(); vram.alloc(VRAM_SIZE); s_vramSz = VRAM_SIZE; }
+		if (s_aramSz != ARAM_SIZE) { if (s_aramSz) aica::aica_ram.free(); aica::aica_ram.alloc(ARAM_SIZE); s_aramSz = ARAM_SIZE; }
+		if (s_eramSz != (size_t)elan::ERAM_SIZE) {
+			if (s_eramSz) free_pages(elan::RAM);
+			elan::RAM = (u8*)malloc_pages(elan::ERAM_SIZE);
+			s_eramSz = elan::ERAM_SIZE;
+		}
 	}
 	else {
 		NOTICE_LOG(VMEM, "Info: nvmem is enabled");

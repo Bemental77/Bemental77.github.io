@@ -1979,6 +1979,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_gwff(int on) {
     bemental_sh4_set_nolink_pc(on ? 0x8c032e5au : 0u);
 }
 
+static uintptr_t g_tw_ram_base = 0;   // what the trampoline baked as the RAM base (tripwire)
 static void wasm_block_trampoline()
 {
 #ifdef DEBUG_DISPATCH
@@ -2081,6 +2082,7 @@ static void wasm_block_trampoline()
     static uintptr_t s_ram_base = 0;
     if (!s_ram_base) {
         s_ram_base = (uintptr_t)GetMemPtr(0x0c000000, 1);
+        g_tw_ram_base = s_ram_base;   // the mainloop tripwire checks it against the live mem_b
         // GetMemPtr only resolves area-3 (sh4_mem.cpp:277-291). The build
         // path is `ram_base == nullptr` (nvmem disabled per the [flycast.log]
         // line), so addrspace::getAddress returns all nulls. Read the
@@ -3994,6 +3996,20 @@ public:
 		// RCB under a cached pointer (addrspace.cpp termMappings) — boot then
 		// ran a zeroed context from pc=0, which reads as a REIOS reboot loop
 		// and appeared or vanished with unrelated layout changes. Say so.
+		// Same for the buffer bases baked into the dispatcher and into every
+		// compiled block (area-3 fast path, VRAM store fast path): they are
+		// captured once and must stay the live mem_b / vram.
+		if ((g_tw_ram_base && g_tw_ram_base != (uintptr_t)&mem_b[0]) ||
+		    (bemental::sh4::g_vram_lin_base && bemental::sh4::g_vram_lin_base != (u32)(uintptr_t)&vram[0])) {
+			static bool s_said_buf = false;
+			if (!s_said_buf) {
+				s_said_buf = true;
+				MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt:'[ctx-tripwire] FATAL: a cached guest-memory base is stale: RAM baked 0x' +
+					($0>>>0).toString(16) + ' live 0x' + ($1>>>0).toString(16) + ', VRAM baked 0x' + ($2>>>0).toString(16) +
+					' live 0x' + ($3>>>0).toString(16) + ' (see addrspace.cpp termMappings).'}); },
+					(int)g_tw_ram_base, (int)(uintptr_t)&mem_b[0], (int)bemental::sh4::g_vram_lin_base, (int)(uintptr_t)&vram[0]);
+			}
+		}
 		if (ctx != &Sh4cntx) {
 			static bool s_said = false;
 			if (!s_said) {
