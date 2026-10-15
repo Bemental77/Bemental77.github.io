@@ -49,7 +49,9 @@ enum WasmImportFunc : u32 {
     WIMPORT_SHIL_FB = 7,    // (block_vaddr, op_idx) -> void
     WIMPORT_LOOKUP_IDX = 8, // (vaddr) -> i32 wasmTable index, -1 = miss/stale
                             // (ORDER 21b Lever 1/2 global tail-link resolver)
-    WIMPORT_COUNT   = 9
+    WIMPORT_SLICE_END = 9,  // (vaddr) -> i32: credit a spent timeslice in place;
+                            // 0 = run on, 1 = return PC (rec_wasm.cpp sh4_slice_end)
+    WIMPORT_COUNT   = 10
 };
 
 // ---------------------------------------------------------------------------

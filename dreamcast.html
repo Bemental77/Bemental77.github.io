@@ -2672,6 +2672,7 @@
           // is the escape hatch (?shard=1 kept as an explicit-on for older
           // builds). Sent before any compiles either way.
           const qs = new URLSearchParams(location.search);
+          if (qs.get('sliceinwasm') === '0') worker.postMessage({ cmd: 'sliceinwasm', on: 0 });   // control: spent slices return to the dispatcher
           if (qs.has('noshard'))    worker.postMessage({ cmd: 'shard', on: 0 });
           else if (qs.has('shard')) worker.postMessage({ cmd: 'shard', on: 1 });
           // Lever-7: ARM7 wasm rec is default ON; ?noarm7jit=1 pins the v0
@@ -5539,6 +5540,7 @@
     recoverchain:'guest-crash rewind keeps chaining ON',
     rteintc:     'legacy per-block RTE UpdateINTC',
     noshard:     'shard dispatch OFF',
+    sliceinwasm: 'timeslice credit changed (?sliceinwasm=0: every spent slice returns to the C dispatcher)',
     glsplit:     'GL stream offload changed (?glsplit=0: the core draws on its emulation thread)',
     shard:       'shard dispatch forced ON',
     noarm7jit:   'ARM7 JIT OFF',

@@ -2919,6 +2919,13 @@
         break;
       }
 
+      case 'sliceinwasm': {
+        try {
+          if (Module._flycast_set_slice_inwasm) Module._flycast_set_slice_inwasm(data.on | 0);
+          postMessage({ cmd: 'print', txt: '[sliceinwasm] ' + ((data.on | 0) ? 'ON' : 'OFF (control: every spent slice returns to the dispatcher)') });
+        } catch (err) { postMessage({ cmd: 'print', txt: '[sliceinwasm] threw: ' + err }); }
+        break;
+      }
       case 'shard': {
         try {
           if (Module._flycast_set_shard) Module._flycast_set_shard(data.on | 0);

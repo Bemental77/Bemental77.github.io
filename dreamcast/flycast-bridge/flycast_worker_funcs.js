@@ -77,19 +77,20 @@ function flycast_build_imports() {
   var viaTable = null;
   try {
     if (Module._sh4_import_fnptrs && typeof wasmTable !== 'undefined' && wasmTable) {
-      var buf = Module._malloc(36);
+      var NIMP = 10;   // == WIMPORT_COUNT (bementalJIT/guests/sh4/wasm_emit.h)
+      var buf = Module._malloc(4 * NIMP);
       Module._sh4_import_fnptrs(buf);
       var idx = [];
-      for (var i = 0; i < 9; i++) idx.push(Module.HEAPU32[(buf >> 2) + i]);
+      for (var i = 0; i < NIMP; i++) idx.push(Module.HEAPU32[(buf >> 2) + i]);
       Module._free(buf);
       var fns = [];
-      for (var j = 0; j < 9; j++) fns.push(wasmTable.get(idx[j]));
+      for (var j = 0; j < NIMP; j++) fns.push(wasmTable.get(idx[j]));
       var allFns = true;
-      for (var k = 0; k < 9; k++) if (typeof fns[k] !== 'function') { allFns = false; break; }
+      for (var k = 0; k < NIMP; k++) if (typeof fns[k] !== 'function') { allFns = false; break; }
       if (allFns) {
         viaTable = { r8: fns[0], r16: fns[1], r32: fns[2],
                      w8: fns[3], w16: fns[4], w32: fns[5],
-                     ifb: fns[6], shil: fns[7], lk: fns[8] };
+                     ifb: fns[6], shil: fns[7], lk: fns[8], se: fns[9] };
       }
     }
   } catch (e) { viaTable = null; }
@@ -124,6 +125,7 @@ function flycast_build_imports() {
       // flycast_install_block grows/populates, so an emitted block's
       // return_call_indirect targets sibling blocks' slots directly.
       sh4_lookup_idx: (viaTable && viaTable.lk) || pick('sh4_jit_lookup_idx'),
+      sh4_slice_end:  (viaTable && viaTable.se) || pick('sh4_slice_end'),
       __indirect_function_table: wasmTable,
     },
   };

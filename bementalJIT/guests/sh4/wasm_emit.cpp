@@ -241,6 +241,18 @@ bool g_emit_hop_guard = []{
     const char* e = std::getenv("FLYCAST_HOP_GUARD");
     return !(e && e[0] == '0');
 }();
+// SLICE END IN WASM (2026-10-14; rec_wasm.cpp sh4_slice_end). A block entered
+// on a spent timeslice credits it through the WIMPORT_SLICE_END import and runs
+// on instead of returning to the dispatcher (~446K returns a guest second at
+// SH4_TIMESLICE 448). Needs the callee-side precheck (prologue trim) and makes
+// the caller-side hop guard pointless (it would return to C first), so the
+// guard is dropped while this is on. DEFAULT ON; flycast_set_slice_inwasm(0)
+// (page ?sliceinwasm=0) is the control. Compile-time: set before blocks build.
+bool g_emit_slice_inwasm = []{
+    const char* e = std::getenv("FLYCAST_SLICE_INWASM");
+    return !(e && e[0] == '0');
+}();
+static inline bool hopGuard() { return g_emit_hop_guard && !(g_emit_slice_inwasm && g_emit_prologue_trim); }
 
 // ---------------------------------------------------------------------------
 // Env-var gates (module-scope, read once at first emit). Both default OFF —
@@ -2788,7 +2800,7 @@ static s32 sibling_func_idx(u32 target_vaddr, u32 self_vaddr,
 // fixture-level diff over the offline emitter dump).
 // ---------------------------------------------------------------------------
 static void emitTailTo(WasmModuleBuilder& b, u32 func_idx) {
-        if (!g_emit_hop_guard) {
+        if (!hopGuard()) {
             // Guard elided: the callee's OWN slice-yield precheck is now the
             // first instruction of its body (prologue-trim hoist) and stores
             // exactly the PC this arm already wrote, so the observable result
@@ -2838,7 +2850,7 @@ static void emitConstTargetProbe(WasmModuleBuilder& b, u32 target) {
             g_ic[6*site+2] = 0xFFFFFFFFu;
         }
 
-        if (g_emit_hop_guard) {
+        if (hopGuard()) {
         b.op_local_get(LOCAL_CTX);
         b.op_i32_load(ctx_off::CYCLE_COUNTER);
         b.op_i32_const(0);
@@ -2874,7 +2886,7 @@ static void emitConstTargetProbe(WasmModuleBuilder& b, u32 target) {
             b.op_local_get(LOCAL_TMP2);
             b.op_return_call_indirect(0, 0);
           b.op_end();
-        if (g_emit_hop_guard) b.op_end();        // close the vector-guard if
+        if (hopGuard()) b.op_end();        // close the vector-guard if
         (void)icpc;
 }
 
@@ -2943,7 +2955,7 @@ void emitBlockExit(WasmModuleBuilder& b, RuntimeBlockInfo* block,
         uint32_t* icsl1 = &g_ic[6*site+4];
         uint32_t* icgn1 = &g_ic[6*site+5];
 
-        if (g_emit_hop_guard) {
+        if (hopGuard()) {
         b.op_local_get(LOCAL_CTX);
         b.op_i32_load(ctx_off::CYCLE_COUNTER);
         b.op_i32_const(0);
@@ -3005,7 +3017,7 @@ void emitBlockExit(WasmModuleBuilder& b, RuntimeBlockInfo* block,
             b.op_local_get(LOCAL_TMP2);         // wasmTable index
             b.op_return_call_indirect(0, 0);    // type 0 (i32,i32)->i32, table 0
           b.op_end();
-        if (g_emit_hop_guard) b.op_end();        // close the vector-guard if
+        if (hopGuard()) b.op_end();        // close the vector-guard if
     };
 
     // Whether emitBlockExit's caller still needs to push the PC for the
@@ -3093,7 +3105,7 @@ void emitBlockExit(WasmModuleBuilder& b, RuntimeBlockInfo* block,
         // Lever-5E3 check: on a RETURN, if the resolved pc matches the
         // prediction and its fill is current-generation, chain directly.
         if (block != nullptr && block->BlockType == BET_DynamicRet) {
-            if (g_emit_hop_guard) {
+            if (hopGuard()) {
             b.op_local_get(LOCAL_CTX);
             b.op_i32_load(ctx_off::CYCLE_COUNTER);
             b.op_i32_const(0);
@@ -3118,7 +3130,7 @@ void emitBlockExit(WasmModuleBuilder& b, RuntimeBlockInfo* block,
                     b.op_i32_load(0);
                     b.op_return_call_indirect(0, 0);
                 b.op_end();
-            if (g_emit_hop_guard) b.op_end();   // close the vector-guard if
+            if (hopGuard()) b.op_end();   // close the vector-guard if
         }
         if (block != nullptr && block->BlockType != BET_DynamicIntr)
             emit_global_probe(true);        // chain jmp/jsr @Rn, rts; skip RTE — IC on the DYNAMIC class
@@ -4113,9 +4125,23 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
               b.op_local_get(LOCAL_CTX);
               b.op_i32_const((s32)block->vaddr);
               b.op_i32_store(ctx_off::PC);
-              b.op_local_get(LOCAL_CTX);
-              b.op_i32_load(ctx_off::PC);
-              b.op_return();
+              if (g_emit_slice_inwasm) {
+                // credit the slice here; run on unless the dispatcher must look
+                b.op_i32_const((s32)block->vaddr);
+                b.op_call(WIMPORT_SLICE_END);
+                b.op_if(0x40);
+                  b.op_local_get(LOCAL_CTX);
+                  b.op_i32_load(ctx_off::PC);
+                  b.op_return();
+                b.op_end();
+                b.op_local_get(LOCAL_CTX);           // the refilled counter, for the drain below
+                b.op_i32_load(ctx_off::CYCLE_COUNTER);
+                b.op_local_set(LOCAL_CC);
+              } else {
+                b.op_local_get(LOCAL_CTX);
+                b.op_i32_load(ctx_off::PC);
+                b.op_return();
+              }
             b.op_end();
         }
 
@@ -4535,6 +4561,7 @@ static void emitTypeImportSection(WasmModuleBuilder& b)
     b.emitImportFunc("env", "sh4_ifb",     2);
     b.emitImportFunc("env", "sh4_shil_fb", 2);
     b.emitImportFunc("env", "sh4_lookup_idx", 1);   // WIMPORT_LOOKUP_IDX, (i32)->i32
+    b.emitImportFunc("env", "sh4_slice_end", 1);    // WIMPORT_SLICE_END, (i32)->i32
     // Import Emscripten's shared __indirect_function_table as this module's
     // table 0 so emit_global_probe's return_call_indirect can target sibling
     // blocks' wasmTable slots. initialSize 0 / no-max is a permissive lower
@@ -4675,6 +4702,9 @@ extern "C" void bemental_sh4_set_prologue_trim(int on) {
 }
 extern "C" void bemental_sh4_set_hop_guard(int on) {
     bemental::sh4::g_emit_hop_guard = !!on;
+}
+extern "C" void bemental_sh4_set_slice_inwasm(int on) {
+    bemental::sh4::g_emit_slice_inwasm = !!on;
 }
 // Single-predicate BET_CLS_COND exit (2026-08-29). DEFAULT ON; bisect switch.
 extern "C" void bemental_sh4_set_cond_merge(int on) {

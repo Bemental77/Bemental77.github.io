@@ -493,6 +493,13 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_ic(int on) {
         memset((void*)g_code_map, 0, sizeof(g_code_map));
     }
 }
+extern "C" void bemental_sh4_set_slice_inwasm(int on);
+void bm_ResetCache();
+// Slice end inside emitted code (sh4_slice_end). COMPILE-time: set before blocks build.
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_slice_inwasm(int on) {
+    bemental_sh4_set_slice_inwasm(on);
+    bm_ResetCache();   // blocks compiled under the other setting must not survive the switch
+}
 extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_chain(int on) {
     g_chain_enabled = !!on;
 }
@@ -2328,6 +2335,140 @@ isk_no_skip:
 // ---------------------------------------------------------------------------
 // Sh4Dynarec subclass.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// THE SLICE CREDIT, ONE COPY (2026-10-14). The dispatcher used to inline this
+// loop; it is now also run from INSIDE emitted code (sh4_slice_end below), so
+// both callers share this function and cannot drift. Returns nonzero if any
+// pass vectored an interrupt.
+// ---------------------------------------------------------------------------
+volatile uint32_t g_slice_credited = 0;   // sh4_slice_end credited since the dispatcher last looked
+static inline int credit_slices(Sh4Context* ctx) {
+	int any = 0;
+	do {
+			ctx->cycle_counter += SH4_TIMESLICE;
+			// DIAGNOSTIC (boot-title-wedge, strip after verdict):
+			// suppress interrupt VECTORING while pc is inside the
+			// DP decrypt routine (0x8c004100-0x8c00425f). The
+			// scheduler still ticks and pend stays latched —
+			// delivery resumes on the first drain outside the
+			// range. The JIT arm's XOR keystream corrupts
+			// nondeterministically, interrupt-correlated; if this
+			// window makes the decrypt output correct and
+			// deterministic, vector-time state preservation under
+			// the JIT is convicted.
+			int vectored;
+			{
+				const u32 dpc = ctx->pc;
+				const bool in_decrypt =
+					dpc >= 0x8c004100u && dpc < 0x8c004260u;
+				Sh4cntx.sh4_sched_next -= SH4_TIMESLICE;
+				if (Sh4cntx.sh4_sched_next < 0) {
+					// Lever-12 bucket [1]: ALL sh4_sched device
+					// callbacks. See the g_attr_sched_ms block near
+					// the top of this file for what this covers and
+					// what it deliberately does not (the renderer is
+					// NOT here -- it is on the guest store path).
+					// [2026-08-29] LEVER13_SCHED_TIMER: this pair fired
+					// 21,378 times/s and was 3.91% of ALL worker self
+					// time in the CDP profile. Default 0 keeps the
+					// COUNT (which is load-robust and is what the
+					// scene-identity controls are read from) and
+					// drops only the clock reads. See the
+					// LEVER13_SCHED_TIMER block by g_attr_sched_ms.
+#if LEVER13_SCHED_TIMER
+					const double t_sched = emscripten_get_now();
+					sh4_sched_tick(SH4_TIMESLICE);
+					const double d_sched = emscripten_get_now() - t_sched;
+					g_attr_sched_ms += d_sched;
+					if (d_sched >= SCHED_FAT_MS) {
+						g_attr_schedfat_ms += d_sched;
+						++g_attr_schedfat_n;
+					}
+#else
+					sh4_sched_tick(SH4_TIMESLICE);
+#endif
+					++g_attr_sched_n;
+					++g_dbg_sched_ticks;
+				}
+				// ORDER 21b — recompute the SR interrupt gate against LIVE
+				// sr before this deferred (slice-boundary) delivery. Native
+				// emits UpdateSR (-> SRdecode) THEN UpdateINTC at each block
+				// end (rec_x64.cpp:296,530); our crediting-loop delivery read a
+				// STALE Sh4cntx.interrupt_pend and so delivered a level-4 Maple
+				// IRQ while the guest ran at SR.IMASK=15 (ssr=0x400000f0, a
+				// masked bootstrap critical section), vectoring to the still-
+				// unfilled reios vector vbr+0x600=0x8c000600 (all 0xFF) and
+				// livelocking (Do_Interrupt sets BL=1, no valid RTE; veccnt
+				// frozen at 40878, pc pinned). SRdecode() recomputes
+				// decoded_srimask = ~InterruptLevelBit[sr.IMASK] (0 when sr.BL)
+				// + recalc_pending_itrs (sh4_interrupts.cpp:142-151): at
+				// IMASK=15 interrupt_pend -> 0 (held PENDING, not delivered);
+				// at IMASK=0 it stays permissive, so no regression.
+				SRdecode();
+				vectored = (Sh4cntx.interrupt_pend && !in_decrypt)
+					? UpdateINTC() : 0;
+				if (vectored) ++g_dbg_vec_count;
+				// DIAG: reliable committed snapshot at the delivery gate.
+				++g_dbg_credit_runs;
+				// Lever-4 task 6: parity-gate rolling state hash.
+				if (g_parity_hashing) {
+					u32 h = g_parity_hash;
+					#define PMIX(v) do { h ^= (u32)(v); h *= 16777619u; } while (0)
+					PMIX(ctx->pc); PMIX(ctx->sr.getFull()); PMIX(ctx->pr);
+					PMIX(ctx->gbr); PMIX(ctx->vbr); PMIX(ctx->ssr); PMIX(ctx->spc);
+					PMIX(ctx->mac.l); PMIX(ctx->mac.h);
+					for (int i = 0; i < 16; i++) PMIX(ctx->r[i]);
+					#undef PMIX
+					g_parity_hash = h;
+					++g_parity_passes;
+				}
+				g_dbg_sr_credit       = ctx->sr.getFull();
+				g_dbg_pend_credit     = ctx->interrupt_pend;
+				g_dbg_istnrm_credit   = SB_ISTNRM;
+				g_dbg_pc_credit       = ctx->pc;
+				g_dbg_schednext_credit = Sh4cntx.sh4_sched_next;
+			}
+			// Escape forensics v2: record every vector event —
+			// spc + interrupt status/mask registers + trajectory
+			// ring position. The fatal interrupt's bits diff
+			// against the healthy first vector's.
+			if (vectored) {
+				VecEv& v = g_vec_ring[g_vec_ring_idx++ & 7];
+				v.spc = ctx->spc;
+				v.istnrm = SB_ISTNRM; v.istext = SB_ISTEXT;
+				v.iml2 = SB_IML2NRM; v.iml4 = SB_IML4NRM;
+				v.iml6 = SB_IML6NRM;
+				v.ring_pos = g_pc_ring_idx;
+			}
+		any |= vectored;
+	} while (ctx->cycle_counter <= 0);
+	return any;
+}
+
+// SLICE END WITHOUT LEAVING WASM (2026-10-14). A block whose entry finds the
+// timeslice spent (cycle_counter <= 0) used to store its PC and return to the
+// C dispatcher, which credited the slice and then looked the SAME block up
+// again: ~446K times a guest second at SH4_TIMESLICE 448 — dispatch_slice +
+// jit_lookup + the trampoline were ~10% of the worker. With
+// g_emit_slice_inwasm the block calls this instead and, unless something
+// happened that the dispatcher must see, simply runs on.
+// Returns 0 = credited, keep running this block; 1 = return PC to the dispatcher.
+// The guest sees exactly what the dispatcher path produces: the same credit
+// at the same guest point (the block's entry, PC already stored), and the
+// dispatcher takes over whenever (a) the frame is over (CpuRunning false: the
+// C loop owns the deterministic stop, so this does not credit at all), (b) an
+// interrupt vectored (PC moved), or (c) the IC generation moved (a sched
+// event wrote code: the dispatcher's verified lookup must run).
+extern "C" EMSCRIPTEN_KEEPALIVE int sh4_slice_end(uint32_t vaddr) {
+	Sh4Context* ctx = &Sh4cntx;
+	if (!ctx->CpuRunning) return 1;
+	const uint32_t gen0 = g_ic_generation;
+	const int vec = credit_slices(ctx);
+	g_slice_credited = 1;
+	if (vec || !ctx->CpuRunning || g_ic_generation != gen0 || ctx->pc != vaddr) return 1;
+	return 0;
+}
+
 class WasmDynarec : public Sh4Dynarec
 {
 public:
@@ -3406,6 +3547,7 @@ public:
 				// (rec_x64.cpp:148-149) and fixes the over/under-drain
 				// the flat 32-cycle subtract introduced. The drain check
 				// + INTC pump below still drives the scheduler.
+				if (g_slice_credited) { g_slice_credited = 0; det_credited = true; }   // sh4_slice_end credited inside emitted code
 				if (ctx->cycle_counter <= 0) {
 					// ORDER 2026-08-19a §3 — honest cycle crediting (the
 					// general fix). Tail-linked block chains drain
@@ -3419,103 +3561,7 @@ public:
 					// on: at the measured ~240 credited timeslices/sec that
 					// was ~9 wall-seconds PER FIRE, hundreds of fires per
 					// load — effectively never. Credit every burned slice.
-					do {
-						ctx->cycle_counter += SH4_TIMESLICE;
-						// DIAGNOSTIC (boot-title-wedge, strip after verdict):
-						// suppress interrupt VECTORING while pc is inside the
-						// DP decrypt routine (0x8c004100-0x8c00425f). The
-						// scheduler still ticks and pend stays latched —
-						// delivery resumes on the first drain outside the
-						// range. The JIT arm's XOR keystream corrupts
-						// nondeterministically, interrupt-correlated; if this
-						// window makes the decrypt output correct and
-						// deterministic, vector-time state preservation under
-						// the JIT is convicted.
-						int vectored;
-						{
-							const u32 dpc = ctx->pc;
-							const bool in_decrypt =
-								dpc >= 0x8c004100u && dpc < 0x8c004260u;
-							Sh4cntx.sh4_sched_next -= SH4_TIMESLICE;
-							if (Sh4cntx.sh4_sched_next < 0) {
-								// Lever-12 bucket [1]: ALL sh4_sched device
-								// callbacks. See the g_attr_sched_ms block near
-								// the top of this file for what this covers and
-								// what it deliberately does not (the renderer is
-								// NOT here -- it is on the guest store path).
-								// [2026-08-29] LEVER13_SCHED_TIMER: this pair fired
-								// 21,378 times/s and was 3.91% of ALL worker self
-								// time in the CDP profile. Default 0 keeps the
-								// COUNT (which is load-robust and is what the
-								// scene-identity controls are read from) and
-								// drops only the clock reads. See the
-								// LEVER13_SCHED_TIMER block by g_attr_sched_ms.
-#if LEVER13_SCHED_TIMER
-								const double t_sched = emscripten_get_now();
-								sh4_sched_tick(SH4_TIMESLICE);
-								const double d_sched = emscripten_get_now() - t_sched;
-								g_attr_sched_ms += d_sched;
-								if (d_sched >= SCHED_FAT_MS) {
-									g_attr_schedfat_ms += d_sched;
-									++g_attr_schedfat_n;
-								}
-#else
-								sh4_sched_tick(SH4_TIMESLICE);
-#endif
-								++g_attr_sched_n;
-								++g_dbg_sched_ticks;
-							}
-							// ORDER 21b — recompute the SR interrupt gate against LIVE
-							// sr before this deferred (slice-boundary) delivery. Native
-							// emits UpdateSR (-> SRdecode) THEN UpdateINTC at each block
-							// end (rec_x64.cpp:296,530); our crediting-loop delivery read a
-							// STALE Sh4cntx.interrupt_pend and so delivered a level-4 Maple
-							// IRQ while the guest ran at SR.IMASK=15 (ssr=0x400000f0, a
-							// masked bootstrap critical section), vectoring to the still-
-							// unfilled reios vector vbr+0x600=0x8c000600 (all 0xFF) and
-							// livelocking (Do_Interrupt sets BL=1, no valid RTE; veccnt
-							// frozen at 40878, pc pinned). SRdecode() recomputes
-							// decoded_srimask = ~InterruptLevelBit[sr.IMASK] (0 when sr.BL)
-							// + recalc_pending_itrs (sh4_interrupts.cpp:142-151): at
-							// IMASK=15 interrupt_pend -> 0 (held PENDING, not delivered);
-							// at IMASK=0 it stays permissive, so no regression.
-							SRdecode();
-							vectored = (Sh4cntx.interrupt_pend && !in_decrypt)
-								? UpdateINTC() : 0;
-							if (vectored) ++g_dbg_vec_count;
-							// DIAG: reliable committed snapshot at the delivery gate.
-							++g_dbg_credit_runs;
-							// Lever-4 task 6: parity-gate rolling state hash.
-							if (g_parity_hashing) {
-								u32 h = g_parity_hash;
-								#define PMIX(v) do { h ^= (u32)(v); h *= 16777619u; } while (0)
-								PMIX(ctx->pc); PMIX(ctx->sr.getFull()); PMIX(ctx->pr);
-								PMIX(ctx->gbr); PMIX(ctx->vbr); PMIX(ctx->ssr); PMIX(ctx->spc);
-								PMIX(ctx->mac.l); PMIX(ctx->mac.h);
-								for (int i = 0; i < 16; i++) PMIX(ctx->r[i]);
-								#undef PMIX
-								g_parity_hash = h;
-								++g_parity_passes;
-							}
-							g_dbg_sr_credit       = ctx->sr.getFull();
-							g_dbg_pend_credit     = ctx->interrupt_pend;
-							g_dbg_istnrm_credit   = SB_ISTNRM;
-							g_dbg_pc_credit       = ctx->pc;
-							g_dbg_schednext_credit = Sh4cntx.sh4_sched_next;
-						}
-						// Escape forensics v2: record every vector event —
-						// spc + interrupt status/mask registers + trajectory
-						// ring position. The fatal interrupt's bits diff
-						// against the healthy first vector's.
-						if (vectored) {
-							VecEv& v = g_vec_ring[g_vec_ring_idx++ & 7];
-							v.spc = ctx->spc;
-							v.istnrm = SB_ISTNRM; v.istext = SB_ISTEXT;
-							v.iml2 = SB_IML2NRM; v.iml4 = SB_IML4NRM;
-							v.iml6 = SB_IML6NRM;
-							v.ring_pos = g_pc_ring_idx;
-						}
-					} while (ctx->cycle_counter <= 0);
+					credit_slices(ctx);
 					// The wall-clock-gated SPG raise that lived here
 					// (May 2026: SCANINT1/SCANINT2/HBLANK/MAPLE_VBOI forced
 					// at wall-60Hz) is REMOVED, not tuned. It mixed wall
