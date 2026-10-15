@@ -500,6 +500,130 @@ run back to back.
 - The off arm ran at higher load, so this is not a clean pair.
 - Solo on is above every earlier band in this file (0.58-0.68x). It is still 0/2 PASS.
 
+## 2026-10-15 — the room cell, split; rollback-mode batch compile; the room starts in delay on a slow box
+
+Rig: `dreamcast/tools/toaster_room_split.mjs <room|pair|solo> <rate> <sec>` (new). Same arm as
+the gate (SwiftShader, 512 MB heap, `tools/toaster_duty.py`). `room` = host + joiner in a new
+window (own renderer, the bench's `--joiner tab` topology); `pair` = two solo pages in two
+windows, the room's topology without the room. Per heartbeat it logs x (aicaX), emu/gate/held,
+the engine's mode; `--thrat H` adds per-thread CPU from /proc over the steady window. PSO seed
+scene, wasm `25c20ad8` for the split, load 5-20 (the cell itself drives it to ~15-20).
+
+### Where the room cell's time goes (rate 6.2)
+
+| | x | emulation worker CPU (ms per wall s) | CPU ms per guest s |
+|---|---|---|---|
+| solo, steady | 0.83-0.85 | 179 | 215 |
+| pair of solos, steady (60-120 s runs) | 0.54-0.67 | 118-132 | 204-219 |
+| room, steady (hb 25-60) | 0.41-0.51 | 98-122 | 212-244 |
+| room, the gate's 20 s window | 0.26-0.39 | | |
+
+- **Re-simulation: 0.** On this box the capacity gate moves every room to delay lockstep
+  (delay 2-3) by frame 15-20, `resims 0` in every room cell.
+- **Two consoles on one box (pair vs solo): -25 to -35%.** The worker gets 118-132 ms of
+  CPU a second instead of 179. Same work per guest second.
+- **Coupling (room vs pair, steady): -15 to -25%.** Work per guest second is the same as
+  solo within the noise (212-244 vs 204-219 ms); the worker gets less CPU (98-122 ms/s),
+  because a console parked on the gate (40-190 ms/s) cannot use its duty-cycle slices later.
+  The room runs at the slower console's pace at each moment.
+- **Start-up (window vs steady): -20 to -30%.** The room armed rollback at frame 0: the
+  per-block rollback-mode refill held the first 8 frames for 9-13 s (`hb1 emu=6920`: one
+  `run_iter` of 7 s), then the gate's switch to delay at frame 15-20 flushed again and the
+  sharded refill (`refill after LEAVE: 30 frames 4.2-5.2 s`) fell inside the window.
+
+⚠ An earlier reading of "+28% CPU per guest second in the room" used per-heartbeat means
+over a window whose heartbeats were not all 1 s; time-weighted (`hbMs`) it is gone.
+
+### Rollback-mode batch compile (rec_wasm.cpp `rbb_compile`, `?rbbatch=N`, 1 = control)
+
+The design in dreamcast/docs/rollback/TASKS.md: a miss in rollback mode compiles its block
+with its static successors (BFS over BranchBlock/NextBlock, up to 32) into ONE module, every
+member registered before the miss's block runs. Bodies are the per-block bodies
+(`build_blocks_unlinked`: no tail-link, no trace), so every edge still goes through the
+verified lookup or the IC. A member with an FPU op is unconfirmed until its first entry
+(`s_block_fcfg`: FPSCR PR/SZ/RM + SR.FD at decode); a mismatch discards it and the miss path
+compiles it from live state, i.e. what per-block install does. Members come only from main
+RAM, even pcs, MMU off, SR.FD clear, never 0x8c0000e0/0xac010000/0xac008300, and after a
+pre-scan that rejects a branch in a delay slot (the decoder throws on it). A member that
+will not register is dropped, never parked.
+
+Measured with the new one-line `[rollback] refill after ARM: 30 frames N ms` (worker), room,
+rate 1, load 3-7, ms for the first 30 frames after the arm:
+
+| cap | runs | compiles / registered |
+|---|---|---|
+| 1 (per-block, control) | 1877, 1909, 2258, 1850 | 2484 / 2484 |
+| 2 | 1439, 1739, 2078 | 1479 / 2824 |
+| 4 | 1669, 1404 | 973 / 3403 |
+| 8 | 1434, 1926 | 672 / 4194 |
+| 32 (shipped) | 1737, 1810 | 402 / 7195 |
+
+About -10 to -20%, inside a wide noise band. A CPU profile of the refill (per-block arm)
+says why it is no more: `new WebAssembly.Module` is 13.8% of it, Instance 2.3%; the rest is
+running the frames, the ring saves (`RamRegion::serialize` 8%) and GL program setup. At rate
+6.2 the arm-to-first-heartbeat stall read 10.2 / 8.9 s batched vs 11.4 / 12.8 s per-block.
+The 2.3x of the old note compared a per-block refill with a sharded one whose compiles are
+DEFERRED (pending blocks span-interpret until a seal), so it was never mostly install cost.
+
+Exact, wasm `aa0fbd55`: rollback rig REF1==REF2 61/61, REF==RB 59/59, 0 full-flush
+fallbacks, 26 rollbacks; 1,101 batches / 20,346 members ahead / 128 FPU-config recompiles /
+0 dropped / 0 rollback-mode parks. `--diag 8 --rbload` (cold vs warm cache): D1==D2==D3.
+
+### The gated pump parks instead of spinning (`?lsspin=1` = control)
+
+`pumpKick(1)` is "now" (`ms > 1` is the timer test), so after its 8 quick re-checks a pump
+parked on the lockstep gate re-posted itself with no delay for as long as the gate held.
+Room at rate 1, delay lockstep: host worker 530 ms of CPU a second with ~250 ms/s in
+`run_iter` and ~300 ms/s on the gate (pair of solos: 190-200). Now it sleeps; the input that
+un-parks it kicks the pump, any kick pre-empts the park, and a 100 ms timer is the backstop.
+A joiner parked 624 ms/s now burns 141 ms/s. At rate 6.2 it moves nothing measurable
+(room steady 0.455/0.464 vs 0.510/0.419 control): the duty cycle already caps the spin.
+
+### A slow console declares a step estimate at Ready; the room starts in delay
+
+The host's gate already starts a room in delay when a console declares an unaffordable
+rollback step at Ready, but a Dreamcast console enters a room on a fresh page and declared
+nothing, so every room started in rollback. dreamcast.html now declares 0.25 x the normalize
+handshake's time (a fixed serialize + unserialize + flush every console does before frame 0:
+74-118 ms on this box at full speed, 332-690 ms at rate 6.2). Measured frames replace it.
+`?dcstepest=0` = the control. A room that starts in delay and is later moved to rollback arms
+its ring at that frame, without entering rollback mode early (`rbArm enter:0`); the core
+switches at the agreed frame as before. (Not reachable on this box: delay frames report no
+step, so the estimate stands and the gate never sees calm.)
+
+Room cell, rate 6.2, interleaved, load 9-18: estimate on **0.494 / 0.339**, control
+**0.357 / 0.299**; first bench result 46-47 s after load vs 52-56 s. `&dcrb=0` (delay only)
+read 0.403 / 0.390 against 0.363 / 0.347 in the same set.
+
+### P1/P2 aliases (found by the Gauntlet soak)
+
+The first Gauntlet forced-rollback soak with batching was a CORE CRASH at frame 42
+(`os_DebugBreak` in `bm_AddBlock` from `compilePC`, pc 0x8c00d828; the per-block control was
+IN SYNC). flycast's jump table is indexed by the physical address, ours by vaddr: a member
+compiled at one view (0xac.. / 0x8c..) and a later miss at the other found the FPCA entry
+claimed. Per-block install never compiles a view the guest did not run. Now a rollback-mode
+miss whose other view holds the entry drops that entry first (`g_rbb_alias_drops`, ctx 157:
+25 in a Gauntlet boot, 0 in the PSO lobby). Reproduced and fixed on
+`rollback_measure.mjs --game gauntlet --warm 2 --rbload` (crashed at 4 s; now runs). That rig's
+REF==RB on a Gauntlet boot diverges at f90-93 with batching ON and with the per-block control
+alike (two control runs: f90, f93) — the known Gauntlet boot non-exactness, not this change.
+
+### Verified, wasm `c0d7fe58` (hash-stable across every run)
+
+- Rollback rig, PSO lobby: REF1==REF2 61/61, REF==RB 59/59, 0 full-flush fallbacks, 0
+  rollback-mode parks, 1,101 batches / 20,346 members / 128 FPU-config recompiles.
+  `--diag 8 --rbload`: D1==D2==D3 (cold vs warm cache byte-identical).
+- Soaks (hermetic snapshot, owd 20+10): PSO lockstep IN SYNC 59 RAM + 59 fingerprints (the
+  room started in delay 3 from the estimate); PSO forced rollback IN SYNC 33; Gauntlet
+  forced rollback IN SYNC 32 (41 rollbacks); mixed PSO rollback room, joiner
+  `rbbatch=1&lsspin=1&dcstepest=0`, IN SYNC 33; the same mixed room on Gauntlet IN SYNC 31.
+- Boot probe 0.999x; `verify_core_tree` PASS.
+
+Toaster gate, `tools/toaster_bench.mjs --pages dreamcast --rate 6.2 --reps 2 --ladder 0`
+(load 4.9 at start, 16-19 during): solo **0.790 / 0.838**, room **0.348 / 0.388** (delay 2,
+in sync). Before (84811cd): solo 0.813 / 0.840, room 0.287 / 0.303; the same bench at 10:30
+today read room 0.277 / 0.223. Still 0/2 PASS.
+
 ## Status
 
 - [x] Split measured: solo at 1 and 6.2, room at 6.2 for 60 s, and a worker

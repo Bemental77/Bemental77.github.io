@@ -2350,6 +2350,7 @@
     (/[?&]glcount=1/.test(location.search) ? '&glcount=1' : '') +   // DIAG: per-call WebGL inventory (worker)
     (/[?&]glsplit=0/.test(location.search) ? '&glsplit=0' : '') +   // control: the core draws on its own thread (flycast_worker.js GLRec)
     (/[?&]jitnames=1/.test(location.search) ? '&jitnames=1' : '') + // DIAG: emitted blocks named by guest PC in CPU profiles
+    ((/[?&]rbbatch=\d+/.exec(location.search) || [''])[0].replace(/^\?/, '&')) +   // rollback-mode compile batch cap (rec_wasm.cpp rbb_compile; 1 = per-block control)
     ((/[?&]jitdump=(all|[0-9a-f]+)/.exec(location.search) || [''])[0].replace(/^\?/, '&'));   // DIAG: dump the module holding that block
   const caps = { heapAlloc: false, lazyDisc: false, probed: false };
   const capsPromise = fetch(WORKER_URL).then((r) => {
@@ -3113,6 +3114,26 @@
         // which lsArmBeforeFreerun() leaves as null and the panel reports as
         // "not confirmed" — never as done.
         LS.normalizeAck = { ok: !!d.ok, error: d.error || null, ms: d.ms == null ? null : (d.ms | 0) };
+        // THE STEP ESTIMATE AT READY (2026-10-15). The host's capacity gate
+        // (lib/netplay.js) STARTS a room in input delay when a console's
+        // declared rollback step `st` is one it cannot afford — but a Dreamcast
+        // console enters a room on a fresh page and had nothing to declare, so
+        // every room started in rollback, and a console too slow for it paid a
+        // rollback-mode recompile of the whole scene, then a second flush and
+        // recompile when the gate moved the room to delay ~15 frames later.
+        // Measured, toaster rate 6.2 (dreamcast/docs/toaster-split/TASKS.md):
+        // ~8-10 s of start-up at 0.01-0.1x, and the room bench 0.35-0.36 vs
+        // 0.39-0.40 when the room starts in delay. The normalize handshake is a
+        // fixed piece of work (serialize + unserialize of the frame-0 state +
+        // a JIT flush) every console does before frame 0, so its time scales
+        // with the device: 74-118 ms on this 4-core box at full speed, 332-690
+        // ms under the rate-6.2 duty cycle. One rollback step here costs ~0.25x
+        // the normalize time (frame + ring save, ~20-25 ms at full speed), which
+        // the gate already judges unaffordable on this box. The estimate is only
+        // what the console declares BEFORE it has run a frame; every rollback
+        // frame's ack replaces it with the measured cost ('lsFrame' st).
+        // ?dcstepest=0 = declare nothing, the control.
+        if (d.ok && d.ms > 0 && LSQ.stepEst) LS.stepEstMs = Math.round(d.ms * DC_STEP_PER_NORMALIZE * 10) / 10;
         pageLog('[lockstep] determinism normalize ' + (d.ok ? 'OK' : 'FAILED') +
                 (d.ms != null ? ' in ' + d.ms + ' ms' : '') + (d.error ? ' — ' + d.error : ''));
         break;
@@ -6179,7 +6200,9 @@
              // setting): this console's worker IGNORES every re-simulation plan,
              // i.e. it keeps the frames it ran on a wrong prediction. A room with
              // one such console must DESYNC; if it does not, the detector is blind.
-             rbBroken: q.get('dcrbbroken') === '1' };
+             rbBroken: q.get('dcrbbroken') === '1',
+             // the rollback-step estimate declared at Ready ('lsNormalize'); ?dcstepest=0 = the control
+             stepEst: q.get('dcstepest') !== '0' };
   })();
   // ROLLBACK IS ON BY DEFAULT ONLY FOR A DISC IT IS PROVEN EXACT ON. The host
   // proposes the room's mode, so the host's disc decides: a rollback room's
@@ -6192,6 +6215,8 @@
   // frame 600 — so a Gauntlet room stays delay lockstep, which is IN SYNC.
   // An explicit ?dcrb=N (N>0) opts any disc in, for testing.
   const RB_PROVEN = new Set(['pso2']);
+  // ms of rollback step per ms of the normalize handshake (see 'lsNormalize')
+  const DC_STEP_PER_NORMALIZE = 0.25;
   // The lockstep options every Dreamcast Session is built with. `game` = the
   // host's disc (a joiner passes nothing: it never picks the room's mode, but
   // it says it CAN run rollback, so a proven host's room is not refused it).
@@ -6531,6 +6556,15 @@
       // The old rig's port-1 witness, kept truthful under the new architecture:
       // these are the bytes actually handed to the emulator for that port.
       NET.sentP2 = Array.from(r.image.subarray(64, 76));
+      // A ROOM THAT STARTED IN INPUT DELAY and that the host's gate now moves to
+      // rollback: arm the ring here, without entering rollback mode — the worker
+      // switches its core at this frame (the rb flag travels with it), as every
+      // console does.
+      if (ls.rollback > 0 && !LS.rbArmed) {
+        LS.rbArmed = true;
+        worker.postMessage({ cmd: 'rbArm', w: ls.rollback, enter: 0, broken: LSQ.rbBroken ? 1 : 0, keepMode: new URLSearchParams(location.search).get('dcrbkeepmode') === '1' ? 1 : 0 });
+        pageLog('[rollback] the room moved to ROLLBACK at frame ' + r.frame + ' — ring armed, the core switches at this frame');
+      }
       if (ls.rollback > 0 && LS.rbArmed) {
         // ROLLBACK FRAME: the plan to re-simulate (if a late input changed a
         // frame already run) travels with the frame it precedes, and so do the
@@ -9058,6 +9092,11 @@
         // at frame 0: the disc, the seed state and the card set's fingerprint.
         const tag = roomDiscTag();
         if (NET.declared && NET.declaredTag === tag) return;   // another tick sent this exact tag meanwhile
+        // the step estimate (see 'lsNormalize'): declared only while nothing has been measured
+        if (LS.stepEstMs > 0) {
+          const e = eng || (typeof s._ensureLockstep === 'function' ? s._ensureLockstep() : null);
+          if (e && !(e.selfStepMs > 0)) { e.selfStepMs = LS.stepEstMs; pageLog('[net] declaring an estimated rollback step of ' + LS.stepEstMs + ' ms (0.25 x the normalize time) — the host starts the room in input delay if it cannot afford rollback'); }
+        }
         const again = NET.declared;
         if (s.setReady(true, tag)) {
           NET.declared = true; NET.declaredTag = tag;

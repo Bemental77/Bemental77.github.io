@@ -305,6 +305,27 @@ static uint32_t s_block_vgen[JIT_TABLE_SIZE];
 // units. 0 = per-block install (its own module; no siblings).
 static uint32_t s_block_unit[JIT_TABLE_SIZE];
 static uint32_t s_cur_unit = 0, s_unit_serial = 0;
+// ROLLBACK-MODE BATCH (rbb_compile, 2026-10-15). A batch member that was decoded
+// AHEAD of its first execution, with the FPSCR/SR.FD of the miss that formed the
+// batch, and that holds an FPU op (decode reads FPSCR.PR/SZ/RM, and SR.FD makes
+// the decoder raise FpuDisabled). Per-block install decodes a block at its FIRST
+// entry, with the FPSCR live then. So the member is UNCONFIRMED until its first
+// entry: if the config live then equals the one it was decoded with, the code is
+// what per-block install would have produced and the flag clears; otherwise the
+// slot is discarded and the miss path compiles it from live state — again what
+// per-block install would have done. 0 = confirmed / not a batch member.
+static uint32_t s_block_fcfg[JIT_TABLE_SIZE];
+static constexpr u32 FCFG_FPSCR_MASK = 0x00180003u;   // SZ(20) | PR(19) | RM(1:0)
+static inline u32 fcfg_now() {
+    return 0x80000000u | (Sh4cntx.fpscr.full & FCFG_FPSCR_MASK) | (Sh4cntx.sr.FD ? 0x40000000u : 0u);
+}
+static uint32_t g_rbb_cap = 32;          // members per batch incl. the miss; <= 1 = per-block (the control)
+static uint32_t g_rbb_batches = 0;       // batches installed (ctx_snapshot 152)
+static uint32_t g_rbb_members = 0;       // members installed AHEAD of execution (153)
+static uint32_t g_rbb_fcfg_redo = 0;     // unconfirmed members whose first entry saw another FPU config (154)
+static uint32_t g_rbb_dropped = 0;       // members built but not registered (probe limit) (155)
+static uint32_t g_rbb_alias_drops = 0;   // misses whose other address view held the FPCA entry (157)
+static void rb_discard_slot(u32 slot);   // defined with the keep-code load below
 // Slot of the last jit_lookup that returned STALE (valid only right after it).
 static uint32_t g_lookup_slot = 0;
 static constexpr u32 SMC_CHUNKS = 1u << 22;   // 16MB >> 2
@@ -353,6 +374,7 @@ static bool jit_live(u32 vaddr) {
         u32 slot = (h + i) & JIT_TABLE_MASK;
         if (s_block_pc[slot] == vaddr) {
             if (!s_block_fn[slot]) return false;
+            if (s_block_fcfg[slot] && s_block_fcfg[slot] != fcfg_now()) return false;   // first entry would recompile
             if (s_block_len[slot] == 0) return true;
             const uint32_t gen = g_ic_generation;
             if (gen != 0 && s_block_vgen[slot] == gen && !s_block_stale[slot]) return true;
@@ -361,6 +383,16 @@ static bool jit_live(u32 vaddr) {
         if (s_block_pc[slot] == 0) return false;
     }
     return false;
+}
+// A verified hit about to run. An unconfirmed batch member (s_block_fcfg) is
+// confirmed here, or discarded so the miss path compiles it from live state.
+static inline BlockFn jit_confirm(u32 slot) {
+    const u32 c = s_block_fcfg[slot];
+    if (c) {
+        if (c != fcfg_now()) { rb_discard_slot(slot); ++g_rbb_fcfg_redo; return nullptr; }
+        s_block_fcfg[slot] = 0;
+    }
+    return s_block_fn[slot];
 }
 static BlockFn jit_lookup(u32 vaddr) {
     g_lookup_stale = false;
@@ -382,7 +414,7 @@ static BlockFn jit_lookup(u32 vaddr) {
                 // verified clean in the CURRENT generation (see s_block_vgen).
                 const uint32_t gen = g_ic_generation;
                 if (gen != 0 && s_block_vgen[slot] == gen && !s_block_stale[slot])
-                    return s_block_fn[slot];
+                    return jit_confirm(slot);
                 if (ram_code_sum(vaddr, s_block_len[slot]) != s_block_sum[slot]) {
                     g_lookup_stale = true;
                     g_lookup_slot = slot;
@@ -401,7 +433,7 @@ static BlockFn jit_lookup(u32 vaddr) {
                 s_block_stale[slot] = 0;   // sum matches -> (re)verified
                 s_block_vgen[slot] = gen;  // stamp; 0 while disarmed = no skip
             }
-            return s_block_fn[slot];
+            return jit_confirm(slot);
         }
         if (s_block_pc[slot] == 0)     return nullptr;
     }
@@ -422,6 +454,7 @@ static bool jit_register(u32 vaddr, BlockFn fn, u32 code_bytes) {
             s_block_sum[slot] = verify ? ram_code_sum(vaddr, code_bytes) : 0;
             s_block_stale[slot] = 0;   // fresh snapshot — no longer known-stale
             s_block_unit[slot] = s_cur_unit;   // patch 0002: install unit
+            s_block_fcfg[slot] = 0;            // rbb_compile sets it after registering a member
             // Lever-5E1: the sum just computed IS this generation's verification.
             s_block_vgen[slot] = (verify && g_ic_generation) ? g_ic_generation : 0;
             // Build 2 (lever-4): a RE-compile moves this vaddr to a NEW wasmTable
@@ -856,6 +889,7 @@ static void jit_clear() {
     memset(s_block_stale, 0, sizeof(s_block_stale));
     memset(s_block_vgen, 0, sizeof(s_block_vgen));
     memset(s_block_unit, 0, sizeof(s_block_unit));
+    memset(s_block_fcfg, 0, sizeof(s_block_fcfg));
 }
 
 // Lever-6B: dispatch-loop state hoisted to file scope so the inner loop can
@@ -1045,6 +1079,10 @@ static bool s_shard_enabled = []{
 // per hop vs intra-module, with direct in-shard return_call at 0.66ns.
 extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_shard(int on) {
     s_shard_enabled = !!on;
+}
+// Rollback-mode batch cap (rbb_compile). <= 1 = per-block install, the control.
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_rb_batch(int n) {
+    g_rbb_cap = n < 1 ? 1u : n > 4096 ? 4096u : (u32)n;
 }
 // Lever-11 v0: frame-wait-spin slice burn toggle (?idleskip=1).
 extern "C" { extern volatile uint32_t g_idleskip; }
@@ -1365,6 +1403,7 @@ static void rb_discard_slot(u32 slot) {
     s_block_stale[slot] = 0;
     s_block_vgen[slot] = 0;
     s_block_unit[slot] = 0;
+    s_block_fcfg[slot] = 0;
 }
 
 // Drop every slot in `slot`'s install unit (or just `slot` for unit 0).
@@ -1616,6 +1655,12 @@ EMSCRIPTEN_KEEPALIVE uint32_t flycast_ctx_snapshot(uint32_t which) {
         case 149: return g_pswff_fallbacks;       // head arrivals run for real
         case 150: return g_pswff_chk_ok;          // ?pswff=2 DIAG: predictions that matched
         case 151: return g_pswff_chk_bad;         // ?pswff=2 DIAG: predictions that did not
+        case 152: return g_rbb_batches;           // rollback-mode batches installed
+        case 153: return g_rbb_members;           // members installed ahead of execution
+        case 154: return g_rbb_fcfg_redo;         // members recompiled at first entry (FPU config)
+        case 155: return g_rbb_dropped;           // members dropped at register (probe limit)
+        case 156: return g_rb_parks;              // parks while in rollback mode (must stay 0)
+        case 157: return g_rbb_alias_drops;       // P1/P2 alias entries dropped before a compile
         case 82: return (u32)g_attr_mainloop_ms;  // lever-5 attribution: SH4 mainloop wall (ms total)
         case 83: return (u32)g_attr_retro_ms;     // lever-5 attribution: whole retro_run wall (ms total)
         // lever-12 mainloop split (cumulative; the heartbeat carries the
@@ -3010,6 +3055,123 @@ public:
 		bemental_sh4_set_nolink_pc2(0x8c38d480u);   // every arm (flycast_set_pswff)
 	}
 
+	// -----------------------------------------------------------------------
+	// ROLLBACK-MODE BATCH COMPILE (2026-10-15). Rollback mode installs every
+	// block on its own (one WebAssembly.Module + Instance per block) so that a
+	// block is live from its first execution and routing is a pure function of
+	// guest state (no pending span-interpretation). That made the room start-up
+	// refill 2.3x slower than sharded install: 6,245 blocks of the first lobby
+	// frame in 1.48 s vs 0.31 s (dreamcast/docs/rollback/TASKS.md).
+	//
+	// Here a miss compiles its block WITH its static successors (BranchBlock /
+	// NextBlock, breadth-first, up to g_rbb_cap blocks) into ONE module, and every
+	// member is registered before the miss's block runs. Each member's body is
+	// the per-block body (build_blocks_unlinked: no tail-link, no trace), so every
+	// edge between members still goes through the verified lookup or the IC, as
+	// between per-block installs. What per-block install would do differently,
+	// and how each is closed:
+	//  * it decodes a block at its first ENTRY; a member is decoded earlier.
+	//    - Bytes: a member is registered with its checksum, and its first entry
+	//      is a verified lookup (stale -> rollback-mode recompile), exactly as
+	//      for any registered block.
+	//    - FPU config: decode reads FPSCR.PR/SZ/RM and SR.FD. A member with an
+	//      FPU op is UNCONFIRMED (s_block_fcfg) until its first entry, which
+	//      confirms it or discards it for a recompile from live state.
+	//    - Side effects of decoding: Setup raises guest exceptions for an odd
+	//      pc, an MMU fault, FpuDisabled, or a fetch fault, and the decoder
+	//      throws on a branch in a delay slot. Members are therefore taken only
+	//      from main RAM, even pcs, with the MMU off and SR.FD clear, and after a
+	//      pre-scan that rejects a delay-slot branch.
+	//  * compilePC resets the whole cache when it compiles 0x8c0000e0,
+	//    0xac010000 or 0xac008300: never members.
+	//  * a member that would not register (probe limit) is dropped, never
+	//    parked, so it is compiled on its first miss like any block.
+	// Extra blocks in the table change no route: a block is either live or a
+	// miss that compiles synchronously before it runs, in both models. The keep-
+	// code load drops members per slot (unit 0: no member links another).
+	// ?rbbatch=N sets the cap (worker URL); ?rbbatch=1 is per-block install.
+	// -----------------------------------------------------------------------
+	static bool rbb_scan_ok(u32 pc) {
+		for (u32 i = 0; i < 512; i++, pc += 2) {
+			if (!vaddr_in_ram(pc) || !vaddr_in_ram(pc + 2)) return false;
+			const sh4_opcodelistentry* d = OpDesc[IReadMem16(pc)];
+			if (!d) return false;
+			if (d->SetPC()) {
+				if (d->type & Delayslot) {
+					const sh4_opcodelistentry* n = OpDesc[IReadMem16(pc + 2)];
+					if (!n || n->SetPC()) return false;
+				}
+				return true;
+			}
+		}
+		return true;
+	}
+	bool rbb_compile(RuntimeBlockInfo* head)
+	{
+		const u32 hv = head->vaddr;
+		std::vector<RuntimeBlockInfo*> mem;
+		mem.push_back(head);
+		std::vector<u32> keys;   // RAM offset of every member: one FPCA entry each
+		keys.push_back(hv & 0x00FFFFFEu);
+		std::vector<u32> q;
+		auto push = [&](RuntimeBlockInfo* r) {
+			if (r->BranchBlock != NullAddress) q.push_back(r->BranchBlock);
+			if (r->NextBlock != NullAddress) q.push_back(r->NextBlock);
+		};
+		push(head);
+		for (size_t qi = 0; qi < q.size() && mem.size() < g_rbb_cap; qi++) {
+			const u32 sv = q[qi];
+			if ((sv & 1) || !vaddr_in_ram(sv)) continue;
+			if (sv == 0x8c0000e0u || sv == 0xac010000u || sv == 0xac008300u) continue;
+			const u32 key = sv & 0x00FFFFFEu;
+			if (std::find(keys.begin(), keys.end(), key) != keys.end()) continue;
+			if (bm_GetCodeByVAddr(sv) != (DynarecCodeEntryPtr)ngen_FailedToFindBlock) continue;
+			if (s_unreg_len.count(sv)) continue;
+			if (!rbb_scan_ok(sv)) continue;
+			RuntimeBlockInfo* r = allocateBlock();
+			if (!r->Setup(sv, Sh4cntx.fpscr)) { delete r; continue; }   // cannot fail on these pcs (see above)
+			r->blockcheck_failures = 0;
+			mem.push_back(r); keys.push_back(key);
+			push(r);
+		}
+		if (mem.size() < 2) return false;   // nothing to batch: the per-block path is identical
+		std::vector<u8> bytes = bemental::sh4::build_blocks_unlinked(mem);
+		std::vector<u32> vaddrs;
+		for (auto* r : mem) vaddrs.push_back(r->vaddr);
+		const u32 fc = fcfg_now();
+		s_cur_unit = 0;
+		const int base = install_shard_tries((uintptr_t)bytes.data(), (int)bytes.size(), vaddrs.data(), (int)mem.size());
+		if (base <= 0) {   // the head retries on its own module (the per-block path)
+			for (size_t i = 1; i < mem.size(); i++) delete mem[i];
+			return false;
+		}
+		++g_rbb_batches;
+		for (size_t i = 0; i < mem.size(); i++) {
+			RuntimeBlockInfo* r = mem[i];
+			BlockFn fn = reinterpret_cast<BlockFn>(static_cast<uintptr_t>(base + (int)i));
+			if (!jit_register(r->vaddr, fn, r->sh4_code_size)) {
+				if (i == 0) { park_unregistered(r->vaddr, r->sh4_code_size); continue; }   // as the per-block path
+				++g_rbb_dropped; delete r; continue;
+			}
+			if (i == 0) continue;   // compilePC adds the head to the block manager
+			if (r->has_fpu_op) {
+				const u32 h = jit_hash(r->vaddr);
+				for (u32 k = 0; k < JIT_PROBE_LIMIT; k++) {
+					const u32 slot = (h + k) & JIT_TABLE_MASK;
+					if (s_block_pc[slot] == r->vaddr) { s_block_fcfg[slot] = fc; break; }
+				}
+			}
+			if (g_gwff) gwff_learn(r);
+			if (g_pswff) pswff_learn(r);
+			r->code           = (DynarecCodeEntryPtr)(uintptr_t)r;
+			r->host_code_size = 0;
+			r->host_opcodes   = 0;
+			bm_AddBlock(r);
+			++g_rbb_members;
+		}
+		return true;
+	}
+
 	void compile(RuntimeBlockInfo* block, bool /*smc_checks*/, bool /*optimise*/) override
 	{
 		++g_compile_calls;
@@ -3018,6 +3180,37 @@ public:
 		if (g_jitfail_inject_n && ++s_compiles_since_reset == g_jitfail_inject_n) {
 			s_jitfail_vaddr = block->vaddr;
 			s_jitfail_left = g_jitfail_once ? 1u : 0xFFFFFFFFu;
+		}
+		// AN ALIAS IN THE BLOCK MANAGER. flycast's jump table is indexed by the
+		// PHYSICAL address (FPCA: addr & 0x1FFFFFE), our table by vaddr, so the
+		// P1 and P2 views of one code word (0x8c.. / 0xac..) share one FPCA entry.
+		// A batch member compiled at one view, and then a miss at the other,
+		// reaches compilePC with FPCA already claimed, and bm_AddBlock's verify
+		// kills the worker (measured: Gauntlet's boot in rollback mode, miss at
+		// 0x8c00d828). Per-block install never compiles a view the guest did not
+		// execute, so drop the alias: the miss compiles from live RAM, as it would
+		// have without the member, and the alias recompiles on its own next miss.
+		if (g_rb_mode && !mmu_enabled()) {
+			DynarecCodeEntryPtr c = bm_GetCodeByVAddr(block->vaddr);
+			if (c != (DynarecCodeEntryPtr)ngen_FailedToFindBlock) {
+				RuntimeBlockInfo* o = (RuntimeBlockInfo*)(void*)c;
+				const u32 ov = o->vaddr, h = jit_hash(ov);
+				bool done = false;
+				for (u32 k = 0; k < JIT_PROBE_LIMIT && !done; k++) {
+					const u32 slot = (h + k) & JIT_TABLE_MASK;
+					if (s_block_pc[slot] == ov) { rb_discard_slot(slot); done = true; }
+					else if (s_block_pc[slot] == 0) break;
+				}
+				if (bm_GetCodeByVAddr(block->vaddr) != (DynarecCodeEntryPtr)ngen_FailedToFindBlock) bm_DiscardBlock(o);
+				++g_rbb_alias_drops;
+			}
+		}
+		if (g_rb_mode && !s_shard_enabled && g_rbb_cap > 1 && !mmu_enabled() && !Sh4cntx.sr.FD &&
+		    vaddr_in_ram(block->vaddr) && rbb_compile(block)) {
+			block->code           = (DynarecCodeEntryPtr)(uintptr_t)block;
+			block->host_code_size = 0;
+			block->host_opcodes   = 0;
+			return;
 		}
 		// Earlier-style 0x8c0133f4 diag dump that lived here was DUPLICATING the
 		// build_block() call done below at the per-block install site (line ~715),

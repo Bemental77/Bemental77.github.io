@@ -4786,6 +4786,33 @@ std::vector<u8> build_blocks(const std::vector<RuntimeBlockInfo*>& blocks) {
     return b.getBytes();
 }
 
+// ROLLBACK-MODE BATCH (rec_wasm.cpp rbb_compile): build_blocks' envelope with
+// build_block's bodies. Passing no maps to emitBlockFuncBody makes
+// sibling_func_idx return -1 for every target, so no member can tail-link or
+// inline another: each body is byte-for-byte the per-block body.
+std::vector<u8> build_blocks_unlinked(const std::vector<RuntimeBlockInfo*>& blocks) {
+    WasmModuleBuilder b;
+    b.emitHeader();
+    emitTypeImportSection(b);
+    const u32 n = (u32)blocks.size();
+    {
+        std::vector<u32> typeIdx(n, 0u);
+        b.emitFunctionSection(n, n > 0 ? typeIdx.data() : nullptr);
+    }
+    {
+        std::vector<std::string> names(n);
+        for (u32 i = 0; i < n; ++i) names[i] = "run_" + std::to_string(i);
+        b.beginExportSection(n);
+        for (u32 i = 0; i < n; ++i) b.emitExport(names[i].c_str(), WASM_EXPORT_FUNC, WIMPORT_COUNT + i);
+        b.endSection();
+    }
+    b.emitDataCountSection(0);
+    b.beginCodeSection(n);
+    for (u32 i = 0; i < n; ++i) emitBlockFuncBody(b, blocks[i]);
+    b.endSection();
+    return b.getBytes();
+}
+
 } // namespace bemental::sh4
 
 // C-linkage bridge for the mem-fastpath kill-switch — the emitter global is

@@ -647,6 +647,8 @@ try {
   });
   try { require(path.join(REPO, 'tools', 'browser_leak_guard.js')).guard(browser, 'rollback_measure'); } catch (_) {}
   const page = await browser.newPage();
+  // --echo RE: print page console lines matching RE (worker prints arrive here)
+  if (arg('echo', '')) { const re = new RegExp(arg('echo', '')); page.on('console', (m) => { const t = m.text(); if (re.test(t)) say('PAGE ' + t.slice(0, 400)); }); }
   await page.setViewport({ width: 900, height: 700 });
   page.on('pageerror', (e) => say('  [page!] ' + ((e && e.message) || String(e))));
   await page.goto(URLBASE + '/dreamcast.html' + (QUERY ? '?' + QUERY : ''), { waitUntil: 'domcontentloaded', timeout: 120000 });
@@ -821,6 +823,11 @@ try {
   };
   if (RBLOAD) report.rbLoadCounts = await wEval(worker, '({ keep: self.__rb.rbKeep, fullFlushFallbacks: self.__rb.rbFallbacks })');
   if (RBLOAD) say('RBLOAD loads: ' + JSON.stringify(report.rbLoadCounts));
+  if (RBLOAD) {   // rollback-mode compile (rec_wasm.cpp rbb_compile): batches, members, FPU-config recompiles, dropped, rollback-mode parks (must be 0)
+    const c = await wEval(worker, '(function(M){ return [152,153,154,155,156,111,157].map(function(i){ return M._flycast_ctx_snapshot(i) >>> 0; }); })(self.Module)').catch(() => null);
+    report.rbBatch = c && { batches: c[0], members: c[1], fcfgRedo: c[2], dropped: c[3], rbParks: c[4], compileCalls: c[5], aliasDrops: c[6] };
+    say('RB compile: ' + JSON.stringify(report.rbBatch));
+  }
   report.rb = {
     rollbacks: s.rollbacks, resimFrames: s.resim, maxDepth: s.maxDepth, mispredicted: s.mispredicted, watchdog: s.watchdog,
     loadMs: stat(s.loadMs), resimFrameMs: stat(s.resimFrameMs), resimSaveMs: stat(s.resimSaveMs),

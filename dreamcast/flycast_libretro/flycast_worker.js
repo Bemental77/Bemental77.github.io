@@ -1161,7 +1161,7 @@
   // Arm a rollback room on this worker, BEFORE its frame 0. Every console of the
   // room does exactly this at the same point, so the mode switch (which flushes
   // the code cache once) is part of the shared timeline.
-  function rbArm(w) {
+  function rbArm(w, enter) {
     const M = self.Module;
     rbFree();
     rbW = Math.max(1, w | 0);
@@ -1186,12 +1186,21 @@
       M.HEAPU8.fill(0, p, p + rbSize);
       rbSlots.push(p); rbSlotF.push(-1); rbSlotOff.push(0);
     }
-    M._emscripten_set_rollback_mode(1);
+    // ?rbbatch=N (worker URL): members per rollback-mode compile batch
+    // (rec_wasm.cpp rbb_compile; default 32). ?rbbatch=1 = per-block install,
+    // the control. Set before the mode switch so the refill uses it.
+    { const m = /[?&]rbbatch=(\d+)/.exec(self.location.search);
+      if (m && typeof M._flycast_set_rb_batch === 'function') M._flycast_set_rb_batch(+m[1]); }
+    // enter = 0: a room that STARTS in input delay (the host's capacity gate
+    // judged a console too slow at Ready) holds the ring for a later switch but
+    // stays on the shard: the core enters rollback mode only at the agreed frame
+    // of a switch (rbSwitchCore), from the same flush on every console.
+    if (enter !== 0) { M._emscripten_set_rollback_mode(1); rfStart(M, 'ARM'); }
     // A rollback frame never takes a live fingerprint (curRb gates it): the
     // engine asks for CONFIRMED frames itself (takeHashDue). lsHashEvery stays
     // as it is for the delay frames a capacity-gated room may switch to.
     postMessage({ cmd: 'print', txt: '[rollback] ARMED — window ' + rbW + ' frames, ring ' + rbN + ' x ' +
-                  (rbSize / 1048576).toFixed(1) + ' MB, rollback mode ON (per-block install, keep-code restore)' });
+                  (rbSize / 1048576).toFixed(1) + ' MB, ' + (enter !== 0 ? 'rollback mode ON (per-block install, keep-code restore)' : 'rollback mode held for a switch (the room starts in input delay)') });
     return true;
   }
   function rbSlot(k) { const i = k % rbN; return (rbSlotF && rbSlotF[i] === k) ? rbSlots[i] : 0; }
@@ -1266,14 +1275,32 @@
   // ?dcrbkeepmode=1 (page) is the control: the old keep-rollback-mode.
   // ---------------------------------------------------------------------------
   let rbCoreOn = false, rbKeepMode = false, shardWanted = true;
+  // THE ROOM START-UP REFILL, MEASURED (2026-10-15). Every switch into or out of
+  // rollback mode flushes the code cache, and the frames after it recompile.
+  // The first RF_FRAMES frames after a flush are timed (wall inside run_iter)
+  // and reported once with the compile counters (rec_wasm.cpp ctx_snapshot
+  // 110 fresh registrations, 111 compile calls, 152/153 rollback-mode batches /
+  // members ahead of execution). One line per flush; nothing per frame.
+  const RF_FRAMES = 30;
+  let rfLeft = 0, rfWhy = '', rfMs = 0, rfMax = 0, rfN = 0, rfC0 = null;
+  function rfSnap(M) { try { return [110, 111, 152, 153].map((i) => M._flycast_ctx_snapshot(i) >>> 0); } catch (_) { return [0, 0, 0, 0]; } }
+  function rfStart(M, why) { rfLeft = RF_FRAMES; rfWhy = why; rfMs = 0; rfMax = 0; rfN = 0; rfC0 = rfSnap(M); }
+  function rfNote(M, ms) {
+    rfMs += ms; rfN++; if (ms > rfMax) rfMax = ms;
+    if (--rfLeft > 0) return;
+    const c = rfSnap(M), d = c.map((v, i) => v - rfC0[i]);
+    postMessage({ cmd: 'print', txt: '[rollback] refill after ' + rfWhy + ': ' + rfN + ' frames ' + Math.round(rfMs) + ' ms (max ' +
+      Math.round(rfMax) + ') — compiles ' + d[1] + ', registered ' + d[0] + ', batches ' + d[2] + ' (+' + d[3] + ' members ahead)' });
+  }
   function rbSwitchCore(M, on, f) {
     try {
-      if (on) M._emscripten_set_rollback_mode(1);   // flushes, shard off
+      if (on) { M._emscripten_set_rollback_mode(1); rfStart(M, 'ENTER at frame ' + f); }   // flushes, shard off
       else {
         M._emscripten_set_rollback_mode(0);
         if (typeof M._flycast_set_shard === 'function') M._flycast_set_shard(shardWanted ? 1 : 0);
         if (typeof M._flycast_lockstep_reset === 'function') M._flycast_lockstep_reset();
         if (typeof M._flycast_ic_invalidate === 'function') M._flycast_ic_invalidate();
+        rfStart(M, 'LEAVE at frame ' + f);
       }
       rbCoreOn = on; rbStats.modeSwitches = (rbStats.modeSwitches | 0) + 1;
       postMessage({ cmd: 'print', txt: '[rollback] core ' + (on ? 'ENTERS rollback mode' : 'LEAVES rollback mode (shard ' + (shardWanted ? 'on' : 'off') + ')') + ' at frame ' + f });
@@ -1393,7 +1420,28 @@
   let pumpQueued = false;
   let pumpTaskEnd = 0;     // performance.now() when the last pump task returned
   let pumpWaitAsked = 0;   // timer wait asked for across that gap (not render hold)
+  // THE GATE PARK (2026-10-15). A pump parked on the lockstep gate used to
+  // re-check through pumpKick(1), and pumpKick treats ms <= 1 as "now": after
+  // its 8 quick re-checks the parked pump kept re-posting itself with no delay
+  // at all — a hot spin for as long as the gate held. Measured (room, rate 1,
+  // delay lockstep): host worker thread 530 ms of CPU per second with 250 ms/s
+  // inside run_iter and ~300 ms/s parked on the gate; a pair of solo consoles
+  // on the same box, 190-200 ms/s. On a box whose cores are shared that spin is
+  // taken from the other console and the renderer. Now the parked pump sleeps:
+  // the input that un-parks it kicks the pump itself ('lsInput'), and any kick
+  // pre-empts the park; the long timer is only a backstop. ?lsspin=1 = the old
+  // spin, the control.
+  let stallTimer = 0;
+  const LS_PARK_MS = 100;
+  const lsSpinCtl = /[?&]lsspin=1/.test(self.location.search);
+  function pumpPark() {
+    if (pumpQueued) return;
+    pumpQueued = true;
+    pumpWaitAsked = 0;   // parked time is gate time (noteHeld), not a governor sleep
+    stallTimer = setTimeout(() => { stallTimer = 0; pumpChannel.port2.postMessage(0); }, LS_PARK_MS);
+  }
   function pumpKick(ms) {
+    if (stallTimer) { clearTimeout(stallTimer); stallTimer = 0; pumpQueued = false; }
     if (pumpQueued) return;
     pumpQueued = true;
     pumpWaitAsked = ms > 1 ? ms : 0;   // a timer's own wait is not render hold
@@ -1798,7 +1846,8 @@
         // fraction of a frame and a 4 ms timer clamp would turn every one of
         // them into 4 ms of added latency. Fall back to a timer after that so a
         // long stall is not a hot spin.
-        pumpKick(lsStallSpin++ < 8 ? 0 : 1);
+        if (lsStallSpin++ < 8 || lsSpinCtl) pumpKick(lsSpinCtl ? 1 : 0);
+        else pumpPark();
         return;
       }
       if (lsStallSince) {
@@ -1924,6 +1973,7 @@
     // governor's "now" below (it was calling performance.now() here anyway).
     const t1 = performance.now();
     paceBusyMs += t1 - t0;
+    if (rfLeft > 0) rfNote(Module, t1 - t0);
     let delay = 0;
     if (!uncap && typeof Module._flycast_guest_cycles === 'function') {
       // Governor: schedule the next iteration so guest time never leads wall
@@ -2146,8 +2196,9 @@
       // it, because under lockstep every machine writes every pad.
       case 'rbArm': {
         if (runIterSuspended()) { rbFault('rbArm while a frame is asyncify-suspended'); break; }
-        const ok = rbArm(data.w | 0);
-        rbCoreOn = !!ok; rbKeepMode = !!data.keepMode;
+        const enter = data.enter === 0 ? 0 : 1;
+        const ok = rbArm(data.w | 0, enter);
+        rbCoreOn = !!ok && enter === 1; rbKeepMode = !!data.keepMode;
         rbBroken = !!data.broken;
         if (rbBroken) postMessage({ cmd: 'print', txt: '[rollback] ⚠ BROKEN-VARIANT CONTROL: this worker ignores every re-simulation plan (?dcrbbroken=1) — the room must desync' });
         postMessage({ cmd: 'rbArmed', ok, w: rbW, slots: rbN, mb: Math.round(rbN * rbSize / 1048576), why: rbStats.fault });
