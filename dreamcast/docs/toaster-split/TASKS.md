@@ -657,6 +657,18 @@ Rate 6.2, 20-heartbeat window (lib/bench.js's rule), load 0.4-3.2:
 inside the noise (gate wait 0-100 ms/s). Every room started in delay through the step estimate
 (87-92 ms declared).
 
+### The up-switch, exercised (`?dcstepfake=HI,LO,F`, test arm)
+
+A console with the arm declares HI ms at Ready and reports LO from frame F on, whatever it
+measured. That makes a room that started in delay get moved up to rollback by the host's gate.
+PSO soak (hermetic snapshot, owd 20+10, `dcstepfake=200,1,300` on both):
+- The room started in delay, and both consoles logged "moved to ROLLBACK at frame 651".
+- Each armed its ring held (`enter:0`) and entered rollback mode at frame 651. The refill
+  after ENTER was 1.2-1.5 s with batching.
+- 25 / 30 rollbacks, depth 4. **IN SYNC** over 34 RAM checkpoints and 34 fingerprints.
+- The same room with the joiner on `dcrbbroken=1` **DESYNCs** (first RAM mismatch at f1380),
+  so the detectors work across the switch.
+
 ## Status
 
 - [x] Split measured: solo at 1 and 6.2, room at 6.2 for 60 s, and a worker
