@@ -1767,6 +1767,7 @@ extern "C" void flycast_rb_reset_host_history(void);   // rec_wasm.cpp, patch 00
 extern "C" { extern volatile uint32_t g_syncsr_count; }
 // Lever-10 sizing instrument (defined in rec_wasm.cpp; read via ctxsnap 89).
 extern "C" { extern volatile uint32_t g_syncfpscr_count; }
+extern "C" { extern volatile uint32_t g_div32_count; }
 // Lever-5D sizing (defined in rec_wasm.cpp; ctxsnap 84-87): IFB op mix.
 extern "C" { extern volatile uint32_t g_ifb_ftrv, g_ifb_fipr, g_ifb_fsca, g_ifb_other; }
 extern "C" {
@@ -2890,6 +2891,7 @@ void sh4_interp_shil_fb(uint32_t block_vaddr, uint32_t op_idx) {
         case shop_div32u:
         case shop_div32s:
         case shop_div32p2: {
+            ++g_div32_count;
             // shil_chf[op.op] is the codegen compile() method (shil_canonical.h:63,
             // 41-43), which drives the backend's canonStart/canonParam/canonCall/
             // canonFinish to EMIT a call — it does NOT execute the arithmetic. On

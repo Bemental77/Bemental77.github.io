@@ -51,6 +51,7 @@
 // new wasmTable index for the module's "run" export, 0 on failure.
 extern "C" int wasm_install_block(uintptr_t bytesPtr, int len, uint32_t vaddr);
 extern "C" int wasm_dispatcher_get_last_error(char* dst, int max_len);
+extern "C" void flycast_jit_declare_park_arm(uint32_t pc);   // rec_wasm.cpp
 
 namespace aica::arm {
 
@@ -93,6 +94,22 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_arm7selftest(int on) {
 }
 static u32 s_selftest_blocks = 0, s_selftest_mismatch = 0;
 
+// ARM7 sound-RAM accesses inline (2026-10-15). Every LDR/STR used to be a
+// call_indirect into DoMemOp, which masks the address and, below 0x800000,
+// just loads or stores sound RAM. emitMemOp now does that RAM arm itself and
+// keeps the call for registers. PSO lobby, ?armtime=1, two interleaved
+// pairs: 68.4 / 68.3 ms of ARM per guest second vs 75.2 / 74.4 with
+// ?armmemfp=0 (the control). COMPILE-time: the toggle flushes the ARM cache.
+// (Block-end chaining — each block calling EntryPoints[pc] itself instead of
+// returning to the mainloop — was measured in the same set and bought
+// nothing: 67.8 / 65.3 with it off. Not kept.)
+static bool s_arm7memfp = true;   // sound-RAM loads/stores inline (emitMemOp); ?armmemfp=0 = control
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_armmemfp(int on) {
+    if (s_arm7memfp == !!on) return;
+    s_arm7memfp = !!on;
+    recompiler::flush();
+}
+
 // ---------------------------------------------------------------------------
 // v0 runner (task 2) — interprets a block span under REC conventions.
 // ---------------------------------------------------------------------------
@@ -115,7 +132,61 @@ static void arm_compile_stub()
     recompiler::compile();
 }
 
+// ---------------------------------------------------------------------------
+// ARM7 cycle histogram by block start pc (DIAG, ?armhist=A,B on the page).
+// It is how the pure-spin drop was sized and rejected (2026-10-15): neither
+// PSO's nor Gauntlet's sound driver has a store-free loop that repeats its
+// register file inside one sample (dreamcast/docs/toaster-split/TASKS.md).
+// ---------------------------------------------------------------------------
+static u32* s_armhist = nullptr;   // ARAM_SIZE_MAX/4 counters, allocated on demand
+static void armhist_print()
+{
+    if (!s_armhist) return;
+    const u32 N = ARAM_SIZE_MAX / 4;
+    u64 tot = 0; for (u32 i = 0; i < N; ++i) tot += s_armhist[i];
+    u32 top[16] = {0}; u32 val[16] = {0};
+    for (u32 i = 0; i < N; ++i) {
+        const u32 v = s_armhist[i]; if (v <= val[15]) continue;
+        int k = 15; while (k > 0 && val[k - 1] < v) { val[k] = val[k - 1]; top[k] = top[k - 1]; --k; }
+        val[k] = v; top[k] = i;
+    }
+    for (int k = 0; k < 16 && val[k]; ++k) {
+        const u32 pc = top[k] * 4;
+        MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt:'[armhist] #' + $0 + ' pc=0x' + ($1>>>0).toString(16) + ' ' +
+            (($2|0) / 100).toFixed(2) + '% of ' + ($3>>>0) + 'K cyc'}); }, k, (int)pc, (int)(tot ? (u64)val[k] * 10000 / tot : 0), (int)(u32)(tot / 1000));
+    }
+    for (int k = 0; k < 4 && val[k]; ++k) {   // code words for an offline disassembly
+        const u32 pc = (top[k] * 4) & ARAM_MASK, base = pc >= 64 ? pc - 64 : 0;
+        char buf[24 * 9 + 1]; buf[0] = 0; char* o = buf;
+        for (int w = 0; w < 24; ++w) o += snprintf(o, 10, "%08x ", *(u32*)&aica_ram[(base + w * 4) & ARAM_MASK]);
+        MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt:'[armcode] base=0x' + ($0>>>0).toString(16) + ' ' + UTF8ToString($1)}); }, (int)base, buf);
+    }
+    memset(s_armhist, 0, N * 4);
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_armhist(int on) {
+    if (on && !s_armhist) s_armhist = (u32*)calloc(ARAM_SIZE_MAX / 4, 4);
+    else if (!on && s_armhist) { armhist_print(); free(s_armhist); s_armhist = nullptr; }
+}
+// DIAG (?armtime=1): wall time inside the ARM mainloop per guest second,
+// printed every 5 guest seconds of samples. Two clock reads a sample.
+static bool s_armtime = false;
+static double s_armtime_ms = 0;
+static u32 s_armtime_n = 0;
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_armtime(int on) { s_armtime = !!on; s_armtime_ms = 0; s_armtime_n = 0; }
+static void arm_mainloop_run(reg_pair* regs, void (*entrypoints[])());
 static void arm_mainloop_c(reg_pair* regs, void (*entrypoints[])())
+{
+    if (!s_armtime) { arm_mainloop_run(regs, entrypoints); return; }
+    const double t0 = emscripten_get_now();
+    arm_mainloop_run(regs, entrypoints);
+    s_armtime_ms += emscripten_get_now() - t0;
+    if (++s_armtime_n == 5 * 44100) {
+        MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt:'[armtime] arm=' + ($0).toFixed(1) + ' ms per guest second'}); },
+                           s_armtime_ms / 5.0);
+        s_armtime_ms = 0; s_armtime_n = 0;
+    }
+}
+static void arm_mainloop_run(reg_pair* regs, void (*entrypoints[])())
 {
     for (;;) {
         if ((int)regs[CYCL_CNT].I <= 0)
@@ -124,7 +195,15 @@ static void arm_mainloop_c(reg_pair* regs, void (*entrypoints[])())
             CPUFiq();
             continue;
         }
-        entrypoints[(regs[R15_ARM_NEXT].I & (ARAM_SIZE_MAX - 1)) / 4]();
+        const u32 pc = regs[R15_ARM_NEXT].I;
+        void (*fn)() = entrypoints[(pc & (ARAM_SIZE_MAX - 1)) / 4];
+        if (s_armhist) {
+            const int c0 = (int)regs[CYCL_CNT].I;
+            fn();
+            s_armhist[(pc & (ARAM_SIZE_MAX - 1)) >> 2] += (u32)(c0 - (int)regs[CYCL_CNT].I);
+            continue;
+        }
+        fn();
     }
 }
 
@@ -708,6 +787,48 @@ private:
             b.op_local_set(L_LHS);
         }
 
+        const bool load = op.op_type == ArmOp::LDR;
+        if (s_arm7memfp) {
+            // Sound RAM inline (?armmemfp=0 is the control): readMem/writeMem's
+            // own RAM arm (arm_mem.h), same address arithmetic, same unaligned
+            // word rotation. Registers (addr bit 23 set) keep the C call.
+            b.op_local_get(L_LHS);
+            b.op_i32_const(0x00800000);
+            b.op_i32_and();
+            b.op_i32_eqz();
+            b.op_if(load ? WASM_TYPE_I32 : 0x40);
+              // ptr = aica_ram.data + (addr & (ARAM_MASK - (size - 1)))
+              b.op_i32_const((s32)(u32)(uintptr_t)&aica_ram);   // RamRegion's first member is its data pointer
+              b.op_i32_load(0);
+              b.op_i32_const((s32)(u32)(uintptr_t)&settings.platform.aram_mask);
+              b.op_i32_load(0);
+              b.op_i32_const(op.byte_xfer ? 0 : 3);
+              b.op_i32_sub();
+              b.op_local_get(L_LHS);
+              b.op_i32_and();
+              b.op_i32_add();
+              if (load) {
+                  if (op.byte_xfer) {
+                      b.op_i32_load8_u(0);
+                  } else {
+                      b.op_i32_load(0, 0);
+                      b.op_local_get(L_LHS);
+                      b.op_i32_const(3);
+                      b.op_i32_and();
+                      b.op_i32_const(3);
+                      b.op_i32_shl();
+                      b.op_i32_rotr();
+                  }
+              } else {
+                  if (op.arg[2].isImmediate())
+                      b.op_i32_const((s32)op.arg[2].getImmediate());
+                  else
+                      loadReg((int)op.arg[2].getReg().armreg);
+                  if (op.byte_xfer) b.op_i32_store8(0); else b.op_i32_store(0, 0);
+              }
+            b.op_else();
+        }
+
         // DoMemOp(addr, data) -> value
         b.op_local_get(L_LHS);
         if (op.op_type == ArmOp::STR) {
@@ -721,11 +842,11 @@ private:
         b.op_i32_const((s32)tbl_idx(
             recompiler::getMemOp(op.op_type == ArmOp::LDR, op.byte_xfer)));
         b.op_call_indirect(T_I32X2_I32, 0);
+        if (!load) b.op_drop();
+        if (s_arm7memfp) b.op_end();
 
-        if (op.op_type == ArmOp::LDR)
+        if (load)
             storeRegFromStack((int)op.rd.getReg().armreg);
-        else
-            b.op_drop();
     }
 
     void emitBranch(const ArmOp& op)
@@ -924,8 +1045,9 @@ void arm7backend_compile(const std::vector<ArmOp>& block_ops, u32 cycles)
 
     if (s_arm7jit_enabled) {
         std::vector<u8> bytes = build_arm7_block(block_ops, cycles);
-        const int idx = wasm_install_block(
-            (uintptr_t)bytes.data(), (int)bytes.size(), pc);
+        int idx = 0;
+        for (int k = 0; k < 3 && idx <= 0; ++k)   // retried, like the SH4 installs (rec_wasm.cpp install_block_tries)
+            idx = wasm_install_block((uintptr_t)bytes.data(), (int)bytes.size(), pc);
         if (idx > 0) {
             static bool s_logged = false;
             if (!s_logged) {
@@ -955,6 +1077,7 @@ void arm7backend_compile(const std::vector<ArmOp>& block_ops, u32 cycles)
                     ($0>>>0).toString(16) + ' err="' + s + '" — v0 fallback'});
             }, (int)pc, (uintptr_t)err);
         }
+        flycast_jit_declare_park_arm(pc);   // a route the other consoles did not take: a declared room desync
         // fall through to the v0 runner
     }
 

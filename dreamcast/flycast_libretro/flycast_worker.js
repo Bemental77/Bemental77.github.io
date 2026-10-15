@@ -3136,6 +3136,22 @@
         break;
       }
 
+      case 'armmemfp': {   // arm7_rec_wasm.cpp flycast_set_armmemfp (0 = control: every ARM load/store calls DoMemOp)
+        try {
+          if (Module._flycast_set_armmemfp) Module._flycast_set_armmemfp(data.on | 0);
+          postMessage({ cmd: 'print', txt: '[armmemfp] ' + ((data.on | 0) ? 'ON' : 'OFF (control: every ARM load/store calls DoMemOp)') });
+        } catch (err) { postMessage({ cmd: 'print', txt: '[armmemfp] threw: ' + err }); }
+        break;
+      }
+      case 'armtime': {   // DIAG: arm7_rec_wasm.cpp flycast_set_armtime
+        try { if (Module._flycast_set_armtime) Module._flycast_set_armtime(data.on | 0); } catch (err) {}
+        break;
+      }
+      case 'armhist': {   // DIAG: arm7_rec_wasm.cpp flycast_set_armhist (1 = arm, 0 = print + disarm)
+        try { if (Module._flycast_set_armhist) Module._flycast_set_armhist(data.on | 0); }
+        catch (err) { postMessage({ cmd: 'print', txt: '[armhist] threw: ' + (err && err.message ? err.message : String(err)) }); }
+        break;
+      }
       case 'jitfailinject': {   // TEST: rec_wasm.cpp flycast_set_jitfail
         try {
           if (Module._flycast_set_jitfail) Module._flycast_set_jitfail(data.n | 0, data.once | 0);
@@ -3219,7 +3235,7 @@
             // exactly, by construction. "No SMC occurred" == d(icgen) is 0.
             ' icgen=' + (f(74)>>>0) + ' smcS=' + (f(75)>>>0) + ' smcB=' + (f(76)>>>0) + ' smcR=' + (f(77)>>>0) + ' cpg=' + (f(78)>>>0) + ' smcT=' + (f(79)>>>0) +
             ' smcI=' + (f(103)>>>0) + ' smcC=' + (f(104)>>>0) + ' smcX=' + (f(105)>>>0) + ' smcP=' + (f(106)>>>0) + ' smcAcc=' + (f(107)>>>0) + ' smcE=' + (f(108)>>>0) +
-            ' smcA=0x' + h(f(80)) + ' syncsr=' + (f(81)>>>0) + ' shms=' + (f(82)>>>0) + ' rrms=' + (f(83)>>>0) + ' ftrv=' + (f(84)>>>0) + ' fipr=' + (f(85)>>>0) + ' fsca=' + (f(86)>>>0) + ' ifbo=' + (f(87)>>>0) + ' icn=' + (f(88)>>>0) + ' syncfp=' + (f(89)>>>0) + ' isk=' + (f(90)>>>0) });
+            ' smcA=0x' + h(f(80)) + ' syncsr=' + (f(81)>>>0) + ' shms=' + (f(82)>>>0) + ' rrms=' + (f(83)>>>0) + ' ftrv=' + (f(84)>>>0) + ' fipr=' + (f(85)>>>0) + ' fsca=' + (f(86)>>>0) + ' ifbo=' + (f(87)>>>0) + ' icn=' + (f(88)>>>0) + ' syncfp=' + (f(89)>>>0) + ' isk=' + (f(90)>>>0) + ' div32=' + (f(146)>>>0) + ' ifb=' + (Module._flycast_diag_ifb ? Number(Module._flycast_diag_ifb()) : -1) });
         } catch (err) {
           postMessage({ cmd: 'print', txt: '[ctxsnap] threw: ' + (err && err.message ? err.message : String(err)) });
         }
