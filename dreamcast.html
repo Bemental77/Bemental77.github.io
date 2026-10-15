@@ -2782,6 +2782,9 @@
             // ?gwff=0 — the control for the Gauntlet wait-loop fast-forward
             // (rec_wasm.cpp gwff_try; default ON in the worker).
             if (_isk.get('gwff') === '0') worker.postMessage({ cmd: 'setgwff', on: 0 });
+            // ?jitfailinject=N[&jitfailonce=1] — TEST: the Nth block compiled after the
+            // next JIT reset fails to install (rec_wasm.cpp install_*_tries).
+            if (_isk.has('jitfailinject')) worker.postMessage({ cmd: 'jitfailinject', n: parseInt(_isk.get('jitfailinject'), 10) | 0, once: _isk.has('jitfailonce') ? 1 : 0 });
           }
           // Monomorphic inline-cache: COLD-ARM at boot (lever-4 task 5). The
           // per-write SMC map makes arming safe through the SMC-heavy boot —
@@ -5546,6 +5549,7 @@
     uncap:       'GUEST UNGOVERNED — the game runs FASTER than hardware',
     noidleskip:  'idle-skip OFF',
     gwff:        'Gauntlet wait fast-forward OFF',
+    jitfailinject: 'TEST: injected JIT install failure',
     idleskip:    'idle-skip forced ON',
     interp:      'SH4 interpreter',
     interpAt:    'SH4 interpreter after N s',

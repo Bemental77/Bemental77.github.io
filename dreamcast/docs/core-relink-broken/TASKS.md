@@ -246,7 +246,15 @@ Verified: 12 KB, 16 KB and 64 KB padding, and the original ARM-pointer
 variant, all boot (1 REIOS boot, 120 syscalls, 60 fps); PSO boots with 16 KB
 padding.
 
-Same class, not proven: `mem_b`, `vram` and `aica_ram` are also freed and
-re-allocated by the same path. They kept their addresses in every build
-measured (0x6b20000 / 0x7b30000 / 0x8340000). Any pointer to them cached
-before `loadGame()` would have the same exposure.
+Same class, closed (`a commit after 9c87822`): `mem_b`, `vram`, `aica_ram`
+and Elan RAM were also freed and re-allocated by that path. They kept their
+addresses in every build measured (0x6b20000 / 0x7b30000 / 0x8340000), but only
+because the allocator handed them back. Each is now kept while its size is
+unchanged, and reallocated only when a platform switch changes the size.
+- The mainloop tripwire also fires if the RAM base baked into the dispatcher, or
+  the VRAM base baked into compiled blocks, stops matching the live buffer.
+- The `[VMEM] BASE` line now prints the same addresses at both
+  `initMappings()` calls by construction.
+- Clean build `9bb37388`: no tripwire, Gauntlet 0.998x, rollback rig 60/60
+  EXACT, soaks IN SYNC (PSO lockstep 56, PSO rollback 32, Gauntlet rollback
+  48).

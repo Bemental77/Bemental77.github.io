@@ -438,7 +438,7 @@ async function launch(role) {
       if (+gv[1] > 0 && P.gov.at.length < 40) P.gov.at.push([SOAK_T0 ? +((Date.now() - SOAK_T0) / 1000).toFixed(1) : null, +gv[1]]);
       if (SOAK_T0) { P.gov.soakDropMs += +gv[1]; P.gov.soakBeats++; }
     }
-    if (/desync|lockstep\] (ARMED|FRAME GATE|frame gate|⚠)|\[seed\]|\[vmu\]|normalize|watchdog|threw|REFUS|recover|setidleskip|idle-skip|gwff|\[shard\]|determinism|anchor frame|REFUSING|state saved|saveState|state load|stateLoaded|Save State|Load State|rollback|rbArm/i.test(t) && P.log.length < 4000)
+    if (/desync|lockstep\] (ARMED|FRAME GATE|frame gate|⚠)|\[seed\]|\[vmu\]|normalize|watchdog|threw|REFUS|recover|setidleskip|idle-skip|gwff|jitfail|jit-park|\[shard\]|determinism|anchor frame|REFUSING|state saved|saveState|state load|stateLoaded|Save State|Load State|rollback|rbArm/i.test(t) && P.log.length < 4000)
       P.log.push(((Date.now() - T0) / 1000).toFixed(1) + ' ' + t.slice(0, 400));
   });
   const mq = '/tmp/npdm/mqtt-5.3.4.min.js';

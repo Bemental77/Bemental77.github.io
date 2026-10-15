@@ -913,6 +913,68 @@ static std::map<u32, u32> s_unreg_len;
 // must span-INTERPRET a parked pc from live RAM instead, forever — until
 // reset() clears the parks, which is sound because bm_ResetCache refills the
 // WHOLE FPCB with ngen_FailedToFindBlock first (see reset()).
+// ---------------------------------------------------------------------------
+// A FAILED INSTALL IS A ROOM EVENT (2026-10-15). Which route a block takes
+// (compiled vs span-interpreted) must be the same on every console of a room,
+// and the two routes charge different guest cycles. A block whose install the
+// HOST refuses (the JS module/instance creation throws: memory, table growth)
+// is the one route decision that does not follow from guest execution. So:
+//  (1) every install is retried (INSTALL_TRIES), which turns a transient
+//      refusal into the same compiled route the other consoles took, and
+//  (2) a block that still cannot be installed is parked as before AND counted
+//      in g_jit_hard_parks, which is a word of the lockstep fingerprint
+//      (flycast_worker.js lsWords, ctx_snapshot 144): the room declares the
+//      desync at the next fingerprint, naming the cause, instead of drifting
+//      silently. The count is zeroed only at the room anchor
+//      (flycast_lockstep_reset), so every console starts the room at 0.
+// ?jitfailinject=N poisons the Nth block compiled since the last JIT reset:
+// every install of it fails (?jitfailonce=1: only its first attempt does).
+// ---------------------------------------------------------------------------
+static u32 g_jit_hard_parks = 0;
+static u32 g_jit_retry_saves = 0;     // installs that succeeded on a retry
+static u32 g_jitfail_inject_n = 0, g_jitfail_once = 0;
+static u32 s_compiles_since_reset = 0, s_jitfail_vaddr = 0, s_jitfail_left = 0;
+static constexpr int INSTALL_TRIES = 3;
+static inline bool jitfail_hit(u32 vaddr) {
+    if (!s_jitfail_left || vaddr != s_jitfail_vaddr) return false;
+    --s_jitfail_left;
+    MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt:'[jitfail] injected install failure vaddr=0x' + ($0>>>0).toString(16) +
+        ' (left ' + ($1>>>0) + ')'}); }, (int)vaddr, (int)s_jitfail_left);
+    return true;
+}
+static int install_shard_tries(uintptr_t bytes, int len, const u32* vaddrs, int count) {
+    bool poisoned = false;
+    for (int i = 0; i < count; ++i) if (vaddrs[i] == s_jitfail_vaddr && s_jitfail_left) poisoned = true;
+    for (int k = 0; k < INSTALL_TRIES; ++k) {
+        // a poisoned member takes the whole module down, like a V8 validation failure
+        if (poisoned && jitfail_hit(s_jitfail_vaddr)) continue;
+        const int idx = wasm_install_shard(bytes, len, (uintptr_t)vaddrs, count);
+        if (idx > 0) { if (k) ++g_jit_retry_saves; return idx; }
+    }
+    return 0;
+}
+static int install_block_tries(uintptr_t bytes, int len, u32 vaddr) {
+    for (int k = 0; k < INSTALL_TRIES; ++k) {
+        if (jitfail_hit(vaddr)) continue;
+        const int idx = wasm_install_block(bytes, len, vaddr);
+        if (idx > 0) { if (k) ++g_jit_retry_saves; return idx; }
+    }
+    return 0;
+}
+static void jit_declare_park(u32 vaddr) {
+    ++g_jit_hard_parks;
+    static int s_n = 0;
+    if (s_n < 8) {
+        ++s_n;
+        MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt:'[jit-park] ⚠ block 0x' + ($0>>>0).toString(16) +
+            ' could not be installed after ' + $1 + ' tries; it runs interpreted on THIS console only. In a room this is a ' +
+            'declared desync (fingerprint word jitParks=' + ($2>>>0) + ').'}); }, (int)vaddr, INSTALL_TRIES, (int)g_jit_hard_parks);
+    }
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_jitfail(int n, int once) {
+    g_jitfail_inject_n = (u32)n; g_jitfail_once = !!once;
+}
+
 extern volatile uint32_t g_rb_mode, g_rb_parks;   // patch 0002, defined below
 static inline void park_unregistered(u32 vaddr, u32 code_bytes) {
     s_unreg_len[vaddr] = code_bytes;
@@ -969,6 +1031,7 @@ extern "C" { extern volatile uint32_t g_idleskip; }
 void bm_ResetCache();
 extern "C" EMSCRIPTEN_KEEPALIVE void flycast_lockstep_reset(void) {
     bm_ResetCache();
+    g_jit_hard_parks = 0;   // the room anchor: every console starts the room at 0
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_idleskip(int on) {
@@ -1002,9 +1065,9 @@ static void seal_pending_shard() {
     for (auto* b : s_pending_shard) vaddrs.push_back(b->vaddr);
 
     const int count = (int)s_pending_shard.size();
-    const int base_idx = wasm_install_shard(
+    const int base_idx = install_shard_tries(
         (uintptr_t)bytes.data(), (int)bytes.size(),
-        (uintptr_t)vaddrs.data(), count);
+        vaddrs.data(), count);
 
     // Blocks whose jit_register hits the probe limit are compiled (bm_AddBlock
     // has already claimed FPCA for them) but NOT reachable via jit_lookup, so
@@ -1107,7 +1170,7 @@ static void seal_pending_shard() {
         int singles = 0, hard_failed = 0;
         for (auto* blk : s_pending_shard) {
             std::vector<u8> one = bemental::sh4::build_block(blk);
-            const int idx1 = wasm_install_block(
+            const int idx1 = install_block_tries(
                 (uintptr_t)one.data(), (int)one.size(), blk->vaddr);
             if (idx1 > 0) {
                 BlockFn fn = reinterpret_cast<BlockFn>(
@@ -1124,6 +1187,7 @@ static void seal_pending_shard() {
             }
             ++hard_failed;
             park_unregistered(blk->vaddr, blk->sh4_code_size);
+            jit_declare_park(blk->vaddr);
             static int s_bad_log = 0;
             if (s_bad_log < 8) {
                 ++s_bad_log;
@@ -1507,6 +1571,8 @@ EMSCRIPTEN_KEEPALIVE uint32_t flycast_ctx_snapshot(uint32_t which) {
         case 81: return g_syncsr_count;           // lever-5B sizing: shop_sync_sr C-fallback fires
         case 89: return g_syncfpscr_count;        // lever-10 sizing: shop_sync_fpscr C-fallback fires
         case 90: return g_idleskip_burns;         // lever-11 v0: frame-wait-spin slice burns
+        case 143: return g_jit_retry_saves;       // installs saved by a retry
+        case 144: return g_jit_hard_parks;        // installs that failed every retry (fingerprint word)
         case 140: return g_gwff_runs;             // Gauntlet wait-loop fast-forwards
         case 141: return g_gwff_passes;           // passes they applied
         case 142: return g_gwff_fallbacks;        // head arrivals run for real
@@ -1913,6 +1979,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_gwff(int on) {
     bemental_sh4_set_nolink_pc(on ? 0x8c032e5au : 0u);
 }
 
+static uintptr_t g_tw_ram_base = 0;   // what the trampoline baked as the RAM base (tripwire)
 static void wasm_block_trampoline()
 {
 #ifdef DEBUG_DISPATCH
@@ -2015,6 +2082,7 @@ static void wasm_block_trampoline()
     static uintptr_t s_ram_base = 0;
     if (!s_ram_base) {
         s_ram_base = (uintptr_t)GetMemPtr(0x0c000000, 1);
+        g_tw_ram_base = s_ram_base;   // the mainloop tripwire checks it against the live mem_b
         // GetMemPtr only resolves area-3 (sh4_mem.cpp:277-291). The build
         // path is `ram_base == nullptr` (nvmem disabled per the [flycast.log]
         // line), so addrspace::getAddress returns all nulls. Read the
@@ -2712,6 +2780,10 @@ public:
 	{
 		++g_compile_calls;
 		if (g_gwff) gwff_learn(block);
+		if (g_jitfail_inject_n && ++s_compiles_since_reset == g_jitfail_inject_n) {
+			s_jitfail_vaddr = block->vaddr;
+			s_jitfail_left = g_jitfail_once ? 1u : 0xFFFFFFFFu;
+		}
 		// Earlier-style 0x8c0133f4 diag dump that lived here was DUPLICATING the
 		// build_block() call done below at the per-block install site (line ~715),
 		// and the duplicate decl of `bytes` triggered a -Wshadow / redefinition
@@ -2848,8 +2920,8 @@ public:
 				postMessage({cmd:'print', txt: s});
 			}, (int)vaddr, (int)bytes.size(), hex.c_str());
 		}
-		int idx = wasm_install_block((uintptr_t)bytes.data(),
-		                             (int)bytes.size(), vaddr);
+		int idx = install_block_tries((uintptr_t)bytes.data(),
+		                              (int)bytes.size(), vaddr);
 		if (idx > 0) {
 			// On wasm32, casting a table index to a function pointer is
 			// the canonical way to obtain a callable funcref — `BlockFn`
@@ -2892,6 +2964,7 @@ public:
 			// span-interprets it from live RAM instead. Same treatment as the
 			// probe-limit arm above and as both shard-seal arms.
 			park_unregistered(vaddr, block->sh4_code_size);
+			jit_declare_park(vaddr);
 			static int s_inst_log = 0;
 			if (g_diag_enabled && s_inst_log < 8) {
 				s_inst_log++;
@@ -3039,6 +3112,7 @@ public:
 		// function of guest execution.
 		s_dispatches_at_last_seal = s_dispatch_count;
 		s_pending_interp = 0;
+		s_compiles_since_reset = 0;   // ?jitfailinject ordinal restarts with the table
 		// ROLLBACK DETERMINISM (patch 0001): the idle-skip streak is host
 		// history no savestate carries. Zero it on every reset so a restore
 		// starts the progress bound from the same phase on every run/peer.
@@ -3922,6 +3996,20 @@ public:
 		// RCB under a cached pointer (addrspace.cpp termMappings) — boot then
 		// ran a zeroed context from pc=0, which reads as a REIOS reboot loop
 		// and appeared or vanished with unrelated layout changes. Say so.
+		// Same for the buffer bases baked into the dispatcher and into every
+		// compiled block (area-3 fast path, VRAM store fast path): they are
+		// captured once and must stay the live mem_b / vram.
+		if ((g_tw_ram_base && g_tw_ram_base != (uintptr_t)&mem_b[0]) ||
+		    (bemental::sh4::g_vram_lin_base && bemental::sh4::g_vram_lin_base != (u32)(uintptr_t)&vram[0])) {
+			static bool s_said_buf = false;
+			if (!s_said_buf) {
+				s_said_buf = true;
+				MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt:'[ctx-tripwire] FATAL: a cached guest-memory base is stale: RAM baked 0x' +
+					($0>>>0).toString(16) + ' live 0x' + ($1>>>0).toString(16) + ', VRAM baked 0x' + ($2>>>0).toString(16) +
+					' live 0x' + ($3>>>0).toString(16) + ' (see addrspace.cpp termMappings).'}); },
+					(int)g_tw_ram_base, (int)(uintptr_t)&mem_b[0], (int)bemental::sh4::g_vram_lin_base, (int)(uintptr_t)&vram[0]);
+			}
+		}
 		if (ctx != &Sh4cntx) {
 			static bool s_said = false;
 			if (!s_said) {

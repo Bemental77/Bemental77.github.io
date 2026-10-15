@@ -1355,6 +1355,10 @@
       const c = M._flycast_guest_cycles();
       w.push(c >>> 0, Math.floor(c / 4294967296) >>> 0);
     }
+    // 14 jitParks: blocks whose install the HOST refused on every retry, so
+    // they run interpreted on this console only (rec_wasm.cpp
+    // jit_declare_park). Nonzero on one console = a declared desync.
+    if (typeof M._flycast_ctx_snapshot === 'function') w.push(M._flycast_ctx_snapshot(144) >>> 0);
     return w;
   }
   function lsHash(words) {
@@ -3132,6 +3136,15 @@
         break;
       }
 
+      case 'jitfailinject': {   // TEST: rec_wasm.cpp flycast_set_jitfail
+        try {
+          if (Module._flycast_set_jitfail) Module._flycast_set_jitfail(data.n | 0, data.once | 0);
+          postMessage({ cmd: 'print', txt: '[jitfail] armed: block #' + (data.n | 0) + ' after the next JIT reset' + (data.once ? ' (first attempt only)' : ' (every attempt)') });
+        } catch (err) {
+          postMessage({ cmd: 'print', txt: '[jitfail] threw: ' + (err && err.message ? err.message : String(err)) });
+        }
+        break;
+      }
       case 'setgwff': {
         try {
           if (Module._flycast_set_gwff) Module._flycast_set_gwff((data.on | 0));
