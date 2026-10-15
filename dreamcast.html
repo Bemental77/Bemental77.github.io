@@ -2689,6 +2689,9 @@
             setTimeout(() => worker.postMessage({ cmd: 'armhist', on: 1 }), (ha || 40) * 1000);
             setTimeout(() => worker.postMessage({ cmd: 'armhist', on: 0 }), ((ha || 40) + (hb || 20)) * 1000);
           }
+          if (qs.get('aicafast') === '0') worker.postMessage({ cmd: 'aicafast', on: 0 });   // control: upstream's per-sample AICA path
+          if (qs.get('aicahash') === '1') worker.postMessage({ cmd: 'aicahash', on: 1 });   // DIAG: audio/AICA/RAM hash per 5 guest s
+          if (qs.has('aicatime')) worker.postMessage({ cmd: 'aicatime', on: +qs.get('aicatime') | 0 });   // DIAG: 1 = AICA_Sample split, 2 = sh4_sched_tick wall, per guest second
           if (qs.get('armtime') === '1') worker.postMessage({ cmd: 'armtime', on: 1 });   // DIAG: ARM mainloop ms per guest second
           if (qs.has('divinline')) worker.postMessage({ cmd: 'divinline', on: qs.get('divinline') === '1' ? 1 : 0 });   // ARM: ?divinline=1 = SH4 div32 inline (default: the C fallback)
           if (qs.get('armmemfp') === '0') worker.postMessage({ cmd: 'armmemfp', on: 0 });   // control: ARM7 sound-RAM accesses call DoMemOp
@@ -5558,6 +5561,7 @@
     uncap:       'GUEST UNGOVERNED — the game runs FASTER than hardware',
     noidleskip:  'idle-skip OFF',
     armmemfp:    'ARM7 inline sound-RAM access OFF',
+    aicafast:    'AICA per-sample fast path OFF',
     divinline:   'SH4 inline div32 changed',
     gwff:        'Gauntlet wait fast-forward OFF',
     jitfailinject: 'TEST: injected JIT install failure',

@@ -338,6 +338,55 @@ Toaster-rate profile, this build (rate 6.2, 15 s, 7,449 samples, worker 98% busy
 - P4/TMU reads (readt + ReadMem_p4mmr) 3.0
 - JS glue ~4
 
+## 2026-10-15 — the AICA sound update: what is in it, and an exact ~1% cut (?aicafast=0 control)
+
+What the 18.6% is. It is `AicaUpdate` INCLUSIVE, and the ARM7 mainloop is 10.6 of it.
+The rest is the per-sample sound path. `?aicatime=1` (new DIAG) splits it and counts
+voices. PSO Pioneer 2 lobby: 2.0-2.4 of 64 channels enabled a sample, FEG active on
+0-0.4, `config::DSPEnabled` = 0 (the game loads an 84-step DSP program, and it never
+runs). Gauntlet attract: ~1 channel, DSP off. So there is nothing to vectorise. Mixing,
+interpolation, envelopes and DSP together are a few channel-steps a sample. The cost
+is the fixed per-sample path. A CPU profile with the parts forced out of line (rate 6.2,
+attribution only): `timeStep` 4.5% of busy. `StepAll` self 2.3%, which is the
+64-entry `enabled` scan. `__pthread_mutex_lock/unlock` in `WriteSample` 0.55%.
+`sh4_sched_tick` self 3.6%: its list walk plus an `sh4_sched_ffts` walk for every
+reschedule.
+
+Shipped, all exact, `?aicafast=0` = upstream's route:
+- `StepAll` walks a 64-bit enabled mask (`ChannelEx::enMask`) in ascending order. It
+  re-reads the mask above the channel it just stepped, so a self-disable reads the same
+  as the scan. The writers are enable/disable/deserialize, which are also the only
+  writers of `enabled`.
+- `WriteSample` (libretro audiostream, new ported file) skips the per-sample mutex
+  while ThreadedRendering is off. Every user of `audio_buffer` then runs on the
+  emulation thread.
+- `sh4_sched_request` inside `sh4_sched_tick`'s callbacks skips its own `ffts`, since the
+  tick ends with one. ffts is a pure function of (sch_list, now), and it keeps `now()` fixed.
+
+Measured. `?aicatime=2` (new DIAG) times every `sh4_sched_tick` with work, which covers
+all callbacks: AICA, ARM7, SPG, TMU. It reports ms per guest second, with the same two
+clock reads in both arms. PSO lobby, interleaved, load 1.7-5.6: on 95.5 / 93.3,
+off 100.0 / 99.1. Gauntlet attract: on 84.8, off 91.2. That is -5 to -6 ms of the ~500 /
+~800 ms of emulation, about 1%. Whole-emulation pairs (emu ms per guest second, PSO,
+load 2.7-6.5) cannot resolve it: on 509.6 / 504.1, off 495.9 / 504.3. Toaster rate 6.2,
+2 reps, load 6-13: solo on 0.592 / 0.555, off 0.563 / 0.576. Room on 0.168 / 0.186,
+off 0.212 / 0.212. Both are inside the bench's noise.
+
+Exactness, wasm `c63e673e`:
+- `?aicahash=1` (new DIAG) prints, every 5 guest s of SH4 time, a hash of the output
+  samples, the whole `aica::serialize` state (ARM7, DSP, timers, sound RAM, regs, 64
+  channels) and SH4 RAM, and checks the mask. On vs off: PSO lobby 50 windows
+  identical, and Gauntlet attract 47. Off vs off also matched (18).
+- Rollback rig REF1==REF2 61/61, REF==RB 59/59, 0 full-flush fallbacks.
+- Soaks IN SYNC: PSO lockstep 102 checkpoints, PSO forced rollback 32, Gauntlet
+  forced rollback 32.
+- Mixed rollback rooms with the joiner on `aicafast=0`: PSO and Gauntlet, 32 checkpoints
+  each, IN SYNC.
+- Boots: PSO lobby 1.000x and Gauntlet 0.999x, with screenshots.
+
+What is left in the 18.6% is the ARM7 (~68 ms per guest second in PSO, `?armtime=1`)
+and the scheduler's per-event walk. Neither is a mixing cost.
+
 ## Status
 
 - [x] Split measured: solo at 1 and 6.2, room at 6.2 for 60 s, and a worker

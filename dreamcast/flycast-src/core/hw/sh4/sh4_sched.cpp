@@ -117,6 +117,18 @@ u64 sh4_sched_now64()
 	return sh4_sched_ffb - Sh4cntx.sh4_sched_next;
 }
 
+namespace aica::sgc { extern bool g_aica_fast; }
+// [wasm port, 2026-10-15] Set while sh4_sched_tick runs its callbacks (the
+// AICA one fires 44.1K times a guest second). A reschedule from inside a
+// callback then skips its own sh4_sched_ffts(), because the tick ends with one.
+// EXACT: ffts is a pure function of (sch_list, now) and keeps now() fixed
+// (ffb -= next; next = f(); ffb += next), nothing in a callback reads
+// sh4_sched_next / ffb / next_id except through now(), and the tick's loop
+// decides what fires from sched.end and fztime alone. So one ffts at the end
+// leaves ffb, sh4_sched_next and next_id exactly as the chain of ffts did.
+// ?aicafast=0 is the control.
+static bool s_sched_in_tick = false;
+
 void sh4_sched_request(int id, int cycles)
 {
 	verify(cycles == -1 || (cycles >= 0 && cycles <= SH4_MAIN_CLOCK));
@@ -135,6 +147,8 @@ void sh4_sched_request(int id, int cycles)
 			sched.end++;
 	}
 
+	if (s_sched_in_tick)
+		return;
 	sh4_sched_ffts();
 }
 
@@ -169,7 +183,37 @@ static void handle_cb(sched_list& sched)
 		sh4_sched_request(&sched - &sch_list[0], std::max(0, re_sch - jitter));
 }
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+// DIAG (?aicatime=2): wall inside every sh4_sched_tick that has work (all
+// scheduler callbacks: AICA sample + ARM7, SPG lines, TMU, ...), in ms per
+// guest second, printed every 5 guest seconds. Two clock reads a tick, the
+// same in both ?aicafast arms, so the arm DIFFERENCE is the witness.
+namespace aica::sgc { int g_sched_time_on = 0; }
+static double s_st_ms = 0; static u32 s_st_n = 0; static u64 s_st_win = ~0ull;
+static void sh4_sched_tick_body(int cycles);
 void sh4_sched_tick(int cycles)
+{
+	if (Sh4cntx.sh4_sched_next >= 0)
+		return;
+	if (!aica::sgc::g_sched_time_on) { sh4_sched_tick_body(cycles); return; }
+	const double t0 = emscripten_get_now();
+	sh4_sched_tick_body(cycles);
+	s_st_ms += emscripten_get_now() - t0;
+	s_st_n++;
+	const u64 win = sh4_sched_now64() / (5ull * SH4_MAIN_CLOCK);
+	if (win != s_st_win)
+	{
+		if (s_st_win != ~0ull)
+			MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt:'[schedtime] w=' + $0 + ' tick=' + ($1).toFixed(1) + ' ms/guest-s n=' + $2 + ' fast=' + $3}); },
+				(int)win, s_st_ms / 5.0, s_st_n, (int)aica::sgc::g_aica_fast);
+		s_st_win = win; s_st_ms = 0; s_st_n = 0;
+	}
+}
+static void sh4_sched_tick_body(int cycles)
+#else
+void sh4_sched_tick(int cycles)
+#endif
 {
 	if (Sh4cntx.sh4_sched_next >= 0)
 		return;
@@ -177,6 +221,7 @@ void sh4_sched_tick(int cycles)
 	u32 fztime = sh4_sched_now() - cycles;
 	if (sh4_sched_next_id != -1)
 	{
+		struct InTick { InTick() { s_sched_in_tick = aica::sgc::g_aica_fast; } ~InTick() { s_sched_in_tick = false; } } inTick;   // cleared on a throw too
 		for (sched_list& sched : sch_list)
 		{
 			// Generalize the 2026-05-16 SPG VBLANK_IN scheduler-bucket fix

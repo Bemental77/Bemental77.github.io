@@ -3150,6 +3150,21 @@
         } catch (err) { postMessage({ cmd: 'print', txt: '[armmemfp] threw: ' + err }); }
         break;
       }
+      case 'aicafast': {   // sgc_if.cpp flycast_set_aicafast (0 = control: upstream's per-sample AICA path)
+        try {
+          if (Module._flycast_set_aicafast) Module._flycast_set_aicafast(data.on | 0);
+          postMessage({ cmd: 'print', txt: '[aicafast] ' + ((data.on | 0) ? 'ON' : 'OFF (control: 64-channel scan, per-sample mutex, ffts per reschedule)') });
+        } catch (err) { postMessage({ cmd: 'print', txt: '[aicafast] threw: ' + err }); }
+        break;
+      }
+      case 'aicahash': {   // DIAG: sgc_if.cpp flycast_set_aicahash (audio + AICA state + RAM hash per 5 guest s)
+        try { if (Module._flycast_set_aicahash) Module._flycast_set_aicahash(data.on | 0); } catch (err) {}
+        break;
+      }
+      case 'aicatime': {   // DIAG: sgc_if.cpp flycast_set_aicatime (AICA_Sample split per guest second)
+        try { if (Module._flycast_set_aicatime) Module._flycast_set_aicatime(data.on | 0); } catch (err) {}
+        break;
+      }
       case 'armtime': {   // DIAG: arm7_rec_wasm.cpp flycast_set_armtime
         try { if (Module._flycast_set_armtime) Module._flycast_set_armtime(data.on | 0); } catch (err) {}
         break;
