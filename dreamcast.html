@@ -2351,7 +2351,9 @@
     (/[?&]glsplit=0/.test(location.search) ? '&glsplit=0' : '') +   // control: the core draws on its own thread (flycast_worker.js GLRec)
     (/[?&]jitnames=1/.test(location.search) ? '&jitnames=1' : '') + // DIAG: emitted blocks named by guest PC in CPU profiles
     ((/[?&]rbbatch=\d+/.exec(location.search) || [''])[0].replace(/^\?/, '&')) +   // rollback-mode compile batch cap (rec_wasm.cpp rbb_compile; 1 = per-block control)
-    ((/[?&]jitdump=(all|[0-9a-f]+)/.exec(location.search) || [''])[0].replace(/^\?/, '&'));   // DIAG: dump the module holding that block
+    ((/[?&]jitdump=(all|[0-9a-f]+)/.exec(location.search) || [''])[0].replace(/^\?/, '&')) +   // DIAG: dump the module holding that block
+    // SH4 emitter levers + DIAG census (flycast_worker.js reads sh4*= / jitcensus=1 before any block compiles)
+    location.search.replace(/^\?/, '').split('&').filter((kv) => /^(sh4[a-z0-9]*|jitcensus)=/.test(kv)).map((kv) => '&' + kv).join('');
   const caps = { heapAlloc: false, lazyDisc: false, probed: false };
   const capsPromise = fetch(WORKER_URL).then((r) => {
     if (!r.ok) throw new Error('HTTP ' + r.status);

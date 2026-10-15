@@ -199,6 +199,118 @@ function flycast_name_module(bytes, vaddrOf) {
   } catch (e) { return bytes; }
 }
 
+// ?jitcensus=1 (DIAG): the executed-op census. Every installed module's code
+// section is parsed here; each function's ops are counted by class, split into
+// d0 (not inside any if/else arm) and cond (inside one). The function's entry
+// counter (wasm_emit.cpp emitCensusEntry: i32.const A; i32.const A; i32.load;
+// i32.const 1; i32.add; i32.store) names its census id, (A - base) / 4.
+// self.__dcCensusReport() weights each function's counts by its executions
+// since the previous call. Memory/stack classes come from a small abstract
+// stack: an address that is local 0 is ctx (guest registers, pc, cycles), one
+// built from local 1 is guest RAM, an i32.const is a host global.
+var flycast_census = { fn: Object.create(null), prev: null };
+function flycast_census_parse(bytes) {
+  try {
+    var M = self.Module || Module; var base = M._flycast_census_info(1) >>> 0; if (!base) return;
+    var p = 8, n = bytes.length, types = [], ftype = [], nimp = 0;
+    function u() { var r = 0, sh = 0, b; do { b = bytes[p++]; r += (b & 0x7f) * Math.pow(2, sh); sh += 7; } while (b & 0x80); return r; }
+    function s32() { var r = 0, sh = 0, b; do { b = bytes[p++]; r |= (b & 0x7f) << sh; sh += 7; } while (b & 0x80); if (sh < 32 && (b & 0x40)) r |= (-1 << sh); return r | 0; }
+    function skipLeb() { while (bytes[p++] & 0x80) {} }
+    while (p < n) {
+      var id = bytes[p++], size = u(), end = p + size;
+      if (id === 1) { var c = u(); for (var i = 0; i < c; i++) { p++; var np = u(); p += np; var nr = u(); p += nr; types.push([np, nr]); } }
+      else if (id === 2) { var c2 = u(); for (var i2 = 0; i2 < c2; i2++) { var l1 = u(); p += l1; var l2 = u(); p += l2; var k = bytes[p++];
+          if (k === 0) { ftype.push(u()); nimp++; } else if (k === 1) { p++; var fl = u(); u(); if (fl & 1) u(); } else if (k === 2) { var f2 = u(); u(); if (f2 & 1) u(); } else { p += 2; } } }
+      else if (id === 3) { var c3 = u(); for (var i3 = 0; i3 < c3; i3++) ftype.push(u()); }
+      else if (id === 10) {
+        var nf = u();
+        for (var fi = 0; fi < nf; fi++) {
+          var bsz = u(), bend = p + bsz;
+          var ng = u(); for (var g = 0; g < ng; g++) { u(); p++; }
+          var H = Object.create(null), cid = -1, ctl = [], st = [], unr = false, ifd = 0, ops = [];
+          var add = function (k) { var e = H[k] || (H[k] = [0, 0]); e[ifd > 0 ? 1 : 0]++; };
+          var pop = function () { return unr ? 'x' : (st.length ? st.pop() : 'x'); };
+          var push = function (t) { if (!unr) st.push(t); };
+          var memk = function (t) { return t === 'ctx' ? 'ctx' : (t === 'ram' ? 'ram' : (t === 'c' ? 'abs' : 'oth')); };
+          while (p < bend) {
+            var o = bytes[p++], pos = ops.length; ops.push(o);
+            if (o === 0x02 || o === 0x03 || o === 0x04) {
+              var bt = bytes[p]; var nres = 0; if (bt === 0x40) p++; else if (bt >= 0x6f && bt <= 0x7f) { p++; nres = 1; } else { var ti = s32(); nres = types[ti] ? types[ti][1] : 0; }
+              if (o === 0x04) { pop(); add('ctl.if'); } else add(o === 0x03 ? 'ctl.loop' : 'ctl.block');
+              ctl.push({ k: o, h: st.length, r: nres, u: unr }); if (o === 0x04) ifd++;
+              continue;
+            }
+            if (o === 0x05) { var fr = ctl[ctl.length - 1]; st.length = fr.h; unr = fr.u; add('ctl.else'); fr.k = 0x05; continue; }
+            if (o === 0x0b) { var f3 = ctl.pop(); if (!f3) { add('ctl.end'); break; } if (f3.k === 0x04 || f3.k === 0x05) ifd--; st.length = f3.h; unr = f3.u; for (var r1 = 0; r1 < f3.r; r1++) push('v'); add('ctl.end'); continue; }
+            if (o === 0x0c) { u(); add('ctl.br'); unr = true; st.length = 0; continue; }
+            if (o === 0x0d) { u(); pop(); add('ctl.br_if'); continue; }
+            if (o === 0x0e) { var cnt = u(); for (var q = 0; q <= cnt; q++) u(); pop(); add('ctl.br_table'); unr = true; st.length = 0; continue; }
+            if (o === 0x0f) { add('ctl.return'); unr = true; st.length = 0; continue; }
+            if (o === 0x00 || o === 0x01) { add('ctl.nop'); if (o === 0) { unr = true; st.length = 0; } continue; }
+            if (o === 0x10 || o === 0x12) { var f = u(); var ty = types[ftype[f]] || [0, 0]; for (var a1 = 0; a1 < ty[0]; a1++) pop();
+              add((o === 0x12 ? 'tail.return_call' : (f < nimp ? 'call.import' + f : 'call.local')));
+              if (o === 0x12) { unr = true; st.length = 0; } else for (var r2 = 0; r2 < ty[1]; r2++) push('v'); continue; }
+            if (o === 0x11 || o === 0x13) { var t2 = u(); u(); var ty2 = types[t2] || [0, 0]; pop(); for (var a2 = 0; a2 < ty2[0]; a2++) pop();
+              add(o === 0x13 ? 'tail.return_call_indirect' : 'call.indirect'); if (o === 0x13) { unr = true; st.length = 0; } else for (var r3 = 0; r3 < ty2[1]; r3++) push('v'); continue; }
+            if (o === 0x1a) { pop(); add('stk.drop'); continue; }
+            if (o === 0x1b) { pop(); pop(); pop(); push('v'); add('alu.select'); continue; }
+            if (o === 0x20) { var li = u(); push(li === 0 ? 'ctx' : (li === 1 ? 'rb' : 'v')); add('loc.get'); continue; }
+            if (o === 0x21) { u(); pop(); add('loc.set'); continue; }
+            if (o === 0x22) { u(); var tv = pop(); push(tv === 'c' ? 'v' : tv); add('loc.tee'); continue; }
+            if (o === 0x23) { u(); push('v'); add('glb.get'); continue; }
+            if (o === 0x24) { u(); pop(); add('glb.set'); continue; }
+            if (o >= 0x28 && o <= 0x35) { u(); var off = u(); var at = pop(); var mk = memk(at); add(mk + '.load');
+              if (mk === 'ctx') add('ctxoff.' + (off === 372 ? 'cycles' : off === 328 ? 'pc' : off === 340 ? 'T' : off === 332 ? 'jdyn' : off < 0x40 ? 'sq' : off < 0x80 ? 'xf' : off < 0xc0 ? 'fr' : off < 0x100 ? 'r' : 'sys') + '.load');
+              push('v'); continue; }
+            if (o >= 0x36 && o <= 0x3e) { u(); var off2 = u(); pop(); var at2 = pop(); var mk2 = memk(at2); add(mk2 + '.store');
+              if (mk2 === 'ctx') add('ctxoff.' + (off2 === 372 ? 'cycles' : off2 === 328 ? 'pc' : off2 === 340 ? 'T' : off2 === 332 ? 'jdyn' : off2 < 0x40 ? 'sq' : off2 < 0x80 ? 'xf' : off2 < 0xc0 ? 'fr' : off2 < 0x100 ? 'r' : 'sys') + '.store');
+              continue; }
+            if (o === 0x3f || o === 0x40) { p++; if (o === 0x40) pop(); push('v'); add('mem.size'); continue; }
+            if (o === 0x41) { var cv = s32(); push('c'); add('const.i32');
+              if (cid < 0 && bytes[p] === 0x41) { var sp = p; p++; var cv2 = s32(); if (cv2 === cv && bytes[p] === 0x28) { var idx = ((cv >>> 0) - base) / 4; if (idx >= 0 && idx === Math.floor(idx) && idx < (M._flycast_census_info(0) >>> 0) + 1) { cid = idx; } } p = sp; }
+              continue; }
+            if (o === 0x42) { skipLeb(); push('v'); add('const.i64'); continue; }
+            if (o === 0x43) { p += 4; push('v'); add('const.f'); continue; }
+            if (o === 0x44) { p += 8; push('v'); add('const.f'); continue; }
+            if (o === 0xfc) { var so = u(); if (so === 10) { p += 2; pop(); pop(); pop(); } else if (so === 11) { p += 1; pop(); pop(); pop(); } else if (so === 8) { u(); p++; pop(); pop(); pop(); } else if (so === 9) { u(); } else { pop(); push('v'); } add('bulk.' + so); continue; }
+            if (o === 0x45 || o === 0x50 || (o >= 0x67 && o <= 0x69) || (o >= 0x79 && o <= 0x7b) || (o >= 0x8b && o <= 0x91) || (o >= 0x99 && o <= 0x9f) || (o >= 0xa7 && o <= 0xc4)) {
+              pop(); push('v'); add(o === 0x45 ? 'alu.eqz' : (o >= 0xa7 ? 'cvt' : (o >= 0x8b ? 'fpu.un' : 'alu.un'))); continue; }
+            if ((o >= 0x46 && o <= 0x4f) || (o >= 0x51 && o <= 0x5a)) { pop(); pop(); push('v'); add('alu.cmp'); continue; }
+            if ((o >= 0x5b && o <= 0x66)) { pop(); pop(); push('v'); add('fpu.cmp'); continue; }
+            if ((o >= 0x6a && o <= 0x78) || (o >= 0x7c && o <= 0x8a)) { var b2 = pop(), b1 = pop();
+              push(o === 0x6a && (b1 === 'rb' || b2 === 'rb') ? 'ram' : 'v'); add(o === 0x6a || o === 0x7c ? 'alu.add' : (o === 0x71 || o === 0x83) ? 'alu.and' : 'alu.bin'); continue; }
+            if ((o >= 0x92 && o <= 0x98) || (o >= 0xa0 && o <= 0xa6)) { pop(); pop(); push('v'); add('fpu.bin'); continue; }
+            add('unk.' + o.toString(16)); p = bend; break;
+          }
+          p = bend;
+          if (cid >= 0) { H['const.i32'][0] -= 3; H['abs.load'][0] -= 1; H['abs.store'][0] -= 1; H['alu.add'][0] -= 1; flycast_census.fn[cid] = H; }
+        }
+      }
+      p = end;
+    }
+  } catch (e) { flycast_census.err = String(e); }
+}
+self.__dcCensusReport = function (top) {
+  var M = self.Module || Module; top = top || 40;
+  var N = M._flycast_census_info(0) >>> 0, C = M._flycast_census_info(1) >>> 2, V = M._flycast_census_info(2) >>> 2, G = M._flycast_census_info(3) >>> 2, Y = M._flycast_census_info(4) >>> 2;
+  var cur = new Uint32Array(N); for (var i = 0; i < N; i++) cur[i] = HEAPU32[C + i];
+  var prev = flycast_census.prev; flycast_census.prev = cur;
+  var tot = Object.create(null), W = 0, GO = 0, CY = 0, missing = 0, blocks = [];
+  for (var j = 0; j < N; j++) {
+    var w = (cur[j] - (prev && j < prev.length ? prev[j] : 0)) >>> 0; if (!w) continue;
+    var H = flycast_census.fn[j]; if (!H) { missing += w; continue; }
+    W += w; GO += w * HEAPU32[G + j]; CY += w * HEAPU32[Y + j];
+    var d0 = 0; for (var k in H) { var e = tot[k] || (tot[k] = [0, 0]); e[0] += w * H[k][0]; e[1] += w * H[k][1]; if (k.indexOf('ctxoff.') !== 0) d0 += H[k][0]; }
+    blocks.push([j, w, d0]);
+  }
+  var D0 = 0, CO = 0; for (var k2 in tot) if (k2.indexOf('ctxoff.') !== 0) { D0 += tot[k2][0]; CO += tot[k2][1]; }
+  blocks.sort(function (a, b) { return b[1] * b[2] - a[1] * a[2]; });
+  return { trace: [5, 6, 7, 8, 9].map(function (i) { return M._flycast_census_info(i) >>> 0; }), entries: W, entriesMissing: missing, guestOps: GO, guestCycles: CY, d0: D0, cond: CO, d0PerGuestOp: GO ? D0 / GO : 0, condPerGuestOp: GO ? CO / GO : 0,
+    guestOpsPerEntry: W ? GO / W : 0, parseErr: flycast_census.err || '',
+    classes: Object.keys(tot).sort(function (a, b) { return tot[b][0] - tot[a][0]; }).map(function (k) { return [k, tot[k][0], tot[k][1]]; }),
+    top: blocks.slice(0, top).map(function (x) { return [(HEAPU32[V + x[0]] >>> 0).toString(16), x[1], HEAPU32[G + x[0]], x[2]]; }) };
+};
+
 function flycast_install_block(bytesPtr, len, vaddr) {
   bytesPtr = bytesPtr >>> 0;
   len      = len      >>> 0;
@@ -206,6 +318,7 @@ function flycast_install_block(bytesPtr, len, vaddr) {
   try {
     var src   = HEAPU8.subarray(bytesPtr, bytesPtr + len);
     var bytes = new Uint8Array(src);
+    if (self.__dcJitCensus) flycast_census_parse(bytes);
     if (self.__dcJitNames) bytes = flycast_name_module(bytes, function () { return vaddr; });
     var mod   = new WebAssembly.Module(bytes);
     if (!flycast_wasm_imports) {
@@ -264,6 +377,7 @@ function flycast_install_shard(bytesPtr, len, vaddrsPtr, count) {
   try {
     var src   = HEAPU8.subarray(bytesPtr, bytesPtr + len);
     var bytes = new Uint8Array(src);
+    if (self.__dcJitCensus) flycast_census_parse(bytes);
     if (self.__dcJitNames) bytes = flycast_name_module(bytes, function (i) { return HEAPU32[(vaddrsPtr >>> 2) + i]; });
     var mod   = new WebAssembly.Module(bytes);
     if (!flycast_wasm_imports) {

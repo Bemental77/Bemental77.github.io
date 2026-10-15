@@ -814,3 +814,36 @@ Gauntlet's attract is a video decode at 94% executed guest time: ~6x short at 6.
       That is the user's call to grant.
 - [ ] After that, lever 1 then lever 2, each measured on `tools/toaster_bench.mjs`,
       kept IN SYNC on `room_desync_soak.mjs`, and confirmed by screenshot.
+
+## 2026-10-15 (later) — SH4 emitter: executed-op census, and deferred first-use register loads (?sh4lazy=0 control)
+
+**Census** (`?jitcensus=1`, DIAG; `toaster_split.mjs --census F`): static ops per function weighted
+by per-function entry counters. Unconditional wasm ops per guest SH4 instruction: Gauntlet attract
+12.6 (+24.0 inside if-arms), PSO lobby 13.0 (+22.7); ~10 guest instructions per block entry.
+Ctx (guest register / pc / cycle) loads + stores are ~1.7 per instruction.
+
+**Instruction-level truth** (`perf record -e cpu-clock` + V8 `--perf-prof`, `perf inject --jit`;
+the box has no PMU, so cpu-clock sampling). Gauntlet attract, worker samples: emitted code 64%,
+all of it TurboFan (Liftoff 0.05%). Emitted-code samples by x86 instruction: **stack spill
+loads+stores 12.7%**, ctx loads 4.9% / stores 6.5%, guest RAM 6.3%, globals 7.8%, branches 7.9%.
+The eager prologue kept every cached register live across the whole block, and TurboFan spilled
+them. (SwiftShader rasterizer threads take ~56% of the box's CPU in that run.)
+
+**Shipped: deferred first-use loads** (`wasm_emit.cpp computeDeferAt`, `?sh4lazy=0` = control).
+A read-first register is loaded right before the first op that names it (a top-level point in
+the oplist, never inside an emitter's if-arm). Exit-only registers keep the prologue load. Off for
+self-loops, traces and the memset path. In-run A/B, Gauntlet attract, rate 1, 30 s arms, load
+1.7: **946.9 vs 990.9 emu ms per guest second (-4.4%)**.
+Exact, wasm `ad2e6aff`: rollback rig REF1==REF2 61/61, REF==RB 59/59; PSO lockstep soak IN SYNC
+(52 RAM checkpoints + 52 fingerprints); mixed Gauntlet forced-rollback room, joiner `?sh4lazy=0`,
+IN SYNC (32 + 32, 39/48 rollbacks); boot 1.000x; verify_core_tree PASS.
+
+**Measured null or worse, shipped OFF** (in-run A/B, Gauntlet):
+- `?sh4sb=1`: loop superblocks over guest code. The planner now searches both arms of a
+  conditional and decodes members that are not in the shard batch (`trace_decode`). 886.9 vs 880.4.
+  The old LEVER-12 planner never formed the hot poll loop (0x8c05c952→960→986): it follows the
+  fall-through arm, and its members span shards.
+- `?sh4frm=1`: FR registers in f32 locals through fmov.s loads/stores and int<->FR moves.
+  899.1 vs 877.3 (12 s arms) and 805.8 vs 794.7 (30 s arms).
+- A node micro-bench prices a block hop at ~2.4 ns (direct return_call) vs ~3.7 ns (indirect,
+  cross-instance), so hop transport itself is small.
