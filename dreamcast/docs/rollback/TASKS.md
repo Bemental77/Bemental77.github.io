@@ -97,12 +97,16 @@ Gauntlet room is delay lockstep (`?dcrb=N` opts any disc in, for testing).
 * **Cost.** A rollback frame here costs run + ~5 ms save; at depth 4 a whole
   step is ~140–210 ms p50 against a 33 ms frame, so rollback is only
   affordable with real headroom. The toaster (rate 6.2) cannot run it at all.
-* **Room start in rollback mode compiles 2.3x slower**: per-block install
-  costs 1.48 s for the 6,245 blocks of the first lobby frame vs 0.31 s
-  sharded (+ later seals) — `ctx_snapshot` 110/111. Deterministic batching
-  (compile a miss together with its static successors into one module, every
-  member live before it runs) plus an FPSCR-mode guard on FPU blocks is the
-  fix; not done.
+* ~~**Room start in rollback mode compiles 2.3x slower**~~ — **batched
+  (2026-10-15, `rec_wasm.cpp` `rbb_compile`, `?rbbatch=N`, 1 = per-block
+  control)**: a miss compiles with up to 31 static successors into one module,
+  every member registered before the miss runs, FPU members confirmed at first
+  entry (FPSCR/SR.FD guard). Exact (rig 61/61 + 59/59, cold==warm). The win is
+  only ~10-20% of the refill: the 2.3x compared per-block install with a
+  sharded refill whose compiles are deferred (pending blocks span-interpret), and
+  `new WebAssembly.Module` is ~14% of a per-block refill. On a slow console the
+  room now starts in input delay instead (dreamcast.html declares a step
+  estimate at Ready). Numbers: dreamcast/docs/toaster-split/TASKS.md.
 
 ### Commands
 

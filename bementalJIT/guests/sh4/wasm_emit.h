@@ -367,4 +367,12 @@ std::vector<u8> build_block(RuntimeBlockInfo* block);
 // just skip install in that case).
 std::vector<u8> build_blocks(const std::vector<RuntimeBlockInfo*>& blocks);
 
+// ROLLBACK-MODE BATCH (2026-10-15, rec_wasm.cpp rbb_compile). Same module
+// envelope as build_blocks — N functions run_0..run_<N-1> in ONE module, so
+// one WebAssembly.Module + Instance serves N blocks — but NO sibling maps: every
+// function body is exactly the one build_block would emit for that block (no
+// intra-module tail-link, no trace), so each member routes and verifies like a
+// per-block install.
+std::vector<u8> build_blocks_unlinked(const std::vector<RuntimeBlockInfo*>& blocks);
+
 } // namespace bemental::sh4
