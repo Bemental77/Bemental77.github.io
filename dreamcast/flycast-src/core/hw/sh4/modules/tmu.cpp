@@ -87,6 +87,21 @@ extern "C" u32 tmu_tcnt_read_direct(u32 ch)
 	}
 }
 
+// [wasm port, 2026-10-15] Side-effect-free model of a TCNTn read, for the PSO
+// wait-loop fast-forward (flycast-bridge/rec_wasm.cpp pswff_try). It returns the
+// raw count read_TMU_TCNTch would compute if now() were `at` (so a caller can
+// ask what a read made N guest cycles from now would see), and tmu_now_cycles()
+// returns now() itself. A negative value is the case where the real read would
+// reload the counter and raise the underflow; the caller must not skip that read.
+extern "C" s64 tmu_tcnt_model(u32 ch, u64 at)
+{
+	return tmu_ch_base[ch] - ((at >> tmu_shift[ch]) & tmu_mask[ch]);
+}
+extern "C" u64 tmu_now_cycles()
+{
+	return now();
+}
+
 template<u32 ch>
 static void write_TMU_TCNT(u32 addr, u32 data) {
 	write_TMU_TCNTch(ch, data);
