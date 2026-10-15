@@ -380,6 +380,20 @@ if (SAVEST) {
   await page.evaluate(() => document.getElementById('btnSave').click());
   await sleep(8000);
   say('Save State clicked (see the page log for the persisted line)');
+  // --statefile PATH: also write that savestate (IndexedDB key state:<game>) to a file,
+  // for rigs that restore it (dreamcast/tools/toaster_split.mjs --state).
+  const SF = arg('--statefile', '');
+  if (SF) {
+    const b64 = await page.evaluate((g) => new Promise((res) => {
+      const r = indexedDB.open('dc-savestates', 1);
+      r.onsuccess = () => { const q = r.result.transaction('states', 'readonly').objectStore('states').get(g === 'pso2' ? 'pso2' : 'state:' + g);
+        q.onsuccess = () => { const v = q.result; if (!v) return res(''); const u = new Uint8Array(v.buffer || v); let s = ''; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); res(btoa(s)); };
+        q.onerror = () => res(''); };
+      r.onerror = () => res('');
+    }), GAME);
+    if (b64) { fs.writeFileSync(SF, Buffer.from(b64, 'base64')); say('statefile written ' + SF + ' (' + Buffer.from(b64, 'base64').length + ' B)'); }
+    else say('statefile: no savestate in IndexedDB');
+  }
 }
 
 // ---------------------------------------------------------------------------

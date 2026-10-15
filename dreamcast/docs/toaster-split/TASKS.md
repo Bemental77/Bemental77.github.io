@@ -830,15 +830,49 @@ The eager prologue kept every cached register live across the whole block, and T
 them. (SwiftShader rasterizer threads take ~56% of the box's CPU in that run.)
 
 **Shipped: deferred first-use loads** (`wasm_emit.cpp computeDeferAt`, `?sh4lazy=0` = control).
-A read-first register is loaded right before the first op that names it (a top-level point in
-the oplist, never inside an emitter's if-arm). Exit-only registers keep the prologue load. Off for
-self-loops, traces and the memset path. In-run A/B, Gauntlet attract, rate 1, 30 s arms, load
-1.7: **946.9 vs 990.9 emu ms per guest second (-4.4%)**.
-Exact, wasm `ad2e6aff`: rollback rig REF1==REF2 61/61, REF==RB 59/59; PSO lockstep soak IN SYNC
-(52 RAM checkpoints + 52 fingerprints); mixed Gauntlet forced-rollback room, joiner `?sh4lazy=0`,
-IN SYNC (32 + 32, 39/48 rollbacks); boot 1.000x; verify_core_tree PASS.
+A read-first register is loaded right before the first op that names it. That point is
+top level in the oplist, never inside an emitter's if-arm. Exit-only registers keep the
+prologue load. Off for self-loops, traces and the memset path. Exact, wasm `ad2e6aff`:
+- rollback rig REF1==REF2 61/61, REF==RB 59/59;
+- PSO lockstep soak IN SYNC (52 RAM checkpoints + 52 fingerprints);
+- mixed Gauntlet forced-rollback room, joiner `?sh4lazy=0`, IN SYNC (32 + 32);
+- boot 1.000x.
 
-**Measured null or worse, shipped OFF** (in-run A/B, Gauntlet):
+The -4.4% first reported for it (Gauntlet attract) was rig bias, see below. On the fixed rig,
+PSO lobby: **561.0 vs 562.5, null**.
+
+### ⚠ The in-run A/B was biased (fixed 2026-10-15)
+
+`toaster_split --ab` counted the FIRST arm window. That window follows the cold start (boot,
+state load, first compile), not a flush from the other arm. Placebo runs (`--ab NAME:SECS:1:1`:
+the same value in both arms, the same flushes) read the first arm slow:
+- PSO lobby: +4.5%;
+- Gauntlet attract: +8.5%.
+
+That window is now discarded, and the PSO placebo reads +1.2%. Gauntlet's **cold-boot attract
+cannot carry an in-run A/B at all**: it is a fixed sequence, so arms land on the same scenes
+every run (placebo +14% after the fix).
+
+For Gauntlet, use `dreamcast/states/gauntlet_level1_wizard.state`, gameplay in level 1 made by
+`gauntlet_p2_probe.mjs --savestate --statefile`. Add `--abreload`, which re-loads the state at
+every switch: the idle level times out to the title after a few minutes. Placebo there: +2.0%.
+**The rig's floor is about ±2%.**
+
+Fixed-rig numbers:
+
+| knob | scene | on | off | placebo, same scene | verdict |
+|---|---|---|---|---|---|
+| sh4lazy | PSO lobby, rate 1 | 561.0 | 562.5 | +1.2% | null, kept (exact) |
+| sh4smcbr: branch-guarded SMC generation bump | PSO lobby | 581.2 | 574.2 | +1.2% | null, OFF |
+| sh4plink: per-arm cond-exit sibling link | PSO lobby | 509.9 | 500.9 | +1.2% | null, OFF |
+| divinline | Gauntlet level, reload | 478.0 | 476.3 | +2.0% | null |
+| g2ff | bench, rate 6.2, 8 s arms | 961.4 | 1021.5 | -3.0% (957.1 / 986.6) | ~-3%, kept |
+| armff | bench, rate 6.2 | 956.1 | 1009.2 | -3.0% | ~-2%, kept |
+
+`?sh4early=1` (store a register at its last definition) is unpriced: its one A/B was the biased
+Gauntlet attract. Shipped OFF.
+
+**Shipped OFF, measured only on the biased Gauntlet-attract rig (unpriced):**
 - `?sh4sb=1`: loop superblocks over guest code. The planner now searches both arms of a
   conditional and decodes members that are not in the shard batch (`trace_decode`). 886.9 vs 880.4.
   The old LEVER-12 planner never formed the hot poll loop (0x8c05c952→960→986): it follows the

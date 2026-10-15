@@ -39,6 +39,11 @@ const prof = +fl('prof') || 0, shot = fl('shot'), room = a.includes('--room');
 // lie wholly inside one arm (the first after each switch is dropped). Interleaving at this
 // grain cancels the box's drift, which run-to-run pairs cannot (they read +-8% here).
 const ab = fl('ab'); const [abName, abSecs] = ab ? [ab.split(':')[0], +(ab.split(':')[1] || 5)] : [null, 0];
+// NAME:SECS:V1:V0 sends V1 / V0 for the two arms (default 1 / 0); NAME:SECS:1:1 is a placebo with the same flushes.
+const abVal = ab && ab.split(':').length >= 4 ? { 1: ab.split(':')[2], 0: ab.split(':')[3] } : { 1: '1', 0: '0' };
+// The FIRST arm window is discarded: it follows the cold start (boot / state load / first
+// compile), not a flush from the other arm, and read +4.5..8.5% slow in placebo runs (1:1).
+let abSwitch = 0;
 let abArm = null, abNext = 0, abSkip = 0, abSess = null; const abAcc = { 1: { e: 0, x: 0, n: 0 }, 0: { e: 0, x: 0, n: 0 } };
 const BASE = process.env.BASE_URL || 'http://localhost:8080';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -55,6 +60,9 @@ p.on('pageerror', (e) => errs.push(String(e.message).slice(0, 200)));
 const dumpF = fl('dump'); let dumpBuf = null, dumpN = 0;
 const censF = fl('census'); let censState = 0;
 const peekA = fl('peek');
+// --abreload: with --state, every arm switch also re-loads that state, so every arm window
+// replays the same guest seconds (a scene that drifts, e.g. an idle level timing out to the title).
+const abReload = a.includes('--abreload');
 const stateF = fl('state'); let stateHb = -1;
 const settled = (r) => r.booted && !r.rest && r.hbr >= 3 && (!stateF || (stateHb >= 0 && r.hb >= stateHb + 5));
 p.on('console', (m) => { const t = m.text();
@@ -72,19 +80,19 @@ while (Date.now() - t0 < (secs + 240 * Math.max(1, rate / 3)) * 1000) {
     // --state PATH (repo-relative): replace the bench scene with a savestate through the worker's own loadState
     const wt = b.targets().find((t) => /worker|other/.test(t.type()) && /flycast_worker\.js/.test(t.url()));
     const cs = wt && await wt.createCDPSession().catch(() => null);
-    const ev = cs && await cs.send('Runtime.evaluate', { awaitPromise: true, returnByValue: true, expression: `fetch('/${stateF}').then((x) => x.arrayBuffer()).then((buf) => { self.onmessage({ data: { cmd: 'loadState', data: buf } }); return buf.byteLength; })` }).catch((e) => ({ result: { value: String(e) } }));
+    const ev = cs && await cs.send('Runtime.evaluate', { awaitPromise: true, returnByValue: true, expression: `fetch('/${stateF}').then((x) => x.arrayBuffer()).then((buf) => { self.__abState = buf.slice(0); self.onmessage({ data: { cmd: 'loadState', data: buf } }); return buf.byteLength; })` }).catch((e) => ({ result: { value: String(e) } }));
     console.log('state ' + stateF + ' applied: ' + JSON.stringify(ev && ev.result && ev.result.value)); stateHb = r.hb; if (cs) await cs.detach().catch(() => {});
   }
   if (abName && settled(r) && Date.now() >= abNext && !r.done) {
     const wt = b.targets().find((t) => /worker|other/.test(t.type()) && /flycast_worker\.js/.test(t.url()));
     if (wt && !abSess) { abSess = await wt.createCDPSession().catch((e) => { console.log('ab session failed ' + e); return null; }); }
-    if (abSess) { abArm = abArm === 1 ? 0 : 1;
-      const ev = await abSess.send('Runtime.evaluate', { expression: abName.startsWith('js.') ? `self.${abName.slice(3)} = ${abArm ? 'true' : 'false'}; 1` : `self.Module._flycast_set_${abName}(${abArm}); 1` }).catch((e) => ({ exceptionDetails: String(e) }));
+    if (abSess) { abArm = abArm === 1 ? 0 : 1; abSwitch++;
+      const ev = await abSess.send('Runtime.evaluate', { expression: (abName.startsWith('js.') ? `self.${abName.slice(3)} = ${abArm ? 'true' : 'false'}; 1` : `self.Module._flycast_set_${abName}(${abVal[abArm]}); 1`) + (stateF && abReload ? `; self.__abState && self.onmessage({ data: { cmd: 'loadState', data: self.__abState.slice(0) } }); 1` : '') }).catch((e) => ({ exceptionDetails: String(e) }));
       if (ev.exceptionDetails) console.log('ab set failed ' + JSON.stringify(ev.exceptionDetails).slice(0, 200));
       abNext = Date.now() + abSecs * 1000; abSkip = 2; }
   }
   if (r.booted && (!rows.length || rows[rows.length - 1].hb !== r.hb)) { rows.push(r); const pc = r.pace || {}; const f = r.fs || {};
-    if (abArm !== null) { if (abSkip > 0) abSkip--; else if (+r.aicaX > 0) { const A = abAcc[abArm]; A.e += +pc.emu; A.w = (A.w || 0) + (+pc.wall - (+pc.paced || 0)); A.x += +r.aicaX; A.n++; } }
+    if (abArm !== null && abSwitch >= 2) { if (abSkip > 0) abSkip--; else if (+r.aicaX > 0) { const A = abAcc[abArm]; A.e += +pc.emu; A.w = (A.w || 0) + (+pc.wall - (+pc.paced || 0)); A.x += +r.aicaX; A.n++; } }
     console.log(`hb${r.hb} x=${(+r.aicaX).toFixed(3)} fps=${r.fps} emu=${pc.emu} held=${pc.held} gate=${pc.gate} paced=${pc.paced} wall=${pc.wall} drop=${pc.drop} fs=${f.frames}/${f.drawn}/${f.skipped}/${f.lagSkips}` + (r.j && r.j.pace ? ` | J x=${(+r.j.x).toFixed(3)} emu=${r.j.pace.emu} held=${r.j.pace.held} gate=${r.j.pace.gate} paced=${r.j.pace.paced} drop=${r.j.pace.drop}` : '')); }
   if (prof && !profd && settled(r)) {
     profd = true;

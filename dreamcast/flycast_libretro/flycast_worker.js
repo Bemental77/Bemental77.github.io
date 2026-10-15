@@ -767,7 +767,10 @@
         const sb = /[?&]sh4sb=(\d)/.exec(qs); if (sb && Module._flycast_set_sb) Module._flycast_set_sb(+sb[1]);
         const frm = /[?&]sh4frm=(\d)/.exec(qs); if (frm && Module._flycast_set_frm) Module._flycast_set_frm(+frm[1]);
         const lz = /[?&]sh4lazy=(\d)/.exec(qs); if (lz && Module._flycast_set_lazy) Module._flycast_set_lazy(+lz[1]);
-        if (self.__dcJitCensus || tm || sb || frm || lz) postMessage({ cmd: 'print', txt: '[sh4emit] census=' + (self.__dcJitCensus ? 1 : 0) + ' trace=' + (tm ? tm[1] : '-') + ' sb=' + (sb ? sb[1] : '-') + ' frm=' + (frm ? frm[1] : '-') + ' lazy=' + (lz ? lz[1] : '-') });
+        const ef = /[?&]sh4early=(\d)/.exec(qs); if (ef && Module._flycast_set_early) Module._flycast_set_early(+ef[1]);
+        const sm = /[?&]sh4smcbr=(\d)/.exec(qs); if (sm && Module._flycast_set_smcbr) Module._flycast_set_smcbr(+sm[1]);
+        const pl = /[?&]sh4plink=(\d)/.exec(qs); if (pl && Module._flycast_set_plink) Module._flycast_set_plink(+pl[1]);
+        if (self.__dcJitCensus || tm || sb || frm || lz || ef || sm || pl) postMessage({ cmd: 'print', txt: '[sh4emit] census=' + (self.__dcJitCensus ? 1 : 0) + ' trace=' + (tm ? tm[1] : '-') + ' sb=' + (sb ? sb[1] : '-') + ' frm=' + (frm ? frm[1] : '-') + ' lazy=' + (lz ? lz[1] : '-') + ' early=' + (ef ? ef[1] : '-') + ' smcbr=' + (sm ? sm[1] : '-') + ' plink=' + (pl ? pl[1] : '-') });
       } catch (e) { postMessage({ cmd: 'print', txt: '[sh4emit] knobs threw: ' + e }); }
       coreReady = true;
       maybePostReady();

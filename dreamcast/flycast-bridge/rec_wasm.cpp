@@ -1219,7 +1219,7 @@ extern "C" void bemental_sh4_set_trace_hooks(RuntimeBlockInfo* (*dec)(u32, Runti
 extern "C" void bemental_sh4_set_trace_decode(int on);
 extern "C" void bemental_sh4_set_trace(int mode);
 // ?sh4sb=1 arms loop superblocks over guest code (default OFF).
-static bool s_sb_on = false;   // measured null on Gauntlet in-run (886.9 vs 880.4 ms/guest-s): shipped OFF, ?sh4sb=1 arms
+static bool s_sb_on = false;   // Gauntlet attract A/B (886.9 vs 880.4) predates the rig fix: unpriced, shipped OFF, ?sh4sb=1 arms
 static void sb_apply() {
     bemental_sh4_set_trace_hooks(trace_decode, trace_pc_ok);
     bemental_sh4_set_trace_decode(s_sb_on ? 1 : 0);
@@ -1238,6 +1238,27 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_frm(int on) {
 extern "C" void bemental_sh4_set_lazy_load(int on);
 extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_lazy(int on) {
     bemental_sh4_set_lazy_load(on);
+    bm_ResetCache();
+}
+// ?sh4early=0: the control for storing a register at its last definition
+// (wasm_emit.cpp g_emit_early_flush). COMPILE-time.
+extern "C" void bemental_sh4_set_early_flush(int on);
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_early(int on) {
+    bemental_sh4_set_early_flush(on);
+    bm_ResetCache();
+}
+// ?sh4smcbr=0: the control for the branch-guarded SMC generation bump on guest
+// RAM stores (wasm_emit.cpp g_emit_smc_branch). COMPILE-time.
+extern "C" void bemental_sh4_set_smc_branch(int on);
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_smcbr(int on) {
+    bemental_sh4_set_smc_branch(on);
+    bm_ResetCache();
+}
+// ?sh4plink=0: the control for per-arm intra-shard linking of conditional exits
+// (wasm_emit.cpp g_emit_partial_link). COMPILE-time.
+extern "C" void bemental_sh4_set_partial_link(int on);
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_plink(int on) {
+    bemental_sh4_set_partial_link(on);
     bm_ResetCache();
 }
 extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_sb(int on) {
