@@ -197,6 +197,38 @@ emitted SH4 code at 55% of busy time and FLAT: the hottest block is 1.2%, and th
 30th is 0.17%. The remaining dispatcher share is the SH4_TIMESLICE (448) round
 trip, about 446K a guest second.
 
+## Tried and rejected 2026-10-15: AICA + ARM7 on their own pthread
+
+The design is in the reflog: local commits acf7c1b..63c7e42, never pushed.
+- The SH4 thread posted sample k at its own guest time T_k and kept running.
+- A pthread ran `arm::run(1)` for that sample.
+- Every SH4 access to AICA space (sb_mem.cpp area 0, the aica_if.cpp G2 DMA) and every
+  savestate first waited for the posted sample.
+- The AICA -> SH4 IRQ level was re-derived on the SH4 thread at T_k+1, at most one sample late.
+
+Semantics were otherwise exact. Measured how often the SH4 touches AICA space:
+
+| scene | accesses/s | distinct sample periods/s with an access |
+|---|---|---|
+| PSO Pioneer 2 lobby | 45.6K | 2.8K (of 44.1K) |
+| Gauntlet | — | ~70 |
+
+So the coupling is loose enough on paper. On this box it lost badly:
+
+| run | without the thread | with the thread |
+|---|---|---|
+| PSO lobby at 1.000x, emu ms per guest second | 442 | 559-733 |
+| toaster rate 6.2, solo | 0.684 | 0.343 |
+
+Instrumented: the AICA thread was busy only ~10% of wall (2.2 us a sample).
+The SH4 still waited at 78% of samples, about 7.6 us each, ~25% of wall in all.
+The cause: a spinning thread gets descheduled while idle, then misses the next
+post. That happens on a box whose four cores are already shared with SwiftShader,
+the render worker and the browser, and under the toaster's duty cycle. A per-sample
+handoff needs a core of its own. A batched handoff (lag L samples) would shift
+SPU-IRQ timing by L samples. It would also still pay a full sync at every SH4 AICA
+access, and with a sleeping thread that sync costs a wake latency. Not pursued.
+
 ## Status
 
 - [x] Split measured: solo at 1 and 6.2, room at 6.2 for 60 s, and a worker
