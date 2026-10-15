@@ -44,13 +44,23 @@ const BASE = process.env.BASE_URL || 'http://localhost:8080';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const udd = fs.mkdtempSync(path.join(os.tmpdir(), 'toaster-split-'));
 const b = await puppeteer.launch({ executablePath: process.env.CHROME_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome', headless: 'new', userDataDir: udd,
-  args: ['--no-sandbox', '--autoplay-policy=no-user-gesture-required', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--js-flags=--max-old-space-size=512'], protocolTimeout: 600000 });
+  args: ['--no-sandbox', '--autoplay-policy=no-user-gesture-required', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--js-flags=--max-old-space-size=512' + (process.env.TS_JSFLAGS ? ' ' + process.env.TS_JSFLAGS : '')], protocolTimeout: 600000 });
 guard.guard(b, 'dreamcast/tools/toaster_split.mjs');
 let duty = null;
 if (rate > 1) duty = spawn('python3', [path.join(ROOT, 'tools/toaster_duty.py'), String(b.process().pid), String(rate), '2'], { stdio: 'ignore' });
 const p = await b.newPage(); const errs = [];
 p.on('pageerror', (e) => errs.push(String(e.message).slice(0, 200)));
-p.on('console', (m) => { const t = m.text(); if (/error|threw|desync/i.test(t)) errs.push(t.slice(0, 200)); if (/\[split\]/.test(t)) console.log('  ' + t.replace(/^.*\[split\]/, '[split]').slice(0, 260)); if (/\[(pchist|pswff|gwff|xff|g2|ctxsnap|setg2|armhist|armcode|armtime|aicatime|armff|setarmff|b2ff|setb2ff|lazydisc|glcount)/.test(t)) console.log('  ' + t.slice(0, /ctxsnap/.test(t) ? 4000 : 520)); if (/\[peek\]/.test(t)) console.log(t); });
+// --dump F: write every [jitdump] module (?jitdump=<pc>|all) to F.<n>.wasm. --census F: at the end, write the
+// worker's ?jitcensus=1 report (self.__dcCensusReport) to F as JSON.
+const dumpF = fl('dump'); let dumpBuf = null, dumpN = 0;
+const censF = fl('census'); let censState = 0;
+const peekA = fl('peek');
+const stateF = fl('state'); let stateHb = -1;
+const settled = (r) => r.booted && !r.rest && r.hbr >= 3 && (!stateF || (stateHb >= 0 && r.hb >= stateHb + 5));
+p.on('console', (m) => { const t = m.text();
+  if (dumpF && /\[jitdump\]/.test(t)) { const body = t.replace(/^.*\[jitdump\] /, '');
+    if (/^begin/.test(body)) dumpBuf = []; else if (/^end/.test(body)) { if (dumpBuf) fs.writeFileSync(dumpF + '.' + (dumpN++) + '.wasm', Buffer.from(dumpBuf.join(''), 'base64')); dumpBuf = null; }
+    else if (dumpBuf) dumpBuf.push(body.split(' ')[1] || ''); return; } if (/error|threw|desync/i.test(t)) errs.push(t.slice(0, 200)); if (/\[split\]/.test(t)) console.log('  ' + t.replace(/^.*\[split\]/, '[split]').slice(0, 260)); if (/\[(sh4emit|pchist|pswff|gwff|xff|g2|ctxsnap|setg2|armhist|armcode|armtime|aicatime|armff|setarmff|b2ff|setb2ff|lazydisc|glcount)/.test(t)) console.log('  ' + t.slice(0, /ctxsnap/.test(t) ? 4000 : 520)); if (/\[peek\]/.test(t)) console.log(t); });
 const code = 'Z' + Math.random().toString(36).slice(2, 6).toUpperCase().replace(/[^A-Z2-9]/g, 'Q');
 await p.goto(room ? `${BASE}/dreamcast.html?bench=1&benchauto=1&benchsec=${secs}&benchphase=room&np=${code}&host=1&net=local&game=pso2${extra}` : `${BASE}/dreamcast.html?bench=1&benchauto=1&benchroom=0&benchsec=${secs}${extra}`, { waitUntil: 'load', timeout: 180000 });
 const rows = []; let profd = false; const t0 = Date.now();
@@ -58,7 +68,14 @@ while (Date.now() - t0 < (secs + 240 * Math.max(1, rate / 3)) * 1000) {
   await sleep(1000);
   const r = await p.evaluate(() => { const q = window.__dcProbe && window.__dcProbe(); return q && { hb: q.hb, booted: q.booted, aicaX: q.aicaX, fps: q.fps, pace: q.pace, fs: q.fskip, rest: q.restoring, hbr: q.hbSinceRestore, done: !!window.__benchResult, res: window.__benchResult && (window.__benchResult.room || window.__benchResult.solo), j: (() => { try { const f = document.querySelector('iframe'); const q = f && f.contentWindow.__dcProbe && f.contentWindow.__dcProbe(); return q && { x: q.aicaX, pace: q.pace, fs: q.fskip }; } catch (e) { return null; } })() }; }).catch(() => null);
   if (!r) continue;
-  if (abName && r.booted && !r.rest && r.hbr >= 3 && Date.now() >= abNext && !r.done) {
+  if (stateF && r.booted && !r.rest && r.hbr >= 3 && stateHb < 0) {
+    // --state PATH (repo-relative): replace the bench scene with a savestate through the worker's own loadState
+    const wt = b.targets().find((t) => /worker|other/.test(t.type()) && /flycast_worker\.js/.test(t.url()));
+    const cs = wt && await wt.createCDPSession().catch(() => null);
+    const ev = cs && await cs.send('Runtime.evaluate', { awaitPromise: true, returnByValue: true, expression: `fetch('/${stateF}').then((x) => x.arrayBuffer()).then((buf) => { self.onmessage({ data: { cmd: 'loadState', data: buf } }); return buf.byteLength; })` }).catch((e) => ({ result: { value: String(e) } }));
+    console.log('state ' + stateF + ' applied: ' + JSON.stringify(ev && ev.result && ev.result.value)); stateHb = r.hb; if (cs) await cs.detach().catch(() => {});
+  }
+  if (abName && settled(r) && Date.now() >= abNext && !r.done) {
     const wt = b.targets().find((t) => /worker|other/.test(t.type()) && /flycast_worker\.js/.test(t.url()));
     if (wt && !abSess) { abSess = await wt.createCDPSession().catch((e) => { console.log('ab session failed ' + e); return null; }); }
     if (abSess) { abArm = abArm === 1 ? 0 : 1;
@@ -69,12 +86,25 @@ while (Date.now() - t0 < (secs + 240 * Math.max(1, rate / 3)) * 1000) {
   if (r.booted && (!rows.length || rows[rows.length - 1].hb !== r.hb)) { rows.push(r); const pc = r.pace || {}; const f = r.fs || {};
     if (abArm !== null) { if (abSkip > 0) abSkip--; else if (+r.aicaX > 0) { const A = abAcc[abArm]; A.e += +pc.emu; A.w = (A.w || 0) + (+pc.wall - (+pc.paced || 0)); A.x += +r.aicaX; A.n++; } }
     console.log(`hb${r.hb} x=${(+r.aicaX).toFixed(3)} fps=${r.fps} emu=${pc.emu} held=${pc.held} gate=${pc.gate} paced=${pc.paced} wall=${pc.wall} drop=${pc.drop} fs=${f.frames}/${f.drawn}/${f.skipped}/${f.lagSkips}` + (r.j && r.j.pace ? ` | J x=${(+r.j.x).toFixed(3)} emu=${r.j.pace.emu} held=${r.j.pace.held} gate=${r.j.pace.gate} paced=${r.j.pace.paced} drop=${r.j.pace.drop}` : '')); }
-  if (prof && !profd && r.booted && !r.rest && r.hbr >= 3) {
+  if (prof && !profd && settled(r)) {
     profd = true;
     const wt = b.targets().find((t) => /worker|other/.test(t.type()) && /flycast_worker\.js/.test(t.url()));
     if (wt) { const s = await wt.createCDPSession(); await s.send('Profiler.enable'); await s.send('Profiler.setSamplingInterval', { interval: 200 }); await s.send('Profiler.start');
       await sleep(prof * 1000); const { profile } = await s.send('Profiler.stop'); fs.writeFileSync(fl('profout') || '/tmp/dcsplit.cpuprofile', JSON.stringify(profile)); console.log('profile saved'); }
     else console.log('no worker target', b.targets().map((t) => t.type() + ' ' + t.url()).join('\n'));
+  }
+  if (censF && settled(r) && (censState === 0 || (censState === 1 && r.done))) {
+    const wt = b.targets().find((t) => /worker|other/.test(t.type()) && /flycast_worker\.js/.test(t.url()));
+    const cs = wt && await wt.createCDPSession().catch(() => null);
+    const ev = cs && await cs.send('Runtime.evaluate', { expression: 'JSON.stringify(self.__dcCensusReport ? self.__dcCensusReport(60) : null)', returnByValue: true }).catch((e) => ({ result: { value: String(e) } }));
+    if (censState === 1) { fs.writeFileSync(censF, (ev && ev.result && ev.result.value) || 'null'); console.log('census saved ' + censF); }
+    censState++; if (cs) await cs.detach().catch(() => {});
+  }
+  if (peekA && r.done) {   // --peek ADDR:BYTES:FILE — guest memory at the end of the run (SH4 view, 16-bit reads)
+    const [pa, pn, pf] = peekA.split(':'); const wt = b.targets().find((t) => /worker|other/.test(t.type()) && /flycast_worker\.js/.test(t.url()));
+    const cs = wt && await wt.createCDPSession().catch(() => null);
+    const ev = cs && await cs.send('Runtime.evaluate', { returnByValue: true, expression: `(function(){ const o = []; for (let i = 0; i < ${+pn}; i += 2) o.push(self.Module._sh4_mem_read16((0x${pa} + i) >>> 0) & 0xffff); return o; })()` }).catch(() => null);
+    if (ev && ev.result && ev.result.value) { fs.writeFileSync(pf, Buffer.from(new Uint16Array(ev.result.value).buffer)); console.log('peek saved ' + pf); }
   }
   if (r.done) { console.log('RESULT', JSON.stringify(r.res && { speed: r.res.speed, over: r.res.over, frames: r.res.frames, ms: r.res.ms })); break; }
 }

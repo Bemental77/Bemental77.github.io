@@ -756,6 +756,19 @@
       } catch (e) {
         postMessage({ cmd: 'print', txt: '[flycast-shim] worker_init threw: ' + (e && e.message ? e.message : String(e)) });
       }
+      // SH4 emitter knobs read from the worker URL, applied before any block
+      // compiles (each setter also flushes the JIT). ?jitcensus=1 = DIAG executed-op
+      // census (flycast_worker_funcs.js; read with self.__dcCensusReport()).
+      // ?sh4trace=N = LEVER-12 trace formation (0 off, the default).
+      try {
+        const qs = self.location.search;
+        if (/[?&]jitcensus=1/.test(qs) && Module._flycast_set_census) { self.__dcJitCensus = true; Module._flycast_set_census(1); }
+        const tm = /[?&]sh4trace=(\d)/.exec(qs); if (tm && Module._flycast_set_trace) Module._flycast_set_trace(+tm[1]);
+        const sb = /[?&]sh4sb=(\d)/.exec(qs); if (sb && Module._flycast_set_sb) Module._flycast_set_sb(+sb[1]);
+        const frm = /[?&]sh4frm=(\d)/.exec(qs); if (frm && Module._flycast_set_frm) Module._flycast_set_frm(+frm[1]);
+        const lz = /[?&]sh4lazy=(\d)/.exec(qs); if (lz && Module._flycast_set_lazy) Module._flycast_set_lazy(+lz[1]);
+        if (self.__dcJitCensus || tm || sb || frm || lz) postMessage({ cmd: 'print', txt: '[sh4emit] census=' + (self.__dcJitCensus ? 1 : 0) + ' trace=' + (tm ? tm[1] : '-') + ' sb=' + (sb ? sb[1] : '-') + ' frm=' + (frm ? frm[1] : '-') + ' lazy=' + (lz ? lz[1] : '-') });
+      } catch (e) { postMessage({ cmd: 'print', txt: '[sh4emit] knobs threw: ' + e }); }
       coreReady = true;
       maybePostReady();
     } catch (err) {

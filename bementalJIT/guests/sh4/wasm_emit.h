@@ -115,6 +115,10 @@ struct RegCacheEntry {
     // prologue's `local.get ctx; load off; local.set L` is dead work — the
     // local is written before anything can read it. Set by computeNoPreload().
     bool preload;
+    // ?sh4lazy (deferred first-use load): >= 0 = the index of the first op
+    // that references this offset; the prologue skips it and the load is
+    // emitted right before that op, at top level. -1 = loaded at the prologue.
+    int deferAt = -1;
 };
 
 struct RegCache {
@@ -271,7 +275,7 @@ struct RegCache {
     // ctx memory is authoritative for EVERY entry.
     void reloadPrologue(WasmModuleBuilder& b) {
         for (auto& kv : entries) {
-            if (!kv.second.preload) { kv.second.dirty = false; continue; }
+            if (!kv.second.preload || kv.second.deferAt >= 0) { kv.second.dirty = false; continue; }
             b.op_local_get(LOCAL_CTX);
             if (kv.second.isF32) b.op_f32_load(kv.first);
             else                 b.op_i32_load(kv.first);
@@ -280,6 +284,16 @@ struct RegCache {
         }
     }
 
+    // Emit the deferred loads whose first reference is op `idx` (top level).
+    void loadDeferred(WasmModuleBuilder& b, int idx) {
+        for (auto& kv : entries) {
+            if (kv.second.deferAt != idx) continue;
+            b.op_local_get(0);
+            if (kv.second.isF32) b.op_f32_load(kv.first);
+            else                 b.op_i32_load(kv.first);
+            b.op_local_set(kv.second.wasmLocal);
+        }
+    }
     void setNoPreload(u32 ctxOffset) {
         auto it = entries.find(ctxOffset);
         if (it != entries.end()) it->second.preload = false;

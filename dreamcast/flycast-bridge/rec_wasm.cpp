@@ -580,6 +580,24 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_divinline(int on) {
     bemental_sh4_set_div_inline(on);
     bm_ResetCache();
 }
+// ?jitcensus=1 (DIAG): per-function entry counters for the executed-op census
+// (wasm_emit.cpp emitCensusEntry; the worker joins them with its parse of every
+// installed module). COMPILE-time: flushes so every block is rebuilt counted.
+extern "C" void bemental_sh4_set_census(int on);
+extern "C" uint32_t bemental_sh4_census_info(int i);
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_census(int on) {
+    bemental_sh4_set_census(on);
+    bm_ResetCache();
+}
+static u32 g_trace_decodes_fwd(int i);
+extern "C" EMSCRIPTEN_KEEPALIVE uint32_t flycast_census_info(int i) { return i >= 8 ? g_trace_decodes_fwd(i) : bemental_sh4_census_info(i); }
+// LEVER-12 trace formation (wasm_emit.cpp planTrace; 0 off = default, 1 loop
+// traces, 2 + straight-line). COMPILE-time: flushes.
+extern "C" void bemental_sh4_set_trace(int mode);
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_trace(int mode) {
+    bemental_sh4_set_trace(mode);
+    bm_ResetCache();
+}
 extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_chain(int on) {
     g_chain_enabled = !!on;
 }
@@ -1141,11 +1159,101 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_rb_reset_host_history(void) {
 // we read it (no forward decl needed) to drive the SHARD_DISPATCH_SEAL
 // fallback so a low-rate boot phase doesn't leave blocks pending forever.
 
+// ---- SUPERBLOCK MEMBERS FROM GUEST CODE (wasm_emit.cpp planTrace; ?sh4sb=0 = control) ----
+// A trace may inline a successor that the shard batch does not hold; it is
+// decoded here, at seal time, from guest RAM with the head's FPU config, under
+// the rollback-mode batch decode's guards (main RAM, even pc, MMU off, SR.FD
+// clear, no delay-slot branch, not a cache-reset pc). Its code words are marked
+// in the SMC map, so a write to them bumps g_ic_generation and the member's
+// generation guard leaves the trace before running stale code. Members live in
+// s_trace_pool until the seal's build returns. trace_pc_ok vetoes every pc the
+// trampoline must see on each arrival (idle skip, the gwff/pswff/g2ff paths,
+// whose fast-forwards need each of their blocks compiled and live).
+static std::vector<RuntimeBlockInfo*> s_trace_pool;
+static std::unordered_map<u64, RuntimeBlockInfo*> s_trace_memo;
+static u32 g_trace_decodes = 0, g_trace_decode_fails = 0;
+static bool trace_pc_ok(u32 v) {
+    if (v >= 0x8c3c53d8u && v <= 0x8c3c53f8u) return false;   // idle-skip spin
+    if (v >= 0x8c032e20u && v < 0x8c032f00u) return false;    // gwff loop
+    if (v >= 0x8c038440u && v < 0x8c0384a0u) return false;
+    if (v >= 0x8c036600u && v < 0x8c036608u) return false;
+    if (v >= 0x8c38d480u && v < 0x8c38d4b0u) return false;    // pswff pass
+    if (v >= 0x8c37a8b8u && v < 0x8c37b6b0u) return false;    // g2ff path + pswff helpers
+    if (s_g2_watch && v == s_g2_watch) return false;
+    return true;
+}
+static bool trace_scan_ok(u32 pc) {
+    for (u32 i = 0; i < 512; i++, pc += 2) {
+        if (!vaddr_in_ram(pc) || !vaddr_in_ram(pc + 2)) return false;
+        const sh4_opcodelistentry* d = OpDesc[IReadMem16(pc)];
+        if (!d) return false;
+        if (d->SetPC()) {
+            if (d->type & Delayslot) {
+                const sh4_opcodelistentry* n = OpDesc[IReadMem16(pc + 2)];
+                if (!n || n->SetPC()) return false;
+            }
+            return true;
+        }
+    }
+    return true;
+}
+static RuntimeBlockInfo* trace_decode(u32 sv, RuntimeBlockInfo* head) {
+    if (g_rb_mode || mmu_enabled() || Sh4cntx.sr.FD) return nullptr;
+    if ((sv & 1) || !vaddr_in_ram(sv)) return nullptr;
+    if (sv == 0x8c0000e0u || sv == 0xac010000u || sv == 0xac008300u) return nullptr;
+    if (s_unreg_len.count(sv)) return nullptr;
+    const u64 key = ((u64)head->fpu_cfg.full << 32) | sv;
+    auto it = s_trace_memo.find(key);
+    if (it != s_trace_memo.end()) return it->second;
+    RuntimeBlockInfo* r = nullptr;
+    if (trace_scan_ok(sv)) {
+        r = new RuntimeBlockInfo();
+        if (!r->Setup(sv, head->fpu_cfg)) { delete r; r = nullptr; }
+    }
+    if (r) { r->blockcheck_failures = 0; code_pages_mark_block(sv, r->sh4_code_size); s_trace_pool.push_back(r); ++g_trace_decodes; }
+    else ++g_trace_decode_fails;
+    s_trace_memo[key] = r;
+    return r;
+}
+extern "C" void bemental_sh4_set_trace_hooks(RuntimeBlockInfo* (*dec)(u32, RuntimeBlockInfo*), bool (*ok)(u32));
+extern "C" void bemental_sh4_set_trace_decode(int on);
+extern "C" void bemental_sh4_set_trace(int mode);
+// ?sh4sb=1 arms loop superblocks over guest code (default OFF).
+static bool s_sb_on = false;   // measured null on Gauntlet in-run (886.9 vs 880.4 ms/guest-s): shipped OFF, ?sh4sb=1 arms
+static void sb_apply() {
+    bemental_sh4_set_trace_hooks(trace_decode, trace_pc_ok);
+    bemental_sh4_set_trace_decode(s_sb_on ? 1 : 0);
+    bemental_sh4_set_trace(s_sb_on ? 1 : 0);
+}
+void bm_ResetCache();
+// ?sh4frm=0: the control for FR registers kept in f32 locals across fmov.s
+// loads/stores and int<->FR moves (wasm_emit.cpp g_emit_fr_mem). COMPILE-time.
+extern "C" void bemental_sh4_set_fr_mem(int on);
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_frm(int on) {
+    bemental_sh4_set_fr_mem(on);
+    bm_ResetCache();
+}
+// ?sh4lazy=0: the control for deferred first-use register loads (wasm_emit.cpp
+// g_emit_lazy_load). COMPILE-time.
+extern "C" void bemental_sh4_set_lazy_load(int on);
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_lazy(int on) {
+    bemental_sh4_set_lazy_load(on);
+    bm_ResetCache();
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_sb(int on) {
+    s_sb_on = !!on;
+    sb_apply();
+    bm_ResetCache();
+}
+
+static u32 g_trace_decodes_fwd(int i) { return i == 8 ? g_trace_decodes : i == 9 ? g_trace_decode_fails : 0; }
 static void seal_pending_shard() {
     s_pending_interp = 0;
     if (s_pending_shard.empty()) return;
 
     std::vector<u8> bytes = bemental::sh4::build_blocks(s_pending_shard);
+    for (auto* r : s_trace_pool) delete r;
+    s_trace_pool.clear(); s_trace_memo.clear();
 
     std::vector<u32> vaddrs;
     vaddrs.reserve(s_pending_shard.size());
@@ -3337,6 +3445,7 @@ public:
 		INFO_LOG(DYNAREC, "[rec_wasm] init");
 		bemental_sh4_set_nolink_pc(g_gwff ? 0x8c032e5au : 0u);
 		bemental_sh4_set_nolink_pc2(0x8c38d480u);   // every arm (flycast_set_pswff)
+		sb_apply();   // superblocks (?sh4sb=0 = control)
 	}
 
 	// -----------------------------------------------------------------------

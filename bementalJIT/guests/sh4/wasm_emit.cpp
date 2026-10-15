@@ -23,6 +23,7 @@
 #include "hw/sh4/dyna/ngen.h"
 
 #include <cstdio>
+#include <functional>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -685,6 +686,13 @@ static inline void emitLoadParamCached(WasmModuleBuilder& b, const shil_param& p
         b.op_i32_const((s32)p._imm);
         return;
     }
+    // ?sh4frm (FR registers in f32 locals on the integer paths too): an
+    // offset with an f32 entry is read as its bits (scanBlocksF32 admits only
+    // ops whose emitters reach the register through these three helpers).
+    if (p.is_reg()) {
+        s32 fl = cache.getLocalF32(p.reg_offset());
+        if (fl >= 0) { b.op_local_get((u32)fl); b.op_i32_reinterpret_f32(); return; }
+    }
     if (p.is_r32i()) {
         s32 local = cache.getLocal(p.reg_offset());
         if (local >= 0) {
@@ -710,6 +718,7 @@ static inline void emitLoadParamCached(WasmModuleBuilder& b, const shil_param& p
 // emitPreStore: push ctx_ptr ONLY if rd is not cached (paired with emitPostStore).
 static inline void emitPreStore(WasmModuleBuilder& b, const shil_param& rd,
                                 const RegCache& cache) {
+    if (rd.is_reg() && cache.getLocalF32(rd.reg_offset()) >= 0) return;   // ?sh4frm
     if (rd.is_r32i() && cache.getLocal(rd.reg_offset()) >= 0) {
         // 6A: an UNLOADED reg stored inside a conditional arm must go to ctx
         // (a local.set there would leave the other arm's path reading a
@@ -725,6 +734,10 @@ static inline void emitPreStore(WasmModuleBuilder& b, const shil_param& rd,
 // the canonical value — mark loaded so subsequent reads skip the lazy fetch.
 static inline void emitPostStore(WasmModuleBuilder& b, const shil_param& rd,
                                  RegCache& cache) {
+    if (rd.is_reg()) {                                                     // ?sh4frm
+        s32 fl = cache.getLocalF32(rd.reg_offset());
+        if (fl >= 0) { b.op_f32_reinterpret_i32(); b.op_local_set((u32)fl); cache.markDirty(rd.reg_offset()); return; }
+    }
     if (rd.is_r32i()) {
         s32 local = cache.getLocal(rd.reg_offset());
         if (local >= 0 &&
@@ -3746,6 +3759,9 @@ static void emitMemsetFastPath(WasmModuleBuilder& b, RuntimeBlockInfo* block,
 // pairs, and the raw-bank natives fipr/ftrv/frswap (v2 can make those
 // cache-aware; v1 keeps them memory-direct and airtight). An excluded offset
 // gets NO entry, so both paths stay ctx-direct and can never desync.
+// ?sh4frm (default OFF; 1 arms): fmov.s loads/stores and int<->FR moves
+// keep their FR register in its f32 local instead of excluding it from the cache.
+bool g_emit_fr_mem = false;   // measured +1.4..2.5% WORSE in-run on Gauntlet: shipped OFF, ?sh4frm=1 arms
 static bool fpu_f32_helper_op(u32 opnum) {
     switch (opnum) {
     case shop_fadd: case shop_fsub: case shop_fmul: case shop_fdiv:
@@ -3790,6 +3806,23 @@ static void scanBlocksF32(RuntimeBlockInfo* const* blks, size_t nblk, RegCache& 
             addTo(cand, op.rd.reg_offset());
             addTo(cand, op.rs1.reg_offset());
             continue;
+        }
+        // ?sh4frm: a 32-bit fmov.s load/store and an int<->FR mov32 reach the FR
+        // side only through emitLoadParamCached / emitPreStore / emitPostStore,
+        // which move the bits through the f32 local (reinterpret), so these are
+        // candidates rather than exclusions. Pairs (size 8) stay excluded.
+        if (g_emit_fr_mem && !s_lazy_regcache_enabled) {
+            if (op.op == shop_readm && op.size == 4 && op.rd.is_r32f() && !op.rs1.is_r32f() && !op.rs3.is_r32f()) {
+                addTo(cand, op.rd.reg_offset()); continue;
+            }
+            if (op.op == shop_writem && op.size == 4 && op.rs2.is_r32f() && !op.rs1.is_r32f() && !op.rs3.is_r32f()) {
+                addTo(cand, op.rs2.reg_offset()); continue;
+            }
+            if (op.op == shop_mov32 && (op.rd.is_r32f() || op.rs1.is_r32f())) {
+                if (op.rd.is_r32f()) addTo(cand, op.rd.reg_offset());
+                if (op.rs1.is_r32f()) addTo(cand, op.rs1.reg_offset());
+                continue;
+            }
         }
         switch (op.op) {
         case shop_fipr:
@@ -3945,6 +3978,43 @@ static void computeNoPreload(RuntimeBlockInfo* blk, RegCache& cache)
         if (kv.second == 2) cache.setNoPreload(kv.first);
 }
 
+// ?sh4lazy (default ON; 0 = the control): DEFERRED FIRST-USE LOADS. The eager
+// prologue loaded every cached register at block entry, so each was live in a
+// local across the whole block; on long blocks (Gauntlet's decode, ~25 cached
+// offsets) TurboFan spilled them to the stack and reloaded them at their use —
+// a perf sample of the worker put 12.7% of emitted-code samples on stack spill
+// traffic, more than on the ctx loads themselves. Now a read-first register is
+// loaded right before the first op that names it (always a top-level point in
+// the oplist, never inside an emitter's if-arm, which is what sank the old lazy
+// cache 6A). Registers no op names (the exit's jdyn / sr.T) keep the prologue
+// load. A barrier op before the first use flushes nothing for it (it is not
+// dirty) and its reloadAll loads it; the later deferred load then re-reads the
+// same ctx word. Off for self-loops, traces and the memset path, whose bodies
+// re-enter or branch before the oplist.
+bool g_emit_lazy_load = true;
+static void computeDeferAt(RuntimeBlockInfo* blk, RegCache& cache)
+{
+    if (blk == nullptr) return;
+    std::vector<u32> offs;
+    std::unordered_map<u32, int> first;
+    auto mark = [&](const shil_param& p, int i) {
+        offs.clear();
+        appendParamOffsets(p, offs);
+        for (u32 o : offs) first.emplace(o, i);
+    };
+    for (size_t i = 0; i < blk->oplist.size(); ++i) {
+        const shil_opcode& op = blk->oplist[i];
+        mark(op.rs1, (int)i); mark(op.rs2, (int)i); mark(op.rs3, (int)i);
+        mark(op.rd, (int)i); mark(op.rd2, (int)i);
+        if (op.op == shop_jdyn || op.op == shop_jcond) first.emplace(ctx_off::JDYN, (int)i);
+    }
+    for (auto& kv : cache.entries) {
+        if (!kv.second.preload) continue;          // defined first: no load at all
+        auto it = first.find(kv.first);
+        if (it != first.end() && it->second > 0) kv.second.deferAt = it->second;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LEVER-12 trace formation — planning half (see the g_emit_trace comment).
 // ---------------------------------------------------------------------------
@@ -4005,7 +4075,7 @@ static bool traceBlockEligible(RuntimeBlockInfo* blk, RuntimeBlockInfo* head) {
 //   everything else          -> no continuation (the trace ends here and the
 //                               member's own emitBlockExit closes it).
 // Returns false when there is no trace continuation.
-static bool traceChooseSucc(RuntimeBlockInfo* blk, RuntimeBlockInfo* head,
+[[maybe_unused]] static bool traceChooseSucc(RuntimeBlockInfo* blk, RuntimeBlockInfo* head,
                             const std::unordered_map<u32, RuntimeBlockInfo*>* v2b,
                             u32* out_succ, bool* out_taken_is_cont, u32* out_side)
 {
@@ -4037,7 +4107,37 @@ static bool traceChooseSucc(RuntimeBlockInfo* blk, RuntimeBlockInfo* head,
 struct TracePlan {
     std::vector<RuntimeBlockInfo*> blocks;   // blocks[0] == head
     bool is_loop = false;                    // last member's successor == head
+    // Per member: the successor the trace continues to, whether that is the
+    // TAKEN arm (cond) or the only target (static), and the side-exit target
+    // (cond only). For the last member of a non-loop trace these are unused.
+    std::vector<u32>  succ, side;
+    std::vector<bool> taken_cont;
+    std::vector<bool> decoded;               // member decoded for this trace (not a batch block)
 };
+
+// SUPERBLOCK MEMBERS FROM GUEST CODE (?sh4sb, 2026-10-15). LEVER-12 could only
+// inline blocks that happened to be sealed in the same shard batch, and it
+// followed the FALL-THROUGH arm of a conditional, so the hot loops it was built
+// for rarely formed (Gauntlet's attract poll 0x8c05c952 -> 960 -> 986 -> 952
+// takes the branch and spans shards). With these hooks the planner decodes a
+// successor from guest RAM when the batch does not hold it (rec_wasm.cpp
+// trace_decode: same guards as the rollback-mode batch decode, decoded with the
+// head's FPU config, its code words marked in the SMC map), and searches BOTH
+// arms of every conditional for a path back to the head. A decoded member always
+// carries the SMC generation guard. g_trace_pc_ok_cb vetoes every pc the
+// dispatcher must see on each arrival (idle skip, gwff/pswff/g2ff heads): such
+// a pc is never inlined, and never heads a loop trace.
+RuntimeBlockInfo* (*g_trace_decode_cb)(u32 vaddr, RuntimeBlockInfo* head) = nullptr;
+bool (*g_trace_pc_ok_cb)(u32 vaddr) = nullptr;
+bool g_trace_decode = false;     // ?sh4sb: allow decoded members (shipped default set below)
+
+static bool traceWritesFpscr(RuntimeBlockInfo* blk) {
+    for (const shil_opcode& op : blk->oplist) {
+        if (op.rd.is_reg()  && op.rd._reg  == reg_fpscr) return true;
+        if (op.rd2.is_reg() && op.rd2._reg == reg_fpscr) return true;
+    }
+    return false;
+}
 
 static TracePlan planTrace(RuntimeBlockInfo* head,
                            const std::unordered_map<u32, RuntimeBlockInfo*>* v2b)
@@ -4045,59 +4145,129 @@ static TracePlan planTrace(RuntimeBlockInfo* head,
     TracePlan plan;
     if (g_emit_trace <= 0 || head == nullptr || v2b == nullptr) return plan;
     if (!g_emit_regcache || s_lazy_regcache_enabled) return plan;  // eager cache only
-    // ---- risk-3 valve: never let trace formation be what exhausts the IC ----
-    // A trace's side exits allocate g_ic sites, and a straight-line trace
-    // duplicates its TAIL member's whole exit into every prefix that reaches it,
-    // so per-block site consumption can multiply. Measured offline (emit_dump
-    // `sizes`, 256-block single-page shards): the FLYCAST_TRACE=1 loop shape is
-    // EXACTLY neutral (1.00 sites/block on and off), but the FLYCAST_TRACE=2
-    // 4-block-static-chain shape goes 0.50 -> 2.00 sites/block, a 4x multiplier
-    // — the worst case the default limits permit. Real-run anchor: PSO's longest
-    // run with icn telemetry (/tmp/dc-probes/R-CAPX.log) compiled 11767 blocks
-    // and reached g_ic_next = 12220, i.e. 1.04 sites/block, so the table (65536)
-    // exhausts near 63K blocks today but near 15.8K blocks under a worst-case
-    // TRACE=2 workload — only 1.34x the observed high-water.
-    // Why that matters beyond capacity: have_ic degrades GRACEFULLY per site, so
-    // exhaustion is silent, and in a matched pair the TRACED arm would exhaust
-    // FIRST — every block compiled after the crossover loses its IC in the ON arm
-    // while the same block still has one in the OFF arm. That reads as a trace
-    // regression and is not one. Stopping trace formation at 3/4 of the table
-    // makes trace-attributable exhaustion impossible: the remaining quarter is
-    // reserved for the plain per-block exits, which is what the arm without
-    // traces would have spent anyway. Nothing observed comes near this bound.
+    // risk-3 valve (see the LEVER-12 note): never let traces exhaust the IC.
     if (g_ic_next >= IC_SITES - (IC_SITES / 4)) return plan;
-    // The head must not be a shape a proven in-block fastpath already owns.
     if (detectMemsetByteLoop(head).detected) return plan;
     if (BET_GET_CLS(head->BlockType) == BET_CLS_COND && head->BranchBlock == head->vaddr)
         return plan;
     if (!traceBlockEligible(head, nullptr)) return plan;
+    if (g_trace_pc_ok_cb && !g_trace_pc_ok_cb(head->vaddr)) return plan;
+    const bool can_decode = g_trace_decode && g_trace_decode_cb != nullptr && g_ic_generation != 0;
 
-    plan.blocks.push_back(head);
+    // A member, from the batch or decoded. nullptr = not available / not eligible.
+    auto lookup = [&](u32 v, bool* dec) -> RuntimeBlockInfo* {
+        *dec = false;
+        if (v == NullAddress || v == head->vaddr) return nullptr;
+        if (g_emit_nolink_pc && v == g_emit_nolink_pc) return nullptr;
+        if (g_emit_nolink_pc2 && v == g_emit_nolink_pc2) return nullptr;
+        if (g_trace_pc_ok_cb && !g_trace_pc_ok_cb(v)) return nullptr;
+        RuntimeBlockInfo* r = nullptr;
+        auto it = v2b->find(v);
+        if (it != v2b->end()) r = it->second;
+        else if (can_decode) { r = g_trace_decode_cb(v, head); *dec = (r != nullptr); }
+        if (r == nullptr || !traceBlockEligible(r, head)) return nullptr;
+        if (r->has_fpu_op && (r->fpu_cfg.PR != head->fpu_cfg.PR || r->fpu_cfg.SZ != head->fpu_cfg.SZ)) return nullptr;
+        return r;
+    };
+    // Successor list of a member, loop-closing candidates first: for a
+    // conditional, the backward arm before the forward one.
+    auto succs = [&](RuntimeBlockInfo* blk, u32* t, bool* tk, u32* sd) -> int {
+        if (blk->BlockType == BET_StaticJump) { t[0] = blk->BranchBlock; tk[0] = true; sd[0] = 0; return 1; }
+        if (BET_GET_CLS(blk->BlockType) != BET_CLS_COND) return 0;
+        const u32 tkn = blk->BranchBlock, fall = blk->NextBlock;
+        if (tkn == fall) return 0;
+        if (tkn <= blk->vaddr) { t[0] = tkn; tk[0] = true; sd[0] = fall; t[1] = fall; tk[1] = false; sd[1] = tkn; }
+        else                   { t[0] = fall; tk[0] = false; sd[0] = tkn; t[1] = tkn; tk[1] = true; sd[1] = fall; }
+        return 2;
+    };
+
+    // 1. A loop back to the head, depth-first over both arms.
+    std::vector<RuntimeBlockInfo*> path{ head };
+    std::vector<u32> psucc, pside; std::vector<bool> ptk, pdec{ false };
     u32 ops = (u32)head->oplist.size();
-    RuntimeBlockInfo* cur = head;
-    for (;;) {
-        u32 succ = 0, side = 0; bool taken_is_cont = false;
-        if (!traceChooseSucc(cur, head, v2b, &succ, &taken_is_cont, &side)) break;
-        if (succ == head->vaddr) { plan.is_loop = true; break; }   // loop closes
-        if (plan.blocks.size() >= g_trace_max_blocks) break;
-        auto it = v2b->find(succ);
-        if (it == v2b->end() || it->second == nullptr) break;       // out of shard
-        RuntimeBlockInfo* nxt = it->second;
-        if (nxt == cur) break;
-        bool already = false;
-        for (auto* m : plan.blocks) if (m == nxt || m->vaddr == nxt->vaddr) already = true;
-        if (already) break;                    // only head-closing cycles are modelled
-        if (!traceBlockEligible(nxt, head)) break;
-        if (ops + (u32)nxt->oplist.size() > g_trace_max_ops) break;
-        plan.blocks.push_back(nxt);
-        ops += (u32)nxt->oplist.size();
-        cur = nxt;
+    std::function<bool(RuntimeBlockInfo*)> dfs = [&](RuntimeBlockInfo* cur) -> bool {
+        u32 t[2], sd[2]; bool tk[2];
+        const int n = succs(cur, t, tk, sd);
+        for (int k = 0; k < n; ++k) {
+            if (t[k] == head->vaddr) {
+                psucc.push_back(t[k]); ptk.push_back(tk[k]); pside.push_back(sd[k]);
+                return true;
+            }
+        }
+        if (path.size() >= g_trace_max_blocks) return false;
+        for (int k = 0; k < n; ++k) {
+            bool dec = false;
+            bool seen = false;
+            for (auto* m : path) if (m->vaddr == t[k]) seen = true;
+            if (seen) continue;
+            RuntimeBlockInfo* nx = lookup(t[k], &dec);
+            if (nx == nullptr) continue;
+            if (ops + (u32)nx->oplist.size() > g_trace_max_ops) continue;
+            psucc.push_back(t[k]); ptk.push_back(tk[k]); pside.push_back(sd[k]);
+            path.push_back(nx); pdec.push_back(dec); ops += (u32)nx->oplist.size();
+            if (dfs(nx)) return true;
+            path.pop_back(); pdec.pop_back(); ops -= (u32)nx->oplist.size();
+            psucc.pop_back(); ptk.pop_back(); pside.pop_back();
+        }
+        return false;
+    };
+    if (dfs(head) && path.size() >= 2) {
+        plan.blocks = path; plan.is_loop = true;
+        plan.succ = psucc; plan.side = pside; plan.taken_cont = ptk; plan.decoded = pdec;
+    } else if (g_emit_trace >= 2) {
+        // 2. Straight line: static jumps, and the fall-through of a conditional.
+        plan.blocks.push_back(head); plan.decoded.push_back(false);
+        ops = (u32)head->oplist.size();
+        RuntimeBlockInfo* cur = head;
+        while (plan.blocks.size() < g_trace_max_blocks) {
+            u32 t[2], sd[2]; bool tk[2];
+            const int n = succs(cur, t, tk, sd);
+            if (n == 0) break;
+            const int k = (n == 2 && tk[0]) ? 1 : 0;   // the fall-through arm
+            bool dec = false, seen = false;
+            for (auto* m : plan.blocks) if (m->vaddr == t[k]) seen = true;
+            if (seen) break;
+            RuntimeBlockInfo* nx = lookup(t[k], &dec);
+            if (nx == nullptr || ops + (u32)nx->oplist.size() > g_trace_max_ops) break;
+            plan.succ.push_back(t[k]); plan.taken_cont.push_back(tk[k]); plan.side.push_back(sd[k]);
+            plan.blocks.push_back(nx); plan.decoded.push_back(dec); ops += (u32)nx->oplist.size();
+            cur = nx;
+        }
+        if (plan.blocks.size() < 2) plan = TracePlan{};
     }
-    // A 1-block "trace" is just the normal path; a loop trace needs >= 2 members
-    // (the 1-block self-loop is the self-loop lever's job).
-    if (plan.blocks.size() < 2) { plan.blocks.clear(); plan.is_loop = false; }
-    if (!plan.is_loop && g_emit_trace < 2) { plan.blocks.clear(); }
+    if (!plan.blocks.empty()) {
+        for (auto* m : plan.blocks) if (traceWritesFpscr(m)) { plan = TracePlan{}; break; }
+    }
+    // Pad the per-member arrays for the last member of a straight-line trace.
+    while (plan.succ.size() < plan.blocks.size()) { plan.succ.push_back(0); plan.side.push_back(0); plan.taken_cont.push_back(false); }
     return plan;
+}
+
+// ---------------------------------------------------------------------------
+// EXECUTED-OP CENSUS (DIAG, ?jitcensus=1; OFF by default, emits nothing when
+// off). Each compiled function gets one entry counter, bumped after the slice
+// precheck. The worker parses every installed module's code section, counts
+// ops per function (unconditional vs inside an if arm) and finds each
+// function's counter by the address of the bump below, so the report weights
+// static op counts by executions. g_cen_gops/g_cen_cyc hold the head block's
+// guest_opcodes/guest_cycles for ops-per-guest-instruction.
+// ---------------------------------------------------------------------------
+bool g_emit_census = false;
+extern "C" {
+uint32_t g_cen_max = 0, g_cen_n = 0;
+uint32_t* g_cen_cnt = nullptr;
+uint32_t* g_cen_vaddr = nullptr;
+uint32_t* g_cen_gops = nullptr;
+uint32_t* g_cen_cyc = nullptr;
+}
+static void emitCensusEntry(WasmModuleBuilder& b, RuntimeBlockInfo* block) {
+    if (!g_emit_census || block == nullptr || g_cen_cnt == nullptr || g_cen_n >= g_cen_max) return;
+    const u32 id = g_cen_n++;
+    g_cen_vaddr[id] = block->vaddr;
+    g_cen_gops[id] = block->guest_opcodes;
+    g_cen_cyc[id] = block->guest_cycles;
+    g_cen_cnt[id] = 0;
+    emitRtBump(b, &g_cen_cnt[id]);
 }
 
 static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
@@ -4261,6 +4431,12 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
             b.op_end();
         }
 
+        // ?jitcensus=1 (DIAG, OFF by default): count this function's entries
+        // past the slice precheck, so a census can weight its static op counts
+        // by executions (flycast_worker_funcs.js flycast_census_parse joins
+        // them by this counter's address). Emits nothing when off.
+        emitCensusEntry(b, block);
+
         // Memset byte-loop fast path. Detected BEFORE reloadOrInvalidate so
         // a successful early-return skips the cache prologue entirely. On
         // fall-through (runtime endpoint/length checks failed) cache state
@@ -4282,6 +4458,9 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
         // Elision is therefore off whenever a multi-block body is emitted.
         if (g_emit_preload_elide && g_emit_regcache && !have_trace)
             computeNoPreload(block, cache);
+        const bool lazy_load = g_emit_lazy_load && g_emit_regcache && !have_trace && !self_loop
+                               && !mp.detected && !s_lazy_regcache_enabled;
+        if (lazy_load) computeDeferAt(block, cache);
         reloadPrologueOrInvalidate(b, cache);
 
         // Per-block interrupt-pend check (Fix A — redream-style). If a peripheral
@@ -4426,8 +4605,8 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
             // head — see the g_trace_gen block on why bailing to the head
             // livelocks and bailing to the member cannot). One de-opt per site
             // per generation bump; the restamp is what makes it self-healing.
-            auto emit_member_smc_guard = [&](RuntimeBlockInfo* blk) {
-                if (!g_trace_smc_guard) return;
+            auto emit_member_smc_guard = [&](RuntimeBlockInfo* blk, bool decoded) {
+                if (!g_trace_smc_guard && !decoded) return;
                 if (g_trace_gen_next >= TRACE_GEN_SITES) return;   // graceful: no guard
                 uint32_t* tgen = &g_trace_gen[g_trace_gen_next++];
                 *tgen = g_ic_generation;    // stamp at compile time
@@ -4464,7 +4643,7 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
                 // i == 0 is the head's own code — it was verified by the lookup
                 // that entered this function, and guarding it would bail into
                 // itself. Only inlined members need the generation proof.
-                if (i > 0) emit_member_smc_guard(m);
+                if (i > 0) emit_member_smc_guard(m, trace.decoded[i]);
 
                 if (m->guest_cycles > 0) {
                     b.op_local_get(LOCAL_CTX);
@@ -4492,9 +4671,10 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
                     reloadOrInvalidate(b, cache);
                 }
 
-                u32 succ = 0, side = 0; bool taken_is_cont = false;
-                const bool has_succ =
-                    traceChooseSucc(m, block, vaddr_to_block, &succ, &taken_is_cont, &side);
+                const u32 succ = trace.succ[i], side = trace.side[i];
+                const bool taken_is_cont = trace.taken_cont[i];
+                const bool has_succ = succ != 0;
+                (void)succ;
                 const bool is_cond = BET_GET_CLS(m->BlockType) == BET_CLS_COND;
 
                 if (i < last) {
@@ -4564,6 +4744,7 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
 
         for (size_t i = 0; i < block->oplist.size(); ++i) {
             const shil_opcode& op = block->oplist[i];
+            if (lazy_load) cache.loadDeferred(b, (int)i);
             if (emitShilOp(b, op, block, (u32)i, cache)) continue;
 
             // Fallback: shop_ifb of this guest opcode (e.g. division).
@@ -4820,6 +5001,43 @@ std::vector<u8> build_blocks_unlinked(const std::vector<RuntimeBlockInfo*>& bloc
 // against this unmangled setter.
 extern "C" void bemental_sh4_set_mem_fastpaths(int on) {
     bemental::sh4::g_emit_mem_fastpaths = !!on;
+}
+extern "C" void bemental_sh4_set_census(int on) {
+    using namespace bemental::sh4;
+    if (on && g_cen_cnt == nullptr) {
+        g_cen_max = 1u << 17;
+        g_cen_cnt = (uint32_t*)calloc(g_cen_max, 4); g_cen_vaddr = (uint32_t*)calloc(g_cen_max, 4);
+        g_cen_gops = (uint32_t*)calloc(g_cen_max, 4); g_cen_cyc = (uint32_t*)calloc(g_cen_max, 4);
+        if (!g_cen_cnt || !g_cen_vaddr || !g_cen_gops || !g_cen_cyc) { g_cen_cnt = nullptr; g_cen_max = 0; }
+    }
+    g_emit_census = !!on && g_cen_cnt != nullptr;
+}
+extern "C" uint32_t bemental_sh4_census_info(int i) {
+    using namespace bemental::sh4;
+    switch (i) {
+    case 0: return g_cen_n;
+    case 1: return (uint32_t)(uintptr_t)g_cen_cnt;
+    case 2: return (uint32_t)(uintptr_t)g_cen_vaddr;
+    case 3: return (uint32_t)(uintptr_t)g_cen_gops;
+    case 4: return (uint32_t)(uintptr_t)g_cen_cyc;
+    case 5: return g_trace_formed;
+    case 6: return g_trace_loops;
+    case 7: return g_trace_members;
+    default: return 0;
+    }
+}
+extern "C" void bemental_sh4_set_trace_hooks(RuntimeBlockInfo* (*dec)(u32, RuntimeBlockInfo*), bool (*ok)(u32)) {
+    bemental::sh4::g_trace_decode_cb = dec;
+    bemental::sh4::g_trace_pc_ok_cb = ok;
+}
+extern "C" void bemental_sh4_set_trace_decode(int on) {
+    bemental::sh4::g_trace_decode = !!on;
+}
+extern "C" void bemental_sh4_set_fr_mem(int on) {
+    bemental::sh4::g_emit_fr_mem = !!on;
+}
+extern "C" void bemental_sh4_set_lazy_load(int on) {
+    bemental::sh4::g_emit_lazy_load = !!on;
 }
 extern "C" void bemental_sh4_set_regcache(int on) {
     bemental::sh4::g_emit_regcache = !!on;
