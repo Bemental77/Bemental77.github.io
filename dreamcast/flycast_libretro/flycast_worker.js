@@ -3190,6 +3190,15 @@
         }
         break;
       }
+      case 'setpswff': {   // rec_wasm.cpp flycast_set_pswff: 0 = control, 1 = on (default), 2 = DIAG check
+        try {
+          if (Module._flycast_set_pswff) Module._flycast_set_pswff((data.on | 0));
+          postMessage({ cmd: 'print', txt: '[setpswff] g_pswff=' + (data.on | 0) });
+        } catch (err) {
+          postMessage({ cmd: 'print', txt: '[setpswff] threw: ' + (err && err.message ? err.message : String(err)) });
+        }
+        break;
+      }
       case 'setgwff': {
         try {
           if (Module._flycast_set_gwff) Module._flycast_set_gwff((data.on | 0));
@@ -3264,7 +3273,7 @@
             // exactly, by construction. "No SMC occurred" == d(icgen) is 0.
             ' icgen=' + (f(74)>>>0) + ' smcS=' + (f(75)>>>0) + ' smcB=' + (f(76)>>>0) + ' smcR=' + (f(77)>>>0) + ' cpg=' + (f(78)>>>0) + ' smcT=' + (f(79)>>>0) +
             ' smcI=' + (f(103)>>>0) + ' smcC=' + (f(104)>>>0) + ' smcX=' + (f(105)>>>0) + ' smcP=' + (f(106)>>>0) + ' smcAcc=' + (f(107)>>>0) + ' smcE=' + (f(108)>>>0) +
-            ' smcA=0x' + h(f(80)) + ' syncsr=' + (f(81)>>>0) + ' shms=' + (f(82)>>>0) + ' rrms=' + (f(83)>>>0) + ' ftrv=' + (f(84)>>>0) + ' fipr=' + (f(85)>>>0) + ' fsca=' + (f(86)>>>0) + ' ifbo=' + (f(87)>>>0) + ' icn=' + (f(88)>>>0) + ' syncfp=' + (f(89)>>>0) + ' isk=' + (f(90)>>>0) + ' div32=' + (f(146)>>>0) + ' ifb=' + (Module._flycast_diag_ifb ? Number(Module._flycast_diag_ifb()) : -1) });
+            ' smcA=0x' + h(f(80)) + ' syncsr=' + (f(81)>>>0) + ' shms=' + (f(82)>>>0) + ' rrms=' + (f(83)>>>0) + ' ftrv=' + (f(84)>>>0) + ' fipr=' + (f(85)>>>0) + ' fsca=' + (f(86)>>>0) + ' ifbo=' + (f(87)>>>0) + ' icn=' + (f(88)>>>0) + ' syncfp=' + (f(89)>>>0) + ' isk=' + (f(90)>>>0) + ' div32=' + (f(146)>>>0) + ' pswff=' + (f(147)>>>0) + '/' + (f(148)>>>0) + '/' + (f(149)>>>0) + ' pschk=' + (f(150)>>>0) + '/' + (f(151)>>>0) + ' ifb=' + (Module._flycast_diag_ifb ? Number(Module._flycast_diag_ifb()) : -1) });
         } catch (err) {
           postMessage({ cmd: 'print', txt: '[ctxsnap] threw: ' + (err && err.message ? err.message : String(err)) });
         }
