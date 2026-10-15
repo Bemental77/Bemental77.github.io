@@ -38,6 +38,10 @@
 #include "hw/arm7/arm7.h"
 #include "hw/arm7/arm7_rec.h"
 #include "hw/aica/aica_if.h"
+#include "hw/arm7/arm_mem.h"   // armff: the same readMem/writeMem the blocks call
+#include "serialize.h"         // armff DIAG check: aica::serialize round trip
+#include <algorithm>
+#include <vector>
 
 #include <emscripten.h>
 #include <emscripten/threading.h>
@@ -173,6 +177,286 @@ static bool s_armtime = false;
 static double s_armtime_ms = 0;
 static u32 s_armtime_n = 0;
 extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_armtime(int on) { s_armtime = !!on; s_armtime_ms = 0; s_armtime_n = 0; }
+// ---------------------------------------------------------------------------
+// PSO'S SOUND-DRIVER LOOP, BLOCK BY BLOCK IN C (armff, 2026-10-15). The ARM7
+// driver's main loop (0x194..0x1e0) never waits. Each pass bumps the monitored-
+// channel counter and writes it to MSLC (0xac0), checks the SH4->ARM command
+// queue (0x2100), pops its own queue four times (0x1cec / 0xd60), updates ONE
+// channel's status from the monitor registers (0x93c, groups A/B/C), and checks
+// two flags (0x1c0 / 0x1d8): 31 blocks, 11 of them a single bl and 8 a return.
+// A pass is ~840 decode cycles, longer than a sample's 512, and the loop is
+// ~26% of the toaster's emulation (?armtime=1), most of it mainloop dispatch.
+//
+// armff_go runs those 27 blocks in C, starting at whichever of them the ARM is
+// at, exactly as the mainloop would: before each block the cycle counter must
+// be positive and no FIQ pending, the block debits its decode cycles, and it
+// stops at the first pc that is not one of them (a full queue, a set flag, an
+// active channel) or at the end of the sample. Each block is modelled for every
+// input (both branch outcomes, its conditional ops, its flags as the emitter
+// computes them), and it runs only while EntryPoints still holds the block that
+// arm7backend_compile built from the golden bytes (learned with its cycles).
+// Accesses go through the same arm::readMem/writeMem the blocks call, in
+// program order (the MSLC write, the 0x2810 read that clears the loop flag,
+// the 0x2814 read). The MLA in each group path is a FALLBACK op: interpret()
+// debits 6 + 3 and leaves r15 = its pc + 8. ?armff=0 is the control; ?armff=2 is
+// a DIAG check: at every 64th entry it serializes the AICA (ARM7 registers,
+// sound RAM, AICA registers, channels), runs the blocks in C, serializes the
+// result, restores the first state, lets the compiled blocks run the same
+// number of blocks and compares the two serializations byte for byte.
+// ---------------------------------------------------------------------------
+static u32 s_armff = 1;
+static u32 s_af_runs = 0, s_af_blocks = 0, s_af_chk_ok = 0, s_af_chk_bad = 0, s_af_chk_lost = 0;
+static const u32 AF_GOLD[][2] = {
+{0x194,0xeb000249}, {0x198,0xeb0007d8}, {0x19c,0xeb0006d2}, {0x1a0,0xeb0002ee}, {0x1a4,0xeb0006d0}, {0x1a8,0xeb0002ec},
+{0x1ac,0xeb0006ce}, {0x1b0,0xeb0002ea}, {0x1b4,0xeb0006cc}, {0x1b8,0xeb0002e8}, {0x1bc,0xeb0001de}, {0x1c0,0xe5df9062},
+{0x1c4,0xe31900ff}, {0x1c8,0x0a000002}, {0x1cc,0x13a09000}, {0x1d0,0xe5cf9052}, {0x1d4,0xeaffffee}, {0x1d8,0xe5df9048},
+{0x1dc,0xe31900ff}, {0x1e0,0x0affffeb}, {0x93c,0xe3a05801}, {0x940,0xe5df0194}, {0x944,0xe59f1364}, {0x948,0xe5d11000},
+{0x94c,0xe59f23a8}, {0x950,0xe5d22000}, {0x954,0xe0823001}, {0x958,0xe1500003}, {0x95c,0x5a000039}, {0x960,0xe1500001},
+{0x964,0x5a000019}, {0x968,0xe3a01040}, {0x96c,0xe3a02801}, {0x970,0xe0252190}, {0x974,0xe59f83c8}, {0x978,0xe5980000},
+{0x97c,0xe2104902}, {0x980,0x0a000002}, {0x984,0xe5954035}, {0x988,0xe31400ff}, {0x98c,0x15c5402b}, {0x990,0xe1a036a0},
+{0x994,0xe3100c1f}, {0x998,0x13a000ff}, {0x99c,0xe20000ff}, {0x9a0,0xe22000ff}, {0x9a4,0xe2033003}, {0x9a8,0xe2333003},
+{0x9ac,0x13a000ff}, {0x9b0,0xe5c50003}, {0x9b4,0xe5950000}, {0x9b8,0xe3d00000}, {0x9bc,0x11a0f00e}, {0x9c0,0xe5df1114},
+{0x9c4,0xe59f537c}, {0x9c8,0xe7c50001}, {0x9cc,0xe1a0f00e}, {0x9d0,0xe0400001}, {0x9d4,0xe3a02b4a}, {0x9d8,0xe3a01040},
+{0x9dc,0xe0252190}, {0x9e0,0xe59f835c}, {0x9e4,0xe5980000}, {0x9e8,0xe5952018}, {0x9ec,0xe2100902}, {0x9f0,0x12822001},
+{0x9f4,0x15852018}, {0x9f8,0xe59f834c}, {0x9fc,0xe5980000}, {0xa00,0xe5d51000}, {0xa04,0xe3110001}, {0xa08,0x01a0f00e},
+{0xa0c,0xe585001c}, {0xa10,0xe1a04000}, {0xa14,0xe5d5103d}, {0xa18,0xe28f2000}, {0xa1c,0xe082f001}, {0xa20,0xe1a04084},
+{0xa24,0xea000001}, {0xa28,0xe1a00000}, {0xa2c,0xe1a040a4}, {0xa30,0xe5854034}, {0xa34,0xe5951018}, {0xa38,0xe595202c},
+{0xa3c,0xe0200291}, {0xa40,0xe5850020}, {0xa44,0xe1a0f00e}, {0xa48,0xe0400003}, {0xa4c,0xe3a02b4e}, {0xa50,0xe3a01040},
+{0xa54,0xe0252190}, {0xa58,0xe59f82e4}, {0xa5c,0xe5980000}, {0xa60,0xe5951018}, {0xa64,0xe2100902}, {0xa68,0x12811001},
+{0xa6c,0x15851018}, {0xa70,0xe59f82d4}, {0xa74,0xe5980000}, {0xa78,0xe5d51000}, {0xa7c,0xe3110001}, {0xa80,0x01a0f00e},
+{0xa84,0xe585001c}, {0xa88,0xe1a04000}, {0xa8c,0xe5d5103d}, {0xa90,0xe28f2000}, {0xa94,0xe082f001}, {0xa98,0xe1a04084},
+{0xa9c,0xea000001}, {0xaa0,0xe1a00000}, {0xaa4,0xe1a040a4}, {0xaa8,0xe5854034}, {0xaac,0xe5951018}, {0xab0,0xe5952024},
+{0xab4,0xe0200291}, {0xab8,0xe5850020}, {0xabc,0xe1a0f00e}, {0xac0,0xe5df1014}, {0xac4,0xe2811001}, {0xac8,0xe201103f},
+{0xacc,0xe59f827c}, {0xad0,0xe5c81000}, {0xad4,0xe5cf1000}, {0xad8,0xe1a0f00e}, {0xd60,0xe1b01001}, {0xd64,0x01a0f00e},
+{0x1cec,0xe3a00a0b}, {0x1cf0,0xe3a03a12}, {0x1cf4,0xe5931000}, {0x1cf8,0xe51f30c4}, {0x1cfc,0xe5932000}, {0x1d00,0xe1510002},
+{0x1d04,0x03a01000}, {0x1d08,0x0a000005}, {0x1d0c,0xe0800002}, {0x1d10,0xe5901000}, {0x1d14,0xe2822004}, {0x1d18,0xe59f4008},
+{0x1d1c,0xe0022004}, {0x1d20,0xe5832000}, {0x1d24,0xe1a0f00e}, {0x2100,0xe3a00a15}, {0x2104,0xe59f1058}, {0x2108,0xe5911000},
+{0x210c,0xe59f3054}, {0x2110,0xe5932000}, {0x2114,0xe1510002}, {0x2118,0x0a00000b}, {0x211c,0xe7901002}, {0x2120,0xe59f0028},
+{0x2124,0xe2822004}, {0x2128,0xe0022000}, {0x212c,0xe5832000}, {0x2130,0xe3a02a0b}, {0x2134,0xe3a03a12}, {0x2138,0xe5934000},
+{0x213c,0xe7821004}, {0x2140,0xe2844004}, {0x2144,0xe0044000}, {0x2148,0xe5834000}, {0x214c,0xe1a0f00e}, {0xcb0,0x00012060},
+{0xcfc,0x00012061}, {0xd44,0x00802810}, {0xd48,0x00012020}, {0xd4c,0x00802814}, {0xd50,0x0080280d}, {0x1c3c,0x00012004},
+{0x2164,0x0001242c}, {0x2168,0x00012428} };
+static constexpr u32 AF_N = sizeof(AF_GOLD) / sizeof(AF_GOLD[0]);
+static constexpr u32 AF_NLIT = 9;   // the last 9 are literal-pool words the blocks load at run time
+static inline u32 af_w(u32 a) { return *(u32*)&aica_ram[a & ARAM_MASK & ~3u]; }
+static inline u8 af_b(u32 a) { return aica_ram[a & ARAM_MASK]; }
+static bool af_golden_ok() {
+    for (u32 i = 0; i < AF_N; i++) if (af_w(AF_GOLD[i][0]) != AF_GOLD[i][1]) return false;
+    return true;
+}
+static bool af_lits_ok() {
+    for (u32 i = AF_N - AF_NLIT; i < AF_N; i++) if (af_w(AF_GOLD[i][0]) != AF_GOLD[i][1]) return false;
+    return true;
+}
+enum { B194, B198, B19C, B1A0, B1A4, B1A8, B1AC, B1B0, B1B4, B1B8, B1BC, BAC0, B2100, B214C, B1CEC, B1D24, BD60,
+       B93C, B960, B968, B984, B990, B9C0, B9D0, BA48, B1C0, B1D8, AF_NB };
+static const u32 AF_BLK[AF_NB] = { 0x194, 0x198, 0x19c, 0x1a0, 0x1a4, 0x1a8, 0x1ac, 0x1b0, 0x1b4, 0x1b8, 0x1bc,
+                                   0xac0, 0x2100, 0x214c, 0x1cec, 0x1d24, 0xd60, 0x93c, 0x960, 0x968, 0x984, 0x990, 0x9c0,
+                                   0x9d0, 0xa48, 0x1c0, 0x1d8 };
+static constexpr u32 AF_IDXN = 0x2200 / 4;
+static u8 s_af_idx[AF_IDXN];   // pc/4 -> block index + 1 (0 = not one of them)
+static void (*s_af_fn[AF_NB])() = {};
+static u32 s_af_cyc[AF_NB] = {};
+static void af_init_idx() {
+    static bool done = false; if (done) return; done = true;
+    for (u32 i = 0; i < AF_NB; i++) s_af_idx[AF_BLK[i] / 4] = (u8)(i + 1);
+}
+// Which modelled blocks are live: recomputed when an EntryPoints slot may have
+// changed (any compile, any flush), so the per-block test is one bit.
+static u32 s_af_epoch = 1, s_af_mask_epoch = 0, s_af_mask = 0;
+static inline u32 af_live_mask() {
+    if (s_af_mask_epoch != s_af_epoch) {
+        u32 m = 0;
+        for (u32 i = 0; i < AF_NB; i++)
+            if (s_af_fn[i] && recompiler::EntryPoints[AF_BLK[i] / 4] == s_af_fn[i]) m |= 1u << i;
+        s_af_mask = m; s_af_mask_epoch = s_af_epoch;
+    }
+    return s_af_mask;
+}
+static void armff_learn(u32 pc, void (*fn)(), u32 cycles) {
+    ++s_af_epoch;
+    af_init_idx();
+    if (pc >= 0x2200 || (pc & 3) || !s_af_idx[pc / 4]) return;
+    const u32 i = s_af_idx[pc / 4] - 1;
+    const bool ok = af_golden_ok();
+    s_af_fn[i] = ok ? fn : nullptr; s_af_cyc[i] = ok ? cycles : 0;
+}
+static void armff_forget() { ++s_af_epoch; for (u32 i = 0; i < AF_NB; i++) { s_af_fn[i] = nullptr; s_af_cyc[i] = 0; } }
+static constexpr u32 AF_MLA = 9;   // interpret(): 6 + 3 (multiplier 0x40 < 0x100)
+static constexpr u32 FN = 1u << 31, FZ = 1u << 30, FC = 1u << 29, FV = 1u << 28;
+static inline u32 af_cmp(u32 a, u32 b, u32 fl) {
+    const u32 r = a - b;
+    fl &= ~(FN | FZ | FC | FV);
+    if (r >> 31) fl |= FN;
+    if (r == 0) fl |= FZ;
+    if (a >= b) fl |= FC;
+    if (((a ^ b) & (a ^ r)) >> 31) fl |= FV;
+    return fl;
+}
+static inline u32 af_nz(u32 v, u32 fl) { fl &= ~(FN | FZ); if (v >> 31) fl |= FN; if (!v) fl |= FZ; return fl; }   // logical, C/V kept
+// Run modelled blocks from the current pc; returns how many ran.
+static u32 armff_go(reg_pair* regs) {
+    if (!af_lits_ok()) return 0;
+    const u32 live = af_live_mask();
+    u32 r[16]; for (int i = 0; i < 16; i++) r[i] = regs[i].I;
+    u32 fl = regs[RN_PSR_FLAGS].I, pc = regs[R15_ARM_NEXT].I;
+    s32 cc = (s32)regs[CYCL_CNT].I;
+    u32 n = 0;
+    for (;;) {
+        if (cc <= 0 || regs[INTR_PEND].I) break;
+        if (pc >= 0x2200 || (pc & 3) || !s_af_idx[pc / 4]) break;
+        const u32 i = s_af_idx[pc / 4] - 1;
+        if (!((live >> i) & 1u)) break;
+        cc -= (s32)s_af_cyc[i];
+        u32 nx;
+        switch (i) {
+        case B194: case B198: case B19C: case B1A0: case B1A4: case B1A8: case B1AC: case B1B0: case B1B4: case B1B8: case B1BC: {
+            static const u32 T[11] = { 0xac0, 0x2100, 0x1cec, 0xd60, 0x1cec, 0xd60, 0x1cec, 0xd60, 0x1cec, 0xd60, 0x93c };
+            r[14] = pc + 4; nx = T[i - B194]; break; }
+        case BAC0:
+            r[1] = (af_b(0xadc) + 1u) & 0x3fu;
+            r[8] = af_w(0xd50);
+            writeMem<u8>(r[8], (u8)r[1]);
+            writeMem<u8>(0xadc, (u8)r[1]);
+            nx = r[14]; break;
+        case B2100:
+            r[0] = 0x15000; r[1] = readMem<u32>(af_w(0x2164)); r[3] = af_w(0x2168); r[2] = readMem<u32>(r[3]);
+            fl = af_cmp(r[1], r[2], fl);
+            nx = (fl & FZ) ? 0x214c : 0x211c; break;
+        case B214C: case B1D24:
+            nx = r[14]; break;
+        case B1CEC:
+            r[0] = 0xb000; r[3] = 0x12000; r[1] = readMem<u32>(r[3]); r[3] = af_w(0x1c3c); r[2] = readMem<u32>(r[3]);
+            fl = af_cmp(r[1], r[2], fl);
+            if (fl & FZ) r[1] = 0;
+            nx = (fl & FZ) ? 0x1d24 : 0x1d0c; break;
+        case BD60:
+            fl = af_nz(r[1], fl);
+            nx = (fl & FZ) ? r[14] : 0xd68; break;
+        case B93C:
+            r[5] = 0x10000; r[0] = readMem<u8>(0xadc);
+            r[1] = readMem<u8>(af_w(0xcb0)); r[2] = readMem<u8>(af_w(0xcfc));
+            r[3] = r[2] + r[1];
+            fl = af_cmp(r[0], r[3], fl);
+            nx = (fl & FN) ? 0x960 : 0xa48; break;
+        case B960:
+            fl = af_cmp(r[0], r[1], fl);
+            nx = (fl & FN) ? 0x968 : 0x9d0; break;
+        case B968:
+            r[1] = 0x40; r[2] = 0x10000;
+            r[15] = 0x978; r[5] = r[0] * r[1] + r[2]; cc -= (s32)AF_MLA;
+            r[8] = af_w(0xd44); r[0] = readMem<u32>(r[8]);
+            r[4] = r[0] & 0x8000u;
+            fl = (fl & ~(FN | FZ | FC)) | (r[4] ? 0u : FZ);
+            nx = (fl & FZ) ? 0x990 : 0x984; break;
+        case B984: case B990:
+            if (i == B984) {
+                r[4] = readMem<u32>(r[5] + 0x35);
+                fl = (fl & ~(FN | FZ)) | ((r[4] & 0xffu) ? 0u : FZ);
+                if (!(fl & FZ)) writeMem<u8>(r[5] + 0x2b, (u8)r[4]);
+            }
+            r[3] = r[0] >> 13;
+            fl = (fl & ~(FN | FZ | FC)) | ((r[0] & 0x1f00u) ? 0u : FZ);
+            if (!(fl & FZ)) r[0] = 0xff;
+            r[0] &= 0xffu; r[0] ^= 0xffu; r[3] &= 3u; r[3] ^= 3u;
+            fl = af_nz(r[3], fl);
+            if (!(fl & FZ)) r[0] = 0xff;
+            writeMem<u8>(r[5] + 3, (u8)r[0]);
+            r[0] = readMem<u32>(r[5]);
+            fl = af_nz(r[0], fl);
+            nx = (fl & FZ) ? 0x9c0 : r[14]; break;
+        case B9C0:
+            r[1] = readMem<u8>(0xadc); r[5] = af_w(0xd48);
+            writeMem<u8>(r[5] + r[1], (u8)r[0]);
+            nx = r[14]; break;
+        case B9D0: case BA48: {
+            const bool b = i == B9D0;
+            r[0] = b ? r[0] - r[1] : r[0] - r[3];
+            r[2] = b ? 0x12800 : 0x13800; r[1] = 0x40;
+            r[15] = b ? 0x9e4 : 0xa5c; r[5] = r[0] * r[1] + r[2]; cc -= (s32)AF_MLA;
+            r[8] = af_w(0xd44); r[0] = readMem<u32>(r[8]);
+            u32& cnt = b ? r[2] : r[1];
+            cnt = readMem<u32>(r[5] + 0x18);
+            r[0] &= 0x8000u;
+            fl = (fl & ~(FN | FZ | FC)) | (r[0] ? 0u : FZ);
+            if (!(fl & FZ)) { cnt += 1; writeMem<u32>(r[5] + 0x18, cnt); }
+            r[8] = af_w(0xd4c); r[0] = readMem<u32>(r[8]);
+            r[1] = readMem<u8>(r[5]);
+            fl = (fl & ~(FN | FZ)) | ((r[1] & 1u) ? 0u : FZ);
+            nx = (fl & FZ) ? r[14] : (b ? 0xa0c : 0xa84); break; }
+        case B1C0:
+            r[9] = readMem<u8>(0x22a);
+            fl = af_nz(r[9] & 0xffu, fl);
+            nx = (fl & FZ) ? 0x1d8 : 0x1cc; break;
+        case B1D8:
+            r[9] = readMem<u8>(0x228);
+            fl = af_nz(r[9] & 0xffu, fl);
+            nx = (fl & FZ) ? 0x194 : 0x1e4; break;
+        default: nx = pc; break;
+        }
+        pc = nx; ++n;
+    }
+    if (!n) return 0;
+    for (int i = 0; i < 16; i++) regs[i].I = r[i];
+    regs[RN_PSR_FLAGS].I = fl; regs[CYCL_CNT].I = (u32)cc; regs[R15_ARM_NEXT].I = pc;
+    return n;
+}
+// DIAG check state
+static std::vector<u8> s_af_s0, s_af_s1, s_af_s2;
+static struct { bool on; u32 left; } s_af_chk = {};
+static u32 s_af_entries = 0;
+static size_t af_ser(std::vector<u8>& v) {
+    Serializer dry; aica::serialize(dry);
+    v.resize(dry.size());
+    Serializer s(v.data(), v.size()); aica::serialize(s);
+    return s.size();
+}
+static bool armff_try(reg_pair* regs) {
+    if (s_armff == 2) {
+        if (s_af_chk.on || (++s_af_entries & 63u)) return false;
+        af_ser(s_af_s0);
+        const u32 n = armff_go(regs);
+        if (!n) return false;
+        af_ser(s_af_s1);
+        { Deserializer d(s_af_s0.data(), s_af_s0.size()); aica::deserialize(d); }
+        s_af_chk.on = true; s_af_chk.left = n;
+        return false;                                                      // the compiled blocks run the same n blocks
+    }
+    const u32 n = armff_go(regs);
+    if (!n) return false;
+    ++s_af_runs; s_af_blocks += n;
+    if ((s_af_runs & 262143u) == 1u)
+        MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt:'[armff] runs=' + ($0>>>0) + ' blocks=' + ($1>>>0)}); }, (int)s_af_runs, (int)s_af_blocks);
+    return true;
+}
+// After each compiled block while a check is in flight.
+static void armff_check_step() {
+    if (--s_af_chk.left) return;
+    s_af_chk.on = false;
+    af_ser(s_af_s2);
+    size_t bad = (size_t)-1;
+    if (s_af_s1.size() != s_af_s2.size()) bad = 0;
+    else for (size_t i = 0; i < s_af_s1.size(); i++) if (s_af_s1[i] != s_af_s2[i]) { bad = i; break; }
+    if (bad == (size_t)-1) {
+        if ((++s_af_chk_ok & 1023u) == 1u)
+            MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt:'[armff-check] ok=' + ($0>>>0) + ' bad=' + ($1>>>0) + ' lost=' + ($2>>>0)}); },
+                               (int)s_af_chk_ok, (int)s_af_chk_bad, (int)s_af_chk_lost);
+        return;
+    }
+    if (++s_af_chk_bad <= 8)
+        MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt:'[armff-check] MISMATCH #' + ($0>>>0) + ' at byte ' + ($1>>>0) + ' of ' + ($2>>>0) +
+                             ' c=' + ($3>>>0).toString(16) + ' real=' + ($4>>>0).toString(16)}); },
+                           (int)s_af_chk_bad, (int)bad, (int)s_af_s1.size(),
+                           bad < s_af_s1.size() ? (int)s_af_s1[bad] : -1, bad < s_af_s2.size() ? (int)s_af_s2[bad] : -1);
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_armff(int on) { s_armff = (u32)(on < 0 ? 0 : on > 2 ? 2 : on); s_af_chk.on = false; }
+extern "C" EMSCRIPTEN_KEEPALIVE u32 flycast_armff_stat(int i) {
+    switch (i) { case 0: return s_af_runs; case 1: return s_af_blocks; case 2: return 0;
+                 case 3: return s_af_chk_ok; case 4: return s_af_chk_bad; case 5: return s_af_chk_lost; }
+    if (i >= 18 && i < 18 + (int)AF_NB) return s_af_fn[i - 18] ? s_af_cyc[i - 18] : 0xffffffffu;
+    return 0;
+}
+
 static void arm_mainloop_run(reg_pair* regs, void (*entrypoints[])());
 static void arm_mainloop_c(reg_pair* regs, void (*entrypoints[])())
 {
@@ -189,14 +473,18 @@ static void arm_mainloop_c(reg_pair* regs, void (*entrypoints[])())
 static void arm_mainloop_run(reg_pair* regs, void (*entrypoints[])())
 {
     for (;;) {
-        if ((int)regs[CYCL_CNT].I <= 0)
+        if ((int)regs[CYCL_CNT].I <= 0) {
+            if (s_af_chk.on) { s_af_chk.on = false; ++s_af_chk_lost; }   // armff DIAG: the sample ended first
             return;
+        }
         if (regs[INTR_PEND].I) {
             CPUFiq();
             continue;
         }
         const u32 pc = regs[R15_ARM_NEXT].I;
+        if (s_armff && pc < 0x2200u && s_af_idx[pc >> 2] && armff_try(regs)) continue;   // the driver loop in C (armff)
         void (*fn)() = entrypoints[(pc & (ARAM_SIZE_MAX - 1)) / 4];
+        if (s_af_chk.on) { fn(); armff_check_step(); continue; }   // armff DIAG: count the compiled blocks
         if (s_armhist) {
             const int c0 = (int)regs[CYCL_CNT].I;
             fn();
@@ -1040,6 +1328,7 @@ static void run_selftest(u32 pc, u32 end_pc, void (*fn)())
 // ---------------------------------------------------------------------------
 void arm7backend_compile(const std::vector<ArmOp>& block_ops, u32 cycles)
 {
+    ++s_af_epoch;   // armff: an EntryPoints slot is about to change
     const u32 pc = arm_Reg[R15_ARM_NEXT].I;
     const u32 slot = (pc & (ARAM_SIZE_MAX - 1)) / 4;
 
@@ -1059,6 +1348,7 @@ void arm7backend_compile(const std::vector<ArmOp>& block_ops, u32 cycles)
             }
             void (*fn)() = (void (*)())(uintptr_t)(u32)idx;
             recompiler::EntryPoints[slot] = fn;
+            armff_learn(pc, fn, cycles);
             recompiler::advance((u32)bytes.size());   // honest cache pressure
             if (s_arm7_selftest && selftest_eligible(block_ops))
                 run_selftest(pc, recompiler::block_end_pc, fn);
@@ -1086,6 +1376,7 @@ void arm7backend_compile(const std::vector<ArmOp>& block_ops, u32 cycles)
 
 void arm7backend_flush()
 {
+    armff_forget();
     arm_mainloop = &arm_mainloop_c;
     arm_compilecode = &arm_compile_stub;
 }

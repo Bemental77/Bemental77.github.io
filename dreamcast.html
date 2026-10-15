@@ -2799,6 +2799,12 @@
             // ?pswff=0 — the control for the PSO timed-wait fast-forward
             // (rec_wasm.cpp pswff_try; default ON). ?pswff=2 is a DIAG check.
             if (_isk.get('pswff') === '0' || _isk.get('pswff') === '2') worker.postMessage({ cmd: 'setpswff', on: +_isk.get('pswff') });
+            // ?g2ff=0 — the control for PSO's G2 sound-RAM read in closed form
+            // (rec_wasm.cpp g2ff_try; default ON). ?g2ff=2 is a DIAG check.
+            if (_isk.get('g2ff') === '0' || _isk.get('g2ff') === '2') worker.postMessage({ cmd: 'setg2ff', on: +_isk.get('g2ff') });
+            // ?armff=0 — the control for the ARM7 sound-driver pass in closed form
+            // (arm7_rec_wasm.cpp armff_try; default ON). ?armff=2 is a DIAG check.
+            if (_isk.get('armff') === '0' || _isk.get('armff') === '2') worker.postMessage({ cmd: 'setarmff', on: +_isk.get('armff') });
             // ?jitfailinject=N[&jitfailonce=1] — TEST: the Nth block compiled after the
             // next JIT reset fails to install (rec_wasm.cpp install_*_tries).
             if (_isk.has('jitfailinject')) worker.postMessage({ cmd: 'jitfailinject', n: parseInt(_isk.get('jitfailinject'), 10) | 0, once: _isk.has('jitfailonce') ? 1 : 0 });
@@ -5596,6 +5602,8 @@
     divinline:   'SH4 inline div32 changed',
     gwff:        'Gauntlet wait fast-forward OFF',
     pswff:       'PSO wait fast-forward changed (?pswff=0 OFF, 2 DIAG check)',
+    g2ff:        'PSO G2 sound-RAM read closed form changed (?g2ff=0 OFF, 2 DIAG check)',
+    armff:       'ARM7 driver pass closed form changed (?armff=0 OFF, 2 DIAG check)',
     jitfailinject: 'TEST: injected JIT install failure',
     idleskip:    'idle-skip forced ON',
     interp:      'SH4 interpreter',

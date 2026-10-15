@@ -687,6 +687,125 @@ duty-cycled CPU, not the lockstep. There is no coupling lever to take: on two de
 toaster room runs at solo speed. What keeps both short of 1.000x is the solo work itself
 (~2.2x over budget at 6.2, the levers above).
 
+## 2026-10-15 (later) — PSO's G2 sound-RAM read in closed form (?g2ff=0 control)
+
+Re-profiled at rate 6.2 after pswff, bench scene (`toaster_split.mjs 6.2 120 '&pchist=50,60'`):
+82.2% of guest time is burnt (idle-skip 68.8%, pswff 13.5%). The executed rest is flat,
+except one family: the Shinobi G2-safe copy at 0x8c37af50 and its helpers (0x8c37a8b8-
+0x8c37b4d8), ~10% of host self time (15% inclusive) in a `?jitnames=1` profile.
+
+A census of its entries (bench scene, 30 guest s): 399,156 calls (13.3K a guest second).
+341,620 from 0x8c352d70 and 50,344 from 0x8c352c9c are ONE-WORD reads of sound RAM (size 4,
+count 1, sel 0/0). 0x8c352d40/0x8c352c6c are the sound manager's read32 helpers. They read
+hundreds of different words once a frame each (the driver's state), so this is work, not a
+poll. Each call masks interrupts, suspends the 4 G2 DMA channels (4 SB_xxSUSP stores),
+waits for the G2 FIFO twice (SB_FFST, always 0 here), copies one word, resumes the channels
+and restores SR: 64 block entries and 623 guest cycles to move 4 bytes.
+
+`g2ff_try` (rec_wasm.cpp) applies the whole call at its entry for that shape. The end state
+is closed-form: R0-R7, SR (IMASK restored, T=1), `old_sr` and SRdecode, as the last ldc
+leaves them; the 14 stack words the call leaves below R15; [0x8c5783f4]=0; the two FIFO-wait
+counters [P+0x10c]/[P+0x110] +1; [dst]; SUSP bit 0 clear. Guards: no tick inside (the gwff
+closed form over the 64 learned block cycles), no interrupt pending before or after, no
+bank change, every block of the path compiled and live (cached by IC generation + a table
+epoch that rb_discard_slot bumps), code and literal pools byte-identical to a golden copy
+(the pools are marked in the SMC map so a write drops the cache), and the stack frame,
+the struct, [0x8c5783f4] and dst disjoint. Anything else runs the real call (~15% of calls:
+a tick falls inside). The entry is unchained in every arm, so `?g2ff=0` compiles the same
+code and differs only in the apply.
+
+- `?g2ff=2` (DIAG) predicts, applies nothing, and compares R0-R15, PR, MAC, SR, old_sr, T,
+  cycle counter, sched_next, the 18 written words and the 4 SUSP registers at the return:
+  **720,897 predictions, 0 mismatches** (bench scene, 60 s).
+- Rate 1, bench scene, emu ms per guest second (last 30 heartbeats), 3 interleaved pairs,
+  load 2.2-5.0, wasm `3cc30f83`: on 329.4 / 337.0 / 353.5, off 356.5 / 365.6 / 372.6.
+  Mean **340.0 vs 364.9, -6.8%**; every pair favours on.
+- Toaster 6.2 solo (`toaster_bench.mjs --rate 6.2 --reps 2 --ladder 0 --room 0`), load during
+  the reps in brackets: on 0.700 / 0.756 (13.9 / 12.5), off 0.667 / 0.625 (6.2 / 6.8),
+  on 0.708 / 0.672 (8.3 / 9.3). The on arm is ahead in all four, inside the bench's noise,
+  and this box read lower today than 84811cd's 0.79-0.84 for both arms. Still 0/2 PASS.
+
+Exactness, wasm `3cc30f83`:
+- Rollback rig, PSO lobby: REF1==REF2 61/61, REF==RB 59/59, 0 full-flush fallbacks; g2ff
+  applied 262K calls inside the run (`--echo g2ff`).
+- Soaks (hermetic snapshot, owd 20+10), all IN SYNC: PSO lockstep 37 RAM + 37 fingerprints;
+  PSO forced rollback 32; Gauntlet forced rollback 29 RAM + 32 fingerprints; mixed PSO
+  rollback room with the joiner on `?g2ff=0`, 33 + 33 (42 / 40 rollbacks).
+- Boots with screenshots: PSO lobby (guest 0.995x), Gauntlet intro (0.996x).
+  `verify_core_tree` PASS (only bridge files changed).
+
+### What the toaster has left, ranked (rate 1, bench scene, ~340 ms per guest second)
+
+- **ARM7: 84-96 ms per guest second (`?armtime=1`), ~26%.** The driver's main loop at 0x194
+  polls the SH4 command queue (0x2100), pops its own queue four times (0x1cec / 0xd60), and
+  updates ONE channel's status per pass round-robin (0x93c: MSLC = counter, then reads the
+  monitor registers 0x2810/0x2814). With the queues empty that pass is ~30 one-instruction
+  `bl` / return blocks, ~4 passes a sample. 0x1cec alone is 26% of ARM cycles.
+- SH4 emitted code: flat over ~2000 pcs.
+- Dispatch / scheduler ~15%, AICA C ~9%, JS ~11% (GL record/post on the worker).
+- Gauntlet is not the same problem: its attract is a video decode (0x8c111xxx byte loops +
+  ftrv, 94% of guest time executed, 6.3% burnt). It costs 850-900 ms per guest second at
+  rate 1 and runs 0.13-0.5x at rate 6.2: ~6x short, not 1.2x.
+
+## 2026-10-15 (later) — the ARM7 driver loop run block by block in C (?armff=0 control)
+
+PSO's driver loop (0x194..0x1e0, read in place from sound RAM): each pass bumps the
+monitored channel and writes MSLC (0xac0), checks the SH4->ARM queue (0x2100), pops its own
+queue four times (0x1cec / 0xd60), updates one channel from the monitor registers (0x93c,
+groups A/B/C by [0x12060]/[0x12061] = 2/54 here), and checks two flags (0x1c0 / 0x1d8). The
+learned decode cycles put a pass at ~840 cycles, so it is NOT a few passes a sample: a
+sample's 512 cycles end mid-pass. So whole-pass fast-forward never fits; `armff_go`
+(arm7_rec_wasm.cpp) runs those 27 blocks in C instead, from whatever pc the ARM is at,
+exactly as the mainloop would: cycles > 0 and no FIQ before each block, the block's decode
+cycles (+9 for the MLA FALLBACK, r15 = its pc + 8), every input modelled (both branch
+outcomes, conditional ops, flags as the emitter computes them, incl. C from >255
+immediates), accesses through the same arm::readMem/writeMem in program order (MSLC write,
+0x2810 read that clears the loop flag, 0x2814 read). It stops at the first pc outside the
+set (full queue, set flag, active channel) and runs only while EntryPoints holds the block
+compiled from the golden bytes (live mask cached by a compile/flush epoch). Gauntlet's
+driver is different: it never fires there.
+
+- `?armff=2` DIAG: every 64th entry serializes the AICA (ARM regs, sound RAM, AICA regs,
+  channels), runs the blocks in C, serializes, restores, lets the compiled blocks run the
+  same number of blocks and compares byte for byte: **16,385 (bench scene) and 21,505 (PSO
+  lobby) checks, 0 mismatches, 0 lost**.
+- ~400K of the ARM's ~600K blocks a guest second now run in C.
+- In-run A/B (new `toaster_split.mjs --ab NAME:SECS`: toggles the knob in the worker every
+  SECS s and reports emu ms per guest second per arm; run-to-run pairs read +-8% here):
+  rate 6.2, 200 s: armff 1058.7 vs 1104.4 (**-4.1%**); g2ff 1051.1 vs 1150.4 (**-8.6%**).
+  Rate 1: armff 284.4 vs 287.8 (-1.2%), g2ff 299.3 vs 310.5 (-3.6%). The duty cycle makes
+  both worth more at the toaster rate than at rate 1.
+- Toaster 6.2 solo, 2 reps each, load during the reps in brackets: both on 0.901 / 0.925
+  (4.5 / 9.5), armff=0 0.793 / 0.783 (5.1 / 5.4), both off 0.701 / 0.753 (5.9 / 6.6), both
+  on again 0.736 / 0.797 (9.1 / 7.1). Still 0/2 PASS.
+
+Exactness, wasm `e8316176`: rollback rig (PSO lobby, armff applied 1.8M runs inside it)
+REF1==REF2 61/61, REF==RB 59/59, 0 full-flush fallbacks. Soaks IN SYNC: PSO lockstep 64 + 64,
+PSO forced rollback 33, Gauntlet forced rollback 29 + 32, mixed PSO rollback room with the
+joiner on `?armff=0` 33 + 33 (40 / 43 rollbacks). Boots with screenshots: PSO lobby 0.997x,
+Gauntlet intro 1.009x. `verify_core_tree` PASS.
+
+## 2026-10-15 (later) — four more candidates, each measured in-run and null
+
+All with `toaster_split.mjs 6.2 200 '' --ab KNOB:8` (the knob toggled in the worker every
+8 s; the noise floor of this rig is ~1-1.5%), base = g2ff + armff (wasm `e8316176`). None was kept.
+
+| candidate | on | off | verdict |
+|---|---|---|---|
+| b2ff: the G2 bulk copy 0x8c37b2c4 K words at a time (DIAG 16,605 / 0 bad; ~74 words a fast-forward, sound-RAM destination) | 1044.7 | 1045.3 | null |
+| iskloop: the idle-skip burn + credit sequence looped inside the trampoline | 1065.8 | 1052.5 | null (dispatcher overhead is not where idle time goes) |
+| GL recorder: drop redundant activeTexture/bindTexture (glsm re-applies ~130 a frame; 52K of 50-150 ops a post) | busy 1097.9 | 1094.4 | null |
+| pswff head check from 3 literals instead of ~36 ReadMem16 (DIAG 262K / 0 bad) | 1043.2 | 1048.8 | -0.5%, inside the noise |
+
+Also seen: the lazy disc's async readahead never completes in the bench (`readahead=0` in
+[lazydisc]); misses (~0.2/s) inflate synchronously in JS. Small at steady state.
+
+Where the toaster stands (bench scene, rate 6.2): ~1045 ms of emulation per guest second,
+x = 0.90-0.93 over 200 s windows; the 20 s gate cell reads 0.74-0.93 run to run on this box.
+1.000x needs ~950: about 10% more. The remaining split is flat: SH4 emitted code ~46% over
+~2000 pcs, dispatch/scheduler ~15%, AICA/ARM per sample ~12% (armff_go itself 4.5%), JS ~11%.
+Gauntlet's attract is a video decode at 94% executed guest time: ~6x short at 6.2.
+
 ## Status
 
 - [x] Split measured: solo at 1 and 6.2, room at 6.2 for 60 s, and a worker

@@ -326,6 +326,12 @@ static uint32_t g_rbb_fcfg_redo = 0;     // unconfirmed members whose first entr
 static uint32_t g_rbb_dropped = 0;       // members built but not registered (probe limit) (155)
 static uint32_t g_rbb_alias_drops = 0;   // misses whose other address view held the FPCA entry (157)
 static void rb_discard_slot(u32 slot);   // defined with the keep-code load below
+// g2ff_try (PSO G2 sound-RAM read in closed form): its code-ready cache key, the
+// table epoch a removal bumps (rb_discard_slot is not seen by the generation), and
+// the DIAG check's watched return pc.
+static u32 s_g2_ok_gen = 0, s_g2_tbl_epoch = 1, s_g2_watch = 0;
+extern "C" { volatile uint32_t g_g2ff = 1; }
+static volatile uint32_t g_g2ff_runs = 0, g_g2ff_fallbacks = 0, g_g2ff_chk_ok = 0, g_g2ff_chk_bad = 0;
 // Slot of the last jit_lookup that returned STALE (valid only right after it).
 static uint32_t g_lookup_slot = 0;
 static constexpr u32 SMC_CHUNKS = 1u << 22;   // 16MB >> 2
@@ -512,6 +518,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE int sh4_jit_lookup_idx(uint32_t vaddr) {
     // Same rule for the Gauntlet wait-loop head (gwff_try lives in the trampoline).
     if (g_gwff && vaddr == 0x8c032e5au) return -1;
     if (vaddr == 0x8c38d480u) return -1;   // PSO wait-loop head (pswff_try), in every arm: see flycast_set_pswff
+    if (vaddr == 0x8c37af50u) return -1;   // PSO G2 read entry (g2ff_try), in every arm: see flycast_set_g2ff
+    if (s_g2_watch && vaddr == s_g2_watch) return -1;   // ?g2ff=2 DIAG: the predicted call's return
     BlockFn fn = jit_lookup(vaddr);
     if (fn) { ++g_chain_hits;
         // Lever-5E3 fill: this resolve IS the prediction's answer. Armed-only
@@ -546,6 +554,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_ic(int on) {
         }
     } else {
         g_ic_generation = 0;
+        s_g2_ok_gen = 0;   // g2ff_try's literal-pool marks go with the map
         // All-zero map keeps the branchless emitted mark inert while disarmed.
         memset((void*)g_code_map, 0, sizeof(g_code_map));
     }
@@ -726,8 +735,14 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_pchist(int what) {
 			MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt: UTF8ToString($0)}); }, line);
 		}
 	}
-	for (size_t k = 0; k < idx.size() && k < 40; k++) {
+	for (size_t k = 0; k < idx.size() && k < 4096; k++) {
 		const u32 i = idx[k], pc = g_pch_pc[i];
+		if (k >= 40) {   // the tail without disassembly, for offline aggregation by region
+			if (g_pch_cyc[i] + g_pch_burn[i] < g_pch_total / 1000000) break;
+			snprintf(line, sizeof line, "[pchist] %5.2f%% exec %5.2f%% burn pc=%08x", 100.0 * g_pch_cyc[i] / g_pch_total, 100.0 * g_pch_burn[i] / g_pch_total, pc);
+			MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt: UTF8ToString($0)}); }, line);
+			continue;
+		}
 		std::string dis;
 		for (u32 j = 0; j < 12; j++) {
 			u16 op = 0; try { op = ReadMem16(pc + j * 2); } catch (...) {}
@@ -1388,6 +1403,7 @@ static inline bool rb_span_hits(u32 vaddr, u32 len, const uint8_t* map) {
 static void rb_discard_slot(u32 slot) {
     const u32 v = s_block_pc[slot];
     if (v == 0 || s_block_fn[slot] == nullptr) return;
+    ++s_g2_tbl_epoch;
     // NOT bm_GetBlock(): that resolves through blkmap.upper_bound +
     // containsCode(), and this backend registers every block with
     // host_code_size = 0, so containsCode is false for all of them. Instead use
@@ -1655,6 +1671,10 @@ EMSCRIPTEN_KEEPALIVE uint32_t flycast_ctx_snapshot(uint32_t which) {
         case 149: return g_pswff_fallbacks;       // head arrivals run for real
         case 150: return g_pswff_chk_ok;          // ?pswff=2 DIAG: predictions that matched
         case 151: return g_pswff_chk_bad;         // ?pswff=2 DIAG: predictions that did not
+        case 158: return g_g2ff_runs;             // PSO G2 reads applied in closed form
+        case 159: return g_g2ff_fallbacks;        // G2 read entries run for real
+        case 160: return g_g2ff_chk_ok;           // ?g2ff=2 DIAG: predictions that matched
+        case 161: return g_g2ff_chk_bad;          // ?g2ff=2 DIAG: predictions that did not
         case 152: return g_rbb_batches;           // rollback-mode batches installed
         case 153: return g_rbb_members;           // members installed ahead of execution
         case 154: return g_rbb_fcfg_redo;         // members recompiled at first entry (FPU config)
@@ -2252,6 +2272,265 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_pswff(int on) {
     s_ps_chk.on = false;
 }
 
+// ---------------------------------------------------------------------------
+// PSO G2 SOUND-RAM READ, IN CLOSED FORM (2026-10-15). PSO's sound manager reads
+// its driver's state out of sound RAM one 32-bit word at a time, ~13.3K reads a
+// guest second in the toaster gate's bench scene, through the Shinobi G2-safe
+// copy 0x8c37af50(src=R4, dst=R5, size=R6, count=R7, sel=[R15], [R15+4]):
+//   mask interrupts (SR.IMASK=15); suspend the 4 G2 DMA channels (0x8c37ade0:
+//   SB_xxSUSP=1 via 0x8c37ad98, [0x8c5783f4]=1); wait for the G2 FIFO (0x8c37af14,
+//   SB_FFST bit 4, [P+0x10c]++); for an AICA source wait again (0x8c37a8cc, bit 0,
+//   [P+0x110]++); copy; resume the channels (0x8c37ac58: SUSP=0,
+//   [0x8c5783f4]=0); restore SR.IMASK.
+// One call is 64 block entries and ~310 guest instructions to move one word.
+// g2ff_try applies the whole call at its entry, for the shape the census found
+// in ~98% of calls (size 4, count 1, sel 0/0, source in sound RAM, [P+0xd4]==1,
+// channel table 0..3, hw base 0xa05f7800), when nothing in it can be observed
+// out of order:
+//  * no scheduler tick inside it (gwff_try's closed form over the 54 block
+//    cycles, learned from flycast's decoder for the golden bytes only), so no
+//    device, DMA or interrupt can run between its accesses;
+//  * no interrupt pending at entry or after (SR.IMASK is restored to its entry
+//    value, so the pending set and the mask are unchanged), no bank change;
+//  * every block of the path compiled and live (a pending or stale block runs
+//    interpreted at another cycle charge, or runs other bytes);
+//  * the code and literal pools are byte-identical to the golden copy; and the
+//    stack frame, the struct P=[0x8c40c8f8], [0x8c5783f4], and dst are disjoint,
+//    so the end state does not depend on the order of the accesses.
+// SB_FFST reads 0 and SB_xxSUSP is a plain bit store (sb.cpp), so the end state
+// of the four SUSP registers is bit 0 clear. Everything else falls back to the
+// real call. ?g2ff=0 is the control; ?g2ff=2 is a DIAG check that predicts,
+// applies nothing, and compares registers, SR, cycles and every word the call
+// writes at the return.
+// ---------------------------------------------------------------------------
+static constexpr u32 G2_LO = 0x8c37a8b8u, G2_HI = 0x8c37b0bcu;
+static const struct { u32 lo, hi; } G2_GOLD_RANGE[4] = {
+    { 0x8c37a8b8u, 0x8c37a908u }, { 0x8c37ac38u, 0x8c37ac9cu }, { 0x8c37ad98u, 0x8c37ae24u }, { 0x8c37af00u, 0x8c37b0bcu } };
+static const u32 G2_GOLD[191] = {
+    // 0x8c37a8b8 .. 0x8c37a908
+    0x6022d203,0x0329c801,0x000b2432,0x0000e000,0xa05f688c,0x2fd62fe6,0x7ffc4f22,0xdd0ade0b,0x64f34e0b,0x880160f2,0x900c8bfa,0x032e62d2,0x02367301,0x880160f2,0xe0008bf2,0x4f267f04,0x000b6df6,0x01106ef6,0x8c40c8f8,0x8c37a8b8,
+    // 0x8c37ac38 .. 0x8c37ac9c
+    0xe100d206,0x63226042,0x40084008,0x40006332,0x6403303c,0x000b1417,0x00006013,0x8c40c8f8,0xee002fe6,0x2fc62fd6,0x4f222fb6,0xdc0b9d12,0x64c2db09,0x4b0b7404,0x7e3434ec,0x8bf83ed2,0xe200d307,0x23226023,0x6bf64f26,0x6df66cf6,0x6ef6000b,0x000000d0,0x8c37ac38,0x8c40c8f8,0x8c5783f4,
+    // 0x8c37ad98 .. 0x8c37ae24
+    0x931d0002,0x40094009,0x6503c90f,0x20390002,0x400ecbf0,0x6042d10b,0x40086212,0x63224008,0x303c4000,0x6403e201,0x03021427,0x91076053,0x4008c90f,0x40082319,0x400e203b,0xe000000b,0x0000ff0f,0x8c40c8f8,0xee002fe6,0x2fc62fd6,0x4f222fb6,0xdc0b9d12,0x64c2db09,0x4b0b7404,0x7e3434ec,0x8bf83ed2,0xe201d307,0x2322e000,0x6bf64f26,0x6df66cf6,0x6ef6000b,0x000000d0,0x8c37ad98,0x8c40c8f8,0x8c5783f4,
+    // 0x8c37af00 .. 0x8c37b0bc
+    0x6022d203,0x0329c810,0x000b2432,0x0000e000,0xa05f688c,0x2fd62fe6,0x7ffc4f22,0xdd0ade0b,0x64f34e0b,0x880160f2,0x900c8bfa,0x032e62d2,0x02367301,0x880160f2,0xe0008bf2,0x4f267f04,0x000b6df6,0x010c6ef6,0x8c40c8f8,0x8c37af00,0x2fd62fe6,0x2fb62fc6,0x2f962fa6,0x7ff84f22,0x6953d32e,0x6a439157,0x60322f62,0x8801001e,0x6e738f0a,0x934f0002,0x40094009,0x1f01c90f,0x20390002,0x400ecbf0,0xe50150f9,0x8800e4ff,0xeb008d06,0x89058801,0x89058802,0x0009a005,0x6cb3a003,0x6c53a001,0x50fa6c43,0x89058800,0x89058801,0x89058802,0x0009a005,0x6db3a003,0x6d53a001,0xd2166d43,0x0009420b,0x430bd315,0xd4150009,0x24a9d215,0x8b053422,0x3416d114,0xd2148902,0x0009420b,0x880160f2,0x88028905,0x88048922,0xa03f8931,0x4e150009,0x669365a3,0x64b38f3a,0x74016250,0x35cc34e3,0x8ff92620,0xa03136dc,0x00d40009,0x0000ff0f,0x8c40c8f8,0x8c37ade0,0x8c37af14,0x1fffffff,0x00700000,0x01000000,0x8c37a8cc,0x470067c3,0x4e154d00,0x669365a3,0x64b38f18,0x74016251,0x357c34e3,0x8ff92621,0xa00f36dc,0x67c30009,0x4e154708,0x66a36593,0x8f0764b3,0x62624d08,0x34e37401,0x2522367c,0x35dc8ff9,0x430bd30e,0xd30e0009,0x60329116,0x8801001e,0x50f18b08,0x93100202,0x4008c90f,0x40082239,0x400e202b,0x7f08e000,0x69f64f26,0x6bf66af6,0x6df66cf6,0x6ef6000b,0xff0f00d4,0x8c37ac58,0x8c40c8f8 };
+static inline u32& g2_ram32(u32 a) { return *(u32*)&mem_b[a & 0x00FFFFFCu]; }
+static inline bool g2_in_ram(u32 a, u32 len) { return a >= 0x8c000000u && a + len <= 0x8d000000u && a + len >= a; }
+static inline bool g2_ov(u32 a, u32 alen, u32 b, u32 blen) { return a < b + blen && b < a + alen; }
+static bool g2_golden_ok() {
+    const u32* g = G2_GOLD;
+    for (const auto& r : G2_GOLD_RANGE)
+        for (u32 a = r.lo; a < r.hi; a += 4, ++g)
+            if (g2_ram32(a) != *g) return false;
+    return true;
+}
+// Learned blocks of the region: size and cycles by entry, from flycast's decoder.
+static constexpr u32 G2_NSLOT = (G2_HI - G2_LO) / 2;
+static u16 s_g2_size[G2_NSLOT], s_g2_cyc[G2_NSLOT];
+static u32 s_g2_learn_ver = 1;
+static void g2ff_learn(const RuntimeBlockInfo* b) {
+    if (b->vaddr < G2_LO || b->vaddr >= G2_HI || (b->vaddr & 1)) return;
+    const u32 i = (b->vaddr - G2_LO) / 2;
+    const bool ok = g2_golden_ok() && b->sh4_code_size < 0x10000u && b->guest_cycles < 0x10000u;
+    const u16 sz = ok ? (u16)b->sh4_code_size : 0, cy = ok ? (u16)b->guest_cycles : 0;
+    if (sz != s_g2_size[i] || cy != s_g2_cyc[i]) { s_g2_size[i] = sz; s_g2_cyc[i] = cy; ++s_g2_learn_ver; }
+}
+// The executed instruction runs of the one call shape, in order (inclusive ends).
+static const u32 G2_SUSP_ITER[4][2] = { {0x8c37ad98u,0x8c37adaau}, {0x8c37adacu,0x8c37add2u}, {0x8c37add4u,0x8c37add6u}, {0x8c37adfau,0x8c37adfeu} };
+static const u32 G2_RES_ITER[2][2]  = { {0x8c37ac38u,0x8c37ac50u}, {0x8c37ac72u,0x8c37ac76u} };
+static void g2_path(std::vector<std::pair<u32,u32>>& p) {
+    auto r = [&](u32 a, u32 b) { p.push_back({a, b}); };
+    r(0x8c37af50u,0x8c37af72u); r(0x8c37af74u,0x8c37af86u); r(0x8c37af88u,0x8c37af92u); r(0x8c37afa0u,0x8c37afa2u);
+    r(0x8c37afaau,0x8c37afaeu); r(0x8c37afbcu,0x8c37afbeu); r(0x8c37afc6u,0x8c37afcau);
+    for (int k = 0; k < 4; k++) { r(k ? 0x8c37adf2u : 0x8c37ade0u, 0x8c37adf8u); for (auto& s : G2_SUSP_ITER) r(s[0], s[1]); }
+    r(0x8c37ae00u,0x8c37ae12u); r(0x8c37afccu,0x8c37afd0u);
+    r(0x8c37af14u,0x8c37af22u); r(0x8c37af00u,0x8c37af0cu); r(0x8c37af24u,0x8c37af28u); r(0x8c37af2au,0x8c37af38u); r(0x8c37af3au,0x8c37af44u);
+    r(0x8c37afd2u,0x8c37afdau); r(0x8c37afdcu,0x8c37afe0u); r(0x8c37afe2u,0x8c37afe6u);
+    r(0x8c37a8ccu,0x8c37a8dau); r(0x8c37a8b8u,0x8c37a8c4u); r(0x8c37a8dcu,0x8c37a8e0u); r(0x8c37a8e2u,0x8c37a8f0u); r(0x8c37a8f2u,0x8c37a8fcu);
+    r(0x8c37afe8u,0x8c37afecu); r(0x8c37afeeu,0x8c37aff0u); r(0x8c37aff2u,0x8c37aff4u);
+    r(0x8c37b05au,0x8c37b068u); r(0x8c37b06au,0x8c37b076u); r(0x8c37b078u,0x8c37b07cu);
+    for (int k = 0; k < 4; k++) { r(k ? 0x8c37ac6au : 0x8c37ac58u, 0x8c37ac70u); for (auto& s : G2_RES_ITER) r(s[0], s[1]); }
+    r(0x8c37ac78u,0x8c37ac8au); r(0x8c37b07eu,0x8c37b088u); r(0x8c37b08au,0x8c37b09au); r(0x8c37b09cu,0x8c37b0aeu);
+}
+// Walk the path through the learned partition: total cycles, the last block's,
+// and the distinct block entries. False if any run is not covered exactly.
+static u32 s_g2_C = 0, s_g2_clast = 0, s_g2_walk_ver = 0;
+static std::vector<u32> s_g2_entries;
+static bool g2_walk() {
+    if (s_g2_walk_ver == s_g2_learn_ver) return s_g2_C != 0;
+    s_g2_walk_ver = s_g2_learn_ver; s_g2_C = 0; s_g2_entries.clear();
+    std::vector<std::pair<u32,u32>> p; g2_path(p);
+    u32 C = 0, last = 0, nblk = 0;
+    for (size_t i = 0; i < p.size(); ) {
+        u32 e = p[i].first;                        // a block entry
+        for (;;) {
+            if (e < G2_LO || e >= G2_HI) return false;
+            const u32 k = (e - G2_LO) / 2;
+            const u32 sz = s_g2_size[k], cy = s_g2_cyc[k];
+            if (!sz || !cy) return false;
+            const u32 end = e + sz - 2;            // the block's last instruction
+            if (end > p[i].second) return false;   // ends past a taken branch: not this partition
+            C += cy; last = cy; ++nblk;
+            if (std::find(s_g2_entries.begin(), s_g2_entries.end(), e) == s_g2_entries.end()) s_g2_entries.push_back(e);
+            if (end == p[i].second) break;
+            e = end + 2;                           // block split inside a run: next block follows
+        }
+        ++i;
+    }
+    if (nblk != p.size()) return false;            // one block per run: 64 block entries
+    s_g2_C = C; s_g2_clast = last;
+    return true;
+}
+// jit_live + the stamp jit_lookup would leave on a verified hit.
+static bool g2_live(u32 vaddr) {
+    u32 h = jit_hash(vaddr);
+    for (u32 i = 0; i < JIT_PROBE_LIMIT; i++) {
+        u32 slot = (h + i) & JIT_TABLE_MASK;
+        if (s_block_pc[slot] == vaddr) {
+            if (!s_block_fn[slot] || s_block_fcfg[slot]) return false;
+            if (s_block_len[slot] == 0) return true;
+            const uint32_t gen = g_ic_generation;
+            if (gen != 0 && s_block_vgen[slot] == gen && !s_block_stale[slot]) return true;
+            if (ram_code_sum(vaddr, s_block_len[slot]) != s_block_sum[slot]) return false;
+            s_block_stale[slot] = 0; s_block_vgen[slot] = gen;
+            return true;
+        }
+        if (s_block_pc[slot] == 0) return false;
+    }
+    return false;
+}
+static u32 s_g2_ok_epoch = 0, s_g2_ok_ver = 0;
+static bool g2_code_ready() {
+    const u32 gen = g_ic_generation;
+    if (gen != 0 && s_g2_ok_gen == gen && s_g2_ok_epoch == s_g2_tbl_epoch && s_g2_ok_ver == s_g2_learn_ver) return true;
+    if (!g2_walk() || !g2_golden_ok()) return false;
+    for (u32 e : s_g2_entries) if (!g2_live(e)) return false;
+    if (gen == 0) return true;                     // disarmed: verified now, not cached
+    // The literal pools are not block code, so no store would mark them: mark the
+    // whole golden region, so any write to it moves the generation (and drops this cache).
+    for (const auto& r : G2_GOLD_RANGE) code_pages_mark_block(r.lo, r.hi - r.lo);
+    s_g2_ok_gen = g_ic_generation; s_g2_ok_epoch = s_g2_tbl_epoch; s_g2_ok_ver = s_g2_learn_ver;
+    return true;
+}
+extern "C" void sh4_intr_state_ptrs(u32* out4);
+// The DIAG check's stash: what the call will leave, compared at its return.
+static struct G2Chk { bool on; u32 ret; u32 r[16]; u32 pr, macl, mach, status, T, old_status; int cc, sn; uint64_t ticks, vecs;
+                      u32 wa[24], wv[24]; u32 nw; u32 susp[4]; } s_g2_chk = {};
+// Returns true if it applied the call (pc = the caller's return address).
+static bool g2ff_try(Sh4Context* ctx) {
+    if (ctx->interrupt_pend || !ctx->CpuRunning || g_parity_hashing || mmu_enabled()) return false;
+    if (ctx->r[6] != 4u || ctx->r[7] != 1u) return false;
+    const u32 sp = ctx->r[15], src = ctx->r[4], dst = ctx->r[5];
+    if ((sp & 3) || !g2_in_ram(sp - 56, 64)) return false;
+    if (g2_ram32(sp) != 0 || g2_ram32(sp + 4) != 0) return false;            // sel 0 / 0
+    if ((src & 3) || (src & 0x1fffffffu) < 0x00800000u || (src & 0x1fffffffu) >= 0x00a00000u) return false;   // sound RAM
+    if ((dst & 3) || !g2_in_ram(dst, 4)) return false;
+    const u32 P = g2_ram32(0x8c40c8f8u);
+    if ((P & 3) || !g2_in_ram(P, 0x114)) return false;
+    if (g2_ram32(P + 0xd4) != 1u || g2_ram32(P) != 0xa05f7800u) return false;
+    u32 ch[4];
+    for (int i = 0; i < 4; i++) { ch[i] = g2_ram32(P + 4 + 52 * i); if (ch[i] > 3u) return false; }
+    // Disjointness: what the call writes vs everything it reads or writes.
+    if (g2_ov(sp - 56, 64, P, 0x114) || g2_ov(sp - 56, 64, 0x8c40c8f8u, 4) || g2_ov(sp - 56, 64, 0x8c5783f4u, 4) ||
+        g2_ov(sp - 56, 64, G2_LO, G2_HI - G2_LO)) return false;
+    if (g2_ov(dst, 4, sp - 56, 64) || g2_ov(dst, 4, P, 0x114) || g2_ov(dst, 4, 0x8c40c8f8u, 4) || g2_ov(dst, 4, 0x8c5783f4u, 4) ||
+        g2_ov(dst, 4, G2_LO, G2_HI - G2_LO)) return false;
+    if (g2_ov(P, 0x114, 0x8c40c8f8u, 4) || g2_ov(P, 0x114, 0x8c5783f4u, 4) || g2_ov(P, 0x114, G2_LO, G2_HI - G2_LO)) return false;
+    // SR: no bank change at any ldc, and nothing pending after the mask is restored.
+    if (ctx->sr.MD ? (ctx->old_sr.RB != ctx->sr.RB) : (ctx->old_sr.RB != 0)) return false;
+    static u32 s_ip[4] = { 0, 0, 0, 0 };
+    if (!s_ip[0]) sh4_intr_state_ptrs(s_ip);
+    {
+        const u32 vpend = *(const u32*)(uintptr_t)s_ip[0], vmask = *(const u32*)(uintptr_t)s_ip[1];
+        const u32 dec = ctx->sr.BL ? 0u : ~((const u32*)(uintptr_t)s_ip[3])[ctx->sr.IMASK];
+        if (vpend & vmask & dec) return false;
+    }
+    if (!g2_code_ready()) return false;
+    if (g_g2ff == 2 && s_g2_chk.on) return false;  // DIAG: a prediction is still in flight
+    // cycles: gwff_try's closed form with one pass
+    const int sn = Sh4cntx.sh4_sched_next;
+    if (sn < 0) return false;
+    const long long M = sn / SH4_TIMESLICE, cc0 = ctx->cycle_counter, C = s_g2_C;
+    const long long TL = cc0 - (C - (long long)s_g2_clast);      // uncredited counter at the last block's entry
+    const long long m = TL > 0 ? 0 : (1 - TL + SH4_TIMESLICE - 1) / SH4_TIMESLICE;
+    if (m > M) return false;                       // a credit inside would tick the scheduler
+    const u32 ffst = ReadMem32(0xa05f688cu);
+    if (ffst & 0x11u) return false;                // both FIFO waits pass on their first read
+    const u32 v = ReadMem32(src);
+    // the end state
+    const u32 imask0 = ctx->sr.IMASK;
+    const u32 full1 = (ctx->sr.getFull() & ~1u) | 1u;          // SR as b08a's stc sees it, IMASK restored after
+    u32 r[16]; for (int i = 0; i < 16; i++) r[i] = ctx->r[i];
+    r[0] = 0; r[1] = 0xd4u; r[2] = (full1 | 0xf0u) & 0xffffff0fu; r[3] = 0xffffff0fu;
+    r[4] = 0xa05f7800u + 32u * ch[3]; r[5] = dst; r[6] = src; r[7] = 0;
+    const u32 newstatus = ((full1 & 0xffffff0fu) | (imask0 << 4)) & sr_t::MASK;
+    const u32 wa[18] = { sp - 4, sp - 8, sp - 12, sp - 16, sp - 20, sp - 24, sp - 28, sp - 32, sp - 36, sp - 40, sp - 44, sp - 48, sp - 52, sp - 56,
+                         0x8c5783f4u, P + 0x10c, P + 0x110, dst };
+    const u32 wv[18] = { ctx->r[14], ctx->r[13], ctx->r[12], ctx->r[11], ctx->r[10], ctx->r[9], ctx->pr, imask0, 4u, 1u, 0u, 0u, 0u, 0x8c37b07eu,
+                         0u, g2_ram32(P + 0x10c) + 1u, g2_ram32(P + 0x110) + 1u, v };
+    const int ccK = (int)(cc0 - C + (long long)SH4_TIMESLICE * m);
+    const int snK = (int)(sn - (long long)SH4_TIMESLICE * m);
+    if (g_g2ff == 2) {                             // DIAG: predict, apply nothing
+        G2Chk& k = s_g2_chk;
+        k.on = true; k.ret = ctx->pr; s_g2_watch = ctx->pr;
+        for (int i = 0; i < 16; i++) k.r[i] = r[i];
+        k.pr = ctx->pr; k.macl = ctx->mac.l; k.mach = ctx->mac.h; k.status = newstatus; k.T = 1;
+        k.old_status = newstatus & (~(1u << 29) | ((newstatus >> 30) & 1u) << 29);
+        k.cc = ccK; k.sn = snK; k.ticks = g_dbg_sched_ticks; k.vecs = g_dbg_vec_count;
+        k.nw = 18; for (int i = 0; i < 18; i++) { k.wa[i] = wa[i]; k.wv[i] = wv[i]; }
+        for (int i = 0; i < 4; i++) k.susp[i] = 0xa05f781cu + 32u * ch[i];
+        // the return must come back through the trampoline: drop every IC/RAS entry
+        if (g_ic_generation) { ++g_ic_generation; ++g_smc_gen_accounted; }
+        return false;
+    }
+    // apply: memory (RAM direct, with the store-path SMC marks), devices, registers
+    for (int i = 0; i < 18; i++) g2_ram32(wa[i]) = wv[i];
+    smc_mark_range(sp - 56, 56, 0); smc_mark(0x8c5783f4u, 4, 0); smc_mark(P + 0x10c, 8, 0); smc_mark(dst, 4, 0);
+    for (int i = 0; i < 4; i++) WriteMem32(0xa05f781cu + 32u * ch[i], 0u);      // SUSP=1 then 0: bit 0 clear
+    for (int i = 0; i < 16; i++) ctx->r[i] = r[i];
+    ctx->sr.status = newstatus; ctx->sr.T = 1;
+    ctx->old_sr.status = newstatus; ctx->old_sr.RB &= ctx->sr.MD;           // UpdateSR's bookkeeping
+    SRdecode();
+    ctx->pc = ctx->pr;
+    ctx->cycle_counter = ccK;
+    Sh4cntx.sh4_sched_next = snK;
+    if (m) g_slice_credited = 1;
+    ++g_g2ff_runs;
+    if ((g_g2ff_runs & 262143u) == 1u)
+        MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt:'[g2ff] runs=' + ($0>>>0) + ' fallbacks=' + ($1>>>0) + ' C=' + ($2|0)}); },
+                           (int)g_g2ff_runs, (int)g_g2ff_fallbacks, (int)s_g2_C);
+    return true;
+}
+// DIAG check: at the return arrival after a prediction (?g2ff=2).
+static void g2ff_check(Sh4Context* ctx) {
+    G2Chk& k = s_g2_chk;
+    k.on = false; s_g2_watch = 0;
+    if (k.ticks != g_dbg_sched_ticks || k.vecs != g_dbg_vec_count) return;   // not comparable
+    const long long dc = (long long)ctx->cycle_counter - k.cc;
+    const bool cyc_ok = dc == (long long)k.sn - Sh4cntx.sh4_sched_next && dc >= 0 && dc % SH4_TIMESLICE == 0 && (dc == 0 || k.cc <= 0);
+    bool ok = ctx->pr == k.pr && ctx->mac.l == k.macl && ctx->mac.h == k.mach && ctx->sr.status == k.status && ctx->sr.T == k.T &&
+              ctx->old_sr.status == k.old_status && cyc_ok && ctx->interrupt_pend == 0;
+    for (int i = 0; i < 16; i++) ok = ok && ctx->r[i] == k.r[i];
+    u32 badw = 0;
+    for (u32 i = 0; i < k.nw; i++) if (g2_ram32(k.wa[i]) != k.wv[i]) { ok = false; if (!badw) badw = k.wa[i]; }
+    for (int i = 0; i < 4; i++) if (ReadMem32(k.susp[i]) & 1u) { ok = false; if (!badw) badw = k.susp[i]; }
+    if (ok) { ++g_g2ff_chk_ok; if ((g_g2ff_chk_ok & 65535u) == 1u)
+        MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt:'[g2ff-check] ok=' + ($0>>>0) + ' bad=' + ($1>>>0)}); }, (int)g_g2ff_chk_ok, (int)g_g2ff_chk_bad);
+        return; }
+    if (++g_g2ff_chk_bad <= 8) {
+        char buf[700]; int o = snprintf(buf, sizeof buf, "[g2ff-check] MISMATCH #%u cc %d/%d sn %d/%d pr %08x/%08x st %08x/%08x old %08x/%08x T %u/%u pend %u badw %08x",
+            (unsigned)g_g2ff_chk_bad, ctx->cycle_counter, k.cc, Sh4cntx.sh4_sched_next, k.sn, ctx->pr, k.pr, ctx->sr.status, k.status,
+            ctx->old_sr.status, k.old_status, (unsigned)ctx->sr.T, k.T, (unsigned)ctx->interrupt_pend, badw);
+        for (int i = 0; i < 16; i++) if (ctx->r[i] != k.r[i]) o += snprintf(buf + o, sizeof buf - o, " r%d %08x/%08x", i, ctx->r[i], k.r[i]);
+        MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt: UTF8ToString($0)}); }, buf);
+    }
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_g2ff(int on) {
+    g_g2ff = (u32)(on < 0 ? 0 : on > 2 ? 2 : on);
+    s_g2_chk.on = false; s_g2_watch = 0;
+}
+
 static uintptr_t g_tw_ram_base = 0;   // what the trampoline baked as the RAM base (tripwire)
 static void wasm_block_trampoline()
 {
@@ -2472,6 +2751,11 @@ static void wasm_block_trampoline()
         }
     }
 isk_no_skip:
+    if (s_g2_watch && pc == s_g2_watch) g2ff_check(ctx);
+    if (g_g2ff && pc == 0x8c37af50u) {
+        if (g2ff_try(ctx)) return;
+        ++g_g2ff_fallbacks;
+    }
     if (g_gwff && pc == 0x8c032e5au) {
         if (gwff_try(ctx)) return;
         ++g_gwff_fallbacks;
@@ -3163,6 +3447,7 @@ public:
 			}
 			if (g_gwff) gwff_learn(r);
 			if (g_pswff) pswff_learn(r);
+			g2ff_learn(r);
 			r->code           = (DynarecCodeEntryPtr)(uintptr_t)r;
 			r->host_code_size = 0;
 			r->host_opcodes   = 0;
@@ -3177,6 +3462,7 @@ public:
 		++g_compile_calls;
 		if (g_gwff) gwff_learn(block);
 		if (g_pswff) pswff_learn(block);
+		g2ff_learn(block);
 		if (g_jitfail_inject_n && ++s_compiles_since_reset == g_jitfail_inject_n) {
 			s_jitfail_vaddr = block->vaddr;
 			s_jitfail_left = g_jitfail_once ? 1u : 0xFFFFFFFFu;
