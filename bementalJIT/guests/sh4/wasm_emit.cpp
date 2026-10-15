@@ -87,6 +87,7 @@ static void emitSmcChunkLoad(WasmModuleBuilder& b, u32 addr_local, u32 byte_off 
     // of the memset fastpath's mark loop.
     b.op_i32_load8_u((u32)(uintptr_t)g_code_map);   // map[chunk] (0|1)
 }
+bool g_emit_smc_branch = false;   // PSO lobby in-run 581.2 vs 574.2 (placebo +1.2%): null, shipped OFF, ?sh4smcbr=1 arms
 static void emitSmcMarkLocal(WasmModuleBuilder& b, u32 addr_local, u32 width) {
     // `addr_local` holds the MASKED physical EA (addr & 0x1FFFFFFF), area==3.
     // gen += map[c(phys)] — adds 0 for non-code chunks; the map is all-zero
@@ -94,6 +95,15 @@ static void emitSmcMarkLocal(WasmModuleBuilder& b, u32 addr_local, u32 width) {
     // add invalidates (equality compare). width <= 4 and aligned -> single
     // chunk; the 8-byte fmov.d pair (aligned) -> chunks c and c+1.
     const u32 gen = (u32)(uintptr_t)&g_ic_generation;
+    // ?sh4smcbr (default OFF; 1 arms): test the map byte(s) and do the
+    // generation read-modify-write only when one is set. The RMW ran on every
+    // guest RAM store and chained every store through one global word; the
+    // add is of 0 whenever the bytes are 0, so the result is identical.
+    if (g_emit_smc_branch) {
+        emitSmcChunkLoad(b, addr_local);
+        if (width > 4) { emitSmcChunkLoad(b, addr_local, 4); b.op_i32_or(); }
+        b.op_if(0x40);
+    }
     b.op_i32_const((s32)gen);            // store addr
     b.op_i32_const((s32)gen);            // load addr
     b.op_i32_load(0);                    // gen
@@ -104,6 +114,7 @@ static void emitSmcMarkLocal(WasmModuleBuilder& b, u32 addr_local, u32 width) {
     }
     b.op_i32_add();
     b.op_i32_store(0);                   // gen += touched-chunk map bytes
+    if (g_emit_smc_branch) b.op_end();
     // (The K2-attribution last-addr diag emitted here was STRIPPED after its
     // verdict — it named the 16B-granularity false positives: the pre-block
     // data word 0x0c37ea68, then the ISR frame counter 0x0c379b80. See
@@ -2911,6 +2922,8 @@ uint32_t g_trace_gen_next = 0;    // compile-time site allocator; exhaustion jus
 static bool g_ic_cs = true;    // cond/static IC: ~1.8x native. SAFE as of lever-4 Build 2 — every write path into RAM (emitted fastpath stores incl. memset, C slowpath imports, WriteMemBlock/DMA chokepoints) bumps g_ic_generation on a code-word hit (4-byte-granular map, zero false positives at the title: icgen=1 flat, task-3e probe). The old corruption class (loader SMC out-racing periodic flushes) is closed event-driven; jit_register re-registration bumps cover slot-churn.
 }
 
+bool g_emit_partial_link = false;   // PSO lobby in-run 509.9 vs 500.9: null, shipped OFF, ?sh4plink=1 arms
+extern bool (*g_trace_pc_ok_cb)(u32 vaddr);   // rec_wasm trace_pc_ok: pcs the trampoline must see
 static s32 sibling_func_idx(u32 target_vaddr, u32 self_vaddr,
                             const std::unordered_map<u32, u32>* vaddr_to_idx) {
     if (!g_emit_tail_link) return -1;
@@ -3310,15 +3323,22 @@ void emitBlockExit(WasmModuleBuilder& b, RuntimeBlockInfo* block,
             const s32 br_idx   = sibling_func_idx(block->BranchBlock, self_vaddr, vaddr_to_idx);
             const s32 next_idx = sibling_func_idx(block->NextBlock,   self_vaddr, vaddr_to_idx);
             const bool both_siblings = (br_idx >= 0 && next_idx >= 0);
+            // ?sh4plink (default OFF; 1 arms): link each arm on its own —
+            // a sibling arm tail-calls directly even when the other arm leaves
+            // the shard (it used to take the IC probe whenever both were not
+            // siblings). Same target, same PC store, same slice guard.
+            auto pl_ok = [&](u32 t) { return g_trace_pc_ok_cb == nullptr || g_trace_pc_ok_cb(t); };
+            const bool link_br   = both_siblings || (g_emit_partial_link && br_idx >= 0 && pl_ok(block->BranchBlock));
+            const bool link_next = both_siblings || (g_emit_partial_link && next_idx >= 0 && pl_ok(block->NextBlock));
             push_pred();
             b.op_if(0x40);                                  // void
               store_pc(block->BranchBlock);
-              if (both_siblings) emit_tail_to((u32)br_idx); // ends the frame
-              else               emit_const_target_probe(block->BranchBlock);
+              if (link_br) emit_tail_to((u32)br_idx);       // ends the frame
+              else         emit_const_target_probe(block->BranchBlock);
             b.op_else();
               store_pc(block->NextBlock);
-              if (both_siblings) emit_tail_to((u32)next_idx);
-              else               emit_const_target_probe(block->NextBlock);
+              if (link_next) emit_tail_to((u32)next_idx);
+              else           emit_const_target_probe(block->NextBlock);
             b.op_end();
             if (both_siblings) return;   // both arms tail-called; below unreachable
             emit_rt_bump(&g_exit_cond_xshd);   // guard-block/miss only (scar #2)
@@ -3761,7 +3781,7 @@ static void emitMemsetFastPath(WasmModuleBuilder& b, RuntimeBlockInfo* block,
 // gets NO entry, so both paths stay ctx-direct and can never desync.
 // ?sh4frm (default OFF; 1 arms): fmov.s loads/stores and int<->FR moves
 // keep their FR register in its f32 local instead of excluding it from the cache.
-bool g_emit_fr_mem = false;   // measured +1.4..2.5% WORSE in-run on Gauntlet: shipped OFF, ?sh4frm=1 arms
+bool g_emit_fr_mem = false;   // Gauntlet attract A/B (+1.4..2.5%) predates the rig fix: unpriced, shipped OFF, ?sh4frm=1 arms
 static bool fpu_f32_helper_op(u32 opnum) {
     switch (opnum) {
     case shop_fadd: case shop_fsub: case shop_fmul: case shop_fdiv:
@@ -4012,6 +4032,43 @@ static void computeDeferAt(RuntimeBlockInfo* blk, RegCache& cache)
         if (!kv.second.preload) continue;          // defined first: no load at all
         auto it = first.find(kv.first);
         if (it != first.end() && it->second > 0) kv.second.deferAt = it->second;
+    }
+}
+
+// ?sh4early (default ON; 0 = the control): STORE A REGISTER AT ITS LAST
+// DEFINITION. A register whose last reference in the block is a full top-level
+// definition (preload_toplevel_def_op) is stored to ctx right after that op
+// instead of by the exit's flushAll, so its local is dead from there on and
+// does not have to survive (or be spilled) across the rest of the block. Same
+// stores, same values: nothing later in the block reads or writes the offset.
+// jdyn and sr.T are read by the exit code and keep the exit flush.
+bool g_emit_early_flush = false;   // unpriced: its only A/B (Gauntlet attract) was rig bias (placebo +8.5%); shipped OFF, ?sh4early=1 arms
+static void computeFlushAt(RuntimeBlockInfo* blk, RegCache& cache)
+{
+    if (blk == nullptr) return;
+    std::vector<u32> offs;
+    std::unordered_map<u32, int> last;
+    auto mark = [&](const shil_param& p, int i) {
+        offs.clear();
+        appendParamOffsets(p, offs);
+        for (u32 o : offs) last[o] = i;
+    };
+    for (size_t i = 0; i < blk->oplist.size(); ++i) {
+        const shil_opcode& op = blk->oplist[i];
+        mark(op.rs1, (int)i); mark(op.rs2, (int)i); mark(op.rs3, (int)i);
+        mark(op.rd, (int)i); mark(op.rd2, (int)i);
+        if (op.op == shop_jdyn || op.op == shop_jcond) last[ctx_off::JDYN] = (int)i;
+    }
+    for (auto& kv : cache.entries) {
+        if (kv.first == ctx_off::JDYN || kv.first == ctx_off::SR_T) continue;
+        auto it = last.find(kv.first);
+        if (it == last.end()) continue;
+        const shil_opcode& op = blk->oplist[(size_t)it->second];
+        if (!preload_toplevel_def_op(op)) continue;
+        offs.clear(); appendParamOffsets(op.rd, offs); appendParamOffsets(op.rd2, offs);
+        bool defines = false;
+        for (u32 o : offs) if (o == kv.first) defines = true;
+        if (defines) kv.second.flushAt = it->second;
     }
 }
 
@@ -4461,6 +4518,9 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
         const bool lazy_load = g_emit_lazy_load && g_emit_regcache && !have_trace && !self_loop
                                && !mp.detected && !s_lazy_regcache_enabled;
         if (lazy_load) computeDeferAt(block, cache);
+        const bool early_flush = g_emit_early_flush && g_emit_regcache && !have_trace && !self_loop
+                                 && !mp.detected && !s_lazy_regcache_enabled;
+        if (early_flush) computeFlushAt(block, cache);
         reloadPrologueOrInvalidate(b, cache);
 
         // Per-block interrupt-pend check (Fix A — redream-style). If a peripheral
@@ -4745,7 +4805,10 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
         for (size_t i = 0; i < block->oplist.size(); ++i) {
             const shil_opcode& op = block->oplist[i];
             if (lazy_load) cache.loadDeferred(b, (int)i);
-            if (emitShilOp(b, op, block, (u32)i, cache)) continue;
+            if (emitShilOp(b, op, block, (u32)i, cache)) {
+                if (early_flush) cache.flushEarly(b, (int)i);
+                continue;
+            }
 
             // Fallback: shop_ifb of this guest opcode (e.g. division).
             cache.flushAll(b);
@@ -5038,6 +5101,15 @@ extern "C" void bemental_sh4_set_fr_mem(int on) {
 }
 extern "C" void bemental_sh4_set_lazy_load(int on) {
     bemental::sh4::g_emit_lazy_load = !!on;
+}
+extern "C" void bemental_sh4_set_early_flush(int on) {
+    bemental::sh4::g_emit_early_flush = !!on;
+}
+extern "C" void bemental_sh4_set_smc_branch(int on) {
+    bemental::sh4::g_emit_smc_branch = !!on;
+}
+extern "C" void bemental_sh4_set_partial_link(int on) {
+    bemental::sh4::g_emit_partial_link = !!on;
 }
 extern "C" void bemental_sh4_set_regcache(int on) {
     bemental::sh4::g_emit_regcache = !!on;

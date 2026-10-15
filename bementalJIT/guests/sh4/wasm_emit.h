@@ -119,6 +119,9 @@ struct RegCacheEntry {
     // that references this offset; the prologue skips it and the load is
     // emitted right before that op, at top level. -1 = loaded at the prologue.
     int deferAt = -1;
+    // ?sh4early: >= 0 = the index of the op that last names this offset and
+    // fully defines it at top level; the dirty value is stored right after it.
+    int flushAt = -1;
 };
 
 struct RegCache {
@@ -292,6 +295,16 @@ struct RegCache {
             if (kv.second.isF32) b.op_f32_load(kv.first);
             else                 b.op_i32_load(kv.first);
             b.op_local_set(kv.second.wasmLocal);
+        }
+    }
+    void flushEarly(WasmModuleBuilder& b, int idx) {
+        for (auto& kv : entries) {
+            if (kv.second.flushAt != idx || !kv.second.dirty) continue;
+            b.op_local_get(0);
+            b.op_local_get(kv.second.wasmLocal);
+            if (kv.second.isF32) b.op_f32_store(kv.first);
+            else                 b.op_i32_store(kv.first);
+            kv.second.dirty = false;
         }
     }
     void setNoPreload(u32 ctxOffset) {
