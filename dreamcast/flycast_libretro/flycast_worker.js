@@ -3150,6 +3150,13 @@
         } catch (err) { postMessage({ cmd: 'print', txt: '[armmemfp] threw: ' + err }); }
         break;
       }
+      case 'tcntfp': {   // EmscriptenWorker.cpp flycast_set_tcntfp (0 = control: TCNT reads take the readt / p4mmr / bank route)
+        try {
+          if (Module._flycast_set_tcntfp) Module._flycast_set_tcntfp(data.on | 0);
+          postMessage({ cmd: 'print', txt: '[tcntfp] ' + ((data.on | 0) ? 'ON' : 'OFF (control: TCNT reads via readt / p4mmr / TMU bank)') });
+        } catch (err) { postMessage({ cmd: 'print', txt: '[tcntfp] threw: ' + err }); }
+        break;
+      }
       case 'aicafast': {   // sgc_if.cpp flycast_set_aicafast (0 = control: upstream's per-sample AICA path)
         try {
           if (Module._flycast_set_aicafast) Module._flycast_set_aicafast(data.on | 0);

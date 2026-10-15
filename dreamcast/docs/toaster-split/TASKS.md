@@ -387,6 +387,43 @@ Exactness, wasm `c63e673e`:
 What is left in the 18.6% is the ARM7 (~68 ms per guest second in PSO, `?armtime=1`)
 and the scheduler's per-event walk. Neither is a mixing cost.
 
+## 2026-10-15 — TMU TCNT reads go straight to the handler (?tcntfp=0 control)
+
+Which reads these are. Every SH4 read that misses the inline RAM path was
+histogrammed by address over 20 s (a temporary build, not kept).
+- Bench scene (the toaster gate's PSO seed): `TCNT0` (0xFFD8000C) 32-bit, ~500K a
+  guest second, 85% of all slow-path reads. Next are SB_ISTNRM (0xA05F6900, ~43K/s) and
+  SB_FFST (0xA05F688C, ~31K/s).
+- PSO lobby: TCNT0 is only ~1.2K/s. ISTNRM and FFST lead there.
+
+`?pchist` names the reader: a timed wait at 0x8c38d480..0x8c38d4a8. It calls
+0x8c37b636 (`mov.l @(lit)=ffd8000c,R2 ; mov.l @R2,R3`), subtracts the start tick and
+scales the result with a multiply/divide helper, then exits on elapsed >= 0x28870 or a
+RAM flag. It is ~13.6% of all guest cycles in that scene, which is ~43% of the cycles
+idle-skip does not burn. An exact fast-forward of this loop (gwff-style) is the larger
+lever, and it is not built here.
+
+Shipped, exact: `sh4_mem_read32` sends a 32-bit read of TCNT0/1/2 straight to
+`read_TMU_TCNT<ch>`, through `tmu_tcnt_read_direct` (tmu.cpp, new ported file), while
+`ReadMem32 == addrspace::read32` (MMU off). That handler is what the readt -> RF32[] ->
+ReadMem_p4mmr -> TMU bank route ends in, and nothing else on the route has an effect.
+With the MMU on, reads take the normal route.
+
+Measured. Bench scene, rate 1, `toaster_split.mjs 1 40`, emu ms per guest second, 4
+interleaved pairs, load 1.3-4.9. On / off: 376.6 / 385.2, 384.8 / 407.3, 385.9 / 435.1,
+404.5 / 411.5. Every pair favours on, and the mean is -5% (388 vs 410). Toaster 6.2,
+2 reps: solo on 0.677 / 0.583 (load 6-16), off 0.575 / 0.581 (load 15-26). Room on
+0.201 / 0.235, off 0.238 / 0.245. Both are inside the bench's noise.
+
+Exactness, wasm `d31fabe4`:
+- `?aicahash=1` on vs off: bench scene 35 windows identical (the TCNT-heavy scene),
+  PSO lobby 32, Gauntlet 33.
+- Rollback rig REF1==REF2 61/61, REF==RB 59/59.
+- Soaks IN SYNC: PSO lockstep 81 checkpoints, PSO forced rollback 33, Gauntlet forced
+  rollback 32.
+- Mixed rollback rooms with the joiner on `tcntfp=0`: PSO 33, Gauntlet 32, IN SYNC.
+- Boots: PSO lobby 1.000x and Gauntlet attract, with screenshots.
+
 ## Status
 
 - [x] Split measured: solo at 1 and 6.2, room at 6.2 for 60 s, and a worker

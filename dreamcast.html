@@ -2689,6 +2689,7 @@
             setTimeout(() => worker.postMessage({ cmd: 'armhist', on: 1 }), (ha || 40) * 1000);
             setTimeout(() => worker.postMessage({ cmd: 'armhist', on: 0 }), ((ha || 40) + (hb || 20)) * 1000);
           }
+          if (qs.get('tcntfp') === '0') worker.postMessage({ cmd: 'tcntfp', on: 0 });   // control: TMU TCNT reads take the readt / p4mmr route
           if (qs.get('aicafast') === '0') worker.postMessage({ cmd: 'aicafast', on: 0 });   // control: upstream's per-sample AICA path
           if (qs.get('aicahash') === '1') worker.postMessage({ cmd: 'aicahash', on: 1 });   // DIAG: audio/AICA/RAM hash per 5 guest s
           if (qs.has('aicatime')) worker.postMessage({ cmd: 'aicatime', on: +qs.get('aicatime') | 0 });   // DIAG: 1 = AICA_Sample split, 2 = sh4_sched_tick wall, per guest second
@@ -5562,6 +5563,7 @@
     noidleskip:  'idle-skip OFF',
     armmemfp:    'ARM7 inline sound-RAM access OFF',
     aicafast:    'AICA per-sample fast path OFF',
+    tcntfp:      'TMU TCNT direct read OFF',
     divinline:   'SH4 inline div32 changed',
     gwff:        'Gauntlet wait fast-forward OFF',
     jitfailinject: 'TEST: injected JIT install failure',
