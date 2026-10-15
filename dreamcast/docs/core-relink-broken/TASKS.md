@@ -206,3 +206,47 @@ Audited 2026-09-07 against the link script's own file list
   `[maple] bus (type per slot, -1=empty): p0[...] p1[...] p2[...] p3[...]`.
   The old single-slot probe could not tell "no VMU" from "no devices at all",
   which are very different faults. One line, once, at load.
+
+## Layout-dependent REIOS reboot loop: a stale Sh4RCB pointer (2026-10-15, fixed)
+
+Symptom: unrelated bridge edits sent every boot into a REIOS reboot loop,
+`pc=0`, no throws, on Gauntlet and PSO, with the JIT and with `?interp=1`.
+Examples were a 16 KB histogram array in `rec_wasm.cpp`, or a function in
+`arm7_rec_wasm.cpp` that returns `&arm_Reg[...]`.
+
+Bisect: a bare `volatile u32` padding array in `rec_wasm.cpp`, with no ARM
+reference, reproduces it.
+
+| padding | result |
+|---|---|
+| 4 B - 8 KB | boots |
+| 12 KB, 16 KB | loops |
+
+So it is pure static-data layout. The link map shows the same set of archive
+objects in both builds, so it is not an archive-pull or ODR effect.
+
+Cause: with nvmem disabled, `addrspace::initMappings()` used to free and
+re-allocate `p_sh4rcb` on every `setPlatform()`.
+1. `Emulator::init()` calls `setPlatform`, and only then the executor's
+   `Init()`. `Init()` caches `&p_sh4rcb->cntx` in `Sh4Interpreter::ctx`,
+   `sh4cycles`, `icache`/`ocache` and the dynarec's `sh4ctx`.
+2. `loadGame()` then calls `setPlatform` again. Every cached pointer dangled,
+   unless `allocAligned` handed back the same block.
+3. Measured (`[laydiag]`): the good layout reused 0x6b0fe00. The 16 KB-shifted
+   layout put the new RCB at 0xd68fe00. Reset initialised the freed context,
+   and the dispatcher ran the live, zeroed one from pc=0.
+
+Fix (`core/hw/mem/addrspace.cpp`, now a tracked ported file): the RCB is kept
+across `initMappings()`; its size does not depend on the platform. `release()`
+still frees it. `rec_wasm.cpp` mainloop now prints
+`[ctx-tripwire] FATAL ...` once if the cached context ever differs from
+`p_sh4rcb->cntx`.
+
+Verified: 12 KB, 16 KB and 64 KB padding, and the original ARM-pointer
+variant, all boot (1 REIOS boot, 120 syscalls, 60 fps); PSO boots with 16 KB
+padding.
+
+Same class, not proven: `mem_b`, `vram` and `aica_ram` are also freed and
+re-allocated by the same path. They kept their addresses in every build
+measured (0x6b20000 / 0x7b30000 / 0x8340000). Any pointer to them cached
+before `loadGame()` would have the same exposure.
