@@ -33,7 +33,7 @@ const guard = (await import(path.join(ROOT, 'tools/browser_leak_guard.js'))).def
 const a = process.argv.slice(2); const rate = +a[0] || 1, secs = +a[1] || 30, extra = a[2] && !a[2].startsWith('--') ? a[2] : '';
 const fl = (n) => { const i = a.indexOf('--' + n); return i >= 0 ? a[i + 1] : null; };
 const prof = +fl('prof') || 0, shot = fl('shot'), room = a.includes('--room');
-// --ab NAME:SECS — an in-run A/B of an EXACT runtime knob (NAME = a _flycast_set_NAME export, or js.VAR for a worker global): once the seed restore has
+// --ab NAME:SECS — an in-run A/B of an EXACT runtime knob (NAME = a _flycast_set_NAME export, js.VAR for a worker global, or fn.FUNC for a worker function called with the arm's value): once the seed restore has
 // settled, call Module._flycast_set_NAME(1/0) in the emulation worker, alternating every
 // SECS s, and report emulation ms per guest second for each arm over the heartbeats that
 // lie wholly inside one arm (the first after each switch is dropped). Interleaving at this
@@ -44,6 +44,9 @@ const abVal = ab && ab.split(':').length >= 4 ? { 1: ab.split(':')[2], 0: ab.spl
 // The FIRST arm window is discarded: it follows the cold start (boot / state load / first
 // compile), not a flush from the other arm, and read +4.5..8.5% slow in placebo runs (1:1).
 let abSwitch = 0;
+// --abskip N: heartbeats dropped after each switch (default 2). A --abreload switch at the toaster
+// rate needs more: the reloaded state's JIT refill spans several heartbeats.
+const ABSKIP = +(fl('abskip') || 2);
 let abArm = null, abNext = 0, abSkip = 0, abSess = null; const abAcc = { 1: { e: 0, x: 0, n: 0 }, 0: { e: 0, x: 0, n: 0 } };
 const BASE = process.env.BASE_URL || 'http://localhost:8080';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -72,13 +75,14 @@ const settled = (r) => r.booted && !r.rest && r.hbr >= 3 && (!stateF || (stateHb
 p.on('console', (m) => { const t = m.text();
   if (dumpF && /\[jitdump\]/.test(t)) { const body = t.replace(/^.*\[jitdump\] /, '');
     if (/^begin/.test(body)) dumpBuf = []; else if (/^end/.test(body)) { if (dumpBuf) fs.writeFileSync(dumpF + '.' + (dumpN++) + '.wasm', Buffer.from(dumpBuf.join(''), 'base64')); dumpBuf = null; }
-    else if (dumpBuf) dumpBuf.push(body.split(' ')[1] || ''); return; } if (/error|threw|desync/i.test(t)) errs.push(t.slice(0, 200)); if (/\[split\]/.test(t)) console.log('  ' + t.replace(/^.*\[split\]/, '[split]').slice(0, 260)); if (/\[(sh4emit|pchist|pswff|gwff|xff|g2|ctxsnap|setg2|armhist|armcode|armtime|aicatime|armff|setarmff|b2ff|setb2ff|lazydisc|glcount|glinfo|lowrender)/.test(t)) console.log('  ' + t.slice(0, /ctxsnap/.test(t) ? 4000 : 520)); if (/\[peek\]/.test(t)) console.log(t); });
+    else if (dumpBuf) dumpBuf.push(body.split(' ')[1] || ''); return; } if (/error|threw|desync/i.test(t)) errs.push(t.slice(0, 200)); if (/\[split\]/.test(t)) console.log('  ' + t.replace(/^.*\[split\]/, '[split]').slice(0, 260)); if (/\[(sh4emit|pchist|pswff|gwff|xff|g2|ctxsnap|setg2|armhist|armcode|armtime|aicatime|armff|setarmff|b2ff|setb2ff|lazydisc|glcount|glinfo|lowrender|glsync|glsizes|aicahash)/.test(t)) console.log('  ' + t.slice(0, /ctxsnap/.test(t) ? 4000 : 520)); if (/\[peek\]/.test(t)) console.log(t); });
 const code = 'Z' + Math.random().toString(36).slice(2, 6).toUpperCase().replace(/[^A-Z2-9]/g, 'Q');
 await p.goto(room ? `${BASE}/dreamcast.html?bench=1&benchauto=1&benchsec=${secs}&benchphase=room&np=${code}&host=1&net=local&game=pso2${extra}` : `${BASE}/dreamcast.html?bench=1&benchauto=1&benchroom=0&benchsec=${secs}${extra}`, { waitUntil: 'load', timeout: 180000 });
+let evErrs = 0; if (fl('css')) await p.addStyleTag({ content: fl('css') }).catch((e) => console.log('css failed ' + e));   // --css 'rule' (DIAG: e.g. the canvas's on-screen size)
 const rows = []; let profd = false; const t0 = Date.now();
 while (Date.now() - t0 < (secs + 240 * Math.max(1, rate / 3)) * 1000) {
   await sleep(1000);
-  const r = await p.evaluate(() => { const q = window.__dcProbe && window.__dcProbe(); return q && { hb: q.hb, booted: q.booted, aicaX: q.aicaX, fps: q.fps, pace: q.pace, fs: q.fskip, rest: q.restoring, hbr: q.hbSinceRestore, done: !!window.__benchResult, res: window.__benchResult && (window.__benchResult.room || window.__benchResult.solo), j: (() => { try { const f = document.querySelector('iframe'); const q = f && f.contentWindow.__dcProbe && f.contentWindow.__dcProbe(); return q && { x: q.aicaX, pace: q.pace, fs: q.fskip }; } catch (e) { return null; } })() }; }).catch(() => null);
+  const r = await p.evaluate(() => { const q = window.__dcProbe && window.__dcProbe(); return q && { hb: q.hb, booted: q.booted, aicaX: q.aicaX, fps: q.fps, pace: q.pace, fs: q.fskip, rest: q.restoring, hbr: q.hbSinceRestore, done: !!window.__benchResult, res: window.__benchResult && (window.__benchResult.room || window.__benchResult.solo), j: (() => { try { const f = document.querySelector('iframe'); const q = f && f.contentWindow.__dcProbe && f.contentWindow.__dcProbe(); return q && { x: q.aicaX, pace: q.pace, fs: q.fskip }; } catch (e) { return null; } })() }; }).catch((e) => { if (++evErrs <= 3) console.log('probe evaluate failed: ' + String(e && e.message || e).slice(0, 200)); return null; });
   if (!r) continue;
   if (stateF && r.booted && !r.rest && r.hbr >= 3 && stateHb < 0) {
     // --state PATH (repo-relative): replace the bench scene with a savestate through the worker's own loadState
@@ -91,9 +95,9 @@ while (Date.now() - t0 < (secs + 240 * Math.max(1, rate / 3)) * 1000) {
     const wt = b.targets().find((t) => /worker|other/.test(t.type()) && /flycast_worker\.js/.test(t.url()));
     if (wt && !abSess) { abSess = await wt.createCDPSession().catch((e) => { console.log('ab session failed ' + e); return null; }); }
     if (abSess) { abArm = abArm === 1 ? 0 : 1; abSwitch++;
-      const ev = await abSess.send('Runtime.evaluate', { expression: (abName.startsWith('js.') ? `self.${abName.slice(3)} = ${abArm ? 'true' : 'false'}; 1` : `self.Module._flycast_set_${abName}(${abVal[abArm]}); 1`) + (stateF && abReload ? `; self.__abState && self.onmessage({ data: { cmd: 'loadState', data: self.__abState.slice(0) } }); 1` : '') }).catch((e) => ({ exceptionDetails: String(e) }));
+      const ev = await abSess.send('Runtime.evaluate', { expression: (abName.startsWith('js.') ? `self.${abName.slice(3)} = ${abArm ? 'true' : 'false'}; 1` : abName.startsWith('fn.') ? `self.${abName.slice(3)}('${abVal[abArm]}'); 1` : `self.Module._flycast_set_${abName}(${abVal[abArm]}); 1`) + (stateF && abReload ? `; self.__abState && self.onmessage({ data: { cmd: 'loadState', data: self.__abState.slice(0) } }); 1` : '') }).catch((e) => ({ exceptionDetails: String(e) }));
       if (ev.exceptionDetails) console.log('ab set failed ' + JSON.stringify(ev.exceptionDetails).slice(0, 200));
-      abNext = Date.now() + abSecs * 1000; abSkip = 2; }
+      abNext = Date.now() + abSecs * 1000; abSkip = ABSKIP; }
   }
   if (r.booted && (!rows.length || rows[rows.length - 1].hb !== r.hb)) { rows.push(r); const pc = r.pace || {}; const f = r.fs || {};
     if (abArm !== null && abSwitch >= 2) { if (abSkip > 0) abSkip--; else if (+r.aicaX > 0) { const A = abAcc[abArm]; A.e += +pc.emu; A.w = (A.w || 0) + (+pc.wall - (+pc.paced || 0)); A.x += +r.aicaX; A.n++; } }
@@ -118,6 +122,7 @@ while (Date.now() - t0 < (secs + 240 * Math.max(1, rate / 3)) * 1000) {
     const ev = cs && await cs.send('Runtime.evaluate', { returnByValue: true, expression: `(function(){ const o = []; for (let i = 0; i < ${+pn}; i += 2) o.push(self.Module._sh4_mem_read16((0x${pa} + i) >>> 0) & 0xffff); return o; })()` }).catch(() => null);
     if (ev && ev.result && ev.result.value) { fs.writeFileSync(pf, Buffer.from(new Uint16Array(ev.result.value).buffer)); console.log('peek saved ' + pf); }
   }
+  if (r.done && !r.res) console.log('RESULT has no window: ' + await p.evaluate(() => JSON.stringify(window.__benchResult).slice(0, 600)).catch((e) => String(e)));
   if (r.done) { console.log('RESULT', JSON.stringify(r.res && { speed: r.res.speed, over: r.res.over, frames: r.res.frames, ms: r.res.ms })); break; }
 }
 if (abName) for (const k of [1, 0]) { const A = abAcc[k]; console.log(`AB ${abName}=${k} emu/guest-s=${A.x ? (A.e / A.x).toFixed(1) : 'n/a'} busy/guest-s=${A.x ? (A.w / A.x).toFixed(1) : 'n/a'} meanx=${A.n ? (A.x / A.n).toFixed(4) : 'n/a'} heartbeats=${A.n}`); }
