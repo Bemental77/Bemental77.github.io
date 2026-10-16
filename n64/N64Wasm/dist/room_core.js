@@ -26,6 +26,32 @@
 //   __n64InstallRoomCore(G, env) -> R   (once per realm; installs G.__n64State)
 (function (root) {
   'use strict';
+  // ═══════════════════════════════════════════════════════════════════════════
+  // THE CATCH-UP CEILING (2026-10-16) — no window of 5 s or more ever holds more than
+  // viHz x (1 + 5/300) guest fields per second (61/s at 60 Hz, 1.0167x), the GameCube
+  // PACE_* rule (4ed89e7). WHY: the 1.000x governor never runs a field BEFORE its slot, but
+  // it does run owed fields back (the two-period allowance back to back, then up to
+  // LS_REPAY_MS / REPAY.capMs of debt at up to 2x), and a room also runs hidden catch-up
+  // frames (rbCatchUp). Each is a short sprint, and a 5 s window that held a stall's
+  // repayment read as FAST-FORWARD: the live two-browser room after PR 266 measured 5-s
+  // windows of 1.044x / 1.032x engine and 1.040x / 1.102x by the page's own witness. The
+  // debt is still repaid — just at no more than 1/60 over the hardware rate, so it can never
+  // read as the guest running faster than the console.
+  // O(1): a ring of the last 5 s of field timestamps (at most N = floor(5000 x RATE) of them)
+  // bounds every window that starts inside it; M = the least C(s) - RATE x s over the fields
+  // that aged out bounds every longer one (a field at t may run iff C + 1 - RATE x t <= M).
+  // ?pacecap=0 = the control arm (no ceiling; the old behaviour).
+  root.__n64PaceCeiling = function (hz, extraPer5s) {
+    var RATE = hz * (1 + (extraPer5s == null ? 5 : extraPer5s) / 300) / 1000, WIN = 5000;
+    var N = Math.max(1, Math.floor(WIN * RATE + 1e-9));
+    var ts = new Float64Array(N), ks = new Float64Array(N), qh = 0, qn = 0, c = 0, m = Infinity;
+    function out() { var v = ks[qh] - RATE * ts[qh]; if (v < m) m = v; qh = (qh + 1) % N; qn--; }
+    function age(t) { while (qn > 0 && ts[qh] <= t - WIN) out(); }
+    var P = { hz: hz, held: 0, n: 0,
+      ok: function (t) { age(t); return qn < N && (m === Infinity || c + 1 - RATE * t <= m + 1e-9); },
+      note: function (t) { age(t); if (qn === N) out(); var k = (qh + qn) % N; ts[k] = t; ks[k] = c; qn++; c++; P.n++; } };
+    return P;
+  };
   root.__n64InstallRoomCore = function (G, env) {
     if (G.__n64RoomCore) return G.__n64RoomCore;
     var FPR_N = 128, FPR = { f: new Int32Array(FPR_N), v: new Uint32Array(FPR_N), n: 0 };
@@ -149,6 +175,20 @@
     var LS_REPAY_Q = new URLSearchParams(env.search).get('lsrepay');
     var LS_REPAY_MS = (LS_REPAY_Q != null && LS_REPAY_Q !== '' && +LS_REPAY_Q >= 0) ? +LS_REPAY_Q : 250;
     var LS_REPAY_GAP = 0.5;
+    // THE CATCH-UP CEILING (root.__n64PaceCeiling above): every field this console's guest lives
+    // through — credited or a hidden catch-up — is noted; none runs while a >= 5 s window
+    // ending now is full. Re-simulated and run-ahead frames are not new guest time.
+    var PACE_ON = new URLSearchParams(env.search).get('pacecap') !== '0';
+    // (kept OUT of LS: the core worker posts every LS field to the page, and a function in it
+    // makes that postMessage throw — the page's whole room mirror then stops)
+    var PACER = null;
+    function lsPace() {
+      if (!PACE_ON || !(LS.viHz > 0)) return null;
+      if (!PACER || PACER.hz !== LS.viHz) PACER = root.__n64PaceCeiling(LS.viHz);
+      return PACER;
+    }
+    function lsPaceOk() { var P = lsPace(); if (!P || P.ok(performance.now())) return true; P.held++; return false; }
+    function lsPaceNote() { var P = lsPace(); if (P) P.note(performance.now()); }
     // ?lsdrive=raf|timer|all — WHICH DRIVERS may run a lockstep frame. A
     // measurement arm; 'all' (rAF + 4 ms timer + input-arrival kick) is the
     // shipped default.
@@ -193,8 +233,9 @@
       // REPAYING (beyond the two-period allowance): one owed frame per LS_REPAY_GAP x period
       if (now - due > period * 2 && keep > period * 2) {
         if (LS.lastDue && now - LS.lastDue < period * LS_REPAY_GAP) { LS.repayHeld = (LS.repayHeld | 0) + 1; return false; }
+        if (!lsPaceOk()) return false;
         LS.repaidMs = (LS.repaidMs || 0) + period;
-      }
+      } else if (!lsPaceOk()) return false;
       LS.lastDue = now;
       return true;
     }
@@ -1493,7 +1534,7 @@
           var hPer = 1000 / LS.viHz / ((LS.pace > 0 && LS.pace <= 1) ? LS.pace : 1);
           hOwed = performance.now() >= LS.baseWall + (LS.frame - LS.baseFrame) * hPer;
         }
-        RB.hidden++; LS.frame++; if (!hOwed) LS.baseFrame++; else LS.hiddenOwed = (LS.hiddenOwed | 0) + 1;
+        RB.hidden++; LS.frame++; lsPaceNote(); if (!hOwed) LS.baseFrame++; else LS.hiddenOwed = (LS.hiddenOwed | 0) + 1;
         if (G.__n64RbLog) G.__n64RbLog.push(['hidden', r.frame]);
       } else {
         if (!rbStep(ls, r.frame, r.image, true, false)) return rbFail(ls, 'frame failed: ' + N64S.fault);
@@ -1633,7 +1674,7 @@
       // Frames that alone cost more than a field period — a burst this device
       // cannot absorb inside the governor's two-period allowance if it repeats.
       if (LS.viHz > 0 && dt > 1000 / LS.viHz) { LS.costOver = (LS.costOver || 0) + 1; if (dt > (LS.costMax || 0)) LS.costMax = dt; }
-      LS.frame++;
+      LS.frame++; lsPaceNote();
       try { lsGlWitness(); } catch (e) {}
       try { LS.lastFp = M._neil_last_fp ? (M._neil_last_fp() >>> 0) : 0; } catch (e) { LS.lastFp = 0; }
       // TEST SEAM: (frame, fingerprint) of the last FPR_N presented frames, so a rig comparing
@@ -1745,6 +1786,7 @@
         if (RB.ready && typeof ls.rbCatchUp === 'function') {
           var cu = ls.rbCatchUp();
           for (var ci = 0; ci < cu; ci++) {
+            if (!lsPaceOk()) break;          // THE CATCH-UP CEILING: a hidden frame is guest time too
             var rh = ls.beginFrame(lsLocalPads(), { hidden: true });
             if (!rh || !rh.ready || !rbRunFrame(ls, rh, true)) break;
             ran++;
@@ -2151,7 +2193,7 @@
         waitingOn: LS.waitingOn.slice(),
         stalls: LS.stalls,
         stallMs: Math.round(LS.stallMs),
-        reanchors: LS.reanchors, repaidMs: Math.round(LS.repaidMs || 0), repayHeld: LS.repayHeld | 0, hiddenOwed: LS.hiddenOwed | 0,
+        reanchors: LS.reanchors, repaidMs: Math.round(LS.repaidMs || 0), repayHeld: LS.repayHeld | 0, paceHeld: PACER ? PACER.held : 0, hiddenOwed: LS.hiddenOwed | 0,
         fault: LS.fault,
         engine: rep,
         viTotal: (function () {
