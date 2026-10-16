@@ -975,3 +975,20 @@ toggled in the worker; new `fn.` form and `--abskip`), GPU throttled, emu ms per
 PSO: **-12.4%** against a -0.8% placebo. Gauntlet: -4.3% against -1.6%, inside the floor —
 its level runs ~4 s of emulation per guest second at 6.2 and draws 1-2 pictures a second, so
 the picture is not its problem.
+
+**Toaster gate** (`toaster_bench --pages dreamcast --rate 6.2 --reps 2 --ladder 0 --room 0`, GPU
+throttled, raster proof 5.95-6.66x / arm difference 4.57-6.03x; `--qs lowrender=0` = off;
+two interleaved on/off pairs, load 2-11):
+
+| arm | solo speed (reps) |
+|---|---|
+| low-render (auto: SwiftShader detected) | 0.672, 0.806, 0.827 (one rep: no window — boot passed the bench's 4-min wait) |
+| `lowrender=0` | 0.614, 0.611, 0.663, 0.683 |
+
+Mean 0.768 vs 0.643. Still 0/7 PASS. The 4-min boot miss is new with the GPU throttled (twice
+in ~20 runs, also seen with `lowrender=0`): a slow device's boot now pays for its rasterizer too.
+
+**room2** (`toaster_room2 room 6.2 40`, GPU in one CORES/R cgroup, raster 6.07-6.65x):
+on 0.936 / 0.945 (steady 0.984 / 0.983); `&lowrender=0` 0.973 / 0.970 (steady 0.976 / 0.976).
+Null — the room starts on PSO's title, which draws little. One earlier "on" room2 run never
+started (the host never reached Allow); the retry ran.
