@@ -2588,6 +2588,14 @@ window.GcRate = (function () {
                   + 'frozen at the last frame that arrived. Reload the page to acquire a new device.' };
     // Nothing to say about a present path that was never asked to run.
     if (!s.started || !s.wgpuOk) return null;
+    // A NETPLAY ROOM HOLDING THIS CONSOLE IS NOT A RENDER STALL (2026-10-16, a real report from a
+    // Windows/RTX 3060 Ti host alone in room N42HM: "PRESENT STALLED ... the stall is upstream of
+    // present — the emulator worker" over a console whose room was waiting for player 2). The room's
+    // frame gate (THE LOCKSTEP INTERLOCK) withholds every frame credit until the room has an input
+    // for that frame, so the publish seqlock stops BY DESIGN while it waits — nothing is wedged.
+    // `s.room` is the gate's own account (window.__gcRoomHold, built where GCLS lives); it names what
+    // the room is waiting for, and it wins over the stall and the boot timeout.
+    if (s.room) return gcRoomVerdict(s.room);
     // Hidden tabs stop rAF, so the paint stamp legitimately goes stale. Not a fault.
     if (s.hidden) return null;
     if (!s.everPainted) {
@@ -2607,6 +2615,25 @@ window.GcRate = (function () {
                   + 'still alive, so the stall is upstream of present — the emulator worker.' };
     return null;
   }
+  // The room hold as a render-path verdict: 'warn' (the picture is held on purpose, by the room),
+  // never 'bad' (that claims a fault) and never 'ok' (the game is not advancing). `kind` lets the
+  // badge announce it and a rig assert on it.
+  function gcRoomVerdict(h) {
+    return { level: 'warn', kind: 'room', room: h.kind, short: 'netplay: ' + h.short, why: h.why };
+  }
+  // When a hold ENDS (the room releases, or hands the console back to solo) the last paint is as old as
+  // the hold was long, so the stall clock restarts there — as it does on a tab coming back — instead of
+  // reading the hold's own duration as a stall in the second before the room's first picture lands.
+  // MEASURED (tools/gc_netplay_room_test.mjs ALONE=1): PRESENT STALLED for 1-2 s at every release, with
+  // the renderer acking in 19 ms.
+  var _roomHoldWas = false, _roomHoldClearAt = 0;
+  function gcRoomHoldNow() {
+    var h = null;
+    try { h = (typeof window.__gcRoomHold === 'function') ? window.__gcRoomHold() : null; } catch (e) { h = null; }
+    if (_roomHoldWas && !h) _roomHoldClearAt = performance.now();
+    _roomHoldWas = !!h;
+    return h;
+  }
   // Live inputs for the pure function above. Kept separate so the tests can bypass it.
   function gcPresentHealthNow() {
     var G = window.__gcGpu;
@@ -2614,13 +2641,16 @@ window.GcRate = (function () {
       started:      !!window.__gcStartedAtMs,
       wgpuOk:       gcWgpuOk(),
       deviceLost:   G.deviceLost || null,
+      room:         gcRoomHoldNow(),
       everPainted:  !!_presentLastMs,
       // Boot window starts when the disc has finished streaming (0 while it streams); paths
       // that never stream a disc fall back to the Start click.
       msSinceStart: (!window.__gcStartedAtMs || window.__gcRomStreaming) ? 0
-                  : (Date.now() - (window.__gcRomStreamedAtMs || window.__gcStartedAtMs)),
+                  : Math.min(Date.now() - (window.__gcRomStreamedAtMs || window.__gcStartedAtMs),
+                             _roomHoldClearAt ? performance.now() - _roomHoldClearAt : Infinity),
       // performance.now() and _presentLastMs share a time origin; Date.now() does not.
-      msSincePaint: _presentLastMs ? (performance.now() - _presentLastMs) : 0,
+      msSincePaint: _presentLastMs ? Math.min(performance.now() - _presentLastMs,
+                                              _roomHoldClearAt ? performance.now() - _roomHoldClearAt : Infinity) : 0,
       hidden:       (typeof document !== 'undefined' && document.hidden) || _presentHiddenGraceUntil > performance.now(),
     });
   }
@@ -2632,6 +2662,10 @@ window.GcRate = (function () {
       return { level: 'warn', short: 'render: SOFTWARE (?wgpu=0)',
                why: 'You opened this page with ?wgpu=0, which disables the WebGPU backend on purpose. '
                   + 'Dolphin falls back to its CPU rasterizer. Remove ?wgpu=0 for the normal path.' };
+    if (!gcWgpuOk() && window.__gcStartedAtMs && !G.deviceLost) {
+      var rh = gcRoomHoldNow();
+      if (rh) return gcRoomVerdict(rh);
+    }
     if (gcWgpuOk()) {
       // A capability that WAS true at load is not evidence the path is running now.
       var h = gcPresentHealthNow();
@@ -2693,7 +2727,15 @@ window.GcRate = (function () {
     // status line carry it too — the badge alone is a small span nobody is watching at t=90s.
     // Only bad-involving transitions: this runs at 1 Hz, and the routine probing…->✓ settle on
     // every normal load is not news.
+    gcRoomBanner(v.kind === 'room' ? v : null);
     if (v.short !== _lastBadgeShort) {
+      // The room's hold is news too: the status line and the log say what the room is waiting for.
+      if (v.kind === 'room') { pageLog('[netplay] ' + v.short + ' — ' + v.why); setStatus(v.short.replace(/^netplay: /, '')); }
+      else if (_lastBadgeShort && /^netplay: /.test(_lastBadgeShort)) {
+        var ended = window.__gcRoomEnded && (Date.now() - window.__gcRoomEnded.ms < 10000) ? window.__gcRoomEnded : null;
+        var msg = ended ? 'The room ended (' + ended.why + ') — you are playing on by yourself.' : 'Playing.';
+        pageLog('[netplay] ' + msg); setStatus(msg); if (ended) toast(msg);
+      }
       if (_lastBadgeShort !== null && (v.level === 'bad' || _lastBadgeLevel === 'bad')) {
         pageLog('[gpu] render path changed: ' + _lastBadgeShort + ' -> ' + v.short + ' — ' + v.why);
         if (v.level === 'bad') setStatus(v.short + ' — see 🩺 Diagnostics');
@@ -2707,6 +2749,32 @@ window.GcRate = (function () {
     gcApplyStartGuard(v);
   }
   var _lastBadgeShort = null, _lastBadgeLevel = null;
+  // ON THE PICTURE, NOT ONLY IN A 12px BADGE: a held room shows a banner over the game saying what it
+  // is waiting for (a frozen frame with nothing on it reads as a crash). Body-level and fixed like
+  // #toast, and moved into the fullscreen element when one is open, for the same reason.
+  var _roomBannerEl = null;
+  function gcRoomBanner(v) {
+    if (!v && !_roomBannerEl) return;
+    if (!_roomBannerEl) {
+      _roomBannerEl = document.createElement('div'); _roomBannerEl.id = 'gcRoomHold';
+      _roomBannerEl.setAttribute('role', 'status'); _roomBannerEl.setAttribute('aria-live', 'polite');
+      _roomBannerEl.style.cssText = 'position:fixed;left:50%;top:18%;transform:translateX(-50%);z-index:9000;max-width:min(560px,calc(100vw - 32px));'
+        + 'box-sizing:border-box;padding:12px 16px;border-radius:8px;background:rgba(10,14,24,.88);color:#fff;font:600 15px/1.35 system-ui,sans-serif;'
+        + 'text-align:center;pointer-events:none;box-shadow:0 4px 18px rgba(0,0,0,.5);display:none';
+    }
+    var host = document.fullscreenElement || document.webkitFullscreenElement || document.body;
+    if (_roomBannerEl.parentNode !== host) host.appendChild(_roomBannerEl);
+    if (!v) { _roomBannerEl.style.display = 'none'; return; }
+    var t = v.short.replace(/^netplay: /, ''), d = v.why;
+    if (_roomBannerEl.getAttribute('data-t') !== t + '|' + d) {
+      _roomBannerEl.setAttribute('data-t', t + '|' + d); _roomBannerEl.setAttribute('data-kind', v.room || '');
+      _roomBannerEl.textContent = '';
+      var a = document.createElement('div'); a.textContent = t; _roomBannerEl.appendChild(a);
+      var b = document.createElement('div'); b.textContent = d; b.style.cssText = 'font-weight:400;font-size:13px;opacity:.85;margin-top:4px';
+      _roomBannerEl.appendChild(b);
+    }
+    _roomBannerEl.style.display = 'block';
+  }
   // A black canvas behind an ENABLED Start button reads as "broken", not "unsupported".
   // #btnStart shipped with no disabled state and the only assignment to it was inside
   // startEmulator (i.e. after the click), so a no-WebGPU visitor could start the emulator
@@ -6481,6 +6549,22 @@ window.GcRate = (function () {
     // The no-WebGPU case is owned by the capability verdict, not duplicated here.
     ck('88 no-WebGPU is left to the capability verdict, not double-reported',
        gcPresentHealth(withH({ wgpuOk: false, everPainted: false, msSinceStart: 999999 })) === null, 'wgpuOk=false');
+    // THE ROOM HOLD (2026-10-16): a netplay room withholding frames is NOT a present stall. A real
+    // host alone in a room read "PRESENT STALLED ... the emulator worker" over a room waiting for player 2.
+    var held = { kind: 'alone', short: 'WAITING FOR PLAYER 2', why: 'You are hosting room ABCDE.' };
+    var rs = gcPresentHealth(withH({ msSincePaint: 111000, room: held }));
+    ck('88r a room hold past the stall threshold is NOT a render stall', !!rs && rs.level !== 'bad' && rs.kind === 'room',
+       rs ? rs.level + ' ' + rs.short : 'null');
+    ck('88r2 the room verdict names what the room waits for', !!rs && /WAITING FOR PLAYER 2/.test(rs.short) && rs.room === 'alone',
+       rs ? rs.short : 'null');
+    var rb = gcPresentHealth(withH({ everPainted: true, msSinceStart: GC_PRESENT_BOOT_MS * 3, msSincePaint: 90000, room: { kind: 'left', short: 'PLAYER LEFT — WAITING', why: 'x' } }));
+    ck('88r3 a player who left is said as that, never as an emulator fault', !!rb && rb.level === 'warn' && rb.room === 'left',
+       rb ? rb.short : 'null');
+    var rl = gcPresentHealth(withH({ msSincePaint: 111000, room: held, deviceLost: { reason: 'destroyed', message: 'm' } }));
+    ck('88r4 a lost device still outranks the room hold', !!rl && rl.level === 'bad' && /DEVICE LOST/.test(rl.short),
+       rl ? rl.short : 'null');
+    ck('88r5 with no room hold the stall still fires (the watchdog is not weakened)',
+       (function () { var r = gcPresentHealth(withH({ msSincePaint: GC_PRESENT_STALL_MS + 1, room: null })); return !!r && r.level === 'bad'; })(), '');
     // The Start guard is the "black canvas behind an enabled Start" fix. Assert the decision,
     // not the DOM, so it holds on the mobile shell too.
     // gcApplyStartGuard writes the visible status line, so these two drive real DOM. Snapshot
@@ -10327,6 +10411,15 @@ window.GcRate = (function () {
     }
     if (hold !== RRY.hold) { RRY.hold = hold; if (hold) RRY.holds++; try { Atomics.store(paceI32, SHIP_HOLD, hold); } catch (e) {} }
   }
+  function gcLsToSolo() {
+    gcLsGate = false; gcLsStage = null;              // pads write the SAB directly again
+    Atomics.store(paceI32, LS_ARMED, 0);
+    if (RBP.scheme) { RBP.scheme = false; RBP.stopGen++; Atomics.store(RBP.i32, RBC.HIDDEN, 0); Atomics.store(RBP.i32, RBC.STOP_GEN, RBP.stopGen); }
+    GCLS.armed = false; GCLS.running = false; GCLS.pendingAck = -1;
+    gcRaOff(); gcRaReclaim(); GCRA.retro.length = 0; GCRA.begun = null; GCRA.plan = null;
+    var owed = Math.min(gcLsEarned, MAX_BACKLOG); gcLsEarned = 0; gcRaMirror();
+    if (owed > 0) { Atomics.add(paceI32, 0, owed); Atomics.notify(paceI32, 0); }
+  }
   function gcLsStep() {
     var ls = gcLsEngine();
     gcRaBeat();
@@ -10335,17 +10428,27 @@ window.GcRate = (function () {
     // room no longer exists. Credits the clock earned while gated go back through the model's
     // backlog clamp (pool.add), so this can never fast-forward the guest (gate #9).
     if (GCLS.armed && !GCLS.session) {
-      gcLsGate = false; gcLsStage = null;              // pads write the SAB directly again
-      Atomics.store(paceI32, LS_ARMED, 0);
-      if (RBP.scheme) { RBP.scheme = false; RBP.stopGen++; Atomics.store(RBP.i32, RBC.HIDDEN, 0); Atomics.store(RBP.i32, RBC.STOP_GEN, RBP.stopGen); }
-      GCLS.armed = false; GCLS.running = false; GCLS.pendingAck = -1;
-      gcRaOff(); gcRaReclaim(); GCRA.retro.length = 0; GCRA.begun = null; GCRA.plan = null;
-      var owed = Math.min(gcLsEarned, MAX_BACKLOG); gcLsEarned = 0; gcRaMirror();
-      if (owed > 0) { Atomics.add(paceI32, 0, owed); Atomics.notify(paceI32, 0); }
+      gcLsToSolo();
       gcLsSay('left the room — this console plays on by itself from frame ' + Atomics.load(paceI32, PAD_ACK));
       return;
     }
     if (!GCLS.armed || !ls) return;
+    // THE ROOM ENDED UNDER A CONSOLE THAT WAS PLAYING IN IT (2026-10-16). The engine fails a room
+    // whose other side went silent past its stall budget (lib/netplay.js _stallBudget: a guest gives
+    // up on a vanished host after 30 s) or that closed; this used to DISENGAGE and wait "until the
+    // room is back" — which it never is — so the last player sat on a frozen frame forever, and the
+    // render watchdog called it a present stall. A room that is over hands the console back to its
+    // own clock exactly as Leave does (the branch above). A DESYNC is the exception: that room
+    // stops on the frame the detector named, which is the evidence, and it says so.
+    if (GCLS.running && GCLS.startFrame >= 0 && !ls.desync &&
+        (ls.state === 'failed' || ls.state === 'closed' || ls.state === 'ended')) {
+      GCLS.roomEnded = { at: Atomics.load(paceI32, PAD_ACK), why: String(ls.error || ls.state), ms: Date.now() };
+      window.__gcRoomEnded = GCLS.roomEnded;
+      gcLsSay('the room ended (' + GCLS.roomEnded.why + ') — handing this console back to its own clock');
+      gcLsToSolo();
+      gcNetPartySync();
+      return;
+    }
     if (ls.state !== 'running' && ls.state !== 'stalled') {
       gcRaOff();
       if (GCLS.running) {
@@ -10543,7 +10646,7 @@ window.GcRate = (function () {
       GCRA.begun = r; GCRA.races++;
       return;
     }
-    GCLS.stalling = false; GCLS.waitingOn = []; GCLS.stallReason = null;
+    GCLS.stalling = false; GCLS.waitingOn = []; GCLS.stallReason = null; GCLS.lastReleaseMs = performance.now();
     gcLatWitness(ls, r);
     if (unsafe) RBP.unsafeFrames++;
     if (RBP.scheme) {
@@ -10708,7 +10811,7 @@ window.GcRate = (function () {
           var set = ls.cards;
           clearInterval(timer); timer = 0;
           gcCardChoose(set).then(function (c) {
-            GCCARD.state = 'agreed'; GCCARD.why = null; GCCARD.key = c.key; GCCARD.t = c.cardTime;
+            GCCARD.state = 'agreed'; GCCARD.why = null; GCCARD.key = c.key; GCCARD.t = c.cardTime; GCCARD.agreedMs = Date.now();
             GCCARD.size = c.card ? c.card.byteLength : 0; GCCARD.hash = c.key.split('@')[0];
             gcLsSay('card agreed: ' + (c.card ? 'the host\'s card ' + GCCARD.hash : 'one BLANK card (the host has none saved)') +
                     ' at card clock ' + c.cardTime + (GCCARD.persist ? ' — this console persists what the room saves' :
@@ -10927,6 +11030,97 @@ window.GcRate = (function () {
              // and how often the guest found this thread silent but the integrator's lock held
              bk: Atomics.load(paceI32, 242), selfGranted: Atomics.load(paceI32, 223), selfLockBusy: Atomics.load(paceI32, 224) };
   };
+  // ── IS THE ROOM HOLDING THIS CONSOLE'S PICTURE? (2026-10-16) ──────────────────────────────────
+  // The render watchdog (gcPresentHealth) reads the publish seqlock, and a room's frame gate stops
+  // that seqlock ON PURPOSE: no credit reaches the worker until the room has this frame's input. A
+  // host alone in a room, a room whose other player is still loading, and a room whose other player
+  // went silent all looked identical to a wedged emulator worker ("PRESENT STALLED", reported by a
+  // real host on an RTX 3060 Ti, alone in room N42HM, frozen on the last boot frame). This is the
+  // gate's own account, in words, or null when the room is not what is holding the picture — in
+  // particular null while THIS console's own worker owes a frame (pendingAck), which is a real stall
+  // and must keep reading as one.
+  var GC_ROOM_HOLD_MS = 1500;
+  var GCHOLD = { ack: -1, ackAt: 0 };
+  function gcRoomWho(p) { return p === 0 ? 'the host' : 'player ' + ((p | 0) + 1); }
+  function gcRoomHold() {
+    var s = GCLS.session, ls = gcLsEngine();
+    if (GCLS.roomEnded && !GCLS.armed && Date.now() - GCLS.roomEnded.ms < 8000)
+      return null;                                     // just handed back to solo; the status line says so
+    // BEFORE THE GATE ARMS the room can already be holding this console: the boot waits for the room
+    // to agree ONE memory card (gcLsAgreeCard), and that set is not complete while nobody else is in.
+    // MEASURED on the live site (2026-10-16, a host alone on the WGPU path): 'card pending' for the
+    // whole run, the JIT's boot frames stop at the takeover, and the watchdog read PRESENT STALLED.
+    var cardWait = !GCLS.armed && !!window.__gcStartedAtMs && (GCCARD.state === 'pending' || GCCARD.state === 'failed');
+    // ...and between the card being agreed and the gate arming, the recomp is booting to its first frame
+    // start (the JIT's pictures have stopped): bounded to a minute, past which silence is a real fault.
+    var booting = !GCLS.armed && !!window.__gcStartedAtMs && GCCARD.state === 'agreed' && GCCARD.agreedMs &&
+                  Date.now() - GCCARD.agreedMs < 60000 && !(GCLS.startFrame >= 0);
+    if (s && ls && booting) return { kind: 'starting', short: 'STARTING THE ROOM',
+      why: 'Every console in room ' + (s.code || '') + ' has agreed the memory card; this one is starting Mario Party 4 at the room\'s frame 0.' };
+    if (!s || !ls || !(GCLS.armed || cardWait)) return null;
+    var code = s.code || '', host = !!s.isHost;
+    var rows = null; try { rows = gcNetPartyRows(s, { gated: true, running: !!GCLS.running }); } catch (e) {}
+    rows = rows || [];
+    var others = rows.filter(function (r) { return r.state !== 'open' && !/\(you\)/.test(r.who); });
+    var gone = others.filter(function (r) { return r.state === 'disconnected'; });
+    if (cardWait && GCCARD.state === 'failed') return { kind: 'failed', short: 'ROOM COULD NOT START', why: String(GCCARD.why || 'the memory card check failed').replace(/^⚠\s*/, '') };
+    if (!GCLS.running) {
+      if (ls.desync) return { kind: 'desync', short: 'ROOM STOPPED — out of sync',
+        why: 'The consoles in this room stopped agreeing at frame ' + ls.desync.frame + ', so the room stopped there rather than ' +
+             'let the games silently differ. Reload and rejoin with the code ' + code + ' to play again.' };
+      if (ls.state === 'failed') return { kind: 'failed', short: 'ROOM COULD NOT START',
+        why: 'Room ' + code + ' refused to start: ' + (ls.error || 'the engine failed') + '. Reload and rejoin with the code ' + code + '.' };
+      var bar = gcNetBar(s);
+      if (!others.length || (bar && bar.alone) || others.length === gone.length)
+        return { kind: 'alone', short: host ? 'WAITING FOR PLAYER 2' : 'WAITING FOR THE HOST',
+          why: (host ? 'You are hosting room ' + code + '. Mario Party 4 is loaded and held at its first frame until another player joins — share the code ' + code + '. '
+                     : 'This console is loaded and held at the room\'s first frame until the host is back. ') +
+               'Every console starts together at frame 0, so nothing runs until then. Nothing is broken.' };
+      var notReady = others.filter(function (r) { return r.state !== 'ready'; }).map(function (r) { return r.who; });
+      return { kind: 'loading', short: 'WAITING FOR ' + (notReady.length ? notReady.join(' AND ') : 'THE OTHER PLAYER').toUpperCase() + ' TO LOAD',
+        why: 'Room ' + code + ': every console starts together at frame 0, and this one is held there until ' +
+             (notReady.length ? notReady.join(' and ') : 'everyone') + ' has loaded the game. It starts by itself.' };
+    }
+    // Running: the room holds a frame only when the ENGINE refused it (stallReason) and this console's
+    // own worker owes nothing, and the guest has not moved for GC_ROOM_HOLD_MS.
+    var ack = paceI32 ? Atomics.load(paceI32, PAD_ACK) : 0, now = performance.now();
+    if (ack !== GCHOLD.ack) { GCHOLD.ack = ack; GCHOLD.ackAt = now; }
+    // THE ROOM'S OWN RENDER YIELD (A ROOM ON A SOFTWARE WEBGPU ADAPTER, above): with a renderer that
+    // takes >= ROOM_SLOW_RENDER_MS a frame, the room DELIBERATELY draws a keep-alive picture only (one in
+    // flight, none until the renderer has idled gcRoomRenderIdleMs()), so the guests keep the CPU.
+    // MEASURED (tools/gc_netplay_room_test.mjs, SwiftShader WebGPU, 2026-10-16): drawMsEma 0.98-22.7 s,
+    // holding, 0 published, the guest at 0.98-1.00x — and the watchdog read PRESENT STALLED for the
+    // whole room; acks arrived 20-60 s apart (a keep-alive after a hold is a full, self-contained frame,
+    // far dearer than the EMA). That is a decision, not a stall, while the GUEST IS ADVANCING (it ran a
+    // frame in the last 10 s: the worker is alive) and the renderer acked within the last 3 minutes; the first-ack ("blind") phase
+    // counts for the room's first minute only. Never on a hardware GPU after its first ack: an MP4
+    // frame is nowhere near 250 ms there.
+    // "Advancing" with room for a scene load: on a software GPU one MP4 loading frame measured 1-2.5 s.
+    var moving = now - GCHOLD.ackAt < 10000;
+    var slowYield = RRY.ema >= ROOM_SLOW_RENDER_MS && RRY.lastAck && now - RRY.lastAck < 180000;
+    var blindYield = !RRY.lastAck && GCLS.clockT0 && now - GCLS.clockT0 < 60000;   // the room's first picture is not drawn yet
+    if (ROOM_YIELD && GCLS.running && moving && (slowYield || blindYield))
+      return { kind: 'yield', short: slowYield ? 'SLOW GPU — A PICTURE EVERY FEW SECONDS' : 'DRAWING THE FIRST PICTURE',
+        why: slowYield
+          ? 'This device draws a frame in ' + (RRY.ema / 1000).toFixed(1) + ' s (a software or very slow GPU), so the room keeps the game ' +
+            'running at full speed for everyone and shows only an occasional picture here. The game itself is not stalled.'
+          : 'The room is running; this device\'s renderer has not finished its first picture yet, and the room sends it no more until it ' +
+            'has (so a slow GPU cannot hold the game back). The game itself is not stalled.' };
+    if (now - GCHOLD.ackAt < GC_ROOM_HOLD_MS || GCLS.pendingAck >= 0 || !GCLS.stallReason) return null;
+    if (GCLS.stallReason === 'memory budget') return null;
+    var waits = (GCLS.waitingOn || []).map(gcRoomWho);
+    var heldS = Math.round((now - GCHOLD.ackAt) / 1000);
+    if (gone.length)
+      return { kind: 'left', short: (gone.length > 1 ? 'PLAYERS LEFT' : gone[0].who.toUpperCase() + ' LEFT') + ' — WAITING',
+        why: (gone.map(function (r) { return r.who; }).join(' and ')) + ' disconnected ' + heldS + 's ago. ' +
+             (host ? 'Their controller goes idle and the game carries on without them in a moment; they can rejoin with the code ' + code + '.'
+                   : 'This console is trying to get back into the room; if the host does not come back, it plays on by itself.') };
+    return { kind: 'input', short: 'WAITING FOR ' + (waits.length ? waits.join(' AND ') : 'THE OTHER PLAYER').toUpperCase(),
+      why: 'Room ' + code + ' has held this console for ' + heldS + 's because ' + (waits.length ? waits.join(' and ') : 'another player') +
+           '\'s input for the next frame has not arrived (their connection or their page has stopped sending). The game resumes ' +
+           'by itself when it does; a player who stays silent is dropped and the room plays on.' };
+  }
+  window.__gcRoomHold = gcRoomHold;
   window.__gcLockstep = function () {
     var ls = gcLsEngine();
     return {
@@ -10961,6 +11155,8 @@ window.GcRate = (function () {
       ownAhead: (GCLS.running && GCLS.clockT0 && paceI32) ? +((Atomics.load(paceI32, PAD_ACK) - GCLS.clockF0) - (performance.now() - GCLS.clockT0) * GUEST_HZ / 1000).toFixed(2) : null,
       selfFrames: GCRA.frames | 0, hiddenFrames: RBP.hidden | 0,
       hashSink: GCLS.hashSink, fault: GCLS.fault,
+      // the room ended under this console while it played (gcLsStep): { at, why, ms } — it plays on solo
+      roomEnded: GCLS.roomEnded || null,
       // the card every console booted (THE ROOM'S MEMORY CARD) and the tag the barrier compared
       card: { state: GCCARD.state, why: GCCARD.why, key: GCCARD.key, size: GCCARD.size,
               persist: GCCARD.persist, beats: GCCARD.beats },
