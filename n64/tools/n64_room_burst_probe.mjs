@@ -54,6 +54,12 @@ const JSON_OUT = flag('json', '');
 // --unthrottle-at S: lift the guest's worker throttle S seconds into the measured window (the
 // device "gets faster": a gated room must return to zero-lag mode, rbResume, with 0 desyncs).
 const UNTHROTTLE_AT = +flag('unthrottle-at', '0');
+// --trace PATH: a Chrome trace of the HOST browser (every process: V8 compile / wasm / GC
+// categories) over the first --trace-sec s of the measured window — what the renderer's
+// ThreadPool threads (V8's background compile and GC) spend their time on.
+const TRACE = flag('trace', ''), TRACE_SEC = +flag('trace-sec', '30');
+const TRACE_CATS = ['toplevel', 'v8', 'v8.wasm', 'disabled-by-default-v8.wasm.detailed', 'disabled-by-default-v8.compile',
+  'disabled-by-default-v8.gc', 'devtools.timeline', '__metadata'];
 const CHROME = process.env.CHROME_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
 const CG_ROOT = '/sys/fs/cgroup/cpu';
 const ANDROID_UA = 'Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36';
@@ -215,6 +221,7 @@ try {
   out.startMs = Date.now() - t0;
   if (!(a && b && a.running && b.running)) throw new Error('room never started: host ' + JSON.stringify(a).slice(0, 300) + ' join ' + JSON.stringify(b).slice(0, 300));
   await sleep(WARM * 1000);
+  if (TRACE) await H.page.tracing.start({ path: TRACE, categories: TRACE_CATS });
   const tl = [];
   const s0 = { h: await sample(H), j: await sample(J) };
   let lh = s0.h, lj = s0.j;
@@ -232,6 +239,20 @@ try {
               jScreen: j.scr && lj.scr ? j.scr.changes - lj.scr.changes : null, jMade: j.w && j.w.fpsText,
               hScreen: h.scr && lh.scr ? h.scr.changes - lh.scr.changes : null, hK: h.rb && h.rb.k });
     lh = h; lj = j;
+    if (TRACE && i + 1 === TRACE_SEC) { await H.page.tracing.stop(); out.trace = TRACE; }
+  }
+  if (TRACE && !out.trace) { await H.page.tracing.stop(); out.trace = TRACE; }
+  // --jitstats (needs workerrig=clock in the query): the JIT's own counters, from the core worker —
+  // recompile-cache hits, live offers, corpus jobs sent / cached, position-independent spans
+  if (argv.includes('--jitstats')) {
+    const src = `(function(){var B=self.bementalMips;if(!B)return null;var A=B.async,W=B.warm,R=B.reloc,s=B.stats;
+      return JSON.stringify({async:{offered:A.offered,installed:A.installed,stale:A.stale,failed:A.failed,modules:A.modules,reoffered:A.reoffered,wstat:A.wstat||null},
+        warm:{offered:W.offered,cached:W.cached,dropped:W.dropped},reloc:{moves:R.moves,pages:R.pages,resent:R.resent,thin:R.thin},
+        stats:{blocks:s.blocks,cacheHits:s.cacheHits,asyncOffered:s.asyncOffered,fails:s.fails,picSpans:s.picSpans|0,absSpans:s.absSpans|0}});})()`;
+    out.jit = {};
+    for (const [k, P] of [['host', H], ['join', J]]) {
+      try { out.jit[k] = JSON.parse(await P.page.evaluate((x) => window.__n64Worker.eval(x), src)); } catch (er) { out.jit[k] = { err: String(er.message || er).slice(0, 200) }; }
+    }
   }
   const e = { h: lh, j: lj };
   const secs = (e.h.t - s0.h.t) / 1000, viHz = e.h.viHz || 60;

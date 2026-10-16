@@ -37,6 +37,7 @@ const src = fs.readFileSync(SRCFILE, 'utf8');
 
 // --- synthetic guest layout (byte addresses inside the fake linear memory) ---
 const SRC = 0x10000, ENTRY = 0x20000, STRIDE = 32;
+const PICBP = 0x5f0000, ENTRY2 = 0x30000;   // the span page's precomp_block; where a moved block's entries go
 const REG = 0x40000, HI = 0x40100, LO = 0x40108;
 const PCG = 0x40200, LASTADDR = 0x40204, NEXTINT = 0x40208, SKIPJ = 0x40210, JTA = 0x40214, ACTUALA = 0x40218;
 const COUNT = 0x62000 + 9 * 4;                 // &g_cp0_regs[CP0_COUNT_REG]
@@ -158,6 +159,11 @@ function makeWorld(words, opts = {}) {
   // the core always invokes a block through `PC->ops()`, so PC == entryPtr on
   // entry; the delay-slot guard's `call_indirect` relies on that being true.
   HEAPU32[PCG >> 2] = ENTRY;
+  // the span's own page has a precomp block whose entries start at ENTRY (blocks[page]->block),
+  // as in the core — so the emitter can name them relative to the block (mips_emit.js
+  // POSITION-INDEPENDENT SPANS). `--nopic` runs the whole corpus in the absolute form.
+  HEAPU32[(BLOCKS >> 2) + (0x80100000 >>> 12)] = PICBP; HEAPU32[PICBP >> 2] = ENTRY;
+  HEAPU32[(PICBP >> 2) + 1] = 0x80100000; HEAPU32[(PICBP >> 2) + 2] = 0x80101000;
   // Both FPR banks, 32 entries each, modelled the way the core lays them out
   // in FR=1 mode: reg_cop1_simple[i] and reg_cop1_double[i] both point at the
   // SAME 8-byte reg_cop1_fgr_64[i] slot (cp1.c:120-165), the float using its
@@ -239,13 +245,14 @@ const PIN_ALL = process.argv.includes('--pin');
 // PATHS); cases that set opts.noCold do so themselves. CI should run it both ways.
 const NOCOLD_ALL = process.argv.includes('--nocold');
 const CHAIN_ALL = process.argv.includes('--chain');
+const NOPIC_ALL = process.argv.includes('--nopic');
 function loadEmitter(pin, noCold, cold, chain, noRdMark, fbx) {
   const sb = { WebAssembly, console: { error() {}, log() {}, warn() {} }, Uint32Array, Object, Array, Math, String };
   if (noRdMark) sb.__jitNoRdMark = true;   // the ?rdtrack=0 arm
   sb.window = sb; sb.__jitPin = !!(pin || (PIN_ALL && pin !== false));   // pin === false: this case opts out of --pin
   // CHAINING is off unless asked for: a chained exit runs the stub op at PC, which the
   // corpus's exit expectations (PC, regs) do not model; `--chain` runs everything chained
-  sb.__fbAsync = Object.assign({ jitCold: !(noCold || (NOCOLD_ALL && !cold)), jitChain: !!(chain || CHAIN_ALL) }, fbx || {});
+  sb.__fbAsync = Object.assign({ jitCold: !(noCold || (NOCOLD_ALL && !cold)), jitChain: !!(chain || CHAIN_ALL), jitPic: !NOPIC_ALL }, fbx || {});
   vm.createContext(sb); vm.runInContext(src, sb);
   return sb.bementalMips;
 }
@@ -1332,6 +1339,62 @@ function asyncSourceCase(name, remap) {
 }
 tests.push(asyncSourceCase('async: a span built from P1 is not installed after its TLB page was recompiled from P2', true));
 tests.push(asyncSourceCase('control: with no remap the same off-thread span is installed', false));
+
+// ---- POSITION-INDEPENDENT SPANS (2026-10-16, mips_emit.js): the heap put the block somewhere else ----
+// A span compiled for its block at ENTRY runs from a block whose entries were moved to ENTRY2
+// (blocks[page]->block = ENTRY2, PC in it — what another session's heap does, and what a corpus
+// module built for another layout meets). It must name ENTRY2's entries: the fall-through PC, the
+// successor a continuing fallback compares PC with, the label a PC-indexed entry dispatches on.
+// RED in the absolute form (?jitpic=0, the control rows): the PC lands back in the OLD block (the
+// fallback op runs on the old block's entry), and the label entry traps (verified: it does).
+function picMoveCase(name, words, { pic, enterAt = 0, expect }) {
+  const bm = loadEmitter(false, false, false, false, false, { jitPic: pic, jitChain: false });
+  const w = makeWorld(words, {});
+  const idx = bm.compileSpan(w.p, { HEAPU32: w.HEAPU32, wasmTable: w.table, wasmMemory: w.mem });
+  if (!(idx > 0)) return { name, ok: false, detail: 'emit failed' };
+  const n = (words.length + 4) * STRIDE / 4;
+  for (let k = 0; k < n; k++) w.HEAPU32[(ENTRY2 >> 2) + k] = w.HEAPU32[(ENTRY >> 2) + k];
+  for (let k = 0; k < n; k++) w.HEAPU32[(ENTRY >> 2) + k] = 0x77;      // the old block is gone
+  w.HEAPU32[PICBP >> 2] = ENTRY2;
+  w.HEAPU32[PCG >> 2] = ENTRY2 + enterAt * STRIDE;
+  const fn = enterAt ? w.HEAPU32[(ENTRY2 + enterAt * STRIDE) >> 2] : idx;
+  let got;
+  try { w.table.get(fn)(); got = { pc: w.HEAPU32[PCG >> 2], r9: Number(w.REG64[(REG >> 3) + 9]) }; } catch (e) { got = { trap: String(e).slice(0, 60) }; }
+  const ok = JSON.stringify(got) === JSON.stringify(expect);
+  return { name, ok, detail: 'got ' + JSON.stringify(got) + ' want ' + JSON.stringify(expect) + ' picSpans ' + (bm.stats.picSpans | 0) };
+}
+{
+  const fall = [I(OPC.ADDIU, 0, 9, 5), I(OPC.ADDIU, 9, 10, 1), 0, 0];
+  tests.push(picMoveCase('pic: a moved block — the fall-through exit names the NEW block', fall, { pic: true, expect: { pc: ENTRY2 + 4 * STRIDE, r9: 5 } }));
+  tests.push(picMoveCase('control (?jitpic=0): the absolute form names the OLD block', fall, { pic: false, expect: { pc: ENTRY + 4 * STRIDE, r9: 5 } }));
+  const fb = [I(0x22, 4, 8, 0), I(OPC.ADDIU, 0, 9, 5), 0, 0];            // LWL: a fallback that continues
+  tests.push(picMoveCase('pic: a moved block — a continuing fallback still continues', fb, { pic: true, expect: { pc: ENTRY2 + 4 * STRIDE, r9: 5 } }));
+  tests.push(picMoveCase('control (?jitpic=0): the fallback runs with PC in the OLD block', fb, { pic: false, expect: { pc: ENTRY + 4 * STRIDE, r9: 5 } }));
+  const lab = [MTC0(8, 12), I(OPC.ADDIU, 0, 9, 5), 0];                   // index 1: a label
+  tests.push(picMoveCase('pic: a moved block — a label entry dispatches by the new block', lab, { pic: true, enterAt: 1, expect: { pc: ENTRY2 + 3 * STRIDE, r9: 5 } }));
+}
+// the recompile key holds the entry's OFFSET in its block: the same span in a block at another
+// address is a cache HIT (one module), and in the absolute form a miss (a second compile)
+function picKeyCase(name, pic) {
+  const sb = { WebAssembly, console: { error() {}, log() {}, warn() {} }, Uint32Array, Object, Array, Math, String, Map, Set, Proxy, performance: { now: () => 0 } };
+  sb.window = sb; sb.__fbAsync = { jitCold: true, jitChain: false, jitAsync: false, jitPic: pic };
+  vm.createContext(sb); vm.runInContext(src, sb);
+  const bm = sb.bementalMips;
+  const words = [I(OPC.ADDIU, 0, 9, 5), I(OPC.ADDIU, 9, 10, 1), 0, 0];
+  const w = makeWorld(words, {});
+  const M = { HEAPU32: w.HEAPU32, wasmTable: w.table, wasmMemory: w.mem };
+  const a = bm.compileSpan(w.p, M);
+  const n = (words.length + 4) * STRIDE / 4;
+  for (let k = 0; k < n; k++) w.HEAPU32[(ENTRY2 >> 2) + k] = 1;     // a fresh block (ops not yet compiled)
+  w.HEAPU32[PICBP >> 2] = ENTRY2;
+  const p2 = Object.assign({}, w.p, { entryPtr: ENTRY2 });
+  const b = bm.compileSpan(p2, M);
+  const hits = bm.stats.cacheHits | 0;
+  const ok = a > 0 && b > 0 && (pic ? hits === 1 : hits === 0);
+  return { name, ok, detail: `slots ${a}/${b} cacheHits ${hits}` };
+}
+tests.push(picKeyCase('pic: the same span in a block at another address is a recompile-cache hit', true));
+tests.push(picKeyCase('control (?jitpic=0): in the absolute form it is a second compile', false));
 
 let fail = 0;
 for (const t of tests) {

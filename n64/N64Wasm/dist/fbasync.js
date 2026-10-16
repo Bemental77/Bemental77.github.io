@@ -64,6 +64,7 @@
                        jitSlot: FB_Q.get('jitslot') !== '0',
                        jitFastHit: FB_Q.get('jitfasthit') !== '0',
                        jitRelocFull: FB_Q.get('jitrelocfull') !== '0',
+                       jitPic: FB_Q.get('jitpic') !== '0',
                        seq: FB_WITNESS ? [] : null };
   // Glide64_Ini.c's read_always = 1 branches, by the name each one tests
   // (HAVE_HWFBE is not defined in this build, so the #ifndef branches apply).
