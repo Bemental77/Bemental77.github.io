@@ -2482,6 +2482,7 @@ window.GcRate = (function () {
         o.vendor = String(info.vendor || '?'); o.architecture = String(info.architecture || '?');
         o.device_ = String(info.device || '?'); o.description = String(info.description || '');
       }
+      o.isFallbackAdapter = !!((info && info.isFallbackAdapter) || ad.isFallbackAdapter);
       var dev = await ad.requestDevice();
       if (!dev) { o.err = 'adapter.requestDevice() resolved null — adapter present but no device'; return o; }
       o.device = true;
@@ -2665,6 +2666,10 @@ window.GcRate = (function () {
       var rh = gcRoomHoldNow();
       if (rh) return gcRoomVerdict(rh);
     }
+    if (gcWgpuOk() && window.__gcWgpuSoftware)
+      return { level: 'warn', short: 'render: WebGL2 (software WebGPU adapter)',
+               why: 'This device\'s WebGPU adapter is a software rasterizer (' + window.__gcWgpuSoftware + '), on which the WGPU '
+                  + 'backend presented about 0.2 frames/s; the page uses the WebGL2 path instead. ?swgl=0 keeps WGPU.' };
     if (gcWgpuOk()) {
       // A capability that WAS true at load is not evidence the path is running now.
       var h = gcPresentHealthNow();
@@ -2856,6 +2861,24 @@ window.GcRate = (function () {
     window.__gcGpu.probed = true;
     // Legacy name kept: var_setup's backend choice keys off it (see _wgpu below).
     if (!gcWgpuOk()) window.__gcWebGPUUnavailable = true;
+    // ── A SOFTWARE WebGPU ADAPTER TAKES THE WebGL2 PATH (2026-10-16) ─────────────────────────────
+    // An adapter that is a CPU rasterizer (SwiftShader / llvmpipe / lavapipe / WARP: no GPU in the
+    // device — Chrome exposes one under --enable-unsafe-swiftshader, which is what the toaster gate
+    // runs) is a working WebGPU device, so the page used to keep the WGPU backend on it. MEASURED
+    // (MP4 solo, 3D title, rate 1, bench overlay + per-thread /proc, same build): WGPU on SwiftShader
+    // presented 0.2 frames/s (draw latency EMA 17 s) while SwiftShader's 4 threads burned 2.8 cores
+    // and dolphin_worker 0.77; the WebGL2 fallback on the same SwiftShader presented 13.2-14.0/s with
+    // the title correct (screenshots), the guest 1.000x on both. So such an adapter is treated
+    // like no WebGPU: the page re-enters once on the WebGL2 fallback (below), exactly the path a
+    // device without WebGPU already takes. A hardware adapter is untouched. ?swgl=0 is the control.
+    if (gcWgpuOk() && !/[?&]swgl=0\b/.test(location.search)) {
+      var _wv = window.__gcGpu.webgpu;
+      var _wid = [_wv.vendor, _wv.architecture, _wv.device_, _wv.description].join(' ');
+      if (_wv.isFallbackAdapter || /swiftshader|llvmpipe|lavapipe|softpipe|warp|microsoft basic render/i.test(_wid)) {
+        window.__gcWebGPUUnavailable = true; window.__gcWgpuSoftware = _wid.trim();
+        pageLog('[gpu] WebGPU adapter "' + _wid.trim() + '" is a SOFTWARE rasterizer — using the WebGL2 path instead (?swgl=0: keep WGPU)');
+      }
+    }
     gcRenderBadge();
     var v = gcRenderVerdict();
     pageLog('[gpu] ' + v.short + ' — ' + v.why);
