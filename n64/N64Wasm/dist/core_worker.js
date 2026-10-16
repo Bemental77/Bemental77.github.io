@@ -331,9 +331,20 @@ function tickBody(src) {
   } else CLK.base = 0;     // resume re-anchors: a pause is not debt
   schedule();
 }
+// A FIELD THE CATCH-UP CEILING HOLDS IS NOT DUE (2026-10-16). dueNow() is the slot clock alone,
+// so while PACECAP held an owed field (due() false), every tick queued the next one as an
+// immediate task: a busy loop. MEASURED (n64/tools/n64_toaster_account.mjs --duty 1, SM64 solo,
+// desktop, 40 s): 157,311 ceiling holds = 157,498 immediate ticks, ~3,900 a second. A held field
+// now waits on a timer of a quarter period (the rAF tick still fires too); the ceiling still
+// decides when it runs. ?pacespin=1 = the control arm (the old immediate re-queue).
+function paceHolds(now) {
+  if (PACECAP.spin || !PACECAP.on || !PACECAP.p || PACECAP.p.hz !== CLK.viHz) return false;
+  return !PACECAP.p.ok(now);
+}
 function schedule() {
   if (paused) return;
-  if (!SCHED.coupled && dueNow(performance.now())) {
+  var nw0 = performance.now();
+  if (!SCHED.coupled && dueNow(nw0) && !paceHolds(nw0)) {
     // Yielded (THE COMMIT YIELD): its timer turn runs the field.
     if (CB.waiting) return;
     if (!SCHED.imm) {
@@ -349,7 +360,7 @@ function schedule() {
   if (hasRaf && !SCHED.raf) { SCHED.raf = true; self.requestAnimationFrame(function () { tick('raf'); }); }
   if (!SCHED.tmr && !(SCHED.coupled && hasRaf)) {
     var wait = 8;
-    if (CLK.viHz > 0 && CLK.base) { var nw = performance.now(); wait = Math.max(0, nextAt(nw) - nw); }
+    if (CLK.viHz > 0 && CLK.base) { var nw = performance.now(); wait = Math.max(0, nextAt(nw) - nw); if (!wait && paceHolds(nw)) wait = 250 / CLK.viHz; }
     SCHED.tmr = true; setTimeout(function () { tick('tmr'); }, wait);
   }
 }
@@ -1618,6 +1629,7 @@ function boot(d) {
   BOOT.rigClock = new URLSearchParams(d.search || '').get('workerrig') === 'clock';
   var rq = new URLSearchParams(d.search || '').get('repay'); if (rq != null && rq !== '' && +rq >= 0) REPAY.capMs = +rq;
   if (new URLSearchParams(d.search || '').get('pacecap') === '0') PACECAP.on = false;
+  if (new URLSearchParams(d.search || '').get('pacespin') === '1') PACECAP.spin = true;
   fsInstall(d.search);
   (function () {
     var gq = new URLSearchParams(d.search || '').get('gpuq');
