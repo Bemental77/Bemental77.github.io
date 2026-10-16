@@ -207,6 +207,30 @@ const AUDIO_RATE = 32000;      // MusyX's own output rate: hw_pc.c:76 / hw_dolph
 let audioTest = false;         // ?audiotest=1 — synthetic tone, transport self-test only
 let audioAcc = 0;              // fractional carry so 60 frames emit exactly AUDIO_RATE samples
 let audioPhase = 0;
+// ── THE WORKER WRITES ITS PCM INTO THE WORKLET'S RING ITSELF (2026-10-16) ─────────────────────
+// Every frame used to post its ~2 KB of PCM to the page (postMessage + an ArrayBuffer slice), and the
+// page copied it into the AudioWorklet's SharedArrayBuffer ring (pushAudioSamples). MEASURED (MP4
+// solo, 3D title, rate 1, CPU profile of this worker, attribution only): that postMessage was 9.9%
+// of this thread's non-idle time and the slice another 1.1% — a third as much as the whole game's
+// wasm (26.5%). The page now hands the ring over at boot (boot msg audioRing; THE SAME ring, the
+// same single-producer head/tail protocol, the same drop-when-full rule) and this thread writes it.
+// The ring carries one extra Int32 after its samples (AUD_LIVE): the page sets it when the worklet
+// is up, which is exactly when pushAudioSamples starts accepting samples, so no sample is written
+// that the old path would have dropped. ?audsab=0 (no ring handed over) is the control.
+let audRing = null;             // { hdr: Int32Array(4), data: Int16Array(cap), cap, live: Int32Array(1) }
+function audRingPush(src) {
+  const r = audRing;   // returns nothing; samples past the free space are dropped, exactly as pushAudioSamples drops them
+  if (!Atomics.load(r.live, 0)) return;               // no consumer yet: dropped, as the page dropped it
+  const hdr = r.hdr, data = r.data, cap = r.cap;
+  const head = Atomics.load(hdr, 0), tail = Atomics.load(hdr, 1);
+  const free = cap - ((head - tail) | 0);
+  const n = src.length > free ? free : src.length;
+  if (n <= 0) return;
+  const start = (head >>> 0) % cap, first = Math.min(n, cap - start);
+  data.set(first === src.length ? src : src.subarray(0, first), start);
+  if (n > first) data.set(src.subarray(first, n), 0);
+  Atomics.store(hdr, 0, (head + n) | 0);
+}
 let audioStallFrames = 0;      // consecutive frames the mixer returned 0 samples (see pumpAudio)
 const AUDIO_STALL_FRAMES = 120;
 // A score that keeps crossing the threshold could emit two lines per 2 s indefinitely. Bounded
@@ -225,7 +249,7 @@ function pumpAudio(quiet) {
   const n = (audioAcc / 60) | 0;
   audioAcc -= n * 60;
   if (n <= 0) return;
-  let pcm = null;
+  let pcm = null, ringed = false;
   // ENGINE PATH. The software mixer (shims/src/gc_musyx_mix.c, RECOMP_MUSYX=1) stages int16
   // stereo frames inside the wasm heap and returns how many it actually produced; copy them out
   // because the heap can move on a memory growth.
@@ -233,7 +257,9 @@ function pumpAudio(quiet) {
     const got = Module.___recomp_audio_pump(n) | 0;
     if (got > 0) {
       const base = Module.___recomp_audio_base() >>> 0;
-      pcm = new Int16Array(Module.wasmMemory.buffer.slice(base, base + got * 4));
+      // straight from the heap into the ring (a view, not a copy: written before anything can grow the heap)
+      if (audRing && !quiet && !(base & 1)) { audRingPush(new Int16Array(Module.wasmMemory.buffer, base, got * 2)); ringed = true; }
+      else pcm = new Int16Array(Module.wasmMemory.buffer.slice(base, base + got * 4));
     }
     // A mixer that produces nothing is the audio-path version of `default: return 0` — the
     // transport stays healthy, every producer-side counter still reads fine, and the page is
@@ -258,7 +284,7 @@ function pumpAudio(quiet) {
   // TRANSPORT SELF-TEST (?audiotest=1). A 440 Hz sine at 0.15 full scale, phase-continuous
   // across frames so tools/audio_probe.mjs reads 0 discontinuities and 0 gaps when the whole
   // chain is healthy. This is NOT game audio and never runs without the query parameter.
-  if (!pcm && audioTest) {
+  if (!pcm && !ringed && audioTest) {
     pcm = new Int16Array(n * 2);
     const step = (2 * Math.PI * 440) / AUDIO_RATE;
     for (let i = 0; i < n; i++) {
@@ -271,6 +297,7 @@ function pumpAudio(quiet) {
   // quiet: a re-simulated or hidden frame (THE ROLLBACK RING). The mixer above still ran — it is
   // guest state — but its samples were already played once (or belong to a catch-up nobody hears).
   if (!pcm || quiet) return;
+  if (audRing) { audRingPush(pcm); return; }
   postMessage({ cmd: 'audio', buf: pcm.buffer, len: pcm.byteLength }, [pcm.buffer]);
 }
 
@@ -3404,6 +3431,12 @@ async function boot(msg) {
   // Tell the page the output rate BEFORE any 'audio' message, so it builds the AudioContext at
   // the right rate the first time (the same contract dolphin_worker's 'audioRate' has).
   audioTest = !!msg.audioTest;
+  // the page allocates it as 16 B header + cap int16 + 4 B AUD_LIVE (gamecube.html GcAudio.RING_SAMPLES)
+  if (msg.audioRing && msg.audioRing.byteLength === 20 + 2 * (msg.audioRingCap | 0) && (msg.audioRingCap | 0) > 0) {
+    const sab = msg.audioRing, hdr = new Int32Array(sab, 0, 4), cap = msg.audioRingCap | 0;
+    audRing = { hdr, cap, data: new Int16Array(sab, 16, cap), live: new Int32Array(sab, 16 + cap * 2, 1) };
+    log('audio: this worker writes the worklet ring directly (' + cap + ' samples; ?audsab=0: control)');
+  }
   postMessage({ cmd: 'audioRate', rate: AUDIO_RATE });
   log('audio: rate ' + AUDIO_RATE + ' Hz, source = ' +
       (Module.___recomp_audio_pump ? 'engine' : (audioTest ? '?audiotest=1 SYNTHETIC TONE (transport self-test, not game audio)'
