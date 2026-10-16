@@ -1818,7 +1818,7 @@
   // wasmTable.set, unrooting the previous instance for GC — the table is
   // bounded by distinct block entries, not by recompile churn (vaddr keys
   // are stable across precomp_block realloc; host entryPtr is not)
-  var slotByVaddr = Object.create(null);
+  var slotByVaddr = new Map();   // (a Map: vaddrs >= 2^31 made every lookup of a plain object's key a string)
   // recompile cache (see compileSpan): hash -> [{ key, inst, labels, labelOps }]
   var spanCache = new Map(), spanCacheN = 0, SPAN_CACHE_MAX = 16384;
 
@@ -2182,11 +2182,16 @@
   // equals the live one in full. ?jitreloc=0 (core_worker.js) = the corpus at its own addresses only.
   var RELOC = { C: null, live: null, pg: null, seen: null, pred: 0, sent: null, sentId: null, done: null, idJob: null,
                 moves: 0, pages: 0, resent: 0, said: 0, q: [], pumpT: 0 };
+  var RELOC_FULL = 3, RELOC_FULL_CAP = null;
+  function relocFullCap() {
+    if (RELOC_FULL_CAP === null) { var g = (typeof globalThis !== 'undefined') ? globalThis : self, f = g.__fbAsync; RELOC_FULL_CAP = !(f && f.jitRelocFull === false); }
+    return RELOC_FULL_CAP;
+  }
   function relocOff() { var g = (typeof globalThis !== 'undefined') ? globalThis : self; return !!g.__jitRelocOff; }
   function relocInit(C, live) {
     var R = RELOC, n = C.jobs.length, stride = C.static.stride >>> 0;
     R.C = C; R.live = { p: Object.assign({}, live.p), flags: live.flags, tableBase: live.tableBase };
-    R.pg = new Map(); R.seen = new Map(); R.pred = 0; R.idJob = new Map();
+    R.pg = new Map(); R.seen = new Map(); R.pred = 0; R.idJob = new Map(); R.full = null; R.thin = 0;
     R.sent = new Float64Array(n).fill(NaN); R.sentId = new Float64Array(n).fill(NaN); R.done = new Float64Array(n).fill(NaN);
     for (var i = 0; i < n; i++) {
       var cj = C.jobs[i], vp = cj.vaddr >>> 12, base = (cj.entryPtr - ((cj.vaddr & 0xFFF) >>> 2) * stride) | 0, g = R.pg.get(vp);
@@ -2206,8 +2211,26 @@
     R.seen.set(vp, d); R.pages++;
     if (quiet) { R.pred = d; return; }
     if (d === R.pred) { relocSend(g.jobs.slice(), true); return; }
+    R.moves++;
+    // ---- A HEAP THAT MOVES BACK AND FORTH IS NOT A NEW PLACE EACH TIME (2026-10-16) ----
+    // Blocks are carved from a heap whose free space is reused, so the deltas pages show are not
+    // monotonic: in a two-browser MK64 room each console saw 145 "moves" by frame 3400 (115 of them
+    // in the race start's ~10 s), most of them back to a delta already seen — and every one dropped
+    // the compile worker's queue and sent the WHOLE corpus out again: 306,000 span compiles a
+    // console, the 500-870 ms/s of V8 compilation beside the room's worst seconds, and the race
+    // start's own offers missed the cache (470 live compiles). Now only the first RELOC_FULL
+    // distinct deltas rebuild the corpus; any other move rebuilds the page that showed it (above:
+    // its own delta, at the front) and leaves the queue alone. Which modules get BUILT changes;
+    // a span is still installed only on a full key match. ?jitrelocfull=0 = every move, as before.
+    var full = R.full || (R.full = new Set([R.pred]));
+    if (relocFullCap() && (full.has(d) || full.size >= RELOC_FULL)) {
+      R.thin = (R.thin | 0) + 1;
+      relocSend(g.jobs.slice(), true);
+      return;
+    }
+    full.add(d);
     // THE HEAP MOVED: what the worker still has queued was built for the old place
-    R.pred = d; R.moves++;
+    R.pred = d;
     if (ASYNC.w) ASYNC.w.postMessage({ warmDrop: true });
     for (var i = 0; i < R.sent.length; i++) {
       if (R.sent[i] === R.sent[i] && R.done[i] !== R.sent[i]) { WARM.ids.delete(R.sentId[i]); R.idJob.delete(R.sentId[i]); R.sent[i] = NaN; }
@@ -2239,7 +2262,8 @@
     if (b) for (var i = 0; i < b.length; i++) if (keyEq(b[i].key, key, key.length)) return;   // compiled live meanwhile
     var fns = [Bh.inst.exports['s' + r.k]];
     for (var wk = 1; wk < r.labels.length; wk++) fns.push(r.nfn === 1 ? fns[0] : Bh.inst.exports['s' + r.k + '_' + wk]);
-    cachePut(key, fns, r.labels, r.labelOps);
+    var ent = cachePut(key, fns, r.labels, r.labelOps);
+    try { slotsAhead(ASYNC.M || (typeof globalThis !== 'undefined' ? globalThis : self).Module, ent); } catch (e) { stats.slotsAheadErr = String((e && e.message) || e).slice(0, 120); }
     WARM.cached++;
   }
   // the early start's held modules, into the recompile cache between fields (see warmStart)
@@ -2478,32 +2502,143 @@
       { id: 10, chunks: code }]);
     return { batch: true, items: items, bytes: bytes, spans: parts.length, ms: t0 ? performance.now() - t0 : 0 };
   }
+  // ---- SLOTS WITHOUT TABLE TRAFFIC (2026-10-16) ----
+  // A recompile-cache hit (most offers once a corpus is in: SM64/MK64 1550+ a session, ~400 in
+  // MK64's race-start fields) installed its entry and every label — ~15 a span — each a
+  // wasmTable.grow(1) + set. MEASURED (MK64 solo, Chrome 141): 48 us of each hit's ~80 us.
+  // Two things change, neither what any slot holds when it is called:
+  //   * a set is skipped when the slot already holds that very function (slotFn mirrors every set
+  //     this file makes, and nothing else writes a JIT slot) — a page recompiled from the same
+  //     words finds its slots as it left them;
+  //   * slots come from a block taken SLOT_CHUNK at a time, so the table grows rarely. (A V8 before
+  //     the shared dispatch table — node 22, i.e. Chrome ~124 — paid O(instances) per grow: 1-6 ms
+  //     a grow with 1000-3000 instances importing the table, measured.) Anything else that grows
+  //     the table (Emscripten's addFunction) takes from past the end, never from a reserved block.
+  // ?jitslot=0 is the control arm: every install a grow(1) + set, as before.
+  var slotFn = [], SLOT_CHUNK = 256, slotNext = 0, slotEnd = 0, SLOT_MODE = null;
+  function slotMode() {
+    if (SLOT_MODE === null) { var g = (typeof globalThis !== 'undefined') ? globalThis : self, f = g.__fbAsync; SLOT_MODE = !(f && f.jitSlot === false); }
+    return SLOT_MODE;
+  }
+  function slotTake(Module) {
+    var T = Module.wasmTable;
+    if (!slotMode()) { var s1 = T.length; T.grow(1); return s1; }
+    if (slotNext >= slotEnd) { slotNext = T.length; T.grow(SLOT_CHUNK); slotEnd = slotNext + SLOT_CHUNK; }
+    return slotNext++;
+  }
   function installSlot(Module, vkey, fn) {
-    var sidx = slotByVaddr[vkey];
+    var sidx = slotByVaddr.get(vkey);
+    if (!TABLE_BASE && Module.wasmTable) TABLE_BASE = Module.wasmTable.length;   // (set by compileSpan before any install)
     if (sidx !== undefined) {
-      Module.wasmTable.set(sidx, fn);
+      if (slotFn[sidx] !== fn || !slotMode()) { Module.wasmTable.set(sidx, fn); slotFn[sidx] = fn; }
       stats.slotReuses++;
     } else {
-      sidx = Module.wasmTable.length;
-      Module.wasmTable.grow(1);
+      sidx = slotTake(Module);
       Module.wasmTable.set(sidx, fn);
-      slotByVaddr[vkey] = sidx;
+      slotFn[sidx] = fn;
+      slotByVaddr.set(vkey, sidx);
       stats.distinctSlots++;
     }
     return sidx;
+  }
+  // A cached entry's slots, made before any offer asks for it (warmCache, between or at the end of
+  // fields): only for addresses that have NO slot yet — a slot nothing points at, so filling it
+  // changes nothing that runs; the offer then finds it already holding its function.
+  function slotsAhead(Module, ent) {
+    if (!slotMode() || !ent || !ent.key) return;
+    var va = ent.key[0] >>> 0;
+    if (!slotByVaddr.has(va)) installSlot(Module, va, ent.fns[0]);
+    for (var k = 1; k < ent.labels.length; k++) {
+      var vk = (va + ent.labels[k] * 4) >>> 0;
+      if (!slotByVaddr.has(vk)) installSlot(Module, vk, ent.fns[k]);
+    }
+  }
+  // ---- CACHE HIT IN PLACE (2026-10-16) ----
+  // A hit used to build the full recompile key (a fresh Uint32Array of the page's 1024 words + the
+  // span's ops), hash it and compare it, inside compileSpan — which is too large to be optimized.
+  // Here the candidates are found by the key's six head words (vaddr, entryPtr, span, page bounds,
+  // source) and each is compared word for word against memory as it is: the same words and ops
+  // the key would have been built from, in full, so a hit is exactly the hit it was. A miss falls
+  // through to the key build, which then skips the bucket this has already searched. The install
+  // is the bucket hit's, line for line. ?jitfasthit=0 = the old path (the A/B arm).
+  var headCache = new Map(), FAST_HIT = null;
+  function fastHitOn() {
+    if (FAST_HIT === null) { var g = (typeof globalThis !== 'undefined') ? globalThis : self, f = g.__fbAsync; FAST_HIT = !(f && f.jitFastHit === false); }
+    return FAST_HIT;
+  }
+  function headHash(k) { var h = 0x811c9dc5 | 0; for (var i = 0; i < 6; i++) h = Math.imul(h ^ k[i], 16777619); return h; }
+  var headProbe = new Uint32Array(6);
+  function cacheHitInPlace(p, Module, U, span, pageW0, pageN) {
+    var hp = headProbe;
+    hp[0] = p.vaddr >>> 0; hp[1] = p.entryPtr >>> 0; hp[2] = span; hp[3] = p.blockStart >>> 0; hp[4] = p.blockEnd >>> 0; hp[5] = p.srcPtr >>> 0;
+    var b = headCache.get(headHash(hp));
+    if (!b) return 0;
+    var keyLen = 6 + pageN + span, ob = 6 + pageN, base = p.entryPtr >>> 0, st = p.stride, q;
+    for (var bi = 0; bi < b.length; bi++) {
+      var ce = b[bi], k = ce.key;
+      if (k.length !== keyLen || k[0] !== hp[0] || k[1] !== hp[1] || k[2] !== hp[2] || k[3] !== hp[3] || k[4] !== hp[4] || k[5] !== hp[5]) continue;
+      for (q = 0; q < pageN; q++) if (k[6 + q] !== U[pageW0 + q]) break;
+      if (q < pageN) continue;
+      for (q = 0; q < span; q++) if (k[ob + q] !== U[(base + q * st) >> 2]) break;
+      if (q < span) continue;
+      var hidx = installSlot(Module, p.vaddr >>> 0, ce.fns[0]);
+      for (var hk = 1; hk < ce.labels.length; hk++) {
+        var hptr = p.entryPtr + ce.labels[hk] * p.stride;
+        if (U[hptr >> 2] !== ce.labelOps[hk]) continue;
+        U[hptr >> 2] = installSlot(Module, (p.vaddr + ce.labels[hk] * 4) >>> 0, ce.fns[hk]);
+        stats.labelEntries = (stats.labelEntries || 0) + 1;
+      }
+      stats.cacheHits = (stats.cacheHits || 0) + 1;
+      stats.fastHits = (stats.fastHits || 0) + 1;
+      return hidx;
+    }
+    return 0;
   }
   // fns: the span's entry function and its label wrappers, in label order
   function cachePut(keyArr, fns, labels, labelOps) {
     var kh = 0x811c9dc5 | 0;
     for (var kq = 0; kq < keyArr.length; kq++) kh = Math.imul(kh ^ keyArr[kq], 16777619);
-    if (spanCacheN >= SPAN_CACHE_MAX) { spanCache.clear(); spanCacheN = 0; }
+    if (spanCacheN >= SPAN_CACHE_MAX) { spanCache.clear(); headCache.clear(); spanCacheN = 0; }
     var nb = spanCache.get(kh);
     if (!nb) { nb = []; spanCache.set(kh, nb); }
-    nb.push({ key: keyArr, fns: fns, labels: labels, labelOps: labelOps });
+    var ent = { key: keyArr, fns: fns, labels: labels, labelOps: labelOps };
+    nb.push(ent);
+    var hh = headHash(keyArr), hb = headCache.get(hh);
+    if (!hb) { hb = []; headCache.set(hh, hb); }
+    hb.push(ent);
     spanCacheN++;
+    return ent;
   }
 
+  // THE HIT FRONT (2026-10-16). compileSpan below is too large to be optimized, and a recompile-
+  // cache hit ran its whole preamble (a register cache, label arrays, ...) as unoptimized code:
+  // MEASURED (MK64 solo) 24 us a call before the hit was even looked for. This small function makes
+  // the same checks in the same order with the same outcomes — the corpus page observed, the
+  // delay-slot precondition, the page-end truncation, the page's source recorded, the null-ops and
+  // JIT-op refusals — and answers a hit itself (CACHE HIT IN PLACE). Anything else (a refusal, a
+  // miss) is compileSpanFull, which repeats those checks idempotently and skips the cache search
+  // this has done. ?jitfasthit=0: compileSpanFull alone, as before.
+  var FRONT_MISS = false;
   function compileSpan(p, Module) {
+    if (EMIT_ONLY || !fastHitOn()) return compileSpanFull(p, Module);
+    if (census.on === null) census.on = !!(typeof window !== 'undefined' && window.__jitCensus);
+    if (RELOC.C) relocObserve(p);
+    if (!p.delaySlot) return compileSpanFull(p, Module);
+    var U = Module.HEAPU32, span = p.span, trunc = false;
+    var pageLen = ((p.blockEnd - p.blockStart) >>> 0) >>> 2, entryInPage = ((p.vaddr - p.blockStart) >>> 0) >>> 2;
+    if (pageLen > 0 && entryInPage < pageLen && span > pageLen - entryInPage) { span = pageLen - entryInPage; trunc = true; }
+    if (span <= 0 || opsZeroAt(U, p.entryPtr, p.stride, span + 1) >= 0) return compileSpanFull(p, Module);
+    if (!TABLE_BASE) TABLE_BASE = Module.wasmTable ? Module.wasmTable.length : 0;
+    if (TABLE_BASE && opsAnyAtOrAbove(U, p.entryPtr, p.stride, span, TABLE_BASE)) return compileSpanFull(p, Module);
+    if (!draining && !ASYNC.retry) PAGE_SRC[p.vaddr >>> 12] = srcBase(p);
+    var srcW = p.srcPtr >> 2, pageW0 = srcW, pageN = span;
+    if (pageLen > 0 && entryInPage < pageLen) { pageW0 = srcW - entryInPage; pageN = pageLen; }
+    var h = cacheHitInPlace(p, Module, U, span, pageW0, pageN);
+    if (h > 0) { if (trunc) stats.pageTruncated = (stats.pageTruncated || 0) + 1; return h; }
+    FRONT_MISS = true;
+    try { return compileSpanFull(p, Module); } finally { FRONT_MISS = false; }
+  }
+  function compileSpanFull(p, Module) {
     // resolved once, on the first compile — the page sets window.__jitCensus
     // before loading this script, and it must stay constant for the session
     // (it decides each module's import/type shape)
@@ -2658,6 +2793,9 @@
     if (pageLen > 0 && entryInPage < pageLen) {
       pageW0 = srcW - entryInPage; pageN = pageLen; pageA0 = p.blockStart >>> 0; spanOff = entryInPage;
     }
+    // the recompile cache's hit, out of this (unoptimizable) function: CACHE HIT IN PLACE below
+    var fastTried = FRONT_MISS;     // the front (compileSpan) searched the cache for exactly this key
+    FRONT_MISS = false;
 
     // ---- RECOMPILE CACHE (2026-09-30) ----
     // MK64 recompiles ~110 spans inside a 700-frame race window (pages that
@@ -2692,7 +2830,8 @@
       keyFillOps(keyArr, 6 + pageN, HEAPU32, p.entryPtr, p.stride, span);
     }
     kh = keyHash(keyArr, keyLen);
-    var bucket = EMIT_ONLY ? null : spanCache.get(kh);
+    // (fastTried: cacheHitInPlace has already compared every entry of this key against memory)
+    var bucket = (EMIT_ONLY || fastTried) ? null : spanCache.get(kh);
     if (bucket) {
       for (var bi = 0; bi < bucket.length; bi++) {
         var ce = bucket[bi];
