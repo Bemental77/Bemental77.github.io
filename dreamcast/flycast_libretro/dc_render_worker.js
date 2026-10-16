@@ -70,6 +70,9 @@ function exec(ops) {
           break;
         }
         case '+s': objs.set(op[2], gl.createShader(op[1])); break;
+        case '__size':   // the window follows the picture (flycast_worker.js sizeWrap): resize the drawing buffer
+          if (gl.canvas.width !== op[1] || gl.canvas.height !== op[2]) { gl.canvas.width = op[1]; gl.canvas.height = op[2]; }
+          break;
         case '-': {   // delete: ['-', method, id]
           const o = objs.get(op[2]); if (o) gl[op[1]](o); objs.delete(op[2]);
           break;

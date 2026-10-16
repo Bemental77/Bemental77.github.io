@@ -784,7 +784,7 @@
 783:XXH32
 784:Sh4Interpreter::ExecuteDelayslot()
 785:SetInterruptMask(InterruptID)
-786:SetBaseClipping()_5337
+786:SetBaseClipping()_5340
 787:Serializer::Serializer(void*, unsigned long, bool)
 788:ResetInterruptMask(InterruptID)
 789:OpenGl4Source::OpenGl4Source()
@@ -853,7 +853,7 @@
 852:void setN2Uniforms<gl4PipelineShader>(PolyParam const*, gl4PipelineShader*, rend_context const&)
 853:void addrspace::writet<unsigned long long>(unsigned int, unsigned long long)
 854:ungetc
-855:strtox_7198
+855:strtox_7201
 856:strdup
 857:std::__2::locale::operator=(std::__2::locale const&)
 858:std::__2::default_delete<asio::io_context>::operator()[abi:ne210108](asio::io_context*) const
@@ -934,7 +934,7 @@
 933:modem::BufferedTransformer::available()
 934:mmu_set_state()
 935:mbrtowc
-936:maple_device::~maple_device()_1769
+936:maple_device::~maple_device()_1772
 937:jvs_io_board::read_digital_in(unsigned int const*, unsigned int*)
 938:inflateInit2_
 939:fseek
@@ -1032,7 +1032,7 @@
 1031:FSE_buildCTable_wksp
 1032:Emulator::stop()
 1033:DCFlashChip::ReadBlock(unsigned int, unsigned int, void*)
-1034:Cartridge::~Cartridge()_2340
+1034:Cartridge::~Cartridge()_2343
 1035:zip_stat_index
 1036:zip_source_tell
 1037:zip_source_pass_to_lower_layer
@@ -1147,7 +1147,7 @@
 1146:tactx_Find(unsigned int, bool)
 1147:strtoul
 1148:std::runtime_error::~runtime_error()
-1149:std::logic_error::~logic_error()_8276
+1149:std::logic_error::~logic_error()_8279
 1150:std::__throw_bad_alloc()
 1151:std::__2::vector<aica::arm::ArmOp, std::__2::allocator<aica::arm::ArmOp>>::insert(std::__2::__wrap_iter<aica::arm::ArmOp const*>, aica::arm::ArmOp const&)
 1152:std::__2::vector<N2Matrix, std::__2::allocator<N2Matrix>>::push_back[abi:ne210108](N2Matrix const&)
@@ -1365,7 +1365,7 @@
 1364:std::__2::unique_ptr<jvs_837_13551, std::__2::default_delete<jvs_837_13551>> std::__2::make_unique[abi:ne210108]<jvs_837_13551, int, MIEImpl*, int, 0>(int&&, MIEImpl*&&, int&&)
 1365:std::__2::unique_ptr<jvs_837_13551, std::__2::default_delete<jvs_837_13551>> std::__2::make_unique[abi:ne210108]<jvs_837_13551, int, MIEImpl*, 0>(int&&, MIEImpl*&&)
 1366:std::__2::to_string(unsigned int)
-1367:std::__2::time_put<char, std::__2::ostreambuf_iterator<char, std::__2::char_traits<char>>>::~time_put()_8043
+1367:std::__2::time_put<char, std::__2::ostreambuf_iterator<char, std::__2::char_traits<char>>>::~time_put()_8046
 1368:std::__2::thread::join()
 1369:std::__2::system_error::system_error(std::__2::error_code, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
 1370:std::__2::stream_data<std::__2::basic_ostream<wchar_t, std::__2::char_traits<wchar_t>>, std::__2::__stdoutbuf<wchar_t>>::init(_IO_FILE*)
@@ -1384,10 +1384,10 @@
 1383:std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> std::__2::operator+[abi:ne210108]<char, std::__2::char_traits<char>, std::__2::allocator<char>>(char const*, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>&&)
 1384:std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>::__grow_by_without_replace[abi:ne210108](unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long)
 1385:std::__2::basic_ostringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_ostringstream()
-1386:std::__2::basic_ostream<char, std::__2::char_traits<char>>::~basic_ostream()_7396
+1386:std::__2::basic_ostream<char, std::__2::char_traits<char>>::~basic_ostream()_7399
 1387:std::__2::basic_istringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_istringstream()
-1388:std::__2::basic_istream<char, std::__2::char_traits<char>>::~basic_istream()_7378
-1389:std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()_7412
+1388:std::__2::basic_istream<char, std::__2::char_traits<char>>::~basic_istream()_7381
+1389:std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()_7415
 1390:std::__2::__tree<std::__2::__value_type<unsigned int, void (*)()>, std::__2::__map_value_compare<unsigned int, std::__2::pair<unsigned int const, void (*)()>, std::__2::less<unsigned int>, true>, std::__2::allocator<std::__2::pair<unsigned int const, void (*)()>>>::destroy(std::__2::__tree_node<std::__2::__value_type<unsigned int, void (*)()>, void*>*)
 1391:std::__2::__tree<std::__2::__value_type<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, cmrc::detail::file_or_directory const*>, std::__2::__map_value_compare<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::pair<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const, cmrc::detail::file_or_directory const*>, std::__2::less<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>, true>, std::__2::allocator<std::__2::pair<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const, cmrc::detail::file_or_directory const*>>>::destroy(std::__2::__tree_node<std::__2::__value_type<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, cmrc::detail::file_or_directory const*>, void*>*)
 1392:std::__2::__tree<std::__2::__value_type<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, cmrc::detail::file_or_directory>, std::__2::__map_value_compare<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::pair<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const, cmrc::detail::file_or_directory>, std::__2::less<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>, true>, std::__2::allocator<std::__2::pair<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const, cmrc::detail::file_or_directory>>>::destroy(std::__2::__tree_node<std::__2::__value_type<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, cmrc::detail::file_or_directory>, void*>*)
@@ -1433,7 +1433,7 @@
 1432:path_mkdir
 1433:parsexml
 1434:open
-1435:non-virtual thunk to modem::V14Encoder::~V14Encoder()_2067
+1435:non-virtual thunk to modem::V14Encoder::~V14Encoder()_2070
 1436:net::modbba::start()
 1437:net::modbba::PowerSmashPPPSocket::receive()::'lambda'(std::__2::error_code const&, unsigned long)::operator()(std::__2::error_code const&, unsigned long) const
 1438:net::modbba::PPPSocket::receive()::'lambda'(std::__2::error_code const&, unsigned long)::operator()(std::__2::error_code const&, unsigned long) const
@@ -1507,7 +1507,7 @@
 1506:compression_source_new
 1507:compileFinalAndModVolShaders()
 1508:cmrc::embedded_filesystem::_get(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>) const
-1509:card_reader::DerbyBRCardReader::~DerbyBRCardReader()_2449
+1509:card_reader::DerbyBRCardReader::~DerbyBRCardReader()_2452
 1510:build_tree
 1511:bm_vmem_pagefill(void**, unsigned int)
 1512:bemental::sh4::emitTypeImportSection(WasmModuleBuilder&)
@@ -1818,9 +1818,9 @@
 1817:void WriteMem_area0<unsigned char, 2u, false>(unsigned int, unsigned char)
 1818:void SetGPState<2u, true>(PolyParam const*, unsigned int)
 1819:void DrawList<0u, false>(std::__2::vector<PolyParam, std::__2::allocator<PolyParam>> const&, int, int)
-1820:virtual thunk to std::__2::basic_ostream<char, std::__2::char_traits<char>>::~basic_ostream()_7397
+1820:virtual thunk to std::__2::basic_ostream<char, std::__2::char_traits<char>>::~basic_ostream()_7400
 1821:virtual thunk to std::__2::basic_ostream<char, std::__2::char_traits<char>>::~basic_ostream()
-1822:virtual thunk to std::__2::basic_istream<char, std::__2::char_traits<char>>::~basic_istream()_7379
+1822:virtual thunk to std::__2::basic_istream<char, std::__2::char_traits<char>>::~basic_istream()_7382
 1823:virtual thunk to std::__2::basic_istream<char, std::__2::char_traits<char>>::~basic_istream()
 1824:virtmem::prepare_jit_block(void*, unsigned long, void**)
 1825:updateRxFifoStatus()
@@ -1876,7 +1876,7 @@
 1875:strlcpy_retro__
 1876:strerror_r
 1877:store_int
-1878:std::runtime_error::~runtime_error()_8279
+1878:std::runtime_error::~runtime_error()_8282
 1879:std::rethrow_exception(std::exception_ptr)
 1880:std::__2::vector<std::__2::pair<std::__2::condition_variable*, std::__2::mutex*>, std::__2::__hidden_allocator<std::__2::pair<std::__2::condition_variable*, std::__2::mutex*>>>::~vector[abi:ne210108]()
 1881:std::__2::vector<std::__2::locale::facet*, std::__2::__sso_allocator<std::__2::locale::facet*, 30ul>>::~vector[abi:ne210108]()
@@ -1949,13 +1949,13 @@
 1948:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::seekpos(std::__2::fpos<__mbstate_t>, unsigned int)
 1949:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::seekoff(long long, std::__2::ios_base::seekdir, unsigned int)
 1950:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::basic_streambuf()
-1951:std::__2::basic_ostringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_ostringstream()_7464
+1951:std::__2::basic_ostringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_ostringstream()_7467
 1952:std::__2::basic_ostream<wchar_t, std::__2::char_traits<wchar_t>>::flush()
-1953:std::__2::basic_ostream<char, std::__2::char_traits<char>>::~basic_ostream()_7394
+1953:std::__2::basic_ostream<char, std::__2::char_traits<char>>::~basic_ostream()_7397
 1954:std::__2::basic_ostream<char, std::__2::char_traits<char>>& std::__2::basic_ostream<char, std::__2::char_traits<char>>::__put_num_integer_promote[abi:ne210108]<unsigned int>(unsigned int)
 1955:std::__2::basic_ostream<char, std::__2::char_traits<char>>& std::__2::basic_ostream<char, std::__2::char_traits<char>>::__put_num_integer_promote[abi:ne210108]<int>(int)
-1956:std::__2::basic_istringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_istringstream()_7469
-1957:std::__2::basic_istream<char, std::__2::char_traits<char>>::~basic_istream()_7376
+1956:std::__2::basic_istringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_istringstream()_7472
+1957:std::__2::basic_istream<char, std::__2::char_traits<char>>::~basic_istream()_7379
 1958:std::__2::basic_ios<char, std::__2::char_traits<char>>::init[abi:ne210108](std::__2::basic_streambuf<char, std::__2::char_traits<char>>*)
 1959:std::__2::__time_put::__do_put(char*, char*&, tm const*, char, char) const
 1960:std::__2::__throw_out_of_range[abi:ne210108](char const*)
@@ -2094,7 +2094,7 @@
 2093:non-virtual thunk to modem::v42b::V42Base::~V42Base()
 2094:non-virtual thunk to card_reader::SanwaCRP1231BR::read()
 2095:non-virtual thunk to card_reader::SanwaCRP1231BR::available()
-2096:non-virtual thunk to card_reader::DerbyBRCardReader::~DerbyBRCardReader()_2451
+2096:non-virtual thunk to card_reader::DerbyBRCardReader::~DerbyBRCardReader()_2454
 2097:non-virtual thunk to card_reader::DerbyBRCardReader::~DerbyBRCardReader()
 2098:netlink_msg_to_ifaddr
 2099:net::modbba::readModem()
@@ -2317,7 +2317,7 @@
 2316:asio::detail::select_reactor::cancel_ops_unlocked(int, std::__2::error_code const&)
 2317:asio::detail::scheduler::~scheduler()
 2318:asio::detail::scheduler::do_run_one(asio::detail::conditionally_enabled_mutex::scoped_lock&, asio::detail::scheduler_thread_info&, std::__2::error_code const&)
-2319:asio::detail::resolver_service<asio::ip::tcp>::~resolver_service()_4176
+2319:asio::detail::resolver_service<asio::ip::tcp>::~resolver_service()_4179
 2320:asio::detail::resolver_service<asio::ip::tcp>::~resolver_service()
 2321:asio::detail::resolver_service<asio::ip::tcp>::shutdown()
 2322:asio::detail::resolver_service<asio::ip::tcp>::notify_fork(asio::execution_context::fork_event)
@@ -2991,16 +2991,16 @@
 2990:void MMRegister<&BSC.<unsigned int at offset 0>, 255u, 0u>::writeModule<528482304u, unsigned int, 54460413u, 0u>(unsigned int, unsigned int)
 2991:void* std::__2::__thread_proxy[abi:ne210108]<std::__2::tuple<std::__2::unique_ptr<std::__2::__thread_struct, std::__2::default_delete<std::__2::__thread_struct>>, WorkerThread::start()::'lambda'()>>(void*)
 2992:void* std::__2::__thread_proxy[abi:ne210108]<std::__2::tuple<std::__2::unique_ptr<std::__2::__thread_struct, std::__2::default_delete<std::__2::__thread_struct>>, PicoThread::run()::$_2>>(void*)
-2993:virtual thunk to std::__2::basic_ostringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_ostringstream()_7466
+2993:virtual thunk to std::__2::basic_ostringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_ostringstream()_7469
 2994:virtual thunk to std::__2::basic_ostringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_ostringstream()
-2995:virtual thunk to std::__2::basic_istringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_istringstream()_7471
+2995:virtual thunk to std::__2::basic_istringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_istringstream()_7474
 2996:virtual thunk to std::__2::basic_istringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_istringstream()
-2997:virtual thunk to std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()_7414
+2997:virtual thunk to std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()_7417
 2998:virtual thunk to std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()
-2999:virtual thunk to asio::basic_socket_iostream<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_iostream()_4022
+2999:virtual thunk to asio::basic_socket_iostream<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_iostream()_4025
 3000:virtual thunk to asio::basic_socket_iostream<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_iostream()
 3001:video_cb(void const*, unsigned int, unsigned int, unsigned long)
-3002:vblankCallback(Event, void*)_5365
+3002:vblankCallback(Event, void*)_5368
 3003:vblankCallback(Event, void*)
 3004:vasprintf
 3005:update_max_arp_reqs
@@ -3268,7 +3268,7 @@
 3267:undo
 3268:trace_pc_ok(unsigned int)
 3269:trace_decode(unsigned int, RuntimeBlockInfo*)
-3270:touchscreen::TouchscreenPipe::~TouchscreenPipe()_2490
+3270:touchscreen::TouchscreenPipe::~TouchscreenPipe()_2493
 3271:touchscreen::TouchscreenPipe::~TouchscreenPipe()
 3272:touchscreen::TouchscreenPipe::write(unsigned char)
 3273:touchscreen::TouchscreenPipe::schedCallback(int, int, int, void*)
@@ -3312,14 +3312,14 @@
 3311:tcp_closing_ack
 3312:tcp_closewait
 3313:tcp_closeconn
-3314:systemsp::Touchscreen::~Touchscreen()_2609
+3314:systemsp::Touchscreen::~Touchscreen()_2612
 3315:systemsp::Touchscreen::~Touchscreen()
 3316:systemsp::Touchscreen::write(unsigned char)
 3317:systemsp::Touchscreen::serialize(Serializer&) const
 3318:systemsp::Touchscreen::schedCallback(int, int, int, void*)
 3319:systemsp::Touchscreen::read()
 3320:systemsp::Touchscreen::deserialize(Deserializer&)
-3321:systemsp::SystemSpCart::~SystemSpCart()_2563
+3321:systemsp::SystemSpCart::~SystemSpCart()_2566
 3322:systemsp::SystemSpCart::schedCallback(int, int, int, void*)
 3323:systemsp::SystemSpCart::handleEvent(Event, void*)
 3324:systemsp::SystemSpCart::Write(unsigned int, unsigned int, unsigned int)
@@ -3330,11 +3330,11 @@
 3329:systemsp::SystemSpCart::Init(LoadProgress*, std::__2::vector<unsigned char, std::__2::allocator<unsigned char>>*)
 3330:systemsp::SystemSpCart::GetBootId(RomBootID*)
 3331:systemsp::SystemSpCart::Deserialize(Deserializer&)
-3332:systemsp::SerialPort::~SerialPort()_2588
+3332:systemsp::SerialPort::~SerialPort()_2591
 3333:systemsp::SerialPort::~SerialPort()
 3334:systemsp::SerialPort::updateStatus()
 3335:systemsp::SerialPort::setPipe(SerialPort::Pipe*)
-3336:systemsp::RfidReaderWriter::~RfidReaderWriter()_2600
+3336:systemsp::RfidReaderWriter::~RfidReaderWriter()_2603
 3337:systemsp::RfidReaderWriter::~RfidReaderWriter()
 3338:systemsp::RfidReaderWriter::write(unsigned char)
 3339:systemsp::RfidReaderWriter::serialize(Serializer&) const
@@ -3391,12 +3391,12 @@
 3390:std::__2::time_get<char, std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>>::do_get_date(std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>, std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>, std::__2::ios_base&, unsigned int&, tm*) const
 3391:std::__2::time_get<char, std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>>::do_get(std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>, std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>, std::__2::ios_base&, unsigned int&, tm*, char, char) const
 3392:std::__2::numpunct<wchar_t> const& std::__2::use_facet[abi:ne210108]<std::__2::numpunct<wchar_t>>(std::__2::locale const&)
-3393:std::__2::numpunct<wchar_t>::~numpunct()_7991
+3393:std::__2::numpunct<wchar_t>::~numpunct()_7994
 3394:std::__2::numpunct<wchar_t>::do_truename() const
 3395:std::__2::numpunct<wchar_t>::do_grouping() const
 3396:std::__2::numpunct<wchar_t>::do_falsename() const
 3397:std::__2::numpunct<char> const& std::__2::use_facet[abi:ne210108]<std::__2::numpunct<char>>(std::__2::locale const&)
-3398:std::__2::numpunct<char>::~numpunct()_7989
+3398:std::__2::numpunct<char>::~numpunct()_7992
 3399:std::__2::numpunct<char>::do_truename() const
 3400:std::__2::numpunct<char>::do_thousands_sep() const
 3401:std::__2::numpunct<char>::do_grouping() const
@@ -3454,12 +3454,12 @@
 3453:std::__2::money_get<char, std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>>::__do_get(std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>&, std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>, bool, std::__2::locale const&, unsigned int, unsigned int&, bool&, std::__2::ctype<char> const&, std::__2::unique_ptr<char, void (*)(void*)>&, char*&, char*)
 3454:std::__2::messages<wchar_t>::do_get(long, int, int, std::__2::basic_string<wchar_t, std::__2::char_traits<wchar_t>, std::__2::allocator<wchar_t>> const&) const
 3455:std::__2::messages<char>::do_get(long, int, int, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&) const
-3456:std::__2::locale::__imp::~__imp()_7893
+3456:std::__2::locale::__imp::~__imp()_7896
 3457:std::__2::locale::__imp::__imp(unsigned long)
 3458:std::__2::locale::__global()
 3459:std::__2::istreambuf_iterator<wchar_t, std::__2::char_traits<wchar_t>>::operator*[abi:ne210108]() const
 3460:std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>::operator*[abi:ne210108]() const
-3461:std::__2::ios_base::~ios_base()_7487
+3461:std::__2::ios_base::~ios_base()_7490
 3462:std::__2::ios_base::getloc() const
 3463:std::__2::ios_base::failure::failure(char const*, std::__2::error_code const&)
 3464:std::__2::ios_base::__set_badbit_and_consider_rethrow()
@@ -3481,7 +3481,7 @@
 3480:std::__2::ctype<wchar_t>::do_is(wchar_t const*, wchar_t const*, unsigned long*) const
 3481:std::__2::ctype<wchar_t>::do_is(unsigned long, wchar_t) const
 3482:std::__2::ctype<char> const& std::__2::use_facet[abi:ne210108]<std::__2::ctype<char>>(std::__2::locale const&)
-3483:std::__2::ctype<char>::~ctype()_7918
+3483:std::__2::ctype<char>::~ctype()_7921
 3484:std::__2::ctype<char>::do_widen(char const*, char const*, char*) const
 3485:std::__2::ctype<char>::do_toupper(char) const
 3486:std::__2::ctype<char>::do_toupper(char*, char const*) const
@@ -3496,7 +3496,7 @@
 3495:std::__2::collate<char>::do_hash(char const*, char const*) const
 3496:std::__2::collate<char>::do_compare(char const*, char const*, char const*, char const*) const
 3497:std::__2::codecvt<wchar_t, char, __mbstate_t> const& std::__2::use_facet[abi:ne210108]<std::__2::codecvt<wchar_t, char, __mbstate_t>>(std::__2::locale const&)
-3498:std::__2::codecvt<wchar_t, char, __mbstate_t>::~codecvt()_7935
+3498:std::__2::codecvt<wchar_t, char, __mbstate_t>::~codecvt()_7938
 3499:std::__2::codecvt<wchar_t, char, __mbstate_t>::do_unshift(__mbstate_t&, char*, char*, char*&) const
 3500:std::__2::codecvt<wchar_t, char, __mbstate_t>::do_out(__mbstate_t&, wchar_t const*, wchar_t const*, wchar_t const*&, char*, char*, char*&) const
 3501:std::__2::codecvt<wchar_t, char, __mbstate_t>::do_max_length() const
@@ -3506,7 +3506,7 @@
 3505:std::__2::codecvt<wchar_t, char, __mbstate_t>::codecvt(unsigned long)
 3506:std::__2::codecvt<char, char, __mbstate_t> const& std::__2::use_facet[abi:ne210108]<std::__2::codecvt<char, char, __mbstate_t>>(std::__2::locale const&)
 3507:std::__2::codecvt<char, char, __mbstate_t>::do_length(__mbstate_t&, char const*, char const*, unsigned long) const
-3508:std::__2::basic_stringbuf<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_stringbuf()_7460
+3508:std::__2::basic_stringbuf<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_stringbuf()_7463
 3509:std::__2::basic_stringbuf<char, std::__2::char_traits<char>, std::__2::allocator<char>>::underflow()
 3510:std::__2::basic_stringbuf<char, std::__2::char_traits<char>, std::__2::allocator<char>>::seekpos(std::__2::fpos<__mbstate_t>, unsigned int)
 3511:std::__2::basic_stringbuf<char, std::__2::char_traits<char>, std::__2::allocator<char>>::seekoff(long long, std::__2::ios_base::seekdir, unsigned int)
@@ -3520,19 +3520,19 @@
 3519:std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>::assign(char const*)
 3520:std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>::append[abi:ne210108](std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
 3521:std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>& std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>::append[abi:ne210108]<char*, 0>(char*, char*)
-3522:std::__2::basic_streambuf<wchar_t, std::__2::char_traits<wchar_t>>::~basic_streambuf()_7417
+3522:std::__2::basic_streambuf<wchar_t, std::__2::char_traits<wchar_t>>::~basic_streambuf()_7420
 3523:std::__2::basic_streambuf<wchar_t, std::__2::char_traits<wchar_t>>::xsputn(wchar_t const*, long)
 3524:std::__2::basic_streambuf<wchar_t, std::__2::char_traits<wchar_t>>::xsgetn(wchar_t*, long)
 3525:std::__2::basic_streambuf<wchar_t, std::__2::char_traits<wchar_t>>::uflow()
 3526:std::__2::basic_streambuf<wchar_t, std::__2::char_traits<wchar_t>>::sgetc[abi:ne210108]()
-3527:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::~basic_streambuf()_7360
+3527:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::~basic_streambuf()_7363
 3528:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::xsputn(char const*, long)
 3529:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::xsgetn(char*, long)
 3530:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::uflow()
 3531:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::sgetc[abi:ne210108]()
 3532:std::__2::basic_ostream<wchar_t, std::__2::char_traits<wchar_t>>::sentry::sentry(std::__2::basic_ostream<wchar_t, std::__2::char_traits<wchar_t>>&)
-3533:std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()_7409
-3534:std::__2::basic_ios<char, std::__2::char_traits<char>>::~basic_ios()_7358
+3533:std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()_7412
+3534:std::__2::basic_ios<char, std::__2::char_traits<char>>::~basic_ios()_7361
 3535:std::__2::basic_ios<char, std::__2::char_traits<char>>::~basic_ios()
 3536:std::__2::basic_ios<char, std::__2::char_traits<char>>::fill[abi:ne210108]() const
 3537:std::__2::bad_weak_ptr::what() const
@@ -3585,53 +3585,53 @@
 3584:std::__2::__shared_ptr_pointer<DnsResolver*, std::__2::shared_ptr<DnsResolver>::__shared_ptr_default_delete<DnsResolver, DnsResolver>, std::__2::allocator<DnsResolver>>::__on_zero_shared()
 3585:std::__2::__shared_ptr_pointer<DnsResolver*, std::__2::shared_ptr<DnsResolver>::__shared_ptr_default_delete<DnsResolver, DnsResolver>, std::__2::allocator<DnsResolver>>::__get_deleter(std::type_info const&) const
 3586:std::__2::__shared_ptr_pointer<DirectPlayImpl*, std::__2::shared_ptr<DirectPlayImpl>::__shared_ptr_default_delete<DirectPlayImpl, DirectPlayImpl>, std::__2::allocator<DirectPlayImpl>>::__get_deleter(std::type_info const&) const
-3587:std::__2::__shared_ptr_emplace<maple_sega_vmu, std::__2::allocator<maple_sega_vmu>>::~__shared_ptr_emplace()_1628
+3587:std::__2::__shared_ptr_emplace<maple_sega_vmu, std::__2::allocator<maple_sega_vmu>>::~__shared_ptr_emplace()_1631
 3588:std::__2::__shared_ptr_emplace<maple_sega_vmu, std::__2::allocator<maple_sega_vmu>>::~__shared_ptr_emplace()
-3589:std::__2::__shared_ptr_emplace<maple_sega_twinstick, std::__2::allocator<maple_sega_twinstick>>::~__shared_ptr_emplace()_1679
+3589:std::__2::__shared_ptr_emplace<maple_sega_twinstick, std::__2::allocator<maple_sega_twinstick>>::~__shared_ptr_emplace()_1682
 3590:std::__2::__shared_ptr_emplace<maple_sega_twinstick, std::__2::allocator<maple_sega_twinstick>>::~__shared_ptr_emplace()
-3591:std::__2::__shared_ptr_emplace<maple_sega_purupuru, std::__2::allocator<maple_sega_purupuru>>::~__shared_ptr_emplace()_1641
+3591:std::__2::__shared_ptr_emplace<maple_sega_purupuru, std::__2::allocator<maple_sega_purupuru>>::~__shared_ptr_emplace()_1644
 3592:std::__2::__shared_ptr_emplace<maple_sega_purupuru, std::__2::allocator<maple_sega_purupuru>>::~__shared_ptr_emplace()
-3593:std::__2::__shared_ptr_emplace<maple_sega_controller, std::__2::allocator<maple_sega_controller>>::~__shared_ptr_emplace()_1595
+3593:std::__2::__shared_ptr_emplace<maple_sega_controller, std::__2::allocator<maple_sega_controller>>::~__shared_ptr_emplace()_1598
 3594:std::__2::__shared_ptr_emplace<maple_sega_controller, std::__2::allocator<maple_sega_controller>>::~__shared_ptr_emplace()
-3595:std::__2::__shared_ptr_emplace<maple_racing_controller, std::__2::allocator<maple_racing_controller>>::~__shared_ptr_emplace()_1734
+3595:std::__2::__shared_ptr_emplace<maple_racing_controller, std::__2::allocator<maple_racing_controller>>::~__shared_ptr_emplace()_1737
 3596:std::__2::__shared_ptr_emplace<maple_racing_controller, std::__2::allocator<maple_racing_controller>>::~__shared_ptr_emplace()
-3597:std::__2::__shared_ptr_emplace<maple_popnmusic_controller, std::__2::allocator<maple_popnmusic_controller>>::~__shared_ptr_emplace()_1723
+3597:std::__2::__shared_ptr_emplace<maple_popnmusic_controller, std::__2::allocator<maple_popnmusic_controller>>::~__shared_ptr_emplace()_1726
 3598:std::__2::__shared_ptr_emplace<maple_popnmusic_controller, std::__2::allocator<maple_popnmusic_controller>>::~__shared_ptr_emplace()
-3599:std::__2::__shared_ptr_emplace<maple_mouse, std::__2::allocator<maple_mouse>>::~__shared_ptr_emplace()_1657
+3599:std::__2::__shared_ptr_emplace<maple_mouse, std::__2::allocator<maple_mouse>>::~__shared_ptr_emplace()_1660
 3600:std::__2::__shared_ptr_emplace<maple_mouse, std::__2::allocator<maple_mouse>>::~__shared_ptr_emplace()
-3601:std::__2::__shared_ptr_emplace<maple_microphone, std::__2::allocator<maple_microphone>>::~__shared_ptr_emplace()_1617
+3601:std::__2::__shared_ptr_emplace<maple_microphone, std::__2::allocator<maple_microphone>>::~__shared_ptr_emplace()_1620
 3602:std::__2::__shared_ptr_emplace<maple_microphone, std::__2::allocator<maple_microphone>>::~__shared_ptr_emplace()
-3603:std::__2::__shared_ptr_emplace<maple_maracas_controller, std::__2::allocator<maple_maracas_controller>>::~__shared_ptr_emplace()_1701
+3603:std::__2::__shared_ptr_emplace<maple_maracas_controller, std::__2::allocator<maple_maracas_controller>>::~__shared_ptr_emplace()_1704
 3604:std::__2::__shared_ptr_emplace<maple_maracas_controller, std::__2::allocator<maple_maracas_controller>>::~__shared_ptr_emplace()
-3605:std::__2::__shared_ptr_emplace<maple_lightgun, std::__2::allocator<maple_lightgun>>::~__shared_ptr_emplace()_1664
+3605:std::__2::__shared_ptr_emplace<maple_lightgun, std::__2::allocator<maple_lightgun>>::~__shared_ptr_emplace()_1667
 3606:std::__2::__shared_ptr_emplace<maple_lightgun, std::__2::allocator<maple_lightgun>>::~__shared_ptr_emplace()
-3607:std::__2::__shared_ptr_emplace<maple_keyboard, std::__2::allocator<maple_keyboard>>::~__shared_ptr_emplace()_1650
+3607:std::__2::__shared_ptr_emplace<maple_keyboard, std::__2::allocator<maple_keyboard>>::~__shared_ptr_emplace()_1653
 3608:std::__2::__shared_ptr_emplace<maple_keyboard, std::__2::allocator<maple_keyboard>>::~__shared_ptr_emplace()
-3609:std::__2::__shared_ptr_emplace<maple_fishing_controller, std::__2::allocator<maple_fishing_controller>>::~__shared_ptr_emplace()_1712
+3609:std::__2::__shared_ptr_emplace<maple_fishing_controller, std::__2::allocator<maple_fishing_controller>>::~__shared_ptr_emplace()_1715
 3610:std::__2::__shared_ptr_emplace<maple_fishing_controller, std::__2::allocator<maple_fishing_controller>>::~__shared_ptr_emplace()
-3611:std::__2::__shared_ptr_emplace<maple_dreamparapara_controller, std::__2::allocator<maple_dreamparapara_controller>>::~__shared_ptr_emplace()_1766
+3611:std::__2::__shared_ptr_emplace<maple_dreamparapara_controller, std::__2::allocator<maple_dreamparapara_controller>>::~__shared_ptr_emplace()_1769
 3612:std::__2::__shared_ptr_emplace<maple_dreamparapara_controller, std::__2::allocator<maple_dreamparapara_controller>>::~__shared_ptr_emplace()
-3613:std::__2::__shared_ptr_emplace<maple_densha_controller, std::__2::allocator<maple_densha_controller>>::~__shared_ptr_emplace()_1745
+3613:std::__2::__shared_ptr_emplace<maple_densha_controller, std::__2::allocator<maple_densha_controller>>::~__shared_ptr_emplace()_1748
 3614:std::__2::__shared_ptr_emplace<maple_densha_controller, std::__2::allocator<maple_densha_controller>>::~__shared_ptr_emplace()
-3615:std::__2::__shared_ptr_emplace<maple_atomiswave_controller, std::__2::allocator<maple_atomiswave_controller>>::~__shared_ptr_emplace()_1609
+3615:std::__2::__shared_ptr_emplace<maple_atomiswave_controller, std::__2::allocator<maple_atomiswave_controller>>::~__shared_ptr_emplace()_1612
 3616:std::__2::__shared_ptr_emplace<maple_atomiswave_controller, std::__2::allocator<maple_atomiswave_controller>>::~__shared_ptr_emplace()
-3617:std::__2::__shared_ptr_emplace<maple_ascii_stick, std::__2::allocator<maple_ascii_stick>>::~__shared_ptr_emplace()_1690
+3617:std::__2::__shared_ptr_emplace<maple_ascii_stick, std::__2::allocator<maple_ascii_stick>>::~__shared_ptr_emplace()_1693
 3618:std::__2::__shared_ptr_emplace<maple_ascii_stick, std::__2::allocator<maple_ascii_stick>>::~__shared_ptr_emplace()
-3619:std::__2::__shared_ptr_emplace<dreampotato::DreamPotato, std::__2::allocator<dreampotato::DreamPotato>>::~__shared_ptr_emplace()_4201
+3619:std::__2::__shared_ptr_emplace<dreampotato::DreamPotato, std::__2::allocator<dreampotato::DreamPotato>>::~__shared_ptr_emplace()_4204
 3620:std::__2::__shared_ptr_emplace<dreampotato::DreamPotato, std::__2::allocator<dreampotato::DreamPotato>>::~__shared_ptr_emplace()
 3621:std::__2::__shared_ptr_emplace<dreampotato::DreamPotato, std::__2::allocator<dreampotato::DreamPotato>>::__on_zero_shared()
-3622:std::__2::__shared_ptr_emplace<atomiswave_lightgun, std::__2::allocator<atomiswave_lightgun>>::~__shared_ptr_emplace()_1673
+3622:std::__2::__shared_ptr_emplace<atomiswave_lightgun, std::__2::allocator<atomiswave_lightgun>>::~__shared_ptr_emplace()_1676
 3623:std::__2::__shared_ptr_emplace<atomiswave_lightgun, std::__2::allocator<atomiswave_lightgun>>::~__shared_ptr_emplace()
-3624:std::__2::__shared_ptr_emplace<RFIDReaderWriterImpl, std::__2::allocator<RFIDReaderWriterImpl>>::~__shared_ptr_emplace()_1934
+3624:std::__2::__shared_ptr_emplace<RFIDReaderWriterImpl, std::__2::allocator<RFIDReaderWriterImpl>>::~__shared_ptr_emplace()_1937
 3625:std::__2::__shared_ptr_emplace<RFIDReaderWriterImpl, std::__2::allocator<RFIDReaderWriterImpl>>::~__shared_ptr_emplace()
-3626:std::__2::__shared_ptr_emplace<MiniUPnP, std::__2::allocator<MiniUPnP>>::~__shared_ptr_emplace()_4900
+3626:std::__2::__shared_ptr_emplace<MiniUPnP, std::__2::allocator<MiniUPnP>>::~__shared_ptr_emplace()_4903
 3627:std::__2::__shared_ptr_emplace<MiniUPnP, std::__2::allocator<MiniUPnP>>::~__shared_ptr_emplace()
 3628:std::__2::__shared_ptr_emplace<MiniUPnP, std::__2::allocator<MiniUPnP>>::__on_zero_shared()
-3629:std::__2::__shared_ptr_emplace<MapleLinkVmu, std::__2::allocator<MapleLinkVmu>>::~__shared_ptr_emplace()_1774
+3629:std::__2::__shared_ptr_emplace<MapleLinkVmu, std::__2::allocator<MapleLinkVmu>>::~__shared_ptr_emplace()_1777
 3630:std::__2::__shared_ptr_emplace<MapleLinkVmu, std::__2::allocator<MapleLinkVmu>>::~__shared_ptr_emplace()
-3631:std::__2::__shared_ptr_emplace<MIEImpl, std::__2::allocator<MIEImpl>>::~__shared_ptr_emplace()_1875
+3631:std::__2::__shared_ptr_emplace<MIEImpl, std::__2::allocator<MIEImpl>>::~__shared_ptr_emplace()_1878
 3632:std::__2::__shared_ptr_emplace<MIEImpl, std::__2::allocator<MIEImpl>>::~__shared_ptr_emplace()
-3633:std::__2::__shared_ptr_emplace<FullController, std::__2::allocator<FullController>>::~__shared_ptr_emplace()_1756
+3633:std::__2::__shared_ptr_emplace<FullController, std::__2::allocator<FullController>>::~__shared_ptr_emplace()_1759
 3634:std::__2::__shared_ptr_emplace<FullController, std::__2::allocator<FullController>>::~__shared_ptr_emplace()
 3635:std::__2::__num_put<wchar_t>::__widen_and_group_int(char*, char*, char*, wchar_t*, wchar_t*&, wchar_t*&, std::__2::locale const&)
 3636:std::__2::__num_put<wchar_t>::__widen_and_group_float(char*, char*, char*, wchar_t*, wchar_t*&, wchar_t*&, std::__2::locale const&)
@@ -3687,7 +3687,7 @@
 3686:std::__2::__async_assoc_state<void, std::__2::__async_func<Emulator::start()::$_0>>::__execute()
 3687:std::__2::__async_assoc_state<void, std::__2::__async_func<DirectPlayImpl::forwardPorts(unsigned short, bool)::'lambda'()>>::__execute()
 3688:std::__2::__async_assoc_state<bool, std::__2::__async_func<NaomiNetwork::startNetworkAsync()::'lambda'()>>::__execute()
-3689:std::__2::__assoc_sub_state::~__assoc_sub_state()_7348
+3689:std::__2::__assoc_sub_state::~__assoc_sub_state()_7351
 3690:std::__2::__assoc_sub_state::__sub_wait(std::__2::unique_lock<std::__2::mutex>&)
 3691:std::__2::__assoc_sub_state::__make_ready()
 3692:std::__2::__assoc_sub_state::__execute()
@@ -3701,7 +3701,7 @@
 3700:stbi__resample_row_generic(unsigned char*, unsigned char*, unsigned char*, int, int)
 3701:stbi__idct_block(unsigned char*, int, short*)
 3702:stbi__YCbCr_to_RGB_row(unsigned char*, unsigned char const*, unsigned char const*, unsigned char const*, int, int)
-3703:start_6142
+3703:start_6145
 3704:start
 3705:sqWrite_nommu_area_3_nonvmem(unsigned int, Sh4Context*)
 3706:sqWrite_nommu_area_3(unsigned int, Sh4Context*)
@@ -3872,7 +3872,7 @@
 3871:read_BSC_PDTRA(unsigned int)
 3872:pthread_cond_wait
 3873:proto_deinit_cb
-3874:process_6147
+3874:process_6150
 3875:process
 3876:ppp_modem_send_reset
 3877:ppp_modem_send_echo
@@ -3915,32 +3915,32 @@
 3914:norend::Render()
 3915:norend::RenderFramebuffer(FramebufferInfo const&)
 3916:norend::Process(TA_context*)
-3917:non-virtual thunk to std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()_7413
+3917:non-virtual thunk to std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()_7416
 3918:non-virtual thunk to std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()
-3919:non-virtual thunk to modem::v42b::Decompressor::~Decompressor()_2126
+3919:non-virtual thunk to modem::v42b::Decompressor::~Decompressor()_2129
 3920:non-virtual thunk to modem::v42b::Decompressor::~Decompressor()
 3921:non-virtual thunk to modem::v42b::Decompressor::write(unsigned char)
-3922:non-virtual thunk to modem::v42b::Compressor::~Compressor()_2122
+3922:non-virtual thunk to modem::v42b::Compressor::~Compressor()_2125
 3923:non-virtual thunk to modem::v42b::Compressor::write(unsigned char)
-3924:non-virtual thunk to modem::V8bisProtocol::~V8bisProtocol()_2085
+3924:non-virtual thunk to modem::V8bisProtocol::~V8bisProtocol()_2088
 3925:non-virtual thunk to modem::V8bisProtocol::~V8bisProtocol()
 3926:non-virtual thunk to modem::V8bisProtocol::write(unsigned char)
-3927:non-virtual thunk to modem::V42Protocol::~V42Protocol()_2081
+3927:non-virtual thunk to modem::V42Protocol::~V42Protocol()_2084
 3928:non-virtual thunk to modem::V42Protocol::~V42Protocol()
 3929:non-virtual thunk to modem::V42Protocol::write(unsigned char)
 3930:non-virtual thunk to modem::V14Encoder::write(unsigned char)
 3931:non-virtual thunk to modem::V14Decoder::write(unsigned char)
 3932:non-virtual thunk to card_reader::SanwaCRP1231BR::write(unsigned char)
-3933:non-virtual thunk to card_reader::InitialDCardReader::~InitialDCardReader()_2444
+3933:non-virtual thunk to card_reader::InitialDCardReader::~InitialDCardReader()_2447
 3934:non-virtual thunk to card_reader::InitialDCardReader::~InitialDCardReader()
-3935:non-virtual thunk to card_reader::ClubKartCardReader::~ClubKartCardReader()_2469
+3935:non-virtual thunk to card_reader::ClubKartCardReader::~ClubKartCardReader()_2472
 3936:non-virtual thunk to card_reader::ClubKartCardReader::~ClubKartCardReader()
 3937:non-virtual thunk to card_reader::ClubKartCardReader::write(unsigned char)
 3938:non-virtual thunk to asio::detail::select_reactor::run(long, asio::detail::op_queue<asio::detail::scheduler_operation>&)
 3939:non-virtual thunk to asio::detail::select_reactor::interrupt()
-3940:non-virtual thunk to asio::basic_socket_iostream<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_iostream()_4021
+3940:non-virtual thunk to asio::basic_socket_iostream<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_iostream()_4024
 3941:non-virtual thunk to asio::basic_socket_iostream<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_iostream()
-3942:non-virtual thunk to MIEImpl::~MIEImpl()_1862
+3942:non-virtual thunk to MIEImpl::~MIEImpl()_1865
 3943:non-virtual thunk to MIEImpl::~MIEImpl()
 3944:non-virtual thunk to MIEImpl::setPipe(SerialPort::Pipe*)
 3945:ngen_FailedToFindBlock_internal()
@@ -3965,17 +3965,17 @@
 3964:modem_write(pico_device*, void const*, int)
 3965:modem_sched_func(int, int, int, void*)
 3966:modem_read(pico_device*, void*, int)
-3967:modem::v42b::V42Base::~V42Base()_2119
+3967:modem::v42b::V42Base::~V42Base()_2122
 3968:modem::v42b::V42Base::reset()
-3969:modem::v42b::Decompressor::~Decompressor()_2124
+3969:modem::v42b::Decompressor::~Decompressor()_2127
 3970:modem::v42b::Decompressor::~Decompressor()
 3971:modem::v42b::Compressor::~Compressor()
 3972:modem::v42b::Compressor::checkDictSize()
-3973:modem::V8bisProtocol::~V8bisProtocol()_2083
+3973:modem::V8bisProtocol::~V8bisProtocol()_2086
 3974:modem::V8bisProtocol::~V8bisProtocol()
 3975:modem::V8bisProtocol::read()
 3976:modem::V8bisProtocol::available()
-3977:modem::V42Protocol::~V42Protocol()_2078
+3977:modem::V42Protocol::~V42Protocol()_2081
 3978:modem::V42Protocol::read()
 3979:modem::V14Encoder::reset()
 3980:modem::V14Decoder::reset()
@@ -3983,9 +3983,9 @@
 3982:modem::PipeIn::read()
 3983:modem::PipeIn::available()
 3984:modem::HdlcEncoder::reset()
-3985:modem::HdlcDecoder::~HdlcDecoder()_2077
+3985:modem::HdlcDecoder::~HdlcDecoder()_2080
 3986:modem::HdlcDecoder::~HdlcDecoder()
-3987:modem::BufferedTransformer::~BufferedTransformer()_2022
+3987:modem::BufferedTransformer::~BufferedTransformer()_2025
 3988:modem::BufferedTransformer::reset()
 3989:mmu_IReadMem16(unsigned int)
 3990:midiffb::midiReceiver(unsigned char)
@@ -3998,9 +3998,9 @@
 3997:mcast_so_addsrcm
 3998:mcast_so_addm
 3999:mcast_listen_cmp
-4000:maximum_compressed_size_6138
+4000:maximum_compressed_size_6141
 4001:maximum_compressed_size
-4002:maple_sega_vmu::~maple_sega_vmu()_1778
+4002:maple_sega_vmu::~maple_sega_vmu()_1781
 4003:maple_sega_vmu::serialize(Serializer&) const
 4004:maple_sega_vmu::getData(unsigned long&) const
 4005:maple_sega_vmu::fullSave()
@@ -4035,7 +4035,7 @@
 4034:maple_popnmusic_controller::getAnalogAxis(int, PlainJoystickState const&)
 4035:maple_mouse::get_device_type()
 4036:maple_mouse::dma(unsigned int)
-4037:maple_microphone::~maple_microphone()_1622
+4037:maple_microphone::~maple_microphone()_1625
 4038:maple_microphone::~maple_microphone()
 4039:maple_microphone::serialize(Serializer&) const
 4040:maple_microphone::dma(unsigned int)
@@ -4142,7 +4142,7 @@
 4141:install_block_tries(unsigned long, int, unsigned int)
 4142:input_state_cb(unsigned int, unsigned int, unsigned int, unsigned int)
 4143:input_segment_compare
-4144:input_6145
+4144:input_6148
 4145:input
 4146:initconn_retry
 4147:iNotImplemented(Sh4Context*, unsigned int)
@@ -4363,7 +4363,7 @@
 4362:htonl
 4363:hostfs::StdStorage::openFile(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
 4364:hostfs::StdStorage::exists(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
-4365:hostfs::StdFile::~StdFile()_5105
+4365:hostfs::StdFile::~StdFile()_5108
 4366:hostfs::StdFile::~StdFile()
 4367:hostfs::StdFile::write(void const*, unsigned long, unsigned long)
 4368:hostfs::StdFile::tell()
@@ -4379,7 +4379,7 @@
 4378:hostfs::LibretroStorage::getParentPath(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
 4379:hostfs::LibretroStorage::getFileInfo(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
 4380:hostfs::LibretroStorage::addStorage(bool, bool, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&, void (*)(bool, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>), std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
-4381:hostfs::LibretroFile::~LibretroFile()_1053
+4381:hostfs::LibretroFile::~LibretroFile()_1056
 4382:hostfs::LibretroFile::~LibretroFile()
 4383:hostfs::LibretroFile::write(void const*, unsigned long, unsigned long)
 4384:hostfs::LibretroFile::tell()
@@ -4419,946 +4419,949 @@
 4418:flycast_vmu_gen
 4419:flycast_sh4dis
 4420:flycast_set_trace
-4421:flycast_set_tcntfp
-4422:flycast_set_sq_fp
-4423:flycast_set_smcbr
-4424:flycast_set_slice_inwasm
-4425:flycast_set_shard
-4426:flycast_set_self_loop
-4427:flycast_set_sb
-4428:flycast_set_rte_intc
-4429:flycast_set_render_skip
-4430:flycast_set_regcache
-4431:flycast_set_rb_batch
-4432:flycast_set_pswff
-4433:flycast_set_plink
-4434:flycast_set_pc_trace_until
-4435:flycast_set_modvol
-4436:flycast_set_mem_fastpaths
-4437:flycast_set_lazy
-4438:flycast_set_jitfail
-4439:flycast_set_interp_range
-4440:flycast_set_interp_only
-4441:flycast_set_imm_fastpath
-4442:flycast_set_idleskip
-4443:flycast_set_gwff
-4444:flycast_set_g2ff
-4445:flycast_set_frm
-4446:flycast_set_fog
-4447:flycast_set_early
-4448:flycast_set_divinline
-4449:flycast_set_deterministic
-4450:flycast_set_chain
-4451:flycast_set_census
-4452:flycast_set_armtime
-4453:flycast_set_armmemfp
-4454:flycast_set_armhist
-4455:flycast_set_armff
-4456:flycast_set_arm7selftest
-4457:flycast_set_arm7jit
-4458:flycast_set_aicatime
-4459:flycast_set_aicahash
-4460:flycast_set_aicafast
-4461:flycast_ser_sections
-4462:flycast_run_iter_flag_ptr
-4463:flycast_render_skips
-4464:flycast_rb_reset_host_history
-4465:flycast_pchist
-4466:flycast_log_cb(retro_log_level, char const*, ...)
-4467:flycast_keep_pthread_runtime
-4468:flycast_jit_declare_park_arm
-4469:flycast_interp_step_count
-4470:flycast_guest_cycles
-4471:flycast_get_sh4_pc
-4472:flycast_flash_size
-4473:flycast_flash_ptr
-4474:flycast_flash_gen
-4475:flycast_diag_set
-4476:flycast_diag_ifb
-4477:flycast_ctx_snapshot
-4478:flycast_census_info
-4479:flycast_armff_stat
-4480:float std::__2::__num_get_float[abi:ne210108]<float>(char const*, char const*, unsigned int&)
-4481:flac_codec_init
-4482:flac_codec_free
-4483:flac_codec_decompress
-4484:fault_handler(int, siginfo_t*, void*)
-4485:end_of_input_6146
-4486:end_of_input
-4487:end_6144
-4488:end
-4489:emscripten_worker_init
-4490:emscripten_state_size
-4491:emscripten_stack_set_limits
-4492:emscripten_stack_get_current
-4493:emscripten_set_video_target
-4494:emscripten_set_rollback_mode
-4495:emscripten_set_player_ports
-4496:emscripten_set_audio_ring
-4497:emscripten_save_state_into
-4498:emscripten_save_state
-4499:emscripten_run_iter
-4500:emscripten_reset
-4501:emscripten_rb_ram_offset
-4502:emscripten_rb_mute_audio
-4503:emscripten_rb_hash
-4504:emscripten_parity_tick
-4505:emscripten_parity_begin
-4506:emscripten_lockstep_normalize
-4507:emscripten_load_state_rollback
-4508:emscripten_load_state
-4509:emscripten_load_disc
-4510:emscripten_get_port_polls
-4511:emscripten_get_player_ports
-4512:emscripten_get_maple_ptr
-4513:emscripten_create_gl_context
-4514:elan::write_elanreg(unsigned int, unsigned int)
-4515:elan::write_elancmd(unsigned int, unsigned int)
-4516:elan::schedCallback(int, int, int, void*)
-4517:elan::read_elanreg(unsigned int)
-4518:elan::packColorRGBA(glm::vec<4, float, (glm::qualifier)0> const&)
-4519:elan::packColorBGRA(glm::vec<4, float, (glm::qualifier)0> const&)
-4520:drflac__realloc_default
-4521:drflac__on_seek_ogg
-4522:drflac__on_read_ogg
-4523:dreampotato::DreamPotato::~DreamPotato()_3982
-4524:dreampotato::DreamPotato::~DreamPotato()
-4525:dreampotato::DreamPotato::send(MapleMsg const&)
-4526:dreampotato::DreamPotato::sendReceive(MapleMsg const&, MapleMsg&)
-4527:dreampotato::DreamPotato::isConnected()
-4528:double std::__2::__num_get_float[abi:ne210108]<double>(char const*, char const*, unsigned int&)
-4529:discSwapCallback(int, int, int, void*)
-4530:disassemble_op(char const*, unsigned int, unsigned short)
-4531:dhcp_settings_cmp
-4532:dhcp_negotiations_cmp
-4533:deinit_cb
-4534:deflate_slow
-4535:deflate_fast
-4536:decompress_allocate_6148
-4537:decompress_allocate
-4538:decltype(auto) std::__2::__variant_detail::__visitation::__base::__dispatcher<1ul>::__dispatch[abi:ne210108]<void std::__2::__variant_detail::__ctor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>>::__generic_construct[abi:ne210108]<std::__2::__variant_detail::__move_constructor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>, (std::__2::__variant_detail::_Trait)1>>(std::__2::__variant_detail::__ctor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>>&, std::__2::__variant_detail::__move_constructor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>, (std::__2::__variant_detail::_Trait)1>&&)::'lambda'(std::__2::__variant_detail::__move_constructor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>, (std::__2::__variant_detail::_Trait)1>&&)&&, std::__2::__variant_detail::__base<(std::__2::__variant_detail::_Trait)1, std::__2::monostate, std::__2::function<void ()>>&&>(std::__2::__variant_detail::__move_constructor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>, (std::__2::__variant_detail::_Trait)1>, std::__2::__variant_detail::__base<(std::__2::__variant_detail::_Trait)1, std::__2::monostate, std::__2::function<void ()>>&&)
-4539:decltype(auto) std::__2::__variant_detail::__visitation::__base::__dispatcher<1ul>::__dispatch[abi:ne210108]<std::__2::__variant_detail::__dtor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>, (std::__2::__variant_detail::_Trait)1>::__destroy[abi:ne210108]()::'lambda'(auto&)&&, std::__2::__variant_detail::__base<(std::__2::__variant_detail::_Trait)1, std::__2::monostate, std::__2::function<void ()>>&>(auto, std::__2::__variant_detail::__base<(std::__2::__variant_detail::_Trait)1, std::__2::monostate, std::__2::function<void ()>>&)
-4540:dec_illegalOp(unsigned int)
-4541:dec_i1111_1011_1111_1101(unsigned int)
-4542:dec_i1111_0011_1111_1101(unsigned int)
-4543:dec_i1011_iiii_iiii_iiii(unsigned int)
-4544:dec_i1010_iiii_iiii_iiii(unsigned int)
-4545:dec_i1000_1111_iiii_iiii(unsigned int)
-4546:dec_i1000_1101_iiii_iiii(unsigned int)
-4547:dec_i1000_1011_iiii_iiii(unsigned int)
-4548:dec_i1000_1001_iiii_iiii(unsigned int)
-4549:dec_i0100_nnnn_0110_1010(unsigned int)
-4550:dec_i0100_nnnn_0110_0110(unsigned int)
-4551:dec_i0100_nnnn_0010_1011(unsigned int)
-4552:dec_i0100_nnnn_0010_0101(unsigned int)
-4553:dec_i0100_nnnn_0010_0100(unsigned int)
-4554:dec_i0100_nnnn_0001_1011(unsigned int)
-4555:dec_i0100_nnnn_0000_1110(unsigned int)
-4556:dec_i0100_nnnn_0000_1011(unsigned int)
-4557:dec_i0100_nnnn_0000_0111(unsigned int)
-4558:dec_i0100_nnnn_0000_0011(unsigned int)
-4559:dec_i0000_nnnn_0010_0011(unsigned int)
-4560:dec_i0000_nnnn_0000_0011(unsigned int)
-4561:dec_i0000_0000_0010_1011(unsigned int)
-4562:dec_i0000_0000_0000_1011(unsigned int)
-4563:deauth
-4564:crc_read
-4565:cookie_compare
-4566:context_reset()
-4567:context_destroy()
-4568:config::RendererOption::reset()
-4569:config::Option<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, true>::~Option()_1001
-4570:config::Option<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, true>::~Option()
-4571:config::Option<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, true>::reset()
-4572:config::Option<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, true>::load()
-4573:config::Option<long long, true>::~Option()_1017
-4574:config::Option<long long, true>::~Option()
-4575:config::Option<long long, true>::reset()
-4576:config::Option<long long, true>::load()
-4577:config::Option<int, true>::~Option()
-4578:config::Option<int, false>::~Option()_996
-4579:config::Option<int, false>::~Option()
-4580:config::Option<float, true>::~Option()_1013
-4581:config::Option<float, true>::~Option()
-4582:config::Option<float, true>::reset()
-4583:config::Option<float, true>::load()
-4584:config::Option<bool, true>::~Option()_983
-4585:config::Option<bool, true>::~Option()
-4586:config::Option<bool, true>::reset()
-4587:config::Option<bool, true>::load()
-4588:config::Option<RenderType, true>::~Option()
-4589:config::Option<MapleDeviceType, true>::~Option()_1023
-4590:config::Option<MapleDeviceType, true>::~Option()
-4591:config::IntOption::load()
-4592:compress_callback
-4593:compress_allocate_6139
-4594:compress_allocate
-4595:cdzs_codec_init
-4596:cdzs_codec_free
-4597:cdzs_codec_decompress
-4598:cdzl_codec_init
-4599:cdzl_codec_free
-4600:cdzl_codec_decompress
-4601:cdlz_codec_init
-4602:cdlz_codec_free
-4603:cdlz_codec_decompress
-4604:cdfl_codec_init
-4605:cdfl_codec_free
-4606:cdfl_codec_decompress
-4607:card_reader::SanwaCRP1231LR::getStatus1()
-4608:card_reader::SanwaCRP1231BR::loadCard()
-4609:card_reader::SanwaCRP1231BR::getStatus1()
-4610:card_reader::InitialDCardReader::~InitialDCardReader()_2432
-4611:card_reader::InitialDCardReader::~InitialDCardReader()
-4612:card_reader::ClubKartCardReader::~ClubKartCardReader()_2458
-4613:card_reader::ClubKartCardReader::~ClubKartCardReader()
-4614:card_reader::ClubKartCardReader::loadCard()
-4615:card_reader::CardReaderWriter::~CardReaderWriter()
-4616:card_reader::BarcodeReader::~BarcodeReader()_2473
-4617:card_reader::BarcodeReader::~BarcodeReader()
-4618:card_reader::BarcodeReader::read()
-4619:cancel_notification
-4620:cancel_active_ctxs
-4621:call_with_ctx
-4622:call_then_finish_task
-4623:call_cancel_then_free_ctx
-4624:call_callback_then_free_ctx
-4625:bool asio::execution::detail::any_executor_base::equal_ex<asio::io_context::basic_executor_type<std::__2::allocator<void>, 4ul>>(asio::execution::detail::any_executor_base const&, asio::execution::detail::any_executor_base const&)
-4626:bool asio::execution::detail::any_executor_base::equal_ex<asio::io_context::basic_executor_type<std::__2::allocator<void>, 0ul>>(asio::execution::detail::any_executor_base const&, asio::execution::detail::any_executor_base const&)
-4627:bemental::sh4::build_blocks_unlinked(std::__2::vector<RuntimeBlockInfo*, std::__2::allocator<RuntimeBlockInfo*>> const&)
-4628:auth_start_timer
-4629:auth_rsp
-4630:auth_req
-4631:auth_abort
-4632:auth
-4633:audio_sample_cb(short, short)
-4634:audio_sample_batch_cb(short const*, unsigned long)
-4635:atomiswave_lightgun::transform_kcode(unsigned int)
-4636:asio_detail_posix_thread_function
-4637:asio::ip::bad_address_cast::what() const
-4638:asio::execution_context::service* asio::detail::service_registry::create<asio::detail::scheduler, asio::execution_context>(void*)
-4639:asio::execution_context::service* asio::detail::service_registry::create<asio::detail::resolver_service<asio::ip::udp>, asio::io_context>(void*)
-4640:asio::execution_context::service* asio::detail::service_registry::create<asio::detail::reactive_socket_service<asio::ip::udp>, asio::io_context>(void*)
-4641:asio::execution_context::service* asio::detail::service_registry::create<asio::detail::reactive_socket_service<asio::ip::tcp>, asio::io_context>(void*)
-4642:asio::execution_context::service* asio::detail::service_registry::create<asio::detail::deadline_timer_service<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>, asio::io_context>(void*)
-4643:asio::execution::bad_executor::what() const
-4644:asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>> asio::execution::detail::any_executor_base::prefer_fn<asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>>, asio::io_context::basic_executor_type<std::__2::allocator<void>, 4ul>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>>(void const*, void const*)
-4645:asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>> asio::execution::detail::any_executor_base::prefer_fn<asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>>, asio::io_context::basic_executor_type<std::__2::allocator<void>, 4ul>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>>(void const*, void const*)
-4646:asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>> asio::execution::detail::any_executor_base::prefer_fn<asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>>, asio::io_context::basic_executor_type<std::__2::allocator<void>, 4ul>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>>(void const*, void const*)
-4647:asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>> asio::execution::detail::any_executor_base::prefer_fn<asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>>, asio::io_context::basic_executor_type<std::__2::allocator<void>, 0ul>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>>(void const*, void const*)
-4648:asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>> asio::execution::detail::any_executor_base::prefer_fn<asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>>, asio::io_context::basic_executor_type<std::__2::allocator<void>, 0ul>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>>(void const*, void const*)
-4649:asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>> asio::execution::detail::any_executor_base::prefer_fn<asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>>, asio::io_context::basic_executor_type<std::__2::allocator<void>, 0ul>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>>(void const*, void const*)
-4650:asio::error::detail::netdb_category::name() const
-4651:asio::error::detail::netdb_category::message(int) const
-4652:asio::error::detail::misc_category::name() const
-4653:asio::error::detail::misc_category::message(int) const
-4654:asio::error::detail::addrinfo_category::name() const
-4655:asio::error::detail::addrinfo_category::message(int) const
-4656:asio::detail::wait_handler<void net::modbba::AccessPointFinder::find<net::modbba::DCNetThread::run()::$_0>(net::modbba::DCNetThread::run()::$_0 const&)::'lambda'(std::__2::error_code const&), asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4657:asio::detail::wait_handler<void net::modbba::AccessPointFinder::find<net::modbba::DCNetThread::run()::$_0>(net::modbba::DCNetThread::run()::$_0 const&)::'lambda'(std::__2::error_code const&)::operator()(std::__2::error_code const&) const::'lambda'(std::__2::error_code const&), asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4658:asio::detail::wait_handler<std::__2::__bind<void (&)(std::__2::error_code const&, asio::basic_waitable_timer<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>, asio::any_io_executor>*), std::__2::placeholders::__ph<1> const&, asio::basic_waitable_timer<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>, asio::any_io_executor>*&>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4659:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::~timer_queue()_4930
-4660:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::~timer_queue()
-4661:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::wait_duration_usec(long) const
-4662:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::wait_duration_msec(long) const
-4663:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::get_ready_timers(asio::detail::op_queue<asio::detail::scheduler_operation>&)
-4664:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::get_all_timers(asio::detail::op_queue<asio::detail::scheduler_operation>&)
-4665:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::empty() const
-4666:asio::detail::system_category::name() const
-4667:asio::detail::system_category::message(int) const
-4668:asio::detail::select_reactor::~select_reactor()_4061
-4669:asio::detail::select_reactor::~select_reactor()
-4670:asio::detail::select_reactor::notify_fork(asio::execution_context::fork_event)
-4671:asio::detail::select_reactor::interrupt()
-4672:asio::detail::scheduler::~scheduler()_4071
-4673:asio::detail::scheduler::shutdown()
-4674:asio::detail::scheduler::get_default_task(asio::execution_context&)
-4675:asio::detail::reactive_socket_sendto_op_base<asio::mutable_buffers_1, asio::ip::basic_endpoint<asio::ip::udp>>::do_perform(asio::detail::reactor_op*)
-4676:asio::detail::reactive_socket_sendto_op<asio::mutable_buffers_1, asio::ip::basic_endpoint<asio::ip::udp>, std::__2::__bind<void (DnsResolver::*)(pico_ip4*, std::__2::error_code const&, unsigned long), std::__2::shared_ptr<DnsResolver>, pico_ip4*&, std::__2::placeholders::__ph<1> const&, std::__2::placeholders::__ph<2> const&>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4677:asio::detail::reactive_socket_send_op_base<asio::const_buffers_1>::do_perform(asio::detail::reactor_op*)
-4678:asio::detail::reactive_socket_send_op<asio::const_buffers_1, asio::detail::write_op<asio::basic_stream_socket<asio::ip::tcp, asio::any_io_executor>, asio::mutable_buffers_1, asio::mutable_buffer const*, asio::detail::transfer_all_t, std::__2::__bind<void (TcpSocket::*)(std::__2::error_code const&, unsigned long), std::__2::shared_ptr<TcpSocket>, std::__2::placeholders::__ph<1> const&, std::__2::placeholders::__ph<2> const&>>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4679:asio::detail::reactive_socket_send_op<asio::const_buffers_1, asio::detail::write_op<asio::basic_stream_socket<asio::ip::tcp, asio::any_io_executor>, asio::mutable_buffers_1, asio::mutable_buffer const*, asio::detail::transfer_all_t, net::modbba::PPPSocket::doSend()::'lambda'(std::__2::error_code const&, unsigned long)>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4680:asio::detail::reactive_socket_send_op<asio::const_buffers_1, asio::detail::write_op<asio::basic_stream_socket<asio::ip::tcp, asio::any_io_executor>, asio::mutable_buffers_1, asio::mutable_buffer const*, asio::detail::transfer_all_t, net::modbba::EthSocket::doSend()::'lambda'(std::__2::error_code const&, unsigned long)>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4681:asio::detail::reactive_socket_recvfrom_op<asio::mutable_buffers_1, asio::ip::basic_endpoint<asio::ip::udp>, net::modbba::AccessPointFinder::receivePing()::'lambda'(std::__2::error_code const&, unsigned long), asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4682:asio::detail::reactive_socket_recvfrom_op<asio::mutable_buffers_1, asio::ip::basic_endpoint<asio::ip::udp>, net::modbba::AccessPointFinder::receiveAccessPoints()::'lambda'(std::__2::error_code const&, unsigned long), asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4683:asio::detail::reactive_socket_recvfrom_op<asio::mutable_buffers_1, asio::ip::basic_endpoint<asio::ip::udp>, UdpSocket::readAsync()::'lambda'(std::__2::error_code const&, unsigned long), asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4684:asio::detail::reactive_socket_recvfrom_op<asio::mutable_buffer, asio::ip::basic_endpoint<asio::ip::udp>, std::__2::__bind<void (DnsResolver::*)(pico_ip4*, std::__2::error_code const&, unsigned long), std::__2::shared_ptr<DnsResolver>, pico_ip4*&, std::__2::placeholders::__ph<1> const&, std::__2::placeholders::__ph<2> const&>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4685:asio::detail::reactive_socket_recv_op_base<asio::mutable_buffers_1>::do_perform(asio::detail::reactor_op*)
-4686:asio::detail::reactive_socket_recv_op<asio::mutable_buffers_1, std::__2::__bind<void (TcpSocket::*)(std::__2::error_code const&, unsigned long), std::__2::shared_ptr<TcpSocket>, std::__2::placeholders::__ph<1> const&, std::__2::placeholders::__ph<2> const&>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4687:asio::detail::reactive_socket_recv_op<asio::mutable_buffers_1, net::modbba::PowerSmashPPPSocket::receive()::'lambda'(std::__2::error_code const&, unsigned long), asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4688:asio::detail::reactive_socket_recv_op<asio::mutable_buffers_1, net::modbba::PPPSocket::receive()::'lambda'(std::__2::error_code const&, unsigned long), asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4689:asio::detail::reactive_socket_recv_op<asio::mutable_buffers_1, asio::detail::read_until_match_op_v2<asio::basic_stream_socket<asio::ip::tcp, asio::any_io_executor>, asio::dynamic_vector_buffer<unsigned char, std::__2::allocator<unsigned char>>, std::__2::pair<asio::buffers_iterator<asio::const_buffers_1, char>, bool> (*)(asio::buffers_iterator<asio::const_buffers_1, char>, asio::buffers_iterator<asio::const_buffers_1, char>), net::modbba::EthSocket::receive()::'lambda'(std::__2::error_code const&, unsigned long)>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4690:asio::detail::reactive_socket_connect_op_base::do_perform(asio::detail::reactor_op*)
-4691:asio::detail::reactive_socket_connect_op<std::__2::__bind<void (TcpSocket::*)(std::__2::error_code const&), std::__2::shared_ptr<TcpSocket>, std::__2::placeholders::__ph<1> const&>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4692:asio::detail::reactive_socket_accept_op_base<asio::basic_socket<asio::ip::tcp, asio::any_io_executor>, asio::ip::tcp>::do_perform(asio::detail::reactor_op*)
-4693:asio::detail::reactive_socket_accept_op<asio::basic_socket<asio::ip::tcp, asio::any_io_executor>, asio::ip::tcp, std::__2::__bind<void (TcpAcceptor::*)(std::__2::shared_ptr<TcpSocket>, std::__2::error_code const&), std::__2::shared_ptr<TcpAcceptor>, std::__2::shared_ptr<TcpSocket>&, std::__2::placeholders::__ph<1> const&>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4694:asio::detail::posix_thread::func<asio::detail::scheduler::thread_function>::run()
-4695:asio::detail::executor_op<asio::detail::executor_function, std::__2::allocator<void>, asio::detail::scheduler_operation>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4696:asio::detail::deadline_timer_service<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::~deadline_timer_service()_4927
-4697:asio::detail::deadline_timer_service<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::~deadline_timer_service()
-4698:asio::detail::completion_handler<net::modbba::DCNetThread::sendModem(unsigned char)::'lambda'(), asio::io_context::basic_executor_type<std::__2::allocator<void>, 0ul>>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4699:asio::detail::completion_handler<net::modbba::DCNetThread::sendEthFrame(unsigned char const*, unsigned int)::'lambda'(), asio::io_context::basic_executor_type<std::__2::allocator<void>, 0ul>>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4700:asio::detail::cancellation_handler<asio::detail::reactive_socket_service_base::reactor_op_cancellation>::destroy()
-4701:asio::detail::cancellation_handler<asio::detail::reactive_socket_service_base::reactor_op_cancellation>::call(asio::cancellation_type)
-4702:asio::detail::cancellation_handler<asio::detail::deadline_timer_service<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::op_cancellation>::destroy()
-4703:asio::detail::cancellation_handler<asio::detail::deadline_timer_service<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::op_cancellation>::call(asio::cancellation_type)
-4704:asio::basic_socket_streambuf<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_streambuf()_4025
-4705:asio::basic_socket_streambuf<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::underflow()
-4706:asio::basic_socket_streambuf<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::sync()
-4707:asio::basic_socket_streambuf<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::setbuf(char*, long)
-4708:asio::basic_socket_iostream<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_iostream()_4020
-4709:asio::basic_socket_iostream<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_iostream()
-4710:arp_expire
-4711:arp_compare
-4712:aica::dma_end_sched(int, int, int, void*)
-4713:aica::arm::arm_mainloop_c(aica::arm::reg_pair*, void (**)())
-4714:aica::arm::arm_compile_stub()
-4715:aica::arm::arm7_v0_block()
-4716:aica::arm::(anonymous namespace)::Arm7WasmEmitter::emitOp(aica::arm::ArmOp const&)
-4717:aica::arm::CPUUpdateCPSR()
-4718:aica::Write_SB_G2APRO(unsigned int, unsigned int)
-4719:aica::Write_SB_ADST(unsigned int, unsigned int)
-4720:aica::Read_SB_ADST(unsigned int)
-4721:aica::DreamcastSecond(int, int, int, void*)
-4722:aica::AicaUpdate(int, int, int, void*)
-4723:action_terminate
-4724:action_abort
-4725:_emscripten_tls_init
-4726:_emscripten_thread_init
-4727:_emscripten_thread_exit
-4728:_emscripten_tempret_set
-4729:_emscripten_stack_restore
-4730:_emscripten_stack_alloc
-4731:_emscripten_run_js_on_main_thread_done
-4732:_emscripten_run_js_on_main_thread
-4733:_emscripten_check_mailbox
-4734:__wasm_init_memory
-4735:__wasm_call_ctors
-4736:__wasm_apply_tls_relocs
-4737:__stdio_write
-4738:__stdio_seek
-4739:__stdio_read
-4740:__stdio_close
-4741:__set_thread_state
-4742:__pthread_self_internal
-4743:__isxdigit_l
-4744:__isdigit_l
-4745:__emscripten_stdout_seek
-4746:__cxxabiv1::__vmi_class_type_info::search_below_dst(__cxxabiv1::__dynamic_cast_info*, void const*, int, bool) const
-4747:__cxxabiv1::__vmi_class_type_info::search_above_dst(__cxxabiv1::__dynamic_cast_info*, void const*, void const*, int, bool) const
-4748:__cxxabiv1::__vmi_class_type_info::has_unambiguous_public_base(__cxxabiv1::__dynamic_cast_info*, void*, int) const
-4749:__cxxabiv1::__si_class_type_info::search_below_dst(__cxxabiv1::__dynamic_cast_info*, void const*, int, bool) const
-4750:__cxxabiv1::__si_class_type_info::search_above_dst(__cxxabiv1::__dynamic_cast_info*, void const*, void const*, int, bool) const
-4751:__cxxabiv1::__si_class_type_info::has_unambiguous_public_base(__cxxabiv1::__dynamic_cast_info*, void*, int) const
-4752:__cxxabiv1::__pointer_type_info::can_catch(__cxxabiv1::__shim_type_info const*, void*&) const
-4753:__cxxabiv1::__fundamental_type_info::can_catch(__cxxabiv1::__shim_type_info const*, void*&) const
-4754:__cxxabiv1::__class_type_info::search_below_dst(__cxxabiv1::__dynamic_cast_info*, void const*, int, bool) const
-4755:__cxxabiv1::__class_type_info::search_above_dst(__cxxabiv1::__dynamic_cast_info*, void const*, void const*, int, bool) const
-4756:__cxxabiv1::__class_type_info::has_unambiguous_public_base(__cxxabiv1::__dynamic_cast_info*, void*, int) const
-4757:__cxxabiv1::__class_type_info::can_catch(__cxxabiv1::__shim_type_info const*, void*&) const
-4758:__cxxabiv1::__aligned_malloc_with_fallback(unsigned long)
-4759:__cxxabiv1::__aligned_free_with_fallback(void*)
-4760:__cxx_global_array_dtor_889
-4761:__cxx_global_array_dtor_823
-4762:__cxx_global_array_dtor_8018
-4763:__cxx_global_array_dtor_681
-4764:__cxx_global_array_dtor_631
-4765:__cxx_global_array_dtor_6222
-4766:__cxx_global_array_dtor_6191
-4767:__cxx_global_array_dtor_5757
-4768:__cxx_global_array_dtor_572
-4769:__cxx_global_array_dtor_5664
-4770:__cxx_global_array_dtor_5572
-4771:__cxx_global_array_dtor_5449
-4772:__cxx_global_array_dtor_5413
-4773:__cxx_global_array_dtor_5360
-4774:__cxx_global_array_dtor_5343
-4775:__cxx_global_array_dtor_5315
-4776:__cxx_global_array_dtor_5303
-4777:__cxx_global_array_dtor_5274
-4778:__cxx_global_array_dtor_5215
-4779:__cxx_global_array_dtor_5158
-4780:__cxx_global_array_dtor_5149
-4781:__cxx_global_array_dtor_5081
-4782:__cxx_global_array_dtor_5064
-4783:__cxx_global_array_dtor_4943
-4784:__cxx_global_array_dtor_4670
-4785:__cxx_global_array_dtor_4668
-4786:__cxx_global_array_dtor_4621
-4787:__cxx_global_array_dtor_4274
-4788:__cxx_global_array_dtor_4234
-4789:__cxx_global_array_dtor_4205
-4790:__cxx_global_array_dtor_3966
-4791:__cxx_global_array_dtor_3891
-4792:__cxx_global_array_dtor_3641
-4793:__cxx_global_array_dtor_3314
-4794:__cxx_global_array_dtor_3056
-4795:__cxx_global_array_dtor_2986
-4796:__cxx_global_array_dtor_2841
-4797:__cxx_global_array_dtor_2822
-4798:__cxx_global_array_dtor_2760
-4799:__cxx_global_array_dtor_2747
-4800:__cxx_global_array_dtor_2492
-4801:__cxx_global_array_dtor_2475
-4802:__cxx_global_array_dtor_2413
-4803:__cxx_global_array_dtor_2307
-4804:__cxx_global_array_dtor_1984
-4805:__cxx_global_array_dtor_1973
-4806:__cxx_global_array_dtor_1787
-4807:__cxx_global_array_dtor_1567
-4808:__cxx_global_array_dtor_1390
-4809:__cxx_global_array_dtor_1229
-4810:__cxx_global_array_dtor_1154
-4811:__cxx_global_array_dtor_1067
-4812:__cxx_global_array_dtor.98
-4813:__cxx_global_array_dtor.96
-4814:__cxx_global_array_dtor.93
-4815:__cxx_global_array_dtor.90
-4816:__cxx_global_array_dtor.9
-4817:__cxx_global_array_dtor.8_5417
-4818:__cxx_global_array_dtor.8_1989
-4819:__cxx_global_array_dtor.89
-4820:__cxx_global_array_dtor.88
-4821:__cxx_global_array_dtor.86
-4822:__cxx_global_array_dtor.84
-4823:__cxx_global_array_dtor.83
-4824:__cxx_global_array_dtor.81
-4825:__cxx_global_array_dtor.8
-4826:__cxx_global_array_dtor.7_2828
-4827:__cxx_global_array_dtor.79
-4828:__cxx_global_array_dtor.76
-4829:__cxx_global_array_dtor.73
-4830:__cxx_global_array_dtor.70
-4831:__cxx_global_array_dtor.6_5416
-4832:__cxx_global_array_dtor.6_5217
-4833:__cxx_global_array_dtor.6_4944
-4834:__cxx_global_array_dtor.6_4671
-4835:__cxx_global_array_dtor.6_2769
-4836:__cxx_global_array_dtor.6_1985
-4837:__cxx_global_array_dtor.6_1976
-4838:__cxx_global_array_dtor.68
-4839:__cxx_global_array_dtor.67
-4840:__cxx_global_array_dtor.64
-4841:__cxx_global_array_dtor.62
-4842:__cxx_global_array_dtor.6
-4843:__cxx_global_array_dtor.59
-4844:__cxx_global_array_dtor.56
-4845:__cxx_global_array_dtor.5584
-4846:__cxx_global_array_dtor.5582
-4847:__cxx_global_array_dtor.5580
-4848:__cxx_global_array_dtor.5578
-4849:__cxx_global_array_dtor.5576
-4850:__cxx_global_array_dtor.5574
-4851:__cxx_global_array_dtor.53_8005
-4852:__cxx_global_array_dtor.53
-4853:__cxx_global_array_dtor.51
-4854:__cxx_global_array_dtor.5
-4855:__cxx_global_array_dtor.4_5415
-4856:__cxx_global_array_dtor.4_2989
-4857:__cxx_global_array_dtor.4_2764
-4858:__cxx_global_array_dtor.4_1975
-4859:__cxx_global_array_dtor.48
-4860:__cxx_global_array_dtor.46
-4861:__cxx_global_array_dtor.44
-4862:__cxx_global_array_dtor.41
-4863:__cxx_global_array_dtor.40_8032
-4864:__cxx_global_array_dtor.4
-4865:__cxx_global_array_dtor.38_8030
-4866:__cxx_global_array_dtor.38
-4867:__cxx_global_array_dtor.36_8028
-4868:__cxx_global_array_dtor.36
-4869:__cxx_global_array_dtor.34_8026
-4870:__cxx_global_array_dtor.33
-4871:__cxx_global_array_dtor.32
-4872:__cxx_global_array_dtor.31
-4873:__cxx_global_array_dtor.30_8022
-4874:__cxx_global_array_dtor.30
-4875:__cxx_global_array_dtor.3
-4876:__cxx_global_array_dtor.2_5414
-4877:__cxx_global_array_dtor.2_5316
-4878:__cxx_global_array_dtor.2_5082
-4879:__cxx_global_array_dtor.2_4207
-4880:__cxx_global_array_dtor.2_2988
-4881:__cxx_global_array_dtor.2_2761
-4882:__cxx_global_array_dtor.2_2418
-4883:__cxx_global_array_dtor.2_1974
-4884:__cxx_global_array_dtor.2_1788
-4885:__cxx_global_array_dtor.29_8020
-4886:__cxx_global_array_dtor.29
-4887:__cxx_global_array_dtor.28
-4888:__cxx_global_array_dtor.27
-4889:__cxx_global_array_dtor.26
-4890:__cxx_global_array_dtor.25
-4891:__cxx_global_array_dtor.24
-4892:__cxx_global_array_dtor.23
-4893:__cxx_global_array_dtor.22
-4894:__cxx_global_array_dtor.20_899
-4895:__cxx_global_array_dtor.20_671
-4896:__cxx_global_array_dtor.206
-4897:__cxx_global_array_dtor.203
-4898:__cxx_global_array_dtor.201
-4899:__cxx_global_array_dtor.20
-4900:__cxx_global_array_dtor.2
-4901:__cxx_global_array_dtor.1_7524
-4902:__cxx_global_array_dtor.199
-4903:__cxx_global_array_dtor.197
-4904:__cxx_global_array_dtor.195
-4905:__cxx_global_array_dtor.193
-4906:__cxx_global_array_dtor.190
-4907:__cxx_global_array_dtor.19
-4908:__cxx_global_array_dtor.187
-4909:__cxx_global_array_dtor.185
-4910:__cxx_global_array_dtor.183
-4911:__cxx_global_array_dtor.180
-4912:__cxx_global_array_dtor.18
-4913:__cxx_global_array_dtor.178
-4914:__cxx_global_array_dtor.176
-4915:__cxx_global_array_dtor.174
-4916:__cxx_global_array_dtor.172
-4917:__cxx_global_array_dtor.17
-4918:__cxx_global_array_dtor.169
-4919:__cxx_global_array_dtor.166
-4920:__cxx_global_array_dtor.164
-4921:__cxx_global_array_dtor.162
-4922:__cxx_global_array_dtor.16
-4923:__cxx_global_array_dtor.159
-4924:__cxx_global_array_dtor.157
-4925:__cxx_global_array_dtor.155
-4926:__cxx_global_array_dtor.152
-4927:__cxx_global_array_dtor.15
-4928:__cxx_global_array_dtor.149
-4929:__cxx_global_array_dtor.147
-4930:__cxx_global_array_dtor.144
-4931:__cxx_global_array_dtor.142
-4932:__cxx_global_array_dtor.140
-4933:__cxx_global_array_dtor.14
-4934:__cxx_global_array_dtor.139
-4935:__cxx_global_array_dtor.137
-4936:__cxx_global_array_dtor.134_8016
-4937:__cxx_global_array_dtor.134
-4938:__cxx_global_array_dtor.131_8014
-4939:__cxx_global_array_dtor.131
-4940:__cxx_global_array_dtor.13
-4941:__cxx_global_array_dtor.128
-4942:__cxx_global_array_dtor.126
-4943:__cxx_global_array_dtor.123
-4944:__cxx_global_array_dtor.120
-4945:__cxx_global_array_dtor.11_895
-4946:__cxx_global_array_dtor.11_2830
-4947:__cxx_global_array_dtor.117
-4948:__cxx_global_array_dtor.114
-4949:__cxx_global_array_dtor.112
-4950:__cxx_global_array_dtor.110
-4951:__cxx_global_array_dtor.11
-4952:__cxx_global_array_dtor.108
-4953:__cxx_global_array_dtor.107
-4954:__cxx_global_array_dtor.106
-4955:__cxx_global_array_dtor.103
-4956:__cxx_global_array_dtor.101
-4957:__cxx_global_array_dtor.1
-4958:__cxx_global_array_dtor
-4959:__cxa_pure_virtual
-4960:__cxa_increment_exception_refcount
-4961:__cxa_get_exception_ptr
-4962:__cxa_can_catch
-4963:__ctype_get_mb_cur_max
-4964:_ZZN13SCIFRegisters4initEvEN3$_78__invokeIJtEEEDajDpT_
-4965:_ZZN13SCIFRegisters4initEvEN3$_68__invokeIJEEEDajDpT_
-4966:_ZZN13SCIFRegisters4initEvEN3$_58__invokeIJtEEEDajDpT_
-4967:_ZZN13SCIFRegisters4initEvEN3$_48__invokeIJEEEDajDpT_
-4968:_ZZN13SCIFRegisters4initEvEN3$_38__invokeIJtEEEDajDpT_
-4969:_ZZN13SCIFRegisters4initEvEN3$_28__invokeIJEEEDajDpT_
-4970:_ZZN13SCIFRegisters4initEvEN3$_18__invokeIJhEEEDajDpT_
-4971:_ZZN13SCIFRegisters4initEvEN3$_08__invokeIJtEEEDajDpT_
-4972:(anonymous namespace)::GameState::GameState()::'lambda0'(Event, void*)::__invoke(Event, void*)
-4973:(anonymous namespace)::GameState::GameState()::'lambda'(Event, void*)::__invoke(Event, void*)
-4974:ZipSourceCallback(void*, void*, unsigned long long, zip_source_cmd)
-4975:ZipArchiveFile::~ZipArchiveFile()_2214
-4976:ZipArchiveFile::~ZipArchiveFile()
-4977:ZipArchiveFile::Read(void*, unsigned int)
-4978:ZipArchive::~ZipArchive()_2205
-4979:ZipArchive::Open(hostfs::File*)
-4980:ZipArchive::OpenFile(char const*)
-4981:ZipArchive::OpenFileByCrc(unsigned int)
-4982:ZSTD_compressBlock_lazy_row
-4983:ZSTD_compressBlock_lazy_extDict_row
-4984:ZSTD_compressBlock_lazy_extDict
-4985:ZSTD_compressBlock_lazy_dictMatchState_row
-4986:ZSTD_compressBlock_lazy_dictMatchState
-4987:ZSTD_compressBlock_lazy_dedicatedDictSearch_row
-4988:ZSTD_compressBlock_lazy_dedicatedDictSearch
-4989:ZSTD_compressBlock_lazy2_row
-4990:ZSTD_compressBlock_lazy2_extDict_row
-4991:ZSTD_compressBlock_lazy2_extDict
-4992:ZSTD_compressBlock_lazy2_dictMatchState_row
-4993:ZSTD_compressBlock_lazy2_dictMatchState
-4994:ZSTD_compressBlock_lazy2_dedicatedDictSearch_row
-4995:ZSTD_compressBlock_lazy2_dedicatedDictSearch
-4996:ZSTD_compressBlock_lazy2
-4997:ZSTD_compressBlock_lazy
-4998:ZSTD_compressBlock_greedy_row
-4999:ZSTD_compressBlock_greedy_extDict_row
-5000:ZSTD_compressBlock_greedy_extDict
-5001:ZSTD_compressBlock_greedy_dictMatchState_row
-5002:ZSTD_compressBlock_greedy_dictMatchState
-5003:ZSTD_compressBlock_greedy_dedicatedDictSearch_row
-5004:ZSTD_compressBlock_greedy_dedicatedDictSearch
-5005:ZSTD_compressBlock_greedy
-5006:ZSTD_compressBlock_fast_extDict
-5007:ZSTD_compressBlock_fast_dictMatchState
-5008:ZSTD_compressBlock_doubleFast_extDict
-5009:ZSTD_compressBlock_doubleFast_dictMatchState
-5010:ZSTD_compressBlock_btultra_extDict
-5011:ZSTD_compressBlock_btultra_dictMatchState
-5012:ZSTD_compressBlock_btultra2
-5013:ZSTD_compressBlock_btultra
-5014:ZSTD_compressBlock_btopt_extDict
-5015:ZSTD_compressBlock_btopt_dictMatchState
-5016:ZSTD_compressBlock_btopt
-5017:ZSTD_compressBlock_btlazy2_extDict
-5018:ZSTD_compressBlock_btlazy2_dictMatchState
-5019:ZSTD_compressBlock_btlazy2
-5020:ZSTD_btGetAllMatches_noDict_6
-5021:ZSTD_btGetAllMatches_noDict_5
-5022:ZSTD_btGetAllMatches_noDict_4
-5023:ZSTD_btGetAllMatches_noDict_3
-5024:ZSTD_btGetAllMatches_extDict_6
-5025:ZSTD_btGetAllMatches_extDict_5
-5026:ZSTD_btGetAllMatches_extDict_4
-5027:ZSTD_btGetAllMatches_extDict_3
-5028:ZSTD_btGetAllMatches_dictMatchState_6
-5029:ZSTD_btGetAllMatches_dictMatchState_5
-5030:ZSTD_btGetAllMatches_dictMatchState_4
-5031:ZSTD_btGetAllMatches_dictMatchState_3
-5032:ZSTDMT_compressionJob
-5033:Write_SB_ISTERR(unsigned int, unsigned int)
-5034:WritableChip::Reload()
-5035:WasmDynarec::rewrite(host_context_t&, void*)
-5036:WasmDynarec::reset()
-5037:WasmDynarec::rbb_compile(RuntimeBlockInfo*)::'lambda'(RuntimeBlockInfo*)::operator()(RuntimeBlockInfo*) const
-5038:WasmDynarec::mainloop(void*)
-5039:WasmDynarec::init(Sh4Context&, Sh4CodeBuffer&)
-5040:WasmDynarec::dispatch_slice(Sh4Context*)
-5041:WasmDynarec::compile(RuntimeBlockInfo*, bool, bool)
-5042:WasmDynarec::canonParam(shil_opcode const*, shil_param const*, CanonicalParamType)
-5043:UdpSink::UdpSink(asio::io_context&)::'lambda'(unsigned short, pico_socket*)::__invoke(unsigned short, pico_socket*)
-5044:TextureCacheData::UploadToGPU(int, int, unsigned char const*, bool, bool)
-5045:TextureCacheData::UploadToGPUGl4(int, int, unsigned char const*, bool, bool)
-5046:TextureCacheData::UploadToGPUGl2(int, int, unsigned char const*, bool, bool)
-5047:TextureCacheData::GetId()
-5048:TcpSocket::onWritten(std::__2::error_code const&, unsigned long)
-5049:TcpSocket::onRead(std::__2::error_code const&, unsigned long)
-5050:TcpSocket::onConnect(std::__2::error_code const&)
-5051:TcpSocket::attachPicoSocket()::'lambda'(unsigned short, pico_socket*)::__invoke(unsigned short, pico_socket*)
-5052:TcpSink::TcpSink(asio::io_context&, std::__2::shared_ptr<DirectPlay>)::'lambda'(unsigned short, pico_socket*)::__invoke(unsigned short, pico_socket*)
-5053:TcpAcceptor::onAccept(std::__2::shared_ptr<TcpSocket>, std::__2::error_code const&)
-5054:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<9u, 1u>(Ta_Dma*, Ta_Dma*)
-5055:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<8u, 1u>(Ta_Dma*, Ta_Dma*)
-5056:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<7u, 1u>(Ta_Dma*, Ta_Dma*)
-5057:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<6u, 2u>(Ta_Dma*, Ta_Dma*)
-5058:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<5u, 2u>(Ta_Dma*, Ta_Dma*)
-5059:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<4u, 1u>(Ta_Dma*, Ta_Dma*)
-5060:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<3u, 1u>(Ta_Dma*, Ta_Dma*)
-5061:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<2u, 1u>(Ta_Dma*, Ta_Dma*)
-5062:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<1u, 1u>(Ta_Dma*, Ta_Dma*)
-5063:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<14u, 2u>(Ta_Dma*, Ta_Dma*)
-5064:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<13u, 2u>(Ta_Dma*, Ta_Dma*)
-5065:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<12u, 2u>(Ta_Dma*, Ta_Dma*)
-5066:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<11u, 2u>(Ta_Dma*, Ta_Dma*)
-5067:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<10u, 1u>(Ta_Dma*, Ta_Dma*)
-5068:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<0u, 1u>(Ta_Dma*, Ta_Dma*)
-5069:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_B_32<4>(Ta_Dma*, Ta_Dma*)
-5070:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_B_32<2>(Ta_Dma*, Ta_Dma*)
-5071:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_handle_poly<14u, 2u>(Ta_Dma*, Ta_Dma*)
-5072:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_handle_poly<13u, 2u>(Ta_Dma*, Ta_Dma*)
-5073:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_handle_poly<12u, 2u>(Ta_Dma*, Ta_Dma*)
-5074:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_handle_poly<11u, 2u>(Ta_Dma*, Ta_Dma*)
-5075:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<9u, 1u>(Ta_Dma*, Ta_Dma*)
-5076:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<8u, 1u>(Ta_Dma*, Ta_Dma*)
-5077:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<7u, 1u>(Ta_Dma*, Ta_Dma*)
-5078:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<6u, 2u>(Ta_Dma*, Ta_Dma*)
-5079:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<5u, 2u>(Ta_Dma*, Ta_Dma*)
-5080:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<4u, 1u>(Ta_Dma*, Ta_Dma*)
-5081:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<3u, 1u>(Ta_Dma*, Ta_Dma*)
-5082:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<2u, 1u>(Ta_Dma*, Ta_Dma*)
-5083:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<1u, 1u>(Ta_Dma*, Ta_Dma*)
-5084:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<14u, 2u>(Ta_Dma*, Ta_Dma*)
-5085:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<13u, 2u>(Ta_Dma*, Ta_Dma*)
-5086:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<12u, 2u>(Ta_Dma*, Ta_Dma*)
-5087:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<11u, 2u>(Ta_Dma*, Ta_Dma*)
-5088:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<10u, 1u>(Ta_Dma*, Ta_Dma*)
-5089:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<0u, 1u>(Ta_Dma*, Ta_Dma*)
-5090:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_B_32<4>(Ta_Dma*, Ta_Dma*)
-5091:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_B_32<2>(Ta_Dma*, Ta_Dma*)
-5092:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_handle_poly<14u, 2u>(Ta_Dma*, Ta_Dma*)
-5093:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_handle_poly<13u, 2u>(Ta_Dma*, Ta_Dma*)
-5094:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_handle_poly<12u, 2u>(Ta_Dma*, Ta_Dma*)
-5095:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_handle_poly<11u, 2u>(Ta_Dma*, Ta_Dma*)
-5096:TAParserTempl<2, 1, 0, 3>::ta_sprite_data(Ta_Dma*, Ta_Dma*)
-5097:TAParserTempl<2, 1, 0, 3>::ta_spriteB_data(Ta_Dma*, Ta_Dma*)
-5098:TAParserTempl<2, 1, 0, 3>::ta_poly_B_Invalid(Ta_Dma*, Ta_Dma*)
-5099:TAParserTempl<2, 1, 0, 3>::ta_modvolB_32(Ta_Dma*, Ta_Dma*)
-5100:TAParserTempl<2, 1, 0, 3>::ta_mod_vol_data(Ta_Dma*, Ta_Dma*)
-5101:TAParserTempl<2, 1, 0, 3>::ta_main(Ta_Dma*, Ta_Dma*)
-5102:TAParserTempl<2, 1, 0, 3>::AppendPolyParam4Full(void*)
-5103:TAParserTempl<2, 1, 0, 3>::AppendPolyParam2Full(void*)
-5104:TAParserTempl<2, 1, 0, 3>::AppendPolyParam1(void*)
-5105:TAParserTempl<0, 1, 2, 3>::ta_sprite_data(Ta_Dma*, Ta_Dma*)
-5106:TAParserTempl<0, 1, 2, 3>::ta_spriteB_data(Ta_Dma*, Ta_Dma*)
-5107:TAParserTempl<0, 1, 2, 3>::ta_poly_B_Invalid(Ta_Dma*, Ta_Dma*)
-5108:TAParserTempl<0, 1, 2, 3>::ta_modvolB_32(Ta_Dma*, Ta_Dma*)
-5109:TAParserTempl<0, 1, 2, 3>::ta_mod_vol_data(Ta_Dma*, Ta_Dma*)
-5110:TAParserTempl<0, 1, 2, 3>::ta_main(Ta_Dma*, Ta_Dma*)
-5111:TAParserTempl<0, 1, 2, 3>::AppendPolyParam4Full(void*)
-5112:TAParserTempl<0, 1, 2, 3>::AppendPolyParam2Full(void*)
-5113:TAParserTempl<0, 1, 2, 3>::AppendPolyParam1(void*)
-5114:SzArchiveFile::Read(void*, unsigned int)
-5115:SzArchive::~SzArchive()_2198
-5116:SzArchive::~SzArchive()
-5117:SzArchive::Open(hostfs::File*)
-5118:SzArchive::OpenFile(char const*)
-5119:SzArchive::OpenFileByCrc(unsigned int)
-5120:SzArchive::ArchiveStream::Seek(ISeekInStream const*, long long*, ESzSeek)
-5121:SzArchive::ArchiveStream::Read(ISeekInStream const*, void*, unsigned long*)
-5122:SzAlloc
-5123:SwapIntervalDetector::eventHandler(Event, void*)
-5124:Sh4Recompiler::~Sh4Recompiler()_3070
-5125:Sh4Recompiler::~Sh4Recompiler()
-5126:Sh4Recompiler::Term()
-5127:Sh4Recompiler::Run()
-5128:Sh4Recompiler::Reset(bool)
-5129:Sh4Recompiler::ResetCache()
-5130:Sh4Recompiler::Init()
-5131:Sh4Interpreter::Term()
-5132:Sh4Interpreter::Stop()
-5133:Sh4Interpreter::Step()
-5134:Sh4Interpreter::Start()
-5135:Sh4Interpreter::Run()
-5136:Sh4Interpreter::IsCpuRunning()
-5137:Sh4Dynarec::allocateBlock()
-5138:SerialPort::receiveBreak()
-5139:STBI::callbacks::'lambda'(void*, int)::__invoke(void*, int)
-5140:STBI::callbacks::'lambda'(void*, char*, int)::__invoke(void*, char*, int)
-5141:STBI::callbacks::'lambda'(void*)::__invoke(void*)
-5142:SRamChip::Write(unsigned int, unsigned int, unsigned int)
-5143:SRamChip::Serialize(Serializer&) const
-5144:SRamChip::Deserialize(Deserializer&)
-5145:SCSPTR2_read(unsigned int)
-5146:SCSCR2_read(unsigned int)
-5147:SCIFSerialPort::~SCIFSerialPort()_3362
-5148:SCIFSerialPort::~SCIFSerialPort()
-5149:SCIFSerialPort::setPipe(SerialPort::Pipe*)
-5150:SCIFSerialPort::schedCallback(int, int, int, void*)
-5151:SCIFSerialPort::receiveBreak()
-5152:SCIFSerialPort::SCSMR2_write(unsigned int, unsigned short)
-5153:SCIFSerialPort::SCFCR2_read(unsigned int)
-5154:SCIFSerialPort::SCBRR2_write(unsigned int, unsigned char)
-5155:RuntimeBlockInfo::~RuntimeBlockInfo()_3010
-5156:Renderer::onEvent(Event, void*)
-5157:RegWrite_SB_SDST(unsigned int, unsigned int)
-5158:RegWrite_SB_PDST(unsigned int, unsigned int)
-5159:RegWrite_SB_C2DST(unsigned int, unsigned int)
-5160:RawTrackFile::~RawTrackFile()_3937
-5161:RawTrackFile::~RawTrackFile()
-5162:RawTrackFile::Read(unsigned int, unsigned char*, SectorFormat*, unsigned char*, SubcodeFormat*)
-5163:RFIDReaderWriterImpl::~RFIDReaderWriterImpl()
-5164:RFIDReaderWriterImpl::serialize(Serializer&) const
-5165:RFIDReaderWriterImpl::get_device_type()
-5166:RFIDReaderWriterImpl::dma(unsigned int)
-5167:RFIDReaderWriterImpl::deserialize(Deserializer&)
-5168:RFIDReaderWriterImpl::RawDma(unsigned int const*, unsigned int, unsigned int*)
-5169:RFIDReaderWriterImpl::OnSetup()
-5170:PostProcessor::VertexArray::defineVtxAttribs()
-5171:PicoThread::run()
-5172:PTYPipe::write(unsigned char)
-5173:PTYPipe::read()
-5174:PTYPipe::available()
-5175:POOL_thread
-5176:OpenGLRenderer::getPaletteTextureSlot() const
-5177:OpenGLRenderer::getFogTextureSlot() const
-5178:OpenGLRenderer::Term()
-5179:OpenGLRenderer::Render()
-5180:OpenGLRenderer::RenderLastFrame()
-5181:OpenGLRenderer::RenderFramebuffer(FramebufferInfo const&)
-5182:OpenGLRenderer::Process(TA_context*)
-5183:OpenGLRenderer::Present()
-5184:OpenGLRenderer::Init()
-5185:OpenGLRenderer::GetTexture(TSP, TCW, int)
-5186:OpenGLRenderer::GetLastFrame(std::__2::vector<unsigned char, std::__2::allocator<unsigned char>>&, int&, int&)
-5187:OpenGL4Renderer::getPaletteTextureSlot() const
-5188:OpenGL4Renderer::getFogTextureSlot() const
-5189:OpenGL4Renderer::Term()
-5190:OpenGL4Renderer::Render()
-5191:OpenGL4Renderer::Init()
-5192:NullModemPipe::~NullModemPipe()_4658
-5193:NullModemPipe::write(unsigned char)
-5194:NullModemPipe::sendBreak()
-5195:NullModemPipe::read()
-5196:NullModemPipe::available()
-5197:NetworkOutput::vblankCallback(Event, void*)
-5198:NetOut::write(unsigned char)
-5199:NetIn::read()
-5200:NetIn::available()
-5201:NetDimm::~NetDimm()_2412
-5202:NetDimm::~NetDimm()
-5203:NetDimm::schedCallback()
-5204:NetDimm::process()
-5205:NetDimm::Write(unsigned int, unsigned int, unsigned int)
-5206:NetDimm::Init(LoadProgress*, std::__2::vector<unsigned char, std::__2::allocator<unsigned char>>*)
-5207:NetDimm::Deserialize(Deserializer&)
-5208:Naomi_DmaStart(unsigned int, unsigned int)
-5209:Naomi_DmaEnable(unsigned int, unsigned int)
-5210:NaomiNetworkHandshake::stop()
-5211:NaomiNetworkHandshake::start()
-5212:NaomiNetworkHandshake::startNow()
-5213:NaomiNetworkHandshake::canStartNow()
-5214:NaomiCartridge::SetKey(unsigned int)
-5215:NaomiCartridge::GetBootId(RomBootID*)
-5216:NaomiCartridge::AdvancePtr(unsigned int)
-5217:NameValueParserStartElt
-5218:NameValueParserGetData
-5219:NameValueParserEndElt
-5220:ModvolVertexArray::defineVtxAttribs()
-5221:ModemEmu::~ModemEmu()_4245
-5222:ModemEmu::~ModemEmu()
-5223:ModemEmu::write(unsigned char)
-5224:ModemEmu::schedCallback(int, int, int, void*)
-5225:ModemEmu::read()
-5226:ModemEmu::available()
-5227:MemChip::~MemChip()_1292
-5228:MemChip::Read8(unsigned int)
-5229:MapleLinkVmu::serialize(Serializer&) const
-5230:MapleLinkVmu::linkStatus()
-5231:MapleLinkVmu::dma(unsigned int)
-5232:MapleLinkVmu::deserialize(Deserializer&)
-5233:MapleLinkVmu::OnSetup()
-5234:MainVertexArray::defineVtxAttribs()
-5235:MIEImpl::~MIEImpl()_1854
-5236:MIEImpl::~MIEImpl()
-5237:MIEImpl::setPipe(SerialPort::Pipe*)
-5238:MIEImpl::serialize(Serializer&) const
-5239:MIEImpl::handle_86_subcommand()
-5240:MIEImpl::get_device_type()
-5241:MIEImpl::firmwareLoaded(unsigned int)
-5242:MIEImpl::deserialize(Deserializer&)
-5243:M4Cartridge::~M4Cartridge()_2230
-5244:M4Cartridge::SetKey(unsigned int)
-5245:M4Cartridge::SetKeyData(unsigned char*)
-5246:M4Cartridge::ReadMem(unsigned int, unsigned int)
-5247:M4Cartridge::PioOffsetChanged(unsigned int)
-5248:M4Cartridge::Init(LoadProgress*, std::__2::vector<unsigned char, std::__2::allocator<unsigned char>>*)
-5249:M4Cartridge::GetDmaPtr(unsigned int&)
-5250:M4Cartridge::DmaOffsetChanged(unsigned int)
-5251:M4Cartridge::AdvancePtr(unsigned int)
-5252:M2Cartridge::Write(unsigned int, unsigned int, unsigned int)
-5253:M2Cartridge::Serialize(Serializer&) const
-5254:M2Cartridge::Read(unsigned int, unsigned int, void*)
-5255:M2Cartridge::GetDmaPtr(unsigned int&)
-5256:M2Cartridge::GetBootId(RomBootID*)
-5257:M2Cartridge::Deserialize(Deserializer&)
-5258:M1Cartridge::Serialize(Serializer&) const
-5259:M1Cartridge::ReadMem(unsigned int, unsigned int)
-5260:M1Cartridge::GetDmaPtr(unsigned int&)
-5261:M1Cartridge::DmaOffsetChanged(unsigned int)
-5262:M1Cartridge::Deserialize(Deserializer&)
-5263:M1Cartridge::AdvancePtr(unsigned int)
-5264:LookToRead2_Skip
-5265:LookToRead2_Seek
-5266:LookToRead2_Read
-5267:LookToRead2_Look_Lookahead
-5268:LookToRead2_Look_Exact
-5269:LibretroGraphicsContext::~LibretroGraphicsContext()
-5270:LibretroGraphicsContext::term()
-5271:IsoFs::File::~File()
-5272:IsoFs::Entry::~Entry()
-5273:IsoFs::Directory::~Directory()_5136
-5274:IsoFs::Directory::~Directory()
-5275:IGDstartelt
-5276:IGDendelt
-5277:IGDdata
-5278:HKS0100TouchScreen::~HKS0100TouchScreen()_1580
-5279:HKS0100TouchScreen::~HKS0100TouchScreen()
-5280:HKS0100TouchScreen::read()
-5281:HKS0100TouchScreen::available()
-5282:GlQuadDrawer::VertexArray::defineVtxAttribs()
-5283:Gl4ModvolVertexArray::defineVtxAttribs()
-5284:Gl4MainVertexArray::defineVtxAttribs()
-5285:GLGraphicsContext::~GLGraphicsContext()
-5286:GLGraphicsContext::setSwapInterval(int)
-5287:GLGraphicsContext::isAMD()
-5288:GLGraphicsContext::hasPerPixel()
-5289:GLGraphicsContext::getDriverVersion()
-5290:GLGraphicsContext::getDriverName()
-5291:GGPONetworkHandshake::start()
-5292:GDROM_DmaStart(unsigned int, unsigned int)
-5293:GDROM_DmaEnable(unsigned int, unsigned int)
-5294:GDCartridge::~GDCartridge()_2264
-5295:GDCartridge::schedCallback()
-5296:GDCartridge::process()
-5297:GDCartridge::WriteMem(unsigned int, unsigned int, unsigned int)
-5298:GDCartridge::Serialize(Serializer&) const
-5299:GDCartridge::Read(unsigned int, unsigned int, void*)
-5300:GDCartridge::ReadMem(unsigned int, unsigned int)
-5301:GDCartridge::Init(LoadProgress*, std::__2::vector<unsigned char, std::__2::allocator<unsigned char>>*)
-5302:GDCartridge::GetDmaPtr(unsigned int&)
-5303:GDCartridge::GDCartridge(unsigned int)::$_0::__invoke(int, int, int, void*)
-5304:FullController::get_device_type()
-5305:FullController::get_device_name()
-5306:FullController::get_capabilities()
-5307:FullController::getButtonState(PlainJoystickState const&)
-5308:FullController::getAnalogAxis(int, PlainJoystickState const&)
-5309:DnsResolver::responseReceived(pico_ip4*, std::__2::error_code const&, unsigned long)
-5310:DnsResolver::querySent(pico_ip4*, std::__2::error_code const&, unsigned long)
-5311:Disc::~Disc()_3927
-5312:DirectPlayImpl::~DirectPlayImpl()_4908
-5313:DirectPlayImpl::processOutPacket(unsigned char const*, int)
-5314:DCFlashChip::Write(unsigned int, unsigned int, unsigned int)
-5315:DCFlashChip::Serialize(Serializer&) const
-5316:DCFlashChip::Reset()
-5317:DCFlashChip::Read8(unsigned int)
-5318:DCFlashChip::Deserialize(Deserializer&)
-5319:CustomTextureSource::~CustomTextureSource()_5479
-5320:CustomTextureSource::~CustomTextureSource()
-5321:CustomTextureSource::shouldReplace() const
-5322:CustomTextureSource::shouldPreload() const
-5323:CustomTextureSource::preloadTextures(std::__2::function<void (unsigned int, TextureData&&)>, std::__2::atomic<bool>*)
-5324:CustomTextureSource::loadMap()
-5325:CustomTextureSource::loadCustomTexture(unsigned int, int&, int&)
-5326:CustomTextureSource::isTextureReplaced(unsigned int)
-5327:CrcUpdateT8
-5328:CrcUpdateT4
-5329:Cartridge::Init(LoadProgress*, std::__2::vector<unsigned char, std::__2::allocator<unsigned char>>*)
-5330:Cartridge::GetPtr(unsigned int, unsigned int&)
-5331:CPU_VERSION_read(unsigned int)
-5332:CHDTrack::Read(unsigned int, unsigned char*, SectorFormat*, unsigned char*, SubcodeFormat*)
-5333:CHDDisc::~CHDDisc()_3926
-5334:CHDDisc::~CHDDisc()
-5335:CHD::Callbacks::fsize(chd_core_file*)
-5336:CHD::Callbacks::fseek(chd_core_file*, long long, int)
-5337:CHD::Callbacks::fread(void*, unsigned long, unsigned long, chd_core_file*)
-5338:CHD::Callbacks::fclose(chd_core_file*)
-5339:CCN_PTEH_write(unsigned int, unsigned int)
-5340:CCN_MMUCR_write(unsigned int, unsigned int)
-5341:CCN_CCR_write(unsigned int, unsigned int)
-5342:BattleCableHandshake::~BattleCableHandshake()_4645
-5343:BattleCableHandshake::~BattleCableHandshake()
-5344:BattleCableHandshake::stop()
-5345:BattleCableHandshake::start()
-5346:BaseTAParser::NullVertexData(Ta_Dma*, Ta_Dma*)
-5347:BaseMapleLink::storageEnabled()
-5348:BaseMapleLink::gameStarted()
-5349:BaseMapleLink::eventHandler(Event, void*)
-5350:BaseMIE::handle_86_subcommand()
-5351:BaseMIE::dma(unsigned int)
-5352:AWCartridge::WriteMem(unsigned int, unsigned int, unsigned int)
-5353:AWCartridge::SetKey(unsigned int)
-5354:AWCartridge::Serialize(Serializer&) const
-5355:AWCartridge::ReadMem(unsigned int, unsigned int)
-5356:AWCartridge::Init(LoadProgress*, std::__2::vector<unsigned char, std::__2::allocator<unsigned char>>*)
-5357:AWCartridge::GetDmaPtr(unsigned int&)
-5358:AWCartridge::GetBootId(RomBootID*)
-5359:AWCartridge::Deserialize(Deserializer&)
-5360:AWCartridge::AdvancePtr(unsigned int)
-5361:AT93CxxSerialEeprom::~AT93CxxSerialEeprom()_2562
-5362:AT93CxxSerialEeprom::Write(unsigned int, unsigned int, unsigned int)
-5363:AQuadVertexArray::defineVtxAttribs()
+4421:flycast_set_tex_filter
+4422:flycast_set_tcntfp
+4423:flycast_set_strip_sort
+4424:flycast_set_sq_fp
+4425:flycast_set_smcbr
+4426:flycast_set_slice_inwasm
+4427:flycast_set_shard
+4428:flycast_set_self_loop
+4429:flycast_set_sb
+4430:flycast_set_rte_intc
+4431:flycast_set_render_skip
+4432:flycast_set_render_res
+4433:flycast_set_regcache
+4434:flycast_set_rb_batch
+4435:flycast_set_pswff
+4436:flycast_set_plink
+4437:flycast_set_pc_trace_until
+4438:flycast_set_modvol
+4439:flycast_set_mem_fastpaths
+4440:flycast_set_lazy
+4441:flycast_set_jitfail
+4442:flycast_set_interp_range
+4443:flycast_set_interp_only
+4444:flycast_set_imm_fastpath
+4445:flycast_set_idleskip
+4446:flycast_set_gwff
+4447:flycast_set_g2ff
+4448:flycast_set_frm
+4449:flycast_set_fog
+4450:flycast_set_early
+4451:flycast_set_divinline
+4452:flycast_set_deterministic
+4453:flycast_set_chain
+4454:flycast_set_census
+4455:flycast_set_armtime
+4456:flycast_set_armmemfp
+4457:flycast_set_armhist
+4458:flycast_set_armff
+4459:flycast_set_arm7selftest
+4460:flycast_set_arm7jit
+4461:flycast_set_aicatime
+4462:flycast_set_aicahash
+4463:flycast_set_aicafast
+4464:flycast_ser_sections
+4465:flycast_run_iter_flag_ptr
+4466:flycast_render_skips
+4467:flycast_rb_reset_host_history
+4468:flycast_pchist
+4469:flycast_log_cb(retro_log_level, char const*, ...)
+4470:flycast_keep_pthread_runtime
+4471:flycast_jit_declare_park_arm
+4472:flycast_interp_step_count
+4473:flycast_guest_cycles
+4474:flycast_get_sh4_pc
+4475:flycast_flash_size
+4476:flycast_flash_ptr
+4477:flycast_flash_gen
+4478:flycast_diag_set
+4479:flycast_diag_ifb
+4480:flycast_ctx_snapshot
+4481:flycast_census_info
+4482:flycast_armff_stat
+4483:float std::__2::__num_get_float[abi:ne210108]<float>(char const*, char const*, unsigned int&)
+4484:flac_codec_init
+4485:flac_codec_free
+4486:flac_codec_decompress
+4487:fault_handler(int, siginfo_t*, void*)
+4488:end_of_input_6149
+4489:end_of_input
+4490:end_6147
+4491:end
+4492:emscripten_worker_init
+4493:emscripten_state_size
+4494:emscripten_stack_set_limits
+4495:emscripten_stack_get_current
+4496:emscripten_set_video_target
+4497:emscripten_set_rollback_mode
+4498:emscripten_set_player_ports
+4499:emscripten_set_audio_ring
+4500:emscripten_save_state_into
+4501:emscripten_save_state
+4502:emscripten_run_iter
+4503:emscripten_reset
+4504:emscripten_rb_ram_offset
+4505:emscripten_rb_mute_audio
+4506:emscripten_rb_hash
+4507:emscripten_parity_tick
+4508:emscripten_parity_begin
+4509:emscripten_lockstep_normalize
+4510:emscripten_load_state_rollback
+4511:emscripten_load_state
+4512:emscripten_load_disc
+4513:emscripten_get_port_polls
+4514:emscripten_get_player_ports
+4515:emscripten_get_maple_ptr
+4516:emscripten_create_gl_context
+4517:elan::write_elanreg(unsigned int, unsigned int)
+4518:elan::write_elancmd(unsigned int, unsigned int)
+4519:elan::schedCallback(int, int, int, void*)
+4520:elan::read_elanreg(unsigned int)
+4521:elan::packColorRGBA(glm::vec<4, float, (glm::qualifier)0> const&)
+4522:elan::packColorBGRA(glm::vec<4, float, (glm::qualifier)0> const&)
+4523:drflac__realloc_default
+4524:drflac__on_seek_ogg
+4525:drflac__on_read_ogg
+4526:dreampotato::DreamPotato::~DreamPotato()_3985
+4527:dreampotato::DreamPotato::~DreamPotato()
+4528:dreampotato::DreamPotato::send(MapleMsg const&)
+4529:dreampotato::DreamPotato::sendReceive(MapleMsg const&, MapleMsg&)
+4530:dreampotato::DreamPotato::isConnected()
+4531:double std::__2::__num_get_float[abi:ne210108]<double>(char const*, char const*, unsigned int&)
+4532:discSwapCallback(int, int, int, void*)
+4533:disassemble_op(char const*, unsigned int, unsigned short)
+4534:dhcp_settings_cmp
+4535:dhcp_negotiations_cmp
+4536:deinit_cb
+4537:deflate_slow
+4538:deflate_fast
+4539:decompress_allocate_6151
+4540:decompress_allocate
+4541:decltype(auto) std::__2::__variant_detail::__visitation::__base::__dispatcher<1ul>::__dispatch[abi:ne210108]<void std::__2::__variant_detail::__ctor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>>::__generic_construct[abi:ne210108]<std::__2::__variant_detail::__move_constructor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>, (std::__2::__variant_detail::_Trait)1>>(std::__2::__variant_detail::__ctor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>>&, std::__2::__variant_detail::__move_constructor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>, (std::__2::__variant_detail::_Trait)1>&&)::'lambda'(std::__2::__variant_detail::__move_constructor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>, (std::__2::__variant_detail::_Trait)1>&&)&&, std::__2::__variant_detail::__base<(std::__2::__variant_detail::_Trait)1, std::__2::monostate, std::__2::function<void ()>>&&>(std::__2::__variant_detail::__move_constructor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>, (std::__2::__variant_detail::_Trait)1>, std::__2::__variant_detail::__base<(std::__2::__variant_detail::_Trait)1, std::__2::monostate, std::__2::function<void ()>>&&)
+4542:decltype(auto) std::__2::__variant_detail::__visitation::__base::__dispatcher<1ul>::__dispatch[abi:ne210108]<std::__2::__variant_detail::__dtor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>, (std::__2::__variant_detail::_Trait)1>::__destroy[abi:ne210108]()::'lambda'(auto&)&&, std::__2::__variant_detail::__base<(std::__2::__variant_detail::_Trait)1, std::__2::monostate, std::__2::function<void ()>>&>(auto, std::__2::__variant_detail::__base<(std::__2::__variant_detail::_Trait)1, std::__2::monostate, std::__2::function<void ()>>&)
+4543:dec_illegalOp(unsigned int)
+4544:dec_i1111_1011_1111_1101(unsigned int)
+4545:dec_i1111_0011_1111_1101(unsigned int)
+4546:dec_i1011_iiii_iiii_iiii(unsigned int)
+4547:dec_i1010_iiii_iiii_iiii(unsigned int)
+4548:dec_i1000_1111_iiii_iiii(unsigned int)
+4549:dec_i1000_1101_iiii_iiii(unsigned int)
+4550:dec_i1000_1011_iiii_iiii(unsigned int)
+4551:dec_i1000_1001_iiii_iiii(unsigned int)
+4552:dec_i0100_nnnn_0110_1010(unsigned int)
+4553:dec_i0100_nnnn_0110_0110(unsigned int)
+4554:dec_i0100_nnnn_0010_1011(unsigned int)
+4555:dec_i0100_nnnn_0010_0101(unsigned int)
+4556:dec_i0100_nnnn_0010_0100(unsigned int)
+4557:dec_i0100_nnnn_0001_1011(unsigned int)
+4558:dec_i0100_nnnn_0000_1110(unsigned int)
+4559:dec_i0100_nnnn_0000_1011(unsigned int)
+4560:dec_i0100_nnnn_0000_0111(unsigned int)
+4561:dec_i0100_nnnn_0000_0011(unsigned int)
+4562:dec_i0000_nnnn_0010_0011(unsigned int)
+4563:dec_i0000_nnnn_0000_0011(unsigned int)
+4564:dec_i0000_0000_0010_1011(unsigned int)
+4565:dec_i0000_0000_0000_1011(unsigned int)
+4566:deauth
+4567:crc_read
+4568:cookie_compare
+4569:context_reset()
+4570:context_destroy()
+4571:config::RendererOption::reset()
+4572:config::Option<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, true>::~Option()_1004
+4573:config::Option<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, true>::~Option()
+4574:config::Option<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, true>::reset()
+4575:config::Option<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, true>::load()
+4576:config::Option<long long, true>::~Option()_1020
+4577:config::Option<long long, true>::~Option()
+4578:config::Option<long long, true>::reset()
+4579:config::Option<long long, true>::load()
+4580:config::Option<int, true>::~Option()
+4581:config::Option<int, false>::~Option()_999
+4582:config::Option<int, false>::~Option()
+4583:config::Option<float, true>::~Option()_1016
+4584:config::Option<float, true>::~Option()
+4585:config::Option<float, true>::reset()
+4586:config::Option<float, true>::load()
+4587:config::Option<bool, true>::~Option()_986
+4588:config::Option<bool, true>::~Option()
+4589:config::Option<bool, true>::reset()
+4590:config::Option<bool, true>::load()
+4591:config::Option<RenderType, true>::~Option()
+4592:config::Option<MapleDeviceType, true>::~Option()_1026
+4593:config::Option<MapleDeviceType, true>::~Option()
+4594:config::IntOption::load()
+4595:compress_callback
+4596:compress_allocate_6142
+4597:compress_allocate
+4598:cdzs_codec_init
+4599:cdzs_codec_free
+4600:cdzs_codec_decompress
+4601:cdzl_codec_init
+4602:cdzl_codec_free
+4603:cdzl_codec_decompress
+4604:cdlz_codec_init
+4605:cdlz_codec_free
+4606:cdlz_codec_decompress
+4607:cdfl_codec_init
+4608:cdfl_codec_free
+4609:cdfl_codec_decompress
+4610:card_reader::SanwaCRP1231LR::getStatus1()
+4611:card_reader::SanwaCRP1231BR::loadCard()
+4612:card_reader::SanwaCRP1231BR::getStatus1()
+4613:card_reader::InitialDCardReader::~InitialDCardReader()_2435
+4614:card_reader::InitialDCardReader::~InitialDCardReader()
+4615:card_reader::ClubKartCardReader::~ClubKartCardReader()_2461
+4616:card_reader::ClubKartCardReader::~ClubKartCardReader()
+4617:card_reader::ClubKartCardReader::loadCard()
+4618:card_reader::CardReaderWriter::~CardReaderWriter()
+4619:card_reader::BarcodeReader::~BarcodeReader()_2476
+4620:card_reader::BarcodeReader::~BarcodeReader()
+4621:card_reader::BarcodeReader::read()
+4622:cancel_notification
+4623:cancel_active_ctxs
+4624:call_with_ctx
+4625:call_then_finish_task
+4626:call_cancel_then_free_ctx
+4627:call_callback_then_free_ctx
+4628:bool asio::execution::detail::any_executor_base::equal_ex<asio::io_context::basic_executor_type<std::__2::allocator<void>, 4ul>>(asio::execution::detail::any_executor_base const&, asio::execution::detail::any_executor_base const&)
+4629:bool asio::execution::detail::any_executor_base::equal_ex<asio::io_context::basic_executor_type<std::__2::allocator<void>, 0ul>>(asio::execution::detail::any_executor_base const&, asio::execution::detail::any_executor_base const&)
+4630:bemental::sh4::build_blocks_unlinked(std::__2::vector<RuntimeBlockInfo*, std::__2::allocator<RuntimeBlockInfo*>> const&)
+4631:auth_start_timer
+4632:auth_rsp
+4633:auth_req
+4634:auth_abort
+4635:auth
+4636:audio_sample_cb(short, short)
+4637:audio_sample_batch_cb(short const*, unsigned long)
+4638:atomiswave_lightgun::transform_kcode(unsigned int)
+4639:asio_detail_posix_thread_function
+4640:asio::ip::bad_address_cast::what() const
+4641:asio::execution_context::service* asio::detail::service_registry::create<asio::detail::scheduler, asio::execution_context>(void*)
+4642:asio::execution_context::service* asio::detail::service_registry::create<asio::detail::resolver_service<asio::ip::udp>, asio::io_context>(void*)
+4643:asio::execution_context::service* asio::detail::service_registry::create<asio::detail::reactive_socket_service<asio::ip::udp>, asio::io_context>(void*)
+4644:asio::execution_context::service* asio::detail::service_registry::create<asio::detail::reactive_socket_service<asio::ip::tcp>, asio::io_context>(void*)
+4645:asio::execution_context::service* asio::detail::service_registry::create<asio::detail::deadline_timer_service<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>, asio::io_context>(void*)
+4646:asio::execution::bad_executor::what() const
+4647:asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>> asio::execution::detail::any_executor_base::prefer_fn<asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>>, asio::io_context::basic_executor_type<std::__2::allocator<void>, 4ul>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>>(void const*, void const*)
+4648:asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>> asio::execution::detail::any_executor_base::prefer_fn<asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>>, asio::io_context::basic_executor_type<std::__2::allocator<void>, 4ul>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>>(void const*, void const*)
+4649:asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>> asio::execution::detail::any_executor_base::prefer_fn<asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>>, asio::io_context::basic_executor_type<std::__2::allocator<void>, 4ul>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>>(void const*, void const*)
+4650:asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>> asio::execution::detail::any_executor_base::prefer_fn<asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>>, asio::io_context::basic_executor_type<std::__2::allocator<void>, 0ul>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>>(void const*, void const*)
+4651:asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>> asio::execution::detail::any_executor_base::prefer_fn<asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>>, asio::io_context::basic_executor_type<std::__2::allocator<void>, 0ul>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>>(void const*, void const*)
+4652:asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>> asio::execution::detail::any_executor_base::prefer_fn<asio::execution::any_executor<asio::execution::context_as_t<asio::execution_context&>, asio::execution::detail::blocking::never_t<0>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::tracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::outstanding_work::untracked_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::fork_t<0>>, asio::execution::prefer_only<asio::execution::detail::relationship::continuation_t<0>>>, asio::io_context::basic_executor_type<std::__2::allocator<void>, 0ul>, asio::execution::prefer_only<asio::execution::detail::blocking::possibly_t<0>>>(void const*, void const*)
+4653:asio::error::detail::netdb_category::name() const
+4654:asio::error::detail::netdb_category::message(int) const
+4655:asio::error::detail::misc_category::name() const
+4656:asio::error::detail::misc_category::message(int) const
+4657:asio::error::detail::addrinfo_category::name() const
+4658:asio::error::detail::addrinfo_category::message(int) const
+4659:asio::detail::wait_handler<void net::modbba::AccessPointFinder::find<net::modbba::DCNetThread::run()::$_0>(net::modbba::DCNetThread::run()::$_0 const&)::'lambda'(std::__2::error_code const&), asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4660:asio::detail::wait_handler<void net::modbba::AccessPointFinder::find<net::modbba::DCNetThread::run()::$_0>(net::modbba::DCNetThread::run()::$_0 const&)::'lambda'(std::__2::error_code const&)::operator()(std::__2::error_code const&) const::'lambda'(std::__2::error_code const&), asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4661:asio::detail::wait_handler<std::__2::__bind<void (&)(std::__2::error_code const&, asio::basic_waitable_timer<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>, asio::any_io_executor>*), std::__2::placeholders::__ph<1> const&, asio::basic_waitable_timer<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>, asio::any_io_executor>*&>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4662:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::~timer_queue()_4933
+4663:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::~timer_queue()
+4664:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::wait_duration_usec(long) const
+4665:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::wait_duration_msec(long) const
+4666:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::get_ready_timers(asio::detail::op_queue<asio::detail::scheduler_operation>&)
+4667:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::get_all_timers(asio::detail::op_queue<asio::detail::scheduler_operation>&)
+4668:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::empty() const
+4669:asio::detail::system_category::name() const
+4670:asio::detail::system_category::message(int) const
+4671:asio::detail::select_reactor::~select_reactor()_4064
+4672:asio::detail::select_reactor::~select_reactor()
+4673:asio::detail::select_reactor::notify_fork(asio::execution_context::fork_event)
+4674:asio::detail::select_reactor::interrupt()
+4675:asio::detail::scheduler::~scheduler()_4074
+4676:asio::detail::scheduler::shutdown()
+4677:asio::detail::scheduler::get_default_task(asio::execution_context&)
+4678:asio::detail::reactive_socket_sendto_op_base<asio::mutable_buffers_1, asio::ip::basic_endpoint<asio::ip::udp>>::do_perform(asio::detail::reactor_op*)
+4679:asio::detail::reactive_socket_sendto_op<asio::mutable_buffers_1, asio::ip::basic_endpoint<asio::ip::udp>, std::__2::__bind<void (DnsResolver::*)(pico_ip4*, std::__2::error_code const&, unsigned long), std::__2::shared_ptr<DnsResolver>, pico_ip4*&, std::__2::placeholders::__ph<1> const&, std::__2::placeholders::__ph<2> const&>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4680:asio::detail::reactive_socket_send_op_base<asio::const_buffers_1>::do_perform(asio::detail::reactor_op*)
+4681:asio::detail::reactive_socket_send_op<asio::const_buffers_1, asio::detail::write_op<asio::basic_stream_socket<asio::ip::tcp, asio::any_io_executor>, asio::mutable_buffers_1, asio::mutable_buffer const*, asio::detail::transfer_all_t, std::__2::__bind<void (TcpSocket::*)(std::__2::error_code const&, unsigned long), std::__2::shared_ptr<TcpSocket>, std::__2::placeholders::__ph<1> const&, std::__2::placeholders::__ph<2> const&>>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4682:asio::detail::reactive_socket_send_op<asio::const_buffers_1, asio::detail::write_op<asio::basic_stream_socket<asio::ip::tcp, asio::any_io_executor>, asio::mutable_buffers_1, asio::mutable_buffer const*, asio::detail::transfer_all_t, net::modbba::PPPSocket::doSend()::'lambda'(std::__2::error_code const&, unsigned long)>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4683:asio::detail::reactive_socket_send_op<asio::const_buffers_1, asio::detail::write_op<asio::basic_stream_socket<asio::ip::tcp, asio::any_io_executor>, asio::mutable_buffers_1, asio::mutable_buffer const*, asio::detail::transfer_all_t, net::modbba::EthSocket::doSend()::'lambda'(std::__2::error_code const&, unsigned long)>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4684:asio::detail::reactive_socket_recvfrom_op<asio::mutable_buffers_1, asio::ip::basic_endpoint<asio::ip::udp>, net::modbba::AccessPointFinder::receivePing()::'lambda'(std::__2::error_code const&, unsigned long), asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4685:asio::detail::reactive_socket_recvfrom_op<asio::mutable_buffers_1, asio::ip::basic_endpoint<asio::ip::udp>, net::modbba::AccessPointFinder::receiveAccessPoints()::'lambda'(std::__2::error_code const&, unsigned long), asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4686:asio::detail::reactive_socket_recvfrom_op<asio::mutable_buffers_1, asio::ip::basic_endpoint<asio::ip::udp>, UdpSocket::readAsync()::'lambda'(std::__2::error_code const&, unsigned long), asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4687:asio::detail::reactive_socket_recvfrom_op<asio::mutable_buffer, asio::ip::basic_endpoint<asio::ip::udp>, std::__2::__bind<void (DnsResolver::*)(pico_ip4*, std::__2::error_code const&, unsigned long), std::__2::shared_ptr<DnsResolver>, pico_ip4*&, std::__2::placeholders::__ph<1> const&, std::__2::placeholders::__ph<2> const&>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4688:asio::detail::reactive_socket_recv_op_base<asio::mutable_buffers_1>::do_perform(asio::detail::reactor_op*)
+4689:asio::detail::reactive_socket_recv_op<asio::mutable_buffers_1, std::__2::__bind<void (TcpSocket::*)(std::__2::error_code const&, unsigned long), std::__2::shared_ptr<TcpSocket>, std::__2::placeholders::__ph<1> const&, std::__2::placeholders::__ph<2> const&>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4690:asio::detail::reactive_socket_recv_op<asio::mutable_buffers_1, net::modbba::PowerSmashPPPSocket::receive()::'lambda'(std::__2::error_code const&, unsigned long), asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4691:asio::detail::reactive_socket_recv_op<asio::mutable_buffers_1, net::modbba::PPPSocket::receive()::'lambda'(std::__2::error_code const&, unsigned long), asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4692:asio::detail::reactive_socket_recv_op<asio::mutable_buffers_1, asio::detail::read_until_match_op_v2<asio::basic_stream_socket<asio::ip::tcp, asio::any_io_executor>, asio::dynamic_vector_buffer<unsigned char, std::__2::allocator<unsigned char>>, std::__2::pair<asio::buffers_iterator<asio::const_buffers_1, char>, bool> (*)(asio::buffers_iterator<asio::const_buffers_1, char>, asio::buffers_iterator<asio::const_buffers_1, char>), net::modbba::EthSocket::receive()::'lambda'(std::__2::error_code const&, unsigned long)>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4693:asio::detail::reactive_socket_connect_op_base::do_perform(asio::detail::reactor_op*)
+4694:asio::detail::reactive_socket_connect_op<std::__2::__bind<void (TcpSocket::*)(std::__2::error_code const&), std::__2::shared_ptr<TcpSocket>, std::__2::placeholders::__ph<1> const&>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4695:asio::detail::reactive_socket_accept_op_base<asio::basic_socket<asio::ip::tcp, asio::any_io_executor>, asio::ip::tcp>::do_perform(asio::detail::reactor_op*)
+4696:asio::detail::reactive_socket_accept_op<asio::basic_socket<asio::ip::tcp, asio::any_io_executor>, asio::ip::tcp, std::__2::__bind<void (TcpAcceptor::*)(std::__2::shared_ptr<TcpSocket>, std::__2::error_code const&), std::__2::shared_ptr<TcpAcceptor>, std::__2::shared_ptr<TcpSocket>&, std::__2::placeholders::__ph<1> const&>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4697:asio::detail::posix_thread::func<asio::detail::scheduler::thread_function>::run()
+4698:asio::detail::executor_op<asio::detail::executor_function, std::__2::allocator<void>, asio::detail::scheduler_operation>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4699:asio::detail::deadline_timer_service<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::~deadline_timer_service()_4930
+4700:asio::detail::deadline_timer_service<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::~deadline_timer_service()
+4701:asio::detail::completion_handler<net::modbba::DCNetThread::sendModem(unsigned char)::'lambda'(), asio::io_context::basic_executor_type<std::__2::allocator<void>, 0ul>>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4702:asio::detail::completion_handler<net::modbba::DCNetThread::sendEthFrame(unsigned char const*, unsigned int)::'lambda'(), asio::io_context::basic_executor_type<std::__2::allocator<void>, 0ul>>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
+4703:asio::detail::cancellation_handler<asio::detail::reactive_socket_service_base::reactor_op_cancellation>::destroy()
+4704:asio::detail::cancellation_handler<asio::detail::reactive_socket_service_base::reactor_op_cancellation>::call(asio::cancellation_type)
+4705:asio::detail::cancellation_handler<asio::detail::deadline_timer_service<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::op_cancellation>::destroy()
+4706:asio::detail::cancellation_handler<asio::detail::deadline_timer_service<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::op_cancellation>::call(asio::cancellation_type)
+4707:asio::basic_socket_streambuf<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_streambuf()_4028
+4708:asio::basic_socket_streambuf<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::underflow()
+4709:asio::basic_socket_streambuf<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::sync()
+4710:asio::basic_socket_streambuf<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::setbuf(char*, long)
+4711:asio::basic_socket_iostream<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_iostream()_4023
+4712:asio::basic_socket_iostream<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_iostream()
+4713:arp_expire
+4714:arp_compare
+4715:aica::dma_end_sched(int, int, int, void*)
+4716:aica::arm::arm_mainloop_c(aica::arm::reg_pair*, void (**)())
+4717:aica::arm::arm_compile_stub()
+4718:aica::arm::arm7_v0_block()
+4719:aica::arm::(anonymous namespace)::Arm7WasmEmitter::emitOp(aica::arm::ArmOp const&)
+4720:aica::arm::CPUUpdateCPSR()
+4721:aica::Write_SB_G2APRO(unsigned int, unsigned int)
+4722:aica::Write_SB_ADST(unsigned int, unsigned int)
+4723:aica::Read_SB_ADST(unsigned int)
+4724:aica::DreamcastSecond(int, int, int, void*)
+4725:aica::AicaUpdate(int, int, int, void*)
+4726:action_terminate
+4727:action_abort
+4728:_emscripten_tls_init
+4729:_emscripten_thread_init
+4730:_emscripten_thread_exit
+4731:_emscripten_tempret_set
+4732:_emscripten_stack_restore
+4733:_emscripten_stack_alloc
+4734:_emscripten_run_js_on_main_thread_done
+4735:_emscripten_run_js_on_main_thread
+4736:_emscripten_check_mailbox
+4737:__wasm_init_memory
+4738:__wasm_call_ctors
+4739:__wasm_apply_tls_relocs
+4740:__stdio_write
+4741:__stdio_seek
+4742:__stdio_read
+4743:__stdio_close
+4744:__set_thread_state
+4745:__pthread_self_internal
+4746:__isxdigit_l
+4747:__isdigit_l
+4748:__emscripten_stdout_seek
+4749:__cxxabiv1::__vmi_class_type_info::search_below_dst(__cxxabiv1::__dynamic_cast_info*, void const*, int, bool) const
+4750:__cxxabiv1::__vmi_class_type_info::search_above_dst(__cxxabiv1::__dynamic_cast_info*, void const*, void const*, int, bool) const
+4751:__cxxabiv1::__vmi_class_type_info::has_unambiguous_public_base(__cxxabiv1::__dynamic_cast_info*, void*, int) const
+4752:__cxxabiv1::__si_class_type_info::search_below_dst(__cxxabiv1::__dynamic_cast_info*, void const*, int, bool) const
+4753:__cxxabiv1::__si_class_type_info::search_above_dst(__cxxabiv1::__dynamic_cast_info*, void const*, void const*, int, bool) const
+4754:__cxxabiv1::__si_class_type_info::has_unambiguous_public_base(__cxxabiv1::__dynamic_cast_info*, void*, int) const
+4755:__cxxabiv1::__pointer_type_info::can_catch(__cxxabiv1::__shim_type_info const*, void*&) const
+4756:__cxxabiv1::__fundamental_type_info::can_catch(__cxxabiv1::__shim_type_info const*, void*&) const
+4757:__cxxabiv1::__class_type_info::search_below_dst(__cxxabiv1::__dynamic_cast_info*, void const*, int, bool) const
+4758:__cxxabiv1::__class_type_info::search_above_dst(__cxxabiv1::__dynamic_cast_info*, void const*, void const*, int, bool) const
+4759:__cxxabiv1::__class_type_info::has_unambiguous_public_base(__cxxabiv1::__dynamic_cast_info*, void*, int) const
+4760:__cxxabiv1::__class_type_info::can_catch(__cxxabiv1::__shim_type_info const*, void*&) const
+4761:__cxxabiv1::__aligned_malloc_with_fallback(unsigned long)
+4762:__cxxabiv1::__aligned_free_with_fallback(void*)
+4763:__cxx_global_array_dtor_892
+4764:__cxx_global_array_dtor_823
+4765:__cxx_global_array_dtor_8021
+4766:__cxx_global_array_dtor_681
+4767:__cxx_global_array_dtor_631
+4768:__cxx_global_array_dtor_6225
+4769:__cxx_global_array_dtor_6194
+4770:__cxx_global_array_dtor_5760
+4771:__cxx_global_array_dtor_572
+4772:__cxx_global_array_dtor_5667
+4773:__cxx_global_array_dtor_5575
+4774:__cxx_global_array_dtor_5452
+4775:__cxx_global_array_dtor_5416
+4776:__cxx_global_array_dtor_5363
+4777:__cxx_global_array_dtor_5346
+4778:__cxx_global_array_dtor_5318
+4779:__cxx_global_array_dtor_5306
+4780:__cxx_global_array_dtor_5277
+4781:__cxx_global_array_dtor_5218
+4782:__cxx_global_array_dtor_5161
+4783:__cxx_global_array_dtor_5152
+4784:__cxx_global_array_dtor_5084
+4785:__cxx_global_array_dtor_5067
+4786:__cxx_global_array_dtor_4946
+4787:__cxx_global_array_dtor_4673
+4788:__cxx_global_array_dtor_4671
+4789:__cxx_global_array_dtor_4624
+4790:__cxx_global_array_dtor_4277
+4791:__cxx_global_array_dtor_4237
+4792:__cxx_global_array_dtor_4208
+4793:__cxx_global_array_dtor_3969
+4794:__cxx_global_array_dtor_3894
+4795:__cxx_global_array_dtor_3644
+4796:__cxx_global_array_dtor_3317
+4797:__cxx_global_array_dtor_3059
+4798:__cxx_global_array_dtor_2989
+4799:__cxx_global_array_dtor_2844
+4800:__cxx_global_array_dtor_2825
+4801:__cxx_global_array_dtor_2763
+4802:__cxx_global_array_dtor_2750
+4803:__cxx_global_array_dtor_2495
+4804:__cxx_global_array_dtor_2478
+4805:__cxx_global_array_dtor_2416
+4806:__cxx_global_array_dtor_2310
+4807:__cxx_global_array_dtor_1987
+4808:__cxx_global_array_dtor_1976
+4809:__cxx_global_array_dtor_1790
+4810:__cxx_global_array_dtor_1570
+4811:__cxx_global_array_dtor_1393
+4812:__cxx_global_array_dtor_1232
+4813:__cxx_global_array_dtor_1157
+4814:__cxx_global_array_dtor_1070
+4815:__cxx_global_array_dtor.98
+4816:__cxx_global_array_dtor.96
+4817:__cxx_global_array_dtor.93
+4818:__cxx_global_array_dtor.90
+4819:__cxx_global_array_dtor.9
+4820:__cxx_global_array_dtor.8_5420
+4821:__cxx_global_array_dtor.8_1992
+4822:__cxx_global_array_dtor.89
+4823:__cxx_global_array_dtor.88
+4824:__cxx_global_array_dtor.86
+4825:__cxx_global_array_dtor.84
+4826:__cxx_global_array_dtor.83
+4827:__cxx_global_array_dtor.81
+4828:__cxx_global_array_dtor.8
+4829:__cxx_global_array_dtor.7_2831
+4830:__cxx_global_array_dtor.79
+4831:__cxx_global_array_dtor.76
+4832:__cxx_global_array_dtor.73
+4833:__cxx_global_array_dtor.70
+4834:__cxx_global_array_dtor.6_5419
+4835:__cxx_global_array_dtor.6_5220
+4836:__cxx_global_array_dtor.6_4947
+4837:__cxx_global_array_dtor.6_4674
+4838:__cxx_global_array_dtor.6_2772
+4839:__cxx_global_array_dtor.6_1988
+4840:__cxx_global_array_dtor.6_1979
+4841:__cxx_global_array_dtor.68
+4842:__cxx_global_array_dtor.67
+4843:__cxx_global_array_dtor.64
+4844:__cxx_global_array_dtor.62
+4845:__cxx_global_array_dtor.6
+4846:__cxx_global_array_dtor.59
+4847:__cxx_global_array_dtor.56
+4848:__cxx_global_array_dtor.5584
+4849:__cxx_global_array_dtor.5582
+4850:__cxx_global_array_dtor.5580
+4851:__cxx_global_array_dtor.5578
+4852:__cxx_global_array_dtor.5576
+4853:__cxx_global_array_dtor.5574
+4854:__cxx_global_array_dtor.53_8008
+4855:__cxx_global_array_dtor.53
+4856:__cxx_global_array_dtor.51
+4857:__cxx_global_array_dtor.5
+4858:__cxx_global_array_dtor.4_5418
+4859:__cxx_global_array_dtor.4_2992
+4860:__cxx_global_array_dtor.4_2767
+4861:__cxx_global_array_dtor.4_1978
+4862:__cxx_global_array_dtor.48
+4863:__cxx_global_array_dtor.46
+4864:__cxx_global_array_dtor.44
+4865:__cxx_global_array_dtor.41
+4866:__cxx_global_array_dtor.40_8035
+4867:__cxx_global_array_dtor.4
+4868:__cxx_global_array_dtor.38_8033
+4869:__cxx_global_array_dtor.38
+4870:__cxx_global_array_dtor.36_8031
+4871:__cxx_global_array_dtor.36
+4872:__cxx_global_array_dtor.34_8029
+4873:__cxx_global_array_dtor.33
+4874:__cxx_global_array_dtor.32
+4875:__cxx_global_array_dtor.31
+4876:__cxx_global_array_dtor.30_8025
+4877:__cxx_global_array_dtor.30
+4878:__cxx_global_array_dtor.3
+4879:__cxx_global_array_dtor.2_5417
+4880:__cxx_global_array_dtor.2_5319
+4881:__cxx_global_array_dtor.2_5085
+4882:__cxx_global_array_dtor.2_4210
+4883:__cxx_global_array_dtor.2_2991
+4884:__cxx_global_array_dtor.2_2764
+4885:__cxx_global_array_dtor.2_2421
+4886:__cxx_global_array_dtor.2_1977
+4887:__cxx_global_array_dtor.2_1791
+4888:__cxx_global_array_dtor.29_8023
+4889:__cxx_global_array_dtor.29
+4890:__cxx_global_array_dtor.28
+4891:__cxx_global_array_dtor.27
+4892:__cxx_global_array_dtor.26
+4893:__cxx_global_array_dtor.25
+4894:__cxx_global_array_dtor.24
+4895:__cxx_global_array_dtor.23
+4896:__cxx_global_array_dtor.22
+4897:__cxx_global_array_dtor.20_902
+4898:__cxx_global_array_dtor.20_671
+4899:__cxx_global_array_dtor.206
+4900:__cxx_global_array_dtor.203
+4901:__cxx_global_array_dtor.201
+4902:__cxx_global_array_dtor.20
+4903:__cxx_global_array_dtor.2
+4904:__cxx_global_array_dtor.1_7527
+4905:__cxx_global_array_dtor.199
+4906:__cxx_global_array_dtor.197
+4907:__cxx_global_array_dtor.195
+4908:__cxx_global_array_dtor.193
+4909:__cxx_global_array_dtor.190
+4910:__cxx_global_array_dtor.19
+4911:__cxx_global_array_dtor.187
+4912:__cxx_global_array_dtor.185
+4913:__cxx_global_array_dtor.183
+4914:__cxx_global_array_dtor.180
+4915:__cxx_global_array_dtor.18
+4916:__cxx_global_array_dtor.178
+4917:__cxx_global_array_dtor.176
+4918:__cxx_global_array_dtor.174
+4919:__cxx_global_array_dtor.172
+4920:__cxx_global_array_dtor.17
+4921:__cxx_global_array_dtor.169
+4922:__cxx_global_array_dtor.166
+4923:__cxx_global_array_dtor.164
+4924:__cxx_global_array_dtor.162
+4925:__cxx_global_array_dtor.16
+4926:__cxx_global_array_dtor.159
+4927:__cxx_global_array_dtor.157
+4928:__cxx_global_array_dtor.155
+4929:__cxx_global_array_dtor.152
+4930:__cxx_global_array_dtor.15
+4931:__cxx_global_array_dtor.149
+4932:__cxx_global_array_dtor.147
+4933:__cxx_global_array_dtor.144
+4934:__cxx_global_array_dtor.142
+4935:__cxx_global_array_dtor.140
+4936:__cxx_global_array_dtor.14
+4937:__cxx_global_array_dtor.139
+4938:__cxx_global_array_dtor.137
+4939:__cxx_global_array_dtor.134_8019
+4940:__cxx_global_array_dtor.134
+4941:__cxx_global_array_dtor.131_8017
+4942:__cxx_global_array_dtor.131
+4943:__cxx_global_array_dtor.13
+4944:__cxx_global_array_dtor.128
+4945:__cxx_global_array_dtor.126
+4946:__cxx_global_array_dtor.123
+4947:__cxx_global_array_dtor.120
+4948:__cxx_global_array_dtor.11_898
+4949:__cxx_global_array_dtor.11_2833
+4950:__cxx_global_array_dtor.117
+4951:__cxx_global_array_dtor.114
+4952:__cxx_global_array_dtor.112
+4953:__cxx_global_array_dtor.110
+4954:__cxx_global_array_dtor.11
+4955:__cxx_global_array_dtor.108
+4956:__cxx_global_array_dtor.107
+4957:__cxx_global_array_dtor.106
+4958:__cxx_global_array_dtor.103
+4959:__cxx_global_array_dtor.101
+4960:__cxx_global_array_dtor.1
+4961:__cxx_global_array_dtor
+4962:__cxa_pure_virtual
+4963:__cxa_increment_exception_refcount
+4964:__cxa_get_exception_ptr
+4965:__cxa_can_catch
+4966:__ctype_get_mb_cur_max
+4967:_ZZN13SCIFRegisters4initEvEN3$_78__invokeIJtEEEDajDpT_
+4968:_ZZN13SCIFRegisters4initEvEN3$_68__invokeIJEEEDajDpT_
+4969:_ZZN13SCIFRegisters4initEvEN3$_58__invokeIJtEEEDajDpT_
+4970:_ZZN13SCIFRegisters4initEvEN3$_48__invokeIJEEEDajDpT_
+4971:_ZZN13SCIFRegisters4initEvEN3$_38__invokeIJtEEEDajDpT_
+4972:_ZZN13SCIFRegisters4initEvEN3$_28__invokeIJEEEDajDpT_
+4973:_ZZN13SCIFRegisters4initEvEN3$_18__invokeIJhEEEDajDpT_
+4974:_ZZN13SCIFRegisters4initEvEN3$_08__invokeIJtEEEDajDpT_
+4975:(anonymous namespace)::GameState::GameState()::'lambda0'(Event, void*)::__invoke(Event, void*)
+4976:(anonymous namespace)::GameState::GameState()::'lambda'(Event, void*)::__invoke(Event, void*)
+4977:ZipSourceCallback(void*, void*, unsigned long long, zip_source_cmd)
+4978:ZipArchiveFile::~ZipArchiveFile()_2217
+4979:ZipArchiveFile::~ZipArchiveFile()
+4980:ZipArchiveFile::Read(void*, unsigned int)
+4981:ZipArchive::~ZipArchive()_2208
+4982:ZipArchive::Open(hostfs::File*)
+4983:ZipArchive::OpenFile(char const*)
+4984:ZipArchive::OpenFileByCrc(unsigned int)
+4985:ZSTD_compressBlock_lazy_row
+4986:ZSTD_compressBlock_lazy_extDict_row
+4987:ZSTD_compressBlock_lazy_extDict
+4988:ZSTD_compressBlock_lazy_dictMatchState_row
+4989:ZSTD_compressBlock_lazy_dictMatchState
+4990:ZSTD_compressBlock_lazy_dedicatedDictSearch_row
+4991:ZSTD_compressBlock_lazy_dedicatedDictSearch
+4992:ZSTD_compressBlock_lazy2_row
+4993:ZSTD_compressBlock_lazy2_extDict_row
+4994:ZSTD_compressBlock_lazy2_extDict
+4995:ZSTD_compressBlock_lazy2_dictMatchState_row
+4996:ZSTD_compressBlock_lazy2_dictMatchState
+4997:ZSTD_compressBlock_lazy2_dedicatedDictSearch_row
+4998:ZSTD_compressBlock_lazy2_dedicatedDictSearch
+4999:ZSTD_compressBlock_lazy2
+5000:ZSTD_compressBlock_lazy
+5001:ZSTD_compressBlock_greedy_row
+5002:ZSTD_compressBlock_greedy_extDict_row
+5003:ZSTD_compressBlock_greedy_extDict
+5004:ZSTD_compressBlock_greedy_dictMatchState_row
+5005:ZSTD_compressBlock_greedy_dictMatchState
+5006:ZSTD_compressBlock_greedy_dedicatedDictSearch_row
+5007:ZSTD_compressBlock_greedy_dedicatedDictSearch
+5008:ZSTD_compressBlock_greedy
+5009:ZSTD_compressBlock_fast_extDict
+5010:ZSTD_compressBlock_fast_dictMatchState
+5011:ZSTD_compressBlock_doubleFast_extDict
+5012:ZSTD_compressBlock_doubleFast_dictMatchState
+5013:ZSTD_compressBlock_btultra_extDict
+5014:ZSTD_compressBlock_btultra_dictMatchState
+5015:ZSTD_compressBlock_btultra2
+5016:ZSTD_compressBlock_btultra
+5017:ZSTD_compressBlock_btopt_extDict
+5018:ZSTD_compressBlock_btopt_dictMatchState
+5019:ZSTD_compressBlock_btopt
+5020:ZSTD_compressBlock_btlazy2_extDict
+5021:ZSTD_compressBlock_btlazy2_dictMatchState
+5022:ZSTD_compressBlock_btlazy2
+5023:ZSTD_btGetAllMatches_noDict_6
+5024:ZSTD_btGetAllMatches_noDict_5
+5025:ZSTD_btGetAllMatches_noDict_4
+5026:ZSTD_btGetAllMatches_noDict_3
+5027:ZSTD_btGetAllMatches_extDict_6
+5028:ZSTD_btGetAllMatches_extDict_5
+5029:ZSTD_btGetAllMatches_extDict_4
+5030:ZSTD_btGetAllMatches_extDict_3
+5031:ZSTD_btGetAllMatches_dictMatchState_6
+5032:ZSTD_btGetAllMatches_dictMatchState_5
+5033:ZSTD_btGetAllMatches_dictMatchState_4
+5034:ZSTD_btGetAllMatches_dictMatchState_3
+5035:ZSTDMT_compressionJob
+5036:Write_SB_ISTERR(unsigned int, unsigned int)
+5037:WritableChip::Reload()
+5038:WasmDynarec::rewrite(host_context_t&, void*)
+5039:WasmDynarec::reset()
+5040:WasmDynarec::rbb_compile(RuntimeBlockInfo*)::'lambda'(RuntimeBlockInfo*)::operator()(RuntimeBlockInfo*) const
+5041:WasmDynarec::mainloop(void*)
+5042:WasmDynarec::init(Sh4Context&, Sh4CodeBuffer&)
+5043:WasmDynarec::dispatch_slice(Sh4Context*)
+5044:WasmDynarec::compile(RuntimeBlockInfo*, bool, bool)
+5045:WasmDynarec::canonParam(shil_opcode const*, shil_param const*, CanonicalParamType)
+5046:UdpSink::UdpSink(asio::io_context&)::'lambda'(unsigned short, pico_socket*)::__invoke(unsigned short, pico_socket*)
+5047:TextureCacheData::UploadToGPU(int, int, unsigned char const*, bool, bool)
+5048:TextureCacheData::UploadToGPUGl4(int, int, unsigned char const*, bool, bool)
+5049:TextureCacheData::UploadToGPUGl2(int, int, unsigned char const*, bool, bool)
+5050:TextureCacheData::GetId()
+5051:TcpSocket::onWritten(std::__2::error_code const&, unsigned long)
+5052:TcpSocket::onRead(std::__2::error_code const&, unsigned long)
+5053:TcpSocket::onConnect(std::__2::error_code const&)
+5054:TcpSocket::attachPicoSocket()::'lambda'(unsigned short, pico_socket*)::__invoke(unsigned short, pico_socket*)
+5055:TcpSink::TcpSink(asio::io_context&, std::__2::shared_ptr<DirectPlay>)::'lambda'(unsigned short, pico_socket*)::__invoke(unsigned short, pico_socket*)
+5056:TcpAcceptor::onAccept(std::__2::shared_ptr<TcpSocket>, std::__2::error_code const&)
+5057:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<9u, 1u>(Ta_Dma*, Ta_Dma*)
+5058:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<8u, 1u>(Ta_Dma*, Ta_Dma*)
+5059:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<7u, 1u>(Ta_Dma*, Ta_Dma*)
+5060:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<6u, 2u>(Ta_Dma*, Ta_Dma*)
+5061:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<5u, 2u>(Ta_Dma*, Ta_Dma*)
+5062:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<4u, 1u>(Ta_Dma*, Ta_Dma*)
+5063:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<3u, 1u>(Ta_Dma*, Ta_Dma*)
+5064:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<2u, 1u>(Ta_Dma*, Ta_Dma*)
+5065:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<1u, 1u>(Ta_Dma*, Ta_Dma*)
+5066:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<14u, 2u>(Ta_Dma*, Ta_Dma*)
+5067:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<13u, 2u>(Ta_Dma*, Ta_Dma*)
+5068:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<12u, 2u>(Ta_Dma*, Ta_Dma*)
+5069:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<11u, 2u>(Ta_Dma*, Ta_Dma*)
+5070:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<10u, 1u>(Ta_Dma*, Ta_Dma*)
+5071:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_data<0u, 1u>(Ta_Dma*, Ta_Dma*)
+5072:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_B_32<4>(Ta_Dma*, Ta_Dma*)
+5073:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_poly_B_32<2>(Ta_Dma*, Ta_Dma*)
+5074:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_handle_poly<14u, 2u>(Ta_Dma*, Ta_Dma*)
+5075:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_handle_poly<13u, 2u>(Ta_Dma*, Ta_Dma*)
+5076:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_handle_poly<12u, 2u>(Ta_Dma*, Ta_Dma*)
+5077:Ta_Dma* TAParserTempl<2, 1, 0, 3>::ta_handle_poly<11u, 2u>(Ta_Dma*, Ta_Dma*)
+5078:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<9u, 1u>(Ta_Dma*, Ta_Dma*)
+5079:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<8u, 1u>(Ta_Dma*, Ta_Dma*)
+5080:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<7u, 1u>(Ta_Dma*, Ta_Dma*)
+5081:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<6u, 2u>(Ta_Dma*, Ta_Dma*)
+5082:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<5u, 2u>(Ta_Dma*, Ta_Dma*)
+5083:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<4u, 1u>(Ta_Dma*, Ta_Dma*)
+5084:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<3u, 1u>(Ta_Dma*, Ta_Dma*)
+5085:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<2u, 1u>(Ta_Dma*, Ta_Dma*)
+5086:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<1u, 1u>(Ta_Dma*, Ta_Dma*)
+5087:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<14u, 2u>(Ta_Dma*, Ta_Dma*)
+5088:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<13u, 2u>(Ta_Dma*, Ta_Dma*)
+5089:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<12u, 2u>(Ta_Dma*, Ta_Dma*)
+5090:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<11u, 2u>(Ta_Dma*, Ta_Dma*)
+5091:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<10u, 1u>(Ta_Dma*, Ta_Dma*)
+5092:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_data<0u, 1u>(Ta_Dma*, Ta_Dma*)
+5093:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_B_32<4>(Ta_Dma*, Ta_Dma*)
+5094:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_poly_B_32<2>(Ta_Dma*, Ta_Dma*)
+5095:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_handle_poly<14u, 2u>(Ta_Dma*, Ta_Dma*)
+5096:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_handle_poly<13u, 2u>(Ta_Dma*, Ta_Dma*)
+5097:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_handle_poly<12u, 2u>(Ta_Dma*, Ta_Dma*)
+5098:Ta_Dma* TAParserTempl<0, 1, 2, 3>::ta_handle_poly<11u, 2u>(Ta_Dma*, Ta_Dma*)
+5099:TAParserTempl<2, 1, 0, 3>::ta_sprite_data(Ta_Dma*, Ta_Dma*)
+5100:TAParserTempl<2, 1, 0, 3>::ta_spriteB_data(Ta_Dma*, Ta_Dma*)
+5101:TAParserTempl<2, 1, 0, 3>::ta_poly_B_Invalid(Ta_Dma*, Ta_Dma*)
+5102:TAParserTempl<2, 1, 0, 3>::ta_modvolB_32(Ta_Dma*, Ta_Dma*)
+5103:TAParserTempl<2, 1, 0, 3>::ta_mod_vol_data(Ta_Dma*, Ta_Dma*)
+5104:TAParserTempl<2, 1, 0, 3>::ta_main(Ta_Dma*, Ta_Dma*)
+5105:TAParserTempl<2, 1, 0, 3>::AppendPolyParam4Full(void*)
+5106:TAParserTempl<2, 1, 0, 3>::AppendPolyParam2Full(void*)
+5107:TAParserTempl<2, 1, 0, 3>::AppendPolyParam1(void*)
+5108:TAParserTempl<0, 1, 2, 3>::ta_sprite_data(Ta_Dma*, Ta_Dma*)
+5109:TAParserTempl<0, 1, 2, 3>::ta_spriteB_data(Ta_Dma*, Ta_Dma*)
+5110:TAParserTempl<0, 1, 2, 3>::ta_poly_B_Invalid(Ta_Dma*, Ta_Dma*)
+5111:TAParserTempl<0, 1, 2, 3>::ta_modvolB_32(Ta_Dma*, Ta_Dma*)
+5112:TAParserTempl<0, 1, 2, 3>::ta_mod_vol_data(Ta_Dma*, Ta_Dma*)
+5113:TAParserTempl<0, 1, 2, 3>::ta_main(Ta_Dma*, Ta_Dma*)
+5114:TAParserTempl<0, 1, 2, 3>::AppendPolyParam4Full(void*)
+5115:TAParserTempl<0, 1, 2, 3>::AppendPolyParam2Full(void*)
+5116:TAParserTempl<0, 1, 2, 3>::AppendPolyParam1(void*)
+5117:SzArchiveFile::Read(void*, unsigned int)
+5118:SzArchive::~SzArchive()_2201
+5119:SzArchive::~SzArchive()
+5120:SzArchive::Open(hostfs::File*)
+5121:SzArchive::OpenFile(char const*)
+5122:SzArchive::OpenFileByCrc(unsigned int)
+5123:SzArchive::ArchiveStream::Seek(ISeekInStream const*, long long*, ESzSeek)
+5124:SzArchive::ArchiveStream::Read(ISeekInStream const*, void*, unsigned long*)
+5125:SzAlloc
+5126:SwapIntervalDetector::eventHandler(Event, void*)
+5127:Sh4Recompiler::~Sh4Recompiler()_3073
+5128:Sh4Recompiler::~Sh4Recompiler()
+5129:Sh4Recompiler::Term()
+5130:Sh4Recompiler::Run()
+5131:Sh4Recompiler::Reset(bool)
+5132:Sh4Recompiler::ResetCache()
+5133:Sh4Recompiler::Init()
+5134:Sh4Interpreter::Term()
+5135:Sh4Interpreter::Stop()
+5136:Sh4Interpreter::Step()
+5137:Sh4Interpreter::Start()
+5138:Sh4Interpreter::Run()
+5139:Sh4Interpreter::IsCpuRunning()
+5140:Sh4Dynarec::allocateBlock()
+5141:SerialPort::receiveBreak()
+5142:STBI::callbacks::'lambda'(void*, int)::__invoke(void*, int)
+5143:STBI::callbacks::'lambda'(void*, char*, int)::__invoke(void*, char*, int)
+5144:STBI::callbacks::'lambda'(void*)::__invoke(void*)
+5145:SRamChip::Write(unsigned int, unsigned int, unsigned int)
+5146:SRamChip::Serialize(Serializer&) const
+5147:SRamChip::Deserialize(Deserializer&)
+5148:SCSPTR2_read(unsigned int)
+5149:SCSCR2_read(unsigned int)
+5150:SCIFSerialPort::~SCIFSerialPort()_3365
+5151:SCIFSerialPort::~SCIFSerialPort()
+5152:SCIFSerialPort::setPipe(SerialPort::Pipe*)
+5153:SCIFSerialPort::schedCallback(int, int, int, void*)
+5154:SCIFSerialPort::receiveBreak()
+5155:SCIFSerialPort::SCSMR2_write(unsigned int, unsigned short)
+5156:SCIFSerialPort::SCFCR2_read(unsigned int)
+5157:SCIFSerialPort::SCBRR2_write(unsigned int, unsigned char)
+5158:RuntimeBlockInfo::~RuntimeBlockInfo()_3013
+5159:Renderer::onEvent(Event, void*)
+5160:RegWrite_SB_SDST(unsigned int, unsigned int)
+5161:RegWrite_SB_PDST(unsigned int, unsigned int)
+5162:RegWrite_SB_C2DST(unsigned int, unsigned int)
+5163:RawTrackFile::~RawTrackFile()_3940
+5164:RawTrackFile::~RawTrackFile()
+5165:RawTrackFile::Read(unsigned int, unsigned char*, SectorFormat*, unsigned char*, SubcodeFormat*)
+5166:RFIDReaderWriterImpl::~RFIDReaderWriterImpl()
+5167:RFIDReaderWriterImpl::serialize(Serializer&) const
+5168:RFIDReaderWriterImpl::get_device_type()
+5169:RFIDReaderWriterImpl::dma(unsigned int)
+5170:RFIDReaderWriterImpl::deserialize(Deserializer&)
+5171:RFIDReaderWriterImpl::RawDma(unsigned int const*, unsigned int, unsigned int*)
+5172:RFIDReaderWriterImpl::OnSetup()
+5173:PostProcessor::VertexArray::defineVtxAttribs()
+5174:PicoThread::run()
+5175:PTYPipe::write(unsigned char)
+5176:PTYPipe::read()
+5177:PTYPipe::available()
+5178:POOL_thread
+5179:OpenGLRenderer::getPaletteTextureSlot() const
+5180:OpenGLRenderer::getFogTextureSlot() const
+5181:OpenGLRenderer::Term()
+5182:OpenGLRenderer::Render()
+5183:OpenGLRenderer::RenderLastFrame()
+5184:OpenGLRenderer::RenderFramebuffer(FramebufferInfo const&)
+5185:OpenGLRenderer::Process(TA_context*)
+5186:OpenGLRenderer::Present()
+5187:OpenGLRenderer::Init()
+5188:OpenGLRenderer::GetTexture(TSP, TCW, int)
+5189:OpenGLRenderer::GetLastFrame(std::__2::vector<unsigned char, std::__2::allocator<unsigned char>>&, int&, int&)
+5190:OpenGL4Renderer::getPaletteTextureSlot() const
+5191:OpenGL4Renderer::getFogTextureSlot() const
+5192:OpenGL4Renderer::Term()
+5193:OpenGL4Renderer::Render()
+5194:OpenGL4Renderer::Init()
+5195:NullModemPipe::~NullModemPipe()_4661
+5196:NullModemPipe::write(unsigned char)
+5197:NullModemPipe::sendBreak()
+5198:NullModemPipe::read()
+5199:NullModemPipe::available()
+5200:NetworkOutput::vblankCallback(Event, void*)
+5201:NetOut::write(unsigned char)
+5202:NetIn::read()
+5203:NetIn::available()
+5204:NetDimm::~NetDimm()_2415
+5205:NetDimm::~NetDimm()
+5206:NetDimm::schedCallback()
+5207:NetDimm::process()
+5208:NetDimm::Write(unsigned int, unsigned int, unsigned int)
+5209:NetDimm::Init(LoadProgress*, std::__2::vector<unsigned char, std::__2::allocator<unsigned char>>*)
+5210:NetDimm::Deserialize(Deserializer&)
+5211:Naomi_DmaStart(unsigned int, unsigned int)
+5212:Naomi_DmaEnable(unsigned int, unsigned int)
+5213:NaomiNetworkHandshake::stop()
+5214:NaomiNetworkHandshake::start()
+5215:NaomiNetworkHandshake::startNow()
+5216:NaomiNetworkHandshake::canStartNow()
+5217:NaomiCartridge::SetKey(unsigned int)
+5218:NaomiCartridge::GetBootId(RomBootID*)
+5219:NaomiCartridge::AdvancePtr(unsigned int)
+5220:NameValueParserStartElt
+5221:NameValueParserGetData
+5222:NameValueParserEndElt
+5223:ModvolVertexArray::defineVtxAttribs()
+5224:ModemEmu::~ModemEmu()_4248
+5225:ModemEmu::~ModemEmu()
+5226:ModemEmu::write(unsigned char)
+5227:ModemEmu::schedCallback(int, int, int, void*)
+5228:ModemEmu::read()
+5229:ModemEmu::available()
+5230:MemChip::~MemChip()_1295
+5231:MemChip::Read8(unsigned int)
+5232:MapleLinkVmu::serialize(Serializer&) const
+5233:MapleLinkVmu::linkStatus()
+5234:MapleLinkVmu::dma(unsigned int)
+5235:MapleLinkVmu::deserialize(Deserializer&)
+5236:MapleLinkVmu::OnSetup()
+5237:MainVertexArray::defineVtxAttribs()
+5238:MIEImpl::~MIEImpl()_1857
+5239:MIEImpl::~MIEImpl()
+5240:MIEImpl::setPipe(SerialPort::Pipe*)
+5241:MIEImpl::serialize(Serializer&) const
+5242:MIEImpl::handle_86_subcommand()
+5243:MIEImpl::get_device_type()
+5244:MIEImpl::firmwareLoaded(unsigned int)
+5245:MIEImpl::deserialize(Deserializer&)
+5246:M4Cartridge::~M4Cartridge()_2233
+5247:M4Cartridge::SetKey(unsigned int)
+5248:M4Cartridge::SetKeyData(unsigned char*)
+5249:M4Cartridge::ReadMem(unsigned int, unsigned int)
+5250:M4Cartridge::PioOffsetChanged(unsigned int)
+5251:M4Cartridge::Init(LoadProgress*, std::__2::vector<unsigned char, std::__2::allocator<unsigned char>>*)
+5252:M4Cartridge::GetDmaPtr(unsigned int&)
+5253:M4Cartridge::DmaOffsetChanged(unsigned int)
+5254:M4Cartridge::AdvancePtr(unsigned int)
+5255:M2Cartridge::Write(unsigned int, unsigned int, unsigned int)
+5256:M2Cartridge::Serialize(Serializer&) const
+5257:M2Cartridge::Read(unsigned int, unsigned int, void*)
+5258:M2Cartridge::GetDmaPtr(unsigned int&)
+5259:M2Cartridge::GetBootId(RomBootID*)
+5260:M2Cartridge::Deserialize(Deserializer&)
+5261:M1Cartridge::Serialize(Serializer&) const
+5262:M1Cartridge::ReadMem(unsigned int, unsigned int)
+5263:M1Cartridge::GetDmaPtr(unsigned int&)
+5264:M1Cartridge::DmaOffsetChanged(unsigned int)
+5265:M1Cartridge::Deserialize(Deserializer&)
+5266:M1Cartridge::AdvancePtr(unsigned int)
+5267:LookToRead2_Skip
+5268:LookToRead2_Seek
+5269:LookToRead2_Read
+5270:LookToRead2_Look_Lookahead
+5271:LookToRead2_Look_Exact
+5272:LibretroGraphicsContext::~LibretroGraphicsContext()
+5273:LibretroGraphicsContext::term()
+5274:IsoFs::File::~File()
+5275:IsoFs::Entry::~Entry()
+5276:IsoFs::Directory::~Directory()_5139
+5277:IsoFs::Directory::~Directory()
+5278:IGDstartelt
+5279:IGDendelt
+5280:IGDdata
+5281:HKS0100TouchScreen::~HKS0100TouchScreen()_1583
+5282:HKS0100TouchScreen::~HKS0100TouchScreen()
+5283:HKS0100TouchScreen::read()
+5284:HKS0100TouchScreen::available()
+5285:GlQuadDrawer::VertexArray::defineVtxAttribs()
+5286:Gl4ModvolVertexArray::defineVtxAttribs()
+5287:Gl4MainVertexArray::defineVtxAttribs()
+5288:GLGraphicsContext::~GLGraphicsContext()
+5289:GLGraphicsContext::setSwapInterval(int)
+5290:GLGraphicsContext::isAMD()
+5291:GLGraphicsContext::hasPerPixel()
+5292:GLGraphicsContext::getDriverVersion()
+5293:GLGraphicsContext::getDriverName()
+5294:GGPONetworkHandshake::start()
+5295:GDROM_DmaStart(unsigned int, unsigned int)
+5296:GDROM_DmaEnable(unsigned int, unsigned int)
+5297:GDCartridge::~GDCartridge()_2267
+5298:GDCartridge::schedCallback()
+5299:GDCartridge::process()
+5300:GDCartridge::WriteMem(unsigned int, unsigned int, unsigned int)
+5301:GDCartridge::Serialize(Serializer&) const
+5302:GDCartridge::Read(unsigned int, unsigned int, void*)
+5303:GDCartridge::ReadMem(unsigned int, unsigned int)
+5304:GDCartridge::Init(LoadProgress*, std::__2::vector<unsigned char, std::__2::allocator<unsigned char>>*)
+5305:GDCartridge::GetDmaPtr(unsigned int&)
+5306:GDCartridge::GDCartridge(unsigned int)::$_0::__invoke(int, int, int, void*)
+5307:FullController::get_device_type()
+5308:FullController::get_device_name()
+5309:FullController::get_capabilities()
+5310:FullController::getButtonState(PlainJoystickState const&)
+5311:FullController::getAnalogAxis(int, PlainJoystickState const&)
+5312:DnsResolver::responseReceived(pico_ip4*, std::__2::error_code const&, unsigned long)
+5313:DnsResolver::querySent(pico_ip4*, std::__2::error_code const&, unsigned long)
+5314:Disc::~Disc()_3930
+5315:DirectPlayImpl::~DirectPlayImpl()_4911
+5316:DirectPlayImpl::processOutPacket(unsigned char const*, int)
+5317:DCFlashChip::Write(unsigned int, unsigned int, unsigned int)
+5318:DCFlashChip::Serialize(Serializer&) const
+5319:DCFlashChip::Reset()
+5320:DCFlashChip::Read8(unsigned int)
+5321:DCFlashChip::Deserialize(Deserializer&)
+5322:CustomTextureSource::~CustomTextureSource()_5482
+5323:CustomTextureSource::~CustomTextureSource()
+5324:CustomTextureSource::shouldReplace() const
+5325:CustomTextureSource::shouldPreload() const
+5326:CustomTextureSource::preloadTextures(std::__2::function<void (unsigned int, TextureData&&)>, std::__2::atomic<bool>*)
+5327:CustomTextureSource::loadMap()
+5328:CustomTextureSource::loadCustomTexture(unsigned int, int&, int&)
+5329:CustomTextureSource::isTextureReplaced(unsigned int)
+5330:CrcUpdateT8
+5331:CrcUpdateT4
+5332:Cartridge::Init(LoadProgress*, std::__2::vector<unsigned char, std::__2::allocator<unsigned char>>*)
+5333:Cartridge::GetPtr(unsigned int, unsigned int&)
+5334:CPU_VERSION_read(unsigned int)
+5335:CHDTrack::Read(unsigned int, unsigned char*, SectorFormat*, unsigned char*, SubcodeFormat*)
+5336:CHDDisc::~CHDDisc()_3929
+5337:CHDDisc::~CHDDisc()
+5338:CHD::Callbacks::fsize(chd_core_file*)
+5339:CHD::Callbacks::fseek(chd_core_file*, long long, int)
+5340:CHD::Callbacks::fread(void*, unsigned long, unsigned long, chd_core_file*)
+5341:CHD::Callbacks::fclose(chd_core_file*)
+5342:CCN_PTEH_write(unsigned int, unsigned int)
+5343:CCN_MMUCR_write(unsigned int, unsigned int)
+5344:CCN_CCR_write(unsigned int, unsigned int)
+5345:BattleCableHandshake::~BattleCableHandshake()_4648
+5346:BattleCableHandshake::~BattleCableHandshake()
+5347:BattleCableHandshake::stop()
+5348:BattleCableHandshake::start()
+5349:BaseTAParser::NullVertexData(Ta_Dma*, Ta_Dma*)
+5350:BaseMapleLink::storageEnabled()
+5351:BaseMapleLink::gameStarted()
+5352:BaseMapleLink::eventHandler(Event, void*)
+5353:BaseMIE::handle_86_subcommand()
+5354:BaseMIE::dma(unsigned int)
+5355:AWCartridge::WriteMem(unsigned int, unsigned int, unsigned int)
+5356:AWCartridge::SetKey(unsigned int)
+5357:AWCartridge::Serialize(Serializer&) const
+5358:AWCartridge::ReadMem(unsigned int, unsigned int)
+5359:AWCartridge::Init(LoadProgress*, std::__2::vector<unsigned char, std::__2::allocator<unsigned char>>*)
+5360:AWCartridge::GetDmaPtr(unsigned int&)
+5361:AWCartridge::GetBootId(RomBootID*)
+5362:AWCartridge::Deserialize(Deserializer&)
+5363:AWCartridge::AdvancePtr(unsigned int)
+5364:AT93CxxSerialEeprom::~AT93CxxSerialEeprom()_2565
+5365:AT93CxxSerialEeprom::Write(unsigned int, unsigned int, unsigned int)
+5366:AQuadVertexArray::defineVtxAttribs()

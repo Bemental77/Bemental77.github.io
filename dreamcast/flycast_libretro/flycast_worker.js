@@ -237,6 +237,63 @@
     const W2 = self.WebGL2RenderingContext;
     if (W2) fskWrap(W2.prototype); else { FSK.on = false; FSK.why = 'no WebGL2'; }
   } catch (e) { FSK.on = false; FSK.why = 'wrap failed: ' + e; }
+
+  // ---------------------------------------------------------------------------
+  // THE WINDOW FOLLOWS THE PICTURE (LOW-RENDER, 2026-10-15). The core presents
+  // by copying its own frame into the window at the frame's own size
+  // (postprocess.cpp: one Y-flipped NEAREST blit, or — gl.bogusBlitFramebuffer,
+  // the route ANGLE on SwiftShader takes — glViewport(0,0,w,h) + one quad). At the console's 640x480 that is
+  // the canvas's size. When the picture is rendered smaller (?lowrender:
+  // flycast_set_render_res(240) -> 320x240) the drawing buffer is resized to
+  // the frame, so the whole picture fills it and the page's CSS box (640x480,
+  // image-rendering: pixelated) scales it on screen — no extra GL pass, and a
+  // quarter of the pixels to rasterise and to blit. Applied to the real
+  // prototype (drawing on this thread) and to the GL recorder's (an op the
+  // render worker applies to the canvas it owns). Picture only: nothing here
+  // is read by the core.
+  // ---------------------------------------------------------------------------
+  function sizeWrap(P, resize) {
+    if (!P || P.__dcSizeWrap || typeof P.blitFramebuffer !== 'function') return;
+    const bl = P.blitFramebuffer, bf = P.bindFramebuffer;
+    const K = self.WebGL2RenderingContext.prototype;
+    P.bindFramebuffer = function (t, fb) {
+      if (t === K.FRAMEBUFFER || t === K.DRAW_FRAMEBUFFER) this.__szDraw = fb || null;
+      return bf.apply(this, arguments);
+    };
+    P.blitFramebuffer = function (x0, y0, x1, y1, dx0, dy0, dx1, dy1) {
+      if (!this.__szDraw && dx0 === 0 && Math.min(dy0, dy1) === 0) {
+        const w = Math.abs(dx1 - dx0), h = Math.abs(dy1 - dy0);
+        if (w >= 64 && h >= 64 && w <= 4096 && h <= 4096) resize(this, w, h);
+      }
+      return bl.apply(this, arguments);
+    };
+    // The other present route (postprocess.cpp, gl.bogusBlitFramebuffer — what ANGLE on
+    // SwiftShader takes): bind the window, glViewport(0, 0, frame w, frame h), draw a quad.
+    const vp = P.viewport;
+    P.viewport = function (x, y, w, h) {
+      if (!this.__szDraw && x === 0 && y === 0 && w >= 64 && h >= 64 && w <= 4096 && h <= 4096) resize(this, w, h);
+      return vp.apply(this, arguments);
+    };
+    P.__dcSizeWrap = true;
+  }
+  self.__dcWinSize = null;
+  // In-run A/B hook (dreamcast/tools/toaster_split.mjs --ab fn.__dcLowRenderAB:SECS):
+  // 1 = the page's low-render picture (320x240, nearest, fog off), 0 = the core's own.
+  self.__dcLowRenderAB = (v) => {
+    const M = self.Module; if (!M || !M._flycast_set_render_res) return 0;
+    const on = String(v) === '1';
+    M._flycast_set_render_res(on ? 240 : 480); M._flycast_set_tex_filter(on ? 1 : 0); M._flycast_set_fog(on ? 0 : 1);
+    return 1;
+  };
+  try {
+    if (self.WebGL2RenderingContext) sizeWrap(self.WebGL2RenderingContext.prototype, (gl, w, h) => {
+      const c = gl.canvas;
+      if (c && (c.width !== w || c.height !== h) && typeof c.width === 'number' && !c.__rec) {
+        c.width = w; c.height = h; self.__dcWinSize = w + 'x' + h;
+        postMessage({ cmd: 'print', txt: '[lowrender] window drawing buffer ' + w + 'x' + h + ' (this thread)' });
+      }
+    });
+  } catch (e) { postMessage({ cmd: 'print', txt: '[lowrender] size wrap failed: ' + e }); }
   // Start of a new retro_run (a clean asyncify boundary): retire finished
   // pictures, then decide whether this frame draws.
   // HOW MANY PICTURES MAY BE ON THE GPU before a frame skips its draws, when the
@@ -407,7 +464,17 @@
       if (newNames.length) { msg.names = newNames.slice(); newNames.length = 0; }
       rw.postMessage(msg, xfer);
     };
+    // ?glsyncstat=1 (DIAG): count and time every call the producer waits on, by method,
+    // printed every 5 s as calls/s and ms/s ([glsync]).
+    const SYNC = /[?&]glsyncstat=1/.test(self.location.search) ? { c: Object.create(null), t: Object.create(null), t0: performance.now() } : null;
+    if (SYNC) setInterval(() => { const dt = (performance.now() - SYNC.t0) / 1000; SYNC.t0 = performance.now();
+      postMessage({ cmd: 'print', txt: '[glsync] ' + Object.keys(SYNC.c).map((k) => k + '=' + (SYNC.c[k] / dt).toFixed(1) + '/' + (SYNC.t[k] / dt).toFixed(1) + 'ms').join(' ') });
+      SYNC.c = Object.create(null); SYNC.t = Object.create(null); }, 5000);
     P.__sync = function (meth, args) {
+      if (SYNC) { const t = performance.now(); try { return this.__sync0(meth, args); } finally { SYNC.c[meth] = (SYNC.c[meth] | 0) + 1; SYNC.t[meth] = (SYNC.t[meth] || 0) + performance.now() - t; } }
+      return this.__sync0(meth, args);
+    };
+    P.__sync0 = function (meth, args) {
       Atomics.store(ctl, 0, 0);
       this.__post(['sync', meth].concat(args));
       // the render worker is a separate thread: block until it answers (rare calls only)
@@ -528,6 +595,26 @@
       if (/^(get|is|check|create|delete)/.test(k)) P[k] = function () { return this.__sync(k, Array.prototype.map.call(arguments, ex)); };
       else P[k] = rec(k);
     }
+    // ?glsizes=1 (DIAG): print each distinct render-target / viewport / blit size the core asks for, once.
+    if (/[?&]glsizes=1/.test(self.location.search)) {
+      const seen = Object.create(null);
+      const tap = (n, f) => { const o = P[n]; P[n] = function () { try { const k = f(arguments); if (k && !seen[n + k]) { seen[n + k] = 1; postMessage({ cmd: 'print', txt: '[glsizes] ' + n + ' ' + k }); } } catch (_) {} return o.apply(this, arguments); }; };
+      tap('viewport', (a) => a[2] + 'x' + a[3]);
+      tap('renderbufferStorage', (a) => '0x' + (a[1] >>> 0).toString(16) + ' ' + a[2] + 'x' + a[3]);
+      tap('texImage2D', (a) => (a[1] === 0 && a[3] >= 320) ? '0x' + (a[2] >>> 0).toString(16) + ' ' + a[3] + 'x' + a[4] : null);
+      tap('texStorage2D', (a) => '0x' + (a[2] >>> 0).toString(16) + ' ' + a[3] + 'x' + a[4] + ' levels=' + a[1]);
+      tap('blitFramebuffer', (a) => a[0] + ',' + a[1] + ',' + a[2] + ',' + a[3] + ' -> ' + a[4] + ',' + a[5] + ',' + a[6] + ',' + a[7] + ' filter=0x' + (a[9] >>> 0).toString(16));
+      tap('generateMipmap', () => 'called');
+      tap('texParameteri', (a) => '0x' + (a[1] >>> 0).toString(16) + '=0x' + (a[2] >>> 0).toString(16));
+      tap('texParameterf', (a) => '0x' + (a[1] >>> 0).toString(16) + '=' + a[2]);
+      tap('samplerParameteri', (a) => '0x' + (a[1] >>> 0).toString(16) + '=0x' + (a[2] >>> 0).toString(16));
+    }
+    sizeWrap(P, (rec, w, h) => {
+      if (rec.drawingBufferWidth === w && rec.drawingBufferHeight === h) return;
+      rec.drawingBufferWidth = rec.canvas.width = w; rec.drawingBufferHeight = rec.canvas.height = h;
+      rec.__ops.push(['__size', w, h]); self.__dcWinSize = w + 'x' + h;
+      postMessage({ cmd: 'print', txt: '[lowrender] window drawing buffer ' + w + 'x' + h + ' (render worker)' });
+    });
     fskWrap(P);
     OC.getContext = function (type, attrs) {
       if (REC || (type !== 'webgl2' && type !== 'experimental-webgl2') || this.width < 64) return origGet.apply(this, arguments);
@@ -3022,6 +3109,23 @@
           postMessage({ cmd: 'print', txt: '[fog] enabled=' + (data.on | 0) });
         } catch (err) {
           postMessage({ cmd: 'print', txt: '[fog] threw: ' + (err && err.message ? err.message : String(err)) });
+        }
+        break;
+      }
+
+      case 'lowrender': {   // dreamcast.html LOW-RENDER: picture-cost knobs on a software-rasterizer device
+        // data: { res: picture height (480 = native 640x480), filter: 0 game's / 1 nearest,
+        //         sort: 1 per-strip, fog: 0/1 } — each optional; none reaches guest state.
+        try {
+          const M = Module, did = [];
+          if (data.res != null && M._flycast_set_render_res) { M._flycast_set_render_res(data.res | 0); did.push('res=' + (data.res | 0)); }
+          if (data.filter != null && M._flycast_set_tex_filter) { M._flycast_set_tex_filter(data.filter | 0); did.push('filter=' + (data.filter | 0)); }
+          if (data.sort != null && M._flycast_set_strip_sort) { M._flycast_set_strip_sort(data.sort | 0); did.push('stripsort=' + (data.sort | 0)); }
+          if (data.fog != null && M._flycast_set_fog) { M._flycast_set_fog(data.fog | 0); did.push('fog=' + (data.fog | 0)); }
+          self.__dcLowRender = Object.assign(self.__dcLowRender || {}, data);
+          postMessage({ cmd: 'print', txt: '[lowrender] ' + (did.join(' ') || 'no setter in this core') + (data.why ? ' (' + data.why + ')' : '') });
+        } catch (err) {
+          postMessage({ cmd: 'print', txt: '[lowrender] threw: ' + (err && err.message ? err.message : String(err)) });
         }
         break;
       }

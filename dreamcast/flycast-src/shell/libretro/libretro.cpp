@@ -3906,4 +3906,25 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_modvol(int on)
 {
 	config::ModifierVolumes.override(on != 0);
 }
+// LOW-RENDER (dreamcast.html ?lowrender, 2026-10-15): picture-cost knobs for a device
+// whose WebGL is a software rasterizer (SwiftShader). None of them reaches guest state:
+//  * RenderResolution: the height the PVR picture is rendered at (480 = the console's
+//    own 640x480; 240 = 320x240). Screen and render-to-texture targets scale with it
+//    (transform_matrix.cpp getScaledFramebufferSize); with RenderToTextureBuffer off
+//    (the default here) no rendered pixel is ever read back into VRAM.
+//  * TextureFiltering: 0 = as the game asks, 1 = force nearest (gldraw.cpp).
+//  * PerStripSorting: translucent polygons sorted per strip instead of per triangle
+//    (the CPU-side sort in the renderer's Process; host draw order only).
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_render_res(int h)
+{
+	if (h >= 120 && h <= 1920) config::RenderResolution.override(h);
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_tex_filter(int mode)
+{
+	if (mode >= 0 && mode <= 2) config::TextureFiltering.override(mode);
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_strip_sort(int on)
+{
+	config::PerStripSorting.override(on != 0);
+}
 #endif

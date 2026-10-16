@@ -881,3 +881,114 @@ Gauntlet attract. Shipped OFF.
   899.1 vs 877.3 (12 s arms) and 805.8 vs 794.7 (30 s arms).
 - A node micro-bench prices a block hop at ~2.4 ns (direct return_call) vs ~3.7 ns (indirect,
   cross-instance), so hop transport itself is small.
+
+## 2026-10-15 (later) — the toaster gate now throttles the GPU process too
+
+Until now `tools/toaster_duty.py` duty-cycled only `--type=renderer` processes. Chrome's GPU
+process runs SwiftShader on the host CPU, so on a no-GPU toaster the rasterizer ran at full
+speed while the emulation was slowed 6.2x. Now it is stopped and continued in the same cycle
+(`gpu=1`, the default; `toaster_bench --gputhrottle 0` / `toaster_split --gpuoff` /
+`toaster_room2 --gpuoff` = the old arm). `toaster_room2` puts the GPU process in ONE cgroup
+with a quota of CORES/R cores (a per-thread 1/R cap let SwiftShader's parallel threads take
+4/R: raster slowed only 3.49x).
+
+Arm-difference proof (new `RASTER_SRC`: a fragment-bound 640x480 WebGL2 loop, one
+triangle and a 1-pixel readPixels a frame, so the score is the rasterizer's throughput).
+`toaster_bench --rate 6.2 --proof-only`, load 1.9:
+
+| context | rate 1 | rate 6.2, GPU throttled | rate 6.2, GPU NOT throttled | slowdown |
+|---|---|---|---|---|
+| raster (frames / 10 s) | 615 | 96 | 459 | **6.41x** vs 1.34x (arm difference 4.78x) |
+| page / worker / nested / SW (BenchmarkIndex) | 2106 / 2110 / 2093 / 1988 | 290 / 269 / 347 / 359 | | 7.26 / 7.84 / 6.04 / 5.54 |
+
+The bench VOIDs the run unless raster slows >= 0.5 R AND the arm difference is >= 1.5x.
+`toaster_room2 solo`: raster 371 free -> 54 under quota (6.87x), BenchmarkIndex 6.36x.
+
+### What the GPU throttle shows (rate 6.2, PSO bench scene, `toaster_split`, load 4-9)
+
+| arm | x (last 20-40 hb) | emu per guest s | pictures drawn/s | GPU process CPU (ms per wall s) |
+|---|---|---|---|---|
+| GPU throttled (the honest arm) | 0.62-0.69 | 1387-1529 | 2.9-3.2 | 478 |
+| GPU NOT throttled (old arm) | 0.937-0.944 | 993-997 | 7.6-9.1 | 1233 |
+
+No `__sync` call waits on the render worker in steady state (`?glsyncstat=1`, new DIAG: 0 a
+second), so the extra emulation time is CPU contention: in each on-slice SwiftShader's four
+raster threads (~93 ms/s each, the whole slice) run on the same four cores as the SH4.
+Gauntlet level state (`--state ... &benchgame=gauntlet`), same pair: x 0.237 vs 0.277.
+
+## 2026-10-15 (later) — LOW-RENDER on software rasterizers (`?lowrender=0` control)
+
+**What flycast renders now.** `?glsizes=1` (new DIAG, prints each distinct render-target /
+viewport / blit size and texture parameter once): one 640x480 RGBA texture + a 640x480
+DEPTH24_STENCIL8 renderbuffer (the postprocess target), viewport 640x480 — the console's own
+resolution, no upscale (`RenderResolution` 480 = option.cpp's default; the bridge answers no
+core option). Anisotropy 1, no mipmap filters (MIN/MAG LINEAR or NEAREST only), and the
+present on ANGLE/SwiftShader is `gl.bogusBlitFramebuffer`'s route: viewport(0,0,w,h) + one quad.
+
+**Where SwiftShader's time goes**, rate 1, PSO bench scene, 30 pictures/s every arm, GPU
+process CPU from /proc (one run each):
+
+| arm | GPU process ms/s | emu ms per guest s |
+|---|---|---|
+| core defaults (`lowrender=0`) | 3271 (~109 ms a picture) | 227 |
+| 320x240 + nearest + fog off + per-strip sort | 1609 | 159 |
+| same, game's filtering | 1658 | 158 |
+| same, fog on | 1813 | 160 |
+| same, per-TRIANGLE sort (the default) | **1262** | 154 |
+| same, 640x480 | 2707 | 167 |
+| same, 160x120 | 1284 | 156 |
+| canvas shown at 64x48 / hidden (compositor) | 1304 / 1272 | |
+
+Per-strip sorting costs MORE raster than the default per-triangle sort here, so it is not
+used. Below 320x240 nothing is left to gain: ~40 ms a picture is fixed (not the page
+compositor — hiding the canvas moves nothing), most likely per-draw/per-pass work in
+SwiftShader's threads.
+
+**Shipped.** `lib/capability.js softwareGL()` (renderer names SwiftShader / llvmpipe /
+softpipe / lavapipe / WARP, or the browser refuses `failIfMajorPerformanceCaveat:true` — a
+measured refusal, not a property read; 4 new self-test assertions, `?captest=1` 241/241 under
+SwiftShader). On such a device dreamcast.html sends `{res: 240, filter: 1, fog: 0}`
+(`flycast_set_render_res / _tex_filter / _fog`, new core setters in libretro.cpp next to
+`flycast_set_fog`). The window follows the picture: the worker resizes the drawing buffer to
+the frame the core presents (`sizeWrap`, both the recorder and the direct path), and the page's
+640x480 CSS box scales it (`image-rendering: pixelated`). `?lowrender=0` = off, `=1` = on
+anywhere, `?lrres= / lrfilter= / lrsort= / lrfog=` one knob.
+
+**Exact — rendering never reaches guest state** (wasm `26d01864`):
+- `?aicahash=1&noshard=1`, bench scene, lowrender 1 vs 0: **42/42 windows identical**
+  (audio, whole AICA state, SH4 RAM).
+- Rollback rig with `--query '&lowrender=1'` (PSO lobby): REF1==REF2 61/61, REF==RB 59/59,
+  0 full-flush fallbacks, 26 rollbacks.
+- Mixed rooms, host `lowrender=1`, joiner `lowrender=0` (snapshot server, owd 20+10): PSO
+  lockstep IN SYNC 80 RAM + 80 fingerprints (138 guest s); PSO forced rollback IN SYNC 32 + 32
+  (32 / 58 rollbacks); Gauntlet IN SYNC 29 RAM + 32 fingerprints (the gate held this one in
+  delay lockstep, delay 7: no rollback ran). Screenshots: host 320x240, joiner 640x480, same frame.
+
+**Measured, in-run A/B** (`toaster_split --ab fn.__dcLowRenderAB:SECS`, the whole lever
+toggled in the worker; new `fn.` form and `--abskip`), GPU throttled, emu ms per guest s:
+
+| scene | on | off | placebo (same value both arms) |
+|---|---|---|---|
+| PSO bench, rate 6.2, 8 s arms | 1048.6 (x 0.880) | 1197.0 (x 0.793) | 958.8 / 967.0 (-0.8%) |
+| Gauntlet level, rate 6.2, 30 s arms, `--abreload --abskip 6` | 4013.3 (x 0.241) | 4192.8 (x 0.230) | 4310.2 / 4380.0 (-1.6%) |
+
+PSO: **-12.4%** against a -0.8% placebo. Gauntlet: -4.3% against -1.6%, inside the floor —
+its level runs ~4 s of emulation per guest second at 6.2 and draws 1-2 pictures a second, so
+the picture is not its problem.
+
+**Toaster gate** (`toaster_bench --pages dreamcast --rate 6.2 --reps 2 --ladder 0 --room 0`, GPU
+throttled, raster proof 5.95-6.66x / arm difference 4.57-6.03x; `--qs lowrender=0` = off;
+two interleaved on/off pairs, load 2-11):
+
+| arm | solo speed (reps) |
+|---|---|
+| low-render (auto: SwiftShader detected) | 0.672, 0.806, 0.827 (one rep: no window — boot passed the bench's 4-min wait) |
+| `lowrender=0` | 0.614, 0.611, 0.663, 0.683 |
+
+Mean 0.768 vs 0.643. Still 0/7 PASS. The 4-min boot miss is new with the GPU throttled (twice
+in ~20 runs, also seen with `lowrender=0`): a slow device's boot now pays for its rasterizer too.
+
+**room2** (`toaster_room2 room 6.2 40`, GPU in one CORES/R cgroup, raster 6.07-6.65x):
+on 0.936 / 0.945 (steady 0.984 / 0.983); `&lowrender=0` 0.973 / 0.970 (steady 0.976 / 0.976).
+Null — the room starts on PSO's title, which draws little. One earlier "on" room2 run never
+started (the host never reached Allow); the retry ran.
