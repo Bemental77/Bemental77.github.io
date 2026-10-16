@@ -164,6 +164,48 @@
   function storeI32(addr, valueBytes) { return [OP.i32_const, 0x00].concat(valueBytes, [OP.i32_store, 0x02], leb(addr)); }
   function storeI32Const(addr, value) { return storeI32(addr, [OP.i32_const].concat(sleb(value))); }
 
+  // ---- POSITION-INDEPENDENT SPANS (2026-10-16) ----
+  // A span's module used to bake the host address of every precomp entry it names (the PC it stores
+  // before a fallback op, the successor it compares PC with, its entry for the label dispatch) —
+  // so a module is valid only for a block at the address it was built for, and the recompile key
+  // held that address (its word 1, entryPtr). Precomp blocks are carved from the general heap when
+  // the guest first runs code in a page, so a session lays them out where IT happens to have free
+  // space: MEASURED (two-browser MK64 room, a shipped corpus's 235 pages against the 218 the
+  // session entered): the first 29 pages sat 9,112 B from where the corpus saw them, the next 12
+  // 192.6 MB away (a buffer taken in between), and from page 96 on each page 96 B further than the
+  // last — 143 distinct deltas. Every one rejected the corpus's modules for that page; the compile
+  // worker rebuilt the corpus three times (9,000 span compiles a console) and 3% of those modules
+  // were ever used: the early start's 3,186 had 0 hits.
+  // Now a span names its block's entries RELATIVE to the block: base = blocks[vaddr >> 12]->block,
+  // read at the point of use (two loads; blocks[] is a static of the core — p.blocksBase), plus
+  // the entry's constant offset. The module is the same bytes for a block at any address, so the
+  // key's word 1 is the entry's OFFSET in its block and a module built for one heap layout serves
+  // every other. Used only when blocks[vaddr >> 12]->block IS the block the span's entries are in
+  // when it is compiled (picLive; else the old absolute form and an absolute key — the two key
+  // forms cannot collide: an offset is < 1024 x stride, an absolute entry is a heap address).
+  // ?jitpic=0 = the absolute form throughout (the A/B arm).
+  var PICX = null;                // while a span is emitted: { slot: &blocks[page], base: its block as compiled }
+  var PIC_ON = null;
+  function picOn() {
+    if (PIC_ON === null) { var g = (typeof globalThis !== 'undefined') ? globalThis : self, f = g.__fbAsync; PIC_ON = !(f && f.jitPic === false); }
+    return PIC_ON;
+  }
+  function picBase(p) { return (p.entryPtr - ((p.vaddr & 0xFFF) >>> 2) * p.stride) | 0; }
+  // may this span be emitted position-independent? (the core's thread only: reads blocks[])
+  function picLive(p, U) {
+    if (!picOn() || !p.blocksBase || !(p.stride > 0)) return false;
+    var bp = U[(p.blocksBase >> 2) + (p.vaddr >>> 12)];
+    return !!bp && (U[bp >> 2] | 0) === picBase(p);
+  }
+  // the recompile key's word 1 for a span compiled (pic) position-independent or not
+  function keyEntry(p, pic) { return pic ? ((p.entryPtr - picBase(p)) >>> 0) : (p.entryPtr >>> 0); }
+  // the bytes that push the host address of precomp entry `ptr` of the span being emitted
+  function ptrBytes(ptr) {
+    if (!PICX) return [OP.i32_const].concat(sleb(ptr));
+    return [OP.i32_const].concat(sleb(PICX.slot), [OP.i32_load, 0x02, 0x00, OP.i32_load, 0x02, 0x00, OP.i32_const], sleb((ptr - PICX.base) | 0), [OP.i32_add]);
+  }
+  function storePC(p, ptr) { return storeI32(p.pcGlobal, ptrBytes(ptr)); }
+
   function sext16(v) { return (v << 16) >> 16; }
 
   // SLEB128 over a full 64-bit value. The existing sleb() coerces with `n |= 0`
@@ -709,7 +751,7 @@
         [OP.if_, OP.void_],
           coldJump([].concat(
             bump('#gen_interrupt'),
-            storeI32Const(p.pcGlobal, finalPtr),
+            storePC(p, finalPtr),
             [OP.i32_const], sleb(p.genInt), [OP.call_indirect, 0x00, 0x00]), exitDepth + 1, flushRegs),
         [OP.end]);
     }
@@ -718,7 +760,7 @@
       [OP.if_, OP.void_],
       bump('#gen_interrupt'),
       C.flushAll(),                       // compile-state: dirty cleared on BOTH arms (flush emits stores only here, but the arm not taken loses nothing: dirty was already current)
-      storeI32Const(p.pcGlobal, finalPtr),
+      storePC(p, finalPtr),
       [OP.i32_const], sleb(p.genInt), [OP.call_indirect, 0x00, 0x00],
       // ALWAYS return to the dispatcher after gen_interrupt (2026-09-30).
       // It used to continue in-block when PC was unchanged, but gen_interrupt
@@ -930,24 +972,24 @@
     if (COLD) {
       // out of line, and always back to the dispatcher (see COLD PATHS)
       return coldJump([].concat(
-        storeI32Const(p.pcGlobal, slow ? slow.ptr : instrPtr),
+        storePC(p, slow ? slow.ptr : instrPtr),
         [OP.i32_const], sleb(slow ? slow.opsIdx : opsIdx), [OP.call_indirect, 0x00, 0x00]), brDepth, flushed.regs);
     }
     if (slow) {
       return [].concat(
         flushed,
-        storeI32Const(p.pcGlobal, slow.ptr),
+        storePC(p, slow.ptr),
         [OP.i32_const], sleb(slow.opsIdx), [OP.call_indirect, 0x00, 0x00],
         [OP.br].concat(leb(brDepth + RAW)));
     }
     return [].concat(
       flushed,
-      storeI32Const(p.pcGlobal, instrPtr),
+      storePC(p, instrPtr),
       [OP.i32_const], sleb(opsIdx), [OP.call_indirect, 0x00, 0x00],
       refreshReg >= 0 ? loadI64(p.regBase + refreshReg * 8).concat([OP.local_set], leb(L_REG0 + refreshReg)) : [],
       exitAlways
         ? [OP.br].concat(leb(brDepth + RAW))
-        : [].concat(loadI32(p.pcGlobal), [OP.i32_const], sleb(instrPtr + p.stride), [OP.i32_ne],
+        : [].concat(loadI32(p.pcGlobal), ptrBytes(instrPtr + p.stride), [OP.i32_ne],
                     [OP.br_if], leb(brDepth + RAW)));
   }
 
@@ -1297,7 +1339,7 @@
         [OP.else_],
           coldJump([].concat(
             bump((slow ? 'SLOTCU1MISS:' : 'CU1MISS:') + mnem(word)),
-            storeI32Const(p.pcGlobal, slow ? slow.ptr : instrPtr),
+            storePC(p, slow ? slow.ptr : instrPtr),
             [OP.i32_const], sleb(slow ? slow.opsIdx : opsIdx), [OP.call_indirect, 0x00, 0x00]), exitDepth + 1, preFlush.regs),
         [OP.end]
       );
@@ -1311,7 +1353,7 @@
         preFlush,
         // in a delay slot the coprocessor-unusable exception needs delay_slot
         // set, which only the interpreter does — hand back the whole branch
-        storeI32Const(p.pcGlobal, slow ? slow.ptr : instrPtr),
+        storePC(p, slow ? slow.ptr : instrPtr),
         [OP.i32_const], sleb(slow ? slow.opsIdx : opsIdx), [OP.call_indirect, 0x00, 0x00],
         [OP.br].concat(leb(exitDepth + 1 + RAW)),
       [OP.end]
@@ -1648,7 +1690,7 @@
             var cmpBail = [].concat(
               bump((slow ? 'SLOTCMPNAN:' : 'CMPNAN:') + mnem(word)),
               preFlush,
-              storeI32Const(p.pcGlobal, slow ? slow.ptr : instrPtr),
+              storePC(p, slow ? slow.ptr : instrPtr),
               [OP.i32_const], sleb(slow ? slow.opsIdx : opsIdx), [OP.call_indirect, 0x00, 0x00],
               [OP.br].concat(leb(exitDepth + 2 + RAW)));
             var cm = compareNat(p, S, fn, fs, rt, cmpBail);
@@ -1982,7 +2024,7 @@
     ASYNC.w = null; ASYNC.on = null;
     if (ASYNC.restarts > 3 || !asyncMake(ASYNC.M)) { ASYNC.on = false; ASYNC.pending.clear(); return; }
     ASYNC.pending.forEach(function (j, id) {
-      ASYNC.outbox.push({ id: id, p: j.p, w0: j.w0, words: j.words, ops: j.ops, flags: j.flags || jitFlags(), tableBase: TABLE_BASE });
+      ASYNC.outbox.push({ id: id, p: j.p, w0: j.w0, words: j.words, ops: j.ops, flags: j.flags || jitFlags(), tableBase: TABLE_BASE, pic: !!j.pic });
     });
     asyncFlush();
     var R = RELOC;
@@ -2010,10 +2052,10 @@
     for (var k = 0; k < nOps; k++) ops[k] = U[(p.entryPtr + k * p.stride) >> 2];
     var words = U.slice(pageW0, pageW0 + pageN + 1);    // the page, and the word after it
     var id = ASYNC.nextId++;
-    var job = { id: id, p: Object.assign({}, p), w0: pageW0, words: words, ops: ops, flags: jitFlags(), tableBase: TABLE_BASE };
+    var job = { id: id, p: Object.assign({}, p), w0: pageW0, words: words, ops: ops, flags: jitFlags(), tableBase: TABLE_BASE, pic: picLive(p, U) };
     if (WARM.corpus || (WARM.early && WARM.early.ok === null)) warmStart(job);
     if (WARM.capture) WARM.capture.push({ p: job.p, w0: pageW0, words: words, ops: ops, flags: job.flags, tableBase: TABLE_BASE });
-    ASYNC.pending.set(id, { p: job.p, w0: pageW0, words: words, ops: ops, bp: bp, blk: bp ? U[bp >> 2] : 0, keyArr: keyArr, tries: ASYNC.retry | 0, flags: job.flags });
+    ASYNC.pending.set(id, { p: job.p, w0: pageW0, words: words, ops: ops, bp: bp, blk: bp ? U[bp >> 2] : 0, keyArr: keyArr, tries: ASYNC.retry | 0, flags: job.flags, pic: job.pic });
     // batched: one message per field end (or per 32 offers) — a scene load offers hundreds
     // of spans inside one field, and a message each cost more than the copy itself
     ASYNC.outbox.push(job);
@@ -2129,13 +2171,13 @@
     var pageLen = ((cj.blockEnd - cj.blockStart) >>> 0) >>> 2, entryInPage = ((cj.vaddr - cj.blockStart) >>> 0) >>> 2;
     if (pageLen > 0 && entryInPage < pageLen && span > pageLen - entryInPage) span = pageLen - entryInPage;
     var key = new Uint32Array(6 + pageN + span);
-    key[0] = pp.vaddr >>> 0; key[1] = pp.entryPtr >>> 0; key[2] = span; key[3] = pp.blockStart >>> 0;
+    key[0] = pp.vaddr >>> 0; key[1] = keyEntry(pp, picOn()); key[2] = span; key[3] = pp.blockStart >>> 0;
     key[4] = pp.blockEnd >>> 0; key[5] = pp.srcPtr >>> 0;
     key.set(w.words.subarray(0, pageN), 6); key.set(cj.ops.subarray(0, span), 6 + pageN);
     WARM.ids.set(id, key);
     R.idJob.set(id, i); R.sent[i] = d; R.sentId[i] = id;
     WARM.offered++;
-    return { id: id, p: pp, w0: w.w0, words: w.words, ops: cj.ops, flags: R.live.flags, tableBase: R.live.tableBase };
+    return { id: id, p: pp, w0: w.w0, words: w.words, ops: cj.ops, flags: R.live.flags, tableBase: R.live.tableBase, pic: picOn() };
   }
   // jobs `list` (corpus indices), each for the block delta its page is known (or predicted) at.
   // NOT built here: building a job copies its page and posting it clones that — ~40 us a job, so a
@@ -2202,7 +2244,9 @@
   // The core's offer in page vaddr>>>12: where did its block land, against the corpus?
   function relocObserve(p, quiet) {
     var R = RELOC;
-    if (!R.C || relocOff()) return;
+    // POSITION-INDEPENDENT SPANS: a corpus module serves its page wherever the block landed — there
+    // is nothing to follow (the corpus is built once, at its own addresses)
+    if (!R.C || relocOff() || picOn()) return;
     var vp = p.vaddr >>> 12;
     if (R.seen.has(vp)) return;
     var g = R.pg.get(vp);
@@ -2426,7 +2470,7 @@
     } });
     window.__jitNoFP = job.flags.noFP; window.__jitNoLabels = job.flags.noLabels; window.__jitPin = job.flags.pin;
     window.__jitNoRdMark = !!job.flags.noRdMark;
-    EMIT_ONLY = { out: null, tableBase: job.tableBase | 0, cold: job.flags.cold !== false, chain: job.flags.chain === true,
+    EMIT_ONLY = { out: null, tableBase: job.tableBase | 0, cold: job.flags.cold !== false, chain: job.flags.chain === true, pic: !!job.pic,
                   batch: !!batchCtx, fnBase: batchCtx ? batchCtx.fnBase : 0, jt: !!(batchCtx && batchCtx.jt), part: null };
     TABLE_BASE = job.tableBase | 0;
     var idx = 0;
@@ -2570,7 +2614,7 @@
   var headProbe = new Uint32Array(6);
   function cacheHitInPlace(p, Module, U, span, pageW0, pageN) {
     var hp = headProbe;
-    hp[0] = p.vaddr >>> 0; hp[1] = p.entryPtr >>> 0; hp[2] = span; hp[3] = p.blockStart >>> 0; hp[4] = p.blockEnd >>> 0; hp[5] = p.srcPtr >>> 0;
+    hp[0] = p.vaddr >>> 0; hp[1] = keyEntry(p, picLive(p, U)); hp[2] = span; hp[3] = p.blockStart >>> 0; hp[4] = p.blockEnd >>> 0; hp[5] = p.srcPtr >>> 0;
     var b = headCache.get(headHash(hp));
     if (!b) return 0;
     var keyLen = 6 + pageN + span, ob = 6 + pageN, base = p.entryPtr >>> 0, st = p.stride, q;
@@ -2647,6 +2691,11 @@
     COLD = null;
     if (RELOC.C && !EMIT_ONLY) relocObserve(p);
     var HEAPU32 = Module.HEAPU32;
+    // POSITION-INDEPENDENT SPANS: decided here for the whole emission (the compile worker is told
+    // by the job: it cannot read blocks[])
+    var picNow = EMIT_ONLY ? !!EMIT_ONLY.pic : picLive(p, HEAPU32);
+    PICX = picNow ? { slot: (p.blocksBase + (p.vaddr >>> 12) * 4) | 0, base: picBase(p) } : null;
+    if (picNow) stats.picSpans = (stats.picSpans | 0) + 1; else if (!EMIT_ONLY && picOn()) stats.absSpans = (stats.absSpans | 0) + 1;
     var C = new RegCache(p.reg);
     p.regBase = p.reg;
     p_hi_lo.hi = p.hi; p_hi_lo.lo = p.lo;
@@ -2812,7 +2861,7 @@
     // (the ops of the span's own entries only: index `span` is not baked — see above)
     var keyLen = 6 + pageN + span;
     var keyArr = new Uint32Array(keyLen);
-    keyArr[0] = p.vaddr >>> 0; keyArr[1] = p.entryPtr >>> 0; keyArr[2] = span; keyArr[3] = p.blockStart >>> 0;
+    keyArr[0] = p.vaddr >>> 0; keyArr[1] = keyEntry(p, picNow); keyArr[2] = span; keyArr[3] = p.blockStart >>> 0;
     keyArr[4] = p.blockEnd >>> 0; keyArr[5] = p.srcPtr >>> 0;
     var kh = 0x811c9dc5 | 0, kq;
     // FAST EMIT: in the compile worker HEAPU32 is a Proxy over the copied inputs (emitJob), and
@@ -3037,7 +3086,7 @@
             [OP.if_, OP.void_],
               coldJump([].concat(
                 bump('CU1MISS:' + mnem(word)),
-                storeI32Const(p.pcGlobal, instrPtr),
+                storePC(p, instrPtr),
                 [OP.i32_const], sleb(HEAPU32[instrPtr >> 2]), [OP.call_indirect, 0x00, 0x00]), EXIT + 1, C.dirtyRegs()),
             [OP.end]);
         } else if (br.cu1) {
@@ -3046,7 +3095,7 @@
             [OP.if_, OP.void_],
               bump('CU1MISS:' + mnem(word)),
               C.flushSnapshot(),
-              storeI32Const(p.pcGlobal, instrPtr),
+              storePC(p, instrPtr),
               [OP.i32_const], sleb(HEAPU32[instrPtr >> 2]), [OP.call_indirect, 0x00, 0x00],
               [OP.br].concat(leb(EXIT + 1 + RAW)),
             [OP.end]);
@@ -3078,7 +3127,7 @@
               nSeg > 1 ? [OP.i32_const].concat(sleb(PCL ? targetIdx : tOrd), [OP.local_set], leb(L_START)) : [],   // PCL: the dispatch is by span index
               [OP.br], leb(topD));
           }
-          return poll.concat(bump('#exit:branch'), storeI32Const(p.pcGlobal, targetPtr), chainOr(exitD));
+          return poll.concat(bump('#exit:branch'), storePC(p, targetPtr), chainOr(exitD));
         }
         // delay-slot bytes at a given $exit depth. ALU slots emit inline as
         // before; memory/FP slots emit their native fast arm and bail the
@@ -3210,7 +3259,7 @@
       app(body, [].concat(
         bump(mnem(word) + (brReason ? '@' + brReason : '')),
         C.flushAndInvalidate(),
-        storeI32Const(p.pcGlobal, instrPtr),
+        storePC(p, instrPtr),
         [OP.i32_const], sleb(opsIdx), [OP.call_indirect, 0x00, 0x00],
         // MTC0 Count/Status run gen_interrupt inline (mips_instructions.def
         // :672,:698) and any store may hit the MI write handler that does
@@ -3218,7 +3267,7 @@
         // so those hand back to the dispatcher unconditionally (see slowArm).
         mayGenInterrupt(word)
           ? [OP.br].concat(leb(EXIT + RAW))
-          : [].concat(loadI32(p.pcGlobal), [OP.i32_const], sleb(nextPtr), [OP.i32_ne, OP.br_if], leb(EXIT + RAW),
+          : [].concat(loadI32(p.pcGlobal), ptrBytes(nextPtr), [OP.i32_ne, OP.br_if], leb(EXIT + RAW),
                       C.reloadPinned())   // continuing: the op may have written a pinned register
       ));
       stats.fallbackOps++;
@@ -3227,7 +3276,7 @@
     app(body, [].concat(
       C.flush(),
       bump('#exit:fallthrough'),
-      storeI32Const(p.pcGlobal, p.entryPtr + span * p.stride),
+      storePC(p, p.entryPtr + span * p.stride),
       CHAIN && !RAW ? chainOr(EXIT) : []
     ));
     if (C.err.readOnlyWrite >= 0) {
@@ -3323,7 +3372,7 @@
       var sodd = p.stride >>> stz, sinv = sodd;
       for (var ni = 0; ni < 5; ni++) sinv = Math.imul(sinv, 2 - Math.imul(sodd, sinv));
       var maxL = labels[nSeg - 1];
-      startPro = [].concat(loadI32(p.pcGlobal), [OP.i32_const], sleb(p.entryPtr | 0), [OP.i32_sub],
+      startPro = [].concat(loadI32(p.pcGlobal), ptrBytes(p.entryPtr | 0), [OP.i32_sub],
         stz ? [OP.i32_const].concat(sleb(stz), [OP.i32_shr_u]) : [], [OP.i32_const], sleb(sinv), [OP.i32_mul],
         [OP.local_set], leb(L_START));
       // $g(idx): run label idx's ORIGINAL interpreter op (any other idx: none — see above)
