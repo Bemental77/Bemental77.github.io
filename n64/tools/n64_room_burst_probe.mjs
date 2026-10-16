@@ -28,7 +28,7 @@
 //
 // USAGE (a dev server on the snapshot first; CLAUDE.md gate #2 — tools/devserver.mjs):
 //   bash tools/probe_lock.sh run -- node n64/tools/n64_room_burst_probe.mjs --url http://localhost:19200 \
-//        --secs 60 --worker-cpu 0.5 --query costdbg=1 [--qhost ..] [--qjoin ..] [--json PATH]
+//        --secs 60 --worker-cpu 0.5 --query costdbg=1 [--qhost ..] [--qjoin ..] [--json PATH] [--screen]
 // Emits one JSON summary line on stdout.
 import { createRequire } from 'node:module';
 import fs from 'node:fs';
@@ -68,6 +68,13 @@ if (!fs.existsSync(MQTT_CACHE)) {
 const MQTT_SRC = fs.readFileSync(MQTT_CACHE, 'utf8');
 
 // The screen witness, before any page script, on the RAW requestAnimationFrame.
+// ⚠ OPT-IN (--screen), NOT THE DEFAULT (2026-10-16). drawImage + getImageData of the worker's
+// canvas on every animation frame is a synchronous GPU readback: MEASURED (CPU profile of the
+// host page, MK64 room, SwiftShader) it was 78% of the main thread, the page logged 267 long
+// tasks (p50 175 ms, max 915 ms) in 80 s, and the room read 0.885x with 22 s of stalls; the
+// same room without it read 0.996 / 1.000x. The main thread relays the room's DataChannel, so
+// the rig was manufacturing the stalls it measures. Without --screen, screenPerS reads 0 (not measured).
+const SCREEN = argv.includes('--screen');
 const PRE = `(() => {
   const raf = window.requestAnimationFrame.bind(window);
   const S = window.__scr = { frames: 0, changes: 0, last: -1, err: null };
@@ -76,6 +83,7 @@ const PRE = `(() => {
     raf(f);
     try {
       const src = document.getElementById('canvas');
+      if (!${SCREEN}) return;
       if (!src || !window.__n64Worker || !window.__n64Worker.state().booted) return;
       if (!cv) { cv = document.createElement('canvas'); cv.width = 96; cv.height = 72; cx = cv.getContext('2d', { willReadFrequently: true }); }
       cx.drawImage(src, 0, 0, 96, 72);

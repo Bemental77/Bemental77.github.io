@@ -569,7 +569,20 @@ function fsCoreReady() {
 // may the next field skip? (a snapshot it can use is held, or there is room for one)
 function fsSnapFresh(s) { return FSK.snaps.length && s - FSK.snaps[FSK.snaps.length - 1].s < FSK.snapEvery; }
 function fsCanSkip() {
-  return FSK.on && (!RM.on || FSK.roomLinear) && fsCoreReady() && FSK.serial >= FSK.suspendUntil && (fsSnapFresh(FSK.serial + 1) || FSK.snaps.length < FSK.maxSnaps);
+  return FSK.on && (!RM.on || FSK.roomLinear) && fsCoreReady() && FSK.serial >= FSK.suspendUntil && (fsSnapFresh(FSK.serial + 1) || (FSK.snaps.length < FSK.maxSnaps && fsCanAlloc()));
+}
+// May a NEW snapshot buffer be had right now? fsAlloc's own heap test, without the malloc. A skip
+// that needs a snapshot it cannot get draws after all — so fsCanSkip must not promise one: the GPU
+// queue guard (gqReady) holds a field only when the frame skip says it cannot skip, and a promise
+// fsSnap then broke left NO bound on the GPU's queue. MEASURED (n64/tools/n64_toaster_room2.mjs
+// room 6.2, MK64, delay lockstep, no heap for a snapshot): 231 skips wanted, 0 taken, 64 fences
+// outstanding, the oldest 30 s; a texImage2D blocked 28 s.
+function fsCanAlloc() {
+  if (FSK.pool.length || FSW.p) return true;
+  if (FSK.bufs >= FSK.maxSnaps) return false;
+  if (!M || typeof M._neil_heap_brk !== 'function' || typeof M._neil_heap_free_below !== 'function') return true;
+  var n = FSK.size + FSK.gsize, above = M.HEAPU8.length - (M._neil_heap_brk() >>> 0), total = above + (M._neil_heap_free_below() >>> 0);
+  return !(above < n || total - n < FS_RESERVE);
 }
 function fsAlloc() {
   if (FSK.pool.length) return FSK.pool.pop();
@@ -656,6 +669,17 @@ function fsSnap(s) {
   FSK.snapsTaken++; FSK.snapMs += dt; if (dt > FSK.maxSnapMs) FSK.maxSnapMs = dt;
   return true;
 }
+// Every snapshot buffer this file holds goes back to the heap (none may be in use: fsResolve first).
+// A room returning to rollback re-arms its ring with mallocs of its own (room_core.js n64sPoolDrain):
+// MEASURED (n64_rollback_probe --force-return 6, the delay stretches' frame skip holding its buffers)
+// "out of memory for the rollback snapshots" at the return without this.
+function fsFreeAll() {
+  var n = 0;
+  if (!M || typeof M._free !== 'function') return 0;
+  while (FSK.pool.length) { M._free(FSK.pool.pop()); FSK.bufs--; n++; }
+  if (FSW.p) { M._free(FSW.p); FSW.p = 0; FSK.bufs--; n++; }
+  return n;
+}
 function fsDrop(i) {
   var S = FSK.snaps.splice(i, 1)[0];
   if (S.fbs && self.__fbAsync && self.__fbAsync.release) self.__fbAsync.release(S.fbs);
@@ -728,6 +752,15 @@ function fsResolve() {
 }
 function fsDropAll() { while (FSK.snaps.length) fsDrop(0); FSK.stale = false; }
 // ONE FIELD. Replaces a bare _neil_ls_run_frame for the solo clock (runOneFrame) and the rigs.
+// Is the field about to run one that draws? (The cadence: the field two before it drew — a title
+// drawing every second field skips the fields that draw and runs the others as they are.)
+// ⚠ AND WHEN THE GPU IS FAR BEHIND, ASSUME IT DRAWS (2026-10-16). The guess was the only thing
+// between the GPU and an unbounded queue: a field it called picture-less that drew anyway went to
+// the GPU, and the GPU queue guard does not hold a field the frame skip could skip. MEASURED
+// (two-browser MK64 rollback room, SwiftShader, 4 cores, fix a0036e2 in): the fence queue grew to
+// 19-23 pictures, the oldest 4-6 s outstanding — 4-6 s of picture lag, and the reservoir that a
+// later GL call blocks on. Past GQ.max pictures every field that can skip, skips.
+function fsExpect() { return (FSK.hist & 2) !== 0 || FSK.fq.length > GQ.max; }
 function fsField() {
   var s = ++FSK.serial, ready = fsCoreReady(), now = performance.now();
   FSK.fields++;
@@ -735,7 +768,7 @@ function fsField() {
   fsPoll(now);
   var skip = false;
   if (FSK.force) skip = (s % FSK.force) !== 0 && fsCanSkip();
-  else if (FSK.on && FSK.fq.length >= FSK.depth) { FSK.held++; skip = (FSK.hist & 2) !== 0 && fsCanSkip(); }
+  else if (FSK.on && FSK.fq.length >= FSK.depth) { FSK.held++; skip = fsExpect() && fsCanSkip(); }
   if (!skip && !FSK.force && fsLate(now)) { skip = fsCanSkip(); if (skip) FSK.lateSkips++; }
   // A snapshot is needed only for the first skipped field after the newest one: a re-run from an
   // older snapshot re-runs a later skipped field too (every field's pads are kept). So one is taken
@@ -1146,7 +1179,7 @@ var ROOM_FS = {
   ok: function () { return FSK.on && !!M && fsCoreReady(); },
   force: function () { return FSK.force | 0; },
   behind: function () { fsPoll(performance.now()); return FSK.fq.length >= FSK.depth; },
-  expect: function () { return (FSK.hist & 2) !== 0; },
+  expect: function () { return fsExpect(); },
   begin: function (skip, k) {
     FSK.skipping = !!skip; FSK.drewNow = false; FSK.swNow = 0;
     if (fsCoreReady()) M._neil_fs_set(skip ? 1 : 0, (k | 0) & 0x7FFFFFFF);
@@ -1170,6 +1203,8 @@ var ROOM_FS = {
   linear: function () { FSK.roomLinear = true; try { fsField(); } finally { FSK.roomLinear = false; } },
   linearCanSkip: function () { FSK.roomLinear = true; try { return fsCanSkip(); } finally { FSK.roomLinear = false; } },
   settleLinear: function () { fsResolve(); },
+  // back to rollback: the ring needs the heap the delay stretch's snapshots took (fsFreeAll)
+  release: function () { fsResolve(); return fsFreeAll(); },
   // the solo machinery's counters (delay lockstep's frames run through it)
   report: function () { return { skipped: FSK.skipped, drawn: FSK.drawn, redo: FSK.redo, redoFields: FSK.redoFields, repairs: FSK.repairs, lost: FSK.lost, snaps: FSK.snapsTaken }; }
 };
