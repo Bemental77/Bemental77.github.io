@@ -439,6 +439,24 @@
     function n64sFree(buf) {
       if (buf && buf.__ptr) { (N64S.pool || (N64S.pool = [])).push(buf); N64S.heapBufs--; }
     }
+    // ⚠ A ROOM IN DELAY LOCKSTEP GIVES ITS SPARE STATE BUFFERS BACK TO THE HEAP (2026-10-16). The pool
+    // above only ever grew: the ring slots written ahead before Ready (lsRbProve: up to RB_WINDOW + 6
+    // of them, 20.4 MB each) and every slot rbRelease handed back stayed parked here for the rest of
+    // the room. A delay-lockstep frame runs through the worker's own frame skip (core_worker.js
+    // fsField), whose snapshots are mallocs of their own — and with the pool holding the heap it
+    // found none: MEASURED (n64/tools/n64_toaster_room2.mjs room 6.2, MK64, two 2-core devices, the
+    // room in delay 2-3): brk 382-392 MB of 512, 119-129 MB above it, 0 MB free below — under its
+    // 128 MB reserve — so every field that wanted to skip drew instead (noHeap 231 of 231 tries,
+    // skipped 0), the GPU fell 30 s behind (64 fences outstanding) and single fields blocked in
+    // texImage2D / bufferData for 17-28 s: the room read 0.15-0.19x with 7-22 s of stalls a side.
+    // While the ring holds nothing it can load, the pool is freed; rbRearm / rbInit allocate afresh.
+    function n64sPoolDrain() {
+      var M = G.Module, n = 0;
+      if (!N64S.pool || !N64S.pool.length || !M || typeof M._free !== 'function') return 0;
+      while (N64S.pool.length) { var b = N64S.pool.pop(); if (b && b.__ptr) { M._free(b.__ptr); n++; } }
+      N64S.drained = (N64S.drained | 0) + n;
+      return n;
+    }
     function n64sRawSave(dst) {
       var M = G.Module, t0 = performance.now(), d = dst && dst.__ptr ? dst : null;
       if (!d) { d = N64S.scratch || (N64S.scratch = n64sRawAlloc()); if (!d) { N64S.fault = 'no wasm heap left for a savestate'; return false; } }
@@ -1428,7 +1446,10 @@
         if (r.rollback) return rbFail(ls, 'a correction reached back across the switch to rollback (frame ' + r.rollback.from + ' < ' + r.frame + ')');
         // delay frames ran through the worker's own frame-skip machinery: settle it first, so no
         // blank capture is live in the state the ring re-arms at (RFS)
-        if (env.fs && RFS.on) env.fs.settleLinear();
+        if (env.fs && RFS.on) {
+          if (env.fs.release) { var nf = env.fs.release(); if (nf) env.log('[rollback] back to rollback: the delay stretch\'s ' + nf + ' frame-skip snapshot buffers given back to the heap for the ring'); }
+          else env.fs.settleLinear();
+        }
         if (!rbRearm(ls, r.frame | 0)) return rbFail(ls, 'rollback could not resume: ' + RB.fault);
       }
       if (r.rollback) {
@@ -1797,6 +1818,7 @@
         // the framebuffer pins they hold) go back now — a phone's memory — rather
         // than sitting through the delay stretch; rbRearm allocates afresh.
         if (RB.ready && !RB.stale) { rbRelease(); RB.stale = true; }
+        if (N64S.pool && N64S.pool.length) { var nd = n64sPoolDrain(); if (nd) env.log('[rollback] delay lockstep: ' + nd + ' spare state buffers (' + Math.round(nd * N64S.size / 1048576) + ' MB) given back to the heap'); }
         // A CAPACITY-GATED ROOM IN DELAY keeps telling the host what rollback
         // would cost this console now (lib/netplay.js _capDecide reads `st` to
         // decide a return to zero-lag mode): without this the step stays what it
