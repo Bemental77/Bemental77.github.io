@@ -208,7 +208,15 @@ const CONSOLES = {
         rateBy: 'witness' },
   n64: { name: 'N64', title: 'Mario Kart 64', page: '/n64/', game: 'Mario Kart 64', hostFlag: '',
          hz: '((window.__n64Net && window.__n64Net().viHz) || 60)',
-         witness: '(window.__n64Rate ? window.__n64Rate.speed : null)', frames: 'null', bootMs: 240000, seam: 'window.__n64Net && window.__n64Net()' },
+         witness: '(window.__n64Rate ? window.__n64Rate.speed : null)', frames: 'null', bootMs: 240000, seam: 'window.__n64Net && window.__n64Net()',
+         // ⚠ THE ROOM'S ENGINE RUNS IN THE CORE WORKER BY DEFAULT (n64/index.html WORKER ROOMS,
+         // ec9f66b, 2026-10-01), so the prototype beginFrame hook below never fires on this page:
+         // every live n64 cell read engine=null ready=0 for 240 s while both pages were RUNNING
+         // in rollback at frame 7192 / 0.996x (seen 2026-10-16 by attaching to the profiles).
+         // The passing n64 cells before that all carried --query '&worker=0' — not what ships.
+         // wkEngine is the page's own mirror of the worker engine's report() (__n64Net().engine,
+         // <= 100 ms old) plus its own input->present latency samples (room_core.js LAT).
+         wkEngine: '(window.__n64Net && (function (n) { return n.worker && n.engine ? { rep: n.engine, mode: n.mode, lat: n.lat ? n.lat.samples : null } : null; })(window.__n64Net()))' },
   gc: { name: 'GameCube', title: 'Mario Party 4', page: '/gamecube.html', game: 'Mario Party 4', hostFlag: '',
         // __gcRate.speed is CUMULATIVE since boot (credits consumed / wall), so it lags any
         // change by minutes; producedPerS is the recomp's per-second guest frame count at the
@@ -464,7 +472,7 @@ function preloadSrc(cfg) {
     L.prototype.beginFrame = function (pads) {
       const r = begin.call(this, pads);
       try {
-        M.engineSeen = true;
+        M.engineSeen = true; M.engineOnPage = true;
         M.engine = this;
         if (r && r.ready) {
           M.readyFrames++;
@@ -488,6 +496,33 @@ function preloadSrc(cfg) {
     return true;
   };
   if (!hook()) { const iv = setInterval(() => { if (hook()) clearInterval(iv); }, 10); }
+  // ---------------- worker-room engine mirror (CFG.wkEngine) ----------------
+  // A page whose engine runs in a worker never calls beginFrame here; its events
+  // still reach the _emit hook above (the page dispatches them through
+  // Lockstep.prototype._emit), but frames, state and latency come from the page's
+  // own mirror of the worker engine's report(). readyFrames = the engine's own
+  // cumulative ready-frame count (report().frames). Latency = the page's own
+  // input->present samples, appended as they arrive (they carry no id, so new ones
+  // are found after the last-seen tail entry).
+  if (CFG.wkEngine) {
+    let latTail = null;
+    setInterval(() => {
+      if (M.engineOnPage) return;
+      let w = null; try { w = eval(CFG.wkEngine); } catch (x) {}
+      if (!w || !w.rep) return;
+      const rep = w.rep;
+      M.engineSeen = true; M.engineInWorker = true;
+      M.engine = { state: rep.state, frame: rep.frame, delay: rep.delay, rollback: w.mode === 'rollback' ? 1 : 0,
+                   report: () => rep, inWorker: true };
+      if (typeof rep.frames === 'number') { M.readyFrames = rep.frames; M.lastFrame = rep.frame; }
+      const L = w.lat || [];
+      let from = 0;
+      if (latTail != null) { from = L.length; for (let i = L.length - 1; i >= 0; i--) { if (JSON.stringify(L[i]) === latTail) { from = i + 1; break; } } }
+      else from = L.length;    // samples from before the rig attached are not ours
+      for (let i = from; i < L.length; i++) M.lat.push({ frames: L[i].frames, ms: L[i].ms, delay: rep.delay, rollback: w.mode === 'rollback', src: 'page' });
+      if (L.length) latTail = JSON.stringify(L[L.length - 1]);
+    }, 100);
+  }
   // The rig calls this immediately before a real key press.
   M.press = () => {
     const e = M.engine;
@@ -948,7 +983,7 @@ async function runCell(cid, aid, attempt) {
       cell.firewall = { brokers: brokerList, resolver: fronts.resolverRule, uid: fw.uid };
     }
     const pre = { mqtt: mqttSource(), hooks: null };
-    const cfg = (role) => ({ role, console: cid, witness: C.witness, witnessCum: C.witnessCum || null, frames: C.frames, hz: C.hz, seam: C.seam, aux: C.aux || 'null', ui: C.ui || 'null',
+    const cfg = (role) => ({ role, console: cid, witness: C.witness, witnessCum: C.witnessCum || null, frames: C.frames, hz: C.hz, seam: C.seam, aux: C.aux || 'null', ui: C.ui || 'null', wkEngine: C.wkEngine || null,
                              p2p: A.p2p || null, relay: !!A.relay, ice: !!A.firewall });
     const code = mkCode();
     cell.code = code;
