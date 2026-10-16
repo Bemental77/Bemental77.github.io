@@ -301,6 +301,7 @@ static void DepthBufferRasterize(struct vertexi * vtx, int vertices, int dzdx)
          int             z = left_z + IMUL16(prestep, dzdx);
          uint16_t *ptr_dst = (uint16_t*)(gfx_info.RDRAM + g_gdp.zb_address);
          int         shift = x1 + y1 * rdp.zi_width;
+         neil_rd_mark(g_gdp.zb_address + 2u * (uint32_t)shift, 2u * (uint32_t)width + 4);   /* RDRAM write tracking: main/neil_rddirty.h */
 
          /* draw to depth buffer */
          for (x = 0; x < width; x++)
@@ -931,6 +932,7 @@ void copyWhiteToRDRAM(void)
    if(g_gdp.fb_width == 0)
       return;
 
+   neil_rd_mark(gDP.colorImage.address, 4u * g_gdp.fb_width * gDP.colorImage.height);   /* RDRAM write tracking: main/neil_rddirty.h */
    if(g_gdp.fb_size == G_IM_SIZ_32b)
    {
       uint32_t *ptr_dst = (uint32_t*)(gfx_info.RDRAM + gDP.colorImage.address);
@@ -978,8 +980,11 @@ void DrawWholeFrameBufferToScreen(void)
   DrawFrameBufferToScreen(&fb_info);
 
   if (!(settings.frame_buffer & fb_ref))
+  {
+    neil_rd_mark(gDP.colorImage.address, (gDP.colorImage.width * gDP.colorImage.height) << g_gdp.fb_size >> 1);   /* RDRAM write tracking: main/neil_rddirty.h */
     memset(gfx_info.RDRAM + gDP.colorImage.address, 0,
           (gDP.colorImage.width * gDP.colorImage.height) << g_gdp.fb_size >> 1);
+  }
 }
 
 void CopyFrameBuffer(int32_t buffer)
@@ -1020,6 +1025,7 @@ void CopyFrameBuffer(int32_t buffer)
       {
          uint32_t y, x;
 
+         neil_rd_mark(gDP.colorImage.address, (g_gdp.fb_size == G_IM_SIZ_16b ? 2u : 4u) * width * height);   /* RDRAM write tracking: main/neil_rddirty.h */
          if (g_gdp.fb_size == G_IM_SIZ_16b)
          {
             uint16_t *ptr_dst   = (uint16_t*)(gfx_info.RDRAM + gDP.colorImage.address);
@@ -1122,6 +1128,8 @@ void CopyFrameBuffer(int32_t buffer)
 
       if (samp || ptr_src)
       {
+         if (y_end > 0)   /* RDRAM write tracking: main/neil_rddirty.h */
+            neil_rd_mark(gDP.colorImage.address, (g_gdp.fb_size <= G_IM_SIZ_16b ? 2u : 4u) * (width * (uint32_t)y_end + (uint32_t)x_end));
 #define NF_SRC(x, y) (samp ? samp[(x) + (y) * x_end] \
       : ptr_src[(int)((x)*scale_x + rdp.offset_x) + (int)((y) * scale_y + rdp.offset_y) * stride])
          if (g_gdp.fb_size <= G_IM_SIZ_16b)
@@ -1283,5 +1291,6 @@ void DrawPartFrameBufferToScreen(void)
    fb_info.opaque = 0;
 
    DrawFrameBufferToScreen(&fb_info);
+   neil_rd_mark(gDP.colorImage.address, (gDP.colorImage.width * gDP.colorImage.height) << g_gdp.fb_size >> 1);   /* RDRAM write tracking: main/neil_rddirty.h */
    memset(gfx_info.RDRAM + gDP.colorImage.address, 0, (gDP.colorImage.width * gDP.colorImage.height) << g_gdp.fb_size >> 1);
 }

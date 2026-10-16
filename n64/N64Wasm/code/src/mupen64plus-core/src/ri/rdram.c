@@ -19,6 +19,7 @@
  *   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.          *
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
+#include "main/neil_rddirty.h"   /* RDRAM write tracking for the raw fast save */
 #include "rdram.h"
 #include "ri_controller.h"
 
@@ -38,6 +39,7 @@ void poweron_rdram(struct rdram* rdram)
 {
     memset(rdram->regs, 0, RDRAM_REGS_COUNT*sizeof(uint32_t));
     memset(rdram->dram, 0, rdram->dram_size);
+    neil_rd_mark_all();
 }
 
 
@@ -78,6 +80,7 @@ int write_rdram_dram(void* opaque, uint32_t address, uint32_t value, uint32_t ma
     uint32_t addr            = RDRAM_DRAM_ADDR(address);
 
     ri->rdram.dram[addr] = MASKED_WRITE(&ri->rdram.dram[addr], value, mask);
+    NEIL_RD_MARK1(addr << 2);
 
     return 0;
 }

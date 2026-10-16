@@ -36,6 +36,7 @@
 
 #include <string.h>
 #include "main/lfb_hook.h"   /* glide's lazy framebuffer copy: LFB_TOUCH before RDRAM is used */
+#include "main/neil_rddirty.h"   /* RDRAM write tracking for the raw fast save */
 
 enum
 {
@@ -129,6 +130,8 @@ static void dma_pi_write(struct pi_controller *pi)
    const uint8_t* rom;
 
    LFB_TOUCH(pi->regs[PI_DRAM_ADDR_REG], (pi->regs[PI_WR_LEN_REG] & 0xFFFFFF) + 8);
+   /* every path below (cart ROM, SRAM, FlashRAM, 64DD) writes within this range */
+   neil_rd_mark(pi->regs[PI_DRAM_ADDR_REG], (pi->regs[PI_WR_LEN_REG] & 0xFFFFFF) + 8);
 
    if (pi->regs[PI_CART_ADDR_REG] < 0x10000000 && !(pi->regs[PI_CART_ADDR_REG] >= 0x06000000 && pi->regs[PI_CART_ADDR_REG] < 0x08000000))
    {

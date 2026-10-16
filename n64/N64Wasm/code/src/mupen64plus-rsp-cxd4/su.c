@@ -26,6 +26,7 @@ u32 inst_word;
 u32 SR[32];
 typedef VECTOR_OPERATION(*p_vector_func)(v16, v16);
 
+#include "../mupen64plus-core/src/main/neil_rddirty.h"   /* RDRAM write tracking for the raw fast save */
 pu8 DRAM;
 pu8 DMEM;
 pu8 IMEM;
@@ -260,6 +261,8 @@ void SP_DMA_WRITE(void)
     ++length;
     ++count;
     skip += length;
+    /* every offD below lies in [CR1 & ~7, CR1 + count*skip): main/neil_rddirty.h */
+    neil_rd_mark(*CR[0x1] & 0x00FFFFF8ul, count * skip + 8);
     do {
         register unsigned int i;
 

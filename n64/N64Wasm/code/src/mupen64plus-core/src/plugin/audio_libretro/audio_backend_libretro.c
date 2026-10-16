@@ -28,6 +28,7 @@
 #include "plugin/plugin.h"
 #include "ri/ri_controller.h"
 #include "vi/vi_controller.h"
+#include "main/neil_rddirty.h"   /* RDRAM write tracking for the raw fast save */
 
 #include <stdio.h>
 #include <stddef.h>
@@ -141,6 +142,13 @@ static void aiLenChanged(void* user_data, const void* buffer, size_t size)
    int16_t *raw_data = (int16_t*)buffer;
    size_t frames     = size / 4;
    uint8_t *p        = (uint8_t*)buffer;
+
+   /* THE SWAP BELOW WRITES RDRAM: `buffer` is the AI's DMA source in RDRAM (see the AI_DRAM_ADDR
+    * note below), swapped in place — guest-visible, so a raw fast save must copy these pages
+    * (main/neil_rddirty.h). Found by ?rdtrack=check on SM64: every stale page held this buffer
+    * with each pair of halfwords swapped. */
+   if (p >= (uint8_t*)g_dev.ri.rdram.dram && p < (uint8_t*)g_dev.ri.rdram.dram + RDRAM_MAX_SIZE)
+      neil_rd_mark((uint32_t)(p - (uint8_t*)g_dev.ri.rdram.dram), (uint32_t)size);
 
    for (i = 0; i < size; i += 4)
    {

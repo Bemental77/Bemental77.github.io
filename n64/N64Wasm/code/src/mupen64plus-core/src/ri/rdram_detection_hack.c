@@ -27,6 +27,7 @@
 #include "si/si_controller.h"
 
 #include <stdint.h>
+#include "main/neil_rddirty.h"   /* RDRAM write tracking for the raw fast save */
 
 /* HACK: force detected RDRAM size
  * This hack is triggered just before initial ROM loading (see pi_controller.c)
@@ -40,4 +41,5 @@ void force_detected_rdram_size_hack(void)
         : 0x3f0;
 
     g_dev.ri.rdram.dram[address/4] = g_dev.ri.rdram.dram_size;
+    neil_rd_mark(address, 4);
 }

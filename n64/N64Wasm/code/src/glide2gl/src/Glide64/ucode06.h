@@ -956,6 +956,7 @@ static void DrawYUVImageToFrameBuffer(uint16_t ul_x, uint16_t ul_y, uint16_t lr_
    mb   = (uint32_t*)(gfx_info.RDRAM + g_gdp.ti_address); //pointer to the first macro block
    dst  = (uint16_t*)(gfx_info.RDRAM + gDP.colorImage.address);
    dst += ul_x + ul_y * ci_width;
+   neil_rd_mark(gDP.colorImage.address + 2 * (ul_x + ul_y * ci_width), 2 * (16 * ci_width + 16));   /* RDRAM write tracking: main/neil_rddirty.h */
 
    /* YUV macro block contains 16x16 texture. 
     * we need to put it in the proper place inside cimg */

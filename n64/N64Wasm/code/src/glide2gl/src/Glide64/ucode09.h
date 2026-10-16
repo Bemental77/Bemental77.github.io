@@ -490,6 +490,7 @@ static void uc9_movemem(uint32_t w0, uint32_t w1)
          else
          {
             int dmem_addr = (idx<<3) + ofs;
+            neil_rd_mark(addr, len);   /* RDRAM write tracking: main/neil_rddirty.h */
             memcpy(gfx_info.RDRAM + addr, gfx_info.DMEM + dmem_addr, len);
          }
          break;

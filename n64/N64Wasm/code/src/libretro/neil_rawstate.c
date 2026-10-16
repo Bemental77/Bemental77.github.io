@@ -83,6 +83,8 @@
 #include "pi/pi_controller.h"
 #include "libretro_memory.h"
 #include "../mupen64plus-core/src/main/lfb_hook.h"
+#define NEIL_RD_INLINE 1   /* the one object that owns the marks (main/neil_rddirty.h) */
+#include "../mupen64plus-core/src/main/neil_rddirty.h"
 
 /* savestates.c */
 extern size_t savestates_m64p_last_len;
@@ -153,6 +155,94 @@ static int g_tlb_remapped_pages;  /* virtual pages the last such load invalidate
  * here moved the core's statics 4 KiB up, and the JIT's span corpora (dist/jit/) are keyed by those
  * host addresses (mips_emit.js A SHIPPED SPAN CORPUS) — every shipped corpus was rejected */
 static unsigned char* g_phys_chg;
+
+/* ---- RDRAM WRITE TRACKING (2026-10-16; main/neil_rddirty.h has the why and the writers) ----
+ * The block g_phys_chg points at grows a tail rather than a new static (a static moves the core's
+ * statics, and with them every shipped JIT corpus — bd3d7a9): the per-page epoch of RDRAM, the
+ * mode and the counters. Allocated at the first save or load, whichever comes first.
+ *   rd_ep[p]  the save epoch (neil_hid_epoch, shared with the hidden plane) in which page p was
+ *             last written: every save first FOLDS the mark bytes into it (mark -> current epoch,
+ *             mark cleared). A fast save into a buffer saved in epoch E copies exactly the pages
+ *             with rd_ep > E; every other page of that buffer already holds the live bytes.
+ *   rd_mode   0 = track (the default), 1 = CHECK: every page a fast save skips is compared with
+ *             live RDRAM, a difference is copied and counted (a writer that does not mark), 2 = OFF:
+ *             every save copies all of RDRAM, as before (the A/B arm; the marks still run).
+ * A raw LOAD marks exactly the pages whose bytes it changes (it compares them first), so the
+ * saves after a rollback copy what the rollback changed, not all 8 MiB per ring buffer. */
+struct neil_heapblk
+{
+   unsigned char phys_chg[RDRAM_MAX_SIZE >> 12];
+   uint32_t rd_ep[NEIL_RD_PAGES];
+   int rd_mode;
+   int st[12];  /* NEIL_RDST_* */
+};
+enum { NEIL_RDST_SAVES, NEIL_RDST_TRACKED, NEIL_RDST_COPIED_LAST, NEIL_RDST_COPIED, NEIL_RDST_MISSES,
+       NEIL_RDST_MISS_PAGE, NEIL_RDST_FULL, NEIL_RDST_LOAD_CHANGED, NEIL_RDST_MISS_AT, NEIL_RDST_MISS_WAS, NEIL_RDST_MISS_IS };
+
+static struct neil_heapblk* heapblk(void)
+{
+   struct neil_heapblk* b;
+   uint32_t p;
+   if (g_phys_chg)
+      return (struct neil_heapblk*)g_phys_chg;
+   b = (struct neil_heapblk*)calloc(1, sizeof(*b));
+   if (!b)
+      return NULL;
+   /* nothing is known about what was written before now: every page counts as written in
+    * the current epoch, so no buffer saved before can skip any of it */
+   for (p = 0; p < NEIL_RD_PAGES; p++)
+      b->rd_ep[p] = neil_hid_epoch;
+   b->st[NEIL_RDST_MISS_PAGE] = -1;
+   g_phys_chg = (unsigned char*)b;
+   return b;
+}
+
+/* mark bytes -> epochs (the current one), marks cleared */
+static void rd_fold(struct neil_heapblk* b)
+{
+   const uint32_t* w = (const uint32_t*)NEIL_RD_DIRTY;
+   unsigned char* d = NEIL_RD_DIRTY;
+   uint32_t i, k, ep = neil_hid_epoch;
+   for (i = 0; i < NEIL_RD_PAGES / 4; i++)
+   {
+      if (!w[i])
+         continue;
+      for (k = 0; k < 4; k++)
+         if (d[i * 4 + k])
+         {
+            b->rd_ep[i * 4 + k] = ep;
+            d[i * 4 + k] = 0;
+         }
+   }
+}
+
+/* every other object marks through this (main/neil_rddirty.h: only this one references invalid_code) */
+void neil_rd_mark_x(uint32_t off, uint32_t len) { neil_rd_mark(off, len); }
+
+/* 0 track (default), 1 check, 2 off; returns the mode now in force (-1: no memory for it) */
+int neil_state_set_rdtrack(int mode)
+{
+   struct neil_heapblk* b = heapblk();
+   if (!b)
+      return -1;
+   b->rd_mode = (mode == 1 || mode == 2) ? mode : 0;
+   return b->rd_mode;
+}
+/* 0 saves, 1 tracked fast saves, 2 pages the last save copied, 3 pages copied in all tracked saves,
+ * 4 misses (check mode), 5 the last missed page (-1 none), 6 saves that copied all of RDRAM,
+ * 7 pages the last raw load changed; 8 = the mode; 9 the last miss's first differing word (RDRAM
+ * offset), 10 its stale value (the buffer's), 11 its live value */
+int neil_state_rdtrack_stat(int i)
+{
+   struct neil_heapblk* b = (struct neil_heapblk*)g_phys_chg;
+   if (!b)
+      return i == 5 ? -1 : 0;
+   if (i == 8)
+      return b->rd_mode;
+   if (i >= 9 && i <= 11)
+      return b->st[i - 1];
+   return (i >= 0 && i < 8) ? b->st[i] : 0;
+}
 
 #define ALIGN8(x) (((x) + 7u) & ~7u)
 
@@ -252,10 +342,17 @@ static int save_raw(unsigned char* dst, int fast)
    struct neil_raw_hdr h, prev;
    unsigned char* p;
    uint32_t len, hid_changed_since = 0;
-   int lut_skip = 0, hid_partial = 0, ok;
+   int lut_skip = 0, hid_partial = 0, rd_skip = 0, ok;
+   struct neil_heapblk* blk;
 
    if (!dst)
       return 0;
+   blk = heapblk();
+   if (blk)
+   {
+      rd_fold(blk);
+      blk->st[NEIL_RDST_SAVES]++;
+   }
    if (fast)
    {
       /* Fast only into a buffer THIS instance fully wrote as a raw state and
@@ -271,13 +368,51 @@ static int save_raw(unsigned char* dst, int fast)
          lut_skip = (prev.tlb_gen == neil_tlb_gen);
          hid_partial = 1;
          hid_changed_since = prev.hid_epoch;
+         /* RDRAM: only once its place in the stream is proven (g_dram_off_ok, by a full save) */
+         rd_skip = blk && blk->rd_mode != 2 && g_dram_off_ok == 1;
       }
    }
-   savestates_skip_tlb_luts = lut_skip;
+   savestates_skip_tlb_luts = lut_skip | (rd_skip ? 2 : 0);
    ok = savestates_save_m64p(dst, NEIL_M64P_REGION);
    savestates_skip_tlb_luts = 0;
    if (!ok)
       return 0;
+   if (rd_skip)
+   {
+      /* the pages written since this buffer's own save; in check mode every other page is
+       * compared with live RDRAM too — a difference is a writer that did not mark */
+      const unsigned char* d = (const unsigned char*)g_dev.ri.rdram.dram;
+      unsigned char* img = dst + NEIL_M64P_DRAM_OFF;
+      uint32_t pg, n = 0;
+      for (pg = 0; pg < NEIL_RD_PAGES; pg++)
+      {
+         if (blk->rd_ep[pg] > hid_changed_since)
+         {
+            memcpy(img + (pg << 12), d + (pg << 12), 4096);
+            n++;
+         }
+         else if (blk->rd_mode == 1 && memcmp(img + (pg << 12), d + (pg << 12), 4096) != 0)
+         {
+            uint32_t o = 0;
+            while (o < 4096 && img[(pg << 12) + o] == d[(pg << 12) + o]) o++;
+            o &= ~3u;
+            blk->st[NEIL_RDST_MISSES]++;
+            blk->st[NEIL_RDST_MISS_PAGE] = (int)pg;
+            blk->st[NEIL_RDST_MISS_AT] = (int)((pg << 12) + o);
+            memcpy(&blk->st[NEIL_RDST_MISS_WAS], img + (pg << 12) + o, 4);
+            memcpy(&blk->st[NEIL_RDST_MISS_IS], d + (pg << 12) + o, 4);
+            memcpy(img + (pg << 12), d + (pg << 12), 4096);
+         }
+      }
+      blk->st[NEIL_RDST_TRACKED]++;
+      blk->st[NEIL_RDST_COPIED_LAST] = (int)n;
+      blk->st[NEIL_RDST_COPIED] += (int)n;
+   }
+   else if (blk)
+   {
+      blk->st[NEIL_RDST_FULL]++;
+      blk->st[NEIL_RDST_COPIED_LAST] = (int)NEIL_RD_PAGES;
+   }
    len = (uint32_t)savestates_m64p_last_len;
    if (len + 1024u > NEIL_M64P_REGION)
       return 0; /* cannot happen with a 16-node queue; refuse rather than overrun */
@@ -468,8 +603,7 @@ int neil_state_load_raw(const unsigned char* src)
       lut_same = 1;
       g_tlb_same_by_content++;
    }
-   if (!g_phys_chg)
-      g_phys_chg = (unsigned char*)malloc(RDRAM_MAX_SIZE >> 12);
+   heapblk();
    if (g_phys_chg)
       memset(g_phys_chg, 0, RDRAM_MAX_SIZE >> 12);
    if (lut_same && g_dram_off_ok == 1)
@@ -495,6 +629,21 @@ int neil_state_load_raw(const unsigned char* src)
       savestates_keep_code_cache = 0;
    }
    savestates_skip_tlb_luts = lut_same;
+   if (g_phys_chg && g_dram_off_ok == 1)
+   {
+      /* RDRAM WRITE TRACKING: the load writes exactly the pages whose bytes differ */
+      const unsigned char* cur = (const unsigned char*)g_dev.ri.rdram.dram;
+      const unsigned char* img = src + NEIL_M64P_DRAM_OFF;
+      uint32_t pg, n = 0;
+      for (pg = 0; pg < NEIL_RD_PAGES; pg++)
+         if (memcmp(cur + (pg << 12), img + (pg << 12), 4096) != 0)
+         {
+            NEIL_RD_DIRTY[pg] = 1;
+            n++;
+         }
+      ((struct neil_heapblk*)g_phys_chg)->st[NEIL_RDST_LOAD_CHANGED] = (int)n;
+      savestates_skip_tlb_luts |= 2;
+   }
 
    /* RDRAM is replaced: glide's queued framebuffer copies belong to the old
     * one. A rollback puts back the snapshot's own queue (fbasync.js restore ->

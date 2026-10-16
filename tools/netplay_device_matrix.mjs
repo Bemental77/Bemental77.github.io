@@ -552,6 +552,10 @@ function preloadSrc(cfg) {
       lt: M.lt.n, ltMs: Math.round(M.lt.ms),
       ad: (() => { const d = window.__audioDiag; return d ? { p: d.framesProduced, c: d.framesConsumed, u: d.underruns == null ? null : d.underruns, uf: d.underrunFrames, df: d.droppedFrames, fill: d.fill } : null; })(),
       // lib/cart_audio.js's sink counters (gba/snes/genesis), page-native.
+      // n64/audio-worklet.js's own report (n64/index.html window.__audioDbg): u = dry calls of the
+      // sink (a real underrun: the queue ran out), m = silenced entries, b = backlog. The tap above
+      // counts EVERY run of all-zero quanta, which a game's own digital silence also produces.
+      sk: (() => { const d = window.__audioDbg; return d && typeof d.u === 'number' ? { u: d.u, m: d.m, b: d.b } : null; })(),
       ca: (() => { const c = window.__cartAudio; return c ? { rx: c.rxFrames, u: c.underruns, m: c.missingFrames, o: c.overflowFrames, b: c.backlog, mode: c.mode } : null; })(),
       // THE CAPACITY GATE'S INPUTS, as this engine sees them (lib/netplay.js
       // _capDecide): its own step (st), steps per frame (rs), corrections per
@@ -1364,12 +1368,34 @@ function analysePlayer(d, peerRole) {
   const secs = W.length;
   r.hz = +(+hz).toFixed(3);
   r.engineX = secs ? +(W.reduce((a, w) => a + w.x, 0) / secs).toFixed(4) : null;
-  let maxWin5 = 0;
-  for (let i = 0; i + 5 <= W.length; i++) { const s = W.slice(i, i + 5).reduce((a, w) => a + w.x, 0) / 5; if (s > maxWin5) maxWin5 = s; }
+  // A 5-s ENGINE WINDOW IS 5 s OF WALL TIME, NOT FIVE SAMPLES (2026-10-16). `ready` is the frames
+  // counted between two ticks of this rig's 1-s setInterval; dividing five of them by 5 s assumed the
+  // ticks were exactly 1 s apart. They are not under load, and on n64 the count itself is the page's
+  // mirror of the worker's report (<= 100 ms old), so a window could close on a fresh mirror after
+  // opening on a stale one. MEASURED (live n64 x a after PR 267, load 9.9): this reading said a host
+  // window ran at 1.032x while the room's own timestamped frame clock (witnessCum, below) held under
+  // the 1.02 ceiling. Each window now runs from sample i to the first sample >= 5000 ms later and
+  // divides the frames counted in between by the time actually elapsed (the witness rule, 4ed89e7).
+  // Samples whose hz changed were dropped above, so a window never spans a dropped sample.
+  const winRate = (i, j) => { let f = 0; for (let k = i + 1; k <= j; k++) f += W[k].ready / (+W[k].hz || +hz); return f / Math.max(1e-3, (W[j].t - W[i].t) / 1000); };
+  const contiguous = (i, j) => W[j].t - W[i].t < 1500 * (j - i) + 1500;
+  let maxWin5 = 0, minWin5 = Infinity;
+  for (let i = 0, j = 0; i < W.length; i++) {
+    if (j <= i) j = i + 1;
+    while (j < W.length && W[j].t - W[i].t < 5000) j++;
+    if (j >= W.length) break;
+    if (!contiguous(i, j)) continue;
+    const v = winRate(i, j); if (v > maxWin5) maxWin5 = v; if (v < minWin5) minWin5 = v;
+  }
   r.maxWin5 = +maxWin5.toFixed(4);
-  let minWin5 = Infinity;
-  for (let i = 0; i + 5 <= W.length; i++) { const s = W.slice(i, i + 5).reduce((a, w) => a + w.x, 0) / 5; if (s < minWin5) minWin5 = s; }
   r.minWin5 = minWin5 === Infinity ? null : +minWin5.toFixed(4);
+  // the old five-samples reading, kept beside it as a diagnostic only (never judged)
+  let m5s = null; for (let i = 0; i + 5 <= W.length; i++) { const v = W.slice(i, i + 5).reduce((a, w) => a + w.x, 0) / 5; if (m5s == null || v > m5s) m5s = v; }
+  r.maxWin5Samples = m5s == null ? null : +m5s.toFixed(4);
+  // the sink's own underruns over the measured window (n64: audio-worklet.js), next to the tap's dropouts
+  const SK = W.filter((w) => w.sk);
+  r.sink = SK.length >= 2 ? { underruns: SK[SK.length - 1].sk.u - SK[0].sk.u, missing: SK[SK.length - 1].sk.m - SK[0].sk.m,
+                              backlogMin: Math.min(...SK.map((w) => w.sk.b)), backlogEnd: SK[SK.length - 1].sk.b } : null;
   const wit = W.map((w) => w.witness).filter((x) => typeof x === 'number' && isFinite(x));
   r.witnessX = wit.length ? +(wit.reduce((a, b) => a + b, 0) / wit.length).toFixed(4) : null;
   r.witnessMax = wit.length ? +Math.max(...wit).toFixed(4) : null;
@@ -1602,7 +1628,7 @@ if (flag('rejudge', '')) {
         say(`  => ${cell.void ? 'VOID (load ' + maxLoad + ')' : (v.pass ? 'PASS' : ((v.nonRateFailures || v.why).length === 0 && (v.boxLimited || v.deviceLimited) ? (v.boxLimited ? 'BOX-LIMITED' : 'DEVICE-LIMITED') : 'FAIL'))} ${v.deviceLimited ? '[device: ' + v.deviceLimited + '] ' : ''}${v.boxLimited ? '[box: ' + v.boxLimited + '] ' : ''}${v.why.join(' · ')}`);
         if (cell.analysis) for (const k of Object.keys(cell.analysis)) {
           const a = cell.analysis[k]; if (!a) continue;
-          say(`     ${k.padEnd(6)} engine ${a.engineX}x (5s ${a.minWin5}..${a.maxWin5}) witness ${a.witnessX} fc ${a.frameCounterX} · stalls ${a.stalls}/${a.stallMs}ms on ${JSON.stringify(a.waitedOn)} · delay ${a.delayNow} [${a.delayChanges.join(' ')}] · lat ${JSON.stringify(a.latFrames)} · modes ${(a.capModes || []).map((c) => c.mode + ' ' + c.s + 's@' + c.x + 'x').join(' -> ') || '-'} · audio ${JSON.stringify(a.audio)} · hashes ${a.hashesCompared} · relay ${a.relay} · err ${a.errors}/${a.consoleErrors}`);
+          say(`     ${k.padEnd(6)} engine ${a.engineX}x (5s ${a.minWin5}..${a.maxWin5}) witness ${a.witnessX} fc ${a.frameCounterX} · stalls ${a.stalls}/${a.stallMs}ms on ${JSON.stringify(a.waitedOn)} · delay ${a.delayNow} [${a.delayChanges.join(' ')}] · lat ${JSON.stringify(a.latFrames)} · modes ${(a.capModes || []).map((c) => c.mode + ' ' + c.s + 's@' + c.x + 'x').join(' -> ') || '-'} · audio ${JSON.stringify(a.audio)} · sink ${JSON.stringify(a.sink)} · wit5 ${a.witnessMinWin5}..${a.witnessMaxWin5} (5-sample engine ${a.maxWin5Samples}) · hashes ${a.hashesCompared} · relay ${a.relay} · err ${a.errors}/${a.consoleErrors}`);
           if (a.relayInfo || a.rb || a.ice) say(`     ${k.padEnd(6)} relay ${JSON.stringify(a.relayInfo || null)} · rb ${JSON.stringify(a.rb || null)} · ice ${JSON.stringify(a.ice || null)} · sig ${a.sig || '-'} · chip ${JSON.stringify(a.chip || null)}`);
           const shots = (cell.shots && cell.shots[k]) || [];
           say(`     ${k.padEnd(6)} canvas ${shots.map((s) => (s.showing ? 'OK' : 'BLANK') + '(' + s.litFrac + '/' + s.colours + ')').join(' ')}`);

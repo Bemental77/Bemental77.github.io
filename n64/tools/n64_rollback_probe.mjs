@@ -567,6 +567,10 @@ try {
     if (!room.ranWith || !Object.keys(room.ranWith).length)   // (no run tap: the ring's images, as before)
       room.ranWith = await page.evaluate(() => window.__n64Worker.eval('(function (R) { var o = {}; if (!R || !R.RB) return o; for (var j = 0; j < R.RB.imgF.length; j++) { var f = R.RB.imgF[j], im = R.RB.img[j]; if (f >= 0 && im) o[f] = Array.prototype.slice.call(im); } return o; })(self.RM && self.RM.R)'));
   } else if (CIN) room.cinStat = await page.evaluate(() => window.__cinStat || null);
+  // RDRAM WRITE TRACKING (core_worker.js; the core's neil_state_rdtrack_stat): how the ring's fast saves
+  // copied RDRAM, and in check mode (--weval 'Module._neil_state_set_rdtrack(1)' or ?rdtrack=check)
+  // how many skipped pages differed from live RDRAM — a writer that does not mark
+  if (out.worker) out.rdtrack = await page.evaluate(() => window.__n64Worker.eval('self.__n64RdStat ? self.__n64RdStat() : null')).catch((e) => ({ err: String(e) }));
   Object.assign(out, {
     mode: z.mode, roomRate: +((z.frame - a.frame) / secs / (z.viHz || 50)).toFixed(4),
     secsBelow99: tl.filter((x) => x.rate < 0.99).length,
@@ -796,6 +800,14 @@ if (out.ranWithFinal && out.ranWithFinal.of > 0) {
   const W = out.ranWithFinal;
   if (W.wrongN > 0) bad('every confirmed frame last ran on the room\'s core with its final input', JSON.stringify(W));
   else if (W.checked > 0) ok('every confirmed frame last ran on the room\'s core with its final input', W.checked + ' frames');
+}
+if (out.rdtrack && out.rdtrack.core !== false && !out.rdtrack.err) {
+  const T = out.rdtrack, line = `${T.saves} saves, ${T.tracked} tracked (${T.copied} pages copied, ${T.tracked ? (T.copied / T.tracked).toFixed(1) : '-'} a save of 2048), ${T.full} full; last load changed ${T.loadChanged}`;
+  if (T.mode === 1) {
+    if (T.misses > 0) bad('RDRAM write tracking: every page a fast save skipped equals live RDRAM', `${T.misses} stale pages (last ${T.missPage}); ${line}`);
+    else if (T.tracked > 0) ok('RDRAM write tracking: every page a fast save skipped equals live RDRAM (check mode)', line);
+    else bad('RDRAM write tracking check VOID: no tracked save ran', line);
+  } else console.log('  INFO  RDRAM write tracking (mode ' + T.mode + '): ' + line);
 }
 if (out.engineState === 'desync' || out.engineState === 'failed' || out.fault) bad('engine state', out.engineState + ' ' + (out.fault || out.error || ''));
 if (out.picsStraight) {
