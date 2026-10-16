@@ -516,7 +516,32 @@ var FS_RESERVE = 128 * 1048576;
 var FS_MAXAGE = 16;               // a snapshot older than this many fields is resolved by a re-run now (?fskipage=N)
 var FS_IDLE = 3;                  // ?fskipidle=N (0 = off): a stale window past the title's cadence is resolved now
 function fsGapMax() { var m = 0; for (var i = 0; i < 16; i++) if (FSK.gaps[i] > m) m = FSK.gaps[i]; return m; }
+// ---- RDRAM WRITE TRACKING (2026-10-16) ----
+// A snapshot (neil_state_save_raw_fast into a pool buffer) copies only the RDRAM pages written since
+// that buffer's own save: every RDRAM writer in the core marks its pages (code/src/mupen64plus-core/
+// src/main/neil_rddirty.h), and so does every native store the JIT emits (mips_emit.js rdMarkBytes).
+// ?rdtrack=0 = the A/B arm: every snapshot copies all 8 MiB again AND the JIT emits no marks (one
+// arm — never one without the other). ?rdtrack=check = the exactness arm: every page a snapshot
+// skips is compared with live RDRAM; a difference (a writer that does not mark) is copied and
+// counted — self.__n64RdStat().misses must stay 0. The mode is handed to the core right before the
+// first snapshot, so an arm moves the heap at the same moment the default does.
+var RD_STAT_NAMES = ['saves', 'tracked', 'copiedLast', 'copied', 'misses', 'missPage', 'full', 'loadChanged', 'mode', 'missAt', 'missWas', 'missIs'];
+self.__n64RdStat = function () {
+  var o = { want: FSK.rdMode | 0 };
+  if (!M || typeof M._neil_state_rdtrack_stat !== 'function') { o.core = false; return o; }
+  for (var i = 0; i < RD_STAT_NAMES.length; i++) o[RD_STAT_NAMES[i]] = M._neil_state_rdtrack_stat(i) | 0;
+  return o;
+};
+// ?rdtrack=check: a skipped page that differed is said at once, and a summary every 256 snapshots
+function fsRdCheckSay() {
+  var T = self.__n64RdStat();
+  if (T.misses > (FSK.rdMissSaid | 0)) { FSK.rdMissSaid = T.misses; log('[rdtrack] ⚠ ' + T.misses + ' RDRAM pages a fast save skipped differed from live RDRAM (last at 0x' + (T.missAt >>> 0).toString(16) + ': 0x' + (T.missWas >>> 0).toString(16) + ' in the snapshot, 0x' + (T.missIs >>> 0).toString(16) + ' live) — a writer that does not mark'); }
+  if ((T.saves & 255) === 0) log('[rdtrack] check: ' + T.saves + ' saves, ' + T.tracked + ' tracked, ' + (T.tracked ? (T.copied / T.tracked).toFixed(1) : '-') + ' pages copied a save of 2048, ' + T.misses + ' misses');
+}
 function fsInstall(search) {
+  var qr = new URLSearchParams(search || '').get('rdtrack');
+  FSK.rdMode = qr === '0' ? 2 : qr === 'check' ? 1 : 0;
+  if (FSK.rdMode === 2) self.__jitNoRdMark = true;   // read by mips_emit.js jitFlags(): every module, the corpus's too
   var q = new URLSearchParams(search || '').get('fskip');
   if (q === '0') { FSK.on = false; FSK.why = 'off (?fskip=0)'; }
   else if (q && /^force:\d+$/.test(q)) { FSK.force = Math.max(2, +q.slice(6)); FSK.why = 'rig: skip all but 1 of ' + FSK.force + ' fields'; }
@@ -669,7 +694,9 @@ function fsWarmStep(slack) {
 function fsSnap(s) {
   var p = fsAlloc(); if (!p) return false;
   var t0 = performance.now();
+  if (FSK.rdMode && !FSK.rdSet && typeof M._neil_state_set_rdtrack === 'function') { FSK.rdSet = true; M._neil_state_set_rdtrack(FSK.rdMode); }
   if (!(M._neil_state_save_raw_fast(p) | 0)) { FSK.pool.push(p); return false; }
+  if (FSK.rdMode === 1) fsRdCheckSay();
   if (FSK.gsize) M._neil_gl_state_save(p + FSK.size);
   var fbs = self.__fbAsync && self.__fbAsync.snapshot ? self.__fbAsync.snapshot() : null;
   // glide's rand() (lazy_fb.c): a re-run must draw the same noise a run that never re-ran draws

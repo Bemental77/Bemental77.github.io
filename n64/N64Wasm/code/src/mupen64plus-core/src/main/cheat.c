@@ -60,6 +60,7 @@ typedef struct cheat
 } cheat_t;
 
 #include "lfb_hook.h"
+#include "neil_rddirty.h"   /* RDRAM write tracking for the raw fast save */
 
 /* Local variables */
 static LIST_HEAD(active_cheats);
@@ -81,12 +82,14 @@ static uint8_t read_address_8bit(unsigned int address)
 static void update_address_16bit(unsigned int address, unsigned short new_value)
 {
     LFB_TOUCH(address, 2);   /* glide's lazy framebuffer copy: these bytes first */
+    neil_rd_mark(address, 2);
     *(uint16_t *)(((uint8_t*)g_dev.ri.rdram.dram + ((address & 0xFFFFFF)^S16))) = new_value;
 }
 
 static void update_address_8bit(unsigned int address, unsigned char new_value)
 {
     LFB_TOUCH(address, 1);   /* glide's lazy framebuffer copy: these bytes first */
+    neil_rd_mark(address, 1);
      *(uint8_t *)(((uint8_t*)g_dev.ri.rdram.dram + ((address & 0xFFFFFF)^S8))) = new_value;
 }
 

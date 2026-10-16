@@ -49,6 +49,7 @@
 #include "../si/si_controller.h"
 #include "../vi/vi_controller.h"
 #include "osal/preproc.h"
+#include "neil_rddirty.h"   /* RDRAM write tracking for the raw fast save */
 
 static const char* savestate_magic = "M64+SAVE";
 static const int savestate_latest_version = 0x00010000;  /* 1.0 */
@@ -67,7 +68,9 @@ size_t savestates_m64p_last_len = 0;
 int savestates_keep_code_cache = 0;
 /* When nonzero the loader (or saver) skips the two 4 MiB TLB lookup tables:
  * the raw code sets it only when neil_tlb_gen proves the destination already
- * holds identical bytes. 0 (the default) = the shipped behaviour. */
+ * holds identical bytes. 0 (the default) = the shipped behaviour.
+ * Bit 1 (2), saver only: skip the RDRAM image too — neil_rawstate.c's fast save
+ * then writes exactly the pages main/neil_rddirty.h says changed. */
 int savestates_skip_tlb_luts = 0;
 extern uint32_t neil_tlb_gen; /* r4300/tlb.c */
 /* Where the TLB lookup tables and the 32 TLB entries sit in the m64p stream
@@ -238,6 +241,10 @@ int savestates_load_m64p(const unsigned char *data, size_t size)
    g_dev.dp.dps_regs[DPS_BUFTEST_DATA_REG] = GETDATA(curr, uint32_t);
 
    COPYARRAY(g_dev.ri.rdram.dram, curr, uint32_t, RDRAM_MAX_SIZE/4);
+   /* RDRAM was replaced. Bit 1 (2): the raw loader (neil_rawstate.c) has marked exactly the
+    * pages that differ, before this copy (main/neil_rddirty.h). */
+   if (!(savestates_skip_tlb_luts & 2))
+      neil_rd_mark_all();
    COPYARRAY(g_dev.sp.mem, curr, uint32_t, SP_MEM_SIZE/4);
    COPYARRAY(g_dev.si.pif.ram, curr, uint8_t, PIF_RAM_SIZE);
 
@@ -247,7 +254,7 @@ int savestates_load_m64p(const unsigned char *data, size_t size)
    g_dev.pi.flashram.erase_offset = GETDATA(curr, unsigned int);
    g_dev.pi.flashram.write_pointer = GETDATA(curr, unsigned int);
 
-   if (savestates_skip_tlb_luts)
+   if (savestates_skip_tlb_luts & 1)
    {
       /* raw loader proved (neil_tlb_gen) the LUTs are already these bytes */
       curr += 2 * 0x100000 * sizeof(unsigned int);
@@ -530,7 +537,16 @@ int savestates_save_m64p(unsigned char *data, size_t size)
    PUTDATA(curr, uint32_t, g_dev.dp.dps_regs[DPS_BUFTEST_ADDR_REG]);
    PUTDATA(curr, uint32_t, g_dev.dp.dps_regs[DPS_BUFTEST_DATA_REG]);
 
-   PUTARRAY(g_dev.ri.rdram.dram, curr, uint32_t, RDRAM_MAX_SIZE/4);
+   if (savestates_skip_tlb_luts & 2)
+   {
+      /* raw fast save (neil_rawstate.c): the caller copies only the RDRAM pages written since
+       * this buffer's own save (main/neil_rddirty.h); the rest already hold these bytes */
+      curr += RDRAM_MAX_SIZE;
+   }
+   else
+   {
+      PUTARRAY(g_dev.ri.rdram.dram, curr, uint32_t, RDRAM_MAX_SIZE/4);   /* two statements: braces */
+   }
    PUTARRAY(g_dev.sp.mem, curr, uint32_t, SP_MEM_SIZE/4);
    PUTARRAY(g_dev.si.pif.ram, curr, uint8_t, PIF_RAM_SIZE);
 
@@ -541,7 +557,7 @@ int savestates_save_m64p(unsigned char *data, size_t size)
    PUTDATA(curr, unsigned int, g_dev.pi.flashram.write_pointer);
 
    neil_m64p_lut_off = (size_t)(curr - (unsigned char*)data);
-   if (savestates_skip_tlb_luts)
+   if (savestates_skip_tlb_luts & 1)
    {
       /* raw fast save: the destination already holds these exact bytes */
       curr += 2 * 0x100000 * sizeof(unsigned int);

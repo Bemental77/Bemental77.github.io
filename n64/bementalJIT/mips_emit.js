@@ -1077,6 +1077,25 @@
     );
   }
 
+  // ---- RDRAM WRITE TRACKING (2026-10-16) ----
+  // The core's raw fast save copies only the RDRAM pages written since a ring buffer's own
+  // save (n64/N64Wasm/code/src/mupen64plus-core/src/main/neil_rddirty.h), so EVERY writer
+  // marks the 4 KiB pages it writes — the interpreter in write_rdram_dram, and a native store
+  // here: dirty[(a >> 12) & 0x7FF] = 1. The 2048 mark bytes live at invalid_code + 0x80800
+  // (indices no guest code can occupy: the KSEG0 view of physical 8-16 MiB, unmapped on the
+  // N64), so the address comes from p.invalidCode — no new param, and the shipped span corpora
+  // (keyed by the param block) still match. `extra` adds an offset first (SD/SDC1: the second
+  // word's page). Off only with ?rdtrack=0 (core_worker.js), which also turns the core's
+  // tracking off — the two are one arm, never mixed (an unmarked store with tracking ON would
+  // be a stale page in a snapshot).
+  function rdMarkBytes(p, extra) {
+    if (typeof window !== 'undefined' && window.__jitNoRdMark) return [];
+    var a = [OP.local_get, L_ADDR];
+    if (extra) a = a.concat([OP.i32_const], sleb(extra), [OP.i32_add]);
+    return a.concat([OP.i32_const, 0x0C, OP.i32_shr_u, OP.i32_const], sleb(0x7FF),
+      [OP.i32_and, OP.i32_const, 0x01, OP.i32_store8, 0x00], leb((p.invalidCode + 0x80800) >>> 0));
+  }
+
   // CHECK_MEMORY mirror (cached_interp.c): if (!invalid_code[a>>12]) and the
   // page block instr at (a&0xFFF)/4 has ops != NOTCOMPILED, mark the page
   // invalid; blocks[x] dereferenced only under invalid_code[x]==0.
@@ -1228,7 +1247,7 @@
         [OP.i32_store, 0x02], leb(p.dramBase)
       );
     }
-    var checkMemory = checkMemoryBytes(p);
+    var checkMemory = [].concat(rdMarkBytes(p, 0), op === 0x3F ? rdMarkBytes(p, 7) : [], checkMemoryBytes(p));
     if (COLD) {
       // LEAN CODE: as emitLoad — `if (table != rdram) cold; fast` (the cold arm never continues)
       return [].concat(
@@ -1698,14 +1717,14 @@
         [OP.i64_or, OP.i64_store, 0x03, 0x00]);
     } else if (op === 0x39) { // SWC1: dram word = *(u32*)simple[ft]; CHECK_MEMORY
       tableBase = p.writememW; cmpVal = p.wrRdram;
-      fast = wordOff.concat(fprPtr(p.cp1Simple, ft), [OP.i32_load, 0x02, 0x00], [OP.i32_store, 0x02], leb(p.dramBase), checkMemoryBytes(p));
+      fast = wordOff.concat(fprPtr(p.cp1Simple, ft), [OP.i32_load, 0x02, 0x00], [OP.i32_store, 0x02], leb(p.dramBase), rdMarkBytes(p, 0), checkMemoryBytes(p));
     } else {                  // SDC1: dram[a]=hi32(v), dram[a+4]=lo32(v); CHECK_MEMORY
       tableBase = p.writememD; cmpVal = p.wrRdramD;
       fast = [].concat(
         fprPtr(p.cp1Double, ft), [OP.i64_load, 0x03, 0x00, OP.local_set], leb(L_I64S),
         wordOff, [OP.local_get].concat(leb(L_I64S), [OP.i64_const], sleb(32), [OP.i64_shr_u, OP.i32_wrap_i64]), [OP.i32_store, 0x02], leb(p.dramBase),
         word4Off, [OP.local_get].concat(leb(L_I64S), [OP.i32_wrap_i64]), [OP.i32_store, 0x02], leb(p.dramBase),
-        checkMemoryBytes(p));
+        rdMarkBytes(p, 0), rdMarkBytes(p, 7), checkMemoryBytes(p));
     }
     var nat = COLD
       // LEAN CODE: as emitLoad — `if (table != rdram) cold; fast` (the cold arm never continues)
@@ -1976,9 +1995,15 @@
     }
   }
   function jitFlags() {
-    return { noFP: !!(typeof window !== 'undefined' && window.__jitNoFP), noLabels: !!(typeof window !== 'undefined' && window.__jitNoLabels),
-             pin: pinOn(), cold: coldOn(), chain: chainOn() };
+    var f = { noFP: !!(typeof window !== 'undefined' && window.__jitNoFP), noLabels: !!(typeof window !== 'undefined' && window.__jitNoLabels),
+              pin: pinOn(), cold: coldOn(), chain: chainOn() };
+    if (typeof window !== 'undefined' && window.__jitNoRdMark) f.noRdMark = true;   // only in the ?rdtrack=0 arm
+    return f;
   }
+  // the flags a corpus is judged by: noRdMark (the ?rdtrack=0 arm) changes what the compile worker
+  // emits for EVERY job, the corpus's included (they are built with the live flags), not which
+  // spans exist — so it does not reject a corpus
+  function flagsKey(f) { var o = Object.assign({}, f); delete o.noRdMark; return JSON.stringify(o); }
   function asyncOffer(p, U, span, pageW0, pageN, keyArr) {
     var page = p.vaddr >>> 12, bp = U[(p.blocksBase >> 2) + page];
     var nOps = span + 2, ops = new Uint32Array(nOps);
@@ -2016,6 +2041,21 @@
   // A REJECTED CORPUS IS SAID OUT LOUD. The param block holds host addresses (statics, table
   // indices), so a core rebuild that moves the core's static data rejects every shipped corpus —
   // cb0d31a did, and nothing said so (warm.dropped only). Regenerate with n64/tools/n64_jit_corpus.mjs.
+  // A REJECTED CORPUS BUILDS NOTHING MORE (2026-10-16). The early start (warmEarly) runs relocInit
+  // with the CORPUS's own param block, before any live block is known; when the first real offer
+  // then rejects the corpus, RELOC still held it, and every later offer in a corpus page
+  // (relocObserve) sent that page's jobs out again — built from the corpus's static fields (pcGlobal,
+  // dramBase, ... of ANOTHER core build) with only entryPtr moved to the live block, so their keys
+  // matched and they went into the recompile cache: modules storing through stale host addresses.
+  // FOUND on a core rebuild that moved the statics 1 MiB (the rejection was logged, then the page
+  // hung: a ?jitcorpus=0 run and a ?jit=off run of the same build were fine). Now a rejection stops
+  // the relocation, drops what the compile worker still has queued and forgets the ids in flight.
+  function warmStopReloc() {
+    var R = RELOC;
+    R.C = null; R.q = []; if (R.pumpT) { clearTimeout(R.pumpT); R.pumpT = 0; }
+    WARM.ids.clear();
+    if (ASYNC.w) ASYNC.w.postMessage({ warmDrop: true });
+  }
   function warmSayDropped(why) {
     var g = (typeof globalThis !== 'undefined') ? globalThis : self, s = '[jit] ⚠ span corpus REJECTED (' + why + ') — made for another core build; regenerate it (n64/tools/n64_jit_corpus.mjs)';
     try { if (typeof g.log === 'function') g.log(s); else console.warn(s); } catch (e) {}
@@ -2024,7 +2064,7 @@
     var k;
     for (k in C.static) if (C.static[k] !== live.p[k]) return 'param ' + k;
     for (k in live.p) if (!WARM_PER_SPAN[k] && !(k in C.static)) return 'param ' + k + ' not in corpus';
-    if (JSON.stringify(C.flags) !== JSON.stringify(live.flags)) return 'flags';
+    if (flagsKey(C.flags) !== flagsKey(live.flags)) return 'flags';
     if ((C.tableBase | 0) !== (live.tableBase | 0)) return 'tableBase';
     return null;
   }
@@ -2041,6 +2081,7 @@
         // nothing it compiled was ever put where a span could find it: dropped, and the corpus is
         // judged again against the live block, as without an early start
         E.ok = false; E.why = why; E.held = []; WARM.ids.clear();
+        warmStopReloc();
         warmSayDropped('early start: ' + why);
         WARM.corpus = E.C; WARM.started = false; WARM.offered = 0;
       } else {
@@ -2062,7 +2103,7 @@
     C = WARM.corpus; WARM.corpus = null;
     if (WARM.started || !C) return; WARM.started = true;
     if (early) WARM.early = { ok: null, C: C, flags: live.flags, tableBase: live.tableBase, held: [], why: null, at: Date.now() };
-    else { why = warmCheck(C, live); if (why) { WARM.dropped = why; warmSayDropped(why); return; } }
+    else { why = warmCheck(C, live); if (why) { WARM.dropped = why; warmStopReloc(); warmSayDropped(why); return; } }
     relocInit(C, live);
     // a start at a real offer knows where the heap put that offer's block: the corpus goes out
     // already re-targeted to it (A CORPUS THAT FOLLOWS THE HEAP)
@@ -2360,6 +2401,7 @@
       return 0;
     } });
     window.__jitNoFP = job.flags.noFP; window.__jitNoLabels = job.flags.noLabels; window.__jitPin = job.flags.pin;
+    window.__jitNoRdMark = !!job.flags.noRdMark;
     EMIT_ONLY = { out: null, tableBase: job.tableBase | 0, cold: job.flags.cold !== false, chain: job.flags.chain === true,
                   batch: !!batchCtx, fnBase: batchCtx ? batchCtx.fnBase : 0, jt: !!(batchCtx && batchCtx.jt), part: null };
     TABLE_BASE = job.tableBase | 0;

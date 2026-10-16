@@ -505,6 +505,8 @@ static void colorimage_yoshis_story_memrect(uint16_t ul_x, uint16_t ul_y,
 
   if (lr_y > g_gdp.__clip.yl)
     lr_y = g_gdp.__clip.yl;
+  if (lr_y > ul_y)   /* RDRAM write tracking: main/neil_rddirty.h */
+    neil_rd_mark(gDP.colorImage.address + ul_x + ul_y * gDP.colorImage.width, (lr_y - ul_y) * gDP.colorImage.width + width);
 
   for (y = ul_y; y < lr_y; y++)
   {
@@ -529,6 +531,7 @@ static void colorimage_palette_modification(void)
    uint16_t prim16     = (uint16_t)((prmr << 11)|(prmg << 6)|(prmb << 1)|1);
    uint16_t *ptr_dst   = (uint16_t*)(gfx_info.RDRAM + gDP.colorImage.address);
 
+   neil_rd_mark(gDP.colorImage.address, 32);   /* RDRAM write tracking: main/neil_rddirty.h */
    for (i = 0; i < 16; i++)
       ptr_dst[i^1] = (rdp.pal_8[i]&1) ? prim16 : env16;
 }
@@ -544,6 +547,7 @@ static void colorimage_zbuffer_copy(uint32_t w0, uint32_t w1)
    uint16_t  *ptr_src = ((uint16_t*)g_gdp.tmem)+ul_u;
    uint16_t  *ptr_dst = (uint16_t*)(gfx_info.RDRAM + gDP.colorImage.address);
 
+   neil_rd_mark(gDP.colorImage.address, 2u * ((uint32_t)ul_x + width) + 4);   /* RDRAM write tracking: main/neil_rddirty.h */
    for (x = 0; x < width; x++)
    {
       uint16_t c = ptr_src[x];
@@ -1379,6 +1383,7 @@ static void rdp_setcolorimage(uint32_t w0, uint32_t w1)
                         CopyFrameBuffer (GR_BUFFER_BACKBUFFER);
                         rdp.fb_drawn = true;
                      }
+                     neil_rd_mark(cur_fb->addr, (cur_fb->width*cur_fb->height)<<cur_fb->size>>1);   /* RDRAM write tracking: main/neil_rddirty.h */
                      memcpy(gfx_info.RDRAM+cur_fb->addr,
                            gfx_info.RDRAM + gDP.colorImage.address,
                            (cur_fb->width*cur_fb->height)<<cur_fb->size>>1);
@@ -1386,6 +1391,7 @@ static void rdp_setcolorimage(uint32_t w0, uint32_t w1)
                }
             }
             else
+               neil_rd_mark(cur_fb->addr, cur_fb->width * cur_fb->height * g_gdp.fb_size);   /* RDRAM write tracking: main/neil_rddirty.h */
                memset(gfx_info.RDRAM+cur_fb->addr, 0, cur_fb->width * cur_fb->height * g_gdp.fb_size);
             rdp.skip_drawing = true;
             break;
@@ -1401,12 +1407,14 @@ static void rdp_setcolorimage(uint32_t w0, uint32_t w1)
             if (!rdp.motionblur || (settings.frame_buffer&fb_motionblur))
             {
                if (cur_fb->width == gDP.colorImage.width)
+                  neil_rd_mark(cur_fb->addr, (cur_fb->width*cur_fb->height)<<cur_fb->size>>1);   /* RDRAM write tracking: main/neil_rddirty.h */
                   memcpy(gfx_info.RDRAM+cur_fb->addr,
                         gfx_info.RDRAM+rdp.maincimg[1].addr,
                         (cur_fb->width*cur_fb->height)<<cur_fb->size>>1);
                //rdp.skip_drawing = true;
             }
             else
+               neil_rd_mark(cur_fb->addr, (cur_fb->width*cur_fb->height) << g_gdp.fb_size >> 1);   /* RDRAM write tracking: main/neil_rddirty.h */
                memset(gfx_info.RDRAM+cur_fb->addr, 0, (cur_fb->width*cur_fb->height) << g_gdp.fb_size >> 1);
             break;
             /*
@@ -1922,6 +1930,7 @@ void DetectFrameBufferUsage(void)
             if (settings.frame_buffer&fb_motionblur)
                CopyFrameBuffer (GR_BUFFER_BACKBUFFER);
             else
+               neil_rd_mark(gDP.colorImage.address, gDP.colorImage.width * gDP.colorImage.height * g_gdp.fb_size);   /* RDRAM write tracking: main/neil_rddirty.h */
                memset(gfx_info.RDRAM + gDP.colorImage.address,
                      0,
                      gDP.colorImage.width * gDP.colorImage.height * g_gdp.fb_size);

@@ -705,6 +705,9 @@ void glide64gDPFillRectangle(uint32_t ul_x, uint32_t ul_y, uint32_t lr_x, uint32
             if (lr_y > ul_y && lr_x > ul_x)   /* the depth image is written here: a queued frame under it first */
                LFB_TOUCH(gDP.colorImage.address + 4 * (ul_y * zi_width_in_dwords + ul_x),
                      4 * ((lr_y - 1 - ul_y) * zi_width_in_dwords + (lr_x - ul_x)));
+            if (lr_y > ul_y && lr_x > ul_x)   /* RDRAM write tracking: main/neil_rddirty.h */
+               neil_rd_mark(gDP.colorImage.address + 4 * (ul_y * zi_width_in_dwords + ul_x),
+                     4 * ((lr_y - 1 - ul_y) * zi_width_in_dwords + (lr_x - ul_x)));
             dst = (uint32_t*)(gfx_info.RDRAM + gDP.colorImage.address);
             dst += ul_y * zi_width_in_dwords;
             for (y = ul_y; y < lr_y; y++)

@@ -29,6 +29,7 @@ static uint32_t idxlim32;
 static uint32_t* rdram32;
 static uint16_t* rdram16;
 static uint8_t* rdram8;
+#include "main/neil_rddirty.h"   /* RDRAM write tracking for the raw fast save (the main plane) */
 static uint8_t rdram_hidden[RDRAM_MAX_SIZE / 2];
 
 // NEIL RAW STATE: which 4 KiB pages of rdram_hidden were written, and when.
@@ -109,6 +110,7 @@ static STRICTINLINE void rdram_write_idx8(uint32_t in, uint8_t val)
     in &= RDRAM_MASK;
     if (rdram_valid_idx8(in)) {
         rdram8[in ^ BYTE_ADDR_XOR] = val;
+        NEIL_RD_MARK1(in);
     }
 }
 
@@ -117,6 +119,7 @@ static STRICTINLINE void rdram_write_idx16(uint32_t in, uint16_t val)
     in &= RDRAM_MASK >> 1;
     if (rdram_valid_idx16(in)) {
         rdram16[in ^ WORD_ADDR_XOR] = val;
+        NEIL_RD_MARK1(in << 1);
     }
 }
 
@@ -125,6 +128,7 @@ static STRICTINLINE void rdram_write_idx32(uint32_t in, uint32_t val)
     in &= RDRAM_MASK >> 2;
     if (rdram_valid_idx32(in)) {
         rdram32[in] = val;
+        NEIL_RD_MARK1(in << 2);
     }
 }
 
@@ -144,6 +148,7 @@ static STRICTINLINE void rdram_write_pair8(uint32_t in, uint8_t rval, uint8_t hv
     in &= RDRAM_MASK;
     if (rdram_valid_idx8(in)) {
         rdram8[in ^ BYTE_ADDR_XOR] = rval;
+        NEIL_RD_MARK1(in);
         if (in & 1) {
             rdram_hidden[in >> 1] = hval;
             NEIL_HID_MARK(in >> 1);
@@ -156,6 +161,7 @@ static STRICTINLINE void rdram_write_pair16(uint32_t in, uint16_t rval, uint8_t 
     in &= RDRAM_MASK >> 1;
     if (rdram_valid_idx16(in)) {
         rdram16[in ^ WORD_ADDR_XOR] = rval;
+        NEIL_RD_MARK1(in << 1);
         rdram_hidden[in] = hval;
         NEIL_HID_MARK(in);
     }
@@ -166,6 +172,7 @@ static STRICTINLINE void rdram_write_pair32(uint32_t in, uint32_t rval, uint8_t 
     in &= RDRAM_MASK >> 2;
     if (rdram_valid_idx32(in)) {
         rdram32[in] = rval;
+        NEIL_RD_MARK1(in << 2);
         rdram_hidden[in << 1] = hval0;
         rdram_hidden[(in << 1) + 1] = hval1;
         NEIL_HID_MARK(in << 1);

@@ -146,6 +146,7 @@ void alist_save(struct hle_t* hle, uint16_t dmem, uint32_t address, uint16_t cou
     address &= ~7;
     count = align(count, 8);
     LFB_TOUCH(address, count);
+    neil_rd_mark(address, count);   /* RDRAM write tracking (main/neil_rddirty.h) */
     memcpy(hle->dram + address, hle->alist_buffer + dmem, count);
 }
 
@@ -263,6 +264,7 @@ void alist_envmix_exp(
     uint32_t ptr            = 0;
     short *save_buffer      = (short*)((uint8_t*)hle->dram + address);
     LFB_TOUCH(address, 0x80);   /* the envmixer's saved state (lazy framebuffer copy) */
+    neil_rd_mark(address, 0x80);   /* RDRAM write tracking (main/neil_rddirty.h) */
 
     if (init)
     {
@@ -365,6 +367,7 @@ void alist_envmix_ge(
     int16_t* const wr       = (int16_t*)(hle->alist_buffer + dmem_wr);
     short *save_buffer      = (short*)((uint8_t*)hle->dram + address);
     LFB_TOUCH(address, 0x80);   /* the envmixer's saved state (lazy framebuffer copy) */
+    neil_rd_mark(address, 0x80);   /* RDRAM write tracking (main/neil_rddirty.h) */
 
     if (init)
     {
@@ -438,6 +441,7 @@ void alist_envmix_lin(
     struct ramp_t ramps[2];
     short *save_buffer = (short*)((uint8_t*)hle->dram + address);
     LFB_TOUCH(address, 0x80);   /* the envmixer's saved state (lazy framebuffer copy) */
+    neil_rd_mark(address, 0x80);   /* RDRAM write tracking (main/neil_rddirty.h) */
 
     const int16_t * const in = (int16_t*)(hle->alist_buffer + dmemi);
     int16_t* const dl = (int16_t*)(hle->alist_buffer + dmem_dl);
@@ -625,12 +629,12 @@ static void alist_resample_load(struct hle_t* hle,
 static void alist_resample_save(struct hle_t* hle,
       uint32_t address, uint16_t pos, uint32_t pitch_accu)
 {
-    *dram_u16(hle, address + 0) = *sample(hle, pos + 0);
-    *dram_u16(hle, address + 2) = *sample(hle, pos + 1);
-    *dram_u16(hle, address + 4) = *sample(hle, pos + 2);
-    *dram_u16(hle, address + 6) = *sample(hle, pos + 3);
+    *dram_w16(hle, address + 0) = *sample(hle, pos + 0);
+    *dram_w16(hle, address + 2) = *sample(hle, pos + 1);
+    *dram_w16(hle, address + 4) = *sample(hle, pos + 2);
+    *dram_w16(hle, address + 6) = *sample(hle, pos + 3);
 
-    *dram_u16(hle, address + 8) = pitch_accu;
+    *dram_w16(hle, address + 8) = pitch_accu;
 }
 
 void alist_resample(
@@ -816,8 +820,11 @@ void alist_filter(
    int16_t* in2 = (int16_t*)(hle->alist_buffer + dmem);
 
    LFB_TOUCH(lut_address[0], 16);   /* lazy framebuffer copy: bytes read/written below */
+   neil_rd_mark(lut_address[0], 16);   /* RDRAM write tracking (main/neil_rddirty.h) */
    LFB_TOUCH(lut_address[1], 16);
+   neil_rd_mark(lut_address[1], 16);   /* RDRAM write tracking (main/neil_rddirty.h) */
    LFB_TOUCH(address, 16);
+   neil_rd_mark(address, 16);   /* RDRAM write tracking (main/neil_rddirty.h) */
 
    for (x = 0; x < 8; ++x)
    {

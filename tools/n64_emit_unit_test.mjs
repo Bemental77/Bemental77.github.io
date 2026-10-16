@@ -239,8 +239,9 @@ const PIN_ALL = process.argv.includes('--pin');
 // PATHS); cases that set opts.noCold do so themselves. CI should run it both ways.
 const NOCOLD_ALL = process.argv.includes('--nocold');
 const CHAIN_ALL = process.argv.includes('--chain');
-function loadEmitter(pin, noCold, cold, chain) {
+function loadEmitter(pin, noCold, cold, chain, noRdMark) {
   const sb = { WebAssembly, console: { error() {}, log() {}, warn() {} }, Uint32Array, Object, Array, Math, String };
+  if (noRdMark) sb.__jitNoRdMark = true;   // the ?rdtrack=0 arm
   sb.window = sb; sb.__jitPin = !!(pin || (PIN_ALL && pin !== false));   // pin === false: this case opts out of --pin
   // CHAINING is off unless asked for: a chained exit runs the stub op at PC, which the
   // corpus's exit expectations (PC, regs) do not model; `--chain` runs everything chained
@@ -256,7 +257,7 @@ function T(name, words, { regs = {}, dram = {}, expectRegs = {}, expectDram = {}
                           expectRefused = false, expectPC = null, expectLastAddr = null, expectCount = null,
                           lastAddr = null, enterAt = 0, skipJump = 0, expectInvalid = {},
                           expectActual = null, expectJTA = null }) {
-  const bm = loadEmitter(opts.pin, opts.noCold, opts.cold, opts.chain);
+  const bm = loadEmitter(opts.pin, opts.noCold, opts.cold, opts.chain, opts.noRdMark);
   const { mem, table, HEAPU32, REG64, p } = makeWorld(words, opts);
   const DV = new DataView(mem.buffer);
   HEAPU32[FCR31A >> 2] = fcr31 >>> 0;
@@ -269,6 +270,8 @@ function T(name, words, { regs = {}, dram = {}, expectRegs = {}, expectDram = {}
   for (const [a, v] of Object.entries(dram)) HEAPU32[(DRAM + (+a)) >> 2] = v >>> 0;
   if (lastAddr !== null) HEAPU32[LASTADDR >> 2] = lastAddr >>> 0;
   if (skipJump) HEAPU32[SKIPJ >> 2] = skipJump >>> 0;
+  // the RDRAM mark bytes start CLEAN (the world fills invalid_code with 1s = every page invalid)
+  if (opts.rdClear) new Uint8Array(mem.buffer, INVALID + 0x80800, 2048).fill(0);
   const idx = bm.compileSpan(p, { HEAPU32, wasmTable: table, wasmMemory: mem });
   // A refusal is a RESULT, not a failure: the delay-slot guard cannot be
   // emitted without &delay_slot, and an unguarded block corrupts the guest, so
@@ -436,6 +439,21 @@ const tests = [
   T('cold: a LOAD slow arm hands back at the next instruction', [I(OPC.LW, 4, 8, 0x18), I(OPC.ADDIU, 0, 9, 5), 0],
     { regs: { 4: SLOW_ADDR }, expectRegs: { 9: '0x0' }, expectPC: ENTRY + STRIDE, opts: { cold: true } }),
   // controls: the fast arm was always correct and must stay so
+  // RDRAM WRITE TRACKING (mips_emit.js rdMarkBytes): a native store marks its 4 KiB page in the
+  // byte table at invalid_code + 0x80800 (page (a >> 12) & 0x7FF), and nothing else there
+  T('rdtrack: a native SW marks its page', [I(OPC.SW, 4, 8, 0x18), 0],
+    { regs: { 4: HIT_ADDR, 8: V }, opts: { rdClear: true, rdramHit: true }, expectInvalid: { [0x80800 + 0x100]: 1, [0x80800 + 0x101]: 0, [0x80800 + 0xff]: 0 } }),
+  T('rdtrack: a native SB marks the page of its own byte', [I(OPC.SB, 4, 8, 0x1018), 0],
+    { regs: { 4: HIT_ADDR, 8: V }, opts: { rdClear: true, rdramHit: true }, expectInvalid: { [0x80800 + 0x101]: 1, [0x80800 + 0x100]: 0 } }),
+  T('rdtrack: a native SD marks its page', [I(OPC.SD, 4, 8, 0xff8), 0],
+    { regs: { 4: HIT_ADDR, 8: V }, opts: { rdClear: true, rdramHit: true }, expectDram: { 0x100ff8: '0xdeadbeef' },
+      expectInvalid: { [0x80800 + 0x100]: 1, [0x80800 + 0x101]: 0 } }),
+  T('rdtrack: a KSEG0 address marks the same physical page', [I(OPC.SW, 4, 8, 0x18), 0],
+    { regs: { 4: '0xffffffff80100000', 8: V }, opts: { rdClear: true, rdramHit: true }, expectInvalid: { [0x80800 + 0x100]: 1 } }),
+  T('rdtrack: a slow store marks nothing natively (the interpreter op marks it)', [I(OPC.SW, 4, 8, 0x18), 0],
+    { regs: { 4: SLOW_ADDR, 8: V }, opts: { rdClear: true }, expectInvalid: { [0x80800 + 0x100]: 0 } }),
+  T('rdtrack control (?rdtrack=0): the native SW marks nothing', [I(OPC.SW, 4, 8, 0x18), 0],
+    { regs: { 4: HIT_ADDR, 8: V }, opts: { rdClear: true, rdramHit: true, noRdMark: true }, expectInvalid: { [0x80800 + 0x100]: 0 } }),
   T('SW fast arm control', [I(OPC.SW, 4, 8, 0x18), OR(10, 8, 0)],
     { regs: { 4: HIT_ADDR, 8: V }, expectRegs: { 10: V }, opts: { rdramHit: true } }),
   T('SD fast arm control', [I(OPC.SD, 4, 8, 0x18), OR(10, 8, 0)],

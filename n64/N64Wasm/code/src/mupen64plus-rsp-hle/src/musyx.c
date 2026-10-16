@@ -352,12 +352,12 @@ static void save_base_vol(struct hle_t* hle, const int32_t *base_vol, uint32_t a
     unsigned k;
 
     for (k = 0; k < 4; ++k) {
-        *dram_u16(hle, address) = (uint16_t)(base_vol[k] >> 16);
+        *dram_w16(hle, address) = (uint16_t)(base_vol[k] >> 16);
         address += 2;
     }
 
     for (k = 0; k < 4; ++k) {
-        *dram_u16(hle, address) = (uint16_t)(base_vol[k]);
+        *dram_w16(hle, address) = (uint16_t)(base_vol[k]);
         address += 2;
     }
 }
@@ -917,6 +917,7 @@ static void interleave_stage_v1(struct hle_t* hle, musyx_t *musyx, uint32_t outp
    int16_t *left      = musyx->left;
    int16_t *right     = musyx->right;
    uint32_t *dst      = dram_u32(hle, output_ptr);
+   neil_rd_mark(output_ptr, SUBFRAME_SIZE * 4);   /* the loop below writes past the element (main/neil_rddirty.h) */
 
 #ifndef NDEBUG
    HleVerboseMessage(hle->user_defined, "interleave: %08x", output_ptr);
@@ -977,6 +978,7 @@ static void interleave_stage_v2(struct hle_t* hle, musyx_t *musyx,
 
    /* interleave L_total and R_total */
    dst = dram_u32(hle, output_ptr);
+   neil_rd_mark(output_ptr, SUBFRAME_SIZE * 4);   /* the loop below writes past the element (main/neil_rddirty.h) */
 
    for(i = 0; i < SUBFRAME_SIZE; ++i)
    {

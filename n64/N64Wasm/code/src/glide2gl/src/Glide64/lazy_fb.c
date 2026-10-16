@@ -180,6 +180,8 @@ static void reg_write(const lfb_reg_t *r, const uint16_t *samp)
 {
    int x, y;
    const int stride = r->x1;            /* NF_SRC(x, y) = samp[x + y * x_end] */
+   if (r->y1 > 0)   /* RDRAM write tracking: main/neil_rddirty.h */
+      neil_rd_mark(r->addr, (r->bpp32 ? 4u : 2u) * ((uint32_t)r->width * (uint32_t)r->y1 + (uint32_t)r->x1));
    if (!r->bpp32)
    {
       uint16_t *ptr_dst = (uint16_t*)(gfx_info.RDRAM + r->addr);

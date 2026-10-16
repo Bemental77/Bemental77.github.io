@@ -4,6 +4,7 @@
 
 #include <stdint.h>
 #include "../../../mupen64plus-core/src/main/lfb_hook.h"
+#include "../../../mupen64plus-core/src/main/neil_rddirty.h"   /* RDRAM write tracking: every glide write into RDRAM marks its pages */
 
 /* CopyFrameBuffer's scaled branch, at the end of a read_always display list:
  * 1 = the copy is queued (nothing to write now), 0 = make it eagerly. */

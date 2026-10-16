@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "main/lfb_hook.h"   /* glide's lazy framebuffer copy: LFB_TOUCH before RDRAM is used */
+#include "main/neil_rddirty.h"   /* RDRAM write tracking for the raw fast save */
 
 static void dma_sp_write(struct rsp_core* sp, unsigned length, unsigned count, unsigned skip)
 {
@@ -66,6 +67,7 @@ static void dma_sp_read(struct rsp_core* sp, unsigned length, unsigned count, un
     unsigned char *dram   = (unsigned char*)sp->ri->rdram.dram;
 
     LFB_TOUCH(dramaddr, count * (length + skip));
+    neil_rd_mark(dramaddr, count * (length + skip));
     for(j = 0; j < count; j++)
     {
         for(i = 0; i < length; i++)

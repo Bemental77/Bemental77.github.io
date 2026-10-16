@@ -252,6 +252,7 @@ void mp3_task(struct hle_t* hle, unsigned int index, uint32_t address)
        }
        /* --------------- Inner Loop End -------------------- */
        LFB_TOUCH(writePtr, 0x180);
+       neil_rd_mark(writePtr, 0x180);   /* RDRAM write tracking (main/neil_rddirty.h) */
        memcpy(hle->dram + writePtr, hle->mp3_buffer + 0xe70, 0x180);
        writePtr += 0x180;
        readPtr  += 0x180;
