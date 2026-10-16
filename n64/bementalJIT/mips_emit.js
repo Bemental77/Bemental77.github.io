@@ -2182,11 +2182,16 @@
   // equals the live one in full. ?jitreloc=0 (core_worker.js) = the corpus at its own addresses only.
   var RELOC = { C: null, live: null, pg: null, seen: null, pred: 0, sent: null, sentId: null, done: null, idJob: null,
                 moves: 0, pages: 0, resent: 0, said: 0, q: [], pumpT: 0 };
+  var RELOC_FULL = 3, RELOC_FULL_CAP = null;
+  function relocFullCap() {
+    if (RELOC_FULL_CAP === null) { var g = (typeof globalThis !== 'undefined') ? globalThis : self, f = g.__fbAsync; RELOC_FULL_CAP = !(f && f.jitRelocFull === false); }
+    return RELOC_FULL_CAP;
+  }
   function relocOff() { var g = (typeof globalThis !== 'undefined') ? globalThis : self; return !!g.__jitRelocOff; }
   function relocInit(C, live) {
     var R = RELOC, n = C.jobs.length, stride = C.static.stride >>> 0;
     R.C = C; R.live = { p: Object.assign({}, live.p), flags: live.flags, tableBase: live.tableBase };
-    R.pg = new Map(); R.seen = new Map(); R.pred = 0; R.idJob = new Map();
+    R.pg = new Map(); R.seen = new Map(); R.pred = 0; R.idJob = new Map(); R.full = null; R.thin = 0;
     R.sent = new Float64Array(n).fill(NaN); R.sentId = new Float64Array(n).fill(NaN); R.done = new Float64Array(n).fill(NaN);
     for (var i = 0; i < n; i++) {
       var cj = C.jobs[i], vp = cj.vaddr >>> 12, base = (cj.entryPtr - ((cj.vaddr & 0xFFF) >>> 2) * stride) | 0, g = R.pg.get(vp);
@@ -2206,8 +2211,26 @@
     R.seen.set(vp, d); R.pages++;
     if (quiet) { R.pred = d; return; }
     if (d === R.pred) { relocSend(g.jobs.slice(), true); return; }
+    R.moves++;
+    // ---- A HEAP THAT MOVES BACK AND FORTH IS NOT A NEW PLACE EACH TIME (2026-10-16) ----
+    // Blocks are carved from a heap whose free space is reused, so the deltas pages show are not
+    // monotonic: in a two-browser MK64 room each console saw 145 "moves" by frame 3400 (115 of them
+    // in the race start's ~10 s), most of them back to a delta already seen — and every one dropped
+    // the compile worker's queue and sent the WHOLE corpus out again: 306,000 span compiles a
+    // console, the 500-870 ms/s of V8 compilation beside the room's worst seconds, and the race
+    // start's own offers missed the cache (470 live compiles). Now only the first RELOC_FULL
+    // distinct deltas rebuild the corpus; any other move rebuilds the page that showed it (above:
+    // its own delta, at the front) and leaves the queue alone. Which modules get BUILT changes;
+    // a span is still installed only on a full key match. ?jitrelocfull=0 = every move, as before.
+    var full = R.full || (R.full = new Set([R.pred]));
+    if (relocFullCap() && (full.has(d) || full.size >= RELOC_FULL)) {
+      R.thin = (R.thin | 0) + 1;
+      relocSend(g.jobs.slice(), true);
+      return;
+    }
+    full.add(d);
     // THE HEAP MOVED: what the worker still has queued was built for the old place
-    R.pred = d; R.moves++;
+    R.pred = d;
     if (ASYNC.w) ASYNC.w.postMessage({ warmDrop: true });
     for (var i = 0; i < R.sent.length; i++) {
       if (R.sent[i] === R.sent[i] && R.done[i] !== R.sent[i]) { WARM.ids.delete(R.sentId[i]); R.idJob.delete(R.sentId[i]); R.sent[i] = NaN; }
