@@ -135,7 +135,10 @@ const out = { base: BASE, duty: DUTY, acct: ACCT, q: EXTRA, load0: os.loadavg()[
 try {
   const page = await browser.newPage();
   page.on('console', (m) => { const t = m.text(); if (/RESULT|⚠|\[fskip\]|\[present\]/.test(t)) console.log('  > ' + t.slice(0, 200)); });
-  const q = `?bench=1&benchauto=1&benchsec=${WARM + SEC + 60}&benchroom=0&workerrig=clock${EXTRA ? '&' + EXTRA : ''}`;
+  // --game NAME: that title through the page's own ?game=&autostart instead of the bench's (SM64)
+  const GAME = flag('game', '');
+  const q = GAME ? `?game=${encodeURIComponent(GAME)}&autostart&workerrig=clock${EXTRA ? '&' + EXTRA : ''}`
+                 : `?bench=1&benchauto=1&benchsec=${WARM + SEC + 60}&benchroom=0&workerrig=clock${EXTRA ? '&' + EXTRA : ''}`;
   await page.goto(BASE + '/n64/index.html' + q, { waitUntil: 'domcontentloaded' });
   const ev = (src) => page.evaluate((s) => { const W = window.__n64Worker; if (!W || !W.state().booted) return null; return W.eval(s); }, src);
   const tb = Date.now(); let booted = false;
@@ -143,6 +146,7 @@ try {
   if (!booted) throw new Error('worker never booted');
   const tBoot = Date.now(); console.log('booted after ' + ((tBoot - tb) / 1000).toFixed(0) + ' s; warming ' + WARM + ' s');
   await sleep(WARM * 1000);
+  if (flag('pageeval', '')) { out.pageEval = await page.evaluate(flag('pageeval', '')).catch((e) => 'ERR ' + e); console.log('pageeval: ' + JSON.stringify(out.pageEval).slice(0, 2000)); }
   if (flag('eval', '')) { out.eval = await ev(flag('eval', '')).catch((e) => 'ERR ' + e); console.log('eval: ' + out.eval); }
   if (ACCT) console.log('install: ' + await ev(INSTALL));
   await sleep(1000);
