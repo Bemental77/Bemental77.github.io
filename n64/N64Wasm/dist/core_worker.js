@@ -752,6 +752,15 @@ function fsResolve() {
 }
 function fsDropAll() { while (FSK.snaps.length) fsDrop(0); FSK.stale = false; }
 // ONE FIELD. Replaces a bare _neil_ls_run_frame for the solo clock (runOneFrame) and the rigs.
+// Is the field about to run one that draws? (The cadence: the field two before it drew — a title
+// drawing every second field skips the fields that draw and runs the others as they are.)
+// ⚠ AND WHEN THE GPU IS FAR BEHIND, ASSUME IT DRAWS (2026-10-16). The guess was the only thing
+// between the GPU and an unbounded queue: a field it called picture-less that drew anyway went to
+// the GPU, and the GPU queue guard does not hold a field the frame skip could skip. MEASURED
+// (two-browser MK64 rollback room, SwiftShader, 4 cores, fix a0036e2 in): the fence queue grew to
+// 19-23 pictures, the oldest 4-6 s outstanding — 4-6 s of picture lag, and the reservoir that a
+// later GL call blocks on. Past GQ.max pictures every field that can skip, skips.
+function fsExpect() { return (FSK.hist & 2) !== 0 || FSK.fq.length > GQ.max; }
 function fsField() {
   var s = ++FSK.serial, ready = fsCoreReady(), now = performance.now();
   FSK.fields++;
@@ -759,7 +768,7 @@ function fsField() {
   fsPoll(now);
   var skip = false;
   if (FSK.force) skip = (s % FSK.force) !== 0 && fsCanSkip();
-  else if (FSK.on && FSK.fq.length >= FSK.depth) { FSK.held++; skip = (FSK.hist & 2) !== 0 && fsCanSkip(); }
+  else if (FSK.on && FSK.fq.length >= FSK.depth) { FSK.held++; skip = fsExpect() && fsCanSkip(); }
   if (!skip && !FSK.force && fsLate(now)) { skip = fsCanSkip(); if (skip) FSK.lateSkips++; }
   // A snapshot is needed only for the first skipped field after the newest one: a re-run from an
   // older snapshot re-runs a later skipped field too (every field's pads are kept). So one is taken
@@ -1170,7 +1179,7 @@ var ROOM_FS = {
   ok: function () { return FSK.on && !!M && fsCoreReady(); },
   force: function () { return FSK.force | 0; },
   behind: function () { fsPoll(performance.now()); return FSK.fq.length >= FSK.depth; },
-  expect: function () { return (FSK.hist & 2) !== 0; },
+  expect: function () { return fsExpect(); },
   begin: function (skip, k) {
     FSK.skipping = !!skip; FSK.drewNow = false; FSK.swNow = 0;
     if (fsCoreReady()) M._neil_fs_set(skip ? 1 : 0, (k | 0) & 0x7FFFFFFF);
