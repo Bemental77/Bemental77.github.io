@@ -480,6 +480,7 @@ function buildRecompTriangleFifo() {
 // movie yielded ~0.9x/s -> 2.6fps. 2 keeps the fixed-count determinism contract (constant
 // guest-advance per pump), just yields ~8x more often so presents track the emulated rate.
 var PUMP_BATCH_ITERS = 2;
+var PUMP_PACE_MS = 2, __recompPumpPace = true;   // see startTickLoop: ONCE THE RECOMP DRIVES THE GAME
 
 // ---------------------------------------------------------------------------
 // LOCKSTEP PUMP (2026-09-08). Online play on this page used to mean ONE
@@ -772,10 +773,22 @@ function startTickLoop() {
   // Zero-clamp yield chain, not setInterval(16): while we're below native
   // speed there is no idle budget to give back — run flat-out, yielding
   // each turn so input/mailbox messages keep flowing.
+  // ── ONCE THE RECOMP DRIVES THE GAME, THIS LOOP IS PACED, NOT FLAT OUT (2026-10-16) ──────────
+  // After the takeover (recompStart, gate released) Dolphin's CPU is parked and this worker is only
+  // the renderer: frames arrive as 'recompFrame' messages and render inside that handler. The pump
+  // still has to run (skipping it stalls the boot, see pumpBatch), but nothing here needs it
+  // ~flat out. MEASURED (MP4 solo, rate 1, per-thread /proc): this thread used ~1 core and the GPU
+  // process's main thread ~0.9 core even while the renderer drew nothing, against the recomp
+  // worker's 0.06 — and on the toaster arm every renderer/GPU thread shares the same throttled
+  // on-slices as the guest. So then the next pump is a real timer (PUMP_PACE_MS; Chrome clamps a
+  // nested timer to >= 4 ms), leaving the thread idle in between: messages, readback completions
+  // and Dawn's timer-driven ticks are delivered exactly as before. recompStart's pumpPace:false
+  // (page ?pumppace=0) is the control.
   var pump = function () {
     pumpBatch();
     __ticks++;
-    zeroYield(pump);   // [tick-diag stripped 2026-08-05 per gate #8]
+    if (__recompLive && !__recompGate && __recompPumpPace) setTimeout(pump, PUMP_PACE_MS);
+    else zeroYield(pump);   // [tick-diag stripped 2026-08-05 per gate #8]
   };
   tickInterval = 1;   // marker: loop armed (no timer id under zeroYield)
   zeroYield(pump);
@@ -1326,6 +1339,7 @@ self.onmessage = function (e) {
     case 'recompStart': {
       // [vi-timing-gate 2026-09-30] Only take over once the hardware exists (see __recompGate).
       __recompLive = true;
+      __recompPumpPace = e.data.pumpPace !== false;
       if (__recompGate) break;                       // already waiting
       if (!e.data.deferTerminate && __recompHwReady()) __recompBegin();   // older page: as before
       else __recompArmGate(e.data.deferTerminate);
