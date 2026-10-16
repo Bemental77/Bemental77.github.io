@@ -8243,7 +8243,7 @@ window.GcRate = (function () {
       // Same two moves the recomp path makes, for the same two reasons.
       // deferTerminate: Dolphin answers {recompGate:'ready'} once its emulated hardware exists and
       // waits for 'recompGateGo' before it touches RAM (worker_funcs.js __recompGate).
-      dolphin_worker.postMessage({ cmd: 'recompStart', deferTerminate: true });
+      dolphin_worker.postMessage({ cmd: 'recompStart', deferTerminate: true, pumpPace: !/[?&]pumppace=0\b/.test(location.search) });   // ?pumppace=0: dolphin's pump stays flat out (worker_funcs.js startTickLoop)
     // [main-thread 2026-10-01] The recomp pushes its own PCM through this page into the worklet
     // ring from here on; take the ring back from the dolphin shim so there is one producer.
     window.__gcRecompOwnsAudio = true;
@@ -11510,7 +11510,7 @@ window.GcRate = (function () {
     discP = null;   // buffers get transferred below — a retry must refetch
     console.log('[recomp-live] parts loaded (' + parts.reduce(function (a, b) { return a + b.byteLength; }, 0) + 'B); taking over');
     // deferTerminate: see stopJit below and worker_funcs.js __recompGate.
-    dolphin_worker.postMessage({ cmd: 'recompStart', deferTerminate: true });
+    dolphin_worker.postMessage({ cmd: 'recompStart', deferTerminate: true, pumpPace: !/[?&]pumppace=0\b/.test(location.search) });   // ?pumppace=0: dolphin's pump stays flat out (worker_funcs.js startTickLoop)
     // [main-thread 2026-10-01] The recomp pushes its own PCM through this page into the worklet
     // ring from here on; take the ring back from the dolphin shim so there is one producer.
     window.__gcRecompOwnsAudio = true;
