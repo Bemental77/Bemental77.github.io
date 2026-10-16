@@ -45,6 +45,15 @@
 //   MOBILE=i,j those tabs emulate a phone (the mobile shell; the room presses the splash's Start).
 //   CONTROL=1  the MATCHED CONTROL for the rate: the same tabs and input, solo, no room.
 //   NO_WEBGPU=1 every browser without WebGPU (device matrix no-webgpu arm): the WebGL2 fallback.
+//   ALONE=1    the host opens the room and presses Start BY ITSELF, before anyone joins, and sits
+//              there ALONE_MS (default 90000): the page must say it is waiting for player 2 (badge,
+//              banner) and never claim a render fault; then the guests join and the room must start.
+//   LEAVE=1    after the run, the LAST guest's tab closes; for LEAVE_MS (default 90000) the consoles
+//              left behind must name the wait (player left) and never a render fault, and must not
+//              stay frozen: their guest frames advance again (the room plays on, or ends to solo).
+//              LEAVE_WHO=host closes the HOST's tab instead.
+// THROUGHOUT: every page records any render-fault claim its badge makes (PRESENT STALLED / NO FIRST
+// FRAME); a room holding frames on purpose is not one (2026-10-16, a real host alone in room N42HM).
 // Every window prints the room rate per console AND where the time went: held for the ROOM's
 // input (the other console's frames had not arrived) vs held for this console's OWN worker.
 import { createRequire } from 'node:module';
@@ -85,6 +94,10 @@ const HOST_CARD = process.env.HOST_CARD ? fs.readFileSync(process.env.HOST_CARD)
 const CONTROL = process.env.CONTROL === '1';
 const NO_WEBGPU = process.env.NO_WEBGPU === '1';
 const RB = process.env.RB !== '0';
+const ALONE = process.env.ALONE === '1' && !SEPARATE && !CONTROL;
+const ALONE_MS = parseInt(process.env.ALONE_MS || '90000', 10);
+const LEAVE = process.env.LEAVE === '1' && !CONTROL;
+const LEAVE_MS = parseInt(process.env.LEAVE_MS || '90000', 10);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let pass = 0, fail = 0;
 const ok = (n, d) => { pass++; console.log(`  PASS  ${n}${d ? ' — ' + d : ''}`); };
@@ -254,6 +267,33 @@ for (let i = 0; i < PLAYERS; i++) {
 }
 for (const { p } of pages) await coiSettle(p);
 const host = pages[0].p;
+// Every page records each render-fault claim its badge makes. Re-installed per document (coiSettle
+// may have reloaded it), read back with badClaims().
+const watchClaims = (p) => p.evaluate(() => {
+  if (window.__badClaims) return;
+  window.__badClaims = [];
+  setInterval(() => {
+    const t = (document.getElementById('gpuPath') || {}).textContent || '';
+    // `room`: had this console's room NOT yet ended when it made the claim? After a room ENDS
+    // the console plays solo, and a solo game on a software GPU is a different question.
+    const g = window.__gcLockstep ? window.__gcLockstep() : null;
+    if (/STALLED|NO FIRST FRAME/.test(t) && window.__badClaims.length < 50) window.__badClaims.push({ t: Math.round(performance.now() / 1000), text: t, room: !(g && g.roomEnded),
+      ctx: g && { gated: g.gated, running: g.running, state: g.state, card: g.card && g.card.state, frames: g.guestFrames, why: g.stallReason,
+                  rr: window.__gcRoomRender ? (({ drawMsEma, slow, sent, holding }) => ({ drawMsEma, slow, sent, holding }))(window.__gcRoomRender()) : null } });
+  }, 1000);
+}).catch(() => {});
+for (const { p } of pages) await watchClaims(p);
+const badClaims = (all) => Promise.all(pages.map(({ p }) => p.evaluate((a) => (window.__badClaims || []).filter((c) => a || c.room), !!all).catch(() => null)));
+const holdOf = (p) => p.evaluate(() => {
+  const h = window.__gcRoomHold ? window.__gcRoomHold() : null, b = document.getElementById('gcRoomHold');
+  return { hold: h && { kind: h.kind, short: h.short }, banner: b && b.style.display !== 'none' ? b.textContent.slice(0, 160) : null,
+           badge: (document.getElementById('gpuPath') || {}).textContent || null, status: (document.getElementById('status') || {}).textContent || null,
+           frames: window.__gcLockstep ? window.__gcLockstep().guestFrames : null,
+           diag: (() => { const g = window.__gcLockstep ? window.__gcLockstep() : null, R = window.__gcRate || {};
+             return g && { state: g.state, gated: g.gated, running: g.running, hidden: g.hiddenFrames, self: g.selfFrames, fed: g.framesFed,
+                           earned: g.earned, why: g.stallReason, published: R.published, shown: R.shown, speed: R.speed,
+                           rr: window.__gcRoomRender ? window.__gcRoomRender() : null }; })() };
+}).catch((e) => ({ err: String(e).slice(0, 120) }));
 
 // ---- the memory cards: the host's, and a DIFFERENT one on every guest --------------------------
 const md5 = (b) => crypto.createHash('md5').update(b).digest('hex');
@@ -357,6 +397,24 @@ if (!SEPARATE) {
   code = await host.evaluate(() => document.querySelector('.np-code').textContent.trim());
 }
 console.log('[host] room code ' + code + (SEPARATE ? ' (hand-off URLs, MQTT relay signalling, WebRTC)' : ' (panel, same-browser transport)'));
+// ---- ALONE=1: the host presses Start with nobody in the room -----------------------------------
+if (ALONE) {
+  await host.evaluate(() => document.getElementById('btnStart').click());
+  const ta = Date.now(); let h = null, kinds = new Set();
+  while (Date.now() - ta < ALONE_MS) {
+    await sleep(5000);
+    h = await holdOf(host); if (h.hold) kinds.add(h.hold.kind);
+    console.log(`  [alone t=${((Date.now() - ta) / 1000).toFixed(0)}s] ${JSON.stringify(h)}`);
+  }
+  await host.screenshot({ path: path.join(SHOTS, 'gc-room-alone.png') }).catch(() => {});
+  const claims = (await badClaims())[0] || [];
+  report.alone = { last: h, kinds: [...kinds], claims };
+  (h && h.hold && h.hold.kind === 'alone' && /WAITING FOR PLAYER 2/.test(h.banner || '') && /WAITING FOR PLAYER 2/.test(h.badge || '') && !h.frames)
+    ? ok('a-host-alone-is-told-it-is-waiting-for-player-2', `badge "${h.badge}" · banner "${(h.banner || '').slice(0, 90)}…" · status "${h.status}" · guest frames ${h.frames}`)
+    : bad('a-host-alone-is-told-it-is-waiting-for-player-2', JSON.stringify(h));
+  claims.length ? bad('a-host-alone-is-never-told-its-render-path-stalled', JSON.stringify(claims.slice(0, 3)))
+                : ok('a-host-alone-is-never-told-its-render-path-stalled', `${ALONE_MS / 1000}s alone after Start, no PRESENT STALLED / NO FIRST FRAME`);
+}
 for (let i = 1; i < PLAYERS; i++) {
   if (!SEPARATE) await pages[i].p.evaluate((c) => {
     document.querySelector('.np-btn').click();
@@ -649,8 +707,44 @@ if (HOST_CARD && SEPARATE) {
     : bad('every-console-booted-the-HOSTS-card-not-its-own', JSON.stringify(report.boot.map((b) => b && b.card)));
 }
 
+// ---- LEAVE=1: the last guest closes its tab; the room must not freeze the others ---------------
+let leftAlone = false;
+if (LEAVE) {
+  const gone = pages.splice(process.env.LEAVE_WHO === 'host' ? 0 : pages.length - 1, 1)[0];
+  const f0 = await Promise.all(pages.map(({ p }) => holdOf(p)));
+  console.log('  [before leave] ' + f0.map((h, i) => `${pages[i].who}: ${JSON.stringify(h)}`).join(' | '));
+  console.log('  [claims before leave] ' + JSON.stringify(await badClaims()));
+  await gone.p.close().catch(() => {});
+  console.log(`[${gone.who}] closed its tab; watching ${pages.map((x) => x.who).join(',')} for ${LEAVE_MS / 1000}s`);
+  const tl = Date.now(); const kinds = new Set(); const series = [];
+  while (Date.now() - tl < LEAVE_MS) {
+    await sleep(3000);
+    const hs = await Promise.all(pages.map(({ p }) => holdOf(p)));
+    hs.forEach((h) => { if (h.hold) kinds.add(h.hold.kind); });
+    series.push({ t: Math.round((Date.now() - tl) / 1000), frames: hs.map((h) => h.frames), hold: hs.map((h) => h.hold && h.hold.kind) });
+    if (series.length % 2 === 1) console.log(`  [left t=${((Date.now() - tl) / 1000).toFixed(0)}s] ` + hs.map((h, i) => `${pages[i].who}: ${JSON.stringify(h)}`).join(' | '));
+  }
+  const end = await Promise.all(pages.map(({ p }) => holdOf(p)));
+  const tail = series.filter((x) => x.t >= LEAVE_MS / 1000 - 21);
+  const adv = pages.map((_, i) => tail.length > 1 ? (tail[tail.length - 1].frames[i] - tail[0].frames[i]) : 0);
+  for (const { p, who } of pages) await p.screenshot({ path: path.join(SHOTS, `gc-room-left-${who}.png`) }).catch(() => {});
+  const claims = (await badClaims()).filter(Boolean).flat().filter((c) => c.t * 1000 >= 0);
+  report.leave = { who: gone.who, kinds: [...kinds], adv, end, f0: f0.map((h) => h.frames), series, claims };
+  adv.every((a) => a >= 600)
+    ? ok('a-player-leaving-does-not-freeze-the-others', `guest frames over the last 20 s of ${LEAVE_MS / 1000}s: ${adv.join(' / ')} (holds seen: ${[...kinds].join(',') || 'none'}; end: ${end.map((h) => h.status).join(' | ')})`)
+    : bad('a-player-leaving-does-not-freeze-the-others', JSON.stringify({ adv, kinds: [...kinds], end }));
+  // 'yield' is the room's own keep-alive drawing on a slow (software) GPU — named, and not a fault
+  [...kinds].every((k) => k === 'left' || k === 'input' || k === 'yield')
+    ? ok('a-wait-on-a-player-who-left-is-named-as-that', [...kinds].join(',') || 'never held long enough to say')
+    : bad('a-wait-on-a-player-who-left-is-named-as-that', [...kinds].join(','));
+  const after = (await badClaims(true)).filter(Boolean).flat().filter((c) => !c.room);
+  claims.length ? bad('nobody-left-behind-is-told-its-render-path-stalled', JSON.stringify(claims.slice(0, 3)))
+                : ok('nobody-left-behind-is-told-its-render-path-stalled', 'no PRESENT STALLED / NO FIRST FRAME on any remaining console while it was in the room' +
+                     (after.length ? ` (after the room ended, solo: ${after.length} claim(s) from ${after[0].t}s — the solo renderer, not the room)` : ''));
+  leftAlone = pages.length < 2;
+}
 // ---- LAST: the detector fires (this halts the room on purpose) --------------------------------
-if (FORCE_DESYNC) {
+if (FORCE_DESYNC && !leftAlone) {
   await pages[PLAYERS - 1].p.evaluate(() => window.__gcForceDesync(0x1234abcd));
   let named = null;
   for (let k = 0; k < 60 && !named; k++) {
@@ -660,6 +754,12 @@ if (FORCE_DESYNC) {
   }
   named ? ok('a-real-divergence-is-detected-by-EVERY-console', JSON.stringify(named[0]))
         : bad('a-real-divergence-is-detected-by-EVERY-console', 'perturbed one console\'s fingerprint; not every console reported it');
+}
+{
+  const all = (await badClaims()).map((c, i) => c && c.length ? `${pages[i].who}: ${JSON.stringify(c.slice(0, 2))}` : null).filter(Boolean);
+  report.badClaims = all;
+  all.length ? bad('no-console-ever-claims-a-render-fault-the-room-caused', all.join(' · ').slice(0, 500))
+             : ok('no-console-ever-claims-a-render-fault-the-room-caused', 'no PRESENT STALLED / NO FIRST FRAME on any console through boot, barrier and run');
 }
 report.md5After = await servedMd5();
 JSON.stringify(report.md5After) === JSON.stringify(report.md5)
