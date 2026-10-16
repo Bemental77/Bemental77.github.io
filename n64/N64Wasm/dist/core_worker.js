@@ -213,6 +213,7 @@ function runOneFrame() {
   applyPads();
   fsField();
   CLK.frame++;
+  if (PACECAP.p) PACECAP.p.note(performance.now());
   audioPump();
 }
 // LOST TIME IS REPAID — AND THE GUEST STILL NEVER RUNS AHEAD OF THE WALL CLOCK (2026-10-05).
@@ -250,9 +251,17 @@ function due(now) {
   var keep = Math.max(period * 2, REPAY.capMs);
   if (now - d > keep) { CLK.lostMs += now - d - keep; CLK.base = now - keep; CLK.baseFrame = CLK.frame; CLK.reanchors++; d = slotOf(); }
   if (now < nextAt(now)) { REPAY.held++; return false; }
+  if (PACECAP.on && self.__n64PaceCeiling) {
+    // THE CATCH-UP CEILING (room_core.js __n64PaceCeiling): a repayment never makes a >= 5 s window
+    // hold more than viHz x (1 + 5/300) fields per second; the debt waits for the room
+    if (!PACECAP.p || PACECAP.p.hz !== CLK.viHz) PACECAP.p = self.__n64PaceCeiling(CLK.viHz);
+    if (!PACECAP.p.ok(now)) { PACECAP.p.held++; return false; }
+  }
   if (now - d > period * 2) REPAY.repaidMs += period;
   return true;
 }
+// ?pacecap=0 = the control arm (no ceiling)
+var PACECAP = { on: true, p: null };
 // THE DRIVER. ONE FIELD PER TASK, NEVER A BATCH. An OffscreenCanvas from
 // transferControlToOffscreen commits what the context holds when this thread
 // next updates its rendering — at most once per task, and in practice on the
@@ -1112,7 +1121,7 @@ function postStats() {
          vi: viTotal(), costMs: M._neil_frame_cost_ms(), costN: M._neil_frame_cost_n() >>> 0,
          apos: M._neilGetAudioWritePosition() | 0, audDropped: ((RM.R ? (RM.R.AUDX.dropped | 0) : 0) + FSK.audDrop) % 64000,
          frame: CLK.frame, presents: CLK.presents, ticks: CLK.ticks,
-         lostMs: CLK.lostMs, reanchors: CLK.reanchors, busyMs: CLK.busyMs, repaidMs: REPAY.repaidMs, repayHeld: REPAY.held,
+         lostMs: CLK.lostMs, reanchors: CLK.reanchors, busyMs: CLK.busyMs, repaidMs: REPAY.repaidMs, repayHeld: REPAY.held, paceHeld: PACECAP.p ? PACECAP.p.held : 0,
          rafTicks: SCHED.rafTicks, immTicks: SCHED.immTicks, tmrTicks: SCHED.tmrTicks,
          paced: SCHED.paced, notOwed: SCHED.notOwed, coupled: SCHED.coupled, owed: Math.max(-2, Math.min(2, owed)),
          shown: PRES.shown, animFrames: PRES.frames, fpsText: fpsText(),
@@ -1581,6 +1590,7 @@ function boot(d) {
   // measurement of what a player gets, driven by a pad function (applyPads)
   BOOT.rigClock = new URLSearchParams(d.search || '').get('workerrig') === 'clock';
   var rq = new URLSearchParams(d.search || '').get('repay'); if (rq != null && rq !== '' && +rq >= 0) REPAY.capMs = +rq;
+  if (new URLSearchParams(d.search || '').get('pacecap') === '0') PACECAP.on = false;
   fsInstall(d.search);
   (function () {
     var gq = new URLSearchParams(d.search || '').get('gpuq');
@@ -1630,7 +1640,7 @@ function boot(d) {
       log('[glflush] arm: flush after every fenceSync');
     }
   })();
-  importScripts('fbasync.js?v=' + CORE_V, 'jit_params.js?v=' + CORE_V);
+  importScripts('fbasync.js?v=' + CORE_V, 'jit_params.js?v=' + CORE_V, 'room_core.js?v=' + CORE_V);   // room_core: __n64PaceCeiling (solo too)
   // The SAME readback implementation as the page (fbasync.js), decided from the
   // SAME ROM header with the SAME query string, so this console hands RDRAM the
   // same bytes at the same guest point as a main-thread one would.

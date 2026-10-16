@@ -216,6 +216,12 @@ const CONSOLES = {
          // The passing n64 cells before that all carried --query '&worker=0' — not what ships.
          // wkEngine is the page's own mirror of the worker engine's report() (__n64Net().engine,
          // <= 100 ms old) plus its own input->present latency samples (room_core.js LAT).
+         // THE GUEST CLOCK, CUMULATIVE, WITH ITS OWN TIMESTAMP: [frames, epoch ms]. The room's frame
+         // (credited and hidden catch-up frames alike), as of the worker's last 'lsf' tick (frameAt,
+         // timeOrigin-based) or, with the room on the page, right now. __n64Rate.speed is a ~1 s
+         // window the page closes on its own timer — five of them equal-weighted are not a 5-s rate
+         // (the GameCube lesson in 4ed89e7); this is read over the clock's own timestamps.
+         witnessCum: '(window.__n64Net && (function (n) { return n && n.frame != null ? [n.frame, n.frameAt || (performance.timeOrigin + performance.now())] : null; })(window.__n64Net()))',
          wkEngine: '(window.__n64Net && (function (n) { return n.worker && n.engine ? { rep: n.engine, mode: n.mode, lat: n.lat ? n.lat.samples : null } : null; })(window.__n64Net()))' },
   gc: { name: 'GameCube', title: 'Mario Party 4', page: '/gamecube.html', game: 'Mario Party 4', hostFlag: '',
         // __gcRate.speed is CUMULATIVE since boot (credits consumed / wall), so it lags any
@@ -541,7 +547,7 @@ function preloadSrc(cfg) {
       t: Math.round(now() - M.t0), ready: M.readyFrames - lastReady, frame: e ? e.frame : null,
       state: e ? e.state : null, delay: e ? e.delay : null,
       stalls: rep ? rep.stalls : null, stallMs: rep ? rep.stallMs : null,
-      witness: ev(CFG.witness), wc: ev(CFG.witnessCum || 'null'), frames: ev(CFG.frames), hz: ev(CFG.hz), aux: ev(CFG.aux || 'null'), ui: ev(CFG.ui || 'null'),
+      witness: ev(CFG.witness), ...((v) => Array.isArray(v) ? { wc: v[0], wt: Math.round(v[1] - performance.timeOrigin - M.t0) } : { wc: v })(ev(CFG.witnessCum || 'null')), frames: ev(CFG.frames), hz: ev(CFG.hz), aux: ev(CFG.aux || 'null'), ui: ev(CFG.ui || 'null'),
       aq: M.audio.quanta, aDrop: M.audio.dropouts, raf: rafN,
       lt: M.lt.n, ltMs: Math.round(M.lt.ms),
       ad: (() => { const d = window.__audioDiag; return d ? { p: d.framesProduced, c: d.framesConsumed, u: d.underruns == null ? null : d.underruns, uf: d.underrunFrames, df: d.droppedFrames, fill: d.fill } : null; })(),
@@ -1375,7 +1381,9 @@ function analysePlayer(d, peerRole) {
   const C5 = W.filter((w) => typeof w.wc === 'number' && isFinite(w.wc));
   if (C5.length >= 6) {
     r.witnessHudX = r.witnessX; r.witnessHudMax = r.witnessMax; r.witnessHudMaxWin5 = r.witnessMaxWin5;
-    const rateOf = (a, b) => (b.wc - a.wc) / Math.max(1e-3, (b.t - a.t) / 1000) / hz;
+    // wt: the clock's OWN timestamp when it publishes one (n64), else this rig's sample time
+    const tOf = (w) => (typeof w.wt === 'number' && isFinite(w.wt) ? w.wt : w.t);
+    const rateOf = (a, b) => (b.wc - a.wc) / Math.max(1e-3, (tOf(b) - tOf(a)) / 1000) / hz;
     let mx = null, mn = null, m1 = null;
     // A 5-s window is 5 s of WALL time, not five samples: a long task that delays one sample makes
     // five samples span 4.85 s (gc-pace-after host a: 302 frames over 4.853 s read 1.037x). Each
