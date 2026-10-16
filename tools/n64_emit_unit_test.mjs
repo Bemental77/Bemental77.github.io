@@ -239,13 +239,13 @@ const PIN_ALL = process.argv.includes('--pin');
 // PATHS); cases that set opts.noCold do so themselves. CI should run it both ways.
 const NOCOLD_ALL = process.argv.includes('--nocold');
 const CHAIN_ALL = process.argv.includes('--chain');
-function loadEmitter(pin, noCold, cold, chain, noRdMark) {
+function loadEmitter(pin, noCold, cold, chain, noRdMark, fbx) {
   const sb = { WebAssembly, console: { error() {}, log() {}, warn() {} }, Uint32Array, Object, Array, Math, String };
   if (noRdMark) sb.__jitNoRdMark = true;   // the ?rdtrack=0 arm
   sb.window = sb; sb.__jitPin = !!(pin || (PIN_ALL && pin !== false));   // pin === false: this case opts out of --pin
   // CHAINING is off unless asked for: a chained exit runs the stub op at PC, which the
   // corpus's exit expectations (PC, regs) do not model; `--chain` runs everything chained
-  sb.__fbAsync = { jitCold: !(noCold || (NOCOLD_ALL && !cold)), jitChain: !!(chain || CHAIN_ALL) };
+  sb.__fbAsync = Object.assign({ jitCold: !(noCold || (NOCOLD_ALL && !cold)), jitChain: !!(chain || CHAIN_ALL) }, fbx || {});
   vm.createContext(sb); vm.runInContext(src, sb);
   return sb.bementalMips;
 }
@@ -1080,8 +1080,8 @@ const tests = [
 // A recompile of the SAME span (same page words, same precomp ops, same
 // addresses) re-installs the cached instance; ANY difference in the key must
 // miss. Simulates init_block (ops reset) between the two compiles.
-function cacheCase(name, mutate, wantHit) {
-  const bm = loadEmitter();
+function cacheCase(name, mutate, wantHit, fbx) {
+  const bm = loadEmitter(undefined, undefined, undefined, undefined, undefined, fbx);
   const words = [I(OPC.ADDIU, 0, 1, 3), I(OPC.ADDIU, 2, 2, 1), I(OPC.ADDIU, 1, 1, 0xffff), I(OPC.BNE, 1, 0, 0xfffd), 0, I(OPC.ADDIU, 0, 3, 7), 0];
   const w = makeWorld(words, {});
   const Mod = { HEAPU32: w.HEAPU32, wasmTable: w.table, wasmMemory: w.mem };
@@ -1167,6 +1167,31 @@ function cacheCase(name, mutate, wantHit) {
 tests.push(cacheCase('recompile of an IDENTICAL span re-installs the cached instance (entry + labels)', () => {}, true));
 tests.push(cacheCase('control: one changed page word MISSES the cache', (w) => { w.HEAPU32[(SRC >> 2) + 5] = I(OPC.ADDIU, 0, 3, 9); }, false));
 tests.push(cacheCase('control: one changed precomp op MISSES the cache', (w) => { w.HEAPU32[(ENTRY + 2 * STRIDE) >> 2] = 2; }, false));
+// CACHE HIT IN PLACE (2026-10-16): the same three verdicts through the old key-build path (?jitfasthit=0, ?jitslot=0)
+tests.push(cacheCase('?jitfasthit=0 jitslot=0: an IDENTICAL span still hits', () => {}, true, { jitFastHit: false, jitSlot: false }));
+tests.push(cacheCase('?jitfasthit=0: one changed page word still MISSES', (w) => { w.HEAPU32[(SRC >> 2) + 5] = I(OPC.ADDIU, 0, 3, 9); }, false, { jitFastHit: false }));
+tests.push(cacheCase('?jitfasthit=0: one changed precomp op still MISSES', (w) => { w.HEAPU32[(ENTRY + 2 * STRIDE) >> 2] = 2; }, false, { jitFastHit: false }));
+// the word AFTER the span's page and an op past the span are not in the key: a hit either way
+tests.push(cacheCase('fast hit: the op at index span (not baked) does not make it miss', (w) => { w.HEAPU32[(ENTRY + 7 * STRIDE) >> 2] = 5; }, true));
+// SLOTS WITHOUT TABLE TRAFFIC: a re-hit of the same span writes nothing into the table
+{
+  const bm = loadEmitter();
+  const words = [I(OPC.ADDIU, 0, 1, 3), I(OPC.ADDIU, 2, 2, 1), I(OPC.ADDIU, 1, 1, 0xffff), I(OPC.BNE, 1, 0, 0xfffd), 0, I(OPC.ADDIU, 0, 3, 7), 0];
+  const w = makeWorld(words, {});
+  const Mod = { HEAPU32: w.HEAPU32, wasmTable: w.table, wasmMemory: w.mem };
+  const bad = [];
+  const i1 = bm.compileSpan(w.p, Mod);
+  const reset = () => { for (let k = 0; k < words.length + 4; k++) w.HEAPU32[(ENTRY + k * STRIDE) >> 2] = 1; };
+  reset(); const i2 = bm.compileSpan(w.p, Mod);
+  let sets = 0, grows = 0; const s0 = w.table.set.bind(w.table), g0 = w.table.grow.bind(w.table);
+  w.table.set = (...a) => { sets++; return s0(...a); }; w.table.grow = (...a) => { grows++; return g0(...a); };
+  reset(); const i3 = bm.compileSpan(w.p, Mod);
+  if (!(i1 > 0 && i2 === i1 && i3 === i1)) bad.push(`slots ${i1} ${i2} ${i3}`);
+  if (sets || grows) bad.push(`re-hit wrote the table: ${sets} sets, ${grows} grows`);
+  if ((bm.stats.fastHits || 0) !== 2) bad.push(`fastHits=${bm.stats.fastHits}`);
+  if (w.HEAPU32[(ENTRY + STRIDE) >> 2] === 1) bad.push('label 1 not re-installed');
+  tests.push({ name: 'slots: a re-hit of the same span makes no table writes, and re-installs entry + labels', ok: bad.length === 0, detail: bad.join('; ') });
+}
 
 // ---- BATCHED MODULES (2026-10-03): the compile worker emits a batch of offers as ONE module
 // (mips_emit.js emitBatch). Each span's code must run exactly as from its own module: the same
