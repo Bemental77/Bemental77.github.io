@@ -355,10 +355,23 @@ index 713a00a..6272695 100644
  
  static BoardSpace spaceData[2][256];
 diff --git a/src/game/malloc.c b/src/game/malloc.c
-index a66cc87..05e2b90 100644
+index a66cc87..7b6cc5c 100644
 --- a/src/game/malloc.c
 +++ b/src/game/malloc.c
-@@ -22,6 +22,12 @@ void HuMemInitAll(void)
+@@ -12,7 +12,12 @@ void HuMemInitAll(void)
+     u32 free_size;
+     for(i=0; i<4; i++) {
+ #ifdef TARGET_PC
++#ifdef __EMSCRIPTEN__
++        // wasm32: pointers are 4 bytes as on the GameCube, so the 64-bit port's 4x is not needed
++        HeapSizeTbl[i] *= 2;
++#else
+         HeapSizeTbl[i] *= 4;
++#endif
+ #endif
+         ptr = OSAlloc(HeapSizeTbl[i]);
+         if(ptr == NULL) {
+@@ -22,6 +27,12 @@ void HuMemInitAll(void)
          HeapTbl[i] = HuMemInit(ptr, HeapSizeTbl[i]);
      }
      free_size = OSCheckHeap(currentHeapHandle);

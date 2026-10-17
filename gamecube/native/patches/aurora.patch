@@ -50,6 +50,33 @@ index 0447183..38c00f6 100644
    time_t sysTime, tzDST;
  
    time(&sysTime);
+diff --git a/lib/dolphin/AR.cpp b/lib/dolphin/AR.cpp
+index c2cb3bc..56d12f4 100644
+--- a/lib/dolphin/AR.cpp
++++ b/lib/dolphin/AR.cpp
+@@ -16,6 +16,9 @@ static BOOL AR_init_flag;
+ // at a base address returned by ARInit. We emulate this by malloc'ing a buffer
+ // and using a simple bump allocator (matching ARAlloc behavior on real hardware).
+ static u8* sAramBuffer = nullptr;
++#ifdef __EMSCRIPTEN__
++extern "C" void* mp4web_det_calloc(size_t a, size_t b);
++#endif
+ 
+ // Convert an ARAM "address" (offset) to a real host pointer
+ static u8* aramToHost(u32 aramAddr) {
+@@ -62,7 +65,12 @@ u32 ARInit(u32* stack_index_addr, u32 num_entries) {
+     return ARAM_STACK_START;
+   }
+ 
++#ifdef __EMSCRIPTEN__
++  // web: ARAM is game state (the game DMAs data in and reads it back) -> the deterministic game heap
++  sAramBuffer = (u8*)mp4web_det_calloc(1, aurora::g_config.mem2Size);
++#else
+   sAramBuffer = (u8*)calloc(1, aurora::g_config.mem2Size);
++#endif
+   if (sAramBuffer) {
+     Log.debug("Initialized 0x{:X} bytes of ARAM!", aurora::g_config.mem2Size);
+   } else {
 diff --git a/lib/dolphin/dvd/dvd.cpp b/lib/dolphin/dvd/dvd.cpp
 index 863ecb8..5235f25 100644
 --- a/lib/dolphin/dvd/dvd.cpp
@@ -118,6 +145,24 @@ index 863ecb8..5235f25 100644
    const NodDiscOptions options{
        .preloader_threads = 1,
    };
+diff --git a/lib/dolphin/os/OSMemory.cpp b/lib/dolphin/os/OSMemory.cpp
+index 2a963a5..ae9e642 100644
+--- a/lib/dolphin/os/OSMemory.cpp
++++ b/lib/dolphin/os/OSMemory.cpp
+@@ -136,6 +136,13 @@ static void* AllocMEM1(u32 size) {
+   assert(result == mem1Address);
+   return result;
+ }
++#elif defined(__EMSCRIPTEN__)
++// web: MEM1 is game state, so it lives in the deterministic game heap (gamecube/native/src/det_heap.c),
++// inside the range rollback snapshots and the state hash cover
++extern "C" void* mp4web_det_calloc(size_t a, size_t b);
++static void* AllocMEM1(u32 size) {
++  return mp4web_det_calloc(1, size);
++}
+ #else
+ static void* AllocMEM1(u32 size) {
+   return calloc(1, size);
 diff --git a/lib/dolphin/os/OSTime.cpp b/lib/dolphin/os/OSTime.cpp
 index 6207f80..72562c8 100644
 --- a/lib/dolphin/os/OSTime.cpp
@@ -255,6 +300,33 @@ index eff0c65..116f57e 100644
        g_instance.ProcessEvents();
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds{100});
+diff --git a/lib/gfx/common.hpp b/lib/gfx/common.hpp
+index db245d0..271d28e 100644
+--- a/lib/gfx/common.hpp
++++ b/lib/gfx/common.hpp
+@@ -172,11 +172,22 @@ private:
+ 
+ namespace aurora::gfx {
+ inline constexpr bool UseTextureBuffer = true;
++#ifdef __EMSCRIPTEN__
++// web: every byte of a frame's staging buffer is also mirrored in wasm memory while it is mapped.
++// Sized from measured per-frame peaks on Mario Party 4 (title, menus, a board, a minigame) with
++// headroom; textures larger than the upload area take the direct-write path.
++inline constexpr uint64_t UniformBufferSize = 4194304;   // 4mb
++inline constexpr uint64_t VertexBufferSize = 2097152;    // 2mb
++inline constexpr uint64_t IndexBufferSize = 1048576;     // 1mb
++inline constexpr uint64_t StorageBufferSize = 4194304;   // 4mb
++inline constexpr uint64_t TextureUploadSize = 8388608;   // 8mb
++#else
+ inline constexpr uint64_t UniformBufferSize = 25165824;  // 24mb
+ inline constexpr uint64_t VertexBufferSize = 3145728;    // 3mb
+ inline constexpr uint64_t IndexBufferSize = 1048576;     // 1mb
+ inline constexpr uint64_t StorageBufferSize = 8388608;   // 8mb
+ inline constexpr uint64_t TextureUploadSize = 25165824;  // 24mb
++#endif
+ 
+ extern AuroraStats g_stats;
+ extern uint32_t g_drawCallCount;
 diff --git a/lib/gfx/pipeline_cache.cpp b/lib/gfx/pipeline_cache.cpp
 index 04a4310..553a78d 100644
 --- a/lib/gfx/pipeline_cache.cpp

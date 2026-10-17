@@ -55,8 +55,8 @@ extern "C" int port_main(int argc, char* argv[]) {
     config.windowHeight = HU_FB_HEIGHT * 2;
     config.desiredBackend = BACKEND_WEBGPU;
     config.logCallback = &aurora_log_callback;
-    config.mem1Size = 64 * 1024 * 1024;
-    config.mem2Size = 24 * 1024 * 1024;
+    config.mem1Size = 24 * 1024 * 1024;   // hardware MEM1; the game heaps live in the deterministic arena
+    config.mem2Size = 16 * 1024 * 1024;   // hardware ARAM
     config.allowJoystickBackgroundEvents = false;
     config.pauseOnFocusLost = false;
     config.allowTextureDumps = false;
