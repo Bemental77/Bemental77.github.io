@@ -1,0 +1,79 @@
+// gamecube/native/tools/mp4n_probe.mjs — headless driver for mp4-native.html (the MP4 source port).
+// Serves the repo with tools/devserver.mjs on its own port, boots the page in Chrome (SwiftShader
+// Vulkan WebGPU when there is no GPU), and reports state every WAIT/NSHOT seconds with screenshots.
+//   node gamecube/native/tools/mp4n_probe.mjs <waitS> <out.png> [extra query, e.g. "epoch=820000000&hash=30"]
+// env:
+//   NSHOT=n          screenshots/state samples over the run (out_0.png ..)
+//   SCRIPT='[[f0,f1,buttons],..]'  port-0 input by guest frame (GC PAD_* bits; 4096=Start, 256=A)
+//   NAV=board        overlay-relative route: title -> file -> Party Mode -> 1P+3COM -> board -> play
+//   HASHOUT=f.json   with &hash=N: game-state hashes every N frames (compare two runs for determinism)
+//   SNAPTEST=f1,f2   whole-memory snapshot at f1, run to f2, restore, rerun, compare hashes
+//   DIFFAT=f DIFFOUT=f.json [DUMPADDR=a]  per-4KB state checksums at frame f (find what diverges)
+//   WAV=f.wav        with &audrec=S: the first S seconds of game audio
+//   KEYS="sec:Code:holdMs,.."  real keyboard presses;  DUMPIO=1 Chrome stderr;  NOSS=1 no ANGLE SwiftShader
+// Before measured runs: node tools/browser_leak_guard.js reap && uptime; wrap in tools/probe_lock.sh run --
+import { createRequire } from 'module';
+import fs from 'fs'; import os from 'os'; import path from 'path'; import { spawn } from 'child_process';
+const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../..');
+const require = createRequire(process.env.HOME + '/probe-deps/');
+const puppeteer = require('puppeteer');
+const guard = (await import(ROOT + '/tools/browser_leak_guard.js')).default;
+const [waitS, out, qs = ''] = process.argv.slice(2);
+const PORT = 18978;
+const srv = spawn('node', [ROOT + '/tools/devserver.mjs'], { cwd: ROOT, env: Object.assign({}, process.env, { PORT: String(PORT) }), stdio: 'ignore' });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+await sleep(1500);
+const udd = fs.mkdtempSync(path.join(os.tmpdir(), 'mp4n-'));
+const b = await puppeteer.launch({ executablePath: '/opt/pw-browsers/chromium-1194/chrome-linux/chrome', headless: 'new', userDataDir: udd, dumpio: !!process.env.DUMPIO,
+  args: ['--no-sandbox', '--autoplay-policy=no-user-gesture-required', '--enable-unsafe-webgpu', '--enable-features=Vulkan', '--use-vulkan=swiftshader', ...(process.env.NOSS ? [] : ['--use-angle=swiftshader', '--enable-unsafe-swiftshader']), '--window-size=1280,1000'] });
+try { guard.guard(b, 'scratch mp4n'); } catch (_e) {}
+const logs = []; const t0 = Date.now();
+try {
+  const p = await b.newPage(); await p.setViewport({ width: +(process.env.VW || 1100), height: 1000 });
+  await p.evaluateOnNewDocument(() => { window.addEventListener('error', (ev) => console.log('ERRSTACK ' + (ev.error && ev.error.stack))); window.addEventListener('unhandledrejection', (ev) => console.log('REJSTACK ' + (ev.reason && ev.reason.stack)));  });
+  await p.evaluateOnNewDocument(() => { Error.stackTraceLimit = 100; for (const k of ['warn', 'error', 'log']) { const o = console[k].bind(console); console[k] = (...a) => { const t = a.join(' '); o(...a); if (/Instance reference|Device lost|Aborted/.test(t)) o('JSSTACK ' + new Error().stack.split('\n').slice(2, 40).map((l) => l.trim().replace(/\(?http[^)]*\)?/, '')).join(' | ')); }; } });
+  p.on('console', (m) => { logs.push(((Date.now() - t0) / 1000).toFixed(1) + ' ' + m.text().slice(0, /JSSTACK|ERRSTACK|REJSTACK/.test(m.text()) ? 8000 : 500)); if (/Instance reference|Aborted|rror/.test(m.text())) logs.push('  STACK ' + m.stackTrace().slice(0, 25).map((f) => f.url.split('/').pop() + ':' + f.lineNumber + ' ' + (f.functionName||'')).join(' < ')); });
+  p.on('response', (r) => { if (r.status() >= 400) logs.push('HTTP ' + r.status() + ' ' + r.url()); });
+  p.on('pageerror', (e) => logs.push('PAGEERROR ' + String(e.message).slice(0, 400) + ' :: ' + String(e.stack || '').slice(0, 1500)));
+  await p.goto(`http://127.0.0.1:${PORT}/mp4-native.html?autostart=1${qs ? '&' + qs : ''}`, { waitUntil: 'domcontentloaded', timeout: 120000 });
+  // KEYS="sec:Code:holdMs,..." real keyboard presses; SCRIPT='[[f0,f1,buttons],...]' frame-scripted pad 0
+  if (process.env.KEYS) for (const k of process.env.KEYS.split(',')) { const [sec, code, hold] = k.split(':'); setTimeout(async () => { try { await p.keyboard.down(code); await sleep(+hold || 300); await p.keyboard.up(code); logs.push('KEY ' + code + ' @' + sec); } catch (e) {} }, +sec * 1000); }
+  if (process.env.SCRIPT) { await p.waitForFunction(() => window.Mp4Input, { timeout: 120000 }); await p.evaluate((sc) => { const S = JSON.parse(sc); window.Mp4Input.override((f) => { const o = new Array(32).fill(0); o[0] = 1; for (const [a, b, btn, sx, sy] of S) if (f >= a && f < b) { o[1] |= btn; o[2] = sx || 0; o[3] = sy || 0; } if (o[1]) console.log('OVR ' + f + ' ' + o[1]); return o; }); console.log('OVERRIDE SET'); }, process.env.SCRIPT); }
+  if (process.env.SNAPTEST) { const [f1, f2] = process.env.SNAPTEST.split(',').map(Number); await p.waitForFunction(() => window.Mp4State && window.__mp4n.module, { timeout: 120000 }); await p.evaluate((f1, f2) => { const S = window.Mp4State, m = window.__mp4n.module, T = window.__snapT = { phase: 'wait' }; const tick = () => { const f = m._mp4web_total(); if (T.phase === 'wait' && f >= f1) { T.phase = 'snapping'; S.requestSnapshot((snap) => { T.snap = snap; T.snapFrame = snap.frame; T.snapMs = S.lastSnapshotMs; T.memMB = snap.mem.length / 1048576; T.phase = 'run1'; }); } else if (T.phase === 'run1' && f >= f2) { T.phase = 'restoring'; T.pass1 = Object.assign({}, S.hashes); S.hashes = Object.create(null); S.requestRestore(T.snap, (fr) => { T.restoredTo = fr; T.restoreMs = S.lastRestoreMs; T.phase = 'run2'; }); } else if (T.phase === 'run2' && f >= f2) { T.pass2 = Object.assign({}, S.hashes); T.phase = 'done'; } if (T.phase !== 'done') setTimeout(tick, 50); }; tick(); }, f1, f2); }
+  if (process.env.DIFFAT) { await p.waitForFunction(() => window.Mp4State && window.__mp4n.module && window.__mp4n.module.mp4FrameHook, { timeout: 120000 }); await p.evaluate((F, D) => { const m = window.__mp4n.module, prev = m.mp4FrameHook; m.mp4FrameHook = (f) => { if (f === F) { const pr = m._malloc(32); m._mp4web_state_ranges(pr); const R = Array.from(new Uint32Array(m.HEAPU8.buffer, pr, 8)); m._free(pr); const H = m.HEAPU8, CH = 4096; const sum = (a, b) => { const out = []; for (let o = a; o < b; o += CH) { let h = 2166136261; const e = Math.min(b, o + CH); for (let i = o; i < e; i++) { h ^= H[i]; h = Math.imul(h, 16777619); } out.push([o, h >>> 0]); } return out; }; window.__diff = { R, mem1: sum(R[0], R[0] + R[1]), data: sum(R[2], R[3]), bss: sum(R[4], R[6]).concat(sum(R[7], R[5])), dump: D ? Array.from(H.subarray(D, D + 4096)) : null }; } return prev(f); }; }, +process.env.DIFFAT, +(process.env.DUMPADDR || 0)); }
+  // NAV=board: inputs keyed to overlay starts (console "DLLStart N"), so the route survives timing shifts
+  if (process.env.NAV) {
+    p.on('console', (msg) => { const mm = /DLLStart (\d+)/.exec(msg.text()); if (mm) p.evaluate((o) => { const m = window.__mp4n && window.__mp4n.module; (window.__ovl = window.__ovl || {})[o] = m ? m._mp4web_total() : 0; window.__ovlLast = o; }, +mm[1]).catch(() => {}); });
+    await p.waitForFunction(() => window.Mp4Input, { timeout: 120000 });
+    if (process.env.NAVEXTRA) await p.evaluate((x) => { window.__navExtra = JSON.parse(x); }, process.env.NAVEXTRA);
+    await p.evaluate(() => {
+      const A = 256, START = 4096, LEFT = 1;
+      const rel70 = [];
+      for (const f of [110, 260, 410, 560, 710]) rel70.push([f, A]);
+      for (const f of [860, 900, 940, 980]) rel70.push([f, LEFT]);
+      if (window.__navExtra) { for (const e of window.__navExtra) rel70.push(e); } else {
+      for (let f = 1060; f <= 3310; f += 200) rel70.push([f, A]);
+      rel70.push([3510, START], [3710, START]);
+      for (let f = 3910; f < 30000; f += 150) rel70.push([f, A]); }
+      window.Mp4Input.override((f) => {
+        const o = new Array(32).fill(0); o[0] = 1; const ov = window.__ovl || {};
+        let btn = 0;
+        if (ov[70] !== undefined) { const r = f - ov[70]; for (const [a, b, len] of rel70) if (r >= a && r < a + (len || 8)) btn |= b; }
+        else if (ov[74] !== undefined) { const r = f - ov[74]; if (r > 150 && r % 150 < 8) btn |= A; }
+        else if (f > 900 && f % 100 < 8) btn |= START;
+        o[1] = btn; return o;
+      });
+    });
+  }
+  const n = +(process.env.NSHOT || 1);
+  for (let k = 0; k < n; k++) {
+    await sleep(+waitS * 1000 / n);
+    const st = await p.evaluate(() => { const m = window.__mp4n || {}; const mod = m.module; return { phase: m.phase, errors: m.errors, frames: mod && mod._mp4web_frames ? mod._mp4web_frames() : null, reanchors: mod && mod._mp4web_reanchors ? mod._mp4web_reanchors() : null, last: window.Mp4Input && window.Mp4Input.last() ? window.Mp4Input.last().slice(0, 4).join('/') : null, total: mod && mod._mp4web_total ? mod._mp4web_total() : null, busy: mod && mod._mp4web_busy_ms ? Math.round(mod._mp4web_busy_ms()) : null, audio: m.audio ? { pushed: m.audio.pushed, nonSilent: m.audio.nonSilent, peak: m.audio.peak, gaps: m.audio.gaps, drops: m.audio.drops, ctx: m.audio.ctx && m.audio.ctx.state } : null, det: mod && mod._mp4web_det_heap_high_water ? [mod._mp4web_det_heap_high_water(), mod._mp4web_det_heap_fallbacks()] : null, gpuw: mod && mod._mp4web_gpu_wait_ms ? Math.round(mod._mp4web_gpu_wait_ms()) : null, t: performance.now() }; }).catch((e) => ({ err: String(e) }));
+    console.log(((Date.now() - t0) / 1000).toFixed(1) + 's ' + JSON.stringify(st));
+    await p.screenshot({ path: n > 1 ? out.replace(/\.png$/, '_' + k + '.png') : out });
+  }
+  if (process.env.SNAPTEST) { const r = await p.evaluate(() => { const T = window.__snapT || {}; return { phase: T.phase, snapFrame: T.snapFrame, restoredTo: T.restoredTo, snapMs: T.snapMs, restoreMs: T.restoreMs, memMB: T.memMB, pass1: T.pass1, pass2: T.pass2 }; }); logs.push('SNAPTEST ' + JSON.stringify(r)); }
+  if (process.env.DIFFOUT) { const d = await p.evaluate(() => window.__diff); fs.writeFileSync(process.env.DIFFOUT, JSON.stringify(d)); logs.push('DIFF ' + !!d); }
+  if (process.env.HASHOUT) { const h = await p.evaluate(() => window.Mp4State && window.Mp4State.hashes); fs.writeFileSync(process.env.HASHOUT, JSON.stringify(h)); logs.push('HASHES ' + Object.keys(h || {}).length); }
+  if (process.env.WAV) { const b64 = await p.evaluate(() => { const a = window.__mp4n.audio; if (!a || !a.rec) return null; const u = new Uint8Array(a.rec.buffer, 0, a.recLen * 2); let s = ''; for (let i = 0; i < u.length; i += 32768) s += String.fromCharCode.apply(null, u.subarray(i, i + 32768)); return btoa(s); }); if (b64) { const pcm = Buffer.from(b64, 'base64'); const h = Buffer.alloc(44); h.write('RIFF', 0); h.writeUInt32LE(36 + pcm.length, 4); h.write('WAVEfmt ', 8); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(2, 22); h.writeUInt32LE(32000, 24); h.writeUInt32LE(128000, 28); h.writeUInt16LE(4, 32); h.writeUInt16LE(16, 34); h.write('data', 36); h.writeUInt32LE(pcm.length, 40); fs.writeFileSync(process.env.WAV, Buffer.concat([h, pcm])); logs.push('WAV ' + pcm.length); } }
+} finally { console.log(logs.join('\n')); try { await b.close(); } catch (_e) {} srv.kill(); fs.rmSync(udd, { recursive: true, force: true }); }
