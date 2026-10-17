@@ -26,11 +26,15 @@
   .readout { margin-top: 10px; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--fg); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
   .readout b { font-weight: 600; }
   .readout .warn { color: var(--accent); }
+  .note { margin-top: 12px; padding: 12px 14px; border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 6px; background: var(--panel); }
+  .note a { color: var(--accent); font-weight: 600; }
   .keys { margin-top: 6px; color: var(--muted); font-size: 13px; }
   .keys kbd { font: 12px ui-monospace, monospace; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; background: var(--panel); }
   pre#log { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px; max-height: 220px; overflow: auto; font-size: 12px; margin-top: 12px; white-space: pre-wrap; }
 </style>
-<script src="/lib/netplay.js?v=48908ab8"></script>
+<script src="/lib/capability.js?v=b411172f"></script>
+<script src="/lib/bench.js?v=3a51eccb"></script><!-- ?bench=1 real-device benchmark; inert without it -->
+<script src="/lib/netplay.js?v=f4a331e0"></script>
 <script src="/lib/netplay-ui.js?v=8f7af831"></script>
 <script src="/gamecube/native/mp4n_room.js"></script>
 </head>
@@ -44,6 +48,7 @@
     <button id="btnRoomGo" hidden>Start the party now</button>
     <span id="status">Idle</span>
   </div>
+  <div class="note" id="capNote" role="status" hidden></div>
   <div class="readout" id="readout" aria-live="off"></div>
   <div class="keys">Move <kbd>&larr;&uarr;&darr;&rarr;</kbd>/<kbd>WASD</kbd> &middot; A <kbd>Space</kbd>/<kbd>X</kbd> &middot; B <kbd>Z</kbd> &middot; X <kbd>C</kbd> &middot; Y <kbd>V</kbd> &middot; L/R <kbd>Q</kbd>/<kbd>E</kbd> &middot; Z <kbd>Shift</kbd> &middot; Start <kbd>Enter</kbd> &middot; C-stick <kbd>IJKL</kbd> &middot; D-pad <kbd>TFGH</kbd> &middot; gamepads work too</div>
   <pre id="log"></pre>
@@ -183,6 +188,8 @@
       Mp4State.attach(mod);
       if (Q.get('hash')) Mp4State.hashEvery(+Q.get('hash') || 60);
       if (window.Mp4Room) Mp4Room.attach(mod);
+      // ?frameskip=N: at most N undrawn frames in a row when behind (0 = always draw; default 3)
+      if (Q.get('frameskip') != null && mod._mp4web_set_frameskip) mod._mp4web_set_frameskip(+Q.get('frameskip') || 0);
       startReadout(mod);
       mod.callMain([]);
     } catch (e) {
@@ -200,13 +207,13 @@
     function snap() {
       var rm = window.Mp4Room && Mp4Room.active() ? Mp4Room.report() : null;
       // in a room the guest clock is the room's live frames; re-simulated frames are not new time
-      return { t: performance.now(), f: rm && rm.armed ? rm.stats.live : mod._mp4web_total(), busy: mod._mp4web_busy_ms(), gpu: mod._mp4web_gpu_wait_ms(), re: mod._mp4web_reanchors(), rm: rm };
+      return { t: performance.now(), f: rm && rm.armed ? rm.stats.live : mod._mp4web_total(), d: mod._mp4web_drawn ? mod._mp4web_drawn() : null, busy: mod._mp4web_busy_ms(), gpu: mod._mp4web_gpu_wait_ms(), re: mod._mp4web_reanchors(), rm: rm };
     }
     setInterval(function () {
       var c = snap();
       if (prev && c.f > prev.f) {
         var df = c.f - prev.f, dt = (c.t - prev.t) / 1000, rate = df / dt / 60, ms = (c.busy - prev.busy) / df, gpu = (c.gpu - prev.gpu) / df;
-        var r = { guestRate: rate, framesPerSec: df / dt, hostMsPerFrame: ms, gpuWaitMsPerFrame: gpu, cpuMsPerFrame: ms - gpu, headroom: (1000 / 60) / ms, reanchors: c.re - prev.re, frames: c.f };
+        var r = { guestRate: rate, framesPerSec: (c.d != null && prev.d != null) ? (c.d - prev.d) / dt : df / dt, hostMsPerFrame: ms, gpuWaitMsPerFrame: gpu, cpuMsPerFrame: ms - gpu, headroom: (1000 / 60) / ms, reanchors: c.re - prev.re, frames: c.f };
         window.__mp4n.rate = r;
         var roomTxt = '';
         if (c.rm && c.rm.armed) {
@@ -228,17 +235,66 @@
       prev = c;
     }, 1000);
   }
-  btn.addEventListener('click', start);
+  // ---- browsers without WebGPU -------------------------------------------------------------------
+  // This port draws only through WebGPU. lib/capability.js measures it by DOING it (adapter, device,
+  // a configured canvas context — a present navigator.gpu proves nothing). Where it fails (older
+  // Safari, Firefox without WebGPU, some Android / Xbox Edge) the visitor is sent to gamecube.html,
+  // which runs Mario Party 4 on its recomp engine with a WebGL2 fallback, and is told why first.
+  // ?forcenative=1 skips the check. A room is different: everyone in it must run the same engine,
+  // so a native room cannot be joined from the recomp page — the note says so and links the lobby.
+  var CAP = { checked: false, ok: true, why: null };
+  function capOk(r) { var w = r && r.webgpu; return !!(w && w.adapter && w.device && w.canvasCtx && w.configured); }
+  function capCheck() {
+    if (Q.get('forcenative') === '1' || !window.Capability || !Capability.ready) { CAP.checked = true; return Promise.resolve(CAP); }
+    return Capability.ready.then(function (r) {
+      CAP.checked = true; CAP.ok = capOk(r);
+      CAP.why = CAP.ok ? null : ((r && r.webgpu && r.webgpu.err) || 'no working WebGPU');
+      window.__mp4n.cap = { ok: CAP.ok, why: CAP.why };
+      return CAP;
+    }, function () { CAP.checked = true; return CAP; });
+  }
+  function capRoute() {
+    var note = document.getElementById('capNote');
+    var inRoom = !!Q.get('np');
+    btn.disabled = true;
+    window.__mp4n.phase = 'no-webgpu';
+    if (inRoom) {
+      note.innerHTML = '<b>This browser can\'t run the native port</b> — it has no working WebGPU (<span class="why"></span>). ' +
+        'Everyone in a room runs the same engine, so this room can\'t be joined from here. Ask the host to open a ' +
+        '<a href="/multiplayer.html">GameCube-engine Mario Party 4 room</a> instead, which runs without WebGPU, ' +
+        'or open this link in Chrome or Edge on a computer. <a href="?forcenative=1">Try anyway</a>';
+      status('This browser has no WebGPU');
+    } else {
+      var target = '/gamecube.html';
+      note.innerHTML = '<b>Your browser has no working WebGPU</b> (<span class="why"></span>), which this native port needs. ' +
+        'Mario Party 4 also runs on the site\'s GameCube engine without it — opening that now. ' +
+        '<a href="' + target + '">Open it now</a> &middot; <a href="?forcenative=1">Try the native port anyway</a>';
+      status('Opening the GameCube engine…');
+      try { localStorage.setItem('gcwasm_romIdx', '0'); } catch (e) {}   // gamecube.html ROMS[0] is Mario Party 4
+      if (Q.get('noredirect') !== '1') setTimeout(function () { location.href = target; }, 4000);
+    }
+    note.querySelector('.why').textContent = CAP.why;
+    note.hidden = false;
+    log('capability: no WebGPU (' + CAP.why + ') — ' + (inRoom ? 'room cannot be joined here' : 'routing to gamecube.html'));
+  }
+  var startRequested = false;
+  var startGated = function () {
+    if (startRequested) return; startRequested = true;
+    capCheck().then(function () { if (CAP.ok) start(); else capRoute(); });
+  };
+  capCheck().then(function () { if (!CAP.ok) capRoute(); });
+
+  btn.addEventListener('click', function () { capCheck().then(function () { if (CAP.ok) start(); else capRoute(); }); });
   document.getElementById('btnRoomGo').addEventListener('click', function () { if (window.Mp4Room) Mp4Room.startNow(); });
   // ?np=<CODE>&game=<key>[&join=1][&players=2-4][&net=local]: handed a room by multiplayer.html (or
   // opened from the Party button). The game starts by itself once the party has connected; frame 0
   // runs when every seated player is holding at it.
   var NP = { np: Q.get('np'), game: Q.get('game'), join: Q.get('join') === '1', players: Q.get('players') };
-  if (window.Mp4Room && Mp4Room.mount({ log: log, onStart: start, handoff: NP })) {
+  if (window.Mp4Room && Mp4Room.mount({ log: log, onStart: startGated, handoff: NP })) {
     var ho = Mp4Room._R.handoff;
     if (ho) { status((ho.join ? 'Joining' : 'Hosting') + ' room ' + ho.code + ' — waiting for ' + (ho.join ? 'the host' : ho.players + ' players')); log('room: handed ' + ho.code + ' for ' + (ho.game || 'Mario Party 4') + (ho.join ? ' (joining)' : ' (hosting, ' + ho.players + ' players)')); }
   }
-  if (Q.get('autostart') === '1') start();
+  if (Q.get('autostart') === '1') startGated();
 })();
 </script>
 </body>

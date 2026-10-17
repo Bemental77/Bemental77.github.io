@@ -26,6 +26,8 @@
 //   --gputhrottle 1|0 duty-cycle the GPU process too (default 1; 0 = old arm)
 //   --proof-only      run calibration + the arm-difference proofs and exit
 //   --out <file>      JSON (default /tmp/toaster-bench.json)
+//   --webgpu 1        add SwiftShader Vulkan WebGPU (needed by mp4native; give the page it is compared with the same)
+//   --qs '&k=v'       extra query on the bench URL (mp4native: '&players=2' for the 2-player loopback room)
 //
 // ── THE TOASTER ARM ─────────────────────────────────────────────────────────
 //   1. --use-angle=swiftshader --enable-unsafe-swiftshader: no GPU. The arm
@@ -107,8 +109,12 @@ const guardMod = (await import('./browser_leak_guard.js')).default;
 const argv = process.argv.slice(2);
 const flag = (n, d) => { const i = argv.indexOf('--' + n); return i >= 0 && argv[i + 1] != null ? argv[i + 1] : d; };
 const BASE = flag('url', 'http://localhost:8080');
-const PATHS = { n64: '/n64/index.html', ps1: '/ps1.html', snes: '/snes.html', genesis: '/genesis.html', gba: '/gba.html', gamecube: '/gamecube.html', dreamcast: '/dreamcast.html' };
-const PAGES = flag('pages', Object.keys(PATHS).join(',')).split(',');
+const PATHS = { n64: '/n64/index.html', ps1: '/ps1.html', snes: '/snes.html', genesis: '/genesis.html', gba: '/gba.html', gamecube: '/gamecube.html', dreamcast: '/dreamcast.html', mp4native: '/mp4-native.html' };
+// mp4native is not in the default set (it needs WebGPU: run it with --webgpu 1, and its comparison
+// page gamecube with the same flag, so both arms run in the same browser configuration)
+const PAGES = flag('pages', Object.keys(PATHS).filter((k) => k !== 'mp4native').join(',')).split(',');
+const WEBGPU = flag('webgpu', '0') === '1';   // SwiftShader Vulkan WebGPU (headless Chrome has no WebGPU device without it)
+const QS = flag('qs', '');                     // extra query appended to the bench URL (carried into the room phase by lib/bench.js)
 const REPS = +flag('reps', 3);
 const LADDER = flag('ladder', '1') !== '0';
 const SEC = +flag('sec', 20);
@@ -127,6 +133,7 @@ const dbg = (...a) => { if (process.env.TOASTER_DEBUG) console.log('[toaster:dbg
 function chromeArgs() {
   const a = ['--no-sandbox', '--ignore-certificate-errors', '--autoplay-policy=no-user-gesture-required', '--enable-unsafe-webgpu'];
   if (GPU === 'swiftshader') a.push('--use-angle=swiftshader', '--enable-unsafe-swiftshader');
+  if (WEBGPU) a.push('--enable-features=Vulkan', '--use-vulkan=swiftshader');
   if (HEAP > 0) a.push(`--js-flags=--max-old-space-size=${HEAP}`);
   return a;
 }
@@ -309,7 +316,7 @@ async function benchRun(page, rate) {
   try {
     const p = await b.newPage();
     p.on('pageerror', (e) => errs.push(String(e.message).slice(0, 200)));
-    const url = `${BASE}${PATHS[page]}?bench=1&benchauto=1&benchsec=${SEC}`;
+    const url = `${BASE}${PATHS[page]}?bench=1&benchauto=1&benchsec=${SEC}${QS}`;
     await p.goto(url, { waitUntil: 'load', timeout: 180000 }).catch((e) => errs.push('goto ' + e.message));
     const deadline = Date.now() + Math.min(40, 8 + 4 * rate) * 60000;
     while (!r && Date.now() < deadline) {
@@ -323,7 +330,7 @@ async function benchRun(page, rate) {
   const recs = th.records();
   await close(b);
   const w = (s) => s ? { pass: passOf(s), speed: s.speed, over: s.over, frames: s.frames, p50: s.ms && s.ms.p50, p99: s.ms && s.ms.p99,
-                          max: s.ms && s.ms.max, budgetMs: s.budgetMs, mode: s.mode, delay: s.delay, error: s.error } : null;
+                          max: s.ms && s.ms.max, budgetMs: s.budgetMs, fps: s.fps, mode: s.mode, delay: s.delay, error: s.error } : null;
   const ss = GPU !== 'swiftshader' ? null : /swiftshader/i.test(String(renderer || ''));
   return { page, rate, ok: !!r, pass: r ? r.pass : false, solo: r ? w(r.solo) : { pass: false, error: 'no bench result before the deadline' },
            // a room that was attempted (result published from the room phase) and never ran is a FAIL
