@@ -60,7 +60,16 @@
   // Two builds of the same module: dist/ (solo) and dist/rb/ (with the rollback write barrier, which
   // costs CPU every frame — loaded only by a room, or with ?rb=1 for the rollback self-test).
   var BUILD = Q.get('build') || 'gamecube/native/dist/';
-  function buildFor(room) { return Q.get('build') || ((room || Q.get('rb') === '1') ? 'gamecube/native/dist/rb/' : 'gamecube/native/dist/'); }
+  // Solo on a browser with JSPI (WebAssembly.Suspending, Chrome 137+): dist/jspi/ — libco's fibers and
+  // the frame sleep run on JSPI, nothing is Asyncify-instrumented (?jspi=0 forces the Asyncify build).
+  // A room always loads dist/rb/ (Asyncify: a paused fiber must live in memory to be rolled back).
+  function hasJspi() { try { return typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function'; } catch (e) { return false; } }
+  function buildFor(room) {
+    if (Q.get('build')) return Q.get('build');
+    if (room || Q.get('rb') === '1') return 'gamecube/native/dist/rb/';
+    if (Q.get('jspi') !== '0' && hasJspi()) return 'gamecube/native/dist/jspi/';
+    return 'gamecube/native/dist/';
+  }
   var PARTS = ['a', 'b', 'c', 'd', 'e', 'f'];
   var logEl = document.getElementById('log'), statusEl = document.getElementById('status');
   var btn = document.getElementById('btnStart');
@@ -134,6 +143,8 @@
     var room = window.Mp4Room ? Mp4Room.bootOpts() : null;   // inside a room: the shared epoch and a fresh card
     if (room) log('room: booting with the room\'s epoch and a fresh memory card');
     BUILD = buildFor(!!room);
+    window.__mp4n.build = BUILD;
+    log('build: ' + BUILD);
     audioInit();
     try {
       if (!navigator.gpu) throw new Error('this browser has no WebGPU');

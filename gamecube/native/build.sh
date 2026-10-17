@@ -126,11 +126,12 @@ if [ "$STAGE" = link ] || [ "$STAGE" = all ]; then
   printf 'char mp4web_game_data_b[1] = {1};\nchar mp4web_game_bss_b[1];\n' > "$BUILD/mark/game_b.c"
   printf 'char mp4web_game_data_e[1] = {1};\nchar mp4web_game_bss_e[1];\n' > "$BUILD/mark/game_e.c"
   for m in game_b game_e; do emcc "${CF[@]}" -c "$BUILD/mark/$m.c" -o "$BUILD/mark/$m.o"; done
+  EXPORTS=_main,_mp4web_frames,_mp4web_reanchors,_mp4web_total,_mp4web_busy_ms,_mp4web_gpu_wait_ms,_mp4web_audio_samples,_mp4web_state_hash,_mp4web_state_ranges,_mp4web_rb_enable,_mp4web_rb_disable,_mp4web_rb_boundary,_mp4web_rb_restore,_mp4web_rb_oldest,_mp4web_rb_hash,_mp4web_rb_stats,_mp4web_rb_on,_mp4web_rb_audit,_mp4web_rb_hash_full,_mp4web_rb_pages,_mp4web_rb_small_hash,_mp4web_rb_base,_mp4web_rb_page_hashes,_mp4web_set_frame,_mp4web_set_max_debt,_mp4web_set_gfx_skip,_mp4web_set_frameskip,_mp4web_drawn,_mp4web_auto_skipped,_mp4web_gpu_scratch_frames,_mp4web_set_gpu_nowait,_mp4web_cow,_mp4web_mem_stats,_mp4web_det_heap_high_water,_mp4web_det_heap_fallbacks,_malloc,_free
   # game objects first, then the overlays in their bracketed order (rel_dispatch.c relies on it)
   em++ -O2 -fexceptions "${PORTS[@]}" -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=131072 -sSTACK_SIZE=1048576 \
     -sINITIAL_MEMORY=268435456 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2147483648 \
     -sENVIRONMENT=web -sEXIT_RUNTIME=0 -sINVOKE_RUN=0 -sMODULARIZE=1 -sEXPORT_NAME=createMp4Native \
-    -lidbfs.js -sEXPORTED_RUNTIME_METHODS=callMain,HEAPU8,HEAP16,HEAP32,FS,IDBFS,addRunDependency,removeRunDependency -sEXPORTED_FUNCTIONS=_main,_mp4web_frames,_mp4web_reanchors,_mp4web_total,_mp4web_busy_ms,_mp4web_gpu_wait_ms,_mp4web_audio_samples,_mp4web_state_hash,_mp4web_state_ranges,_mp4web_rb_enable,_mp4web_rb_disable,_mp4web_rb_boundary,_mp4web_rb_restore,_mp4web_rb_oldest,_mp4web_rb_hash,_mp4web_rb_stats,_mp4web_rb_on,_mp4web_rb_audit,_mp4web_rb_hash_full,_mp4web_rb_pages,_mp4web_rb_small_hash,_mp4web_rb_base,_mp4web_rb_page_hashes,_mp4web_set_frame,_mp4web_set_max_debt,_mp4web_set_gfx_skip,_mp4web_set_frameskip,_mp4web_drawn,_mp4web_auto_skipped,_mp4web_gpu_scratch_frames,_mp4web_set_gpu_nowait,_mp4web_cow,_mp4web_mem_stats,_mp4web_det_heap_high_water,_mp4web_det_heap_fallbacks,_malloc,_free \
+    -lidbfs.js -sEXPORTED_RUNTIME_METHODS=callMain,HEAPU8,HEAP16,HEAP32,FS,IDBFS,addRunDependency,removeRunDependency -sEXPORTED_FUNCTIONS="$EXPORTS" \
     -sFORCE_FILESYSTEM=1 --post-js "$HERE/src/post.js" --js-library "$HERE/src/rollback_lib.js" ${LINK_EXTRA:-} -Wl,--Map="$OUT/mp4native.map" \
     "$BUILD"/obj/au__*.o "$BUILD/mark/game_b.o" "$BUILD"/obj/gau__*.o "$BUILD"/obj/game__*.o $(cat "$BUILD/rel/link_order.txt") "$BUILD/mark/game_e.o" -o "$OUT/mp4native.js" 2> "$OUT/link.log" \
     && echo "[link] ok $(stat -c %s "$OUT/mp4native.wasm") B wasm" || { echo "[link] FAIL"; grep -c "undefined symbol" "$OUT/link.log"; head -c 3000 "$OUT/link.log"; exit 1; }
@@ -141,5 +142,30 @@ if [ "$STAGE" = link ] || [ "$STAGE" = all ]; then
   if [ "${WB:-1}" = 1 ]; then
     mkdir -p "$OUT/rb"
     bash "$HERE/wb/instrument.sh" "$OUT/mp4native.wasm" "$OUT/rb/mp4native.wasm" && cp "$OUT/mp4native.js" "$OUT/rb/mp4native.js"
+  fi
+  # THE JSPI SOLO BUILD (OUT/jspi/): the same objects, but libco's fibers switch on JSPI
+  # (src/libco_jspi.c + src/libco_jspi.js) and the game loop sleeps on JSPI, so nothing is Asyncify-
+  # instrumented. Solo only — a JSPI fiber's paused stack lives in the JS engine, not in memory, so it
+  # cannot be rolled back; rooms load rb/. The page picks it where WebAssembly.Suspending exists.
+  if [ "${JSPI:-1}" = 1 ]; then
+    mkdir -p "$OUT/jspi"
+    cc1 jspi "$HERE/src/libco_jspi.c" "${GAMEF[@]}" -include "$HERE/shim/det_alloc.h" || exit 1
+    oname() { echo "$BUILD/obj/$1__$(echo "$2" | sed "s#^$SRC/##; s#^$DEPS/##; s#[/.]#_#g").o"; }
+    JOBJ=$(oname jspi "$HERE/src/libco_jspi.c")
+    # JS-based C++ exceptions put a JS frame (invoke_*) between wasm frames, and JSPI cannot suspend
+    # through a JS frame. The C++ that uses exceptions (the port's .cpp files, main) is built again
+    # with wasm exceptions for this variant; everything else is plain C / no-exception C++.
+    game_srcs | grep '\.cpp$' | build_list wx "${GAMEF[@]}" -fwasm-exceptions
+    echo "$HERE/src/portmain_web.cpp" | build_list wx "${GAMEF[@]}" -fwasm-exceptions
+    echo "$AU/lib/gfx/png_io.cpp" | build_list wx -fwasm-exceptions -sSUPPORT_LONGJMP=wasm   # libpng's setjmp
+    GOBJS=$(for f in $(game_srcs); do case "$f" in *libco_fiber.c) echo "$JOBJ" ;; *.cpp) oname wx "$f" ;; *) oname game "$f" ;; esac; done)
+    AOBJS=$(for o in "$BUILD"/obj/au__*.o; do case "$o" in *portmain_web*) oname wx "$HERE/src/portmain_web.cpp" ;; *png_io*) oname wx "$AU/lib/gfx/png_io.cpp" ;; *) echo "$o" ;; esac; done)
+    em++ -O2 -fwasm-exceptions -sSUPPORT_LONGJMP=wasm "${PORTS[@]}" -sJSPI=1 -sJSPI_EXPORTS=mp4web_co_entry -sSTACK_SIZE=1048576 \
+      -sINITIAL_MEMORY=268435456 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2147483648 \
+      -sENVIRONMENT=web -sEXIT_RUNTIME=0 -sINVOKE_RUN=0 -sMODULARIZE=1 -sEXPORT_NAME=createMp4Native \
+      -lidbfs.js -sEXPORTED_RUNTIME_METHODS=callMain,HEAPU8,HEAP16,HEAP32,FS,IDBFS,addRunDependency,removeRunDependency -sEXPORTED_FUNCTIONS="$EXPORTS,_mp4web_co_entry" \
+      -sFORCE_FILESYSTEM=1 --post-js "$HERE/src/post.js" --js-library "$HERE/src/rollback_lib.js" --js-library "$HERE/src/libco_jspi.js" ${LINK_EXTRA:-} ${JSPI_LINK_EXTRA:-} \
+      $AOBJS "$BUILD/mark/game_b.o" "$BUILD"/obj/gau__*.o $GOBJS $(cat "$BUILD/rel/link_order.txt") "$BUILD/mark/game_e.o" -o "$OUT/jspi/mp4native.js" 2> "$OUT/jspi/link.log" \
+      && echo "[link jspi] ok $(stat -c %s "$OUT/jspi/mp4native.wasm") B wasm" || { echo "[link jspi] FAIL"; head -c 3000 "$OUT/jspi/link.log"; exit 1; }
   fi
 fi
