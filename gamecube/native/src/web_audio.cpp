@@ -34,7 +34,11 @@ uint64_t sSamplesOut = 0;
 int64_t sEpochTicks = -1;
 
 struct PendingRead { DVDFileInfo* fileInfo; void* addr; s32 length; s32 offset; DVDCallback callback; };
-std::vector<PendingRead> sReads;
+// a fixed array, not a std::vector: this file's statics are game state (rolled back with it), and a
+// vector's buffer would live in the shared C heap outside that state
+constexpr int kMaxReads = 32;
+PendingRead sReads[kMaxReads];
+int sReadCount = 0;
 
 void output_callback(s16* output, size_t frames, u32 rate, u32 channels) {
   (void)output; (void)frames; (void)rate; (void)channels;
@@ -65,8 +69,9 @@ void partyboard_audio_shutdown(void) { sStarted = false; }
 
 // Stream reads complete at the next frame's audio step (a fixed point in the frame), not inline.
 BOOL partyboard_audio_read_async(DVDFileInfo* fileInfo, void* addr, s32 length, s32 offset, DVDCallback callback) {
+  if (sReadCount >= kMaxReads) return FALSE;
   fileInfo->cb.state = DVD_STATE_BUSY;
-  sReads.push_back({fileInfo, addr, length, offset, callback});
+  sReads[sReadCount++] = {fileInfo, addr, length, offset, callback};
   return TRUE;
 }
 
@@ -81,10 +86,13 @@ void AISetStreamVolLeft(u8 vol) { (void)vol; }
 void AISetStreamVolRight(u8 vol) { (void)vol; }
 
 static void process_reads() {
-  if (sReads.empty()) return;
-  std::vector<PendingRead> reads;
-  reads.swap(sReads);
-  for (const auto& r : reads) {
+  if (sReadCount == 0) return;
+  PendingRead reads[kMaxReads];
+  const int n = sReadCount;
+  memcpy(reads, sReads, sizeof(PendingRead) * n);
+  sReadCount = 0;
+  for (int i = 0; i < n; ++i) {
+    const PendingRead& r = reads[i];
     const s32 result = DVDReadPrio(r.fileInfo, r.addr, r.length, r.offset, 2);
     if (r.callback != nullptr) r.callback(result, r.fileInfo);
   }

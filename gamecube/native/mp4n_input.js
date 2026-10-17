@@ -3,7 +3,8 @@
 // frame boundary); this samples every source AT THAT MOMENT and writes 4 ports x 8 i32:
 //   [connected, buttons (GC PAD_* bits), stickX, stickY, substickX, substickY, trigL, trigR]
 // Port 0 = keyboard + touch + the first gamepad; ports 1-3 = further gamepads.
-// Mp4Input.override(fn) replaces the source entirely (netplay / replay feed recorded frames).
+// Mp4Input.override(fn) replaces the source entirely (netplay / replay feed recorded frames);
+// Mp4Input.sampleLocal() is this screen's player as a room's 8-byte pad image.
 (function () {
   'use strict';
   var B = { LEFT: 0x1, RIGHT: 0x2, DOWN: 0x4, UP: 0x8, Z: 0x10, R: 0x20, L: 0x40, A: 0x100, B: 0x200, X: 0x400, Y: 0x800, START: 0x1000 };
@@ -113,8 +114,24 @@
     stage.appendChild(o);
   }
 
+  // This console's own player as the 8-byte pad image a netplay room exchanges:
+  //   [buttons lo, buttons hi, stickX, stickY, substickX, substickY, trigL, trigR] (sticks as int8)
+  // Keyboard + touch + the first connected gamepad — the one person at this screen.
+  function sampleLocal() {
+    var rec = { btn: 0, sx: 0, sy: 0, cx: 0, cy: 0, tl: 0, tr: 0 };
+    samplePort0Keyboard(rec);
+    var pads = (navigator.getGamepads ? Array.prototype.slice.call(navigator.getGamepads()) : []).filter(function (g) { return g && g.connected; });
+    if (pads[0]) samplePad(pads[0], rec);
+    var b = new Uint8Array(8);
+    b[0] = rec.btn & 0xFF; b[1] = (rec.btn >> 8) & 0xFF;
+    b[2] = clamp127(rec.sx) & 0xFF; b[3] = clamp127(rec.sy) & 0xFF; b[4] = clamp127(rec.cx) & 0xFF; b[5] = clamp127(rec.cy) & 0xFF;
+    b[6] = Math.min(255, rec.tl | 0); b[7] = Math.min(255, rec.tr | 0);
+    return b;
+  }
+
   window.Mp4Input = {
     BUTTONS: B,
+    sampleLocal: sampleLocal,
     latch: latch,
     attachTouch: attachTouch,
     override: function (fn) { overrideFn = fn; },

@@ -263,6 +263,12 @@
       // one-emulated-frame boundary to gate — so they are NOT offered here.
       note: 'Only Mario Party 4 can run a room on GameCube — the other titles have no frame gate yet.',
       games: [ { key: 'Mario Party 4', label: 'Mario Party 4' } ] },
+    // The native source port (mp4-native.html): Mario Party 4 compiled to WebAssembly, no
+    // emulator. Rollback rooms of 2-4 (gamecube/native/mp4n_room.js); the host starts when the
+    // party is in, or sooner with "Start with N players now".
+    { key: 'mp4native', name: 'Mario Party 4 (native)', page: '/mp4-native.html', handoff: '/mp4-native.html?np=', hostFlag: '',
+      players: 4, note: 'The native port — up to four players, zero input delay (rollback). The host starts once everyone is in.',
+      games: [ { key: 'Mario Party 4', label: 'Mario Party 4 (native port)' } ] },
     { key: 'genesis', name: 'Sega Genesis', page: '/genesis.html', handoff: '/genesis.html?np=', hostFlag: 'host=1',
       // 4 since 2026-10-07: a Team Player / 4-Way Play goes in for 3+ seated on
       // a cart that takes one (genesis.html genMultitapPlan). Neither listed

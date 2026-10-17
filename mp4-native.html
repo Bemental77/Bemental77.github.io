@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
 <title>Mario Party 4 Native</title>
 <meta name="description" content="Mario Party 4 as a source port for the web: the decomp's PC port (Party Board) on Aurora, compiled to WebAssembly + WebGPU.">
 <style>
@@ -29,6 +30,9 @@
   .keys kbd { font: 12px ui-monospace, monospace; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; background: var(--panel); }
   pre#log { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px; max-height: 220px; overflow: auto; font-size: 12px; margin-top: 12px; white-space: pre-wrap; }
 </style>
+<script src="/lib/netplay.js?v=48908ab8"></script>
+<script src="/lib/netplay-ui.js?v=8f7af831"></script>
+<script src="/gamecube/native/mp4n_room.js"></script>
 </head>
 <body>
 <main>
@@ -37,6 +41,7 @@
   <div class="stage"><canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas></div>
   <div class="bar">
     <button id="btnStart">Start</button>
+    <button id="btnRoomGo" hidden>Start the party now</button>
     <span id="status">Idle</span>
   </div>
   <div class="readout" id="readout" aria-live="off"></div>
@@ -47,7 +52,10 @@
 (function () {
   'use strict';
   var Q = new URLSearchParams(location.search);
+  // Two builds of the same module: dist/ (solo) and dist/rb/ (with the rollback write barrier, which
+  // costs CPU every frame — loaded only by a room, or with ?rb=1 for the rollback self-test).
   var BUILD = Q.get('build') || 'gamecube/native/dist/';
+  function buildFor(room) { return Q.get('build') || ((room || Q.get('rb') === '1') ? 'gamecube/native/dist/rb/' : 'gamecube/native/dist/'); }
   var PARTS = ['a', 'b', 'c', 'd', 'e', 'f'];
   var logEl = document.getElementById('log'), statusEl = document.getElementById('status');
   var btn = document.getElementById('btnStart');
@@ -85,7 +93,7 @@
   // they are scheduled back to back on the AudioContext clock. If the queue runs dry it restarts a
   // little ahead (a gap, never a speed change); if it runs far ahead (host clock faster than the
   // audio clock) a chunk is dropped.
-  var audio = { ctx: null, next: 0, pushed: 0, nonSilent: 0, peak: 0, gaps: 0, drops: 0 };
+  var audio = { ctx: null, next: 0, pushed: 0, nonSilent: 0, peak: 0, gaps: 0, drops: 0, muted: 0 };
   window.__mp4n.audio = audio;
   if (Q.get('audrec')) { audio.rec = new Int16Array(32000 * 2 * (+Q.get('audrec') || 20)); audio.recLen = 0; }  // probe: keep the first N s
   function audioInit() {
@@ -98,6 +106,7 @@
     if (audio.ctx && audio.ctx.state === 'suspended') audio.ctx.resume();
   }
   function audioPush(pcm, rate) {
+    if (window.Mp4Room && Mp4Room.pushMuted()) { audio.muted += pcm.length >> 1; return; }   // a re-simulated or hidden room frame: already heard / not shown
     var n = pcm.length >> 1, peak = 0, i;
     for (i = 0; i < pcm.length; i++) { var a = pcm[i] < 0 ? -pcm[i] : pcm[i]; if (a > peak) peak = a; }
     if (audio.rec && audio.recLen < audio.rec.length) { var take = Math.min(pcm.length, audio.rec.length - audio.recLen); audio.rec.set(pcm.subarray(0, take), audio.recLen); audio.recLen += take; }
@@ -112,8 +121,14 @@
     audio.next += n / rate;
   }
 
+  var started = false;
   async function start() {
+    if (started) return;
+    started = true;
     btn.disabled = true;
+    var room = window.Mp4Room ? Mp4Room.bootOpts() : null;   // inside a room: the shared epoch and a fresh card
+    if (room) log('room: booting with the room\'s epoch and a fresh memory card');
+    BUILD = buildFor(!!room);
     audioInit();
     try {
       if (!navigator.gpu) throw new Error('this browser has no WebGPU');
@@ -144,7 +159,7 @@
         // memory-card saves persist in IndexedDB (?nosave=1: a fresh card every visit — what a
         // netplay session or a determinism test wants, since a save is game state)
         preRun: [function (M) {
-          if (Q.get('nosave') || !M.FS || !M.IDBFS) return;
+          if (Q.get('nosave') || room || !M.FS || !M.IDBFS) return;
           try {
             M.FS.mkdir('/partyboard');
             M.FS.mount(M.IDBFS, {}, '/partyboard');
@@ -154,7 +169,7 @@
             window.addEventListener('pagehide', function () { M.FS.syncfs(false, function () {}); });
           } catch (e) { log('saves: ' + e); }
         }],
-        mp4EpochSeconds: Q.get('epoch') ? +Q.get('epoch') : undefined,
+        mp4EpochSeconds: room ? room.epoch : Q.get('epoch') ? +Q.get('epoch') : undefined,
         mp4InputLatch: function (frame, ptr) { var m = window.__mp4n.module; Mp4Input.latch(frame, ptr, m && m.HEAP32); },
         locateFile: function (p) { return BUILD + p; },
         print: function (t) { log(t); },
@@ -167,12 +182,13 @@
       canvas.focus();
       Mp4State.attach(mod);
       if (Q.get('hash')) Mp4State.hashEvery(+Q.get('hash') || 60);
+      if (window.Mp4Room) Mp4Room.attach(mod);
       startReadout(mod);
       mod.callMain([]);
     } catch (e) {
       window.__mp4n.phase = 'failed'; window.__mp4n.errors.push(String(e && e.message || e));
       status('Cannot start: ' + (e && e.message || e)); log(String(e && e.stack || e));
-      btn.disabled = false;
+      btn.disabled = false; started = false;
     }
   }
   // Speed / headroom. Guest rate = guest frames per wall second / 60 — it must read 1.000x; below that
@@ -181,21 +197,47 @@
   // Headroom = 16.667 ms / host ms. Presented frames are the guest's 60, never more.
   function startReadout(mod) {
     var el = document.getElementById('readout'), prev = null;
-    function snap() { return { t: performance.now(), f: mod._mp4web_total(), busy: mod._mp4web_busy_ms(), gpu: mod._mp4web_gpu_wait_ms(), re: mod._mp4web_reanchors() }; }
+    function snap() {
+      var rm = window.Mp4Room && Mp4Room.active() ? Mp4Room.report() : null;
+      // in a room the guest clock is the room's live frames; re-simulated frames are not new time
+      return { t: performance.now(), f: rm && rm.armed ? rm.stats.live : mod._mp4web_total(), busy: mod._mp4web_busy_ms(), gpu: mod._mp4web_gpu_wait_ms(), re: mod._mp4web_reanchors(), rm: rm };
+    }
     setInterval(function () {
       var c = snap();
       if (prev && c.f > prev.f) {
         var df = c.f - prev.f, dt = (c.t - prev.t) / 1000, rate = df / dt / 60, ms = (c.busy - prev.busy) / df, gpu = (c.gpu - prev.gpu) / df;
         var r = { guestRate: rate, framesPerSec: df / dt, hostMsPerFrame: ms, gpuWaitMsPerFrame: gpu, cpuMsPerFrame: ms - gpu, headroom: (1000 / 60) / ms, reanchors: c.re - prev.re, frames: c.f };
         window.__mp4n.rate = r;
+        var roomTxt = '';
+        if (c.rm && c.rm.armed) {
+          var e = c.rm.engine || {};
+          roomTxt = '<br>Room ' + (c.rm.role || '') + ' &middot; frame ' + c.rm.next + ' &middot; ' + (e.rollback ? 'rollback (window ' + e.rollback + ', 0 frames input delay)' : 'delay ' + e.delay) +
+            ' &middot; ' + c.rm.stats.rollbacks + ' rewinds, ' + c.rm.stats.resim + ' frames re-run &middot; fingerprints compared ' + (e.hashesCompared || 0) +
+            (c.rm.failed || e.desync ? ' <span class="warn">' + (c.rm.failed || 'DESYNC') + '</span>' : '');
+        }
         el.innerHTML = '<b>Guest ' + rate.toFixed(3) + 'x</b>' + (rate < 0.995 ? ' <span class="warn">(host behind)</span>' : '') +
           ' &middot; ' + r.framesPerSec.toFixed(1) + ' frames/s presented &middot; host ' + ms.toFixed(2) + ' ms/frame (CPU ' + r.cpuMsPerFrame.toFixed(2) +
-          ', GPU wait ' + gpu.toFixed(2) + ') &middot; <b>' + r.headroom.toFixed(2) + 'x headroom</b>';
+          ', GPU wait ' + gpu.toFixed(2) + ') &middot; <b>' + r.headroom.toFixed(2) + 'x headroom</b>' + roomTxt;
+      }
+      var go = document.getElementById('btnRoomGo');
+      go.hidden = !(c.rm && c.rm.role === 'host' && !c.rm.armed && c.rm.seated >= 2);
+      if (!go.hidden) go.textContent = 'Start with ' + c.rm.seated + ' players now';
+      if (c.rm && c.rm.active && !c.rm.running && !(prev && c.f > prev.f)) {
+        el.innerHTML = 'Room: ' + (c.rm.failed ? '<span class="warn">' + c.rm.failed + '</span>' : c.rm.armed ? 'holding at frame 0 until every player is ready' : 'waiting for the party');
       }
       prev = c;
     }, 1000);
   }
   btn.addEventListener('click', start);
+  document.getElementById('btnRoomGo').addEventListener('click', function () { if (window.Mp4Room) Mp4Room.startNow(); });
+  // ?np=<CODE>&game=<key>[&join=1][&players=2-4][&net=local]: handed a room by multiplayer.html (or
+  // opened from the Party button). The game starts by itself once the party has connected; frame 0
+  // runs when every seated player is holding at it.
+  var NP = { np: Q.get('np'), game: Q.get('game'), join: Q.get('join') === '1', players: Q.get('players') };
+  if (window.Mp4Room && Mp4Room.mount({ log: log, onStart: start, handoff: NP })) {
+    var ho = Mp4Room._R.handoff;
+    if (ho) { status((ho.join ? 'Joining' : 'Hosting') + ' room ' + ho.code + ' — waiting for ' + (ho.join ? 'the host' : ho.players + ' players')); log('room: handed ' + ho.code + ' for ' + (ho.game || 'Mario Party 4') + (ho.join ? ' (joining)' : ' (hosting, ' + ho.players + ' players)')); }
+  }
   if (Q.get('autostart') === '1') start();
 })();
 </script>

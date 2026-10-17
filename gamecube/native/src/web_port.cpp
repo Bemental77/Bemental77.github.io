@@ -9,6 +9,34 @@
 #include <cstdint>
 #include <dolphin/pad.h>
 #include <xxhash.h>
+#include <aurora/gfx.h>
+#include <dolphin/os.h>
+#include <malloc.h>
+#include <unistd.h>
+
+// ---- memory accounting: per-frame peaks of aurora's staging sub-buffers + heap figures ----------
+static uint32_t g_peak[5];
+static void track_gfx_peaks() {
+  const AuroraStats* st = aurora_get_stats();
+  if (!st) return;
+  const uint32_t v[5] = {st->lastVertSize, st->lastUniformSize, st->lastIndexSize, st->lastStorageSize, st->lastTextureUploadSize};
+  for (int i = 0; i < 5; ++i) if (v[i] > g_peak[i]) g_peak[i] = v[i];
+}
+extern "C" double mp4web_det_heap_high_water(void);
+extern "C" double mp4web_det_stack_high_water(void);
+// [vert, uniform, index, storage, texupload peaks, sbrk top, malloc in-use, malloc footprint, det hw, stack hw, MEM1 used]
+extern "C" EMSCRIPTEN_KEEPALIVE void mp4web_mem_stats(double* out) {
+  for (int i = 0; i < 5; ++i) out[i] = g_peak[i];
+  const struct mallinfo mi = mallinfo();
+  out[5] = static_cast<double>(reinterpret_cast<uintptr_t>(sbrk(0)));
+  out[6] = mi.uordblks; out[7] = mi.arena;
+  out[8] = mp4web_det_heap_high_water(); out[9] = mp4web_det_stack_high_water();
+  // highest non-zero byte of MEM1 (how much of it the game ever touched)
+  const uint8_t* m1 = reinterpret_cast<const uint8_t*>(OSBaseAddress);
+  uint32_t hi = 0;
+  if (m1) for (uint32_t i = 24u * 1024 * 1024; i-- > 0;) if (m1[i]) { hi = i + 1; break; }
+  out[10] = hi;
+}
 
 // ---- determinism: state hash + whole-memory snapshot at the frame boundary --------------------
 // Game state = MEM1 (every HuMem heap, the msm heap) + the game's and overlays' .data/.bss (the link
@@ -20,7 +48,7 @@ extern "C" char mp4web_game_data_b[], mp4web_game_data_e[], mp4web_game_bss_b[],
 extern "C" EMSCRIPTEN_KEEPALIVE double mp4web_state_hash() {
   XXH3_state_t* st = XXH3_createState();
   XXH3_64bits_reset(st);
-  if (OSBaseAddress) XXH3_64bits_update(st, reinterpret_cast<const void*>(OSBaseAddress), 64u * 1024 * 1024);
+  if (OSBaseAddress) XXH3_64bits_update(st, reinterpret_cast<const void*>(OSBaseAddress), 24u * 1024 * 1024);
   XXH3_64bits_update(st, mp4web_game_data_b, mp4web_game_data_e - mp4web_game_data_b);
   uintptr_t sb, se; mp4web_stack_range(&sb, &se);   // fiber stacks: stale scratch below live frames
   XXH3_64bits_update(st, mp4web_game_bss_b, sb - reinterpret_cast<uintptr_t>(mp4web_game_bss_b));
@@ -31,7 +59,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE double mp4web_state_hash() {
 }
 // [mem1 base, mem1 size, data b, data e, bss b, bss e, stacks b, stacks e (skipped)] — for tools that diff state between instances
 extern "C" EMSCRIPTEN_KEEPALIVE void mp4web_state_ranges(uint32_t* out) {
-  out[0] = static_cast<uint32_t>(OSBaseAddress); out[1] = 64u * 1024 * 1024;
+  out[0] = static_cast<uint32_t>(OSBaseAddress); out[1] = 24u * 1024 * 1024;
   out[2] = reinterpret_cast<uintptr_t>(mp4web_game_data_b); out[3] = reinterpret_cast<uintptr_t>(mp4web_game_data_e);
   out[4] = reinterpret_cast<uintptr_t>(mp4web_game_bss_b); out[5] = reinterpret_cast<uintptr_t>(mp4web_game_bss_e);
   uintptr_t sb, se; mp4web_stack_range(&sb, &se); out[6] = static_cast<uint32_t>(sb); out[7] = static_cast<uint32_t>(se);
@@ -81,20 +109,44 @@ static double g_busy = 0.0;       // host ms spent producing frames (wake -> nex
 static double g_lastWake = -1.0;
 static double g_gpuWait = 0.0;    // of g_busy: ms spent yielded inside a frame waiting on a GPU buffer map
 
+// Pacing knobs a netplay room sets (mp4n_room.js). Solo: a frame may run up to 250 ms late and the
+// schedule catches up; in a room the debt is capped at one frame, so a console that fell behind
+// never sprints (the room's hidden catch-up frames, granted and capped by lib/netplay.js, are the
+// only frames that run faster than the clock, and they are not presented).
+static double g_maxDebt = 250.0;
+extern "C" EMSCRIPTEN_KEEPALIVE void mp4web_set_max_debt(double ms) { g_maxDebt = ms; }
+
+// The hook's answer, a bit set:
+//   1  re-anchor the pacing clock (after a restore that is not a room rewind)
+//   2  HOLD: do not run the next frame yet — sleep 2 ms and ask again (a room waiting on input)
+//   4  OFF-SCHEDULE: this frame is a re-simulation or a hidden catch-up — run it at once, no
+//      sleep, and do not count it against the 60 Hz schedule
+enum { kHookReanchor = 1, kHookHold = 2, kHookOffSchedule = 4 };
+
 extern "C" void frame_limiter() {
   constexpr double period = 1000.0 / 60.0;
+  track_gfx_peaks();
   mp4web_audio_frame();   // this frame's 5 ms sound ticks + samples (before the sleep: part of the frame's cost)
   double now = emscripten_get_now();
   if (g_lastWake >= 0) g_busy += now - g_lastWake;
   ++g_total;
   if (g_t0 < 0) { g_t0 = now; g_frame = 0; }
-  ++g_frame;
-  double due = g_t0 + static_cast<double>(g_frame) * period;
-  if (now - due > 250.0) { g_t0 = now; g_frame = 0; ++g_reanchors; due = now; }
   if (mp4web_state_pending_js()) mp4web_gfx_quiesce();
-  if (mp4web_frame_hook_js(static_cast<double>(g_total))) { g_t0 = -1; due = now; }
-  const double wait = due - now;
-  emscripten_sleep(wait > 0 ? static_cast<unsigned>(wait) : 0);
+  int fl;
+  for (;;) {
+    fl = mp4web_frame_hook_js(static_cast<double>(g_total));
+    if (!(fl & kHookHold)) break;
+    emscripten_sleep(2);
+  }
+  now = emscripten_get_now();
+  if (fl & kHookReanchor) { g_t0 = now; g_frame = 0; }
+  if (!(fl & kHookOffSchedule)) {
+    ++g_frame;
+    double due = g_t0 + static_cast<double>(g_frame) * period;
+    if (now - due > g_maxDebt) { g_t0 = now; g_frame = 0; ++g_reanchors; due = now; }
+    const double wait = due - now;
+    emscripten_sleep(wait > 0 ? static_cast<unsigned>(wait) : 0);
+  }
   g_lastWake = emscripten_get_now();
   latch_input(g_total); // input for frame g_total (0-based count of frames already produced)
   // sub-millisecond remainder: spin is pointless in a browser; the next frame absorbs it
@@ -112,3 +164,5 @@ extern "C" void mp4web_yield_for_gpu(void) {
   g_gpuWait += emscripten_get_now() - t;
 }
 extern "C" EMSCRIPTEN_KEEPALIVE double mp4web_gpu_wait_ms() { return g_gpuWait; }
+// After a rollback restore the frame counter goes back with the game (it lives outside game state).
+extern "C" EMSCRIPTEN_KEEPALIVE void mp4web_set_frame(double f) { g_total = static_cast<uint64_t>(f); }

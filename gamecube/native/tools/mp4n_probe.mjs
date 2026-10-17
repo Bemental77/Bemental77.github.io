@@ -10,6 +10,12 @@
 //   SNAPTEST=f1,f2   whole-memory snapshot at f1, run to f2, restore, rerun, compare hashes
 //   DIFFAT=f DIFFOUT=f.json [DUMPADDR=a]  per-4KB state checksums at frame f (find what diverges)
 //   WAV=f.wav        with &audrec=S: the first S seconds of game audio
+//   RBTEST=at,period,depth  rollback self-test (needs the write-barrier build): logging on from frame `at`;
+//                    every `period` frames rewind `depth` frames (mp4web_rb_restore) and re-run them on the
+//                    same input; every re-run frame's fingerprint must equal its first run's, and the
+//                    restored state's must equal the one recorded at that frame
+//   RBON=at          rollback logging on from `at` (a boundary every frame, no hashing, no rewinds):
+//                    what the write barrier costs while a room runs
 //   KEYS="sec:Code:holdMs,.."  real keyboard presses;  DUMPIO=1 Chrome stderr;  NOSS=1 no ANGLE SwiftShader
 // Before measured runs: node tools/browser_leak_guard.js reap && uptime; wrap in tools/probe_lock.sh run --
 import { createRequire } from 'module';
@@ -41,6 +47,28 @@ try {
   if (process.env.SCRIPT) { await p.waitForFunction(() => window.Mp4Input, { timeout: 120000 }); await p.evaluate((sc) => { const S = JSON.parse(sc); window.Mp4Input.override((f) => { const o = new Array(32).fill(0); o[0] = 1; for (const [a, b, btn, sx, sy] of S) if (f >= a && f < b) { o[1] |= btn; o[2] = sx || 0; o[3] = sy || 0; } if (o[1]) console.log('OVR ' + f + ' ' + o[1]); return o; }); console.log('OVERRIDE SET'); }, process.env.SCRIPT); }
   if (process.env.SNAPTEST) { const [f1, f2] = process.env.SNAPTEST.split(',').map(Number); await p.waitForFunction(() => window.Mp4State && window.__mp4n.module, { timeout: 120000 }); await p.evaluate((f1, f2) => { const S = window.Mp4State, m = window.__mp4n.module, T = window.__snapT = { phase: 'wait' }; const tick = () => { const f = m._mp4web_total(); if (T.phase === 'wait' && f >= f1) { T.phase = 'snapping'; S.requestSnapshot((snap) => { T.snap = snap; T.snapFrame = snap.frame; T.snapMs = S.lastSnapshotMs; T.memMB = snap.mem.length / 1048576; T.phase = 'run1'; }); } else if (T.phase === 'run1' && f >= f2) { T.phase = 'restoring'; T.pass1 = Object.assign({}, S.hashes); S.hashes = Object.create(null); S.requestRestore(T.snap, (fr) => { T.restoredTo = fr; T.restoreMs = S.lastRestoreMs; T.phase = 'run2'; }); } else if (T.phase === 'run2' && f >= f2) { T.pass2 = Object.assign({}, S.hashes); T.phase = 'done'; } if (T.phase !== 'done') setTimeout(tick, 50); }; tick(); }, f1, f2); }
   if (process.env.DIFFAT) { await p.waitForFunction(() => window.Mp4State && window.__mp4n.module && window.__mp4n.module.mp4FrameHook, { timeout: 120000 }); await p.evaluate((F, D) => { const m = window.__mp4n.module, prev = m.mp4FrameHook; m.mp4FrameHook = (f) => { if (f === F) { const pr = m._malloc(32); m._mp4web_state_ranges(pr); const R = Array.from(new Uint32Array(m.HEAPU8.buffer, pr, 8)); m._free(pr); const H = m.HEAPU8, CH = 4096; const sum = (a, b) => { const out = []; for (let o = a; o < b; o += CH) { let h = 2166136261; const e = Math.min(b, o + CH); for (let i = o; i < e; i++) { h ^= H[i]; h = Math.imul(h, 16777619); } out.push([o, h >>> 0]); } return out; }; window.__diff = { R, mem1: sum(R[0], R[0] + R[1]), data: sum(R[2], R[3]), bss: sum(R[4], R[6]).concat(sum(R[7], R[5])), dump: D ? Array.from(H.subarray(D, D + 4096)) : null }; } return prev(f); }; }, +process.env.DIFFAT, +(process.env.DUMPADDR || 0)); }
+  if (process.env.RBON) { const ea = +process.env.RBON; await p.waitForFunction(() => window.__mp4n && window.__mp4n.module && window.__mp4n.module.mp4FrameHook, { timeout: 120000 }); await p.evaluate((ea) => { const m = window.__mp4n.module, prev = m.mp4FrameHook; let on = false; m.mp4FrameHook = (f) => { const r = prev(f); if (!on && f >= ea) { window.__rbOnRc = m._mp4web_rb_enable(f, 40, 8192); on = true; } else if (on) m._mp4web_rb_boundary(f); return r; }; }, ea); }
+  if (process.env.RBTEST) {
+    const [ea, per, dep] = process.env.RBTEST.split(',').map(Number);
+    await p.waitForFunction(() => window.__mp4n && window.__mp4n.module && window.__mp4n.module.mp4FrameHook, { timeout: 120000 });
+    await p.evaluate((ea, per, dep) => {
+      const m = window.__mp4n.module, prev = m.mp4FrameHook;
+      const T = window.__rbT = { on: false, h1: {}, cmp: 0, bad: [], restores: 0, rcmp: 0, rbad: 0, enableRc: null, replayUntil: -1, hashMs: 0, maxHashMs: 0, restoreMs: [] };
+      m.mp4FrameHook = (f) => {
+        let r = prev(f);
+        if (!T.on && f === ea) { T.enableRc = m._mp4web_rb_enable(f, 16, 8192); T.on = T.enableRc > 0; return r; }
+        if (!T.on || f <= ea) return r;
+        m._mp4web_rb_boundary(f);
+        const t0 = performance.now(); const h = m._mp4web_rb_hash(); const dt = performance.now() - t0; T.hashMs += dt; if (dt > T.maxHashMs) T.maxHashMs = dt;
+        if (T.h1[f] === undefined) T.h1[f] = h; else { T.cmp++; if (T.h1[f] !== h) T.bad.push(f); }
+        if (f > T.replayUntil && f % per === 0 && f - dep > ea) {
+          const k = f - dep, t1 = performance.now(), rc = m._mp4web_rb_restore(k);
+          if (rc === 0) { T.restoreMs.push(performance.now() - t1); m._mp4web_set_frame(k); T.restores++; T.replayUntil = f; r = 1; T.rcmp++; if (m._mp4web_rb_hash() !== T.h1[k]) T.rbad++; } else T.rcFail = rc;
+        }
+        return r;
+      };
+    }, ea, per, dep);
+  }
   // NAV=board: inputs keyed to overlay starts (console "DLLStart N"), so the route survives timing shifts
   if (process.env.NAV) {
     p.on('console', (msg) => { const mm = /DLLStart (\d+)/.exec(msg.text()); if (mm) p.evaluate((o) => { const m = window.__mp4n && window.__mp4n.module; (window.__ovl = window.__ovl || {})[o] = m ? m._mp4web_total() : 0; window.__ovlLast = o; }, +mm[1]).catch(() => {}); });
@@ -73,6 +101,7 @@ try {
     await p.screenshot({ path: n > 1 ? out.replace(/\.png$/, '_' + k + '.png') : out });
   }
   if (process.env.SNAPTEST) { const r = await p.evaluate(() => { const T = window.__snapT || {}; return { phase: T.phase, snapFrame: T.snapFrame, restoredTo: T.restoredTo, snapMs: T.snapMs, restoreMs: T.restoreMs, memMB: T.memMB, pass1: T.pass1, pass2: T.pass2 }; }); logs.push('SNAPTEST ' + JSON.stringify(r)); }
+  if (process.env.RBTEST) { const r = await p.evaluate(() => { const T = window.__rbT, m = window.__mp4n.module; const st = Array.from(new Float64Array(m.HEAPU8.buffer, m._mp4web_rb_stats(), 8)); const rs = T.restoreMs.slice().sort((a, b) => a - b); return { enableRc: T.enableRc, restores: T.restores, restoreExactChecked: T.rcmp, restoreInexact: T.rbad, rerunFramesCompared: T.cmp, mismatches: T.bad.length, firstBad: T.bad.slice(0, 5), rcFail: T.rcFail, restoreMsP50: rs[rs.length >> 1], restoreMsMax: rs[rs.length - 1], avgHashMs: T.hashMs / Math.max(1, Object.keys(T.h1).length + T.cmp), maxHashMs: T.maxHashMs, boundaries: st[0], pagesPerFrame: st[1] / Math.max(1, st[0]), maxPagesPerFrame: st[2], restoredPagesPer: st[4] / Math.max(1, st[3]), lastBoundaryMs: st[6], overflow: st[7] }; }); logs.push('RBTEST ' + JSON.stringify(r)); }
   if (process.env.DIFFOUT) { const d = await p.evaluate(() => window.__diff); fs.writeFileSync(process.env.DIFFOUT, JSON.stringify(d)); logs.push('DIFF ' + !!d); }
   if (process.env.HASHOUT) { const h = await p.evaluate(() => window.Mp4State && window.Mp4State.hashes); fs.writeFileSync(process.env.HASHOUT, JSON.stringify(h)); logs.push('HASHES ' + Object.keys(h || {}).length); }
   if (process.env.WAV) { const b64 = await p.evaluate(() => { const a = window.__mp4n.audio; if (!a || !a.rec) return null; const u = new Uint8Array(a.rec.buffer, 0, a.recLen * 2); let s = ''; for (let i = 0; i < u.length; i += 32768) s += String.fromCharCode.apply(null, u.subarray(i, i + 32768)); return btoa(s); }); if (b64) { const pcm = Buffer.from(b64, 'base64'); const h = Buffer.alloc(44); h.write('RIFF', 0); h.writeUInt32LE(36 + pcm.length, 4); h.write('WAVEfmt ', 8); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(2, 22); h.writeUInt32LE(32000, 24); h.writeUInt32LE(128000, 28); h.writeUInt16LE(4, 32); h.writeUInt16LE(16, 34); h.write('data', 36); h.writeUInt32LE(pcm.length, 40); fs.writeFileSync(process.env.WAV, Buffer.concat([h, pcm])); logs.push('WAV ' + pcm.length); } }

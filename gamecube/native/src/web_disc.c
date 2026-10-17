@@ -26,8 +26,10 @@ EM_JS(double, mp4web_disc_read_js, (double off, void* out, double len), {
   return done;
 });
 
+void mp4web_rb_mark(uint32_t a, uint32_t n);   // rollback.c: log pages JS is about to overwrite
 static int64_t web_read_at(void* u, uint64_t off, void* out, size_t len) {
   (void)u;
+  mp4web_rb_mark((uint32_t)(uintptr_t)out, (uint32_t)len);
   return (int64_t)mp4web_disc_read_js((double)off, out, (double)len);
 }
 static int64_t web_len(void* u) { (void)u; return (int64_t)mp4web_disc_len_js(); }

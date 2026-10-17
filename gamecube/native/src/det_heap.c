@@ -14,7 +14,7 @@
 #include <stdio.h>
 
 #ifndef MP4WEB_DET_HEAP_MB
-#define MP4WEB_DET_HEAP_MB 160
+#define MP4WEB_DET_HEAP_MB 112
 #endif
 #define HEAP_BYTES ((size_t)MP4WEB_DET_HEAP_MB * 1024 * 1024)
 #define ALIGN 16u
@@ -30,11 +30,11 @@ typedef struct Heap {
   const char* name;
 } Heap;
 
-static _Alignas(16) unsigned char g_arena[HEAP_BYTES];
+static _Alignas(4096) unsigned char g_arena[HEAP_BYTES];   // page-aligned: rollback tracks whole pages
 // Process fiber stacks get their own arena: their addresses must be deterministic (the game keeps
 // them), but the bytes below each live frame are stale scratch, so the state hash skips this range.
-#define STACK_BYTES ((size_t)24 * 1024 * 1024)
-static _Alignas(16) unsigned char g_stackArena[STACK_BYTES];
+#define STACK_BYTES ((size_t)8 * 1024 * 1024)
+static _Alignas(4096) unsigned char g_stackArena[STACK_BYTES];
 static Heap g_heap = {g_arena, HEAP_BYTES, NULL, 0, 0, 0, 0, "det_heap"};
 static Heap g_stacks = {g_stackArena, STACK_BYTES, NULL, 0, 0, 0, 0, "det_stacks"};
 
