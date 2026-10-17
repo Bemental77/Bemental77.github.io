@@ -1,0 +1,78 @@
+diff --git a/include/game/object.h b/include/game/object.h
+index a9a6085..1e3d9e9 100644
+--- a/include/game/object.h
++++ b/include/game/object.h
+@@ -69,7 +69,7 @@ typedef struct om_dll_data {
+ 	char *name;
+ #ifdef _WIN32
+     HMODULE hModule;
+-#elif defined (__linux__) || defined(__APPLE__)
++#elif defined (__linux__) || defined(__APPLE__) || defined(__EMSCRIPTEN__)
+     void *handle;
+ #else
+ 	OSModuleHeader *module;
+diff --git a/src/game/objdll.c b/src/game/objdll.c
+index b87d08d..cca17be 100644
+--- a/src/game/objdll.c
++++ b/src/game/objdll.c
+@@ -8,6 +8,17 @@
+ 
+ #if defined(__linux__) || defined(__APPLE__)
+ #include <dlfcn.h>
++#elif defined(__EMSCRIPTEN__)
++// web: every overlay is compiled into the one module (gamecube/native/rel_build.py); "loading" one
++// restores its statics and hands back its ObjectSetup (gamecube/native/src/rel_dispatch.c)
++void *mp4web_rel_open(const char *name);
++void *mp4web_rel_sym(void *handle, const char *sym);
++int mp4web_rel_close(void *handle);
++const char *mp4web_rel_error(void);
++#define dlopen(n, f) mp4web_rel_open(n)
++#define dlsym mp4web_rel_sym
++#define dlclose mp4web_rel_close
++#define dlerror mp4web_rel_error
+ #endif
+ 
+ typedef s32 (*DLLProlog)(void);
+@@ -118,7 +129,7 @@ omDllData *omDLLLink(omDllData **dll_ptr, s16 overlay, s16 flag)
+ 	if (dll->hModule == NULL) {
+ 		OSReport("objdll>++++++++++++++++ DLL Link Failed\n");
+ 	}
+-#elif defined(__linux__) || defined(__APPLE__) || defined(__ANDROID__)
++#elif defined(__linux__) || defined(__APPLE__) || defined(__ANDROID__) || defined(__EMSCRIPTEN__)
+ 	{
+ 		// RPATH has to be set properly in CMake
+ 		dll->handle = dlopen(dllFile->name, RTLD_LAZY);
+@@ -145,7 +156,7 @@ omDllData *omDLLLink(omDllData **dll_ptr, s16 overlay, s16 flag)
+ 		DLLObjectSetup objectSetup = (DLLObjectSetup)GetProcAddress(dll->hModule, "ObjectSetup");
+ 		objectSetup();
+ 		}
+-#elif defined(__linux__) || defined(__APPLE__)
++#elif defined(__linux__) || defined(__APPLE__) || defined(__EMSCRIPTEN__)
+ 		DLLObjectSetup objectSetup = (DLLObjectSetup)dlsym(dll->handle, "ObjectSetup");
+ 		objectSetup();
+ #else
+@@ -161,7 +172,7 @@ void omDLLUnlink(omDllData *dll_ptr, s16 flag)
+ 	OSReport("odjdll>Unlink DLL:%s\n", dll_ptr->name);
+ #ifdef _WIN32
+     FreeLibrary(dll_ptr->hModule);
+-#elif defined(__linux__) || defined(__APPLE__)
++#elif defined(__linux__) || defined(__APPLE__) || defined(__EMSCRIPTEN__)
+ 	dlclose(dll_ptr->handle);
+ #else
+ 	if(flag == 1) {
+diff --git a/src/port/imgui.cpp b/src/port/imgui.cpp
+index 612f611..0efc4fa 100644
+--- a/src/port/imgui.cpp
++++ b/src/port/imgui.cpp
+@@ -252,9 +252,11 @@ class Limiter
+ #endif
+ };
+ 
++#ifndef __EMSCRIPTEN__ // web: gamecube/native/src/web_port.cpp yields to the browser on an absolute 1/60 schedule
+ static Limiter g_frameLimiter;
+ void frame_limiter()
+ {
+     g_frameLimiter.Sleep(
+         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::seconds{1}) / 60);
+ }
++#endif

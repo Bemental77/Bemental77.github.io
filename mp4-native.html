@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mario Party 4 Native</title>
+<meta name="description" content="Mario Party 4 as a source port for the web: the decomp's PC port (Party Board) on Aurora, compiled to WebAssembly + WebGPU.">
+<style>
+  :root { --bg: #f6f5f2; --fg: #1d1d1f; --muted: #6b6b70; --panel: #ffffff; --line: #dedcd6; --accent: #c4302b; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg: #121214; --fg: #ececee; --muted: #9a9aa2; --panel: #1c1c20; --line: #2e2e34; --accent: #ff5b52; }
+  }
+  :root[data-theme="dark"] { --bg: #121214; --fg: #ececee; --muted: #9a9aa2; --panel: #1c1c20; --line: #2e2e34; --accent: #ff5b52; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 16px; color: var(--muted); }
+  .stage { background: #000; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; aspect-ratio: 4 / 3; position: relative; }
+  canvas#canvas { width: 100%; height: 100%; display: block; }
+  .bar { display: flex; gap: 12px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 9px 18px; font: inherit; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { color: var(--muted); font-variant-numeric: tabular-nums; }
+  pre#log { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px; max-height: 220px; overflow: auto; font-size: 12px; margin-top: 12px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Mario Party 4 &mdash; native port</h1>
+  <p class="sub">The decompiled game compiled straight to WebAssembly, drawing through WebGPU. No emulator.</p>
+  <div class="stage"><canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas></div>
+  <div class="bar">
+    <button id="btnStart">Start</button>
+    <span id="status">Idle</span>
+  </div>
+  <pre id="log"></pre>
+</main>
+<script>
+(function () {
+  'use strict';
+  var Q = new URLSearchParams(location.search);
+  var BUILD = Q.get('build') || 'gamecube/native/dist/';
+  var PARTS = ['a', 'b', 'c', 'd', 'e', 'f'];
+  var logEl = document.getElementById('log'), statusEl = document.getElementById('status');
+  var btn = document.getElementById('btnStart');
+  var lines = [];
+  function log(s) {
+    console.log('[mp4n] ' + s);
+    lines.push(s); if (lines.length > 400) lines.shift();
+    logEl.textContent = lines.join('\n'); logEl.scrollTop = logEl.scrollHeight;
+  }
+  function status(s) { statusEl.textContent = s; }
+  window.__mp4n = { phase: 'idle', errors: [] };
+
+  // fetch + inflate one gzipped part in a worker (the inflate would otherwise block this thread)
+  var inflateSrc = 'self.onmessage=function(e){(async function(){try{var r=await fetch(e.data);' +
+    'if(!r.ok)throw new Error(e.data+" -> "+r.status);' +
+    'var b=await new Response(r.body.pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();' +
+    'self.postMessage({buf:b},[b]);}catch(x){self.postMessage({err:String(x&&x.message||x)});}})();};';
+  function inflate(url) {
+    return new Promise(function (resolve, reject) {
+      var w = new Worker(URL.createObjectURL(new Blob([inflateSrc], { type: 'text/javascript' })));
+      w.onmessage = function (e) { w.terminate(); e.data.err ? reject(new Error(e.data.err)) : resolve(e.data.buf); };
+      w.postMessage(new URL(url, location.href).href);
+    });
+  }
+
+  function loadScript(src) {
+    return new Promise(function (resolve, reject) {
+      var s = document.createElement('script'); s.src = src; s.onload = resolve;
+      s.onerror = function () { reject(new Error('could not load ' + src)); };
+      document.head.appendChild(s);
+    });
+  }
+
+  async function start() {
+    btn.disabled = true;
+    try {
+      if (!navigator.gpu) throw new Error('this browser has no WebGPU');
+      if (typeof DecompressionStream !== 'function') throw new Error('this browser has no DecompressionStream');
+      window.__mp4n.phase = 'disc';
+      var done = 0;
+      status('Loading disc 0/' + PARTS.length);
+      var parts = await Promise.all(PARTS.map(function (sx) {
+        return inflate('gamecube/roms/MarioParty4.bin.parta' + sx + '.gz').then(function (b) {
+          status('Loading disc ' + (++done) + '/' + PARTS.length); return new Uint8Array(b);
+        });
+      }));
+      var id = String.fromCharCode.apply(null, parts[0].subarray(0, 6));
+      var magic = new DataView(parts[0].buffer).getUint32(0x1C, false) >>> 0;
+      if (id !== 'GMPE01' || magic !== 0xC2339F3D) throw new Error('disc is not Mario Party 4 (id ' + id + ')');
+      log('disc ' + parts.reduce(function (n, p) { return n + p.length; }, 0) + ' B, ' + id);
+      window.__mp4n.phase = 'module';
+      status('Loading game');
+      await loadScript(BUILD + 'mp4native.js');
+      var canvas = document.getElementById('canvas');
+      var mod = await createMp4Native({
+        canvas: canvas,
+        mp4Disc: parts,
+        locateFile: function (p) { return BUILD + p; },
+        print: function (t) { log(t); },
+        printErr: function (t) { log(t); if (/\[(ERROR|FATAL)\]/.test(t)) window.__mp4n.errors.push(t); },
+        onAbort: function (r) { window.__mp4n.phase = 'aborted'; window.__mp4n.errors.push('abort: ' + r); status('Stopped: ' + r); }
+      });
+      window.__mp4n.module = mod;
+      window.__mp4n.phase = 'running';
+      status('Running');
+      canvas.focus();
+      mod.callMain([]);
+    } catch (e) {
+      window.__mp4n.phase = 'failed'; window.__mp4n.errors.push(String(e && e.message || e));
+      status('Cannot start: ' + (e && e.message || e)); log(String(e && e.stack || e));
+      btn.disabled = false;
+    }
+  }
+  btn.addEventListener('click', start);
+  if (Q.get('autostart') === '1') start();
+})();
+</script>
+</body>
+</html>
