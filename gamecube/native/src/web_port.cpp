@@ -123,12 +123,27 @@ extern "C" EMSCRIPTEN_KEEPALIVE void mp4web_set_max_debt(double ms) { g_maxDebt 
 //      sleep, and do not count it against the 60 Hz schedule
 enum { kHookReanchor = 1, kHookHold = 2, kHookOffSchedule = 4 };
 
+// FRAME SKIP — the guest keeps 1.000x, the picture gives. A frame Aurora does not draw costs a few
+// ms instead of the whole GPU frame (measured on SwiftShader: ~4 vs ~94 ms), and drawing is the
+// only part of a frame that does not change game state. So when the schedule says this console is
+// more than half a frame late, the NEXT frame is run undrawn — at most g_skipMax in a row, so at
+// least one frame in (g_skipMax+1) is presented (60 / 4 = 15 per second at the default 3).
+// The game, its audio and its clock run every frame exactly as before; only presents are dropped.
+extern "C" int mp4web_gfx_skip_draws;          // aurora gfx/common.cpp (patched)
+static int g_skipMax = 3, g_skipRun = 0;
+static uint64_t g_drawn = 0, g_autoSkipped = 0;
+extern "C" EMSCRIPTEN_KEEPALIVE void mp4web_set_frameskip(int maxRun) { g_skipMax = maxRun < 0 ? 0 : maxRun; }
+extern "C" EMSCRIPTEN_KEEPALIVE double mp4web_drawn() { return static_cast<double>(g_drawn); }
+extern "C" EMSCRIPTEN_KEEPALIVE double mp4web_auto_skipped() { return static_cast<double>(g_autoSkipped); }
+
 extern "C" void frame_limiter() {
   constexpr double period = 1000.0 / 60.0;
   track_gfx_peaks();
   mp4web_audio_frame();   // this frame's 5 ms sound ticks + samples (before the sleep: part of the frame's cost)
   double now = emscripten_get_now();
   if (g_lastWake >= 0) g_busy += now - g_lastWake;
+  if (!mp4web_gfx_skip_draws) ++g_drawn;     // the frame that just ended was presented
+  mp4web_gfx_skip_draws = 0;                 // the next frame is drawn unless the room's hook or the frame skip says otherwise
   ++g_total;
   if (g_t0 < 0) { g_t0 = now; g_frame = 0; }
   if (mp4web_state_pending_js()) mp4web_gfx_quiesce();
@@ -145,6 +160,11 @@ extern "C" void frame_limiter() {
     double due = g_t0 + static_cast<double>(g_frame) * period;
     if (now - due > g_maxDebt) { g_t0 = now; g_frame = 0; ++g_reanchors; due = now; }
     const double wait = due - now;
+    // the next frame: drawn, unless the room already said not to, or this console is behind
+    if (!mp4web_gfx_skip_draws) {
+      if (wait < -0.5 * period && g_skipRun < g_skipMax) { mp4web_gfx_skip_draws = 1; ++g_skipRun; ++g_autoSkipped; }
+      else g_skipRun = 0;
+    }
     emscripten_sleep(wait > 0 ? static_cast<unsigned>(wait) : 0);
   }
   g_lastWake = emscripten_get_now();

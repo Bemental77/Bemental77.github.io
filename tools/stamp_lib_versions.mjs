@@ -36,7 +36,7 @@ const PAGES = [
   'gba.html', 'genesis.html', 'n64/index.html',
   'dreamcast_multiplayer.html', 'gamecube_multiplayer.html', 'ps1_multiplayer.html',
   'snes_multiplayer.html', 'genesis_multiplayer.html', 'gba_multiplayer.html',
-  'n64_multiplayer.html', 'multiplayer.html',
+  'n64_multiplayer.html', 'multiplayer.html', 'mp4-native.html',
 ];
 
 const CHECK = process.argv.includes('--check');

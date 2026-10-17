@@ -32,7 +32,8 @@
   .keys kbd { font: 12px ui-monospace, monospace; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; background: var(--panel); }
   pre#log { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px; max-height: 220px; overflow: auto; font-size: 12px; margin-top: 12px; white-space: pre-wrap; }
 </style>
-<script src="/lib/capability.js?v=6461f930"></script>
+<script src="/lib/capability.js?v=b411172f"></script>
+<script src="/lib/bench.js?v=d1826e5a"></script><!-- ?bench=1 real-device benchmark; inert without it -->
 <script src="/lib/netplay.js?v=48908ab8"></script>
 <script src="/lib/netplay-ui.js?v=8f7af831"></script>
 <script src="/gamecube/native/mp4n_room.js"></script>
@@ -187,6 +188,8 @@
       Mp4State.attach(mod);
       if (Q.get('hash')) Mp4State.hashEvery(+Q.get('hash') || 60);
       if (window.Mp4Room) Mp4Room.attach(mod);
+      // ?frameskip=N: at most N undrawn frames in a row when behind (0 = always draw; default 3)
+      if (Q.get('frameskip') != null && mod._mp4web_set_frameskip) mod._mp4web_set_frameskip(+Q.get('frameskip') || 0);
       startReadout(mod);
       mod.callMain([]);
     } catch (e) {
@@ -204,13 +207,13 @@
     function snap() {
       var rm = window.Mp4Room && Mp4Room.active() ? Mp4Room.report() : null;
       // in a room the guest clock is the room's live frames; re-simulated frames are not new time
-      return { t: performance.now(), f: rm && rm.armed ? rm.stats.live : mod._mp4web_total(), busy: mod._mp4web_busy_ms(), gpu: mod._mp4web_gpu_wait_ms(), re: mod._mp4web_reanchors(), rm: rm };
+      return { t: performance.now(), f: rm && rm.armed ? rm.stats.live : mod._mp4web_total(), d: mod._mp4web_drawn ? mod._mp4web_drawn() : null, busy: mod._mp4web_busy_ms(), gpu: mod._mp4web_gpu_wait_ms(), re: mod._mp4web_reanchors(), rm: rm };
     }
     setInterval(function () {
       var c = snap();
       if (prev && c.f > prev.f) {
         var df = c.f - prev.f, dt = (c.t - prev.t) / 1000, rate = df / dt / 60, ms = (c.busy - prev.busy) / df, gpu = (c.gpu - prev.gpu) / df;
-        var r = { guestRate: rate, framesPerSec: df / dt, hostMsPerFrame: ms, gpuWaitMsPerFrame: gpu, cpuMsPerFrame: ms - gpu, headroom: (1000 / 60) / ms, reanchors: c.re - prev.re, frames: c.f };
+        var r = { guestRate: rate, framesPerSec: (c.d != null && prev.d != null) ? (c.d - prev.d) / dt : df / dt, hostMsPerFrame: ms, gpuWaitMsPerFrame: gpu, cpuMsPerFrame: ms - gpu, headroom: (1000 / 60) / ms, reanchors: c.re - prev.re, frames: c.f };
         window.__mp4n.rate = r;
         var roomTxt = '';
         if (c.rm && c.rm.armed) {
