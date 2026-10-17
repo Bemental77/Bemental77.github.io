@@ -1602,7 +1602,7 @@ function shipFrame(pos, resim, hiddenNow) {
 // ?shiphash=1 (boot msg shipHash): a verification aid, off by default. Every shipped frame's FIFO (with
 // its prologue) and its regions (address + bytes) are folded into one FNV-1a hash, logged every 300
 // frames with the frame number — two runs of the same guest that ship the same bytes log the same lines.
-let shipHash = false, shipHashH = 0x811c9dc5, shipHashN = 0;
+let shipExact = true, shipHash = false, shipHashH = 0x811c9dc5, shipHashN = 0;
 function shipHashBytes(h, u8) { for (let i = 0; i < u8.length; i++) h = Math.imul(h ^ u8[i], 16777619); return h; }
 function shipHashFrame(n, fifo, regions) {
   let h = shipHashBytes(shipHashH ^ n, fifo);
@@ -3485,6 +3485,16 @@ async function boot(msg) {
                 if (late > 1) ftUnschedMs += late;
                 if (bkCfg && Atomics.load(paceI32, 0) <= 0) { selfGrant(); if (rbI32) roomSelf(); }
               }
+              // ── A FRAME SHIPS THE GUEST MEMORY OF ITS OWN FRAME (2026-10-17) ──────────────────────
+              // A job the slack did not finish used to be finished at the start of the NEXT
+              // VIWaitForRetrace — after the guest had run another frame, so its region copies (and a
+              // new display list's body) read memory the guest had already changed. MEASURED (MP4 solo,
+              // ?shiphash=1, 6+5 runs): frame 41's region 0xae1320+180960 shipped one of TWO different
+              // contents depending on timing (c146f977 / 9c5036a3), and with every job finished inside
+              // its own frame it shipped a third, f0810e3d, in 6 of 6 runs — the frame's real bytes.
+              // Two consoles of a room could draw different pictures. So whatever is left when the
+              // credit comes is finished here, before the guest runs on. ?shipexact=0: the old order.
+              if (shipJobs.length && shipExact) { const tf = performance.now(); shipFlush(); ftBusyMs += performance.now() - tf; }
               Atomics.sub(paceI32, 0, 1);
             }
             rbBusyStart();
@@ -3683,6 +3693,7 @@ async function boot(msg) {
     } catch (e) { gw = null; log('fifo walk: JS — gx_walk.wasm unavailable (' + ((e && e.message) || e) + ')'); }
   } else log('fifo walk: JS (?cwalk=0)');
   shipHash = !!msg.shipHash;
+  shipExact = msg.shipExact !== false;
   cwCheck = gw !== null && !!msg.cwalkCheck;
   if (cwCheck) log('fifo walk: CHECK MODE — every walk runs in gx_walk AND the JS walk, compared');
   if (msg.shipWarm !== false) {

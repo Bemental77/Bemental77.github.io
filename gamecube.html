@@ -11834,6 +11834,8 @@ window.GcRate = (function () {
                      cwalkCheck: q.get('cwalk') === 'check',   // the differential arm (recomp_worker.js cwCheckWalk)
                      // verification aid: a hash of every shipped frame, logged every 300 frames (recomp_worker.js shipHashFrame)
                      shipHash: q.get('shiphash') === '1',
+                     // a ship job the guest's slack did not finish is finished before the guest runs on (recomp_worker.js A FRAME SHIPS THE GUEST MEMORY OF ITS OWN FRAME); ?shipexact=0: control
+                     shipExact: q.get('shipexact') !== '0',
                      // the guest's own thread runs the backstop clock's step while it waits (recomp_worker.js
                      // THE GUEST'S OWN THREAD IS A BACKSTOP CLOCK TOO), once this thread has missed
                      // more than one of its 8 ms grants (12 ms); ?selfgrant=0: control
