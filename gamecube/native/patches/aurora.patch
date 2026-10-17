@@ -1,5 +1,5 @@
 diff --git a/lib/aurora.cpp b/lib/aurora.cpp
-index dc5ae5b..f7663c0 100644
+index dc5ae5b..92ee932 100644
 --- a/lib/aurora.cpp
 +++ b/lib/aurora.cpp
 @@ -39,6 +39,9 @@ using webgpu::g_surface;
@@ -12,7 +12,40 @@ index dc5ae5b..f7663c0 100644
  #ifdef ENABLE_BACKEND_WEBGPU
      BACKEND_WEBGPU,
  #endif
-@@ -323,11 +326,15 @@ void end_frame() noexcept {
+@@ -198,6 +201,9 @@ const AuroraEvent* update() noexcept {
+   return window::poll_events();
+ }
+ 
++#ifdef __EMSCRIPTEN__
++extern "C" int mp4web_gfx_skip_draws;   // gfx/common.cpp
++#endif
+ bool begin_frame() noexcept {
+   ZoneScoped;
+ #ifdef AURORA_ENABLE_GX
+@@ -251,7 +257,12 @@ void end_frame() noexcept {
+     wgpu::Texture currentTexture;
+     wgpu::TextureView currentView;
+     auto surfaceStatus = wgpu::SurfaceGetCurrentTextureStatus::Error;
++#ifdef __EMSCRIPTEN__
++    // a skipped (re-simulated / hidden) frame leaves the canvas showing the last presented one
++    if (window::is_presentable() && g_surface && !mp4web_gfx_skip_draws) {
++#else
+     if (window::is_presentable() && g_surface) {
++#endif
+       ZoneScopedN("Acquire texture");
+       wgpu::SurfaceTexture surfaceTexture;
+       g_surface.GetCurrentTexture(&surfaceTexture);
+@@ -313,6 +324,9 @@ void end_frame() noexcept {
+         pass.End();
+       }
+     } else {
++#ifdef __EMSCRIPTEN__
++      if (!mp4web_gfx_skip_draws)
++#endif
+       Log.info("Skipping present; window not presentable");
+     }
+     const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
+@@ -323,12 +337,20 @@ void end_frame() noexcept {
      }
      if (canPresent && g_surface) {
        ZoneScopedN("Present");
@@ -25,9 +58,14 @@ index dc5ae5b..f7663c0 100644
          webgpu::release_surface();
        }
 +#endif
++#ifdef __EMSCRIPTEN__
++    } else if (g_surface && !mp4web_gfx_skip_draws) {   // a skipped frame acquired nothing: not an error
++#else
      } else if (g_surface) {
++#endif
        switch (surfaceStatus) {
        case wgpu::SurfaceGetCurrentTextureStatus::Timeout:
+         Log.warn("Surface texture acquisition timed out");
 diff --git a/lib/card/Util.cpp b/lib/card/Util.cpp
 index 0447183..38c00f6 100644
 --- a/lib/card/Util.cpp
@@ -234,19 +272,38 @@ index 2d7f795..17cb345 100644
            g_keyboardBindings[i].m_buttonMapping, [&kbState, &i, &status](const PADKeyButtonBinding& mapping) {
              if (mapping.scancode > PAD_KEY_INVALID && kbState[mapping.scancode]) {
 diff --git a/lib/gfx/common.cpp b/lib/gfx/common.cpp
-index eff0c65..116f57e 100644
+index eff0c65..2d1304b 100644
 --- a/lib/gfx/common.cpp
 +++ b/lib/gfx/common.cpp
-@@ -1,4 +1,8 @@
+@@ -1,4 +1,19 @@
  #include "common.hpp"
 +#ifdef __EMSCRIPTEN__
 +#include <emscripten.h>
 +extern "C" void mp4web_yield_for_gpu(void); // gamecube/native/src/web_port.cpp
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++// web: a netplay room re-simulates frames after a late input and runs hidden catch-up frames. Their
++// game state is all that matters, so their frames skip every draw (render passes, EFB copies, the
++// present) and keep only what later frames depend on: staging copies (texture uploads) and palette
++// conversions. Set per frame at the frame boundary by gamecube/native/mp4n_room.js.
++extern "C" {
++int mp4web_gfx_skip_draws = 0;
++EMSCRIPTEN_KEEPALIVE void mp4web_set_gfx_skip(int on) { mp4web_gfx_skip_draws = on ? 1 : 0; }
++}
++#endif
 +#endif
  
  #include "clear.hpp"
  #include "depth_peek.hpp"
-@@ -991,6 +995,9 @@ static bool wait_for_staging_buffer(size_t slot) {
+@@ -221,6 +236,7 @@ struct FramePacket {
+   AuroraStats stats{};
+   uint32_t drawCallCount = 0;
+   uint32_t mergedDrawCallCount = 0;
++  bool skipDraws = false;
+ };
+ 
+ static std::array<FramePacket, FrameSlotCount> g_framePackets;
+@@ -991,6 +1007,9 @@ static bool wait_for_staging_buffer(size_t slot) {
        return false;
      }
      if (render_worker::is_idle()) {
@@ -256,7 +313,7 @@ index eff0c65..116f57e 100644
        g_instance.ProcessEvents();
      } else {
        std::this_thread::sleep_for(std::chrono::milliseconds{1});
-@@ -998,6 +1005,23 @@ static bool wait_for_staging_buffer(size_t slot) {
+@@ -998,6 +1017,23 @@ static bool wait_for_staging_buffer(size_t slot) {
    }
  }
  
@@ -280,7 +337,7 @@ index eff0c65..116f57e 100644
  static size_t acquire_frame_slot() {
    ZoneScopedN("Acquire frame slot");
    while (true) {
-@@ -1005,6 +1029,9 @@ static size_t acquire_frame_slot() {
+@@ -1005,6 +1041,9 @@ static size_t acquire_frame_slot() {
        return *slot;
      }
      if (render_worker::is_idle()) {
@@ -290,7 +347,7 @@ index eff0c65..116f57e 100644
        g_instance.ProcessEvents();
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds{100});
-@@ -1023,6 +1050,9 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
+@@ -1023,6 +1062,9 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
        return std::nullopt;
      }
      if (render_worker::is_idle()) {
@@ -300,6 +357,35 @@ index eff0c65..116f57e 100644
        g_instance.ProcessEvents();
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds{100});
+@@ -1044,6 +1086,9 @@ bool begin_frame() {
+   frame.frameId = g_nextFrameId++;
+   frame.frameIndex = g_frameIndex;
+   frame.stagingBuffer = *stagingSlot;
++#ifdef __EMSCRIPTEN__
++  frame.skipDraws = mp4web_gfx_skip_draws != 0;
++#endif
+   g_recordingFrame = &frame;
+   g_recordingFrameSlot = frameSlot;
+ 
+@@ -1236,11 +1281,17 @@ static void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const Frame
+   switch (op.type) {
+   case FrameOpType::RenderPass:
+     if (op.renderPass != nullptr) {
++      if (frame.skipDraws) {
++        for (const auto& conv : op.renderPass->paletteConvs) {
++          tex_palette_conv::run(cmd, conv);
++        }
++        break;
++      }
+       render(cmd, frame, *op.renderPass, op.index);
+     }
+     break;
+   case FrameOpType::TextureCopy:
+-    if (op.textureCopy != nullptr) {
++    if (op.textureCopy != nullptr && !frame.skipDraws) {
+       cmd.CopyTextureToTexture(&op.textureCopy->src, &op.textureCopy->dst, &op.textureCopy->size);
+     }
+     break;
 diff --git a/lib/gfx/common.hpp b/lib/gfx/common.hpp
 index db245d0..271d28e 100644
 --- a/lib/gfx/common.hpp

@@ -54,7 +54,7 @@
     atTotal: -1, tickedAt: -1,
     replay: [], image: null, pushMute: false,
     catchUp: 0, hashAt: Object.create(null), due: [], sent: Object.create(null),   // sent: frame -> fingerprint this console submitted
-    stats: { live: 0, resim: 0, hidden: 0, rollbacks: 0, maxDepth: 0, holds: 0, hashesSent: 0, restoreFail: 0, maxRestoreMs: 0, frameTimes: [] },
+    stats: { live: 0, resim: 0, hidden: 0, undrawn: 0, rollbacks: 0, maxDepth: 0, holds: 0, hashesSent: 0, restoreFail: 0, maxRestoreMs: 0, frameTimes: [] },
     log: function () {}
   };
 
@@ -77,12 +77,28 @@
     var mo = {
       game: GAME_ID, transport: R.transport,
       onSession: function (sess, role) {
+        if (R.solo && !R.switching) {
+          // A game already running solo cannot be the room's frame 0 (its state, clock, memory card and
+          // build differ), and swapping a live WebGPU/Asyncify module in place is not cheap. Before
+          // anyone has paired, the page re-opens itself as this room's hand-off — same code, same side —
+          // so the Party click is the only click. The game boots again, inside the room.
+          R.switching = true;
+          var u = new URL(location.href);
+          u.searchParams.set('np', sess.code); u.searchParams.set('game', 'Mario Party 4');
+          if (role === 'host') u.searchParams.delete('join'); else u.searchParams.set('join', '1');
+          if (R.transport === 'local') u.searchParams.set('net', 'local');
+          u.searchParams.delete('autostart');
+          R.log('room: this game started solo — reopening inside room ' + sess.code + ' as ' + role);
+          try { sess.close && sess.close(); } catch (e) {}
+          setTimeout(function () { location.replace(u.toString()); }, 50);
+          return;
+        }
         R.session = sess; R.role = role; engineOpts(sess);
         sess.on('lockstep', function (e) { if (e && (e.state === 'failed' || e.state === 'desync')) R.log('room: ' + e.state + (e.detail ? ' — ' + JSON.stringify(e.detail).slice(0, 200) : '')); });
       },
       onReady: function (sess, role) {
         R.session = sess; R.role = role;
-        if (R.solo) { R.log('room: this game was started solo, so it cannot be the room\'s frame 0 — reload the page and join with ' + sess.code); return; }
+        if (R.solo) return;   // onSession is re-opening the page inside the room
         R.log('room: connected as ' + role + ' (' + sess.code + ') — starting the game; frame 0 waits for every player');
         if (R.onStart) R.onStart();
       }
@@ -266,14 +282,17 @@
     if (live) { R.lastLive = frame; R.stats.live++; if (quiet) R.stats.hidden++; }
     else R.stats.resim++;
     R.pushMute = !!quiet;                 // its samples arrive at the next boundary; a repeat or a hidden frame is not heard
-    return (quiet || !live) ? HOOK_OFF : 0;
+    var skip = (quiet || !live) ? 1 : 0;  // nor drawn: Aurora skips its render passes and the present (game state is untouched)
+    if (skip) R.stats.undrawn++;
+    if (R.mod._mp4web_set_gfx_skip) R.mod._mp4web_set_gfx_skip(skip);
+    return skip ? HOOK_OFF : 0;
   }
 
   function attach(mod) {
     R.mod = mod;
     var prev = mod.mp4FrameHook;
-    // A game that started before any room existed is solo for good: its state is not the room's
-    // frame 0, so it can never join one (reload with the code to join).
+    // A game that started before any room existed is solo: its state is not the room's frame 0. If
+    // its player opens a party later, onSession re-opens the page inside that room.
     R.solo = !R.session && !R.handoff;
     mod.mp4FrameHook = function (total) {
       var fl = prev ? (prev(total) | 0) : 0;
@@ -297,7 +316,7 @@
     }
     return { active: !!(R.session || R.handoff), role: R.role, want: R.want, seated: ls ? seated(ls) : 0, armed: R.armed, running: R.running, failed: R.failed,
              stopReason: R.stopReason || null, next: R.next, waiting: R.waiting || null, broken: R.broken,
-             stats: { live: R.stats.live, resim: R.stats.resim, hidden: R.stats.hidden, rollbacks: R.stats.rollbacks, maxDepth: R.stats.maxDepth,
+             stats: { live: R.stats.live, resim: R.stats.resim, hidden: R.stats.hidden, undrawn: R.stats.undrawn, rollbacks: R.stats.rollbacks, maxDepth: R.stats.maxDepth,
                       holds: R.stats.holds, hashesSent: R.stats.hashesSent, restoreFail: R.stats.restoreFail, maxRestoreMs: R.stats.maxRestoreMs,
                       liveFramesLast5s: win5 },
              engine: eng };

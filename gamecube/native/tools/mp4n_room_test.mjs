@@ -18,7 +18,9 @@
 // usage (from the repo root; the rig starts its own tools/devserver.mjs):
 //   node tools/browser_leak_guard.js reap && uptime
 //   bash tools/probe_lock.sh run -- node gamecube/native/tools/mp4n_room_test.mjs [--players 2|3|4]
-//        [--frames N] [--break epoch] [--timeout S] [--shots DIR]
+//        [--frames N] [--break epoch] [--solo-host] [--timeout S] [--shots DIR]
+//   --mixed: odd seats emulate a phone (390x844, DPR 3, touch, CPU x2 slower) — host-side differences must not reach game state
+//   --solo-host: the host page starts a solo game, then opens the Party panel; it must reopen itself in the room
 import { createRequire } from 'module';
 import fs from 'fs'; import os from 'os'; import path from 'path';
 import { spawn, execSync } from 'child_process';
@@ -32,6 +34,8 @@ const flag = (n, d) => { const i = argv.indexOf('--' + n); return i >= 0 && argv
 const N = Math.max(2, Math.min(4, parseInt(flag('players', '2'), 10) || 2));
 const FRAMES = parseInt(flag('frames', '900'), 10);
 const BREAK = flag('break', '');
+const SOLO_HOST = argv.includes('--solo-host');   // the host starts a solo game first, then opens a party from it
+const MIXED = argv.includes('--mixed');   // odd seats are a 'phone': 390x844 at DPR 3, touch, CPU slowed 2x
 const TIMEOUT = parseInt(flag('timeout', '1500'), 10) * 1000;
 const SHOTS = flag('shots', '');
 const CHROME = process.env.CHROME_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
@@ -40,7 +44,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let pass = 0, fail = 0;
 const ok = (name, cond, detail) => { (cond ? pass++ : fail++); console.log(`  ${cond ? 'PASS' : 'FAIL'}  ${name}  ${detail == null ? '' : detail}`); };
 const ALPHA = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-const CODE = Array.from({ length: 5 }, () => ALPHA[Math.floor(Math.random() * ALPHA.length)]).join('');
+let CODE = Array.from({ length: 5 }, () => ALPHA[Math.floor(Math.random() * ALPHA.length)]).join('');
 
 const srv = spawn('node', [path.join(REPO, 'tools/devserver.mjs')], { cwd: REPO, env: Object.assign({}, process.env, { PORT: String(PORT) }), stdio: 'ignore' });
 await sleep(1500);
@@ -72,7 +76,10 @@ const T = () => ((Date.now() - t0) / 1000).toFixed(0) + 's';
 try {
   for (let i = 0; i < N; i++) {
     const page = await openWindowPage();
-    await page.setViewport({ width: 880, height: 760 });
+    if (MIXED && i % 2) {
+      await page.setViewport({ width: 390, height: 844, deviceScaleFactor: 3, isMobile: true, hasTouch: true });
+      const cdp = await page.target().createCDPSession(); await cdp.send('Emulation.setCPUThrottlingRate', { rate: 2 });
+    } else await page.setViewport({ width: 880, height: 760 });
     const tag = i ? 'G' + i : 'H';
     const errs = [], logs = [];
     page.on('pageerror', (e) => errs.push(String((e && e.message) || e)));
@@ -81,6 +88,18 @@ try {
     let q = `np=${CODE}&game=${encodeURIComponent('Mario Party 4')}&net=local&players=${N}`;
     if (i) q += '&join=1';
     if (BREAK && i === N - 1) q += '&npbreak=' + BREAK;
+    if (SOLO_HOST && i === 0) {
+      // solo first: the game runs, THEN its player opens the Party panel (which hosts by itself);
+      // the page must re-open itself inside that room with the panel's code
+      await page.goto(`http://127.0.0.1:${PORT}/mp4-native.html?autostart=1&net=local&players=${N}`, { waitUntil: 'domcontentloaded', timeout: 120000 });
+      const soloRan = await page.waitForFunction(() => { const m = window.__mp4n && window.__mp4n.module; return m && m._mp4web_total() > 120; }, { timeout: 300000, polling: 500 }).then(() => true).catch(() => false);
+      const nav = page.waitForNavigation({ timeout: 60000 }).catch(() => null);
+      await page.evaluate(() => document.querySelector('.np-btn').click());
+      await nav;
+      await page.waitForFunction(() => /[?&]np=/.test(location.search), { timeout: 60000, polling: 250 }).catch(() => {});
+      CODE = await page.evaluate(() => new URLSearchParams(location.search).get('np'));
+      ok('solo-game-reopens-inside-the-room', soloRan && /^[A-Z2-9]{5}$/.test(CODE || ''), `ran solo ${soloRan}, reopened as ${await page.evaluate(() => location.search)}`);
+    } else
     await page.goto(`http://127.0.0.1:${PORT}/mp4-native.html?${q}`, { waitUntil: 'domcontentloaded', timeout: 120000 });
     P.push({ page, tag, errs, logs });
     if (i) {
