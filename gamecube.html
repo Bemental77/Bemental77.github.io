@@ -11829,6 +11829,11 @@ window.GcRate = (function () {
                      // the ship code (walk, discovery, pack) runs on a synthetic frame before main() so it is optimized
                      // before the first 3D scene needs it (?shipwarm=0: control)
                      shipWarm: q.get('shipwarm') !== '0',
+                     // the FIFO walk runs as wasm (gamecube/recomp/gx_walk; recomp_worker.js THE FIFO WALK RUNS AS WASM); ?cwalk=0: the JS walk
+                     cwalk: q.get('cwalk') !== '0',
+                     cwalkCheck: q.get('cwalk') === 'check',   // the differential arm (recomp_worker.js cwCheckWalk)
+                     // verification aid: a hash of every shipped frame, logged every 300 frames (recomp_worker.js shipHashFrame)
+                     shipHash: q.get('shiphash') === '1',
                      // the guest's own thread runs the backstop clock's step while it waits (recomp_worker.js
                      // THE GUEST'S OWN THREAD IS A BACKSTOP CLOCK TOO), once this thread has missed
                      // more than one of its 8 ms grants (12 ms); ?selfgrant=0: control
