@@ -6,6 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <link rel="icon" href="data:,">
   <script src="/lib/debugreport.js?v=94ec9928"></script>
+  <script src="/lib/volume.js?v=1"></script>
   <script src="/lib/wakelock.js"></script>
   <!-- Shared capability layer. Same-origin (like /lib/wakelock.js above), so it does NOT
        violate this page's self-hosting invariant: the rule is that nothing comes from a
@@ -1635,6 +1636,7 @@ N64Rate.selfTest = function (logFn) {
   window.ROMLIST = [];
   // Fetched at loadRom() as an ABSOLUTE window.ASSET_BASE URL, so <base> does not apply.
   const ROMS = [
+    { label: 'Super Smash Bros.', file: 'Super Smash Bros. (USA).z64' },
     { label: 'Super Mario 64', file: 'sm64.z64' },
     { label: 'Mario Kart 64', file: 'mariokart.z64' },
     { label: 'Zelda: Ocarina of Time', file: 'oot.z64' },

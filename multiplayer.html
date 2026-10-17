@@ -169,16 +169,24 @@
   </div>
 
   <div id="joinPane" class="card" hidden>
-    <h2>2. Enter the room code</h2>
-    <label for="codeIn">Code</label>
-    <input id="codeIn" maxlength="5" autocapitalize="characters" autocomplete="off"
+    <h2>Join a party</h2>
+    <label for="codeIn">Room code, or paste the invite link</label>
+    <input id="codeIn" autocapitalize="characters" autocomplete="off"
            spellcheck="false" placeholder="ABCDE">
-    <p class="hint">Five characters. There is no I, O, 0 or 1 in a code. Pick the same
-       <em>console</em> — the game is whichever one the host is on, and your console follows the
-       room rather than your pick.</p>
+    <p class="hint">Five characters, no I, O, 0 or 1. If you were sent a link, paste it here and
+       the console and game fill themselves in.</p>
+    <div id="jDetected" class="invited" hidden></div>
+    <div id="jPick" hidden>
+      <label>What console is the host playing on?</label>
+      <div class="chips" id="jConsoles"></div>
+    </div>
+    <select id="jGame" hidden></select>
     <p class="warn" id="joinWarn" hidden></p>
+    <p class="hint" id="joinSummary">Enter the code, then choose the console the host is on.</p>
     <div class="row">
-      <button id="btnJoin" type="button">Join and start my console</button>
+      <button id="btnJoin" type="button" disabled>Join and start my console</button>
+      <button id="btnJChange" class="sec" type="button" hidden>Not that console?</button>
+      <button id="btnJoinBack" class="sec" type="button">← Back</button>
     </div>
   </div>
 
@@ -237,7 +245,7 @@
     { key: 'n64', name: 'Nintendo 64', page: '/n64/', handoff: '/n64/?np=', hostFlag: '',
       players: 4, note: 'Four controller ports.',
       games: [
-        'Super Mario 64', 'Mario Kart 64', 'Zelda: Ocarina of Time', 'Paper Mario',
+        'Super Smash Bros.', 'Super Mario 64', 'Mario Kart 64', 'Zelda: Ocarina of Time', 'Paper Mario',
         'Star Fox 64', 'Pokémon Snap', 'Donkey Kong 64', 'Banjo-Tooie',
         "Conker's Bad Fur Day", 'Diddy Kong Racing', 'Star Wars Episode I: Racer',
         "Cruis'n USA", 'NFL Blitz 2001', 'The New Tetris', 'Gauntlet Legends',
@@ -378,7 +386,13 @@
     // took them to the new one — two players on two different pages, holding one
     // code they could never meet on. #pick stays visible the whole time the host
     // pane is open, so changing console after minting is one click away.
-    if (code && !$('hostPane').hidden) $('invite').value = inviteUrl(c, sel.value, code);
+    // The code NAMES ITS CONSOLE, so a new console means a new code — otherwise a friend typing
+    // the old one would be sent to the wrong machine.
+    if (code && !$('hostPane').hidden) {
+      code = Netplay.makeCode(5, c.key);
+      $('code').textContent = code;
+      $('invite').value = inviteUrl(c, sel.value, code);
+    }
     return true;
   }
 
@@ -407,7 +421,7 @@
     // remembered, silently invalidated the code their friend was typing. The
     // only visible difference was five characters. Pressing it again now just
     // shows the party that is already open; a reload is how you get a new one.
-    if (!code) code = Netplay.makeCode(5);
+    if (!code) code = Netplay.makeCode(5, sys.key);
     showHost();
   });
   // Changing the game after minting must re-point the link — the link IS the
@@ -433,42 +447,119 @@
 
   // ---- join ------------------------------------------------------------------
   $('btnJoinPane').addEventListener('click', function () {
+    $('pick').hidden = true;          // the host's picker must not sit over a joiner's screen
     $('joinPane').hidden = false;
     $('hostPane').hidden = true;
     $('codeIn').focus();
   });
-  function tryJoin(raw) {
+  $('btnJoinBack').addEventListener('click', function () {
+    $('joinPane').hidden = true;
+    $('invitedCard').hidden = true;
+    $('pick').hidden = false;
+  });
+  // THE JOINER HAS NO DEFAULT CONSOLE. The host's picker defaults to the Dreamcast, and a joiner
+  // who inherited that default saw the wrong console highlighted while trying to join an N64
+  // room. Here nothing is chosen until the joiner (or the invite link) chooses it, and Join stays
+  // disabled until the code, the console and the game are all set.
+  var jSys = null, jChips = {}, jGame = $('jGame');
+  var jManual = false;      // the joiner (or a pasted link) chose the console: stop auto-detecting
+  var jGameKnown = false;   // a pasted/invite link named the game; otherwise the host's roster does
+  CONSOLES.forEach(function (c) {
+    if (!c.games.length) return;
+    var b = document.createElement('button');
+    b.type = 'button'; b.className = 'chip';
+    b.innerHTML = '<span></span>';
+    b.firstChild.textContent = c.name;
+    b.setAttribute('aria-pressed', 'false');
+    b.addEventListener('click', function () { jManual = true; setJoin(c.key); $('jPick').hidden = true; });
+    jChips[c.key] = b;
+    $('jConsoles').appendChild(b);
+  });
+  function setJoin(key, game) {
+    var c = BY_KEY[key];
+    if (!c || !c.games.length) return false;
+    jSys = c;
+    Object.keys(jChips).forEach(function (k) { jChips[k].setAttribute('aria-pressed', k === key ? 'true' : 'false'); });
+    // The game is the HOST'S to name: every page that holds a room follows the host's roster
+    // ('room-game') before it boots, so the value passed here is only a starting point. It is
+    // never shown to the joiner, who therefore cannot get it wrong.
+    jGame.innerHTML = '';
+    c.games.forEach(function (g) {
+      var o = document.createElement('option');
+      o.value = g.key; o.textContent = g.label;
+      jGame.appendChild(o);
+    });
+    jGameKnown = !!gameOf(c, game);
+    jGame.value = jGameKnown ? game : c.games[0].key;
+    updateJoin();
+    return true;
+  }
+  function readCode(raw) {
     var v = (raw || '').trim();
-    var warn = $('joinWarn');
-    // A host is handed TWO things to share — a code and a link — and this box is
-    // where a person pastes whichever one they were sent. Refusing the link with
-    // "that does not look like a code" was true and useless: the code is in its
-    // ?np=, along with the console and the game, and this page already reads all
-    // three out of a URL when one is in its own address bar.
+    // A host shares a code AND a link; accept whichever one was pasted. The link carries the
+    // code, the console and the game.
     if (/[?&]np=/.test(v)) {
       try {
         var u = new URL(v, location.origin);
         var linkSys = u.searchParams.get('sys');
-        var linkGame = u.searchParams.get('game');
-        if (linkSys && BY_KEY[linkSys]) pickConsole(linkSys, linkGame || undefined);
+        if (linkSys && BY_KEY[linkSys]) { jManual = true; setJoin(linkSys, u.searchParams.get('game') || undefined); }
         v = u.searchParams.get('np') || '';
       } catch (e) { /* not a URL after all — fall through to the code check */ }
     }
-    v = v.toUpperCase();
+    return v.toUpperCase();
+  }
+  function updateJoin() {
+    var v = $('codeIn').value.trim().toUpperCase();
+    var haveCode = CODE_RE.test(v);
+    // THE CODE NAMES ITS CONSOLE (lib/netplay.js makeCode): read it, do not ask.
+    if (haveCode && !jManual) {
+      var det = Netplay.consoleOfCode ? Netplay.consoleOfCode(v) : null;
+      if (det && BY_KEY[det] && BY_KEY[det].games.length) { if (!jSys || jSys.key !== det) { setJoin(det); return; } }
+    }
+    var codeSays = haveCode && Netplay.consoleOfCode ? Netplay.consoleOfCode(v) : null;
+    var detected = !!(jSys && haveCode && (jManual || (codeSays && jSys.key === codeSays)));
+    // A code from before codes named their console cannot be read; ask, with nothing preselected.
+    $('jPick').hidden = !(haveCode && !detected);
+    $('jDetected').hidden = !detected;
+    $('btnJChange').hidden = !detected;
+    if (detected) {
+      $('jDetected').textContent = (jGameKnown ? jGame.options[jGame.selectedIndex].text + ' \u2014 ' : '') +
+        jSys.name + ' room ' + v + '. Your console loads the host\u2019s game by itself.';
+    }
+    $('btnJoin').disabled = !(haveCode && detected);
+    $('joinSummary').textContent = detected ? 'Ready \u2014 press Join.'
+      : !haveCode ? 'Enter the five-character room code.'
+      : 'This is an older code that does not say its console \u2014 choose the console the host is playing on.';
+  }
+  function tryJoin(raw) {
+    var v = readCode(raw);
+    var warn = $('joinWarn');
     // The same alphabet every page's netStartGuest() enforces. Refusing a
     // malformed code HERE means the player is told on the page they typed it
     // on, rather than after a hand-off into an emulator that then cannot pair.
     if (!CODE_RE.test(v)) {
       warn.hidden = false;
-      warn.textContent = 'That does not look like a code — five characters, and no I, O, 0 or 1.';
+      warn.textContent = 'That does not look like a code \u2014 five characters, and no I, O, 0 or 1.';
+      return false;
+    }
+    if (!jSys || !jGame.value) {
+      warn.hidden = false;
+      warn.textContent = 'Choose the console the host is playing on.';
       return false;
     }
     warn.hidden = true;
-    location.href = emulatorUrl(sys, sel.value, v, true);
+    location.href = emulatorUrl(jSys, jGame.value, v, true);
     return true;
   }
+  jGame.addEventListener('change', updateJoin);
+  $('btnJChange').addEventListener('click', function () { jManual = true; $('jPick').hidden = false; $('jDetected').hidden = true; $('btnJChange').hidden = true; });
+  $('codeIn').addEventListener('input', function () {
+    if (!/[?&]np=/.test($('codeIn').value)) jManual = false; // a new code is read afresh
+    $('codeIn').value = readCode($('codeIn').value); // a pasted link collapses to its code
+    $('joinWarn').hidden = true;
+    updateJoin();
+  });
   $('btnJoin').addEventListener('click', function () { tryJoin($('codeIn').value); });
-  $('codeIn').addEventListener('keydown', function (e) { if (e.key === 'Enter') tryJoin($('codeIn').value); });
 
   // ---- an invitation: /multiplayer.html?np=CODE&sys=<console>&game=<key> ------
   // Everything is known, so the joiner is shown ONE button. The pickers stay on
@@ -481,14 +572,17 @@
     var c = BY_KEY[preSys || ''];
     var g = c ? gameOf(c, preGame || '') : null;
     if (!c || !c.games.length || !g) {
-      // A code with no (or an unknown) game: the join pane, code filled in, and
+      // A code with no (or an unknown) game: the join card, code filled in, and
       // the player picks what the host told them.
+      $('pick').hidden = true;
       $('joinPane').hidden = false;
       $('codeIn').value = np;
+      if (c && c.games.length) { jManual = true; setJoin(c.key); }
+      updateJoin();
       if (preSys || preGame) {
         $('joinWarn').hidden = false;
         $('joinWarn').textContent = 'The link named a game this site does not offer online' +
-          (preSys ? ' on ' + preSys : '') + ' — pick the console and game the host is on.';
+          (preSys ? ' on ' + preSys : '') + ' \u2014 pick the console and game the host is on.';
       }
       return;
     }
@@ -497,12 +591,16 @@
       ' — room ' + np + '. Your own console loads the game; nothing starts until everyone is in.';
     $('invitedCard').hidden = false;
     $('pick').hidden = true;
+    jManual = true;
+    setJoin(c.key, g.key);
+    $('codeIn').value = np;
+    updateJoin();
     $('btnInvitedJoin').addEventListener('click', function () { tryJoin(np); });
     $('btnInvitedPick').addEventListener('click', function () {
       $('invitedCard').hidden = true;
-      $('pick').hidden = false;
       $('joinPane').hidden = false;
       $('codeIn').value = np;
+      updateJoin();
     });
   })();
 
