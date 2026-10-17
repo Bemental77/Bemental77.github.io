@@ -16,6 +16,7 @@
 //                    restored state's must equal the one recorded at that frame
 //   RBON=at          rollback logging on from `at` (a boundary every frame, no hashing, no rewinds):
 //                    what the write barrier costs while a room runs
+//   VW/VH/DPR/MOBILE=1  viewport, devicePixelRatio, mobile+touch emulation; CPUTHROTTLE=n  CDP CPU slowdown x n
 //   KEYS="sec:Code:holdMs,.."  real keyboard presses;  DUMPIO=1 Chrome stderr;  NOSS=1 no ANGLE SwiftShader
 // Before measured runs: node tools/browser_leak_guard.js reap && uptime; wrap in tools/probe_lock.sh run --
 import { createRequire } from 'module';
@@ -35,7 +36,8 @@ const b = await puppeteer.launch({ executablePath: '/opt/pw-browsers/chromium-11
 try { guard.guard(b, 'scratch mp4n'); } catch (_e) {}
 const logs = []; const t0 = Date.now();
 try {
-  const p = await b.newPage(); await p.setViewport({ width: +(process.env.VW || 1100), height: 1000 });
+  const p = await b.newPage(); await p.setViewport({ width: +(process.env.VW || 1100), height: +(process.env.VH || 1000), deviceScaleFactor: +(process.env.DPR || 1), isMobile: !!process.env.MOBILE, hasTouch: !!process.env.MOBILE });
+  if (process.env.CPUTHROTTLE) { const cdp = await p.target().createCDPSession(); await cdp.send('Emulation.setCPUThrottlingRate', { rate: +process.env.CPUTHROTTLE }); }
   await p.evaluateOnNewDocument(() => { window.addEventListener('error', (ev) => console.log('ERRSTACK ' + (ev.error && ev.error.stack))); window.addEventListener('unhandledrejection', (ev) => console.log('REJSTACK ' + (ev.reason && ev.reason.stack)));  });
   await p.evaluateOnNewDocument(() => { Error.stackTraceLimit = 100; for (const k of ['warn', 'error', 'log']) { const o = console[k].bind(console); console[k] = (...a) => { const t = a.join(' '); o(...a); if (/Instance reference|Device lost|Aborted/.test(t)) o('JSSTACK ' + new Error().stack.split('\n').slice(2, 40).map((l) => l.trim().replace(/\(?http[^)]*\)?/, '')).join(' | ')); }; } });
   p.on('console', (m) => { logs.push(((Date.now() - t0) / 1000).toFixed(1) + ' ' + m.text().slice(0, /JSSTACK|ERRSTACK|REJSTACK/.test(m.text()) ? 8000 : 500)); if (/Instance reference|Aborted|rror/.test(m.text())) logs.push('  STACK ' + m.stackTrace().slice(0, 25).map((f) => f.url.split('/').pop() + ':' + f.lineNumber + ' ' + (f.functionName||'')).join(' < ')); });

@@ -101,13 +101,17 @@ GAMEF=(-DTARGET_PC -DNON_MATCHING -DOPTIMIZED_TEXTURE_LOADING -DBYTESWAPPING -DT
        -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-implicit-int)
 game_srcs() {
   sed -n '/set(GAME_FILES/,/)/p; /set(PORT_FILES/,/)/p' "$PB/files.cmake" | grep -v "^ *#" | grep -oE "src/[A-Za-z0-9_/.-]+\.(c|cpp)" | grep -v "^src/port/ui/\|^src/port/portmain.cpp\|^src/port/achievements.cpp\|^src/port/audio.cpp" | sed "s#^#$PB/#"
-  echo "$HERE/src/libco_fiber.c"; echo "$HERE/src/rel_dispatch.c"; echo "$HERE/src/portmain_web.cpp"; echo "$HERE/src/web_stubs.cpp"; echo "$HERE/src/web_audio.cpp"; echo "$HERE/src/det_heap.c"; echo "$HERE/src/nod_web.c"   # game heap: aurora keeps its handles inside game-held DVD blocks
+  echo "$HERE/src/libco_fiber.c"; echo "$HERE/src/rel_dispatch.c"; echo "$HERE/src/web_stubs.cpp"; echo "$HERE/src/web_audio.cpp"; echo "$HERE/src/det_heap.c"; echo "$HERE/src/nod_web.c"   # game heap: aurora keeps its handles inside game-held DVD blocks
   sed -n '/add_library(musyx STATIC/,/)/p' "$MX/CMakeLists.txt" | grep -oE "src/[A-Za-z0-9_/.-]+\.c" | sed "s#^#$MX/#"
   echo "$MX/src/musyx/runtime/hw_pc_null.c"   # no SDL device: the game renders each frame's samples itself
   echo "$MX/src/musyx/debugger/debugger.c"   # the runtime calls its pause/step hooks unconditionally
 }
 if [ "$STAGE" = game ] || [ "$STAGE" = all ]; then
   game_srcs | build_list game "${GAMEF[@]}"
+  # main() and its host-side statics (AuroraInfo holds the window's pixel size and scale, which differ
+  # per device) are NOT game state: built with the game's flags, linked outside the game's range
+  rm -f "$BUILD"/obj/game__*portmain_web*
+  echo "$HERE/src/portmain_web.cpp" | build_list au "${GAMEF[@]}" -fexceptions
 fi
 # ---- the overlays (src/REL/*): compiled into the module, namespaced, fresh statics per link ----
 if [ "$STAGE" = rel ] || [ "$STAGE" = all ]; then
@@ -126,7 +130,7 @@ if [ "$STAGE" = link ] || [ "$STAGE" = all ]; then
   em++ -O2 -fexceptions "${PORTS[@]}" -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=131072 -sSTACK_SIZE=1048576 \
     -sINITIAL_MEMORY=268435456 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2147483648 \
     -sENVIRONMENT=web -sEXIT_RUNTIME=0 -sINVOKE_RUN=0 -sMODULARIZE=1 -sEXPORT_NAME=createMp4Native \
-    -lidbfs.js -sEXPORTED_RUNTIME_METHODS=callMain,HEAPU8,HEAP16,HEAP32,FS,IDBFS,addRunDependency,removeRunDependency -sEXPORTED_FUNCTIONS=_main,_mp4web_frames,_mp4web_reanchors,_mp4web_total,_mp4web_busy_ms,_mp4web_gpu_wait_ms,_mp4web_audio_samples,_mp4web_state_hash,_mp4web_state_ranges,_mp4web_rb_enable,_mp4web_rb_disable,_mp4web_rb_boundary,_mp4web_rb_restore,_mp4web_rb_oldest,_mp4web_rb_hash,_mp4web_rb_stats,_mp4web_rb_on,_mp4web_rb_audit,_mp4web_rb_hash_full,_mp4web_rb_pages,_mp4web_rb_small_hash,_mp4web_rb_base,_mp4web_rb_page_hashes,_mp4web_set_frame,_mp4web_set_max_debt,_mp4web_cow,_mp4web_mem_stats,_mp4web_det_heap_high_water,_mp4web_det_heap_fallbacks,_malloc,_free \
+    -lidbfs.js -sEXPORTED_RUNTIME_METHODS=callMain,HEAPU8,HEAP16,HEAP32,FS,IDBFS,addRunDependency,removeRunDependency -sEXPORTED_FUNCTIONS=_main,_mp4web_frames,_mp4web_reanchors,_mp4web_total,_mp4web_busy_ms,_mp4web_gpu_wait_ms,_mp4web_audio_samples,_mp4web_state_hash,_mp4web_state_ranges,_mp4web_rb_enable,_mp4web_rb_disable,_mp4web_rb_boundary,_mp4web_rb_restore,_mp4web_rb_oldest,_mp4web_rb_hash,_mp4web_rb_stats,_mp4web_rb_on,_mp4web_rb_audit,_mp4web_rb_hash_full,_mp4web_rb_pages,_mp4web_rb_small_hash,_mp4web_rb_base,_mp4web_rb_page_hashes,_mp4web_set_frame,_mp4web_set_max_debt,_mp4web_set_gfx_skip,_mp4web_cow,_mp4web_mem_stats,_mp4web_det_heap_high_water,_mp4web_det_heap_fallbacks,_malloc,_free \
     -sFORCE_FILESYSTEM=1 --post-js "$HERE/src/post.js" --js-library "$HERE/src/rollback_lib.js" ${LINK_EXTRA:-} -Wl,--Map="$OUT/mp4native.map" \
     "$BUILD"/obj/au__*.o "$BUILD/mark/game_b.o" "$BUILD"/obj/gau__*.o "$BUILD"/obj/game__*.o $(cat "$BUILD/rel/link_order.txt") "$BUILD/mark/game_e.o" -o "$OUT/mp4native.js" 2> "$OUT/link.log" \
     && echo "[link] ok $(stat -c %s "$OUT/mp4native.wasm") B wasm" || { echo "[link] FAIL"; grep -c "undefined symbol" "$OUT/link.log"; head -c 3000 "$OUT/link.log"; exit 1; }
