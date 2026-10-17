@@ -14,6 +14,74 @@ index a84043f..a7dd298 100644
  s32 fn_1_8944(void);
  M420DllPlayerStruct *fn_1_1B8C(s32, s32);
  void fn_1_1E14(M420DllPlayerStruct *);
+diff --git a/include/REL/mgmodedll.h b/include/REL/mgmodedll.h
+index 9872dc4..54c5d4e 100644
+--- a/include/REL/mgmodedll.h
++++ b/include/REL/mgmodedll.h
+@@ -32,7 +32,12 @@ typedef struct datalist_sprite {
+ 
+ typedef struct struct_bss8_24 {
+     omObjData *unk0;
++#ifdef TARGET_PC
++    // arm64 passes variadic arguments on the stack but the handlers read them from registers
++    void (*unk4)(omObjData *, void *);
++#else
+     void (*unk4)(omObjData *, ...);
++#endif
+     u8 unk8[0x50];
+     s32 unk58;
+     s32 unk5C;
+diff --git a/include/REL/mstory2Dll.h b/include/REL/mstory2Dll.h
+index 4c05573..a5674b7 100644
+--- a/include/REL/mstory2Dll.h
++++ b/include/REL/mstory2Dll.h
+@@ -35,7 +35,12 @@ typedef struct {
+ 
+ typedef struct {
+     /* 0x00 */ omObjData* unk00;
++#ifdef TARGET_PC
++    // arm64 passes variadic arguments on the stack but the handlers read them from registers
++    /* 0x04 */ void (*unk04)(omObjData*, void*);
++#else
+     /* 0x04 */ void (*unk04)(omObjData*, ...);
++#endif
+     /* 0x08 */ s32 unk08;
+     /* 0x0C */ s32 unk0C;
+     /* 0x10 */ char unk10[0x18];
+diff --git a/include/REL/mstory3Dll.h b/include/REL/mstory3Dll.h
+index b9b0630..705bfec 100755
+--- a/include/REL/mstory3Dll.h
++++ b/include/REL/mstory3Dll.h
+@@ -42,7 +42,12 @@ typedef struct {
+ 
+ typedef struct {
+     /* 0x00 */ omObjData* unk00;
++#ifdef TARGET_PC
++    // arm64 passes variadic arguments on the stack but the handlers read them from registers
++    /* 0x04 */ void (*unk04)(omObjData*, void*);
++#else
+     /* 0x04 */ void (*unk04)(omObjData*, ...);
++#endif
+     /* 0x08 */ s32 unk08;
+     /* 0x0C */ s32 unk0C;
+     /* 0x10 */ s32 unk10;
+diff --git a/include/REL/mstoryDll.h b/include/REL/mstoryDll.h
+index 6067ad4..c6faa14 100755
+--- a/include/REL/mstoryDll.h
++++ b/include/REL/mstoryDll.h
+@@ -35,7 +35,12 @@ typedef struct {
+ 
+ typedef struct {
+     /* 0x00 */ omObjData* unk00;
++#ifdef TARGET_PC
++    // arm64 passes variadic arguments on the stack but the handlers read them from registers
++    /* 0x04 */ void (*unk04)(omObjData*, void*);
++#else
+     /* 0x04 */ void (*unk04)(omObjData*, ...);
++#endif
+     /* 0x08 */ s32 unk08;
+     /* 0x0C */ s32 unk0C;
+     /* 0x10 */ char unk10[0x18];
 diff --git a/include/game/board/bowser.h b/include/game/board/bowser.h
 index 9074ed4..d6da2e6 100644
 --- a/include/game/board/bowser.h
@@ -56,6 +124,140 @@ index 944cafd..d6ebdec 100644
      fn_1_4964();
      fn_1_D98();
      fn_1_D14(0, 1);
+diff --git a/src/REL/mentDll/main.c b/src/REL/mentDll/main.c
+index 32cd713..20cfb9a 100644
+--- a/src/REL/mentDll/main.c
++++ b/src/REL/mentDll/main.c
+@@ -45,7 +45,12 @@ typedef struct MentDllUnkBss16C4Struct {
+     /* 0x2C */ float unk_2C;
+ } MentDllUnkBss16C4Struct; /* size = 0x30 */
+ 
++#ifdef TARGET_PC
++// arm64 passes variadic arguments on the stack but the handlers read them from registers
++typedef void (*MentDllUnkFunc)(omObjData *, void *);
++#else
+ typedef void (*MentDllUnkFunc)(omObjData *, ...);
++#endif
+ 
+ typedef struct MentDllUnkBss3114Struct {
+     /* 0x00 */ omObjData *unk_00;
+@@ -1256,11 +1261,11 @@ s32 fn_1_99CC(void)
+ 
+         for (i = 0; i < 6; i++) {
+             lbl_1_bss_33AC[i].unk_08 = 0;
+-            lbl_1_bss_33AC[i].unk_04 = (void (*)(omObjData *, ...))fn_1_127FC;
++            lbl_1_bss_33AC[i].unk_04 = (MentDllUnkFunc)fn_1_127FC;
+         }
+ 
+         lbl_1_bss_33AC[sp8[var_r30]].unk_08 = 1;
+-        lbl_1_bss_35BC->unk_04 = (void (*)(omObjData *, ...))fn_1_18F74;
++        lbl_1_bss_35BC->unk_04 = (MentDllUnkFunc)fn_1_18F74;
+         while (1) {
+             fn_1_4D8();
+             for (i = 0; i < 6; i++) {
+diff --git a/src/REL/mgmodedll/main.c b/src/REL/mgmodedll/main.c
+index ded0a59..f47ac39 100755
+--- a/src/REL/mgmodedll/main.c
++++ b/src/REL/mgmodedll/main.c
+@@ -8,7 +8,12 @@ extern s32 rand8(void);
+ 
+ typedef struct {
+     /* 0x00 */ omObjData *unk00;
++#ifdef TARGET_PC
++    // arm64 passes variadic arguments on the stack but the handlers read them from registers
++    /* 0x04 */ void (*unk04)(omObjData *, void *);
++#else
+     /* 0x04 */ void (*unk04)(omObjData *, ...);
++#endif
+     /* 0x08 */ s32 unk08[4];
+     /* 0x18 */ char unk18[4];
+     /* 0x1C */ s32 unk1C[4];
+diff --git a/src/REL/mpexDll/charsel.c b/src/REL/mpexDll/charsel.c
+index 8f56832..08f7f78 100644
+--- a/src/REL/mpexDll/charsel.c
++++ b/src/REL/mpexDll/charsel.c
+@@ -11,7 +11,12 @@
+ 
+ #include "REL/mpexDll.h"
+ 
++#ifdef TARGET_PC
++// arm64 passes variadic arguments on the stack but the handlers read them from registers
++typedef void (*MpexDllUnkFunc2)(omObjData *, void *);
++#else
+ typedef void (*MpexDllUnkFunc2)(omObjData *, ...);
++#endif
+ 
+ typedef struct MpexDllUnkStruct4 {
+     /* 0x00 */ omObjData *unk_00;
+diff --git a/src/REL/mpexDll/mpex.c b/src/REL/mpexDll/mpex.c
+index c952a94..ea9ec98 100644
+--- a/src/REL/mpexDll/mpex.c
++++ b/src/REL/mpexDll/mpex.c
+@@ -23,7 +23,12 @@
+ 
+ #include "REL/mpexDll.h"
+ 
++#ifdef TARGET_PC
++// arm64 passes variadic arguments on the stack but the handlers read them from registers
++typedef void (*MpexDllUnkFunc2)(omObjData *, void *);
++#else
+ typedef void (*MpexDllUnkFunc2)(omObjData *, ...);
++#endif
+ 
+ typedef struct MpexDllUnkStruct3 {
+     /* 0x00 */ s32 unk_00;
+diff --git a/src/REL/mstory3Dll/result_seq.c b/src/REL/mstory3Dll/result_seq.c
+index 12817dd..40905d9 100755
+--- a/src/REL/mstory3Dll/result_seq.c
++++ b/src/REL/mstory3Dll/result_seq.c
+@@ -1417,7 +1417,11 @@ void fn_1_D48C(void) {
+     while (TRUE) {
+         fn_1_938();
+         if (lbl_1_bss_1558.unk04 != NULL) {
++#ifdef TARGET_PC
++            lbl_1_bss_1558.unk04(temp_r3, NULL);
++#else
+             lbl_1_bss_1558.unk04(temp_r3);
++#endif
+         }
+     }
+ }
+@@ -1770,7 +1774,11 @@ void fn_1_FE80(void) {
+     while (TRUE) {
+         fn_1_938();
+         if (lbl_1_bss_1530.unk04 != NULL) {
++#ifdef TARGET_PC
++            lbl_1_bss_1530.unk04(temp_r31, NULL);
++#else
+             lbl_1_bss_1530.unk04(temp_r31);
++#endif
+         }
+         fn_1_D7D8(temp_r31);
+     }
+@@ -2474,7 +2482,11 @@ void fn_1_13908(void) {
+     while (TRUE) {
+         fn_1_938();
+         if (lbl_1_bss_1490[temp_r31].unk04 != NULL) {
++#ifdef TARGET_PC
++            lbl_1_bss_1490[temp_r31].unk04(lbl_1_bss_1490[temp_r31].unk00, NULL);
++#else
+             lbl_1_bss_1490[temp_r31].unk04(lbl_1_bss_1490[temp_r31].unk00);
++#endif
+         }
+     }
+ }
+@@ -2674,7 +2686,11 @@ void fn_1_140A0(void) {
+     while (TRUE) {
+         fn_1_938();
+         if (lbl_1_bss_1468.unk04 != NULL) {
++#ifdef TARGET_PC
++            lbl_1_bss_1468.unk04(temp_r3, NULL);
++#else
+             lbl_1_bss_1468.unk04(temp_r3);
++#endif
+         }
+     }
+ }
 diff --git a/src/REL/w03Dll/main.c b/src/REL/w03Dll/main.c
 index 20cab22..236cb94 100644
 --- a/src/REL/w03Dll/main.c
@@ -91,6 +293,23 @@ index 20cab22..236cb94 100644
          BoardJunctionMaskSet(0xC00);
      }
  }
+diff --git a/src/REL/ztardll/select.c b/src/REL/ztardll/select.c
+index e123e1d..34e1035 100644
+--- a/src/REL/ztardll/select.c
++++ b/src/REL/ztardll/select.c
+@@ -12,7 +12,12 @@
+ 
+ #include "REL/ztardll.h"
+ 
++#ifdef TARGET_PC
++// arm64 passes variadic arguments on the stack but the handlers read them from registers
++typedef void (*ZtarUnkFunc)(omObjData *, void *);
++#else
+ typedef void (*ZtarUnkFunc)(omObjData *, ...);
++#endif
+ 
+ typedef struct ZtarDllUnkStruct2 {
+     /* 0x00 */ omObjData *unk_00;
 diff --git a/src/game/audio.c b/src/game/audio.c
 index b5b8317..5e1fed1 100644
 --- a/src/game/audio.c

@@ -119,7 +119,7 @@ if [ "$STAGE" = link ] || [ "$STAGE" = all ]; then
   em++ -O2 -fexceptions "${PORTS[@]}" -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=131072 -sSTACK_SIZE=1048576 \
     -sINITIAL_MEMORY=268435456 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2147483648 \
     -sENVIRONMENT=web -sEXIT_RUNTIME=0 -sINVOKE_RUN=0 -sMODULARIZE=1 -sEXPORT_NAME=createMp4Native \
-    -sEXPORTED_RUNTIME_METHODS=callMain,HEAPU8,HEAP16,HEAP32 -sEXPORTED_FUNCTIONS=_main,_mp4web_frames,_mp4web_reanchors,_mp4web_total,_mp4web_busy_ms,_mp4web_gpu_wait_ms,_mp4web_audio_samples,_mp4web_state_hash,_mp4web_state_ranges,_mp4web_det_heap_high_water,_mp4web_det_heap_fallbacks,_malloc,_free \
+    -lidbfs.js -sEXPORTED_RUNTIME_METHODS=callMain,HEAPU8,HEAP16,HEAP32,FS,IDBFS,addRunDependency,removeRunDependency -sEXPORTED_FUNCTIONS=_main,_mp4web_frames,_mp4web_reanchors,_mp4web_total,_mp4web_busy_ms,_mp4web_gpu_wait_ms,_mp4web_audio_samples,_mp4web_state_hash,_mp4web_state_ranges,_mp4web_det_heap_high_water,_mp4web_det_heap_fallbacks,_malloc,_free \
     -sFORCE_FILESYSTEM=1 --post-js "$HERE/src/post.js" ${LINK_EXTRA:-} -Wl,--Map="$OUT/mp4native.map" \
     "$BUILD"/obj/au__*.o "$BUILD/mark/game_b.o" "$BUILD"/obj/game__*.o $(cat "$BUILD/rel/link_order.txt") "$BUILD/mark/game_e.o" -o "$OUT/mp4native.js" 2> "$OUT/link.log" \
     && echo "[link] ok $(stat -c %s "$OUT/mp4native.wasm") B wasm" || { echo "[link] FAIL"; grep -c "undefined symbol" "$OUT/link.log"; head -c 3000 "$OUT/link.log"; }

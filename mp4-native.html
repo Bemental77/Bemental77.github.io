@@ -141,6 +141,19 @@
         canvas: canvas,
         mp4Disc: parts,
         mp4AudioPush: audioPush,
+        // memory-card saves persist in IndexedDB (?nosave=1: a fresh card every visit — what a
+        // netplay session or a determinism test wants, since a save is game state)
+        preRun: [function (M) {
+          if (Q.get('nosave') || !M.FS || !M.IDBFS) return;
+          try {
+            M.FS.mkdir('/partyboard');
+            M.FS.mount(M.IDBFS, {}, '/partyboard');
+            M.addRunDependency('mp4-saves');
+            M.FS.syncfs(true, function (e) { if (e) log('saves: could not load (' + e + ')'); M.removeRunDependency('mp4-saves'); });
+            setInterval(function () { M.FS.syncfs(false, function () {}); }, 5000);
+            window.addEventListener('pagehide', function () { M.FS.syncfs(false, function () {}); });
+          } catch (e) { log('saves: ' + e); }
+        }],
         mp4EpochSeconds: Q.get('epoch') ? +Q.get('epoch') : undefined,
         mp4InputLatch: function (frame, ptr) { var m = window.__mp4n.module; Mp4Input.latch(frame, ptr, m && m.HEAP32); },
         locateFile: function (p) { return BUILD + p; },
