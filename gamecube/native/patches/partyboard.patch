@@ -1,3 +1,31 @@
+diff --git a/include/REL/m420dll.h b/include/REL/m420dll.h
+index a84043f..a7dd298 100644
+--- a/include/REL/m420dll.h
++++ b/include/REL/m420dll.h
+@@ -58,7 +58,11 @@ void fn_1_669C(s32 arg0);
+ void fn_1_6728(void);
+ s32 fn_1_67E8(s32);
+ s32 fn_1_6810(void);
++#ifdef __EMSCRIPTEN__
++void fn_1_8934(u32 seed); // rand.c's definition; wasm traps on a mismatched call
++#else
+ void fn_1_8934(void);
++#endif
+ s32 fn_1_8944(void);
+ M420DllPlayerStruct *fn_1_1B8C(s32, s32);
+ void fn_1_1E14(M420DllPlayerStruct *);
+diff --git a/include/game/board/bowser.h b/include/game/board/bowser.h
+index 9074ed4..d6da2e6 100644
+--- a/include/game/board/bowser.h
++++ b/include/game/board/bowser.h
+@@ -3,6 +3,6 @@
+ 
+ #include "game/process.h"
+ 
+-void BoardBowserExec(s32 player, s32 space);
++s32 BoardBowserExec(s32 player, s32 space); // returns s32 (bowser.c); callers ignore it
+ 
+ #endif
 diff --git a/include/game/object.h b/include/game/object.h
 index a9a6085..1e3d9e9 100644
 --- a/include/game/object.h
@@ -11,6 +39,81 @@ index a9a6085..1e3d9e9 100644
      void *handle;
  #else
  	OSModuleHeader *module;
+diff --git a/src/REL/m420dll/main.c b/src/REL/m420dll/main.c
+index 944cafd..d6ebdec 100644
+--- a/src/REL/m420dll/main.c
++++ b/src/REL/m420dll/main.c
+@@ -73,8 +73,12 @@ s32 fn_1_198(void)
+     s32 var_r30;
+ 
+     Vec sp14[3] = { { 0.0f, 4000.0f, 100.0f }, { 0.0f, 1.0f, 0.0f }, { 0.0f, 0.0f, 0.0f } };
++#ifdef __EMSCRIPTEN__
++    fn_1_8934(frand()); // PPC: the seed is r3, i.e. frand()'s return value, left untouched by the bare call
++#else
+     frand();
+     fn_1_8934();
++#endif
+     fn_1_4964();
+     fn_1_D98();
+     fn_1_D14(0, 1);
+diff --git a/src/REL/w03Dll/main.c b/src/REL/w03Dll/main.c
+index 20cab22..236cb94 100644
+--- a/src/REL/w03Dll/main.c
++++ b/src/REL/w03Dll/main.c
+@@ -32,7 +32,15 @@ void fn_1_AF8(void);
+ void fn_1_DEC(void);
+ void fn_1_10B0(void);
+ void fn_1_10E4(omObjData* arg0);
++#ifdef __EMSCRIPTEN__
++// statue.c defines fn_1_12C8 as void, and wasm traps on the mismatched call. On the GameCube the
++// caller tests r3 as left by BoardRollDispSet(1): 1 when no roll object exists, else the last sprite
++// call's r3. APPROXIMATION (unverified for the roll-object path): treat it as nonzero.
++void fn_1_12C8(void);
++static inline s32 w03_statue_event(void) { fn_1_12C8(); return 1; }
++#else
+ s32 fn_1_12C8(void);
++#endif
+ s32 fn_1_2930(s32 arg0);
+ 
+ #ifndef __MWERKS__
+@@ -328,7 +336,13 @@ s32 fn_1_A74(void) {
+ }
+ 
+ void fn_1_AF8(void) {
+-    if ((BoardPlayerSizeGet(GWSystem.player_curr) == 0) && (fn_1_12C8() != 0) && (lbl_1_bss_0->unk2 != 0)) {
++    if ((BoardPlayerSizeGet(GWSystem.player_curr) == 0) && (
++#ifdef __EMSCRIPTEN__
++        w03_statue_event()
++#else
++        fn_1_12C8()
++#endif
++        != 0) && (lbl_1_bss_0->unk2 != 0)) {
+         BoardJunctionMaskSet(0xC00);
+     }
+ }
+diff --git a/src/game/board/space.c b/src/game/board/space.c
+index 713a00a..6272695 100644
+--- a/src/game/board/space.c
++++ b/src/game/board/space.c
+@@ -27,9 +27,18 @@
+ #include <port/byteswap.h>
+ #endif
+ 
++#ifdef __EMSCRIPTEN__ // wasm traps on a call whose signature differs from the definition; on PPC the extra arg is ignored
++s32 BoardBlockExec(s32 player);
++extern void BoardMushroomExec(s32 player);
++extern void BoardBooHouseExec(s32 player);
++#define BoardBlockExec(player, space) BoardBlockExec(player)
++#define BoardMushroomExec(player, space) BoardMushroomExec(player)
++#define BoardBooHouseExec(player, space) BoardBooHouseExec(player)
++#else
+ s32 BoardBlockExec(s32 player, s32 space); // wrong
+ extern void BoardMushroomExec(s32 player, s32 space); // wrong
+ extern void BoardBooHouseExec(s32 player, s32 space); // wrong
++#endif
+ extern void BoardBlockHouseExec(s32 player, s32 space); // wrong
+ 
+ static BoardSpace spaceData[2][256];
 diff --git a/src/game/objdll.c b/src/game/objdll.c
 index b87d08d..cca17be 100644
 --- a/src/game/objdll.c

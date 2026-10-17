@@ -11,7 +11,8 @@
 #   BUILD=/home/user/mp4native/build   (objects ~10 MB; out/mp4native.{js,wasm})
 #   STAGE=aurora|game|rel|link|all (default all)
 # Source patches (apply once to fresh checkouts): patches/aurora.patch (git apply in aurora/),
-# patches/partyboard.patch (in partyboard/), patches/imgui.patch (patch -p1 in DEPS/imgui).
+# patches/partyboard.patch (in partyboard/), patches/musyx.patch (patch -p1 in musyx/),
+# patches/imgui.patch (patch -p1 in DEPS/imgui).
 # Then: copy BUILD/out/mp4native.{js,wasm} to gamecube/native/dist/ and open /mp4-native.html.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
