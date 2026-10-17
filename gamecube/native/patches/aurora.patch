@@ -183,6 +183,37 @@ index 863ecb8..5235f25 100644
    const NodDiscOptions options{
        .preloader_threads = 1,
    };
+diff --git a/lib/dolphin/mtx/vec.c b/lib/dolphin/mtx/vec.c
+index 6dc1467..27c9621 100644
+--- a/lib/dolphin/mtx/vec.c
++++ b/lib/dolphin/mtx/vec.c
+@@ -36,7 +36,14 @@ void C_VECNormalize(const Vec* src, Vec* unit) {
+   assert(unit && "VECNormalize():  NULL VecPtr 'unit' ");
+ 
+   mag = (src->z * src->z) + ((src->x * src->x) + (src->y * src->y));
++#ifdef __EMSCRIPTEN__
++  // web: a zero vector is a debug assert here (and NaN on hardware). The game reaches it (seen after
++  // a scripted route ran out of input, frame ~23596): give a zero vector — the same on every
++  // machine, where a NaN's bits are not guaranteed to be.
++  if (mag == 0.0f) { unit->x = unit->y = unit->z = 0.0f; return; }
++#else
+   assert(0.0f != mag && "VECNormalize():  zero magnitude vector ");
++#endif
+ 
+   mag = 1.0f/ sqrtf(mag);
+   unit->x = src->x * mag;
+@@ -52,7 +59,11 @@ void PSVECNormalize(const Vec* src, Vec* unit) {
+   assert(unit && "VECNormalize():  NULL VecPtr 'unit' ");
+ 
+   sqsum = (src->z * src->z + src->x * src->x) + src->y * src->y;
++#ifdef __EMSCRIPTEN__
++  if (sqsum == 0.0f) { unit->x = unit->y = unit->z = 0.0f; return; }   // see C_VECNormalize
++#else
+   assert(0.0f != sqsum && "VECNormalize():  zero magnitude vector ");
++#endif
+ 
+   rsqrt = ppc_rsqrte(sqsum);
+   unit->x = src->x * rsqrt;
 diff --git a/lib/dolphin/os/OSMemory.cpp b/lib/dolphin/os/OSMemory.cpp
 index 2a963a5..ae9e642 100644
 --- a/lib/dolphin/os/OSMemory.cpp
@@ -272,10 +303,10 @@ index 2d7f795..17cb345 100644
            g_keyboardBindings[i].m_buttonMapping, [&kbState, &i, &status](const PADKeyButtonBinding& mapping) {
              if (mapping.scancode > PAD_KEY_INVALID && kbState[mapping.scancode]) {
 diff --git a/lib/gfx/common.cpp b/lib/gfx/common.cpp
-index eff0c65..2d1304b 100644
+index eff0c65..495c337 100644
 --- a/lib/gfx/common.cpp
 +++ b/lib/gfx/common.cpp
-@@ -1,4 +1,19 @@
+@@ -1,4 +1,32 @@
  #include "common.hpp"
 +#ifdef __EMSCRIPTEN__
 +#include <emscripten.h>
@@ -290,20 +321,43 @@ index eff0c65..2d1304b 100644
 +int mp4web_gfx_skip_draws = 0;
 +EMSCRIPTEN_KEEPALIVE void mp4web_set_gfx_skip(int on) { mp4web_gfx_skip_draws = on ? 1 : 0; }
 +}
++// web: THE GAME NEVER WAITS FOR THE GPU. A frame records into a mapped staging buffer; when the GPU
++// is so far behind that none of the StagingBufferCount buffers has come back mapped, the old code
++// spun (yielding to the browser) until one did — the guest stood still for the GPU. Now that frame
++// records into a CPU scratch area instead and is not drawn (its game work runs exactly as before;
++// Aurora is outside the game's state). Its texture uploads go through their own mapped-at-creation
++// buffers and are submitted with the frame, so later frames see the same textures.
++static uint8_t* g_scratch = nullptr;
++static uint64_t g_scratchFrames = 0;
++static int g_gpuNoWait = 1;
++extern "C" {
++EMSCRIPTEN_KEEPALIVE double mp4web_gpu_scratch_frames(void) { return (double)g_scratchFrames; }
++EMSCRIPTEN_KEEPALIVE void mp4web_set_gpu_nowait(int on) { g_gpuNoWait = on ? 1 : 0; }
++}
 +#endif
 +#endif
  
  #include "clear.hpp"
  #include "depth_peek.hpp"
-@@ -221,6 +236,7 @@ struct FramePacket {
+@@ -221,6 +249,8 @@ struct FramePacket {
    AuroraStats stats{};
    uint32_t drawCallCount = 0;
    uint32_t mergedDrawCallCount = 0;
 +  bool skipDraws = false;
++  bool scratch = false;   // web: recorded into g_scratch (no staging buffer was ready); never drawn
  };
  
  static std::array<FramePacket, FrameSlotCount> g_framePackets;
-@@ -991,6 +1007,9 @@ static bool wait_for_staging_buffer(size_t slot) {
+@@ -383,7 +413,7 @@ void queue_texture_upload_data(const uint8_t* data, size_t length, uint32_t byte
+                                wgpu::TexelCopyTextureInfo tex, wgpu::Extent3D size) {
+   const auto copyBytesPerRow = AURORA_ALIGN(bytesPerRow, 256);
+   auto& frame = current_frame_packet();
+-  if (frame.textureUpload.size() + copyBytesPerRow * rowsPerImage <= TextureUploadSize) {
++  if (!frame.scratch && frame.textureUpload.size() + copyBytesPerRow * rowsPerImage <= TextureUploadSize) {
+     const auto range = push_texture_data(data, length, bytesPerRow, rowsPerImage);
+     const wgpu::TexelCopyBufferLayout layout{
+         .offset = range.offset,
+@@ -991,6 +1021,9 @@ static bool wait_for_staging_buffer(size_t slot) {
        return false;
      }
      if (render_worker::is_idle()) {
@@ -313,7 +367,7 @@ index eff0c65..2d1304b 100644
        g_instance.ProcessEvents();
      } else {
        std::this_thread::sleep_for(std::chrono::milliseconds{1});
-@@ -998,6 +1017,23 @@ static bool wait_for_staging_buffer(size_t slot) {
+@@ -998,6 +1031,23 @@ static bool wait_for_staging_buffer(size_t slot) {
    }
  }
  
@@ -337,7 +391,7 @@ index eff0c65..2d1304b 100644
  static size_t acquire_frame_slot() {
    ZoneScopedN("Acquire frame slot");
    while (true) {
-@@ -1005,6 +1041,9 @@ static size_t acquire_frame_slot() {
+@@ -1005,6 +1055,9 @@ static size_t acquire_frame_slot() {
        return *slot;
      }
      if (render_worker::is_idle()) {
@@ -347,7 +401,7 @@ index eff0c65..2d1304b 100644
        g_instance.ProcessEvents();
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds{100});
-@@ -1023,6 +1062,9 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
+@@ -1023,6 +1076,9 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
        return std::nullopt;
      }
      if (render_worker::is_idle()) {
@@ -357,17 +411,122 @@ index eff0c65..2d1304b 100644
        g_instance.ProcessEvents();
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds{100});
-@@ -1044,6 +1086,9 @@ bool begin_frame() {
+@@ -1033,8 +1089,32 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
+ bool begin_frame() {
+   ZoneScoped;
+   const size_t frameSlot = acquire_frame_slot();
++#ifdef __EMSCRIPTEN__
++  std::optional<size_t> stagingSlot;
++  bool scratch = false;
++  if (g_gpuNoWait) {
++    if (auto sl = g_stagingSlots.try_acquire()) {
++      const auto st = s_mappingStates[*sl].load(std::memory_order_acquire);
++      if (st == BufferMapState::Mapped) stagingSlot = sl;
++      else {
++        if (st == BufferMapState::Unmapped) map_staging_buffer(*sl);
++        g_stagingSlots.release(*sl);
++      }
++    }
++    if (!stagingSlot) {
++      scratch = true;
++      if (g_scratch == nullptr) g_scratch = static_cast<uint8_t*>(malloc(StagingBufferSize));
++      ++g_scratchFrames;
++      mp4web_gfx_skip_draws = 1;   // not presented (web_port.cpp counts it undrawn)
++    }
++  } else {
++    stagingSlot = acquire_mapped_staging_buffer();
++  }
++#else
+   const auto stagingSlot = acquire_mapped_staging_buffer();
+-  if (!stagingSlot) {
++  const bool scratch = false;
++#endif
++  if (!stagingSlot && !scratch) {
+     g_frameSlots.release(frameSlot);
+     return false;
+   }
+@@ -1043,17 +1123,27 @@ bool begin_frame() {
+   frame = {};
    frame.frameId = g_nextFrameId++;
    frame.frameIndex = g_frameIndex;
-   frame.stagingBuffer = *stagingSlot;
+-  frame.stagingBuffer = *stagingSlot;
++  frame.stagingBuffer = scratch ? SIZE_MAX : *stagingSlot;
++  frame.scratch = scratch;
 +#ifdef __EMSCRIPTEN__
 +  frame.skipDraws = mp4web_gfx_skip_draws != 0;
 +#endif
    g_recordingFrame = &frame;
    g_recordingFrameSlot = frameSlot;
  
-@@ -1236,11 +1281,17 @@ static void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const Frame
+   size_t bufferOffset = 0;
+-  const auto& stagingBuf = g_stagingBuffers[*stagingSlot];
+   const auto mapBuffer = [&](ByteBuffer& buf, uint64_t size) {
+     if (size <= 0) {
+       return;
+     }
+-    buf = ByteBuffer{static_cast<u8*>(stagingBuf.GetMappedRange(bufferOffset, size)), static_cast<size_t>(size)};
++#ifdef __EMSCRIPTEN__
++    if (scratch) {
++      buf = ByteBuffer{g_scratch + bufferOffset, static_cast<size_t>(size)};
++      bufferOffset += size;
++      return;
++    }
++#endif
++    buf = ByteBuffer{static_cast<u8*>(g_stagingBuffers[*stagingSlot].GetMappedRange(bufferOffset, size)), static_cast<size_t>(size)};
+     bufferOffset += size;
+   };
+   mapBuffer(frame.verts, VertexBufferSize);
+@@ -1145,8 +1235,10 @@ void end_frame(EndFrameCallback callback) {
+   const size_t stagingSlot = frame.stagingBuffer;
+   render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback)]() mutable {
+     auto& packet = g_framePackets[frameSlot];
+-    g_stagingBuffers[stagingSlot].Unmap();
+-    s_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
++    if (stagingSlot != SIZE_MAX) {
++      g_stagingBuffers[stagingSlot].Unmap();
++      s_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
++    }
+     auto encoder = std::move(packet.encoder);
+     const auto stats = packet.stats;
+     packet = {};
+@@ -1162,7 +1254,7 @@ void end_frame(EndFrameCallback callback) {
+       callback(encoder);
+     }
+     expire_cached_bind_groups();
+-    map_staging_buffer(stagingSlot, true);
++    if (stagingSlot != SIZE_MAX) map_staging_buffer(stagingSlot, true);
+   });
+ }
+ 
+@@ -1232,15 +1324,45 @@ static void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& f
+ }
+ 
+ static void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
++  if (frame.scratch) {
++    // no staging buffer: only what later frames depend on — the frame's own-buffer texture uploads
++    // (all of them, in a scratch frame) and palette conversions; nothing is drawn
++    if constexpr (UseTextureBuffer) {
++      for (size_t i = frame.copied.textureUploadCount; i < op.textureUploads.size(); ++i) {
++        const auto& item = *op.textureUploads[i];
++        if (!item.buffer) continue;
++        const wgpu::TexelCopyBufferInfo buf{
++            .layout = wgpu::TexelCopyBufferLayout{.offset = item.layout.offset,
++                                                  .bytesPerRow = AURORA_ALIGN(item.layout.bytesPerRow, 256),
++                                                  .rowsPerImage = item.layout.rowsPerImage},
++            .buffer = item.buffer,
++        };
++        cmd.CopyBufferToTexture(&buf, &item.tex, &item.size);
++      }
++      frame.copied.textureUploadCount = op.textureUploads.size();
++    }
++    if (op.type == FrameOpType::RenderPass && op.renderPass != nullptr) {
++      for (const auto& conv : op.renderPass->paletteConvs) {
++        tex_palette_conv::run(cmd, conv);
++      }
++    }
++    return;
++  }
+   copy_staging_to_high_water(cmd, frame, op);
    switch (op.type) {
    case FrameOpType::RenderPass:
      if (op.renderPass != nullptr) {
