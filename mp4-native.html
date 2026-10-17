@@ -142,7 +142,7 @@
     btn.disabled = true;
     var room = window.Mp4Room ? Mp4Room.bootOpts() : null;   // inside a room: the shared epoch and a fresh card
     if (room) log('room: booting with the room\'s epoch and a fresh memory card');
-    BUILD = buildFor(!!room);
+    BUILD = (room && room.build && !Q.get('build')) ? room.build : buildFor(!!room);   // a room: rb/ (rollback) or the plain build (delay), mp4n_room.js decides
     window.__mp4n.build = BUILD;
     log('build: ' + BUILD);
     audioInit();

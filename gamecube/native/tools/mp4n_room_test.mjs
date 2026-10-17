@@ -18,7 +18,7 @@
 // usage (from the repo root; the rig starts its own tools/devserver.mjs):
 //   node tools/browser_leak_guard.js reap && uptime
 //   bash tools/probe_lock.sh run -- node gamecube/native/tools/mp4n_room_test.mjs [--players 2|3|4]
-//        [--frames N] [--break epoch] [--solo-host] [--timeout S] [--shots DIR]
+//        [--frames N] [--break epoch] [--solo-host] [--timeout S] [--shots DIR] [--npmode auto|rollback|delay]
 //   --mixed: odd seats emulate a phone (390x844, DPR 3, touch, CPU x2 slower) — host-side differences must not reach game state
 //   --solo-host: the host page starts a solo game, then opens the Party panel; it must reopen itself in the room
 import { createRequire } from 'module';
@@ -38,6 +38,11 @@ const SOLO_HOST = argv.includes('--solo-host');   // the host starts a solo game
 const MIXED = argv.includes('--mixed');   // odd seats are a 'phone': 390x844 at DPR 3, touch, CPU slowed 2x
 const TIMEOUT = parseInt(flag('timeout', '1500'), 10) * 1000;
 const SHOTS = flag('shots', '');
+// Each console picks rollback or delay from a 100 ms CPU probe at page load. Seats sharing ONE machine
+// contend for it while siblings boot (measured: 4 seats on this 4-vCPU VM, one probed 41,480 < 45,000
+// and the whole room correctly fell back to delay lockstep). --npmode rollback|delay pins every seat;
+// the default (auto) leaves the decision to the page, as on real separate devices.
+const NPMODE = flag('npmode', 'auto');
 const CHROME = process.env.CHROME_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
 const PORT = 18000 + Math.floor(Math.random() * 1000);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -87,6 +92,7 @@ try {
     page.on('console', (msg) => { const t = msg.text(); if (/^\[mp4n\] room|desync|DESYNC/.test(t)) { logs.push(T() + ' ' + t); console.log(`  [${tag} ${T()}] ${t.slice(0, 220)}`); } if (msg.type() === 'error' && !/favicon|Failed to load resource/i.test(t)) errs.push(t.slice(0, 300)); });
     let q = `np=${CODE}&game=${encodeURIComponent('Mario Party 4')}&net=local&players=${N}`;
     if (i) q += '&join=1';
+    if (NPMODE !== 'auto') q += '&npmode=' + NPMODE;
     if (BREAK && i === N - 1) q += '&npbreak=' + BREAK;
     if (SOLO_HOST && i === 0) {
       // solo first: the game runs, THEN its player opens the Party panel (which hosts by itself);

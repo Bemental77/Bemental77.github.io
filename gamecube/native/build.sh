@@ -126,13 +126,13 @@ if [ "$STAGE" = link ] || [ "$STAGE" = all ]; then
   printf 'char mp4web_game_data_b[1] = {1};\nchar mp4web_game_bss_b[1];\n' > "$BUILD/mark/game_b.c"
   printf 'char mp4web_game_data_e[1] = {1};\nchar mp4web_game_bss_e[1];\n' > "$BUILD/mark/game_e.c"
   for m in game_b game_e; do emcc "${CF[@]}" -c "$BUILD/mark/$m.c" -o "$BUILD/mark/$m.o"; done
-  EXPORTS=_main,_mp4web_frames,_mp4web_reanchors,_mp4web_total,_mp4web_busy_ms,_mp4web_gpu_wait_ms,_mp4web_audio_samples,_mp4web_state_hash,_mp4web_state_ranges,_mp4web_rb_enable,_mp4web_rb_disable,_mp4web_rb_boundary,_mp4web_rb_restore,_mp4web_rb_oldest,_mp4web_rb_hash,_mp4web_rb_stats,_mp4web_rb_on,_mp4web_rb_audit,_mp4web_rb_hash_full,_mp4web_rb_pages,_mp4web_rb_small_hash,_mp4web_rb_base,_mp4web_rb_page_hashes,_mp4web_set_frame,_mp4web_set_max_debt,_mp4web_set_gfx_skip,_mp4web_set_frameskip,_mp4web_drawn,_mp4web_auto_skipped,_mp4web_gpu_scratch_frames,_mp4web_set_gpu_nowait,_mp4web_cow,_mp4web_mem_stats,_mp4web_det_heap_high_water,_mp4web_det_heap_fallbacks,_malloc,_free
+  EXPORTS=_main,_mp4web_frames,_mp4web_reanchors,_mp4web_total,_mp4web_busy_ms,_mp4web_gpu_wait_ms,_mp4web_audio_samples,_mp4web_state_hash,_mp4web_state_ranges,_mp4web_rb_enable,_mp4web_rb_disable,_mp4web_rb_boundary,_mp4web_rb_restore,_mp4web_rb_mark,_mp4web_fp_step,_mp4web_rb_oldest,_mp4web_rb_hash,_mp4web_rb_stats,_mp4web_rb_on,_mp4web_rb_audit,_mp4web_rb_hash_full,_mp4web_rb_pages,_mp4web_rb_small_hash,_mp4web_rb_base,_mp4web_rb_page_hashes,_mp4web_set_frame,_mp4web_set_max_debt,_mp4web_set_catchup,_mp4web_set_gfx_skip,_mp4web_set_frameskip,_mp4web_drawn,_mp4web_auto_skipped,_mp4web_gpu_scratch_frames,_mp4web_set_gpu_nowait,_mp4web_cow,_mp4web_mem_stats,_mp4web_det_heap_high_water,_mp4web_det_heap_fallbacks,_mp4web_det_owner,_malloc,_free
   # game objects first, then the overlays in their bracketed order (rel_dispatch.c relies on it)
   em++ -O2 -fexceptions "${PORTS[@]}" -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=131072 -sSTACK_SIZE=1048576 \
     -sINITIAL_MEMORY=268435456 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2147483648 \
     -sENVIRONMENT=web -sEXIT_RUNTIME=0 -sINVOKE_RUN=0 -sMODULARIZE=1 -sEXPORT_NAME=createMp4Native \
     -lidbfs.js -sEXPORTED_RUNTIME_METHODS=callMain,HEAPU8,HEAP16,HEAP32,FS,IDBFS,addRunDependency,removeRunDependency -sEXPORTED_FUNCTIONS="$EXPORTS" \
-    -sFORCE_FILESYSTEM=1 --post-js "$HERE/src/post.js" --js-library "$HERE/src/rollback_lib.js" ${LINK_EXTRA:-} -Wl,--Map="$OUT/mp4native.map" \
+    -sFORCE_FILESYSTEM=1 --post-js "$HERE/src/post.js" --js-library "$HERE/src/rollback_lib.js" --profiling-funcs ${LINK_EXTRA:-} -Wl,--Map="$OUT/mp4native.map" \
     "$BUILD"/obj/au__*.o "$BUILD/mark/game_b.o" "$BUILD"/obj/gau__*.o "$BUILD"/obj/game__*.o $(cat "$BUILD/rel/link_order.txt") "$BUILD/mark/game_e.o" -o "$OUT/mp4native.js" 2> "$OUT/link.log" \
     && echo "[link] ok $(stat -c %s "$OUT/mp4native.wasm") B wasm" || { echo "[link] FAIL"; grep -c "undefined symbol" "$OUT/link.log"; head -c 3000 "$OUT/link.log"; exit 1; }
   # TWO BINARIES from one link. OUT/ is the solo build: no write barrier (the barrier costs ~3 ms of
@@ -143,6 +143,8 @@ if [ "$STAGE" = link ] || [ "$STAGE" = all ]; then
     mkdir -p "$OUT/rb"
     bash "$HERE/wb/instrument.sh" "$OUT/mp4native.wasm" "$OUT/rb/mp4native.wasm" && cp "$OUT/mp4native.js" "$OUT/rb/mp4native.js"
   fi
+  # the link kept function names (--profiling-funcs) for wb/uninstrument.py; the solo build drops them
+  "$HOME/emsdk-upstream/upstream/bin/wasm-opt" --all-features --strip-debug "$OUT/mp4native.wasm" -o "$OUT/mp4native.wasm"
   # THE JSPI SOLO BUILD (OUT/jspi/): the same objects, but libco's fibers switch on JSPI
   # (src/libco_jspi.c + src/libco_jspi.js) and the game loop sleeps on JSPI, so nothing is Asyncify-
   # instrumented. Solo only — a JSPI fiber's paused stack lives in the JS engine, not in memory, so it

@@ -120,3 +120,19 @@ double mp4web_det_heap_high_water(void) { return (double)g_heap.highWater; }
 double mp4web_det_stack_high_water(void) { return (double)g_stacks.highWater; }
 double mp4web_det_heap_in_use(void) { return (double)g_heap.inUse; }
 double mp4web_det_heap_fallbacks(void) { return (double)(g_heap.fallbacks + g_stacks.fallbacks); }
+
+// Test aid: the det-heap block holding address `a` -> out[0] = its user pointer, out[1] = its size
+// (0, 0 when `a` is outside the arena). Walks the boundary tags from the start.
+#include <emscripten.h>
+EMSCRIPTEN_KEEPALIVE void mp4web_det_owner(uintptr_t a, uint32_t* out) {
+  out[0] = out[1] = 0;
+  Heap* h = &g_heap;
+  if (!h->init || a < (uintptr_t)h->arena || a >= (uintptr_t)(h->arena + h->bytes)) return;
+  unsigned char* p = h->arena;
+  while (p < h->arena + h->bytes) {
+    Block* b = (Block*)p;
+    if (!b->size) return;
+    if (a < (uintptr_t)(p + b->size)) { out[0] = (uint32_t)(uintptr_t)(b + 1); out[1] = b->size | (b->used ? 0 : 0x80000000u); return; }
+    p += b->size;
+  }
+}

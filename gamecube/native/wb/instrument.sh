@@ -27,9 +27,15 @@ s = s[:end + 1] + imp + s[end + 1:]
 with open(p, 'w') as f: f.write(s)
 print('[wb] bulk ops rewritten: memory.copy %d, memory.fill %d' % (nc, nf))
 PY
-"$B/wasm-as" "${F[@]}" "$T/a.wat" -o "$T/a.wasm"; rm -f "$T/a.wat"
-"$B/wasm-opt" "${F[@]}" --instrument-memory "$T/a.wasm" -o "$T/b.wasm"; rm -f "$T/a.wasm"
+"$B/wasm-as" -g "${F[@]}" "$T/a.wat" -o "$T/a.wasm"; rm -f "$T/a.wat"
+"$B/wasm-opt" -g "${F[@]}" --instrument-memory "$T/a.wasm" -o "$T/b.wasm"; rm -f "$T/a.wasm"
+# the barrier off for functions that never store into game memory (wb/exclude.txt; needs the link's
+# function names: build.sh links with --profiling-funcs)
+if [ "${WB_EXCLUDE:-1}" = 1 ]; then
+  "$B/wasm-dis" "${F[@]}" "$T/b.wasm" -o "$T/b.wat" && python3 "$HERE/uninstrument.py" "$T/b.wat" "$T/b2.wat" "$HERE/exclude.txt" \
+    && rm -f "$T/b.wat" && "$B/wasm-as" -g "${F[@]}" "$T/b2.wat" -o "$T/b.wasm" && rm -f "$T/b2.wat"
+fi
 "$B/wasm-as" "${F[@]}" "$HERE/barrier.wat" -o "$T/barrier.wasm"
 "$B/wasm-merge" "${F[@]}" "$T/b.wasm" main "$T/barrier.wasm" env -o "$T/c.wasm"; rm -f "$T/b.wasm"
-"$B/wasm-opt" "${F[@]}" -O2 --flexible-inline-max-function-size=64 "$T/c.wasm" -o "$OUT"
+"$B/wasm-opt" "${F[@]}" -O2 --flexible-inline-max-function-size=64 --strip-debug "$T/c.wasm" -o "$OUT"
 echo "[wb] $(stat -c %s "$IN") -> $(stat -c %s "$OUT") B"

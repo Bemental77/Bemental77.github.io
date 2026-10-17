@@ -54,7 +54,7 @@
     atTotal: -1, tickedAt: -1,
     replay: [], image: null, pushMute: false,
     catchUp: 0, hashAt: Object.create(null), due: [], sent: Object.create(null),   // sent: frame -> fingerprint this console submitted
-    stats: { live: 0, resim: 0, hidden: 0, undrawn: 0, rollbacks: 0, maxDepth: 0, holds: 0, hashesSent: 0, restoreFail: 0, maxRestoreMs: 0, frameTimes: [] },
+    stats: { holdWhy: {}, live: 0, resim: 0, hidden: 0, undrawn: 0, tBoundary: 0, tHash: 0, tRestore: 0, tHook: 0, rollbacks: 0, maxDepth: 0, holds: 0, hashesSent: 0, restoreFail: 0, maxRestoreMs: 0, frameTimes: [] },
     log: function () {}
   };
 
@@ -62,11 +62,42 @@
   function m() { return R.mod; }
 
   // ---- the lobby ----------------------------------------------------------------------------
+  // ---- rollback or delay, decided before the game loads -------------------------------------------
+  // Rollback needs the write-barrier build (dist/rb/), whose every game store pays a check, plus the
+  // re-simulations. A console that cannot afford that runs the plain build and tells the room it
+  // cannot roll back (rbCapable false); lib/netplay.js then runs the WHOLE room in delay lockstep
+  // (input delay sized from the link) — and nobody in it re-simulates. Measured on the toaster rig
+  // (rate 6.2): solo 1.000x, a rollback room 0.52-0.84x. The decision is a 100 ms CPU probe at page
+  // load (it must precede the engine and the module); ?npmode=rollback|delay overrides it.
+  // calibration (this 4-vCPU VM, Chrome 141): 96,200-104,950 unthrottled, 17,250-17,990 on the toaster rig
+  // (CPU / 6.2, where a rollback room ran 0.85x). Below ~45 % of this VM, delay lockstep.
+  var CAP_PROBE_MS = 100, CAP_DELAY_SCORE = 45000;   // 4 K-step blocks per second
+  function capacityProbe() {
+    var a = new Int32Array(4096), x = 1, n = 0, t0 = performance.now();
+    while (performance.now() - t0 < CAP_PROBE_MS) { for (var i = 0; i < 4096; i++) { x = (Math.imul(x, 1103515245) + 12345 + a[i]) | 0; a[i] = x; } n++; }
+    return Math.round(n * 1000 / CAP_PROBE_MS);   // 4 K-step blocks per second
+  }
+  function decideMode() {
+    var o = Q.get('npmode');
+    if (o === 'rollback' || o === 'delay') { R.mode = o; R.modeWhy = '?npmode=' + o; return; }
+    if (Q.get('rb') === '0') { R.mode = 'delay'; R.modeWhy = '?rb=0'; return; }
+    R.capScore = capacityProbe();
+    R.mode = R.capScore < CAP_DELAY_SCORE ? 'delay' : 'rollback';
+    R.modeWhy = 'CPU probe ' + R.capScore + (R.mode === 'delay' ? ' < ' : ' >= ') + CAP_DELAY_SCORE;
+  }
   function engineOpts(sess) {
-    var o = { portCount: 4, padBytes: PAD_BYTES, hashEvery: 60, rollback: Q.get('rb') === '0' ? 0 : RB_WINDOW,
+    if (!R.mode) decideMode();
+    var o = { portCount: 4, padBytes: PAD_BYTES, hashEvery: 60, rollback: R.mode === 'delay' ? 0 : RB_WINDOW,
               rbCatchUp: true, rollbackOk: true, rbResume: true, frameHz: 60 };
-    try { if (!sess.ls && typeof sess.startLockstep === 'function') sess.startLockstep(o); }
-    catch (e) { R.log('room: could not build the engine: ' + ((e && e.message) || e)); }
+    // a console slow enough for delay lockstep is also slow enough that a frame's wall time jitters
+    // past 3 frames of slack (measured on the toaster rig: 300-630 input stalls a minute at delay 3);
+    // start, and floor, the delay at 5 frames there (the recomp page's toaster rooms settle at 6)
+    if (R.mode === 'delay') o.delay = 3;
+    try {
+      if (!sess.ls && typeof sess.startLockstep === 'function') sess.startLockstep(o);
+      if (sess.ls && R.mode === 'delay') sess.ls.rbCapable = false;   // the host then never runs rollback
+    } catch (e) { R.log('room: could not build the engine: ' + ((e && e.message) || e)); }
+    R.log('room: this console ' + (R.mode === 'delay' ? 'cannot afford rollback — plain build, asks for delay lockstep' : 'runs rollback (barrier build)') + ' (' + R.modeWhy + ')');
   }
   function mount(opts) {
     R.log = opts.log || R.log;
@@ -133,7 +164,10 @@
   function bootOpts() {
     if (!R.session && !R.handoff) return null;
     var epoch = R.broken === 'epoch' ? Math.floor(Date.now() / 1000) - 946684800 : ROOM_EPOCH;
-    return { epoch: epoch, nosave: true };
+    if (!R.mode) decideMode();
+    // both builds lay out game memory identically (the barrier is merged after the link), so the two
+    // can share a room; a JSPI build cannot (its fiber records differ)
+    return { epoch: epoch, nosave: true, build: R.mode === 'delay' ? 'gamecube/native/dist/' : 'gamecube/native/dist/rb/' };
   }
 
   // ---- arming ------------------------------------------------------------------------------
@@ -147,11 +181,16 @@
   }
   function arm() {
     var mod = m(), ls = engine();
-    var rc = mod._mp4web_rb_enable(0, RING, POOL_PAGES);
-    if (rc <= 0) { fail('this build cannot rewind (rb_enable ' + rc + ')'); return false; }
+    R.rbOn = false;
+    if (R.mode !== 'delay') {
+      var rc = mod._mp4web_rb_enable(0, RING, POOL_PAGES);
+      if (rc <= 0) { fail('this build cannot rewind (rb_enable ' + rc + ')'); return false; }
+      R.rbOn = true;
+    }
     mod._mp4web_set_max_debt(1000 / 60);
+    if (mod._mp4web_set_catchup) mod._mp4web_set_catchup(2.5, 1 / 120);   // a stall's time may be made up, never faster than 1.0167x per 5 s
     R.armed = true; R.next = 0; R.lastRan = -1;
-    R.hashAt[0] = mod._mp4web_rb_hash();
+    if (R.rbOn) R.hashAt[0] = mod._mp4web_rb_hash();
     R.log('room: armed at frame 0 — ports ' + JSON.stringify(ls.roster) + ', mine ' + JSON.stringify(ls.localPorts) + ', want ' + R.want);
     try { R.session.setReady(true, 'GMPE01:' + (Q.get('build') || 'dist')); } catch (e) { R.log('room: setReady refused: ' + e); }
     return true;
@@ -187,9 +226,18 @@
   }
 
   // ---- fingerprints ----------------------------------------------------------------------------
+  // The fingerprint follows how the room STARTED, the same on every console: a rollback room
+  // (every console has the barrier) uses rb_hash; a delay room uses the barrier-free spread hash
+  // (mp4web_fp_step: 1/600 of the pages every frame, folded per fingerprint).
   function hashNow(k) {
     var ls = engine(), every = ls && ls.hashEvery > 0 ? ls.hashEvery : 60;
-    if (k > 0 && (k - 1) % every === 0) {
+    var due = k > 0 && (k - 1) % every === 0;
+    if (R.fp === 'spread') {
+      var hs = m()._mp4web_fp_step(k, due ? 1 : 0);
+      if (due) R.hashAt[k] = (hs % 4294967296) >>> 0;
+      return;
+    }
+    if (due) {
       var h = m()._mp4web_rb_hash();
       R.hashAt[k] = (h % 4294967296) >>> 0;
     }
@@ -224,8 +272,11 @@
       if (R.lastRan >= 0) {
         var k = R.lastRan + 1;
         R.next = k;
+        var tb0 = performance.now();
         mod._mp4web_rb_boundary(k);
+        var tb1 = performance.now();
         hashNow(k);
+        R.stats.tBoundary += tb1 - tb0; R.stats.tHash += performance.now() - tb1;
         if (R.lastLive === R.lastRan) {
           R.lastLive = -1;
           ls.endFrame(null);
@@ -248,7 +299,14 @@
       R.stats.holds++;
       return HOOK_HOLD;
     }
-    if (!R.running) { R.running = true; R.log('room: running — ' + (ls.rollback ? 'rollback, window ' + ls.rollback : 'delay ' + ls.delay)); }
+    if (!R.running) {
+      R.running = true;
+      if (!R.fp) {
+        R.fp = (ls.rollback > 0 && R.rbOn) ? 'rb' : 'spread';
+        if (R.fp === 'spread' && R.rbOn) { m()._mp4web_rb_disable(); R.rbOn = false; }   // a delay room never rewinds
+      }
+      R.log('room: running — ' + (ls.rollback ? 'rollback, window ' + ls.rollback : 'delay lockstep, ' + ls.delay + ' frames') + ', fingerprint ' + R.fp);
+    }
     flushDue(ls);
     if (R.tickedAt !== total) {
       R.tickedAt = total;
@@ -258,13 +316,13 @@
     var hidden = rejoining || R.catchUp > 0;
     var r = ls.beginFrame(localPads(ls), hidden ? { hidden: true } : undefined);
     if (ls.rollback && typeof ls.rbRingFrames === 'function' && ls.rbRingFrames() > RING) { fail('the room\'s rollback window (' + ls.rollback + ') outgrew this console\'s ' + RING + '-frame history'); return HOOK_HOLD; }
-    if (!r || !r.ready) { R.stats.holds++; R.waiting = r ? (r.waitingOn || []).slice() : null; return HOOK_HOLD; }
+    if (!r || !r.ready) { R.stats.holds++; var why = (r && r.reason) || 'input'; R.stats.holdWhy[why] = (R.stats.holdWhy[why] || 0) + 1; R.waiting = r ? (r.waitingOn || []).slice() : null; return HOOK_HOLD; }
     R.waiting = null;
     if (hidden && R.catchUp > 0) R.catchUp--;
     if (r.rollback) {
       var t0 = performance.now();
       var rc = mod._mp4web_rb_restore(r.rollback.from);
-      var dt = performance.now() - t0; if (dt > R.stats.maxRestoreMs) R.stats.maxRestoreMs = dt;
+      var dt = performance.now() - t0; if (dt > R.stats.maxRestoreMs) R.stats.maxRestoreMs = dt; R.stats.tRestore += dt;
       if (rc < 0) { R.stats.restoreFail++; fail('rewind to frame ' + r.rollback.from + ' is out of reach (' + rc + ')'); return HOOK_HOLD; }
       for (var hk in R.hashAt) if (+hk > r.rollback.from) delete R.hashAt[hk];
       R.stats.rollbacks++; if (r.rollback.depth > R.stats.maxDepth) R.stats.maxDepth = r.rollback.depth;
@@ -297,7 +355,9 @@
     mod.mp4FrameHook = function (total) {
       var fl = prev ? (prev(total) | 0) : 0;
       if (R.solo) return fl;
-      return fl | hook(total);
+      var th = performance.now(), r = hook(total);
+      if (!(r & HOOK_HOLD)) R.stats.tHook += performance.now() - th;
+      return fl | r;
     };
     if (window.Mp4Input && !R.solo) Mp4Input.override(function () { return latch(); });
   }
@@ -314,9 +374,9 @@
       try { eng.rb = ls.rollback ? ls.rollbackReport() : null; } catch (e) {}
       try { eng.clock = ls.clockStats ? Object.assign({}, ls.clockStats) : null; } catch (e) {}
     }
-    return { active: !!(R.session || R.handoff), role: R.role, want: R.want, seated: ls ? seated(ls) : 0, armed: R.armed, running: R.running, failed: R.failed,
+    return { active: !!(R.session || R.handoff), role: R.role, want: R.want, seated: ls ? seated(ls) : 0, mode: R.mode || null, modeWhy: R.modeWhy || null, capScore: R.capScore || null, fp: R.fp || null, armed: R.armed, running: R.running, failed: R.failed,
              stopReason: R.stopReason || null, next: R.next, waiting: R.waiting || null, broken: R.broken,
-             stats: { live: R.stats.live, resim: R.stats.resim, hidden: R.stats.hidden, undrawn: R.stats.undrawn, rollbacks: R.stats.rollbacks, maxDepth: R.stats.maxDepth,
+             stats: { holdWhy: R.stats.holdWhy, live: R.stats.live, resim: R.stats.resim, hidden: R.stats.hidden, undrawn: R.stats.undrawn, tBoundary: +R.stats.tBoundary.toFixed(1), tHash: +R.stats.tHash.toFixed(1), tRestore: +R.stats.tRestore.toFixed(1), tHook: +R.stats.tHook.toFixed(1), rollbacks: R.stats.rollbacks, maxDepth: R.stats.maxDepth,
                       holds: R.stats.holds, hashesSent: R.stats.hashesSent, restoreFail: R.stats.restoreFail, maxRestoreMs: R.stats.maxRestoreMs,
                       liveFramesLast5s: win5 },
              engine: eng };
