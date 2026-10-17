@@ -133,6 +133,7 @@ const RECEIVER = {
   dreamcast: { file: 'dreamcast.html', params: ['np', 'game', 'join'] },
   n64:       { file: 'n64/index.html', params: ['np', 'game', 'join'] },
   gamecube:  { file: 'gamecube.html',  params: ['np', 'game', 'join'] },
+  mp4native: { file: 'mp4-native.html', params: ['np', 'game', 'join'] },
   genesis:   { file: 'genesis.html',   params: ['np', 'game', 'join', 'host'] },
   snes:      { file: 'snes.html',      params: ['np', 'game', 'join', 'host'] },
   ps1:       { file: 'ps1.html',       params: ['np', 'game', 'join', 'host'] },
