@@ -91,6 +91,27 @@ index 20cab22..236cb94 100644
          BoardJunctionMaskSet(0xC00);
      }
  }
+diff --git a/src/game/audio.c b/src/game/audio.c
+index b5b8317..5e1fed1 100644
+--- a/src/game/audio.c
++++ b/src/game/audio.c
+@@ -485,8 +485,16 @@ void HuAudDllSndGrpSet(u16 ovl) {
+ 
+ #define SNDGRP_TIMEOUT 500
+ 
++#ifdef __EMSCRIPTEN__
++// web: the sound engine ticks only when the game advances it (deterministic), so a busy-wait for
++// voices to stop must advance it itself: one 5 ms cycle per iteration, the same 500 ms budget.
++extern void mp4web_audio_pump_cycle(void);
++#define SNDGRP_WAIT(tickStart) \
++    for (s32 sndgrpWaitCycles = 0; (msmMusGetNumPlay(TRUE) != 0 || msmSeGetNumPlay(TRUE) != 0) && sndgrpWaitCycles < SNDGRP_TIMEOUT / 5; ++sndgrpWaitCycles) mp4web_audio_pump_cycle()
++#else
+ #define SNDGRP_WAIT(tickStart) \
+     while((msmMusGetNumPlay(TRUE) != 0 || msmSeGetNumPlay(TRUE) != 0) && OSTicksToMilliseconds(OSGetTick()-(tickStart)) < SNDGRP_TIMEOUT)
++#endif
+ 
+ 
+ void HuAudSndGrpSetSet(s16 grpSet) {
 diff --git a/src/game/board/space.c b/src/game/board/space.c
 index 713a00a..6272695 100644
 --- a/src/game/board/space.c
@@ -114,6 +135,23 @@ index 713a00a..6272695 100644
  extern void BoardBlockHouseExec(s32 player, s32 space); // wrong
  
  static BoardSpace spaceData[2][256];
+diff --git a/src/game/malloc.c b/src/game/malloc.c
+index a66cc87..05e2b90 100644
+--- a/src/game/malloc.c
++++ b/src/game/malloc.c
+@@ -22,6 +22,12 @@ void HuMemInitAll(void)
+         HeapTbl[i] = HuMemInit(ptr, HeapSizeTbl[i]);
+     }
+     free_size = OSCheckHeap(currentHeapHandle);
++#ifdef __EMSCRIPTEN__
++    // web: the leftover heap comes from the deterministic game heap; 8 MB is already 4x what MEM1 leaves on hardware
++    if (free_size > 8 * 1024 * 1024) {
++        free_size = 8 * 1024 * 1024;
++    }
++#endif
+     OSReport("HuMem> left memory space %dKB(%d)\n", free_size/1024, free_size);
+     ptr = OSAlloc(free_size);
+     if(ptr == NULL) {
 diff --git a/src/game/objdll.c b/src/game/objdll.c
 index b87d08d..cca17be 100644
 --- a/src/game/objdll.c
@@ -163,6 +201,25 @@ index b87d08d..cca17be 100644
  	dlclose(dll_ptr->handle);
  #else
  	if(flag == 1) {
+diff --git a/src/port/dolassets.cpp b/src/port/dolassets.cpp
+index 0a924c9..0fb9b17 100644
+--- a/src/port/dolassets.cpp
++++ b/src/port/dolassets.cpp
+@@ -90,7 +90,14 @@ void InitializeDol()
+     const u8 *dol = DVDGetDOLLocation(&dolSize);
+     if (!dol)
+         return;
++#ifdef __EMSCRIPTEN__
++    // web: the game holds pointers into this copy and edits it in place — it is game state, so it
++    // comes from the deterministic game heap (gamecube/native/src/det_heap.c), not the shared C heap
++    extern void* mp4web_det_malloc(size_t);
++    dolPtr = static_cast<u8*>(mp4web_det_malloc(dolSize));
++#else
+     dolPtr = new u8[dolSize];
++#endif
+     memcpy(dolPtr, dol, dolSize);
+ }
+ 
 diff --git a/src/port/imgui.cpp b/src/port/imgui.cpp
 index 612f611..0efc4fa 100644
 --- a/src/port/imgui.cpp

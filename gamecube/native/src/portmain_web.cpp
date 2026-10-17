@@ -31,6 +31,7 @@ u8 OSGetLanguage() { return selectedLanguage; }
 static void aurora_log_callback(AuroraLogLevel level, const char* module, const char* message, unsigned int len) {
   static const char* names[] = {"TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"};
   const int l = static_cast<int>(level);
+  if (l < 2) return; // TRACE/DEBUG: aurora logs GX FIFO detail every frame; printing it costs real time
   std::fprintf(l >= LOG_WARNING ? stderr : stdout, "[%s] [%s] %.*s\n", (l >= 0 && l < 6) ? names[l] : "?", module, static_cast<int>(len), message);
   if (level == LOG_FATAL) { std::fflush(stdout); std::fflush(stderr); std::abort(); }
 }
