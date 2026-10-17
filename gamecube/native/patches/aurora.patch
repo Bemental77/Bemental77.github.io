@@ -1,0 +1,363 @@
+diff --git a/lib/aurora.cpp b/lib/aurora.cpp
+index dc5ae5b..f7663c0 100644
+--- a/lib/aurora.cpp
++++ b/lib/aurora.cpp
+@@ -39,6 +39,9 @@ using webgpu::g_surface;
+ 
+ #ifdef AURORA_ENABLE_GX
+ constexpr std::array PreferredBackendOrder{
++#ifdef __EMSCRIPTEN__
++    BACKEND_WEBGPU,
++#endif
+ #ifdef ENABLE_BACKEND_WEBGPU
+     BACKEND_WEBGPU,
+ #endif
+@@ -323,11 +326,15 @@ void end_frame() noexcept {
+     }
+     if (canPresent && g_surface) {
+       ZoneScopedN("Present");
++#ifdef __EMSCRIPTEN__
++      // the browser presents the canvas's current texture when this task returns
++#else
+       auto presentStatus = g_surface.Present();
+       if (presentStatus != wgpu::Status::Success) {
+         Log.warn("Surface present failed: {}", static_cast<int>(presentStatus));
+         webgpu::release_surface();
+       }
++#endif
+     } else if (g_surface) {
+       switch (surfaceStatus) {
+       case wgpu::SurfaceGetCurrentTextureStatus::Timeout:
+diff --git a/lib/dolphin/dvd/dvd.cpp b/lib/dolphin/dvd/dvd.cpp
+index 863ecb8..be578eb 100644
+--- a/lib/dolphin/dvd/dvd.cpp
++++ b/lib/dolphin/dvd/dvd.cpp
+@@ -324,6 +324,9 @@ void cbForPrepareStreamAsync(s32 result, DVDCommandBlock* block) {
+ 
+ } // namespace
+ 
++#ifdef __EMSCRIPTEN__
++extern "C" void mp4web_disc_stream(NodDiscStream* s);
++#endif
+ extern "C" {
+ 
+ bool aurora_dvd_open(const char* disc_path) {
+@@ -333,17 +336,24 @@ bool aurora_dvd_open(const char* disc_path) {
+ 
+   clearState();
+ 
+-  SDL_IOStream* io = SDL_IOFromFile(disc_path, "rb");
+-  if (io == nullptr) {
+-    return false;
++  NodDiscStream stream{};
++#ifdef __EMSCRIPTEN__
++  if (std::strncmp(disc_path, "web:", 4) == 0) {
++    mp4web_disc_stream(&stream); // the page's disc image (gamecube/native/src/web_disc.c)
++  } else
++#endif
++  {
++    SDL_IOStream* io = SDL_IOFromFile(disc_path, "rb");
++    if (io == nullptr) {
++      return false;
++    }
++    stream = NodDiscStream{
++        .user_data = io,
++        .read_at = sdlStreamReadAt,
++        .stream_len = sdlStreamLen,
++        .close = sdlStreamClose,
++    };
+   }
+-
+-  const NodDiscStream stream{
+-      .user_data = io,
+-      .read_at = sdlStreamReadAt,
+-      .stream_len = sdlStreamLen,
+-      .close = sdlStreamClose,
+-  };
+   const NodDiscOptions options{
+       .preloader_threads = 1,
+   };
+diff --git a/lib/dolphin/pad/pad.cpp b/lib/dolphin/pad/pad.cpp
+index 2d7f795..817d20a 100644
+--- a/lib/dolphin/pad/pad.cpp
++++ b/lib/dolphin/pad/pad.cpp
+@@ -1,3 +1,4 @@
++#include <SDL3/SDL_version.h>
+ #include "../../input.hpp"
+ #include "../../device.hpp"
+ #include "../../internal.hpp"
+@@ -488,9 +489,11 @@ void __PADSetDefaultMapping(aurora::input::GameController* controller) /*  NOLIN
+   case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+     controller->m_buttonMapping = g_defaultButtonsJoyConLeft;
+     break;
++#if SDL_VERSION_ATLEAST(3, 3, 0)
+   case SDL_GAMEPAD_TYPE_GAMECUBE:
+     controller->m_buttonMapping = g_defaultButtonsGamecube;
+     break;
++#endif
+   default:
+     controller->m_buttonMapping = g_defaultButtonsStandard;
+     break;
+diff --git a/lib/gfx/common.cpp b/lib/gfx/common.cpp
+index eff0c65..23a4785 100644
+--- a/lib/gfx/common.cpp
++++ b/lib/gfx/common.cpp
+@@ -1,4 +1,8 @@
+ #include "common.hpp"
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++extern "C" void mp4web_yield_for_gpu(void); // gamecube/native/src/web_port.cpp
++#endif
+ 
+ #include "clear.hpp"
+ #include "depth_peek.hpp"
+@@ -991,6 +995,9 @@ static bool wait_for_staging_buffer(size_t slot) {
+       return false;
+     }
+     if (render_worker::is_idle()) {
++#ifdef __EMSCRIPTEN__
++      mp4web_yield_for_gpu(); // map callbacks resolve only once the browser event loop runs
++#endif
+       g_instance.ProcessEvents();
+     } else {
+       std::this_thread::sleep_for(std::chrono::milliseconds{1});
+@@ -1005,6 +1012,9 @@ static size_t acquire_frame_slot() {
+       return *slot;
+     }
+     if (render_worker::is_idle()) {
++#ifdef __EMSCRIPTEN__
++      mp4web_yield_for_gpu(); // map callbacks resolve only once the browser event loop runs
++#endif
+       g_instance.ProcessEvents();
+     } else {
+       std::this_thread::sleep_for(std::chrono::microseconds{100});
+@@ -1023,6 +1033,9 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
+       return std::nullopt;
+     }
+     if (render_worker::is_idle()) {
++#ifdef __EMSCRIPTEN__
++      mp4web_yield_for_gpu(); // map callbacks resolve only once the browser event loop runs
++#endif
+       g_instance.ProcessEvents();
+     } else {
+       std::this_thread::sleep_for(std::chrono::microseconds{100});
+diff --git a/lib/gfx/pipeline_cache.cpp b/lib/gfx/pipeline_cache.cpp
+index 04a4310..553a78d 100644
+--- a/lib/gfx/pipeline_cache.cpp
++++ b/lib/gfx/pipeline_cache.cpp
+@@ -1026,7 +1026,13 @@ PipelineRef find_pipeline(ShaderType type, const rmlui::PipelineConfig& config,
+ #endif
+ 
+ void initialize_pipeline_cache() {
++#ifdef __EMSCRIPTEN__
++  // web: no on-disk pipeline cache and no writer thread; pipelines are built synchronously
++  // (g_hasPipelineThread is false for BackendType::WebGPU below)
++  g_pipelineCacheBroken = true;
++#else
+   g_pipelineCacheBroken = false;
++#endif
+   g_pipelineCacheWriterStop = false;
+   g_pipelineFrameActive = false;
+   g_pipelineThreadEnd = false;
+@@ -1040,7 +1046,7 @@ void initialize_pipeline_cache() {
+     g_pipelineThread = std::thread(pipeline_worker);
+   }
+ 
+-  const size_t loadedCount = load_pipeline_cache();
++  const size_t loadedCount = g_pipelineCacheBroken ? 0 : load_pipeline_cache();
+   if (!g_pipelineCacheBroken && loadedCount > 0) {
+     g_gpuCachePrunePending = true;
+   }
+diff --git a/lib/gfx/render_worker.cpp b/lib/gfx/render_worker.cpp
+index 1484076..538bf7f 100644
+--- a/lib/gfx/render_worker.cpp
++++ b/lib/gfx/render_worker.cpp
+@@ -197,7 +197,12 @@ void initialize() {
+   }
+   g_queue.reset();
+   g_pendingItems.store(0, std::memory_order_release);
++#ifdef __EMSCRIPTEN__
++  // web: no render thread — every item runs inline on the one thread (is_worker_thread() is true)
++  (void)&worker_main;
++#else
+   g_thread = std::thread(worker_main);
++#endif
+ }
+ 
+ void shutdown() {
+@@ -263,7 +268,11 @@ void synchronize() {
+   sync->cv.wait(lock, [&] { return sync->complete; });
+ }
+ 
++#ifdef __EMSCRIPTEN__
++bool is_worker_thread() noexcept { return true; }
++#else
+ bool is_worker_thread() noexcept { return g_workerThreadId == std::this_thread::get_id(); }
++#endif
+ 
+ bool is_idle() noexcept { return g_pendingItems.load(std::memory_order_acquire) == 0; }
+ 
+diff --git a/lib/gfx/texture.cpp b/lib/gfx/texture.cpp
+index 013afc0..60a2321 100644
+--- a/lib/gfx/texture.cpp
++++ b/lib/gfx/texture.cpp
+@@ -29,6 +29,7 @@ wgpu::Extent3D physical_size(wgpu::Extent3D size, TextureFormatInfo info) {
+   return {.width = width, .height = height, .depthOrArrayLayers = size.depthOrArrayLayers};
+ }
+ 
++#ifdef WEBGPU_DAWN
+ bool setup_swizzle(wgpu::TextureComponentSwizzleDescriptor& swizzle, u32 format) noexcept {
+   if (!webgpu::g_textureComponentSwizzleSupported) {
+     return false;
+@@ -51,6 +52,7 @@ bool setup_swizzle(wgpu::TextureComponentSwizzleDescriptor& swizzle, u32 format)
+     return false;
+   }
+ }
++#endif
+ } // namespace
+ 
+ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 format, ArrayRef<uint8_t> data,
+@@ -138,10 +140,12 @@ TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t m
+       .dimension = wgpu::TextureViewDimension::e2D,
+       .mipLevelCount = mips,
+   };
++#ifdef WEBGPU_DAWN
+   wgpu::TextureComponentSwizzleDescriptor swizzle;
+   if (setup_swizzle(swizzle, gxFormat)) {
+     textureViewDescriptor.nextInChain = &swizzle;
+   }
++#endif
+   auto textureView = texture.CreateView(&textureViewDescriptor);
+   return std::make_shared<TextureRef>(std::move(texture), std::move(textureView), wgpu::TextureView{}, size, wgpuFormat,
+                                       mips, gxFormat);
+diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
+index 3671ed5..79e7315 100644
+--- a/lib/gx/shader.cpp
++++ b/lib/gx/shader.cpp
+@@ -639,14 +639,15 @@ auto attr_address(const AttrConfig& mapping, GXAttr attr, std::string_view vidx,
+     -> AttrAddress {
+   const u32 dlOffset = mapping.offset + dlExtra;
+   if (mapping.attrType == GX_INDEX8) {
+-    return {fmt::format("ubuf.array_start[{}] + raw_fetch_u8_1(&vbuf, ubuf.vtx_start + {} * {}u + {}u) * {}u + {}u",
+-                        attr - GX_VA_POS, vidx, vtxStride, dlOffset, mapping.stride, within),
++    // array_start is array<vec4<u32>, 3>: standard WebGPU uniform layout forbids a 4-byte array stride
++    return {fmt::format("ubuf.array_start[{}][{}] + raw_fetch_u8_1(&vbuf, ubuf.vtx_start + {} * {}u + {}u) * {}u + {}u",
++                        (attr - GX_VA_POS) / 4, (attr - GX_VA_POS) % 4, vidx, vtxStride, dlOffset, mapping.stride, within),
+             "abuf"sv, mapping.le};
+   }
+   if (mapping.attrType == GX_INDEX16) {
+     return {
+-        fmt::format("ubuf.array_start[{}] + raw_fetch_u16_1(&vbuf, ubuf.vtx_start + {} * {}u + {}u, false) * {}u + {}u",
+-                    attr - GX_VA_POS, vidx, vtxStride, dlOffset, mapping.stride, within),
++        fmt::format("ubuf.array_start[{}][{}] + raw_fetch_u16_1(&vbuf, ubuf.vtx_start + {} * {}u + {}u, false) * {}u + {}u",
++                    (attr - GX_VA_POS) / 4, (attr - GX_VA_POS) % 4, vidx, vtxStride, dlOffset, mapping.stride, within),
+         "abuf"sv, mapping.le};
+   }
+   return {fmt::format("ubuf.vtx_start + {} * {}u + {}u", vidx, vtxStride, dlOffset + within), "vbuf"sv, false};
+@@ -1899,7 +1900,7 @@ struct Uniform {{
+     render_viewport_size: vec2f,
+     logical_viewport_size: vec2f,
+     pad: vec2u,
+-    array_start: array<u32, 12>,{0}
++    array_start: array<vec4<u32>, 3>,{0}
+ }};
+ @group(0) @binding(0)
+ var<storage, read> vbuf: array<u32>;
+diff --git a/lib/webgpu/gpu.cpp b/lib/webgpu/gpu.cpp
+index a969465..01ed959 100644
+--- a/lib/webgpu/gpu.cpp
++++ b/lib/webgpu/gpu.cpp
+@@ -19,7 +19,9 @@
+ #include "../window.hpp"
+ 
+ #ifdef WEBGPU_DAWN
++#ifndef __EMSCRIPTEN__
+ #include "../dawn/BackendBinding.hpp"
++#endif
+ #include <dawn/native/DawnNative.h>
+ #endif
+ 
+@@ -670,13 +672,21 @@ static bool create_surface() {
+     Log.error("Failed to create surface: no window");
+     return false;
+   }
++#ifdef __EMSCRIPTEN__
++  // the page's <canvas id="canvas"> (emdawnwebgpu)
++  wgpu::EmscriptenSurfaceSourceCanvasHTMLSelector canvasSource{};
++  canvasSource.selector = "#canvas";
++  const wgpu::ChainedStruct* chainedPtr = &canvasSource;
++#else
+   const auto chainedDescriptor = utils::SetupWindowAndGetSurfaceDescriptor(window);
+   if (!chainedDescriptor) {
+     Log.error("Failed to create surface descriptor for current window");
+     return false;
+   }
++  const wgpu::ChainedStruct* chainedPtr = chainedDescriptor.get();
++#endif
+   const wgpu::SurfaceDescriptor surfaceDescriptor{
+-      .nextInChain = chainedDescriptor.get(),
++      .nextInChain = chainedPtr,
+       .label = "Surface",
+   };
+   release_surface();
+@@ -691,6 +701,11 @@ static bool create_surface() {
+ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
+   if (!g_instance) {
+     Log.info("Creating WebGPU instance");
++#ifdef __EMSCRIPTEN__
++    // emdawnwebgpu (Emscripten 4.0.10): timed WaitAny is a capability, and needs ASYNCIFY or JSPI
++    wgpu::InstanceDescriptor instanceDescriptor{};
++    instanceDescriptor.capabilities.timedWaitAnyEnable = true;
++#else
+     const std::array requiredInstanceFeatures{
+         wgpu::InstanceFeatureName::TimedWaitAny,
+     };
+@@ -698,6 +713,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
+         .requiredFeatureCount = requiredInstanceFeatures.size(),
+         .requiredFeatures = requiredInstanceFeatures.data(),
+     };
++#endif
+ #ifdef WEBGPU_DAWN
+     dawn::native::DawnInstanceDescriptor dawnInstanceDescriptor;
+     dawnInstanceDescriptor.backendValidationLevel = dawn::native::BackendValidationLevel::Disabled;
+@@ -813,15 +829,21 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
+     g_adapter.GetFeatures(&supportedFeatures);
+     for (size_t i = 0; i < supportedFeatures.featureCount; ++i) {
+       const auto feature = supportedFeatures.features[i];
+-      if (feature == wgpu::FeatureName::TextureCompressionBC || feature == wgpu::FeatureName::TextureCompressionASTC ||
+-          feature == wgpu::FeatureName::TextureComponentSwizzle) {
++      if (feature == wgpu::FeatureName::TextureCompressionBC || feature == wgpu::FeatureName::TextureCompressionASTC
++#ifdef WEBGPU_DAWN
++          || feature == wgpu::FeatureName::TextureComponentSwizzle
++#endif
++          ) {
+         if (feature == wgpu::FeatureName::TextureCompressionBC) {
+           g_bcTexturesSupported = true;
+         } else if (feature == wgpu::FeatureName::TextureCompressionASTC) {
+           g_astcTexturesSupported = true;
+-        } else if (feature == wgpu::FeatureName::TextureComponentSwizzle) {
++        }
++#ifdef WEBGPU_DAWN
++        else if (feature == wgpu::FeatureName::TextureComponentSwizzle) {
+           g_textureComponentSwizzleSupported = true;
+         }
++#endif
+         requiredFeatures.push_back(feature);
+       }
+     }
+@@ -896,6 +918,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
+     if (!g_device) {
+       return false;
+     }
++#ifndef __EMSCRIPTEN__
+     g_device.SetLoggingCallback([](wgpu::LoggingType type, wgpu::StringView message) {
+       AuroraLogLevel level = LOG_FATAL;
+       switch (type) {
+@@ -916,6 +939,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
+       }
+       Log.report(level, "WebGPU message: {}", message);
+     });
++#endif
+   }
+   g_queue = g_device.GetQueue();
+ 

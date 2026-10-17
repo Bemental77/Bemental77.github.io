@@ -1,0 +1,8 @@
+--- a/backends/imgui_impl_wgpu.cpp
++++ b/backends/imgui_impl_wgpu.cpp
+@@ -48,3 +48,4 @@
+ // When targeting native platforms (i.e. NOT emscripten), one of IMGUI_IMPL_WEBGPU_BACKEND_DAWN
+ // or IMGUI_IMPL_WEBGPU_BACKEND_WGPU must be provided. See imgui_impl_wgpu.h for more details.
+-#ifndef __EMSCRIPTEN__
++// mp4native: emdawnwebgpu is the Dawn API under Emscripten
++#if !defined(__EMSCRIPTEN__) || defined(IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
