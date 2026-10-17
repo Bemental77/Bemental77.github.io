@@ -350,7 +350,10 @@ function cardLoad(buf) {
 let vcdLo = 0, vcdHi = 0;
 const vatA = new Array(8).fill(0);
 const arrayBase = new Array(16).fill(0), arrayStride = new Array(16).fill(0);
-const knownDLs = new Map();          // guest addr -> {size, k1, keys} (walked+synced): the binding
+// clear()/delete() also drop gx_walk's mirror of the signature rings (cwDlDirty; see THE FIFO WALK RUNS AS WASM)
+let cwDlDirty = true;
+class DlMap extends Map { clear() { cwDlDirty = true; return super.clear(); } delete(k) { cwDlDirty = true; return super.delete(k); } }
+const knownDLs = new DlMap();        // guest addr -> {size, k1, keys} (walked+synced): the binding
                                      // signatures it was walked with — the first in k1, any more in
                                      // the Set `keys` (made only for a second one: most DLs have one)
 function dlKeysClear(e) { e.k1 = null; if (e.keys !== null) e.keys.clear(); }
@@ -374,14 +377,25 @@ const TEX_BPP = { 0: 4, 1: 8, 2: 8, 3: 16, 4: 16, 5: 16, 6: 32, 8: 4, 9: 8, 10: 
 // [...shadow]) — with the values in a Uint32Array indexed by register. `ver` moves when a register
 // is seen for the first time or the shadow is cleared, so buildPrologue sorts XF keys only then.
 class RegShadow {
-  constructor(n) { this.val = new Uint32Array(n); this.seen = new Uint8Array(n); this.order = []; this.ver = 0; }
-  set(k, v) { if (!this.seen[k]) { this.seen[k] = 1; this.order.push(k); this.ver++; } this.val[k] = v; return this; }
+  // val/seen indexed by register, ord = first-insertion order, meta = [count, ver]. Plain typed arrays
+  // of its own until rebind() points it into gx_walk.wasm's memory (THE FIFO WALK RUNS AS WASM), where
+  // the compiled walk writes the same four arrays with the same rule.
+  constructor(n) { this.val = new Uint32Array(n); this.seen = new Uint8Array(n); this.ord = new Uint32Array(n); this.meta = new Int32Array(2); }
+  rebind(val, seen, ord, meta) {
+    const o = this.order.slice(), v = o.map((k) => this.val[k]);
+    this.val = val; this.seen = seen; this.ord = ord; this.meta = meta;
+    this.seen.fill(0); this.meta[0] = 0; this.meta[1]++;
+    for (let i = 0; i < o.length; i++) this.set(o[i], v[i]);
+  }
+  get order() { return this.ord.subarray(0, this.meta[0]); }
+  get ver() { return this.meta[1]; }
+  set(k, v) { if (!this.seen[k]) { this.seen[k] = 1; this.ord[this.meta[0]++] = k; this.meta[1]++; } this.val[k] = v; return this; }
   get(k) { return this.seen[k] ? this.val[k] : undefined; }
   has(k) { return this.seen[k] === 1; }
-  get size() { return this.order.length; }
-  clear() { const o = this.order; for (let i = 0; i < o.length; i++) this.seen[o[i]] = 0; o.length = 0; this.ver++; }
-  keys() { return this.order.slice()[Symbol.iterator](); }
-  *[Symbol.iterator]() { const o = this.order.slice(); for (let i = 0; i < o.length; i++) yield [o[i], this.val[o[i]]]; }
+  get size() { return this.meta[0]; }
+  clear() { const o = this.ord, n = this.meta[0]; for (let i = 0; i < n; i++) this.seen[o[i]] = 0; this.meta[0] = 0; this.meta[1]++; }
+  keys() { return Array.from(this.order)[Symbol.iterator](); }
+  *[Symbol.iterator]() { const o = Array.from(this.order); for (let i = 0; i < o.length; i++) yield [o[i], this.val[o[i]]]; }
 }
 // cp/bp: the register number is a byte. xf: the walk stores xfAddr + k with xfAddr <= 0xFFFF and
 // k < count <= 0x10000, so every key it can produce is below 0x20000.
@@ -547,6 +561,179 @@ const DL_SIG_CACHE = 8;   // the signatures a DL's entry remembers (Hu3D calls o
 // GUEST'S SLACK). A display list's body is always walked whole. Otherwise it returns `end`.
 let wsTick = 0;
 function walkStream(mem, buf, start, end, depth, newDLs, touched, deadline) {
+  if (gw !== null && depth === 0) return cwCheck ? cwCheckWalk(mem, buf, start, end, newDLs) : cwWalk(mem, buf, start, end, newDLs, deadline);
+  return walkStreamJs(mem, buf, start, end, depth, newDLs, touched, deadline);
+}
+// ?cwalk=check (boot msg cwalkCheck): THE DIFFERENTIAL. Every top-level walk runs twice from the same
+// state — gx_walk first, then (state restored) walkStreamJs — and everything a walk can leave behind is
+// compared: the CP/XF/BP shadows (order and values), the walk's CP/BP variables and slot reach,
+// pairSeen / texBound / arrUsed (in insertion order), every knownDLs entry (signature ring, k1, keys),
+// the new display lists and the return value. The JS result is kept. Every walk runs whole (the
+// ship step's deadline is ignored), so this is a correctness arm only, never a timing one.
+let cwCheck = false, cwCk = { n: 0, bad: 0, said: 0 };
+function cwSnap() {
+  const sh = {}; for (const k of ['cp', 'xf', 'bp']) { const r = gxShadow[k]; sh[k] = { o: Array.from(r.order), v: Array.from(r.order, (x) => r.val[x]), ver: r.ver }; }
+  return { sh, vcdLo, vcdHi, tlutSrc, vatA: vatA.slice(), arrayBase: arrayBase.slice(), arrayStride: arrayStride.slice(), texImg0: texImg0.slice(),
+           slotUse: Array.from(slotUse), pairSeen: [...pairSeen].map(([k, v]) => [k, v.base, v.stride]), texBound: [...texBound], arrUsed: [...arrUsed],
+           dls: [...knownDLs].map(([a, e]) => [a, e.size, e.k1, e.keys === null ? null : [...e.keys], e.cE, e.cN, e.c === null ? null : e.c.slice()]) };
+}
+function cwRestore(S) {
+  for (const k of ['cp', 'xf', 'bp']) { const r = gxShadow[k]; r.clear(); for (let i = 0; i < S.sh[k].o.length; i++) r.set(S.sh[k].o[i], S.sh[k].v[i]); r.meta[1] = S.sh[k].ver; }
+  vcdLo = S.vcdLo; vcdHi = S.vcdHi; tlutSrc = S.tlutSrc;
+  for (let i = 0; i < 8; i++) { vatA[i] = S.vatA[i]; texImg0[i] = S.texImg0[i]; }
+  for (let i = 0; i < 16; i++) { arrayBase[i] = S.arrayBase[i]; arrayStride[i] = S.arrayStride[i]; slotUse[i] = S.slotUse[i]; }
+  pairSeen.clear(); for (const [k, b, st] of S.pairSeen) pairSeen.set(k, { base: b, stride: st });
+  texBound.clear(); for (const [k, v] of S.texBound) texBound.set(k, v);
+  arrUsed.clear(); for (const [k, v] of S.arrUsed) arrUsed.set(k, v);
+  Map.prototype.clear.call(knownDLs);
+  for (const [a, size, k1, keys, cE, cN, c] of S.dls) knownDLs.set(a, { size, k1, keys: keys === null ? null : new Set(keys), cE, cN, c: c === null ? null : c.slice() });
+}
+function cwCheckWalk(mem, buf, start, end, newDLs) {
+  const S0 = cwSnap(), nd0 = newDLs === null ? null : newDLs.length;
+  let rc, ec = null; try { rc = cwWalk(mem, buf, start, end, newDLs, 0); } catch (e) { ec = String(e && e.message); }
+  const SC = cwSnap(), ndC = newDLs === null ? null : JSON.stringify(newDLs.slice(nd0));
+  cwRestore(S0); if (newDLs !== null) newDLs.length = nd0;
+  let rj, ej = null; try { rj = walkStreamJs(mem, buf, start, end, 0, newDLs, null, 0); } catch (e) { ej = String(e && e.message); }
+  const SJ = cwSnap(), ndJ = newDLs === null ? null : JSON.stringify(newDLs.slice(nd0));
+  cwCk.n++;
+  const diff = [];
+  if (rc !== rj) diff.push('ret ' + rc + ' vs ' + rj);
+  if (ec !== ej) diff.push('throw ' + ec + ' vs ' + ej);
+  if (ndC !== ndJ) diff.push('newDLs');
+  for (const k of Object.keys(SJ)) {
+    if (k === 'sh') { for (const r of ['cp', 'xf', 'bp']) if (JSON.stringify(SC.sh[r].o) !== JSON.stringify(SJ.sh[r].o) || JSON.stringify(SC.sh[r].v) !== JSON.stringify(SJ.sh[r].v)) diff.push('shadow.' + r); }
+    else if (JSON.stringify(SC[k]) !== JSON.stringify(SJ[k])) diff.push(k);
+  }
+  if (diff.length) { cwCk.bad++; if (cwCk.said++ < 10) log('CWCHECK MISMATCH f' + viRetrace + ': ' + diff.join(', ')); }
+  if ((cwCk.n % 300) === 0) log('CWCHECK f' + viRetrace + ' walks=' + cwCk.n + ' mismatches=' + cwCk.bad);
+  if (ej !== null) throw new Error(ej);
+  return rj;
+}
+// ── THE FIFO WALK RUNS AS WASM (2026-10-16) ─────────────────────────────────────────────────────
+// gx_walk/gx_walk.c is walkStreamJs below, command for command, compiled into its own small module
+// (no imports, its own memory — nothing it holds is in guest memory, so the rollback ring and the
+// room fingerprint see nothing new). MEASURED (MP4 3D title, rate 1, counters in a scratch copy):
+// 70 KB of FIFO, 874 CP + 1562 XF loads + 5891 BP writes + 1296 display-list calls a frame, 0.37-0.42
+// ms of JS on the guest's thread. The register shadow, the walk's CP/BP state and the slot reach live
+// in gx_walk's memory during a walk and are copied back into the JS variables when it ends; pairSeen,
+// texBound and arrUsed are filled from its event list in stream order; every display-list call whose
+// binding signature gx_walk has not seen in this entry's ring stops the walk and runs the JS logic
+// (cwDlMiss), which then writes the ring back — so a gx_walk hit is always a JS hit. ?cwalk=0
+// (boot msg cwalk:false) keeps walkStreamJs.
+let gw = null, gwU8 = null, gwU32 = null, gwF64 = null, gwP = null, cwTopSrc = null, cwEpoch = -1;
+function cwInit(inst) {
+  const e = inst.exports, buf = e.memory.buffer;
+  gwU8 = new Uint8Array(buf); gwU32 = new Uint32Array(buf); gwF64 = new Float64Array(buf);
+  gwP = { top: e.gw_top_buf(), body: e.gw_body_buf(), vatA: e.gw_vatA() >> 2, ab: e.gw_arrayBase() >> 2, as: e.gw_arrayStride() >> 2,
+          ti: e.gw_texImg0() >> 2, su: e.gw_slotUse() >> 3, ev: e.gw_ev() >> 2, dl: e.gw_out_dl() >> 2, scr: e.gw_dl_scratch() >> 2 };
+  const kinds = ['cp', 'xf', 'bp'], N = [0x100, 0x20000, 0x100];
+  for (let k = 0; k < 3; k++)
+    gxShadow[kinds[k]].rebind(new Uint32Array(buf, e.gw_sh_val(k), N[k]), new Uint8Array(buf, e.gw_sh_seen(k), N[k]),
+                              new Uint32Array(buf, e.gw_sh_order(k), N[k]), new Int32Array(buf, e.gw_sh_meta(k), 2));
+  xfSortedVer = -1;
+  gw = e;
+}
+function cwSyncIn() {
+  gw.gw_set_scalars(vcdLo >>> 0, vcdHi >>> 0, tlutSrc >>> 0, psGen | 0, (XF_SHADOW_ALL ? 1 : 0) | (noteReach ? 2 : 0));
+  const U = gwU32, P = gwP;
+  for (let i = 0; i < 8; i++) { U[P.vatA + i] = vatA[i] >>> 0; U[P.ti + i] = texImg0[i] >>> 0; }
+  for (let i = 0; i < 16; i++) { U[P.ab + i] = arrayBase[i] >>> 0; U[P.as + i] = arrayStride[i] >>> 0; gwF64[P.su + i] = slotUse[i]; }
+}
+function cwSyncOut() {
+  vcdLo = gw.gw_vcdLo(); vcdHi = gw.gw_vcdHi(); tlutSrc = gw.gw_tlutSrc();
+  const U = gwU32, P = gwP;
+  for (let i = 0; i < 8; i++) { vatA[i] = U[P.vatA + i]; texImg0[i] = U[P.ti + i]; }
+  for (let i = 0; i < 16; i++) { arrayBase[i] = U[P.ab + i]; arrayStride[i] = U[P.as + i]; slotUse[i] = gwF64[P.su + i]; }
+}
+const cwPairCache = new Map();
+function cwDrain() {
+  const n = gw.gw_ev_n(), U = gwU32;
+  for (let i = 0, o = gwP.ev; i < n; i++, o += 4) {
+    const t = U[o], a = U[o + 1], b = U[o + 2];
+    if (t === 1) {
+      // the key string and its value, made once per (base, stride): the same key and an equal value
+      // as walkStreamJs's pairSeen.set (discovery reads only .base/.stride and sets .key = the key)
+      let pe = b < 65536 ? cwPairCache.get(a * 65536 + b) : undefined;
+      if (pe === undefined) { pe = { k: a + '|' + b, v: { base: a, stride: b } }; if (b < 65536 && cwPairCache.size < 65536) cwPairCache.set(a * 65536 + b, pe); }
+      pairSeen.set(pe.k, pe.v);
+    }
+    else if (t === 2) texBound.set(a, Math.max(texBound.get(a) || 0, b));
+    else { const k = a * 256 + b, c = U[o + 3], u = arrUsed.get(k); if (u === undefined || c > u) arrUsed.set(k, c); }
+  }
+  gw.gw_ev_reset();
+}
+function cwDlMirror(addr, ent) {
+  const S = gwU32, o = gwP.scr, c = ent.c;
+  for (let i = 0; i < 32; i++) S[o + i] = (c && i < c.length ? c[i] : 0) >>> 0;
+  gw.gw_dl_put(addr >>> 0, ent.cN | 0, gwP.scr << 2);
+}
+// One display-list call gx_walk could not prove a hit: walkStreamJs's logic for it, verbatim, with
+// the body walked by gx_walk at depth 1.
+function cwDlMiss(mem, addr, size, a0, a1, a2, a4, newDLs) {
+  let ent = knownDLs.get(addr);
+  if (!ent) { ent = { size, k1: null, keys: null, cE: 0, cN: 0, c: null }; knownDLs.set(addr, ent); }
+  else if (ent.cE === dlKeysEpoch && ent.c) {
+    const c = ent.c, cn = ent.cN < DL_SIG_CACHE ? ent.cN : DL_SIG_CACHE;
+    for (let i = 0, j = 0; i < cn; i++, j += 4) if (c[j] === a0 && c[j + 1] === a1 && c[j + 2] === a2 && c[j + 3] === a4) { cwDlMirror(addr, ent); return; }
+  }
+  if (ent.cE !== dlKeysEpoch || !ent.c) { ent.cE = dlKeysEpoch; ent.cN = 0; ent.c = [a0, a1, a2, a4]; ent.cN = 1; }
+  else { const j = 4 * (ent.cN++ % DL_SIG_CACHE), c = ent.c; c[j] = a0; c[j + 1] = a1; c[j + 2] = a2; c[j + 3] = a4; }
+  cwDlMirror(addr, ent);
+  const bk = abStr(0) + '|' + abStr(1) + '|' + abStr(2) + '|' + abStr(4);
+  if (ent.k1 !== bk && !(ent.keys !== null && ent.keys.has(bk))) {
+    if (ent.k1 === null && (ent.keys === null || ent.keys.size === 0)) {
+      ent.k1 = bk;
+      if (newDLs !== null) newDLs.push({ addr, size });
+    } else { if (ent.keys === null) ent.keys = new Set(); ent.keys.add(bk); }
+    const ofs = addr & 0x01FFFFFF, mv = memView(mem);
+    if (ofs + size > mv.length) throw new RangeError('DL 0x' + (addr >>> 0).toString(16) + '+' + size + ' runs past guest memory');
+    const n = Math.min(mv.length - ofs, size + 0x41000);
+    if (n > (2 << 20)) throw new RangeError('DL 0x' + (addr >>> 0).toString(16) + '+' + size + ' is larger than gx_walk\'s body buffer');
+    gwU8.set(mv.subarray(ofs, ofs + n), gwP.body);
+    gw.gw_set_lens(cwTopLen, n);
+    for (let p = 0; ;) {
+      const r = gw.gw_walk(1, p, size, 1, 0);
+      cwDrain();
+      if (r === 3) { p = gw.gw_out_p(); continue; }
+      if (r === -1) log('walk: unknown op 0x' + gw.gw_out_bad().toString(16) + ' at +0x' + (gw.gw_out_p() + ofs).toString(16));
+      else if (r === -2) log('DRAW OVERRUN in walk');
+      break;
+    }
+  }
+}
+let cwTopLen = 0;
+function cwWalk(mem, buf, start, end, newDLs, deadline) {
+  if (start === 0 || buf !== cwTopSrc) {
+    if (buf.length > (8 << 20)) { const r = walkStreamJs(mem, buf, start, end, 0, newDLs, null, deadline); cwDlDirty = true; return r; }
+    gwU8.set(buf, gwP.top); cwTopSrc = buf; cwTopLen = buf.length;
+  }
+  if (cwDlDirty || cwEpoch !== dlKeysEpoch) { gw.gw_dl_clear(); cwDlDirty = false; cwEpoch = dlKeysEpoch; }
+  cwSyncIn();
+  const budget = (deadline !== 0 && deadline !== Infinity) ? 1024 : 0;
+  let p = start, ret;
+  try {
+    for (;;) {
+      gw.gw_set_lens(cwTopLen, 0);
+      const r = gw.gw_walk(0, p, end, 0, budget);
+      cwDrain();
+      p = gw.gw_out_p();
+      if (r === 0) { ret = end; break; }
+      if (r === 3) continue;
+      if (r === 1) { if (performance.now() >= deadline) { ret = p; break; } continue; }
+      if (r === 2) {
+        const D = gwU32, o = gwP.dl;
+        cwSyncOut();                         // abStr() and a throw below see the walk's state
+        cwDlMiss(mem, D[o], D[o + 1], D[o + 2], D[o + 3], D[o + 4], D[o + 5], newDLs);
+        continue;
+      }
+      if (r === -1) log('walk: unknown op 0x' + gw.gw_out_bad().toString(16) + ' at +0x' + p.toString(16));
+      else log('DRAW OVERRUN in walk');
+      ret = undefined; break;
+    }
+  } finally { cwSyncOut(); }
+  return ret;
+}
+function walkStreamJs(mem, buf, start, end, depth, newDLs, touched, deadline) {
   let p = start;
   // [perf 2026-08-28] these were closures over `buf`, rebuilt on EVERY call — and walkStream
   // recurses once per display list. [2026-10-06] and the closures that replaced them were not
@@ -658,7 +845,7 @@ function walkStream(mem, buf, start, end, depth, newDLs, touched, deadline) {
           // new view per DL: a full-image frame walks ~1300 of them.
           const ofs = addr & 0x01FFFFFF, mv = memView(mem);
           if (ofs + size > mv.length) throw new RangeError('DL 0x' + (addr >>> 0).toString(16) + '+' + size + ' runs past guest memory');
-          walkStream(mem, mv, ofs, ofs + size, depth + 1, newDLs, touched, 0);
+          walkStreamJs(mem, mv, ofs, ofs + size, depth + 1, newDLs, touched, 0);
         }
       }
     }
@@ -689,7 +876,7 @@ const PRO_IDENT = [0x3f800000, 0, 0, 0, 0, 0x3f800000, 0, 0, 0, 0, 0x3f800000, 0
 let xfSortedVer = -1, xfSorted = [];
 function xfKeysSorted() {
   const xf = gxShadow.xf;
-  if (xf.ver !== xfSortedVer) { xfSorted = xf.order.slice().sort((x, y) => x - y); xfSortedVer = xf.ver; }
+  if (xf.ver !== xfSortedVer) { xfSorted = xf.order.slice().sort(); xfSortedVer = xf.ver; }
   return xfSorted;
 }
 function prologueLen() {
@@ -1412,6 +1599,17 @@ function shipFrame(pos, resim, hiddenNow) {
   // every frame of an uncapped run, which never parks (pace cell 5) and so has no slack to run it in
   if (withImage || !paceI32 || Atomics.load(paceI32, 5)) shipFlush();
 }
+// ?shiphash=1 (boot msg shipHash): a verification aid, off by default. Every shipped frame's FIFO (with
+// its prologue) and its regions (address + bytes) are folded into one FNV-1a hash, logged every 300
+// frames with the frame number — two runs of the same guest that ship the same bytes log the same lines.
+let shipHash = false, shipHashH = 0x811c9dc5, shipHashN = 0;
+function shipHashBytes(h, u8) { for (let i = 0; i < u8.length; i++) h = Math.imul(h ^ u8[i], 16777619); return h; }
+function shipHashFrame(n, fifo, regions) {
+  let h = shipHashBytes(shipHashH ^ n, fifo);
+  for (const r of regions) { h = Math.imul(h ^ r.addr, 16777619); h = shipHashBytes(h, r.bytes); }
+  shipHashH = h >>> 0; shipHashN++;
+  if (n % 300 === 0) log('SHIPHASH f' + n + ' ' + shipHashH.toString(16) + ' (' + shipHashN + ' frames)');
+}
 // Run job `j` (the oldest) until it is done or `deadline` (performance.now()) has passed; true = done.
 function shipJobRun(j, deadline) {
   const mem = () => Module.wasmMemory;
@@ -1512,6 +1710,7 @@ function shipJobRun(j, deadline) {
   const isSab = (b) => typeof SharedArrayBuffer !== 'undefined' && b instanceof SharedArrayBuffer;
   for (const r of regions) if (!isSab(r.bytes.buffer) && transfers.indexOf(r.bytes.buffer) < 0) transfers.push(r.bytes.buffer);
   if (mem1Snap && !isSab(mem1Snap)) transfers.push(mem1Snap);
+  if (shipHash) shipHashFrame(j.n, fifo, regions);
   shipPosts.push([{ cmd: 'frame', n: j.n, fifo: fifo.buffer, mem1: mem1Snap, poolSeq: j.seq, hidden: j.hidden,
                     regions: regions.map((r) => ({ addr: r.addr, bytes: shipPool ? r.bytes : r.bytes.buffer })) }, transfers]);
   shipJobs.shift();
@@ -3475,6 +3674,17 @@ async function boot(msg) {
     log('prefault: MEM1 window + ship pool (' + mem1Pool.length + ' images, ' + regPool.length + ' region buffers) + spares ('
         + spare.img.length + ' images, ' + spare.reg.length + ' region buffers) in ' + (performance.now() - t0).toFixed(1) + ' ms');
   }
+  // THE FIFO WALK RUNS AS WASM (gx_walk/gx_walk.c); boot msg cwalk:false (page ?cwalk=0) keeps the JS walk
+  if (msg.cwalk !== false) {
+    try {
+      const wb = await (await fetch(new URL('gx_walk/gx_walk.wasm' + self.location.search, self.location.href).href)).arrayBuffer();
+      cwInit((await WebAssembly.instantiate(wb)).instance);
+      log('fifo walk: gx_walk.wasm (' + wb.byteLength + ' B; ?cwalk=0: the JS walk)');
+    } catch (e) { gw = null; log('fifo walk: JS — gx_walk.wasm unavailable (' + ((e && e.message) || e) + ')'); }
+  } else log('fifo walk: JS (?cwalk=0)');
+  shipHash = !!msg.shipHash;
+  cwCheck = gw !== null && !!msg.cwalkCheck;
+  if (cwCheck) log('fifo walk: CHECK MODE — every walk runs in gx_walk AND the JS walk, compared');
   if (msg.shipWarm !== false) {
     const w = shipWarmUp(150);
     log('ship code warmed up: ' + w.it + ' synthetic frames in ' + w.ms.toFixed(1) + ' ms');
