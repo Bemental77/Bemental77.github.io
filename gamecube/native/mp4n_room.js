@@ -54,7 +54,7 @@
     atTotal: -1, tickedAt: -1,
     replay: [], image: null, pushMute: false,
     catchUp: 0, hashAt: Object.create(null), due: [], sent: Object.create(null),   // sent: frame -> fingerprint this console submitted
-    stats: { live: 0, resim: 0, hidden: 0, rollbacks: 0, maxDepth: 0, holds: 0, hashesSent: 0, restoreFail: 0, maxRestoreMs: 0, frameTimes: [] },
+    stats: { live: 0, resim: 0, hidden: 0, undrawn: 0, rollbacks: 0, maxDepth: 0, holds: 0, hashesSent: 0, restoreFail: 0, maxRestoreMs: 0, frameTimes: [] },
     log: function () {}
   };
 
@@ -266,7 +266,10 @@
     if (live) { R.lastLive = frame; R.stats.live++; if (quiet) R.stats.hidden++; }
     else R.stats.resim++;
     R.pushMute = !!quiet;                 // its samples arrive at the next boundary; a repeat or a hidden frame is not heard
-    return (quiet || !live) ? HOOK_OFF : 0;
+    var skip = (quiet || !live) ? 1 : 0;  // nor drawn: Aurora skips its render passes and the present (game state is untouched)
+    if (skip) R.stats.undrawn++;
+    if (R.mod._mp4web_set_gfx_skip) R.mod._mp4web_set_gfx_skip(skip);
+    return skip ? HOOK_OFF : 0;
   }
 
   function attach(mod) {
@@ -297,7 +300,7 @@
     }
     return { active: !!(R.session || R.handoff), role: R.role, want: R.want, seated: ls ? seated(ls) : 0, armed: R.armed, running: R.running, failed: R.failed,
              stopReason: R.stopReason || null, next: R.next, waiting: R.waiting || null, broken: R.broken,
-             stats: { live: R.stats.live, resim: R.stats.resim, hidden: R.stats.hidden, rollbacks: R.stats.rollbacks, maxDepth: R.stats.maxDepth,
+             stats: { live: R.stats.live, resim: R.stats.resim, hidden: R.stats.hidden, undrawn: R.stats.undrawn, rollbacks: R.stats.rollbacks, maxDepth: R.stats.maxDepth,
                       holds: R.stats.holds, hashesSent: R.stats.hashesSent, restoreFail: R.stats.restoreFail, maxRestoreMs: R.stats.maxRestoreMs,
                       liveFramesLast5s: win5 },
              engine: eng };
