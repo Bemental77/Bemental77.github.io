@@ -442,7 +442,13 @@
     // remembered, silently invalidated the code their friend was typing. The
     // only visible difference was five characters. Pressing it again now just
     // shows the party that is already open; a reload is how you get a new one.
-    if (!code) code = Netplay.makeCode(5, sys.key);
+    // ⚠ BUT A CODE NAMES ITS CONSOLE. A host who opened a party, looked at "I have a code", came Back
+    // and picked another console got the FIRST console's code back here (pickConsole re-mints only
+    // while the host pane is showing, and the join pane hides it): the hand-off went to the new
+    // console's page with a code that sends every joiner to the old one. Found by
+    // tools/multiplayer_page_browser_test.mjs. Same console: the same party, as before.
+    var named = code && Netplay.consoleOfCode ? Netplay.consoleOfCode(code) : null;
+    if (!code || (named && named !== sys.key)) code = Netplay.makeCode(5, sys.key);
     showHost();
   });
   // Changing the game after minting must re-point the link — the link IS the
