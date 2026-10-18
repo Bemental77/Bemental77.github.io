@@ -166,7 +166,7 @@ async function launch(role, cpus) {
   // SENDTIME=1 (diagnostic): time every RTCDataChannel / WebSocket send on the page (window.__sendT)
   if (process.env.SENDTIME === '1') await P.page.evaluateOnNewDocument(() => {
     const T = window.__sendT = { dc: 0, dcN: 0, dcMax: 0, ws: 0, wsN: 0 };
-    const wrap = (proto, k, kn) => { const f = proto.send; proto.send = function () { const t0 = performance.now(); try { return f.apply(this, arguments); } finally { const d = performance.now() - t0; T[k] += d; T[kn]++; if (k === 'dc' && d > T.dcMax) T.dcMax = d; } }; };
+    const wrap = (proto, k, kn) => { const f = proto.send; proto.send = function () { const t0 = performance.now(); try { return f.apply(this, arguments); } finally { const d = performance.now() - t0; T[k] += d; T[kn]++; if (k === 'dc' && d > T.dcMax) T.dcMax = d; if (k === 'dc') { const L = 'lab_' + this.label; T[L] = (T[L] || 0) + d; T[L + 'N'] = (T[L + 'N'] || 0) + 1; } } }; };
     if (window.RTCDataChannel) wrap(RTCDataChannel.prototype, 'dc', 'dcN');
     if (window.WebSocket) wrap(WebSocket.prototype, 'ws', 'wsN');
   });
