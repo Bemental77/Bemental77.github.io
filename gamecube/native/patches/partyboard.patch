@@ -82,6 +82,19 @@ index 6067ad4..c6faa14 100755
      /* 0x08 */ s32 unk08;
      /* 0x0C */ s32 unk0C;
      /* 0x10 */ char unk10[0x18];
+diff --git a/include/REL/w05Dll.h b/include/REL/w05Dll.h
+index 7983489..4714eb0 100644
+--- a/include/REL/w05Dll.h
++++ b/include/REL/w05Dll.h
+@@ -115,7 +115,7 @@ void fn_1_97AC(void);
+ void fn_1_9A68(omObjData *);
+ void fn_1_9AC0(void);
+ void fn_1_9AF0(void);
+-void fn_1_9B74(void);
++s32 fn_1_9B74(void);
+ void fn_1_9C24(omObjData *);
+ void fn_1_9C98(dataCopy2 *);
+ void fn_1_9D0C(omObjData *);
 diff --git a/include/game/board/bowser.h b/include/game/board/bowser.h
 index 9074ed4..d6da2e6 100644
 --- a/include/game/board/bowser.h
@@ -107,6 +120,134 @@ index a9a6085..1e3d9e9 100644
      void *handle;
  #else
  	OSModuleHeader *module;
+diff --git a/src/REL/bootDll/main.c b/src/REL/bootDll/main.c
+index 4303911..8f82b4b 100644
+--- a/src/REL/bootDll/main.c
++++ b/src/REL/bootDll/main.c
+@@ -15,6 +15,9 @@
+ #include "game/thpmain.h"
+ #include "game/window.h"
+ #include "game/wipe.h"
++#include "game/objsub.h"
++#include "game/gamework.h"
++#include "game/board/main.h"
+ #include "math.h"
+ 
+ #include "data_num/title.h"
+@@ -159,6 +162,64 @@ void ObjectSetup(void)
+      }
+ #endif
+ #endif
++#ifdef __EMSCRIPTEN__
++     {
++         // WEB CRASH SWEEP (mp4-native.html ?mg=401..463): from a cold boot, straight into one minigame,
++         // set up the way Mini-Game mode launches one (mgmodedll/minigame.c): four characters, player 1
++         // human (driven by the test's inputs), the rest COM, teams by the minigame's type, then the
++         // instruction overlay, which hands over to the minigame. Off unless the page asks for it.
++         extern int mp4web_debug_mg(void);
++         s32 mg = mp4web_debug_mg();
++         if (omovlevtno == 0 && mg >= 401 && mg <= 463 && mgInfoTbl[mg - 401].ovl != DLL_NONE) {
++             s32 type = mgInfoTbl[mg - 401].type;
++             BootInitForSkippedSequence();
++             for (i = 0; i < 4; i++) {
++                 GWPlayerCfg[i].character = i;
++                 GWPlayerCfg[i].pad_idx = i;
++                 GWPlayerCfg[i].diff = 0;
++                 GWPlayerCfg[i].iscom = (i != 0);
++                 GWPlayerCfg[i].group = (type == 1) ? (i != 0) : (type == 2) ? (i >= 2) : i;
++                 CharMotionInit(GWPlayerCfg[i].character);
++             }
++             GWMGAvailSet(mg);
++             GWSystem.mg_next = mg - 401;
++             OSReport("[mp4web] crash sweep: minigame %d (overlay %d, type %d)\n", (int)mg, (int)mgInfoTbl[mg - 401].ovl, (int)type);
++             omOvlCallEx(DLL_instdll, 1, 0, 0);
++             HuPrcEnd();
++             do {
++                 HuPrcVSleep();
++             } while (1);
++         }
++     }
++     {
++         // WEB CRASH SWEEP (?board=0..6): straight into a Party Mode board (w01..w06, then w10), set up the
++         // way the party setup does before it calls the board (mentDll): four characters, player 1 human,
++         // the rest COM, no teams, 10 turns, bonus stars on.
++         extern int mp4web_debug_board(void);
++         s32 board = mp4web_debug_board() - 1;
++         if (omovlevtno == 0 && board >= 0 && board <= 6) {
++             BootInitForSkippedSequence();
++             for (i = 0; i < 4; i++) {
++                 GWPlayerCfg[i].character = i;
++                 GWPlayerCfg[i].pad_idx = i;
++                 GWPlayerCfg[i].diff = 0;
++                 GWPlayerCfg[i].group = 0;
++                 GWPlayerCfg[i].iscom = (i != 0);
++             }
++             BoardPartyConfigSet(0, 1, 0, 10, 0, 0, 0, 0);
++             BoardSaveInit(board);
++             for (i = 0; i < 4; i++) {
++                 CharMotionInit(GWPlayerCfg[i].character);
++             }
++             OSReport("[mp4web] crash sweep: board %d (overlay %d)\n", (int)board, (int)(DLL_w01dll + board));
++             omOvlCallEx(DLL_w01dll + board, 1, 0, 0);
++             HuPrcEnd();
++             do {
++                 HuPrcVSleep();
++             } while (1);
++         }
++     }
++#endif
+ #ifdef TARGET_PC
+      if (omovlevtno == 0 && partyboard_settings_skipBootSequence()) {
+          for (i = 0; i < 4; i++) {
+diff --git a/src/REL/m418Dll/main.c b/src/REL/m418Dll/main.c
+index c05b5b2..df3b2fb 100644
+--- a/src/REL/m418Dll/main.c
++++ b/src/REL/m418Dll/main.c
+@@ -1432,11 +1432,12 @@ s32 fn_1_5D58(void)
+ 
+     var_r31 = 0;
+     if (lbl_1_bss_50.unk10 != NULL) {
+-        lbl_1_bss_50.unk10();
++        // port: the sequence callbacks are void(s32) (the arg is unused); a call through void(void) traps in wasm
++        ((M418DllInFunc)lbl_1_bss_50.unk10)(0);
+         lbl_1_bss_50.unk10 = NULL;
+     }
+     if (lbl_1_bss_50.unk14 != NULL) {
+-        var_r31 = lbl_1_bss_50.unk14();
++        var_r31 = ((M418DllInRetFunc)lbl_1_bss_50.unk14)(0);
+     }
+     return var_r31;
+ }
+@@ -2227,11 +2228,12 @@ s32 fn_1_84B0(void)
+ 
+     var_r31 = 0;
+     if (lbl_1_bss_38.unk10 != NULL) {
+-        lbl_1_bss_38.unk10();
++        // port: the sequence callbacks are void(s32) (the arg is unused); a call through void(void) traps in wasm
++        ((M418DllInFunc)lbl_1_bss_38.unk10)(0);
+         lbl_1_bss_38.unk10 = NULL;
+     }
+     if (lbl_1_bss_38.unk14 != NULL) {
+-        var_r31 = lbl_1_bss_38.unk14();
++        var_r31 = ((M418DllInRetFunc)lbl_1_bss_38.unk14)(0);
+     }
+     return var_r31;
+ }
+@@ -2599,11 +2601,12 @@ s32 fn_1_9364(void)
+ 
+     var_r31 = 0;
+     if (lbl_1_bss_20.unk10 != NULL) {
+-        lbl_1_bss_20.unk10();
++        // port: the sequence callbacks are void(s32) (the arg is unused); a call through void(void) traps in wasm
++        ((M418DllInFunc)lbl_1_bss_20.unk10)(0);
+         lbl_1_bss_20.unk10 = NULL;
+     }
+     if (lbl_1_bss_20.unk14 != NULL) {
+-        var_r31 = lbl_1_bss_20.unk14();
++        var_r31 = ((M418DllInRetFunc)lbl_1_bss_20.unk14)(0);
+     }
+     return var_r31;
+ }
 diff --git a/src/REL/m420dll/main.c b/src/REL/m420dll/main.c
 index 944cafd..d6ebdec 100644
 --- a/src/REL/m420dll/main.c
@@ -124,8 +265,108 @@ index 944cafd..d6ebdec 100644
      fn_1_4964();
      fn_1_D98();
      fn_1_D14(0, 1);
+diff --git a/src/REL/m435Dll/main.c b/src/REL/m435Dll/main.c
+index 33125f0..c122a98 100755
+--- a/src/REL/m435Dll/main.c
++++ b/src/REL/m435Dll/main.c
+@@ -19,6 +19,12 @@
+ 
+ #include "ext_math.h"
+ #include "version.h"
++#ifdef TARGET_PC
++// port: these callbacks are stored through (void *) into function pointers of another type; a wasm
++// call_indirect traps on any signature mismatch, so each goes through a wrapper of the stored type
++// that calls the real function with the arguments it takes (the extra ones were never read)
++static void fn_1_B1F4_mp4w(struct om_obj_data * a0);
++#endif
+ 
+ s32 rand8(void);
+ #ifndef __MWERKS__
+@@ -2525,7 +2531,7 @@ void fn_1_B950(omObjData *arg0) {
+         var_r29->unk88[i] = 0.0f;
+     }
+     var_r29->unk04 = 1;
+-    arg0->func = (void*) fn_1_B1F4; // fn_1_B1F4 must return s32 to match
++    arg0->func = (void *)fn_1_B1F4_mp4w; // fn_1_B1F4 must return s32 to match
+ }
+ 
+ void fn_1_BBE8(void) {
+@@ -4285,3 +4291,7 @@ void fn_1_14A54(void) {
+ void ObjectSetup(void) {
+     fn_1_14A54();
+ }
++
++#ifdef TARGET_PC
++static void fn_1_B1F4_mp4w(struct om_obj_data * a0) { fn_1_B1F4(a0); }
++#endif
+diff --git a/src/REL/m436Dll/main.c b/src/REL/m436Dll/main.c
+index 0265a0e..655facc 100755
+--- a/src/REL/m436Dll/main.c
++++ b/src/REL/m436Dll/main.c
+@@ -16,6 +16,12 @@
+ #include "ext_math.h"
+ #include "version.h"
+ #include <string.h>
++#ifdef TARGET_PC
++// port: these callbacks are stored through (void *) into function pointers of another type; a wasm
++// call_indirect traps on any signature mismatch, so each goes through a wrapper of the stored type
++// that calls the real function with the arguments it takes (the extra ones were never read)
++static void fn_1_62C4_mp4w(struct om_obj_data * a0);
++#endif
+ 
+ s32 rand8(void);
+ #ifndef __MWERKS__
+@@ -1572,7 +1578,7 @@ void fn_1_68E8(omObjData *arg0)
+ 
+     var_r30 = &lbl_1_bss_1A8;
+     fn_1_11818(var_r30->unk00, 0, 8, 5, 0);
+-    arg0->func = (void *)fn_1_62C4; // fn_1_62C4 must return s32 to match
++    arg0->func = (void *)fn_1_62C4_mp4w; // fn_1_62C4 must return s32 to match
+ }
+ 
+ void fn_1_6944(omObjData *arg0)
+@@ -1602,7 +1608,7 @@ void fn_1_6944(omObjData *arg0)
+         var_r29->unk88[i] = 0.0f;
+     }
+     var_r29->unk04 = 1;
+-    arg0->func = (void *)fn_1_62C4; // fn_1_62C4 must return s32 to match
++    arg0->func = (void *)fn_1_62C4_mp4w; // fn_1_62C4 must return s32 to match
+ }
+ 
+ void fn_1_6BDC(void)
+@@ -3311,3 +3317,7 @@ void ObjectSetup(void)
+ {
+     fn_1_108DC();
+ }
++
++#ifdef TARGET_PC
++static void fn_1_62C4_mp4w(struct om_obj_data * a0) { fn_1_62C4(a0); }
++#endif
+diff --git a/src/REL/m449Dll/main.c b/src/REL/m449Dll/main.c
+index 1986d49..124330f 100644
+--- a/src/REL/m449Dll/main.c
++++ b/src/REL/m449Dll/main.c
+@@ -177,8 +177,18 @@ s32 lbl_1_data_23C[0xA] = {
+ UnkBss64Struct lbl_1_bss_64[12];
+ omObjData *lbl_1_bss_60;
+ omObjData *lbl_1_bss_5C;
++#ifdef TARGET_PC
++// port: the game indexes the two player objects as (&lbl_1_bss_54)[i], which relies on lbl_1_bss_58
++// sitting right after lbl_1_bss_54 (true in the GameCube's .bss). Nothing promises that here -- in the
++// web build the second write landed on lbl_1_bss_50 (the stage object), so the players looked their
++// start positions up on model -1 and faulted. An array makes the layout the code assumes real.
++omObjData *lbl_1_bss_54_58[2];
++#define lbl_1_bss_54 lbl_1_bss_54_58[0]
++#define lbl_1_bss_58 lbl_1_bss_54_58[1]
++#else
+ omObjData *lbl_1_bss_58;
+ omObjData *lbl_1_bss_54;
++#endif
+ omObjData *lbl_1_bss_50;
+ s32 lbl_1_bss_4C;
+ s32 lbl_1_bss_48;
 diff --git a/src/REL/mentDll/main.c b/src/REL/mentDll/main.c
-index 32cd713..20cfb9a 100644
+index 32cd713..9317cbe 100644
 --- a/src/REL/mentDll/main.c
 +++ b/src/REL/mentDll/main.c
 @@ -45,7 +45,12 @@ typedef struct MentDllUnkBss16C4Struct {
@@ -141,7 +382,18 @@ index 32cd713..20cfb9a 100644
  
  typedef struct MentDllUnkBss3114Struct {
      /* 0x00 */ omObjData *unk_00;
-@@ -1256,11 +1261,11 @@ s32 fn_1_99CC(void)
+@@ -681,7 +686,9 @@ void fn_1_7A14(void)
+     }
+ }
+ 
+-void fn_1_81A8(omObjData *arg0, void *arg1, void *arg2)
++// port: called through MentDllUnkFunc (omObjData *, void *); the third parameter was never passed
++// (and is unused), and a mismatched call_indirect traps in wasm
++void fn_1_81A8(omObjData *arg0, void *arg1)
+ {
+     fn_1_1F868();
+     lbl_1_bss_3114->unk_04 = NULL;
+@@ -1256,11 +1263,11 @@ s32 fn_1_99CC(void)
  
          for (i = 0; i < 6; i++) {
              lbl_1_bss_33AC[i].unk_08 = 0;
@@ -156,10 +408,22 @@ index 32cd713..20cfb9a 100644
              fn_1_4D8();
              for (i = 0; i < 6; i++) {
 diff --git a/src/REL/mgmodedll/main.c b/src/REL/mgmodedll/main.c
-index ded0a59..f47ac39 100755
+index ded0a59..2745a4b 100755
 --- a/src/REL/mgmodedll/main.c
 +++ b/src/REL/mgmodedll/main.c
-@@ -8,7 +8,12 @@ extern s32 rand8(void);
+@@ -3,12 +3,24 @@
+ #include "game/wipe.h"
+ 
+ #include "ext_math.h"
++#ifdef TARGET_PC
++// port: these callbacks are stored through (void *) into function pointers of another type; a wasm
++// call_indirect traps on any signature mismatch, so each goes through a wrapper of the stored type
++// that calls the real function with the arguments it takes (the extra ones were never read)
++static void fn_1_19F5C_mp4w(omObjData * a0, void * a1);
++static void fn_1_1F32C_mp4w(omObjData * a0, void * a1);
++#endif
+ 
+ extern s32 rand8(void);
  
  typedef struct {
      /* 0x00 */ omObjData *unk00;
@@ -172,8 +436,35 @@ index ded0a59..f47ac39 100755
      /* 0x08 */ s32 unk08[4];
      /* 0x18 */ char unk18[4];
      /* 0x1C */ s32 unk1C[4];
+@@ -1641,7 +1653,7 @@ s32 fn_1_20970(void)
+     HuSprPosSet(temp_r28, 8, lbl_1_data_32C[0][0] - 50, lbl_1_data_32C[0][1]);
+     HuSprAttrReset(temp_r28, 9, HUSPR_ATTR_DISPOFF);
+     HuSprPosSet(temp_r28, 9, lbl_1_data_32C[3][0] + 50, lbl_1_data_32C[0][1]);
+-    lbl_1_bss_2050.unk04 = (void *)fn_1_19F5C;
++    lbl_1_bss_2050.unk04 = (void *)fn_1_19F5C_mp4w;
+     var_r24 = 99;
+     var_r23 = 0;
+     while (TRUE) {
+@@ -2038,7 +2050,7 @@ s32 fn_1_2228C(s32 arg0)
+     fn_1_243B0();
+     fn_1_25CA8(MAKE_MESSID(26, 33));
+     fn_1_1FC44(0);
+-    lbl_1_bss_2050.unk04 = (void *)fn_1_1F32C;
++    lbl_1_bss_2050.unk04 = (void *)fn_1_1F32C_mp4w;
+     var_r26 = 99;
+     while (TRUE) {
+         fn_1_243B0();
+@@ -2802,3 +2814,8 @@ void fn_1_26790(s32 arg0, s32 arg1, float arg2, float arg3)
+ {
+     HuSprPosSet(arg0, arg1, arg2, arg3 + 0.5f);
+ }
++
++#ifdef TARGET_PC
++static void fn_1_19F5C_mp4w(omObjData * a0, void * a1) { fn_1_19F5C(a0); }
++static void fn_1_1F32C_mp4w(omObjData * a0, void * a1) { fn_1_1F32C(a0); }
++#endif
 diff --git a/src/REL/mpexDll/charsel.c b/src/REL/mpexDll/charsel.c
-index 8f56832..08f7f78 100644
+index 8f56832..4de4da7 100644
 --- a/src/REL/mpexDll/charsel.c
 +++ b/src/REL/mpexDll/charsel.c
 @@ -11,7 +11,12 @@
@@ -189,6 +480,39 @@ index 8f56832..08f7f78 100644
  
  typedef struct MpexDllUnkStruct4 {
      /* 0x00 */ omObjData *unk_00;
+@@ -41,8 +46,8 @@ void fn_1_14EF0(void);
+ void fn_1_151C8(void);
+ void fn_1_154A4(void);
+ void fn_1_15774(void);
+-void fn_1_157C4(void);
+-void fn_1_15D48(void);
++void fn_1_157C4(omObjData *arg0, void *arg1);
++void fn_1_15D48(omObjData *arg0, void *arg1);
+ void fn_1_16320(void);
+ void fn_1_16600(s32 arg0);
+ void fn_1_16874(s32);
+@@ -1313,7 +1318,9 @@ void fn_1_15774(void)
+     HuSprAttrSet(var_r31, 2, 4);
+ }
+ 
+-void fn_1_157C4(void)
++// port: called through MpexDllUnkFunc2 (omObjData *, void *); both arguments are unused, and a
++// mismatched call_indirect traps in wasm
++void fn_1_157C4(omObjData *arg0, void *arg1)
+ {
+     float var_f31;
+     float var_f30;
+@@ -1422,7 +1429,9 @@ void fn_1_157C4(void)
+     lbl_1_bss_5DC.unk_28 = 0;
+ }
+ 
+-void fn_1_15D48(void)
++// port: called through MpexDllUnkFunc2 (omObjData *, void *); both arguments are unused, and a
++// mismatched call_indirect traps in wasm
++void fn_1_15D48(omObjData *arg0, void *arg1)
+ {
+     float var_f31;
+     float var_f30;
 diff --git a/src/REL/mpexDll/mpex.c b/src/REL/mpexDll/mpex.c
 index c952a94..ea9ec98 100644
 --- a/src/REL/mpexDll/mpex.c
@@ -206,11 +530,237 @@ index c952a94..ea9ec98 100644
  
  typedef struct MpexDllUnkStruct3 {
      /* 0x00 */ s32 unk_00;
+diff --git a/src/REL/mstory3Dll/result.c b/src/REL/mstory3Dll/result.c
+index c1bf76e..48a67b6 100755
+--- a/src/REL/mstory3Dll/result.c
++++ b/src/REL/mstory3Dll/result.c
+@@ -19,6 +19,12 @@
+ #include "game/sprite.h"
+ #include "game/window.h"
+ #include "game/wipe.h"
++#ifdef TARGET_PC
++// port: these callbacks are stored through (void *) into function pointers of another type; a wasm
++// call_indirect traps on any signature mismatch, so each goes through a wrapper of the stored type
++// that calls the real function with the arguments it takes (the extra ones were never read)
++static void fn_1_18CFC_mp4w(omObjData * a0, void * a1);
++#endif
+ 
+ extern s32 rand8(void);
+ 
+@@ -959,7 +965,7 @@ void fn_1_18F98(void) {
+     } else if (var_r30 == 5) {
+         HuSprBankSet(lbl_1_bss_19BC.unk00->work[1], 3, 0);
+     }
+-    lbl_1_bss_19BC.unk04 = (void*) fn_1_18CFC;
++    lbl_1_bss_19BC.unk04 = (void *)fn_1_18CFC_mp4w;
+ }
+ 
+ void fn_1_19144(void) {
+@@ -1626,3 +1632,7 @@ void fn_1_1DE4C(void) {
+     var_r31->unk20.z = 0.0f;
+     var_r31->unk38 = 650.0f;
+ }
++
++#ifdef TARGET_PC
++static void fn_1_18CFC_mp4w(omObjData * a0, void * a1) { fn_1_18CFC(a0); }
++#endif
 diff --git a/src/REL/mstory3Dll/result_seq.c b/src/REL/mstory3Dll/result_seq.c
-index 12817dd..40905d9 100755
+index 12817dd..d54fb19 100755
 --- a/src/REL/mstory3Dll/result_seq.c
 +++ b/src/REL/mstory3Dll/result_seq.c
-@@ -1417,7 +1417,11 @@ void fn_1_D48C(void) {
+@@ -21,6 +21,28 @@
+ #include "msm/msmse.h"
+ 
+ #include "ext_math.h"
++#ifdef TARGET_PC
++// port: these callbacks are stored through (void *) into function pointers of another type; a wasm
++// call_indirect traps on any signature mismatch, so each goes through a wrapper of the stored type
++// that calls the real function with the arguments it takes (the extra ones were never read)
++static void fn_1_1036C_mp4w(omObjData * a0, void * a1);
++static void fn_1_10D74_mp4w(omObjData * a0, void * a1);
++static void fn_1_11794_mp4w(omObjData * a0, void * a1);
++static void fn_1_11834_mp4w(omObjData * a0, void * a1);
++static void fn_1_123D8_mp4w(omObjData * a0, void * a1);
++static void fn_1_1241C_mp4w(omObjData * a0, void * a1);
++static void fn_1_12420_mp4w(omObjData * a0, void * a1);
++static void fn_1_13A38_mp4w(omObjData * a0, void * a1);
++static void fn_1_93D0_mp4w(omObjData * a0, void * a1);
++static void fn_1_96B0_mp4w(omObjData * a0, void * a1);
++static void fn_1_9990_mp4w(omObjData * a0, void * a1);
++static void fn_1_9A08_mp4w(omObjData * a0, void * a1);
++static void fn_1_BE5C_mp4w(omObjData * a0, void * a1);
++static void fn_1_BF60_mp4w(omObjData * a0, void * a1);
++static void fn_1_CE6C_mp4w(omObjData * a0, void * a1);
++static void fn_1_D718_mp4w(omObjData * a0, void * a1);
++static void fn_1_D7D8_mp4w(omObjData * a0, void * a1);
++#endif
+ 
+ #ifndef __MWERKS__
+ extern s32 rand8(void);
+@@ -238,11 +260,11 @@ void fn_1_7004(s32 arg0, s32 arg1, s32 arg2) {
+ 
+     temp_r27 = lbl_1_bss_1580.unk20;
+     var_r26 = arg0;
+-    lbl_1_bss_1530.unk04 = (void*) fn_1_D718;
++    lbl_1_bss_1530.unk04 = (void *)fn_1_D718_mp4w;
+     for (var_r30 = 0; var_r30 < 4; var_r30++) {
+-        lbl_1_bss_1490[var_r30].unk04 = (void*) fn_1_1241C;
++        lbl_1_bss_1490[var_r30].unk04 = (void *)fn_1_1241C_mp4w;
+     }
+-    lbl_1_bss_1468.unk04 = (void*) fn_1_13A38;
++    lbl_1_bss_1468.unk04 = (void *)fn_1_13A38_mp4w;
+     if (arg2 != 0) {
+         for (var_r31 = 0; var_r31 < 4; var_r31++) {
+             sp1C[var_r31] = lbl_1_bss_1490[var_r31].unk00->work[0];
+@@ -644,12 +666,12 @@ void fn_1_93D0(omObjData* arg0) {
+ void fn_1_9488(void) {
+     s32 var_r31;
+ 
+-    lbl_1_bss_1530.unk04 = (void*) fn_1_93D0;
++    lbl_1_bss_1530.unk04 = (void *)fn_1_93D0_mp4w;
+     do {
+         fn_1_938();
+     } while (lbl_1_bss_1580.unk18 != 99);
+     for (var_r31 = 0; var_r31 < 4; var_r31++) {
+-        lbl_1_bss_1490[var_r31].unk04 = (void*) fn_1_1036C;
++        lbl_1_bss_1490[var_r31].unk04 = (void *)fn_1_1036C_mp4w;
+         lbl_1_bss_1490[var_r31].unk18 = lbl_1_bss_1490[var_r31].unk1C = 0;
+     }
+     fn_1_12A98(0);
+@@ -700,12 +722,12 @@ void fn_1_96B0(omObjData* arg0) {
+ void fn_1_9768(void) {
+     s32 var_r31;
+ 
+-    lbl_1_bss_1530.unk04 = (void*) fn_1_96B0;
++    lbl_1_bss_1530.unk04 = (void *)fn_1_96B0_mp4w;
+     do {
+         fn_1_938();
+     } while (lbl_1_bss_1580.unk18 != 99);
+     for (var_r31 = 0; var_r31 < 4; var_r31++) {
+-        lbl_1_bss_1490[var_r31].unk04 = (void*) fn_1_10D74;
++        lbl_1_bss_1490[var_r31].unk04 = (void *)fn_1_10D74_mp4w;
+         lbl_1_bss_1490[var_r31].unk18 = lbl_1_bss_1490[var_r31].unk1C = 0;
+     }
+     fn_1_12A98(1);
+@@ -809,19 +831,19 @@ void fn_1_9A64(s32 arg0) {
+         for (var_r31 = 0; var_r31 < 4; var_r31++) {
+             for (var_r30 = 0; var_r30 < 4; var_r30++) {
+                 if (var_r31 == lbl_1_bss_1448[var_r30]) {
+-                    lbl_1_bss_1490[var_r31].unk04 = (void*) fn_1_11834;
++                    lbl_1_bss_1490[var_r31].unk04 = (void *)fn_1_11834_mp4w;
+                     lbl_1_bss_1490[var_r31].unk18 = 0;
+                     break;
+                 }
+             }
+             if (var_r30 == 4) {
+-                lbl_1_bss_1490[var_r31].unk04 = (void*) fn_1_11794;
++                lbl_1_bss_1490[var_r31].unk04 = (void *)fn_1_11794_mp4w;
+                 lbl_1_bss_1490[var_r31].unk18 = 0;
+             }
+         }
+     } else {
+         for (var_r31 = 0; var_r31 < 4; var_r31++) {
+-            lbl_1_bss_1490[var_r31].unk04 = (void*) fn_1_11794;
++            lbl_1_bss_1490[var_r31].unk04 = (void *)fn_1_11794_mp4w;
+             lbl_1_bss_1490[var_r31].unk18 = 0;
+         }
+     }
+@@ -838,27 +860,27 @@ void fn_1_9A64(s32 arg0) {
+         case 1:
+             fn_1_13D38(lbl_1_bss_1580.unk10, lbl_1_bss_1448[0], 0);
+             lbl_1_bss_1420 = 12;
+-            lbl_1_bss_1530.unk04 = (void*) fn_1_9990;
+-            lbl_1_bss_1468.unk04 = (void*) fn_1_9A08;
++            lbl_1_bss_1530.unk04 = (void *)fn_1_9990_mp4w;
++            lbl_1_bss_1468.unk04 = (void *)fn_1_9A08_mp4w;
+             break;
+         case 2:
+             fn_1_13D38(lbl_1_bss_1580.unk10, lbl_1_bss_1448[0], 0);
+             fn_1_13D38(lbl_1_bss_1580.unk10, lbl_1_bss_1448[1], 1);
+             lbl_1_bss_1420 = 13;
+-            lbl_1_bss_1530.unk04 = (void*) fn_1_9990;
+-            lbl_1_bss_1468.unk04 = (void*) fn_1_9A08;
++            lbl_1_bss_1530.unk04 = (void *)fn_1_9990_mp4w;
++            lbl_1_bss_1468.unk04 = (void *)fn_1_9A08_mp4w;
+             break;
+         case 3:
+             fn_1_13D38(lbl_1_bss_1580.unk10, lbl_1_bss_1448[0], 0);
+             fn_1_13D38(lbl_1_bss_1580.unk10, lbl_1_bss_1448[1], 1);
+             fn_1_13D38(lbl_1_bss_1580.unk10, lbl_1_bss_1448[2], 2);
+             lbl_1_bss_1420 = 14;
+-            lbl_1_bss_1530.unk04 = (void*) fn_1_9990;
+-            lbl_1_bss_1468.unk04 = (void*) fn_1_9A08;
++            lbl_1_bss_1530.unk04 = (void *)fn_1_9990_mp4w;
++            lbl_1_bss_1468.unk04 = (void *)fn_1_9A08_mp4w;
+             break;
+         case 4:
+             HuAudFXFadeOut(lbl_1_bss_68[0], 500);
+-            lbl_1_bss_1468.unk04 = (void*) fn_1_9A08;
++            lbl_1_bss_1468.unk04 = (void *)fn_1_9A08_mp4w;
+             if (lbl_1_bss_1580.unkC4[lbl_1_bss_1448[0]].unk00.unk2C == 0 && arg0 == 2) {
+                 fn_1_13C78(lbl_1_bss_1580.unk10, 26, 3);
+             } else {
+@@ -916,7 +938,7 @@ s32 fn_1_A314(void) {
+     }
+     lbl_1_bss_68[0] = HuAudFXPlay(0x9E);
+     lbl_1_bss_B0 = 1.0f;
+-    lbl_1_bss_1530.unk04 = (void*) fn_1_D7D8;
++    lbl_1_bss_1530.unk04 = (void *)fn_1_D7D8_mp4w;
+     fn_1_7004(0x40, 30, 0);
+     fn_1_8C18();
+     lbl_1_bss_AC = 125.0f;
+@@ -958,7 +980,7 @@ void fn_1_A4F0(void) {
+         lbl_1_bss_1438[var_r31] = lbl_1_bss_1428[var_r31] = -1;
+     }
+     for (var_r31 = 0; var_r31 < lbl_1_bss_1458[0]; var_r31++) {
+-        lbl_1_bss_1490[lbl_1_bss_1448[var_r31]].unk04 = (void*) fn_1_123D8;
++        lbl_1_bss_1490[lbl_1_bss_1448[var_r31]].unk04 = (void *)fn_1_123D8_mp4w;
+         lbl_1_bss_1490[lbl_1_bss_1448[var_r31]].unk18 = 0;
+     }
+     do {
+@@ -1009,7 +1031,7 @@ void fn_1_ABAC(void) {
+     s32 var_r31;
+ 
+     for (var_r31 = 0; var_r31 < 4; var_r31++) {
+-        lbl_1_bss_1490[var_r31].unk04 = (void*) fn_1_12420;
++        lbl_1_bss_1490[var_r31].unk04 = (void *)fn_1_12420_mp4w;
+     }
+     do {
+         fn_1_938();
+@@ -1136,7 +1158,7 @@ void fn_1_B788(void) {
+     lbl_1_bss_1448[0] = 0;
+     lbl_1_bss_1448[1] = 2;
+     for (var_r31 = 0; var_r31 < lbl_1_bss_1458[0]; var_r31++) {
+-        lbl_1_bss_1490[lbl_1_bss_1448[var_r31]].unk04 = (void*) fn_1_123D8;
++        lbl_1_bss_1490[lbl_1_bss_1448[var_r31]].unk04 = (void *)fn_1_123D8_mp4w;
+         lbl_1_bss_1490[lbl_1_bss_1448[var_r31]].unk18 = 0;
+     }
+     do {
+@@ -1274,7 +1296,7 @@ void fn_1_C060(float arg8) {
+         Hu3DModelPosSet(lbl_1_bss_1530.unk00->model[20], var_f31, var_f30, 460.0f);
+         Hu3DModelRotSet(lbl_1_bss_1530.unk00->model[20], 0.0f, temp_f29, 0.0f);
+     }
+-    lbl_1_bss_1530.unk04 = (void*) fn_1_BE5C;
++    lbl_1_bss_1530.unk04 = (void *)fn_1_BE5C_mp4w;
+     fn_1_958(30);
+     fn_1_1E28(lbl_1_bss_1530.unk00, 20, 20, 0, 0);
+     fn_1_958(30);
+@@ -1324,7 +1346,7 @@ void fn_1_C060(float arg8) {
+         Hu3DModelTPLvlSet(lbl_1_bss_1530.unk00->model[22], var_f28);
+     }
+     lbl_1_bss_B8 = 0;
+-    lbl_1_bss_1530.unk04 = (void*) fn_1_BF60;
++    lbl_1_bss_1530.unk04 = (void *)fn_1_BF60_mp4w;
+     fn_1_958(30);
+     Hu3DParManKill(lbl_1_data_364);
+     lbl_1_data_364 = -1;
+@@ -1412,12 +1434,16 @@ void fn_1_D48C(void) {
+ 
+     temp_r3 = omAddObjEx(lbl_1_bss_A8, 0x100, 16, 16, -1, NULL);
+     lbl_1_bss_1558.unk00 = temp_r3;
+-    lbl_1_bss_1558.unk04 = (void*) fn_1_CE6C;
++    lbl_1_bss_1558.unk04 = (void *)fn_1_CE6C_mp4w;
+     lbl_1_bss_1558.unk00->data = &lbl_1_bss_1558;
      while (TRUE) {
          fn_1_938();
          if (lbl_1_bss_1558.unk04 != NULL) {
@@ -222,7 +772,7 @@ index 12817dd..40905d9 100755
          }
      }
  }
-@@ -1770,7 +1774,11 @@ void fn_1_FE80(void) {
+@@ -1770,7 +1796,11 @@ void fn_1_FE80(void) {
      while (TRUE) {
          fn_1_938();
          if (lbl_1_bss_1530.unk04 != NULL) {
@@ -234,7 +784,7 @@ index 12817dd..40905d9 100755
          }
          fn_1_D7D8(temp_r31);
      }
-@@ -2474,7 +2482,11 @@ void fn_1_13908(void) {
+@@ -2474,7 +2504,11 @@ void fn_1_13908(void) {
      while (TRUE) {
          fn_1_938();
          if (lbl_1_bss_1490[temp_r31].unk04 != NULL) {
@@ -246,7 +796,7 @@ index 12817dd..40905d9 100755
          }
      }
  }
-@@ -2674,7 +2686,11 @@ void fn_1_140A0(void) {
+@@ -2674,7 +2708,11 @@ void fn_1_140A0(void) {
      while (TRUE) {
          fn_1_938();
          if (lbl_1_bss_1468.unk04 != NULL) {
@@ -258,11 +808,100 @@ index 12817dd..40905d9 100755
          }
      }
  }
+@@ -2936,3 +2974,23 @@ void fn_1_15450(s32 arg0) {
+     fn_1_14700(temp_r3);
+     fn_1_14F80(temp_r3_2);
+ }
++
++#ifdef TARGET_PC
++static void fn_1_1036C_mp4w(omObjData * a0, void * a1) { fn_1_1036C(a0); }
++static void fn_1_10D74_mp4w(omObjData * a0, void * a1) { fn_1_10D74(a0); }
++static void fn_1_11794_mp4w(omObjData * a0, void * a1) { fn_1_11794(a0); }
++static void fn_1_11834_mp4w(omObjData * a0, void * a1) { fn_1_11834(a0); }
++static void fn_1_123D8_mp4w(omObjData * a0, void * a1) { fn_1_123D8(a0); }
++static void fn_1_1241C_mp4w(omObjData * a0, void * a1) { fn_1_1241C(a0); }
++static void fn_1_12420_mp4w(omObjData * a0, void * a1) { fn_1_12420(a0); }
++static void fn_1_13A38_mp4w(omObjData * a0, void * a1) { fn_1_13A38(a0); }
++static void fn_1_93D0_mp4w(omObjData * a0, void * a1) { fn_1_93D0(a0); }
++static void fn_1_96B0_mp4w(omObjData * a0, void * a1) { fn_1_96B0(a0); }
++static void fn_1_9990_mp4w(omObjData * a0, void * a1) { fn_1_9990(a0); }
++static void fn_1_9A08_mp4w(omObjData * a0, void * a1) { fn_1_9A08(a0); }
++static void fn_1_BE5C_mp4w(omObjData * a0, void * a1) { fn_1_BE5C(); }
++static void fn_1_BF60_mp4w(omObjData * a0, void * a1) { fn_1_BF60(); }
++static void fn_1_CE6C_mp4w(omObjData * a0, void * a1) { fn_1_CE6C(a0); }
++static void fn_1_D718_mp4w(omObjData * a0, void * a1) { fn_1_D718(a0); }
++static void fn_1_D7D8_mp4w(omObjData * a0, void * a1) { fn_1_D7D8(a0); }
++#endif
+diff --git a/src/REL/w02Dll/roulette.c b/src/REL/w02Dll/roulette.c
+index ec5d09c..9732bf9 100644
+--- a/src/REL/w02Dll/roulette.c
++++ b/src/REL/w02Dll/roulette.c
+@@ -17,6 +17,12 @@
+ #include "game/board/com.h"
+ #include "game/board/player.h"
+ #include "game/board/view.h"
++#ifdef TARGET_PC
++// port: these callbacks are stored through (void *) into function pointers of another type; a wasm
++// call_indirect traps on any signature mismatch, so each goes through a wrapper of the stored type
++// that calls the real function with the arguments it takes (the extra ones were never read)
++static void fn_1_BE74_mp4w(void);
++#endif
+ #endif
+ 
+ /* DATA */
+@@ -824,8 +830,12 @@ void fn_1_E41C(void)
+     lbl_1_bss_388 = GWSystem.player_curr;
+     OSReport("Roulette Player %d\n", lbl_1_bss_388);
+     lbl_1_bss_38C = HuPrcChildCreate(fn_1_BCFC, 8195, 8192, 0, boardMainProc);
+-    HuPrcDestructorSet2(lbl_1_bss_38C, (void *)fn_1_BE74); // fn_1_BE74 requires implicit return
++    HuPrcDestructorSet2(lbl_1_bss_38C, (void *)fn_1_BE74_mp4w); // fn_1_BE74 requires implicit return
+     while (lbl_1_bss_38C) {
+         HuPrcVSleep();
+     }
+ }
++
++#ifdef TARGET_PC
++static void fn_1_BE74_mp4w(void) { fn_1_BE74(); }
++#endif
+diff --git a/src/REL/w02Dll/shuffleboard.c b/src/REL/w02Dll/shuffleboard.c
+index 2a6fab7..152d64e 100644
+--- a/src/REL/w02Dll/shuffleboard.c
++++ b/src/REL/w02Dll/shuffleboard.c
+@@ -9,6 +9,12 @@
+ 
+ #ifndef __MWERKS__
+ #include "game/board/audio.h"
++#ifdef TARGET_PC
++// port: these callbacks are stored through (void *) into function pointers of another type; a wasm
++// call_indirect traps on any signature mismatch, so each goes through a wrapper of the stored type
++// that calls the real function with the arguments it takes (the extra ones were never read)
++static void fn_1_94AC_mp4w(void);
++#endif
+ #endif
+ 
+ 
+@@ -89,7 +95,7 @@ void fn_1_93C8(u32 arg0)
+ 	lbl_1_bss_36E = GWSystem.player_curr;
+ 	BoardPlayerPostTurnHookSet(lbl_1_bss_36E, fn_1_9250);
+ 	lbl_1_bss_378 = HuPrcCreate(fn_1_94C0, 8196, 8192, 0);
+-	HuPrcDestructorSet2(lbl_1_bss_378, (void *)fn_1_94AC);
++	HuPrcDestructorSet2(lbl_1_bss_378, (void *)fn_1_94AC_mp4w);
+ 	while(lbl_1_bss_378) {
+ 		HuPrcVSleep();
+ 	}
+@@ -588,3 +594,7 @@ void fn_1_BB30(void)
+ 	}
+ 	
+ }
++
++#ifdef TARGET_PC
++static void fn_1_94AC_mp4w(void) { fn_1_94AC(); }
++#endif
 diff --git a/src/REL/w03Dll/main.c b/src/REL/w03Dll/main.c
-index 20cab22..236cb94 100644
+index 20cab22..5705478 100644
 --- a/src/REL/w03Dll/main.c
 +++ b/src/REL/w03Dll/main.c
-@@ -32,7 +32,15 @@ void fn_1_AF8(void);
+@@ -32,8 +32,16 @@ void fn_1_AF8(void);
  void fn_1_DEC(void);
  void fn_1_10B0(void);
  void fn_1_10E4(omObjData* arg0);
@@ -274,10 +913,12 @@ index 20cab22..236cb94 100644
 +static inline s32 w03_statue_event(void) { fn_1_12C8(); return 1; }
 +#else
  s32 fn_1_12C8(void);
+-s32 fn_1_2930(s32 arg0);
 +#endif
- s32 fn_1_2930(s32 arg0);
++s32 fn_1_2930(void);
  
  #ifndef __MWERKS__
+ void fn_1_3058(void);
 @@ -328,7 +336,13 @@ s32 fn_1_A74(void) {
  }
  
@@ -293,6 +934,55 @@ index 20cab22..236cb94 100644
          BoardJunctionMaskSet(0xC00);
      }
  }
+diff --git a/src/REL/w03Dll/statue.c b/src/REL/w03Dll/statue.c
+index 6e7eb71..0eff957 100644
+--- a/src/REL/w03Dll/statue.c
++++ b/src/REL/w03Dll/statue.c
+@@ -583,7 +583,9 @@ void fn_1_2818(void)
+     HuPrcSleep(0x3C);
+ }
+ 
+-s32 fn_1_2930(s32 arg0)
++// port: a pre-turn hook, called as s32() with no arguments (arg0 was never passed or read); a wasm
++// call_indirect traps when the callee takes a parameter the call does not supply
++s32 fn_1_2930(void)
+ {
+     lbl_1_bss_0->unk0--;
+ 
+diff --git a/src/REL/w05Dll/mg_coin.c b/src/REL/w05Dll/mg_coin.c
+index 79fc26e..5046a06 100644
+--- a/src/REL/w05Dll/mg_coin.c
++++ b/src/REL/w05Dll/mg_coin.c
+@@ -84,7 +84,7 @@ void fn_1_97AC(void)
+         lbl_1_bss_D6[var_r31] = BoardModelCreate(DATA_MAKE_NUM(DATADIR_BOARD, 0x0A), NULL, 1);
+         BoardModelVisibilitySet(lbl_1_bss_D6[var_r31], 0);
+     }
+-    BoardPlayerPostTurnHookSet(lbl_1_bss_C0, (s32(*)())fn_1_9B74);
++    BoardPlayerPostTurnHookSet(lbl_1_bss_C0, fn_1_9B74);
+     lbl_1_bss_CC = omAddObjEx(boardObjMan, 0x101, 0U, 0U, -1, fn_1_9A68);
+     lbl_1_bss_D0 = omAddObjEx(boardObjMan, 0x101, 0U, 0U, -1, fn_1_9C24);
+     lbl_1_bss_C6 = 0;
+@@ -118,14 +118,18 @@ void fn_1_9AF0(void)
+     BoardMGDoneFlagSet(0);
+ }
+ 
+-void fn_1_9B74(void)
++// port: the post-turn hook is s32(); the original is void and returns whatever r3 holds, which the
++// disc's w05Dll.rel (0x9c0c: bl BoardModelAttrReset; epilogue keeps r3) shows is BoardModelAttrReset's
++// result. Returning it keeps the hook's clear-or-rerun decision exact (and a void callee called as
++// s32() traps in wasm).
++s32 fn_1_9B74(void)
+ {
+     HSFOBJECT *var_r31;
+     omDelObjEx(boardObjMan, lbl_1_bss_C8);
+     BoardModelKill(lbl_1_bss_FE);
+     var_r31 = Hu3DModelObjPtrGet(BoardModelIDGet(lbl_1_bss_14[1]), lbl_1_data_464[lbl_1_bss_B8]);
+     var_r31->type = lbl_1_bss_BC;
+-    BoardModelAttrReset(lbl_1_bss_14[1], 0x40000004);
++    return BoardModelAttrReset(lbl_1_bss_14[1], 0x40000004);
+ }
+ 
+ void fn_1_9C24(omObjData *arg0)
 diff --git a/src/REL/ztardll/select.c b/src/REL/ztardll/select.c
 index e123e1d..34e1035 100644
 --- a/src/REL/ztardll/select.c
@@ -331,8 +1021,42 @@ index b5b8317..5e1fed1 100644
  
  
  void HuAudSndGrpSetSet(s16 grpSet) {
+diff --git a/src/game/board/boo.c b/src/game/board/boo.c
+index 335d36a..2cee691 100755
+--- a/src/game/board/boo.c
++++ b/src/game/board/boo.c
+@@ -20,6 +20,12 @@
+ 
+ #include "ext_math.h"
+ #include <string.h>
++#ifdef TARGET_PC
++// port: these callbacks are stored through (void *) into function pointers of another type; a wasm
++// call_indirect traps on any signature mismatch, so each goes through a wrapper of the stored type
++// that calls the real function with the arguments it takes (the extra ones were never read)
++static void BallRenderHook_mp4w(HU3DMODEL * a0, f32 (*a1)[4]);
++#endif
+ 
+ typedef struct {
+     struct {
+@@ -566,7 +572,7 @@ static void CreateBallView(void) {
+     temp_r29 = temp_r31->unk08->bmp;
+     temp_r29->data = HuMemDirectMallocNum(HEAP_SYSTEM, 0x3200, MEMORY_DEFAULT_NUM);
+     memset(temp_r29->data, 0, 0x3200);
+-    temp_r31->unk04 = Hu3DHookFuncCreate((void*) BallRenderHook);
++    temp_r31->unk04 = Hu3DHookFuncCreate((void *)BallRenderHook_mp4w);
+     Hu3DModelLayerSet(temp_r31->unk04, 3);
+     Hu3DModelCameraSet(temp_r31->unk04, 1);
+     temp_r31->unk06 = Hu3DProjectionCreate(temp_r31->unk08, 25.0f, 100.0f, 13000.0f);
+@@ -1496,3 +1502,7 @@ static void UpdatePlayerCoins(void) {
+     }
+     BoardPlayerCoinsAdd(stealTarget, -stealValue);
+ }
++
++#ifdef TARGET_PC
++static void BallRenderHook_mp4w(HU3DMODEL * a0, f32 (*a1)[4]) { BallRenderHook(); }
++#endif
 diff --git a/src/game/board/space.c b/src/game/board/space.c
-index 713a00a..6272695 100644
+index 713a00a..b003595 100644
 --- a/src/game/board/space.c
 +++ b/src/game/board/space.c
 @@ -27,9 +27,18 @@
@@ -354,6 +1078,77 @@ index 713a00a..6272695 100644
  extern void BoardBlockHouseExec(s32 player, s32 space); // wrong
  
  static BoardSpace spaceData[2][256];
+@@ -333,8 +342,16 @@ static inline s32 BoardStarSpaceTypeGet(s16 index)
+ 
+ void BoardSpaceStarSetIndex(s32 index)
+ {
++#ifdef TARGET_PC
++    // port: when the star space has no host link (w10, the tutorial board) the getters leave these
++    // unset and the GameCube positions the platform from stack garbage; reading an uninitialised
++    // rot.y is undefined behaviour that clang compiles to a trap, so start them at zero
++    Vec pos = {0.0f, 0.0f, 0.0f};
++    Vec rot = {0.0f, 0.0f, 0.0f};
++#else
+     Vec pos;
+     Vec rot;
++#endif
+     s16 space;
+     if (_CheckFlag(FLAG_ID_MAKE(1, 1))) {
+         BoardSpaceTypeSet(0, boardSpaceStarTbl[GWSystem.star_pos], 1);
+diff --git a/src/game/hsfman.c b/src/game/hsfman.c
+index 7c6e592..7bf5e34 100644
+--- a/src/game/hsfman.c
++++ b/src/game/hsfman.c
+@@ -29,6 +29,9 @@ SHARED_SYM HU3DCAMERA Hu3DCamera[HU3D_CAM_MAX];
+ static s16 layerNum[8];
+ static void (*layerHook[8])(s16);
+ ANIMDATA *reflectAnim[5];
++#ifdef BYTESWAPPING
++static ANIMDATA *reflectAnimDefault0;   // web port: the built-in map, restored by Hu3DAllKill
++#endif
+ SHARED_SYM ANIMDATA *hiliteAnim[4];
+ HU3DPROJECTION Hu3DProjection[4];
+ SHARED_SYM HU3DSHADOW Hu3DShadowData;
+@@ -93,6 +96,9 @@ void Hu3DInit(void) {
+     }
+ #if defined(__MWERKS__) || defined(BYTESWAPPING)
+     reflectAnim[0] = HuSprAnimRead(refMapData0);
++#ifdef BYTESWAPPING
++    reflectAnimDefault0 = reflectAnim[0];
++#endif
+     reflectAnim[1] = HuSprAnimRead(refMapData1);
+     reflectAnim[2] = HuSprAnimRead(refMapData2);
+     reflectAnim[3] = HuSprAnimRead(refMapData3);
+@@ -346,6 +352,12 @@ void Hu3DAllKill(void) {
+ #else
+     reflectAnim[0] = HuSprAnimRead(refMapData0);
+ #endif
++#else
++    // web port: release a map Hu3DReflectMapSet installed and restore the built-in one (see there)
++    if (reflectAnim[0] != reflectAnimDefault0) {
++        HuSprAnimKill(reflectAnim[0]);
++        reflectAnim[0] = reflectAnimDefault0;
++    }
+ #endif
+     if(Hu3DShadowData.buf) {
+         HuMemDirectFree(Hu3DShadowData.buf);
+@@ -1910,8 +1922,14 @@ void Hu3DReflectMapSet(ANIMDATA* arg0) {
+     reflectAnim[0] = HuSprAnimRead(arg0);
+ #endif
+ #else
+-    assert(0 == 1);
+-    OSReport("PC TODO: Hu3DReflectMapSet ran which tries to reallocate an anim\n");
++    // web port: what the GameCube does, for byteswapped anims. There the ANIMDATA is parsed in place in
++    // the file buffer; here HuSprAnimRead makes a byteswapped copy, so the copy (not the buffer, which
++    // stays the caller's) is what gets released when it is replaced, and Hu3DAllKill puts the
++    // built-in map back (m444 sets its own reflection map; this path used to assert)
++    if (reflectAnim[0] != reflectAnimDefault0) {
++        HuSprAnimKill(reflectAnim[0]);
++    }
++    reflectAnim[0] = HuSprAnimRead(arg0);
+ #endif
+     reflectMapNo = 0;
+ }
 diff --git a/src/game/malloc.c b/src/game/malloc.c
 index a66cc87..7b6cc5c 100644
 --- a/src/game/malloc.c

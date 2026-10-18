@@ -144,7 +144,7 @@ if [ "$STAGE" = link ] || [ "$STAGE" = all ]; then
     bash "$HERE/wb/instrument.sh" "$OUT/mp4native.wasm" "$OUT/rb/mp4native.wasm" && cp "$OUT/mp4native.js" "$OUT/rb/mp4native.js"
   fi
   # the link keeps function names (--profiling-funcs, for profiles of the link output); the shipped builds drop them
-  "$HOME/emsdk-upstream/upstream/bin/wasm-opt" --all-features --strip-debug "$OUT/mp4native.wasm" -o "$OUT/mp4native.wasm"
+  [ "${STRIP:-1}" = 1 ] && "$HOME/emsdk-upstream/upstream/bin/wasm-opt" --all-features --strip-debug "$OUT/mp4native.wasm" -o "$OUT/mp4native.wasm"
   # THE JSPI SOLO BUILD (OUT/jspi/): the same objects, but libco's fibers switch on JSPI
   # (src/libco_jspi.c + src/libco_jspi.js) and the game loop sleeps on JSPI, so nothing is Asyncify-
   # instrumented. Solo only — a JSPI fiber's paused stack lives in the JS engine, not in memory, so it

@@ -183,11 +183,91 @@ index 863ecb8..5235f25 100644
    const NodDiscOptions options{
        .preloader_threads = 1,
    };
+diff --git a/lib/dolphin/mtx/mtx.c b/lib/dolphin/mtx/mtx.c
+index ba2796d..6a64d21 100644
+--- a/lib/dolphin/mtx/mtx.c
++++ b/lib/dolphin/mtx/mtx.c
+@@ -1,3 +1,9 @@
++#ifdef __EMSCRIPTEN__
++// web port: no asserts here, like the retail SDK's MTX library (and Party Board's Release desktop build,
++// which defines NDEBUG): MP4 hands it degenerate input on some first frames (m401 sets a camera's aspect
++// one frame after first drawing with it), which retail turns into an inf matrix rather than a halt
++#define NDEBUG
++#endif
+ #include <dolphin/mtx.h>
+ 
+ #include <assert.h>
+diff --git a/lib/dolphin/mtx/mtx44.c b/lib/dolphin/mtx/mtx44.c
+index 1ca47cf..292449a 100644
+--- a/lib/dolphin/mtx/mtx44.c
++++ b/lib/dolphin/mtx/mtx44.c
+@@ -1,3 +1,9 @@
++#ifdef __EMSCRIPTEN__
++// web port: no asserts here, like the retail SDK's MTX library (and Party Board's Release desktop build,
++// which defines NDEBUG): MP4 hands it degenerate input on some first frames (m401 sets a camera's aspect
++// one frame after first drawing with it), which retail turns into an inf matrix rather than a halt
++#define NDEBUG
++#endif
+ #include <assert.h>
+ #include <math.h>
+ #include <dolphin/mtx/mtx44ext.h>
+diff --git a/lib/dolphin/mtx/mtxstack.c b/lib/dolphin/mtx/mtxstack.c
+index c026935..928f8ea 100644
+--- a/lib/dolphin/mtx/mtxstack.c
++++ b/lib/dolphin/mtx/mtxstack.c
+@@ -1,3 +1,9 @@
++#ifdef __EMSCRIPTEN__
++// web port: no asserts here, like the retail SDK's MTX library (and Party Board's Release desktop build,
++// which defines NDEBUG): MP4 hands it degenerate input on some first frames (m401 sets a camera's aspect
++// one frame after first drawing with it), which retail turns into an inf matrix rather than a halt
++#define NDEBUG
++#endif
+ #include <assert.h>
+ #include <stdint.h>
+ #include <dolphin/mtx.h>
+diff --git a/lib/dolphin/mtx/mtxvec.c b/lib/dolphin/mtx/mtxvec.c
+index fcb32e0..88c728a 100644
+--- a/lib/dolphin/mtx/mtxvec.c
++++ b/lib/dolphin/mtx/mtxvec.c
+@@ -1,3 +1,9 @@
++#ifdef __EMSCRIPTEN__
++// web port: no asserts here, like the retail SDK's MTX library (and Party Board's Release desktop build,
++// which defines NDEBUG): MP4 hands it degenerate input on some first frames (m401 sets a camera's aspect
++// one frame after first drawing with it), which retail turns into an inf matrix rather than a halt
++#define NDEBUG
++#endif
+ #include <assert.h>
+ #include <dolphin/mtx.h>
+ 
+diff --git a/lib/dolphin/mtx/quat.c b/lib/dolphin/mtx/quat.c
+index 80966d6..39f43d4 100644
+--- a/lib/dolphin/mtx/quat.c
++++ b/lib/dolphin/mtx/quat.c
+@@ -1,3 +1,9 @@
++#ifdef __EMSCRIPTEN__
++// web port: no asserts here, like the retail SDK's MTX library (and Party Board's Release desktop build,
++// which defines NDEBUG): MP4 hands it degenerate input on some first frames (m401 sets a camera's aspect
++// one frame after first drawing with it), which retail turns into an inf matrix rather than a halt
++#define NDEBUG
++#endif
+ #include <assert.h>
+ #include <math.h>
+ #include <dolphin/mtx.h>
 diff --git a/lib/dolphin/mtx/vec.c b/lib/dolphin/mtx/vec.c
-index 6dc1467..27c9621 100644
+index 6dc1467..bfa2440 100644
 --- a/lib/dolphin/mtx/vec.c
 +++ b/lib/dolphin/mtx/vec.c
-@@ -36,7 +36,14 @@ void C_VECNormalize(const Vec* src, Vec* unit) {
+@@ -1,3 +1,9 @@
++#ifdef __EMSCRIPTEN__
++// web port: no asserts here, like the retail SDK's MTX library (and Party Board's Release desktop build,
++// which defines NDEBUG): MP4 hands it degenerate input on some first frames (m401 sets a camera's aspect
++// one frame after first drawing with it), which retail turns into an inf matrix rather than a halt
++#define NDEBUG
++#endif
+ #include <assert.h>
+ #include <math.h>
+ #include <dolphin/mtx.h>
+@@ -36,7 +42,14 @@ void C_VECNormalize(const Vec* src, Vec* unit) {
    assert(unit && "VECNormalize():  NULL VecPtr 'unit' ");
  
    mag = (src->z * src->z) + ((src->x * src->x) + (src->y * src->y));
@@ -202,7 +282,7 @@ index 6dc1467..27c9621 100644
  
    mag = 1.0f/ sqrtf(mag);
    unit->x = src->x * mag;
-@@ -52,7 +59,11 @@ void PSVECNormalize(const Vec* src, Vec* unit) {
+@@ -52,7 +65,11 @@ void PSVECNormalize(const Vec* src, Vec* unit) {
    assert(unit && "VECNormalize():  NULL VecPtr 'unit' ");
  
    sqsum = (src->z * src->z + src->x * src->x) + src->y * src->y;
@@ -687,6 +767,71 @@ index 1484076..538bf7f 100644
  
  bool is_idle() noexcept { return g_pendingItems.load(std::memory_order_acquire) == 0; }
  
+diff --git a/lib/gfx/tex_copy_conv.cpp b/lib/gfx/tex_copy_conv.cpp
+index 50f4c43..00003d0 100644
+--- a/lib/gfx/tex_copy_conv.cpp
++++ b/lib/gfx/tex_copy_conv.cpp
+@@ -243,6 +243,47 @@ static constexpr std::string_view FragZ16 = R"(
+ }
+ )"sv;
+ 
++// The other depth copy formats (web port: only Z16 had a pipeline, so a Z24X8/Z8/... copy fell through to
++// the colour blit or a raw texture copy from the depth texture, which WebGPU rejects — m419's half-size
++// depth copy aborted on it). Same byte layout as the colour formats they alias: Z8/Z8M/Z8L/Z4 read as
++// I8/I4, Z16L as IA8, Z24X8 as RGBA8 (Z bytes high to low, alpha 255). Graphics only, not game state.
++static constexpr std::string_view FragZ8 = R"(
++@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
++    let i = f32((gx_z24(in.uv) >> 16u) & 0xFFu) / 255.0;
++    return vec4f(i, i, i, i);
++}
++)"sv;
++static constexpr std::string_view FragZ8M = R"(
++@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
++    let i = f32((gx_z24(in.uv) >> 8u) & 0xFFu) / 255.0;
++    return vec4f(i, i, i, i);
++}
++)"sv;
++static constexpr std::string_view FragZ8L = R"(
++@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
++    let i = f32(gx_z24(in.uv) & 0xFFu) / 255.0;
++    return vec4f(i, i, i, i);
++}
++)"sv;
++static constexpr std::string_view FragZ4 = R"(
++@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
++    let i = f32((gx_z24(in.uv) >> 20u) & 0xFu) / 15.0;
++    return vec4f(i, i, i, i);
++}
++)"sv;
++static constexpr std::string_view FragZ16L = R"(
++@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
++    let z = gx_z24(in.uv);
++    return vec4f(vec3f(f32((z >> 8u) & 0xFFu) / 255.0), f32(z & 0xFFu) / 255.0);
++}
++)"sv;
++static constexpr std::string_view FragZ24X8 = R"(
++@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
++    let z = gx_z24(in.uv);
++    return vec4f(f32((z >> 16u) & 0xFFu) / 255.0, f32((z >> 8u) & 0xFFu) / 255.0, f32(z & 0xFFu) / 255.0, 1.0);
++}
++)"sv;
++
+ struct ConvPipeline {
+   GXTexFmt fmt;
+   std::string_view fragShader;
+@@ -269,6 +310,12 @@ static constexpr std::array ConvPipelines{
+ 
+ static constexpr std::array DepthConvPipelines{
+     ConvPipeline{GX_TF_Z16, FragZ16, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv Z16"},
++    ConvPipeline{GX_TF_Z8, FragZ8, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv Z8"},
++    ConvPipeline{GX_TF_Z24X8, FragZ24X8, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv Z24X8"},
++    ConvPipeline{GX_CTF_Z4, FragZ4, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv Z4"},
++    ConvPipeline{GX_CTF_Z8M, FragZ8M, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv Z8M"},
++    ConvPipeline{GX_CTF_Z8L, FragZ8L, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv Z8L"},
++    ConvPipeline{GX_CTF_Z16L, FragZ16L, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv Z16L"},
+ };
+ 
+ static wgpu::BindGroupLayout g_bindGroupLayout;
 diff --git a/lib/gfx/texture.cpp b/lib/gfx/texture.cpp
 index 013afc0..60a2321 100644
 --- a/lib/gfx/texture.cpp
