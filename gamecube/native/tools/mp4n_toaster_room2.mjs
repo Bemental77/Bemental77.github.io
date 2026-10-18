@@ -58,11 +58,12 @@ function tree(pid) { const k = kidsMap(), o = [pid], q = [pid]; while (q.length)
 const ptype = (pid) => { try { const m = /--type=([\w-]+)/.exec(fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8')); return m ? m[1] : 'browser'; } catch (e) { return null; } };
 // CPU seconds per Chrome process type (renderer / gpu-process / utility / browser), from /proc utime+stime
 const HZ = 100;
+// per pid (a process that exits between two readings takes its CPU with it, so deltas are per pid)
 function cpuByType(P) {
   const o = {}; let bpid; try { bpid = P.browser.process().pid; } catch (e) { return o; }
   for (const pid of tree(bpid)) {
-    try { const st = fs.readFileSync(`/proc/${pid}/stat`, 'utf8').slice(0); const f = st.slice(st.lastIndexOf(')') + 2).split(' ');
-      const t = (+f[11] + +f[12]) / HZ, k = ptype(pid) || '?'; o[k] = (o[k] || 0) + t; } catch (e) {}
+    try { const st = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); const f = st.slice(st.lastIndexOf(')') + 2).split(' ');
+      o[pid] = { t: (+f[11] + +f[12]) / HZ, k: ptype(pid) || '?' }; } catch (e) {}
   }
   return o;
 }
@@ -89,7 +90,18 @@ function deviceScan(P) {
     const gpuG = pt === 'gpu-process' ? path.join(P.dev.top, 'g' + pid) : null;
     for (const t of tids) {
       if (P.dev.groups.has(+t)) continue;
-      const g = gpuG || path.join(P.dev.top, 't' + t);
+      // Renderer threads: each its own group (a thread is R times slower) INSIDE one group capped at
+      // CORES/R for all of them together (the device has CORES cores, each R times slower). Without the
+      // shared cap, N busy threads got N/R: measured, the recomp page runs ~5 busy dedicated workers,
+      // each at the 1/R per-thread quota, so it had up to 5/6.2 of a core where native's one game thread
+      // had 1/6.2.
+      const rG = path.join(P.dev.top, 'r');
+      if (!gpuG && !fs.existsSync(rG)) {
+        fs.mkdirSync(rG); fs.writeFileSync(path.join(rG, 'cpu.cfs_period_us'), '10000'); P.dev.mult.set(rG, CORES);
+        fs.writeFileSync(path.join(rG, 'cpu.cfs_quota_us'), P.dev.quotaOn ? String(Math.round(10000 * P.dev.frac * CORES)) : '-1');
+        P.dev.rG = rG;
+      }
+      const g = gpuG || path.join(rG, 't' + t);
       try {
         if (!fs.existsSync(g)) {
           fs.mkdirSync(g);
@@ -105,7 +117,9 @@ function deviceScan(P) {
 }
 function deviceQuota(P, on) {
   P.dev.quotaOn = on;
-  for (const g of new Set(P.dev.groups.values())) { try { fs.writeFileSync(path.join(g, 'cpu.cfs_quota_us'), on ? String(Math.round(10000 * P.dev.frac * (P.dev.mult.get(g) || 1))) : '-1'); } catch (e) {} }
+  // the shared renderer cap first when raising quotas off, last when turning them on (a child may not exceed its parent)
+  const gs = [...new Set(P.dev.groups.values())]; if (P.dev.rG) { if (on) gs.push(P.dev.rG); else gs.unshift(P.dev.rG); }
+  for (const g of gs) { try { fs.writeFileSync(path.join(g, 'cpu.cfs_quota_us'), on ? String(Math.round(10000 * P.dev.frac * (P.dev.mult.get(g) || 1))) : '-1'); } catch (e) {} }
 }
 function deviceStat(P) {
   let thr = 0, nrp = 0, nrt = 0;
@@ -129,6 +143,7 @@ async function deviceEnd(P) {
   for (let i = 0; i < 20; i++) {
     let left = 0;
     for (const g of new Set(P.dev.groups.values())) { try { fs.rmdirSync(g); } catch (e) { left++; } }
+    if (P.dev.rG) { try { fs.rmdirSync(P.dev.rG); } catch (e) {} }
     try { fs.rmdirSync(P.dev.top); fs.rmdirSync(P.dev.set); return; } catch (e) {}
     await sleep(250);
   }
@@ -295,7 +310,8 @@ try {
       rows: R.map((r) => ({ T: r.T, f: r.frame, x: r.x, st: r.state, rb: r.rb, d: r.delay, stalls: r.stalls })) };
     if (o.lastStats) say(`STATS ${P.role}: ${JSON.stringify(o.lastStats)} rb=${JSON.stringify(o.lastRb)} mode=${o.lastMode}`);
     if (P.cpu0 && P.cpu1) { const fr = Math.max(1, P.cpu1.f - P.cpu0.f), sec = P.cpu1.T - P.cpu0.T, by = {};
-      for (const k of Object.keys(P.cpu1.c)) by[k] = +(1000 * (P.cpu1.c[k] - (P.cpu0.c[k] || 0)) / fr).toFixed(2);
+      for (const [pid, v] of Object.entries(P.cpu1.c)) by[v.k] = (by[v.k] || 0) + 1000 * (v.t - ((P.cpu0.c[pid] || {}).t || 0)) / fr;
+      for (const k of Object.keys(by)) by[k] = +by[k].toFixed(2);
       o.cpuMsPerFrame = by; say(`CPU ${P.role}: ms per guest frame by process ${JSON.stringify(by)} over ${fr} frames / ${sec.toFixed(0)} s`); }
     say(`SUMMARY ${PAGE} ${mode} ${P.role}: open@${o.openT}s window x=${o.win.x && o.win.x.toFixed(3)} min ${o.win.min && o.win.min.toFixed(3)} presented ${o.win.presented != null ? o.win.presented.toFixed(1) : '-'}/s host ${o.win.msPerFrame != null ? o.win.msPerFrame.toFixed(1) : '-'} ms/frame (n=${o.win.n}, first ${SKIP}s discarded)  steady x=${o.steady.x && o.steady.x.toFixed(3)}  stalls ${o.stalls}  desync=${o.desync} hc=${o.hc}  throttled ${o.cg.nr_throttled}/${o.cg.nr_periods}`);
     await P.page.screenshot({ path: path.join(OUTD, `${name}-${P.role}.png`) }).catch(() => {});
