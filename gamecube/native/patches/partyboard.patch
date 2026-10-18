@@ -121,20 +121,21 @@ index a9a6085..1e3d9e9 100644
  #else
  	OSModuleHeader *module;
 diff --git a/src/REL/bootDll/main.c b/src/REL/bootDll/main.c
-index 4303911..8f82b4b 100644
+index 4303911..c889925 100644
 --- a/src/REL/bootDll/main.c
 +++ b/src/REL/bootDll/main.c
-@@ -15,6 +15,9 @@
+@@ -15,6 +15,10 @@
  #include "game/thpmain.h"
  #include "game/window.h"
  #include "game/wipe.h"
 +#include "game/objsub.h"
 +#include "game/gamework.h"
++#include "game/flag.h"
 +#include "game/board/main.h"
  #include "math.h"
  
  #include "data_num/title.h"
-@@ -159,6 +162,64 @@ void ObjectSetup(void)
+@@ -159,6 +163,79 @@ void ObjectSetup(void)
       }
  #endif
  #endif
@@ -183,7 +184,22 @@ index 4303911..8f82b4b 100644
 +                 GWPlayerCfg[i].iscom = (i != 0);
 +             }
 +             BoardPartyConfigSet(0, 1, 0, 10, 0, 0, 0, 0);
++             if (board == 6) {
++                 // w10 is the tutorial board: entered as mentDll does it (four COMs, its characters, flag 0x1000B, 20 turns)
++                 static const s32 tutChars[4] = { 3, 0, 2, 4 };
++                 _SetFlag(0x1000B);
++                 for (i = 0; i < 4; i++) {
++                     GWPlayerCfg[i].character = tutChars[i];
++                     GWPlayerCfg[i].iscom = 1;
++                 }
++             }
++             else {
++                 _ClearFlag(0x1000B);
++             }
 +             BoardSaveInit(board);
++             if (board == 6) {
++                 GWSystem.max_turn = 0x14;
++             }
 +             for (i = 0; i < 4; i++) {
 +                 CharMotionInit(GWPlayerCfg[i].character);
 +             }
@@ -1095,6 +1111,24 @@ index 713a00a..b003595 100644
      s16 space;
      if (_CheckFlag(FLAG_ID_MAKE(1, 1))) {
          BoardSpaceTypeSet(0, boardSpaceStarTbl[GWSystem.star_pos], 1);
+diff --git a/src/game/board/tutorial.c b/src/game/board/tutorial.c
+index acf23c5..1937607 100755
+--- a/src/game/board/tutorial.c
++++ b/src/game/board/tutorial.c
+@@ -9,7 +9,13 @@
+ #include <string.h>
+ 
+ SHARED_SYM s32 boardTutorialData[4]; // maybe a single s32 + padding?
++#ifdef TARGET_PC
++// port: the only hook (w10's TutorialHookExec) returns int; called through a void-returning pointer a
++// wasm call_indirect traps on the signature mismatch. The result is ignored either way.
++static int (*tutorialHook)(s16, s32);
++#else
+ static void (*tutorialHook)(s16, s32);
++#endif
+ s8 boardTutorialDirInputX;
+ s8 boardTutorialDirInputY;
+ s16 boardTutorialDirInputTime;
 diff --git a/src/game/hsfman.c b/src/game/hsfman.c
 index 7c6e592..7bf5e34 100644
 --- a/src/game/hsfman.c
