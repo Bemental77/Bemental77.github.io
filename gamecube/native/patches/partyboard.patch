@@ -121,7 +121,7 @@ index a9a6085..1e3d9e9 100644
  #else
  	OSModuleHeader *module;
 diff --git a/src/REL/bootDll/main.c b/src/REL/bootDll/main.c
-index 4303911..c889925 100644
+index 4303911..80b6c0c 100644
 --- a/src/REL/bootDll/main.c
 +++ b/src/REL/bootDll/main.c
 @@ -15,6 +15,10 @@
@@ -135,7 +135,7 @@ index 4303911..c889925 100644
  #include "math.h"
  
  #include "data_num/title.h"
-@@ -159,6 +163,79 @@ void ObjectSetup(void)
+@@ -159,6 +163,114 @@ void ObjectSetup(void)
       }
  #endif
  #endif
@@ -183,7 +183,11 @@ index 4303911..c889925 100644
 +                 GWPlayerCfg[i].group = 0;
 +                 GWPlayerCfg[i].iscom = (i != 0);
 +             }
-+             BoardPartyConfigSet(0, 1, 0, 10, 0, 0, 0, 0);
++             {
++                 extern int mp4web_debug_turns(void);
++                 s32 turns = mp4web_debug_turns();
++                 BoardPartyConfigSet(0, 1, 0, (turns > 0) ? turns : 10, 0, 0, 0, 0);
++             }
 +             if (board == 6) {
 +                 // w10 is the tutorial board: entered as mentDll does it (four COMs, its characters, flag 0x1000B, 20 turns)
 +                 static const s32 tutChars[4] = { 3, 0, 2, 4 };
@@ -205,6 +209,37 @@ index 4303911..c889925 100644
 +             }
 +             OSReport("[mp4web] crash sweep: board %d (overlay %d)\n", (int)board, (int)(DLL_w01dll + board));
 +             omOvlCallEx(DLL_w01dll + board, 1, 0, 0);
++             HuPrcEnd();
++             do {
++                 HuPrcVSleep();
++             } while (1);
++         }
++     }
++     {
++         // WEB COVERAGE PASS (?ovl=N, an overlay index): straight into any other overlay -- the menus, Story
++         // mode, results -- after the skipped-boot init, with player 1 human and three COMs; the Story
++         // overlays get the story config the story entrance sets (BoardStoryConfigSet)
++         extern int mp4web_debug_ovl(void);
++         s32 ovl = mp4web_debug_ovl() - 1;
++         if (omovlevtno == 0 && ovl > DLL_bootdll && ovl < DLL_MAX) {
++             BootInitForSkippedSequence();
++             for (i = 0; i < 4; i++) {
++                 GWPlayerCfg[i].character = i;
++                 GWPlayerCfg[i].pad_idx = i;
++                 GWPlayerCfg[i].diff = 0;
++                 GWPlayerCfg[i].group = 0;
++                 GWPlayerCfg[i].iscom = (i != 0);
++                 CharMotionInit(GWPlayerCfg[i].character);
++             }
++             if (ovl == DLL_mstorydll || ovl == DLL_mstory2dll || ovl == DLL_mstory3dll || ovl == DLL_mstory4dll) {
++                 BoardStoryConfigSet(0, 0);
++             }
++             else if (ovl == DLL_w20dll || ovl == DLL_w21dll) {   // the two extra boards, set up as the board menu does
++                 BoardSaveInit(ovl == DLL_w20dll ? 7 : 8);
++                 BoardPartyConfigSet(0, 0, 0, 20, 0, 0, 0, 0);
++             }
++             OSReport("[mp4web] crash sweep: overlay %d\n", (int)ovl);
++             omOvlCallEx(ovl, 1, 0, 0);
 +             HuPrcEnd();
 +             do {
 +                 HuPrcVSleep();
@@ -480,7 +515,7 @@ index ded0a59..2745a4b 100755
 +static void fn_1_1F32C_mp4w(omObjData * a0, void * a1) { fn_1_1F32C(a0); }
 +#endif
 diff --git a/src/REL/mpexDll/charsel.c b/src/REL/mpexDll/charsel.c
-index 8f56832..4de4da7 100644
+index 8f56832..3a41214 100644
 --- a/src/REL/mpexDll/charsel.c
 +++ b/src/REL/mpexDll/charsel.c
 @@ -11,7 +11,12 @@
@@ -507,7 +542,21 @@ index 8f56832..4de4da7 100644
  void fn_1_16320(void);
  void fn_1_16600(s32 arg0);
  void fn_1_16874(s32);
-@@ -1313,7 +1318,9 @@ void fn_1_15774(void)
+@@ -760,7 +765,13 @@ s32 fn_1_140B0(s32 arg0, s32 arg1)
+     s32 var_r31;
+     s32 var_r30;
+     s32 var_r29;
++#ifdef TARGET_PC
++    // port: read before it is first set (the loop below tests it for 999 on entry); on the GameCube it holds
++    // the caller's r28. Uninitialised it is undefined behaviour that clang compiles to a trap; 0 keeps the test false
++    s32 var_r28 = 0;
++#else
+     s32 var_r28;
++#endif
+     s32 var_r27;
+     s32 var_r26;
+     s32 var_r24;
+@@ -1313,7 +1324,9 @@ void fn_1_15774(void)
      HuSprAttrSet(var_r31, 2, 4);
  }
  
@@ -518,7 +567,7 @@ index 8f56832..4de4da7 100644
  {
      float var_f31;
      float var_f30;
-@@ -1422,7 +1429,9 @@ void fn_1_157C4(void)
+@@ -1422,7 +1435,9 @@ void fn_1_157C4(void)
      lbl_1_bss_5DC.unk_28 = 0;
  }
  
@@ -1000,7 +1049,7 @@ index 79fc26e..5046a06 100644
  
  void fn_1_9C24(omObjData *arg0)
 diff --git a/src/REL/ztardll/select.c b/src/REL/ztardll/select.c
-index e123e1d..34e1035 100644
+index e123e1d..b307209 100644
 --- a/src/REL/ztardll/select.c
 +++ b/src/REL/ztardll/select.c
 @@ -12,7 +12,12 @@
@@ -1016,6 +1065,20 @@ index e123e1d..34e1035 100644
  
  typedef struct ZtarDllUnkStruct2 {
      /* 0x00 */ omObjData *unk_00;
+@@ -884,7 +889,13 @@ s32 fn_1_97D0(s32 arg0, s32 arg1)
+     s32 var_r31;
+     s32 var_r30;
+     s32 var_r29;
++#ifdef TARGET_PC
++    // port: read before it is first set (the loop below tests it for 999 on entry); on the GameCube it holds
++    // the caller's r28. Uninitialised it is undefined behaviour that clang compiles to a trap; 0 keeps the test false
++    s32 var_r28 = 0;
++#else
+     s32 var_r28;
++#endif
+     s32 var_r27;
+     s32 var_r26;
+     s32 var_r24;
 diff --git a/src/game/audio.c b/src/game/audio.c
 index b5b8317..5e1fed1 100644
 --- a/src/game/audio.c

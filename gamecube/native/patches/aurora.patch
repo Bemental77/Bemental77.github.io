@@ -1,5 +1,5 @@
 diff --git a/lib/aurora.cpp b/lib/aurora.cpp
-index dc5ae5b..92ee932 100644
+index dc5ae5b..c7d1da1 100644
 --- a/lib/aurora.cpp
 +++ b/lib/aurora.cpp
 @@ -39,6 +39,9 @@ using webgpu::g_surface;
@@ -22,7 +22,32 @@ index dc5ae5b..92ee932 100644
  bool begin_frame() noexcept {
    ZoneScoped;
  #ifdef AURORA_ENABLE_GX
-@@ -251,7 +257,12 @@ void end_frame() noexcept {
+@@ -218,7 +224,12 @@ bool begin_frame() noexcept {
+     }
+   }
+ 
++#ifndef __EMSCRIPTEN__
+   imgui::new_frame(window::get_window_size());
++#endif
++  // web port: no ImGui frame. Nothing on the web draws with ImGui, but NewFrame still opened its implicit
++  // debug window, polled monitors and the present added an ImGui render pass over the surface every frame
++  // (~3% of the renderer's busy time on the toaster rig, plus a GPU pass)
+   if (!gfx::begin_frame()) {
+     return false;
+   }
+@@ -231,7 +242,11 @@ void end_frame() noexcept {
+ #ifdef AURORA_ENABLE_GX
+   gx::fifo::drain();
+   gfx::finish();
++#ifdef __EMSCRIPTEN__
++  imgui::DrawData imguiDrawData;   // empty: see begin_frame
++#else
+   auto imguiDrawData = imgui::freeze();
++#endif
+ 
+   const auto& presentSource = webgpu::present_source();
+   const auto viewport = webgpu::calculate_present_viewport(webgpu::g_graphicsConfig.surfaceConfiguration.width,
+@@ -251,7 +266,12 @@ void end_frame() noexcept {
      wgpu::Texture currentTexture;
      wgpu::TextureView currentView;
      auto surfaceStatus = wgpu::SurfaceGetCurrentTextureStatus::Error;
@@ -35,7 +60,16 @@ index dc5ae5b..92ee932 100644
        ZoneScopedN("Acquire texture");
        wgpu::SurfaceTexture surfaceTexture;
        g_surface.GetCurrentTexture(&surfaceTexture);
-@@ -313,6 +324,9 @@ void end_frame() noexcept {
+@@ -293,7 +313,7 @@ void end_frame() noexcept {
+         pass.Draw(3);
+         pass.End();
+       }
+-      {
++      if (imguiDrawData) {
+         const std::array attachments{
+             wgpu::RenderPassColorAttachment{
+                 .view = currentView,
+@@ -313,6 +333,9 @@ void end_frame() noexcept {
          pass.End();
        }
      } else {
@@ -45,7 +79,7 @@ index dc5ae5b..92ee932 100644
        Log.info("Skipping present; window not presentable");
      }
      const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
-@@ -323,12 +337,20 @@ void end_frame() noexcept {
+@@ -323,12 +346,20 @@ void end_frame() noexcept {
      }
      if (canPresent && g_surface) {
        ZoneScopedN("Present");

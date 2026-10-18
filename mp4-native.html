@@ -122,7 +122,35 @@
       try { audio.ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e2) { audio.ctx = null; }
     }
     if (audio.ctx && audio.ctx.state === 'suspended') audio.ctx.resume();
+    audioWorkletInit();
   }
+  // The steady path: an AudioWorklet fed one transferred Float32Array per frame, so a frame's samples cost
+  // one copy + one message instead of an AudioBuffer + a source node + a scheduled start (the per-frame node
+  // path was ~5% of the renderer's busy time on the toaster rig). Same policy as the node path: an empty
+  // queue restarts 50 ms ahead (a gap, counted), more than 300 ms queued drops the frame's chunk (counted).
+  // Used only when the context really runs at the game's 32 kHz; until the module has loaded (and
+  // otherwise) the node path below plays.
+  function audioWorkletInit() {
+    var ctx = audio.ctx;
+    if (!ctx || !ctx.audioWorklet || typeof AudioWorkletNode === 'undefined' || ctx.sampleRate !== 32000) return;
+    var src = 'class P extends AudioWorkletProcessor{constructor(){super();this.q=[];this.h=0;this.avail=0;this.prime=true;this.used=0;this.gaps=0;this.t=0;' +
+      'this.port.onmessage=(e)=>{this.q.push(e.data);this.avail+=e.data.length>>1;};}' +
+      'process(_,outs){var L=outs[0][0],R=outs[0][1]||outs[0][0],m=L.length,k=0;' +
+      'if(this.prime&&this.avail<1600){L.fill(0);R.fill(0);}else{this.prime=false;' +
+      'while(k<m&&this.q.length){var b=this.q[0],c=Math.min(m-k,(b.length>>1)-this.h);for(var x=0;x<c;x++){L[k+x]=b[2*(this.h+x)];R[k+x]=b[2*(this.h+x)+1];}' +
+      'k+=c;this.h+=c;this.avail-=c;this.used+=c;if(this.h>=(b.length>>1)){this.q.shift();this.h=0;}}' +
+      'if(k<m){for(;k<m;k++){L[k]=0;R[k]=0;}this.prime=true;this.gaps++;}}' +
+      'if(++this.t>=25){this.t=0;this.port.postMessage([this.used,this.gaps]);}return true;}}registerProcessor("mp4n-pcm",P);';
+    var url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+    ctx.audioWorklet.addModule(url).then(function () {
+      var node = new AudioWorkletNode(ctx, 'mp4n-pcm', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2] });
+      node.connect(ctx.destination);
+      audio.wlSent = 0; audio.wlUsed = 0;
+      node.port.onmessage = function (e) { audio.wlUsed = e.data[0]; audio.gaps = e.data[1]; };
+      audio.node = node;
+    }).catch(function (e) { log('audio worklet unavailable (' + e + '); using buffer sources'); });
+  }
+
   function audioPush(pcm, rate) {
     if (window.Mp4Room && Mp4Room.pushMuted()) { audio.muted += pcm.length >> 1; return; }   // a re-simulated or hidden room frame: already heard / not shown
     var n = pcm.length >> 1, peak = 0, i;
@@ -130,6 +158,14 @@
     if (audio.rec && audio.recLen < audio.rec.length) { var take = Math.min(pcm.length, audio.rec.length - audio.recLen); audio.rec.set(pcm.subarray(0, take), audio.recLen); audio.recLen += take; }
     audio.pushed += n; if (peak > 64) audio.nonSilent += n; if (peak > audio.peak) audio.peak = peak;
     var ctx = audio.ctx; if (!ctx) return;
+    if (audio.node && rate === 32000) {
+      if (audio.wlSent - audio.wlUsed + n > 9600 + 2000) { audio.drops++; return; }   // > 300 ms queued (+ the 25-quantum report lag)
+      var f = new Float32Array(n * 2);
+      for (i = 0; i < n * 2; i++) f[i] = pcm[i] / 32768;
+      audio.node.port.postMessage(f, [f.buffer]);
+      audio.wlSent += n;
+      return;
+    }
     var b = ctx.createBuffer(2, n, rate), L = b.getChannelData(0), R = b.getChannelData(1);
     for (i = 0; i < n; i++) { L[i] = pcm[2 * i] / 32768; R[i] = pcm[2 * i + 1] / 32768; }
     var now = ctx.currentTime;
@@ -192,6 +228,8 @@
         mp4EpochSeconds: room ? room.epoch : Q.get('epoch') ? +Q.get('epoch') : undefined,
         mp4DebugMg: !room && Q.get('mg') ? +Q.get('mg') : undefined,   // crash sweep: boot straight into minigame N (401..463)
         mp4DebugBoard: !room && Q.get('board') ? +Q.get('board') : undefined,   // crash sweep: boot straight into Party Mode board N (0..5 = w01..w06, 6 = w10)
+        mp4DebugTurns: !room && Q.get('turns') ? +Q.get('turns') : undefined,   // with ?board: the party's turn count (default 10)
+        mp4DebugOvl: !room && Q.get('ovl') ? +Q.get('ovl') : undefined,   // crash sweep: boot straight into overlay index N (menus, Story mode, results)
         mp4InputLatch: function (frame, ptr) { var m = window.__mp4n.module; Mp4Input.latch(frame, ptr, m && m.HEAP32); },
         locateFile: function (p) { return BUILD + p; },
         print: function (t) { log(t); },

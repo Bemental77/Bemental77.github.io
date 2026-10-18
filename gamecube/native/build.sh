@@ -98,7 +98,8 @@ fi
 GAMEF=(-DTARGET_PC -DNON_MATCHING -DOPTIMIZED_TEXTURE_LOADING -DBYTESWAPPING -DTARGET_DOL -DVERSION=0
        -DMUSY_VERSION_MAJOR=2 -DMUSY_VERSION_MINOR=0 -DMUSY_VERSION_PATCH=0 -DMUSY_TARGET=MUSY_TARGET_PC
        -I"$PB/include" -I"$HERE/shim/game" -I"$AU/include/dolphin" -I"$MX/include" -I"$BUILD/gen" -I"$BUILD/gen/extern"
-       -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-implicit-int)
+       -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-implicit-int
+       -ftrivial-auto-var-init=zero)   # decomp code reads locals before setting them (220 clang warnings, e.g. mpexDll charsel, ztardll select): undefined behaviour that clang can compile to a trap; the GameCube read register/stack leftovers, here they read 0
 game_srcs() {
   sed -n '/set(GAME_FILES/,/)/p; /set(PORT_FILES/,/)/p' "$PB/files.cmake" | grep -v "^ *#" | grep -oE "src/[A-Za-z0-9_/.-]+\.(c|cpp)" | grep -v "^src/port/ui/\|^src/port/portmain.cpp\|^src/port/achievements.cpp\|^src/port/audio.cpp" | sed "s#^#$PB/#"
   echo "$HERE/src/libco_fiber.c"; echo "$HERE/src/rel_dispatch.c"; echo "$HERE/src/web_stubs.cpp"; echo "$HERE/src/web_audio.cpp"; echo "$HERE/src/det_heap.c"; echo "$HERE/src/nod_web.c"   # game heap: aurora keeps its handles inside game-held DVD blocks

@@ -121,9 +121,11 @@ extern "C" EMSCRIPTEN_KEEPALIVE void mp4web_set_max_debt(double ms) { g_maxDebt 
 // cap frames held; a late console keeps min(lateness, credit) and runs it back to back. With
 // cap 2.5 and rate 1/120 no 5 s window can run more than 300 + 5 frames: 1.0167x, GameCube's bar.
 static double g_catchTokens = 0.0, g_catchCap = 0.0, g_catchRate = 0.0;
-// page ?mg=401..463 / ?board=0..6 (crash sweep): what bootDll boots straight into; 0 = normal boot
+// page ?mg=401..463 / ?board=0..6 [&turns=N] / ?ovl=N (crash sweep): what bootDll boots straight into; 0 = normal boot
 EM_JS(int, mp4web_debug_mg, (void), { return (typeof Module.mp4DebugMg === 'number') ? Module.mp4DebugMg : 0; });
 EM_JS(int, mp4web_debug_board, (void), { return (typeof Module.mp4DebugBoard === 'number') ? Module.mp4DebugBoard + 1 : 0; });
+EM_JS(int, mp4web_debug_ovl, (void), { return (typeof Module.mp4DebugOvl === 'number') ? Module.mp4DebugOvl + 1 : 0; });
+EM_JS(int, mp4web_debug_turns, (void), { return (typeof Module.mp4DebugTurns === 'number') ? Module.mp4DebugTurns : 0; });
 
 extern "C" EMSCRIPTEN_KEEPALIVE void mp4web_set_catchup(double capFrames, double ratePerFrame) {
   g_catchCap = capFrames; g_catchRate = ratePerFrame; if (g_catchTokens > g_catchCap) g_catchTokens = g_catchCap;

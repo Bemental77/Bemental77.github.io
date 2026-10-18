@@ -48,10 +48,10 @@ PY
 echo "[wb] tracked range 0x$(printf %x "$WB_BASE") + $WB_PAGES pages, table 0x$(printf %x "$WB_TABLE")"
 # WB_NOINLINE=1 (diagnostic): leave binaryen's call to store_ptr at each site (barrier.wat: same check, out of line)
 if [ "${WB_NOINLINE:-0}" = 1 ]; then mv "$T/b.wat" "$T/b2.wat"; else python3 "$HERE/inline_hooks.py" "$T/b.wat" "$T/b2.wat" "$WB_BASE" "$WB_PAGES" "$WB_TABLE"; rm -f "$T/b.wat"; fi
-"$B/wasm-as" "${F[@]}" "$T/b2.wat" -o "$T/b.wasm"; rm -f "$T/b2.wat"
+"$B/wasm-as" $([ "${WB_STRIP:-1}" = 1 ] || echo -g) "${F[@]}" "$T/b2.wat" -o "$T/b.wasm"; rm -f "$T/b2.wat"
 "$B/wasm-as" -g "${F[@]}" "$HERE/barrier.wat" -o "$T/barrier.wasm"
-"$B/wasm-merge" "${F[@]}" "$T/b.wasm" main "$T/barrier.wasm" env -o "$T/c.wasm"; rm -f "$T/b.wasm"
+"$B/wasm-merge" $([ "${WB_STRIP:-1}" = 1 ] || echo -g) "${F[@]}" "$T/b.wasm" main "$T/barrier.wasm" env -o "$T/c.wasm"; rm -f "$T/b.wasm"
 # -O2 never inlined the store hook (binaryen's flexible inlining is -O3 only: Call 110,096 plain ->
 # 315,881 with the barrier), hence inline_hooks.py; the barrier's slow paths stay out of line.
-"$B/wasm-opt" "${F[@]}" --no-inline='mp4wb_*' -O2 --strip-debug "$T/c.wasm" -o "$OUT"
+"$B/wasm-opt" "${F[@]}" --no-inline='mp4wb_*' -O2 $([ "${WB_STRIP:-1}" = 1 ] && echo --strip-debug || echo -g) "$T/c.wasm" -o "$OUT"   # WB_STRIP=0 keeps names (profiling)
 echo "[wb] $(stat -c %s "$IN") -> $(stat -c %s "$OUT") B"
