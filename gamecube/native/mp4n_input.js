@@ -117,9 +117,11 @@
   // This console's own player as the 8-byte pad image a netplay room exchanges:
   //   [buttons lo, buttons hi, stickX, stickY, substickX, substickY, trigL, trigR] (sticks as int8)
   // Keyboard + touch + the first connected gamepad — the one person at this screen.
-  function sampleLocal() {
+  var scriptFn = null;   // Mp4Input.script(fn): fn(frame) -> extra GC buttons for this console's pad (room tests drive a route)
+  function sampleLocal(frame) {
     var rec = { btn: 0, sx: 0, sy: 0, cx: 0, cy: 0, tl: 0, tr: 0 };
     samplePort0Keyboard(rec);
+    if (scriptFn && frame != null) rec.btn |= scriptFn(frame) | 0;
     var pads = (navigator.getGamepads ? Array.prototype.slice.call(navigator.getGamepads()) : []).filter(function (g) { return g && g.connected; });
     if (pads[0]) samplePad(pads[0], rec);
     var b = new Uint8Array(8);
@@ -135,6 +137,7 @@
     latch: latch,
     attachTouch: attachTouch,
     override: function (fn) { overrideFn = fn; },
+    script: function (fn) { scriptFn = fn; },
     last: function () { return lastLatched; }
   };
 })();

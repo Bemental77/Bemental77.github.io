@@ -222,6 +222,36 @@ EMSCRIPTEN_KEEPALIVE double mp4web_rb_hash(void) {
 }
 
 EMSCRIPTEN_KEEPALIVE double* mp4web_rb_stats(void) { return g_stats; }
+
+// ---- the delay-room fingerprint: no write barrier needed ----------------------------------------
+// A delay-lockstep room may hold consoles without the barrier (the plain build), so it cannot use
+// rb_hash. Instead every console hashes the same 1/FP_CHUNKS of the game's pages at every frame
+// boundary (chunk = frame % FP_CHUNKS) and folds them; at each fingerprint frame the fold is the
+// fingerprint and starts again. Same pages, same frames, same bytes on every console -> same value;
+// all of memory is covered every FP_CHUNKS frames, at ~1/FP_CHUNKS of a full hash per frame.
+#define FP_CHUNKS 600u
+static uint64_t g_fpAcc;
+EMSCRIPTEN_KEEPALIVE double mp4web_fp_step(int32_t frame, int finish) {
+  const uint32_t b = ((uint32_t)(uintptr_t)mp4web_game_bss_b + PAGE - 1) & ~(PAGE - 1);
+  const uint32_t e = (uint32_t)(uintptr_t)mp4web_game_bss_e & ~(PAGE - 1);
+  const uint32_t pages = (e - b) >> PAGE_SHIFT;
+  uintptr_t sb, se; mp4web_stack_range(&sb, &se);
+  const uint32_t skipB = (uint32_t)((sb - b) >> PAGE_SHIFT), skipE = (uint32_t)((se - b + PAGE - 1) >> PAGE_SHIFT);
+  const uint32_t c = (uint32_t)frame % FP_CHUNKS;
+  const uint32_t p0 = (uint32_t)(((uint64_t)pages * c) / FP_CHUNKS), p1 = (uint32_t)(((uint64_t)pages * (c + 1)) / FP_CHUNKS);
+  for (uint32_t p = p0; p < p1; ++p) {
+    if (p >= skipB && p < skipE) continue;
+    g_fpAcc ^= mixp(p, XXH3_64bits((const void*)(uintptr_t)(b + (p << PAGE_SHIFT)), PAGE));
+  }
+  if (!finish) return 0;
+  // .data and the unaligned bss ends are small: whole, at every fingerprint
+  const uint32_t ds = (uint32_t)(mp4web_game_data_e - mp4web_game_data_b);
+  const uint32_t hb = b - (uint32_t)(uintptr_t)mp4web_game_bss_b;
+  const uint32_t te = (uint32_t)(uintptr_t)mp4web_game_bss_e - e;
+  uint64_t h = g_fpAcc ^ XXH3_64bits(mp4web_game_data_b, ds) ^ (XXH3_64bits(mp4web_game_bss_b, hb) * 3) ^ (XXH3_64bits((const void*)(uintptr_t)e, te) * 5);
+  g_fpAcc = 0;
+  return (double)(h >> 11);
+}
 EMSCRIPTEN_KEEPALIVE int mp4web_rb_on(void) { return g_on; }
 
 // Test aid: pages whose bytes changed without passing the barrier since their hash was last taken

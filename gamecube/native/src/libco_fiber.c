@@ -40,7 +40,15 @@ cothread_t co_create(unsigned int heapsize, void (*entry)(void)) {
 }
 cothread_t co_derive(void *memory, unsigned int heapsize, void (*entry)(void)) { (void)memory; return co_create(heapsize, entry); }
 void co_delete(cothread_t t) { Co *c = (Co *)t; if (!c || c == &s_main || c == s_cur) return; STACK_FREE(c->cstack); STACK_FREE(c->astack); free(c); }
-void co_switch(cothread_t t) { co_init(); Co *from = s_cur, *to = (Co *)t; if (from == to) return; s_cur = to; emscripten_fiber_swap(&from->f, &to->f); }
+// emscripten_fiber_swap writes both fibers' records FROM JS (the parked stack pointer, the entry
+// cleared on first entry, the rewind id), where the write barrier never sees it; the records are game
+// state (det heap). Log their pages first — measured: a rewind left a fiber "already started".
+void mp4web_rb_mark(uint32_t a, uint32_t n);   // src/rollback.c
+void co_switch(cothread_t t) {
+  co_init(); Co *from = s_cur, *to = (Co *)t; if (from == to) return; s_cur = to;
+  mp4web_rb_mark((uint32_t)(uintptr_t)&from->f, sizeof from->f); mp4web_rb_mark((uint32_t)(uintptr_t)&to->f, sizeof to->f);
+  emscripten_fiber_swap(&from->f, &to->f);
+}
 int co_serializable(void) { return 0; }
 #else
 // ---- JSPI fibers (browsers with WebAssembly.Suspending; solo only) ----

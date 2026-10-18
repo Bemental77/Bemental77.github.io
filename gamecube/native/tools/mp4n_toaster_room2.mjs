@@ -139,7 +139,8 @@ async function launch(role, cpus) {
   deviceScan(P); P.scan = setInterval(() => deviceScan(P), 300);
   P.page = (await browser.pages())[0] || await browser.newPage();
   P.page.on('pageerror', (e) => P.errs.push(String(e.message).slice(0, 200)));
-  P.page.on('console', (m) => { const t = m.text();
+  P.tail = [];
+  P.page.on('console', (m) => { const t = m.text(); P.tail.push(`${ts()} ${t.slice(0, 300)}`); if (P.tail.length > 400) P.tail.shift();
     if (/ARMED|armed|desync|delay lockstep|zero-lag|capacity|room:|⚠/i.test(t) && P.lines.length < 200) { const L = `${ts()} ${role} ${t.slice(0, 220)}`; P.lines.push(L); console.log('  ' + L); } });
   const mq = '/tmp/npdm/mqtt-5.3.4.min.js';
   if (!fs.existsSync(mq)) execSync(`mkdir -p /tmp/npdm && curl -sS -f -o ${mq} https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.3.4/mqtt.min.js`);
@@ -202,7 +203,8 @@ const probe = () => {
     const frame = room ? r.stats.live : (m ? m._mp4web_total() : null);
     return { t, frame, pres: m && m._mp4web_drawn ? m._mp4web_drawn() : (room ? r.stats.live - r.stats.hidden : frame), hz: 60, state: room ? e.state : (frame > 0 ? 'running' : null),
              stalls: r.stats.holds, rb: e.rollback, delay: e.delay, desync: !!e.desync, hc: e.hashesCompared, rollbacks: r.stats.rollbacks,
-             busy: m ? m._mp4web_busy_ms() : null, total: m ? m._mp4web_total() : null };
+             busy: m ? m._mp4web_busy_ms() : null, total: m ? m._mp4web_total() : null, st: r.stats,
+             rbw: e.rb ? { window: e.rb.window, meanDepth: e.rb.meanDepth, maxDepth: e.rb.maxDepth, rollbacks: e.rb.rollbacks, resimFrames: e.rb.resimFrames, predicted: e.rb.predictedFrames, catchUps: e.rb.catchUps } : null, mode: e.rollback ? 'rollback' : (e.delay != null ? 'delay' : null) };
   }
   const g = window.__gcLockstep ? window.__gcLockstep() : null, R = window.__gcRate || {};
   const room = !!(g && g.gated);
@@ -268,8 +270,10 @@ try {
     const o = out.players[P.role] = { openT: P.t0, skip: SKIP, win: { n: w.length, x: mean(w.map((r) => r.x)), min: w.length ? Math.min(...w.map((r) => r.x)) : null, presented: mean(w.map((r) => r.p).filter((v) => v != null)), msPerFrame: mean(w.map((r) => r.ms).filter((v) => v != null)) },
       steady: { n: steady.length, x: mean(steady.map((r) => r.x)) },
       stalls: last.stalls != null && first.stalls != null ? last.stalls - first.stalls : null, stallMs: last.stallMs != null && first.stallMs != null ? Math.round(last.stallMs - first.stallMs) : null,
-      rollbacks: last.rollbacks, desync: last.desync || null, hc: last.hc, cg: deviceStat(P), lines: P.lines, errs: P.errs.slice(0, 8),
+      rollbacks: last.rollbacks, desync: last.desync || null, hc: last.hc, cg: deviceStat(P), lines: P.lines, errs: P.errs.slice(0, 8), tail: P.errs.length ? P.tail.slice(-150) : [],
+      lastStats: last.st || null, lastRb: last.rbw || null, lastMode: last.mode || null,
       rows: R.map((r) => ({ T: r.T, f: r.frame, x: r.x, st: r.state, rb: r.rb, d: r.delay, stalls: r.stalls })) };
+    if (o.lastStats) say(`STATS ${P.role}: ${JSON.stringify(o.lastStats)} rb=${JSON.stringify(o.lastRb)} mode=${o.lastMode}`);
     say(`SUMMARY ${PAGE} ${mode} ${P.role}: open@${o.openT}s window x=${o.win.x && o.win.x.toFixed(3)} min ${o.win.min && o.win.min.toFixed(3)} presented ${o.win.presented != null ? o.win.presented.toFixed(1) : '-'}/s host ${o.win.msPerFrame != null ? o.win.msPerFrame.toFixed(1) : '-'} ms/frame (n=${o.win.n}, first ${SKIP}s discarded)  steady x=${o.steady.x && o.steady.x.toFixed(3)}  stalls ${o.stalls}  desync=${o.desync} hc=${o.hc}  throttled ${o.cg.nr_throttled}/${o.cg.nr_periods}`);
     await P.page.screenshot({ path: path.join(OUTD, `${name}-${P.role}.png`) }).catch(() => {});
   }

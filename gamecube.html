@@ -9087,7 +9087,8 @@ window.GcRate = (function () {
   // not bound longer windows (a deficit second lets the next one burst: 1.047x over the next 6 s); a token
   // bucket bounds them but repays far less (1.01x / depth 2: relay rooms 0.945x and a direct room's host
   // 45 frames behind, stuck in REJOIN; 1.002x / depth 4: relay rooms 0.959-0.978x, from 0.984-0.991x).
-  // ROLLBACK FRAMES ARE NOT PACED (running ahead is rollback's to do): there a console that loses time
+  // [SUPERSEDED 2026-10-17: rollback rooms are paced too, see gcLsStep; REJOIN stays exempt.]
+  // ROLLBACK FRAMES WERE NOT PACED (running ahead is rollback's to do): there a console that loses time
   // must close the gap to the room or sit in REJOIN behind a held picture. MEASURED with them paced: a
   // direct room's joiner lost 12 frames, entered REJOIN and showed a held frame for 10 s (981 hidden
   // frames) while the pace held its banked credits.
@@ -10588,7 +10589,12 @@ window.GcRate = (function () {
     }
     if (!hidden && gcLsEarned <= 0) return;      // the wall clock has not earned a frame — this is the 1.000x half
     // CATCH-UP IS PACED (see PACE_RATE): the credit stays banked and is spent once the ceiling allows it.
-    if (!(ls.rollback > 0) && !rejoining && gcPaceFull(nowMs)) {
+    // ROLLBACK ROOMS ARE PACED TOO (2026-10-17): unpaced, a recomp MP4 rollback room on the toaster rig
+    // (gamecube/native/tools/mp4n_toaster_room2.mjs, CPU / 6.2) hit 5 s windows of 1.047 / 1.070x while
+    // catching up — the guest faster than the hardware. Paced: 1.014 / 1.015x max, mean 1.000 / 1.000x;
+    // tools/gc_netplay_room_test.mjs 21/21 (240 s, mean 0.9998x, max window 1.0050x, 3860 rewinds).
+    // Every room holds the same 1.0167x-per-5 s ceiling; a REJOINING console stays exempt.
+    if (!rejoining && gcPaceFull(nowMs)) {
       if (hidden) RBP.catchUp = 0;     // re-measured next tick, never owed twice
       GCLS.paceHeld = (GCLS.paceHeld | 0) + 1; GCLS.paceMs = (GCLS.paceMs || 0) + stepDt;
       return;

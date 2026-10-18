@@ -115,6 +115,15 @@ static double g_gpuWait = 0.0;    // of g_busy: ms spent yielded inside a frame 
 // only frames that run faster than the clock, and they are not presented).
 static double g_maxDebt = 250.0;
 extern "C" EMSCRIPTEN_KEEPALIVE void mp4web_set_max_debt(double ms) { g_maxDebt = ms; }
+// A ROOM MAY CATCH UP, BUT NEVER FAST. Time a room console loses waiting on an input used to be
+// dropped outright (debt capped at one frame), so every stall lowered its guest rate for good.
+// Now a token bucket lets it keep some of that time: +rate frames of credit per frame run, at most
+// cap frames held; a late console keeps min(lateness, credit) and runs it back to back. With
+// cap 2.5 and rate 1/120 no 5 s window can run more than 300 + 5 frames: 1.0167x, GameCube's bar.
+static double g_catchTokens = 0.0, g_catchCap = 0.0, g_catchRate = 0.0;
+extern "C" EMSCRIPTEN_KEEPALIVE void mp4web_set_catchup(double capFrames, double ratePerFrame) {
+  g_catchCap = capFrames; g_catchRate = ratePerFrame; if (g_catchTokens > g_catchCap) g_catchTokens = g_catchCap;
+}
 
 // The hook's answer, a bit set:
 //   1  re-anchor the pacing clock (after a restore that is not a room rewind)
@@ -158,11 +167,20 @@ extern "C" void frame_limiter() {
   if (!(fl & kHookOffSchedule)) {
     ++g_frame;
     double due = g_t0 + static_cast<double>(g_frame) * period;
-    if (now - due > g_maxDebt) { g_t0 = now; g_frame = 0; ++g_reanchors; due = now; }
+    // lateness is read BEFORE the debt cap re-anchors the clock: a room caps the debt at one frame,
+    // so after re-anchoring it never looks late, and its frames were never skipped (every live room
+    // frame was drawn on a device that could not afford it)
+    const double late = now - due;
+    if (late > g_maxDebt) {
+      double keep = 0.0;
+      if (g_catchCap > 0.0) { keep = late < g_catchTokens * period ? late : g_catchTokens * period; g_catchTokens -= keep / period; }
+      g_t0 = now - keep; g_frame = 0; ++g_reanchors; due = g_t0;
+    }
+    if (g_catchCap > 0.0) { g_catchTokens += g_catchRate; if (g_catchTokens > g_catchCap) g_catchTokens = g_catchCap; }
     const double wait = due - now;
     // the next frame: drawn, unless the room already said not to, or this console is behind
     if (!mp4web_gfx_skip_draws) {
-      if (wait < -0.5 * period && g_skipRun < g_skipMax) { mp4web_gfx_skip_draws = 1; ++g_skipRun; ++g_autoSkipped; }
+      if (late > 0.5 * period && g_skipRun < g_skipMax) { mp4web_gfx_skip_draws = 1; ++g_skipRun; ++g_autoSkipped; }
       else g_skipRun = 0;
     }
     emscripten_sleep(wait > 0 ? static_cast<unsigned>(wait) : 0);
