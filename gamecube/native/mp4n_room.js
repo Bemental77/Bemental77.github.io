@@ -206,7 +206,7 @@
     var known = (ls.localPorts && ls.localPorts.length) ? ls.localPorts : null;
     if (!known && R.role !== 'host') return {};      // a guest with no seat yet drives nobody's pad
     var ports = known || [0], out = {};
-    var mine = window.Mp4Input ? Mp4Input.sampleLocal() : new Uint8Array(PAD_BYTES);
+    var mine = window.Mp4Input ? Mp4Input.sampleLocal((ls.frame | 0) + (ls.delay | 0)) : new Uint8Array(PAD_BYTES);   // the frame this input is for
     ports.forEach(function (p, k) { out[p] = k === 0 ? mine : new Uint8Array(PAD_BYTES); });
     return out;
   }

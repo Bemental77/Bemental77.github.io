@@ -10,10 +10,12 @@
   (global $base (mut i32) (i32.const 0))
   (global $pages (mut i32) (i32.const 0))      ;; 0 = barrier off
   (global $table (mut i32) (i32.const 0))      ;; one byte per 4 KB page: 1 = already copied this frame
+  (global $span8 (mut i32) (i32.const 0))      ;; pages*4096 + 8 (0 = barrier off): the store filter below
 
   (func (export "mp4web_barrier_present") (result i32) (i32.const 1))
   (func (export "mp4web_barrier_init") (param $b i32) (param $n i32) (param $t i32)
-    (global.set $base (local.get $b)) (global.set $pages (local.get $n)) (global.set $table (local.get $t)))
+    (global.set $base (local.get $b)) (global.set $pages (local.get $n)) (global.set $table (local.get $t))
+    (global.set $span8 (if (result i32) (local.get $n) (then (i32.add (i32.shl (local.get $n) (i32.const 12)) (i32.const 8))) (else (i32.const 0)))))
 
   (func $mark (param $a i32) (param $len i32)
     (local $p i32)
@@ -32,9 +34,19 @@
       (then (if (i32.eqz (i32.load8_u (i32.add (global.get $table) (local.get $p))))
         (then (call $cow (local.get $p)))))))
 
+  ;; EVERY store in the module comes through here (no function is exempt). The filter is the part that
+  ;; inlines at each store site: one add, one unsigned compare, one branch. It passes a store whose first
+  ;; byte is in [base - 8, base + pages*4096): inside the tracked range, or starting up to 8 bytes below
+  ;; it and so possibly reaching into its first page. Everything else (Aurora, WebGPU, libc buffers
+  ;; outside the game's ranges) skips the call; inside, $mark does the page check exactly as before.
   (func (export "store_ptr") (param $id i32) (param $bytes i32) (param $off i32) (param $ptr i32) (result i32)
-    (call $mark (i32.add (local.get $ptr) (local.get $off)) (local.get $bytes))
+    (if (i32.lt_u (i32.add (i32.sub (i32.add (local.get $ptr) (local.get $off)) (global.get $base)) (i32.const 8)) (global.get $span8))
+      (then (call $mark_in (i32.add (local.get $ptr) (local.get $off)) (local.get $bytes))))
     (local.get $ptr))
+  (func $mark_in (param $a i32) (param $len i32)
+    (if (i32.lt_u (local.get $a) (global.get $base))
+      (then (call $mark2 (i32.add (local.get $a) (i32.sub (local.get $len) (i32.const 1)))) (return)))
+    (call $mark (local.get $a) (local.get $len)))
   (func (export "load_ptr") (param i32 i32 i32) (param $ptr i32) (result i32) (local.get $ptr))
   (func (export "load_val_i32") (param i32) (param $v i32) (result i32) (local.get $v))
   (func (export "load_val_i64") (param i32) (param $v i64) (result i64) (local.get $v))

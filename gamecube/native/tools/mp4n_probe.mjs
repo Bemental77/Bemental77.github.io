@@ -6,6 +6,7 @@
 //   NSHOT=n          screenshots/state samples over the run (out_0.png ..)
 //   SCRIPT='[[f0,f1,buttons],..]'  port-0 input by guest frame (GC PAD_* bits; 4096=Start, 256=A)
 //   NAV=board        overlay-relative route: title -> file -> Party Mode -> 1P+3COM -> board -> play
+//                    (NAVLEFT=n board-select LEFT presses, default 4; NAVASTEP=n A every n frames on the board, default 150)
 //   HASHOUT=f.json   with &hash=N: game-state hashes every N frames (compare two runs for determinism)
 //   SNAPTEST=f1,f2   whole-memory snapshot at f1, run to f2, restore, rerun, compare hashes
 //   DIFFAT=f DIFFOUT=f.json [DUMPADDR=a]  per-4KB state checksums at frame f (find what diverges)
@@ -89,15 +90,15 @@ try {
     p.on('console', (msg) => { const mm = /DLLStart (\d+)/.exec(msg.text()); if (mm) p.evaluate((o) => { const m = window.__mp4n && window.__mp4n.module; (window.__ovl = window.__ovl || {})[o] = m ? m._mp4web_total() : 0; window.__ovlLast = o; }, +mm[1]).catch(() => {}); });
     await p.waitForFunction(() => window.Mp4Input, { timeout: 120000 });
     if (process.env.NAVEXTRA) await p.evaluate((x) => { window.__navExtra = JSON.parse(x); }, process.env.NAVEXTRA);
-    await p.evaluate(() => {
+    await p.evaluate((nl, astep) => {
       const A = 256, START = 4096, LEFT = 1;
       const rel70 = [];
       for (const f of [110, 260, 410, 560, 710]) rel70.push([f, A]);
-      for (const f of [860, 900, 940, 980]) rel70.push([f, LEFT]);
+      for (let k = 0; k < nl; k++) rel70.push([860 + 40 * k, LEFT]);   // NAVLEFT: board-select presses (default 4)
       if (window.__navExtra) { for (const e of window.__navExtra) rel70.push(e); } else {
       for (let f = 1060; f <= 3310; f += 200) rel70.push([f, A]);
       rel70.push([3510, START], [3710, START]);
-      for (let f = 3910; f < 30000; f += 150) rel70.push([f, A]); }
+      for (let f = 3910; f < 30000; f += astep) rel70.push([f, A]); }   // NAVASTEP: A every N frames on the board (default 150)
       window.Mp4Input.override((f) => {
         const o = new Array(32).fill(0); o[0] = 1; const ov = window.__ovl || {};
         let btn = 0;
@@ -106,7 +107,7 @@ try {
         else if (f > 900 && f % 100 < 8) btn |= START;
         o[1] = btn; return o;
       });
-    });
+    }, +(process.env.NAVLEFT || 4), +(process.env.NAVASTEP || 150));
   }
   const n = +(process.env.NSHOT || 1);
   for (let k = 0; k < n; k++) {
