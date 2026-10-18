@@ -255,20 +255,24 @@
         'Banjo-Kazooie: Christmas Edition', 'Star Fox: Survival',
         'Super Mario Odyssey 64 (hack)',
       ].map(function (l) { return { key: l, label: l }; }) },
-    { key: 'gamecube', name: 'GameCube', page: '/gamecube.html', handoff: '/gamecube.html?np=', hostFlag: '',
+    // THE DEFAULT FOR MARIO PARTY 4: the native source port (mp4-native.html) — Mario Party 4 compiled
+    // to WebAssembly, no emulator. Rooms of 2-4 (gamecube/native/mp4n_room.js): rollback where the
+    // console can afford it, delay lockstep where it cannot; the host starts when the party is in, or
+    // sooner with "Start with N players now". Chosen over the GameCube-engine entry below on fair
+    // numbers (gamecube/native/tools/mp4n_toaster_room2.mjs, 60 s rooms): desktop 0.997x vs 0.999-1.000x
+    // (a tie, and native presents more frames: 7.7-7.9/s vs 4.9-5.8/s), toaster (CPU / 6.2) 0.979x vs
+    // 0.754x. It needs WebGPU; where there is none the GameCube-engine entry is picked instead.
+    { key: 'mp4native', name: 'Mario Party 4', page: '/mp4-native.html', handoff: '/mp4-native.html?np=', hostFlag: '',
+      players: 4, note: 'Mario Party 4 on its native port — up to four players. The host starts once everyone is in. Needs WebGPU (Chrome or Edge); without it, use GameCube (emulator).',
+      games: [ { key: 'Mario Party 4', label: 'Mario Party 4 (native port)' } ] },
+    { key: 'gamecube', name: 'GameCube (emulator)', page: '/gamecube.html', handoff: '/gamecube.html?np=', hostFlag: '',
       players: 4,
       // tools/undelivered.mjs 'gamecube-lockstep-is-mario-party-4-only': the
       // frame gate is built on the recomp engine, and the recomp is the Mario
       // Party 4 port. The other three titles run on the JIT path, which has no
       // one-emulated-frame boundary to gate — so they are NOT offered here.
-      note: 'Only Mario Party 4 can run a room on GameCube — the other titles have no frame gate yet.',
+      note: 'Mario Party 4 on the GameCube emulator — the fallback for browsers without WebGPU. Only Mario Party 4 can run a room here; the other titles have no frame gate yet.',
       games: [ { key: 'Mario Party 4', label: 'Mario Party 4' } ] },
-    // The native source port (mp4-native.html): Mario Party 4 compiled to WebAssembly, no
-    // emulator. Rollback rooms of 2-4 (gamecube/native/mp4n_room.js); the host starts when the
-    // party is in, or sooner with "Start with N players now".
-    { key: 'mp4native', name: 'Mario Party 4 (native)', page: '/mp4-native.html', handoff: '/mp4-native.html?np=', hostFlag: '',
-      players: 4, note: 'The native port — up to four players, zero input delay (rollback). The host starts once everyone is in.',
-      games: [ { key: 'Mario Party 4', label: 'Mario Party 4 (native port)' } ] },
     { key: 'genesis', name: 'Sega Genesis', page: '/genesis.html', handoff: '/genesis.html?np=', hostFlag: 'host=1',
       // 4 since 2026-10-07: a Team Player / 4-Way Play goes in for 3+ seated on
       // a cart that takes one (genesis.html genMultitapPlan). Neither listed
@@ -400,6 +404,23 @@
   // the default is the Dreamcast, whose four-port co-op is what this exists for.
   var preSys = QS.get('sys'), preGame = QS.get('game');
   if (!pickConsole(preSys, preGame)) pickConsole('dreamcast', preGame);
+  // THE MARIO PARTY 4 FALLBACK. The native port draws only through WebGPU, so a host whose browser has
+  // none is offered the GameCube-engine entry instead. Measured by asking for an adapter, never by the
+  // presence of navigator.gpu (CLAUDE.md: navigator.gpu is truthy where requestAdapter() resolves null).
+  (function () {
+    var c = chips.mp4native; if (!c) return;
+    var none = function () {
+      c.lastChild.textContent = 'needs WebGPU \u00b7 use GameCube (emulator)';
+      if (sys && sys.key === 'mp4native' && !code) {
+        pickConsole('gamecube', 'Mario Party 4');
+        $('sysNote').textContent = 'This browser has no working WebGPU, which the native Mario Party 4 port needs, so this room uses the GameCube emulator. ' + (BY_KEY.gamecube.note || '');
+      }
+    };
+    try {
+      if (!navigator.gpu || typeof navigator.gpu.requestAdapter !== 'function') { none(); return; }
+      navigator.gpu.requestAdapter().then(function (a) { if (!a) none(); }, none);
+    } catch (e) { none(); }
+  })();
   // A page's Party button naming a single-player game: say so, rather than
   // silently swapping in a different game.
   if (preSys && preGame && MPGames.isSolo(preSys, preGame)) {
