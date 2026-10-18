@@ -87,13 +87,20 @@ const T = () => ((Date.now() - t0) / 1000).toFixed(0) + 's';
 try {
   for (let i = 0; i < N; i++) {
     const page = await openWindowPage();
+    // SENDTIME=1 (diagnostic): time every RTCDataChannel / WebSocket send on the page
+    if (process.env.SENDTIME === '1') await page.evaluateOnNewDocument(() => {
+      const T = window.__sendT = { dc: 0, dcN: 0, ws: 0, wsN: 0, dcMax: 0 };
+      const wrap = (proto, k, kn) => { const f = proto.send; proto.send = function () { const t0 = performance.now(); try { return f.apply(this, arguments); } finally { const d = performance.now() - t0; T[k] += d; T[kn]++; if (k === 'dc' && d > T.dcMax) T.dcMax = d; } }; };
+      if (window.RTCDataChannel) wrap(RTCDataChannel.prototype, 'dc', 'dcN');
+      if (window.WebSocket) wrap(WebSocket.prototype, 'ws', 'wsN');
+    });
     if (MIXED && i % 2) {
       await page.setViewport({ width: 390, height: 844, deviceScaleFactor: 3, isMobile: true, hasTouch: true });
       const cdp = await page.target().createCDPSession(); await cdp.send('Emulation.setCPUThrottlingRate', { rate: 2 });
     } else await page.setViewport({ width: 880, height: 760 });
     const tag = i ? 'G' + i : 'H';
     const errs = [], logs = [], ovl = [];
-    page.on('pageerror', (e) => errs.push(String((e && e.message) || e)));
+    page.on('pageerror', (e) => { errs.push(String((e && e.message) || e)); if (e && e.stack) console.log(`  [${tag} ${T()}] PAGEERROR ${String(e.stack).split('\n').slice(0, 8).join(' | ').slice(0, 900)}`); });
     page.on('response', (r) => { if (r.status() >= 400 && !/favicon/.test(r.url())) errs.push('HTTP ' + r.status() + ' ' + r.url()); });
     page.on('console', (msg) => { const t = msg.text(); const om = /DLLStart (\d+)/.exec(t); if (om) { ovl.push(+om[1]); page.evaluate((o) => { window.__routeOvl = o; }, +om[1]).catch(() => {}); console.log(`  [${tag} ${T()}] overlay ${om[1]}`); } if (/^\[mp4n\] room|desync|DESYNC/.test(t)) { logs.push(T() + ' ' + t); console.log(`  [${tag} ${T()}] ${t.slice(0, 220)}`); } if (msg.type() === 'error' && !/favicon|Failed to load resource/i.test(t)) errs.push(t.slice(0, 300)); });
     let q = `np=${CODE}&game=${encodeURIComponent('Mario Party 4')}&net=local&players=${N}`;
@@ -151,7 +158,7 @@ try {
     }
   })());
   // run until every console has FRAMES live frames, a desync, or the timeout
-  let last = null; let shot = 0;
+  let last = null; let shot = 0; let lastKey = '', sameFor = 0, stalled = false;
   for (;;) {
     await sleep(10000);
     last = await rep();
@@ -159,6 +166,13 @@ try {
     const des = last.some((x) => x.r && (x.r.stopReason === 'desync' || (x.r.engine && x.r.engine.desync)));
     console.log(`  [${T()}] frames ${fr.join('/')} rewinds ${last.map((x) => x.r && x.r.stats.rollbacks).join('/')} compared ${last.map((x) => x.r && x.r.engine && x.r.engine.hashesCompared).join('/')} states ${last.map((x) => x.r && x.r.engine && x.r.engine.state).join('/')}`);
     if (SHOTS && shot++ % 6 === 0) { fs.mkdirSync(SHOTS, { recursive: true }); for (const p of P) await p.page.screenshot({ path: path.join(SHOTS, `${p.tag}_${T()}.png`) }).catch(() => {}); }
+    // A ROOM THAT STOPS MOVING is reported, not waited out: 60 s with no console advancing ends the run
+    // with what each console says it is waiting for, its phase and its errors.
+    const key = fr.join('/');
+    if (key === lastKey) { if (++sameFor >= 6) {
+      const why = await Promise.all(P.map((p) => p.page.evaluate(() => { const r = window.Mp4Room && Mp4Room.report(); return { phase: window.__mp4n && window.__mp4n.phase, errors: window.__mp4n && window.__mp4n.errors, waiting: r && r.waiting, holdWhy: r && r.stats && r.stats.holdWhy, state: r && r.engine && r.engine.state, total: window.__mp4n && window.__mp4n.module && window.__mp4n.module._mp4web_total() }; }).catch((e) => ({ err: String(e) }))));
+      console.log('  STALLED ' + JSON.stringify(why).slice(0, 2000)); stalled = true; break; } }
+    else { sameFor = 0; lastKey = key; }
     if (des || last.some((x) => x.r && x.r.failed) || fr.every((f) => f >= FRAMES) || Date.now() - t0 > TIMEOUT) break;
   }
   stop = true; await Promise.all(pressers);
@@ -179,6 +193,7 @@ try {
   const compared = last.map((x) => (x.r && x.r.engine && x.r.engine.hashesCompared) || 0);
   console.log(`  frames ${fr.join('/')} presses ${presses} at ${T()}`);
   console.log('  stats ' + JSON.stringify(last.map((x) => x.r && x.r.stats)));
+  if (process.env.SENDTIME === '1') console.log('  sendtime ' + JSON.stringify(await Promise.all(P.map((p) => p.page.evaluate(() => window.__sendT).catch(() => null)))));
   if (BREAK) {
     ok('control-the-broken-console-is-caught', desynced || differ.length > 0,
        `engine desync=${desynced}, fingerprints differing at ${differ.length} of ${common} common frames (first ${differ.slice(0, 3).join(',')})`);
@@ -199,7 +214,8 @@ try {
     ok('in-sync-cross-check', common >= 3 && differ.length === 0, `${common} frames fingerprinted by all ${N} consoles, ${differ.length} differ`);
     if (SCRIPT) {
       // the route: every console loaded the same overlays in the same order (a prefix: one may be a load behind)
-      const seqs = P.map((p) => p.ovl), n = Math.min(...seqs.map((q) => q.length));
+      // a rollback across an overlay's first frame runs its DLLStart again on that console: collapse repeats
+      const seqs = P.map((p) => p.ovl.filter((o, k, a) => k === 0 || a[k - 1] !== o)), n = Math.min(...seqs.map((q) => q.length));
       const same = seqs.every((q) => q.slice(0, n).join() === seqs[0].slice(0, n).join());
       ok('route-same-overlays-on-every-console', same && n >= 4, seqs.map((q, k) => P[k].tag + ':' + q.join(' ')).join('  '));
     }
