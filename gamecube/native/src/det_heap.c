@@ -33,7 +33,9 @@ typedef struct Heap {
 static _Alignas(4096) unsigned char g_arena[HEAP_BYTES];   // page-aligned: rollback tracks whole pages
 // Process fiber stacks get their own arena: their addresses must be deterministic (the game keeps
 // them), but the bytes below each live frame are stale scratch, so the state hash skips this range.
-#define STACK_BYTES ((size_t)8 * 1024 * 1024)
+// 32 MB: an Asyncify fiber takes >= 128 KB (64 KB C stack minimum + 64 KB unwind buffer), and m411
+// runs ~100 processes at once; 8 MB ran out there (the GameCube's own heap held its small stacks)
+#define STACK_BYTES ((size_t)32 * 1024 * 1024)
 static _Alignas(4096) unsigned char g_stackArena[STACK_BYTES];
 static Heap g_heap = {g_arena, HEAP_BYTES, NULL, 0, 0, 0, 0, "det_heap"};
 static Heap g_stacks = {g_stackArena, STACK_BYTES, NULL, 0, 0, 0, 0, "det_stacks"};

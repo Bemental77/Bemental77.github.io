@@ -74,10 +74,14 @@
   var logEl = document.getElementById('log'), statusEl = document.getElementById('status');
   var btn = document.getElementById('btnStart');
   var lines = [];
+  // the on-page log is redrawn at most once a frame: some minigames (m449) print ~300 lines a second,
+  // and a textContent rewrite + scrollTop read per line forced a layout each time (m449 ran at ~0.5x)
+  var logDirty = false;
+  function logFlush() { logDirty = false; logEl.textContent = lines.join('\n'); logEl.scrollTop = logEl.scrollHeight; }
   function log(s) {
     console.log('[mp4n] ' + s);
     lines.push(s); if (lines.length > 400) lines.shift();
-    logEl.textContent = lines.join('\n'); logEl.scrollTop = logEl.scrollHeight;
+    if (!logDirty) { logDirty = true; requestAnimationFrame(logFlush); }
   }
   function status(s) { statusEl.textContent = s; }
   window.__mp4n = { phase: 'idle', errors: [] };
@@ -186,6 +190,8 @@
           } catch (e) { log('saves: ' + e); }
         }],
         mp4EpochSeconds: room ? room.epoch : Q.get('epoch') ? +Q.get('epoch') : undefined,
+        mp4DebugMg: !room && Q.get('mg') ? +Q.get('mg') : undefined,   // crash sweep: boot straight into minigame N (401..463)
+        mp4DebugBoard: !room && Q.get('board') ? +Q.get('board') : undefined,   // crash sweep: boot straight into Party Mode board N (0..5 = w01..w06, 6 = w10)
         mp4InputLatch: function (frame, ptr) { var m = window.__mp4n.module; Mp4Input.latch(frame, ptr, m && m.HEAP32); },
         locateFile: function (p) { return BUILD + p; },
         print: function (t) { log(t); },
