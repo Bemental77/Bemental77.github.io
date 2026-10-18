@@ -303,7 +303,7 @@ index 2d7f795..17cb345 100644
            g_keyboardBindings[i].m_buttonMapping, [&kbState, &i, &status](const PADKeyButtonBinding& mapping) {
              if (mapping.scancode > PAD_KEY_INVALID && kbState[mapping.scancode]) {
 diff --git a/lib/gfx/common.cpp b/lib/gfx/common.cpp
-index eff0c65..fe41a41 100644
+index eff0c65..dcf7c96 100644
 --- a/lib/gfx/common.cpp
 +++ b/lib/gfx/common.cpp
 @@ -1,4 +1,41 @@
@@ -588,6 +588,22 @@ index eff0c65..fe41a41 100644
        cmd.CopyTextureToTexture(&op.textureCopy->src, &op.textureCopy->dst, &op.textureCopy->size);
      }
      break;
+@@ -1392,7 +1550,14 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
+       const auto& vp = cmd.data.setViewport;
+       const float minDepth = gx::UseReversedZ ? 1.f - vp.zfar : vp.znear;
+       const float maxDepth = gx::UseReversedZ ? 1.f - vp.znear : vp.zfar;
+-      pass.SetViewport(vp.left, vp.top, vp.width, vp.height, minDepth, maxDepth);
++      // GX accepts a negative viewport width/height (a mirrored viewport); WebGPU rejects it as a
++      // validation error, which aborted the whole game (MP4 minigame overlay 19, measured twice in
++      // gamecube/native/tools/mp4n_room_test.mjs --script runs: "Viewport bounds (width: -13.2..."). Draw
++      // into the same rectangle with positive extents instead of failing the frame.
++      float vl = vp.left, vt = vp.top, vw = vp.width, vh = vp.height;
++      if (vw < 0.f) { vl += vw; vw = -vw; }
++      if (vh < 0.f) { vt += vh; vh = -vh; }
++      pass.SetViewport(vl, vt, vw, vh, minDepth, maxDepth);
+     } break;
+     case CommandType::SetScissor: {
+       const auto& sc = cmd.data.setScissor;
 diff --git a/lib/gfx/common.hpp b/lib/gfx/common.hpp
 index db245d0..271d28e 100644
 --- a/lib/gfx/common.hpp

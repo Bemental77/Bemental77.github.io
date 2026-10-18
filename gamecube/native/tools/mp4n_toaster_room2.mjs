@@ -163,6 +163,13 @@ async function launch(role, cpus) {
   makeDevice(P, cpus);
   deviceScan(P); P.scan = setInterval(() => deviceScan(P), 300);
   P.page = (await browser.pages())[0] || await browser.newPage();
+  // SENDTIME=1 (diagnostic): time every RTCDataChannel / WebSocket send on the page (window.__sendT)
+  if (process.env.SENDTIME === '1') await P.page.evaluateOnNewDocument(() => {
+    const T = window.__sendT = { dc: 0, dcN: 0, dcMax: 0, ws: 0, wsN: 0 };
+    const wrap = (proto, k, kn) => { const f = proto.send; proto.send = function () { const t0 = performance.now(); try { return f.apply(this, arguments); } finally { const d = performance.now() - t0; T[k] += d; T[kn]++; if (k === 'dc' && d > T.dcMax) T.dcMax = d; if (k === 'dc') { const L = 'lab_' + this.label; T[L] = (T[L] || 0) + d; T[L + 'N'] = (T[L + 'N'] || 0) + 1; } } }; };
+    if (window.RTCDataChannel) wrap(RTCDataChannel.prototype, 'dc', 'dcN');
+    if (window.WebSocket) wrap(WebSocket.prototype, 'ws', 'wsN');
+  });
   P.page.on('pageerror', (e) => P.errs.push(String(e.message).slice(0, 200)));
   P.tail = [];
   P.page.on('console', (m) => { const t = m.text(); P.tail.push(`${ts()} ${t.slice(0, 300)}`); if (P.tail.length > 400) P.tail.shift();
@@ -313,6 +320,7 @@ try {
       for (const [pid, v] of Object.entries(P.cpu1.c)) by[v.k] = (by[v.k] || 0) + 1000 * (v.t - ((P.cpu0.c[pid] || {}).t || 0)) / fr;
       for (const k of Object.keys(by)) by[k] = +by[k].toFixed(2);
       o.cpuMsPerFrame = by; say(`CPU ${P.role}: ms per guest frame by process ${JSON.stringify(by)} over ${fr} frames / ${sec.toFixed(0)} s`); }
+    if (process.env.SENDTIME === '1') { try { say(`SENDTIME ${P.role}: ${JSON.stringify(await P.page.evaluate(() => window.__sendT))}`); } catch (e) {} }
     say(`SUMMARY ${PAGE} ${mode} ${P.role}: open@${o.openT}s window x=${o.win.x && o.win.x.toFixed(3)} min ${o.win.min && o.win.min.toFixed(3)} presented ${o.win.presented != null ? o.win.presented.toFixed(1) : '-'}/s host ${o.win.msPerFrame != null ? o.win.msPerFrame.toFixed(1) : '-'} ms/frame (n=${o.win.n}, first ${SKIP}s discarded)  steady x=${o.steady.x && o.steady.x.toFixed(3)}  stalls ${o.stalls}  desync=${o.desync} hc=${o.hc}  throttled ${o.cg.nr_throttled}/${o.cg.nr_periods}`);
     await P.page.screenshot({ path: path.join(OUTD, `${name}-${P.role}.png`) }).catch(() => {});
   }
