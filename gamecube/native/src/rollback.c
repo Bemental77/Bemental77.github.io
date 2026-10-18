@@ -31,7 +31,18 @@ extern void mp4web_barrier_init(uint32_t base, uint32_t pages, uint32_t table);
 extern int mp4web_barrier_present(void);
 
 static uint32_t g_base, g_pages;           // tracked .bss, page-aligned inward
-static uint8_t* g_table;                   // 1 = page already logged in the open frame
+// THE PAGE TABLE the inline store check reads (wb/inline_hooks.py bakes its address, and the tracked
+// range's base and size, into every store site as constants, read from the link map): one byte per
+// tracked page, 1 = nothing to do (already logged in the open frame, or rollback is off), 0 = not yet
+// logged -> the store takes the slow path. Outside the game's ranges (this file is).
+#define T_MAX (1u << 16)                   // 256 MB of tracked state
+uint8_t mp4wb_table[T_MAX];
+static uint8_t* g_table = mp4wb_table;
+// A restore is writing pages: log nothing. VOLATILE, measured: as a plain int the compiler saw no read
+// of it between `= 1` and `= 0` in mp4web_rb_restore (memcpy is a builtin; the barrier that calls
+// mp4web_cow is merged in after the link) and deleted the `= 1`, so the restore's own copies were
+// logged — an inexact restore at k = 2217 and a hung game.
+static volatile int g_restoring;
 static uint8_t* g_pool;                    // page images, a ring of g_cap slots
 static uint32_t* g_ent;                    // page index of each logged image, same ring
 static uint32_t g_cap;
@@ -65,7 +76,7 @@ static void mark_stale(uint32_t p) {
 
 // The barrier calls this the first time a page is written in the open frame.
 EMSCRIPTEN_KEEPALIVE void mp4web_cow(uint32_t p) {
-  if (!g_on || p >= g_pages || g_table[p]) return;
+  if (!g_on || g_restoring || p >= g_pages || g_table[p]) return;
   g_table[p] = 1;
   const uint32_t slot = (uint32_t)(g_head % g_cap);
   memcpy(g_pool + (size_t)slot * PAGE, (const void*)(uintptr_t)(g_base + (p << PAGE_SHIFT)), PAGE);
@@ -73,6 +84,15 @@ EMSCRIPTEN_KEEPALIVE void mp4web_cow(uint32_t p) {
   ++g_head;
   if (g_head > g_cap) g_overwritten = g_head - g_cap;
   mark_stale(p);
+}
+
+// Before anything runs: the table says "nothing to do" everywhere, and the barrier's slow path learns
+// the range (the same one inline_hooks.py baked into the store sites).
+__attribute__((constructor(101))) static void table_init(void) {
+  memset(mp4wb_table, 1, sizeof mp4wb_table);
+  const uint32_t b = ((uint32_t)(uintptr_t)mp4web_game_bss_b + PAGE - 1) & ~(PAGE - 1);
+  const uint32_t e = (uint32_t)(uintptr_t)mp4web_game_bss_e & ~(PAGE - 1);
+  mp4web_barrier_init(b, (e - b) >> PAGE_SHIFT, (uint32_t)(uintptr_t)mp4wb_table);
 }
 
 // JS is about to write [a, a+n) directly (the disc reader): log those pages first.
@@ -94,15 +114,15 @@ EMSCRIPTEN_KEEPALIVE int mp4web_rb_enable(int32_t frame, uint32_t ring, uint32_t
   g_dsize = (uint32_t)(mp4web_game_data_e - mp4web_game_data_b);
   // the unaligned bss head/tail (< 2 pages) ride along with .data's copy
   g_ring = ring; g_cap = poolPages;
-  free(g_table); free(g_pool); free(g_ent); free(g_dcopy); free(g_ph); free(g_stale); free(g_staleList);
-  g_table = calloc(g_pages, 1);
+  free(g_pool); free(g_ent); free(g_dcopy); free(g_ph); free(g_stale); free(g_staleList);
+  if (g_pages > T_MAX) return -4;
   g_pool = malloc((size_t)g_cap * PAGE);
   g_ent = malloc(sizeof(uint32_t) * g_cap);
   g_dcopy = malloc((size_t)g_ring * (g_dsize + 2 * PAGE));
   g_ph = malloc(sizeof(uint64_t) * g_pages);
   g_stale = calloc(g_pages, 1);
   g_staleList = malloc(sizeof(uint32_t) * g_pages);
-  if (!g_table || !g_pool || !g_ent || !g_dcopy || !g_ph || !g_stale || !g_staleList) return -3;
+  if (!g_pool || !g_ent || !g_dcopy || !g_ph || !g_stale || !g_staleList) return -3;
   g_hacc = 0; g_staleN = 0;
   { uintptr_t sb, se; mp4web_stack_range(&sb, &se);
     g_skipB = (uint32_t)((sb - g_base) >> PAGE_SHIFT); g_skipE = (uint32_t)((se - g_base + PAGE - 1) >> PAGE_SHIFT); }
@@ -117,12 +137,12 @@ EMSCRIPTEN_KEEPALIVE int mp4web_rb_enable(int32_t frame, uint32_t ring, uint32_t
   g_cur = frame;
   g_log[frame % g_ring] = (FrameLog){frame, 0, 0};
   g_on = 1;
-  mp4web_barrier_init(g_base, g_pages, (uint32_t)(uintptr_t)g_table);
+  memset(g_table, 0, g_pages);               // every tracked page: not yet logged
   return (int)g_pages;
 }
 
 EMSCRIPTEN_KEEPALIVE void mp4web_rb_disable(void) {
-  mp4web_barrier_init(0, 0, 0);
+  memset(g_table, 1, g_pages);
   g_on = 0;
 }
 
@@ -177,7 +197,7 @@ EMSCRIPTEN_KEEPALIVE int mp4web_rb_restore(int32_t k) {
   if (k > g_cur) return -2;
   if ((double)k < mp4web_rb_oldest()) return -3;
   const double t0 = emscripten_get_now();
-  mp4web_barrier_init(g_base, 0, (uint32_t)(uintptr_t)g_table);   // our own copies must not be logged
+  g_restoring = 1;                               // our own copies must not be logged
   // the open frame's writes first (its log is still open), then each closed frame back to k
   uint64_t restored = 0;
   for (int64_t j = g_cur; j >= k; --j) {
@@ -195,7 +215,7 @@ EMSCRIPTEN_KEEPALIVE int mp4web_rb_restore(int32_t k) {
   g_head = g_log[k % g_ring].start;              // logs >= k are gone; their slots get reused
   g_cur = k;
   g_log[k % g_ring] = (FrameLog){k, g_head, 0};
-  mp4web_barrier_init(g_base, g_pages, (uint32_t)(uintptr_t)g_table);
+  g_restoring = 0;
   g_stats[3] += 1; g_stats[4] += (double)restored;
   g_stats[5] = emscripten_get_now() - t0;
   return 0;

@@ -303,10 +303,10 @@ index 2d7f795..17cb345 100644
            g_keyboardBindings[i].m_buttonMapping, [&kbState, &i, &status](const PADKeyButtonBinding& mapping) {
              if (mapping.scancode > PAD_KEY_INVALID && kbState[mapping.scancode]) {
 diff --git a/lib/gfx/common.cpp b/lib/gfx/common.cpp
-index eff0c65..495c337 100644
+index eff0c65..fe41a41 100644
 --- a/lib/gfx/common.cpp
 +++ b/lib/gfx/common.cpp
-@@ -1,4 +1,32 @@
+@@ -1,4 +1,41 @@
  #include "common.hpp"
 +#ifdef __EMSCRIPTEN__
 +#include <emscripten.h>
@@ -328,6 +328,15 @@ index eff0c65..495c337 100644
 +// Aurora is outside the game's state). Its texture uploads go through their own mapped-at-creation
 +// buffers and are submitted with the frame, so later frames see the same textures.
 +static uint8_t* g_scratch = nullptr;
++// web: a frame is recorded into this CPU buffer, and only the bytes actually used are written into the
++// mapped staging buffer at end_frame (WriteMappedRange). emdawnwebgpu's Unmap copies EVERY range handed out by
++// GetMappedRange from the wasm heap into the GPU buffer, so mapping the regions' full capacities up
++// front copied all of StagingBufferSize every frame: _emwgpuBufferUnmap was 14% of a room console's
++// busy main thread (CPU profile, rollback room, desktop).
++static uint8_t* g_shadow = nullptr;
++#ifdef __EMSCRIPTEN__
++extern "C" WGPUStatus emwgpuBufferWriteMappedRange(WGPUBuffer buffer, size_t offset, void const* data, size_t size);
++#endif
 +static uint64_t g_scratchFrames = 0;
 +static int g_gpuNoWait = 1;
 +extern "C" {
@@ -339,7 +348,7 @@ index eff0c65..495c337 100644
  
  #include "clear.hpp"
  #include "depth_peek.hpp"
-@@ -221,6 +249,8 @@ struct FramePacket {
+@@ -221,6 +258,8 @@ struct FramePacket {
    AuroraStats stats{};
    uint32_t drawCallCount = 0;
    uint32_t mergedDrawCallCount = 0;
@@ -348,7 +357,7 @@ index eff0c65..495c337 100644
  };
  
  static std::array<FramePacket, FrameSlotCount> g_framePackets;
-@@ -383,7 +413,7 @@ void queue_texture_upload_data(const uint8_t* data, size_t length, uint32_t byte
+@@ -383,7 +422,7 @@ void queue_texture_upload_data(const uint8_t* data, size_t length, uint32_t byte
                                 wgpu::TexelCopyTextureInfo tex, wgpu::Extent3D size) {
    const auto copyBytesPerRow = AURORA_ALIGN(bytesPerRow, 256);
    auto& frame = current_frame_packet();
@@ -357,7 +366,7 @@ index eff0c65..495c337 100644
      const auto range = push_texture_data(data, length, bytesPerRow, rowsPerImage);
      const wgpu::TexelCopyBufferLayout layout{
          .offset = range.offset,
-@@ -991,6 +1021,9 @@ static bool wait_for_staging_buffer(size_t slot) {
+@@ -991,6 +1030,9 @@ static bool wait_for_staging_buffer(size_t slot) {
        return false;
      }
      if (render_worker::is_idle()) {
@@ -367,7 +376,7 @@ index eff0c65..495c337 100644
        g_instance.ProcessEvents();
      } else {
        std::this_thread::sleep_for(std::chrono::milliseconds{1});
-@@ -998,6 +1031,23 @@ static bool wait_for_staging_buffer(size_t slot) {
+@@ -998,6 +1040,23 @@ static bool wait_for_staging_buffer(size_t slot) {
    }
  }
  
@@ -391,7 +400,7 @@ index eff0c65..495c337 100644
  static size_t acquire_frame_slot() {
    ZoneScopedN("Acquire frame slot");
    while (true) {
-@@ -1005,6 +1055,9 @@ static size_t acquire_frame_slot() {
+@@ -1005,6 +1064,9 @@ static size_t acquire_frame_slot() {
        return *slot;
      }
      if (render_worker::is_idle()) {
@@ -401,7 +410,7 @@ index eff0c65..495c337 100644
        g_instance.ProcessEvents();
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds{100});
-@@ -1023,6 +1076,9 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
+@@ -1023,6 +1085,9 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
        return std::nullopt;
      }
      if (render_worker::is_idle()) {
@@ -411,7 +420,7 @@ index eff0c65..495c337 100644
        g_instance.ProcessEvents();
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds{100});
-@@ -1033,8 +1089,32 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
+@@ -1033,8 +1098,32 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
  bool begin_frame() {
    ZoneScoped;
    const size_t frameSlot = acquire_frame_slot();
@@ -445,7 +454,7 @@ index eff0c65..495c337 100644
      g_frameSlots.release(frameSlot);
      return false;
    }
-@@ -1043,17 +1123,27 @@ bool begin_frame() {
+@@ -1043,17 +1132,32 @@ bool begin_frame() {
    frame = {};
    frame.frameId = g_nextFrameId++;
    frame.frameIndex = g_frameIndex;
@@ -472,11 +481,45 @@ index eff0c65..495c337 100644
 +      return;
 +    }
 +#endif
++#ifdef __EMSCRIPTEN__
++    if (g_shadow == nullptr) g_shadow = static_cast<uint8_t*>(malloc(StagingBufferSize));
++    buf = ByteBuffer{g_shadow + bufferOffset, static_cast<size_t>(size)};
++#else
 +    buf = ByteBuffer{static_cast<u8*>(g_stagingBuffers[*stagingSlot].GetMappedRange(bufferOffset, size)), static_cast<size_t>(size)};
++#endif
      bufferOffset += size;
    };
    mapBuffer(frame.verts, VertexBufferSize);
-@@ -1145,8 +1235,10 @@ void end_frame(EndFrameCallback callback) {
+@@ -1118,6 +1222,28 @@ void end_frame(EndFrameCallback callback) {
+   frame.stats.lastIndexSize = frame.indices.size();
+   frame.stats.lastStorageSize = frame.storage.size();
+   frame.stats.lastTextureUploadSize = frame.textureUpload.size();
++#ifdef __EMSCRIPTEN__
++  if (!frame.scratch && frame.stagingBuffer != SIZE_MAX) {   // the used bytes only
++    uint64_t off = 0;
++    const auto put = [&](ByteBuffer& b, uint64_t cap) {
++      const uint64_t n = std::min<uint64_t>(AURORA_ALIGN(b.size(), 4), cap);
++      // Only these bytes go into the mapped buffer (no GetMappedRange shadow for Unmap to copy back).
++      // NOT queue.WriteBuffer: measured 96.6% of a solo console's main thread (Chrome copies from the
++      // whole wasm memory view). Straight to emdawnwebgpu's JS: the C++ wrapper's own map-state check
++      // read "unmapped" on frames where the GPUBuffer was mapped (a re-map then failed "already mapped").
++      if (n > 0 && emwgpuBufferWriteMappedRange(g_stagingBuffers[frame.stagingBuffer].Get(), off, b.data(), n) != WGPUStatus_Success) {
++        static uint32_t fails; ++fails;
++        if ((fails & (fails - 1)) == 0) Log.error("staging WriteMappedRange({}, {}) failed (x{})", off, n, fails);
++      }
++      off += cap;
++    };
++    put(frame.verts, VertexBufferSize);
++    put(frame.uniforms, UniformBufferSize);
++    put(frame.indices, IndexBufferSize);
++    put(frame.storage, StorageBufferSize);
++    if constexpr (UseTextureBuffer) put(frame.textureUpload, TextureUploadSize);
++  }
++#endif
+ 
+   const size_t frameSlot = g_recordingFrameSlot;
+   const uint64_t frameId = frame.frameId;
+@@ -1145,8 +1271,10 @@ void end_frame(EndFrameCallback callback) {
    const size_t stagingSlot = frame.stagingBuffer;
    render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback)]() mutable {
      auto& packet = g_framePackets[frameSlot];
@@ -489,7 +532,7 @@ index eff0c65..495c337 100644
      auto encoder = std::move(packet.encoder);
      const auto stats = packet.stats;
      packet = {};
-@@ -1162,7 +1254,7 @@ void end_frame(EndFrameCallback callback) {
+@@ -1162,7 +1290,7 @@ void end_frame(EndFrameCallback callback) {
        callback(encoder);
      }
      expire_cached_bind_groups();
@@ -498,7 +541,7 @@ index eff0c65..495c337 100644
    });
  }
  
-@@ -1232,15 +1324,45 @@ static void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& f
+@@ -1232,15 +1360,45 @@ static void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& f
  }
  
  static void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {

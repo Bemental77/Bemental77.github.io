@@ -258,11 +258,19 @@ try {
           r.p = r.pres != null && prev.pres != null ? (r.pres - prev.pres) / dt : (r.presRate != null ? r.presRate : null);
           r.ms = r.busy != null && prev.busy != null && r.total > prev.total ? (r.busy - prev.busy) / (r.total - prev.total) : null; }
         console.log(`${r.T} ${P.role} f=${r.frame} x=${r.x != null ? r.x.toFixed(3) : '-'} pres=${r.p != null ? r.p.toFixed(1) : '-'}/s ${r.state} ${r.rb ? 'RB' : 'd' + r.delay} stalls=${r.stalls} rbk=${r.rollbacks} hc=${r.hc}${r.desync ? ' DESYNC' : ''}`);
+        // PROFILE=role: a CPU profile of that console for PROFILE_S seconds, from SKIP s after it opens
+        // (a profile perturbs timing: use it for where the CPU goes, never for a rate)
+        if (process.env.PROFILE === P.role && P.t0 != null && !P.prof && r.T - P.t0 >= SKIP) {
+          P.prof = (async () => { const c = await P.page.target().createCDPSession(); await c.send('Profiler.enable'); await c.send('Profiler.setSamplingInterval', { interval: 200 }); await c.send('Profiler.start');
+            await sleep(1000 * +(process.env.PROFILE_S || 20)); const { profile } = await c.send('Profiler.stop');
+            fs.writeFileSync(`${OUTD}/${name}-${P.role}.cpuprofile`, JSON.stringify(profile)); say(`profile -> ${OUTD}/${name}-${P.role}.cpuprofile`); })().catch((e) => say('profile failed ' + e));
+        }
         if (P.t0 == null || r.T - P.t0 < SKIP + secs) done = false;
       }
     }
     if (done) break;
   }
+  for (const P of PS) if (P.prof) await P.prof;
   const mean = (v) => v.length ? v.reduce((s, x) => s + x, 0) / v.length : null;
   for (const P of PS) {
     const R = P.rows, w = P.t0 == null ? [] : R.filter((r) => r.T > P.t0 + SKIP && r.T <= P.t0 + SKIP + secs && r.x != null);
