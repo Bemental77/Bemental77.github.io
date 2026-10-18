@@ -88,6 +88,10 @@ const EXPECT = {
   gbaDisabled === true ? ok('gba-chip-is-disabled', 'listed, not pressable — the visitor is told rather than left to wonder') : bad('gba-chip-is-disabled', String(gbaDisabled));
 
   for (const [key, ex] of Object.entries(EXPECT)) {
+    // A console with no multiplayer game in the catalogue (lib/mpgames.js drops single-player titles)
+    // has a disabled chip and no room to host or join: nothing to hand off. Today: SNES (SimCity).
+    const offered = await p.evaluate((k) => { const c = window.__mpCatalog.find((x) => x.key === k); return !!(c && c.games.length); }, key);
+    if (!offered) { ok(`${key}-not-offered`, 'no multiplayer game listed — chip disabled, nothing to hand off'); continue; }
     // pick the console by its chip
     await p.evaluate((k) => { const c = window.__mpCatalog.find((x) => x.key === k); [...document.querySelectorAll('#consoles button')].find((b) => b.firstChild.textContent === c.name).click(); }, key);
     const game = await p.evaluate(() => document.getElementById('game').value);
@@ -114,9 +118,20 @@ const EXPECT = {
     await p.click('#btnJoin');
     const joinNav = await until(async () => nav.url);
     const j = decoded(joinNav || '');
-    const joinOk = j.path === ex.path && j.q.np === shown && j.q.game === game && j.q.join === '1' && !('host' in j.q);
-    joinOk ? ok(`${key}-join-navigates-as-joiner`, joinNav) : bad(`${key}-join-navigates-as-joiner`, `${joinNav} (wanted ${ex.path} np=${shown} game="${game}" join=1)`);
+    // A JOINER TYPES THE CODE AND NOTHING ELSE (d2ad2e3: room codes name their console). It cannot
+    // know the host's game, so the hand-off carries the console's first game only as a starting point:
+    // every room page follows the host's roster ('room-game') before it boots, and the joiner's
+    // session is built with no game so the pairing never compares one (dreamcast.html netStartGuest).
+    // What must hold: the right page, the code, join=1, never host, and a game of THAT console.
+    const consoleGames = ((s.consoles || []).find((c) => c.key === key) || {}).games || null;   // the page's own catalogue (window.__mp)
+    const gameOkForConsole = !('game' in j.q) || !consoleGames || consoleGames.includes(j.q.game);
+    const joinOk = j.path === ex.path && j.q.np === shown && gameOkForConsole && j.q.join === '1' && !('host' in j.q);
+    joinOk ? ok(`${key}-join-navigates-as-joiner`, joinNav) : bad(`${key}-join-navigates-as-joiner`, `${joinNav} (wanted ${ex.path} np=${shown} join=1, a ${key} game)`);
+    // The join pane hides the host's picker (the joiner gets its own card), so go Back to it, as a
+    // person would, before picking the next console.
+    await p.click('#btnJoinBack');
   }
+  await p.click('#btnJoinPane');
   // a malformed code is refused HERE, on the page it was typed on
   await p.evaluate(() => { document.getElementById('codeIn').value = 'AB01I'; });
   nav.url = null; await p.click('#btnJoin'); await sleep(300);
@@ -136,6 +151,7 @@ const EXPECT = {
       const c = window.__mpCatalog.find((x) => x.key === key);
       [...document.querySelectorAll('#consoles button')].find((b) => b.firstChild.textContent === c.name).click();
     }, k);
+    await p.click('#btnJoinBack');   // the malformed-code cell above left the join pane open
     await chip('dreamcast');
     await p.click('#btnHost');
     const code = await until(async () => {
@@ -153,10 +169,14 @@ const EXPECT = {
     // link button, which reads that same field.
     const shownInvite = await p.evaluate(() => document.getElementById('invite').value);
     const iv = decoded(shownInvite || '');
-    (iv.q.np === code && iv.q.sys === 'genesis' && iv.q.game === gameNow && after.sys === 'genesis')
+    // A CODE NAMES ITS CONSOLE (d2ad2e3), so the console change mints a new one: the link must carry
+    // the code now on screen, and that code must name the new console.
+    const codeNow = await p.evaluate(() => (document.getElementById('code').textContent || '').trim());
+    const named = await p.evaluate((c) => (window.Netplay && Netplay.consoleOfCode) ? Netplay.consoleOfCode(c) : null, codeNow);
+    (iv.q.np === codeNow && codeNow !== code && named === 'genesis' && iv.q.sys === 'genesis' && iv.q.game === gameNow && after.sys === 'genesis')
       ? ok('invite-follows-a-console-change', shownInvite)
       : bad('invite-follows-a-console-change',
-            `#invite=${shownInvite} — but the page now shows sys=${after.sys} game="${gameNow}" code=${code}`);
+            `#invite=${shownInvite} — but the page now shows sys=${after.sys} game="${gameNow}" code=${codeNow} (was ${code}, names ${named})`);
   }
   await p.close();
 
@@ -206,7 +226,8 @@ const EXPECT = {
     });
     await p3.click('#btnJoinPane');
     const link = ORIGIN + '/multiplayer.html?np=K7MQ2&sys=genesis&game=' + encodeURIComponent('X-Men') + '&net=local';
-    await p3.evaluate((v) => { document.getElementById('codeIn').value = v; }, link);
+    // a paste fires 'input' (the lobby collapses the link to its code there and enables Join)
+    await p3.evaluate((v) => { const el = document.getElementById('codeIn'); el.value = v; el.dispatchEvent(new Event('input', { bubbles: true })); }, link);
     nav3.url = null;
     await p3.click('#btnJoin');
     const pasted = await until(async () => nav3.url, 4000);
@@ -239,10 +260,11 @@ console.log('\n== invite link, cold, phone viewport ==');
   const u = decoded((await until(async () => nav.url)) || '');
   u.path === '/n64/' && u.q.np === 'K7MQ2' && u.q.game === 'Mario Kart 64' && u.q.join === '1'
     ? ok('invite-join-navigates', nav.url) : bad('invite-join-navigates', String(nav.url));
-  // "not the game they meant" reveals the pickers with the code kept
+  // "not the game they meant" opens the JOINER'S own pane with the code kept (d2ad2e3: the joiner gets
+  // its own card; the host's picker is never shown over a joiner's screen)
   await p.tap('#btnInvitedPick');
-  const kept = await p.evaluate(() => ({ pick: document.getElementById('pick').checkVisibility(), code: document.getElementById('codeIn').value }));
-  kept.pick && kept.code === 'K7MQ2' ? ok('invite-fallback-keeps-the-code', JSON.stringify(kept)) : bad('invite-fallback-keeps-the-code', JSON.stringify(kept));
+  const kept = await p.evaluate(() => ({ join: document.getElementById('joinPane').checkVisibility(), hostPick: document.getElementById('pick').checkVisibility(), code: document.getElementById('codeIn').value }));
+  kept.join && !kept.hostPick && kept.code === 'K7MQ2' ? ok('invite-fallback-keeps-the-code', JSON.stringify(kept)) : bad('invite-fallback-keeps-the-code', JSON.stringify(kept));
   await p.close();
 }
 // An invite naming a game the site does not offer: join pane, code kept, told why.
