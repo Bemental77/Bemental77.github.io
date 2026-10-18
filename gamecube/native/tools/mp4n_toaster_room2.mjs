@@ -56,6 +56,16 @@ function kidsMap() {
 }
 function tree(pid) { const k = kidsMap(), o = [pid], q = [pid]; while (q.length) { for (const c of k.get(q.shift()) || []) { o.push(c); q.push(c); } } return o; }
 const ptype = (pid) => { try { const m = /--type=([\w-]+)/.exec(fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8')); return m ? m[1] : 'browser'; } catch (e) { return null; } };
+// CPU seconds per Chrome process type (renderer / gpu-process / utility / browser), from /proc utime+stime
+const HZ = 100;
+function cpuByType(P) {
+  const o = {}; let bpid; try { bpid = P.browser.process().pid; } catch (e) { return o; }
+  for (const pid of tree(bpid)) {
+    try { const st = fs.readFileSync(`/proc/${pid}/stat`, 'utf8').slice(0); const f = st.slice(st.lastIndexOf(')') + 2).split(' ');
+      const t = (+f[11] + +f[12]) / HZ, k = ptype(pid) || '?'; o[k] = (o[k] || 0) + t; } catch (e) {}
+  }
+  return o;
+}
 function makeDevice(P, cpus) {
   const set = path.join(CPUSET, `${TAG}-${P.role}`);
   fs.mkdirSync(set);
@@ -265,6 +275,8 @@ try {
             await sleep(1000 * +(process.env.PROFILE_S || 20)); const { profile } = await c.send('Profiler.stop');
             fs.writeFileSync(`${OUTD}/${name}-${P.role}.cpuprofile`, JSON.stringify(profile)); say(`profile -> ${OUTD}/${name}-${P.role}.cpuprofile`); })().catch((e) => say('profile failed ' + e));
         }
+        if (P.t0 != null && !P.cpu0 && r.T - P.t0 >= SKIP) P.cpu0 = { c: cpuByType(P), f: r.frame, T: r.T };
+        if (P.cpu0 && !P.cpu1 && r.T - P.t0 >= SKIP + secs) P.cpu1 = { c: cpuByType(P), f: r.frame, T: r.T };
         if (P.t0 == null || r.T - P.t0 < SKIP + secs) done = false;
       }
     }
@@ -282,6 +294,9 @@ try {
       lastStats: last.st || null, lastRb: last.rbw || null, lastMode: last.mode || null,
       rows: R.map((r) => ({ T: r.T, f: r.frame, x: r.x, st: r.state, rb: r.rb, d: r.delay, stalls: r.stalls })) };
     if (o.lastStats) say(`STATS ${P.role}: ${JSON.stringify(o.lastStats)} rb=${JSON.stringify(o.lastRb)} mode=${o.lastMode}`);
+    if (P.cpu0 && P.cpu1) { const fr = Math.max(1, P.cpu1.f - P.cpu0.f), sec = P.cpu1.T - P.cpu0.T, by = {};
+      for (const k of Object.keys(P.cpu1.c)) by[k] = +(1000 * (P.cpu1.c[k] - (P.cpu0.c[k] || 0)) / fr).toFixed(2);
+      o.cpuMsPerFrame = by; say(`CPU ${P.role}: ms per guest frame by process ${JSON.stringify(by)} over ${fr} frames / ${sec.toFixed(0)} s`); }
     say(`SUMMARY ${PAGE} ${mode} ${P.role}: open@${o.openT}s window x=${o.win.x && o.win.x.toFixed(3)} min ${o.win.min && o.win.min.toFixed(3)} presented ${o.win.presented != null ? o.win.presented.toFixed(1) : '-'}/s host ${o.win.msPerFrame != null ? o.win.msPerFrame.toFixed(1) : '-'} ms/frame (n=${o.win.n}, first ${SKIP}s discarded)  steady x=${o.steady.x && o.steady.x.toFixed(3)}  stalls ${o.stalls}  desync=${o.desync} hc=${o.hc}  throttled ${o.cg.nr_throttled}/${o.cg.nr_periods}`);
     await P.page.screenshot({ path: path.join(OUTD, `${name}-${P.role}.png`) }).catch(() => {});
   }
