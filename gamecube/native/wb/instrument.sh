@@ -53,5 +53,5 @@ if [ "${WB_NOINLINE:-0}" = 1 ]; then mv "$T/b.wat" "$T/b2.wat"; else python3 "$H
 "$B/wasm-merge" "${F[@]}" "$T/b.wasm" main "$T/barrier.wasm" env -o "$T/c.wasm"; rm -f "$T/b.wasm"
 # -O2 never inlined the store hook (binaryen's flexible inlining is -O3 only: Call 110,096 plain ->
 # 315,881 with the barrier), hence inline_hooks.py; the barrier's slow paths stay out of line.
-"$B/wasm-opt" "${F[@]}" --no-inline='mp4wb_*' -O2 --strip-debug "$T/c.wasm" -o "$OUT"
+"$B/wasm-opt" "${F[@]}" --no-inline='mp4wb_*' -O2 $([ "${WB_STRIP:-1}" = 1 ] && echo --strip-debug) "$T/c.wasm" -o "$OUT"   # WB_STRIP=0 keeps names (profiling)
 echo "[wb] $(stat -c %s "$IN") -> $(stat -c %s "$OUT") B"
