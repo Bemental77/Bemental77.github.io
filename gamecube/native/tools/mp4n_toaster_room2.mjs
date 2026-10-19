@@ -297,6 +297,18 @@ try {
             await sleep(1000 * +(process.env.PROFILE_S || 20)); const { profile } = await c.send('Profiler.stop');
             fs.writeFileSync(`${OUTD}/${name}-${P.role}.cpuprofile`, JSON.stringify(profile)); say(`profile -> ${OUTD}/${name}-${P.role}.cpuprofile`); })().catch((e) => say('profile failed ' + e));
         }
+        // TRACE=role: a Chrome trace (every process: renderer threads, GPU process, GC, uploads) while that
+        // console's guest frame is in [TRACE_FROM, TRACE_TO) (default 600..950: the boot's title load)
+        if (process.env.TRACE === P.role && !P.trace && r.frame != null && r.frame >= +(process.env.TRACE_FROM || 600)) {
+          P.trace = (async () => {
+            const cats = (process.env.TRACE_CATS || 'devtools.timeline,disabled-by-default-devtools.timeline,v8,v8.gc,disabled-by-default-v8.gc,toplevel,gpu,blink,webaudio,audio,disabled-by-default-devtools.timeline.frame,cc,viz,scheduler').split(',');
+            await P.page.tracing.start({ path: `${OUTD}/${name}-${P.role}.trace.json`, categories: cats });
+            say(`trace on at f=${r.frame}`);
+            const until = +(process.env.TRACE_TO || 950), t1 = Date.now() + 20000;
+            while (Date.now() < t1) { await sleep(250); const last = P.rows[P.rows.length - 1]; if (last && last.frame >= until) break; }
+            await P.page.tracing.stop(); say(`trace -> ${OUTD}/${name}-${P.role}.trace.json`);
+          })().catch((e) => say('trace failed ' + e));
+        }
         if (P.t0 != null && !P.cpu0 && r.T - P.t0 >= SKIP) P.cpu0 = { c: cpuByType(P), f: r.frame, T: r.T };
         if (P.cpu0 && !P.cpu1 && r.T - P.t0 >= SKIP + secs) P.cpu1 = { c: cpuByType(P), f: r.frame, T: r.T };
         if (P.t0 == null || r.T - P.t0 < SKIP + secs) done = false;
