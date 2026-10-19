@@ -174,7 +174,7 @@ async function launch(role, cpus) {
   P.tail = [];
   P.page.on('console', (m) => { const t = m.text(); if (t.startsWith('RIG:')) console.log(`${ts()} ${role} ${t}`);   // an EVAL arm's own report, in full
     P.tail.push(`${ts()} ${t.slice(0, 300)}`); if (P.tail.length > 400) P.tail.shift();
-    if (/ARMED|armed|desync|delay lockstep|zero-lag|capacity|room:|⚠/i.test(t) && P.lines.length < 200) { const L = `${ts()} ${role} ${t.slice(0, 220)}`; P.lines.push(L); console.log('  ' + L); } });
+    if (/ARMED|armed|desync|delay lockstep|zero-lag|capacity|room:|⚠|rror|unreachable|abort/i.test(t) && P.lines.length < 200) { const L = `${ts()} ${role} ${t.slice(0, 220)}`; P.lines.push(L); console.log('  ' + L); } });
   // ROUTE=route.json (e.g. gamecube/native/tools/route_party_minigames.json): the host's pad follows the
   // frame-keyed route (Party Mode -> board -> minigames, as mp4n_room_test.mjs --script); the joiner is a
   // second human pressing keys at its own pace (menu keys, then only A + stick once on the board)
@@ -349,12 +349,13 @@ try {
       steady: { n: steady.length, x: mean(steady.map((r) => r.x)) },
       stalls: last.stalls != null && first.stalls != null ? last.stalls - first.stalls : null, stallMs: last.stallMs != null && first.stallMs != null ? Math.round(last.stallMs - first.stallMs) : null,
       rollbacks: last.rollbacks, desync: last.desync || null, hc: last.hc, cg: deviceStat(P), lines: P.lines, errs: P.errs.slice(0, 8), tail: P.errs.length ? P.tail.slice(-150) : [],
-      lastStats: last.st || null, lastRb: last.rbw || null, lastMode: last.mode || null,
+      lastStats: last.st || null, lastRb: last.rbw || null, lastMode: last.mode || null, ovl: P.ovl,
       gs: (() => { const g = w.map((r) => r.gs).filter(Boolean); if (!g.length) return null; const md = (a) => a.slice().sort((x, y) => x - y)[a.length >> 1];
         const dr = g.filter((x) => x.draws > 0);   // samples that landed on a drawn frame (a skipped frame records no draws)
         return { drawnSamples: dr.length, draws: dr.length ? md(dr.map((x) => x.draws)) : 0, merged: dr.length ? md(dr.map((x) => x.merged)) : 0, upKB: [0, 1, 2, 3, 4].map((i) => +((dr.length ? md(dr.map((x) => x.up[i])) : 0) / 1024).toFixed(1)), pipes: g[g.length - 1].pipes, canvas: g[g.length - 1].canvas,
           presented: mean(w.map((r) => r.p).filter((v) => v != null)), gpuWaitMs: g[g.length - 1].gpuWait, autoSkipped: g[g.length - 1].auto }; })(),
       rows: R.map((r) => ({ T: r.T, f: r.frame, x: r.x, st: r.state, rb: r.rb, d: r.delay, stalls: r.stalls })) };
+    if (P.ovl && P.ovl.length) say(`OVL ${P.role}: ${P.ovl.join(',')}`);
     if (o.gs) say(`GFX ${P.role}: ${JSON.stringify(o.gs)} (median per sampled frame; upKB = vert/uniform/index/storage/texture)`);
     if (o.lastStats) say(`STATS ${P.role}: ${JSON.stringify(o.lastStats)} rb=${JSON.stringify(o.lastRb)} mode=${o.lastMode}`);
     if (P.cpu0 && P.cpu1) { const fr = Math.max(1, P.cpu1.f - P.cpu0.f), sec = P.cpu1.T - P.cpu0.T, by = {};

@@ -29,7 +29,7 @@ const require = createRequire(process.env.HOME + '/probe-deps/');
 const puppeteer = require('puppeteer');
 const guard = (await import(ROOT + '/tools/browser_leak_guard.js')).default;
 const [waitS, out, qs = ''] = process.argv.slice(2);
-const PORT = 18978;
+const PORT = +(process.env.PROBE_PORT || 18978);   // PROBE_PORT: parallel correctness shards (perf runs stay serialized under tools/probe_lock.sh)
 const srv = spawn('node', [ROOT + '/tools/devserver.mjs'], { cwd: ROOT, env: Object.assign({}, process.env, { PORT: String(PORT) }), stdio: 'ignore' });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 await sleep(1500);
