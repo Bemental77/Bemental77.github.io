@@ -1,3 +1,85 @@
+diff --git a/src/musyx/runtime/StdReverb/reverb.c b/src/musyx/runtime/StdReverb/reverb.c
+index 905442a..9e9fc49 100644
+--- a/src/musyx/runtime/StdReverb/reverb.c
++++ b/src/musyx/runtime/StdReverb/reverb.c
+@@ -647,6 +647,69 @@ static void HandleReverb(s32 *sptr, SND_AUX_REVERBHI *rv, s32 k) {
+   _SND_REVHI_WORK *work = &rv->rv;
+   f32 dampWet = work->level * 0.6f;
+   f32 dampDry = 0.6f - dampWet;
++#ifdef __EMSCRIPTEN__
++  // web port: the same arithmetic in the same order, but the six delay lines' cursors, the low-pass
++  // state, the pre-delay cursor and the coefficients live in locals for the 160 samples and are written
++  // back once. In the rollback build every store to the work struct is a write-barrier check; this
++  // loop did ~40 of them per sample (measured: reverb ~4% of the toaster renderer's busy time).
++  _SND_REVHI_DELAYLINE c0 = work->C[k * 3], c1 = work->C[k * 3 + 1], c2 = work->C[k * 3 + 2];
++  _SND_REVHI_DELAYLINE a0 = work->AP[k * 3], a1 = work->AP[k * 3 + 1], a2 = work->AP[k * 3 + 2];
++  _SND_REVHI_DELAYLINE *comb0 = &c0, *comb1 = &c1, *comb2 = &c2;
++  _SND_REVHI_DELAYLINE *allpass0 = &a0, *allpass1 = &a1, *allpass2 = &a2;
++  const f32 cc0 = work->combCoef[k * 3], cc1 = work->combCoef[k * 3 + 1], cc2 = work->combCoef[k * 3 + 2];
++  const f32 apc = work->allPassCoeff, damping = work->damping;
++  f32 lpLast = work->lpLastout[k];
++  const s32 preTime = work->preDelayTime;
++  f32 *prePtr = work->preDelayPtr[k];
++  f32 *const preLine = work->preDelayLine[k];
++  s32 i;
++
++  for (i = 0; i < 160; ++i) {
++    f32 sample = (f32)sptr[i];
++    f32 delayed = sample;
++    f32 comb0Last, comb1Last, comb2Last, allpass0Last, allpass1Last, allpass2Last;
++    f32 combSum, allpass0Input, allpass1Input, allpass2Input, lowPass, allPass;
++    if (preTime != 0) {
++      delayed = *prePtr;
++      *prePtr = sample;
++      ++prePtr;
++      if (prePtr >= preLine + preTime) {
++        prePtr = preLine;
++      }
++    }
++    DLwriteSample(comb0, cc0 * comb0->lastOutput + delayed);
++    DLwriteSample(comb1, cc1 * comb1->lastOutput + delayed);
++    DLwriteSample(comb2, cc2 * comb2->lastOutput + delayed);
++    comb0Last = DLreadSample(comb0);
++    comb1Last = DLreadSample(comb1);
++    comb2Last = DLreadSample(comb2);
++    combSum = comb0Last + comb1Last + comb2Last;
++    allpass0Last = allpass0->lastOutput;
++    allpass0Input = apc * allpass0Last + combSum;
++    DLwriteSample(allpass0, allpass0Input);
++    lowPass = allpass0Last - apc * allpass0Input;
++    DLreadSample(allpass0);
++    allpass1Last = allpass1->lastOutput;
++    allpass1Input = apc * allpass1Last + lowPass;
++    DLwriteSample(allpass1, allpass1Input);
++    lowPass = allpass1Last - apc * allpass1Input;
++    DLreadSample(allpass1);
++    lowPass *= 0.3f;
++    lpLast = damping * lpLast + lowPass;
++    allpass2Last = allpass2->lastOutput;
++    allpass2Input = apc * allpass2Last + lpLast;
++    DLwriteSample(allpass2, allpass2Input);
++    allPass = allpass2Last - apc * allpass2Input;
++    DLreadSample(allpass2);
++    sptr[i] = (s32)(dampDry * sample + dampWet * allPass);
++  }
++  work->C[k * 3] = c0; work->C[k * 3 + 1] = c1; work->C[k * 3 + 2] = c2;
++  work->AP[k * 3] = a0; work->AP[k * 3 + 1] = a1; work->AP[k * 3 + 2] = a2;
++  work->lpLastout[k] = lpLast;
++  if (preTime != 0) {
++    work->preDelayPtr[k] = prePtr;
++  }
++#else
+   _SND_REVHI_DELAYLINE *comb0 = &work->C[k * 3];
+   _SND_REVHI_DELAYLINE *comb1 = &work->C[k * 3 + 1];
+   _SND_REVHI_DELAYLINE *comb2 = &work->C[k * 3 + 2];
+@@ -702,6 +765,7 @@ static void HandleReverb(s32 *sptr, SND_AUX_REVERBHI *rv, s32 k) {
+ 
+     sptr[i] = (s32)(dampDry * sample + dampWet * allPass);
+   }
++#endif
+ }
+ #endif
+ 
 diff --git a/src/musyx/runtime/StdReverb/reverb_fx.c b/src/musyx/runtime/StdReverb/reverb_fx.c
 index 1c292b1..f7c8a83 100644
 --- a/src/musyx/runtime/StdReverb/reverb_fx.c
@@ -11,3 +93,37 @@ index 1c292b1..f7c8a83 100644
                             f32 preDelay, f32 crosstalk);
  extern void ReverbHICallback(s32 *left, s32 *right, s32 *surround, SND_AUX_REVERBHI *rev);
  
+diff --git a/src/musyx/runtime/hw_pc.c b/src/musyx/runtime/hw_pc.c
+index 65abcc5..529938f 100644
+--- a/src/musyx/runtime/hw_pc.c
++++ b/src/musyx/runtime/hw_pc.c
+@@ -134,6 +134,29 @@ static s32 mixRampChannel(s32 *dest, const s32 *src, int nSamples, s16 startVol,
+   if (!dest || (!startVol && !endVol))
+     return 0;
+   s32 contribution = 0;
++#ifdef __EMSCRIPTEN__
++  // web port: the same values without two integer divisions per sample. env = envStart + trunc(dE*i/n)
++  // and vol = startVol + trunc(dV*(frameOffset+i)/cycleFrames) are stepped as quotient + remainder
++  // (k >= 0, so trunc(d*k/n) = sign(d) * floor(|d|*k/n)); 3M random cases (all lengths, offsets, cycle
++  // sizes, full s16/u16 ranges and the edge pairs) give results identical to the division form
++  {
++    const s32 dE = (s32)envEnd - envStart, nE = nSamples;
++    const s32 dV = (s32)endVol - startVol, nV = (s32)cycleFrames;
++    const u32 aE = dE < 0 ? (u32)-dE : (u32)dE, aV = dV < 0 ? (u32)-dV : (u32)dV;
++    u32 qE = 0, rE = 0, qV = (u32)(((u64)aV * (u32)frameOffset) / (u32)nV), rV = (u32)(((u64)aV * (u32)frameOffset) % (u32)nV);
++    const u32 qsE = aE / (u32)nE, rsE = aE % (u32)nE, qsV = aV / (u32)nV, rsV = aV % (u32)nV;
++    for (int i = 0; i < nSamples; ++i) {
++      s32 env = envStart + (dE < 0 ? -(s32)qE : (s32)qE);
++      s32 vol = startVol + (dV < 0 ? -(s32)qV : (s32)qV);
++      s32 mixVol = (vol * env) >> 15;
++      contribution = (src[i] * mixVol) >> 15;
++      dest[i] += contribution;
++      qE += qsE; rE += rsE; if (rE >= (u32)nE) { rE -= (u32)nE; ++qE; }
++      qV += qsV; rV += rsV; if (rV >= (u32)nV) { rV -= (u32)nV; ++qV; }
++    }
++    return contribution;
++  }
++#endif
+   for (int i = 0; i < nSamples; ++i) {
+     s32 env = envStart + ((s32)envEnd - envStart) * i / nSamples;
+     s32 vol = startVol + ((s32)endVol - startVol) * (frameOffset + i) / (s32)cycleFrames;

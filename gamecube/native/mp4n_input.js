@@ -60,6 +60,25 @@
     rec.cx += dz(a[2] || 0) * 127; rec.cy -= dz(a[3] || 0) * 127;
   }
 
+  // navigator.getGamepads() every frame was ~2% of the renderer's busy time on the toaster rig with no
+  // pad attached. Browsers expose a pad only after it has sent input, which fires 'gamepadconnected';
+  // until then (and after the last one leaves) poll at most once a second, as a fallback for pads a
+  // browser surfaces without the event.
+  var padsLive = false, padPollAt = 0;
+  window.addEventListener('gamepadconnected', function () { padsLive = true; });
+  window.addEventListener('gamepaddisconnected', function () { padPollAt = 0; padsLive = false; });
+  function connectedPads() {
+    if (!navigator.getGamepads) return [];
+    if (!padsLive) {
+      var now = performance.now();
+      if (now < padPollAt) return [];
+      padPollAt = now + 1000;
+    }
+    var pads = Array.prototype.slice.call(navigator.getGamepads() || []).filter(function (g) { return g && g.connected; });
+    if (pads.length) padsLive = true;
+    return pads;
+  }
+
   var overrideFn = null, lastLatched = null;
   function latch(frame, ptr, heap32) {
     var out = new Array(32).fill(0);
@@ -67,7 +86,7 @@
       var o = overrideFn(frame) || out;
       for (var j = 0; j < 32; j++) out[j] = o[j] | 0;
     } else {
-      var pads = (navigator.getGamepads ? Array.prototype.slice.call(navigator.getGamepads()) : []).filter(function (g) { return g && g.connected; });
+      var pads = connectedPads();
       for (var port = 0; port < 4; port++) {
         var rec = { btn: 0, sx: 0, sy: 0, cx: 0, cy: 0, tl: 0, tr: 0 }, connected = port === 0;
         if (port === 0) samplePort0Keyboard(rec);
@@ -122,7 +141,7 @@
     var rec = { btn: 0, sx: 0, sy: 0, cx: 0, cy: 0, tl: 0, tr: 0 };
     samplePort0Keyboard(rec);
     if (scriptFn && frame != null) rec.btn |= scriptFn(frame) | 0;
-    var pads = (navigator.getGamepads ? Array.prototype.slice.call(navigator.getGamepads()) : []).filter(function (g) { return g && g.connected; });
+    var pads = connectedPads();
     if (pads[0]) samplePad(pads[0], rec);
     var b = new Uint8Array(8);
     b[0] = rec.btn & 0xFF; b[1] = (rec.btn >> 8) & 0xFF;
