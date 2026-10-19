@@ -11,6 +11,7 @@
 //   SNAPTEST=f1,f2   whole-memory snapshot at f1, run to f2, restore, rerun, compare hashes
 //   DIFFAT=f DIFFOUT=f.json [DUMPADDR=a]  per-4KB state checksums at frame f (find what diverges)
 //   WAV=f.wav        with &audrec=S: the first S seconds of game audio
+//   RBPOOL=n RBKEEP=1  with RBTEST: a small page pool, and rb_keep(f - depth) at every boundary (the pool must grow, not overwrite)
 //   RBTEST=at,period,depth  rollback self-test (needs the write-barrier build): logging on from frame `at`;
 //                    every `period` frames rewind `depth` frames (mp4web_rb_restore) and re-run them on the
 //                    same input; every re-run frame's fingerprint must equal its first run's, and the
@@ -60,14 +61,17 @@ try {
     const [ea, per, dep, toEa] = process.env.RBTEST.split(',').map(Number);   // toEa=1: rewinds may land ON the enable frame (a room's first misprediction)
     await p.waitForFunction(() => window.__mp4n && window.__mp4n.module && window.__mp4n.module.mp4FrameHook, { timeout: 120000 });
     if (toEa) await p.evaluate(() => { window.__rbToEa = 1; });
+    // RBPOOL=n: page-image pool size at enable (default 8192); RBKEEP=1: tell rollback.c the oldest frame a rewind will target
+    await p.evaluate((pool, keep) => { if (pool) window.__rbPool = pool; if (keep) window.__rbKeep = 1; }, +(process.env.RBPOOL || 0), +(process.env.RBKEEP || 0));
     await p.evaluate((ea, per, dep, rbdiff, rbdump) => {
       const m = window.__mp4n.module, prev = m.mp4FrameHook;
       const T = window.__rbT = { on: false, h1: {}, cmp: 0, bad: [], restores: 0, rcmp: 0, rbad: 0, enableRc: null, replayUntil: -1, hashMs: 0, maxHashMs: 0, restoreMs: [] };
       m.mp4FrameHook = (f) => {
         let r = prev(f);
-        if (!T.on && f === ea) { T.enableRc = m._mp4web_rb_enable(f, 16, 8192); T.on = T.enableRc > 0; if (T.on) { T.h1[f] = m._mp4web_rb_hash(); T.sm = { [f]: [m._mp4web_rb_small_hash(0), m._mp4web_rb_small_hash(1), m._mp4web_rb_small_hash(2)] }; } return r; }   // the enable frame is fingerprinted too: a rewind onto it is checked
+        if (!T.on && f === ea) { T.enableRc = m._mp4web_rb_enable(f, 16, window.__rbPool || 8192); T.on = T.enableRc > 0; if (T.on) { T.h1[f] = m._mp4web_rb_hash(); T.sm = { [f]: [m._mp4web_rb_small_hash(0), m._mp4web_rb_small_hash(1), m._mp4web_rb_small_hash(2)] }; } return r; }   // the enable frame is fingerprinted too: a rewind onto it is checked
         if (!T.on || f <= ea) return r;
         m._mp4web_rb_boundary(f);
+        if (window.__rbKeep && m._mp4web_rb_keep) m._mp4web_rb_keep(Math.max(ea, f - dep));   // RBKEEP=1: the pool must grow rather than lose frame f - dep
         const t0 = performance.now(); const h = m._mp4web_rb_hash(); const dt = performance.now() - t0; T.hashMs += dt; if (dt > T.maxHashMs) T.maxHashMs = dt;
         const pageSums = () => { const b = m._mp4web_rb_base(), n = m._mp4web_rb_pages(), H = new Int32Array(m.HEAPU8.buffer, b, n * 1024), out = new Int32Array(n); for (let p = 0; p < n; p++) { let x = 0; const o = p * 1024; for (let i = 0; i < 1024; i++) x = (Math.imul(x, 31) + H[o + i]) | 0; out[p] = x; } return out; };
         if (rbdiff && T.h1[f] === undefined && f === rbdiff) { T.ps = pageSums(); if (rbdump) T.pg = m.HEAPU8.slice(rbdump, rbdump + 4096); }
@@ -80,7 +84,7 @@ try {
           if (rc === 0) { T.restoreMs.push(performance.now() - t1); m._mp4web_set_frame(k); T.restores++; T.replayUntil = f; r = 1; T.rcmp++; if (m._mp4web_rb_hash() !== T.h1[k]) { T.rbad++; const sm = [m._mp4web_rb_small_hash(0), m._mp4web_rb_small_hash(1), m._mp4web_rb_small_hash(2)], o = T.sm && T.sm[k]; const rec = { k, at: f, full: m._mp4web_rb_hash_full() === T.h1[k], smallDiff: o ? sm.map((x, i) => x !== o[i]) : null };
             if (T.ps && k === rbdiff) { const now = pageSums(), b = m._mp4web_rb_base(), d = []; for (let p = 0; p < now.length; p++) if (now[p] !== T.ps[p]) d.push((b + p * 4096).toString(16)); rec.pages = d.slice(0, 20); rec.npages = d.length; if (m._mp4web_det_owner && d.length) { const q = m._malloc(8); rec.owner = d.slice(0, 4).map((x) => { m._mp4web_det_owner(parseInt(x, 16), q); const o = new Uint32Array(m.HEAPU8.buffer, q, 2); return [o[0].toString(16), o[1]]; }); m._free(q); } }
             if (T.pg && k === rbdiff) { const cur = m.HEAPU8.subarray(rbdump, rbdump + 4096), offs = []; for (let i = 0; i < 4096; i++) if (cur[i] !== T.pg[i]) offs.push(i); rec.bytes = offs.slice(0, 64).map((i) => [(rbdump + i).toString(16), T.pg[i], cur[i]]); rec.nbytes = offs.length; if (offs.length && m._mp4web_det_owner) { const q = m._malloc(8); m._mp4web_det_owner(rbdump + offs[0], q); const o = new Uint32Array(m.HEAPU8.buffer, q, 2); rec.byteOwner = [o[0].toString(16), o[1]]; m._free(q); } }
-            (T.rbadAt = T.rbadAt || []).push(rec); } } else T.rcFail = rc;
+            (T.rbadAt = T.rbadAt || []).push(rec); } } else { T.rcFail = rc; T.rcFails = (T.rcFails || 0) + 1; }
         }
         return r;
       };
@@ -118,7 +122,7 @@ try {
     await p.screenshot({ path: n > 1 ? out.replace(/\.png$/, '_' + k + '.png') : out });
   }
   if (process.env.SNAPTEST) { const r = await p.evaluate(() => { const T = window.__snapT || {}; return { phase: T.phase, snapFrame: T.snapFrame, restoredTo: T.restoredTo, snapMs: T.snapMs, restoreMs: T.restoreMs, memMB: T.memMB, pass1: T.pass1, pass2: T.pass2 }; }); logs.push('SNAPTEST ' + JSON.stringify(r)); }
-  if (process.env.RBTEST) { const r = await p.evaluate(() => { const T = window.__rbT, m = window.__mp4n.module; const st = Array.from(new Float64Array(m.HEAPU8.buffer, m._mp4web_rb_stats(), 8)); const rs = T.restoreMs.slice().sort((a, b) => a - b); return { enableRc: T.enableRc, inexactAt: T.rbadAt || [], fullChecked: T.fullCmp || 0, fullMismatch: T.fullBad || 0, fullFirst: T.fullFirst || null, restores: T.restores, restoreExactChecked: T.rcmp, restoreInexact: T.rbad, rerunFramesCompared: T.cmp, mismatches: T.bad.length, firstBad: T.bad.slice(0, 5), rcFail: T.rcFail, restoreMsP50: rs[rs.length >> 1], restoreMsMax: rs[rs.length - 1], avgHashMs: T.hashMs / Math.max(1, Object.keys(T.h1).length + T.cmp), maxHashMs: T.maxHashMs, boundaries: st[0], pagesPerFrame: st[1] / Math.max(1, st[0]), maxPagesPerFrame: st[2], restoredPagesPer: st[4] / Math.max(1, st[3]), lastBoundaryMs: st[6], overflow: st[7] }; }); logs.push('RBTEST ' + JSON.stringify(r)); }
+  if (process.env.RBTEST) { const r = await p.evaluate(() => { const T = window.__rbT, m = window.__mp4n.module; const st = Array.from(new Float64Array(m.HEAPU8.buffer, m._mp4web_rb_stats(), 8)); const rs = T.restoreMs.slice().sort((a, b) => a - b); return { enableRc: T.enableRc, inexactAt: T.rbadAt || [], fullChecked: T.fullCmp || 0, fullMismatch: T.fullBad || 0, fullFirst: T.fullFirst || null, restores: T.restores, restoreExactChecked: T.rcmp, restoreInexact: T.rbad, rerunFramesCompared: T.cmp, mismatches: T.bad.length, firstBad: T.bad.slice(0, 5), rcFail: T.rcFail, rcFails: T.rcFails || 0, restoreMsP50: rs[rs.length >> 1], restoreMsMax: rs[rs.length - 1], avgHashMs: T.hashMs / Math.max(1, Object.keys(T.h1).length + T.cmp), maxHashMs: T.maxHashMs, boundaries: st[0], pagesPerFrame: st[1] / Math.max(1, st[0]), maxPagesPerFrame: st[2], restoredPagesPer: st[4] / Math.max(1, st[3]), lastBoundaryMs: st[6], overflow: st[7] }; }); logs.push('RBTEST ' + JSON.stringify(r)); }
   if (process.env.CNTDUMP) { const c = await p.evaluate(() => { const m = window.__mp4n.module, C = window.__cnt; const a = new Uint32Array(m.HEAPU8.buffer, C.ptr, C.n), o = {}; for (let i = 0; i < C.n; i++) if (a[i]) o[i] = a[i]; return { o, frames: m._mp4web_total() }; }); fs.writeFileSync(process.env.CNTDUMP, JSON.stringify(c)); logs.push('CNTDUMP ' + Object.keys(c.o).length + ' sites, frames ' + c.frames); }
   if (process.env.DIFFOUT) { const d = await p.evaluate(() => window.__diff); fs.writeFileSync(process.env.DIFFOUT, JSON.stringify(d)); logs.push('DIFF ' + !!d); }
   if (process.env.HASHOUT) { const h = await p.evaluate(() => window.Mp4State && window.Mp4State.hashes); fs.writeFileSync(process.env.HASHOUT, JSON.stringify(h)); logs.push('HASHES ' + Object.keys(h || {}).length); }

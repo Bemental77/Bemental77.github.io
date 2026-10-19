@@ -280,6 +280,8 @@
         if (R.lastLive === R.lastRan) {
           R.lastLive = -1;
           ls.endFrame(null);
+          // the first frame the room may still rewind to: rollback.c grows its history rather than lose it
+          if (mod._mp4web_rb_keep && ls.rollback > 0 && typeof ls._rbConfirmed === 'number') mod._mp4web_rb_keep(ls._rbConfirmed + 1);
           if (ls.rollback > 0) { var dq = ls.takeHashDue(); for (var i = 0; i < dq.length; i++) R.due.push(dq[i]); }
           else if (R.hashAt[k] != null && (k - 1) % (ls.hashEvery || 60) === 0) { try { if (ls.submitHash(k - 1, R.hashAt[k])) { R.stats.hashesSent++; R.sent[k - 1] = R.hashAt[k]; } } catch (e) {} }
           R.stats.frameTimes.push(performance.now()); if (R.stats.frameTimes.length > 4000) R.stats.frameTimes.splice(0, 1000);

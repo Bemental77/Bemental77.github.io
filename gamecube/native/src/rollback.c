@@ -74,10 +74,35 @@ static void mark_stale(uint32_t p) {
   if (!g_stale[p]) { g_stale[p] = 1; g_staleList[g_staleN++] = p; }
 }
 
+// THE POOL GROWS rather than lose a frame the room may still rewind to. The page says which frame that is
+// (mp4web_rb_keep: the first frame not yet confirmed); when the ring is about to overwrite an image of that
+// frame or a later one, the pool doubles (up to POOL_MAX) instead. Without it a burst of writes (an overlay
+// loading while a peer lagged) overwrote unconfirmed history and the room failed: "rewind to frame N is out
+// of reach (-3)". Only at POOL_MAX does the ring overwrite, as before.
+#define POOL_MAX (1u << 15)                // 128 MB of page images
+static int64_t g_keep = -1;
+EMSCRIPTEN_KEEPALIVE void mp4web_rb_keep(int32_t k) { g_keep = k; }
+static void grow_pool(void) {
+  const uint32_t ncap = g_cap * 2 > POOL_MAX ? POOL_MAX : g_cap * 2;
+  if (ncap <= g_cap) return;
+  uint8_t* np = malloc((size_t)ncap * PAGE); uint32_t* ne = malloc(sizeof(uint32_t) * ncap);
+  if (!np || !ne) { free(np); free(ne); return; }
+  const uint64_t lo = g_head > g_cap ? g_head - g_cap : 0;   // the images still held
+  for (uint64_t i = lo; i < g_head; ++i) {
+    memcpy(np + (size_t)(i % ncap) * PAGE, g_pool + (size_t)(i % g_cap) * PAGE, PAGE);
+    ne[i % ncap] = g_ent[i % g_cap];
+  }
+  free(g_pool); free(g_ent); g_pool = np; g_ent = ne; g_cap = ncap;
+}
+
 // The barrier calls this the first time a page is written in the open frame.
 EMSCRIPTEN_KEEPALIVE void mp4web_cow(uint32_t p) {
   if (!g_on || g_restoring || p >= g_pages || g_table[p]) return;
   g_table[p] = 1;
+  if (g_head >= g_cap && g_keep >= 0 && g_cap < POOL_MAX) {
+    const FrameLog* K = &g_log[g_keep % g_ring];
+    if (K->frame == g_keep && g_head - g_cap >= K->start) grow_pool();   // would overwrite history still needed
+  }
   const uint32_t slot = (uint32_t)(g_head % g_cap);
   memcpy(g_pool + (size_t)slot * PAGE, (const void*)(uintptr_t)(g_base + (p << PAGE_SHIFT)), PAGE);
   g_ent[slot] = p;
@@ -133,7 +158,7 @@ EMSCRIPTEN_KEEPALIVE int mp4web_rb_enable(int32_t frame, uint32_t ring, uint32_t
     g_hacc ^= mixp(p, g_ph[p]);
   }
   for (uint32_t i = 0; i < MAXR; ++i) g_log[i].frame = -1;
-  g_head = 0; g_overwritten = 0; g_overflow = 0;
+  g_head = 0; g_overwritten = 0; g_overflow = 0; g_keep = -1;
   memset(g_stats, 0, sizeof g_stats);
   g_cur = frame;
   g_log[frame % g_ring] = (FrameLog){frame, 0, 0};
