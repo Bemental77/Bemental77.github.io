@@ -163,6 +163,7 @@ async function launch(role, cpus) {
   makeDevice(P, cpus);
   deviceScan(P); P.scan = setInterval(() => deviceScan(P), 300);
   P.page = (await browser.pages())[0] || await browser.newPage();
+  if (process.env.MOBILE) await P.page.emulate(puppeteer.KnownDevices[process.env.MOBILE === '1' ? 'iPhone 12' : process.env.MOBILE]);   // MOBILE=1: phone viewport, touch, UA
   // SENDTIME=1 (diagnostic): time every RTCDataChannel / WebSocket send on the page (window.__sendT)
   if (process.env.SENDTIME === '1') await P.page.evaluateOnNewDocument(() => {
     const T = window.__sendT = { dc: 0, dcN: 0, dcMax: 0, ws: 0, wsN: 0 };
@@ -187,7 +188,7 @@ async function launch(role, cpus) {
     .then(() => P.page.evaluate(process.env.EVAL)).then(() => say('EVAL done')).catch((e) => say('EVAL failed ' + e));
   if (process.env.ROUTE) {
     const SC = JSON.parse(fs.readFileSync(process.env.ROUTE, 'utf8'));
-    if (role === 'H') P.page.waitForFunction(() => window.Mp4Input && Mp4Input.script, { timeout: 900000, polling: 50 })
+    if (role === 'H' || role === 'A') P.page.waitForFunction(() => window.Mp4Input && Mp4Input.script, { timeout: 900000, polling: 50 })
       .then(() => P.page.evaluate((sc) => { Mp4Input.script((f) => { let b = 0; for (const [a, z, k, ov] of sc) if (f >= a && f < z && (ov == null || window.__routeOvl === ov)) b |= k; return b; }); }, SC))
       .then(() => say('route installed on H')).catch((e) => say('route failed ' + e));
     else (async () => {
@@ -200,6 +201,7 @@ async function launch(role, cpus) {
   const mq = '/tmp/npdm/mqtt-5.3.4.min.js';
   if (!fs.existsSync(mq)) execSync(`mkdir -p /tmp/npdm && curl -sS -f -o ${mq} https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.3.4/mqtt.min.js`);
   await P.page.evaluateOnNewDocument(fs.readFileSync(mq, 'utf8'));
+  if (process.env.PRELOAD) await P.page.evaluateOnNewDocument(process.env.PRELOAD);   // an experiment's page-start hook (e.g. capture the GPUDevice)
   return P;
 }
 const BENCH_SRC = `function computeBenchmarkIndex(duration){const halfTime=duration/2;
@@ -315,6 +317,17 @@ try {
           r.p = r.pres != null && prev.pres != null ? (r.pres - prev.pres) / dt : (r.presRate != null ? r.presRate : null);
           r.ms = r.busy != null && prev.busy != null && r.total > prev.total ? (r.busy - prev.busy) / (r.total - prev.total) : null; }
         console.log(`${r.T} ${P.role} f=${r.frame} x=${r.x != null ? r.x.toFixed(3) : '-'} pres=${r.p != null ? r.p.toFixed(1) : '-'}/s ${r.state} ${r.rb ? 'RB' : 'd' + r.delay} stalls=${r.stalls} rbk=${r.rollbacks} hc=${r.hc}${r.desync ? ' DESYNC' : ''}`);
+        // LIFECYCLE=role:afterS:forS — background that console's tab (CDP freeze + hidden) afterS seconds
+        // after it opens, for forS seconds, then bring it back (a phone switching apps)
+        if (process.env.LIFECYCLE && P.t0 != null && !P.lc) {
+          const [lr, la, lf] = process.env.LIFECYCLE.split(':');
+          if (lr === P.role && r.T - P.t0 >= +la) {
+            P.lc = (async () => { const c = await P.page.target().createCDPSession();
+              await c.send('Emulation.setFocusEmulationEnabled', { enabled: false }).catch(() => {});
+              await c.send('Page.setWebLifecycleState', { state: 'frozen' }); say(`LIFECYCLE ${P.role} frozen`);
+              await sleep(1000 * +lf); await c.send('Page.setWebLifecycleState', { state: 'active' }); say(`LIFECYCLE ${P.role} active`); })().catch((e) => say('lifecycle failed ' + e));
+          }
+        }
         // PROFILE=role: a CPU profile of that console for PROFILE_S seconds, from SKIP s after it opens
         // (a profile perturbs timing: use it for where the CPU goes, never for a rate)
         if (process.env.PROFILE === P.role && P.t0 != null && !P.prof && r.T - P.t0 >= SKIP) {
