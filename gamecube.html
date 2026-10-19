@@ -7,6 +7,7 @@
   <link rel="icon" href="data:,">
   <script src="/lib/debugreport.js?v=94ec9928"></script>
   <script src="/lib/volume.js?v=1"></script>
+  <script src="/lib/autosave.js?v=1"></script>
   <script src="/coi-serviceworker.js"></script>
   <!-- The game library's origin. ONE constant for the whole site, so the split
        is revertible by editing a single line — see lib/asset_base.js. -->
@@ -7881,6 +7882,7 @@ window.GcRate = (function () {
   }
   function toggleFullscreen() { var el = isMobile ? $('mobileShell') : $('canvasWrap'); if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } else { var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen; if (fn) fn.call(el).catch(() => {}); } }
   $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnExport').addEventListener('click', exportState); $('btnImport').addEventListener('click', () => $('importFile').click()); $('importFile').addEventListener('change', (e) => { if (e.target.files && e.target.files[0]) importState(e.target.files[0]); e.target.value = ''; }); $('btnMute').addEventListener('click', toggleMute); $('btnResetAudio').addEventListener('click', resetAudio); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; _logFlush(); });
+  Autosave.init({ canSave: function () { return !$('btnSave').disabled && !(typeof GCLS !== 'undefined' && GCLS && GCLS.session); }, save: saveState });
   $('btnDiag').addEventListener('click', gcShowDiag);
   $('diagClose').addEventListener('click', () => { $('diagOverlay').style.display = 'none'; });
   $('diagOverlay').addEventListener('click', (e) => { if (e.target === $('diagOverlay')) $('diagOverlay').style.display = 'none'; });

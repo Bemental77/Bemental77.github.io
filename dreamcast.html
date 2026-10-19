@@ -7,6 +7,7 @@
   <link rel="icon" href="data:,">
   <script src="/lib/debugreport.js?v=94ec9928"></script>
   <script src="/lib/volume.js?v=1"></script>
+  <script src="/lib/autosave.js?v=1"></script>
   <script src="/coi-serviceworker.js"></script>
   <!-- The game library's origin. ONE constant for the whole site, so the split
        is revertible by editing a single line — see lib/asset_base.js. -->
@@ -5473,6 +5474,11 @@
     if (!booted) { pageLog('[page] Start the game before saving'); return; }
     pageLog('[page] saving state…');
     worker.postMessage({ cmd: 'saveState' });
+  });
+  // ?autosave=<ms> is the probe's own timed capture (line ~2880), not this feature.
+  Autosave.init({
+    canSave: () => booted && !NET.session && !new URLSearchParams(location.search).has('autosave'),
+    save: () => $('btnSave').click(),
   });
   // Export: download the current state as a file (falls back to the
   // IndexedDB-persisted copy, so it works right after a reload, before

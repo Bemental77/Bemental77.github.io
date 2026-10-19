@@ -7,6 +7,7 @@
   <link rel="icon" href="data:,">
   <script src="/lib/debugreport.js?v=94ec9928"></script>
   <script src="/lib/volume.js?v=1"></script>
+  <script src="/lib/autosave.js?v=1"></script>
   <script src="/lib/wakelock.js"></script>
   <!-- Shared capability layer. Same-origin (like /lib/wakelock.js above), so it does NOT
        violate this page's self-hosting invariant: the rule is that nothing comes from a
@@ -3561,6 +3562,7 @@ N64Rate.selfTest = function (logFn) {
   function resetGame() { if (!running) return toast('Emulator not running', true); window.Module._neil_reset(); toast('Reset'); }
   function toggleFullscreen() { var el = isMobile ? $('mobileShell') : $('canvasDiv'); if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } else { var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen; if (fn) fn.call(el).catch(() => {}); } }
   $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnExport').addEventListener('click', exportState); $('btnImport').addEventListener('click', importState); $('btnMute').addEventListener('click', toggleMute); $('btnReset').addEventListener('click', resetGame); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; if (logEl.style.display === 'block') logEl.scrollTop = logEl.scrollHeight; });
+  Autosave.init({ canSave: function () { return running && !(typeof NET !== 'undefined' && NET && NET.session); }, save: saveState });
 
   // ---- diagnostics wiring -----------------------------------------------------------------
   // Three entry points, because the report is worthless if it is only reachable from a state

@@ -3,6 +3,7 @@
 <head>
   <script src="/lib/debugreport.js?v=94ec9928"></script>
   <script src="/lib/volume.js?v=1"></script>
+  <script src="/lib/autosave.js?v=1"></script>
   <script src="/lib/capability.js?v=b411172f"></script>
   <script src="/lib/bench.js?v=3a51eccb"></script><!-- ?bench=1 real-device benchmark; inert without it -->
   <script src="/lib/xboxinput.js"></script>
@@ -1348,6 +1349,7 @@
   async function resetAudio() { var ctx = getAudioCtx(); if (!ctx) { toast('Audio not ready', true); return; } if (audioDraining) return; audioDraining = true; toast('Resetting audio…'); try { await ctx.suspend(); } catch (e) {} await new Promise(r => setTimeout(r, 150)); if (window._soundScratchPtr) { try { Module._free(window._soundScratchPtr); } catch (e) {} window._soundScratchPtr = 0; window._soundScratchSize = 0; } if (!audioMuted) { try { await ctx.resume(); } catch (e) {} } audioDraining = false; toast('Audio reset'); }
   function toggleFullscreen() { var el = isMobile ? $('mobileShell') : $('canvasWrap'); if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } else { var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen; if (fn) fn.call(el).catch(() => {}); } }
   $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnExport').addEventListener('click', exportState); $('btnImport').addEventListener('click', importState); $('btnMute').addEventListener('click', toggleMute); $('btnResetAudio').addEventListener('click', resetAudio); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; });
+  Autosave.init({ canSave: function () { return !$('btnSave').disabled && !(typeof NET !== 'undefined' && NET && NET.session); }, save: saveState });
   function openMobileMenu() { $('mobileMenu').classList.add('open'); } function closeMobileMenu() { $('mobileMenu').classList.remove('open'); }
   function applyGhost(on) { $('mobileShell').classList.toggle('ghost', on); if ($('mGhost')) $('mGhost').textContent = 'Transparent Controls: ' + (on ? 'On' : 'Off'); }
   function toggleGhost() { var on = !$('mobileShell').classList.contains('ghost'); localStorage.setItem('ps1wasm_ghost', on ? '1' : '0'); applyGhost(on); }
