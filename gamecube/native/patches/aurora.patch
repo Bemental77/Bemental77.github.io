@@ -1,5 +1,5 @@
 diff --git a/lib/aurora.cpp b/lib/aurora.cpp
-index dc5ae5b..c7d1da1 100644
+index dc5ae5b..27b922a 100644
 --- a/lib/aurora.cpp
 +++ b/lib/aurora.cpp
 @@ -39,6 +39,9 @@ using webgpu::g_surface;
@@ -60,7 +60,20 @@ index dc5ae5b..c7d1da1 100644
        ZoneScopedN("Acquire texture");
        wgpu::SurfaceTexture surfaceTexture;
        g_surface.GetCurrentTexture(&surfaceTexture);
-@@ -293,7 +313,7 @@ void end_frame() noexcept {
+@@ -263,6 +283,12 @@ void end_frame() noexcept {
+     }
+ 
+     const bool canPresent = currentTexture && currentView;
++#ifdef __EMSCRIPTEN__
++    if (canPresent && !encoder) {   // gfx creates the frame's encoder on first use; a present always needs one
++      const wgpu::CommandEncoderDescriptor encoderDescriptor{.label = "Redraw encoder"};
++      encoder = webgpu::g_device.CreateCommandEncoder(&encoderDescriptor);
++    }
++#endif
+     if (canPresent) {
+       wgpu::BindGroup presentBindGroup;
+       if (rmlBindGroup) {
+@@ -293,7 +319,7 @@ void end_frame() noexcept {
          pass.Draw(3);
          pass.End();
        }
@@ -69,7 +82,7 @@ index dc5ae5b..c7d1da1 100644
          const std::array attachments{
              wgpu::RenderPassColorAttachment{
                  .view = currentView,
-@@ -313,6 +333,9 @@ void end_frame() noexcept {
+@@ -313,22 +339,36 @@ void end_frame() noexcept {
          pass.End();
        }
      } else {
@@ -78,8 +91,16 @@ index dc5ae5b..c7d1da1 100644
 +#endif
        Log.info("Skipping present; window not presentable");
      }
-     const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
-@@ -323,12 +346,20 @@ void end_frame() noexcept {
+-    const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
+-    const auto buffer = encoder.Finish(&cmdBufDescriptor);
++#ifdef __EMSCRIPTEN__
++    if (encoder)   // nothing was encoded (an undrawn frame with no uploads): nothing to submit
++#endif
+     {
++      const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
++      const auto buffer = encoder.Finish(&cmdBufDescriptor);
+       ZoneScopedN("Queue Submit");
+       g_queue.Submit(1, &buffer);
      }
      if (canPresent && g_surface) {
        ZoneScopedN("Present");
@@ -417,7 +438,7 @@ index 2d7f795..17cb345 100644
            g_keyboardBindings[i].m_buttonMapping, [&kbState, &i, &status](const PADKeyButtonBinding& mapping) {
              if (mapping.scancode > PAD_KEY_INVALID && kbState[mapping.scancode]) {
 diff --git a/lib/gfx/common.cpp b/lib/gfx/common.cpp
-index eff0c65..dcf7c96 100644
+index eff0c65..f477612 100644
 --- a/lib/gfx/common.cpp
 +++ b/lib/gfx/common.cpp
 @@ -1,4 +1,41 @@
@@ -471,7 +492,30 @@ index eff0c65..dcf7c96 100644
  };
  
  static std::array<FramePacket, FrameSlotCount> g_framePackets;
-@@ -383,7 +422,7 @@ void queue_texture_upload_data(const uint8_t* data, size_t length, uint32_t byte
+@@ -360,6 +399,22 @@ static void enqueue_op(FramePacket& frame, size_t frameSlot, uint32_t opIndex) {
+       return;
+     }
+     auto& packet = g_framePackets[frameSlot];
++#ifdef __EMSCRIPTEN__
++    // web: the frame's command encoder is created on first use. A scratch frame (no staging buffer: the
++    // GPU is behind) usually encodes nothing at all, and its empty encoder + Finish + Submit cost ~6.5% of
++    // a toaster console's main thread on the board, plus the GPU process's decoding of each of them.
++    if (packet.scratch) {
++      bool work = op.type == FrameOpType::RenderPass && op.renderPass != nullptr && !op.renderPass->paletteConvs.empty();
++      if constexpr (UseTextureBuffer)
++        for (size_t i = packet.copied.textureUploadCount; !work && i < op.textureUploads.size(); ++i)
++          work = op.textureUploads[i]->buffer != nullptr;
++      if (!work) return;
++    }
++    if (!packet.encoder) {
++      const auto encoderDescriptor = wgpu::CommandEncoderDescriptor{.label = "Redraw encoder"};
++      packet.encoder = g_device.CreateCommandEncoder(&encoderDescriptor);
++    }
++#endif
+     encode_op(packet.encoder, packet, op);
+   });
+ }
+@@ -383,7 +438,7 @@ void queue_texture_upload_data(const uint8_t* data, size_t length, uint32_t byte
                                 wgpu::TexelCopyTextureInfo tex, wgpu::Extent3D size) {
    const auto copyBytesPerRow = AURORA_ALIGN(bytesPerRow, 256);
    auto& frame = current_frame_packet();
@@ -480,7 +524,7 @@ index eff0c65..dcf7c96 100644
      const auto range = push_texture_data(data, length, bytesPerRow, rowsPerImage);
      const wgpu::TexelCopyBufferLayout layout{
          .offset = range.offset,
-@@ -991,6 +1030,9 @@ static bool wait_for_staging_buffer(size_t slot) {
+@@ -991,6 +1046,9 @@ static bool wait_for_staging_buffer(size_t slot) {
        return false;
      }
      if (render_worker::is_idle()) {
@@ -490,7 +534,7 @@ index eff0c65..dcf7c96 100644
        g_instance.ProcessEvents();
      } else {
        std::this_thread::sleep_for(std::chrono::milliseconds{1});
-@@ -998,6 +1040,23 @@ static bool wait_for_staging_buffer(size_t slot) {
+@@ -998,6 +1056,23 @@ static bool wait_for_staging_buffer(size_t slot) {
    }
  }
  
@@ -514,7 +558,7 @@ index eff0c65..dcf7c96 100644
  static size_t acquire_frame_slot() {
    ZoneScopedN("Acquire frame slot");
    while (true) {
-@@ -1005,6 +1064,9 @@ static size_t acquire_frame_slot() {
+@@ -1005,6 +1080,9 @@ static size_t acquire_frame_slot() {
        return *slot;
      }
      if (render_worker::is_idle()) {
@@ -524,7 +568,7 @@ index eff0c65..dcf7c96 100644
        g_instance.ProcessEvents();
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds{100});
-@@ -1023,6 +1085,9 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
+@@ -1023,6 +1101,9 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
        return std::nullopt;
      }
      if (render_worker::is_idle()) {
@@ -534,7 +578,7 @@ index eff0c65..dcf7c96 100644
        g_instance.ProcessEvents();
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds{100});
-@@ -1033,8 +1098,32 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
+@@ -1033,8 +1114,32 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
  bool begin_frame() {
    ZoneScoped;
    const size_t frameSlot = acquire_frame_slot();
@@ -568,7 +612,7 @@ index eff0c65..dcf7c96 100644
      g_frameSlots.release(frameSlot);
      return false;
    }
-@@ -1043,17 +1132,32 @@ bool begin_frame() {
+@@ -1043,17 +1148,32 @@ bool begin_frame() {
    frame = {};
    frame.frameId = g_nextFrameId++;
    frame.frameIndex = g_frameIndex;
@@ -604,7 +648,20 @@ index eff0c65..dcf7c96 100644
      bufferOffset += size;
    };
    mapBuffer(frame.verts, VertexBufferSize);
-@@ -1118,6 +1222,28 @@ void end_frame(EndFrameCallback callback) {
+@@ -1081,10 +1201,12 @@ bool begin_frame() {
+   push_command(CommandType::SetScissor, Command::Data{.setScissor = g_cachedScissor});
+   begin_pipeline_frame();
+   render_worker::enqueue_begin_frame(frame.frameId, [frameSlot] {
++#ifndef __EMSCRIPTEN__   // web: created on first use (enqueue_op)
+     const auto encoderDescriptor = wgpu::CommandEncoderDescriptor{
+         .label = "Redraw encoder",
+     };
+     g_framePackets[frameSlot].encoder = g_device.CreateCommandEncoder(&encoderDescriptor);
++#endif
+   });
+   return true;
+ }
+@@ -1118,6 +1240,28 @@ void end_frame(EndFrameCallback callback) {
    frame.stats.lastIndexSize = frame.indices.size();
    frame.stats.lastStorageSize = frame.storage.size();
    frame.stats.lastTextureUploadSize = frame.textureUpload.size();
@@ -633,7 +690,7 @@ index eff0c65..dcf7c96 100644
  
    const size_t frameSlot = g_recordingFrameSlot;
    const uint64_t frameId = frame.frameId;
-@@ -1145,8 +1271,10 @@ void end_frame(EndFrameCallback callback) {
+@@ -1145,8 +1289,10 @@ void end_frame(EndFrameCallback callback) {
    const size_t stagingSlot = frame.stagingBuffer;
    render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback)]() mutable {
      auto& packet = g_framePackets[frameSlot];
@@ -646,7 +703,7 @@ index eff0c65..dcf7c96 100644
      auto encoder = std::move(packet.encoder);
      const auto stats = packet.stats;
      packet = {};
-@@ -1162,7 +1290,7 @@ void end_frame(EndFrameCallback callback) {
+@@ -1162,7 +1308,7 @@ void end_frame(EndFrameCallback callback) {
        callback(encoder);
      }
      expire_cached_bind_groups();
@@ -655,7 +712,7 @@ index eff0c65..dcf7c96 100644
    });
  }
  
-@@ -1232,15 +1360,45 @@ static void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& f
+@@ -1232,15 +1378,45 @@ static void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& f
  }
  
  static void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
@@ -702,7 +759,7 @@ index eff0c65..dcf7c96 100644
        cmd.CopyTextureToTexture(&op.textureCopy->src, &op.textureCopy->dst, &op.textureCopy->size);
      }
      break;
-@@ -1392,7 +1550,14 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
+@@ -1392,7 +1568,14 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
        const auto& vp = cmd.data.setViewport;
        const float minDepth = gx::UseReversedZ ? 1.f - vp.zfar : vp.znear;
        const float maxDepth = gx::UseReversedZ ? 1.f - vp.znear : vp.zfar;
