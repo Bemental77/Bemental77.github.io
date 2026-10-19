@@ -258,6 +258,28 @@
   // the host is not keeping up (the game is never sped up to compensate). Host ms per frame is the time
   // from the frame boundary to the next one minus the scheduled sleep: what producing one frame costs.
   // Headroom = 16.667 ms / host ms. Presented frames are the guest's 60, never more.
+  // ADAPTIVE INTERNAL RESOLUTION. Aurora renders at the canvas's pixel size; on a weak GPU that fill is
+  // the cost (measured on the toaster rig: ~0.38 us of GPU-process CPU per pixel per drawn frame). When the
+  // GPU is measured to be behind — at least 20% of frames found no staging buffer free (a scratch frame:
+  // the GPU had not finished the earlier ones) for 5 seconds running, after the first 20 s of play — rendering drops to the GameCube's own
+  // 640x480 (scaled up when presented). Measured, never guessed from the device; one way (no oscillation);
+  // ?res=N fixes the scale and turns this off. Rendering is not game state (the game never reads the EFB),
+  // so consoles in a room may differ here.
+  var RES = { hot: 0, done: Q.get('res') != null };
+  function autoRes(c, p, df) {
+    var mod = window.__mp4n.module;
+    if (RES.done || !mod || !mod._mp4web_gpu_scratch_frames || !mod._mp4web_set_fb_scale) return;
+    var sc = mod._mp4web_gpu_scratch_frames(), cv = document.getElementById('canvas');
+    if (RES.sc == null || !cv) { RES.sc = sc; return; }
+    var frac = (sc - RES.sc) / df; RES.sc = sc;
+    if (cv.width * cv.height <= 640 * 480 * 1.1) return;   // already at (or below) native: nothing to gain
+    if (c.f < 1200) return;   // not during boot / the first 20 s: pipeline creation stalls every GPU there
+    RES.hot = frac >= 0.2 ? RES.hot + 1 : 0;
+    if (RES.hot < 5) return;
+    RES.done = true; window.__mp4n.autoRes = { at: c.f, scratchFrac: +frac.toFixed(2), canvas: [cv.width, cv.height] };
+    mod._mp4web_set_fb_scale(1);
+    log('render resolution: 640x480 (native) — the GPU could not keep up at ' + cv.width + 'x' + cv.height + ' (' + Math.round(frac * 100) + '% of frames undrawn for 5 s)');
+  }
   function startReadout(mod) {
     var el = document.getElementById('readout'), prev = null;
     function snap() {
@@ -271,6 +293,7 @@
         var df = c.f - prev.f, dt = (c.t - prev.t) / 1000, rate = df / dt / 60, ms = (c.busy - prev.busy) / df, gpu = (c.gpu - prev.gpu) / df;
         var r = { guestRate: rate, framesPerSec: (c.d != null && prev.d != null) ? (c.d - prev.d) / dt : df / dt, hostMsPerFrame: ms, gpuWaitMsPerFrame: gpu, cpuMsPerFrame: ms - gpu, headroom: (1000 / 60) / ms, reanchors: c.re - prev.re, frames: c.f };
         window.__mp4n.rate = r;
+        autoRes(c, prev, df);
         var roomTxt = '';
         if (c.rm && c.rm.armed) {
           var e = c.rm.engine || {};
