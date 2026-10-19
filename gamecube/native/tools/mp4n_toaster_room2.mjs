@@ -174,6 +174,23 @@ async function launch(role, cpus) {
   P.tail = [];
   P.page.on('console', (m) => { const t = m.text(); P.tail.push(`${ts()} ${t.slice(0, 300)}`); if (P.tail.length > 400) P.tail.shift();
     if (/ARMED|armed|desync|delay lockstep|zero-lag|capacity|room:|⚠/i.test(t) && P.lines.length < 200) { const L = `${ts()} ${role} ${t.slice(0, 220)}`; P.lines.push(L); console.log('  ' + L); } });
+  // ROUTE=route.json (e.g. gamecube/native/tools/route_party_minigames.json): the host's pad follows the
+  // frame-keyed route (Party Mode -> board -> minigames, as mp4n_room_test.mjs --script); the joiner is a
+  // second human pressing keys at its own pace (menu keys, then only A + stick once on the board)
+  P.ovl = [];
+  P.page.on('console', (m) => { const om = /DLLStart (\d+)/.exec(m.text()); if (om && P.ovl[P.ovl.length - 1] !== +om[1]) { P.ovl.push(+om[1]); P.page.evaluate((o) => { window.__routeOvl = o; }, +om[1]).catch(() => {}); } });
+  if (process.env.ROUTE) {
+    const SC = JSON.parse(fs.readFileSync(process.env.ROUTE, 'utf8'));
+    if (role === 'H') P.page.waitForFunction(() => window.Mp4Input && Mp4Input.script, { timeout: 900000, polling: 50 })
+      .then(() => P.page.evaluate((sc) => { Mp4Input.script((f) => { let b = 0; for (const [a, z, k, ov] of sc) if (f >= a && f < z && (ov == null || window.__routeOvl === ov)) b |= k; return b; }); }, SC))
+      .then(() => say('route installed on H')).catch((e) => say('route failed ' + e));
+    else (async () => {
+      const KEYS = ['Enter', 'Space', 'ArrowDown', 'ArrowRight', 'Space', 'ArrowUp', 'KeyX', 'Enter'], BOARD = ['Space', 'ArrowDown', 'Space', 'ArrowRight', 'Space', 'ArrowLeft'];
+      let k = 0;
+      while (!P.closed) { await sleep(4200 + Math.floor(Math.random() * 1500)); const ks = P.ovl.length >= 4 ? BOARD : KEYS; const c = ks[k++ % ks.length];
+        try { await P.page.keyboard.down(c); await sleep(340); await P.page.keyboard.up(c); } catch (_e) { break; } }
+    })();
+  }
   const mq = '/tmp/npdm/mqtt-5.3.4.min.js';
   if (!fs.existsSync(mq)) execSync(`mkdir -p /tmp/npdm && curl -sS -f -o ${mq} https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.3.4/mqtt.min.js`);
   await P.page.evaluateOnNewDocument(fs.readFileSync(mq, 'utf8'));
@@ -236,6 +253,8 @@ const probe = () => {
     return { t, frame, pres: m && m._mp4web_drawn ? m._mp4web_drawn() : (room ? r.stats.live - r.stats.hidden : frame), hz: 60, state: room ? e.state : (frame > 0 ? 'running' : null),
              stalls: r.stats.holds, rb: e.rollback, delay: e.delay, desync: !!e.desync, hc: e.hashesCompared, rollbacks: r.stats.rollbacks,
              busy: m ? m._mp4web_busy_ms() : null, total: m ? m._mp4web_total() : null, st: r.stats,
+             gs: (() => { if (!m || !m._mp4web_gfx_stats) return null; const p = window.__gsBuf || (window.__gsBuf = m._malloc(64)); m._mp4web_gfx_stats(p);   // last frame: draws, merged, vert/uniform/index/storage/texture-upload bytes, pipelines
+               const v = Array.from(new Float64Array(m.HEAPU8.buffer, p, 8)); const c = document.getElementById('canvas'); return { draws: v[0], merged: v[1], up: v.slice(2, 7), pipes: v[7], canvas: c ? [c.width, c.height] : null, gpuWait: m._mp4web_gpu_wait_ms ? m._mp4web_gpu_wait_ms() : null, auto: m._mp4web_auto_skipped ? m._mp4web_auto_skipped() : null }; })(),
              rbw: e.rb ? { window: e.rb.window, meanDepth: e.rb.meanDepth, maxDepth: e.rb.maxDepth, rollbacks: e.rb.rollbacks, resimFrames: e.rb.resimFrames, predicted: e.rb.predictedFrames, catchUps: e.rb.catchUps } : null, mode: e.rollback ? 'rollback' : (e.delay != null ? 'delay' : null) };
   }
   const g = window.__gcLockstep ? window.__gcLockstep() : null, R = window.__gcRate || {};
@@ -297,6 +316,18 @@ try {
             await sleep(1000 * +(process.env.PROFILE_S || 20)); const { profile } = await c.send('Profiler.stop');
             fs.writeFileSync(`${OUTD}/${name}-${P.role}.cpuprofile`, JSON.stringify(profile)); say(`profile -> ${OUTD}/${name}-${P.role}.cpuprofile`); })().catch((e) => say('profile failed ' + e));
         }
+        // TRACE=role: a Chrome trace (every process: renderer threads, GPU process, GC, uploads) while that
+        // console's guest frame is in [TRACE_FROM, TRACE_TO) (default 600..950: the boot's title load)
+        if (process.env.TRACE === P.role && !P.trace && r.frame != null && r.frame >= +(process.env.TRACE_FROM || 600)) {
+          P.trace = (async () => {
+            const cats = (process.env.TRACE_CATS || 'devtools.timeline,disabled-by-default-devtools.timeline,v8,v8.gc,disabled-by-default-v8.gc,toplevel,gpu,blink,webaudio,audio,disabled-by-default-devtools.timeline.frame,cc,viz,scheduler').split(',');
+            await P.page.tracing.start({ path: `${OUTD}/${name}-${P.role}.trace.json`, categories: cats });
+            say(`trace on at f=${r.frame}`);
+            const until = +(process.env.TRACE_TO || 950), t1 = Date.now() + 20000;
+            while (Date.now() < t1) { await sleep(250); const last = P.rows[P.rows.length - 1]; if (last && last.frame >= until) break; }
+            await P.page.tracing.stop(); say(`trace -> ${OUTD}/${name}-${P.role}.trace.json`);
+          })().catch((e) => say('trace failed ' + e));
+        }
         if (P.t0 != null && !P.cpu0 && r.T - P.t0 >= SKIP) P.cpu0 = { c: cpuByType(P), f: r.frame, T: r.T };
         if (P.cpu0 && !P.cpu1 && r.T - P.t0 >= SKIP + secs) P.cpu1 = { c: cpuByType(P), f: r.frame, T: r.T };
         if (P.t0 == null || r.T - P.t0 < SKIP + secs) done = false;
@@ -314,7 +345,11 @@ try {
       stalls: last.stalls != null && first.stalls != null ? last.stalls - first.stalls : null, stallMs: last.stallMs != null && first.stallMs != null ? Math.round(last.stallMs - first.stallMs) : null,
       rollbacks: last.rollbacks, desync: last.desync || null, hc: last.hc, cg: deviceStat(P), lines: P.lines, errs: P.errs.slice(0, 8), tail: P.errs.length ? P.tail.slice(-150) : [],
       lastStats: last.st || null, lastRb: last.rbw || null, lastMode: last.mode || null,
+      gs: (() => { const g = w.map((r) => r.gs).filter(Boolean); if (!g.length) return null; const md = (a) => a.slice().sort((x, y) => x - y)[a.length >> 1];
+        return { draws: md(g.map((x) => x.draws)), merged: md(g.map((x) => x.merged)), upKB: [0, 1, 2, 3, 4].map((i) => +(md(g.map((x) => x.up[i])) / 1024).toFixed(1)), pipes: g[g.length - 1].pipes, canvas: g[g.length - 1].canvas,
+          presented: mean(w.map((r) => r.p).filter((v) => v != null)), gpuWaitMs: g[g.length - 1].gpuWait, autoSkipped: g[g.length - 1].auto }; })(),
       rows: R.map((r) => ({ T: r.T, f: r.frame, x: r.x, st: r.state, rb: r.rb, d: r.delay, stalls: r.stalls })) };
+    if (o.gs) say(`GFX ${P.role}: ${JSON.stringify(o.gs)} (median per sampled frame; upKB = vert/uniform/index/storage/texture)`);
     if (o.lastStats) say(`STATS ${P.role}: ${JSON.stringify(o.lastStats)} rb=${JSON.stringify(o.lastRb)} mode=${o.lastMode}`);
     if (P.cpu0 && P.cpu1) { const fr = Math.max(1, P.cpu1.f - P.cpu0.f), sec = P.cpu1.T - P.cpu0.T, by = {};
       for (const [pid, v] of Object.entries(P.cpu1.c)) by[v.k] = (by[v.k] || 0) + 1000 * (v.t - ((P.cpu0.c[pid] || {}).t || 0)) / fr;

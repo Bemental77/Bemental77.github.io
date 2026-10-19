@@ -227,6 +227,7 @@
         }],
         mp4EpochSeconds: room ? room.epoch : Q.get('epoch') ? +Q.get('epoch') : undefined,
         mp4DebugMg: !room && Q.get('mg') ? +Q.get('mg') : undefined,   // crash sweep: boot straight into minigame N (401..463)
+        mp4FbScale: Q.get('res') != null ? +Q.get('res') : undefined,   // ?res=N: render at N x 640x480 (0 = canvas pixels)
         mp4DebugBoard: !room && Q.get('board') ? +Q.get('board') : undefined,   // crash sweep: boot straight into Party Mode board N (0..5 = w01..w06, 6 = w10)
         mp4DebugTurns: !room && Q.get('turns') ? +Q.get('turns') : undefined,   // with ?board: the party's turn count (default 10)
         mp4DebugOvl: !room && Q.get('ovl') ? +Q.get('ovl') : undefined,   // crash sweep: boot straight into overlay index N (menus, Story mode, results)
