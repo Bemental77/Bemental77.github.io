@@ -57,14 +57,15 @@ try {
   if (process.env.CNTDUMP) { await p.waitForFunction(() => window.__mp4n && window.__mp4n.module && window.__mp4n.module.__wx, { timeout: 120000 }); await p.evaluate((n) => { const m = window.__mp4n.module; const ptr = m._malloc(n * 4); m.HEAPU8.fill(0, ptr, ptr + n * 4); m.__wx.mp4web_cnt_set(ptr); window.__cnt = { ptr, n }; }, +(process.env.CNTN || 600000)); }
   if (process.env.RBON) { const ea = +process.env.RBON; await p.waitForFunction(() => window.__mp4n && window.__mp4n.module && window.__mp4n.module.mp4FrameHook, { timeout: 120000 }); await p.evaluate((ea) => { const m = window.__mp4n.module, prev = m.mp4FrameHook; let on = false; m.mp4FrameHook = (f) => { const r = prev(f); if (!on && f >= ea) { window.__rbOnRc = m._mp4web_rb_enable(f, 40, 8192); on = true; } else if (on) m._mp4web_rb_boundary(f); return r; }; }, ea); }
   if (process.env.RBTEST) {
-    const [ea, per, dep] = process.env.RBTEST.split(',').map(Number);
+    const [ea, per, dep, toEa] = process.env.RBTEST.split(',').map(Number);   // toEa=1: rewinds may land ON the enable frame (a room's first misprediction)
     await p.waitForFunction(() => window.__mp4n && window.__mp4n.module && window.__mp4n.module.mp4FrameHook, { timeout: 120000 });
+    if (toEa) await p.evaluate(() => { window.__rbToEa = 1; });
     await p.evaluate((ea, per, dep, rbdiff, rbdump) => {
       const m = window.__mp4n.module, prev = m.mp4FrameHook;
       const T = window.__rbT = { on: false, h1: {}, cmp: 0, bad: [], restores: 0, rcmp: 0, rbad: 0, enableRc: null, replayUntil: -1, hashMs: 0, maxHashMs: 0, restoreMs: [] };
       m.mp4FrameHook = (f) => {
         let r = prev(f);
-        if (!T.on && f === ea) { T.enableRc = m._mp4web_rb_enable(f, 16, 8192); T.on = T.enableRc > 0; return r; }
+        if (!T.on && f === ea) { T.enableRc = m._mp4web_rb_enable(f, 16, 8192); T.on = T.enableRc > 0; if (T.on) { T.h1[f] = m._mp4web_rb_hash(); T.sm = { [f]: [m._mp4web_rb_small_hash(0), m._mp4web_rb_small_hash(1), m._mp4web_rb_small_hash(2)] }; } return r; }   // the enable frame is fingerprinted too: a rewind onto it is checked
         if (!T.on || f <= ea) return r;
         m._mp4web_rb_boundary(f);
         const t0 = performance.now(); const h = m._mp4web_rb_hash(); const dt = performance.now() - t0; T.hashMs += dt; if (dt > T.maxHashMs) T.maxHashMs = dt;
@@ -74,7 +75,7 @@ try {
         else { T.cmp++; if (T.h1[f] !== h) T.bad.push(f); }
         // a store into game memory that bypassed the barrier leaves its page's incremental hash stale
         if (f % 60 === 0) { T.fullCmp = (T.fullCmp || 0) + 1; if (m._mp4web_rb_hash_full() !== h) { T.fullBad = (T.fullBad || 0) + 1; if (!T.fullFirst) T.fullFirst = f; } }
-        if (f > T.replayUntil && f % per === 0 && f - dep > ea) {
+        if (f > T.replayUntil && f % per === 0 && f - dep > ea - (window.__rbToEa ? 1 : 0)) {
           const k = f - dep, t1 = performance.now(), rc = m._mp4web_rb_restore(k);
           if (rc === 0) { T.restoreMs.push(performance.now() - t1); m._mp4web_set_frame(k); T.restores++; T.replayUntil = f; r = 1; T.rcmp++; if (m._mp4web_rb_hash() !== T.h1[k]) { T.rbad++; const sm = [m._mp4web_rb_small_hash(0), m._mp4web_rb_small_hash(1), m._mp4web_rb_small_hash(2)], o = T.sm && T.sm[k]; const rec = { k, at: f, full: m._mp4web_rb_hash_full() === T.h1[k], smallDiff: o ? sm.map((x, i) => x !== o[i]) : null };
             if (T.ps && k === rbdiff) { const now = pageSums(), b = m._mp4web_rb_base(), d = []; for (let p = 0; p < now.length; p++) if (now[p] !== T.ps[p]) d.push((b + p * 4096).toString(16)); rec.pages = d.slice(0, 20); rec.npages = d.length; if (m._mp4web_det_owner && d.length) { const q = m._malloc(8); rec.owner = d.slice(0, 4).map((x) => { m._mp4web_det_owner(parseInt(x, 16), q); const o = new Uint32Array(m.HEAPU8.buffer, q, 2); return [o[0].toString(16), o[1]]; }); m._free(q); } }

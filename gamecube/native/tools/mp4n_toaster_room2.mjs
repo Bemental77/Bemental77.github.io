@@ -171,8 +171,9 @@ async function launch(role, cpus) {
     if (window.WebSocket) wrap(WebSocket.prototype, 'ws', 'wsN');
   });
   P.page.on('pageerror', (e) => P.errs.push(String(e.message).slice(0, 200)));
-  P.tail = [];
+  P.tail = []; P.head = [];   // head: the first 800 console lines (a room's start), kept in the output
   P.page.on('console', (m) => { const t = m.text(); if (t.startsWith('RIG:')) console.log(`${ts()} ${role} ${t}`);   // an EVAL arm's own report, in full
+    if (P.head.length < 800) P.head.push(`${ts()} ${t.slice(0, 300)}`);
     P.tail.push(`${ts()} ${t.slice(0, 300)}`); if (P.tail.length > 400) P.tail.shift();
     if (/ARMED|armed|desync|delay lockstep|zero-lag|capacity|room:|⚠|rror|unreachable|abort/i.test(t) && P.lines.length < 200) { const L = `${ts()} ${role} ${t.slice(0, 220)}`; P.lines.push(L); console.log('  ' + L); } });
   // ROUTE=route.json (e.g. gamecube/native/tools/route_party_minigames.json): the host's pad follows the
@@ -348,7 +349,7 @@ try {
     const o = out.players[P.role] = { openT: P.t0, skip: SKIP, win: { n: w.length, x: mean(w.map((r) => r.x)), min: w.length ? Math.min(...w.map((r) => r.x)) : null, presented: mean(w.map((r) => r.p).filter((v) => v != null)), msPerFrame: mean(w.map((r) => r.ms).filter((v) => v != null)) },
       steady: { n: steady.length, x: mean(steady.map((r) => r.x)) },
       stalls: last.stalls != null && first.stalls != null ? last.stalls - first.stalls : null, stallMs: last.stallMs != null && first.stallMs != null ? Math.round(last.stallMs - first.stallMs) : null,
-      rollbacks: last.rollbacks, desync: last.desync || null, hc: last.hc, cg: deviceStat(P), lines: P.lines, errs: P.errs.slice(0, 8), tail: P.errs.length ? P.tail.slice(-150) : [],
+      rollbacks: last.rollbacks, desync: last.desync || null, hc: last.hc, cg: deviceStat(P), lines: P.lines, errs: P.errs.slice(0, 8), tail: P.errs.length ? P.tail.slice(-150) : [], head: P.head,
       lastStats: last.st || null, lastRb: last.rbw || null, lastMode: last.mode || null, ovl: P.ovl,
       gs: (() => { const g = w.map((r) => r.gs).filter(Boolean); if (!g.length) return null; const md = (a) => a.slice().sort((x, y) => x - y)[a.length >> 1];
         const dr = g.filter((x) => x.draws > 0);   // samples that landed on a drawn frame (a skipped frame records no draws)
