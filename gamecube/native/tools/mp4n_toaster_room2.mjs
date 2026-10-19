@@ -174,6 +174,23 @@ async function launch(role, cpus) {
   P.tail = [];
   P.page.on('console', (m) => { const t = m.text(); P.tail.push(`${ts()} ${t.slice(0, 300)}`); if (P.tail.length > 400) P.tail.shift();
     if (/ARMED|armed|desync|delay lockstep|zero-lag|capacity|room:|⚠/i.test(t) && P.lines.length < 200) { const L = `${ts()} ${role} ${t.slice(0, 220)}`; P.lines.push(L); console.log('  ' + L); } });
+  // ROUTE=route.json (e.g. gamecube/native/tools/route_party_minigames.json): the host's pad follows the
+  // frame-keyed route (Party Mode -> board -> minigames, as mp4n_room_test.mjs --script); the joiner is a
+  // second human pressing keys at its own pace (menu keys, then only A + stick once on the board)
+  P.ovl = [];
+  P.page.on('console', (m) => { const om = /DLLStart (\d+)/.exec(m.text()); if (om && P.ovl[P.ovl.length - 1] !== +om[1]) { P.ovl.push(+om[1]); P.page.evaluate((o) => { window.__routeOvl = o; }, +om[1]).catch(() => {}); } });
+  if (process.env.ROUTE) {
+    const SC = JSON.parse(fs.readFileSync(process.env.ROUTE, 'utf8'));
+    if (role === 'H') P.page.waitForFunction(() => window.Mp4Input && Mp4Input.script, { timeout: 900000, polling: 50 })
+      .then(() => P.page.evaluate((sc) => { Mp4Input.script((f) => { let b = 0; for (const [a, z, k, ov] of sc) if (f >= a && f < z && (ov == null || window.__routeOvl === ov)) b |= k; return b; }); }, SC))
+      .then(() => say('route installed on H')).catch((e) => say('route failed ' + e));
+    else (async () => {
+      const KEYS = ['Enter', 'Space', 'ArrowDown', 'ArrowRight', 'Space', 'ArrowUp', 'KeyX', 'Enter'], BOARD = ['Space', 'ArrowDown', 'Space', 'ArrowRight', 'Space', 'ArrowLeft'];
+      let k = 0;
+      while (!P.closed) { await sleep(4200 + Math.floor(Math.random() * 1500)); const ks = P.ovl.length >= 4 ? BOARD : KEYS; const c = ks[k++ % ks.length];
+        try { await P.page.keyboard.down(c); await sleep(340); await P.page.keyboard.up(c); } catch (_e) { break; } }
+    })();
+  }
   const mq = '/tmp/npdm/mqtt-5.3.4.min.js';
   if (!fs.existsSync(mq)) execSync(`mkdir -p /tmp/npdm && curl -sS -f -o ${mq} https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.3.4/mqtt.min.js`);
   await P.page.evaluateOnNewDocument(fs.readFileSync(mq, 'utf8'));
