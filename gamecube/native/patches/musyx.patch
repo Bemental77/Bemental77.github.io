@@ -94,7 +94,7 @@ index 1c292b1..f7c8a83 100644
  extern void ReverbHICallback(s32 *left, s32 *right, s32 *surround, SND_AUX_REVERBHI *rev);
  
 diff --git a/src/musyx/runtime/hw_pc.c b/src/musyx/runtime/hw_pc.c
-index 65abcc5..529938f 100644
+index 65abcc5..2776b6c 100644
 --- a/src/musyx/runtime/hw_pc.c
 +++ b/src/musyx/runtime/hw_pc.c
 @@ -134,6 +134,29 @@ static s32 mixRampChannel(s32 *dest, const s32 *src, int nSamples, s16 startVol,
@@ -127,3 +127,108 @@ index 65abcc5..529938f 100644
    for (int i = 0; i < nSamples; ++i) {
      s32 env = envStart + ((s32)envEnd - envStart) * i / nSamples;
      s32 vol = startVol + ((s32)endVol - startVol) * (frameOffset + i) / (s32)cycleFrames;
+@@ -179,9 +202,29 @@ static void foldStereoToOutput(const s32 *left, const s32 *right) {
+   }
+ }
+ 
++#ifdef __EMSCRIPTEN__
++#include <wasm_simd128.h>
++/* web port: the same 32-tap dot product, exactly (integer products and sums; only the order of the
++ * additions differs, which wrapping 64-bit addition does not see), four taps per SIMD step. The ring
++ * is mirrored into a doubled local copy (dbl[k] == dbl[k + 32] == history[k]) so the 32 taps from any
++ * start are one contiguous run; the ring itself (game state) is written exactly as before. */
++__attribute__((target("simd128"))) static s64 polyphaseDot(const s32 *lin, const s32 *coefficients) {
++  v128_t acc = wasm_i64x2_splat(0);
++  for (u32 tap = 0; tap < POLYPHASE_TAPS; tap += 4) {
++    const v128_t x = wasm_v128_load(lin + tap), c = wasm_v128_load(coefficients + tap);
++    acc = wasm_i64x2_add(acc, wasm_i64x2_extmul_low_i32x4(x, c));
++    acc = wasm_i64x2_add(acc, wasm_i64x2_extmul_high_i32x4(x, c));
++  }
++  return wasm_i64x2_extract_lane(acc, 0) + wasm_i64x2_extract_lane(acc, 1);
++}
++#endif
++
+ /* Causal generated polyphase interpolation. Decoder history and sample position
+  * advance only as the renderer consumes source samples; there is no speculative
+  * decode across a stream refill boundary. */
++#ifdef __EMSCRIPTEN__
++__attribute__((target("simd128")))
++#endif
+ static int resampleVoice(DSPvoice *voice, u32 voiceIdx, s32 *out, int numSamples, u32 pitch) {
+   VoiceResamplerState *state = &voiceResampler[voiceIdx];
+   const u32 mode = voice->srcTypeSelect;
+@@ -196,6 +239,11 @@ static int resampleVoice(DSPvoice *voice, u32 voiceIdx, s32 *out, int numSamples
+     band = 1;
+   if (band > POLYPHASE_BANDS)
+     band = POLYPHASE_BANDS;
++#ifdef __EMSCRIPTEN__
++  s32 dbl[2 * POLYPHASE_TAPS];
++  if (mode != SAL_SRC_NONE && mode != SAL_SRC_LINEAR)
++    for (u32 k = 0; k < POLYPHASE_TAPS; ++k) dbl[k] = dbl[k + POLYPHASE_TAPS] = state->history[k];
++#endif
+   for (int i = 0; i < numSamples; ++i) {
+     state->phase += pitch;
+     while (state->phase >= 65536) {
+@@ -213,6 +261,9 @@ static int resampleVoice(DSPvoice *voice, u32 voiceIdx, s32 *out, int numSamples
+         state->reader.useInitialPS = true;
+       }
+       s16 sample = salPCReadSample(&state->reader, &voice->smp_info, voice->streamLoopPS);
++#ifdef __EMSCRIPTEN__
++      { const u32 k = state->historyIndex & (POLYPHASE_TAPS - 1); dbl[k] = dbl[k + POLYPHASE_TAPS] = sample; }
++#endif
+       state->history[state->historyIndex++ & (POLYPHASE_TAPS - 1)] = sample;
+       if (state->reader.ended && state->tail < POLYPHASE_TAPS)
+         ++state->tail;
+@@ -226,11 +277,15 @@ static int resampleVoice(DSPvoice *voice, u32 voiceIdx, s32 *out, int numSamples
+       out[i] = older + (s32)((s64)(newer - older) * state->phase / 65536);
+     } else {
+       const s32 *coefficients = polyphaseTable[band - 1][state->phase >> 9];
++#ifdef __EMSCRIPTEN__
++      out[i] = clamp16((s32)(polyphaseDot(dbl + (state->historyIndex & (POLYPHASE_TAPS - 1)), coefficients) >> 23));
++#else
+       s64 result = 0;
+       for (u32 tap = 0; tap < POLYPHASE_TAPS; ++tap)
+         result += (s64)state->history[(state->historyIndex + tap) & (POLYPHASE_TAPS - 1)] *
+                   coefficients[tap];
+       out[i] = clamp16((s32)(result >> 23));
++#endif
+     }
+   }
+   voice->playInfo.posHi = state->reader.position;
+@@ -256,6 +311,36 @@ static u32 itdTarget(const DSPvoice *voice, u32 channel) {
+ 
+ static void applyITD(const DSPvoice *voice, VoiceResamplerState *state, int frames, int offset) {
+   u32 targets[2] = {itdTarget(voice, 0), itdTarget(voice, 1)};
++#ifdef __EMSCRIPTEN__
++  /* web port: a channel whose delay is not moving (target == current: every voice without ITD, and
++   * ITD voices between changes) has delay == itdDelay for every i, so the per-sample s64 division
++   * drops out; zero delay reads back the sample just stored (as the s16 the history holds) */
++  if (targets[0] == state->itdDelay[0] && targets[1] == state->itdDelay[1]) {
++    const u32 d0 = state->itdDelay[0], d1 = state->itdDelay[1];
++    if (d0 == 0 && d1 == 0) {
++      for (int i = 0; i < frames; ++i) {
++        const s16 v = (s16)voiceDecodeBuf[i];
++        state->itdHistory[state->itdIndex++ & 127] = v;
++        itdOutput[0][i] = v;
++        itdOutput[1][i] = v;
++      }
++      return;
++    }
++    const u32 dl[2] = {d0, d1};
++    for (int i = 0; i < frames; ++i) {
++      state->itdHistory[state->itdIndex & 127] = voiceDecodeBuf[i];
++      for (u32 channel = 0; channel < 2; ++channel) {
++        const s64 delay = dl[channel];
++        u32 index = state->itdIndex - (u32)(delay >> 16);
++        s32 newer = state->itdHistory[index & 127];
++        s32 older = state->itdHistory[(index - 1) & 127];
++        itdOutput[channel][i] = newer + (s32)((s64)(older - newer) * (delay & 0xffff) / 65536);
++      }
++      ++state->itdIndex;
++    }
++    return;
++  }
++#endif
+   for (int i = 0; i < frames; ++i) {
+     state->itdHistory[state->itdIndex & 127] = voiceDecodeBuf[i];
+     for (u32 channel = 0; channel < 2; ++channel) {

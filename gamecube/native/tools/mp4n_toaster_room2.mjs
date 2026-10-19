@@ -253,6 +253,8 @@ const probe = () => {
     return { t, frame, pres: m && m._mp4web_drawn ? m._mp4web_drawn() : (room ? r.stats.live - r.stats.hidden : frame), hz: 60, state: room ? e.state : (frame > 0 ? 'running' : null),
              stalls: r.stats.holds, rb: e.rollback, delay: e.delay, desync: !!e.desync, hc: e.hashesCompared, rollbacks: r.stats.rollbacks,
              busy: m ? m._mp4web_busy_ms() : null, total: m ? m._mp4web_total() : null, st: r.stats,
+             gs: (() => { if (!m || !m._mp4web_gfx_stats) return null; const p = window.__gsBuf || (window.__gsBuf = m._malloc(64)); m._mp4web_gfx_stats(p);   // last frame: draws, merged, vert/uniform/index/storage/texture-upload bytes, pipelines
+               const v = Array.from(new Float64Array(m.HEAPU8.buffer, p, 8)); const c = document.getElementById('canvas'); return { draws: v[0], merged: v[1], up: v.slice(2, 7), pipes: v[7], canvas: c ? [c.width, c.height] : null, gpuWait: m._mp4web_gpu_wait_ms ? m._mp4web_gpu_wait_ms() : null, auto: m._mp4web_auto_skipped ? m._mp4web_auto_skipped() : null }; })(),
              rbw: e.rb ? { window: e.rb.window, meanDepth: e.rb.meanDepth, maxDepth: e.rb.maxDepth, rollbacks: e.rb.rollbacks, resimFrames: e.rb.resimFrames, predicted: e.rb.predictedFrames, catchUps: e.rb.catchUps } : null, mode: e.rollback ? 'rollback' : (e.delay != null ? 'delay' : null) };
   }
   const g = window.__gcLockstep ? window.__gcLockstep() : null, R = window.__gcRate || {};
@@ -343,7 +345,11 @@ try {
       stalls: last.stalls != null && first.stalls != null ? last.stalls - first.stalls : null, stallMs: last.stallMs != null && first.stallMs != null ? Math.round(last.stallMs - first.stallMs) : null,
       rollbacks: last.rollbacks, desync: last.desync || null, hc: last.hc, cg: deviceStat(P), lines: P.lines, errs: P.errs.slice(0, 8), tail: P.errs.length ? P.tail.slice(-150) : [],
       lastStats: last.st || null, lastRb: last.rbw || null, lastMode: last.mode || null,
+      gs: (() => { const g = w.map((r) => r.gs).filter(Boolean); if (!g.length) return null; const md = (a) => a.slice().sort((x, y) => x - y)[a.length >> 1];
+        return { draws: md(g.map((x) => x.draws)), merged: md(g.map((x) => x.merged)), upKB: [0, 1, 2, 3, 4].map((i) => +(md(g.map((x) => x.up[i])) / 1024).toFixed(1)), pipes: g[g.length - 1].pipes, canvas: g[g.length - 1].canvas,
+          presented: mean(w.map((r) => r.p).filter((v) => v != null)), gpuWaitMs: g[g.length - 1].gpuWait, autoSkipped: g[g.length - 1].auto }; })(),
       rows: R.map((r) => ({ T: r.T, f: r.frame, x: r.x, st: r.state, rb: r.rb, d: r.delay, stalls: r.stalls })) };
+    if (o.gs) say(`GFX ${P.role}: ${JSON.stringify(o.gs)} (median per sampled frame; upKB = vert/uniform/index/storage/texture)`);
     if (o.lastStats) say(`STATS ${P.role}: ${JSON.stringify(o.lastStats)} rb=${JSON.stringify(o.lastRb)} mode=${o.lastMode}`);
     if (P.cpu0 && P.cpu1) { const fr = Math.max(1, P.cpu1.f - P.cpu0.f), sec = P.cpu1.T - P.cpu0.T, by = {};
       for (const [pid, v] of Object.entries(P.cpu1.c)) by[v.k] = (by[v.k] || 0) + 1000 * (v.t - ((P.cpu0.c[pid] || {}).t || 0)) / fr;

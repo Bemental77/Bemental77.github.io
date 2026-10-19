@@ -19,6 +19,10 @@
 #include <port/port_version.h>
 #include <filesystem>
 #include <cstdio>
+#include <emscripten.h>
+
+// page ?res=N: internal render resolution N x 640x480 (0 = the canvas pixel size). Not game state.
+EM_JS(double, mp4web_fb_scale_js, (void), { return (typeof Module.mp4FbScale === 'number') ? Module.mp4FbScale : 0; });
 
 extern "C" int game_main();
 
@@ -68,6 +72,7 @@ extern "C" int port_main(int argc, char* argv[]) {
     return 1;
   }
   AuroraSetViewportPolicy(AURORA_VIEWPORT_FIT);
+  if (const double fbs = mp4web_fb_scale_js(); fbs > 0) VISetFrameBufferScale(static_cast<float>(fbs));
   if (!aurora_dvd_open("web:")) {
     PartyBoardMainLog.error("Failed to open the disc image the page provided");
     return 1;

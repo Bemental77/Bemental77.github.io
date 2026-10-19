@@ -22,6 +22,17 @@ static void track_gfx_peaks() {
   const uint32_t v[5] = {st->lastVertSize, st->lastUniformSize, st->lastIndexSize, st->lastStorageSize, st->lastTextureUploadSize};
   for (int i = 0; i < 5; ++i) if (v[i] > g_peak[i]) g_peak[i] = v[i];
 }
+// internal render resolution: 0 = the canvas's pixel size (Aurora's default), N = N x the GameCube's
+// 640x480 (fitted to the canvas aspect). Presentation scales it to the canvas either way.
+extern "C" void VISetFrameBufferScale(float scale);
+extern "C" EMSCRIPTEN_KEEPALIVE void mp4web_set_fb_scale(double s) { VISetFrameBufferScale(static_cast<float>(s)); }
+// last recorded frame: [draws, merged draws, vert B, uniform B, index B, storage B, texture upload B, pipelines created]
+extern "C" EMSCRIPTEN_KEEPALIVE void mp4web_gfx_stats(double* out) {
+  const AuroraStats* st = aurora_get_stats();
+  if (!st) return;
+  out[0] = st->drawCallCount; out[1] = st->mergedDrawCallCount; out[2] = st->lastVertSize; out[3] = st->lastUniformSize;
+  out[4] = st->lastIndexSize; out[5] = st->lastStorageSize; out[6] = st->lastTextureUploadSize; out[7] = st->createdPipelines;
+}
 extern "C" double mp4web_det_heap_high_water(void);
 extern "C" double mp4web_det_stack_high_water(void);
 // [vert, uniform, index, storage, texupload peaks, sbrk top, malloc in-use, malloc footprint, det hw, stack hw, MEM1 used]
