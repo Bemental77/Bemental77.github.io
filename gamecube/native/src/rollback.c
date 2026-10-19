@@ -104,6 +104,7 @@ EMSCRIPTEN_KEEPALIVE void mp4web_rb_mark(uint32_t a, uint32_t n) {
   }
 }
 
+static void copy_small(uint8_t* dst);
 // ring = frames of history kept (rollback window + slack); poolPages = page images kept in all.
 EMSCRIPTEN_KEEPALIVE int mp4web_rb_enable(int32_t frame, uint32_t ring, uint32_t poolPages) {
   if (!mp4web_barrier_present()) return -1;               // this wasm was not instrumented
@@ -136,6 +137,11 @@ EMSCRIPTEN_KEEPALIVE int mp4web_rb_enable(int32_t frame, uint32_t ring, uint32_t
   memset(g_stats, 0, sizeof g_stats);
   g_cur = frame;
   g_log[frame % g_ring] = (FrameLog){frame, 0, 0};
+  // .data (and the unaligned bss ends) at the start of the first logged frame. Without it a rewind to
+  // that frame — a room's first misprediction, right after arming — restored an uninitialised copy:
+  // .data came back zeroed (PartyBoard_IsRunning = 0), game_main returned and the console stopped at
+  // live frame 3-4 ("game_main returned 0 (running=0)", then aurora's shutdown).
+  copy_small(g_dcopy + (size_t)(frame % g_ring) * (g_dsize + 2 * PAGE));
   g_on = 1;
   memset(g_table, 0, g_pages);               // every tracked page: not yet logged
   return (int)g_pages;

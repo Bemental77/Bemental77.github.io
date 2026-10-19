@@ -28,11 +28,12 @@ with open(p, 'w') as f: f.write(s)
 print('[wb] bulk ops rewritten: memory.copy %d, memory.fill %d' % (nc, nf))
 PY
 "$B/wasm-as" -g "${F[@]}" "$T/a.wat" -o "$T/a.wasm"; rm -f "$T/a.wat"
-"$B/wasm-opt" -g "${F[@]}" --instrument-memory "$T/a.wasm" -o "$T/b.wasm"; rm -f "$T/a.wasm"
+# straight to text: a binary round trip here can re-read binaryen's stack-IR output with a store's
+# offset constant wrapped in a scratch block (seen with the trimmed-Asyncify link), which the inliner rejects
+"$B/wasm-opt" -g "${F[@]}" --instrument-memory "$T/a.wasm" -S -o "$T/b.wat"; rm -f "$T/a.wasm"
 # NO FUNCTION IS EXEMPT (an exclusion list was tried and dropped: an unvisited path could write game
 # memory unlogged). The store check goes INLINE at every store site (wb/inline_hooks.py): no call unless
 # the store may be a page's first write in the frame.
-"$B/wasm-dis" "${F[@]}" "$T/b.wasm" -o "$T/b.wat"; rm -f "$T/b.wasm"
 # the tracked range and the page table, from the link map (wasm-ld --Map, written next to IN by build.sh)
 MAP="${WB_MAP:-${IN%.wasm}.map}"
 read -r WB_BASE WB_PAGES WB_TABLE < <(python3 - "$MAP" <<'PY'
