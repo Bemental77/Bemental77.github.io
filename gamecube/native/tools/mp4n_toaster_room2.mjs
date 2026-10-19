@@ -172,13 +172,18 @@ async function launch(role, cpus) {
   });
   P.page.on('pageerror', (e) => P.errs.push(String(e.message).slice(0, 200)));
   P.tail = [];
-  P.page.on('console', (m) => { const t = m.text(); P.tail.push(`${ts()} ${t.slice(0, 300)}`); if (P.tail.length > 400) P.tail.shift();
+  P.page.on('console', (m) => { const t = m.text(); if (t.startsWith('RIG:')) console.log(`${ts()} ${role} ${t}`);   // an EVAL arm's own report, in full
+    P.tail.push(`${ts()} ${t.slice(0, 300)}`); if (P.tail.length > 400) P.tail.shift();
     if (/ARMED|armed|desync|delay lockstep|zero-lag|capacity|room:|⚠/i.test(t) && P.lines.length < 200) { const L = `${ts()} ${role} ${t.slice(0, 220)}`; P.lines.push(L); console.log('  ' + L); } });
   // ROUTE=route.json (e.g. gamecube/native/tools/route_party_minigames.json): the host's pad follows the
   // frame-keyed route (Party Mode -> board -> minigames, as mp4n_room_test.mjs --script); the joiner is a
   // second human pressing keys at its own pace (menu keys, then only A + stick once on the board)
   P.ovl = [];
   P.page.on('console', (m) => { const om = /DLLStart (\d+)/.exec(m.text()); if (om && P.ovl[P.ovl.length - 1] !== +om[1]) { P.ovl.push(+om[1]); P.page.evaluate((o) => { window.__routeOvl = o; }, +om[1]).catch(() => {}); } });
+  // EVAL='js': run in the page once the module is up (an experiment arm, e.g. every frame undrawn:
+  // const m = __mp4n.module, h = m.mp4FrameHook; m.mp4FrameHook = (f) => { m._mp4web_set_gfx_skip(1); return h ? h(f) : 0; })
+  if (process.env.EVAL) P.page.waitForFunction(() => window.__mp4n && window.__mp4n.module && window.__mp4n.phase === 'running', { timeout: 900000, polling: 100 })
+    .then(() => P.page.evaluate(process.env.EVAL)).then(() => say('EVAL done')).catch((e) => say('EVAL failed ' + e));
   if (process.env.ROUTE) {
     const SC = JSON.parse(fs.readFileSync(process.env.ROUTE, 'utf8'));
     if (role === 'H') P.page.waitForFunction(() => window.Mp4Input && Mp4Input.script, { timeout: 900000, polling: 50 })
@@ -346,7 +351,8 @@ try {
       rollbacks: last.rollbacks, desync: last.desync || null, hc: last.hc, cg: deviceStat(P), lines: P.lines, errs: P.errs.slice(0, 8), tail: P.errs.length ? P.tail.slice(-150) : [],
       lastStats: last.st || null, lastRb: last.rbw || null, lastMode: last.mode || null,
       gs: (() => { const g = w.map((r) => r.gs).filter(Boolean); if (!g.length) return null; const md = (a) => a.slice().sort((x, y) => x - y)[a.length >> 1];
-        return { draws: md(g.map((x) => x.draws)), merged: md(g.map((x) => x.merged)), upKB: [0, 1, 2, 3, 4].map((i) => +(md(g.map((x) => x.up[i])) / 1024).toFixed(1)), pipes: g[g.length - 1].pipes, canvas: g[g.length - 1].canvas,
+        const dr = g.filter((x) => x.draws > 0);   // samples that landed on a drawn frame (a skipped frame records no draws)
+        return { drawnSamples: dr.length, draws: dr.length ? md(dr.map((x) => x.draws)) : 0, merged: dr.length ? md(dr.map((x) => x.merged)) : 0, upKB: [0, 1, 2, 3, 4].map((i) => +((dr.length ? md(dr.map((x) => x.up[i])) : 0) / 1024).toFixed(1)), pipes: g[g.length - 1].pipes, canvas: g[g.length - 1].canvas,
           presented: mean(w.map((r) => r.p).filter((v) => v != null)), gpuWaitMs: g[g.length - 1].gpuWait, autoSkipped: g[g.length - 1].auto }; })(),
       rows: R.map((r) => ({ T: r.T, f: r.frame, x: r.x, st: r.state, rb: r.rb, d: r.delay, stalls: r.stalls })) };
     if (o.gs) say(`GFX ${P.role}: ${JSON.stringify(o.gs)} (median per sampled frame; upKB = vert/uniform/index/storage/texture)`);
