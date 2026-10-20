@@ -166,10 +166,12 @@ static unsigned g_winN = 0, g_winHead = 0;
 static double g_lastStart = -1.0;
 static uint64_t g_forgiven = 0;    // debts dropped (each a stall over carryMs)
 static double g_forgivenMs = 0.0;
+static double g_forgivenAt[8][2];   // the last forgiven debts: [guest frame, ms]
 extern "C" EMSCRIPTEN_KEEPALIVE void mp4web_set_pacing(double carryMs, double maxRate) { g_carryMs = carryMs; g_maxRate = maxRate; }
 extern "C" EMSCRIPTEN_KEEPALIVE void mp4web_pacing_stats(double* out) {
   out[0] = static_cast<double>(g_forgiven); out[1] = g_forgivenMs;
   out[2] = g_t0 >= 0 ? emscripten_get_now() - (g_t0 + static_cast<double>(g_frame) * (1000.0 / 60.0)) : 0.0;   // current debt, ms
+  for (int i = 0; i < 8; ++i) { out[3 + 2 * i] = g_forgivenAt[i][0]; out[4 + 2 * i] = g_forgivenAt[i][1]; }   // out[3..18]
 }
 // the earliest a live frame may start under the rate cap
 static double pacing_earliest(double period) {
@@ -233,7 +235,7 @@ extern "C" void frame_limiter() {
     ++g_frame;
     double due = g_t0 + static_cast<double>(g_frame) * period;
     const double late = now - due;
-    if (late > g_carryMs) { ++g_forgiven; g_forgivenMs += late; g_t0 = now - static_cast<double>(g_frame) * period; due = now; ++g_reanchors; }
+    if (late > g_carryMs) { g_forgivenAt[g_forgiven & 7][0] = static_cast<double>(g_total); g_forgivenAt[g_forgiven & 7][1] = late; ++g_forgiven; g_forgivenMs += late; g_t0 = now - static_cast<double>(g_frame) * period; due = now; ++g_reanchors; }
     double start = due > now ? due : now;
     const double earliest = pacing_earliest(period);
     if (earliest > start) start = earliest;

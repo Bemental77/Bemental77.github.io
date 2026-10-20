@@ -197,7 +197,9 @@ async function launch(role, cpus) {
   if (process.env.ROUTE) {
     const SC = JSON.parse(fs.readFileSync(process.env.ROUTE, 'utf8'));
     if (role === 'H' || role === 'A') P.page.waitForFunction(() => window.Mp4Input && Mp4Input.script, { timeout: 900000, polling: 50 })
-      .then(() => P.page.evaluate((sc) => { Mp4Input.script((f) => { let b = 0; for (const [a, z, k, ov] of sc) if (f >= a && f < z && (ov == null || window.__routeOvl === ov)) b |= k; return b; }); }, SC))
+      .then(() => P.page.evaluate((sc, solo) => { const fn = (f) => { let b = 0; for (const [a, z, k, ov] of sc) if (f >= a && f < z && (ov == null || window.__routeOvl === ov)) b |= k; return b; };
+        // Mp4Input.script feeds a ROOM's local pad only; a solo game reads the override
+        if (solo) Mp4Input.override((f) => { const o = new Array(32).fill(0); o[0] = 1; o[1] = fn(f); return o; }); else Mp4Input.script(fn); }, SC, role === 'A'))
       .then(() => say('route installed on H')).catch((e) => say('route failed ' + e));
     else (async () => {
       const KEYS = ['Enter', 'Space', 'ArrowDown', 'ArrowRight', 'Space', 'ArrowUp', 'KeyX', 'Enter'], BOARD = ['Space', 'ArrowDown', 'Space', 'ArrowRight', 'Space', 'ArrowLeft'];
@@ -408,7 +410,7 @@ try {
         const dr = g.filter((x) => x.draws > 0);   // samples that landed on a drawn frame (a skipped frame records no draws)
         return { drawnSamples: dr.length, draws: dr.length ? md(dr.map((x) => x.draws)) : 0, merged: dr.length ? md(dr.map((x) => x.merged)) : 0, upKB: [0, 1, 2, 3, 4].map((i) => +((dr.length ? md(dr.map((x) => x.up[i])) : 0) / 1024).toFixed(1)), pipes: g[g.length - 1].pipes, canvas: g[g.length - 1].canvas,
           presented: mean(w.map((r) => r.p).filter((v) => v != null)), gpuWaitMs: g[g.length - 1].gpuWait, autoSkipped: g[g.length - 1].auto }; })(),
-      rows: R.map((r) => ({ T: r.T, f: r.frame, x: r.x, st: r.state, rb: r.rb, d: r.delay, stalls: r.stalls })) };
+      rows: R.map((r) => ({ T: r.T, f: r.frame, x: r.x, st: r.state, rb: r.rb, d: r.delay, stalls: r.stalls, rbk: r.rollbacks, resim: r.st && r.st.resim, hidden: r.st && r.st.hidden, tB: r.st && r.st.tBoundary, tR: r.st && r.st.tRestore, tH: r.st && r.st.tHash, busy: r.busy, total: r.total })) };
     if (P.ovl && P.ovl.length) say(`OVL ${P.role}: ${P.ovl.join(',')}`);
     if (o.gs) say(`GFX ${P.role}: ${JSON.stringify(o.gs)} (median per sampled frame; upKB = vert/uniform/index/storage/texture)`);
     if (o.lastStats) say(`STATS ${P.role}: ${JSON.stringify(o.lastStats)} rb=${JSON.stringify(o.lastRb)} mode=${o.lastMode}`);
@@ -424,7 +426,9 @@ try {
     // the audio a player heard: worklet underruns (gaps) and their silent samples, queue target, drops, the render
     // side's reconciles, and the room's own clock rate (game time per wall time: what audio can follow at most)
     try { const au = await P.page.evaluate(() => { const a = window.__mp4n && window.__mp4n.audio; if (!a) return null; const R = window.Mp4Room && Mp4Room.report(); const oc = R && R.engine && R.engine.rb && R.engine.rb.ownClock;
-        return { worklet: !!a.wlAud, ring: !!a.ring, gaps: a.gaps, gapSamples: a.gapSamples, drops: a.drops, muted: a.muted, nonSilent: a.nonSilent, target: a.q && a.q.target, ratio: a.q && a.q.last && +a.q.last[2].toFixed(4), reconciles: a.renderStats && a.renderStats[9], voiceResets: a.renderStats && a.renderStats[8], clockRate: oc ? oc.rate : null, lead: oc ? oc.lead : null }; });
+        return { worklet: !!a.wlAud, ring: !!a.ring, gaps: a.gaps, gapSamples: a.gapSamples, drops: a.drops, muted: a.muted, nonSilent: a.nonSilent, target: a.q && a.q.target, ratio: a.q && a.q.last && +a.q.last[2].toFixed(4), reconciles: a.renderStats && a.renderStats[9], voiceResets: a.renderStats && a.renderStats[8], clockRate: oc ? oc.rate : null, lead: oc ? oc.lead : null,
+          pacing: (() => { const m = window.__mp4n.module; if (!m || !m._mp4web_pacing_stats) return null; const p = m._malloc(152); m._mp4web_pacing_stats(p); const v = Array.from(new Float64Array(m.HEAPU8.buffer, p, 19)); m._free(p); const at = []; for (let i = 0; i < 8; i++) if (v[4 + 2 * i] > 0) at.push([v[3 + 2 * i], Math.round(v[4 + 2 * i])]); return { forgiven: v[0], forgivenMs: Math.round(v[1]), debtMs: Math.round(v[2]), at }; })(),
+          holds: R && R.stats ? R.stats.holds : null, holdWhy: R && R.stats ? R.stats.holdWhy : null, advWaits: R && R.engine && R.engine.rb ? R.engine.rb.advantageWaits : null, windowStalls: R && R.engine && R.engine.rb ? R.engine.rb.windowStalls : null }; });
       o.audio = au; if (au) say(`AUDIO ${P.role}: ${JSON.stringify(au)}`); } catch (e) {}
     if (process.env.SENDTIME === '1') { try { say(`SENDTIME ${P.role}: ${JSON.stringify(await P.page.evaluate(() => window.__sendT))}`); } catch (e) {} }
     say(`SUMMARY ${PAGE} ${mode} ${P.role}: open@${o.openT}s window x=${o.win.x && o.win.x.toFixed(3)} min ${o.win.min && o.win.min.toFixed(3)} presented ${o.win.presented != null ? o.win.presented.toFixed(1) : '-'}/s host ${o.win.msPerFrame != null ? o.win.msPerFrame.toFixed(1) : '-'} ms/frame (n=${o.win.n}, first ${SKIP}s discarded)  steady x=${o.steady.x && o.steady.x.toFixed(3)}  stalls ${o.stalls}  desync=${o.desync} hc=${o.hc}  throttled ${o.cg.nr_throttled}/${o.cg.nr_periods}`);
