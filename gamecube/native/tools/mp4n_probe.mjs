@@ -5,6 +5,7 @@
 // env:
 //   NSHOT=n          screenshots/state samples over the run (out_0.png ..)
 //   POKE=frame:hexaddr:and:or  a u16 of game memory rewritten at that frame's boundary (before an RBTEST enable)
+//   HEAPSCAN=frame:b-e,..:hostlo HEAPSCANOUT=f.json  game-memory words that point at the C stack/heap (diff two runs)
 //   PEEK=hexaddr:len,..  bytes of wasm memory at the end of the run
 //   ROUTE=file.json  a room route ([f0,f1,buttons,overlay?]), inputs memoized per frame (rollback-safe)
 //   SCRIPT='[[f0,f1,buttons],..]'  port-0 input by guest frame (GC PAD_* bits; 4096=Start, 256=A)
@@ -50,6 +51,9 @@ try {
   p.on('console', (m) => { logs.push(((Date.now() - t0) / 1000).toFixed(1) + ' ' + m.text().slice(0, /JSSTACK|ERRSTACK|REJSTACK/.test(m.text()) ? 8000 : 500)); if (/Instance reference|Aborted|rror/.test(m.text())) logs.push('  STACK ' + m.stackTrace().slice(0, 25).map((f) => f.url.split('/').pop() + ':' + f.lineNumber + ' ' + (f.functionName||'')).join(' < ')); });
   p.on('response', (r) => { if (r.status() >= 400) logs.push('HTTP ' + r.status() + ' ' + r.url()); });
   p.on('pageerror', (e) => logs.push('PAGEERROR ' + String(e.message).slice(0, 400) + ' :: ' + String(e.stack || '').slice(0, 1500)));
+  // HEAPSHIFT=n (diagnostic): malloc n bytes once the runtime is up, before main — shifts every later C-heap
+  // address, as a second console's different allocation history would (pairs with HEAPSCAN)
+  if (process.env.HEAPSHIFT) await p.evaluateOnNewDocument((n) => { let real; Object.defineProperty(window, 'createMp4Native', { configurable: true, set(f) { real = f; }, get() { return real && ((o) => { o = o || {}; const prev = o.onRuntimeInitialized; o.onRuntimeInitialized = function () { try { this._malloc(n); console.log('HEAPSHIFT ' + n); } catch (e) { console.log('HEAPSHIFT failed ' + e); } if (prev) prev.call(this); }; return real(o); }); } }); }, +process.env.HEAPSHIFT);
   await p.goto(`http://127.0.0.1:${PORT}/mp4-native.html?autostart=1${qs ? '&' + qs : ''}`, { waitUntil: 'domcontentloaded', timeout: 120000 });
   // KEYS="sec:Code:holdMs,..." real keyboard presses; SCRIPT='[[f0,f1,buttons],...]' frame-scripted pad 0
   if (process.env.KEYS) for (const k of process.env.KEYS.split(',')) { const [sec, code, hold] = k.split(':'); setTimeout(async () => { try { await p.keyboard.down(code); await sleep(+hold || 300); await p.keyboard.up(code); logs.push('KEY ' + code + ' @' + sec); } catch (e) {} }, +sec * 1000); }
@@ -76,6 +80,15 @@ try {
     const [pf, pa, pand, por] = process.env.POKE.split(':');
     await p.waitForFunction(() => window.__mp4n && window.__mp4n.module && window.__mp4n.module.mp4FrameHook, { timeout: 120000 });
     await p.evaluate((F, A, AND, OR) => { const m = window.__mp4n.module, prev = m.mp4FrameHook; let done = false; m.mp4FrameHook = (f) => { if (!done && f >= F) { done = true; const H = m.HEAPU8, v = H[A] | (H[A + 1] << 8), w = (v & AND) | OR; H[A] = w & 255; H[A + 1] = w >> 8; console.log('POKE f=' + f + ' ' + A.toString(16) + ' ' + v.toString(16) + ' -> ' + w.toString(16)); } return prev(f); }; }, +pf, parseInt(pa, 16), parseInt(pand, 16), parseInt(por, 16));
+  }
+  // HEAPSCAN=frame:ranges:hostlo HEAPSCANOUT=f.json — at that frame's boundary, every aligned u32 in the given
+  // game-memory ranges ("b-e,b-e" hex, e.g. .data and the hashed .bss) whose value points past the static data
+  // (>= hostlo: the C stack and the C heap, whose addresses differ between two consoles). Diff two runs'
+  // files to find host pointers kept in game state.
+  if (process.env.HEAPSCAN) {
+    const [hf, hr, hlo] = process.env.HEAPSCAN.split(':');
+    await p.waitForFunction(() => window.__mp4n && window.__mp4n.module && window.__mp4n.module.mp4FrameHook, { timeout: 120000 });
+    await p.evaluate((F, R, LO) => { const m = window.__mp4n.module, prev = m.mp4FrameHook; m.mp4FrameHook = (f) => { if (f === F && !window.__heapScan) { const H = m.HEAP32, hi = m.HEAPU8.length, out = []; for (const [b, e] of R) for (let a = b & ~3; a < e; a += 4) { const v = H[a >> 2] >>> 0; if (v >= LO && v < hi) out.push([a, v]); } window.__heapScan = { f, n: out.length, out }; console.log('HEAPSCAN f=' + f + ' ' + out.length + ' words'); } return prev(f); }; }, +hf, hr.split(',').map((x) => x.split('-').map((y) => parseInt(y, 16))), parseInt(hlo, 16));
   }
   if (process.env.RBTEST) {
     const [ea, per, dep, toEa] = process.env.RBTEST.split(',').map(Number);   // toEa=1: rewinds may land ON the enable frame (a room's first misprediction)
@@ -143,6 +156,7 @@ try {
   }
   if (process.env.SNAPTEST) { const r = await p.evaluate(() => { const T = window.__snapT || {}; return { phase: T.phase, snapFrame: T.snapFrame, restoredTo: T.restoredTo, snapMs: T.snapMs, restoreMs: T.restoreMs, memMB: T.memMB, pass1: T.pass1, pass2: T.pass2 }; }); logs.push('SNAPTEST ' + JSON.stringify(r)); }
   // PEEK=hexaddr:len[,...]: wasm-memory bytes at the end of the run (e.g. a game-memory counter, from the link map)
+  if (process.env.HEAPSCAN && process.env.HEAPSCANOUT) { const r = await p.evaluate(() => window.__heapScan || null); fs.writeFileSync(process.env.HEAPSCANOUT, JSON.stringify(r)); logs.push('HEAPSCAN -> ' + process.env.HEAPSCANOUT + ' ' + (r ? r.n : 'none')); }
   if (process.env.PEEK) { const r = await p.evaluate((spec) => { const m = window.__mp4n.module; return spec.split(',').map((x) => { const [a, n] = x.split(':'); const o = parseInt(a, 16); return a + ' ' + Array.from(m.HEAPU8.subarray(o, o + (+n || 4))).map((v) => v.toString(16).padStart(2, '0')).join(''); }); }, process.env.PEEK); logs.push('PEEK ' + r.join(' | ')); }
   if (process.env.RBTEST) { const r = await p.evaluate(() => { const T = window.__rbT, m = window.__mp4n.module; const st = Array.from(new Float64Array(m.HEAPU8.buffer, m._mp4web_rb_stats(), 8)); const rs = T.restoreMs.slice().sort((a, b) => a - b); return { enableRc: T.enableRc, inexactAt: T.rbadAt || [], fullChecked: T.fullCmp || 0, fullMismatch: T.fullBad || 0, fullFirst: T.fullFirst || null, restores: T.restores, restoreExactChecked: T.rcmp, restoreInexact: T.rbad, rerunFramesCompared: T.cmp, mismatches: T.bad.length, firstBad: T.bad.slice(0, 5), rcFail: T.rcFail, rcFails: T.rcFails || 0, restoreMsP50: rs[rs.length >> 1], restoreMsMax: rs[rs.length - 1], avgHashMs: T.hashMs / Math.max(1, Object.keys(T.h1).length + T.cmp), maxHashMs: T.maxHashMs, boundaries: st[0], pagesPerFrame: st[1] / Math.max(1, st[0]), maxPagesPerFrame: st[2], restoredPagesPer: st[4] / Math.max(1, st[3]), lastBoundaryMs: st[6], overflow: st[7] }; }); logs.push('RBTEST ' + JSON.stringify(r)); }
   if (process.env.CNTDUMP) { const c = await p.evaluate(() => { const m = window.__mp4n.module, C = window.__cnt; const a = new Uint32Array(m.HEAPU8.buffer, C.ptr, C.n), o = {}; for (let i = 0; i < C.n; i++) if (a[i]) o[i] = a[i]; return { o, frames: m._mp4web_total() }; }); fs.writeFileSync(process.env.CNTDUMP, JSON.stringify(c)); logs.push('CNTDUMP ' + Object.keys(c.o).length + ' sites, frames ' + c.frames); }
