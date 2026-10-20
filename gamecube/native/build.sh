@@ -101,7 +101,7 @@ GAMEF=(-DTARGET_PC -DNON_MATCHING -DOPTIMIZED_TEXTURE_LOADING -DBYTESWAPPING -DT
        -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-implicit-int
        -ftrivial-auto-var-init=zero)   # decomp code reads locals before setting them (220 clang warnings, e.g. mpexDll charsel, ztardll select): undefined behaviour that clang can compile to a trap; the GameCube read register/stack leftovers, here they read 0
 game_srcs() {
-  sed -n '/set(GAME_FILES/,/)/p; /set(PORT_FILES/,/)/p' "$PB/files.cmake" | grep -v "^ *#" | grep -oE "src/[A-Za-z0-9_/.-]+\.(c|cpp)" | grep -v "^src/port/ui/\|^src/port/portmain.cpp\|^src/port/achievements.cpp\|^src/port/audio.cpp" | sed "s#^#$PB/#"
+  sed -n '/set(GAME_FILES/,/)/p; /set(PORT_FILES/,/)/p' "$PB/files.cmake" | grep -v "^ *#" | grep -oE "src/[A-Za-z0-9_/.-]+\.(c|cpp)" | grep -v "^src/port/ui/\|^src/port/portmain.cpp\|^src/port/achievements.cpp\|^src/port/audio.cpp\|^src/port/config.cpp" | sed "s#^#$PB/#"
   echo "$HERE/src/libco_fiber.c"; echo "$HERE/src/rel_dispatch.c"; echo "$HERE/src/web_stubs.cpp"; echo "$HERE/src/web_audio.cpp"; echo "$HERE/src/det_heap.c"; echo "$HERE/src/host_state.c"; echo "$HERE/src/nod_web.c"   # game heap: aurora keeps its handles inside game-held DVD blocks
   sed -n '/add_library(musyx STATIC/,/)/p' "$MX/CMakeLists.txt" | grep -oE "src/[A-Za-z0-9_/.-]+\.c" | sed "s#^#$MX/#"
   echo "$MX/src/musyx/runtime/hw_pc_null.c"   # no SDL device: the game renders each frame's samples itself
@@ -113,6 +113,11 @@ if [ "$STAGE" = game ] || [ "$STAGE" = all ]; then
   # per device) are NOT game state: built with the game's flags, linked outside the game's range
   rm -f "$BUILD"/obj/game__*portmain_web*
   echo "$HERE/src/portmain_web.cpp" | build_list au "${GAMEF[@]}" -fexceptions
+  # port/config.cpp's registry (an absl::flat_hash_map) points into the C++ heap, whose addresses differ per
+  # console: inside the game's range it put a host pointer in the state hash (found by the probe's
+  # HEAPSHIFT + HEAPSCAN pair: RegisteredConfigVars, 2 words, the only ones). Settings, not game state: outside.
+  rm -f "$BUILD"/obj/game__*port_config_cpp*
+  echo "$PB/src/port/config.cpp" | build_list au "${GAMEF[@]}" -fexceptions
 fi
 # ---- the overlays (src/REL/*): compiled into the module, namespaced, fresh statics per link ----
 if [ "$STAGE" = rel ] || [ "$STAGE" = all ]; then
@@ -160,9 +165,10 @@ if [ "$STAGE" = link ] || [ "$STAGE" = all ]; then
     # with wasm exceptions for this variant; everything else is plain C / no-exception C++.
     game_srcs | grep '\.cpp$' | build_list wx "${GAMEF[@]}" -fwasm-exceptions
     echo "$HERE/src/portmain_web.cpp" | build_list wx "${GAMEF[@]}" -fwasm-exceptions
+    echo "$PB/src/port/config.cpp" | build_list wx "${GAMEF[@]}" -fwasm-exceptions
     echo "$AU/lib/gfx/png_io.cpp" | build_list wx -fwasm-exceptions -sSUPPORT_LONGJMP=wasm   # libpng's setjmp
     GOBJS=$(for f in $(game_srcs); do case "$f" in *libco_fiber.c) echo "$JOBJ" ;; *.cpp) oname wx "$f" ;; *) oname game "$f" ;; esac; done)
-    AOBJS=$(for o in "$BUILD"/obj/au__*.o; do case "$o" in *portmain_web*) oname wx "$HERE/src/portmain_web.cpp" ;; *png_io*) oname wx "$AU/lib/gfx/png_io.cpp" ;; *) echo "$o" ;; esac; done)
+    AOBJS=$(for o in "$BUILD"/obj/au__*.o; do case "$o" in *portmain_web*) oname wx "$HERE/src/portmain_web.cpp" ;; *port_config_cpp*) oname wx "$PB/src/port/config.cpp" ;; *png_io*) oname wx "$AU/lib/gfx/png_io.cpp" ;; *) echo "$o" ;; esac; done)
     em++ -O2 -fwasm-exceptions -sSUPPORT_LONGJMP=wasm "${PORTS[@]}" -sJSPI=1 -sJSPI_EXPORTS=mp4web_co_entry -sSTACK_SIZE=1048576 \
       -sINITIAL_MEMORY=268435456 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2147483648 \
       -sENVIRONMENT=web -sEXIT_RUNTIME=0 -sINVOKE_RUN=0 -sMODULARIZE=1 -sEXPORT_NAME=createMp4Native \
