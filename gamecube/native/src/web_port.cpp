@@ -157,6 +157,8 @@ enum { kHookReanchor = 1, kHookHold = 2, kHookOffSchedule = 4 };
 // The game, its audio and its clock run every frame exactly as before; only presents are dropped.
 extern "C" int mp4web_gfx_skip_draws;          // aurora gfx/common.cpp (patched)
 static int g_skipMax = 3, g_skipRun = 0;
+// set by aurora's GXCopyTex on an undrawn frame (its copy had no EFB to read): the next frame is not auto-skipped
+extern "C" { int mp4web_gx_copy_redraw = 0; }
 static uint64_t g_drawn = 0, g_autoSkipped = 0;
 extern "C" EMSCRIPTEN_KEEPALIVE void mp4web_set_frameskip(int maxRun) { g_skipMax = maxRun < 0 ? 0 : maxRun; }
 extern "C" EMSCRIPTEN_KEEPALIVE double mp4web_drawn() { return static_cast<double>(g_drawn); }
@@ -168,7 +170,7 @@ extern "C" void frame_limiter() {
   mp4web_audio_frame();   // this frame's 5 ms sound ticks + samples (before the sleep: part of the frame's cost)
   double now = emscripten_get_now();
   if (g_lastWake >= 0) g_busy += now - g_lastWake;
-  if (!mp4web_gfx_skip_draws) ++g_drawn;     // the frame that just ended was presented
+  if (!mp4web_gfx_skip_draws) { ++g_drawn; mp4web_gx_copy_redraw = 0; }     // the frame that just ended was presented
   mp4web_gfx_skip_draws = 0;                 // the next frame is drawn unless the room's hook or the frame skip says otherwise
   ++g_total;
   if (g_t0 < 0) { g_t0 = now; g_frame = 0; }
@@ -197,7 +199,7 @@ extern "C" void frame_limiter() {
     const double wait = due - now;
     // the next frame: drawn, unless the room already said not to, or this console is behind
     if (!mp4web_gfx_skip_draws) {
-      if (late > 0.5 * period && g_skipRun < g_skipMax) { mp4web_gfx_skip_draws = 1; ++g_skipRun; ++g_autoSkipped; }
+      if (late > 0.5 * period && g_skipRun < g_skipMax && !mp4web_gx_copy_redraw) { mp4web_gfx_skip_draws = 1; ++g_skipRun; ++g_autoSkipped; }
       else g_skipRun = 0;
     }
     emscripten_sleep(wait > 0 ? static_cast<unsigned>(wait) : 0);
