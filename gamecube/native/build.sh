@@ -147,7 +147,8 @@ if [ "$STAGE" = link ] || [ "$STAGE" = all ]; then
   # console in a room loads it, so they all run the same code). WB=0 skips the rb/ variant.
   if [ "${WB:-1}" = 1 ]; then
     mkdir -p "$OUT/rb"
-    bash "$HERE/wb/instrument.sh" "$OUT/mp4native.wasm" "$OUT/rb/mp4native.wasm" && cp "$OUT/mp4native.js" "$OUT/rb/mp4native.js"
+    # a failed instrument (disk full: wasm-opt's temp output) used to fall through to "ok", leaving the PREVIOUS rb/
+    { bash "$HERE/wb/instrument.sh" "$OUT/mp4native.wasm" "$OUT/rb/mp4native.wasm" && cp "$OUT/mp4native.js" "$OUT/rb/mp4native.js"; } || { echo "[wb] FAIL: rb/ not rebuilt"; exit 1; }
   fi
   # the link keeps function names (--profiling-funcs, for profiles of the link output); the shipped builds drop them
   [ "${STRIP:-1}" = 1 ] && "$HOME/emsdk-upstream/upstream/bin/wasm-opt" --all-features --strip-debug "$OUT/mp4native.wasm" -o "$OUT/mp4native.wasm"
