@@ -532,6 +532,30 @@ index 863ecb8..5235f25 100644
    const NodDiscOptions options{
        .preloader_threads = 1,
    };
+diff --git a/lib/dolphin/gx/GXDispList.cpp b/lib/dolphin/gx/GXDispList.cpp
+index e165cd1..1861e0a 100644
+--- a/lib/dolphin/gx/GXDispList.cpp
++++ b/lib/dolphin/gx/GXDispList.cpp
+@@ -81,6 +81,7 @@ void GXCallDisplayListLE(const void* data, u32 nbytes) {
+   // (VCD, VAT, etc.) are processed into g_gxState before the display
+   // list's draw commands reference them.
+   aurora::gx::fifo::drain();
++  if (aurora::gx::fifo::skipping()) return;   // web: an undrawn frame decodes nothing (fifo.cpp)
+ 
+   // Process the display list through the command processor (little-endian)
+   aurora::gx::fifo::process(static_cast<const u8*>(data), nbytes, false);
+diff --git a/lib/dolphin/gx/GXFrameBuffer.cpp b/lib/dolphin/gx/GXFrameBuffer.cpp
+index c196cf6..797ef37 100644
+--- a/lib/dolphin/gx/GXFrameBuffer.cpp
++++ b/lib/dolphin/gx/GXFrameBuffer.cpp
+@@ -149,6 +149,7 @@ void GXCopyDisp(void* dest, GXBool clear) {}
+ 
+ void GXCopyTex(void* dest, GXBool clear) {
+   aurora::gx::fifo::drain();
++  if (aurora::gx::fifo::skipping()) return;   // web: an undrawn frame copies nothing (fifo.cpp)
+ 
+   const auto rect = aurora::gx::map_logical_scissor(g_gxState.texCopySrc);
+   const auto [dstWidth, dstHeight] = scale_copy_dst(g_gxState.texCopyDstWidth, g_gxState.texCopyDstHeight);
 diff --git a/lib/dolphin/gx/GXManage.cpp b/lib/dolphin/gx/GXManage.cpp
 index 84c3cfc..a5b7fca 100644
 --- a/lib/dolphin/gx/GXManage.cpp
@@ -1375,6 +1399,62 @@ index 9748556..2f2c133 100644
  
    auto* lastDraw = !g_gxState.stateDirty ? gfx::get_last_draw_command<DrawData>() : nullptr;
    const bool canMerge = lastDraw != nullptr && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS &&
+diff --git a/lib/gx/fifo.cpp b/lib/gx/fifo.cpp
+index 1e986e9..9daba10 100644
+--- a/lib/gx/fifo.cpp
++++ b/lib/gx/fifo.cpp
+@@ -68,10 +68,39 @@ uint32_t end_display_list() {
+ 
+ bool in_display_list() { return detail::sInDisplayList; }
+ 
++#ifdef __EMSCRIPTEN__
++}  // namespace aurora::gx::fifo
++extern "C" int mp4web_gfx_skip_draws;   // gfx/common.cpp
++#include <emscripten.h>
++namespace aurora::gx::fifo {
++// WEB: AN UNDRAWN FRAME IS NOT DECODED. The game's GX calls still write the FIFO (and the GX shadow
++// registers, which live in game memory), but a frame nobody will see (a frame skip, a netplay re-simulation
++// or catch-up, a GPU-busy scratch frame) has its FIFO dropped instead of interpreted: no register decode, no
++// display-list walk, no texture-copy setup. Nothing here writes game memory, so state hashes cannot change;
++// a drawn frame re-issues the GX state it draws with. Module.mp4FifoSkip === false (?fifoskip=0) decodes it.
++static int sSkipOn = -1;
++static double sSkippedBytes = 0;
++bool skipping() {
++  if (!mp4web_gfx_skip_draws) return false;
++  if (sSkipOn < 0) sSkipOn = EM_ASM_INT({ return Module['mp4FifoSkip'] === false ? 0 : 1; });
++  return sSkipOn != 0;
++}
++extern "C" EMSCRIPTEN_KEEPALIVE double mp4web_fifo_skipped_bytes() { return sSkippedBytes; }
++#else
++bool skipping() { return false; }
++#endif
++
+ void drain() {
+   if (detail::sBufferSize == 0) {
+     return;
+   }
++#ifdef __EMSCRIPTEN__
++  if (skipping()) {
++    sSkippedBytes += detail::sBufferSize;
++    detail::sBufferSize = 0;
++    return;
++  }
++#endif
+   process(detail::sBufferData, detail::sBufferSize, true);
+   detail::sBufferSize = 0;
+ }
+diff --git a/lib/gx/fifo.hpp b/lib/gx/fifo.hpp
+index 01a63e5..e5cd5be 100644
+--- a/lib/gx/fifo.hpp
++++ b/lib/gx/fifo.hpp
+@@ -84,6 +84,7 @@ bool in_display_list();
+ 
+ // Drain the internal FIFO buffer through the command processor
+ void drain();
++bool skipping();   // web: this frame is undrawn and its FIFO is dropped, not decoded (fifo.cpp)
+ 
+ // Internal buffer inspection
+ const uint8_t* get_buffer_data();
 diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
 index 3671ed5..79e7315 100644
 --- a/lib/gx/shader.cpp
