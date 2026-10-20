@@ -236,9 +236,10 @@ const benchRun = (P, ms) => P.page.evaluate((ms) => new Promise((r) => { window.
 async function proof(PS) {
   const med = (v) => v.slice().sort((x, y) => x - y)[Math.floor(v.length / 2)];
   // CALN=n (default 7) BenchmarkIndex samples per median: with 3, the factor moved 0.85-1.19 run to run on this box
-  // (free 1580-2350 on the same cpuset), so the "same" device model was not the same device. spread = (max-min)/median.
-  const N = Math.max(3, +(process.env.CALN || 7)), spread = (v) => { const m = med(v); return m ? (Math.max(...v) - Math.min(...v)) / m : 1; };
-  const bench = async (P, n) => { const v = []; for (let i = 0; i < n; i++) v.push(await benchRun(P, 2000)); return v; };
+  // (free 1580-2350 on the same cpuset), so the "same" device model was not the same device. spread = interquartile range / median
+  // (max-min read 0.14-0.30 on every run here: one outlier sample, not a moving device). Each set starts with a discarded warm-up.
+  const N = Math.max(3, +(process.env.CALN || 7)), spread = (v) => { const w = v.slice().sort((x, y) => x - y), m = med(v), q = (f) => w[Math.min(w.length - 1, Math.floor(f * (w.length - 1) + 0.5))]; return m ? (q(0.75) - q(0.25)) / m : 1; };
+  const bench = async (P, n) => { await benchRun(P, 500); const v = []; for (let i = 0; i < n; i++) v.push(await benchRun(P, 2000)); return v; };
   const R = {};
   for (const P of PS) await benchWorker(P);
   for (const P of PS) { deviceQuota(P, false); const v = await bench(P, N); R[P.role] = { free: med(v), freeSpread: +spread(v).toFixed(3) };
@@ -270,8 +271,8 @@ async function proof(PS) {
     r.rasterSlowdown = r.rasterFree && r.rasterAlone ? +(r.rasterFree / r.rasterAlone).toFixed(2) : null;
     if (r.together != null) r.share = +(r.together / r.alone).toFixed(3);
     r.cpuset = cpusetProof(P); r.cg = deviceStat(P);
-    say(`PROOF ${P.role}: renderer quota x${r.cal} (calibration); BenchmarkIndex free ${r.free} alone ${r.alone} together ${r.together ?? '-'} -> slowdown ${r.slowdown}x (want ~${rate}), check ${r.checkSlowdown}x spread free ${r.freeSpread} check ${r.checkSpread} (N=${N}), share ${r.share ?? '-'} (want ~1), cpus ${JSON.stringify(r.cpuset)}, throttled ${r.cg.nr_throttled}/${r.cg.nr_periods} periods; raster free ${r.rasterFree} quota ${r.rasterAlone} -> ${r.rasterSlowdown}x (GPU ${GPUOFF ? 'NOT throttled, --gpuoff' : 'throttled, want >= ' + (0.5 * rate).toFixed(1)})`);
     r.checkSlowdown = r.check ? +(r.free / r.check).toFixed(2) : null;
+    say(`PROOF ${P.role}: renderer quota x${r.cal} (calibration); BenchmarkIndex free ${r.free} alone ${r.alone} together ${r.together ?? '-'} -> slowdown ${r.slowdown}x (want ~${rate}), check ${r.checkSlowdown}x spread free ${r.freeSpread} check ${r.checkSpread} (N=${N}), share ${r.share ?? '-'} (want ~1), cpus ${JSON.stringify(r.cpuset)}, throttled ${r.cg.nr_throttled}/${r.cg.nr_periods} periods; raster free ${r.rasterFree} quota ${r.rasterAlone} -> ${r.rasterSlowdown}x (GPU ${GPUOFF ? 'NOT throttled, --gpuoff' : 'throttled, want >= ' + (0.5 * rate).toFixed(1)})`);
     r.ok = Math.abs(r.slowdown / rate - 1) <= 0.25 && (r.checkSlowdown == null || process.env.CALFIX || (Math.abs(r.checkSlowdown / rate - 1) <= 0.08 && r.checkSpread <= 0.15 && r.freeSpread <= 0.15)) && (r.share == null || r.share >= 0.9) && Object.keys(r.cpuset).length === 1 && r.cg.nr_throttled > 0 && (GPUOFF || (r.rasterSlowdown != null && r.rasterSlowdown >= 0.5 * rate));
   }
   return R;
