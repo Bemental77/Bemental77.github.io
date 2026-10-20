@@ -451,7 +451,7 @@ index 0000000..965b1c5
 +  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 +};
 diff --git a/src/musyx/runtime/hw_pc.c b/src/musyx/runtime/hw_pc.c
-index 65abcc5..0ec43ac 100644
+index 65abcc5..0140153 100644
 --- a/src/musyx/runtime/hw_pc.c
 +++ b/src/musyx/runtime/hw_pc.c
 @@ -1,10 +1,12 @@
@@ -1105,12 +1105,12 @@ index 65abcc5..0ec43ac 100644
    if (dest) {
      u32 channels = salPCChannels();
      for (u32 i = 0; i < cycleFrames; ++i) {
-@@ -681,7 +967,587 @@ void salCtrlDsp(s16 *dest) {
+@@ -681,7 +967,663 @@ void salCtrlDsp(s16 *dest) {
      }
    }
  }
 +#endif
- 
++
 +#if !defined(SAL_PC_SPLIT) && !defined(SAL_PC_RENDER)
 +void salCtrlDsp(s16 *dest) {
 +  u8 st;
@@ -1359,7 +1359,8 @@ index 65abcc5..0ec43ac 100644
 +  return (p ? p : mirrorZero) + (a & (MIRROR_PAGE - 1));
 +}
 +
-+static u32 rStats[8];   /* frames replayed, resyncs, cycles, records, aux prepares, DATA bytes, segments, retires */
++static u32 rStats[10];  /* frames replayed, full resyncs, cycles, records, aux prepares, DATA bytes, segments, retires,
++                          * voices reset by a reconcile, reconciles */
 +
 +/* the AUX effects: one instance per control-side struct (its address is the key) */
 +typedef struct RenderAux {
@@ -1440,7 +1441,7 @@ index 65abcc5..0ec43ac 100644
 +  *handler = type == SAL_AUXT_REVHI ? sndAuxCallbackReverbHI : type == SAL_AUXT_REVSTD ? sndAuxCallbackReverbSTD
 +             : type == SAL_AUXT_CHORUS ? sndAuxCallbackChorus : sndAuxCallbackDelay;
 +}
-+
+ 
 +static void renderActivateStudio(u32 st, u32 isMaster, u32 type) {
 +  DSPstudioinfo *state = &dspStudio[st];
 +  memset(state->main[0], 0, SAL_PC_STUDIO_BYTES);
@@ -1486,40 +1487,115 @@ index 65abcc5..0ec43ac 100644
 +
 +/* a resync: rebuild every voice cursor, studio and effect from the frame's snapshot. The decoder
 + * history (yn1/yn2, the resampler taps) starts from zero: the control side does not keep it. */
-+static void resync(const u8 *p) {
-+  ++rStats[1];
-+  renderInit();
++/* A serial gap: frames the render side never saw (a rollback's re-simulation, an overflow, the page
++ * starting late). The first time it builds everything from the snapshot. After that it RECONCILES: a
++ * voice, studio or effect whose control state matches what this side already has keeps everything it
++ * has (decoder history, resampler taps, reverb tails, depop), so a rollback that did not change the
++ * audio continues seamlessly. Only what differs is rebuilt: a changed voice retires its tail and
++ * restarts its decoder from the snapshot cursor (history from zero), a changed effect is prepared
++ * again from its parameters. */
++static int sameSample(const DSPvoice *vp, const SalRecSample *o) {
++  return (u32)(uintptr_t)vp->smp_info.addr == o->addr && vp->smp_info.length == o->length && vp->smp_info.loop == o->loop &&
++         vp->smp_info.loopLength == o->loopLength && vp->smp_info.compType == (u8)o->compType &&
++         (u32)(uintptr_t)vp->vSampleInfo.loopBufferAddr == o->vAddr && vp->vSampleInfo.loopBufferLength == o->vLength &&
++         vp->vSampleInfo.inLoopBuffer == (u8)o->vInLoop && vp->streamLoopPS == (u8)o->streamLoopPS;
++}
++static int sameAdpcm(u32 v, const SalRecAdpcm *a) {
++  const DSPADPCMplusInfo *d = rVoices[v].smp_info.extraData;
++  if (!a->has) return d == NULL;
++  return d && d->initialPS == a->initialPS && d->loopPS == a->loopPS && d->loopY0 == a->loopY0 && d->loopY1 == a->loopY1 &&
++         !memcmp(d->coefTab, a->coefTab, sizeof d->coefTab);
++}
++static int sameVoice(const SalSnapVoice *o) {
++  const DSPvoice *vp = &rVoices[o->voice];
++  const VoiceResamplerState *rs = &voiceResampler[o->voice];
++  if (vp->state != DSP_VOICE_STATE_PLAYING || o->state != DSP_VOICE_STATE_PLAYING || vp->studio != (u8)o->studio) return 0;
++  return sameSample(vp, &o->smp) && sameAdpcm(o->voice, &o->adpcm) && rs->reader.position == o->reader.position &&
++         rs->reader.predictorScale == o->reader.predictorScale && rs->reader.useInitialPS == (bool)o->reader.useInitialPS &&
++         rs->reader.ended == (bool)o->reader.ended && rs->phase == o->phase && rs->historyIndex == o->historyIndex &&
++         rs->tail == (u8)o->tail && rs->itdDelay[0] == o->itd0 && rs->itdDelay[1] == o->itd1;
++}
++static void setVoice(const SalSnapVoice *o) {
++  DSPvoice *vp = &rVoices[o->voice];
++  VoiceResamplerState *rs = &voiceResampler[o->voice];
++  memset(vp, 0, sizeof *vp);
++  memset(rs, 0, sizeof *rs);
++  memset(lastContribution[o->voice], 0, sizeof(lastContribution[o->voice]));
 +#if MUSY_VERSION >= MUSY_VERSION_CHECK(2, 0, 1)
-+  memset(filterState, 0, sizeof(filterState));
++  filterState[o->voice] = 0;
 +#endif
-+  for (u32 i = 0; i < 8; ++i) { auxShutdown(&rAux[i]); rAux[i].key = 0; }
-+  memset(rVoices, 0, sizeof rVoices);
++  vp->state = (u8)o->state; vp->studio = (u8)o->studio;
++  setSample(vp, &o->smp);
++  setAdpcm(o->voice, &o->adpcm);
++  setReader(&rs->reader, &o->reader);
++  rs->reader.yn1 = rs->reader.yn2 = 0;
++  rs->phase = o->phase; rs->historyIndex = o->historyIndex; rs->tail = (u8)o->tail;
++  rs->itdDelay[0] = o->itd0; rs->itdDelay[1] = o->itd1;
++}
++static void retireVoice(u32 v) {   /* this side's voice ends: its last output decays through depop, as a stop does */
++  DSPvoice *vp = &rVoices[v];
++  if (vp->state == DSP_VOICE_STATE_INACTIVE) return;
++  const u32 saved = renderOffset;
++  renderOffset = 0;
++  retireContribution(vp);
++  renderOffset = saved;
++  vp->state = DSP_VOICE_STATE_INACTIVE;
++}
++static void resync(const u8 *p) {
++  const int first = !rSynced;
++  if (first) {
++    ++rStats[1];
++    renderInit();
++#if MUSY_VERSION >= MUSY_VERSION_CHECK(2, 0, 1)
++    memset(filterState, 0, sizeof(filterState));
++#endif
++    for (u32 i = 0; i < 8; ++i) { auxShutdown(&rAux[i]); rAux[i].key = 0; }
++    memset(rVoices, 0, sizeof rVoices);
++  } else {
++    ++rStats[9];
++  }
++  u8 seen[SYNTH_MAX_VOICES];
++  memset(seen, 0, sizeof seen);
 +  const u32 nv = ((const u32 *)p)[1]; p += 8;
 +  for (u32 i = 0; i < nv; ++i, p += sizeof(SalSnapVoice)) {
 +    const SalSnapVoice *o = (const SalSnapVoice *)p;
 +    if (o->voice >= SYNTH_MAX_VOICES) continue;
-+    DSPvoice *vp = &rVoices[o->voice];
-+    VoiceResamplerState *rs = &voiceResampler[o->voice];
-+    vp->state = (u8)o->state; vp->studio = (u8)o->studio;
-+    setSample(vp, &o->smp);
-+    setAdpcm(o->voice, &o->adpcm);
-+    setReader(&rs->reader, &o->reader);
-+    rs->reader.yn1 = rs->reader.yn2 = 0;
-+    rs->phase = o->phase; rs->historyIndex = o->historyIndex; rs->tail = (u8)o->tail;
-+    rs->itdDelay[0] = o->itd0; rs->itdDelay[1] = o->itd1;
++    seen[o->voice] = 1;
++    if (!first && sameVoice(o)) continue;
++    if (!first) { retireVoice(o->voice); ++rStats[8]; }
++    setVoice(o);
 +  }
++  if (!first)
++    for (u32 v = 0; v < SYNTH_MAX_VOICES; ++v)
++      if (!seen[v]) retireVoice(v);
 +  const u32 ns = *(const u32 *)p; p += 4;
 +  for (u32 i = 0; i < ns; ++i, p += sizeof(SalSnapStudio)) {
 +    const SalSnapStudio *o = (const SalSnapStudio *)p;
 +    if (o->studio >= 8) continue;
-+    if (o->active) renderActivateStudio(o->studio, o->isMaster, o->type);
-+    else dspStudio[o->studio].state = DSP_STUDIO_STATE_INACTIVE;
++    DSPstudioinfo *sp = &dspStudio[o->studio];
++    if (o->active) {
++      if (first || sp->state != DSP_STUDIO_STATE_ACTIVE || sp->isMaster != (u8)o->isMaster || sp->type != (SND_STUDIO_TYPE)o->type)
++        renderActivateStudio(o->studio, o->isMaster, o->type);
++    } else sp->state = DSP_STUDIO_STATE_INACTIVE;
 +  }
 +  const u32 na = *(const u32 *)p; p += 4;
++  u8 keep[8];
++  memset(keep, 0, sizeof keep);
 +  for (u32 i = 0; i < na; ++i, p += sizeof(SalSnapAux)) {
 +    const SalSnapAux *o = (const SalSnapAux *)p;
++    RenderAux *a = auxFind(o->key, 0);
++    if (a && a->live && a->type == o->type) {
++      RenderAux t = *a;
++      auxParams(&t, o->type, o->data);
++      if (!memcmp(&t.u, &a->u, sizeof t.u)) { keep[a - rAux] = 1; continue; }   /* the same effect: its tail continues */
++    }
++    if (a) { auxShutdown(a); a->key = 0; }
 +    auxPrepare(o->type, o->key, o->data);
++    a = auxFind(o->key, 0);
++    if (a) keep[a - rAux] = 1;
 +  }
++  for (u32 i = 0; i < 8; ++i)
++    if (rAux[i].key && !keep[i]) { auxShutdown(&rAux[i]); rAux[i].key = 0; }
 +  rSynced = 1;
 +}
 +
@@ -1693,7 +1769,7 @@ index 65abcc5..0ec43ac 100644
  bool salInitAi(SND_SOME_CALLBACK callback, u32 flags, u32 *outFreq) {
    (void)flags;
    salPCResetOutput(callback);
-@@ -690,6 +1556,10 @@ bool salInitAi(SND_SOME_CALLBACK callback, u32 flags, u32 *outFreq) {
+@@ -690,6 +1632,10 @@ bool salInitAi(SND_SOME_CALLBACK callback, u32 flags, u32 *outFreq) {
    memset(depop, 0, sizeof(depop));
    depopCursor = renderOffset = 0;
    initResampleTables();
@@ -1704,7 +1780,7 @@ index 65abcc5..0ec43ac 100644
    synthInfo.numSamples = 32;
    *outFreq = salPCMixRate();
    return true;
-@@ -760,6 +1630,10 @@ void salActivateStudio(u8 studio, u32 isMaster, SND_STUDIO_TYPE type) {
+@@ -760,6 +1706,10 @@ void salActivateStudio(u8 studio, u32 isMaster, SND_STUDIO_TYPE type) {
    state->type = type;
    state->auxAHandler = state->auxBHandler = NULL;
    state->auxAUser = state->auxBUser = NULL;
@@ -1715,7 +1791,7 @@ index 65abcc5..0ec43ac 100644
  }
  
  /* Hardware HRTF storage is not used by the native panner. */
-@@ -812,3 +1686,4 @@ void salReconnectVoice(DSPvoice *voice, u8 studio) {
+@@ -812,3 +1762,4 @@ void salReconnectVoice(DSPvoice *voice, u8 studio) {
    }
    voice->studio = studio;
  }

@@ -341,7 +341,11 @@
     R.lastRan = frame;
     if (live) { R.lastLive = frame; R.stats.live++; if (quiet) R.stats.hidden++; }
     else R.stats.resim++;
-    R.pushMute = !!quiet;                 // its samples arrive at the next boundary; a repeat or a hidden frame is not heard
+    // its samples arrive at the next boundary. Only a RE-SIMULATION is not heard: those frames' audio already went
+    // out once (the render side continues from the corrected state, mp4-native.html audioLog). A hidden catch-up or
+    // rejoin frame is a NEW frame of game time, so its audio plays like any other (muting it starved the worklet:
+    // 375-491 underruns in a 480 s live room).
+    R.pushMute = !live;
     var skip = (quiet || !live) ? 1 : 0;  // nor drawn: Aurora skips its render passes and the present (game state is untouched)
     if (skip) R.stats.undrawn++;
     if (R.mod._mp4web_set_gfx_skip) R.mod._mp4web_set_gfx_skip(skip);

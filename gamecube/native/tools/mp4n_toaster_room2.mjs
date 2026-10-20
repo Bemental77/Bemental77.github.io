@@ -235,23 +235,30 @@ const rasterRun = (P) => P.page.evaluate(`(${RASTER_SRC})(2000)`);
 const benchRun = (P, ms) => P.page.evaluate((ms) => new Promise((r) => { window.__bw.onmessage = (e) => r(e.data); window.__bw.postMessage(ms); }), ms);
 async function proof(PS) {
   const med = (v) => v.slice().sort((x, y) => x - y)[Math.floor(v.length / 2)];
+  // CALN=n (default 7) BenchmarkIndex samples per median: with 3, the factor moved 0.85-1.19 run to run on this box
+  // (free 1580-2350 on the same cpuset), so the "same" device model was not the same device. spread = (max-min)/median.
+  const N = Math.max(3, +(process.env.CALN || 7)), spread = (v) => { const m = med(v); return m ? (Math.max(...v) - Math.min(...v)) / m : 1; };
+  const bench = async (P, n) => { const v = []; for (let i = 0; i < n; i++) v.push(await benchRun(P, 2000)); return v; };
   const R = {};
   for (const P of PS) await benchWorker(P);
-  for (const P of PS) { deviceQuota(P, false); const v = []; for (let i = 0; i < 5; i++) v.push(await benchRun(P, 2000)); R[P.role] = { free: med(v) };
+  for (const P of PS) { deviceQuota(P, false); const v = await bench(P, N); R[P.role] = { free: med(v), freeSpread: +spread(v).toFixed(3) };
     const rv = []; for (let i = 0; i < 3; i++) rv.push(await rasterRun(P)); R[P.role].rasterFree = med(rv); }
   for (const P of PS) deviceQuota(P, true);
   await sleep(300);
-  for (const P of PS) { const v = []; for (let i = 0; i < 3; i++) v.push(await benchRun(P, 2000)); R[P.role].alone = med(v);
+  for (const P of PS) { const v = await bench(P, N); R[P.role].alone = med(v);
     // CALIBRATE (CAL=0 skips): scale this player's renderer quota until free/alone is within 5% of the rate
     // CALFIX=f: pin the factor instead (diagnostic: replay an earlier run's device model on today's box)
     if (process.env.CALFIX) { P.dev.cal = +process.env.CALFIX; deviceQuota(P, true); await sleep(300);
-      const w = []; for (let i = 0; i < 3; i++) w.push(await benchRun(P, 2000)); R[P.role].alone = med(w); }
-    else for (let it = 0; it < 4 && process.env.CAL !== '0'; it++) {
+      const w = await bench(P, N); R[P.role].alone = med(w); }
+    else for (let it = 0; it < 6 && process.env.CAL !== '0'; it++) {
       const sd = R[P.role].free / R[P.role].alone; if (Math.abs(sd / rate - 1) <= 0.05) break;
       P.dev.cal *= sd / rate; deviceQuota(P, true); await sleep(300);
-      const w = []; for (let i = 0; i < 3; i++) w.push(await benchRun(P, 2000)); R[P.role].alone = med(w);
+      const w = await bench(P, N); R[P.role].alone = med(w);
     }
     R[P.role].cal = +P.dev.cal.toFixed(3);
+    // the device-model check, measured again after calibrating (N fresh samples): the model holds only if this
+    // independent median is within 8% of the rate and its samples agree within 15%
+    { const v = await bench(P, N); R[P.role].check = med(v); R[P.role].checkSpread = +spread(v).toFixed(3); }
     const rv = []; for (let i = 0; i < 3; i++) rv.push(await rasterRun(P)); R[P.role].rasterAlone = med(rv); }
   if (PS.length > 1) {
     const tog = await Promise.all(PS.map(async (P) => { const v = []; for (let i = 0; i < 3; i++) v.push(await benchRun(P, 2000)); return med(v); }));
@@ -263,8 +270,9 @@ async function proof(PS) {
     r.rasterSlowdown = r.rasterFree && r.rasterAlone ? +(r.rasterFree / r.rasterAlone).toFixed(2) : null;
     if (r.together != null) r.share = +(r.together / r.alone).toFixed(3);
     r.cpuset = cpusetProof(P); r.cg = deviceStat(P);
-    say(`PROOF ${P.role}: renderer quota x${r.cal} (calibration); BenchmarkIndex free ${r.free} alone ${r.alone} together ${r.together ?? '-'} -> slowdown ${r.slowdown}x (want ~${rate}), share ${r.share ?? '-'} (want ~1), cpus ${JSON.stringify(r.cpuset)}, throttled ${r.cg.nr_throttled}/${r.cg.nr_periods} periods; raster free ${r.rasterFree} quota ${r.rasterAlone} -> ${r.rasterSlowdown}x (GPU ${GPUOFF ? 'NOT throttled, --gpuoff' : 'throttled, want >= ' + (0.5 * rate).toFixed(1)})`);
-    r.ok = Math.abs(r.slowdown / rate - 1) <= 0.25 && (r.share == null || r.share >= 0.9) && Object.keys(r.cpuset).length === 1 && r.cg.nr_throttled > 0 && (GPUOFF || (r.rasterSlowdown != null && r.rasterSlowdown >= 0.5 * rate));
+    say(`PROOF ${P.role}: renderer quota x${r.cal} (calibration); BenchmarkIndex free ${r.free} alone ${r.alone} together ${r.together ?? '-'} -> slowdown ${r.slowdown}x (want ~${rate}), check ${r.checkSlowdown}x spread free ${r.freeSpread} check ${r.checkSpread} (N=${N}), share ${r.share ?? '-'} (want ~1), cpus ${JSON.stringify(r.cpuset)}, throttled ${r.cg.nr_throttled}/${r.cg.nr_periods} periods; raster free ${r.rasterFree} quota ${r.rasterAlone} -> ${r.rasterSlowdown}x (GPU ${GPUOFF ? 'NOT throttled, --gpuoff' : 'throttled, want >= ' + (0.5 * rate).toFixed(1)})`);
+    r.checkSlowdown = r.check ? +(r.free / r.check).toFixed(2) : null;
+    r.ok = Math.abs(r.slowdown / rate - 1) <= 0.25 && (r.checkSlowdown == null || process.env.CALFIX || (Math.abs(r.checkSlowdown / rate - 1) <= 0.08 && r.checkSpread <= 0.15 && r.freeSpread <= 0.15)) && (r.share == null || r.share >= 0.9) && Object.keys(r.cpuset).length === 1 && r.cg.nr_throttled > 0 && (GPUOFF || (r.rasterSlowdown != null && r.rasterSlowdown >= 0.5 * rate));
   }
   return R;
 }
@@ -412,6 +420,11 @@ try {
       for (const [pid, v] of Object.entries(P.cpu1.c)) by[v.k] = (by[v.k] || 0) + 1000 * (v.t - ((P.cpu0.c[pid] || {}).t || 0)) / fr;
       for (const k of Object.keys(by)) by[k] = +by[k].toFixed(2);
       o.cpuMsPerFrame = by; say(`CPU ${P.role}: ms per guest frame by process ${JSON.stringify(by)} over ${fr} frames / ${sec.toFixed(0)} s`); }
+    // the audio a player heard: worklet underruns (gaps) and their silent samples, queue target, drops, the render
+    // side's reconciles, and the room's own clock rate (game time per wall time: what audio can follow at most)
+    try { const au = await P.page.evaluate(() => { const a = window.__mp4n && window.__mp4n.audio; if (!a) return null; const R = window.Mp4Room && Mp4Room.report(); const oc = R && R.engine && R.engine.rb && R.engine.rb.ownClock;
+        return { worklet: !!a.wlAud, ring: !!a.ring, gaps: a.gaps, gapSamples: a.gapSamples, drops: a.drops, muted: a.muted, nonSilent: a.nonSilent, target: a.q && a.q.target, ratio: a.q && a.q.last && +a.q.last[2].toFixed(4), reconciles: a.renderStats && a.renderStats[9], voiceResets: a.renderStats && a.renderStats[8], clockRate: oc ? oc.rate : null, lead: oc ? oc.lead : null }; });
+      o.audio = au; if (au) say(`AUDIO ${P.role}: ${JSON.stringify(au)}`); } catch (e) {}
     if (process.env.SENDTIME === '1') { try { say(`SENDTIME ${P.role}: ${JSON.stringify(await P.page.evaluate(() => window.__sendT))}`); } catch (e) {} }
     say(`SUMMARY ${PAGE} ${mode} ${P.role}: open@${o.openT}s window x=${o.win.x && o.win.x.toFixed(3)} min ${o.win.min && o.win.min.toFixed(3)} presented ${o.win.presented != null ? o.win.presented.toFixed(1) : '-'}/s host ${o.win.msPerFrame != null ? o.win.msPerFrame.toFixed(1) : '-'} ms/frame (n=${o.win.n}, first ${SKIP}s discarded)  steady x=${o.steady.x && o.steady.x.toFixed(3)}  stalls ${o.stalls}  desync=${o.desync} hc=${o.hc}  throttled ${o.cg.nr_throttled}/${o.cg.nr_periods}`);
     await P.page.screenshot({ path: path.join(OUTD, `${name}-${P.role}.png`) }).catch(() => {});
