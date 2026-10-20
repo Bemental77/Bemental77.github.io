@@ -21,6 +21,9 @@
 //   npm run web ; node tools/browser_leak_guard.js reap && uptime
 //   bash tools/probe_lock.sh run -- node gamecube/native/tools/mp4n_toaster_room2.mjs <room|solo> <rate> <sec> --page native|recomp
 //        [--noproof] [--cores 2] [--gpuoff] [--skip 10] [--name N]
+//   FWIN=f0:f1,..   measure fixed GUEST-FRAME windows (x and CPU ms/frame per window) instead of the wall-clock one, so two
+//                   arms compare the same scenes; the run ends when every window closed (give <sec> room, e.g. 400)
+//   CALFIX=f        pin the renderer-quota factor instead of calibrating (replay an earlier run's device model)
 // Output: /tmp/mp4-room2/<name>.json (+ screenshots).
 // ============================================================================
 import { createRequire } from 'module'; import fs from 'fs'; import os from 'os'; import path from 'path';
@@ -35,6 +38,7 @@ const fl = (n) => { const i = a.indexOf('--' + n); return i >= 0 ? a[i + 1] : nu
 const SKIP = +(fl('skip') || 10), PAGE = fl('page') || 'native';
 const name = fl('name') || `${PAGE}-${mode}-${rate}`, NOPROOF = a.includes('--noproof'), CORES = +(fl('cores') || 2), GPUOFF = a.includes('--gpuoff');
 const BASE = process.env.BASE_URL || 'http://localhost:8080';
+const FWIN = (process.env.FWIN || '').split(',').filter(Boolean).map((w) => w.split(':').map(Number));
 const CHROME = process.env.CHROME_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
 const OUTD = '/tmp/mp4-room2'; fs.mkdirSync(OUTD, { recursive: true });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -231,20 +235,30 @@ const rasterRun = (P) => P.page.evaluate(`(${RASTER_SRC})(2000)`);
 const benchRun = (P, ms) => P.page.evaluate((ms) => new Promise((r) => { window.__bw.onmessage = (e) => r(e.data); window.__bw.postMessage(ms); }), ms);
 async function proof(PS) {
   const med = (v) => v.slice().sort((x, y) => x - y)[Math.floor(v.length / 2)];
+  // CALN=n (default 7) BenchmarkIndex samples per median: with 3, the factor moved 0.85-1.19 run to run on this box
+  // (free 1580-2350 on the same cpuset), so the "same" device model was not the same device. spread = (max-min)/median.
+  const N = Math.max(3, +(process.env.CALN || 7)), spread = (v) => { const m = med(v); return m ? (Math.max(...v) - Math.min(...v)) / m : 1; };
+  const bench = async (P, n) => { const v = []; for (let i = 0; i < n; i++) v.push(await benchRun(P, 2000)); return v; };
   const R = {};
   for (const P of PS) await benchWorker(P);
-  for (const P of PS) { deviceQuota(P, false); const v = []; for (let i = 0; i < 5; i++) v.push(await benchRun(P, 2000)); R[P.role] = { free: med(v) };
+  for (const P of PS) { deviceQuota(P, false); const v = await bench(P, N); R[P.role] = { free: med(v), freeSpread: +spread(v).toFixed(3) };
     const rv = []; for (let i = 0; i < 3; i++) rv.push(await rasterRun(P)); R[P.role].rasterFree = med(rv); }
   for (const P of PS) deviceQuota(P, true);
   await sleep(300);
-  for (const P of PS) { const v = []; for (let i = 0; i < 3; i++) v.push(await benchRun(P, 2000)); R[P.role].alone = med(v);
+  for (const P of PS) { const v = await bench(P, N); R[P.role].alone = med(v);
     // CALIBRATE (CAL=0 skips): scale this player's renderer quota until free/alone is within 5% of the rate
-    for (let it = 0; it < 4 && process.env.CAL !== '0'; it++) {
+    // CALFIX=f: pin the factor instead (diagnostic: replay an earlier run's device model on today's box)
+    if (process.env.CALFIX) { P.dev.cal = +process.env.CALFIX; deviceQuota(P, true); await sleep(300);
+      const w = await bench(P, N); R[P.role].alone = med(w); }
+    else for (let it = 0; it < 6 && process.env.CAL !== '0'; it++) {
       const sd = R[P.role].free / R[P.role].alone; if (Math.abs(sd / rate - 1) <= 0.05) break;
       P.dev.cal *= sd / rate; deviceQuota(P, true); await sleep(300);
-      const w = []; for (let i = 0; i < 3; i++) w.push(await benchRun(P, 2000)); R[P.role].alone = med(w);
+      const w = await bench(P, N); R[P.role].alone = med(w);
     }
     R[P.role].cal = +P.dev.cal.toFixed(3);
+    // the device-model check, measured again after calibrating (N fresh samples): the model holds only if this
+    // independent median is within 8% of the rate and its samples agree within 15%
+    { const v = await bench(P, N); R[P.role].check = med(v); R[P.role].checkSpread = +spread(v).toFixed(3); }
     const rv = []; for (let i = 0; i < 3; i++) rv.push(await rasterRun(P)); R[P.role].rasterAlone = med(rv); }
   if (PS.length > 1) {
     const tog = await Promise.all(PS.map(async (P) => { const v = []; for (let i = 0; i < 3; i++) v.push(await benchRun(P, 2000)); return med(v); }));
@@ -256,8 +270,9 @@ async function proof(PS) {
     r.rasterSlowdown = r.rasterFree && r.rasterAlone ? +(r.rasterFree / r.rasterAlone).toFixed(2) : null;
     if (r.together != null) r.share = +(r.together / r.alone).toFixed(3);
     r.cpuset = cpusetProof(P); r.cg = deviceStat(P);
-    say(`PROOF ${P.role}: renderer quota x${r.cal} (calibration); BenchmarkIndex free ${r.free} alone ${r.alone} together ${r.together ?? '-'} -> slowdown ${r.slowdown}x (want ~${rate}), share ${r.share ?? '-'} (want ~1), cpus ${JSON.stringify(r.cpuset)}, throttled ${r.cg.nr_throttled}/${r.cg.nr_periods} periods; raster free ${r.rasterFree} quota ${r.rasterAlone} -> ${r.rasterSlowdown}x (GPU ${GPUOFF ? 'NOT throttled, --gpuoff' : 'throttled, want >= ' + (0.5 * rate).toFixed(1)})`);
-    r.ok = Math.abs(r.slowdown / rate - 1) <= 0.25 && (r.share == null || r.share >= 0.9) && Object.keys(r.cpuset).length === 1 && r.cg.nr_throttled > 0 && (GPUOFF || (r.rasterSlowdown != null && r.rasterSlowdown >= 0.5 * rate));
+    say(`PROOF ${P.role}: renderer quota x${r.cal} (calibration); BenchmarkIndex free ${r.free} alone ${r.alone} together ${r.together ?? '-'} -> slowdown ${r.slowdown}x (want ~${rate}), check ${r.checkSlowdown}x spread free ${r.freeSpread} check ${r.checkSpread} (N=${N}), share ${r.share ?? '-'} (want ~1), cpus ${JSON.stringify(r.cpuset)}, throttled ${r.cg.nr_throttled}/${r.cg.nr_periods} periods; raster free ${r.rasterFree} quota ${r.rasterAlone} -> ${r.rasterSlowdown}x (GPU ${GPUOFF ? 'NOT throttled, --gpuoff' : 'throttled, want >= ' + (0.5 * rate).toFixed(1)})`);
+    r.checkSlowdown = r.check ? +(r.free / r.check).toFixed(2) : null;
+    r.ok = Math.abs(r.slowdown / rate - 1) <= 0.25 && (r.checkSlowdown == null || process.env.CALFIX || (Math.abs(r.checkSlowdown / rate - 1) <= 0.08 && r.checkSpread <= 0.15 && r.freeSpread <= 0.15)) && (r.share == null || r.share >= 0.9) && Object.keys(r.cpuset).length === 1 && r.cg.nr_throttled > 0 && (GPUOFF || (r.rasterSlowdown != null && r.rasterSlowdown >= 0.5 * rate));
   }
   return R;
 }
@@ -365,7 +380,15 @@ try {
         }
         if (P.t0 != null && !P.cpu0 && r.T - P.t0 >= SKIP) P.cpu0 = { c: cpuByType(P), f: r.frame, T: r.T };
         if (P.cpu0 && !P.cpu1 && r.T - P.t0 >= SKIP + secs) P.cpu1 = { c: cpuByType(P), f: r.frame, T: r.T };
-        if (P.t0 == null || r.T - P.t0 < SKIP + secs) done = false;
+        // FWIN=f0:f1,..: fixed GUEST-FRAME windows (the same scenes in every arm, unlike a wall-clock
+        // window): x and CPU ms per frame from the first sample at/after f0 to the first at/after f1
+        if (FWIN.length) {
+          P.fw = P.fw || FWIN.map(() => ({}));
+          FWIN.forEach(([f0, f1], i) => { const w = P.fw[i];
+            if (!w.a && r.frame != null && r.frame >= f0) w.a = { t: r.t, f: r.frame, c: cpuByType(P) };
+            if (w.a && !w.b && r.frame >= f1) w.b = { t: r.t, f: r.frame, c: cpuByType(P) }; });
+          if (!P.fw.every((w) => w.b)) done = false;
+        } else if (P.t0 == null || r.T - P.t0 < SKIP + secs) done = false;
       }
     }
     if (done) break;
@@ -388,10 +411,20 @@ try {
     if (P.ovl && P.ovl.length) say(`OVL ${P.role}: ${P.ovl.join(',')}`);
     if (o.gs) say(`GFX ${P.role}: ${JSON.stringify(o.gs)} (median per sampled frame; upKB = vert/uniform/index/storage/texture)`);
     if (o.lastStats) say(`STATS ${P.role}: ${JSON.stringify(o.lastStats)} rb=${JSON.stringify(o.lastRb)} mode=${o.lastMode}`);
+    if (P.fw) { o.fwin = P.fw.map((w, i) => { if (!w.a || !w.b) return { win: FWIN[i], incomplete: true };
+        const fr = w.b.f - w.a.f, by = {}; for (const [pid, v] of Object.entries(w.b.c)) by[v.k] = (by[v.k] || 0) + 1000 * (v.t - ((w.a.c[pid] || {}).t || 0)) / fr;
+        for (const k of Object.keys(by)) by[k] = +by[k].toFixed(2);
+        return { win: FWIN[i], frames: fr, x: +(fr / ((w.b.t - w.a.t) / 1000) / 60).toFixed(4), cpu: by }; });
+      for (const w of o.fwin) say(`FWIN ${P.role} ${w.win.join('-')}: ${w.incomplete ? 'INCOMPLETE' : 'x=' + w.x.toFixed(3) + ' renderer ' + w.cpu.renderer + ' gpu ' + w.cpu['gpu-process'] + ' ms/frame over ' + w.frames + ' frames'}`); }
     if (P.cpu0 && P.cpu1) { const fr = Math.max(1, P.cpu1.f - P.cpu0.f), sec = P.cpu1.T - P.cpu0.T, by = {};
       for (const [pid, v] of Object.entries(P.cpu1.c)) by[v.k] = (by[v.k] || 0) + 1000 * (v.t - ((P.cpu0.c[pid] || {}).t || 0)) / fr;
       for (const k of Object.keys(by)) by[k] = +by[k].toFixed(2);
       o.cpuMsPerFrame = by; say(`CPU ${P.role}: ms per guest frame by process ${JSON.stringify(by)} over ${fr} frames / ${sec.toFixed(0)} s`); }
+    // the audio a player heard: worklet underruns (gaps) and their silent samples, queue target, drops, the render
+    // side's reconciles, and the room's own clock rate (game time per wall time: what audio can follow at most)
+    try { const au = await P.page.evaluate(() => { const a = window.__mp4n && window.__mp4n.audio; if (!a) return null; const R = window.Mp4Room && Mp4Room.report(); const oc = R && R.engine && R.engine.rb && R.engine.rb.ownClock;
+        return { worklet: !!a.wlAud, ring: !!a.ring, gaps: a.gaps, gapSamples: a.gapSamples, drops: a.drops, muted: a.muted, nonSilent: a.nonSilent, target: a.q && a.q.target, ratio: a.q && a.q.last && +a.q.last[2].toFixed(4), reconciles: a.renderStats && a.renderStats[9], voiceResets: a.renderStats && a.renderStats[8], clockRate: oc ? oc.rate : null, lead: oc ? oc.lead : null }; });
+      o.audio = au; if (au) say(`AUDIO ${P.role}: ${JSON.stringify(au)}`); } catch (e) {}
     if (process.env.SENDTIME === '1') { try { say(`SENDTIME ${P.role}: ${JSON.stringify(await P.page.evaluate(() => window.__sendT))}`); } catch (e) {} }
     say(`SUMMARY ${PAGE} ${mode} ${P.role}: open@${o.openT}s window x=${o.win.x && o.win.x.toFixed(3)} min ${o.win.min && o.win.min.toFixed(3)} presented ${o.win.presented != null ? o.win.presented.toFixed(1) : '-'}/s host ${o.win.msPerFrame != null ? o.win.msPerFrame.toFixed(1) : '-'} ms/frame (n=${o.win.n}, first ${SKIP}s discarded)  steady x=${o.steady.x && o.steady.x.toFixed(3)}  stalls ${o.stalls}  desync=${o.desync} hc=${o.hc}  throttled ${o.cg.nr_throttled}/${o.cg.nr_periods}`);
     await P.page.screenshot({ path: path.join(OUTD, `${name}-${P.role}.png`) }).catch(() => {});
