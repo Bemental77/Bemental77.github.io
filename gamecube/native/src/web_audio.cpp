@@ -7,7 +7,11 @@
 // frame, which renders exactly the samples that frame covers (32000/60 per frame, the fraction
 // carried exactly), so every 5 ms tick happens at the same guest-frame position on every machine —
 // what netplay needs — and the guest never runs faster or slower than its frames.
-// The page (Module.mp4AudioPush) schedules each frame's samples on a WebAudio clock.
+// The samples themselves are not made here (the audio split, musyx hw_pc_split.h): the game's MusyX
+// runs everything the game can observe and logs the sample-level work; once per frame that log goes
+// to the page (Module.mp4AudioLog), whose audio module (dist/audio/, normally inside the
+// AudioWorklet) replays it into PCM. SAL_PC_NOSPLIT builds the single-module renderer, which pushes
+// PCM (Module.mp4AudioPush) as before.
 #include <emscripten.h>
 #include <cstdint>
 #include <cstring>
@@ -46,9 +50,25 @@ void output_callback(s16* output, size_t frames, u32 rate, u32 channels) {
 }
 }  // namespace
 
+#ifdef SAL_PC_NOSPLIT
 EM_JS(void, mp4web_audio_push_js, (const int16_t* pcm, int frames, int rate), {
   if (Module.mp4AudioPush) Module.mp4AudioPush(HEAP16.subarray(pcm >> 1, (pcm >> 1) + frames * 2), rate);
 });
+#else
+extern "C" {
+extern uint8_t* salPCLogBuf;
+extern uint32_t salPCLogLen, salPCLogOverflow, mp4web_audio_log_serial;
+void salPCLogFrame(uint32_t serial);
+}
+EM_JS(void, mp4web_audio_log_js, (const uint8_t* log, int len, int ok, int frames), {
+  if (Module.mp4AudioLog) Module.mp4AudioLog(HEAPU8.subarray(log, log + len), ok, frames);
+});
+// the end of a guest frame's audio: hand the log over, start the next (its header and resync snapshot)
+static void ship_log(int frames) {
+  mp4web_audio_log_js(salPCLogBuf, static_cast<int>(salPCLogLen), salPCLogOverflow ? 0 : 1, frames);
+  salPCLogFrame(++mp4web_audio_log_serial);
+}
+#endif
 
 extern "C" {
 
@@ -58,6 +78,9 @@ void partyboard_audio_unlock(void) {}
 void partyboard_audio_pre_init(void) {
   const SND_PC_CONFIG cfg{kRate, kChannels};
   sndPCConfigure(&cfg);
+#ifndef SAL_PC_NOSPLIT
+  salPCLogFrame(++mp4web_audio_log_serial);   // the first frame's header: the engine's init records follow it
+#endif
 }
 
 void partyboard_audio_start(void) {
@@ -98,11 +121,16 @@ static void process_reads() {
   }
 }
 
+static uint32_t sShipFrames = 0;    // samples the current log covers (host-side meaning only: the page's buffer size)
 static void render(uint32_t n) {
   static int16_t buf[(kRate / 60 + 2) * kChannels];
   if (n == 0 || !sndPCRender(buf, n)) return;
   sSamplesOut += n;
+#ifdef SAL_PC_NOSPLIT
   mp4web_audio_push_js(buf, static_cast<int>(n), static_cast<int>(kRate));
+#else
+  sShipFrames += n;
+#endif
 }
 
 // Called once per guest frame (web_port.cpp frame_limiter).
@@ -110,12 +138,17 @@ void mp4web_audio_frame(void) {
   process_reads();
   const uint64_t f = sFrames++;
   sDue += (kRate * (f + 1)) / 60 - (kRate * f) / 60;  // 533 or 534
-  if (!sStarted) { sRendered = sDue; return; }
-  if (sRendered < sDue) {
+  if (!sStarted) {
+    sRendered = sDue;
+  } else if (sRendered < sDue) {
     const uint32_t n = static_cast<uint32_t>(sDue - sRendered);
     render(n);
     sRendered = sDue;
   }
+#ifndef SAL_PC_NOSPLIT
+  ship_log(static_cast<int>(sShipFrames));
+  sShipFrames = 0;
+#endif
 }
 
 // One 5 ms engine cycle on demand (game/audio.c SNDGRP_WAIT); later frames render that much less.

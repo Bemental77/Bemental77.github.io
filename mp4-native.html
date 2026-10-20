@@ -124,35 +124,112 @@
     if (audio.ctx && audio.ctx.state === 'suspended') audio.ctx.resume();
     audioWorkletInit();
   }
-  // The steady path: an AudioWorklet fed one transferred Float32Array per frame, so a frame's samples cost
-  // one copy + one message instead of an AudioBuffer + a source node + a scheduled start (the per-frame node
-  // path was ~5% of the renderer's busy time on the toaster rig). Same policy as the node path: an empty
-  // queue restarts 50 ms ahead (a gap, counted), more than 300 ms queued drops the frame's chunk (counted).
-  // Used only when the context really runs at the game's 32 kHz; until the module has loaded (and
-  // otherwise) the node path below plays.
+  // THE AUDIO SPLIT (musyx hw_pc_split.h). The game's MusyX runs everything the game can observe and,
+  // once per guest frame, hands over a log of the sample-level work (Module.mp4AudioLog); the audio
+  // module (gamecube/native/dist/audio/mp4audio.wasm, the same MusyX sources built as the render half)
+  // replays it into PCM. Its home is the AudioWorklet: logs go there through a SharedArrayBuffer ring
+  // when the page is cross-origin isolated, else one transferred message per frame, and the worklet
+  // plays what it renders. If the worklet cannot run it (no AudioWorklet, a context not at 32 kHz, not
+  // loaded yet, ?audrec recording) a main-thread instance renders and the PCM path below plays it.
+  // A frame the page does not replay (a re-simulated or hidden room frame) is a serial gap: the next
+  // replayed frame resyncs the voices from its snapshot (decoder history restarts at zero there).
+  // Starving never blocks anything: an empty queue plays silence until 50 ms is buffered again.
+  function mkAudio(mod) {
+    var inst = new WebAssembly.Instance(mod, { env: { emscripten_notify_memory_growth: function () {} } });
+    var e = inst.exports; if (e._initialize) e._initialize();
+    var inPtr = 0, inCap = 0, outFrames = 32000, outPtr = e.malloc(outFrames * 4);
+    return {
+      render: function (u8) {
+        if (u8.length > inCap) { if (inPtr) e.free(inPtr); inCap = Math.max(65536, u8.length * 2); inPtr = e.malloc(inCap); }
+        new Uint8Array(e.memory.buffer, inPtr, u8.length).set(u8);
+        var n = e.salPCRenderLog(inPtr, u8.length, outPtr, outFrames);
+        return new Int16Array(e.memory.buffer, outPtr, n * 2);
+      },
+      stats: function () { return Array.prototype.slice.call(new Uint32Array(e.memory.buffer, e.salPCRenderStats(), 8)); }
+    };
+  }
+  // the log ring (cross-origin isolated): [u32 len][bytes, padded to 4] entries; Int32 head = bytes written, bytes read
+  var RING = 1 << 20;
+  function ringWrite(r, u8) {
+    var need = 4 + ((u8.length + 3) & ~3), w = Atomics.load(r.h, 0), rd = Atomics.load(r.h, 1);
+    if (RING - (w - rd) < need) return false;
+    var hdr = new Uint8Array(4); new DataView(hdr.buffer).setUint32(0, u8.length, true);
+    ringCopyIn(r.d, w, hdr); ringCopyIn(r.d, w + 4, u8);
+    Atomics.store(r.h, 0, w + need);
+    return true;
+  }
+  function ringCopyIn(d, at, src) { var o = at & (RING - 1), a = Math.min(src.length, RING - o); d.set(src.subarray(0, a), o); if (a < src.length) d.set(src.subarray(a), 0); }
+  // the worklet: plays PCM chunks (Float32Array messages: the single-module builds and the main-thread
+  // fallback) and, once it has the audio module, renders the logs itself
   function audioWorkletInit() {
     var ctx = audio.ctx;
     if (!ctx || !ctx.audioWorklet || typeof AudioWorkletNode === 'undefined' || ctx.sampleRate !== 32000) return;
-    var src = 'class P extends AudioWorkletProcessor{constructor(){super();this.q=[];this.h=0;this.avail=0;this.prime=true;this.used=0;this.gaps=0;this.t=0;' +
-      'this.port.onmessage=(e)=>{this.q.push(e.data);this.avail+=e.data.length>>1;};}' +
-      'process(_,outs){var L=outs[0][0],R=outs[0][1]||outs[0][0],m=L.length,k=0;' +
+    var src = mkAudio.toString() + 'var this_RING=' + RING + ';' +
+      'class P extends AudioWorkletProcessor{constructor(){super();this.q=[];this.h=0;this.avail=0;this.prime=true;this.used=0;this.gaps=0;this.drops=0;this.t=0;this.a=null;this.ring=null;this.logs=0;this.pushed=0;this.nonSilent=0;this.peak=0;' +
+      'this.port.onmessage=(e)=>{var d=e.data;if(d instanceof Float32Array){this.q.push(d);this.avail+=d.length>>1;}' +
+      'else if(d.mod){try{this.a=mkAudio(new WebAssembly.Module(d.mod));if(d.sab)this.ring={h:new Int32Array(d.sab,0,2),d:new Uint8Array(d.sab,8,this_RING)};this.echo=!!d.echo;this.port.postMessage({ready:1});}catch(x){this.port.postMessage({fail:String(x)});}}' +
+      'else if(d.log)this.feed(new Uint8Array(d.log));};}' +
+      'feed(u8){if(!this.a)return;var pcm=this.a.render(u8);this.logs++;var n=pcm.length>>1;if(!n)return;if(this.echo)this.port.postMessage({pcm:pcm.slice()});var pk=0,i;' +
+      'for(i=0;i<pcm.length;i++){var v=pcm[i]<0?-pcm[i]:pcm[i];if(v>pk)pk=v;}this.pushed+=n;if(pk>64)this.nonSilent+=n;if(pk>this.peak)this.peak=pk;' +
+      'if(this.avail+n>9600){this.drops++;return;}var f=new Float32Array(n*2);for(i=0;i<n*2;i++)f[i]=pcm[i]/32768;this.q.push(f);this.avail+=n;}' +
+      'poll(){var r=this.ring;if(!r)return;var w=Atomics.load(r.h,0),rd=Atomics.load(r.h,1);while(rd<w){var o=rd&(this_RING-1),hb=new Uint8Array(4);' +
+      'for(var k=0;k<4;k++)hb[k]=r.d[(o+k)&(this_RING-1)];var len=new DataView(hb.buffer).getUint32(0,true),b=new Uint8Array(len),s=(o+4)&(this_RING-1),a=Math.min(len,this_RING-s);' +
+      'b.set(r.d.subarray(s,s+a));if(a<len)b.set(r.d.subarray(0,len-a),a);rd+=4+((len+3)&~3);Atomics.store(r.h,1,rd);this.feed(b);}}' +
+      'process(_,outs){this.poll();var L=outs[0][0],R=outs[0][1]||outs[0][0],m=L.length,k=0;' +
       'if(this.prime&&this.avail<1600){L.fill(0);R.fill(0);}else{this.prime=false;' +
       'while(k<m&&this.q.length){var b=this.q[0],c=Math.min(m-k,(b.length>>1)-this.h);for(var x=0;x<c;x++){L[k+x]=b[2*(this.h+x)];R[k+x]=b[2*(this.h+x)+1];}' +
       'k+=c;this.h+=c;this.avail-=c;this.used+=c;if(this.h>=(b.length>>1)){this.q.shift();this.h=0;}}' +
       'if(k<m){for(;k<m;k++){L[k]=0;R[k]=0;}this.prime=true;this.gaps++;}}' +
-      'if(++this.t>=25){this.t=0;this.port.postMessage([this.used,this.gaps]);}return true;}}registerProcessor("mp4n-pcm",P);';
+      'if(++this.t>=25){this.t=0;this.port.postMessage({st:[this.used,this.gaps,this.drops,this.logs,this.pushed,this.nonSilent,this.peak],rs:this.a?this.a.stats():null});}return true;}}registerProcessor("mp4n-pcm",P);';
     var url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
     ctx.audioWorklet.addModule(url).then(function () {
       var node = new AudioWorkletNode(ctx, 'mp4n-pcm', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2] });
       node.connect(ctx.destination);
       audio.wlSent = 0; audio.wlUsed = 0;
-      node.port.onmessage = function (e) { audio.wlUsed = e.data[0]; audio.gaps = e.data[1]; };
+      node.port.onmessage = function (e) {
+        var d = e.data;
+        if (d.ready) { audio.wlAud = true; log('audio: the worklet renders (' + (audio.ring ? 'SharedArrayBuffer ring' : 'postMessage') + ')'); return; }
+        if (d.pcm) { if (audio.recLen < audio.rec.length) { var t = Math.min(d.pcm.length, audio.rec.length - audio.recLen); audio.rec.set(d.pcm.subarray(0, t), audio.recLen); audio.recLen += t; } return; }
+        if (d.fail) { audio.ring = null; log('audio: the worklet cannot run the audio module (' + d.fail + '); rendering on the main thread'); return; }
+        if (d.st) {
+          audio.wlUsed = d.st[0]; audio.gaps = d.st[1];
+          if (audio.wlAud) { audio.drops = d.st[2]; audio.wlLogs = d.st[3]; audio.pushed = d.st[4]; audio.nonSilent = d.st[5]; audio.peak = d.st[6]; audio.renderStats = d.rs; }
+        }
+      };
       audio.node = node;
+      audioModuleToWorklet();
     }).catch(function (e) { log('audio worklet unavailable (' + e + '); using buffer sources'); });
   }
+  function audioModuleToWorklet() {
+    if (!audio.node || !audio.mod || audio.modSent || (audio.rec && !Q.get('audwl'))) return;   // ?audrec records the main-thread instance (&audwl=1: the worklet's, echoed back)
+    audio.modSent = true;
+    var sab = null;
+    if (window.crossOriginIsolated && typeof SharedArrayBuffer === 'function') {
+      try { sab = new SharedArrayBuffer(8 + RING); audio.ring = { h: new Int32Array(sab, 0, 2), d: new Uint8Array(sab, 8, RING) }; } catch (e) { sab = null; }
+    }
+    audio.node.port.postMessage({ mod: audio.modBytes.slice(0), sab: sab, echo: !!(audio.rec && Q.get('audwl')) });   // the bytes: a WebAssembly.Module does not reach a worklet in every browser
+  }
+  function audioModuleLoad() {
+    fetch('gamecube/native/dist/audio/mp4audio.wasm').then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer();
+    }).then(function (b) { audio.modBytes = b; return WebAssembly.compile(b); }).then(function (mod) {
+      audio.mod = mod; audio.main = mkAudio(mod); audioModuleToWorklet();
+    }).catch(function (e) { log('audio module unavailable (' + e + '): no sound'); });
+  }
+  // one guest frame's log (ok = 0: it overflowed; the next frame resyncs)
+  function audioLog(u8, ok, frames) {
+    audio.logs = (audio.logs || 0) + 1; audio.logBytes = (audio.logBytes || 0) + u8.length;
+    if (window.Mp4Room && Mp4Room.pushMuted()) { audio.muted += frames; return; }   // a re-simulated or hidden room frame: already heard / not shown
+    if (!ok) { audio.overflows = (audio.overflows || 0) + 1; return; }
+    if (audio.wlAud) {
+      if (audio.ring) { if (!ringWrite(audio.ring, u8)) audio.ringFull = (audio.ringFull || 0) + 1; return; }
+      var c = u8.slice(); audio.node.port.postMessage({ log: c.buffer }, [c.buffer]); return;
+    }
+    if (audio.main) { var pcm = audio.main.render(u8); if (pcm.length) audioPush(pcm, 32000, true); }
+  }
 
-  function audioPush(pcm, rate) {
-    if (window.Mp4Room && Mp4Room.pushMuted()) { audio.muted += pcm.length >> 1; return; }   // a re-simulated or hidden room frame: already heard / not shown
+  function audioPush(pcm, rate, unmuted) {
+    if (!unmuted && window.Mp4Room && Mp4Room.pushMuted()) { audio.muted += pcm.length >> 1; return; }   // a re-simulated or hidden room frame: already heard / not shown
     var n = pcm.length >> 1, peak = 0, i;
     for (i = 0; i < pcm.length; i++) { var a = pcm[i] < 0 ? -pcm[i] : pcm[i]; if (a > peak) peak = a; }
     if (audio.rec && audio.recLen < audio.rec.length) { var take = Math.min(pcm.length, audio.rec.length - audio.recLen); audio.rec.set(pcm.subarray(0, take), audio.recLen); audio.recLen += take; }
@@ -186,6 +263,7 @@
     window.__mp4n.build = BUILD;
     log('build: ' + BUILD);
     audioInit();
+    audioModuleLoad();
     try {
       if (!navigator.gpu) throw new Error('this browser has no WebGPU');
       if (typeof DecompressionStream !== 'function') throw new Error('this browser has no DecompressionStream');
@@ -212,6 +290,7 @@
         canvas: canvas,
         mp4Disc: parts,
         mp4AudioPush: audioPush,
+        mp4AudioLog: audioLog,
         // memory-card saves persist in IndexedDB (?nosave=1: a fresh card every visit — what a
         // netplay session or a determinism test wants, since a save is game state)
         preRun: [function (M) {

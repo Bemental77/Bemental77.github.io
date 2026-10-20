@@ -95,6 +95,19 @@ EM_JS(void, mp4web_input_latch_js, (double frame, int32_t* out), {
   if (Module.mp4InputLatch) Module.mp4InputLatch(frame, out);
 });
 extern "C" void mp4web_audio_frame(void); // web_audio.cpp
+// The audio split's control -> render log (musyx hw_pc_split.h): the game's MusyX writes one guest
+// frame's worth here and web_audio.cpp hands it to the page, which replays it in the audio module.
+// Host-side output, outside the game's state on purpose (the control state never reads it back), and
+// the serial counts every frame shipped or not, so a frame the page did not replay (a muted
+// re-simulation, a hidden catch-up) is a gap the render side resyncs across.
+static uint8_t g_audioLog[512 * 1024];
+extern "C" {
+uint8_t* salPCLogBuf = g_audioLog;
+uint32_t salPCLogCap = sizeof(g_audioLog);
+uint32_t salPCLogLen = 0;
+uint32_t salPCLogOverflow = 0;
+uint32_t mp4web_audio_log_serial = 0;
+}
 static int32_t g_input[4][8];
 static void latch_input(uint64_t frame) {
   for (auto& p : g_input) for (auto& v : p) v = 0;
