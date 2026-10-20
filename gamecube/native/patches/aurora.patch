@@ -300,10 +300,10 @@ index c19185f..10d5ae6 100644
      m_ready = false;
      m_path.clear();
 diff --git a/lib/card/FileIO.hpp b/lib/card/FileIO.hpp
-index 98fa929..4db86b0 100644
+index 98fa929..de32026 100644
 --- a/lib/card/FileIO.hpp
 +++ b/lib/card/FileIO.hpp
-@@ -8,6 +8,24 @@
+@@ -8,6 +8,28 @@
  
  namespace aurora::card {
  
@@ -312,7 +312,11 @@ index 98fa929..4db86b0 100644
 +// in a room / determinism run (?nosave=1) the raw card image is an array in the game's rollback-covered
 +// range (gamecube/native/src/card_arena.c), not a file: a rewind then puts the card back with everything
 +// else. A FileIO whose path is MemCardPath reads and writes that image (the store barrier logs it).
-+inline constexpr const char* MemCardPath = "/mp4web-memcard";   // short: std::string keeps it inline (no heap pointer in the image)
++// ⚠ SHORT ENOUGH FOR std::string's INLINE BUFFER (libc++ on wasm32: 10 chars). The card object lives in
++// game memory and holds this path twice (std::filesystem::path, FileIO::m_path); a longer one is a pointer
++// into the C++ heap, whose addresses differ between two consoles — the first room built with
++// "/mp4web-memcard" desynced at frame 0. card.cpp checks it at CARDInit.
++inline constexpr const char* MemCardPath = "/mc";
 +struct MemCardImage {
 +  uint8_t* data = nullptr;     // image bytes, `cap` long
 +  size_t cap = 0;
@@ -378,7 +382,7 @@ index c2cb3bc..56d12f4 100644
      Log.debug("Initialized 0x{:X} bytes of ARAM!", aurora::g_config.mem2Size);
    } else {
 diff --git a/lib/dolphin/card.cpp b/lib/dolphin/card.cpp
-index 626ce4f..e7dc083 100644
+index 626ce4f..3339aad 100644
 --- a/lib/dolphin/card.cpp
 +++ b/lib/dolphin/card.cpp
 @@ -1,6 +1,10 @@
@@ -416,13 +420,23 @@ index 626ce4f..e7dc083 100644
  void CARDInit(const char* game, const char* maker) {
    if (Initialized) {
      return;
-@@ -161,6 +173,24 @@ void CARDInit(const char* game, const char* maker) {
+@@ -161,6 +173,34 @@ void CARDInit(const char* game, const char* maker) {
    Initialized = true;
    Log.info("CARD API Initialized BUILT <{} {}>", __DATE__, __TIME__);
  
 +#ifdef __EMSCRIPTEN__
 +  // ?nosave=1 and every room (Module.mp4MemCard): a fresh raw card in game memory, never a file
-+  const bool memCard = EM_ASM_INT({ return Module['mp4MemCard'] ? 1 : 0; }) != 0;
++  bool memCard = EM_ASM_INT({ return Module['mp4MemCard'] ? 1 : 0; }) != 0;
++  if (memCard) {
++    // the path must sit inside the string object (see MemCardPath), or the card object would hold a heap pointer
++    const std::filesystem::path probe{aurora::card::MemCardPath};
++    const auto* d = reinterpret_cast<const char*>(probe.native().data());
++    const auto* o = reinterpret_cast<const char*>(&probe.native());
++    if (d < o || d >= o + sizeof(probe.native())) {
++      Log.error("memory card disabled: its path is not stored inline (the card would not be deterministic)");
++      memCard = false;
++    }
++  }
 +  if (memCard) {
 +    static_assert(sizeof(aurora::card::CardRawFile) + 64 <= MemCardObjBytes, "card object outgrew its arena slot");
 +    SelectedFileType = CARD_RAWIMAGE;
@@ -441,7 +455,7 @@ index 626ce4f..e7dc083 100644
    for (int i = 0; i < CardChannels.size(); ++i) {
      switch (SelectedFileType) {
      case CARD_RAWIMAGE:
-@@ -190,7 +220,7 @@ void CARDInit(const char* game, const char* maker) {
+@@ -190,7 +230,7 @@ void CARDInit(const char* game, const char* maker) {
      const auto& curPath = cardPaths[i];
  
      std::error_code ec;
