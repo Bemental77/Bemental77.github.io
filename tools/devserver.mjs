@@ -106,6 +106,9 @@ const server = http.createServer((req, res) => {
     // a relink is the torn-pair failure that has faked emulator bugs here.
     'Cache-Control': 'no-store',
   };
+  // DEVSERVER_COI=1: serve every page cross-origin isolated (COOP/COEP), as a visitor whose origin a
+  // coi-serviceworker page has already isolated sees it — to exercise SharedArrayBuffer-only paths
+  if (process.env.DEVSERVER_COI) { base['Cross-Origin-Opener-Policy'] = 'same-origin'; base['Cross-Origin-Embedder-Policy'] = 'require-corp'; }
 
   if (req.headers['if-none-match'] === etag) { res.writeHead(304, base); return res.end(); }
 

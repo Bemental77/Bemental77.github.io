@@ -10,11 +10,12 @@
 #   DEPS=/home/user/mp4native/deps  SDL-release-3.2.4, abseil lts_20240722, fmt 11.1.4, imgui 1.91.9b,
 #                                 xxhash 0.8, nlohmann_json, sqlite-amalgamation-3510300
 #   BUILD=/home/user/mp4native/build   (objects ~10 MB; out/mp4native.{js,wasm})
-#   STAGE=aurora|game|rel|link|all (default all)
+#   STAGE=aurora|game|rel|audio|link|all (default all)
 # Source patches (apply once to fresh checkouts): patches/aurora.patch (git apply in aurora/),
 # patches/partyboard.patch (in partyboard/), patches/musyx.patch (patch -p1 in musyx/),
 # patches/imgui.patch (patch -p1 in DEPS/imgui).
-# Then: copy BUILD/out/mp4native.{js,wasm} to gamecube/native/dist/ and BUILD/out/rb/* to dist/rb/, and open
+# Then: copy BUILD/out/mp4native.{js,wasm} to gamecube/native/dist/, BUILD/out/rb/* to dist/rb/, BUILD/out/audio/mp4audio.wasm
+# to dist/audio/, and open
 # /mp4-native.html (solo loads dist/, a room loads dist/rb/).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -123,6 +124,20 @@ fi
 if [ "$STAGE" = rel ] || [ "$STAGE" = all ]; then
   printf '%s\n' "${CF[@]}" "${GAMEF[@]}" -include "$HERE/shim/det_alloc.h" > "$BUILD/rel_cflags.txt"
   python3 "$HERE/rel_build.py" "$BUILD" "$PB" "$BUILD/rel_cflags.txt"
+fi
+# ---- the audio module (OUT/audio/mp4audio.wasm): the render half of the game's MusyX (musyx
+# hw_pc_split.h), built from the same sources with SAL_PC_RENDER and the game's code-generation flags
+# (-ftrivial-auto-var-init=zero, the MUSY_* version), standalone (no JS glue): the page instantiates it
+# in the AudioWorklet, and on the main thread where no worklet can run it ----
+if [ "$STAGE" = audio ] || [ "$STAGE" = link ] || [ "$STAGE" = all ]; then
+  OUT="${OUT:-$BUILD/out}"; mkdir -p "$OUT/audio"; R="$MX/src/musyx/runtime"
+  emcc -O2 -std=gnu11 -mbulk-memory -DSAL_PC_RENDER -DTARGET_PC -DNON_MATCHING -DMUSY_VERSION_MAJOR=2 -DMUSY_VERSION_MINOR=0 -DMUSY_VERSION_PATCH=0 \
+    -DMUSY_TARGET=MUSY_TARGET_PC -I"$MX/include" -ftrivial-auto-var-init=zero -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types \
+    "$R/hw_pc.c" "$R/hw_pc_decode.c" "$R/hw_pc_rate.c" "$R/StdReverb/reverb.c" "$R/StdReverb/reverb_fx.c" "$R/CheapReverb/creverb.c" \
+    "$R/CheapReverb/creverb_fx.c" "$R/Chorus/chorus_fx.c" "$R/Delay/delay_fx.c" \
+    -sSTANDALONE_WASM --no-entry -sEXPORTED_FUNCTIONS=_salPCRenderLog,_salPCRenderStats,_malloc,_free -sALLOW_MEMORY_GROWTH=1 \
+    -sINITIAL_MEMORY=16777216 -sFILESYSTEM=0 -o "$OUT/audio/mp4audio.wasm" 2> "$OUT/audio/build.log" \
+    && echo "[audio] ok $(stat -c %s "$OUT/audio/mp4audio.wasm") B wasm" || { echo "[audio] FAIL"; head -c 3000 "$OUT/audio/build.log"; exit 1; }
 fi
 # ---- link: one module, Asyncify (the game loop and libco fibers block; the browser must run) ----
 if [ "$STAGE" = link ] || [ "$STAGE" = all ]; then
