@@ -154,13 +154,45 @@ EM_JS(int, mp4web_debug_turns, (void), { return (typeof Module.mp4DebugTurns ===
 extern "C" EMSCRIPTEN_KEEPALIVE void mp4web_set_catchup(double capFrames, double ratePerFrame) {
   g_catchCap = capFrames; g_catchRate = ratePerFrame; if (g_catchTokens > g_catchCap) g_catchTokens = g_catchCap;
 }
+// REPAID DEBT (a room, mp4n_room.js: mp4web_set_pacing(1000, 1.0167)). The guest averages exactly 1.000x of wall time:
+// lateness of up to carryMs (re-simulation time included, it is lateness like any other) is kept and repaid by running
+// frames early, but no frame starts sooner than period/maxRate after the previous live one and no 5 s window holds more
+// than 300*maxRate live frames, so catch-up never exceeds maxRate. A frame is never started before its due time (the
+// guest never runs ahead of wall time). Debt over carryMs is a real stall (a hidden tab, a long load): forgiven, so
+// nothing sprints for long. maxRate 0 = the solo rule (g_maxDebt, unthrottled catch-up).
+static double g_carryMs = 0.0, g_maxRate = 0.0;
+static double g_win[512];          // start times of the last live frames (a ring), for the 5 s window
+static unsigned g_winN = 0, g_winHead = 0;
+static double g_lastStart = -1.0;
+static uint64_t g_forgiven = 0;    // debts dropped (each a stall over carryMs)
+static double g_forgivenMs = 0.0;
+extern "C" EMSCRIPTEN_KEEPALIVE void mp4web_set_pacing(double carryMs, double maxRate) { g_carryMs = carryMs; g_maxRate = maxRate; }
+extern "C" EMSCRIPTEN_KEEPALIVE void mp4web_pacing_stats(double* out) {
+  out[0] = static_cast<double>(g_forgiven); out[1] = g_forgivenMs;
+  out[2] = g_t0 >= 0 ? emscripten_get_now() - (g_t0 + static_cast<double>(g_frame) * (1000.0 / 60.0)) : 0.0;   // current debt, ms
+}
+// the earliest a live frame may start under the rate cap
+static double pacing_earliest(double period) {
+  double e = g_lastStart >= 0 ? g_lastStart + period / g_maxRate : 0.0;
+  const unsigned cap = static_cast<unsigned>(300.0 * g_maxRate);   // live frames per 5 s
+  if (g_winN >= cap && cap > 0 && cap <= 512) {
+    const double oldest = g_win[(g_winHead + 512 - cap) & 511];      // the cap-th most recent start
+    if (oldest + 5000.0 > e) e = oldest + 5000.0;
+  }
+  return e;
+}
+static void pacing_started(double t) {
+  g_lastStart = t; g_win[g_winHead] = t; g_winHead = (g_winHead + 1) & 511; if (g_winN < 512) ++g_winN;
+}
 
 // The hook's answer, a bit set:
 //   1  re-anchor the pacing clock (after a restore that is not a room rewind)
 //   2  HOLD: do not run the next frame yet — sleep 2 ms and ask again (a room waiting on input)
 //   4  OFF-SCHEDULE: this frame is a re-simulation or a hidden catch-up — run it at once, no
 //      sleep, and do not count it against the 60 Hz schedule
-enum { kHookReanchor = 1, kHookHold = 2, kHookOffSchedule = 4 };
+//   8  (with 4) RE-SIMULATION: not new game time. Under repaid debt (mp4web_set_pacing) only a re-simulation
+//      runs off schedule; a hidden catch-up frame (4 alone) is paced like any live frame, just not drawn
+enum { kHookReanchor = 1, kHookHold = 2, kHookOffSchedule = 4, kHookResim = 8 };
 
 // FRAME SKIP — the guest keeps 1.000x, the picture gives. A frame Aurora does not draw costs a few
 // ms instead of the whole GPU frame (measured on SwiftShader: ~4 vs ~94 ms), and drawing is the
@@ -196,7 +228,25 @@ extern "C" void frame_limiter() {
   }
   now = emscripten_get_now();
   if (fl & kHookReanchor) { g_t0 = now; g_frame = 0; }
-  if (!(fl & kHookOffSchedule)) {
+  if (g_maxRate > 0.0 && !(fl & kHookOffSchedule && fl & kHookResim)) {
+    // REPAID DEBT: every live frame (drawn or hidden) takes one period of the schedule
+    ++g_frame;
+    double due = g_t0 + static_cast<double>(g_frame) * period;
+    const double late = now - due;
+    if (late > g_carryMs) { ++g_forgiven; g_forgivenMs += late; g_t0 = now - static_cast<double>(g_frame) * period; due = now; ++g_reanchors; }
+    double start = due > now ? due : now;
+    const double earliest = pacing_earliest(period);
+    if (earliest > start) start = earliest;
+    if (!mp4web_gfx_skip_draws && !(fl & kHookOffSchedule)) {
+      if (late > 0.5 * period && g_skipRun < g_skipMax && !mp4web_gx_copy_redraw) { mp4web_gfx_skip_draws = 1; ++g_skipRun; ++g_autoSkipped; }
+      else g_skipRun = 0;
+    }
+    const double wait = start - now;
+    emscripten_sleep(wait > 0 ? static_cast<unsigned>(wait) : 0);
+    // the cap is kept on INTENDED start times: a timer that wakes late must not push the next frame's earliest start
+    // later too, or a console behind the clock could never repay (every interval = period/maxRate + oversleep)
+    pacing_started(start);
+  } else if (!(fl & kHookOffSchedule)) {
     ++g_frame;
     double due = g_t0 + static_cast<double>(g_frame) * period;
     // lateness is read BEFORE the debt cap re-anchors the clock: a room caps the debt at one frame,

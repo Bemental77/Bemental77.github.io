@@ -19,13 +19,12 @@
 //   2. a rewind in progress: run the next re-simulated frame with its agreed input, muted.
 //   3. otherwise ask the room: beginFrame(myPad) -> not ready: HOLD; a rollback: rb_restore(from)
 //      and queue the corrected frames, then the live one; else run frame k with the room's image.
-// Guest speed: a live frame is paced by frame_limiter at exactly 60 Hz with its debt capped at
-// one frame (mp4web_set_max_debt), so nothing sprints; the only frames that run faster than the
-// clock are re-simulations (never presented as new time) and the hidden catch-up frames the
-// engine grants and caps itself (lib/netplay.js rbCatchUp / _ocAllow).
+// Guest speed: every live frame (drawn, or hidden as a catch-up) is paced by frame_limiter against wall time, its
+// lateness (re-simulation time included) repaid at no more than 1.0167x over any 5 s and forgiven past 1 s
+// (mp4web_set_pacing); the only frames that run off the clock are re-simulations (never new game time).
 (function () {
   'use strict';
-  var HOOK_REANCHOR = 1, HOOK_HOLD = 2, HOOK_OFF = 4;
+  var HOOK_REANCHOR = 1, HOOK_HOLD = 2, HOOK_OFF = 4, HOOK_RESIM = 8;
   var GAME_ID = 'mp4native';
   var PAD_BYTES = 8;
   var ROOM_EPOCH = 55814400;            // 2001-10-08 00:00 in GC seconds-since-2000: any fixed value works; every console uses this one
@@ -187,8 +186,10 @@
       if (rc <= 0) { fail('this build cannot rewind (rb_enable ' + rc + ')'); return false; }
       R.rbOn = true;
     }
-    mod._mp4web_set_max_debt(1000 / 60);
-    if (mod._mp4web_set_catchup) mod._mp4web_set_catchup(2.5, 1 / 120);   // a stall's time may be made up, never faster than 1.0167x per 5 s
+    // the guest averages exactly 1.000x of wall time: lateness up to 1 s (re-simulation time included) is repaid, never
+    // faster than 1.0167x over any 5 s window and never ahead of wall time; a longer stall is forgiven (web_port.cpp)
+    if (mod._mp4web_set_pacing) mod._mp4web_set_pacing(1000, 1.0167);
+    else { mod._mp4web_set_max_debt(1000 / 60); if (mod._mp4web_set_catchup) mod._mp4web_set_catchup(2.5, 1 / 120); }
     R.armed = true; R.next = 0; R.lastRan = -1;
     if (R.rbOn) R.hashAt[0] = mod._mp4web_rb_hash();
     R.log('room: armed at frame 0 — ports ' + JSON.stringify(ls.roster) + ', mine ' + JSON.stringify(ls.localPorts) + ', want ' + R.want);
@@ -349,7 +350,7 @@
     var skip = (quiet || !live) ? 1 : 0;  // nor drawn: Aurora skips its render passes and the present (game state is untouched)
     if (skip) R.stats.undrawn++;
     if (R.mod._mp4web_set_gfx_skip) R.mod._mp4web_set_gfx_skip(skip);
-    return skip ? HOOK_OFF : 0;
+    return skip ? (live ? HOOK_OFF : HOOK_OFF | HOOK_RESIM) : 0;   // a hidden live frame is paced like any other (repaid debt)
   }
 
   function attach(mod) {
