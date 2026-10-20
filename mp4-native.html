@@ -182,7 +182,7 @@
   // the worklet: plays PCM chunks (Float32Array messages: the single-module builds and the main-thread
   // fallback) and, once it has the audio module, renders the logs itself
   // THE WORKLET (its source is this function's text). One ring of float stereo samples at 32 kHz holds what is
-  // queued. The read position advances by a playback ratio trimmed gently (smoothed; +-1.5% at most outside a burst or a near-empty queue) to hold the
+  // queued. The read position advances by a playback ratio trimmed gently (smoothed; +-1% at most, except the last 20 ms before empty) to hold the
   // queue at TARGET (60 ms; each underrun adds 20 ms up to 150 ms, 30 s without one takes 5 ms back: a room whose
   // frames arrive in 50-100 ms bursts after rollbacks and holds settles deeper, a steady solo game stays at 60 ms), so a producer that runs a little fast or slow never makes it overflow or starve; the
   // guest's own rate is untouched (this only stretches when the queued samples are heard). Only an empty queue is
@@ -247,16 +247,15 @@
         else {
           this.prime = false;
           // proportional + integral: the integral follows the rate game time actually arrives at (a room whose holds
-          // leave it at 0.99x of the wall clock, the host clock vs the audio device's) within +-1.5%; the
-          // proportional term rides out the frame-to-frame sawtooth. A queue under 40% of TARGET (a late frame) may
-          // slow playback to 0.97 for a moment, which is far less audible than a gap; one over twice TARGET (the
-          // catch-up burst after a hold) drains at up to 1.02. After an underrun, play resumes at TARGET/2.
+          // leave it at 0.99x of the wall clock, the host clock vs the audio device's) within +-1%; the
+          // proportional term rides out the frame-to-frame sawtooth. The trim stays within +-1% (3% is about half a
+          // semitone, audible on sustained music) except in the last 20 ms before empty, where it may slow to 0.97 for
+          // a moment rather than gap. After an underrun, play resumes at TARGET/2.
           var e = (q - TARGET) / TARGET;
-          this.integ = Math.max(-0.015, Math.min(0.015, (this.integ || 0) + e * 0.00004));
-          var low = q < 0.4 * TARGET;
-          var high = q > 2 * TARGET;   // a burst (catch-up frames after a hold): drain it within a few seconds
-          var want = Math.max(low ? 0.97 : 0.98, Math.min(high ? 1.02 : 1.015, 1 + 0.004 * e + this.integ));
-          this.ratio += (want - this.ratio) * (low || high ? 0.25 : 0.02);
+          this.integ = Math.max(-0.01, Math.min(0.01, (this.integ || 0) + e * 0.00004));
+          var low = q < 640;   // the last 20 ms before empty
+          var want = Math.max(low ? 0.97 : 0.99, Math.min(1.01, 1 + 0.004 * e + this.integ));
+          this.ratio += (want - this.ratio) * (low ? 0.25 : 0.02);
           if (this.ratio < this.rMin) this.rMin = this.ratio; if (this.ratio > this.rMax) this.rMax = this.ratio;
           for (; k < m; k++) {
             if (this.w - this.r < 2) break;
