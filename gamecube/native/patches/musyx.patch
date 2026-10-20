@@ -451,7 +451,7 @@ index 0000000..965b1c5
 +  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 +};
 diff --git a/src/musyx/runtime/hw_pc.c b/src/musyx/runtime/hw_pc.c
-index 65abcc5..0140153 100644
+index 65abcc5..57fdb25 100644
 --- a/src/musyx/runtime/hw_pc.c
 +++ b/src/musyx/runtime/hw_pc.c
 @@ -1,10 +1,12 @@
@@ -597,7 +597,7 @@ index 65abcc5..0140153 100644
    for (int i = 0; i < frames; ++i) {
      state->itdHistory[state->itdIndex & 127] = voiceDecodeBuf[i];
      for (u32 channel = 0; channel < 2; ++channel) {
-@@ -343,42 +401,270 @@ static int renderVoiceSegment(DSPvoice *vp, s32 *mainL, s32 *mainR, s32 *mainS,
+@@ -343,42 +401,292 @@ static int renderVoiceSegment(DSPvoice *vp, s32 *mainL, s32 *mainR, s32 *mainS,
    return voiceDone;
  }
  
@@ -721,9 +721,26 @@ index 65abcc5..0140153 100644
 +  return numSamples;
 +}
 +
++/* DELTA: a voice's VCYCLE goes out on its first segment of each guest frame (so a render side that reconciled at
++ * the frame's start has it) and after that only when a field changed; SEG2 carries the pitch only when it changed.
++ * The render side keeps the values and applies the same end-of-cycle step (lastVol = vol) the control side does. */
++static SalRecVCycle sentVCycle[SYNTH_MAX_VOICES];
++static u8 sentVCycleThisFrame[SYNTH_MAX_VOICES];
++static u32 sentPitch[SYNTH_MAX_VOICES];
++static u8 sentPitchThisFrame[SYNTH_MAX_VOICES];
++static void fillVCycle(SalRecVCycle *r, DSPvoice *vp, u32 voiceIdx);
 +static void logVCycle(DSPvoice *vp, u32 voiceIdx) {
++  SalRecVCycle now;
++  memset(&now, 0, sizeof now);
++  fillVCycle(&now, vp, voiceIdx);
++  if (sentVCycleThisFrame[voiceIdx] && !memcmp(&now, &sentVCycle[voiceIdx], sizeof now)) return;
 +  SalRecVCycle *r = logPut(SALR_VCYCLE, sizeof(SalRecVCycle));
 +  if (!r) return;
++  *r = now;
++  sentVCycle[voiceIdx] = now;
++  sentVCycleThisFrame[voiceIdx] = 1;
++}
++static void fillVCycle(SalRecVCycle *r, DSPvoice *vp, u32 voiceIdx) {
 +  r->voice = voiceIdx; r->studio = vp->studio;
 +  logSample(&r->smp, vp);
 +  const u16 v[9] = {vp->volL, vp->volR, vp->volS, vp->volLa, vp->volRa, vp->volSa, vp->volLb, vp->volRb, vp->volSb};
@@ -758,10 +775,13 @@ index 65abcc5..0140153 100644
 +  /* the bytes this segment reads (DATA) go first, so the render side has them when it runs the SEG */
 +  VoiceResamplerState *state = &voiceResampler[voiceIdx];
 +  controlResample(vp, voiceIdx, frameSamples, pitch);
-+  SalRecSeg *r = logPut(SALR_SEG, sizeof(SalRecSeg));
++  (void)frameOffset;   /* the render side has segmentOffset (CYCLE) */
++  const int withPitch = !sentPitchThisFrame[voiceIdx] || sentPitch[voiceIdx] != pitch;
++  u8 *r = logPut(SALR_SEG2, withPitch ? 12 : 8);
 +  if (r) {
-+    r->voice = voiceIdx; r->subframe = subframe; r->frameOffset = (u32)frameOffset; r->frameSamples = (u32)frameSamples;
-+    r->pitch = pitch; r->adsrStart = adsrStart; r->adsrEnd = adsrEnd; r->buffers = buffers;
++    r[0] = (u8)voiceIdx; r[1] = (u8)subframe; r[2] = (u8)buffers; r[3] = (u8)withPitch;
++    ((u16 *)r)[2] = adsrStart; ((u16 *)r)[3] = adsrEnd;
++    if (withPitch) { memcpy(r + 8, &pitch, 4); sentPitch[voiceIdx] = pitch; sentPitchThisFrame[voiceIdx] = 1; }
 +  }
 +  const u32 tail = vp->srcTypeSelect == SAL_SRC_NONE ? 1 : vp->srcTypeSelect == SAL_SRC_LINEAR ? 2 : POLYPHASE_TAPS;
 +  return state->tail >= tail;
@@ -807,6 +827,8 @@ index 65abcc5..0140153 100644
 +void salPCLogFrame(u32 serial) {
 +  salPCLogLen = 0;
 +  salPCLogOverflow = 0;
++  memset(sentVCycleThisFrame, 0, sizeof(sentVCycleThisFrame));
++  memset(sentPitchThisFrame, 0, sizeof(sentPitchThisFrame));
 +  u32 nv = 0;
 +  for (u32 v = 0; v < salNumVoices; ++v) if (dspVoice && dspVoice[v].state != DSP_VOICE_STATE_INACTIVE) ++nv;
 +  u32 na = 0;
@@ -889,7 +911,7 @@ index 65abcc5..0140153 100644
          if (vp->postBreak || (vp->changed[0] & 0x20)) {
            if (vp->state != DSP_VOICE_STATE_STARTING || vp->startupBreak) {
              salDeactivateVoice(vp);
-@@ -389,7 +675,6 @@ void salCtrlDsp(s16 *dest) {
+@@ -389,7 +697,6 @@ void salCtrlDsp(s16 *dest) {
            vp->changed[0] &= ~0x20u;
          }
  
@@ -897,7 +919,7 @@ index 65abcc5..0140153 100644
          if (vp->state == DSP_VOICE_STATE_STARTING) {
            if (adsrSetup(&vp->adsr) != 0) {
              salSynthSendMessage(vp, HW_MESSAGE_SAMPLE_END);
-@@ -397,7 +682,6 @@ void salCtrlDsp(s16 *dest) {
+@@ -397,7 +704,6 @@ void salCtrlDsp(s16 *dest) {
              vp = nextVp;
              continue;
            }
@@ -905,7 +927,7 @@ index 65abcc5..0140153 100644
            vp->virtualSampleID = UINT32_MAX;
            if (vp->smp_info.compType == SAMPLE_TYPE_ADPCM_VIRTUAL) {
              vp->vSampleInfo.loopBufferAddr = NULL;
-@@ -411,18 +695,10 @@ void salCtrlDsp(s16 *dest) {
+@@ -411,18 +717,10 @@ void salCtrlDsp(s16 *dest) {
                continue;
              }
            }
@@ -928,7 +950,7 @@ index 65abcc5..0140153 100644
  
            VoiceResamplerState *native = &voiceResampler[voiceIdx];
            memset(native, 0, sizeof(*native));
-@@ -434,36 +710,27 @@ void salCtrlDsp(s16 *dest) {
+@@ -434,36 +732,29 @@ void salCtrlDsp(s16 *dest) {
              vp = nextVp;
              continue;
            }
@@ -941,6 +963,8 @@ index 65abcc5..0140153 100644
 +              r->itd0 = native->itdDelay[0]; r->itd1 = native->itdDelay[1];
 +              fillAdpcm(&r->adpcm, vp);
 +              sentAdpcm[voiceIdx] = r->adpcm;
++              sentVCycleThisFrame[voiceIdx] = 0;   /* a new note: its first segment sends a VCYCLE */
++              sentPitchThisFrame[voiceIdx] = 0;
 +            }
 +          }
            vp->playInfo.posHi = native->reader.position;
@@ -977,7 +1001,7 @@ index 65abcc5..0140153 100644
            for (u8 subframe = mixStart; subframe < SAL_SUBFRAMES; ++subframe) {
              renderOffset = segmentOffset[subframe];
              if ((vp->changed[subframe] & 0x20) != 0) {
-@@ -472,13 +739,11 @@ void salCtrlDsp(s16 *dest) {
+@@ -472,13 +763,11 @@ void salCtrlDsp(s16 *dest) {
                finished = 1;
                break;
              } else if (vp->postBreak == 0) {
@@ -992,7 +1016,7 @@ index 65abcc5..0140153 100644
              if ((vp->changed[subframe] & 0x10) != 0) {
                if (adsrSetup(&vp->adsr) != 0) {
                  salSynthSendMessage(vp, HW_MESSAGE_SAMPLE_END);
-@@ -487,17 +752,14 @@ void salCtrlDsp(s16 *dest) {
+@@ -487,17 +776,14 @@ void salCtrlDsp(s16 *dest) {
                  break;
                }
              }
@@ -1012,7 +1036,7 @@ index 65abcc5..0140153 100644
              renderOffset = segmentOffset[subframe + 1];
              if (sampleDone) {
                salSynthSendMessage(vp, HW_MESSAGE_SAMPLE_END);
-@@ -505,7 +767,6 @@ void salCtrlDsp(s16 *dest) {
+@@ -505,7 +791,6 @@ void salCtrlDsp(s16 *dest) {
                finished = 1;
                break;
              }
@@ -1020,7 +1044,7 @@ index 65abcc5..0140153 100644
              if (adsrDone) {
                salSynthSendMessage(vp, HW_MESSAGE_SAMPLE_END);
                salDeactivateVoice(vp);
-@@ -513,22 +774,13 @@ void salCtrlDsp(s16 *dest) {
+@@ -513,22 +798,13 @@ void salCtrlDsp(s16 *dest) {
                break;
              }
            }
@@ -1048,7 +1072,7 @@ index 65abcc5..0140153 100644
            if (finished) {
              vp = nextVp;
              continue;
-@@ -538,6 +790,42 @@ void salCtrlDsp(s16 *dest) {
+@@ -538,6 +814,42 @@ void salCtrlDsp(s16 *dest) {
        vp = nextVp;
      }
  
@@ -1091,7 +1115,7 @@ index 65abcc5..0140153 100644
      for (u32 channel = 0; channel < 11; ++channel) {
        s32 *buffer = channel < 3   ? stp->main[salFrame]
                      : channel < 6 ? stp->auxA[salAuxFrame]
-@@ -653,11 +941,9 @@ void salCtrlDsp(s16 *dest) {
+@@ -653,11 +965,9 @@ void salCtrlDsp(s16 *dest) {
            foldStereoToOutput(dpl2Rear, dpl2Rear + SAL_SAMPLES_PER_FRAME);
        }
      }
@@ -1105,7 +1129,7 @@ index 65abcc5..0140153 100644
    if (dest) {
      u32 channels = salPCChannels();
      for (u32 i = 0; i < cycleFrames; ++i) {
-@@ -681,7 +967,663 @@ void salCtrlDsp(s16 *dest) {
+@@ -681,7 +991,693 @@ void salCtrlDsp(s16 *dest) {
      }
    }
  }
@@ -1147,7 +1171,7 @@ index 65abcc5..0140153 100644
 +          }
 +          vp->changed[0] &= ~0x20u;
 +        }
-+
+ 
 +        /* New voice initialization (mirrors salBuildCommandList startup path) */
 +        if (vp->state == DSP_VOICE_STATE_STARTING) {
 +          if (adsrSetup(&vp->adsr) != 0) {
@@ -1318,6 +1342,7 @@ index 65abcc5..0140153 100644
 +u8 salFrame, salAuxFrame, salNumVoices, salMaxStudioNum;
 +static DSPvoice rVoices[SYNTH_MAX_VOICES];
 +static DSPADPCMplusInfo rAdpcm[SYNTH_MAX_VOICES];
++static u32 rPitch[SYNTH_MAX_VOICES];
 +static u32 rRate = 32000, rChannels = 2;
 +u32 salPCMixRate(void) { return rRate; }
 +u32 salPCChannels(void) { return rChannels; }
@@ -1441,7 +1466,7 @@ index 65abcc5..0140153 100644
 +  *handler = type == SAL_AUXT_REVHI ? sndAuxCallbackReverbHI : type == SAL_AUXT_REVSTD ? sndAuxCallbackReverbSTD
 +             : type == SAL_AUXT_CHORUS ? sndAuxCallbackChorus : sndAuxCallbackDelay;
 +}
- 
++
 +static void renderActivateStudio(u32 st, u32 isMaster, u32 type) {
 +  DSPstudioinfo *state = &dspStudio[st];
 +  memset(state->main[0], 0, SAL_PC_STUDIO_BYTES);
@@ -1734,8 +1759,37 @@ index 65abcc5..0140153 100644
 +      break;
 +    }
 +    case SALR_VEND:
-+      if (w[0] < SYNTH_MAX_VOICES) { voiceResampler[w[0]].itdDelay[0] = w[1]; voiceResampler[w[0]].itdDelay[1] = w[2]; }
++      if (w[0] < SYNTH_MAX_VOICES) {
++        voiceResampler[w[0]].itdDelay[0] = w[1]; voiceResampler[w[0]].itdDelay[1] = w[2];
++        DSPvoice *vp = &rVoices[w[0]];   /* the control side's end-of-cycle step: VCYCLE is sent only on change */
++        vp->lastVolL = vp->volL; vp->lastVolR = vp->volR; vp->lastVolS = vp->volS;
++        vp->lastVolLa = vp->volLa; vp->lastVolRa = vp->volRa; vp->lastVolSa = vp->volSa;
++        vp->lastVolLb = vp->volLb; vp->lastVolRb = vp->volRb; vp->lastVolSb = vp->volSb;
++        vp->lastVolRear[0] = vp->volRear[0]; vp->lastVolRear[1] = vp->volRear[1];
++      }
 +      break;
++    case SALR_SEG2: {
++      const u8 *b = d;
++      const u32 v = b[0], sub = b[1], bufs = b[2];
++      if (v >= SYNTH_MAX_VOICES || !stp || sub >= SAL_SUBFRAMES) break;
++      if (b[3]) memcpy(&rPitch[v], b + 8, 4);
++      ++rStats[6];
++      DSPvoice *vp = &rVoices[v];
++      vp->playInfo.pitch = rPitch[v];
++      vp->pitch[0] = rPitch[v];
++      s32 *studioMain = (bufs & 1) ? stp->main[salFrame] : NULL;
++      s32 *auxACur = (bufs & 2) ? stp->auxA[salAuxFrame] : NULL;
++      s32 *auxBCur = (bufs & 4) ? stp->auxB[salAuxFrame] : NULL;
++      const int off = (int)segmentOffset[sub], cnt = (int)(segmentOffset[sub + 1] - segmentOffset[sub]);
++      renderOffset = segmentOffset[sub];
++      renderVoiceSegment(vp, studioMain, studioMain ? studioMain + SAL_SAMPLES_PER_FRAME : NULL,
++                         studioMain ? studioMain + SAL_SAMPLES_PER_FRAME * 2 : NULL, auxACur,
++                         auxACur ? auxACur + SAL_SAMPLES_PER_FRAME : NULL, auxACur ? auxACur + SAL_SAMPLES_PER_FRAME * 2 : NULL,
++                         auxBCur, auxBCur ? auxBCur + SAL_SAMPLES_PER_FRAME : NULL, auxBCur ? auxBCur + SAL_SAMPLES_PER_FRAME * 2 : NULL,
++                         v, off, cnt, ((const u16 *)b)[2], ((const u16 *)b)[3]);
++      renderOffset = segmentOffset[sub + 1];
++      break;
++    }
 +    case SALR_STUDIO_END: {
 +      const SalRecStudioEnd *o = (const SalRecStudioEnd *)d;
 +      if (o->studio >= 8) break;
@@ -1769,7 +1823,7 @@ index 65abcc5..0140153 100644
  bool salInitAi(SND_SOME_CALLBACK callback, u32 flags, u32 *outFreq) {
    (void)flags;
    salPCResetOutput(callback);
-@@ -690,6 +1632,10 @@ bool salInitAi(SND_SOME_CALLBACK callback, u32 flags, u32 *outFreq) {
+@@ -690,6 +1686,10 @@ bool salInitAi(SND_SOME_CALLBACK callback, u32 flags, u32 *outFreq) {
    memset(depop, 0, sizeof(depop));
    depopCursor = renderOffset = 0;
    initResampleTables();
@@ -1780,7 +1834,7 @@ index 65abcc5..0140153 100644
    synthInfo.numSamples = 32;
    *outFreq = salPCMixRate();
    return true;
-@@ -760,6 +1706,10 @@ void salActivateStudio(u8 studio, u32 isMaster, SND_STUDIO_TYPE type) {
+@@ -760,6 +1760,10 @@ void salActivateStudio(u8 studio, u32 isMaster, SND_STUDIO_TYPE type) {
    state->type = type;
    state->auxAHandler = state->auxBHandler = NULL;
    state->auxAUser = state->auxBUser = NULL;
@@ -1791,7 +1845,7 @@ index 65abcc5..0140153 100644
  }
  
  /* Hardware HRTF storage is not used by the native panner. */
-@@ -812,3 +1762,4 @@ void salReconnectVoice(DSPvoice *voice, u8 studio) {
+@@ -812,3 +1816,4 @@ void salReconnectVoice(DSPvoice *voice, u8 studio) {
    }
    voice->studio = studio;
  }
@@ -1900,10 +1954,10 @@ index c7e993b..243e735 100644
  
 diff --git a/src/musyx/runtime/hw_pc_split.h b/src/musyx/runtime/hw_pc_split.h
 new file mode 100644
-index 0000000..071581d
+index 0000000..976382e
 --- /dev/null
 +++ b/src/musyx/runtime/hw_pc_split.h
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,137 @@
 +/* hw_pc_split.h — the web port's split of the native DSP (hw_pc.c) into CONTROL and RENDER.
 + *
 + * CONTROL (the game's module, every console, every frame — re-simulation included): everything the
@@ -1946,6 +2000,8 @@ index 0000000..071581d
 +  SALR_AUX_UPDATE = 14, /* u32 type, u32 key, struct bytes */
 +  SALR_AUX_SHUTDOWN = 15,/* u32 type, u32 key */
 +  SALR_INIT = 16,       /* (none): salInitAi */
++  SALR_SEG2 = 18,       /* u8 voice, u8 subframe, u8 buffers, u8 hasPitch, u16 adsrStart, u16 adsrEnd, [u32 pitch]:
++                         * a segment at segmentOffset[subframe]; the pitch only when it changed (else the voice's last) */
 +  SALR_ADPCM = 17,      /* u32 voice, SalRecAdpcm: the voice's ADPCM info changed since it was last sent */
 +};
 +

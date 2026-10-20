@@ -81,11 +81,15 @@
   // and a textContent rewrite + scrollTop read per line forced a layout each time (m449 ran at ~0.5x)
   var logDirty = false;
   function logFlush() { logDirty = false; logEl.textContent = lines.join('\n'); logEl.scrollTop = logEl.scrollHeight; }
-  function log(s) {
-    console.log('[mp4n] ' + s);
+  function log(s, game) {
+    // the game's own OSReport/printf lines reach the browser console only with ?log=1 (or under automation: the rigs
+    // read lines like "DLLStart N" from it). A console.log per line cost a board load ~70 ms in a profile. The page
+    // log below the canvas always has them.
+    if (!game || CONSOLE_GAME) console.log('[mp4n] ' + s);
     lines.push(s); if (lines.length > 400) lines.shift();
     if (!logDirty) { logDirty = true; requestAnimationFrame(logFlush); }
   }
+  var CONSOLE_GAME = Q.get('log') === '1' || !!navigator.webdriver;
   function status(s) { statusEl.textContent = s; }
   window.__mp4n = { phase: 'idle', errors: [] };
 
@@ -424,8 +428,8 @@
         mp4DebugOvl: !room && Q.get('ovl') ? +Q.get('ovl') : undefined,   // crash sweep: boot straight into overlay index N (menus, Story mode, results)
         mp4InputLatch: function (frame, ptr) { var m = window.__mp4n.module; Mp4Input.latch(frame, ptr, m && m.HEAP32); },
         locateFile: function (p) { return BUILD + p; },
-        print: function (t) { log(t); },
-        printErr: function (t) { log(t); if (/\[(ERROR|FATAL)\]/.test(t)) window.__mp4n.errors.push(t); },
+        print: function (t) { log(t, true); },
+        printErr: function (t) { log(t, !/\[(ERROR|FATAL)\]/.test(t)); if (/\[(ERROR|FATAL)\]/.test(t)) window.__mp4n.errors.push(t); },
         onAbort: function (r) { window.__mp4n.phase = 'aborted'; window.__mp4n.errors.push('abort: ' + r); status('Stopped: ' + r); }
       });
       window.__mp4n.module = mod;
