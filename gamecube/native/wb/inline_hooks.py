@@ -61,6 +61,13 @@ def i32(v):
     v &= 0xffffffff
     return v - (1 << 32) if v >= 1 << 31 else v
 
+def census_inc():
+    if not CENSUS: return ''
+    k = len(census_map); census_map.append(cur_fn[0] + '\t' + cur_cls[0] + '\t' + cur_ptr[0])
+    assert k < (1 << 18)
+    return ('(i32.store offset=%d (i32.const %d) (i32.add (i32.load offset=%d (i32.const %d)) (i32.const 1))) '
+            % (CENSUS_ADDR, 4 * k, CENSUS_ADDR, 4 * k))
+
 def site(ptr, nbytes, off, pad=8):
     # pad: how far below BASE a checked range may start and still reach into it (8 for one store; the
     # whole run's length for a coalesced check)
@@ -69,7 +76,7 @@ def site(ptr, nbytes, off, pad=8):
            '(i32.eqz (i32.load8_u (i32.add (i32.const %d) (i32.shr_u (local.get $__wd) (i32.const 12))))))' % TABLE)
     if nbytes > 1:   # a multi-byte store may cross into the next page: the slow path checks both
         chk = '(i32.or %s (i32.gt_u (i32.and %s (i32.const 4095)) (i32.const %d)))' % (chk, a, 4096 - nbytes)
-    return ('(block (result i32) (local.set $__wa %s) '
+    return ('(block (result i32) ' + census_inc() + '(local.set $__wa %s) '
             '(local.set $__wd (i32.sub %s (i32.const %d))) '
             '(if (i32.lt_u (i32.add (local.get $__wd) (i32.const %d)) (i32.const %d)) '
             '(then (if %s (then (call $__wb_slow %s (i32.const %d)))))) '
@@ -91,6 +98,54 @@ def site(ptr, nbytes, off, pad=8):
 import os
 COALESCE = os.environ.get('WB_COALESCE', '1') == '1'
 MUTANT = os.environ.get('WB_MUTANT') == '1'
+# WB_MUTANT=2 (test only): every 50th store site that has its own check gets none; the rollback self-test must
+# catch it (MUTANT=1's dropped store usually stays covered: logging is per page, and its page is logged anyway).
+# WB_MUTANT=3 (measurement only, NOT a valid build): no store site is checked at all, to size what the checks
+# themselves cost against everything else the barrier build does.
+MUTANT2 = os.environ.get('WB_MUTANT') == '2'
+NOCHECK = os.environ.get('WB_MUTANT') == '3'
+mut_n = [0]
+# WB_CENSUS=1 (measurement only): every checked site counts its executions in src/rollback.c mp4wb_census[k];
+# WB_CENSUS_OUT names the file that maps k -> function
+CENSUS = os.environ.get('WB_CENSUS') == '1'
+CENSUS_ADDR = int(os.environ.get('WB_CENSUS_ADDR') or 0)
+census_map = []
+cur_fn = ['']
+cur_cls = ['']
+cur_ptr = ['']
+# the C shadow-stack pointer: the first mutable i32 global whose initial value is a high address (wasm-ld)
+SPG = None
+for gm in re.finditer(r'\(global (\$\S+) \(mut i32\) \(i32\.const (\d+)\)\)', text):
+    if int(gm.group(2)) > (1 << 20): SPG = gm.group(1); break
+def sp_locals(body):
+    # locals every one of whose assignments is derived from the stack pointer (global.get SPG, or another such local)
+    if not SPG: return set()
+    sets = {}
+    for m in re.finditer(r'\(local\.(set|tee) (\$\S+?)[\s)]', body):
+        x = m.group(2); j = match_paren(body, m.start()); sets.setdefault(x, []).append(body[m.start():j + 1])
+    sp = set(); changed = True
+    while changed:
+        changed = False
+        for x, vs in sets.items():
+            if x in sp: continue
+            ok = all(('(global.get %s)' % SPG) in v or any(('(local.get %s)' % y) in v for y in sp) for v in vs)
+            ok = ok and all(re.search(r'\(call|\(i32\.load', v) is None for v in vs)   # a value read from memory is not an SP address
+            if ok: sp.add(x); changed = True
+    return sp
+def loop_spans(body):
+    return [(lm.start(), match_paren(body, lm.start())) for lm in re.finditer(r'\(loop[\s)]', body)]
+def classify(body, pos, ptr, spl, spans):
+    m = re.fullmatch(r'\(local\.get (\$\S+?)\)|\(i32\.add \(local\.get (\$\S+?)\) \(i32\.const -?\d+\)\)', ptr.strip())
+    x = m and (m.group(1) or m.group(2))
+    if (x and x in spl) or ptr.strip() == '(global.get %s)' % SPG: return 'sp'
+    cm = re.fullmatch(r'\(i32\.const (-?\d+)\)', ptr.strip())
+    if cm:
+        c = int(cm.group(1)) & 0xffffffff
+        return 'const_in' if BASE - 4096 <= c < BASE + PAGES * 4096 + 4096 else 'const_out'
+    # inside a loop: an open '(loop' before pos whose matching ')' is after it
+    for a, b in spans:
+        if a < pos < b: return 'loop'
+    return 'other'
 CONTAINERS = {'block', 'loop', 'then', 'else', 'func', 'try', 'do', 'catch', 'catch_all', 'try_table'}
 store_head = re.compile(r'(i32|i64|f32|f64)\.store(8|16|32)?$')
 forbid = re.compile(r'\((call|call_indirect|call_ref|return_call|return_call_indirect|return_call_ref|br|br_if|br_table|br_on_\w+|return|throw|throw_ref|rethrow|unreachable|memory\.grow|delegate)[\s)]')
@@ -164,6 +219,8 @@ def rewrite(body):
     # site finishes inside the outer's PTR, before the outer sets them.
     ms = list(hook_re.finditer(body))
     pl = plan(body)
+    spl = sp_locals(body) if CENSUS else set()
+    spans = loop_spans(body) if CENSUS else []
     for mm in reversed(ms):
         i = mm.start(); j = match_paren(body, i)
         kids = children(body, i, j)
@@ -174,18 +231,38 @@ def rewrite(body):
         if not nb or not of:
             raise ValueError('non-constant bytes/offset')
         ptr = body[kids[3][0]:kids[3][1] + 1]
+        if CENSUS: cur_cls[0] = classify(body, i, ptr, spl, spans); cur_ptr[0] = re.sub(r'\s+', ' ', ptr)[:160] + ' @' + str(i)
         how = pl.get(i)
-        if how and how[0] == 's':
+        # A CONSTANT ADDRESS OUTSIDE THE TRACKED RANGE: the check's answer is known now (nothing to log), so it is
+        # left out. Only a literal (i32.const C) pointer, with the store's (or the run's) whole byte span
+        # [C + off, C + off + n) ending at or below BASE or starting at or above its end: no runtime value can
+        # change that address. (18% of executed checks on the party route: Aurora's own statics, which are
+        # linked outside the game's range; GX shadow registers in game .bss are constants INSIDE it and stay.)
+        cm = re.fullmatch(r'\(i32\.const (-?\d+)\)', ptr.strip())
+        if cm and not (how and how[0] == 's'):
+            c = int(cm.group(1)) & 0xffffffff
+            lo, n = ((c + how[1]) if how else (c + (int(of.group(1)) & 0xffffffff))), (how[2] if how else int(nb.group(1)))
+            if lo + n <= BASE or lo >= BASE + PAGES * 4096:
+                stats['const_out'] = stats.get('const_out', 0) + 1
+                body = body[:i] + ptr + body[j + 1:]
+                continue
+        if NOCHECK and how:
+            rep_ = ptr
+        elif how and how[0] == 's':
             rep_ = ptr                                       # covered by the run's first store
         elif how and how[0] == 'c':
             rep_ = site(ptr, how[2], how[1], max(8, how[2]))  # the whole run's span, before its first store
+        elif NOCHECK:
+            rep_ = ptr
         else:
-            rep_ = site(ptr, int(nb.group(1)), int(of.group(1)) & 0xffffffff)
+            mut_n[0] += 1
+            rep_ = ptr if (MUTANT2 and mut_n[0] % 50 == 0) else site(ptr, int(nb.group(1)), int(of.group(1)) & 0xffffffff)
         body = body[:i] + rep_ + body[j + 1:]
     return body, len(ms)
 
 out = []; pos = 0; nf = ns = 0
 for fm in re.finditer(r'\n \(func (\$\S+)[^\n]*\n', text):
+    cur_fn[0] = fm.group(1)
     start = fm.start() + 1
     end = match_paren(text, start)
     body = text[start:end + 1]
@@ -206,4 +283,6 @@ last = text.rfind('\n (import ')
 e = text.index('\n', last + 1)
 text = text[:e + 1] + decl_imp + decl_def + text[e + 1:]
 open(dst, 'w').write(text)
-print('[wb] store check inlined at %d sites in %d functions; coalesced: %d runs, %d stores covered by their run\'s first check%s' % (ns, nf, stats['runs'], stats['covered'], ' (MUTANT)' if MUTANT else ''))
+if CENSUS:
+    open(os.environ.get('WB_CENSUS_OUT', '/tmp/wb_census_map.txt'), 'w').write('\n'.join(census_map) + '\n')
+print('[wb] store check inlined at %d sites in %d functions; coalesced: %d runs, %d stores covered by their run\'s first check; %d constant addresses outside the range left unchecked%s' % (ns, nf, stats['runs'], stats['covered'], stats.get('const_out', 0), ' (MUTANT)' if MUTANT else (' (MUTANT2: %d sites unchecked)' % (mut_n[0] // 50) if MUTANT2 else (' (NOCHECK: measurement only)' if NOCHECK else ''))))

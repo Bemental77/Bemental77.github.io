@@ -38,6 +38,9 @@ static uint32_t g_base, g_pages;           // tracked .bss, page-aligned inward
 #define T_MAX (1u << 16)                   // 256 MB of tracked state
 uint8_t mp4wb_table[T_MAX];
 static uint8_t* g_table = mp4wb_table;
+// WB_CENSUS=1 builds only (wb/inline_hooks.py): one execution counter per store-check site. Unused otherwise.
+uint32_t mp4wb_census[1u << 18];
+EMSCRIPTEN_KEEPALIVE uint32_t* mp4web_wb_census(void) { return mp4wb_census; }
 // A restore is writing pages: log nothing. VOLATILE, measured: as a plain int the compiler saw no read
 // of it between `= 1` and `= 0` in mp4web_rb_restore (memcpy is a builtin; the barrier that calls
 // mp4web_cow is merged in after the link) and deleted the `= 1`, so the restore's own copies were

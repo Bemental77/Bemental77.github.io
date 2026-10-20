@@ -1189,10 +1189,25 @@ index eff0c65..0a47b0d 100644
      case CommandType::SetScissor: {
        const auto& sc = cmd.data.setScissor;
 diff --git a/lib/gfx/common.hpp b/lib/gfx/common.hpp
-index db245d0..271d28e 100644
+index db245d0..39258ab 100644
 --- a/lib/gfx/common.hpp
 +++ b/lib/gfx/common.hpp
-@@ -172,11 +172,22 @@ private:
+@@ -127,6 +127,14 @@ public:
+   }
+ 
+   void reserve_extra(size_t size) { resize(m_length + size, true); }
++  // the web port: grow by `size` bytes and return where they start, for a caller that fills them itself (one
++  // length update instead of one per element: prepare_idx_buffer)
++  uint8_t* append_uninit(size_t size) {
++    resize(m_length + size, false);
++    uint8_t* p = m_data + m_length;
++    m_length += size;
++    return p;
++  }
+ 
+   ByteBuffer clone() const {
+     ByteBuffer clone{m_length};
+@@ -172,11 +180,22 @@ private:
  
  namespace aurora::gfx {
  inline constexpr bool UseTextureBuffer = true;
@@ -1417,7 +1432,7 @@ index 013afc0..60a2321 100644
    return std::make_shared<TextureRef>(std::move(texture), std::move(textureView), wgpu::TextureView{}, size, wgpuFormat,
                                        mips, gxFormat);
 diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
-index 9748556..7e076de 100644
+index 9748556..7d8cd72 100644
 --- a/lib/gx/command_processor.cpp
 +++ b/lib/gx/command_processor.cpp
 @@ -1,4 +1,8 @@
@@ -1429,7 +1444,244 @@ index 9748556..7e076de 100644
  
  #include "../gfx/common.hpp"
  #include "dolphin/gx/GXAurora.h"
-@@ -1553,6 +1557,17 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* da
+@@ -19,69 +23,56 @@ namespace aurora::gx::fifo {
+ static Module Log("aurora::gx::fifo");
+ 
+ static u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxCount) {
++  // the web port: the same indices as upstream, written through one pointer into space appended once (upstream
++  // appended each u16 separately, storing the buffer's length after every one: in the rollback build each of
++  // those stores is a barrier check, and this function held 7% of them)
+   u16 numIndices = 0;
++  auto put = [](u8* d, u16 v) { memcpy(d, &v, sizeof v); };
+   if (prim == GX_QUADS) {
+     buf.reserve_extra((vtxCount / 4) * 6 * sizeof(u16));
+-
++    const u32 quads = (vtxCount + 3u) / 4u;
++    u8* d = buf.append_uninit(quads * 6 * sizeof(u16));
+     for (u16 v = 0; v < vtxCount; v += 4) {
+-      u16 idx0 = vtxStart + v;
+-      u16 idx1 = vtxStart + v + 1;
+-      u16 idx2 = vtxStart + v + 2;
+-      u16 idx3 = vtxStart + v + 3;
+-
+-      buf.append(idx0);
+-      buf.append(idx1);
+-      buf.append(idx2);
+-      numIndices += 3;
+-
+-      buf.append(idx2);
+-      buf.append(idx3);
+-      buf.append(idx0);
+-      numIndices += 3;
++      const u16 idx0 = vtxStart + v, idx1 = vtxStart + v + 1, idx2 = vtxStart + v + 2, idx3 = vtxStart + v + 3;
++      put(d + 0, idx0); put(d + 2, idx1); put(d + 4, idx2);
++      put(d + 6, idx2); put(d + 8, idx3); put(d + 10, idx0);
++      d += 12;
++      numIndices += 6;
+     }
+   } else if (prim == GX_TRIANGLES) {
+     buf.reserve_extra(vtxCount * sizeof(u16));
++    u8* d = buf.append_uninit(vtxCount * sizeof(u16));
+     for (u16 v = 0; v < vtxCount; ++v) {
+-      const u16 idx = vtxStart + v;
+-      buf.append(idx);
++      put(d, static_cast<u16>(vtxStart + v));
++      d += 2;
+       ++numIndices;
+     }
+-  } else if (prim == GX_TRIANGLEFAN) {
++  } else if (prim == GX_TRIANGLEFAN || prim == GX_TRIANGLESTRIP) {
+     buf.reserve_extra(((u32(vtxCount) - 3) * 3 + 3) * sizeof(u16));
++    const u32 n = vtxCount < 3 ? vtxCount : 3 + (u32(vtxCount) - 3) * 3;
++    u8* d = buf.append_uninit(n * sizeof(u16));
+     for (u16 v = 0; v < vtxCount; ++v) {
+       const u16 idx = vtxStart + v;
+       if (v < 3) {
+-        buf.append(idx);
+-        ++numIndices;
+-        continue;
+-      }
+-      buf.append(std::array{vtxStart, static_cast<u16>(idx - 1), idx});
+-      numIndices += 3;
+-    }
+-  } else if (prim == GX_TRIANGLESTRIP) {
+-    buf.reserve_extra(((static_cast<u32>(vtxCount) - 3) * 3 + 3) * sizeof(u16));
+-    for (u16 v = 0; v < vtxCount; ++v) {
+-      const u16 idx = vtxStart + v;
+-      if (v < 3) {
+-        buf.append(idx);
++        put(d, idx);
++        d += 2;
+         ++numIndices;
+         continue;
+       }
+-      if ((v & 1) == 0) {
+-        buf.append(std::array{static_cast<u16>(idx - 2), static_cast<u16>(idx - 1), idx});
++      if (prim == GX_TRIANGLEFAN) {
++        put(d + 0, vtxStart); put(d + 2, static_cast<u16>(idx - 1)); put(d + 4, idx);
++      } else if ((v & 1) == 0) {
++        put(d + 0, static_cast<u16>(idx - 2)); put(d + 2, static_cast<u16>(idx - 1)); put(d + 4, idx);
+       } else {
+-        buf.append(std::array{static_cast<u16>(idx - 1), static_cast<u16>(idx - 2), idx});
++        put(d + 0, static_cast<u16>(idx - 1)); put(d + 2, static_cast<u16>(idx - 2)); put(d + 4, idx);
+       }
++      d += 6;
+       numIndices += 3;
+     }
+   } else if (prim == GX_LINES || prim == GX_LINESTRIP || prim == GX_POINTS) {
+     buf.reserve_extra(6 * sizeof(u16));
+-    buf.append<u16>(0);
+-    buf.append<u16>(1);
+-    buf.append<u16>(3);
+-    buf.append<u16>(3);
+-    buf.append<u16>(2);
+-    buf.append<u16>(0);
++    u8* d = buf.append_uninit(6 * sizeof(u16));
++    put(d + 0, 0); put(d + 2, 1); put(d + 4, 3); put(d + 6, 3); put(d + 8, 2); put(d + 10, 0);
+     numIndices = 6;
+   } else
+     UNLIKELY FATAL("unsupported primitive type {}", static_cast<u32>(prim));
+@@ -374,36 +365,40 @@ static void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian);
+ 
+ void process(const u8* data, u32 size, bool bigEndian) {
+   ZoneScoped;
+-  u32 pos = 0;
+-
+-  while (pos < size) {
+-    u8 cmd = data[pos++];
++  // the web port: the cursor lives in a register (lp); `pos`, whose address the handlers take, is written only
++  // around their calls. As one escaped variable, every command byte read stored it back to memory, and in the
++  // rollback build every store is a barrier check (this loop held the module's hottest check sites).
++  u32 lp = 0, pos = 0;
++#define CP_CALL(...) do { pos = lp; __VA_ARGS__; lp = pos; } while (0)
++
++  while (lp < size) {
++    u8 cmd = data[lp++];
+     u8 opcode = cmd & CP_OPCODE_MASK;
+-    // Log.warn("Processing opcode {:02x} at pos {} (size {})", opcode, pos - 1, size);
++    // Log.warn("Processing opcode {:02x} at lp {} (size {})", opcode, lp - 1, size);
+ 
+     switch (opcode) {
+     case CP_CMD_NOP:
+       continue;
+ 
+     case CP_CMD_LOAD_BP_REG: {
+-      CHECK(pos + 4 <= size, "BP reg read overrun");
+-      u32 value = read_u32(data + pos, bigEndian);
+-      pos += 4;
++      CHECK(lp + 4 <= size, "BP reg read overrun");
++      u32 value = read_u32(data + lp, bigEndian);
++      lp += 4;
+       handle_bp(value, bigEndian);
+       break;
+     }
+ 
+     case CP_CMD_LOAD_CP_REG: {
+-      CHECK(pos + 5 <= size, "CP reg read overrun");
+-      u8 addr = data[pos++];
+-      u32 value = read_u32(data + pos, bigEndian);
+-      pos += 4;
++      CHECK(lp + 5 <= size, "CP reg read overrun");
++      u8 addr = data[lp++];
++      u32 value = read_u32(data + lp, bigEndian);
++      lp += 4;
+       handle_cp(addr, value, bigEndian);
+       break;
+     }
+ 
+     case CP_CMD_LOAD_XF_REG: {
+-      handle_xf(data, pos, size, bigEndian);
++      CP_CALL(handle_xf(data, pos, size, bigEndian));
+       break;
+     }
+ 
+@@ -413,12 +408,12 @@ void process(const u8* data, u32 size, bool bigEndian) {
+     case CP_CMD_LOAD_INDX_D: {
+       ZoneScopedN("LOAD_INDX");
+       // Indexed XF load: 4 bytes of data
+-      CHECK(pos + 4 <= size, "indexed XF read overrun");
++      CHECK(lp + 4 <= size, "indexed XF read overrun");
+       u32 arrayType = GX_POS_MTX_ARRAY + (opcode - (CP_CMD_LOAD_INDX_A / 0x08));
+-      u8 srcArrayIdx = data[pos++];
++      u8 srcArrayIdx = data[lp++];
+       auto const& array = g_gxState.arrays[arrayType];
+       u8* srcData = ((u8*)array.data) + srcArrayIdx * array.stride;
+-      u16 addrLen = read_u16(data + pos, bigEndian);
++      u16 addrLen = read_u16(data + lp, bigEndian);
+       u16 len = (addrLen >> 12) + 1;
+       u16 dstAddr = addrLen & 0x0FFF;
+       if (!copy_xf_data(dstAddr, srcData, len, bigEndian)) {
+@@ -426,15 +421,15 @@ void process(const u8* data, u32 size, bool bigEndian) {
+         Log.debug("Unimplemented indexed XF load (opcode 0x{:02X}, dstAddr=%04x)", opcode, dstAddr);
+ #endif
+       }
+-      pos += 4;
++      lp += 4;
+       break;
+     }
+ 
+     case CP_CMD_CALL_DL: {
+       // Call display list: 8 bytes (address + size)
+-      CHECK(pos + 8 <= size, "call DL read overrun");
++      CHECK(lp + 8 <= size, "call DL read overrun");
+       Log.warn("Ignoring nested GX_CMD_CALL_DL");
+-      pos += 8;
++      lp += 8;
+       break;
+     }
+ 
+@@ -444,7 +439,7 @@ void process(const u8* data, u32 size, bool bigEndian) {
+     }
+ 
+     case GX_LOAD_AURORA: {
+-      handle_aurora(data, pos, size, bigEndian);
++      CP_CALL(handle_aurora(data, pos, size, bigEndian));
+       break;
+     }
+ 
+@@ -456,33 +451,34 @@ void process(const u8* data, u32 size, bool bigEndian) {
+     case GX_DRAW_LINES:
+     case GX_DRAW_LINE_STRIP:
+     case GX_DRAW_POINTS: {
+-      handle_draw(cmd, data, pos, size, bigEndian);
++      CP_CALL(handle_draw(cmd, data, pos, size, bigEndian));
+       break;
+     }
+ 
+     default:
+       // Check if it's a draw command (0x80-0xBF range)
+       if (cmd >= 0x80) {
+-        handle_draw(cmd, data, pos, size, bigEndian);
++        CP_CALL(handle_draw(cmd, data, pos, size, bigEndian));
+       } else {
+         // Hex dump surrounding bytes for debugging
+         {
+-          u32 dumpStart = (pos > 17) ? pos - 17 : 0;
+-          u32 dumpEnd = (pos + 16 < size) ? pos + 16 : size;
++          u32 dumpStart = (lp > 17) ? lp - 17 : 0;
++          u32 dumpEnd = (lp + 16 < size) ? lp + 16 : size;
+           std::string hex;
+           for (u32 i = dumpStart; i < dumpEnd; i++) {
+-            if (i == pos - 1)
++            if (i == lp - 1)
+               hex += fmt::format("[{:02x}]", data[i]);
+             else
+               hex += fmt::format(" {:02x}", data[i]);
+           }
+-          Log.error("  hex dump (pos {}-{}):{}", dumpStart, dumpEnd - 1, hex);
++          Log.error("  hex dump (lp {}-{}):{}", dumpStart, dumpEnd - 1, hex);
+         }
+-        FATAL("command_processor: unknown opcode 0x{:02X} at pos {}", cmd, pos - 1);
++        FATAL("command_processor: unknown opcode 0x{:02X} at lp {}", cmd, lp - 1);
+       }
+       break;
+     }
+   }
++#undef CP_CALL
+ }
+ 
+ // Helper to extract bit fields from a 32-bit register
+@@ -1553,6 +1549,17 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* da
    u32 totalVtxBytes = vtxCount * vtxSize;
    if (pos + totalVtxBytes > size)
      UNLIKELY { handle_draw_overrun(totalVtxBytes, data, pos, size); }
