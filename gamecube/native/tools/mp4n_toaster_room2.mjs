@@ -74,7 +74,7 @@ function makeDevice(P, cpus) {
   fs.writeFileSync(path.join(set, 'cpuset.cpus'), cpus);
   const top = path.join(CPU, `${TAG}-${P.role}`);
   fs.mkdirSync(top);
-  P.dev = { set, top, cpus, groups: new Map(), mult: new Map(), quotaOn: false, frac: 1 / rate };
+  P.dev = { set, top, cpus, groups: new Map(), mult: new Map(), quotaOn: false, frac: 1 / rate, cal: 1, gpu: new Set() };
 }
 function deviceScan(P) {
   const bpid = P.browser.process().pid;
@@ -98,7 +98,7 @@ function deviceScan(P) {
       const rG = path.join(P.dev.top, 'r');
       if (!gpuG && !fs.existsSync(rG)) {
         fs.mkdirSync(rG); fs.writeFileSync(path.join(rG, 'cpu.cfs_period_us'), '10000'); P.dev.mult.set(rG, CORES);
-        fs.writeFileSync(path.join(rG, 'cpu.cfs_quota_us'), P.dev.quotaOn ? String(Math.round(10000 * P.dev.frac * CORES)) : '-1');
+        fs.writeFileSync(path.join(rG, 'cpu.cfs_quota_us'), P.dev.quotaOn ? String(quotaUs(P, rG)) : '-1');
         P.dev.rG = rG;
       }
       const g = gpuG || path.join(rG, 't' + t);
@@ -106,8 +106,8 @@ function deviceScan(P) {
         if (!fs.existsSync(g)) {
           fs.mkdirSync(g);
           fs.writeFileSync(path.join(g, 'cpu.cfs_period_us'), '10000');
-          P.dev.mult.set(g, gpuG ? CORES : 1);
-          fs.writeFileSync(path.join(g, 'cpu.cfs_quota_us'), P.dev.quotaOn ? String(Math.round(10000 * P.dev.frac * P.dev.mult.get(g))) : '-1');
+          P.dev.mult.set(g, gpuG ? CORES : 1); if (gpuG) P.dev.gpu.add(g);
+          fs.writeFileSync(path.join(g, 'cpu.cfs_quota_us'), P.dev.quotaOn ? String(quotaUs(P, g)) : '-1');
         }
         fs.writeFileSync(path.join(g, 'tasks'), t);
         P.dev.groups.set(+t, g);
@@ -115,11 +115,15 @@ function deviceScan(P) {
     }
   }
 }
+// CFS quota per 10 ms period. Renderer groups carry the calibration factor `cal` (proof(): a box whose
+// scheduler loses time at small quotas — 4-core container, 2026-10-20: 1/6.2 measured a 10.16x slowdown —
+// gets its renderer quota scaled until the BenchmarkIndex slowdown is the rate). The GPU group is not scaled.
+function quotaUs(P, g) { return Math.max(1000, Math.round(10000 * P.dev.frac * (P.dev.mult.get(g) || 1) * (P.dev.gpu.has(g) ? 1 : P.dev.cal))); }
 function deviceQuota(P, on) {
   P.dev.quotaOn = on;
   // the shared renderer cap first when raising quotas off, last when turning them on (a child may not exceed its parent)
   const gs = [...new Set(P.dev.groups.values())]; if (P.dev.rG) { if (on) gs.push(P.dev.rG); else gs.unshift(P.dev.rG); }
-  for (const g of gs) { try { fs.writeFileSync(path.join(g, 'cpu.cfs_quota_us'), on ? String(Math.round(10000 * P.dev.frac * (P.dev.mult.get(g) || 1))) : '-1'); } catch (e) {} }
+  for (const g of gs) { try { fs.writeFileSync(path.join(g, 'cpu.cfs_quota_us'), on ? String(quotaUs(P, g)) : '-1'); } catch (e) {} }
 }
 function deviceStat(P) {
   let thr = 0, nrp = 0, nrt = 0;
@@ -234,6 +238,13 @@ async function proof(PS) {
   for (const P of PS) deviceQuota(P, true);
   await sleep(300);
   for (const P of PS) { const v = []; for (let i = 0; i < 3; i++) v.push(await benchRun(P, 2000)); R[P.role].alone = med(v);
+    // CALIBRATE (CAL=0 skips): scale this player's renderer quota until free/alone is within 5% of the rate
+    for (let it = 0; it < 4 && process.env.CAL !== '0'; it++) {
+      const sd = R[P.role].free / R[P.role].alone; if (Math.abs(sd / rate - 1) <= 0.05) break;
+      P.dev.cal *= sd / rate; deviceQuota(P, true); await sleep(300);
+      const w = []; for (let i = 0; i < 3; i++) w.push(await benchRun(P, 2000)); R[P.role].alone = med(w);
+    }
+    R[P.role].cal = +P.dev.cal.toFixed(3);
     const rv = []; for (let i = 0; i < 3; i++) rv.push(await rasterRun(P)); R[P.role].rasterAlone = med(rv); }
   if (PS.length > 1) {
     const tog = await Promise.all(PS.map(async (P) => { const v = []; for (let i = 0; i < 3; i++) v.push(await benchRun(P, 2000)); return med(v); }));
@@ -245,7 +256,7 @@ async function proof(PS) {
     r.rasterSlowdown = r.rasterFree && r.rasterAlone ? +(r.rasterFree / r.rasterAlone).toFixed(2) : null;
     if (r.together != null) r.share = +(r.together / r.alone).toFixed(3);
     r.cpuset = cpusetProof(P); r.cg = deviceStat(P);
-    say(`PROOF ${P.role}: BenchmarkIndex free ${r.free} alone ${r.alone} together ${r.together ?? '-'} -> slowdown ${r.slowdown}x (want ~${rate}), share ${r.share ?? '-'} (want ~1), cpus ${JSON.stringify(r.cpuset)}, throttled ${r.cg.nr_throttled}/${r.cg.nr_periods} periods; raster free ${r.rasterFree} quota ${r.rasterAlone} -> ${r.rasterSlowdown}x (GPU ${GPUOFF ? 'NOT throttled, --gpuoff' : 'throttled, want >= ' + (0.5 * rate).toFixed(1)})`);
+    say(`PROOF ${P.role}: renderer quota x${r.cal} (calibration); BenchmarkIndex free ${r.free} alone ${r.alone} together ${r.together ?? '-'} -> slowdown ${r.slowdown}x (want ~${rate}), share ${r.share ?? '-'} (want ~1), cpus ${JSON.stringify(r.cpuset)}, throttled ${r.cg.nr_throttled}/${r.cg.nr_periods} periods; raster free ${r.rasterFree} quota ${r.rasterAlone} -> ${r.rasterSlowdown}x (GPU ${GPUOFF ? 'NOT throttled, --gpuoff' : 'throttled, want >= ' + (0.5 * rate).toFixed(1)})`);
     r.ok = Math.abs(r.slowdown / rate - 1) <= 0.25 && (r.share == null || r.share >= 0.9) && Object.keys(r.cpuset).length === 1 && r.cg.nr_throttled > 0 && (GPUOFF || (r.rasterSlowdown != null && r.rasterSlowdown >= 0.5 * rate));
   }
   return R;
@@ -275,6 +286,11 @@ const probe = () => {
            hc: null, rollbacks: g && g.rollback ? g.rollback.rollbacks : null, speed: R.speed };
 };
 let broker = null; const PS = [];
+// The page server must already answer (npm run web): without it a room's pages never load and the run
+// used to sit until CDP's protocolTimeout ("Runtime.callFunctionOn timed out") — what every room did after
+// a container restart. Fail in a second instead.
+try { const r = await fetch(BASE + '/mp4-native.html', { method: 'HEAD' }); if (!r.ok) throw new Error('HTTP ' + r.status); }
+catch (e) { console.error(`page server ${BASE} does not answer (${e.message || e}): start it with npm run web`); process.exit(2); }
 try {
   const cpusFor = (i) => `${i * CORES}-${i * CORES + CORES - 1}`;
   const roles = mode === 'solo' ? ['A'] : ['H', 'J'];
