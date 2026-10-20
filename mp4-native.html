@@ -225,6 +225,9 @@
             window.addEventListener('pagehide', function () { M.FS.syncfs(false, function () {}); });
           } catch (e) { log('saves: ' + e); }
         }],
+        // the memory card as game memory (rolls back with the game): every room and ?nosave=1 run — a card that
+        // starts fresh and is never kept. ?memcard=0|1 overrides (A/B: the file card does not roll back)
+        mp4MemCard: Q.get('memcard') != null ? Q.get('memcard') === '1' : !!(Q.get('nosave') || room),
         mp4EpochSeconds: room ? room.epoch : Q.get('epoch') ? +Q.get('epoch') : undefined,
         mp4DebugMg: !room && Q.get('mg') ? +Q.get('mg') : undefined,   // crash sweep: boot straight into minigame N (401..463)
         mp4FbScale: Q.get('res') != null ? +Q.get('res') : undefined,   // ?res=N: render at N x 640x480 (0 = canvas pixels)
