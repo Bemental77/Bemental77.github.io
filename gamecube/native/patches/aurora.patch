@@ -149,6 +149,185 @@ index dc5ae5b..0a601f9 100644
        switch (surfaceStatus) {
        case wgpu::SurfaceGetCurrentTextureStatus::Timeout:
          Log.warn("Surface texture acquisition timed out");
+diff --git a/lib/card/CardRawFile.cpp b/lib/card/CardRawFile.cpp
+index bba3520..7c18c0e 100644
+--- a/lib/card/CardRawFile.cpp
++++ b/lib/card/CardRawFile.cpp
+@@ -1,4 +1,5 @@
+ #include "CardRawFile.hpp"
++#include "../fs_helper.hpp"
+ 
+ #include <algorithm>
+ #include <cstdio>
+@@ -734,6 +735,16 @@ void CardRawFile::getFreeBlocks(int32_t& bytesNotUsed, int32_t& filesNotUsed) co
+ void CardRawFile::getEncoding(uint16_t& encoding) const { encoding = m_ch.m_encoding; }
+ 
+ void CardRawFile::format(ECardSlot id, ECardSize size, EEncoding encoding) {
++#ifdef __EMSCRIPTEN__
++  // the in-memory card: the largest standard size its image holds (251 blocks for the 2 MB arena)
++  const bool memCard = isMemCard(fs_path_to_string(m_filename));
++  if (memCard) {
++    for (const ECardSize s : {ECardSize::Card2043Mb, ECardSize::Card1019Mb, ECardSize::Card507Mb, ECardSize::Card251Mb,
++                              ECardSize::Card123Mb, ECardSize::Card59Mb}) {
++      if (static_cast<size_t>(s) * MbitToBlocks * BlockSize <= g_memCard.cap) { if (static_cast<uint16_t>(size) > static_cast<uint16_t>(s)) size = s; break; }
++    }
++  }
++#endif
+   m_ch.raw.fill(0xFF);
+ 
+   uint64_t rand = static_cast<uint64_t>(getGCTime());
+@@ -785,15 +796,20 @@ void CardRawFile::format(ECardSlot id, ECardSize size, EEncoding encoding) {
+     std::unique_ptr<uint8_t[]> dummyBlock;
+     dummyBlock.reset(new uint8_t[BlockSize * blockCount]);
+     memset(dummyBlock.get(), 0xFF, BlockSize * blockCount);
++#ifdef __EMSCRIPTEN__
++    if (memCard)   // the whole data area, so the image is the card's full size (the file path writes one block at its end)
++      m_fileHandle.fileWrite(dummyBlock.get(), BlockSize * blockCount, BlockSize * 5);
++    else
++#endif
+     m_fileHandle.fileWrite(dummyBlock.get(), BlockSize, BlockSize * blockCount);
+     m_dirty = false;
+   }
+ }
+ 
+ ProbeResults CardRawFile::probeCardFile(const std::filesystem::path& filename) {
+-  if (!std::filesystem::exists(filename))
++  if (!cardPathExists(filename))
+     return {ECardResult::NOCARD, 0, 0};
+-  return {ECardResult::READY, static_cast<uint32_t>(std::filesystem::file_size(filename) / BlockSize) / MbitToBlocks,
++  return {ECardResult::READY, static_cast<uint32_t>(cardPathSize(filename) / BlockSize) / MbitToBlocks,
+           BlockSize};
+ }
+ 
+diff --git a/lib/card/FileIO.cpp b/lib/card/FileIO.cpp
+index c19185f..10d5ae6 100644
+--- a/lib/card/FileIO.cpp
++++ b/lib/card/FileIO.cpp
+@@ -4,14 +4,44 @@
+ #include <SDL3/SDL_filesystem.h>
+ 
+ #include <cstdint>
++#include <cstring>
+ #include <utility>
+ 
+ #include "../fs_helper.hpp"
+ 
+ namespace aurora::card {
+ 
++#ifdef __EMSCRIPTEN__
++MemCardImage g_memCard;
++bool isMemCard(const std::string& path) { return g_memCard.data != nullptr && path == MemCardPath; }
++#endif
++
++bool cardPathExists(const std::filesystem::path& path) {
++#ifdef __EMSCRIPTEN__
++  if (isMemCard(fs_path_to_string(path))) return *g_memCard.len != 0;
++#endif
++  std::error_code ec;
++  return std::filesystem::exists(path, ec);
++}
++
++size_t cardPathSize(const std::filesystem::path& path) {
++#ifdef __EMSCRIPTEN__
++  if (isMemCard(fs_path_to_string(path))) return *g_memCard.len;
++#endif
++  std::error_code ec;
++  const auto n = std::filesystem::file_size(path, ec);
++  return ec ? 0 : static_cast<size_t>(n);
++}
++
+ FileIO::FileIO(const std::filesystem::path& filename, bool truncate) {
+   m_path = fs_path_to_string(filename);;
++#ifdef __EMSCRIPTEN__
++  if (isMemCard(m_path)) {
++    if (truncate) *g_memCard.len = 0;
++    m_ready = truncate || *g_memCard.len != 0;   // "r+b" on a missing file fails
++    return;
++  }
++#endif
+   SDL_IOStream* stream = nullptr;
+ 
+   stream = fileOpen(m_path, truncate ? "w+b" : "r+b");
+@@ -40,6 +70,13 @@ bool FileIO::fileRead(void* buf, size_t length, off_t offset) {
+   if (!isReady()) {
+     return false;
+   }
++#ifdef __EMSCRIPTEN__
++  if (isMemCard(m_path)) {
++    if (offset < 0 || static_cast<size_t>(offset) + length > *g_memCard.len) return false;
++    std::memcpy(buf, g_memCard.data + offset, length);
++    return true;
++  }
++#endif
+ 
+   SDL_IOStream* stream = fileOpen(m_path, "rb");
+   if (stream == nullptr) {
+@@ -70,6 +107,16 @@ bool FileIO::fileWrite(const void* buf, size_t length, off_t offset) {
+   if (!isReady()) {
+     return false;
+   }
++#ifdef __EMSCRIPTEN__
++  if (isMemCard(m_path)) {
++    if (offset < 0 || static_cast<size_t>(offset) + length > g_memCard.cap) return false;
++    if (static_cast<size_t>(offset) > *g_memCard.len) std::memset(g_memCard.data + *g_memCard.len, 0, offset - *g_memCard.len);
++    std::memcpy(g_memCard.data + offset, buf, length);
++    if (offset + length > *g_memCard.len) *g_memCard.len = static_cast<uint32_t>(offset + length);
++    if (offset >= 5 * 8192) ++g_memCard.len[1];   // writes into the data area (format, then each save): a witness for tests
++    return true;
++  }
++#endif
+ 
+   SDL_IOStream* stream = fileOpen(m_path, "r+b");
+   if (stream == nullptr) {
+@@ -102,6 +149,9 @@ bool FileIO::fileWrite(const void* buf, size_t length, off_t offset) {
+ }
+ 
+ size_t FileIO::fileSize() const {
++#ifdef __EMSCRIPTEN__
++  if (isMemCard(m_path)) return *g_memCard.len;
++#endif
+   SDL_PathInfo info;
+   const auto tr = fs_path_to_string(m_path);
+   if (SDL_GetPathInfo(m_path.c_str(), &info)) {
+@@ -111,6 +161,9 @@ size_t FileIO::fileSize() const {
+ }
+ 
+ bool FileIO::deleteFile() {
++#ifdef __EMSCRIPTEN__
++  if (isMemCard(m_path)) { *g_memCard.len = 0; m_ready = false; m_path.clear(); return true; }
++#endif
+   if (SDL_RemovePath(m_path.c_str())) {
+     m_ready = false;
+     m_path.clear();
+diff --git a/lib/card/FileIO.hpp b/lib/card/FileIO.hpp
+index 98fa929..4db86b0 100644
+--- a/lib/card/FileIO.hpp
++++ b/lib/card/FileIO.hpp
+@@ -8,6 +8,24 @@
+ 
+ namespace aurora::card {
+ 
++#ifdef __EMSCRIPTEN__
++// web: THE ROOM CARD LIVES IN GAME MEMORY. A card is game state (a save, the boxes the menus probe), so
++// in a room / determinism run (?nosave=1) the raw card image is an array in the game's rollback-covered
++// range (gamecube/native/src/card_arena.c), not a file: a rewind then puts the card back with everything
++// else. A FileIO whose path is MemCardPath reads and writes that image (the store barrier logs it).
++inline constexpr const char* MemCardPath = "/mp4web-memcard";   // short: std::string keeps it inline (no heap pointer in the image)
++struct MemCardImage {
++  uint8_t* data = nullptr;     // image bytes, `cap` long
++  size_t cap = 0;
++  uint32_t* len = nullptr;     // bytes written so far ("file size"); 0 = no card file yet. len[1]: data-area write count
++};
++extern MemCardImage g_memCard;
++bool isMemCard(const std::string& path);
++#endif
++// the card path's existence/size, for the in-memory card as for a file
++bool cardPathExists(const std::filesystem::path& path);
++size_t cardPathSize(const std::filesystem::path& path);
++
+ class FileIO {
+   std::string m_path;
+   bool m_ready = false;
 diff --git a/lib/card/Util.cpp b/lib/card/Util.cpp
 index 0447183..38c00f6 100644
 --- a/lib/card/Util.cpp
@@ -198,6 +377,79 @@ index c2cb3bc..56d12f4 100644
    if (sAramBuffer) {
      Log.debug("Initialized 0x{:X} bytes of ARAM!", aurora::g_config.mem2Size);
    } else {
+diff --git a/lib/dolphin/card.cpp b/lib/dolphin/card.cpp
+index 626ce4f..e7dc083 100644
+--- a/lib/dolphin/card.cpp
++++ b/lib/dolphin/card.cpp
+@@ -1,6 +1,10 @@
+ #include "dolphin/card.h"
+ 
+ #include <filesystem>
++#include <new>
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#endif
+ 
+ #include "../internal.hpp"
+ #include "dolphin/types.h"
+@@ -32,7 +36,7 @@ const char* GetCardRegion() {
+ 
+ #define GET_CARD(slot) CardChannels[slot]
+ #define CARD_USE_GCI_FOLDER SelectedFileType == CARD_GCIFOLDER
+-#define CARD_READY(slot) (CARD_USE_GCI_FOLDER ? true : std::filesystem::exists(CardChannels[slot]->cardFilename()))
++#define CARD_READY(slot) (CARD_USE_GCI_FOLDER ? true : aurora::card::cardPathExists(CardChannels[slot]->cardFilename()))
+ #define CARD_STUB Log.debug("{} is stubbed.", __FUNCTION__);
+ 
+ bool Initialized = false;
+@@ -154,6 +158,14 @@ void CARDSetLoadType(CARDFileType type) {
+   SelectedFileType = type;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// gamecube/native/src/card_arena.c: game memory (rollback-covered). The first bytes hold the slot-A card
++// object itself, so its directory/BAT caches, open state and the image length roll back with the image.
++extern "C" unsigned char mp4web_card_arena[];
++extern "C" const unsigned int mp4web_card_arena_size;
++static constexpr size_t MemCardObjBytes = 128 * 1024;
++#endif
++
+ void CARDInit(const char* game, const char* maker) {
+   if (Initialized) {
+     return;
+@@ -161,6 +173,24 @@ void CARDInit(const char* game, const char* maker) {
+   Initialized = true;
+   Log.info("CARD API Initialized BUILT <{} {}>", __DATE__, __TIME__);
+ 
++#ifdef __EMSCRIPTEN__
++  // ?nosave=1 and every room (Module.mp4MemCard): a fresh raw card in game memory, never a file
++  const bool memCard = EM_ASM_INT({ return Module['mp4MemCard'] ? 1 : 0; }) != 0;
++  if (memCard) {
++    static_assert(sizeof(aurora::card::CardRawFile) + 64 <= MemCardObjBytes, "card object outgrew its arena slot");
++    SelectedFileType = CARD_RAWIMAGE;
++    auto* len = reinterpret_cast<uint32_t*>(mp4web_card_arena + MemCardObjBytes - 64);
++    len[0] = 0; len[1] = 0;
++    aurora::card::g_memCard = {mp4web_card_arena + MemCardObjBytes, mp4web_card_arena_size - MemCardObjBytes, len};
++    cardPaths[0] = aurora::card::MemCardPath;
++    cardPaths[1] = "/mp4web-no-card-b";   // slot B: empty (no file, ever)
++    // placement: never deleted (the web runtime does not run static destructors; nothing resets slot A)
++    CardChannels[0].reset(new (mp4web_card_arena) aurora::card::CardRawFile());
++    CardChannels[1] = std::make_unique<aurora::card::CardRawFile>();
++    for (auto& c : CardChannels) c->InitCard(game, maker);
++    Log.info("memory card: {} KB in game memory (rolls back with the game)", aurora::card::g_memCard.cap / 1024);
++  } else
++#endif
+   for (int i = 0; i < CardChannels.size(); ++i) {
+     switch (SelectedFileType) {
+     case CARD_RAWIMAGE:
+@@ -190,7 +220,7 @@ void CARDInit(const char* game, const char* maker) {
+     const auto& curPath = cardPaths[i];
+ 
+     std::error_code ec;
+-    if (std::filesystem::exists(curPath, ec) && CardChannels[i]->open(curPath)) {
++    if (aurora::card::cardPathExists(curPath) && CardChannels[i]->open(curPath)) {
+       loadedCard = true;
+       Log.info("Loaded GC Card Image: {}", fs_path_to_string(curPath));
+     } else if (ec) {
 diff --git a/lib/dolphin/dvd/dvd.cpp b/lib/dolphin/dvd/dvd.cpp
 index 863ecb8..5235f25 100644
 --- a/lib/dolphin/dvd/dvd.cpp
@@ -266,6 +518,26 @@ index 863ecb8..5235f25 100644
    const NodDiscOptions options{
        .preloader_threads = 1,
    };
+diff --git a/lib/dolphin/gx/GXManage.cpp b/lib/dolphin/gx/GXManage.cpp
+index 84c3cfc..a5b7fca 100644
+--- a/lib/dolphin/gx/GXManage.cpp
++++ b/lib/dolphin/gx/GXManage.cpp
+@@ -6,7 +6,15 @@
+ #include <cstring>
+ 
+ // Global shadow register instance
++#ifdef __EMSCRIPTEN__
++// web: in GAME memory (gamecube/native/src/host_state.c), so a rollback restores it — the game reads it back
++// (GXGetProjectionv / GXGetViewportv) and must see the values of the frames that actually happened
++extern "C" unsigned char mp4web_gx_shadow[4096];
++static_assert(sizeof(__GXData_struct) <= 4096, "GX shadow outgrew its slot in host_state.c");
++static __GXData_struct& sGXData = *reinterpret_cast<__GXData_struct*>(mp4web_gx_shadow);
++#else
+ static __GXData_struct sGXData;
++#endif
+ __GXData_struct* __gx = &sGXData;
+ static GXFifoObj sFifoObj;
+ 
 diff --git a/lib/dolphin/mtx/mtx.c b/lib/dolphin/mtx/mtx.c
 index ba2796d..6a64d21 100644
 --- a/lib/dolphin/mtx/mtx.c

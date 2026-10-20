@@ -102,7 +102,7 @@ GAMEF=(-DTARGET_PC -DNON_MATCHING -DOPTIMIZED_TEXTURE_LOADING -DBYTESWAPPING -DT
        -ftrivial-auto-var-init=zero)   # decomp code reads locals before setting them (220 clang warnings, e.g. mpexDll charsel, ztardll select): undefined behaviour that clang can compile to a trap; the GameCube read register/stack leftovers, here they read 0
 game_srcs() {
   sed -n '/set(GAME_FILES/,/)/p; /set(PORT_FILES/,/)/p' "$PB/files.cmake" | grep -v "^ *#" | grep -oE "src/[A-Za-z0-9_/.-]+\.(c|cpp)" | grep -v "^src/port/ui/\|^src/port/portmain.cpp\|^src/port/achievements.cpp\|^src/port/audio.cpp" | sed "s#^#$PB/#"
-  echo "$HERE/src/libco_fiber.c"; echo "$HERE/src/rel_dispatch.c"; echo "$HERE/src/web_stubs.cpp"; echo "$HERE/src/web_audio.cpp"; echo "$HERE/src/det_heap.c"; echo "$HERE/src/nod_web.c"   # game heap: aurora keeps its handles inside game-held DVD blocks
+  echo "$HERE/src/libco_fiber.c"; echo "$HERE/src/rel_dispatch.c"; echo "$HERE/src/web_stubs.cpp"; echo "$HERE/src/web_audio.cpp"; echo "$HERE/src/det_heap.c"; echo "$HERE/src/host_state.c"; echo "$HERE/src/nod_web.c"   # game heap: aurora keeps its handles inside game-held DVD blocks
   sed -n '/add_library(musyx STATIC/,/)/p' "$MX/CMakeLists.txt" | grep -oE "src/[A-Za-z0-9_/.-]+\.c" | sed "s#^#$MX/#"
   echo "$MX/src/musyx/runtime/hw_pc_null.c"   # no SDL device: the game renders each frame's samples itself
   echo "$MX/src/musyx/debugger/debugger.c"   # the runtime calls its pause/step hooks unconditionally
