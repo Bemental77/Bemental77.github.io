@@ -32,6 +32,9 @@
   .keys kbd { font: 12px ui-monospace, monospace; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; background: var(--panel); }
   pre#log { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px; max-height: 220px; overflow: auto; font-size: 12px; margin-top: 12px; white-space: pre-wrap; }
 </style>
+<!-- the disc parts are served from the game library (Bemental77/gamedata, same origin under /gamedata/ on the
+     live site; tools/devserver.mjs maps it to this tree locally) — see lib/asset_base.js -->
+<script src="/lib/asset_base.js?v=27d8c0a4"></script>
 <script src="/lib/capability.js?v=b411172f"></script>
 <script src="/lib/bench.js?v=3a51eccb"></script><!-- ?bench=1 real-device benchmark; inert without it -->
 <script src="/lib/netplay.js?v=f4a331e0"></script>
@@ -271,7 +274,7 @@
       var done = 0;
       status('Loading disc 0/' + PARTS.length);
       var parts = await Promise.all(PARTS.map(function (sx) {
-        return inflate('gamecube/roms/MarioParty4.bin.parta' + sx + '.gz').then(function (b) {
+        return inflate((window.ASSET_BASE || '') + '/gamecube/roms/MarioParty4.bin.parta' + sx + '.gz').then(function (b) {
           status('Loading disc ' + (++done) + '/' + PARTS.length); return new Uint8Array(b);
         });
       }));
