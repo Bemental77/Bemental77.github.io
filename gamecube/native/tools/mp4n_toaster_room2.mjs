@@ -21,6 +21,9 @@
 //   npm run web ; node tools/browser_leak_guard.js reap && uptime
 //   bash tools/probe_lock.sh run -- node gamecube/native/tools/mp4n_toaster_room2.mjs <room|solo> <rate> <sec> --page native|recomp
 //        [--noproof] [--cores 2] [--gpuoff] [--skip 10] [--name N]
+//   FWIN=f0:f1,..   measure fixed GUEST-FRAME windows (x and CPU ms/frame per window) instead of the wall-clock one, so two
+//                   arms compare the same scenes; the run ends when every window closed (give <sec> room, e.g. 400)
+//   CALFIX=f        pin the renderer-quota factor instead of calibrating (replay an earlier run's device model)
 // Output: /tmp/mp4-room2/<name>.json (+ screenshots).
 // ============================================================================
 import { createRequire } from 'module'; import fs from 'fs'; import os from 'os'; import path from 'path';
@@ -35,6 +38,7 @@ const fl = (n) => { const i = a.indexOf('--' + n); return i >= 0 ? a[i + 1] : nu
 const SKIP = +(fl('skip') || 10), PAGE = fl('page') || 'native';
 const name = fl('name') || `${PAGE}-${mode}-${rate}`, NOPROOF = a.includes('--noproof'), CORES = +(fl('cores') || 2), GPUOFF = a.includes('--gpuoff');
 const BASE = process.env.BASE_URL || 'http://localhost:8080';
+const FWIN = (process.env.FWIN || '').split(',').filter(Boolean).map((w) => w.split(':').map(Number));
 const CHROME = process.env.CHROME_PATH || '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
 const OUTD = '/tmp/mp4-room2'; fs.mkdirSync(OUTD, { recursive: true });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -239,7 +243,10 @@ async function proof(PS) {
   await sleep(300);
   for (const P of PS) { const v = []; for (let i = 0; i < 3; i++) v.push(await benchRun(P, 2000)); R[P.role].alone = med(v);
     // CALIBRATE (CAL=0 skips): scale this player's renderer quota until free/alone is within 5% of the rate
-    for (let it = 0; it < 4 && process.env.CAL !== '0'; it++) {
+    // CALFIX=f: pin the factor instead (diagnostic: replay an earlier run's device model on today's box)
+    if (process.env.CALFIX) { P.dev.cal = +process.env.CALFIX; deviceQuota(P, true); await sleep(300);
+      const w = []; for (let i = 0; i < 3; i++) w.push(await benchRun(P, 2000)); R[P.role].alone = med(w); }
+    else for (let it = 0; it < 4 && process.env.CAL !== '0'; it++) {
       const sd = R[P.role].free / R[P.role].alone; if (Math.abs(sd / rate - 1) <= 0.05) break;
       P.dev.cal *= sd / rate; deviceQuota(P, true); await sleep(300);
       const w = []; for (let i = 0; i < 3; i++) w.push(await benchRun(P, 2000)); R[P.role].alone = med(w);
@@ -365,7 +372,15 @@ try {
         }
         if (P.t0 != null && !P.cpu0 && r.T - P.t0 >= SKIP) P.cpu0 = { c: cpuByType(P), f: r.frame, T: r.T };
         if (P.cpu0 && !P.cpu1 && r.T - P.t0 >= SKIP + secs) P.cpu1 = { c: cpuByType(P), f: r.frame, T: r.T };
-        if (P.t0 == null || r.T - P.t0 < SKIP + secs) done = false;
+        // FWIN=f0:f1,..: fixed GUEST-FRAME windows (the same scenes in every arm, unlike a wall-clock
+        // window): x and CPU ms per frame from the first sample at/after f0 to the first at/after f1
+        if (FWIN.length) {
+          P.fw = P.fw || FWIN.map(() => ({}));
+          FWIN.forEach(([f0, f1], i) => { const w = P.fw[i];
+            if (!w.a && r.frame != null && r.frame >= f0) w.a = { t: r.t, f: r.frame, c: cpuByType(P) };
+            if (w.a && !w.b && r.frame >= f1) w.b = { t: r.t, f: r.frame, c: cpuByType(P) }; });
+          if (!P.fw.every((w) => w.b)) done = false;
+        } else if (P.t0 == null || r.T - P.t0 < SKIP + secs) done = false;
       }
     }
     if (done) break;
@@ -388,6 +403,11 @@ try {
     if (P.ovl && P.ovl.length) say(`OVL ${P.role}: ${P.ovl.join(',')}`);
     if (o.gs) say(`GFX ${P.role}: ${JSON.stringify(o.gs)} (median per sampled frame; upKB = vert/uniform/index/storage/texture)`);
     if (o.lastStats) say(`STATS ${P.role}: ${JSON.stringify(o.lastStats)} rb=${JSON.stringify(o.lastRb)} mode=${o.lastMode}`);
+    if (P.fw) { o.fwin = P.fw.map((w, i) => { if (!w.a || !w.b) return { win: FWIN[i], incomplete: true };
+        const fr = w.b.f - w.a.f, by = {}; for (const [pid, v] of Object.entries(w.b.c)) by[v.k] = (by[v.k] || 0) + 1000 * (v.t - ((w.a.c[pid] || {}).t || 0)) / fr;
+        for (const k of Object.keys(by)) by[k] = +by[k].toFixed(2);
+        return { win: FWIN[i], frames: fr, x: +(fr / ((w.b.t - w.a.t) / 1000) / 60).toFixed(4), cpu: by }; });
+      for (const w of o.fwin) say(`FWIN ${P.role} ${w.win.join('-')}: ${w.incomplete ? 'INCOMPLETE' : 'x=' + w.x.toFixed(3) + ' renderer ' + w.cpu.renderer + ' gpu ' + w.cpu['gpu-process'] + ' ms/frame over ' + w.frames + ' frames'}`); }
     if (P.cpu0 && P.cpu1) { const fr = Math.max(1, P.cpu1.f - P.cpu0.f), sec = P.cpu1.T - P.cpu0.T, by = {};
       for (const [pid, v] of Object.entries(P.cpu1.c)) by[v.k] = (by[v.k] || 0) + 1000 * (v.t - ((P.cpu0.c[pid] || {}).t || 0)) / fr;
       for (const k of Object.keys(by)) by[k] = +by[k].toFixed(2);
