@@ -17,7 +17,9 @@ import sys, re
 p = sys.argv[1]
 with open(p) as f: s = f.read()
 nc = s.count('(memory.copy'); nf = s.count('(memory.fill')
-s = s.replace('(memory.copy', '(call $__mp4web_mcopy').replace('(memory.fill', '(call $__mp4web_mfill')
+import os
+if os.environ.get('WB_NOBULK') != '1':   # WB_NOBULK=1 (measurement only, NOT a valid build): bulk ops unchecked
+    s = s.replace('(memory.copy', '(call $__mp4web_mcopy').replace('(memory.fill', '(call $__mp4web_mfill')
 imp = ' (import "env" "mp4web_mcopy" (func $__mp4web_mcopy (param i32 i32 i32)))\n' \
       ' (import "env" "mp4web_mfill" (func $__mp4web_mfill (param i32 i32 i32)))\n'
 # imports must precede every definition: put ours right after the last existing import
@@ -36,19 +38,19 @@ PY
 # the store may be a page's first write in the frame.
 # the tracked range and the page table, from the link map (wasm-ld --Map, written next to IN by build.sh)
 MAP="${WB_MAP:-${IN%.wasm}.map}"
-read -r WB_BASE WB_PAGES WB_TABLE < <(python3 - "$MAP" <<'PY'
+read -r WB_BASE WB_PAGES WB_TABLE WB_CADDR < <(python3 - "$MAP" <<'PY'
 import re, sys
 sym = {}
 for l in open(sys.argv[1]):
-    m = re.match(r'\s*([0-9a-f]+)\s+[0-9a-f]+\s+[0-9a-f]+\s+(mp4web_game_bss_b|mp4web_game_bss_e|mp4wb_table)\s*$', l)
+    m = re.match(r'\s*([0-9a-f]+)\s+[0-9a-f]+\s+[0-9a-f]+\s+(mp4web_game_bss_b|mp4web_game_bss_e|mp4wb_table|mp4wb_census)\s*$', l)
     if m: sym[m.group(2)] = int(m.group(1), 16)
 b = (sym['mp4web_game_bss_b'] + 4095) & ~4095; e = sym['mp4web_game_bss_e'] & ~4095
-print(b, (e - b) >> 12, sym['mp4wb_table'])
+print(b, (e - b) >> 12, sym['mp4wb_table'], sym.get('mp4wb_census', 0))
 PY
 )
 echo "[wb] tracked range 0x$(printf %x "$WB_BASE") + $WB_PAGES pages, table 0x$(printf %x "$WB_TABLE")"
 # WB_NOINLINE=1 (diagnostic): leave binaryen's call to store_ptr at each site (barrier.wat: same check, out of line)
-if [ "${WB_NOINLINE:-0}" = 1 ]; then mv "$T/b.wat" "$T/b2.wat"; else python3 "$HERE/inline_hooks.py" "$T/b.wat" "$T/b2.wat" "$WB_BASE" "$WB_PAGES" "$WB_TABLE"; rm -f "$T/b.wat"; fi
+if [ "${WB_NOINLINE:-0}" = 1 ]; then mv "$T/b.wat" "$T/b2.wat"; else WB_CENSUS_ADDR="$WB_CADDR" python3 "$HERE/inline_hooks.py" "$T/b.wat" "$T/b2.wat" "$WB_BASE" "$WB_PAGES" "$WB_TABLE"; rm -f "$T/b.wat"; fi
 "$B/wasm-as" $([ "${WB_STRIP:-1}" = 1 ] || echo -g) "${F[@]}" "$T/b2.wat" -o "$T/b.wasm"; rm -f "$T/b2.wat"
 "$B/wasm-as" -g "${F[@]}" "$HERE/barrier.wat" -o "$T/barrier.wasm"
 "$B/wasm-merge" $([ "${WB_STRIP:-1}" = 1 ] || echo -g) "${F[@]}" "$T/b.wasm" main "$T/barrier.wasm" env -o "$T/c.wasm"; rm -f "$T/b.wasm"
