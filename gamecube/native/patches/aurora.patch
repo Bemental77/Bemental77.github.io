@@ -617,10 +617,10 @@ index c026935..928f8ea 100644
  #include <stdint.h>
  #include <dolphin/mtx.h>
 diff --git a/lib/dolphin/mtx/mtxvec.c b/lib/dolphin/mtx/mtxvec.c
-index fcb32e0..88c728a 100644
+index fcb32e0..7bb1b01 100644
 --- a/lib/dolphin/mtx/mtxvec.c
 +++ b/lib/dolphin/mtx/mtxvec.c
-@@ -1,3 +1,9 @@
+@@ -1,5 +1,46 @@
 +#ifdef __EMSCRIPTEN__
 +// web port: no asserts here, like the retail SDK's MTX library (and Party Board's Release desktop build,
 +// which defines NDEBUG): MP4 hands it degenerate input on some first frames (m401 sets a camera's aspect
@@ -629,7 +629,68 @@ index fcb32e0..88c728a 100644
 +#endif
  #include <assert.h>
  #include <dolphin/mtx.h>
++#include <string.h>
++
++#ifdef __EMSCRIPTEN__
++// web port, the rollback build's write barrier: a vector array transform writes its results into a scratch
++// block in Aurora's own statics (outside the tracked game range, so each store's check takes its first exit) and
++// copies each block to dst with one memcpy -- one bulk range check (the barrier's mp4web_mcopy logs every page it
++// covers) instead of a full check per vector. Same arithmetic, same order, same results. Taken only when dst
++// cannot change an input before it is read: dst == src (each vector reads only itself) or dst overlapping
++// neither src nor the matrix; any other overlap keeps the plain loop.
++#define MTXV_CHUNK 64
++static Vec sMtxvScratch[MTXV_CHUNK];
++static inline int mtxv_blockable(const void* m, unsigned mBytes, const Vec* src, const Vec* dst, u32 count) {
++  const char* d = (const char*)dst; const char* de = d + (size_t)count * sizeof(Vec);
++  const char* s = (const char*)src; const char* se = s + (size_t)count * sizeof(Vec);
++  const char* mm = (const char*)m; const char* me = mm + mBytes;
++  if (d < me && mm < de) return 0;
++  return d == s || de <= s || se <= d;
++}
++#define MTXV_ARRAY(M, MBYTES, SRC, DST, COUNT, BODY)                                                     \
++  if (mtxv_blockable(M, MBYTES, SRC, DST, COUNT)) {                                                     \
++    const Vec* const mtxvSrc = (SRC);                                                                    \
++    Vec* const mtxvDst = (DST);                                                                          \
++    const u32 mtxvCount = (COUNT);                                                                       \
++    for (u32 b = 0; b < mtxvCount; b += MTXV_CHUNK) {                                                    \
++      u32 n = mtxvCount - b < MTXV_CHUNK ? mtxvCount - b : MTXV_CHUNK;                                   \
++      const Vec* srcBase = mtxvSrc + b;                                                                  \
++      Vec* dstBase = sMtxvScratch;                                                                       \
++      for (u32 i = 0; i < n; i++) { BODY srcBase++; dstBase++; }                                         \
++      memcpy(mtxvDst + b, sMtxvScratch, n * sizeof(Vec));                                                \
++    }                                                                                                    \
++    return;                                                                                              \
++  }
++#else
++#define MTXV_ARRAY(M, MBYTES, SRC, DST, COUNT, BODY)
++#endif
  
+ void C_MTXMultVec(const Mtx m, const Vec* src, Vec* dst) {
+   Vec vTmp;
+@@ -25,6 +66,7 @@ void C_MTXMultVecArray(const Mtx m, const Vec* srcBase, Vec* dstBase, u32 count)
+   assert(dstBase && "MTXMultVecArray():  NULL VecPtr 'dstBase' ");
+   assert(count > 1 && "MTXMultVecArray():  count must be greater than 1.");
+ 
++  MTXV_ARRAY(m, sizeof(Mtx), srcBase, dstBase, count, vTmp.x = m[0][3] + ((m[0][2] * srcBase->z) + ((m[0][0] * srcBase->x) + (m[0][1] * srcBase->y))); vTmp.y = m[1][3] + ((m[1][2] * srcBase->z) + ((m[1][0] * srcBase->x) + (m[1][1] * srcBase->y))); vTmp.z = m[2][3] + ((m[2][2] * srcBase->z) + ((m[2][0] * srcBase->x) + (m[2][1] * srcBase->y))); dstBase->x = vTmp.x; dstBase->y = vTmp.y; dstBase->z = vTmp.z;)
+   for(i = 0; i < count; i++) {
+     vTmp.x = m[0][3] + ((m[0][2] * srcBase->z) + ((m[0][0] * srcBase->x) + (m[0][1] * srcBase->y)));
+     vTmp.y = m[1][3] + ((m[1][2] * srcBase->z) + ((m[1][0] * srcBase->x) + (m[1][1] * srcBase->y)));
+@@ -61,6 +103,7 @@ void C_MTXMultVecArraySR(const Mtx m, const Vec* srcBase, Vec* dstBase, u32 coun
+   assert(dstBase && "MTXMultVecArraySR():  NULL VecPtr 'dstBase' ");
+   assert(count > 1 && "MTXMultVecArraySR():  count must be greater than 1.");
+ 
++  MTXV_ARRAY(m, sizeof(Mtx), srcBase, dstBase, count, vTmp.x = (m[0][2] * srcBase->z) + ((m[0][0] * srcBase->x) + (m[0][1] * srcBase->y)); vTmp.y = (m[1][2] * srcBase->z) + ((m[1][0] * srcBase->x) + (m[1][1] * srcBase->y)); vTmp.z = (m[2][2] * srcBase->z) + ((m[2][0] * srcBase->x) + (m[2][1] * srcBase->y)); dstBase->x = vTmp.x; dstBase->y = vTmp.y; dstBase->z = vTmp.z;)
+   for(i = 0; i < count; i++) {
+     vTmp.x = (m[0][2] * srcBase->z) + ((m[0][0] * srcBase->x) + (m[0][1] * srcBase->y));
+     vTmp.y = (m[1][2] * srcBase->z) + ((m[1][0] * srcBase->x) + (m[1][1] * srcBase->y));
+@@ -82,6 +125,7 @@ void C_MTXROMultVecArray(const ROMtx m, const Vec *srcBase, Vec *dstBase, u32 co
+   assert(srcBase && "MTXROMultVecArray():  NULL VecPtr 'srcBase' ");
+   assert(dstBase && "MTXROMultVecArray():  NULL VecPtr 'dstBase' ");
+ 
++  MTXV_ARRAY(m, sizeof(ROMtx), srcBase, dstBase, count, vTmp.x = (m[0][0] * srcBase->x) + (m[1][0] * srcBase->y) + (m[2][0] * srcBase->z) + m[3][0]; vTmp.y = (m[0][1] * srcBase->x) + (m[1][1] * srcBase->y) + (m[2][1] * srcBase->z) + m[3][1]; vTmp.z = (m[0][2] * srcBase->x) + (m[1][2] * srcBase->y) + (m[2][2] * srcBase->z) + m[3][2]; dstBase->x = vTmp.x; dstBase->y = vTmp.y; dstBase->z = vTmp.z;)
+   for(i = 0; i < count; i++) {
+     vTmp.x = (m[0][0] * srcBase->x) + (m[1][0] * srcBase->y) + (m[2][0] * srcBase->z) + m[3][0];
+     vTmp.y = (m[0][1] * srcBase->x) + (m[1][1] * srcBase->y) + (m[2][1] * srcBase->z) + m[3][1];
 diff --git a/lib/dolphin/mtx/quat.c b/lib/dolphin/mtx/quat.c
 index 80966d6..39f43d4 100644
 --- a/lib/dolphin/mtx/quat.c
@@ -1432,7 +1493,7 @@ index 013afc0..60a2321 100644
    return std::make_shared<TextureRef>(std::move(texture), std::move(textureView), wgpu::TextureView{}, size, wgpuFormat,
                                        mips, gxFormat);
 diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
-index 9748556..7d8cd72 100644
+index 9748556..026c6a4 100644
 --- a/lib/gx/command_processor.cpp
 +++ b/lib/gx/command_processor.cpp
 @@ -1,4 +1,8 @@
@@ -1541,8 +1602,30 @@ index 9748556..7d8cd72 100644
      numIndices = 6;
    } else
      UNLIKELY FATAL("unsupported primitive type {}", static_cast<u32>(prim));
-@@ -374,36 +365,40 @@ static void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian);
+@@ -372,38 +363,62 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian);
+ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian);
+ static void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian);
  
++// the web port: process()'s unknown-opcode report, out of line and by value. Formatted in place, its arguments
++// were taken by reference, so `cmd` (and the cursor) lived in memory for the whole loop: a store per command byte,
++// and in the rollback build a barrier check each (the module's hottest site).
++[[noreturn]] static void process_bad_opcode(const u8* data, u32 pos, u32 size, u8 cmd) {
++  {
++    u32 dumpStart = (pos > 17) ? pos - 17 : 0;
++    u32 dumpEnd = (pos + 16 < size) ? pos + 16 : size;
++    std::string hex;
++    for (u32 i = dumpStart; i < dumpEnd; i++) {
++      if (i == pos - 1)
++        hex += fmt::format("[{:02x}]", data[i]);
++      else
++        hex += fmt::format(" {:02x}", data[i]);
++    }
++    Log.error("  hex dump (pos {}-{}):{}", dumpStart, dumpEnd - 1, hex);
++  }
++  FATAL("command_processor: unknown opcode 0x{:02X} at pos {}", cmd, pos - 1);
++  abort();
++}
++
  void process(const u8* data, u32 size, bool bigEndian) {
    ZoneScoped;
 -  u32 pos = 0;
@@ -1595,7 +1678,7 @@ index 9748556..7d8cd72 100644
        break;
      }
  
-@@ -413,12 +408,12 @@ void process(const u8* data, u32 size, bool bigEndian) {
+@@ -413,12 +428,12 @@ void process(const u8* data, u32 size, bool bigEndian) {
      case CP_CMD_LOAD_INDX_D: {
        ZoneScopedN("LOAD_INDX");
        // Indexed XF load: 4 bytes of data
@@ -1611,7 +1694,7 @@ index 9748556..7d8cd72 100644
        u16 len = (addrLen >> 12) + 1;
        u16 dstAddr = addrLen & 0x0FFF;
        if (!copy_xf_data(dstAddr, srcData, len, bigEndian)) {
-@@ -426,15 +421,15 @@ void process(const u8* data, u32 size, bool bigEndian) {
+@@ -426,15 +441,15 @@ void process(const u8* data, u32 size, bool bigEndian) {
          Log.debug("Unimplemented indexed XF load (opcode 0x{:02X}, dstAddr=%04x)", opcode, dstAddr);
  #endif
        }
@@ -1630,7 +1713,7 @@ index 9748556..7d8cd72 100644
        break;
      }
  
-@@ -444,7 +439,7 @@ void process(const u8* data, u32 size, bool bigEndian) {
+@@ -444,7 +459,7 @@ void process(const u8* data, u32 size, bool bigEndian) {
      }
  
      case GX_LOAD_AURORA: {
@@ -1639,7 +1722,7 @@ index 9748556..7d8cd72 100644
        break;
      }
  
-@@ -456,33 +451,34 @@ void process(const u8* data, u32 size, bool bigEndian) {
+@@ -456,33 +471,21 @@ void process(const u8* data, u32 size, bool bigEndian) {
      case GX_DRAW_LINES:
      case GX_DRAW_LINE_STRIP:
      case GX_DRAW_POINTS: {
@@ -1654,25 +1737,21 @@ index 9748556..7d8cd72 100644
 -        handle_draw(cmd, data, pos, size, bigEndian);
 +        CP_CALL(handle_draw(cmd, data, pos, size, bigEndian));
        } else {
-         // Hex dump surrounding bytes for debugging
-         {
+-        // Hex dump surrounding bytes for debugging
+-        {
 -          u32 dumpStart = (pos > 17) ? pos - 17 : 0;
 -          u32 dumpEnd = (pos + 16 < size) ? pos + 16 : size;
-+          u32 dumpStart = (lp > 17) ? lp - 17 : 0;
-+          u32 dumpEnd = (lp + 16 < size) ? lp + 16 : size;
-           std::string hex;
-           for (u32 i = dumpStart; i < dumpEnd; i++) {
+-          std::string hex;
+-          for (u32 i = dumpStart; i < dumpEnd; i++) {
 -            if (i == pos - 1)
-+            if (i == lp - 1)
-               hex += fmt::format("[{:02x}]", data[i]);
-             else
-               hex += fmt::format(" {:02x}", data[i]);
-           }
+-              hex += fmt::format("[{:02x}]", data[i]);
+-            else
+-              hex += fmt::format(" {:02x}", data[i]);
+-          }
 -          Log.error("  hex dump (pos {}-{}):{}", dumpStart, dumpEnd - 1, hex);
-+          Log.error("  hex dump (lp {}-{}):{}", dumpStart, dumpEnd - 1, hex);
-         }
+-        }
 -        FATAL("command_processor: unknown opcode 0x{:02X} at pos {}", cmd, pos - 1);
-+        FATAL("command_processor: unknown opcode 0x{:02X} at lp {}", cmd, lp - 1);
++        process_bad_opcode(data, lp, size, cmd);   // by value: a format argument by reference kept cmd in memory
        }
        break;
      }
@@ -1681,7 +1760,26 @@ index 9748556..7d8cd72 100644
  }
  
  // Helper to extract bit fields from a 32-bit register
-@@ -1553,6 +1549,17 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* da
+@@ -1492,7 +1495,7 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
+   pos += dataBytes;
+ }
+ 
+-static void handle_draw_overrun [[noreturn]] (u32 totalVtxBytes, const u8* data, const u32& pos, u32 size) {
++static void handle_draw_overrun [[noreturn]] (u32 totalVtxBytes, const u8* data, u32 pos, u32 size) {
+   // Hex dump around the draw command for debugging
+   u32 cmdPos = pos - 2 - 1; // opcode byte position (before vtxCount and pos++)
+   u32 dumpStart = (cmdPos > 16) ? cmdPos - 16 : 0;
+@@ -1542,7 +1545,8 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
+ // Draw command handler - parses vertices inline and caches results
+ static ByteBuffer handle_draw_idx_buf;
+ 
+-static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* data, u32& pos, u32 size) {
++// web port: the stream position by value, the new one returned (by reference, it pinned the caller's `pos` in memory)
++static u32 draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* data, u32 pos, u32 size) {
+   ZoneScoped;
+   u32 vtxSize;
+   if (g_gxState.lastVtxFmt == fmt)
+@@ -1553,6 +1557,17 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* da
    u32 totalVtxBytes = vtxCount * vtxSize;
    if (pos + totalVtxBytes > size)
      UNLIKELY { handle_draw_overrun(totalVtxBytes, data, pos, size); }
@@ -1693,17 +1791,73 @@ index 9748556..7d8cd72 100644
 +  if (mp4web_gfx_skip_draws && fifo::skipping()) {
 +    pos += totalVtxBytes;
 +    fifo::note_skipped(totalVtxBytes);
-+    return;
++    return pos;
 +  }
 +#endif
  
    auto* lastDraw = !g_gxState.stateDirty ? gfx::get_last_draw_command<DrawData>() : nullptr;
    const bool canMerge = lastDraw != nullptr && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS &&
+@@ -1594,10 +1609,11 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* da
+     lastDraw->vtxCount += vtxCount;
+     lastDraw->indexCount += numIndices;
+     ++gfx::g_mergedDrawCallCount;
+-    return;
++    return pos;
+   }
+ 
+   handle_draw_unmerged(prim, fmt, vtxCount, vertRange);
++  return pos;
+ }
+ 
+ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian) {
+@@ -1608,7 +1624,7 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
+   u16 vtxCount = read_u16(data + pos, bigEndian);
+   pos += 2;
+ 
+-  draw_prim(prim, fmt, vtxCount, data, pos, size);
++  pos = draw_prim(prim, fmt, vtxCount, data, pos, size);
+ }
+ 
+ static ByteBuffer handle_draw_unmerged_idxBuf;
+@@ -1832,15 +1848,19 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
+              "GX_LOAD_AURORA_DRAW_SIZED: {} bytes is not a whole number of size-{} vertices", byteLen, vtxSize);
+       u32 vtxCount = byteLen / vtxSize;
+       ASSERT(vtxCount <= 0xFFFF, "GX_LOAD_AURORA_DRAW_SIZED: too many vertices ({})", vtxCount);
+-      draw_prim(prim, fmt, static_cast<u16>(vtxCount), data, pos, size);
++      pos = draw_prim(prim, fmt, static_cast<u16>(vtxCount), data, pos, size);
+     }
+   } else if (subCmd == GX_LOAD_AURORA_DEBUG_GROUP_PUSH) {
+-    auto label = read_string(data, pos, size, bigEndian);
++    u32 sp = pos;   // a copy escapes into read_string, not the hot cursor
++    auto label = read_string(data, sp, size, bigEndian);
++    pos = sp;
+     gfx::push_debug_group(std::move(label));
+   } else if (subCmd == GX_LOAD_AURORA_DEBUG_GROUP_POP) {
+     pop_debug_group();
+   } else if (subCmd == GX_LOAD_AURORA_DEBUG_MARKER_INSERT) {
+-    auto label = read_string(data, pos, size, bigEndian);
++    u32 sp = pos;   // a copy escapes into read_string, not the hot cursor
++    auto label = read_string(data, sp, size, bigEndian);
++    pos = sp;
+     gfx::insert_debug_marker(std::move(label));
+   }
+ 
 diff --git a/lib/gx/fifo.cpp b/lib/gx/fifo.cpp
-index 1e986e9..476c733 100644
+index 1e986e9..9c63615 100644
 --- a/lib/gx/fifo.cpp
 +++ b/lib/gx/fifo.cpp
-@@ -68,6 +68,31 @@ uint32_t end_display_list() {
+@@ -39,6 +39,10 @@ void write_data_grow(const void* data, uint32_t length) {
+   detail::sBufferCapacity = newCap;
+ }
+ 
++void write_grow_bits(const uint64_t bits, const uint32_t length) {
++  write_data_grow(&bits, length);   // little-endian host: the first `length` bytes of bits are the value's bytes
++}
++
+ void patch_u32(const uint32_t offset, const uint32_t val) {
+   ASSERT(!detail::sInDisplayList && offset + sizeof(uint32_t) <= detail::sBufferSize,
+          "fifo::patch_u32: invalid patch offset {} (buffer size {})", offset, detail::sBufferSize);
+@@ -68,6 +72,31 @@ uint32_t end_display_list() {
  
  bool in_display_list() { return detail::sInDisplayList; }
  
@@ -1736,10 +1890,74 @@ index 1e986e9..476c733 100644
    if (detail::sBufferSize == 0) {
      return;
 diff --git a/lib/gx/fifo.hpp b/lib/gx/fifo.hpp
-index 01a63e5..44ceb23 100644
+index 01a63e5..39e580c 100644
 --- a/lib/gx/fifo.hpp
 +++ b/lib/gx/fifo.hpp
-@@ -84,6 +84,8 @@ bool in_display_list();
+@@ -38,40 +38,41 @@ inline void write_data(const void* data, const uint32_t length) {
+   }
+ }
+ 
+-inline void write_u8(const uint8_t val) {
++// web port: the typed writers keep their value in a register. Their slow path (buffer growth) takes the value
++// by value, not by address: with &val handed to write_data_grow, every GX setter kept the value in its stack
++// frame and stored it there before each write (in the rollback build, a write-barrier check per GX command).
++void write_grow_bits(uint64_t bits, uint32_t length);
++
++template <typename T>
++inline void write_val(const T out) {
++  static_assert(sizeof(T) <= sizeof(uint64_t));
+   if (!detail::sInDisplayList)
+     LIKELY {
+-      if (detail::sBufferSize < detail::sBufferCapacity)
++      if (detail::sBufferSize + sizeof(T) <= detail::sBufferCapacity)
+         LIKELY {
+-          detail::sBufferData[detail::sBufferSize++] = val;
++          std::memcpy(detail::sBufferData + detail::sBufferSize, &out, sizeof(T));
++          detail::sBufferSize += sizeof(T);
+           return;
+         }
+-      write_data_grow(&val, 1);
++      uint64_t bits = 0;
++      std::memcpy(&bits, &out, sizeof(T));
++      write_grow_bits(bits, sizeof(T));
+     }
+-  else if (detail::sDlWritePos < detail::sDlSize) {
+-    detail::sDlBuffer[detail::sDlWritePos++] = val;
++  else if (detail::sDlWritePos + sizeof(T) <= detail::sDlSize) {
++    std::memcpy(detail::sDlBuffer + detail::sDlWritePos, &out, sizeof(T));
++    detail::sDlWritePos += sizeof(T);
+   }
+ }
+ 
+-inline void write_u16(const uint16_t val) {
+-  const auto out = bswap(val);
+-  write_data(&out, sizeof(out));
+-}
++inline void write_u8(const uint8_t val) { write_val(val); }
+ 
+-inline void write_u32(const uint32_t val) {
+-  const auto out = bswap(val);
+-  write_data(&out, sizeof(out));
+-}
++inline void write_u16(const uint16_t val) { write_val(bswap(val)); }
+ 
+-inline void write_u64(const uint64_t val) {
+-  const auto out = bswap(val);
+-  write_data(&out, sizeof(out));
+-}
++inline void write_u32(const uint32_t val) { write_val(bswap(val)); }
+ 
+-inline void write_f32(const float val) {
+-  const auto out = bswap(val);
+-  write_data(&out, sizeof(out));
+-}
++inline void write_u64(const uint64_t val) { write_val(bswap(val)); }
++
++inline void write_f32(const float val) { write_val(bswap(val)); }
+ 
+ // Overwrites a u32 previously written to the FIFO buffer at the given offset.
+ // Not valid during display list recording.
+@@ -84,6 +85,8 @@ bool in_display_list();
  
  // Drain the internal FIFO buffer through the command processor
  void drain();
@@ -1781,6 +1999,63 @@ index 3671ed5..79e7315 100644
  }};
  @group(0) @binding(0)
  var<storage, read> vbuf: array<u32>;
+diff --git a/lib/logging.hpp b/lib/logging.hpp
+index aae81dd..0d05540 100644
+--- a/lib/logging.hpp
++++ b/lib/logging.hpp
+@@ -17,36 +17,43 @@ struct Module {
+   const char* name;
+   explicit Module(const char* name) noexcept : name(name) {}
+ 
++  // web port: the level test and the argument pack inline at the call site; the formatting call out of line takes
++  // a packed copy of the values. With the pack forwarded by reference into an out-of-line template, every local a
++  // log names had its address escape, so it lived in the caller's stack frame and each update of it was a store
++  // (in the rollback build, a write-barrier check): the command processor's hottest loop held such locals.
++  [[gnu::noinline]] void vreport(const AuroraLogLevel level, fmt::string_view fmt, fmt::format_args args) noexcept {
++    auto message = fmt::vformat(fmt, args);
++    log_internal(level, name, message.c_str(), static_cast<unsigned int>(message.size()));
++  }
++
+   template <typename... T>
+-  void report(const AuroraLogLevel level, fmt::format_string<T...> fmt, T&&... args) noexcept {
++  [[gnu::always_inline]] void report(const AuroraLogLevel level, fmt::format_string<T...> fmt, T&&... args) noexcept {
+     if (g_config.logLevel > level) return;
+-
+-    auto message = fmt::format(fmt, std::forward<T>(args)...);
+-    log_internal(level, name, message.c_str(), static_cast<unsigned int>(message.size()));
++    vreport(level, fmt.get(), fmt::vargs<T...>{{args...}});
+   }
+ 
+   template <typename... T>
+-  void debug(fmt::format_string<T...> fmt, T&&... args) noexcept {
++  [[gnu::always_inline]] void debug(fmt::format_string<T...> fmt, T&&... args) noexcept {
+     report(LOG_DEBUG, fmt, std::forward<T>(args)...);
+   }
+ 
+   template <typename... T>
+-  void info(fmt::format_string<T...> fmt, T&&... args) noexcept {
++  [[gnu::always_inline]] void info(fmt::format_string<T...> fmt, T&&... args) noexcept {
+     report(LOG_INFO, fmt, std::forward<T>(args)...);
+   }
+ 
+   template <typename... T>
+-  void warn(fmt::format_string<T...> fmt, T&&... args) noexcept {
++  [[gnu::always_inline]] void warn(fmt::format_string<T...> fmt, T&&... args) noexcept {
+     report(LOG_WARNING, fmt, std::forward<T>(args)...);
+   }
+ 
+   template <typename... T>
+-  void error(fmt::format_string<T...> fmt, T&&... args) noexcept {
++  [[gnu::always_inline]] void error(fmt::format_string<T...> fmt, T&&... args) noexcept {
+     report(LOG_ERROR, fmt, std::forward<T>(args)...);
+   }
+ 
+   template <typename... T>
+-  [[noreturn]] void fatal(fmt::format_string<T...> fmt, T&&... args) noexcept {
++  [[noreturn, gnu::always_inline]] void fatal(fmt::format_string<T...> fmt, T&&... args) noexcept {
+     report(LOG_FATAL, fmt, std::forward<T>(args)...);
+     std::abort();
+   }
 diff --git a/lib/webgpu/gpu.cpp b/lib/webgpu/gpu.cpp
 index a969465..cf3ca45 100644
 --- a/lib/webgpu/gpu.cpp
