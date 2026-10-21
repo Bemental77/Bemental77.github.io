@@ -103,6 +103,7 @@ MUTANT = os.environ.get('WB_MUTANT') == '1'
 # WB_MUTANT=3 (measurement only, NOT a valid build): no store site is checked at all, to size what the checks
 # themselves cost against everything else the barrier build does.
 MUTANT2 = os.environ.get('WB_MUTANT') == '2'
+MUTANT2_PHASE = int(os.environ.get('WB_MUTANT_PHASE', '0')) % 50   # which 1-in-50 sites WB_MUTANT=2 drops
 NOCHECK = os.environ.get('WB_MUTANT') == '3'
 mut_n = [0]
 # WB_CENSUS=1 (measurement only): every checked site counts its executions in src/rollback.c mp4wb_census[k];
@@ -256,7 +257,7 @@ def rewrite(body):
             rep_ = ptr
         else:
             mut_n[0] += 1
-            rep_ = ptr if (MUTANT2 and mut_n[0] % 50 == 0) else site(ptr, int(nb.group(1)), int(of.group(1)) & 0xffffffff)
+            rep_ = ptr if (MUTANT2 and mut_n[0] % 50 == MUTANT2_PHASE) else site(ptr, int(nb.group(1)), int(of.group(1)) & 0xffffffff)
         body = body[:i] + rep_ + body[j + 1:]
     return body, len(ms)
 
