@@ -64,7 +64,7 @@ def i32(v):
 def census_inc():
     if not CENSUS: return ''
     k = len(census_map); census_map.append(cur_fn[0] + '\t' + cur_cls[0] + '\t' + cur_ptr[0] + '\t' + cur_mut[0])
-    assert k < (1 << 18)
+    assert k < (1 << 18) - 16   # the top slots: rollback.c's cover attribution
     return ('(i32.store offset=%d (i32.const %d) (i32.add (i32.load offset=%d (i32.const %d)) (i32.const 1))) '
             % (CENSUS_ADDR, 4 * k, CENSUS_ADDR, 4 * k))
 
@@ -76,11 +76,16 @@ def site(ptr, nbytes, off, pad=8):
            '(i32.eqz (i32.load8_u (i32.add (i32.const %d) (i32.shr_u (local.get $__wd) (i32.const 12))))))' % TABLE)
     if nbytes > 1:   # a multi-byte store may cross into the next page: the slow path checks both
         chk = '(i32.or %s (i32.gt_u (i32.and %s (i32.const 4095)) (i32.const %d)))' % (chk, a, 4096 - nbytes)
-    return ('(block (result i32) ' + census_inc() + '(local.set $__wa %s) '
+    ci = census_inc()
+    slow = '(call $__wb_slow %s (i32.const %d))' % (a, nbytes)
+    if ATTR:   # WB_ATTR=1: the slow path knows which site called it (rollback.c's cover attribution); 0x3FFF0 = no site
+        slot = CENSUS_ADDR + 4 * ((1 << 18) - 1)
+        slow = '(i32.store (i32.const %d) (i32.const %d)) %s (i32.store (i32.const %d) (i32.const %d))' % (slot, len(census_map) - 1, slow, slot, 0x3FFF0)
+    return ('(block (result i32) ' + ci + '(local.set $__wa %s) '
             '(local.set $__wd (i32.sub %s (i32.const %d))) '
             '(if (i32.lt_u (i32.add (local.get $__wd) (i32.const %d)) (i32.const %d)) '
-            '(then (if %s (then (call $__wb_slow %s (i32.const %d)))))) '
-            '(local.get $__wa))') % (ptr, a, i32(BASE), pad, i32(PAGES * 4096 + pad), chk, a, nbytes)
+            '(then (if %s (then %s)))) '
+            '(local.get $__wa))') % (ptr, a, i32(BASE), pad, i32(PAGES * 4096 + pad), chk, slow)
 
 # ---- COALESCING ------------------------------------------------------------------------------------
 # One check for a straight-line run of stores through the same base pointer. Conservative on purpose;
@@ -105,6 +110,13 @@ MUTANT = os.environ.get('WB_MUTANT') == '1'
 MUTANT2 = os.environ.get('WB_MUTANT') == '2'
 MUTANT2_PHASE = int(os.environ.get('WB_MUTANT_PHASE', '0')) % 50   # which 1-in-50 sites WB_MUTANT=2 drops
 NOCHECK = os.environ.get('WB_MUTANT') == '3'
+# WB_MUTANT_FN=regex (test only): every store site in the functions whose name matches gets no check. Dropping
+# 1 site in 50 can leave a page logged by its other writers; a whole function can be a page's only writer.
+FNMUT = re.compile(os.environ['WB_MUTANT_FN']) if os.environ.get('WB_MUTANT_FN') else None
+# WB_ATTR=1 (diagnostic, with WB_CENSUS=1 and WB_MUTANT_FN): the mutant's stores note their pages
+# (rollback.c mp4wb_tgt_note) and every slow path names its site, so the page can say which site covered them
+ATTR = os.environ.get('WB_ATTR') == '1'
+fnmut_n = [0]
 mut_n = [0]
 # WB_CENSUS=1 (measurement only): every checked site counts its executions in src/rollback.c mp4wb_census[k];
 # WB_CENSUS_OUT names the file that maps k -> function
@@ -248,7 +260,9 @@ def rewrite(body):
                 stats['const_out'] = stats.get('const_out', 0) + 1
                 body = body[:i] + ptr + body[j + 1:]
                 continue
-        if NOCHECK and how:
+        if FNMUT and FNMUT.search(cur_fn[0]):
+            rep_ = ('(call $mp4wb_tgt_note %s)' % ptr) if ATTR else ptr; fnmut_n[0] += 1
+        elif NOCHECK and how:
             rep_ = ptr
         elif how and how[0] == 's':
             rep_ = ptr                                       # covered by the run's first store
@@ -288,4 +302,5 @@ text = text[:e + 1] + decl_imp + decl_def + text[e + 1:]
 open(dst, 'w').write(text)
 if CENSUS:
     open(os.environ.get('WB_CENSUS_OUT', '/tmp/wb_census_map.txt'), 'w').write('\n'.join(census_map) + '\n')
+if FNMUT: print('[wb] WB_MUTANT_FN: %d sites unchecked in functions matching %s' % (fnmut_n[0], FNMUT.pattern))
 print('[wb] store check inlined at %d sites in %d functions; coalesced: %d runs, %d stores covered by their run\'s first check; %d constant addresses outside the range left unchecked%s' % (ns, nf, stats['runs'], stats['covered'], stats.get('const_out', 0), ' (MUTANT)' if MUTANT else (' (MUTANT2: %d sites unchecked)' % (mut_n[0] // 50) if MUTANT2 else (' (NOCHECK: measurement only)' if NOCHECK else ''))))
