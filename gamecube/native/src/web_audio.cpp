@@ -60,12 +60,15 @@ extern uint8_t* salPCLogBuf;
 extern uint32_t salPCLogLen, salPCLogOverflow, mp4web_audio_log_serial;
 void salPCLogFrame(uint32_t serial);
 }
-EM_JS(void, mp4web_audio_log_js, (const uint8_t* log, int len, int ok, int frames), {
-  if (Module.mp4AudioLog) Module.mp4AudioLog(HEAPU8.subarray(log, log + len), ok, frames);
+// the page's answer: 1 the log reached a render module, 0 it did not, 2 it reached a different render instance than
+// the last one (the sent-data shadow, web_port.cpp, keys on it)
+EM_JS(int, mp4web_audio_log_js, (const uint8_t* log, int len, int ok, int frames), {
+  return Module.mp4AudioLog ? (Module.mp4AudioLog(HEAPU8.subarray(log, log + len), ok, frames) | 0) : 0;
 });
+extern "C" void salPCShadowFrameEnd(int delivered);   // web_port.cpp
 // the end of a guest frame's audio: hand the log over, start the next (its header and resync snapshot)
 static void ship_log(int frames) {
-  mp4web_audio_log_js(salPCLogBuf, static_cast<int>(salPCLogLen), salPCLogOverflow ? 0 : 1, frames);
+  salPCShadowFrameEnd(mp4web_audio_log_js(salPCLogBuf, static_cast<int>(salPCLogLen), salPCLogOverflow ? 0 : 1, frames));
   salPCLogFrame(++mp4web_audio_log_serial);
 }
 #endif
