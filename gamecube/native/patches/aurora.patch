@@ -1492,6 +1492,36 @@ index 013afc0..60a2321 100644
    auto textureView = texture.CreateView(&textureViewDescriptor);
    return std::make_shared<TextureRef>(std::move(texture), std::move(textureView), wgpu::TextureView{}, size, wgpuFormat,
                                        mips, gxFormat);
+diff --git a/lib/gfx/texture_replacement.cpp b/lib/gfx/texture_replacement.cpp
+index ad37737..b9c0076 100644
+--- a/lib/gfx/texture_replacement.cpp
++++ b/lib/gfx/texture_replacement.cpp
+@@ -1005,6 +1005,12 @@ void shutdown() noexcept {
+ }
+ 
+ void register_tlut(const GXTlutObj* obj, const void* data, GXTlutFmt format, uint16_t entries) noexcept {
++#ifdef __EMSCRIPTEN__
++  // web port: no replacement is ever registered here (the front-end that loads texture packs is not built), and
++  // this metadata is read only by find_replacement once one is. Copying every TLUT at each GXInitTlutObj and
++  // cloning it at each GXLoadTlut was ~2.8% of a toaster room console's main-thread busy time.
++  return;
++#endif
+   if (obj == nullptr || data == nullptr) {
+     return;
+   }
+@@ -1022,6 +1028,12 @@ void register_tlut(const GXTlutObj* obj, const void* data, GXTlutFmt format, uin
+ }
+ 
+ void load_tlut(const GXTlutObj* obj, uint32_t idx) noexcept {
++#ifdef __EMSCRIPTEN__
++  // web port: no replacement is ever registered here (the front-end that loads texture packs is not built), and
++  // this metadata is read only by find_replacement once one is. Copying every TLUT at each GXInitTlutObj and
++  // cloning it at each GXLoadTlut was ~2.8% of a toaster room console's main-thread busy time.
++  return;
++#endif
+   if (idx >= s_loadedTluts.size()) {
+     return;
+   }
 diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
 index 9748556..026c6a4 100644
 --- a/lib/gx/command_processor.cpp
