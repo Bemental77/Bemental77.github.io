@@ -7,6 +7,8 @@
 // re-anchors (rather than racing to catch up — the game is never sped up).
 #include <emscripten.h>
 #include <cstdint>
+#include <cstring>
+#include <cstdlib>
 #include <dolphin/pad.h>
 #include <xxhash.h>
 #include <aurora/gfx.h>
@@ -107,6 +109,76 @@ uint32_t salPCLogCap = sizeof(g_audioLog);
 uint32_t salPCLogLen = 0;
 uint32_t salPCLogOverflow = 0;
 uint32_t mp4web_audio_log_serial = 0;
+}
+// THE SENT-DATA SHADOW (musyx hw_pc.c flushRunVals): what the render module's sample mirror holds, as far as
+// the control side knows, in 64-byte chunks. A chunk whose bytes match what was last delivered is not sent
+// again (each guest frame re-sent every source byte its voices read: ~22 KB a frame through the log, the
+// page's ring and the render module's mirror). Host-side, outside the game's state like the log: it tracks
+// the render module, which a rollback does not rewind. A chunk is clean only while its valid bit is set:
+// the bits of a frame's sends are dropped when the page did not deliver that frame's log (a muted
+// re-simulation, a hidden frame, a full ring, an overflow), and all of them when the log went to a
+// different render instance than the last one (the worklet taking over from the main thread, or back).
+// (its tables are allocated on first use rather than static: static, they moved every game address after
+// them in the link — 0xE0000 B — and with them the link-map constants the test routes read, e.g. omcurovl)
+static uint8_t** g_shadowPage = nullptr;     // [65536]: 64 KiB pages of shadow bytes, then 1024 valid bits (128 B)
+static uint16_t* g_shadowUsed = nullptr;     // [65536]: the allocated pages, for a reset
+static uint32_t g_shadowUsedN = 0;
+static uint32_t (*g_shadowSent)[2] = nullptr;   // [4096]: this frame's sends (addr, len)
+static uint32_t g_shadowSentN = 0, g_shadowSentLost = 0;
+static bool shadow_init() {
+  if (g_shadowPage) return true;
+  g_shadowPage = static_cast<uint8_t**>(calloc(1u << 16, sizeof(uint8_t*)));
+  g_shadowUsed = static_cast<uint16_t*>(calloc(1u << 16, sizeof(uint16_t)));
+  g_shadowSent = static_cast<uint32_t(*)[2]>(calloc(4096, sizeof(uint32_t[2])));
+  if (!g_shadowPage || !g_shadowUsed || !g_shadowSent) { free(g_shadowPage); free(g_shadowUsed); free(g_shadowSent); g_shadowPage = nullptr; return false; }
+  return true;
+}
+static uint8_t* shadow_page(uint32_t page) {
+  uint8_t* p = g_shadowPage[page];
+  if (!p) {
+    p = static_cast<uint8_t*>(calloc(1, 65536 + 128));
+    if (!p) return nullptr;
+    g_shadowPage[page] = p; g_shadowUsed[g_shadowUsedN++] = static_cast<uint16_t>(page);
+  }
+  return p;
+}
+static void shadow_invalidate(uint32_t addr, uint32_t len) {
+  if (!g_shadowPage) return;
+  for (uint32_t c = addr & ~63u; c < addr + len; c += 64) {
+    uint8_t* p = g_shadowPage[c >> 16];
+    if (p) { const uint32_t k = (c & 65535u) >> 6; p[65536 + (k >> 3)] &= static_cast<uint8_t>(~(1u << (k & 7))); }
+  }
+}
+static void shadow_reset() { if (g_shadowPage) for (uint32_t i = 0; i < g_shadowUsedN; ++i) memset(g_shadowPage[g_shadowUsed[i]] + 65536, 0, 128); }
+extern "C" {
+// a 64-byte-aligned chunk the render module already holds byte for byte
+int salPCShadowClean(uint32_t c) {
+  if (!g_shadowPage) return 0;
+  const uint8_t* p = g_shadowPage[c >> 16];
+  if (!p) return 0;
+  const uint32_t k = (c & 65535u) >> 6;
+  if (!(p[65536 + (k >> 3)] & (1u << (k & 7)))) return 0;
+  return memcmp(p + (c & 65535u), reinterpret_cast<const void*>(static_cast<uintptr_t>(c)), 64) == 0;
+}
+// chunks [c, c + len) were just written into the log
+void salPCShadowSent(uint32_t c, uint32_t len) {
+  if (!shadow_init()) return;
+  for (uint32_t a = c; a < c + len; a += 64) {
+    uint8_t* p = shadow_page(a >> 16);
+    if (!p) continue;
+    memcpy(p + (a & 65535u), reinterpret_cast<const void*>(static_cast<uintptr_t>(a)), 64);
+    const uint32_t k = (a & 65535u) >> 6;
+    p[65536 + (k >> 3)] |= static_cast<uint8_t>(1u << (k & 7));
+  }
+  if (g_shadowSentN < 4096) { g_shadowSent[g_shadowSentN][0] = c; g_shadowSent[g_shadowSentN][1] = len; ++g_shadowSentN; }
+  else g_shadowSentLost = 1;
+}
+// the page's answer for one frame's log: 1 delivered, 0 not, 2 delivered to a different render instance
+void salPCShadowFrameEnd(int delivered) {
+  if (delivered == 2 || (delivered == 0 && g_shadowSentLost)) shadow_reset();
+  else if (delivered == 0) for (uint32_t i = 0; i < g_shadowSentN; ++i) shadow_invalidate(g_shadowSent[i][0], g_shadowSent[i][1]);
+  g_shadowSentN = 0; g_shadowSentLost = 0;
+}
 }
 static int32_t g_input[4][8];
 static void latch_input(uint64_t frame) {

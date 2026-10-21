@@ -338,13 +338,19 @@
     var tnow = performance.now(), st = audio.stall || (audio.stall = [0, 0, 0, 0]);
     if (audio.lastLogT && !(window.Mp4Room && Mp4Room.pushMuted())) { var dl = tnow - audio.lastLogT; if (dl > 50) st[0]++; if (dl > 100) st[1]++; if (dl > 200) st[2]++; if (dl > 500) st[3]++; }
     if (!(window.Mp4Room && Mp4Room.pushMuted())) audio.lastLogT = tnow;
-    if (window.Mp4Room && Mp4Room.pushMuted()) { audio.muted += frames; return; }   // a re-simulated or hidden room frame: already heard / not shown
-    if (!ok) { audio.overflows = (audio.overflows || 0) + 1; return; }
+    // the answer (the game's sent-data shadow keys on it: it sends sample bytes a render module already holds only
+    // once): 0 = this log reached no render module, 1 = it did, 2 = it reached a different instance than the last
+    if (window.Mp4Room && Mp4Room.pushMuted()) { audio.muted += frames; return 0; }   // a re-simulated or hidden room frame: already heard / not shown
+    if (!ok) { audio.overflows = (audio.overflows || 0) + 1; return 0; }
+    var sink;
     if (audio.wlAud) {
-      if (audio.ring) { if (!ringWrite(audio.ring, u8)) audio.ringFull = (audio.ringFull || 0) + 1; return; }
-      batchLog(u8); return;
-    }
-    if (audio.main) { var pcm = audio.main.render(u8); if (pcm.length) audioPush(pcm, 32000, true); }
+      if (audio.ring) { if (!ringWrite(audio.ring, u8)) { audio.ringFull = (audio.ringFull || 0) + 1; return 0; } }
+      else if (!batchLog(u8)) return 0;
+      sink = audio.node;
+    } else if (audio.main) { var pcm = audio.main.render(u8); if (pcm.length) audioPush(pcm, 32000, true); sink = audio.main; }
+    else return 0;
+    if (sink !== audio.logSink) { audio.logSink = sink; return 2; }
+    return 1;
   }
 
   // The FALLBACK (a page the service worker could not isolate: the first load before it registers, a browser without
@@ -356,11 +362,12 @@
     var B = audio.batch || (audio.batch = { buf: new Uint8Array(1 << 18), len: 0, n: 0, timer: 0 });
     var need = 4 + ((u8.length + 3) & ~3);
     if (B.len + need > B.buf.length) flushLogs();
-    if (need > B.buf.length) return;
+    if (need > B.buf.length) return false;
     new DataView(B.buf.buffer).setUint32(B.len, u8.length, true);
     B.buf.set(u8, B.len + 4); B.len += need; B.n++;
     if (B.n >= 3) flushLogs();
     else if (!B.timer) B.timer = setTimeout(flushLogs, 40);
+    return true;
   }
   function flushLogs() {
     var B = audio.batch; if (!B) return;

@@ -451,7 +451,7 @@ index 0000000..965b1c5
 +  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 +};
 diff --git a/src/musyx/runtime/hw_pc.c b/src/musyx/runtime/hw_pc.c
-index 65abcc5..2dc42b6 100644
+index 65abcc5..2e08150 100644
 --- a/src/musyx/runtime/hw_pc.c
 +++ b/src/musyx/runtime/hw_pc.c
 @@ -1,10 +1,12 @@
@@ -597,7 +597,7 @@ index 65abcc5..2dc42b6 100644
    for (int i = 0; i < frames; ++i) {
      state->itdHistory[state->itdIndex & 127] = voiceDecodeBuf[i];
      for (u32 channel = 0; channel < 2; ++channel) {
-@@ -343,42 +401,394 @@ static int renderVoiceSegment(DSPvoice *vp, s32 *mainL, s32 *mainR, s32 *mainS,
+@@ -343,42 +401,417 @@ static int renderVoiceSegment(DSPvoice *vp, s32 *mainL, s32 *mainR, s32 *mainS,
    return voiceDone;
  }
  
@@ -606,6 +606,10 @@ index 65abcc5..2dc42b6 100644
 +/* salPCLogBuf/Cap/Len/Overflow are defined by the web port, outside the game's state: the log is
 + * output, and nothing here reads it back (the control state never depends on it, overflow included) */
 +
++#ifdef __EMSCRIPTEN__
++int salPCShadowClean(u32 chunk);
++void salPCShadowSent(u32 chunk, u32 len);
++#endif
 +static void *logPut(u32 type, u32 bytes) {
 +  const u32 need = 4 + ((bytes + 3) & ~3u);
 +  if (!salPCLogBuf || salPCLogLen + need > salPCLogCap) {
@@ -667,11 +671,30 @@ index 65abcc5..2dc42b6 100644
 +  case SAMPLE_TYPE_PCM8: b0 = first; b1 = last + 1; break;
 +  default: return;
 +  }
++#ifdef __EMSCRIPTEN__
++  /* only the 64-byte chunks the render module does not already hold byte for byte (the sent-data shadow,
++   * outside the game's state: gamecube/native/src/web_port.cpp); a chunk goes whole */
++  const u32 hi = addr + b1;
++  u32 c = (addr + b0) & ~63u;
++  while (c < hi) {
++    while (c < hi && salPCShadowClean(c)) c += 64;
++    if (c >= hi) break;
++    const u32 s = c;
++    while (c < hi && !salPCShadowClean(c)) c += 64;
++    const u32 len = c - s;
++    u32 *r = logPut(SALR_DATA, 8 + len);
++    if (!r) return;
++    r[0] = s; r[1] = len;
++    memcpy(r + 2, (const void *)(uintptr_t)s, len);
++    salPCShadowSent(s, len);
++  }
++#else
 +  const u32 len = b1 - b0;
 +  u32 *r = logPut(SALR_DATA, 8 + len);
 +  if (!r) return;
 +  r[0] = addr + b0; r[1] = len;
 +  memcpy(r + 2, (const void *)(uintptr_t)(addr + b0), len);
++#endif
 +}
 +
 +/* resampleVoice's cursor half: every phase step and source read, no sample values. The cursor (phase,
@@ -1013,7 +1036,7 @@ index 65abcc5..2dc42b6 100644
          if (vp->postBreak || (vp->changed[0] & 0x20)) {
            if (vp->state != DSP_VOICE_STATE_STARTING || vp->startupBreak) {
              salDeactivateVoice(vp);
-@@ -389,7 +799,6 @@ void salCtrlDsp(s16 *dest) {
+@@ -389,7 +822,6 @@ void salCtrlDsp(s16 *dest) {
            vp->changed[0] &= ~0x20u;
          }
  
@@ -1021,7 +1044,7 @@ index 65abcc5..2dc42b6 100644
          if (vp->state == DSP_VOICE_STATE_STARTING) {
            if (adsrSetup(&vp->adsr) != 0) {
              salSynthSendMessage(vp, HW_MESSAGE_SAMPLE_END);
-@@ -397,7 +806,6 @@ void salCtrlDsp(s16 *dest) {
+@@ -397,7 +829,6 @@ void salCtrlDsp(s16 *dest) {
              vp = nextVp;
              continue;
            }
@@ -1029,7 +1052,7 @@ index 65abcc5..2dc42b6 100644
            vp->virtualSampleID = UINT32_MAX;
            if (vp->smp_info.compType == SAMPLE_TYPE_ADPCM_VIRTUAL) {
              vp->vSampleInfo.loopBufferAddr = NULL;
-@@ -411,18 +819,10 @@ void salCtrlDsp(s16 *dest) {
+@@ -411,18 +842,10 @@ void salCtrlDsp(s16 *dest) {
                continue;
              }
            }
@@ -1052,7 +1075,7 @@ index 65abcc5..2dc42b6 100644
  
            VoiceResamplerState *native = &voiceResampler[voiceIdx];
            memset(native, 0, sizeof(*native));
-@@ -434,36 +834,29 @@ void salCtrlDsp(s16 *dest) {
+@@ -434,36 +857,29 @@ void salCtrlDsp(s16 *dest) {
              vp = nextVp;
              continue;
            }
@@ -1103,7 +1126,7 @@ index 65abcc5..2dc42b6 100644
            for (u8 subframe = mixStart; subframe < SAL_SUBFRAMES; ++subframe) {
              renderOffset = segmentOffset[subframe];
              if ((vp->changed[subframe] & 0x20) != 0) {
-@@ -472,13 +865,11 @@ void salCtrlDsp(s16 *dest) {
+@@ -472,13 +888,11 @@ void salCtrlDsp(s16 *dest) {
                finished = 1;
                break;
              } else if (vp->postBreak == 0) {
@@ -1118,7 +1141,7 @@ index 65abcc5..2dc42b6 100644
              if ((vp->changed[subframe] & 0x10) != 0) {
                if (adsrSetup(&vp->adsr) != 0) {
                  salSynthSendMessage(vp, HW_MESSAGE_SAMPLE_END);
-@@ -487,17 +878,14 @@ void salCtrlDsp(s16 *dest) {
+@@ -487,17 +901,14 @@ void salCtrlDsp(s16 *dest) {
                  break;
                }
              }
@@ -1138,7 +1161,7 @@ index 65abcc5..2dc42b6 100644
              renderOffset = segmentOffset[subframe + 1];
              if (sampleDone) {
                salSynthSendMessage(vp, HW_MESSAGE_SAMPLE_END);
-@@ -505,7 +893,6 @@ void salCtrlDsp(s16 *dest) {
+@@ -505,7 +916,6 @@ void salCtrlDsp(s16 *dest) {
                finished = 1;
                break;
              }
@@ -1146,7 +1169,7 @@ index 65abcc5..2dc42b6 100644
              if (adsrDone) {
                salSynthSendMessage(vp, HW_MESSAGE_SAMPLE_END);
                salDeactivateVoice(vp);
-@@ -513,22 +900,13 @@ void salCtrlDsp(s16 *dest) {
+@@ -513,22 +923,13 @@ void salCtrlDsp(s16 *dest) {
                break;
              }
            }
@@ -1174,7 +1197,7 @@ index 65abcc5..2dc42b6 100644
            if (finished) {
              vp = nextVp;
              continue;
-@@ -538,6 +916,42 @@ void salCtrlDsp(s16 *dest) {
+@@ -538,6 +939,42 @@ void salCtrlDsp(s16 *dest) {
        vp = nextVp;
      }
  
@@ -1217,7 +1240,7 @@ index 65abcc5..2dc42b6 100644
      for (u32 channel = 0; channel < 11; ++channel) {
        s32 *buffer = channel < 3   ? stp->main[salFrame]
                      : channel < 6 ? stp->auxA[salAuxFrame]
-@@ -653,11 +1067,9 @@ void salCtrlDsp(s16 *dest) {
+@@ -653,11 +1090,9 @@ void salCtrlDsp(s16 *dest) {
            foldStereoToOutput(dpl2Rear, dpl2Rear + SAL_SAMPLES_PER_FRAME);
        }
      }
@@ -1231,7 +1254,7 @@ index 65abcc5..2dc42b6 100644
    if (dest) {
      u32 channels = salPCChannels();
      for (u32 i = 0; i < cycleFrames; ++i) {
-@@ -681,7 +1093,693 @@ void salCtrlDsp(s16 *dest) {
+@@ -681,7 +1116,693 @@ void salCtrlDsp(s16 *dest) {
      }
    }
  }
@@ -1273,7 +1296,7 @@ index 65abcc5..2dc42b6 100644
 +          }
 +          vp->changed[0] &= ~0x20u;
 +        }
- 
++
 +        /* New voice initialization (mirrors salBuildCommandList startup path) */
 +        if (vp->state == DSP_VOICE_STATE_STARTING) {
 +          if (adsrSetup(&vp->adsr) != 0) {
@@ -1920,12 +1943,12 @@ index 65abcc5..2dc42b6 100644
 +}
 +u32 *salPCRenderStats(void) { return rStats; }
 +#endif /* SAL_PC_RENDER */
-+
+ 
 +#ifndef SAL_PC_RENDER
  bool salInitAi(SND_SOME_CALLBACK callback, u32 flags, u32 *outFreq) {
    (void)flags;
    salPCResetOutput(callback);
-@@ -690,6 +1788,10 @@ bool salInitAi(SND_SOME_CALLBACK callback, u32 flags, u32 *outFreq) {
+@@ -690,6 +1811,10 @@ bool salInitAi(SND_SOME_CALLBACK callback, u32 flags, u32 *outFreq) {
    memset(depop, 0, sizeof(depop));
    depopCursor = renderOffset = 0;
    initResampleTables();
@@ -1936,7 +1959,7 @@ index 65abcc5..2dc42b6 100644
    synthInfo.numSamples = 32;
    *outFreq = salPCMixRate();
    return true;
-@@ -760,6 +1862,10 @@ void salActivateStudio(u8 studio, u32 isMaster, SND_STUDIO_TYPE type) {
+@@ -760,6 +1885,10 @@ void salActivateStudio(u8 studio, u32 isMaster, SND_STUDIO_TYPE type) {
    state->type = type;
    state->auxAHandler = state->auxBHandler = NULL;
    state->auxAUser = state->auxBUser = NULL;
@@ -1947,7 +1970,7 @@ index 65abcc5..2dc42b6 100644
  }
  
  /* Hardware HRTF storage is not used by the native panner. */
-@@ -812,3 +1918,4 @@ void salReconnectVoice(DSPvoice *voice, u8 studio) {
+@@ -812,3 +1941,4 @@ void salReconnectVoice(DSPvoice *voice, u8 studio) {
    }
    voice->studio = studio;
  }
