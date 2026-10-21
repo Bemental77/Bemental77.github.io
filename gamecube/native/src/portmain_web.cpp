@@ -59,6 +59,9 @@ extern "C" int port_main(int argc, char* argv[]) {
     config.windowHeight = HU_FB_HEIGHT * 2;
     config.desiredBackend = BACKEND_WEBGPU;
     config.logCallback = &aurora_log_callback;
+    // the callback drops TRACE/DEBUG; with the level at INFO, aurora's Module::report returns before formatting
+    // them (~0.9% of a toaster room console's main-thread busy time went to formatting GX FIFO debug lines)
+    config.logLevel = LOG_INFO;
     config.mem1Size = 24 * 1024 * 1024;   // hardware MEM1; the game heaps live in the deterministic arena
     config.mem2Size = 16 * 1024 * 1024;   // hardware ARAM
     config.allowJoystickBackgroundEvents = false;

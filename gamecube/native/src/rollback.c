@@ -41,6 +41,22 @@ static uint8_t* g_table = mp4wb_table;
 // WB_CENSUS=1 builds only (wb/inline_hooks.py): one execution counter per store-check site. Unused otherwise.
 uint32_t mp4wb_census[1u << 18];
 EMSCRIPTEN_KEEPALIVE uint32_t* mp4web_wb_census(void) { return mp4wb_census; }
+// COVER ATTRIBUTION (diagnostic, wb/inline_hooks.py WB_ATTR=1 with WB_MUTANT_FN): which checked store site first
+// logged each page a whole-function mutant wrote unchecked, frame by frame. Its state lives in the census
+// array's top slots and in memory allocated at first use: a static here would move every game address.
+#define ATTR_SITE   (mp4wb_census[(1u << 18) - 1])   // the site about to take the slow path (written inline)
+#define ATTR_ON     (mp4wb_census[(1u << 18) - 2])   // set by the page (JS) to start
+#define ATTR_FIRST  (mp4wb_census[(1u << 18) - 3])   // -> u32[pages]: the first-logging site of each page this frame
+#define ATTR_LIST   (mp4wb_census[(1u << 18) - 4])   // -> u32[65536]: pages the target wrote this frame
+#define ATTR_LISTN  (mp4wb_census[(1u << 18) - 5])
+#define ATTR_COVER  (mp4wb_census[(1u << 18) - 6])   // -> u32[1 << 18]: pages covered, by covering site
+#define ATTR_BARE   (mp4wb_census[(1u << 18) - 7])   // target pages nothing logged in their frame
+#define ATTR_NOTES  (mp4wb_census[(1u << 18) - 8])   // target stores seen
+static void attr_alloc(uint32_t pages) {
+  if (!ATTR_FIRST) ATTR_FIRST = (uint32_t)(uintptr_t)calloc(pages ? pages : 1, 4);
+  if (!ATTR_LIST) ATTR_LIST = (uint32_t)(uintptr_t)calloc(65536, 4);
+  if (!ATTR_COVER) ATTR_COVER = (uint32_t)(uintptr_t)calloc(1u << 18, 4);
+}
 // A restore is writing pages: log nothing. VOLATILE, measured: as a plain int the compiler saw no read
 // of it between `= 1` and `= 0` in mp4web_rb_restore (memcpy is a builtin; the barrier that calls
 // mp4web_cow is merged in after the link) and deleted the `= 1`, so the restore's own copies were
@@ -102,6 +118,7 @@ static void grow_pool(void) {
 EMSCRIPTEN_KEEPALIVE void mp4web_cow(uint32_t p) {
   if (!g_on || g_restoring || p >= g_pages || g_table[p]) return;
   g_table[p] = 1;
+  if (ATTR_ON && ATTR_FIRST) ((uint32_t*)(uintptr_t)ATTR_FIRST)[p] = ATTR_SITE;
   if (g_head >= g_cap && g_keep >= 0 && g_cap < POOL_MAX) {
     const FrameLog* K = &g_log[g_keep % g_ring];
     if (K->frame == g_keep && g_head - g_cap >= K->start) grow_pool();   // would overwrite history still needed
@@ -197,9 +214,34 @@ static void restore_small(const uint8_t* src) {
 
 // The boundary before frame `frame` runs (frame == g_cur + 1 normally): close the open log, save
 // .data for the new frame, open its log.
+// a whole-function mutant's store (WB_ATTR=1): note its page, store through unchecked
+EMSCRIPTEN_KEEPALIVE uint32_t mp4wb_tgt_note(uint32_t addr) {
+  if (ATTR_ON && g_on && !g_restoring) {
+    attr_alloc(g_pages);
+    ++ATTR_NOTES;
+    const uint32_t rel = addr - g_base;
+    uint32_t* list = (uint32_t*)(uintptr_t)ATTR_LIST;
+    if (rel < (g_pages << PAGE_SHIFT) && list && ATTR_LISTN < 65536 && !(ATTR_LISTN && list[ATTR_LISTN - 1] == (rel >> PAGE_SHIFT)))
+      list[ATTR_LISTN++] = rel >> PAGE_SHIFT;
+  }
+  return addr;
+}
+static void attr_frame(void) {
+  if (!ATTR_ON || !ATTR_LIST || !ATTR_FIRST || !ATTR_COVER) { ATTR_LISTN = 0; return; }
+  uint32_t* list = (uint32_t*)(uintptr_t)ATTR_LIST;
+  for (uint32_t i = 0; i < ATTR_LISTN; ++i) {
+    const uint32_t p = list[i];
+    if (p >= g_pages) continue;
+    if (g_table[p]) { const uint32_t k = ((uint32_t*)(uintptr_t)ATTR_FIRST)[p]; if (k < (1u << 18)) ((uint32_t*)(uintptr_t)ATTR_COVER)[k]++; }
+    else { ++ATTR_BARE; if (p >= mp4wb_census[(1u << 18) - 9] && p < mp4wb_census[(1u << 18) - 10]) ++mp4wb_census[(1u << 18) - 11];
+      for (uint32_t j = 13; j < 29; ++j) { uint32_t* q = &mp4wb_census[(1u << 18) - j]; if (*q == p + 1) break; if (!*q) { *q = p + 1; break; } } }   // the first 16 distinct bare pages (+1), slots -13..-28   // in [slot -9, slot -10): a page range the page names (e.g. the fiber stacks)
+  }
+  ATTR_LISTN = 0;
+}
 EMSCRIPTEN_KEEPALIVE void mp4web_rb_boundary(int32_t frame) {
   if (!g_on) return;
   const double t0 = emscripten_get_now();
+  attr_frame();
   FrameLog* L = &g_log[g_cur % g_ring];
   L->count = g_head - L->start;
   for (uint64_t i = L->start; i < g_head; ++i) g_table[g_ent[i % g_cap]] = 0;
