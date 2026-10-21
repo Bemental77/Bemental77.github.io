@@ -63,7 +63,7 @@ def i32(v):
 
 def census_inc():
     if not CENSUS: return ''
-    k = len(census_map); census_map.append(cur_fn[0] + '\t' + cur_cls[0] + '\t' + cur_ptr[0])
+    k = len(census_map); census_map.append(cur_fn[0] + '\t' + cur_cls[0] + '\t' + cur_ptr[0] + '\t' + cur_mut[0])
     assert k < (1 << 18)
     return ('(i32.store offset=%d (i32.const %d) (i32.add (i32.load offset=%d (i32.const %d)) (i32.const 1))) '
             % (CENSUS_ADDR, 4 * k, CENSUS_ADDR, 4 * k))
@@ -114,6 +114,7 @@ census_map = []
 cur_fn = ['']
 cur_cls = ['']
 cur_ptr = ['']
+cur_mut = ['-']   # census: the site's WB_MUTANT=2 index (mut_n), '-' for a coalesced run's head
 # the C shadow-stack pointer: the first mutable i32 global whose initial value is a high address (wasm-ld)
 SPG = None
 for gm in re.finditer(r'\(global (\$\S+) \(mut i32\) \(i32\.const (\d+)\)\)', text):
@@ -252,11 +253,12 @@ def rewrite(body):
         elif how and how[0] == 's':
             rep_ = ptr                                       # covered by the run's first store
         elif how and how[0] == 'c':
+            cur_mut[0] = '-'
             rep_ = site(ptr, how[2], how[1], max(8, how[2]))  # the whole run's span, before its first store
         elif NOCHECK:
             rep_ = ptr
         else:
-            mut_n[0] += 1
+            mut_n[0] += 1; cur_mut[0] = str(mut_n[0])
             rep_ = ptr if (MUTANT2 and mut_n[0] % 50 == MUTANT2_PHASE) else site(ptr, int(nb.group(1)), int(of.group(1)) & 0xffffffff)
         body = body[:i] + rep_ + body[j + 1:]
     return body, len(ms)
