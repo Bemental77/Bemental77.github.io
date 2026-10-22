@@ -835,7 +835,7 @@ index 2d7f795..17cb345 100644
            g_keyboardBindings[i].m_buttonMapping, [&kbState, &i, &status](const PADKeyButtonBinding& mapping) {
              if (mapping.scancode > PAD_KEY_INVALID && kbState[mapping.scancode]) {
 diff --git a/lib/gfx/common.cpp b/lib/gfx/common.cpp
-index eff0c65..0a47b0d 100644
+index eff0c65..0bbf45f 100644
 --- a/lib/gfx/common.cpp
 +++ b/lib/gfx/common.cpp
 @@ -1,4 +1,41 @@
@@ -1042,14 +1042,22 @@ index eff0c65..0a47b0d 100644
        g_instance.ProcessEvents();
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds{100});
-@@ -1033,8 +1140,32 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
+@@ -1033,8 +1140,40 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
  bool begin_frame() {
    ZoneScoped;
    const size_t frameSlot = acquire_frame_slot();
 +#ifdef __EMSCRIPTEN__
 +  std::optional<size_t> stagingSlot;
 +  bool scratch = false;
-+  if (g_gpuNoWait) {
++  if (mp4web_gfx_skip_draws) {
++    // already known undrawn (a frame skip, a re-simulation, a hidden catch-up): the scratch area, not a staging
++    // buffer. Its texture uploads still reach the GPU (each in its own buffer: queue_texture_upload_data, encode_op)
++    // and palette conversions still run; nothing it would have copied into a staging buffer is ever drawn. A
++    // staging buffer cost these frames a WriteMappedRange, an Unmap and a MapAsync each (~1.3% of a toaster room
++    // console's main-thread busy time). Not counted as a GPU-busy scratch frame.
++    scratch = true;
++    if (g_scratch == nullptr) g_scratch = static_cast<uint8_t*>(malloc(StagingBufferSize));
++  } else if (g_gpuNoWait) {
 +    if (auto sl = g_stagingSlots.try_acquire()) {
 +      const auto st = s_mappingStates[*sl].load(std::memory_order_acquire);
 +      if (st == BufferMapState::Mapped) stagingSlot = sl;
@@ -1076,7 +1084,7 @@ index eff0c65..0a47b0d 100644
      g_frameSlots.release(frameSlot);
      return false;
    }
-@@ -1043,17 +1174,32 @@ bool begin_frame() {
+@@ -1043,17 +1182,32 @@ bool begin_frame() {
    frame = {};
    frame.frameId = g_nextFrameId++;
    frame.frameIndex = g_frameIndex;
@@ -1112,7 +1120,7 @@ index eff0c65..0a47b0d 100644
      bufferOffset += size;
    };
    mapBuffer(frame.verts, VertexBufferSize);
-@@ -1081,10 +1227,12 @@ bool begin_frame() {
+@@ -1081,10 +1235,12 @@ bool begin_frame() {
    push_command(CommandType::SetScissor, Command::Data{.setScissor = g_cachedScissor});
    begin_pipeline_frame();
    render_worker::enqueue_begin_frame(frame.frameId, [frameSlot] {
@@ -1125,7 +1133,7 @@ index eff0c65..0a47b0d 100644
    });
    return true;
  }
-@@ -1110,6 +1258,9 @@ void end_frame(EndFrameCallback callback) {
+@@ -1110,6 +1266,9 @@ void end_frame(EndFrameCallback callback) {
    ZoneScoped;
    ASSERT(!g_inOffscreen, "end_frame called while offscreen rendering is active");
    ASSERT(g_currentRenderPass == UINT32_MAX, "end_frame called before finish finalized the current render pass");
@@ -1135,7 +1143,7 @@ index eff0c65..0a47b0d 100644
    auto& frame = current_frame_packet();
    frame.stats.drawCallCount = g_drawCallCount;
    frame.stats.mergedDrawCallCount = g_mergedDrawCallCount;
-@@ -1118,6 +1269,28 @@ void end_frame(EndFrameCallback callback) {
+@@ -1118,6 +1277,28 @@ void end_frame(EndFrameCallback callback) {
    frame.stats.lastIndexSize = frame.indices.size();
    frame.stats.lastStorageSize = frame.storage.size();
    frame.stats.lastTextureUploadSize = frame.textureUpload.size();
@@ -1164,7 +1172,7 @@ index eff0c65..0a47b0d 100644
  
    const size_t frameSlot = g_recordingFrameSlot;
    const uint64_t frameId = frame.frameId;
-@@ -1145,8 +1318,10 @@ void end_frame(EndFrameCallback callback) {
+@@ -1145,8 +1326,10 @@ void end_frame(EndFrameCallback callback) {
    const size_t stagingSlot = frame.stagingBuffer;
    render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback)]() mutable {
      auto& packet = g_framePackets[frameSlot];
@@ -1177,7 +1185,7 @@ index eff0c65..0a47b0d 100644
      auto encoder = std::move(packet.encoder);
      const auto stats = packet.stats;
      packet = {};
-@@ -1162,7 +1337,7 @@ void end_frame(EndFrameCallback callback) {
+@@ -1162,7 +1345,7 @@ void end_frame(EndFrameCallback callback) {
        callback(encoder);
      }
      expire_cached_bind_groups();
@@ -1186,7 +1194,7 @@ index eff0c65..0a47b0d 100644
    });
  }
  
-@@ -1232,15 +1407,45 @@ static void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& f
+@@ -1232,15 +1415,45 @@ static void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& f
  }
  
  static void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
@@ -1233,7 +1241,7 @@ index eff0c65..0a47b0d 100644
        cmd.CopyTextureToTexture(&op.textureCopy->src, &op.textureCopy->dst, &op.textureCopy->size);
      }
      break;
-@@ -1392,7 +1597,14 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
+@@ -1392,7 +1605,14 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
        const auto& vp = cmd.data.setViewport;
        const float minDepth = gx::UseReversedZ ? 1.f - vp.zfar : vp.znear;
        const float maxDepth = gx::UseReversedZ ? 1.f - vp.znear : vp.zfar;
