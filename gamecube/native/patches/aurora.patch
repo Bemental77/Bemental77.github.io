@@ -835,7 +835,7 @@ index 2d7f795..17cb345 100644
            g_keyboardBindings[i].m_buttonMapping, [&kbState, &i, &status](const PADKeyButtonBinding& mapping) {
              if (mapping.scancode > PAD_KEY_INVALID && kbState[mapping.scancode]) {
 diff --git a/lib/gfx/common.cpp b/lib/gfx/common.cpp
-index eff0c65..0bbf45f 100644
+index eff0c65..753832b 100644
 --- a/lib/gfx/common.cpp
 +++ b/lib/gfx/common.cpp
 @@ -1,4 +1,41 @@
@@ -880,7 +880,22 @@ index eff0c65..0bbf45f 100644
  
  #include "clear.hpp"
  #include "depth_peek.hpp"
-@@ -221,6 +258,8 @@ struct FramePacket {
+@@ -110,6 +147,14 @@ namespace {
+ struct CachedBindGroup {
+   wgpu::BindGroup bindGroup;
+   uint32_t lastUsedFrame = 0;
++  // THE KEY IS A HASH OF THE DESCRIPTOR, WHICH HOLDS RAW OBJECT POINTERS (texture views, samplers, buffers). A
++  // released object's address is reused by the next allocation, so a texture created later at the same address
++  // hashed to this entry and drew with the OLD texture: on the web, timing-dependent wrong textures (a board's
++  // ground drawn with a font atlas, a HUD coin or star replaced by another image). Holding a reference to every
++  // object the descriptor names keeps those addresses from being reused while the entry can still be found.
++  std::vector<wgpu::TextureView> views;
++  std::vector<wgpu::Sampler> samplers;
++  std::vector<wgpu::Buffer> buffers;
+ };
+ 
+ constexpr uint32_t BindGroupCacheRetainFrames = 32;
+@@ -221,6 +266,8 @@ struct FramePacket {
    AuroraStats stats{};
    uint32_t drawCallCount = 0;
    uint32_t mergedDrawCallCount = 0;
@@ -889,7 +904,7 @@ index eff0c65..0bbf45f 100644
  };
  
  static std::array<FramePacket, FrameSlotCount> g_framePackets;
-@@ -239,7 +278,11 @@ static webgpu::TextureWithSampler g_offscreenDepth;
+@@ -239,7 +286,11 @@ static webgpu::TextureWithSampler g_offscreenDepth;
  static Viewport g_cachedViewport;
  static ClipRect g_cachedScissor;
  
@@ -901,7 +916,7 @@ index eff0c65..0bbf45f 100644
    auto expected = BufferMapState::Unmapped;
    if (!s_mappingStates[slot].compare_exchange_strong(expected, BufferMapState::Mapping, std::memory_order_acq_rel,
                                                       std::memory_order_acquire)) {
-@@ -248,7 +291,8 @@ static void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion = false
+@@ -248,7 +299,8 @@ static void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion = false
  
    g_stagingBuffers[slot].MapAsync(
        wgpu::MapMode::Write, 0, StagingBufferSize, wgpu::CallbackMode::AllowSpontaneous,
@@ -911,7 +926,7 @@ index eff0c65..0bbf45f 100644
          if (status == wgpu::MapAsyncStatus::CallbackCancelled || status == wgpu::MapAsyncStatus::Aborted) {
            Log.warn("Buffer mapping {}: {}", magic_enum::enum_name(status), message);
            s_mappingStates[slot].store(BufferMapState::Unmapped, std::memory_order_release);
-@@ -257,8 +301,16 @@ static void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion = false
+@@ -257,8 +309,16 @@ static void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion = false
            }
            return;
          }
@@ -928,7 +943,7 @@ index eff0c65..0bbf45f 100644
          s_mappingStates[slot].store(BufferMapState::Mapped, std::memory_order_release);
          if (releaseSlotOnCompletion) {
            g_stagingSlots.release(slot);
-@@ -297,7 +349,19 @@ struct OffscreenCacheEntry {
+@@ -297,7 +357,19 @@ struct OffscreenCacheEntry {
  };
  static absl::flat_hash_map<OffscreenCacheKey, OffscreenCacheEntry> g_offscreenCache;
  
@@ -948,7 +963,7 @@ index eff0c65..0bbf45f 100644
    CHECK(g_recordingFrame != nullptr, "No active frame packet");
    return *g_recordingFrame;
  }
-@@ -360,6 +424,22 @@ static void enqueue_op(FramePacket& frame, size_t frameSlot, uint32_t opIndex) {
+@@ -360,6 +432,22 @@ static void enqueue_op(FramePacket& frame, size_t frameSlot, uint32_t opIndex) {
        return;
      }
      auto& packet = g_framePackets[frameSlot];
@@ -971,7 +986,7 @@ index eff0c65..0bbf45f 100644
      encode_op(packet.encoder, packet, op);
    });
  }
-@@ -383,7 +463,7 @@ void queue_texture_upload_data(const uint8_t* data, size_t length, uint32_t byte
+@@ -383,7 +471,7 @@ void queue_texture_upload_data(const uint8_t* data, size_t length, uint32_t byte
                                 wgpu::TexelCopyTextureInfo tex, wgpu::Extent3D size) {
    const auto copyBytesPerRow = AURORA_ALIGN(bytesPerRow, 256);
    auto& frame = current_frame_packet();
@@ -980,7 +995,7 @@ index eff0c65..0bbf45f 100644
      const auto range = push_texture_data(data, length, bytesPerRow, rowsPerImage);
      const wgpu::TexelCopyBufferLayout layout{
          .offset = range.offset,
-@@ -977,6 +1057,7 @@ void shutdown() {
+@@ -977,6 +1065,7 @@ void shutdown() {
    for (auto& state : s_mappingStates) {
      state.store(BufferMapState::Unmapped, std::memory_order_release);
    }
@@ -988,7 +1003,7 @@ index eff0c65..0bbf45f 100644
  }
  
  static bool wait_for_staging_buffer(size_t slot) {
-@@ -991,6 +1072,9 @@ static bool wait_for_staging_buffer(size_t slot) {
+@@ -991,6 +1080,9 @@ static bool wait_for_staging_buffer(size_t slot) {
        return false;
      }
      if (render_worker::is_idle()) {
@@ -998,7 +1013,7 @@ index eff0c65..0bbf45f 100644
        g_instance.ProcessEvents();
      } else {
        std::this_thread::sleep_for(std::chrono::milliseconds{1});
-@@ -998,6 +1082,23 @@ static bool wait_for_staging_buffer(size_t slot) {
+@@ -998,6 +1090,23 @@ static bool wait_for_staging_buffer(size_t slot) {
    }
  }
  
@@ -1022,7 +1037,7 @@ index eff0c65..0bbf45f 100644
  static size_t acquire_frame_slot() {
    ZoneScopedN("Acquire frame slot");
    while (true) {
-@@ -1005,6 +1106,9 @@ static size_t acquire_frame_slot() {
+@@ -1005,6 +1114,9 @@ static size_t acquire_frame_slot() {
        return *slot;
      }
      if (render_worker::is_idle()) {
@@ -1032,7 +1047,7 @@ index eff0c65..0bbf45f 100644
        g_instance.ProcessEvents();
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds{100});
-@@ -1023,6 +1127,9 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
+@@ -1023,6 +1135,9 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
        return std::nullopt;
      }
      if (render_worker::is_idle()) {
@@ -1042,7 +1057,7 @@ index eff0c65..0bbf45f 100644
        g_instance.ProcessEvents();
      } else {
        std::this_thread::sleep_for(std::chrono::microseconds{100});
-@@ -1033,8 +1140,40 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
+@@ -1033,8 +1148,40 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
  bool begin_frame() {
    ZoneScoped;
    const size_t frameSlot = acquire_frame_slot();
@@ -1084,7 +1099,7 @@ index eff0c65..0bbf45f 100644
      g_frameSlots.release(frameSlot);
      return false;
    }
-@@ -1043,17 +1182,32 @@ bool begin_frame() {
+@@ -1043,17 +1190,32 @@ bool begin_frame() {
    frame = {};
    frame.frameId = g_nextFrameId++;
    frame.frameIndex = g_frameIndex;
@@ -1120,7 +1135,7 @@ index eff0c65..0bbf45f 100644
      bufferOffset += size;
    };
    mapBuffer(frame.verts, VertexBufferSize);
-@@ -1081,10 +1235,12 @@ bool begin_frame() {
+@@ -1081,10 +1243,12 @@ bool begin_frame() {
    push_command(CommandType::SetScissor, Command::Data{.setScissor = g_cachedScissor});
    begin_pipeline_frame();
    render_worker::enqueue_begin_frame(frame.frameId, [frameSlot] {
@@ -1133,7 +1148,7 @@ index eff0c65..0bbf45f 100644
    });
    return true;
  }
-@@ -1110,6 +1266,9 @@ void end_frame(EndFrameCallback callback) {
+@@ -1110,6 +1274,9 @@ void end_frame(EndFrameCallback callback) {
    ZoneScoped;
    ASSERT(!g_inOffscreen, "end_frame called while offscreen rendering is active");
    ASSERT(g_currentRenderPass == UINT32_MAX, "end_frame called before finish finalized the current render pass");
@@ -1143,7 +1158,7 @@ index eff0c65..0bbf45f 100644
    auto& frame = current_frame_packet();
    frame.stats.drawCallCount = g_drawCallCount;
    frame.stats.mergedDrawCallCount = g_mergedDrawCallCount;
-@@ -1118,6 +1277,28 @@ void end_frame(EndFrameCallback callback) {
+@@ -1118,6 +1285,28 @@ void end_frame(EndFrameCallback callback) {
    frame.stats.lastIndexSize = frame.indices.size();
    frame.stats.lastStorageSize = frame.storage.size();
    frame.stats.lastTextureUploadSize = frame.textureUpload.size();
@@ -1172,7 +1187,7 @@ index eff0c65..0bbf45f 100644
  
    const size_t frameSlot = g_recordingFrameSlot;
    const uint64_t frameId = frame.frameId;
-@@ -1145,8 +1326,10 @@ void end_frame(EndFrameCallback callback) {
+@@ -1145,8 +1334,10 @@ void end_frame(EndFrameCallback callback) {
    const size_t stagingSlot = frame.stagingBuffer;
    render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback)]() mutable {
      auto& packet = g_framePackets[frameSlot];
@@ -1185,7 +1200,7 @@ index eff0c65..0bbf45f 100644
      auto encoder = std::move(packet.encoder);
      const auto stats = packet.stats;
      packet = {};
-@@ -1162,7 +1345,7 @@ void end_frame(EndFrameCallback callback) {
+@@ -1162,7 +1353,7 @@ void end_frame(EndFrameCallback callback) {
        callback(encoder);
      }
      expire_cached_bind_groups();
@@ -1194,7 +1209,7 @@ index eff0c65..0bbf45f 100644
    });
  }
  
-@@ -1232,15 +1415,45 @@ static void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& f
+@@ -1232,15 +1423,45 @@ static void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& f
  }
  
  static void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
@@ -1241,7 +1256,7 @@ index eff0c65..0bbf45f 100644
        cmd.CopyTextureToTexture(&op.textureCopy->src, &op.textureCopy->dst, &op.textureCopy->size);
      }
      break;
-@@ -1392,7 +1605,14 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
+@@ -1392,7 +1613,14 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
        const auto& vp = cmd.data.setViewport;
        const float minDepth = gx::UseReversedZ ? 1.f - vp.zfar : vp.znear;
        const float maxDepth = gx::UseReversedZ ? 1.f - vp.znear : vp.zfar;
@@ -1257,6 +1272,39 @@ index eff0c65..0bbf45f 100644
      } break;
      case CommandType::SetScissor: {
        const auto& sc = cmd.data.setScissor;
+@@ -1531,16 +1759,28 @@ BindGroupRef bind_group_ref(const WGPUBindGroupDescriptor& descriptor) {
+   const auto it = g_cachedBindGroups.find(id);
+   if (it == g_cachedBindGroups.end()) {
+     auto bg = wgpu::BindGroup::Acquire(wgpuDeviceCreateBindGroup(g_device.Get(), &descriptor));
+-    g_cachedBindGroups.emplace(id, CachedBindGroup{
+-                                       .bindGroup = std::move(bg),
+-                                       .lastUsedFrame = g_frameIndex,
+-                                   });
++    CachedBindGroup entry{.bindGroup = std::move(bg), .lastUsedFrame = g_frameIndex};
++    for (size_t i = 0; i < descriptor.entryCount; ++i) {
++      const auto& e = descriptor.entries[i];
++      if (e.textureView) entry.views.emplace_back(e.textureView);   // the wrappers add a reference
++      if (e.sampler) entry.samplers.emplace_back(e.sampler);
++      if (e.buffer) entry.buffers.emplace_back(e.buffer);
++    }
++    g_cachedBindGroups.emplace(id, std::move(entry));
+   } else {
+     it->second.lastUsedFrame = g_frameIndex;
+   }
+   return id;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// web: the bind group cache's size (each entry now holds its views, samplers and buffers: this must stay bounded)
++extern "C" EMSCRIPTEN_KEEPALIVE double mp4web_gfx_bind_groups(void) {
++  std::lock_guard lock{g_bindGroupCacheMutex};
++  return static_cast<double>(g_cachedBindGroups.size());
++}
++#endif
++
+ wgpu::BindGroup find_bind_group(BindGroupRef id) {
+   std::lock_guard lock{g_bindGroupCacheMutex};
+   const auto it = g_cachedBindGroups.find(id);
 diff --git a/lib/gfx/common.hpp b/lib/gfx/common.hpp
 index db245d0..39258ab 100644
 --- a/lib/gfx/common.hpp
