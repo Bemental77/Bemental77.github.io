@@ -354,7 +354,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE double mp4web_busy_ms() { return g_busy; }
 // aurora's gfx/common.cpp calls this where it would spin on ProcessEvents waiting for a mapped buffer
 extern "C" void mp4web_yield_for_gpu(void) {
   const double t = emscripten_get_now();
-  emscripten_sleep(0);
+  emscripten_sleep(1);   // a timer, not a zero yield (src/rollback_lib.js): a wait on the GPU must not spin
   g_gpuWait += emscripten_get_now() - t;
 }
 extern "C" EMSCRIPTEN_KEEPALIVE double mp4web_gpu_wait_ms() { return g_gpuWait; }
