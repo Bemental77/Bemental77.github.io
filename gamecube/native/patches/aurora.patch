@@ -896,7 +896,7 @@ index 2d7f795..17cb345 100644
            g_keyboardBindings[i].m_buttonMapping, [&kbState, &i, &status](const PADKeyButtonBinding& mapping) {
              if (mapping.scancode > PAD_KEY_INVALID && kbState[mapping.scancode]) {
 diff --git a/lib/gfx/common.cpp b/lib/gfx/common.cpp
-index eff0c65..753832b 100644
+index eff0c65..26d491f 100644
 --- a/lib/gfx/common.cpp
 +++ b/lib/gfx/common.cpp
 @@ -1,4 +1,41 @@
@@ -1333,7 +1333,18 @@ index eff0c65..753832b 100644
      } break;
      case CommandType::SetScissor: {
        const auto& sc = cmd.data.setScissor;
-@@ -1531,16 +1759,28 @@ BindGroupRef bind_group_ref(const WGPUBindGroupDescriptor& descriptor) {
+@@ -1492,6 +1720,10 @@ Range push_uniform(const uint8_t* data, size_t length) {
+   ZoneScoped;
+   return push(current_frame_packet().uniforms, data, length, g_cachedLimits.minUniformBufferOffsetAlignment);
+ }
++uint64_t current_frame_packet_id() { return current_frame_packet().frameId; }
++Range push_storage_table(const uint8_t* data, size_t length) {   // web: gx's matrix table (read as words)
++  return push(current_frame_packet().storage, data, length, 16);
++}
+ Range push_storage(const uint8_t* data, size_t length) {
+   ZoneScoped;
+   return push(current_frame_packet().storage, data, length, g_cachedLimits.minStorageBufferOffsetAlignment);
+@@ -1531,16 +1763,28 @@ BindGroupRef bind_group_ref(const WGPUBindGroupDescriptor& descriptor) {
    const auto it = g_cachedBindGroups.find(id);
    if (it == g_cachedBindGroups.end()) {
      auto bg = wgpu::BindGroup::Acquire(wgpuDeviceCreateBindGroup(g_device.Get(), &descriptor));
@@ -1367,7 +1378,7 @@ index eff0c65..753832b 100644
    std::lock_guard lock{g_bindGroupCacheMutex};
    const auto it = g_cachedBindGroups.find(id);
 diff --git a/lib/gfx/common.hpp b/lib/gfx/common.hpp
-index db245d0..39258ab 100644
+index db245d0..3cff2a2 100644
 --- a/lib/gfx/common.hpp
 +++ b/lib/gfx/common.hpp
 @@ -127,6 +127,14 @@ public:
@@ -1408,6 +1419,15 @@ index db245d0..39258ab 100644
  
  extern AuroraStats g_stats;
  extern uint32_t g_drawCallCount;
+@@ -284,6 +303,8 @@ static Range push_indices(ArrayRef<T> data, size_t alignment) {
+   return push_indices(reinterpret_cast<const uint8_t*>(data.data()), data.size() * sizeof(T), alignment);
+ }
+ Range push_uniform(const uint8_t* data, size_t length);
++Range push_storage_table(const uint8_t* data, size_t length);
++uint64_t current_frame_packet_id();
+ template <typename T>
+ static Range push_uniform(const T& data) {
+   return push_uniform(reinterpret_cast<const uint8_t*>(&data), sizeof(T));
 diff --git a/lib/gfx/pipeline_cache.cpp b/lib/gfx/pipeline_cache.cpp
 index 04a4310..14a3daa 100644
 --- a/lib/gfx/pipeline_cache.cpp
@@ -1640,7 +1660,7 @@ index ad37737..b9c0076 100644
      return;
    }
 diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
-index 9748556..026c6a4 100644
+index 9748556..53fbb12 100644
 --- a/lib/gx/command_processor.cpp
 +++ b/lib/gx/command_processor.cpp
 @@ -1,4 +1,8 @@
@@ -1749,7 +1769,31 @@ index 9748556..026c6a4 100644
      numIndices = 6;
    } else
      UNLIKELY FATAL("unsupported primitive type {}", static_cast<u32>(prim));
-@@ -372,38 +363,62 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian);
+@@ -246,6 +237,7 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
+     CHECK(mtxIdx < MaxPnMtx, "XF: PosMtx copy oob? Should never happen; mtxIdx={}", mtxIdx);
+     CHECK(startOffset == 0 && len == 12, "XF: PosMtx sub-copy unsupported: offs={}, len={}", startOffset, len);
+     auto& mtx = g_gxState.pnMtx[mtxIdx].pos;
++    g_xfMtxDirty |= 1u << mtxIdx;
+     f32* flat = reinterpret_cast<f32*>(&mtx);
+     for (u32 i = 0; i < len; i++) {
+       flat[i] = read_f32(data + i * 4, bigEndian);
+@@ -262,6 +254,7 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
+ 
+     // Determine if 2x4 or 3x4 from count
+     auto& mtx = g_gxState.texMtxs[mtxIdx];
++    g_xfMtxDirty |= 1u << (MaxPnMtx + mtxIdx);
+     f32* flat = reinterpret_cast<f32*>(&mtx);
+     for (u32 i = 0; i < len; i++) {
+       flat[i] = read_f32(data + i * 4, bigEndian);
+@@ -277,6 +270,7 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
+     CHECK(mtxIdx < MaxPnMtx, "XF: NrmMtx copy oob? Should never happen; mtxIdx={}", mtxIdx);
+     CHECK(startOffset == 0 && len == 9, "XF: NrmMtx sub-copy unsupported: offs={}, len={}", startOffset, len);
+     auto& mtx = g_gxState.pnMtx[mtxIdx].nrm;
++    g_xfMtxDirty |= 1u << (MaxPnMtx + MaxTexMtx + mtxIdx);
+     f32* flat = reinterpret_cast<f32*>(&mtx);
+     for (u32 i = 0; i < len; i++) {
+       u32 xfIdx = i;
+@@ -372,38 +366,62 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian);
  static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian);
  static void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian);
  
@@ -1825,7 +1869,7 @@ index 9748556..026c6a4 100644
        break;
      }
  
-@@ -413,12 +428,12 @@ void process(const u8* data, u32 size, bool bigEndian) {
+@@ -413,12 +431,12 @@ void process(const u8* data, u32 size, bool bigEndian) {
      case CP_CMD_LOAD_INDX_D: {
        ZoneScopedN("LOAD_INDX");
        // Indexed XF load: 4 bytes of data
@@ -1841,7 +1885,7 @@ index 9748556..026c6a4 100644
        u16 len = (addrLen >> 12) + 1;
        u16 dstAddr = addrLen & 0x0FFF;
        if (!copy_xf_data(dstAddr, srcData, len, bigEndian)) {
-@@ -426,15 +441,15 @@ void process(const u8* data, u32 size, bool bigEndian) {
+@@ -426,15 +444,15 @@ void process(const u8* data, u32 size, bool bigEndian) {
          Log.debug("Unimplemented indexed XF load (opcode 0x{:02X}, dstAddr=%04x)", opcode, dstAddr);
  #endif
        }
@@ -1860,7 +1904,7 @@ index 9748556..026c6a4 100644
        break;
      }
  
-@@ -444,7 +459,7 @@ void process(const u8* data, u32 size, bool bigEndian) {
+@@ -444,7 +462,7 @@ void process(const u8* data, u32 size, bool bigEndian) {
      }
  
      case GX_LOAD_AURORA: {
@@ -1869,7 +1913,7 @@ index 9748556..026c6a4 100644
        break;
      }
  
-@@ -456,33 +471,21 @@ void process(const u8* data, u32 size, bool bigEndian) {
+@@ -456,33 +474,21 @@ void process(const u8* data, u32 size, bool bigEndian) {
      case GX_DRAW_LINES:
      case GX_DRAW_LINE_STRIP:
      case GX_DRAW_POINTS: {
@@ -1907,7 +1951,7 @@ index 9748556..026c6a4 100644
  }
  
  // Helper to extract bit fields from a 32-bit register
-@@ -1492,7 +1495,7 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
+@@ -1492,7 +1498,7 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
    pos += dataBytes;
  }
  
@@ -1916,7 +1960,7 @@ index 9748556..026c6a4 100644
    // Hex dump around the draw command for debugging
    u32 cmdPos = pos - 2 - 1; // opcode byte position (before vtxCount and pos++)
    u32 dumpStart = (cmdPos > 16) ? cmdPos - 16 : 0;
-@@ -1542,7 +1545,8 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
+@@ -1542,7 +1548,8 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
  // Draw command handler - parses vertices inline and caches results
  static ByteBuffer handle_draw_idx_buf;
  
@@ -1926,7 +1970,7 @@ index 9748556..026c6a4 100644
    ZoneScoped;
    u32 vtxSize;
    if (g_gxState.lastVtxFmt == fmt)
-@@ -1553,6 +1557,17 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* da
+@@ -1553,6 +1560,17 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* da
    u32 totalVtxBytes = vtxCount * vtxSize;
    if (pos + totalVtxBytes > size)
      UNLIKELY { handle_draw_overrun(totalVtxBytes, data, pos, size); }
@@ -1944,7 +1988,7 @@ index 9748556..026c6a4 100644
  
    auto* lastDraw = !g_gxState.stateDirty ? gfx::get_last_draw_command<DrawData>() : nullptr;
    const bool canMerge = lastDraw != nullptr && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS &&
-@@ -1594,10 +1609,11 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* da
+@@ -1594,10 +1612,11 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* da
      lastDraw->vtxCount += vtxCount;
      lastDraw->indexCount += numIndices;
      ++gfx::g_mergedDrawCallCount;
@@ -1957,7 +2001,7 @@ index 9748556..026c6a4 100644
  }
  
  static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian) {
-@@ -1608,7 +1624,7 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
+@@ -1608,7 +1627,7 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
    u16 vtxCount = read_u16(data + pos, bigEndian);
    pos += 2;
  
@@ -1966,7 +2010,7 @@ index 9748556..026c6a4 100644
  }
  
  static ByteBuffer handle_draw_unmerged_idxBuf;
-@@ -1832,15 +1848,19 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
+@@ -1832,15 +1851,19 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
               "GX_LOAD_AURORA_DRAW_SIZED: {} bytes is not a whole number of size-{} vertices", byteLen, vtxSize);
        u32 vtxCount = byteLen / vtxSize;
        ASSERT(vtxCount <= 0xFFFF, "GX_LOAD_AURORA_DRAW_SIZED: too many vertices ({})", vtxCount);
@@ -2113,8 +2157,23 @@ index 01a63e5..39e580c 100644
  
  // Internal buffer inspection
  const uint8_t* get_buffer_data();
+diff --git a/lib/gx/gx.hpp b/lib/gx/gx.hpp
+index 287bbd7..01d641e 100644
+--- a/lib/gx/gx.hpp
++++ b/lib/gx/gx.hpp
+@@ -390,6 +390,10 @@ struct GXState {
+   void clearVtxSizeCache() { lastVtxFmt = GX_MAX_VTXFMT; }
+ };
+ extern GXState g_gxState;
++// web: XF matrix slots written since their last upload into the frame's matrix table (bit s: s < 10 position
++// matrix s, s < 20 texture matrix s - 10, s < 30 normal matrix s - 20). Set by copy_xf_data, the only writer of
++// those matrices; build_uniform uploads each dirty slot once and points the draw's uniform at it.
++extern u32 g_xfMtxDirty;
+ struct ShaderInfo;
+ 
+ void initialize() noexcept;
 diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
-index 3671ed5..79e7315 100644
+index 3671ed5..a103437 100644
 --- a/lib/gx/shader.cpp
 +++ b/lib/gx/shader.cpp
 @@ -639,14 +639,15 @@ auto attr_address(const AttrConfig& mapping, GXAttr attr, std::string_view vidx,
@@ -2137,6 +2196,81 @@ index 3671ed5..79e7315 100644
          "abuf"sv, mapping.le};
    }
    return {fmt::format("ubuf.vtx_start + {} * {}u + {}u", vidx, vtxStride, dlOffset + within), "vbuf"sv, false};
+@@ -929,7 +930,7 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
+           "\n    let in_vidx = iidx;"
+           "\n    let in_pos = {};"
+           "\n    let in_pnmtxidx = {};"
+-          "\n    let mv_pos = vec4f(in_pos, 1.0) * ubuf.postex_mtx[in_pnmtxidx];",
++          "\n    let mv_pos = vec4f(in_pos, 1.0) * mtx_pt(in_pnmtxidx);",
+           attr_load(config, GX_VA_POS, "in_vidx"sv), attr_load(config, GX_VA_PNMTXIDX, "in_vidx"sv));
+     } else {
+       // GX_LINES / GX_LINESTRIP: each instance = two vertices, expand to quad
+@@ -944,8 +945,8 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
+           "\n    let pnmtxidx_a = {};"
+           "\n    let pnmtxidx_b = {};"
+           "\n    let in_pnmtxidx = select(pnmtxidx_a, pnmtxidx_b, use_b);"
+-          "\n    let mv_pos_a = vec4f(pos_a, 1.0) * ubuf.postex_mtx[pnmtxidx_a];"
+-          "\n    let mv_pos_b = vec4f(pos_b, 1.0) * ubuf.postex_mtx[pnmtxidx_b];"
++          "\n    let mv_pos_a = vec4f(pos_a, 1.0) * mtx_pt(pnmtxidx_a);"
++          "\n    let mv_pos_b = vec4f(pos_b, 1.0) * mtx_pt(pnmtxidx_b);"
+           "\n    let mv_pos = select(mv_pos_a, mv_pos_b, use_b);",
+           config.lineMode == 1 ? 2 : 1, attr_load(config, GX_VA_POS, "vidx_a"sv),
+           attr_load(config, GX_VA_POS, "vidx_b"sv), attr_load(config, GX_VA_PNMTXIDX, "vidx_a"sv),
+@@ -988,7 +989,7 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
+ 
+   if (config.lineMode == 0) {
+     vtxXfrAttrsPre += fmt::format(
+-        "\n    let mv_pos = vec4f({}, 1.0) * ubuf.postex_mtx[in_pnmtxidx];"
++        "\n    let mv_pos = vec4f({}, 1.0) * mtx_pt(in_pnmtxidx);"
+         "\n    out.pos = vec4f(mv_pos, 1.0) * ubuf.proj;",
+         vtx_attr(config, GX_VA_POS));
+   } else if (config.lineMode == 3) {
+@@ -1025,7 +1026,7 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
+     vtxXfrAttrsPre += "\n    out.pos.z += out.pos.w;";
+   }
+   vtxXfrAttrsPre += fmt::format(
+-      "\n    let nrm_tmp = vec4f({}, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
++      "\n    let nrm_tmp = vec4f({}, 0.0) * mtx_nrm(in_pnmtxidx);"
+       "\n    let mv_nrm = select(nrm_tmp, normalize(nrm_tmp), dot(nrm_tmp, nrm_tmp) > 1e-10);",
+       vtx_attr(config, GX_VA_NRM));
+   if constexpr (EnableNormalVisualization) {
+@@ -1034,8 +1035,8 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
+   }
+ 
+   uniBufAttrs += "\n    proj: mat4x4f,";
+-  uniBufAttrs += fmt::format("\n    postex_mtx: array<mat3x4f, {}>,", MaxPnMtx + MaxTexMtx);
+-  uniBufAttrs += fmt::format("\n    nrm_mtx: array<mat3x4f, {}>,", MaxPnMtx);
++  // web: offsets (in words) of the 30 matrix slots in the frame's matrix table (abuf); see build_uniform
++  uniBufAttrs += "\n    mtx_ofs: array<vec4u, 8>,";
+   std::string fragmentFnPre;
+   std::string fragmentFn;
+ 
+@@ -1171,8 +1172,8 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
+       const u32 lightIdx = tcg.type - GX_TG_BUMP0;
+       vtxXfrAttrs += fmt::format(
+           "\n    let bump_ldir{0} = normalize(ubuf.lights[{1}].pos - mv_pos);"
+-          "\n    let bump_tan{0} = vec4f(in_tangent, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
+-          "\n    let bump_bin{0} = vec4f(in_binrm, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
++          "\n    let bump_tan{0} = vec4f(in_tangent, 0.0) * mtx_nrm(in_pnmtxidx);"
++          "\n    let bump_bin{0} = vec4f(in_binrm, 0.0) * mtx_nrm(in_pnmtxidx);"
+           "\n    out.tex{0}_uv = tc{2}_proj.xy + vec2f(dot(bump_ldir{0}, bump_tan{0}), dot(bump_ldir{0}, "
+           "bump_bin{0}));",
+           i, lightIdx, tcg.embossSrc);
+@@ -1198,12 +1199,12 @@ std::string build_shader_source(const ShaderConfig& config) noexcept {
+       UNLIKELY FATAL("unhandled tcg src {}", underlying(tcg.src));
+     if (tcg.type == GX_TG_MTX2x4 || tcg.type == GX_TG_MTX3x4) {
+       if (info.indexAttr.test(GX_VA_TEX0MTXIDX + i)) {
+-        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0} * ubuf.postex_mtx[in_texmtxidx{0} / 3u];", i);
++        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0} * mtx_pt(in_texmtxidx{0} / 3u);", i);
+       } else if (tcg.mtx == GX_IDENTITY) {
+         vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0}.xyz;", i);
+       } else {
+         u32 texMtxIdx = (tcg.mtx) / 3;
+-        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0} * ubuf.postex_mtx[{1}];", i, texMtxIdx);
++        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0} * mtx_pt({1}u);", i, texMtxIdx);
+       }
+       if (tcg.type == GX_TG_MTX2x4) {
+         vtxXfrAttrs += fmt::format("\n    tc{0}_tmp.z = 1.0f;", i);
 @@ -1899,7 +1900,7 @@ struct Uniform {{
      render_viewport_size: vec2f,
      logical_viewport_size: vec2f,
@@ -2146,6 +2280,85 @@ index 3671ed5..79e7315 100644
  }};
  @group(0) @binding(0)
  var<storage, read> vbuf: array<u32>;
+@@ -1908,6 +1909,16 @@ var<storage, read> abuf: array<u32>;
+ @group(1) @binding(0)
+ var<uniform> ubuf: Uniform;{1}
+ 
++fn ld_mtx(slot: u32) -> mat3x4f {{
++    let o = ubuf.mtx_ofs[slot >> 2u][slot & 3u];
++    return mat3x4f(bitcast<vec4f>(vec4u(abuf[o], abuf[o + 1u], abuf[o + 2u], abuf[o + 3u])),
++                   bitcast<vec4f>(vec4u(abuf[o + 4u], abuf[o + 5u], abuf[o + 6u], abuf[o + 7u])),
++                   bitcast<vec4f>(vec4u(abuf[o + 8u], abuf[o + 9u], abuf[o + 10u], abuf[o + 11u])));
++}}
++// the index clamp the uniform arrays these replace got from the robustness transform (array<mat3x4f, 20> / 10)
++fn mtx_pt(i: u32) -> mat3x4f {{ return ld_mtx(min(i, 19u)); }}
++fn mtx_nrm(i: u32) -> mat3x4f {{ return ld_mtx(20u + min(i, 9u)); }}
++
+ struct VertexOutput {{
+     @builtin(position) pos: vec4f,{2}
+ }};
+diff --git a/lib/gx/shader_info.cpp b/lib/gx/shader_info.cpp
+index bb9ddec..2a90809 100644
+--- a/lib/gx/shader_info.cpp
++++ b/lib/gx/shader_info.cpp
+@@ -1,3 +1,4 @@
++#include <bit>
+ #include "shader_info.hpp"
+ 
+ #include <cmath>
+@@ -5,6 +6,7 @@
+ #include <tracy/Tracy.hpp>
+ 
+ namespace aurora::gx {
++u32 g_xfMtxDirty = 0;
+ // TODO: remove, just for testing
+ bool enableLodBias = true;
+ 
+@@ -199,7 +201,7 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
+   }
+ 
+   // 10 position matrices, 10 texture matrices, 10 normal matrices.
+-  info.uniformSize += sizeof(Mat3x4<float>) * 30;
++  info.uniformSize += 32 * sizeof(u32); // mtx_ofs: the 30 matrix slots' word offsets in the frame's matrix table
+   info.uniformSize += 16; // active PN matrix index + padding
+ 
+   for (int i = 0; i < config.tevStageCount; ++i) {
+@@ -400,16 +402,25 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
+   }
+   buf.append(g_gxState.proj);
+ 
+-  for (int i = 0; i < MaxPnMtx; i++) {
+-    buf.append(g_gxState.pnMtx[i].pos);
+-  }
+-
+-  for (int i = 0; i < MaxTexMtx; i++) {
+-    buf.append(g_gxState.texMtxs[i]);
+-  }
+-
+-  for (int i = 0; i < MaxPnMtx; i++) {
+-    buf.append(g_gxState.pnMtx[i].nrm);
++  {
++    // web: the 30 matrices (10 position, 10 texture, 10 normal: ~1.4 KB) used to be copied into every draw's
++    // uniform block. Each now goes into the frame's matrix table (in the storage buffer) only when it was
++    // written since its last upload, and the uniform holds each slot's offset there; the shader rebuilds the
++    // same mat3x4f from the same 48 bytes (shader.cpp ld_mtx). A new frame packet uploads all 30 again.
++    static_assert(MaxPnMtx == 10 && MaxTexMtx == 10 && sizeof(Mat3x4<float>) == 48);
++    static uint64_t tableFrame = UINT64_MAX;
++    static std::array<u32, 32> slotOfs{};
++    if (tableFrame != gfx::current_frame_packet_id()) {
++      tableFrame = gfx::current_frame_packet_id();
++      g_xfMtxDirty = (1u << 30) - 1;
++    }
++    for (u32 dirty = g_xfMtxDirty; dirty != 0; dirty &= dirty - 1) {
++      const u32 s = std::countr_zero(dirty);
++      const Mat3x4<float>& m = s < 10 ? g_gxState.pnMtx[s].pos : s < 20 ? g_gxState.texMtxs[s - 10] : g_gxState.pnMtx[s - 20].nrm;
++      slotOfs[s] = gfx::push_storage_table(reinterpret_cast<const uint8_t*>(&m), sizeof(m)).offset / 4;
++    }
++    g_xfMtxDirty = 0;
++    buf.append(slotOfs);
+   }
+ 
+   for (int i = 0; i < info.loadsTevReg.size(); ++i) {
 diff --git a/lib/logging.hpp b/lib/logging.hpp
 index aae81dd..0d05540 100644
 --- a/lib/logging.hpp
