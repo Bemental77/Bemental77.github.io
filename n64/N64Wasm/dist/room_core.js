@@ -1146,10 +1146,18 @@
     // the next save replaces and the frames between the newest one and now.
     // Re-published whenever K or the slot capacity changes — a heap that
     // fragments (fewer slots fit) LOWERS it.
+    // THE REACH IS n x K, AND K CAN RISE (2026-10-23). This published n x the CURRENT K, and K
+    // starts at 1, so a console holding 7 states (a 512 MB heap with Pokemon Stadium in it:
+    // 20.4 MB each) told the room it could hold 4 frames — and the room, needing 8 on a
+    // 135 ms link, left rollback for input delay for good ("can hold 4 frames of savestates;
+    // this connection needs 8", kind memory, never re-measured). It could have held 52 by
+    // snapshotting every 8th frame. So the capacity published is the one at RB_K_MAX, and
+    // rbAdaptK never picks a K whose reach is short of the room's window (rbKMin): what a
+    // deeper K costs is judged where it belongs, by the time gate (selfStepMs).
     function rbPublishCap(why, slots) {
       var ls = env.engine(), n = slots != null ? slots : RB.cap;
       if (!ls || !(n > 0)) return;
-      var c = Math.max(4, n * Math.max(1, RB.k) - 4);
+      var c = Math.max(4, n * (RB.kFixed || RB_K_MAX) - 4);
       if (ls.rbMaxWindow === c) return;
       ls.rbMaxWindow = c; RB.maxWindow = c;
       env.log('[rollback] this console can hold a window of ' + c + ' frames (' + n + ' snapshots x one every ' + RB.k
@@ -1380,18 +1388,34 @@
       return { exp: (1 + p * D) * save / k + p * (load + (k - 1) / 2 * run),
                worst: load + (W + k - 1) * run + Math.ceil((W + k) / k) * save };
     }
+    // the smallest K whose ring (RB.cap states, one every K frames) reaches the room's window
+    function rbKMin(ls) {
+      var W = Math.max(1, ls.rollback | 0), n = Math.max(2, RB.cap | 0);
+      return Math.max(1, Math.min(RB_K_MAX, Math.ceil((W + 4) / n)));
+    }
     function rbAdaptK(ls) {
-      if (RB.kFixed || RB.frames - RB.kAt < 50) return;
+      if (RB.kFixed) return;
+      var kMin = rbKMin(ls);
+      if (RB.k < kMin) {
+        // the window outgrew the ring: reach it NOW, not at the next once-a-50-frames decision
+        env.log('[rollback] snapshot every ' + RB.k + ' -> ' + kMin + ' frames: the room\'s window is ' + (ls.rollback | 0)
+              + ' frames and this console holds ' + RB.cap + ' states');
+        RB.k = kMin; RB.kChanges++; RB.kAt = RB.frames;
+        rbPublishCap('snapshot every ' + kMin + ' frames');
+        if (G.__n64RbLog) G.__n64RbLog.push(['k', RB.frames, kMin]);
+        return;
+      }
+      if (RB.frames - RB.kAt < 50) return;
       RB.kAt = RB.frames;
       if (!(RB.runEma > 0) || !(RB.saveEma > 0)) return;
       var F = LS.viHz > 0 ? 1000 / LS.viHz : 1000 / 60, W = Math.max(1, ls.rollback | 0);
       var best = 0, bestExp = Infinity, safe = 0, safeWorst = Infinity;
-      for (var k = 1; k <= RB_K_MAX; k++) {
+      for (var k = kMin; k <= RB_K_MAX; k++) {
         var c = rbCostK(k, W, F);
         if (c.worst <= 2 * F && c.exp < bestExp - 1e-6) { bestExp = c.exp; best = k; }
         if (c.worst < safeWorst - 1e-6) { safeWorst = c.worst; safe = k; }
       }
-      var nk = best || safe || 1;
+      var nk = best || safe || kMin;
       // HYSTERESIS. A real desktop host (MK64, run 12.7 ms, no K fitting two fields) flipped
       // K 1 <-> 8 every few seconds: with nothing fitting, `safe` is decided by run vs save,
       // and EMAs that wander across that line flip it. Every flip frees or allocates 16.8 MB
