@@ -70,7 +70,8 @@ typedef struct _shader_program_key
    int ccolor0_location;
    int ccolor1_location;
 
-   GLuint frag;            /* UBER: the uber program's fragment shader, for its log */
+   int pending;            /* UBER: linked without a query; asked about at a field end (ub_poll) */
+   GLuint frag;            /* ...its fragment shader, for the log if the link failed */
 } shader_program_key;
 
 static int fct[4], source0[4], operand0[4], source1[4], operand1[4], source2[4], operand2[4];
@@ -750,7 +751,7 @@ void neil_shader_warm_step(void)
 }
 
 /* the program glide is about to compile from fragment_shader, if it was prewarmed */
-static int warm_adopt(shader_program_key *shader)
+static int warm_adopt(shader_program_key *shader, int may_defer)
 {
    int i;
    uint32_t h;
@@ -782,6 +783,8 @@ static int warm_adopt(shader_program_key *shader)
          shader->fogColor_location        = L->fogColor_location;
          shader->alphaRef_location        = L->alphaRef_location;
       }
+      else if (may_defer && !warm_complete(shader->program_object))
+         shader->pending = 1;            /* UBER: drawn with the uber program until it is asked about */
       else
       {
          check_link(shader->program_object);
@@ -803,12 +806,16 @@ static int warm_adopt(shader_program_key *shader)
  * the field: measured ?costdbg=1 solo, 566.8 / 403.7 / 244.1 ms fields, all
  * 'prog', the music audibly slowing.
  * So one more program is built at boot, from the same header, with every
- * section's text below written as a branch on uniforms instead of as text, and
- * every combiner it reproduces is DRAWN WITH IT: a combiner never seen before
- * costs no compile at all, with no list and no warm-up. Which program a draw uses
- * is then a function of glide's state alone — the same on every console of a
- * room and in every re-run of a frame, whatever each machine's compile speed or
- * stored list. Each branch is the statement glide's writer emits
+ * section's text below written as a branch on uniforms instead of as text. A
+ * combiner never seen before is compiled and linked WITHOUT A QUERY and drawn with
+ * the uber program until KHR_parallel_shader_compile says its own link is done;
+ * it is asked about at a field end (ub_poll) and draws with its own program from
+ * then on — so no field waits for a compile, with no list and no warm-up, and a
+ * weak GPU does not pay the uber program's every-branch cost for longer than a
+ * link takes. The two draw the SAME pixels (measured below), so which of them a
+ * draw used, and when each console's link finished, cannot desync a room.
+ * Without KHR_parallel_shader_compile every combiner it reproduces is drawn with
+ * it. Each branch is the statement glide's writer emits
  * for that argument, character for character, in the order the writers emit
  * them (the tables are glide's own strings: grColorCombine, grColorCombineExt,
  * grAlphaCombine, grAlphaCombineExt, grTexCombine, grTexColorCombineExt,
@@ -1257,7 +1264,7 @@ static GLint ub_loc[19];
 static GLuint ub_prog;
 static int ub_state;           /* 0 not built, 1 linking, 2 ready, -1 off or failed */
 static shader_program_key ub_key;
-static int ub_draws;
+static int ub_draws, ub_deferred, ub_landed;
 
 /* glide's writers emit no declaration for these, so the real program would not link
  * and the uber program must not pretend it does */
@@ -1355,8 +1362,26 @@ static void ub_start(void)
 /* at a field end (neil_shader_warm_step), never in a display list */
 static void ub_poll(void)
 {
+   int i;
+   static int fields;
    if (ub_state == 1 && warm_complete(ub_prog))
       ub_ask();
+   if (ub_state == 2 && (++fields % 3600) == 0)
+      printf("[shader] uber: %d binds, %d programs compiled behind it, %d of them linked and in use\n",
+            ub_draws, ub_deferred, ub_landed);
+   /* a program drawn with the uber program while it linked: asked about here, between
+    * fields, once COMPLETION_STATUS_KHR says its link is done — never in a display list */
+   for (i = 0; i < number_of_programs; i++)
+   {
+      shader_program_key *p = &shader_programs[i];
+      if (!p->pending || !warm_complete(p->program_object))
+         continue;
+      if (!check_link(p->program_object) && p->frag)
+         check_compile(p->frag);
+      shader_find_uniforms(p);
+      p->pending = 0;
+      ub_landed++;
+   }
 }
 static void ub_ask(void)
 {
@@ -1372,7 +1397,9 @@ static void ub_ask(void)
    for (i = 0; i < 19; i++)
       ub_loc[i] = glGetUniformLocation(ub_prog, ub_names[i]);
    ub_state = 2;
-   printf("[shader] uber: ready — every combiner it reproduces is drawn with it, no compile in a field\n");
+   printf("[shader] uber: ready — %s\n", warm_parallel
+         ? "a combiner seen for the first time is drawn with it while its own program links"
+         : "no KHR_parallel_shader_compile, so every combiner it reproduces is drawn with it");
 }
 static void ub_upload(void)
 {
@@ -1405,6 +1432,24 @@ static void ub_use(void)
    update_uniforms(&ub_key);
    ub_upload();
    ub_draws++;
+}
+
+/* finish_shader_program_setup without a single query: asked about by ub_poll */
+static void ub_defer(shader_program_key *shader)
+{
+   GLuint fragshader = glCreateShader(GL_FRAGMENT_SHADER);
+   glShaderSource(fragshader, 1, (const GLchar**)&fragment_shader, NULL);
+   glCompileShader(fragshader);
+   shader->program_object = glCreateProgram();
+   glAttachShader(shader->program_object, vertex_shader_object);
+   glAttachShader(shader->program_object, fragshader);
+   shader_bind_attributes(shader);
+   glLinkProgram(shader->program_object);
+   shader->pending = 1;
+   shader->frag = fragshader;
+   sess_compiled++;
+   ub_deferred++;
+   append_shader_program(shader);
 }
 
 static void finish_shader_program_setup(shader_program_key *shader)
@@ -1576,7 +1621,9 @@ void compile_shader(void)
 
    need_to_compile = 0;
 
-   if (ub_on())
+   /* without KHR_parallel_shader_compile no link can be polled: the uber program draws
+    * everything it reproduces */
+   if (!warm_parallel && ub_on())
    {
       ub_use();
       return;
@@ -1597,6 +1644,19 @@ void compile_shader(void)
             program->three_point_filter0 == three_point_filter[0] &&
             program->three_point_filter1 == three_point_filter[1])
       {
+         if (program->pending)
+         {
+            if (ub_on())
+            {
+               ub_use();
+               return;
+            }
+            /* no uber program for this state: wait for the link, as glide always did */
+            if (!check_link(program->program_object) && program->frag)
+               check_compile(program->frag);
+            shader_find_uniforms(program);
+            program->pending = 0;
+         }
          use_shader_program(program);
          update_uniforms(program);
          return;
@@ -1628,6 +1688,7 @@ void compile_shader(void)
    shader.constant_color_location = 0;
    shader.ccolor0_location      = 0;
    shader.ccolor1_location      = 0;
+   shader.pending               = 0;
    shader.frag                  = 0;
 
    strcpy(fragment_shader, fragment_shader_header);
@@ -1655,8 +1716,23 @@ void compile_shader(void)
    strcat(fragment_shader, fragment_shader_end);
 
    sess_note(fragment_shader);
-   if (!warm_adopt(&shader))
-      finish_shader_program_setup(&shader);
+   {
+      /* UBER: a combiner seen for the first time is compiled with no query and drawn
+       * with the uber program until its own link is done */
+      int defer = warm_parallel && ub_on();
+      if (!warm_adopt(&shader, defer))
+      {
+         if (defer)
+            ub_defer(&shader);
+         else
+            finish_shader_program_setup(&shader);
+      }
+   }
+   if (shader.pending)
+   {
+      ub_use();
+      return;
+   }
 
    update_uniforms(&shader);
 }
