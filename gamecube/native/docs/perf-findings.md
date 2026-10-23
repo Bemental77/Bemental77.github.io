@@ -89,6 +89,22 @@ Terms used below:
   send 5.47/5.99 ms.
   - Messaging costs about 0.95 ms, and binary saves about 0.1 ms of it. The cost is the DataChannel transport,
     not JSON. Not built.
+- **Input-message elision in rooms** (send only on change, plus a periodic "unchanged through frame N").
+  Dropped before building.
+  - The census looked favourable: on the party route the local pad image changed on 1.14% of frames
+    (scripted) and 0.63% (keyboard). Analog sticks were not measurable on the rig.
+  - But in `lib/netplay.js` each input message's arrival is also the room's timing signal, and eliding
+    messages biases three things:
+    - **Advantage.** `_rbAdvBy` (about line 4009) is the local frame minus the newest frame received, sampled
+      every frame. It is the clock `rbCatchUp` runs from and is sent to peers as `av`. A confirm every 4 frames
+      lags the newest frame by about 1.5 frames, so peers would see the console as behind and catch up to a lag
+      that isn't there.
+    - **The rollback-window frontier.** `_rbNewestBy` feeds the "solid" frontier (about lines 4296, 4406 and
+      5346). Elision eats up to cadence - 1 frames of the window.
+    - **Host acks and the redundancy window.** `ak` rides every second message, and the limp and NAK logic
+      reads arrivals. K = 4 frames would no longer cover the gap.
+  - Doing it right means changing the clock and window maths of the engine every emulator shares, for a gain
+    of about 0.7 ms per frame (toaster) on steady input and about 0 during stick play.
 - **FIFO memo** (skip display lists that repeat the previous frame verbatim). The FIFO is 444 KB per frame.
   - Display lists are 308 KB of it and repeat 100% verbatim; command runs between them repeat 61.5%.
   - The repeated bytes are mostly vertex data, which undrawn frames already skip in O(1). The cost that remains
