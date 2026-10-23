@@ -2974,6 +2974,17 @@ GLuint glsm_get_current_framebuffer(void)
    return hw_render.get_current_framebuffer();
 }
 
+/* what glsm_state_bind just bound: unit i holds ids[i] (GL_TEXTURE_2D), and unit
+ * `active` is the active one. Read by glide's GL call shadow right after the bind
+ * (libretronew.c glsm_enter), so it starts each frame KNOWING every unit's binding
+ * instead of forgetting it. */
+void glsm_texture_bindings(const GLuint **ids, int *count, int *active)
+{
+   *ids = gl_state.bind_textures.ids;
+   *count = gl_state.bind_textures.ids ? (int)glsm_max_textures : 0;
+   *active = (int)gl_state.active_texture;
+}
+
 bool glsm_ctl(enum glsm_state_ctl state, void *data)
 {
    switch (state)
