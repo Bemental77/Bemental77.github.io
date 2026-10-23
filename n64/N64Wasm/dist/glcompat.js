@@ -35,6 +35,8 @@
 //   ?webgl=1     use WebGL1 even where WebGL2 exists — the arm that runs the fallback on any machine
 //   ?webgl=2     WebGL2 only (no fallback) — the old behaviour, a control arm
 //   ?gllog=1     on a WebGL1 context, log the first 40 GL errors with the call that raised them
+//   ?pdb=0       the drawing buffer is cleared after every present again (PRESERVED below) — the
+//                A/B arm and kill switch
 //   ?nfselftest=fail  rig seam: report that the native sampling pass cannot run here (a room then refuses a mix)
 (function (root) {
   root.__n64InstallGLCompat = function (G, search) {
@@ -92,6 +94,16 @@
           return orig.apply(this, arguments);
         }
         var cv = this, gl = null;
+        // PRESERVED (2026-10-23). A WebGL drawing buffer is CLEARED after every present unless
+        // the context keeps it; native GL keeps the back buffer until it is drawn over, and
+        // glide64 relies on that: CopyFrameBuffer(GR_BUFFER_BACKBUFFER) reads the PREVIOUS
+        // frame out of it into RDRAM, where the game takes it as a texture (glide64_rdp.c, the
+        // two "for Pokemon Stadium" branches). Here it read a cleared buffer, so Pokemon
+        // Stadium's rental / entry screens drew a black background and no header — Angrylion,
+        // which never touches GL, drew the blurred previous scene and "Select entry Pokemon"
+        // on the same guest frames (CPU fingerprint identical over 400 fields).
+        if (Q.get('pdb') !== '0') attrs.preserveDrawingBuffer = true;
+        st.pdb = !!attrs.preserveDrawingBuffer;
         var tryOne = function (k, a, rung) {
           var g = null, err = null;
           try { g = orig.call(cv, k, a); } catch (e) { err = String((e && e.message) || e).slice(0, 120); g = null; }
