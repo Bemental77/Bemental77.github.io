@@ -4258,5 +4258,7 @@ N64Rate.selfTest = function (logFn) {
   mark('page-ready');
 })();
 </script>
+<!-- ?daily: SM64 Daily Parkour (n64/daily/README.md). Only loaded in that mode. -->
+<script>if (new URLSearchParams(location.search).has('daily')) { var sd = document.createElement('script'); sd.src = '/n64/daily/daily.js'; document.body.appendChild(sd); }</script>
 </body>
 </html>

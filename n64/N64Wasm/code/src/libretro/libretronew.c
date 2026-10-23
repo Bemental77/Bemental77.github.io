@@ -451,6 +451,13 @@ static unsigned int g_vi_total = 0; /* VIs since boot, counted regardless of ena
 void neil_diff_enable(int v) { g_diff_enabled = v; g_diff_n = 0; }
 int neil_diff_count(void) { return g_diff_n; }
 unsigned int neil_vi_total(void) { return g_vi_total; }
+
+/* RAM WITNESS for page-side game logic (n64/sm64-daily). Returns the wasm
+ * linear-memory address of g_rdram (main.c:105), so the page can read guest
+ * state straight out of HEAPU32 without a copy. g_rdram holds host-endian
+ * 32-bit words: an aligned guest word at physical address A is
+ * HEAPU32[(ptr + A) >> 2]; a byte is at (A ^ 3), a halfword at (A ^ 2). */
+unsigned int neil_rdram_ptr(void) { extern uint32_t g_rdram[]; return (unsigned int)(uintptr_t)g_rdram; }
 unsigned int neil_diff_get(int i) { return (i >= 0 && i < g_diff_n) ? g_diff_buf[i] : 0; }
 
 /* LOCKSTEP: the SAME architectural-state checksum, but readable for the frame
