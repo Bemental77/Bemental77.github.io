@@ -575,10 +575,10 @@ index 84c3cfc..a5b7fca 100644
  static GXFifoObj sFifoObj;
  
 diff --git a/lib/dolphin/mtx/mtx.c b/lib/dolphin/mtx/mtx.c
-index ba2796d..6a64d21 100644
+index ba2796d..8796d40 100644
 --- a/lib/dolphin/mtx/mtx.c
 +++ b/lib/dolphin/mtx/mtx.c
-@@ -1,3 +1,9 @@
+@@ -1,7 +1,16 @@
 +#ifdef __EMSCRIPTEN__
 +// web port: no asserts here, like the retail SDK's MTX library (and Party Board's Release desktop build,
 +// which defines NDEBUG): MP4 hands it degenerate input on some first frames (m401 sets a camera's aspect
@@ -588,6 +588,40 @@ index ba2796d..6a64d21 100644
  #include <dolphin/mtx.h>
  
  #include <assert.h>
+ #include <math.h>
++#ifdef __wasm_simd128__
++#include <wasm_simd128.h>
++#endif
+ 
+ void C_MTXIdentity(Mtx m) {
+   assert(m && "MtxIdentity():  NULL Mtx 'm' ");
+@@ -46,6 +55,26 @@ void C_MTXConcat(const Mtx a, const Mtx b, Mtx ab) {
+   assert(b && "MTXConcat():  NULL MtxPtr 'b'  ");
+   assert(ab && "MTXConcat():  NULL MtxPtr 'ab' ");
+ 
++#ifdef __wasm_simd128__
++  // web (build.sh compiles the MTX library with -msimd128): the same products and sums, in the same order, four
++  // columns at a time. Per row i, column j < 3: (0 + a[i][2]*b[2][j]) + (a[i][0]*b[0][j] + a[i][1]*b[1][j]);
++  // column 3: a[i][3] + (a[i][2]*b[2][3] + (a[i][0]*b[0][3] + a[i][1]*b[1][3])). Lanes add (u + c) + t with
++  // c = (0, 0, 0, -0), then + (-0, -0, -0, a[i][3]): x + -0 == x exactly, and IEEE addition commutes, so every
++  // element is the scalar expression's value bit for bit (the `0 +` keeps turning -0 into +0, as above). b's rows
++  // are read before any store and each row of a before its own row is stored, so ab == a or ab == b is safe.
++  {
++    const v128_t b0 = wasm_v128_load(b[0]), b1 = wasm_v128_load(b[1]), b2 = wasm_v128_load(b[2]);
++    const v128_t c = wasm_f32x4_make(0.0f, 0.0f, 0.0f, -0.0f);
++    for (int i = 0; i < 3; i++) {
++      const f32 a0 = a[i][0], a1 = a[i][1], a2 = a[i][2], a3 = a[i][3];
++      const v128_t t = wasm_f32x4_add(wasm_f32x4_mul(wasm_f32x4_splat(a0), b0), wasm_f32x4_mul(wasm_f32x4_splat(a1), b1));
++      const v128_t u = wasm_f32x4_mul(wasm_f32x4_splat(a2), b2);
++      const v128_t w = wasm_f32x4_add(wasm_f32x4_add(u, c), t);
++      wasm_v128_store(ab[i], wasm_f32x4_add(w, wasm_f32x4_make(-0.0f, -0.0f, -0.0f, a3)));
++    }
++    return;
++  }
++#endif
+   if (ab == a || ab == b) {
+     m = mTmp;
+   } else {
 diff --git a/lib/dolphin/mtx/mtx44.c b/lib/dolphin/mtx/mtx44.c
 index 1ca47cf..292449a 100644
 --- a/lib/dolphin/mtx/mtx44.c
@@ -617,10 +651,10 @@ index c026935..928f8ea 100644
  #include <stdint.h>
  #include <dolphin/mtx.h>
 diff --git a/lib/dolphin/mtx/mtxvec.c b/lib/dolphin/mtx/mtxvec.c
-index fcb32e0..7bb1b01 100644
+index fcb32e0..a09176c 100644
 --- a/lib/dolphin/mtx/mtxvec.c
 +++ b/lib/dolphin/mtx/mtxvec.c
-@@ -1,5 +1,46 @@
+@@ -1,5 +1,49 @@
 +#ifdef __EMSCRIPTEN__
 +// web port: no asserts here, like the retail SDK's MTX library (and Party Board's Release desktop build,
 +// which defines NDEBUG): MP4 hands it degenerate input on some first frames (m401 sets a camera's aspect
@@ -630,6 +664,9 @@ index fcb32e0..7bb1b01 100644
  #include <assert.h>
  #include <dolphin/mtx.h>
 +#include <string.h>
++#ifdef __wasm_simd128__
++#include <wasm_simd128.h>
++#endif
 +
 +#ifdef __EMSCRIPTEN__
 +// web port, the rollback build's write barrier: a vector array transform writes its results into a scratch
@@ -667,7 +704,7 @@ index fcb32e0..7bb1b01 100644
  
  void C_MTXMultVec(const Mtx m, const Vec* src, Vec* dst) {
    Vec vTmp;
-@@ -25,6 +66,7 @@ void C_MTXMultVecArray(const Mtx m, const Vec* srcBase, Vec* dstBase, u32 count)
+@@ -25,6 +69,7 @@ void C_MTXMultVecArray(const Mtx m, const Vec* srcBase, Vec* dstBase, u32 count)
    assert(dstBase && "MTXMultVecArray():  NULL VecPtr 'dstBase' ");
    assert(count > 1 && "MTXMultVecArray():  count must be greater than 1.");
  
@@ -675,7 +712,7 @@ index fcb32e0..7bb1b01 100644
    for(i = 0; i < count; i++) {
      vTmp.x = m[0][3] + ((m[0][2] * srcBase->z) + ((m[0][0] * srcBase->x) + (m[0][1] * srcBase->y)));
      vTmp.y = m[1][3] + ((m[1][2] * srcBase->z) + ((m[1][0] * srcBase->x) + (m[1][1] * srcBase->y)));
-@@ -61,6 +103,7 @@ void C_MTXMultVecArraySR(const Mtx m, const Vec* srcBase, Vec* dstBase, u32 coun
+@@ -61,6 +106,7 @@ void C_MTXMultVecArraySR(const Mtx m, const Vec* srcBase, Vec* dstBase, u32 coun
    assert(dstBase && "MTXMultVecArraySR():  NULL VecPtr 'dstBase' ");
    assert(count > 1 && "MTXMultVecArraySR():  count must be greater than 1.");
  
@@ -683,10 +720,34 @@ index fcb32e0..7bb1b01 100644
    for(i = 0; i < count; i++) {
      vTmp.x = (m[0][2] * srcBase->z) + ((m[0][0] * srcBase->x) + (m[0][1] * srcBase->y));
      vTmp.y = (m[1][2] * srcBase->z) + ((m[1][0] * srcBase->x) + (m[1][1] * srcBase->y));
-@@ -82,6 +125,7 @@ void C_MTXROMultVecArray(const ROMtx m, const Vec *srcBase, Vec *dstBase, u32 co
+@@ -82,6 +128,31 @@ void C_MTXROMultVecArray(const ROMtx m, const Vec *srcBase, Vec *dstBase, u32 co
    assert(srcBase && "MTXROMultVecArray():  NULL VecPtr 'srcBase' ");
    assert(dstBase && "MTXROMultVecArray():  NULL VecPtr 'dstBase' ");
  
++#ifdef __wasm_simd128__
++  // web: the blocked path (MTXV_ARRAY) with x, y, z computed together: per lane j,
++  // ((m[0][j]*x + m[1][j]*y) + m[2][j]*z) + m[3][j] -- the scalar expression's order, so the same bits. Each
++  // result goes to the scratch block with one 16-byte store (its 4th lane lands on the next slot's x, which that
++  // slot then overwrites; the block's last slot is stored lane by lane).
++  if (mtxv_blockable(m, sizeof(ROMtx), srcBase, dstBase, count)) {
++    const v128_t c0 = wasm_v128_load(m[0]), c1 = wasm_v128_load(m[1]), c2 = wasm_v128_load(m[2]);
++    const v128_t c3 = wasm_f32x4_make(m[3][0], m[3][1], m[3][2], 0.0f);
++    for (u32 b = 0; b < count; b += MTXV_CHUNK) {
++      const u32 n = count - b < MTXV_CHUNK ? count - b : MTXV_CHUNK;
++      const Vec* src = srcBase + b;
++      for (u32 k = 0; k < n; k++, src++) {
++        const v128_t r = wasm_f32x4_add(wasm_f32x4_add(wasm_f32x4_add(wasm_f32x4_mul(c0, wasm_f32x4_splat(src->x)),
++                                                                      wasm_f32x4_mul(c1, wasm_f32x4_splat(src->y))),
++                                                       wasm_f32x4_mul(c2, wasm_f32x4_splat(src->z))),
++                                        c3);
++        if (k + 1 < MTXV_CHUNK) wasm_v128_store(&sMtxvScratch[k], r);
++        else { sMtxvScratch[k].x = wasm_f32x4_extract_lane(r, 0); sMtxvScratch[k].y = wasm_f32x4_extract_lane(r, 1); sMtxvScratch[k].z = wasm_f32x4_extract_lane(r, 2); }
++      }
++      memcpy(dstBase + b, sMtxvScratch, n * sizeof(Vec));
++    }
++    return;
++  }
++#endif
 +  MTXV_ARRAY(m, sizeof(ROMtx), srcBase, dstBase, count, vTmp.x = (m[0][0] * srcBase->x) + (m[1][0] * srcBase->y) + (m[2][0] * srcBase->z) + m[3][0]; vTmp.y = (m[0][1] * srcBase->x) + (m[1][1] * srcBase->y) + (m[2][1] * srcBase->z) + m[3][1]; vTmp.z = (m[0][2] * srcBase->x) + (m[1][2] * srcBase->y) + (m[2][2] * srcBase->z) + m[3][2]; dstBase->x = vTmp.x; dstBase->y = vTmp.y; dstBase->z = vTmp.z;)
    for(i = 0; i < count; i++) {
      vTmp.x = (m[0][0] * srcBase->x) + (m[1][0] * srcBase->y) + (m[2][0] * srcBase->z) + m[3][0];

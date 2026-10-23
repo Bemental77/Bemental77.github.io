@@ -57,7 +57,8 @@ cc1() {
   local o="$BUILD/obj/${tag}__$(echo "$src" | sed "s#^$SRC/##; s#^$DEPS/##; s#[/.]#_#g").o"
   [ -f "$o" ] && [ "$o" -nt "$src" ] && return 0
   case "$src" in
-    *.c) emcc "${CF[@]}" $([ "$tag" = game ] && echo -include "$HERE/shim/det_alloc.h") "$@" -c "$src" -o "$o" 2> "$o.log" || { echo "FAIL $src"; head -c 1500 "$o.log"; return 1; } ;;
+    # Aurora's MTX library takes wasm SIMD (lib/dolphin/mtx: C_MTXConcat, C_MTXROMultVecArray, in the scalar order)
+    *.c) emcc "${CF[@]}" $([ "$tag" = game ] && echo -include "$HERE/shim/det_alloc.h") $(case "$src" in */lib/dolphin/mtx/*) echo -msimd128;; esac) "$@" -c "$src" -o "$o" 2> "$o.log" || { echo "FAIL $src"; head -c 1500 "$o.log"; return 1; } ;;
     # Party Board's C++ uses try/catch (config load, settings): JS-based EH, which Asyncify supports
     *)   em++ "${CXXF[@]}" $([ "$tag" = game ] && echo -fexceptions) "$@" -c "$src" -o "$o" 2> "$o.log" || { echo "FAIL $src"; head -c 1500 "$o.log"; return 1; } ;;
   esac
