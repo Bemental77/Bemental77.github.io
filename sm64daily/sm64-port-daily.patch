@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index cfac1e8..2265b18 100644
+index cfac1e8..43ca336 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -170,7 +170,7 @@ endif
@@ -24,7 +24,7 @@ index cfac1e8..2265b18 100644
  ifeq ($(TARGET_WEB),1)
    PLATFORM_CFLAGS  := -DTARGET_WEB
 -  PLATFORM_LDFLAGS := -lm -no-pie -s TOTAL_MEMORY=20MB -g4 --source-map-base http://localhost:8080/ -s "EXTRA_EXPORTED_RUNTIME_METHODS=['callMain']"
-+  PLATFORM_LDFLAGS := -lm -sTOTAL_MEMORY=128MB -sEXPORTED_RUNTIME_METHODS=callMain,HEAP16,HEAPU8 -sEXPORTED_FUNCTIONS=_main,_daily_restart,_daily_debug_warp,_daily_debug_mario_y,_daily_debug_standing,_daily_set_ghost,_daily_rec_ptr,_daily_rec_count,_malloc,_free
++  PLATFORM_LDFLAGS := -lm -sTOTAL_MEMORY=128MB -sEXPORTED_RUNTIME_METHODS=callMain,HEAP16,HEAPU8 -sEXPORTED_FUNCTIONS=_main,_daily_restart,_daily_debug_warp,_daily_debug_mario_y,_daily_debug_standing,_daily_debug_inside,_daily_set_ghost,_daily_rec_ptr,_daily_rec_count,_malloc,_free
  endif
  
  PLATFORM_CFLAGS += -DNO_SEGMENTED_MEMORY -DUSE_SYSTEM_MALLOC
@@ -111,10 +111,10 @@ index 66c410b..001e85f 100644
  extern const BehaviorScript bhvStaticObject[];
 diff --git a/src/game/daily.c b/src/game/daily.c
 new file mode 100644
-index 0000000..748b376
+index 0000000..fcdc0b9
 --- /dev/null
 +++ b/src/game/daily.c
-@@ -0,0 +1,886 @@
+@@ -0,0 +1,940 @@
 +// SM64 DAILY PARKOUR
 +//
 +// Every day the page hands this module a seed (window.sm64DailySeed) and the
@@ -550,7 +550,7 @@ index 0000000..748b376
 +        case MD_WALLKICK: {
 +            // A chimney: a floor between two purple walls; the way out is on top of the right wall,
 +            // higher than any jump from the floor (triple ~595), so it takes wall kicks (~480 each).
-+            f32 H = rnd_f(800, 900 + 100 * hard), inner = rnd_f(230, 290), side;
++            f32 H = rnd_f(800, 900 + 100 * hard), inner = rnd_f(380, 480), side;   // playtest: 230-290 was too tight to kick between
 +            s16 hl = h + 0x4000;
 +            struct Part *l, *r;
 +            a = station(c, h, rnd_f(120, 200), rnd_f(-200, -80), inner / 2.0f, rnd_f(260, 320));
@@ -628,6 +628,28 @@ index 0000000..748b376
 +
 +static s32 sMods[64], sNumMods;
 +
++static s32 build_lift(s32 cur) {
++    struct Part *c = &sPart[cur], *pole, *n;
++    s32 start = sNumParts, tries;
++    for (tries = 0; tries < 60; tries++) {
++        f32 cx = (AREA_X0 + AREA_X1) / 2, cz = (AREA_Z0 + AREA_Z1) / 2;
++        s16 h = tries < 20 ? atan2s(cz - c->z, cx - c->x) + (s16) rnd_f(-0x2000, 0x2000) : (s16) (rnd_u32() & 0xFFFF);
++        f32 e = extent_along(c, h), d;
++        sNumParts = start;
++        if (e < 160.0f) continue;
++        pole = add_part(PT_POLE);
++        n = add_part(PT_CHECKER);
++        if (!pole || !n) break;
++        pole->x = c->x + sins(h) * (e - 120.0f); pole->z = c->z + coss(h) * (e - 120.0f); pole->y = c->y; pole->r = 1; pole->h = 0;
++        n->station = 1; n->yaw = h; n->hx = rnd_f(240, 300); n->hz = rnd_f(240, 300); n->h = 160.0f;
++        d = (e - 120.0f) + rnd_f(180, 240) + n->hz;
++        n->x = c->x + sins(h) * d; n->z = c->z + coss(h) * d; n->y = c->y + rnd_f(2050, 2200);
++        if (!blocked(n, cur)) { c->hint = "CLIMB THE POLE"; return (s32) (n - sPart); }
++    }
++    sNumParts = start;
++    return -1;
++}
++
 +// ── host level ──────────────────────────────────────────────────────────────
 +// Each day the course is built over a different SM64 world. Ids into this
 +// table are what the page shows (window.sm64DailyHost).
@@ -657,7 +679,7 @@ index 0000000..748b376
 +    return sHosts[sHostIdx];
 +}
 +
-+static void generate(u32 seed, s32 dow) {
++static f32 generate_once(u32 seed, s32 dow) {
 +    // Monday (1) easiest .. Sunday (0) hardest.
 +    f32 hard = ((dow + 6) % 7) / 6.0f, secs = 0;
 +    s32 used[MD_COUNT], cur, i, m, tries, sinceCheck = 0, last = -1;
@@ -708,6 +730,13 @@ index 0000000..748b376
 +                got = build_module(m, cur, h, hard);
 +            }
 +        }
++        if (got < 0) {
++            // Out of room on this level (small worlds like the Courtyard): climb. A giant pole on
++            // the current platform leads to a new layer ~2100+ up, which may overlap the layers
++            // below (blocked() ignores parts that far apart vertically).
++            got = build_lift(cur);
++            m = MD_POLE;
++        }
 +        if (got < 0) break;
 +        used[m]++; last = m;
 +        if (sNumMods < 64) sMods[sNumMods++] = m;
@@ -719,6 +748,17 @@ index 0000000..748b376
 +    sPart[cur].goal = 1; sPart[cur].check = 0;
 +    sPart[cur].hx = DMAX(sPart[cur].hx, 280.0f); sPart[cur].hz = DMAX(sPart[cur].hz, 280.0f);
 +    for (sNumStations = 0, i = 0; i < sNumParts; i++) if (sPart[i].station) sNumStations++;
++    return secs;
++}
++
++// Every day must get a full course. If today's seed leaves the world too little room for ~2:00,
++// derive another seed from it (deterministically, so everyone still gets the same course).
++static void generate(u32 seed, s32 dow) {
++    u32 k;
++    for (k = 0; k < 8; k++) {
++        if (generate_once(seed + k * 0x9E3779B9u, dow) >= TARGET_SECONDS * 0.85f) return;
++    }
++    generate_once(seed, dow);
 +}
 +
 +// ── objects ─────────────────────────────────────────────────────────────────
@@ -894,6 +934,20 @@ index 0000000..748b376
 +static s32 standing_on(void);
 +s32 daily_debug_standing(void) { return standing_on(); }
 +
++// Test hook (exported): is Mario's x/z inside station n's footprint (in its own rotated frame)?
++s32 daily_debug_inside(s32 n) {
++    s32 i, k = 0;
++    for (i = 0; i < sNumParts; i++) {
++        if (sPart[i].station && k++ == n) {
++            struct Part *p = &sPart[i];
++            f32 dx = gMarioState->pos[0] - p->x, dz = gMarioState->pos[2] - p->z;
++            f32 lx = dx * coss(p->yaw) - dz * sins(p->yaw), lz = dx * sins(p->yaw) + dz * coss(p->yaw);
++            return absf(lx) < p->hx - 40.0f && absf(lz) < p->hz - 40.0f;
++        }
++    }
++    return -1;
++}
++
 +// Test hook (exported): stand Mario on station number n (0 = start).
 +void daily_debug_warp(s32 n) {
 +    s32 i, k = 0;
@@ -1003,10 +1057,10 @@ index 0000000..748b376
 +}
 diff --git a/src/game/daily.h b/src/game/daily.h
 new file mode 100644
-index 0000000..0eee0dc
+index 0000000..2ba5db4
 --- /dev/null
 +++ b/src/game/daily.h
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,31 @@
 +#ifndef DAILY_H
 +#define DAILY_H
 +
@@ -1033,6 +1087,7 @@ index 0000000..0eee0dc
 +void daily_restart(void);
 +s32 daily_debug_mario_y(void);
 +s32 daily_debug_standing(void);
++s32 daily_debug_inside(s32 n);
 +s32 daily_host_level(void);
 +void daily_debug_warp(s32 i);
 +
