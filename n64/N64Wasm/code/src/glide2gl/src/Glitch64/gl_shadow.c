@@ -311,9 +311,65 @@ void gls_Uniform4f(GLint loc, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3)
 
 /* ---- capabilities --------------------------------------------------------- */
 
+/* LAZY CULL (2026-10-23). grCullMode turns GL_CULL_FACE on for a draw and off after
+ * it: Pokemon Stadium sent 150 glEnable + 150 glDisable a field, in pairs that cancel
+ * whenever no draw comes between them. Culling only acts when something is drawn, so
+ * the request is kept (gls_cull_want) and sent at the next draw only if it differs from
+ * what GL has (gls_cull_act). A change still ends a held-back merge batch at once
+ * (GLS_PRE): those triangles draw under the state they were queued in. Before any code
+ * outside glide runs (glsm's unbind at the frame's end) the request is sent. */
+static struct { uint32_t ep; uint8_t on; } gls_cull_want, gls_cull_act;
+void gls_flush_cull(void)
+{
+   if (gls_cull_want.ep != gls_ep) return;
+   if (gls_cull_act.ep == gls_ep && gls_cull_act.on == gls_cull_want.on) return;
+   if (gls_cull_want.on) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+   gls_sent++;
+   gls_cull_act = gls_cull_want;
+}
+
+/* LAZY ARRAY BUFFER (2026-10-23). Every streamed draw is bind(vbo) / bufferData / draw /
+ * bind(0) (geometry.c vbo_draw), so the next draw's bind(vbo) undoes the bind(0) with
+ * nothing between them that reads the binding: 303 binds a field in Pokemon Stadium for
+ * 151 that change anything a later call sees. The ARRAY_BUFFER binding is kept as a
+ * request and sent (gls_flush_abuf) right before the first call that reads it —
+ * glVertexAttribPointer, glBufferData/SubData, glDrawArrays, glGetIntegerv,
+ * glDeleteBuffers — and before glsm's unbind at the frame's end. */
+static struct { uint32_t ep; GLuint v; } gls_abuf_want, gls_abuf_act;
+void gls_flush_abuf(void)
+{
+   if (gls_abuf_want.ep != gls_ep) return;
+   if (gls_abuf_act.ep == gls_ep && gls_abuf_act.v == gls_abuf_want.v) return;
+   glBindBuffer(GL_ARRAY_BUFFER, gls_abuf_want.v); gls_sent++;
+   gls_abuf_act = gls_abuf_want;
+}
+void gls_BindBuffer(GLenum target, GLuint buffer)
+{
+   if (target != GL_ARRAY_BUFFER || !gls_on)
+   {
+      GLS_PRE(); glBindBuffer(target, buffer); gls_sent++;
+      if (target == GL_ARRAY_BUFFER) { gls_abuf_act.ep = gls_ep; gls_abuf_act.v = buffer; gls_abuf_want = gls_abuf_act; }
+      return;
+   }
+   if (gls_abuf_want.ep == gls_ep && gls_abuf_want.v == buffer) { gls_dropped++; return; }
+   if (gls_abuf_want.ep != gls_ep && gls_abuf_act.ep == gls_ep && gls_abuf_act.v == buffer) { gls_dropped++; return; }
+   gls_abuf_want.ep = gls_ep; gls_abuf_want.v = buffer;
+   gls_dropped++;                        /* counted as sent if gls_flush_abuf sends it */
+}
+
 static void gls_capset(GLenum cap, int on)
 {
    int i, free_i = -1;
+   if (cap == GL_CULL_FACE && gls_on)
+   {
+      int cur = (gls_cull_want.ep == gls_ep) ? gls_cull_want.on
+              : (gls_cull_act.ep == gls_ep) ? gls_cull_act.on : -1;
+      if (cur == on) { gls_dropped++; return; }
+      GLS_PRE();                          /* triangles held back draw under the old state */
+      gls_cull_want.ep = gls_ep; gls_cull_want.on = (uint8_t)on;
+      gls_dropped++;                      /* counted as sent if gls_flush_cull sends it */
+      return;
+   }
    for (i = 0; i < GLS_CAPS; i++)
    {
       if (gls_cap[i].ep == gls_ep && gls_cap[i].cap == cap)

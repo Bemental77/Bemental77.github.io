@@ -69,6 +69,9 @@ void gls_BlendFunc(GLenum sf, GLenum df);
 void gls_DepthMask(GLboolean flag);
 void gls_DepthFunc(GLenum func);
 void gls_CullFace(GLenum mode);
+void gls_flush_cull(void);       /* LAZY CULL: send a pending GL_CULL_FACE change (gl_shadow.c) */
+void gls_flush_abuf(void);       /* LAZY ARRAY BUFFER: send a pending ARRAY_BUFFER binding */
+void gls_BindBuffer(GLenum target, GLuint buffer);
 void gls_PolygonOffset(GLfloat factor, GLfloat units);
 void gls_sync_active(void);
 void gls_forget_fixed(void);
@@ -109,14 +112,14 @@ void vbo_merge_flush(void);
 #define glPolygonOffset            gls_PolygonOffset
 /* every other GL entry point this core calls: draw what is held back first */
 #define glGetUniformLocation(...) (GLS_PRE(), glGetUniformLocation(__VA_ARGS__))
-#define glGetIntegerv(...) (GLS_PRE(), gls_sync_active(), glGetIntegerv(__VA_ARGS__))
-#define glBindBuffer(...) (GLS_PRE(), glBindBuffer(__VA_ARGS__))
-#define glVertexAttribPointer(...) (GLS_PRE(), glVertexAttribPointer(__VA_ARGS__))
+#define glGetIntegerv(...) (GLS_PRE(), gls_sync_active(), gls_flush_abuf(), glGetIntegerv(__VA_ARGS__))
+#define glBindBuffer               gls_BindBuffer
+#define glVertexAttribPointer(...) (GLS_PRE(), gls_flush_abuf(), glVertexAttribPointer(__VA_ARGS__))
 #define glGenTextures(...) (GLS_PRE(), glGenTextures(__VA_ARGS__))
 #define glTexImage2D(...) (GLS_PRE(), gls_sync_active(), glTexImage2D(__VA_ARGS__))
 #define glBindAttribLocation(...) (GLS_PRE(), glBindAttribLocation(__VA_ARGS__))
 #define glPixelStorei(...) (GLS_PRE(), glPixelStorei(__VA_ARGS__))
-#define glDrawArrays(...) (GLS_PRE(), glDrawArrays(__VA_ARGS__))
+#define glDrawArrays(...) (GLS_PRE(), gls_flush_cull(), gls_flush_abuf(), glDrawArrays(__VA_ARGS__))
 #define glBindSampler(...) (GLS_PRE(), glBindSampler(__VA_ARGS__))
 #define glBindFramebuffer(...) (GLS_PRE(), glBindFramebuffer(__VA_ARGS__))
 #define glAttachShader(...) (GLS_PRE(), glAttachShader(__VA_ARGS__))
@@ -132,8 +135,8 @@ void vbo_merge_flush(void);
 #define glCullFace                 gls_CullFace
 #define glCreateProgram(...) (GLS_PRE(), glCreateProgram(__VA_ARGS__))
 #define glClear(...) (GLS_PRE(), glClear(__VA_ARGS__))
-#define glBufferSubData(...) (GLS_PRE(), glBufferSubData(__VA_ARGS__))
-#define glBufferData(...) (GLS_PRE(), glBufferData(__VA_ARGS__))
+#define glBufferSubData(...) (GLS_PRE(), gls_flush_abuf(), glBufferSubData(__VA_ARGS__))
+#define glBufferData(...) (GLS_PRE(), gls_flush_abuf(), glBufferData(__VA_ARGS__))
 #define glTexSubImage2D(...) (GLS_PRE(), gls_sync_active(), glTexSubImage2D(__VA_ARGS__))
 #define glScissor(...) (GLS_PRE(), glScissor(__VA_ARGS__))
 #define glIsProgram(...) (GLS_PRE(), glIsProgram(__VA_ARGS__))
@@ -148,7 +151,7 @@ void vbo_merge_flush(void);
 #define glFramebufferTexture2D(...) (GLS_PRE(), glFramebufferTexture2D(__VA_ARGS__))
 #define glDrawPixels(...) (GLS_PRE(), glDrawPixels(__VA_ARGS__))
 #define glDrawBuffer(...) (GLS_PRE(), glDrawBuffer(__VA_ARGS__))
-#define glDeleteBuffers(...) (GLS_PRE(), glDeleteBuffers(__VA_ARGS__))
+#define glDeleteBuffers(...) (GLS_PRE(), gls_flush_abuf(), glDeleteBuffers(__VA_ARGS__))
 #define glCopyTexSubImage2D(...) (GLS_PRE(), gls_sync_active(), glCopyTexSubImage2D(__VA_ARGS__))
 #define glClearDepth(...) (GLS_PRE(), glClearDepth(__VA_ARGS__))
 #define glClearColor(...) (GLS_PRE(), glClearColor(__VA_ARGS__))

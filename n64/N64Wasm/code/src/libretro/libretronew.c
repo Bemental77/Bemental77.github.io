@@ -70,6 +70,8 @@ void gles2n64_reset(void);
 void gls_reset(void);   /* glide's GL call shadow: src/glide2gl/src/Glitch64/gl_shadow.c */
 void gls_reset_objects(void);
 void gls_learn_units(const GLuint *ids, int n, int active);
+void gls_flush_cull(void);
+void gls_flush_abuf(void);
 void glsm_texture_bindings(const GLuint **ids, int *count, int *active);
 void vbo_merge_flush(void);   /* triangles glide's draw merging still holds (geometry.c) */
 void neil_shader_warm_step(void);   /* glitch64_combiner.c ASKED AHEAD */
@@ -1368,6 +1370,8 @@ static void glsm_exit(void)
         return;
 #endif
     vbo_merge_flush();   /* nothing glide drew may stay held past the frame */
+    gls_flush_cull();    /* ...nor a GL_CULL_FACE change glide asked for (gl_shadow.c LAZY CULL) */
+    gls_flush_abuf();    /* ...nor an ARRAY_BUFFER binding (gl_shadow.c LAZY ARRAY BUFFER) */
     glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);
     /* the unbind disabled every vertex array, unbound every texture and reset
      * blend/depth through its own GL calls: what the frontend draws after it
