@@ -68,6 +68,7 @@ void gls_BlendFuncSeparate(GLenum s0, GLenum d0, GLenum s1, GLenum d1);
 void gls_BlendFunc(GLenum sf, GLenum df);
 void gls_DepthMask(GLboolean flag);
 void gls_DepthFunc(GLenum func);
+void gls_CullFace(GLenum mode);
 void gls_PolygonOffset(GLfloat factor, GLfloat units);
 void gls_sync_active(void);
 void gls_forget_fixed(void);
@@ -128,7 +129,7 @@ void vbo_merge_flush(void);
 #define glGetShaderiv(...) (GLS_PRE(), glGetShaderiv(__VA_ARGS__))
 #define glGetProgramiv(...) (GLS_PRE(), glGetProgramiv(__VA_ARGS__))
 #define glGetError(...) (GLS_PRE(), glGetError(__VA_ARGS__))
-#define glCullFace(...) (GLS_PRE(), glCullFace(__VA_ARGS__))
+#define glCullFace                 gls_CullFace
 #define glCreateProgram(...) (GLS_PRE(), glCreateProgram(__VA_ARGS__))
 #define glClear(...) (GLS_PRE(), glClear(__VA_ARGS__))
 #define glBufferSubData(...) (GLS_PRE(), glBufferSubData(__VA_ARGS__))

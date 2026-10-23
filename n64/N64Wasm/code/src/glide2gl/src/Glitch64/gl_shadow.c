@@ -49,6 +49,7 @@ static struct { uint32_t ep; GLenum v; } gls_active, gls_want;
 static struct { uint32_t ep; GLenum s0, d0, s1, d1; } gls_blend;
 static struct { uint32_t ep; GLboolean v; } gls_dmask;
 static struct { uint32_t ep; GLenum v; } gls_dfunc;
+static struct { uint32_t ep; GLenum v; } gls_cullf;   /* glCullFace: glsm sets it too, so fixed-function */
 static struct { uint32_t ep; uint32_t f, u; } gls_poff;
 static uint32_t gls_fixed_ep = 1;
 static struct { uint32_t ep; GLuint v; } gls_prog, gls_vao;
@@ -62,6 +63,17 @@ static struct { uint32_t ep; GLuint tex; uint8_t p; uint8_t known; GLint v; } gl
 static struct { uint32_t ep; GLuint prog; GLint loc; uint8_t type; uint8_t known; uint32_t w[4]; } gls_uni[GLS_UNI];
 
 void gls_forget_fixed(void);
+/* the bindings a caller outside the shadow has just made, exactly (glsm_state_bind):
+ * learned for this epoch, so a texture call on a unit glsm left empty — which WebGL
+ * treats as a no-op — is recognised as one (gls_TexParameteri NO TEXTURE BOUND) */
+void gls_learn_units(const GLuint *ids, int n, int active)
+{
+   int i;
+   if (!ids) return;
+   for (i = 0; i < n && i < GLS_UNITS; i++) { gls_unit[i].ep = gls_ep; gls_unit[i].tex = ids[i]; }
+   gls_active.ep = gls_ep; gls_active.v = GL_TEXTURE0 + (GLenum)active;
+   gls_want = gls_active;
+}
 void gls_reset(void) { gls_ep++; if (!gls_ep) gls_ep = 1; gls_resets++; gls_forget_fixed(); }
 void gls_reset_objects(void) { gls_oep++; if (!gls_oep) gls_oep = 1; gls_texp_used = gls_uni_used = 0; }
 void gls_sync_active(void);
@@ -153,6 +165,13 @@ void gls_TexParameteri(GLenum target, GLenum pname, GLint param)
    if (gls_on && u >= 0 && p >= 0 && gls_unit[u].ep == gls_ep)
    {
       tex = gls_unit[u].tex;
+      /* NO TEXTURE BOUND (2026-10-23). WebGL has no default texture object: with null
+       * bound to the unit, texParameteri changes nothing and only raises
+       * INVALID_OPERATION, so not sending it is exactly equivalent. Measured, Pokemon
+       * Stadium menus: all 600 of the field's texParameteri calls (four per draw, from
+       * grTexFilterClampMode) landed on a unit glide had bound texture 0 to, and none
+       * could be dropped by the cache below, which keys on a texture object. */
+      if (!tex) { gls_dropped++; return; }
       if (tex) s = gls_texp_slot(tex, p, &fresh);
       if (s >= 0 && !fresh && gls_texp[s].known && gls_texp[s].v == param) { gls_dropped++; return; }
    }
@@ -222,6 +241,11 @@ static int gls_uni_same(GLint loc, uint8_t type, const uint32_t *w, int n, int *
    int k;
    GLuint prog;
    *slot = -1;
+   /* LOCATION -1 (2026-10-23): a uniform the bound program does not have. GL ignores
+    * such a call by definition ("if location is -1, the data passed in is silently
+    * ignored"), so not sending it changes nothing. glide sets every uniform of its
+    * key on every program, used or not: Pokemon Stadium sent one per draw. */
+   if (gls_on && loc == -1) return 1;
    if (!gls_on || loc < 0 || gls_prog.ep != gls_ep || !gls_prog.v) return 0;
    prog = gls_prog.v;
    i = gls_hash(prog, (uint32_t)loc) & (GLS_UNI - 1);
@@ -361,6 +385,15 @@ void gls_DepthFunc(GLenum func)
    if (gls_on && gls_dfunc.ep == gls_fixed_ep && gls_dfunc.v == func) { gls_dropped++; return; }
    GLS_PRE(); glDepthFunc(func); gls_sent++;
    gls_dfunc.ep = gls_fixed_ep; gls_dfunc.v = func;
+}
+
+/* grCullMode sets the face on every draw that culls (Pokemon Stadium: 150 a field, the
+ * same face each time) */
+void gls_CullFace(GLenum mode)
+{
+   if (gls_on && gls_cullf.ep == gls_fixed_ep && gls_cullf.v == mode) { gls_dropped++; return; }
+   GLS_PRE(); glCullFace(mode); gls_sent++;
+   gls_cullf.ep = gls_fixed_ep; gls_cullf.v = mode;
 }
 
 void gls_PolygonOffset(GLfloat factor, GLfloat units)

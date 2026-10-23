@@ -69,6 +69,8 @@ int glide64InitGfx(void);
 void gles2n64_reset(void);
 void gls_reset(void);   /* glide's GL call shadow: src/glide2gl/src/Glitch64/gl_shadow.c */
 void gls_reset_objects(void);
+void gls_learn_units(const GLuint *ids, int n, int active);
+void glsm_texture_bindings(const GLuint **ids, int *count, int *active);
 void vbo_merge_flush(void);   /* triangles glide's draw merging still holds (geometry.c) */
 void neil_shader_warm_step(void);   /* glitch64_combiner.c ASKED AHEAD */
 #endif
@@ -1394,6 +1396,13 @@ static void glsm_enter(void)
      * it forgets everything, so nothing learned in one frame is trusted in the
      * next (src/glide2gl/src/Glitch64/gl_shadow.h) */
     gls_reset();
+    /* ...except what the bind itself just did, which glsm knows exactly: every
+     * unit's texture and the active unit */
+    {
+        const GLuint *ids; int n, active;
+        glsm_texture_bindings(&ids, &n, &active);
+        gls_learn_units(ids, n, active);
+    }
 #endif
 }
 #endif
