@@ -94,6 +94,8 @@ void vbo_merge_flush(void);
 #define glUniform1f                gls_Uniform1f
 #define glUniform3f                gls_Uniform3f
 #define glUniform4f                gls_Uniform4f
+/* the uber program's selectors (glitch64_combiner.c UBER): not shadowed, but a held-back merge is drawn first */
+#define glUniform4i(...) (GLS_PRE(), glUniform4i(__VA_ARGS__))
 #define glEnable                   gls_Enable
 #define glDisable                  gls_Disable
 #define glEnableVertexAttribArray  gls_EnableVertexAttribArray

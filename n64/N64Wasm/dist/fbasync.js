@@ -39,6 +39,8 @@
 //                    mips_emit.js COLD PATHS) — the A/B arm and kill switch.
 //   ?jitchain=1      JIT blocks tail-call the next JIT block where that is exact (bementalJIT
 //                    mips_emit.js CHAINING). OFF by default: unpriced (inside the rig's noise).
+//   ?uber=0          a combiner on no prewarm list compiles in the middle of the field again
+//                    (glitch64_combiner.c UBER) — the A/B arm and kill switch. Default on.
 //   ?glmerge=0       every glide triangle is its own draw again (geometry.c draw
 //                    merging, mymain.cpp apply_gl_shadow) — A/B arm, kill switch.
 (function (root) {
@@ -55,6 +57,7 @@
                        vboMode: FB_Q.has('vbo') ? +FB_Q.get('vbo') : undefined,
                        glShadow: FB_Q.get('glshadow') !== '0',
                        glMerge: FB_Q.get('glmerge') !== '0',
+                       uber: FB_Q.get('uber') !== '0',
                        lazy: FB_Q.get('fblazy') !== '0',
                        jitBudget: FB_Q.has('jitbudget') ? Math.max(0, +FB_Q.get('jitbudget') | 0) : undefined,
                        jitAsync: FB_Q.get('jitasync') !== '0',

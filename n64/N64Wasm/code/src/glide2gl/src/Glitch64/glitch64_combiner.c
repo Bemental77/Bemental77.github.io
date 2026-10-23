@@ -69,6 +69,8 @@ typedef struct _shader_program_key
    int constant_color_location;
    int ccolor0_location;
    int ccolor1_location;
+
+   GLuint frag;            /* UBER: the uber program's fragment shader, for its log */
 } shader_program_key;
 
 static int fct[4], source0[4], operand0[4], source1[4], operand1[4], source2[4], operand2[4];
@@ -115,6 +117,28 @@ static int tex0_combiner_ext = 0;
 static int tex1_combiner_ext = 0;
 static int c_combiner_ext = 0;
 static int a_combiner_ext = 0;
+
+/* UBER: the arguments each section's source text was last built from (see UBER
+ * below). Recorded where the writers rebuild their text, after their own
+ * early-outs, so this is always the text glide would compile now.
+ * tex[0] is fragment_shader_texture0 (glide's TMU1), tex[1] texture1.
+ * mode: 0 grTexCombine/grColorCombine/grAlphaCombine, 1 the *Ext writer,
+ *       2 init_combiner's texture1 ("ctexture1 = texture2D(texture0, ...)"),
+ *       3 nothing written yet. x[] = a,a_mode,b,b_mode,c,c_invert,d,d_invert.
+ * tex aext: grTexAlphaCombineExt appended to an Ext colour text (y[]);
+ * tex bad: it appended to a non-Ext text, which declares none of what it reads. */
+typedef struct { int mode, fn, fac, inv, afn, afac, ainv, aext, bad; int x[8], y[8]; } ub_tex_t;
+typedef struct { int mode, fn, fac, local, other; int x[8]; } ub_cmb_t;
+static ub_tex_t ub_tex[2];
+static ub_cmb_t ub_col, ub_alp;
+static void ub_poll(void);
+static void update_uniforms(const shader_program_key *prog);
+static void ub_ext8(int *d, uint32_t a, uint32_t a_mode, uint32_t b, uint32_t b_mode,
+      uint32_t c, int32_t c_invert, uint32_t dd, int32_t d_invert)
+{
+   d[0] = (int)a; d[1] = (int)a_mode; d[2] = (int)b; d[3] = (int)b_mode;
+   d[4] = (int)c; d[5] = c_invert ? 1 : 0; d[6] = (int)dd; d[7] = d_invert ? 1 : 0;
+}
 
 #if defined(HAVE_OPENGLES2) // Desktop GL fix
 #define GLSL_VERSION "100"
@@ -447,7 +471,9 @@ static void append_shader_program(shader_program_key *shader)
    int curr_index;
    int                   index = number_of_programs;
 
-   if (current_shader)
+   int in_arr = current_shader && current_shader >= shader_programs
+             && current_shader < shader_programs + number_of_programs;
+   if (in_arr)
       curr_index = current_shader->index;
 
    shader->index = index;
@@ -464,7 +490,7 @@ static void append_shader_program(shader_program_key *shader)
       shader_programs = new_ptr;
    }
 
-   if (current_shader)
+   if (in_arr)
       current_shader = &shader_programs[curr_index];
 
    shader_programs[index] = *shader;
@@ -702,6 +728,7 @@ int neil_shader_warm_complete(GLuint prog) { return warm_complete(prog); }
 void neil_shader_warm_step(void)
 {
    int nf_done;
+   ub_poll();
    if (warm_ask_in < 0)
       return;
    for (; warm_next < warm_n; warm_next++)
@@ -768,6 +795,618 @@ static int warm_adopt(shader_program_key *shader)
    return 0;
 }
 
+/* ---- UBER (2026-10-23) ----
+ * A combiner glide has not seen this session still cost a compile + link in the
+ * middle of the display list, and the first query of the new program waited for
+ * both. SHADER PREWARM removes that for every program on the shipped/stored list;
+ * a program on no list (a new move in a Pokémon Stadium battle) still stalled
+ * the field: measured ?costdbg=1 solo, 566.8 / 403.7 / 244.1 ms fields, all
+ * 'prog', the music audibly slowing.
+ * So one more program is built at boot, from the same header, with every
+ * section's text below written as a branch on uniforms instead of as text, and
+ * every combiner it reproduces is DRAWN WITH IT: a combiner never seen before
+ * costs no compile at all, with no list and no warm-up. Which program a draw uses
+ * is then a function of glide's state alone — the same on every console of a
+ * room and in every re-run of a frame, whatever each machine's compile speed or
+ * stored list. Each branch is the statement glide's writer emits
+ * for that argument, character for character, in the order the writers emit
+ * them (the tables are glide's own strings: grColorCombine, grColorCombineExt,
+ * grAlphaCombine, grAlphaCombineExt, grTexCombine, grTexColorCombineExt,
+ * grTexAlphaCombineExt, the 3-point reads, dither, fog, the alpha test).
+ * NOT used (glide's own program, compiled as before): chroma keying (its text is
+ * built from the previous call's state, which no key records), any argument a
+ * writer emits no declaration for (the real program would not link), ?uber=0.
+ * Its own link is asked about at a field end once KHR_parallel_shader_compile
+ * says it is complete, or waited for once at the first draw that wants it. */
+static const char *ub_decls =
+"uniform mediump ivec4 uT0a; uniform mediump ivec4 uT0b; uniform mediump ivec4 uT0x1; uniform mediump ivec4 uT0x2; uniform mediump ivec4 uT0y1; uniform mediump ivec4 uT0y2; \n"
+"uniform mediump ivec4 uT1a; uniform mediump ivec4 uT1b; uniform mediump ivec4 uT1x1; uniform mediump ivec4 uT1x2; uniform mediump ivec4 uT1y1; uniform mediump ivec4 uT1y2; \n"
+"uniform mediump ivec4 uCa; uniform mediump ivec4 uCx1; uniform mediump ivec4 uCx2; \n"
+"uniform mediump ivec4 uAa; uniform mediump ivec4 uAx1; uniform mediump ivec4 uAx2; \n"
+"uniform mediump ivec4 uF; \n";
+
+/* uTna = (mode, fn, fac, inv)   uTnb = (afn, afac, ainv, aext)
+ * uTnx1/x2 = the colour Ext a, a_mode, b, b_mode / c, c_inv, d, d_inv;  uTny1/y2 = the alpha Ext ones
+ * uCa / uAa = (mode, fn, fac, local); uCx1 / uAx1 = Ext a, a_mode, b, b_mode;
+ * uCx2 / uAx2 = Ext c, c_inv, d, d_inv — or, in mode 0, (other, 0, 0, 0)
+ * uF = (dither, 3-point tex0, 3-point tex1, fog) */
+static const char *ub_body =
+/* dither (fragment_shader_dither) */
+"  if (uF.x != 0) { \n"
+"  highp float temp=abs(sin((vTexCoord[2].a)+sin((vTexCoord[2].a)+(vTexCoord[2].b))))*170.0; \n"
+"  if ((fract(temp)+fract(temp/2.0)+fract(temp/4.0))>1.5) discard; \n"
+"  } \n"
+/* readtex0 / readtex1 */
+"  vec4 readtex0; \n"
+"  if (uF.y != 0) { \n"
+"  offset=fract(vTexCoord[0].xy*exactSizes.xy-vec2(0.5,0.5)); \n"
+"  offset-=step(1.0,offset.x+offset.y); \n"
+"  c0=TEX0_OFFSET(offset); \n"
+"  c1=TEX0_OFFSET(vec2(offset.x-sign(offset.x),offset.y)); \n"
+"  c2=TEX0_OFFSET(vec2(offset.x,offset.y-sign(offset.y))); \n"
+"  readtex0 =c0+abs(offset.x)*(c1-c0)+abs(offset.y)*(c2-c0); \n"
+"  } else { readtex0 = TEX0; } \n"
+"  vec4 readtex1; \n"
+"  if (uF.z != 0) { \n"
+"  offset=fract(vTexCoord[1].xy*exactSizes.zw-vec2(0.5,0.5)); \n"
+"  offset-=step(1.0,offset.x+offset.y); \n"
+"  c0=TEX1_OFFSET(offset); \n"
+"  c1=TEX1_OFFSET(vec2(offset.x-sign(offset.x),offset.y)); \n"
+"  c2=TEX1_OFFSET(vec2(offset.x,offset.y-sign(offset.y))); \n"
+"  readtex1 =c0+abs(offset.x)*(c1-c0)+abs(offset.y)*(c2-c0); \n"
+"  } else { readtex1 = TEX1; } \n"
+
+/* ---- fragment_shader_texture0 ---- */
+"  vec4 ctexture0 = vec4(0.0); \n"
+"  if (uT0a.x == 0) { \n"
+"    vec4 texture0_color_factor = vec4(0.0); int f = uT0a.z; \n"
+"    if (f == 1) texture0_color_factor = readtex0; \n"
+"    else if (f == 3) texture0_color_factor = vec4(readtex0.a); \n"
+"    else if (f == 4) texture0_color_factor = vec4(lambda); \n"
+"    else if (f == 8) texture0_color_factor = vec4(1.0); \n"
+"    else if (f == 9) texture0_color_factor = vec4(1.0) - readtex0; \n"
+"    else if (f == 10) texture0_color_factor = vec4(1.0) - vec4(0.0); \n"
+"    else if (f == 11) texture0_color_factor = vec4(1.0) - vec4(readtex0.a); \n"
+"    else if (f == 12) texture0_color_factor = vec4(1.0) - vec4(lambda); \n"
+"    int fn = uT0a.y; \n"
+"    if (fn == 0) ctexture0 = vec4(0.0); \n"
+"    else if (fn == 1) ctexture0 = readtex0; \n"
+"    else if (fn == 2) ctexture0 = vec4(readtex0.a); \n"
+"    else if (fn == 3) ctexture0 = texture0_color_factor * vec4(0.0); \n"
+"    else if (fn == 4) ctexture0 = texture0_color_factor * vec4(0.0) + readtex0; \n"
+"    else if (fn == 5) ctexture0 = texture0_color_factor * vec4(0.0) + vec4(readtex0.a); \n"
+"    else if (fn == 6) ctexture0 = texture0_color_factor * (vec4(0.0) - readtex0); \n"
+"    else if (fn == 7) ctexture0 = texture0_color_factor * (vec4(0.0) - readtex0) + readtex0; \n"
+"    else if (fn == 8) ctexture0 = texture0_color_factor * (vec4(0.0) - readtex0) + vec4(readtex0.a); \n"
+"    else if (fn == 9) ctexture0 = texture0_color_factor * (-readtex0) + readtex0; \n"
+"    else if (fn == 16) ctexture0 = texture0_color_factor * (-readtex0) + vec4(readtex0.a); \n"
+"    else ctexture0 = readtex0; \n"
+"    if (uT0a.w != 0) ctexture0 = vec4(1.0) - ctexture0; \n"
+"    float texture0_alpha_factor = 0.0; int af = uT0b.y; \n"
+"    if (af == 1) texture0_alpha_factor = readtex0.a; \n"
+"    else if (af == 3) texture0_alpha_factor = readtex0.a; \n"
+"    else if (af == 4) texture0_alpha_factor = lambda; \n"
+"    else if (af == 8) texture0_alpha_factor = 1.0; \n"
+"    else if (af == 9) texture0_alpha_factor = 1.0 - readtex0.a; \n"
+"    else if (af == 10) texture0_alpha_factor = 1.0 - 0.0; \n"
+"    else if (af == 11) texture0_alpha_factor = 1.0 - readtex0.a; \n"
+"    else if (af == 12) texture0_alpha_factor = 1.0 - lambda; \n"
+"    int afn = uT0b.x; \n"
+"    if (afn == 0) ctexture0.a = 0.0; \n"
+"    else if (afn == 1 || afn == 2) ctexture0.a = readtex0.a; \n"
+"    else if (afn == 3) ctexture0.a = texture0_alpha_factor * 0.0; \n"
+"    else if (afn == 4 || afn == 5) ctexture0.a = texture0_alpha_factor * 0.0 + readtex0.a; \n"
+"    else if (afn == 6) ctexture0.a = texture0_alpha_factor * (0.0 - readtex0.a); \n"
+"    else if (afn == 7 || afn == 8) ctexture0.a = texture0_alpha_factor * (0.0 - readtex0.a) + readtex0.a; \n"
+"    else if (afn == 9 || afn == 16) ctexture0.a = texture0_alpha_factor * (-readtex0.a) + readtex0.a; \n"
+"    else ctexture0.a = readtex0.a; \n"
+"    if (uT0b.z != 0) ctexture0.a = 1.0 - ctexture0.a; \n"
+"  } else { \n"
+"    vec4 ctex0s_a = vec4(0.0); int k = uT0x1.x; \n"
+"    if (k == 8) ctex0s_a = vec4(vFrontColor.a); \n"
+"    else if (k == 9) ctex0s_a = vFrontColor; \n"
+"    else if (k == 10) ctex0s_a = vec4(readtex0.a); \n"
+"    else if (k == 11) ctex0s_a = readtex0; \n"
+"    else if (k == 17) ctex0s_a = ccolor0; \n"
+"    else if (k == 16) ctex0s_a = vec4(ccolor0.a); \n"
+"    vec4 ctex0_a = vec4(0.0); k = uT0x1.y; \n"
+"    if (k == 1) ctex0_a = ctex0s_a; \n"
+"    else if (k == 2) ctex0_a = vec4(1.0) - ctex0s_a; \n"
+"    else if (k == 3) ctex0_a = -ctex0s_a; \n"
+"    vec4 ctex0s_b = vec4(0.0); k = uT0x1.z; \n"
+"    if (k == 8) ctex0s_b = vec4(vFrontColor.a); \n"
+"    else if (k == 9) ctex0s_b = vFrontColor; \n"
+"    else if (k == 10) ctex0s_b = vec4(readtex0.a); \n"
+"    else if (k == 11) ctex0s_b = readtex0; \n"
+"    else if (k == 16) ctex0s_b = vec4(ccolor0.a); \n"
+"    else if (k == 17) ctex0s_b = ccolor0; \n"
+"    vec4 ctex0_b = vec4(0.0); k = uT0x1.w; \n"
+"    if (k == 1) ctex0_b = ctex0s_b; \n"
+"    else if (k == 2) ctex0_b = vec4(1.0) - ctex0s_b; \n"
+"    else if (k == 3) ctex0_b = -ctex0s_b; \n"
+"    vec4 ctex0_c = vec4(0.0); k = uT0x2.x; \n"
+"    if (k == 4) ctex0_c = ctex0s_b; \n"
+"    else if (k == 7) ctex0_c = vec4(lambda); \n"
+"    else if (k == 9) ctex0_c = vFrontColor; \n"
+"    else if (k == 8) ctex0_c = vec4(vFrontColor.a); \n"
+"    else if (k == 10) ctex0_c = vec4(readtex0.a); \n"
+"    else if (k == 11) ctex0_c = readtex0; \n"
+"    else if (k == 16) ctex0_c = vec4(ccolor0.a); \n"
+"    else if (k == 17) ctex0_c = ccolor0; \n"
+"    if (uT0x2.y != 0) ctex0_c = vec4(1.0) - ctex0_c; \n"
+"    vec4 ctex0_d = vec4(0.0); k = uT0x2.z; \n"
+"    if (k == 4) ctex0_d = ctex0s_b; \n"
+"    else if (k == 9) ctex0_d = vFrontColor; \n"
+"    else if (k == 10) ctex0_d = vec4(readtex0.a); \n"
+"    if (uT0x2.w != 0) ctex0_d = vec4(1.0) - ctex0_d; \n"
+"    ctexture0 = (ctex0_a + ctex0_b) * ctex0_c + ctex0_d; \n"
+"    if (uT0b.w != 0) { \n"
+"      k = uT0y1.x; \n"
+"      if (k == 8) ctex0s_a.a = vFrontColor.a; \n"
+"      else if (k == 10) ctex0s_a.a = readtex0.a; \n"
+"      else if (k == 16) ctex0s_a.a = ccolor0.a; \n"
+"      else ctex0s_a.a = 0.0; \n"
+"      k = uT0y1.y; \n"
+"      if (k == 1) ctex0_a.a = ctex0s_a.a; \n"
+"      else if (k == 2) ctex0_a.a = 1.0 - ctex0s_a.a; \n"
+"      else if (k == 3) ctex0_a.a = -ctex0s_a.a; \n"
+"      else ctex0_a.a = 0.0; \n"
+"      k = uT0y1.z; \n"
+"      if (k == 8) ctex0s_b.a = vFrontColor.a; \n"
+"      else if (k == 10) ctex0s_b.a = readtex0.a; \n"
+"      else if (k == 16) ctex0s_b.a = ccolor0.a; \n"
+"      else ctex0s_b.a = 0.0; \n"
+"      k = uT0y1.w; \n"
+"      if (k == 1) ctex0_b.a = ctex0s_b.a; \n"
+"      else if (k == 2) ctex0_b.a = 1.0 - ctex0s_b.a; \n"
+"      else if (k == 3) ctex0_b.a = -ctex0s_b.a; \n"
+"      else ctex0_b.a = 0.0; \n"
+"      k = uT0y2.x; \n"
+"      if (k == 4) ctex0_c.a = ctex0s_b.a; \n"
+"      else if (k == 7) ctex0_c.a = lambda; \n"
+"      else if (k == 8) ctex0_c.a = vFrontColor.a; \n"
+"      else if (k == 10) ctex0_c.a = readtex0.a; \n"
+"      else if (k == 16) ctex0_c.a = ccolor0.a; \n"
+"      else ctex0_c.a = 0.0; \n"
+"      k = uT0y2.z; \n"
+"      if (k == 4) ctex0_d.a = ctex0s_b.a; \n"
+"      else if (k == 8 || k == 9) ctex0_d.a = vFrontColor.a; \n"
+"      else if (k == 10) ctex0_d.a = readtex0.a; \n"
+"      else ctex0_d.a = 0.0; \n"
+"      if (uT0y2.y != 0) ctex0_c.a = 1.0 - ctex0_c.a; \n"
+"      if (uT0y2.w != 0) ctex0_d.a = 1.0 - ctex0_d.a; \n"
+"      ctexture0.a = (ctex0_a.a + ctex0_b.a) * ctex0_c.a + ctex0_d.a; \n"
+"    } \n"
+"  } \n"
+
+/* ---- fragment_shader_texture1 ---- */
+"  vec4 ctexture1 = vec4(0.0); \n"
+"  if (uT1a.x == 2) { \n"
+"    ctexture1 = texture2D(texture0, vec2(vTexCoord[0])); \n"
+"  } else if (uT1a.x == 0) { \n"
+"    vec4 texture1_color_factor = vec4(0.0); int f = uT1a.z; \n"
+"    if (f == 1) texture1_color_factor = readtex1; \n"
+"    else if (f == 2) texture1_color_factor = vec4(ctexture0.a); \n"
+"    else if (f == 3) texture1_color_factor = vec4(readtex1.a); \n"
+"    else if (f == 4) texture1_color_factor = vec4(lambda); \n"
+"    else if (f == 8) texture1_color_factor = vec4(1.0); \n"
+"    else if (f == 9) texture1_color_factor = vec4(1.0) - readtex1; \n"
+"    else if (f == 10) texture1_color_factor = vec4(1.0) - vec4(ctexture0.a); \n"
+"    else if (f == 11) texture1_color_factor = vec4(1.0) - vec4(readtex1.a); \n"
+"    else if (f == 12) texture1_color_factor = vec4(1.0) - vec4(lambda); \n"
+"    int fn = uT1a.y; \n"
+"    if (fn == 0) ctexture1 = vec4(0.0); \n"
+"    else if (fn == 1) ctexture1 = readtex1; \n"
+"    else if (fn == 2) ctexture1 = vec4(readtex1.a); \n"
+"    else if (fn == 3) ctexture1 = texture1_color_factor * ctexture0; \n"
+"    else if (fn == 4) ctexture1 = texture1_color_factor * ctexture0 + readtex1; \n"
+"    else if (fn == 5) ctexture1 = texture1_color_factor * ctexture0 + vec4(readtex1.a); \n"
+"    else if (fn == 6) ctexture1 = texture1_color_factor * (ctexture0 - readtex1); \n"
+"    else if (fn == 7) ctexture1 = texture1_color_factor * (ctexture0 - readtex1) + readtex1; \n"
+"    else if (fn == 8) ctexture1 = texture1_color_factor * (ctexture0 - readtex1) + vec4(readtex1.a); \n"
+"    else if (fn == 9) ctexture1 = texture1_color_factor * (-readtex1) + readtex1; \n"
+"    else if (fn == 16) ctexture1 = texture1_color_factor * (-readtex1) + vec4(readtex1.a); \n"
+"    else ctexture1 = readtex1; \n"
+"    if (uT1a.w != 0) ctexture1 = vec4(1.0) - ctexture1; \n"
+"    float texture1_alpha_factor = 0.0; int af = uT1b.y; \n"
+"    if (af == 1) texture1_alpha_factor = readtex1.a; \n"
+"    else if (af == 2) texture1_alpha_factor = ctexture0.a; \n"
+"    else if (af == 3) texture1_alpha_factor = readtex1.a; \n"
+"    else if (af == 4) texture1_alpha_factor = lambda; \n"
+"    else if (af == 8) texture1_alpha_factor = 1.0; \n"
+"    else if (af == 9) texture1_alpha_factor = 1.0 - readtex1.a; \n"
+"    else if (af == 10) texture1_alpha_factor = 1.0 - ctexture0.a; \n"
+"    else if (af == 11) texture1_alpha_factor = 1.0 - readtex1.a; \n"
+"    else if (af == 12) texture1_alpha_factor = 1.0 - lambda; \n"
+"    int afn = uT1b.x; \n"
+"    if (afn == 0) ctexture1.a = 0.0; \n"
+"    else if (afn == 1 || afn == 2) ctexture1.a = readtex1.a; \n"
+"    else if (afn == 3) ctexture1.a = texture1_alpha_factor * ctexture0.a; \n"
+"    else if (afn == 4 || afn == 5) ctexture1.a = texture1_alpha_factor * ctexture0.a + readtex1.a; \n"
+"    else if (afn == 6) ctexture1.a = texture1_alpha_factor * (ctexture0.a - readtex1.a); \n"
+"    else if (afn == 7 || afn == 8) ctexture1.a = texture1_alpha_factor * (ctexture0.a - readtex1.a) + readtex1.a; \n"
+"    else if (afn == 9 || afn == 16) ctexture1.a = texture1_alpha_factor * (-readtex1.a) + readtex1.a; \n"
+"    else ctexture1.a = ctexture0.a; \n"
+"    if (uT1b.z != 0) ctexture1.a = 1.0 - ctexture1.a; \n"
+"  } else { \n"
+"    vec4 ctex1s_a = vec4(0.0); int k = uT1x1.x; \n"
+"    if (k == 8) ctex1s_a = vec4(vFrontColor.a); \n"
+"    else if (k == 9) ctex1s_a = vFrontColor; \n"
+"    else if (k == 10) ctex1s_a = vec4(readtex1.a); \n"
+"    else if (k == 11) ctex1s_a = readtex1; \n"
+"    else if (k == 13) ctex1s_a = vec4(ctexture0.a); \n"
+"    else if (k == 14) ctex1s_a = ctexture0; \n"
+"    else if (k == 17) ctex1s_a = ccolor1; \n"
+"    else if (k == 16) ctex1s_a = vec4(ccolor1.a); \n"
+"    vec4 ctex1_a = vec4(0.0); k = uT1x1.y; \n"
+"    if (k == 1) ctex1_a = ctex1s_a; \n"
+"    else if (k == 2) ctex1_a = vec4(1.0) - ctex1s_a; \n"
+"    else if (k == 3) ctex1_a = -ctex1s_a; \n"
+"    vec4 ctex1s_b = vec4(0.0); k = uT1x1.z; \n"
+"    if (k == 8) ctex1s_b = vec4(vFrontColor.a); \n"
+"    else if (k == 9) ctex1s_b = vFrontColor; \n"
+"    else if (k == 10) ctex1s_b = vec4(readtex1.a); \n"
+"    else if (k == 11) ctex1s_b = readtex1; \n"
+"    else if (k == 13) ctex1s_b = vec4(ctexture0.a); \n"
+"    else if (k == 14) ctex1s_b = ctexture0; \n"
+"    else if (k == 16) ctex1s_b = vec4(ccolor1.a); \n"
+"    else if (k == 17) ctex1s_b = ccolor1; \n"
+"    vec4 ctex1_b = vec4(0.0); k = uT1x1.w; \n"
+"    if (k == 1) ctex1_b = ctex1s_b; \n"
+"    else if (k == 2) ctex1_b = vec4(1.0) - ctex1s_b; \n"
+"    else if (k == 3) ctex1_b = -ctex1s_b; \n"
+"    vec4 ctex1_c = vec4(0.0); k = uT1x2.x; \n"
+"    if (k == 4) ctex1_c = ctex1s_b; \n"
+"    else if (k == 7) ctex1_c = vec4(lambda); \n"
+"    else if (k == 9) ctex1_c = vFrontColor; \n"
+"    else if (k == 8) ctex1_c = vec4(vFrontColor.a); \n"
+"    else if (k == 10) ctex1_c = vec4(readtex1.a); \n"
+"    else if (k == 11) ctex1_c = readtex1; \n"
+"    else if (k == 13) ctex1_c = vec4(ctexture0.a); \n"
+"    else if (k == 14) ctex1_c = ctexture0; \n"
+"    else if (k == 16) ctex1_c = vec4(ccolor1.a); \n"
+"    else if (k == 17) ctex1_c = ccolor1; \n"
+"    if (uT1x2.y != 0) ctex1_c = vec4(1.0) - ctex1_c; \n"
+"    vec4 ctex1_d = vec4(0.0); k = uT1x2.z; \n"
+"    if (k == 4) ctex1_d = ctex1s_b; \n"
+"    else if (k == 9) ctex1_d = vFrontColor; \n"
+"    else if (k == 10) ctex1_d = vec4(readtex1.a); \n"
+"    if (uT1x2.w != 0) ctex1_d = vec4(1.0) - ctex1_d; \n"
+"    ctexture1 = (ctex1_a + ctex1_b) * ctex1_c + ctex1_d; \n"
+"    if (uT1b.w != 0) { \n"
+"      k = uT1y1.x; \n"
+"      if (k == 8) ctex1s_a.a = vFrontColor.a; \n"
+"      else if (k == 10) ctex1s_a.a = readtex1.a; \n"
+"      else if (k == 13) ctex1s_a.a = ctexture0.a; \n"
+"      else if (k == 16) ctex1s_a.a = ccolor1.a; \n"
+"      else ctex1s_a.a = 0.0; \n"
+"      k = uT1y1.y; \n"
+"      if (k == 1) ctex1_a.a = ctex1s_a.a; \n"
+"      else if (k == 2) ctex1_a.a = 1.0 - ctex1s_a.a; \n"
+"      else if (k == 3) ctex1_a.a = -ctex1s_a.a; \n"
+"      else ctex1_a.a = 0.0; \n"
+"      k = uT1y1.z; \n"
+"      if (k == 8) ctex1s_b.a = vFrontColor.a; \n"
+"      else if (k == 10) ctex1s_b.a = readtex1.a; \n"
+"      else if (k == 13) ctex1s_b.a = ctexture0.a; \n"
+"      else if (k == 16) ctex1s_b.a = ccolor1.a; \n"
+"      else ctex1s_b.a = 0.0; \n"
+"      k = uT1y1.w; \n"
+"      if (k == 1) ctex1_b.a = ctex1s_b.a; \n"
+"      else if (k == 2) ctex1_b.a = 1.0 - ctex1s_b.a; \n"
+"      else if (k == 3) ctex1_b.a = -ctex1s_b.a; \n"
+"      else ctex1_b.a = 0.0; \n"
+"      k = uT1y2.x; \n"
+"      if (k == 4) ctex1_c.a = ctex1s_b.a; \n"
+"      else if (k == 7) ctex1_c.a = lambda; \n"
+"      else if (k == 8) ctex1_c.a = vFrontColor.a; \n"
+"      else if (k == 10) ctex1_c.a = readtex1.a; \n"
+"      else if (k == 13) ctex1_c.a = ctexture0.a; \n"
+"      else if (k == 16) ctex1_c.a = ccolor1.a; \n"
+"      else ctex1_c.a = 0.0; \n"
+"      k = uT1y2.z; \n"
+"      if (k == 4) ctex1_d.a = ctex1s_b.a; \n"
+"      else if (k == 8 || k == 9) ctex1_d.a = vFrontColor.a; \n"
+"      else if (k == 10) ctex1_d.a = readtex1.a; \n"
+"      else ctex1_d.a = 0.0; \n"
+"      if (uT1y2.y != 0) ctex1_c.a = 1.0 - ctex1_c.a; \n"
+"      if (uT1y2.w != 0) ctex1_d.a = 1.0 - ctex1_d.a; \n"
+"      ctexture1.a = (ctex1_a.a + ctex1_b.a) * ctex1_c.a + ctex1_d.a; \n"
+"    } \n"
+"  } \n"
+
+/* ---- fragment_shader_color_combiner ---- */
+"  if (uCa.x == 0) { \n"
+"    vec4 color_local = vec4(0.0); vec4 color_other = vec4(0.0); vec4 color_factor = vec4(0.0); \n"
+"    if (uCa.w == 0) color_local = vFrontColor; else if (uCa.w == 1) color_local = constant_color; \n"
+"    if (uCx2.x == 0) color_other = vFrontColor; else if (uCx2.x == 1) color_other = ctexture1; else if (uCx2.x == 2) color_other = constant_color; \n"
+"    int f = uCa.z; \n"
+"    if (f == 1) color_factor = color_local; \n"
+"    else if (f == 2) color_factor = vec4(color_other.a); \n"
+"    else if (f == 3) color_factor = vec4(color_local.a); \n"
+"    else if (f == 4) color_factor = vec4(ctexture1.a); \n"
+"    else if (f == 5) color_factor = ctexture1; \n"
+"    else if (f == 8) color_factor = vec4(1.0); \n"
+"    else if (f == 9) color_factor = vec4(1.0) - color_local; \n"
+"    else if (f == 10) color_factor = vec4(1.0) - vec4(color_other.a); \n"
+"    else if (f == 11) color_factor = vec4(1.0) - vec4(color_local.a); \n"
+"    else if (f == 12) color_factor = vec4(1.0) - vec4(ctexture1.a); \n"
+"    int fn = uCa.y; \n"
+"    if (fn == 0) gl_FragColor = vec4(0.0); \n"
+"    else if (fn == 1) gl_FragColor = color_local; \n"
+"    else if (fn == 2) gl_FragColor = vec4(color_local.a); \n"
+"    else if (fn == 3) gl_FragColor = color_factor * color_other; \n"
+"    else if (fn == 4) gl_FragColor = color_factor * color_other + color_local; \n"
+"    else if (fn == 5) gl_FragColor = color_factor * color_other + vec4(color_local.a); \n"
+"    else if (fn == 6) gl_FragColor = color_factor * (color_other - color_local); \n"
+"    else if (fn == 7) gl_FragColor = color_factor * (color_other - color_local) + color_local; \n"
+"    else if (fn == 8) gl_FragColor = color_factor * (color_other - color_local) + vec4(color_local.a); \n"
+"    else if (fn == 9) gl_FragColor = color_factor * (-color_local) + color_local; \n"
+"    else if (fn == 16) gl_FragColor = color_factor * (-color_local) + vec4(color_local.a); \n"
+"    else gl_FragColor = TEX0; \n"
+"  } else { \n"
+"    vec4 cs_a = vec4(0.0); int k = uCx1.x; \n"
+"    if (k == 1) cs_a = vec4(ctexture1.a); \n"
+"    else if (k == 5) cs_a = vec4(constant_color.a); \n"
+"    else if (k == 6) cs_a = constant_color; \n"
+"    else if (k == 8) cs_a = vec4(vFrontColor.a); \n"
+"    else if (k == 9) cs_a = vFrontColor; \n"
+"    else if (k == 15) cs_a = ctexture1; \n"
+"    vec4 c_a = vec4(0.0); k = uCx1.y; \n"
+"    if (k == 1) c_a = cs_a; \n"
+"    else if (k == 2) c_a = vec4(1.0) - cs_a; \n"
+"    else if (k == 3) c_a = -cs_a; \n"
+"    vec4 cs_b = vec4(0.0); k = uCx1.z; \n"
+"    if (k == 1) cs_b = vec4(ctexture1.a); \n"
+"    else if (k == 5) cs_b = vec4(constant_color.a); \n"
+"    else if (k == 6) cs_b = constant_color; \n"
+"    else if (k == 8) cs_b = vec4(vFrontColor.a); \n"
+"    else if (k == 9) cs_b = vFrontColor; \n"
+"    else if (k == 15) cs_b = ctexture1; \n"
+"    vec4 c_b = vec4(0.0); k = uCx1.w; \n"
+"    if (k == 1) c_b = cs_b; \n"
+"    else if (k == 2) c_b = vec4(1.0) - cs_b; \n"
+"    else if (k == 3) c_b = -cs_b; \n"
+"    vec4 c_c = vec4(0.0); k = uCx2.x; \n"
+"    if (k == 1) c_c = vec4(ctexture1.a); \n"
+"    else if (k == 2) c_c = vec4(c_b.a); \n"
+"    else if (k == 3) c_c = vec4(c_a.a); \n"
+"    else if (k == 4) c_c = cs_b; \n"
+"    else if (k == 5) c_c = vec4(constant_color.a); \n"
+"    else if (k == 6) c_c = constant_color; \n"
+"    else if (k == 8) c_c = vec4(vFrontColor.a); \n"
+"    else if (k == 9) c_c = vFrontColor; \n"
+"    else if (k == 15) c_c = ctexture1; \n"
+"    if (uCx2.y != 0) c_c = vec4(1.0) - c_c; \n"
+"    vec4 c_d = vec4(0.0); k = uCx2.z; \n"
+"    if (k == 2) c_d = vec4(c_b.a); \n"
+"    else if (k == 4) c_d = cs_b; \n"
+"    else if (k == 15) c_d = ctexture1; \n"
+"    else if (k == 9) c_d = vFrontColor; \n"
+"    if (uCx2.w != 0) c_d = vec4(1.0) - c_d; \n"
+"    gl_FragColor = (c_a + c_b) * c_c + c_d; \n"
+"  } \n"
+
+/* ---- fragment_shader_alpha_combiner ---- */
+"  if (uAa.x == 0) { \n"
+"    float alpha_local = 0.0; float alpha_other = 0.0; float alpha_factor = 0.0; \n"
+"    if (uAa.w == 0) alpha_local = vFrontColor.a; else if (uAa.w == 1) alpha_local = constant_color.a; \n"
+"    if (uAx2.x == 0) alpha_other = vFrontColor.a; else if (uAx2.x == 1) alpha_other = ctexture1.a; else if (uAx2.x == 2) alpha_other = constant_color.a; \n"
+"    int f = uAa.z; \n"
+"    if (f == 1) alpha_factor = alpha_local; \n"
+"    else if (f == 2) alpha_factor = alpha_other; \n"
+"    else if (f == 3) alpha_factor = alpha_local; \n"
+"    else if (f == 4) alpha_factor = ctexture1.a; \n"
+"    else if (f == 8) alpha_factor = 1.0; \n"
+"    else if (f == 9) alpha_factor = 1.0 - alpha_local; \n"
+"    else if (f == 10) alpha_factor = 1.0 - alpha_other; \n"
+"    else if (f == 11) alpha_factor = 1.0 - alpha_local; \n"
+"    else if (f == 12) alpha_factor = 1.0 - ctexture1.a; \n"
+"    int fn = uAa.y; \n"
+"    if (fn == 0) gl_FragColor.a = 0.0; \n"
+"    else if (fn == 1 || fn == 2) gl_FragColor.a = alpha_local; \n"
+"    else if (fn == 3) gl_FragColor.a = alpha_factor * alpha_other; \n"
+"    else if (fn == 4 || fn == 5) gl_FragColor.a = alpha_factor * alpha_other + alpha_local; \n"
+"    else if (fn == 6) gl_FragColor.a = alpha_factor * (alpha_other - alpha_local); \n"
+"    else if (fn == 7 || fn == 8) gl_FragColor.a = alpha_factor * (alpha_other - alpha_local) + alpha_local; \n"
+"    else if (fn == 9 || fn == 16) gl_FragColor.a = alpha_factor * (-alpha_local) + alpha_local; \n"
+"  } else if (uAa.x == 1) { \n"
+"    float as_a = 0.0; int k = uAx1.x; \n"
+"    if (k == 1) as_a = ctexture1.a; \n"
+"    else if (k == 5) as_a = constant_color.a; \n"
+"    else if (k == 8) as_a = vFrontColor.a; \n"
+"    float a_a = 0.0; k = uAx1.y; \n"
+"    if (k == 1) a_a = as_a; \n"
+"    else if (k == 2) a_a = 1.0 - as_a; \n"
+"    else if (k == 3) a_a = -as_a; \n"
+"    float as_b = 0.0; k = uAx1.z; \n"
+"    if (k == 1) as_b = ctexture1.a; \n"
+"    else if (k == 5) as_b = constant_color.a; \n"
+"    else if (k == 8) as_b = vFrontColor.a; \n"
+"    float a_b = 0.0; k = uAx1.w; \n"
+"    if (k == 1) a_b = as_b; \n"
+"    else if (k == 2) a_b = 1.0 - as_b; \n"
+"    else if (k == 3) a_b = -as_b; \n"
+"    float a_c = 0.0; k = uAx2.x; \n"
+"    if (k == 1) a_c = ctexture1.a; \n"
+"    else if (k == 2) a_c = as_b; \n"
+"    else if (k == 3) a_c = as_a; \n"
+"    else if (k == 4) a_c = as_b; \n"
+"    else if (k == 5) a_c = constant_color.a; \n"
+"    else if (k == 8) a_c = vFrontColor.a; \n"
+"    if (uAx2.y != 0) a_c = 1.0 - a_c; \n"
+"    float a_d = 0.0; k = uAx2.z; \n"
+"    if (k == 1) a_d = ctexture1.a; \n"
+"    else if (k == 2) a_d = as_b; \n"
+"    else if (k == 4) a_d = as_b; \n"
+"    if (uAx2.w != 0) a_d = 1.0 - a_d; \n"
+"    gl_FragColor.a = (a_a + a_b) * a_c + a_d; \n"
+"  } \n"
+/* (uAa.x == 3: no alpha writer has run, and its empty text leaves gl_FragColor.a alone) */
+
+/* fog (fragment_shader_fog); the alpha test is fragment_shader_end, appended after this */
+"  if (uF.w != 0) { \n"
+"  float fog;  \n"
+"  fog = vTexCoord[0].b;  \n"
+"  gl_FragColor.rgb = mix(fogColor, gl_FragColor.rgb, fog); \n"
+"  } \n";
+
+static const char *ub_names[19] = { "uT0a", "uT0b", "uT0x1", "uT0x2", "uT0y1", "uT0y2",
+   "uT1a", "uT1b", "uT1x1", "uT1x2", "uT1y1", "uT1y2", "uCa", "uCx1", "uCx2", "uAa", "uAx1", "uAx2", "uF" };
+static GLint ub_loc[19];
+static GLuint ub_prog;
+static int ub_state;           /* 0 not built, 1 linking, 2 ready, -1 off or failed */
+static shader_program_key ub_key;
+static int ub_draws;
+
+/* glide's writers emit no declaration for these, so the real program would not link
+ * and the uber program must not pretend it does */
+static int ub_fac_ok(int f, int alpha) { return f == 0 || f == 1 || f == 2 || f == 3 || f == 4 || (!alpha && f == 5) || (f >= 8 && f <= 12); }
+static int ub_fn_has_factor(int fn) { return (fn >= 3 && fn <= 9) || fn == 16; }
+static int ub_cmb_ok(const ub_cmb_t *c, int alpha)
+{
+   int fn = c->fn, f = c->fac, need_local, need_other;
+   if (c->mode == 1) return 1;
+   if (c->mode == 3) return alpha;            /* no alpha text: nothing written; no colour text: nothing drawn */
+   if (ub_fn_has_factor(fn) && !ub_fac_ok(f, alpha)) return 0;
+   need_local = fn == 1 || fn == 2 || (fn >= 4 && fn <= 9) || fn == 16 || (fn == 3 && (f == 1 || f == 3 || f == 9 || f == 11));
+   need_other = (fn >= 3 && fn <= 8) || ((fn == 9 || fn == 16) && (f == 2 || f == 10));
+   if (need_local && c->local != 0 && c->local != 1) return 0;
+   if (need_other && (c->other < 0 || c->other > 2)) return 0;
+   return 1;
+}
+static int ub_tex_ok(const ub_tex_t *t)
+{
+   if (t->bad) return 0;
+   if (t->mode != 0) return 1;
+   if (ub_fn_has_factor(t->fn) && !ub_fac_ok(t->fac, 1)) return 0;   /* tex colour factors: no 5 either */
+   if (ub_fn_has_factor(t->afn) && !ub_fac_ok(t->afac, 1)) return 0;
+   return 1;
+}
+/* the current text is one the uber program reproduces — a function of glide's state only */
+static int ub_state_ok(void)
+{
+   if (chroma_enabled) return 0;
+   if (ub_tex[0].mode == 3 && ub_tex[1].mode != 2) return 0;   /* something would read an undeclared ctexture0 */
+   return ub_tex_ok(&ub_tex[0]) && ub_tex_ok(&ub_tex[1]) && ub_cmb_ok(&ub_col, 0) && ub_cmb_ok(&ub_alp, 1);
+}
+static void ub_ask(void);
+/* this draw uses the uber program */
+static int ub_on(void)
+{
+   if (ub_state == 1) ub_ask();
+   return ub_state == 2 && ub_state_ok();
+}
+
+static void ub_start(void)
+{
+   const char *mainp;
+   char *src;
+   size_t pre, n;
+   GLuint frag;
+   int want = 1, par = 0, soft = 0;
+   ub_state = -1; ub_prog = 0;
+#ifdef __EMSCRIPTEN__
+   want = EM_ASM_INT({ var g = (typeof globalThis !== 'undefined') ? globalThis : self; var f = g.__fbAsync; return (f && f.uber === false) ? 0 : 1; });
+   par = EM_ASM_INT({ try { return (typeof GLctx !== 'undefined' && GLctx && GLctx.getExtension('KHR_parallel_shader_compile')) ? 1 : 0; } catch (e) { return 0; } });
+   /* A SOFTWARE RASTERISER is the one place this costs more than it saves: it runs every
+    * branch on the CPU for every pixel, and its compiles are cheap. Measured under
+    * SwiftShader, Pokemon Stadium into a battle, 6500 fields: field mean 2.19 -> 3.06 ms,
+    * max 32.8 -> 92.6 ms, fields over two periods 0 -> 46. (On the Intel UHD 630 the
+    * same path cost ~0.2 ms a field and removed fields of 127-562 ms.) */
+   soft = EM_ASM_INT({ try { var e = GLctx.getExtension('WEBGL_debug_renderer_info');
+      var r = String(GLctx.getParameter(e ? e.UNMASKED_RENDERER_WEBGL : GLctx.RENDERER));
+      return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(r) ? 1 : 0; } catch (x) { return 0; } });
+#endif
+   if (!want || soft)
+   {
+      printf("[shader] uber: off (%s)\n", want ? "software renderer" : "?uber=0");
+      return;
+   }
+   /* without KHR_parallel_shader_compile its link is asked at the first field end */
+   if (par)
+      warm_parallel = 1;
+   mainp = strstr(fragment_shader_header, "\nvoid main()");
+   if (!mainp) return;
+   pre = (size_t)(mainp - fragment_shader_header) + 1;
+   n = strlen(fragment_shader_header) + strlen(ub_decls) + strlen(ub_body) + strlen(fragment_shader_end) + 1;
+   src = (char*)malloc(n);
+   if (!src) return;
+   memcpy(src, fragment_shader_header, pre); src[pre] = 0;
+   strcat(src, ub_decls);
+   strcat(src, fragment_shader_header + pre);
+   strcat(src, ub_body);
+   strcat(src, fragment_shader_end);
+   frag = glCreateShader(GL_FRAGMENT_SHADER);
+   glShaderSource(frag, 1, (const GLchar**)&src, NULL);
+   glCompileShader(frag);
+   free(src);
+   ub_prog = glCreateProgram();
+   glAttachShader(ub_prog, vertex_shader_object);
+   glAttachShader(ub_prog, frag);
+   memset(&ub_key, 0, sizeof(ub_key));
+   ub_key.program_object = ub_prog;
+   ub_key.frag = frag;
+   ub_key.index = -1;
+   shader_bind_attributes(&ub_key);
+   glLinkProgram(ub_prog);             /* asked about at a field end, once complete (ub_poll) */
+   ub_state = 1;
+}
+/* at a field end (neil_shader_warm_step), never in a display list */
+static void ub_poll(void)
+{
+   if (ub_state == 1 && warm_complete(ub_prog))
+      ub_ask();
+}
+static void ub_ask(void)
+{
+   int i;
+   if (!check_link(ub_prog))
+   {
+      check_compile(ub_key.frag);
+      printf("[shader] uber: link FAILED — misses compile in the field, as before\n");
+      ub_state = -1;
+      return;
+   }
+   shader_find_uniforms(&ub_key);
+   for (i = 0; i < 19; i++)
+      ub_loc[i] = glGetUniformLocation(ub_prog, ub_names[i]);
+   ub_state = 2;
+   printf("[shader] uber: ready — every combiner it reproduces is drawn with it, no compile in a field\n");
+}
+static void ub_upload(void)
+{
+   int t;
+   for (t = 0; t < 2; t++)
+   {
+      const ub_tex_t *x = &ub_tex[t];
+      GLint *L = &ub_loc[t * 6];
+      glUniform4i(L[0], x->mode, x->fn, x->fac, x->inv);
+      glUniform4i(L[1], x->afn, x->afac, x->ainv, x->aext);
+      glUniform4i(L[2], x->x[0], x->x[1], x->x[2], x->x[3]);
+      glUniform4i(L[3], x->x[4], x->x[5], x->x[6], x->x[7]);
+      glUniform4i(L[4], x->y[0], x->y[1], x->y[2], x->y[3]);
+      glUniform4i(L[5], x->y[4], x->y[5], x->y[6], x->y[7]);
+   }
+   glUniform4i(ub_loc[12], ub_col.mode, ub_col.fn, ub_col.fac, ub_col.local);
+   glUniform4i(ub_loc[13], ub_col.x[0], ub_col.x[1], ub_col.x[2], ub_col.x[3]);
+   if (ub_col.mode == 0) glUniform4i(ub_loc[14], ub_col.other, 0, 0, 0);
+   else glUniform4i(ub_loc[14], ub_col.x[4], ub_col.x[5], ub_col.x[6], ub_col.x[7]);
+   glUniform4i(ub_loc[15], ub_alp.mode, ub_alp.fn, ub_alp.fac, ub_alp.local);
+   glUniform4i(ub_loc[16], ub_alp.x[0], ub_alp.x[1], ub_alp.x[2], ub_alp.x[3]);
+   if (ub_alp.mode == 0) glUniform4i(ub_loc[17], ub_alp.other, 0, 0, 0);
+   else glUniform4i(ub_loc[17], ub_alp.x[4], ub_alp.x[5], ub_alp.x[6], ub_alp.x[7]);
+   glUniform4i(ub_loc[18], dither_enabled ? 1 : 0, three_point_filter[0] ? 1 : 0, three_point_filter[1] ? 1 : 0, fog_enabled ? 1 : 0);
+}
+static void ub_use(void)
+{
+   glUseProgram(ub_prog);
+   current_shader = &ub_key;
+   update_uniforms(&ub_key);
+   ub_upload();
+   ub_draws++;
+}
+
 static void finish_shader_program_setup(shader_program_key *shader)
 {
    GLuint fragshader = glCreateShader(GL_FRAGMENT_SHADER);
@@ -829,6 +1468,8 @@ void init_combiner(void)
    strcpy(fragment_shader_alpha_combiner, "");
    strcpy(fragment_shader_texture1, "vec4 ctexture1 = texture2D(texture0, vec2(vTexCoord[0])); \n");
    strcpy(fragment_shader_texture0, "");
+   memset(ub_tex, 0, sizeof(ub_tex)); memset(&ub_col, 0, sizeof(ub_col)); memset(&ub_alp, 0, sizeof(ub_alp));
+   ub_tex[0].mode = 3; ub_tex[1].mode = 2; ub_col.mode = 3; ub_alp.mode = 3;
 
    first_color = 1;
    first_alpha = 1;
@@ -840,6 +1481,7 @@ void init_combiner(void)
    dither_enabled = 0;
 
    shader_prewarm();
+   ub_start();
 }
 
 static void compile_chroma_shader(void)
@@ -934,6 +1576,12 @@ void compile_shader(void)
 
    need_to_compile = 0;
 
+   if (ub_on())
+   {
+      ub_use();
+      return;
+   }
+
    for( i = 0; i < number_of_programs; i++)
    {
       shader_program_key *program = &shader_programs[i];
@@ -980,6 +1628,7 @@ void compile_shader(void)
    shader.constant_color_location = 0;
    shader.ccolor0_location      = 0;
    shader.ccolor1_location      = 0;
+   shader.frag                  = 0;
 
    strcpy(fragment_shader, fragment_shader_header);
 
@@ -1170,6 +1819,7 @@ void grColorCombine(
    color_combiner_key = function | (factor << 4) | (local << 8) | (other << 10);
    chroma_other_color = other;
 
+   ub_col.mode = 0; ub_col.fn = function; ub_col.fac = factor; ub_col.local = local; ub_col.other = other;
    strcpy(fragment_shader_color_combiner, "");
    switch(function)
    {
@@ -1332,6 +1982,7 @@ void grAlphaCombine(
    alpha_combiner_key = function | (factor << 4) | (local << 8) | (other << 10);
    chroma_other_alpha = other;
 
+   ub_alp.mode = 0; ub_alp.fn = function; ub_alp.fac = factor; ub_alp.local = local; ub_alp.other = other;
    strcpy(fragment_shader_alpha_combiner, "");
 
    switch(function)
@@ -1586,6 +2237,9 @@ grTexCombine(
          (alpha_function << 8) | (alpha_factor << 12) |
          (rgb_invert << 16);
       texture0_combinera_key = 0;
+      ub_tex[0].mode = 0; ub_tex[0].fn = rgb_function; ub_tex[0].fac = rgb_factor; ub_tex[0].inv = rgb_invert ? 1 : 0;
+      ub_tex[0].afn = alpha_function; ub_tex[0].afac = alpha_factor; ub_tex[0].ainv = alpha_invert ? 1 : 0;
+      ub_tex[0].aext = 0; ub_tex[0].bad = 0;
       strcpy(fragment_shader_texture0, "");
 
       switch(rgb_function)
@@ -1714,6 +2368,9 @@ grTexCombine(
          (alpha_function << 8) | (alpha_factor << 12) |
          (rgb_invert << 16);
       texture1_combinera_key = 0;
+      ub_tex[1].mode = 0; ub_tex[1].fn = rgb_function; ub_tex[1].fac = rgb_factor; ub_tex[1].inv = rgb_invert ? 1 : 0;
+      ub_tex[1].afn = alpha_function; ub_tex[1].afac = alpha_factor; ub_tex[1].ainv = alpha_invert ? 1 : 0;
+      ub_tex[1].aext = 0; ub_tex[1].bad = 0;
       strcpy(fragment_shader_texture1, "");
 
       switch(rgb_function)
@@ -1898,6 +2555,7 @@ void  grColorCombineExt(uint32_t a, uint32_t a_mode,
       ((c & 0x1F) << 14) | ((c_invert & 1) << 19) |
       ((d & 0x1F) << 20) | ((d_invert & 1) << 25);
    c_combiner_ext = 1;
+   ub_col.mode = 1; ub_ext8(ub_col.x, a, a_mode, b, b_mode, c, c_invert, d, d_invert);
    strcpy(fragment_shader_color_combiner, "");
 
    switch(a)
@@ -2069,6 +2727,7 @@ void grAlphaCombineExt(uint32_t a, uint32_t a_mode,
       ((c & 0x1F) << 14) | ((c_invert & 1) << 19) |
       ((d & 0x1F) << 20) | ((d_invert & 1) << 25);
    a_combiner_ext = 1;
+   ub_alp.mode = 1; ub_ext8(ub_alp.x, a, a_mode, b, b_mode, c, c_invert, d, d_invert);
    strcpy(fragment_shader_alpha_combiner, "");
 
    switch(a)
@@ -2219,6 +2878,8 @@ grTexColorCombineExt(int32_t       tmu,
          ((c & 0x1F) << 14) | ((c_invert & 1) << 19) |
          ((d & 0x1F) << 20) | ((d_invert & 1) << 25);
       tex0_combiner_ext = 1;
+      ub_tex[0].mode = 1; ub_tex[0].aext = 0; ub_tex[0].bad = 0;
+      ub_ext8(ub_tex[0].x, a, a_mode, b, b_mode, c, c_invert, d, d_invert);
       strcpy(fragment_shader_texture0, "");
 
       switch(a)
@@ -2395,6 +3056,8 @@ grTexColorCombineExt(int32_t       tmu,
          ((c & 0x1F) << 14) | ((c_invert & 1) << 19) |
          ((d & 0x1F) << 20) | ((d_invert & 1) << 25);
       tex1_combiner_ext = 1;
+      ub_tex[1].mode = 1; ub_tex[1].aext = 0; ub_tex[1].bad = 0;
+      ub_ext8(ub_tex[1].x, a, a_mode, b, b_mode, c, c_invert, d, d_invert);
       strcpy(fragment_shader_texture1, "");
 
       switch(a)
@@ -2593,6 +3256,8 @@ grTexAlphaCombineExt(int32_t       tmu,
          ((b & 0x1F) << 7) | ((b_mode & 3) << 12) |
          ((c & 0x1F) << 14) | ((c_invert & 1) << 19) |
          ((d & 0x1F) << 20) | ((d_invert & 1) << 25);
+      if (ub_tex[0].mode == 1) { ub_tex[0].aext = 1; ub_ext8(ub_tex[0].y, a, a_mode, b, b_mode, c, c_invert, d, d_invert); }
+      else ub_tex[0].bad = 1;
 
       switch(a)
       {
@@ -2730,6 +3395,8 @@ grTexAlphaCombineExt(int32_t       tmu,
          ((b & 0x1F) << 7) | ((b_mode & 3) << 12) |
          ((c & 0x1F) << 14) | ((c_invert & 1) << 19) |
          ((d & 0x1F) << 20) | ((d_invert & 1) << 25);
+      if (ub_tex[1].mode == 1) { ub_tex[1].aext = 1; ub_ext8(ub_tex[1].y, a, a_mode, b, b_mode, c, c_invert, d, d_invert); }
+      else ub_tex[1].bad = 1;
 
       switch(a)
       {
