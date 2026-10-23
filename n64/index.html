@@ -222,7 +222,8 @@
             padding: 11px 12px; font: 12.5px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             color: #dbe4ee; box-shadow: 0 6px 24px rgba(0,0,0,.45); }
   #lsRoom[hidden] { display: none; }
-  #lsRoom .lsHead { color: #9fb2c6; margin-bottom: 7px; }
+  #lsRoom .lsHead { color: #9fb2c6; margin-bottom: 7px; display: flex; align-items: center; justify-content: space-between; }
+  #lsRoom button#lsHide { flex: 0 0 auto; min-height: 26px; width: 30px; padding: 0; font-size: 16px; line-height: 1; }
   #lsRoom .lsHead b { color: #9fe0a0; font: 700 15px/1 ui-monospace, Menlo, monospace; letter-spacing: 2px; }
   #lsRoom .lsSeats { display: flex; flex-direction: column; gap: 3px; margin-bottom: 7px; }
   #lsRoom .seat { display: flex; justify-content: space-between; gap: 8px;
@@ -277,7 +278,13 @@
      that includes the engine's own fail strings, which lsParty() rewrites.
 -->
 <div id="lsRoom" hidden>
-  <div class="lsHead">Party <b id="lsCode">-----</b></div>
+  <!-- ⚠ THE PANEL MUST BE DISMISSABLE. It is position:fixed over the top-right
+       of the control bar (Mute/Reset sit under it on a desktop) and had no
+       close control, so in a room those buttons were unreachable for the whole
+       session. It hides itself when the game starts (the Party button's label
+       carries the live state), the Party button toggles it, and a room that
+       stops brings it back so the reason is seen. -->
+  <div class="lsHead"><span>Party <b id="lsCode">-----</b></span><button id="lsHide" type="button" class="sec" title="Hide the party panel (the Party button shows it again)" aria-label="Hide party panel">×</button></div>
   <div id="lsSeats" class="lsSeats"></div>
   <div id="lsMsg" class="lsMsg">Waiting for players…</div>
   <div class="lsBtns">
@@ -4556,7 +4563,7 @@ N64Rate.selfTest = function (logFn) {
       b.addEventListener('click', function () {
         // In a room the control OPENS the party panel; with no room it goes to
         // the lobby that mints a code. Same id, same button, live label.
-        if (NET.pendingCode) { var r = $('lsRoom'); if (r) r.hidden = false; return; }
+        if (NET.pendingCode) { var r = $('lsRoom'); if (r) r.hidden = !r.hidden; return; }
         var sel = isMobile ? $('mobileRomSelect') : $('romSelect');
         var pick = ROMS[+(sel && sel.value) || 0] || ROMS[0];
         // ONE URL for every console (commit ea6dd165). This used to send the
@@ -4697,6 +4704,16 @@ N64Rate.selfTest = function (logFn) {
     // character they get.
     var renderRoom = function () {
       var p = lsParty();
+      // Out of the way once the game is running; back when the room stops.
+      // Each fires on the TRANSITION only, so a player who reopens or closes
+      // the panel by hand is never overridden by the 400 ms tick.
+      var panel = $('lsRoom');
+      if (panel && NET.pendingCode) {
+        if (p.state === 'playing' && !NET.panelAutoHid) { NET.panelAutoHid = true; panel.hidden = true; }
+        var bad = !!(p.error || LS.fault);
+        if (bad && !NET.panelShownBad) panel.hidden = false;
+        NET.panelShownBad = bad;
+      }
       ['btnNet', 'mobileSplashNet'].forEach(function (id) {
         var b = $(id); if (!b) return;
         var t = partyLabel(p); if (b.textContent !== t) b.textContent = t;
@@ -4849,6 +4866,9 @@ N64Rate.selfTest = function (logFn) {
       // on a host that has already declared — measured by the crossdevice rig.
       try { renderRoom(); } catch (e) {}
     }
+
+    var hideBtn = $('lsHide');
+    if (hideBtn) hideBtn.addEventListener('click', function () { var r = $('lsRoom'); if (r) r.hidden = true; });
 
     var leave = $('netLeave');
     if (leave) leave.addEventListener('click', function () {
