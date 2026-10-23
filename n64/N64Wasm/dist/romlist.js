@@ -37,6 +37,8 @@ var ROMLIST = [
   {url:ROM_BASE+"papermario.z64",title:"Paper Mario"},
   {url:ROM_BASE+"starfox.z64",title:"Star Fox 64"},
   {url:ROM_BASE+"pkmnsnap.z64",title:"Pok\u00e9mon Snap"},
+  {url:ROM_BASE+"pkmnstadium.z64",title:"Pok\u00e9mon Stadium"},
+  {url:ROM_BASE+"pkmnstadium2.z64",title:"Pok\u00e9mon Stadium 2"},
   {url:ROM_BASE+"dk64.z64",title:"Donkey Kong 64"},
   {url:ROM_BASE+"banjo-tooie.z64",title:"Banjo-Tooie"},
   {url:ROM_BASE+"conker.z64",title:"Conker's Bad Fur Day"},
