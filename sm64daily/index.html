@@ -73,6 +73,11 @@
   .day.done i { background: var(--gold); } .day.tried i { background: var(--dim); }
   .day:hover { border-color: var(--line2); }
   .day.sel { border-color: var(--red); background: rgba(229,50,43,.14); }
+  .chip.mode { color: #fff; background: linear-gradient(180deg, #2a3a70, #1f2a52); border-color: #3c58b0; }
+  .word { display: flex; align-items: center; gap: 8px; margin-top: 12px; flex-wrap: wrap; font-size: 13px; color: var(--mute); }
+  .word input { width: 150px; text-transform: uppercase; letter-spacing: 3px; font: 700 15px ui-monospace, Menlo, monospace; background: #0d1018; color: var(--text); border: 1px solid var(--line2); border-radius: 8px; padding: 7px 9px; }
+  .word .btn { padding: 7px 14px; }
+  .todaylink { color: var(--cyan); text-decoration: none; margin-left: auto; }
   .lede { color: var(--mute); margin: 12px 0 0; }
   .lede b { color: var(--gold); }
   .lede .g { color: var(--green); font-weight: 650; }
@@ -263,15 +268,22 @@
   function playable(d) { return /^\d{4}-\d{2}-\d{2}$/.test(d || '') && (qs.has('test') || (daysBack(d) >= 0 && daysBack(d) <= WINDOW)); }
   var asked = hashArgs.get('d') || qs.get('date');
   var today = playable(asked) ? asked : realToday;
-  var pastDay = today !== realToday;
-  var dayNo = Math.round((Date.parse(today + 'T00:00:00Z') - Date.parse(EPOCH + 'T00:00:00Z')) / 86400000) + 1;
-  var dow = new Date(today + 'T12:00:00').getDay();
+  // Any word or code (1-24 letters/digits) is a course of its own (?w=apple): same word, same
+  // course, for everyone. 36^24 strings, each hashed to its own seed.
+  var WORD = ((hashArgs.get('w') || qs.get('w') || '') + '').toLowerCase();
+  if (!/^[a-z0-9]{1,24}$/.test(WORD)) WORD = '';
+  var pastDay = !WORD && today !== realToday;
+  var dayNo = WORD ? 0 : Math.round((Date.parse(today + 'T00:00:00Z') - Date.parse(EPOCH + 'T00:00:00Z')) / 86400000) + 1;
+  var dow = WORD ? hash('sm64dow:' + WORD) % 7 : new Date(today + 'T12:00:00').getDay();
   var DIFF = ['Hard', 'Easy', 'Easy', 'Medium', 'Medium', 'Hard', 'Hard'][dow];
-  var seed = hash('sm64daily:' + today) | 0;
+  var seed = (WORD ? hash('sm64word:' + WORD) : hash('sm64daily:' + today)) | 0;
+  if (qs.has('test') && qs.has('seed')) seed = +qs.get('seed') | 0;   // test hook: an exact seed
+  var KEY = WORD ? 'w:' + WORD : today;                 // where this course's stats live
+  var TITLE = WORD ? 'Word course · ' + WORD.toUpperCase() : 'Daily Parkour #' + dayNo;
   // Read by src/game/daily.c when the course is built.
   window.sm64DailySeed = seed;
   window.sm64DailyDow = dow;
-  window.sm64DailyNumber = dayNo;
+  window.sm64DailyNumber = WORD ? (hash('sm64track:' + WORD) % 1000) + 1 : dayNo;
   if (qs.has('host')) window.sm64DailyHostOverride = +qs.get('host');   // test hook: build over a given world
 
   // Same table and formula as daily.c (sHosts / daily_host_level), so the card can name today's world before boot.
@@ -281,7 +293,14 @@
   var hostIdx = qs.has('host') ? (+qs.get('host')) % HOSTS.length : ((Math.imul(seed, 2654435761 | 0) >>> 0) >>> 8) % HOSTS.length;
   // Same order as daily.c's MD_* enum.
   var MODULES = [['Hop', '🟦'], ['Moving platform', '🌀'], ['Platform chain', '⚙️'], ['Thwomp', '🪨'], ['Pendulum', '🕰️'],
-    ['Fire bars', '🔥'], ['Long jump', '🏃'], ['Backflip ledge', '🤸'], ['Triple jump', '⏫'], ['Wall kick', '🧱'], ['Pole climb', '🎋'], ['Slide', '🛝']];
+    ['Fire bars', '🔥'], ['Long jump', '🏃'], ['Backflip ledge', '🤸'], ['Triple jump', '⏫'], ['Wall kick', '🧱'], ['Pole climb', '🎋'], ['Slide', '🛝'],
+    ['Enemy arena', '👊'], ['Amp bridge', '⚡'], ['Cannon', '💣'], ['Switch bridge', '🟪'], ['Shell surf', '🐢'], ['Vanish cap', '👻'],
+    ['Metal cap', '🔩'], ['Wing cap', '🪽'], ['Monkey bars', '🐒'], ['Quicksand', '⏳'], ['Ice floes', '🧊'], ['Crosswind', '🌬️'],
+    ['Updraft', '🌪️'], ['Pool dive', '🏊'], ['Poison gas', '☠️']];
+  // The challenge, rolled from the seed — same formula as daily.c mode_for_seed.
+  var MODES = [['Race to the Star', 'Reach the <b>Power Star</b>.'], ['Red Coin Hunt', 'Find all <b>8 red coins</b>, then reach the star.'],
+    ['Clear the Enemies', 'Beat <b>every enemy</b> on the course, then reach the star.'], ['Coin Rush', 'Collect <b>coins</b> until the star unlocks.']];
+  var MODE = (function () { var r = ((Math.imul(seed ^ 0x5BD1E995, 0x85EBCA6B | 0) >>> 0) >>> 9) % 100; return r < 34 ? 0 : r < 58 ? 1 : r < 80 ? 2 : 3; })();
   // Same order as daily.c's sTracks (one per day, rotating).
   var TRACKS = ['Slider', 'Bob-omb Battlefield', 'Koopa Road', 'Dire, Dire Docks', 'Wing Cap', 'Lethal Lava Land', 'Snow Mountain', 'Koopa the Quick',
     'Hazy Maze Cave', 'Metal Cap', "Big Boo's Haunt", 'File Select', "Koopa's Theme", 'Merry-Go-Round', 'Boss Battle', 'Ultimate Koopa'];
@@ -302,9 +321,9 @@
   var toastT;
   function toast(t) { $('toast').textContent = t; $('toast').classList.add('show'); clearTimeout(toastT); toastT = setTimeout(function () { $('toast').classList.remove('show'); }, 2600); }
 
-  $('dayPill').textContent = '#' + dayNo;
-  $('meta').innerHTML = '<b>' + esc(HOSTS[hostIdx]) + '</b> · ' + DIFF + ' · ' + esc(prettyDate(today));
-  document.title = 'SM64 Daily Parkour #' + dayNo + ' · ' + HOSTS[hostIdx];
+  $('dayPill').textContent = WORD ? WORD.toUpperCase() : '#' + dayNo;
+  $('meta').innerHTML = '<b>' + esc(HOSTS[hostIdx]) + '</b> · ' + MODES[MODE][0] + ' · ' + DIFF + (WORD ? '' : ' · ' + esc(prettyDate(today)));
+  document.title = 'SM64 ' + TITLE + ' · ' + HOSTS[hostIdx];
 
   // ── cards ──
   var cardFocus = 0;
@@ -343,7 +362,7 @@
   }
   async function shareLink(run) {
     var name = (lsGet('sm64daily.name') || '').slice(0, 16);
-    var h = 'd=' + today + '&t=' + run.frames + (name ? '&n=' + encodeURIComponent(name) : '') + '&g=' + run.path;
+    var h = (WORD ? 'w=' + WORD : 'd=' + today) + '&t=' + run.frames + (name ? '&n=' + encodeURIComponent(name) : '') + '&g=' + run.path;
     return location.origin + location.pathname + '#' + h;
   }
 
@@ -463,6 +482,7 @@
         var walk = held('walk') ? 0.45 : 1;
         sx = Math.round(best[0] * 80 * walk); sy = Math.round(best[1] * 80 * walk);
       }
+      if (window.__padOverride) { btn = window.__padOverride.btn | 0; sx = window.__padOverride.x | 0; sy = window.__padOverride.y | 0; }   // test hook
       if (Module._daily_set_pad) Module._daily_set_pad(btn, sx, sy);
     }
     padPrev = now;
@@ -655,21 +675,29 @@
       + '<span>' + k('cl') + k('cr') + ' camera</span><span>' + k('restart') + ' restart</span><span>🎮 works too</span><a id="ctlLink">Change controls</a></div>';
   }
   function intro() {
-    var s = load(), d = s.days[today];
-    card('<div class="eyebrow">Daily Parkour #' + dayNo + ' · ' + esc(prettyDate(today)) + (pastDay ? ' · past day' : '') + '</div>'
+    var s = load(), d = s.days[KEY];
+    card('<div class="eyebrow">' + esc(TITLE) + (WORD ? '' : ' · ' + esc(prettyDate(today))) + (pastDay ? ' · past day' : '') + '</div>'
       + '<h1>' + esc(HOSTS[hostIdx]) + '</h1>'
-      + '<div class="chips"><span class="chip ' + DIFF.toLowerCase() + '">' + DIFF + '</span><span class="chip">♪ ' + esc(track) + '</span><span class="chip">~2 min</span></div>'
+      + '<div class="chips"><span class="chip mode">' + MODES[MODE][0] + '</span><span class="chip ' + DIFF.toLowerCase() + '">' + DIFF + '</span><span class="chip">♪ ' + esc(track) + '</span><span class="chip">~2 min</span></div>'
       + (ghost ? '<div class="ghostbar">👻 <b>Racing ' + (ghostName ? esc(ghostName) + '\'s' : 'a friend\'s') + ' ghost</b>' + (ghostFrames ? ' (' + fmt(ghostFrames) + ')' : '') + ' — the white shadow.</div>' : '')
       + dayStrip(s)
-      + '<p class="lede">A new course every day. Reach the <b>Power Star</b>. <span class="g">Green</span> platforms are checkpoints.</p>'
-      + '<div class="tiles"><div class="tile"><div class="k">Best today</div><div class="v">' + (d && d.best ? bestText(d.best, d.total) : '—') + '</div></div>'
+      + '<p class="lede">' + MODES[MODE][1] + ' <span class="g">Green</span> platforms are checkpoints.</p>'
+      + '<form class="word" id="wordForm" autocomplete="off"><label for="wordIn">Play any word</label><input type="text" id="wordIn" maxlength="24" placeholder="e.g. apple" value="' + esc(WORD) + '" spellcheck="false" autocapitalize="off"><button class="btn" type="submit">Go</button>' + (WORD ? '<a class="todaylink" href="' + location.pathname + '">Back to today</a>' : '') + '</form>'
+      + '<div class="tiles"><div class="tile"><div class="k">' + (WORD ? 'Best' : 'Best today') + '</div><div class="v">' + (d && d.best ? bestText(d.best, d.total) : '—') + '</div></div>'
       + '<div class="tile"><div class="k">Streak</div><div class="v">' + streak(s) + '</div></div>'
       + '<div class="tile"><div class="k">Attempts</div><div class="v">' + (d ? d.attempts : 0) + '</div></div></div>'
       + '<div class="btns"><button class="btn go" id="play">' + (d ? 'Play again' : 'Play') + ' <span class="hint">A · Enter</span></button></div>'
       + controlsSummary());
     $('play').onclick = play;
-    [].forEach.call($('box').querySelectorAll('.day'), function (b) { b.onclick = function () { if (b.getAttribute('data-d') !== today) goDay(b.getAttribute('data-d')); }; });
+    [].forEach.call($('box').querySelectorAll('.day'), function (b) { b.onclick = function () { if (WORD || b.getAttribute('data-d') !== today) goDay(b.getAttribute('data-d')); }; });
     $('ctlLink').onclick = function () { openMenu('paneControls'); };
+    $('wordForm').onsubmit = function (e) {
+      e.preventDefault();
+      var w = $('wordIn').value.trim().toLowerCase();
+      w = w.replace(/[^a-z0-9]/g, '');
+      if (!/^[a-z0-9]{1,24}$/.test(w)) { toast('Letters and numbers, up to 24'); $('wordIn').focus(); return; }
+      location.href = location.pathname + '?w=' + w;
+    };
   }
   // The last week, newest on the right: pick a day to play its course.
   function dayStrip(s) {
@@ -679,19 +707,19 @@
       var k = dateKey(dt), rec = s.days[k], st = rec && rec.best ? (rec.best.done ? 'done' : 'tried') : '';
       var label = i === 0 ? 'Today' : dt.toLocaleDateString(undefined, { weekday: 'short' });
       var tip = prettyDate(k) + (rec && rec.best ? ' · best ' + bestText(rec.best, rec.total) : '');
-      out += '<button class="day ' + st + (k === today ? ' sel' : '') + '" data-d="' + k + '" title="' + esc(tip) + '"><span>' + esc(label) + '</span><b>' + dt.getDate() + '</b><i></i></button>';
+      out += '<button class="day ' + st + (k === today && !WORD ? ' sel' : '') + '" data-d="' + k + '" title="' + esc(tip) + '"><span>' + esc(label) + '</span><b>' + dt.getDate() + '</b><i></i></button>';
     }
     return out + '</div>';
   }
   function goDay(k) {
-    var u = new URLSearchParams(location.search); u.delete('date');
+    var u = new URLSearchParams(location.search); u.delete('date'); u.delete('w');
     if (k !== realToday) u.set('date', k);
     location.href = location.pathname + (u.toString() ? '?' + u : '');
   }
   function play() {
     if (started) { hideCard(); Module._daily_restart(); return; }
     started = true;
-    card('<div class="eyebrow">Daily Parkour #' + dayNo + '</div><h1>' + esc(HOSTS[hostIdx]) + '</h1><p class="lede" id="loadMsg">Loading the game…</p><div class="bar"><i id="loadBar"></i></div>');
+    card('<div class="eyebrow">' + esc(TITLE) + '</div><h1>' + esc(HOSTS[hostIdx]) + '</h1><p class="lede" id="loadMsg">Loading the game…</p><div class="bar"><i id="loadBar"></i></div>');
     var s = document.createElement('script'); s.src = 'sm64.us.js';
     s.onerror = function () { card('<div class="eyebrow">Daily Parkour</div><h1>Could not load the game</h1><p class="lede">Check your connection, then try again.</p><div class="btns"><button class="btn go" id="retry">Reload</button></div>'); $('retry').onclick = function () { location.reload(); }; };
     document.body.appendChild(s);
@@ -719,24 +747,24 @@
     total = n;
     var res = { done: !!done, frames: frames, plats: plats };
     var rec = readRecording();
-    var s = load(), d = s.days[today] || (s.days[today] = { attempts: 0 });
+    var s = load(), d = s.days[KEY] || (s.days[KEY] = { attempts: 0 });
     d.attempts++; d.total = n; d.host = hostIdx; d.icons = moduleIcons();
     var nb = better(res, d.best);
     var shareText = function () {
-      return 'SM64 Daily Parkour #' + dayNo + ' · ' + HOSTS[hostIdx] + '\n' + (d.icons || '') + '\n⏱ ' + bestText(d.best, n)
+      return 'SM64 ' + TITLE + ' · ' + HOSTS[hostIdx] + ' · ' + MODES[MODE][0] + '\n' + (d.icons || '') + '\n⏱ ' + bestText(d.best, n)
         + (ghostFrames && d.best.done ? (d.best.frames < ghostFrames ? '  🏁 beat ' : '  👻 lost to ') + (ghostName || 'the ghost') + ' (' + fmt(ghostFrames) + ')' : '')
-        + '\n' + location.origin + location.pathname;
+        + '\n' + location.origin + location.pathname + (WORD ? '?w=' + WORD : '');
     };
     var finish = function () {
       save(s);
       setTimeout(function () {
         var vsGhost = ghostFrames && done ? (frames < ghostFrames ? '🏁 You beat ' : '👻 ') + esc(ghostName || 'the ghost') + (frames < ghostFrames ? ' by ' : ' was faster by ') + fmt(Math.abs(ghostFrames - frames)) : '';
-        card('<div class="eyebrow">Daily Parkour #' + dayNo + ' · ' + esc(HOSTS[hostIdx]) + '</div>'
+        card('<div class="eyebrow">' + esc(TITLE) + ' · ' + esc(HOSTS[hostIdx]) + '</div>'
           + '<h1>' + (done ? 'Finished!' : 'Run over') + '</h1>'
           + '<div class="big">' + bestText(res, n) + (nb && d.attempts > 1 ? '<span class="badge">New best</span>' : '') + '</div>'
           + (vsGhost ? '<div class="ghostbar">' + vsGhost + '</div>' : '')
           + '<div class="icons" title="Today\'s course">' + (d.icons || '') + '</div>'
-          + '<div class="tiles"><div class="tile"><div class="k">Best today</div><div class="v">' + bestText(d.best, n) + '</div></div>'
+          + '<div class="tiles"><div class="tile"><div class="k">' + (WORD ? 'Best' : 'Best today') + '</div><div class="v">' + bestText(d.best, n) + '</div></div>'
           + '<div class="tile"><div class="k">Attempts</div><div class="v">' + d.attempts + '</div></div>'
           + '<div class="tile"><div class="k">Streak</div><div class="v">' + streak(s) + '</div></div></div>'
           + '<pre id="share">' + esc(shareText()) + '</pre>'
