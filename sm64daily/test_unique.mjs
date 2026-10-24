@@ -20,7 +20,7 @@ for (let h = 0; h < NH; h++) {
   const page = await browser.newPage();
   // Load the page on one of this world's own dates, so the world is chosen the normal way (no override).
   await page.evaluateOnNewDocument(() => { window.__ready = null; });
-  await page.goto(url + '?date=' + mine[0].date, { waitUntil: 'load' });
+  await page.goto(url + '?test=1&date=' + mine[0].date, { waitUntil: 'load' });
   await page.click('#play');
   await page.evaluate(() => { const r = window.sm64DailyReady; window.sm64DailyReady = (n, p) => { window.__ready = n; r(n, p); }; });
   await page.waitForFunction('window.__ready !== null', { timeout: 90000 });

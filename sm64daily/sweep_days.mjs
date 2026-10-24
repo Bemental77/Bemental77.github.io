@@ -16,7 +16,7 @@ for (let k = 0; k < days; k++) {
   const date = d.toISOString().slice(0, 10);
   const page = await browser.newPage(); await page.setViewport({ width: 640, height: 480 });
   const errs = []; page.on('pageerror', e => errs.push(String(e).slice(0, 120)));
-  await page.goto(url + '?date=' + date + (process.env.Q || ''), { waitUntil: 'load' });
+  await page.goto(url + '?test=1&date=' + date + (process.env.Q || ''), { waitUntil: 'load' });
   await page.waitForSelector('#play');
   await page.evaluate(() => { const r = window.sm64DailyReady; window.sm64DailyReady = (...a) => { window.__ready = a[0]; r(...a); };
     const q = window.sm64DailyResult; window.sm64DailyResult = (...a) => { window.__res = a; q(...a); }; });

@@ -20,11 +20,11 @@ for (const date of ['2026-10-23', '2026-10-24']) {
     navigator.getGamepads = () => [{ id: 'fake', connected: true, index: 0, mapping: 'standard', axes: [0, 0, 0, 0],
       buttons: Array.from({ length: 17 }, (_, i) => ({ pressed: i === 0 && window.__padA, value: i === 0 && window.__padA ? 1 : 0 })) }];
   });
-  await page.goto(url + '?date=' + date, { waitUntil: 'load' });
+  await page.goto(url + '?test=1&date=' + date, { waitUntil: 'load' });
   await page.evaluate(() => { const r = window.sm64DailyReady; window.sm64DailyReady = (n, p) => { window.__ready = n; r(n, p); }; });
   await wait(500);
   const t0 = Date.now();
-  await page.evaluate(() => { window.__padA = true; }); await wait(150); await page.evaluate(() => { window.__padA = false; });
+  await page.evaluate(() => { window.__padA = true; }); await wait(300); await page.evaluate(() => { window.__padA = false; });
   const loading = await page.evaluate(() => (document.querySelector('#box') || {}).textContent);
   const shots = [];
   for (let k = 0; k < 6 && !(await page.evaluate(() => window.__ready !== null)); k++) { await wait(700); const f = `${OUT}-${date}-boot${k}.png`; await page.screenshot({ path: f }); shots.push(f); }

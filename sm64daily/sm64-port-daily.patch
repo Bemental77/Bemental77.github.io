@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index cfac1e8..b02358e 100644
+index cfac1e8..8dd8a63 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -170,7 +170,7 @@ endif
@@ -24,7 +24,7 @@ index cfac1e8..b02358e 100644
  ifeq ($(TARGET_WEB),1)
    PLATFORM_CFLAGS  := -DTARGET_WEB
 -  PLATFORM_LDFLAGS := -lm -no-pie -s TOTAL_MEMORY=20MB -g4 --source-map-base http://localhost:8080/ -s "EXTRA_EXPORTED_RUNTIME_METHODS=['callMain']"
-+  PLATFORM_LDFLAGS := -lm -sTOTAL_MEMORY=128MB -sEXPORTED_RUNTIME_METHODS=callMain,HEAP16,HEAPU8 -sEXPORTED_FUNCTIONS=_main,_daily_restart,_daily_debug_warp,_daily_debug_mario_y,_daily_debug_standing,_daily_debug_inside,_daily_debug_gen,_daily_debug_gen_info,_daily_debug_track,_daily_set_ghost,_daily_rec_ptr,_daily_rec_count,_malloc,_free
++  PLATFORM_LDFLAGS := -lm -sTOTAL_MEMORY=128MB -sEXPORTED_RUNTIME_METHODS=callMain,HEAP16,HEAPU8 -sEXPORTED_FUNCTIONS=_main,_daily_restart,_daily_debug_warp,_daily_debug_mario_y,_daily_debug_standing,_daily_debug_inside,_daily_debug_gen,_daily_debug_gen_info,_daily_debug_track,_daily_set_pad,_daily_set_volume,_daily_pause,_daily_set_ghost,_daily_rec_ptr,_daily_rec_count,_malloc,_free
  endif
  
  PLATFORM_CFLAGS += -DNO_SEGMENTED_MEMORY -DUSE_SYSTEM_MALLOC
@@ -127,6 +127,21 @@ index 04b8fc4..7c601a6 100644
      INIT_LEVEL(),
      FIXED_LOAD(/*loadAddr*/ _goddardSegmentStart, /*romStart*/ _goddardSegmentRomStart, /*romEnd*/ _goddardSegmentRomEnd),
      LOAD_RAW(/*seg*/ 0x13, _behaviorSegmentRomStart, _behaviorSegmentRomEnd),
+diff --git a/src/audio/effects.c b/src/audio/effects.c
+index 91c2f03..c20b3ce 100644
+--- a/src/audio/effects.c
++++ b/src/audio/effects.c
+@@ -63,6 +63,10 @@ static void sequence_channel_process_sound(struct SequenceChannel *seqChannel) {
+     s32 i;
+ 
+     channelVolume = seqChannel->volume * seqChannel->volumeScale * seqChannel->seqPlayer->fadeVolume;
++    {   // SM64 DAILY PARKOUR: the page's music / sound-effect volumes (players 0-1 = music + fanfares, 2 = effects).
++        extern float gDailyMusicVolume, gDailySfxVolume;
++        channelVolume *= (seqChannel->seqPlayer == &gSequencePlayers[2]) ? gDailySfxVolume : gDailyMusicVolume;
++    }
+     if (seqChannel->seqPlayer->muted && (seqChannel->muteBehavior & MUTE_BEHAVIOR_SOFTEN) != 0) {
+         channelVolume *= seqChannel->seqPlayer->muteVolumeScale;
+     }
 diff --git a/src/game/daily.c b/src/game/daily.c
 new file mode 100644
 index 0000000..27a2393
@@ -1236,6 +1251,70 @@ index 10ff1e6..6d44be9 100644
  unsigned int configKeyZ          = 0x25;
  unsigned int configKeyCUp        = 0x148;
  unsigned int configKeyCDown      = 0x150;
+diff --git a/src/pc/controller/controller_entry_point.c b/src/pc/controller/controller_entry_point.c
+index f86cf0d..b8bac6c 100644
+--- a/src/pc/controller/controller_entry_point.c
++++ b/src/pc/controller/controller_entry_point.c
+@@ -6,6 +6,10 @@
+ #include "controller_recorded_tas.h"
+ #include "controller_keyboard.h"
+ 
++#ifdef TARGET_WEB
++extern struct ControllerAPI controller_page;
++#endif
++
+ #if defined(_WIN32) || defined(_WIN64)
+ #include "controller_xinput.h"
+ #else
+@@ -17,6 +21,12 @@
+ #endif
+ 
+ static struct ControllerAPI *controller_implementations[] = {
++#ifdef TARGET_WEB
++    // SM64 DAILY PARKOUR: input comes from the page (controller_page.c) and nothing else.
++    &controller_page,
++};
++static struct ControllerAPI *controller_implementations_native[] __attribute__((unused)) = {
++#endif
+     &controller_recorded_tas,
+ #if defined(_WIN32) || defined(_WIN64)
+     &controller_xinput,
+diff --git a/src/pc/controller/controller_page.c b/src/pc/controller/controller_page.c
+new file mode 100644
+index 0000000..21927ef
+--- /dev/null
++++ b/src/pc/controller/controller_page.c
+@@ -0,0 +1,30 @@
++#ifdef TARGET_WEB
++// SM64 DAILY PARKOUR: the page owns input. It reads the keyboard, any controller (Gamepad API)
++// and the touch controls through the player's own remappable bindings, and hands the game one
++// N64 pad state per frame through daily_set_pad(). This replaces the SDL controller and the
++// fixed keyboard map on the web build, so a remap on the page is the whole story.
++#include <ultra64.h>
++#include "controller_api.h"
++
++static u16 sButtons;
++static s8 sStickX, sStickY;
++
++void daily_set_pad(int buttons, int stickX, int stickY) {
++    sButtons = (u16) buttons;
++    sStickX = (s8) (stickX > 80 ? 80 : stickX < -80 ? -80 : stickX);
++    sStickY = (s8) (stickY > 80 ? 80 : stickY < -80 ? -80 : stickY);
++}
++
++static void controller_page_init(void) {
++}
++
++static void controller_page_read(OSContPad *pad) {
++    pad->button |= sButtons;
++    if (sStickX != 0 || sStickY != 0) {
++        pad->stick_x = sStickX;
++        pad->stick_y = sStickY;
++    }
++}
++
++struct ControllerAPI controller_page = { controller_page_init, controller_page_read };
++#endif
 diff --git a/src/pc/gfx/gfx_opengl.c b/src/pc/gfx/gfx_opengl.c
 index 7bc9745..e93408c 100644
 --- a/src/pc/gfx/gfx_opengl.c
@@ -1292,3 +1371,52 @@ index 4fd5c43..ef634de 100644
      }
  }
  
+diff --git a/src/pc/pc_main.c b/src/pc/pc_main.c
+index 89aa1fa..89ebb48 100644
+--- a/src/pc/pc_main.c
++++ b/src/pc/pc_main.c
+@@ -44,6 +44,12 @@ s8 gShowProfiler;
+ s8 gShowDebugText;
+ 
+ static struct AudioAPI *audio_api;
++float gDailyMasterVolume = 1.0f, gDailyMusicVolume = 1.0f, gDailySfxVolume = 1.0f;
++
++// SM64 DAILY PARKOUR: volumes from the page, 0..100 each.
++void daily_set_volume(int master, int music, int sfx) {
++    gDailyMasterVolume = master / 100.0f; gDailyMusicVolume = music / 100.0f; gDailySfxVolume = sfx / 100.0f;
++}
+ static struct GfxWindowManagerAPI *wm_api;
+ static struct GfxRenderingAPI *rendering_api;
+ 
+@@ -94,6 +100,9 @@ void produce_one_frame(void) {
+         create_next_audio_buffer(audio_buffer + i * (num_audio_samples * 2), num_audio_samples);
+     }
+     //printf("Audio samples before submitting: %d\n", audio_api->buffered());
++    if (gDailyMasterVolume < 1.0f) {   // SM64 DAILY PARKOUR: the page's master volume / mute
++        for (u32 i = 0; i < num_audio_samples * 2 * 2; i++) audio_buffer[i] = (s16) (audio_buffer[i] * gDailyMasterVolume);
++    }
+     audio_api->play((u8 *)audio_buffer, 2 * num_audio_samples * 4);
+     
+     gfx_end_frame();
+@@ -109,11 +118,21 @@ static void request_anim_frame(void (*func)(double time)) {
+     }), func);
+ }
+ 
++// SM64 DAILY PARKOUR: the page pauses the game (and its clock) while a menu is open.
++static int sDailyPaused;
++void daily_pause(int paused) { sDailyPaused = paused; }
++
+ static void on_anim_frame(double time) {
+     static double target_time;
+ 
+     time *= 0.03; // milliseconds to frame count (33.333 ms -> 1)
+ 
++    if (sDailyPaused) {
++        target_time = time;
++        request_anim_frame(on_anim_frame);
++        return;
++    }
++
+     if (time >= target_time + 10.0) {
+         // We are lagging 10 frames behind, probably due to coming back after inactivity,
+         // so reset, with a small margin to avoid potential jitter later.
