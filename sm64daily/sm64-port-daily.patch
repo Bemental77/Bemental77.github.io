@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index cfac1e8..b448b3e 100644
+index cfac1e8..9a55bf4 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -170,7 +170,7 @@ endif
@@ -24,7 +24,7 @@ index cfac1e8..b448b3e 100644
  ifeq ($(TARGET_WEB),1)
    PLATFORM_CFLAGS  := -DTARGET_WEB
 -  PLATFORM_LDFLAGS := -lm -no-pie -s TOTAL_MEMORY=20MB -g4 --source-map-base http://localhost:8080/ -s "EXTRA_EXPORTED_RUNTIME_METHODS=['callMain']"
-+  PLATFORM_LDFLAGS := -lm -sTOTAL_MEMORY=128MB -sEXPORTED_RUNTIME_METHODS=callMain,HEAP16,HEAPU8 -sEXPORTED_FUNCTIONS=_main,_daily_restart,_daily_debug_warp,_daily_debug_mario_y,_daily_debug_standing,_daily_debug_inside,_daily_debug_gen,_daily_debug_gen_info,_daily_debug_track,_daily_debug_mode,_daily_debug_auto,_daily_debug_used_auto,_daily_debug_modules,_daily_debug_objective,_daily_debug_dyn_count,_daily_debug_dyn_warp,_daily_debug_defeat_all,_daily_debug_cannon,_daily_debug_next_station,_daily_debug_part_of_cannon,_daily_debug_mod_info,_daily_debug_num_parts,_daily_debug_part,_daily_debug_put,_daily_debug_mario,_daily_debug_cap,_daily_debug_camyaw,_daily_debug_floor,_daily_debug_action,_daily_debug_dyn,_daily_debug_num_dyn,_daily_debug_dyn_move,_daily_debug_star,_daily_set_pad,_daily_set_volume,_daily_pause,_daily_set_ghost,_daily_rec_ptr,_daily_rec_count,_malloc,_free
++  PLATFORM_LDFLAGS := -lm -sTOTAL_MEMORY=128MB -sEXPORTED_RUNTIME_METHODS=callMain,HEAP16,HEAPU8 -sEXPORTED_FUNCTIONS=_main,_daily_restart,_daily_debug_warp,_daily_debug_mario_y,_daily_debug_standing,_daily_debug_inside,_daily_debug_gen,_daily_debug_gen_info,_daily_debug_track,_daily_debug_mode,_daily_debug_auto,_daily_debug_used_auto,_daily_debug_modules,_daily_debug_objective,_daily_debug_dyn_count,_daily_debug_dyn_warp,_daily_debug_defeat_all,_daily_debug_cannon,_daily_debug_next_station,_daily_debug_part_of_cannon,_daily_debug_mod_info,_daily_debug_num_parts,_daily_debug_part,_daily_debug_put,_daily_debug_mario,_daily_debug_cap,_daily_debug_camyaw,_daily_debug_cammode,_daily_debug_floor,_daily_debug_action,_daily_debug_dyn,_daily_debug_num_dyn,_daily_debug_dyn_move,_daily_debug_star,_daily_set_pad,_daily_set_volume,_daily_pause,_daily_set_ghost,_daily_rec_ptr,_daily_rec_count,_malloc,_free
  endif
  
  PLATFORM_CFLAGS += -DNO_SEGMENTED_MEMORY -DUSE_SYSTEM_MALLOC
@@ -253,12 +253,43 @@ index 34b855e..774cf9f 100644
  
      o->oTreasureChestUnkF4 = 1;
      o->oTreasureChestUnkFC = 0;
+diff --git a/src/game/camera.c b/src/game/camera.c
+index e2fb175..e45edb7 100644
+--- a/src/game/camera.c
++++ b/src/game/camera.c
+@@ -5,6 +5,7 @@
+ #include "prevent_bss_reordering.h"
+ #include "sm64.h"
+ #include "camera.h"
++#include "daily.h"
+ #include "seq_ids.h"
+ #include "dialog_ids.h"
+ #include "audio/external.h"
+@@ -6522,6 +6523,18 @@ s16 camera_course_processing(struct Camera *c) {
+     UNUSED struct CameraTrigger unused;
+     u8 oldMode = c->mode;
+ 
++    // SM64 DAILY PARKOUR: a course floats over the level, so the level's camera triggers and area
++    // rules (fixed angles, 8-direction, radial, boss...) would lock the camera in odd places. Keep
++    // Lakitu's free-roam camera, except for the modes Mario's own actions need.
++    if (daily_active()) {
++        c->defMode = CAMERA_MODE_FREE_ROAM;
++        if (c->mode != CAMERA_MODE_FREE_ROAM && c->mode != CAMERA_MODE_C_UP && c->mode != CAMERA_MODE_INSIDE_CANNON
++            && c->mode != CAMERA_MODE_BEHIND_MARIO && c->mode != CAMERA_MODE_WATER_SURFACE) {
++            transition_to_camera_mode(c, CAMERA_MODE_FREE_ROAM, 1);
++        }
++        return c->mode;
++    }
++
+     if (c->mode == CAMERA_MODE_C_UP) {
+         c->mode = sModeInfo.lastMode;
+     }
 diff --git a/src/game/daily.c b/src/game/daily.c
 new file mode 100644
-index 0000000..a6ba0fd
+index 0000000..7a23d6f
 --- /dev/null
 +++ b/src/game/daily.c
-@@ -0,0 +1,2406 @@
+@@ -0,0 +1,2407 @@
 +// SM64 DAILY PARKOUR
 +//
 +// The page hands this module a seed (window.sm64DailySeed: the date, or a
@@ -2323,6 +2354,7 @@ index 0000000..a6ba0fd
 +    if (fl == NULL) return -99999;
 +    return f == 0 ? (s32) h : f == 1 ? fl->type : fl->object != NULL;
 +}
++s32 daily_debug_cammode(void) { return gCurrentArea->camera->mode; }
 +s32 daily_debug_camyaw(void) { return gMarioState->area->camera->yaw; }   // intendedYaw = atan2s(-stickY, stickX) + this (mario.c)
 +void daily_debug_cap(s32 flag) {
 +    struct MarioState *m = gMarioState;
@@ -2667,10 +2699,10 @@ index 0000000..a6ba0fd
 +}
 diff --git a/src/game/daily.h b/src/game/daily.h
 new file mode 100644
-index 0000000..abefcf8
+index 0000000..aa1f8b6
 --- /dev/null
 +++ b/src/game/daily.h
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,61 @@
 +#ifndef DAILY_H
 +#define DAILY_H
 +
@@ -2721,6 +2753,7 @@ index 0000000..abefcf8
 +s32 daily_debug_mario(s32 f);
 +void daily_debug_cap(s32 flag);
 +s32 daily_debug_camyaw(void);
++s32 daily_debug_cammode(void);
 +s32 daily_debug_floor(s32 x, s32 y, s32 z, s32 f);
 +void daily_debug_action(s32 act, s32 fwd);
 +s32 daily_debug_dyn(s32 i, s32 f);

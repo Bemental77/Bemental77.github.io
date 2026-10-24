@@ -9600,6 +9600,7 @@ var _daily_debug_standing = Module['_daily_debug_standing'] = makeInvalidEarlyAc
 var _daily_debug_put = Module['_daily_debug_put'] = makeInvalidEarlyAccess('_daily_debug_put');
 var _daily_debug_mario = Module['_daily_debug_mario'] = makeInvalidEarlyAccess('_daily_debug_mario');
 var _daily_debug_floor = Module['_daily_debug_floor'] = makeInvalidEarlyAccess('_daily_debug_floor');
+var _daily_debug_cammode = Module['_daily_debug_cammode'] = makeInvalidEarlyAccess('_daily_debug_cammode');
 var _daily_debug_camyaw = Module['_daily_debug_camyaw'] = makeInvalidEarlyAccess('_daily_debug_camyaw');
 var _daily_debug_cap = Module['_daily_debug_cap'] = makeInvalidEarlyAccess('_daily_debug_cap');
 var _daily_debug_dyn = Module['_daily_debug_dyn'] = makeInvalidEarlyAccess('_daily_debug_dyn');
@@ -9656,6 +9657,7 @@ function assignWasmExports(wasmExports) {
   assert(typeof wasmExports['daily_debug_put'] != 'undefined', 'missing Wasm export: daily_debug_put');
   assert(typeof wasmExports['daily_debug_mario'] != 'undefined', 'missing Wasm export: daily_debug_mario');
   assert(typeof wasmExports['daily_debug_floor'] != 'undefined', 'missing Wasm export: daily_debug_floor');
+  assert(typeof wasmExports['daily_debug_cammode'] != 'undefined', 'missing Wasm export: daily_debug_cammode');
   assert(typeof wasmExports['daily_debug_camyaw'] != 'undefined', 'missing Wasm export: daily_debug_camyaw');
   assert(typeof wasmExports['daily_debug_cap'] != 'undefined', 'missing Wasm export: daily_debug_cap');
   assert(typeof wasmExports['daily_debug_dyn'] != 'undefined', 'missing Wasm export: daily_debug_dyn');
@@ -9708,6 +9710,7 @@ function assignWasmExports(wasmExports) {
   _daily_debug_put = Module['_daily_debug_put'] = createExportWrapper('daily_debug_put', wasmExports['daily_debug_put'], 4);
   _daily_debug_mario = Module['_daily_debug_mario'] = createExportWrapper('daily_debug_mario', wasmExports['daily_debug_mario'], 1);
   _daily_debug_floor = Module['_daily_debug_floor'] = createExportWrapper('daily_debug_floor', wasmExports['daily_debug_floor'], 4);
+  _daily_debug_cammode = Module['_daily_debug_cammode'] = createExportWrapper('daily_debug_cammode', wasmExports['daily_debug_cammode'], 0);
   _daily_debug_camyaw = Module['_daily_debug_camyaw'] = createExportWrapper('daily_debug_camyaw', wasmExports['daily_debug_camyaw'], 0);
   _daily_debug_cap = Module['_daily_debug_cap'] = createExportWrapper('daily_debug_cap', wasmExports['daily_debug_cap'], 1);
   _daily_debug_dyn = Module['_daily_debug_dyn'] = createExportWrapper('daily_debug_dyn', wasmExports['daily_debug_dyn'], 2);
