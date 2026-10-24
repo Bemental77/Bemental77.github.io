@@ -1541,12 +1541,6 @@
         // is behind on. Run like a re-simulation — its audio dropped, no page
         // bookkeeping — so the speakers stay at 1.000x (gate 9). The governor's
         // schedule moves with it (baseFrame), so it is never repaid as a sprint.
-        audioFlushNow();
-        RFS.inResim = true;
-        var okh;
-        try { okh = rbStep(ls, r.frame, r.image, false, false, 'hidden'); } finally { RFS.inResim = false; }
-        audioDropNow();
-        if (!okh) return rbFail(ls, 'frame failed: ' + N64S.fault);
         // ...UNLESS THIS CONSOLE OWES THE FRAME ITSELF (?lsrepay, the default): when its own
         // wall-clock schedule already has this frame's slot in the past, the hidden frame IS
         // the repayment — it advances the schedule like a credited frame, so the debt is not
@@ -1558,6 +1552,24 @@
           var hPer = 1000 / LS.viHz / ((LS.pace > 0 && LS.pace <= 1) ? LS.pace : 1);
           hOwed = performance.now() >= LS.baseWall + (LS.frame - LS.baseFrame) * hPer;
         }
+        // ITS SOUND IS PLAYED WHEN THE FRAME IS OWED (below): an owed hidden frame is a
+        // frame of real time this console ran late — the governor runs at most one
+        // field a tick, so on a phone every tick it missed comes back this way — and
+        // its samples ARE the guest's audio for that time. Dropping them was the
+        // reported phone's music (2026-10-23, Mali-G715 guest, Pokémon Stadium room):
+        // 496 hidden frames, all of them owed, the worklet measured the producer at
+        // p=0.349, steered its floor down to play at r=0.914 (9% slow, flat) and ran
+        // dry 16 times, 601232 entries silenced — "speed 0.25x audio" while the game
+        // ran at 1.002x. Production stays 1.000x of the guest, and the worklet's
+        // ratio (<= 1.05, n64/audio-worklet.js) absorbs the burst. A hidden frame the
+        // console does NOT owe (catching up to the room past its own schedule) is
+        // audio beyond real time and is still dropped, as is every re-simulation.
+        audioFlushNow();
+        if (!hOwed) RFS.inResim = true;
+        var okh;
+        try { okh = rbStep(ls, r.frame, r.image, false, false, 'hidden'); } finally { RFS.inResim = false; }
+        if (hOwed) audioFlushNow(); else audioDropNow();
+        if (!okh) return rbFail(ls, 'frame failed: ' + N64S.fault);
         RB.hidden++; LS.frame++; lsPaceNote(); if (!hOwed) LS.baseFrame++; else LS.hiddenOwed = (LS.hiddenOwed | 0) + 1;
         if (G.__n64RbLog) G.__n64RbLog.push(['hidden', r.frame]);
       } else {
@@ -1776,6 +1788,11 @@
         // two-tab room (mobile host, desktop joiner) diverged at frame 0 in every
         // region of the state; the HEAD page, whose first retro_run is the room's
         // frame 0, did not. Here every console has finished booting.
+        // ...and it is ROOM time: frame 0 was due when the room started, so this
+        // console's own clock starts before the pre-roll, not after it — a slow
+        // pre-roll (233 ms on a Mali-G715) is then lost time it may catch up, not
+        // a permanent offset behind the host (lib/netplay.js clockStartNow).
+        if (typeof ls.clockStartNow === 'function') ls.clockStartNow();
         try { lsPreroll(); } catch (e) { env.log('[lockstep] pre-roll threw: ' + ((e && e.message) || e)); }
         LS.running = true;
         LS.startedAt = ls.frame | 0;        // "everyone started together at frame N"

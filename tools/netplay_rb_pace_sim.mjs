@@ -302,7 +302,14 @@ export function simulate(sc) {
     if (!p.declared && ls.localPorts.length) { p.declared = true; ls.declareReady('g'); }
     const running = ls.state === 'running' || ls.state === 'stalled';
     if (!running) { p.lastTs = 0; return; }
-    if (p.beganAt == null) { p.beganAt = T; p.ring.set(ls.frame, p.st); }
+    if (p.beganAt == null) {
+      p.beganAt = T; p.ring.set(ls.frame, p.st);
+      // sc.prerollMs { id: ms }: the page's thread is busy that long after the room
+      // starts and before its first frame attempt — n64 room_core lsPreroll(), which
+      // measured 233 ms on the reported Mali-G715 guest (its first retro_run).
+      const pre = sc.prerollMs && sc.prerollMs[p.id];
+      if (pre > 0) { if (typeof ls.clockStartNow === 'function') ls.clockStartNow(); p.busyUntil = T + pre; p.lastTs = 0; return; }
+    }
     if (!p.lastTs) { p.lastTs = T; p.accum = 0; return; }
     // genesis.html: a DELAY-lockstep room may run up to 250 ms / 15 frames a
     // tick of the wall time it owes (ROOM_MAX_TICK_MS); solo and rollback 100 / 4
@@ -370,7 +377,7 @@ export function simulate(sc) {
   }
   // ---- verdicts -----------------------------------------------------------
   const warm = (sc.warmSecs == null ? 5 : sc.warmSecs) * 1000;
-  const out = { name: sc.name, players: n, consoles: {}, zeroStall: !!sc.zeroStall };
+  const out = { name: sc.name, players: n, consoles: {}, zeroStall: !!sc.zeroStall, behindMax: sc.behindMax == null ? null : sc.behindMax };
   let minRate = Infinity, maxWin = 0, lagBad = 0, lagN = 0, desyncs = 0, compared = 0;
   for (const id of ids) {
     const p = P[id], ls = p.ls, rep = ls.report(), rb = rep.rollback || {};
@@ -394,7 +401,7 @@ export function simulate(sc) {
     if (ls.state === 'desync') desyncs++;
     compared += rep.hashesCompared || 0;
     out.consoles[id] = { rate: +rate.toFixed(4), max5s: +mw.toFixed(4), presented: +(p.presented / ((T - (p.beganAt || 0)) / FRAME)).toFixed(4),
-      frames: p.frames, hidden: p.hidden, aheadOfRoomClock: +p.aheadMax.toFixed(2), state: ls.state, error: ls.error || null,
+      frames: p.frames, hidden: p.hidden, aheadOfRoomClock: +p.aheadMax.toFixed(2), behindRoomEnd: +(roomClock() - p.frames).toFixed(2), state: ls.state, error: ls.error || null,
       window: ls.rollback, windowPeak: ls._rbWinPeak || ls.rollback, stalls: rb.windowStalls, lsStalls: ls.stats.stalls | 0, cadenceHolds: ls.stats.cadenceHolds | 0, stallMs: Math.round(ls.stats.stallMs || 0), advWaits: rb.advantageWaits,
       rollbacks: rb.rollbacks, maxDepth: rb.maxDepth, resim: p.resim, catchUp: rb.catchUpFrames || 0,
       windowChanges: rb.windowChanges || 0, holeNaks: rb.holeNaks || 0, compared: rep.hashesCompared, maxTickWork: +p.maxTickWork.toFixed(1),
@@ -471,6 +478,17 @@ CELLS['rb-4p-100ms-phone'] = { players: 4, baseMs: 100, jitterMs: 30, loss: 0.02
 CELLS['rb-2p-127rtt'] = { pingHint: true, players: 2, baseMs: 58, jitterMs: 20, spike: { p: 0.02, ms: 60 }, loss: 0.02, zeroStall: true };
 CELLS['rb-2p-127rtt-phone'] = { pingHint: true, players: 2, baseMs: 58, jitterMs: 20, spike: { p: 0.02, ms: 60 }, loss: 0.02, stepMs: { G1: 4 }, zeroStall: true };
 CELLS['rb-2p-127rtt-lossy'] = { pingHint: true, players: 2, baseMs: 58, jitterMs: 30, spike: { p: 0.03, ms: 80 }, loss: 0.05, zeroStall: true };
+// THE REPORTED ROOM, 2026-10-23 (Pokémon Stadium, Mali-G715 guest, RTT 127 ms): the
+// guest's pre-roll took 233 ms, its own clock started after it, and it ended 14.27
+// frames behind the host (myAdvantage -10, window 8 -> 30, 496 hidden catch-up frames
+// whose audio is dropped). A console that STARTED late is behind the ROOM, not ahead
+// of its own clock: it must close the gap, once, and then hold it.
+CELLS['rb-2p-127rtt-phone-preroll'] = { pingHint: true, players: 2, baseMs: 58, jitterMs: 20, spike: { p: 0.02, ms: 60 }, loss: 0.02, stepMs: { G1: 4 }, prerollMs: { G1: 233 }, behindMax: 6 };
+// Before the fix (own clock from the first frame ATTEMPT): G1 ended 19.38 frames behind, 3571 of its
+// frames hidden, presented 0, window 27/27. After (own clock from begin()): 4.38 behind — the same
+// one-way offset rb-2p-127rtt-phone ends at (5.38) — 22 hidden, presented 0.9696, window 16/25.
+// ⚠ NOT zeroStall: ONE 16-17 ms stall at ~0.6 s (frame 24-25) on BOTH engines (old: on H, new: on
+// G1) while the window grows from 8 to cover a console that started 233 ms late. Open.
 // the room with display ticks that hitch (a 60 ms stall on 1% of ticks)
 CELLS['rb-2p-100ms-hitchy'] = { players: 2, baseMs: 100, jitterMs: 30, loss: 0.02, hiccup: { p: 0.01, ms: 60 } };
 
@@ -489,6 +507,11 @@ export function judge(r) {
   if (r.desyncs) bad.push(r.desyncs + ' desyncs');
   if (!(r.compared > 0)) bad.push('no fingerprints compared');
   if (r.truthBad || !(r.truthChecked > 0)) bad.push(r.truthBad + '/' + r.truthChecked + ' fingerprinted states differ from a straight run');
+  // sc.behindMax: no console may END the room more than this many frames behind the room clock
+  if (r.behindMax != null) for (const id in r.consoles) {
+    const c = r.consoles[id];
+    if (!(c.behindRoomEnd <= r.behindMax)) bad.push(id + ' ended ' + c.behindRoomEnd + ' frames behind the room clock (> ' + r.behindMax + ')');
+  }
   for (const id in r.consoles) if (r.consoles[id].state === 'failed') bad.push(id + ' failed: ' + r.consoles[id].error);
   // ZERO SLOWDOWN: a room whose inputs arrive within the window never stalls.
   if (r.zeroStall) for (const id in r.consoles) {
