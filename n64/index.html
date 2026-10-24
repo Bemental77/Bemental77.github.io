@@ -121,14 +121,22 @@
     #mobileShell.hide-controls #mobileHideHint { display: flex; }
     #mobileHideHint { display: none; position: absolute; top: 10px; right: 10px; width: 40px; height: 40px; border-radius: 20px; background: rgba(0,0,0,0.55); color: #fff; align-items: center; justify-content: center; font-size: 22px; font-weight: 700; z-index: 20; -webkit-tap-highlight-color: transparent; }
     .faceWrap { flex: 1; display: flex; align-items: center; justify-content: center; }
-    .faceDiamond { width: min(32vh, 180px); height: min(32vh, 180px); position: relative; }
-    .faceBtn { position: absolute; width: min(12vh, 64px); height: min(12vh, 64px); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 16px; font-weight: 700; color: rgba(255,255,255,0.92); border: 2px solid rgba(0,0,0,0.3); box-shadow: 0 4px 0 rgba(0,0,0,0.5), inset 0 2px 4px rgba(255,255,255,0.25); -webkit-tap-highlight-color: transparent; }
+    /* THE N64'S OWN RIGHT HAND: four yellow C buttons in a diamond (up/down/left/right
+       where the thumb expects them), B and A below and to its left. It used to be one
+       diamond of C-up / B / C-down / A with C-right on a shoulder bar and C-left in the
+       bottom row: C-down sat where C-right belongs and A sat where C-down belongs, so a
+       game asking for C-down (Pokemon Stadium's team pick) had no button where one is. */
+    .faceDiamond { width: min(200px, 100%, 52vh); aspect-ratio: 10 / 11; position: relative; }
+    .faceBtn { position: absolute; width: 28%; aspect-ratio: 1; transform: translate(-50%, -50%); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 16px; font-weight: 700; color: rgba(255,255,255,0.92); border: 2px solid rgba(0,0,0,0.3); box-shadow: 0 4px 0 rgba(0,0,0,0.5), inset 0 2px 4px rgba(255,255,255,0.25); -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
     .faceBtn.held { filter: brightness(0.65); box-shadow: 0 1px 0 rgba(0,0,0,0.4), inset 0 1px 3px rgba(0,0,0,0.3); }
-    /* N64 colors: A blue, B green, C buttons yellow. */
-    .btn-cup    { background: radial-gradient(circle at 38% 32%, #e6c200, #8a7400); top: 0;   left: 50%; transform: translateX(-50%); }
-    .btn-b      { background: radial-gradient(circle at 38% 32%, #44bb66, #116633); top: 50%; left: 0;   transform: translateY(-50%); }
-    .btn-cdown  { background: radial-gradient(circle at 38% 32%, #e6c200, #8a7400); top: 50%; right: 0;  transform: translateY(-50%); }
-    .btn-a      { background: radial-gradient(circle at 38% 32%, #5588ee, #1133aa); bottom: 0; left: 50%; transform: translateX(-50%); }
+    /* N64 colors: A blue, B green, C buttons yellow. Positions are button CENTRES. */
+    .faceBtn.cb { width: 25%; font-size: 12px; background: radial-gradient(circle at 38% 32%, #e6c200, #8a7400); }
+    .btn-cup    { left: 62%; top: 4%;  transform: translate(-50%, 0); }
+    .btn-cdown  { left: 62%; top: 49%; transform: translate(-50%, 0); }
+    .btn-cleft  { left: 37%; top: 26.5%; transform: translate(-50%, 0); }
+    .btn-cright { left: 87%; top: 26.5%; transform: translate(-50%, 0); }
+    .btn-b      { left: 16%; top: 66%; background: radial-gradient(circle at 38% 32%, #44bb66, #116633); }
+    .btn-a      { left: 44%; top: 84%; background: radial-gradient(circle at 38% 32%, #5588ee, #1133aa); }
     #mobileBottom { position: absolute; bottom: max(30px, calc(env(safe-area-inset-bottom, 0px) + 20px)); left: 50%; transform: translateX(-50%); display: flex; gap: 10px; align-items: center; z-index: 10; }
     .sysBtn { height: 26px; padding: 0 14px; border-radius: 13px; background: linear-gradient(180deg, #555 0%, #333 100%); border: 1px solid #222; color: #ccc; font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
     .sysBtn.held { filter: brightness(0.6); }
@@ -354,16 +362,16 @@
     </div>
   </div>
   <div class="mobileSide right">
-    <div class="shoulderStack"><div class="shoulderBtn" id="mobileR">R</div><div class="shoulderBtn cBtn" id="mobileCRight">C▶</div></div>
+    <div class="shoulderStack"><div class="shoulderBtn" id="mobileR">R</div></div>
     <div class="faceWrap">
       <div class="faceDiamond">
-        <div class="faceBtn btn-cup" id="mobileCUp">C▲</div><div class="faceBtn btn-b" id="mobileB">B</div>
-        <div class="faceBtn btn-cdown" id="mobileCDown">C▼</div><div class="faceBtn btn-a" id="mobileA">A</div>
+        <div class="faceBtn cb btn-cup" id="mobileCUp">C▲</div><div class="faceBtn cb btn-cleft" id="mobileCLeft">C◀</div>
+        <div class="faceBtn cb btn-cright" id="mobileCRight">C▶</div><div class="faceBtn cb btn-cdown" id="mobileCDown">C▼</div>
+        <div class="faceBtn btn-b" id="mobileB">B</div><div class="faceBtn btn-a" id="mobileA">A</div>
       </div>
     </div>
   </div>
   <div id="mobileBottom">
-    <div class="sysBtn cBtn" id="mobileCLeft">C◀</div>
     <div class="menuBtn" id="mobileMenuBtn">≡</div>
     <div class="sysBtn" id="mobileStart">Start</div>
   </div>
