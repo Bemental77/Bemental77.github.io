@@ -71,6 +71,7 @@ typedef struct _shader_program_key
    int ccolor1_location;
 
    int pending;            /* UBER: linked without a query; asked about at a field end (ub_poll) */
+   int born;               /* UBER: the field it was linked in (ub_fields) — without KHR_parallel_shader_compile, its age is the only "done" signal */
    GLuint frag;            /* ...its fragment shader, for the log if the link failed */
 } shader_program_key;
 
@@ -657,7 +658,7 @@ static void shader_prewarm(void)
    fclose(f);
    buf[n] = 0;
 #ifdef __EMSCRIPTEN__
-   warm_parallel = EM_ASM_INT({ try { return (typeof GLctx !== 'undefined' && GLctx && GLctx.getExtension('KHR_parallel_shader_compile')) ? 1 : 0; } catch (e) { return 0; } });
+   warm_parallel = EM_ASM_INT({ try { return (typeof GLctx !== 'undefined' && GLctx && GLctx.getExtension('KHR_parallel_shader_compile') && !((typeof globalThis !== 'undefined' ? globalThis : self).__fbAsync && (typeof globalThis !== 'undefined' ? globalThis : self).__fbAsync.parsc === false)) ? 1 : 0; } catch (e) { return 0; } });
 #endif
    for (q = buf, end = buf + n; q < end; q += strlen(q) + 1)
    {
@@ -1315,7 +1316,7 @@ static void ub_start(void)
    ub_state = -1; ub_prog = 0;
 #ifdef __EMSCRIPTEN__
    want = EM_ASM_INT({ var g = (typeof globalThis !== 'undefined') ? globalThis : self; var f = g.__fbAsync; return (f && f.uber === false) ? 0 : 1; });
-   par = EM_ASM_INT({ try { return (typeof GLctx !== 'undefined' && GLctx && GLctx.getExtension('KHR_parallel_shader_compile')) ? 1 : 0; } catch (e) { return 0; } });
+   par = EM_ASM_INT({ try { return (typeof GLctx !== 'undefined' && GLctx && GLctx.getExtension('KHR_parallel_shader_compile') && !((typeof globalThis !== 'undefined' ? globalThis : self).__fbAsync && (typeof globalThis !== 'undefined' ? globalThis : self).__fbAsync.parsc === false)) ? 1 : 0; } catch (e) { return 0; } });
    /* A SOFTWARE RASTERISER is the one place this costs more than it saves: it runs every
     * branch on the CPU for every pixel, and its compiles are cheap. Measured under
     * SwiftShader, Pokemon Stadium into a battle, 6500 fields: field mean 2.19 -> 3.06 ms,
@@ -1360,10 +1361,16 @@ static void ub_start(void)
    ub_state = 1;
 }
 /* at a field end (neil_shader_warm_step), never in a display list */
+/* Fields a program is drawn with the uber program before its link is asked about when
+ * COMPLETION_STATUS_KHR cannot be polled. The link has been running in the GPU process
+ * all that time; the query then finds it done (or waits only for its tail). */
+#define UB_AGE_FIELDS 8
+static int ub_fields;
 static void ub_poll(void)
 {
    int i;
    static int fields;
+   ub_fields++;
    if (ub_state == 1 && warm_complete(ub_prog))
       ub_ask();
    if (ub_state == 2 && (++fields % 3600) == 0)
@@ -1374,7 +1381,9 @@ static void ub_poll(void)
    for (i = 0; i < number_of_programs; i++)
    {
       shader_program_key *p = &shader_programs[i];
-      if (!p->pending || !warm_complete(p->program_object))
+      if (!p->pending)
+         continue;
+      if (warm_parallel ? !warm_complete(p->program_object) : (ub_fields - p->born < UB_AGE_FIELDS))
          continue;
       if (!check_link(p->program_object) && p->frag)
          check_compile(p->frag);
@@ -1399,7 +1408,7 @@ static void ub_ask(void)
    ub_state = 2;
    printf("[shader] uber: ready — %s\n", warm_parallel
          ? "a combiner seen for the first time is drawn with it while its own program links"
-         : "no KHR_parallel_shader_compile, so every combiner it reproduces is drawn with it");
+         : "no KHR_parallel_shader_compile: a combiner seen for the first time is drawn with it for 8 fields while its own program links");
 }
 static void ub_upload(void)
 {
@@ -1446,6 +1455,7 @@ static void ub_defer(shader_program_key *shader)
    shader_bind_attributes(shader);
    glLinkProgram(shader->program_object);
    shader->pending = 1;
+   shader->born = ub_fields;
    shader->frag = fragshader;
    sess_compiled++;
    ub_deferred++;
@@ -1621,13 +1631,12 @@ void compile_shader(void)
 
    need_to_compile = 0;
 
-   /* without KHR_parallel_shader_compile no link can be polled: the uber program draws
-    * everything it reproduces */
-   if (!warm_parallel && ub_on())
-   {
-      ub_use();
-      return;
-   }
+   /* ⚠ NOT "WITHOUT KHR_parallel_shader_compile THE UBER PROGRAM DRAWS EVERYTHING". It
+    * did, and on the reported Mali-G715 (Chrome 155, no such extension) every one of
+    * 386193 binds went through it — the 34 programs the prewarm list compiled at boot
+    * were never used, and that phone showed 8 pictures a second of 30 made. Without the
+    * extension a new combiner is still compiled behind the uber program; ub_poll asks
+    * about its link UB_AGE_FIELDS fields later instead of polling for it. */
 
    for( i = 0; i < number_of_programs; i++)
    {
@@ -1719,7 +1728,7 @@ void compile_shader(void)
    {
       /* UBER: a combiner seen for the first time is compiled with no query and drawn
        * with the uber program until its own link is done */
-      int defer = warm_parallel && ub_on();
+      int defer = ub_on();
       if (!warm_adopt(&shader, defer))
       {
          if (defer)
