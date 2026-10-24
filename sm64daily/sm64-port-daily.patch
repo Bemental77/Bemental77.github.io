@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index cfac1e8..22b5a40 100644
+index cfac1e8..b448b3e 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -170,7 +170,7 @@ endif
@@ -24,7 +24,7 @@ index cfac1e8..22b5a40 100644
  ifeq ($(TARGET_WEB),1)
    PLATFORM_CFLAGS  := -DTARGET_WEB
 -  PLATFORM_LDFLAGS := -lm -no-pie -s TOTAL_MEMORY=20MB -g4 --source-map-base http://localhost:8080/ -s "EXTRA_EXPORTED_RUNTIME_METHODS=['callMain']"
-+  PLATFORM_LDFLAGS := -lm -sTOTAL_MEMORY=128MB -sEXPORTED_RUNTIME_METHODS=callMain,HEAP16,HEAPU8 -sEXPORTED_FUNCTIONS=_main,_daily_restart,_daily_debug_warp,_daily_debug_mario_y,_daily_debug_standing,_daily_debug_inside,_daily_debug_gen,_daily_debug_gen_info,_daily_debug_track,_daily_debug_mode,_daily_debug_auto,_daily_debug_modules,_daily_debug_objective,_daily_debug_dyn_count,_daily_debug_dyn_warp,_daily_debug_defeat_all,_daily_debug_cannon,_daily_debug_next_station,_daily_debug_part_of_cannon,_daily_debug_mod_info,_daily_debug_num_parts,_daily_debug_part,_daily_debug_put,_daily_debug_mario,_daily_debug_cap,_daily_debug_camyaw,_daily_debug_floor,_daily_debug_action,_daily_debug_dyn,_daily_debug_num_dyn,_daily_debug_dyn_move,_daily_debug_star,_daily_set_pad,_daily_set_volume,_daily_pause,_daily_set_ghost,_daily_rec_ptr,_daily_rec_count,_malloc,_free
++  PLATFORM_LDFLAGS := -lm -sTOTAL_MEMORY=128MB -sEXPORTED_RUNTIME_METHODS=callMain,HEAP16,HEAPU8 -sEXPORTED_FUNCTIONS=_main,_daily_restart,_daily_debug_warp,_daily_debug_mario_y,_daily_debug_standing,_daily_debug_inside,_daily_debug_gen,_daily_debug_gen_info,_daily_debug_track,_daily_debug_mode,_daily_debug_auto,_daily_debug_used_auto,_daily_debug_modules,_daily_debug_objective,_daily_debug_dyn_count,_daily_debug_dyn_warp,_daily_debug_defeat_all,_daily_debug_cannon,_daily_debug_next_station,_daily_debug_part_of_cannon,_daily_debug_mod_info,_daily_debug_num_parts,_daily_debug_part,_daily_debug_put,_daily_debug_mario,_daily_debug_cap,_daily_debug_camyaw,_daily_debug_floor,_daily_debug_action,_daily_debug_dyn,_daily_debug_num_dyn,_daily_debug_dyn_move,_daily_debug_star,_daily_set_pad,_daily_set_volume,_daily_pause,_daily_set_ghost,_daily_rec_ptr,_daily_rec_count,_malloc,_free
  endif
  
  PLATFORM_CFLAGS += -DNO_SEGMENTED_MEMORY -DUSE_SYSTEM_MALLOC
@@ -255,10 +255,10 @@ index 34b855e..774cf9f 100644
      o->oTreasureChestUnkFC = 0;
 diff --git a/src/game/daily.c b/src/game/daily.c
 new file mode 100644
-index 0000000..965bcc6
+index 0000000..a6ba0fd
 --- /dev/null
 +++ b/src/game/daily.c
-@@ -0,0 +1,2329 @@
+@@ -0,0 +1,2406 @@
 +// SM64 DAILY PARKOUR
 +//
 +// The page hands this module a seed (window.sm64DailySeed: the date, or a
@@ -501,7 +501,7 @@ index 0000000..965bcc6
 +// ── SM64's own platform pieces ──────────────────────────────────────────────
 +// Each is loaded into a free model slot and spawned with its real behavior. `col` is the
 +// collision the behavior uses for that behParam — read here only to measure the piece.
-+enum { R_STEP, R_LONGSTEP, R_HAZ_THWOMP, R_HAZ_PENDULUM, R_HAZ_FIREBAR, R_HAZ_ANY, R_LIFT };
++enum { R_STEP, R_LONGSTEP, R_HAZ_THWOMP, R_HAZ_PENDULUM, R_HAZ_FIREBAR, R_HAZ_ANY, R_LIFT, R_EXTRA };
 +struct Piece {
 +    const char *name;
 +    const BehaviorScript *beh;
@@ -513,7 +513,7 @@ index 0000000..965bcc6
 +};
 +#define PM(n) (0xE2 + (n))      // 0xE2..0xFE: free (the host's objects are cleared)
 +#include "daily_lib.inc.h"
-+#define MAX_PIECES 96
++#define MAX_PIECES 128
 +static struct Piece sPiece[MAX_PIECES] = {
 +    { "LLL HEXAGON",     bhvLllRotatingHexagonalPlatform, lll_geo_000A78,   lll_seg7_collision_hexagonal_platform, 0,          R_STEP,     PM(0) },
 +    { "LLL ROCK",        bhvLllSinkingRockBlock,          lll_geo_000DD0,   lll_seg7_collision_floating_block,     0,          R_STEP,     PM(1) },
@@ -592,7 +592,7 @@ index 0000000..965bcc6
 +static void load_all_models(void) {
 +    s32 i;
 +    sPool = alloc_only_pool_init();   // USE_SYSTEM_MALLOC build: grows with malloc (memory.c:500)
-+    for (i = 0; i < NUM_PIECES; i++) load_model(sPiece[i].model, sPiece[i].geo);
++    for (i = 0; i < NUM_PIECES; i++) if (sPiece[i].geo) load_model(sPiece[i].model, sPiece[i].geo);   // global models are already loaded
 +    load_model(MODEL_FIREBAR_BLOCK, lll_geo_000B38);
 +    load_model(MODEL_GIANT_POLE, wf_geo_000AE0);
 +    load_model(MODEL_CHECKER, sCheckerGeo);
@@ -922,7 +922,7 @@ index 0000000..965bcc6
 +                                           7, 9, 6, 8, 12, 8, 9, 16, 7, 6, 5, 9 };
 +static const f32 sModWeight[MD_COUNT] = { 1.0f, 2.5f, 1.5f, 1, 1, 1, 1, 1, 1, 1, 1, 0.8f,
 +                                          1.2f, 1, 1, 1, 1, 1, 1, 0.8f, 0.8f, 1, 1, 1, 1, 0.8f, 1, 0,     // the boss is placed, never picked
-+                                          1, 1, 1, 1, 1, 0.8f, 1, 1.2f, 1.6f, 1, 1, 1 };
++                                          1, 1, 1, 1, 1, 0.8f, 1, 2.4f, 1.6f, 1, 1, 1 };
 +static f32 sModOn[MD_COUNT];
 +static s32 sKickboards;   // this seed's palette: which modules it uses, and how much (generate)
 +
@@ -948,7 +948,7 @@ index 0000000..965bcc6
 +    }
 +}
 +
-+static u8 sPieceOn[96];
++static u8 sPieceOn[128];
 +static s32 sNumAutoDrawn;   // this seed's set of moving platforms (generate)
 +static s32 pick_step_piece(void) {
 +    s32 tries;
@@ -1011,6 +1011,34 @@ index 0000000..965bcc6
 +}
 +
 +// Build one module after station `cur`. Returns the index of its landing station, or -1 (rolled back).
++// Level ground Mario can run across: dry, and none of the floors that hurt, sink, warp or blow.
++static s32 ground_ok(struct Surface *fl, f32 x, f32 z, f32 y) {
++    s16 t = fl->type;
++    if (host_water(x, z) > y - 50.0f) return FALSE;
++    if (t == SURFACE_BURNING || t == SURFACE_DEATH_PLANE || t == SURFACE_VERTICAL_WIND || t == SURFACE_HORIZONTAL_WIND
++        || (t >= SURFACE_SHALLOW_QUICKSAND && t <= SURFACE_MOVING_QUICKSAND) || t == SURFACE_INSTANT_QUICKSAND
++        || t == SURFACE_DEEP_MOVING_QUICKSAND || t == SURFACE_SHALLOW_MOVING_QUICKSAND || t == SURFACE_INSTANT_MOVING_QUICKSAND
++        || (t >= SURFACE_INSTANT_WARP_1B && t <= SURFACE_INSTANT_WARP_1E) || t == SURFACE_WARP || t == SURFACE_LOOK_UP_WARP
++        || t == SURFACE_TIMER_START || t == SURFACE_TIMER_END) return FALSE;
++    return TRUE;
++}
++
++// A pad resting on the level's ground at (x, z): every corner of its footprint must have walkable
++// ground within 70 of the others; its top sits 20 above the highest. Returns the top, or -1e9.
++static f32 ground_pad_top(f32 x, f32 z, f32 half, f32 yHint) {
++    struct Surface *fl;
++    f32 lo = 1e9f, hi = -1e9f;
++    s32 k;
++    for (k = 0; k < 5; k++) {
++        f32 px = x + (k == 1 ? half : k == 2 ? -half : 0), pz = z + (k == 3 ? half : k == 4 ? -half : 0);
++        f32 t = find_floor(px, yHint + 400.0f, pz, &fl);
++        if (fl == NULL || fl->object != NULL || !ground_ok(fl, px, pz, t)) return -1e9f;
++        if (t < lo) lo = t;
++        if (t > hi) hi = t;
++    }
++    return hi - lo > 70.0f ? -1e9f : hi + 20.0f;
++}
++
 +static s32 build_module(s32 m, s32 cur, s16 h, f32 hard) {
 +    struct Part *c = &sPart[cur], *n = NULL, *a, *b;
 +    s32 start = sNumParts, startDyn = sNumDyn, startEnv = sNumEnv, i;
@@ -1327,41 +1355,51 @@ index 0000000..965bcc6
 +
 +        case MD_GROUND: {
 +            // Down to the level itself: slide to its ground, run across it, ride an updraft back up.
-+            // Only where the level's ground is walkable along the way (no drops, water or hazards).
-+            f32 e = extent_along(c, h), run = rnd_f(1100, 1700), px = c->x + sins(h) * (e + run), pz = c->z + coss(h) * (e + run);
-+            f32 y1 = terrain_at(px, pz), L = rnd_f(1500, 2600), y2, drop, len, ang, mid, k;
-+            struct Surface *fl;
-+            struct Part *pad1, *pad2, *sl;
-+            if (y1 < -19000.0f || find_floor(px, 20000.0f, pz, &fl) < -19000.0f || fl == NULL || fl->type != SURFACE_DEFAULT && fl->type != SURFACE_NOT_SLIPPERY
-+                && fl->type != SURFACE_HARD && fl->type != SURFACE_NOISE_DEFAULT && fl->type != SURFACE_HARD_NOT_SLIPPERY && fl->type != SURFACE_SLIPPERY) break;
-+            drop = c->y - (y1 + 25.0f);
-+            if (drop < 500.0f || drop > 4000.0f || drop > run * 1.0f) break;
-+            {   // the run along the ground: gentle, dry, no hazards
-+                f32 prev = y1, d2;
-+                for (d2 = 80.0f; d2 <= L; d2 += 80.0f) {
-+                    f32 x = px + sins(h) * d2, z = pz + coss(h) * d2, t = find_floor(x, prev + 400.0f, z, &fl);
-+                    if (fl == NULL || absf(t - prev) > 90.0f || host_water(x, z) > t - 50.0f || fl->type == SURFACE_BURNING
-+                        || fl->type == SURFACE_DEATH_PLANE || (fl->type >= SURFACE_SHALLOW_QUICKSAND && fl->type <= SURFACE_MOVING_QUICKSAND)) { L = -1; break; }
-+                    prev = t;
++            // Tries several landing spots and run directions, and takes the longest walkable stretch
++            // (no sudden drops, water, lava, quicksand, warps or death floors) of at least 1000.
++            s32 att;
++            f32 e = extent_along(c, h);
++            for (att = 0; att < 14 && n == NULL; att++) {
++                f32 run = rnd_f(900, 2300), px = c->x + sins(h) * (e + run), pz = c->z + coss(h) * (e + run);
++                f32 y1, y2, drop, len, mid, k, best = 0, prev, d2, maxL = rnd_f(1800, 3000);
++                s16 g = h + (s16) rnd_f(-0x3000, 0x3000), ang;
++                struct Surface *fl;
++                struct Part *pad1, *pad2, *sl;
++                y1 = find_floor(px, c->y, pz, &fl);
++                if (fl == NULL || fl->object != NULL || !ground_ok(fl, px, pz, y1)) continue;
++                drop = c->y - (y1 + 25.0f);
++                if (drop < 400.0f || drop > 4500.0f || drop > run * 1.1f) continue;
++                prev = y1; y2 = y1;
++                for (d2 = 80.0f; d2 <= maxL; d2 += 80.0f) {
++                    f32 x = px + sins(g) * d2, z = pz + coss(g) * d2, t = find_floor(x, prev + 300.0f, z, &fl);
++                    if (fl == NULL || absf(t - prev) > 110.0f || !ground_ok(fl, x, z, t) || absf(t - y1) > 900.0f) break;
++                    prev = t; best = d2; y2 = t;
 +                }
-+                if (L < 0 || absf(prev - y1) > 700.0f) break;
-+                y2 = prev;
++                if (best < 1000.0f) continue;
++                sl = add_part(PT_BOX);
++                pad1 = add_part(PT_CHECKER);
++                pad2 = add_part(PT_CHECKER);
++                if (!sl || !pad1 || !pad2) break;
++                len = sqrtf(run * run + drop * drop); ang = atan2s(run, drop); mid = e + run / 2.0f;
++                sl->box = BK_SLIDE; sl->hx = 240.0f; sl->hz = len / 2.0f; sl->h = 60.0f; sl->yaw = h; sl->pitch = ang; sl->gnd = 1;
++                sl->x = c->x + sins(h) * mid; sl->z = c->z + coss(h) * mid; sl->y = c->y - 10.0f - drop / 2.0f;
++                pad1->station = 1; pad1->gnd = 1; pad1->yaw = g; pad1->hx = 320.0f; pad1->hz = 320.0f; pad1->h = 80.0f;
++                pad1->x = px; pad1->z = pz; pad1->y = ground_pad_top(px, pz, 300.0f, y1);
++                pad2->station = 1; pad2->gnd = 1; pad2->yaw = g; pad2->hx = 260.0f; pad2->hz = 260.0f; pad2->h = 80.0f; pad2->fk = BK_WINDPAD;
++                pad2->x = px + sins(g) * best; pad2->z = pz + coss(g) * best; pad2->y = ground_pad_top(pad2->x, pad2->z, 240.0f, y2);
++                if (pad1->y < -1e8f || pad2->y < -1e8f) { sNumParts = (s32) (sl - sPart); continue; }
++                drop = c->y - pad1->y; len = sqrtf(run * run + drop * drop); ang = atan2s(run, drop);
++                sl->hz = len / 2.0f; sl->pitch = ang; sl->y = c->y - 10.0f - drop / 2.0f;
++                for (k = 600.0f; k < best - 300.0f; k += 160.0f) {
++                    f32 x = px + sins(g) * k, z = pz + coss(g) * k;
++                    add_dyn(DK_COIN, x, find_floor(x, y1 + 1000.0f, z, &fl) + 60.0f, z, (s32) (pad1 - sPart));
++                }
++                // Back in the sky: 1150 up clears the ground by SKY_CLEAR; the updraft holds Mario ~1210 up.
++                n = station(pad2, g, rnd_f(40, 90), 1150.0f, rnd_f(280, 340), rnd_f(280, 340));
++                if (n) n->h = 120.0f;
++                if (n && blocked(n, (s32) (sl - sPart))) n = NULL;
++                if (!n) sNumParts = (s32) (sl - sPart);
 +            }
-+            sl = add_part(PT_BOX);
-+            pad1 = add_part(PT_CHECKER);
-+            if (!sl || !pad1) break;
-+            len = sqrtf(run * run + drop * drop); ang = atan2s(run, drop); mid = e + run / 2.0f;
-+            sl->box = BK_SLIDE; sl->hx = 240.0f; sl->hz = len / 2.0f; sl->h = 60.0f; sl->yaw = h; sl->pitch = ang; sl->gnd = 1;
-+            sl->x = c->x + sins(h) * mid; sl->z = c->z + coss(h) * mid; sl->y = c->y - 10.0f - drop / 2.0f;
-+            pad1->station = 1; pad1->gnd = 1; pad1->yaw = h; pad1->hx = 320.0f; pad1->hz = 320.0f; pad1->h = 80.0f;
-+            pad1->x = px + sins(h) * 300.0f; pad1->z = pz + coss(h) * 300.0f; pad1->y = terrain_at(pad1->x, pad1->z) + 25.0f;
-+            pad2 = add_part(PT_CHECKER);
-+            if (!pad2) break;
-+            pad2->station = 1; pad2->gnd = 1; pad2->yaw = h; pad2->hx = 260.0f; pad2->hz = 260.0f; pad2->h = 80.0f; pad2->fk = BK_WINDPAD;
-+            pad2->x = px + sins(h) * L; pad2->z = pz + coss(h) * L; pad2->y = y2 + 25.0f;
-+            for (k = 700.0f; k < L - 300.0f; k += 160.0f) add_dyn(DK_COIN, px + sins(h) * k, y2 + 60.0f + (y1 - y2) * (1 - k / L), pz + coss(h) * k, (s32) (pad1 - sPart));
-+            n = station(pad2, h, rnd_f(60, 120), 1000.0f, rnd_f(280, 340), rnd_f(280, 340));
-+            if (n) n->h = 200.0f;
 +            break;
 +        }
 +
@@ -1649,8 +1687,10 @@ index 0000000..965bcc6
 +// table are what the page shows (window.sm64DailyHost).
 +static const s16 sHosts[] = {
 +    LEVEL_CASTLE_GROUNDS, LEVEL_BOB, LEVEL_WF, LEVEL_JRB, LEVEL_CCM, LEVEL_SSL, LEVEL_LLL, LEVEL_SL,
-+    LEVEL_TTM,   /* LEVEL_WDW left out: its walls leave room for ~3 platforms */ LEVEL_THI, LEVEL_RR, LEVEL_BITDW, LEVEL_BITFS, LEVEL_BITS, LEVEL_DDD,
++    LEVEL_TTM, LEVEL_THI, LEVEL_RR, LEVEL_BITDW, LEVEL_BITFS, LEVEL_BITS, LEVEL_DDD,
 +    LEVEL_CASTLE_COURTYARD,
++    // Open-sky worlds added next (a course floats above them like the others).
++    LEVEL_WDW, LEVEL_BBH, LEVEL_PSS, LEVEL_TOTWC, LEVEL_VCUTM, LEVEL_WMOTR, LEVEL_BOWSER_1, LEVEL_BOWSER_2, LEVEL_BOWSER_3,
 +};
 +static s32 sHostIdx = 0;
 +
@@ -1698,6 +1738,23 @@ index 0000000..965bcc6
 +            local_pt(p, -p->hz + 80.0f + j * (2 * p->hz - 160.0f) / 4.0f, 0, &x, &z);
 +            d = add_dyn(DK_COIN, x, p->y + 40.0f, z, (s32) (p - sPart));
 +            if (d && sMode == MODE_COINS) d->objective = 1;
++        }
++    }
++}
++
++// This seed's extras, each on one or two platforms, toward a corner, standing on the top.
++static void place_extras(void) {
++    s32 st[MAX_PARTS], ns = 0, i, k;
++    for (i = 1; i < sNumParts; i++) if (sPart[i].station && i != sGoal && sPart[i].hx >= 200.0f && sPart[i].hz >= 200.0f) st[ns++] = i;
++    if (ns == 0) return;
++    for (i = NUM_BUILTIN_PIECES; i < NUM_PIECES; i++) {
++        if (sPiece[i].role != R_EXTRA) continue;
++        for (k = 0; k < 1 + rnd_i(2) && sNumParts < MAX_PARTS - 4; k++) {
++            struct Part *s = &sPart[st[rnd_i(ns)]], *e = add_part(PT_PIECE);
++            if (!e) return;
++            e->piece = i; e->yaw = (s16) (rnd_u32() & 0xFFFF); e->r = 1; e->h = 0;
++            local_pt(s, rnd_f(-(s->hz - 120), s->hz - 120), rnd_f(-(s->hx - 120), s->hx - 120), &e->x, &e->z);
++            e->y = s->y - DMIN(sPiece[i].minY, 0.0f) + 2.0f;
 +        }
 +    }
 +}
@@ -1791,6 +1848,7 @@ index 0000000..965bcc6
 +    sPart[cur].goal = 1; sPart[cur].check = 0; sPart[cur].fk = 0;
 +    sPart[cur].hx = DMAX(sPart[cur].hx, 280.0f); sPart[cur].hz = DMAX(sPart[cur].hz, 280.0f);
 +    for (sNumStations = 0, i = 0; i < sNumParts; i++) if (sPart[i].station) sNumStations++;
++    place_extras();
 +    place_collectibles();
 +    if (sMode == MODE_COINS) {
 +        s32 t = 0;
@@ -1853,18 +1911,30 @@ index 0000000..965bcc6
 +            for (a = 0x74; a <= 0xE1; a++) claimed[a] = 1;            // the global/common set our objects use
 +            for (a = 0; a < NUM_LIB; a++) if (lib_ok(a)) { claimed[sLib[a].model] = 1; claimed[sLib[a].model2] = 1; claimed[sLib[a].model3] = 1; }
 +            if (sBoss >= 0) { claimed[sBosses[sBoss].model] = 1; claimed[sBosses[sBoss].model2] = 1; }
-+            claimed[MODEL_WF_KICKABLE_BOARD] = claimed[MODEL_WF_KICKABLE_BOARD_FELLED] = 1;
++            if (sModOn[MD_KICKBOARD] > 0) claimed[MODEL_WF_KICKABLE_BOARD] = claimed[MODEL_WF_KICKABLE_BOARD_FELLED] = 1;
 +            claimed[MODEL_TRAMPOLINE] = claimed[MODEL_TRAMPOLINE_CENTER] = claimed[MODEL_TRAMPOLINE_BASE] = 1;
 +            if (sGroupB == 15) claimed[MODEL_CHAIN_CHOMP] = claimed[MODEL_METALLIC_BALL] = claimed[MODEL_WOODEN_POST] = 1;
-+            for (tries = 0; tries < 400 && sNumPieces < MAX_PIECES && sNumPieces < NUM_BUILTIN_PIECES + 18; tries++) {
++            for (tries = 0; tries < 600 && sNumPieces < MAX_PIECES && sNumPieces < NUM_BUILTIN_PIECES + 30; tries++) {
 +                const struct AutoPiece *ap = &sAuto[PRNG() % NUM_AUTO];
 +                struct Piece *pc = &sPiece[sNumPieces];
 +                const Collision *col = beh_collision(ap->beh);
-+                if (claimed[ap->model]) continue;
++                s32 slot = ap->model, dup = 0, q;
++                for (q = NUM_BUILTIN_PIECES; q < sNumPieces; q++) if (sPiece[q].beh == ap->beh) dup = 1;
++                if (dup) continue;
++                if (!ap->glob && claimed[slot]) {
++                    // Its home slot is taken: any free level-geometry slot will do for a model it doesn't switch.
++                    for (slot = 0x16; slot <= 0x53 && claimed[slot]; slot++) ;
++                    if (slot > 0x53) continue;
++                }
 +                bzero(pc, sizeof(*pc));
-+                pc->name = ap->name; pc->beh = ap->beh; pc->geo = ap->geo; pc->bp = ap->bp; pc->model = ap->model;
++                pc->name = ap->name; pc->beh = ap->beh; pc->geo = ap->glob ? NULL : ap->geo; pc->bp = ap->bp; pc->model = (u8) slot;
 +                if (col != NULL) { pc->col = col; measure(pc); }
-+                if (ap->role == 1) {
++                if (ap->role == 3) {
++                    // Life on the course: NPCs, signs, 1-ups, hearts, crazy boxes, butterflies, Moneybags...
++                    pc->role = R_EXTRA;
++                    if (col == NULL) { pc->minY = 0; pc->maxY = 100; pc->rx = pc->rz = pc->r = 100; }
++                    if (pc->r > 700.0f) continue;
++                } else if (ap->role == 1) {
 +                    pc->role = R_HAZ_ANY;
 +                    if (col == NULL) { pc->minY = 0; pc->maxY = 200; pc->rx = pc->rz = pc->r = 200; }
 +                    if (pc->r > 1200.0f) continue;
@@ -1873,7 +1943,7 @@ index 0000000..965bcc6
 +                    if (col == NULL || pc->rx < 110.0f || pc->rz < 110.0f || pc->r > 1600.0f || pc->maxY - pc->minY > 2400.0f) continue;
 +                    pc->role = (pc->rx > pc->rz * 2.0f || pc->rz > pc->rx * 2.0f) ? R_LONGSTEP : R_STEP;
 +                }
-+                claimed[ap->model] = 1;
++                if (!ap->glob) claimed[slot] = 1;
 +                sPieceOn[sNumPieces] = 1;
 +                sNumPieces++;
 +            }
@@ -1912,6 +1982,13 @@ index 0000000..965bcc6
 +s32 daily_debug_gen_info(void) { return sNumStations * 10000 + (s32) sGenSecs; }
 +s32 daily_debug_mode(void) { return sMode; }
 +s32 daily_debug_auto(void) { return sNumAutoDrawn; }
++// Test hook: how many parts of the current course use inventory object k (sAuto[k]); k = -1 -> NUM_AUTO.
++s32 daily_debug_used_auto(s32 k) {
++    s32 i, n = 0;
++    if (k < 0) return NUM_AUTO;
++    for (i = 0; i < sNumParts; i++) if (sPart[i].type == PT_PIECE && sPiece[sPart[i].piece].beh == sAuto[k].beh) n++;
++    return n;
++}
 +s32 daily_debug_modules(s32 i) { return i < sNumMods ? sMods[i] : -1; }
 +// Test hook: module k's [0] id, [1] the station it starts from, [2] the station it lands on.
 +// [3] its first part, [4] one past its last part, [5] its first dyn, [6] one past its last dyn.
@@ -2590,10 +2667,10 @@ index 0000000..965bcc6
 +}
 diff --git a/src/game/daily.h b/src/game/daily.h
 new file mode 100644
-index 0000000..b0b06b9
+index 0000000..abefcf8
 --- /dev/null
 +++ b/src/game/daily.h
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,60 @@
 +#ifndef DAILY_H
 +#define DAILY_H
 +
@@ -2628,6 +2705,7 @@ index 0000000..b0b06b9
 +void daily_star_target(f32 *x, f32 *y, f32 *z);
 +s32 daily_debug_mode(void);
 +s32 daily_debug_auto(void);
++s32 daily_debug_used_auto(s32 k);
 +s32 daily_debug_modules(s32 i);
 +s32 daily_debug_objective(void);
 +s32 daily_debug_dyn_count(void);
@@ -2655,10 +2733,10 @@ index 0000000..b0b06b9
 +#endif // DAILY_H
 diff --git a/src/game/daily_lib.inc.h b/src/game/daily_lib.inc.h
 new file mode 100644
-index 0000000..815c96b
+index 0000000..10d8614
 --- /dev/null
 +++ b/src/game/daily_lib.inc.h
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,121 @@
 +// GENERATED by sm64daily/gen_lib.py from the behaviour inventory. Do not edit by hand.
 +// Every platform, hazard and mechanism SM64 places in its levels that works on its own, with the geo
 +// and behaviour params it is placed with in its home level. daily.c measures each from the collision
@@ -2667,87 +2745,117 @@ index 0000000..815c96b
 +#include "actors/common1.h"
 +#include "actors/group1.h"
 +#include "actors/group14.h"
++#include "actors/group15.h"
 +#include "actors/group17.h"
 +#include "actors/group4.h"
++#include "actors/group7.h"
++#include "actors/group9.h"
 +#include "levels/bbh/header.h"
 +#include "levels/bitdw/header.h"
 +#include "levels/bitfs/header.h"
 +#include "levels/bits/header.h"
 +#include "levels/bowser_2/header.h"
 +#include "levels/bowser_3/header.h"
++#include "levels/castle_grounds/header.h"
++#include "levels/castle_inside/header.h"
 +#include "levels/hmc/header.h"
 +#include "levels/jrb/header.h"
 +#include "levels/lll/header.h"
 +#include "levels/rr/header.h"
 +#include "levels/ssl/header.h"
 +#include "levels/ttc/header.h"
++#include "levels/ttm/header.h"
 +#include "levels/wdw/header.h"
 +#include "levels/wf/header.h"
-+struct AutoPiece { const char *name; const BehaviorScript *beh; const GeoLayout *geo; u32 bp; u8 role; u8 model; };
++// glob: the model is loaded by levels/scripts.c for every level (use it as is, never reload it).
++struct AutoPiece { const char *name; const BehaviorScript *beh; const GeoLayout *geo; u32 bp; u8 role; u8 model; u8 glob; };
 +static const struct AutoPiece sAuto[] = {
-+    { "ActivatedBackAndForthPlatform", bhvActivatedBackAndForthPlatform, bits_geo_000658, 0x00610000, 0, MODEL_BITS_ARROW_PLATFORM },
-+    { "ArrowLift", bhvArrowLift, wdw_geo_000598, 0x00000000, 0, MODEL_WDW_ARROW_LIFT },
-+    { "BbhTiltingTrapPlatform", bhvBbhTiltingTrapPlatform, geo_bbh_0005C8, 0x00000000, 0, MODEL_BBH_TILTING_FLOOR_PLATFORM },
-+    { "BbhTumblingBridge", bhvBbhTumblingBridge, geo_bbh_0005E0, 0x00000000, 0, MODEL_BBH_TUMBLING_PLATFORM },
-+    { "BitfsSinkingCagePlatform", bhvBitfsSinkingCagePlatform, bitfs_geo_000690, 0x00010000, 0, MODEL_BITFS_SINKING_CAGE_PLATFORM },
-+    { "BitfsSinkingPlatforms", bhvBitfsSinkingPlatforms, bitfs_geo_000770, 0x00000000, 0, MODEL_BITFS_SINKING_PLATFORMS },
-+    { "BitfsTiltingInvertedPyramid", bhvBitfsTiltingInvertedPyramid, bitfs_geo_0006C0, 0x00000000, 0, MODEL_BITFS_TILTING_SQUARE_PLATFORM },
-+    { "CheckerboardElevatorGroup", bhvCheckerboardElevatorGroup, checkerboard_platform_geo, 0x014B0000, 0, MODEL_CHECKERBOARD_PLATFORM },
-+    { "ClamShell", bhvClamShell, clam_shell_geo, 0x00000000, 1, MODEL_CLAM_SHELL },
-+    { "ControllablePlatform", bhvControllablePlatform, hmc_geo_0005A0, 0x00000000, 0, MODEL_HMC_METAL_PLATFORM },
-+    { "Dorrie", bhvDorrie, dorrie_geo, 0x00000000, 0, MODEL_DORRIE },
-+    { "FallingBowserPlatform", bhvFallingBowserPlatform, bowser_3_geo_000290, 0x00010000, 0, MODEL_BOWSER_3_FALLING_PLATFORM_1 },
-+    { "FallingPillar", bhvFallingPillar, jrb_geo_000900, 0x00000000, 1, MODEL_JRB_FALLING_PILLAR },
-+    { "FerrisWheelAxle", bhvFerrisWheelAxle, bits_geo_000640, 0x00000000, 0, MODEL_BITS_FERRIS_WHEEL_AXLE },
-+    { "FireSpitter", bhvFireSpitter, bowling_ball_geo, 0x00000000, 1, MODEL_BOWLING_BALL },
-+    { "Flame", bhvFlame, red_flame_geo, 0x00000000, 1, MODEL_RED_FLAME },
-+    { "Grindel", bhvGrindel, ssl_geo_000734, 0x001C0000, 1, MODEL_SSL_GRINDEL },
-+    { "HauntedBookshelf", bhvHauntedBookshelf, geo_bbh_000610, 0x00000000, 2, MODEL_BBH_MOVING_BOOKSHELF },
-+    { "HiddenStaircaseStep", bhvHiddenStaircaseStep, geo_bbh_0005B0, 0x00000000, 0, MODEL_BBH_STAIRCASE_STEP },
-+    { "HorizontalGrindel", bhvHorizontalGrindel, ssl_geo_000734, 0x00000000, 1, MODEL_SSL_GRINDEL },
-+    { "LllDrawbridgeSpawner", bhvLllDrawbridgeSpawner, lll_geo_000B20, 0x00000000, 0, MODEL_LLL_DRAWBRIDGE_PART },
-+    { "LllHexagonalMesh", bhvLllHexagonalMesh, lll_geo_000AF0, 0x00000000, 0, MODEL_LEVEL_GEOMETRY_0E },
-+    { "LllMovingOctagonalMeshPlatform", bhvLllMovingOctagonalMeshPlatform, lll_geo_000B08, 0x00000000, 0, MODEL_LLL_MOVING_OCTAGONAL_MESH_PLATFORM },
-+    { "LllRotatingHexagonalPlatform", bhvLllRotatingHexagonalPlatform, lll_geo_000A78, 0x00000000, 0, MODEL_LLL_ROTATING_HEXAGONAL_PLATFORM },
-+    { "LllRotatingHexagonalRing", bhvLllRotatingHexagonalRing, lll_geo_000BB0, 0x00000000, 0, MODEL_LLL_ROTATING_HEXAGONAL_RING },
-+    { "LllSinkingRectangularPlatform", bhvLllSinkingRectangularPlatform, lll_geo_000BC8, 0x00000000, 0, MODEL_LLL_SINKING_RECTANGULAR_PLATFORM },
-+    { "LllSinkingRockBlock", bhvLllSinkingRockBlock, lll_geo_000DD0, 0x00000000, 0, MODEL_LLL_SINKING_ROCK_BLOCK },
-+    { "LllSinkingSquarePlatforms", bhvLllSinkingSquarePlatforms, lll_geo_000BE0, 0x00000000, 0, MODEL_LLL_SINKING_SQUARE_PLATFORMS },
-+    { "LllTiltingInvertedPyramid", bhvLllTiltingInvertedPyramid, lll_geo_000BF8, 0x00000000, 0, MODEL_LLL_TILTING_SQUARE_PLATFORM },
-+    { "LllVolcanoFallingTrap", bhvLllVolcanoFallingTrap, lll_geo_000EA8, 0x00000000, 1, MODEL_LLL_VOLCANO_FALLING_TRAP },
-+    { "MerryGoRound", bhvMerryGoRound, geo_bbh_000640, 0x00000000, 0, MODEL_BBH_MERRY_GO_ROUND },
-+    { "OctagonalPlatformRotating", bhvOctagonalPlatformRotating, rr_geo_0008A8, 0x03010000, 0, MODEL_RR_OCTAGONAL_PLATFORM },
-+    { "PillarBase", bhvPillarBase, jrb_geo_000918, 0x00000000, 0, MODEL_JRB_FALLING_PILLAR_BASE },
-+    { "RockSolid", bhvRockSolid, jrb_geo_000930, 0x00000000, 0, MODEL_JRB_ROCK },
-+    { "RotatingPlatform", bhvRotatingPlatform, wf_geo_0009B8, 0x08000000, 0, MODEL_WF_ROTATING_PLATFORM },
-+    { "RrRotatingBridgePlatform", bhvRrRotatingBridgePlatform, rr_geo_000878, 0x00010000, 1, MODEL_RR_ROTATING_BRIDGE_PLATFORM },
-+    { "SeesawPlatform", bhvSeesawPlatform, rr_geo_000908, 0x00050000, 0, MODEL_RR_SEESAW_PLATFORM },
-+    { "SlidingPlatform2", bhvSlidingPlatform2, rr_geo_0008C0, 0x010C0000, 0, MODEL_RR_SLIDING_PLATFORM },
-+    { "Spindel", bhvSpindel, ssl_geo_000764, 0x00000000, 1, MODEL_SSL_SPINDEL },
-+    { "SquarishPathMoving", bhvSquarishPathMoving, geo_bitdw_000558, 0x00000000, 0, MODEL_BITDW_SQUARE_PLATFORM },
-+    { "SquishablePlatform", bhvSquishablePlatform, bitfs_geo_000708, 0x00000000, 0, MODEL_BITFS_STRETCHING_PLATFORMS },
-+    { "SslMovingPyramidWall", bhvSslMovingPyramidWall, ssl_geo_000794, 0x00010000, 1, MODEL_SSL_MOVING_PYRAMID_WALL },
-+    { "SwingPlatform", bhvSwingPlatform, rr_geo_000860, 0x00000000, 0, MODEL_RR_SWINGING_PLATFORM },
-+    { "TTC2DRotator", bhvTTC2DRotator, ttc_geo_000358, 0x00000000, 0, MODEL_TTC_CLOCK_HAND },
-+    { "TTCCog", bhvTTCCog, ttc_geo_0002E0, 0x00000000, 0, MODEL_TTC_ROTATING_HEXAGON },
-+    { "TTCElevator", bhvTTCElevator, ttc_geo_000340, 0x00000000, 0, MODEL_TTC_ELEVATOR_PLATFORM },
-+    { "TTCMovingBar", bhvTTCMovingBar, ttc_geo_0002C8, 0x00000000, 1, MODEL_TTC_PUSH_BLOCK },
-+    { "TTCPendulum", bhvTTCPendulum, ttc_geo_000270, 0x00000000, 1, MODEL_TTC_PENDULUM },
-+    { "TTCPitBlock", bhvTTCPitBlock, ttc_geo_000310, 0x00000000, 1, MODEL_TTC_PIT_BLOCK },
-+    { "TTCRotatingSolid", bhvTTCRotatingSolid, ttc_geo_000240, 0x00000000, 0, MODEL_TTC_ROTATING_CUBE },
-+    { "TTCSpinner", bhvTTCSpinner, ttc_geo_000370, 0x00000000, 0, MODEL_TTC_SPINNER },
-+    { "TTCTreadmill", bhvTTCTreadmill, ttc_geo_0002A8, 0x00000000, 0, MODEL_TTC_SMALL_TREADMILL },
-+    { "Thwomp", bhvThwomp, thwomp_geo, 0x00000000, 1, MODEL_THWOMP },
-+    { "Thwomp2", bhvThwomp2, thwomp_geo, 0x00000000, 1, MODEL_THWOMP },
-+    { "TiltingBowserLavaPlatform", bhvTiltingBowserLavaPlatform, bowser_2_geo_000170, 0x00000000, 0, MODEL_BOWSER_2_TILTING_ARENA },
-+    { "Tower", bhvTower, lll_geo_000A60, 0x00000000, 0, MODEL_LEVEL_GEOMETRY_08 },
-+    { "ToxBox", bhvToxBox, ssl_geo_000630, 0x00000000, 1, MODEL_SSL_TOX_BOX },
-+    { "WaterBombCannon", bhvWaterBombCannon, cannon_base_geo, 0x00010000, 1, MODEL_CANNON_BASE },
-+    { "WdwExpressElevator", bhvWdwExpressElevator, wdw_geo_000610, 0x00320000, 0, MODEL_WDW_EXPRESS_ELEVATOR },
-+    { "WdwExpressElevatorPlatform", bhvWdwExpressElevatorPlatform, wdw_geo_000610, 0x00320000, 0, MODEL_WDW_EXPRESS_ELEVATOR },
-+    { "WfRotatingWoodenPlatform", bhvWfRotatingWoodenPlatform, wf_geo_000A58, 0x00000000, 0, MODEL_WF_ROTATING_WOODEN_PLATFORM },
-+    { "WfTumblingBridge", bhvWfTumblingBridge, bitfs_geo_0006F0, 0x00030000, 0, MODEL_BITFS_TUMBLING_PLATFORM },
-+    { "WoodenPost", bhvWoodenPost, wooden_post_geo, 0x00000000, 2, MODEL_WOODEN_POST },
++    { "1Up", bhv1Up, mushroom_1up_geo, 0x00000000, 3, MODEL_1UP, 1 },
++    { "ActivatedBackAndForthPlatform", bhvActivatedBackAndForthPlatform, bits_geo_000658, 0x00610000, 0, MODEL_BITS_ARROW_PLATFORM, 0 },
++    { "ArrowLift", bhvArrowLift, wdw_geo_000598, 0x00000000, 0, MODEL_WDW_ARROW_LIFT, 0 },
++    { "BbhTiltingTrapPlatform", bhvBbhTiltingTrapPlatform, geo_bbh_0005C8, 0x00000000, 0, MODEL_BBH_TILTING_FLOOR_PLATFORM, 0 },
++    { "BbhTumblingBridge", bhvBbhTumblingBridge, geo_bbh_0005E0, 0x00000000, 0, MODEL_BBH_TUMBLING_PLATFORM, 0 },
++    { "BitfsSinkingCagePlatform", bhvBitfsSinkingCagePlatform, bitfs_geo_000690, 0x00010000, 0, MODEL_BITFS_SINKING_CAGE_PLATFORM, 0 },
++    { "BitfsSinkingPlatforms", bhvBitfsSinkingPlatforms, bitfs_geo_000770, 0x00000000, 0, MODEL_BITFS_SINKING_PLATFORMS, 0 },
++    { "BitfsTiltingInvertedPyramid", bhvBitfsTiltingInvertedPyramid, bitfs_geo_0006C0, 0x00000000, 0, MODEL_BITFS_TILTING_SQUARE_PLATFORM, 0 },
++    { "BreakableBoxSmall", bhvBreakableBoxSmall, breakable_box_small_geo, 0x00000000, 3, MODEL_BREAKABLE_BOX_SMALL, 1 },
++    { "BulletBillCannon", bhvBulletBillCannon, ttm_geo_000858, 0x00000000, 3, MODEL_LEVEL_GEOMETRY_09, 0 },
++    { "Butterfly", bhvButterfly, butterfly_geo, 0x00000000, 3, MODEL_BUTTERFLY, 1 },
++    { "CastleFlagWaving", bhvCastleFlagWaving, castle_grounds_geo_000660, 0x00000000, 3, MODEL_CASTLE_GROUNDS_FLAG, 0 },
++    { "CheckerboardElevatorGroup", bhvCheckerboardElevatorGroup, checkerboard_platform_geo, 0x014B0000, 0, MODEL_CHECKERBOARD_PLATFORM, 1 },
++    { "ClamShell", bhvClamShell, clam_shell_geo, 0x00000000, 1, MODEL_CLAM_SHELL, 1 },
++    { "ControllablePlatform", bhvControllablePlatform, hmc_geo_0005A0, 0x00000000, 0, MODEL_HMC_METAL_PLATFORM, 0 },
++    { "DecorativePendulum", bhvDecorativePendulum, castle_geo_001518, 0x00000000, 3, MODEL_CASTLE_CLOCK_PENDULUM, 0 },
++    { "Dorrie", bhvDorrie, dorrie_geo, 0x00000000, 0, MODEL_DORRIE, 1 },
++    { "FallingBowserPlatform", bhvFallingBowserPlatform, bowser_3_geo_000290, 0x00010000, 0, MODEL_BOWSER_3_FALLING_PLATFORM_1, 0 },
++    { "FallingPillar", bhvFallingPillar, jrb_geo_000900, 0x00000000, 1, MODEL_JRB_FALLING_PILLAR, 0 },
++    { "FerrisWheelAxle", bhvFerrisWheelAxle, bits_geo_000640, 0x00000000, 0, MODEL_BITS_FERRIS_WHEEL_AXLE, 0 },
++    { "FireSpitter", bhvFireSpitter, bowling_ball_geo, 0x00000000, 1, MODEL_BOWLING_BALL, 1 },
++    { "Flame", bhvFlame, red_flame_geo, 0x00000000, 1, MODEL_RED_FLAME, 1 },
++    { "FlyingBookend", bhvFlyingBookend, bookend_geo, 0x00000000, 3, MODEL_BOOKEND, 1 },
++    { "GhostHuntBoo", bhvGhostHuntBoo, boo_geo, 0x00000000, 3, MODEL_BOO, 1 },
++    { "GoombaTripletSpawner", bhvGoombaTripletSpawner, koopa_with_shell_geo, 0x00010000, 3, MODEL_KOOPA_WITH_SHELL, 1 },
++    { "Grindel", bhvGrindel, ssl_geo_000734, 0x001C0000, 1, MODEL_SSL_GRINDEL, 0 },
++    { "HauntedBookshelf", bhvHauntedBookshelf, geo_bbh_000610, 0x00000000, 2, MODEL_BBH_MOVING_BOOKSHELF, 0 },
++    { "HauntedChair", bhvHauntedChair, haunted_chair_geo, 0x00000000, 3, MODEL_HAUNTED_CHAIR, 1 },
++    { "Hidden1up", bhvHidden1up, mushroom_1up_geo, 0x00000000, 3, MODEL_1UP, 1 },
++    { "HiddenStaircaseStep", bhvHiddenStaircaseStep, geo_bbh_0005B0, 0x00000000, 0, MODEL_BBH_STAIRCASE_STEP, 0 },
++    { "HorizontalGrindel", bhvHorizontalGrindel, ssl_geo_000734, 0x00000000, 1, MODEL_SSL_GRINDEL, 0 },
++    { "JumpingBox", bhvJumpingBox, breakable_box_geo, 0x00000000, 3, MODEL_BREAKABLE_BOX, 1 },
++    { "LllDrawbridgeSpawner", bhvLllDrawbridgeSpawner, lll_geo_000B20, 0x00000000, 0, MODEL_LLL_DRAWBRIDGE_PART, 0 },
++    { "LllHexagonalMesh", bhvLllHexagonalMesh, lll_geo_000AF0, 0x00000000, 0, MODEL_LEVEL_GEOMETRY_0E, 0 },
++    { "LllMovingOctagonalMeshPlatform", bhvLllMovingOctagonalMeshPlatform, lll_geo_000B08, 0x00000000, 0, MODEL_LLL_MOVING_OCTAGONAL_MESH_PLATFORM, 0 },
++    { "LllRotatingHexagonalPlatform", bhvLllRotatingHexagonalPlatform, lll_geo_000A78, 0x00000000, 0, MODEL_LLL_ROTATING_HEXAGONAL_PLATFORM, 0 },
++    { "LllRotatingHexagonalRing", bhvLllRotatingHexagonalRing, lll_geo_000BB0, 0x00000000, 0, MODEL_LLL_ROTATING_HEXAGONAL_RING, 0 },
++    { "LllSinkingRectangularPlatform", bhvLllSinkingRectangularPlatform, lll_geo_000BC8, 0x00000000, 0, MODEL_LLL_SINKING_RECTANGULAR_PLATFORM, 0 },
++    { "LllSinkingRockBlock", bhvLllSinkingRockBlock, lll_geo_000DD0, 0x00000000, 0, MODEL_LLL_SINKING_ROCK_BLOCK, 0 },
++    { "LllSinkingSquarePlatforms", bhvLllSinkingSquarePlatforms, lll_geo_000BE0, 0x00000000, 0, MODEL_LLL_SINKING_SQUARE_PLATFORMS, 0 },
++    { "LllTiltingInvertedPyramid", bhvLllTiltingInvertedPyramid, lll_geo_000BF8, 0x00000000, 0, MODEL_LLL_TILTING_SQUARE_PLATFORM, 0 },
++    { "LllVolcanoFallingTrap", bhvLllVolcanoFallingTrap, lll_geo_000EA8, 0x00000000, 1, MODEL_LLL_VOLCANO_FALLING_TRAP, 0 },
++    { "MerryGoRound", bhvMerryGoRound, geo_bbh_000640, 0x00000000, 0, MODEL_BBH_MERRY_GO_ROUND, 0 },
++    { "MessagePanel", bhvMessagePanel, wooden_signpost_geo, 0x00000000, 3, MODEL_WOODEN_SIGNPOST, 1 },
++    { "MoneybagHidden", bhvMoneybagHidden, yellow_coin_geo, 0x00000000, 3, MODEL_YELLOW_COIN, 1 },
++    { "MovingBlueCoin", bhvMovingBlueCoin, blue_coin_geo, 0x00000000, 3, MODEL_BLUE_COIN, 1 },
++    { "OctagonalPlatformRotating", bhvOctagonalPlatformRotating, rr_geo_0008A8, 0x03010000, 0, MODEL_RR_OCTAGONAL_PLATFORM, 0 },
++    { "PillarBase", bhvPillarBase, jrb_geo_000918, 0x00000000, 0, MODEL_JRB_FALLING_PILLAR_BASE, 0 },
++    { "RecoveryHeart", bhvRecoveryHeart, heart_geo, 0x00000000, 3, MODEL_HEART, 1 },
++    { "RockSolid", bhvRockSolid, jrb_geo_000930, 0x00000000, 0, MODEL_JRB_ROCK, 0 },
++    { "RotatingPlatform", bhvRotatingPlatform, wf_geo_0009B8, 0x08000000, 0, MODEL_WF_ROTATING_PLATFORM, 0 },
++    { "RrCruiserWing", bhvRrCruiserWing, rr_geo_000890, 0x00000000, 3, MODEL_RR_CRUISER_WING, 0 },
++    { "RrRotatingBridgePlatform", bhvRrRotatingBridgePlatform, rr_geo_000878, 0x00010000, 1, MODEL_RR_ROTATING_BRIDGE_PLATFORM, 0 },
++    { "SeesawPlatform", bhvSeesawPlatform, rr_geo_000908, 0x00050000, 0, MODEL_RR_SEESAW_PLATFORM, 0 },
++    { "ShipPart3", bhvShipPart3, jrb_geo_000978, 0x00000000, 3, MODEL_JRB_SHIP_LEFT_HALF_PART, 0 },
++    { "SlidingPlatform2", bhvSlidingPlatform2, rr_geo_0008C0, 0x010C0000, 0, MODEL_RR_SLIDING_PLATFORM, 0 },
++    { "SmallPenguin", bhvSmallPenguin, penguin_geo, 0x00010000, 3, MODEL_PENGUIN, 1 },
++    { "Spindel", bhvSpindel, ssl_geo_000764, 0x00000000, 1, MODEL_SSL_SPINDEL, 0 },
++    { "SquarishPathMoving", bhvSquarishPathMoving, geo_bitdw_000558, 0x00000000, 0, MODEL_BITDW_SQUARE_PLATFORM, 0 },
++    { "SquishablePlatform", bhvSquishablePlatform, bitfs_geo_000708, 0x00000000, 0, MODEL_BITFS_STRETCHING_PLATFORMS, 0 },
++    { "SslMovingPyramidWall", bhvSslMovingPyramidWall, ssl_geo_000794, 0x00010000, 1, MODEL_SSL_MOVING_PYRAMID_WALL, 0 },
++    { "StaticObject", bhvStaticObject, lll_geo_000AC0, 0x00000000, 3, MODEL_LEVEL_GEOMETRY_0C, 0 },
++    { "SunkenShipPart2", bhvSunkenShipPart2, jrb_geo_000978, 0x00000000, 3, MODEL_JRB_SHIP_LEFT_HALF_PART, 0 },
++    { "SwingPlatform", bhvSwingPlatform, rr_geo_000860, 0x00000000, 0, MODEL_RR_SWINGING_PLATFORM, 0 },
++    { "TTC2DRotator", bhvTTC2DRotator, ttc_geo_000358, 0x00000000, 0, MODEL_TTC_CLOCK_HAND, 0 },
++    { "TTCCog", bhvTTCCog, ttc_geo_0002E0, 0x00000000, 0, MODEL_TTC_ROTATING_HEXAGON, 0 },
++    { "TTCElevator", bhvTTCElevator, ttc_geo_000340, 0x00000000, 0, MODEL_TTC_ELEVATOR_PLATFORM, 0 },
++    { "TTCMovingBar", bhvTTCMovingBar, ttc_geo_0002C8, 0x00000000, 1, MODEL_TTC_PUSH_BLOCK, 0 },
++    { "TTCPendulum", bhvTTCPendulum, ttc_geo_000270, 0x00000000, 1, MODEL_TTC_PENDULUM, 0 },
++    { "TTCPitBlock", bhvTTCPitBlock, ttc_geo_000310, 0x00000000, 1, MODEL_TTC_PIT_BLOCK, 0 },
++    { "TTCRotatingSolid", bhvTTCRotatingSolid, ttc_geo_000240, 0x00000000, 0, MODEL_TTC_ROTATING_CUBE, 0 },
++    { "TTCSpinner", bhvTTCSpinner, ttc_geo_000370, 0x00000000, 0, MODEL_TTC_SPINNER, 0 },
++    { "TTCTreadmill", bhvTTCTreadmill, ttc_geo_0002A8, 0x00000000, 0, MODEL_TTC_SMALL_TREADMILL, 0 },
++    { "Thwomp", bhvThwomp, thwomp_geo, 0x00000000, 1, MODEL_THWOMP, 1 },
++    { "Thwomp2", bhvThwomp2, thwomp_geo, 0x00000000, 1, MODEL_THWOMP, 1 },
++    { "TiltingBowserLavaPlatform", bhvTiltingBowserLavaPlatform, bowser_2_geo_000170, 0x00000000, 0, MODEL_BOWSER_2_TILTING_ARENA, 0 },
++    { "ToadMessage", bhvToadMessage, toad_geo, 0x00000000, 3, MODEL_TOAD, 1 },
++    { "Tower", bhvTower, lll_geo_000A60, 0x00000000, 0, MODEL_LEVEL_GEOMETRY_08, 0 },
++    { "ToxBox", bhvToxBox, ssl_geo_000630, 0x00000000, 1, MODEL_SSL_TOX_BOX, 0 },
++    { "TripletButterfly", bhvTripletButterfly, butterfly_geo, 0x00000000, 3, MODEL_BUTTERFLY, 1 },
++    { "WaterBombCannon", bhvWaterBombCannon, cannon_base_geo, 0x00010000, 1, MODEL_CANNON_BASE, 1 },
++    { "WdwExpressElevator", bhvWdwExpressElevator, wdw_geo_000610, 0x00320000, 0, MODEL_WDW_EXPRESS_ELEVATOR, 0 },
++    { "WdwExpressElevatorPlatform", bhvWdwExpressElevatorPlatform, wdw_geo_000610, 0x00320000, 0, MODEL_WDW_EXPRESS_ELEVATOR, 0 },
++    { "WfRotatingWoodenPlatform", bhvWfRotatingWoodenPlatform, wf_geo_000A58, 0x00000000, 0, MODEL_WF_ROTATING_WOODEN_PLATFORM, 0 },
++    { "WfTumblingBridge", bhvWfTumblingBridge, bitfs_geo_0006F0, 0x00030000, 0, MODEL_BITFS_TUMBLING_PLATFORM, 0 },
++    { "WoodenPost", bhvWoodenPost, wooden_post_geo, 0x00000000, 2, MODEL_WOODEN_POST, 1 },
 +};
 +#define NUM_AUTO ((s32) (sizeof(sAuto) / sizeof(sAuto[0])))
 diff --git a/src/game/interaction.c b/src/game/interaction.c

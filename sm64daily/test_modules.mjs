@@ -294,6 +294,8 @@ async function checkModule(c, k, mod) {
       const onPad = await mario();
       await D('put', p2.x, p2.y + 300, p2.z, p2.yaw);
       let maxY = -1e9; for (let t = 0; t < 30; t++) { await wait(150); maxY = Math.max(maxY, (await mario()).y); }
+      await D('put', p1.x, p1.y + 60, p1.z, p1.yaw); await wait(1200);
+      await c.page.screenshot({ path: '/private/tmp/claude-501/-Users-caseybement-Bemental77-github-io/fe4a0d6b-2c85-4029-a48f-be6ae4f13d51/scratchpad/ground-' + p1.i + '.png' });
       rec(mod, onPad.on === p1.i && maxY > L.y + 40, { standsOnGroundPad: onPad.on === p1.i, padAboveGround: p1.y - (await D('floor', p1.x, p1.y - 30, p1.z, 0)), lift: maxY - p2.y, ledge: L.y - p2.y });
       break;
     }

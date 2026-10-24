@@ -289,7 +289,9 @@
   // Same table and formula as daily.c (sHosts / daily_host_level), so the card can name today's world before boot.
   var HOSTS = ['Castle Grounds', "Bob-omb Battlefield", "Whomp's Fortress", 'Jolly Roger Bay', 'Cool, Cool Mountain', 'Shifting Sand Land',
     'Lethal Lava Land', "Snowman's Land", 'Tall, Tall Mountain', 'Tiny-Huge Island', 'Rainbow Ride',
-    'Bowser in the Dark World', 'Bowser in the Fire Sea', 'Bowser in the Sky', 'Dire, Dire Docks', 'Castle Courtyard'];
+    'Bowser in the Dark World', 'Bowser in the Fire Sea', 'Bowser in the Sky', 'Dire, Dire Docks', 'Castle Courtyard',
+    'Wet-Dry World', "Big Boo's Haunt", "The Princess's Secret Slide", 'Tower of the Wing Cap', 'Vanish Cap under the Moat',
+    'Wing Mario over the Rainbow', "Bowser's Dark World arena", "Bowser's Fire Sea arena", "Bowser's Sky arena"];
   var hostIdx = qs.has('host') ? (+qs.get('host')) % HOSTS.length : ((Math.imul(seed, 2654435761 | 0) >>> 0) >>> 8) % HOSTS.length;
   // Same order as daily.c's MD_* enum.
   var MODULES = [['Hop', '🟦'], ['Moving platform', '🌀'], ['Platform chain', '⚙️'], ['Thwomp', '🪨'], ['Pendulum', '🕰️'],
