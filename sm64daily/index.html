@@ -296,11 +296,15 @@
     ['Fire bars', '🔥'], ['Long jump', '🏃'], ['Backflip ledge', '🤸'], ['Triple jump', '⏫'], ['Wall kick', '🧱'], ['Pole climb', '🎋'], ['Slide', '🛝'],
     ['Enemy arena', '👊'], ['Amp bridge', '⚡'], ['Cannon', '💣'], ['Switch bridge', '🟪'], ['Shell surf', '🐢'], ['Vanish cap', '👻'],
     ['Metal cap', '🔩'], ['Wing cap', '🪽'], ['Monkey bars', '🐒'], ['Quicksand', '⏳'], ['Ice floes', '🧊'], ['Crosswind', '🌬️'],
-    ['Updraft', '🌪️'], ['Pool dive', '🏊'], ['Poison gas', '☠️']];
+    ['Updraft', '🌪️'], ['Pool dive', '🏊'], ['Poison gas', '☠️'], ['Boss arena', '👑']];
   // The challenge, rolled from the seed — same formula as daily.c mode_for_seed.
   var MODES = [['Race to the Star', 'Reach the <b>Power Star</b>.'], ['Red Coin Hunt', 'Find all <b>8 red coins</b>, then reach the star.'],
-    ['Clear the Enemies', 'Beat <b>every enemy</b> on the course, then reach the star.'], ['Coin Rush', 'Collect <b>coins</b> until the star unlocks.']];
-  var MODE = (function () { var r = ((Math.imul(seed ^ 0x5BD1E995, 0x85EBCA6B | 0) >>> 0) >>> 9) % 100; return r < 34 ? 0 : r < 58 ? 1 : r < 80 ? 2 : 3; })();
+    ['Clear the Enemies', 'Beat <b>every enemy</b> on the course, then reach the star.'], ['Coin Rush', 'Collect <b>coins</b> until the star unlocks.'],
+    ['Boss Battle', 'Fight through to the arena and beat the <b>boss</b> — its star ends the run.']];
+  var MODE = (function () { var r = ((Math.imul(seed ^ 0x5BD1E995, 0x85EBCA6B | 0) >>> 0) >>> 9) % 100; return r < 28 ? 0 : r < 46 ? 1 : r < 62 ? 2 : r < 76 ? 3 : 4; })();
+  // Which boss, on a Boss Battle — same formula as daily.c (generate: sBoss).
+  var BOSSES = ['King Bob-omb', 'King Whomp', 'Big Bully', 'Wiggler', 'Big Boo'];
+  var BOSS = MODE === 4 ? ((Math.imul(seed ^ 0x27D4EB2F, 0x165667B1) >>> 0) >>> 13) % BOSSES.length : -1;
   // Same order as daily.c's sTracks (one per day, rotating).
   var TRACKS = ['Slider', 'Bob-omb Battlefield', 'Koopa Road', 'Dire, Dire Docks', 'Wing Cap', 'Lethal Lava Land', 'Snow Mountain', 'Koopa the Quick',
     'Hazy Maze Cave', 'Metal Cap', "Big Boo's Haunt", 'File Select', "Koopa's Theme", 'Merry-Go-Round', 'Boss Battle', 'Ultimate Koopa'];
@@ -678,7 +682,7 @@
     var s = load(), d = s.days[KEY];
     card('<div class="eyebrow">' + esc(TITLE) + (WORD ? '' : ' · ' + esc(prettyDate(today))) + (pastDay ? ' · past day' : '') + '</div>'
       + '<h1>' + esc(HOSTS[hostIdx]) + '</h1>'
-      + '<div class="chips"><span class="chip mode">' + MODES[MODE][0] + '</span><span class="chip ' + DIFF.toLowerCase() + '">' + DIFF + '</span><span class="chip">♪ ' + esc(track) + '</span><span class="chip">~2 min</span></div>'
+      + '<div class="chips"><span class="chip mode">' + MODES[MODE][0] + (BOSS >= 0 ? ': ' + BOSSES[BOSS] : '') + '</span><span class="chip ' + DIFF.toLowerCase() + '">' + DIFF + '</span><span class="chip">♪ ' + esc(track) + '</span><span class="chip">~2 min</span></div>'
       + (ghost ? '<div class="ghostbar">👻 <b>Racing ' + (ghostName ? esc(ghostName) + '\'s' : 'a friend\'s') + ' ghost</b>' + (ghostFrames ? ' (' + fmt(ghostFrames) + ')' : '') + ' — the white shadow.</div>' : '')
       + dayStrip(s)
       + '<p class="lede">' + MODES[MODE][1] + ' <span class="g">Green</span> platforms are checkpoints.</p>'

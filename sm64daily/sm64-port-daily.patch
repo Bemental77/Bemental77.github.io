@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index cfac1e8..7ac89fb 100644
+index cfac1e8..8971a66 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -170,7 +170,7 @@ endif
@@ -24,7 +24,7 @@ index cfac1e8..7ac89fb 100644
  ifeq ($(TARGET_WEB),1)
    PLATFORM_CFLAGS  := -DTARGET_WEB
 -  PLATFORM_LDFLAGS := -lm -no-pie -s TOTAL_MEMORY=20MB -g4 --source-map-base http://localhost:8080/ -s "EXTRA_EXPORTED_RUNTIME_METHODS=['callMain']"
-+  PLATFORM_LDFLAGS := -lm -sTOTAL_MEMORY=128MB -sEXPORTED_RUNTIME_METHODS=callMain,HEAP16,HEAPU8 -sEXPORTED_FUNCTIONS=_main,_daily_restart,_daily_debug_warp,_daily_debug_mario_y,_daily_debug_standing,_daily_debug_inside,_daily_debug_gen,_daily_debug_gen_info,_daily_debug_track,_daily_debug_mode,_daily_debug_modules,_daily_debug_objective,_daily_debug_dyn_count,_daily_debug_dyn_warp,_daily_debug_defeat_all,_daily_debug_cannon,_daily_debug_next_station,_daily_debug_part_of_cannon,_daily_debug_mod_info,_daily_debug_num_parts,_daily_debug_part,_daily_debug_put,_daily_debug_mario,_daily_debug_cap,_daily_debug_camyaw,_daily_debug_action,_daily_debug_dyn,_daily_debug_num_dyn,_daily_set_pad,_daily_set_volume,_daily_pause,_daily_set_ghost,_daily_rec_ptr,_daily_rec_count,_malloc,_free
++  PLATFORM_LDFLAGS := -lm -sTOTAL_MEMORY=128MB -sEXPORTED_RUNTIME_METHODS=callMain,HEAP16,HEAPU8 -sEXPORTED_FUNCTIONS=_main,_daily_restart,_daily_debug_warp,_daily_debug_mario_y,_daily_debug_standing,_daily_debug_inside,_daily_debug_gen,_daily_debug_gen_info,_daily_debug_track,_daily_debug_mode,_daily_debug_modules,_daily_debug_objective,_daily_debug_dyn_count,_daily_debug_dyn_warp,_daily_debug_defeat_all,_daily_debug_cannon,_daily_debug_next_station,_daily_debug_part_of_cannon,_daily_debug_mod_info,_daily_debug_num_parts,_daily_debug_part,_daily_debug_put,_daily_debug_mario,_daily_debug_cap,_daily_debug_camyaw,_daily_debug_floor,_daily_debug_action,_daily_debug_dyn,_daily_debug_num_dyn,_daily_debug_dyn_move,_daily_debug_star,_daily_set_pad,_daily_set_volume,_daily_pause,_daily_set_ghost,_daily_rec_ptr,_daily_rec_count,_malloc,_free
  endif
  
  PLATFORM_CFLAGS += -DNO_SEGMENTED_MEMORY -DUSE_SYSTEM_MALLOC
@@ -142,12 +142,65 @@ index 91c2f03..c20b3ce 100644
      if (seqChannel->seqPlayer->muted && (seqChannel->muteBehavior & MUTE_BEHAVIOR_SOFTEN) != 0) {
          channelVolume *= seqChannel->seqPlayer->muteVolumeScale;
      }
+diff --git a/src/game/behavior_actions.c b/src/game/behavior_actions.c
+index a42849a..a53ca25 100644
+--- a/src/game/behavior_actions.c
++++ b/src/game/behavior_actions.c
+@@ -19,6 +19,7 @@
+ #include "game_init.h"
+ #include "ingame_menu.h"
+ #include "interaction.h"
++#include "daily.h"
+ #include "level_misc_macros.h"
+ #include "level_table.h"
+ #include "level_update.h"
+diff --git a/src/game/behaviors/bully.inc.c b/src/game/behaviors/bully.inc.c
+index 21c561a..1f4ed05 100644
+--- a/src/game/behaviors/bully.inc.c
++++ b/src/game/behaviors/bully.inc.c
+@@ -207,6 +207,7 @@ void bully_act_level_death(void) {
+                 spawn_default_star(130.0f, 1600.0f, -4335.0f);
+             else {
+                 spawn_default_star(0, 950.0f, -6800.0f);
++                if (!daily_active()) // SM64 DAILY PARKOUR: no Lethal Lava Land bridge on a course
+                 spawn_object_abs_with_rot(o, 0, MODEL_NONE, bhvLllTumblingBridge, 0, 154, -5631, 0, 0,
+                                           0);
+             }
+diff --git a/src/game/behaviors/cannon.inc.c b/src/game/behaviors/cannon.inc.c
+index 6a18f18..17f8168 100644
+--- a/src/game/behaviors/cannon.inc.c
++++ b/src/game/behaviors/cannon.inc.c
+@@ -31,7 +31,11 @@ void opened_cannon_act_0(void) {
+             o->oInteractStatus = 0;
+     } else {
+         cur_obj_become_intangible();
+-        cur_obj_disable_rendering();
++        // SM64 DAILY PARKOUR: in a level the cannon hides in its hole until Mario is near; on a
++        // course it sits on a platform in plain sight, so keep drawing it.
++        if (!daily_active()) {
++            cur_obj_disable_rendering();
++        }
+         o->oCannonUnk10C = 0;
+     }
+ }
+diff --git a/src/game/behaviors/spawn_star.inc.c b/src/game/behaviors/spawn_star.inc.c
+index b48c3e4..3909f09 100644
+--- a/src/game/behaviors/spawn_star.inc.c
++++ b/src/game/behaviors/spawn_star.inc.c
+@@ -110,6 +110,7 @@ void bhv_star_spawn_loop(void) {
+ }
+ 
+ struct Object *spawn_star(struct Object *sp30, f32 sp34, f32 sp38, f32 sp3C) {
++    daily_star_target(&sp34, &sp38, &sp3C);   // SM64 DAILY PARKOUR: a boss's star flies to its arena
+     sp30 = spawn_object_abs_with_rot(o, 0, MODEL_STAR, bhvStarSpawnCoordinates, o->oPosX, o->oPosY,
+                                      o->oPosZ, 0, 0, 0);
+     sp30->oBehParams = o->oBehParams;
 diff --git a/src/game/daily.c b/src/game/daily.c
 new file mode 100644
-index 0000000..b85a39f
+index 0000000..c0f09ba
 --- /dev/null
 +++ b/src/game/daily.c
-@@ -0,0 +1,1791 @@
+@@ -0,0 +1,1886 @@
 +// SM64 DAILY PARKOUR
 +//
 +// The page hands this module a seed (window.sm64DailySeed: the date, or a
@@ -222,6 +275,11 @@ index 0000000..b85a39f
 +#include "levels/bitdw/header.h"
 +#include "levels/bits/header.h"
 +#include "levels/wf/header.h"
++#include "actors/group2.h"
++#include "actors/group3.h"
++#include "actors/group9.h"
++#include "actors/group11.h"
++#include "actors/group14.h"
 +
 +#ifdef TARGET_WEB
 +#include <emscripten.h>
@@ -472,7 +530,7 @@ index 0000000..b85a39f
 +
 +// ── things that come and go: enemies, coins, item boxes, timed boxes ───────
 +// Respawned for every run (begin_run), so a restart is a clean slate.
-+enum { DK_GOOMBA, DK_GOOMBA_BIG, DK_BOBOMB, DK_CHUCKYA, DK_FLYGUY, DK_AMP, DK_REDCOIN, DK_COIN, DK_CAPBOX, DK_HIDDEN, DK_COUNT };
++enum { DK_GOOMBA, DK_GOOMBA_BIG, DK_BOBOMB, DK_CHUCKYA, DK_FLYGUY, DK_AMP, DK_REDCOIN, DK_COIN, DK_CAPBOX, DK_HIDDEN, DK_BOSS, DK_COUNT };
 +struct Dyn {
 +    f32 x, y, z;
 +    s16 yaw, part;
@@ -492,8 +550,25 @@ index 0000000..b85a39f
 +    d->kind = kind; d->x = x; d->y = y; d->z = z; d->part = (s16) part; d->yaw = (s16) (rnd_u32() & 0xFFFF);
 +    return d;
 +}
++// ── bosses ──────────────────────────────────────────────────────────────────
++// One per Boss Battle course, on an arena at the end. Their models share slots (King Bob-omb and
++// the small Bully are both 0x56 — include/model_ids.h), so only the day's boss is loaded; the
++// host's objects are gone, so the slots are free. Their stars fly to their home level's
++// coordinates; spawn_star asks daily_star_target for the arena instead.
++enum { BOSS_KING_BOBOMB, BOSS_KING_WHOMP, BOSS_BIG_BULLY, BOSS_WIGGLER, BOSS_BIG_BOO, BOSS_COUNT };
++struct Boss { const char *name; const BehaviorScript *beh; u8 model; const GeoLayout *geo; u8 model2; const GeoLayout *geo2; u32 bp; };
++static const struct Boss sBosses[BOSS_COUNT] = {
++    { "KING BOB-OMB", bhvKingBobomb,    MODEL_KING_BOBOMB,  king_bobomb_geo,  0, NULL, 0 },
++    { "KING WHOMP",   bhvWhompKingBoss, MODEL_WHOMP,        whomp_geo,        0, NULL, 0 },
++    { "BIG BULLY",    bhvBigBully,      MODEL_BULLY_BOSS,   bully_boss_geo,   0, NULL, 0 },
++    { "WIGGLER",      bhvWigglerHead,   MODEL_WIGGLER_HEAD, wiggler_head_geo, MODEL_WIGGLER_BODY, wiggler_body_geo, 0 },
++    { "BIG BOO",      bhvBalconyBigBoo, MODEL_BOO,          boo_geo,          0, NULL, 0 },
++};
++static s32 sBoss = -1, sArena = -1;
++
 +static const BehaviorScript *dyn_beh(u8 k) {
 +    switch (k) {
++        case DK_BOSS:    return sBosses[sBoss].beh;
 +        case DK_GOOMBA: case DK_GOOMBA_BIG: return bhvGoomba;
 +        case DK_BOBOMB:  return bhvBobomb;
 +        case DK_CHUCKYA: return bhvChuckya;
@@ -507,6 +582,7 @@ index 0000000..b85a39f
 +}
 +static u32 dyn_model(u8 k) {
 +    switch (k) {
++        case DK_BOSS:    return sBosses[sBoss].model;
 +        case DK_GOOMBA: case DK_GOOMBA_BIG: return MODEL_GOOMBA;
 +        case DK_BOBOMB:  return MODEL_BLACK_BOBOMB;
 +        case DK_CHUCKYA: return MODEL_CHUCKYA;
@@ -522,7 +598,7 @@ index 0000000..b85a39f
 +// Walking enemies need their platform's collision under them, and SM64 only loads an object's
 +// collision while Mario is within its oCollisionDistance (surface_load.c:834). So they are spawned
 +// once Mario comes near their platform, not at the start.
-+static s32 lazy(u8 k) { return k == DK_GOOMBA || k == DK_GOOMBA_BIG || k == DK_BOBOMB || k == DK_CHUCKYA; }
++static s32 lazy(u8 k) { return k == DK_GOOMBA || k == DK_GOOMBA_BIG || k == DK_BOBOMB || k == DK_CHUCKYA || k == DK_BOSS; }
 +#define LAZY_RADIUS 2200.0f
 +
 +// Water and poison-gas regions we add (axis-aligned, like SM64's own: surface_collision.c:589-655).
@@ -668,12 +744,12 @@ index 0000000..b85a39f
 +}
 +
 +// ── the day's challenge ─────────────────────────────────────────────────────
-+enum { MODE_RACE, MODE_RED, MODE_CLEAR, MODE_COINS, MODE_COUNT };
++enum { MODE_RACE, MODE_RED, MODE_CLEAR, MODE_COINS, MODE_BOSS, MODE_COUNT };
 +static s32 sMode, sIslands;
 +// Same formula as the page (index.html daily_mode), so the card can name the challenge before boot.
 +static s32 mode_for_seed(u32 seed) {
 +    u32 h = (seed ^ 0x5BD1E995u) * 0x85EBCA6Bu, r = (h >> 9) % 100;
-+    return r < 34 ? MODE_RACE : r < 58 ? MODE_RED : r < 80 ? MODE_CLEAR : MODE_COINS;
++    return r < 28 ? MODE_RACE : r < 46 ? MODE_RED : r < 62 ? MODE_CLEAR : r < 76 ? MODE_COINS : MODE_BOSS;
 +}
 +
 +// ── modules ─────────────────────────────────────────────────────────────────
@@ -681,11 +757,11 @@ index 0000000..b85a39f
 +enum { MD_HOP, MD_STEPPING, MD_DOUBLE_STEPPING, MD_THWOMP, MD_PENDULUM, MD_FIREBAR, MD_LONG, MD_POWER_STEP,
 +       MD_TRIPLE, MD_WALLKICK, MD_POLE, MD_SLIDE,
 +       MD_ENEMIES, MD_AMPS, MD_CANNON, MD_SWITCH, MD_SHELL, MD_VANISH, MD_METAL, MD_WING, MD_BARS, MD_SAND,
-+       MD_ICE, MD_WIND, MD_UPDRAFT, MD_POOL, MD_GAS, MD_COUNT };
++       MD_ICE, MD_WIND, MD_UPDRAFT, MD_POOL, MD_GAS, MD_BOSS, MD_COUNT };
 +static const f32 sModSeconds[MD_COUNT] = { 2.5f, 5, 8, 6, 6, 7, 4.5f, 4, 6, 9, 12, 5,
-+                                           8, 6, 9, 9, 8, 7, 7, 12, 13, 6, 6, 6, 7, 14, 6 };
++                                           8, 6, 9, 9, 8, 7, 7, 12, 13, 6, 6, 6, 7, 14, 6, 40 };
 +static const f32 sModWeight[MD_COUNT] = { 1.0f, 2.5f, 1.5f, 1, 1, 1, 1, 1, 1, 1, 1, 0.8f,
-+                                          1.2f, 1, 1, 1, 1, 1, 1, 0.8f, 0.8f, 1, 1, 1, 1, 0.8f, 1 };
++                                          1.2f, 1, 1, 1, 1, 1, 1, 0.8f, 0.8f, 1, 1, 1, 1, 0.8f, 1, 0 };   // the boss is placed, never picked
 +
 +static s32 pick_step_piece(void) {
 +    s32 tries;
@@ -1091,6 +1167,24 @@ index 0000000..b85a39f
 +            break;
 +        }
 +
++        case MD_BOSS: {
++            // The arena: big and flat (the bosses pound, sweep and throw). The Big Bully only dies on
++            // lava or a death floor (obj_behaviors.c:708-723), so his arena has a lava moat below it:
++            // knock him off into it. Mario can bounce back out of the lava.
++            struct Dyn *d;
++            n = station(c, h, rnd_f(160, 220), rnd_f(-40, 40), 950.0f, 950.0f);
++            if (!n) break;
++            n->r = 1400.0f;
++            if (sBoss == BOSS_BIG_BULLY) {
++                b = box_at(BK_LAVA, n, 0, 0, n->y - 170.0f, n->hx + 650.0f, n->hz + 650.0f, 60.0f, n->yaw);
++                if (b) b->r = 1;
++            }
++            d = add_dyn(DK_BOSS, n->x, n->y + 60.0f, n->z, (s32) (n - sPart));
++            if (d) { d->bp = sBosses[sBoss].bp; d->yaw = h + 0x8000; d->objective = 1; }
++            sArena = (s32) (n - sPart);
++            break;
++        }
++
 +        case MD_GAS: {
 +            // A poison-gas chamber (like Hazy Maze Cave's): hurry through, it drains health (mario.c:1460-1463).
 +            s16 ha = axis(h);
@@ -1236,7 +1330,7 @@ index 0000000..b85a39f
 +    }
 +    cur = 0;
 +
-+    while (secs < TARGET_SECONDS && sNumParts < MAX_PARTS - 16) {
++    while (secs < (sMode == MODE_BOSS ? TARGET_SECONDS * 0.6f : TARGET_SECONDS) && sNumParts < MAX_PARTS - 16) {
 +        s32 got = -1, partsBefore = sNumParts, dynBefore = sNumDyn;
 +        for (tries = 0; tries < 250 && got < 0; tries++) {
 +            f32 w[MD_COUNT], sum = 0, r;
@@ -1275,6 +1369,21 @@ index 0000000..b85a39f
 +        cur = got;
 +        if (++sinceCheck >= 3) { sPart[cur].check = 1; sinceCheck = 0; }
 +    }
++    if (sMode == MODE_BOSS) {
++        // The finale: the boss arena. Its star ends the run.
++        s32 got = -1, partsBefore = sNumParts, dynBefore = sNumDyn;
++        sArena = -1;
++        for (tries = 0; tries < 300 && got < 0; tries++) {
++            s16 h = tries < 100 ? sPart[cur].yaw + (s16) rnd_f(-0x3000, 0x3000) : (s16) (rnd_u32() & 0xFFFF);
++            got = build_module(MD_BOSS, cur, h, hard);
++        }
++        if (got < 0) return 0;
++        sPart[cur].check = 1;   // respawn right before the arena
++        if (sNumMods < 64) { sModFirst[sNumMods] = cur; sModLand[sNumMods] = got; sModStart[sNumMods] = partsBefore; sModDynStart[sNumMods] = dynBefore;
++                             sMods[sNumMods++] = MD_BOSS; sModStart[sNumMods] = sNumParts; sModDynStart[sNumMods] = sNumDyn; }
++        secs += sModSeconds[MD_BOSS];
++        cur = got;
++    }
 +    sGoal = cur;
 +    sPart[cur].goal = 1; sPart[cur].check = 0; sPart[cur].fk = 0;
 +    sPart[cur].hx = DMAX(sPart[cur].hx, 280.0f); sPart[cur].hz = DMAX(sPart[cur].hz, 280.0f);
@@ -1305,6 +1414,7 @@ index 0000000..b85a39f
 +static void generate(u32 seed, s32 dow) {
 +    u32 k, h = (seed ^ 0x27D4EB2Fu) * 0x165667B1u;
 +    sMode = mode_for_seed(seed);
++    sBoss = sMode == MODE_BOSS ? (s32) ((h >> 13) % BOSS_COUNT) : -1;
 +    sTheme = (s32) ((h >> 11) % NUM_THEMES);
 +    sStyle = ((h >> 5) & 3) == 0 ? STYLE_CHECKER : STYLE_BOX;
 +    sIslands = ((h >> 17) % 5) == 0;
@@ -1516,7 +1626,7 @@ index 0000000..b85a39f
 +    o->oFaceAngleYaw += (o->oBehParams & 0x200) ? 0x500 : 0x300;
 +    // The goal star: see-through until the challenge is done, then gone into Mario's hands.
 +    if (o->oBehParams & 0x200) {
-+        if (sFinished) { o->header.gfx.node.flags &= ~GRAPH_RENDER_ACTIVE; return; }
++        if (sFinished || sMode == MODE_BOSS) { o->header.gfx.node.flags &= ~GRAPH_RENDER_ACTIVE; return; }
 +        o->header.gfx.node.flags |= GRAPH_RENDER_ACTIVE;
 +        o->header.gfx.sharedChild = gLoadedGraphNodes[sUnlocked ? MODEL_GOAL_STAR : MODEL_CHECK_STAR];
 +        return;
@@ -1637,8 +1747,15 @@ index 0000000..b85a39f
 +        case 0: return (s32) m->pos[0]; case 1: return (s32) m->pos[1]; case 2: return (s32) m->pos[2];
 +        case 3: return (s32) m->action; case 4: return m->health; case 5: return (s32) m->flags;
 +        case 6: return m->floor ? m->floor->type : -1; case 7: return (s32) m->forwardVel; case 8: return (s32) (m->quicksandDepth);
-+        case 9: return m->numCoins; default: return m->floor && m->floor->object ? (s32) (m->floor->object->oBehParams & 0xFF) : -1;
++        case 9: return m->numCoins; case 11: return (s32) m->floorHeight; default: return m->floor && m->floor->object ? (s32) (m->floor->object->oBehParams & 0xFF) : -1;
 +    }
++}
++// Test hook: the floor under (x, y, z): f 0 = height, 1 = type, 2 = is one of our objects.
++s32 daily_debug_floor(s32 x, s32 y, s32 z, s32 f) {
++    struct Surface *fl;
++    f32 h = find_floor(x, y, z, &fl);
++    if (fl == NULL) return -99999;
++    return f == 0 ? (s32) h : f == 1 ? fl->type : fl->object != NULL;
 +}
 +s32 daily_debug_camyaw(void) { return gMarioState->area->camera->yaw; }   // intendedYaw = atan2s(-stickY, stickX) + this (mario.c)
 +void daily_debug_cap(s32 flag) {
@@ -1660,6 +1777,15 @@ index 0000000..b85a39f
 +    }
 +}
 +s32 daily_debug_num_dyn(void) { return sNumDyn; }
++void daily_debug_dyn_move(s32 i, s32 x, s32 y, s32 z) {
++    if (i >= 0 && i < sNumDyn && dyn_alive(&sDyn[i])) { sDyn[i].obj->oPosX = x; sDyn[i].obj->oPosY = y; sDyn[i].obj->oPosZ = z; }
++}
++// Test hook: is any star (a boss's flying star, or a collectable one) out, and where.
++s32 daily_debug_star(s32 f) {
++    struct Object *st = cur_obj_nearest_object_with_behavior(bhvStarSpawnCoordinates);
++    if (st == NULL) return -99999;
++    return f == 0 ? (s32) st->oPosX : f == 1 ? (s32) st->oPosY : f == 2 ? (s32) st->oPosZ : f == 3 ? (s32) st->oHomeY : (s32) st->oAction;
++}
 +void daily_debug_action(s32 act, s32 fwd) { set_mario_action(gMarioState, (u32) act, 0); gMarioState->forwardVel = fwd; }
 +
 +// Test hook (exported): is Mario's x/z inside station n's footprint (in its own rotated frame)?
@@ -1798,6 +1924,11 @@ index 0000000..b85a39f
 +    return TRUE;
 +}
 +s32 daily_active(void) { return sInited && gCurrLevelNum == sHosts[sHostIdx]; }
++// Called by spawn_star (spawn_star.inc.c): a boss's star flies to the arena, not to its home level's spot.
++void daily_star_target(f32 *x, f32 *y, f32 *z) {
++    if (!daily_active() || sArena < 0) return;
++    *x = sPart[sArena].x; *y = sPart[sArena].y + 260.0f; *z = sPart[sArena].z;
++}
 +
 +static s32 in_our_env(f32 x, f32 z) {
 +    s32 i;
@@ -1808,6 +1939,7 @@ index 0000000..b85a39f
 +void daily_update(void) {
 +    struct MarioState *m = gMarioState;
 +    s32 i, on, lowest, left;
++    f32 reach;
 +
 +    if (gCurrLevelNum != sHosts[sHostIdx] || gMarioObject == NULL || gCurrentArea == NULL) {
 +        sInited = FALSE;
@@ -1827,6 +1959,10 @@ index 0000000..b85a39f
 +        clear_host_objects();
 +        load_all_models();
 +        generate(seed, dow);
++        if (sBoss >= 0) {
++            load_model(sBosses[sBoss].model, sBosses[sBoss].geo);
++            if (sBosses[sBoss].geo2) load_model(sBosses[sBoss].model2, sBosses[sBoss].geo2);
++        }
 +        {
 +            const u8 *st = sThemes[sTheme][0], *ac = sThemes[sTheme][1];
 +            for (i = 0; i < 3; i++) { sBoxColor[BK_STATION][i] = st[i]; sBoxColor[BK_WALL][i] = ac[i]; }
@@ -1864,11 +2000,13 @@ index 0000000..b85a39f
 +            continue;
 +        }
 +        if (d->kind == DK_REDCOIN) d->obj->parentObj = sGoalStar;
++        // A boss thrown off into the sky comes back to its arena.
++        if (d->kind == DK_BOSS && d->obj->oPosY < sPart[d->part].y - 1500.0f) { obj_mark_for_deletion(d->obj); spawn_dyn(d); continue; }
 +        // An enemy knocked off the course counts as beaten.
 +        if (is_enemy(d->kind) && d->kind != DK_FLYGUY && d->obj->oPosY < sPart[d->part].y - 700.0f) obj_mark_for_deletion(d->obj);
 +    }
 +    left = objective_left();
-+    if (!sUnlocked && left == 0) {
++    if (!sUnlocked && left == 0 && sMode != MODE_BOSS) {
 +        sUnlocked = TRUE;
 +        play_sound(SOUND_GENERAL2_RIGHT_ANSWER, gGlobalSoundSource);
 +        say(sMode == MODE_RED ? "STAR UNLOCKED" : sMode == MODE_CLEAR ? "ALL CLEAR" : "STAR UNLOCKED", 60);
@@ -1895,8 +2033,8 @@ index 0000000..b85a39f
 +            say("CHECKPOINT", 45);
 +        }
 +        if (on == sGoal) {
-+            if (sUnlocked) finish_run(sGoalStar);
-+            else if (sMsgTimer <= 0) say(sMode == MODE_RED ? "FIND ALL 8 RED COINS" : sMode == MODE_CLEAR ? "BEAT EVERY ENEMY" : "COLLECT MORE COINS", 60);
++            if (sUnlocked && sMode != MODE_BOSS) finish_run(sGoalStar);
++            else if (sMsgTimer <= 0 && sMode != MODE_BOSS) say(sMode == MODE_RED ? "FIND ALL 8 RED COINS" : sMode == MODE_CLEAR ? "BEAT EVERY ENEMY" : "COLLECT MORE COINS", 60);
 +        }
 +    }
 +    // The dance would warp out of the level on its 80th frame (general_star_dance_handler);
@@ -1907,11 +2045,18 @@ index 0000000..b85a39f
 +        report();
 +    }
 +
-+    // Fell: below every station by a margin, or standing on the level's real ground or in its water,
-+    // or died. Respawn on the last checkpoint.
++    // Fell: below every station by a margin, down on the level's own ground far below where he can
++    // climb back from (the level's ground is part of the world, not a death — courses pass over and
++    // across it), into a death plane or the level's water, or died. Respawn on the last checkpoint.
 +    for (lowest = 0, i = 1; i < sNumParts; i++) if (sPart[i].station && sPart[i].y < sPart[lowest].y) lowest = i;
++    {
++        s32 best = 0, k = 0;
++        for (i = 0; i < sNumParts; i++) if (sPart[i].station && k++ == sBest) best = i;
++        reach = DMIN(sPart[sLastCheck].y, sPart[best].y);
++    }
 +    if (!sFinished && (sRespawnReq || m->pos[1] < sPart[lowest].y - 1500.0f
-+                       || (m->floor != NULL && m->floor->object == NULL && m->pos[1] - m->floorHeight < 300.0f)
++                       || (m->floor != NULL && m->floor->object == NULL && !(m->action & ACT_FLAG_AIR)
++                           && m->floorHeight < reach - 600.0f && m->pos[1] - m->floorHeight < 100.0f)
 +                       || (m->floor != NULL && m->floor->object == NULL && (m->floor->type == SURFACE_DEATH_PLANE || m->floor->type == SURFACE_VERTICAL_WIND)
 +                           && m->pos[1] < m->floorHeight + 2048.0f + 400.0f)
 +                       || m->pos[1] < host_water(m->pos[0], m->pos[2]) + 150.0f
@@ -1921,7 +2066,10 @@ index 0000000..b85a39f
 +    }
 +
 +    // HUD: progress or the challenge (the timer is SM64's own), and short flashes.
-+    if (sMode == MODE_RACE) {
++    if (sMode == MODE_BOSS) {
++        print_text(20, 36, "BOSS");
++        print_text(20, 16, sBosses[sBoss].name);
++    } else if (sMode == MODE_RACE) {
 +        print_text(20, 36, "PLAT");
 +        print_text_fmt_int(90, 36, "%d", sBest);
 +        print_text(20, 16, "OF");
@@ -1941,10 +2089,10 @@ index 0000000..b85a39f
 +}
 diff --git a/src/game/daily.h b/src/game/daily.h
 new file mode 100644
-index 0000000..cba4cec
+index 0000000..2a10231
 --- /dev/null
 +++ b/src/game/daily.h
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,58 @@
 +#ifndef DAILY_H
 +#define DAILY_H
 +
@@ -1976,6 +2124,7 @@ index 0000000..cba4cec
 +s32 daily_take_star(struct Object *o);
 +s32 daily_intercept_warp(s32 warpOp);
 +s32 daily_active(void);
++void daily_star_target(f32 *x, f32 *y, f32 *z);
 +s32 daily_debug_mode(void);
 +s32 daily_debug_modules(s32 i);
 +s32 daily_debug_objective(void);
@@ -1992,9 +2141,12 @@ index 0000000..cba4cec
 +s32 daily_debug_mario(s32 f);
 +void daily_debug_cap(s32 flag);
 +s32 daily_debug_camyaw(void);
++s32 daily_debug_floor(s32 x, s32 y, s32 z, s32 f);
 +void daily_debug_action(s32 act, s32 fwd);
 +s32 daily_debug_dyn(s32 i, s32 f);
 +s32 daily_debug_num_dyn(void);
++void daily_debug_dyn_move(s32 i, s32 x, s32 y, s32 z);
++s32 daily_debug_star(s32 f);
 +s32 daily_host_level(void);
 +void daily_debug_warp(s32 i);
 +
@@ -2099,6 +2251,18 @@ index c3da0cb..b04e4e5 100644
  
          if (m->floor->type == SURFACE_VERTICAL_WIND && -3000.0f < offsetY && offsetY < 2000.0f) {
              if (offsetY >= 0.0f) {
+diff --git a/src/game/obj_behaviors.c b/src/game/obj_behaviors.c
+index fdfc70f..8c7acb8 100644
+--- a/src/game/obj_behaviors.c
++++ b/src/game/obj_behaviors.c
+@@ -25,6 +25,7 @@
+ #include "mario_misc.h"
+ #include "memory.h"
+ #include "obj_behaviors.h"
++#include "daily.h"
+ #include "object_helpers.h"
+ #include "object_list_processor.h"
+ #include "rendering_graph_node.h"
 diff --git a/src/menu/title_screen.c b/src/menu/title_screen.c
 index 071714f..fa989d9 100644
 --- a/src/menu/title_screen.c
