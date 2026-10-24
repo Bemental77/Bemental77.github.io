@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index cfac1e8..8971a66 100644
+index cfac1e8..22b5a40 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -170,7 +170,7 @@ endif
@@ -24,7 +24,7 @@ index cfac1e8..8971a66 100644
  ifeq ($(TARGET_WEB),1)
    PLATFORM_CFLAGS  := -DTARGET_WEB
 -  PLATFORM_LDFLAGS := -lm -no-pie -s TOTAL_MEMORY=20MB -g4 --source-map-base http://localhost:8080/ -s "EXTRA_EXPORTED_RUNTIME_METHODS=['callMain']"
-+  PLATFORM_LDFLAGS := -lm -sTOTAL_MEMORY=128MB -sEXPORTED_RUNTIME_METHODS=callMain,HEAP16,HEAPU8 -sEXPORTED_FUNCTIONS=_main,_daily_restart,_daily_debug_warp,_daily_debug_mario_y,_daily_debug_standing,_daily_debug_inside,_daily_debug_gen,_daily_debug_gen_info,_daily_debug_track,_daily_debug_mode,_daily_debug_modules,_daily_debug_objective,_daily_debug_dyn_count,_daily_debug_dyn_warp,_daily_debug_defeat_all,_daily_debug_cannon,_daily_debug_next_station,_daily_debug_part_of_cannon,_daily_debug_mod_info,_daily_debug_num_parts,_daily_debug_part,_daily_debug_put,_daily_debug_mario,_daily_debug_cap,_daily_debug_camyaw,_daily_debug_floor,_daily_debug_action,_daily_debug_dyn,_daily_debug_num_dyn,_daily_debug_dyn_move,_daily_debug_star,_daily_set_pad,_daily_set_volume,_daily_pause,_daily_set_ghost,_daily_rec_ptr,_daily_rec_count,_malloc,_free
++  PLATFORM_LDFLAGS := -lm -sTOTAL_MEMORY=128MB -sEXPORTED_RUNTIME_METHODS=callMain,HEAP16,HEAPU8 -sEXPORTED_FUNCTIONS=_main,_daily_restart,_daily_debug_warp,_daily_debug_mario_y,_daily_debug_standing,_daily_debug_inside,_daily_debug_gen,_daily_debug_gen_info,_daily_debug_track,_daily_debug_mode,_daily_debug_auto,_daily_debug_modules,_daily_debug_objective,_daily_debug_dyn_count,_daily_debug_dyn_warp,_daily_debug_defeat_all,_daily_debug_cannon,_daily_debug_next_station,_daily_debug_part_of_cannon,_daily_debug_mod_info,_daily_debug_num_parts,_daily_debug_part,_daily_debug_put,_daily_debug_mario,_daily_debug_cap,_daily_debug_camyaw,_daily_debug_floor,_daily_debug_action,_daily_debug_dyn,_daily_debug_num_dyn,_daily_debug_dyn_move,_daily_debug_star,_daily_set_pad,_daily_set_volume,_daily_pause,_daily_set_ghost,_daily_rec_ptr,_daily_rec_count,_malloc,_free
  endif
  
  PLATFORM_CFLAGS += -DNO_SEGMENTED_MEMORY -DUSE_SYSTEM_MALLOC
@@ -197,10 +197,10 @@ index b48c3e4..3909f09 100644
      sp30->oBehParams = o->oBehParams;
 diff --git a/src/game/daily.c b/src/game/daily.c
 new file mode 100644
-index 0000000..c0f09ba
+index 0000000..20a9ce7
 --- /dev/null
 +++ b/src/game/daily.c
-@@ -0,0 +1,1886 @@
+@@ -0,0 +1,2220 @@
 +// SM64 DAILY PARKOUR
 +//
 +// The page hands this module a seed (window.sm64DailySeed: the date, or a
@@ -275,7 +275,13 @@ index 0000000..c0f09ba
 +#include "levels/bitdw/header.h"
 +#include "levels/bits/header.h"
 +#include "levels/wf/header.h"
++#include "actors/group1.h"
 +#include "actors/group2.h"
++#include "actors/group5.h"
++#include "actors/group7.h"
++#include "actors/group13.h"
++#include "actors/group17.h"
++#include "levels/bbh/header.h"
 +#include "actors/group3.h"
 +#include "actors/group9.h"
 +#include "actors/group11.h"
@@ -433,7 +439,7 @@ index 0000000..c0f09ba
 +// ── SM64's own platform pieces ──────────────────────────────────────────────
 +// Each is loaded into a free model slot and spawned with its real behavior. `col` is the
 +// collision the behavior uses for that behParam — read here only to measure the piece.
-+enum { R_STEP, R_LONGSTEP, R_HAZ_THWOMP, R_HAZ_PENDULUM, R_HAZ_FIREBAR };
++enum { R_STEP, R_LONGSTEP, R_HAZ_THWOMP, R_HAZ_PENDULUM, R_HAZ_FIREBAR, R_HAZ_ANY };
 +struct Piece {
 +    const char *name;
 +    const BehaviorScript *beh;
@@ -444,7 +450,9 @@ index 0000000..c0f09ba
 +    f32 minY, maxY, rx, rz, r;   // measured from `col`
 +};
 +#define PM(n) (0xE2 + (n))      // 0xE2..0xEF unused by any level (include/model_ids.h)
-+static struct Piece sPiece[] = {
++#include "daily_lib.inc.h"
++#define MAX_PIECES 96
++static struct Piece sPiece[MAX_PIECES] = {
 +    { "LLL HEXAGON",     bhvLllRotatingHexagonalPlatform, lll_geo_000A78,   lll_seg7_collision_hexagonal_platform, 0,          R_STEP,     PM(0) },
 +    { "LLL ROCK",        bhvLllSinkingRockBlock,          lll_geo_000DD0,   lll_seg7_collision_floating_block,     0,          R_STEP,     PM(1) },
 +    { "BITFS SINKER",    bhvBitfsSinkingPlatforms,        bitfs_geo_000770, bitfs_seg7_collision_sinking_platform, 0,          R_STEP,     PM(2) },
@@ -459,8 +467,18 @@ index 0000000..c0f09ba
 +    { "RR BRIDGE",       bhvRrRotatingBridgePlatform,     rr_geo_000878,    rr_seg7_collision_rotating_platform_with_fire, 0x00010000, R_LONGSTEP, PM(11) },
 +    { "THWOMP",          bhvThwomp,                       thwomp_geo,       thwomp_seg5_collision_0500B7D0,        0,          R_HAZ_THWOMP,   PM(12) },
 +    { "TTC PENDULUM",    bhvTTCPendulum,                  ttc_geo_000270,   ttc_seg7_collision_clock_pendulum,     0,          R_HAZ_PENDULUM, PM(13) },
++    { "TTC COG",         bhvTTCCog,                       ttc_geo_0002E0,   ttc_seg7_collision_07015584,           0,          R_STEP,     PM(14) },
++    { "TTC ELEVATOR",    bhvTTCElevator,                  ttc_geo_000340,   ttc_seg7_collision_clock_platform,     0x00030000, R_STEP,     PM(15) },
++    { "BBH TILT FLOOR",  bhvBbhTiltingTrapPlatform,       geo_bbh_0005C8,   bbh_seg7_collision_tilt_floor_platform, 0,         R_STEP,     PM(16) },
++    { "BITFS CAGE",      bhvBitfsSinkingCagePlatform,     bitfs_geo_000690, bitfs_seg7_collision_sinking_cage_platform, 0,     R_STEP,     PM(17) },
++    { "RR SWING",        bhvSwingPlatform,                rr_geo_000860,    rr_seg7_collision_pendulum,            0,          R_STEP,     PM(18) },
++    { "WF ROTATOR",      bhvWfRotatingWoodenPlatform,     wf_geo_000A58,    wf_seg7_collision_clocklike_rotation,  0,          R_LONGSTEP, PM(19) },
++    { "LLL TILT PYRAMID",bhvLllTiltingInvertedPyramid,    lll_geo_000BF8,   lll_seg7_collision_inverted_pyramid,   0,          R_STEP,     PM(20) },
++    { "LLL SLOW TILT",   bhvLllSinkingRectangularPlatform, lll_geo_000BC8,  lll_seg7_collision_slow_tilting_platform, 0,       R_LONGSTEP, PM(21) },
 +};
-+#define NUM_PIECES (s32) (sizeof(sPiece) / sizeof(sPiece[0]))
++#define NUM_BUILTIN_PIECES 22
++static s32 sNumPieces = NUM_BUILTIN_PIECES;
++#define NUM_PIECES sNumPieces
 +#define MODEL_FIREBAR_BLOCK 0xF9
 +#define MODEL_GIANT_POLE    0xFA
 +#define MODEL_GOAL_STAR     0xFB
@@ -492,13 +510,22 @@ index 0000000..c0f09ba
 +    p->rx = mx; p->rz = mz; p->r = mr;
 +}
 +
++// The collision a behaviour script loads itself: LOAD_COLLISION_DATA is the word BC_B(0x2A) and a
++// pointer (data/behavior_data.c:261-263), before the script's loop starts (BEGIN_LOOP, 0x08).
++static const Collision *beh_collision(const BehaviorScript *beh) {
++    const uintptr_t *w = (const uintptr_t *) segmented_to_virtual((void *) beh);
++    s32 i;
++    for (i = 0; i < 48; i++) {
++        if (w[i] == ((uintptr_t) 0x2A << 24)) return (const Collision *) segmented_to_virtual((void *) w[i + 1]);
++        if (w[i] == ((uintptr_t) 0x08 << 24)) break;
++    }
++    return NULL;
++}
++
 +static void load_all_models(void) {
 +    s32 i;
 +    sPool = alloc_only_pool_init();   // USE_SYSTEM_MALLOC build: grows with malloc (memory.c:500)
-+    for (i = 0; i < NUM_PIECES; i++) {
-+        load_model(sPiece[i].model, sPiece[i].geo);
-+        measure(&sPiece[i]);
-+    }
++    for (i = 0; i < NUM_PIECES; i++) load_model(sPiece[i].model, sPiece[i].geo);
 +    load_model(MODEL_FIREBAR_BLOCK, lll_geo_000B38);
 +    load_model(MODEL_GIANT_POLE, wf_geo_000AE0);
 +    load_model(MODEL_CHECKER, sCheckerGeo);
@@ -517,7 +544,7 @@ index 0000000..c0f09ba
 +    f32 hx, hz, h;      // stations/boxes: half width (local x), half length (local z), height
 +    f32 r;              // footprint radius (for spacing)
 +    s16 yaw, pitch, force, param;
-+    u8 type, box, fk, piece, station, check, goal, kind;
++    u8 type, box, fk, piece, station, check, goal, kind, gnd;
 +    struct Object *obj;
 +};
 +static struct Part sPart[MAX_PARTS];
@@ -530,12 +557,13 @@ index 0000000..c0f09ba
 +
 +// ── things that come and go: enemies, coins, item boxes, timed boxes ───────
 +// Respawned for every run (begin_run), so a restart is a clean slate.
-+enum { DK_GOOMBA, DK_GOOMBA_BIG, DK_BOBOMB, DK_CHUCKYA, DK_FLYGUY, DK_AMP, DK_REDCOIN, DK_COIN, DK_CAPBOX, DK_HIDDEN, DK_BOSS, DK_COUNT };
++enum { DK_GOOMBA, DK_GOOMBA_BIG, DK_BOBOMB, DK_CHUCKYA, DK_FLYGUY, DK_AMP, DK_REDCOIN, DK_COIN, DK_CAPBOX, DK_HIDDEN, DK_BOSS,
++       DK_LIB, DK_BREAKBOX, DK_METALBOX, DK_BLUESWITCH, DK_BLUECOIN, DK_KICKBOARD, DK_COUNT };
 +struct Dyn {
 +    f32 x, y, z;
 +    s16 yaw, part;
 +    u32 bp;
-+    u8 kind, objective, spawned;
++    u8 kind, objective, spawned, lib;
 +    s32 gone;
 +    struct Object *obj;
 +};
@@ -550,6 +578,49 @@ index 0000000..c0f09ba
 +    d->kind = kind; d->x = x; d->y = y; d->z = z; d->part = (s16) part; d->yaw = (s16) (rnd_u32() & 0xFFFF);
 +    return d;
 +}
++// ── the enemy library ───────────────────────────────────────────────────────
++// Every SM64 level loads the global set (Goomba, Bob-omb, Chuckya, Fly Guy, Amp...) plus one enemy
++// group from each of two families: script_func_global_2..12 and 13..18 (levels/scripts.c; e.g. BoB
++// loads 4 + 15, LLL 3 + 18). Groups in a family share model slots, so a course rolls one of each,
++// as a level does — a different cast per seed, never a slot conflict.
++struct LibEnemy {
++    const char *name; const BehaviorScript *beh; u8 model; const GeoLayout *geo;
++    u8 model2; const GeoLayout *geo2; u8 model3; const GeoLayout *geo3;
++    u32 bp; u8 group, ground, killable;
++};
++static const struct LibEnemy sLib[] = {
++    { "GOOMBA",       bhvGoomba,           MODEL_GOOMBA,             NULL, 0, NULL, 0, NULL, 0,          1, 1, 1 },
++    { "BIG GOOMBA",   bhvGoomba,           MODEL_GOOMBA,             NULL, 0, NULL, 0, NULL, 0x00010000, 1, 1, 1 },
++    { "BOB-OMB",      bhvBobomb,           MODEL_BLACK_BOBOMB,       NULL, 0, NULL, 0, NULL, 0,          1, 1, 1 },
++    { "CHUCKYA",      bhvChuckya,          MODEL_CHUCKYA,            NULL, 0, NULL, 0, NULL, 0,          1, 1, 1 },
++    { "FLY GUY",      bhvFlyGuy,           MODEL_FLYGUY,             NULL, 0, NULL, 0, NULL, 0,          1, 0, 1 },
++    { "HOMING AMP",   bhvHomingAmp,        MODEL_AMP,                NULL, 0, NULL, 0, NULL, 0,          1, 0, 0 },
++    { "HEAVE-HO",     bhvHeaveHo,          MODEL_HEAVE_HO,           heave_ho_geo, 0, NULL, 0, NULL, 0,  2, 1, 0 },
++    { "BULLET BILL",  bhvBulletBill,       MODEL_BULLET_BILL,        bullet_bill_geo, 0, NULL, 0, NULL, 0, 2, 0, 0 },
++    { "BULLY",        bhvSmallBully,       MODEL_BULLY,              bully_geo, 0, NULL, 0, NULL, 0,     3, 1, 1 },
++    { "POKEY",        bhvPokey,            MODEL_NONE,               NULL, MODEL_POKEY_HEAD, pokey_head_geo, MODEL_POKEY_BODY_PART, pokey_body_part_geo, 0, 6, 1, 1 },
++    { "TWEESTER",     bhvTweester,         MODEL_TWEESTER,           tweester_geo, 0, NULL, 0, NULL, 0x00050000, 6, 1, 0 },
++    { "MR. BLIZZARD", bhvMrBlizzard,       MODEL_MR_BLIZZARD_HIDDEN, mr_blizzard_hidden_geo, MODEL_MR_BLIZZARD, mr_blizzard_geo, 0, NULL, 0, 8, 1, 1 },
++    { "SPINDRIFT",    bhvSpindrift,        MODEL_SPINDRIFT,          spindrift_geo, 0, NULL, 0, NULL, 0, 8, 1, 1 },
++    { "BOO",          bhvBoo,              MODEL_BOO,                boo_geo, 0, NULL, 0, NULL, 0,       10, 0, 1 },
++    { "MAD PIANO",    bhvMadPiano,         MODEL_MAD_PIANO,          mad_piano_geo, 0, NULL, 0, NULL, 0, 10, 1, 0 },
++    { "LAKITU",       bhvEnemyLakitu,      MODEL_ENEMY_LAKITU,       enemy_lakitu_geo, MODEL_SPINY, spiny_geo, MODEL_SPINY_BALL, spiny_ball_geo, 0, 12, 0, 1 },
++    { "SKEETER",      bhvSkeeter,          MODEL_SKEETER,            skeeter_geo, 0, NULL, 0, NULL, 0,   14, 1, 1 },
++    { "PIRANHA",      bhvPiranhaPlant,     MODEL_PIRANHA_PLANT,      piranha_plant_geo, 0, NULL, 0, NULL, 0, 15, 1, 1 },
++    { "FIRE PIRANHA", bhvFirePiranhaPlant, MODEL_PIRANHA_PLANT,      piranha_plant_geo, 0, NULL, 0, NULL, 0x00010000, 15, 1, 1 },
++    { "WHOMP",        bhvSmallWhomp,       MODEL_WHOMP,              whomp_geo, 0, NULL, 0, NULL, 0,     15, 1, 1 },
++    { "KOOPA",        bhvKoopa,            MODEL_KOOPA_WITH_SHELL,   koopa_with_shell_geo, MODEL_KOOPA_WITHOUT_SHELL, koopa_without_shell_geo, 0, NULL, 0x00010000, 15, 1, 1 },
++    { "SWOOP",        bhvSwoop,            MODEL_SWOOP,              swoop_geo, 0, NULL, 0, NULL, 0,     18, 0, 1 },
++    { "SCUTTLEBUG",   bhvScuttlebug,       MODEL_SCUTTLEBUG,         scuttlebug_geo, 0, NULL, 0, NULL, 0, 18, 1, 1 },
++    { "MR. I",        bhvMrI,              MODEL_NONE,               NULL, MODEL_MR_I, mr_i_geo, MODEL_MR_I_IRIS, mr_i_iris_geo, 0, 18, 0, 1 },
++    { "SNUFIT",       bhvSnufit,           MODEL_SNUFIT,             snufit_geo, 0, NULL, 0, NULL, 0,    18, 0, 1 },
++};
++#define NUM_LIB ((s32) (sizeof(sLib) / sizeof(sLib[0])))
++static const u8 sGroupsA[] = { 2, 3, 6, 8, 10, 12 }, sGroupsB[] = { 14, 15, 18 };
++static s32 sGroupA, sGroupB;
++static s32 lib_ok(s32 i) { return sLib[i].group == 1 || sLib[i].group == sGroupA || sLib[i].group == sGroupB; }
++static void load_lib_models(void);
++
 +// ── bosses ──────────────────────────────────────────────────────────────────
 +// One per Boss Battle course, on an arena at the end. Their models share slots (King Bob-omb and
 +// the small Bully are both 0x56 — include/model_ids.h), so only the day's boss is loaded; the
@@ -569,6 +640,12 @@ index 0000000..c0f09ba
 +static const BehaviorScript *dyn_beh(u8 k) {
 +    switch (k) {
 +        case DK_BOSS:    return sBosses[sBoss].beh;
++        case DK_LIB:     return sLib[0].beh;   // (per-dyn: see dyn_beh_of)
++        case DK_BREAKBOX: return bhvBreakableBox;
++        case DK_METALBOX: return bhvPushableMetalBox;
++        case DK_BLUESWITCH: return bhvBlueCoinSwitch;
++        case DK_BLUECOIN: return bhvHiddenBlueCoin;
++        case DK_KICKBOARD: return bhvKickableBoard;
 +        case DK_GOOMBA: case DK_GOOMBA_BIG: return bhvGoomba;
 +        case DK_BOBOMB:  return bhvBobomb;
 +        case DK_CHUCKYA: return bhvChuckya;
@@ -583,6 +660,11 @@ index 0000000..c0f09ba
 +static u32 dyn_model(u8 k) {
 +    switch (k) {
 +        case DK_BOSS:    return sBosses[sBoss].model;
++        case DK_BREAKBOX: return MODEL_BREAKABLE_BOX;
++        case DK_METALBOX: return MODEL_METAL_BOX;
++        case DK_BLUESWITCH: return MODEL_BLUE_COIN_SWITCH;
++        case DK_BLUECOIN: return MODEL_BLUE_COIN;
++        case DK_KICKBOARD: return MODEL_WF_KICKABLE_BOARD;
 +        case DK_GOOMBA: case DK_GOOMBA_BIG: return MODEL_GOOMBA;
 +        case DK_BOBOMB:  return MODEL_BLACK_BOBOMB;
 +        case DK_CHUCKYA: return MODEL_CHUCKYA;
@@ -594,11 +676,13 @@ index 0000000..c0f09ba
 +        default:         return MODEL_BREAKABLE_BOX_SMALL;
 +    }
 +}
-+static s32 is_enemy(u8 k) { return k <= DK_FLYGUY; }
++static s32 is_enemy(u8 k) { return k <= DK_FLYGUY || k == DK_LIB; }
++static const BehaviorScript *dyn_beh_of(struct Dyn *d) { return d->kind == DK_LIB ? sLib[d->lib].beh : dyn_beh(d->kind); }
++static u32 dyn_model_of(struct Dyn *d) { return d->kind == DK_LIB ? sLib[d->lib].model : dyn_model(d->kind); }
 +// Walking enemies need their platform's collision under them, and SM64 only loads an object's
 +// collision while Mario is within its oCollisionDistance (surface_load.c:834). So they are spawned
 +// once Mario comes near their platform, not at the start.
-+static s32 lazy(u8 k) { return k == DK_GOOMBA || k == DK_GOOMBA_BIG || k == DK_BOBOMB || k == DK_CHUCKYA || k == DK_BOSS; }
++static s32 lazy(u8 k) { return k == DK_GOOMBA || k == DK_GOOMBA_BIG || k == DK_BOBOMB || k == DK_CHUCKYA || k == DK_BOSS || k == DK_LIB || k == DK_METALBOX; }
 +#define LAZY_RADIUS 2200.0f
 +
 +// Water and poison-gas regions we add (axis-aligned, like SM64's own: surface_collision.c:589-655).
@@ -652,7 +736,7 @@ index 0000000..c0f09ba
 +        s32 k;
 +        for (k = 0; k < 5; k++) {
 +            f32 x = p->x + (k == 1 ? r : k == 2 ? -r : 0), z = p->z + (k == 3 ? r : k == 4 ? -r : 0), t = terrain_at(x, z);
-+            if (t < -19000.0f || p->y - p->h - 100.0f < t + SKY_CLEAR) return TRUE;
++            if (t < -19000.0f || (!p->gnd && p->y - p->h - 100.0f < t + SKY_CLEAR)) return TRUE;   // ground pieces sit on the level
 +        }
 +    }
 +    for (i = 0; i < from; i++) {
@@ -757,17 +841,38 @@ index 0000000..c0f09ba
 +enum { MD_HOP, MD_STEPPING, MD_DOUBLE_STEPPING, MD_THWOMP, MD_PENDULUM, MD_FIREBAR, MD_LONG, MD_POWER_STEP,
 +       MD_TRIPLE, MD_WALLKICK, MD_POLE, MD_SLIDE,
 +       MD_ENEMIES, MD_AMPS, MD_CANNON, MD_SWITCH, MD_SHELL, MD_VANISH, MD_METAL, MD_WING, MD_BARS, MD_SAND,
-+       MD_ICE, MD_WIND, MD_UPDRAFT, MD_POOL, MD_GAS, MD_BOSS, MD_COUNT };
++       MD_ICE, MD_WIND, MD_UPDRAFT, MD_POOL, MD_GAS, MD_BOSS,
++       MD_LEDGES, MD_LONGCHAIN, MD_CRAWL, MD_BREAKWALL, MD_PUSHBOX, MD_BLUECOIN, MD_KICKBOARD, MD_GROUND, MD_HAZARD, MD_COUNT };
 +static const f32 sModSeconds[MD_COUNT] = { 2.5f, 5, 8, 6, 6, 7, 4.5f, 4, 6, 9, 12, 5,
-+                                           8, 6, 9, 9, 8, 7, 7, 12, 13, 6, 6, 6, 7, 14, 6, 40 };
++                                           8, 6, 9, 9, 8, 7, 7, 12, 13, 6, 6, 6, 7, 14, 6, 40,
++                                           7, 9, 6, 8, 12, 8, 9, 16, 7 };
 +static const f32 sModWeight[MD_COUNT] = { 1.0f, 2.5f, 1.5f, 1, 1, 1, 1, 1, 1, 1, 1, 0.8f,
-+                                          1.2f, 1, 1, 1, 1, 1, 1, 0.8f, 0.8f, 1, 1, 1, 1, 0.8f, 1, 0 };   // the boss is placed, never picked
++                                          1.2f, 1, 1, 1, 1, 1, 1, 0.8f, 0.8f, 1, 1, 1, 1, 0.8f, 1, 0,     // the boss is placed, never picked
++                                          1, 1, 1, 1, 1, 0.8f, 1, 1.2f, 1.6f };
++static f32 sModOn[MD_COUNT];
++static s32 sKickboards;   // this seed's palette: which modules it uses, and how much (generate)
 +
++static void load_lib_models(void) {
++    s32 i;
++    for (i = 0; i < NUM_LIB; i++) {
++        if (sLib[i].group == 1 || !lib_ok(i)) continue;
++        if (sLib[i].geo) load_model(sLib[i].model, sLib[i].geo);
++        if (sLib[i].geo2) load_model(sLib[i].model2, sLib[i].geo2);
++        if (sLib[i].geo3) load_model(sLib[i].model3, sLib[i].geo3);
++    }
++    if (sKickboards) {
++        load_model(MODEL_WF_KICKABLE_BOARD, wf_geo_000BA8);
++        load_model(MODEL_WF_KICKABLE_BOARD_FELLED, wf_geo_000BC8);   // it swaps to this when kicked down
++    }
++}
++
++static u8 sPieceOn[96];
++static s32 sNumAutoDrawn;   // this seed's set of moving platforms (generate)
 +static s32 pick_step_piece(void) {
 +    s32 tries;
-+    for (tries = 0; tries < 50; tries++) {
++    for (tries = 0; tries < 80; tries++) {
 +        s32 i = rnd_i(NUM_PIECES);
-+        if (sPiece[i].role == R_STEP || sPiece[i].role == R_LONGSTEP) return i;
++        if ((sPiece[i].role == R_STEP || sPiece[i].role == R_LONGSTEP) && (sPieceOn[i] || tries > 60)) return i;
 +    }
 +    return 0;
 +}
@@ -888,7 +993,9 @@ index 0000000..c0f09ba
 +        case MD_WALLKICK: {
 +            // A chimney: a floor between two walls; the way out is on top of the right wall,
 +            // higher than any jump from the floor (triple ~595), so it takes wall kicks (~480 each).
-+            f32 H = rnd_f(800, 900 + 100 * hard), inner = rnd_f(380, 480), side;   // playtest: 230-290 was too tight to kick between
++            // Variants: which wall has the way out on top, how tall (2-3 kicks), how wide.
++            f32 H = rnd_f(750, 950 + 300 * hard), inner = rnd_f(380, 520), side;   // playtest: 230-290 was too tight to kick between
++            s32 flip = rnd_i(2);
 +            s16 hl = h + 0x4000;
 +            struct Part *l, *r;
 +            a = station(c, h, rnd_f(120, 200), rnd_f(-200, -80), inner / 2.0f, rnd_f(260, 320));
@@ -897,6 +1004,7 @@ index 0000000..c0f09ba
 +            l = add_part(PT_BOX); r = add_part(PT_BOX);
 +            if (!l || !r) break;
 +            l->box = BK_WALL; l->hx = 40.0f; l->hz = a->hz; l->h = H + 140.0f; l->yaw = h;
++            if (flip) { hl = h - 0x4000; }
 +            l->x = a->x + sins(hl) * side; l->z = a->z + coss(hl) * side; l->y = a->y + H;
 +            *r = *l;
 +            r->x = a->x - sins(hl) * side; r->z = a->z - coss(hl) * side; r->y = a->y + H - 40.0f;
@@ -949,16 +1057,176 @@ index 0000000..c0f09ba
 +        }
 +
 +        case MD_ENEMIES: {
-+            // An arena: Goombas (some huge), a Bob-omb, a Chuckya, Fly Guys. Stomp, punch, throw.
-+            s32 k, cnt = 3 + rnd_i(2 + (s32) (hard * 2)), chuck = 0;
-+            n = station(c, h, rnd_f(150, 240), rnd_f(-80, 80), rnd_f(520, 640), rnd_f(520, 640));
-+            if (!n) break;
++            // An arena with this course's cast: the global enemies plus its two groups (sLib). Bullies only
++            // die in lava, so an arena with one gets a lava moat below its rim.
++            s32 k, cnt = 3 + rnd_i(2 + (s32) (hard * 2)), lava = 0, cand[NUM_LIB], nc = 0;
++            for (k = 0; k < NUM_LIB; k++) if (lib_ok(k)) cand[nc++] = k;
++            n = station(c, h, rnd_f(150, 240), rnd_f(-80, 80), rnd_f(540, 680), rnd_f(540, 680));
++            if (!n || nc == 0) break;
 +            for (k = 0; k < cnt; k++) {
-+                s32 r = rnd_i(100);
-+                u8 kind = r < 40 ? DK_GOOMBA : r < 55 ? DK_GOOMBA_BIG : r < 70 ? DK_BOBOMB : r < 85 ? DK_FLYGUY : DK_CHUCKYA;
-+                if (kind == DK_CHUCKYA && chuck++) kind = DK_GOOMBA;
-+                add_enemy(kind, n, rnd_f(-(n->hz - 180), n->hz - 180), rnd_f(-(n->hx - 180), n->hx - 180));
++                // Favour the course's own groups over the globals, so each cast feels like a world.
++                s32 li = cand[rnd_i(nc)], t;
++                for (t = 0; t < 3 && sLib[li].group == 1; t++) li = cand[rnd_i(nc)];
++                {
++                    f32 x, z;
++                    struct Dyn *d;
++                    local_pt(n, rnd_f(-(n->hz - 180), n->hz - 180), rnd_f(-(n->hx - 180), n->hx - 180), &x, &z);
++                    if (sLib[li].beh == bhvBulletBill) local_pt(n, n->hz - 60, 0, &x, &z);
++                    d = add_dyn(DK_LIB, x, n->y + (sLib[li].ground ? 40.0f : 280.0f), z, (s32) (n - sPart));
++                    if (!d) break;
++                    d->lib = (u8) li; d->bp = sLib[li].bp; d->objective = sLib[li].killable;
++                    if (sLib[li].beh == bhvBulletBill) d->yaw = h + 0x8000;
++                    if (sLib[li].beh == bhvSmallBully) lava = 1;
++                }
 +            }
++            if (lava) { b = box_at(BK_LAVA, n, 0, 0, n->y - 170.0f, n->hx + 600.0f, n->hz + 600.0f, 60.0f, n->yaw); if (b) b->r = 1; }
++            break;
++        }
++
++        case MD_LEDGES: {
++            // A climb: ledges each just above a single jump — jump and grab, pull up, again.
++            s32 k, cnt = 3 + rnd_i(2);
++            a = c;
++            for (k = 0; k < cnt && a; k++) {
++                f32 dy = rnd_f(250, 300 + 40 * hard);
++                a = station(a, h + (s16) rnd_f(-0x1000, 0x1000), rnd_f(0, 40), dy, rnd_f(180, 230), rnd_f(150, 190));
++                if (a) a->h = dy + 220.0f;
++            }
++            n = a;
++            break;
++        }
++
++        case MD_LONGCHAIN: {
++            // Long jump after long jump: each landing is just long enough to get back up to speed.
++            s32 k, cnt = 2 + rnd_i(2);
++            a = station(c, h, rnd_f(150, 220), rnd_f(-60, 60), 220.0f, rnd_f(420, 500));
++            for (k = 0; k < cnt && a; k++) a = station(a, h + (s16) rnd_f(-0x800, 0x800), rnd_f(680, 760 + 40 * hard), rnd_f(-120, -30), 230.0f, rnd_f(380, 440));
++            n = a;
++            break;
++        }
++
++        case MD_CRAWL: {
++            // A block with a crawl space through it: crouch and crawl, or dive and slide under.
++            f32 clr = 150.0f;   // Mario stands 160 tall: he must crawl or slide
++            n = station(c, h, rnd_f(150, 220), rnd_f(-60, 60), 210.0f, rnd_f(650, 850));
++            if (!n) break;
++            b = box_at(BK_WALL, n, 0, 0, n->y + clr + 700.0f, n->hx + 60.0f, n->hz - 160.0f, 700.0f, n->yaw);
++            break;
++        }
++
++        case MD_BREAKWALL: {
++            // A wall of breakable boxes (3 wide, 3 high) with solid wall above: punch or kick a way through.
++            s32 ix, iy;
++            n = station(c, h, rnd_f(150, 220), rnd_f(-60, 60), 230.0f, rnd_f(650, 800));
++            if (!n) break;
++            box_at(BK_WALL, n, 0, 0, n->y + 1400.0f, n->hx + 160.0f, 110.0f, 800.0f, n->yaw);
++            for (ix = -1; ix <= 1; ix++) for (iy = 0; iy < 3; iy++) {
++                f32 x, z;
++                struct Dyn *d;
++                local_pt(n, 0, ix * 200.0f, &x, &z);
++                d = add_dyn(DK_BREAKBOX, x, n->y + iy * 200.0f, z, (s32) (n - sPart));
++                if (d) d->yaw = n->yaw;
++            }
++            break;
++        }
++
++        case MD_PUSHBOX: {
++            // A puzzle: a ledge too high for any jump from the floor, and a metal box across the platform.
++            // Push the box to the foot of the ledge and jump from its top.
++            struct Dyn *d;
++            f32 x, z;
++            a = station(c, h, rnd_f(150, 220), rnd_f(-60, 60), 420.0f, 440.0f);
++            if (!a) break;
++            n = station(a, h, 0, rnd_f(640, 680), rnd_f(240, 300), rnd_f(240, 300));
++            if (!n) break;
++            n->h = 900.0f;
++            local_pt(a, -a->hz + 250.0f, 0, &x, &z);
++            d = add_dyn(DK_METALBOX, x, a->y, z, (s32) (a - sPart));
++            if (d) d->yaw = h;
++            break;
++        }
++
++        case MD_BLUECOIN: {
++            // A blue coin switch: ground-pound it, then grab the blue coins (5 each) before they vanish.
++            s32 k;
++            struct Dyn *d;
++            n = station(c, h, rnd_f(150, 220), rnd_f(-60, 60), rnd_f(420, 520), rnd_f(420, 520));
++            if (!n) break;
++            d = add_dyn(DK_BLUESWITCH, n->x, n->y, n->z, (s32) (n - sPart));
++            for (k = 0; k < 6; k++) {
++                f32 x, z, an = k * (6.2832f / 6);
++                local_pt(n, sinf(an) * (n->hz - 90), cosf(an) * (n->hx - 90), &x, &z);
++                d = add_dyn(DK_BLUECOIN, x, n->y + 40.0f + (k & 1) * 200.0f, z, (s32) (n - sPart));
++            }
++            break;
++        }
++
++        case MD_KICKBOARD: {
++            // Whomp's Fortress's kickable board at the edge of a gap: jump-kick it and it falls into a bridge.
++            struct Dyn *d;
++            f32 x, z;
++            a = station(c, h, rnd_f(150, 220), rnd_f(-60, 60), 260.0f, 300.0f);
++            if (!a) break;
++            n = station(a, h, rnd_f(980, 1060), 0, rnd_f(260, 320), rnd_f(260, 320));
++            if (!n) break;
++            local_pt(a, a->hz - 60.0f, 0, &x, &z);
++            d = add_dyn(DK_KICKBOARD, x, a->y, z, (s32) (a - sPart));
++            if (d) d->yaw = h;   // it falls toward its local +Z (kickable_board.inc.c)
++            sKickboards++;
++            break;
++        }
++
++        case MD_HAZARD: {
++            // A run past one of this seed's hazards from across the game (grindels, spindels, rolling logs,
++            // flames, crushers... — sAuto), sitting where its home level would put it: on the floor.
++            s32 k, pick = -1;
++            for (k = 0; k < 20 && pick < 0; k++) { s32 i = rnd_i(NUM_PIECES); if (sPiece[i].role == R_HAZ_ANY) pick = i; }
++            if (pick < 0) break;
++            n = station(c, h, rnd_f(150, 220), rnd_f(-60, 60), DMAX(280.0f, DMIN(sPiece[pick].rx + 160.0f, 520.0f)), rnd_f(700, 950));
++            if (!n) break;
++            b = add_part(PT_PIECE);
++            if (!b) { n = NULL; break; }
++            b->piece = pick; b->x = n->x; b->z = n->z; b->yaw = h; b->y = n->y - DMIN(sPiece[pick].minY, 0.0f); b->r = 1; b->h = 0;
++            break;
++        }
++
++        case MD_GROUND: {
++            // Down to the level itself: slide to its ground, run across it, ride an updraft back up.
++            // Only where the level's ground is walkable along the way (no drops, water or hazards).
++            f32 e = extent_along(c, h), run = rnd_f(1100, 1700), px = c->x + sins(h) * (e + run), pz = c->z + coss(h) * (e + run);
++            f32 y1 = terrain_at(px, pz), L = rnd_f(1500, 2600), y2, drop, len, ang, mid, k;
++            struct Surface *fl;
++            struct Part *pad1, *pad2, *sl;
++            if (y1 < -19000.0f || find_floor(px, 20000.0f, pz, &fl) < -19000.0f || fl == NULL || fl->type != SURFACE_DEFAULT && fl->type != SURFACE_NOT_SLIPPERY
++                && fl->type != SURFACE_HARD && fl->type != SURFACE_NOISE_DEFAULT && fl->type != SURFACE_HARD_NOT_SLIPPERY && fl->type != SURFACE_SLIPPERY) break;
++            drop = c->y - (y1 + 25.0f);
++            if (drop < 500.0f || drop > 4000.0f || drop > run * 1.0f) break;
++            {   // the run along the ground: gentle, dry, no hazards
++                f32 prev = y1, d2;
++                for (d2 = 80.0f; d2 <= L; d2 += 80.0f) {
++                    f32 x = px + sins(h) * d2, z = pz + coss(h) * d2, t = find_floor(x, prev + 400.0f, z, &fl);
++                    if (fl == NULL || absf(t - prev) > 90.0f || host_water(x, z) > t - 50.0f || fl->type == SURFACE_BURNING
++                        || fl->type == SURFACE_DEATH_PLANE || (fl->type >= SURFACE_SHALLOW_QUICKSAND && fl->type <= SURFACE_MOVING_QUICKSAND)) { L = -1; break; }
++                    prev = t;
++                }
++                if (L < 0 || absf(prev - y1) > 700.0f) break;
++                y2 = prev;
++            }
++            sl = add_part(PT_BOX);
++            pad1 = add_part(PT_CHECKER);
++            if (!sl || !pad1) break;
++            len = sqrtf(run * run + drop * drop); ang = atan2s(run, drop); mid = e + run / 2.0f;
++            sl->box = BK_SLIDE; sl->hx = 240.0f; sl->hz = len / 2.0f; sl->h = 60.0f; sl->yaw = h; sl->pitch = ang; sl->gnd = 1;
++            sl->x = c->x + sins(h) * mid; sl->z = c->z + coss(h) * mid; sl->y = c->y - 10.0f - drop / 2.0f;
++            pad1->station = 1; pad1->gnd = 1; pad1->yaw = h; pad1->hx = 320.0f; pad1->hz = 320.0f; pad1->h = 80.0f;
++            pad1->x = px + sins(h) * 300.0f; pad1->z = pz + coss(h) * 300.0f; pad1->y = terrain_at(pad1->x, pad1->z) + 25.0f;
++            pad2 = add_part(PT_CHECKER);
++            if (!pad2) break;
++            pad2->station = 1; pad2->gnd = 1; pad2->yaw = h; pad2->hx = 260.0f; pad2->hz = 260.0f; pad2->h = 80.0f; pad2->fk = BK_WINDPAD;
++            pad2->x = px + sins(h) * L; pad2->z = pz + coss(h) * L; pad2->y = y2 + 25.0f;
++            for (k = 700.0f; k < L - 300.0f; k += 160.0f) add_dyn(DK_COIN, px + sins(h) * k, y2 + 60.0f + (y1 - y2) * (1 - k / L), pz + coss(h) * k, (s32) (pad1 - sPart));
++            n = station(pad2, h, rnd_f(60, 120), 1000.0f, rnd_f(280, 340), rnd_f(280, 340));
++            if (n) n->h = 200.0f;
 +            break;
 +        }
 +
@@ -1310,7 +1578,7 @@ index 0000000..c0f09ba
 +    sRng = seed ? seed : 0x5EED1234;
 +    for (i = 0; i < 8; i++) rnd_u32();
 +    bzero(used, sizeof(used));
-+    sNumParts = 0; sNumMods = 0; sNumDyn = 0; sNumEnv = 0;
++    sNumParts = 0; sNumMods = 0; sNumDyn = 0; sNumEnv = 0; sKickboards = 0;
 +
 +    s = add_part(PT_CHECKER);
 +    s->hx = 300.0f; s->hz = 300.0f; s->station = 1;
@@ -1337,7 +1605,7 @@ index 0000000..c0f09ba
 +            for (m = 0; m < MD_COUNT; m++) {
 +                // Every course should mix the move set: unused modules are strongly preferred,
 +                // and the same module never twice in a row. The challenge and the day's flavour tilt it.
-+                w[m] = sModWeight[m] * (used[m] ? 0.3f : 2.5f);
++                w[m] = sModWeight[m] * sModOn[m] * (used[m] ? 0.6f : 1.6f);
 +                if (sMode == MODE_CLEAR && (m == MD_ENEMIES)) w[m] *= enemyMods < 4 ? 6.0f : 1.0f;
 +                if (sIslands && (m == MD_CANNON || m == MD_WING)) w[m] *= 3.0f;
 +                if (m == last) w[m] = 0;
@@ -1419,6 +1687,68 @@ index 0000000..c0f09ba
 +    sStyle = ((h >> 5) & 3) == 0 ? STYLE_CHECKER : STYLE_BOX;
 +    sIslands = ((h >> 17) % 5) == 0;
 +    gTTCSpeedSetting = (s16) ((h >> 21) % 3);   // slow, fast or random: TTC's own pieces follow it
++    {
++        // This seed's palette: a handful of modules (and moving platforms, and two enemy groups) of its own,
++        // each with its own weight — so courses differ in kind, not just in layout.
++        u32 r = h ^ 0xA5A5F00Du, j, want;
++        s32 m, i;
++        #define PRNG() (r ^= r << 13, r ^= r >> 17, r ^= r << 5, r)
++        for (m = 0; m < MD_COUNT; m++) sModOn[m] = 0;
++        sModOn[MD_HOP] = 0.6f; sModOn[MD_STEPPING] = 1.0f;
++        want = 6 + PRNG() % 6;
++        for (j = 0; j < want; j++) {
++            m = 1 + (s32) (PRNG() % (MD_COUNT - 1));
++            if (m == MD_BOSS || sModOn[m] > 0) { j--; if (PRNG() % 50 == 0) break; continue; }
++            sModOn[m] = 0.5f + (PRNG() % 100) / 66.0f;
++        }
++        if (sMode == MODE_CLEAR) sModOn[MD_ENEMIES] = DMAX(sModOn[MD_ENEMIES], 1.5f);
++        if (sIslands) { sModOn[MD_CANNON] = DMAX(sModOn[MD_CANNON], 1.5f); sModOn[MD_WING] = DMAX(sModOn[MD_WING], 1.2f); }
++        // Moving platforms and hazards: the built-in ones, plus a draw from the whole inventory (sAuto).
++        sNumPieces = NUM_BUILTIN_PIECES;
++        for (i = 0; i < NUM_BUILTIN_PIECES; i++) { measure(&sPiece[i]); sPieceOn[i] = (PRNG() % 100) < 35; }
++        {
++            static u8 claimed[256];
++            s32 a, tries;
++            bzero(claimed, sizeof(claimed));
++            for (a = 0x00; a <= 0x15; a++) claimed[a] = 1;            // Mario, our boxes
++            for (a = 0xE2; a <= 0xFF; a++) claimed[a] = 1;            // our pieces, markers
++            for (a = 0x74; a <= 0xE1; a++) claimed[a] = 1;            // the global/common set our objects use
++            for (a = 0; a < NUM_LIB; a++) if (lib_ok(a)) { claimed[sLib[a].model] = 1; claimed[sLib[a].model2] = 1; claimed[sLib[a].model3] = 1; }
++            if (sBoss >= 0) { claimed[sBosses[sBoss].model] = 1; claimed[sBosses[sBoss].model2] = 1; }
++            claimed[MODEL_WF_KICKABLE_BOARD] = claimed[MODEL_WF_KICKABLE_BOARD_FELLED] = 1;
++            for (tries = 0; tries < 400 && sNumPieces < MAX_PIECES && sNumPieces < NUM_BUILTIN_PIECES + 18; tries++) {
++                const struct AutoPiece *ap = &sAuto[PRNG() % NUM_AUTO];
++                struct Piece *pc = &sPiece[sNumPieces];
++                const Collision *col = beh_collision(ap->beh);
++                if (claimed[ap->model]) continue;
++                bzero(pc, sizeof(*pc));
++                pc->name = ap->name; pc->beh = ap->beh; pc->geo = ap->geo; pc->bp = ap->bp; pc->model = ap->model;
++                if (col != NULL) { pc->col = col; measure(pc); }
++                if (ap->role == 1) {
++                    pc->role = R_HAZ_ANY;
++                    if (col == NULL) { pc->minY = 0; pc->maxY = 200; pc->rx = pc->rz = pc->r = 200; }
++                    if (pc->r > 1200.0f) continue;
++                } else {
++                    // A platform needs a top to land on, and must fit in a gap.
++                    if (col == NULL || pc->rx < 110.0f || pc->rz < 110.0f || pc->r > 1600.0f || pc->maxY - pc->minY > 2400.0f) continue;
++                    pc->role = (pc->rx > pc->rz * 2.0f || pc->rz > pc->rx * 2.0f) ? R_LONGSTEP : R_STEP;
++                }
++                claimed[ap->model] = 1;
++                sPieceOn[sNumPieces] = 1;
++                sNumPieces++;
++            }
++            sNumAutoDrawn = sNumPieces - NUM_BUILTIN_PIECES;
++        }
++        sGroupA = sGroupsA[PRNG() % sizeof(sGroupsA)];
++        sGroupB = sGroupsB[PRNG() % sizeof(sGroupsB)];
++        // A boss's model lives in its group's slots: that group is the course's group.
++        if (sBoss == BOSS_KING_BOBOMB) sGroupA = 4;
++        if (sBoss == BOSS_BIG_BULLY) sGroupA = 3;
++        if (sBoss == BOSS_WIGGLER) sGroupA = 12;
++        if (sBoss == BOSS_BIG_BOO) sGroupA = 10;
++        if (sBoss == BOSS_KING_WHOMP) sGroupB = 15;
++        #undef PRNG
++    }
 +    for (k = 0; k < 8; k++) {
 +        if ((sGenSecs = generate_once(seed + k * 0x9E3779B9u, dow)) >= TARGET_SECONDS * 0.85f) return;
 +    }
@@ -1440,6 +1770,7 @@ index 0000000..c0f09ba
 +}
 +s32 daily_debug_gen_info(void) { return sNumStations * 10000 + (s32) sGenSecs; }
 +s32 daily_debug_mode(void) { return sMode; }
++s32 daily_debug_auto(void) { return sNumAutoDrawn; }
 +s32 daily_debug_modules(s32 i) { return i < sNumMods ? sMods[i] : -1; }
 +// Test hook: module k's [0] id, [1] the station it starts from, [2] the station it lands on.
 +// [3] its first part, [4] one past its last part, [5] its first dyn, [6] one past its last dyn.
@@ -1580,10 +1911,10 @@ index 0000000..c0f09ba
 +}
 +
 +static s32 dyn_alive(struct Dyn *d) {
-+    return d->obj != NULL && d->obj->activeFlags != ACTIVE_FLAG_DEACTIVATED && d->obj->behavior == segmented_to_virtual(dyn_beh(d->kind));
++    return d->obj != NULL && d->obj->activeFlags != ACTIVE_FLAG_DEACTIVATED && d->obj->behavior == segmented_to_virtual(dyn_beh_of(d));
 +}
 +static void spawn_dyn(struct Dyn *d) {
-+    struct Object *o = spawn_object_abs_with_rot(gMarioObject, 0, dyn_model(d->kind), dyn_beh(d->kind),
++    struct Object *o = spawn_object_abs_with_rot(gMarioObject, 0, dyn_model_of(d), dyn_beh_of(d),
 +                                                 (s16) d->x, (s16) d->y, (s16) d->z, 0, d->yaw, 0);
 +    o->oBehParams = d->bp;
 +    o->oBehParams2ndByte = (d->bp >> 16) & 0xFF;
@@ -1957,8 +2288,9 @@ index 0000000..c0f09ba
 +#endif
 +        sHostEnv = gEnvironmentRegions;
 +        clear_host_objects();
-+        load_all_models();
 +        generate(seed, dow);
++        load_all_models();
++        load_lib_models();
 +        if (sBoss >= 0) {
 +            load_model(sBosses[sBoss].model, sBosses[sBoss].geo);
 +            if (sBosses[sBoss].geo2) load_model(sBosses[sBoss].model2, sBosses[sBoss].geo2);
@@ -2003,7 +2335,9 @@ index 0000000..c0f09ba
 +        // A boss thrown off into the sky comes back to its arena.
 +        if (d->kind == DK_BOSS && d->obj->oPosY < sPart[d->part].y - 1500.0f) { obj_mark_for_deletion(d->obj); spawn_dyn(d); continue; }
 +        // An enemy knocked off the course counts as beaten.
-+        if (is_enemy(d->kind) && d->kind != DK_FLYGUY && d->obj->oPosY < sPart[d->part].y - 700.0f) obj_mark_for_deletion(d->obj);
++        if (is_enemy(d->kind) && d->kind != DK_FLYGUY && !(d->kind == DK_LIB && !sLib[d->lib].ground) && d->obj->oPosY < sPart[d->part].y - 700.0f) obj_mark_for_deletion(d->obj);
++        // A metal box that went over an edge goes home.
++        if (d->kind == DK_METALBOX && d->obj->oPosY < sPart[d->part].y - 300.0f) { obj_mark_for_deletion(d->obj); spawn_dyn(d); }
 +    }
 +    left = objective_left();
 +    if (!sUnlocked && left == 0 && sMode != MODE_BOSS) {
@@ -2089,10 +2423,10 @@ index 0000000..c0f09ba
 +}
 diff --git a/src/game/daily.h b/src/game/daily.h
 new file mode 100644
-index 0000000..2a10231
+index 0000000..b0b06b9
 --- /dev/null
 +++ b/src/game/daily.h
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,59 @@
 +#ifndef DAILY_H
 +#define DAILY_H
 +
@@ -2126,6 +2460,7 @@ index 0000000..2a10231
 +s32 daily_active(void);
 +void daily_star_target(f32 *x, f32 *y, f32 *z);
 +s32 daily_debug_mode(void);
++s32 daily_debug_auto(void);
 +s32 daily_debug_modules(s32 i);
 +s32 daily_debug_objective(void);
 +s32 daily_debug_dyn_count(void);
@@ -2151,6 +2486,103 @@ index 0000000..2a10231
 +void daily_debug_warp(s32 i);
 +
 +#endif // DAILY_H
+diff --git a/src/game/daily_lib.inc.h b/src/game/daily_lib.inc.h
+new file mode 100644
+index 0000000..815c96b
+--- /dev/null
++++ b/src/game/daily_lib.inc.h
+@@ -0,0 +1,91 @@
++// GENERATED by sm64daily/gen_lib.py from the behaviour inventory. Do not edit by hand.
++// Every platform, hazard and mechanism SM64 places in its levels that works on its own, with the geo
++// and behaviour params it is placed with in its home level. daily.c measures each from the collision
++// its own behaviour script loads (LOAD_COLLISION_DATA), and each seed draws its own set from it.
++#include "actors/common0.h"
++#include "actors/common1.h"
++#include "actors/group1.h"
++#include "actors/group14.h"
++#include "actors/group17.h"
++#include "actors/group4.h"
++#include "levels/bbh/header.h"
++#include "levels/bitdw/header.h"
++#include "levels/bitfs/header.h"
++#include "levels/bits/header.h"
++#include "levels/bowser_2/header.h"
++#include "levels/bowser_3/header.h"
++#include "levels/hmc/header.h"
++#include "levels/jrb/header.h"
++#include "levels/lll/header.h"
++#include "levels/rr/header.h"
++#include "levels/ssl/header.h"
++#include "levels/ttc/header.h"
++#include "levels/wdw/header.h"
++#include "levels/wf/header.h"
++struct AutoPiece { const char *name; const BehaviorScript *beh; const GeoLayout *geo; u32 bp; u8 role; u8 model; };
++static const struct AutoPiece sAuto[] = {
++    { "ActivatedBackAndForthPlatform", bhvActivatedBackAndForthPlatform, bits_geo_000658, 0x00610000, 0, MODEL_BITS_ARROW_PLATFORM },
++    { "ArrowLift", bhvArrowLift, wdw_geo_000598, 0x00000000, 0, MODEL_WDW_ARROW_LIFT },
++    { "BbhTiltingTrapPlatform", bhvBbhTiltingTrapPlatform, geo_bbh_0005C8, 0x00000000, 0, MODEL_BBH_TILTING_FLOOR_PLATFORM },
++    { "BbhTumblingBridge", bhvBbhTumblingBridge, geo_bbh_0005E0, 0x00000000, 0, MODEL_BBH_TUMBLING_PLATFORM },
++    { "BitfsSinkingCagePlatform", bhvBitfsSinkingCagePlatform, bitfs_geo_000690, 0x00010000, 0, MODEL_BITFS_SINKING_CAGE_PLATFORM },
++    { "BitfsSinkingPlatforms", bhvBitfsSinkingPlatforms, bitfs_geo_000770, 0x00000000, 0, MODEL_BITFS_SINKING_PLATFORMS },
++    { "BitfsTiltingInvertedPyramid", bhvBitfsTiltingInvertedPyramid, bitfs_geo_0006C0, 0x00000000, 0, MODEL_BITFS_TILTING_SQUARE_PLATFORM },
++    { "CheckerboardElevatorGroup", bhvCheckerboardElevatorGroup, checkerboard_platform_geo, 0x014B0000, 0, MODEL_CHECKERBOARD_PLATFORM },
++    { "ClamShell", bhvClamShell, clam_shell_geo, 0x00000000, 1, MODEL_CLAM_SHELL },
++    { "ControllablePlatform", bhvControllablePlatform, hmc_geo_0005A0, 0x00000000, 0, MODEL_HMC_METAL_PLATFORM },
++    { "Dorrie", bhvDorrie, dorrie_geo, 0x00000000, 0, MODEL_DORRIE },
++    { "FallingBowserPlatform", bhvFallingBowserPlatform, bowser_3_geo_000290, 0x00010000, 0, MODEL_BOWSER_3_FALLING_PLATFORM_1 },
++    { "FallingPillar", bhvFallingPillar, jrb_geo_000900, 0x00000000, 1, MODEL_JRB_FALLING_PILLAR },
++    { "FerrisWheelAxle", bhvFerrisWheelAxle, bits_geo_000640, 0x00000000, 0, MODEL_BITS_FERRIS_WHEEL_AXLE },
++    { "FireSpitter", bhvFireSpitter, bowling_ball_geo, 0x00000000, 1, MODEL_BOWLING_BALL },
++    { "Flame", bhvFlame, red_flame_geo, 0x00000000, 1, MODEL_RED_FLAME },
++    { "Grindel", bhvGrindel, ssl_geo_000734, 0x001C0000, 1, MODEL_SSL_GRINDEL },
++    { "HauntedBookshelf", bhvHauntedBookshelf, geo_bbh_000610, 0x00000000, 2, MODEL_BBH_MOVING_BOOKSHELF },
++    { "HiddenStaircaseStep", bhvHiddenStaircaseStep, geo_bbh_0005B0, 0x00000000, 0, MODEL_BBH_STAIRCASE_STEP },
++    { "HorizontalGrindel", bhvHorizontalGrindel, ssl_geo_000734, 0x00000000, 1, MODEL_SSL_GRINDEL },
++    { "LllDrawbridgeSpawner", bhvLllDrawbridgeSpawner, lll_geo_000B20, 0x00000000, 0, MODEL_LLL_DRAWBRIDGE_PART },
++    { "LllHexagonalMesh", bhvLllHexagonalMesh, lll_geo_000AF0, 0x00000000, 0, MODEL_LEVEL_GEOMETRY_0E },
++    { "LllMovingOctagonalMeshPlatform", bhvLllMovingOctagonalMeshPlatform, lll_geo_000B08, 0x00000000, 0, MODEL_LLL_MOVING_OCTAGONAL_MESH_PLATFORM },
++    { "LllRotatingHexagonalPlatform", bhvLllRotatingHexagonalPlatform, lll_geo_000A78, 0x00000000, 0, MODEL_LLL_ROTATING_HEXAGONAL_PLATFORM },
++    { "LllRotatingHexagonalRing", bhvLllRotatingHexagonalRing, lll_geo_000BB0, 0x00000000, 0, MODEL_LLL_ROTATING_HEXAGONAL_RING },
++    { "LllSinkingRectangularPlatform", bhvLllSinkingRectangularPlatform, lll_geo_000BC8, 0x00000000, 0, MODEL_LLL_SINKING_RECTANGULAR_PLATFORM },
++    { "LllSinkingRockBlock", bhvLllSinkingRockBlock, lll_geo_000DD0, 0x00000000, 0, MODEL_LLL_SINKING_ROCK_BLOCK },
++    { "LllSinkingSquarePlatforms", bhvLllSinkingSquarePlatforms, lll_geo_000BE0, 0x00000000, 0, MODEL_LLL_SINKING_SQUARE_PLATFORMS },
++    { "LllTiltingInvertedPyramid", bhvLllTiltingInvertedPyramid, lll_geo_000BF8, 0x00000000, 0, MODEL_LLL_TILTING_SQUARE_PLATFORM },
++    { "LllVolcanoFallingTrap", bhvLllVolcanoFallingTrap, lll_geo_000EA8, 0x00000000, 1, MODEL_LLL_VOLCANO_FALLING_TRAP },
++    { "MerryGoRound", bhvMerryGoRound, geo_bbh_000640, 0x00000000, 0, MODEL_BBH_MERRY_GO_ROUND },
++    { "OctagonalPlatformRotating", bhvOctagonalPlatformRotating, rr_geo_0008A8, 0x03010000, 0, MODEL_RR_OCTAGONAL_PLATFORM },
++    { "PillarBase", bhvPillarBase, jrb_geo_000918, 0x00000000, 0, MODEL_JRB_FALLING_PILLAR_BASE },
++    { "RockSolid", bhvRockSolid, jrb_geo_000930, 0x00000000, 0, MODEL_JRB_ROCK },
++    { "RotatingPlatform", bhvRotatingPlatform, wf_geo_0009B8, 0x08000000, 0, MODEL_WF_ROTATING_PLATFORM },
++    { "RrRotatingBridgePlatform", bhvRrRotatingBridgePlatform, rr_geo_000878, 0x00010000, 1, MODEL_RR_ROTATING_BRIDGE_PLATFORM },
++    { "SeesawPlatform", bhvSeesawPlatform, rr_geo_000908, 0x00050000, 0, MODEL_RR_SEESAW_PLATFORM },
++    { "SlidingPlatform2", bhvSlidingPlatform2, rr_geo_0008C0, 0x010C0000, 0, MODEL_RR_SLIDING_PLATFORM },
++    { "Spindel", bhvSpindel, ssl_geo_000764, 0x00000000, 1, MODEL_SSL_SPINDEL },
++    { "SquarishPathMoving", bhvSquarishPathMoving, geo_bitdw_000558, 0x00000000, 0, MODEL_BITDW_SQUARE_PLATFORM },
++    { "SquishablePlatform", bhvSquishablePlatform, bitfs_geo_000708, 0x00000000, 0, MODEL_BITFS_STRETCHING_PLATFORMS },
++    { "SslMovingPyramidWall", bhvSslMovingPyramidWall, ssl_geo_000794, 0x00010000, 1, MODEL_SSL_MOVING_PYRAMID_WALL },
++    { "SwingPlatform", bhvSwingPlatform, rr_geo_000860, 0x00000000, 0, MODEL_RR_SWINGING_PLATFORM },
++    { "TTC2DRotator", bhvTTC2DRotator, ttc_geo_000358, 0x00000000, 0, MODEL_TTC_CLOCK_HAND },
++    { "TTCCog", bhvTTCCog, ttc_geo_0002E0, 0x00000000, 0, MODEL_TTC_ROTATING_HEXAGON },
++    { "TTCElevator", bhvTTCElevator, ttc_geo_000340, 0x00000000, 0, MODEL_TTC_ELEVATOR_PLATFORM },
++    { "TTCMovingBar", bhvTTCMovingBar, ttc_geo_0002C8, 0x00000000, 1, MODEL_TTC_PUSH_BLOCK },
++    { "TTCPendulum", bhvTTCPendulum, ttc_geo_000270, 0x00000000, 1, MODEL_TTC_PENDULUM },
++    { "TTCPitBlock", bhvTTCPitBlock, ttc_geo_000310, 0x00000000, 1, MODEL_TTC_PIT_BLOCK },
++    { "TTCRotatingSolid", bhvTTCRotatingSolid, ttc_geo_000240, 0x00000000, 0, MODEL_TTC_ROTATING_CUBE },
++    { "TTCSpinner", bhvTTCSpinner, ttc_geo_000370, 0x00000000, 0, MODEL_TTC_SPINNER },
++    { "TTCTreadmill", bhvTTCTreadmill, ttc_geo_0002A8, 0x00000000, 0, MODEL_TTC_SMALL_TREADMILL },
++    { "Thwomp", bhvThwomp, thwomp_geo, 0x00000000, 1, MODEL_THWOMP },
++    { "Thwomp2", bhvThwomp2, thwomp_geo, 0x00000000, 1, MODEL_THWOMP },
++    { "TiltingBowserLavaPlatform", bhvTiltingBowserLavaPlatform, bowser_2_geo_000170, 0x00000000, 0, MODEL_BOWSER_2_TILTING_ARENA },
++    { "Tower", bhvTower, lll_geo_000A60, 0x00000000, 0, MODEL_LEVEL_GEOMETRY_08 },
++    { "ToxBox", bhvToxBox, ssl_geo_000630, 0x00000000, 1, MODEL_SSL_TOX_BOX },
++    { "WaterBombCannon", bhvWaterBombCannon, cannon_base_geo, 0x00010000, 1, MODEL_CANNON_BASE },
++    { "WdwExpressElevator", bhvWdwExpressElevator, wdw_geo_000610, 0x00320000, 0, MODEL_WDW_EXPRESS_ELEVATOR },
++    { "WdwExpressElevatorPlatform", bhvWdwExpressElevatorPlatform, wdw_geo_000610, 0x00320000, 0, MODEL_WDW_EXPRESS_ELEVATOR },
++    { "WfRotatingWoodenPlatform", bhvWfRotatingWoodenPlatform, wf_geo_000A58, 0x00000000, 0, MODEL_WF_ROTATING_WOODEN_PLATFORM },
++    { "WfTumblingBridge", bhvWfTumblingBridge, bitfs_geo_0006F0, 0x00030000, 0, MODEL_BITFS_TUMBLING_PLATFORM },
++    { "WoodenPost", bhvWoodenPost, wooden_post_geo, 0x00000000, 2, MODEL_WOODEN_POST },
++};
++#define NUM_AUTO ((s32) (sizeof(sAuto) / sizeof(sAuto[0])))
 diff --git a/src/game/interaction.c b/src/game/interaction.c
 index 0d00061..25c8375 100644
 --- a/src/game/interaction.c

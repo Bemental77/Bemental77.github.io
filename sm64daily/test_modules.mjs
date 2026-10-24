@@ -7,8 +7,10 @@ import { fileURLToPath } from 'node:url';
 const url = process.env.URL || 'http://localhost:8080/sm64daily/';
 const maxCourses = +(process.argv[2] || 40);
 const NAMES = ['HOP', 'STEPPING', 'DOUBLE_STEPPING', 'THWOMP', 'PENDULUM', 'FIREBAR', 'LONG', 'POWER_STEP', 'TRIPLE', 'WALLKICK', 'POLE', 'SLIDE',
-  'ENEMIES', 'AMPS', 'CANNON', 'SWITCH', 'SHELL', 'VANISH', 'METAL', 'WING', 'BARS', 'SAND', 'ICE', 'WIND', 'UPDRAFT', 'POOL', 'GAS'];
-const WANT = new Set(process.env.ONLY ? process.env.ONLY.split(',').map(n => NAMES.indexOf(n)) : NAMES.slice(12).map((_, i) => i + 12));
+  'ENEMIES', 'AMPS', 'CANNON', 'SWITCH', 'SHELL', 'VANISH', 'METAL', 'WING', 'BARS', 'SAND', 'ICE', 'WIND', 'UPDRAFT', 'POOL', 'GAS', 'BOSS',
+  'LEDGES', 'LONGCHAIN', 'CRAWL', 'BREAKWALL', 'PUSHBOX', 'BLUECOIN', 'KICKBOARD', 'GROUND'];
+const WANT = new Set(process.env.ONLY ? process.env.ONLY.split(',').map(n => NAMES.indexOf(n)) : NAMES.slice(12).map((_, i) => i + 12).filter(m => NAMES[m] !== 'BOSS' && NAMES[m] !== 'LONGCHAIN'));
+const B_BTN = 0x4000, Z_BTN = 0x2000;
 const A = 0x8000, VANISH = 2, METAL = 4, WING = 8, ACT_FLYING = 0x10880899, SWIM = 1 << 13, HANG = 1 << 21, SURFACE_ICE = 0x2E;
 const wait = ms => new Promise(r => setTimeout(r, ms));
 const browser = await puppeteer.launch({ headless: 'new', executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
@@ -215,6 +217,83 @@ async function checkModule(c, k, mod) {
       await D('put', padP.x, padP.y + 300, padP.z, padP.yaw);
       let maxY = -1e9; for (let t = 0; t < 30; t++) { await wait(150); const m = await mario(); maxY = Math.max(maxY, m.y); }
       rec(mod, maxY >= L.y + 40, { padTop: padP.y, maxY, ledge: L.y, liftNeeded: L.y - padP.y });
+      break;
+    }
+    case 'CRAWL': {
+      const n = L;
+      const run = async (btn, ms) => {
+        await fresh(); await D('warp', await stationNo(first)); await wait(600);
+        const s0 = c.local(n, -n.hz + 40, 0); await D('put', s0.x | 0, n.y + 20, s0.z | 0, n.yaw); await wait(500);
+        await steerFor(btn, n.yaw, 80, ms); const m = await mario(); await pad(null); return along(n, m);
+      };
+      const walk = await run(0, 2500), crawl = await run(Z_BTN, 7000);
+      const blockAt = -(n.hz - 160);
+      rec(mod, walk < blockAt + 20 && crawl > blockAt + 300, { blockFace: blockAt, walkReached: Math.round(walk), crawlReached: Math.round(crawl) });
+      break;
+    }
+    case 'BREAKWALL': {
+      const n = L;
+      const boxes = []; for (let i = d0; i < d1; i++) boxes.push(i);
+      await D('warp', await stationNo(first)); await wait(600);
+      const s0 = c.local(n, -170, 0); await D('put', s0.x | 0, n.y + 20, s0.z | 0, n.yaw); await wait(500);
+      for (let t = 0; t < 6; t++) { await steer(0, n.yaw, 30); await wait(150); await steer(B_BTN, n.yaw, 0); await wait(150); await pad(0, 0, 0); await wait(300); }
+      let broken = 0; for (const i of boxes) if (!(await D('dyn', i, 4))) broken++;
+      await pad(null);
+      rec(mod, broken > 0, { boxes: boxes.length, broken });
+      break;
+    }
+    case 'PUSHBOX': {
+      let bi = -1; for (let i = d0; i < d1; i++) if ((await D('dyn', i, 0)) === 13) bi = i;
+      const a = stations[0];
+      await D('warp', await stationNo(a.i)); await wait(800);
+      const b0 = { x: await D('dyn', bi, 1), z: await D('dyn', bi, 3) };
+      const s0 = c.local(a, along(a, b0) - 230, 0); await D('put', s0.x | 0, a.y + 20, s0.z | 0, a.yaw); await wait(500);
+      await steerFor(0, a.yaw, 80, 8000);
+      const b1 = { x: await D('dyn', bi, 1), z: await D('dyn', bi, 3) };
+      await pad(null);
+      rec(mod, along(a, b1) - along(a, b0) > 150, { boxMoved: Math.round(along(a, b1) - along(a, b0)), boxNowAt: Math.round(along(a, b1)), ledgeFaceAt: a.hz });
+      break;
+    }
+    case 'LEDGES': {
+      const st = stations;
+      const l1 = st[0];
+      await D('warp', await stationNo(first)); await wait(700);
+      let got = false;
+      for (let t = 0; t < 30 && !got; t++) { await steer(t % 6 === 2 ? A : 0, l1.yaw, 80); await wait(150); const m = await mario(); if (m.on === l1.i) got = true; }
+      await pad(null);
+      rec(mod, got, { reachedFirstLedge: got, ledgeRise: l1.y - (await part(first)).y });
+      break;
+    }
+    case 'KICKBOARD': {
+      let bi = -1; for (let i = d0; i < d1; i++) if ((await D('dyn', i, 0)) === 16) bi = i;
+      const a = stations[0];
+      await D('warp', await stationNo(a.i)); await wait(700);
+      const bx = { x: await D('dyn', bi, 1), z: await D('dyn', bi, 3) };
+      const s0 = c.local(a, along(a, bx) - 250, 0); await D('put', s0.x | 0, a.y + 20, s0.z | 0, a.yaw); await wait(400);
+      await steerFor(0, a.yaw, 60, 300); await steer(A, a.yaw, 60); await wait(250); await steer(B_BTN, a.yaw, 60); await wait(1500); await pad(null); await wait(2500);
+      const mid = c.local(a, a.hz + 500, 0);
+      const fy = await D('floor', mid.x | 0, a.y + 300, mid.z | 0, 0), fo = await D('floor', mid.x | 0, a.y + 300, mid.z | 0, 2);
+      rec(mod, fo === 1 && Math.abs(fy - a.y) < 120, { bridgeFloorY: fy - a.y, isObject: fo });
+      break;
+    }
+    case 'BLUECOIN': {
+      const n = L;
+      await D('put', n.x, n.y + 400, n.z, n.yaw); await wait(150); await pad(Z_BTN, 0, 0); await wait(1500); await pad(null);
+      const coins = []; for (let i = d0; i < d1; i++) if ((await D('dyn', i, 0)) === 15) coins.push(i);
+      const c0 = await D('mario', 9);
+      const ci = coins[0]; await D('put', await D('dyn', ci, 1), (await D('dyn', ci, 2)) - 20, await D('dyn', ci, 3), 0); await wait(600);
+      const c1 = await D('mario', 9);
+      rec(mod, c1 - c0 >= 5, { coinsBefore: c0, coinsAfter: c1 });
+      break;
+    }
+    case 'GROUND': {
+      const pads = parts.filter(p => p.type === 0 && p.i !== land);
+      const p1 = pads[0], p2 = pads[1] || L;
+      await D('put', p1.x, p1.y + 60, p1.z, p1.yaw); await wait(1500);
+      const onPad = await mario();
+      await D('put', p2.x, p2.y + 300, p2.z, p2.yaw);
+      let maxY = -1e9; for (let t = 0; t < 30; t++) { await wait(150); maxY = Math.max(maxY, (await mario()).y); }
+      rec(mod, onPad.on === p1.i && maxY > L.y + 40, { standsOnGroundPad: onPad.on === p1.i, padAboveGround: p1.y - (await D('floor', p1.x, p1.y - 30, p1.z, 0)), lift: maxY - p2.y, ledge: L.y - p2.y });
       break;
     }
     case 'ENEMIES': case 'AMPS': {
