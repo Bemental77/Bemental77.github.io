@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index cfac1e8..b95c47d 100644
+index cfac1e8..af268d0 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -170,7 +170,7 @@ endif
@@ -24,7 +24,7 @@ index cfac1e8..b95c47d 100644
  ifeq ($(TARGET_WEB),1)
    PLATFORM_CFLAGS  := -DTARGET_WEB
 -  PLATFORM_LDFLAGS := -lm -no-pie -s TOTAL_MEMORY=20MB -g4 --source-map-base http://localhost:8080/ -s "EXTRA_EXPORTED_RUNTIME_METHODS=['callMain']"
-+  PLATFORM_LDFLAGS := -lm --emit-symbol-map -sTOTAL_MEMORY=128MB -sEXPORTED_RUNTIME_METHODS=callMain,HEAP16,HEAPU8 -sEXPORTED_FUNCTIONS=_main,_daily_restart,_daily_debug_warp,_daily_debug_mario_y,_daily_debug_standing,_daily_debug_inside,_daily_debug_gen,_daily_debug_gen_info,_daily_debug_track,_daily_debug_mode,_daily_debug_auto,_daily_debug_last_beh,_daily_debug_spawn_auto,_daily_debug_isle,_daily_debug_used_auto,_daily_debug_modules,_daily_debug_objective,_daily_debug_dyn_count,_daily_debug_dyn_warp,_daily_debug_defeat_all,_daily_debug_cannon,_daily_debug_next_station,_daily_debug_part_of_cannon,_daily_debug_mod_info,_daily_debug_num_parts,_daily_debug_part,_daily_debug_put,_daily_debug_mario,_daily_debug_cap,_daily_debug_camyaw,_daily_debug_cammode,_daily_debug_floor,_daily_debug_action,_daily_debug_dyn,_daily_debug_num_dyn,_daily_debug_dyn_move,_daily_debug_star,_daily_set_pad,_daily_set_volume,_daily_pause,_daily_set_ghost,_daily_rec_ptr,_daily_rec_count,_malloc,_free
++  PLATFORM_LDFLAGS := -lm --emit-symbol-map -sTOTAL_MEMORY=128MB -sEXPORTED_RUNTIME_METHODS=callMain,HEAP16,HEAPU8 -sEXPORTED_FUNCTIONS=_main,_daily_restart,_daily_debug_warp,_daily_debug_mario_y,_daily_debug_standing,_daily_debug_inside,_daily_debug_gen,_daily_debug_gen_info,_daily_debug_track,_daily_debug_mode,_daily_debug_auto,_daily_debug_last_beh,_daily_debug_spawn_auto,_daily_debug_isle,_daily_debug_used_auto,_daily_debug_modules,_daily_debug_objective,_daily_debug_dyn_count,_daily_debug_dyn_warp,_daily_debug_defeat_all,_daily_debug_cannon,_daily_debug_next_station,_daily_debug_part_of_cannon,_daily_debug_overlap,_daily_debug_near_cannon,_daily_debug_bad_models,_daily_debug_piece_name,_daily_debug_on_part,_daily_debug_mod_info,_daily_debug_num_parts,_daily_debug_part,_daily_debug_put,_daily_debug_mario,_daily_debug_cap,_daily_debug_camyaw,_daily_debug_cammode,_daily_debug_floor,_daily_debug_action,_daily_debug_dyn,_daily_debug_num_dyn,_daily_debug_dyn_move,_daily_debug_star,_daily_set_pad,_daily_set_volume,_daily_pause,_daily_set_ghost,_daily_rec_ptr,_daily_rec_count,_malloc,_free
  endif
  
  PLATFORM_CFLAGS += -DNO_SEGMENTED_MEMORY -DUSE_SYSTEM_MALLOC
@@ -199,6 +199,50 @@ index 5617e5b..5534711 100644
          bhvCmdProc = BehaviorCmdTable[*gCurBhvCommand >> 24];
          bhvProcResult = bhvCmdProc();
      } while (bhvProcResult == BHV_PROC_CONTINUE);
+diff --git a/src/engine/level_script.c b/src/engine/level_script.c
+index 70bf675..c027665 100644
+--- a/src/engine/level_script.c
++++ b/src/engine/level_script.c
+@@ -8,6 +8,7 @@
+ #include "buffers/framebuffers.h"
+ #include "buffers/zbuffer.h"
+ #include "game/area.h"
++#include "game/daily.h"
+ #include "game/game_init.h"
+ #include "game/mario.h"
+ #include "game/memory.h"
+@@ -20,6 +21,7 @@
+ #include "geo_layout.h"
+ #include "graph_node.h"
+ #include "level_script.h"
++#include "game/daily.h"
+ #include "level_misc_macros.h"
+ #include "math_util.h"
+ #include "surface_collision.h"
+@@ -406,6 +408,7 @@ static void level_cmd_load_model_from_dl(void) {
+     if (val1 < 256) {
+         gLoadedGraphNodes[val1] =
+             (struct GraphNode *) init_graph_node_display_list(sLevelPool, 0, val2, val3);
++        daily_note_model(val1, val3);
+     }
+ 
+     sCurrentCmd = CMD_NEXT;
+@@ -417,6 +420,7 @@ static void level_cmd_load_model_from_geo(void) {
+ 
+     if (arg0 < 256) {
+         gLoadedGraphNodes[arg0] = process_geo_layout(sLevelPool, arg1);
++        daily_note_model(arg0, arg1);
+     }
+ 
+     sCurrentCmd = CMD_NEXT;
+@@ -439,6 +443,7 @@ static void level_cmd_23(void) {
+         // is being stored to the array, so cast the pointer.
+         gLoadedGraphNodes[model] =
+             (struct GraphNode *) init_graph_node_scale(sLevelPool, 0, arg0H, arg1, arg2.f);
++        daily_note_model(model, arg1);
+     }
+ 
+     sCurrentCmd = CMD_NEXT;
 diff --git a/src/engine/surface_load.c b/src/engine/surface_load.c
 index 9a5f177..c7cccdc 100644
 --- a/src/engine/surface_load.c
@@ -373,10 +417,10 @@ index e2fb175..e45edb7 100644
      }
 diff --git a/src/game/daily.c b/src/game/daily.c
 new file mode 100644
-index 0000000..2fdeeed
+index 0000000..0e35244
 --- /dev/null
 +++ b/src/game/daily.c
-@@ -0,0 +1,2609 @@
+@@ -0,0 +1,2888 @@
 +// SM64 DAILY PARKOUR
 +//
 +// The page hands this module a seed (window.sm64DailySeed: the date, or a
@@ -632,6 +676,7 @@ index 0000000..2fdeeed
 +#define PM(n) (0xE2 + (n))      // 0xE2..0xFE: free (the host's objects are cleared)
 +#include "daily_lib.inc.h"
 +#include "daily_isles.inc.h"
++#include "daily_models.inc.h"
 +#define MAX_PIECES 128
 +static struct Piece sPiece[MAX_PIECES] = {
 +    { "LLL HEXAGON",     bhvLllRotatingHexagonalPlatform, lll_geo_000A78,   lll_seg7_collision_hexagonal_platform, 0,          R_STEP,     PM(0) },
@@ -673,9 +718,17 @@ index 0000000..2fdeeed
 +
 +static struct AllocOnlyPool *sPool;
 +
++static const void *sSlotGeo[256];   // what each model slot holds: the geo (or display list) last loaded into it
++void daily_note_model(s32 id, const void *src) { if (id >= 0 && id < 256) sSlotGeo[id] = src; }
 +static void load_model(u8 id, const GeoLayout *geo) {
 +    gLoadedGraphNodes[id] = process_geo_layout(sPool, (void *) geo);
++    sSlotGeo[id] = geo;
 +}
++// Model slots the course has given out (generate); the rest of 0x16..0x73 are free for models
++// loaded on demand (daily_model_for).
++static u8 sClaimed[256];
++#define FREE_SLOT_LO 0x16
++#define FREE_SLOT_HI 0x73
 +
 +// Footprint and walkable top of a piece, from its collision vertices (TERRAIN_LOAD_VERTICES list).
 +static void measure(struct Piece *p) {
@@ -1130,7 +1183,55 @@ index 0000000..2fdeeed
 +    }
 +}
 +
++// The day's enemy groups (and its boss) are rolled after the inventory pieces took their model
++// slots, so a piece can hold a slot one of the day's enemies loads its model into — the enemy then
++// wears the piece's model or the piece the enemy's. Such pieces move to a free slot.
 +static u8 sPieceOn[128];
++static void settle_slots(void) {
++    u8 need[256];
++    s32 i, s;
++    bzero(need, sizeof(need));
++    for (i = 0; i < NUM_LIB; i++) if (lib_ok(i) && sLib[i].group != 1) need[sLib[i].model] = need[sLib[i].model2] = need[sLib[i].model3] = 1;
++    if (sBoss >= 0) need[sBosses[sBoss].model] = need[sBosses[sBoss].model2] = 1;
++    if (sGroupB == 15) need[MODEL_CHAIN_CHOMP] = need[MODEL_METALLIC_BALL] = need[MODEL_WOODEN_POST] = 1;
++    need[MODEL_NONE] = 0;
++    for (i = 0; i < 256; i++) if (need[i]) sClaimed[i] = 1;
++    for (i = NUM_BUILTIN_PIECES; i < sNumPieces; i++) {
++        if (sPiece[i].geo == NULL || !need[sPiece[i].model]) continue;
++        for (s = FREE_SLOT_LO; s <= FREE_SLOT_HI && sClaimed[s]; s++) ;
++        if (s > FREE_SLOT_HI) { sPieceOn[i] = 0; continue; }
++        sPiece[i].model = (u8) s; sClaimed[s] = 1;
++    }
++    for (i = 0; i < 2; i++) {
++        if (!need[sIsleSlot[i]]) continue;
++        for (s = FREE_SLOT_LO; s <= FREE_SLOT_HI && sClaimed[s]; s++) ;
++        if (s <= FREE_SLOT_HI) { sIsleSlot[i] = (u8) s; sClaimed[s] = 1; }
++    }
++}
++
++// Children and model switches: a hidden Moneybag spawns MODEL_MONEYBAG (0x66), a slot that holds
++// the Chain Chomp or Mr. I's iris in other enemy groups (model_ids.h:433,445,450). Every
++// (behavior, model id) pair SM64 uses has its geo in sModelGeo (gen_models.py); when the slot holds
++// something else, the geo is loaded into a free slot (once) and that slot is used instead.
++static s32 sNoRemap;   // test hook (window.sm64DailyNoRemap): measure the course without it
++u32 daily_model_for(u32 model, const void *beh) {
++    const GeoLayout *want = NULL;
++    s32 i, s;
++    if (model == 0 || model >= 256 || beh == NULL || sNoRemap || !daily_active()) return model;
++    for (i = 0; i < NUM_MODEL_GEO; i++) {
++        if (sModelGeo[i].model != model || segmented_to_virtual((void *) sModelGeo[i].beh) != beh) continue;
++        if (sSlotGeo[model] == sModelGeo[i].geo) return model;   // any of the pair's geos will do
++        if (want == NULL) want = sModelGeo[i].geo;
++    }
++    if (want == NULL) return model;
++    for (s = 1; s < 256; s++) if (sSlotGeo[s] == want && gLoadedGraphNodes[s] != NULL) return (u32) s;
++    for (s = FREE_SLOT_LO; s <= FREE_SLOT_HI && sClaimed[s]; s++) ;
++    if (s > FREE_SLOT_HI) return model;
++    sClaimed[s] = 1;
++    load_model((u8) s, want);
++    return (u32) s;
++}
++
 +static s32 sNumAutoDrawn;   // this seed's set of moving platforms (generate)
 +static s32 pick_step_piece(void) {
 +    s32 tries;
@@ -2008,18 +2109,129 @@ index 0000000..2fdeeed
 +}
 +
 +// This seed's extras, each on one or two platforms, toward a corner, standing on the top.
++// ── what occupies space ────────────────────────────────────────────────────
++// A part's solid volume as an upright oriented box: centre, half extents along its local axes,
++// heading, bottom and top. Pieces use the extents of their collision; extras that far, too.
++struct Shape { f32 x, z, hx, hz, lo, hi; s16 yaw; };
++static s32 part_shape(struct Part *p, struct Shape *sh) {
++    sh->x = p->x; sh->z = p->z; sh->yaw = p->yaw;
++    switch (p->type) {
++        case PT_CHECKER: case PT_BOX: case PT_DECOR:
++            sh->hx = p->hx; sh->hz = p->hz; sh->hi = p->y; sh->lo = p->y - p->h;
++            if (p->type == PT_DECOR) { sh->lo = p->y - p->h; }
++            return TRUE;
++        case PT_PIECE: {
++            struct Piece *pc = &sPiece[p->piece];
++            if (pc->col == NULL && pc->role != R_EXTRA && pc->role != R_HAZ_ANY) return FALSE;
++            sh->hx = DMAX(pc->rx, 60.0f); sh->hz = DMAX(pc->rz, 60.0f);
++            sh->lo = p->y + pc->minY; sh->hi = p->y + pc->maxY;
++            return TRUE;
++        }
++        case PT_ISLE: {
++            struct IsleInfo *f = &sIsleInfo[p->piece];
++            sh->x = p->x + p->sc * (f->x0 + f->x1) / 2.0f; sh->z = p->z + p->sc * (f->z0 + f->z1) / 2.0f; sh->yaw = 0;
++            sh->hx = p->sc * (f->x1 - f->x0) / 2.0f; sh->hz = p->sc * (f->z1 - f->z0) / 2.0f;
++            sh->lo = p->y + p->sc * f->y0; sh->hi = p->y + p->sc * f->y1;
++            return TRUE;
++        }
++        case PT_OBJ:   // a cannon (and the room to stand at it) or a floor switch
++            sh->hx = sh->hz = p->kind == OK_CANNON ? 160.0f : 110.0f; sh->lo = p->y; sh->hi = p->y + 250.0f;
++            return TRUE;
++        case PT_POLE:
++            sh->hx = sh->hz = 40.0f; sh->lo = p->y; sh->hi = p->y + 2000.0f;
++            return TRUE;
++    }
++    return FALSE;
++}
++// Separating axis test for two upright boxes, shrunk by `slack` (touching is fine).
++static s32 shapes_meet(struct Shape *a, struct Shape *b, f32 slack, f32 vslack) {
++    s16 ax[4] = { a->yaw, a->yaw + 0x4000, b->yaw, b->yaw + 0x4000 };
++    s32 k;
++    if (a->hi - vslack <= b->lo || b->hi - vslack <= a->lo) return FALSE;
++    for (k = 0; k < 4; k++) {
++        f32 ux = sins(ax[k]), uz = coss(ax[k]);
++        f32 d = absf((b->x - a->x) * ux + (b->z - a->z) * uz);
++        f32 ra = a->hz * absf(coss(ax[k] - a->yaw)) + a->hx * absf(sins(ax[k] - a->yaw));
++        f32 rb = b->hz * absf(coss(ax[k] - b->yaw)) + b->hx * absf(sins(ax[k] - b->yaw));
++        if (d >= ra + rb - slack) return FALSE;
++    }
++    return TRUE;
++}
++static s32 module_of(s32 i) {
++    s32 k;
++    for (k = 0; k < sNumMods; k++) if (i >= sModStart[k] && i < sModStart[k + 1]) return k;
++    return -1;
++}
++// Extras (NPCs, signs, 1-ups, crazy boxes...) stand on stations, each clear of everything else
++// there: the station's other parts, cannons and switches (with room to walk up to them), enemies,
++// a checkpoint's star, and each other. One that doesn't fit anywhere is left out.
++static s32 extra_fits(struct Part *e, f32 R, struct Part *st) {
++    struct Shape a, b;
++    s32 j;
++    a.x = e->x; a.z = e->z; a.yaw = 0; a.hx = a.hz = R; a.lo = e->y + sPiece[e->piece].minY; a.hi = e->y + DMAX(sPiece[e->piece].maxY, 160.0f);
++    for (j = 0; j < sNumParts; j++) {
++        struct Part *q = &sPart[j];
++        if (q == e || q == st || !part_shape(q, &b)) continue;
++        if (q->type == PT_OBJ) { f32 room = q->kind == OK_CANNON ? 600.0f : 250.0f; b.hx += room; b.hz += room; }   // room to reach a cannon or a switch, unbothered
++        if (q->type == PT_PIECE && sPiece[q->piece].role == R_EXTRA) { b.hx = b.hz = DMAX(sPiece[q->piece].r, 60.0f); }
++        if (shapes_meet(&a, &b, -60.0f, -20.0f)) return FALSE;
++    }
++    for (j = 0; j < sNumDyn; j++) {
++        f32 dx = sDyn[j].x - e->x, dz = sDyn[j].z - e->z;
++        if (dx * dx + dz * dz < (R + 200.0f) * (R + 200.0f) && absf(sDyn[j].y - e->y) < 400.0f) return FALSE;
++    }
++    if ((st->check || st == &sPart[sGoal])) {
++        f32 dx = st->x - e->x, dz = st->z - e->z;
++        if (dx * dx + dz * dz < (R + 160.0f) * (R + 160.0f)) return FALSE;
++    }
++    return TRUE;
++}
++// The stream position the original placement left behind: per extra piece, 1 + rnd_i(2) copies
++// (re-drawn each loop test), each a station, a yaw and a spot (two rnd_f).
++static u32 old_extras_draws(void) {
++    u32 save = sRng, after;
++    s32 ns = 0, i, k, np = sNumParts;
++    for (i = 1; i < sNumParts; i++) if (sPart[i].station && i != sGoal && sPart[i].hx >= 200.0f && sPart[i].hz >= 200.0f) ns++;
++    if (ns > 0) {
++        for (i = NUM_BUILTIN_PIECES; i < NUM_PIECES; i++) {
++            if (sPiece[i].role != R_EXTRA) continue;
++            for (k = 0; k < 1 + rnd_i(2) && np < MAX_PARTS - 4; k++) {
++                rnd_i(ns);
++                if (np >= MAX_PARTS) goto done;
++                np++;
++                rnd_u32(); rnd_f(0, 1); rnd_f(0, 1);
++            }
++        }
++    }
++done:
++    after = sRng; sRng = save;
++    return after;
++}
 +static void place_extras(void) {
-+    s32 st[MAX_PARTS], ns = 0, i, k;
++    s32 st[MAX_PARTS], ns = 0, i, k, t;
 +    for (i = 1; i < sNumParts; i++) if (sPart[i].station && i != sGoal && sPart[i].hx >= 200.0f && sPart[i].hz >= 200.0f) st[ns++] = i;
 +    if (ns == 0) return;
 +    for (i = NUM_BUILTIN_PIECES; i < NUM_PIECES; i++) {
++        f32 R;
 +        if (sPiece[i].role != R_EXTRA) continue;
++        // bhvStaticObject is a level's scenery (LLL's, here: lll_geo_000AC0) with no collision: on a
++        // station it reads as a floor over the floor, and Mario runs through it.
++        if (sPiece[i].beh == bhvStaticObject) continue;
++        R = DMAX(sPiece[i].r, 60.0f);
 +        for (k = 0; k < 1 + rnd_i(2) && sNumParts < MAX_PARTS - 4; k++) {
-+            struct Part *s = &sPart[st[rnd_i(ns)]], *e = add_part(PT_PIECE);
++            struct Part *e = add_part(PT_PIECE);
 +            if (!e) return;
-+            e->piece = i; e->yaw = (s16) (rnd_u32() & 0xFFFF); e->r = 1; e->h = 0;
-+            local_pt(s, rnd_f(-(s->hz - 120), s->hz - 120), rnd_f(-(s->hx - 120), s->hx - 120), &e->x, &e->z);
-+            e->y = s->y - DMIN(sPiece[i].minY, 0.0f) + 2.0f;
++            e->piece = i; e->r = 1; e->h = 0;
++            for (t = 0; t < 24; t++) {
++                struct Part *s = &sPart[st[rnd_i(ns)]];
++                f32 mx = s->hx - R - 40.0f, mz = s->hz - R - 40.0f;
++                e->yaw = (s16) (rnd_u32() & 0xFFFF);
++                if (mx < 0 || mz < 0) continue;
++                local_pt(s, rnd_f(-mz, mz), rnd_f(-mx, mx), &e->x, &e->z);
++                e->y = s->y - DMIN(sPiece[i].minY, 0.0f) + 2.0f;
++                if (extra_fits(e, R, s)) break;
++            }
++            if (t == 24) { sNumParts--; break; }
 +        }
 +    }
 +}
@@ -2113,7 +2325,15 @@ index 0000000..2fdeeed
 +    sPart[cur].goal = 1; sPart[cur].check = 0; sPart[cur].fk = 0;
 +    sPart[cur].hx = DMAX(sPart[cur].hx, 280.0f); sPart[cur].hz = DMAX(sPart[cur].hz, 280.0f);
 +    for (sNumStations = 0, i = 0; i < sNumParts; i++) if (sPart[i].station) sNumStations++;
-+    place_extras();
++    {
++        // Extras draw from their own stream; the rest of the course carries on from where the old
++        // placement (any extras anywhere on a station) left the seed's stream, so the coins and
++        // enemies of every course already played are where they were.
++        u32 after = old_extras_draws(), own = sRng ^ 0x9E3779B9u;
++        sRng = own ? own : 1;
++        place_extras();
++        sRng = after;
++    }
 +    place_collectibles();
 +    if (sMode == MODE_COINS) {
 +        s32 t = 0;
@@ -2168,7 +2388,7 @@ index 0000000..2fdeeed
 +            measure(&sPiece[i]); sPieceOn[i] = (PRNG() % 100) < 35;
 +        }
 +        {
-+            static u8 claimed[256];
++            u8 *claimed = sClaimed;
 +            s32 a, tries;
 +            bzero(claimed, sizeof(claimed));
 +            for (a = 0x00; a <= 0x15; a++) claimed[a] = 1;            // Mario, our boxes
@@ -2238,6 +2458,7 @@ index 0000000..2fdeeed
 +        if (sBoss == BOSS_BIG_BOO) sGroupA = 10;
 +        if (sBoss == BOSS_KING_WHOMP) sGroupB = 15;
 +        if (sBoss == BOSS_CHESTS) sGroupB = 14;
++        settle_slots();
 +        #undef PRNG
 +    }
 +    for (k = 0; k < 8; k++) {
@@ -2304,11 +2525,81 @@ index 0000000..2fdeeed
 +                 case 4: return sModStart[k + 1]; case 5: return sModDynStart[k]; default: return sModDynStart[k + 1]; }
 +}
 +s32 daily_debug_num_parts(void) { return sNumParts; }
++// Test hook: the name of the SM64 piece a part is (0 if it is none).
++s32 daily_debug_piece_name(s32 i) { return sPart[i].type == PT_PIECE ? (s32) (uintptr_t) sPiece[sPart[i].piece].name : 0; }
 +// Test hook: part i's [0..2] x y z, [3] type, [4] box kind, [5] hx, [6] hz, [7] yaw, [8] param, [9] kind.
++// Test hook: pairs of parts from different modules (or extras) that occupy the same space.
++// k = -1: the count; k >= 0: pair k as i * 1000 + j.
++s32 daily_debug_overlap(s32 k) {
++    s32 i, j, n = 0;
++    struct Shape a, b;
++    for (i = 0; i < sNumParts; i++) {
++        if (!part_shape(&sPart[i], &a)) continue;
++        for (j = i + 1; j < sNumParts; j++) {
++            s32 mi = module_of(i), mj = module_of(j);
++            if (mi == mj && mi >= 0) continue;
++            if (!part_shape(&sPart[j], &b)) continue;
++            if (!shapes_meet(&a, &b, 20.0f, 20.0f)) continue;
++            if (k == n) return i * 1000 + j;
++            n++;
++        }
++    }
++    return k < 0 ? n : -1;
++}
++// Test hook: live objects wearing a model their behavior never uses (sModelGeo); k = -1 the count,
++// k >= 0 the k-th one's behavior address.
++s32 daily_debug_bad_models(s32 k) {
++    s32 i, n = 0;
++    for (i = 0; i < NUM_OBJ_LISTS; i++) {
++      struct ObjectNode *head = &gObjectLists[i], *nd;
++      for (nd = head->next; nd != head; nd = nd->next) {
++        struct Object *ob = (struct Object *) nd;
++        s32 t, known = 0, ok = 0;
++        if (ob->activeFlags == ACTIVE_FLAG_DEACTIVATED || ob->header.gfx.sharedChild == NULL) continue;
++        for (t = 0; t < NUM_MODEL_GEO && !ok; t++) {
++            s32 sl;
++            if (segmented_to_virtual((void *) sModelGeo[t].beh) != ob->behavior) continue;
++            known = 1;
++            for (sl = 1; sl < 256 && !ok; sl++) if (gLoadedGraphNodes[sl] == ob->header.gfx.sharedChild && sSlotGeo[sl] == sModelGeo[t].geo) ok = 1;
++        }
++        for (t = 0; t < NUM_PIECES && known && !ok; t++) {   // or the geo we load that piece with
++            s32 sl;
++            if (sPiece[t].geo == NULL || segmented_to_virtual((void *) sPiece[t].beh) != ob->behavior) continue;
++            for (sl = 1; sl < 256 && !ok; sl++) if (gLoadedGraphNodes[sl] == ob->header.gfx.sharedChild && sSlotGeo[sl] == sPiece[t].geo) ok = 1;
++        }
++        if (!known || ok) continue;
++        if (k == n) {   // its behavior's name
++            for (t = 0; t < NUM_MODEL_GEO; t++) if (segmented_to_virtual((void *) sModelGeo[t].beh) == ob->behavior) return (s32) (uintptr_t) sModelGeo[t].name;
++            return 1;
++        }
++        n++;
++      }
++    }
++    return k < 0 ? n : 0;
++}
++// Test hook: enemies within `d` of a cannon (horizontally, and within 600 vertically).
++s32 daily_debug_near_cannon(s32 d) {
++    s32 i, j, n = 0;
++    for (i = 0; i < sNumParts; i++) {
++        if (sPart[i].type != PT_OBJ || sPart[i].kind != OK_CANNON) continue;
++        for (j = 0; j < sNumDyn; j++) {
++            f32 dx = sDyn[j].x - sPart[i].x, dz = sDyn[j].z - sPart[i].z;
++            if (!is_enemy(sDyn[j].kind)) continue;
++            if (dx * dx + dz * dz < (f32) d * d && absf(sDyn[j].y - sPart[i].y) < 600.0f) n++;
++        }
++    }
++    return n;
++}
 +s32 daily_debug_part(s32 i, s32 f) {
 +    struct Part *p = &sPart[i];
 +    switch (f) { case 0: return (s32) p->x; case 1: return (s32) p->y; case 2: return (s32) p->z; case 3: return p->type; case 4: return p->box;
-+                 case 5: return (s32) p->hx; case 6: return (s32) p->hz; case 7: return p->yaw; case 8: return p->param; default: return p->kind; }
++                 case 5: return (s32) p->hx; case 6: return (s32) p->hz; case 7: return p->yaw; case 8: return p->param;
++                 case 10: return (s32) top_of(p); case 11: return p->type == PT_PIECE ? sPiece[p->piece].role : -1;
++                 case 12: return p->type == PT_PIECE ? (s32) sPiece[p->piece].rx : (s32) p->hx;
++                 case 13: return p->type == PT_PIECE ? (s32) sPiece[p->piece].rz : (s32) p->hz;
++                 case 14: return p->obj != NULL ? (s32) p->obj->oCollisionDistance : -1;
++                 case 15: return p->pitch;
++                 default: return p->kind; }
 +}
 +
 +// ── objects ─────────────────────────────────────────────────────────────────
@@ -2618,6 +2909,14 @@ index 0000000..2fdeeed
 +s32 daily_debug_mario_y(void) { return (s32) gMarioState->pos[1]; }
 +static s32 standing_on(void);
 +s32 daily_debug_standing(void) { return standing_on(); }
++// Test hook: 1 if Mario stands on part i's object, 2 if he is in the air, 0 if he stands on something else.
++s32 daily_debug_on_part(s32 i) {
++    struct MarioState *m = gMarioState;
++    if (m->action & ACT_FLAG_AIR) return 2;
++    if (m->floor == NULL || m->floor->object == NULL) return 0;
++    if (m->floor->object == sPart[i].obj) return 1;
++    return m->floor->object->behavior == segmented_to_virtual(bhvDailyPlatform) && (m->floor->object->oBehParams & 0xFF) == (i & 0xFF);   // its checkpoint cap
++}
 +// Test hooks: put Mario at (x, y, z) facing yaw, standing/falling; read his state; hand him a cap.
 +void daily_debug_put(s32 x, s32 y, s32 z, s32 yaw) {
 +    struct MarioState *m = gMarioState;
@@ -2632,7 +2931,16 @@ index 0000000..2fdeeed
 +        case 0: return (s32) m->pos[0]; case 1: return (s32) m->pos[1]; case 2: return (s32) m->pos[2];
 +        case 3: return (s32) m->action; case 4: return m->health; case 5: return (s32) m->flags;
 +        case 6: return m->floor ? m->floor->type : -1; case 7: return (s32) m->forwardVel; case 8: return (s32) (m->quicksandDepth);
-+        case 9: return m->numCoins; case 11: return (s32) m->floorHeight; default: return m->floor && m->floor->object ? (s32) (m->floor->object->oBehParams & 0xFF) : -1;
++        case 9: return m->numCoins; case 11: return (s32) m->floorHeight;
++        case 12: {   // the name of the behavior of the object Mario stands on (1: ours, 0: the level)
++            s32 t;
++            if (m->floor == NULL || m->floor->object == NULL) return 0;
++            for (t = 0; t < NUM_MODEL_GEO; t++) if (segmented_to_virtual((void *) sModelGeo[t].beh) == m->floor->object->behavior) return (s32) (uintptr_t) sModelGeo[t].name;
++            return 1;
++        }
++        case 13: return m->floor && m->floor->object ? (s32) m->floor->object->oPosY : -99999;
++        case 14: return m->floor && m->floor->object ? (s32) m->floor->object->oBehParams : -1;
++        default: return m->floor && m->floor->object ? (s32) (m->floor->object->oBehParams & 0xFF) : -1;
 +    }
 +}
 +// Test hook: the floor under (x, y, z): f 0 = height, 1 = type, 2 = is one of our objects.
@@ -2842,6 +3150,9 @@ index 0000000..2fdeeed
 +        sDay = EM_ASM_INT({ return (typeof window !== 'undefined' && window.sm64DailyNumber) | 0; });
 +#endif
 +        sHostEnv = gEnvironmentRegions;
++#ifdef TARGET_WEB
++        sNoRemap = EM_ASM_INT({ return (typeof window !== 'undefined' && window.sm64DailyNoRemap) ? 1 : 0; });
++#endif
 +        clear_host_objects();
 +        generate(seed, dow);
 +        load_all_models();
@@ -2868,6 +3179,18 @@ index 0000000..2fdeeed
 +        EM_ASM({ if (typeof window !== 'undefined' && window.sm64DailyReady) window.sm64DailyReady($0, $1); }, sNumStations, sNumParts);
 +#endif
 +        return;
++    }
++    // SM64 pieces load their collision only while Mario is within oCollisionDistance of their
++    // origin (surface_load.c:838) — 1000 by default (spawn_object.c:309), 400 for a TTC elevator.
++    // In their home levels that is enough; on a course a long piece's far end, or a moving one that
++    // has carried its surface away from its origin, would be a floor Mario falls through.
++    for (i = 0; i < sNumParts; i++) {
++        struct Part *p = &sPart[i];
++        f32 need;
++        if (p->type != PT_PIECE || p->obj == NULL || p->obj->activeFlags == ACTIVE_FLAG_DEACTIVATED
++            || p->obj->behavior != segmented_to_virtual((void *) sPiece[p->piece].beh)) continue;
++        need = sPiece[p->piece].r + (sPiece[p->piece].maxY - sPiece[p->piece].minY) + 1500.0f;
++        if (p->obj->oCollisionDistance < need) p->obj->oCollisionDistance = need;
 +    }
 +    if (sRestartReq) { sRestartReq = FALSE; begin_run(); return; }
 +
@@ -2988,10 +3311,10 @@ index 0000000..2fdeeed
 +}
 diff --git a/src/game/daily.h b/src/game/daily.h
 new file mode 100644
-index 0000000..5c7262d
+index 0000000..bb28f14
 --- /dev/null
 +++ b/src/game/daily.h
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,71 @@
 +#ifndef DAILY_H
 +#define DAILY_H
 +
@@ -3023,6 +3346,8 @@ index 0000000..5c7262d
 +s32 daily_take_star(struct Object *o);
 +s32 daily_intercept_warp(s32 warpOp);
 +s32 daily_active(void);
++void daily_note_model(s32 id, const void *src);
++u32 daily_model_for(u32 model, const void *beh);
 +void daily_star_target(f32 *x, f32 *y, f32 *z);
 +s32 daily_debug_mode(void);
 +s32 daily_debug_auto(void);
@@ -3038,6 +3363,11 @@ index 0000000..5c7262d
 +s32 daily_debug_cannon(s32 k);
 +s32 daily_debug_next_station(s32 part);
 +s32 daily_debug_part_of_cannon(s32 k);
++s32 daily_debug_overlap(s32 k);
++s32 daily_debug_near_cannon(s32 d);
++s32 daily_debug_bad_models(s32 k);
++s32 daily_debug_piece_name(s32 i);
++s32 daily_debug_on_part(s32 i);
 +s32 daily_debug_mod_info(s32 k, s32 f);
 +s32 daily_debug_num_parts(void);
 +s32 daily_debug_part(s32 i, s32 f);
@@ -3523,6 +3853,487 @@ index 0000000..19401fe
 +    { "WoodenPost", bhvWoodenPost, wooden_post_geo, 0x00000000, 2, MODEL_WOODEN_POST, 0 },
 +};
 +#define NUM_AUTO ((s32) (sizeof(sAuto) / sizeof(sAuto[0])))
+diff --git a/src/game/daily_models.inc.h b/src/game/daily_models.inc.h
+new file mode 100644
+index 0000000..50fa2ce
+--- /dev/null
++++ b/src/game/daily_models.inc.h
+@@ -0,0 +1,475 @@
++// Generated by gen_models.py - do not edit. (behavior, model id) -> the geo it means there.
++#include "actors/common0.h"
++#include "actors/common1.h"
++#include "actors/group0.h"
++#include "actors/group1.h"
++#include "actors/group10.h"
++#include "actors/group11.h"
++#include "actors/group12.h"
++#include "actors/group13.h"
++#include "actors/group14.h"
++#include "actors/group15.h"
++#include "actors/group16.h"
++#include "actors/group17.h"
++#include "actors/group2.h"
++#include "actors/group3.h"
++#include "actors/group4.h"
++#include "actors/group5.h"
++#include "actors/group6.h"
++#include "actors/group7.h"
++#include "actors/group8.h"
++#include "actors/group9.h"
++#include "levels/bbh/header.h"
++#include "levels/bitdw/header.h"
++#include "levels/bitfs/header.h"
++#include "levels/bits/header.h"
++#include "levels/bob/header.h"
++#include "levels/bowser_2/header.h"
++#include "levels/bowser_3/header.h"
++#include "levels/castle_grounds/header.h"
++#include "levels/castle_inside/header.h"
++#include "levels/ccm/header.h"
++#include "levels/ddd/header.h"
++#include "levels/hmc/header.h"
++#include "levels/jrb/header.h"
++#include "levels/lll/header.h"
++#include "levels/rr/header.h"
++#include "levels/sl/header.h"
++#include "levels/ssl/header.h"
++#include "levels/thi/header.h"
++#include "levels/ttc/header.h"
++#include "levels/ttm/header.h"
++#include "levels/vcutm/header.h"
++#include "levels/wdw/header.h"
++#include "levels/wf/header.h"
++struct ModelGeo { const BehaviorScript *beh; u8 model; const GeoLayout *geo; const char *name; };
++static const struct ModelGeo sModelGeo[] = {
++    { bhv1Up, MODEL_1UP, mushroom_1up_geo, "1Up" },
++    { bhv1upRunningAway, MODEL_1UP, mushroom_1up_geo, "1upRunningAway" },
++    { bhv1upWalking, MODEL_1UP, mushroom_1up_geo, "1upWalking" },
++    { bhvActivatedBackAndForthPlatform, MODEL_BITFS_ELEVATOR, bitfs_geo_000678, "ActivatedBackAndForthPlatform" },
++    { bhvActivatedBackAndForthPlatform, MODEL_BITS_ARROW_PLATFORM, bits_geo_000658, "ActivatedBackAndForthPlatform" },
++    { bhvAnimatesOnFloorSwitchPress, MODEL_BITDW_STAIRCASE, geo_bitdw_000600, "AnimatesOnFloorSwitchPress" },
++    { bhvAnimatesOnFloorSwitchPress, MODEL_BITS_STAIRCASE, bits_geo_0006A0, "AnimatesOnFloorSwitchPress" },
++    { bhvAnimatesOnFloorSwitchPress, MODEL_RR_TRICKY_TRIANGLES, rr_geo_000958, "AnimatesOnFloorSwitchPress" },
++    { bhvArrowLift, MODEL_WDW_ARROW_LIFT, wdw_geo_000598, "ArrowLift" },
++    { bhvBalconyBigBoo, MODEL_BOO, boo_geo, "BalconyBigBoo" },
++    { bhvBbhTiltingTrapPlatform, MODEL_BBH_TILTING_FLOOR_PLATFORM, geo_bbh_0005C8, "BbhTiltingTrapPlatform" },
++    { bhvBbhTumblingBridge, MODEL_BBH_TUMBLING_PLATFORM, geo_bbh_0005E0, "BbhTumblingBridge" },
++    { bhvBeginningLakitu, MODEL_LAKITU, lakitu_geo, "BeginningLakitu" },
++    { bhvBeginningPeach, MODEL_PEACH, peach_geo, "BeginningPeach" },
++    { bhvBetaChestBottom, MODEL_TREASURE_CHEST_BASE, treasure_chest_base_geo, "BetaChestBottom" },
++    { bhvBetaChestLid, MODEL_TREASURE_CHEST_BASE, treasure_chest_base_geo, "BetaChestLid" },
++    { bhvBetaChestLid, MODEL_TREASURE_CHEST_LID, treasure_chest_lid_geo, "BetaChestLid" },
++    { bhvBetaMovingFlames, MODEL_RED_FLAME, red_flame_geo, "BetaMovingFlames" },
++    { bhvBetaTrampolineSpring, MODEL_TRAMPOLINE, springboard_top_geo, "BetaTrampolineSpring" },
++    { bhvBetaTrampolineSpring, MODEL_TRAMPOLINE_CENTER, springboard_spring_geo, "BetaTrampolineSpring" },
++    { bhvBetaTrampolineTop, MODEL_TRAMPOLINE, springboard_top_geo, "BetaTrampolineTop" },
++    { bhvBigBoulder, MODEL_HMC_ROLLING_ROCK, hmc_geo_000548, "BigBoulder" },
++    { bhvBigBully, MODEL_BULLY_BOSS, bully_boss_geo, "BigBully" },
++    { bhvBigBullyWithMinions, MODEL_BULLY_BOSS, bully_boss_geo, "BigBullyWithMinions" },
++    { bhvBigChillBully, MODEL_BIG_CHILL_BULLY, chilly_chief_big_geo, "BigChillBully" },
++    { bhvBigSnowmanWhole, MODEL_CCM_SNOWMAN_BASE, ccm_geo_0003F0, "BigSnowmanWhole" },
++    { bhvBird, MODEL_BIRDS, birds_geo, "Bird" },
++    { bhvBitfsSinkingCagePlatform, MODEL_BITFS_SINKING_CAGE_PLATFORM, bitfs_geo_000690, "BitfsSinkingCagePlatform" },
++    { bhvBitfsSinkingPlatforms, MODEL_BITFS_SINKING_PLATFORMS, bitfs_geo_000770, "BitfsSinkingPlatforms" },
++    { bhvBitfsTiltingInvertedPyramid, MODEL_BITFS_TILTING_SQUARE_PLATFORM, bitfs_geo_0006C0, "BitfsTiltingInvertedPyramid" },
++    { bhvBlackSmokeBowser, MODEL_BURN_SMOKE, burn_smoke_geo, "BlackSmokeBowser" },
++    { bhvBlackSmokeMario, MODEL_BURN_SMOKE, burn_smoke_geo, "BlackSmokeMario" },
++    { bhvBlueBowserFlame, MODEL_RED_FLAME, red_flame_geo, "BlueBowserFlame" },
++    { bhvBlueFish, MODEL_FISH, fish_geo, "BlueFish" },
++    { bhvBobomb, MODEL_BLACK_BOBOMB, black_bobomb_geo, "Bobomb" },
++    { bhvBobombBuddy, MODEL_BOBOMB_BUDDY, bobomb_buddy_geo, "BobombBuddy" },
++    { bhvBobombBuddyOpensCannon, MODEL_BOBOMB_BUDDY, bobomb_buddy_geo, "BobombBuddyOpensCannon" },
++    { bhvBobombBullyDeathSmoke, MODEL_SMOKE, smoke_geo, "BobombBullyDeathSmoke" },
++    { bhvBobombFuseSmoke, MODEL_SMOKE, smoke_geo, "BobombFuseSmoke" },
++    { bhvBoo, MODEL_BOO, boo_geo, "Boo" },
++    { bhvBooCage, MODEL_HAUNTED_CAGE, haunted_cage_geo, "BooCage" },
++    { bhvBooInCastle, MODEL_BOO_CASTLE, boo_castle_geo, "BooInCastle" },
++    { bhvBooStaircase, MODEL_BBH_STAIRCASE_STEP, geo_bbh_0005B0, "BooStaircase" },
++    { bhvBooWithCage, MODEL_BOO, boo_geo, "BooWithCage" },
++    { bhvBookSwitch, MODEL_BOOKEND, bookend_geo, "BookSwitch" },
++    { bhvBookSwitch, MODEL_BOOKEND_PART, bookend_part_geo, "BookSwitch" },
++    { bhvBookendSpawn, MODEL_BOOKEND_PART, bookend_part_geo, "BookendSpawn" },
++    { bhvBouncingFireballFlame, MODEL_RED_FLAME, red_flame_geo, "BouncingFireballFlame" },
++    { bhvBowlingBall, MODEL_BOWLING_BALL, bowling_ball_geo, "BowlingBall" },
++    { bhvBowser, MODEL_BOWSER_NO_SHADOW, bowser_geo_no_shadow, "Bowser" },
++    { bhvBowserBodyAnchor, MODEL_BOWSER_NO_SHADOW, bowser_geo_no_shadow, "BowserBodyAnchor" },
++    { bhvBowserBomb, MODEL_BOWSER_BOMB, bowser_bomb_geo, "BowserBomb" },
++    { bhvBowserBombExplosion, MODEL_BOWSER_FLAMES, bowser_flames_geo, "BowserBombExplosion" },
++    { bhvBowserBombSmoke, MODEL_BOWSER_SMOKE, bowser_impact_smoke_geo, "BowserBombSmoke" },
++    { bhvBowserFlameSpawn, MODEL_BOWSER_BOMB_CHILD_OBJ, bowser_bomb_geo, "BowserFlameSpawn" },
++    { bhvBowserFlameSpawn, MODEL_BOWSER_NO_SHADOW, bowser_geo_no_shadow, "BowserFlameSpawn" },
++    { bhvBowserKey, MODEL_BOWSER_KEY, bowser_key_geo, "BowserKey" },
++    { bhvBowserKeyCourseExit, MODEL_BOWSER_KEY_CUTSCENE, bowser_key_cutscene_geo, "BowserKeyCourseExit" },
++    { bhvBowserKeyUnlockDoor, MODEL_BOWSER_KEY_CUTSCENE, bowser_key_cutscene_geo, "BowserKeyUnlockDoor" },
++    { bhvBowserShockWave, MODEL_BOWSER_WAVE, invisible_bowser_accessory_geo, "BowserShockWave" },
++    { bhvBowserSubDoor, MODEL_DDD_BOWSER_SUB_DOOR, ddd_geo_000478, "BowserSubDoor" },
++    { bhvBowserTailAnchor, MODEL_BOWSER_NO_SHADOW, bowser_geo_no_shadow, "BowserTailAnchor" },
++    { bhvBowsersSub, MODEL_DDD_BOWSER_SUB, ddd_geo_0004A0, "BowsersSub" },
++    { bhvBreakableBox, MODEL_BREAKABLE_BOX_SMALL, breakable_box_small_geo, "BreakableBox" },
++    { bhvBreakableBoxSmall, MODEL_BREAKABLE_BOX_SMALL, breakable_box_small_geo, "BreakableBoxSmall" },
++    { bhvBubba, MODEL_BUBBA, bubba_geo, "Bubba" },
++    { bhvBubbleMaybe, MODEL_BUBBLE, bubble_geo, "BubbleMaybe" },
++    { bhvBubbleParticleSpawner, MODEL_BUBBLE, bubble_geo, "BubbleParticleSpawner" },
++    { bhvBubbleSplash, MODEL_SMALL_WATER_SPLASH, small_water_splash_geo, "BubbleSplash" },
++    { bhvBulletBill, MODEL_BULLET_BILL, bullet_bill_geo, "BulletBill" },
++    { bhvBulletBillCannon, MODEL_LEVEL_GEOMETRY_09, ttm_geo_000858, "BulletBillCannon" },
++    { bhvBulletBillCannon, MODEL_LEVEL_GEOMETRY_09, wf_geo_0008E8, "BulletBillCannon" },
++    { bhvButterfly, MODEL_BUTTERFLY, butterfly_geo, "Butterfly" },
++    { bhvCameraLakitu, MODEL_LAKITU, lakitu_geo, "CameraLakitu" },
++    { bhvCannon, MODEL_CANNON_BASE, cannon_base_geo, "Cannon" },
++    { bhvCannonBarrel, MODEL_CANNON_BARREL, cannon_barrel_geo, "CannonBarrel" },
++    { bhvCannonBarrelBubbles, MODEL_CANNON_BARREL, cannon_barrel_geo, "CannonBarrelBubbles" },
++    { bhvCapSwitch, MODEL_CAP_SWITCH, cap_switch_geo, "CapSwitch" },
++    { bhvCastleFlagWaving, MODEL_CASTLE_GROUNDS_FLAG, castle_grounds_geo_000660, "CastleFlagWaving" },
++    { bhvCelebrationStar, MODEL_STAR, star_geo, "CelebrationStar" },
++    { bhvCelebrationStarSparkle, MODEL_SPARKLES, sparkles_geo, "CelebrationStarSparkle" },
++    { bhvChainChompChainPart, MODEL_METALLIC_BALL, metallic_ball_geo, "ChainChompChainPart" },
++    { bhvChainChompGate, MODEL_BOB_CHAIN_CHOMP_GATE, bob_geo_000440, "ChainChompGate" },
++    { bhvCheckerboardElevatorGroup, MODEL_CHECKERBOARD_PLATFORM, checkerboard_platform_geo, "CheckerboardElevatorGroup" },
++    { bhvCheckerboardPlatformSub, MODEL_CHECKERBOARD_PLATFORM, checkerboard_platform_geo, "CheckerboardPlatformSub" },
++    { bhvClamShell, MODEL_CLAM_SHELL, clam_shell_geo, "ClamShell" },
++    { bhvClockHourHand, MODEL_CASTLE_CLOCK_HOUR_HAND, castle_geo_001548, "ClockHourHand" },
++    { bhvClockMinuteHand, MODEL_CASTLE_CLOCK_MINUTE_HAND, castle_geo_001530, "ClockMinuteHand" },
++    { bhvCloud, MODEL_MIST, mist_geo, "Cloud" },
++    { bhvCloudPart, MODEL_FWOOSH, fwoosh_geo, "CloudPart" },
++    { bhvCloudPart, MODEL_MIST, mist_geo, "CloudPart" },
++    { bhvCoffin, MODEL_BBH_WOODEN_TOMB, geo_bbh_000658, "Coffin" },
++    { bhvCoinFormation, MODEL_BLUE_COIN, blue_coin_geo, "CoinFormation" },
++    { bhvCoinFormation, MODEL_YELLOW_COIN_NO_SHADOW, yellow_coin_no_shadow_geo, "CoinFormation" },
++    { bhvCoinFormationSpawn, MODEL_BLUE_COIN, blue_coin_geo, "CoinFormationSpawn" },
++    { bhvCoinFormationSpawn, MODEL_YELLOW_COIN, yellow_coin_geo, "CoinFormationSpawn" },
++    { bhvCoinFormationSpawn, MODEL_YELLOW_COIN_NO_SHADOW, yellow_coin_no_shadow_geo, "CoinFormationSpawn" },
++    { bhvCoinInsideBoo, MODEL_BLUE_COIN, blue_coin_geo, "CoinInsideBoo" },
++    { bhvCoinInsideBoo, MODEL_YELLOW_COIN, yellow_coin_geo, "CoinInsideBoo" },
++    { bhvCoinInsideBoo, MODEL_YELLOW_COIN_NO_SHADOW, yellow_coin_no_shadow_geo, "CoinInsideBoo" },
++    { bhvCoinSparkles, MODEL_BLUE_COIN, blue_coin_geo, "CoinSparkles" },
++    { bhvCoinSparkles, MODEL_SPARKLES, sparkles_geo, "CoinSparkles" },
++    { bhvCoinSparkles, MODEL_YELLOW_COIN_NO_SHADOW, yellow_coin_no_shadow_geo, "CoinSparkles" },
++    { bhvControllablePlatform, MODEL_HMC_METAL_PLATFORM, hmc_geo_0005A0, "ControllablePlatform" },
++    { bhvControllablePlatformSub, MODEL_HMC_METAL_ARROW_PLATFORM, hmc_geo_0005B8, "ControllablePlatformSub" },
++    { bhvCourtyardBooTriplet, MODEL_BOO, boo_geo, "CourtyardBooTriplet" },
++    { bhvDDDPole, MODEL_DDD_POLE, ddd_geo_000450, "DDDPole" },
++    { bhvDddMovingPole, MODEL_BITFS_BLUE_POLE, bitfs_geo_0006A8, "DddMovingPole" },
++    { bhvDecorativePendulum, MODEL_CASTLE_CLOCK_PENDULUM, castle_geo_001518, "DecorativePendulum" },
++    { bhvDonutPlatform, MODEL_RR_DONUT_PLATFORM, rr_geo_000920, "DonutPlatform" },
++    { bhvDoorWarp, MODEL_CASTLE_KEY_DOOR, key_door_geo, "DoorWarp" },
++    { bhvDorrie, MODEL_DORRIE, dorrie_geo, "Dorrie" },
++    { bhvEndBirds1, MODEL_BIRDS, birds_geo, "EndBirds1" },
++    { bhvEndBirds2, MODEL_BIRDS, birds_geo, "EndBirds2" },
++    { bhvEndPeach, MODEL_PEACH, peach_geo, "EndPeach" },
++    { bhvEndToad, MODEL_TOAD, toad_geo, "EndToad" },
++    { bhvExclamationBox, MODEL_EXCLAMATION_BOX, exclamation_box_geo, "ExclamationBox" },
++    { bhvExclamationBox, MODEL_EXCLAMATION_BOX_OUTLINE, exclamation_box_outline_geo, "ExclamationBox" },
++    { bhvExitPodiumWarp, MODEL_TTM_SLIDE_EXIT_PODIUM, ttm_geo_000DF4, "ExitPodiumWarp" },
++    { bhvExplosion, MODEL_EXPLOSION, explosion_geo, "Explosion" },
++    { bhvEyerokHand, MODEL_EYEROK_LEFT_HAND, eyerok_left_hand_geo, "EyerokHand" },
++    { bhvEyerokHand, MODEL_EYEROK_RIGHT_HAND, eyerok_right_hand_geo, "EyerokHand" },
++    { bhvFallingBowserPlatform, MODEL_BOWSER_3_FALLING_PLATFORM_1, bowser_3_geo_000290, "FallingBowserPlatform" },
++    { bhvFallingBowserPlatform, MODEL_BOWSER_3_FALLING_PLATFORM_10, bowser_3_geo_000368, "FallingBowserPlatform" },
++    { bhvFallingBowserPlatform, MODEL_BOWSER_3_FALLING_PLATFORM_2, bowser_3_geo_0002A8, "FallingBowserPlatform" },
++    { bhvFallingBowserPlatform, MODEL_BOWSER_3_FALLING_PLATFORM_3, bowser_3_geo_0002C0, "FallingBowserPlatform" },
++    { bhvFallingBowserPlatform, MODEL_BOWSER_3_FALLING_PLATFORM_4, bowser_3_geo_0002D8, "FallingBowserPlatform" },
++    { bhvFallingBowserPlatform, MODEL_BOWSER_3_FALLING_PLATFORM_5, bowser_3_geo_0002F0, "FallingBowserPlatform" },
++    { bhvFallingBowserPlatform, MODEL_BOWSER_3_FALLING_PLATFORM_6, bowser_3_geo_000308, "FallingBowserPlatform" },
++    { bhvFallingBowserPlatform, MODEL_BOWSER_3_FALLING_PLATFORM_7, bowser_3_geo_000320, "FallingBowserPlatform" },
++    { bhvFallingBowserPlatform, MODEL_BOWSER_3_FALLING_PLATFORM_8, bowser_3_geo_000338, "FallingBowserPlatform" },
++    { bhvFallingBowserPlatform, MODEL_BOWSER_3_FALLING_PLATFORM_9, bowser_3_geo_000350, "FallingBowserPlatform" },
++    { bhvFallingPillar, MODEL_JRB_FALLING_PILLAR, jrb_geo_000900, "FallingPillar" },
++    { bhvFerrisWheelAxle, MODEL_BITDW_FERRIS_WHEEL_AXLE, geo_bitdw_000570, "FerrisWheelAxle" },
++    { bhvFerrisWheelAxle, MODEL_BITS_FERRIS_WHEEL_AXLE, bits_geo_000640, "FerrisWheelAxle" },
++    { bhvFireParticleSpawner, MODEL_RED_FLAME, red_flame_geo, "FireParticleSpawner" },
++    { bhvFirePiranhaPlant, MODEL_PIRANHA_PLANT, piranha_plant_geo, "FirePiranhaPlant" },
++    { bhvFireSpitter, MODEL_BOWLING_BALL, bowling_ball_geo, "FireSpitter" },
++    { bhvFlame, MODEL_BLUE_FLAME, blue_flame_geo, "Flame" },
++    { bhvFlame, MODEL_RED_FLAME, red_flame_geo, "Flame" },
++    { bhvFlameBouncing, MODEL_BLUE_FLAME, blue_flame_geo, "FlameBouncing" },
++    { bhvFlameBowser, MODEL_RED_FLAME, red_flame_geo, "FlameBowser" },
++    { bhvFlameFloatingLanding, MODEL_BLUE_FLAME, blue_flame_geo, "FlameFloatingLanding" },
++    { bhvFlameFloatingLanding, MODEL_RED_FLAME, red_flame_geo, "FlameFloatingLanding" },
++    { bhvFlameLargeBurningOut, MODEL_RED_FLAME, red_flame_geo, "FlameLargeBurningOut" },
++    { bhvFlameMovingForwardGrowing, MODEL_RED_FLAME, red_flame_geo, "FlameMovingForwardGrowing" },
++    { bhvFloorSwitchAnimatesObject, MODEL_PURPLE_SWITCH, purple_switch_geo, "FloorSwitchAnimatesObject" },
++    { bhvFloorSwitchGrills, MODEL_PURPLE_SWITCH, purple_switch_geo, "FloorSwitchGrills" },
++    { bhvFloorSwitchHardcodedModel, MODEL_PURPLE_SWITCH, purple_switch_geo, "FloorSwitchHardcodedModel" },
++    { bhvFloorSwitchHiddenObjects, MODEL_PURPLE_SWITCH, purple_switch_geo, "FloorSwitchHiddenObjects" },
++    { bhvFloorTrapInCastle, MODEL_CASTLE_BOWSER_TRAP, castle_geo_000F18, "FloorTrapInCastle" },
++    { bhvFlyingBookend, MODEL_BOOKEND, bookend_geo, "FlyingBookend" },
++    { bhvFlyingBookend, MODEL_BOOKEND_PART, bookend_part_geo, "FlyingBookend" },
++    { bhvGhostHuntBigBoo, MODEL_BOO, boo_geo, "GhostHuntBigBoo" },
++    { bhvGhostHuntBoo, MODEL_BOO, boo_geo, "GhostHuntBoo" },
++    { bhvGoldenCoinSparkles, MODEL_BLUE_COIN, blue_coin_geo, "GoldenCoinSparkles" },
++    { bhvGoldenCoinSparkles, MODEL_SPARKLES, sparkles_geo, "GoldenCoinSparkles" },
++    { bhvGoldenCoinSparkles, MODEL_YELLOW_COIN_NO_SHADOW, yellow_coin_no_shadow_geo, "GoldenCoinSparkles" },
++    { bhvGoomba, MODEL_GOOMBA, goomba_geo, "Goomba" },
++    { bhvGoombaTripletSpawner, MODEL_KOOPA_WITH_SHELL, koopa_with_shell_geo, "GoombaTripletSpawner" },
++    { bhvGrandStar, MODEL_STAR, star_geo, "GrandStar" },
++    { bhvGrindel, MODEL_SSL_GRINDEL, ssl_geo_000734, "Grindel" },
++    { bhvHauntedBookshelf, MODEL_BBH_MOVING_BOOKSHELF, geo_bbh_000610, "HauntedBookshelf" },
++    { bhvHauntedBookshelfManager, MODEL_BOOKEND_PART, bookend_part_geo, "HauntedBookshelfManager" },
++    { bhvHauntedChair, MODEL_HAUNTED_CHAIR, haunted_chair_geo, "HauntedChair" },
++    { bhvHidden1up, MODEL_1UP, mushroom_1up_geo, "Hidden1up" },
++    { bhvHidden1upInPole, MODEL_1UP, mushroom_1up_geo, "Hidden1upInPole" },
++    { bhvHiddenAt120Stars, MODEL_CASTLE_GROUNDS_CANNON_GRILL, castle_grounds_geo_000724, "HiddenAt120Stars" },
++    { bhvHiddenObject, MODEL_BREAKABLE_BOX_SMALL, breakable_box_small_geo, "HiddenObject" },
++    { bhvHiddenObject, MODEL_WDW_HIDDEN_PLATFORM, wdw_geo_0005E8, "HiddenObject" },
++    { bhvHiddenStaircaseStep, MODEL_BBH_STAIRCASE_STEP, geo_bbh_0005B0, "HiddenStaircaseStep" },
++    { bhvHmcElevatorPlatform, MODEL_HMC_ELEVATOR_PLATFORM, hmc_geo_0005D0, "HmcElevatorPlatform" },
++    { bhvHoot, MODEL_HOOT, hoot_geo, "Hoot" },
++    { bhvHorizontalGrindel, MODEL_SSL_GRINDEL, ssl_geo_000734, "HorizontalGrindel" },
++    { bhvIdleWaterWave, MODEL_IDLE_WATER_WAVE, idle_water_wave_geo, "IdleWaterWave" },
++    { bhvJetStreamWaterRing, MODEL_WATER_RING, water_ring_geo, "JetStreamWaterRing" },
++    { bhvJrbFloatingPlatform, MODEL_JRB_FLOATING_PLATFORM, jrb_geo_000948, "JrbFloatingPlatform" },
++    { bhvJrbSlidingBox, MODEL_JRB_SLIDING_BOX, jrb_geo_000960, "JrbSlidingBox" },
++    { bhvJumpingBox, MODEL_BREAKABLE_BOX, breakable_box_geo, "JumpingBox" },
++    { bhvJumpingBox, MODEL_BREAKABLE_BOX_SMALL, breakable_box_small_geo, "JumpingBox" },
++    { bhvKickableBoard, MODEL_WF_KICKABLE_BOARD, wf_geo_000BA8, "KickableBoard" },
++    { bhvKickableBoard, MODEL_WF_KICKABLE_BOARD_FELLED, wf_geo_000BC8, "KickableBoard" },
++    { bhvKingBobomb, MODEL_KING_BOBOMB, king_bobomb_geo, "KingBobomb" },
++    { bhvKlepto, MODEL_KLEPTO, klepto_geo, "Klepto" },
++    { bhvKoopa, MODEL_KOOPA_WITHOUT_SHELL, koopa_without_shell_geo, "Koopa" },
++    { bhvKoopa, MODEL_KOOPA_WITH_SHELL, koopa_with_shell_geo, "Koopa" },
++    { bhvKoopaFlag, MODEL_KOOPA_FLAG, koopa_flag_geo, "KoopaFlag" },
++    { bhvKoopaRaceEndpoint, MODEL_KOOPA_WITHOUT_SHELL, koopa_without_shell_geo, "KoopaRaceEndpoint" },
++    { bhvKoopaRaceEndpoint, MODEL_KOOPA_WITH_SHELL, koopa_with_shell_geo, "KoopaRaceEndpoint" },
++    { bhvKoopaShell, MODEL_KOOPA_SHELL, koopa_shell_geo, "KoopaShell" },
++    { bhvKoopaShellFlame, MODEL_RED_FLAME, red_flame_geo, "KoopaShellFlame" },
++    { bhvKoopaShellUnderwater, MODEL_KOOPA_SHELL, koopa_shell_geo, "KoopaShellUnderwater" },
++    { bhvLargeBomp, MODEL_WF_LARGE_BOMP, wf_geo_000A40, "LargeBomp" },
++    { bhvLllDrawbridge, MODEL_LLL_DRAWBRIDGE_PART, lll_geo_000B20, "LllDrawbridge" },
++    { bhvLllDrawbridgeSpawner, MODEL_LLL_DRAWBRIDGE_PART, lll_geo_000B20, "LllDrawbridgeSpawner" },
++    { bhvLllHexagonalMesh, MODEL_LEVEL_GEOMETRY_0E, lll_geo_000AF0, "LllHexagonalMesh" },
++    { bhvLllMovingOctagonalMeshPlatform, MODEL_LLL_MOVING_OCTAGONAL_MESH_PLATFORM, lll_geo_000B08, "LllMovingOctagonalMeshPlatform" },
++    { bhvLllRollingLog, MODEL_LLL_ROLLING_LOG, lll_geo_000DE8, "LllRollingLog" },
++    { bhvLllRotatingBlockWithFireBars, MODEL_LLL_ROTATING_BLOCK_FIRE_BARS, lll_geo_000B38, "LllRotatingBlockWithFireBars" },
++    { bhvLllRotatingHexFlame, MODEL_RED_FLAME, red_flame_geo, "LllRotatingHexFlame" },
++    { bhvLllRotatingHexagonalRing, MODEL_LLL_ROTATING_HEXAGONAL_RING, lll_geo_000BB0, "LllRotatingHexagonalRing" },
++    { bhvLllSinkingRectangularPlatform, MODEL_LLL_SINKING_RECTANGULAR_PLATFORM, lll_geo_000BC8, "LllSinkingRectangularPlatform" },
++    { bhvLllSinkingRockBlock, MODEL_LLL_SINKING_ROCK_BLOCK, lll_geo_000DD0, "LllSinkingRockBlock" },
++    { bhvLllSinkingSquarePlatforms, MODEL_LLL_SINKING_SQUARE_PLATFORMS, lll_geo_000BE0, "LllSinkingSquarePlatforms" },
++    { bhvLllTiltingInvertedPyramid, MODEL_LLL_TILTING_SQUARE_PLATFORM, lll_geo_000BF8, "LllTiltingInvertedPyramid" },
++    { bhvLllVolcanoFallingTrap, MODEL_LLL_VOLCANO_FALLING_TRAP, lll_geo_000EA8, "LllVolcanoFallingTrap" },
++    { bhvLllWoodPiece, MODEL_LLL_WOOD_BRIDGE, lll_geo_000B50, "LllWoodPiece" },
++    { bhvMadPiano, MODEL_MAD_PIANO, mad_piano_geo, "MadPiano" },
++    { bhvMantaRay, MODEL_MANTA_RAY, manta_seg5_geo_05008D14, "MantaRay" },
++    { bhvMantaRayWaterRing, MODEL_WATER_RING, water_ring_geo, "MantaRayWaterRing" },
++    { bhvMerryGoRound, MODEL_BBH_MERRY_GO_ROUND, geo_bbh_000640, "MerryGoRound" },
++    { bhvMerryGoRoundBigBoo, MODEL_BOO, boo_geo, "MerryGoRoundBigBoo" },
++    { bhvMerryGoRoundBoo, MODEL_BOO, boo_geo, "MerryGoRoundBoo" },
++    { bhvMeshElevator, MODEL_BBH_MESH_ELEVATOR, geo_bbh_000628, "MeshElevator" },
++    { bhvMessagePanel, MODEL_WOODEN_SIGNPOST, wooden_signpost_geo, "MessagePanel" },
++    { bhvMetalCap, MODEL_MARIOS_METAL_CAP, marios_metal_cap_geo, "MetalCap" },
++    { bhvMips, MODEL_MIPS, mips_geo, "Mips" },
++    { bhvMistParticleSpawner, MODEL_MIST, mist_geo, "MistParticleSpawner" },
++    { bhvMoatGrills, MODEL_CASTLE_GROUNDS_VCUTM_GRILL, castle_grounds_geo_00070C, "MoatGrills" },
++    { bhvMoneybag, MODEL_MONEYBAG, moneybag_geo, "Moneybag" },
++    { bhvMoneybagHidden, MODEL_YELLOW_COIN, yellow_coin_geo, "MoneybagHidden" },
++    { bhvMontyMole, MODEL_MONTY_MOLE, monty_mole_geo, "MontyMole" },
++    { bhvMovingBlueCoin, MODEL_BLUE_COIN, blue_coin_geo, "MovingBlueCoin" },
++    { bhvMovingYellowCoin, MODEL_YELLOW_COIN, yellow_coin_geo, "MovingYellowCoin" },
++    { bhvMrBlizzard, MODEL_MR_BLIZZARD, mr_blizzard_geo, "MrBlizzard" },
++    { bhvMrBlizzard, MODEL_MR_BLIZZARD_HIDDEN, mr_blizzard_hidden_geo, "MrBlizzard" },
++    { bhvMrIBlueCoin, MODEL_BLUE_COIN, blue_coin_geo, "MrIBlueCoin" },
++    { bhvMrIBlueCoin, MODEL_YELLOW_COIN_NO_SHADOW, yellow_coin_no_shadow_geo, "MrIBlueCoin" },
++    { bhvMrIBody, MODEL_MR_I_IRIS, mr_i_iris_geo, "MrIBody" },
++    { bhvMrIParticle, MODEL_PURPLE_MARBLE, purple_marble_geo, "MrIParticle" },
++    { bhvNormalCap, MODEL_MARIOS_CAP, marios_cap_geo, "NormalCap" },
++    { bhvObjectWaterSplash, MODEL_SMALL_WATER_SPLASH, small_water_splash_geo, "ObjectWaterSplash" },
++    { bhvObjectWaterWave, MODEL_IDLE_WATER_WAVE, idle_water_wave_geo, "ObjectWaterWave" },
++    { bhvObjectWaveTrail, MODEL_WAVE_TRAIL, wave_trail_geo, "ObjectWaveTrail" },
++    { bhvOctagonalPlatformRotating, MODEL_BITS_OCTAGONAL_PLATFORM, bits_geo_000610, "OctagonalPlatformRotating" },
++    { bhvOctagonalPlatformRotating, MODEL_RR_OCTAGONAL_PLATFORM, rr_geo_0008A8, "OctagonalPlatformRotating" },
++    { bhvOrangeNumber, MODEL_NUMBER, number_geo, "OrangeNumber" },
++    { bhvPillarBase, MODEL_JRB_FALLING_PILLAR_BASE, jrb_geo_000918, "PillarBase" },
++    { bhvPiranhaPlant, MODEL_PIRANHA_PLANT, piranha_plant_geo, "PiranhaPlant" },
++    { bhvPiranhaPlantBubble, MODEL_BUBBLE, bubble_geo, "PiranhaPlantBubble" },
++    { bhvPiranhaPlantWakingBubbles, MODEL_BUBBLE, bubble_geo, "PiranhaPlantWakingBubbles" },
++    { bhvPitBowlingBall, MODEL_BOWLING_BALL, bowling_ball_geo, "PitBowlingBall" },
++    { bhvPlatformOnTrack, MODEL_BITFS_PLATFORM_ON_TRACK, bitfs_geo_000758, "PlatformOnTrack" },
++    { bhvPlatformOnTrack, MODEL_CCM_ROPEWAY_LIFT, ccm_geo_0003D0, "PlatformOnTrack" },
++    { bhvPlatformOnTrack, MODEL_CHECKERBOARD_PLATFORM, checkerboard_platform_geo, "PlatformOnTrack" },
++    { bhvPlatformOnTrack, MODEL_RR_FLYING_CARPET, rr_geo_000848, "PlatformOnTrack" },
++    { bhvPokeyBodyPart, MODEL_POKEY_BODY_PART, pokey_body_part_geo, "PokeyBodyPart" },
++    { bhvPokeyBodyPart, MODEL_POKEY_HEAD, pokey_head_geo, "PokeyBodyPart" },
++    { bhvPoundTinyStarParticle, MODEL_CARTOON_STAR, cartoon_star_geo, "PoundTinyStarParticle" },
++    { bhvPunchTinyTriangle, MODEL_DIRT_ANIMATION, dirt_animation_geo, "PunchTinyTriangle" },
++    { bhvPurpleParticle, MODEL_PURPLE_MARBLE, purple_marble_geo, "PurpleParticle" },
++    { bhvPyramidElevator, MODEL_SSL_PYRAMID_ELEVATOR, ssl_geo_0007AC, "PyramidElevator" },
++    { bhvPyramidElevatorTrajectoryMarkerBall, MODEL_TRAJECTORY_MARKER_BALL, bowling_ball_track_geo, "PyramidElevatorTrajectoryMarkerBall" },
++    { bhvPyramidTop, MODEL_SSL_PYRAMID_TOP, ssl_geo_000618, "PyramidTop" },
++    { bhvPyramidTopFragment, MODEL_DIRT_ANIMATION, dirt_animation_geo, "PyramidTopFragment" },
++    { bhvRacingPenguin, MODEL_PENGUIN, penguin_geo, "RacingPenguin" },
++    { bhvRecoveryHeart, MODEL_HEART, heart_geo, "RecoveryHeart" },
++    { bhvRedCoinStarMarker, MODEL_TRANSPARENT_STAR, transparent_star_geo, "RedCoinStarMarker" },
++    { bhvRockSolid, MODEL_JRB_ROCK, jrb_geo_000930, "RockSolid" },
++    { bhvRotatingExclamationMark, MODEL_EXCLAMATION_BOX, exclamation_box_geo, "RotatingExclamationMark" },
++    { bhvRotatingExclamationMark, MODEL_EXCLAMATION_BOX_OUTLINE, exclamation_box_outline_geo, "RotatingExclamationMark" },
++    { bhvRotatingPlatform, MODEL_WDW_ROTATING_PLATFORM, wdw_geo_000640, "RotatingPlatform" },
++    { bhvRrCruiserWing, MODEL_RR_CRUISER_WING, rr_geo_000890, "RrCruiserWing" },
++    { bhvRrElevatorPlatform, MODEL_RR_ELEVATOR_PLATFORM, rr_geo_0008F0, "RrElevatorPlatform" },
++    { bhvRrRotatingBridgePlatform, MODEL_RR_ROTATING_BRIDGE_PLATFORM, rr_geo_000878, "RrRotatingBridgePlatform" },
++    { bhvSLWalkingPenguin, MODEL_PENGUIN, penguin_geo, "SLWalkingPenguin" },
++    { bhvScuttlebug, MODEL_SCUTTLEBUG, scuttlebug_geo, "Scuttlebug" },
++    { bhvSeaweed, MODEL_SEAWEED, seaweed_geo, "Seaweed" },
++    { bhvSeesawPlatform, MODEL_BITDW_SEESAW_PLATFORM, geo_bitdw_000540, "SeesawPlatform" },
++    { bhvSeesawPlatform, MODEL_BITFS_SEESAW_PLATFORM, bitfs_geo_000788, "SeesawPlatform" },
++    { bhvSeesawPlatform, MODEL_BITS_SEESAW_PLATFORM, bits_geo_000670, "SeesawPlatform" },
++    { bhvSeesawPlatform, MODEL_BITS_TILTING_W_PLATFORM, bits_geo_000688, "SeesawPlatform" },
++    { bhvSeesawPlatform, MODEL_BOB_SEESAW_PLATFORM, bob_geo_000458, "SeesawPlatform" },
++    { bhvSeesawPlatform, MODEL_RR_SEESAW_PLATFORM, rr_geo_000908, "SeesawPlatform" },
++    { bhvSeesawPlatform, MODEL_VCUTM_SEESAW_PLATFORM, vcutm_geo_0001F0, "SeesawPlatform" },
++    { bhvShipPart3, MODEL_JRB_SHIP_BACK_LEFT_PART, jrb_geo_0009B0, "ShipPart3" },
++    { bhvShipPart3, MODEL_JRB_SHIP_BACK_RIGHT_PART, jrb_geo_000A00, "ShipPart3" },
++    { bhvShipPart3, MODEL_JRB_SHIP_LEFT_HALF_PART, jrb_geo_000978, "ShipPart3" },
++    { bhvShipPart3, MODEL_JRB_SHIP_RIGHT_HALF_PART, jrb_geo_0009E8, "ShipPart3" },
++    { bhvSingleCoinGetsSpawned, MODEL_BLUE_COIN, blue_coin_geo, "SingleCoinGetsSpawned" },
++    { bhvSingleCoinGetsSpawned, MODEL_YELLOW_COIN, yellow_coin_geo, "SingleCoinGetsSpawned" },
++    { bhvSingleCoinGetsSpawned, MODEL_YELLOW_COIN_NO_SHADOW, yellow_coin_no_shadow_geo, "SingleCoinGetsSpawned" },
++    { bhvSkeeter, MODEL_SKEETER, skeeter_geo, "Skeeter" },
++    { bhvSkeeterWave, MODEL_IDLE_WATER_WAVE, idle_water_wave_geo, "SkeeterWave" },
++    { bhvSlidingPlatform2, MODEL_BITDW_SLIDING_PLATFORM, geo_bitdw_000528, "SlidingPlatform2" },
++    { bhvSlidingPlatform2, MODEL_BITFS_MOVING_SQUARE_PLATFORM, bitfs_geo_000728, "SlidingPlatform2" },
++    { bhvSlidingPlatform2, MODEL_BITFS_SLIDING_PLATFORM, bitfs_geo_000740, "SlidingPlatform2" },
++    { bhvSlidingPlatform2, MODEL_BITS_SLIDING_PLATFORM, bits_geo_0005E0, "SlidingPlatform2" },
++    { bhvSlidingPlatform2, MODEL_BITS_TWIN_SLIDING_PLATFORMS, bits_geo_0005F8, "SlidingPlatform2" },
++    { bhvSlidingPlatform2, MODEL_RR_SLIDING_PLATFORM, rr_geo_0008C0, "SlidingPlatform2" },
++    { bhvSlidingSnowMound, MODEL_SL_SNOW_TRIANGLE, sl_geo_000390, "SlidingSnowMound" },
++    { bhvSmallBomp, MODEL_WF_SMALL_BOMP, wf_geo_000A00, "SmallBomp" },
++    { bhvSmallBully, MODEL_BULLY, bully_geo, "SmallBully" },
++    { bhvSmallPenguin, MODEL_PENGUIN, penguin_geo, "SmallPenguin" },
++    { bhvSmallWaterWave, MODEL_BUBBLE, bubble_geo, "SmallWaterWave" },
++    { bhvSmallWhomp, MODEL_WHOMP, whomp_geo, "SmallWhomp" },
++    { bhvSmoke, MODEL_SMOKE, smoke_geo, "Smoke" },
++    { bhvSnowmansBottom, MODEL_CCM_SNOWMAN_BASE, ccm_geo_0003F0, "SnowmansBottom" },
++    { bhvSnowmansHead, MODEL_CCM_SNOWMAN_HEAD, ccm_geo_00040C, "SnowmansHead" },
++    { bhvSnufitBalls, MODEL_BOWLING_BALL, bowling_ball_geo, "SnufitBalls" },
++    { bhvSparkle, MODEL_SPARKLES_ANIMATION, sparkles_animation_geo, "Sparkle" },
++    { bhvSparkleParticleSpawner, MODEL_SPARKLES, sparkles_geo, "SparkleParticleSpawner" },
++    { bhvSpawnedStar, MODEL_STAR, star_geo, "SpawnedStar" },
++    { bhvSpawnedStarNoLevelExit, MODEL_STAR, star_geo, "SpawnedStarNoLevelExit" },
++    { bhvSpawnedStarNoLevelExit, MODEL_TRANSPARENT_STAR, transparent_star_geo, "SpawnedStarNoLevelExit" },
++    { bhvSpindel, MODEL_SSL_SPINDEL, ssl_geo_000764, "Spindel" },
++    { bhvSpiny, MODEL_SPINY, spiny_geo, "Spiny" },
++    { bhvSpiny, MODEL_SPINY_BALL, spiny_ball_geo, "Spiny" },
++    { bhvSquarishPathMoving, MODEL_BITDW_SQUARE_PLATFORM, geo_bitdw_000558, "SquarishPathMoving" },
++    { bhvSquishablePlatform, MODEL_BITFS_STRETCHING_PLATFORMS, bitfs_geo_000708, "SquishablePlatform" },
++    { bhvSslMovingPyramidWall, MODEL_SSL_MOVING_PYRAMID_WALL, ssl_geo_000794, "SslMovingPyramidWall" },
++    { bhvStar, MODEL_STAR, star_geo, "Star" },
++    { bhvStarDoor, MODEL_CASTLE_STAR_DOOR_30_STARS, castle_geo_000F00, "StarDoor" },
++    { bhvStarDoor, MODEL_CASTLE_STAR_DOOR_50_STARS, castle_geo_000F00, "StarDoor" },
++    { bhvStarDoor, MODEL_CASTLE_STAR_DOOR_70_STARS, castle_geo_000F00, "StarDoor" },
++    { bhvStarDoor, MODEL_CASTLE_STAR_DOOR_8_STARS, castle_geo_000F00, "StarDoor" },
++    { bhvStarSpawnCoordinates, MODEL_STAR, star_geo, "StarSpawnCoordinates" },
++    { bhvStaticObject, MODEL_LEVEL_GEOMETRY_03, lll_geo_0009E0, "StaticObject" },
++    { bhvStaticObject, MODEL_LEVEL_GEOMETRY_03, wf_geo_0007E0, "StaticObject" },
++    { bhvStaticObject, MODEL_LEVEL_GEOMETRY_04, lll_geo_0009F8, "StaticObject" },
++    { bhvStaticObject, MODEL_LEVEL_GEOMETRY_04, wf_geo_000820, "StaticObject" },
++    { bhvStaticObject, MODEL_LEVEL_GEOMETRY_05, lll_geo_000A10, "StaticObject" },
++    { bhvStaticObject, MODEL_LEVEL_GEOMETRY_05, wf_geo_000860, "StaticObject" },
++    { bhvStaticObject, MODEL_LEVEL_GEOMETRY_06, lll_geo_000A28, "StaticObject" },
++    { bhvStaticObject, MODEL_LEVEL_GEOMETRY_06, wf_geo_000878, "StaticObject" },
++    { bhvStaticObject, MODEL_LEVEL_GEOMETRY_07, lll_geo_000A40, "StaticObject" },
++    { bhvStaticObject, MODEL_LEVEL_GEOMETRY_07, wf_geo_000890, "StaticObject" },
++    { bhvStaticObject, MODEL_LEVEL_GEOMETRY_08, lll_geo_000A60, "StaticObject" },
++    { bhvStaticObject, MODEL_LEVEL_GEOMETRY_0A, lll_geo_000A90, "StaticObject" },
++    { bhvStaticObject, MODEL_LEVEL_GEOMETRY_0A, wf_geo_000900, "StaticObject" },
++    { bhvStaticObject, MODEL_LEVEL_GEOMETRY_0B, lll_geo_000AA8, "StaticObject" },
++    { bhvStaticObject, MODEL_LEVEL_GEOMETRY_0C, lll_geo_000AC0, "StaticObject" },
++    { bhvStaticObject, MODEL_LEVEL_GEOMETRY_0C, wf_geo_000940, "StaticObject" },
++    { bhvStaticObject, MODEL_LEVEL_GEOMETRY_0D, lll_geo_000AD8, "StaticObject" },
++    { bhvStaticObject, MODEL_STAR, star_geo, "StaticObject" },
++    { bhvStaticObject, MODEL_TRAMPOLINE_BASE, springboard_bottom_geo, "StaticObject" },
++    { bhvStaticObject, MODEL_TTM_BLUE_SMILEY, ttm_geo_000D14, "StaticObject" },
++    { bhvStaticObject, MODEL_TTM_MOON_SMILEY, ttm_geo_000DBC, "StaticObject" },
++    { bhvStaticObject, MODEL_TTM_STAR_SMILEY, ttm_geo_000D84, "StaticObject" },
++    { bhvStaticObject, MODEL_TTM_YELLOW_SMILEY, ttm_geo_000D4C, "StaticObject" },
++    { bhvStrongWindParticle, MODEL_MIST, mist_geo, "StrongWindParticle" },
++    { bhvSunkenShipPart, MODEL_JRB_SUNKEN_SHIP, jrb_geo_000990, "SunkenShipPart" },
++    { bhvSunkenShipPart, MODEL_JRB_SUNKEN_SHIP_BACK, jrb_geo_0009C8, "SunkenShipPart" },
++    { bhvSunkenShipPart2, MODEL_JRB_SHIP_LEFT_HALF_PART, jrb_geo_000978, "SunkenShipPart2" },
++    { bhvSunkenShipPart2, MODEL_JRB_SHIP_RIGHT_HALF_PART, jrb_geo_0009E8, "SunkenShipPart2" },
++    { bhvSushiShark, MODEL_SUSHI, sushi_geo, "SushiShark" },
++    { bhvSwingPlatform, MODEL_RR_SWINGING_PLATFORM, rr_geo_000860, "SwingPlatform" },
++    { bhvTTC2DRotator, MODEL_TTC_CLOCK_HAND, ttc_geo_000358, "TTC2DRotator" },
++    { bhvTTCCog, MODEL_TTC_ROTATING_HEXAGON, ttc_geo_0002E0, "TTCCog" },
++    { bhvTTCElevator, MODEL_TTC_ELEVATOR_PLATFORM, ttc_geo_000340, "TTCElevator" },
++    { bhvTTCMovingBar, MODEL_TTC_PUSH_BLOCK, ttc_geo_0002C8, "TTCMovingBar" },
++    { bhvTTCPendulum, MODEL_TTC_PENDULUM, ttc_geo_000270, "TTCPendulum" },
++    { bhvTTCPitBlock, MODEL_TTC_PIT_BLOCK, ttc_geo_000310, "TTCPitBlock" },
++    { bhvTTCRotatingSolid, MODEL_TTC_ROTATING_CUBE, ttc_geo_000240, "TTCRotatingSolid" },
++    { bhvTTCSpinner, MODEL_TTC_SPINNER, ttc_geo_000370, "TTCSpinner" },
++    { bhvTTCTreadmill, MODEL_TTC_SMALL_TREADMILL, ttc_geo_0002A8, "TTCTreadmill" },
++    { bhvTemporaryYellowCoin, MODEL_BLUE_COIN, blue_coin_geo, "TemporaryYellowCoin" },
++    { bhvTemporaryYellowCoin, MODEL_YELLOW_COIN, yellow_coin_geo, "TemporaryYellowCoin" },
++    { bhvTemporaryYellowCoin, MODEL_YELLOW_COIN_NO_SHADOW, yellow_coin_no_shadow_geo, "TemporaryYellowCoin" },
++    { bhvThiHugeIslandTop, MODEL_THI_HUGE_ISLAND_TOP, thi_geo_0005B0, "ThiHugeIslandTop" },
++    { bhvThiTinyIslandTop, MODEL_THI_TINY_ISLAND_TOP, thi_geo_0005C8, "ThiTinyIslandTop" },
++    { bhvThwomp, MODEL_THWOMP, thwomp_geo, "Thwomp" },
++    { bhvThwomp2, MODEL_THWOMP, thwomp_geo, "Thwomp2" },
++    { bhvTiltingBowserLavaPlatform, MODEL_BOWSER_2_TILTING_ARENA, bowser_2_geo_000170, "TiltingBowserLavaPlatform" },
++    { bhvToadMessage, MODEL_TOAD, toad_geo, "ToadMessage" },
++    { bhvTower, MODEL_LEVEL_GEOMETRY_08, lll_geo_000A60, "Tower" },
++    { bhvTower, MODEL_LEVEL_GEOMETRY_08, wf_geo_0008A8, "Tower" },
++    { bhvTowerDoor, MODEL_WF_TOWER_DOOR, wf_geo_000BE0, "TowerDoor" },
++    { bhvToxBox, MODEL_SSL_TOX_BOX, ssl_geo_000630, "ToxBox" },
++    { bhvTrackBall, MODEL_TRAJECTORY_MARKER_BALL, bowling_ball_track_geo, "TrackBall" },
++    { bhvTreasureChestBottom, MODEL_TREASURE_CHEST_BASE, treasure_chest_base_geo, "TreasureChestBottom" },
++    { bhvTreasureChestTop, MODEL_TREASURE_CHEST_LID, treasure_chest_lid_geo, "TreasureChestTop" },
++    { bhvTreeLeaf, MODEL_LEAVES, leaves_geo, "TreeLeaf" },
++    { bhvTripletButterfly, MODEL_BUTTERFLY, butterfly_geo, "TripletButterfly" },
++    { bhvTtmRollingLog, MODEL_TTM_ROLLING_LOG, ttm_geo_000730, "TtmRollingLog" },
++    { bhvTuxiesMother, MODEL_PENGUIN, penguin_geo, "TuxiesMother" },
++    { bhvTweester, MODEL_TWEESTER, tweester_geo, "Tweester" },
++    { bhvUkiki, MODEL_UKIKI, ukiki_geo, "Ukiki" },
++    { bhvUkikiCage, MODEL_TRANSPARENT_STAR, transparent_star_geo, "UkikiCage" },
++    { bhvUkikiCage, MODEL_TTM_STAR_CAGE, ttm_geo_000710, "UkikiCage" },
++    { bhvUkikiCageStar, MODEL_STAR, star_geo, "UkikiCageStar" },
++    { bhvUkikiCageStar, MODEL_TRANSPARENT_STAR, transparent_star_geo, "UkikiCageStar" },
++    { bhvUnagi, MODEL_UNAGI, unagi_geo, "Unagi" },
++    { bhvUnlockDoorStar, MODEL_STAR, star_geo, "UnlockDoorStar" },
++    { bhvVanishCap, MODEL_MARIOS_CAP, marios_cap_geo, "VanishCap" },
++    { bhvVolcanoFlames, MODEL_RED_FLAME, red_flame_geo, "VolcanoFlames" },
++    { bhvWallTinyStarParticle, MODEL_CARTOON_STAR, cartoon_star_geo, "WallTinyStarParticle" },
++    { bhvWarpPipe, MODEL_BITS_WARP_PIPE, warp_pipe_geo, "WarpPipe" },
++    { bhvWaterAirBubble, MODEL_BUBBLE, bubble_geo, "WaterAirBubble" },
++    { bhvWaterBomb, MODEL_WATER_BOMB, water_bomb_geo, "WaterBomb" },
++    { bhvWaterBombCannon, MODEL_CANNON_BASE, cannon_base_geo, "WaterBombCannon" },
++    { bhvWaterBombShadow, MODEL_WATER_BOMB_SHADOW, water_bomb_shadow_geo, "WaterBombShadow" },
++    { bhvWaterDropletSplash, MODEL_SMALL_WATER_SPLASH, small_water_splash_geo, "WaterDropletSplash" },
++    { bhvWaterLevelDiamond, MODEL_WDW_WATER_LEVEL_DIAMOND, wdw_geo_0005C0, "WaterLevelDiamond" },
++    { bhvWaterLevelPillar, MODEL_CASTLE_WATER_LEVEL_PILLAR, castle_geo_001940, "WaterLevelPillar" },
++    { bhvWaterMist, MODEL_MIST, mist_geo, "WaterMist" },
++    { bhvWaterMist2, MODEL_MIST, mist_geo, "WaterMist2" },
++    { bhvWaterSplash, MODEL_WATER_SPLASH, water_splash_geo, "WaterSplash" },
++    { bhvWaveTrail, MODEL_WAVE_TRAIL, wave_trail_geo, "WaveTrail" },
++    { bhvWdwExpressElevator, MODEL_WDW_EXPRESS_ELEVATOR, wdw_geo_000610, "WdwExpressElevator" },
++    { bhvWdwExpressElevatorPlatform, MODEL_WDW_EXPRESS_ELEVATOR, wdw_geo_000610, "WdwExpressElevatorPlatform" },
++    { bhvWdwRectangularFloatingPlatform, MODEL_WDW_RECTANGULAR_FLOATING_PLATFORM, wdw_geo_000628, "WdwRectangularFloatingPlatform" },
++    { bhvWdwSquareFloatingPlatform, MODEL_WDW_SQUARE_FLOATING_PLATFORM, wdw_geo_000580, "WdwSquareFloatingPlatform" },
++    { bhvWfBreakableWallLeft, MODEL_WF_BREAKABLE_WALL_LEFT, wf_geo_000B90, "WfBreakableWallLeft" },
++    { bhvWfBreakableWallRight, MODEL_WF_BREAKABLE_WALL_RIGHT, wf_geo_000B78, "WfBreakableWallRight" },
++    { bhvWfElevatorTowerPlatform, MODEL_WF_TOWER_SQUARE_PLATORM_ELEVATOR, wf_geo_000B60, "WfElevatorTowerPlatform" },
++    { bhvWfRotatingWoodenPlatform, MODEL_WF_ROTATING_WOODEN_PLATFORM, wf_geo_000A58, "WfRotatingWoodenPlatform" },
++    { bhvWfSlidingPlatform, MODEL_WF_SLIDING_PLATFORM, wf_geo_000A98, "WfSlidingPlatform" },
++    { bhvWfSlidingTowerPlatform, MODEL_WF_TOWER_SQUARE_PLATORM, wf_geo_000B10, "WfSlidingTowerPlatform" },
++    { bhvWfSolidTowerPlatform, MODEL_WF_TOWER_SQUARE_PLATORM, wf_geo_000B10, "WfSolidTowerPlatform" },
++    { bhvWfTumblingBridge, MODEL_BITFS_TUMBLING_PLATFORM, bitfs_geo_0006F0, "WfTumblingBridge" },
++    { bhvWfTumblingBridge, MODEL_WF_TUMBLING_BRIDGE, wf_geo_000AC8, "WfTumblingBridge" },
++    { bhvWhitePuff1, MODEL_MIST, mist_geo, "WhitePuff1" },
++    { bhvWhitePuff2, MODEL_SMOKE, smoke_geo, "WhitePuff2" },
++    { bhvWhitePuffSmoke, MODEL_SMOKE, smoke_geo, "WhitePuffSmoke" },
++    { bhvWhitePuffSmoke2, MODEL_SMOKE, smoke_geo, "WhitePuffSmoke2" },
++    { bhvWhompKingBoss, MODEL_WHOMP, whomp_geo, "WhompKingBoss" },
++    { bhvWigglerBody, MODEL_WIGGLER_BODY, wiggler_body_geo, "WigglerBody" },
++    { bhvWigglerHead, MODEL_WIGGLER_HEAD, wiggler_head_geo, "WigglerHead" },
++    { bhvWind, MODEL_MIST, mist_geo, "Wind" },
++    { bhvWingCap, MODEL_MARIOS_WING_CAP, marios_wing_cap_geo, "WingCap" },
++    { bhvWoodenPost, MODEL_WOODEN_POST, wooden_post_geo, "WoodenPost" },
++    { bhvYellowBall, MODEL_YELLOW_SPHERE, yellow_sphere_geo, "YellowBall" },
++    { bhvYellowCoin, MODEL_BLUE_COIN, blue_coin_geo, "YellowCoin" },
++    { bhvYellowCoin, MODEL_YELLOW_COIN, yellow_coin_geo, "YellowCoin" },
++    { bhvYellowCoin, MODEL_YELLOW_COIN_NO_SHADOW, yellow_coin_no_shadow_geo, "YellowCoin" },
++    { bhvYoshi, MODEL_YOSHI, yoshi_geo, "Yoshi" },
++};
++#define NUM_MODEL_GEO ((s32) (sizeof(sModelGeo) / sizeof(sModelGeo[0])))
 diff --git a/src/game/interaction.c b/src/game/interaction.c
 index 0d00061..25c8375 100644
 --- a/src/game/interaction.c
@@ -3635,6 +4446,44 @@ index fdfc70f..8c7acb8 100644
  #include "object_helpers.h"
  #include "object_list_processor.h"
  #include "rendering_graph_node.h"
+diff --git a/src/game/object_helpers.c b/src/game/object_helpers.c
+index 8a138cd..1628a10 100644
+--- a/src/game/object_helpers.c
++++ b/src/game/object_helpers.c
+@@ -26,6 +26,7 @@
+ #include "rendering_graph_node.h"
+ #include "spawn_object.h"
+ #include "spawn_sound.h"
++#include "daily.h"
+ 
+ static s8 sBbhStairJiggleOffsets[] = { -8, 8, -4, 4 };
+ static s16 sPowersOfTwo[] = { 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80 };
+@@ -527,6 +528,7 @@ struct Object *spawn_object_at_origin(struct Object *parent, UNUSED s32 unusedAr
+     const BehaviorScript *behaviorAddr;
+ 
+     behaviorAddr = segmented_to_virtual(behavior);
++    model = daily_model_for(model, behaviorAddr);   // a course mixes levels: the slot may hold another level's model
+     obj = create_object(behaviorAddr);
+ 
+     obj->parentObj = parent;
+@@ -1121,6 +1123,7 @@ void cur_obj_get_dropped(void) {
+ }
+ 
+ void cur_obj_set_model(s32 modelID) {
++    modelID = daily_model_for(modelID, o->behavior);
+     o->header.gfx.sharedChild = gLoadedGraphNodes[modelID];
+ }
+ 
+@@ -2751,7 +2754,8 @@ s32 cur_obj_update_dialog_with_cutscene(s32 actionArg, s32 dialogFlags, s32 cuts
+ }
+ 
+ s32 cur_obj_has_model(u16 modelID) {
+-    if (o->header.gfx.sharedChild == gLoadedGraphNodes[modelID]) {
++    if (o->header.gfx.sharedChild == gLoadedGraphNodes[modelID]
++        || o->header.gfx.sharedChild == gLoadedGraphNodes[daily_model_for(modelID, o->behavior)]) {
+         return TRUE;
+     } else {
+         return FALSE;
 diff --git a/src/menu/title_screen.c b/src/menu/title_screen.c
 index 071714f..fa989d9 100644
 --- a/src/menu/title_screen.c
