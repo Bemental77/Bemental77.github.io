@@ -58,6 +58,10 @@
                        glShadow: FB_Q.get('glshadow') !== '0',
                        glMerge: FB_Q.get('glmerge') !== '0',
                        uber: FB_Q.get('uber') !== '0',
+                       // ?parsc=0: the core acts as if KHR_parallel_shader_compile were absent
+                       // (the reported Mali-G715 on Chrome 155 has none) — the arm that reproduces
+                       // that phone's shader path on a desktop GPU that does have it.
+                       parsc: FB_Q.get('parsc') !== '0',
                        lazy: FB_Q.get('fblazy') !== '0',
                        jitBudget: FB_Q.has('jitbudget') ? Math.max(0, +FB_Q.get('jitbudget') | 0) : undefined,
                        jitAsync: FB_Q.get('jitasync') !== '0',
