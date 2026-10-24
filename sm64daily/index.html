@@ -117,11 +117,11 @@
       + '<button class="go" id="play">' + (d ? 'Play again' : 'Play') + '</button>' + KEYS);
     $('play').onclick = play;
   }
-  var KEYS = '<p class="sub" style="margin-top:12px"><kbd>WASD</kbd> move · <kbd>Space</kbd> A · <kbd>K</kbd> Z · <kbd>J</kbd> B · <kbd>←↑→↓</kbd> camera · <kbd>⌫</kbd> restart</p>';
+  var KEYS = '<p class="sub" style="margin-top:12px"><kbd>WASD</kbd> move · <kbd>Space</kbd> A · <kbd>K</kbd> Z · <kbd>J</kbd> B · <kbd>←↑→↓</kbd> camera · <kbd>⌫</kbd> restart · 🎮 <kbd>A</kbd>/<kbd>Start</kbd> play, <kbd>View</kbd> restart</p>';
   function play() {
     if (started) { $('card').hidden = true; Module._daily_restart(); $('canvas').focus(); return; }
     started = true;
-    card('<h1>SM64 Daily Parkour #' + dayNo + '</h1><p class="sub">Loading Super Mario 64…</p>');
+    card('<h1>SM64 Daily Parkour #' + dayNo + '</h1><p class="sub">Loading…</p>');
     var s = document.createElement('script'); s.src = 'sm64.us.js'; s.onerror = function () { card('<h1>Could not load the game</h1><p>Reload to try again.</p>'); };
     document.body.appendChild(s);
   }
@@ -180,6 +180,24 @@
   document.addEventListener('keydown', function (e) {
     if (e.code === 'Backspace' && window.Module && Module._daily_restart && $('card').hidden) { e.preventDefault(); Module._daily_restart(); }
   });
+  // Controller: A or Start presses the card's main button (Play / Try again); View/Back restarts a run.
+  // In-game the controller is read by the game itself (SDL), so only the page's own buttons live here.
+  var padPrev = {};
+  (function pollPads() {
+    var pads = navigator.getGamepads ? navigator.getGamepads() : [];
+    for (var i = 0; i < pads.length; i++) {
+      var g = pads[i]; if (!g) continue;
+      var now = { a: !!(g.buttons[0] && g.buttons[0].pressed), start: !!(g.buttons[9] && g.buttons[9].pressed), back: !!(g.buttons[8] && g.buttons[8].pressed) };
+      var was = padPrev[i] || {};
+      if (((now.a && !was.a) || (now.start && !was.start)) && !$('card').hidden) {
+        var go = $('card').querySelector('button.go');
+        if (go) go.click();
+      }
+      if (now.back && !was.back && window.Module && Module._daily_restart && $('card').hidden) Module._daily_restart();
+      padPrev[i] = now;
+    }
+    requestAnimationFrame(pollPads);
+  })();
   if (hashArgs.get('g')) unpackRun(hashArgs.get('g')).then(function (r) { ghost = r; intro(); }, intro); else intro();
 })();
 </script>

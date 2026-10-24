@@ -25,7 +25,7 @@ await page.screenshot({ path: OUT + '-jump.png' });
 await wait(3000); await page.screenshot({ path: OUT + '-after.png' });
 // Walk the course by warping onto each platform in order (daily_debug_warp), as a finisher would.
 for (let i = 1; i < ready; i++) { await page.evaluate((i) => Module._daily_debug_warp(i), i); await wait(900); if (process.env.SHOTS) await page.screenshot({ path: OUT + '-st' + String(i).padStart(2, '0') + '.png' }); }
-await wait(2500); await page.screenshot({ path: OUT + '-finish.png' });
+await wait(5500); await page.screenshot({ path: OUT + '-finish.png' });   // the star dance plays before the card
 const card = await page.evaluate(() => ({ h: (document.querySelector('#box h1') || {}).textContent, share: (document.getElementById('share') || {}).textContent, store: localStorage.getItem('sm64daily.v2') }));
 console.log('card', JSON.stringify(card));
 console.log('results', JSON.stringify(await page.evaluate(() => window.__results)));

@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index cfac1e8..43ca336 100644
+index cfac1e8..b02358e 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -170,7 +170,7 @@ endif
@@ -24,7 +24,7 @@ index cfac1e8..43ca336 100644
  ifeq ($(TARGET_WEB),1)
    PLATFORM_CFLAGS  := -DTARGET_WEB
 -  PLATFORM_LDFLAGS := -lm -no-pie -s TOTAL_MEMORY=20MB -g4 --source-map-base http://localhost:8080/ -s "EXTRA_EXPORTED_RUNTIME_METHODS=['callMain']"
-+  PLATFORM_LDFLAGS := -lm -sTOTAL_MEMORY=128MB -sEXPORTED_RUNTIME_METHODS=callMain,HEAP16,HEAPU8 -sEXPORTED_FUNCTIONS=_main,_daily_restart,_daily_debug_warp,_daily_debug_mario_y,_daily_debug_standing,_daily_debug_inside,_daily_set_ghost,_daily_rec_ptr,_daily_rec_count,_malloc,_free
++  PLATFORM_LDFLAGS := -lm -sTOTAL_MEMORY=128MB -sEXPORTED_RUNTIME_METHODS=callMain,HEAP16,HEAPU8 -sEXPORTED_FUNCTIONS=_main,_daily_restart,_daily_debug_warp,_daily_debug_mario_y,_daily_debug_standing,_daily_debug_inside,_daily_debug_gen,_daily_debug_gen_info,_daily_debug_track,_daily_set_ghost,_daily_rec_ptr,_daily_rec_count,_malloc,_free
  endif
  
  PLATFORM_CFLAGS += -DNO_SEGMENTED_MEMORY -DUSE_SYSTEM_MALLOC
@@ -109,12 +109,30 @@ index 66c410b..001e85f 100644
  extern const BehaviorScript bhvUnused2A10[];
  extern const BehaviorScript bhvStar[];
  extern const BehaviorScript bhvStaticObject[];
+diff --git a/levels/intro/script.c b/levels/intro/script.c
+index 04b8fc4..7c601a6 100644
+--- a/levels/intro/script.c
++++ b/levels/intro/script.c
+@@ -19,6 +19,13 @@
+ #include "levels/intro/header.h"
+ 
+ const LevelScript level_intro_splash_screen[] = {
++    // SM64 DAILY PARKOUR: no logo, no Mario head - straight to today's world (intro_regular -> daily_host_level).
++    INIT_LEVEL(),
++    CALL(/*arg*/ LVL_INTRO_REGULAR, /*func*/ lvl_intro_update),
++    EXIT_AND_EXECUTE(/*seg*/ 0x15, _scriptsSegmentRomStart, _scriptsSegmentRomEnd, level_main_scripts_entry),
++};
++
++const LevelScript level_intro_splash_screen_unused[] = {
+     INIT_LEVEL(),
+     FIXED_LOAD(/*loadAddr*/ _goddardSegmentStart, /*romStart*/ _goddardSegmentRomStart, /*romEnd*/ _goddardSegmentRomEnd),
+     LOAD_RAW(/*seg*/ 0x13, _behaviorSegmentRomStart, _behaviorSegmentRomEnd),
 diff --git a/src/game/daily.c b/src/game/daily.c
 new file mode 100644
-index 0000000..fcdc0b9
+index 0000000..27a2393
 --- /dev/null
 +++ b/src/game/daily.c
-@@ -0,0 +1,940 @@
+@@ -0,0 +1,984 @@
 +// SM64 DAILY PARKOUR
 +//
 +// Every day the page hands this module a seed (window.sm64DailySeed) and the
@@ -156,6 +174,10 @@ index 0000000..fcdc0b9
 +#include "object_helpers.h"
 +#include "object_list_processor.h"
 +#include "mario.h"
++#include "interaction.h"
++#include "sound_init.h"
++#include "seq_ids.h"
++#include "game_init.h"
 +#include "camera.h"
 +#include "print.h"
 +#include "area.h"
@@ -339,6 +361,7 @@ index 0000000..fcdc0b9
 +    load_model(MODEL_GIANT_POLE, wf_geo_000AE0);
 +    load_model(MODEL_CHECKER, sCheckerGeo);
 +    load_model(MODEL_GOAL_STAR, star_geo);
++    load_model(MODEL_STAR, star_geo);   // the star Mario holds up in the dance (bhvCelebrationStar)
 +    load_model(MODEL_CHECK_STAR, transparent_star_geo);
 +    build_boxes();
 +}
@@ -753,17 +776,33 @@ index 0000000..fcdc0b9
 +
 +// Every day must get a full course. If today's seed leaves the world too little room for ~2:00,
 +// derive another seed from it (deterministically, so everyone still gets the same course).
++static f32 sGenSecs;
 +static void generate(u32 seed, s32 dow) {
 +    u32 k;
 +    for (k = 0; k < 8; k++) {
-+        if (generate_once(seed + k * 0x9E3779B9u, dow) >= TARGET_SECONDS * 0.85f) return;
++        if ((sGenSecs = generate_once(seed + k * 0x9E3779B9u, dow)) >= TARGET_SECONDS * 0.85f) return;
 +    }
-+    generate_once(seed, dow);
++    sGenSecs = generate_once(seed, dow);
 +}
++
++// Test hook (exported): build (but don't spawn) the course a seed gives over the current world;
++// returns a hash of every part's placement. daily_debug_gen_info() = stations*10000 + seconds.
++u32 daily_debug_gen(u32 seed, s32 dow) {
++    u32 h = 2166136261u;
++    s32 i;
++    generate(seed, dow);
++    for (i = 0; i < sNumParts; i++) {
++        s32 v[5] = { (s32) sPart[i].x, (s32) sPart[i].y, (s32) sPart[i].z, sPart[i].type, sPart[i].piece };
++        s32 j;
++        for (j = 0; j < 5; j++) { h ^= (u32) v[j]; h *= 16777619u; }
++    }
++    return h;
++}
++s32 daily_debug_gen_info(void) { return sNumStations * 10000 + (s32) sGenSecs; }
 +
 +// ── objects ─────────────────────────────────────────────────────────────────
 +static struct Object *sGhostObj;
-+static struct Object *sGoalCap;
++static struct Object *sGoalCap, *sGoalStar;
 +
 +static void spawn_course(void) {
 +    s32 i;
@@ -818,13 +857,11 @@ index 0000000..fcdc0b9
 +                                      (s16) p->x, (s16) (p->y + 260.0f), (s16) p->z, 0, 0, 0);
 +        c->oBehParams = i;
 +    }
-+    // The goal: a gold cap, and a Power Star spinning over it.
-+    {
-+        struct Object *g = spawn_object_abs_with_rot(gMarioObject, 0, MODEL_GOAL_STAR, bhvDailyMarker,
-+                                                     (s16) sPart[sGoal].x, (s16) (sPart[sGoal].y + 300.0f), (s16) sPart[sGoal].z, 0, 0, 0);
-+        g->oBehParams = sGoal | 0x200;
-+        obj_scale(g, 1.6f);
-+    }
++    // The goal: a gold cap, and a Power Star spinning over it at grabbing height.
++    sGoalStar = spawn_object_abs_with_rot(gMarioObject, 0, MODEL_GOAL_STAR, bhvDailyMarker,
++                                          (s16) sPart[sGoal].x, (s16) (sPart[sGoal].y + 150.0f), (s16) sPart[sGoal].z, 0, 0, 0);
++    sGoalStar->oBehParams = sGoal | 0x200;
++    obj_scale(sGoalStar, 1.3f);
 +    sGoalCap = spawn_object_abs_with_rot(gMarioObject, 0, BOX_MODEL_BASE + BK_GOALCAP, bhvDailyPlatform,
 +                                         (s16) sPart[sGoal].x, (s16) (sPart[sGoal].y + 6.0f), (s16) sPart[sGoal].z, 0, sPart[sGoal].yaw, 0);
 +    obj_scale_xyz(sGoalCap, sPart[sGoal].hx / 50.0f * 0.98f, 0.06f, sPart[sGoal].hz / 50.0f * 0.98f);
@@ -849,12 +886,14 @@ index 0000000..fcdc0b9
 +    o->oDrawingDistance = 30000.0f;
 +}
 +
-+static s32 sLastCheck;
++static s32 sLastCheck, sFinished;
 +
 +void bhv_daily_marker_loop(void) {
 +    struct Object *o = gCurrentObject;
 +    o->oFaceAngleYaw += (o->oBehParams & 0x200) ? 0x500 : 0x300;
 +    o->oDrawingDistance = 30000.0f;
++    // The goal star is in Mario's hands once the run is finished.
++    if ((o->oBehParams & 0x200) && sFinished) { o->header.gfx.node.flags &= ~GRAPH_RENDER_ACTIVE; return; }
 +    // A checkpoint's star goes once that checkpoint (or a later one) has been reached.
 +    if (!(o->oBehParams & 0x200) && (o->oBehParams & 0x7F) <= sLastCheck) o->header.gfx.node.flags &= ~GRAPH_RENDER_ACTIVE;
 +    else o->header.gfx.node.flags |= GRAPH_RENDER_ACTIVE;
@@ -888,7 +927,7 @@ index 0000000..fcdc0b9
 +}
 +
 +// ── run state ────────────────────────────────────────────────────────────────
-+static s32 sInited, sBest, sStarted, sFinished, sRestartReq, sMsgTimer, sDay;
++static s32 sInited, sBest, sStarted, sReported, sRestartReq, sMsgTimer, sDay;
 +static const char *sMsg;
 +
 +static s32 station_number(s32 part) {
@@ -922,7 +961,8 @@ index 0000000..fcdc0b9
 +static void say(const char *msg, s32 frames) { sMsg = msg; sMsgTimer = frames; }
 +
 +static void begin_run(void) {
-+    sLastCheck = 0; sBest = 0; sStarted = FALSE; sFinished = FALSE; sRecN = 0;
++    if (gMarioState->action == ACT_STAR_DANCE_EXIT) enable_background_sound();   // restarted mid-dance
++    sLastCheck = 0; sBest = 0; sStarted = FALSE; sFinished = FALSE; sReported = FALSE; sRecN = 0;
 +    level_control_timer(TIMER_CONTROL_SHOW);
 +    put_mario_on(0);
 +}
@@ -974,6 +1014,16 @@ index 0000000..fcdc0b9
 +    return sPart[i].station ? i : -1;
 +}
 +
++// Today's music: SM64's own looping tracks, rotating one per day (the same track for everyone that day).
++static const u8 sTracks[] = {
++    SEQ_LEVEL_SLIDE, SEQ_LEVEL_GRASS, SEQ_LEVEL_KOOPA_ROAD, SEQ_LEVEL_WATER, SEQ_EVENT_POWERUP, SEQ_LEVEL_HOT,
++    SEQ_LEVEL_SNOW, SEQ_EVENT_RACE, SEQ_LEVEL_UNDERGROUND, SEQ_EVENT_METAL_CAP, SEQ_LEVEL_SPOOKY, SEQ_MENU_FILE_SELECT,
++    SEQ_LEVEL_BOSS_KOOPA, SEQ_EVENT_MERRY_GO_ROUND, SEQ_EVENT_BOSS, SEQ_LEVEL_BOSS_KOOPA_FINAL,
++};
++#define NUM_TRACKS ((s32) (sizeof(sTracks) / sizeof(sTracks[0])))
++static s32 todays_track(void) { return ((sDay - 1) % NUM_TRACKS + NUM_TRACKS) % NUM_TRACKS; }
++s32 daily_debug_track(void) { return sTracks[todays_track()]; }
++
 +void daily_update(void) {
 +    struct MarioState *m = gMarioState;
 +    s32 i, on, lowest;
@@ -982,6 +1032,8 @@ index 0000000..fcdc0b9
 +        sInited = FALSE;
 +        return;
 +    }
++    // No pause menu: its "Exit Course" would leave the course for the castle. Start does nothing here.
++    gPlayer1Controller->buttonPressed &= ~START_BUTTON;
 +    if (!sInited) {
 +        u32 seed = 0;
 +        s32 dow = 1;
@@ -995,6 +1047,7 @@ index 0000000..fcdc0b9
 +        spawn_course();
 +        sInited = TRUE;
 +        begin_run();
++        set_background_music(0, SEQUENCE_ARGS(4, sTracks[todays_track()]), 0);
 +#ifdef TARGET_WEB
 +        // Today's module list (ids into the page's MODULES table), for the intro card and share line.
 +        EM_ASM({ if (typeof window !== 'undefined') { window.sm64DailyModules = []; window.sm64DailyHost = $0; } }, sHostIdx);
@@ -1026,12 +1079,21 @@ index 0000000..fcdc0b9
 +            say("CHECKPOINT", 45);
 +        }
 +        if (on == sGoal) {
++            // SM64's own star grab: the collect-star fanfare, Mario holding the star up, "Here we go!".
 +            sFinished = TRUE;
 +            level_control_timer(TIMER_CONTROL_STOP);
-+            play_sound(SOUND_MENU_STAR_SOUND, gGlobalSoundSource);
++            spawn_object(sGoalStar, MODEL_NONE, bhvStarKeyCollectionPuffSpawner);
++            mario_stop_riding_and_holding(m);
++            set_mario_action(m, ACT_STAR_DANCE_EXIT, 0);
 +            say("FINISH", 10000);
-+            report();
 +        }
++    }
++    // The dance would warp out of the level on its 80th frame (general_star_dance_handler);
++    // step it to its closing animation just before that, so Mario stays on the course.
++    if (sFinished && m->action == ACT_STAR_DANCE_EXIT && m->actionState == 0 && m->actionTimer >= 79) m->actionState = 2;
++    if (sFinished && !sReported && (m->action != ACT_STAR_DANCE_EXIT || m->actionState == 2)) {
++        sReported = TRUE;
++        report();
 +    }
 +
 +    // Fell: below every station by a margin, or standing on the real ground. Respawn on the last checkpoint.
@@ -1057,10 +1119,10 @@ index 0000000..fcdc0b9
 +}
 diff --git a/src/game/daily.h b/src/game/daily.h
 new file mode 100644
-index 0000000..2ba5db4
+index 0000000..e0ae256
 --- /dev/null
 +++ b/src/game/daily.h
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,34 @@
 +#ifndef DAILY_H
 +#define DAILY_H
 +
@@ -1088,6 +1150,9 @@ index 0000000..2ba5db4
 +s32 daily_debug_mario_y(void);
 +s32 daily_debug_standing(void);
 +s32 daily_debug_inside(s32 n);
++u32 daily_debug_gen(u32 seed, s32 dow);
++s32 daily_debug_gen_info(void);
++s32 daily_debug_track(void);
 +s32 daily_host_level(void);
 +void daily_debug_warp(s32 i);
 +
