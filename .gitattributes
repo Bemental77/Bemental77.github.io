@@ -104,3 +104,5 @@ dreamcast/discs/**/*.gdi filter= diff= merge= -text
 # 133-byte stub instead of the overlay, which is exactly the false-negative class
 # this project has already paid for. Ship as a real blob.
 gamecube/recomp/sr/*.bin filter= diff= merge= -text
+# SM64 Daily: Pages must serve the real binary, not an LFS pointer (and the LFS budget is exhausted).
+sm64daily/*.wasm                     filter= diff= merge= -text
