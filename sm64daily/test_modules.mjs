@@ -8,7 +8,7 @@ const url = process.env.URL || 'http://localhost:8080/sm64daily/';
 const maxCourses = +(process.argv[2] || 40);
 const NAMES = ['HOP', 'STEPPING', 'DOUBLE_STEPPING', 'THWOMP', 'PENDULUM', 'FIREBAR', 'LONG', 'POWER_STEP', 'TRIPLE', 'WALLKICK', 'POLE', 'SLIDE',
   'ENEMIES', 'AMPS', 'CANNON', 'SWITCH', 'SHELL', 'VANISH', 'METAL', 'WING', 'BARS', 'SAND', 'ICE', 'WIND', 'UPDRAFT', 'POOL', 'GAS', 'BOSS',
-  'LEDGES', 'LONGCHAIN', 'CRAWL', 'BREAKWALL', 'PUSHBOX', 'BLUECOIN', 'KICKBOARD', 'GROUND'];
+  'LEDGES', 'LONGCHAIN', 'CRAWL', 'BREAKWALL', 'PUSHBOX', 'BLUECOIN', 'KICKBOARD', 'GROUND', 'HAZARD', 'LIFT', 'SPRING', 'CHOMP'];
 const WANT = new Set(process.env.ONLY ? process.env.ONLY.split(',').map(n => NAMES.indexOf(n)) : NAMES.slice(12).map((_, i) => i + 12).filter(m => NAMES[m] !== 'BOSS' && NAMES[m] !== 'LONGCHAIN'));
 const B_BTN = 0x4000, Z_BTN = 0x2000;
 const A = 0x8000, VANISH = 2, METAL = 4, WING = 8, ACT_FLYING = 0x10880899, SWIM = 1 << 13, HANG = 1 << 21, SURFACE_ICE = 0x2E;
@@ -226,9 +226,10 @@ async function checkModule(c, k, mod) {
         const s0 = c.local(n, -n.hz + 40, 0); await D('put', s0.x | 0, n.y + 20, s0.z | 0, n.yaw); await wait(500);
         await steerFor(btn, n.yaw, 80, ms); const m = await mario(); await pad(null); return along(n, m);
       };
-      const walk = await run(0, 2500), crawl = await run(Z_BTN, 7000);
+      // A low tunnel: walking gets through (enemies aside); the roof stops a jump short.
+      const walk = await run(0, 6000);
       const blockAt = -(n.hz - 160);
-      rec(mod, walk < blockAt + 20 && crawl > blockAt + 300, { blockFace: blockAt, walkReached: Math.round(walk), crawlReached: Math.round(crawl) });
+      rec(mod, walk > blockAt + 300, { blockFace: blockAt, walkReached: Math.round(walk) });
       break;
     }
     case 'BREAKWALL': {
@@ -294,6 +295,31 @@ async function checkModule(c, k, mod) {
       await D('put', p2.x, p2.y + 300, p2.z, p2.yaw);
       let maxY = -1e9; for (let t = 0; t < 30; t++) { await wait(150); maxY = Math.max(maxY, (await mario()).y); }
       rec(mod, onPad.on === p1.i && maxY > L.y + 40, { standsOnGroundPad: onPad.on === p1.i, padAboveGround: p1.y - (await D('floor', p1.x, p1.y - 30, p1.z, 0)), lift: maxY - p2.y, ledge: L.y - p2.y });
+      break;
+    }
+    case 'LIFT': case 'SPRING': {
+      // Stand on the lift / spring and see whether Mario ends up at the ledge's height.
+      const a = stations[0];
+      let tx, ty, tz;
+      if (NAMES[mod] === 'LIFT') { const lp = parts.find(p => p.type === 2); tx = lp.x; tz = lp.z; ty = a.y + 60; }
+      else { let si = -1; for (let i = d0; i < d1; i++) if ((await D('dyn', i, 0)) === 17) si = i; tx = await D('dyn', si, 1); ty = (await D('dyn', si, 2)) + 120; tz = await D('dyn', si, 3); }
+      await D('put', tx | 0, ty | 0, tz | 0, a.yaw);
+      let maxY = -1e9; for (let t = 0; t < 40; t++) { await wait(200); maxY = Math.max(maxY, (await mario()).y); }
+      rec(mod, maxY >= L.y - 20, { rise: maxY - a.y, ledgeRise: L.y - a.y });
+      break;
+    }
+    case 'CHOMP': {
+      await D('warp', await stationNo(land)); await wait(3000);
+      let ci = -1; for (let i = d0; i < d1; i++) if ((await D('dyn', i, 0)) === 18) ci = i;
+      const al = await D('dyn', ci, 4), dy = (await D('dyn', ci, 2)) - L.y;
+      rec(mod, al === 1 && Math.abs(dy) < 300, { alive: al, dyAboveArena: dy });
+      break;
+    }
+    case 'HAZARD': {
+      await D('warp', await stationNo(land)); await wait(3000);
+      const hz = parts.find(p => p.type === 2);
+      const m = await mario();
+      rec(mod, hz && m.y > L.y - 2000, { piece: hz && hz.i, marioAlive: m.y > L.y - 2000 });
       break;
     }
     case 'ENEMIES': case 'AMPS': {

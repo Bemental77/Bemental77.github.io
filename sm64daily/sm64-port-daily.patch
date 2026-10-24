@@ -183,6 +183,42 @@ index 6a18f18..17f8168 100644
          o->oCannonUnk10C = 0;
      }
  }
+diff --git a/src/game/behaviors/elevator.inc.c b/src/game/behaviors/elevator.inc.c
+index 3436907..01aff46 100644
+--- a/src/game/behaviors/elevator.inc.c
++++ b/src/game/behaviors/elevator.inc.c
+@@ -98,6 +98,11 @@ void bhv_elevator_init(void) {
+         o->oElevatorUnkF8 = o->oHomeY;
+         o->oElevatorUnkFC = (o->oElevatorUnkF4 + o->oElevatorUnkF8) / 2;
+         o->oElevatorUnk100 = cur_obj_has_behavior(bhvRrElevatorPlatform);
++        if (daily_active()) {   // SM64 DAILY PARKOUR: on a course it runs from 900 below where it was spawned
++            o->oElevatorUnkF4 = o->oHomeY - 900.0f;
++            o->oElevatorUnkFC = (o->oElevatorUnkF4 + o->oElevatorUnkF8) / 2;
++            o->oElevatorUnk100 = 0;
++        }
+     } else {
+         o->oElevatorUnkF4 = sElevatorHeights[o->oBehParams2ndByte * 3];
+         o->oElevatorUnkF8 = sElevatorHeights[o->oBehParams2ndByte * 3 + 1];
+diff --git a/src/game/behaviors/rolling_log.inc.c b/src/game/behaviors/rolling_log.inc.c
+index dd88e55..6f2528c 100644
+--- a/src/game/behaviors/rolling_log.inc.c
++++ b/src/game/behaviors/rolling_log.inc.c
+@@ -11,6 +11,7 @@ void bhv_ttm_rolling_log_init(void) {
+     o->oPitouneUnkFC = 3654.0f;
+     o->oPitouneUnkF4 = 271037.0f;
+     o->oMoveAngleYaw = 8810;
++    if (daily_active()) { o->oPitouneUnkF8 = o->oPosX; o->oPitouneUnkFC = o->oPosZ; o->oMoveAngleYaw = o->oFaceAngleYaw; }   // SM64 DAILY PARKOUR
+     o->oForwardVel = 0;
+     o->oVelX = 0;
+     o->oVelZ = 0;
+@@ -146,6 +147,7 @@ void bhv_lll_rolling_log_init(void) {
+     o->oPitouneUnkF4 = 1048576.0f;
+ 
+     o->oMoveAngleYaw = 0x3FFF;
++    if (daily_active()) { o->oPitouneUnkF8 = o->oPosX; o->oPitouneUnkFC = o->oPosZ; o->oMoveAngleYaw = o->oFaceAngleYaw; }   // SM64 DAILY PARKOUR
+     o->oForwardVel = 0;
+     o->oVelX = 0;
+     o->oVelZ = 0;
 diff --git a/src/game/behaviors/spawn_star.inc.c b/src/game/behaviors/spawn_star.inc.c
 index b48c3e4..3909f09 100644
 --- a/src/game/behaviors/spawn_star.inc.c
@@ -195,12 +231,34 @@ index b48c3e4..3909f09 100644
      sp30 = spawn_object_abs_with_rot(o, 0, MODEL_STAR, bhvStarSpawnCoordinates, o->oPosX, o->oPosY,
                                       o->oPosZ, 0, 0, 0);
      sp30->oBehParams = o->oBehParams;
+diff --git a/src/game/behaviors/treasure_chest.inc.c b/src/game/behaviors/treasure_chest.inc.c
+index 34b855e..774cf9f 100644
+--- a/src/game/behaviors/treasure_chest.inc.c
++++ b/src/game/behaviors/treasure_chest.inc.c
+@@ -176,10 +176,17 @@ void bhv_treasure_chest_jrb_loop(void) {
+ }
+ 
+ void bhv_treasure_chest_init(void) {
++    if (daily_active()) {   // SM64 DAILY PARKOUR: the four chests around the controller, wherever it is
++        spawn_treasure_chest(1, o->oPosX - 500, o->oPosY, o->oPosZ + 450, -0x6001);
++        spawn_treasure_chest(2, o->oPosX + 550, o->oPosY, o->oPosZ + 350, 0x1FFF);
++        spawn_treasure_chest(3, o->oPosX - 450, o->oPosY, o->oPosZ - 550, 9102);
++        spawn_treasure_chest(4, o->oPosX + 400, o->oPosY, o->oPosZ - 400, 16019);
++    } else {
+     spawn_treasure_chest(1, -4500, -5119, 1300, -0x6001);
+     spawn_treasure_chest(2, -1800, -5119, 1050, 0x1FFF);
+     spawn_treasure_chest(3, -4500, -5119, -1100, 9102);
+     spawn_treasure_chest(4, -2400, -4607, 125, 16019);
++    }
+ 
+     o->oTreasureChestUnkF4 = 1;
+     o->oTreasureChestUnkFC = 0;
 diff --git a/src/game/daily.c b/src/game/daily.c
 new file mode 100644
-index 0000000..20a9ce7
+index 0000000..965bcc6
 --- /dev/null
 +++ b/src/game/daily.c
-@@ -0,0 +1,2220 @@
+@@ -0,0 +1,2329 @@
 +// SM64 DAILY PARKOUR
 +//
 +// The page hands this module a seed (window.sm64DailySeed: the date, or a
@@ -282,6 +340,10 @@ index 0000000..20a9ce7
 +#include "actors/group13.h"
 +#include "actors/group17.h"
 +#include "levels/bbh/header.h"
++#include "levels/hmc/header.h"
++#include "levels/ttm/header.h"
++#include "actors/group8.h"
++#include "actors/group14.h"
 +#include "actors/group3.h"
 +#include "actors/group9.h"
 +#include "actors/group11.h"
@@ -439,7 +501,7 @@ index 0000000..20a9ce7
 +// ── SM64's own platform pieces ──────────────────────────────────────────────
 +// Each is loaded into a free model slot and spawned with its real behavior. `col` is the
 +// collision the behavior uses for that behParam — read here only to measure the piece.
-+enum { R_STEP, R_LONGSTEP, R_HAZ_THWOMP, R_HAZ_PENDULUM, R_HAZ_FIREBAR, R_HAZ_ANY };
++enum { R_STEP, R_LONGSTEP, R_HAZ_THWOMP, R_HAZ_PENDULUM, R_HAZ_FIREBAR, R_HAZ_ANY, R_LIFT };
 +struct Piece {
 +    const char *name;
 +    const BehaviorScript *beh;
@@ -449,7 +511,7 @@ index 0000000..20a9ce7
 +    u8 role, model;
 +    f32 minY, maxY, rx, rz, r;   // measured from `col`
 +};
-+#define PM(n) (0xE2 + (n))      // 0xE2..0xEF unused by any level (include/model_ids.h)
++#define PM(n) (0xE2 + (n))      // 0xE2..0xFE: free (the host's objects are cleared)
 +#include "daily_lib.inc.h"
 +#define MAX_PIECES 96
 +static struct Piece sPiece[MAX_PIECES] = {
@@ -475,14 +537,19 @@ index 0000000..20a9ce7
 +    { "WF ROTATOR",      bhvWfRotatingWoodenPlatform,     wf_geo_000A58,    wf_seg7_collision_clocklike_rotation,  0,          R_LONGSTEP, PM(19) },
 +    { "LLL TILT PYRAMID",bhvLllTiltingInvertedPyramid,    lll_geo_000BF8,   lll_seg7_collision_inverted_pyramid,   0,          R_STEP,     PM(20) },
 +    { "LLL SLOW TILT",   bhvLllSinkingRectangularPlatform, lll_geo_000BC8,  lll_seg7_collision_slow_tilting_platform, 0,       R_LONGSTEP, PM(21) },
++    // Elevators and rolling logs run on their home level's absolute coordinates; on a course they are
++    // patched (elevator.inc.c, rolling_log.inc.c) to work around wherever they are spawned.
++    { "HMC ELEVATOR",    bhvHmcElevatorPlatform,          hmc_geo_0005D0,   NULL,                                  0,          R_LIFT,     PM(22) },
++    { "LLL ROLLING LOG", bhvLllRollingLog,                lll_geo_000DE8,   NULL,                                  0,          R_LONGSTEP, PM(23) },
++    { "TTM ROLLING LOG", bhvTtmRollingLog,                ttm_geo_000730,   NULL,                                  0,          R_LONGSTEP, PM(24) },
 +};
-+#define NUM_BUILTIN_PIECES 22
++#define NUM_BUILTIN_PIECES 25
 +static s32 sNumPieces = NUM_BUILTIN_PIECES;
 +#define NUM_PIECES sNumPieces
-+#define MODEL_FIREBAR_BLOCK 0xF9
-+#define MODEL_GIANT_POLE    0xFA
-+#define MODEL_GOAL_STAR     0xFB
-+#define MODEL_CHECK_STAR    0xFC
++#define MODEL_FIREBAR_BLOCK 0x13   // after our boxes (0x03..0x12)
++#define MODEL_GIANT_POLE    0x14
++#define MODEL_GOAL_STAR     0x15
++#define MODEL_CHECK_STAR    0xFF
 +#define MODEL_CHECKER       MODEL_CHECKERBOARD_PLATFORM   // already a global model (scripts.c), loaded again to be safe
 +
 +static struct AllocOnlyPool *sPool;
@@ -558,7 +625,7 @@ index 0000000..20a9ce7
 +// ── things that come and go: enemies, coins, item boxes, timed boxes ───────
 +// Respawned for every run (begin_run), so a restart is a clean slate.
 +enum { DK_GOOMBA, DK_GOOMBA_BIG, DK_BOBOMB, DK_CHUCKYA, DK_FLYGUY, DK_AMP, DK_REDCOIN, DK_COIN, DK_CAPBOX, DK_HIDDEN, DK_BOSS,
-+       DK_LIB, DK_BREAKBOX, DK_METALBOX, DK_BLUESWITCH, DK_BLUECOIN, DK_KICKBOARD, DK_COUNT };
++       DK_LIB, DK_BREAKBOX, DK_METALBOX, DK_BLUESWITCH, DK_BLUECOIN, DK_KICKBOARD, DK_SPRING, DK_CHOMP, DK_COUNT };
 +struct Dyn {
 +    f32 x, y, z;
 +    s16 yaw, part;
@@ -626,7 +693,7 @@ index 0000000..20a9ce7
 +// the small Bully are both 0x56 — include/model_ids.h), so only the day's boss is loaded; the
 +// host's objects are gone, so the slots are free. Their stars fly to their home level's
 +// coordinates; spawn_star asks daily_star_target for the arena instead.
-+enum { BOSS_KING_BOBOMB, BOSS_KING_WHOMP, BOSS_BIG_BULLY, BOSS_WIGGLER, BOSS_BIG_BOO, BOSS_COUNT };
++enum { BOSS_KING_BOBOMB, BOSS_KING_WHOMP, BOSS_BIG_BULLY, BOSS_WIGGLER, BOSS_BIG_BOO, BOSS_CHESTS, BOSS_COUNT };
 +struct Boss { const char *name; const BehaviorScript *beh; u8 model; const GeoLayout *geo; u8 model2; const GeoLayout *geo2; u32 bp; };
 +static const struct Boss sBosses[BOSS_COUNT] = {
 +    { "KING BOB-OMB", bhvKingBobomb,    MODEL_KING_BOBOMB,  king_bobomb_geo,  0, NULL, 0 },
@@ -634,6 +701,8 @@ index 0000000..20a9ce7
 +    { "BIG BULLY",    bhvBigBully,      MODEL_BULLY_BOSS,   bully_boss_geo,   0, NULL, 0 },
 +    { "WIGGLER",      bhvWigglerHead,   MODEL_WIGGLER_HEAD, wiggler_head_geo, MODEL_WIGGLER_BODY, wiggler_body_geo, 0 },
 +    { "BIG BOO",      bhvBalconyBigBoo, MODEL_BOO,          boo_geo,          0, NULL, 0 },
++    // Not a boss: Dire, Dire Docks' treasure-chest puzzle (open the four in order) — its star ends the run.
++    { "TREASURE CHESTS", bhvTreasureChests, MODEL_TREASURE_CHEST_BASE, treasure_chest_base_geo, MODEL_TREASURE_CHEST_LID, treasure_chest_lid_geo, 0 },
 +};
 +static s32 sBoss = -1, sArena = -1;
 +
@@ -646,6 +715,8 @@ index 0000000..20a9ce7
 +        case DK_BLUESWITCH: return bhvBlueCoinSwitch;
 +        case DK_BLUECOIN: return bhvHiddenBlueCoin;
 +        case DK_KICKBOARD: return bhvKickableBoard;
++        case DK_SPRING: return bhvBetaTrampolineTop;
++        case DK_CHOMP: return bhvChainChomp;
 +        case DK_GOOMBA: case DK_GOOMBA_BIG: return bhvGoomba;
 +        case DK_BOBOMB:  return bhvBobomb;
 +        case DK_CHUCKYA: return bhvChuckya;
@@ -659,12 +730,14 @@ index 0000000..20a9ce7
 +}
 +static u32 dyn_model(u8 k) {
 +    switch (k) {
-+        case DK_BOSS:    return sBosses[sBoss].model;
++        case DK_BOSS:    return sBoss == BOSS_CHESTS ? MODEL_NONE : sBosses[sBoss].model;   // the chest puzzle's controller is invisible
 +        case DK_BREAKBOX: return MODEL_BREAKABLE_BOX;
 +        case DK_METALBOX: return MODEL_METAL_BOX;
 +        case DK_BLUESWITCH: return MODEL_BLUE_COIN_SWITCH;
 +        case DK_BLUECOIN: return MODEL_BLUE_COIN;
 +        case DK_KICKBOARD: return MODEL_WF_KICKABLE_BOARD;
++        case DK_SPRING: return MODEL_TRAMPOLINE;
++        case DK_CHOMP: return MODEL_CHAIN_CHOMP;
 +        case DK_GOOMBA: case DK_GOOMBA_BIG: return MODEL_GOOMBA;
 +        case DK_BOBOMB:  return MODEL_BLACK_BOBOMB;
 +        case DK_CHUCKYA: return MODEL_CHUCKYA;
@@ -682,7 +755,7 @@ index 0000000..20a9ce7
 +// Walking enemies need their platform's collision under them, and SM64 only loads an object's
 +// collision while Mario is within its oCollisionDistance (surface_load.c:834). So they are spawned
 +// once Mario comes near their platform, not at the start.
-+static s32 lazy(u8 k) { return k == DK_GOOMBA || k == DK_GOOMBA_BIG || k == DK_BOBOMB || k == DK_CHUCKYA || k == DK_BOSS || k == DK_LIB || k == DK_METALBOX; }
++static s32 lazy(u8 k) { return k == DK_GOOMBA || k == DK_GOOMBA_BIG || k == DK_BOBOMB || k == DK_CHUCKYA || k == DK_BOSS || k == DK_LIB || k == DK_METALBOX || k == DK_CHOMP; }
 +#define LAZY_RADIUS 2200.0f
 +
 +// Water and poison-gas regions we add (axis-aligned, like SM64's own: surface_collision.c:589-655).
@@ -842,13 +915,14 @@ index 0000000..20a9ce7
 +       MD_TRIPLE, MD_WALLKICK, MD_POLE, MD_SLIDE,
 +       MD_ENEMIES, MD_AMPS, MD_CANNON, MD_SWITCH, MD_SHELL, MD_VANISH, MD_METAL, MD_WING, MD_BARS, MD_SAND,
 +       MD_ICE, MD_WIND, MD_UPDRAFT, MD_POOL, MD_GAS, MD_BOSS,
-+       MD_LEDGES, MD_LONGCHAIN, MD_CRAWL, MD_BREAKWALL, MD_PUSHBOX, MD_BLUECOIN, MD_KICKBOARD, MD_GROUND, MD_HAZARD, MD_COUNT };
++       MD_LEDGES, MD_LONGCHAIN, MD_CRAWL, MD_BREAKWALL, MD_PUSHBOX, MD_BLUECOIN, MD_KICKBOARD, MD_GROUND, MD_HAZARD,
++       MD_LIFT, MD_SPRING, MD_CHOMP, MD_COUNT };
 +static const f32 sModSeconds[MD_COUNT] = { 2.5f, 5, 8, 6, 6, 7, 4.5f, 4, 6, 9, 12, 5,
 +                                           8, 6, 9, 9, 8, 7, 7, 12, 13, 6, 6, 6, 7, 14, 6, 40,
-+                                           7, 9, 6, 8, 12, 8, 9, 16, 7 };
++                                           7, 9, 6, 8, 12, 8, 9, 16, 7, 6, 5, 9 };
 +static const f32 sModWeight[MD_COUNT] = { 1.0f, 2.5f, 1.5f, 1, 1, 1, 1, 1, 1, 1, 1, 0.8f,
 +                                          1.2f, 1, 1, 1, 1, 1, 1, 0.8f, 0.8f, 1, 1, 1, 1, 0.8f, 1, 0,     // the boss is placed, never picked
-+                                          1, 1, 1, 1, 1, 0.8f, 1, 1.2f, 1.6f };
++                                          1, 1, 1, 1, 1, 0.8f, 1, 1.2f, 1.6f, 1, 1, 1 };
 +static f32 sModOn[MD_COUNT];
 +static s32 sKickboards;   // this seed's palette: which modules it uses, and how much (generate)
 +
@@ -859,6 +933,14 @@ index 0000000..20a9ce7
 +        if (sLib[i].geo) load_model(sLib[i].model, sLib[i].geo);
 +        if (sLib[i].geo2) load_model(sLib[i].model2, sLib[i].geo2);
 +        if (sLib[i].geo3) load_model(sLib[i].model3, sLib[i].geo3);
++    }
++    load_model(MODEL_TRAMPOLINE, springboard_top_geo);           // unused by every level (model_ids.h:521-523)
++    load_model(MODEL_TRAMPOLINE_CENTER, springboard_spring_geo);
++    load_model(MODEL_TRAMPOLINE_BASE, springboard_bottom_geo);
++    if (sGroupB == 15) {   // the Chain Chomp's group
++        load_model(MODEL_CHAIN_CHOMP, chain_chomp_geo);
++        load_model(MODEL_METALLIC_BALL, metallic_ball_geo);
++        load_model(MODEL_WOODEN_POST, wooden_post_geo);
 +    }
 +    if (sKickboards) {
 +        load_model(MODEL_WF_KICKABLE_BOARD, wf_geo_000BA8);
@@ -1106,11 +1188,20 @@ index 0000000..20a9ce7
 +        }
 +
 +        case MD_CRAWL: {
-+            // A block with a crawl space through it: crouch and crawl, or dive and slide under.
-+            f32 clr = 150.0f;   // Mario stands 160 tall: he must crawl or slide
-+            n = station(c, h, rnd_f(150, 220), rnd_f(-60, 60), 210.0f, rnd_f(650, 850));
++            // A low tunnel through a block: room to walk (Mario is 160 tall; SM64's ground steps treat any
++            // gap under 160 as a wall, crawling included — mario_step.c), no room to jump over what's inside.
++            f32 clr = 240.0f, x, z;
++            s32 k, cand[NUM_LIB], nc = 0;
++            n = station(c, h, rnd_f(150, 220), rnd_f(-60, 60), 230.0f, rnd_f(750, 950));
 +            if (!n) break;
 +            b = box_at(BK_WALL, n, 0, 0, n->y + clr + 700.0f, n->hx + 60.0f, n->hz - 160.0f, 700.0f, n->yaw);
++            for (k = 0; k < NUM_LIB; k++) if (lib_ok(k) && sLib[k].ground && sLib[k].beh != bhvSmallBully && sLib[k].beh != bhvTweester && sLib[k].beh != bhvPokey) cand[nc++] = k;
++            for (k = 0; k < 2 && nc > 0; k++) {
++                struct Dyn *d;
++                local_pt(n, -n->hz / 3 + k * (2 * n->hz / 3), 0, &x, &z);
++                d = add_dyn(DK_LIB, x, n->y + 40.0f, z, (s32) (n - sPart));
++                if (d) { d->lib = (u8) cand[rnd_i(nc)]; d->bp = sLib[d->lib].bp; d->objective = sLib[d->lib].killable; }
++            }
 +            break;
 +        }
 +
@@ -1187,6 +1278,50 @@ index 0000000..20a9ce7
 +            b = add_part(PT_PIECE);
 +            if (!b) { n = NULL; break; }
 +            b->piece = pick; b->x = n->x; b->z = n->z; b->yaw = h; b->y = n->y - DMIN(sPiece[pick].minY, 0.0f); b->r = 1; b->h = 0;
++            break;
++        }
++
++        case MD_LIFT: {
++            // Hazy Maze Cave's elevator: step on at the bottom, ride it up to a ledge 900 above.
++            s32 k, pick = -1;
++            for (k = 0; k < NUM_PIECES; k++) if (sPiece[k].role == R_LIFT) pick = k;
++            if (pick < 0) break;
++            a = station(c, h, rnd_f(150, 220), rnd_f(-60, 60), 300.0f, 300.0f);
++            if (!a) break;
++            b = add_part(PT_PIECE);
++            if (!b) break;
++            b->piece = pick; b->yaw = h; b->r = DMAX(sPiece[pick].r, 200.0f); b->h = 0;
++            put_ahead(b, a, h, 40.0f, 0, b->r);
++            b->y = a->y + 900.0f - sPiece[pick].maxY;     // its home is the top; the patched bottom is 900 below
++            n = station(b, h, 40.0f, 0, rnd_f(260, 320), rnd_f(260, 320));
++            if (n) { n->y = a->y + 900.0f; n->h = 200.0f; }
++            break;
++        }
++
++        case MD_SPRING: {
++            // A springboard (SM64's unused one, made to bounce: see daily_update) up to a ledge too high for any jump.
++            struct Dyn *d;
++            a = station(c, h, rnd_f(150, 220), rnd_f(-60, 60), 300.0f, 300.0f);
++            if (!a) break;
++            n = station(a, h, rnd_f(80, 160), rnd_f(900, 1050), rnd_f(260, 320), rnd_f(260, 320));
++            if (!n) break;
++            n->h = 300.0f;
++            {
++                f32 x, z;
++                local_pt(a, a->hz - 110.0f, 0, &x, &z);
++                d = add_dyn(DK_SPRING, x, a->y + 150.0f, z, (s32) (a - sPart));
++            }
++            break;
++        }
++
++        case MD_CHOMP: {
++            // Bob-omb Battlefield's Chain Chomp, chained mid-arena (it can reach ~750-900): get past it.
++            struct Dyn *d;
++            if (sGroupB != 15) break;
++            n = station(c, h, rnd_f(150, 220), rnd_f(-60, 60), 1000.0f, 1000.0f);
++            if (!n) break;
++            n->r = 1450.0f;
++            d = add_dyn(DK_CHOMP, n->x, n->y + 50.0f, n->z, (s32) (n - sPart));
 +            break;
 +        }
 +
@@ -1705,7 +1840,10 @@ index 0000000..20a9ce7
 +        if (sIslands) { sModOn[MD_CANNON] = DMAX(sModOn[MD_CANNON], 1.5f); sModOn[MD_WING] = DMAX(sModOn[MD_WING], 1.2f); }
 +        // Moving platforms and hazards: the built-in ones, plus a draw from the whole inventory (sAuto).
 +        sNumPieces = NUM_BUILTIN_PIECES;
-+        for (i = 0; i < NUM_BUILTIN_PIECES; i++) { measure(&sPiece[i]); sPieceOn[i] = (PRNG() % 100) < 35; }
++        for (i = 0; i < NUM_BUILTIN_PIECES; i++) {
++            if (sPiece[i].col == NULL) sPiece[i].col = beh_collision(sPiece[i].beh);
++            measure(&sPiece[i]); sPieceOn[i] = (PRNG() % 100) < 35;
++        }
 +        {
 +            static u8 claimed[256];
 +            s32 a, tries;
@@ -1716,6 +1854,8 @@ index 0000000..20a9ce7
 +            for (a = 0; a < NUM_LIB; a++) if (lib_ok(a)) { claimed[sLib[a].model] = 1; claimed[sLib[a].model2] = 1; claimed[sLib[a].model3] = 1; }
 +            if (sBoss >= 0) { claimed[sBosses[sBoss].model] = 1; claimed[sBosses[sBoss].model2] = 1; }
 +            claimed[MODEL_WF_KICKABLE_BOARD] = claimed[MODEL_WF_KICKABLE_BOARD_FELLED] = 1;
++            claimed[MODEL_TRAMPOLINE] = claimed[MODEL_TRAMPOLINE_CENTER] = claimed[MODEL_TRAMPOLINE_BASE] = 1;
++            if (sGroupB == 15) claimed[MODEL_CHAIN_CHOMP] = claimed[MODEL_METALLIC_BALL] = claimed[MODEL_WOODEN_POST] = 1;
 +            for (tries = 0; tries < 400 && sNumPieces < MAX_PIECES && sNumPieces < NUM_BUILTIN_PIECES + 18; tries++) {
 +                const struct AutoPiece *ap = &sAuto[PRNG() % NUM_AUTO];
 +                struct Piece *pc = &sPiece[sNumPieces];
@@ -1747,6 +1887,7 @@ index 0000000..20a9ce7
 +        if (sBoss == BOSS_WIGGLER) sGroupA = 12;
 +        if (sBoss == BOSS_BIG_BOO) sGroupA = 10;
 +        if (sBoss == BOSS_KING_WHOMP) sGroupB = 15;
++        if (sBoss == BOSS_CHESTS) sGroupB = 14;
 +        #undef PRNG
 +    }
 +    for (k = 0; k < 8; k++) {
@@ -2042,6 +2183,22 @@ index 0000000..20a9ce7
 +    }
 +}
 +
++// Platforms that fall or crumble (tumbling bridges, falling pillars...) come back when Mario
++// respawns, so a fall after crossing one never strands him behind it.
++static void respawn_broken_pieces(void) {
++    s32 i;
++    for (i = 0; i < sNumParts; i++) {
++        struct Part *p = &sPart[i];
++        struct Object *o = p->obj;
++        if (p->type != PT_PIECE) continue;
++        if (o == NULL || o->activeFlags == ACTIVE_FLAG_DEACTIVATED || o->behavior != segmented_to_virtual(sPiece[p->piece].beh)
++            || absf(o->oPosY - p->y) > 1500.0f) {
++            if (o != NULL && o->activeFlags != ACTIVE_FLAG_DEACTIVATED && o->behavior == segmented_to_virtual(sPiece[p->piece].beh)) obj_mark_for_deletion(o);
++            spawn_part_obj(i);
++        }
++    }
++}
++
 +static void begin_run(void) {
 +    struct MarioState *m = gMarioState;
 +    s32 i;
@@ -2055,6 +2212,7 @@ index 0000000..20a9ce7
 +    for (i = 0; i < sNumParts; i++)
 +        if (sPart[i].type == PT_OBJ && sPart[i].kind == OK_CANNON && sPart[i].obj) sPart[i].obj->oAction = 0;   // a cannon left loaded
 +    respawn_all_dyn();
++    respawn_broken_pieces();
 +    put_mario_on(0);
 +}
 +
@@ -2339,6 +2497,14 @@ index 0000000..20a9ce7
 +        // A metal box that went over an edge goes home.
 +        if (d->kind == DK_METALBOX && d->obj->oPosY < sPart[d->part].y - 300.0f) { obj_mark_for_deletion(d->obj); spawn_dyn(d); }
 +    }
++    // The springboard: landing on its top launches Mario (SM64 never finished it: beta_trampoline.inc.c
++    // stubs the bounce out). Its top is a platform object, so Mario stands on it like any floor.
++    if (m->floor != NULL && m->floor->object != NULL && m->floor->object->behavior == segmented_to_virtual(bhvBetaTrampolineTop)
++        && !(m->action & ACT_FLAG_AIR) && m->pos[1] - m->floorHeight < 10.0f) {
++        set_mario_action(m, ACT_TRIPLE_JUMP, 0);
++        m->vel[1] = 92.0f;
++        play_sound(SOUND_GENERAL_BOING1, gGlobalSoundSource);
++    }
 +    left = objective_left();
 +    if (!sUnlocked && left == 0 && sMode != MODE_BOSS) {
 +        sUnlocked = TRUE;
@@ -2396,6 +2562,7 @@ index 0000000..20a9ce7
 +                       || m->pos[1] < host_water(m->pos[0], m->pos[2]) + 150.0f
 +                       || ((m->action & ACT_FLAG_SWIMMING) && !in_our_env(m->pos[0], m->pos[2])) || m->health < 0x100)) {
 +        sRespawnReq = FALSE;
++        respawn_broken_pieces();
 +        put_mario_on(sLastCheck);
 +    }
 +
