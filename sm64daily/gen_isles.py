@@ -13,8 +13,11 @@ for script in sorted(glob.glob('levels/*/script.c')):
     hdr = 'levels/%s/header.h' % lvl
     if not os.path.exists(hdr): continue
     hsrc = open(hdr).read()
-    for n, geo in re.findall(r'AREA\(\s*(?:/\*index\*/\s*)?(\d+)\s*,\s*(?:/\*geo\*/\s*)?(\w+)\s*\)', src):
-        col = '%s_seg7_area_%s_collision' % (lvl, n)
+    for m in re.finditer(r'AREA\(\s*(?:/\*index\*/\s*)?(\d+)\s*,\s*(?:/\*geo\*/\s*)?(\w+)\s*\)(.*?)END_AREA', src, re.S):
+        n, geo, body = m.group(1), m.group(2), m.group(3)
+        tm = re.search(r'TERRAIN\(\s*(?:/\*terrainData\*/\s*)?(\w+)\s*\)', body)
+        if not tm: continue
+        col = tm.group(1)
         if 'const Collision %s[]' % col not in hsrc: continue
         g = None
         for f in glob.glob('levels/%s/areas/%s/geo.inc.c' % (lvl, n)) + glob.glob('levels/%s/areas/*/geo.inc.c' % lvl) + glob.glob('levels/%s/geo.inc.c' % lvl):

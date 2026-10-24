@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index cfac1e8..9a55bf4 100644
+index cfac1e8..b95c47d 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -170,7 +170,7 @@ endif
@@ -24,7 +24,7 @@ index cfac1e8..9a55bf4 100644
  ifeq ($(TARGET_WEB),1)
    PLATFORM_CFLAGS  := -DTARGET_WEB
 -  PLATFORM_LDFLAGS := -lm -no-pie -s TOTAL_MEMORY=20MB -g4 --source-map-base http://localhost:8080/ -s "EXTRA_EXPORTED_RUNTIME_METHODS=['callMain']"
-+  PLATFORM_LDFLAGS := -lm -sTOTAL_MEMORY=128MB -sEXPORTED_RUNTIME_METHODS=callMain,HEAP16,HEAPU8 -sEXPORTED_FUNCTIONS=_main,_daily_restart,_daily_debug_warp,_daily_debug_mario_y,_daily_debug_standing,_daily_debug_inside,_daily_debug_gen,_daily_debug_gen_info,_daily_debug_track,_daily_debug_mode,_daily_debug_auto,_daily_debug_used_auto,_daily_debug_modules,_daily_debug_objective,_daily_debug_dyn_count,_daily_debug_dyn_warp,_daily_debug_defeat_all,_daily_debug_cannon,_daily_debug_next_station,_daily_debug_part_of_cannon,_daily_debug_mod_info,_daily_debug_num_parts,_daily_debug_part,_daily_debug_put,_daily_debug_mario,_daily_debug_cap,_daily_debug_camyaw,_daily_debug_cammode,_daily_debug_floor,_daily_debug_action,_daily_debug_dyn,_daily_debug_num_dyn,_daily_debug_dyn_move,_daily_debug_star,_daily_set_pad,_daily_set_volume,_daily_pause,_daily_set_ghost,_daily_rec_ptr,_daily_rec_count,_malloc,_free
++  PLATFORM_LDFLAGS := -lm --emit-symbol-map -sTOTAL_MEMORY=128MB -sEXPORTED_RUNTIME_METHODS=callMain,HEAP16,HEAPU8 -sEXPORTED_FUNCTIONS=_main,_daily_restart,_daily_debug_warp,_daily_debug_mario_y,_daily_debug_standing,_daily_debug_inside,_daily_debug_gen,_daily_debug_gen_info,_daily_debug_track,_daily_debug_mode,_daily_debug_auto,_daily_debug_last_beh,_daily_debug_spawn_auto,_daily_debug_isle,_daily_debug_used_auto,_daily_debug_modules,_daily_debug_objective,_daily_debug_dyn_count,_daily_debug_dyn_warp,_daily_debug_defeat_all,_daily_debug_cannon,_daily_debug_next_station,_daily_debug_part_of_cannon,_daily_debug_mod_info,_daily_debug_num_parts,_daily_debug_part,_daily_debug_put,_daily_debug_mario,_daily_debug_cap,_daily_debug_camyaw,_daily_debug_cammode,_daily_debug_floor,_daily_debug_action,_daily_debug_dyn,_daily_debug_num_dyn,_daily_debug_dyn_move,_daily_debug_star,_daily_set_pad,_daily_set_volume,_daily_pause,_daily_set_ghost,_daily_rec_ptr,_daily_rec_count,_malloc,_free
  endif
  
  PLATFORM_CFLAGS += -DNO_SEGMENTED_MEMORY -DUSE_SYSTEM_MALLOC
@@ -142,6 +142,93 @@ index 91c2f03..c20b3ce 100644
      if (seqChannel->seqPlayer->muted && (seqChannel->muteBehavior & MUTE_BEHAVIOR_SOFTEN) != 0) {
          channelVolume *= seqChannel->seqPlayer->muteVolumeScale;
      }
+diff --git a/src/engine/behavior_script.c b/src/engine/behavior_script.c
+index 5617e5b..5534711 100644
+--- a/src/engine/behavior_script.c
++++ b/src/engine/behavior_script.c
+@@ -1,3 +1,6 @@
++#ifdef TARGET_WEB
++#include <emscripten.h>
++#endif
+ #include <ultra64.h>
+ 
+ #include "sm64.h"
+@@ -361,6 +364,16 @@ typedef void (*NativeBhvFunc)(void);
+ static s32 bhv_cmd_call_native(void) {
+     NativeBhvFunc behaviorFunc = BHV_CMD_GET_VPTR(1);
+ 
++#ifdef TARGET_WEB
++    // SM64 DAILY PARKOUR: a wasm function pointer is an index into the function table; anything past
++    // it would trap the whole game. Report the object and drop it instead.
++    if ((uintptr_t) behaviorFunc == 0 || (uintptr_t) behaviorFunc >= (uintptr_t) EM_ASM_INT({ return wasmTable.length; })) {
++        EM_ASM({ console.error('[daily] bad native call', $0 >>> 0, 'beh', $1, 'pos', $2, $3, $4); }, (int) (uintptr_t) behaviorFunc,
++               (int) (uintptr_t) gCurrentObject->behavior, (int) gCurrentObject->oPosX, (int) gCurrentObject->oPosY, (int) gCurrentObject->oPosZ);
++        gCurrentObject->activeFlags = ACTIVE_FLAG_DEACTIVATED;
++        return BHV_PROC_BREAK;
++    }
++#endif
+     behaviorFunc();
+ 
+     gCurBhvCommand += 2;
+@@ -903,6 +916,7 @@ static BhvCommandProc BehaviorCmdTable[] = {
+ };
+ 
+ // Execute the behavior script of the current object, process the object flags, and other miscellaneous code for updating objects.
++const void *gDailyLastBeh, *gDailyLastCmd;   // SM64 DAILY PARKOUR: what was running, for a crash report
+ void cur_obj_update(void) {
+     UNUSED u32 unused;
+ 
+@@ -933,7 +947,20 @@ void cur_obj_update(void) {
+     // Execute the behavior script.
+     gCurBhvCommand = gCurrentObject->curBhvCommand;
+ 
++    gDailyLastBeh = gCurrentObject->behavior;
+     do {
++        gDailyLastCmd = gCurBhvCommand;
++        // SM64 DAILY PARKOUR: an object whose script pointer isn't a script would call outside the
++        // command table and kill the game. Report it once and remove the object instead.
++        if ((*gCurBhvCommand >> 24) >= sizeof(BehaviorCmdTable) / sizeof(BehaviorCmdTable[0])) {
++#ifdef TARGET_WEB
++            EM_ASM({ console.error('[daily] bad behavior script: obj model', $0, 'cmd', $1 >>> 0, 'beh', $2, 'pos', $3, $4, $5); },
++                   gCurrentObject->header.gfx.sharedChild ? 1 : 0, *gCurBhvCommand, (int) (uintptr_t) gCurrentObject->behavior,
++                   (int) gCurrentObject->oPosX, (int) gCurrentObject->oPosY, (int) gCurrentObject->oPosZ);
++#endif
++            gCurrentObject->activeFlags = ACTIVE_FLAG_DEACTIVATED;
++            return;
++        }
+         bhvCmdProc = BehaviorCmdTable[*gCurBhvCommand >> 24];
+         bhvProcResult = bhvCmdProc();
+     } while (bhvProcResult == BHV_PROC_CONTINUE);
+diff --git a/src/engine/surface_load.c b/src/engine/surface_load.c
+index 9a5f177..c7cccdc 100644
+--- a/src/engine/surface_load.c
++++ b/src/engine/surface_load.c
+@@ -810,9 +810,13 @@ void load_object_surfaces(s16 **data, s16 *vertexData) {
+ /**
+  * Transform an object's vertices, reload them, and render the object.
+  */
++// SM64 DAILY PARKOUR: a whole level spawned as an island has thousands of vertices; the stack buffer
++// below holds 200. Larger collisions use this one (collision loading never re-enters).
++static s16 sBigVertexData[3 * 16384];
+ void load_object_collision_model(void) {
+     UNUSED s32 unused;
+-    s16 vertexData[600];
++    s16 vertexDataSmall[600];
++    s16 *vertexData = vertexDataSmall;
+ 
+     s16 *collisionData = gCurrentObject->collisionData;
+     f32 marioDist = gCurrentObject->oDistanceToMario;
+@@ -834,6 +838,10 @@ void load_object_collision_model(void) {
+     if (!(gTimeStopState & TIME_STOP_ACTIVE) && marioDist < tangibleDist
+         && !(gCurrentObject->activeFlags & ACTIVE_FLAG_IN_DIFFERENT_ROOM)) {
+         collisionData++;
++        if (*collisionData > 200) {
++            if (*collisionData > 16384) return;
++            vertexData = sBigVertexData;
++        }
+         transform_object_vertices(&collisionData, vertexData);
+ 
+         // TERRAIN_LOAD_CONTINUE acts as an "end" to the terrain data.
 diff --git a/src/game/behavior_actions.c b/src/game/behavior_actions.c
 index a42849a..a53ca25 100644
 --- a/src/game/behavior_actions.c
@@ -286,10 +373,10 @@ index e2fb175..e45edb7 100644
      }
 diff --git a/src/game/daily.c b/src/game/daily.c
 new file mode 100644
-index 0000000..7a23d6f
+index 0000000..2fdeeed
 --- /dev/null
 +++ b/src/game/daily.c
-@@ -0,0 +1,2407 @@
+@@ -0,0 +1,2609 @@
 +// SM64 DAILY PARKOUR
 +//
 +// The page hands this module a seed (window.sm64DailySeed: the date, or a
@@ -544,6 +631,7 @@ index 0000000..7a23d6f
 +};
 +#define PM(n) (0xE2 + (n))      // 0xE2..0xFE: free (the host's objects are cleared)
 +#include "daily_lib.inc.h"
++#include "daily_isles.inc.h"
 +#define MAX_PIECES 128
 +static struct Piece sPiece[MAX_PIECES] = {
 +    { "LLL HEXAGON",     bhvLllRotatingHexagonalPlatform, lll_geo_000A78,   lll_seg7_collision_hexagonal_platform, 0,          R_STEP,     PM(0) },
@@ -635,18 +723,72 @@ index 0000000..7a23d6f
 +// ── course data ─────────────────────────────────────────────────────────────
 +// A Part is anything placed. Stations are what Mario lands on between obstacles; they carry
 +// progress, checkpoints and the goal.
-+enum { PT_CHECKER, PT_BOX, PT_PIECE, PT_POLE, PT_FIREBAR, PT_OBJ, PT_DECOR };
++enum { PT_CHECKER, PT_BOX, PT_PIECE, PT_POLE, PT_FIREBAR, PT_OBJ, PT_DECOR, PT_ISLE };
 +enum { OK_CANNON, OK_SWITCH };
 +struct Part {
 +    f32 x, y, z;        // stations/boxes: top-centre; pieces: object origin
 +    f32 hx, hz, h;      // stations/boxes: half width (local x), half length (local z), height
 +    f32 r;              // footprint radius (for spacing)
 +    s16 yaw, pitch, force, param;
-+    u8 type, box, fk, piece, station, check, goal, kind, gnd;
++    f32 sc;             // isles: scale
++    u8 type, box, fk, piece, station, check, goal, kind, gnd, model;
 +    struct Object *obj;
 +};
 +static struct Part sPart[MAX_PARTS];
 +static s32 sNumParts, sNumStations, sGoal;
++// Mini worlds: a whole SM64 level area (daily_isles.inc.h), shrunk to an island. Measured from its own
++// collision: bounding box and its highest point (the summit, where the next platform goes).
++struct IsleInfo { f32 x0, x1, z0, z1, y0, y1, sx, sy, sz; s32 ok; };
++static struct IsleInfo sIsleInfo[64];
++static void measure_isle(s32 i) {
++    const Collision *c = segmented_to_virtual((void *) sIsles[i].col);
++    struct IsleInfo *f = &sIsleInfo[i];
++    s32 n, k;
++    if (f->ok) return;
++    f->x0 = f->z0 = f->y0 = 1e9f; f->x1 = f->z1 = f->y1 = -1e9f;
++    if (*c++ != TERRAIN_LOAD_VERTICES) return;
++    n = *c++;
++    for (k = 0; k < n; k++, c += 3) {
++        f32 x = c[0], y = c[1], z = c[2];
++        if (x < f->x0) f->x0 = x; if (x > f->x1) f->x1 = x;
++        if (z < f->z0) f->z0 = z; if (z > f->z1) f->z1 = z;
++        if (y < f->y0) f->y0 = y;
++        if (y > f->y1) { f->y1 = y; f->sx = x; f->sy = y; f->sz = z; }
++    }
++    f->ok = 1;
++}
++// The highest floor of island i at its own (unscaled) x, z: walks its collision's triangle lists
++// (vertices, then type + count + triangles, 4 shorts for the types that carry a force).
++static f32 isle_floor(s32 i, f32 x, f32 z) {
++    const s16 *c = segmented_to_virtual((void *) sIsles[i].col), *v;
++    s32 nv, k;
++    f32 best = -1e9f;
++    if (*c++ != TERRAIN_LOAD_VERTICES) return best;
++    nv = *c++; v = c; c += nv * 3;
++    while (*c != TERRAIN_LOAD_CONTINUE && *c != TERRAIN_LOAD_END && *c != TERRAIN_LOAD_OBJECTS && *c != TERRAIN_LOAD_ENVIRONMENT) {
++        s16 type = *c++, cnt = *c++;
++        s32 force = (type == SURFACE_0004 || type == SURFACE_FLOWING_WATER || type == SURFACE_DEEP_MOVING_QUICKSAND || type == SURFACE_SHALLOW_MOVING_QUICKSAND
++                     || type == SURFACE_MOVING_QUICKSAND || type == SURFACE_HORIZONTAL_WIND || type == SURFACE_INSTANT_MOVING_QUICKSAND);
++        for (k = 0; k < cnt; k++, c += force ? 4 : 3) {
++            const s16 *a = &v[c[0] * 3], *b = &v[c[1] * 3], *d = &v[c[2] * 3];
++            f32 ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2], wx = d[0] - a[0], wy = d[1] - a[1], wz = d[2] - a[2];
++            f32 nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx, e1, e2, e3, y;
++            if (ny < 0.0001f * sqrtf(nx * nx + ny * ny + nz * nz)) continue;   // floors face up
++            e1 = (b[2] - a[2]) * (x - a[0]) - (b[0] - a[0]) * (z - a[2]);
++            e2 = (d[2] - b[2]) * (x - b[0]) - (d[0] - b[0]) * (z - b[2]);
++            e3 = (a[2] - d[2]) * (x - d[0]) - (a[0] - d[0]) * (z - d[2]);
++            if (!((e1 >= 0 && e2 >= 0 && e3 >= 0) || (e1 <= 0 && e2 <= 0 && e3 <= 0))) continue;
++            y = a[1] - (nx * (x - a[0]) + nz * (z - a[2])) / ny;
++            if (y > best && type != SURFACE_DEATH_PLANE) best = y;
++        }
++    }
++    return best;
++}
++static s32 sIsleOn[2] = { -1, -1 };
++static s32 sIsleDbg[6];
++s32 daily_debug_isle(s32 k) { s32 v = sIsleDbg[k]; if (k == 5) bzero(sIsleDbg, sizeof(sIsleDbg)); return v; }
++static u8 sIsleSlot[2];
++
 +static u32 sRng;
 +
 +static u32 rnd_u32(void) { sRng ^= sRng << 13; sRng ^= sRng >> 17; sRng ^= sRng << 5; return sRng; }
@@ -847,6 +989,15 @@ index 0000000..7a23d6f
 +        struct Part *q = &sPart[i];
 +        f32 dx = q->x - p->x, dz = q->z - p->z;
 +        if (q->type == PT_DECOR || q->type == PT_OBJ) continue;
++        if (q->type == PT_ISLE) {   // an island's footprint: its scaled bounding box
++            struct IsleInfo *f = &sIsleInfo[q->piece];
++            f32 ix = q->x + q->sc * (f->x0 + f->x1) / 2.0f, iz = q->z + q->sc * (f->z0 + f->z1) / 2.0f;
++            f32 ir = q->sc * DMAX(f->x1 - f->x0, f->z1 - f->z0) / 2.0f * 1.1f, itop = q->y + q->sc * f->y1, ibot = q->y + q->sc * f->y0;
++            if (p->y + 700.0f < ibot - 400.0f || p->y - p->h - 400.0f > itop + 700.0f) continue;
++            if (p->y - p->h > itop - 250.0f) continue;   // up level with its summit: the course carries on from there
++            if (sqrtf((ix - p->x) * (ix - p->x) + (iz - p->z) * (iz - p->z)) < r + ir + 180.0f && !p->gnd) return TRUE;
++            continue;
++        }
 +        if (q->y - q->h - 400.0f > p->y + 700.0f || p->y - p->h - 400.0f > q->y + 700.0f) continue;
 +        if (sqrtf(dx * dx + dz * dz) < r + radius_of(q) + 180.0f) return TRUE;
 +    }
@@ -947,13 +1098,13 @@ index 0000000..7a23d6f
 +       MD_ENEMIES, MD_AMPS, MD_CANNON, MD_SWITCH, MD_SHELL, MD_VANISH, MD_METAL, MD_WING, MD_BARS, MD_SAND,
 +       MD_ICE, MD_WIND, MD_UPDRAFT, MD_POOL, MD_GAS, MD_BOSS,
 +       MD_LEDGES, MD_LONGCHAIN, MD_CRAWL, MD_BREAKWALL, MD_PUSHBOX, MD_BLUECOIN, MD_KICKBOARD, MD_GROUND, MD_HAZARD,
-+       MD_LIFT, MD_SPRING, MD_CHOMP, MD_COUNT };
++       MD_LIFT, MD_SPRING, MD_CHOMP, MD_ISLAND, MD_COUNT };
 +static const f32 sModSeconds[MD_COUNT] = { 2.5f, 5, 8, 6, 6, 7, 4.5f, 4, 6, 9, 12, 5,
 +                                           8, 6, 9, 9, 8, 7, 7, 12, 13, 6, 6, 6, 7, 14, 6, 40,
-+                                           7, 9, 6, 8, 12, 8, 9, 16, 7, 6, 5, 9 };
++                                           7, 9, 6, 8, 12, 8, 9, 16, 7, 6, 5, 9, 25 };
 +static const f32 sModWeight[MD_COUNT] = { 1.0f, 2.5f, 1.5f, 1, 1, 1, 1, 1, 1, 1, 1, 0.8f,
 +                                          1.2f, 1, 1, 1, 1, 1, 1, 0.8f, 0.8f, 1, 1, 1, 1, 0.8f, 1, 0,     // the boss is placed, never picked
-+                                          1, 1, 1, 1, 1, 0.8f, 1, 2.4f, 1.6f, 1, 1, 1 };
++                                          1, 1, 1, 1, 1, 0.8f, 1, 2.4f, 1.6f, 1, 1, 1, 3 };
 +static f32 sModOn[MD_COUNT];
 +static s32 sKickboards;   // this seed's palette: which modules it uses, and how much (generate)
 +
@@ -1013,16 +1164,18 @@ index 0000000..7a23d6f
 +// The middle of the widest run of pitches that land. A shot covers ~10000*sin(2*pitch) on the level,
 +// so the window is narrow; it must be at least ~1 degree (3 x 0x40) wide — the stick aims in steps
 +// of stickY*10 (act_in_cannon), and the reticle shows the aim.
-+static s16 cannon_aim(f32 sx, f32 sy, f32 sz, s16 yaw, struct Part *b) {
++static s16 cannon_aim_upto(f32 sx, f32 sy, f32 sz, s16 yaw, struct Part *b, s32 maxPitch, s32 minRun) {
 +    s32 p, run = 0, bestRun = 0, bestMid = -1;
-+    for (p = 0x0080; p <= 0x2400; p += 0x40) {   // flat shots only: a high lob is too touchy
++    for (p = 0x0080; p <= maxPitch; p += 0x40) {
 +        if (cannon_lands(sx, sy, sz, yaw, (s16) p, b)) {
 +            run++;
 +            if (run > bestRun) { bestRun = run; bestMid = p - (run - 1) * 0x20; }
 +        } else run = 0;
 +    }
-+    return bestRun >= 3 ? (s16) bestMid : -1;
++    return bestRun >= minRun ? (s16) bestMid : -1;
 +}
++// Cannon modules: flat shots only — a high lob is too touchy to make the only way across.
++static s16 cannon_aim(f32 sx, f32 sy, f32 sz, s16 yaw, struct Part *b) { return cannon_aim_upto(sx, sy, sz, yaw, b, 0x2400, 3); }
 +
 +static s16 axis(s16 h) { return (s16) (((h + 0x2000) & 0xC000)); }   // nearest of the four axis headings
 +
@@ -1384,6 +1537,86 @@ index 0000000..7a23d6f
 +            break;
 +        }
 +
++        case MD_ISLAND: {
++            // A whole SM64 level, shrunk, floating ahead: climb it to the platform on its summit. A cannon
++            // on the platform before it, aimed at the summit, is the way up if the climb doesn't go.
++            s32 which = sIsleOn[rnd_i(2)], k;
++            struct IsleInfo *f;
++            struct Part *isle, *can;
++            f32 w, sc, qx, qz, half;
++            s16 pitch;
++            sIsleDbg[0]++;
++            if (which < 0) break;
++            f = &sIsleInfo[which];
++            w = DMAX(f->x1 - f->x0, f->z1 - f->z0);
++            if (w < 100.0f) { sIsleDbg[1]++; break; }
++            sc = DMIN(DMAX(3200.0f / w, 0.12f), 0.5f);
++            half = w * sc / 2.0f;
++            a = station(c, h, rnd_f(150, 220), rnd_f(-60, 60), 300.0f, 300.0f);   // the cannon platform
++            if (!a) break;
++            k = 0;
++            {
++                f32 d = extent_along(a, h) + rnd_f(200, 400) + half;
++                qx = a->x + sins(h) * d; qz = a->z + coss(h) * d;
++            }
++            // Find where Mario steps on: a floor on the near side of the island (toward the cannon platform),
++            // and hang the island so that spot is just below the platform. The climb from there to the
++            // summit must be real (200..2500), and the island's underside must clear the level below it.
++            {
++                f32 ccx = (f->x0 + f->x1) / 2.0f, ccz = (f->z0 + f->z1) / 2.0f, ex = 0, ez = 0, ey = -1e9f, t;
++                s32 tries;
++                for (tries = 0; tries < 12 && ey < -1e8f; tries++) {
++                    f32 rr = rnd_f(0.55f, 0.85f) * (w / 2.0f), side = rnd_f(-0.5f, 0.5f) * (w / 2.0f);
++                    // the near side faces back along -h; island local axes = world axes (yaw 0)
++                    f32 lx = ccx - sins(h) * rr + coss(h) * side, lz = ccz - coss(h) * rr - sins(h) * side;
++                    t = isle_floor(which, lx, lz);
++                    if (t > -1e8f && f->sy - t > 200.0f / sc && f->sy - t < 2500.0f / sc) { ex = lx; ez = lz; ey = t; }
++                }
++                if (ey < -1e8f) { sIsleDbg[1]++; break; }
++                isle = add_part(PT_ISLE);
++                if (!isle) break;
++                isle->piece = (u8) which; isle->sc = sc; isle->model = sIsleSlot[which == sIsleOn[0] ? 0 : 1];
++                isle->x = qx - sc * ccx; isle->z = qz - sc * ccz;
++                isle->y = a->y + rnd_f(-600, 300) - sc * ey;   // the entry is a drop, a step, or a double jump up from the platform
++                isle->r = 1; isle->h = 0;
++                // Nudge it so the entry spot sits ~250 past the cannon platform's edge.
++                {
++                    f32 wx = isle->x + sc * ex, wz = isle->z + sc * ez, want = extent_along(a, h) + 250.0f;
++                    f32 have = (wx - a->x) * sins(h) + (wz - a->z) * coss(h);
++                    isle->x += sins(h) * (want - have); isle->z += coss(h) * (want - have);
++                }
++                {   // underside clear of the level, and clear of the course so far
++                    f32 bottom = isle->y + sc * f->y0, cx2 = isle->x + sc * ccx, cz2 = isle->z + sc * ccz;
++                    s32 kk, bad = 0;
++                    for (kk = 0; kk < 5 && !bad; kk++) {
++                        f32 tx = cx2 + (kk == 1 ? half : kk == 2 ? -half : 0), tz = cz2 + (kk == 3 ? half : kk == 4 ? -half : 0), tt = terrain_at(tx, tz);
++                        if (tt < -19000.0f || bottom < tt + 150.0f) bad = 1;
++                    }
++                    for (kk = 0; kk < (s32) (a - sPart) && !bad; kk++) {
++                        struct Part *q = &sPart[kk];
++                        if (q->type == PT_DECOR || q->type == PT_OBJ || q->type == PT_ISLE) continue;
++                        if (q->y < bottom - 400.0f || q->y - q->h > isle->y + sc * f->y1 + 400.0f) continue;
++                        if (sqrtf((q->x - cx2) * (q->x - cx2) + (q->z - cz2) * (q->z - cz2)) < half * 1.1f + radius_of(q) + 150.0f) bad = 1;
++                    }
++                    if (bad) { sIsleDbg[2]++; sNumParts--; n = NULL; break; }
++                }
++            }
++            n = add_part(PT_CHECKER);
++            if (!n) break;
++            n->station = 1; n->yaw = h; n->hx = 250.0f; n->hz = 250.0f; n->h = 60.0f; n->r = 1;   // wide enough to land a cannon shot on
++            n->x = isle->x + sc * f->sx; n->z = isle->z + sc * f->sz; n->y = isle->y + sc * f->sy + 40.0f;
++            // A backup, aimed by hand: any pitch the cannon allows (act_in_cannon caps it at 0x38E3).
++            pitch = cannon_aim_upto(a->x, a->y + 350.0f, a->z, atan2s(n->z - a->z, n->x - a->x), n, 0x3800, 2);
++            if (pitch < 0) { sIsleDbg[3]++; n = NULL; break; }
++            sIsleDbg[4]++;
++            can = add_part(PT_OBJ);
++            if (!can) { n = NULL; break; }
++            can->kind = OK_CANNON; can->x = a->x; can->z = a->z; can->y = a->y; can->yaw = atan2s(n->z - a->z, n->x - a->x); can->param = pitch; can->r = 1;
++            // The next module leaves from the summit; the summit platform is not checked against the island.
++            n->gnd = 1;
++            break;
++        }
++
 +        case MD_GROUND: {
 +            // Down to the level itself: slide to its ground, run across it, ride an updraft back up.
 +            // Tries several landing spots and run directions, and takes the longest walkable stretch
@@ -1689,6 +1922,7 @@ index 0000000..7a23d6f
 +    return (s32) (n - sPart);
 +}
 +
++
 +static s32 sMods[64], sNumMods, sModFirst[64], sModLand[64], sModStart[65], sModDynStart[65];
 +
 +static s32 build_lift(s32 cur) {
@@ -1943,9 +2177,24 @@ index 0000000..7a23d6f
 +            for (a = 0; a < NUM_LIB; a++) if (lib_ok(a)) { claimed[sLib[a].model] = 1; claimed[sLib[a].model2] = 1; claimed[sLib[a].model3] = 1; }
 +            if (sBoss >= 0) { claimed[sBosses[sBoss].model] = 1; claimed[sBosses[sBoss].model2] = 1; }
 +            if (sModOn[MD_KICKBOARD] > 0) claimed[MODEL_WF_KICKABLE_BOARD] = claimed[MODEL_WF_KICKABLE_BOARD_FELLED] = 1;
++            // Two mini worlds for this seed (used if MD_ISLAND is in its palette), in free slots.
++            {
++                s32 t;
++                for (t = 0; t < 2; t++) {
++                    s32 sl;
++                    sIsleOn[t] = (s32) (PRNG() % NUM_ISLES);
++                    measure_isle(sIsleOn[t]);
++                    for (sl = 0x53; sl >= 0x16 && claimed[sl]; sl--) ;
++                    sIsleSlot[t] = (u8) sl; claimed[sl] = 1;
++                }
++            }
 +            claimed[MODEL_TRAMPOLINE] = claimed[MODEL_TRAMPOLINE_CENTER] = claimed[MODEL_TRAMPOLINE_BASE] = 1;
 +            if (sGroupB == 15) claimed[MODEL_CHAIN_CHOMP] = claimed[MODEL_METALLIC_BALL] = claimed[MODEL_WOODEN_POST] = 1;
-+            for (tries = 0; tries < 600 && sNumPieces < MAX_PIECES && sNumPieces < NUM_BUILTIN_PIECES + 30; tries++) {
++            s32 bare = 0;
++#ifdef TARGET_WEB
++            bare = EM_ASM_INT({ return (typeof window !== 'undefined' && window.sm64DailyBare) ? 1 : 0; });   // test hook: no inventory objects
++#endif
++            for (tries = 0; tries < (bare ? 0 : 600) && sNumPieces < MAX_PIECES && sNumPieces < NUM_BUILTIN_PIECES + 30; tries++) {
 +                const struct AutoPiece *ap = &sAuto[PRNG() % NUM_AUTO];
 +                struct Piece *pc = &sPiece[sNumPieces];
 +                const Collision *col = beh_collision(ap->beh);
@@ -2013,6 +2262,32 @@ index 0000000..7a23d6f
 +s32 daily_debug_gen_info(void) { return sNumStations * 10000 + (s32) sGenSecs; }
 +s32 daily_debug_mode(void) { return sMode; }
 +s32 daily_debug_auto(void) { return sNumAutoDrawn; }
++// Test hook: which of our spawn tables the object running last belongs to (a crash report):
++// 1000+k sAuto[k], 2000+k sLib[k], 3000+k sPiece[k], 4000+k dyn kind k, 5000 platform, 6000 boss, -1 unknown.
++extern const void *gDailyLastBeh, *gDailyLastCmd;
++s32 daily_debug_last_beh(s32 f) {
++    const void *b = gDailyLastBeh;
++    s32 k;
++    if (f == 1) return (s32) (uintptr_t) gDailyLastCmd - (s32) (uintptr_t) b;
++    for (k = 0; k < NUM_AUTO; k++) if (segmented_to_virtual((void *) sAuto[k].beh) == b) return 1000 + k;
++    for (k = 0; k < NUM_LIB; k++) if (segmented_to_virtual((void *) sLib[k].beh) == b) return 2000 + k;
++    for (k = 0; k < NUM_PIECES; k++) if (segmented_to_virtual((void *) sPiece[k].beh) == b) return 3000 + k;
++    for (k = 0; k < DK_COUNT; k++) if (k != DK_BOSS && k != DK_LIB && segmented_to_virtual((void *) dyn_beh((u8) k)) == b) return 4000 + k;
++    if (segmented_to_virtual((void *) bhvDailyPlatform) == b) return 5000;
++    if (sBoss >= 0 && segmented_to_virtual((void *) sBosses[sBoss].beh) == b) return 6000;
++    return -1;
++}
++// Test hook: spawn inventory object k (sAuto[k]) 300 in front of Mario, the way the course would.
++s32 daily_debug_spawn_auto(s32 k) {
++    const struct AutoPiece *ap = &sAuto[k];
++    struct MarioState *m = gMarioState;
++    struct Object *o;
++    if (!ap->glob) load_model(0x52, ap->geo);
++    o = spawn_object_abs_with_rot(gMarioObject, 0, ap->glob ? ap->model : 0x52, ap->beh,
++                                  (s16) (m->pos[0] + sins(m->faceAngle[1]) * 300.0f), (s16) m->pos[1], (s16) (m->pos[2] + coss(m->faceAngle[1]) * 300.0f), 0, 0, 0);
++    o->oBehParams = ap->bp; o->oBehParams2ndByte = (ap->bp >> 16) & 0xFF; o->parentObj = o;
++    return 1;
++}
 +// Test hook: how many parts of the current course use inventory object k (sAuto[k]); k = -1 -> NUM_AUTO.
 +s32 daily_debug_used_auto(s32 k) {
 +    s32 i, n = 0;
@@ -2092,6 +2367,11 @@ index 0000000..7a23d6f
 +            o->oDrawingDistance = 30000.0f;
 +            break;
 +        }
++        case PT_ISLE:
++            o = spawn_object_abs_with_rot(gMarioObject, 0, p->model, bhvDailyPlatform, (s16) p->x, (s16) p->y, (s16) p->z, 0, 0, 0);
++            obj_scale(o, p->sc);
++            o->oBehParams = i;
++            break;
 +        case PT_POLE:
 +            o = spawn_object_abs_with_rot(gMarioObject, 0, MODEL_GIANT_POLE, bhvGiantPole,
 +                                          (s16) p->x, (s16) p->y, (s16) p->z, 0, 0, 0);
@@ -2189,6 +2469,14 @@ index 0000000..7a23d6f
 +    s32 k;
 +    // Collision must match the drawn model: checkerboard collision for checkerboard platforms
 +    // (same +-256 x +-153.5 extents as its model), unit-box collision (of the right surface) for boxes.
++    if (p->type == PT_ISLE && !(o->oBehParams & 0x100)) {
++        // A mini world: the level area's own collision, scaled with the object (surface_load.c applies its scale).
++        o->collisionData = segmented_to_virtual((void *) sIsles[p->piece].col);
++        obj_build_transform_from_pos_and_angle(o, O_POS_INDEX, O_FACE_ANGLE_INDEX);
++        o->oCollisionDistance = 40000.0f;
++        o->oDrawingDistance = 40000.0f;
++        return;
++    }
 +    if (o->oBehParams & 0x100) o->collisionData = (void *) make_box_col(SURFACE_NOT_SLIPPERY, 0);
 +    else if ((k = box_kind_of(p)) < 0) o->collisionData = segmented_to_virtual(checkerboard_platform_seg8_collision_0800D710);
 +    else o->collisionData = (void *) make_box_col(box_surface(k), p->force);
@@ -2558,6 +2846,7 @@ index 0000000..7a23d6f
 +        generate(seed, dow);
 +        load_all_models();
 +        load_lib_models();
++        for (i = 0; i < 2; i++) if (sIsleOn[i] >= 0 && sModOn[MD_ISLAND] > 0) load_model(sIsleSlot[i], sIsles[sIsleOn[i]].geo);   // mini worlds
 +        if (sBoss >= 0) {
 +            load_model(sBosses[sBoss].model, sBosses[sBoss].geo);
 +            if (sBosses[sBoss].geo2) load_model(sBosses[sBoss].model2, sBosses[sBoss].geo2);
@@ -2699,10 +2988,10 @@ index 0000000..7a23d6f
 +}
 diff --git a/src/game/daily.h b/src/game/daily.h
 new file mode 100644
-index 0000000..aa1f8b6
+index 0000000..5c7262d
 --- /dev/null
 +++ b/src/game/daily.h
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,64 @@
 +#ifndef DAILY_H
 +#define DAILY_H
 +
@@ -2737,6 +3026,9 @@ index 0000000..aa1f8b6
 +void daily_star_target(f32 *x, f32 *y, f32 *z);
 +s32 daily_debug_mode(void);
 +s32 daily_debug_auto(void);
++s32 daily_debug_last_beh(s32 f);
++s32 daily_debug_spawn_auto(s32 k);
++s32 daily_debug_isle(s32 k);
 +s32 daily_debug_used_auto(s32 k);
 +s32 daily_debug_modules(s32 i);
 +s32 daily_debug_objective(void);
@@ -2764,9 +3056,349 @@ index 0000000..aa1f8b6
 +void daily_debug_warp(s32 i);
 +
 +#endif // DAILY_H
+diff --git a/src/game/daily_isles.inc.h b/src/game/daily_isles.inc.h
+new file mode 100644
+index 0000000..4ecc379
+--- /dev/null
++++ b/src/game/daily_isles.inc.h
+@@ -0,0 +1,334 @@
++// GENERATED by sm64daily/gen_isles.py: every level area as a spawnable mini world. Do not edit by hand.
++#include "levels/bitdw/header.h"
++#include "levels/bitfs/header.h"
++#include "levels/bits/header.h"
++#include "levels/bob/header.h"
++#include "levels/bowser_1/header.h"
++#include "levels/bowser_2/header.h"
++#include "levels/bowser_3/header.h"
++#include "levels/castle_courtyard/header.h"
++#include "levels/castle_grounds/header.h"
++#include "levels/ccm/header.h"
++#include "levels/cotmc/header.h"
++#include "levels/ddd/header.h"
++#include "levels/jrb/header.h"
++#include "levels/lll/header.h"
++#include "levels/pss/header.h"
++#include "levels/rr/header.h"
++#include "levels/sa/header.h"
++#include "levels/sl/header.h"
++#include "levels/ssl/header.h"
++#include "levels/thi/header.h"
++#include "levels/totwc/header.h"
++#include "levels/ttc/header.h"
++#include "levels/ttm/header.h"
++#include "levels/vcutm/header.h"
++#include "levels/wdw/header.h"
++#include "levels/wf/header.h"
++#include "levels/wmotr/header.h"
++static const GeoLayout sIsleGeo_bitdw_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, bitdw_seg7_dl_070020C8),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_bitfs_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, bitfs_seg7_dl_07002118),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_bits_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, bits_seg7_dl_07002918),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_bob_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, bob_seg7_dl_07004390),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, bob_seg7_dl_07009D80),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT_DECAL, bob_seg7_dl_0700A470),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, bob_seg7_dl_0700A920),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, bob_seg7_dl_0700DD18),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, bob_seg7_dl_0700E338),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_bowser_1_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, bowser_1_seg7_dl_07002768),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_bowser_2_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, bowser_2_seg7_dl_07001930),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_bowser_3_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, bowser_3_seg7_dl_070046B0),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_castle_courtyard_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, castle_courtyard_seg7_dl_070048B8),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT_DECAL, castle_courtyard_seg7_dl_07005698),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, castle_courtyard_seg7_dl_07005938),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_castle_grounds_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, castle_grounds_seg7_dl_07006D70),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, castle_grounds_seg7_dl_070095F0),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, castle_grounds_seg7_dl_0700A860),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT_DECAL, castle_grounds_seg7_dl_0700B1D0),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, castle_grounds_seg7_dl_0700BA20),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE_DECAL, castle_grounds_seg7_dl_0700C430),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, castle_grounds_seg7_dl_0700C210),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_ccm_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ccm_seg7_dl_0700B090),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ccm_seg7_dl_0700B1D8),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ccm_seg7_dl_0700C380),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, ccm_seg7_dl_0700D578),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT_DECAL, ccm_seg7_dl_0700DDF0),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_ccm_2[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ccm_seg7_dl_0701CE30),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ccm_seg7_dl_0701E558),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE_DECAL, ccm_seg7_dl_0701E6B0),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, ccm_seg7_dl_0701FC78),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, ccm_seg7_dl_0701FD78),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, ccm_seg7_dl_0701FE60),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, ccm_seg7_dl_070207F0),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_cotmc_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, cotmc_seg7_dl_07007D48),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, cotmc_seg7_dl_0700A160),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, cotmc_seg7_dl_0700A4B8),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_ddd_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ddd_seg7_dl_07004D48),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ddd_seg7_dl_070057E8),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, ddd_seg7_dl_07005C40),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, ddd_seg7_dl_07005F78),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_ddd_2[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ddd_seg7_dl_07007408),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ddd_seg7_dl_07007CB8),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, ddd_seg7_dl_07008C48),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, ddd_seg7_dl_07008F80),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, ddd_seg7_dl_0700BAE0),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ddd_seg7_dl_0700CE48),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_jrb_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, jrb_seg7_dl_07002FD0),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, jrb_seg7_dl_07004940),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, jrb_seg7_dl_07004C78),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, jrb_seg7_dl_070058C8),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, jrb_seg7_dl_070069B0),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, jrb_seg7_dl_07007570),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, jrb_seg7_dl_07007718),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_jrb_2[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, jrb_seg7_dl_0700EF00),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, jrb_seg7_dl_0700FE48),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, jrb_seg7_dl_07010548),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_lll_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, lll_seg7_dl_070134E0),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, lll_seg7_dl_070138F8),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, lll_seg7_dl_070137C0),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_lll_2[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, lll_seg7_dl_070235C8),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, lll_seg7_dl_07024C18),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, lll_seg7_dl_070255D8),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, lll_seg7_dl_07025A48),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, lll_seg7_dl_07025BD8),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_pss_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, pss_seg7_dl_0700A7C0),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, pss_seg7_dl_0700AFA8),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, pss_seg7_dl_0700B3F0),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, pss_seg7_dl_0700D338),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, pss_seg7_dl_0700DAD8),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, pss_seg7_dl_0700E2B0),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE_DECAL, pss_seg7_dl_0700E3E8),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_rr_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, dl_cruiser_metal_holes),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_sa_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, sa_seg7_dl_07002DE8),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, sa_seg7_dl_07002FD0),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_sl_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, sl_seg7_dl_07005478),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, sl_seg7_dl_070056B0),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, sl_seg7_dl_070073D0),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, sl_seg7_dl_07007880),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, sl_seg7_dl_070088B0),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT_DECAL, sl_seg7_dl_07008D58),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, sl_seg7_dl_0700A5A0),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_sl_2[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, sl_seg7_dl_0700BAE8),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, sl_seg7_dl_0700BCF8),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, sl_seg7_dl_0700C9E8),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, sl_seg7_dl_0700CB58),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_ssl_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ssl_seg7_dl_07009F48),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ssl_seg7_dl_0700BA78),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, ssl_seg7_dl_0700BC18),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT_DECAL, ssl_seg7_dl_0700BD00),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_ssl_2[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ssl_seg7_dl_0701EE80),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, ssl_seg7_dl_0701F920),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT_DECAL, ssl_seg7_dl_0701FCE0),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_ssl_3[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ssl_seg7_dl_07021A08),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, ssl_seg7_dl_07021DE8),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_thi_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, thi_seg7_dl_07005260),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, thi_seg7_dl_07006968),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, thi_seg7_dl_07007008),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, thi_seg7_dl_070072E8),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT_DECAL, thi_seg7_dl_070073C0),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_thi_2[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, thi_seg7_dl_07005260),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, thi_seg7_dl_07006968),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, thi_seg7_dl_07007008),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, thi_seg7_dl_070072E8),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT_DECAL, thi_seg7_dl_07007538),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_thi_3[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, thi_seg7_dl_07007C20),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, thi_seg7_dl_07009670),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, thi_seg7_dl_07009D50),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, thi_seg7_dl_07009F58),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_totwc_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, totwc_seg7_dl_07005D28),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, totwc_seg7_dl_07007048),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, totwc_seg7_dl_070078B8),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_ttc_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ttc_seg7_dl_0700AD38),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, ttc_seg7_dl_0700B1D8),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, ttc_seg7_dl_0700E878),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_ttm_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ttm_seg7_dl_0700A120),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ttm_seg7_dl_0700A2E0),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_ttm_2[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ttm_seg7_dl_0701D798),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ttm_seg7_dl_0701DBB8),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_ttm_3[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ttm_seg7_dl_070249A0),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ttm_seg7_dl_07024C78),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ttm_seg7_dl_07025F48),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_ttm_4[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ttm_seg7_dl_0702A1B8),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, ttm_seg7_dl_0702A8A0),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_vcutm_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, vcutm_seg7_dl_07007E88),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, vcutm_seg7_dl_07008E10),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, vcutm_seg7_dl_070093E8),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, vcutm_seg7_dl_070080D0),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_wdw_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, wdw_seg7_dl_07009AB0),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, wdw_seg7_dl_0700A138),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, wdw_seg7_dl_07012798),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT_DECAL, wdw_seg7_dl_07012908),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_wdw_2[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, wdw_seg7_dl_07011E48),
++        GEO_DISPLAY_LIST(LAYER_ALPHA, wdw_seg7_dl_07012258),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT_DECAL, wdw_seg7_dl_07012908),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_wf_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, wf_seg7_dl_070050C8),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE_DECAL, wf_seg7_dl_070052B8),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT_DECAL, wf_seg7_dl_07005538),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, wf_seg7_dl_07005690),
++    GEO_CLOSE_NODE(), GEO_END() };
++static const GeoLayout sIsleGeo_wmotr_1[] = {
++    GEO_CULLING_RADIUS(32000), GEO_OPEN_NODE(),
++        GEO_DISPLAY_LIST(LAYER_OPAQUE, wmotr_seg7_dl_0700C1F8),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, wmotr_seg7_dl_0700EFD8),
++        GEO_DISPLAY_LIST(LAYER_TRANSPARENT, wmotr_seg7_dl_07010608),
++    GEO_CLOSE_NODE(), GEO_END() };
++struct Isle { const char *name; const GeoLayout *geo; const Collision *col; };
++static const struct Isle sIsles[] = {
++    { "BITDW_1", sIsleGeo_bitdw_1, bitdw_seg7_collision_level },
++    { "BITFS_1", sIsleGeo_bitfs_1, bitfs_seg7_collision_level },
++    { "BITS_1", sIsleGeo_bits_1, bits_seg7_collision_level },
++    { "BOB_1", sIsleGeo_bob_1, bob_seg7_collision_level },
++    { "BOWSER_1_1", sIsleGeo_bowser_1_1, bowser_1_seg7_collision_level },
++    { "BOWSER_2_1", sIsleGeo_bowser_2_1, bowser_2_seg7_collision_lava },
++    { "BOWSER_3_1", sIsleGeo_bowser_3_1, bowser_3_seg7_collision_level },
++    { "CASTLE_COURTYARD_1", sIsleGeo_castle_courtyard_1, castle_courtyard_seg7_collision },
++    { "CASTLE_GROUNDS_1", sIsleGeo_castle_grounds_1, castle_grounds_seg7_collision_level },
++    { "CCM_1", sIsleGeo_ccm_1, ccm_seg7_area_1_collision },
++    { "CCM_2", sIsleGeo_ccm_2, ccm_seg7_area_2_collision },
++    { "COTMC_1", sIsleGeo_cotmc_1, cotmc_seg7_collision_level },
++    { "DDD_1", sIsleGeo_ddd_1, ddd_seg7_area_1_collision },
++    { "DDD_2", sIsleGeo_ddd_2, ddd_seg7_area_2_collision },
++    { "JRB_1", sIsleGeo_jrb_1, jrb_seg7_area_1_collision },
++    { "JRB_2", sIsleGeo_jrb_2, jrb_seg7_area_2_collision },
++    { "LLL_1", sIsleGeo_lll_1, lll_seg7_area_1_collision },
++    { "LLL_2", sIsleGeo_lll_2, lll_seg7_area_2_collision },
++    { "PSS_1", sIsleGeo_pss_1, pss_seg7_collision },
++    { "RR_1", sIsleGeo_rr_1, rr_seg7_collision_level },
++    { "SA_1", sIsleGeo_sa_1, sa_seg7_collision },
++    { "SL_1", sIsleGeo_sl_1, sl_seg7_area_1_collision },
++    { "SL_2", sIsleGeo_sl_2, sl_seg7_area_2_collision },
++    { "SSL_1", sIsleGeo_ssl_1, ssl_seg7_area_1_collision },
++    { "SSL_2", sIsleGeo_ssl_2, ssl_seg7_area_2_collision },
++    { "SSL_3", sIsleGeo_ssl_3, ssl_seg7_area_3_collision },
++    { "THI_1", sIsleGeo_thi_1, thi_seg7_area_1_collision },
++    { "THI_2", sIsleGeo_thi_2, thi_seg7_area_2_collision },
++    { "THI_3", sIsleGeo_thi_3, thi_seg7_area_3_collision },
++    { "TOTWC_1", sIsleGeo_totwc_1, totwc_seg7_collision },
++    { "TTC_1", sIsleGeo_ttc_1, ttc_seg7_collision_level },
++    { "TTM_1", sIsleGeo_ttm_1, ttm_seg7_area_1_collision },
++    { "TTM_2", sIsleGeo_ttm_2, ttm_seg7_area_2_collision },
++    { "TTM_3", sIsleGeo_ttm_3, ttm_seg7_area_3_collision },
++    { "TTM_4", sIsleGeo_ttm_4, ttm_seg7_area_4_collision },
++    { "VCUTM_1", sIsleGeo_vcutm_1, vcutm_seg7_collision },
++    { "WDW_1", sIsleGeo_wdw_1, wdw_seg7_area_1_collision },
++    { "WDW_2", sIsleGeo_wdw_2, wdw_seg7_area_2_collision },
++    { "WF_1", sIsleGeo_wf_1, wf_seg7_collision_070102D8 },
++    { "WMOTR_1", sIsleGeo_wmotr_1, wmotr_seg7_collision },
++};
++#define NUM_ISLES ((s32) (sizeof(sIsles) / sizeof(sIsles[0])))
 diff --git a/src/game/daily_lib.inc.h b/src/game/daily_lib.inc.h
 new file mode 100644
-index 0000000..10d8614
+index 0000000..19401fe
 --- /dev/null
 +++ b/src/game/daily_lib.inc.h
 @@ -0,0 +1,121 @@
@@ -2816,21 +3448,21 @@ index 0000000..10d8614
 +    { "Butterfly", bhvButterfly, butterfly_geo, 0x00000000, 3, MODEL_BUTTERFLY, 1 },
 +    { "CastleFlagWaving", bhvCastleFlagWaving, castle_grounds_geo_000660, 0x00000000, 3, MODEL_CASTLE_GROUNDS_FLAG, 0 },
 +    { "CheckerboardElevatorGroup", bhvCheckerboardElevatorGroup, checkerboard_platform_geo, 0x014B0000, 0, MODEL_CHECKERBOARD_PLATFORM, 1 },
-+    { "ClamShell", bhvClamShell, clam_shell_geo, 0x00000000, 1, MODEL_CLAM_SHELL, 1 },
++    { "ClamShell", bhvClamShell, clam_shell_geo, 0x00000000, 1, MODEL_CLAM_SHELL, 0 },
 +    { "ControllablePlatform", bhvControllablePlatform, hmc_geo_0005A0, 0x00000000, 0, MODEL_HMC_METAL_PLATFORM, 0 },
 +    { "DecorativePendulum", bhvDecorativePendulum, castle_geo_001518, 0x00000000, 3, MODEL_CASTLE_CLOCK_PENDULUM, 0 },
-+    { "Dorrie", bhvDorrie, dorrie_geo, 0x00000000, 0, MODEL_DORRIE, 1 },
++    { "Dorrie", bhvDorrie, dorrie_geo, 0x00000000, 0, MODEL_DORRIE, 0 },
 +    { "FallingBowserPlatform", bhvFallingBowserPlatform, bowser_3_geo_000290, 0x00010000, 0, MODEL_BOWSER_3_FALLING_PLATFORM_1, 0 },
 +    { "FallingPillar", bhvFallingPillar, jrb_geo_000900, 0x00000000, 1, MODEL_JRB_FALLING_PILLAR, 0 },
 +    { "FerrisWheelAxle", bhvFerrisWheelAxle, bits_geo_000640, 0x00000000, 0, MODEL_BITS_FERRIS_WHEEL_AXLE, 0 },
 +    { "FireSpitter", bhvFireSpitter, bowling_ball_geo, 0x00000000, 1, MODEL_BOWLING_BALL, 1 },
 +    { "Flame", bhvFlame, red_flame_geo, 0x00000000, 1, MODEL_RED_FLAME, 1 },
-+    { "FlyingBookend", bhvFlyingBookend, bookend_geo, 0x00000000, 3, MODEL_BOOKEND, 1 },
-+    { "GhostHuntBoo", bhvGhostHuntBoo, boo_geo, 0x00000000, 3, MODEL_BOO, 1 },
-+    { "GoombaTripletSpawner", bhvGoombaTripletSpawner, koopa_with_shell_geo, 0x00010000, 3, MODEL_KOOPA_WITH_SHELL, 1 },
++    { "FlyingBookend", bhvFlyingBookend, bookend_geo, 0x00000000, 3, MODEL_BOOKEND, 0 },
++    { "GhostHuntBoo", bhvGhostHuntBoo, boo_geo, 0x00000000, 3, MODEL_BOO, 0 },
++    { "GoombaTripletSpawner", bhvGoombaTripletSpawner, koopa_with_shell_geo, 0x00010000, 3, MODEL_KOOPA_WITH_SHELL, 0 },
 +    { "Grindel", bhvGrindel, ssl_geo_000734, 0x001C0000, 1, MODEL_SSL_GRINDEL, 0 },
 +    { "HauntedBookshelf", bhvHauntedBookshelf, geo_bbh_000610, 0x00000000, 2, MODEL_BBH_MOVING_BOOKSHELF, 0 },
-+    { "HauntedChair", bhvHauntedChair, haunted_chair_geo, 0x00000000, 3, MODEL_HAUNTED_CHAIR, 1 },
++    { "HauntedChair", bhvHauntedChair, haunted_chair_geo, 0x00000000, 3, MODEL_HAUNTED_CHAIR, 0 },
 +    { "Hidden1up", bhvHidden1up, mushroom_1up_geo, 0x00000000, 3, MODEL_1UP, 1 },
 +    { "HiddenStaircaseStep", bhvHiddenStaircaseStep, geo_bbh_0005B0, 0x00000000, 0, MODEL_BBH_STAIRCASE_STEP, 0 },
 +    { "HorizontalGrindel", bhvHorizontalGrindel, ssl_geo_000734, 0x00000000, 1, MODEL_SSL_GRINDEL, 0 },
@@ -2859,7 +3491,7 @@ index 0000000..10d8614
 +    { "SeesawPlatform", bhvSeesawPlatform, rr_geo_000908, 0x00050000, 0, MODEL_RR_SEESAW_PLATFORM, 0 },
 +    { "ShipPart3", bhvShipPart3, jrb_geo_000978, 0x00000000, 3, MODEL_JRB_SHIP_LEFT_HALF_PART, 0 },
 +    { "SlidingPlatform2", bhvSlidingPlatform2, rr_geo_0008C0, 0x010C0000, 0, MODEL_RR_SLIDING_PLATFORM, 0 },
-+    { "SmallPenguin", bhvSmallPenguin, penguin_geo, 0x00010000, 3, MODEL_PENGUIN, 1 },
++    { "SmallPenguin", bhvSmallPenguin, penguin_geo, 0x00010000, 3, MODEL_PENGUIN, 0 },
 +    { "Spindel", bhvSpindel, ssl_geo_000764, 0x00000000, 1, MODEL_SSL_SPINDEL, 0 },
 +    { "SquarishPathMoving", bhvSquarishPathMoving, geo_bitdw_000558, 0x00000000, 0, MODEL_BITDW_SQUARE_PLATFORM, 0 },
 +    { "SquishablePlatform", bhvSquishablePlatform, bitfs_geo_000708, 0x00000000, 0, MODEL_BITFS_STRETCHING_PLATFORMS, 0 },
@@ -2876,10 +3508,10 @@ index 0000000..10d8614
 +    { "TTCRotatingSolid", bhvTTCRotatingSolid, ttc_geo_000240, 0x00000000, 0, MODEL_TTC_ROTATING_CUBE, 0 },
 +    { "TTCSpinner", bhvTTCSpinner, ttc_geo_000370, 0x00000000, 0, MODEL_TTC_SPINNER, 0 },
 +    { "TTCTreadmill", bhvTTCTreadmill, ttc_geo_0002A8, 0x00000000, 0, MODEL_TTC_SMALL_TREADMILL, 0 },
-+    { "Thwomp", bhvThwomp, thwomp_geo, 0x00000000, 1, MODEL_THWOMP, 1 },
-+    { "Thwomp2", bhvThwomp2, thwomp_geo, 0x00000000, 1, MODEL_THWOMP, 1 },
++    { "Thwomp", bhvThwomp, thwomp_geo, 0x00000000, 1, MODEL_THWOMP, 0 },
++    { "Thwomp2", bhvThwomp2, thwomp_geo, 0x00000000, 1, MODEL_THWOMP, 0 },
 +    { "TiltingBowserLavaPlatform", bhvTiltingBowserLavaPlatform, bowser_2_geo_000170, 0x00000000, 0, MODEL_BOWSER_2_TILTING_ARENA, 0 },
-+    { "ToadMessage", bhvToadMessage, toad_geo, 0x00000000, 3, MODEL_TOAD, 1 },
++    { "ToadMessage", bhvToadMessage, toad_geo, 0x00000000, 3, MODEL_TOAD, 0 },
 +    { "Tower", bhvTower, lll_geo_000A60, 0x00000000, 0, MODEL_LEVEL_GEOMETRY_08, 0 },
 +    { "ToxBox", bhvToxBox, ssl_geo_000630, 0x00000000, 1, MODEL_SSL_TOX_BOX, 0 },
 +    { "TripletButterfly", bhvTripletButterfly, butterfly_geo, 0x00000000, 3, MODEL_BUTTERFLY, 1 },
@@ -2888,7 +3520,7 @@ index 0000000..10d8614
 +    { "WdwExpressElevatorPlatform", bhvWdwExpressElevatorPlatform, wdw_geo_000610, 0x00320000, 0, MODEL_WDW_EXPRESS_ELEVATOR, 0 },
 +    { "WfRotatingWoodenPlatform", bhvWfRotatingWoodenPlatform, wf_geo_000A58, 0x00000000, 0, MODEL_WF_ROTATING_WOODEN_PLATFORM, 0 },
 +    { "WfTumblingBridge", bhvWfTumblingBridge, bitfs_geo_0006F0, 0x00030000, 0, MODEL_BITFS_TUMBLING_PLATFORM, 0 },
-+    { "WoodenPost", bhvWoodenPost, wooden_post_geo, 0x00000000, 2, MODEL_WOODEN_POST, 1 },
++    { "WoodenPost", bhvWoodenPost, wooden_post_geo, 0x00000000, 2, MODEL_WOODEN_POST, 0 },
 +};
 +#define NUM_AUTO ((s32) (sizeof(sAuto) / sizeof(sAuto[0])))
 diff --git a/src/game/interaction.c b/src/game/interaction.c

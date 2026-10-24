@@ -285,6 +285,7 @@
   window.sm64DailyDow = dow;
   window.sm64DailyNumber = WORD ? (hash('sm64track:' + WORD) % 1000) + 1 : dayNo;
   if (qs.has('host')) window.sm64DailyHostOverride = +qs.get('host');   // test hook: build over a given world
+  if (qs.has('test') && qs.has('bare')) window.sm64DailyBare = 1;          // test hook: no inventory objects
 
   // Same table and formula as daily.c (sHosts / daily_host_level), so the card can name today's world before boot.
   var HOSTS = ['Castle Grounds', "Bob-omb Battlefield", "Whomp's Fortress", 'Jolly Roger Bay', 'Cool, Cool Mountain', 'Shifting Sand Land',
@@ -301,7 +302,7 @@
     ['Updraft', '🌪️'], ['Pool dive', '🏊'], ['Poison gas', '☠️'], ['Boss arena', '👑'],
     ['Ledge climb', '🧗'], ['Long jump chain', '🦘'], ['Low tunnel', '🚇'], ['Box wall', '📦'], ['Push-box puzzle', '🧊'],
     ['Blue coin switch', '🔵'], ['Kick-board bridge', '🪵'], ['Ground run', '🏞️'], ['Hazard run', '⚠️'],
-    ['Elevator', '🛗'], ['Springboard', '🦘'], ['Chain Chomp', '⛓️']];
+    ['Elevator', '🛗'], ['Springboard', '🦘'], ['Chain Chomp', '⛓️'], ['Mini world', '🏝️']];
   // The challenge, rolled from the seed — same formula as daily.c mode_for_seed.
   var MODES = [['Race to the Star', 'Reach the <b>Power Star</b>.'], ['Red Coin Hunt', 'Find all <b>8 red coins</b>, then reach the star.'],
     ['Clear the Enemies', 'Beat <b>every enemy</b> on the course, then reach the star.'], ['Coin Rush', 'Collect <b>coins</b> until the star unlocks.'],
@@ -324,7 +325,7 @@
   function fmt(f) { var s = f / 30, m = Math.floor(s / 60); s -= m * 60; return m + ':' + (s < 10 ? '0' : '') + s.toFixed(2); }
   function streak(s) { var n = 0, d = new Date(realToday + 'T12:00:00'); while (s.days[dateKey(d)] && s.days[dateKey(d)].best && s.days[dateKey(d)].best.done) { n++; d.setDate(d.getDate() - 1); } return n; }
   function bestText(b, total) { return b.done ? fmt(b.frames) : b.plats + '/' + total; }
-  function moduleIcons() { return (window.sm64DailyModules || []).filter(function (m) { return m !== 0; }).map(function (m) { return MODULES[m][1]; }).join(''); }
+  function moduleIcons() { return (window.sm64DailyModules || []).filter(function (m) { return m !== 0 && MODULES[m]; }).map(function (m) { return MODULES[m][1]; }).join(''); }
   function esc(t) { return String(t).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
   function prettyDate(d) { return new Date(d + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' }); }
   var toastT;

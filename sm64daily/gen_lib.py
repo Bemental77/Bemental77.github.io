@@ -10,8 +10,11 @@ spec = []
 for f in sorted(glob.glob(os.path.join(inv, 'spec_*.json'))): spec += json.load(open(f))
 placed = json.load(open(os.path.join(inv, 'placed.json')))
 pat = re.compile(r'LOAD_MODEL_FROM_GEO\(\s*(?:/\*model\*/\s*)?(\w+)\s*,\s*(?:/\*geo\*/\s*)?(\w+)\s*\)')
-m2g, glob_models = {}, set(pat.findall(open('levels/scripts.c').read()))
-glob_models = {a for a, b in glob_models}
+# Models EVERY level has: the common block every level runs (level_main_scripts_entry) and
+# script_func_global_1. The other script_func_global_N in levels/scripts.c are per-level groups.
+_sc = open('levels/scripts.c').read()
+_glob_src = ''.join(m.group(1) for m in re.finditer(r'const LevelScript (?:level_main_scripts_entry|script_func_global_1)\[\] = \{(.*?)\n\};', _sc, re.S))
+m2g, glob_models = {}, {a for a, b in pat.findall(_glob_src)}
 for f in glob.glob('levels/*/script.c') + ['levels/scripts.c']:
     lvl = f.split('/')[1]
     for a, b in pat.findall(open(f).read()): m2g.setdefault(a, []).append(b)

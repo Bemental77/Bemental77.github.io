@@ -8,7 +8,7 @@ const url = process.env.URL || 'http://localhost:8080/sm64daily/';
 const maxCourses = +(process.argv[2] || 40);
 const NAMES = ['HOP', 'STEPPING', 'DOUBLE_STEPPING', 'THWOMP', 'PENDULUM', 'FIREBAR', 'LONG', 'POWER_STEP', 'TRIPLE', 'WALLKICK', 'POLE', 'SLIDE',
   'ENEMIES', 'AMPS', 'CANNON', 'SWITCH', 'SHELL', 'VANISH', 'METAL', 'WING', 'BARS', 'SAND', 'ICE', 'WIND', 'UPDRAFT', 'POOL', 'GAS', 'BOSS',
-  'LEDGES', 'LONGCHAIN', 'CRAWL', 'BREAKWALL', 'PUSHBOX', 'BLUECOIN', 'KICKBOARD', 'GROUND', 'HAZARD', 'LIFT', 'SPRING', 'CHOMP'];
+  'LEDGES', 'LONGCHAIN', 'CRAWL', 'BREAKWALL', 'PUSHBOX', 'BLUECOIN', 'KICKBOARD', 'GROUND', 'HAZARD', 'LIFT', 'SPRING', 'CHOMP', 'ISLAND'];
 const WANT = new Set(process.env.ONLY ? process.env.ONLY.split(',').map(n => NAMES.indexOf(n)) : NAMES.slice(12).map((_, i) => i + 12).filter(m => NAMES[m] !== 'BOSS' && NAMES[m] !== 'LONGCHAIN'));
 const B_BTN = 0x4000, Z_BTN = 0x2000;
 const A = 0x8000, VANISH = 2, METAL = 4, WING = 8, ACT_FLYING = 0x10880899, SWIM = 1 << 13, HANG = 1 << 21, SURFACE_ICE = 0x2E;
@@ -308,6 +308,21 @@ async function checkModule(c, k, mod) {
       await D('put', tx | 0, ty | 0, tz | 0, a.yaw);
       let maxY = -1e9; for (let t = 0; t < 40; t++) { await wait(200); maxY = Math.max(maxY, (await mario()).y); }
       rec(mod, maxY >= L.y - 20, { rise: maxY - a.y, ledgeRise: L.y - a.y });
+      break;
+    }
+    case 'ISLAND': {
+      const can = parts.find(p => p.type === 5 && p.kind === 0);
+      let nC = 0; for (let i = 0; i < can.i; i++) if ((await D('part', i, 3)) === 5 && (await D('part', i, 9)) === 0) nC++;
+      // Stand at the back of the cannon platform (not on the cannon), looking toward the island.
+      const st0 = stations[0], back = c.local(st0, -st0.hz + 60, 0);
+      await D('warp', await stationNo(first)); await wait(1500);
+      await D('put', back.x | 0, st0.y + 20, back.z | 0, st0.yaw); await wait(2500);
+      await c.page.screenshot({ path: '/private/tmp/claude-501/-Users-caseybement-Bemental77-github-io/fe4a0d6b-2c85-4029-a48f-be6ae4f13d51/scratchpad/isle-' + land + '.png' });
+      await D('cannon', nC);
+      let landed = -1; for (let t = 0; t < 40 && landed < 0; t++) { await wait(250); if ((await mario()).on === land) landed = t; }
+      await wait(800);
+      await c.page.screenshot({ path: '/private/tmp/claude-501/-Users-caseybement-Bemental77-github-io/fe4a0d6b-2c85-4029-a48f-be6ae4f13d51/scratchpad/isle-' + land + '-summit.png' });
+      rec(mod, landed >= 0, { landedOnSummitAfter: landed * 250 });
       break;
     }
     case 'CHOMP': {
