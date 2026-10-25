@@ -75,10 +75,158 @@ console.log('\n== the delay is a floor, and it is read in milliseconds ==');
   // renders every other VBlank (PSO Ver.2), ~16.7 on a 60 fps one.
   is('felt-60hz-delay3', Math.round(new Lockstep({ delay: 3 }).latencyMs(1000 / 60)), 50);
   is('felt-30hz-delay3', Math.round(new Lockstep({ delay: 3 }).latencyMs(1000 / 30)), 100);
+  // ⚠ THIS CELL READ 1 FOR ONE DAY, AND 1 WAS WRONG. The formula was changed to
+  // `x < 0.5 ? 1 : ceil(x)+1` on the reasoning that ceil() "charges a whole
+  // frame for a transit of nearly nothing" — a same-box room measured 0.86 ms
+  // RTT and was answered with 2 frames of delay. The reasoning was about
+  // TRANSIT, and the second frame is not transit: it is the SLACK between two
+  // consoles that nothing phase-locks to each other.
+  //
+  // Measured on LOOPBACK — inside the very band the change was made for — with
+  // tools/netplay_lockstep_pair_test.mjs, two browsers, a real
+  // RTCPeerConnection, 600 frames each at SECONDS=10, no injected delay:
+  //     delay 1  host 8 stalls (5 ms)   mean lead 0.15 | guest 167 stalls,
+  //              609 ms of the 10 s stalled, worst single stall 421 ms
+  //     delay 2  host 0 stalls (0 ms)   mean lead 1.03 | guest 1 stall (2 ms)
+  // A 421 ms stall is longer than delayBumpAfterMs (400), so a delay-1 room
+  // does not even hold its delay: the host raises it to 3 and the step-down
+  // floor (Math.max(2, delay-at-begin)) never lets it back to 1.
   is('recommend-lan', Lockstep.recommendDelay(2, 1000 / 60), 2);
+  // UNCHANGED THROUGHOUT. Every link whose transit is longer than a frame was
+  // always going to get ceil(x)+1; the churn was only ever at the bottom.
   is('recommend-60ms', Lockstep.recommendDelay(60, 1000 / 60), 3);
   is('recommend-160ms', Lockstep.recommendDelay(160, 1000 / 60), 6);
+  // ⚠ THE CELLS THAT REFUTE `round(x) + 1`, which is the other obvious-looking
+  // change to this line and is also wrong. Rounding is not a no-op in the middle
+  // of the range: it shortens 40 ms at 60 Hz from 3 frames to 2, and 500 ms at
+  // 30 fps from 9 to 8 — and 9 is the figure this repo publishes for a 500 ms
+  // link (tools/delay_stepdown_test.mjs:14). These pin the difference so a later
+  // "simplification" fails loudly instead of quietly trimming the margin on
+  // exactly the links that need it.
+  is('recommend-40ms-60hz-keeps-its-margin', Lockstep.recommendDelay(40, 1000 / 60), 3);
+  is('recommend-500ms-30fps-still-9', Lockstep.recommendDelay(500, 1000 / 30), 9);
+  // A frame is one retro_run, so the SAME link asks for fewer frames on a title
+  // that runs 30 of them a second — and each is twice as long. Both halves have
+  // to be right or the answer is wrong twice over.
+  is('recommend-lan-30fps', Lockstep.recommendDelay(2, 1000 / 30), 2);
+  is('recommend-100ms-30fps', Lockstep.recommendDelay(100, 1000 / 30), 3);
+  // ⚠ AND AN RTT THAT MEASURES ZERO IS NOT A REASON TO SHIP THE ONE
+  // CONFIGURATION THAT WAS MEASURED BROKEN. pingPeer() rounds, so a same-box
+  // link can genuinely report 0; the old clamp was Math.max(1, ...) and handed
+  // such a room a one-frame delay. The floor is 2.
+  is('recommend-zero-rtt', Lockstep.recommendDelay(0, 1000 / 60), 2);
+  // ⚠ THE TWO PROPERTIES THE FORM EXISTS FOR, SWEPT RATHER THAN SAMPLED — a
+  // cell per rtt would miss the hole a future edit opens between the samples.
+  {
+    let oneFrame = null, thin = null;
+    for (let r = 0; r <= 600; r += 0.5) {
+      for (const q of [1000 / 60, 1000 / 30]) {
+        const d = Lockstep.recommendDelay(r, q);
+        if (d < 2 && oneFrame == null) oneFrame = [r, +q.toFixed(2), d];
+        // The margin over one-way transit, which is what the pair rig measured
+        // as `lead`. ceil(x)+1 guarantees a WHOLE frame of it.
+        if (d * q - r / 2 < q - 1e-9 && thin == null) thin = [r, +q.toFixed(2), d, +(d * q - r / 2).toFixed(2)];
+      }
+    }
+    eq('recommend-never-asks-for-a-one-frame-room', oneFrame, null);
+    eq('recommend-always-keeps-a-WHOLE-frame-of-slack-over-transit', thin, null);
+  }
   is('portCount-not-assumed', new Lockstep({ portCount: 1 }).portCount, 1);
+}
+
+// ===========================================================================
+console.log('\n== a ONE-FRAME room: what it does, and why the recommender does not ask for one ==');
+// ⚠ THIS BLOCK WAS WRITTEN AS THE SAFETY ARGUMENT FOR LOWERING THE FLOOR TO 1.
+// The lowering has since been REVERTED on a matched-pair measurement (see the
+// recommendDelay cells above: on loopback, delay 1 ran with mean lead 0.02-0.15
+// and 167 guest stalls per 600 frames against delay 2's 1 stall and mean lead
+// ~1.0). The block is kept, and it is now evidence for the opposite reading:
+// a one-frame room is something the ENGINE can survive, not something the
+// recommender should choose. It still runs, it still stalls rather than
+// guessing, it still raises itself — and the value it raises itself to, and
+// settles at, is 2, which is exactly what recommendDelay() now answers
+// directly. A caller that passes delay 1 explicitly (this block, or a page that
+// hardcodes it) gets a working room; it does not get a comfortable one.
+{
+  let clock = 10000;                       // past delayBumpAfterMs*2 from zero
+  const now = () => clock;
+  const b = room([{ id: 'H', host: true, opts: { now } }, { id: 'G', opts: { now } }],
+                 { portCount: 2, delay: 1 });
+  b.H.seat('H', 1); b.H.seat('G', 1);
+  b.H.declareReady('gauntlet'); b.G.declareReady('gauntlet');
+  is('floor-room-runs-at-delay-1', b.H.delay, 1);
+  is('floor-room-both-started', b.H.state + '/' + b.G.state, 'running/running');
+
+  // 1. IT IS A ROOM, NOT A DEADLOCK. Six frames with a healthy wire, both sides
+  //    advancing on each other's real input — a one-frame lead is enough to
+  //    keep the pipeline primed when the link is as fast as the measurement said.
+  let ran = 0;
+  for (let i = 0; i < 6; i++) {
+    const rh = b.H.beginFrame(pad(1)), rg = b.G.beginFrame(pad(2));
+    if (!rh.ready || !rg.ready) break;
+    b.H.endFrame(null); b.G.endFrame(null); ran++; clock += 34;
+  }
+  is('a-one-frame-room-actually-advances', ran, 6);
+  // and each side really was consuming the OTHER's pad, not a neutral fill
+  const img = b.H.beginFrame(pad(1));
+  (img.ready && img.image[1 * b.H.padBytes] === 2)
+    ? ok('a-one-frame-room-carries-the-peer-pad', `port 1 byte 0 = ${img.image[1 * b.H.padBytes]} from G`)
+    : bad('a-one-frame-room-carries-the-peer-pad', JSON.stringify({ ready: img.ready, reason: img.reason }));
+  b.H.endFrame(null); b.G.beginFrame(pad(2)); b.G.endFrame(null);
+
+  // 2. IF ONE FRAME IS NOT ENOUGH, THE ENGINE SAYS SO AND RAISES IT ITSELF.
+  //    The wire is held, so H runs out of G's input and stalls — the exact
+  //    failure a too-small delay produces.
+  b.held = true;   // the wire stops carrying G
+  const stalledAt = [];
+  for (let i = 0; i < 3 && !stalledAt.length; i++) {
+    const r = b.H.beginFrame(pad(1));
+    if (r.ready) { b.H.endFrame(null); clock += 34; } else stalledAt.push(r);
+  }
+  is('a-too-small-delay-STALLS-rather-than-guessing', stalledAt.length ? stalledAt[0].reason : 'never-stalled', 'stall');
+  // Longer than delayBumpAfterMs (400) AND past the pace warm-up: the engine
+  // does not raise until paceWindowMs*3 after pacing was born (lib/netplay.js,
+  // grep 'paceWindowMs * 3'), so a stall inside that window is held, not raised.
+  clock += Math.max(500, b.H.paceWindowMs * 3 + 1);
+  b.H.beginFrame(pad(1));
+  const pd = b.H._pendingDelay;
+  (pd && pd.d === 3 && !pd.down)
+    ? ok('the-room-RAISES-itself-off-the-floor', `1 -> ${pd.d} agreed at frame ${pd.at} after the stall outlasted the bump window — ` +
+         'the raise is the engine measuring the path with the thing the path costs')
+    : bad('the-room-RAISES-itself-off-the-floor', JSON.stringify(pd));
+
+  // 3. AND THE RECOVERY LANDS ON 2, WHICH IS WHAT THE ROOM USED TO START AT.
+  //    _delayFloor is Math.max(2, delay-at-begin), so a room that began at 1
+  //    steps back down 3 -> 2 and stops. A wrong guess at the floor therefore
+  //    costs one stall and ends at the old value; it cannot ratchet.
+  is('the-floor-under-a-1-frame-room-is-still-2', b.H._delayFloor, 2);
+  // the wire comes back: the held inputs land, the agreed raise takes effect at
+  // the frame it named, and the room RUNS AGAIN at 3. A stall is a pause.
+  b.held = false; b.flush();
+  let resumed = 0;
+  for (let i = 0; i < 12; i++) {
+    const rh = b.H.beginFrame(pad(1)), rg = b.G.beginFrame(pad(2));
+    if (rh.ready) { b.H.endFrame(null); resumed++; }
+    if (rg.ready) b.G.endFrame(null);
+    clock += 34;
+  }
+  (b.H.state === 'running' && b.H.delay === 3 && resumed > 0)
+    ? ok('the-raised-room-RESUMES-at-the-delay-it-agreed', `${resumed} frames after the wire came back, delay now ${b.H.delay}`)
+    : bad('the-raised-room-RESUMES-at-the-delay-it-agreed', `state ${b.H.state}, delay ${b.H.delay}, ran ${resumed}`);
+  b.H._pendingDelay = null; b.H._queuedTo = b.H.frame + b.H.delay;
+  b.H._lastStallAt = clock; b.H._lastGiveBackAt = 0;
+  clock += b.H.delayCalmMs + 1;
+  const down1 = b.H._maybeGiveDelayBack();
+  (down1 && b.H._pendingDelay && b.H._pendingDelay.d === 2 && b.H._pendingDelay.down === true)
+    ? ok('calm-buys-the-raise-back-one-frame-at-a-time', `3 -> ${b.H._pendingDelay.d} after one calm window`)
+    : bad('calm-buys-the-raise-back-one-frame-at-a-time', JSON.stringify(b.H._pendingDelay));
+  b.H._pendingDelay = null; b.H.delay = 2; b.H._lastGiveBackAt = 0;
+  clock += b.H.delayCalmMs + 1;
+  const down2 = b.H._maybeGiveDelayBack();
+  (!down2 && b.H.delay === 2 && !b.H._pendingDelay)
+    ? ok('and-it-stops-there-instead-of-ratcheting-back-to-1',
+         'a stall costs the room one step to 2 — the delay it would have started at before this change — and no more')
+    : bad('and-it-stops-there-instead-of-ratcheting-back-to-1', `delay ${b.H.delay}, pending ${JSON.stringify(b.H._pendingDelay)}`);
 }
 
 console.log('\n== the lobby: nobody starts until everybody is ready, on the same game ==');

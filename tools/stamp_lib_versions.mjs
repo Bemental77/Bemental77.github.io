@@ -29,7 +29,7 @@ import { execSync } from 'child_process';
 // seams that moved and print n/a where the answer is.
 // lib/bench.js is here because a device that cached an old benchmark would
 // report results in a shape (or by a method) the collector no longer expects.
-const LIBS = ['lib/netplay.js', 'lib/asset_base.js', 'lib/capability.js', 'lib/bgz.js', 'lib/debugreport.js', 'lib/bench.js'];
+const LIBS = ['lib/netplay.js', 'lib/netplay-ui.js', 'lib/asset_base.js', 'lib/capability.js', 'lib/bgz.js', 'lib/debugreport.js', 'lib/bench.js'];
 
 const PAGES = [
   'index.html', 'dreamcast.html', 'gamecube.html', 'ps1.html', 'snes.html',
