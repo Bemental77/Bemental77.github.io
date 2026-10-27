@@ -311,11 +311,12 @@ function checkStackCookie() {
   }
   var cookie1 = HEAPU32[((max)>>2)];
   var cookie2 = HEAPU32[(((max)+(4))>>2)];
-  // SM64 DAILY PARKOUR: hand-edited glue, not emcc output (a rebuild overwrites it). The game does a
-  // stray one-byte zero write to address 11 (a NULL-based store in the decomp) during the Wiggler
-  // fight. Addresses 0..11 are the dead bottom of the 64 KB stack (sampled use never passes ~37 KB), so the
-  // write is harmless, but this check turned it into a fatal abort that froze the page. Repair the
-  // canary and count instead; Module.strayWrites is for anyone chasing the real store.
+  // SM64 DAILY PARKOUR: hand-edited glue, not emcc output (a rebuild overwrites it). On the Wiggler day
+  // the game wrote floats through a dangling pointer (0 or a small integer: an orphaned body part
+  // reading a recycled parent slot's oWigglerSegments) over addresses ~0..80, which includes this
+  // canary. That bug is fixed in the wasm. The bottom of the 64 KB stack is dead (sampled use never
+  // passes ~37 KB), but a pointer to a larger garbage value would not be, so this is a backstop, not
+  // the fix: repair the canary and count instead of aborting; Module.strayWrites is for anyone chasing it.
   if (cookie1 != 0x02135467 || cookie2 != 0x89BACDFE || HEAPU32[((0)>>2)] != 0x63736d65 /* 'emsc' */) {
     Module['strayWrites'] = (Module['strayWrites'] | 0) + 1;
     if (Module['strayWrites'] <= 3) console.warn('sm64daily: stray write into the stack canary repaired (' + ptrToString(max) + ' ' + ptrToString(cookie1) + ' ' + ptrToString(cookie2) + ' @0 ' + ptrToString(HEAPU32[((0)>>2)]) + ')');

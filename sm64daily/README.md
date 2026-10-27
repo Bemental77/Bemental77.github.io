@@ -40,8 +40,8 @@ The `.wasm` in this folder carries one **binary patch** (below), and the `.js` g
 Symptom: on a Wiggler day the page froze mid-fight. In the console: `Aborted(Stack overflow! Stack cookie has been overwritten at 0x00000004 ... received 0x00bacdfe 0x02135467)`.
 
 Cause: `daily.c` replaces every enemy on a respawn (Mario dies, the run restarts, a boss thrown off the arena), but the Wiggler head's three `bhvWigglerBody` objects are separate objects and survive. They keep running
-`bhv_wiggler_body_part_update`, which reads `o->parentObj->oWigglerSegments`. When the dead head's slot is handed to another object (the new head's own first body part gets it), that field is 0, and the orphans write floats and angles through NULL over addresses `0 .. 79`, on top of the canary.
-The write was never a real stack overflow: sampled stack depth stays under ~37 KB of 64 KB.
+`bhv_wiggler_body_part_update`, which reads `o->parentObj->oWigglerSegments`. When the dead head's slot is handed to another object, `oWigglerSegments` becomes whatever that object keeps in the same field: 0 for some orphans, a small odd integer (a base of 7) for another. The orphans then store their `posY` floats through that pointer, into addresses of roughly `0 .. 80`, which includes the canary: a 4-byte float at the odd address 11 (-30.0, -60.0, -90.0 ... as the body part falls 30 a frame) puts its low byte on the canary's top byte, which is why it first looked like a single zero byte.
+The write was never a real stack overflow: sampled stack depth stays under ~37 KB of 64 KB. A *larger* garbage value would write elsewhere; the fix does not depend on the value.
 
 Fix: a body part whose parent is NULL, deactivated or no longer a `bhvWigglerHead` deletes itself.
 Observed with the repair switched off: across 10 cycles and 6 head replacements the orphans all deactivate, the dead stack stays zero and the canary stays intact. Other enemies with child objects (the chain chomp's chain parts, the Pokey's body parts) are built the same way and are **not** checked.

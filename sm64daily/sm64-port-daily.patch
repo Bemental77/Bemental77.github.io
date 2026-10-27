@@ -4706,8 +4706,8 @@ diff --git a/src/game/behaviors/wiggler.inc.c b/src/game/behaviors/wiggler.inc.c
      f32 posOffset;
  
 +    // SM64 DAILY PARKOUR: daily.c respawns the head (Mario dies, the run restarts) without its body
-+    // parts. An orphan would keep updating through a dead parent whose oWigglerSegments is NULL once
-+    // the slot is recycled, writing over low memory. Delete it instead.
++    // parts. An orphan keeps updating through a dead parent; once that slot is recycled its oWigglerSegments
++    // is whatever the new tenant keeps there (0 or a small int) and the orphan writes through it. Delete it.
 +    if (o->parentObj == NULL || o->parentObj->activeFlags == ACTIVE_FLAG_DEACTIVATED
 +        || o->parentObj->behavior != segmented_to_virtual(bhvWigglerHead)) {
 +        obj_mark_for_deletion(o);

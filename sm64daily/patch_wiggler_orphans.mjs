@@ -5,8 +5,9 @@
 // Why: daily.c replaces the Wiggler head whenever it respawns the course's enemies (Mario dies, the
 // run restarts, the boss is thrown off the arena). The head's three bhvWigglerBody objects are not
 // deleted, so they keep running bhv_wiggler_body_part_update against a dead parentObj. Once that
-// slot is recycled its oWigglerSegments is NULL, and the body parts write floats and angles through
-// it into addresses 0..79 -- on top of the emscripten stack canary, which aborts the module.
+// slot is recycled its oWigglerSegments is whatever the new tenant keeps in that field (0, or a small
+// integer such as 7), and the body parts store their posY floats through it into addresses ~0..80 --
+// onto the emscripten stack canary, which aborts the module.
 //
 // The proper fix is in the C source (sm64-port-daily.patch). This script applies the same guard to
 // the shipped binary when the decomp can't be rebuilt:
@@ -62,6 +63,7 @@ const guard = [
 ];
 
 const insertAt = c;
+if (has(buf, guard, insertAt, insertAt + guard.length) === insertAt) { console.log(`function #${fn.i} is already patched; nothing written`); process.exit(0); }
 const out = Buffer.concat([buf.subarray(0, insertAt), Buffer.from(guard), buf.subarray(insertAt)]);
 // re-encode: the function's size, then the code section's size (both LEBs may change length)
 const newFnSize = fn.size + guard.length;

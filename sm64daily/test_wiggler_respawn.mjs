@@ -2,8 +2,8 @@
 //
 // daily.c replaces the Wiggler head on every respawn but not its three body parts. The orphans kept running
 // bhv_wiggler_body_part_update against a dead parent; once that slot was recycled its oWigglerSegments was
-// NULL, and they wrote floats and angles through it over addresses 0..79 -- on the emscripten stack canary,
-// which aborted the module (the page stays up on its last frame: a "freeze").
+// 0 or a small integer, and they stored posY floats through it over addresses ~0..80 -- onto the emscripten
+// stack canary, which aborted the module (the page stays up on its last frame: a "freeze").
 //
 //   npm run web                                  # the devserver, in another terminal
 //   node sm64daily/test_wiggler_respawn.mjs      # URL=... CHROME=... to override
