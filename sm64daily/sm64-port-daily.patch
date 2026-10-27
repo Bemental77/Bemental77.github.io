@@ -4694,3 +4694,27 @@ index 89aa1fa..89ebb48 100644
      if (time >= target_time + 10.0) {
          // We are lagging 10 frames behind, probably due to coming back after inactivity,
          // so reset, with a small margin to avoid potential jitter later.
+diff --git a/src/game/behaviors/wiggler.inc.c b/src/game/behaviors/wiggler.inc.c
+--- a/src/game/behaviors/wiggler.inc.c
++++ b/src/game/behaviors/wiggler.inc.c
+@@ -66,9 +66,19 @@ void bhv_wiggler_body_part_update(void) {
+     f32 dy;
+     f32 dz;
+     f32 dxz;
+-    struct ChainSegment *segment = &o->parentObj->oWigglerSegments[o->oBehParams2ndByte];
++    struct ChainSegment *segment;
+     f32 posOffset;
+ 
++    // SM64 DAILY PARKOUR: daily.c respawns the head (Mario dies, the run restarts) without its body
++    // parts. An orphan would keep updating through a dead parent whose oWigglerSegments is NULL once
++    // the slot is recycled, writing over low memory. Delete it instead.
++    if (o->parentObj == NULL || o->parentObj->activeFlags == ACTIVE_FLAG_DEACTIVATED
++        || o->parentObj->behavior != segmented_to_virtual(bhvWigglerHead)) {
++        obj_mark_for_deletion(o);
++        return;
++    }
++    segment = &o->parentObj->oWigglerSegments[o->oBehParams2ndByte];
++
+     cur_obj_scale(o->parentObj->header.gfx.scale[0]);
+ 
+     o->oFaceAnglePitch = segment->pitch;

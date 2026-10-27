@@ -730,13 +730,21 @@
     if (started) { hideCard(); Module._daily_restart(); return; }
     started = true;
     card('<div class="eyebrow">' + esc(TITLE) + '</div><h1>' + esc(HOSTS[hostIdx]) + '</h1><p class="lede" id="loadMsg">Loading the game…</p><div class="bar"><i id="loadBar"></i></div>');
-    var s = document.createElement('script'); s.src = 'sm64.us.js';
+    var s = document.createElement('script'); s.src = 'sm64.us.js?v=2';   // bump when the glue changes (Pages caches it)
     s.onerror = function () { card('<div class="eyebrow">Daily Parkour</div><h1>Could not load the game</h1><p class="lede">Check your connection, then try again.</p><div class="btns"><button class="btn go" id="retry">Reload</button></div>'); $('retry').onclick = function () { location.reload(); }; };
     document.body.appendChild(s);
   }
   window.Module = {
     canvas: $('canvas'),
+    locateFile: function (p) { return p + '?v=2'; },   // the wasm moves with sm64.us.js?v=2 (Pages caches both)
     print: function () {}, printErr: function (t) { console.warn(t); },
+    // A wasm abort used to leave the last frame on screen with no message (the "freeze").
+    onAbort: function (why) {
+      running = false;
+      try { console.error('sm64daily: game aborted: ' + why); } catch (e) {}
+      card('<div class="eyebrow">Daily Parkour</div><h1>The game stopped</h1><p class="lede">The emulator hit an error and cannot continue. Your saved best is safe. Reload to run it again.</p><div class="btns"><button class="btn go" id="crashReload">Reload</button></div>');
+      $('crashReload').onclick = function () { location.reload(); };
+    },
     setStatus: function (t) {
       var m = /\((\d+(?:\.\d+)?)\/(\d+)\)/.exec(t || '');
       if (m && $('loadBar')) $('loadBar').style.width = Math.max(8, Math.round(100 * m[1] / m[2])) + '%';
