@@ -30,6 +30,7 @@
        architecture on a page that has one. -->
   <script src="/lib/netplay.js?v=5a4e0d80"></script>
   <script src="/lib/mpgames.js"></script>
+  <script src="/lib/publiclobby.js"></script>
   <!-- The Party button is NOT gated on the selected game any more (MPGames.gateParty used to disable it for a
        single-player title): the lobby it opens handles that itself - Host is disabled with the reason, Join
        still works - so a player on a solo game can still open it to join a friend. -->
@@ -267,6 +268,17 @@
                  padding: 0 12px; font: 700 18px ui-monospace, Menlo, monospace; letter-spacing: 3px; text-transform: uppercase; }
   #lobby .lbNote { color: #93a2b3; font-size: 12.5px; margin: 10px 0 0; min-height: 1.4em; }
   #lobby .lbNote.bad { color: #ff9b9b; }
+  #lobby .lbQuick { margin-bottom: 10px; }
+  #lobby .lbQuick button { background: #1f6f3a; border-color: #2f9a52; font-weight: 600; }
+  #lobby .lbOpen { margin: 0 0 12px; }
+  #lobby .lbOpenHead { color: #9fb2c6; font-size: 12px; margin-bottom: 4px; }
+  #lobby .lbList { display: flex; flex-direction: column; gap: 4px; max-height: 160px; overflow-y: auto; }
+  #lobby .lbGameRow { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; background: #131922; }
+  #lobby .lbGameRow .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #lobby .lbGameRow .ct { color: #7f8d9d; font-size: 12px; }
+  #lobby .lbGameRow button { flex: 0 0 auto; min-height: 30px; padding: 0 14px; }
+  #lobby .lbEmpty { color: #7f8d9d; font-size: 12.5px; padding: 4px 2px; }
+  #lobby .lbPub { display: flex; align-items: center; gap: 6px; color: #aab6c4; font-size: 12.5px; margin: 0 0 10px; }
 </style>
   <!-- JAVASCRIPT OFF. Measured 2026-09-01: none of the three emulator pages had a
        <noscript> at all, so a visitor with JS disabled (blocked by an extension, or on
@@ -332,6 +344,12 @@
   <div class="lbCard">
     <div class="lbHead"><span id="lbTitle">How do you want to play?</span><button id="lbClose" type="button" class="sec" aria-label="Close">×</button></div>
     <div class="lbGame" id="lbGame"></div>
+    <div class="lbQuick"><button id="lbQuick" type="button" style="width:100%">Quick play: join anyone</button></div>
+    <div class="lbOpen">
+      <div class="lbOpenHead" id="lbOpenHead">Open games</div>
+      <div class="lbList" id="lbList"></div>
+    </div>
+    <label class="lbPub"><input type="checkbox" id="lbPublic" checked style="flex:0 0 auto;min-height:0;width:auto"> Public game: list it so anyone can join</label>
     <div class="lbRow">
       <button id="lbSolo" type="button">Play solo</button>
       <button id="lbHost" type="button">Host a party</button>
@@ -4680,8 +4698,8 @@ N64Rate.selfTest = function (logFn) {
       var sel = isMobile ? $('mobileRomSelect') : $('romSelect');
       return ROMS[+(sel && sel.value) || 0] || ROMS[0];
     }
-    function lbUrl(game, code, join) {
-      var u = code ? '/n64/?np=' + encodeURIComponent(code) + '&game=' + encodeURIComponent(game) + (join ? '&join=1' : '')
+    function lbUrl(game, code, join, pub) {
+      var u = code ? '/n64/?np=' + encodeURIComponent(code) + '&game=' + encodeURIComponent(game) + (join ? '&join=1' : (pub ? '&pub=1' : ''))
                    : '/n64/?game=' + encodeURIComponent(game) + '&autostart';
       if (netTransport() === 'local') u += '&net=local';
       return u;
@@ -4697,9 +4715,42 @@ N64Rate.selfTest = function (logFn) {
                   : (NET.pendingCode ? 'You are in party ' + NET.pendingCode + '. Choosing another way to play restarts the game.'
                                      : 'Hosting or joining restarts the game so everyone starts together.'));
       $('lbIn').value = ''; $('lbJoin').disabled = true;
+      $('lbQuick').disabled = solo;
       lbEl.hidden = false;
+      lbWatch();
     }
-    function lbClose() { if (lbEl) lbEl.hidden = true; }
+    function lbClose() { if (lbEl) lbEl.hidden = true; lbUnwatch(); }
+    // The live list of public games (lib/publiclobby.js). Rendered with textContent only: the names come from strangers.
+    var lbRooms = [], lbW = null;
+    function lbOpenRooms() {
+      return lbRooms.filter(function (r) { return r.state !== 'playing' && r.seated < r.ports && !MPGames.isSolo('n64', r.game); });
+    }
+    function lbRender() {
+      var list = $('lbList'); if (!list) return;
+      var rooms = lbOpenRooms();
+      list.textContent = '';
+      if (!rooms.length) {
+        var e = document.createElement('div'); e.className = 'lbEmpty';
+        e.textContent = lbW ? 'No open games right now. Host one and others will see it here.' : 'Looking for games…';
+        list.appendChild(e);
+      }
+      rooms.slice(0, 20).forEach(function (r) {
+        var row = document.createElement('div'); row.className = 'lbGameRow';
+        var nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = r.game;
+        var ct = document.createElement('span'); ct.className = 'ct'; ct.textContent = r.seated + '/' + r.ports;
+        var jb = document.createElement('button'); jb.type = 'button'; jb.textContent = 'Join';
+        jb.addEventListener('click', function () { lbGo(lbUrl(r.game, r.code, true)); });
+        row.appendChild(nm); row.appendChild(ct); row.appendChild(jb); list.appendChild(row);
+      });
+      var h = $('lbOpenHead'); if (h) h.textContent = rooms.length ? 'Open games (' + rooms.length + ')' : 'Open games';
+    }
+    function lbWatch() {
+      if (lbW || !window.PublicLobby) { lbRender(); return; }
+      lbRooms = [];
+      try { lbW = PublicLobby.watch('n64', function (l) { lbRooms = l; lbRender(); }); } catch (e) { lbW = null; }
+      lbRender();
+    }
+    function lbUnwatch() { if (lbW) { try { lbW.stop(); } catch (e) {} lbW = null; } lbRooms = []; }
     function lbGo(url) {
       var s = NET.session; NET.leaving = true;
       if (s) { try { s.close(); } catch (e) {} }
@@ -4717,7 +4768,17 @@ N64Rate.selfTest = function (logFn) {
       $('lbHost').addEventListener('click', function () {
         var pick = lbPick();
         if (MPGames.isSolo('n64', pick.label)) return;
-        lbGo(lbUrl(pick.label, Netplay.makeCode(5, 'n64'), false));
+        lbGo(lbUrl(pick.label, Netplay.makeCode(5, 'n64'), false, $('lbPublic').checked));
+      });
+      // Quick play: the one-button path. Join an open game of the selected title if there is one (any open
+      // game otherwise), and if nobody is hosting, host a public game and wait for the next player.
+      $('lbQuick').addEventListener('click', function () {
+        var pick = lbPick();
+        if (MPGames.isSolo('n64', pick.label)) return;
+        var open = lbOpenRooms();
+        var mine = open.filter(function (r) { return r.game === pick.label; })[0] || open[0];
+        if (mine) { lbGo(lbUrl(mine.game, mine.code, true)); return; }
+        lbGo(lbUrl(pick.label, Netplay.makeCode(5, 'n64'), false, true));
       });
       var lbIn = $('lbIn');
       lbIn.addEventListener('input', function () {
@@ -4778,6 +4839,17 @@ N64Rate.selfTest = function (logFn) {
       // going to pay is simply paid together, which is the point of forming the
       // room first.
       NET.bootWhenConnected = true;
+      // A PUBLIC game (&pub=1, set by the lobby's "Public game" box) lists itself in the live lobby while it
+      // can still take players (lib/publiclobby.js). A private room is never listed and its code goes nowhere.
+      if (!isJoin && qs.get('pub') === '1' && window.PublicLobby) {
+        try {
+          NET.advert = PublicLobby.advertise('n64', function () {
+            var p = lsParty();
+            return { code: NET.pendingCode, game: gameName, seated: Math.max(1, p.seated), ports: p.ports, state: p.state };   // the host is seated before the roster says so
+          });
+          pageLog('[net] public game: listed in the lobby while it has room');
+        } catch (e) { pageLog('[net] public listing failed: ' + (e && e.message || e)); }
+      }
       // WHERE THE ENGINE IS BUILT IS DECIDED FIRST (wkRoomDecide, inside startSession), and
       // that needs the capability layer's measured WebGL2-in-a-worker answer — a brief wait.
       wkCapReady(function () { startSession(!isJoin, np, gameName).then(function () {
@@ -5068,6 +5140,7 @@ N64Rate.selfTest = function (logFn) {
       // 0/4 · waiting" and "share the code …" on a page that had left the
       // room. No session means the control reads "Party" and nothing else.
       NET.pendingCode = null; NET.declared = false; NET.declaring = false;
+      if (NET.advert) { try { NET.advert.stop(); } catch (e) {} NET.advert = null; }
       if (roomTick) { clearInterval(roomTick); roomTick = 0; }
       lsDisarm('you left the room');
       try { renderRoom(); } catch (e) {}
