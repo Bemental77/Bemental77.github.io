@@ -331,6 +331,7 @@
     <button id="lsLink" type="button" class="sec">Copy link</button>
   </div>
   <div class="lsBtns" style="margin-top:7px">
+    <button id="lsLobby" type="button">Lobby</button>
     <button id="lsSolo" type="button">Play solo</button>
     <button id="netLeave" type="button" class="sec">Leave</button>
   </div>
@@ -1744,7 +1745,9 @@ N64Rate.selfTest = function (logFn) {
     { label: 'Star Fox: Survival', file: 'starfoxsurvival.z64' },
     { label: 'Super Mario Odyssey 64 (hack)', file: 'marioo.z64' },
     { label: 'GoldenEye 007', file: 'GoldenEye 007 (USA).z64' },
-    { label: 'Smash Remix 1.0.1', file: 'smashremix.z64' }
+    { label: 'Smash Remix 1.0.1', file: 'smashremix.z64' },
+    { label: "Pokémon Stadium 2: Mord's Moveset", file: 'pkmnstadium2mord.z64' },
+    { label: 'Mario Party 3: StarStruck', file: 'mp3starstruck.z64' }
   ];
   const $ = id => document.getElementById(id);
   (function populateRomSelect() {
@@ -5064,7 +5067,7 @@ N64Rate.selfTest = function (logFn) {
                                   + '(WebGL' + (LS_GL.lost ? ' context lost' : ' produced no pixels') + '). Open 🩺 Diagnostics and share it.');
         }
       }
-      else if (p.alone) setMsg('Waiting for another player — share the code ' + p.code + '. Starts by itself once two are in and loaded.');
+      else if (p.alone) setMsg('Waiting for another player — share the code ' + p.code + (NET.advert ? ' (it is also listed in the lobby)' : '') + '. Starts by itself once two are in and loaded. Not waiting? Play solo, or open the Lobby.');
       else if (p.waitingFor.length) setMsg('Starts by itself when everyone is loaded — waiting for ' + p.waitingFor.join(', ') + '.');
       // `starting`: everyone has declared and the barrier has not released. On
       // the host that is unobservable (declare -> _checkBarrier -> begin() is
@@ -5157,6 +5160,8 @@ N64Rate.selfTest = function (logFn) {
     var hideBtn = $('lsHide');
     if (hideBtn) hideBtn.addEventListener('click', function () { var r = $('lsRoom'); if (r) r.hidden = true; });
 
+    var plobby = $('lsLobby');
+    if (plobby) plobby.addEventListener('click', function () { lbOpen(); });
     var psolo = $('lsSolo');
     if (psolo) psolo.addEventListener('click', function () { lbGo(lbUrl(lbPick().label, null, false)); });
     var plink = $('lsLink');
