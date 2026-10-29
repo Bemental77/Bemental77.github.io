@@ -3654,19 +3654,27 @@ N64Rate.selfTest = function (logFn) {
   // buttons are only bound here where a face button is the better place for them.
   // A game listed here keeps its OWN saved mapping (MAPPINGS_LS_KEY + ':' + file), so the global
   // mapping a visitor saved for other games can never override its scheme.
-  var SMASH_PAD = { // Nintendo Switch Online N64 layout for Smash: ZL = Z (shield), L/R bumpers, top face = jump (C-Up)
-    Joy_Mapping_Action_A: 0, Joy_Mapping_Action_B: 2, Joy_Mapping_Action_Start: 9,
-    Joy_Mapping_Action_Z: 6, Joy_Mapping_Action_L: 4, Joy_Mapping_Action_R: 5, Joy_Mapping_Action_CUP: 3
+  // SMASH: modern Switch layout (Ultimate-style positions). A attack = right face, B special = bottom
+  // face, jump = top + left face (Smash 64 jumps on ANY C button), ZR = shield (N64 Z), RB = grab
+  // (N64 R), LB = taunt (N64 L). The right stick stays on the C buttons, which is jump in this game.
+  var SMASH_PAD = {
+    Joy_Mapping_Action_A: 1, Joy_Mapping_Action_B: 0, Joy_Mapping_Action_Start: 9,
+    Joy_Mapping_Action_Z: 7, Joy_Mapping_Action_L: 4, Joy_Mapping_Action_R: 5,
+    Joy_Mapping_Action_CUP: 3, Joy_Mapping_Action_CLEFT: 2
   };
+  // GOLDENEYE, the twin-stick layout from Nintendo Wire's modern-controls guide: the game's control
+  // style must be 1.2 "Solitaire"; LEFT stick moves (the N64 C buttons), RIGHT stick looks (the N64
+  // stick) = swapSticks; ZR fires (N64 Z), ZL aims (N64 L).
   var GAME_PADS = {
     'Super Smash Bros. (USA).z64': SMASH_PAD,
     'smashremix.z64': SMASH_PAD,
-    // GoldenEye as on the Xbox remake: RT fires (N64 Z), LT aims (N64 R), A = use/reload, bumper = L
     'GoldenEye 007 (USA).z64': {
       Joy_Mapping_Action_A: 0, Joy_Mapping_Action_B: 2, Joy_Mapping_Action_Start: 9,
-      Joy_Mapping_Action_Z: 7, Joy_Mapping_Action_R: 6, Joy_Mapping_Action_L: 4
+      Joy_Mapping_Action_Z: 7, Joy_Mapping_Action_L: 6, Joy_Mapping_Action_R: 5
     }
   };
+  var GAME_SWAP_STICKS = { 'GoldenEye 007 (USA).z64': true };
+  var swapSticksUser = null;
   function gameDefaults(file) { return Object.assign({}, MAPPING_DEFAULTS, GAME_PADS[file] || {}); }
   function curRomFile() {
     var sel = $('romSelect') || $('mobileRomSelect'), r = sel && ROMS[+sel.value];
@@ -3687,6 +3695,9 @@ N64Rate.selfTest = function (logFn) {
       if (!km) return;
       var m = loadMappings(file);
       for (var k in m) { if (k in km) km[k] = m[k]; }
+      var rd = window.myApp.rivetsData;
+      if (swapSticksUser === null) swapSticksUser = !!rd.swapSticks;
+      rd.swapSticks = GAME_SWAP_STICKS[file] ? true : swapSticksUser;
     } catch (e) {}
   }
   var remapState = null; // working copy while the panel is open
