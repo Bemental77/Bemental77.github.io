@@ -2596,6 +2596,7 @@ N64Rate.selfTest = function (logFn) {
         // stick = turn (N64 stick X, analog) + look (C-up/down). C-up LOOKS DOWN in that style (measured in the
         // live game, 2026-10-29), so a right-stick push UP is sent as C-down. Needs no in-game setting, so it also
         // holds in a room, where saves (and so the control style) are not loaded.
+        // (Pushed twice: the first deploy of this change died in the runner's checkout on a network error.)
         if (rd.dualHoney) { var lx = x0, ly = y0, rx = x1, ry = y1; x0 = rx; y0 = ly; x1 = lx; y1 = -ry; }
         a0 = x0; a1 = y0;
         if ((p === 1 && rd.invert2P) || (p === 2 && rd.invert3P) || (p === 3 && rd.invert4P)) a1 = -a1;
