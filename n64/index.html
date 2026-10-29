@@ -3291,6 +3291,7 @@ N64Rate.selfTest = function (logFn) {
 
   async function loadRom(rom) {
     mark('rom-fetch');
+    applyGamePad(rom.file);
     setStatus('Downloading ' + rom.label + '…');
     try {
       var resp = await fetch(window.ASSET_BASE + '/n64/N64Wasm/roms/' + rom.file);
@@ -3647,10 +3648,46 @@ N64Rate.selfTest = function (logFn) {
     { label: 'Menu', key: 'Mapping_Menu', joy: 'Joy_Mapping_Menu' }
   ];
   var MAPPINGS_LS_KEY = 'n64wasm_mappings_v3';
-  function loadMappings() {
-    var m = Object.assign({}, MAPPING_DEFAULTS);
-    try { var saved = JSON.parse(localStorage.getItem(MAPPINGS_LS_KEY) || '{}'); for (var k in saved) { if (k in m) m[k] = saved[k]; } } catch (e) {}
+  // PER-GAME DEFAULT GAMEPAD SCHEMES. Joy_* values are indices into the browser's standard-mapping
+  // gamepad (Xbox layout: 0 bottom face, 1 right, 2 left, 3 top, 4 LB, 5 RB, 6 LT, 7 RT, 9 Start).
+  // The right stick already drives the C buttons (wkCompose, and the core's own stick read), so C
+  // buttons are only bound here where a face button is the better place for them.
+  // A game listed here keeps its OWN saved mapping (MAPPINGS_LS_KEY + ':' + file), so the global
+  // mapping a visitor saved for other games can never override its scheme.
+  var SMASH_PAD = { // Nintendo Switch Online N64 layout for Smash: ZL = Z (shield), L/R bumpers, top face = jump (C-Up)
+    Joy_Mapping_Action_A: 0, Joy_Mapping_Action_B: 2, Joy_Mapping_Action_Start: 9,
+    Joy_Mapping_Action_Z: 6, Joy_Mapping_Action_L: 4, Joy_Mapping_Action_R: 5, Joy_Mapping_Action_CUP: 3
+  };
+  var GAME_PADS = {
+    'Super Smash Bros. (USA).z64': SMASH_PAD,
+    'smashremix.z64': SMASH_PAD,
+    // GoldenEye as on the Xbox remake: RT fires (N64 Z), LT aims (N64 R), A = use/reload, bumper = L
+    'GoldenEye 007 (USA).z64': {
+      Joy_Mapping_Action_A: 0, Joy_Mapping_Action_B: 2, Joy_Mapping_Action_Start: 9,
+      Joy_Mapping_Action_Z: 7, Joy_Mapping_Action_R: 6, Joy_Mapping_Action_L: 4
+    }
+  };
+  function gameDefaults(file) { return Object.assign({}, MAPPING_DEFAULTS, GAME_PADS[file] || {}); }
+  function curRomFile() {
+    var sel = $('romSelect') || $('mobileRomSelect'), r = sel && ROMS[+sel.value];
+    return r ? r.file : '';
+  }
+  function mappingsKey(file) { return GAME_PADS[file] ? MAPPINGS_LS_KEY + ':' + file : MAPPINGS_LS_KEY; }
+  function loadMappings(file) {
+    if (file === undefined) file = curRomFile();
+    var m = gameDefaults(file);
+    try { var saved = JSON.parse(localStorage.getItem(mappingsKey(file)) || '{}'); for (var k in saved) { if (k in m) m[k] = saved[k]; } } catch (e) {}
     return m;
+  }
+  // Called at the top of loadRom, before the vendored script writes config.txt: the core and
+  // wkCompose both read this one KeyMappings object, so this is where the scheme takes effect.
+  function applyGamePad(file) {
+    try {
+      var km = window.myApp && window.myApp.rivetsData && window.myApp.rivetsData.inputController && window.myApp.rivetsData.inputController.KeyMappings;
+      if (!km) return;
+      var m = loadMappings(file);
+      for (var k in m) { if (k in km) km[k] = m[k]; }
+    } catch (e) {}
   }
   var remapState = null; // working copy while the panel is open
   var captureCancel = null;
@@ -3715,7 +3752,7 @@ N64Rate.selfTest = function (logFn) {
   function closeRemap() { stopCapture(); $('remapPanel').classList.remove('open'); }
   function saveRemap() {
     stopCapture();
-    localStorage.setItem(MAPPINGS_LS_KEY, JSON.stringify(remapState));
+    localStorage.setItem(mappingsKey(curRomFile()), JSON.stringify(remapState));
     // apply live where possible: pre-boot, config.txt picks these up at start
     if (window.myApp && window.myApp.rivetsData && window.myApp.rivetsData.inputController) {
       var km = window.myApp.rivetsData.inputController.KeyMappings;
@@ -3729,7 +3766,7 @@ N64Rate.selfTest = function (logFn) {
   $('mRemap').addEventListener('click', openRemap);
   $('remapClose').addEventListener('click', closeRemap);
   $('remapSave').addEventListener('click', saveRemap);
-  $('remapDefaults').addEventListener('click', function () { remapState = Object.assign({}, MAPPING_DEFAULTS); renderRemapRows(); });
+  $('remapDefaults').addEventListener('click', function () { remapState = gameDefaults(curRomFile()); renderRemapRows(); });
 
   // Xbox Edge: L3 triggers browser-back; trap it so it can't unload the page.
   // (Physical gamepads are read natively by the core via the emscripten HTML5
