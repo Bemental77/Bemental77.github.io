@@ -2591,6 +2591,12 @@ N64Rate.selfTest = function (logFn) {
         var ax = gp.axes || [];
         var x0 = (ax[0] || 0) * S | 0, y0 = (ax[1] || 0) * S | 0, x1 = (ax[2] || 0) * S | 0, y1 = (ax[3] || 0) * S | 0;
         if (rd.swapSticks) { var tx = x0, ty = y0; x0 = x1; y0 = y1; x1 = tx; y1 = ty; }
+        // dualHoney (GoldenEye in its default 1.1 Honey style, where the N64 stick is forward/back + TURN and the
+        // C buttons are sidestep + look): left stick = forward/back (N64 stick Y) + strafe (C-left/right), right
+        // stick = turn (N64 stick X, analog) + look (C-up/down). C-up LOOKS DOWN in that style (measured in the
+        // live game, 2026-10-29), so a right-stick push UP is sent as C-down. Needs no in-game setting, so it also
+        // holds in a room, where saves (and so the control style) are not loaded.
+        if (rd.dualHoney) { var lx = x0, ly = y0, rx = x1, ry = y1; x0 = rx; y0 = ly; x1 = lx; y1 = -ry; }
         a0 = x0; a1 = y0;
         if ((p === 1 && rd.invert2P) || (p === 2 && rd.invert3P) || (p === 3 && rd.invert4P)) a1 = -a1;
         if (x1 < -16000) m |= 1 << WK_BIT.cleft;
@@ -3663,8 +3669,9 @@ N64Rate.selfTest = function (logFn) {
     Joy_Mapping_Action_CUP: 3, Joy_Mapping_Action_CLEFT: 2
   };
   // GOLDENEYE, the twin-stick layout from Nintendo Wire's modern-controls guide: the game's control
-  // style must be 1.2 "Solitaire"; LEFT stick moves (the N64 C buttons), RIGHT stick looks (the N64
-  // stick) = swapSticks; ZR fires (N64 Z), ZL aims (N64 L).
+  // style was assumed to be 1.2 "Solitaire" with the sticks swapped; the live game actually starts in 1.1 Honey
+  // (and a room never loads the save that would hold another style), so GoldenEye uses GAME_DUAL below instead.
+  // ZR fires (N64 Z), ZL aims (N64 L).
   var GAME_PADS = {
     'Super Smash Bros. (USA).z64': SMASH_PAD,
     'smashremix.z64': SMASH_PAD,
@@ -3673,7 +3680,9 @@ N64Rate.selfTest = function (logFn) {
       Joy_Mapping_Action_Z: 7, Joy_Mapping_Action_L: 6, Joy_Mapping_Action_R: 5
     }
   };
-  var GAME_SWAP_STICKS = { 'GoldenEye 007 (USA).z64': true };
+  var GAME_SWAP_STICKS = {};
+  // Games whose sticks are composed by wkCompose's dualHoney branch (see there): modern twin-stick on the default style.
+  var GAME_DUAL = { 'GoldenEye 007 (USA).z64': true };
   var swapSticksUser = null;
   function gameDefaults(file) { return Object.assign({}, MAPPING_DEFAULTS, GAME_PADS[file] || {}); }
   function curRomFile() {
@@ -3698,6 +3707,7 @@ N64Rate.selfTest = function (logFn) {
       var rd = window.myApp.rivetsData;
       if (swapSticksUser === null) swapSticksUser = !!rd.swapSticks;
       rd.swapSticks = GAME_SWAP_STICKS[file] ? true : swapSticksUser;
+      rd.dualHoney = !!GAME_DUAL[file];
     } catch (e) {}
   }
   var remapState = null; // working copy while the panel is open
