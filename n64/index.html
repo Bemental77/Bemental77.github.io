@@ -30,7 +30,9 @@
        architecture on a page that has one. -->
   <script src="/lib/netplay.js?v=5a4e0d80"></script>
   <script src="/lib/mpgames.js"></script>
-  <script>MPGames.gateParty('n64', ['btnNet', 'mobileSplashNet'], ['romSelect', 'mobileRomSelect']);</script>
+  <!-- The Party button is NOT gated on the selected game any more (MPGames.gateParty used to disable it for a
+       single-player title): the lobby it opens handles that itself - Host is disabled with the reason, Join
+       still works - so a player on a solo game can still open it to join a friend. -->
   <script>
     // Same honest-failure contract as the sibling pages, with the spec that makes
     // this the PORTABILITY REFERENCE: Capability.SPECS.n64 requires only
@@ -248,6 +250,23 @@
                    background: #17324b; color: #dbe9f7; font-size: 12.5px; cursor: pointer; }
   #lsRoom button.sec { background: #1a1f27; border-color: #2a3340; color: #aab6c4; }
   #lsRoom button:disabled { opacity: .45; cursor: default; }
+  /* ---- the lobby: solo / host / join in one place ---- */
+  #lobby { position: fixed; inset: 0; z-index: 70; display: flex; align-items: center; justify-content: center;
+           background: rgba(0,0,0,.6); font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #dbe4ee; }
+  #lobby[hidden] { display: none; }
+  #lobby .lbCard { width: min(380px, calc(100vw - 32px)); background: #10141a; border: 1px solid #2a3340; border-radius: 12px;
+                   padding: 16px; box-shadow: 0 10px 40px rgba(0,0,0,.6); }
+  #lobby .lbHead { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; font-size: 16px; font-weight: 600; }
+  #lobby .lbGame { color: #9fe0a0; margin-bottom: 12px; }
+  #lobby .lbRow { display: flex; gap: 8px; margin-bottom: 10px; }
+  #lobby button { flex: 1; min-height: 44px; border-radius: 8px; border: 1px solid #35506b; background: #17324b; color: #dbe9f7; font-size: 14px; cursor: pointer; }
+  #lobby button.sec { background: #1a1f27; border-color: #2a3340; color: #aab6c4; flex: 0 0 44px; }
+  #lobby button:disabled { opacity: .45; cursor: default; }
+  #lobby .lbJoin { display: flex; gap: 8px; }
+  #lobby input { flex: 1; min-width: 0; min-height: 44px; border-radius: 8px; border: 1px solid #2a3340; background: #0b0e12; color: #dbe4ee;
+                 padding: 0 12px; font: 700 18px ui-monospace, Menlo, monospace; letter-spacing: 3px; text-transform: uppercase; }
+  #lobby .lbNote { color: #93a2b3; font-size: 12.5px; margin: 10px 0 0; min-height: 1.4em; }
+  #lobby .lbNote.bad { color: #ff9b9b; }
 </style>
   <!-- JAVASCRIPT OFF. Measured 2026-09-01: none of the three emulator pages had a
        <noscript> at all, so a visitor with JS disabled (blocked by an extension, or on
@@ -297,7 +316,31 @@
   <div id="lsMsg" class="lsMsg">Waiting for players…</div>
   <div class="lsBtns">
     <button id="lsCopy" type="button" class="sec">Copy code</button>
+    <button id="lsLink" type="button" class="sec">Copy link</button>
+  </div>
+  <div class="lsBtns" style="margin-top:7px">
+    <button id="lsSolo" type="button">Play solo</button>
     <button id="netLeave" type="button" class="sec">Leave</button>
+  </div>
+</div>
+<!-- THE LOBBY. One place to choose how to play the selected game: solo, host a party, or join one with a
+     code. It replaces the trip to /multiplayer.html (a second page with its own console and game pickers). It
+     opens from the Party button. Nothing here boots a core: every choice ends in the same page URL the old
+     lobby handed back, so the room contract (the room forms first, then the core boots from the same state)
+     is unchanged. -->
+<div id="lobby" hidden role="dialog" aria-modal="true" aria-labelledby="lbTitle">
+  <div class="lbCard">
+    <div class="lbHead"><span id="lbTitle">How do you want to play?</span><button id="lbClose" type="button" class="sec" aria-label="Close">×</button></div>
+    <div class="lbGame" id="lbGame"></div>
+    <div class="lbRow">
+      <button id="lbSolo" type="button">Play solo</button>
+      <button id="lbHost" type="button">Host a party</button>
+    </div>
+    <div class="lbJoin">
+      <input id="lbIn" maxlength="5" placeholder="CODE" autocapitalize="characters" autocomplete="off" spellcheck="false" aria-label="Party code">
+      <button id="lbJoin" type="button" disabled>Join</button>
+    </div>
+    <p class="lbNote" id="lbNote"></p>
   </div>
 </div>
 <!-- Shown ONLY by the <noscript> stylesheet in <head>; invisible whenever JS runs. -->
@@ -4626,6 +4669,76 @@ N64Rate.selfTest = function (logFn) {
     var np = (qs.get('np') || '').toUpperCase();
     var npGame = qs.get('game') || '';
     var isJoin = qs.get('join') === '1';
+    // ---- THE LOBBY: solo, host or join from one dialog ---------------------
+    // Every choice is a page URL, the same three shapes the old /multiplayer.html lobby handed back
+    // (a room's core must boot from the room's start state, so changing mode reloads the page; the game
+    // choice rides along so nothing is re-picked). The game is the HOST'S to name: a joiner's page
+    // follows the host's roster before it boots, so the game in a join link is only a starting point.
+    var lbEl = $('lobby');
+    var LB_CODE = /^[A-HJ-NP-Z2-9]{5}$/;
+    function lbPick() {
+      var sel = isMobile ? $('mobileRomSelect') : $('romSelect');
+      return ROMS[+(sel && sel.value) || 0] || ROMS[0];
+    }
+    function lbUrl(game, code, join) {
+      var u = code ? '/n64/?np=' + encodeURIComponent(code) + '&game=' + encodeURIComponent(game) + (join ? '&join=1' : '')
+                   : '/n64/?game=' + encodeURIComponent(game) + '&autostart';
+      if (netTransport() === 'local') u += '&net=local';
+      return u;
+    }
+    function lbNote(t, bad) { var n = $('lbNote'); if (n) { n.textContent = t || ''; n.className = 'lbNote' + (bad ? ' bad' : ''); } }
+    function lbOpen() {
+      if (!lbEl) return;
+      var pick = lbPick(), solo = !!(window.MPGames && MPGames.isSolo('n64', pick.label));
+      $('lbGame').textContent = pick.label;
+      $('lbHost').disabled = solo;
+      $('lbSolo').textContent = NET.pendingCode ? 'Play solo' : 'Keep playing solo';
+      lbNote(solo ? pick.label + " is a single-player game, so it has no party. You can still join a friend's party with their code."
+                  : (NET.pendingCode ? 'You are in party ' + NET.pendingCode + '. Choosing another way to play restarts the game.'
+                                     : 'Hosting or joining restarts the game so everyone starts together.'));
+      $('lbIn').value = ''; $('lbJoin').disabled = true;
+      lbEl.hidden = false;
+    }
+    function lbClose() { if (lbEl) lbEl.hidden = true; }
+    function lbGo(url) {
+      var s = NET.session; NET.leaving = true;
+      if (s) { try { s.close(); } catch (e) {} }
+      location.href = url;
+    }
+    window.__lobbyOpen = lbOpen;
+    if (lbEl) {
+      $('lbClose').addEventListener('click', lbClose);
+      lbEl.addEventListener('click', function (e) { if (e.target === lbEl) lbClose(); });
+      document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !lbEl.hidden) lbClose(); });
+      $('lbSolo').addEventListener('click', function () {
+        if (!NET.pendingCode) { lbClose(); return; }          // already solo: nothing to change
+        lbGo(lbUrl(lbPick().label, null, false));
+      });
+      $('lbHost').addEventListener('click', function () {
+        var pick = lbPick();
+        if (MPGames.isSolo('n64', pick.label)) return;
+        lbGo(lbUrl(pick.label, Netplay.makeCode(5, 'n64'), false));
+      });
+      var lbIn = $('lbIn');
+      lbIn.addEventListener('input', function () {
+        lbIn.value = lbIn.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+        $('lbJoin').disabled = !LB_CODE.test(lbIn.value);
+        lbNote('');
+      });
+      var lbJoin = function () {
+        var c = lbIn.value;
+        if (!LB_CODE.test(c)) { lbNote('A party code is five letters and numbers.', true); return; }
+        // A code names its console. A code from another console goes to the lobby that routes it.
+        var named = Netplay.consoleOfCode ? Netplay.consoleOfCode(c) : null;
+        if (named && named !== 'n64') { location.href = '/multiplayer.html?np=' + encodeURIComponent(c); return; }
+        var pick = lbPick();
+        var game = MPGames.isSolo('n64', pick.label) ? 'Super Smash Bros.' : pick.label;
+        lbGo(lbUrl(game, c, true));
+      };
+      $('lbJoin').addEventListener('click', lbJoin);
+      lbIn.addEventListener('keydown', function (e) { if (e.key === 'Enter') lbJoin(); });
+    }
+
     ['btnNet', 'mobileSplashNet'].forEach(function (id) {
       var b = $(id); if (!b) return;
       b.hidden = false;
@@ -4633,13 +4746,7 @@ N64Rate.selfTest = function (logFn) {
         // In a room the control OPENS the party panel; with no room it goes to
         // the lobby that mints a code. Same id, same button, live label.
         if (NET.pendingCode) { var r = $('lsRoom'); if (r) r.hidden = !r.hidden; return; }
-        var sel = isMobile ? $('mobileRomSelect') : $('romSelect');
-        var pick = ROMS[+(sel && sel.value) || 0] || ROMS[0];
-        // ONE URL for every console (commit ea6dd165). This used to send the
-        // player to /n64_multiplayer.html — a SECOND lobby, with its own
-        // catalogue to drift and its own copy of the flow. The one lobby takes
-        // the console and the game as ?sys=&game= and hands back to this page.
-        location.href = '/multiplayer.html?sys=n64&game=' + encodeURIComponent(pick.label);
+        lbOpen();
       });
     });
 
@@ -4938,6 +5045,17 @@ N64Rate.selfTest = function (logFn) {
 
     var hideBtn = $('lsHide');
     if (hideBtn) hideBtn.addEventListener('click', function () { var r = $('lsRoom'); if (r) r.hidden = true; });
+
+    var psolo = $('lsSolo');
+    if (psolo) psolo.addEventListener('click', function () { lbGo(lbUrl(lbPick().label, null, false)); });
+    var plink = $('lsLink');
+    if (plink) plink.addEventListener('click', function () {
+      var code = NET.pendingCode || '';
+      var url = location.origin + lbUrl(npGame || lbPick().label, code, true);
+      var done = function (t) { plink.textContent = t; setTimeout(function () { plink.textContent = 'Copy link'; }, 1500); };
+      try { navigator.clipboard.writeText(url).then(function () { done('Copied'); }, function () { done('Copy failed'); }); }
+      catch (e) { done('Copy failed'); }
+    });
 
     var leave = $('netLeave');
     if (leave) leave.addEventListener('click', function () {
