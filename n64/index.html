@@ -3663,8 +3663,8 @@ N64Rate.selfTest = function (logFn) {
     Joy_Mapping_Action_CUP: 3, Joy_Mapping_Action_CLEFT: 2
   };
   // GOLDENEYE, the twin-stick layout from Nintendo Wire's modern-controls guide: the game's control
-  // style must be 1.2 "Solitaire"; LEFT stick moves (the N64 C buttons), RIGHT stick looks (the N64
-  // stick) = swapSticks; ZR fires (N64 Z), ZL aims (N64 L).
+  // style must be 1.2 "Solitaire" was the first assumption and is superseded: see GAME_SWAP_STICKS below.
+  // ZR fires (N64 Z), ZL aims (N64 L).
   var GAME_PADS = {
     'Super Smash Bros. (USA).z64': SMASH_PAD,
     'smashremix.z64': SMASH_PAD,
@@ -3673,7 +3673,10 @@ N64Rate.selfTest = function (logFn) {
       Joy_Mapping_Action_Z: 7, Joy_Mapping_Action_L: 6, Joy_Mapping_Action_R: 5
     }
   };
-  var GAME_SWAP_STICKS = { 'GoldenEye 007 (USA).z64': true };
+  // NO game swaps the sticks. GoldenEye used to (swapSticks put the physical RIGHT stick on the N64 analog
+  // stick) and the right stick moved the player: the N64 analog stick is the movement control in the game as
+  // it ships, so the physical LEFT stick must be the N64 stick. Left stick = move, right stick = C buttons.
+  var GAME_SWAP_STICKS = {};
   var swapSticksUser = null;
   function gameDefaults(file) { return Object.assign({}, MAPPING_DEFAULTS, GAME_PADS[file] || {}); }
   function curRomFile() {
