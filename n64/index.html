@@ -2649,6 +2649,11 @@ N64Rate.selfTest = function (logFn) {
           var bi = km[WK_JOY[j][0]];
           if (bi != null && bi >= 0 && bt[bi] && bt[bi].pressed) m |= 1 << WK_BIT[WK_JOY[j][1]];
         }
+        // ZR held = the C-button modifier (Switch Online N64): A becomes C-right, B becomes C-down.
+        if (rd.zrC && bt[7] && bt[7].pressed) {
+          if (m & (1 << WK_BIT.a)) { m &= ~(1 << WK_BIT.a); m |= 1 << WK_BIT.cright; }
+          if (m & (1 << WK_BIT.b)) { m &= ~(1 << WK_BIT.b); m |= 1 << WK_BIT.cdown; }
+        }
         var ax = gp.axes || [];
         var x0 = (ax[0] || 0) * S | 0, y0 = (ax[1] || 0) * S | 0, x1 = (ax[2] || 0) * S | 0, y1 = (ax[3] || 0) * S | 0;
         if (rd.swapSticks) { var tx = x0, ty = y0; x0 = x1; y0 = y1; x1 = tx; y1 = ty; }
@@ -3725,9 +3730,15 @@ N64Rate.selfTest = function (logFn) {
   // SMASH: modern Switch layout (Ultimate-style positions). A attack = right face, B special = bottom
   // face, jump = top + left face (Smash 64 jumps on ANY C button), ZR = shield (N64 Z), RB = grab
   // (N64 R), LB = taunt (N64 L). The right stick stays on the C buttons, which is jump in this game.
+  // SMASH 64 ON A SWITCH PRO CONTROLLER, as Nintendo Switch Online lays out N64: N64 A and B are Switch A and B
+  // ("A and B on the N64 controller correspond to A and B on the Switch controllers", DBLTAP); C-up and C-left are
+  // X and Y, and C-right / C-down have no button of their own: hold ZR and press A / B (DBLTAP, iMore) - see
+  // GAME_ZRC and wkCompose. ZR is therefore the C modifier and no longer N64 Z; Z (shield) is ZL. That last point
+  // is not in the sources I could fetch (the one reply that says it, on GameFAQs, is informal); it follows from ZR
+  // being taken. The right stick also feeds the C buttons (Nintendo Life forum: "tilt the right stick up" for C-up).
   var SMASH_PAD = {
     Joy_Mapping_Action_A: 1, Joy_Mapping_Action_B: 0, Joy_Mapping_Action_Start: 9,
-    Joy_Mapping_Action_Z: 7, Joy_Mapping_Action_L: 4, Joy_Mapping_Action_R: 5,
+    Joy_Mapping_Action_Z: 6, Joy_Mapping_Action_L: 4, Joy_Mapping_Action_R: 5,
     Joy_Mapping_Action_CUP: 3, Joy_Mapping_Action_CLEFT: 2
   };
   // GOLDENEYE, the twin-stick layout from Nintendo Wire's modern-controls guide: the game's control
@@ -3745,7 +3756,10 @@ N64Rate.selfTest = function (logFn) {
   var GAME_SWAP_STICKS = {};
   // Games whose sticks are composed by wkCompose's dualHoney branch (see there): modern twin-stick on the default style.
   var GAME_DUAL = { 'GoldenEye 007 (USA).z64': true };
+  // Games where holding ZR turns A into C-right and B into C-down (the Switch Online N64 C-button scheme, above).
+  var GAME_ZRC = { 'Super Smash Bros. (USA).z64': true, 'smashremix.z64': true };
   var swapSticksUser = null;
+  window.__padTest = { compose: function () { wkCompose(); return WK.sent; }, apply: function (f) { return applyGamePad(f); } };   // for the headless input check
   function gameDefaults(file) { return Object.assign({}, MAPPING_DEFAULTS, GAME_PADS[file] || {}); }
   function curRomFile() {
     var sel = $('romSelect') || $('mobileRomSelect'), r = sel && ROMS[+sel.value];
@@ -3770,6 +3784,7 @@ N64Rate.selfTest = function (logFn) {
       if (swapSticksUser === null) swapSticksUser = !!rd.swapSticks;
       rd.swapSticks = GAME_SWAP_STICKS[file] ? true : swapSticksUser;
       rd.dualHoney = !!GAME_DUAL[file];
+      rd.zrC = !!GAME_ZRC[file];
     } catch (e) {}
   }
   var remapState = null; // working copy while the panel is open
