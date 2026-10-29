@@ -95,8 +95,17 @@
     var hit = null;
     if (name) for (var i = 0; i < FB_READ_ALWAYS.length; i++) if (name.indexOf(FB_READ_ALWAYS[i]) >= 0) { hit = FB_READ_ALWAYS[i]; break; }
     st.readAlways = !!hit;
+    // POKEMON SNAP RUNS THE EXACT READBACK. Snap judges a photo (and shows Oak the shots) from pixels it reads back out of
+    // RDRAM, so what lands there has to be what glide itself writes: synchronous, eager, full-window. The shortcuts below
+    // (one-call-late async copy, the lazy copy, the native-resolution sample) are exact against this core's old eager path
+    // only, and were priced on Mario Kart 64. Decided HERE, from the ROM header, because this runs in every realm that
+    // boots the title: an earlier cut put the switches in the page's query string and a worker that was created before
+    // that string changed kept deciding ASYNC (seen in a player's report). ?fbasync / ?fblazy / ?fbnative given by hand win.
+    st.exact = !!(name && name.indexOf('POKEMON SNAP') >= 0) && FB_FORCE == null;
+    st.lazy = st.exact ? false : (FB_Q.get('fblazy') !== '0');
     if (FB_FORCE === '1') { st.on = true; st.decided = 'forced on (?fbasync=1)'; }
     else if (FB_FORCE === '0') { st.on = false; st.decided = 'opted out (?fbasync=0)'; }
+    else if (st.exact) { st.on = false; st.decided = 'exact readback for Pokémon Snap (sync, eager, full-window)'; }
     else { st.on = !!hit; st.decided = hit ? 'read_always title (' + hit + ')' : 'off — glide does not read this title back every frame'; }
     return st.on;
   };

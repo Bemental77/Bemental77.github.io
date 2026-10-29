@@ -1702,7 +1702,7 @@ N64Rate.selfTest = function (logFn) {
 };
 </script>
 <script src="/n64/N64Wasm/dist/glcompat.js?v=ff72e6de"></script>
-<script src="/n64/N64Wasm/dist/fbasync.js?v=9265bbf0"></script>
+<script src="/n64/N64Wasm/dist/fbasync.js?v=7a0de006"></script>
 <script src="/n64/N64Wasm/dist/jit_params.js?v=bb2930f6"></script>
 <script src="/n64/N64Wasm/dist/room_core.js?v=555c9494"></script>
 <script>
@@ -2565,7 +2565,7 @@ N64Rate.selfTest = function (logFn) {
   // logged. If the worker fails while it boots (no WebGL2 there after all, a
   // core abort before "Starting R4300"), the page reloads ONCE with ?worker=0
   // (wkFallback) and says so in its log.
-  var WK_V = '7989501b';                           // cache-buster for the worker's scripts
+  var WK_V = 'ec1f1f1d';                           // cache-buster for the worker's scripts
   var WK_DEFAULT = true;                     // the default for a capable console (solo and rooms)
   var WK = { on: false, why: null, w: null, stat: null, statAt: 0, presents0: 0, pendingAudioPort: null,
              evals: {}, evalId: 0, sent: null, composed: 0, posted: 0, fatal: null, booted: false,
@@ -3396,30 +3396,6 @@ N64Rate.selfTest = function (logFn) {
       // boots, so glide's first readback already takes the chosen path.
       try {
         window.__fbDecide(bytes);
-        // POKEMON SNAP: THE EXACT READBACK, NOT THE FAST ONE. Snap judges a photo (and shows Oak the shots) from pixels it
-        // reads back out of RDRAM, so what lands there has to be what glide itself would write. The three shortcuts above
-        // (one-call-late asynchronous readback, the lazy copy, the native-resolution sample) are each documented as exact
-        // against THIS core's old eager path, which for Snap is not the same claim; they were priced on Mario Kart 64.
-        // Snap is single-player, so the shortcuts buy nothing a room needs. It runs the original path: synchronous, eager,
-        // full-window readback. The switches go in the query string because the core worker reads its flags from there.
-        // Any of ?fbasync / ?fblazy / ?fbnative given by hand still wins, and another game gets its defaults back.
-        try {
-          var snapQ = new URL(location.href), snapSet = false;
-          if (typeof curRomFile === 'function' && curRomFile() === 'pkmnsnap.z64') {
-            [['fbasync', '0'], ['fblazy', '0'], ['fbnative', '0']].forEach(function (kv) {
-              if (!snapQ.searchParams.has(kv[0])) { snapQ.searchParams.set(kv[0], kv[1]); window.__snapFb = (window.__snapFb || []).concat(kv[0]); snapSet = true; }
-            });
-            if (snapSet) history.replaceState(null, '', snapQ.pathname + snapQ.search + snapQ.hash);
-            var fq = new URLSearchParams(location.search);
-            if (fq.get('fbasync') === '0') { window.__fbAsync.on = false; window.__fbAsync.decided = 'exact readback for Pokémon Snap (sync, eager, full-window)'; }
-            window.__fbAsync.lazy = fq.get('fblazy') !== '0';
-          } else if (window.__snapFb && window.__snapFb.length) {
-            window.__snapFb.forEach(function (k) { snapQ.searchParams.delete(k); });
-            window.__snapFb = [];
-            history.replaceState(null, '', snapQ.pathname + snapQ.search + snapQ.hash);
-            window.__fbAsync.lazy = new URLSearchParams(location.search).get('fblazy') !== '0';
-          }
-        } catch (e) { pageLog('[fb] snap readback override failed: ' + ((e && e.message) || e)); }
         facts.fbasync = '[fb] ' + (window.__fbAsync.romName || '?') + ': readback ' + (window.__fbAsync.on ? 'ASYNC' : 'sync')
           + ' — ' + window.__fbAsync.decided;
         pageLog(facts.fbasync);

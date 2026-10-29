@@ -1727,6 +1727,7 @@ function boot(d) {
           }
           if (!roomArmed) M._neil_ls_arm(1);
           var fbn = new URLSearchParams(d.search || '').get('fbnative');
+          if (fbn == null && self.__fbAsync && self.__fbAsync.exact) fbn = '0';   // Pokémon Snap: the full-window readback (fbasync.js __fbDecide)
           if (fbn != null && typeof M._neil_set_native_fbread === 'function') M._neil_set_native_fbread(fbn === '0' ? 0 : 1);
           // `window` is defined only now, after the runtime decided it is a worker:
           // the JIT up-call (recomp.c) and the emitter both spell it `window.`.
