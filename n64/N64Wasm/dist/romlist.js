@@ -60,4 +60,6 @@ var ROMLIST = [
   {url:ROM_BASE+"banjoChristmas.z64",title:"Banjo-Kazooie: Christmas Edition"},
   {url:ROM_BASE+"starfoxsurvival.z64",title:"Star Fox: Survival"},
   {url:ROM_BASE+"marioo.z64",title:"Super Mario Odyssey 64 (hack)"},
+  {url:ROM_BASE+"GoldenEye 007 (USA).z64",title:"GoldenEye 007"},
+  {url:ROM_BASE+"smashremix.z64",title:"Smash Remix 1.0.1"},
 ];
