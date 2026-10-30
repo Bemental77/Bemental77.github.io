@@ -1612,8 +1612,10 @@ bool neil_export_fla()
     return true;
 }
 
+extern void gauntlet_hud_reset(void);
 bool neil_unserialize()
 {
+    gauntlet_hud_reset();
     printf("load state\n");
     lfb_drop_all();          /* RDRAM is about to be replaced */
     gzFile fi = gzopen("savestate.gz", "rb");

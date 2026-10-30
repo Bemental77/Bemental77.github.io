@@ -196,6 +196,7 @@ typedef struct
    int buff_clear;
    int swapmode;
    bool swapmode_retro;
+   bool gauntlet_hud;   /* Gauntlet Legends: see glide64_rdp.c GAUNTLET HUD FRAMES */
    int lodmode;
    int aspectmode;
 

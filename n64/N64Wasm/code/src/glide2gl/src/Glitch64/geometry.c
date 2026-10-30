@@ -1,3 +1,6 @@
+/* Gauntlet Legends HUD frames (Glide64/glide64_rdp.c): draws submitted, and a switch that submits them to nobody */
+unsigned g_gl_draws = 0;
+int g_gl_mute = 0;
 /*
 * Glide64 - Glide video plugin for Nintendo 64 emulators.
 * Copyright (c) 2002  Dave2001
@@ -193,12 +196,12 @@ static void vbo_draw_prim(GLenum prim)
          else
             glBufferSubData(GL_ARRAY_BUFFER, 0, vbuf_length * sizeof(VBufVertex), vbuf_data);
 
-         glDrawArrays(prim, 0, vbuf_length);
+         { if (!g_gl_mute) glDrawArrays(prim, 0, vbuf_length); }
          glBindBuffer(GL_ARRAY_BUFFER, 0);
       }
       else
       {
-         glDrawArrays(prim, 0, vbuf_length); //NEIL - this is literally where it draws everything
+         { if (!g_gl_mute) glDrawArrays(prim, 0, vbuf_length); } //NEIL - this is literally where it draws everything
       }
    }
 
@@ -358,6 +361,7 @@ void grDepthBiasLevel( int32_t level )
 
 void grDrawVertexArrayContiguous(uint32_t mode, uint32_t count, void *pointers)
 {
+   g_gl_draws++;
    if(need_to_compile)
       compile_shader();
 

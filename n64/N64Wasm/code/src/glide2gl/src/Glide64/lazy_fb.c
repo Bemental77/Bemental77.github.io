@@ -307,8 +307,10 @@ void neil_gl_state_save(uint8_t *dst)
    /* the toast stays the LAST int of the image: n64_rollback_probe --pics reads it there */
    memcpy(dst, neil_toast_counter_ptr(), sizeof(int));
 }
+extern void gauntlet_hud_reset(void);
 void neil_gl_state_load(const uint8_t *src)
 {
+   gauntlet_hud_reset();
    /* rdp.tex_ctr is an EPOCH, not state: a vertex's UVs are reused while its stamp equals it
     * (glide64_util.c uv_calculated), so it only ever grows — put back, an old value could equal a
     * stamp left by the fields being re-run. */

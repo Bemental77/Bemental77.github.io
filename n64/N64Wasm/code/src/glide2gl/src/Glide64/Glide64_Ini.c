@@ -107,6 +107,7 @@ void ReadSpecialSettings (const char * name)
    }
 
    settings.hacks = 0;
+   settings.gauntlet_hud = false;
 
    // We might want to detect some games by ucode crc, so set
    // up uc_crc here
@@ -727,6 +728,9 @@ void ReadSpecialSettings (const char * name)
    {
       //depthmode = 1
       settings.swapmode = 2;
+      /* no clear after the swap: the game's HUD frames must not wipe the picture (glide64_rdp.c GAUNTLET HUD FRAMES) */
+      settings.buff_clear = 0;
+      settings.gauntlet_hud = true;
    }
    else if (strstr(name, (const char*)"Getter Love!!"))
    {

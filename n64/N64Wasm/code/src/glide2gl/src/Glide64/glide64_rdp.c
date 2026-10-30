@@ -1331,8 +1331,70 @@ static void RestoreScale(void)
    g_gdp.flags       |= UPDATE_VIEWPORT | UPDATE_SCISSOR;
 }
 
+/* ---- GAUNTLET HUD FRAMES (settings.gauntlet_hud) ------------------------------------------
+ * Gauntlet Legends interleaves two kinds of display list, both ending in the same window here:
+ *   scene frame: [SetColorImage aux -> swap] [Z image] [main image] <the scene's draws>
+ *   HUD frame:   [SetColorImage aux -> swap] <a few draws under the aux image> [Z image] [main
+ *                image] <tens of draws laid out in the top-left corner: the game rendering a small
+ *                texture (HUD / portrait pieces) into the idle frame buffer>
+ * On the console a HUD frame draws into the buffer that is not being shown, so the picture on
+ * screen does not change. Glide64 has one window, so that frame's clear and draws replaced the
+ * picture with a black screen holding a few coloured fragments, once every ~17 fields: the
+ * flicker. (fb emulation is software-only in this build and does not give the game its texture
+ * back, so the HUD itself stays missing, as Glide64's known-issues list says.)
+ * A HUD frame is recognised the one way that is certain before its main pass: it submits more than
+ * one draw between the swap and the next SetColorImage, where a scene frame submits exactly one
+ * (a full-window quad). MEASURED here (hub, cold boot): scene frames 1, HUD frames 5. Everything
+ * such a frame draws is discarded (g_gl_mute, geometry.c) until the next swap, so the window keeps
+ * the picture the swap just presented. Draws held between the swap and that decision are dropped
+ * either way (a scene frame's one quad only repeats what its own full-window fill does next).
+ * More than GAUNT_MAXRUN HUD-looking frames in a row (some other part of the game) are drawn
+ * normally instead of blanking the game. */
+#define GAUNT_MAXRUN 4
+extern unsigned g_gl_draws;
+extern int g_gl_mute;
+extern void vbo_merge_flush(void);
+extern void gauntlet_hud_clear(void);
+static int  gaunt_armed = 0, gaunt_run = 0;
+static unsigned gaunt_draws0 = 0;
+
+void gauntlet_hud_armed_at_swap(void)
+{
+   if (!settings.gauntlet_hud)
+      return;
+   vbo_merge_flush();   /* triangles still held back belong to the frame that just ended */
+   gaunt_armed  = 1;
+   gaunt_draws0 = g_gl_draws;
+   g_gl_mute    = 1;     /* anything drawn before the next SetColorImage is undecided: hold it */
+}
+
+void gauntlet_hud_reset(void)
+{
+   gaunt_armed = 0;
+   gaunt_run   = 0;
+   g_gl_mute   = 0;
+}
+
+static void gauntlet_hud_color_image(void)
+{
+   if (!settings.gauntlet_hud || !gaunt_armed)
+      return;
+   gaunt_armed = 0;
+   if (g_gl_draws - gaunt_draws0 > 1 && gaunt_run < GAUNT_MAXRUN)
+   {
+      gaunt_run++;      /* a HUD frame: keep discarding until the next swap */
+   }
+   else
+   {
+      gaunt_run = (g_gl_draws - gaunt_draws0 > 1) ? gaunt_run + 1 : 0;
+      g_gl_mute = 0;
+      gauntlet_hud_clear();   /* a frame that is drawn gets the clear it always had */
+   }
+}
+
 static void rdp_setcolorimage(uint32_t w0, uint32_t w1)
 {
+   gauntlet_hud_color_image();
    gdp_set_color_image(w0, w1);
 
    if (fb_emulation_enabled && (rdp.num_of_ci < NUMTEXBUF))

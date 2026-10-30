@@ -679,10 +679,22 @@ void glide_set_filtering(unsigned value)
 	}
 }
 
+extern void gauntlet_hud_armed_at_swap(void);
+
+/* the clear newSwapBuffers makes when settings.buff_clear is on, made late for Gauntlet Legends: only a frame that is drawn gets it */
+void gauntlet_hud_clear(void)
+{
+   g_gdp.flags |= UPDATE_SCISSOR;
+   grClipWindow (0, 0, settings.scr_res_x, settings.scr_res_y);
+   grDepthMask (FXTRUE);
+   grBufferClear (0, 0, 0xFFFF);
+}
+
 void newSwapBuffers(void)
 {
    if (!rdp.updatescreen)
       return;
+   gauntlet_hud_armed_at_swap();
 
    rdp.updatescreen = 0;
 
