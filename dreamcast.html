@@ -5806,6 +5806,13 @@
   const STALL_MS = 12000;         // generous: a savestate restore can pause frames
   const NEVER_STARTED_MS = 60000; // booted, disc loaded, and still no frame ever
   let stallState = '';
+  // Where NEVER_STARTED_MS is measured from. It used to be T0 (page load), which
+  // counts the disc DOWNLOAD against the core: Quake III's sixteen CDDA tracks
+  // (~440 MB eager) push boot past 60 s of page age on a normal connection, and
+  // a core that was about to draw its first frame was called dead (live
+  // 2026-10-29: banner "has never produced a single frame" over a title screen
+  // at 60 fps). rebaseStallClocks() moves it to boot completion.
+  let stallEpoch = T0;
   // Kept SEPARATE from stallState on purpose. A legitimate lockstep hold is not
   // a stall that later "recovers", and folding it into stallState would make
   // the release log claim the page recovered from a fault that never happened.
@@ -5813,6 +5820,7 @@
   function rebaseStallClocks() {
     const now = Date.now();
     lastTelemetryAt = lastCallsAt = lastDistinctAt = now;
+    stallEpoch = now;
     // The pre-boot watchdog measures the same kind of silence and is fooled the
     // same way: iOS suspends a backgrounded tab's fetches, so time spent hidden
     // must not count as a stalled download.
@@ -5916,7 +5924,7 @@
     if (!framesEverFlowed) {
       if (lastTelemetryAt && now - lastTelemetryAt > STALL_MS) {
         state = 'telemetry'; why = 'the emulator worker stopped reporting entirely';
-      } else if (now - T0 > NEVER_STARTED_MS) {
+      } else if (now - stallEpoch > NEVER_STARTED_MS) {
         state = 'no-first-frame'; why = 'the disc loaded but the emulator has never produced a single frame';
       }
     } else if (lastTelemetryAt && now - lastTelemetryAt > STALL_MS) {
@@ -5972,6 +5980,8 @@
     } else if (stallState) {
       pageLog('[stall] recovered from "' + stallState + '" at +' + ((now - T0) / 1000).toFixed(1) + 's');
       stallState = '';
+      // The status line carried the stall text; put it back, or it outlives the recovery.
+      if (statusEl && /^The (emulator has stopped|picture is not changing)/.test(statusEl.textContent)) setStatus('Running.');
       const bar = document.getElementById('alertBar');
       // Only clear the banner if a stall is what put it there — a lost GPU
       // context does not recover and its notice must not be wiped by this.
