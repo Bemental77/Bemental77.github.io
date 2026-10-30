@@ -578,6 +578,7 @@
       <option value="sa2">Sonic Adventure 2 (USA)</option>
       <option value="gauntlet">Gauntlet Legends (USA)</option>
       <option value="mvc2">Marvel vs. Capcom 2 (USA)</option>
+      <option value="quake3">Quake III Arena (USA)</option>
     </select>
     <button id="btnStart">Start</button>
     <button id="btnReset" disabled>Reset</button>
@@ -2260,6 +2261,27 @@
         { name: 'Track5.bin', bytes: 696634176, index: 'Track5.bin.bgzi.json',
           parts: ['aa','ab','ac','ad','ae','af','ag'].map(s => 'Track5.bin.part' + s + '.bgz') },
         { name: 'GauntletLegends.cue' },
+      ],
+    },
+    // Quake III Arena: a 20-track GD-ROM. Track3 (460,194,672 B, 5 parts) and
+    // Track20 (263,459,280 B, 3 parts) are the two data tracks and ship as .bgz
+    // with block indexes; Track1/2 and the sixteen CDDA tracks 4-19 ship whole,
+    // exactly as gauntlet's Track4 does. productId is the disc's own IP.BIN
+    // (+0x40 of Track3 user data): "MK-51061".
+    quake3: {
+      name: 'Quake III Arena (USA)',
+      base: window.ASSET_BASE + '/dreamcast/discs/quake3/',
+      cue:  'QuakeIII.cue',
+      productId: 'MK-51061',
+      files: [
+        { name: 'Track1.bin' },
+        { name: 'Track2.bin' },
+        { name: 'Track3.bin', bytes: 460194672, index: 'Track3.bin.bgzi.json',
+          parts: ['aa','ab','ac','ad','ae'].map(s => 'Track3.bin.part' + s + '.bgz') },
+        ...[4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19].map(n => ({ name: 'Track' + n + '.bin' })),
+        { name: 'Track20.bin', bytes: 263459280, index: 'Track20.bin.bgzi.json',
+          parts: ['aa','ab','ac'].map(s => 'Track20.bin.part' + s + '.bgz') },
+        { name: 'QuakeIII.cue' },
       ],
     },
     // A .cdi is ONE file, not a cue plus tracks — `cue` here is really "the disc
