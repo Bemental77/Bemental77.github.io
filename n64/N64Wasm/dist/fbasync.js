@@ -103,6 +103,9 @@
     // that string changed kept deciding ASYNC (seen in a player's report). ?fbasync / ?fblazy / ?fbnative given by hand win.
     st.exact = !!(name && name.indexOf('POKEMON SNAP') >= 0) && FB_FORCE == null;
     st.lazy = st.exact ? false : (FB_Q.get('fblazy') !== '0');
+    // THE SNAP DETECTOR (see "SNAP DETECTOR" below): keyed on the ROM header name; ?snapdet=0 is the A/B arm and kill switch.
+    st.snapDet = !!(name && name.indexOf('POKEMON SNAP') >= 0) && FB_Q.get('snapdet') !== '0';
+    if (st.snapDet && st.snapInstall) st.snapInstall();
     if (FB_FORCE === '1') { st.on = true; st.decided = 'forced on (?fbasync=1)'; }
     else if (FB_FORCE === '0') { st.on = false; st.decided = 'opted out (?fbasync=0)'; }
     else if (st.exact) { st.on = false; st.decided = 'exact readback for Pokémon Snap (sync, eager, full-window)'; }
@@ -178,6 +181,7 @@
       // waited for the frame it had just drawn — the one-call offset bought
       // nothing. The bytes the core receives are identical either way.
       st.prefetch = function () {
+        if (st.snapDet) { snapK = 0; snapS.lists++; }       // a display list starts (glide64_rdp.c ProcessDList): the SNAP DETECTOR's copy index restarts
         if (!st.on || !FB_PREFETCH) return;
         for (var c = 0; c < ctxs.length; c++) {
           var p = ctxs[c].__fb.pending;
@@ -239,9 +243,73 @@
         for (var i = from; i < from + bytes; i += 61) hsh = Math.imul(hsh ^ u8[i], 16777619) >>> 0;
         if (st.seq.length < 40000) st.seq.push([st.calls, hsh, mode, blocked ? 1 : 0]);
       };
+      // ---- SNAP DETECTOR ----------------------------------------------------------------------------------------
+      // Pokémon Snap decides "is a Pokémon in the middle of the picture" by looking at the framebuffer through the RDP
+      // (ethteck/pokemonsnap src/app_level/pokemon_detect.c). Before the first Pokémon of a frame is drawn, and after each
+      // one, PokemonDetector_SaveRegion loads the 8x8 tile x 156..163, y 116..123 of the colour image (0x0F000000) and
+      // TextureRectangles it, in COPY mode, into a colour image of its own (width 8, PokemonDetector_Regions[k]). The CPU
+      // then compares Regions[k-1] with Regions[k] (FindPokemonInFocus): 32 of 64 pixels different = this Pokémon is in
+      // focus. In-focus is what makes a Pokémon count for a photo and what moves its behaviour on (pokemon.c sTimerInFocus).
+      // Glide64 has no render targets here (no frame-buffer emulation for this title: only read_always), so that copy was
+      // (a) loaded from RDRAM, i.e. the PREVIOUS frame, (b) drawn into the top-left 16x16 of the real window — the stray
+      // block every frame — and (c) NEVER WRITTEN TO RDRAM: Regions[] stayed all zeros (measured on a player's state), the
+      // comparison always read 0 different pixels, and nothing was ever in focus.
+      // Here the copy is done as the RDP does it: when the core draws that quad (a 4-vertex strip under the N64 scissor
+      // 0,0,32,32), the draw is not made; the window pixels the N64 tile maps to are read NOW — after every draw queued so
+      // far, the same instant the RDP reads its tile — packed exactly as CopyFrameBuffer packs a read-back pixel
+      // (565 -> 5551), and stored as the RDP stores a 16-bit texel copy (halfword index ^ 1) into Regions[k], k = this
+      // list's k-th copy. Regions[] are found through the table at 0x803AE578 (the US 1.0 cartridge; the pointers are
+      // validated, so another build finds a table that does not validate and nothing is touched).
+      var SNAP_TBL = 0x3AE578, snapK = 0, snapS = st.snapStats = { lists: 0, copies: 0, badTable: 0, noRdram: 0, over: 0, log: [] };
+      var px = new Uint8Array(16 * 16 * 4);
+      var hookSnap = function (P) {
+        var nread = P.__fbNativeRead || P.readPixels, nscissor = P.scissor, ndraw = P.drawArrays;
+        if (typeof nread !== 'function' || typeof nscissor !== 'function' || typeof ndraw !== 'function') return;
+        P.scissor = function (x, y, w, h) { this.__sx = x; this.__sy = y; this.__sw = w; this.__sh = h; return nscissor.apply(this, arguments); };
+        P.drawArrays = function (mode, first, count) {
+          var gl = this;
+          if (mode === 5 && count === 4 && gl.__sw > 0) {
+            var W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
+            var sw = Math.round(W * 32 / 320), sh = Math.round(H * 32 / 240);
+            if (gl.__sx === 0 && gl.__sw === sw && gl.__sh === sh && gl.__sy === H - sh && snapCopy(gl, nread, W, H)) return;
+          }
+          return ndraw.apply(gl, arguments);
+        };
+      };
+      // wrapped only when the title is Pokémon Snap (__fbDecide): every other title's GL calls are untouched
+      var snapInstalled = false;
+      st.snapInstall = function () {
+        if (snapInstalled) return; snapInstalled = true;
+        if (G.WebGL2RenderingContext) hookSnap(G.WebGL2RenderingContext.prototype);
+        if (G.WebGLRenderingContext) hookSnap(G.WebGLRenderingContext.prototype);
+      };
+      var snapCopy = function (gl, nread, W, H) {
+        var M = G.Module, cp = G.__n64CorePtrs;
+        if (!M || !M.HEAPU32 || !cp || !cp.dramBase) { snapS.noRdram++; return false; }
+        var u32 = M.HEAPU32, u16 = M.HEAPU16, base = cp.dramBase >>> 0;
+        if (snapK >= 20) { snapS.over++; return false; }
+        var p = u32[(base + SNAP_TBL + 4 * snapK) >>> 2] >>> 0;
+        if (p < 0x80000000 || p > 0x807FFF80 || (p & 3)) { snapS.badTable++; return false; }
+        // the window pixel each N64 pixel takes: CopyFrameBuffer's (int)(x * scale + offset), scale = window / N64 size
+        var xMin = Math.floor(156 * W / 320), xMax = Math.floor(163 * W / 320);
+        var tMin = Math.floor(116 * H / 240), tMax = Math.floor(123 * H / 240);
+        var gMin = H - 1 - tMax, gh = tMax - tMin + 1, rw = xMax - xMin + 1;
+        if (rw * gh * 4 > px.length) return false;
+        nread.call(gl, xMin, gMin, rw, gh, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        var a = ((base + (p & 0x7FFFFF)) >>> 1);
+        for (var j = 0; j < 8; j++) for (var i = 0; i < 8; i++) {
+          var o = ((H - 1 - Math.floor((116 + j) * H / 240) - gMin) * rw + (Math.floor((156 + i) * W / 320) - xMin)) * 4;
+          var c = ((px[o] >> 3) << 11) | ((px[o + 1] >> 2) << 5) | (px[o + 2] >> 3);
+          c = (c & 0xFFC0) | ((c & 0x001F) << 1) | 1;
+          u16[a + ((i + j * 8) ^ 1)] = c;
+        }
+        snapK++; snapS.copies++;
+        return true;
+      };
       var hookRead = function (P) {
       var orig = P.readPixels;
       if (typeof orig !== 'function') return;
+      P.__fbNativeRead = orig;                              // the SNAP DETECTOR's own 8x8 read goes round the hand-over below
       P.readPixels = function (x, y, w, h, format, type, dst, dstIndex) {
         var gl = this, w1 = isW1(gl);
         if (!st.on && !st.seq) return orig.apply(gl, arguments);

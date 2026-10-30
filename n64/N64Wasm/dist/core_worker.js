@@ -573,10 +573,12 @@ function fsWrap() { self.__n64GLProtos(self).forEach(fsWrapP); }
 function fsWrapP(P) {
   var FB = P.FRAMEBUFFER, DFB = P.DRAW_FRAMEBUFFER, bf = P.bindFramebuffer;
   P.bindFramebuffer = function (t, fb) { if (t === FB || t === DFB) this.__fsFb = fb || null; return bf.apply(this, arguments); };
+  { var vp0 = P.viewport, sc0 = P.scissor; P.viewport = function (a, b, c, d) { this.__vp = a + ',' + b + ',' + c + ',' + d; return vp0.apply(this, arguments); }; P.scissor = function (a, b, c, d) { this.__sc = a + ',' + b + ',' + c + ',' + d; return sc0.apply(this, arguments); }; }
   ['drawArrays', 'drawElements', 'drawRangeElements', 'drawArraysInstanced', 'drawElementsInstanced',
    'clear', 'clearBufferfv', 'clearBufferiv', 'clearBufferuiv', 'clearBufferfi', 'blitFramebuffer'].forEach(function (n) {
     var f = P[n]; if (typeof f !== 'function') return;
     P[n] = function () {
+      if (self.__fcap) { var k = /^clear/.test(n) ? 'c' : n === 'blitFramebuffer' ? 'b' : 'd'; FCN[(this.__fsFb ? 'o' : 'w') + k]++; if (!this.__fsFb) { var kk = k + ' vp' + this.__vp + ' sc' + this.__sc; FCS[kk] = (FCS[kk] || 0) + 1; } }
       if (this.__fsFb) return f.apply(this, arguments);            // an offscreen target: never skipped
       if (FSK.skipping) { FSK.swNow++; return; }
       FSK.drewNow = true; FSK.tickAny = true; FSK.tickDrew = true;
@@ -808,6 +810,15 @@ function fsDropAll() { while (FSK.snaps.length) fsDrop(0); FSK.stale = false; }
 // 19-23 pictures, the oldest 4-6 s outstanding — 4-6 s of picture lag, and the reservoir that a
 // later GL call blocks on. Past GQ.max pictures every field that can skip, skips.
 function fsExpect() { return (FSK.hist & 2) !== 0 || FSK.fq.length > GQ.max; }
+var FCS = {};
+var FCN = { wc: 0, wd: 0, wb: 0, oc: 0, od: 0, ob: 0 };
+var FCAP = { W: 320, H: 240, bc: null, cv: null, ctx: null };
+function fcapField(s, skip) { try {
+  if (!FCAP.bc) { FCAP.bc = new BroadcastChannel('fcap'); FCAP.cv = new OffscreenCanvas(FCAP.W, FCAP.H); FCAP.ctx = FCAP.cv.getContext('2d', { willReadFrequently: true }); }
+  FCAP.ctx.drawImage(BOOT.canvas, 0, 0, FCAP.W, FCAP.H); var im = FCAP.ctx.getImageData(0, 0, FCAP.W, FCAP.H).data;
+  FCAP.bc.postMessage({ n: JSON.stringify(FCN) + JSON.stringify(FCS), s: s, skip: skip, drew: FSK.drewNow, sw: FSK.swNow, px: im.buffer });
+FCS = {}; FCN.wc = FCN.wd = FCN.wb = FCN.oc = FCN.od = FCN.ob = 0;
+} catch (e) { if (!FCAP.err) { FCAP.err = 1; log("[fcap] err " + e); } } }
 function fsField() {
   var s = ++FSK.serial, ready = fsCoreReady(), now = performance.now();
   FSK.fields++;
@@ -827,6 +838,7 @@ function fsField() {
   if (ready) M._neil_fs_set(skip ? 1 : 0, s);
   try { M._neil_ls_run_frame(); }
   finally { FSK.skipping = false; if (ready) M._neil_fs_set(0, s); }
+  if (self.__fcap) fcapField(s, skip);
   var sw = FSK.swNow;
   if (skip) { FSK.skipped++; if (sw) { FSK.stale = true; FSK.staleS = s; FSK.staleIdle = 0; } else { FSK.skipNoDraw++; if (FSK.stale) FSK.staleIdle++; } }
   else if (FSK.drewNow) { FSK.stale = false; FSK.staleIdle = 0; }
@@ -1626,6 +1638,7 @@ function boot(d) {
   BOOT = d;
   // ?workerrig=clock: the rig seam (eval) with the frame clock RUNNING as shipped — a
   // measurement of what a player gets, driven by a pad function (applyPads)
+  self.__fcap = !!new URLSearchParams(d.search || '').get('fcap'); if (new URLSearchParams(d.search || '').get('fcap') === '2') { FCAP.W = 640; FCAP.H = 480; }
   BOOT.rigClock = new URLSearchParams(d.search || '').get('workerrig') === 'clock';
   var rq = new URLSearchParams(d.search || '').get('repay'); if (rq != null && rq !== '' && +rq >= 0) REPAY.capMs = +rq;
   if (new URLSearchParams(d.search || '').get('pacecap') === '0') PACECAP.on = false;
@@ -1690,6 +1703,9 @@ function boot(d) {
     self.__fbDecide(rom);
     log('[fb] ' + (self.__fbAsync.romName || '?') + ': readback ' + (self.__fbAsync.on ? 'ASYNC' : 'sync') + ' — ' + self.__fbAsync.decided + ' (core worker)');
   } catch (e) { log('[fb] readback decision failed: ' + e); }
+  // Pokémon Snap's detector copy (fbasync.js SNAP DETECTOR) is made when the core draws it, from the window as it is then;
+  // a field whose draws are skipped (FRAME SKIP) would leave the previous field's copy in RDRAM for the game to compare.
+  if (self.__fbAsync.snapDet && FSK.on) { FSK.on = false; FSK.why = 'off: Pokémon Snap reads its detector copy from the window the field draws (fbasync.js SNAP DETECTOR)'; log('[fskip] ' + FSK.why); }
   var shaderList = shdLoad(d);
   fetch('assets.zip').then(function (r) {
     if (!r.ok) throw new Error('assets.zip HTTP ' + r.status);
