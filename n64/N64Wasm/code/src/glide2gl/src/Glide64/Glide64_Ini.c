@@ -108,6 +108,7 @@ void ReadSpecialSettings (const char * name)
 
    settings.hacks = 0;
    settings.gauntlet_hud = false;
+   settings.snap_depth = false;
 
    // We might want to detect some games by ucode crc, so set
    // up uc_crc here
@@ -1149,6 +1150,7 @@ void ReadSpecialSettings (const char * name)
    }
    else if (strstr(name, (const char*)"POKEMON SNAP"))
    {
+      settings.snap_depth = true;
       //depthmode = 1
 #ifdef HAVE_HWFBE
       hires = 0;

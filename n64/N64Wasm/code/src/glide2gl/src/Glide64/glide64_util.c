@@ -1274,6 +1274,7 @@ void update(void)
    update_scissor(set_scissor);
 }
 
+extern int g_snap_score;
 static void draw_tri_depth(VERTEX **vtx)
 {
    float X0 = vtx[0]->sx / rdp.scale_x;
@@ -1530,7 +1531,7 @@ void cull_trianglefaces(VERTEX **v, unsigned iterations, bool do_update, bool do
             continue;
 
       deltaZ = dzdx = 0;
-      if (wd == 0 && (fb_depth_render_enabled || (rdp.rm & ZMODE_DECAL) == ZMODE_DECAL))
+      if (wd == 0 && (fb_depth_render_enabled || g_snap_score || (rdp.rm & ZMODE_DECAL) == ZMODE_DECAL))
          draw_tri_depth(v + vcount);
       draw_tri (v + vcount, wd);
    }

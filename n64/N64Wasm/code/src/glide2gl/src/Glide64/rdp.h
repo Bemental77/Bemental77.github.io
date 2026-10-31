@@ -197,6 +197,7 @@ typedef struct
    int swapmode;
    bool swapmode_retro;
    bool gauntlet_hud;   /* Gauntlet Legends: see glide64_rdp.c GAUNTLET HUD FRAMES */
+   bool snap_depth;     /* Pokemon Snap: the photo scorer's 64x48 depth passes are rendered into RDRAM (Framebuffer_glide64.c SNAP PHOTO SCORE) */
    int lodmode;
    int aspectmode;
 

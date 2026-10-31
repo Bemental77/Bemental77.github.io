@@ -1195,14 +1195,75 @@ float ScaleZ(float z)
    return z;
 }
 
+/* ---- SNAP PHOTO SCORE (settings.snap_depth) -----------------------------------------------
+ * Pokemon Snap scores a photo by RENDERING each Pokemon again, on the RDP, into 64x48 16-bit depth images in RDRAM
+ * (ethteck/pokemonsnap src/app_render/score.c, func_800A007C / score_Render), then counting pixels with the CPU:
+ *   CurrentZ, PokemonZ[0..11], ZBeforeThis[0..11]   - 25 contiguous 0x1800-byte images, CurrentZ first;
+ *   a setup list clears CurrentZ + PokemonZ[] to 0xFFFC with a FILL rectangle (colour image = CurrentZ, 64 wide, 64x624);
+ *   per Pokemon: ZBeforeThis[i] = CurrentZ (a COPY-mode texture rectangle), depth image = PokemonZ[i], draw the Pokemon,
+ *   depth image = CurrentZ, draw the Pokemon again.  A Pokemon pixel is PokemonZ[i][p] != 0xFFFC; it is in front when
+ *   PokemonZ[i][p] == CurrentZ[p] and ZBeforeThis[i][p] != CurrentZ[p].
+ * Glide64 has no render targets here, so none of that reached RDRAM: every pixel count was 0, no photo ever had a Pokemon in it
+ * ("pokemonInFocus == 0", photo id 9999) and Oak's Mark had nothing to offer. Here the passes are done: the clear and the
+ * ZBeforeThis copy are made in RDRAM, and the triangles drawn while g_snap_score is set go through this file's software depth
+ * rasteriser (DepthBufferRasterize, the one fb_depth_render uses) into the depth image the game selected.
+ * g_snap_score is on from the clear of the 13 images to the next colour image that is not 64 wide (the game's own frame). */
+int g_snap_score = 0;
+static uint32_t snap_zbase = 0;
+#define SNAP_ZSZ 0x1800u
+
+int snap_score_fill(uint32_t ul_x, uint32_t ul_y, uint32_t lr_x, uint32_t lr_y)
+{
+   uint32_t x, y;
+   uint16_t *z;
+   if (!settings.snap_depth || gDP.colorImage.width != 64 || g_gdp.fill_color.total != 0xFFFCFFFC
+         || ((gDP.otherMode.h & RDP_CYCLE_TYPE) >> 20) != 3)
+      return 0;
+   if (lr_x > 64) lr_x = 64;
+   if (lr_y > 48 * 13) lr_y = 48 * 13;
+   snap_zbase  = gDP.colorImage.address;
+   g_snap_score = 1;
+   if (snap_zbase + 13u * SNAP_ZSZ > 0x800000u)
+      return 1;
+   LFB_TOUCH(snap_zbase, 13u * SNAP_ZSZ);
+   neil_rd_mark(snap_zbase, 13u * SNAP_ZSZ);
+   z = (uint16_t*)(gfx_info.RDRAM + snap_zbase);
+   for (y = ul_y; y < lr_y; y++)
+      for (x = ul_x; x < lr_x; x++)
+         z[(y * 64 + x) ^ 1] = 0xFFFC;
+   return 1;
+}
+
+void snap_score_zimg(uint32_t addr)
+{
+   uint32_t rel;
+   if (!g_snap_score || addr < snap_zbase + SNAP_ZSZ)
+      return;
+   rel = addr - snap_zbase;
+   if (rel % SNAP_ZSZ || rel / SNAP_ZSZ > 12u || snap_zbase + 25u * SNAP_ZSZ > 0x800000u)
+      return;
+   /* the COPY-mode texture rectangle that came just before this: ZBeforeThis[i] = CurrentZ */
+   LFB_TOUCH(addr + 12u * SNAP_ZSZ, SNAP_ZSZ);
+   neil_rd_mark(addr + 12u * SNAP_ZSZ, SNAP_ZSZ);
+   memcpy(gfx_info.RDRAM + addr + 12u * SNAP_ZSZ, gfx_info.RDRAM + snap_zbase, SNAP_ZSZ);
+}
+
+void snap_score_colorimage(uint32_t width)
+{
+   if (g_snap_score && width != 64)
+      g_snap_score = 0;
+}
+
 void DrawDepthBuffer(VERTEX * vtx, int n)
 {
    unsigned i     = 0;
-   if ( gfx_plugin_accuracy < 3)
+   if ( gfx_plugin_accuracy < 3 && !g_snap_score)
        return;
 
-   if (fb_depth_render_enabled && dzdx && (rdp.flags & ZBUF_UPDATE))
+   if ((fb_depth_render_enabled || g_snap_score) && dzdx && (rdp.flags & ZBUF_UPDATE))
    {
+      if (!zLUT)
+         ZLUT_init();   /* the Snap photo-score passes run with n64_z_scale off, so nothing built the table */
       struct vertexi v[12];
       int index = 0;
       int inc   = 1;

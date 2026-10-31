@@ -1235,6 +1235,9 @@ static void rdp_settile(uint32_t w0, uint32_t w1)
    rdp.last_tile = gdp_set_tile(w0, w1);
 }
 
+extern int snap_score_fill(uint32_t ul_x, uint32_t ul_y, uint32_t lr_x, uint32_t lr_y);
+extern void snap_score_zimg(uint32_t addr);
+extern void snap_score_colorimage(uint32_t width);
 static void rdp_fillrect(uint32_t w0, uint32_t w1)
 {
 	const uint32_t ul_x = _SHIFTR(w1, 14, 10);
@@ -1246,6 +1249,8 @@ static void rdp_fillrect(uint32_t w0, uint32_t w1)
    if (lr_x < ul_x || lr_y < ul_y)
       return;
 
+   if (snap_score_fill(ul_x, ul_y, lr_x, lr_y))
+      return;
    glide64gDPFillRectangle(ul_x, ul_y, lr_x, lr_y);
 }
 
@@ -1315,6 +1320,7 @@ static void rdp_setdepthimage(uint32_t w0, uint32_t w1)
    g_gdp.zb_address = RSP_SegmentToPhysical(w1);
 
    rdp.zi_width = gDP.colorImage.width;
+   snap_score_zimg(g_gdp.zb_address);
 }
 
 int SwapOK = true;
@@ -1396,6 +1402,7 @@ static void rdp_setcolorimage(uint32_t w0, uint32_t w1)
 {
    gauntlet_hud_color_image();
    gdp_set_color_image(w0, w1);
+   snap_score_colorimage(_SHIFTR(w0, 0, 12) + 1);
 
    if (fb_emulation_enabled && (rdp.num_of_ci < NUMTEXBUF))
    {
