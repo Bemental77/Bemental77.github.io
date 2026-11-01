@@ -513,7 +513,7 @@ function gqReady() {
 // software GPU (SwiftShader, 4 vCPUs) drawing ONE MK64 picture after a ~5 ms field (max 225-349 ms
 // in heavy stretches) — nothing queues ahead of it. ?fskip=2 (earlier build, same rig): 1.000x, p50
 // 99-103 ms, 14.7-17.1 presents/s — throughput bought with a second picture of lag.
-var FSK = { on: true, depth: 1, maxSnaps: 6, snapEvery: 8, force: 0, skipping: false, serial: 0, lastDrew: false, drewNow: false, swNow: 0,
+var FSK = { on: true, depth: 1, budget: -1, maxSnaps: 6, snapEvery: 8, force: 0, skipping: false, serial: 0, lastDrew: false, drewNow: false, swNow: 0,
            hist: 0, stale: false, fq: [], pend: [], snaps: [], pool: [], bufs: 0, size: 0, top: 0, raw: null,
            pads: null, curPads: new Int32Array(12), setPad: null, taintSeen: 0, jsTaint: 0, ageTIn: 0, pollT: 0,
            fields: 0, drawn: 0, skipped: 0, skipNoDraw: 0, snapsTaken: 0, snapMs: 0, maxSnapMs: 0, redo: 0, redoFields: 0,
@@ -556,7 +556,11 @@ function fsInstall(search) {
   var q = new URLSearchParams(search || '').get('fskip');
   if (q === '0') { FSK.on = false; FSK.why = 'off (?fskip=0)'; }
   else if (q && /^force:\d+$/.test(q)) { FSK.force = Math.max(2, +q.slice(6)); FSK.why = 'rig: skip all but 1 of ' + FSK.force + ' fields'; }
-  else if (q && +q > 0) FSK.depth = Math.min(4, +q | 0);
+  else if (q && +q > 0) { FSK.depth = Math.min(4, +q | 0); FSK.budget = 0; }   // ?fskip=N: the old COUNT rule, N pictures in flight
+  var qb = new URLSearchParams(search || '').get('fskipms');                  // ?fskipms=N: the age budget in ms (0 = the old count rule)
+  if (qb != null && qb !== '' && +qb >= 0) FSK.budget = +qb;
+  var qf = new URLSearchParams(search || '').get('fbafter');                  // ?fbafter=N: the starvation fallback's threshold in field periods
+  if (qf != null && qf !== '' && +qf > 0) FB.after = +qf;
   // rig seams: ?fskip=force:K skips all but 1 of K fields whatever the GPU does (exactness rigs);
   // ?fsrerun=A:B snapshots field A (nothing skipped) and re-runs A..B at B (a re-run alone);
   // ?fskipage=N moves FS_MAXAGE; ?fskiplog=1 logs every re-run
@@ -808,6 +812,26 @@ function fsDropAll() { while (FSK.snaps.length) fsDrop(0); FSK.stale = false; }
 // 19-23 pictures, the oldest 4-6 s outstanding — 4-6 s of picture lag, and the reservoir that a
 // later GL call blocks on. Past GQ.max pictures every field that can skip, skips.
 function fsExpect() { return (FSK.hist & 2) !== 0 || FSK.fq.length > GQ.max; }
+// IS THE GPU BEHIND? (2026-10-31) The test was "FSK.depth (1) pictures are still unsignalled", which is
+// not lateness: ONE picture in flight is the normal state of any GPU whose fence latency is longer than
+// the gap between a field's end and the next field's start. MEASURED (two-process rig, Smash Remix, host
+// worker 3x slowed, SwiftShader): behind() answered true on 509 of 1216 fields while the OLDEST fence was
+// on average 5.9 ms old (a field takes ~9.4 ms of a 16.7 ms period, so the next one starts ~7 ms after the
+// last one's fence was set, and the fence needs ~10 ms) — the frame skip was throwing away pictures the
+// GPU was going to finish in time. A field is skipped only when a picture it would queue behind is LATE:
+// the oldest unsignalled fence (a COMPLETION fence, SYNC_GPU_COMMANDS_COMPLETE, not a submission count) has
+// been outstanding longer than FSK.budget ms (default 1.5 field periods), or the queue is past GQ.max
+// pictures. A real GPU signals within a few ms, so there this never fires; a GPU slower than the field
+// rate grows the oldest fence's age until the budget is reached, then skips exactly as many fields as it
+// cannot draw: the picture's lag stays bounded by the budget. ?fskipms=0 / ?fskip=N = the old count rule.
+function fsBehind(now) {
+  var n = FSK.fq.length;
+  if (!n) return false;
+  if (FSK.budget === 0) return n >= FSK.depth;
+  if (n > GQ.max) return true;
+  var b = FSK.budget > 0 ? FSK.budget : 1.5 * fbPeriod();
+  return now - FSK.fq[0].tEnd > b;
+}
 function fsField() {
   var s = ++FSK.serial, ready = fsCoreReady(), now = performance.now();
   FSK.fields++;
@@ -815,7 +839,7 @@ function fsField() {
   fsPoll(now);
   var skip = false;
   if (FSK.force) skip = (s % FSK.force) !== 0 && fsCanSkip();
-  else if (FSK.on && FSK.fq.length >= FSK.depth) { FSK.held++; skip = fsExpect() && fsCanSkip(); }
+  else if (FSK.on && fsBehind(now)) { FSK.held++; skip = fsExpect() && fsCanSkip(); }
   if (!skip && !FSK.force && fsLate(now)) { skip = fsCanSkip(); if (skip) FSK.lateSkips++; }
   // A snapshot is needed only for the first skipped field after the newest one: a re-run from an
   // older snapshot re-runs a later skipped field too (every field's pads are kept). So one is taken
@@ -954,8 +978,43 @@ function pbInstallP(P) {
     };
   });
 }
+// ---- THE STARVATION FALLBACK: PICTURES THE CANVAS COMMIT WOULD NOT CARRY (2026-10-31) -------
+// The placeholder canvas is committed only by THIS worker's animation frame. A saturated worker
+// gets few of them: MEASURED (two-process rig, Smash Remix, host worker slowed 6x by busy-waiting
+// inside the frame call): 2-8 rAF callbacks in 15-20 s with ~50 fields/s drawn -> 0.3-2 pictures/s
+// on the screen; at 3x, 50-59 rAFs/s against 60 fields/s -> 33-44 shown. ?present=bitmap fixes it
+// but made a 3x host leave rollback in 3/3 matched pairs (GPU fence queue never drained, 27 draws/s
+// skipped), so it is not the default. Here the bitmap path runs ONLY while this worker's rAF has
+// been silent for FB.after field periods: the picture just drawn is taken with
+// transferToImageBitmap and sent, flagged `fb`, to the page, which shows it on a canvas over #canvas
+// (index.html wkFbPresent). When the rAF is back and a field has drawn since the last take, 'fbOff'
+// tells the page to uncover the real canvas. A healthy worker never takes the branch.
+// ?fbk=0 (page) disables. FB.on is set only with the page's say-so (boot.fbk).
+var FB = { on: false, active: false, lastRaf: 0, after: 3, sent: 0, offs: 0, errs: 0, ms: 0 };
+
+function fbPeriod() { return (CLK.viHz > 0 ? 1000 / CLK.viHz : 1000 / 60); }
+function fbStarved(now) { return FB.lastRaf > 0 && now - FB.lastRaf > FB.after * fbPeriod(); }
+function fbPresent() {
+  if (!FB.on || PB.on || !PB.drew) return;
+  var now = performance.now();
+  if (!fbStarved(now)) { if (!FB.active) PB.drew = false; return; }     // the rAF commit carries it
+  PB.drew = false;
+  var bmp = null;
+  try { bmp = BOOT.canvas.transferToImageBitmap(); } catch (e) { FB.errs++; return; }
+  try { postMessage({ t: 'frame', b: bmp, f: CLK.frame, fb: 1 }, [bmp]); FB.sent++; FB.active = true; } catch (e) { FB.errs++; }
+  // the picture just taken is the newest one drawn and not yet committed: it is on its way to the page by bitmap, so
+  // it is neither a later commit's `shown` nor an `overwritten` picture (the page counts it as fb.shown / fb.dropped)
+  for (var bi = FSK.pend.length - 1; bi >= 0; bi--) { if (!FSK.pend[bi].tCommit) { FSK.pend[bi].tCommit = now; FSK.pend[bi].bm = true; break; } }
+  FB.ms += performance.now() - now;
+}
+// from the worker's own animation-frame loop
+function fbRaf(now) {
+  FB.lastRaf = now;
+  if (FB.active && PB.drew) { FB.active = false; FB.offs++; PB.drew = false; try { postMessage({ t: 'fbOff' }); } catch (e) {} }
+}
 function pbPresent() {
-  if (!PB.on || !PB.drew) return;
+  if (!PB.on) { if (FB.on) fbPresent(); return; }
+  if (!PB.drew) return;
   PB.drew = false;
   var bmp = null, t0 = performance.now();
   try { bmp = BOOT.canvas.transferToImageBitmap(); } catch (e) { PB.errs++; PB.err = String((e && e.message) || e); return; }
@@ -1034,6 +1093,7 @@ function observePresents() {
   (function obs() {
     self.requestAnimationFrame(obs);
     PRES.frames++;
+    if (FB.on) fbRaf(performance.now());
     // THE COMMIT YIELD: this frame pushes whatever was drawn before it.
     CB.commitThis = CB.drawn; CB.drawn = false;
     if (!M || !M._neil_vi_total) return;
@@ -1164,6 +1224,7 @@ function postStats() {
          paced: SCHED.paced, notOwed: SCHED.notOwed, coupled: SCHED.coupled, owed: Math.max(-2, Math.min(2, owed)),
          shown: PRES.shown, animFrames: PRES.frames, fpsText: fpsText(),
          pb: PB.on ? { sent: PB.sent, errs: PB.errs, err: PB.err, ms: Math.round(PB.ms) } : null,
+         fb: FB.on ? { sent: FB.sent, offs: FB.offs, errs: FB.errs, active: FB.active, ms: Math.round(FB.ms) } : null,
          cb: { mode: CB.mode, yields: CB.holds, released: CB.released, forced: CB.forced,
                rafDraws: CB.rafDraws, taskDraws: CB.taskDraws, rafSkips: CB.rafSkips },
          audioSent: AUD.sent, audioDropped: AUD.dropped,
@@ -1225,7 +1286,7 @@ function roomInstall(d) {
 var ROOM_FS = {
   ok: function () { return FSK.on && !!M && fsCoreReady(); },
   force: function () { return FSK.force | 0; },
-  behind: function () { fsPoll(performance.now()); return FSK.fq.length >= FSK.depth; },
+  behind: function () { var now = performance.now(); fsPoll(now); return fsBehind(now); },
   expect: function () { return fsExpect(); },
   begin: function (skip, k) {
     FSK.skipping = !!skip; FSK.drewNow = false; FSK.swNow = 0;
@@ -1260,7 +1321,7 @@ function roomFsCanSkip() { try { return !!(RM.R && RM.R.rfsCanSkip && RM.R.rfsCa
 // Every clonable field the page's Session and panel read off `session.ls` synchronously.
 function roomLite(ls) {
   return { state: ls.state, frame: ls.frame, roster: ls.roster.slice(), localPorts: ls.localPorts.slice(), delay: ls.delay,
-           rollback: ls.rollback, _rbAdaptive: ls._rbAdaptive, rosterAt: ls.rosterAt, peerId: ls.peerId, isHost: ls.isHost,
+           rollback: ls.rollback, _rbAdaptive: ls._rbAdaptive, _capGate: ls._capGate, _capAdaptive: ls._capAdaptive, _rsRoom: ls._rsRoom, rosterAt: ls.rosterAt, peerId: ls.peerId, isHost: ls.isHost,
            portCount: ls.portCount, padBytes: ls.padBytes, lobby: new Map(Array.from(ls.lobby.keys()).map(function (k) { return [k, true]; })),
            dropped: new Map(ls.dropped), _bar: ls._bar || null, error: ls.error, desync: ls.desync, hashEvery: ls.hashEvery,
            _rbConfirmed: ls._rbConfirmed, roomGame: ls.roomGame, rbMaxWindow: ls.rbMaxWindow, rbCapable: ls.rbCapable,
@@ -1667,6 +1728,9 @@ function boot(d) {
     d.canvas = new OffscreenCanvas(d.cw > 0 ? d.cw : 640, d.ch > 0 ? d.ch : 480);
     PB.on = true; pbInstall();
     log('[present] core worker: pictures go to the page as ImageBitmaps, one per drawn field (no canvas commit)');
+  } else if (d.fbk && hasRaf && typeof OffscreenCanvas === 'function') {
+    FB.on = true; pbInstall();
+    log('[present] core worker: starvation fallback armed — if the animation frames of this worker stop (' + FB.after + ' field periods), pictures go to the page as ImageBitmaps until they return');
   }
   fsWrap();
   installShims(d.canvas);

@@ -101,7 +101,7 @@ const result = {
 
 const browser = await puppeteer.launch({
   headless: 'new',
-  executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   args: ['--autoplay-policy=no-user-gesture-required', '--no-sandbox', '--disable-dev-shm-usage'],
 });
   // [leak-guard] A SIGKILLed parent ORPHANS this browser — verified by test and
