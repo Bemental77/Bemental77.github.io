@@ -19,16 +19,17 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import os from 'node:os';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const tmp = path.join(process.env.TMPDIR || '/tmp', 'netplay_pre_adaptive_' + process.pid + '.js');
+const tmp = path.join(process.env.TMPDIR || os.tmpdir(), 'netplay_pre_adaptive_' + process.pid + '.js');
 fs.writeFileSync(tmp, execSync('git show ffc0f52:lib/netplay.js', { cwd: root, maxBuffer: 64 << 20 }));
 let pass = 0, fail = 0;
 const ok = (n, c, d) => { if (c) { pass++; console.log('  PASS  ' + n + (d ? '  ' + d : '')); } else { fail++; console.log('  FAIL  ' + n + (d ? '  ' + d : '')); } };
 function measure(js, cell) {
-  const out = execSync(process.execPath + ' --input-type=module', { cwd: root, env: Object.assign({}, process.env, { NETPLAY_JS: js || '' }),
+  const out = execSync(JSON.stringify(process.execPath) + ' --input-type=module', { cwd: root, env: Object.assign({}, process.env, { NETPLAY_JS: js || '' }),
     input: `
-      import { simulate } from ${JSON.stringify(path.join(root, 'tools/netplay_rb_pace_sim.mjs'))};
+      import { simulate } from ${JSON.stringify(pathToFileURL(path.join(root, 'tools/netplay_rb_pace_sim.mjs')).href)};
       const L = globalThis.Netplay.Lockstep.prototype; const rx = L.receive; let bytes = 0, lsBytes = 0, ls = 0, hostOut = 0;
       L.receive = function (m) { const b = JSON.stringify(m).length; bytes += b; if (m.t === 'ls') { lsBytes += b; ls++; } if (!this.isHost) hostOut += b; return rx.apply(this, arguments); };
       const r = simulate(${JSON.stringify(Object.assign({ name: 'c', secs: 40 }, cell))});

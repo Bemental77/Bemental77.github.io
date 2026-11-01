@@ -347,8 +347,8 @@ try {
       await page.close();
       return out;
     };
-    const on = await arm('');
-    const off = await arm('&pace=0');
+    const on = await arm(process.env.N64_PACE_ON_Q || '');
+    const off = await arm(process.env.N64_PACE_OFF_Q != null ? process.env.N64_PACE_OFF_Q : '&pace=0&fskip=0');
     t.on = on.pace; t.off = off.pace;
     t.onSpeed = on.rate && on.rate.speed; t.offSpeed = off.rate && off.rate.speed;
     // Wired to the real core: both exports resolved out of the shipped dist/n64wasm.js. With the

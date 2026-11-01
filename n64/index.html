@@ -28,7 +28,7 @@
        the wire. The file still exists because sibling pages have not been
        converted yet; loading it here would ship a second, contradictory online
        architecture on a page that has one. -->
-  <script src="/lib/netplay.js?v=5a4e0d80"></script>
+  <script src="/lib/netplay.js?v=a00f72be"></script>
   <script src="/lib/mpgames.js"></script>
   <script src="/lib/publiclobby.js"></script>
   <!-- The Party button is NOT gated on the selected game any more (MPGames.gateParty used to disable it for a
@@ -245,6 +245,13 @@
   #lsRoom .seat.rdy .st { color: #7ee787; }
   #lsRoom .lsMsg { color: #93a2b3; margin-bottom: 9px; min-height: 2.6em; }
   #lsRoom .lsMsg.bad { color: #ff9b9b; }
+  #lsRoom .lsNote { margin: 0 0 9px; display: flex; flex-direction: column; gap: 6px; }
+  #lsRoom .lsNote[hidden] { display: none; }
+  #lsRoom .lsNote .nt { color: #f2d49b; font-size: 12px; line-height: 1.4; }
+  #lsRoom .lsNote .nt.relay { color: #ffb38a; }
+  #lsRoom .lsNote button { min-height: 28px; flex: none; }
+  #lsRoom .seat .lk { margin-left: 6px; color: #8fb4d8; font-size: 11px; }
+  #lsRoom .seat .lk.relay { color: #ffb38a; font-weight: 600; }
   #lsRoom .lsMsg.ok { color: #7ee787; }
   #lsRoom .lsBtns { display: flex; gap: 7px; }
   #lsRoom button { flex: 1; min-height: 32px; border-radius: 7px; border: 1px solid #35506b;
@@ -326,6 +333,7 @@
   <div class="lsHead"><span>Party <b id="lsCode">-----</b></span><button id="lsHide" type="button" class="sec" title="Hide the party panel (the Party button shows it again)" aria-label="Hide party panel">×</button></div>
   <div id="lsSeats" class="lsSeats"></div>
   <div id="lsMsg" class="lsMsg">Waiting for players…</div>
+  <div id="lsNote" class="lsNote" hidden></div>
   <div class="lsBtns">
     <button id="lsCopy" type="button" class="sec">Copy code</button>
     <button id="lsLink" type="button" class="sec">Copy link</button>
@@ -333,6 +341,7 @@
   <div class="lsBtns" style="margin-top:7px">
     <button id="lsLobby" type="button">Lobby</button>
     <button id="lsSolo" type="button">Play solo</button>
+    <button id="lsCopyReport" type="button" class="sec" title="Copies a JSON flight-recorder report (last ~30 min of rates, RTT, rollbacks, stalls, mode switches) to send to the developer">Copy session report</button>
     <button id="netLeave" type="button" class="sec">Leave</button>
   </div>
 </div>
@@ -1704,7 +1713,8 @@ N64Rate.selfTest = function (logFn) {
 <script src="/n64/N64Wasm/dist/glcompat.js?v=ff72e6de"></script>
 <script src="/n64/N64Wasm/dist/fbasync.js?v=714f1616"></script>
 <script src="/n64/N64Wasm/dist/jit_params.js?v=bb2930f6"></script>
-<script src="/n64/N64Wasm/dist/room_core.js?v=555c9494"></script>
+<script src="/n64/N64Wasm/dist/room_core.js?v=3d321d72"></script>
+<script src="/n64/N64Wasm/dist/netreport.js?v=2"></script><!-- always-on netplay flight recorder; reads __n64Net()/__n64Rate once a second -->
 <script>
 (function () {
   'use strict';
@@ -2285,7 +2295,7 @@ N64Rate.selfTest = function (logFn) {
     // its own animation frames, with this page's definition: frames in which the core's field
     // counter moved (core_worker.js observePresents). This page's rAF says nothing about them.
     // With bitmap presentation the pictures are put on screen HERE (wkPresentTick): count those.
-    if (WK.on) { var pr = WK.bctx ? (WK.bmpShown | 0) : WK.stat ? (WK.stat.shown | 0) : 0; shown = pr - WK.presents0; WK.presents0 = pr; }
+    if (WK.on) { var pr = WK.bctx ? (WK.bmpShown | 0) : WK.stat ? ((WK.stat.shown | 0) + (WK.fbShown | 0)) : 0; shown = pr - WK.presents0; WK.presents0 = pr; }
     var pace = pacer.drain();
     paceTotals.paced += pace.paced; paceTotals.denied += pace.denied;
     paceTotals.idle += pace.idle; paceTotals.notOwed += pace.notOwed; paceTotals.ticks += pace.ticks;
@@ -2565,7 +2575,7 @@ N64Rate.selfTest = function (logFn) {
   // logged. If the worker fails while it boots (no WebGL2 there after all, a
   // core abort before "Starting R4300"), the page reloads ONCE with ?worker=0
   // (wkFallback) and says so in its log.
-  var WK_V = 'c640445b';                           // cache-buster for the worker's scripts and core (md5 of fbasync.js + core_worker.js + n64wasm.wasm, first 8)
+  var WK_V = '1a678646';                           // cache-buster for the worker's scripts and core (md5 of the committed blobs of fbasync.js, core_worker.js, room_core.js, glcompat.js, n64wasm.js, n64wasm.wasm and lib/netplay.js, first 8 (the worker importScripts room_core and netplay with this stamp))
   var WK_DEFAULT = true;                     // the default for a capable console (solo and rooms)
   var WK = { on: false, why: null, w: null, stat: null, statAt: 0, presents0: 0, pendingAudioPort: null,
              evals: {}, evalId: 0, sent: null, composed: 0, posted: 0, fatal: null, booted: false,
@@ -2738,7 +2748,8 @@ N64Rate.selfTest = function (logFn) {
     var d = e.data || {};
     switch (d.t) {
       case 'stat': WK.stat = d; break;
-      case 'frame': wkPresent(d.b); break;
+      case 'frame': if (d.fb) wkFbPresent(d.b); else wkPresent(d.b); break;
+      case 'fbOff': wkFbOff(); break;
       case 'print':
         pageLog('> ' + d.s);
         if (String(d.s).indexOf('Starting R4300 emulator') !== -1) { running = true; mark('running'); setStatus('Running.'); }
@@ -2845,6 +2856,43 @@ N64Rate.selfTest = function (logFn) {
     try { WK.bctx.transferFromImageBitmap(b); WK.bmpShown = (WK.bmpShown | 0) + 1; } catch (e) { WK.bmpErr = String((e && e.message) || e); }
     if (Q.length) { WK.pRaf = true; requestAnimationFrame(wkPresentTick); }
   }
+  // THE STARVATION FALLBACK'S PRESENTER: pictures the worker sent while its own animation frames were
+  // not coming (core_worker.js FB). A second canvas over #canvas shows them on this thread's frames,
+  // in order, at most two waiting (the oldest is dropped, counted). Hidden again at 'fbOff', which the
+  // worker sends once its own commits are back.
+  function wkFbPresent(b) {
+    if (!b) return;
+    var Q = WK.fq || (WK.fq = []);
+    WK.fbIn = (WK.fbIn | 0) + 1;
+    if (document.hidden) { try { b.close(); } catch (e) {} return; }
+    Q.push(b);
+    while (Q.length > 2) { var x = Q.shift(); try { x.close(); } catch (e) {} WK.fbDropped = (WK.fbDropped | 0) + 1; }
+    if (!WK.fRaf) { WK.fRaf = true; requestAnimationFrame(wkFbTick); }
+  }
+  function wkFbTick() {
+    WK.fRaf = false;
+    var Q = WK.fq, b = Q && Q.shift();
+    if (!b) return;
+    try {
+      var cv = $('canvas'), ov = WK.fov;
+      if (!ov) {
+        ov = WK.fov = document.createElement('canvas');
+        ov.id = 'canvasFb'; ov.setAttribute('aria-hidden', 'true');
+        WK.fctx = ov.getContext('bitmaprenderer');
+        cv.parentNode.insertBefore(ov, cv.nextSibling);
+      }
+      if (ov.width !== b.width || ov.height !== b.height) { ov.width = b.width; ov.height = b.height; }
+      var cs = window.getComputedStyle(cv);
+      ov.style.cssText = 'position:absolute;pointer-events:none;display:block;left:' + cv.offsetLeft + 'px;top:' + cv.offsetTop + 'px;width:' + cv.offsetWidth + 'px;height:' + cv.offsetHeight + 'px;' + (cs.imageRendering ? 'image-rendering:' + cs.imageRendering + ';' : '');
+      WK.fctx.transferFromImageBitmap(b); WK.fbShown = (WK.fbShown | 0) + 1; WK.fbOn = true;
+    } catch (e) { WK.fbErr = String((e && e.message) || e); try { b.close(); } catch (e2) {} }
+    if (Q.length) { WK.fRaf = true; requestAnimationFrame(wkFbTick); }
+  }
+  function wkFbOff() {
+    var Q = WK.fq; while (Q && Q.length) { try { Q.shift().close(); } catch (e) {} }
+    if (WK.fov) WK.fov.style.display = 'none';
+    WK.fbOn = false;
+  }
   function wkBoot(app, bytes, files) {
     var q = new URLSearchParams(location.search);
     // HOW THE WORKER'S PICTURES REACH THE SCREEN (core_worker.js, THE COMMIT YIELD and
@@ -2854,6 +2902,17 @@ N64Rate.selfTest = function (logFn) {
     // here, one per animation frame of this (idle) thread — where the browser has
     // transferToImageBitmap and ImageBitmapRenderingContext.
     var cv = $('canvas'), pm = q.get('present'), off = null;
+    // THE STARVATION FALLBACK (2026-10-31). The worker's placeholder canvas commits only on the
+    // worker's OWN animation frame, and a console whose core worker is saturated (a slow host) gets few
+    // of them: MEASURED (two-process rig, Smash Remix, host core worker slowed by busy-waiting inside
+    // the frame call, 4 vCPU/SwiftShader): 6x -> 0.3-2 shown/s from 2-8 worker rAFs in 20 s while ~50
+    // fields/s were drawn. Making ?present=bitmap the room default FIXED that (6x: 13-24 shown/s) but
+    // pushed a 3x host out of rollback in 3 of 3 matched pairs (the GPU fence queue never drained, 27
+    // skipped draws/s, step cost up), so it stays an arm. Instead the worker is told this page can show
+    // ImageBitmaps on a second canvas laid over #canvas (wkFbPresent); it sends one ONLY while its own
+    // rAF has been silent for ~3 field periods, so a healthy console is untouched. ?fbk=0 turns it off.
+    WK.fbk = (q.get('fbk') !== '0') && typeof OffscreenCanvas === 'function'
+             && typeof OffscreenCanvas.prototype.transferToImageBitmap === 'function' && typeof ImageBitmapRenderingContext === 'function';
     WK.bctx = null;
     if (pm === 'bitmap' && typeof OffscreenCanvas === 'function'
         && typeof OffscreenCanvas.prototype.transferToImageBitmap === 'function' && typeof ImageBitmapRenderingContext === 'function') {
@@ -2867,7 +2926,7 @@ N64Rate.selfTest = function (logFn) {
                     rom: buf, files: files, romName: app.rom_name,
                     viHz: (romRegion && romRegion.viHz > 0) ? romRegion.viHz : 0, search: location.search,
                     jit: (q.get('jit') === 'off' || q.has('nojit')) ? 'off' : 'emit', rig: q.get('workerrig') === '1', v: WK_V,
-                    room: !!(WK.room && NET.session), workerfail: q.get('workerfail') || null },
+                    room: !!(WK.room && NET.session), workerfail: q.get('workerfail') || null, fbk: !!WK.fbk && !WK.bctx },
                   off ? [off, buf] : [buf]);
     if (WK.pendingAudioPort) { w.postMessage({ t: 'audioPort', port: WK.pendingAudioPort }, [WK.pendingAudioPort]); WK.pendingAudioPort = null; }
     wkWireInput();
@@ -2879,7 +2938,7 @@ N64Rate.selfTest = function (logFn) {
   window.__n64Worker = {
     state: function () { return { on: WK.on, why: WK.why, booted: WK.booted, fatal: WK.fatal, stat: WK.stat, composed: WK.composed, posted: WK.posted, sent: WK.sent ? Array.prototype.slice.call(WK.sent) : null,
                                   present: WK.bctx ? { mode: 'bitmap', in: WK.bmpIn | 0, shown: WK.bmpShown | 0, dropped: WK.bmpDropped | 0, err: WK.bmpErr || null }
-                                                   : { mode: (WK.stat && WK.stat.cb && WK.stat.cb.mode) || 'commit' } }; },
+                                                   : { mode: (WK.stat && WK.stat.cb && WK.stat.cb.mode) || 'commit', fb: { in: WK.fbIn | 0, shown: WK.fbShown | 0, dropped: WK.fbDropped | 0, on: !!WK.fbOn, err: WK.fbErr || null } } }; },
     eval: function (src) {
       return new Promise(function (res, rej) {
         if (!WK.w) return rej(new Error('no core worker'));
@@ -2923,7 +2982,7 @@ N64Rate.selfTest = function (logFn) {
   // from the input handlers and an 8 ms heartbeat); room_core.js lsLocalPads maps
   // them onto this console's ports exactly as it does on this thread.
   var WK_ENG_CALLS = ['seat', 'unseat', 'dropPeer', 'forgetReady', 'requestRoster', '_rosterSend', 'declareReady', 'fail',
-                      'stopRosterBeat', 'setDelay'];
+                      'stopRosterBeat', 'setDelay', 'rsExpect'];
   var WK_ENG_WORKER_ONLY = ['beginFrame', 'endFrame', 'submitHash', 'takeHashDue', 'rbCatchUp', 'rbPace', 'rbRingFrames', 'wantsHash'];
   var WK_ENG_SETTINGS = ['delay', 'rbHintMs', 'netFloorDelay', 'rttDelay'];
   function wkPost(m) { var w = wkEnsureWorker(); w.postMessage(m); }
@@ -3480,7 +3539,7 @@ N64Rate.selfTest = function (logFn) {
     // script.js chain-loads input_controller.js -> n64wasm.js (both resolve via <base>).
     var s = document.createElement('script');
     s.src = '/n64/N64Wasm/dist/script.js?v=' + Date.now();
-    s.onerror = function () { setStatus('Failed to load emulator core.'); };
+    s.onerror = function () { setStatus('Failed to load emulator core.'); if (window.__n64CantBoot) window.__n64CantBoot('the emulator core failed to load'); };
     document.body.appendChild(s);
     // Surface boot failures instead of sitting at "Loading core…" forever
     // (that silence hid the prod LFS-pointer wasm, 2026-06-12).
@@ -3493,6 +3552,7 @@ N64Rate.selfTest = function (logFn) {
         window.Module.printErr = function (t) { pageLog('[core-err] ' + t); };
         window.Module.onAbort = function (what) {
           setStatus('Emulator crashed (' + what + ') — reload to retry. Add ?eruda to the URL to see details.');
+          if (window.__n64CantBoot) window.__n64CantBoot('the emulator crashed while starting (' + String(what).slice(0, 80) + ')');
           toast('Emulator crashed', true);
           pageLog('[abort] ' + what);
         };
@@ -3506,6 +3566,7 @@ N64Rate.selfTest = function (logFn) {
       if (Date.now() > bootDeadline) {
         clearInterval(poll);
         setStatus('Core failed to start — reload to retry (see log).');
+        if (window.__n64CantBoot) window.__n64CantBoot('the emulator core did not start within 90 s');
         toast('Core failed to start', true);
       }
     }, 50);
@@ -4071,7 +4132,7 @@ N64Rate.selfTest = function (logFn) {
   var LS = ROOM.LS, RB = ROOM.RB, RA = ROOM.RA, LAT = ROOM.LAT, N64S = ROOM.N64S, GLSKIP = ROOM.GLSKIP,
       LS_GL = ROOM.LS_GL, LS_RB = ROOM.LS_RB, AUDX = ROOM.AUDX;
   var LS_PAD_BYTES = ROOM.LS_PAD_BYTES, LSN = ROOM.LSN;
-  var RB_DEFAULT = ROOM.RB_DEFAULT, RB_WANT = ROOM.RB_WANT, RB_WINDOW = ROOM.RB_WINDOW;
+  var RB_DEFAULT = ROOM.RB_DEFAULT, RB_WANT = ROOM.RB_WANT, RB_WINDOW = ROOM.RB_WINDOW, RB_DELAY = ROOM.RB_DELAY;
   // With the room in the core worker (WK.room) none of these may run here: there is no
   // core on this page, and LS is then a MIRROR of the worker's (WORKER ROOMS, below).
   function lsFeed() { if (WK.room) return; return ROOM.lsFeed(); }
@@ -4207,6 +4268,12 @@ N64Rate.selfTest = function (logFn) {
         } else if (tags.length > 1 && base.every(function (b) { return b === base[0]; })) {
           text = 'everyone picked ' + base[0] + ', but not every console is running the same version of this page — '
                + 'every player should reload the page (on a phone: close the tab and reopen it) and join again';
+          // A joiner does that reload itself, once, past the HTTP cache (the host's page cannot be
+          // fixed from here; if it was the stale one the bound in netSelfHeal stops the loop).
+          if (!isHost && !NET.staleHealed && window.__n64NetHeal) {
+            NET.staleHealed = true;
+            setTimeout(function () { try { window.__n64NetHeal('This console is on a different build of this page than the room', null, true); } catch (e) {} }, 800);
+          }
         }
       }
       error = text;
@@ -4447,6 +4514,34 @@ N64Rate.selfTest = function (logFn) {
       pageLog('[net] ' + msg);
     };
 
+    // ⚠ BOUNDED SELF-HEAL FOR A JOINER, instead of a refusal the player has to act on. A reload
+    // keeps ?np=&join=1, so the console re-knocks on the same code (before the game starts the
+    // host re-seats it). Used where the failure is the PAGE's, not the room's: a console that began
+    // loading a different ROM than the host named (late 'room-game'), a console on a cached older
+    // build (version mismatch / barrier disc-tag mismatch), a roster that dropped this console
+    // before the start. `refresh` re-fetches the page and its scripts past the HTTP cache first.
+    // At most 2 per 2 minutes (sessionStorage) so a room that cannot be healed this way cannot loop.
+    var netSelfHeal = function (why, mutate, refresh) {
+      var key = 'n64NetHeal', now = Date.now(), tries = [];
+      try { tries = JSON.parse(sessionStorage.getItem(key) || '[]').filter(function (t) { return now - t < 120000; }); } catch (e) {}
+      if (tries.length >= 2) { pageLog('[net] self-heal skipped (' + why + '): already reloaded ' + tries.length + 'x in 2 min'); return false; }
+      tries.push(now);
+      try { sessionStorage.setItem(key, JSON.stringify(tries)); } catch (e) {}
+      var q = new URLSearchParams(location.search);
+      if (mutate) mutate(q);
+      netStatus(why + ' — reloading this page to join the room again…', 'busy');
+      var went = false;
+      var go = function () { if (went) return; went = true; location.replace(location.pathname + '?' + q.toString() + location.hash); };
+      if (refresh) {
+        var urls = [location.pathname];
+        Array.prototype.forEach.call(document.scripts, function (sc) { if (sc.src) urls.push(sc.src); });
+        try { Promise.all(urls.map(function (u) { return fetch(u, { cache: 'reload' }).catch(function () {}); })).then(go, go); } catch (e) { go(); }
+        setTimeout(go, 5000);
+      } else setTimeout(go, 600);
+      return true;
+    };
+    window.__n64NetHeal = netSelfHeal;
+
     // ⚠ THE DECLARE WAITS FOR main(), AND ARMING IS NOT THAT. dist/script.js
     // runs `this.beforeRun(); … await this.LoadSram(); Module.callMain(…)`
     // (:233-237): an awaited IndexedDB round-trip sits between the hook that
@@ -4465,6 +4560,7 @@ N64Rate.selfTest = function (logFn) {
       if (!M || typeof M.callMain !== 'function') {
         LS.fault = 'this build of the core exposes no Module.callMain, so the page cannot tell '
                  + 'when main() has run and will not declare itself loaded';
+        if (window.__n64CantBoot) window.__n64CantBoot('this build of the core cannot report that it has started');
         pageLog('[lockstep] ⚠ ' + LS.fault);
         return;
       }
@@ -4584,6 +4680,13 @@ N64Rate.selfTest = function (logFn) {
       if (e.state === 'connected') netStatus('Connected — the game loads by itself now, and starts once everyone is loaded.', 'ok');
       else if (e.state === 'closed' || e.state === 'failed') {
         lsDisarm(NET.leaving ? 'you left the room' : 'the room closed');
+        if (e.state === 'failed' && !NET.leaving && NET.role === 'guest' && e.detail) {
+          var d = String(e.detail);
+          // A console on a cached older build is the one refusal that is the PAGE's fault: reload
+          // it past the cache once instead of telling the player to.
+          if (/version mismatch/.test(d)) netSelfHeal('This page is an older build than the host\'s', null, true);
+          else netStatus('Could not join this room: ' + d + (/full|already started|new code/.test(d) ? '' : '. Check the code and try again.'), 'bad');
+        }
       }
       pageLog('[net] ' + (NET.role || 'session') + ' ' + e.state + (e.detail ? ' (' + e.detail + ')' : ''));
     };
@@ -4594,12 +4697,29 @@ N64Rate.selfTest = function (logFn) {
     // console and MUST start it.
     var startSession = async function (asHost, code, game) {
       if (NET.session) return;
+      // MEMORY GATE, BEFORE THE ROOM EXISTS. The core asks for ONE 512 MB WebAssembly.Memory
+      // (Makefile TOTAL_MEMORY). A phone that cannot grant it used to host or join happily, pass
+      // admission, and only fail at boot - while every other player sat at the start barrier.
+      // Capability.heapCheck DOES the allocation (a deviceMemory read is a rounded hint, absent on
+      // Safari/Firefox). It runs here, on a player's decision to go online, never on a solo page
+      // view. A refusal rejects: the .then/.catch pair at the call site prints "Could not open the room: ...".
+      try {
+        var hc = (window.Capability && typeof Capability.heapCheck === 'function') ? Capability.heapCheck(512) : null;
+        pageLog('[net] memory check before ' + (asHost ? 'hosting' : 'joining') + ': ' + (hc ? (hc.ok ? 'granted 512 MB' : 'REFUSED - ' + hc.err) : 'not available (no capability layer)'));
+        if (hc && !hc.ok) throw new Error('this device cannot ' + (asHost ? 'host' : 'join') + ' a room: ' + hc.why + '. ' + hc.fix);
+      } catch (memErr) { if (/this device cannot/.test(String(memErr && memErr.message))) throw memErr; }
       NET.role = asHost ? 'host' : 'guest';
       NET.guest = !asHost;
       NET.game = game;
       wkRoomDecide();
       var s = new Netplay.Session({
-        game: game, host: asHost, code: code, transport: netTransport(),
+        // ⚠ A JOINER IS CONSTRUCTED GAMELESS (lib/netplay.js:6170-6186). The host names the
+        // disc and the room announces it ('room-game', handled below), so a joiner whose
+        // lobby picker held a different title is never DENIED at the handshake
+        // (netplay.js:7580 / :7603 / :7682, "the other player is on X"). The START BARRIER
+        // still compares what each console actually LOADED (netplay.js:3087-3096), so a real
+        // disc mismatch is still caught -- only the avoidable, typed-string refusal is gone.
+        game: asHost ? game : null, host: asHost, code: code, transport: netTransport(),
         // THE CONSOLE'S port count, handed to the engine rather than assumed by
         // it: four SI channels, all of them permanently plugged
         // (libretronew.c:179). padBytes is this page's own 4-byte pad above.
@@ -4627,10 +4747,40 @@ N64Rate.selfTest = function (logFn) {
         // rbResume: a capacity-gated room that dropped to input delay can come
         // back to zero-lag mode — room_core.js rbRearm keeps the start of the
         // first rollback frame after the delay stretch (lib/netplay.js opts.rbResume).
-        if (typeof s.startLockstep === 'function') s.startLockstep({ portCount: 4, padBytes: LS_PAD_BYTES, rollback: RB_WANT ? RB_WINDOW : 0,
-          rollbackOk: true, rbCatchUp: true, rbResume: true });
+        if (typeof s.startLockstep === 'function') s.startLockstep({ portCount: 4, padBytes: LS_PAD_BYTES, rollback: RB_WANT ? RB_WINDOW : 0, rbDelay: RB_DELAY,
+          rollbackOk: true, rbCatchUp: true, rbResume: true,
+          // rsReplay: a page that reloads (or a tab closed and reopened) is replayed back into the running match from the
+          // host's input record (lib/netplay.js _rsServeRestart) -- in a plain input-delay room too.
+          rsReplay: true,
+          // rsCheckpoint: the host keeps its newest exact state (deflated) for a returning page, which loads it and replays only the
+          // frames since -- minutes of replay become seconds (lib/netplay.js RS_CK_EVERY; room_core.js ck*). ?nock=1 = the control arm.
+          rsCheckpoint: typeof CompressionStream === 'function' && typeof DecompressionStream === 'function' && !/[?&]nock=1/.test(location.search),
+          // gameFile: the host publishes its ROM's file name beside the title, so a joiner whose own list lacks the title can fetch
+          // it from the site's ROM path (room-game handler below).
+          gameFile: (function () { var r = ROMS.filter(function (x) { return x.label === NET.game; })[0]; return (NET.role === 'host' && r) ? r.file : null; })() });
       } catch (e) { pageLog('[lockstep] startLockstep threw: ' + ((e && e.message) || e)); }
       s.on('status', onStatus);
+      // ---- lobby events (lib/netplay.js): all of them also surface in the panel note (renderNote) ----
+      s.on('peer-cannot-boot', function (e) {
+        NET.notice = { text: (e.port == null ? 'A player' : 'Player ' + (e.port + 1)) + ' could not start the game (' + e.why + ') - their seat was released.', until: Date.now() + 20000 };
+        pageLog('[net] ' + NET.notice.text);
+      });
+      s.on('peer-kicked', function (e) { pageLog('[net] dropped ' + (e.port == null ? 'a player' : 'player ' + (e.port + 1)) + ' before the start: ' + e.why); });
+      s.on('kicked', function (e) {
+        NET.notice = { text: 'The host removed you from the room: ' + e.why, until: Date.now() + 3600000 };
+        netStatus(NET.notice.text, 'bad');
+      });
+      s.on('build-mismatch', function (e) { pageLog('[net] build mismatch (mine ' + e.mine + ' / theirs ' + e.theirs + '): ' + e.text); });
+      s.on('link-relayed', function (e) { pageLog('[net] ' + e.text); });
+      s.on('barrier-stuck', function (e) { pageLog('[net] the start barrier has made no progress for ' + e.seconds + ' s, waiting on seat(s) ' + (e.ports || []).map(function (p) { return p + 1; }).join(', ')); });
+      // A joiner whose device cannot boot the core tells the host so the room does not wait forever.
+      window.__n64CantBoot = function (why) {
+        var sess = NET.session;
+        if (!sess || sess.isHost || NET.cantSent || NET.declared) return false;
+        NET.cantSent = true;
+        pageLog('[net] telling the host this console cannot start: ' + why);
+        try { return sess.announceCannotBoot(why); } catch (e) { return false; }
+      };
       // The host's roster names the ROM the room is on. A joiner loads THAT --
       // not whatever its picker held -- so the two agree at the barrier.
       // genesis.html:1836, snes.html:1817 and ps1.html:1818 already do this;
@@ -4642,10 +4792,57 @@ N64Rate.selfTest = function (logFn) {
       s.on('room-game', function (e) {
         if (!e || !e.game || NET.role === 'host') return;
         NET.roomGame = e.game;
+        var prevGame = NET.game;
         var i = netPreselectGame(e.game);
-        if (i >= 0) { NET.game = ROMS[i].label; pageLog('[net] the room is on ' + ROMS[i].label + ' -- this console follows it'); }
-        else pageLog('[net] the room named "' + e.game + '", which is not on this page');
+        // THE ROOM'S GAME IS NOT IN THIS PAGE'S LIST (an older cached page, or a title added since): the host also published
+        // the ROM's file name, so check the site's own ROM path for it and add it to the picker -- no dead-end status line.
+        if (i < 0 && e.file && /^[A-Za-z0-9][\w .()'+\-]{0,120}\.(z64|n64|v64)$/.test(e.file) && !NET.romResolving) {
+          NET.romResolving = e.file;
+          var wantFile = e.file, wantGame = e.game;
+          fetch(window.ASSET_BASE + '/n64/N64Wasm/roms/' + encodeURIComponent(wantFile), { method: 'HEAD' }).then(function (rs) {
+            if (!rs.ok) throw new Error('HTTP ' + rs.status);
+            ROMS.push({ label: wantGame, file: wantFile });
+            [$('romSelect'), $('mobileRomSelect')].forEach(function (sel) {
+              if (!sel) return; var opt = document.createElement('option'); opt.value = String(ROMS.length - 1); opt.textContent = wantGame; sel.appendChild(opt);
+            });
+            pageLog('[net] the room is on ' + wantGame + ', which this page\'s list did not carry -- found ' + wantFile + ' on the site and added it');
+            NET.romResolving = null;
+            s._emit('room-game', { game: wantGame, file: null });
+          }).catch(function (err) {
+            pageLog('[net] the room is on "' + wantGame + '" (' + wantFile + ') but the site has no such file (' + err.message + ')');
+            NET.romResolving = null; NET.romUnresolved = true;
+            if (!netSelfHeal('This page does not carry "' + wantGame + '"', null, true)) {
+              netStatus('The host is playing "' + wantGame + '", which this page does not have. Reload this page to get the newest game list.', 'bad');
+            }
+          });
+          return;
+        }
+        if (i >= 0) {
+          NET.game = ROMS[i].label; pageLog('[net] the room is on ' + ROMS[i].label + ' -- this console follows it');
+          // The name arrived AFTER this console began loading its own pick (the room-game wait in
+          // press() is bounded). Following in the picker is too late for a ROM already booting:
+          // restart this page on the host's game (same code) rather than fail at the barrier.
+          if (NET.bootStarted && prevGame !== NET.game) {
+            var hostLabel = NET.game;
+            netSelfHeal('The host is on ' + hostLabel + ' but this console had already started loading ' + prevGame,
+                        function (q) { q.set('game', hostLabel); q.set('join', '1'); });
+          }
+        }
+        else {
+          pageLog('[net] the room named "' + e.game + '", which is not on this page');
+          netStatus('The host is playing "' + e.game + '", which this page does not have. Ask the host for a game from this list, or reload this page if it is out of date.', 'bad');
+        }
       });
+      // The host's newest roster no longer lists this console although it WAS seated. Before the
+      // game starts a reload re-knocks on the same code and takes a seat again; once playing, a
+      // reload (or a closed-and-reopened tab) is replayed back into the match by the host's input record
+      // (lib/netplay.js _rsServeRestart), and a live page whose link died rejoins by the engine's own path;
+      // this message is for a console the host's roster genuinely no longer lists.
+      try { s.on('roster-evicted', function () {
+        if (NET.role === 'host' || NET.leaving) return;
+        if (LS.running) netStatus('The host\'s room no longer lists this console. If the controller stays idle, leave the party and join with the code again.', 'bad');
+        else netSelfHeal('The host\'s room dropped this console', null);
+      }); } catch (e) {}
       try { s.on('lockstep', function (e) {
         watchLockstep(s);
         // A player who went silent is dropped by the host and the game goes on;
@@ -4876,7 +5073,11 @@ N64Rate.selfTest = function (logFn) {
         // emulator at all.
         var press = function () {
           var b = $('btnStart');
-          if (b && (b.disabled || b.getAttribute('aria-disabled') === 'true')) { NET.startBlocked = true; return false; }
+          if (b && (b.disabled || b.getAttribute('aria-disabled') === 'true')) {
+            NET.startBlocked = true;
+            if (window.__n64CantBoot) window.__n64CantBoot('this device failed the capability check (see the banner on that device)');
+            return false;
+          }
           NET.startBlocked = false; NET.bootStarted = true;
           lsReportLoad(1);
           if (isMobile) { var sp = $('mobileSplash'); if (sp) sp.style.display = 'none'; }
@@ -4968,6 +5169,63 @@ N64Rate.selfTest = function (logFn) {
     // that disagrees with the engine is worse than no seat list, because a
     // player has to know they are P3 BEFORE the game starts — that is which
     // character they get.
+    // ---- per-seat link type + RTT, and the lobby notes (separate from the one-sentence lsMsg) ----
+    var linkLabel = function (k) { return k === 'direct' ? 'direct' : k === 'stun' ? 'peer-to-peer' : k === 'turn' ? 'RELAY' : k === 'broker' ? 'RELAY (broker)' : '…'; };
+    var linkMap = function () {
+      var m = {};
+      try { var info = NET.session && NET.session.roomInfo(); ((info && info.linkQuality) || []).forEach(function (r) { if (r.port != null) m[r.port] = r; }); } catch (e) {}
+      return m;
+    };
+    var seatWord = function (port) { return port === 0 ? 'the host' : 'player ' + (port + 1); };
+    var reloadPage = function () {
+      var urls = [location.pathname];
+      Array.prototype.forEach.call(document.scripts, function (sc) { if (sc.src) urls.push(sc.src); });
+      var went = false, go = function () { if (went) return; went = true; location.reload(); };
+      try { Promise.all(urls.map(function (u) { return fetch(u, { cache: 'reload' }).catch(function () {}); })).then(go, go); } catch (e) { go(); }
+      setTimeout(go, 5000);
+    };
+    var noteActs = [], noteKey = '';
+    var renderNote = function () {
+      var el = $('lsNote'); if (!el) return;
+      var sess = NET.session, items = [], info = null;
+      try { info = sess && sess.roomInfo(); } catch (e) {}
+      if (info) {
+        var isHost = !!info.host, playing = !!info.started;
+        if (info.buildMismatch) items.push({ text: info.buildMismatch.text, btn: { label: isHost ? 'Reload this page (closes the room)' : 'Reload this page', act: reloadPage } });
+        var bar = info.barrier;
+        if (!playing && bar && bar.stuck && bar.stuckFor && bar.stuckFor.length) {
+          bar.stuckFor.forEach(function (peer) {
+            var port = -1; (info.seats || []).forEach(function (x) { if (x.peer === peer) port = x.port; });
+            if (port < 0) return;
+            if (isHost) items.push({ text: seatWord(port).replace(/^./, function (c) { return c.toUpperCase(); }) + ' has not finished loading after a minute, so the room is held.',
+                                     btn: { label: 'Drop ' + seatWord(port) + ' and continue', act: function () { sess.kickPeer(port, 'the host dropped ' + seatWord(port) + ' because the game had not loaded after a minute'); } } });
+            else items.push({ text: 'Still waiting for ' + seatWord(port) + ', who has not finished loading. The host can drop them to start.' });
+          });
+        }
+        (info.linkQuality || []).forEach(function (r) {
+          if (!r.relayed) return;
+          items.push({ cls: 'relay', text: (isHost ? 'The connection to ' + (r.port == null ? 'a player' : seatWord(r.port)) : 'Your connection to the host') + ' is relayed ('
+            + (r.kind === 'turn' ? 'through a relay server' : 'through the signalling broker') + (r.rttMs != null ? ', about ' + r.rttMs + ' ms round trip' : '') + ') - expect lag.' });
+        });
+      }
+      if (NET.notice && Date.now() < NET.notice.until) items.push({ text: NET.notice.text });
+      var key = JSON.stringify(items.map(function (i) { return [i.text, i.btn && i.btn.label]; }));
+      if (key === noteKey) return;
+      noteKey = key; noteActs = [];
+      el.textContent = '';
+      el.hidden = !items.length;
+      items.forEach(function (i) {
+        var d = document.createElement('div'); d.className = 'nt' + (i.cls ? ' ' + i.cls : ''); d.textContent = i.text; el.appendChild(d);
+        if (i.btn) { var b = document.createElement('button'); b.type = 'button'; b.className = 'sec'; b.textContent = i.btn.label; b.setAttribute('data-act', String(noteActs.push(i.btn.act) - 1)); el.appendChild(b); }
+      });
+    };
+    (function () {
+      var el = $('lsNote'); if (!el) return;
+      el.addEventListener('click', function (ev) {
+        var t = ev.target; var a = t && t.getAttribute && t.getAttribute('data-act');
+        if (a != null && noteActs[+a]) { try { noteActs[+a](); } catch (e) { pageLog('[net] note action threw: ' + ((e && e.message) || e)); } }
+      });
+    })();
     var renderRoom = function () {
       var p = lsParty();
       // Out of the way once the game is running; back when the room stops.
@@ -4980,6 +5238,7 @@ N64Rate.selfTest = function (logFn) {
         if (bad && !NET.panelShownBad) panel.hidden = false;
         NET.panelShownBad = bad;
       }
+      try { renderNote(); } catch (e) {}
       ['btnNet', 'mobileSplashNet'].forEach(function (id) {
         var b = $(id); if (!b) return;
         var t = partyLabel(p); if (b.textContent !== t) b.textContent = t;
@@ -4988,11 +5247,14 @@ N64Rate.selfTest = function (logFn) {
       if (!seats) return;
       if (!p.rows.length) seats.innerHTML = '<div class="seat empty"><span>Connecting…</span></div>';
       else {
+        var lks = linkMap();
         var html = p.rows.map(function (r) {
           var cls = 'seat' + (r.local ? ' me' : '') + (r.who ? '' : ' empty')
                   + (r.state === 'ready' || r.state === 'playing' ? ' rdy' : '');
+          var lk = lks[r.port];
+          var lkHtml = (lk && !r.local && lk.kind) ? '<span class="lk' + (lk.relayed ? ' relay' : '') + '">' + linkLabel(lk.kind) + (lk.rttMs != null ? ' ' + lk.rttMs + ' ms' : '') + '</span>' : '';
           return '<div class="' + cls + '"><span>P' + (r.port + 1) + ' · ' + (r.who ? r.who + (r.local ? ' (you)' : '') : '—') + '</span>'
-               + '<span class="st">' + r.state + '</span></div>';
+               + '<span class="st">' + r.state + lkHtml + '</span></div>';
         }).join('');
         if (seats.innerHTML !== html) seats.innerHTML = html;
       }
@@ -5002,6 +5264,14 @@ N64Rate.selfTest = function (logFn) {
       // The engine's words never reach the panel raw — lsParty() has already
       // turned every peer id into a seat word (see NEVER A NONCE, PART TWO).
       else if (p.error) setMsg('The room stopped — ' + p.error + '. Leave the party to keep playing by yourself.', 'bad');
+      else if (p.state === 'playing' && LS.rejoining) {
+        // THIS PAGE IS REJOINING a match already in progress (it reloaded, or its link died): it replays the match hidden --
+        // nothing is shown or heard -- and the controller comes back when it is level. Say so, with progress.
+        var rjPct = Math.min(99, Math.round(100 * (LS.frame || 0) / Math.max(1, LS.rejoinTo || 1)));
+        var rjText = 'Rejoining the match -- catching up to the room (' + rjPct + '%). Your controller is live again the moment you are level.';
+        setMsg(rjText, '');
+        if (!LS_GL.lost) setStatus(rjText);
+      }
       else if (p.state === 'playing') {
         // The design's sentence LEADS; a stall is appended, never substituted —
         // measured: the rig read "Waiting for player 2…" on a room that had
@@ -5094,6 +5364,10 @@ N64Rate.selfTest = function (logFn) {
           // with three or four players, to the host-relayed guest-to-guest path
           // (Lockstep.recommendDelayForRoom). One ping at a fixed 16.7 ms was
           // measured to leave a 50-150 ms link stalling (tools/netplay_pace_sim.mjs).
+          // SYNCING STAGE: visible while the round trips run, before this console declares. (The
+          // barrier itself already holds every core at frame 0 until all seated consoles have
+          // declared; the panel names who is still loading.)
+          netStatus('Syncing players — measuring the connection to everyone before the game starts…', 'busy');
           var rep = await sess.rttReport(600, { samples: 6, frameMs: LS.viHz > 0 ? 1000 / LS.viHz : 1000 / 60 });
           if (rep && rep.worstMs != null) NET.rttMs = Math.round(rep.worstMs);
           if (WK.room && NET.rttMs) wkPost({ t: 'lsset', k: 'rttMs', v: NET.rttMs });
@@ -5305,6 +5579,9 @@ N64Rate.selfTest = function (logFn) {
     out.state = NET.session ? NET.session.state : null;
     out.code = NET.session ? NET.session.code : null;
     out.party = lsParty();
+    // Per-seat path type + RTT (direct | stun | turn | broker) and any build mismatch: the flight recorder (netreport.js) keeps both.
+    try { out.links = NET.session && NET.session.linkReport ? NET.session.linkReport() : null; } catch (e) { out.links = null; }
+    try { out.buildMismatch = NET.session && NET.session.buildMismatch ? NET.session.buildMismatch.names : null; } catch (e) { out.buildMismatch = null; }
     // WHO THE ROOM IS WAITING ON (lsPace) — this page's verdict.
     out.pace = LS.paceVerdict || null;
     return out;

@@ -21,7 +21,7 @@
        page is the only page. The file itself still exists because n64/index.html
        has not been converted yet; nothing here routes to it. -->
   <script src="/lib/cart_audio.js?v=a77bd483"></script>
-  <script src="/lib/netplay.js?v=5a4e0d80"></script>
+  <script src="/lib/netplay.js?v=a00f72be"></script>
   <meta charset="UTF-8" />
   <title>Genesis Wasm</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -2415,7 +2415,7 @@
     });
     NET.gameIdx = i;
     NET.role = 'guest';
-    var s = new Netplay.Session({ game: game, host: false, code: code, portCount: GEN_PORTS, transport: netTransport() });
+    var s = new Netplay.Session({ game: null /* a joiner is gameless: the host names the disc (room-game); a typed string must never DENY a joiner (lib/netplay.js:6170) */, host: false, code: code, portCount: GEN_PORTS, transport: netTransport() });
     netWire(s);
     // ⚠ NO START LOCK, AND NO START CLICK EITHER. Under streaming a joiner had
     // no emulator and Start was disabled for it — the single line that made

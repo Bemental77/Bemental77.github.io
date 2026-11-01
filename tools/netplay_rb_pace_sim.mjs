@@ -98,6 +98,8 @@ const fnv = (h, v) => Math.imul((h ^ (v >>> 0)) >>> 0, 0x01000193) >>> 0;
 const coreStep = (st, image, k) => { let h = fnv(st, k); for (let i = 0; i < image.length; i++) h = fnv(h, image[i]); return h >>> 0; };
 
 export function simulate(sc) {
+  // RBD=<0..3|auto>: run every cell (and every test that goes through simulate) with that rollback input-delay floor.
+  if (sc.rbDelay == null && process.env.RBD) sc = Object.assign({}, sc, { rbDelay: process.env.RBD === 'auto' ? 'auto' : +process.env.RBD });
   const rnd = prng(sc.seed || 11);
   // sc.hz: the console's frame rate (PS1 Monster Rancher 2 runs at 50 Hz).
   const HZ = sc.hz > 0 ? sc.hz : 60, FRAME = 1000 / HZ, secs = sc.secs || 60;
@@ -117,7 +119,11 @@ export function simulate(sc) {
     const spike = sc.spike && rnd() < sc.spike.p ? rnd() * sc.spike.ms : 0;
     return Math.max(0, base + rnd() * (sc.jitterMs || 0) + spike);
   };
-  const outage = (id) => (sc.outages || (sc.outage ? [sc.outage] : [])).some((o) => o.id === id && T >= o.from && T < o.to);
+  // sc.restart { id, at, loadMs }: that console's PAGE is reloaded at `at` -- dead (no ticks, no messages either way) for
+  // `loadMs` while the new page boots, then a brand-new engine at frame 0 declares into the running match.
+  const rsLoad = sc.restart ? (sc.restart.loadMs == null ? 3000 : sc.restart.loadMs) : 0;
+  const outage = (id) => (sc.outages || (sc.outage ? [sc.outage] : [])).some((o) => o.id === id && T >= o.from && T < o.to)
+    || !!(sc.restart && sc.restart.id === id && T >= sc.restart.at && T < sc.restart.at + rsLoad);
   // One hop. `m` is already a private copy.
   const hop = (from, to, m) => {
     if (outage(from) || outage(to)) { stats.dropped++; return; }
@@ -186,6 +192,9 @@ export function simulate(sc) {
     if (sc.readyStepMs && sc.readyStepMs[id] != null) opts.selfStepMs = sc.readyStepMs[id];
     else if (sc.readyStepMs) opts.selfStepMs = 0;
     if (sc.rbResume) opts.rbResume = true;
+    if (sc.rbDelay != null) opts.rbDelay = sc.rbDelay;
+    if (sc.noCap) opts.rbNoCap = true;
+    if (sc.rsReplay) opts.rsReplay = true;
     if (host && sc.hintMs) opts.rbHintMs = sc.hintMs;
     // sc.pingHint: the Session's lobby pings (Session._lobbyPing) — five round
     // trips to every guest over THIS link model before the start, sized like
@@ -204,6 +213,7 @@ export function simulate(sc) {
     if (sc.lockstep) { opts.rollback = 0; opts.delay = sc.delay || 3; }
     // A naive page does not know rollback exists: it passes no rollback option.
     if (sc.naiveIds && sc.naiveIds.includes(id)) { delete opts.rollback; delete opts.rbCatchUp; delete opts.selfStepMs; }
+    p.opts = opts;
     p.ls = old ? new (oldLockstep(sc.oldRef || 'ffc0f52'))(opts) : new Lockstep(opts);
     p.old = !!old;
     if (!sc.readyStepMs) p.ls.selfStepMs = p.stepMs;
@@ -230,6 +240,7 @@ export function simulate(sc) {
     const pads = {};
     for (const port of ls.localPorts) pads[port] = padFor(p.id, port, f);
     if (!p.sampled.has(f)) p.sampled.set(f, pads);
+    if (T >= (sc.warmSecs == null ? 5 : sc.warmSecs) * 1000) { if (!hidden) p.firstRuns = (p.firstRuns | 0) + 1; }
     const r = ls.beginFrame(pads, hidden ? { hidden: true } : undefined);
     // THE ROOM'S TRUTH for this console's ports: exactly what it PUT for each
     // frame (its pad on the frame in rollback, `delay` frames ahead — or held —
@@ -250,6 +261,7 @@ export function simulate(sc) {
       let st = p.ring.get(r.rollback.from);
       if (st === undefined) throw new Error(p.id + ': rollback to ' + r.rollback.from + ' is outside the savestate ring (frame ' + f + ')');
       for (const fr of r.rollback.frames) { st = coreStep(st, fr.image, fr.frame); p.ring.set(fr.frame + 1, st); work += p.stepMs; p.resim++; }
+      if (T >= (sc.warmSecs == null ? 5 : sc.warmSecs) * 1000) { p.hist = p.hist || {}; const dd = r.rollback.depth; p.hist[dd] = (p.hist[dd] | 0) + 1; p.resimW = (p.resimW | 0) + r.rollback.frames.length; }
       p.st = st;
     }
     const first = p.sampled.get(r.frame);
@@ -261,7 +273,12 @@ export function simulate(sc) {
       const b = r.image.subarray(port * PAD, port * PAD + PAD);
       if (!zeroLagOwed) continue;
       p.lagN++;
-      const a = first[port];
+      // sc.rbDelay N (fixed): the pad on the frame is the one sampled N frames earlier (neutral before the first N).
+      // 'auto' changes it mid-room: the check is not owed (the fill and drain frames are not "the pad of the frame").
+      if (sc.rbDelay === 'auto') { p.lagN--; continue; }
+      const dN = sc.rbDelay | 0;
+      const src = dN ? p.sampled.get(r.frame - dN) : first;
+      const a = src ? src[port] : [0, 0];
       if (!(ls._limp && ls._isLimp && ls._isLimp(port, r.frame)) && (a[0] !== b[0] || a[1] !== b[1])) p.lagBad++;
     }
     // genesis.html rbStep: EVERY frame loads its own start slot first. After a
@@ -328,12 +345,29 @@ export function simulate(sc) {
     }
     while (p.accum >= FRAME && ran < (delayRoom ? 15 : 4)) { const w = runFrame(p, rejoining); if (!w) break; work += w; p.accum -= FRAME; ran++; }
     if (globalThis.__simTick) globalThis.__simTick(p, T, ran, work);
+    if (T >= (sc.warmSecs == null ? 5 : sc.warmSecs) * 1000 && !rejoining) { p.wTicks = (p.wTicks | 0) + 1; if (work > FRAME + 1e-9) p.overTicks = (p.overTicks | 0) + 1; }
     if (p.accum > FRAME) p.accum = FRAME;
     if (ran && !rejoining) p.presented++;
     if (pace < 1) p.pacedTicks++;
     p.ticks++;
     if (work > p.maxTickWork) p.maxTickWork = work;
     p.busyUntil = T + work;
+  }
+  if (sc.restart) {
+    const R = sc.restart;
+    q.push(R.at + rsLoad, () => {
+      const p = P[R.id];
+      p.ls = new Lockstep(p.opts);
+      if (!sc.readyStepMs) p.ls.selfStepMs = p.stepMs;
+      p.ls.on('leave', (e) => events.push({ t: Math.round(T), at: R.id, ev: 'leave', who: e.who, ports: e.ports, frame: e.at, missed: !!e.missed }));
+      p.ls.on('rejoin', (e) => events.push({ t: Math.round(T), at: R.id, ev: 'rejoin', who: e.who, ports: e.ports, frame: e.at }));
+      p.ls.on('restart', () => events.push({ t: Math.round(T), at: R.id, ev: 'restart' }));
+      p.ring = new Map(); p.st = 0x811c9dc5; p.beganAt = null; p.declared = false; p.lastTs = 0; p.accum = 0; p.sampled = new Map();
+      p.frames = 0; p.hidden = 0; p.presented = 0; p.frameAt = []; p.restartedAt = T;
+      // the Session's side: the old link died with the page (rsExpect), the new one came up and the roster went down it
+      P.H.ls.rsExpect(R.id);
+      P.H.ls._rosterSend();
+    });
   }
   for (const id of ids) {
     const p = P[id];
@@ -401,10 +435,11 @@ export function simulate(sc) {
     if (ls.state === 'desync') desyncs++;
     compared += rep.hashesCompared || 0;
     out.consoles[id] = { rate: +rate.toFixed(4), max5s: +mw.toFixed(4), presented: +(p.presented / ((T - (p.beganAt || 0)) / FRAME)).toFixed(4),
-      frames: p.frames, hidden: p.hidden, aheadOfRoomClock: +p.aheadMax.toFixed(2), behindRoomEnd: +(roomClock() - p.frames).toFixed(2), state: ls.state, error: ls.error || null,
+      frame: ls.frame, frames: p.frames, hidden: p.hidden, aheadOfRoomClock: +p.aheadMax.toFixed(2), behindRoomEnd: +(roomClock() - p.frames).toFixed(2), state: ls.state, error: ls.error || null,
       window: ls.rollback, windowPeak: ls._rbWinPeak || ls.rollback, stalls: rb.windowStalls, lsStalls: ls.stats.stalls | 0, cadenceHolds: ls.stats.cadenceHolds | 0, stallMs: Math.round(ls.stats.stallMs || 0), advWaits: rb.advantageWaits,
       rollbacks: rb.rollbacks, maxDepth: rb.maxDepth, resim: p.resim, catchUp: rb.catchUpFrames || 0,
       windowChanges: rb.windowChanges || 0, holeNaks: rb.holeNaks || 0, compared: rep.hashesCompared, maxTickWork: +p.maxTickWork.toFixed(1),
+      wTicks: p.wTicks | 0, overTicks: p.overTicks | 0, resimW: p.resimW | 0, hist: p.hist || {}, inputDelay: ls._rbd | 0, rbdHistory: ls.rbdHistory || [],
       lag: p.lagBad + '/' + p.lagN, rejoinTicks: p.rejoinTicks, pacedTicks: p.pacedTicks, old: p.old,
       mode: ls.rollback ? 'rollback' : 'delay', delay: ls.delay, modes: p.modes,
       // lib/netplay.js ownClock(): frames past THIS console's own wall clock

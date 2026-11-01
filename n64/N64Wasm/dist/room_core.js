@@ -734,6 +734,11 @@
     var RB_DEFAULT = true;
     var RB_WANT = RB_Q.get('rb') === '1' || (RB_DEFAULT && RB_Q.get('rb') !== '0');  // ?rb=1 / ?rb=0 override either way
     var RB_WINDOW = Math.max(2, Math.min(12, +(RB_Q.get('rbw') || 8) | 0));
+    // ?rbd=N (0..3) / ?rbd=auto: the rollback room's INPUT-DELAY FLOOR (lib/netplay.js RB_DELAY_MAX, Lockstep._rbd): each
+    // console stamps its own pad on frame f + N, so a late remote input forces a correction N frames shallower. 0 (the default)
+    // = the pad is applied on the frame it was sampled, as before. The HOST's value is the room's; 'auto' lets the host
+    // pick 0..2 from the slowest console's measured correction cost (Lockstep._rbdDecide).
+    var RB_DELAY = (function (v) { return v === 'auto' ? 'auto' : Math.max(0, Math.min(3, +(v || 0) | 0)); })(RB_Q.get('rbd'));
     // ---- RE-SIMULATED FRAMES DRAW NOTHING (GLSKIP) -----------------------------
     // A re-simulated frame is never seen (only the present frame, drawn last in
     // the same task, reaches the screen) and its audio is dropped, so its GL
@@ -891,11 +896,21 @@
     // catch-up runs at the repay rule's own pace (gate 9 untouched: no frame runs before its slot).
     // Same box, same arm: room 0.9926-0.9963x with 47-85 ms lost -> 0.9996x, 0 lost.
     // ?fskiplate=0 is the arm (every catch-up frame presented, as before).
-    var RFS_LATE = RB_Q.get('fskiplate') !== '0', RFS_LATE_SHOW = 100;
+    var RFS_LATE = RB_Q.get('fskiplate') !== '0', RFS_LATE_SHOW = Math.max(1, +(RB_Q.get('fskipshow') || 100));   // ?fskipshow=MS: the longest a late console goes without drawing a picture
+    // ?fskipgap=F (2026-10-31): ONLY A FRAME THAT RUNS WITHIN F PERIODS OF THE PREVIOUS PRESENTED ONE IS SWALLOWED. The skip above is for a
+    // catch-up BURST (the repay rule runs owed frames back to back, up to 2x) that the blocked presentation could not take. But a rollback
+    // console is routinely >2 periods behind its schedule (a correction's re-simulation is paid in wall time, then repaid at <=2x): MEASURED
+    // 80 ms link, SM64-class load, Smash Remix: the joiner sat >2 periods late 31-37% of the time, rfsLate() swallowed ~500 of 1530 presented
+    // frames and the joiner drew 41/s (shown 37/s against 55/s with ?fskiplate=0). A frame that arrives a whole period (or nearly) after the
+    // last one is not part of a burst, so it is drawn however late the schedule says the console is. 0 = the old rule (every late frame). Default 0.75.
+    // MEASURED (hermetic: same files, 6 runs per arm ABBA, 80 ms link, 0% loss, host 1x, live fight each run, rollback held, lost 0): the joiner's shown/s was 32.2 [31.6-33.6] with the old rule, 54.2 [53.1-54.9] with fskipgap=0.75, 56.1 [55.7-57.0] with ?fskiplate=0 (the skip off); speed 1.00 and lost 0 in all three.
+    var RFS_LATE_GAP = (RB_Q.get('fskipgap') != null && RB_Q.get('fskipgap') !== '') ? Math.max(0, +RB_Q.get('fskipgap')) : 0.75;
     function rfsLate() {
       if (!RFS_LATE || !(LS.viHz > 0) || !LS.baseWall) return false;
       var period = 1000 / LS.viHz / ((LS.pace > 0 && LS.pace <= 1) ? LS.pace : 1), now = performance.now();
+      var gap = now - (RFS.lastPres || 0); RFS.lastPres = now;
       if (now - (LS.baseWall + (LS.frame - LS.baseFrame) * period) <= period * 2) return false;
+      if (RFS_LATE_GAP && gap >= RFS_LATE_GAP * period) return false;
       if (now - RFS.drewAt > RFS_LATE_SHOW) return false;
       RFS.lateSkips++; return true;
     }
@@ -1081,7 +1096,7 @@
             + RB.cap + ' exact states x ' + (rbSlotBytes() / 1048576).toFixed(1) + ' MB (budget ' + RB_RING_BUDGET_MB
             + ' MB, allocated as used; past it snapshots are thinned, never refused), one every '
             + (RB.kFixed ? RB.k + ' frames (?rbk)' : 'K frames, K adapted to the measured cost'
-            ) + '; local input applied with 0 frames of delay');
+            ) + '; local input applied with ' + (ls._rbd | 0) + ' frames of delay' + (ls._rbdAuto ? ' (?rbd=auto: the host adjusts it, 0..2)' : (ls._rbd ? ' (?rbd)' : '')));
       return true;
     }
     // ⚠ BACK TO ROLLBACK AFTER INPUT DELAY (lib/netplay.js _capDecide: a
@@ -1162,6 +1177,86 @@
       ls.rbMaxWindow = c; RB.maxWindow = c;
       env.log('[rollback] this console can hold a window of ' + c + ' frames (' + n + ' snapshots x one every ' + RB.k
             + ' frames) — ' + why);
+    }
+    // ---- CHECKPOINTS (lib/netplay.js RS_CK_EVERY) ---------------------------------------------------------------------------
+    // A returning page used to replay the whole match from frame 0 (~200 frames/s: a 3-minute match = 80 s). The HOST now keeps the
+    // newest EXACT ring snapshot (every input before it confirmed), deflated, and hands it to the returning page, which loads it
+    // and replays only the frames since. The engine moves the bytes; these four functions are the page's half.
+    var CK = { busy: false, ready: null, made: 0, bytes: 0, ms: 0, applied: 0, failed: 0 };
+    function ckOk() { return typeof CompressionStream === 'function' && typeof DecompressionStream === 'function' && n64sRawOk(); }
+    function ckStream(u8, Ctor) {
+      var cs = new Ctor('deflate-raw'), w = cs.writable.getWriter();
+      w.write(u8).catch(function () {}); w.close().catch(function () {});
+      var r = cs.readable.getReader(), parts = [], n = 0;
+      return (function pump() {
+        return r.read().then(function (x) {
+          if (x.done) { var o = new Uint8Array(n), p = 0; for (var i = 0; i < parts.length; i++) { o.set(parts[i], p); p += parts[i].length; } return o; }
+          parts.push(x.value); n += x.value.length; return pump();
+        });
+      })();
+    }
+    // ⚠ THE DEFLATE RUNS ON THE THREAD THAT FEEDS IT: handing CompressionStream the whole 20 MB at once froze the host's frames for
+    // ~120-400 ms (14 frames of host-behind-guest in the rig) every checkpoint. It is fed one CK_SLICE per tick instead (ckFeed, from
+    // ckPump): ~80 ticks, a few ms each.
+    var CK_SLICE = 262144;
+    function ckDeflateStart(raw) {
+      var cs = new CompressionStream('deflate-raw'), w = cs.writable.getWriter(), r = cs.readable.getReader(), parts = [], n = 0;
+      var job = { raw: raw, off: 0, w: w, closed: false, p: null };
+      job.p = (function pump() {
+        return r.read().then(function (x) {
+          if (x.done) { var o = new Uint8Array(n), q = 0; for (var i = 0; i < parts.length; i++) { o.set(parts[i], q); q += parts[i].length; } return o; }
+          parts.push(x.value); n += x.value.length; return pump();
+        });
+      })();
+      return job;
+    }
+    function ckFeed(job) {
+      var nop = function () {};
+      if (job.off < job.raw.length) { var e = Math.min(job.raw.length, job.off + CK_SLICE); job.w.write(job.raw.subarray(job.off, e)).catch(nop); job.off = e; }
+      if (job.off >= job.raw.length && !job.closed) { job.closed = true; job.w.close().catch(nop); }
+    }
+    // HOST: the newest exact snapshot, deflated, to the engine (one at a time; the copy is the only synchronous cost).
+    function ckCapture(ls) {
+      var s = rbAtOrBelow(ls.rsCkMax());
+      if (!s || s.frame < 1 || !s.buf) return;
+      var f = s.frame, t0 = performance.now(), raw = new Uint8Array(N64S.size);
+      raw.set(s.buf.subarray(0, N64S.size));
+      CK.busy = true;
+      var job = CK.job = ckDeflateStart(raw);
+      job.p.then(function (z) {
+        CK.job = null; CK.busy = false; CK.made++; CK.bytes = z.length; CK.ms = Math.round(performance.now() - t0);
+        ls.rsCkPut(f, z, raw.length);
+        env.log('[checkpoint] host: exact state at frame ' + f + ' kept for a returning page (' + (z.length / 1048576).toFixed(2) + ' MB deflated of '
+              + (raw.length / 1048576).toFixed(1) + ', ' + CK.ms + ' ms)');
+      }, function (e) { CK.job = null; CK.busy = false; env.log('[checkpoint] host: could not compress a state: ' + e); });
+    }
+    // GUEST: a downloaded checkpoint -> inflate (async) -> load + seed the engine (sync, at the top of a tick).
+    function ckApplyBegin(ls, p) {
+      CK.busy = true;
+      ckStream(p.bytes, DecompressionStream).then(function (raw) { CK.busy = false; CK.ready = { f: p.f, raw: raw, ms: p.ms }; },
+        function (e) { CK.busy = false; CK.failed++; ls.rsCkFailed('inflate failed: ' + e); });
+    }
+    function ckApplyFinish(ls) {
+      var c = CK.ready; CK.ready = null;
+      if (!c) return;
+      if (c.raw.length !== N64S.size) { CK.failed++; ls.rsCkFailed('the state is ' + c.raw.length + ' B, this core needs ' + N64S.size); return; }
+      var t0 = performance.now();
+      N64S.located = true;       // the raw API needs no located buffer; a fresh page has simply not saved yet
+      if (!n64sLoad(c.raw)) { CK.failed++; ls.rsCkFailed('the core refused the state: ' + N64S.fault); return; }
+      if (!ls.rsCkLoaded(c.f)) return;
+      LS.frame = c.f; LS.fed = c.f; LS.baseWall = 0; LS.baseFrame = c.f;
+      // the ring: armed lazily on a fresh page's first frame (rbInit saves at ls.frame, now the checkpoint's); re-armed otherwise
+      if (!(RB.ready ? rbRearm(ls, c.f) : rbInit(ls))) { rbFail(ls, RB.fault || N64S.fault || 'the ring could not be armed at the checkpoint'); return; }
+      try { if (RFS.on) rfsNote(); } catch (e) {}
+      CK.applied++;
+      env.log('[checkpoint] guest: started from the exact state of the host at frame ' + c.f + ' (downloaded in ' + c.ms + ' ms, loaded in '
+            + Math.round(performance.now() - t0) + ' ms) -- replaying only the frames since');
+    }
+    function ckPump(ls) {
+      if (CK.job) ckFeed(CK.job);
+      if (!CK.busy && RB.ready && ls.rsCkWant() && ckOk()) ckCapture(ls);
+      if (!CK.busy && !CK.ready) { var p = ls.rsCkTake(); if (p) { if (ckOk()) ckApplyBegin(ls, p); else ls.rsCkFailed('this page cannot load a state (no stream codec / raw states)'); } }
+      if (CK.ready) ckApplyFinish(ls);
     }
     function rbGrow(want) {
       var nn = want | 0;
@@ -1564,13 +1659,18 @@
         // ratio (<= 1.05, n64/audio-worklet.js) absorbs the burst. A hidden frame the
         // console does NOT owe (catching up to the room past its own schedule) is
         // audio beyond real time and is still dropped, as is every re-simulation.
+        // A REJOIN REPLAY IS NEVER AUDIO: those frames are a match this page did not play (ls.rsReplaying), however "owed" its stale
+        // schedule calls them. Playing their sound ties the replay to real-time audio and it never levels (measured: n64_rejoin_rig_test
+        // rb-close-long 1900 frames behind for good after merging the owed-audio rule).
+        var hRep = typeof ls.rsReplaying === 'function' && ls.rsReplaying();
+        var hPlay = hOwed && !hRep;
         audioFlushNow();
-        if (!hOwed) RFS.inResim = true;
+        if (!hPlay) RFS.inResim = true;
         var okh;
         try { okh = rbStep(ls, r.frame, r.image, false, false, 'hidden'); } finally { RFS.inResim = false; }
-        if (hOwed) audioFlushNow(); else audioDropNow();
+        if (hPlay) audioFlushNow(); else audioDropNow();
         if (!okh) return rbFail(ls, 'frame failed: ' + N64S.fault);
-        RB.hidden++; LS.frame++; lsPaceNote(); if (!hOwed) LS.baseFrame++; else LS.hiddenOwed = (LS.hiddenOwed | 0) + 1;
+        RB.hidden++; LS.frame++; if (!(typeof ls.rsReplaying === 'function' && ls.rsReplaying())) lsPaceNote(); if (!hOwed) LS.baseFrame++; else LS.hiddenOwed = (LS.hiddenOwed | 0) + 1;
         if (G.__n64RbLog) G.__n64RbLog.push(['hidden', r.frame]);
       } else {
         if (!rbStep(ls, r.frame, r.image, true, false)) return rbFail(ls, 'frame failed: ' + N64S.fault);
@@ -1710,7 +1810,7 @@
       // Frames that alone cost more than a field period — a burst this device
       // cannot absorb inside the governor's two-period allowance if it repeats.
       if (LS.viHz > 0 && dt > 1000 / LS.viHz) { LS.costOver = (LS.costOver || 0) + 1; if (dt > (LS.costMax || 0)) LS.costMax = dt; }
-      LS.frame++; lsPaceNote();
+      LS.frame++; { var _rl = env.engine && env.engine(); if (!(_rl && typeof _rl.rsReplaying === 'function' && _rl.rsReplaying())) lsPaceNote(); }
       try { lsGlWitness(); } catch (e) {}
       try { LS.lastFp = M._neil_last_fp ? (M._neil_last_fp() >>> 0) : 0; } catch (e) { LS.lastFp = 0; }
       // TEST SEAM: (frame, fingerprint) of the last FPR_N presented frames, so a rig comparing
@@ -1812,6 +1912,7 @@
       // than `delay` frames ahead anyway, but the real limiter here is lsDueNow():
       // this loop stops the moment the guest would get ahead of wall time, which
       // is what keeps the guest at 1.000x rather than sprinting through a backlog.
+      if (typeof ls.rsCkWant === 'function') { try { ckPump(ls); } catch (e) { env.log('[checkpoint] ' + (e && e.stack || e)); } }
       var guard = 0, ran = 0, tick0 = performance.now();
       if (ls.rollback) {
         // ADAPTIVE ROOM (lib/netplay.js, the block above rbCatchUp): the ring
@@ -1827,11 +1928,32 @@
         if (RB.ready && typeof ls.rbCatchUp === 'function') {
           var cu = ls.rbCatchUp();
           for (var ci = 0; ci < cu; ci++) {
-            if (!lsPaceOk()) break;          // THE CATCH-UP CEILING: a hidden frame is guest time too
+            // THE CATCH-UP CEILING: a hidden frame is guest time too -- except a RELOADED page's replay of
+            // a match it did not play (ls.rsReplaying: lib/netplay.js), which rebuilds its state and is
+            // bounded by the engine's own-clock bar to the room's present.
+            if (!(typeof ls.rsReplaying === 'function' && ls.rsReplaying()) && !lsPaceOk()) break;
             var rh = ls.beginFrame(lsLocalPads(), { hidden: true });
             if (!rh || !rh.ready || !rbRunFrame(ls, rh, true)) break;
             ran++;
           }
+        }
+      }
+      // A RELOADED PAGE IN AN INPUT-DELAY ROOM replays the match hidden too (lib/netplay.js rsReplaying; the engine's
+      // _lsCatchUp grants the count). Silent -- the audio is dropped -- and exempt from the catch-up ceiling because it
+      // rebuilds this page's state; the engine's own-clock bar stops it at the room's present.
+      if (!ls.rollback && typeof ls.rsReplaying === 'function') { LS.rejoining = !!ls.rsReplaying(); LS.rejoinTo = (ls._rsHostFrame | 0); }
+      if (!ls.rollback && (ls._rsRoom || ls._rsActive) && typeof ls.rbCatchUp === 'function') {
+        var dcu = ls.rbCatchUp();
+        for (var di = 0; di < dcu; di++) {
+          if (!(typeof ls.rsReplaying === 'function' && ls.rsReplaying()) && !lsPaceOk()) break;     // the ceiling, except for a replay
+          var dh = ls.beginFrame(lsLocalPads(), { hidden: true });
+          if (!dh || !dh.ready) break;
+          if (RB.ready && !RB.stale) { var dfs = rfsSettle(ls, true); if (dfs !== true) { rbFail(ls, dfs); break; } }
+          if (!lsRunOneFrame(dh.image)) { LS.fault = LS.abort || 'the core could not run a replayed frame'; if (LS.abort) { try { ls.fail(LS.fault); } catch (e) {} } break; }
+          LS.fed++; ran++;
+          audioDropNow();
+          var dwh = (typeof ls.wantsHash === 'function') ? ls.wantsHash() : true;
+          if (dwh && LS.lastFp) { ls.endFrame(LS.lastFp, [LS.lastFp]); LS.hashes++; } else ls.endFrame(null);
         }
       }
       while (lsDueNow()) {
@@ -1840,7 +1962,12 @@
         if (ls.rollback && RB.ready && typeof ls.rbRingFrames === 'function' && RB.n < ls.rbRingFrames() && !rbGrow(ls.rbRingFrames())) {
           rbFail(ls, 'rollback could not grow its ring: ' + RB.fault); break;
         }
-        var r = ls.beginFrame(pads);
+        // A CONSOLE A REJOIN-SIZED GAP BEHIND THE ROOM (a player back from a dead link, or a RELOADED page replaying the match
+        // from the host's record -- lib/netplay.js _rsServeRestart) presents nothing: every frame it runs is hidden (picture held,
+        // audio dropped) until it is level, as the engine's rbRejoining() contract says. Shown, it would be a fast-forward.
+        var rjn = !!(ls.rollback && typeof ls.rbRejoining === 'function' && ls.rbRejoining());
+        LS.rejoining = rjn; if (rjn) LS.rejoinTo = (typeof ls._rsHostFrame === 'number' ? ls._rsHostFrame : 0) | 0;
+        var r = ls.beginFrame(pads, rjn ? { hidden: true } : undefined);
         if (!r || !r.ready) {
           if (!LS.stalling && r && r.reason === 'stall') { LS.stalls++; LS.stallSince = performance.now(); }
           LS.stalling = !!(r && r.reason === 'stall');
@@ -1870,7 +1997,7 @@
         // The HOST decided lockstep or rollback ('lsgo' carries it) — never this
         // page's own query string, which only says what THIS console proposes.
         if (ls.rollback) {
-          if (!rbRunFrame(ls, r)) break;
+          if (!rbRunFrame(ls, r, rjn)) break;
           LS.fed++; ran++;
           if (++guard > 240) { env.log('[lockstep] ⚠ feed loop hit its 240-frame bound — not sprinting the guest'); break; }
           // ⚠ ONE TASK NEVER HOLDS THE PAGE FOR MORE THAN ABOUT A FIELD. On a
@@ -1896,6 +2023,7 @@
           break;
         }
         LS.fed++; ran++;
+        if (typeof ls.rsReplaying === 'function' && ls.rsReplaying()) audioDropNow();
         // A frame the ring did not see: the next rollback frame re-arms it (rbRearm).
         // Nothing in the ring can be loaded again, so its states (16.8 MB each, and
         // the framebuffer pins they hold) go back now — a phone's memory — rather
@@ -2247,7 +2375,7 @@
     var R = G.__n64RoomCore = {
       LS: LS, RB: RB, RA: RA, LAT: LAT, N64S: N64S, GLSKIP: GLSKIP, LS_GL: LS_GL, LS_RB: LS_RB, AUDX: AUDX,
       LS_PAD_BYTES: LS_PAD_BYTES, LSN: LSN, N64S_FIELDS: N64S_FIELDS,
-      RB_DEFAULT: RB_DEFAULT, RB_WANT: RB_WANT, RB_WINDOW: RB_WINDOW, RB_RING_BUDGET_MB: RB_RING_BUDGET_MB,
+      RB_DEFAULT: RB_DEFAULT, RB_WANT: RB_WANT, RB_WINDOW: RB_WINDOW, RB_DELAY: RB_DELAY, RB_RING_BUDGET_MB: RB_RING_BUDGET_MB,
       lsFeed: lsFeed, lsDriveOk: lsDriveOk, lsDueNow: lsDueNow, lsLocalPads: lsLocalPads, lsApplyImage: lsApplyImage,
       lsArmBeforeBoot: lsArmBeforeBoot, lsDisarm: lsDisarm, lsPreroll: lsPreroll,
       lsRbProve: lsRbProve, lsRbRefuse: lsRbRefuse, lsSelfCap: lsSelfCap, lsGlWitness: lsGlWitness,
