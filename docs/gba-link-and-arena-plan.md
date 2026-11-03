@@ -199,3 +199,18 @@ after every GR5 run. **Nothing here ran on a real phone, with a second human, ov
   `tools/audit_peerjs_crossdevice.mjs` and `tools/gba_link_smoke.mjs`, and the new `docs/gba-link-rooms-testing.md`.
 - **A restamp after commit must rewrite `?v=` for `lib/debugreport.js` and `lib/bench.js`** on the pages that load them (`node tools/stamp_lib_versions.mjs`, default HEAD mode, never
   `--worktree`). `--check` stays green until then because it hashes `HEAD`. `lib/audiodiag.js` is not in the stamper's list.
+
+## Pokemon Arena online play (2026-11-03): R7 and R8 built, with ONE deviation from this plan
+
+**Built:** battle a friend over the internet (`pokemonarena/ONLINE.md`): R7 the match protocol and R8 the lobby entry, tag `A` and the standing gates. `tools/pokemonarena_netmatch_test.mjs`
+(207 checks, 18 mutants killed), `tools/pokemonarena_online_page_test.mjs` (two real Chrome tabs through the real lobby), `multiplayer_page_test` 83/0, `no_streaming_test` 11/11.
+
+**The deviation, stated plainly because the plan said it needed the owner's sign-off (Part 4 item 9).** Part 3 chose "the unmodified Lockstep engine with frame = a fixed 30 Hz tick". It was
+NOT used. The match runs on a message-driven protocol (`pokemonarena/js/netmatch.js`) over the same `Netplay.Session` channel: every machine still runs the whole engine, only the two players'
+choices cross the wire, a missing choice is waited for and never guessed, and a state hash on every round stops a diverged match by turn number (`no_streaming_test` accepts it on that ground). Why
+not the frame engine: a 30 Hz tick runs for the minutes a player spends thinking, and a backgrounded tab (timers throttled to 1 Hz) would turn each choice into several seconds; commit-reveal inside
+a frame also needed the synchronous SHA-256 that Part 4 item 3 found missing (`rom.js` `sha256Hex` is one, used here). **This is the "TurnSync" architecture Part 4 item 9 flagged.** If the owner
+wants the frame engine after all, `netmatch.js` is the only module to replace; `online_match.js`, the scene, the lobby entry and the tests' page half do not change.
+
+**Part 4 items this closed or touched:** 3 (a synchronous SHA-256 exists: `rom.js`), 4 (receipts: NOT built; online battles are unrated and not recorded, and the career schema was not changed), 5 (the disconnect
+policy: 60 s of grace, then the player who stayed wins).

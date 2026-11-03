@@ -37,6 +37,7 @@
      snes       /snes.html?np=CODE&game=<ROMS label>&host=1 | &join=1
      ps1        /ps1.html?np=CODE&game=<ROMS label>&host=1 | &join=1
      gba        /gba.html?np=CODE&game=<ROMLIST title>&host=1&seats=N | &join=1
+     pokemonarena /pokemonarena/battle.html?np=CODE&game=Pokemon%20Arena&host=1 | &join=1   (the page asks each player for a team before connecting)
   The cartridge pages take an explicit &host=1 because their bare ?np=
   receiver predates this page and means "fill the JOIN box"; changing that
   meaning would break invitations already in the wild. gba.html is the one
@@ -68,10 +69,9 @@
   2000 are on gba.html but are deliberately not offered here.
 
   A ROOM CODE NAMES ITS CONSOLE through lib/netplay.js CODE_TAGS, and that now
-  includes the Game Boy Advance ('B') — so a joiner who types only a GBA code is
-  taken to GBA without being asked, like every other console. 'A' is RESERVED in
-  the same registry for the Pokemon arena and nothing mints it yet (the lobby
-  does not list the arena). Only an OLDER code with a random first character
+  includes the Game Boy Advance ('B') and the Pokemon Arena ('A') — so a joiner who
+  types only a GBA or Arena code is taken to that console without being asked, like
+  every other console. Only an OLDER code with a random first character
   still gets the "which console?" question. tools/multiplayer_page_test.mjs
   pins the registry (gba 'B', pokemonarena 'A', no tag shared) and the engine's
   behaviour for it, and that registering them reclassified no other page path.
@@ -335,6 +335,13 @@
         { key: 'Kirby Nightmare in Dreamland', label: 'Kirby Nightmare in Dreamland', seats: [2, 3, 4] },
         { key: 'Sonic Advance 3',              label: 'Sonic Advance 3',              seats: [2] },
       ] },
+    // POKEMON ARENA. Not an emulator: a turn-based battle. Both browsers run the same deterministic engine (pokemonarena/js/engine.js) and only the two players'
+    // CHOICES cross the wire (pokemonarena/js/netmatch.js: commit-reveal, a shared seed neither player controls, a state hash on every turn), so it is lockstep in
+    // exactly the sense every other page here is. Pairing, the host's approval of the joiner and the relay fallback are lib/netplay.js, as everywhere. The game key
+    // is js/online.js GAME_KEY; tools/multiplayer_page_test.mjs pins the two together. hostFlag is host=1 like the cartridge pages: a bare ?np= means "fill the join box".
+    { key: 'pokemonarena', name: 'Pokemon Arena', page: '/pokemonarena/battle.html', handoff: '/pokemonarena/battle.html?np=', hostFlag: 'host=1',
+      players: 2, note: 'Two players, one battle: bring a saved team or take a random one. Both of you run the battle on your own device, so nothing is streamed. 3v3 or 6v6, chosen by the host.',
+      games: [ { key: 'Pokemon Arena', label: 'Pokemon Arena (battle a friend)' } ] },
   ];
   var BY_KEY = {};
   CONSOLES.forEach(function (c) { BY_KEY[c.key] = c; });

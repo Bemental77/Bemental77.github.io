@@ -168,6 +168,7 @@ await withBrowserMulti({ port: CDP_PORT, windows: 1, width: 1280, height: 800 },
     genesis:   { path: '/genesis.html',   host: { host: '1' }, join: { join: '1' } },
     snes:      { path: '/snes.html',      host: { host: '1' }, join: { join: '1' } },
     ps1:       { path: '/ps1.html',       host: { host: '1' }, join: { join: '1' } },
+    pokemonarena: { path: '/pokemonarena/battle.html', host: { host: '1' }, join: { join: '1' } },
   };
   if (want('core')) {
     const { p, nav } = await lobbyPage(false);

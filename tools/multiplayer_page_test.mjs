@@ -199,7 +199,7 @@ function judgeGba({ lobbyHtml, room, romlist, solo, gbaHtml, netplaySrc, netplay
       if (owner) regBad.push(`'${v}' (${k}'s tag) is already ${owner}'s`);
     }
   }
-  put('gba-room-code-registry', !regBad.length, regBad.length ? regBad.join('; ') : `CODE_TAGS ${JSON.stringify(tags)}: gba 'B', pokemonarena 'A' (reserved for the arena, nothing mints it), every tag unique`);
+  put('gba-room-code-registry', !regBad.length, regBad.length ? regBad.join('; ') : `CODE_TAGS ${JSON.stringify(tags)}: gba 'B', pokemonarena 'A' (the Arena's online matches), every tag unique`);
 
   // the engine's behaviour, not just its table: the real makeCode / consoleOfCode evaluated with a chosen location.pathname
   const engineAt = (pathname) => {
@@ -384,6 +384,8 @@ const RECEIVER = {
   genesis:   { file: 'genesis.html',   params: ['np', 'game', 'join', 'host'] },
   snes:      { file: 'snes.html',      params: ['np', 'game', 'join', 'host'] },
   ps1:       { file: 'ps1.html',       params: ['np', 'game', 'join', 'host'] },
+  // Pokemon Arena: the receiver is the battle page's online module (battle_boot.js hands it location.search); a battle, not a core
+  pokemonarena: { file: 'pokemonarena/js/online.js', params: ['np', 'game', 'join', 'host'] },
 };
 for (const [key, r] of Object.entries(RECEIVER)) {
   const c = byKey[key];
@@ -405,6 +407,20 @@ for (const [key, r] of Object.entries(RECEIVER)) {
   unread.length
     ? bad(`${key}-receiver-reads-${r.params.join('+')}`, `${r.file} never reads ?${unread.join(', ?')} — a hand-off would land on a page that ignores part of its URL`)
     : ok(`${key}-receiver-reads-${r.params.join('+')}`, r.file);
+}
+
+// Pokemon Arena: the one game the lobby names is the one the page's own module names, and it is not a single-player title
+{
+  const { GAME_KEY } = await import(pathToFileURL(path.resolve('pokemonarena/js/online.js')).href);
+  const c = byKey.pokemonarena;
+  c && c.games.length === 1 && c.games[0].key === GAME_KEY && c.players === 2 && c.page === '/pokemonarena/battle.html'
+    ? ok('pokemonarena-lobby-entry-matches-online.js', `game "${GAME_KEY}", 2 players, ${c.page}`)
+    : bad('pokemonarena-lobby-entry-matches-online.js', c ? `lobby game=${JSON.stringify(c.games.map((g) => g.key))} online.js GAME_KEY="${GAME_KEY}" players=${c.players} page=${c.page}` : 'multiplayer.html has no pokemonarena entry');
+  const ctxM = { window: {}, location: { search: '' } };
+  vm.runInNewContext(read('lib/mpgames.js'), ctxM);
+  (ctxM.window.MPGames.SOLO.pokemonarena || []).length === 0 && ctxM.window.MPGames.canRoom('pokemonarena', GAME_KEY)
+    ? ok('pokemonarena-is-roomable', 'not a single-player title')
+    : bad('pokemonarena-is-roomable', 'MPGames says the Arena cannot be roomed');
 }
 
 // The invite link the lobby mints must come back to THIS page with the three

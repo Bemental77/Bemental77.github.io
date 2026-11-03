@@ -37,6 +37,7 @@ const PAGES = [
   'dreamcast_multiplayer.html', 'gamecube_multiplayer.html', 'ps1_multiplayer.html',
   'snes_multiplayer.html', 'genesis_multiplayer.html', 'gba_multiplayer.html',
   'n64_multiplayer.html', 'multiplayer.html', 'mp4-native.html',
+  'pokemonarena/battle.html',        // online play: two players on different builds are told apart by this stamp
 ];
 
 const CHECK = process.argv.includes('--check');

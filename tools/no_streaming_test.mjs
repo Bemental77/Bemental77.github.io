@@ -32,6 +32,9 @@ const PAGES = [
   'snes_multiplayer.html', 'gba_multiplayer.html', 'genesis_multiplayer.html',
   'n64_multiplayer.html',
   'multiplayer.html',
+  // Pokemon Arena: a turn-based battle. Both browsers run the same engine and only the two players' choices cross the wire (pokemonarena/js/netmatch.js);
+  // the page-side module is where the session is opened and the wire message is routed, so that is the file this gate reads.
+  'pokemonarena/js/online.js',
 ];
 
 // Machinery that only exists to stream one machine's picture to another. Each
@@ -48,7 +51,8 @@ const STREAMING = [
 // Evidence the page drives the lockstep loop itself, rather than merely
 // mentioning it. `lsInput`/`beginFrame` are the frame-gated feed; a page that
 // says "lockstep" in a comment and never feeds a frame is still streaming.
-const LOCKSTEP = ['beginFrame', 'lsInput', 'lsNormalize', 'submitHash'];
+// 'lsarena' is the turn-based game's wire message (every machine runs the engine; only the players' choices cross): the Arena's lockstep, with no frame to gate.
+const LOCKSTEP = ['beginFrame', 'lsInput', 'lsNormalize', 'submitHash', 'lsarena'];
 
 // ⚠ COMMENTS MUST BE STRIPPED AS BLOCKS, NOT AS LINES. A page that REMOVED the
 // streaming machinery says so in prose — dreamcast.html:394 reads "There is no
@@ -87,6 +91,7 @@ const LOBBY_HANDOFF = {
     // page above) and the lobby has handed to it since stage GR4. gba_multiplayer.html stays a plain redirect: it
     // has no online code of its own, so like the other *_multiplayer.html redirects it is reported n/a.
     { to: 'gba.html',       link: /\/gba\.html\?np=/ },
+    { to: 'pokemonarena/js/online.js', link: /\/pokemonarena\/battle\.html\?np=/ },
   ] },
 };
 
@@ -116,7 +121,7 @@ for (const p of PAGES) {
   // token, NetplayUI.mount, so a page that renamed its label and later stopped
   // mounting the shared lobby would silently fall out of scope and be reported
   // n/a instead of checked. The party tokens are added for that reason.
-  const online = /netHostBtn|lobbyCard|Play Online|Party ·|netParty|gcNetParty|NetplayHost|NetplayUI\.mount|Netplay\.(Session|Lockstep|makeCode)/.test(stripped);
+  const online = /netHostBtn|lobbyCard|Play Online|Party ·|netParty|gcNetParty|NetplayHost|NetplayUI\.mount|Netplay\.(Session|Lockstep|makeCode)|lsarena/.test(stripped);
   if (!online) { console.log(`  n/a   ${p} — no online play`); skipped++; continue; }
   scoped++;
 
