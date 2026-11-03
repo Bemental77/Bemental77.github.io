@@ -2,7 +2,7 @@
 //
 //   node tools/pokemonarena_fullscreen_test.mjs               Node units for the switch, then real Chrome on both pages at eight viewports
 //   node tools/pokemonarena_fullscreen_test.mjs --units       the Node units only (and their mutants)
-//   node tools/pokemonarena_fullscreen_test.mjs --mutants     ... and break screenfit.js / the stylesheets / the pages 18 + 10 ways: each must fail a named check
+//   node tools/pokemonarena_fullscreen_test.mjs --mutants     ... and break screenfit.js / the stylesheets / the pages 18 + 12 ways: each must fail a named check
 //   ARENA_PORT=8098 ARENA_CDP=9284 ARENA_OVERLAY_PORT=8118 ARENA_OUT=<dir for screenshots>
 //   ARENA_ORIGIN=https://caseybement.com      run the browser part against a DEPLOYED site (no local server, no mutants)
 //
@@ -185,7 +185,7 @@ const snapJs = (spec) => `(() => { const b = document.body, c = document.getElem
   const q = (sel) => { const e = document.querySelector(sel); if (!e) return null; const x = e.getBoundingClientRect(), cs = getComputedStyle(e); return { l: x.left, t: x.top, r: x.right, b: x.bottom, w: x.width, h: x.height, shown: x.width > 0 && x.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden', pressed: e.getAttribute('aria-pressed'), label: e.getAttribute('aria-label') }; };
   return { full: b.dataset.full, edge: b.dataset.edge, layout: b.dataset.layout, pad: b.dataset.pad, fsEl: document.fullscreenElement ? document.fullscreenElement.tagName : null, ss: (() => { try { return sessionStorage.getItem('arena.fullscreen'); } catch (_e) { return 'x'; } })(),
     vw: document.documentElement.clientWidth, vh: innerHeight, sw: document.documentElement.scrollWidth, cw: r.width, ch: r.height, cl: r.left, ct: r.top, cr: r.right, cb: r.bottom, border: parseFloat(getComputedStyle(c).borderLeftWidth), k: ${spec.hook}.scale && ${spec.hook}.scale.k,
-    wrap: q('#screenWrap'), top: q('#top'), fullBtn: q('#fullBtn'), fullExit: q('#fullExit'), prompt: q('.arena-sndprompt'), promptHidden: (() => { const p = document.querySelector('.arena-sndprompt'); return !p || p.hidden; })(), promptCrammed: (() => { const p = document.querySelector('.arena-sndprompt'); return !!p && p.hasAttribute('data-overlap'); })(),
+    wrap: q('#screenWrap'), dpad: q('#dpad'), ab: q('#ab'), top: q('#top'), fullBtn: q('#fullBtn'), fullExit: q('#fullExit'), prompt: q('.arena-sndprompt'), promptHidden: (() => { const p = document.querySelector('.arena-sndprompt'); return !p || p.hidden; })(), promptCrammed: (() => { const p = document.querySelector('.arena-sndprompt'); return !!p && p.hasAttribute('data-overlap'); })(),
     pads: [...document.querySelectorAll('#dpad .pbtn, #ab .pbtn')].map((e) => { const x = e.getBoundingClientRect(); return { id: e.id, l: x.left, t: x.top, r: x.right, b: x.bottom, w: x.width, h: x.height }; }) }; })()`;
 const hit = (a, b, pad = 0) => a && b && a.l < b.r - pad && a.r > b.l + pad && a.t < b.b - pad && a.b > b.t + pad;
 const asBox = (s) => ({ l: s.cl, t: s.ct, r: s.cr, b: s.cb });
@@ -229,6 +229,13 @@ async function runViewport(page, base, name, spec, vp, { deepChecks = true, shot
   ok(Math.abs(S0.cw / S0.ch - 1.5) < 0.01, tag + 'the picture is 3:2', `${S0.cw}x${S0.ch}`);
   if (portraitPad) ok(S0.edge === '1' && S0.border === 0 && Math.abs(S0.cw - S0.vw) < 0.5 && S0.cl === 0, tag + 'held upright the picture runs edge to edge (' + S0.cw.toFixed(1) + ' of ' + S0.vw + ' css px, no frame)', JSON.stringify([S0.edge, S0.border, S0.cl]));
   if (portraitPad) ok(S0.wrap && Math.abs(S0.wrap.l) < 0.5 && Math.abs(S0.wrap.w - S0.vw) < 0.5, tag + 'the screen box itself spans the viewport (its margins reach over the page gutters), so the loading / error panels inside it are sized from the real width', JSON.stringify(S0.wrap));
+  // THE CONTROLS ARE WITHIN THUMB REACH, NOT GLUED TO THE BOTTOM EDGE. A real phone (a tall one, in fullscreen) showed them on the very bottom edge, where the system's swipe-up gesture lives and
+  // where the browser's "exit full screen" toast lands on top of them; they now sit in the middle of the free room under the picture. A phone with no room to spare keeps them under the picture.
+  if (portraitPad && vp.roomy) {
+    const d = S0.dpad, a = S0.ab, mid = (d.t + d.b) / 2;
+    ok(d.b <= S0.vh - 100 && a.b <= S0.vh - 100, tag + 'the touch buttons end at least 100 css px above the bottom edge (d-pad ' + Math.round(S0.vh - d.b) + ', A/B ' + Math.round(S0.vh - a.b) + ')', JSON.stringify([d, a, S0.vh]));
+    ok(mid >= S0.vh * 0.55 && mid <= S0.vh * 0.82, tag + 'the d-pad sits in the lower middle of the screen, not at its edge (centre at ' + Math.round((mid / S0.vh) * 100) + ' % of the height)', JSON.stringify([d, S0.vh]));
+  }
   if (vp.n === 'land844x390') ok(S0.cw >= spec.floorLand844, tag + 'held sideways the picture is not smaller than the old whole-scale rule gave it (' + S0.cw.toFixed(0) + ' >= ' + spec.floorLand844 + ')', String(S0.cw));
   if (vp.n === 'desk1280x800') ok(S0.cw >= spec.floorDesk, tag + 'on a desktop it is not smaller than the old whole-scale rule gave it (' + S0.cw.toFixed(0) + ' >= ' + spec.floorDesk + ')', String(S0.cw));
   const pads0 = S0.pads.filter((p) => p.w > 0);
@@ -313,6 +320,8 @@ const SHOTS = process.env.ARENA_SKIP_SHOTS !== '1';
 
 /* =============================================================================================== 3. mutants of the page code and the stylesheets */
 const PAGE_MUTANTS = [
+  { id: 'the controls go back to the very bottom edge', file: 'battle.css', from: 'body[data-pad="on"][data-layout="portrait"] #dpad, body[data-pad="on"][data-layout="portrait"] #ab { align-self: center; }', to: 'body[data-pad="on"][data-layout="portrait"] #dpad, body[data-pad="on"][data-layout="portrait"] #ab { align-self: end; margin-bottom: 6px; }', only: 'battle', vps: ['phone390x844'] },
+  { id: 'the hub: the controls go back to the very bottom edge', file: 'arena.css', from: 'body[data-pad="on"][data-layout="portrait"] #dpad, body[data-pad="on"][data-layout="portrait"] #ab { align-self: center; }', to: 'body[data-pad="on"][data-layout="portrait"] #dpad, body[data-pad="on"][data-layout="portrait"] #ab { align-self: end; margin-bottom: 6px; }', only: 'hub', vps: ['phone412x915'] },
   { id: 'the old rule: a whole scale only', file: 'js/screenfit.js', from: 'if (whole / exact >= SNAP) return', to: 'if (true) return', only: 'battle', vps: ['phone390x844'] },
   { id: 'edge-to-edge CSS removed (the picture keeps its gutters)', file: 'battle.css', from: 'body[data-edge="1"] #screenWrap { margin-inline: calc(var(--gutter) * -1); width: calc(100% + var(--gutter) * 2); max-width: none; }', to: '', only: 'battle', vps: ['phone390x844'] },
   { id: 'the frame stays on a phone', file: 'battle.css', from: 'body[data-pad="on"] canvas#battle, body[data-edge="1"] canvas#battle, body[data-full="1"] canvas#battle { border-width: 0; border-radius: 0; }', to: '', only: 'battle', vps: ['phone390x844'] },

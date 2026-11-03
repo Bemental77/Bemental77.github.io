@@ -218,10 +218,10 @@ export function createSoundSystem(opts = {}) {
     const p = S.prompt;
     if (!p || p.hidden || !win || !doc) return;
     const vw = doc.documentElement.clientWidth, vh = win.innerHeight, G = 8, PAD = 2;
-    const obs = [], wts = []; let canvasPage = false;          // wts: what covering each costs. The picture, the touch pad and the header's controls cost 10; a dim footer line costs 1, so on a page too full for a free spot the pill goes over a footer line, never over a touch button
-    for (const sel of PROMPT_OBSTACLES) { const el = doc.querySelector(sel); const r = el ? rectOf(el) : null; if (r) { obs.push(r); wts.push(PROMPT_FOOTERS.includes(sel) ? 1 : 10); if (sel === 'canvas') canvasPage = true; } }
+    const obs = [], wts = []; let canvasPage = false;          // wts: what covering each costs. The picture costs 30, the header's controls 20, a touch pad cluster or the hub's lobby link 10, a dim footer line 1: on a page too full for a free spot the pill goes over the cheapest thing, and never over the picture while anything else will do
+    for (const sel of PROMPT_OBSTACLES) { const el = doc.querySelector(sel); const r = el ? rectOf(el) : null; if (r) { obs.push(r); wts.push(sel === 'canvas' ? 30 : PROMPT_FOOTERS.includes(sel) ? 1 : 10); if (sel === 'canvas') canvasPage = true; } }
     const head = doc.getElementById('top'); const headBox = head ? rectOf(head) : null; const kids = [];
-    if (head) for (const k of Array.from(head.children)) { const r = ownRect(k); if (r) { obs.push(r); wts.push(10); kids.push(r); } }
+    if (head) for (const k of Array.from(head.children)) { const r = ownRect(k); if (r) { obs.push(r); wts.push(20); kids.push(r); } }
     const lowest = obs.reduce((m, o) => Math.max(m, o.bottom), 0);
     // the widest free stretch of the header's first row
     let gap = null;

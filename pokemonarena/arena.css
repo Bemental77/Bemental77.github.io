@@ -132,12 +132,12 @@ body[data-pad="on"] canvas#hub:focus-visible, body[data-edge="1"] canvas#hub:foc
 /* edge to edge: the screen's box reaches over the page's gutters (the margin-box stays the grid area, so nothing widens the page) */
 body[data-edge="1"] #screenWrap { margin-inline: calc(var(--gutter) * -1); width: calc(100% + var(--gutter) * 2); max-width: none; }
 
-/* a phone held upright: the picture is as wide as the phone allows (its height is whatever 3:2 gives), so the room under it goes to the controls, at the bottom;
+/* a phone held upright: the picture is as wide as the phone allows (its height is whatever 3:2 gives), so the room under it goes to the controls, in the MIDDLE of that room: the very bottom edge is where a phone's swipe-up gesture lives and where the browser's "exit full screen" toast lands (a real phone showed both on top of the buttons), and it is the hardest place for a thumb to reach on a tall phone;
    the link to the online lobby stays up under the header, where it is seen */
 body[data-pad="on"][data-layout="portrait"] #top { order: -2; }
 body[data-pad="on"][data-layout="portrait"] #onlineLink { order: -1; }
 body[data-pad="on"][data-layout="portrait"] #play { flex: 1 1 auto; grid-template-rows: auto 1fr; }
-body[data-pad="on"][data-layout="portrait"] #dpad, body[data-pad="on"][data-layout="portrait"] #ab { align-self: end; margin-bottom: 6px; }
+body[data-pad="on"][data-layout="portrait"] #dpad, body[data-pad="on"][data-layout="portrait"] #ab { align-self: center; }
 
 /* the header on a phone stays ONE row (the way back, Sound, Controls, Fullscreen fit in 288 px): a second row would push the bottom touch buttons off a 568 px screen */
 @media (max-width: 480px) {
