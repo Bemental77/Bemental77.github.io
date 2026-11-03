@@ -1,12 +1,17 @@
+// ─── GBA input: keyboard + gamepad → the held-button flags script.js reads once per emulated frame ─────────────────────────────
+// This file only SETS FLAGS (Key_Up … Key_Action_R). script.js _getKeyMask() turns them into the 10-bit mask handed to
+// core.setKeys() before each core.runFrame(); the on-screen SP controls in gba.html set the same flags.
+//
+// 2026-11-01 (stage GP, gba.html brought to the site's page standard): this file used to end by calling
+// `window.myApp.setupInputController()` and was loaded by script.js with a random ?v= (so it was never cached). It is now a plain
+// <script> in gba.html, content-versioned like the core files, and MyClass.setupInputController() constructs it. Also gone:
+//   * setupMobileControls / menuTouch / mobilePress* / updateMobileControls — dead since the SP shell wires touch directly (they
+//     needed nipplejs and jQuery, neither of which this page loads, and called a myApp.sendMobileControls that does not exist);
+//   * the Remap_Check / Key_Last / Joy_Last hand-shake with the rivets remap modal — the remap panel in script.js captures its own
+//     keystrokes and gamepad presses now (the n64 page's design), so the controller never has to know a remap is in progress.
 class InputController {
 
     constructor() {
-
-        this.DebugKeycodes = false
-
-        this.Key_Last = ''
-        this.Joy_Last = null
-        this.Remap_Check = false
 
         this.Key_Up = false
         this.Key_Down = false
@@ -20,23 +25,11 @@ class InputController {
         this.Key_Action_R = false
         this.Key_Menu = false
 
-        this.MobileA = false
-        this.MobileB = false
-        this.MobileStart = false
-        this.MobileSelect = false
-        this.MobileL = false
-        this.MobileR = false
-
-        this.nippleDirection = 'none'
-        this.VectorX = 0
-        this.VectorY = 0
-
         this.KeyMappings = this.defaultKeymappings()
 
         document.onkeydown = this.keyDown.bind(this)
         document.onkeyup = this.keyUp.bind(this)
 
-        this.setGamePadButtons()
         this.setupGamePad()
         this.startGamepadLoop()
     }
@@ -53,6 +46,7 @@ class InputController {
             Mapping_Action_Select: 'v',
             Mapping_Action_L: 'q',
             Mapping_Action_R: 'e',
+            // Nothing reads Key_Menu (script.js has no menu hotkey); the mapping is kept so a visitor's saved mappings still load.
             Mapping_Menu: '`',
 
             Joy_Mapping_Left: 14,
@@ -78,10 +72,6 @@ class InputController {
         })
     }
 
-    setGamePadButtons() {
-        this.gamepadButtons = []
-    }
-
     startGamepadLoop() {
         const loop = () => {
             this.processGamepad()
@@ -94,146 +84,69 @@ class InputController {
         if (this.frameId) cancelAnimationFrame(this.frameId)
     }
 
+    // A pad only ever RELEASES what a pad pressed. The flags are shared with the keyboard and the on-screen controls, and an idle
+    // pad that is merely plugged in must not cancel them: this used to send a key-up for every flag that was set while the pad's
+    // button was up, so a connected-but-untouched gamepad silently swallowed the keyboard (and the touch controls) every frame.
+    // `_padHeld["flag|mapping"]` records the flags this pad set; only those are released. (tools/gba_page_standard_test.mjs 'browser E'.)
     processGamepad() {
+        const held = this._padHeld || (this._padHeld = {})
+        const release = () => {
+            for (const name of Object.keys(held)) {
+                if (!held[name]) continue
+                held[name] = false
+                const [flag, mapping] = name.split('|')
+                if (this[flag]) this.sendKeyUpEvent(this.KeyMappings[mapping])
+            }
+        }
         try {
             const gamepads = navigator.getGamepads ? navigator.getGamepads() : []
-            if (!gamepads) return
-
             let gp = null
-            for (let i = 0; i < gamepads.length; i++) {
-                if (gamepads[i] && gamepads[i].buttons.length > 0) {
-                    gp = gamepads[i]
+            if (gamepads) {
+                for (let i = 0; i < gamepads.length; i++) {
+                    if (gamepads[i] && gamepads[i].buttons.length > 0) {
+                        gp = gamepads[i]
+                    }
                 }
             }
 
-            if (!gp) return
+            if (!gp) { release(); return }       // unplugged mid-press: let go of what it held
 
-            for (let i = 0; i < gp.buttons.length; i++) {
-                if (this.DebugKeycodes && gp.buttons[i].pressed) console.log('joy:', i)
-                if (gp.buttons[i].pressed) this.Joy_Last = i
-            }
-
+            // read every source first, then decide per flag: a flag is held by the pad while ANY of its sources is on
+            const on = {}
+            const want = (flag, mapping, isOn) => { const k = flag + '|' + mapping; on[k] = on[k] || !!isOn }
             const btn = n => n >= 0 && gp.buttons[n] && gp.buttons[n].pressed
+            const km = this.KeyMappings
 
-            const set = (flag, joyBtn, keyMapping) => {
-                if (btn(joyBtn)) {
-                    if (!this[flag]) this.sendKeyDownEvent(this.KeyMappings[keyMapping])
-                } else {
-                    if (this[flag]) this.sendKeyUpEvent(this.KeyMappings[keyMapping])
+            want('Key_Up', 'Mapping_Up', btn(km.Joy_Mapping_Up))
+            want('Key_Down', 'Mapping_Down', btn(km.Joy_Mapping_Down))
+            want('Key_Left', 'Mapping_Left', btn(km.Joy_Mapping_Left))
+            want('Key_Right', 'Mapping_Right', btn(km.Joy_Mapping_Right))
+            want('Key_Action_A', 'Mapping_Action_A', btn(km.Joy_Mapping_Action_A))
+            want('Key_Action_B', 'Mapping_Action_B', btn(km.Joy_Mapping_Action_B))
+            want('Key_Action_Start', 'Mapping_Action_Start', btn(km.Joy_Mapping_Action_Start))
+            want('Key_Action_Select', 'Mapping_Action_Select', btn(km.Joy_Mapping_Action_Select))
+            want('Key_Action_L', 'Mapping_Action_L', btn(km.Joy_Mapping_Action_L))
+            want('Key_Action_R', 'Mapping_Action_R', btn(km.Joy_Mapping_Action_R))
+
+            const hx = gp.axes ? (gp.axes[0] || 0) : 0
+            const vy = gp.axes ? (gp.axes[1] || 0) : 0
+            want('Key_Left', 'Mapping_Left', hx < -0.35)
+            want('Key_Right', 'Mapping_Right', hx > 0.35)
+            want('Key_Down', 'Mapping_Down', vy > 0.35)
+            want('Key_Up', 'Mapping_Up', vy < -0.35)
+
+            for (const k of Object.keys(on)) {
+                const [flag, mapping] = k.split('|')
+                if (on[k]) {
+                    held[k] = true
+                    if (!this[flag]) this.sendKeyDownEvent(this.KeyMappings[mapping])
+                } else if (held[k]) {
+                    held[k] = false
+                    if (this[flag]) this.sendKeyUpEvent(this.KeyMappings[mapping])
                 }
             }
-
-            set('Key_Up', this.KeyMappings.Joy_Mapping_Up, 'Mapping_Up')
-            set('Key_Down', this.KeyMappings.Joy_Mapping_Down, 'Mapping_Down')
-            set('Key_Left', this.KeyMappings.Joy_Mapping_Left, 'Mapping_Left')
-            set('Key_Right', this.KeyMappings.Joy_Mapping_Right, 'Mapping_Right')
-            set('Key_Action_A', this.KeyMappings.Joy_Mapping_Action_A, 'Mapping_Action_A')
-            set('Key_Action_B', this.KeyMappings.Joy_Mapping_Action_B, 'Mapping_Action_B')
-            set('Key_Action_Start', this.KeyMappings.Joy_Mapping_Action_Start, 'Mapping_Action_Start')
-            set('Key_Action_Select', this.KeyMappings.Joy_Mapping_Action_Select, 'Mapping_Action_Select')
-            set('Key_Action_L', this.KeyMappings.Joy_Mapping_Action_L, 'Mapping_Action_L')
-            set('Key_Action_R', this.KeyMappings.Joy_Mapping_Action_R, 'Mapping_Action_R')
-
-            try {
-                let hx = gp.axes[0] || 0
-                let vy = gp.axes[1] || 0
-
-                if (hx < -0.35) {
-                    if (!this.Key_Left) this.sendKeyDownEvent(this.KeyMappings.Mapping_Left)
-                } else {
-                    if (this.Key_Left) this.sendKeyUpEvent(this.KeyMappings.Mapping_Left)
-                }
-
-                if (hx > 0.35) {
-                    if (!this.Key_Right) this.sendKeyDownEvent(this.KeyMappings.Mapping_Right)
-                } else {
-                    if (this.Key_Right) this.sendKeyUpEvent(this.KeyMappings.Mapping_Right)
-                }
-
-                if (vy > 0.35) {
-                    if (!this.Key_Down) this.sendKeyDownEvent(this.KeyMappings.Mapping_Down)
-                } else {
-                    if (this.Key_Down) this.sendKeyUpEvent(this.KeyMappings.Mapping_Down)
-                }
-
-                if (vy < -0.35) {
-                    if (!this.Key_Up) this.sendKeyDownEvent(this.KeyMappings.Mapping_Up)
-                } else {
-                    if (this.Key_Up) this.sendKeyUpEvent(this.KeyMappings.Mapping_Up)
-                }
-
-            } catch (e) { }
-
         } catch (e) { }
     }
-
-    setupMobileControls(touch_element_id) {
-        if (!touch_element_id) return
-
-        this.manager = nipplejs.create({
-            zone: document.getElementById(touch_element_id),
-            color: 'darkgray',
-            mode: 'dynamic'
-        })
-
-        this.manager.on('move', (evt, data) => {
-            window['myApp'].rivetsData.hadNipple = true
-            this.VectorX = data.vector.x
-            this.VectorY = data.vector.y
-        })
-
-        this.manager.on('end', () => {
-            this.Key_Left = false
-            this.Key_Right = false
-            this.Key_Up = false
-            this.Key_Down = false
-            this.VectorX = 0
-            this.VectorY = 0
-        })
-
-        const el = document.getElementById(touch_element_id)
-
-        el.addEventListener('touchstart', e => e.preventDefault(), false)
-        el.addEventListener('touchend', e => e.preventDefault(), false)
-        el.addEventListener('touchmove', e => e.preventDefault(), false)
-
-        const bind = (id, press, release) => {
-            const node = document.getElementById(id)
-            if (!node) return
-            node.addEventListener('touchstart', press.bind(this), false)
-            node.addEventListener('touchend', release.bind(this), false)
-            node.addEventListener('touchmove', e => e.preventDefault(), false)
-        }
-
-        bind('mobileA', this.mobilePressA, this.mobileReleaseA)
-        bind('mobileB', this.mobilePressB, this.mobileReleaseB)
-        bind('mobileStart', this.mobilePressStart, this.mobileReleaseStart)
-        bind('mobileSelect', this.mobilePressSelect, this.mobileReleaseSelect)
-        bind('mobileL', this.mobilePressL, this.mobileReleaseL)
-        bind('mobileR', this.mobilePressR, this.mobileReleaseR)
-
-        const menu = document.getElementById('menuDiv')
-        if (menu) menu.addEventListener('touchstart', this.menuTouch.bind(this), false)
-    }
-
-    menuTouch() {
-        $('#mobileButtons').show()
-        $('#menuDiv').hide()
-    }
-
-    mobilePressA(e) { e.preventDefault(); this.Key_Action_A = true; this.MobileA = true }
-    mobilePressB(e) { e.preventDefault(); this.Key_Action_B = true; this.MobileB = true }
-    mobilePressStart(e) { e.preventDefault(); this.Key_Action_Start = true; this.MobileStart = true }
-    mobilePressSelect(e) { e.preventDefault(); this.Key_Action_Select = true; this.MobileSelect = true }
-    mobilePressL(e) { e.preventDefault(); this.Key_Action_L = true; this.MobileL = true }
-    mobilePressR(e) { e.preventDefault(); this.Key_Action_R = true; this.MobileR = true }
-
-    mobileReleaseA(e) { e.preventDefault(); this.Key_Action_A = false; this.MobileA = false }
-    mobileReleaseB(e) { e.preventDefault(); this.Key_Action_B = false; this.MobileB = false }
-    mobileReleaseStart(e) { e.preventDefault(); this.Key_Action_Start = false; this.MobileStart = false }
-    mobileReleaseSelect(e) { e.preventDefault(); this.Key_Action_Select = false; this.MobileSelect = false }
-    mobileReleaseL(e) { e.preventDefault(); this.Key_Action_L = false; this.MobileL = false }
-    mobileReleaseR(e) { e.preventDefault(); this.Key_Action_R = false; this.MobileR = false }
 
     sendKeyDownEvent(key) {
         const ev = new KeyboardEvent('Gamepad Event Down', { key })
@@ -254,70 +167,56 @@ class InputController {
         return key
     }
 
-    keyDown(event) {
-        const key = this._normalizeArrow(event)
-        this.Key_Last = key
-
-        if (key === this.KeyMappings.Mapping_Up) this.Key_Up = true
-        if (key === this.KeyMappings.Mapping_Down) this.Key_Down = true
-        if (key === this.KeyMappings.Mapping_Left) this.Key_Left = true
-        if (key === this.KeyMappings.Mapping_Right) this.Key_Right = true
-        if (key === this.KeyMappings.Mapping_Action_A) this.Key_Action_A = true
-        if (key === this.KeyMappings.Mapping_Action_B) this.Key_Action_B = true
-        if (key === this.KeyMappings.Mapping_Action_Start) this.Key_Action_Start = true
-        if (key === this.KeyMappings.Mapping_Action_Select) this.Key_Action_Select = true
-        if (key === this.KeyMappings.Mapping_Action_L) this.Key_Action_L = true
-        if (key === this.KeyMappings.Mapping_Action_R) this.Key_Action_R = true
-        if (key === this.KeyMappings.Mapping_Menu) this.Key_Menu = true
+    // A letter compares case-insensitively: with Shift or Caps Lock down `e.key` is 'M', and a game key that stops answering because
+    // a modifier is held is not what anyone wants. Named keys ('Enter', 'ArrowUp') are left exactly as they are.
+    _same(key, mapping) {
+        if (typeof key === 'string' && key.length === 1 && typeof mapping === 'string' && mapping.length === 1) {
+            return key.toLowerCase() === mapping.toLowerCase()
+        }
+        return key === mapping
     }
 
+    // A key typed into the ROM picker, a file input or any text field is the visitor operating the PAGE, not the game: arrow keys
+    // move a <select> and must not also move the character. (The synthetic events the gamepad path builds have no target.)
+    _typingInPageControl(event) {
+        const t = event && event.target
+        const tag = t && t.tagName
+        return tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || !!(t && t.isContentEditable)
+    }
+
+    keyDown(event) {
+        if (this._typingInPageControl(event)) return
+        const key = this._normalizeArrow(event)
+        const km = this.KeyMappings
+
+        if (this._same(key, km.Mapping_Up)) this.Key_Up = true
+        if (this._same(key, km.Mapping_Down)) this.Key_Down = true
+        if (this._same(key, km.Mapping_Left)) this.Key_Left = true
+        if (this._same(key, km.Mapping_Right)) this.Key_Right = true
+        if (this._same(key, km.Mapping_Action_A)) this.Key_Action_A = true
+        if (this._same(key, km.Mapping_Action_B)) this.Key_Action_B = true
+        if (this._same(key, km.Mapping_Action_Start)) this.Key_Action_Start = true
+        if (this._same(key, km.Mapping_Action_Select)) this.Key_Action_Select = true
+        if (this._same(key, km.Mapping_Action_L)) this.Key_Action_L = true
+        if (this._same(key, km.Mapping_Action_R)) this.Key_Action_R = true
+        if (this._same(key, km.Mapping_Menu)) this.Key_Menu = true
+    }
+
+    // keyUp is NOT guarded: a key released while a form control has focus must still clear the flag it set before the focus moved.
     keyUp(event) {
         const key = this._normalizeArrow(event)
+        const km = this.KeyMappings
 
-        if (key === this.KeyMappings.Mapping_Up) this.Key_Up = false
-        if (key === this.KeyMappings.Mapping_Down) this.Key_Down = false
-        if (key === this.KeyMappings.Mapping_Left) this.Key_Left = false
-        if (key === this.KeyMappings.Mapping_Right) this.Key_Right = false
-        if (key === this.KeyMappings.Mapping_Action_A) this.Key_Action_A = false
-        if (key === this.KeyMappings.Mapping_Action_B) this.Key_Action_B = false
-        if (key === this.KeyMappings.Mapping_Action_Start) this.Key_Action_Start = false
-        if (key === this.KeyMappings.Mapping_Action_Select) this.Key_Action_Select = false
-        if (key === this.KeyMappings.Mapping_Action_L) this.Key_Action_L = false
-        if (key === this.KeyMappings.Mapping_Action_R) this.Key_Action_R = false
-        if (key === this.KeyMappings.Mapping_Menu) this.Key_Menu = false
-    }
-
-    update() {
-        this.processGamepad()
-
-        if (this.Remap_Check) {
-            if (this.Key_Last !== '' || this.Joy_Last !== null) {
-                window['myApp'].remapPressed()
-                this.Remap_Check = false
-            }
-        }
-    }
-
-    updateMobileControls() {
-        let s = ''
-        s += this.Key_Up ? '1' : '0'
-        s += this.Key_Down ? '1' : '0'
-        s += this.Key_Left ? '1' : '0'
-        s += this.Key_Right ? '1' : '0'
-        s += this.Key_Action_A ? '1' : '0'
-        s += this.Key_Action_B ? '1' : '0'
-        s += this.Key_Action_Start ? '1' : '0'
-        s += this.Key_Action_Select ? '1' : '0'
-        s += this.Key_Action_L ? '1' : '0'
-        s += this.Key_Action_R ? '1' : '0'
-
-        window['myApp'].sendMobileControls(s, this.VectorX.toString(), this.VectorY.toString())
+        if (this._same(key, km.Mapping_Up)) this.Key_Up = false
+        if (this._same(key, km.Mapping_Down)) this.Key_Down = false
+        if (this._same(key, km.Mapping_Left)) this.Key_Left = false
+        if (this._same(key, km.Mapping_Right)) this.Key_Right = false
+        if (this._same(key, km.Mapping_Action_A)) this.Key_Action_A = false
+        if (this._same(key, km.Mapping_Action_B)) this.Key_Action_B = false
+        if (this._same(key, km.Mapping_Action_Start)) this.Key_Action_Start = false
+        if (this._same(key, km.Mapping_Action_Select)) this.Key_Action_Select = false
+        if (this._same(key, km.Mapping_Action_L)) this.Key_Action_L = false
+        if (this._same(key, km.Mapping_Action_R)) this.Key_Action_R = false
+        if (this._same(key, km.Mapping_Menu)) this.Key_Menu = false
     }
 }
-
-window['myApp'].setupInputController()
-
-var rando3 = Math.floor(Math.random() * 100000)
-var wasmScript = document.createElement('script')
-wasmScript.src = '/gba/gbaWasm/dist/44gba.js?v=' + rando3
-document.getElementsByTagName('head')[0].appendChild(wasmScript)

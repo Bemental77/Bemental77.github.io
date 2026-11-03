@@ -49,6 +49,15 @@ send.email.ts
 /ps1/duckstation-master
 /gamecube/docs
 /dreamcast/docs
+# gba/mgba is the mGBA wasm build (see gba/mgba/README.md): the recipe, its patches and its notes are development
+# files, not served. What IS served from gba/mgba/: dist/ (core + glue + buildinfo, loaded by the page) plus SOURCE.md
+# and LICENSE-MPL-2.0. The last two stay deployable on purpose: MPL-2.0 section 3.2(a) obliges whoever distributes the
+# Executable Form to tell recipients how to obtain its source, and the served SOURCE.md is where the binary does that.
+/gba/mgba/build.sh
+/gba/mgba/patches
+/gba/mgba/README.md
+# pokemonarena/dev holds developer fixtures the tests drive (the input lab, the IndexedDB smoke page): not part of the game, never served
+/pokemonarena/dev
 
 # ─── OFFSITE-BEGIN ──────────────────────────────────────────────────────────
 # NOT "not on the site" — SERVED FROM A DIFFERENT REPO, SAME ORIGIN.

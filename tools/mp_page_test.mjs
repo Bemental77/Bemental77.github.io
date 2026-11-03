@@ -155,8 +155,11 @@ const PLATFORMS = {
     game: 'Sonic Advance 3',
     assetPrefix: ['/gba/'],
     bootMs: 180000,
-    // ⚠ SHARED, NOT p2 — a Game Boy Advance has one controller. See
-    // gba_multiplayer.html's header for the export-table measurement.
+    // ⚠ SHARED, NOT p2 — this block is the STREAMING-ERA description of the 44vba core, which had one KEYINPUT register
+    // and no link cable (it asserted `_emuRunFrame` below; that export is gone). It is not true of gba.html any more:
+    // since 2026-11-01 the page runs mGBA, which hosts several linked GBAs in one wasm instance, and forms lockstep link-cable
+    // rooms itself (gba/mgba/README.md "The room page"); /gba_multiplayer.html is a redirect and `__gbamp` exists on no page.
+    // This whole harness is retired (tools/audit_all.mjs NOT_RUN); GBA rooms are tested by tools/gba_netplay_test.mjs.
     players: 'shared',
     romLabels: () => [...fs.readFileSync('gba/gbaWasm/dist/romlist.js', 'utf8')
       .matchAll(/title:\s*"([^"]+)"/g)].map((m) => m[1]),

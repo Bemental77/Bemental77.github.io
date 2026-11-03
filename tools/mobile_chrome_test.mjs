@@ -89,8 +89,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // THE PAGES. Every selector below was read out of the live file, not assumed —
 // the six emulator shells are near-copies of each other but they are NOT
 // identical: only dreamcast.html carries a Play Online entry INSIDE the mobile
-// menu (#mNet); ps1/snes/genesis/n64 put theirs on the splash only; gamecube.html
-// has no mobile netplay entry at all; gba.html has its own shell ids entirely.
+// menu (#mNet) - and, since the rooms stage, gba.html, which has one in both places;
+// ps1/snes/genesis/n64 put theirs on the splash only; gamecube.html has no mobile
+// netplay entry at all. (gba.html's own shell ids went with the page-standard stage.)
 // ---------------------------------------------------------------------------
 const PAGES = [
   { name: 'dreamcast', url: '/dreamcast.html',
@@ -160,19 +161,19 @@ const PAGES = [
     menuBtn: '#mobileMenuBtn', menu: '#mobileMenu', menuOpenClass: 'open',
     menuNet: null, splashNet: '#mobileSplashNet' },
 
-  // gba.html is the odd one out in every respect: its shell is #spShell (not
-  // #mobileShell), it has NO splash — the desktop Play button starts it and the
-  // vendored script.js:866 calls spActivate() — and its Play Online entry lives
-  // INSIDE the menu as #spNetBtn. It is also the one page of the six that never
-  // had a #rotateHint at all.
+  // ⚠ gba.html IS NO LONGER THE ODD ONE OUT, AND THIS ROW DESCRIBED THE PAGE IT WAS. It used to have its own shell
+  // (#spShell), no splash (the desktop #btnPlayGame started it) and a menu of its own (#spMenuBtn / #spMenuOverlay), and
+  // `menuNet`/`splashNet` were null because "a Game Boy Advance has one KEYINPUT register and this core implements no link
+  // cable". Since 2026-11-01 it is on the family's page standard (the same #mobileShell / #mobileSplash / #mobileMenuBtn /
+  // #mobileMenu ids as genesis; none of #spShell, #btnPlayGame, #spMenuBtn, #spMenuOverlay exists in gba.html) and it forms
+  // link-cable rooms (mGBA hosts several linked GBAs in one wasm instance), with a Party entry in both places a phone can
+  // reach it: #mobileSplashNet on the splash (a joiner never starts a game, so the splash is the only route they have) and
+  // #mNet inside the menu. The old comment and null entries were true of the 44vba core, which no longer ships.
   { name: 'gba', url: '/gba.html',
-    shell: '#spShell', start: '#btnPlayGame',
+    shell: '#mobileShell', start: '#mobileSplashStart',
     seam: '__gbaNet', liveField: 'live', liveMs: 240000,
-    menuBtn: '#spMenuBtn', menu: '#spMenuOverlay', menuOpenClass: 'open',
-    // ⚠ menuNet is null since 2026-09-08 — a Game Boy Advance has one KEYINPUT
-    // register and this core implements no link cable, so there is no second
-    // controller to give anybody and #spNetBtn was removed.
-    menuNet: null, splashNet: null },
+    menuBtn: '#mobileMenuBtn', menu: '#mobileMenu', menuOpenClass: 'open',
+    menuNet: '#mNet', splashNet: '#mobileSplashNet' },
 
   // ---- the seven /*_multiplayer.html pages --------------------------------
   // They have no emulator, no splash and no hamburger, and what can go wrong is
@@ -546,7 +547,7 @@ async function cell(spec, orient) {
     const shell = await probe(page, spec.shell);
     out.push('    shell: ' + fmt(shell));
     if (!shell.present || shell.display === 'none') {
-      // gba has no isMobile branch — its shell only appears once a ROM loads.
+      // (a page with no splash shows its shell only once a ROM loads; gba.html used to be that page - it has a splash now)
       if (!spec.start) { rec.verdict = 'VOID'; out.push('    VOID: shell never shown'); return rec; }
     }
 

@@ -53,8 +53,8 @@ const SOURCES = [
   'ps1.html',
   'gba.html',
   'snes.html',
-  'gba/gbaWasm/dist/script.js',          // -> input_controller.js
-  'gba/gbaWasm/dist/input_controller.js', // -> 44gba.js
+  'gba/gbaWasm/dist/script.js',          // -> input_controller.js; its mGBA locateFile literal is invisible to the scanner (ALWAYS_REQUIRED)
+  'gba/gbaWasm/dist/input_controller.js', // keys/gamepad only since the mGBA port: it no longer injects a core (it used to load 44gba.js)
   'genesis.html',
 ];
 
@@ -71,8 +71,17 @@ const ALWAYS_REQUIRED = new Map([
    'wasmpsx_worker.js locateFile("wasmpsx_worker.wasm")'],
   ['/ps1/ps1Wasm/dist/wasmpsx_worker.data',
    'wasmpsx_worker.js preload package — it CONTAINS THE PSX BIOS at /bios/ps-41a.bin; without it the emulator has no BIOS to boot'],
-  ['/gba/gbaWasm/dist/44gba.wasm',
-   'gba script.js Module.locateFile = p => "/gba/gbaWasm/dist/" + p'],
+  // gba.html runs mGBA now (stage G3). The row that stood here, /gba/gbaWasm/dist/44gba.wasm
+  // ("gba script.js Module.locateFile = p => '/gba/gbaWasm/dist/' + p"), described a load the page no longer makes -
+  // tools/gba_mgba_solo_test.mjs asserts that no 44gba file is requested - so it was a requirement for nothing, and a
+  // requirement for nothing is how a list like this turns into the wish list its header warns about. The files stay in the
+  // repo; the deploy no longer has to prove them. What the page DOES load, spelled out because no URL scanner can see it:
+  ['/gba/mgba/dist/mgba_core.wasm',
+   'gba script.js _bootCore(): MgbaCore.create({ locateFile: p => p === "mgba_core.wasm" ? "/gba/mgba/dist/mgba_core.wasm?v=" + MGBA_WASM_V : ... }) - a ternary, not a literal fetch(); the room path fetches it too (gba.html fetch("/gba/mgba/dist/mgba_core.wasm?v=" + ...))'],
+  ['/gba/mgba/dist/mgba_core.js', 'gba.html <script src="/gba/mgba/dist/mgba_core.js?v=..."> (the Emscripten factory createMgbaCore)'],
+  ['/gba/mgba/mgba_core.js', 'gba.html <script src="/gba/mgba/mgba_core.js?v=..."> (window.MgbaCore, the adapter)'],
+  ['/gba/mgba/room.js',
+   'gba.html: var ROOM_JS = "/gba/mgba/room.js?v=..." then a DYNAMIC import() of it - the room protocol; a deploy that dropped it would leave every room unable to form while solo play looked fine'],
   ['/snes/snesWasm/snes9x_2005.wasm',
    'snes.html Module.locateFile = p => "/snes/snesWasm/" + p'],
   // ⚠ THE ONE RUNTIME URL ON THE N64 PAGE THAT NOTHING CAN SEE. It is a bare

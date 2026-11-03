@@ -1,0 +1,60 @@
+{
+  "source": {
+    "repo": "https://github.com/Spuds0588/mgba-splitscreen.git",
+    "commit": "f1d5975d77285f77affbfe64b7050ebd5c4b6a77",
+    "patches": [
+      "0001-cmake-honor-use-pthreads-off.patch",
+      "0002-lockstep-no-fs-assist-link-witnesses.patch",
+      "0003-gba-remove-irq-trace-add-sio-irq-witness.patch",
+      "0004-gpio-rtc-pinned-utc-offset.patch"
+    ],
+    "patchedTreeDiffSha256": "f7bcbb9f1c65f484e4983e8174ffe8bea400a85630514d749e9b08cc5e04cc31"
+  },
+  "toolchain": {
+    "emscripten": "6.0.2 (7a2d97d627ff4945eae28847ce0387ac52b92c09)",
+    "cmake": "4.4.4",
+    "ninja": "1.13.2.git.kitware.jobserver-pipe-1"
+  },
+  "bridge": {
+    "sha256_of_LF_normalised_sources": {
+      "bridge/bemental_gba.c": "91c129e5e8b5d1ed06a517aa655eb7fe1561ec0e30376c451cd8d2cd73672651",
+      "bridge/bemental_gba.h": "94d1891624feb77209e032dc2fb73ec6ca8ab077d794f2930708b50072194630",
+      "bridge/legacy_mgs.c": "dfd2c898b5570646c20b72212be9883e07509f574e055c5287ff0fff7445f3db"
+    }
+  },
+  "threads": "none (USE_PTHREADS=OFF, no -pthread, no SharedArrayBuffer)",
+  "libmgbaDefines": [
+    "-DBUILD_STATIC",
+    "-DENABLE_DIRECTORIES",
+    "-DENABLE_VFS",
+    "-DENABLE_VFS_FD",
+    "-DHAVE_FREELOCALE",
+    "-DHAVE_FUTIMENS",
+    "-DHAVE_LOCALE",
+    "-DHAVE_LOCALTIME_R",
+    "-DHAVE_NEWLOCALE",
+    "-DHAVE_REALPATH",
+    "-DHAVE_SETLOCALE",
+    "-DHAVE_STRDUP",
+    "-DHAVE_STRLCPY",
+    "-DHAVE_STRNDUP",
+    "-DHAVE_STRTOF_L",
+    "-DHAVE_USELOCALE",
+    "-DHAVE_VASPRINTF",
+    "-DHAVE_XLOCALE",
+    "-DM_CORE_GB",
+    "-DM_CORE_GBA",
+    "-D_GNU_SOURCE",
+    "-DNDEBUG"
+  ],
+  "link": {
+    "initialMemory": 201326592,
+    "allowMemoryGrowth": 0,
+    "environment": "web,node",
+    "exportName": "createMgbaCore"
+  },
+  "md5": {
+    "mgba_core.wasm": "13474b3883009819a5ac7304e568cb0a",
+    "mgba_core.js": "b2d6dba079610b9edc18ee994eb2a0b4"
+  }
+}

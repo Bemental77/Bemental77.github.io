@@ -14,10 +14,24 @@
 // passing, the entry is stale and this exits nonzero demanding it be closed or
 // rewritten. A todo list that can quietly go out of date is worse than none.
 // ---------------------------------------------------------------------------
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, readdirSync } from 'fs';
 import { createHash } from 'crypto';
 
 const read = (p) => (existsSync(p) ? readFileSync(p, 'utf8') : '');
+
+// ── the GBA entries below ─────────────────────────────────────────────────────────────────────────────────────────────────
+// GBA link-cable rooms exist (gba.html, 2026-11-01: every player runs ALL the linked cores of a room in one mGBA wasm instance, only
+// pad words and one battery image per seat cross the wire). These are the edges of that feature that are real gaps.
+// THE PIN. Several of them are properties of the shipped core binary (a thing the core does not do), and the only honest way to say
+// "this binary does not do X" is to tie the claim to THAT binary — the same device the mario-party-4 entry above uses. When the core is
+// rebuilt for ANY reason, every entry that cites the pin goes STALE together, which means: re-check each one (did the rebuild add the
+// thing?), then re-pin or close it. It is a forced re-read, not a failure.
+const GBA_CORE_MD5 = '13474b3883009819a5ac7304e568cb0a';   // gba/mgba/dist/mgba_core.wasm, 791,107 B (also in dist/mgba_core.buildinfo.json)
+const gbaCorePinned = () => existsSync('gba/mgba/dist/mgba_core.wasm') &&
+  createHash('md5').update(readFileSync('gba/mgba/dist/mgba_core.wasm')).digest('hex') === GBA_CORE_MD5;
+// The text from one marker up to the next one, or '' if either marker is missing. Every verify() that asks for an ABSENCE inside such a
+// slice also demands a positive anchor, so an unreadable or moved file cannot make a gap read as open (or closed) by accident.
+const between = (text, from, to) => { const i = text.indexOf(from); if (i < 0) return ''; const j = text.indexOf(to, i + from.length); return j < 0 ? '' : text.slice(i, j); };
 
 const OPEN = [
   // ── CLOSED 2026-09-09: 'vmu-does-not-carry-into-a-room' ────────────────────
@@ -161,6 +175,75 @@ const OPEN = [
     why: 'Dreamcast MAPLE_PORTS is 4 and N64 exposes 4; Since 2026-10-07 PS1 (ps1.html: a multitap in port 1 via pad_worker.c ps1_multitap when 3+ are seated), SNES and Genesis rooms seat 4 (snes.html: a Super Multitap via exports.c setMultitap when 3+ are seated; genesis.html: a Team Player / 4-Way Play via gpgx_shim.c gpx_set_multitap for a cart that takes one) — but no room opens more than 4 ports, and a SNES multitap has 4 pads behind it plus port 1 (5 players), a Genesis Team Player in each port 8: the core can, no page asks for it. init_sfc_setting still boots SNES_JOYPAD (the adaptor goes in per room).',
     evidence: 'ps1.html PS1_PORTS = 4 (one multitap: 4 slots; a second one in port 2 would make 8, no page asks for it); snes exports.c init_sfc_setting sets Settings.ControllerOption = SNES_JOYPAD.',
     verify: () => /ControllerOption\s*=\s*SNES_JOYPAD/.test(read('snes/snesWasm/source/exports.c')),
+  },
+
+  // ════ GBA LINK-CABLE ROOMS (plan G8, 2026-11-02) ═══════════════════════════════════════════════════════════════════════
+  // The user decided these are OUT OF SCOPE for the first delivery (docs/gba-link-and-arena-plan.md, stage GR5). Each is written down
+  // here so that "out of scope" cannot quietly turn into "forgotten". Every verify() reads a LIVE artifact or code shape in the place
+  // the gap is IN, never a sentence in a doc.
+  {
+    id: 'gba-wireless-adapter-games-cannot-be-served',
+    what: 'Games that link through the GBA Wireless Adapter (the RFU) cannot be played in a room - only the link CABLE can. That includes the Pokemon games\' wireless rooms; their Cable Club is the cable path and is a separate entry below.',
+    why: 'mGBA, the core the site ships, has no RFU driver, so there is nothing for a game to talk to. The shipped core is the pinned Spuds0588/mgba-splitscreen fork at f1d5975d + four patches + the site\'s own bridge, built to wasm md5 13474b38...; none of the four patches or the bridge adds an adapter, and a game that needs one never leaves its "searching for adapter" screen. A room cannot offer such a title, and it must not list one.',
+    evidence: 'gba/mgba/README.md "Manual SoulGold Cable Club recipe" step 6 ("The Wireless Adapter path cannot be served (mGBA has no RFU)"); docs/gba-link-and-arena-plan.md game matrix; gba/mgba/dist/mgba_core.buildinfo.json lists the four patches.',
+    // The binary itself, pinned: a rebuilt core is exactly the change that could have added a driver, so it forces a re-read.
+    verify: () => gbaCorePinned(),
+  },
+  {
+    id: 'gba-single-pak-multiboot-link-is-not-supported',
+    what: 'The link mode where ONE cartridge sends a program to GBAs that have NO cartridge (Single-Pak / multiboot) cannot be played in a room. Every seat of a room boots the same game from its own cartridge image, so only the Multi-Play (Multi-Pak) modes work.',
+    why: 'Kirby and Sonic Advance 3 each ship both kinds of link mode, and the rooms catalogue is built from their Multi-Play rows only (tools/gba_link_smoke.mjs: "SUB-GAMES -> Quick Draw -> MULTIPLAYER", "MULTI-PAK MODE"). Serving a multiboot image needs a way to start a seat WITHOUT a ROM and hand it the master\'s image over the simulated cable, and the bridge has no such entry point: it maps ONE ROM and gives it to every seat. No row exists, so no title is offered on the strength of one.',
+    evidence: 'gba/mgba/bridge/bemental_gba.c:205 `static uint8_t* g_rom` (the one ROM image); gba/mgba/mgba_core.js:78-86 loadRom(bytes) -> _bgb_load_rom(p, len, code); no `multiboot` identifier in the core adapter or the bridge.',
+    verify: () => gbaCorePinned() && /static uint8_t\* g_rom\b/.test(read('gba/mgba/bridge/bemental_gba.c')) &&
+      !/multiboot/i.test(read('gba/mgba/mgba_core.js') + read('gba/mgba/bridge/bemental_gba.c') + read('gba/mgba/bridge/bemental_gba.h')),
+  },
+  {
+    id: 'gba-mixed-rom-rooms-are-not-possible',
+    what: 'Every player of a room must be running the identical game file. Two players cannot link a Ruby cartridge to an Emerald one, or different regions or versions of one game.',
+    why: 'A room\'s config carries ONE romMd5 and the disc string every peer must repeat folds it, so a peer on another ROM is refused by name (ROOM_ROM); and the core takes one ROM for all of its seats (`bgb_load_rom(p, len, code)` has no seat argument). Nothing in the protocol, the adapter or the bridge can describe seats that differ in ROM, and the lockstep model needs every peer to simulate every seat from the same bytes, so this is a design property, not an oversight.',
+    evidence: 'gba/mgba/room.js CONFIG_KEYS = [... \'romMd5\' ...] (one ROM field) and the ROOM_ROM refusal; gba/mgba/mgba_core.js loadRom(bytes) calls _bgb_load_rom(p, rom.length, code); gba/mgba/bridge/bemental_gba.c:205.',
+    verify: () => gbaCorePinned() && /static uint8_t\* g_rom\b/.test(read('gba/mgba/bridge/bemental_gba.c')) &&
+      /_bgb_load_rom\(p, rom\.length, code\)/.test(read('gba/mgba/mgba_core.js')) &&
+      /const CONFIG_KEYS = \[[^\]]*'romMd5'[^\]]*\];/.test(read('gba/mgba/room.js')) && !/romMd5s|seatRoms|romsBySeat/.test(read('gba/mgba/room.js')),
+  },
+  {
+    id: 'gba-rooms-have-no-spectators',
+    what: 'A GBA room has only players. Nobody can join to watch a room, and a player cannot watch another seat\'s screen: the page draws the LOCAL seat and plays the local seat\'s sound.',
+    why: 'lib/netplay.js seats every connected peer in one of four ports (portCount 4); it has no read-only role, and neither has the page - a joiner is gameless until the host\'s N seats are filled, then every console boots all N cores. A spectator would need an engine role that receives the input stream without owning a port, and a page mode that simulates the room without contributing a save or a pad word. (The streaming spectator that used to exist is cancelled: spectating by video is exactly what the 2026-09-08 directive forbids; a lockstep spectator would be a peer that runs the cores and sends nothing.)',
+    evidence: 'grep of lib/netplay.js, gba.html and gba/mgba/room.js for spectate / isSpectator / `spectator:` finds none; the only "spectator" in lib/netplay.js is prose about the cancelled stream (lines 37, 1524, 6986).',
+    verify: () => !/\bspectate\b|isSpectator|spectator\s*[:=]/.test(read('lib/netplay.js') + read('gba.html') + read('gba/mgba/room.js')) &&
+      /portCount/.test(read('lib/netplay.js')) && /portCount: MAX_SEATS/.test(read('gba/mgba/room.js')),
+  },
+  {
+    id: 'gba-soulgold-cable-club-is-not-tested-by-automation',
+    what: 'The Pokemon SoulGold Cable Club (trade, battle) has never been run through a room by any automated test, and SoulGold is NOT in the rooms catalogue. Nothing here shows two SoulGolds trading, or what a trade does to each save.',
+    why: 'The Cable Club is reachable only with a save made inside a Pokemon Center, and no such save exists on the build machine; a solo core cannot be scripted there from a new game within a test budget that anyone has found. So the title has no passing link row (a title enters ROOMABLE only with one), the game\'s trade/battle path is untested, and the clean-end save protocol (only the local seat committed, only after an end every peer reached) was exercised on a TOY trade core - a model of the Trade Center, not Pokemon. A manual recipe is written down and has not been performed by a person.',
+    evidence: 'gba/mgba/README.md "Manual recipe: the SoulGold Cable Club through the page (NOT automated, NOT roomable yet)" and "Until that has been done by a person with a real save, the SoulGold trade/battle path is not exercised by any automated test"; gba/mgba/room.js LINK_ROWS has no SoulGold row.',
+    // Open while the catalogue's own rows (the source ROOMABLE is derived from) hold no Pokemon title at all.
+    verify: () => { const rows = between(read('gba/mgba/room.js'), 'export const LINK_ROWS', ']);'); return /sbam-2p/.test(rows) && !/Pokemon|SoulGold|Ultra Violet/i.test(rows); },
+  },
+  {
+    id: 'gba-low-memory-and-slow-devices-are-unmeasured-on-hardware',
+    what: 'No real phone, tablet, console browser or low-memory device has run a GBA room, or even solo play on the mGBA core. How a device that cannot allocate the core\'s 192 MiB heap behaves, and how many seats a real phone can hold at 1.000x, are unknown.',
+    why: 'The core\'s heap is FIXED at 201,326,592 B (ALLOW_MEMORY_GROWTH=0; the old 44vba core was 128 MB), a room boots a SECOND 192 MiB instance (the solo core is closed first, and whether the OS gets the memory back is the garbage collector\'s decision), and every ms/frame figure in the repo is a shared-desktop headless-Chrome number with Windows CPU busy % standing in for a load average. The CPU-throttled arms are stand-ins, not devices. The page has a "Could not start the emulator core" path for a failed allocation; it has been run by a test, never by a device that really ran out of memory.',
+    evidence: 'gba/mgba/dist/mgba_core.buildinfo.json link.initialMemory 201326592; gba/mgba/README.md "Known limits of the room page" and "This decision rests on desktop numbers only"; docs/devices/ holds a note for Edge on Xbox only.',
+    // Closes when a measured device note for this core lands next to the Xbox one.
+    verify: () => { try { return JSON.parse(read('gba/mgba/dist/mgba_core.buildinfo.json')).link.initialMemory === 201326592 && !readdirSync('docs/devices').some((f) => /gba|mgba|game-?boy/i.test(f)); } catch (e) { return true; } },
+  },
+  {
+    id: 'gba-rejoin-replay-runs-hidden-frames-above-1x',
+    what: 'OWNER DECISION, not a build gap: a GBA player who drops and reloads is brought level by re-simulating the room\'s recorded history as HIDDEN frames, at several times hardware speed, and only then runs at 1.000x. Whether that counts as "the guest never runs faster than hardware" (CLAUDE.md gate 9) has not been decided.',
+    why: 'Savestates of this core do not round-trip bit-exactly (hash() differed at 30 of 30 samples after a restore while all video frames matched), so checkpoints and rollback are off and a rejoin is a replay from frame 0 (`rsReplay: true`). Measured once (headless Chrome, Kirby x2, one run): a page ~7 s into a ~25 s room was level again 2.65 s after the harness began waiting, having re-simulated ~1,580 frames - the hidden replay itself ran at AT LEAST ~10x hardware; once level it ran at 1.0021x. The room itself never runs faster, nothing is presented or heard at speed, and the alternative (rsReplay off) means a returning page cannot rejoin and the room plays on without that seat. By the table in gba/mgba/README.md a 30-minute room is caught up in about 2 minutes (Super Bust-A-Move x2) to about 20 minutes (Kirby x4) on this desktop.',
+    evidence: 'gba/mgba/README.md "A returning page" (the gate 9 note) and "Disconnect policy: rsReplay ON"; gba/mgba/room.js lockstepOptions(): rsReplay: true.',
+    verify: () => /rsReplay:\s*true/.test(read('gba/mgba/room.js')),
+  },
+  {
+    id: 'gba-rooms-have-never-run-over-the-shipped-transport',
+    what: 'Every GBA room result comes from ONE browser profile on ONE machine over ?net=local (a BroadcastChannel). A GBA room has never formed over the transport a visitor actually gets - the public PeerJS broker and a real ICE negotiation - let alone between two networks.',
+    why: 'tools/gba_netplay_test.mjs puts every simulated player in a window of one Chrome profile, because BroadcastChannel signalling needs a shared profile; its README says plainly that NAT traversal is not exercised. tools/audit_peerjs_crossdevice.mjs is the rig that runs two SEPARATE profiles with no ?net=local, but its gba row still names the retired /gba_multiplayer.html lobby (a redirect) and a `__gbamp` seam no page publishes, so it cannot drive a GBA room, and gba.html forms its rooms through its own Party panel. This is the GBA-specific half of never-tested-across-two-networks above.',
+    evidence: 'tools/gba_netplay_test.mjs: all four `net=` occurrences are `net=local`; tools/audit_peerjs_crossdevice.mjs PLATFORMS.gba.lobby = \'/gba_multiplayer.html\'; gba/mgba/README.md "Not real, said plainly".',
+    verify: () => { const t = read('tools/gba_netplay_test.mjs'), hits = [...t.matchAll(/net=([a-z]+)/g)].map((m) => m[1]);
+      return hits.length > 0 && hits.every((h) => h === 'local') && /gba:\s*\{\s*lobby:\s*'\/gba_multiplayer\.html'/.test(read('tools/audit_peerjs_crossdevice.mjs')); },
   },
 ];
 

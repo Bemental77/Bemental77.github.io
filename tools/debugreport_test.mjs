@@ -153,12 +153,9 @@ function pageDom(page) {
         h('div', { id: 'statusBar' }, status, fps), log),
         shell(h('div', { id: 'mobileSplash' }, h('button', { id: 'mobileSplashStart' }), h('p', { class: 'rotateTip' })), menu()),
         page === 'ps1' ? netOverlay() : h('div', { class: 'np-wrap' }, h('div', { class: 'np-card' }, h('div', { class: 'np-act' }, h('button', { class: 'ghost' }))))];
-    case 'genesis': case 'snes':
+    case 'genesis': case 'snes': case 'gba':
       return [h('div', { id: 'desktop' }, bar(h('button', { id: 'btnNet' })), h('div', { id: 'statusBar' }, status, fps)),
         shell(h('div', { id: 'mobileSplash' }, h('button', { id: 'mobileSplashStart' }), h('button', { id: 'mobileSplashNet' })), menu()), netOverlay()];
-    case 'gba':
-      return [h('div', { id: 'maindiv' }, h('div', { id: 'mydiv', class: 'mt-4' })),
-        h('div', { id: 'spMenuOverlay' }, h('div', { class: 'sp-overlay-box' }, h('button', { class: 'btn' }), h('hr'), h('button', { class: 'btn' })))];
     case 'multiplayer':
       return [h('div', { id: 'wrap' }, h('p', { class: 'hint' }), h('div', { class: 'card' }, h('p', { class: 'hint' })), h('p', { class: 'hint' }, h('a', { href: '/playground.html' })))];
     default: return [];
@@ -239,7 +236,8 @@ const WHERE = {
   ps1: [['bar', 'controlBar', 'btnLog', 'after'], ['menu', 'mobileMenuBox', 'mClose', 'before'], ['splash', 'mobileSplash', 'mobileSplashStart', 'after'], ['party', '', 'netClose', 'before']],
   genesis: [['bar', 'controlBar', null, 'last'], ['menu', 'mobileMenuBox', 'mClose', 'before'], ['splash', 'mobileSplash', 'mobileSplashNet', 'after'], ['party', '', 'netClose', 'before']],
   snes: [['bar', 'statusBar', null, 'last'], ['menu', 'mobileMenuBox', 'mClose', 'before'], ['splash', 'mobileSplash', 'mobileSplashNet', 'after'], ['party', '', 'netClose', 'before']],
-  gba: [['bar', 'mydiv', null, 'last'], ['menu', null, null, 'before-hr']],
+  // gba.html is the family shape now (it was a Bootstrap page: #mydiv + an overlay's <hr>): the same four spots as genesis.
+  gba: [['bar', 'controlBar', null, 'last'], ['menu', 'mobileMenuBox', 'mClose', 'before'], ['splash', 'mobileSplash', 'mobileSplashNet', 'after'], ['party', '', 'netClose', 'before']],
   multiplayer: [['bar', 'wrap', null, 'footer']],
 };
 console.log('1. loading installs nothing that runs per frame; 2. button placement');

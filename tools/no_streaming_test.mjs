@@ -83,6 +83,10 @@ const LOBBY_HANDOFF = {
     { to: 'genesis.html',   link: /\/genesis\.html\?np=/ },
     { to: 'snes.html',      link: /\/snes\.html\?np=/ },
     { to: 'ps1.html',       link: /\/ps1\.html\?np=/ },
+    // gba.html forms lockstep link-cable rooms since stage GR2 (it drives beginFrame; it is counted as an online
+    // page above) and the lobby has handed to it since stage GR4. gba_multiplayer.html stays a plain redirect: it
+    // has no online code of its own, so like the other *_multiplayer.html redirects it is reported n/a.
+    { to: 'gba.html',       link: /\/gba\.html\?np=/ },
   ] },
 };
 

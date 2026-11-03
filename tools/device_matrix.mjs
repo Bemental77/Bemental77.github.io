@@ -157,10 +157,13 @@ const PAGES = [
   // verified against the live files on 2026-09-05.
   { id: 'ps1',  url: '/ps1.html',  spec: { wasm: 'required' } },
   { id: 'snes', url: '/snes.html', spec: { wasm: 'required' } },
-  // gba is the ODD ONE OUT and is here to keep it honest: it has NO isMobile branch at
-  // all (so no UA token to correct), its canvas carries an INLINE width that only
-  // !important can beat, and it displays at 240x160 = 3:2 — the one page in this repo
-  // whose console rule must not reuse the 4:3 the other five share.
+  // gba is the ODD ONE OUT and is here to keep it honest: it displays at 240x160 = 3:2 — the
+  // one page in this repo whose console rule must not reuse the 4:3 the other five share.
+  // (Until 2026-11-01 it was ALSO the odd one out in markup: a white Bootstrap page with
+  // #maindiv / #canvasDiv / #spShell and no isMobile branch. Stage GP rebuilt it on the family
+  // skeleton — #desktop / #canvasWrap / #mobileShell / #btnStart / #mobileSplashStart — so the
+  // shared probes below now find it by the SAME ids as the other five; only its on-screen
+  // control classes (.sp-*) and its aspect remain its own.)
   { id: 'gba',  url: '/gba.html',  spec: { wasm: 'required' } },
 ];
 
@@ -263,22 +266,28 @@ const ARMS = [
       // asserted here: getBoundingClientRect reports the LAYOUT box and ignores
       // clip-path, so `ratio` measures the element (4:3) and could not see the crop
       // either way.  The crop is left declared once, at :24.
-      // gba asserts the RULE, not the box: #canvasDiv is display:none until start
-      // (gba.html:523), so there is nothing to measure pre-boot and `boxless` will be
-      // true.  cssAspect === '3 / 2' proves the .console-ua rule matched — and proves it
+      // gba asserts the RULE and, now that the canvas has a box before boot (it sits in the
+      // visible #canvasWrap, as on the other five pages), the MEASURED shape too.
+      // cssAspect === '3 / 2' proves the explicit aspect rule is what applies — and proves it
       // did NOT get the 4:3 the other five use, which is the specific mistake available
-      // here.  backTrap is the load-bearing half: gba had no guard of any kind.
+      // here.  The rendered ratio must be 3:2 (240x160), not merely declared so.  backTrap
+      // is the load-bearing half: gba had no guard of any kind.  (Before stage GP the canvas
+      // lived in a #canvasDiv that was display:none until start, so only the rule could be read.)
       gba: (a) => {
         const c = a.dcConsole || {}, b = a.backTrap || {};
         const aspectOk = String(c.cssAspect || '').replace(/\s/g, '') === '3/2';
-        const ok = c.consoleClass === true && aspectOk
+        const shapeOk = c.boxless === true || Math.abs((c.ratio || 0) - 1.5) < 0.02;
+        const ok = c.consoleClass === true && aspectOk && shapeOk
+                && c.wrapShown === true && c.shellShown === false
+                && c.canvasParent === 'canvasWrap'
                 && b.keySwallowed === true && b.sentinel === true
                 && xboxStickOk(a);
         return { ok,
                  detail: `console-ua=${c.consoleClass} cssAspect=${c.cssAspect} (must be 3 / 2, `
-                       + `NOT the 4:3 the other five use) boxless=${c.boxless} `
+                       + `NOT the 4:3 the other five use) boxless=${c.boxless} ratio=${c.ratio} (must be 1.5) `
+                       + `desktop=${c.wrapShown} shell=${c.shellShown} parent=${c.canvasParent} `
                        + `backTrap{swallowed=${b.keySwallowed} sentinel=${b.sentinel}} `
-                       + `(gba: 240x160, canvasDiv is display:none until start) ` + xboxStickDetail(a) };
+                       + `(gba: 240x160) ` + xboxStickDetail(a) };
       },
       ps1: (a) => {
         const c = a.dcConsole || {}, b = a.backTrap || {};
@@ -411,7 +420,7 @@ const ARMS = [
     // flip anything — and correctly so. It is skipped there rather than voided,
     // because "no change" IS the invariant being asserted for n64.
     // snes and gba are in EXACTLY n64's position and were voided until this was
-    // noticed: snes.html:9 and gba.html:15 both carry an explicit "NO
+    // noticed: snes.html:9 and gba.html:29 both carry an explicit "NO
     // /coi-serviceworker.js on purpose" comment — they are single-threaded cores
     // that need neither COOP/COEP nor SAB.  Their crossOriginIsolated is false in
     // the BASELINE too, so this arm has nothing to flip and correctly refuses a
@@ -430,7 +439,7 @@ const ARMS = [
               + 'it must stay un-isolated and must still run' }),
       gba: (a) => ({
         ok: a.cap?.sab?.crossOriginIsolated === false,
-        detail: 'gba.html:15 declines the coi worker on purpose; it must stay un-isolated and still run' }),
+        detail: 'gba.html:29 declines the coi worker on purpose; it must stay un-isolated and still run' }),
     },
   },
   {
@@ -610,7 +619,10 @@ async function runCell(arm, pg) {
       // dozen of those in the cell path is a quarter-hour of apparent silence.  120 s is
       // still far above any legitimate evaluate here and turns a wedge into an error.
       protocolTimeout: 120000,
-      args: ['--no-sandbox', '--disable-dev-shm-usage', ...(arm.args || [])],
+      // --mute-audio: a test browser must never make sound on the user's machine (they wear headphones; memory
+      // test-browsers-must-be-muted, 2026-11-01). It silences the output device only; AudioContext/AudioWorklet still exist, so no
+      // capability reading changes.
+      args: ['--no-sandbox', '--disable-dev-shm-usage', '--mute-audio', ...(arm.args || [])],
     });
     // [leak-guard] a SIGKILLed parent ORPHANS this browser (uncatchable in-process);
     // `node tools/browser_leak_guard.js reap` kills it once this process is gone.
@@ -1031,11 +1043,12 @@ async function runCell(arm, pg) {
         }
         if (!c || !w) return null;
         const cr = c.getBoundingClientRect(), wr = w.getBoundingClientRect();
-        // COMPUTED aspect-ratio, not just the measured box.  gba's #canvasDiv ships
-        // `display:none` until the emulator starts, so its canvas has NO box to measure
-        // before boot and every dimension above reads 0.  getComputedStyle still resolves
-        // on a display:none element, so this proves the .console-ua RULE MATCHED — which
-        // is the thing under test — without booting a game or mutating the page.
+        // COMPUTED aspect-ratio, not just the measured box.  Before stage GP gba's #canvasDiv shipped
+        // `display:none` until the emulator started, so its canvas had NO box to measure before boot
+        // and every dimension above read 0; getComputedStyle still resolves on a display:none element,
+        // which is why this reads the RULE as well as the box.  gba's canvas now sits in the visible
+        // #canvasWrap like the other five, so both are available; the rule is kept because it proves
+        // the explicit aspect-ratio is what applies without booting a game or mutating the page.
         const cssAspect = (() => { try { return getComputedStyle(c).aspectRatio; } catch (e) { return null; } })();
         const boxless = !(cr.width > 0 && cr.height > 0);
         // The DESKTOP CONTAINER id differs per page — dreamcast/gamecube call it
@@ -1053,9 +1066,9 @@ async function runCell(arm, pg) {
           ratio: cr.height ? +(cr.width / cr.height).toFixed(3) : null,
           consoleClass: document.documentElement.classList.contains('console-ua'),
           cssAspect, boxless,
-          // gba names them differently again: #maindiv is its desktop shell and #spShell
-          // its phone shell (gba.html:468 / :534).  visAny takes the first id that EXISTS,
-          // so adding them here is additive and cannot change the other five pages.
+          // 'maindiv' / 'spShell' are the PRE-2026-11-01 gba page's ids (desktop shell / phone shell); gba
+          // now uses #desktop / #mobileShell like n64/ps1/snes and nothing resolves them. They are left in
+          // because visAny takes the first id that EXISTS, so they are inert and cannot change any page.
           wrapShown: visAny(['wrap', 'desktop', 'maindiv']),
           shellShown: visAny(['mobileShell', 'spShell']),
           canvasParent: c.parentElement ? c.parentElement.id : null,
@@ -1078,7 +1091,8 @@ async function runCell(arm, pg) {
     out.touchTargets = null;
     if (arm.viewport && arm.viewport.hasTouch) {
       out.touchTargets = await page.evaluate(() => {
-        const SEL = '.faceBtn, .shoulderBtn, .dpadDisc, .sysBtn, .menuBtn, #mobileSplashStart, #mobileSplashDiag';
+        // .sp-btn-circle / .sp-shoulder / .sp-dpad-disc are gba's own spellings of face button / shoulder / d-pad (its SP clamshell)
+        const SEL = '.faceBtn, .shoulderBtn, .dpadDisc, .sysBtn, .menuBtn, .sp-btn-circle, .sp-shoulder, .sp-dpad-disc, #mobileSplashStart, #mobileSplashDiag';
         const MIN = 44;
         const vw = window.innerWidth, vh = window.innerHeight;
         const all = [...document.querySelectorAll(SEL)].map((e) => {
@@ -1230,7 +1244,7 @@ async function rigSelfTest() {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dmx-self-a-'));
     const b = await puppeteer.launch({ headless: 'new', executablePath: CHROME, userDataDir: dir,
       protocolTimeout: 120000,
-      args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+      args: ['--no-sandbox', '--disable-dev-shm-usage', '--mute-audio'] });
   // [leak-guard] A SIGKILLed parent ORPHANS this browser — verified by test and
   // uncatchable in-process. `node tools/browser_leak_guard.js reap` kills it once
   // this process is gone; a live run is never touched.
@@ -1247,7 +1261,7 @@ async function rigSelfTest() {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dmx-self-b-'));
     const b = await puppeteer.launch({ headless: 'new', executablePath: CHROME, userDataDir: dir,
       protocolTimeout: 120000,
-      args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+      args: ['--no-sandbox', '--disable-dev-shm-usage', '--mute-audio'] });
     // [leak-guard] a SIGKILLed parent ORPHANS this browser (uncatchable in-process);
     // `node tools/browser_leak_guard.js reap` kills it once this process is gone.
     try { (await import('./browser_leak_guard.js')).default.guard(b, import.meta.url); } catch (_e) {}
@@ -1282,7 +1296,7 @@ async function redirectTest() {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), `dmx-rd-${label}-`));
     const b = await puppeteer.launch({ headless: 'new', executablePath: CHROME, userDataDir: dir,
       protocolTimeout: 120000,
-      args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+      args: ['--no-sandbox', '--disable-dev-shm-usage', '--mute-audio'] });
     // [leak-guard] a SIGKILLed parent ORPHANS this browser (uncatchable in-process);
     // `node tools/browser_leak_guard.js reap` kills it once this process is gone.
     try { (await import('./browser_leak_guard.js')).default.guard(b, import.meta.url); } catch (_e) {}
@@ -1355,7 +1369,7 @@ async function captestRun(pageList) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), `dmx-ct-${pg.id}-`));
     const b = await puppeteer.launch({ headless: 'new', executablePath: CHROME, userDataDir: dir,
       protocolTimeout: 120000,
-      args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+      args: ['--no-sandbox', '--disable-dev-shm-usage', '--mute-audio'] });
     try { (await import('./browser_leak_guard.js')).default.guard(b, import.meta.url); } catch (_e) {}
     const p = await b.newPage();
     const r = { };
@@ -1393,7 +1407,7 @@ async function noJsTest(pageList) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), `dmx-nojs-${pg.id}-`));
     const b = await puppeteer.launch({ headless: 'new', executablePath: CHROME, userDataDir: dir,
       protocolTimeout: 120000,
-      args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+      args: ['--no-sandbox', '--disable-dev-shm-usage', '--mute-audio'] });
     try { (await import('./browser_leak_guard.js')).default.guard(b, import.meta.url); } catch (_e) {}
     const p = await b.newPage();
     await p.setJavaScriptEnabled(false);

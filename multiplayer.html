@@ -36,9 +36,12 @@
      genesis    /genesis.html?np=CODE&game=<ROMS label>&host=1 | &join=1
      snes       /snes.html?np=CODE&game=<ROMS label>&host=1 | &join=1
      ps1        /ps1.html?np=CODE&game=<ROMS label>&host=1 | &join=1
-  The three cartridge pages take an explicit &host=1 because their bare ?np=
+     gba        /gba.html?np=CODE&game=<ROMLIST title>&host=1&seats=N | &join=1
+  The cartridge pages take an explicit &host=1 because their bare ?np=
   receiver predates this page and means "fill the JOIN box"; changing that
-  meaning would break invitations already in the wild.
+  meaning would break invitations already in the wild. gba.html is the one
+  receiver that also reads &seats=N (the room's size; the joiner never sends it —
+  the host's envelope tells every console how many seats there are).
 
   THE INVITE LINK. /multiplayer.html?np=CODE&sys=<console>&game=<key>. Opening it
   lands on the Join card with everything preset, so a joiner needs to know
@@ -57,6 +60,24 @@
   THEM HONEST. Fetching six emulator pages to read their ROMS[] arrays would
   cost a lobby the whole site; a copy costs nothing until it drifts, and the
   test FAILS on drift against every page's live list, in order.
+  THE GBA LIST IS A SUBSET, ON PURPOSE (as GameCube's is): only the titles that
+  gba/mgba/room.js ROOMABLE names — those with a passing link row — each with
+  the seat counts that passed (`seats`). The test imports room.js and FAILS if
+  the two differ in titles, order or seat counts, and has mutants that prove it.
+  Monster Rancher Advance 2, Pokemon SoulGold, PKMN Ultra Violet and Sim City
+  2000 are on gba.html but are deliberately not offered here.
+
+  A ROOM CODE NAMES ITS CONSOLE through lib/netplay.js CODE_TAGS, and that now
+  includes the Game Boy Advance ('B') — so a joiner who types only a GBA code is
+  taken to GBA without being asked, like every other console. 'A' is RESERVED in
+  the same registry for the Pokemon arena and nothing mints it yet (the lobby
+  does not list the arena). Only an OLDER code with a random first character
+  still gets the "which console?" question. tools/multiplayer_page_test.mjs
+  pins the registry (gba 'B', pokemonarena 'A', no tag shared) and the engine's
+  behaviour for it, and that registering them reclassified no other page path.
+  ⚠ UNTIL THE ?v= STAMPS ARE REFRESHED after lib/netplay.js is committed, a
+  browser that cached the previous engine mints an untagged GBA code (see
+  tools/stamp_lib_versions.mjs): the stamp is the only protection against that.
 
   NO coi-serviceworker.js ON PURPOSE. Cross-origin isolation buys
   SharedArrayBuffer, which a lobby has no use for, and the script's registration
@@ -145,6 +166,12 @@
     <div class="chips" id="consoles"></div>
     <label for="game">Game</label>
     <select id="game"></select>
+    <!-- Shown only for a game that was linked at more than one seat count (gba: Kirby 2, 3 or 4). It sets &seats= on
+         the HOST's hand-off; gba.html reads it for the room's size. A joiner never sees it. -->
+    <div id="seatsRow" hidden>
+      <label for="seats">Players in the room</label>
+      <select id="seats"></select>
+    </div>
     <p class="hint" id="sysNote"></p>
     <div class="row">
       <button id="btnHost" type="button">Open a party</button>
@@ -295,13 +322,19 @@
         "Harry Potter & the Sorcerer's Stone", 'Legend of Dragoon (Disc 1)',
         'Legend of Dragoon (Disc 2)', 'Legend of Dragoon (Disc 3)', 'Legend of Dragoon (Disc 4)',
       ].map(function (l) { return { key: l, label: l }; }) },
-    // gba.html's own header: the core cannot carry lockstep — one KEYINPUT
-    // register, _emuRunFrame takes no player index, and there is no link cable
-    // to be a second machine with. Listed so a visitor is TOLD, not left to
-    // wonder why it is missing.
-    { key: 'gba', name: 'Game Boy Advance', page: '/gba.html', handoff: null, hostFlag: '',
-      players: 1, note: 'No online play — a Game Boy Advance has one controller and no link cable here.',
-      games: [] },
+    // THE GAME BOY ADVANCE. gba.html runs mGBA, which hosts several LINKED consoles in one wasm instance, so every
+    // player runs all N of them and only their own 10-bit pad word crosses the wire (gba/mgba/README.md "Rooms").
+    // This list is NOT the page's ROMLIST: it is gba/mgba/room.js ROOMABLE — the titles that have been SHOWN to reach a
+    // linked scene (tools/gba_link_smoke.mjs), each with the seat counts that passed. tools/multiplayer_page_test.mjs
+    // imports room.js and fails if titles, order or `seats` differ. `seats` becomes &seats=N on the host's hand-off.
+    // hostFlag is host=1 like the other cartridge pages: gba.html's bare ?np= means "fill the join box".
+    { key: 'gba', name: 'Game Boy Advance', page: '/gba.html', handoff: '/gba.html?np=', hostFlag: 'host=1',
+      players: 4, note: 'Link-cable rooms: every player runs their own Game Boy Advance, linked. Super Bust-A-Move and Sonic Advance 3 take two players; Kirby takes two, three or four. Only games shown to link are listed.',
+      games: [
+        { key: 'Super Bust-A-Move',            label: 'Super Bust-A-Move',            seats: [2] },
+        { key: 'Kirby Nightmare in Dreamland', label: 'Kirby Nightmare in Dreamland', seats: [2, 3, 4] },
+        { key: 'Sonic Advance 3',              label: 'Sonic Advance 3',              seats: [2] },
+      ] },
   ];
   var BY_KEY = {};
   CONSOLES.forEach(function (c) { BY_KEY[c.key] = c; });
@@ -340,9 +373,23 @@
     if (!c || !c.handoff) return null;
     var u = c.handoff + encodeURIComponent(theCode) + '&game=' + encodeURIComponent(gameKey);
     if (join) u += '&join=1';
-    else if (c.hostFlag) u += '&' + c.hostFlag;
+    else {
+      if (c.hostFlag) u += '&' + c.hostFlag;
+      // The room's size is the HOST's to say (gba.html: &seats=N; every other console's page sizes its own room).
+      // A count the game was never linked at is never sent: hostSeats() falls back to the game's smallest, which is what gba.html does too.
+      var n = hostSeats(c, gameKey);
+      if (n) u += '&seats=' + n;
+    }
     if (transport === 'local') u += '&net=local';
     return u;
+  }
+  // The seat count the host picked for this game, or null for a console/game that declares none.
+  function seatsOf(c, gameKey) { var g = gameOf(c, gameKey); return g && g.seats && g.seats.length ? g.seats : null; }
+  function hostSeats(c, gameKey) {
+    var all = seatsOf(c, gameKey);
+    if (!all) return null;
+    var v = c === sys ? +seatSel.value : 0;      // only the host's picker has a seat control; any other caller gets the smallest
+    return all.indexOf(v) >= 0 ? v : all[0];
   }
   function inviteUrl(c, gameKey, theCode) {
     var u = location.origin + '/multiplayer.html?np=' + encodeURIComponent(theCode)
@@ -353,6 +400,21 @@
 
   // ---- the console chips + game picker ---------------------------------------
   var sel = $('game');
+  var seatSel = $('seats');
+  // Show the seat control only when the picked game was linked at more than one seat count. The choice survives a
+  // change of game when it is still a legal count for the new one; otherwise it falls back to the smallest.
+  function renderSeats() {
+    var all = sys ? seatsOf(sys, sel.value) : null;
+    var keep = +seatSel.value;
+    seatSel.innerHTML = '';
+    (all || []).forEach(function (n) {
+      var o = document.createElement('option');
+      o.value = String(n); o.textContent = n + ' players';
+      seatSel.appendChild(o);
+    });
+    if (all && all.indexOf(keep) >= 0) seatSel.value = String(keep);
+    $('seatsRow').hidden = !(all && all.length > 1);
+  }
   CONSOLES.forEach(function (c) {
     var b = document.createElement('button');
     b.type = 'button'; b.className = 'chip';
@@ -385,6 +447,7 @@
              : gameOf(c, 'Gauntlet Legends') ? 'Gauntlet Legends'
              : c.games[0].key;
     sel.value = dflt;
+    renderSeats();
     $('sysNote').textContent = c.note || '';
     // ⚠ THE LINK FOLLOWS THE CONSOLE TOO. Only the game <select>'s change
     // handler re-pointed #invite, so a host who minted a code and THEN changed
@@ -455,7 +518,10 @@
   });
   // Changing the game after minting must re-point the link — the link IS the
   // game choice for whoever opens it.
-  sel.addEventListener('change', function () { if (code && !$('hostPane').hidden) $('invite').value = inviteUrl(sys, sel.value, code); });
+  sel.addEventListener('change', function () {
+    renderSeats();
+    if (code && !$('hostPane').hidden) $('invite').value = inviteUrl(sys, sel.value, code);
+  });
 
   function copy(text, btn, was) {
     // ⚠ writeText REJECTS A PROMISE, it does not throw. A bare try/catch would
@@ -537,6 +603,10 @@
     }
     return v.toUpperCase();
   }
+  function clearJoin() {
+    jSys = null; jGameKnown = false;
+    Object.keys(jChips).forEach(function (k) { jChips[k].setAttribute('aria-pressed', 'false'); });
+  }
   function updateJoin() {
     var v = $('codeIn').value.trim().toUpperCase();
     var haveCode = CODE_RE.test(v);
@@ -546,6 +616,11 @@
       if (det && BY_KEY[det] && BY_KEY[det].games.length) { if (!jSys || jSys.key !== det) { setJoin(det); return; } }
     }
     var codeSays = haveCode && Netplay.consoleOfCode ? Netplay.consoleOfCode(v) : null;
+    // WHAT IS PRESSED MUST BE WHAT JOIN WILL USE. The input handler reads every edited code afresh (jManual = false), but the console picked for
+    // the EARLIER code (by hand, or read off its tag) stayed pressed: replace a code with another that names no console and the chips came back
+    // with the old one still pressed and Join disabled, until the visitor re-clicked the pressed chip. Found by FV2 (an untagged code, N64
+    // chosen, then another untagged code). A pick that is not the user's own for THIS code and is not what this code names is dropped here.
+    if (!jManual && jSys && !(codeSays && jSys.key === codeSays)) clearJoin();
     var detected = !!(jSys && haveCode && (jManual || (codeSays && jSys.key === codeSays)));
     // A code from before codes named their console cannot be read; ask, with nothing preselected.
     $('jPick').hidden = !(haveCode && !detected);
@@ -644,10 +719,12 @@
       transport: transport,
       consoles: CONSOLES.map(function (c) {
         return { key: c.key, page: c.page, handoff: c.handoff, hostFlag: c.hostFlag,
-                 players: c.players, games: c.games.map(function (g) { return g.key; }) };
+                 players: c.players, games: c.games.map(function (g) { return g.key; }),
+                 seats: c.games.reduce(function (o, g) { if (g.seats) o[g.key] = g.seats.slice(); return o; }, {}) };
       }),
       sys: sys ? sys.key : null,
       game: sel.value,
+      seats: sys ? hostSeats(sys, sel.value) : null,
       code: code,
       hostUrl: code ? emulatorUrl(sys, sel.value, code, false) : null,
       joinUrl: code ? emulatorUrl(sys, sel.value, code, true) : null,

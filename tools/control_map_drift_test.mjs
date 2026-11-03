@@ -289,26 +289,17 @@ const PAIRS = [
       normalize: MP_NAME_ARRAY,
     },
   },
+  // ⚠ gba IS A LOBBY PAIR NOW (converted 2026-11-02, the same flip dreamcast got below). Its guest side was the streaming-era
+  // `gba_multiplayer.html` with a KEYMAP and a GP table; that file is now a bare redirect to gba.html, which forms its own
+  // link-cable rooms (every player runs their own mGBA cores), so there is ONE control table (the vendored
+  // gba/gbaWasm/dist/input_controller.js defaults plus the page's remap modal) and nothing to drift against. The old host side
+  // could not even be read any more: this run read `Unexpected identifier 'setupGamePad'` out of that file's slice. What still
+  // has teeth is the inverse, as for dreamcast: the redirect must carry no control tables.
   {
     name: 'gba',
-    host: {
-      // gba.html owns no tables — the vendored InputController ships the
-      // defaults and the page's remap modal edits them, so THIS file is the
-      // host side of the comparison.
-      url: '/gba/gbaWasm/dist/input_controller.js',
-      decls: (s) => [
-        sliceReturnedObject(s, 'defaultKeymappings', 'DEFAULTS'),
-        `const ACT = { Left:'left', Right:'right', Up:'up', Down:'down',
-                       Action_A:'a', Action_B:'b',
-                       Action_Start:'start', Action_Select:'select',
-                       Action_L:'l', Action_R:'r' };`,
-      ],
-      normalize: DEFAULTS_TABLE,
-    },
-    guest: {
+    lobby: {
       url: '/gba_multiplayer.html',
-      decls: (s) => [sliceDecl(s, 'KEYMAP').text, sliceDecl(s, 'GP').text],
-      normalize: MP_NAME_ARRAY,
+      mustNotDeclare: ['KEYMAP', 'GP'],
     },
   },
   // ⚠ dreamcast HAS NO PAIR ANY MORE, AND THAT IS THE POINT.
@@ -319,7 +310,7 @@ const PAIRS = [
   // exactly ONE copy of the tables and nothing to drift against. The check that
   // still has teeth is the INVERSE — a lobby must carry no control tables at
   // all, because a lobby that maps buttons has started being a viewer again.
-  // (`guest:` and `lobby:` are alternatives; the six pairs above are still on
+  // (`guest:` and `lobby:` are alternatives; the five pairs above that are not gba are still on
   // `guest:` and still FAIL, which is not this conversion's doing — they were
   // already failing before it, their own `*_multiplayer.html` pages having been
   // reduced to stubs by the same directive. Each can be flipped to `lobby:` by

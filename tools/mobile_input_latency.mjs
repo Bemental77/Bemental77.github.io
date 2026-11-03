@@ -17,7 +17,7 @@
 //   gamecube   pollController -> dolphin_worker.postMessage({cmd:'input'})    gamecube.html:5637-5646
 //   dreamcast  frameLoop      -> worker.postMessage({cmd:'input'})            dreamcast.html:4042-4048
 //   snes       runFrame       -> Module._setJoypadInput(padMask())            snes.html:322-323
-//   gba        _runFrame      -> Module._emuRunFrame(this._getKeyMask())      gba/gbaWasm/dist/script.js:296
+//   gba        _runFrame      -> myApp.core.setKeys(0, this._getKeyMask())    gba/gbaWasm/dist/script.js:572 (mGBA; there is no Module._emuRunFrame any more)
 //   n64        core pull      -> myApp.sendMobileControls(...)                n64/index.html:2053-2062
 // The hooks below wrap exactly those call sites, so a sample is recorded at the
 // instant the core is handed the state — no polling from Node, no CDP round-trip
@@ -73,7 +73,8 @@ const PAGES = {
   },
   gba: {
     url: '/gba.html', kind: 'gba', probeId: 'mobileA', romIdx: 4,
-    bit: { shift: 0 }, bitDesc: 'emuRunFrame mask bit0 = GBA_KEY.A (script.js:21)',
+    // option VALUES on gba.html's pickers are ROM URLs (script.js _populateRomSelects), not indexes: boot() picks by ROMLIST[romIdx].url
+    bit: { shift: 0 }, bitDesc: 'core.setKeys(0, mask) mask bit0 = GBA_KEY.A (script.js:88)',
     dpad: 'spDpadH', dir: { left: { shift: 5 }, right: { shift: 4 } },          // GBA_KEY.LEFT=32 RIGHT=16
   },
   n64: {
@@ -227,10 +228,12 @@ function instrument(cfg) {
           const o = Module._setJoypadInput;
           const w = function (m) { push(m); return o.call(Module, m); };
           w.__mil = 1; Module._setJoypadInput = w; M.hooked = 'Module._setJoypadInput'; M.rehooks = (M.rehooks || 0) + 1;
-        } else if (cfg.kind === 'gba' && window.Module && Module._emuRunFrame && !Module._emuRunFrame.__mil) {
-          const o = Module._emuRunFrame;
-          const w = function (m) { push(m); return o.call(Module, m); };
-          w.__mil = 1; Module._emuRunFrame = w; M.hooked = 'Module._emuRunFrame'; M.rehooks = (M.rehooks || 0) + 1;
+        } else if (cfg.kind === 'gba' && window.myApp && myApp.core && typeof myApp.core.setKeys === 'function' && !myApp.core.setKeys.__mil) {
+          // mGBA: the page hands the core its pad as core.setKeys(0, mask) right before core.runFrame() (script.js _runFrame). The
+          // wrapper goes on the core INSTANCE and is re-armed every tick: a room closes the solo core and its replacement has none.
+          const c = myApp.core, o = c.setKeys;
+          const w = function (seat, m) { if (seat === 0) push(m); return o.call(this, seat, m); };
+          w.__mil = 1; c.setKeys = w; M.hooked = 'myApp.core.setKeys(0, mask)'; M.rehooks = (M.rehooks || 0) + 1;
         } else if (cfg.kind === 'n64' && window.myApp && myApp.sendMobileControls && !myApp.sendMobileControls.__mil) {
           const o = myApp.sendMobileControls.bind(myApp);
           const w = function (s, x, y) { push(String(s)); return o(s, x, y); };
@@ -273,14 +276,9 @@ async function boot(page, name, cfg) {
   // changed anything is a placebo, not a result.
   const p = cfg;
   await page.goto(ORIGIN + p.url, { waitUntil: 'domcontentloaded', timeout: 90000 });
-  if (name === 'gba') {
-    await page.waitForFunction(() => window.myApp && myApp.isWasmReady, { timeout: 90000 });
-    await ev(page, (i) => { document.getElementById('romselect').value = window.ROMLIST[i].url; }, p.romIdx);
-    await ev(page, () => myClass.loadRom());
-    await page.waitForFunction(() => window.myApp && myApp.isRunning, { timeout: 90000 });
-    return;
-  }
-  // every other page: wait for the splash Start to be usable, then tap it
+  // (gba.html used to be special-cased here - lowercase #romselect, myClass.loadRom(), no splash. It is on the family's page
+  //  standard now and takes the same path as every other page below; only its pickers' option values differ, see byUrl.)
+  // every page: wait for the splash Start to be usable, then tap it
   if (name === 'ps1') {
     let stable = 0;
     for (let i = 0; i < 60 && stable < 2; i++) {
@@ -294,10 +292,10 @@ async function boot(page, name, cfg) {
     return m && !m.disabled && m.getBoundingClientRect().width > 0;
   }, { timeout: 120000 });
   if (p.romIdx !== undefined) {
-    await ev(page, (i) => {
+    await ev(page, ({ i, byUrl }) => {
       const s = document.getElementById('mobileRomSelect') || document.getElementById('romSelect');
-      if (s) { s.value = String(i); s.dispatchEvent(new Event('change', { bubbles: true })); }
-    }, p.romIdx);
+      if (s) { s.value = byUrl ? String(window.ROMLIST[i].url) : String(i); s.dispatchEvent(new Event('change', { bubbles: true })); }
+    }, { i: p.romIdx, byUrl: name === 'gba' });
   }
   const c = await centre(page, 'mobileSplashStart');
   const cdp = await page.target().createCDPSession();

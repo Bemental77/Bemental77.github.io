@@ -1,0 +1,18 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 60cf468..f1b2210 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -230,7 +230,12 @@ if(WIN32)
+ 	file(GLOB OS_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/windows/*.c)
+ 	source_group("Windows-specific code" FILES ${OS_SRC})
+ elseif(UNIX)
+-	set(USE_PTHREADS ON)
++	# bemental: honor -DUSE_PTHREADS=OFF. This set() used to be unconditional and silently overrode
++	# the command line, so the fork single-threaded wasm build still probed pthread.h, added
++	# -pthread and defined USE_PTHREADS.
++	if(NOT DEFINED USE_PTHREADS)
++		set(USE_PTHREADS ON)
++	endif()
+ 
+ 	if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+ 		add_definitions(-D_GNU_SOURCE)

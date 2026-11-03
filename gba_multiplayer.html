@@ -20,8 +20,10 @@
   immediate as a local console.
 
   Under lockstep THERE IS NO SECOND KIND OF MACHINE. Everybody runs the same
-  emulator page, so a separate "guest" page has nothing left to be. gba.html does not offer online play — a Game Boy Advance has one KEYINPUT register and
-  this core implements no link cable, so there is no second controller to give anybody.
+  emulator page, so a separate "guest" page has nothing left to be. gba.html now forms LINK-CABLE ROOMS itself (stage GR2, 2026-11-01): its core is mGBA, which
+  hosts several linked Game Boy Advances in one wasm instance, so every player runs ALL of them and only 10-bit pad words and one battery image per seat cross
+  the wire. Everyone joins first (Party), the host seats each player, and every console loads the game and starts together on frame 0. An earlier version of
+  this comment said two GBAs could not be linked on this site; that was true of the previous core (44vba) and has not been true since.
 
   ⚠ IT IS A REDIRECT RATHER THAN A DELETION so that a link or a QR code someone
   already shared still lands somewhere useful instead of a 404. Any ?np=<code>
@@ -39,7 +41,7 @@
 <div>
   <p>Taking you to <a id="go" href="/gba.html">the GBA emulator</a>…</p>
   <p style="color:#888;font-size:13px">Online play now runs on the emulator page itself —
-     every player runs their own console.</p>
+     every player runs their own console (open <b>Party</b> there; the host picks the game).</p>
 </div>
 <script>
   // Carry an invitation through. `?np=<code>` is how a room is shared, and the
@@ -48,7 +50,12 @@
     var q = '';
     try {
       var np = new URLSearchParams(location.search).get('np');
-      if (np && /^[A-HJ-NP-Z2-9]{5}$/i.test(np)) q = '?np=' + encodeURIComponent(np.toUpperCase());
+      if (np && /^[A-HJ-NP-Z2-9]{5}$/i.test(np)) {
+        q = '?np=' + encodeURIComponent(np.toUpperCase());
+        // the rest of a lobby hand-off, which gba.html reads: the game's title, host=1 / join=1, the host's seat count, ?net=local (a test rig)
+        var p = new URLSearchParams(location.search);
+        ['game', 'host', 'join', 'seats', 'net'].forEach(function (k) { if (p.get(k) != null) q += '&' + k + '=' + encodeURIComponent(p.get(k)); });
+      }
     } catch (e) {}
     var to = '/gba.html' + q;
     document.getElementById('go').href = to;

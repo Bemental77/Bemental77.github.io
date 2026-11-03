@@ -62,6 +62,10 @@ const h = (v) => ((v || 0) >>> 0).toString(16);
 const PLATFORMS = {
   snes:    { lobby: '/snes_multiplayer.html',    guestSeam: '__snesmp', hostSeam: '__snesNet', game: 'SimCity',              bootMs: 300000, press: ['a', 'Enter'], liveField: 'live' },
   genesis: { lobby: '/genesis_multiplayer.html', guestSeam: '__genmp',  hostSeam: '__genNet',  game: 'Sonic the Hedgehog 3', bootMs: 300000, press: ['a', 'Enter'], liveField: 'live' },
+  // gba: this row cannot drive anything. /gba_multiplayer.html is a redirect with no #lobbyCard and `__gbamp` is published by no
+  // page (snes and genesis above are stale the same way); gba.html forms its link-cable rooms ITSELF, through its Party panel,
+  // and that flow has only ever been run on ?net=local (tools/gba_netplay_test.mjs). A GBA room over the shipped PeerJS transport,
+  // across two profiles, has never been run - tools/undelivered.mjs says so.
   gba:     { lobby: '/gba_multiplayer.html',     guestSeam: '__gbamp',  hostSeam: '__gbaNet',  game: 'Sonic Advance 3',      bootMs: 300000, press: ['m', 'Enter'], liveField: 'live' },
 
   // Dreamcast is the claim-2 case. dreamcast/docs/gauntlet-two-players/TASKS.md

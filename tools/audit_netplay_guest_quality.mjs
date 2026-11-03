@@ -58,6 +58,8 @@ const PLATFORMS = {
   ps1:     { lobby: '/ps1_multiplayer.html',     guestSeam: '__ps1mp',  hostSeam: '__ps1Net',  game: 'Monster Rancher 2',      bootMs: 900000 },
   genesis: { lobby: '/genesis_multiplayer.html', guestSeam: '__genmp',  hostSeam: '__genNet',  game: 'Sonic the Hedgehog 3',   bootMs: 180000 },
   snes:    { lobby: '/snes_multiplayer.html',    guestSeam: '__snesmp', hostSeam: '__snesNet', game: 'SimCity',                bootMs: 180000 },
+  // gba: stale like every row here (the stream it measured is gone), and stale in a gba-specific way too: /gba_multiplayer.html
+  // is a redirect, `__gbamp` is published by no page, and gba.html forms lockstep link-cable rooms ITSELF (tools/gba_netplay_test.mjs).
   gba:     { lobby: '/gba_multiplayer.html',     guestSeam: '__gbamp',  hostSeam: '__gbaNet',  game: 'Sonic Advance 3',        bootMs: 180000 },
   n64:     { lobby: '/n64_multiplayer.html',     guestSeam: '__n64mp',  hostSeam: '__n64Net',  game: 'Mario Kart 64',          bootMs: 300000 },
 };
