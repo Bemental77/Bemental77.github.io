@@ -1,0 +1,70 @@
+{
+ "app": "arena",
+ "schemaVersion": 1,
+ "id": "p_fixture02",
+ "rev": 2,
+ "createdAt": 1700000000000,
+ "updatedAt": 1700000100000,
+ "romHash": "8071e2c348d54c3ec7b78b53837c5cbd757d5cfc461a50fa5ffbc9f5ab35060a",
+ "trainerName": "BLUE",
+ "avatar": { "kind": "preset", "id": 0 },
+ "settings": {
+  "defaultFormat": "nonsense-cup",
+  "animations": "full",
+  "textSpeed": "mid",
+  "sound": true,
+  "reducedMotion": false,
+  "trainingMode": "gen3",
+  "backupNudgeDays": 14
+ },
+ "teams": [
+  { "id": "t_x", "name": "X", "formatId": "open-l100", "monIds": ["m_ok", "m_bad", "m_gone"] }
+ ],
+ "box": [
+  {
+   "id": "m_ok",
+   "species": 3,
+   "nickname": "",
+   "level": 100,
+   "nature": 24,
+   "ability": { "slot": 0 },
+   "heldItem": 0,
+   "ev": { "hp": 0, "atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0 },
+   "iv": { "hp": 0, "atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0 },
+   "moves": [ { "id": 7, "ppUps": 2 } ],
+   "gender": "-",
+   "shiny": false,
+   "friendship": 0,
+   "originalTrainer": { "name": "BLUE", "tid": 1, "sid": 2 },
+   "origin": "rental",
+   "provenance": {},
+   "createdAt": 1700000000300,
+   "updatedAt": 1700000000300
+  },
+  {
+   "id": "m_bad",
+   "species": 0,
+   "level": 0,
+   "nature": 3,
+   "ability": { "slot": 0 },
+   "ev": { "hp": 4 },
+   "iv": { "hp": 31, "atk": 31, "def": 31, "spa": 31, "spd": 31, "spe": 31 },
+   "moves": [ { "id": 1, "ppUps": 0 } ],
+   "gender": "M"
+  },
+  "this is not a record",
+  {
+   "id": "m_ok",
+   "species": 4,
+   "level": 10,
+   "nature": 1,
+   "ability": { "slot": 0 },
+   "ev": { "hp": 0, "atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0 },
+   "iv": { "hp": 1, "atk": 1, "def": 1, "spa": 1, "spd": 1, "spe": 1 },
+   "moves": [ { "id": 7, "ppUps": 0 } ],
+   "gender": "M",
+   "shiny": false
+  }
+ ],
+ "stats": { "wins": 1, "losses": 2, "draws": 0, "forfeits": 0, "streak": 0, "best": 1, "byFormat": {}, "lastMatchAt": null }
+}

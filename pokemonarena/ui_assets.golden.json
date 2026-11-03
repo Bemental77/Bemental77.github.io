@@ -1,0 +1,334 @@
+{
+ "rom": {
+  "sha256": "8071e2c348d54c3ec7b78b53837c5cbd757d5cfc461a50fa5ffbc9f5ab35060a",
+  "md5": "b2c5caf9bc6dd28a44052427ee3ab1b7",
+  "length": 33554432
+ },
+ "note": "HASHES ONLY. sha1 of width,height (u32le) + indexed pixels + palette (u16le) + meta; no ROM-derived pixels are stored here.",
+ "assets": {
+  "font.small": {
+   "width": 256,
+   "height": 512,
+   "sha1": "593a21ee359663e8e5e2089e5a5098cddfcfaf7a"
+  },
+  "font.normal": {
+   "width": 256,
+   "height": 512,
+   "sha1": "386508a40ce0e67fbbb5f544df5c6c667ded1056"
+  },
+  "font.short": {
+   "width": 256,
+   "height": 512,
+   "sha1": "21667cfd2c1ed9189010e3d956af18a20a0bfbad"
+  },
+  "font.narrow": {
+   "width": 256,
+   "height": 512,
+   "sha1": "15c3fb3ab6eebd25080fefc8d349f77968855d4b"
+  },
+  "font.smallNarrow": {
+   "width": 256,
+   "height": 512,
+   "sha1": "60cf3515ba798c5be0857eb7f5e591b1a19e6ba0"
+  },
+  "font.font10": {
+   "width": 256,
+   "height": 512,
+   "sha1": "787f11b3bf6661fe4050401588e92481aaa83a1a"
+  },
+  "font.font11": {
+   "width": 256,
+   "height": 512,
+   "sha1": "241600b520b5a2fc80d9e9bcd19d5142c8bffb6f"
+  },
+  "font.font12": {
+   "width": 256,
+   "height": 512,
+   "sha1": "5029560fd225b0b46072d6f2201f83d2cbe1bbac"
+  },
+  "font.font13": {
+   "width": 256,
+   "height": 512,
+   "sha1": "d66f35efab1a47b1aa8c60423ef92eedf5eac197"
+  },
+  "battle.textPalette": {
+   "width": 16,
+   "height": 1,
+   "sha1": "b0417e2d1b2c4ce9bc451997b836e366bf7c951b"
+  },
+  "textbox.tiles": {
+   "width": 128,
+   "height": 128,
+   "sha1": "6a04bd2e45b915797d7981a79cd38e2cef02b8d8"
+  },
+  "textbox.message": {
+   "width": 240,
+   "height": 48,
+   "sha1": "d0eb1d639eb4c9b888c9981d050d9b1c3d5de51c"
+  },
+  "textbox.actionMenu": {
+   "width": 240,
+   "height": 48,
+   "sha1": "6c696bddce069e39a21a8aa52e892013eabd4fc7"
+  },
+  "textbox.moves": {
+   "width": 240,
+   "height": 48,
+   "sha1": "6b5b1a87ed673bd3b4124f7b199eedcdbf52e007"
+  },
+  "healthbox.singlesPlayer": {
+   "width": 128,
+   "height": 64,
+   "sha1": "965d31a06c6467f3e509fae50a79cc1d2592532f"
+  },
+  "healthbox.singlesOpponent": {
+   "width": 128,
+   "height": 32,
+   "sha1": "51e8c97ee3eaa5684ed124160204e7690886b0be"
+  },
+  "healthbox.doublesPlayer": {
+   "width": 128,
+   "height": 32,
+   "sha1": "0ee9f6c95853592b3c3af92eca348b36d5929a81"
+  },
+  "healthbox.doublesOpponent": {
+   "width": 128,
+   "height": 32,
+   "sha1": "a83370c8920541c12a9d1c888e0817aadc353fbc"
+  },
+  "healthbox.safari": {
+   "width": 128,
+   "height": 64,
+   "sha1": "1a633d79f18a667dac59f3d75a4229fac2acaf9b"
+  },
+  "healthbox.hpGreen": {
+   "width": 72,
+   "height": 8,
+   "sha1": "d6bf122961230f771533c82a964c1809d78a9ede"
+  },
+  "healthbox.hpYellow": {
+   "width": 72,
+   "height": 8,
+   "sha1": "c58e28c7416259584b090b5fc09e1ec50b79ce1a"
+  },
+  "healthbox.hpRed": {
+   "width": 72,
+   "height": 8,
+   "sha1": "1f5a74deda19cd409e70d260067f6ba8a6b31a74"
+  },
+  "healthbox.expBar": {
+   "width": 72,
+   "height": 8,
+   "sha1": "802b6f00dc71683566bfdb2ad50af6c22ecfb4b3"
+  },
+  "healthbox.hpLabel": {
+   "width": 16,
+   "height": 8,
+   "sha1": "c3666e42bf8ac7e59776bf1617f11e68d53bb2f3"
+  },
+  "healthbox.status1": {
+   "width": 144,
+   "height": 8,
+   "sha1": "5ed1171ea98a49fbad84cd69ddee4018b68e9957"
+  },
+  "healthbox.status2": {
+   "width": 144,
+   "height": 8,
+   "sha1": "04eaefb41f6811b75cbe13f02bd6c98f3f010b47"
+  },
+  "healthbox.status3": {
+   "width": 144,
+   "height": 8,
+   "sha1": "0cce59f335fbf2fa2cbf23e8769e70e6cef1442e"
+  },
+  "healthbox.status4": {
+   "width": 144,
+   "height": 8,
+   "sha1": "95b12c23d81de9d7259c22a4c0e88f2e084773eb"
+  },
+  "icon.types": {
+   "width": 32,
+   "height": 416,
+   "sha1": "e0e799e467ea24b9138cd093923b354e22e1ce6c"
+  },
+  "icon.category": {
+   "width": 16,
+   "height": 48,
+   "sha1": "8e80fbf49973157057e33918eea42267298f3eeb"
+  },
+  "icon.status": {
+   "width": 32,
+   "height": 64,
+   "sha1": "461cac5f4e0d35e81aa90f55a720f2f8b429e905"
+  },
+  "battle.ballStatusBar": {
+   "width": 64,
+   "height": 16,
+   "sha1": "73f2fb3b5400e1a6d0123421d4f484dbe689ac05"
+  },
+  "battle.shadow": {
+   "width": 64,
+   "height": 32,
+   "sha1": "5464e119c50e889abd3c900c260da5ebbcdfba99"
+  },
+  "env.0": {
+   "width": 240,
+   "height": 160,
+   "sha1": "2118d4bd9ce0a9d836ae9f4607d062daaf448cd8"
+  },
+  "env.1": {
+   "width": 240,
+   "height": 160,
+   "sha1": "37ace9a044bb40ebc642e74a4549af0eeafde9d5"
+  },
+  "env.2": {
+   "width": 240,
+   "height": 160,
+   "sha1": "6e06f5b54d9cde10da6dd7b098a3e44d4038defd"
+  },
+  "env.3": {
+   "width": 240,
+   "height": 160,
+   "sha1": "f98c507f7486e052b61fd47787664d3650f8e99b"
+  },
+  "env.4": {
+   "width": 240,
+   "height": 160,
+   "sha1": "00f809c3cd037f163f00b125834a84bc6e67f983"
+  },
+  "env.5": {
+   "width": 240,
+   "height": 160,
+   "sha1": "154741c64f158aa96b9fa885b92f998a48ac16d9"
+  },
+  "env.6": {
+   "width": 240,
+   "height": 160,
+   "sha1": "6160f6ed1ac03bf67a8c108c8236f8da9de5008a"
+  },
+  "env.7": {
+   "width": 240,
+   "height": 160,
+   "sha1": "7d7b1fc69fdedaff85060450dad08d091c458c7c"
+  },
+  "env.8": {
+   "width": 240,
+   "height": 160,
+   "sha1": "f6b2da8d99b30f8afab0f5e5107877a155635c72"
+  },
+  "env.9": {
+   "width": 240,
+   "height": 160,
+   "sha1": "80ad70a7953b9341dd5bc7f188458954a4e9a729"
+  },
+  "env.10": {
+   "width": 240,
+   "height": 160,
+   "sha1": "50eafce48e66916940253cbea7d901f51db5ee80"
+  },
+  "env.11": {
+   "width": 240,
+   "height": 160,
+   "sha1": "50eafce48e66916940253cbea7d901f51db5ee80"
+  },
+  "env.12": {
+   "width": 240,
+   "height": 160,
+   "sha1": "14943774f9682eb5a6925e67b994a9e547f9bd70"
+  },
+  "env.13": {
+   "width": 240,
+   "height": 160,
+   "sha1": "8b6210229e914f3711c0bdb5c9edf88620d2e5ba"
+  },
+  "env.14": {
+   "width": 240,
+   "height": 160,
+   "sha1": "470c7222193fe5f024a338044a7a7761654f1f00"
+  },
+  "env.15": {
+   "width": 240,
+   "height": 160,
+   "sha1": "8b8de4dbe2ae92b90ff526259779a3e2bc3a36fb"
+  },
+  "env.16": {
+   "width": 240,
+   "height": 160,
+   "sha1": "4a5593c784174d7e28b1daa0780fc4e907779bad"
+  },
+  "env.17": {
+   "width": 240,
+   "height": 160,
+   "sha1": "6b7d03b8934e089d0df82f292e1328c129263389"
+  },
+  "env.18": {
+   "width": 240,
+   "height": 160,
+   "sha1": "f534359be1e64c51c60b868a82816451e327af7c"
+  },
+  "env.19": {
+   "width": 240,
+   "height": 160,
+   "sha1": "e0f15bd8329acbcf8289602b76f80833b4f6c9dc"
+  },
+  "env.20": {
+   "width": 240,
+   "height": 160,
+   "sha1": "eb1fe9753fa73308c571f4f7f47a6d8eaa0d02a0"
+  },
+  "env.21": {
+   "width": 240,
+   "height": 160,
+   "sha1": "dbb91a3f4fa65783a9128e60ea8ccb9d0fdc2132"
+  },
+  "env.22": {
+   "width": 240,
+   "height": 160,
+   "sha1": "f103cd634b5df2d7ea6979b749a28577700683b4"
+  }
+ },
+ "aggregates": {
+  "species.all": {
+   "count": 1038,
+   "sha1": "c445c60e37b714a2854c35f6cb3967fbe2ffe702"
+  },
+  "species.1": {
+   "name": "Bulbasaur",
+   "frontFrames": 2,
+   "sha1": "5b2727d8f5c68f6098fde38754306bf14675bd67"
+  },
+  "species.25": {
+   "name": "Pikachu",
+   "frontFrames": 2,
+   "sha1": "7f8bc3831b2d4dad13a4f02801f579b5c7ff7282"
+  },
+  "species.150": {
+   "name": "Mewtwo",
+   "frontFrames": 2,
+   "sha1": "cfb86ae53fd50bcc3fe8529ad66a6a51fa358286"
+  },
+  "species.249": {
+   "name": "Lugia",
+   "frontFrames": 2,
+   "sha1": "debc6e62e7cad0e8ea773f9140d19ef4aadce446"
+  },
+  "species.250": {
+   "name": "Ho-Oh",
+   "frontFrames": 2,
+   "sha1": "1e459e29634c05616e9a3dad62750db5c3392f32"
+  },
+  "trainer.fronts": {
+   "count": 134,
+   "sha1": "183e170613b40dc94020cf68eb0b49a8f8ace1ce"
+  },
+  "trainer.backs": {
+   "count": 8,
+   "frames": 34,
+   "sha1": "0b625b1416eb6f523936aaf7d7af0a396df2bda5"
+  },
+  "trainer.heads": {
+   "count": 52,
+   "sha1": "8a08ce4459b2d84ca31f540baf2082d36124d8a5"
+  }
+ }
+}

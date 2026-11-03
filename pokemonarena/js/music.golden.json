@@ -1,0 +1,164 @@
+{
+ "_about": "sha256 hashes and counts only; no ROM bytes, no audio. Float32 little-endian left then right channel of renderSong(rom, index, {seconds, sampleRate: 32768}).",
+ "node": "v24.19.0",
+ "platform": "win32-x64",
+ "roms": {
+  "soulgold": {
+   "sha256": "8071e2c348d54c3ec7b78b53837c5cbd757d5cfc461a50fa5ffbc9f5ab35060a",
+   "songTable": {
+    "offset": 22974168,
+    "count": 988,
+    "songs": 697,
+    "dummies": 291,
+    "codeRefs": [
+     1704328,
+     1706428,
+     1706500
+    ],
+    "mplayOffset": 22974120,
+    "maxTracks": [
+     16,
+     3,
+     9,
+     1
+    ]
+   },
+   "renders": {
+    "802@12": {
+     "sha256": "01a9aa261a0ad38178e20b0e763854ca42a9febdf97c456c5c97d6c80376e992",
+     "quant10bit": "5429a068b027663cc59993dff5b67b9472f83914e567cf099e901308014db594"
+    },
+    "805@12": {
+     "sha256": "684e19eda70a75a6bc7d89ec57be4aadac2d322831d2b415c4f9c46f7cbb82eb",
+     "quant10bit": "b64e12064ebfff1348db59c588c0b66ffea40d243e00f209be08c62ec1219ed2"
+    },
+    "350@12": {
+     "sha256": "ee1bec574f763079d90107793ef091112d95e4bd04e46e5b0cebaf06b68450fb",
+     "quant10bit": "557ad2cc78cc68531808beba60b6f815dfd5a62b26190c8f2142e700d988f985"
+    },
+    "362@10": {
+     "sha256": "2b45cf6d03a742de900d0c34d289b71d0e7a4e63b92b45be9cca45a60e54487b",
+     "quant10bit": "7b3ab8d8f63c97b0dfdbd95f1f1c631f5b6c16e9ec30e7ce04df5901a9e9bdf1"
+    },
+    "399@10": {
+     "sha256": "e146e870f1652debad71cdcca7c30182a0f72bca65ade8964ef47802ea23f980",
+     "quant10bit": "15b77cddf0b55da9f55f0c3d7c648c1962fd5145d09a46fd979ce75c36af0eca"
+    },
+    "888@10": {
+     "sha256": "a0ed002edae3258ff983ffe8bb0bfd9f87d5f20ae1db0db6d3e58663d2bf7379",
+     "quant10bit": "3217dbe8a8ec94c3f041f2df123778658317b602cf046dd07504476eb6baef36"
+    },
+    "887@10": {
+     "sha256": "e27030519d79527d9ab9aedb9c1c6f5c58e134c251dc86429e0833782cbd4b90",
+     "quant10bit": "6028a5e60050f2a8f844a4dedcf04d0785208e5a10c7272c321fddaa9dc6e355"
+    },
+    "811@10": {
+     "sha256": "414faa76148eee572d708beb18b39991b1e63cf3c011257711a32543b456bd73",
+     "quant10bit": "1d748000c58e17438385f5778498a200f7a31e6ff343c16f4f32f52474e7c509"
+    },
+    "4@1.6": {
+     "sha256": "3d62a3a9a5811a4a111b3a9a7a546cddaa9c8d894186188a7831e0ad632f3dd6",
+     "quant10bit": "5eefd9d4dc368550d8d39fc963a5ec8871f5ada8f6c84b92cb2c50914d444a75"
+    },
+    "10@1": {
+     "sha256": "443b260a05c09ecd7c53efc49b8be2bc82b06093a7d4ba5ab55fb1faa14dac4f",
+     "quant10bit": "852339b544552915d08fc526ac30590b8c3525114e46b06fbacccbbe60032e28"
+    },
+    "31@1": {
+     "sha256": "df0820e9607bfc6e2f0640fc045a8120bff802398f9a4aa619864c401097d982",
+     "quant10bit": "e7f1aede03374e2dde763a3048596a7d7b9d2d413fc78e18072dcc976817af23"
+    }
+   },
+   "headerStats": {
+    "entries": 988,
+    "empty": 291,
+    "overPlayerTrackLimit": 2
+   },
+   "analysis": {
+    "analysed": 697,
+    "looping": 357,
+    "nonLooping": 340,
+    "longestMs": 250638,
+    "tempoRange": [
+     44,
+     422
+    ],
+    "digest": "71ca54ea2f9141a1fdfb0616e87b4bde01a84ad32b42a9a0efb656ac17e55752"
+   },
+   "render": {
+    "audible": 646,
+    "silent": 51,
+    "silentRange": [
+     559,
+     609
+    ]
+   }
+  },
+  "ultraviolet": {
+   "sha256": "467fe116ff6d7d5723b9f8fc60dd81c698c5d4e27b1b444168f3be292848d015",
+   "songTable": {
+    "offset": 4862668,
+    "count": 347,
+    "songs": 346,
+    "dummies": 1,
+    "codeRefs": [
+     1954076,
+     1954128,
+     1954204,
+     1954288,
+     1954340
+    ],
+    "mplayOffset": 4862620,
+    "maxTracks": [
+     10,
+     3,
+     9,
+     1
+    ]
+   },
+   "renders": {
+    "321@12": {
+     "sha256": "50fa0713d3645cfd19340fb74388267251f315dd2bc1f00e66798ace25a45fc9",
+     "quant10bit": "930fa9fb831b41e7524720991abfded499e0cd7366dc7f6a8164ab5a8603db6e"
+    },
+    "264@12": {
+     "sha256": "0fee2b832b6117ea75c4a24ed9ca4b629f1cfceabe00237cc301fb11ffb917f2",
+     "quant10bit": "71bfbaa2b8dd968c1b2873b54f2a463ccc2e832691a8a697ceabcb6c198018f1"
+    },
+    "274@10": {
+     "sha256": "8c3a9e3e7cf946fadca1b151fc4ba19ef025c6d3a89ab10c5bac9cc4262d4136",
+     "quant10bit": "e1182fa3d4a6628ba7017e9da3ebf78c8f58b9ce635448c2eb16b2e981344134"
+    },
+    "4@1.6": {
+     "sha256": "3d62a3a9a5811a4a111b3a9a7a546cddaa9c8d894186188a7831e0ad632f3dd6",
+     "quant10bit": "5eefd9d4dc368550d8d39fc963a5ec8871f5ada8f6c84b92cb2c50914d444a75"
+    },
+    "83@10": {
+     "sha256": "f21eb053963fb799f95d3eb30ee13782702d99182885b8dff12cf09d3e605dfa",
+     "quant10bit": "1029d50ae2cb6ba74490fa85dc5f12016b29dc453f4e17b000f30026a7c591a3"
+    }
+   },
+   "headerStats": {
+    "entries": 347,
+    "empty": 1,
+    "overPlayerTrackLimit": 0
+   },
+   "analysis": {
+    "analysed": 346,
+    "looping": 77,
+    "nonLooping": 269,
+    "longestMs": 250638,
+    "tempoRange": [
+     44,
+     422
+    ],
+    "digest": "56a24390aa28a05ec2eb0adaf3415928035d676d1124d1f0198a2f1499f8b1a1"
+   },
+   "render": {
+    "audible": 346,
+    "silent": 0,
+    "silentRange": null
+   }
+  }
+ }
+}

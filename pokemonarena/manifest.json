@@ -1,0 +1,66 @@
+{
+  "schema": 1,
+  "note": "Hashes, offsets and strides only. Nothing ROM-derived (no names, stats, pixels) is stored here; the pack is decoded at runtime from the ROM the site serves. Mirrored by LAYOUT in js/tables.js and PINNED in js/rom.js; tools/pokemonarena_pack_test.mjs fails if they drift.",
+  "rom": {
+    "fileName": "Pokemon SoulGold (v1.1.1).gba",
+    "length": 33554432,
+    "sha256": "8071e2c348d54c3ec7b78b53837c5cbd757d5cfc461a50fa5ffbc9f5ab35060a",
+    "md5": "b2c5caf9bc6dd28a44052427ee3ab1b7",
+    "title": "POKEMON EMER",
+    "gameCode": "BPEE",
+    "makerCode": "01",
+    "fixedByte": "0x96",
+    "version": 0,
+    "headerChecksum": "0x72"
+  },
+  "layout": {
+    "species": {
+      "offset": "0x7c7310",
+      "stride": 280,
+      "slots": 1579
+    },
+    "moves": {
+      "offset": "0x769860",
+      "stride": 72,
+      "count": 936
+    },
+    "abilities": {
+      "offset": "0xef6e44",
+      "stride": 32,
+      "count": 523
+    },
+    "items": {
+      "offset": "0x7451c4",
+      "stride": 44,
+      "count": 930
+    },
+    "types": {
+      "offset": "0x43b56c",
+      "stride": 40,
+      "count": 21
+    },
+    "typeChart": {
+      "offset": "0x43b8b4",
+      "size": 21
+    },
+    "natures": {
+      "offset": "0xef5cac",
+      "stride": 20,
+      "count": 25
+    },
+    "exp": {
+      "offset": "0x889500",
+      "rows": 8,
+      "levels": 101
+    },
+    "tmhm": {
+      "offset": "0x73be1c",
+      "count": 110,
+      "tmCount": 100,
+      "firstItem": 582
+    },
+    "tutors": {
+      "offset": "0x788c70"
+    }
+  }
+}

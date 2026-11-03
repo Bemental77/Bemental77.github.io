@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Pokemon Arena</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="description" content="Pokemon Arena: a Gen 3 style Pokemon battle game on Pokemon SoulGold data. Quick battles, your own teams, and a team builder, with every picture drawn from the ROM this site already serves." />
+  <meta name="color-scheme" content="dark" />
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/pokemonarena/arena.css" />
+  <link rel="stylesheet" href="/pokemonarena/input.css" />
+  <!-- The game library's origin: ONE constant for the whole site (see lib/asset_base.js). The ROM URL is built from it in js/romfetch.js. -->
+  <script src="/lib/asset_base.js"></script>
+</head>
+<body data-state="boot" data-layout="portrait" data-pad="off">
+  <header id="top">
+    <a class="home" id="homeLink" href="/">&lsaquo; Home</a>
+    <h1>Pokemon Arena</h1>
+    <div class="tools">
+      <button id="soundBtn" class="textbtn" type="button" aria-pressed="false" title="Sound is off until you turn it on">Sound: off</button>
+      <button id="controlsBtn" class="textbtn" type="button" title="Keyboard, controller and touch settings">Controls</button>
+    </div>
+  </header>
+
+  <main id="play">
+    <div id="dpad" class="cluster" aria-label="Directional pad">
+      <button class="pbtn" data-btn="up" id="bUp" aria-label="Up" type="button">&#9650;</button>
+      <button class="pbtn" data-btn="left" id="bLeft" aria-label="Left" type="button">&#9664;</button>
+      <button class="pbtn" data-btn="right" id="bRight" aria-label="Right" type="button">&#9654;</button>
+      <button class="pbtn" data-btn="down" id="bDown" aria-label="Down" type="button">&#9660;</button>
+    </div>
+
+    <div id="screenWrap">
+      <canvas id="hub" width="240" height="160" tabindex="0" hidden data-input-target aria-label="Pokemon Arena menu, 240 by 160 pixels. Arrow keys move, Z or Enter chooses, X or Backspace goes back. Click or tap a row to choose it."></canvas>
+      <div id="boot" role="status">
+        <p id="bootText">Starting...</p>
+        <progress id="bar" max="1" value="0"></progress>
+      </div>
+      <div id="error" role="alert" hidden>
+        <h2 id="errTitle">The ROM could not be loaded</h2>
+        <p id="errMsg"></p>
+        <p id="errDetail" class="dim"></p>
+        <div class="row">
+          <button id="retry" type="button" class="textbtn" hidden>Try again</button>
+          <a class="textbtn" href="/">Back to the site</a>
+        </div>
+      </div>
+    </div>
+
+    <div id="ab" class="cluster" aria-label="Action buttons">
+      <div class="abrow">
+        <button class="pbtn" data-btn="b" id="bB" aria-label="B (back)" type="button">B</button>
+        <button class="pbtn" data-btn="a" id="bA" aria-label="A (confirm)" type="button">A</button>
+      </div>
+    </div>
+  </main>
+
+  <p id="note" class="warn" hidden role="status"></p>
+  <p id="romStatus" class="dim" role="status"></p>
+  <p id="keys" class="dim">Arrows or WASD move &middot; Z / Enter = A (choose) &middot; X / Backspace = B (back) &middot; left / right change a setting &middot; click or tap works too</p>
+  <div id="live" class="sr" role="status" aria-live="polite"></div>
+
+  <div id="controlsDialog" role="dialog" aria-modal="true" aria-labelledby="ctlTitle" hidden>
+    <div class="dlg">
+      <div class="dlg-head"><h2 id="ctlTitle">Controls</h2><button id="controlsClose" class="textbtn" type="button" data-nav-close>Close</button></div>
+      <div id="controlsHost"></div>
+      <div class="row"><button id="controlsClose2" class="textbtn" type="button" data-nav-close>Close</button></div>
+    </div>
+  </div>
+
+  <noscript><p class="warn">Pokemon Arena needs JavaScript.</p></noscript>
+  <script type="module" src="/pokemonarena/js/boot.js"></script>
+</body>
+</html>

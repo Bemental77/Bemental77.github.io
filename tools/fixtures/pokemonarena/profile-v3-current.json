@@ -1,0 +1,321 @@
+{
+ "app": "pokemonarena",
+ "schemaVersion": 3,
+ "id": "p_fixture03",
+ "rev": 12,
+ "createdAt": 1700000000000,
+ "updatedAt": 1700000600000,
+ "romSha256": "8071e2c348d54c3ec7b78b53837c5cbd757d5cfc461a50fa5ffbc9f5ab35060a",
+ "trainerName": "GREEN",
+ "avatar": {
+  "kind": "preset",
+  "id": 3
+ },
+ "settings": {
+  "defaultRuleset": "arena-gen3-standard+strict-champions",
+  "animations": "off",
+  "textSpeed": "fast",
+  "sound": true,
+  "reducedMotion": true,
+  "trainingMode": "champions",
+  "backupNudgeDays": 0
+ },
+ "teams": [
+  {
+   "id": "t_main",
+   "name": "STRICT SIX",
+   "ruleset": "arena-gen3-standard+strict-champions",
+   "monIds": [
+    "m_a",
+    "m_b"
+   ]
+  }
+ ],
+ "box": [
+  {
+   "id": "m_a",
+   "species": 9,
+   "nickname": "Shell",
+   "level": 50,
+   "nature": 5,
+   "abilitySlot": 0,
+   "heldItem": 3,
+   "moves": [
+    {
+     "id": 11,
+     "ppUps": 1
+    },
+    {
+     "id": 12,
+     "ppUps": 2
+    },
+    {
+     "id": 13,
+     "ppUps": 3
+    },
+    {
+     "id": 14,
+     "ppUps": 0
+    }
+   ],
+   "ev": {
+    "hp": 252,
+    "atk": 0,
+    "def": 4,
+    "spa": 252,
+    "spd": 0,
+    "spe": 0
+   },
+   "iv": {
+    "hp": 31,
+    "atk": 31,
+    "def": 31,
+    "spa": 31,
+    "spd": 31,
+    "spe": 31
+   },
+   "gender": "M",
+   "shiny": false,
+   "friendship": 70,
+   "originalTrainer": {
+    "name": "GREEN",
+    "tid": 777,
+    "sid": 888
+   },
+   "origin": "custom",
+   "provenance": {},
+   "createdAt": 1700000000100,
+   "updatedAt": 1700000000100
+  },
+  {
+   "id": "m_b",
+   "species": 94,
+   "nickname": "G",
+   "level": 50,
+   "nature": 10,
+   "abilitySlot": 2,
+   "heldItem": 0,
+   "moves": [
+    {
+     "id": 21,
+     "ppUps": 0
+    }
+   ],
+   "ev": {
+    "hp": 0,
+    "atk": 0,
+    "def": 0,
+    "spa": 0,
+    "spd": 0,
+    "spe": 0
+   },
+   "iv": {
+    "hp": 31,
+    "atk": 31,
+    "def": 31,
+    "spa": 31,
+    "spd": 31,
+    "spe": 31
+   },
+   "gender": "F",
+   "shiny": true,
+   "friendship": 0,
+   "originalTrainer": {
+    "name": "",
+    "tid": 0,
+    "sid": 0
+   },
+   "origin": "rental",
+   "provenance": {
+    "source": "fixture",
+    "pid": 1,
+    "otId": 2,
+    "_unknown": {
+     "extra": true
+    }
+   },
+   "createdAt": 1700000000200,
+   "updatedAt": 1700000000200
+  }
+ ],
+ "stats": {
+  "wins": 3,
+  "losses": 1,
+  "draws": 0,
+  "forfeits": 1,
+  "streak": 2,
+  "best": 3,
+  "lastMatchAt": 1700000550000,
+  "byRuleset": {
+   "arena-gen3-standard+strict-champions": {
+    "w": 3,
+    "l": 2
+   }
+  },
+  "firstMatchAt": 1700000100000,
+  "playMs": 1830000,
+  "byFormat": {
+   "3v3": {
+    "w": 2,
+    "l": 1,
+    "dr": 0,
+    "f": 0
+   },
+   "6v6": {
+    "w": 1,
+    "l": 0,
+    "dr": 0,
+    "f": 1
+   }
+  },
+  "byCpu": {
+   "easy": {
+    "w": 1,
+    "l": 0,
+    "dr": 0,
+    "f": 0
+   },
+   "normal": {
+    "w": 2,
+    "l": 1,
+    "dr": 0,
+    "f": 0
+   },
+   "hard": {
+    "w": 0,
+    "l": 0,
+    "dr": 0,
+    "f": 1
+   }
+  },
+  "totals": {
+   "turns": 62,
+   "kos": 12,
+   "faints": 8,
+   "dealt": 2210,
+   "taken": 1904,
+   "hits": 36,
+   "crits": 3,
+   "superEffective": 11,
+   "resisted": 5,
+   "noEffect": 1,
+   "misses": 4,
+   "statusInflicted": 3,
+   "healed": 140,
+   "switches": 6
+  },
+  "bests": {
+   "hit": {
+    "sp": 9,
+    "mv": 11,
+    "dmg": 211,
+    "pct": 88,
+    "vs": 94,
+    "at": 1700000300000
+   },
+   "fastestWin": {
+    "turns": 9,
+    "at": 1700000200000
+   },
+   "longest": {
+    "turns": 21,
+    "at": 1700000550000
+   },
+   "koStreak": 3
+  },
+  "fav": {
+   "species": {
+    "9": 4,
+    "94": 3
+   },
+   "moves": {
+    "11": 9,
+    "12": 6,
+    "21": 5
+   },
+   "mvps": {
+    "9": 3,
+    "94": 1
+   }
+  },
+  "recent": [
+   {
+    "id": "s5_3v3_normal_lq0a",
+    "at": 1700000550000,
+    "fmt": "6v6",
+    "cpu": "hard",
+    "res": "f",
+    "turns": 4,
+    "mvp": 0,
+    "team": [
+     9,
+     94
+    ]
+   },
+   {
+    "id": "s4_3v3_normal_lq09",
+    "at": 1700000450000,
+    "fmt": "3v3",
+    "cpu": "normal",
+    "res": "w",
+    "turns": 12,
+    "mvp": 9,
+    "team": [
+     9,
+     94
+    ]
+   },
+   {
+    "id": "s3_3v3_normal_lq08",
+    "at": 1700000350000,
+    "fmt": "3v3",
+    "cpu": "normal",
+    "res": "w",
+    "turns": 21,
+    "mvp": 94,
+    "team": [
+     9,
+     94
+    ]
+   },
+   {
+    "id": "s2_3v3_easy_lq07",
+    "at": 1700000250000,
+    "fmt": "3v3",
+    "cpu": "easy",
+    "res": "w",
+    "turns": 9,
+    "mvp": 9,
+    "team": [
+     9,
+     94
+    ]
+   },
+   {
+    "id": "s1_3v3_normal_lq06",
+    "at": 1700000150000,
+    "fmt": "3v3",
+    "cpu": "normal",
+    "res": "l",
+    "turns": 16,
+    "mvp": 9,
+    "team": [
+     9,
+     94
+    ]
+   }
+  ]
+ },
+ "identity": {
+  "publicKeyJwk": {
+   "kty": "EC",
+   "crv": "P-256",
+   "x": "2ANwQaT12XwU09a7UMD3iJOf0MjcZ-aY3bxxHprL1tg",
+   "y": "wYCvf3YYXZdMKCT8QxpMt6bjPgpcmcQXRu2xdIiaPr0"
+  },
+  "previousKeys": []
+ },
+ "_unknown": {
+  "keep": "me"
+ }
+}

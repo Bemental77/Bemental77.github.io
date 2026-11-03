@@ -1,0 +1,330 @@
+{
+ "note": "Hashes only. Regenerate with ARENA_UPDATE_GOLDEN=1 node tools/pokemonarena_engine_test.mjs after an intentional engine change.",
+ "engineVersion": 1,
+ "battles": 40,
+ "seed0": 1,
+ "ruleset": "arena-gen3-standard",
+ "digest": "9db8376a764f382e",
+ "rows": [
+  {
+   "i": 1,
+   "hash": "0683d5121ce9ab15",
+   "logHash": "1c2d9e4bb62a72a0",
+   "turns": 12,
+   "winner": 1,
+   "events": 81
+  },
+  {
+   "i": 2,
+   "hash": "06d3b7c99e66eda5",
+   "logHash": "a07792b7531088e7",
+   "turns": 5,
+   "winner": 0,
+   "events": 40
+  },
+  {
+   "i": 3,
+   "hash": "3316376ea13e2d01",
+   "logHash": "5b8cb979f4f36b77",
+   "turns": 10,
+   "winner": 0,
+   "events": 58
+  },
+  {
+   "i": 4,
+   "hash": "9b9fc5c97dc4c567",
+   "logHash": "626d8ee97b501c93",
+   "turns": 5,
+   "winner": 1,
+   "events": 45
+  },
+  {
+   "i": 5,
+   "hash": "ac46edfe54b15f77",
+   "logHash": "4e958f98c9a1068f",
+   "turns": 3,
+   "winner": 1,
+   "events": 24
+  },
+  {
+   "i": 6,
+   "hash": "9d18d79a72cf30f2",
+   "logHash": "d5bbdbb06021bb1f",
+   "turns": 28,
+   "winner": 0,
+   "events": 177
+  },
+  {
+   "i": 7,
+   "hash": "f99049ff0540be16",
+   "logHash": "48fbb794213c9e10",
+   "turns": 17,
+   "winner": 0,
+   "events": 99
+  },
+  {
+   "i": 8,
+   "hash": "6cde273329503bf8",
+   "logHash": "17a1d84ba2227ffc",
+   "turns": 23,
+   "winner": 1,
+   "events": 140
+  },
+  {
+   "i": 9,
+   "hash": "64603fd1d573af33",
+   "logHash": "0d30191f6c9974ed",
+   "turns": 27,
+   "winner": 1,
+   "events": 165
+  },
+  {
+   "i": 10,
+   "hash": "08cf50c942a923d3",
+   "logHash": "16b4769c4c69e01c",
+   "turns": 30,
+   "winner": 1,
+   "events": 191
+  },
+  {
+   "i": 11,
+   "hash": "41e2c06a19071565",
+   "logHash": "cc8f954765d101e9",
+   "turns": 26,
+   "winner": 1,
+   "events": 165
+  },
+  {
+   "i": 12,
+   "hash": "5bc38c4fc4e8d0e3",
+   "logHash": "ceebf098f8f115e2",
+   "turns": 20,
+   "winner": -1,
+   "events": 123
+  },
+  {
+   "i": 13,
+   "hash": "81445cf5dbcbe055",
+   "logHash": "98361efa57f30d62",
+   "turns": 24,
+   "winner": 0,
+   "events": 144
+  },
+  {
+   "i": 14,
+   "hash": "2109d33f84865c31",
+   "logHash": "e9e122bf76f5f42c",
+   "turns": 10,
+   "winner": 0,
+   "events": 59
+  },
+  {
+   "i": 15,
+   "hash": "e76818d40210cb42",
+   "logHash": "509aef08da6aca39",
+   "turns": 6,
+   "winner": 0,
+   "events": 46
+  },
+  {
+   "i": 16,
+   "hash": "0e6bbcaf336764f9",
+   "logHash": "665314a26202d027",
+   "turns": 20,
+   "winner": 1,
+   "events": 110
+  },
+  {
+   "i": 17,
+   "hash": "5a56efe709acd14f",
+   "logHash": "c10d393e626061c4",
+   "turns": 22,
+   "winner": 1,
+   "events": 168
+  },
+  {
+   "i": 18,
+   "hash": "f388bbab511fd3e6",
+   "logHash": "f23507859036fd10",
+   "turns": 38,
+   "winner": 1,
+   "events": 264
+  },
+  {
+   "i": 19,
+   "hash": "b08d3401f10f36c8",
+   "logHash": "76b81f2dbd8a4dbd",
+   "turns": 29,
+   "winner": 1,
+   "events": 164
+  },
+  {
+   "i": 20,
+   "hash": "0e6660e2f8895a05",
+   "logHash": "bc56dfcbb4105581",
+   "turns": 43,
+   "winner": 1,
+   "events": 283
+  },
+  {
+   "i": 21,
+   "hash": "9b1161974509f717",
+   "logHash": "7c09351b6605b804",
+   "turns": 44,
+   "winner": 1,
+   "events": 276
+  },
+  {
+   "i": 22,
+   "hash": "d9be90beeb46deb5",
+   "logHash": "5ea69098e4e7fd0f",
+   "turns": 46,
+   "winner": 0,
+   "events": 275
+  },
+  {
+   "i": 23,
+   "hash": "0b4de86119ff026f",
+   "logHash": "e201a824218b3fbc",
+   "turns": 31,
+   "winner": 1,
+   "events": 172
+  },
+  {
+   "i": 24,
+   "hash": "196ea8e2eecb8c3c",
+   "logHash": "fe3562f39b903a37",
+   "turns": 23,
+   "winner": 0,
+   "events": 153
+  },
+  {
+   "i": 25,
+   "hash": "e1b7e1c9a3ca6d87",
+   "logHash": "e4c789662c09c9d4",
+   "turns": 3,
+   "winner": 0,
+   "events": 24
+  },
+  {
+   "i": 26,
+   "hash": "4c12ec507a90618a",
+   "logHash": "878cfdf9c3cacbcb",
+   "turns": 51,
+   "winner": 0,
+   "events": 312
+  },
+  {
+   "i": 27,
+   "hash": "80c79d7e0d7f2062",
+   "logHash": "c28aad10f2147c55",
+   "turns": 18,
+   "winner": 1,
+   "events": 106
+  },
+  {
+   "i": 28,
+   "hash": "08f6262dd1556ec5",
+   "logHash": "18e146e95bf42814",
+   "turns": 27,
+   "winner": 0,
+   "events": 187
+  },
+  {
+   "i": 29,
+   "hash": "d5089959d73b0547",
+   "logHash": "f5ee0cac8ddeecc6",
+   "turns": 11,
+   "winner": 0,
+   "events": 64
+  },
+  {
+   "i": 30,
+   "hash": "383d4a3f9d0d93c7",
+   "logHash": "be5974193d158063",
+   "turns": 37,
+   "winner": 0,
+   "events": 226
+  },
+  {
+   "i": 31,
+   "hash": "69789e63f9c4952f",
+   "logHash": "da0169852c4846b9",
+   "turns": 57,
+   "winner": 0,
+   "events": 328
+  },
+  {
+   "i": 32,
+   "hash": "08457d2b01ecd38c",
+   "logHash": "f18c1b8a8e98f49f",
+   "turns": 11,
+   "winner": 0,
+   "events": 64
+  },
+  {
+   "i": 33,
+   "hash": "caaf939e16631183",
+   "logHash": "a7d8095e04536b84",
+   "turns": 16,
+   "winner": 0,
+   "events": 96
+  },
+  {
+   "i": 34,
+   "hash": "f4c86678f545797f",
+   "logHash": "ec068bbf5af3c185",
+   "turns": 6,
+   "winner": 1,
+   "events": 42
+  },
+  {
+   "i": 35,
+   "hash": "0dadf7a5e4ab7f7e",
+   "logHash": "72d7b19b940bf98b",
+   "turns": 6,
+   "winner": 1,
+   "events": 42
+  },
+  {
+   "i": 36,
+   "hash": "cd05c0202c03f8e0",
+   "logHash": "4f75866deccfbc53",
+   "turns": 24,
+   "winner": 1,
+   "events": 138
+  },
+  {
+   "i": 37,
+   "hash": "a82e6963c65ac0d3",
+   "logHash": "6607e9d7fdfa4150",
+   "turns": 12,
+   "winner": 1,
+   "events": 101
+  },
+  {
+   "i": 38,
+   "hash": "d7734186231cf371",
+   "logHash": "95b1e0767b7e2798",
+   "turns": 3,
+   "winner": 1,
+   "events": 20
+  },
+  {
+   "i": 39,
+   "hash": "65805958453dcdb0",
+   "logHash": "3417d2a042ad2f9e",
+   "turns": 47,
+   "winner": 1,
+   "events": 292
+  },
+  {
+   "i": 40,
+   "hash": "37346feab9d3e40e",
+   "logHash": "1f520bf650222460",
+   "turns": 5,
+   "winner": 0,
+   "events": 41
+  }
+ ]
+}

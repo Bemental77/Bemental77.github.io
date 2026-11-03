@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PokemonArena IndexedDB smoke</title>
+<link rel="icon" href="data:,">
+<!--
+  DEV PAGE, driven by tools/pokemonarena_idb_smoke_test.mjs under tools/headless_cdp.mjs. Not linked from anywhere and not part of
+  the product; it exists so the IndexedDB adapter, the CryptoKey-in-IndexedDB identity and the CompressionStream paths are exercised
+  by a REAL browser instead of the in-memory twin the Node test uses.
+
+  Query parameters
+    phase=a   fresh database: adapter contract, store, CAS, history ring, identity, export, team code, newer-database handling;
+              then writes a state marker into the database
+    phase=b   run AFTER A RELOAD (and again after a browser restart): finds the marker, the profile, its history ring and the
+              non-extractable private key, and uses them
+    phase=c   deletes everything this page created
+    mode=idb | memory | nonatomic    idb is the real thing. memory and nonatomic are NEGATIVE CONTROLS: memory keeps the store in
+              page memory (so phase b MUST fail to find its marker), nonatomic wraps IndexedDB so each write commits on its own
+              (so the contract's rollback case MUST fail)
+    db=<name> database name (the test passes a unique one)
+  window.__smoke = { phase, mode, db, done, cases: [{name, ok, detail}], passed, failed, env, data }; window.__arena exposes the modules.
+-->
+<style>
+  :root { --bg: #101418; --fg: #d7dde4; --ok: #6fd08c; --bad: #ff7b72; --dim: #8b96a3; }
+  @media (prefers-color-scheme: light) { :root { --bg: #fafafa; --fg: #1d232a; --ok: #1a7f37; --bad: #cf222e; --dim: #57606a; } }
+  html { background: var(--bg); }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 14px/1.45 ui-monospace, Menlo, Consolas, monospace; }
+  h1 { font-size: 16px; margin: 0 0 8px; }
+  #sum { color: var(--dim); margin-bottom: 8px; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .dim { color: var(--dim); }
+  pre { white-space: pre-wrap; word-break: break-word; margin: 0; }
+</style>
+</head>
+<body>
+<h1>PokemonArena IndexedDB smoke (dev)</h1>
+<div id="sum">starting...</div>
+<pre id="out"></pre>
+<script type="module">
+import * as P from '../js/profile.js';
+import * as T from '../js/teamcode.js';
+import * as I from '../js/identity.js';
+import * as S from '../js/store.js';
+import { canonicalJSON } from '../js/stats.js';
+
+const q = new URLSearchParams(location.search);
+const PHASE = q.get('phase') || 'a';
+const MODE = q.get('mode') || 'idb';
+const DB = q.get('db') || 'pokemonarena-smoke';
+const NEWER_DB = DB + '-newer';
+const smoke = window.__smoke = { phase: PHASE, mode: MODE, db: DB, done: false, cases: [], passed: 0, failed: 0, env: {}, data: {} };
+window.__arena = { P, T, I, S, canonicalJSON, DB, MODE };
+const out = document.getElementById('out');
+const sum = document.getElementById('sum');
+function render() {
+  sum.textContent = `phase ${PHASE} mode ${MODE} db ${DB}: ${smoke.passed} passed, ${smoke.failed} failed${smoke.done ? ' (done)' : ' (running)'}`;
+  out.innerHTML = '';
+  for (const c of smoke.cases) {
+    const d = document.createElement('div');
+    d.className = c.ok ? 'ok' : 'bad';
+    d.textContent = (c.ok ? 'ok   ' : 'FAIL ') + c.name + (c.ok ? '' : '  -- ' + c.detail);
+    out.appendChild(d);
+  }
+}
+async function check(name, fn) {
+  let r;
+  try { r = await fn(); } catch (e) { r = 'threw ' + (e && e.name) + ': ' + (e && e.message); }
+  const ok = r === true;
+  smoke.cases.push({ name, ok, detail: ok ? '' : String(r) });
+  if (ok) smoke.passed++; else smoke.failed++;
+  render();
+}
+const J = (x) => JSON.stringify(x);
+const hex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const deleteDb = (name) => new Promise((res, rej) => { const r = indexedDB.deleteDatabase(name); r.onsuccess = () => res(); r.onerror = () => rej(r.error); r.onblocked = () => {}; });
+const CPU = () => crypto.getRandomValues(new Uint8Array(8));
+
+// ---- negative control: an adapter whose transactions are NOT atomic (each operation commits on its own)
+function brokenNonAtomic(a) {
+  return {
+    ...a,
+    transact(names, mode, fn) {
+      const one = (s, m, f) => a.transact([s], m, f);
+      return fn({
+        get: (s, k) => one(s, 'readonly', (tx) => tx.get(s, k)),
+        put: (s, v) => one(s, 'readwrite', (tx) => tx.put(s, v)),
+        delete: (s, k) => one(s, 'readwrite', (tx) => tx.delete(s, k)),
+        list: (s, o) => one(s, 'readonly', (tx) => tx.list(s, o)),
+      });
+    },
+  };
+}
+const contractCtx = () => {
+  if (MODE === 'memory') return { make: async (n) => { const a = S.createMemoryAdapter({ name: n }); await a.open(); return a; }, destroy: async (n) => S.dropMemoryDb(n) };
+  return {
+    make: async (n) => { const a = S.createIdbAdapter({ name: n }); await a.open(); return MODE === 'nonatomic' ? brokenNonAtomic(a) : a; },
+    destroy: (n) => deleteDb(n),
+  };
+};
+async function openMain(extra = {}) {
+  if (MODE === 'memory') return S.openStore({ adapter: S.createMemoryAdapter({ name: DB, durable: true }), dbName: DB, ...extra });
+  return S.openStore({ dbName: DB, ...extra });
+}
+
+async function phaseA() {
+  await check('env/secure-context-and-the-apis-the-modules-need', async () => {
+    smoke.env = {
+      userAgent: navigator.userAgent, isSecureContext, crossOriginIsolated, origin: location.origin,
+      indexedDB: typeof indexedDB, subtle: !!(crypto && crypto.subtle), CompressionStream: typeof CompressionStream, DecompressionStream: typeof DecompressionStream,
+      BroadcastChannel: typeof BroadcastChannel, storageManager: !!(navigator.storage && navigator.storage.persist),
+    };
+    const missing = Object.entries({ isSecureContext, subtle: smoke.env.subtle, indexedDB: smoke.env.indexedDB === 'object', CompressionStream: smoke.env.CompressionStream === 'function', BroadcastChannel: smoke.env.BroadcastChannel === 'function' }).filter(([, v]) => !v).map(([k]) => k);
+    return missing.length ? 'missing: ' + missing.join(', ') : true;
+  });
+
+  // 1. the adapter contract, on whatever the mode selects (idb = the real thing)
+  const res = await S.runAdapterContract(contractCtx());
+  for (const r of res) { smoke.cases.push({ name: r.name + ' [' + MODE + ']', ok: r.ok, detail: r.detail }); if (r.ok) smoke.passed++; else smoke.failed++; }
+  render();
+  if (MODE === 'nonatomic') return; // the control only needs the contract run
+
+  // 2. a store on the main database
+  let store = await openMain();
+  await check('store/open: functional probe passed and the status is honest', async () => {
+    const st = store.status;
+    const want = MODE === 'memory' ? 'memory' : 'indexeddb';
+    if (st.mode !== want || !st.probe || !st.probe.ok || st.notSaved || st.fellBack) return 'status ' + J(st);
+    return true;
+  });
+  await check('store/persistence-request (information only)', async () => { smoke.data.persistence = await store.requestPersistence(); return true; });
+  let p = await store.createProfile({ trainerName: 'SMOKE' });
+  const id = p.id;
+  await check('store/create-save-and-the-history-ring-of-5 on real IndexedDB', async () => {
+    for (let i = 2; i <= 9; i++) { p.trainerName = 'S' + i; p = await store.saveProfile(p); }
+    const h = await store.listHistory(id);
+    return p.rev === 9 && J(h.map((x) => x.rev)) === '[8,7,6,5,4]' ? true : `rev ${p.rev} history ${J(h.map((x) => x.rev))}`;
+  });
+  await check('store/compare-and-swap between two real connections', async () => {
+    const s2 = await openMain();
+    try {
+      const a = (await store.loadProfile(id)).profile;
+      const b = (await s2.loadProfile(id)).profile;
+      a.trainerName = 'FROM-A'; p = await store.saveProfile(a);
+      b.trainerName = 'FROM-B';
+      let err = null;
+      try { await s2.saveProfile(b); } catch (e) { err = e; }
+      if (!(err instanceof S.ConflictError) || err.detail.expectedRev !== 9 || err.detail.actualRev !== 10) return 'second connection was not refused: ' + (err && err.message);
+      const re = (await s2.loadProfile(id)).profile;
+      return re.trainerName === 'FROM-A' && re.rev === 10 ? true : 'reload after conflict';
+    } finally { await s2.close(); }
+  });
+  await check('store/BroadcastChannel reaches a second connection', async () => {
+    const s2 = await openMain();
+    try {
+      const got = [];
+      s2.on('external', (m) => got.push(m));
+      p = (await store.loadProfile(id)).profile;
+      p.trainerName = 'BCAST';
+      p = await store.saveProfile(p);
+      for (let i = 0; i < 80 && !got.length; i++) await sleep(25);
+      return got.length && got[0].t === 'saved' && got[0].id === id && got[0].rev === p.rev ? true : 'messages ' + J(got);
+    } finally { await s2.close(); }
+  });
+  await check('identity/non-extractable private key stored in IndexedDB signs and verifies', async () => {
+    const e = await I.ensureIdentity(p, store.keys, store.deps);
+    if (!e.created || e.status.state !== 'ok') return 'ensureIdentity ' + J(e.status);
+    p = await store.saveProfile(e.profile);
+    const rec = await store.keys.get(I.keySlot(id, e.status.keyId));
+    if (!rec || rec.privateKey.type !== 'private' || rec.privateKey.extractable !== false) return 'stored key is ' + (rec && `${rec.privateKey.type}/extractable=${rec.privateKey.extractable}`);
+    let exportable = false;
+    try { await crypto.subtle.exportKey('jwk', rec.privateKey); exportable = true; } catch (_e) { /* expected */ }
+    if (exportable) return 'the private key could be exported';
+    const receipt = { v: 1, kind: 'smoke-result', matchId: 'm-' + hex(CPU()), winner: 0 };
+    const entry = await I.signReceipt(p, store.keys, receipt);
+    const doc = I.makeReceiptDoc(receipt, [entry]);
+    const v = await I.verifyReceipt(doc);
+    if (!v.ok) return 'receipt: ' + J(v.reasons);
+    await store.setMeta('smoke:receipt', doc);
+    smoke.data.receiptDoc = doc;
+    smoke.data.keyId = entry.keyId;
+    smoke.data.publicKeyJwk = p.identity.publicKeyJwk;
+    return true;
+  });
+  await check('export-import/gzip with the browser CompressionStream, canonical equality', async () => {
+    const e = await P.exportBytes(p, { gzip: true });
+    if (!e.gzip || e.bytes[0] !== 0x1f || e.bytes[1] !== 0x8b) return 'not gzip';
+    const r = await P.parseExport(e.bytes, {});
+    if (!r.ok) return J(r).slice(0, 200);
+    const strip = (x) => { const c = JSON.parse(JSON.stringify(x)); delete c.rev; return canonicalJSON(c); };
+    smoke.data.exportGzBase64 = btoa(String.fromCharCode(...e.bytes));
+    smoke.data.exportCanon = strip(p);
+    return strip(r.profile) === strip(p) && r.gzip ? true : 'profile changed in the round trip';
+  });
+  const sampleTeam = () => ({
+    name: 'SMOKE', ruleset: 'arena-gen3-standard+item-clause', romSha256: '8071e2c348d54c3ec7b78b53837c5cbd757d5cfc461a50fa5ffbc9f5ab35060a',
+    mons: [{ species: 6, nickname: 'Zard', level: 50, nature: 3, abilitySlot: 1, heldItem: 10, moves: [{ id: 1, ppUps: 3 }, { id: 2, ppUps: 0 }], ev: { hp: 4, atk: 252, def: 0, spa: 0, spd: 0, spe: 252 }, iv: { hp: 31, atk: 30, def: 29, spa: 28, spd: 27, spe: 26 }, gender: 'F', shiny: true, friendship: 255 }],
+  });
+  window.__arena.sampleTeam = sampleTeam;
+  await check('teamcode/encode-decode in the browser; card bytes recorded for the cross-engine comparison', async () => {
+    const team = sampleTeam();
+    const code = await T.encodeTeamCode(team);
+    const d = await T.decodeTeamCode(code, {});
+    if (!d.ok) return J(d);
+    if (canonicalJSON(d.team.mons) !== canonicalJSON(team.mons.map(T.battleView))) return 'mons changed';
+    smoke.data.teamCode = code;
+    smoke.data.cardHex = hex(T.encodeTeamBinary(team));
+    smoke.data.cardHash = d.hash;
+    await store.setMeta('smoke:teamcode', code);
+    return true;
+  });
+  await check('store/a database written by a NEWER build opens read-only and is not replaced by memory', async () => {
+    await deleteDb(NEWER_DB);
+    await new Promise((res, rej) => {
+      const r = indexedDB.open(NEWER_DB, 9); // a version this build (1) has never heard of
+      r.onupgradeneeded = () => { const db = r.result; for (const [n, kp] of Object.entries(S.STORES)) db.createObjectStore(n, { keyPath: kp }); };
+      r.onsuccess = () => { const db = r.result; const tx = db.transaction(['profiles'], 'readwrite'); tx.objectStore('profiles').put(P.createProfile({ trainerName: 'FUTURE', id: 'p_future' }, store.deps)); tx.oncomplete = () => { db.close(); res(); }; tx.onerror = () => rej(tx.error); };
+      r.onerror = () => rej(r.error);
+    });
+    const ns = await S.openStore({ dbName: NEWER_DB });
+    try {
+      const st = ns.status;
+      if (st.mode !== 'indexeddb' || !st.readOnly || !st.notSaved || st.fellBack || !/newer-than-app/.test(st.reason)) return 'status ' + J(st);
+      const l = await ns.loadProfile('p_future');
+      let err = null;
+      try { await ns.saveProfile({ ...l.profile, trainerName: 'X' }); } catch (e) { err = e; }
+      return l.ok && err instanceof S.ReadOnlyError ? true : 'read ok=' + l.ok + ' save error=' + (err && err.name);
+    } finally { await ns.close(); }
+  });
+  await check('store/unavailable IndexedDB falls back to memory with the sticky not-saved flag', async () => {
+    const blocked = { open() { throw new DOMException('blocked by policy', 'SecurityError'); } };
+    const fs2 = await S.openStore({ idbFactory: blocked, channel: false });
+    const st = fs2.status;
+    const pr = await fs2.createProfile({ trainerName: 'MEM' });
+    return st.mode === 'memory' && st.notSaved && st.fellBack && /SecurityError/.test(st.reason) && pr.rev === 1 && fs2.status.notSaved ? true : 'status ' + J(st);
+  });
+  // the marker phase b looks for
+  const finalP = (await store.loadProfile(id)).profile;
+  smoke.data.state = { profileId: id, rev: finalP.rev, canon: canonicalJSON(finalP), historyRevs: (await store.listHistory(id)).map((x) => x.rev), keyId: smoke.data.keyId, teamCode: smoke.data.teamCode };
+  await store.setMeta('smoke:state', smoke.data.state);
+  await store.close();
+}
+
+async function phaseB() {
+  const store = await openMain();
+  const st = await store.getMeta('smoke:state');
+  await check('persist/the state marker written before the reload is there [' + MODE + ']', async () => (st && st.profileId ? true : 'no marker in the database (status ' + J(store.status) + ')'));
+  if (!st) { await store.close(); return; }
+  await check('persist/profile has the same revision and exactly the same content', async () => {
+    const r = await store.loadProfile(st.profileId);
+    return r.ok && !r.readOnly && r.profile.rev === st.rev && canonicalJSON(r.profile) === st.canon ? true : 'rev ' + (r.profile && r.profile.rev) + ' vs ' + st.rev;
+  });
+  await check('persist/the history ring survived', async () => { const h = (await store.listHistory(st.profileId)).map((x) => x.rev); return J(h) === J(st.historyRevs) ? true : J(h) + ' vs ' + J(st.historyRevs); });
+  await check('persist/the non-extractable private key survived and still signs', async () => {
+    const prof = (await store.loadProfile(st.profileId)).profile;
+    const status = await I.identityStatus(prof, store.keys);
+    if (status.state !== 'ok' || status.keyId !== st.keyId) return 'identity status ' + J(status);
+    const rec = await store.keys.get(I.keySlot(st.profileId, st.keyId));
+    if (rec.privateKey.extractable !== false) return 'the reloaded key is extractable';
+    const receipt = { v: 1, kind: 'smoke-result', matchId: 'after-' + hex(CPU()), winner: 1 };
+    const entry = await I.signReceipt(prof, store.keys, receipt);
+    const doc = I.makeReceiptDoc(receipt, [entry]);
+    const v = await I.verifyReceipt(doc, { requireKeyIds: [st.keyId] });
+    if (!v.ok) return 'new receipt: ' + J(v.reasons);
+    const old = await store.getMeta('smoke:receipt');
+    const vo = await I.verifyReceipt(old, { requireKeyIds: [st.keyId] });
+    smoke.data.receiptDocAfter = doc;
+    return vo.ok ? true : 'the receipt signed before the reload no longer verifies: ' + J(vo.reasons);
+  });
+  await check('persist/the stored team code still decodes', async () => { const code = await store.getMeta('smoke:teamcode'); const d = await T.decodeTeamCode(code, {}); return d.ok && code === st.teamCode ? true : J(d); });
+  await check('persist/compare-and-swap still works after the reload', async () => {
+    const a = (await store.loadProfile(st.profileId)).profile;
+    const stale = JSON.parse(JSON.stringify(a));
+    a.trainerName = 'AFTER' + st.rev;
+    const saved = await store.saveProfile(a);
+    let err = null;
+    try { await store.saveProfile(stale); } catch (e) { err = e; }
+    const nst = { ...st, rev: saved.rev, canon: canonicalJSON((await store.loadProfile(st.profileId)).profile), historyRevs: (await store.listHistory(st.profileId)).map((x) => x.rev) };
+    await store.setMeta('smoke:state', nst);
+    return saved.rev === st.rev + 1 && err instanceof S.ConflictError ? true : 'rev ' + saved.rev + ' error ' + (err && err.name);
+  });
+  await store.close();
+}
+
+async function phaseC() {
+  await check('cleanup/delete the databases this page created', async () => {
+    await deleteDb(DB); await deleteDb(NEWER_DB);
+    if (typeof indexedDB.databases !== 'function') return true;
+    const left = (await indexedDB.databases()).map((d) => d.name).filter((n) => n === DB || n === NEWER_DB || n.startsWith('contract-'));
+    return left.length === 0 ? true : 'still there: ' + left.join(', ');
+  });
+}
+
+(async () => {
+  try {
+    if (PHASE === 'a') await phaseA();
+    else if (PHASE === 'b') await phaseB();
+    else if (PHASE === 'c') await phaseC();
+    else smoke.cases.push({ name: 'phase', ok: false, detail: 'unknown phase ' + PHASE });
+  } catch (e) {
+    smoke.cases.push({ name: 'page/unexpected exception', ok: false, detail: (e && e.stack) || String(e) });
+    smoke.failed++;
+  }
+  smoke.done = true;
+  render();
+})();
+</script>
+</body>
+</html>

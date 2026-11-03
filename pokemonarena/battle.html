@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Pokemon Arena - Battle</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="description" content="A Gen-3 style Pokemon battle against a CPU opponent, drawn entirely from the Pokemon SoulGold ROM this site already serves: its sprites, fonts, text boxes, HP bars, menus and messages." />
+  <meta name="color-scheme" content="dark" />
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/pokemonarena/battle.css" />
+  <link rel="stylesheet" href="/pokemonarena/input.css" />
+  <!-- The game library's origin: ONE constant for the whole site (see lib/asset_base.js). The ROM URL is built from it in js/romfetch.js. -->
+  <script src="/lib/asset_base.js"></script>
+</head>
+<body data-state="boot" data-layout="portrait" data-pad="off">
+  <header id="top">
+    <a class="home" id="homeLink" href="/pokemonarena/">&lsaquo; Arena</a>
+    <h1>Battle</h1>
+    <div class="tools">
+      <button id="soundBtn" class="textbtn" type="button" aria-pressed="false" title="Sound is off until you turn it on">Sound: off</button>
+      <button id="controlsBtn" class="textbtn" type="button" title="Keyboard, controller and touch settings">Controls</button>
+      <button id="menuBtn" class="textbtn" type="button" title="Battle menu (Start)">Menu</button>
+    </div>
+  </header>
+
+  <main id="play">
+    <div id="dpad" class="cluster" aria-label="Directional pad">
+      <button class="pbtn" data-btn="up" id="bUp" aria-label="Up" type="button">&#9650;</button>
+      <button class="pbtn" data-btn="left" id="bLeft" aria-label="Left" type="button">&#9664;</button>
+      <button class="pbtn" data-btn="right" id="bRight" aria-label="Right" type="button">&#9654;</button>
+      <button class="pbtn" data-btn="down" id="bDown" aria-label="Down" type="button">&#9660;</button>
+    </div>
+
+    <div id="screenWrap">
+      <canvas id="battle" width="240" height="160" tabindex="0" hidden data-input-target aria-label="Battle screen, 240 by 160 pixels. Arrow keys move, Z or Enter confirms, X or Backspace goes back."></canvas>
+      <!-- W1 fix A4/A5: the move menu is the one battle screen with no visible way back and no visible way to read a move; these two chips sit over the picture's top-right corner while it is open -->
+      <div id="ctxchips" hidden>
+        <button id="chipBack" class="chip" type="button" aria-label="Back to the action menu">&lsaquo; Back</button>
+        <button id="chipInfo" class="chip" type="button" aria-label="Read the highlighted move's description">Info</button>
+      </div>
+      <div id="boot" role="status">
+        <p id="bootText">Starting...</p>
+        <progress id="bar" max="1" value="0"></progress>
+      </div>
+      <div id="error" role="alert" hidden>
+        <h2 id="errTitle">The battle could not start</h2>
+        <p id="errMsg"></p>
+        <p id="errDetail" class="dim"></p>
+        <div class="row">
+          <button id="retry" type="button" class="textbtn" hidden>Try again</button>
+          <a id="quickBtn" class="textbtn" href="/pokemonarena/battle.html">Quick Battle</a>
+          <a id="hubBtn" class="textbtn" href="/pokemonarena/">Back to the Arena</a>
+        </div>
+      </div>
+    </div>
+
+    <div id="ab" class="cluster" aria-label="Action buttons">
+      <div class="abrow">
+        <button class="pbtn small" data-btn="x" id="bX" aria-label="X (info)" type="button">X</button>
+        <button class="pbtn small" data-btn="start" id="bStart" aria-label="Menu" type="button">&#9776;</button>
+      </div>
+      <div class="abrow">
+        <button class="pbtn" data-btn="b" id="bB" aria-label="B (back)" type="button">B</button>
+        <button class="pbtn" data-btn="a" id="bA" aria-label="A (confirm)" type="button">A</button>
+      </div>
+    </div>
+  </main>
+
+  <p id="note" class="dim" hidden></p>
+  <p id="keys" class="dim">Arrows or WASD move &middot; Z / Enter = A &middot; X / Backspace = B &middot; C = info &middot; P = menu &middot; hold A or B to type faster &middot; click or tap works too</p>
+
+  <script type="module" src="/pokemonarena/js/battle_boot.js"></script>
+</body>
+</html>

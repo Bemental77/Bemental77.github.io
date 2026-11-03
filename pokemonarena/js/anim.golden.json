@@ -1,0 +1,83 @@
+{
+ "schema": 1,
+ "romSha256": "8071e2c348d54c3ec7b78b53837c5cbd757d5cfc461a50fa5ffbc9f5ab35060a",
+ "note": "sha256 (first 128 bits) of the RGBA frames of the whole animation, drawn onto a flat 240x160 picture each frame; species 4 (side 0) vs species 1 (side 1), seed 1; hashes only",
+ "cases": {
+  "move:33": {
+   "hash": "62bca479c664a8620f3f2824e3dd0242",
+   "frames": 40
+  },
+  "move:52": {
+   "hash": "a34bed1617fa3bc6f72bb81e5d535f0d",
+   "frames": 68
+  },
+  "move:55": {
+   "hash": "0c44c7f3d12291a4b67f97b01c565226",
+   "frames": 124
+  },
+  "move:85": {
+   "hash": "611b412802e2648c12b0e8ec41e4331c",
+   "frames": 235
+  },
+  "move:94": {
+   "hash": "7e18379e45b240b174fb93e175c0bbd0",
+   "frames": 141
+  },
+  "move:63": {
+   "hash": "37512896a5e3c616aad50f2dbc366e5a",
+   "frames": 279
+  },
+  "move:89": {
+   "hash": "9acee653d39a2caa6fc071def5af73b9",
+   "frames": 198
+  },
+  "move:14": {
+   "hash": "48b7dfa9010c874f7e6d4a228178a980",
+   "frames": 68
+  },
+  "move:45": {
+   "hash": "df61de3b1a7a723f60817cbd7568c2ae",
+   "frames": 52
+  },
+  "move:79": {
+   "hash": "ee0780834e1859681072f9497998cc3c",
+   "frames": 193
+  },
+  "move:73": {
+   "hash": "51e465372723f9ca724d152ce961562b",
+   "frames": 139
+  },
+  "move:57": {
+   "hash": "29237063c39f1da7f77637619fa28bce",
+   "frames": 136
+  },
+  "general:0": {
+   "hash": "7778bfd25865458cf5d872562ca8a3e5",
+   "frames": 72
+  },
+  "general:9": {
+   "hash": "ec84837dc648cc2bfad2283231110eda",
+   "frames": 120
+  },
+  "general:10": {
+   "hash": "e2731748cab12fe143a2a36fbdc94205",
+   "frames": 156
+  },
+  "status:2": {
+   "hash": "493b95a5ade1691274ede6a9f51dd9a1",
+   "frames": 39
+  },
+  "status:4": {
+   "hash": "9e3a871403cb1eba413c6a33169c1384",
+   "frames": 97
+  },
+  "special:2": {
+   "hash": "6809e7c8f74e0218d31c9fc2aba8a895",
+   "frames": 27
+  },
+  "bg:7": {
+   "hash": "6de178e89a612d5bf67fd1d5e1dc8766",
+   "frames": 127
+  }
+ }
+}

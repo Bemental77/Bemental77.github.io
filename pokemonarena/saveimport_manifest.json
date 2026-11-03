@@ -1,0 +1,1471 @@
+{
+ "_about": "pokemonarena SoulGold save importer: offsets and hashes ONLY (no ROM text, no save bytes). Tested by tools/pokemonarena_saveimport_test.mjs.",
+ "rom": {
+  "md5": "b2c5caf9bc6dd28a44052427ee3ab1b7",
+  "sha256": "8071e2c348d54c3ec7b78b53837c5cbd757d5cfc461a50fa5ffbc9f5ab35060a",
+  "length": 33554432
+ },
+ "layout": {
+  "tableOffset": 15937388,
+  "entries": 14,
+  "sections": [
+   [
+    0,
+    2864
+   ],
+   [
+    0,
+    3968
+   ],
+   [
+    3968,
+    3968
+   ],
+   [
+    7936,
+    3968
+   ],
+   [
+    11904,
+    3540
+   ],
+   [
+    0,
+    3968
+   ],
+   [
+    3968,
+    3968
+   ],
+   [
+    7936,
+    3968
+   ],
+   [
+    11904,
+    3968
+   ],
+   [
+    15872,
+    3968
+   ],
+   [
+    19840,
+    3968
+   ],
+   [
+    23808,
+    3968
+   ],
+   [
+    27776,
+    3968
+   ],
+   [
+    31744,
+    3968
+   ]
+  ]
+ },
+ "fields": {
+  "personality": 0,
+  "otId": 4,
+  "nickname": 8,
+  "nicknameLen": 12,
+  "flagsA": 20,
+  "flagsB": 21,
+  "otName": 22,
+  "otNameLen": 7,
+  "markings": 29,
+  "extra": 30,
+  "shinyWord": 30,
+  "speciesWord": 32,
+  "itemWord": 34,
+  "experience": 36,
+  "expMask": 16777215,
+  "ppBonuses": 42,
+  "friendship": 43,
+  "moves": 44,
+  "moveMask": 2047,
+  "pp": 52,
+  "ppMask": 127,
+  "evs": 56,
+  "contest": 62,
+  "pokerus": 68,
+  "metLocation": 69,
+  "origins": 70,
+  "ivWord": 72,
+  "natureXor": {
+   "offset": 20,
+   "shift": 3,
+   "bits": 5
+  },
+  "abilityNum": {
+   "offset": 51,
+   "shift": 4,
+   "bits": 2
+  },
+  "hyper": {
+   "hp": {
+    "offset": 51,
+    "shift": 6
+   },
+   "atk": {
+    "offset": 51,
+    "shift": 7
+   },
+   "def": {
+    "offset": 52,
+    "shift": 7
+   },
+   "spe": {
+    "offset": 53,
+    "shift": 7
+   },
+   "spa": {
+    "offset": 54,
+    "shift": 7
+   },
+   "spd": {
+    "offset": 55,
+    "shift": 7
+   }
+  },
+  "shinyModifierBit": {
+   "offset": 31,
+   "shift": 6
+  },
+  "status": 76,
+  "level": 80,
+  "hp": 82,
+  "maxHp": 84,
+  "atk": 86,
+  "def": 88,
+  "spe": 90,
+  "spa": 92,
+  "spd": 94,
+  "boxBytes": 76,
+  "partyBytes": 96
+ },
+ "blocks": {
+  "sb2": {
+   "name": 0,
+   "nameLen": 8,
+   "gender": 8,
+   "tid": 10,
+   "sid": 12
+  },
+  "sb1": {
+   "partyCount": 564,
+   "party": 568,
+   "partyStride": 96,
+   "partyMax": 6,
+   "flags": 6296,
+   "shinyFlag": 2398
+  },
+  "storage": {
+   "currentBox": 0,
+   "boxes": 4,
+   "boxCount": 15,
+   "perBox": 30,
+   "recordBytes": 76,
+   "names": 34204,
+   "nameStride": 9,
+   "wallpapers": 34339,
+   "tag": 34740,
+   "tagText": "BX16"
+  }
+ },
+ "evidence": {
+  "_how": "Three kinds of ground truth, kept apart. [rom] the game's own code, read with a hand-written Thumb decoder (scratch only): SetBoxMonData ROM 0x1ebb70 with jump tables at 0x7c6bb0 (field ids 0-14) and 0x7c6a58 (ids 16-101), SetMonData 0x1ec1bc (table 0x7c6bec), GetBoxMonDataAt 0x20567a, FlagGet 0x132f14. [game] the real game (mGBA wasm core, deterministic) booted on a save the encoder wrote, CONTINUE pressed, Summary pages photographed; the typed values in oracle.* come from those PNGs. [ram] the running game's EWRAM compared byte for byte with the encoder's record. None of this is vanilla pokeemerald unverified.",
+  "container": {
+   "layoutTable": "[rom] 14 x {u16 offset, u16 size} at ROM 0xF32F6C (the importer reads it from the ROM it is given and checks the contiguous runs of SaveBlock1 ids 1-4 and PokemonStorage ids 5-13); sizes 0xB30, 0xF80 x3 + 0xDD4 = 0x3C54, 0xF80 x9 = 0x8B80.",
+   "footerAndChecksum": "[game] a save written by the game itself (tools/pokemonarena_savegen.mjs plays the new game in the core): 14 of 14 sectors of slot 1 verify with footer {id u16 @0xFF4, checksum u16 @0xFF6, signature 0x08012025 @0xFF8, counter u32 @0xFFC} and checksum = fold16(sum of u32 words over the section size).",
+   "slotOfRealSave": "[game] the real save sits in slot 1 (counter 1); slot 0 is erased flash."
+  },
+  "blocks": {
+   "party": "[game] SaveBlock1 +0x234 u32 count, +0x238 party records at stride 96 (6-Pokemon party displayed correctly in the Summary screens, batch 'fields').",
+   "boxes": "[rom] GetBoxMonDataAt (0x20567a): box b slot p is at gPokemonStoragePtr + 4 + b*0x8E8 + p*76 for b <= 14, p <= 29 (ids 15-18 are RAM-only scratch areas past the saved 0x8B80 bytes); [ram] 10 encoder-placed records, corners and middles of boxes 1-15, found byte for byte at those addresses in the running game; box names 9 bytes each at +0x859c (15 names). NOT photographed in the in-game PC screen.",
+   "storageTail": "The bytes after the wallpapers (0x8632..0x8B80) hold a 'BX16' tag at 0x87b4 and are not imported."
+  },
+  "fields": {
+   "nature": "[rom] SetBoxMonData case 12: byte 0x14 bits 3-7 = (personality % 25) XOR nature. [game] pid%25 5 ^ delta 3 -> Docile, 24 ^ 31 -> Relaxed (batch 'misc'); a result of 25+ RESETS the console (observed), so such a record is rejected, never guessed.",
+   "shiny": "[rom] case 11: u16@0x1e bit 14 (byte 0x1f bit 6) = natural XOR desired, natural = ((tid ^ sid ^ pid_hi ^ pid_lo) < T), T = 512, or 256 when story flag 0x95e is set (FlagGet reads SaveBlock1[0x1898 + (id>>3)] bit id&7 = byte 0x19c3 bit 6). [game] Pidgey sprite palettes in batches 'shiny-flag-set' (the real save has the flag set) and 'shiny-flag-clear' (same save with the bit cleared): xor 3/255 shiny, 256+ normal with the flag; 255..511 shiny without it; modifier XORs (xor 3 + modifier = normal, xor 600 + modifier = shiny).",
+   "ability": "[rom] case 56: record byte 0x33 bits 4-5 (the top nibble of move 4's word). [game] Pidgey 1/2/3 -> Tangled Feet / Big Pecks / Big Pecks; Sprigatito 1 -> Overgrow (empty slot walks down), 2 -> Protean.",
+   "hyperTraining": "[rom] cases 91-96: single flag bits 0x33.6 hp, 0x33.7 atk, 0x34.7 def, 0x35.7 spe, 0x36.7 spa, 0x37.7 spd. [game] each flag makes exactly that stat's IV read 31 on the IV page and in the stats (stored IV 0), batches 'hyper' and 'misc'.",
+   "moves": "[rom] cases 21-24: four u16 at 0x2c..0x33, each keeps only 11 bits; the 5 spare high bits of each word hold other fields (ability/hyper flags for move 4, location bits for move 3, others). [game] junk in them leaves the four moves unchanged (batch 'misc', moveJunk).",
+   "pp": "[rom] cases 25-28: PP bytes 0x34..0x37 keep 7 bits, bit 7 of each is a separate flag (hyper-training for slots 2-4 above).",
+   "ppBonuses": "[rom] case 29: byte 0x2a. [game] max PP 15/36/21/24 for 0/1/2/3 ups (batch 'fields' Pikachu); the same byte at the old +0x28 changes nothing.",
+   "experience": "[rom] case 33: 24 bits at 0x24 (the top byte is preserved for other data). [game] bit 21 counts (27000 + 2^21 = 2124152 points, Lv100), bit 31 and the top byte do not, 0xFFFFFF is Lv100.",
+   "level": "[game] the stored level byte (0x50) is ignored: level comes from EXP and the growth rate.",
+   "egg": "[rom] case 55 sets BOTH byte 0x15 bit 2 and IV-word bit 30. [game] IV bit 30 alone draws the Egg page; the flag byte alone draws a normal page named 'Egg'; either rejects the Pokemon (mon.egg).",
+   "gender": "[game] personality low byte >= species gender ratio is male (Pidgey, ratio 127: 126 female, 127/128 male).",
+   "speciesItemBall": "[rom] cases 18/19/48/100: species 11 bits @0x20, tera 5 bits @0x21 high, held item 10 bits @0x22, ball 6 bits. [game] species ids above 1023 display.",
+   "ivEv": "[rom] cases 34-39 EVs at 0x38..0x3d (hp, atk, def, spe, spa, spd); cases 49-54 IVs 5 bits each from 0x48 (hp, atk, def, spe, spa, spd). [game] batches 'fields' and 'hyper'."
+  },
+  "notDecoded": "Not imported and not decoded: u16 @0x28 (10-bit item-like field), contest stats 0x3e..0x43, pokerus 0x44, met location (0x45 + bit 2 of 0x29 + spare move bits), origins 0x46, hpLost, markings, daysSinceFormChange, IV-word bit 31 and byte 0x1f bit 7 / 0x47 bit 3 (no stat or screen effect seen)."
+ },
+ "oracle": {
+  "real": {
+   "trainer": {
+    "name": "Nova",
+    "id": 11757,
+    "gender": "M"
+   },
+   "species": 1289,
+   "nickname": "Bob",
+   "level": 5,
+   "gender": "M",
+   "nature": "Naive",
+   "exp": 135,
+   "nextLv": 44,
+   "ivs": [
+    3,
+    8,
+    20,
+    25,
+    28,
+    7
+   ],
+   "stats": [
+    19,
+    11,
+    11,
+    10,
+    9,
+    12
+   ]
+  },
+  "batches": {
+   "fields": [
+    {
+     "nickname": "Sparky",
+     "species": "Pikachu",
+     "level": 37,
+     "nature": "Adamant",
+     "gender": "F",
+     "ability": "Static",
+     "item": "Oran Berry",
+     "friendship": 200,
+     "ot": "ASH",
+     "tid": 1234,
+     "stats": [
+      84,
+      62,
+      46,
+      42,
+      49,
+      74
+     ],
+     "ivs": [
+      31,
+      30,
+      29,
+      10,
+      15,
+      5
+     ],
+     "evs": [
+      4,
+      8,
+      12,
+      20,
+      24,
+      16
+     ],
+     "exp": 53298,
+     "moves": [
+      [
+       "Thunderbolt",
+       15,
+       15
+      ],
+      [
+       "Quick Attack",
+       36,
+       36
+      ],
+      [
+       "Iron Tail",
+       21,
+       21
+      ],
+      [
+       "Surf",
+       24,
+       24
+      ]
+     ]
+    },
+    {
+     "nickname": "Hidden",
+     "species": "Meowscarada",
+     "level": 100,
+     "nature": "Jolly",
+     "gender": "M",
+     "ability": "Protean",
+     "item": "Leftovers",
+     "friendship": 255,
+     "ot": "Zed",
+     "tid": 1234,
+     "stats": [
+      356,
+      256,
+      176,
+      179,
+      176,
+      379
+     ],
+     "ivs": [
+      31,
+      31,
+      31,
+      31,
+      31,
+      31
+     ],
+     "evs": [
+      252,
+      0,
+      0,
+      4,
+      0,
+      252
+     ],
+     "exp": 1059860,
+     "moves": [
+      [
+       "Scratch",
+       35,
+       35
+      ],
+      [
+       "Tail Whip",
+       30,
+       30
+      ],
+      [
+       "Surf",
+       15,
+       15
+      ],
+      [
+       "Thunderbolt",
+       15,
+       15
+      ]
+     ]
+    },
+    {
+     "nickname": "ShinyP",
+     "species": "Eevee",
+     "level": 20,
+     "nature": "Bold",
+     "gender": "F",
+     "shiny": true,
+     "ability": "Run Away",
+     "item": "None",
+     "friendship": 70,
+     "ot": "Tst",
+     "tid": 100,
+     "stats": [
+      52,
+      24,
+      27,
+      24,
+      32,
+      27
+     ],
+     "ivs": [
+      1,
+      2,
+      3,
+      5,
+      6,
+      4
+     ],
+     "evs": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "exp": 8790,
+     "moves": [
+      [
+       "Scratch",
+       35,
+       35
+      ]
+     ]
+    },
+    {
+     "nickname": "Ctrl",
+     "species": "Eevee",
+     "level": 20,
+     "nature": "Bold",
+     "gender": "F",
+     "shiny": false,
+     "ability": "Run Away",
+     "item": "None",
+     "friendship": 70,
+     "ot": "Tst",
+     "tid": 1234,
+     "stats": [
+      52,
+      24,
+      27,
+      24,
+      32,
+      27
+     ],
+     "ivs": [
+      1,
+      2,
+      3,
+      5,
+      6,
+      4
+     ],
+     "evs": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "exp": 8790,
+     "moves": [
+      [
+       "Scratch",
+       35,
+       35
+      ]
+     ]
+    },
+    {
+     "nickname": "ABCDEFGHIJK",
+     "species": "Pidgey",
+     "level": 20,
+     "nature": "Brave",
+     "gender": "M",
+     "ability": "Keen Eye",
+     "item": "None",
+     "friendship": 70,
+     "ot": "Tst",
+     "tid": 1234,
+     "stats": [
+      46,
+      25,
+      21,
+      20,
+      20,
+      25
+     ],
+     "ivs": [
+      1,
+      2,
+      3,
+      5,
+      6,
+      4
+     ],
+     "evs": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "exp": 6085,
+     "moves": [
+      [
+       "Scratch",
+       35,
+       35
+      ]
+     ]
+    }
+   ],
+   "ability": [
+    {
+     "nickname": "ab1",
+     "species": "Pidgey",
+     "level": 20,
+     "nature": "Hardy",
+     "ability": "Tangled Feet"
+    },
+    {
+     "nickname": "ab2",
+     "species": "Pidgey",
+     "level": 20,
+     "nature": "Hardy",
+     "ability": "Big Pecks"
+    },
+    {
+     "nickname": "ab3",
+     "species": "Pidgey",
+     "level": 20,
+     "nature": "Hardy",
+     "ability": "Big Pecks"
+    },
+    {
+     "nickname": "sg1",
+     "species": "Sprigatito",
+     "level": 20,
+     "nature": "Hardy",
+     "ability": "Overgrow"
+    },
+    {
+     "nickname": "sg2",
+     "species": "Sprigatito",
+     "level": 20,
+     "nature": "Hardy",
+     "ability": "Protean"
+    }
+   ],
+   "hyper": [
+    {
+     "nickname": "hhp",
+     "species": "Pidgey",
+     "level": 20,
+     "nature": "Hardy",
+     "ability": "Keen Eye",
+     "stats": [
+      52,
+      23,
+      21,
+      19,
+      19,
+      27
+     ],
+     "ivs": [
+      31,
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "nickname": "hatk",
+     "species": "Pidgey",
+     "level": 20,
+     "nature": "Hardy",
+     "ability": "Keen Eye",
+     "stats": [
+      46,
+      29,
+      21,
+      19,
+      19,
+      27
+     ],
+     "ivs": [
+      0,
+      31,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "nickname": "hdef",
+     "species": "Pidgey",
+     "level": 20,
+     "nature": "Hardy",
+     "ability": "Keen Eye",
+     "stats": [
+      46,
+      23,
+      27,
+      19,
+      19,
+      27
+     ],
+     "ivs": [
+      0,
+      0,
+      31,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "nickname": "hspe",
+     "species": "Pidgey",
+     "level": 20,
+     "nature": "Hardy",
+     "ability": "Keen Eye",
+     "stats": [
+      46,
+      23,
+      21,
+      19,
+      19,
+      33
+     ],
+     "ivs": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      31
+     ]
+    },
+    {
+     "nickname": "hspa",
+     "species": "Pidgey",
+     "level": 20,
+     "nature": "Hardy",
+     "ability": "Keen Eye",
+     "stats": [
+      46,
+      23,
+      21,
+      25,
+      19,
+      27
+     ],
+     "ivs": [
+      0,
+      0,
+      0,
+      31,
+      0,
+      0
+     ]
+    }
+   ],
+   "misc": [
+    {
+     "nickname": "hspd",
+     "species": "Pidgey",
+     "level": 20,
+     "nature": "Hardy",
+     "stats": [
+      46,
+      23,
+      21,
+      19,
+      25,
+      27
+     ],
+     "ivs": [
+      0,
+      0,
+      0,
+      0,
+      31,
+      0
+     ],
+     "moves": [
+      [
+       "Scratch",
+       35,
+       35
+      ]
+     ]
+    },
+    {
+     "nickname": "moveJunk",
+     "species": "Pikachu",
+     "level": 30,
+     "nature": "Hardy",
+     "exp": 28750,
+     "stats": [
+      70,
+      47,
+      38,
+      44,
+      44,
+      68
+     ],
+     "ivs": [
+      31,
+      31,
+      31,
+      31,
+      31,
+      31
+     ],
+     "moves": [
+      [
+       "Thunderbolt",
+       15,
+       15
+      ],
+      [
+       "Quick Attack",
+       30,
+       30
+      ],
+      [
+       "Iron Tail",
+       15,
+       15
+      ],
+      [
+       "Surf",
+       15,
+       15
+      ]
+     ]
+    },
+    {
+     "nickname": "nat5x3",
+     "species": "Pidgey",
+     "level": 20,
+     "nature": "Docile",
+     "stats": [
+      52,
+      29,
+      27,
+      25,
+      25,
+      33
+     ],
+     "ivs": [
+      31,
+      31,
+      31,
+      31,
+      31,
+      31
+     ]
+    },
+    {
+     "nickname": "nat24xF",
+     "species": "Pidgey",
+     "level": 20,
+     "nature": "Relaxed",
+     "stats": [
+      52,
+      29,
+      29,
+      25,
+      25,
+      29
+     ],
+     "ivs": [
+      31,
+      31,
+      31,
+      31,
+      31,
+      31
+     ]
+    },
+    {
+     "nickname": "exp21",
+     "species": "Pikachu",
+     "level": 100,
+     "nature": "Hardy",
+     "exp": 2124152,
+     "stats": [
+      211,
+      146,
+      116,
+      136,
+      136,
+      216
+     ],
+     "ivs": [
+      31,
+      31,
+      31,
+      31,
+      31,
+      31
+     ],
+     "moves": [
+      [
+       "Scratch",
+       35,
+       35
+      ]
+     ]
+    }
+   ],
+   "shiny-flag-set": [
+    {
+     "nickname": "x3",
+     "species": "Pidgey",
+     "nature": "Hardy",
+     "shiny": true,
+     "tid": 100
+    },
+    {
+     "nickname": "x3m",
+     "species": "Pidgey",
+     "nature": "Hardy",
+     "shiny": false,
+     "tid": 100
+    },
+    {
+     "nickname": "x255",
+     "species": "Pidgey",
+     "nature": "Impish",
+     "shiny": true,
+     "tid": 100
+    },
+    {
+     "nickname": "x256",
+     "species": "Pidgey",
+     "nature": "Adamant",
+     "shiny": false,
+     "tid": 100
+    },
+    {
+     "nickname": "x600m",
+     "species": "Pidgey",
+     "nature": "Docile",
+     "shiny": true,
+     "tid": 100
+    }
+   ],
+   "shiny-flag-clear": [
+    {
+     "nickname": "x255",
+     "species": "Pidgey",
+     "nature": "Impish",
+     "shiny": true,
+     "tid": 100
+    },
+    {
+     "nickname": "x300",
+     "species": "Pidgey",
+     "nature": "Lax",
+     "shiny": true,
+     "tid": 100
+    },
+    {
+     "nickname": "x511",
+     "species": "Pidgey",
+     "nature": "Naive",
+     "shiny": true,
+     "tid": 100
+    },
+    {
+     "nickname": "x512",
+     "species": "Pidgey",
+     "nature": "Lax",
+     "shiny": false,
+     "tid": 100
+    },
+    {
+     "nickname": "x3m",
+     "species": "Pidgey",
+     "nature": "Hardy",
+     "shiny": false,
+     "tid": 100
+    }
+   ],
+   "level": [
+    {
+     "nickname": "lvByte50",
+     "species": "Pidgey",
+     "level": 20,
+     "nature": "Hardy",
+     "exp": 6085,
+     "stats": [
+      52,
+      29,
+      27,
+      25,
+      25,
+      33
+     ],
+     "ivs": [
+      31,
+      31,
+      31,
+      31,
+      31,
+      31
+     ]
+    },
+    {
+     "nickname": "lvByte1",
+     "species": "Pidgey",
+     "level": 50,
+     "nature": "Hardy",
+     "exp": 122229,
+     "stats": [
+      115,
+      65,
+      60,
+      55,
+      55,
+      76
+     ],
+     "ivs": [
+      31,
+      31,
+      31,
+      31,
+      31,
+      31
+     ]
+    },
+    {
+     "nickname": "lvByte0",
+     "species": "Pidgey",
+     "level": 100,
+     "nature": "Hardy",
+     "exp": 1059860,
+     "stats": [
+      221,
+      126,
+      116,
+      106,
+      106,
+      148
+     ],
+     "ivs": [
+      31,
+      31,
+      31,
+      31,
+      31,
+      31
+     ]
+    },
+    {
+     "nickname": "badStats",
+     "species": "Pikachu",
+     "level": 30,
+     "nature": "Hardy",
+     "exp": 28750,
+     "stats": [
+      70,
+      47,
+      38,
+      44,
+      44,
+      68
+     ],
+     "ivs": [
+      31,
+      31,
+      31,
+      31,
+      31,
+      31
+     ]
+    },
+    {
+     "nickname": "exp24",
+     "species": "Pidgey",
+     "level": 100,
+     "nature": "Hardy",
+     "stats": [
+      221,
+      126,
+      116,
+      106,
+      106,
+      148
+     ],
+     "ivs": [
+      31,
+      31,
+      31,
+      31,
+      31,
+      31
+     ]
+    }
+   ],
+   "gender": [
+    {
+     "nickname": "g0",
+     "species": "Pidgey",
+     "gender": "F"
+    },
+    {
+     "nickname": "g126",
+     "species": "Pidgey",
+     "gender": "F"
+    },
+    {
+     "nickname": "g127",
+     "species": "Pidgey",
+     "gender": "M"
+    },
+    {
+     "nickname": "g128",
+     "species": "Pidgey",
+     "gender": "M"
+    },
+    {
+     "nickname": "g255",
+     "species": "Pidgey",
+     "gender": "M"
+    }
+   ],
+   "egg": [
+    {
+     "nickname": "eIv",
+     "egg": true,
+     "note": "IV word bit 30 only: the game draws the Egg page"
+    },
+    {
+     "nickname": "eFlag",
+     "egg": true,
+     "note": "flag byte bit 2 only: the game shows the name Egg on an otherwise normal Pidgey page"
+    },
+    {
+     "nickname": "eBoth",
+     "egg": true,
+     "note": "both bits, as the game itself sets them: the Egg page"
+    },
+    {
+     "nickname": "ctl",
+     "species": "Pidgey",
+     "nature": "Hardy",
+     "gender": "M"
+    }
+   ]
+  }
+ },
+ "goldens": {
+  "realSaveSha256": "f0f38309f3745d2ecca57da2181f7e0e841e1ca045d3102ec9f9b309e978aa87",
+  "gameSaves": {
+   "fields": "43f034859e79290bf7fb5d47e7a05937af1898e94b97e0743a1b7a69ebf9bd51",
+   "ability": "0e61d688796fd5ad7b6df8669e6682f498377ddfe2aedf59d9486de1cba3e302",
+   "hyper": "fb4fac3036744d614c3a49adc7118e1a4ae9d23836ab7f64fb702d02dd13b6bd",
+   "misc": "5ed29ba72951f3256daff45aa54b9cad4496abd506586469042627278428e730",
+   "shiny-flag-set": "a80995f54ab2222859e04085ac0803d22f689c2ea18baecfae7345a71bdb9159",
+   "shiny-flag-clear": "c53278eba0be864a88884f97a77fbde9564cbb8d6976004001945a199f67efbb",
+   "level": "ea337c32689b387a34c94c3ec2459459f7895554cc9ee53aedc7e1007bf4e274",
+   "gender": "e8e128688ffb475bd53eaa77a609ccbed4a8fa5e7b3af24afca19fabda46126f",
+   "egg": "4f0cba19ff4ec3a07178e63a2d697158995b660378059483aba96285252c4c73"
+  },
+  "game": {
+   "fields": {
+    "s1_info": "4e71c6fd23aa488ca816947570ac8cd53427d1bee7899c8bb0b1c9b54d43cedc",
+    "s1_stats": "5178c3ccbc2c30001049a0e3ac8ad7eb582b4104a435269ac98c7d1d4341084b",
+    "s1_ivs": "10b87f5111976bf6e8b92785b2ae94c45306322934590d392a226b7df7a6e330",
+    "s1_evs": "bd6d1a06eacb61977d6ad89a40cb19e7c7262321fa7ef042397bf21166d94677",
+    "s1_moves": "104ff69790283f27ac9603973a8c09cc7c8420f9e5b6d1d325da55c23e290650",
+    "s2_info": "7d33c741cd455b8083de889cc70751d4b88fdd4a58bfebaaeaa5d3b864048acc",
+    "s2_stats": "17b6c6d430232f300e060f4a2fe1d7136c2686a3822bbf6d306d51bbe2924763",
+    "s2_ivs": "c5f37ebd35ba72a9a848b651a81aaefb869f42726f6bfc11635b8472b40726c0",
+    "s2_evs": "851244ec206c161c47ba145907342852be1d86a39a24c0b71a09d1475b3921a0",
+    "s2_moves": "0a66a257d0156b47d1b124167f3e9aca28419e61750fe8ab8fb6cd4408eaae86",
+    "s3_info": "87f7610f2f7e06dae2e3366e05ada6d4f7378eef05d9ea4e37b054f2583adf31",
+    "s3_stats": "c5259d476b64c48b9cba53aa53b3a3cf3c7322e0416d300efed7a5995c713a5d",
+    "s3_ivs": "60b93084f9b988c01ab764e67d0d1d17c09ee7dbdcc1b14f21015855a09429d2",
+    "s3_evs": "f4e025c407c3ab5a01a06e12fffa113c3b04677b4a6146b89bba474b1edbe8e9",
+    "s3_moves": "9550f5dd7f141a166a8c6fe04d0b17012c777443d0214a458e546645077e381d",
+    "s4_info": "36411762976d85ce69695cf26bbe76f73e6a7cf77cab66b0f229a4291fd86834",
+    "s4_stats": "8a473910772cfc1b65014af8b0db79cb2475bb4bf5f4db3e0d39d98619e046b1",
+    "s4_ivs": "b631dda21b1eb6fd66e83f682845255692318731df6c97c05cc8d0672b07b228",
+    "s4_evs": "ce663a3790b2958b3fda3d7af67947ed865c9c89ab37cb3ce64b2ba9d36ab5e5",
+    "s4_moves": "5fad80961e6e2bc80cfb8397d087e9d8ebe4e5e788eac0249affcf83571448f2",
+    "s5_info": "3e7977027d05d8bd8fad33901cb118a84e0fc7c8586b6ea227d78dd090a7c0fd",
+    "s5_stats": "0442d8ba22d236eb91ef3e1466ae396a09f242cab06eaeeb97ec426dd435fbf9",
+    "s5_ivs": "708457739a532146ae3eb6d9d10e973edd325fc45b22baf1bed1380a270c4b32",
+    "s5_evs": "bd5f2b11d4121b29bdc76c526c541f36daa6acddf2c847c8fd47924311871417",
+    "s5_moves": "4e4cd6bba3216dd58675ee2a580443f859a4132656bb36a4ac2771957d958219",
+    "sprite1": "d9e4845c7c6cd336004ae389c40dab1aac9efe1d050a04bb8363d5b73693e4b3",
+    "sprite2": "cda216cdfe09c871e080c909d42375d519acd278faad92b8cebf5fd9ddfc518d",
+    "sprite3": "499120380e36e05239ee5b9d5729b549c8bb0c7b3578ea166137926daae17fde",
+    "sprite4": "662ab0863ad4da13b87626103bcb73eaf13df1cbcdbb0a40c167f2334de250e2",
+    "sprite5": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4"
+   },
+   "ability": {
+    "s1_info": "198ec005a683ad08e59366e346b049e3ce7401080f08c4805592e6ba75d91c04",
+    "s2_info": "b23923826526a3c8cac56af83a010df8d5acd5a72aef777f007d1f93b063f148",
+    "s3_info": "99ff5c71938a59dbaf57b9775144e422ed7b85bd89020c543f20c2e80f164f58",
+    "s4_info": "9bf25a99168edda02d695076903e170cda575619b73ec43469ec69a3a0d06a08",
+    "s5_info": "74f94f0666fe3d6d24289929c90fd4b3817d76dc841faf657058f501fa1e909c",
+    "sprite1": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite2": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite3": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite4": "62feb861180bc243cd3436df4a5fc74871e777c1550f2e49f90c71abca5bd202",
+    "sprite5": "4159174733f81236f3e3082725e1b0e83f081419928fb2d44f09e87f25279bdb"
+   },
+   "hyper": {
+    "s1_info": "21cc5d42df919af2a0e8b8cc60bcfcc24b03cddf74046ee57a964406116d04b6",
+    "s1_stats": "51006e7be178742b8562b86920bcd06c4cfa6f9805246d86cc5f559a98479d2c",
+    "s1_ivs": "f813d8be0347716d815b4f76d5dfd53a38244bb64182c9822f159abd518bce70",
+    "s2_info": "9c8f3f76e7c8915184e798565545dbd4f7fd09d86dea6c79a482a5c4566fff05",
+    "s2_stats": "6ddbd03de4fd776ef2e3289ee216442219e0f728ed74eef72aa7e4577ae04319",
+    "s2_ivs": "6073f3700fa52ba18c24b516e8321193659cf3d546d0aa15460aa912bdbe83c8",
+    "s3_info": "9c5bbedb1fcd0bcc4859b92127b60392ce31d44d3a3b3bcc1068d9ee2f957b59",
+    "s3_stats": "b5e1bfa6d7968080ad6c7ce051f299bafc4d150a7e734fa70e116bbb1c08666c",
+    "s3_ivs": "0fa968352ebf45122003b06433e3aa3016afd5f339f6978dce9047337e5fa304",
+    "s4_info": "908670c93ce26e75c5d49111facc84c96ff475b2472db86bb7d2fcb31cadc597",
+    "s4_stats": "8bf19f085893af66f90837504855a9673a17a5952ef6c936830e14729e9bf35e",
+    "s4_ivs": "deddad42597288d4d6a960de9da7c0d53752d14897bd94f79944666b4c6073d8",
+    "s5_info": "f117bc3b30cdcbc76c58f283b68775ac05b23bda12e1e7658f20aaaf0e448e56",
+    "s5_stats": "851323941e48ce0e616b3f61b6c491d249bb9e46e4255db835fa336f357c5594",
+    "s5_ivs": "f6fe2c3dd9140893396da5ccc5a78e334ecd1a92875aa117a63e3a7a38906b97",
+    "sprite1": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite2": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite3": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite4": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite5": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4"
+   },
+   "misc": {
+    "s1_info": "7af5a09f2e6af049edfd6967eb4a9ad06105f1195263961ba93b282ae34c645c",
+    "s1_stats": "f280f8acfc146c42d3e09e23898c61a816e0a8d6521abc0bd359f23486be32d8",
+    "s1_ivs": "bc4a101e3dee94eb5d1e2bea6fd396bec85ffaa1fa1672ecb2fa1e79b331c851",
+    "s1_moves": "109334b886beee58853583954317424b9d68557411085ab47dc42b50e4ff1899",
+    "s2_info": "05ce02d8c9e5e17cc569ad6647aa46b39304f8be933584a4ba8c5a595c71733d",
+    "s2_stats": "35f0052ec71ab614db4c4ca0bfae7027625d80bca07a2ffe55af4af1dc0199d1",
+    "s2_ivs": "2f8780dadb1592b1a83d3947d792036f0a114d1a43debc83be57275dd915340c",
+    "s2_moves": "6a2a7c9fc523b0903911230b494e5f44866cdacb2c8337a38af524836d5d0534",
+    "s3_info": "6f44dbbac0d7a89cd8cd84cc278199278391250bc9eda96aa8c1be41f935e891",
+    "s3_stats": "679114fbe03a4e65b746a42bf2ccc4310fcc606afd364b10de7ea87b24a80219",
+    "s3_ivs": "7d64dd2407b9c226716053da5ac69c0594c02ddf7abe0af76db45e260199956e",
+    "s3_moves": "cb63d7dac638d9c49ddabd29ef5f78c2a534e2af49c5633563c4e94048b124e7",
+    "s4_info": "78915dd9100df537164d974ad06007f91aa5ca1bb9432f5d61856c6b1771649c",
+    "s4_stats": "8575064e579ce695ecca067a04907cf3959435df9822aad155c81ccd1a578f80",
+    "s4_ivs": "f0e6deb3b672ecad5b721a97cf3861365445ed302a0686ac7e0ee2756a7e431e",
+    "s4_moves": "26101507eeb7f6e91e764a62bc9c5a90fc65f3c1ef07f30d3631669c627a1d94",
+    "s5_info": "98194610fafe43f2b97f8930f902593b722fc97b73110fa7659ad88b98fca95c",
+    "s5_stats": "6e74b56c14a40c1c0122c3a656ac3e9038193ea62538616d350b80e06ad24a8a",
+    "s5_ivs": "7756df3eecf55cd6d982cce66d3b14b263d9fcb7cb9937f4e8a673e953b3a7ac",
+    "s5_moves": "f589d9f3b6e1fa335a291eea121b62171b86ccb4c23ae1f44b24e9f4a2d230bb",
+    "sprite1": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite2": "235fb0e82cf5b3e1a29b1a5d8bb7029e9a879c2dd8c6bc39b47c2ba0c180b463",
+    "sprite3": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite4": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite5": "235fb0e82cf5b3e1a29b1a5d8bb7029e9a879c2dd8c6bc39b47c2ba0c180b463"
+   },
+   "shiny-flag-set": {
+    "s1_info": "d92d9f6489c86ce233108df20b26f87c6baa8febfd6f367258757b0419c9f4d2",
+    "s2_info": "232b2be448855d110ad5ae5e02be8cab7f6329dee4950776d22dc997fb6a81dc",
+    "s3_info": "5105e6e53433e4917d09ea63d13dcc2a745f5b4176344e587d73522911cdf220",
+    "s4_info": "8f15a5494b64dd5a80c2d19948ed6f2e444b489231d4352b90d2b9d713d45868",
+    "s5_info": "193de7e6b0c26f7045e9a9515dea5e88b8b4189c263133dad5eb0f993c9a75b4",
+    "sprite1": "ff1d539571564b449a0f32c7386883de4f55921f6168228eee6baa60c6c311d9",
+    "sprite2": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite3": "ff1d539571564b449a0f32c7386883de4f55921f6168228eee6baa60c6c311d9",
+    "sprite4": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite5": "ff1d539571564b449a0f32c7386883de4f55921f6168228eee6baa60c6c311d9"
+   },
+   "shiny-flag-clear": {
+    "s1_info": "5105e6e53433e4917d09ea63d13dcc2a745f5b4176344e587d73522911cdf220",
+    "s2_info": "6dce7d3bc5382c0100b0c9b6cf9a5b9f27a4b97d2adf06a854614391741cd8cc",
+    "s3_info": "36a910e17d45c43b4b6b8856d3fa915a4d51b9821cbaa1b77870bd2d7d60a005",
+    "s4_info": "cb9cbd988e4f7990b0c5c5a7e5629811eb7281baaf33385c8f2e58d4a454380b",
+    "s5_info": "232b2be448855d110ad5ae5e02be8cab7f6329dee4950776d22dc997fb6a81dc",
+    "sprite1": "ff1d539571564b449a0f32c7386883de4f55921f6168228eee6baa60c6c311d9",
+    "sprite2": "ff1d539571564b449a0f32c7386883de4f55921f6168228eee6baa60c6c311d9",
+    "sprite3": "ff1d539571564b449a0f32c7386883de4f55921f6168228eee6baa60c6c311d9",
+    "sprite4": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite5": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4"
+   },
+   "level": {
+    "s1_info": "377535d6a0d88055b354fcb3c235b6e5689df348c25c6694313670efd407c91b",
+    "s1_stats": "44641dbede71fc8b18a36e35985561456ae9e82198e60b25e5e7fab642156d17",
+    "s1_ivs": "95bce3bdd23cb7b4f479eccbbd442bdf6930af380ae1fee8515f8852aa987d3c",
+    "s2_info": "c5c6f755514d83ca428734187bf6fbbd7d4dd9afd8d83db0a6cd296af9645499",
+    "s2_stats": "3d10792155dfc0b88a75383407d18f0fe0e4944f458ee8ed201cd5123572266b",
+    "s2_ivs": "919e136ef1d59a25fdec663727392a6ecbe1f0ccdb5f802d923b9a13ef39f157",
+    "s3_info": "158997a46c1cbba74ce6c7bd4bc8c8d5ec21c1bd0e4126f22d9a345ba8c7203e",
+    "s3_stats": "65a687a6d009ab369ca36eacbf5afef13a7ecd56ab50207003fd5b1d3491265e",
+    "s3_ivs": "f6cd63e8fc5d85063e323f5fa8582777f55e3544b4a24c6b52c4202e1cde3ab5",
+    "s4_info": "d9c92ebb71cd667fad4a0d4114031b650547c4c524cc8d80188ce89aa2895659",
+    "s4_stats": "055118e98449c0ae1a0c398da2581df9f703bbef7ce37feb4fe07b08adec3782",
+    "s4_ivs": "73a0aec4c8fa0b92be9b5cc6df95637173a6aa9037299925a6138f7b9fe167bf",
+    "s5_info": "ce8e4710f16957cc026f85de9c7932908139cc1f917c99e04d02f4e360a87999",
+    "s5_stats": "0730513908ae7d03a96a378fd9ccc9f9fb53bc13cd3c2af8b75934b9e0f040ac",
+    "s5_ivs": "f901accb4c25275685d4a718cbc8f1e243a693cdc377d53c00f27820f6e697c4",
+    "sprite1": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite2": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite3": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite4": "235fb0e82cf5b3e1a29b1a5d8bb7029e9a879c2dd8c6bc39b47c2ba0c180b463",
+    "sprite5": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4"
+   },
+   "gender": {
+    "s1_info": "6df94c6437795fd0a2b948b8cb18e09bbaadea86c3ac2282d156eb40643c6171",
+    "s2_info": "3a34907e146e50c626b34cebb05bdb981f7474d2f055228fa2366eddb94f611b",
+    "s3_info": "6530cd3d196f7ec34d1a73f6a51220e800b3ef93df85dd47fa426add0710ae88",
+    "s4_info": "266edcacdfbfcb719e8bb9cc6ecd11bf8a380943757048eff9159c010f65ad94",
+    "s5_info": "a34458515e85d9a8b294b1d777fa7f6f1dafd65cb5fb74b4e844edf896b55e81",
+    "sprite1": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite2": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite3": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite4": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite5": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4"
+   },
+   "egg": {
+    "s1_info": "627818bf41f966659698589fa9d97ce327ec0b35e41cd75d3cb0fd233619c67c",
+    "s2_info": "580bce3c7674b4047d0968b960e54e48ebe76c38fbfa09958130c4807eb7849e",
+    "s3_info": "627818bf41f966659698589fa9d97ce327ec0b35e41cd75d3cb0fd233619c67c",
+    "s4_info": "54d8381cba688eb08a93b5087d1959ac317a45b5994ad9f275c4240e9111cc6b",
+    "sprite1": "d2f796e60657bcc80cb111c8b2626e6542149d57648b91942c4db88a33ed0106",
+    "sprite2": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4",
+    "sprite3": "d2f796e60657bcc80cb111c8b2626e6542149d57648b91942c4db88a33ed0106",
+    "sprite4": "f5b5f5cb25231cfed802b5e9af0c19fcf9d88c360e4e9e9c88bf763343632be4"
+   }
+  }
+ },
+ "mutants": [
+  [
+   "M01",
+   "shinyFlag ? 256 : 512",
+   "shinyFlag ? 512 : 256",
+   "shiny threshold swapped between flag set/clear"
+  ],
+  [
+   "M02",
+   "const shiny = natural !== (raw.shinyModifier === 1);",
+   "const shiny = natural || (raw.shinyModifier === 1);",
+   "shiny modifier is an XOR, not an OR"
+  ],
+  [
+   "M03",
+   ") < ctx.shinyThreshold;",
+   ") < 8;",
+   "old xor<8 shiny rule"
+  ],
+  [
+   "M04",
+   "return (raw.personality % 25) ^ raw.natureXor; }",
+   "return raw.personality % 25; }",
+   "nature XOR delta ignored"
+  ],
+  [
+   "M05",
+   "if (natureOf(raw) >= pack.natures.length) return {",
+   "if (false) return {",
+   "nature index 25+ not rejected"
+  ],
+  [
+   "M06",
+   "experience: u32(b, o + FIELD.experience) & FIELD.expMask,",
+   "experience: u32(b, o + FIELD.experience),",
+   "EXP read as the whole 32-bit word"
+  ],
+  [
+   "M07",
+   "u16(b, o + FIELD.moves + i * 2) & FIELD.moveMask",
+   "u16(b, o + FIELD.moves + i * 2)",
+   "move ids not masked to 11 bits"
+  ],
+  [
+   "M08",
+   "ppBonuses: 0x2a, friendship: 0x2b",
+   "ppBonuses: 0x28, friendship: 0x2b",
+   "PP ups read from the old +0x28"
+  ],
+  [
+   "M09",
+   "abilityNum: Object.freeze({ offset: 0x33, shift: 4, bits: 2 })",
+   "abilityNum: Object.freeze({ offset: 0x33, shift: 5, bits: 2 })",
+   "ability index bit position"
+  ],
+  [
+   "M10",
+   "while (abilitySlot > 0 && !slots[abilitySlot]) abilitySlot--;",
+   "while (false) abilitySlot--;",
+   "empty ability slot not walked down"
+  ],
+  [
+   "M11",
+   "const wanted = Math.min(raw.abilityNum, 2);",
+   "const wanted = raw.abilityNum;",
+   "ability index 3 not clamped"
+  ],
+  [
+   "M12",
+   "iv[k] = raw.hyper[k] ? 31 : raw.iv[k];",
+   "iv[k] = raw.iv[k];",
+   "hyper-training ignored"
+  ],
+  [
+   "M13",
+   "spd: Object.freeze({ offset: 0x37, shift: 7 })",
+   "spd: Object.freeze({ offset: 0x37, shift: 6 })",
+   "hyper SpD flag bit position"
+  ],
+  [
+   "M14",
+   "((raw.personality & 0xff) >= ratio ? 'M' : 'F')",
+   "((raw.personality & 0xff) > ratio ? 'M' : 'F')",
+   "gender boundary > instead of >="
+  ],
+  [
+   "M15",
+   "if (exp >= row[l]) level = l; else break;",
+   "if (exp > row[l]) level = l; else break;",
+   "level boundary off by one"
+  ],
+  [
+   "M16",
+   "isEgg: ((b[o + FIELD.flagsB] >> 2) & 1) | ((ivWord >>> 30) & 1),",
+   "isEgg: ((b[o + FIELD.flagsB] >> 2) & 1),",
+   "IV-word egg bit ignored"
+  ],
+  [
+   "M17",
+   "species: speciesWord & 0x7ff,",
+   "species: speciesWord & 0x3ff,",
+   "species id 10 bits instead of 11"
+  ],
+  [
+   "M18",
+   "heldItem: itemWord & 0x3ff,",
+   "heldItem: itemWord & 0x1ff,",
+   "item id 9 bits instead of 10"
+  ],
+  [
+   "M19",
+   "return ((sum >>> 16) + (sum & 0xffff)) & 0xffff;",
+   "return (sum & 0xffff);",
+   "checksum without the fold"
+  ],
+  [
+   "M20",
+   "else chosen = newer(a.counter, b.counter) ? a : b;",
+   "else chosen = b;",
+   "slot chosen by position, not counter"
+  ],
+  [
+   "M21",
+   "if (a === 0xffffffff && b === 0) return false;",
+   "if (false) return false;",
+   "counter wrap 0xFFFFFFFF -> 0 (one direction)"
+  ],
+  [
+   "M22",
+   "the second slot was used' }); chosen = b; }",
+   "the second slot was used' }); chosen = a; }",
+   "tie goes to the first slot"
+  ],
+  [
+   "M23",
+   "Object.freeze([0x20000, 0x20010, 0x22000]);",
+   "Object.freeze([0x20000, 0x20010]);",
+   "legacy 0x22000 buffer refused"
+  ],
+  [
+   "M24",
+   "export const SECTORS_PER_SLOT = 14;",
+   "export const SECTORS_PER_SLOT = 13;",
+   "sectors per slot"
+  ],
+  [
+   "M25",
+   "signatureOk: signature === SIGNATURE,",
+   "signatureOk: true,",
+   "sector signature not checked"
+  ],
+  [
+   "M26",
+   "idOk: id < LAYOUT_ENTRIES,",
+   "idOk: true,",
+   "section id range not checked"
+  ],
+  [
+   "M27",
+   "if (byId.has(s.id)) {",
+   "if (false) {",
+   "duplicate section id accepted"
+  ],
+  [
+   "M28",
+   "if (counters.size > 1) problems.push(",
+   "if (false) problems.push(",
+   "mixed counters inside a slot accepted"
+  ],
+  [
+   "M29",
+   "isBadEgg: b[o + FIELD.flagsB] & 1,",
+   "isBadEgg: 0,",
+   "bad-egg flag ignored"
+  ],
+  [
+   "M30",
+   "partyStride: 96,",
+   "partyStride: 100,",
+   "party stride"
+  ],
+  [
+   "M31",
+   "recordBytes: 76,",
+   "recordBytes: 80,",
+   "box record size"
+  ],
+  [
+   "M32",
+   "nickname: nick.toUpperCase() === sp.name.toUpperCase() ?",
+   "nickname: nick === sp.name.toUpperCase() ?",
+   "species-name nickname test is case sensitive"
+  ],
+  [
+   "M33",
+   "if (p.sha256 !== undefined && p.sha256 !== null && p.sha256 !== PINNED.sha256)",
+   "if (false)",
+   "pack from another ROM accepted"
+  ],
+  [
+   "M34",
+   "if (sections[id].offset !== at) return",
+   "if (false) return",
+   "layout table contiguity not checked"
+  ],
+  [
+   "M35",
+   "if (countRaw > BLOCK.sb1.partyMax) {",
+   "if (false) {",
+   "party count not clamped"
+  ],
+  [
+   "M36",
+   "const level = fromExp;",
+   "const level = hasParty ? raw.party.level : fromExp;",
+   "stored level byte trusted"
+  ],
+  [
+   "M37",
+   "shinyModifierBit: Object.freeze({ offset: 0x1f, shift: 6 })",
+   "shinyModifierBit: Object.freeze({ offset: 0x1f, shift: 7 })",
+   "shiny modifier bit position"
+  ],
+  [
+   "M38",
+   "sb2[BLOCK.sb2.gender] === 1 ? 'F' : 'M'",
+   "sb2[BLOCK.sb2.gender] === 0 ? 'F' : 'M'",
+   "trainer gender inverted"
+  ],
+  [
+   "M39",
+   "flags: 0x1898,",
+   "flags: 0x1899,",
+   "story-flag array offset"
+  ],
+  [
+   "M40",
+   "if (emptyRecord(b, o, Math.min(len, FIELD.boxBytes))) return null;",
+   "if (false) return null;",
+   "empty slots not skipped"
+  ],
+  [
+   "M41",
+   "if (raw.species === 0) return { code: 'mon.no-species'",
+   "if (false) return { code: 'mon.no-species'",
+   "species 0 not rejected"
+  ],
+  [
+   "M42",
+   "const natural = ((raw.tid ^ raw.sid ^ (raw.personality >>> 16) ^ (raw.personality & 0xffff)) >>> 0)",
+   "const natural = ((raw.tid ^ raw.sid ^ (raw.personality >>> 16)) >>> 0)",
+   "shiny xor drops the low personality half"
+  ]
+ ]
+}

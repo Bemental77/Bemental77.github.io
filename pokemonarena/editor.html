@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Pokemon Arena - Team Editor</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="description" content="Build Pokemon Arena teams on Pokemon SoulGold data: pick species, natures, abilities, items, moves, EVs and IVs, with every picture drawn from the ROM this site already serves." />
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/pokemonarena/editor.css" />
+  <link rel="stylesheet" href="/pokemonarena/input.css" />
+  <!-- The game library's origin: ONE constant for the whole site (see lib/asset_base.js). The ROM URL is built from it in js/romfetch.js. -->
+  <script src="/lib/asset_base.js"></script>
+</head>
+<body data-state="boot">
+  <a class="skip" href="#app" data-nav-skip>Skip to the editor</a>
+  <header id="top">
+    <a class="back" id="backLink" href="/pokemonarena/">&lsaquo; Arena</a>
+    <h1>Team Editor</h1>
+    <div id="toolbar" class="toolbar" hidden>
+      <button type="button" class="btn small" id="undoBtn" disabled>Undo</button>
+      <button type="button" class="btn small" id="redoBtn" disabled>Redo</button>
+    </div>
+    <button type="button" class="btn small" id="soundBtn" title="Sound settings: volume, music, effects, soundtrack">Sound</button>
+    <button type="button" class="btn small" id="controlsBtn" title="Keyboard, controller and touch settings">Controls</button>
+    <span id="saveState" class="save" data-state="saved" role="status" aria-live="polite"><span class="dot" aria-hidden="true"></span><span id="saveText">Saved</span></span>
+  </header>
+  <nav id="crumbs" aria-label="Where you are"></nav>
+
+  <div id="banners" aria-live="polite"></div>
+
+  <main id="app" tabindex="-1">
+    <div id="boot" role="status">
+      <p id="bootText">Starting...</p>
+      <progress id="bar" max="1" value="0"></progress>
+    </div>
+    <div id="error" role="alert" hidden>
+      <h2 id="errTitle">The ROM could not be loaded</h2>
+      <p id="errMsg"></p>
+      <p id="errDetail" class="dim"></p>
+      <div class="row"><button id="retry" type="button" class="btn" hidden>Try again</button><a class="btn" href="/pokemonarena/">Back to the Arena</a></div>
+    </div>
+    <div id="view" hidden></div>
+  </main>
+
+  <div id="modalRoot"></div>
+  <div id="toast" role="status" aria-live="polite" hidden></div>
+  <noscript><p class="noscript">The team editor needs JavaScript.</p></noscript>
+
+  <script type="module" src="/pokemonarena/js/editor_app.js"></script>
+</body>
+</html>

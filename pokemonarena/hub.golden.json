@@ -1,0 +1,15 @@
+{
+  "note": "hashes only (fnv1a of the 240x160 RGBA frame); regenerate with node tools/pokemonarena_hub_test.mjs --update",
+  "rom": "Pokemon SoulGold v1.1.1",
+  "views": {
+    "main-0": "7fd9323c",
+    "main-sound": "54e49be6",
+    "quick-format": "4d6ee2f6",
+    "quick-6v6-hard": "1a569b52",
+    "team-kanto": "072e1b9f",
+    "team-illegal-start": "28c83d98",
+    "team-empty": "fecb80c5",
+    "about-0": "712e4eec",
+    "about-3": "16cc3943"
+  }
+}

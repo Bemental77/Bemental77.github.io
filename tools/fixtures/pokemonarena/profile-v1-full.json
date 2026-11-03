@@ -1,0 +1,75 @@
+{
+ "app": "arena",
+ "schemaVersion": 1,
+ "id": "p_fixture01",
+ "rev": 7,
+ "createdAt": 1700000000000,
+ "updatedAt": 1700000500000,
+ "romHash": "8071e2c348d54c3ec7b78b53837c5cbd757d5cfc461a50fa5ffbc9f5ab35060a",
+ "trainerName": "RED",
+ "avatar": { "kind": "mon", "id": 25 },
+ "settings": {
+  "defaultFormat": "singles-6v6-l50",
+  "animations": "fast",
+  "textSpeed": "slow",
+  "sound": false,
+  "reducedMotion": true,
+  "trainingMode": "champions",
+  "backupNudgeDays": 30,
+  "uiScale": 2
+ },
+ "teams": [
+  { "id": "t_a", "name": "MAIN", "formatId": "singles-6v6-l50", "monIds": ["m_1", "m_2"] },
+  { "id": "t_b", "name": "CUP", "formatId": "singles-3v3-l50-cup", "monIds": ["m_2"], "color": "red" }
+ ],
+ "box": [
+  {
+   "id": "m_1",
+   "species": 6,
+   "nickname": "Zard",
+   "level": 50,
+   "nature": 3,
+   "ability": { "slot": 1 },
+   "heldItem": 10,
+   "ev": { "hp": 4, "atk": 252, "def": 0, "spa": 0, "spd": 0, "spe": 252 },
+   "iv": { "hp": 31, "atk": 31, "def": 31, "spa": 31, "spd": 31, "spe": 31 },
+   "moves": [ { "id": 1, "ppUps": 3 }, { "id": 2, "ppUps": 0 } ],
+   "gender": "M",
+   "shiny": true,
+   "friendship": 255,
+   "originalTrainer": { "name": "RED", "tid": 12345, "sid": 54321 },
+   "origin": "save-import",
+   "provenance": { "saveSha": "abababababababababababababababababababababababababababababababab", "slot": 1, "box": 3, "pid": 305419896, "otId": 807408213 },
+   "training": { "sp": { "hp": 2 } },
+   "createdAt": 1700000000100,
+   "updatedAt": 1700000000200,
+   "notes": "my ace",
+   "futureField": [1, 2]
+  },
+  {
+   "id": "m_2",
+   "species": 25,
+   "level": 5,
+   "nature": 0,
+   "ability": { "slot": 0 },
+   "ev": { "hp": 0, "atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0 },
+   "iv": { "hp": 10, "atk": 11, "def": 12, "spa": 13, "spd": 14, "spe": 15 },
+   "moves": [ { "id": 84, "ppUps": 0 } ],
+   "gender": "F",
+   "shiny": false
+  }
+ ],
+ "stats": {
+  "wins": 10,
+  "losses": 4,
+  "draws": 1,
+  "forfeits": 0,
+  "streak": 3,
+  "best": 5,
+  "byFormat": { "singles-6v6-l50": { "w": 8, "l": 3 }, "open-l100": { "w": 2, "l": 1 }, "mystery-cup": { "w": 1, "l": 0 } },
+  "lastMatchAt": 1700000400000
+ },
+ "history": [ { "matchId": "x1", "result": "win" } ],
+ "_unknown": { "carry": "me" },
+ "flavor": "vanilla"
+}

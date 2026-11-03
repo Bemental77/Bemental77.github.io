@@ -1,0 +1,73 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>system animation tick benchmark</title>
+<!-- tools/pokemonarena_sys_tick.mjs drives this page in a headless, muted, throwaway-profile Chrome (behind the shared browser lock) and reads window.RESULT.
+     It plays a scripted battle of 23 system runs on a requestAnimationFrame loop (step + draw + putImageData per tick, exactly what a scene does) in two modes and records how long every tick took
+     and how far apart the rAF callbacks were:  mode "sync": each run is started with animator.start() in the tick that needs it (with systemCache 0 = the round-3 behaviour: every event plays its pre-roll);  mode "sliced": the NEXT run is
+     prepared with animator.prepare() + advance(budget) a little every tick while the current one plays, and begin() takes it when the current one is done. No audio is created. -->
+<canvas id="c" width="240" height="160"></canvas>
+<script type="module">
+import { createMoveAnimator } from '/pokemonarena/js/move_anim.js';
+const ROM_URL = '/gba/gbaWasm/roms/Pokemon%20SoulGold%20(v1.1.1).gba';
+let rom = null;
+const cv = document.getElementById('c'), g = cv.getContext('2d'), img = g.createImageData(240, 160);
+
+// 23 system runs of a 3 v 3 battle: the intro, then per Pokemon pair a few hits, the faint, and a send-out, the foe / the player changing every few runs (= a new battle state)
+const FOES = [19, 25, 132], PLAYERS = [4, 1289, 9];
+function script() {
+  const out = [{ id: 0, ctx: { foe: { species: FOES[0], level: 3 }, player: { species: PLAYERS[0], level: 5 }, seed: 5 } }];
+  const kinds = [7, 6, 7, 5, 2, 3, 4];   // hitFoe, hitPlayer, hitFoe, faintFoe, sendOutPlayer, recallPlayer, faintPlayer
+  let k = 0;
+  while (out.length < 23) {
+    const battle = Math.floor((out.length - 1) / 7);
+    const ctx = { foe: { species: FOES[battle % 3], level: 3 }, player: { species: PLAYERS[battle % 3], level: 5 }, seed: 5 };
+    out.push({ id: kinds[k++ % kinds.length], ctx });
+  }
+  return out;
+}
+const pct = (a, p) => { const s = [...a].sort((x, y) => x - y); return s.length ? s[Math.min(s.length - 1, Math.floor(p * s.length))] : 0; };
+const stat = (a) => ({ n: a.length, min: +Math.min(...a).toFixed(2), median: +pct(a, 0.5).toFixed(2), p95: +pct(a, 0.95).toFixed(2), max: +Math.max(...a).toFixed(2), sum: +a.reduce((x, y) => x + y, 0).toFixed(1) });
+
+async function pass(mode, budget, tag, prewarm, cacheMax) {
+  const animator = await createMoveAnimator({ rom, ...(cacheMax === undefined ? {} : { systemCache: cacheMax }) });   // a fresh animator: cold battle-state cache, warm JIT
+  const S = script();
+  const work = [], gaps = [], starts = [], advances = [], begins = [], events = [];
+  let live = null, idx = 0, prep = null, prepIdx = -1, warm = null, warmKey = null, waited = 0, last = 0, frames = 0;
+  const warmed = new Set([JSON.stringify(S[0].ctx)]);   // the intro is not cached: nothing to prewarm for it
+  const key = (c) => JSON.stringify(c);
+  return new Promise((resolve) => {
+    const tick = (ts) => {
+      const w0 = performance.now();
+      let tag2 = '';
+      if (live && !live.done) { live.step(); live.draw(img); g.putImageData(img, 0, 0); }
+      if (mode === 'sync') {
+        if ((!live || live.done) && idx < S.length) { const t = performance.now(); live = animator.start('system', S[idx].id, S[idx].ctx); starts.push(performance.now() - t); idx++; tag2 = 'start'; }
+      } else {
+        // the next run is prepared while the current one plays: a slice per tick (the first call also fingerprints the battle and looks the battle-state cache up)
+        if (!prep && prepIdx + 1 < S.length) {
+          try { prepIdx++; prep = animator.prepare('system', S[prepIdx].id, S[prepIdx].ctx); } catch (e) { prepIdx--; prep = null; }
+        }
+        if (prewarm) {   // the battle states of the runs after the next one are pre-rolled in the background (an engine of the pool each)
+          if (!warm) { for (let j = idx; j < S.length; j++) { if (S[j].id !== 0 && !warmed.has(key(S[j].ctx))) { try { warm = animator.prepare('system', 'battle', S[j].ctx); warmKey = key(S[j].ctx); } catch (e) { warm = null; } break; } } }
+          if (warm) { const t = performance.now(); warm.advance(budget); advances.push(performance.now() - t); if (warm.ready) { warmed.add(warmKey); warm = null; } }
+        }
+        if (prep && !prep.ready) { const t = performance.now(); prep.advance(budget); advances.push(performance.now() - t); tag2 = 'advance'; }
+        if ((!live || live.done) && prep) {
+          if (prep.ready) { const t = performance.now(); live = prep.begin(); begins.push(performance.now() - t); prep = null; idx++; tag2 += '+begin'; } else waited++;
+        }
+      }
+      const w1 = performance.now();
+      work.push(w1 - w0); if (last) gaps.push(ts - last); last = ts; frames++;
+      if (live && live.done && idx >= S.length) { resolve(summary()); return; }
+      if (frames > 20000) { resolve(summary('aborted')); return; }
+      requestAnimationFrame(tick);
+    };
+    const summary = (note) => ({ tag, mode, budget, note: note || '', frames, tickMs: stat(work), gapMs: stat(gaps), ticksOver10ms: work.filter((x) => x > 10).length, ticksOver16ms: work.filter((x) => x > 16.7).length, ticksOver33ms: work.filter((x) => x > 33.4).length,
+      gapsOver20ms: gaps.filter((x) => x > 20).length, gapsOver34ms: gaps.filter((x) => x > 34).length, startMs: starts.length ? stat(starts) : null, advanceMs: advances.length ? stat(advances) : null, beginMs: begins.length ? stat(begins) : null, waitedTicks: waited, poolStats: animator.system.stats() });
+    requestAnimationFrame(tick);
+  });
+}
+window.init = async () => { const b = await (await fetch(ROM_URL)).arrayBuffer(); rom = new Uint8Array(b); return rom.length; };
+window.runPass = (mode, budget, tag, prewarm, cacheMax) => pass(mode, budget, tag, prewarm, cacheMax);
+window.READY = true;
+</script>

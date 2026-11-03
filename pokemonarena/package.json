@@ -1,0 +1,6 @@
+{
+  "name": "pokemonarena",
+  "private": true,
+  "type": "module",
+  "description": "Scopes ES-module semantics to pokemonarena/ so Node tests can import pokemonarena/js/*.js directly; browsers ignore this file."
+}

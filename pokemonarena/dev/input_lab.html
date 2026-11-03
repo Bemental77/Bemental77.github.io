@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Input lab</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/pokemonarena/input.css">
+<!--
+  DEVELOPER FIXTURE. Not linked from any player-facing page; driven by tools/pokemonarena_input_test.mjs under tools/headless_cdp.mjs.
+  It puts one of every kind of surface the real pages will have in front of the input layer:
+    * a 240x160 canvas with a mock menu (a 2x2 action menu and a scrolling list), driven by actions AND by pointer hover / click / wheel
+    * a second canvas that is letterboxed with object-fit: contain, to check the pointer mapping
+    * a DOM form: buttons, select, range, number, text, checkbox, a tablist and a modal dialog, driven by uinav.js
+    * the Controls panel, an event log and a set of on-screen pads
+  Query:  ?mode=canvas   canvas menu listens, DOM navigation OFF (the canvas page case)
+          ?mode=dom      DOM navigation ON, canvas menu idle (the hub / editor case)   [default]
+          ?nonav=1       never start uinav (negative control)     ?storage=none   run with storage unavailable
+  Test hooks: window.__input = { input, nav, panel, menu, counts, log, actions, lb, mode, setMode(m), state() }
+-->
+<style>
+  :root { color-scheme: dark; --bg: #111; --panel: #1a1a1f; --line: #3a3a44; --fg: #e2e2e8; --dim: #9a9aa8; --accent: #66aaff; --btn: #26262e; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  body { padding: 8px 16px 40px; overflow-x: hidden; max-width: 980px; margin: 0 auto; }
+  h1 { font-size: 18px; margin: 6px 0 2px; }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+  .dim { color: var(--dim); font-size: 13px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin: 10px 0; }
+  button, select, input[type="number"], input[type="text"] { font: inherit; color: var(--fg); background: var(--btn); border: 1px solid var(--line); border-radius: 8px; min-height: 44px; padding: 6px 12px; }
+  input[type="checkbox"] { width: 22px; height: 22px; }
+  input[type="range"] { width: 100%; height: 44px; }
+  label { display: flex; flex-direction: column; gap: 3px; font-size: 13px; color: var(--dim); }
+  label.inline { flex-direction: row; align-items: center; gap: 8px; min-height: 44px; color: var(--fg); font-size: 15px; }
+  .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-items: end; }
+  @media (max-width: 380px) { .grid2 { grid-template-columns: minmax(0, 1fr); } }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  [role="tablist"] { display: flex; flex-wrap: wrap; gap: 4px; }
+  [role="tab"][aria-selected="true"] { background: #27466f; border-color: var(--accent); }
+  #tabPanel { grid-column: 1 / -1; min-height: 28px; }
+  canvas#menu { display: block; width: 240px; height: 160px; border: 2px solid #666; background: #000; image-rendering: pixelated; box-sizing: content-box; }
+  canvas#lb { display: block; width: 300px; max-width: 100%; height: 180px; object-fit: contain; border: 0; background: #2a1d33; image-rendering: pixelated; }
+  #padsBox { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 10px; align-items: center; }
+  .padbtn { min-width: 52px; min-height: 52px; padding: 0 8px; }
+  .padbtn.down { background: #3b4a66; border-color: var(--accent); }
+  #dpad { display: grid; grid-template-columns: repeat(3, 52px); grid-template-rows: repeat(3, 52px); gap: 4px; grid-template-areas: ". up ." "left . right" ". down ."; }
+  #dpad [data-act="up"] { grid-area: up; } #dpad [data-act="left"] { grid-area: left; } #dpad [data-act="right"] { grid-area: right; } #dpad [data-act="down"] { grid-area: down; }
+  #log { margin: 6px 0 0; padding: 8px; background: #000; border-radius: 6px; font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace; min-height: 120px; max-height: 190px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+  #dlg { position: fixed; inset: 0; margin: auto; width: min(92vw, 420px); height: fit-content; z-index: 20; background: #22222a; border: 2px solid var(--accent); border-radius: 12px; padding: 16px; box-shadow: 0 0 0 100vmax rgba(0, 0, 0, .6); }
+  #dlg[hidden] { display: none; }
+  .modes button[aria-pressed="true"] { background: #27466f; border-color: var(--accent); }
+</style>
+</head>
+<body>
+  <h1>Input lab</h1>
+  <p class="dim">Developer fixture for the input layer. Not part of the game.</p>
+  <div class="row modes" role="group" aria-label="Lab mode" data-nav-skip>
+    <button type="button" id="modeCanvas" aria-pressed="false">Canvas mode</button>
+    <button type="button" id="modeDom" aria-pressed="true">Page mode</button>
+    <span class="dim" id="modeNote"></span>
+  </div>
+
+  <section id="canvasSec" aria-label="Canvas menu">
+    <h2>Canvas menu (240x160)</h2>
+    <canvas id="menu" width="240" height="160" tabindex="0" data-input-target aria-label="Mock battle menu, 240 by 160 pixels"></canvas>
+    <p class="dim" id="menuState" role="status"></p>
+    <div id="padsBox" aria-label="On-screen pads">
+      <div id="dpad">
+        <button type="button" class="padbtn" data-act="up" aria-label="Up" data-nav-skip tabindex="-1">&#9650;</button>
+        <button type="button" class="padbtn" data-act="left" aria-label="Left" data-nav-skip tabindex="-1">&#9664;</button>
+        <button type="button" class="padbtn" data-act="right" aria-label="Right" data-nav-skip tabindex="-1">&#9654;</button>
+        <button type="button" class="padbtn" data-act="down" aria-label="Down" data-nav-skip tabindex="-1">&#9660;</button>
+      </div>
+      <div class="row">
+        <button type="button" class="padbtn" data-act="b" aria-label="B" data-nav-skip tabindex="-1">B</button>
+        <button type="button" class="padbtn" data-act="a" aria-label="A" data-nav-skip tabindex="-1">A</button>
+        <button type="button" class="padbtn" data-act="x" aria-label="X" data-nav-skip tabindex="-1">X</button>
+        <button type="button" class="padbtn" data-act="y" aria-label="Y" data-nav-skip tabindex="-1">Y</button>
+        <button type="button" class="padbtn" data-act="l" aria-label="L" data-nav-skip tabindex="-1">L</button>
+        <button type="button" class="padbtn" data-act="r" aria-label="R" data-nav-skip tabindex="-1">R</button>
+        <button type="button" class="padbtn" data-act="start" aria-label="Menu" data-nav-skip tabindex="-1">Menu</button>
+        <button type="button" class="padbtn" data-act="select" aria-label="Info" data-nav-skip tabindex="-1">Info</button>
+      </div>
+    </div>
+    <h2 style="margin-top:14px">Letterboxed canvas (pointer mapping)</h2>
+    <canvas id="lb" width="240" height="160" data-input-target aria-label="Letterboxed 240 by 160 canvas"></canvas>
+  </section>
+
+  <section id="formSec" aria-label="Form">
+    <h2>Form</h2>
+    <div class="grid2">
+      <button type="button" id="btnSave">Save</button>
+      <button type="button" id="btnCancel">Cancel</button>
+      <label>Choice
+        <select id="sel"><option value="one">One</option><option value="two">Two</option><option value="three">Three</option><option value="four">Four</option></select>
+      </label>
+      <label>Level
+        <input type="range" id="rng" min="0" max="100" step="1" value="50">
+      </label>
+      <label>Count
+        <input type="number" id="num" min="0" max="99" step="1" value="5">
+      </label>
+      <label>Name
+        <input type="text" id="txt" autocomplete="off">
+      </label>
+      <label class="inline"><input type="checkbox" id="chk"> Enabled</label>
+      <div role="tablist" aria-label="Sections" id="tabs">
+        <button type="button" role="tab" id="tab1" aria-selected="true" data-tab="alpha">Alpha</button>
+        <button type="button" role="tab" id="tab2" aria-selected="false" data-tab="beta">Beta</button>
+        <button type="button" role="tab" id="tab3" aria-selected="false" data-tab="gamma">Gamma</button>
+      </div>
+      <button type="button" id="btnDlg">Open dialog</button>
+      <div id="tabPanel" role="tabpanel" aria-live="polite">Alpha panel</div>
+    </div>
+  </section>
+
+  <section id="controls" aria-label="Controls panel"></section>
+
+  <section aria-label="Event log">
+    <h2>Event log</h2>
+    <pre id="log" role="log" aria-live="off"></pre>
+  </section>
+
+  <div id="dlg" role="dialog" aria-modal="true" aria-labelledby="dlgTitle" hidden>
+    <h2 id="dlgTitle">Dialog</h2>
+    <p>Focus stays inside this dialog until it is closed.</p>
+    <div class="row">
+      <button type="button" id="dlgOk">OK</button>
+      <button type="button" id="dlgClose" aria-label="Close dialog">Close</button>
+    </div>
+  </div>
+
+<script type="module">
+  import { createInput, ACTIONS, mapClientToLogical } from '/pokemonarena/js/input.js';
+  import { enableDomNav } from '/pokemonarena/js/uinav.js';
+  import { mountControlsPanel } from '/pokemonarena/js/input_panel.js';
+
+  const q = new URLSearchParams(location.search);
+  const $ = (id) => document.getElementById(id);
+  let storage;                                         // undefined -> the layer picks localStorage itself
+  if (q.get('storage') === 'none') storage = null;
+  const input = createInput({ storage });
+  const counts = { save: 0, cancel: 0, dlgOk: 0, chk: 0, sel: 0, rng: 0, num: 0, txt: 0, dlgOpen: 0, dlgClose: 0, menuChosen: [] };
+  const log = [], actions = [];
+
+  /* ---------------------------------------------------------------- the event log */
+  const logEl = $('log');
+  function note(line) { log.push(line); if (log.length > 400) log.shift(); logEl.textContent = log.slice(-14).join('\n'); logEl.scrollTop = logEl.scrollHeight; }
+  input.on('action', (e) => { actions.push({ action: e.action, pressed: e.pressed, repeat: e.repeat, source: e.source, native: !!e.native, code: e.code, button: e.button, t: Math.round(performance.now()) }); if (actions.length > 600) actions.shift();
+    note((e.pressed ? (e.repeat ? 'rep ' : 'down ') : 'up   ') + e.action + '  [' + e.source + (e.code ? ' ' + e.code : '') + (e.button !== undefined ? ' b' + e.button : '') + ']'); });
+  input.on('pointer', (e) => { if (e.kind !== 'move') note('ptr ' + e.kind + ' ' + (e.x === null ? '-' : e.x.toFixed(1) + ',' + e.y.toFixed(1)) + (e.steps ? ' steps ' + e.steps : '') + ' [' + e.source + ']'); });
+  input.on('device', (e) => note('device ' + (e.connected ? 'connected ' : 'disconnected ') + e.id));
+  input.on('source', (e) => note('source -> ' + e.source));
+
+  /* ---------------------------------------------------------------- canvas menu */
+  const menuCanvas = $('menu'), mctx = menuCanvas.getContext('2d');
+  const menu = { screen: 'grid', cursor: 0, scroll: 0, chosen: counts.menuChosen };
+  const GRID = ['FIGHT', 'BAG', 'POKEMON', 'RUN'];
+  const LIST = Array.from({ length: 12 }, (_, i) => 'MON ' + (i + 1));
+  const VIS = 5;
+  const gridRect = (i) => ({ x: 120 + (i % 2) * 56, y: 112 + Math.floor(i / 2) * 20, w: 52, h: 16 });
+  const listRect = (row) => ({ x: 16, y: 24 + row * 22, w: 208, h: 18 });
+  function hit(x, y) {
+    if (menu.screen === 'grid') { for (let i = 0; i < 4; i++) { const r = gridRect(i); if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) return i; } return -1; }
+    for (let row = 0; row < VIS; row++) { const r = listRect(row); if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) return menu.scroll + row; }
+    return -1;
+  }
+  function draw() {
+    mctx.fillStyle = '#101820'; mctx.fillRect(0, 0, 240, 160);
+    mctx.font = '10px monospace'; mctx.textBaseline = 'top';
+    if (menu.screen === 'grid') {
+      mctx.fillStyle = '#fff'; mctx.fillText('What will you do?', 8, 116);
+      GRID.forEach((t, i) => { const r = gridRect(i); mctx.fillStyle = i === menu.cursor ? '#ffd84a' : '#2a3a4a'; mctx.fillRect(r.x, r.y, r.w, r.h); mctx.fillStyle = i === menu.cursor ? '#000' : '#fff'; mctx.fillText(t, r.x + 4, r.y + 3); });
+    } else {
+      mctx.fillStyle = '#fff'; mctx.fillText('Choose a Pokemon', 16, 8);
+      for (let row = 0; row < VIS; row++) { const i = menu.scroll + row, r = listRect(row); mctx.fillStyle = i === menu.cursor ? '#ffd84a' : '#2a3a4a'; mctx.fillRect(r.x, r.y, r.w, r.h); mctx.fillStyle = i === menu.cursor ? '#000' : '#fff'; mctx.fillText(LIST[i], r.x + 4, r.y + 4); }
+      mctx.fillStyle = '#9ab'; mctx.fillText(menu.scroll > 0 ? '^' : ' ', 228, 24); mctx.fillText(menu.scroll + VIS < LIST.length ? 'v' : ' ', 228, 24 + (VIS - 1) * 22);
+    }
+    $('menuState').textContent = 'screen ' + menu.screen + ', cursor ' + menu.cursor + ', chosen ' + (menu.chosen.join(', ') || 'nothing');
+  }
+  function setCursor(i) { if (i < 0) return; const n = menu.screen === 'grid' ? 4 : LIST.length; menu.cursor = Math.max(0, Math.min(n - 1, i)); if (menu.screen === 'list') { if (menu.cursor < menu.scroll) menu.scroll = menu.cursor; if (menu.cursor >= menu.scroll + VIS) menu.scroll = menu.cursor - VIS + 1; } draw(); }
+  function activateMenu() {
+    if (menu.screen === 'grid') { if (menu.cursor === 2) { menu.screen = 'list'; menu.cursor = 0; menu.scroll = 0; } else menu.chosen.push(GRID[menu.cursor]); }
+    else menu.chosen.push(LIST[menu.cursor]);
+    draw();
+  }
+  function menuAction(e) {
+    if (mode !== 'canvas' || !e.pressed) return;
+    const g = menu.screen === 'grid';
+    if (e.action === 'left') setCursor(g ? (menu.cursor % 2 ? menu.cursor - 1 : menu.cursor) : menu.cursor);
+    else if (e.action === 'right') setCursor(g ? (menu.cursor % 2 ? menu.cursor : menu.cursor + 1) : menu.cursor);
+    else if (e.action === 'up') setCursor(g ? (menu.cursor >= 2 ? menu.cursor - 2 : menu.cursor) : menu.cursor - 1);
+    else if (e.action === 'down') setCursor(g ? (menu.cursor < 2 ? menu.cursor + 2 : menu.cursor) : menu.cursor + 1);
+    else if (e.action === 'a') activateMenu();
+    else if (e.action === 'b') { if (!g) { menu.screen = 'grid'; menu.cursor = 2; draw(); } else { menu.chosen.push('BACK'); draw(); } }
+  }
+  input.on('action', menuAction);
+  const toLocal = mapClientToLogical(menuCanvas, 240, 160);
+  input.registerPointerTarget(menuCanvas, { toLocal, cursor: { actionable: (x, y) => hit(x, y) >= 0 } });
+  input.on('pointer', (e) => {
+    if (e.el !== menuCanvas || mode !== 'canvas') return;
+    if (e.kind === 'move' && e.inside) { const i = hit(e.x, e.y); if (i >= 0) setCursor(i); }
+    else if (e.kind === 'down' && e.source === 'touch' && e.inside) { const i = hit(e.x, e.y); if (i >= 0) setCursor(i); }
+    else if (e.kind === 'click' && e.inside) { const i = hit(e.x, e.y); if (i >= 0) { setCursor(i); activateMenu(); } }
+    else if (e.kind === 'wheel') { const n = menu.screen === 'grid' ? (e.steps > 0 ? 2 : -2) : e.steps; setCursor(menu.cursor + n); }
+  });
+  // the letterboxed canvas just records where it was hit
+  const lb = { last: null };
+  const lbCanvas = $('lb'), lbx = lbCanvas.getContext('2d');
+  lbx.fillStyle = '#334'; lbx.fillRect(0, 0, 240, 160); lbx.fillStyle = '#fc6'; lbx.fillRect(0, 0, 8, 8); lbx.fillRect(232, 152, 8, 8);
+  input.registerPointerTarget(lbCanvas, { toLocal: mapClientToLogical(lbCanvas, 240, 160) });
+  input.on('pointer', (e) => { if (e.el === lbCanvas && (e.kind === 'down' || e.kind === 'click')) lb.last = { kind: e.kind, x: e.x, y: e.y, px: e.px, py: e.py, inside: e.inside }; });
+
+  // whole-pixel scale for the menu canvas (the same rule the real battle page uses)
+  function fit() {
+    const dpr = window.devicePixelRatio || 1, availW = Math.min(document.documentElement.clientWidth - 56, 720);
+    const k = Math.max(1, Math.floor((availW * dpr) / 240 + 1e-9));
+    menuCanvas.style.width = (240 * k) / dpr + 'px'; menuCanvas.style.height = (160 * k) / dpr + 'px';
+  }
+  window.addEventListener('resize', fit); fit();
+
+  /* ---------------------------------------------------------------- on-screen pads */
+  for (const b of document.querySelectorAll('#padsBox [data-act]')) input.bindPad(b, b.dataset.act);
+
+  /* ---------------------------------------------------------------- DOM form */
+  $('btnSave').addEventListener('click', () => { counts.save++; note('click Save'); });
+  $('btnCancel').addEventListener('click', () => { counts.cancel++; note('click Cancel'); });
+  $('chk').addEventListener('change', () => { counts.chk++; note('chk -> ' + $('chk').checked); });
+  $('sel').addEventListener('change', () => { counts.sel++; note('sel -> ' + $('sel').value); });
+  $('rng').addEventListener('input', () => { counts.rng++; });
+  $('num').addEventListener('change', () => { counts.num++; });
+  $('txt').addEventListener('input', () => { counts.txt++; });
+  const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
+  function selectTab(t) { for (const x of tabs) x.setAttribute('aria-selected', String(x === t)); $('tabPanel').textContent = t.textContent + ' panel'; note('tab -> ' + t.textContent); }
+  for (const t of tabs) t.addEventListener('click', () => selectTab(t));
+  let opener = null;
+  function openDlg() { opener = document.activeElement; $('dlg').hidden = false; counts.dlgOpen++; $('dlgOk').focus(); note('dialog open'); }
+  function closeDlg() { if ($('dlg').hidden) return; $('dlg').hidden = true; counts.dlgClose++; note('dialog closed'); if (opener && opener.isConnected) opener.focus(); }
+  $('btnDlg').addEventListener('click', openDlg);
+  $('dlgOk').addEventListener('click', () => { counts.dlgOk++; closeDlg(); });
+  $('dlgClose').addEventListener('click', closeDlg);
+
+  /* ---------------------------------------------------------------- panel, nav, mode */
+  const panel = mountControlsPanel($('controls'), { input });
+  let nav = null, mode = 'dom';
+  function setMode(m) {
+    mode = m;
+    $('modeCanvas').setAttribute('aria-pressed', String(m === 'canvas')); $('modeDom').setAttribute('aria-pressed', String(m === 'dom'));
+    $('modeNote').textContent = m === 'canvas' ? 'Canvas menu listens; page navigation is off.' : 'Page navigation is on; the canvas menu is idle.';
+    if (nav) { nav.disable(); nav = null; }
+    if (m === 'dom' && q.get('nonav') !== '1') nav = enableDomNav(document.body, { input, onBack: () => note('onBack called') });
+    api.nav = nav;
+  }
+  $('modeCanvas').addEventListener('click', () => setMode('canvas'));
+  $('modeDom').addEventListener('click', () => setMode('dom'));
+
+  const api = {
+    input, panel, menu, counts, log, actions, lb, nav: null, hit, lbCanvas, menuCanvas,
+    get mode() { return mode; }, setMode,
+    state: () => ({ mode, lastSource: input.lastSource, sourceKnown: input.sourceKnown, held: input.held, pads: input.pads, bindings: input.bindings.get(), store: input.bindings.status(),
+      active: document.activeElement ? (document.activeElement.id || document.activeElement.tagName) : null, rootSource: document.documentElement.getAttribute('data-input-source'),
+      editing: api.nav && api.nav.editing() ? api.nav.editing().id : null, menu: { screen: menu.screen, cursor: menu.cursor, scroll: menu.scroll, chosen: menu.chosen.slice() },
+      values: { sel: $('sel').value, rng: $('rng').value, num: $('num').value, txt: $('txt').value, chk: $('chk').checked, tab: (tabs.find((t) => t.getAttribute('aria-selected') === 'true') || {}).id, dlgHidden: $('dlg').hidden } }),
+    log: log,
+  };
+  window.__input = api;
+  setMode(q.get('mode') === 'canvas' ? 'canvas' : 'dom');
+  draw();
+  api.ready = true;
+</script>
+</body>
+</html>

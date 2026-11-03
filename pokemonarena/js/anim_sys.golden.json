@@ -1,0 +1,56 @@
+{
+ "intro": {
+  "frames": 279,
+  "hashes": {
+   "60": "c55e2cd7685fff0e",
+   "120": "508295cea3b76027",
+   "200": "7e38eaa56e96258f"
+  },
+  "last": "f9e50aa6"
+ },
+ "trainerIntro": {
+  "frames": 373,
+  "hashes": {
+   "100": "db0c4060dd0ff384",
+   "200": "d50811a03fbd1c49",
+   "300": "6e2827a2f4d5bc38"
+  },
+  "last": "a57dbc6d"
+ },
+ "faintFoe": {
+  "frames": 76,
+  "hashes": {
+   "4": "ef9790188f657ab4",
+   "10": "2a6bb623e6156936",
+   "30": "de5beecc16ce0c48"
+  },
+  "last": "15c42b80"
+ },
+ "sendOut": {
+  "frames": 166,
+  "hashes": {
+   "20": "fddf9e1143426685",
+   "60": "6350feea287951ac",
+   "100": "cfa93dc9dbd594ed"
+  },
+  "last": "d037b803"
+ },
+ "hit": {
+  "frames": 42,
+  "hashes": {
+   "3": "2fd222cb052b691d",
+   "9": "abbcd7384b744891",
+   "20": "2b13560840405c16"
+  },
+  "last": "f42b299d"
+ },
+ "recall": {
+  "frames": 53,
+  "hashes": {
+   "6": "90ee2d0318e098e6",
+   "20": "56b2f9dac9a58d04",
+   "40": "914e5ecf12f636c6"
+  },
+  "last": "0e358013"
+ }
+}

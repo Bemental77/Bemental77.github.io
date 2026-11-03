@@ -1,0 +1,138 @@
+{
+ "id0": {
+  "md5": "f7a964d9520f65b84e3956e0f87fdfff",
+  "frames": 279
+ },
+ "id1": {
+  "md5": "31c0ef5e4f4de7ce8912ba12caa5903b",
+  "frames": 373
+ },
+ "id2": {
+  "md5": "ae4f663c0974660c6d2e2d833c7b6c9c",
+  "frames": 166
+ },
+ "id3": {
+  "md5": "8d5c011b3005ee99d711bfa2138a9269",
+  "frames": 53
+ },
+ "id4": {
+  "md5": "3887804e7ba9263f92952e200d8fbf2d",
+  "frames": 55
+ },
+ "id5": {
+  "md5": "5f73bf4ac9faf00db326279e4e2d194d",
+  "frames": 76
+ },
+ "id6": {
+  "md5": "6e3afa5eb926f5ac361e4fa4f9ea1526",
+  "frames": 42
+ },
+ "id7": {
+  "md5": "3c4844de18c3e5666e73b80cb76677c5",
+  "frames": 42
+ },
+ "id8": {
+  "md5": "4dba554a310dc7ac869ec186e32079be",
+  "frames": 163
+ },
+ "id9": {
+  "md5": "e9d44c7c4c6000263d92eee677cf9882",
+  "frames": 53
+ },
+ "ball0": {
+  "md5": "6db0b6540fa8f042bf071e4280713bb0",
+  "frames": 279
+ },
+ "ball1": {
+  "md5": "f7a964d9520f65b84e3956e0f87fdfff",
+  "frames": 279
+ },
+ "ball2": {
+  "md5": "c669523cea59c34692a47d0807b52119",
+  "frames": 279
+ },
+ "ball3": {
+  "md5": "1972006b17b47e904b9497157edc6037",
+  "frames": 279
+ },
+ "ball4": {
+  "md5": "ed85493221983febed236773cba14b7b",
+  "frames": 279
+ },
+ "ball5": {
+  "md5": "9dbc07b59604f4ffc5544e0f2ceb9aaf",
+  "frames": 279
+ },
+ "ball6": {
+  "md5": "38d9c849df3c7301c2deabff77e50740",
+  "frames": 279
+ },
+ "ball7": {
+  "md5": "6fc6b0822849b7ecd9bf6903e54ad7b9",
+  "frames": 279
+ },
+ "ball8": {
+  "md5": "bd1c7048bd4c2164cdba5b914c78f42b",
+  "frames": 279
+ },
+ "ball9": {
+  "md5": "8137bf19519b0f832f5c78016cd9d199",
+  "frames": 279
+ },
+ "ball10": {
+  "md5": "e1a10d43d5857496b458cb2b0e67d831",
+  "frames": 279
+ },
+ "ball11": {
+  "md5": "c67244e3ec3682fcd6d565232ef2a85e",
+  "frames": 279
+ },
+ "ball12": {
+  "md5": "120d6aa9a1467bada8fb615025e0e954",
+  "frames": 279
+ },
+ "ball13": {
+  "md5": "e1d120ad333f2204cf202c7d9484fd3e",
+  "frames": 279
+ },
+ "ball14": {
+  "md5": "8c51fb7c9ece519d4360d7a0f1023d71",
+  "frames": 279
+ },
+ "ball15": {
+  "md5": "548e619ba77a6cc6fe611b3f3da220dd",
+  "frames": 279
+ },
+ "ball16": {
+  "md5": "2129c291ed279846d11b93949510d66b",
+  "frames": 279
+ },
+ "shinyFoe": {
+  "md5": "62ff783cce7af2ec07173f93ee1544ec",
+  "frames": 279
+ },
+ "shinyPlayerSendOut": {
+  "md5": "3f52112548e550be09da9dd373db9de1",
+  "frames": 168
+ },
+ "longCry": {
+  "md5": "7374152a63d93c3bd894b3ed993b0184",
+  "frames": 297
+ },
+ "trainer5Foe": {
+  "md5": "4dba554a310dc7ac869ec186e32079be",
+  "frames": 163
+ },
+ "night": {
+  "md5": "5d4b78c0cb15bf959d9f4b18c07db649",
+  "frames": 53
+ },
+ "id8Gyarados": {
+  "md5": "5e1eb9d63b847636a1ffdd12b3309c1e",
+  "frames": 185
+ },
+ "id2Pikachu": {
+  "md5": "a07205e4112e94c4804b679cfa9a8157",
+  "frames": 150
+ }
+}

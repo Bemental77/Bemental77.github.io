@@ -1,0 +1,21 @@
+{
+ "app": "pokemonarena",
+ "schemaVersion": 4,
+ "id": "p_future",
+ "rev": 4,
+ "createdAt": 1700000000000,
+ "trainerName": {
+  "first": "FUTURE",
+  "last": "USER"
+ },
+ "box": "a string where this build expects an array",
+ "mystery": {
+  "nested": [
+   1,
+   2,
+   {
+    "deep": true
+   }
+  ]
+ }
+}

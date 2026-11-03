@@ -359,11 +359,16 @@ function judgeGba({ lobbyHtml, room, romlist, solo, gbaHtml, netplaySrc, netplay
     missing.length ? bad(`${sys}-solo-keys-exist`, `not on the page: [${missing.join(' | ')}]`)
                    : ok(`${sys}-solo-keys-exist`, `${keys.length} single-player title(s), all on the page`);
   }
-  for (const f of ['n64/index.html', 'ps1.html', 'snes.html']) {
+  for (const f of ['ps1.html', 'snes.html']) {
     /MPGames\.gateParty\(/.test(live(read(f)))
       ? ok(`${f}-party-gated`, 'Party disabled on a single-player game')
       : bad(`${f}-party-gated`, 'no MPGames.gateParty call');
   }
+  // n64/index.html deliberately stopped gating the Party button on the selected game (its own comment says why: the lobby it opens disables Host
+  // with the reason and lets a player on a solo title still Join a friend). The check pins that decision instead of the old gating.
+  /MPGames\.gateParty\(/.test(live(read('n64/index.html')))
+    ? bad('n64/index.html-party-not-gated', 'n64 gates Party again: the page documents that it does not')
+    : ok('n64/index.html-party-not-gated', 'Party stays open on a single-player game; the lobby handles it');
   /MPGames\.isSolo\(/.test(live(lobby))
     ? ok('lobby-filters-solo', 'lobby offers only multiplayer titles')
     : bad('lobby-filters-solo', 'multiplayer.html does not filter through MPGames.isSolo');

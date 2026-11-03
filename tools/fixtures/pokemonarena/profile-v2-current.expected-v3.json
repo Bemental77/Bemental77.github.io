@@ -1,0 +1,232 @@
+{
+ "app": "pokemonarena",
+ "schemaVersion": 3,
+ "id": "p_fixture03",
+ "rev": 12,
+ "createdAt": 1700000000000,
+ "updatedAt": 1700000600000,
+ "romSha256": "8071e2c348d54c3ec7b78b53837c5cbd757d5cfc461a50fa5ffbc9f5ab35060a",
+ "trainerName": "GREEN",
+ "avatar": {
+  "kind": "preset",
+  "id": 3
+ },
+ "settings": {
+  "defaultRuleset": "arena-gen3-standard+strict-champions",
+  "animations": "off",
+  "textSpeed": "fast",
+  "sound": true,
+  "reducedMotion": true,
+  "trainingMode": "champions",
+  "backupNudgeDays": 0
+ },
+ "teams": [
+  {
+   "id": "t_main",
+   "name": "STRICT SIX",
+   "ruleset": "arena-gen3-standard+strict-champions",
+   "monIds": [
+    "m_a",
+    "m_b"
+   ]
+  }
+ ],
+ "box": [
+  {
+   "id": "m_a",
+   "species": 9,
+   "nickname": "Shell",
+   "level": 50,
+   "nature": 5,
+   "abilitySlot": 0,
+   "heldItem": 3,
+   "moves": [
+    {
+     "id": 11,
+     "ppUps": 1
+    },
+    {
+     "id": 12,
+     "ppUps": 2
+    },
+    {
+     "id": 13,
+     "ppUps": 3
+    },
+    {
+     "id": 14,
+     "ppUps": 0
+    }
+   ],
+   "ev": {
+    "hp": 252,
+    "atk": 0,
+    "def": 4,
+    "spa": 252,
+    "spd": 0,
+    "spe": 0
+   },
+   "iv": {
+    "hp": 31,
+    "atk": 31,
+    "def": 31,
+    "spa": 31,
+    "spd": 31,
+    "spe": 31
+   },
+   "gender": "M",
+   "shiny": false,
+   "friendship": 70,
+   "originalTrainer": {
+    "name": "GREEN",
+    "tid": 777,
+    "sid": 888
+   },
+   "origin": "custom",
+   "provenance": {},
+   "createdAt": 1700000000100,
+   "updatedAt": 1700000000100
+  },
+  {
+   "id": "m_b",
+   "species": 94,
+   "nickname": "G",
+   "level": 50,
+   "nature": 10,
+   "abilitySlot": 2,
+   "heldItem": 0,
+   "moves": [
+    {
+     "id": 21,
+     "ppUps": 0
+    }
+   ],
+   "ev": {
+    "hp": 0,
+    "atk": 0,
+    "def": 0,
+    "spa": 0,
+    "spd": 0,
+    "spe": 0
+   },
+   "iv": {
+    "hp": 31,
+    "atk": 31,
+    "def": 31,
+    "spa": 31,
+    "spd": 31,
+    "spe": 31
+   },
+   "gender": "F",
+   "shiny": true,
+   "friendship": 0,
+   "originalTrainer": {
+    "name": "",
+    "tid": 0,
+    "sid": 0
+   },
+   "origin": "rental",
+   "provenance": {
+    "source": "fixture",
+    "pid": 1,
+    "otId": 2,
+    "_unknown": {
+     "extra": true
+    }
+   },
+   "createdAt": 1700000000200,
+   "updatedAt": 1700000000200
+  }
+ ],
+ "stats": {
+  "wins": 3,
+  "losses": 1,
+  "draws": 0,
+  "forfeits": 1,
+  "streak": 2,
+  "best": 3,
+  "lastMatchAt": 1700000550000,
+  "byRuleset": {
+   "arena-gen3-standard+strict-champions": {
+    "w": 3,
+    "l": 1
+   }
+  },
+  "firstMatchAt": null,
+  "playMs": 0,
+  "byFormat": {
+   "3v3": {
+    "w": 0,
+    "l": 0,
+    "dr": 0,
+    "f": 0
+   },
+   "6v6": {
+    "w": 0,
+    "l": 0,
+    "dr": 0,
+    "f": 0
+   }
+  },
+  "byCpu": {
+   "easy": {
+    "w": 0,
+    "l": 0,
+    "dr": 0,
+    "f": 0
+   },
+   "normal": {
+    "w": 0,
+    "l": 0,
+    "dr": 0,
+    "f": 0
+   },
+   "hard": {
+    "w": 0,
+    "l": 0,
+    "dr": 0,
+    "f": 0
+   }
+  },
+  "totals": {
+   "turns": 0,
+   "kos": 0,
+   "faints": 0,
+   "dealt": 0,
+   "taken": 0,
+   "hits": 0,
+   "crits": 0,
+   "superEffective": 0,
+   "resisted": 0,
+   "noEffect": 0,
+   "misses": 0,
+   "statusInflicted": 0,
+   "healed": 0,
+   "switches": 0
+  },
+  "bests": {
+   "hit": null,
+   "fastestWin": null,
+   "longest": null,
+   "koStreak": 0
+  },
+  "fav": {
+   "species": {},
+   "moves": {},
+   "mvps": {}
+  },
+  "recent": []
+ },
+ "identity": {
+  "publicKeyJwk": {
+   "kty": "EC",
+   "crv": "P-256",
+   "x": "2ANwQaT12XwU09a7UMD3iJOf0MjcZ-aY3bxxHprL1tg",
+   "y": "wYCvf3YYXZdMKCT8QxpMt6bjPgpcmcQXRu2xdIiaPr0"
+  },
+  "previousKeys": []
+ },
+ "_unknown": {
+  "keep": "me"
+ }
+}
