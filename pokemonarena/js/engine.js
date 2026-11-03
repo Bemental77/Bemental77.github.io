@@ -499,6 +499,27 @@ export class Battle {
     this.choiceLog.push({ s: side, c: { kind: 'move', slot } });
     return { ok: true, code: 'ok' };
   }
+  /**
+   * A side LEAVES the battle: it closed the page, ran out of time or lost the connection, so it forfeits whatever it had chosen. choose(side, forfeit) cannot
+   * do this for a side that is only waiting for the other player (a real choice is final, so it answers 'already-chosen'), and that is exactly the state a
+   * player is in during a networked turn. concede() replaces a real choice that has not been resolved yet. Everything already fully chosen resolves first
+   * (as for a forfeit), and the unresolved real choice is taken out of the choice log - it never took effect - so replay(choiceLog) still reproduces the
+   * live battle. -> { ok, code }.
+   */
+  concede(side) {
+    const S = this.s;
+    if (side !== 0 && side !== 1) return { ok: false, code: 'bad-side' };
+    while (this.resolvable()) this.step();
+    if (S.phase === 'end') return { ok: false, code: 'ended' };
+    const sd = S.sides[side];
+    if (sd.ch && sd.ch.kind === 'forfeit') return { ok: true, code: 'ok' };
+    if (sd.ch && sd.ch.kind !== 'auto') {
+      for (let i = this.choiceLog.length - 1; i >= 0; i--) if (this.choiceLog[i].s === side) { this.choiceLog.splice(i, 1); break; }
+    }
+    sd.ch = { kind: 'forfeit' };
+    this.choiceLog.push({ s: side, c: { kind: 'forfeit' } });
+    return { ok: true, code: 'ok' };
+  }
   /** True when every side that has to choose has chosen, or a side forfeited. */
   ready() {
     const S = this.s;

@@ -675,7 +675,7 @@ if (process.env.ARENA_SKIP_MUTANTS !== '1') {
     ['scene.js', 'W1 A4: a BACK target is not acted on', (s) => s.replace("case 'back': press('b'); break;", "case 'back': break;")],
     ['battle_ui.js', 'W1 A4: ui.hitTest does not know the BACK target above the move menu', (s) => s.replace("return y < R.mv[0].y ? { kind: 'back', index: 0 } : null; }", 'return null; }')],
     ['scene.js', 'forfeit confirm defaults to YES',(s) => s.replace("S.confirm = { kind, cursor: 1, back: back || 'action' };", "S.confirm = { kind, cursor: 0, back: back || 'action' };")],
-    ['matchctl.js', 'submit does not pump (CPU never answers)', (s) => s.replace("    pump();\n    return r;\n  }\n  const remoteSide", "    return r;\n  }\n  const remoteSide")],
+    ['matchctl.js', 'submit does not pump (CPU never answers)', (s) => s.replace("    announce(side, choice);\n    pump();\n    return r;", "    announce(side, choice);\n    return r;")],
     ['battle_boot.js', 'URL code pattern accepts anything', (s) => s.replace("const CODE_RE = /^ARENA1\\.[A-Za-z0-9_-]{1,1000}\\.[0-9a-fA-F]{4}$/;", 'const CODE_RE = /.*/;')],
     ['battle_boot.js', 'seed range unchecked', (s) => s.replace("|| Number(seedS) > 4294967295", '')],
     ['battle_boot.js', 'fitScale rounds up', (s) => s.replace('Math.floor(Math.min((availW * d) / SCREEN_W, (availH * d) / SCREEN_H) + 1e-9)', 'Math.ceil(Math.min((availW * d) / SCREEN_W, (availH * d) / SCREEN_H))')],

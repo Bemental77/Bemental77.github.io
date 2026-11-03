@@ -10,9 +10,12 @@
 //
 // SIDE KINDS
 //   { kind: 'human' }   choices come from the local UI through ctl.submit(side, choice); each accepted one fires onLocalChoice
+//   { kind: 'human', concede: true }   the same, and a FORFEIT from this seat goes through ctl.concede() so it works even while the seat is
+//                       waiting for the other player with a real choice already in (networked play: pokemonarena/js/netmatch.js)
 //   { kind: 'cpu', level, seed }   ai.js answers the moment a request exists (it only sees viewFor(side) and its own request)
-//   { kind: 'remote' }  the slot a netplay adapter fills: ctl.submitRemote(choice) / ctl.submitWire(u16); same validation
-// The three kinds go through the same ctl.submit() path, so a later netplay stage replaces only who calls it.
+//   { kind: 'remote' }  the slot a netplay adapter fills: ctl.submitRemote(choice) / ctl.submitWire(u16); same validation. It never fires
+//                       onLocalChoice (that is the local player's choices only) and ctl.concede(side) ends the battle when that player leaves.
+// The kinds go through the same ctl.submit() path, so the network adapter replaces only who calls it.
 
 import { createBattle, encodeChoice, decodeChoice } from './engine.js';
 import { createAi, createRng } from './ai.js';
@@ -163,11 +166,26 @@ export function createMatchController(opts) {
     if (battle.winner !== null && !ended) { ended = true; for (const cb of Array.from(subs.end)) { try { cb(battle.winner); } catch (_e) { /* listener errors never stop the match */ } } }
   }
 
+  // onLocalChoice is for the LOCAL player's choices only ({ kind: 'human' }): a CPU answers by itself and a remote side's choice arrives from the network,
+  // where an adapter that listened for "every non-CPU choice" would send the opponent's own choice straight back to them.
+  const announce = (side, choice) => { if (sidesSpec[side].kind === 'human') for (const cb of Array.from(subs.local)) { try { cb({ side, choice, wire: encodeChoice(choice) }); } catch (_e) { /* ignore */ } } };
+
   function submit(side, choice) {
     if (side !== 0 && side !== 1) return { ok: false, code: 'bad-side' };
+    // A networked human may leave at any time, even while waiting for the other player with a real choice already in; that is concede(), not a choice.
+    if (choice && choice.kind === 'forfeit' && sidesSpec[side].concede) return concede(side);
     const r = battle.choose(side, choice);
     if (!r.ok) return r;
-    if (sidesSpec[side].kind !== 'cpu') for (const cb of Array.from(subs.local)) { try { cb({ side, choice, wire: encodeChoice(choice) }); } catch (_e) { /* ignore */ } }
+    announce(side, choice);
+    pump();
+    return r;
+  }
+  // A side leaves the battle (forfeit, time ran out, connection lost): the engine ends it with the other side the winner. See Battle.concede.
+  function concede(side) {
+    if (side !== 0 && side !== 1) return { ok: false, code: 'bad-side' };
+    const r = battle.concede(side);
+    if (!r.ok) return r;
+    announce(side, { kind: 'forfeit' });
     pump();
     return r;
   }
@@ -181,7 +199,7 @@ export function createMatchController(opts) {
     origOf: (side) => battle.s.sides[side].team.map((x) => x.orig),
     requests: () => battle.requests(),
     view: (side) => battle.viewFor(side),
-    submit,
+    submit, concede,
     submitRemote(choice) { const s = remoteSide(); if (s < 0) return { ok: false, code: 'no-remote' }; return submit(s, choice); },
     submitWire(u16) { const c = decodeChoice(u16); return c ? ctl.submitRemote(c) : { ok: false, code: 'bad-wire' }; },
     takeEvents() { const q = queue; queue = []; return q; },
