@@ -171,6 +171,20 @@ class Page {
     await this.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
     await this.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
   }
+  /**
+   * A second tab in the SAME browser: same profile, so the same origin storage and the same BroadcastChannel. That is what a rig needs to pair two players
+   * with lib/netplay.js's 'local' transport (net=local) without a network. The tab has the same viewport; it dies with the browser.
+   */
+  async openTab({ width, height, mobile = false } = {}) {
+    const t = await getJson(`http://127.0.0.1:${this.port}/json/new?about:blank`, { method: 'PUT' });
+    const ws = new WebSocket(t.webSocketDebuggerUrl);
+    await new Promise((res, rej) => { ws.addEventListener('open', res); ws.addEventListener('error', () => rej(new Error('CDP websocket error (second tab)'))); });
+    const tab = new Page(ws);
+    tab.port = this.port;
+    await tab.init();
+    await tab.setViewport(width || this.width || 1280, height || this.height || 800, { mobile });
+    return tab;
+  }
 }
 
 /** What the page's own media queries say about the pointing device, and whether that is what the arm claims ('desktop' = hover:hover + pointer:fine; 'phone' = hover:none + pointer:coarse). */
@@ -211,6 +225,7 @@ export async function withBrowser(opts, fn) {
     const ws = new WebSocket(t.webSocketDebuggerUrl);
     await new Promise((res, rej) => { ws.addEventListener('open', res); ws.addEventListener('error', () => rej(new Error('CDP websocket error'))); });
     page = new Page(ws);
+    page.port = port; page.width = width; page.height = height;
     await page.init();
     await page.setViewport(width, height, { mobile });
     // the arm-difference proof: the arm must report what it claims, or no verdict is printed (a placebo arm is VOID, not a pass)

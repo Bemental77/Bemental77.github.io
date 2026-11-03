@@ -34,6 +34,8 @@ import { createAnimSettings, parseAnimQuery } from './anim_settings.js';
 import { prewarmSystem, trainerChoices } from './anim_sys.js';
 import { matchFromSummary } from './career_stats.js';                 // ST1: the finished match as the career wants it
 import { createResumeStore, resumeKey, navigationType } from './battle_resume.js';       // W1 fix D11: a reload mid-battle resumes it
+import { parseOnlineQuery, createOnline } from './online.js';                         // two players, one battle (netmatch.js + lib/netplay.js); see ONLINE.md
+import { engineFingerprint } from './online_match.js';
 
 export { GBA_FPS };
 const STEP_MS = 1000 / GBA_FPS;
@@ -248,7 +250,8 @@ async function main() {
     return u.pathname + u.search;
   }
   // H1 integration: result buttons are REMATCH / EDIT TEAM / BACK TO HUB for a battle with a team, REMATCH / NEW BATTLE / BACK TO HUB for a quick one
-  const resultOptionsFor = () => (params.team !== null ? ['REMATCH', 'EDIT TEAM', 'BACK TO HUB'] : ['REMATCH', 'NEW BATTLE', 'BACK TO HUB']);
+  let online = null;                                  // the networked match (online.js), or null for a battle against the CPU
+  const resultOptionsFor = () => (online ? ['REMATCH', 'BACK TO HUB'] : params.team !== null ? ['REMATCH', 'EDIT TEAM', 'BACK TO HUB'] : ['REMATCH', 'NEW BATTLE', 'BACK TO HUB']);
   // EDIT TEAM: find which saved team this battle was started with (the address carries only its code) and open the team builder on it
   async function editTeam() {
     let url = '/pokemonarena/editor.html';
@@ -263,6 +266,7 @@ async function main() {
   }
   let resumeStore = null, resuming = false;          // D11: the saved-battle record (cleared when the result is chosen, the battle is left or it ends); resuming = the saved history is being replayed (silent)
   function onResult(choice) {
+    if (online) { hook.resultChoice = choice; online.onResult(choice); return; }       // REMATCH asks the other player; BACK TO HUB leaves the room
     if (resumeStore) resumeStore.clear();
     hook.resultChoice = choice;
     whenCareerSettled(() => runResult(choice));
@@ -319,7 +323,10 @@ async function main() {
   const parsed = parseBattleQuery(location.search);
   if (!parsed.ok) { showError({ title: parsed.error.title, message: parsed.error.message, detail: 'Parameter: ' + parsed.error.param, kind: 'params', param: parsed.error.param }); return; }
   const params = parsed.params;
-  if (params.seed === null) {
+  // An online address (?online=1 or the lobby's ?np=CODE&host=1|join=1) is a battle against a person: the seed is agreed with them, not drawn here.
+  const onlineQuery = parseOnlineQuery(location.search);
+  if (onlineQuery && onlineQuery.error) { showError({ title: 'That address cannot be used', message: onlineQuery.error, detail: 'Parameter: np / host / join', kind: 'params', param: 'np' }); return; }
+  if (params.seed === null && !onlineQuery) {
     const a = new Uint32Array(1);
     if (window.crypto && window.crypto.getRandomValues) window.crypto.getRandomValues(a); else a[0] = (Date.now() >>> 0);
     params.seed = a[0] >>> 0;
@@ -349,7 +356,7 @@ async function main() {
       ui = createBattleUi(bytes);
       text = loadBattleText(bytes, manifest);
     } catch (e) { showError(romError(e)); return; }
-    const r = await resolveBattle(packRef, params);
+    const r = onlineQuery ? { ok: true, spec: null } : await resolveBattle(packRef, params);       // online: the teams and the seed come from the handshake
     if (!r.ok) { showError({ title: r.error.title, message: r.error.message, detail: r.error.detail || '', kind: 'params', param: r.error.param }); return; }
     // AN1: animation settings (`arena.anim`, `?anim=` `?speed=1|2|4` `?animskip=`) and the shared ROM move animator (move_anim.js). The animator is built only while
     // animations are on; a module that is missing or throws leaves the battle on the old lunge + blink and says why in hook.animError.
@@ -373,6 +380,71 @@ async function main() {
     let trainerPool = null; const trainerChoicesOf = () => trainerPool || (trainerPool = trainerChoices(bytes));          // AN1 round 4: the ROM trainers the CPU levels use for the foe picture (anim_sys.js)
     animCfg.onChange((c) => { if (c.on && !animTried) loadAnimator().then((a) => { if (a && scene) scene.setAnimator(a); }); });
     snd.events = []; snd.cries = [];
+    // what every scene hears of the page: the Controls dialog, the cries and sounds (silent while a saved battle is replayed), plus the per-mode result / quit handling
+    const mkHooks = (extra) => ({
+      onControls: openControls,
+      onSendOut: (side, sp) => { if (!resuming) playCryOf(sp, 'normal'); },
+      onFaint: (side, sp) => { if (!resuming) playCryOf(sp, 'faint'); },
+      onSound: (index, pan) => { if (!resuming && snd.events.length < 4096) snd.events.push([index, pan]); },
+      onCry: (species, pan) => { if (!resuming) { if (snd.cries.length < 1024) snd.cries.push([species, pan]); playCryOf(species, 'normal'); } },
+      ...extra,
+    });
+    // the first scene shows the screen: hide the boot panel, size the canvas, wire the input, publish the test hook and start the clock
+    const showReady = () => {
+      els.boot.hidden = true; els.err.hidden = true; canvas.hidden = false;
+      document.body.dataset.state = 'ready';
+      if (nav) { try { nav.disable(); } catch (_e) { /* ignore */ } }
+      touchPad = coarse();
+      fit();
+      wireInput();
+      hook.state = 'ready'; hook.kind = null; hook.error = null; hook.sha256 = sha256;
+      makeHook();
+      if (soundSys) { soundSys.setRom({ bytes, pack: packRef }); window.__arenaSound = soundSys; }       // MU3: the ROM's music; nothing is heard before the first click / tap / key
+      try { canvas.focus({ preventScroll: true }); } catch (_e) { /* ignore */ }
+      runLoop();
+    };
+
+    /* ---- ONLINE: a battle against a person. The scene is built when the handshake has produced the controller (and again for each rematch). ---- */
+    if (onlineQuery) {
+      let shown = false;
+      const mountOnlineScene = (c, info) => {
+        ctl = c; battleRuleset = c.netMeta.ruleset;
+        hook.seed = info.seed; hook.params.seed = info.seed;
+        scene = createScene({
+          ui, pack: packRef, text, ctl: c, viewSide: info.mySide, resultOptions: resultOptionsFor(), env: info.seed % 9, textSpeed: params.speed, meta: c.netMeta.meta,
+          trainer: info.oppName, playerName: 'You', trainerChoices: trainerChoicesOf(), cpuLevel: 'normal', clock: () => performance.now(), sound: soundApi, quitLabel: 'BACK TO HUB',
+          anim: animCfg, animator, animSeed: info.seed,
+          hooks: mkHooks({
+            onResult: onResult,
+            onMatchEnd: () => { try { scene.setCareer({ state: 'none', notes: ['Online battles are not kept', 'in your record yet.'] }); } catch (_e) { /* the result screen still shows */ } },
+            onQuit: () => online.leaveToHub(),
+          }),
+        });
+        scene.begin();
+        if (soundSys) soundSys.hookScene(scene);
+        if (scene.mode === 'steps') scene.tick();
+        hook.online = online;
+        if (!shown) { shown = true; showReady(); hook.mountCount = 1; }
+        else { hook.mountCount++; Object.assign(hook, { scene, ctl }); lastSig = ''; draw(true); }
+      };
+      try {
+        els.boot.hidden = true; document.body.dataset.state = 'online'; hook.state = 'online';
+        online = createOnline({
+          win: window, doc: document, pack: packRef, root: $('screenWrap'), bar: $('note'), query: onlineQuery, teamParam: params.team,
+          formatParam: new URLSearchParams(location.search).get('format'), fingerprint: engineFingerprint(packRef),
+          hooks: {
+            stage: (s) => { hook.onlineStage = s; },
+            mountScene: mountOnlineScene,
+            sceneState: () => ({ mode: scene ? scene.mode : null, pending: !!(ctl && online && online.state.info && ctl.pending(online.state.info.mySide)) }),
+            showFatal: ({ title, message }) => { canvas.hidden = true; showError({ title, message, kind: 'online' }); },
+            toHub: () => navigate('/pokemonarena/'),
+          },
+        });
+        window.__arenaOnline = online;
+        await online.begin();
+      } catch (e) { showError({ title: 'Online play could not start', message: String(e && e.message ? e.message : e), kind: 'internal' }); }
+      return;
+    }
     try {
       const spec = r.spec;
       battleRuleset = spec.ruleset;
@@ -384,7 +456,7 @@ async function main() {
       resumeStore = createResumeStore({ storage: store, key: resumeKey(location.pathname, location.search), seed: spec.seed });
       const rs = resumeStore.restore({ ctl, makeCtl, navType: navigationType() });
       ctl = rs.ctl; hook.resume = rs.info; resuming = rs.info.restored;
-      scene = createScene({ ui, pack: packRef, text, ctl, viewSide: 0, resultOptions: resultOptionsFor(), env: spec.seed % 9, textSpeed: params.speed, meta: spec.meta, trainer: spec.trainer, playerName: 'You', trainerChoices: trainerChoicesOf(), cpuLevel: spec.cpu, clock: () => performance.now(), sound: soundApi, quitLabel: 'BACK TO HUB', anim: animCfg, animator: resuming ? null : animator, animSeed: spec.seed, hooks: { onControls: openControls, onSendOut: (side, sp) => { if (!resuming) playCryOf(sp, 'normal'); }, onFaint: (side, sp) => { if (!resuming) playCryOf(sp, 'faint'); }, onSound: (index, pan) => { if (!resuming && snd.events.length < 4096) snd.events.push([index, pan]); }, onCry: (species, pan) => { if (!resuming) { if (snd.cries.length < 1024) snd.cries.push([species, pan]); playCryOf(species, 'normal'); } }, onResult: onResult, onMatchEnd: recordCareer, onQuit: () => { if (resumeStore) resumeStore.clear(); whenCareerSettled(() => navigate('/pokemonarena/')); } } });
+      scene = createScene({ ui, pack: packRef, text, ctl, viewSide: 0, resultOptions: resultOptionsFor(), env: spec.seed % 9, textSpeed: params.speed, meta: spec.meta, trainer: spec.trainer, playerName: 'You', trainerChoices: trainerChoicesOf(), cpuLevel: spec.cpu, clock: () => performance.now(), sound: soundApi, quitLabel: 'BACK TO HUB', anim: animCfg, animator: resuming ? null : animator, animSeed: spec.seed, hooks: mkHooks({ onResult: onResult, onMatchEnd: recordCareer, onQuit: () => { if (resumeStore) resumeStore.clear(); whenCareerSettled(() => navigate('/pokemonarena/')); } }) });
       scene.begin();
       if (resuming) { hook.resume.frames = scene.catchUp(); resuming = false; scene.setAnimator(animator); }
       if (soundSys) soundSys.hookScene(scene);       // MU3: hit / faint / send-out sounds and the animator's sound events -> the ROM's effects (hooked after a resume's silent replay)
@@ -392,17 +464,7 @@ async function main() {
       if (scene.mode === 'steps') scene.tick();       // AN1 round 4: begin() leaves the scene ONE tick short of its first screen (the team preview). Settle it before 'ready', so the first frame drawn and the first key pressed land on the preview (measured, desktop 1280x800: a key sent at ready was lost on 5 of 5 loads with animations on, 1 of 5 with them off)
     } catch (e) { showError({ title: 'The battle could not start', message: String(e && e.message ? e.message : e), detail: Array.isArray(e && e.detail) ? e.detail.slice(0, 3).map((x) => x.message || x.code).join('; ') : '', kind: 'internal' }); return; }
 
-    els.boot.hidden = true; els.err.hidden = true; canvas.hidden = false;
-    document.body.dataset.state = 'ready';
-    if (nav) { try { nav.disable(); } catch (_e) { /* ignore */ } }
-    touchPad = coarse();
-    fit();
-    wireInput();
-    hook.state = 'ready'; hook.kind = null; hook.error = null; hook.sha256 = sha256;
-    makeHook();
-    if (soundSys) { soundSys.setRom({ bytes, pack: packRef }); window.__arenaSound = soundSys; }       // MU3: the ROM's music; nothing is heard before the first click / tap / key
-    try { canvas.focus({ preventScroll: true }); } catch (_e) { /* ignore */ }
-    runLoop();
+    showReady();
   }
 
   /* ---- input ---- */

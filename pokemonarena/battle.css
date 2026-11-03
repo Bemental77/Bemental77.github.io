@@ -115,3 +115,32 @@ body[data-state="boot"] #menuBtn, body[data-state="error"] #menuBtn, body[data-s
 }
 body[data-layout="landscape"] #top { min-height: 44px; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+
+/* ONLINE (js/online.js): the setup panel that takes the screen's place until the handshake has produced the battle, and the status bar under it */
+#online { width: min(100%, 440px); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 18px 20px; text-align: left; }
+#online[hidden] { display: none; }
+#online h2 { margin: 0 0 6px; font-size: 18px; }
+#online .dim { margin: 0 0 12px; line-height: 1.4; }
+#online .row { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+#online .row[hidden], #online .field[hidden] { display: none; }
+#online .field { display: block; margin: 10px 0; }
+#online .field > span { display: block; font-size: 12px; color: var(--dim); margin-bottom: 4px; }
+#online input, #online select, #online textarea { width: 100%; min-height: 44px; padding: 8px 10px; background: #0e0e12; color: var(--fg); border: 1px solid var(--line); border-radius: 6px; font: inherit; font-size: 15px; }
+#online textarea { min-height: 76px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; resize: vertical; }
+#online input:focus-visible, #online select:focus-visible, #online textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+#online .textbtn.primary { background: #27466f; border-color: var(--accent); }
+#online .textbtn[aria-pressed="true"] { background: #27466f; border-color: var(--accent); }
+#online button:disabled, #online input:disabled, #online select:disabled, #online textarea:disabled { opacity: .55; cursor: default; }
+#online .code { margin: 12px 0 4px; padding: 12px; text-align: center; font: 700 30px/1.1 ui-monospace, Menlo, Consolas, monospace; letter-spacing: 6px; color: #9f9; background: #0e1013; border: 1px dashed #4a4; border-radius: 8px; user-select: all; }
+#online .code[hidden] { display: none; }
+#online .status { min-height: 20px; margin: 10px 0 0; font-size: 13px; color: #9aa; overflow-wrap: anywhere; }
+#online .status.bad { color: #f88; }
+#netbar { width: 100%; max-width: 640px; display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); font-size: 13px; }
+#netbar #nbWho { color: var(--accent); font-weight: 600; white-space: nowrap; }
+#netbar #nbMsg { flex: 1 1 auto; min-width: 0; color: var(--fg); overflow-wrap: anywhere; }
+#netbar #nbClock { font-variant-numeric: tabular-nums; color: var(--dim); white-space: nowrap; }
+#netbar[data-kind="warn"] #nbMsg { color: #fc8; }
+#netbar[data-kind="bad"] #nbMsg { color: #f88; }
+#netbar[data-kind="ok"] #nbMsg { color: #9f9; }
+#netbar[data-low="1"] #nbClock { color: #f88; font-weight: 700; }

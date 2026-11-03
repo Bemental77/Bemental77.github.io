@@ -10,7 +10,10 @@
   <link rel="stylesheet" href="/pokemonarena/battle.css" />
   <link rel="stylesheet" href="/pokemonarena/input.css" />
   <!-- The game library's origin: ONE constant for the whole site (see lib/asset_base.js). The ROM URL is built from it in js/romfetch.js. -->
-  <script src="/lib/asset_base.js"></script>
+  <script src="/lib/asset_base.js?v=27d8c0a4"></script>
+  <!-- Online play (js/online.js): the pairing, the host's approval of the joiner, ICE / relay fallback. Loaded for every battle so the ?v= stamp that tells two
+       players on different builds apart is on the page at DOMContentLoaded; tools/stamp_lib_versions.mjs keeps it current. -->
+  <script src="/lib/netplay.js?v=d6f2aba1"></script>
 </head>
 <body data-state="boot" data-layout="portrait" data-pad="off">
   <header id="top">
