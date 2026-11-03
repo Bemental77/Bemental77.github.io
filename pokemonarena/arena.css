@@ -78,7 +78,7 @@ code { background: #000; padding: 1px 5px; border-radius: 3px; font-size: 12px; 
 
 #note { margin: 0; max-width: 640px; text-align: center; }
 #romStatus { margin: 0; max-width: 640px; text-align: center; }
-#keys { margin: 0; text-align: center; max-width: 640px; }
+#keys { margin: 0; text-align: center; max-width: 640px; min-height: 32px; }       /* two lines of hint, always: the line shortens when the player switches device, and the picture is sized around its height */
 body[data-pad="on"] #keys { display: none; }
 body[data-state="boot"] #keys, body[data-state="error"] #keys, body[data-state="boot"] #romStatus, body[data-state="error"] #romStatus { display: none; }
 body[data-state="boot"] #controlsBtn, body[data-state="error"] #controlsBtn, body[data-state="error"] #soundBtn { visibility: hidden; }       /* D7: an error screen carries no header buttons that need the game (the same on the hub, the battle page and the editor) */
@@ -112,3 +112,47 @@ body[data-state="boot"] #controlsBtn, body[data-state="error"] #controlsBtn, bod
 }
 body[data-layout="landscape"] #top { min-height: 44px; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+/* FILL THE SCREEN, AND FULLSCREEN (js/screenfit.js; the same rules as battle.css).
+   The picture takes all the room it is given. On a touch screen it runs edge to edge with no frame (body[data-edge="1"]: a phone held upright, or fullscreen), the
+   controls sit at the bottom where the thumbs are, and the Fullscreen switch is a corner-bracket button: in the header, and (while the header is hidden for a phone
+   held sideways in fullscreen) a floating one at the top left, above the d-pad. */
+.iconbtn { padding: 0; width: 44px; flex: 0 0 auto; }
+.ic { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; }
+.iconbtn[aria-pressed="true"] .ic-enter, .iconbtn[aria-pressed="false"] .ic-exit { display: none; }
+#top #fullBtn { order: 3; }
+#top .tools { order: 2; }
+#fullExit { display: none; position: fixed; z-index: 30; left: max(8px, env(safe-area-inset-left)); top: max(8px, env(safe-area-inset-top)); background: rgba(26, 26, 31, .85); }
+body[data-full="1"][data-layout="landscape"] #fullExit { display: inline-flex; }
+body[data-full="1"][data-layout="landscape"] #top { display: none; }
+
+/* no frame on a touch screen or in fullscreen: the frame costs 4 px of the picture, and the picture is the point. The focus ring moves inside it. */
+body[data-pad="on"] canvas#hub, body[data-edge="1"] canvas#hub, body[data-full="1"] canvas#hub { border-width: 0; border-radius: 0; }
+body[data-pad="on"] canvas#hub:focus-visible, body[data-edge="1"] canvas#hub:focus-visible, body[data-full="1"] canvas#hub:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* edge to edge: the screen's box reaches over the page's gutters (the margin-box stays the grid area, so nothing widens the page) */
+body[data-edge="1"] #screenWrap { margin-inline: calc(var(--gutter) * -1); width: calc(100% + var(--gutter) * 2); max-width: none; }
+
+/* a phone held upright: the picture is as wide as the phone allows (its height is whatever 3:2 gives), so the room under it goes to the controls, at the bottom;
+   the link to the online lobby stays up under the header, where it is seen */
+body[data-pad="on"][data-layout="portrait"] #top { order: -2; }
+body[data-pad="on"][data-layout="portrait"] #onlineLink { order: -1; }
+body[data-pad="on"][data-layout="portrait"] #play { flex: 1 1 auto; grid-template-rows: auto 1fr; }
+body[data-pad="on"][data-layout="portrait"] #dpad, body[data-pad="on"][data-layout="portrait"] #ab { align-self: end; margin-bottom: 6px; }
+
+/* the header on a phone stays ONE row (the way back, Sound, Controls, Fullscreen fit in 288 px): a second row would push the bottom touch buttons off a 568 px screen */
+@media (max-width: 480px) {
+  #top .home { flex: 1 1 auto; }
+}
+
+/* fullscreen on a phone held sideways: the header is gone, so the pads take the compact sizes and the picture the rest */
+body[data-full="1"][data-layout="landscape"] #dpad { grid-template-columns: repeat(3, 44px); grid-template-rows: repeat(3, 44px); gap: 4px; }
+body[data-full="1"][data-layout="landscape"] #dpad .pbtn { width: 44px; height: 44px; font-size: 18px; }
+body[data-full="1"][data-layout="landscape"] #ab .abrow { gap: 8px; }
+body[data-full="1"][data-layout="landscape"] #ab .pbtn { width: 52px; height: 52px; border-radius: 26px; }
+body[data-full="1"][data-layout="landscape"] #ab #bB { margin-top: 18px; }
+body[data-full="1"][data-layout="landscape"] { padding-left: max(8px, env(safe-area-inset-left)); padding-right: max(8px, env(safe-area-inset-right)); }
+body[data-full="1"][data-layout="landscape"] #play { gap: 6px; }
+/* the boot and error panels live inside the screen's box, which now reaches the screen's edges: they keep the page's gutters */
+body[data-edge="1"] #boot, body[data-edge="1"] #error { width: min(calc(100% - var(--gutter) * 2), 440px); }
+/* an error screen has no game to fullscreen: its header carries the same buttons as the editor's (coherence test D7) */
+body[data-state="error"] #fullBtn, body[data-state="error"] #fullExit { visibility: hidden; }

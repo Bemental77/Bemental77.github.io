@@ -144,3 +144,51 @@ body[data-layout="landscape"] #top { min-height: 44px; }
 #netbar[data-kind="bad"] #nbMsg { color: #f88; }
 #netbar[data-kind="ok"] #nbMsg { color: #9f9; }
 #netbar[data-low="1"] #nbClock { color: #f88; font-weight: 700; }
+
+/* FILL THE SCREEN, AND FULLSCREEN (js/screenfit.js).
+   The picture takes all the room it is given. On a touch screen it runs edge to edge with no frame (body[data-edge="1"]: a phone held upright, or fullscreen), the
+   controls sit at the bottom where the thumbs are, and the Fullscreen switch is a corner-bracket button: in the header, and (while the header is hidden for a phone
+   held sideways in fullscreen) a floating one at the top left, above the d-pad. */
+.iconbtn { padding: 0; width: 44px; flex: 0 0 auto; }
+.ic { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; }
+.iconbtn[aria-pressed="true"] .ic-enter, .iconbtn[aria-pressed="false"] .ic-exit { display: none; }
+#top #fullBtn { order: 3; }
+#top .tools { order: 2; }
+#fullExit { display: none; position: fixed; z-index: 30; left: max(8px, env(safe-area-inset-left)); top: max(8px, env(safe-area-inset-top)); background: rgba(26, 26, 31, .85); }
+body[data-full="1"][data-layout="landscape"] #fullExit { display: inline-flex; }
+body[data-full="1"][data-layout="landscape"] #top { display: none; }
+
+/* no frame on a touch screen or in fullscreen: the frame costs 4 px of the picture, and the picture is the point. The focus ring moves inside it. */
+body[data-pad="on"] canvas#battle, body[data-edge="1"] canvas#battle, body[data-full="1"] canvas#battle { border-width: 0; border-radius: 0; }
+body[data-pad="on"] canvas#battle:focus-visible, body[data-edge="1"] canvas#battle:focus-visible, body[data-full="1"] canvas#battle:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* edge to edge: the screen's box reaches over the page's gutters (the margin-box stays the grid area, so nothing widens the page) */
+body[data-edge="1"] #screenWrap { margin-inline: calc(var(--gutter) * -1); width: calc(100% + var(--gutter) * 2); max-width: none; }
+
+/* a phone held upright: the picture is as wide as the phone allows (its height is whatever 3:2 gives), so the room under it goes to the controls, at the bottom */
+body[data-pad="on"][data-layout="portrait"] #top { order: -2; }
+body[data-pad="on"][data-layout="portrait"] #netbar { order: -1; }
+body[data-pad="on"][data-layout="portrait"] #play { flex: 1 1 auto; grid-template-rows: auto 1fr; }
+body[data-pad="on"][data-layout="portrait"] #dpad, body[data-pad="on"][data-layout="portrait"] #ab { align-self: end; margin-bottom: 6px; }
+
+/* the header on a phone: row 1 = the way back and the Fullscreen switch, row 2 = Sound, Controls, Menu at equal widths */
+@media (max-width: 480px) {
+  #top .home { flex: 1 1 auto; }
+  #top #fullBtn { order: 1; }
+  #top .tools { order: 2; flex: 1 1 100%; margin-left: 0; }
+  #top .tools .textbtn { flex: 1 1 0; }
+}
+
+/* fullscreen on a phone held sideways: the header is gone, so the pads take the compact sizes (the same as a phone short enough to need them) and the picture the rest */
+body[data-full="1"][data-layout="landscape"] #dpad { grid-template-columns: repeat(3, 44px); grid-template-rows: repeat(3, 44px); gap: 4px; }
+body[data-full="1"][data-layout="landscape"] #dpad .pbtn { width: 44px; height: 44px; font-size: 18px; }
+body[data-full="1"][data-layout="landscape"] #ab { gap: 4px; }
+body[data-full="1"][data-layout="landscape"] #ab .abrow { gap: 8px; }
+body[data-full="1"][data-layout="landscape"] #ab .pbtn { width: 52px; height: 52px; border-radius: 26px; }
+body[data-full="1"][data-layout="landscape"] #ab .pbtn.small { width: 44px; height: 44px; }
+body[data-full="1"][data-layout="landscape"] #ab .abrow:last-child #bB { margin-top: 18px; }
+body[data-full="1"][data-layout="landscape"] { padding-left: max(8px, env(safe-area-inset-left)); padding-right: max(8px, env(safe-area-inset-right)); }
+body[data-full="1"][data-layout="landscape"] #play { gap: 6px; }
+/* the boot, error and online-setup panels live inside the screen's box, which now reaches the screen's edges: they keep the page's gutters */
+body[data-edge="1"] #boot, body[data-edge="1"] #error, body[data-edge="1"] #online { width: min(calc(100% - var(--gutter) * 2), 440px); }
+/* an error screen has no game to fullscreen: its header carries the same buttons as the editor's (coherence test D7) */
+body[data-state="error"] #fullBtn, body[data-state="error"] #fullExit { visibility: hidden; }

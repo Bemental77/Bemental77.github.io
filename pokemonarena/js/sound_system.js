@@ -198,7 +198,8 @@ export function createSoundSystem(opts = {}) {
     if (win && typeof win.addEventListener === 'function') win.addEventListener('resize', placePrompt);
   }
   // ---- where the prompt sits: a spot where it covers nothing the player needs ----
-  const PROMPT_OBSTACLES = ['canvas', '#dpad', '#ab', '#keys', '#romStatus', '#note'];      // the picture, the touch pad (both clusters), the footer lines; the header's own children are added below
+  const PROMPT_OBSTACLES = ['canvas', '#dpad', '#ab', '#onlineLink', '#keys', '#romStatus', '#note'];      // the picture, the touch pad (both clusters), the hub's link to the online lobby, the footer lines; the header's own children are added below
+  const PROMPT_FOOTERS = ['#keys', '#romStatus', '#note'];                                    // the dim lines under the page: the cheapest things to cover when nothing is free
   function rectOf(el) {
     try { const r = el.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) return null; const cs = win.getComputedStyle(el); return cs.display === 'none' || cs.visibility === 'hidden' ? null : r; } catch (_e) { return null; }
   }
@@ -217,10 +218,10 @@ export function createSoundSystem(opts = {}) {
     const p = S.prompt;
     if (!p || p.hidden || !win || !doc) return;
     const vw = doc.documentElement.clientWidth, vh = win.innerHeight, G = 8, PAD = 2;
-    const obs = []; let canvasPage = false;
-    for (const sel of PROMPT_OBSTACLES) { const el = doc.querySelector(sel); const r = el ? rectOf(el) : null; if (r) { obs.push(r); if (sel === 'canvas') canvasPage = true; } }
+    const obs = [], wts = []; let canvasPage = false;          // wts: what covering each costs. The picture, the touch pad and the header's controls cost 10; a dim footer line costs 1, so on a page too full for a free spot the pill goes over a footer line, never over a touch button
+    for (const sel of PROMPT_OBSTACLES) { const el = doc.querySelector(sel); const r = el ? rectOf(el) : null; if (r) { obs.push(r); wts.push(PROMPT_FOOTERS.includes(sel) ? 1 : 10); if (sel === 'canvas') canvasPage = true; } }
     const head = doc.getElementById('top'); const headBox = head ? rectOf(head) : null; const kids = [];
-    if (head) for (const k of Array.from(head.children)) { const r = ownRect(k); if (r) { obs.push(r); kids.push(r); } }
+    if (head) for (const k of Array.from(head.children)) { const r = ownRect(k); if (r) { obs.push(r); wts.push(10); kids.push(r); } }
     const lowest = obs.reduce((m, o) => Math.max(m, o.bottom), 0);
     // the widest free stretch of the header's first row
     let gap = null;
@@ -239,13 +240,16 @@ export function createSoundSystem(opts = {}) {
         p.style.maxWidth = ww + 'px'; p.style.left = '0px'; p.style.top = '0px';
         const r = p.getBoundingClientRect(), pw = r.width, ph = r.height;
         const cands = [];
+        // directly under the picture first when the room under it is free (a phone held upright keeps its controls at the bottom, so the free room is the band between the two),
+        // then under everything (a page whose controls sit right under the picture leaves it below them)
+        if (canvasPage) { const cv = doc.querySelector('canvas'), cr = cv ? rectOf(cv) : null; if (cr) cands.push([(vw - pw) / 2, cr.bottom + G]); }
         if (canvasPage) cands.push([(vw - pw) / 2, lowest + G]);
         cands.push([(vw - pw) / 2, vh - ph - G], [G, vh - ph - G], [vw - pw - G, vh - ph - G], [G, (vh - ph) / 2], [vw - pw - G, (vh - ph) / 2]);
         if (withHeader && gap && headBox && gap.w - 2 * G >= pw) cands.push([gap.x + G + (gap.w - 2 * G - pw) / 2, headBox.top + (headBox.height - ph) / 2]);       // LAST RESORT: it floats between the title and the buttons, which looks like part of the header
         for (const [cx, cy] of cands) {
           const box = { left: cx, top: cy, right: cx + pw, bottom: cy + ph };
           if (box.left < 0 || box.top < 0 || box.right > vw || box.bottom > vh) continue;
-          const ov = obs.reduce((s, o) => s + (hits(box, o, PAD) ? 1 : 0), 0);
+          const ov = obs.reduce((s, o, i) => s + (hits(box, o, PAD) ? wts[i] : 0), 0);
           if (!best || ov < best.ov) best = { x: cx, y: cy, w: ww, ov, kind };
           if (ov === 0) return true;
         }

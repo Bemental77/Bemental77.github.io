@@ -343,10 +343,10 @@ try {
   const sigs = await browserSession(BASE, WIDTHS, 'real');
   headerChecks(sigs, 'real');
 
-  // the picture scales by WHOLE DEVICE PIXELS inside the 16 px gutters: at DPR 2, 3x is 360 css px and (with the canvas border) needs a 396 px viewport; a 390 px
-  // phone has 358 px between its gutters and keeps 2x. (Nothing may shrink the gutters or smooth the picture to make 390 reach 3x.)
+  // THE PICTURE FILLS A PHONE (js/screenfit.js): held upright it runs edge to edge, the whole width of the screen, no gutters and no frame. This block used to assert the opposite
+  // (a whole number of device pixels INSIDE the 16 px gutters: 240 css px on a 390 px phone at DPR 2, 324 at DPR 3), which is exactly the small picture a phone owner complained about.
   {
-    const cases = [{ w: 390, dpr: 2, css: 240 }, { w: 396, dpr: 2, css: 360 }, { w: 412, dpr: 2, css: 360 }, { w: 390, dpr: 3, css: 320 }, { w: 360, dpr: 3, css: 320 }];
+    const cases = [{ w: 390, dpr: 2, css: 390 }, { w: 396, dpr: 2, css: 396 }, { w: 412, dpr: 2, css: 412 }, { w: 390, dpr: 3, css: 390 }, { w: 360, dpr: 3, css: 360 }, { w: 360, dpr: 2, css: 360 }, { w: 320, dpr: 2, css: 320 }];
     let port = Number(process.env.ARENA_CDP || 9331) + 40;
     for (const c of cases) {
       await withBrowser({ port: port++, width: c.w, height: 844, mobile: true }, async (page) => {
@@ -356,7 +356,7 @@ try {
           await page.navigate(BASE + pg.url);
           await page.waitFor(pg.ready, { timeoutMs: 120000 });
           const g = await page.eval(`(() => { const c = document.querySelector('canvas#hub, canvas#battle'); const b = c.getBoundingClientRect(); return { css: Math.round(parseFloat(c.style.width) * 100) / 100, total: Math.round(b.width), left: Math.round(b.left), scrollW: document.documentElement.scrollWidth, innerW: innerWidth }; })()`);
-          ok(g.css === c.css && g.left >= 16 && g.left + g.total <= c.w - 16 + 0.5 && g.scrollW <= g.innerW, pg.name + ' at ' + c.w + ' px, DPR ' + c.dpr + ': the canvas is ' + c.css + ' css px (' + (c.css * c.dpr / 240) + 'x whole device pixels), inside the 16 px gutters, no sideways scroll', J(g));
+          ok(g.css === c.css && g.left === 0 && g.total === c.w && g.scrollW <= g.innerW, pg.name + ' at ' + c.w + ' px, DPR ' + c.dpr + ': the canvas is ' + c.css + ' css px, the whole width of the phone (' + (c.css * c.dpr / 240).toFixed(2) + ' device pixels per source pixel), edge to edge, no sideways scroll', J(g));
         }
       });
     }

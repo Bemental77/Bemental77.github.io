@@ -766,7 +766,8 @@ try {
     const p = await logicalToPage(page, `${HUB}.canvas`, 60, mainY(2));
     await moveMouse(page, p.x, p.y); await sleep(800);                                               // ... with a real mouse attached (the layout follows the gesture by 450 ms)
     r.afterMouse = await page.eval(`document.body.dataset.pad`);
-    await page.tap(p.x, p.y); await sleep(800);
+    const p2 = await logicalToPage(page, `${HUB}.canvas`, 60, mainY(2));                              // the picture fills the room the pad gave back, so it has moved: the point is found again, not reused
+    await page.tap(p2.x, p2.y); await sleep(800);
     r.afterTouch = await page.eval(`document.body.dataset.pad`);
     return r;
   }

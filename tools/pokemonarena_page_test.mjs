@@ -94,20 +94,36 @@ async function checkRomfetch(R) {
 
 /* ============================================================================ Node units: scale / query / keys */
 
+// THE RULE (js/screenfit.js): the picture takes the whole room it is given (3:2), snapped to a whole device-pixel scale only when that costs under 6 %.
+// The old rule was floor-only, which is why a phone showed a small picture: 358 css px @3x was given 4x = 320 px, 390 @3x was given 324, 360 @2x was given 244.
 function checkScale(computeScale) {
   const f = []; const t = (n, c) => { if (!c) f.push(n); };
-  let r = computeScale({ availW: 358, availH: 600, dpr: 3 }); t('phone 358x600 @3x -> 4x (320 css px)', r.k === 4 && r.cssW === 320 && Math.abs(r.cssH - 640 / 3) < 1e-9);
-  r = computeScale({ availW: 1248, availH: 600, dpr: 1 }); t('desktop 1248x600 @1x -> 3x', r.k === 3 && r.cssW === 720 && r.cssH === 480);
-  r = computeScale({ availW: 1248, availH: 640, dpr: 1 }); t('height exactly 4x -> 4x', r.k === 4);
-  r = computeScale({ availW: 1248, availH: 639, dpr: 1 }); t('one pixel short of 4x -> 3x', r.k === 3);
-  r = computeScale({ availW: 358, availH: 500, dpr: 1.5 }); t('fractional dpr 1.5: 358 css = 537 device px -> 2x = 320 css', r.k === 2 && r.cssW === 320);
-  r = computeScale({ availW: 100, availH: 50, dpr: 1 }); t('tiny viewport still draws at 1x', r.k === 1 && r.cssW === 240);
-  r = computeScale({ availW: 400, availH: 4000, dpr: 2 }); t('width-limited @2x: 400 css = 800 device -> 3x', r.k === 3 && r.cssW === 360);
-  // property: the canvas is always an integer number of DEVICE pixels per source pixel, and fits unless it is already 1x
+  const near = (a, b) => Math.abs(a - b) < 1e-6;
+  let r = computeScale({ availW: 390, availH: 600, dpr: 3 }); t('iPhone-wide room 390x600 @3x FILLS the width (390 css px, not the 324 a whole 4x gave)', near(r.cssW, 390) && near(r.cssH, 260) && !r.whole && near(r.k, 4.875));
+  r = computeScale({ availW: 358, availH: 600, dpr: 3 }); t('358x600 @3x fills 358 css px (the old rule gave 320)', near(r.cssW, 358));
+  r = computeScale({ availW: 360, availH: 600, dpr: 2 }); t('a 360 px phone @2x fills 360 css px (3x exactly; the old rule gave 2x = 240)', r.k === 3 && r.whole && near(r.cssW, 360));
+  r = computeScale({ availW: 1248, availH: 600, dpr: 1 }); t('desktop 1248x600 @1x fills the height: 900x600 (the old rule gave 720x480)', near(r.cssH, 600) && near(r.cssW, 900));
+  r = computeScale({ availW: 1248, availH: 640, dpr: 1 }); t('height exactly 4x -> 4x, whole', r.k === 4 && r.whole && r.cssW === 960);
+  r = computeScale({ availW: 1248, availH: 639, dpr: 1 }); t('one pixel short of 4x fills the 639 (it does not drop to 3x)', near(r.cssH, 639) && !r.whole);
+  r = computeScale({ availW: 1248, availH: 650, dpr: 1 }); t('within 6 % above a whole scale: keeps the whole 4x (650 -> 640)', r.k === 4 && r.whole && r.cssH === 640);
+  r = computeScale({ availW: 1248, availH: 680, dpr: 1 }); t('4.25x of room (4 is 94.1 % of it): keeps 4x', r.k === 4 && r.whole);
+  r = computeScale({ availW: 1248, availH: 683.2, dpr: 1 }); t('4.27x of room (4 is 93.7 % of it): fills', !r.whole && near(r.cssH, 683.2));
+  r = computeScale({ availW: 1248, availH: 560, dpr: 1 }); t('3.5x of room fills (a 3x here would waste 14 %)', !r.whole && near(r.cssH, 560));
+  r = computeScale({ availW: 358, availH: 500, dpr: 1.5 }); t('fractional dpr 1.5: 358 css fills 358 css', near(r.cssW, 358));
+  r = computeScale({ availW: 100, availH: 50, dpr: 1 }); t('a room smaller than the picture still draws it 1:1', r.k === 1 && r.cssW === 240 && r.cssH === 160);
+  r = computeScale({ availW: 400, availH: 4000, dpr: 2 }); t('width-limited @2x: 400 css fills 400 css', near(r.cssW, 400));
+  // properties over a grid of rooms and densities
   for (let w = 120; w <= 1600; w += 37) for (const h of [200, 333, 640, 901]) for (const dpr of [1, 1.25, 1.5, 2, 2.625, 3]) {
     const s = computeScale({ availW: w, availH: h, dpr });
-    if (Math.abs(s.cssW * dpr - 240 * s.k) > 1e-6 || Math.abs(s.cssH * dpr - 160 * s.k) > 1e-6) { t('integer device scale at ' + w + 'x' + h + '@' + dpr, false); w = 1e9; break; }
-    if (s.k > 1 && (s.cssW > w + 1e-6 || s.cssH > h + 1e-6)) { t('fits at ' + w + 'x' + h + '@' + dpr, false); w = 1e9; break; }
+    const room = Math.min((w * dpr) / 240, (h * dpr) / 160);
+    const where = ' at ' + w + 'x' + h + '@' + dpr;
+    if (Math.abs((s.cssW * 2) / 3 - s.cssH) > 1e-6) { t('the picture keeps its 3:2 shape' + where, false); w = 1e9; break; }
+    if (room < 1) { if (!(s.k === 1 && s.cssW === 240 / dpr)) { t('below 1x of room it is drawn 1:1' + where, false); w = 1e9; break; } continue; }
+    if (s.cssW > w + 1e-6 || s.cssH > h + 1e-6) { t('it never exceeds its room' + where, false); w = 1e9; break; }
+    if (Math.max(s.cssW / w, s.cssH / h) < 0.94 - 1e-9) { t('it fills at least 94 % of one axis of its room' + where, false); w = 1e9; break; }
+    if (s.whole && Math.abs(s.k - Math.round(s.k)) > 1e-9) { t('"whole" means a whole number of device pixels' + where, false); w = 1e9; break; }
+    if (!s.whole && !(near(s.cssW, w) || near(s.cssH, h))) { t('a filled picture touches the room on one axis' + where, false); w = 1e9; break; }
+    if (Math.abs(s.cssW * dpr - 240 * s.k) > 1e-6) { t('k is the number of device pixels per source pixel' + where, false); w = 1e9; break; }
   }
   return f;
 }
@@ -115,11 +131,18 @@ function checkScale(computeScale) {
   const real = checkScale(BOOT.computeScale);
   ok(real.length === 0, 'U2. computeScale passes every check', real.slice(0, 4).join('; '));
   ok(checkScale(BOOT.computeScale).length === 0, 'U2. unmutated twin stays quiet');
+  const floorOnly = ({ availW, availH, dpr = 1 }) => { const k = Math.max(1, Math.floor(Math.min((availW * dpr) / 240, (availH * dpr) / 160) + 1e-9)); return { k, cssW: (240 * k) / dpr, cssH: (160 * k) / dpr, whole: true }; };
+  const fill = (snap) => ({ availW, availH, dpr = 1 }) => { const e = Math.min((availW * dpr) / 240, (availH * dpr) / 160); if (!(e >= 1)) return { k: 1, cssW: 240 / dpr, cssH: 160 / dpr, whole: true }; const wk = Math.floor(e + 1e-9); if (wk / e >= snap) return { k: wk, cssW: (240 * wk) / dpr, cssH: (160 * wk) / dpr, whole: true }; const cssW = Math.min(availW, (availH * 240) / 160); return { k: (cssW * dpr) / 240, cssW, cssH: (cssW * 160) / 240, whole: false }; };
   const mut = {
-    'rounds instead of flooring (overflows)': ({ availW, availH, dpr = 1 }) => { const k = Math.max(1, Math.round(Math.min((availW * dpr) / 240, (availH * dpr) / 160))); return { k, cssW: (240 * k) / dpr, cssH: (160 * k) / dpr }; },
-    'ignores devicePixelRatio': ({ availW, availH }) => { const k = Math.max(1, Math.floor(Math.min(availW / 240, availH / 160))); return { k, cssW: 240 * k, cssH: 160 * k }; },
-    'fractional (non-integer) scale': ({ availW, availH }) => { const k = Math.min(availW / 240, availH / 160); return { k, cssW: 240 * k, cssH: 160 * k }; },
-    'uses the larger axis': ({ availW, availH, dpr = 1 }) => { const k = Math.max(1, Math.floor(Math.max((availW * dpr) / 240, (availH * dpr) / 160))); return { k, cssW: (240 * k) / dpr, cssH: (160 * k) / dpr }; },
+    'the OLD rule: a whole scale only (floor) - the picture is small on a phone': floorOnly,
+    'rounds instead of flooring (overflows)': ({ availW, availH, dpr = 1 }) => { const k = Math.max(1, Math.round(Math.min((availW * dpr) / 240, (availH * dpr) / 160))); return { k, cssW: (240 * k) / dpr, cssH: (160 * k) / dpr, whole: true }; },
+    'ignores devicePixelRatio': ({ availW, availH }) => { const k = Math.max(1, Math.floor(Math.min(availW / 240, availH / 160))); return { k, cssW: 240 * k, cssH: 160 * k, whole: true }; },
+    'always fractional (never snaps to a whole scale)': fill(2),
+    'snaps too eagerly (whole scale kept down to 80 %)': fill(0.8),
+    'snaps to a whole scale at 99.9 % only': fill(0.999),
+    'fills with the larger axis (overflows)': ({ availW, availH, dpr = 1 }) => { const cssW = Math.max(availW, (availH * 240) / 160); return { k: (cssW * dpr) / 240, cssW, cssH: (cssW * 160) / 240, whole: false }; },
+    'a room under 1x shrinks the picture below its own size': ({ availW, availH, dpr = 1 }) => { const k = Math.min((availW * dpr) / 240, (availH * dpr) / 160); return { k, cssW: (240 * k) / dpr, cssH: (160 * k) / dpr, whole: false }; },
+    'stretches to the room (loses the 3:2 shape)': ({ availW, availH, dpr = 1 }) => ({ k: (availW * dpr) / 240, cssW: availW, cssH: availH, whole: false }),
   };
   for (const [n, m] of Object.entries(mut)) { const r = checkScale(m); ok(r.length > 0, 'U2. mutant "' + n + '" is caught', r.length ? r[0] : 'NOT CAUGHT'); }
 }
@@ -236,9 +259,12 @@ async function commonChecks(page, tag, { pad }) {
   ok(c.distinct >= 30 && c.distinct <= 4096 && c.topShare < 0.6, tag + ': canvas is not blank (distinct colours ' + c.distinct + ', most common share ' + c.topShare.toFixed(2) + ')', J(c));
   const scroll = await page.eval('({ sw: document.documentElement.scrollWidth, bw: document.body.scrollWidth, iw: window.innerWidth })');
   ok(scroll.sw <= scroll.iw && scroll.bw <= scroll.iw, tag + ': no horizontal scroll (scrollWidth ' + scroll.sw + ' / body ' + scroll.bw + ' <= innerWidth ' + scroll.iw + ')', J(scroll));
-  const sc = await page.eval("({ w: parseFloat(document.getElementById('hub').style.width), h: parseFloat(document.getElementById('hub').style.height), dpr: window.devicePixelRatio })");
-  const kk = Math.round((sc.w * sc.dpr) / 240);   // style.height is serialised to 3 decimals, hence the 0.02 device-pixel tolerance
-  ok(kk >= 1 && Math.abs(sc.w * sc.dpr - 240 * kk) < 0.02 && Math.abs(sc.h * sc.dpr - 160 * kk) < 0.02, tag + ': canvas is an integer number of device pixels per source pixel (' + sc.w.toFixed(2) + 'x' + sc.h.toFixed(2) + ' css @' + sc.dpr + 'x = ' + kk + 'x)', J(sc));
+  const sc = await page.eval("(() => { const c = document.getElementById('hub'), r = c.getBoundingClientRect(), k = window.__arenaHub.scale; return { w: parseFloat(c.style.width), h: parseFloat(c.style.height), cw: r.width, ch: r.height, dpr: window.devicePixelRatio, vw: document.documentElement.clientWidth, vh: innerHeight, k: k && k.k, whole: k && k.whole, edge: document.body.dataset.edge, pad: document.body.dataset.pad, border: parseFloat(getComputedStyle(c).borderLeftWidth) }; })()");
+  // THE PICTURE FILLS ITS ROOM (screenfit.js). On a phone held upright it runs edge to edge: the whole width of the screen. On a desktop it is 3:2 and either a whole scale or the room's full size.
+  const inW = sc.cw - 2 * sc.border, inH = sc.ch - 2 * sc.border;         // the frame (2 px on a desktop, none on a touch screen) is outside the 240x160 picture
+  ok(Math.abs(inW / inH - 1.5) < 0.01 && Math.abs(sc.w - inW) < 0.5, tag + ': the picture is 3:2 and the size the page set (' + inW.toFixed(1) + 'x' + inH.toFixed(1) + ' css @' + sc.dpr + 'x, k=' + (sc.k && sc.k.toFixed(3)) + ')', J(sc));
+  ok(Math.abs(sc.w * sc.dpr - 240 * sc.k) < 0.02, tag + ': k is the device pixels per source pixel the picture really has', J(sc));
+  if (pad && sc.vw < sc.vh) ok(sc.edge === '1' && sc.border === 0 && Math.abs(sc.cw - sc.vw) < 0.5, tag + ': a phone held upright: the picture runs edge to edge (' + sc.cw.toFixed(1) + ' of ' + sc.vw + ' css px wide, no frame)', J(sc));
   const aspect = await page.eval("(() => { const r = document.getElementById('hub').getBoundingClientRect(); const cs = getComputedStyle(document.getElementById('hub')); return { r: [r.left, r.right, r.top, r.bottom], ir: cs.imageRendering, vw: document.documentElement.clientWidth, vh: innerHeight }; })()");
   ok(/pixelated|crisp/.test(aspect.ir), tag + ': image-rendering is ' + aspect.ir);
   ok(aspect.r[0] >= 0 && aspect.r[1] <= aspect.vw + 0.5, tag + ': the canvas sits inside the viewport width');
@@ -254,10 +280,13 @@ async function commonChecks(page, tag, { pad }) {
   const btns = await page.eval("[...document.querySelectorAll('.pbtn')].map((b) => { const r = b.getBoundingClientRect(); return { id: b.id, w: r.width, h: r.height, vis: r.width > 0 && r.height > 0 && getComputedStyle(b).visibility !== 'hidden' && b.offsetParent !== null }; })");
   if (pad) ok(btns.length === 6 && btns.every((b) => b.vis && b.w >= 44 && b.h >= 44), tag + ': all 6 touch buttons are visible and >= 44 px (min ' + Math.min(...btns.map((b) => Math.min(b.w, b.h))).toFixed(0) + ' px)', J(btns));
   else ok(btns.every((b) => !b.vis), tag + ': touch buttons are hidden on a desktop without touch');
-  // header: one row, every control >= 44 px, nothing wrapped
-  const head = await page.eval("(() => { const t = document.getElementById('top'); const kids = [...t.querySelectorAll('a, button')].map((e) => { const r = e.getBoundingClientRect(); return { id: e.id || e.className, w: r.width, h: r.height, top: r.top }; }); const home = document.getElementById('homeLink'); const hr = home.getBoundingClientRect(); return { kids, homeH: hr.height, tops: [...new Set(kids.map((k) => Math.round(k.top)))] }; })()");
+  // header: one row at every width (the way back, Sound, Controls and the Fullscreen switch fit in 288 px; a second row pushed the bottom touch buttons off a 568 px screen), every control >= 44 px, nothing wrapped
+  const head = await page.eval("(() => { const t = document.getElementById('top'); const kids = [...t.querySelectorAll('a, button')].map((e) => { const r = e.getBoundingClientRect(); return { id: e.id || e.className, w: r.width, h: r.height, top: r.top, l: r.left, r: r.right }; }); const home = document.getElementById('homeLink'); const hr = home.getBoundingClientRect(); return { kids, homeH: hr.height, tops: [...new Set(kids.map((k) => Math.round(k.top)))], vw: document.documentElement.clientWidth }; })()");
   ok(head.kids.every((k) => k.w >= 43.5 && k.h >= 43.5), tag + ': header controls are >= 44 px', J(head.kids));
   ok(head.tops.length === 1, tag + ': the header is one row (controls share one top edge)', J(head.tops));
+  { const fb = head.kids.find((x) => x.id === 'fullBtn'), sb = head.kids.find((x) => x.id === 'soundBtn'), cb = head.kids.find((x) => x.id === 'controlsBtn');
+    ok(fb && fb.w >= 43.5 && fb.h >= 43.5 && fb.r <= head.vw - 15.5 + 0.5, tag + ': the Fullscreen button is on screen, >= 44 px, inside the gutter', J(fb));
+    ok(sb && cb && fb && sb.l >= 15.5 && sb.r <= cb.l && cb.r <= fb.l + 0.5, tag + ': Sound, Controls and Fullscreen sit in that order without overlapping', J([sb, cb, fb])); }
   ok(head.homeH < 60, tag + ': the Home link does not wrap onto two lines (height ' + head.homeH.toFixed(0) + ')', J(head));
   const dem = await page.eval(DEMO_JS);
   ok(dem.length === 0, tag + ': no "demo" / placeholder / [object / undefined / NaN anywhere in the text, title, labels or live region', J(dem));

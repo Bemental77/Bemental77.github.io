@@ -36,6 +36,7 @@ import { matchFromSummary } from './career_stats.js';                 // ST1: th
 import { createResumeStore, resumeKey, navigationType } from './battle_resume.js';       // W1 fix D11: a reload mid-battle resumes it
 import { parseOnlineQuery, createOnline } from './online.js';                         // two players, one battle (netmatch.js + lib/netplay.js); see ONLINE.md
 import { engineFingerprint } from './online_match.js';
+import { fitScale, fitPicture, createFullscreen, PROMPT_ROOM } from './screenfit.js';       // the picture fills its room; the Fullscreen switch
 
 export { GBA_FPS };
 const STEP_MS = 1000 / GBA_FPS;
@@ -46,12 +47,8 @@ const MAX_PARAM = 1100;
 
 /* ------------------------------------------------------------------------------------------ pure helpers */
 
-// Integer upscale chosen in DEVICE pixels: the source pixel is k whole device pixels wide (a phone at devicePixelRatio 3 gets a crisp 4x).
-export function fitScale({ availW, availH, dpr = 1 }) {
-  const d = dpr > 0 ? dpr : 1;
-  const k = Math.max(1, Math.floor(Math.min((availW * d) / SCREEN_W, (availH * d) / SCREEN_H) + 1e-9));
-  return { k, cssW: (SCREEN_W * k) / d, cssH: (SCREEN_H * k) / d };
-}
+// How big the picture is drawn: the whole room it is given, snapped to a whole device-pixel scale only when that costs under 6 % (screenfit.js has the rule and why).
+export { fitScale };
 
 /**
  * -> { ok: true, params: { team, foe, seed, format, cpu, quick } } | { ok: false, error: { param, title, message } }
@@ -165,27 +162,17 @@ async function main() {
 
   /* ---- scaling ---- */
   const coarse = () => !!window.matchMedia && (window.matchMedia('(pointer: coarse)').matches || window.matchMedia('(hover: none)').matches);
+  // The picture takes the room it is given (screenfit.js fitPicture): a phone held upright runs it edge to edge, fullscreen gives it the whole viewport.
+  // The old rule here was a whole scale only (floor), which left a 390 px phone a 324 px picture and a 360 px phone a 244 px one.
   function fit() {
-    const vw = document.documentElement.clientWidth, vh = window.innerHeight, dpr = window.devicePixelRatio || 1;
-    const landscape = vw > vh && vh < 560;
-    document.body.dataset.layout = landscape ? 'landscape' : 'portrait';
-    document.body.dataset.pad = touchPad ? 'on' : 'off';
-    const top = els.top.offsetHeight + 16;
-    const padH = touchPad && !landscape ? Math.max(els.padA.offsetHeight, els.padB.offsetHeight) + 10 : 0;
-    const padW = touchPad && landscape ? els.padA.offsetWidth + els.padB.offsetWidth + 24 : 0;
-    const hint = (!touchPad && document.body.dataset.state === 'ready') ? 40 : 0;
-    // WIDTH: the page's side gutters are 16 px each (32), and the canvas carries a 2 px border on each side (4, content-box). A whole-device-pixel scale k needs
-    // 240 * k / dpr css px: at DPR 2, 3x is 360 px, which with its border (364) needs a 396 px wide viewport; a 390 px phone has 358 px between its gutters, so it
-    // gets 2x (240 px) and stays there unless the gutters shrink (they must not) or the picture is smoothed at a fractional scale (it must not be). The old
-    // extra 4 px of slack here cost 3x on phones 396 to 399 px wide.
-    const availW = Math.max(SCREEN_W / dpr, vw - 32 - padW - (touchPad && landscape ? 8 : 4));
-    const availH = Math.max(SCREEN_H / dpr, vh - top - padH - hint - 12);
-    const s = fitScale({ availW, availH, dpr });
-    canvas.style.width = s.cssW + 'px'; canvas.style.height = s.cssH + 'px';
-    hook.scale = s;
+    hook.scale = fitPicture({ doc: document, win: window, canvas, top: els.top, padA: els.padA, padB: els.padB, touchPad, hint: (!touchPad && document.body.dataset.state === 'ready') ? 40 + PROMPT_ROOM : 0 });
+    try { syncChips(); } catch (_e) { /* the chips are placed again on the next frame */ }
   }
   window.addEventListener('resize', fit);
   window.addEventListener('orientationchange', fit);
+  // the Fullscreen switch: the header button, and the floating one that stands in for it while the header is hidden (a phone held sideways, fullscreen)
+  const fullscreen = hook.fullscreen = createFullscreen({ doc: document, win: window, buttons: [$('fullBtn'), $('fullExit')], onChange: () => { fit(); }, storage: (() => { try { return window.sessionStorage; } catch (_e) { return null; } })() });
+  document.addEventListener('fullscreenchange', () => setTimeout(fit, 120)); document.addEventListener('webkitfullscreenchange', () => setTimeout(fit, 120));       // the viewport settles a moment after the event (iOS reports the old size first)
 
   /* ---- sound: muted by default; an AudioContext exists only after a user gesture AND with sound switched on ---- */
   // MU3: the mixer, the SOUND panel and the music live in sound_system.js (ON by default, audio starts at the first click / tap / key). The old switch below only runs if that file did not load.

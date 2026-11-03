@@ -16,11 +16,14 @@
   <header id="top">
     <a class="home" id="homeLink" href="/">&lsaquo; Home</a>
     <h1>Pokemon Arena</h1>
+    <button id="fullBtn" class="textbtn iconbtn" type="button" aria-pressed="false" aria-label="Fullscreen" title="Fullscreen"><svg class="ic ic-enter" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5" /></svg><svg class="ic ic-exit" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9 4v5H4M20 9h-5V4M15 20v-5h5M4 15h5v5" /></svg></button>
     <div class="tools">
       <button id="soundBtn" class="textbtn" type="button" aria-pressed="false" title="Sound is off until you turn it on">Sound: off</button>
       <button id="controlsBtn" class="textbtn" type="button" title="Keyboard, controller and touch settings">Controls</button>
     </div>
   </header>
+  <!-- stands in for the header's Fullscreen button while the header is hidden (fullscreen on a phone held sideways) -->
+  <button id="fullExit" class="textbtn iconbtn" type="button" aria-pressed="true" aria-label="Exit fullscreen" title="Exit fullscreen"><svg class="ic ic-exit" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9 4v5H4M20 9h-5V4M15 20v-5h5M4 15h5v5" /></svg></button>
 
   <main id="play">
     <div id="dpad" class="cluster" aria-label="Directional pad">

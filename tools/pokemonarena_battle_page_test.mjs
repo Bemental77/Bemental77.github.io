@@ -158,10 +158,12 @@ async function pathShots(page, tag, { touch }) {
   const shots = [];
   ok(await open(page, '?seed=' + SCEN.pathSeed + '&format=3v3&cpu=normal') === 'ready', tag + ': battle.html reaches ready (seed ' + SCEN.pathSeed + ', found at run time)');
   ok(!page.errors.length, tag + ': no console / page errors after load', page.errors.join(' | ').slice(0, 160));
-  const lay = await ev(page, `(() => ({ sw: document.documentElement.scrollWidth, iw: window.innerWidth, k: ${H}.scale && ${H}.scale.k, cw: ${H}.canvas.getBoundingClientRect().width, dpr: window.devicePixelRatio, pad: document.body.dataset.pad, layout: document.body.dataset.layout }))()`);
+  const lay = await ev(page, `(() => { const r = ${H}.canvas.getBoundingClientRect(); return { sw: document.documentElement.scrollWidth, iw: window.innerWidth, k: ${H}.scale && ${H}.scale.k, cw: r.width, ch: r.height, border: parseFloat(getComputedStyle(${H}.canvas).borderLeftWidth), dpr: window.devicePixelRatio, pad: document.body.dataset.pad, layout: document.body.dataset.layout, edge: document.body.dataset.edge }; })()`);
   ok(lay.sw <= lay.iw, tag + ': no horizontal scroll', JSON.stringify(lay));
-  const dev = lay.cw * lay.dpr;
-  ok(Math.abs(dev - (240 * lay.k + 4 * lay.dpr)) < 0.6 || Math.abs((dev - 4 * lay.dpr) / 240 - Math.round((dev - 4 * lay.dpr) / 240)) < 0.01, tag + ': canvas is a whole number of device pixels per source pixel', JSON.stringify(lay));
+  // THE PICTURE FILLS ITS ROOM (screenfit.js; the old rule here was a whole scale only, which left a 390 px phone a 324 px picture): 3:2, and k is the device pixels per source pixel it really has
+  const inW = lay.cw - 2 * lay.border, inH = lay.ch - 2 * lay.border;
+  ok(Math.abs(inW / inH - 1.5) < 0.01 && Math.abs(inW * lay.dpr - 240 * lay.k) < 0.05, tag + ': the picture is 3:2 and k is the device pixels per source pixel it really has (' + inW.toFixed(1) + ' css px @' + lay.dpr + 'x = ' + lay.k.toFixed(3) + 'x)', JSON.stringify(lay));
+  if (touch && lay.layout === 'portrait') ok(lay.edge === '1' && lay.border === 0 && Math.abs(lay.cw - lay.iw) < 0.5, tag + ': a phone held upright: the picture runs edge to edge (' + lay.cw.toFixed(1) + ' of ' + lay.iw + ' css px, no frame)', JSON.stringify(lay));
   const small = await ev(page, `[...document.querySelectorAll('#top button, #top a, ${touch ? '#dpad .pbtn, #ab .pbtn' : '.textbtn'}')].filter((b) => { const r = b.getBoundingClientRect(); return r.width > 0 && (r.width < 43.5 || r.height < 43.5); }).map((b) => b.id || b.className)`);
   ok(small.length === 0, tag + ': every visible control is at least 44 css px', small.join(','));
   const colors = await ev(page, `(() => { const c = ${H}.canvas, d = c.getContext('2d').getImageData(0, 0, 240, 160).data; const s = new Set(); for (let i = 0; i < d.length; i += 4) s.add((d[i] << 16) | (d[i + 1] << 8) | d[i + 2]); return s.size; })()`);
@@ -360,7 +362,7 @@ session('urls', { width: 1280, height: 800 }, async (page) => {
   const scriptsBefore = await (async () => { await open(page, '?seed=1&format=6v6'); return ev(page, `document.scripts.length`); })();
   for (const [q, param] of hostile) {
     const s = await open(page, q);
-    const info = await ev(page, `(() => ({ state: ${H}.state, kind: ${H}.kind, param: ${H}.param, xss: typeof window.__xss, imgs: document.querySelectorAll('img, svg, iframe').length, scripts: document.scripts.length, errVisible: !document.getElementById('error').hidden, canvasHidden: document.getElementById('battle').hidden, body: document.getElementById('error').innerHTML.includes('<') && /<(img|svg|script|b)\\b/i.test(document.getElementById('error').innerHTML) }))()`);
+    const info = await ev(page, `(() => ({ state: ${H}.state, kind: ${H}.kind, param: ${H}.param, xss: typeof window.__xss, imgs: [...document.querySelectorAll('img, svg, iframe')].filter((e) => !e.closest('#fullBtn, #fullExit')).length, scripts: document.scripts.length, errVisible: !document.getElementById('error').hidden, canvasHidden: document.getElementById('battle').hidden, body: document.getElementById('error').innerHTML.includes('<') && /<(img|svg|script|b)\\b/i.test(document.getElementById('error').innerHTML) }))()`);
     ok(s === 'error' && info.kind === 'params' && info.param === param && info.errVisible && info.canvasHidden, 'hostile ' + q.slice(0, 40) + ': refused with an error screen naming ' + param, JSON.stringify(info));
     ok(info.xss === 'undefined' && info.imgs === 0 && info.body === false && info.scripts === scriptsBefore, 'hostile ' + q.slice(0, 40) + ': nothing was executed or injected', JSON.stringify(info));
     const msg = await ev(page, `document.getElementById('errMsg').textContent + document.getElementById('errTitle').textContent + document.getElementById('errDetail').textContent`);

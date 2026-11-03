@@ -432,8 +432,11 @@ async function groupLayout(S) {
     await sleep(500);
     const o2 = await guest.eval('document.documentElement.scrollWidth - document.documentElement.clientWidth');
     ok(o2 <= 0, 'V3 the battle with its status bar does not overflow a phone', String(o2));
-    const nb = await guest.eval('(() => { const r = document.getElementById("netbar").getBoundingClientRect(); const c = window.__arenaBattle.canvas.getBoundingClientRect(); return { top: r.top, bottom: r.bottom, w: r.width, canvasBottom: c.bottom }; })()');
-    ok(nb.top >= nb.canvasBottom - 1 && nb.w <= 390, 'V4 the status bar sits under the picture and inside the screen', JSON.stringify(nb));
+    // On a phone held upright the controls sit at the bottom of the screen and the picture runs edge to edge (screenfit.js), so the status bar sits ABOVE the picture, between the header and it
+    // (it used to sit under it). What matters: it is inside the screen, it covers none of the picture and none of the touch buttons, and it is not hidden below the fold.
+    const nb = await guest.eval('(() => { const r = document.getElementById("netbar").getBoundingClientRect(); const c = window.__arenaBattle.canvas.getBoundingClientRect(); const pads = [...document.querySelectorAll("#dpad .pbtn, #ab .pbtn")].map((e) => e.getBoundingClientRect()); return { top: r.top, bottom: r.bottom, left: r.left, right: r.right, w: r.width, canvasTop: c.top, canvasBottom: c.bottom, vh: innerHeight, onPads: pads.some((p) => p.left < r.right && p.right > r.left && p.top < r.bottom && p.bottom > r.top) }; })()');
+    ok((nb.bottom <= nb.canvasTop + 1 || nb.top >= nb.canvasBottom - 1) && nb.w <= 390 && nb.left >= 0 && nb.right <= 390 && nb.top >= 0 && nb.bottom <= nb.vh && !nb.onPads, 'V4 the status bar is inside the screen and covers neither the picture nor a touch button', JSON.stringify(nb));
+    ok(nb.bottom <= nb.canvasTop + 1, 'V4b held upright it sits above the picture, under the header', JSON.stringify(nb));
     await shot(guest, 'V_phone_battle');
   });
 }
