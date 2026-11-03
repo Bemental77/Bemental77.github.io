@@ -35,7 +35,7 @@
 // team preview that hides the unchosen three is a presentation, not a secret).
 
 import { sha256Hex } from './rom.js';
-import { decodeChoice } from './engine.js';
+import { decodeChoice, encodeChoice } from './engine.js';
 
 export const PROTO = 1;
 export const MSG = 'lsarena';
@@ -142,6 +142,7 @@ export function createNetMatch(opts) {
   let r = 0;
   let q = [], busy = false;
   let downAt = 0, longestDown = 0, outageThisRound = false;
+  let everUp = true;        // false only for a page that was reloaded into a match and has not reached the other player yet
   let rematchMine = false, rematchTheirs = false;
   let endSent = false, endTheirs = null, endChecked = false;
   let conceded = null;      // why this match ended other than by winning: 'forfeit' | 'left' | 'timeout' | 'lost-link' | 'closed'
@@ -177,7 +178,7 @@ export function createNetMatch(opts) {
   };
 
   async function onHello(m) {
-    if (theirHello) { if (!same(strip(theirHello), strip(m))) fail('equivocation', 'The other player sent two different hellos.'); return; }
+    if (theirHello) { if (theirHello.resumed) return; if (!same(strip(theirHello), strip(m))) fail('equivocation', 'The other player sent two different hellos.'); return; }       // (resumed: answered before the reload)
     theirHello = m;
     const c = opts.mine;
     if (m.rom !== c.rom) return fail('rom', 'The other player is using a different game file, so the two games cannot match.');
@@ -271,13 +272,15 @@ export function createNetMatch(opts) {
   function openRound() {
     const ctl = nm.ctl;
     if (ctl.winner !== null) return finishMatch();
-    const p0 = pend(0), p1 = pend(1);
-    const need = [!!p0, !!p1];
+    // WHO MUST CHOOSE comes from the engine's own flag (ctl.needs), not from the open requests: a request disappears the moment a side has chosen, and a page that was
+    // reloaded after answering would then see a round with one chooser fewer than the other machine saw. (Where a controller has no needs(), the requests are the fallback.)
+    const needOf = (s) => (typeof ctl.needs === 'function' ? ctl.needs(s) : !!pend(s));
+    const need = [needOf(0), needOf(1)];
     if (!need[0] && !need[1]) return;          // the engine is mid-resolution; its next events open the round
     r++;
     if (r > LIMITS.rounds) return fail('length', 'The match ran too long.');
     outageThisRound = nm.link === 'down';
-    round = { r, need, hash: ctl.battle.hash(), kind: (p0 || p1).phase, openedAt: now(), mine: null, theirs: null, rdyMine: 0, rdyTheirs: 0, applied: false, revealSentAt: 0, evCount: ctl.battle.events.length };
+    round = { r, need, hash: ctl.battle.hash(), kind: ctl.battle.s.phase === 'preview' ? 'preview' : 'move', openedAt: now(), mine: null, theirs: null, rdyMine: 0, rdyTheirs: 0, applied: false, revealSentAt: 0, evCount: ctl.battle.events.length };
     fire('progress');
     requeueEarly();
     progress();
@@ -476,7 +479,7 @@ export function createNetMatch(opts) {
     nm.link = up ? 'up' : 'down';
     if (!up) { if (!downAt) downAt = now(); outageThisRound = true; if (was === 'up' && !dead() && nm.phase !== 'over') notice('Connection lost. Waiting for the other player to come back...', 'warn'); return; }
     if (downAt) longestDown = Math.max(longestDown, now() - downAt);
-    downAt = 0;
+    downAt = 0; everUp = true;
     if (was === 'down' && !dead() && nm.phase !== 'over') notice('Connection restored.', 'ok');
     // "I am here again": say where I am so the other side resends exactly what I have not seen
     try { opts.send(mk('sync', { ph: nm.phase.slice(0, 12), r })); } catch (_e) { /* ignore */ }
@@ -497,7 +500,11 @@ export function createNetMatch(opts) {
     if (nm.phase !== 'playing' || !round || !nm.ctl) return;
     if (nm.link === 'down') {
       if (downAt) longestDown = Math.max(longestDown, t - downAt);
-      if (downAt && t - downAt > L.graceMs) { notice('The other player did not come back, so you win.', 'warn'); concedeOpp('lost-link'); }
+      if (downAt && t - downAt > L.graceMs) {
+        // a page that was reloaded into this match and never got back to the other player cannot say the OTHER player left
+        if (!everUp) return fail('timeout', 'Could not get back to the other player, so the battle was stopped.', { tell: false });
+        notice('The other player did not come back, so you win.', 'warn'); concedeOpp('lost-link');
+      }
       return;
     }
     const lim = round.kind === 'preview' ? L.previewMs : L.turnMs;
@@ -571,6 +578,71 @@ export function createNetMatch(opts) {
       default: return;
     }
   }
+
+  /* ------------------------------------------------------------------------------------------------ reload */
+  /**
+   * What a page keeps (sessionStorage) so that a RELOAD does not lose the battle: the agreed seed, every choice the engine has taken so far (this machine's log, own choice first),
+   * the round it is in, the choice it has committed to but not yet opened (the nonce is not recoverable from anything else), and every message it has sent this match (so the
+   * other side's 'sync' after the reconnection can be answered). Null when there is nothing to resume.
+   */
+  nm.snapshot = function snapshot() {
+    if (nm.phase !== 'playing' || !nm.ctl || !round) return null;
+    return {
+      v: 1, room: opts.room, role, mn: nm.mn, seed: nm.seed, fmt: nm.fmt, names: nm.names.slice(), r: round.r, rh: round.hash, hash: nm.ctl.battle.hash(),
+      log: nm.ctl.battle.choiceLog.map((e) => ({ s: e.s, c: JSON.parse(JSON.stringify(e.c)) })),
+      outLog: outLog.slice(-600), secret: round.mine && round.mine.nonce ? { r: round.r, w: round.mine.w, nonce: round.mine.nonce } : null,
+    };
+  };
+
+  /**
+   * Pick a battle up again from snapshot(): rebuild the controller from the agreed seed, replay the recorded choices, and refuse unless that lands on the recorded state hash.
+   * The handshake is NOT run again; the link starts DOWN (the page reports it up with linkChanged(true), which sends a 'sync', and the other side resends what this page missed).
+   * -> true, or false with nm.error set (a record that does not replay is a failure by name, never a guess).
+   */
+  nm.resume = function resume(rec) {
+    if (nm.phase !== 'idle') return false;
+    const bad = (why) => { fail('resume', 'The battle could not be picked up again (' + why + ').', { tell: false }); return false; };
+    if (!rec || rec.v !== 1 || rec.role !== role || rec.room !== opts.room || !isInt(rec.mn, 1, 1000) || !isU32(rec.seed) || !Array.isArray(rec.names) || rec.names.length !== 2
+      || !isInt(rec.r, 1, LIMITS.rounds) || typeof rec.hash !== 'string' || !Array.isArray(rec.log) || rec.log.length > 4000 || !Array.isArray(rec.outLog) || !(rec.fmt === '6v6' || rec.fmt === '3v3')) return bad('the record is not one this page wrote');
+    nm.mn = rec.mn; nm.fmt = rec.fmt; nm.names = rec.names.map((x) => cleanName(x)); nm.oppName = nm.names[oppSide]; nm.myName = nm.names[mySide];
+    nm.seed = rec.seed >>> 0; nm.seedMn = nm.mn; ctx = opts.room + '#' + nm.mn;
+    theirHello = { resumed: true };
+    let ctl;
+    try { ctl = opts.makeController({ seed: nm.seed, mySide, fmt: nm.fmt, names: nm.names.slice(), mn: nm.mn }); } catch (e) { return bad('the battle could not be rebuilt: ' + String(e && e.message ? e.message : e).slice(0, 80)); }
+    for (const e of rec.log) {
+      if (!e || (e.s !== 0 && e.s !== 1) || !e.c || typeof e.c !== 'object') return bad('a recorded choice is malformed');
+      const res = e.s === mySide ? ctl.submit(mySide, e.c) : ctl.submitRemote(e.c);
+      if (!res || !res.ok) return bad('a recorded choice was refused: ' + (res && res.code));
+    }
+    if (ctl.battle.hash() !== rec.hash) return bad('the replay did not reach the recorded position');
+    nm.ctl = ctl;
+    ctl.onLocalChoice((ev) => { if (nm.ctl === ctl && ev.side === mySide) onLocal(ev); });
+    ctl.onEvents(() => { if (nm.ctl === ctl && nm.phase === 'playing') schedule(); });
+    outLog = rec.outLog.filter((m) => checkMessage(m) === null && m.mn === nm.mn);
+    r = rec.r - 1; round = null; endSent = false; endTheirs = null; endChecked = false; conceded = null; nm.result = null;
+    nm.resumed = true; nm.link = 'down'; downAt = now(); everUp = false;
+    setPhase('playing');
+    fire('controller', ctl);
+    openRound();
+    if (dead()) return false;
+    if (!round || round.r !== rec.r) return bad('the rebuilt battle is in a different round than the recorded one');
+    // The hash a round opens on is what the other machine compares its own against. The engine we just rebuilt already holds the answer this machine had given, so its
+    // hash is no longer that of the round's opening: the recorded one is used (it is only ever compared with the other side's, so a wrong one only stops our own match).
+    if (typeof rec.rh === 'string' && rec.rh.length > 0 && rec.rh.length <= LIMITS.str) round.hash = rec.rh;
+    // the choice this page had already made: it is in the engine, and only the nonce behind its commitment is needed to open it later
+    if (round.need[mySide] && !ctl.pending(mySide)) {
+      const sec = rec.secret && rec.secret.r === round.r ? rec.secret : null;
+      const mineLog = rec.log.filter((e) => e.s === mySide).pop();
+      const w = sec ? sec.w : (mineLog ? encodeChoice(mineLog.c) : -1);
+      if (round.need[0] && round.need[1]) {
+        if (!sec || !isInt(sec.w, 0, 0xffff) || !HEX32.test(String(sec.nonce))) return bad('the choice committed to before the reload cannot be opened');
+        round.mine = { w, nonce: sec.nonce, c: sha256Hex(bytesOf(['arena1', ctx, round.r, mySide, w, sec.nonce].join('|'))) };
+      } else round.mine = { w, plain: true };
+    }
+    fire('progress');
+    progress();
+    return true;
+  };
 
   nm.status = function status() {
     const open = round && !round.applied;

@@ -199,15 +199,123 @@ async function groupLeaving(S) {
   await withBrowser({ port: CDP0 + 2, width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (host) => {
     // the other player closes the page mid-battle
     const guest = await host.openTab({ width: 900, height: 760 });
-    const ph = await pair(host, guest, 'ACLOS');
+    const ph = await pair(host, guest, 'ACLOS', { hostExtra: '&arenagrace=3000', guestExtra: '&arenagrace=3000' });
     ok(ph[0] === 'playing' && ph[1] === 'playing', 'L6 pair for the closed-page case', JSON.stringify(ph));
     await host.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 });
     await guest.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 });
     await guest.navigate('about:blank');
+    // a closed page may be a RELOAD, so it is not a forfeit: the link drops, the other player is told and waits
+    await host.waitFor('window.__arenaOnline.nm().status().link === "down"', { timeoutMs: 15000 }).catch(() => {});
+    const st0 = await nmStatus(host);
+    ok(st0.link === 'down' && st0.phase === 'playing', 'L7 a closed page is a dropped link first: the other player keeps the match open and is told', JSON.stringify([st0.link, st0.phase]));
+    ok(/Connection lost|waiting for/i.test((await bar(host)).msg), 'L7b and the bar says they are waiting', (await bar(host)).msg);
     await host.waitFor('window.__arenaOnline.nm().status().phase === "over"', { timeoutMs: 20000 }).catch(() => {});
     const st = await nmStatus(host);
-    ok(st.phase === 'over' && st.result && st.result.iWon, 'L7 a closed page forfeits the match; the other player wins at once', JSON.stringify([st.phase, st.result]));
-    ok(/left|forfeit/i.test((await bar(host)).msg), 'L8 and the bar says why', (await bar(host)).msg);
+    ok(st.phase === 'over' && st.result && st.result.iWon && st.result.reason === 'lost-link', 'L8 when the player does not come back within the grace period, the other player wins', JSON.stringify([st.phase, st.result]));
+  });
+}
+
+// A RELOAD (or a connection that drops) does not lose the battle. Real pages, real reloads (CDP Page.reload, which is what the browser reports as a reload).
+async function groupRejoin(S) {
+  ANIM = '&anim=0';
+  const reload = async (page) => { await page.send('Page.reload', { ignoreCache: false }); };
+  const progressTo = async (host, guest, n) => {       // both scenes play until the protocol is at least in round n
+    await Promise.all([drive(host, 60000, true), drive(guest, 60000, true)].map((p) => p.catch(() => null))).catch(() => null);
+  };
+  // a battle that has run a few rounds, then is held (neither screen answers) so a reload lands mid-battle at a known place
+  const playSome = async (host, guest, rounds) => {
+    const AI = (p) => p.eval(`(async () => { const H = window.__arenaBattle, O = window.__arenaOnline; const side = O.state.info.mySide; const mod = await import('/pokemonarena/js/ai.js');
+      if (window.__aiFor !== H.scene) { window.__aiFor = H.scene; const ai = mod.createAi({ pack: H.pack, level: 'normal', seed: 7 + side }); H.scene.S.auto = { ai, decide(req) { return ai.choose(req, H.ctl.view(side), { previewInfo: { foe: H.ctl.previewInfo[side ^ 1] } }); } }; }
+      const t0 = performance.now();
+      while (performance.now() - t0 < 60000 && O.nm().status().round < ${rounds} && H.scene.mode !== 'result') { H.scene.tick(); if (H.scene.mode === 'steps' && H.scene.S.cur && H.scene.S.cur.t === 'text') H.scene.press('a'); await new Promise((r) => setTimeout(r, 0)); }
+      return O.nm().status().round; })()`);
+    return Promise.all([AI(host), AI(guest)]);
+  };
+  const finish = async (host, guest, label) => {
+    const modes = await Promise.all([drive(host, 120000), drive(guest, 120000)]);
+    await sleep(500);
+    const [a, b] = [await nmStatus(host), await nmStatus(guest)];
+    ok(modes.every((m) => m === 'result') && a.phase === 'over' && b.phase === 'over' && a.result.hash === b.result.hash && !a.error && !b.error, label + ' the battle plays on to the end in agreement', JSON.stringify([modes, a.phase, b.phase, a.error, b.error]));
+    return [a, b];
+  };
+
+  // ---- the guest reloads ----
+  await withBrowser({ port: CDP0 + 10, width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (host) => {
+    const guest = await host.openTab({ width: 900, height: 760 });
+    const ph = await pair(host, guest, 'AREJG');
+    ok(ph[0] === 'playing' && ph[1] === 'playing', 'J1 pair for the guest-reload case', JSON.stringify(ph));
+    await host.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 }); await guest.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 });
+    const rounds = await playSome(host, guest, 6);
+    ok(rounds[0] >= 6 && rounds[1] >= 6, 'J2 a few rounds are played', JSON.stringify(rounds));
+    const before = await guest.eval('({ turn: window.__arenaBattle.ctl.turn, hash: window.__arenaBattle.ctl.battle.hash(), seed: window.__arenaOnline.state.info.seed })');
+    const url = new URL(await guest.eval('location.href'));
+    ok(url.searchParams.get('np') === 'AREJG' && url.searchParams.get('join') === '1', 'J3 the address a reload comes back to names the room and the role', url.search);
+    ok(await guest.eval('Object.keys(sessionStorage).some((k) => k.startsWith("arena.online:"))') === true, 'J3b the battle is recorded in the tab', '');
+    await reload(guest);
+    await guest.waitFor('window.__arenaOnline && window.__arenaBattle && window.__arenaBattle.state === "ready" && window.__arenaBattle.resume', { timeoutMs: 90000 });
+    const after = await guest.eval('({ turn: window.__arenaBattle.ctl.turn, hash: window.__arenaBattle.ctl.battle.hash(), seed: window.__arenaOnline.state.info.seed, resumed: window.__arenaOnline.state.info.resumed, resume: window.__arenaBattle.resume })');
+    ok(after.resumed === true && after.resume.restored === true, 'J4 the reloaded page picks the battle up (it did not start a new setup)', JSON.stringify(after.resume));
+    ok(after.seed === before.seed && after.turn === before.turn && after.hash === before.hash, 'J5 and is in exactly the position it left', JSON.stringify([before, after]));
+    await guest.waitFor('window.__arenaOnline.nm().status().link === "up"', { timeoutMs: 60000 });
+    await host.waitFor('window.__arenaOnline.nm().status().link === "up"', { timeoutMs: 60000 });
+    ok(true, 'J6 both sides report the link up again without anyone pressing anything', '');
+    await shot(guest, 'J_guest_after_reload');
+    const [a, b] = await finish(host, guest, 'J7');
+    ok(host.errors.length === 0 && guest.errors.length === 0, 'J8 no page errors through the reload', JSON.stringify(host.errors.concat(guest.errors)).slice(0, 200));
+    ok(await guest.eval('Object.keys(sessionStorage).every((k) => !k.startsWith("arena.online:"))') === true, 'J9 a finished battle leaves no record behind', '');
+  });
+
+  // ---- the host reloads (it has to let the guest in again) ----
+  await withBrowser({ port: CDP0 + 11, width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (host) => {
+    const guest = await host.openTab({ width: 900, height: 760 });
+    const ph = await pair(host, guest, 'AREJH');
+    ok(ph[0] === 'playing' && ph[1] === 'playing', 'J10 pair for the host-reload case', JSON.stringify(ph));
+    await host.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 }); await guest.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 });
+    await playSome(host, guest, 5);
+    const before = await host.eval('({ turn: window.__arenaBattle.ctl.turn, hash: window.__arenaBattle.ctl.battle.hash() })');
+    await reload(host);
+    await host.waitFor('window.__arenaOnline && window.__arenaBattle && window.__arenaBattle.state === "ready" && window.__arenaBattle.resume', { timeoutMs: 90000 });
+    const after = await host.eval('({ turn: window.__arenaBattle.ctl.turn, hash: window.__arenaBattle.ctl.battle.hash(), resumed: window.__arenaOnline.state.info.resumed })');
+    ok(after.resumed === true && after.turn === before.turn && after.hash === before.hash, 'J11 the reloaded HOST is back in exactly the position it left', JSON.stringify([before, after]));
+    // the new host session knows nobody: the guest knocks again by itself and the host is asked once
+    await host.waitFor('document.getElementById("npApproveAllow")', { timeoutMs: 90000 });
+    ok(true, 'J12 the returning guest knocks by itself and the host is asked to allow it', '');
+    await host.eval('document.getElementById("npApproveAllow").click()');
+    await host.waitFor('window.__arenaOnline.nm().status().link === "up"', { timeoutMs: 60000 });
+    await guest.waitFor('window.__arenaOnline.nm().status().link === "up"', { timeoutMs: 60000 });
+    const [a, b] = await finish(host, guest, 'J13');
+    ok(host.errors.length === 0 && guest.errors.length === 0, 'J14 no page errors through the host reload', JSON.stringify(host.errors.concat(guest.errors)).slice(0, 200));
+  });
+
+  // ---- a connection that drops and comes back, nobody reloads ----
+  await withBrowser({ port: CDP0 + 12, width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (host) => {
+    const guest = await host.openTab({ width: 900, height: 760 });
+    const ph = await pair(host, guest, 'AREJL');
+    ok(ph[0] === 'playing' && ph[1] === 'playing', 'J15 pair for the dropped-link case', JSON.stringify(ph));
+    await host.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 }); await guest.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 });
+    await playSome(host, guest, 5);
+    // cut the guest's peer connection under its feet
+    await guest.eval('(() => { const s = window.__arenaOnline.session(); for (const L of s._links.values()) { try { L.dc && L.dc.close(); } catch (e) {} try { L.pc && L.pc.close(); } catch (e) {} } })()');
+    await host.waitFor('window.__arenaOnline.nm().status().link === "down"', { timeoutMs: 20000 }).catch(() => {});
+    ok(true, 'J16 the drop is noticed', '');
+    await host.waitFor('window.__arenaOnline.nm().status().link === "up"', { timeoutMs: 90000 });
+    await guest.waitFor('window.__arenaOnline.nm().status().link === "up"', { timeoutMs: 90000 });
+    ok(true, 'J17 both sides report the link up again by themselves', '');
+    const [a, b] = await finish(host, guest, 'J18');
+    ok(host.errors.length === 0 && guest.errors.length === 0, 'J19 no page errors through the drop', JSON.stringify(host.errors.concat(guest.errors)).slice(0, 200));
+  });
+
+  // ---- opening the same address afresh does NOT resume (only a reload does) ----
+  await withBrowser({ port: CDP0 + 13, width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (host) => {
+    const guest = await host.openTab({ width: 900, height: 760 });
+    const ph = await pair(host, guest, 'AREJF');
+    ok(ph[0] === 'playing' && ph[1] === 'playing', 'J20 pair for the fresh-visit case', JSON.stringify(ph));
+    await host.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 }); await guest.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 });
+    await playSome(host, guest, 4);
+    const url = await guest.eval('location.href');
+    await guest.navigate('about:blank'); await guest.navigate(url);
+    await guest.waitFor('window.__arenaOnline && document.getElementById("olGo") && !document.getElementById("olGo").disabled', { timeoutMs: 90000 });
+    ok(await guest.eval('window.__arenaBattle.state') === 'online' && !(await guest.eval('window.__arenaBattle.resume')), 'J21 a fresh visit to the same address shows the setup form, it does not resume', await guest.eval('window.__arenaBattle.state'));
   });
 }
 
@@ -393,7 +501,7 @@ const only = process.argv.slice(2).filter((a) => !a.startsWith('-'));
 const started = await startServer();
 const S = await loadStack();
 const t0 = Date.now();
-const groups = { hub: groupHub, lobby: groupLobby, match: groupMatch, leaving: groupLeaving, timeout: groupTimeout, refusals: groupRefusals, teams: groupTeams, layout: groupLayout };
+const groups = { hub: groupHub, lobby: groupLobby, match: groupMatch, leaving: groupLeaving, rejoin: groupRejoin, timeout: groupTimeout, refusals: groupRefusals, teams: groupTeams, layout: groupLayout };
 let crashed = null;
 try {
   for (const [name, fn] of Object.entries(groups)) {

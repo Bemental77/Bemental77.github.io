@@ -182,8 +182,8 @@ node tools/pokemonarena_devices_test.mjs       # the same journeys with ONE devi
 node tools/pokemonarena_coherence_test.mjs     # one game, not a pile of pages: titles, no unfinished wording, headers, 6 widths, Controls on every page + mutants
 node tools/stamp_lib_versions.mjs --check      # site-wide lib version stamps (baseline: 17 pages / 6 libs / 19 stale references)
 node tools/no_streaming_test.mjs               # the netplay "no streaming" guard (the Arena's online module is one of its pages)
-node tools/pokemonarena_netmatch_test.mjs      # ONLINE: the match protocol, two instances over a scriptable wire on the real engine (commit-reveal, the shared seed, desync, cheating, leaving, timeouts, a dropped link, rematch); `--mutants` breaks it 18 ways
-node tools/pokemonarena_online_page_test.mjs   # ONLINE: two real Chrome tabs through the real lobby and battle page (approval prompt, handshake, a full match and a rematch, forfeit, a closed page, the clock, refusals, phone layout)
+node tools/pokemonarena_netmatch_test.mjs      # ONLINE: the match protocol, two instances over a scriptable wire on the real engine (commit-reveal, the shared seed, desync, cheating, leaving, timeouts, a dropped link, rematch); `--mutants` breaks it 23 ways
+node tools/pokemonarena_online_page_test.mjs   # ONLINE: two real Chrome tabs through the real lobby and battle page (approval prompt, handshake, a full match and a rematch, forfeit, a closed page, reloads of the guest and the host, a dropped connection, the clock, refusals, phone layout)
 node tools/multiplayer_page_test.mjs           # the lobby's catalogue and hand-off contract, Pokemon Arena included
 ```
 
@@ -230,7 +230,7 @@ True as of this build; each item is also visible in the code it names.
 
 ## Known gaps
 
-* **Online play is built** (`ONLINE.md`) and has these limits: an online battle is **not written into your record** (the career schema has no entry for a human opponent, and changing it would touch stored profiles); **a reloaded or closed page forfeits** the match (there is no rejoin); there are no ratings, ladders or spectators; and **both browsers hold both teams**, because both run the engine, so a modified client could read the other team (it cannot read a choice before making its own, or steer the dice).
+* **Online play is built** (`ONLINE.md`) and has these limits: an online battle is **not written into your record** (the career schema has no entry for a human opponent, and changing it would touch stored profiles); **a reloaded page picks the battle up again**, but a tab closed for good costs the other player up to 60 s before they win, and a reload during the handshake is not resumable; there are no ratings, ladders or spectators; and **both browsers hold both teams**, because both run the engine, so a modified client could read the other team (it cannot read a choice before making its own, or steer the dice).
 * **Doubles** are out of scope.
 * **Not built, and not claimed:** the engine supports 688 of the ROM's 936 moves (and 173 of its 523 abilities, 662 of its 930 items), so a team using anything else is refused (see *What is approximate*); nothing elsewhere on this site links to the Arena yet, so it is reached at
   `/pokemonarena/`; there is no party-screen summary page, no BAG, no unlocks or experience (there is a battle record, see *Stats*) and no offline mode (the game file is fetched from this site on each visit). The move animations, the weather visuals, the music and the volume controls are each described in

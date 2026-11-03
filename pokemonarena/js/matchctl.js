@@ -196,6 +196,10 @@ export function createMatchController(opts) {
     // introduction: the engine's opening events (start, switch-in...) are delivered like any other
     start() { emitEvents(battle.drain()); pump(); return ctl; },
     pending,
+    // Does this side have to choose in the phase the engine is in? Unlike pending(), it stays true after the side has chosen (until the phase resolves), and it is false
+    // for a side locked into a charge / recharge turn. A networked match numbers its rounds from this, so a match rebuilt after a reload (where the answer was already given)
+    // sees the same round shape as the one that was never interrupted.
+    needs: (side) => !!battle.s.need[side],
     origOf: (side) => battle.s.sides[side].team.map((x) => x.orig),
     requests: () => battle.requests(),
     view: (side) => battle.viewFor(side),

@@ -45,7 +45,7 @@ Every message is `{ t:'lsarena', v:1, k, mn, ... }`; `mn` counts rematches. Ever
 | `choice` | both | a round where only **one** side chooses (a replacement after a faint): nothing to hide, so no commitment |
 | `bye` `end` | both | leaving (the leaver forfeits) / the match is over, with the final hash |
 | `rematch` | both | both must ask; then the seed handshake runs again with the same teams |
-| `sync` | both | after a dropped link: "I am here, resend me from round N" |
+| `sync` | both | after a dropped link or a reload: "I am here, resend me from round N" |
 
 **Rounds** are numbered identically on both machines (a round opens each time the engine has advanced and someone has a choice to make). A round is applied only when
 everything it needs is verified: the commitment opens correctly, the choice is legal (`ctl.submitRemote` is the engine's own `choose`), and the opening state hash equals ours.
@@ -54,15 +54,24 @@ everything it needs is verified: the commitment opens correctly, the choice is l
 
 | situation | result |
 |---|---|
-| the player forfeits (pause menu), closes the page, or presses BACK TO HUB | they lose at once; the other side's scene shows the forfeit |
+| the player forfeits (pause menu) or presses BACK TO HUB | they lose at once; the other side's scene shows the forfeit |
+| the player's page is closed or reloaded | the link drops, the other side is told and waits (below); a RELOAD picks the battle up again |
 | a player's screen is ready and they take longer than 2:00 (3:00 at the team preview) | they time themselves out; the other side's clock (+3 s) is the fallback if their page is frozen |
 | a player's screen never becomes ready (a hidden tab) | out after 5:00 from the round opening |
 | both committed and one reveal never comes (a broken or hostile client) | out after 30 s |
-| the link drops | 60 s of grace; the other side's `sync` on reconnection resends exactly what was missed; after 60 s the player who stayed wins |
+| the link drops (a closed page, a lost connection) | 60 s of grace; on reconnection the `sync` below resends exactly what was missed; after 60 s the player who stayed wins. A page that was reloaded into a battle and never gets back to the other player is stopped, and does not claim the other player left |
 | an **abort** (desync, cheating, an illegal choice, a malformed message) | nobody wins; both pages say why |
 
 A claim **against you** ("you timed out", "your link was dead") is believed only when your own clock or link record agrees; otherwise the match is stopped. A claim against
 the sender itself (a forfeit) is simply taken.
+
+## Reloads and dropped connections
+
+* **A reload does not lose the battle.** After every change `online.js` keeps the match's `snapshot()` in `sessionStorage` (per tab; never sent anywhere): the agreed seed, every choice the engine has taken, the round, the hash the round opened on, the commitment's nonce, and every message sent this match. A page that is **reloaded** (the browser says `reload` or `back_forward`; opening the address afresh never resumes) rebuilds the controller from the seed, replays the recorded choices, **refuses unless that lands on the recorded state hash**, replays the scene silently and at speed, and re-syncs: its `sync` makes the other side resend what it missed, and its restored message log answers theirs. The address is rewritten to `?np=CODE&host=1|join=1` when a room is opened, so a reload finds its record.
+* **The guest reloading** is re-admitted by the host with no prompt (`lib/netplay.js` remembers the seat). **The host reloading** makes the guest knock again by itself, and the host is asked once to allow it.
+* **A dropped connection heals by itself:** `lib/netplay.js` re-knocks a link that was open and died (the room has not "started", so its normal rule applies); `online.js` also replaces a session that failed outright, on a timer, while the match's own 60 s clock runs.
+* **Proved by:** `pokemonarena_netmatch_test.mjs` case R reloads each player at *every step* of three real matches, with nothing in flight, with the unsent messages lost, and (the case that found a real bug) with the player having answered but the answer not yet delivered; each must end in the uninterrupted match's exact final position (171 cases), plus records that must be refused by name; and `pokemonarena_online_page_test.mjs` group `rejoin` reloads the guest and the host in real Chrome tabs (same position on return, link back up without a click, the match plays on to the end in agreement), cuts a live connection, and checks that a fresh visit does not resume.
+* **Limits:** the record is per tab (a different tab or browser starts over); a reload during the handshake (before turn 1) is not resumable; closing the tab for good costs the other player up to 60 s before they win.
 
 ## What it guarantees, and what it cannot
 
@@ -76,15 +85,14 @@ the sender itself (a forfeit) is simply taken.
 ## Not built (and not claimed)
 
 * The battle is **not written into your record** (the career schema has no human-opponent entry; changing it touches stored profiles).
-* **A reloaded page forfeits** (there is no rejoin by replay).
 * No ratings, ladders, spectators, rentals or doubles.
 
 ## Tests
 
 ```bash
 node tools/pokemonarena_netmatch_test.mjs             # the protocol on the real engine, in Node (~1.5 s)
-node tools/pokemonarena_netmatch_test.mjs --mutants   # ... and prove it is not vacuous: break netmatch.js / matchctl.js / engine.js, each must fail a named case
-node tools/pokemonarena_online_page_test.mjs          # two real Chrome tabs; groups: hub lobby match leaving timeout refusals teams layout (name them to run a subset)
+node tools/pokemonarena_netmatch_test.mjs --mutants   # ... and prove it is not vacuous: break netmatch.js / matchctl.js / engine.js 23 ways, each must fail a named case
+node tools/pokemonarena_online_page_test.mjs          # two real Chrome tabs; groups: hub lobby match leaving rejoin timeout refusals teams layout (name them to run a subset)
 node tools/multiplayer_page_test.mjs                  # the lobby catalogue and hand-off, Arena included
 node tools/no_streaming_test.mjs                      # online pages are lockstep-only; this module is one of them
 node tools/stamp_lib_versions.mjs --check             # battle.html carries the version stamp that tells two builds apart

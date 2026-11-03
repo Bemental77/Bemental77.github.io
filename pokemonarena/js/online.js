@@ -20,10 +20,13 @@ import { readHubData, teamCodeFor } from './hub_data.js';
 import { judgeTeamCode, randomTeamCode, buildNetController, engineFingerprint } from './online_match.js';
 import { createNetMatch, cleanName, NAME_MAX } from './netmatch.js';
 import { PINNED } from './rom.js';
+import { navigationType } from './battle_resume.js';
 
 export const GAME_KEY = 'Pokemon Arena';
 export const ROOM_RE = /^[A-Za-z0-9]{4,8}$/;
 const LS_NAME = 'arena.online.name';
+const resumeKey = (room, role) => 'arena.online:' + room + ':' + role;       // sessionStorage: per tab, gone when the tab closes, never sent anywhere
+const RESUME_MAX_AGE_MS = 4 * 3600 * 1000;
 
 /** -> null (not an online address) | { error } | { role: 'host' | 'guest' | null, room, transport, limits }. Never throws. */
 export function parseOnlineQuery(search) {
@@ -70,8 +73,40 @@ export function createOnline(cfg) {
   // every use of the clock here is a DURATION (a turn's allowance, a link's grace), so it is the monotonic one: a wall-clock step (NTP, a changed timezone) must not time anyone out
   const now = cfg.now || (() => (win.performance && typeof win.performance.now === 'function' ? win.performance.now() : Date.now()));
   const state = { stage: 'setup', role: query.role, room: query.room, transport: query.transport, nm: null, session: null, mine: null, name: null, fmt: null, error: null, info: null, matches: 0 };
-  let panel = null, bar = null, barTimer = 0, preMsgs = [], wired = false, closed = false;
+  let panel = null, bar = null, barTimer = 0, preMsgs = [], wired = false, closed = false, reconnecting = false;
   const Netplay = () => win.Netplay;
+
+  /* ---------------------------------------------------------------------------------------------- a record to come back to
+   * A RELOAD (or a restored tab) must not lose the battle. After every change the match's snapshot (netmatch.js: the seed, every choice taken, the round, the committed choice, the
+   * messages sent) is kept in sessionStorage with both team codes. A page that is RELOADED (not opened afresh) rebuilds the battle from it, replays it silently, and re-syncs with the
+   * other player through the same room code; the host admits the same player again without a prompt (lib/netplay.js remembers the seat), a returning host is asked once. */
+  const sstore = () => { try { return win.sessionStorage; } catch (_e) { return null; } };
+  function readRecord() {
+    const ss = sstore();
+    if (!ss || !query.room || !query.role) return null;
+    let rec = null;
+    try { rec = JSON.parse(ss.getItem(resumeKey(query.room, query.role)) || 'null'); } catch (_e) { return null; }
+    const ok = rec && typeof rec === 'object' && rec.v === 1 && rec.room === query.room && rec.role === query.role && typeof rec.myTeam === 'string' && typeof rec.oppTeam === 'string'
+      && rec.myTeam.length <= 1100 && rec.oppTeam.length <= 1100 && typeof rec.myName === 'string' && Number.isFinite(rec.at) && Date.now() - rec.at <= RESUME_MAX_AGE_MS && rec.at <= Date.now() + 60000;
+    return ok ? rec : null;
+  }
+  function clearRecord() { try { const ss = sstore(); if (ss && state.room && state.role) ss.removeItem(resumeKey(state.room, state.role)); } catch (_e) { /* ignore */ } }
+  function persist() {
+    const nm = state.nm, ss = sstore();
+    if (!nm || !ss || closed || !state.myTeamCode || !state.oppTeamCode) return;
+    const snap = nm.snapshot();
+    if (!snap) return;
+    try { ss.setItem(resumeKey(state.room, state.role), JSON.stringify({ ...snap, myTeam: state.myTeamCode, oppTeam: state.oppTeamCode, myName: state.name, at: Date.now() })); } catch (_e) { /* storage full or blocked: this match simply cannot be resumed */ }
+  }
+  // the address a reload must come back to: the room and the role, so that the record above can be found (a host who started from ?online=1 had neither)
+  function canonicalizeUrl(role, room) {
+    try {
+      const u = new URL(win.location.href);
+      u.searchParams.delete('online'); u.searchParams.delete('host'); u.searchParams.delete('join');
+      u.searchParams.set('np', room); u.searchParams.set(role === 'host' ? 'host' : 'join', '1');
+      win.history.replaceState(null, '', u.pathname + u.search + u.hash);
+    } catch (_e) { /* the address stays as it was; a reload just starts a new setup */ }
+  }
 
   /* ---------------------------------------------------------------------------------------------- the setup panel */
   const ui = {};
@@ -178,9 +213,10 @@ export function createOnline(cfg) {
     if (!mine.ok) { ui.go.disabled = false; say(mine.message, true); return; }
     const fmt = role === 'host' ? ui.fmt.value : null;
     if (fmt === '3v3' && mine.size < 3) { ui.go.disabled = false; say('A 3v3 battle needs at least 3 Pokemon on your team.', true); return; }
-    state.mine = mine; state.name = name; state.fmt = fmt;
+    state.mine = mine; state.name = name; state.fmt = fmt; state.myTeamCode = tc.code;
     if (role === 'host') room = room || Netplay().makeCode(5, 'pokemonarena');
     state.room = room;
+    canonicalizeUrl(role, room);
     lockSetup(role, room);
     startSession(role, room, tc.code);
   }
@@ -206,19 +242,32 @@ export function createOnline(cfg) {
     session.on('status', (e) => {
       if (closed) return;
       if (e.state === 'connected') {
-        if (!everConnected) { everConnected = true; createMatch(role, room, teamCode); }
-        else if (state.nm) state.nm.linkChanged(true);
+        everConnected = true;
+        if (state.nm) state.nm.linkChanged(true);          // a reconnection, or a page that was reloaded into a match
+        else createMatch(role, room, teamCode);
       } else if (e.state === 'failed') {
-        if (!everConnected) { state.stage = 'setup'; reopenSetup(); say(connectError(session.lastError || e.detail), true); }
-        else if (state.nm) state.nm.linkChanged(false);
+        if (state.nm) { state.nm.linkChanged(false); scheduleReconnect(role, room, teamCode); }
+        else if (!everConnected) { state.stage = 'setup'; reopenSetup(); say(connectError(session.lastError || e.detail), true); }
       } else if ((e.state === 'closed' || e.state === 'signalling') && everConnected && state.nm) state.nm.linkChanged(false);
     });
     session.on('peer-left', () => { if (state.nm && !closed) state.nm.linkChanged(false); });
     session.on('kicked', (e) => { if (!closed) fatal('You were removed from the room', (e && e.why) || 'The host removed you from the room.'); });
     let ok = false;
     try { ok = await session.start(); } catch (e) { session.lastError = String(e && e.message ? e.message : e); }
+    if (!ok && state.nm) { state.nm.linkChanged(false); scheduleReconnect(role, room, teamCode); return; }
     if (!ok && !everConnected) { reopenSetup(); say(connectError(session.lastError), true); return; }
-    if (ok && role === 'host' && !everConnected && !closed) openedRoom(room);
+    if (ok && role === 'host' && !everConnected && !closed && !state.nm) openedRoom(room);
+  }
+  // a session that failed while a match exists is replaced by a fresh one under the same code (the match's own clock decides when to give up)
+  function scheduleReconnect(role, room, teamCode) {
+    if (reconnecting || closed || !state.nm || state.nm.phase !== 'playing') return;
+    reconnecting = true;
+    win.setTimeout(() => {
+      reconnecting = false;
+      if (closed || !state.nm || state.nm.phase !== 'playing') return;
+      try { if (state.session) state.session.close(); } catch (_e) { /* ignore */ }
+      startSession(role, room, teamCode);
+    }, 2500);
   }
   function openedRoom(room) {
     state.stage = 'open'; state.roomOpen = true;
@@ -241,47 +290,56 @@ export function createOnline(cfg) {
     root.querySelector('#online').hidden = false;
   }
 
-  function createMatch(role, room, teamCode) {
+  function createMatch(role, room, teamCode, resume) {
     const mineCard = state.mine;
-    let theirs = null;        // the judged opponent card, kept for makeController
+    let theirs = resume ? resume.theirs : null;        // the judged opponent card, kept for makeController
     const nm = state.nm = createNetMatch({
       role, room, limits: query.limits, now,
       send: (msg) => { try { return !!state.session._send(msg); } catch (_e) { return false; } },
       mine: { rom: PINNED.sha256, fp: cfg.fingerprint, rs: mineCard.rs, name: state.name, team: teamCode, size: mineCard.size, fmt: state.fmt },
-      judge: async (card) => { const j = await judgeTeamCode(card.team, pack); theirs = j; return j; },
+      judge: async (card) => { const j = await judgeTeamCode(card.team, pack); theirs = j; if (j && j.ok) state.oppTeamCode = j.code; return j; },
       makeController: ({ seed, mySide, fmt, names }) => buildNetController({ pack, mySide, seed, fmt, names, mine: mineCard, theirs }),
       on: {
         phase: (p, info) => onPhase(p, info),
         controller: (ctl) => onController(ctl),
         notice: (t, kind) => flash(t, kind),
         end: (res) => onEnd(res),
-        progress: () => renderBar(),
+        progress: () => { renderBar(); persist(); },
       },
     });
+    startBar();
+    if (!wired) { wired = true; win.addEventListener('pagehide', onPageHide); }
+    if (resume) {                      // a reloaded page: the battle is rebuilt from the record (this fires 'controller' with the replayed match, or 'failed')
+      state.stage = 'resuming'; hooks.stage && hooks.stage('resuming');
+      nm.resume(resume.rec);
+      return;
+    }
     state.stage = 'handshake';
     for (const m of preMsgs.splice(0)) nm.receive(m);
     nm.start();
-    startBar();
     say('Connected. Checking the teams...');
-    if (!wired) { wired = true; win.addEventListener('pagehide', onPageHide); }
     hooks.stage && hooks.stage('handshake');
   }
-  function onPageHide(ev) { if (ev && ev.persisted) return; if (state.nm && !closed) { try { state.nm.leave('closed'); } catch (_e) { /* ignore */ } } }
+  // A page that is closing does NOT forfeit: it may be a RELOAD, and the record kept above brings the battle back. The other player sees the link drop and waits (60 s); if this
+  // page never returns they win. Leaving ON PURPOSE (a forfeit, BACK TO HUB) still ends it at once.
+  function onPageHide() { persist(); }
 
   /* ---------------------------------------------------------------------------------------------- the match */
   function onController(ctl) {
     state.matches++;
     const nm = state.nm;
-    const info = { mySide: nm.mySide, names: nm.names.slice(), myName: nm.myName, oppName: nm.oppName, seed: nm.seed, fmt: nm.fmt, mn: nm.mn, room: state.room, role: nm.role };
+    const info = { mySide: nm.mySide, names: nm.names.slice(), myName: nm.myName, oppName: nm.oppName, seed: nm.seed, fmt: nm.fmt, mn: nm.mn, room: state.room, role: nm.role, resumed: !!nm.resumed };
     state.info = info;
     state.stage = 'playing';
     panel.hidden = true;
     hooks.mountScene(ctl, info);
     renderBar();
+    persist();
   }
   function onPhase(p, info) {
     if (p === 'failed') fatal(titleFor(info), info && info.message ? info.message : 'The match was stopped.');
-    else if (p === 'over') { state.stage = 'over'; renderBar(); }
+    else if (p === 'over') { state.stage = 'over'; clearRecord(); renderBar(); }
+    else if (p === 'closed') clearRecord();
     else if (p === 'seed' && state.matches > 0) { state.stage = 'handshake'; flash('Starting the rematch...', 'info'); }
     renderBar();
   }
@@ -299,7 +357,7 @@ export function createOnline(cfg) {
   function fatal(title, message) {
     if (closed) return;
     state.stage = 'failed'; state.error = { title, message };
-    stopBar();
+    clearRecord(); stopBar();
     try { if (state.session) state.session.close(); } catch (_e) { /* ignore */ }
     panel.hidden = true;
     hooks.showFatal({ title, message });
@@ -313,7 +371,7 @@ export function createOnline(cfg) {
   }
   function leaveToHub() {
     if (state.nm && !closed) { try { state.nm.leave('left'); } catch (_e) { /* ignore */ } }
-    closed = true; stopBar();
+    clearRecord(); closed = true; stopBar();
     setTimeout(() => { try { if (state.session) state.session.close(); } catch (_e) { /* ignore */ } hooks.toHub(); }, 60);       // let the goodbye leave before the channel closes
   }
 
@@ -374,6 +432,35 @@ export function createOnline(cfg) {
   /* ---------------------------------------------------------------------------------------------- start */
   async function begin() {
     buildPanel();
+    // a RELOAD of a battle that was under way picks it up again; opening the same address afresh (typing it, following a link) never does
+    const rec = readRecord();
+    if (rec) {
+      const nt = navigationType();
+      if (nt === 'reload' || nt === 'back_forward') { if (await resumeFlow(rec)) return; }
+      else { state.room = rec.room; state.role = rec.role; clearRecord(); }
+    }
+    await setupForm();
+  }
+
+  /** -> true when the battle is being resumed (the scene is mounted by the match's 'controller' event), false when the page should show the setup form after all. */
+  async function resumeFlow(rec) {
+    state.stage = 'resuming'; state.role = rec.role; state.room = rec.room; state.name = rec.myName; state.fmt = rec.fmt;
+    state.myTeamCode = rec.myTeam; state.oppTeamCode = rec.oppTeam;
+    ui.lede.textContent = 'Picking your battle up again...';
+    say('Picking your battle up again...');
+    hooks.stage && hooks.stage('resuming');
+    const giveUp = async (why) => { clearRecord(); state.stage = 'setup'; state.nm = null; await setupForm(); say(why + ' Start a new battle below.', true); return false; };
+    if (!Netplay() || typeof Netplay().supported !== 'function' || !Netplay().supported()) return giveUp('This browser cannot connect two players any more.');
+    const [mine, theirs] = await Promise.all([judgeTeamCode(rec.myTeam, pack), judgeTeamCode(rec.oppTeam, pack)]);
+    if (!mine.ok || !theirs.ok) return giveUp('Your battle could not be picked up again: a team no longer checks out.');
+    state.mine = mine;
+    createMatch(rec.role, rec.room, rec.myTeam, { rec, theirs });
+    if (state.stage === 'failed') return true;          // nm.resume refused the record: fatal() has said so and cleared it
+    startSession(rec.role, rec.room, rec.myTeam);
+    return true;
+  }
+
+  async function setupForm() {
     const { choices, name } = await gatherTeams();
     state.choices = choices;
     for (const c of choices) ui.team.append(el(doc, 'option', { value: c.key, text: c.label, 'data-size': String(c.size || 6) }));

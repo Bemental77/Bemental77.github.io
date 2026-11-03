@@ -367,6 +367,78 @@ async function suiteMain(S, label, { only } = {}) {
     ok(h2.host.nm.phase === 'failed' && h2.host.nm.error.code === 'equivocation', tag('J a second, different hello is equivocation'), JSON.stringify(h2.host.nm.error));
   }
 
+  // ---- R. a reload ------------------------------------------------------------------------------------------------------------------------------
+  // The page dies and comes back from what its sessionStorage held (nm.snapshot()). At EVERY step of two real matches, for the host and for the guest, with and without the
+  // messages the dying page had sent but the wire had not delivered: the battle must finish in the exact final position of the uninterrupted one.
+  if (run('R')) {
+    const playing = (rig) => rig.host.nm.phase === 'playing' && rig.guest.nm.phase === 'playing';
+    const refs = {};
+    for (const seedBase of [71, 72, 78]) { const ref = await makeRig(S, { seedBase, fmt: '3v3' }); await ref.run(); refs[seedBase] = { hash: ref.host.nm.result.hash, winner: ref.host.nm.result.winnerSide, steps: ref.steps }; }
+    let cases = 0, good = 0, resentNeeded = 0;
+    for (const seedBase of [71, 72, 78]) {
+      const ref = refs[seedBase];
+      // 'clean' = nothing in flight; 'lose' = whatever was still queued toward the other side is lost; 'act-lose' = the player ANSWERS and the page dies before that message is delivered
+      for (const role of ['host', 'guest']) for (const mode of (seedBase === 78 ? ['clean', 'lose'] : ['clean', 'lose', 'act-lose'])) for (let k = 1; k < ref.steps; k++) {
+        const loseOutgoing = mode !== 'clean';
+        const rig = await makeRig(S, { seedBase, fmt: '3v3' });
+        await rig.start(); await rig.until(() => playing(rig));
+        for (let i = 0; i < k && playing(rig); i++) await rig.step();
+        if (!playing(rig)) continue;
+        if (mode === 'act-lose') { rig.actNoPump(role); await settle(); }
+        const c = await rig.crash(role, { loseOutgoing });
+        if (c.skipped) continue;
+        cases++;
+        for (let i = 0; i < 4000 && !finished(rig) && !both(rig).some((P) => P.nm.phase === 'failed'); i++) { if (!(await rig.step())) { await settle(); if (!(await rig.step())) break; } }
+        const same = finished(rig) && rig.host.nm.result.hash === ref.hash && rig.guest.nm.result.hash === ref.hash && rig.host.nm.result.winnerSide === ref.winner;
+        if (c.ok && same && !rig.host.nm.error && !rig.guest.nm.error && rig[role].nm.resumed === true) good++;
+        else ok(false, tag(`R${seedBase} ${role} reloaded at step ${k} (${mode}) ends in the same battle`), `resume=${c.ok} phases=${phasesOf(rig)} err=${JSON.stringify(errCodes(rig))} hash=${rig.host.nm.result && rig.host.nm.result.hash} want ${ref.hash}`);
+      }
+    }
+    ok(cases >= 150 && good === cases, tag('R every reload point of two real matches, host and guest, ends in the uninterrupted match\'s exact final position'), good + '/' + cases);
+
+    // a record that does not replay is refused by name, never guessed at
+    const setup = async (seedBase, steps, o = {}) => { const rig = await makeRig(S, { seedBase, fmt: '3v3', ...o }); await rig.start(); await rig.until(() => playing(rig)); for (let i = 0; i < steps && playing(rig); i++) await rig.step(); return rig; };
+    const bads = [
+      ['a state hash that does not match the replay', (r) => { r.hash = '0'.repeat(16); }],
+      ['a seed that is not the one the battle was played with', (r) => { r.seed = (r.seed ^ 1) >>> 0; }],
+      ['a recorded choice that is not legal', (r) => { r.log[0] = { s: r.log[0].s, c: { kind: 'preview', order: [0, 1] } }; }],
+      ['a record for the other role', (r) => { r.role = r.role === 'host' ? 'guest' : 'host'; }],
+      ['a record for another room', (r) => { r.room = 'ELSEWHERE'; }],
+      ['a log that is not a list', (r) => { r.log = 'x'; }],
+      ['a format that is not a format', (r) => { r.fmt = '9v9'; }],
+    ];
+    for (const [what, f] of bads) {
+      const rig = await setup(74, 4);
+      const c = await rig.crash('guest', { tamper: (r) => { f(r); return r; } });
+      ok(c.ok === false && rig.guest.nm.phase === 'failed' && rig.guest.nm.error && rig.guest.nm.error.code === 'resume', tag('R a record with ' + what + ' is refused by name'), JSON.stringify([c.ok, rig.guest.nm.phase, rig.guest.nm.error]));
+    }
+    // junk in the stored messages is dropped, not believed
+    const jr = await setup(74, 4);
+    const jc = await jr.crash('guest', { tamper: (r) => { r.outLog = [{ junk: 1 }, 5, null, { t: 'lsarena', v: 1, k: 'commit', mn: 1 }].concat(r.outLog); } });
+    for (let i = 0; i < 4000 && !finished(jr) && !both(jr).some((P) => P.nm.phase === 'failed'); i++) { if (!(await jr.step())) { await settle(); if (!(await jr.step())) break; } }
+    ok(jc.ok && finished(jr) && !jr.host.nm.error && !jr.guest.nm.error, tag('R junk among the stored messages is dropped and the battle still finishes'), phasesOf(jr).join());
+    // a choice committed before the reload cannot be opened without its nonce: refused, not guessed
+    const sr = await makeRig(S, { seedBase: 75, fmt: '3v3' });
+    await sr.start(); await sr.until(() => playing(sr)); sr.host.hold = true;
+    for (let i = 0; i < 6; i++) await sr.step();
+    const sc = await sr.crash('guest', { tamper: (r) => { r.secret = null; } });
+    ok(sc.ok === false && sr.guest.nm.error && sr.guest.nm.error.code === 'resume', tag('R a commitment whose nonce is gone is refused by name'), JSON.stringify([sc.ok, sr.guest.nm.error]));
+    // a page that is reloaded and never reaches the other player does not claim the other player left
+    const nr = await setup(76, 4, { limits: { graceMs: 30000 } });
+    const nc = await nr.crash('host', { reconnect: false });
+    nr.advance(31000); nr.host.nm.tick(); nr.guest.nm.tick();
+    ok(nc.ok && nr.host.nm.phase === 'failed' && nr.host.nm.error.code === 'timeout' && !nr.host.nm.result, tag('R a reloaded page that cannot get back is stopped, and does not score a win for itself'), JSON.stringify([nr.host.nm.phase, nr.host.nm.error, nr.host.nm.result]));
+    ok(nr.guest.nm.phase === 'over' && nr.guest.nm.result && nr.guest.nm.result.iWon, tag('R ... while the player who stayed wins after the grace period'), nr.guest.nm.phase);
+    // the first message a resumed page gets from the other side may be the handshake it already did: that is ignored, not an error
+    const hr = await setup(77, 5);
+    await hr.crash('host');
+    const hello = hr.wire.log.filter((e) => e.from === 'guest' && e.msg.k === 'hello')[0].msg;
+    hr.host.nm.receive({ ...hello });
+    hr.host.nm.receive({ ...hello, name: 'Mallory' });
+    await settle();
+    ok(hr.host.nm.phase === 'playing', tag('R a handshake message resent after a reload is ignored, even a different one (the page is past the handshake)'), hr.host.nm.phase);
+  }
+
   // ---- M. what a message may be ----------------------------------------------------------------------------------------------------------------------------
   if (run('M')) {
     const NM = S.netmatch;
@@ -433,6 +505,11 @@ const MUTANTS = [
   { id: 'bye-concedes-self', why: 'when the other player leaves, the wrong side is scored as the loser', file: 'netmatch.js', from: /conceded = why === 'timeout' \? 'timeout' : 'left';\n      nm\.ctl\.concede\(oppSide\);/, to: "conceded = why === 'timeout' ? 'timeout' : 'left';\n      nm.ctl.concede(mySide);", cases: ['H'] },
   { id: 'concede-no-pump', why: 'a player leaving does not end the battle on the other machine', file: 'matchctl.js', from: /announce\(side, \{ kind: 'forfeit' \}\);\n    pump\(\);\n    return r;/, to: "announce(side, { kind: 'forfeit' });\n    return r;", cases: ['H'] },
   { id: 'engine-concede-keeps-choice', why: 'a conceded choice stays in the choice log, so the log no longer replays to the battle', file: 'engine.js', from: /for \(let i = this\.choiceLog\.length - 1; i >= 0; i--\) if \(this\.choiceLog\[i\]\.s === side\) \{ this\.choiceLog\.splice\(i, 1\); break; \}/, to: '', cases: ['H'] },
+  { id: 'resume-ignores-hash', why: 'a record that replays to a different position is accepted', file: 'netmatch.js', from: /if \(ctl\.battle\.hash\(\) !== rec\.hash\) return bad\('the replay did not reach the recorded position'\);/, to: '', cases: ['R'] },
+  { id: 'resume-needs-from-requests', why: 'a reloaded page numbers a round by who has an open request, so a round it already answered looks one-sided', file: 'netmatch.js', from: /typeof ctl\.needs === 'function' \? ctl\.needs\(s\) : !!pend\(s\)/, to: '!!pend(s)', cases: ['R'] },
+  { id: 'resume-recomputes-round-hash', why: 'a reloaded page uses the hash of the engine AS REBUILT (which already holds its own answer) as the round-opening hash, so the other side calls it a desync', file: 'netmatch.js', from: /if \(typeof rec\.rh === 'string' && rec\.rh\.length > 0 && rec\.rh\.length <= LIMITS\.str\) round\.hash = rec\.rh;/, to: '', cases: ['R'] },
+  { id: 'resume-forgets-sent-messages', why: 'the messages sent before the reload are not restored, so nothing lost in flight is resent', file: 'netmatch.js', from: /outLog = rec\.outLog\.filter\(/, to: 'outLog = [].filter(', cases: ['R'] },
+  { id: 'resume-believes-the-other-left', why: 'a reloaded page that never got back claims the other player left', file: 'netmatch.js', from: /if \(!everUp\) return fail\('timeout'/, to: "if (false) return fail('timeout'", cases: ['R'] },
   { id: 'claims-believed', why: 'a claim that you timed out is believed without checking your own clock', file: 'netmatch.js', from: /!plausibleClaim\(m\.why\)\) \{/, to: 'false) {', cases: ['H'] },
   { id: 'no-equivocation', why: 'a second, different commitment for a round is not noticed', file: 'netmatch.js', from: /if \(round\.theirs && round\.theirs\.c\) \{ if \(round\.theirs\.c !== m\.c\) fail\('equivocation'[^\n]*\n/, to: 'if (round.theirs && round.theirs.c) return;\n', cases: ['J'] },
   { id: 'names-not-cleaned', why: 'a hostile name goes into the battle as it was sent', file: 'netmatch.js', from: /t = t\.replace\(\/\[\^A-Za-z0-9 \.'_!\?-\]\/g, ''\)/, to: 't = t', cases: ['G', 'M'] },

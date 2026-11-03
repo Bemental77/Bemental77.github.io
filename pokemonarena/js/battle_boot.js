@@ -410,10 +410,12 @@ async function main() {
       const mountOnlineScene = (c, info) => {
         ctl = c; battleRuleset = c.netMeta.ruleset;
         hook.seed = info.seed; hook.params.seed = info.seed;
+        // a RELOADED battle: its history is already in the controller, and the scene plays it silently and at speed (the same replay the CPU battle's reload uses), then goes on live
+        resuming = !!info.resumed;
         scene = createScene({
           ui, pack: packRef, text, ctl: c, viewSide: info.mySide, resultOptions: resultOptionsFor(), env: info.seed % 9, textSpeed: params.speed, meta: c.netMeta.meta,
           trainer: info.oppName, playerName: 'You', trainerChoices: trainerChoicesOf(), cpuLevel: 'normal', clock: () => performance.now(), sound: soundApi, quitLabel: 'BACK TO HUB',
-          anim: animCfg, animator, animSeed: info.seed,
+          anim: animCfg, animator: resuming ? null : animator, animSeed: info.seed,
           hooks: mkHooks({
             onResult: onResult,
             onMatchEnd: () => { try { scene.setCareer({ state: 'none', notes: ['Online battles are not kept', 'in your record yet.'] }); } catch (_e) { /* the result screen still shows */ } },
@@ -421,6 +423,7 @@ async function main() {
           }),
         });
         scene.begin();
+        if (resuming) { hook.resume = { restored: true, online: true, frames: scene.catchUp() }; resuming = false; scene.setAnimator(animator); }
         if (soundSys) soundSys.hookScene(scene);
         if (scene.mode === 'steps') scene.tick();
         hook.online = online;

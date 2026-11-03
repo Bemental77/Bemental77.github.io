@@ -203,7 +203,7 @@ after every GR5 run. **Nothing here ran on a real phone, with a second human, ov
 ## Pokemon Arena online play (2026-11-03): R7 and R8 built, with ONE deviation from this plan
 
 **Built:** battle a friend over the internet (`pokemonarena/ONLINE.md`): R7 the match protocol and R8 the lobby entry, tag `A` and the standing gates. `tools/pokemonarena_netmatch_test.mjs`
-(207 checks, 18 mutants killed), `tools/pokemonarena_online_page_test.mjs` (two real Chrome tabs through the real lobby), `multiplayer_page_test` 83/0, `no_streaming_test` 11/11.
+(220 checks, 23 mutants killed), `tools/pokemonarena_online_page_test.mjs` (two real Chrome tabs through the real lobby), `multiplayer_page_test` 83/0, `no_streaming_test` 11/11.
 
 **The deviation, stated plainly because the plan said it needed the owner's sign-off (Part 4 item 9).** Part 3 chose "the unmodified Lockstep engine with frame = a fixed 30 Hz tick". It was
 NOT used. The match runs on a message-driven protocol (`pokemonarena/js/netmatch.js`) over the same `Netplay.Session` channel: every machine still runs the whole engine, only the two players'

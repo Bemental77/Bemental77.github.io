@@ -55,8 +55,9 @@ export async function makeRig(S, opts = {}) {
     if (!judged.ok && !opts.allowBadOwn) throw new Error('own team rejected: ' + judged.message);
     const P = { role, side, name, code, log: [], notices: [], ends: [], phases: [], judged, ai: ai.createAi({ pack, level: (role === 'host' ? opts.aiLevelA : opts.aiLevelB) || 'normal', seed: 31 * (i + 1) + seedBase }), chose: 0 };
     const peerRole = role === 'host' ? 'guest' : 'host';
-    P.nm = netmatch.createNetMatch({
-      role, room: opts.room || 'ROOM' + seedBase, now: () => clock.t, randomBytes: rngBytes(seedBase * 7919 + i * 104729 + 13), limits: opts.limits,
+    P.crashes = 0;
+    P.make = () => netmatch.createNetMatch({
+      role, room: opts.room || 'ROOM' + seedBase, now: () => clock.t, randomBytes: rngBytes(seedBase * 7919 + i * 104729 + 13 + P.crashes * 7), limits: opts.limits,
       send: (msg) => {
         let m = JSON.parse(JSON.stringify(msg));
         if (wire.rewrite) { const x = wire.rewrite(role, m); if (x) m = JSON.parse(JSON.stringify(x)); }       // a hostile or buggy sender: what leaves is not what the engine meant
@@ -75,6 +76,7 @@ export async function makeRig(S, opts = {}) {
         controller: (ctl) => { P.ctl = ctl; },
       },
     });
+    P.nm = P.make();
     return P;
   };
   players.host = await mkPlayer('host', codeA, opts.nameA || 'Alice', 0);
@@ -103,10 +105,12 @@ export async function makeRig(S, opts = {}) {
     return true;
   };
   const rig = {
+    steps: 0,
     S, wire, clock, host: players.host, guest: players.guest, fp, codeA, codeB, pumpWire, deliver,
     async start() { players.host.nm.start(); players.guest.nm.start(); await settle(); await pumpWire(); },
     /** one round of play for both seats + wire; returns true if anything moved */
     async step() {
+      rig.steps++;
       let moved = false;
       for (const P of [players.host, players.guest]) if (act(P)) moved = true;
       await settle();
@@ -131,6 +135,31 @@ export async function makeRig(S, opts = {}) {
       }
       return fn();
     },
+    /**
+     * THE PAGE IS RELOADED. What its sessionStorage held (nm.snapshot()) survives, everything else dies: whatever was in flight toward it is lost, the other side sees the link
+     * drop, a NEW protocol instance picks the battle up from the record, and both report the link up again. -> { ok, rec }
+     * opts.reconnect = false leaves the new page unable to reach the other player.
+     */
+    async crash(role, { reconnect = true, tamper = null, loseOutgoing = false } = {}) {
+      const P = players[role], peer = players[role === 'host' ? 'guest' : 'host'];
+      const snap = P.nm.snapshot();
+      if (!snap) return { ok: false, rec: null, skipped: true };
+      let rec = JSON.parse(JSON.stringify(snap));
+      if (tamper) rec = tamper(rec) || rec;
+      wire.q[role].length = 0;
+      if (loseOutgoing) wire.q[role === 'host' ? 'guest' : 'host'].length = 0;       // ... and what it had sent that had not arrived
+      peer.nm.linkChanged(false);
+      P.crashes++;
+      P.ctl = null;
+      P.nm = P.make();
+      const ok = P.nm.resume(rec);
+      clock.t += 500;
+      if (reconnect) { peer.nm.linkChanged(true); P.nm.linkChanged(true); }
+      await settle();
+      return { ok, rec };
+    },
+    /** this player answers its open request (if it has one) but the wire is NOT pumped: what it sent is still in flight (so a crash right after can lose it) */
+    actNoPump(role) { return act(players[role]); },
     tick() { players.host.nm.tick(); players.guest.nm.tick(); },
     advance(ms) { clock.t += ms; },
   };
