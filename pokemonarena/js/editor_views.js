@@ -501,14 +501,10 @@ export function profilesView(app) {
 }
 
 function aboutCard() {
-  return h('details', { class: 'card', dataset: { about: '1' } }, h('summary', { style: 'min-height:44px;display:flex;align-items:center;cursor:pointer' }, 'About this editor: what is exact and what is approximate'),
+  return h('details', { class: 'card', dataset: { about: '1' } }, h('summary', { style: 'min-height:44px;display:flex;align-items:center;cursor:pointer' }, 'About this editor'),
     h('ul', { class: 'dim' },
       h('li', null, 'Every picture (party icons, sprites, type badges, move-category icons, stat bars, arrows, portraits) is decoded from the Pokemon SoulGold v1.1.1 ROM this site already serves. Nothing ROM-derived is stored or sent.'),
-      h('li', null, 'Not available from the ROM: held-item icons, the shiny star and a ruleset logo. The editor shows words there instead of invented art.'),
-      h('li', null, 'Stat formulas were read from the ROM routine and checked against known values; whether the hack applies "hyper training" to a stored Pokemon is not modelled.'),
-      h('li', null, 'Hidden Power: the type comes from the IVs by the Gen 3 rule; the power shown is the ROM move table\'s 60. Whether the arena engine uses 30 to 70 instead is undecided.'),
-      h('li', null, 'The held-item list defaults to items with a hold effect (388 of 930): a convenience filter, not a rule. Untick it to see every item.'),
-      h('li', null, 'Legality comes from the rules module: it checks consistency (levels, EVs, IVs, learnable moves), it is not anti-cheat.'),
+      h('li', null, 'The held-item list defaults to items with a hold effect (388 of 930). Untick it to see every item.'),
       h('li', null, 'Forms: battle-only forms (Mega and the like) are ordinary roster entries; they are listed with "form" next to their Pokedex number.')));
 }
 
