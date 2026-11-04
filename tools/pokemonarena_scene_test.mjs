@@ -667,7 +667,7 @@ if (process.env.ARENA_SKIP_MUTANTS !== '1') {
     ['battle_resume.js', 'W1 D11: a replay that does not match the saved hash is accepted', (s) => s.replace("if (!why && String(ctl.battle.hash()) !== String(rec.hash)) why = 'the replayed battle is not the saved one';", '')],
     ['battle_resume.js', 'W1 D11: a fresh visit of the address resumes the old battle', (s) => s.replace("if (info.navType !== 'reload' && info.navType !== 'back_forward') {", 'if (false) {')],
     ['battle_resume.js', 'W1 D11: a refused choice in the record is shrugged off', (s) => s.replace("if (!r || !r.ok) why = ", 'if (false) why = ')],
-    ['battle_resume.js', 'W1 D11: a finished battle still writes its record', (s) => s.replace('try { if (ctl.winner !== null) store.clear(); else store.write(snapshotOf(ctl, seed, humanSide)); }', 'try { store.write(snapshotOf(ctl, seed, humanSide)); }')],
+    ['battle_resume.js', 'W1 D11: a finished battle still writes its record', (s) => s.replace('try { if (ctl.winner !== null) store.clear(); else store.write(snapshotOf(ctl, seed, humanSide, tag)); }', 'try { store.write(snapshotOf(ctl, seed, humanSide, tag)); }')],
     ['scene.js', 'W1 D11: catchUp plays nothing', (s) => s.replace("while (n < max && (S.mode === 'steps' || S.cur || S.queue.length)) { tick(); n++; } } finally", 'while (n < 0) { tick(); n++; } } finally')],
     ['scene.js', 'W1 D11: catchUp leaves A held down', (s) => s.replace('finally { S.held.a = a; S.held.b = b; }', 'finally { }')],
     ['scene.js', 'W1 A4: a tap above the move menu does nothing', (s) => s.replace("return y < ui.R.mv[0].y ? { kind: 'back', index: 0 } : null;", 'return null;')],

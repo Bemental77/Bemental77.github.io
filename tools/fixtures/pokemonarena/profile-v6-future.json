@@ -1,6 +1,6 @@
 {
  "app": "pokemonarena",
- "schemaVersion": 5,
+ "schemaVersion": 6,
  "id": "p_future",
  "rev": 4,
  "createdAt": 1700000000000,

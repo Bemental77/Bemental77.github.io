@@ -10,7 +10,8 @@
 //   hub.press('a');                    // -> [{ type: 'screen', path: 'quick' }]  (a screen change; the page mirrors it into the address bar)
 //   hub.view()                         // -> a plain JSON description hub_screen.js draws
 //
-// SCREENS   main    QUICK BATTLE / BATTLE WITH MY TEAM / RECORD / TEAM BUILDER / IMPORT SAVE / CONTROLS / SOUND / ABOUT
+// SCREENS   main    QUICK BATTLE / BATTLE WITH MY TEAM / TOWER / RECORD / TEAM BUILDER / IMPORT SAVE / CONTROLS / SOUND / ABOUT   (more rows than fit scroll: MAIN_VISIBLE at a time)
+//           tower*  the Pokemon Tower's screens (tower_hub.js owns them; this module only hands every tower path to it): tower, tower-new, tower-offer, tower-buffs, tower-ach, tower-last
 //           quick   FORMAT, CPU, START, BACK            (random teams against the CPU)
 //           team    [PROFILE], TEAM, FORMAT, CPU, START, BACK   (one of the player's saved teams against a random CPU team)
 //           record  the trainer's battle record, in pages (record_model.js); left / right turn the page, up / down switch trainer (several profiles) or turn it (one),
@@ -26,15 +27,18 @@
 //           { type: 'battle', mode: 'quick' | 'team', format, cpu, profileId?, teamId? }   START was chosen
 //           { type: 'blocked', reason }     START refused (a message is also shown in the text box)
 //           { type: 'record-reset', profileId }   RESET RECORD was answered YES (the page empties that profile's record in the store and reloads the list)
+//           { type: 'tower-new' | 'tower-fight' | 'tower-pick' | 'tower-giveup', ... }   the Tower's (tower_hub.js lists them)
 
 import { buildRecordNotice, buildResetConfirm } from './record_model.js';
+import { createTowerHub, TOWER_PATHS, isTowerPath, towerParent } from './tower_hub.js';
 
 export const SCREEN_W = 240, SCREEN_H = 160;
 export const FORMATS = Object.freeze(['3v3', '6v6']);
 export const CPU_LEVELS = Object.freeze(['easy', 'normal', 'hard']);
 export const BUILDER_URL = '/pokemonarena/editor.html';
 export const IMPORT_URL = '/pokemonarena/editor.html#/import';
-export const PATHS = Object.freeze(['main', 'quick', 'team', 'record', 'about']);
+export const PATHS = Object.freeze(['main', 'quick', 'team', 'record', 'about', ...TOWER_PATHS]);
+export const MAIN_VISIBLE = 8;                   // the main menu shows this many rows; with more it scrolls (a row added later needs no change here)
 
 // geometry shared with the renderer and with hit testing (logical 240x160 pixels)
 export const GEOM = Object.freeze({
@@ -53,6 +57,7 @@ export function menuPitch(n) { return n > 7 ? GEOM.menu.pitchEight : n > 6 ? GEO
 const MAIN_ITEMS = Object.freeze([
   { id: 'quick', label: 'QUICK BATTLE', help: ['Random teams against the CPU.', 'Pick 3v3 or 6v6 and the CPU level.'] },
   { id: 'team', label: 'BATTLE WITH MY TEAM', help: ['Fight with a team you built.', 'Make one in the TEAM BUILDER first.'] },
+  { id: 'tower', label: 'TOWER', help: ['Climb 30 floors of trainers.', 'Win a buff after every floor.'] },
   { id: 'record', label: 'RECORD', help: ['Wins, streaks, best hits, favourites', 'and your last battles, by trainer.'] },
   { id: 'builder', label: 'TEAM BUILDER', help: ['Make a profile and build teams:', 'natures, EVs, IVs, items, moves.'] },
   { id: 'import', label: 'IMPORT SAVE', help: ['Bring Pokemon from your own', 'SoulGold save file. It stays here.'] },
@@ -96,6 +101,7 @@ export function createHubModel(opts = {}) {
     data: { state: 'loading', profiles: [], note: '', activeId: null },       // state: loading | ready | unavailable
     about: { page: 0 }, flash: null, tick: 0, resultsOf: null,
     record: { page: 0, profileId: null, focus: 'page', confirm: null, hover: null },
+    offset: { main: 0 }, link: false,
   };
 
   /* ------------------------------------------------------------------------------------------ team data */
@@ -139,9 +145,19 @@ export function createHubModel(opts = {}) {
     rows.push({ id: 'back', kind: 'button', label: 'BACK' });
     return rows;
   }
-  function rowsOf(path) { return path === 'main' ? mainRows() : path === 'quick' ? quickRows() : path === 'team' ? teamRows() : []; }
+  function rowsOf(path) { return path === 'main' ? mainRows() : path === 'quick' ? quickRows() : path === 'team' ? teamRows() : isTowerPath(path) ? tower.menuRows(path) : []; }
   const rows = () => rowsOf(S.path);
-  function clampCursor() { const n = rows().length; if (n) S.cursor[S.path] = clamp(S.cursor[S.path], 0, n - 1); }
+  function clampCursor() { const n = rows().length; if (n && S.path in S.cursor) S.cursor[S.path] = clamp(S.cursor[S.path], 0, n - 1); }
+  // a menu longer than the room scrolls (the main menu): the rows shown are a window of MAIN_VISIBLE, moved just far enough to keep the cursor in it
+  function mainWindow() {
+    const n = mainRows().length, cur = clamp(S.cursor.main, 0, Math.max(0, n - 1));
+    let off = clamp(S.offset.main, 0, Math.max(0, n - MAIN_VISIBLE));
+    if (cur < off) off = cur; else if (cur >= off + MAIN_VISIBLE) off = cur - MAIN_VISIBLE + 1;
+    S.offset.main = off;
+    return { off, n, size: Math.min(n, MAIN_VISIBLE) };
+  }
+  // THE TOWER (tower_hub.js): every path that starts with "tower" is its own state machine; it gets the profiles the store reader built and asks this module for screen changes
+  const tower = createTowerHub({ profiles: () => S.data.profiles, activeId: () => S.data.activeId, dataState: () => S.data.state, go: (path) => go(path), back: () => back(), path: () => S.path, arrivedByLink: () => S.link });
 
   /* ------------------------------------------------------------------------------------------ text box help */
   function helpFor(row) {
@@ -256,6 +272,7 @@ export function createHubModel(opts = {}) {
     clampCursor();
     const base = { screen: S.path, env: S.env, mascot: mascotNow(), tick: S.tick, sound: S.sound };
     if (S.path === 'record') return recordView();
+    if (isTowerPath(S.path)) return tower.view(S.path, base);
     if (S.path === 'about') {
       const pg = ABOUT_PAGES[S.about.page];
       return { ...base, title: false, about: { page: S.about.page, pages: ABOUT_PAGES.length, lines: pg.slice(), last: S.about.page === ABOUT_PAGES.length - 1 }, menu: null, msg: null };
@@ -263,6 +280,10 @@ export function createHubModel(opts = {}) {
     const rs = rows();
     const cur = S.cursor[S.path];
     const row = rs[cur];
+    if (S.path === 'main') {
+      const w = mainWindow();
+      return { ...base, title: true, menu: { rows: rs.slice(w.off, w.off + w.size).map(({ values, ...r }) => r), cursor: cur - w.off, offset: w.off, total: w.n, up: w.off > 0, down: w.off + w.size < w.n }, about: null, msg: row ? helpFor(row) : ['', ''] };
+    }
     return { ...base, title: true, menu: { rows: rs.map(({ values, ...r }) => r), cursor: cur }, about: null, msg: row ? helpFor(row) : ['', ''] };
   }
 
@@ -270,6 +291,7 @@ export function createHubModel(opts = {}) {
   function go(path) {
     if (!PATHS.includes(path) || path === S.path) return [];
     S.from = S.path; S.path = path; S.flash = null;
+    if (isTowerPath(path)) tower.enter(path);
     if (path === 'about') S.about.page = 0;
     if (path === 'team') normaliseTeamSel();
     if (path === 'record') { const rp = curRecordProfile(); S.record.profileId = rp ? rp.id : null; S.record.page = 0; S.record.focus = 'page'; S.record.confirm = null; S.record.hover = null; }
@@ -278,8 +300,8 @@ export function createHubModel(opts = {}) {
   }
   function back() {
     if (S.path === 'main') return [];
-    const eff = go('main');
-    return eff;
+    const up = isTowerPath(S.path) ? towerParent(S.path) : 'main';
+    return go(up).map((e) => (e.type === 'screen' && up !== 'main' ? { ...e, back: true } : e));          // a step back to a Tower screen says so (the page steps the browser history back rather than adding an entry); the page already treats a return to 'main' as one
   }
 
   function change(row, dir) {
@@ -306,6 +328,7 @@ export function createHubModel(opts = {}) {
       switch (row.id) {
         case 'quick': return go('quick');
         case 'team': return go('team');
+        case 'tower': return go('tower');
         case 'record': return go('record');
         case 'builder': return [{ type: 'navigate', url: BUILDER_URL }];
         case 'import': return [{ type: 'navigate', url: IMPORT_URL }];
@@ -332,8 +355,10 @@ export function createHubModel(opts = {}) {
   const api = {
     view,
     path: () => S.path,
-    state: () => JSON.parse(JSON.stringify({ path: S.path, cursor: S.cursor, quick: S.quick, team: S.team, sound: S.sound, about: S.about, record: { page: S.record.page, focus: S.record.focus, confirm: S.record.confirm ? S.record.confirm.cursor : null }, data: { state: S.data.state, profiles: S.data.profiles.length } })),
+    state: () => JSON.parse(JSON.stringify({ path: S.path, cursor: S.cursor, quick: S.quick, team: S.team, sound: S.sound, about: S.about, record: { page: S.record.page, focus: S.record.focus, confirm: S.record.confirm ? S.record.confirm.cursor : null }, data: { state: S.data.state, profiles: S.data.profiles.length }, tower: tower.state() })),
     rows: () => rows().map(({ values, ...r }) => r),
+    /** The Tower's screens (tower_hub.js): a handle for the page and the tests. */
+    tower,
     tick() { S.tick = (S.tick + 1) >>> 0; },
     setTick(n) { S.tick = n >>> 0; },
     setSound(on) { S.sound = !!on; },
@@ -347,16 +372,18 @@ export function createHubModel(opts = {}) {
     teamSettings: () => ({ profileId: S.team.profileId, teamId: S.team.teamId, cpu: S.team.cpu }),
     /** Team data from the store: { state: 'ready' | 'unavailable', note?, profiles: [{ id, name, teams: [{ id, name, size, legal, problems, names[], lead }] }], activeId } */
     setData(d) {
-      S.data = { state: d && d.state === 'unavailable' ? 'unavailable' : 'ready', profiles: d && Array.isArray(d.profiles) ? d.profiles.map((p) => ({ id: String(p.id), name: String(p.name), teams: (p.teams || []).map((t) => ({ id: String(t.id), name: String(t.name), size: t.size | 0, legal: !!t.legal, problems: t.problems | 0, names: (t.names || []).map(String), lead: t.lead || null })), record: recordOf(p) })) : [], note: d && d.note || '', activeId: d && typeof d.activeId === 'string' ? d.activeId : null };
+      S.data = { state: d && d.state === 'unavailable' ? 'unavailable' : 'ready', profiles: d && Array.isArray(d.profiles) ? d.profiles.map((p) => ({ id: String(p.id), name: String(p.name), teams: (p.teams || []).map((t) => ({ id: String(t.id), name: String(t.name), size: t.size | 0, legal: !!t.legal, problems: t.problems | 0, names: (t.names || []).map(String), lead: t.lead || null, ruleset: typeof t.ruleset === 'string' ? t.ruleset : '' })), record: recordOf(p), readOnly: !!p.readOnly, tower: p.tower && typeof p.tower === 'object' ? JSON.parse(JSON.stringify(p.tower)) : null })) : [], note: d && d.note || '', activeId: d && typeof d.activeId === 'string' ? d.activeId : null };
       if (d && d.activeId && !S.team.profileId && S.data.profiles.some((p) => p.id === d.activeId)) S.team.profileId = d.activeId;
       if (S.path === 'team' || S.team.profileId || S.team.teamId) normaliseTeamSel();
       if (S.path === 'record') { const rp = curRecordProfile(); S.record.profileId = rp ? rp.id : null; S.record.page = clamp(S.record.page, 0, recordPages().length - 1); S.record.confirm = null; }
       clampCursor();
+      return tower.onData();                  // the Tower's screens follow the data (a ball taken closes the offer): the effects are screen changes the page mirrors into history
     },
-    goto(path) { return PATHS.includes(path) ? (path === S.path ? [] : go(path)) : []; },
+    goto(path) { if (!PATHS.includes(path) || path === S.path) return []; if (isTowerPath(path) && S.path === 'main') S.link = true; return go(path); },          // (also what a link or the browser's history does: a Tower screen reached that way may open the pending offer by itself)
     back,
     press(action) {
       if (S.path === 'record') return recordPress(action);
+      if (isTowerPath(S.path)) return tower.press(S.path, action);
       if (S.path === 'about') {
         const last = ABOUT_PAGES.length - 1;
         if (action === 'a' || action === 'down' || action === 'right' || action === 'r') { if (S.about.page < last) { S.about.page++; return []; } return action === 'a' ? back() : []; }
@@ -380,10 +407,11 @@ export function createHubModel(opts = {}) {
     /** Which thing is under the logical point? { kind: 'row', index, zone } | { kind: 'page' } | null. zone 'prev' = the left arrow of a choice row. */
     hit(x, y) {
       if (S.path === 'record') return recordHit(x, y);
+      if (isTowerPath(S.path)) return tower.hit(S.path, x, y);
       if (S.path === 'about') { const g = GEOM.about; return x >= g.x - 6 && y >= g.y - 6 && x < g.x + g.w + 6 && y < g.y + g.h + 6 ? { kind: 'page' } : null; }
-      const rs = rows(), m = GEOM.menu, pitch = menuPitch(rs.length);
-      if (x < m.x - 6 || x >= m.x + m.w + 6 || y < m.y || y >= m.y + rs.length * pitch) return null;
-      const index = Math.floor((y - m.y) / pitch);
+      const rs = rows(), win = S.path === 'main' ? mainWindow() : null, m = GEOM.menu, shown = win ? win.size : rs.length, pitch = menuPitch(shown);
+      if (x < m.x - 6 || x >= m.x + m.w + 6 || y < m.y || y >= m.y + shown * pitch) return null;
+      const index = (win ? win.off : 0) + Math.floor((y - m.y) / pitch);
       const row = rs[index];
       const zone = row && row.kind === 'choice' && x < m.x + m.w * 0.45 + 6 && x > m.x + 38 ? 'prev' : 'main';
       return { kind: 'row', index, zone };
@@ -391,6 +419,7 @@ export function createHubModel(opts = {}) {
     pointer(ev) {
       if (!ev) return [];
       if (S.path === 'record') return recordPointer(ev);
+      if (isTowerPath(S.path)) return tower.pointer(S.path, ev);
       if (ev.kind === 'wheel') { const n = Math.abs(ev.steps || 0); const act = (ev.steps || 0) > 0 ? 'down' : 'up'; let out = []; for (let i = 0; i < n; i++) out = out.concat(api.press(act)); return out; }
       const h = ev.x === undefined || ev.x === null ? null : api.hit(ev.x, ev.y);
       if (!h) return [];
@@ -406,7 +435,11 @@ export function createHubModel(opts = {}) {
       return [];
     },
     /** Rectangles the renderer and the tests use (logical pixels). */
-    rects() { const m = GEOM.menu, p = menuPitch(rows().length); return rows().map((_, i) => ({ x: m.x - 4, y: m.y + i * p, w: m.w + 8, h: p })); },
+    rects() {
+      if (isTowerPath(S.path)) return tower.rects(S.path);
+      const all = rows(), win = S.path === 'main' ? mainWindow() : null, shown = win ? win.size : all.length, m = GEOM.menu, p = menuPitch(shown), from = win ? win.off : 0;
+      return all.slice(from, from + shown).map((_, i) => ({ x: m.x - 4, y: m.y + i * p, w: m.w + 8, h: p }));
+    },
   };
   return api;
 }

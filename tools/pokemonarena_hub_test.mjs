@@ -63,7 +63,7 @@ async function loadModel(mutation) {
   const n = SRC.split(mutation.find).length - 1;
   if (n !== 1) throw new Error('mutant "' + mutation.name + '": the text to replace occurs ' + n + ' times (must be 1)');
   // the mutant is written to the temp folder, so its relative import of record_model.js (ST1) is pointed at the real file
-  const src = SRC.replace(mutation.find, mutation.replace).replace("from './record_model.js'", "from '" + pathToFileURL(path.join(root, 'pokemonarena', 'js', 'record_model.js')).href + "'");
+  const src = SRC.replace(mutation.find, mutation.replace).replace("from './record_model.js'", "from '" + pathToFileURL(path.join(root, 'pokemonarena', 'js', 'record_model.js')).href + "'").replace("from './tower_hub.js'", "from '" + pathToFileURL(path.join(root, 'pokemonarena', 'js', 'tower_hub.js')).href + "'");
   const f = path.join(os.tmpdir(), 'arena-hub-mutant-' + process.pid + '-' + mutantCache.size + '.mjs');
   fs.writeFileSync(f, src);
   const m = await import(pathToFileURL(f).href);
@@ -88,6 +88,9 @@ const eff = (list, type) => list.filter((e) => e.type === type);
 const labels = (m) => m.view().menu.rows.map((r) => r.label);
 const rowValue = (m, id) => { const r = m.view().menu.rows.find((x) => x.id === id); return r ? r.value : undefined; };
 const press = (m, ...as) => { let out = []; for (const a of as) out = out.concat(m.press(a)); return out; };
+// the main menu is longer than the room (the Tower joined it), so rows are reached BY ID, not by counting presses; every other row's id is its place whatever joins the menu next
+const toRow = (m, id) => { for (let i = 0; i < 24 && m.rows()[m.state().cursor[m.path()]].id !== id; i++) m.press('down'); return m.rows()[m.state().cursor[m.path()]].id === id; };
+const labelOf = (m, id) => { const r = m.rows().find((x) => x.id === id); return r ? r.label : undefined; };
 const plainOk = (v) => { const seen = []; (function walk(x, p) { if (x === undefined || typeof x === 'function') seen.push(p); else if (x && typeof x === 'object') for (const k of Object.keys(x)) walk(x[k], p + '.' + k); })(v, 'view'); return seen; };
 
 function checkModel(M) {
@@ -95,11 +98,12 @@ function checkModel(M) {
   const mk = (o) => M.createHubModel({ mascot: 25, ...(o || {}) });
   // ---- main menu
   let m = mk();
-  t('main: eight items in order (W1 added IMPORT SAVE, ST1 added RECORD)', J(labels(m)) === J(['QUICK BATTLE', 'BATTLE WITH MY TEAM', 'RECORD', 'TEAM BUILDER', 'IMPORT SAVE', 'CONTROLS', 'SOUND: OFF', 'ABOUT']), J(labels(m)));
+  t('main: nine items in order (W1 added IMPORT SAVE, ST1 added RECORD, the Tower added TOWER)', J(m.rows().map((r) => r.label)) === J(['QUICK BATTLE', 'BATTLE WITH MY TEAM', 'TOWER', 'RECORD', 'TEAM BUILDER', 'IMPORT SAVE', 'CONTROLS', 'SOUND: OFF', 'ABOUT']), J(m.rows().map((r) => r.label)));
+  t('main: nine rows do not fit above the text box, so the menu shows eight and scrolls', m.view().menu.rows.length === 8 && m.view().menu.total === 9 && m.view().menu.down === true && m.view().menu.up === false && m.view().menu.offset === 0, J(m.view().menu));
   t('main: the cursor starts on the first row', m.view().menu.cursor === 0);
-  press(m, 'up'); t('main: up from the first row wraps to the last', m.view().menu.cursor === 7, String(m.view().menu.cursor));
-  press(m, 'down'); t('main: down from the last row wraps to the first', m.view().menu.cursor === 0);
-  press(m, 'down', 'down', 'down', 'down', 'down'); t('main: five downs reach CONTROLS', m.view().menu.cursor === 5);
+  press(m, 'up'); t('main: up from the first row wraps to the last, and the window scrolls to show it', m.state().cursor.main === 8 && m.view().menu.cursor === 7 && m.view().menu.offset === 1 && m.view().menu.up === true && m.view().menu.down === false, J(m.view().menu));
+  press(m, 'down'); t('main: down from the last row wraps to the first, and the window scrolls back', m.state().cursor.main === 0 && m.view().menu.offset === 0);
+  press(m, 'down', 'down', 'down', 'down', 'down', 'down'); t('main: six downs reach CONTROLS', m.state().cursor.main === 6 && m.rows()[6].id === 'controls');
   t('main: B on the main menu does nothing (a menu is not an exit)', m.press('b').length === 0 && m.path() === 'main');
   // ---- QUICK BATTLE
   m = mk();
@@ -120,22 +124,22 @@ function checkModel(M) {
   t('quick: the main cursor is where it was left (QUICK BATTLE)', m.view().menu.cursor === 0);
   m = mk(); m.press('a'); m.press('b'); t('quick: B goes back too', m.path() === 'main');
   // ---- TEAM BUILDER / CONTROLS / SOUND / ABOUT
-  m = mk(); press(m, 'down', 'down', 'down'); e = m.press('a');
+  m = mk(); toRow(m, 'builder'); e = m.press('a');
   t('main: TEAM BUILDER navigates to the team builder', e.length === 1 && e[0].type === 'navigate' && e[0].url === '/pokemonarena/editor.html', J(e));
-  m = mk(); press(m, 'down', 'down', 'down', 'down'); e = m.press('a'); t('main: IMPORT SAVE navigates to the team builder save-import screen', e.length === 1 && e[0].type === 'navigate' && e[0].url === '/pokemonarena/editor.html#/import' && M.IMPORT_URL === e[0].url, J(e));
-  m = mk(); press(m, 'down', 'down', 'down', 'down', 'down'); e = m.press('a'); t('main: CONTROLS asks the page to open the Controls panel', e.length === 1 && e[0].type === 'controls', J(e));
-  m = mk(); press(m, 'down', 'down', 'down', 'down', 'down', 'down'); e = m.press('a');
-  t('main: SOUND toggles on and tells the page', e.length === 1 && e[0].type === 'sound' && e[0].on === true && labels(m)[6] === 'SOUND: ON', J(e) + J(labels(m)));
-  e = m.press('a'); t('main: and off again', (e[0] || {}).on === false && labels(m)[6] === 'SOUND: OFF');
-  m = mk({ sound: true }); t('main: a remembered "sound on" shows ON', labels(m)[6] === 'SOUND: ON');
-  m = mk(); press(m, 'down', 'down', 'down', 'down', 'down', 'down', 'down'); e = m.press('a');
+  m = mk(); toRow(m, 'import'); e = m.press('a'); t('main: IMPORT SAVE navigates to the team builder save-import screen', e.length === 1 && e[0].type === 'navigate' && e[0].url === '/pokemonarena/editor.html#/import' && M.IMPORT_URL === e[0].url, J(e));
+  m = mk(); toRow(m, 'controls'); e = m.press('a'); t('main: CONTROLS asks the page to open the Controls panel', e.length === 1 && e[0].type === 'controls', J(e));
+  m = mk(); toRow(m, 'sound'); e = m.press('a');
+  t('main: SOUND toggles on and tells the page', e.length === 1 && e[0].type === 'sound' && e[0].on === true && labelOf(m, 'sound') === 'SOUND: ON', J(e) + labelOf(m, 'sound'));
+  e = m.press('a'); t('main: and off again', (e[0] || {}).on === false && labelOf(m, 'sound') === 'SOUND: OFF');
+  m = mk({ sound: true }); t('main: a remembered "sound on" shows ON', labelOf(m, 'sound') === 'SOUND: ON');
+  m = mk(); toRow(m, 'about'); e = m.press('a');
   t('about: A on ABOUT opens page 1 of 4', m.path() === 'about' && m.view().about.page === 0 && m.view().about.pages === 4 && e[0].path === 'about');
   press(m, 'a'); t('about: A turns the page', m.view().about.page === 1);
   press(m, 'up'); t('about: up turns back', m.view().about.page === 0);
   press(m, 'up'); t('about: up on page 1 stays', m.view().about.page === 0);
   press(m, 'a', 'a', 'a'); t('about: three A reach the last page', m.view().about.page === 3 && m.view().about.last === true);
   e = m.press('a'); t('about: A on the last page goes back to the main menu', m.path() === 'main' && e[0].path === 'main');
-  m = mk(); press(m, 'down', 'down', 'down', 'down', 'down', 'down', 'down', 'a'); press(m, 'a'); e = m.press('b'); t('about: B leaves from any page', m.path() === 'main');
+  m = mk(); toRow(m, 'about'); press(m, 'a'); press(m, 'a'); e = m.press('b'); t('about: B leaves from any page', m.path() === 'main');
   // ---- MY TEAM: no data yet / no profile / blocked storage
   m = mk(); press(m, 'down', 'a');
   t('team: while the store is being read the screen says so and offers TEAM BUILDER and BACK', m.path() === 'team' && J(labels(m)) === J(['TEAM BUILDER', 'BACK']) && /Looking for your teams/.test(m.view().msg[0]), J(m.view().msg));
@@ -188,7 +192,7 @@ function checkModel(M) {
   t('hit: the middle, top edge and bottom edge of every row map to that row', allRows);
   t('hit: left of the window and below the last row are misses', m.hit(2, 20) === null && m.hit(70, 10 + 7 * 14 + 1) === null && m.hit(200, 20) === null && m.hit(70, 5) === null);
   let ev = m.pointer({ kind: 'move', x: 60, y: 10 + 4 * 12 + 4 }); t('pointer: hover moves the cursor and activates nothing', ev.length === 0 && m.view().menu.cursor === 4);
-  ev = m.pointer({ kind: 'click', x: 60, y: 10 + 4 * 14 + 4 }); t('pointer: a click is cursor + A (CONTROLS)', ev.length === 1 && ev[0].type === 'controls', J(ev));
+  ev = m.pointer({ kind: 'click', x: 60, y: 10 + 6 * 12 + 4 }); t('pointer: a click is cursor + A (CONTROLS)', ev.length === 1 && ev[0].type === 'controls', J(ev));
   m = mk(); ev = m.pointer({ kind: 'click', x: 60, y: 14 }); t('pointer: clicking QUICK BATTLE opens it', m.path() === 'quick' && ev[0].path === 'quick');
   ev = m.pointer({ kind: 'click', x: 100, y: 10 + 1 * 16 + 4 }); t('pointer: clicking a choice row cycles it (CPU -> HARD)', rowValue(m, 'cpu') === 'HARD', rowValue(m, 'cpu'));
   ev = m.pointer({ kind: 'click', x: 60, y: 10 + 1 * 16 + 4 }); t('pointer: clicking the left half of a choice row steps BACK (CPU HARD -> NORMAL)', rowValue(m, 'cpu') === 'NORMAL' && m.view().menu.cursor === 1, rowValue(m, 'cpu'));
@@ -196,7 +200,7 @@ function checkModel(M) {
   ev = m.pointer({ kind: 'click', x: 2, y: 20 }); t('pointer: a click outside the menu does nothing', ev.length === 0 && m.path() === 'quick');
   m = mk(); m.pointer({ kind: 'wheel', steps: 2 }); t('wheel: two notches down move the cursor two rows', m.view().menu.cursor === 2, String(m.view().menu.cursor));
   m.pointer({ kind: 'wheel', steps: -1 }); t('wheel: one notch up moves back', m.view().menu.cursor === 1);
-  m = mk(); press(m, 'down', 'down', 'down', 'down', 'down', 'down', 'down', 'a'); ev = m.pointer({ kind: 'click', x: 100, y: 60 }); t('pointer: a click on the ABOUT window turns the page', m.view().about.page === 1);
+  m = mk(); toRow(m, 'about'); press(m, 'a'); ev = m.pointer({ kind: 'click', x: 100, y: 60 }); t('pointer: a click on the ABOUT window turns the page', m.view().about.page === 1);
   t('pointer: a click outside the ABOUT window does nothing', m.pointer({ kind: 'click', x: 1, y: 150 }).length === 0 && m.view().about.page === 1);
   // ---- determinism and plain views
   const script = (mm) => { const out = []; for (const a of ['down', 'a', 'right', 'down', 'right', 'b', 'down', 'a', 'down', 'right']) { mm.press(a); out.push(J(mm.view())); } return out.join('|'); };
@@ -212,10 +216,10 @@ function checkModel(M) {
 const MUTANTS = [
   { name: 'START ignores the legality of the team', find: 'if (!t.legal) { S.flash', replace: 'if (false) { S.flash', expect: 'START on an illegal team is blocked' },
   { name: 'a 2-Pokemon team may pick 3v3', find: "return size >= 3 ? ['3v3', '6v6'] : ['6v6'];", replace: "return ['3v3', '6v6'];", expect: 'allowedFormats(2) has no 3v3' },
-  { name: 'B on the main menu leaves the game', find: "if (S.path === 'main') return [];\n    const eff", replace: "if (S.path === 'main') return [{ type: 'navigate', url: '/' }];\n    const eff", expect: 'B on the main menu does nothing' },
+  { name: 'B on the main menu leaves the game', find: "if (S.path === 'main') return [];\n    const up", replace: "if (S.path === 'main') return [{ type: 'navigate', url: '/' }];\n    const up", expect: 'B on the main menu does nothing' },
   { name: 'up does not wrap', find: 'S.cursor[S.path] = (cur + rs.length - 1) % rs.length;', replace: 'S.cursor[S.path] = Math.max(0, cur - 1);', expect: 'up from the first row wraps' },
   { name: 'SOUND toggles without telling the page', find: "S.sound = !S.sound; return [{ type: 'sound', on: S.sound }];", replace: 'S.sound = !S.sound; return [];', expect: 'SOUND toggles on and tells the page' },
-  { name: 'the row hit test is half a row low', find: 'const index = Math.floor((y - m.y) / pitch);', replace: 'const index = Math.floor((y - m.y + 6) / pitch);', expect: 'the middle, top edge and bottom edge' },
+  { name: 'the row hit test is half a row low', find: 'const index = (win ? win.off : 0) + Math.floor((y - m.y) / pitch);', replace: 'const index = (win ? win.off : 0) + Math.floor((y - m.y + 6) / pitch);', expect: 'the middle, top edge and bottom edge' },
   { name: 'a click only moves the cursor', find: "if (row && row.kind === 'choice' && h.zone === 'prev') return change(row, -1);\n        return api.press('a');", replace: "if (row && row.kind === 'choice' && h.zone === 'prev') return change(row, -1);\n        return [];", expect: 'a click is cursor + A' },
   { name: 'quick START sends the wrong format', find: 'format: S.quick.format, cpu: S.quick.cpu }]', replace: "format: '3v3', cpu: S.quick.cpu }]", expect: 'START emits one battle effect carrying the chosen format' },
   { name: 'team START loses the team id', find: 'profileId: p.id, teamId: t.id }]', replace: 'profileId: p.id, teamId: null }]', expect: 'START on a legal team emits one battle effect' },
@@ -265,13 +269,13 @@ const frameHash = (v, s = screen) => L.fnv(s.render(v).rgba);
   // every text fits its window: walk the whole state space the menu can reach
   const states = [];
   const walk = (label, fn) => states.push([label, view0(fn)]);
-  walk('main', null); for (let i = 1; i < 7; i++) walk('main' + i, (m) => { for (let k = 0; k < i; k++) m.press('down'); });
-  walk('sound on', (m) => { for (let k = 0; k < 5; k++) m.press('down'); m.press('a'); });
+  walk('main', null); for (let i = 1; i < 9; i++) walk('main' + i, (m) => { for (let k = 0; k < i; k++) m.press('down'); });
+  walk('sound on', (m) => { toRow(m, 'sound'); m.press('a'); });
   for (const fmt of [0, 1]) for (const cpu of [0, 1, 2]) for (const row of [0, 1, 2, 3]) walk('quick f' + fmt + ' c' + cpu + ' r' + row, (m) => { m.press('a'); if (fmt) m.press('right'); m.press('down'); for (let k = 0; k < cpu; k++) m.press('right'); for (let k = 1; k < row; k++) m.press('down'); if (row === 0) { m.press('up'); } if (row === 3) m.press('down'); });
   for (let ti = 0; ti < 5; ti++) for (const row of [0, 1, 2, 3, 4, 5]) walk('team t' + ti + ' r' + row, (m) => { m.press('down'); m.press('a'); m.press('down'); for (let k = 0; k < ti; k++) m.press('right'); for (let k = 0; k < row - 1; k++) m.press('down'); if (row === 0) m.press('up'); });
   walk('team start illegal', (m) => { m.press('down'); m.press('a'); m.press('down'); m.press('right'); m.press('down'); m.press('down'); m.press('down'); m.press('a'); });
   walk('team loading', (m) => { m.setData({ state: 'ready', profiles: [] }); m.press('down'); m.press('a'); });
-  for (let p = 0; p < 4; p++) walk('about ' + p, (m) => { for (let k = 0; k < 6; k++) m.press('down'); m.press('a'); for (let k = 0; k < p; k++) m.press('a'); });
+  for (let p = 0; p < 4; p++) walk('about ' + p, (m) => { toRow(m, 'about'); m.press('a'); for (let k = 0; k < p; k++) m.press('a'); });
   let overflow = [];
   for (const [label, v] of states) for (const w of screen.widths(v)) if (w.px > w.max) overflow.push(label + ': ' + w.what + ' ' + w.px + ' > ' + w.max);
   ok(overflow.length === 0, 'R. every help line, message and about line fits its window in all ' + states.length + ' reachable states', overflow.slice(0, 4).join('; '));
@@ -300,12 +304,26 @@ const frameHash = (v, s = screen) => L.fnv(s.render(v).rgba);
   const untouched = rom.slice(); ok(frameHash(view0(), HS.createHubScreen(B.createBattleUi(untouched))) === base, 'R. twin: a byte-identical copy of the ROM gives the identical picture');
   // golden hashes
   const GV = {
-    'main-0': view0(), 'main-sound': view0((m) => { for (let k = 0; k < 6; k++) m.press('down'); m.press('a'); }), 'quick-format': view0((m) => { m.press('a'); }),
+    'main-0': view0(), 'main-sound': view0((m) => { toRow(m, 'sound'); m.press('a'); }), 'quick-format': view0((m) => { m.press('a'); }),
     'quick-6v6-hard': view0((m) => { m.press('a'); m.press('right'); m.press('down'); m.press('right'); }), 'team-kanto': view0((m) => { m.press('down'); m.press('a'); }),
     'team-illegal-start': view0((m) => { m.press('down'); m.press('a'); m.press('down'); m.press('right'); m.press('down'); m.press('down'); m.press('down'); m.press('a'); }),
-    'team-empty': view0((m) => { m.setData({ state: 'ready', profiles: [] }); m.press('down'); m.press('a'); }), 'about-0': view0((m) => { for (let k = 0; k < 7; k++) m.press('down'); m.press('a'); }),
-    'about-3': view0((m) => { for (let k = 0; k < 7; k++) m.press('down'); m.press('a'); m.press('a'); m.press('a'); m.press('a'); }),
+    'team-empty': view0((m) => { m.setData({ state: 'ready', profiles: [] }); m.press('down'); m.press('a'); }), 'about-0': view0((m) => { toRow(m, 'about'); m.press('a'); }),
+    'about-3': view0((m) => { toRow(m, 'about'); m.press('a'); m.press('a'); m.press('a'); m.press('a'); }),
   };
+  // the Pokemon Tower's screens (tower_hub.js / tower_screen.js): real runs from the game's own rules (hub_lib.towerFixtures), drawn from the ROM. The behaviour is tested in tools/pokemonarena_tower_hub_test.mjs.
+  const TF = await L.towerFixtures(pack);
+  const twData = (tw) => ({ state: 'ready', activeId: 'p1', profiles: [{ id: 'p1', name: 'RED', readOnly: false, tower: tw, teams: [{ id: 't1', name: 'Kanto Squad', size: 3, legal: true, problems: 0, names: ['A', 'B', 'C'], lead: { species: 25 }, ruleset: 'arena-gen3-standard' }] }] });
+  const twView = (tw, steps) => view0((m) => { m.setData(twData(tw)); for (const k of steps) m.press(k); });
+  const TW = ['down', 'down', 'a'];
+  Object.assign(GV, {
+    'main-scrolled': view0((m) => { m.press('up'); }),
+    'tower-home-fight': twView(TF.fight, TW), 'tower-home-none': twView(TF.none, TW), 'tower-home-giveup': twView(TF.fight, [...TW, 'down', 'down', 'a']),
+    'tower-new': twView(TF.none, [...TW, 'a']), 'tower-offer3': twView(TF.offer3, [...TW, 'a']), 'tower-offer3-ball2': twView(TF.offer3, [...TW, 'a', 'right']),
+    'tower-offer3-take': twView(TF.offer3, [...TW, 'a', 'a']), 'tower-offer3-skip': twView(TF.offer3, [...TW, 'a', 'down']), 'tower-offer5': twView(TF.offer5, [...TW, 'a', 'right', 'right']),
+    'tower-buffs': twView(TF.offer5, [...TW, 'down', 'a']), 'tower-synergies': twView(TF.offer5, [...TW, 'down', 'a', 'right']), 'tower-buff-detail': twView(TF.offer5, [...TW, 'down', 'a', 'a']),
+    'tower-ach': twView(TF.fight, [...TW, 'down', 'down', 'down', 'down', 'a']), 'tower-ach-8': twView(TF.fight, [...TW, 'down', 'down', 'down', 'down', 'a', ...Array(9).fill('down')]),
+    'tower-last': twView(TF.none, [...TW, 'down', 'a']), 'tower-noprofile': view0((m) => { m.setData({ state: 'ready', activeId: null, profiles: [] }); for (const k of TW) m.press(k); }),
+  });
   const got = {}; for (const [k, v] of Object.entries(GV)) got[k] = frameHash(v);
   if (UPDATE) { fs.writeFileSync(GOLDEN, JSON.stringify({ note: 'hashes only (fnv1a of the 240x160 RGBA frame); regenerate with node tools/pokemonarena_hub_test.mjs --update', rom: 'Pokemon SoulGold v1.1.1', views: got }, null, 2) + '\n'); console.log('hub.golden.json written'); }
   const gold = fs.existsSync(GOLDEN) ? JSON.parse(fs.readFileSync(GOLDEN, 'utf8')).views : null;
@@ -392,7 +410,10 @@ const url = (q = '') => BASE + '/pokemonarena/' + q;
 const HUB = '__arenaHub';
 const hv = (page) => page.eval(`${HUB}.view()`);
 const where = (page) => page.eval(`${HUB}.model.path()`);
-const cursor = (page) => page.eval(`${HUB}.view().menu ? ${HUB}.view().menu.cursor : -1`);
+const cursor = (page) => page.eval(`${HUB}.view().menu ? ${HUB}.view().menu.cursor : -1`);          // the cursor's place in the rows SHOWN (the main menu shows eight of its nine)
+const mainCursor = (page) => page.eval(`${HUB}.model.state().cursor.main`);                         // ... and in ALL the rows
+// ABOUT is the ninth row and the menu shows eight: walk the cursor onto it (the window scrolls to keep it in view), by the on-screen pad or by key
+const reachAbout = async (page, how) => { for (let i = 0; i < 12 && (await mainCursor(page)) !== 8; i++) { if (how === 'pad') await tapSel(page, '#bDown'); else await key(page, 'down'); await sleep(80); } };
 const rowVal = (page, id) => page.eval(`(() => { const r = ${HUB}.view().menu.rows.find((x) => x.id === ${J(id)}); return r ? r.value : null; })()`);
 const msgOf = (page) => page.eval(`${HUB}.view().msg.join(' ')`);
 const shot = async (page, name) => { await page.screenshot(path.join(OUT, name + '.png')); return name; };
@@ -482,9 +503,9 @@ try {
     // BACK with the on-screen B button
     await tapSel(page, '#bB'); await sleep(150);
     ok((await where(page)) === 'main', tag + 'the on-screen B button goes back');
-    // on-screen pad: down x3 then A -> TEAM BUILDER navigates (ST1: RECORD is the third row, TEAM BUILDER the fourth)
-    await tapSel(page, '#bDown'); await sleep(100); await tapSel(page, '#bDown'); await sleep(100); await tapSel(page, '#bDown'); await sleep(100);
-    ok((await cursor(page)) === 3, tag + 'the on-screen pad moves the cursor (three downs -> TEAM BUILDER)', String(await cursor(page)));
+    // on-screen pad: down x4 then A -> TEAM BUILDER navigates (ST1: TOWER is the third row, RECORD the fourth, TEAM BUILDER the fifth)
+    for (let i = 0; i < 4; i++) { await tapSel(page, '#bDown'); await sleep(100); }
+    ok((await cursor(page)) === 4, tag + 'the on-screen pad moves the cursor (four downs -> TEAM BUILDER)', String(await cursor(page)));
     await tapSel(page, '#bA'); await sleep(200);
     const n2 = await navs(page); ok(n2.length === 2 && n2[1] === '/pokemonarena/editor.html', tag + 'A on TEAM BUILDER goes to the team builder', J(n2));
     // MY TEAM with no profile
@@ -493,7 +514,8 @@ try {
     ok(/no team yet/i.test(await msgOf(page)) && (await page.eval(`${HUB}.view().menu.rows.map((r) => r.label).join()`)) === 'TEAM BUILDER,BACK', tag + 'with no profile it offers TEAM BUILDER (message: ' + await msgOf(page) + ')');
     await shot(page, 'hub_touch_3_team_empty');
     await tapSel(page, '#bB'); await sleep(120);
-    // ABOUT by tapping its window
+    // ABOUT by tapping its window (it is the ninth row: the on-screen UP wraps to it and scrolls it into the eighth window)
+    await reachAbout(page, 'pad'); await sleep(60);
     await tapLogical(page, `${HUB}.canvas`, 60, mainY(7)); await sleep(150);
     ok((await where(page)) === 'about', tag + 'tapping ABOUT opens it');
     await tapLogical(page, `${HUB}.canvas`, 100, 50); await sleep(120);
@@ -529,13 +551,13 @@ try {
     ok((await page.eval(`${HUB}.sound.on()`)) === true && (await page.eval(`localStorage.getItem('arena.audio')`)) === null && (await page.eval(`localStorage.getItem('arena.sound')`)) === null && (await page.eval('window.__audioLog.ctor')) <= 1 && (await page.eval('window.__arenaSound.state().mixer.ctx')) !== 'running', tag + 'SOUND IS ON BY DEFAULT (MU3): nothing stored, and nothing is RUNNING before the first click, tap or key (the page tried at load: its context, if the double made one, is suspended, as a real browser keeps it without a gesture)');
     // (UPDATED DELIBERATELY with the new defaults: nothing stored now means Master 50%, and the visible audio bar says so)
     ok((await page.eval(`window.__arenaSound.mixer.getAudioState().settings.master`)) === 0.5 && (await page.eval(`document.getElementById('abVolume').value`)) === '50', tag + 'the starting volume is half the slider: Master 0.5, and the bar\'s slider reads 50');
-    // keyboard: down x3, Enter -> TEAM BUILDER (ST1: RECORD sits between BATTLE WITH MY TEAM and TEAM BUILDER)
-    await key(page, 'down'); await key(page, 'down'); await key(page, 'down'); await sleep(80);
-    ok((await cursor(page)) === 3, tag + 'three ArrowDown presses reach TEAM BUILDER');
+    // keyboard: down x4, Enter -> TEAM BUILDER (ST1: RECORD sits between BATTLE WITH MY TEAM and TEAM BUILDER)
+    for (let i = 0; i < 4; i++) await key(page, 'down'); await sleep(80);
+    ok((await cursor(page)) === 4, tag + 'four ArrowDown presses reach TEAM BUILDER');
     await key(page, 'a'); await sleep(200);
     ok(J(await navs(page)) === J(['/pokemonarena/editor.html']), tag + 'Enter on TEAM BUILDER navigates to the team builder', J(await navs(page)));
     // Z opens quick, ArrowRight cycles, Backspace goes back
-    await page.eval(`${HUB}.press('up'); ${HUB}.press('up'); ${HUB}.press('up')`);
+    await page.eval(`${HUB}.press('up'); ${HUB}.press('up'); ${HUB}.press('up'); ${HUB}.press('up')`);
     await key(page, 'z'); await sleep(120);
     ok((await where(page)) === 'quick', tag + 'Z opens QUICK BATTLE');
     await key(page, 'right'); await sleep(80);
@@ -544,9 +566,9 @@ try {
     await key(page, 'b'); await sleep(120); ok((await where(page)) === 'main', tag + 'Backspace goes back');
     await key(page, 'z'); await sleep(100); await key(page, 'esc'); await sleep(120); ok((await where(page)) === 'main', tag + 'Escape goes back too');
     // mouse: hover moves the cursor without activating
-    const p3 = await logicalToPage(page, `${HUB}.canvas`, 60, mainY(5));
+    const p3 = await logicalToPage(page, `${HUB}.canvas`, 60, mainY(6));
     await moveMouse(page, p3.x, p3.y); await sleep(120);
-    ok((await cursor(page)) === 5 && (await where(page)) === 'main', tag + 'hovering the CONTROLS row moves the cursor and activates nothing');
+    ok((await cursor(page)) === 6 && (await where(page)) === 'main', tag + 'hovering the CONTROLS row moves the cursor and activates nothing');
     ok((await page.eval(`getComputedStyle(${HUB}.canvas).cursor`)) === 'pointer', tag + 'the mouse pointer becomes a hand over a row', await page.eval(`getComputedStyle(${HUB}.canvas).cursor`));
     await clickLogical(page, `${HUB}.canvas`, 60, mainY(0)); await sleep(150);
     ok((await where(page)) === 'quick', tag + 'a click on QUICK BATTLE opens it');
@@ -563,6 +585,7 @@ try {
     await shot(page, 'hub_kbd_1_main');
     // history: screens are real history entries
     const hist0 = await page.eval('history.length');
+    await reachAbout(page, 'key');                                              // the ninth row: the window scrolls to show it
     await clickLogical(page, `${HUB}.canvas`, 60, mainY(7)); await sleep(150);   // ABOUT
     ok((await where(page)) === 'about' && (await page.eval('location.hash')) === '#about' && (await page.eval('history.state && history.state.arenaHub')) === 'about', tag + 'opening ABOUT pushes a history entry for it (#about, state arenaHub=about)');
     await page.eval('history.back()'); await sleep(250);
@@ -576,25 +599,25 @@ try {
     // B and the browser's Back button share ONE history: opening a screen and leaving it with B must not pile up entries
     await boot(page);
     const L0 = await page.eval('history.length');
-    for (let i = 0; i < 3; i++) { await clickLogical(page, `${HUB}.canvas`, 60, mainY(7)); await sleep(120); await key(page, 'b'); await sleep(250); }
+    for (let i = 0; i < 3; i++) { await reachAbout(page, 'key'); await clickLogical(page, `${HUB}.canvas`, 60, mainY(7)); await sleep(120); await key(page, 'b'); await sleep(250); }
     const L1 = await page.eval('history.length');
     ok(L1 - L0 <= 1 && (await page.eval('location.hash')) === '' && (await where(page)) === 'main', tag + 'three ABOUT / B round trips add at most one history entry in total, not six (' + L0 + ' -> ' + L1 + ')', L0 + ' -> ' + L1);
     // control: make the page's "step back" push a NEW entry instead (the old behaviour) and the same round trips must pile the history up
     await page.eval(`history.back = () => history.pushState({}, '', location.pathname)`);
     const L2 = await page.eval('history.length');
-    for (let i = 0; i < 3; i++) { await clickLogical(page, `${HUB}.canvas`, 60, mainY(7)); await sleep(120); await key(page, 'b'); await sleep(250); }
+    for (let i = 0; i < 3; i++) { await reachAbout(page, 'key'); await clickLogical(page, `${HUB}.canvas`, 60, mainY(7)); await sleep(120); await key(page, 'b'); await sleep(250); }
     const L3 = await page.eval('history.length');
     ok(L3 - L2 >= 5, tag + 'control: when B pushes a new entry instead of stepping back, three round trips pile up ' + (L3 - L2) + ' entries (so the check above can fail)', L2 + ' -> ' + L3);
     await boot(page);
-    // sound: Enter on SOUND (cursor 6); double counts; persisted
+    // sound: Enter on SOUND (cursor 7); double counts; persisted
     await page.eval(`${HUB}.model.goto('main')`);
-    while ((await cursor(page)) !== 6) await key(page, 'down');
+    while ((await mainCursor(page)) !== 7) await key(page, 'down');
     await key(page, 'a'); await sleep(400);
     // MU3's policy: Enter on SOUND OPENS the SOUND panel (it no longer toggles); that Enter is the first gesture, so it created the page's one (fake) AudioContext
     const soundOpen = () => page.eval(`(() => { const d = document.getElementById('soundDialog'); return !!d && !d.hidden; })()`);
     let lg = await page.eval('window.__audioLog');
     ok((await soundOpen()) && lg.ctor === 1 && (await page.eval(`${HUB}.sound.on()`)) === true, tag + 'Enter on SOUND opens the SOUND panel; the key press created exactly one fake AudioContext and sound is on', J(lg));
-    ok((await page.eval(`document.getElementById('soundBtn').textContent`)) === 'Sound: on' && (await page.eval(`${HUB}.view().menu.rows[6].label`)) === 'SOUND: ON', tag + 'the header button and the menu row both say ON');
+    ok((await page.eval(`document.getElementById('soundBtn').textContent`)) === 'Sound: on' && (await page.eval(`${HUB}.view().menu.rows.find((r) => r.id === 'sound').label`)) === 'SOUND: ON', tag + 'the header button and the menu row both say ON');
     await shot(page, 'hub_kbd_3_sound_on');
     await key(page, 'esc'); await sleep(300);
     ok(!(await soundOpen()), tag + 'Esc closes the SOUND panel in one press');
@@ -602,7 +625,7 @@ try {
     const pressM = async () => { await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'm', code: 'KeyM', text: 'm', windowsVirtualKeyCode: 77 }); await sleep(40); await page.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'm', code: 'KeyM', windowsVirtualKeyCode: 77 }); await sleep(250); };
     await pressM();
     const st1 = JSON.parse((await page.eval(`localStorage.getItem('arena.audio')`)) || 'null');
-    ok(st1 && st1.v === 1 && st1.muted === true && (await page.eval(`${HUB}.sound.on()`)) === false && (await page.eval(`document.getElementById('soundBtn').textContent`)) === 'Sound: off' && (await page.eval(`${HUB}.view().menu.rows[6].label`)) === 'SOUND: OFF', tag + 'M mutes: arena.audio {v:1, muted:true}, the button and the menu row say OFF', J(st1));
+    ok(st1 && st1.v === 1 && st1.muted === true && (await page.eval(`${HUB}.sound.on()`)) === false && (await page.eval(`document.getElementById('soundBtn').textContent`)) === 'Sound: off' && (await page.eval(`${HUB}.view().menu.rows.find((r) => r.id === 'sound').label`)) === 'SOUND: OFF', tag + 'M mutes: arena.audio {v:1, muted:true}, the button and the menu row say OFF', J(st1));
     await pressM();
     const st2 = JSON.parse((await page.eval(`localStorage.getItem('arena.audio')`)) || 'null');
     ok(st2 && st2.muted === false && (await page.eval(`${HUB}.sound.on()`)) === true, tag + 'M again unmutes', J(st2));
@@ -618,7 +641,7 @@ try {
     await page.eval(`localStorage.removeItem('arena.audio'); localStorage.setItem('arena.sound', '0')`);
     // Controls dialog by keyboard
     await boot(page);
-    while ((await cursor(page)) !== 5) await key(page, 'down');
+    while ((await mainCursor(page)) !== 6) await key(page, 'down');
     await key(page, 'a'); await page.waitFor(`${HUB}.dialogOpen()`, { timeoutMs: 8000 });
     const c3 = await cursor(page);
     ok((await page.eval(`document.getElementById('controlsDialog').getAttribute('aria-modal')`)) === 'true' && (await page.eval(`!!document.querySelector('#controlsDialog .ip')`)), tag + 'Enter on CONTROLS opens the modal dialog with the input panel');
@@ -672,7 +695,7 @@ try {
     await padPress(page, 1);
     ok((await page.eval(`window.__navTo`)) === '/', tag + 'A7: a second B leaves for the site', String(await page.eval(`window.__navTo`)));
     await page.eval(`window.__navTo = null`);
-    for (let i = 0; i < 5; i++) await padPress(page, 13);
+    for (let i = 0; i < 6; i++) await padPress(page, 13);
     await padPress(page, 0); await page.waitFor(`${HUB}.dialogOpen()`, { timeoutMs: 8000 });
     ok(true, tag + 'A on CONTROLS opens the dialog');
     await padPress(page, 1); await sleep(200);

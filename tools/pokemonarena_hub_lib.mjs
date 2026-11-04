@@ -109,3 +109,41 @@ export const errsOf = (page) => page.errors.concat(page.console.filter((m) => m.
 
 export function fnv(u8) { let h = 0x811c9dc5; for (let i = 0; i < u8.length; i++) h = Math.imul(h ^ u8[i], 0x01000193) >>> 0; return h.toString(16).padStart(8, '0'); }
 export function readRom() { const b = fs.readFileSync(ROM_PATH); return new Uint8Array(b.buffer, b.byteOffset, b.length); }
+
+/* ------------------------------------------------------------------------------- the Tower's fixtures (Phase 2) */
+// Deterministic Tower summaries for the hub's tests: real runs driven through tower_session.js (fixed seeds, fixed clock), so every screen is drawn from data the game itself produces.
+//   offer3   a 3v3 run that has cleared floors 1-3 and is choosing after floor 3 (three balls), with an earlier run behind it (`last`) and some achievements
+//   offer5   the same kind of run after a BOSS floor (five balls)
+//   fight    the run of offer3 after taking a ball: waiting for its fight, with a trainer to show
+//   none     no run under way, a last run, achievements
+//   empty    a profile that never climbed
+export async function towerFixtures(pack) {
+  const SS = await mod('tower_session.js');
+  const { matchctl } = { matchctl: await mod('matchctl.js') };
+  const clock = () => 1700000000000;
+  const drive = async (seed, format, upTo, picks) => {
+    const persist = SS.memoryPersist();
+    const s = SS.createTowerSession({ pack, persist, now: clock });
+    const team = matchctl.randomTeam(pack, seed + 1, 6, 'arena-gen3-standard');
+    await s.startRun({ seed, format, team: { name: 'SQUAD', recs: team.recs, meta: team.meta } });
+    for (let g = 0; g < 400; g++) {
+      const tw = persist.peek(), cur = tw.current;
+      if (!cur) break;
+      if (cur.phase === 'offer') { if (cur.floor - 1 >= upTo) break; await s.pick({ seed, id: picks === null ? null : cur.offer[picks % cur.offer.length].id }); }
+      else await s.finishFloor({ floor: cur.floor, seed, result: { floor: cur.floor, result: 'w', turns: 5, faints: cur.floor % 3 } });
+    }
+    return { persist, s };
+  };
+  const a = await drive(4242, '3v3', 3, 0);
+  // an earlier run behind it: given up on floor 2 (so `last` exists and a few achievements are earned)
+  const earlier = await drive(77, '6v6', 2, 1); await earlier.s.giveUp({ seed: 77 });
+  const withLast = (tw, other) => ({ ...JSON.parse(JSON.stringify(tw)), last: JSON.parse(JSON.stringify(other.last)), runs: other.runs, floors: other.floors, best: { ...other.best, '3v3': tw.best['3v3'] }, achievements: { ...other.achievements, ...tw.achievements }, buffsSeen: { ...other.buffsSeen } });
+  const offer3 = withLast(a.persist.peek(), earlier.persist.peek());
+  const fight = JSON.parse(JSON.stringify(offer3));
+  { const p2 = SS.memoryPersist(fight); const s2 = SS.createTowerSession({ pack, persist: p2, now: clock }); await s2.pick({ seed: 4242, id: fight.current.offer[0].id }); Object.assign(fight, p2.peek()); }
+  const b = await drive(909, '3v3', 10, 2);
+  const offer5 = withLast(b.persist.peek(), earlier.persist.peek());
+  const none = JSON.parse(JSON.stringify(earlier.persist.peek()));
+  const sum = (tw) => SS.summarizeTower(tw, pack);
+  return { raw: { offer3, offer5, fight, none }, offer3: sum(offer3), offer5: sum(offer5), fight: sum(fight), none: sum(none), empty: sum(SS.memoryPersist().peek()) };
+}

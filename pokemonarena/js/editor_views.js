@@ -536,6 +536,15 @@ function recordNote(p, mode) {
   return n ? `Its battle record (${battles}) comes with it.` : 'Its battle record is empty.';
 }
 
+// schema 5: the Pokemon Tower's climb (profile.tower) travels like the battle record: new = the file's comes along, merge = the active profile's is left exactly as it is, replace = the file's takes its place
+function towerNote(p, mode) {
+  const t = p.tower, n = t ? t.runs | 0 : 0, best = t && t.best ? Math.max(t.best['3v3'] | 0, t.best['6v6'] | 0) : 0;
+  const climb = n ? `${n} Tower run${n === 1 ? '' : 's'}, best floor ${best}` : 'no Tower runs';
+  if (mode === 'replace') return `The Tower climb is replaced too: the file's (${climb}) takes its place, and the backup keeps the old one.`;
+  if (mode === 'merge') return "The active profile's Tower climb is left exactly as it is; the file's is not added.";
+  return `Its Tower climb (${climb}) comes with it.`;
+}
+
 function importPreview(app, res, importState, redraw) {
   const p = res.profile;
   const active = app.state ? app.state.profile : null;
@@ -552,6 +561,7 @@ function importPreview(app, res, importState, redraw) {
     mode === 'replace' ? h('p', { class: 'dim' }, 'Replace keeps your current identity key and takes a backup of what it replaces.') : mode === 'merge' ? h('p', { class: 'dim' }, 'Merge adds the file\'s Pokemon and teams to the active profile; duplicates are skipped.') : h('p', { class: 'dim' }, 'A new profile gets a new id. Its identity is the public key only; this browser holds no private key for it.'),
     // ST1: what the import does with the BATTLE RECORD (profile.stats): new = the file's comes along, merge = the active profile's is left exactly as it is, replace = the file's takes its place
     h('p', { class: 'dim', dataset: { importRecord: mode } }, recordNote(p, mode)),
+    h('p', { class: 'dim', dataset: { importTower: mode } }, towerNote(p, mode)),
     h('div', { class: 'row' }, h('button', { type: 'button', class: 'btn primary', dataset: { act: 'import-apply' }, onClick: async () => { const r = await app.actions.applyImport(res, mode); if (r.ok) { importState.result = null; importState.mode = null; } else importState.result = { ok: false, code: r.code || 'import.apply', message: r.message }; redraw(); } }, 'Import'),
       h('button', { type: 'button', class: 'btn', onClick: () => { importState.result = null; redraw(); } }, 'Cancel')));
 }

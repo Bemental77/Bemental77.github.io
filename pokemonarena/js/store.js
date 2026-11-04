@@ -532,7 +532,7 @@ export class ArenaStore {
       if (expectedRev !== undefined && curRev !== expectedRev) throw new ConflictError(`profile ${id}: expected rev ${expectedRev}, the store has ${curRev}`, { id, expectedRev, actualRev: curRev });
       const restored = opened.profile;
       // going back to an older revision of the TEAMS must not take the battle record back with it: the record as it stands now is kept
-      { const now = cur === undefined ? null : openProfileDocument(cur, { deps: this.deps }); if (now && now.ok && !now.readOnly) restored.stats = now.profile.stats; }
+      { const now = cur === undefined ? null : openProfileDocument(cur, { deps: this.deps }); if (now && now.ok && !now.readOnly) restored.stats = now.profile.stats; if (now && now.ok && !now.readOnly) restored.tower = now.profile.tower; }          // ... nor the Tower's record (schema 5)
       restored.rev = curRev; // _commit's CAS compares against what is stored right now (0 = nothing, or an unreadable record)
       return this._commit(tx, restored, { reason: `restore-of-${rev}`, backup: null, allowCorrupt: true });
     });
@@ -566,6 +566,37 @@ export class ArenaStore {
       return { saved, duplicate: false, callouts: r.callouts, before: opened.profile.stats };
     });
     if (out.saved) this._announce({ t: 'saved', id, rev: out.saved.rev });
+    return { ok: true, ...out };
+  }
+  // ---- the Tower's record (schema 5)
+  /**
+   * Change the profile's TOWER record INSIDE ONE read-write transaction (read, change, write), as recordMatch does for the battle record: two tabs finishing steps at the same moment cannot lose either one,
+   * no history entry is made (the ring of HISTORY_KEEP revisions is for the player's EDITS), and `stats` is never touched. `change(tower, profile)` must be a PURE, SYNCHRONOUS function of the record it is given
+   * (it may run on the profile of an older revision of the transaction's document; nothing outside it may be awaited): it returns null (nothing to write) or `{ tower: <the new record>, ...whatever the caller
+   * wants back }`. -> { ok:true, saved (the written profile, or null when nothing changed), before, after (the record before / after), result (what `change` returned, or null) }.
+   * Throws NotFoundError / ReadOnlyError / ValidationError (a record that would not be well formed is refused whole).
+   */
+  async towerUpdate(id, change) {
+    const first = await this.loadProfile(id);
+    if (!first.ok) { if (first.code === 'store.not-found') throw new NotFoundError(`no profile ${id}`, { id }); throw new ValidationError(`profile ${id} cannot be read: ${first.message}`, first.problems || []); }
+    if (first.unsaved) { throw first.writeError; }
+    const out = await this._tx(['profiles', 'profileHistory', 'meta'], 'readwrite', async (tx) => {
+      const stored = await tx.get('profiles', id);
+      if (stored === undefined) throw new NotFoundError(`no profile ${id}`, { id });
+      const doc = openProfileDocument(stored, { deps: this.deps });
+      if (!doc.ok) throw new ValidationError(`profile ${id} cannot be read: ${doc.message}`, doc.problems || []);
+      if (doc.readOnly) throw new ReadOnlyError(`profile ${id} was saved by a newer build and is read-only here`, { id, schemaVersion: doc.profile.schemaVersion });
+      const before = doc.profile.tower, r = change(clone(before), doc.profile);
+      if (!r || !r.tower) return { saved: null, before, after: before, result: r || null };
+      const next = clone(doc.profile);
+      next.tower = r.tower;
+      const bad = checkProfile(next);
+      if (bad.length) throw new ValidationError('the Tower record would not be well formed: ' + bad.slice(0, 2).map((x) => `${x.code} ${x.path}`).join(', '), bad);
+      next.rev = Number.isInteger(stored.rev) ? stored.rev : 0;
+      const written = await this._commit(tx, next, { reason: 'tower', backup: null, allowCorrupt: true, history: false });
+      return { saved: written, before, after: written.tower, result: r };
+    });
+    if (out.saved !== null) this._announce({ t: 'saved', id, rev: out.saved.rev });
     return { ok: true, ...out };
   }
   /** Empty the battle record of one profile (RESET RECORD). The replaced document goes into history and an automatic backup is taken first. */

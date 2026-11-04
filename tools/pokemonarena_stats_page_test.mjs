@@ -326,13 +326,13 @@ try {
   const hv = (page) => ev(page, `${HUB}.view()`);
   const rec = (page) => ev(page, `(() => { const v = ${HUB}.view(); return v.record ? { title: v.record.page.title, index: v.record.index, count: v.record.count, trainer: v.record.trainer && v.record.trainer.name, confirm: v.record.confirm, notice: v.record.notice, text: v.record.page.lines.map((l) => l.cells.map((c) => c.t).filter(Boolean).join(' ')).join(' / ') } : null; })()`);
   const where = (page) => ev(page, `${HUB}.model.path()`);
-  const RECORD_Y = HM.GEOM.menu.y + 2 * HM.menuPitch(8) + (HM.menuPitch(8) >> 1);
+  const RECORD_Y = HM.GEOM.menu.y + 3 * HM.menuPitch(8) + (HM.menuPitch(8) >> 1);          // the fourth row (QUICK, TEAM, TOWER, RECORD); eight of the nine rows are shown, at the 8-row pitch
 
   await session('record: keyboard + mouse', { width: 1280, height: 800, port: cdp++ }, async (page) => {
     const tag = 'record kbd+mouse: ';
     ok((await bootHub(page)) === 'ready', tag + 'the hub is ready (no profile yet)');
-    await key(page, 'down'); await key(page, 'down'); await sleep(80);
-    ok((await ev(page, `${HUB}.view().menu.rows[${HUB}.view().menu.cursor].label`)) === 'RECORD', tag + 'two ArrowDown presses reach the RECORD row');
+    await key(page, 'down'); await key(page, 'down'); await key(page, 'down'); await sleep(80);
+    ok((await ev(page, `${HUB}.view().menu.rows[${HUB}.view().menu.cursor].label`)) === 'RECORD', tag + 'three ArrowDown presses reach the RECORD row (after QUICK BATTLE, BATTLE WITH MY TEAM and TOWER)');
     await key(page, 'a'); await sleep(200);
     ok((await where(page)) === 'record' && (await page.eval('location.hash')) === '#record' && (await page.eval('document.title')) === 'Pokemon Arena - Record', tag + 'Enter opens RECORD (address #record, the title follows)');
     let r = await rec(page);
@@ -449,8 +449,8 @@ try {
     await bootHub(page);
     await page.waitFor(`${HUB}.data && ${HUB}.data.profiles && ${HUB}.data.profiles.length === 1 && ${HUB}.data.profiles[0].record`, { timeoutMs: 15000 });
     await page.send('Runtime.evaluate', { expression: `window.dispatchEvent(new Event('gamepadconnected'))` });
-    await padPress(page, 13); await padPress(page, 13); await padPress(page, 0);
-    ok((await where(page)) === 'record', tag + 'D-pad down twice + A opens RECORD');
+    await padPress(page, 13); await padPress(page, 13); await padPress(page, 13); await padPress(page, 0);
+    ok((await where(page)) === 'record', tag + 'D-pad down three times + A opens RECORD');
     await padPress(page, 15);
     ok((await rec(page)).index === 1, tag + 'D-pad right turns the page');
     await padPress(page, 13);

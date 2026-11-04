@@ -12,6 +12,8 @@
 //   seed=<u32>                  the battle seed (default: drawn once from crypto and written back into the address bar)
 //   format=6v6 | 3v3            6v6 = every Pokemon of both teams; 3v3 = team preview, each side picks 3 (Quick Battle defaults to 3v3)
 //   cpu=easy | normal | hard    the opponent's skill (default normal)
+//   tower=1&floor=N&run=<run seed>[&life=K][&p=<profile id>]   one FLOOR of a Pokemon Tower run (tower_launch.js has the contract; tower_fight.js is the logic, this page only wires it): the teams, seed, format and CPU
+//                               come from the run in the profile, and none of team / foe / seed / format / cpu / the online parameters may be given with it. See TOWER.md.
 // With no parameters the page starts a Quick Battle: two random legal teams under arena-gen3-standard. Anything that is not exactly one
 // of the forms above is refused with an error screen; the offending VALUE IS NEVER ECHOED, executed or put into the DOM.
 //
@@ -37,7 +39,8 @@ import { cleanName } from './netmatch.js';                              // an on
 import { createResumeStore, resumeKey, navigationType } from './battle_resume.js';       // W1 fix D11: a reload mid-battle resumes it
 import { parseOnlineQuery, createOnline } from './online.js';                         // two players, one battle (netmatch.js + lib/netplay.js); see ONLINE.md
 import { engineFingerprint } from './online_match.js';
-import { fitScale, fitPicture, createFullscreen, PROMPT_ROOM } from './screenfit.js';       // the picture fills its room; the Fullscreen switch
+import { fitScale, fitPicture, createFullscreen, PROMPT_ROOM } from './screenfit.js';
+import { parseTowerParams, returnToTower, returnToHub, launchFloorBattle } from './tower_launch.js';       // the Tower's addresses (light: strings only; the Tower's logic is loaded only when the address is a Tower one)       // the picture fills its room; the Fullscreen switch
 
 export { GBA_FPS };
 const STEP_MS = 1000 / GBA_FPS;
@@ -73,8 +76,11 @@ export function parseBattleQuery(search) {
   if (speed !== null && !['slow', 'mid', 'fast', '1', '2', '4'].includes(speed)) return bad('speed', 'That text speed cannot be used', 'The text speed must be slow, mid or fast.');
   if (parseAnimQuery(search).errors.includes('anim')) return bad('anim', 'That animation setting cannot be used', 'The animation setting must be 0 or 1.');
   if (parseAnimQuery(search).errors.includes('animskip')) return bad('animskip', 'That animation setting cannot be used', 'The animation skip setting must be 0 or 1.');
-  const quick = team === null;
-  return { ok: true, params: { team: team === null ? null : team.replace(/\s+/g, ''), foe: foe === null ? 'random' : foe === 'random' ? 'random' : foe.replace(/\s+/g, ''), seed, format: format || (quick ? '3v3' : '6v6'), cpu: cpu || 'normal', speed: ['slow', 'mid', 'fast'].includes(speed) ? speed : 'fast', quick } };
+  const tw = parseTowerParams(q);
+  if (!tw.ok) return bad(tw.error.param, tw.error.title, tw.error.message);
+  if (tw.tower && (team !== null || foe !== null || seedS !== null || format !== null || cpu !== null || ['np', 'host', 'join', 'online'].some((k) => q.has(k)))) return bad('tower', 'That Tower address cannot be used', 'A Tower fight takes its teams, seed, format and CPU level from the run, so the address cannot also name them or ask for an online battle.');
+  const quick = team === null && !tw.tower;
+  return { ok: true, params: { team: team === null ? null : team.replace(/\s+/g, ''), foe: foe === null ? 'random' : foe === 'random' ? 'random' : foe.replace(/\s+/g, ''), seed, format: format || (quick ? '3v3' : '6v6'), cpu: cpu || 'normal', speed: ['slow', 'mid', 'fast'].includes(speed) ? speed : 'fast', quick, tower: tw.tower } };
   function bad(param, title, message) { return { ok: false, error: { param, title, message } }; }
 }
 
@@ -136,6 +142,7 @@ async function main() {
   const mbs = (n) => (n / 1048576).toFixed(1);
   const input = createInput();
   let nav = null, scene = null, ctl = null, ui = null, packRef = null, romBytes = null, last = null;
+  let towerFight = null;                              // the Tower floor's controller (tower_fight.js), or null for every other battle (declared early: fit() reads it)
   let touchPad = false;
   // W1: the pause menu's CONTROLS row opens the shared Controls dialog. While it is open the clock stops and the scene hears nothing (the B
   // that closes the dialog must not also act on the battle), then the pause menu comes back where it was (scene.js openMenu('CONTROLS')).
@@ -158,7 +165,7 @@ async function main() {
     showRomError({ boot: els.boot, err: els.err, errTitle: els.errTitle, errMsg: els.errMsg, errDetail: els.errDetail, retry: els.retry }, { kind: kind || 'internal', title, message, detail, retry, tech: tech || '' });          // W1 D7: the one shared error experience (rom_error.js)
     { const q = $('quickBtn'); if (q) q.hidden = kind !== 'params'; }          // 'Quick Battle' belongs to a refused ADDRESS, not to a missing game file
     document.body.dataset.state = 'error';
-    if (!nav) { try { nav = enableDomNav(els.err, { input, onBack: () => { location.href = '/pokemonarena/'; } }); } catch (_e) { nav = null; } }
+    if (!nav) { try { nav = enableDomNav(els.err, { input, onBack: () => { location.href = hook.params && hook.params.tower ? '/pokemonarena/#tower' : '/pokemonarena/'; } }); } catch (_e) { nav = null; } }
     else { try { nav.refresh(); } catch (_e) { /* ignore */ } }
     if (nav) { try { nav.focusFirst(); } catch (_e) { /* ignore */ } }
     fit();
@@ -170,7 +177,7 @@ async function main() {
   // The picture takes the room it is given (screenfit.js fitPicture): a phone held upright runs it edge to edge, fullscreen gives it the whole viewport.
   // The old rule here was a whole scale only (floor), which left a 390 px phone a 324 px picture and a 360 px phone a 244 px one.
   function fit() {
-    hook.scale = fitPicture({ doc: document, win: window, canvas, top: els.top, padA: els.padA, padB: els.padB, touchPad, hint: (!touchPad && document.body.dataset.state === 'ready') ? 40 + PROMPT_ROOM : 0 });
+    hook.scale = fitPicture({ doc: document, win: window, canvas, top: els.top, padA: els.padA, padB: els.padB, touchPad, hint: ((!touchPad && document.body.dataset.state === 'ready') ? 40 + PROMPT_ROOM : 0) + (towerFight && document.body.dataset.state === 'ready' ? 30 : 0) });          // a Tower floor has its status line under the picture
     try { syncChips(); } catch (_e) { /* the chips are placed again on the next frame */ }
   }
   window.addEventListener('resize', fit);
@@ -243,7 +250,7 @@ async function main() {
   }
   // H1 integration: result buttons are REMATCH / EDIT TEAM / BACK TO HUB for a battle with a team, REMATCH / NEW BATTLE / BACK TO HUB for a quick one
   let online = null;                                  // the networked match (online.js), or null for a battle against the CPU
-  const resultOptionsFor = () => (online ? ['REMATCH', 'BACK TO HUB'] : params.team !== null ? ['REMATCH', 'EDIT TEAM', 'BACK TO HUB'] : ['REMATCH', 'NEW BATTLE', 'BACK TO HUB']);
+  const resultOptionsFor = () => (towerFight ? towerFight.resultOptions(ctl ? ctl.winner : null) : online ? ['REMATCH', 'BACK TO HUB'] : params.team !== null ? ['REMATCH', 'EDIT TEAM', 'BACK TO HUB'] : ['REMATCH', 'NEW BATTLE', 'BACK TO HUB']);
   // EDIT TEAM: find which saved team this battle was started with (the address carries only its code) and open the team builder on it
   async function editTeam() {
     let url = '/pokemonarena/editor.html';
@@ -258,6 +265,7 @@ async function main() {
   }
   let resumeStore = null, resuming = false;          // D11: the saved-battle record (cleared when the result is chosen, the battle is left or it ends); resuming = the saved history is being replayed (silent)
   function onResult(choice) {
+    if (towerFight) { if (resumeStore) resumeStore.clear(); hook.resultChoice = choice; towerFight.onResult(choice); return; }       // a Tower floor: its own buttons, nothing written to the career
     if (online) { hook.resultChoice = choice; whenCareerSettled(() => online.onResult(choice)); return; }       // REMATCH asks the other player; BACK TO HUB leaves the room (after the battle has been written to the profile, at most 1.5 s)
     if (resumeStore) resumeStore.clear();
     hook.resultChoice = choice;
@@ -322,6 +330,39 @@ async function main() {
     return career.promise;
   }
 
+  /* ---- a Tower floor (battle.html?tower=1): the wiring only. The logic is tower_fight.js / tower_session.js, which take callbacks and never read an address. ---- */
+  let towerStore = null;
+  function towerError(message, title) {
+    const back = $('hubBtn'); if (back) { back.href = '/pokemonarena/#tower'; back.textContent = 'Back to the Tower'; }
+    showError({ title: title || 'This Tower fight cannot start', message, detail: '', kind: 'tower' });
+    { const q = $('quickBtn'); if (q) q.hidden = true; }
+  }
+  async function openTowerFight(tw) {
+    let ses, storeMod, fightMod;
+    try { [ses, storeMod, fightMod] = await Promise.all([import('./tower_session.js'), import('./store.js'), import('./tower_fight.js')]); } catch (e) { towerError('The Tower could not be loaded: ' + String(e && e.message ? e.message : e).slice(0, 80)); return null; }
+    try {
+      towerStore = await storeMod.openStore();
+      if (towerStore.status.notSaved) { towerError('This browser is not keeping your profile, so a Tower run cannot be kept between pages. Allow site storage and try again.', 'The Tower needs storage'); return null; }
+      const profileId = tw.profileId || await towerStore.getActiveId();
+      if (!profileId) { towerError('The Tower keeps its run in a trainer profile, and there is none yet. Start a run from the hub.'); return null; }
+      const nv = { toTower: (step) => returnToTower({ navigate, step }), toHub: () => returnToHub({ navigate }), retry: (run) => launchFloorBattle(run, { navigate, profileId }) };
+      const f = await fightMod.createTowerFight({ pack: packRef, persist: ses.storePersist(towerStore, profileId), floor: tw.floor, runId: tw.run, navType: navigationType(), nav: nv });
+      hook.towerProfile = profileId;
+      if (!f.ok) { hook.towerRefused = { status: f.status, why: f.why, next: f.next }; towerError(f.message, f.status === 'abandoned' ? 'The last fight was left' : undefined); return null; }
+      return f;
+    } catch (e) { towerError('The Tower could not be opened: ' + String(e && e.message ? e.message : e).slice(0, 80)); return null; }
+  }
+  function towerMatchEnd(mi) {
+    scene.setCareer(towerFight.recap());                                                    // "SAVING THE CLIMB..." until the write has answered
+    towerFight.onMatchEnd(mi).then(() => { try { scene.setCareer(towerFight.recap()); } catch (_e) { /* the scene is gone */ } });
+  }
+  function showTowerBar() {
+    const bar = $('towerBar'); if (!bar) return;
+    bar.hidden = false; bar.textContent = towerFight.bar();
+    document.title = 'Pokemon Arena - Tower Fight';          // (the title format has no digits: the floor is on the status line)
+    fit();
+  }
+
   /* ---- load ---- */
   const parsed = parseBattleQuery(location.search);
   if (!parsed.ok) { showError({ title: parsed.error.title, message: parsed.error.message, detail: 'Parameter: ' + parsed.error.param, kind: 'params', param: parsed.error.param }); return; }
@@ -329,7 +370,7 @@ async function main() {
   // An online address (?online=1 or the lobby's ?np=CODE&host=1|join=1) is a battle against a person: the seed is agreed with them, not drawn here.
   const onlineQuery = parseOnlineQuery(location.search);
   if (onlineQuery && onlineQuery.error) { showError({ title: 'That address cannot be used', message: onlineQuery.error, detail: 'Parameter: np / host / join', kind: 'params', param: 'np' }); return; }
-  if (params.seed === null && !onlineQuery) {
+  if (params.seed === null && !onlineQuery && !params.tower) {
     const a = new Uint32Array(1);
     if (window.crypto && window.crypto.getRandomValues) window.crypto.getRandomValues(a); else a[0] = (Date.now() >>> 0);
     params.seed = a[0] >>> 0;
@@ -359,7 +400,13 @@ async function main() {
       ui = createBattleUi(bytes);
       text = loadBattleText(bytes, manifest);
     } catch (e) { showError(romError(e)); return; }
-    const r = onlineQuery ? { ok: true, spec: null } : await resolveBattle(packRef, params);       // online: the teams and the seed come from the handshake
+    // A Tower address: the run, its buffs and the floor come from the profile through tower_fight.js (the same functions a hub-hosted fight calls); nothing below this line knows what a buff is.
+    if (params.tower) {
+      const tf = await openTowerFight(params.tower);
+      if (!tf) return;
+      towerFight = tf; params.format = tf.spec.format; params.cpu = tf.spec.cpu; hook.tower = tf;
+    }
+    const r = onlineQuery ? { ok: true, spec: null } : towerFight ? { ok: true, spec: towerFight.spec } : await resolveBattle(packRef, params);       // online: the teams and the seed come from the handshake
     if (!r.ok) { showError({ title: r.error.title, message: r.error.message, detail: r.error.detail || '', kind: 'params', param: r.error.param }); return; }
     // AN1: animation settings (`arena.anim`, `?anim=` `?speed=1|2|4` `?animskip=`) and the shared ROM move animator (move_anim.js). The animator is built only while
     // animations are on; a module that is missing or throws leaves the battle on the old lunge + blink and says why in hook.animError.
@@ -401,6 +448,7 @@ async function main() {
       fit();
       wireInput();
       hook.state = 'ready'; hook.kind = null; hook.error = null; hook.sha256 = sha256;
+      if (towerFight) showTowerBar();
       makeHook();
       if (soundSys) { soundSys.setRom({ bytes, pack: packRef }); window.__arenaSound = soundSys; }       // MU3: the ROM's music; nothing is heard before the first click / tap / key
       try { canvas.focus({ preventScroll: true }); } catch (_e) { /* ignore */ }
@@ -462,19 +510,23 @@ async function main() {
     try {
       const spec = r.spec;
       battleRuleset = spec.ruleset;
-      const makeCtl = () => createMatchController({ pack: packRef, ruleset: spec.ruleset, teams: spec.teams, seed: spec.seed, pick: spec.pick, names: spec.names, sides: spec.sides });
+      const makeCtl = () => createMatchController({ pack: packRef, ruleset: spec.ruleset, teams: spec.teams, seed: spec.seed, pick: spec.pick, names: spec.names, sides: spec.sides, validate: spec.validate });          // spec.validate is undefined for every regular spec (the default, full validation); only a Tower floor sets it
       ctl = makeCtl(); ctl.start();
       // D11: a RELOAD (or a back / forward step) of a battle that was under way replays the human's saved choices into the controller, proves the result is the saved state, and lets
       // the scene play the history at speed and silently; anything doubtful starts the battle from the team preview as before (hook.resume.reason says why). A fresh visit never resumes.
       let store = null; try { store = window.sessionStorage; } catch (_e) { store = null; }
-      resumeStore = createResumeStore({ storage: store, key: resumeKey(location.pathname, location.search), seed: spec.seed });
+      resumeStore = createResumeStore({ storage: store, key: resumeKey(location.pathname, location.search), seed: spec.seed, tag: towerFight ? towerFight.tag : undefined });
       const rs = resumeStore.restore({ ctl, makeCtl, navType: navigationType() });
       ctl = rs.ctl; hook.resume = rs.info; resuming = rs.info.restored;
-      scene = createScene({ ui, pack: packRef, text, ctl, viewSide: 0, resultOptions: resultOptionsFor(), env: spec.seed % 9, textSpeed: params.speed, meta: spec.meta, trainer: spec.trainer, playerName: 'You', trainerChoices: trainerChoicesOf(), cpuLevel: spec.cpu, clock: () => performance.now(), sound: soundApi, quitLabel: 'BACK TO HUB', anim: animCfg, animator: resuming ? null : animator, animSeed: spec.seed, hooks: mkHooks({ onResult: onResult, onMatchEnd: recordCareer, onQuit: () => { if (resumeStore) resumeStore.clear(); whenCareerSettled(() => navigate('/pokemonarena/')); } }) });
+      const sceneOpts = { ui, pack: packRef, text, ctl, viewSide: 0, resultOptions: resultOptionsFor(), env: spec.seed % 9, textSpeed: params.speed, meta: spec.meta, trainer: spec.trainer, playerName: 'You', trainerChoices: trainerChoicesOf(), cpuLevel: spec.cpu, clock: () => performance.now(), sound: soundApi, quitLabel: towerFight ? 'LEAVE TOWER' : 'BACK TO HUB', anim: animCfg, animator: resuming ? null : animator, animSeed: spec.seed, hooks: mkHooks({ onResult: onResult, onMatchEnd: towerFight ? towerMatchEnd : recordCareer, onQuit: () => { if (resumeStore) resumeStore.clear(); if (towerFight) { towerFight.onQuit(); return; } whenCareerSettled(() => navigate('/pokemonarena/')); } }) };
+      // the result buttons are read when the result screen comes up (scene.js startResult), so a Tower floor's can follow who won
+      if (towerFight) Object.defineProperty(sceneOpts, 'resultOptions', { enumerable: true, get: () => resultOptionsFor() });
+      scene = createScene(sceneOpts);
       scene.begin();
       if (resuming) { hook.resume.frames = scene.catchUp(); resuming = false; scene.setAnimator(animator); }
       if (soundSys) soundSys.hookScene(scene);       // MU3: hit / faint / send-out sounds and the animator's sound events -> the ROM's effects (hooked after a resume's silent replay)
       resumeStore.attach(ctl);
+      if (towerFight) ctl.onLocalChoice(() => towerFight.committed());          // the fight begins at the player's first choice: leaving it from then on counts as a loss
       if (scene.mode === 'steps') scene.tick();       // AN1 round 4: begin() leaves the scene ONE tick short of its first screen (the team preview). Settle it before 'ready', so the first frame drawn and the first key pressed land on the preview (measured, desktop 1280x800: a key sent at ready was lost on 5 of 5 loads with animations on, 1 of 5 with them off)
     } catch (e) { showError({ title: 'The battle could not start', message: String(e && e.message ? e.message : e), detail: Array.isArray(e && e.detail) ? e.detail.slice(0, 3).map((x) => x.message || x.code).join('; ') : '', kind: 'internal' }); return; }
 

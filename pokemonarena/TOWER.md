@@ -2,7 +2,7 @@
 
 A solo roguelike climb for Pokemon Arena: thirty floors of CPU trainers, and after every floor you win you choose one of three Poke Balls, each holding a buff that stacks, upgrades and combines with the ones you already have.
 
-**Status: Phase 1.** This document, four pure modules and their tests exist. Nothing is wired into a page, the profile or the hub: no HTML, CSS, `profile.js`, `career_stats.js`, `hub_*.js`, `battle_boot.js`, `scene.js`, online or sound file was touched. Phase 2 (profile schema v5, hub screens, the battle page's tower mode, the offer-screen drawing, page tests) starts when the owner says so.
+**Status: Phase 2, playable.** The Tower is wired end to end: the profile keeps it (schema 5), the hub has a TOWER row with its own screens, a floor is fought on the battle page, and the way back (offer, status, last run, achievements) is in the hub. Section 17 says how it is wired and where the one seam is; sections 1-16 are the design and still describe the rules. The regular game (Quick Battle, team battles, online) never sees a buff and the Tower never writes the career record.
 
 The tables in this file between `<!-- BEGIN gen:... -->` markers are **generated from the code** by `node tools/pokemonarena_tower_doc.mjs` and checked by the test (case `A16`), so they cannot drift from what the modules do.
 
@@ -11,7 +11,16 @@ pokemonarena/js/tower_config.js   every tunable number (floors, odds, foe scalin
 pokemonarena/js/tower_buffs.js    the buff catalogue, the synergies, the interpreter that applies them, the words that describe them
 pokemonarena/js/tower.js          the run: floors, trainers, offers, picks, results, the strict stored form, the Tower's own record
 pokemonarena/js/achievements.js   the achievements, computed from a run's history and the Tower record
-tools/pokemonarena_tower_test.mjs 121 cases + 52 mutants          node tools/pokemonarena_tower_test.mjs [--mutants]
+pokemonarena/js/tower_record.js   the stored shape of the Tower record (light: profile.js imports it)
+pokemonarena/js/tower_session.js  the run as reducers over the stored record + the floor's spec; callbacks, no page, no address
+pokemonarena/js/tower_fight.js    one floor's fight: the lifecycle (begun / left / won / lost) over a session; nav callbacks
+pokemonarena/js/tower_launch.js   THE SEAM: the only Tower file that names an address (launchFloorBattle, returnToTower)
+pokemonarena/js/tower_hub.js      the hub's Tower screens as a pure state machine (effects out, no DOM)
+pokemonarena/js/tower_screen.js   drawing those screens with the ROM's own pieces
+tools/pokemonarena_tower_test.mjs         184 cases + 99 mutants  node tools/pokemonarena_tower_test.mjs [--mutants]
+tools/pokemonarena_tower_profile_test.mjs  41 cases + 26 mutants   schema 5, migration, import / merge, the store transaction
+tools/pokemonarena_tower_hub_test.mjs      the hub screens: 28 mutants, every view drawn   [--mutants]
+tools/pokemonarena_tower_page_test.mjs     real Chrome: phone (touch) and desktop (keyboard + controller)
 tools/pokemonarena_tower_doc.mjs  regenerates / checks the tables in this file
 ```
 
@@ -457,7 +466,7 @@ The four sprites were chosen by **measuring the real ROM's palettes** (the test,
  +--------------------------------------+
 ```
 
-## 11. The Tower's record (proposed `profile.tower`, schema v5)
+## 11. The Tower's record (`profile.tower`, schema v5 - built in Phase 2)
 
 The profile is at schema 4 (`profile.js:60`, `SCHEMA_VERSION = 4`) with a fixed key list (`profile.js:431`, `PROFILE_KEYS`). The Tower adds one key:
 
@@ -476,11 +485,11 @@ The profile is at schema 4 (`profile.js:60`, `SCHEMA_VERSION = 4`) with a fixed 
 - **It is not the career.** `stats` (`career_stats.js:19-24`: `byFormat`, `byCpu`, `totals`, `recent`) is untouched; there is no field a Tower result could fold into (`H10`).
 - **Strict:** `checkTower` refuses unknown fields, wins above runs, a best above the floor count, unknown buffs, bad stamps and a finished run in `current` (`F19`: 8 hostile edits). `current` is itself checked by `parseRun`, which re-derives its held list and offer.
 - **Size is bounded:** `current` is at most six records, one offer and a history the parser caps at 400 rows; `achievements` <= 51 today (the check allows 500); `buffsSeen` <= 124.
-- **Phase 2 work, not done:** add `tower` to `PROFILE_KEYS`; migration 4 -> 5 sets `tower = emptyTower()` and keeps every other key (the existing migrations are the pattern, `profile.js:521-586`); export/import carry it; the validator calls `checkTower`.
+- **Built (Phase 2):** `tower` is in `PROFILE_KEYS`; `SCHEMA_VERSION = 5`; `migrate4to5` is pure and idempotent (it keeps a valid `tower`, sets `emptyTower()` otherwise, and parks junk in `_unknown.v4Tower`); `normalizeTower` repairs field by field and keeps the damaged value in `tower._unknown.towerRejected`; the export checksum covers `tower`; import `new` copies it, `replace` replaces it, `merge` keeps the local one; "Keep my edits" and restoring a revision keep the CURRENT tower and the CURRENT `stats`. A profile of a newer schema stays read-only. The record also holds `last` (a summary of the last finished run). `tools/pokemonarena_tower_profile_test.mjs` proves each of these, and that a whole climb through the real store leaves `stats.totals`, `byCpu` and the online record byte-identical.
 - **Merge (proposal; I have not read the profile merge code in this phase and Phase 2 must follow whatever it does for `stats`):** `best` = max per format; `achievements` = union keeping the earlier stamp; `buffsSeen` = union keeping the larger count; counters (`runs`, `wins`, `floors`, `bosses`) cannot be summed across two copies of the same profile without double counting, so follow `stats`' rule; `current` = the run that has cleared more floors.
 - **Folding a finished run** (`foldRunInto`) is idempotent: a run carries a `folded` flag, so a replay or a second tab cannot count it twice (`F15`, `F18`). A run in progress folds into nothing.
 
-## 12. Hub screens needed (Phase 2)
+## 12. Hub screens (Phase 2: built, except the codex and the grade filter)
 
 1. **Tower home:** the current run (Continue / Give up), Start a run (pick a saved legal team and a format), the record (best floor per format, runs, wins).
 2. **Floor screen:** the floor and the trainer (name, team size, CPU level; the team itself only with Scouting Report), what you hold, a *Fight* button.
@@ -490,7 +499,9 @@ The profile is at schema 4 (`profile.js:60`, `SCHEMA_VERSION = 4`) with a fixed 
 6. **Achievements:** the 51, locked / earned with the stamp, filter by grade.
 7. **Buff codex:** the 124 families, seen or not (from `buffsSeen`), with the effect at each colour.
 
-The battle page needs a *tower mode*: build the match from `battleSetup(pack, run)` (not from two saved teams), pass `validate: false`, run the CPU with `setup.cpu`, and on the end hand `summarizeMatch`'s summary to `recordFloorResult`, **persist the run before showing the result screen**, and never call the career's `foldMatch`.
+Built: 1 (Tower home, with FIGHT / CHOOSE A BUFF / NEW RUN / DROP THIS RUN / TRAINER), 2 (folded into the home screen: the message says who is next), 3 (the offer, section 10), 4 (MY BUFFS with a SYNERGIES tab), 5 (LAST RUN), 6 (ACHIEVEMENTS, all 51, earned ones marked; no grade filter yet). **Deferred:** 7 (the codex of all 124 families) and the achievement filter.
+
+The battle page needs a *tower mode* (built: `battle.html?tower=1&floor=N&run=<seed>[&life=K][&p=<profile id>]`): build the match from `battleSetup(pack, run)` (not from two saved teams), pass `validate: false`, run the CPU with `setup.cpu`, and on the end hand `summarizeMatch`'s summary to `recordFloorResult`, **persist the run before showing the result screen**, and never call the career's `foldMatch`.
 
 ## 13. How the Tower reaches the engine
 
@@ -533,8 +544,26 @@ What this does and does not say. A team with no buffs dies around floor 7-9, and
 ## 16. Questions for the owner (with a recommended default)
 
 1. **A loss ends the run (no lives by default)?** Recommended: yes; Extra Life is a purple/gold buff. `cfg.lives` changes it.
-2. **Leaving a Tower battle mid-fight** (closing the tab): recommended - it counts as a loss on that floor, and a reload resumes the same fight if the battle-resume code can carry a Tower setup (to be checked in Phase 2). Otherwise a reload restarts the floor with no penalty, which is a free retry.
+2. **Leaving a Tower battle mid-fight** (closing the tab): **built as recommended.** The fight BEGINS at the player's first choice (`ctl.onLocalChoice`); from then on leaving it counts as a loss (an Extra Life is spent if held). A reload resumes the same fight (`battle_resume.js` carries a `tag` = `tower:<seed>:<floor>:<livesUsed>:<hash of what is held>` that must match, so a record from another run or another set of buffs is refused). Arriving at a begun fight any other way (a typed address, a link) is a loss. Looking at a floor and leaving before the first choice costs nothing.
 3. **30 floors, bosses at 10 / 20 / 30, formats 3v3 and 6v6?** Recommended: keep; every one is a config value.
 4. **Achievements are cosmetic only** (a badge and a stamp on the profile), nothing that touches regular play. Recommended: yes.
 5. **Scouting Report** needs a trainer-preview line on the floor screen. Recommended: show the trainer's species only, not moves or EVs.
 6. **A daily shared seed** (everyone climbs the same Tower) - free to add later because a run is `seed + picks`. Recommended: after the first version is played.
+
+## 17. Phase 2: how it is wired
+
+**The rule that shaped it.** The owner wants one continuous game, so every Tower rule lives in modules that take plain arguments and callbacks and never read `location`, an address or the DOM. A test (`M7`, `pokemonarena_tower_test.mjs`) fails if any Tower module except `tower_launch.js` names an address, `location`, `window` or a page.
+
+**The seam: `js/tower_launch.js`.** `launchFloorBattle(run, { navigate, profileId })` is the ONLY place the hub starts a floor's battle: today it navigates to `battle.html?tower=1&floor=N&run=<seed>...` (`towerBattleHref`); when the hub hosts battles in its own page, replace that one function (mount the fight, call `startTowerFloor` / `createTowerFight` directly). `returnToTower({ navigate, step })` is the way back (`#tower-offer`, `#tower-last` or `#tower`), `returnToHub` leaves for the main menu, `parseTowerParams` reads an address back (strict: `tower` must be `1`, floor 1-30, decimal run and life, a profile-id alphabet; nothing is echoed). The hub calls it from `boot.js` (`towerEffect`); the battle page calls the same functions through `battle_boot.js`'s thin Tower mode.
+
+**The logic, with no page in it.**
+- `tower_session.js`: `createTowerSession({ pack, persist })` -> `startRun / beginFloor / markFight / finishFloor / pick / giveUp / read`, each a pure reducer over the stored record run in one store transaction (`store.towerUpdate`, compare-and-set, no history entry). Results are idempotent (a replay is "already applied"), achievements are evaluated after each step and stamped with the caller's clock. `startTowerFloor({ pack, persist, floor, runId, navType })` -> `{ ok, spec, tag, markFight(), finish(result) }`. `towerFloorSpec(pack, run)` is the ONE place buffs reach a battle: it builds a normal spec (`validate: false`) plus a `tower` record; `resolveBattle` and every regular spec are untouched and carry no `tower` field.
+- `tower_fight.js`: `createTowerFight({ pack, persist, floor, runId, navType, nav, now })` with `nav = { toTower(step), toHub(), retry(run) }` -> `{ ok, status, spec, tag, bar(), resultOptions(winner), committed(), onMatchEnd(info), recap(), whenSettled(go), onResult(choice), onQuit() }`. A refusal carries a status (`stale`, `abandoned`) and words.
+- `tower_hub.js` / `tower_screen.js`: the hub screens. `hub_model.js` hands every path beginning `tower` to `tower_hub.js`; its effects are `tower-new / tower-fight / tower-pick / tower-giveup` plus screen changes (`back: true` when a screen steps back to another Tower screen). Nothing in the hub navigates to show a Tower screen; only FIGHT uses the battle page.
+- Resumable anywhere: the run, its phase (`battle` / `offer` / `over` / `won`), the offer and the fight flag are in `profile.tower`. Reloading on the offer shows the offer; reloading mid-fight resumes the fight; an offer is applied once (a second pick of the same offer is refused as already applied).
+
+**The offer screen's art.** The three (five for a boss) Poke Balls are the ROM's own ball sprites (`anim_mon.js ballGfx`, ROM balls 7, 9, 4 and 13 for green, blue, purple and gold), drawn at 2x, closed when idle and open and lifted when highlighted, with a rarity-coloured outline; the text box, fonts and colours are the ROM's. **Honest note:** the starter-selection scene's own art (the three balls on the table) is not decoded by this project, so the balls are the battle-intro sprites, not a copy of that scene.
+
+**Main menu.** It now has nine rows and shows eight at a time (`MAIN_VISIBLE` in `hub_model.js`), scrolling to keep the cursor visible, with arrows for what is hidden; another row (OPEN BATTLES) can be added with one entry in the row table and needs nothing from the Tower code.
+
+**Page test.** `tools/pokemonarena_tower_page_test.mjs` plays floors 1-3 in real Chrome at 390x844 (touch only) and 1280x800 (keyboard and a synthetic controller): the offer by touch and by pad, a mid-fight reload that resumes, a floor left by a typed address (a loss), a loss that ends the run, hostile addresses (refused, nothing written), NEW RUN from the hub, the career byte-identical after a climb, and a plain Quick Battle in the same browser playing exactly the battle it played before.

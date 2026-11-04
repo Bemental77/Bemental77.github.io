@@ -5,7 +5,8 @@
 // Math.random: a seed is passed in. Nothing leaves the browser.
 //
 //   const store = await openStore();
-//   const data = await readHubData(store, pack);          // { state, profiles: [{ id, name, teams: [{ id, name, size, legal, problems, names, lead }], record: { battles, resettable, pages } }], activeId, notSaved }
+//   const data = await readHubData(store, pack, { towerSummary });   // { state, profiles: [{ id, name, readOnly, teams: [{ id, name, size, legal, problems, names, lead, ruleset }], record: { battles, resettable, pages }, tower }], activeId, notSaved }
+//      `towerSummary(towerRecord, pack)` (tower_session.js summarizeTower) is passed in by the page once the Tower's code has loaded, so the hub does not carry the engine just to list teams; until then `tower` is null.
 //   const r = await teamCodeFor(store, profileId, teamId); // { ok: true, code } | { ok: false, message }
 //   battleHref({ mode: 'team', code, format: '3v3', cpu: 'normal', seed })   // '/pokemonarena/battle.html?team=...'
 //   await findTeamForCode(store, code)                    // { profileId, teamId } | null  (which saved team a battle was started with)
@@ -65,7 +66,10 @@ export async function readHubData(store, pack, opts = {}) {
         record = r.readOnly ? { battles: 0, resettable: false, pages: buildRecordNotice('readonly') }
           : { battles: battleCount(p.stats), resettable: true, pages: buildRecordPages(p.stats, { speciesName: (id) => speciesName(pack, id), moveName: (id) => (pack.moves[id] && pack.moves[id].name) || '?', tzMinutes: opts.tzMinutes | 0, resettable: true }) };
       } catch (_e) { record = { battles: 0, resettable: false, pages: buildRecordNotice('unavailable') }; }
-      out.profiles.push({ id: p.id, name: p.trainerName, readOnly: !!r.readOnly, teams, record });
+      // the Tower's climb of this profile, summarised for the Tower screens (null while the Tower's code loads, or for a profile of a newer build, whose Tower record this build cannot read)
+      let tower = null;
+      if (!r.readOnly && typeof opts.towerSummary === 'function') { try { tower = opts.towerSummary(p.tower, pack); } catch (_e) { tower = null; } }
+      out.profiles.push({ id: p.id, name: p.trainerName, readOnly: !!r.readOnly, teams, record, tower });
     }
     if (st.notSaved && !out.profiles.length) { out.state = 'unavailable'; out.note = 'This browser is not keeping profiles.'; }
   } catch (e) {

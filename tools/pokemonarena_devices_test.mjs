@@ -173,12 +173,13 @@ class Dev {
   }
 
   /* ---------------------------------------------------------------- hub rows */
-  async hubState() { return this.page.eval(`(() => { const h = window.${HUB}, m = h.model, st = m.state(); const v = m.view(); return { path: m.path(), cursor: st.cursor[m.path()], rows: v.menu ? v.menu.rows.map((r) => ({ id: r.id, label: r.label, value: r.value, disabled: !!r.disabled })) : null, rects: m.rects(), src: h.input ? h.input.lastSource : null, dialog: h.dialogOpen() }; })()`); }
+  async hubState() { return this.page.eval(`(() => { const h = window.${HUB}, m = h.model, st = m.state(); const v = m.view(); return { path: m.path(), cursor: st.cursor[m.path()], rows: v.menu ? v.menu.rows.map((r) => ({ id: r.id, label: r.label, value: r.value, disabled: !!r.disabled })) : null, allRows: m.rows().map((r) => r.id), offset: v.menu && v.menu.offset ? v.menu.offset : 0, rects: m.rects(), src: h.input ? h.input.lastSource : null, dialog: h.dialogOpen() }; })()`); }
   async hubChoose(id, { activate = true } = {}) {
     const s0 = await this.hubState();
-    const idx = s0.rows.findIndex((r) => r.id === id);
-    if (idx < 0) throw new Error('no hub row ' + id + ' in ' + J(s0.rows));
-    if (!this.cursorBased) { const r = s0.rects[idx]; await this.pointAt(HUB + '.canvas', r.x + r.w / 2 - 20, r.y + r.h / 2, { hover: true }); return; }
+    // the main menu scrolls (nine rows, eight shown): the cursor is an index into ALL the rows, the rectangles are those of the rows SHOWN
+    const idx = s0.allRows.indexOf(id);
+    if (idx < 0) throw new Error('no hub row ' + id + ' in ' + J(s0.allRows));
+    if (!this.cursorBased) { const r = s0.rects[idx - s0.offset]; if (!r) throw new Error('hub row ' + id + ' is scrolled out of view; a pointer cannot reach it'); await this.pointAt(HUB + '.canvas', r.x + r.w / 2 - 20, r.y + r.h / 2, { hover: true }); return; }
     for (let g = 0; g < 14; g++) {
       const s = await this.hubState();
       if (s.cursor === idx) break;
@@ -508,7 +509,7 @@ async function journeyA(dev, page) {
   await gamepadWake(page, dev);
   await noDemoWords(dev, 'the hub');
   let h = await dev.hubState();
-  ok(h.rows.map((r) => r.id).join() === 'quick,team,record,builder,import,controls,sound,about', dev.tag('A: the hub shows its eight rows (IMPORT SAVE and, since ST1, RECORD among them)'), J(h.rows.map((r) => r.id)));
+  ok(h.allRows.join() === 'quick,team,tower,record,builder,import,controls,sound,about' && h.rows.length === 8, dev.tag('A: the hub has nine rows (IMPORT SAVE, RECORD and TOWER among them), eight shown at a time'), J(h.allRows));
   await dev.shot('hub');
   await dev.hubChoose('quick');
   h = await dev.hubState();
@@ -673,7 +674,7 @@ async function journeyV(dev, page) {
   await dev.hubChoose('sound');
   await waitFor(page, `(() => { const d = document.getElementById('soundDialog'); return !!d && !d.hidden; })()`, 10000);
   ok(await panelUp(), dev.tag('V: the SOUND row opens the SOUND panel (a modal dialog) with this device'));
-  ok((await page.eval(`${HUB}.view().menu.rows[6].label`)) === 'SOUND: ON', dev.tag('V: the SOUND row still reads ON'));
+  ok((await page.eval(`${HUB}.view().menu.rows.find((r) => r.id === 'sound').label`)) === 'SOUND: ON', dev.tag('V: the SOUND row still reads ON'));
   await dev.shot('sound_open');
   // the Music slider
   const sel = '[data-snd="slider-music"]';

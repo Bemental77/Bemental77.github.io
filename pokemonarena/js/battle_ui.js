@@ -1048,7 +1048,7 @@ export function createBattleUi(rom) {
   const frame = new Frame();
   return {
     rom, assets: ui, LAYOUT, TEXT, R, GEOM, COL, overlayRects, rowRects, resultRects, recapRects, drawWindow, drawIcon, panel, hitTest, actionCells, moveCells, moveInfoRect,
-    env, sprite, healthboxArt, healthboxText, moveNameSlot, tagRects, partyArt, panelRGBA, measure: (font, s) => widthOf(font, s), safeText, fitFont, hpBarInit, hpBarStep,
+    env, sprite, healthboxArt, healthboxText, moveNameSlot, tagRects, partyArt, panelRGBA, ballRGBA, measure: (font, s) => widthOf(font, s), safeText, fitFont, hpBarInit, hpBarStep,
     // view -> { width, height, rgba } (a NEW buffer every call: callers may keep it)
     render(view) {
       const f = new Frame();

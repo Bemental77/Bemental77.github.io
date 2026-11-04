@@ -14,6 +14,7 @@
 
 import { GEOM, SCREEN_W, SCREEN_H, menuPitch } from './hub_model.js';
 import { createPageDrawer } from './page_draw.js';
+import { createTowerScreen } from './tower_screen.js';
 
 class Frame {
   constructor() { this.width = SCREEN_W; this.height = SCREEN_H; this.rgba = new Uint8Array(SCREEN_W * SCREEN_H * 4); }
@@ -92,6 +93,9 @@ export function createHubScreen(ui) {
       }
       if (on) text(f, 'normal', '{CURSOR}', g.x + 2, y + 1, TEXT.dark);
     });
+    // a menu longer than the room scrolls (the main menu): an arrow shows where there is more
+    if (menu.up) text(f, 'normal', '{UP}', g.x + g.w - 9, g.y + 1, TEXT.dark);
+    if (menu.down) text(f, 'normal', '{DOWN}', g.x + g.w - 9, g.y + (n - 1) * pitch + 1, TEXT.dark);
   }
 
   function drawMessage(f, lines) {
@@ -136,13 +140,19 @@ export function createHubScreen(ui) {
     if (!a.last) text(f, 'normal', '{DOWN}', g.x + g.w - 12, g.y + g.h - 15);
   }
 
+  // THE TOWER's screens (tower_screen.js) are drawn with the same pieces: they borrow this module's text, message box and menu
+  const tower = createTowerScreen(ui, { text, textRight, textCentre, width, drawMenu, drawMessage, fitFont: (s, px, fonts) => ui.fitFont(s, px, fonts) });
+
   return {
-    GEOM,
+    GEOM, tower,
     render(view) {
       const f = new Frame();
       f.rgba.set(ui.env(Math.max(0, Math.min(22, view.env | 0))).rgba);
-      if (view.screen !== 'record') mascot(f, view.mascot, view.tick | 0);
-      if (view.screen === 'record' && view.record) {
+      const isTower = typeof view.screen === 'string' && view.screen.startsWith('tower');
+      if (view.screen !== 'record' && !isTower) mascot(f, view.mascot, view.tick | 0);
+      if (isTower && view.tower) {
+        tower.render(f, view);
+      } else if (view.screen === 'record' && view.record) {
         drawRecord(f, view.record, view.tick);
       } else if (view.screen === 'about' && view.about) {
         drawMessage(f, ['Page ' + (view.about.page + 1) + ' of ' + view.about.pages + '.', view.about.last ? 'A or B goes back.' : 'A turns the page. B goes back.']);

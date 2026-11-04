@@ -15,7 +15,7 @@
 // because the ROM struct order (hp, atk, def, spe, spa, spd) differs from the order every UI shows (hp, atk, def,
 // spa, spd, spe); a fixed-order array exists only inside the binary team code (teamcode.js), where the order is pinned.
 //
-// SCHEMA VERSIONS. CURRENT = 4.
+// SCHEMA VERSIONS. CURRENT = 5.
 //   v1  the draft layout written down by the planning stage (docs/gba-link-and-arena-plan.md, research finding F5):
 //       app 'arena', romHash, settings.defaultFormat, teams[].formatId, stats.byFormat, box[].ability = {slot},
 //       box[].training = {sp}, box[].provenance.saveSha, a history[] list. No UI code was released against it; it is
@@ -28,6 +28,10 @@
 //       entry may be an online match (cpu 'online' plus `opp`, the opponent's name). Nothing else changes. The migration adds byCpu.online = zeros and keeps every other value; a v3
 //       document that already had a byCpu.online which is not a {w, l, dr, f} record keeps it in the unknown bag first. A build that only knows v3 opens a v4 document read-only.
 //       NOTE for whoever deploys this: a stored v3 profile is upgraded the first time this build loads it (store.loadProfile writes a changed document back, the v3 one going to history).
+//   v5  the Pokemon Tower: a top-level `tower` section (tower_record.js has its layout: best floor per format, runs, wins, buffs seen, achievements earned, the run under way, a summary of the last run). It is the
+//       Tower's own record and NOTHING ELSE: a Tower battle is never written into `stats` (totals, byCpu, online, recent are the regular career's), and recording a match or resetting the record never touches `tower`.
+//       The migration adds `tower` = an empty record and keeps every other value; a v4 document that already had a key of that name (it was not valid v4) keeps it in the unknown bag first. A build that only
+//       knows v4 opens a v5 document read-only. NOTE for whoever deploys this: a stored v4 profile is upgraded the first time this build loads it (the v4 one going to history), as the v3 ones were.
 // MIGRATIONS are pure functions of their input (they clone first and never throw on JSON input), run in order until
 // schemaVersion == CURRENT, and the whole chain is idempotent (a current document is returned unchanged). Fields the
 // next version does not model are NOT dropped: they are moved into the unknown-field bag `_unknown`.
@@ -51,13 +55,14 @@ import { resolveRuleset, validateMon, validateTeam, DEFAULT_RULESET_ID } from '.
 import { defaultCodec } from './charset.js';
 import { PINNED, sha256Hex } from './rom.js';
 import { emptyCareer, CAREER_KEYS, checkCareer, normalizeCareer, foldMatch, matchIssue, battleCount } from './career_stats.js';
+import { emptyTower, checkTowerShape, normalizeTower } from './tower_record.js';
 
 // ---------------------------------------------------------------------------------------------
 // constants
 // ---------------------------------------------------------------------------------------------
 
 export const APP_ID = 'pokemonarena';
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 export const EXPORT_FORMAT = 'pokemonarena-profile';
 export const EXPORT_VERSION = 1;
 export const EXPORT_MAX_BYTES = 8 * 1024 * 1024;
@@ -93,6 +98,7 @@ export const PROFILE_CODES = Object.freeze({
   'profile.box': 'box is not an array, or has too many entries',
   'profile.stats': 'stats is not an object, or a counter is not a non-negative integer',
   'profile.identity': 'identity is not {publicKeyJwk, previousKeys}, or a JWK is not a public P-256 key',
+  'profile.tower': 'tower is not a well-formed Tower record (tower_record.js)',
   'profile.unknown-bag': '_unknown is present and is not an object',
   'team.shape': 'a team is not an object',
   'team.id': 'team id is not a valid identifier',
@@ -291,7 +297,7 @@ export function createProfile(init = {}, deps) {
     trainerName: init.trainerName === undefined ? 'TRAINER' : init.trainerName,
     avatar: init.avatar || { kind: 'preset', id: 0 },
     settings: { ...defaultSettings(), ...(init.settings || {}) },
-    teams: [], box: [], stats: emptyStats(), identity: emptyIdentity(),
+    teams: [], box: [], stats: emptyStats(), identity: emptyIdentity(), tower: emptyTower(),
   };
   const bad = checkProfile(p);
   if (bad.length) throw new ProfileError('profile.invalid', 'createProfile: ' + bad.map((x) => x.code + ' ' + x.path).join(', '), bad);
@@ -428,7 +434,7 @@ export function isPublicJwk(j) {
   return j.kty === 'EC' && j.crv === 'P-256' && /^[A-Za-z0-9_-]{43}$/.test(j.x) && /^[A-Za-z0-9_-]{43}$/.test(j.y);
 }
 
-const PROFILE_KEYS = ['app', 'schemaVersion', 'id', 'rev', 'createdAt', 'updatedAt', 'romSha256', 'trainerName', 'avatar', 'settings', 'teams', 'box', 'stats', 'identity'];
+const PROFILE_KEYS = ['app', 'schemaVersion', 'id', 'rev', 'createdAt', 'updatedAt', 'romSha256', 'trainerName', 'avatar', 'settings', 'teams', 'box', 'stats', 'identity', 'tower'];
 const SETTINGS_KEYS = ['defaultRuleset', 'animations', 'textSpeed', 'sound', 'reducedMotion', 'trainingMode', 'backupNudgeDays'];
 const STATS_KEYS = ['wins', 'losses', 'draws', 'forfeits', 'streak', 'best', 'lastMatchAt', 'byRuleset', ...CAREER_KEYS];
 const COUNTERS = ['wins', 'losses', 'draws', 'forfeits', 'streak', 'best'];
@@ -484,6 +490,7 @@ export function checkProfile(p) {
   checkSettings(p.settings, add);
   checkStats(p.stats, add);
   checkIdentity(p.identity, add);
+  for (const why of checkTowerShape(p.tower).slice(0, 3)) add('profile.tower', 'tower', 'tower: ' + why);
   if (containsPrivateJwk(p)) add('profile.private-key', 'identity', 'private key material is present');
   if (!Array.isArray(p.box) || p.box.length > PROFILE_LIMITS.boxMax) add('profile.box', 'box', `box must be an array of at most ${PROFILE_LIMITS.boxMax} records`);
   const ids = new Set();
@@ -595,8 +602,20 @@ function migrate3to4(d) {
   return o;
 }
 
+/** v4 -> v5: the Tower's record appears, empty. Every v4 key keeps its value. A `tower` that is already a well-formed Tower record stays (the chain passes through here with the one a second run just wrote, and a
+ *  second run must change nothing); anything else under that name is kept in the unknown bag. */
+function migrate4to5(d) {
+  const o = clone(d);
+  if (!isObj(o)) return o;
+  o.schemaVersion = 5;
+  if (hasOwn.call(o, 'tower')) {
+    if (checkTowerShape(o.tower).length) { bagSet(o, 'v4Tower', o.tower); o.tower = emptyTower(); }
+  } else o.tower = emptyTower();
+  return o;
+}
+
 /** version -> function taking a document of that version and returning one of the NEXT version. Pure; never throws. */
-export const MIGRATIONS = Object.freeze({ 1: migrate1to2, 2: migrate2to3, 3: migrate3to4 });
+export const MIGRATIONS = Object.freeze({ 1: migrate1to2, 2: migrate2to3, 3: migrate3to4, 4: migrate4to5 });
 
 /**
  * Bring a stored / imported document to CURRENT.
@@ -703,6 +722,12 @@ export function normalizeProfile(input, opts = {}) {
     if (Object.keys(car.rejected).length) bag = mergeBag(bag, { careerRejected: car.rejected });
     if (bag) s._unknown = bag;
     out.stats = s;
+  }
+
+  // tower (v5): repaired field by field; what cannot be kept goes to the record's own unknown bag, never lost silently
+  { const tw = normalizeTower(input.tower, P, true);
+    out.tower = tw.value;
+    if (Object.keys(tw.rejected).length) out.tower._unknown = mergeBag(isObj(out.tower._unknown) ? out.tower._unknown : null, { towerRejected: tw.rejected });
   }
 
   // identity
@@ -1126,7 +1151,7 @@ export function planImport(existing, incoming, mode, deps) {
   if (!IMPORT_MODES.includes(mode)) return { ok: false, code: 'plan.mode', message: 'mode must be new, merge or replace' };
   if (!isObj(incoming) || checkProfile(incoming).length) return { ok: false, code: 'plan.incoming', message: 'the incoming profile is not well formed' };
   const now = d.now();
-  const report = { mode, addedMons: 0, skippedMons: [], remappedMons: 0, addedTeams: 0, skippedTeams: [], boxSize: 0, identity: 'incoming-copy', record: 'copied', recordBattles: battleCount(incoming.stats) };
+  const report = { mode, addedMons: 0, skippedMons: [], remappedMons: 0, addedTeams: 0, skippedTeams: [], boxSize: 0, identity: 'incoming-copy', record: 'copied', recordBattles: battleCount(incoming.stats), tower: 'copied', towerRuns: incoming.tower ? incoming.tower.runs : 0 };
   if (mode === 'new') {
     const p = clone(incoming);
     p.id = newId('p', d);
@@ -1147,6 +1172,7 @@ export function planImport(existing, incoming, mode, deps) {
     p.updatedAt = now;
     if (existing.identity.publicKeyJwk) { p.identity = clone(existing.identity); report.identity = 'kept-local'; } else report.identity = 'adopted-incoming';
     report.record = 'replaced';
+    report.tower = 'replaced';
     report.addedMons = p.box.length;
     report.addedTeams = p.teams.length;
     report.boxSize = p.box.length;
@@ -1186,6 +1212,7 @@ export function planImport(existing, incoming, mode, deps) {
   report.boxSize = p.box.length;
   report.identity = 'kept-local';
   report.record = 'kept-local';                   // a merge never touches the battle record: the file's record is NOT added (merging the same file twice must not count its battles twice)
+  report.tower = 'kept-local';                    // ... nor the Tower's record (its counters would count twice the same way); the profile's own Tower climb is exactly as it was
   return { ok: true, profile: p, report };
 }
 
@@ -1211,12 +1238,12 @@ export function recordMatch(profile, match) {
 }
 
 /**
- * `mine` with the battle record of `stored` (a profile as the store holds it NOW). The Team Builder never edits `stats`, so when its save deliberately overrides the store's
+ * `mine` with the battle record AND the Tower record of `stored` (a profile as the store holds it NOW). The Team Builder never edits `stats` or `tower`, so when its save deliberately overrides the store's
  * compare-and-swap ("Keep my edits here" after another tab saved first) it must carry the record that is stored now: another tab may have written a battle (online or against the CPU)
  * in the meantime, and the copy this tab loaded long ago would erase it. Pure: neither argument is modified; the record is copied, never shared.
  */
 export function withStoredRecord(mine, stored) {
-  return { ...mine, stats: clone(stored.stats) };
+  return { ...mine, stats: clone(stored.stats), tower: stored.tower === undefined ? clone(mine.tower) : clone(stored.tower) };
 }
 
 /** A copy of the profile with its battle record emptied (RESET RECORD). Everything else is untouched. */

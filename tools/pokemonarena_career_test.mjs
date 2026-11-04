@@ -48,7 +48,7 @@ const head = (s) => console.log('\n== ' + s);
 const NOW = 1700000999999;
 function mulberry32(seed) { let a = seed >>> 0; return () => { a = (a + 0x6d2b79f5) >>> 0; let x = a; x = Math.imul(x ^ (x >>> 15), x | 1); x ^= x + Math.imul(x ^ (x >>> 7), x | 61); return ((x ^ (x >>> 14)) >>> 0) / 4294967296; }; }
 function detDeps(seed = 1, t0 = NOW) { const r = mulberry32(seed); let tm = t0; return { now: () => tm, randomBytes: (n) => Uint8Array.from({ length: n }, () => Math.floor(r() * 256)), advance: (d) => { tm += d; } }; }
-const FIX = { v2: readFx('profile-v2-current.json'), v2exp: readFx('profile-v2-current.expected-v4.json'), v3: readFx('profile-v3-current.json'), cur: readFx('profile-v4-current.json'), fut: readFx('profile-v5-future.json'), v1full: readFx('profile-v1-full.json'), v1fullExp: readFx('profile-v1-full.expected-v4.json') };
+const FIX = { v2: readFx('profile-v2-current.json'), v2exp: readFx('profile-v2-current.expected-v5.json'), v3: readFx('profile-v3-current.json'), cur: readFx('profile-v5-current.json'), fut: readFx('profile-v6-future.json'), v1full: readFx('profile-v1-full.json'), v1fullExp: readFx('profile-v1-full.expected-v5.json') };
 
 const mkMatch = (o = {}) => ({
   id: 'm1', at: 1000, fmt: '3v3', cpu: 'normal', ruleset: 'arena-gen3-standard', result: 'w', turns: 10, playMs: 60000, mvp: 25, team: [25, 6, 9], species: [25, 6], moves: [[85, 3], [33, 2]],
@@ -334,7 +334,7 @@ async function suite(M) {
   });
 
   await blk('schema', async () => {
-    add('schema/current-version-is-4', P.SCHEMA_VERSION === 4 ? true : String(P.SCHEMA_VERSION));        // 4 since a battle against a person has its own row
+    add('schema/current-version-is-5', P.SCHEMA_VERSION === 5 ? true : String(P.SCHEMA_VERSION));        // 4 since a battle against a person has its own row; 5 since the Tower has its record
     add('schema/a-fresh-profile-has-an-empty-well-formed-record', (() => { const p = base(); return P.checkProfile(p).length === 0 && C.battleCount(p.stats) === 0 && J(Object.keys(p.stats).sort()) === J(['bests', 'best', 'byCpu', 'byFormat', 'byRuleset', 'draws', 'fav', 'firstMatchAt', 'forfeits', 'lastMatchAt', 'losses', 'playMs', 'recent', 'streak', 'totals', 'wins'].sort()) ? true : J(Object.keys(p.stats)); })());
     add('schema/the-current-fixture-is-valid-and-a-fixed-point', (() => { const o = P.openProfileDocument(clone(FIX.cur), { deps: detDeps() }); return o.ok && !o.changed && o.problems.length === 0 && J(o.profile) === J(FIX.cur) ? true : J(o.problems.slice(0, 3)); })());
     // migration
@@ -348,7 +348,7 @@ async function suite(M) {
       return o.ok && o.profile.stats._unknown && J(o.profile.stats._unknown.totals) === J({ surprise: 1 }) && o.profile.stats._unknown.recent === 'old note' && P.checkProfile(o.profile).length === 0 && o.profile.stats.totals.kos === 0 ? true : J(o).slice(0, 300);
     })());
     add('migrate/idempotent-and-a-fixed-point-after-one-pass', (() => { const a = P.openProfileDocument(clone(FIX.v2), { deps: detDeps() }); const b = P.openProfileDocument(clone(a.profile), { deps: detDeps() }); return b.ok && !b.changed && b.problems.length === 0 && J(b.profile) === J(a.profile) ? true : 'second pass changed'; })());
-    add('migrate/a-v5-document-is-read-only-and-untouched', (() => { const o = P.openProfileDocument(clone(FIX.fut), { deps: detDeps() }); return o.ok && o.readOnly === true && o.changed === false && J(o.profile) === J(FIX.fut) ? true : J(o).slice(0, 200); })());
+    add('migrate/a-v6-document-is-read-only-and-untouched', (() => { const o = P.openProfileDocument(clone(FIX.fut), { deps: detDeps() }); return o.ok && o.readOnly === true && o.changed === false && J(o.profile) === J(FIX.fut) ? true : J(o).slice(0, 200); })());
     // hostile stats, key by key: each case is applied to a valid v3 document; the result must open, be valid, repair or set aside only that key, and be a fixed point
     const cases = [
       ['firstMatchAt-text', (s) => { s.firstMatchAt = 'soon'; }], ['firstMatchAt-negative', (s) => { s.firstMatchAt = -1; }], ['playMs-float', (s) => { s.playMs = 1.5; }], ['playMs-missing', (s) => { delete s.playMs; }],
@@ -452,7 +452,7 @@ async function suite(M) {
       const rom = await import(pathToFileURL(path.join(JS, 'rom.js')).href);
       env.checksum = 'sha256:' + rom.sha256Hex(new TextEncoder().encode(canon(env.profile)));
       const r = await P.parseExport(JSON.stringify(env), {});
-      return r.ok && r.migratedFrom === 2 && r.profile.schemaVersion === 4 && r.profile.stats.wins === 3 && r.profile.stats.totals.kos === 0 ? true : J(r).slice(0, 300);
+      return r.ok && r.migratedFrom === 2 && r.profile.schemaVersion === 5 && r.profile.stats.wins === 3 && r.profile.stats.totals.kos === 0 ? true : J(r).slice(0, 300);
     })());
   });
 
@@ -544,7 +544,7 @@ async function suite(M) {
       await put(adapter, v2doc);
       const r = await store.recordMatch('p_old', mkMatch({ id: 'old1', at: 1800000000000 }));
       const hist = await store.listHistory('p_old');
-      add('store/an-old-v2-document-is-migrated-first-then-the-match-is-recorded', r.ok && r.saved.schemaVersion === 4 && r.saved.stats.wins === 4 && r.saved.stats.forfeits === 1 && r.saved.stats.totals.kos === 2 && hist.some((x) => x.reason === 'migration') ? true : J(r).slice(0, 300));
+      add('store/an-old-v2-document-is-migrated-first-then-the-match-is-recorded', r.ok && r.saved.schemaVersion === 5 && r.saved.stats.wins === 4 && r.saved.stats.forfeits === 1 && r.saved.stats.totals.kos === 2 && hist.some((x) => x.reason === 'migration') ? true : J(r).slice(0, 300));
       const gone = await open('gone');
       add('store/a-closed-store-says-so', await (async () => { await gone.store.close(); try { await gone.store.recordMatch('p', mkMatch()); return 'recorded'; } catch (e) { return e.code === 'store.closed' ? true : e.code; } })());
     });
@@ -568,10 +568,10 @@ async function suite(M) {
       await put(adapter, v3doc);
       const up = await store.loadProfile('p_v3');
       const hist = (await adapter.transact(['profileHistory'], 'readonly', (tx) => tx.list('profileHistory'))).filter((h) => h.id === 'p_v3');       // the stored entries (the list API returns summaries)
-      add('store/a-stored-v3-document-is-upgraded-to-v4-with-the-v3-kept-in-history', up.ok && up.migratedFrom === 3 && up.profile.schemaVersion === 4 && up.profile.rev === 7 && J(up.profile.stats.byCpu.online) === J({ w: 0, l: 0, dr: 0, f: 0 })
+      add('store/a-stored-v3-document-is-upgraded-to-v4-with-the-v3-kept-in-history', up.ok && up.migratedFrom === 3 && up.profile.schemaVersion === 5 && up.profile.rev === 7 && J(up.profile.stats.byCpu.online) === J({ w: 0, l: 0, dr: 0, f: 0 })
         && up.profile.stats.wins === v3doc.stats.wins && J(up.profile.stats.recent) === J(v3doc.stats.recent) && hist.length === 1 && hist[0].reason === 'migration' && hist[0].doc.schemaVersion === 3 && J(hist[0].doc) === J(v3doc) ? true : J([up.ok, up.migratedFrom, up.profile && up.profile.rev, hist.map((h) => h.reason)]));
       const r3 = await store.recordMatch('p_v3', om({ id: 'seed2_3v3_AQ111_1' }));
-      add('store/an-online-match-is-recorded-on-a-profile-that-was-just-upgraded', r3.ok && r3.saved.schemaVersion === 4 && r3.saved.stats.wins === v3doc.stats.wins + 1 && r3.saved.stats.byCpu.online.w === 1 ? true : J(r3).slice(0, 300));
+      add('store/an-online-match-is-recorded-on-a-profile-that-was-just-upgraded', r3.ok && r3.saved.schemaVersion === 5 && r3.saved.stats.wins === v3doc.stats.wins + 1 && r3.saved.stats.byCpu.online.w === 1 ? true : J(r3).slice(0, 300));
     });
     // A PROFILE THAT CANNOT BE UPGRADED IS STILL READABLE. Schema 4 makes the write-back of every stored v3 profile mandatory on its first load; if that write fails (a full origin, an aborted
     // transaction) loadProfile used to THROW, so the hub (hub_data catches and `continue`s) dropped the profile with its teams and Record, and a battle page found "no profile".
@@ -599,7 +599,7 @@ async function suite(M) {
       await put(inner, v3('p_full'));
       failing = 'quota';
       const a = await ld('p_full');
-      add('store/a-failed-write-back-of-the-upgrade-still-returns-the-profile-migrated-in-memory (not a throw)', a.ok === true && a.unsaved === true && a.readOnly === false && a.migratedFrom === 3 && a.profile.schemaVersion === 4 && a.profile.rev === 6
+      add('store/a-failed-write-back-of-the-upgrade-still-returns-the-profile-migrated-in-memory (not a throw)', a.ok === true && a.unsaved === true && a.readOnly === false && a.migratedFrom === 3 && a.profile.schemaVersion === 5 && a.profile.rev === 6
         && J(a.profile.stats.byCpu.online) === J({ w: 0, l: 0, dr: 0, f: 0 }) && a.profile.stats.wins === v3('x').stats.wins && J(a.profile.stats.recent) === J(v3('x').stats.recent) && a.writeError && /QuotaExceeded/.test(a.writeError.message) ? true : J(a).slice(0, 300));
       add('store/...and-the-stored-document-is-untouched-no-history-and-the-store-says-it-is-not-saving', J(await raw('p_full')) === J(v3('p_full')) && (await hist('p_full')).length === 0 && store.status.notSaved === true && /write-failed/.test(store.status.reason) ? true : J([store.status.notSaved, store.status.reason]));
       add('store/...and-the-profile-is-listed-as-readable (the hub keeps it)', await (async () => { const l = (await store.listProfiles()).find((p) => p.id === 'p_full'); return l && !l.corrupt && !l.readOnly && l.schemaVersion === 3 && l.rev === 6 ? true : J(l); })());
@@ -607,7 +607,7 @@ async function suite(M) {
         failing = null;
         const saved = await store.saveProfile({ ...clone(a.profile), trainerName: 'FROMMEM' }, { reason: 'edit' });
         const w = await raw('p_full');
-        return saved.rev === 7 && w.schemaVersion === 4 && w.trainerName === 'FROMMEM' && w.stats.wins === v3('x').stats.wins ? true : J([saved.rev, w.schemaVersion]);
+        return saved.rev === 7 && w.schemaVersion === 5 && w.trainerName === 'FROMMEM' && w.stats.wins === v3('x').stats.wins ? true : J([saved.rev, w.schemaVersion]);
       })());
       // retried later: the next load, with writes working again, does the upgrade (and keeps the v3 document in history, as always)
       await put(inner, v3('p_retry'));
@@ -616,7 +616,7 @@ async function suite(M) {
       failing = null;
       const second = await ld('p_retry');
       const third = await ld('p_retry');
-      add('store/the-next-load-retries-the-write (upgraded, the v3 document in history) and a third load writes nothing more', first.unsaved === true && second.ok && !second.unsaved && second.migratedFrom === 3 && second.profile.rev === 7 && (await raw('p_retry')).schemaVersion === 4
+      add('store/the-next-load-retries-the-write (upgraded, the v3 document in history) and a third load writes nothing more', first.unsaved === true && second.ok && !second.unsaved && second.migratedFrom === 3 && second.profile.rev === 7 && (await raw('p_retry')).schemaVersion === 5
         && (await hist('p_retry')).length === 1 && (await hist('p_retry'))[0].reason === 'migration' && J((await hist('p_retry'))[0].doc) === J(v3('p_retry')) && third.profile.rev === 7 && !third.unsaved && third.migratedFrom === null ? true : J([first.unsaved, second.migratedFrom, second.profile && second.profile.rev, third.profile && third.profile.rev]));
       // recording a battle on a profile that could not be upgraded records nothing and says why; the single write transaction would skip the migration's history entry
       await put(inner, v3('p_rec'));
@@ -729,7 +729,7 @@ const MUTANTS = [
   ['C39 an online battle does not count in the overall wins', 'career_stats.js', "s[key] = sat(s[key], 1);", "if (m.cpu !== 'online') s[key] = sat(s[key], 1);", ['online/an-online-match-counts-everywhere-and-in-its-own-row', 'online/a-streak-and-the-totals-span-cpu-and-online']],
   ['C40 the opponent is not carried from the summary into the match', 'career_stats.js', "...(ctx.cpu === 'online' ? { opp: ctx.opp } : {}), ruleset: ctx.ruleset,", "ruleset: ctx.ruleset,", ['online/a-real-battle-summary-becomes-an-online-match']],
   ['P20 recordMatch refuses an online match', 'profile.js', "const why = matchIssue(match);", "const why = match && match.cpu === 'online' ? 'online' : matchIssue(match);", ['store/an-online-match-is-recorded-and-a-duplicate-writes-nothing']],
-  ['P21 there is no migration from schema 3', 'profile.js', "export const MIGRATIONS = Object.freeze({ 1: migrate1to2, 2: migrate2to3, 3: migrate3to4 });", "export const MIGRATIONS = Object.freeze({ 1: migrate1to2, 2: migrate2to3 });", ['store/a-stored-v3-document-is-upgraded-to-v4-with-the-v3-kept-in-history']],
+  ['P21 there is no migration from schema 3', 'profile.js', "export const MIGRATIONS = Object.freeze({ 1: migrate1to2, 2: migrate2to3, 3: migrate3to4, 4: migrate4to5 });", "export const MIGRATIONS = Object.freeze({ 1: migrate1to2, 2: migrate2to3, 4: migrate4to5 });", ['store/a-stored-v3-document-is-upgraded-to-v4-with-the-v3-kept-in-history']],
   ['C41 a win the opponent conceded can be the fastest win', 'career_stats.js', "if (res === 'w' && !m.conceded && (!s.bests.fastestWin", "if (res === 'w' && (!s.bests.fastestWin", ['conceded/a-walkover-at-0-turns-is-a-win-that-sets-no-best (fastest win, longest battle)', 'conceded/a-win-conceded-at-3-turns-never-replaces-the-fastest-win-9 and calls out nothing']],
   ['C42 a conceded win is called out as the fastest win', 'career_stats.js', "if (res === 'w' && !m.conceded && before.bests.fastestWin", "if (res === 'w' && before.bests.fastestWin", ['conceded/a-win-conceded-at-3-turns-never-replaces-the-fastest-win-9 and calls out nothing']],
   ['C43 a walkover can be the longest battle', 'career_stats.js', "if (!walkover && (!s.bests.longest", "if ((!s.bests.longest", ['conceded/a-walkover-at-0-turns-is-a-win-that-sets-no-best (fastest win, longest battle)', 'conceded/a-walkover-(1 turn)-does-not-lengthen-a-longest-battle-of-0-turns-and-calls-out-only-the-first-win']],
@@ -747,8 +747,8 @@ const MUTANTS = [
   ['S42 a programming error during the write-back is forgiven as a write failure', 'store.js', "if (e instanceof StoreError || e instanceof TypeError || e instanceof RangeError || e instanceof ReferenceError || e instanceof SyntaxError) throw e;", "", ['store/a-programming-error-or-a-store-refusal-during-the-write-back-is-still-thrown (only a plain write failure is forgiven)']],
   ['S43 recording a battle goes on after the profile could not be upgraded', 'store.js', "if (l.unsaved) throw l.writeError;", "", ['store/recording-a-battle-on-a-profile-that-could-not-be-upgraded-writes-nothing-and-reports-the-failure']],
   ['S44 the in-memory copy of an unsaved upgrade is flagged read-only', 'store.js', "quarantined: opened.quarantined, unsaved: true, writeError: e };", "quarantined: opened.quarantined, unsaved: true, writeError: e, readOnly: true };", ['store/a-failed-write-back-of-the-upgrade-still-returns-the-profile-migrated-in-memory (not a throw)']],
-  ['P22 keeping my edits carries over the stale record (the stored one is ignored)', 'profile.js', "  return { ...mine, stats: clone(stored.stats) };", "  return { ...mine };", ['keep-my-edits/with-the-stored-record-carried-over-the-edit-is-saved-and-the-battle-survives', 'keep-my-edits/withStoredRecord-takes-only-the-record-from-the-stored-profile-and-shares-nothing']],
-  ['P23 the carried-over record is shared with the stored profile', 'profile.js', "  return { ...mine, stats: clone(stored.stats) };", "  return { ...mine, stats: stored.stats };", ['keep-my-edits/withStoredRecord-takes-only-the-record-from-the-stored-profile-and-shares-nothing']],
+  ['P22 keeping my edits carries over the stale record (the stored one is ignored)', 'profile.js', "  return { ...mine, stats: clone(stored.stats), tower: stored.tower === undefined ? clone(mine.tower) : clone(stored.tower) };", "  return { ...mine };", ['keep-my-edits/with-the-stored-record-carried-over-the-edit-is-saved-and-the-battle-survives', 'keep-my-edits/withStoredRecord-takes-only-the-record-from-the-stored-profile-and-shares-nothing']],
+  ['P23 the carried-over record is shared with the stored profile', 'profile.js', "  return { ...mine, stats: clone(stored.stats), tower: stored.tower === undefined ? clone(mine.tower) : clone(stored.tower) };", "  return { ...mine, stats: stored.stats, tower: stored.tower };", ['keep-my-edits/withStoredRecord-takes-only-the-record-from-the-stored-profile-and-shares-nothing']],
   ['E01 the Team Builder does not carry the stored record when it keeps its edits', 'editor_app.js', " S = { ...S, profile: withStoredRecord(S.profile, cur.profile) };", "", ['keep-my-edits/the-Team-Builder-calls-it-in-keepMine-after-adopting-the-stored-rev (source check: the page needs a browser)']],
   ['C01 a repeated match id is folded again', 'career_stats.js', "if (s.recent.some((r) => r.id === m.id))", "if (false)", ['fold/the-same-match-id-twice-changes-nothing']],
   ['C02 a loss does not end the streak', 'career_stats.js', "} else s.streak = 0;", "} else { /* streak kept */ }", ['fold/a-loss-resets-the-streak-and-keeps-the-best']],
@@ -768,7 +768,7 @@ const MUTANTS = [
   ['C16 unknown keys of the record are dropped instead of kept', 'career_stats.js', "if (Object.keys(tr).length) { setOwn(rejected, 'totals', tr);", "if (false) { setOwn(rejected, 'totals', tr);", ['repair/unknown-extra-keys-of-the-record-are-kept-in-the-bag-not-lost']],
   ['P01 the migration leaves the new keys out', 'profile.js', "      setOwn(o.stats, k, fresh[k]);", "", ['migrate/v2-to-v4-golden']],
   ['P02 a merge takes the file\'s record', 'profile.js', "  const p = clone(existing);\n  p.updatedAt = now;", "  const p = clone(existing);\n  p.stats = clone(incoming.stats);\n  p.updatedAt = now;", ['import/merge-leaves-the-record-exactly-as-it-is']],
-  ['P03 the current version is still 3', 'profile.js', "export const SCHEMA_VERSION = 4;", "export const SCHEMA_VERSION = 3;", ['schema/current-version-is-4']],
+  ['P03 the current version is still 3', 'profile.js', "export const SCHEMA_VERSION = 5;", "export const SCHEMA_VERSION = 3;", ['schema/current-version-is-5']],
     ['P05 repair puts nothing in the unknown bag', 'profile.js', "    if (Object.keys(car.rejected).length) bag = mergeBag(bag, { careerRejected: car.rejected });", "", ['repair/unknown-extra-keys-of-the-record-are-kept-in-the-bag-not-lost']],
   ['P06 replace keeps the old record', 'profile.js', "    report.record = 'replaced';", "    p.stats = clone(existing.stats);\n    report.record = 'replaced';", ['import/replace-takes-the-files-record']],
   ['S01 a battle makes a history entry', 'store.js', "if (exists && !history && valid) {", "if (false) {", ['store/battles-make-no-history-entries-so-edits-stay-recoverable']],

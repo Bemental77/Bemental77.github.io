@@ -14,9 +14,11 @@ import { createRng } from './ai.js';
 import { randomTeam, FORMATS } from './matchctl.js';
 import { validateTeam } from './rules.js';
 import { CONFIG, TIERS } from './tower_config.js';
+import { emptyTower, TOWER_VERSION, checkTowerShape, RUN_KEYS } from './tower_record.js';
 import { FAMILIES, FAMILY_BY_ID, SYNERGIES, capOf, applyTeam, applyFoe, foeMods, runEffects, synergyState, describeOps, tierOfPower, mulPm } from './tower_buffs.js';
 
 export const RUN_VERSION = 1;
+export { emptyTower, TOWER_VERSION };               // the stored record's layout lives in tower_record.js (light: profile.js imports it); re-exported so the Tower's callers need one import
 const clone = (x) => JSON.parse(JSON.stringify(x));
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const isInt = (v, lo, hi) => Number.isInteger(v) && v >= lo && v <= hi;
@@ -71,7 +73,7 @@ export function floorTrainer(pack, { seed, format, floor }, cfg = CONFIG, mods =
 
 /* ---------------------------------------------------------------------------------------------- the run */
 
-const baseRun = (o) => ({ v: RUN_VERSION, seed: o.seed >>> 0, format: o.format, ruleset: o.ruleset, floor: 1, phase: 'battle', team: o.team, types: o.types, held: [], offer: null, history: [], skips: 0, livesUsed: 0, folded: false });
+const baseRun = (o) => ({ v: RUN_VERSION, seed: o.seed >>> 0, format: o.format, ruleset: o.ruleset, floor: 1, phase: 'battle', team: o.team, types: o.types, held: [], offer: null, history: [], skips: 0, livesUsed: 0, folded: false, fighting: false, earned: [] });
 
 /** Start a run on floor 1. team = { name, recs, meta } is a SNAPSHOT of a legal saved team. Throws RangeError for a team that cannot play the format. */
 export function newRun({ pack, seed, format, team, cfg = CONFIG }) {
@@ -97,7 +99,7 @@ export function battleSetup(pack, run, cfg = CONFIG) {
   const player = applyTeam(pack, run.team.recs, run.held, { cfg, salt });
   const foeRecs = applyFoe(pack, trainer.recs, run.held, { cfg, salt });
   return {
-    floor: run.floor, boss: trainer.boss, ruleset: cfg.ruleset, format: run.format, pick: FORMATS[run.format].pick, validate: false, seed: mix(run.seed, run.floor, 0xb477),
+    floor: run.floor, boss: trainer.boss, ruleset: cfg.ruleset, format: run.format, pick: FORMATS[run.format].pick, validate: false, seed: run.livesUsed ? mix(run.seed, run.floor, 0xb477, run.livesUsed) : mix(run.seed, run.floor, 0xb477),
     names: [run.team.name, trainer.name], cpu: trainer.cpu,
     player: { recs: player, meta: clone(run.team.meta) }, foe: { recs: foeRecs, meta: trainer.meta },
     trainer: { name: trainer.name, boss: trainer.boss, spec: trainer.spec }, effects: runEffects(run.held, { cfg }),
@@ -203,6 +205,7 @@ export function recordFloorResult(run, resultIn, { pack = null, cfg = CONFIG } =
   if (!RESULTS.includes(res.result) || !isInt(res.turns, 0, 100000) || !isInt(res.faints, 0, 36)) return { run, applied: false, events: [], why: 'bad result' };
   if (run.phase !== 'battle' || res.floor !== run.floor) return { run, applied: false, events: [], why: run.phase !== 'battle' ? 'not in battle' : 'not the current floor' };
   const r = clone(run), boss = isBoss(run.floor, cfg), won = res.result === 'w';
+  r.fighting = false;
   r.history.push({ floor: run.floor, result: won ? 'w' : 'l', turns: res.turns, faints: res.faints, flawless: won && res.faints === 0, boss, comeback: won && res.comeback, sweep: won && res.sweep, closest: res.closest });
   const events = [];
   if (won) {
@@ -235,11 +238,16 @@ export function takeBuff(run, id, { cfg = CONFIG } = {}) {
 }
 
 /** The player leaves the Tower (a closed tab on a fresh visit, the Give Up menu): the run is over. */
-export function abandonRun(run) { if (run.phase === 'over' || run.phase === 'won') return run; const r = clone(run); r.phase = 'over'; r.offer = null; return r; }
+export function abandonRun(run) { if (run.phase === 'over' || run.phase === 'won') return run; const r = clone(run); r.phase = 'over'; r.offer = null; r.fighting = false; return r; }
+
+/** A fight of the current floor has begun (the battle screen is up). Idempotent. A run that is not waiting for a fight changes nothing. -> { run, applied } */
+export function markFighting(run) {
+  if (run.phase !== 'battle' || run.fighting) return { run, applied: false };
+  const r = clone(run); r.fighting = true; return { run: r, applied: true };
+}
 
 /* ---------------------------------------------------------------------------------------------- serialised form (strict) */
 
-const RUN_KEYS = ['v', 'seed', 'format', 'ruleset', 'floor', 'phase', 'team', 'types', 'held', 'offer', 'history', 'skips', 'livesUsed', 'folded'];
 const HIST_KEYS = ['floor', 'result', 'turns', 'faints', 'flawless', 'boss', 'comeback', 'sweep', 'closest', 'life', 'pick'];
 
 function checkRec(r) {
@@ -267,7 +275,9 @@ export function parseRun(input, { pack = null, cfg = CONFIG } = {}) {
   for (const k of RUN_KEYS) if (!(k in r)) return bad('missing field ' + k);
   if (r.v !== RUN_VERSION) return bad('version');
   if (!isInt(r.seed, 0, 0xffffffff) || !cfg.formats.includes(r.format) || r.ruleset !== cfg.ruleset) return bad('seed, format or ruleset');
-  if (!['battle', 'offer', 'over', 'won'].includes(r.phase) || !isInt(r.floor, 1, cfg.floors) || typeof r.folded !== 'boolean') return bad('phase, floor or folded');
+  if (!['battle', 'offer', 'over', 'won'].includes(r.phase) || !isInt(r.floor, 1, cfg.floors) || typeof r.folded !== 'boolean' || typeof r.fighting !== 'boolean') return bad('phase, floor or folded');
+  if (r.fighting && r.phase !== 'battle') return bad('a fight is marked outside the battle phase');
+  if (!Array.isArray(r.earned) || r.earned.length > 200 || !r.earned.every((x) => typeof x === 'string' && /^[a-z0-9][a-z0-9-]{0,39}$/.test(x)) || new Set(r.earned).size !== r.earned.length) return bad('earned');
   if (!isObj(r.team) || typeof r.team.name !== 'string' || r.team.name.length > 24 || !Array.isArray(r.team.recs) || r.team.recs.length < 1 || r.team.recs.length > 6 || !r.team.recs.every(checkRec)) return bad('team');
   if (FORMATS[r.format].pick && r.team.recs.length < FORMATS[r.format].pick) return bad('team too small for the format');
   if (!Array.isArray(r.team.meta) || r.team.meta.length !== r.team.recs.length || !r.team.meta.every((m) => isObj(m) && (m.gender === null || m.gender === 'M' || m.gender === 'F') && typeof m.shiny === 'boolean')) return bad('team meta');
@@ -304,33 +314,28 @@ export function parseRun(input, { pack = null, cfg = CONFIG } = {}) {
 }
 export const serializeRun = (run) => JSON.stringify(run);
 
-/* ---------------------------------------------------------------------------------------------- the Tower's own record (the proposed profile.tower, schema v5) */
+/* ---------------------------------------------------------------------------------------------- the Tower's own record (profile.tower, schema 5) */
+// The record's LAYOUT and its shallow shape check are in tower_record.js (profile.js imports that, not this file). What is here needs the game: the deep check of the run it holds, and folding a finished run in.
 
-export const TOWER_VERSION = 1;
-export const emptyTower = () => ({ v: TOWER_VERSION, best: { '3v3': 0, '6v6': 0 }, winsByFormat: { '3v3': 0, '6v6': 0 }, runs: 0, wins: 0, floors: 0, bosses: 0, buffsSeen: {}, achievements: {}, current: null });
-
-/** Strict shape check of a stored Tower record. -> [] when well formed, else short problems. */
-export function checkTower(t, { cfg = CONFIG } = {}) {
-  const bad = [];
-  if (!isObj(t)) return ['not an object'];
-  const keys = ['v', 'best', 'winsByFormat', 'runs', 'wins', 'floors', 'bosses', 'buffsSeen', 'achievements', 'current'];
-  for (const k of Object.keys(t)) if (!keys.includes(k)) bad.push('unknown field ' + k);
-  for (const k of keys) if (!(k in t)) bad.push('missing ' + k);
+/** Strict check of a stored Tower record: its shape (tower_record.js) AND the run under way, parsed deeply. -> [] when well formed, else short problems. */
+export function checkTower(t, { cfg = CONFIG, pack = null } = {}) {
+  const bad = checkTowerShape(t, cfg);
   if (bad.length) return bad;
-  if (t.v !== TOWER_VERSION) bad.push('version');
-  if (!isObj(t.best) || !cfg.formats.every((f) => isInt(t.best[f], 0, cfg.floors)) || Object.keys(t.best).length !== cfg.formats.length) bad.push('best');
-  if (!isObj(t.winsByFormat) || !cfg.formats.every((f) => isInt(t.winsByFormat[f], 0, 1e9)) || Object.keys(t.winsByFormat).length !== cfg.formats.length) bad.push('winsByFormat');
-  else if (cfg.formats.reduce((n, f) => n + t.winsByFormat[f], 0) !== t.wins) bad.push('wins != winsByFormat');
-  for (const k of ['runs', 'wins', 'floors', 'bosses']) if (!isInt(t[k], 0, 1e9)) bad.push(k);
-  if (t.wins > t.runs) bad.push('wins > runs');
-  if (!isObj(t.buffsSeen) || !Object.keys(t.buffsSeen).every((id) => FAMILY_BY_ID[id] && isInt(t.buffsSeen[id], 1, 1e9))) bad.push('buffsSeen');
-  if (!isObj(t.achievements) || Object.keys(t.achievements).length > 500 || !Object.values(t.achievements).every((at) => isInt(at, 0, 8.64e15))) bad.push('achievements');
-  if (t.current !== null) { const p = parseRun(t.current, { cfg }); if (!p.ok) bad.push('current run: ' + p.why); else if (p.run.folded || p.run.phase === 'over' || p.run.phase === 'won') bad.push('current run is finished'); }
+  for (const id of Object.keys(t.buffsSeen)) if (!FAMILY_BY_ID[id]) bad.push('unknown buff ' + id);          // the record's SHAPE lets a retired family id through (profile.js must never refuse a player's climb for it); the game-level check does not
+  if (t.current !== null) { const p = parseRun(t.current, { pack, cfg }); if (!p.ok) bad.push('current run: ' + p.why); }
   return bad;
 }
 
-/** Fold a FINISHED run into the Tower record, once. -> { tower, run } (run.folded = true). A run that is not over, or was folded already, changes nothing. */
-export function foldRunInto(tower, run, { cfg = CONFIG } = {}) {
+/** The summary of a finished run the result screen shows (tower.last). */
+export function lastOf(run, at) {
+  return { format: run.format, seed: run.seed, won: run.phase === 'won', cleared: run.history.filter((h) => h.result === 'w').length, livesUsed: run.livesUsed, skips: run.skips, held: run.held.map((h) => ({ id: h.id, p: h.p })), earned: run.earned.slice(), at: Number.isInteger(at) && at >= 0 ? at : 0 };
+}
+
+/**
+ * Fold a FINISHED run into the Tower record, once. -> { tower, run } (run.folded = true). A run that is not over, or was folded already, changes nothing.
+ * The record's counters move, "current" is emptied and "last" becomes this run's summary; "at" is the caller's clock (this module has none).
+ */
+export function foldRunInto(tower, run, { cfg = CONFIG, at = 0 } = {}) {
   if ((run.phase !== 'over' && run.phase !== 'won') || run.folded) return { tower, run };
   const t = clone(tower), wins = run.history.filter((h) => h.result === 'w');
   t.runs += 1; if (run.phase === 'won') { t.wins += 1; t.winsByFormat[run.format] += 1; }
@@ -338,5 +343,7 @@ export function foldRunInto(tower, run, { cfg = CONFIG } = {}) {
   t.best[run.format] = Math.max(t.best[run.format], wins.length);
   for (const h of run.history) if (h.pick) t.buffsSeen[h.pick.id] = (t.buffsSeen[h.pick.id] || 0) + 1;
   t.current = null;
-  return { tower: t, run: { ...clone(run), folded: true } };
+  const folded = { ...clone(run), folded: true };
+  t.last = lastOf(folded, at);
+  return { tower: t, run: folded };
 }

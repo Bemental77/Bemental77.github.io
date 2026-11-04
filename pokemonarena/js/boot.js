@@ -21,11 +21,12 @@ import { createControlsDialog } from './controls_dialog.js';
 import { describeRomError, showRomError } from './rom_error.js';
 import { watchHints } from './hints.js';
 import { fitScale, fitPicture, createFullscreen, stackBelow } from './screenfit.js';
+import { launchFloorBattle } from './tower_launch.js';          // the one place the Tower names a page (the fight is still its own page; tomorrow this mounts it here)
 
 export const GBA_FPS = 59.7275;                 // the hardware frame rate; the menu's idle-animation clock, not a speed-up knob
 const STEP_MS = 1000 / GBA_FPS;
 export const SETTINGS_KEY = 'arena.hub';
-export const SCREEN_TITLES = Object.freeze({ main: 'Pokemon Arena', quick: 'Pokemon Arena - Quick Battle', team: 'Pokemon Arena - My Team', record: 'Pokemon Arena - Record', about: 'Pokemon Arena - About' });
+export const SCREEN_TITLES = Object.freeze({ main: 'Pokemon Arena', quick: 'Pokemon Arena - Quick Battle', team: 'Pokemon Arena - My Team', record: 'Pokemon Arena - Record', about: 'Pokemon Arena - About', tower: 'Pokemon Arena - Tower', 'tower-new': 'Pokemon Arena - Tower New Run', 'tower-offer': 'Pokemon Arena - Tower Offer', 'tower-buffs': 'Pokemon Arena - Tower Buffs', 'tower-ach': 'Pokemon Arena - Tower Achievements', 'tower-last': 'Pokemon Arena - Tower Last Run' });
 
 /* ------------------------------------------------------------------------------------------ pure helpers */
 
@@ -209,7 +210,7 @@ async function main() {
       if (eff.type === 'screen') {
         // going into a screen adds a history entry; coming back to the menu steps BACK through that entry (so B and the browser's Back button agree and the history does not grow)
         try {
-          if (eff.path === 'main' && pushed > 0) { pushed--; history.back(); }
+          if ((eff.path === 'main' || eff.back) && pushed > 0) { pushed--; history.back(); }
           else { history.pushState({ arenaHub: eff.path }, '', hashFor(eff.path)); if (eff.path !== 'main') pushed++; }
         } catch (_e) { /* a sandboxed frame */ }
         syncTitle();
@@ -219,6 +220,7 @@ async function main() {
       else if (eff.type === 'controls') openControls();
       else if (eff.type === 'battle') startBattle(eff);
       else if (eff.type === 'record-reset') resetRecord(eff.profileId);
+      else if (eff.type === 'tower-new' || eff.type === 'tower-fight' || eff.type === 'tower-pick' || eff.type === 'tower-giveup') towerEffect(eff);
     }
     dirty = true;
   }
@@ -235,10 +237,63 @@ async function main() {
       await refreshData();
     } catch (e) { model.notify(['The record could not be reset:', String(e && e.message ? e.message : e).slice(0, 40)]); dirty = true; }
   }
+  /* ---- the Tower: tower_hub.js asks (an effect), tower_session.js does it against the profile store, tower_launch.js is the only code that names a page ---- */
+  let towerMod = null, towerLoading = null;
+  function loadTower() {
+    if (!towerLoading) towerLoading = import('./tower_session.js').then((m) => { towerMod = m; hook.towerLoaded = true; return m; }).catch((e) => { console.warn('[tower] not available', e); hook.towerError = String(e && e.message ? e.message : e); return null; });
+    return towerLoading;
+  }
+  const towerNote = (a, b) => { if (model) { model.tower.notify([a, b || '']); dirty = true; } };
+  async function towerEffect(eff) {
+    hook.towerEffects = (hook.towerEffects || []).concat([eff.type]);
+    try {
+      const m = await loadTower();
+      if (!m) { towerNote('The Tower could not load.', 'Reload the page and try again.'); return; }
+      if (!store) { towerNote('Your profile is not available.', 'Try again in a moment.'); return; }
+      if (store.status.notSaved) { towerNote('This browser is not keeping profiles,', 'so a Tower run cannot be saved.'); return; }
+      if (eff.type === 'tower-new') await towerStart(m, eff);
+      else {
+        const session = m.createTowerSession({ pack, persist: m.storePersist(store, eff.profileId) });
+        if (eff.type === 'tower-fight') {
+          const tw = await session.read(), run = tw.current;
+          if (!run || run.phase !== 'battle') { towerNote('There is no fight waiting.', ''); await refreshData(); return; }
+          saveSettings();
+          launchFloorBattle(run, { navigate, profileId: eff.profileId });
+        } else if (eff.type === 'tower-pick') {
+          const r = await session.pick({ seed: eff.seed, id: eff.id });
+          hook.towerLast = r;
+          if (r && r.applied) towerNote(eff.id ? 'You took ' + m.buffName(eff.id) + '!' : 'You took nothing.', 'Floor ' + r.next.floor + ' is next.'); else towerNote('That could not be applied:', String(r && r.why || 'unknown').slice(0, 30));
+          await refreshData();
+        } else if (eff.type === 'tower-giveup') {
+          const r = await session.giveUp(eff.seed === null || eff.seed === undefined ? {} : { seed: eff.seed });
+          hook.towerLast = r;
+          await refreshData();
+        }
+      }
+    } catch (e) { towerNote('The Tower hit a problem:', String(e && e.message ? e.message : e).slice(0, 30)); }
+  }
+  async function towerStart(m, eff) {
+    let pid = eff.profileId;
+    if (!pid) { const created = await store.createProfile({}); pid = created.id; try { await store.setActiveId(pid); } catch (_e) { /* the Tower does not need it */ } }
+    let team = null;
+    if (eff.teamId) {
+      const l = await store.loadProfile(pid);
+      if (!l.ok) { towerNote('That profile could not be read.', ''); return; }
+      try { team = m.teamSnapshot(l.profile, eff.teamId); } catch (_e) { towerNote('That team could not be used.', ''); return; }
+    }
+    const session = m.createTowerSession({ pack, persist: m.storePersist(store, pid) });
+    const r = await session.startRun({ seed: freshSeed(), format: eff.format, team, replace: true });
+    hook.towerLast = r;
+    if (!r || !r.applied) { towerNote('The run could not start:', String(r && r.why || 'unknown').slice(0, 30)); await refreshData(); return; }
+    try { await store.setActiveId(pid); } catch (_e) { /* the battle page falls back to the profile in its address */ }
+    saveSettings();
+    launchFloorBattle(r.run, { navigate, profileId: pid });
+  }
+
   async function refreshData() {
     if (!store || !pack || !model) return;
-    const d = await readHubData(store, pack, { tzMinutes: new Date().getTimezoneOffset() });
-    model.setData(d);
+    const d = await readHubData(store, pack, { tzMinutes: new Date().getTimezoneOffset(), towerSummary: towerMod ? towerMod.summarizeTower : undefined });
+    run(model.setData(d));
     hook.data = d;
     const unsaved = d.notSaved;
     els.note.hidden = !unsaved; els.note.textContent = unsaved ? 'This browser is not keeping profiles (storage is blocked or in private mode), so teams you build here will be lost when you close the page.' : '';
@@ -266,7 +321,8 @@ async function main() {
   // a plain-text mirror of the canvas for screen readers (the canvas itself has only a static label)
   function speak(v) {
     let s;
-    if (v.record) s = 'Record' + (v.record.trainer ? ' of ' + v.record.trainer.name : '') + ', page ' + (v.record.index + 1) + ' of ' + v.record.count + ': ' + v.record.page.title + '. ' + v.record.page.lines.map((l) => l.cells.map((c) => c.t).filter(Boolean).join(' ')).join('. ') + (v.record.confirm ? ' Choose YES or NO.' : '');
+    if (v.tower) s = 'Tower, ' + v.screen.replace(/^tower-?/, '') + '. ' + (v.msg || []).join(' ') + (v.tower.balls ? ' Buffs: ' + v.tower.balls.map((b, i) => (i === v.tower.cursor ? 'selected ' : '') + b.rarity + ' ' + b.name + ': ' + b.effectText).join('; ') + '.' : '') + (v.menu ? ' ' + v.menu.rows.map((r, i) => (i === v.menu.cursor ? 'selected ' : '') + r.label).join(', ') + '.' : '');
+    else if (v.record) s = 'Record' + (v.record.trainer ? ' of ' + v.record.trainer.name : '') + ', page ' + (v.record.index + 1) + ' of ' + v.record.count + ': ' + v.record.page.title + '. ' + v.record.page.lines.map((l) => l.cells.map((c) => c.t).filter(Boolean).join(' ')).join('. ') + (v.record.confirm ? ' Choose YES or NO.' : '');
     else if (v.about) s = 'About, page ' + (v.about.page + 1) + ' of ' + v.about.pages + '. ' + v.about.lines.join(' ');
     else if (v.menu) { const r = v.menu.rows[v.menu.cursor]; s = (v.screen === 'main' ? 'Main menu. ' : v.screen === 'quick' ? 'Quick battle. ' : 'Battle with my team. ') + (r ? r.label + (r.value !== undefined ? ' ' + r.value : '') + '. ' : '') + (v.msg || []).join(' '); }
     else s = '';
@@ -340,6 +396,7 @@ async function main() {
       setMascot: (id) => { model.setMascot(id); dirty = true; draw(true); },
       closeControls, openControls,
       dialogOpen: () => dialogOpen,
+      tower: { loaded: () => !!towerMod, effect: (e) => towerEffect(e), state: () => model.tower.state() },
     });
     Object.defineProperty(hook, 'renders', { get: () => renders, configurable: true });
     hook.sound = { on: () => (soundSys ? soundSys.audible() : cries.isSoundOn()) };
@@ -418,6 +475,7 @@ async function main() {
     focusCanvas();
     runLoop();
     openProfiles();                                  // the team list fills in when the store answers; the menu is usable at once
+    loadTower().then((m) => { if (m) refreshData(); });          // the Tower's code loads behind the menu (the hub itself carries no engine); its rows fill in when it has
     // OPEN TO BATTLES (presence_boot.js): the switch beside Play online, and a "<name> wants to battle you" dialog whatever the player is doing; loaded after the menu is up, so it can never delay or break it
     import('./presence_boot.js').then((m) => {
       hook.presence = m.mountPresence({

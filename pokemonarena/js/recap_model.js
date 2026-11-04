@@ -128,7 +128,7 @@ export function buildRecapPages(summary, ctx = {}) {
   const m7 = { id: 'record', title: TITLES.record, lines: [], icons: [] };
   const st = career ? career.state : 'none';
   const who7 = career && career.profileName ? career.profileName : '';
-  const head7 = st === 'saved' ? 'SAVED TO ' + who7 + '\'S RECORD' : st === 'duplicate' ? 'ALREADY IN ' + who7 + '\'S RECORD' : st === 'pending' ? 'SAVING...' : st === 'error' ? 'COULD NOT SAVE THIS BATTLE' : 'NOT SAVED';
+  const head7 = st === 'tower' ? String(career.head || 'TOWER').slice(0, 30) : st === 'saved' ? 'SAVED TO ' + who7 + '\'S RECORD' : st === 'duplicate' ? 'ALREADY IN ' + who7 + '\'S RECORD' : st === 'pending' ? 'SAVING...' : st === 'error' ? 'COULD NOT SAVE THIS BATTLE' : 'NOT SAVED';
   m7.lines.push(line(1, cell(head7, 2, 214, 'l', 'normal', st === 'saved' || st === 'duplicate' ? 'good' : st === 'error' ? 'bad' : 'dark')));
   if (st === 'saved' || st === 'duplicate') {
     const s = career.stats;

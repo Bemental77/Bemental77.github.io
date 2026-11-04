@@ -1,0 +1,220 @@
+{
+ "profile": {
+  "app": "pokemonarena",
+  "schemaVersion": 5,
+  "id": "p_fixture02",
+  "rev": 2,
+  "createdAt": 1700000000000,
+  "updatedAt": 1700000100000,
+  "romSha256": "8071e2c348d54c3ec7b78b53837c5cbd757d5cfc461a50fa5ffbc9f5ab35060a",
+  "trainerName": "BLUE",
+  "avatar": {
+   "kind": "preset",
+   "id": 0
+  },
+  "settings": {
+   "defaultRuleset": "arena-gen3-standard",
+   "animations": "full",
+   "textSpeed": "mid",
+   "sound": true,
+   "reducedMotion": false,
+   "trainingMode": "gen3",
+   "backupNudgeDays": 14,
+   "_unknown": {
+    "v1DefaultFormat": "nonsense-cup"
+   }
+  },
+  "teams": [
+   {
+    "id": "t_x",
+    "name": "X",
+    "ruleset": "arena-gen3-standard+lv100",
+    "monIds": [
+     "m_ok"
+    ]
+   }
+  ],
+  "box": [
+   {
+    "id": "m_ok",
+    "species": 3,
+    "nickname": "",
+    "level": 100,
+    "nature": 24,
+    "abilitySlot": 0,
+    "heldItem": 0,
+    "moves": [
+     {
+      "id": 7,
+      "ppUps": 2
+     }
+    ],
+    "ev": {
+     "hp": 0,
+     "atk": 0,
+     "def": 0,
+     "spa": 0,
+     "spd": 0,
+     "spe": 0
+    },
+    "iv": {
+     "hp": 0,
+     "atk": 0,
+     "def": 0,
+     "spa": 0,
+     "spd": 0,
+     "spe": 0
+    },
+    "gender": "-",
+    "shiny": false,
+    "friendship": 0,
+    "originalTrainer": {
+     "name": "BLUE",
+     "tid": 1,
+     "sid": 2
+    },
+    "origin": "rental",
+    "provenance": {},
+    "createdAt": 1700000000300,
+    "updatedAt": 1700000000300
+   }
+  ],
+  "stats": {
+   "wins": 1,
+   "losses": 2,
+   "draws": 0,
+   "forfeits": 0,
+   "streak": 0,
+   "best": 1,
+   "lastMatchAt": null,
+   "byRuleset": {},
+   "firstMatchAt": null,
+   "playMs": 0,
+   "byFormat": {
+    "3v3": {
+     "w": 0,
+     "l": 0,
+     "dr": 0,
+     "f": 0
+    },
+    "6v6": {
+     "w": 0,
+     "l": 0,
+     "dr": 0,
+     "f": 0
+    }
+   },
+   "byCpu": {
+    "easy": {
+     "w": 0,
+     "l": 0,
+     "dr": 0,
+     "f": 0
+    },
+    "normal": {
+     "w": 0,
+     "l": 0,
+     "dr": 0,
+     "f": 0
+    },
+    "hard": {
+     "w": 0,
+     "l": 0,
+     "dr": 0,
+     "f": 0
+    },
+    "online": {
+     "w": 0,
+     "l": 0,
+     "dr": 0,
+     "f": 0
+    }
+   },
+   "totals": {
+    "turns": 0,
+    "kos": 0,
+    "faints": 0,
+    "dealt": 0,
+    "taken": 0,
+    "hits": 0,
+    "crits": 0,
+    "superEffective": 0,
+    "resisted": 0,
+    "noEffect": 0,
+    "misses": 0,
+    "statusInflicted": 0,
+    "healed": 0,
+    "switches": 0
+   },
+   "bests": {
+    "hit": null,
+    "fastestWin": null,
+    "longest": null,
+    "koStreak": 0
+   },
+   "fav": {
+    "species": {},
+    "moves": {},
+    "mvps": {}
+   },
+   "recent": []
+  },
+  "identity": {
+   "publicKeyJwk": null,
+   "previousKeys": []
+  },
+  "tower": {
+   "v": 1,
+   "best": {
+    "3v3": 0,
+    "6v6": 0
+   },
+   "winsByFormat": {
+    "3v3": 0,
+    "6v6": 0
+   },
+   "runs": 0,
+   "wins": 0,
+   "floors": 0,
+   "bosses": 0,
+   "buffsSeen": {},
+   "achievements": {},
+   "current": null,
+   "last": null
+  }
+ },
+ "quarantined": [
+  {
+   "kind": "mon",
+   "index": 1,
+   "codes": [
+    "mon.ev",
+    "mon.level",
+    "mon.species"
+   ]
+  },
+  {
+   "kind": "mon",
+   "index": 2,
+   "codes": [
+    "mon.shape"
+   ]
+  },
+  {
+   "kind": "mon",
+   "index": 3,
+   "codes": [
+    "mon.duplicate-id"
+   ]
+  }
+ ],
+ "problemCodes": [
+  "mon.duplicate-id",
+  "mon.ev",
+  "mon.level",
+  "mon.shape",
+  "mon.species",
+  "profile.settings",
+  "team.missing-mon"
+ ]
+}
