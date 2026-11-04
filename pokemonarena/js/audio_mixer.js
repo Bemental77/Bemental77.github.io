@@ -5,11 +5,16 @@
 //   fx      ->  master        cries, the ROM's sound effects (cries.js takes opts.destination; music.js playEffect takes fxDestination)
 //
 // WHAT THIS FILE GUARANTEES (each item is a named check in tools/pokemonarena_sound_test.mjs)
-//   * NO AudioContext exists until the visitor has acted (a click, a tap or a key press). attach() listens for those and only then calls unlock().
-//     A controller button is NOT a browser user activation, so a controller-only visitor never gets sound by pressing buttons: the pages show a
-//     "press any key, or click or tap" prompt for exactly that case (sound_system.js) and say so in the README.
-//   * ONE context per page, ever. It is created the first time the visitor acts, EVEN IF the sound is muted: a muted page that is later unmuted
-//     with a controller still works, because the context was allowed to start while a gesture was available.
+//   * NOTHING IS HEARD BEFORE THE BROWSER ALLOWS IT, AND THE MUSIC STARTS THE MOMENT IT DOES. A bare mixer creates no AudioContext until the visitor has acted (a click, a tap
+//     or a key press: attach() listens for those and only then calls unlock()). A PAGE'S mixer (sound_system.js passes earlyStart) also TRIES AT ONCE, at attach(): it creates the
+//     context and asks it to resume. The browser decides: with the site's autoplay permission, or when the visitor's click on the previous page of this site carried over (Chrome keeps
+//     sticky user activation across a same-origin navigation: measured in tools/pokemonarena_autoplay_test.mjs, MUSIC.md), the context is running at load and the music starts as soon as
+//     its song is ready; otherwise it stays suspended and the listeners armed below start it on the visitor's very FIRST gesture ANYWHERE on the page (key, mouse, pointer, touch),
+//     with no need to press a Sound button. A controller button is NOT a browser user activation (the pages try it anyway; a browser that counts it starts the sound), so a controller-only
+//     visitor sees a "press any key, or click or tap" prompt (sound_system.js) and says so in the README. A browser with no Web Audio at all gets no prompt (a click cannot help).
+//   * ONE context per page, ever. A page's mixer (earlyStart) creates it at load unless the visitor muted the sound or the tab is hidden (a hidden tab tries again the moment it is shown); every
+//     other case creates it the first time the visitor acts, EVEN IF the sound is muted: a muted page that is later unmuted with a controller still works, because the context was allowed to
+//     start while a gesture was available.
 //   * Volume changes are ramps (no clicks): every gain moves with cancelScheduledValues + setValueAtTime + linearRampToValueAtTime over rampMs.
 //     A context double that only has .value (the test doubles older than this file) still works: the value is assigned.
 //   * Mute really silences: master gain ramps to exactly 0, and after the ramp the context is SUSPENDED (no CPU for a muted page). Unmute
@@ -19,11 +24,14 @@
 //   * Settings persist in localStorage['arena.audio'] = JSON {v:1, master, music, fx, muted, soundtrack}. A bad or hostile value is repaired
 //     field by field and never throws. The OLD key 'arena.sound' ('1' on, '0' off) is migrated ONCE (when arena.audio does not exist); the old key
 //     is left untouched for pages cached from before this change.
-//   * DEFAULT POLICY (the user wants music): sound is ON by default: master 0.7, music 0.6, fx 0.8, muted false, soundtrack soulgold.
+//   * DEFAULT POLICY (the user wants music, at half the slider): sound is ON by default: master 0.5, music 0.6, fx 0.8, muted false, soundtrack soulgold. These apply only when NOTHING is
+//     stored: a stored choice (any field of arena.audio) always wins and is never overwritten, so a visitor who muted or set another volume keeps it (they were written as 0.7 / 0.6 / 0.8 by
+//     every earlier build, and still read that way). The settings schema is unchanged (v:1).
 //   * LEVEL. The synthesizer's own output (music.js at gain 1) is calibrated to the real game's output through the mGBA oracle (MUSIC.md: RMS ratio median 1.004), so a bus
-//     gain of 1.0 IS the level the real game plays at. THE DEFAULT SLIDER POSITIONS ARE THE POSITIONS THAT GIVE GAIN 1.0: master 0.7, music 0.6, fx 0.8 (the old law
-//     gave 0.49 x 0.36 = 0.176: 15 dB under the game, which is why the music was nearly inaudible). gainFor(position, bus): below the default a SQUARE law
-//     ((v / default)^2: loudness is judged roughly logarithmically), above it a straight climb to GAIN_MAX (+3 dB) at 1.0, so master and music together can reach +6 dB over
+//     gain of 1.0 IS the level the real game plays at. THE UNITY POSITIONS ARE THE POSITIONS THAT GIVE GAIN 1.0: master 0.7, music 0.6, fx 0.8 (UNITY below; they used to be the defaults. The
+//     law that gave 0.49 x 0.36 = 0.176 before them was 15 dB under the game, which is why the music was nearly inaudible). A NEW visitor now starts Master at 0.5 (a deliberately quieter start:
+//     gain (0.5 / 0.7)^2 = 0.51, about 6 dB under the real game's level) with Music and Effects at their unity positions. gainFor(position, bus): below the unity position a SQUARE law
+//     ((v / unity)^2: loudness is judged roughly logarithmically), above it a straight climb to GAIN_MAX (+3 dB) at 1.0, so master and music together can reach +6 dB over
 //     the game. A SOFT LIMITER (a WaveShaper, identity below 0.8, saturating to 0.95) sits between the master bus and the speakers, so cry + effects + music together never
 //     clip even at the top of the sliders. The state snapshot reports positions and gains.
 //
@@ -35,16 +43,18 @@ export const LEGACY_SOUND_KEY = 'arena.sound';
 export const BUSES = Object.freeze(['master', 'music', 'fx']);
 // keep in step with music_map.js SOUNDTRACKS (tools/pokemonarena_sound_test.mjs compares the two when music_map.js exists)
 export const SOUNDTRACK_IDS = Object.freeze(['soulgold', 'ultraviolet']);
-export const DEFAULTS = Object.freeze({ v: 1, master: 0.7, music: 0.6, fx: 0.8, muted: false, soundtrack: 'soulgold' });
+export const DEFAULTS = Object.freeze({ v: 1, master: 0.5, music: 0.6, fx: 0.8, muted: false, soundtrack: 'soulgold' });      // what a visitor with NOTHING stored starts with
+/** The slider positions whose gain is exactly 1.0 (the real game's level). The gain law is anchored here, NOT on DEFAULTS: moving the starting volume must not move the law. */
+export const UNITY = Object.freeze({ master: 0.7, music: 0.6, fx: 0.8 });
 export const VOLUME_STEP = 5;                 // percent per step of a slider / key press
 export const RAMP_MS = 30;                    // gain ramp length: long enough to be click-free, short enough to feel instant
 export const DUCK_LEVEL = 0.5;                // music level while a menu / pause screen asks for ducking
 
 const clamp01 = (x) => (x < 0 ? 0 : x > 1 ? 1 : x);
 export const GAIN_MAX = Math.pow(10, 3 / 20);   // +3 dB at slider position 1.0 (per bus)
-/** Slider position (0..1) -> linear gain for a bus (master, music or fx; default master): 1.0 at the bus's default position, the square law below it, a straight climb to GAIN_MAX above. */
+/** Slider position (0..1) -> linear gain for a bus (master, music or fx; default master): 1.0 at the bus's unity position (UNITY), the square law below it, a straight climb to GAIN_MAX above. */
 export function gainFor(v, bus = 'master') {
-  const x = clamp01(Number(v) || 0), v0 = bus === 'music' ? DEFAULTS.music : bus === 'fx' ? DEFAULTS.fx : DEFAULTS.master;
+  const x = clamp01(Number(v) || 0), v0 = bus === 'music' ? UNITY.music : bus === 'fx' ? UNITY.fx : UNITY.master;
   if (x <= v0) return (x / v0) * (x / v0);
   return 1 + (GAIN_MAX - 1) * ((x - v0) / (1 - v0));
 }
@@ -128,6 +138,7 @@ export function createMixer(opts = {}) {
   const doc = opts.document !== undefined ? opts.document : (typeof document !== 'undefined' ? document : null);
   const storage = opts.storage !== undefined ? opts.storage : safeStorage();
   const rampMs = Number.isFinite(opts.rampMs) ? opts.rampMs : RAMP_MS;
+  const earlyStart = opts.earlyStart === true;           // try to start the context at attach(), without waiting for a gesture (the browser decides: see the header)
   const setT = opts.setTimeout || ((fn, ms) => setTimeout(fn, ms));
   const clearT = opts.clearTimeout || ((h) => clearTimeout(h));
   const makeContext = opts.createContext || (() => {
@@ -272,7 +283,11 @@ export function createMixer(opts = {}) {
     if (S.hidden === next) return;
     S.hidden = next;
     if (next) { clearSuspendTimer(); safeSuspend(); emit('hidden'); }
-    else { if (S.ctx && wantRunning()) safeResume(); emit('visible'); }
+    else {
+      if (S.ctx && wantRunning()) safeResume();
+      else if (earlyStart && S.detach.length && !S.settings.muted && !S.ctx && !S.ctxError) unlock();       // a page that LOADED hidden (a background tab) had no early try; it gets it now, when it is shown
+      emit('visible');
+    }
   }
 
   /* ---- reading ---- */
@@ -281,7 +296,7 @@ export function createMixer(opts = {}) {
   /** Is it audible right now (a running context, not muted, tab visible)? Everything that would START a sound asks this first. */
   const canPlay = () => running() && !S.settings.muted && !S.hidden && !S.destroyed;
   /** Does the page still need a user activation to make sound (and would sound be wanted)? Drives the "press any key" prompt. */
-  const needsActivation = () => !S.destroyed && !S.settings.muted && !running();
+  const needsActivation = () => !S.destroyed && !S.settings.muted && !running() && !S.ctxError;       // (a browser with no Web Audio, or a graph that cannot be built: no click will fix it, so nothing asks for one)
   function snapshot() {
     const t = targets();
     return {
@@ -306,7 +321,9 @@ export function createMixer(opts = {}) {
     unlock();
   }
   let activationOn = false;
-  const ACT_EVENTS = ['keydown', 'mousedown', 'pointerdown', 'pointerup', 'touchend'];
+  // 'touchstart' is armed too (a first touch ANYWHERE is the visitor's first gesture); the browser only lets the context start from the events above it that count as an activation, and the listeners stay
+  // armed until the context is running, so a touchstart the browser refuses is followed by the touchend / pointerup that it accepts.
+  const ACT_EVENTS = ['keydown', 'mousedown', 'pointerdown', 'pointerup', 'touchstart', 'touchend'];
   function addActivation() {
     if (activationOn || !win || typeof win.addEventListener !== 'function') return;
     activationOn = true;
@@ -337,6 +354,10 @@ export function createMixer(opts = {}) {
       win.addEventListener('storage', onStorageEvent); S.detach.push(() => win.removeEventListener('storage', onStorageEvent));
     }
     onVisibility();
+    // THE EARLY TRY. A muted visitor has nothing to start (their first gesture still creates the context, so a controller can unmute later); a hidden tab waits to be shown.
+    // The context is created and asked to resume NOW; whether it runs is the browser's decision, and either answer is fine: running -> the music starts as soon as its song is ready;
+    // suspended -> it is the very first gesture on the page that resumes it (the listeners above), which is what the visitor sees as "the music starts when I first touch the page".
+    if (earlyStart && !S.settings.muted && !S.hidden && !S.ctx && !S.ctxError) unlock();
     return () => detach();
   }
   function detach() { removeActivation(); for (const f of S.detach.splice(0)) { try { f(); } catch (_e) { /* ignore */ } } }

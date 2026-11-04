@@ -41,7 +41,18 @@ function project(r, dir) {
 // Standard spatial-navigation choice. `cands` = [{ rect:{left,top,right,bottom}, ... }] in DOM order (the current element is NOT among them).
 //   strictly ahead (no overlap along the travel axis):  score = gap + 2 * (cross-axis gap) + 0.5 * (how far the candidate's CENTRE lies outside
 //                                                       the current element's cross-axis span, 0 when it lies inside) + 0.05 * (centre offset)
-//   merely further along (overlapping, centre beyond):  same terms, plus 1000 so any strictly-ahead candidate always wins
+//   merely further along (overlapping, centre beyond):  same terms, plus 1000, so it loses to any strictly-ahead candidate that is not more than about 500 px off the move's axis (the strict score is gap + 2 * ogap, and that cross-axis term is NOT capped). It is taken ONLY when it ALSO shares some of the cross-axis span with the
+//                                                       current element (ogap === 0: an exact comparison, a neighbour that touches the span counts and one 0.3 px clear of it does not), i.e. when the two RECTANGLES overlap on both axes (neither contains the other: the caller filters containers out):
+//                                                       a control that straddles the edge of a bigger one. A candidate BESIDE the current element (its cross-axis span disjoint from it) is NOT
+//                                                       "ahead" however far its centre lies along the move: Down / Up never step sideways into a taller (or shorter) neighbour, and Left / Right
+//                                                       never step to a control stacked above or below whose centre merely lies further left / right. That rule is wider than the bug that
+//                                                       introduced it (Left from a wide control picked whatever control of the page sat nearest ABOVE it, which on a page with a sticky header is a header
+//                                                       button whose distance changes with the scroll position: a razor-thin tie, adding the audio bar to the editor's header flipped it and Left from the stats
+//                                                       presets jumped into the header, so the Speed slider could not be reached), and it is kept on purpose: measured over every screen and dialog of the editor
+//                                                       (phone and desktop), the hub's and the battle page's Controls / Sound dialogs and the audio bar's song list, NO Up / Down move changed and every changed Left / Right
+//                                                       move was a jump to a control in another row (a header button, a dialog's Close, the next row's far end) that DOM order now replaces with the neighbour
+//                                                       (every control stays reachable on all of them). Nothing in line with the move -> null -> move() falls back to DOM order. A candidate STRICTLY
+//                                                       ahead is unaffected: it is chosen even from another row or column (the cross-axis offset only costs 2 * ogap in its score). tools/pokemonarena_input_test.mjs pins both sides.
 // The centre term is deliberately NOT a plain centre-to-centre distance: that made a narrow control directly beneath a wide one (a checkbox under a
 // full-width number field, 23 px away) lose to a full-width button two rows down, because its centre is far from the wide field's centre. Measured on
 // dev/input_lab.html: Down from #num skipped #chk (old score 129 vs 68). Now anything under the current element counts as aligned and the small
@@ -62,7 +73,7 @@ export function chooseNext(cur, cands, dir) {
     const ocOut = aligned ? 0 : Math.max(0, a.os - b.oc, b.oc - a.oe);
     let score, via;
     if (gap >= -ALIGN_TOL) { score = Math.max(0, gap) + 2 * ogap + 0.5 * ocOut + 0.05 * oc; via = 'strict'; }
-    else if (b.ac > a.ac + ALIGN_TOL) { score = 1000 + (b.ac - a.ac) + 2 * ogap + 0.5 * ocOut + 0.05 * oc; via = 'loose'; }
+    else if (b.ac > a.ac + ALIGN_TOL && ogap === 0) { score = 1000 + (b.ac - a.ac) + 2 * ogap + 0.5 * ocOut + 0.05 * oc; via = 'loose'; }
     else continue;
     if (score < bestScore) { bestScore = score; best = { cand: cands[i], via }; }
   }

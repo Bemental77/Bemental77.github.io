@@ -1,4 +1,4 @@
-// pokemonarena/js/record_model.js -- the RECORD screen's pages, as data: a profile's battle record (profile.stats, schema 3) -> pages of text lines for the ROM renderer.
+// pokemonarena/js/record_model.js -- the RECORD screen's pages, as data: a profile's battle record (profile.stats, schema 4) -> pages of text lines for the ROM renderer.
 //
 // Pure ES module (browser + Node): no DOM, no ROM, no clock (the caller passes the time zone offset). Same page format as recap_model.js (PAGE_W x PAGE_H, lines of
 // positioned cells), drawn by page_draw.js. The hub reads the profiles from the store (hub_data.js), builds these pages with the pack's names, and hands plain JSON
@@ -6,7 +6,7 @@
 //
 //   const pages = buildRecordPages(stats, { speciesName, moveName, tzMinutes: 0, resettable: true });
 //
-// PAGES: OVERALL (battles, win rate, won / lost / drawn / gave up, streak, first and last battle, time played), BY FORMAT AND CPU (3v3, 6v6, EASY, NORMAL, HARD),
+// PAGES: OVERALL (battles, win rate, won / lost / drawn / gave up, streak, first and last battle, time played), BY FORMAT AND CPU (3v3, 6v6, EASY, NORMAL, HARD, and ONLINE once the trainer has fought a person; the WIN RATE line there is per CPU level, or CPU + ONLINE once there is an ONLINE row),
 // FAVOURITES (the most used Pokemon and moves, most MVP awards), HIGHS (biggest hit, fastest win, longest battle, best KO streak and win streak), TOTALS (KOs, faints,
 // damage, hits, crits, effectiveness, misses, status, healing), RECENT (the last 20 battles, five to a page) and RESET. A profile with no battle yet has one page that says so.
 
@@ -17,7 +17,7 @@ const cell = (t, x, w, a = 'l', f = 'small', tone = 'dark') => ({ t: String(t), 
 const line = (y, ...cells) => ({ y, cells });
 const RES = { w: 'WON', l: 'LOST', d: 'DRAW', f: 'QUIT' };
 const RES_TONE = { w: 'good', l: 'bad', d: 'dark', f: 'bad' };
-const CPU = { easy: 'EASY', normal: 'NORMAL', hard: 'HARD' };
+const CPU = { easy: 'EASY', normal: 'NORMAL', hard: 'HARD', online: 'ONLINE' };
 const pad2 = (n) => String(n).padStart(2, '0');
 
 /** 'YY-MM-DD' of a time in ms, shifted by tzMinutes (minutes WEST of UTC, as Date.getTimezoneOffset() says). */
@@ -66,10 +66,22 @@ export function buildRecordPages(stats, ctx = {}) {
   p2.lines.push(line(1, cell('', 2, 60), cell('WON', 62, 36, 'r', 'small', 'dim'), cell('LOST', 100, 36, 'r', 'small', 'dim'), cell('DRAWN', 138, 40, 'r', 'small', 'dim'), cell('QUIT', 180, 36, 'r', 'small', 'dim')));
   const rowOf = (y, label, r) => line(y, cell(label, 2, 58, 'l', 'small', 'dark'), cell(r.w, 62, 36, 'r'), cell(r.l, 100, 36, 'r'), cell(r.dr, 138, 40, 'r'), cell(r.f, 180, 36, 'r'));
   p2.lines.push(rowOf(16, '3V3', stats.byFormat['3v3']), rowOf(29, '6V6', stats.byFormat['6v6']));
-  p2.lines.push(rowOf(48, 'EASY', stats.byCpu.easy), rowOf(61, 'NORMAL', stats.byCpu.normal), rowOf(74, 'HARD', stats.byCpu.hard));
   const sum = (r) => r.w + r.l + r.dr + r.f;
-  const best = ['easy', 'normal', 'hard'].filter((k) => sum(stats.byCpu[k]) > 0).map((k) => [k, Math.floor((200 * stats.byCpu[k].w + sum(stats.byCpu[k])) / (2 * sum(stats.byCpu[k])))]);
-  p2.lines.push(line(92, cell('WIN RATE', 2, 58, 'l', 'small', 'dim'), cell(best.length ? best.map(([k, r]) => CPU[k] + ' ' + r + '%').join('  ') : '-', 62, 154, 'r')));
+  // ONLINE (schema 4) has a row only once the trainer has fought a person, and then the CPU rows move up one row's worth to make room: a record with no online battle is laid out exactly as before
+  const online = sum(stats.byCpu.online) > 0, y0 = online ? 42 : 48;
+  p2.lines.push(rowOf(y0, 'EASY', stats.byCpu.easy), rowOf(y0 + 13, 'NORMAL', stats.byCpu.normal), rowOf(y0 + 26, 'HARD', stats.byCpu.hard));
+  if (online) p2.lines.push(rowOf(y0 + 39, 'ONLINE', stats.byCpu.online));
+  const rateOf = (w, n) => Math.floor((200 * w + n) / (2 * n));         // whole percent, round half up (career_stats.winRate's rule)
+  const best = ['easy', 'normal', 'hard'].filter((k) => sum(stats.byCpu[k]) > 0).map((k) => [k, rateOf(stats.byCpu[k].w, sum(stats.byCpu[k]))]);
+  // The WIN RATE line is the per-level rate of every CPU level that has a battle (EASY 100%  NORMAL 67%  HARD 0%). Once there is an ONLINE row the line reads CPU <rate of all three levels together>
+  // and ONLINE <rate>: four names with their rates do not fit the cell (207 px in the ROM font, the cell is 154), and without a rate for ONLINE a record of nothing but online battles read "WIN RATE -".
+  let rates;
+  if (!online) rates = best.length ? best.map(([k, r]) => CPU[k] + ' ' + r + '%').join('  ') : '-';
+  else {
+    const cpu = ['easy', 'normal', 'hard'].reduce((a, k) => ({ w: a.w + stats.byCpu[k].w, n: a.n + sum(stats.byCpu[k]) }), { w: 0, n: 0 });
+    rates = (cpu.n > 0 ? 'CPU ' + rateOf(cpu.w, cpu.n) + '%  ' : '') + 'ONLINE ' + rateOf(stats.byCpu.online.w, sum(stats.byCpu.online)) + '%';
+  }
+  p2.lines.push(line(online ? 94 : 92, cell('WIN RATE', 2, 58, 'l', 'small', 'dim'), cell(rates, 62, 154, 'r')));
 
   /* FAVOURITES */
   const p3 = page('fav', 'FAVOURITES');
@@ -113,7 +125,7 @@ export function buildRecordPages(stats, ctx = {}) {
       let shown = [], used = 0;
       for (const nm of names) { if (used + nm.length + 2 > 24 && shown.length) break; shown.push(nm); used += nm.length + 2; }
       const more = names.length - shown.length;
-      p.lines.push(line(y + 10, cell(r.mvp ? 'MVP ' + spName(r.mvp) : 'NO MVP', 2, 92, 'l', 'small', 'dim'), { ...cell(shown.join(', ') + (more > 0 ? ' +' + more : ''), 98, 120, 'r', 'small', 'dim'), cutOk: true }));
+      p.lines.push(line(y + 10, cell(r.cpu === 'online' ? 'VS ' + r.opp : r.mvp ? 'MVP ' + spName(r.mvp) : 'NO MVP', 2, 92, 'l', 'small', 'dim'), { ...cell(shown.join(', ') + (more > 0 ? ' +' + more : ''), 98, 120, 'r', 'small', 'dim'), cutOk: true }));
     });
   }
 

@@ -156,3 +156,26 @@ body[data-full="1"][data-layout="landscape"] #play { gap: 6px; }
 body[data-edge="1"] #boot, body[data-edge="1"] #error { width: min(calc(100% - var(--gutter) * 2), 440px); }
 /* an error screen has no game to fullscreen: its header carries the same buttons as the editor's (coherence test D7) */
 body[data-state="error"] #fullBtn, body[data-state="error"] #fullExit { visibility: hidden; }
+
+/* OPEN TO BATTLES (js/presence_boot.js): the switch sits beside the Play online link on the same row, so the footer stays one 44 px line (screenfit.js reserves exactly that on a phone) */
+#onlineLink { display: flex; flex-wrap: nowrap; justify-content: center; align-items: center; gap: 8px; }
+#onlineLink .textbtn { white-space: nowrap; }
+#openToggle[aria-pressed="true"] { background: #1f5a37; border-color: #5c5; }
+/* the switch only works once the menu is up (the module is mounted then): before that, and on an error screen, the link stands alone as it always did */
+body:not([data-state="ready"]) #openToggle { display: none; }
+/* .textbtn's display:inline-flex is an author rule and beats the browser's [hidden]: boot.js hides the switch with [hidden] when presence_boot.js could not load, and without this line a dead "Open: off" stayed on screen */
+#openToggle[hidden] { display: none; }
+/* and until presence_boot.js has mounted and wired the click (it sets data-presence="ready") the switch is invisible and so unclickable and unfocusable: a press before then was silently dropped. visibility, not display: the row does not shift when it appears */
+#openToggle:not([data-presence="ready"]) { visibility: hidden; }
+
+/* THE LOADING PANEL ONLY APPEARS IF LOADING TAKES A MOMENT. A repeat visit (the ROM comes from this browser's own cache, js/romcache.js) is on screen well inside this, so coming back to the hub
+   is not a loading screen; a first visit still shows the panel and its progress bar. visibility, not display: no layout moves.
+   TWO WAYS TO REVEAL IT, because either alone failed someone. (1) The 0 s keyframe below: pure CSS, so the panel also appears if the script never starts. But "prefers-reduced-motion: reduce"
+   (the rule near the top of this file) switches EVERY animation off with !important, and a visitor with Reduce Motion on (iOS, Android and Windows all map it to this query) then saw an empty page for the whole 32 MB
+   first download. (2) So a tiny inline timer in index.html (it runs before the module graph has loaded, so it does not wait for that either) sets data-slow on <body> at the same moment, and the last rule
+   shows the panel for it; no animation involved. (js/boot.js sets it at once on Try again.) With Reduce Motion on AND no script at all nothing reveals it, and the page shows only its header. */
+body[data-state="boot"] #boot { visibility: hidden; animation: arena-boot-in 0s linear 0.4s forwards; }
+@keyframes arena-boot-in { to { visibility: visible; } }
+body[data-state="boot"][data-slow] #boot { visibility: visible; }
+/* ... and until the hub is up the page shows only its header: the Play online link on its own, centred on an empty screen, read as a glitch (visibility again: nothing moves) */
+body[data-state="boot"] #onlineLink { visibility: hidden; }

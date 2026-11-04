@@ -1,12 +1,14 @@
 #!/usr/bin/env node
-// POKEMONARENA CAREER TEST (ST1) -- the battle record kept on a profile: pokemonarena/js/career_stats.js, profile.js (schema 3: migration, check, repair,
+// POKEMONARENA CAREER TEST (ST1) -- the battle record kept on a profile: pokemonarena/js/career_stats.js, profile.js (schema 4: migration, check, repair,
 // recordMatch, resetRecord, planImport), store.js (recordMatch / resetRecord inside one transaction, restoreRevision, history).
 //
 //   A  FOLD, BY HAND   one match at a time into a record: every counter, the streaks, the bests, the favourites (with their cap), the recent list, the
 //                      callouts, saturation, idempotence by match id, bad matches refused, the input never modified.
 //   B  FOLD, FOR REAL  N real engine battles folded in order through profile.recordMatch; every total is recomputed from the battles by a separate loop.
-//   C  SCHEMA 3        the strict check, the repair of hostile stats (every key), the v2 -> v3 migration against a hand-written golden, the v1 -> v3 chain,
-//                      a v4 document stays read-only, a fuzz of the stats block (open never throws, the result is valid and a fixed point).
+//   C  SCHEMA 4        the strict check, the repair of hostile stats (every key), the v2 -> v4 migration against a hand-written golden, the v1 -> v4 chain,
+//                      a v5 document stays read-only, a fuzz of the stats block (open never throws, the result is valid and a fixed point).
+//   O  ONLINE          a battle against a PERSON (schema 4): it counts everywhere a battle counts and in its own byCpu row, never in a CPU level; the opponent's name rides with it
+//                      (and only with it); hostile names are refused; the strict check and the repair know the new entry kind; the store records one and upgrades a stored v3 profile first.
 //   D  IMPORT          what an import does with the record: new = copied, merge = left exactly as it is, replace = the file's.
 //   E  THE STORE       one transaction; a duplicate writes nothing; two tabs at once lose nothing; an editor holding a stale revision is told (Conflict); no
 //                      history entries from battles; a restore of old teams keeps the record; reset takes a backup and a history entry; newer / missing /
@@ -46,7 +48,7 @@ const head = (s) => console.log('\n== ' + s);
 const NOW = 1700000999999;
 function mulberry32(seed) { let a = seed >>> 0; return () => { a = (a + 0x6d2b79f5) >>> 0; let x = a; x = Math.imul(x ^ (x >>> 15), x | 1); x ^= x + Math.imul(x ^ (x >>> 7), x | 61); return ((x ^ (x >>> 14)) >>> 0) / 4294967296; }; }
 function detDeps(seed = 1, t0 = NOW) { const r = mulberry32(seed); let tm = t0; return { now: () => tm, randomBytes: (n) => Uint8Array.from({ length: n }, () => Math.floor(r() * 256)), advance: (d) => { tm += d; } }; }
-const FIX = { v2: readFx('profile-v2-current.json'), v2exp: readFx('profile-v2-current.expected-v3.json'), cur: readFx('profile-v3-current.json'), fut: readFx('profile-v4-future.json'), v1full: readFx('profile-v1-full.json'), v1fullExp: readFx('profile-v1-full.expected-v3.json') };
+const FIX = { v2: readFx('profile-v2-current.json'), v2exp: readFx('profile-v2-current.expected-v4.json'), v3: readFx('profile-v3-current.json'), cur: readFx('profile-v4-current.json'), fut: readFx('profile-v5-future.json'), v1full: readFx('profile-v1-full.json'), v1fullExp: readFx('profile-v1-full.expected-v4.json') };
 
 const mkMatch = (o = {}) => ({
   id: 'm1', at: 1000, fmt: '3v3', cpu: 'normal', ruleset: 'arena-gen3-standard', result: 'w', turns: 10, playMs: 60000, mvp: 25, team: [25, 6, 9], species: [25, 6], moves: [[85, 3], [33, 2]],
@@ -181,22 +183,172 @@ async function suite(M) {
   });
 
   // ---------------------------------------------------------------------------------------------------- C. schema 3
+
+  // ---------------------------------------------------------------------------------------------------- O. a battle against a person (schema 4)
+  await blk('online', async () => {
+    const online = (o = {}) => mkMatch({ cpu: 'online', opp: 'Mallory', id: 'on1_3v3_AQ111', ...o });
+    const on = fold(empty(), online());
+    const s = on.stats;
+    add('online/an-online-match-counts-everywhere-and-in-its-own-row', J([s.wins, s.streak, s.best, s.byFormat['3v3'], s.byCpu.online, s.byRuleset, s.totals.kos, s.totals.turns, s.bests.fastestWin, s.bests.hit.dmg, s.fav.species, s.fav.mvps]) === J([1, 1, 1, { w: 1, l: 0, dr: 0, f: 0 }, { w: 1, l: 0, dr: 0, f: 0 }, { 'arena-gen3-standard': { w: 1, l: 0 } }, 2, 10, { turns: 10, at: 1000 }, 120, { 6: 1, 25: 1 }, { 25: 1 }]) ? true : J([s.wins, s.byCpu, s.totals, s.bests, s.fav]));
+    add('online/the-three-cpu-levels-stay-at-zero', J([s.byCpu.easy, s.byCpu.normal, s.byCpu.hard]) === J([{ w: 0, l: 0, dr: 0, f: 0 }, { w: 0, l: 0, dr: 0, f: 0 }, { w: 0, l: 0, dr: 0, f: 0 }]) ? true : J(s.byCpu));
+    add('online/the-recent-entry-names-the-opponent-and-a-cpu-entry-does-not', (() => {
+      const e = s.recent[0];
+      const mixed = fold(on.stats, mkMatch({ id: 'cpu1', at: 2000 })).stats.recent;
+      return J(e) === J({ id: 'on1_3v3_AQ111', at: 1000, fmt: '3v3', cpu: 'online', res: 'w', turns: 10, mvp: 25, team: [25, 6, 9], opp: 'Mallory' }) && Object.keys(mixed[0]).length === 8 && !('opp' in mixed[0]) && mixed[1].opp === 'Mallory' && C.recentOk(mixed[0]) && C.recentOk(mixed[1]) ? true : J(mixed);
+    })());
+    add('online/a-duplicate-online-id-changes-nothing', (() => { const d = fold(on.stats, online({ result: 'l', turns: 99 })); return d.duplicate === true && J(d.stats) === J(on.stats) && d.callouts.length === 0 ? true : J(d); })());
+    add('online/the-record-after-an-online-match-is-valid-and-is-a-fixed-point', (() => { const p = base(); p.stats = on.stats; const o = P.openProfileDocument(clone(p), { deps: detDeps() }); return P.checkProfile(p).length === 0 && o.ok && !o.changed && o.problems.length === 0 && J(o.profile) === J(p) ? true : J([P.checkProfile(p).slice(0, 2), o.problems.slice(0, 2)]); })());
+    // a streak, the totals and the overall count span the CPU and the people
+    const mixed = fold(fold(fold(empty(), mkMatch({ id: 'c1', at: 100 })).stats, online({ id: 'o1_3v3_AQ111', at: 200, result: 'w' })).stats, online({ id: 'o2_3v3_AQ111', at: 300, result: 'f', opp: 'Zed' })).stats;
+    add('online/a-streak-and-the-totals-span-cpu-and-online', J([mixed.wins, mixed.forfeits, mixed.streak, mixed.best, C.battleCount(mixed), mixed.byCpu.normal, mixed.byCpu.online, mixed.totals.kos, mixed.byFormat['3v3']]) === J([2, 1, 0, 2, 3, { w: 1, l: 0, dr: 0, f: 0 }, { w: 1, l: 0, dr: 0, f: 1 }, 6, { w: 2, l: 0, dr: 0, f: 1 }]) ? true : J(mixed));
+    // the name
+    const goodNames = ['Zed', "A B-c.d_!?", 'x'.repeat(10), 'a', '007'];
+    const badNames = ['', 'x'.repeat(11), 'A  B', ' lead', 'trail ', '<b>', 'caf\u00e9', 'a\tb', 'a\nb', 5, null, undefined, {}, ['Zed']];
+    add('online/a-clean-opponent-name-is-required-and-only-for-online', (() => {
+      for (const n of goodNames) if (C.matchIssue(online({ opp: n })) !== null) return 'a good name was refused: ' + J(n);
+      for (const n of badNames) if (C.matchIssue(online({ opp: n })) !== 'opp') return 'a bad name was accepted: ' + J(n);
+      const noOpp = online(); delete noOpp.opp;
+      if (C.matchIssue(noOpp) !== 'opp') return 'an online match with no opponent name was accepted';
+      if (C.matchIssue(mkMatch({ opp: 'Zed' })) !== 'opp') return 'a CPU match with an opponent name was accepted';
+      return C.matchIssue(mkMatch()) === null && C.OPP_IDS.join() === 'easy,normal,hard,online' && C.CPU_IDS.join() === 'easy,normal,hard' ? true : 'ids ' + C.OPP_IDS;
+    })());
+    add('online/the-strict-check-ties-opp-to-online', (() => {
+      const ok = { id: 'x1', at: 5, fmt: '3v3', cpu: 'online', res: 'w', turns: 4, mvp: 9, team: [9], opp: 'Zed' };
+      const should = [[ok, true], [{ ...ok, opp: ' Zed' }, false], [{ ...ok, opp: 'x'.repeat(11) }, false], [{ ...ok, opp: 7 }, false], [(() => { const o = { ...ok }; delete o.opp; return o; })(), false],
+        [{ ...ok, cpu: 'easy' }, false], [{ ...ok, cpu: 'easy', opp: undefined }, false], [(() => { const o = { ...ok, cpu: 'hard' }; delete o.opp; return o; })(), true], [{ ...ok, cpu: 'cheater' }, false], [{ ...ok, extra: 1 }, false]];
+      const wrong = should.filter(([r, want]) => C.recentOk(r) !== want).map(([r]) => J(r));
+      return wrong.length === 0 ? true : 'wrong verdict for ' + wrong.join(' | ');
+    })());
+    add('online/repair-drops-bad-online-entries-and-zeroes-a-junk-row', (() => {
+      const d = clone(FIX.cur);
+      const good = { id: 'g1', at: 9, fmt: '6v6', cpu: 'online', res: 'l', turns: 7, mvp: 0, team: [9, 94], opp: 'Zed' };
+      const mk = (id, over, drop = []) => { const o = { ...good, id, ...over }; for (const k of drop) delete o[k]; return o; };
+      d.stats.recent = [good, mk('g2', { opp: ' bad' }), mk('g3', {}, ['opp']), mk('g4', { cpu: 'easy' }), mk('g5', { cpu: 'easy' }, ['opp']), mk('g6', { cpu: 'nobody' }, ['opp'])];
+      d.stats.byCpu.online = 'junk';
+      const o = P.openProfileDocument(d, { deps: detDeps() });
+      const ids = o.ok ? o.profile.stats.recent.map((r) => r.id).join() : '';
+      return o.ok && ids === 'g1,g5' && o.profile.stats.recent[0].opp === 'Zed' && !('opp' in o.profile.stats.recent[1]) && J(o.profile.stats.byCpu.online) === J({ w: 0, l: 0, dr: 0, f: 0 }) && P.checkProfile(o.profile).length === 0 ? true : 'ids=' + ids + ' ' + J(o.ok ? o.profile.stats.byCpu : o).slice(0, 200);
+    })());
+    // a real battle's summary becomes an online match
+    if (M.battles.length) {
+      const b = M.battles[0];
+      const sum = M.MS.summarizeMatch(b.events, { viewSide: 0, teams: b.teams });
+      const m = C.matchFromSummary(sum, { id: 'realon0', at: 1700000000000, fmt: b.fmt, cpu: 'online', opp: 'Zed', ruleset: 'arena-gen3-standard', playMs: 20000 });
+      const cpu = C.matchFromSummary(sum, { id: 'realcpu0', at: 1700000000000, fmt: b.fmt, cpu: b.cpu, ruleset: 'arena-gen3-standard', playMs: 20000 });
+      const r = P.recordMatch(base(), m);
+      add('online/a-real-battle-summary-becomes-an-online-match', m.opp === 'Zed' && !('opp' in cpu) && C.matchIssue(m) === null && r.ok && r.profile.stats.byCpu.online.w + r.profile.stats.byCpu.online.l + r.profile.stats.byCpu.online.dr + r.profile.stats.byCpu.online.f === 1 && r.profile.stats.recent[0].opp === 'Zed' && P.checkProfile(r.profile).length === 0 ? true : J(r).slice(0, 300));
+    }
+  });
+
+  // A WIN THE OPPONENT HANDED OVER. Only a person can leave, so this exists only online: the first stranger to close the page at the team preview used to write "FASTEST WIN 0 TURNS" that
+  // nothing could ever beat. A conceded win is a win in every counter; it is never the fastest win; a WALKOVER (a conceded win in which no second turn had begun: turns 0 or 1; usually nothing
+  // was played, but the rule counts turns, not moves -- see 'conceded-real' below) is not the longest battle either.
+  await blk('conceded', async () => {
+    const online = (o = {}) => mkMatch({ cpu: 'online', opp: 'Mallory', id: 'cn1_3v3_o1_ROOM1', ...o });
+    const only = (callouts) => J(callouts.map((c) => c.kind));
+    for (const turns of [0, 1]) {
+      const f = fold(empty(), online({ conceded: true, turns, id: 'wo' + turns }));
+      const s = f.stats;
+      add('conceded/a-walkover-at-' + turns + '-turns-is-a-win-that-sets-no-best (fastest win, longest battle)', J([s.wins, s.streak, s.best, s.byCpu.online.w, s.byFormat['3v3'].w, s.recent[0].res, s.recent[0].turns, s.bests.fastestWin, s.bests.longest, s.totals.turns]) === J([1, 1, 1, 1, 1, 'w', turns, null, null, turns]) && only(f.callouts) === J(['first-win']) ? true : J([s.bests, f.callouts]));
+    }
+    // a real record to beat: fastest win 9 turns, longest battle 12
+    const base0 = fold(fold(empty(), online({ id: 'real9', turns: 9, at: 1000 })).stats, online({ id: 'real12', turns: 12, result: 'l', at: 2000 })).stats;
+    add('conceded/(the record to beat: fastest win 9, longest battle 12)', J([base0.bests.fastestWin, base0.bests.longest]) === J([{ turns: 9, at: 1000 }, { turns: 12, at: 2000 }]) ? true : J(base0.bests));
+    const at = (turns, over = {}) => fold(base0, online({ id: 'c' + turns, at: 5000, conceded: true, turns, ...over }));
+    for (const turns of [0, 1, 3, 8]) {
+      const f = at(turns);
+      add('conceded/a-win-conceded-at-' + turns + '-turns-never-replaces-the-fastest-win-9 and calls out nothing', J(f.stats.bests.fastestWin) === J({ turns: 9, at: 1000 }) && f.stats.wins === 2 && f.stats.streak === 1 && !f.callouts.some((c) => c.kind === 'fastest' || c.kind === 'longest') ? true : J([f.stats.bests, f.callouts]));
+    }
+    add('conceded/...and-the-same-length-by-a-knockout-WOULD-have-been-a-record (the flag is what decides)', J(fold(base0, online({ id: 'ko3', at: 5000, turns: 3 })).stats.bests.fastestWin) === J({ turns: 3, at: 5000 }) && fold(base0, online({ id: 'ko3', at: 5000, turns: 3 })).callouts.some((c) => c.kind === 'fastest') ? true : 'a knocked-out win of 3 turns is no record');
+    // (a walkover has at most 1 turn, so it can only ever "beat" a longest battle of 0 turns: that record is the one that shows whether it was allowed to)
+    const gaveUp0 = fold(empty(), online({ id: 'quit0', result: 'f', turns: 0, at: 1000 })).stats;
+    const wo1 = fold(gaveUp0, online({ id: 'wo1b', conceded: true, turns: 1, at: 3000 }));
+    add('conceded/a-walkover-(1 turn)-does-not-lengthen-a-longest-battle-of-0-turns-and-calls-out-only-the-first-win', J(gaveUp0.bests.longest) === J({ turns: 0, at: 1000 }) && J(wo1.stats.bests.longest) === J({ turns: 0, at: 1000 }) && only(wo1.callouts) === J(['first-win']) ? true : J([wo1.stats.bests.longest, wo1.callouts]));
+    add('conceded/...while-a-win-by-knockout-in-1-turn-would-(the-flag-decides)', J(fold(gaveUp0, online({ id: 'ko1', turns: 1, at: 3000 })).stats.bests.longest) === J({ turns: 1, at: 3000 }) ? true : 'a knockout win in one turn is not the longest battle');
+    add('conceded/a-win-conceded-after-real-play-(40-turns)-IS-the-longest-battle-and-is-called-out', J(at(40).stats.bests.longest) === J({ turns: 40, at: 5000 }) && at(40).callouts.some((c) => c.kind === 'longest' && c.n === 40) && J(at(40).stats.bests.fastestWin) === J({ turns: 9, at: 1000 }) ? true : J([at(40).stats.bests, at(40).callouts]));
+    add('conceded/the-same-two-turns-by-a-LOSS-or-a-forfeit-still-count-as-before (only a conceded win is special)', J(fold(empty(), online({ id: 'lf', result: 'f', turns: 1 })).stats.bests.longest) === J({ turns: 1, at: 1000 }) && J(fold(empty(), online({ id: 'lf2', result: 'l', turns: 0 })).stats.bests.longest) === J({ turns: 0, at: 1000 }) ? true : 'changed');
+    add('conceded/it-still-counts-for-the-ruleset-the-streak-the-favourites-and-the-hit', (() => { const f = fold(empty(), online({ id: 'cf', conceded: true, turns: 1 })); const s = f.stats; return J([s.byRuleset, s.fav.species, s.totals.kos, s.bests.hit]) === J([{ 'arena-gen3-standard': { w: 1, l: 0 } }, { 6: 1, 25: 1 }, 2, { sp: 25, mv: 85, dmg: 120, pct: 70, vs: 6, at: 1000 }]) ? true : J([s.byRuleset, s.fav, s.bests.hit]); })());
+    add('conceded/the-record-after-a-conceded-win-is-valid-and-keeps-no-trace-of-the-flag', (() => { const p = base(); p.stats = at(3).stats; const o = P.openProfileDocument(clone(p), { deps: detDeps() }); return o.ok && o.problems.length === 0 && P.checkProfile(p).length === 0 && !J(p.stats).includes('conceded') ? true : J(o.problems).slice(0, 200); })());
+    // the flag is checked
+    const flagBad = [['false', online({ conceded: false })], ['a string', online({ conceded: 'yes' })], ['1', online({ conceded: 1 })], ['on a loss', online({ conceded: true, result: 'l' })], ['on a forfeit', online({ conceded: true, result: 'f' })], ['on a draw', online({ conceded: true, result: 'd' })]];
+    add('conceded/the-flag-is-true-and-only-on-a-win (anything else is refused with the reason)', flagBad.every(([, m]) => C.matchIssue(m) === 'conceded') && C.matchIssue(online({ conceded: true })) === null ? true : flagBad.map(([n, m]) => n + ':' + C.matchIssue(m)).join(' '));
+    add('conceded/foldMatch-refuses-a-conceded-loss', (() => { try { fold(empty(), online({ conceded: true, result: 'l' })); return 'accepted'; } catch (e) { return e instanceof RangeError ? true : 'threw ' + e.name; } })());
+    add('conceded/the-walkover-limit-is-one-turn (turn 0 = preview, turn 1 = the first choice and any replacement after it; no second turn)', C.WALKOVER_MAX_TURNS === 1 && C.isWalkover(online({ conceded: true, turns: 1 })) && !C.isWalkover(online({ conceded: true, turns: 2 })) && !C.isWalkover(online({ turns: 0 })) && C.isConceded(online({ conceded: true })) && !C.isConceded(online({ result: 'l' })) ? true : 'limit');
+  });
+
+  // WHAT THE ENGINE SAYS, FOR REAL: a controller whose opponent leaves after n rounds -> the summary -> the match the record keeps. This is where "turns 0 or 1" comes from -- and where the
+  // limit of that rule is pinned: turns 0 / 1 is "nothing was played" at the preview and at the first choice, but NOT at the replacement prompt after a first turn in which a Pokemon fainted.
+  await blk('conceded-real', async () => {
+    const cases = [['at the team preview', 0, 0], ['at the first choice', 1, 1], ['after one turn was played', 2, 2]];
+    const mk = (seed, rounds) => {
+      const A = MC.randomTeam(pack, seed * 1000 + 1, 6), B = MC.randomTeam(pack, seed * 1000 + 2, 6);
+      const c = MC.createMatchController({ pack, teams: [A.recs, B.recs], seed, pick: 3, names: ['You', 'Them'], sides: [{ kind: 'human' }, { kind: 'cpu', level: 'normal', seed: seed + 5 }] });
+      c.start();
+      const ai = AI.createAi({ pack, level: 'normal', seed: seed ^ 0x77 });
+      for (let g = 0; g < rounds; g++) { const req = c.pending(0); if (!req) break; const r = c.submit(0, ai.choose(req, c.view(0), { previewInfo: { foe: c.previewInfo[1] } })); if (!r.ok) throw new Error('refused'); }
+      return c;
+    };
+    const summaryOf = (c, viewSide) => M.MS.summarizeMatch(c.battle.events, { viewSide, teams: [0, 1].map((s) => c.battle.s.sides[s].team.map((m) => ({ slot: m.slot, sp: m.sp, name: m.name, level: m.level, mhp: m.mhp }))) });
+    const info = (id, over = {}) => ({ id, at: 1700000000000, fmt: '3v3', cpu: 'online', opp: 'Zed', ruleset: 'arena-gen3-standard', playMs: 20000, ...over });
+    for (const [what, rounds, turns] of cases) {
+      const c = mk(700 + rounds, rounds);
+      const r = c.concede(1);
+      const win = summaryOf(c, 0), left = summaryOf(c, 1);
+      const m = C.matchFromSummary(win, info('real' + rounds));
+      add('conceded-real/the-opponent-leaving-' + what.replace(/ /g, '-') + '-is-a-win-with-' + turns + '-turns-that-the-record-flags', r.ok && win.result === 'w' && win.endedBy === 'forfeit' && win.turns === turns && m.conceded === true && C.matchIssue(m) === null && C.isWalkover(m) === (turns <= 1) ? true : J([r, win.result, win.endedBy, win.turns, m.conceded]));
+      add('conceded-real/...and-the-one-who-left-is-a-forfeit-with-no-flag (' + what + ')', left.result === 'f' && !('conceded' in C.matchFromSummary(left, info('left' + rounds))) ? true : J([left.result, C.matchFromSummary(left, info('left' + rounds))]));
+    }
+    // THE LIMIT OF "turns <= 1 is a walkover". The engine opens turn 2 only after turn 1 has resolved AND a Pokemon that fainted in it has been replaced, so an opponent who leaves at that
+    // replacement prompt concedes at turns = 1 although moves were used and a Pokemon fainted. The rule counts turns, not moves; this pins that behaviour (career_stats.js, ONLINE.md and the
+    // README say it in the same words) so a change to the rule has to change a case.
+    {
+      let hit = null;
+      for (let seed = 1; seed <= 300 && !hit; seed++) {
+        const c = mk(seed, 2); const req = c.pending(0);
+        if (req && req.phase === 'switch' && Math.max(0, ...c.battle.events.filter((e) => e.t === 'turn').map((e) => e.n)) === 1) hit = { seed, c };
+      }
+      add('conceded-real/(setup) some seed leaves the player at a replacement prompt inside turn 1 (a Pokemon fainted in the first turn)', hit ? true : 'no seed in 1..300 reached a forced switch inside turn 1');
+      if (hit) {
+        const r = hit.c.concede(1);
+        const win = summaryOf(hit.c, 0), m = C.matchFromSummary(win, info('forced' + hit.seed));
+        const played = win.sides.some((s) => s.moves.length > 0), fainted = win.sides[0].faints + win.sides[1].faints;
+        add('conceded-real/...the-opponent-leaving-at-that-replacement-prompt-is-a-win-with-1-turn-after-a-move-and-a-faint', r.ok && win.result === 'w' && win.endedBy === 'forfeit' && win.turns === 1 && played && fainted > 0 && m.conceded === true && C.matchIssue(m) === null ? true : J([r, win.result, win.endedBy, win.turns, played, fainted]));
+        const f = fold(empty(), m);
+        add('conceded-real/...and-it-IS-a-walkover-by-the-turn-count (a move was played: the rule counts turns, not moves), so it sets neither the fastest win nor the longest battle', C.isWalkover(m) === true && f.stats.wins === 1 && f.stats.bests.fastestWin === null && f.stats.bests.longest === null && J(f.callouts.map((x) => x.kind)) === J(['first-win']) ? true : J([C.isWalkover(m), f.stats.bests, f.callouts]));
+      }
+    }
+    // a knockout win, a loss and a draw never carry the flag, so their shape is exactly what it was
+    const ko =M.battles.find((b) => M.MS.summarizeMatch(b.events, { viewSide: 0, teams: b.teams }).result === 'w' && M.MS.summarizeMatch(b.events, { viewSide: 0, teams: b.teams }).endedBy === 'ko');
+    const keys = (m) => Object.keys(m).sort().join();
+    add('conceded-real/a-knockout-win-has-no-flag-and-the-match-has-the-shape-it-always-had', ko ? !('conceded' in C.matchFromSummary(M.MS.summarizeMatch(ko.events, { viewSide: 0, teams: ko.teams }), info('ko1'))) && keys(C.matchFromSummary(M.MS.summarizeMatch(ko.events, { viewSide: 0, teams: ko.teams }), info('ko2'))) === 'at,cpu,fmt,foeFaints,id,me,moves,mvp,opp,playMs,result,ruleset,species,team,turns' ? true : keys(C.matchFromSummary(M.MS.summarizeMatch(ko.events, { viewSide: 0, teams: ko.teams }), info('ko2'))) : 'no knockout battle in the sample');
+    add('conceded-real/no-battle-against-the-CPU-is-a-conceded-win (the CPU never leaves), so none carries the flag', M.battles.length > 0 && M.battles.every((b) => { const s = M.MS.summarizeMatch(b.events, { viewSide: 0, teams: b.teams }); return !(s.result === 'w' && s.endedBy === 'forfeit') && !('conceded' in C.matchFromSummary(s, { id: 'x', at: 1, fmt: b.fmt, cpu: b.cpu, ruleset: 'r', playMs: 1 })); }) ? true : 'a CPU battle was a concession');
+  });
+
+  // THE ID OF A BATTLE AGAINST A PERSON (the "once" claim): the pieces both machines agree on, nothing else.
+  await blk('online-id', async () => {
+    const id = (o = {}) => C.onlineMatchId({ seed: 123456789, fmt: '3v3', mn: 1, room: 'ABCDEFGHIJKL', ...o });
+    add('online-id/is-the-seed-the-format-the-match-number-and-the-first-eight-characters-of-the-room', id() === '123456789_3v3_o1_ABCDEFGH' && C.matchIssue(mkMatch({ cpu: 'online', opp: 'Zed', id: id() })) === null ? true : id());
+    add('online-id/each-part-changes-it (a rematch, another room, another seed, another format)', new Set([id(), id({ mn: 2 }), id({ room: 'ZZZZZZZZ' }), id({ seed: 5 }), id({ fmt: '6v6' })]).size === 5 ? true : [id(), id({ mn: 2 }), id({ room: 'ZZZZZZZZ' }), id({ seed: 5 }), id({ fmt: '6v6' })].join(' '));
+    add('online-id/does-not-depend-on-anything-else (same inputs, same id; a seed given as a signed int reads as unsigned)', id() === id() && C.onlineMatchId({ seed: -1, fmt: '6v6', mn: 3, room: 'R' }) === '4294967295_6v6_o3_R' && C.onlineMatchId({ seed: 7, fmt: '3v3', mn: 1 }) === '7_3v3_o1_' ? true : C.onlineMatchId({ seed: -1, fmt: '6v6', mn: 3, room: 'R' }));
+    add('online-id/is-a-valid-record-id-for-the-worst-case (a room of 8 characters of the code alphabet, a full-size seed and a three digit match number)', C.matchIssue(mkMatch({ cpu: 'online', opp: 'Zed', id: C.onlineMatchId({ seed: 4294967295, fmt: '6v6', mn: 999, room: 'ABCDEFGH' }) })) === null ? true : C.onlineMatchId({ seed: 4294967295, fmt: '6v6', mn: 999, room: 'ABCDEFGH' }));
+  });
+
   await blk('schema', async () => {
-    add('schema/current-version-is-3', P.SCHEMA_VERSION === 3 ? true : String(P.SCHEMA_VERSION));
+    add('schema/current-version-is-4', P.SCHEMA_VERSION === 4 ? true : String(P.SCHEMA_VERSION));        // 4 since a battle against a person has its own row
     add('schema/a-fresh-profile-has-an-empty-well-formed-record', (() => { const p = base(); return P.checkProfile(p).length === 0 && C.battleCount(p.stats) === 0 && J(Object.keys(p.stats).sort()) === J(['bests', 'best', 'byCpu', 'byFormat', 'byRuleset', 'draws', 'fav', 'firstMatchAt', 'forfeits', 'lastMatchAt', 'losses', 'playMs', 'recent', 'streak', 'totals', 'wins'].sort()) ? true : J(Object.keys(p.stats)); })());
     add('schema/the-current-fixture-is-valid-and-a-fixed-point', (() => { const o = P.openProfileDocument(clone(FIX.cur), { deps: detDeps() }); return o.ok && !o.changed && o.problems.length === 0 && J(o.profile) === J(FIX.cur) ? true : J(o.problems.slice(0, 3)); })());
     // migration
     const mv = P.openProfileDocument(clone(FIX.v2), { deps: detDeps() });
-    add('migrate/v2-to-v3-golden', mv.ok && mv.migratedFrom === 2 && mv.changed === true && mv.problems.length === 0 && J(mv.profile) === J(FIX.v2exp) ? true : (mv.ok ? 'differs: ' + J(mv.profile.stats) : J(mv)));
+    add('migrate/v2-to-v4-golden', mv.ok && mv.migratedFrom === 2 && mv.changed === true && mv.problems.length === 0 && J(mv.profile) === J(FIX.v2exp) ? true : (mv.ok ? 'differs: ' + J(mv.profile.stats) : J(mv)));
     add('migrate/v2-counters-and-by-ruleset-survive-unchanged', mv.ok && J([mv.profile.stats.wins, mv.profile.stats.losses, mv.profile.stats.forfeits, mv.profile.stats.streak, mv.profile.stats.best, mv.profile.stats.lastMatchAt, mv.profile.stats.byRuleset]) === J([3, 1, 1, 2, 3, 1700000550000, { 'arena-gen3-standard+strict-champions': { w: 3, l: 1 } }]) ? true : 'lost');
-    add('migrate/the-chain-v1-to-v3-matches-the-hand-written-golden', (() => { const o = P.openProfileDocument(clone(FIX.v1full), { deps: detDeps() }); return o.ok && o.migratedFrom === 1 && J(o.profile) === J(FIX.v1fullExp) ? true : (o.ok ? 'differs' : J(o)); })());
+    add('migrate/the-chain-v1-to-v4-matches-the-hand-written-golden', (() => { const o = P.openProfileDocument(clone(FIX.v1full), { deps: detDeps() }); return o.ok && o.migratedFrom === 1 && J(o.profile) === J(FIX.v1fullExp) ? true : (o.ok ? 'differs' : J(o)); })());
     add('migrate/a-v2-document-that-already-had-a-v3-key-keeps-it-in-the-bag', (() => {
       const d = clone(FIX.v2); d.stats.totals = { surprise: 1 }; d.stats.recent = 'old note';
       const o = P.openProfileDocument(d, { deps: detDeps() });
       return o.ok && o.profile.stats._unknown && J(o.profile.stats._unknown.totals) === J({ surprise: 1 }) && o.profile.stats._unknown.recent === 'old note' && P.checkProfile(o.profile).length === 0 && o.profile.stats.totals.kos === 0 ? true : J(o).slice(0, 300);
     })());
     add('migrate/idempotent-and-a-fixed-point-after-one-pass', (() => { const a = P.openProfileDocument(clone(FIX.v2), { deps: detDeps() }); const b = P.openProfileDocument(clone(a.profile), { deps: detDeps() }); return b.ok && !b.changed && b.problems.length === 0 && J(b.profile) === J(a.profile) ? true : 'second pass changed'; })());
-    add('migrate/a-v4-document-is-read-only-and-untouched', (() => { const o = P.openProfileDocument(clone(FIX.fut), { deps: detDeps() }); return o.ok && o.readOnly === true && o.changed === false && J(o.profile) === J(FIX.fut) ? true : J(o).slice(0, 200); })());
+    add('migrate/a-v5-document-is-read-only-and-untouched', (() => { const o = P.openProfileDocument(clone(FIX.fut), { deps: detDeps() }); return o.ok && o.readOnly === true && o.changed === false && J(o.profile) === J(FIX.fut) ? true : J(o).slice(0, 200); })());
     // hostile stats, key by key: each case is applied to a valid v3 document; the result must open, be valid, repair or set aside only that key, and be a fixed point
     const cases = [
       ['firstMatchAt-text', (s) => { s.firstMatchAt = 'soon'; }], ['firstMatchAt-negative', (s) => { s.firstMatchAt = -1; }], ['playMs-float', (s) => { s.playMs = 1.5; }], ['playMs-missing', (s) => { delete s.playMs; }],
@@ -300,7 +452,7 @@ async function suite(M) {
       const rom = await import(pathToFileURL(path.join(JS, 'rom.js')).href);
       env.checksum = 'sha256:' + rom.sha256Hex(new TextEncoder().encode(canon(env.profile)));
       const r = await P.parseExport(JSON.stringify(env), {});
-      return r.ok && r.migratedFrom === 2 && r.profile.schemaVersion === 3 && r.profile.stats.wins === 3 && r.profile.stats.totals.kos === 0 ? true : J(r).slice(0, 300);
+      return r.ok && r.migratedFrom === 2 && r.profile.schemaVersion === 4 && r.profile.stats.wins === 3 && r.profile.stats.totals.kos === 0 ? true : J(r).slice(0, 300);
     })());
   });
 
@@ -392,9 +544,123 @@ async function suite(M) {
       await put(adapter, v2doc);
       const r = await store.recordMatch('p_old', mkMatch({ id: 'old1', at: 1800000000000 }));
       const hist = await store.listHistory('p_old');
-      add('store/an-old-v2-document-is-migrated-first-then-the-match-is-recorded', r.ok && r.saved.schemaVersion === 3 && r.saved.stats.wins === 4 && r.saved.stats.forfeits === 1 && r.saved.stats.totals.kos === 2 && hist.some((x) => x.reason === 'migration') ? true : J(r).slice(0, 300));
+      add('store/an-old-v2-document-is-migrated-first-then-the-match-is-recorded', r.ok && r.saved.schemaVersion === 4 && r.saved.stats.wins === 4 && r.saved.stats.forfeits === 1 && r.saved.stats.totals.kos === 2 && hist.some((x) => x.reason === 'migration') ? true : J(r).slice(0, 300));
       const gone = await open('gone');
       add('store/a-closed-store-says-so', await (async () => { await gone.store.close(); try { await gone.store.recordMatch('p', mkMatch()); return 'recorded'; } catch (e) { return e.code === 'store.closed' ? true : e.code; } })());
+    });
+
+    await blk('store-online', async () => {
+      const { store, adapter } = await open('online');
+      await put(adapter, docFor('p_on', { rev: 2 }));
+      const om = (o = {}) => mkMatch({ cpu: 'online', opp: 'Zed', id: 'seed1_3v3_AQ111_1', at: 1800000000000, ...o });
+      let r1; try { r1 = await store.recordMatch('p_on', om()); } catch (e) { r1 = { ok: false, error: e.code || String(e.message) }; }
+      const l1 = await store.loadProfile('p_on');
+      add('store/an-online-match-is-recorded-and-a-duplicate-writes-nothing', await (async () => {
+        if (!r1.ok) return 'recordMatch failed: ' + J(r1);
+        const r2 = await store.recordMatch('p_on', om());
+        const l2 = await store.loadProfile('p_on');
+        return r1.ok && !r1.duplicate && r1.saved.stats.byCpu.online.w === 1 && J([r1.saved.stats.byCpu.easy, r1.saved.stats.byCpu.normal, r1.saved.stats.byCpu.hard]) === J([FIX.cur.stats.byCpu.easy, FIX.cur.stats.byCpu.normal, FIX.cur.stats.byCpu.hard]) && r1.saved.stats.recent[0].opp === 'Zed' && l1.profile.stats.wins === 4 && l1.repaired === 0
+          && r2.duplicate === true && r2.saved === null && l2.profile.rev === l1.profile.rev ? true : J([r1, r2.duplicate, l2.profile.rev, l1.profile.rev]).slice(0, 300);
+      })());
+      add('store/a-bad-opponent-name-is-refused-and-writes-nothing', await (async () => { try { await store.recordMatch('p_on', om({ id: 'bad1', opp: '<script>' })); return 'accepted'; } catch (e) { return e.code === 'store.invalid' && (await store.loadProfile('p_on')).profile.rev === l1.profile.rev ? true : e.code; } })());
+      // a profile stored by the LAST build (schema 3) is upgraded the first time this one loads it: written back as v4, the v3 document kept in history, every value as it was
+      const v3doc = clone(FIX.v3); v3doc.id = 'p_v3'; v3doc.rev = 6;
+      await put(adapter, v3doc);
+      const up = await store.loadProfile('p_v3');
+      const hist = (await adapter.transact(['profileHistory'], 'readonly', (tx) => tx.list('profileHistory'))).filter((h) => h.id === 'p_v3');       // the stored entries (the list API returns summaries)
+      add('store/a-stored-v3-document-is-upgraded-to-v4-with-the-v3-kept-in-history', up.ok && up.migratedFrom === 3 && up.profile.schemaVersion === 4 && up.profile.rev === 7 && J(up.profile.stats.byCpu.online) === J({ w: 0, l: 0, dr: 0, f: 0 })
+        && up.profile.stats.wins === v3doc.stats.wins && J(up.profile.stats.recent) === J(v3doc.stats.recent) && hist.length === 1 && hist[0].reason === 'migration' && hist[0].doc.schemaVersion === 3 && J(hist[0].doc) === J(v3doc) ? true : J([up.ok, up.migratedFrom, up.profile && up.profile.rev, hist.map((h) => h.reason)]));
+      const r3 = await store.recordMatch('p_v3', om({ id: 'seed2_3v3_AQ111_1' }));
+      add('store/an-online-match-is-recorded-on-a-profile-that-was-just-upgraded', r3.ok && r3.saved.schemaVersion === 4 && r3.saved.stats.wins === v3doc.stats.wins + 1 && r3.saved.stats.byCpu.online.w === 1 ? true : J(r3).slice(0, 300));
+    });
+    // A PROFILE THAT CANNOT BE UPGRADED IS STILL READABLE. Schema 4 makes the write-back of every stored v3 profile mandatory on its first load; if that write fails (a full origin, an aborted
+    // transaction) loadProfile used to THROW, so the hub (hub_data catches and `continue`s) dropped the profile with its teams and Record, and a battle page found "no profile".
+    await blk('store-unsaved', async () => {
+      const dbName = 'career-unsaved-' + process.pid + '-' + (seq++);
+      const inner = S.createMemoryAdapter({ name: dbName });
+      let failing = null;                                   // null | 'quota' (every write) | 'once' (the next write only) | 'type' | 'store'
+      const wrapped = {
+        ...inner, kind: 'memory', durable: true, readOnly: false, open: () => inner.open(), close: () => inner.close(),
+        transact: (names, mode, fn) => {
+          if (failing && mode === 'readwrite') {
+            const why = failing; if (failing === 'once') failing = null;
+            if (why === 'type') return Promise.reject(new TypeError('a programming error'));
+            if (why === 'store') return Promise.reject(new S.ValidationError('refused by the store', []));
+            return Promise.reject(Object.assign(new Error('QuotaExceededError: the origin is full'), { name: 'QuotaExceededError' }));
+          }
+          return inner.transact(names, mode, fn);
+        },
+      };
+      const store = await S.openStore({ adapter: wrapped, channel: false, deps: detDeps(9), storage: null });
+      const v3 = (id) => { const d = clone(FIX.v3); d.id = id; d.rev = 6; return d; };
+      const raw = (id) => inner.transact(['profiles'], 'readonly', (tx) => tx.get('profiles', id));
+      const ld = (id) => store.loadProfile(id).catch((e) => ({ ok: false, threw: String(e && e.message ? e.message : e) }));
+      const hist = async (id) => (await inner.transact(['profileHistory'], 'readonly', (tx) => tx.list('profileHistory'))).filter((h) => h.id === id);
+      await put(inner, v3('p_full'));
+      failing = 'quota';
+      const a = await ld('p_full');
+      add('store/a-failed-write-back-of-the-upgrade-still-returns-the-profile-migrated-in-memory (not a throw)', a.ok === true && a.unsaved === true && a.readOnly === false && a.migratedFrom === 3 && a.profile.schemaVersion === 4 && a.profile.rev === 6
+        && J(a.profile.stats.byCpu.online) === J({ w: 0, l: 0, dr: 0, f: 0 }) && a.profile.stats.wins === v3('x').stats.wins && J(a.profile.stats.recent) === J(v3('x').stats.recent) && a.writeError && /QuotaExceeded/.test(a.writeError.message) ? true : J(a).slice(0, 300));
+      add('store/...and-the-stored-document-is-untouched-no-history-and-the-store-says-it-is-not-saving', J(await raw('p_full')) === J(v3('p_full')) && (await hist('p_full')).length === 0 && store.status.notSaved === true && /write-failed/.test(store.status.reason) ? true : J([store.status.notSaved, store.status.reason]));
+      add('store/...and-the-profile-is-listed-as-readable (the hub keeps it)', await (async () => { const l = (await store.listProfiles()).find((p) => p.id === 'p_full'); return l && !l.corrupt && !l.readOnly && l.schemaVersion === 3 && l.rev === 6 ? true : J(l); })());
+      add('store/a-save-from-that-in-memory-copy-works-once-writes-do (its rev is the stored rev)', await (async () => {
+        failing = null;
+        const saved = await store.saveProfile({ ...clone(a.profile), trainerName: 'FROMMEM' }, { reason: 'edit' });
+        const w = await raw('p_full');
+        return saved.rev === 7 && w.schemaVersion === 4 && w.trainerName === 'FROMMEM' && w.stats.wins === v3('x').stats.wins ? true : J([saved.rev, w.schemaVersion]);
+      })());
+      // retried later: the next load, with writes working again, does the upgrade (and keeps the v3 document in history, as always)
+      await put(inner, v3('p_retry'));
+      failing = 'quota';
+      const first = await ld('p_retry');
+      failing = null;
+      const second = await ld('p_retry');
+      const third = await ld('p_retry');
+      add('store/the-next-load-retries-the-write (upgraded, the v3 document in history) and a third load writes nothing more', first.unsaved === true && second.ok && !second.unsaved && second.migratedFrom === 3 && second.profile.rev === 7 && (await raw('p_retry')).schemaVersion === 4
+        && (await hist('p_retry')).length === 1 && (await hist('p_retry'))[0].reason === 'migration' && J((await hist('p_retry'))[0].doc) === J(v3('p_retry')) && third.profile.rev === 7 && !third.unsaved && third.migratedFrom === null ? true : J([first.unsaved, second.migratedFrom, second.profile && second.profile.rev, third.profile && third.profile.rev]));
+      // recording a battle on a profile that could not be upgraded records nothing and says why; the single write transaction would skip the migration's history entry
+      await put(inner, v3('p_rec'));
+      failing = 'once';
+      let rec = null; try { await store.recordMatch('p_rec', mkMatch({ cpu: 'online', opp: 'Zed', id: 'seedu_3v3_o1_ROOMU', at: 1800000000000 })); } catch (e) { rec = e; }
+      add('store/recording-a-battle-on-a-profile-that-could-not-be-upgraded-writes-nothing-and-reports-the-failure', rec && /QuotaExceeded/.test(rec.message) && J(await raw('p_rec')) === J(v3('p_rec')) && (await hist('p_rec')).length === 0 ? true : rec ? rec.message : 'recorded');
+      const later = await store.recordMatch('p_rec', mkMatch({ cpu: 'online', opp: 'Zed', id: 'seedu_3v3_o1_ROOMU', at: 1800000000000 }));
+      add('store/...and-the-same-battle-records-once-the-profile-has-been-upgraded', later.ok && !later.duplicate && later.saved.stats.byCpu.online.w === 1 && (await hist('p_rec')).length === 1 && (await hist('p_rec'))[0].doc.schemaVersion === 3 ? true : J(later).slice(0, 200));
+      // only a plain write failure is forgiven: a programming error or a refusal of the store itself still throws
+      await put(inner, v3('p_prog'));
+      failing = 'type';
+      const te = await store.loadProfile('p_prog').then(() => null, (e) => e);
+      failing = 'store';
+      const se = await store.loadProfile('p_prog').then(() => null, (e) => e);
+      failing = null;
+      add('store/a-programming-error-or-a-store-refusal-during-the-write-back-is-still-thrown (only a plain write failure is forgiven)', te instanceof TypeError && se instanceof S.ValidationError ? true : J([te && te.name, se && se.name]));
+    });
+
+    // TEAM BUILDER, "Keep my edits here": the save that deliberately overrides compare-and-swap writes the editor's WHOLE document, so the record that another tab wrote in the meantime must be carried over
+    await blk('store-keep-my-edits', async () => {
+      const scenario = async (tag, carry) => {
+        const a = await open('keep-' + tag), b = await a.second();           // a = the Team Builder tab, b = a tab where a battle finishes
+        await put(a.adapter, docFor('p_keep', { rev: 2 }));
+        const mine = (await a.store.loadProfile('p_keep')).profile;          // the editor opened the profile ...
+        const wrote = await b.recordMatch('p_keep', mkMatch({ cpu: 'online', opp: 'Zed', id: 'seedk_3v3_o1_ROOMK', at: 1800000000000 }));       // ... another tab recorded a battle ...
+        const edited = { ...clone(mine), trainerName: 'KEEPER' };
+        const refused = await a.store.saveProfile(edited, { reason: 'edit' }).then(() => null, (e) => e);          // ... and the editor's next save is refused
+        const cur = (await a.store.loadProfile('p_keep')).profile;             // "Keep my edits here": adopt the store's rev (editor_state 'rebase') ...
+        const next = { ...clone(edited), rev: cur.rev };
+        const saved = await a.store.saveProfile(carry ? carry(next, cur) : next, { reason: 'edit' });           // ... and save
+        return { wrote, refused, cur, saved, base: mine };
+      };
+      const kept = await scenario('with', (next, cur) => P.withStoredRecord(next, cur));
+      add('keep-my-edits/the-second-tab-really-did-record-a-battle-and-the-editors-save-was-refused', kept.refused && kept.refused.code === 'store.conflict' && kept.wrote.saved && kept.cur.stats.byCpu.online.w === 1 ? true : J([kept.refused && kept.refused.code, kept.cur.stats.byCpu.online]));
+      add('keep-my-edits/with-the-stored-record-carried-over-the-edit-is-saved-and-the-battle-survives', kept.saved.trainerName === 'KEEPER' && kept.saved.stats.byCpu.online.w === 1 && kept.saved.stats.wins === kept.base.stats.wins + 1 && kept.saved.stats.recent[0].id === 'seedk_3v3_o1_ROOMK' && J(kept.saved.stats) === J(kept.cur.stats) ? true : J([kept.saved.stats.wins, kept.saved.stats.byCpu.online, kept.saved.stats.recent.length]));
+      const lost = await scenario('without', null);
+      add('keep-my-edits/(without-it-the-same-steps-erase-the-battle: the scenario is real)', lost.saved.stats.byCpu.online.w === 0 && lost.saved.stats.wins === lost.base.stats.wins && lost.saved.stats.recent.every((r) => r.id !== 'seedk_3v3_o1_ROOMK') ? true : 'the battle survived without the fix');
+      const mineP = clone(FIX.cur), storedP = clone(FIX.cur); storedP.stats.wins += 5; storedP.trainerName = 'OTHER'; storedP.teams = [];
+      const frozen = JSON.stringify(mineP), frozenS = JSON.stringify(storedP);
+      const out = P.withStoredRecord(mineP, storedP);
+      out.stats.wins += 1; out.stats.recent.length = 0;
+      add('keep-my-edits/withStoredRecord-takes-only-the-record-from-the-stored-profile-and-shares-nothing', JSON.stringify(mineP) === frozen && JSON.stringify(storedP) === frozenS && P.withStoredRecord(mineP, storedP).trainerName === mineP.trainerName && J(P.withStoredRecord(mineP, storedP).teams) === J(mineP.teams) && J(P.withStoredRecord(mineP, storedP).stats) === J(storedP.stats) ? true : 'modified or shared');
+      const src = fs.readFileSync(path.join(M.dir, 'editor_app.js'), 'utf8');
+      add('keep-my-edits/the-Team-Builder-calls-it-in-keepMine-after-adopting-the-stored-rev (source check: the page needs a browser)', /import\s*\{[^}]*\bwithStoredRecord\b[^}]*\}\s*from '\.\/profile\.js'/.test(src) && /async keepMine\(\) \{[^\n]*type: 'rebase', rev: cur\.profile\.rev \}[^\n]*S = \{ \.\.\.S, profile: withStoredRecord\(S\.profile, cur\.profile\) \};[^\n]*await flush\(\)/.test(src) ? true : 'keepMine does not carry the stored record');
     });
     await blk('store-bc', async () => {
       // the broadcast
@@ -439,7 +705,7 @@ const battles = [];
 async function loadFrom(dir) {
   const u = (n) => import(pathToFileURL(path.join(dir, n)).href);
   const [P, S, C, MS] = await Promise.all([u('profile.js'), u('store.js'), u('career_stats.js'), u('match_stats.js')]);
-  return { P, S, C, MS, battles };
+  return { P, S, C, MS, battles, dir };
 }
 function copyJs(dest) { fs.mkdirSync(dest, { recursive: true }); for (const n of fs.readdirSync(JS)) { const s = path.join(JS, n); if (fs.statSync(s).isFile() && n.endsWith('.js')) fs.copyFileSync(s, path.join(dest, n)); } return dest; }
 
@@ -451,6 +717,39 @@ for (const [name, ok] of real) report(name, ok);
 console.log(`  ${real.length} checks (${((Date.now() - t0) / 1000).toFixed(1)} s)`);
 
 const MUTANTS = [
+  ['C30 an online match is counted under the NORMAL level', 'career_stats.js', "s.byCpu[m.cpu][REC_OF[res]] = sat(s.byCpu[m.cpu][REC_OF[res]], 1);", "s.byCpu[m.cpu === 'online' ? 'normal' : m.cpu][REC_OF[res]] = sat(s.byCpu[m.cpu === 'online' ? 'normal' : m.cpu][REC_OF[res]], 1);", ['online/an-online-match-counts-everywhere-and-in-its-own-row', 'online/the-three-cpu-levels-stay-at-zero']],
+  ['C31 the opponent is not kept in the recent list', 'career_stats.js', ", ...(m.cpu === 'online' ? { opp: m.opp } : {}) });", " });", ['online/the-recent-entry-names-the-opponent-and-a-cpu-entry-does-not']],
+  ['C32 an online match with no opponent name is recordable', 'career_stats.js', "if (m.cpu === 'online' ? !oppNameOk(m.opp) : hasOwn.call(m, 'opp')) return 'opp';", "if (m.cpu === 'online' ? false : hasOwn.call(m, 'opp')) return 'opp';", ['online/a-clean-opponent-name-is-required-and-only-for-online']],
+  ['C33 a CPU match may carry an opponent name', 'career_stats.js', "if (m.cpu === 'online' ? !oppNameOk(m.opp) : hasOwn.call(m, 'opp')) return 'opp';", "if (m.cpu === 'online' ? !oppNameOk(m.opp) : false) return 'opp';", ['online/a-clean-opponent-name-is-required-and-only-for-online']],
+  ['C34 any string is an opponent name', 'career_stats.js', "typeof v === 'string' && v.length >= 1 && v.length <= OPP_NAME_MAX && OPP_NAME_RE.test(v);", "typeof v === 'string';", ['online/a-clean-opponent-name-is-required-and-only-for-online', 'online/the-strict-check-ties-opp-to-online']],
+  ['C35 an opponent name may be any length', 'career_stats.js', "v.length >= 1 && v.length <= OPP_NAME_MAX && OPP_NAME_RE.test(v);", "v.length >= 1 && OPP_NAME_RE.test(v);", ['online/a-clean-opponent-name-is-required-and-only-for-online']],
+  ['C36 the strict check does not look at the opponent name', 'career_stats.js', "(r.cpu === 'online' ? oppNameOk(r.opp) : !hasOwn.call(r, 'opp'))", "true", ['online/the-strict-check-ties-opp-to-online']],
+  ['C37 the repair drops the opponent name from an entry it keeps', 'career_stats.js', "...(r.cpu === 'online' ? { opp: r.opp } : {}) }); } else dropped++;", " }); } else dropped++;", ['online/repair-drops-bad-online-entries-and-zeroes-a-junk-row']],
+  ['C38 the repair does not know the online row, so a record with online battles loses them on opening', 'career_stats.js', "for (const [name, ids] of [['byFormat', FORMAT_IDS], ['byCpu', OPP_IDS]]) {\n    const o = src[name];", "for (const [name, ids] of [['byFormat', FORMAT_IDS], ['byCpu', CPU_IDS]]) {\n    const o = src[name];", ['online/the-record-after-an-online-match-is-valid-and-is-a-fixed-point', 'online/repair-drops-bad-online-entries-and-zeroes-a-junk-row']],
+  ['C39 an online battle does not count in the overall wins', 'career_stats.js', "s[key] = sat(s[key], 1);", "if (m.cpu !== 'online') s[key] = sat(s[key], 1);", ['online/an-online-match-counts-everywhere-and-in-its-own-row', 'online/a-streak-and-the-totals-span-cpu-and-online']],
+  ['C40 the opponent is not carried from the summary into the match', 'career_stats.js', "...(ctx.cpu === 'online' ? { opp: ctx.opp } : {}), ruleset: ctx.ruleset,", "ruleset: ctx.ruleset,", ['online/a-real-battle-summary-becomes-an-online-match']],
+  ['P20 recordMatch refuses an online match', 'profile.js', "const why = matchIssue(match);", "const why = match && match.cpu === 'online' ? 'online' : matchIssue(match);", ['store/an-online-match-is-recorded-and-a-duplicate-writes-nothing']],
+  ['P21 there is no migration from schema 3', 'profile.js', "export const MIGRATIONS = Object.freeze({ 1: migrate1to2, 2: migrate2to3, 3: migrate3to4 });", "export const MIGRATIONS = Object.freeze({ 1: migrate1to2, 2: migrate2to3 });", ['store/a-stored-v3-document-is-upgraded-to-v4-with-the-v3-kept-in-history']],
+  ['C41 a win the opponent conceded can be the fastest win', 'career_stats.js', "if (res === 'w' && !m.conceded && (!s.bests.fastestWin", "if (res === 'w' && (!s.bests.fastestWin", ['conceded/a-walkover-at-0-turns-is-a-win-that-sets-no-best (fastest win, longest battle)', 'conceded/a-win-conceded-at-3-turns-never-replaces-the-fastest-win-9 and calls out nothing']],
+  ['C42 a conceded win is called out as the fastest win', 'career_stats.js', "if (res === 'w' && !m.conceded && before.bests.fastestWin", "if (res === 'w' && before.bests.fastestWin", ['conceded/a-win-conceded-at-3-turns-never-replaces-the-fastest-win-9 and calls out nothing']],
+  ['C43 a walkover can be the longest battle', 'career_stats.js', "if (!walkover && (!s.bests.longest", "if ((!s.bests.longest", ['conceded/a-walkover-at-0-turns-is-a-win-that-sets-no-best (fastest win, longest battle)', 'conceded/a-walkover-(1 turn)-does-not-lengthen-a-longest-battle-of-0-turns-and-calls-out-only-the-first-win']],
+  ['C44 a walkover is called out as the longest battle', 'career_stats.js', "if (had && !walkover && before.bests.longest", "if (had && before.bests.longest", ['conceded/a-walkover-(1 turn)-does-not-lengthen-a-longest-battle-of-0-turns-and-calls-out-only-the-first-win']],
+  ['C45 the match does not say the opponent conceded', 'career_stats.js', "    ...(summary.result === 'w' && summary.endedBy === 'forfeit' ? { conceded: true } : {}),\n", "", ['conceded-real/the-opponent-leaving-at-the-team-preview-is-a-win-with-0-turns-that-the-record-flags']],
+  ['C46 the player who left is flagged as well', 'career_stats.js', "summary.result === 'w' && summary.endedBy === 'forfeit'", "summary.endedBy === 'forfeit'", ['conceded-real/...and-the-one-who-left-is-a-forfeit-with-no-flag (at the team preview)']],
+  ['C47 a conceded flag on anything but a win is accepted', 'career_stats.js', "if (hasOwn.call(m, 'conceded') && !(m.conceded === true && m.result === 'w')) return 'conceded';", "", ['conceded/the-flag-is-true-and-only-on-a-win (anything else is refused with the reason)']],
+  ['C48 a walkover may last two turns', 'career_stats.js', "export const WALKOVER_MAX_TURNS = 1;", "export const WALKOVER_MAX_TURNS = 2;", ['conceded/the-walkover-limit-is-one-turn (turn 0 = preview, turn 1 = the first choice and any replacement after it; no second turn)']],
+  ['C52 a walkover is only a conceded win at turn 0 (the first choice already counts as played)', 'career_stats.js', "export const WALKOVER_MAX_TURNS = 1;", "export const WALKOVER_MAX_TURNS = 0;", ['conceded/the-walkover-limit-is-one-turn (turn 0 = preview, turn 1 = the first choice and any replacement after it; no second turn)', 'conceded/a-walkover-(1 turn)-does-not-lengthen-a-longest-battle-of-0-turns-and-calls-out-only-the-first-win']],
+  ['C53 a walkover is decided by what was played (a faint means a move was), not by the turn count', 'career_stats.js', "export const isWalkover = (m) => isConceded(m) && m.turns <= WALKOVER_MAX_TURNS;", "export const isWalkover = (m) => isConceded(m) && m.turns <= WALKOVER_MAX_TURNS && m.me.faints === 0 && m.foeFaints === 0;", ['conceded-real/...and-it-IS-a-walkover-by-the-turn-count (a move was played: the rule counts turns, not moves), so it sets neither the fastest win nor the longest battle']],
+  ['C49 the online id ignores the room', 'career_stats.js', "String(room || '').slice(0, 8)", "''", ['online-id/each-part-changes-it (a rematch, another room, another seed, another format)']],
+  ['C50 the online id ignores the match number', 'career_stats.js', "'_o' + mn + '_'", "'_o1_'", ['online-id/each-part-changes-it (a rematch, another room, another seed, another format)']],
+  ['C51 the online id ignores the seed', 'career_stats.js', "return String(seed >>> 0) + '_'", "return '0_'", ['online-id/each-part-changes-it (a rematch, another room, another seed, another format)']],
+  ['S41 a failed write-back of the upgrade makes the profile unreadable again (the hub drops it)', 'store.js', "return { ok: true, profile: opened.profile, readOnly: false, migratedFrom: opened.migratedFrom,", "throw e; return { ok: true, profile: opened.profile, readOnly: false, migratedFrom: opened.migratedFrom,", ['store/a-failed-write-back-of-the-upgrade-still-returns-the-profile-migrated-in-memory (not a throw)', 'store/the-next-load-retries-the-write (upgraded, the v3 document in history) and a third load writes nothing more']],
+  ['S42 a programming error during the write-back is forgiven as a write failure', 'store.js', "if (e instanceof StoreError || e instanceof TypeError || e instanceof RangeError || e instanceof ReferenceError || e instanceof SyntaxError) throw e;", "", ['store/a-programming-error-or-a-store-refusal-during-the-write-back-is-still-thrown (only a plain write failure is forgiven)']],
+  ['S43 recording a battle goes on after the profile could not be upgraded', 'store.js', "if (l.unsaved) throw l.writeError;", "", ['store/recording-a-battle-on-a-profile-that-could-not-be-upgraded-writes-nothing-and-reports-the-failure']],
+  ['S44 the in-memory copy of an unsaved upgrade is flagged read-only', 'store.js', "quarantined: opened.quarantined, unsaved: true, writeError: e };", "quarantined: opened.quarantined, unsaved: true, writeError: e, readOnly: true };", ['store/a-failed-write-back-of-the-upgrade-still-returns-the-profile-migrated-in-memory (not a throw)']],
+  ['P22 keeping my edits carries over the stale record (the stored one is ignored)', 'profile.js', "  return { ...mine, stats: clone(stored.stats) };", "  return { ...mine };", ['keep-my-edits/with-the-stored-record-carried-over-the-edit-is-saved-and-the-battle-survives', 'keep-my-edits/withStoredRecord-takes-only-the-record-from-the-stored-profile-and-shares-nothing']],
+  ['P23 the carried-over record is shared with the stored profile', 'profile.js', "  return { ...mine, stats: clone(stored.stats) };", "  return { ...mine, stats: stored.stats };", ['keep-my-edits/withStoredRecord-takes-only-the-record-from-the-stored-profile-and-shares-nothing']],
+  ['E01 the Team Builder does not carry the stored record when it keeps its edits', 'editor_app.js', " S = { ...S, profile: withStoredRecord(S.profile, cur.profile) };", "", ['keep-my-edits/the-Team-Builder-calls-it-in-keepMine-after-adopting-the-stored-rev (source check: the page needs a browser)']],
   ['C01 a repeated match id is folded again', 'career_stats.js', "if (s.recent.some((r) => r.id === m.id))", "if (false)", ['fold/the-same-match-id-twice-changes-nothing']],
   ['C02 a loss does not end the streak', 'career_stats.js', "} else s.streak = 0;", "} else { /* streak kept */ }", ['fold/a-loss-resets-the-streak-and-keeps-the-best']],
   ['C03 a forfeit is counted as a loss', 'career_stats.js', "{ w: 'wins', l: 'losses', d: 'draws', f: 'forfeits' }", "{ w: 'wins', l: 'losses', d: 'draws', f: 'losses' }", ['fold/a-forfeit-is-a-forfeit-not-a-loss']],
@@ -467,9 +766,9 @@ const MUTANTS = [
   ['C14 the win rate rounds down', 'career_stats.js', "return n === 0 ? null : Math.floor((200 * s.wins + n) / (2 * n));", "return n === 0 ? null : Math.floor((100 * s.wins) / n);", ['match/win-rate-rounds-half-up-and-is-null-before-the-first-battle']],
   ['C15 a tie replaces the old best', 'career_stats.js', "if (m.me.biggestHit && (!s.bests.hit || m.me.biggestHit.dmg > s.bests.hit.dmg))", "if (m.me.biggestHit && (!s.bests.hit || m.me.biggestHit.dmg >= s.bests.hit.dmg))", ['fold/a-tie-is-not-a-record']],
   ['C16 unknown keys of the record are dropped instead of kept', 'career_stats.js', "if (Object.keys(tr).length) { setOwn(rejected, 'totals', tr);", "if (false) { setOwn(rejected, 'totals', tr);", ['repair/unknown-extra-keys-of-the-record-are-kept-in-the-bag-not-lost']],
-  ['P01 the migration leaves the new keys out', 'profile.js', "      setOwn(o.stats, k, fresh[k]);", "", ['migrate/v2-to-v3-golden']],
+  ['P01 the migration leaves the new keys out', 'profile.js', "      setOwn(o.stats, k, fresh[k]);", "", ['migrate/v2-to-v4-golden']],
   ['P02 a merge takes the file\'s record', 'profile.js', "  const p = clone(existing);\n  p.updatedAt = now;", "  const p = clone(existing);\n  p.stats = clone(incoming.stats);\n  p.updatedAt = now;", ['import/merge-leaves-the-record-exactly-as-it-is']],
-  ['P03 the current version is still 2', 'profile.js', "export const SCHEMA_VERSION = 3;", "export const SCHEMA_VERSION = 2;", ['schema/current-version-is-3']],
+  ['P03 the current version is still 3', 'profile.js', "export const SCHEMA_VERSION = 4;", "export const SCHEMA_VERSION = 3;", ['schema/current-version-is-4']],
     ['P05 repair puts nothing in the unknown bag', 'profile.js', "    if (Object.keys(car.rejected).length) bag = mergeBag(bag, { careerRejected: car.rejected });", "", ['repair/unknown-extra-keys-of-the-record-are-kept-in-the-bag-not-lost']],
   ['P06 replace keeps the old record', 'profile.js', "    report.record = 'replaced';", "    p.stats = clone(existing.stats);\n    report.record = 'replaced';", ['import/replace-takes-the-files-record']],
   ['S01 a battle makes a history entry', 'store.js', "if (exists && !history && valid) {", "if (false) {", ['store/battles-make-no-history-entries-so-edits-stay-recoverable']],

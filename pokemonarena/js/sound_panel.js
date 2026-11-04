@@ -167,7 +167,7 @@ export function createSoundPanel(opts = {}) {
       h('h3', { id: 'snd-st-h' }, 'Soundtrack'),
       seg, refs.stProgress, refs.stStatus,
       h('div', { class: 'snd-foot' },
-        h('p', { class: 'snd-tip' }, 'The M key mutes and unmutes on any page. Every song and sound is read from the ROM in your browser. The starting levels (70 / 60 / 80%) play the music as loud as the real game does.'),
+        h('p', { class: 'snd-tip' }, 'The M key mutes and unmutes on any page. Every song and sound is read from the ROM in your browser. A new visitor starts at Master 50%; 70 / 60 / 80% play the music as loud as the real game does.'),
         closeBtn('close2'))));
     // a click on the dimmed backdrop (not on the dialog) closes it, as every other dialog of the game does
     el.addEventListener('mousedown', (e) => { if (e.target === el) api.close(); });

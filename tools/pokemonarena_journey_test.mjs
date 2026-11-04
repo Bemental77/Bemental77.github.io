@@ -355,7 +355,9 @@ async function journey(vp, port) {
     const errs = errsOf(page);
     ok(errs.length === 0, tag + 'the whole journey raised no page errors and no console errors', errs.slice(0, 3).join(' | '));
     const lg = await page.eval('window.__audioLog');
-    ok(lg.ctor === 0 && lg.start === 0, tag + 'sound stayed off: no AudioContext was created and nothing started (the double counted ' + J(lg) + ')');
+    // UPDATED DELIBERATELY: the page now TRIES to start the sound at load (mixer earlyStart), so a context may exist before any gesture; the double (pokemonarena_hub_lib.mjs AUDIO_DOUBLE) emulates the browser's
+    // autoplay policy and keeps it suspended until a real user activation, which a controller is not (these runs have no real input). What must hold is that nothing STARTED: no source, no running context.
+    ok(lg.ctor <= 1 && lg.start === 0, tag + 'sound stayed off: at most the one context tried at load (suspended) and nothing started (the double counted ' + J(lg) + ')');
   });
 }
 

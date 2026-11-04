@@ -700,7 +700,9 @@ async function journeyV(dev, page) {
   const before = await page.eval(`window.__arenaSound.testPlays`);
   await vpress('[data-snd="test"]'); await sleep(250);
   const after = await page.eval(`window.__arenaSound.testPlays`);
-  if (dev.family === 'gamepad') ok(after === before && (await page.eval('window.__audioLog.ctor')) === 0, dev.tag('V: the Test button is reachable; with no AudioContext (a controller cannot start one) it plays nothing and breaks nothing'), J({ before, after }));
+  // UPDATED DELIBERATELY: the page now TRIES to start the sound at load (mixer earlyStart), so a context may exist before any gesture; the double (pokemonarena_hub_lib.mjs AUDIO_DOUBLE) emulates the browser's
+  // autoplay policy and keeps it suspended until a real user activation, which a controller is not (these runs have no real input). What must hold is that nothing STARTED: no source, no running context.
+  if (dev.family === 'gamepad') ok(after === before && (await page.eval('window.__audioLog.ctor')) <= 1 && (await page.eval('window.__audioLog.start')) === 0, dev.tag('V: the Test button is reachable; with the context still suspended (a controller cannot start one) it plays nothing and breaks nothing'), J({ before, after }));
   else ok(after === before + 1 && (await page.eval('window.__audioLog.start')) >= 1, dev.tag('V: the Test button plays a cry through the mixer'), J({ before, after }));
   // the soundtrack choice: SoulGold (already selected) is pressed; Ultra Violet is only REACHED (keyboard / controller), pointers can see it
   await vpress('[data-snd="soundtrack-soulgold"]'); await sleep(150);
@@ -727,7 +729,7 @@ async function journeyV(dev, page) {
     await page.waitFor(`!${HUB}.dialogOpen()`, { timeoutMs: 8000 });
   }
   const lg = await page.eval('window.__audioLog || {}');
-  if (dev.family === 'gamepad') ok((lg.ctor || 0) === 0, dev.tag('V: a controller alone created NO AudioContext (a pad button is not a user activation)'), J(lg));
+  if (dev.family === 'gamepad') ok((lg.ctor || 0) <= 1 && (lg.start || 0) === 0, dev.tag('V: a controller alone started NO audio (the one context tried at load stayed suspended: a pad button is not a user activation)'), J(lg));
   else ok((lg.ctor || 0) === 1, dev.tag('V: this device\'s first key / click / tap created exactly one AudioContext'), J(lg));
 }
 
@@ -1051,7 +1053,7 @@ async function runFamily(family, port, ctx) {
     ok(errs.length === 0, dev.tag('no console or page error in the whole run'), errs.slice(0, 3).join(' | '));
     const lg = await page.eval('window.__audioLog || {}').catch(() => ({}));
     // MU3: sound is ON by default now (the first key / click / tap creates the one AudioContext), so "stayed off" became: a controller alone never starts audio, and no page ever makes more than one context
-    if (family === 'gamepad') ok(!lg || (lg.ctor || 0) === 0 && (lg.start || 0) === 0, dev.tag('sound: a controller alone never starts audio (a pad button is not a user activation): no AudioContext was created and nothing started'), J(lg));
+    if (family === 'gamepad') ok(!lg || (lg.ctor || 0) <= 1 && (lg.start || 0) === 0, dev.tag('sound: a controller alone never starts audio (a pad button is not a user activation): at most the one context tried at load, still suspended, and nothing started'), J(lg));
     else ok(!lg || (lg.ctor || 0) <= 1, dev.tag('sound: at most one AudioContext per page (the first key / click / tap created it)'), J(lg));
     results.counters = c;
   });

@@ -56,12 +56,14 @@ export function reapLeaks() { spawnSync(process.execPath, [path.join(root, 'tool
 
 /* ------------------------------------------------------------------------------- test doubles (installed before any page script runs) */
 // An AudioContext that can never reach a device: it counts what the page asks of it. window.__audioLog is the log.
+// IT EMULATES THE BROWSER'S AUTOPLAY POLICY (the pages now try to start the sound at load): a context stays 'suspended' until the page has had a user activation (navigator.userActivation.hasBeenActive,
+// true after any real CDP input) unless window.__autoplayAllowed is true (?autoplay=1 in the address: the site may autoplay). The old double resumed at once, which no real visitor's browser does.
 export const AUDIO_DOUBLE = `(() => {
   const log = { ctor: 0, createBuffer: 0, createBufferSource: 0, start: 0, resume: 0, gain: 0, rates: [] };
-  window.__audioLog = log;
+  window.__audioLog = log; window.__autoplayAllowed = /[?&]autoplay=1/.test(location.search);
   class FakeCtx {
     constructor() { log.ctor++; this.state = 'suspended'; this.currentTime = 0; this.destination = {}; }
-    resume() { log.resume++; this.state = 'running'; return Promise.resolve(); }
+    resume() { log.resume++; const nav = navigator, active = !!(nav.userActivation && nav.userActivation.hasBeenActive); if (!window.__autoplayAllowed && !active) { log.blocked = (log.blocked || 0) + 1; return Promise.resolve(); } this.state = 'running'; return Promise.resolve(); }
     suspend() { this.state = 'suspended'; return Promise.resolve(); }
     createBuffer(ch, len, rate) { log.createBuffer++; log.rates.push(rate); const d = new Float32Array(len); return { duration: len / rate, getChannelData: () => d }; }
     createBufferSource() { log.createBufferSource++; return { buffer: null, playbackRate: { value: 1 }, connect() {}, disconnect() {}, start() { log.start++; }, stop() {}, onended: null }; }

@@ -4,6 +4,10 @@
 // Pure ES module (browser + Node 24): no DOM, no IndexedDB, no clock (the caller passes `at`), no ROM. profile.js imports this module (schema version 3);
 // store.js applies `foldMatch` inside one read-write transaction (store.recordMatch); battle_boot.js builds the match with `matchFromSummary`.
 //
+// SCHEMA 4 (online play). A battle against a PERSON is kept like any other: it counts in wins / losses / streaks / totals / bests / favourites and in byFormat, and it has its own
+// row in byCpu (`online`, next to easy / normal / hard) and its own kind of entry in `recent` (cpu 'online' plus `opp`, the other player's name as lib-safe text). Nothing else changed:
+// a schema-3 record migrates by gaining byCpu.online = zeros (profile.js migrate3to4).
+//
 // WHAT IS KEPT (profile.stats, schema 3). The first eight keys are the schema-2 ones and keep their meaning:
 //   wins losses draws forfeits   whole battles by how they ended, from the player's side. A battle the player gave up with FORFEIT is a forfeit (not a loss).
 //   streak best                  the current run of consecutive wins and the longest run ever (a loss, a draw or a forfeit ends the run)
@@ -12,14 +16,22 @@
 //   -- schema 3 --
 //   firstMatchAt                 ms of the first recorded match, null before it
 //   playMs                       the battles' own clock: frames played / 59.7275 Hz, in ms (a battle left open on the result screen costs nothing)
-//   byFormat byCpu               {3v3|6v6: {w, l, dr, f}} and {easy|normal|hard: {w, l, dr, f}}  (wins, losses, draws, forfeits)
+//   byFormat byCpu               {3v3|6v6: {w, l, dr, f}} and {easy|normal|hard|online: {w, l, dr, f}}  (wins, losses, draws, forfeits; `online` = schema 4: a battle against a person)
 //   totals                       turns kos faints dealt taken hits crits superEffective resisted noEffect misses statusInflicted healed switches
 //   bests                        hit {sp, mv, dmg, pct, vs, at} (the biggest single attack ever), fastestWin {turns, at}, longest {turns, at}, koStreak
 //   fav                          species / moves / mvps: {id: count}, each capped (CAREER_LIMITS); beyond the cap the least-used entry is replaced
 //                                (the "space saving" rule: the newcomer takes over its count + 1, so a kept count is never below the truth)
-//   recent                       the last 20 matches, newest first: {id, at, fmt, cpu, res, turns, mvp, team}
+//   recent                       the last 20 matches, newest first: {id, at, fmt, cpu, res, turns, mvp, team}  (+ `opp`, the opponent's name, exactly when cpu is 'online')
 // Every counter is a non-negative safe integer and saturates at Number.MAX_SAFE_INTEGER; every map and list is bounded, so the document stays small.
 // IDEMPOTENCE. A match carries an id; if `recent` already holds it the fold changes nothing (a replay, a double fire, a second tab cannot count a match twice).
+// CONCEDED WINS AND WALKOVERS (online play: only a person can leave). A win the OPPONENT handed over (it left, ran out of time, lost its link or pressed FORFEIT) carries `conceded: true`
+// (matchFromSummary sets it from the engine's own account of how the battle ended). It is a win in every counter, but it is not a fast win: it never sets `bests.fastestWin` (nor calls
+// out 'fastest'), whatever the turn. A WALKOVER is a conceded win in which no SECOND turn had begun: summary.turns is 0 or 1 (WALKOVER_MAX_TURNS). It is not a long battle either, so it
+// never sets `bests.longest` (nor calls out 'longest'). Without this the first stranger to leave at the preview wrote "FASTEST WIN 0 TURNS" that nothing could ever beat.
+// THE RULE COUNTS TURNS, NOT MOVES. Turn 0 is the team preview and turn 1 begins when the first choice is asked for, so the usual walkover is a battle in which nothing was played (the
+// opponent left at the preview or at the first choice). It is not always: the engine opens turn 2 only after turn 1 has resolved AND a Pokemon that fainted in it has been replaced, so an
+// opponent who leaves at that forced-switch prompt concedes a battle that already had moves and a faint in it, still at turns = 1, and that is a walkover here too (measured on the real
+// engine: pokemonarena_career_test.mjs, section conceded-real). The numbers cannot be hurt by this: a 1-turn battle can only ever "beat" a longest battle of 0 turns.
 
 const MAX = Number.MAX_SAFE_INTEGER;
 const TIME_MAX = 8.64e15;
@@ -32,7 +44,26 @@ const KEY_RE = /^[1-9][0-9]{0,4}$/;
 export const CAREER_LIMITS = Object.freeze({ recentMax: 20, speciesMax: 24, movesMax: 24, mvpMax: 12, teamMax: 6, turnsMax: 100000, dmgMax: 99999, playMsMatchMax: 86400000, koStreakMax: 100 });
 export const FORMAT_IDS = Object.freeze(['3v3', '6v6']);
 export const CPU_IDS = Object.freeze(['easy', 'normal', 'hard']);
+/** Whom a battle was against, as the record keeps it: one of the three CPU levels, or 'online' (a person). byCpu has exactly these keys (schema 4). */
+export const OPP_IDS = Object.freeze([...CPU_IDS, 'online']);
+export const OPP_NAME_MAX = 10;
+// the opponent's name as netmatch.cleanName leaves it: ASCII letters, digits and . ' _ ! ? - with single inner spaces, 1 to 10 characters, nothing at either end
+const OPP_NAME_RE = /^[A-Za-z0-9.'_!?-]+(?: [A-Za-z0-9.'_!?-]+)*$/;
+export const oppNameOk = (v) => typeof v === 'string' && v.length >= 1 && v.length <= OPP_NAME_MAX && OPP_NAME_RE.test(v);
 export const RESULT_IDS = Object.freeze(['w', 'l', 'd', 'f']);
+/** A conceded win with at most this many turns is a WALKOVER: no second turn had begun (turn 0 = the team preview, turn 1 = the first choice and, if a Pokemon fainted in it, the replacement prompt that follows). Usually nothing was played; the rule counts turns, not moves (see the header). */
+export const WALKOVER_MAX_TURNS = 1;
+/** True for a win the opponent handed over (see the header). */
+export const isConceded = (m) => !!m && m.result === 'w' && m.conceded === true;
+/** True for a conceded win in which no second turn had begun (turns <= WALKOVER_MAX_TURNS): normally one in which no move was played, but decided by the turn count alone. */
+export const isWalkover = (m) => isConceded(m) && m.turns <= WALKOVER_MAX_TURNS;
+/**
+ * The id of a battle against a person, as the record keeps it: the agreed seed, the format, the match number (a rematch counts on) and the first 8 characters of the room code.
+ * It is built only from what BOTH a first run and a page reloaded into the same match agree on, so a reload that replays a match, or a second tab, folds to the same id (idempotence).
+ */
+export function onlineMatchId({ seed, fmt, mn, room }) {
+  return String(seed >>> 0) + '_' + fmt + '_o' + mn + '_' + String(room || '').slice(0, 8);
+}
 export const TOTAL_KEYS = Object.freeze(['turns', 'kos', 'faints', 'dealt', 'taken', 'hits', 'crits', 'superEffective', 'resisted', 'noEffect', 'misses', 'statusInflicted', 'healed', 'switches']);
 export const CAREER_KEYS = Object.freeze(['firstMatchAt', 'playMs', 'byFormat', 'byCpu', 'totals', 'bests', 'fav', 'recent']);
 const REC_KEYS = ['w', 'l', 'dr', 'f'];                       // 'dr' (not 'd'): a lone "d" member is what a private JWK looks like, and the export scanners (and the tests) look for exactly that
@@ -41,13 +72,13 @@ const FAV_KEYS = ['species', 'moves', 'mvps'];
 const FAV_CAP = { species: CAREER_LIMITS.speciesMax, moves: CAREER_LIMITS.movesMax, mvps: CAREER_LIMITS.mvpMax };
 const BEST_KEYS = ['hit', 'fastestWin', 'longest', 'koStreak'];
 const HIT_KEYS = ['sp', 'mv', 'dmg', 'pct', 'vs', 'at'];
-const RECENT_KEYS = ['id', 'at', 'fmt', 'cpu', 'res', 'turns', 'mvp', 'team'];
+const RECENT_KEYS = ['id', 'at', 'fmt', 'cpu', 'res', 'turns', 'mvp', 'team'];                 // + 'opp' for an online entry
 
 const rec0 = () => ({ w: 0, l: 0, dr: 0, f: 0 });
 export function emptyCareer() {
   return {
     firstMatchAt: null, playMs: 0,
-    byFormat: { '3v3': rec0(), '6v6': rec0() }, byCpu: { easy: rec0(), normal: rec0(), hard: rec0() },
+    byFormat: { '3v3': rec0(), '6v6': rec0() }, byCpu: { easy: rec0(), normal: rec0(), hard: rec0(), online: rec0() },
     totals: Object.fromEntries(TOTAL_KEYS.map((k) => [k, 0])),
     bests: { hit: null, fastestWin: null, longest: null, koStreak: 0 },
     fav: { species: {}, moves: {}, mvps: {} },
@@ -69,8 +100,8 @@ function favOk(m, cap) {
   return ks.length <= cap && ks.every((k) => KEY_RE.test(k) && isInt(Number(k), 1, 65535) && isInt(m[k], 1, MAX));
 }
 export function recentOk(r) {
-  return isObj(r) && Object.keys(r).length === 8 && RECENT_KEYS.every((k) => hasOwn.call(r, k))
-    && typeof r.id === 'string' && ID_RE.test(r.id) && isInt(r.at, 0, TIME_MAX) && FORMAT_IDS.includes(r.fmt) && CPU_IDS.includes(r.cpu) && RESULT_IDS.includes(r.res)
+  return isObj(r) && Object.keys(r).length === (r.cpu === 'online' ? 9 : 8) && RECENT_KEYS.every((k) => hasOwn.call(r, k)) && (r.cpu === 'online' ? oppNameOk(r.opp) : !hasOwn.call(r, 'opp'))
+    && typeof r.id === 'string' && ID_RE.test(r.id) && isInt(r.at, 0, TIME_MAX) && FORMAT_IDS.includes(r.fmt) && OPP_IDS.includes(r.cpu) && RESULT_IDS.includes(r.res)
     && isInt(r.turns, 0, CAREER_LIMITS.turnsMax) && isInt(r.mvp, 0, 65535)
     && Array.isArray(r.team) && r.team.length <= CAREER_LIMITS.teamMax && r.team.every((x) => isInt(x, 1, 65535));
 }
@@ -80,7 +111,7 @@ export function checkCareer(s, add) {
   const bad = (path, why) => add('profile.stats', 'stats.' + path, `${path} ${why}`);
   if (!(s.firstMatchAt === null || isInt(s.firstMatchAt, 0, TIME_MAX))) bad('firstMatchAt', 'must be null or a non-negative integer');
   if (!isInt(s.playMs, 0, MAX)) bad('playMs', 'must be a non-negative integer');
-  for (const [name, ids] of [['byFormat', FORMAT_IDS], ['byCpu', CPU_IDS]]) {
+  for (const [name, ids] of [['byFormat', FORMAT_IDS], ['byCpu', OPP_IDS]]) {
     const o = s[name];
     if (!isObj(o) || Object.keys(o).length !== ids.length || !ids.every((k) => recOk(o[k]))) bad(name, `must hold exactly ${ids.join(', ')}, each {w, l, dr, f} of non-negative integers`);
   }
@@ -116,7 +147,7 @@ export function normalizeCareer(src, P, loud) {
   if (src.firstMatchAt === null || isInt(src.firstMatchAt, 0, TIME_MAX)) out.firstMatchAt = src.firstMatchAt; else if (src.firstMatchAt !== undefined) rep('firstMatchAt', 'invalid; set to null', src.firstMatchAt); else rep('firstMatchAt', 'missing; set to null');
   if (isInt(src.playMs, 0, MAX)) out.playMs = src.playMs; else rep('playMs', 'missing or invalid; set to 0', src.playMs);
   // by format / by cpu
-  for (const [name, ids] of [['byFormat', FORMAT_IDS], ['byCpu', CPU_IDS]]) {
+  for (const [name, ids] of [['byFormat', FORMAT_IDS], ['byCpu', OPP_IDS]]) {
     const o = src[name];
     if (!isObj(o)) { rep(name, 'missing or invalid; zeroed', o); if (o !== undefined) setOwn(rejected, name, o); continue; }
     const [good, rest] = keep(o, ids);
@@ -165,7 +196,7 @@ export function normalizeCareer(src, P, loud) {
     let dropped = 0;
     for (const r of src.recent) {
       if (out.recent.length >= CAREER_LIMITS.recentMax) { dropped++; continue; }
-      if (recentOk(r) && !seen.has(r.id)) { seen.add(r.id); out.recent.push({ id: r.id, at: r.at, fmt: r.fmt, cpu: r.cpu, res: r.res, turns: r.turns, mvp: r.mvp, team: r.team.slice() }); } else dropped++;
+      if (recentOk(r) && !seen.has(r.id)) { seen.add(r.id); out.recent.push({ id: r.id, at: r.at, fmt: r.fmt, cpu: r.cpu, res: r.res, turns: r.turns, mvp: r.mvp, team: r.team.slice(), ...(r.cpu === 'online' ? { opp: r.opp } : {}) }); } else dropped++;
     }
     if (dropped) rep('recent', `${dropped} entr${dropped === 1 ? 'y' : 'ies'} dropped (malformed, repeated or over the limit of ${CAREER_LIMITS.recentMax})`);
   } else rep('recent', 'missing or invalid; emptied', src.recent);
@@ -175,7 +206,7 @@ export function normalizeCareer(src, P, loud) {
 /* ---------------------------------------------------------------------------------------------- one finished match */
 
 /**
- * The match as the career wants it. `summary` = match_stats.summarizeMatch(...) output; ctx = { id, at, fmt, cpu, ruleset, playMs }.
+ * The match as the career wants it. `summary` = match_stats.summarizeMatch(...) output; ctx = { id, at, fmt, cpu, ruleset, playMs } (+ opp, the other player's name, when cpu is 'online').
  * `team` = the species of every Pokemon the player brought (those that took part first); species = those that took part.
  */
 export function matchFromSummary(summary, ctx) {
@@ -184,7 +215,8 @@ export function matchFromSummary(summary, ctx) {
   const played = me.mons.filter((m) => m.switchIns > 0);
   const bh = me.biggestHit;
   return {
-    id: ctx.id, at: ctx.at, fmt: ctx.fmt, cpu: ctx.cpu, ruleset: ctx.ruleset, result: summary.result, turns: summary.turns, playMs: ctx.playMs,
+    id: ctx.id, at: ctx.at, fmt: ctx.fmt, cpu: ctx.cpu, ...(ctx.cpu === 'online' ? { opp: ctx.opp } : {}), ruleset: ctx.ruleset, result: summary.result, turns: summary.turns, playMs: ctx.playMs,
+    ...(summary.result === 'w' && summary.endedBy === 'forfeit' ? { conceded: true } : {}),
     mvp: summary.mvp ? summary.mvp.sp : 0,
     team: me.mons.map((m) => m.sp),
     species: played.map((m) => m.sp),
@@ -204,8 +236,10 @@ export function matchIssue(m) {
   if (typeof m.id !== 'string' || !ID_RE.test(m.id)) return 'id';
   if (!isInt(m.at, 0, TIME_MAX)) return 'at';
   if (!FORMAT_IDS.includes(m.fmt)) return 'fmt';
-  if (!CPU_IDS.includes(m.cpu)) return 'cpu';
+  if (!OPP_IDS.includes(m.cpu)) return 'cpu';
+  if (m.cpu === 'online' ? !oppNameOk(m.opp) : hasOwn.call(m, 'opp')) return 'opp';       // the opponent's name goes with an online match, and only with one
   if (!RESULT_IDS.includes(m.result)) return 'result';
+  if (hasOwn.call(m, 'conceded') && !(m.conceded === true && m.result === 'w')) return 'conceded';       // only a WIN can be conceded by the opponent, and the flag is there only when it was
   if (!isInt(m.turns, 0, CAREER_LIMITS.turnsMax)) return 'turns';
   if (!isInt(m.playMs, 0, CAREER_LIMITS.playMsMatchMax)) return 'playMs';
   if (!isInt(m.mvp, 0, 65535)) return 'mvp';
@@ -250,6 +284,7 @@ export function foldMatch(stats, m, byRulesetId) {
   const before = JSON.parse(JSON.stringify(stats));
   const had = battleCount(before) > 0;
   const res = m.result;
+  const walkover = isWalkover(m);
   const key = { w: 'wins', l: 'losses', d: 'draws', f: 'forfeits' }[res];
   s[key] = sat(s[key], 1);
   if (res === 'w') { s.streak = sat(s.streak, 1); if (s.streak > s.best) s.best = s.streak; } else s.streak = 0;
@@ -267,18 +302,18 @@ export function foldMatch(stats, m, byRulesetId) {
   const callouts = [];
   if (res === 'w' && before.wins === 0) callouts.push({ kind: 'first-win', n: 1 });
   if (res === 'w' && s.streak > before.best && s.streak >= 2) callouts.push({ kind: 'streak', n: s.streak });
-  if (res === 'w' && before.bests.fastestWin && m.turns < before.bests.fastestWin.turns) callouts.push({ kind: 'fastest', n: m.turns });
+  if (res === 'w' && !m.conceded && before.bests.fastestWin && m.turns < before.bests.fastestWin.turns) callouts.push({ kind: 'fastest', n: m.turns });
   if (m.me.biggestHit && before.bests.hit && m.me.biggestHit.dmg > before.bests.hit.dmg) callouts.push({ kind: 'hit', n: m.me.biggestHit.dmg });
-  if (had && before.bests.longest && m.turns > before.bests.longest.turns) callouts.push({ kind: 'longest', n: m.turns });
+  if (had && !walkover && before.bests.longest && m.turns > before.bests.longest.turns) callouts.push({ kind: 'longest', n: m.turns });
   if (before.bests.koStreak > 0 && m.me.koStreak > before.bests.koStreak) callouts.push({ kind: 'ko-streak', n: m.me.koStreak });
   if (m.me.biggestHit && (!s.bests.hit || m.me.biggestHit.dmg > s.bests.hit.dmg)) s.bests.hit = { ...m.me.biggestHit, at: m.at };
-  if (res === 'w' && (!s.bests.fastestWin || m.turns < s.bests.fastestWin.turns)) s.bests.fastestWin = { turns: m.turns, at: m.at };
-  if (!s.bests.longest || m.turns > s.bests.longest.turns) s.bests.longest = { turns: m.turns, at: m.at };
+  if (res === 'w' && !m.conceded && (!s.bests.fastestWin || m.turns < s.bests.fastestWin.turns)) s.bests.fastestWin = { turns: m.turns, at: m.at };
+  if (!walkover && (!s.bests.longest || m.turns > s.bests.longest.turns)) s.bests.longest = { turns: m.turns, at: m.at };
   if (m.me.koStreak > s.bests.koStreak) s.bests.koStreak = m.me.koStreak;
   for (const sp of Array.from(new Set(m.species)).sort((a, b) => a - b)) bumpFav(s.fav.species, sp, 1, FAV_CAP.species);
   for (const [mv, n] of m.moves.slice().sort((a, b) => a[0] - b[0])) bumpFav(s.fav.moves, mv, n, FAV_CAP.moves);
   if (m.mvp) bumpFav(s.fav.mvps, m.mvp, 1, FAV_CAP.mvps);
-  s.recent.unshift({ id: m.id, at: m.at, fmt: m.fmt, cpu: m.cpu, res, turns: m.turns, mvp: m.mvp, team: m.team.slice() });
+  s.recent.unshift({ id: m.id, at: m.at, fmt: m.fmt, cpu: m.cpu, res, turns: m.turns, mvp: m.mvp, team: m.team.slice(), ...(m.cpu === 'online' ? { opp: m.opp } : {}) });
   s.recent = s.recent.slice(0, CAREER_LIMITS.recentMax);
   return { stats: s, duplicate: false, callouts };
 }

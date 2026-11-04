@@ -1,5 +1,9 @@
 #!/usr/bin/env node
-// tools/pokemonarena_sound_level_test.mjs -- LOUDNESS: does a first-time player, at the default sliders, hear the music at the level the REAL game plays it?
+// tools/pokemonarena_sound_level_test.mjs -- LOUDNESS: does a player at the UNITY sliders (master 0.7, music 0.6: audio_mixer.js UNITY), hear the music at the level the REAL game plays it?
+//
+// UPDATED DELIBERATELY (the user: "play music as soon as you join, but at half volume on the slider"): a first-time visitor now starts at Master 0.5 (AM.DEFAULTS.master), which is UNDER the
+// game's level on purpose (gain (0.5/0.7)^2 = 0.51, -5.85 dB). The calibration claim below (the engine at gain 1.0 IS the real game's level) is therefore asserted at the UNITY positions, where it has always
+// been true, and the new starting volume is asserted separately (a quiet start: -5.85 dB, within 0.3 dB, and quieter than the unity median). Until this change UNITY and DEFAULTS were the same numbers.
 //
 //   node tools/pokemonarena_sound_level_test.mjs               # needs the SoulGold ROM (and the Ultra Violet ROM for its half); SKIPPED LOUDLY (counted) when absent
 //
@@ -39,7 +43,7 @@ const peak = (x, s = 0, n = x.length - s) => { let m = 0; for (let i = 0; i < n;
 const median = (a) => { const s = a.slice().sort((x, y) => x - y); const n = s.length; return n % 2 ? s[(n - 1) >> 1] : (s[n / 2 - 1] + s[n / 2]) / 2; };
 
 /** the arena's sink for a rendered signal: the default (or given) slider positions -> bus gains -> the soft limiter */
-function sinkOf(mono, { master = AM.DEFAULTS.master, music = AM.DEFAULTS.music, gain = AM.gainFor, limiter = true } = {}) {
+function sinkOf(mono, { master = AM.UNITY.master, music = AM.UNITY.music, gain = AM.gainFor, limiter = true } = {}) {
   const g = gain(master, 'master') * gain(music, 'music'); const out = new Float32Array(mono.length);
   for (let i = 0; i < mono.length; i++) { const v = mono[i] * g; out[i] = limiter ? AM.limit(v) : v; }
   return out;
@@ -60,13 +64,13 @@ const SONGS = { soulgold: ['hub', 'editor', 'preview', 'battle_normal', 'battle_
 const rows = [], rigs = {};
 for (const [st, which] of [['soulgold', 'sg'], ['ultraviolet', 'uv']]) {
   if (!MO.romAvailable(which)) { console.log('SKIP (counted): the ' + st + ' ROM is not present; its songs were not measured'); C.ok(true, 'SKIPPED: no ' + st + ' ROM'); continue; }
-  head('the ' + st + ' soundtrack: the real game (mGBA) vs the arena at the DEFAULT sliders (master ' + AM.DEFAULTS.master + ', music ' + AM.DEFAULTS.music + ')');
+  head('the ' + st + ' soundtrack: the real game (mGBA) vs the arena at the UNITY sliders (master ' + AM.UNITY.master + ', music ' + AM.UNITY.music + ')');
   const rig = await MO.openRig(which); rigs[st] = rig;
   for (const key of SONGS[st]) {
     const rec = MAP.songFor(st, key); const m = await measure(rig, st + ':' + key + ' (song ' + rec.index + ')', rec.index);
-    const def = m.at({}), old = m.at({ gain: (v) => v * v, limiter: false }), loud = m.at({ master: 1, music: 1 });
+    const def = m.at({}), old = m.at({ gain: (v) => v * v, limiter: false }), loud = m.at({ master: 1, music: 1 }), start = m.at({ master: AM.DEFAULTS.master, music: AM.DEFAULTS.music });
     const d = db(def.rms / m.gameRms);
-    rows.push({ ...m, st, key, def, old, loud, d });
+    rows.push({ ...m, st, key, def, old, loud, d, start });
     console.log('   ' + m.label.padEnd(30) + 'game rms ' + m.gameRms.toFixed(4) + ' peak ' + m.gamePk.toFixed(3) + ' | arena@default rms ' + def.rms.toFixed(4) + ' peak ' + def.peak.toFixed(3) + ' (' + (d >= 0 ? '+' : '') + d.toFixed(2) + ' dB) | old law ' + db(old.rms / m.gameRms).toFixed(1) + ' dB | sliders 100% ' + (db(loud.rms / m.gameRms) >= 0 ? '+' : '') + db(loud.rms / m.gameRms).toFixed(1) + ' dB');
   }
 }
@@ -74,15 +78,22 @@ if (!rows.length) { C.finish(); process.exit(0); }
 
 head('checks');
 for (const r of rows) {
-  C.ok(Math.abs(r.d) <= TOL[r.st].rms, 'level: ' + r.label + ': the arena at the default sliders is ' + (r.d >= 0 ? '+' : '') + r.d.toFixed(2) + ' dB from the real game (tolerance +-' + TOL[r.st].rms + ' dB)', J({ game: r.gameRms, arena: r.def.rms }));
+  C.ok(Math.abs(r.d) <= TOL[r.st].rms, 'level: ' + r.label + ': the arena at the unity sliders is ' + (r.d >= 0 ? '+' : '') + r.d.toFixed(2) + ' dB from the real game (tolerance +-' + TOL[r.st].rms + ' dB)', J({ game: r.gameRms, arena: r.def.rms }));
   C.ok(Math.abs(db(r.def.peak / r.gamePk)) <= TOL[r.st].peak, 'level: ' + r.label + ': PEAK ' + r.def.peak.toFixed(3) + ' vs the game\'s ' + r.gamePk.toFixed(3) + ' (' + db(r.def.peak / r.gamePk).toFixed(2) + ' dB, tolerance +-' + TOL[r.st].peak + ' dB: a peak depends on the exact notes the two renders place)');
-  C.ok(Math.abs(db(r.def.rms / r.engineRms)) < 0.001, 'level: ' + r.label + ': the default sliders pass the music through at EXACTLY gain 1.0 (the limiter does not touch it: its peak ' + r.def.peak.toFixed(3) + ' is under the 0.8 knee)');
+  C.ok(Math.abs(db(r.def.rms / r.engineRms)) < 0.001, 'level: ' + r.label + ': the unity sliders pass the music through at EXACTLY gain 1.0 (the limiter does not touch it: its peak ' + r.def.peak.toFixed(3) + ' is under the 0.8 knee)');
 }
 const sgRows = rows.filter((r) => r.st === 'soulgold'), medSg = median(sgRows.map((r) => r.d));
 C.ok(sgRows.length === 0 || Math.abs(medSg) <= TOL_MEDIAN_DB, 'level: the MEDIAN of the ' + sgRows.length + ' SoulGold songs (the default soundtrack) is ' + medSg.toFixed(2) + ' dB from the real game (tolerance +-' + TOL_MEDIAN_DB + ' dB)');
 const med = median(rows.map((r) => r.d));
 C.ok(Math.abs(med) <= TOL_MEDIAN_DB, 'level: the MEDIAN of all the ' + rows.length + ' songs is ' + (med >= 0 ? '+' : '') + med.toFixed(2) + ' dB from the real game (tolerance +-' + TOL_MEDIAN_DB + ' dB)');
-C.ok(rows.every((r) => r.def.rms > 0.02), 'level: no song reaches the sink below RMS 0.02 at the defaults (FV1\'s old defaults: 0.009-0.015); the quietest is ' + Math.min(...rows.map((r) => r.def.rms)).toFixed(3));
+// THE NEW STARTING VOLUME: Master 0.5 with music and effects at unity. Quiet on purpose: -5.85 dB from the game's level, still audible, and the same for every song (the gain is one number).
+{
+  const want = db(AM.gainFor(AM.DEFAULTS.master, 'master') * AM.gainFor(AM.DEFAULTS.music, 'music')), startD = rows.map((r) => db(r.start.rms / r.gameRms)), medStart = median(startD);
+  C.ok(Math.abs(AM.DEFAULTS.master - 0.5) < 1e-9 && Math.abs(want - 20 * Math.log10((0.5 / 0.7) ** 2)) < 1e-9 && Math.abs(want + 5.85) < 0.01, 'start: a first-time visitor starts at Master 0.5 (' + want.toFixed(2) + ' dB re the real game by the gain law)');
+  C.ok(Math.abs(medStart - want) < 0.3 && medStart < median(rows.map((r) => r.d)) - 5, 'start: the MEDIAN of the ' + rows.length + ' songs at the starting volume is ' + medStart.toFixed(2) + ' dB from the real game (the law says ' + want.toFixed(2) + ', tolerance 0.3 dB) and well under the unity level');
+  C.ok(rows.every((r) => r.start.rms > 0.01), 'start: no song is inaudible at the starting volume (RMS above 0.01; the quietest is ' + Math.min(...rows.map((r) => r.start.rms)).toFixed(3) + ')');
+}
+C.ok(rows.every((r) => r.def.rms > 0.02), 'level: no song reaches the sink below RMS 0.02 at the unity sliders (FV1\'s old defaults: 0.009-0.015); the quietest is ' + Math.min(...rows.map((r) => r.def.rms)).toFixed(3));
 
 head('negative controls: the SAME comparison must fail');
 {
@@ -122,7 +133,7 @@ head('headroom: music + sound effects together, at the defaults and at the top o
     for (let i = 0; i < mix.length; i++) mus[i] = m[Math.min(m.length - 1, pk - 16384 + i)];
     for (let i = 0; i < mix.length; i++) fxs[i] = mix[i] - mus[i];
     const chain = (pos, limiter) => { const gm = AM.gainFor(pos.master, 'master'), gmu = AM.gainFor(pos.music, 'music'), gf = AM.gainFor(pos.fx, 'fx'); let p = 0; for (let i = 0; i < mix.length; i++) { const v = (mus[i] * gmu + fxs[i] * gf) * gm; const o = limiter ? AM.limit(v) : v; if (Math.abs(o) > p) p = Math.abs(o); } return p; };
-    const D = { master: AM.DEFAULTS.master, music: AM.DEFAULTS.music, fx: AM.DEFAULTS.fx }, X = { master: 1, music: 1, fx: 1 };
+    const D = { master: AM.UNITY.master, music: AM.UNITY.music, fx: AM.UNITY.fx }, X = { master: 1, music: 1, fx: 1 };
     const rd = { def: chain(D, true), defNo: chain(D, false), max: chain(X, true), maxNo: chain(X, false) };
     if (rd.max > worst.max) { worst.max = rd.max; which = key; }
     worst.def = Math.max(worst.def, rd.def); worst.defNoLimiter = Math.max(worst.defNoLimiter, rd.defNo); worst.maxNoLimiter = Math.max(worst.maxNoLimiter, rd.maxNo);

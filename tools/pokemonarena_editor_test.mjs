@@ -319,6 +319,65 @@ add('state/mon/remove-reorder-duplicate', (c) => {
     rejected(full.s, go(c, full.ctx, full.s, { type: 'monDuplicate', teamId: full.teamId, monId: full.monIds[0] }), 'team.full', 'duplicate into a full team')].find((x) => x !== true) || true;
 });
 
+add('state/team/sort-orders-the-members-by-type-name-or-dex-in-one-undo-step', (c) => {
+  // Pikachu (Electric), Charizard (Fire/Flying), Bulbasaur (Grass/Poison), Charmander (Fire), Magikarp (Water), Pidgey (Normal/Flying)
+  const f = withMons(c, [25, 6, 1, 4, 129, 16]);
+  const species = (s) => s.profile.teams[0].monIds.map((id) => monOf(s, id).species);
+  const want = { type: [16, 4, 6, 129, 1, 25], name: [1, 6, 4, 129, 16, 25], dex: [1, 4, 6, 16, 25, 129] };
+  for (const by of ['type', 'name', 'dex']) {
+    const t = go(c, f.ctx, f.s, { type: 'teamSort', teamId: f.teamId, by });
+    if (t.error) return by + ': ' + J(t.error);
+    if (J(species(t)) !== J(want[by])) return by + ' order ' + J(species(t)) + ', wanted ' + J(want[by]);
+    if (J(t.profile.teams[0].monIds.slice().sort()) !== J(f.monIds.slice().sort()) || t.profile.box !== f.s.profile.box) return by + ': the sort changed which Pokemon are on the team or rebuilt the box';
+    if (t.undo.length !== f.s.undo.length + 1 || t.seq !== f.s.seq + 1) return by + ': one edit, one undo step';
+    const u = go(c, f.ctx, t, { type: 'undo' });
+    if (J(u.profile.teams[0].monIds) !== J(f.monIds)) return by + ': undo does not restore the order';
+  }
+  const lab = go(c, f.ctx, f.s, { type: 'teamSort', teamId: f.teamId, by: 'type' });
+  return lab.undo[lab.undo.length - 1].label === 'sort Pokemon' ? true : 'undo label ' + lab.undo[lab.undo.length - 1].label;
+});
+add('state/team/sort-keeps-equal-pokemon-in-the-order-they-had', (c) => {
+  const f = withMons(c, [25, 25, 6, 25], { teamRuleset: STD });
+  const [a, b, ch, d] = f.monIds;
+  const t = go(c, f.ctx, f.s, { type: 'teamSort', teamId: f.teamId, by: 'type' });
+  if (t.error) return J(t.error);
+  if (J(t.profile.teams[0].monIds) !== J([ch, a, b, d])) return 'order ' + J(t.profile.teams[0].monIds) + ', wanted ' + J([ch, a, b, d]);
+  const n = go(c, f.ctx, t, { type: 'teamSort', teamId: f.teamId, by: 'name' });
+  return J(n.profile.teams[0].monIds) === J([ch, a, b, d]) ? true : 'a second sort moved equal Pokemon ' + J(n.profile.teams[0].monIds);
+});
+add('state/team/sort-rejects-bad-input-and-a-sorted-team-is-not-an-edit', (c) => {
+  const f = withMons(c, [25, 6, 1]);
+  const sorted = go(c, f.ctx, f.s, { type: 'teamSort', teamId: f.teamId, by: 'type' });
+  const again = go(c, f.ctx, sorted, { type: 'teamSort', teamId: f.teamId, by: 'type' });
+  if (again.error || again.profile !== sorted.profile || again.seq !== sorted.seq || again.undo !== sorted.undo || !again.notice || again.notice.code !== 'team.in-order') return 'a team already in order: ' + J(again.error || again.notice);
+  const bad = [rejected(f.s, go(c, f.ctx, f.s, { type: 'teamSort', teamId: f.teamId, by: 'power' }), 'sort.unknown', 'unknown sort'),
+    rejected(f.s, go(c, f.ctx, f.s, { type: 'teamSort', teamId: f.teamId }), 'sort.unknown', 'no sort'),
+    rejected(f.s, go(c, f.ctx, f.s, { type: 'teamSort', teamId: 'nope', by: 'type' }), 'team.missing', 'unknown team'),
+    rejected(f.s, c.S.reduce(f.s, { type: 'teamSort', teamId: f.teamId, by: 'type' }, { deps: f.ctx.deps }), 'ctx.pack', 'no ROM tables')];
+  return bad.find((x) => x !== true) || true;
+});
+add('state/team/sort-says-what-it-did-in-both-outcomes', (c) => {
+  // The screen shows nothing else of a sort (the button the person pressed is replaced), so BOTH outcomes carry a notice, which the page puts in its live region:
+  // 'team.sorted' names the new order, 'team.in-order' says nothing moved. The notice is data (a reducer result), not DOM, so it is checked here.
+  // Charizard nicknamed: the screen shows the nickname, so the announcement does too. Pikachu, Charizard, Bulbasaur, Charmander, Magikarp, Pidgey as in the sort check above.
+  const f = withMons(c, [25, 6, 1, 4, 129, 16]);
+  const named = go(c, f.ctx, f.s, { type: 'monSet', monId: f.monIds[1], field: 'nickname', value: 'Blaze' });
+  if (named.error) return 'nickname: ' + J(named.error);
+  const want = { type: 'sorted by type: Pidgey, Charmander, Blaze, Magikarp, Bulbasaur, Pikachu', name: 'sorted by name: Bulbasaur, Blaze, Charmander, Magikarp, Pidgey, Pikachu', dex: 'sorted by pokedex number: Bulbasaur, Charmander, Blaze, Pidgey, Pikachu, Magikarp' };
+  for (const by of ['type', 'name', 'dex']) {
+    const t = go(c, f.ctx, named, { type: 'teamSort', teamId: f.teamId, by });
+    if (t.error || !t.notice || t.notice.code !== 'team.sorted' || t.notice.message !== want[by]) return by + ': notice ' + J(t.error || t.notice) + ', wanted ' + want[by];
+    const again = go(c, f.ctx, t, { type: 'teamSort', teamId: f.teamId, by });
+    const how = want[by].split(':')[0].replace('sorted by ', '');
+    if (again.error || !again.notice || again.notice.code !== 'team.in-order' || again.notice.message !== `the team is already sorted by ${how}`) return by + ': already-sorted notice ' + J(again.error || again.notice);
+    if (again.profile !== t.profile) return by + ': an already sorted team changed the profile object';
+  }
+  // a following edit does not carry the old notice along
+  const t = go(c, f.ctx, named, { type: 'teamSort', teamId: f.teamId, by: 'type' });
+  const next = go(c, f.ctx, t, { type: 'teamRename', teamId: f.teamId, name: 'OTHER' });
+  return next.notice === null && !next.error ? true : 'a later edit kept the sort notice: ' + J(next.notice);
+});
+
 // ================================ state: single-field edits
 add('state/field/level-clamps-integers-and-rejects-everything-else', (c) => {
   const f = withMons(c, [PIKACHU]);
@@ -936,7 +995,7 @@ add('state/robustness/fuzz-invariants', (c) => {
       () => ({ type: 'evSet', monId: mon.id, stat: pick(stats), value: junk(), mode: pick(['ev', 'points']), coalesce: rng() < 0.3 ? 'k' : undefined }),
       () => ({ type: 'ivSet', monId: mon.id, stat: pick(stats), value: junk() }), () => ({ type: 'ivPreset', monId: mon.id, preset: pick(['all31', 'all0', 'zeroAtk', 'hp:Fire', 'hp:Dark', 'bad']) }),
       () => ({ type: 'moveSet', monId: mon.id, slot: pick([0, 1, 2, 3, 4, junk()]), moveId: pick([junk(), 1 + Math.floor(rng() * 900), null]) }),
-      () => ({ type: 'teamCreate', ruleset: pick(PRESETS) }), () => ({ type: 'teamDelete', teamId: team.id }), () => ({ type: 'teamDuplicate', teamId: team.id }), () => ({ type: 'teamMove', teamId: team.id, to: junk() }),
+      () => ({ type: 'teamCreate', ruleset: pick(PRESETS) }), () => ({ type: 'teamDelete', teamId: team.id }), () => ({ type: 'teamDuplicate', teamId: team.id }), () => ({ type: 'teamMove', teamId: team.id, to: junk() }), () => ({ type: 'teamSort', teamId: team.id, by: pick(['dex', 'name', 'type', 'power', junk()]) }),
       () => ({ type: 'teamRuleset', teamId: team.id, ruleset: pick(PRESETS) }), () => ({ type: 'teamConform', teamId: team.id }), () => ({ type: 'evSnap', monId: mon.id }), () => ({ type: 'evReset', monId: mon.id }),
       () => ({ type: 'undo' }), () => ({ type: 'redo' }), () => ({ type: 'boxCleanup' }), () => ({ type: 'rename', name: pick(['RED', 'BLUE', '', 'A{B', 'WAYTOOLONGNAME']) }),
     ])();
@@ -1014,6 +1073,163 @@ add('data/search/banned-species-sort-last-and-are-marked-unavailable', (c) => {
   const rows = ids.map((id) => c.D.speciesRow(pack, id, R));
   const firstBad = rows.findIndex((r) => !r.available);
   return ids.includes(PIKACHU) && rows[rows.length - 1].id === PIKACHU && !rows[rows.length - 1].available && firstBad === rows.length - 1 ? true : 'ban handling ' + J(rows.map((r) => [r.id, r.available]));
+});
+
+// ---- sorting and filtering the Pokemon list by type (editor_data.js speciesSearch opts.sort / opts.type, speciesComparator, speciesTypeChoices)
+add('data/search/sort-dex-is-the-old-order-and-the-default', (c) => {
+  const D = c.D;
+  const R = clone(c.R.resolveRuleset(STD)); R.banned.species = [CHARIZARD, PIKACHU, 150];            // ascending: rules.js refuses an unsorted ban list
+  const ex = D.speciesExclusions(pack, R);
+  // the order the editor always had, worked out here from the table: Pokedex number, then ROM entry id; the species the rules leave out come last in the same order
+  const ids = pack.roster.slice().sort((a, b) => pack.species[a].natDex - pack.species[b].natDex || a - b);
+  const want = ids.filter((id) => !ex.has(id)).concat(ids.filter((id) => ex.has(id)));
+  for (const o of [undefined, {}, { sort: 'dex' }, { sort: 'nonsense' }, { sort: undefined, type: '' }, { type: null }, { sort: 'dex', type: undefined }]) {
+    if (J(D.speciesSearch(pack, '', R, o)) !== J(want)) return 'the order differs for options ' + J(o);
+  }
+  if (J(D.speciesSearch(pack, '', R, { unavailable: 'hide', sort: 'dex' })) !== J(want.filter((id) => !ex.has(id)))) return 'hide + dex';
+  const q = D.speciesSearch(pack, 'fire', R);
+  return J(q) === J(want.filter((id) => q.includes(id))) ? true : 'a query keeps the order';
+});
+add('data/search/sort-by-name', (c) => {
+  const D = c.D;
+  const ex = D.speciesExclusions(pack, STD);
+  const ids = D.speciesSearch(pack, '', STD, { sort: 'name' });
+  if (ids.length !== pack.roster.length || new Set(ids).size !== ids.length || J(ids.slice().sort((a, b) => a - b)) !== J(pack.roster.slice().sort((a, b) => a - b))) return 'not every species exactly once';
+  const groups = [ids.filter((id) => !ex.has(id)), ids.filter((id) => ex.has(id))];
+  if (J(ids) !== J(groups[0].concat(groups[1]))) return 'the species the rules leave out are not last';
+  let ties = 0;
+  for (const g of groups) for (let i = 1; i < g.length; i++) {
+    const a = pack.species[g[i - 1]], b = pack.species[g[i]];
+    const cmp = a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+    if (cmp > 0) return 'names out of order at ' + i + ': ' + a.name + ' before ' + b.name;
+    if (cmp === 0) { ties++; if (a.natDex > b.natDex || (a.natDex === b.natDex && g[i - 1] > g[i])) return 'a shared name is not in dex order: ' + a.name; }
+  }
+  return ties > 50 ? true : 'expected the alternate forms to share names (' + ties + ' ties)';
+});
+add('data/search/sort-by-type-uses-the-first-then-the-second-type-in-rom-order', (c) => {
+  const D = c.D;
+  const ex = D.speciesExclusions(pack, STD);
+  const ids = D.speciesSearch(pack, '', STD, { sort: 'type' });
+  if (ids.length !== pack.roster.length || new Set(ids).size !== ids.length || J(ids.slice().sort((a, b) => a - b)) !== J(pack.roster.slice().sort((a, b) => a - b))) return 'not every species exactly once';
+  const groups = [ids.filter((id) => !ex.has(id)), ids.filter((id) => ex.has(id))];
+  if (J(ids) !== J(groups[0].concat(groups[1]))) return 'the species the rules leave out are not last';
+  // the key, worked out from the table: [first type, second type (0 when the Pokemon has one type), Pokedex number, ROM entry id]
+  const key = (id) => { const t = pack.species[id].types; return [t[0], t[0] === t[1] ? 0 : t[1], pack.species[id].natDex, id]; };
+  for (const g of groups) for (let i = 1; i < g.length; i++) {
+    const a = key(g[i - 1]), b = key(g[i]);
+    for (let k = 0; k < 4; k++) { if (a[k] < b[k]) break; if (a[k] > b[k]) return 'out of order at ' + i + ': ' + g[i - 1] + ' ' + J(a) + ' before ' + g[i] + ' ' + J(b); }
+  }
+  // anchors that do not use the key above: Charmander is Fire only, Charizard Fire/Flying, Bulbasaur Grass/Poison, Pikachu Electric, Squirtle Water; the game lists Normal first
+  const a = groups[0], at = (id) => a.indexOf(id);
+  const t = (id) => pack.species[id].types.join();
+  if (t(4) !== '11,11' || t(6) !== '11,3' || t(1) !== '13,4' || t(25) !== '14,14' || t(7) !== '12,12') return 'the anchors are not the Pokemon this check thinks they are';
+  if (!(at(4) < at(6) && at(6) < at(7) && at(7) < at(1) && at(1) < at(25))) return 'Fire, Fire/Flying, Water, Grass/Poison, Electric are not in that order: ' + J([4, 6, 7, 1, 25].map(at));
+  const firstTypes = pack.species[a[0]].types;
+  if (firstTypes[0] !== 1 || firstTypes[1] !== 1) return 'the list does not start with a Normal-only Pokemon: ' + J(firstTypes);
+  // a one-type Pokemon comes before every two-type Pokemon that shares its first type
+  for (const tp of [1, 11, 12, 13, 14]) {
+    const mine = a.filter((id) => pack.species[id].types[0] === tp);
+    const lastMono = Math.max(...mine.map((id, i) => (pack.species[id].types[1] === tp ? i : -1))), firstDual = mine.findIndex((id) => pack.species[id].types[1] !== tp);
+    if (firstDual >= 0 && lastMono > firstDual) return 'a one-type Pokemon comes after a two-type one for first type ' + tp;
+  }
+  return true;
+});
+add('data/search/type-filter-keeps-the-pokemon-with-that-type-in-either-slot', (c) => {
+  const D = c.D;
+  const base = D.speciesSearch(pack, '', STD, { unavailable: 'hide' });
+  const choices = D.speciesTypeChoices(pack);
+  for (const [tid, name] of choices) {
+    for (const v of [tid, String(tid)]) {
+      const got = D.speciesSearch(pack, '', STD, { unavailable: 'hide', type: v });
+      const want = base.filter((id) => pack.species[id].types.includes(tid));
+      if (J(got) !== J(want)) return 'type ' + name + ' (' + J(v) + '): ' + got.length + ' kept, wanted ' + want.length;
+      if (!got.length) return 'type ' + name + ' keeps nothing';
+    }
+  }
+  const fire = D.speciesSearch(pack, '', STD, { type: 11 }), flying = D.speciesSearch(pack, '', STD, { type: 3 });
+  if (!fire.includes(CHARIZARD) || !flying.includes(CHARIZARD)) return 'a Fire/Flying Pokemon is in both the Fire and the Flying lists';
+  if (fire.includes(1) || flying.includes(25)) return 'Bulbasaur is not Fire, Pikachu is not Flying';
+  // the filter and the search text are both applied
+  const pika = D.speciesSearch(pack, 'pika', STD);
+  if (J(D.speciesSearch(pack, 'pika', STD, { type: 14 })) !== J(pika.filter((id) => pack.species[id].types.includes(14))) || !D.speciesSearch(pack, 'pika', STD, { type: 14 }).includes(PIKACHU)) return 'search + Electric';
+  if (D.speciesSearch(pack, 'pika', STD, { type: 11 }).length !== 0) return 'search "pika" + Fire should be empty';
+  // a value that is not a type id changes nothing; a real id nobody has ("???") keeps nothing
+  const all = D.speciesSearch(pack, '', STD);
+  for (const v of ['zzz', 99, -1, 1.5, NaN, {}, []]) if (J(D.speciesSearch(pack, '', STD, { type: v })) !== J(all)) return 'the filter value ' + J(v) + ' should be ignored';
+  if (D.speciesSearch(pack, '', STD, { type: 10 }).length !== 0) return 'type 10 (???) keeps something';
+  // the filter and a sort compose: filter then sort
+  const sorted = D.speciesSearch(pack, '', STD, { sort: 'type' });
+  return J(D.speciesSearch(pack, '', STD, { sort: 'type', type: 11 })) === J(sorted.filter((id) => pack.species[id].types.includes(11))) ? true : 'filter + sort';
+});
+add('data/search/type-choices-are-the-roster-types-in-rom-order', (c) => {
+  const D = c.D;
+  const ch = D.speciesTypeChoices(pack);
+  const used = new Set(); for (const id of pack.roster) for (const t of pack.species[id].types) used.add(t);
+  const want = [...used].sort((a, b) => a - b).map((id) => [id, pack.types[id].name]);
+  if (J(ch) !== J(want)) return J(ch);
+  const names = ch.map((x) => x[1]).join(',');
+  return ch.length === 18 && names === 'Normal,Fighting,Flying,Poison,Ground,Rock,Bug,Ghost,Steel,Fire,Water,Grass,Electric,Psychic,Ice,Dragon,Dark,Fairy' ? true : 'names ' + names;
+});
+add('data/search/sort-comparators-handle-unknown-ids-and-unknown-sorts', (c) => {
+  const D = c.D;
+  for (const by of ['dex', 'name', 'type']) {
+    const cmp = D.speciesComparator(pack, by);
+    if (!(cmp(99999, 25) > 0 && cmp(25, 99999) < 0 && cmp(99998, 99999) < 0 && cmp(25, 25) === 0)) return by + ': an id the pack lacks must sort last, by id, and an id equals itself';
+  }
+  const odd = D.speciesComparator(pack, 'nonsense'), dex = D.speciesComparator(pack, 'dex');
+  for (const [a, b] of [[25, 6], [6, 25], [1, 4], [906, 3]]) if (Math.sign(odd(a, b)) !== Math.sign(dex(a, b))) return 'an unknown sort is not the Pokedex order';
+  return D.SPECIES_SORT_IDS.join() === 'dex,name,type' && D.SPECIES_SORTS.map((x) => x[0]).join() === 'dex,name,type' ? true : 'the list of sorts';
+});
+// ---- Enter in the picker's search box (editor_data.js speciesEnterChoice): a remembered Type / Name order put Crabrawler on top of "abra", and Enter added it
+add('data/search/enter-takes-the-species-whose-whole-name-was-typed-under-every-order', (c) => {
+  const D = c.D;
+  const names = [...new Set(pack.roster.map((id) => pack.species[id].name))];
+  if (names.length < 600) return 'only ' + names.length + ' distinct names: the pack is not the one this check was written for';
+  const firstWrong = { dex: 0, name: 0, type: 0 };             // how often the FIRST ROW is a differently named Pokemon: the cases that used to go wrong
+  for (const sort of ['dex', 'name', 'type']) {
+    for (const nm of names) {
+      const ids = D.speciesSearch(pack, nm, STD, { unavailable: 'hide', sort });
+      if (!ids.length) continue;                                // a name only the engine layer's exclusions hide
+      if (pack.species[ids[0]].name !== nm) firstWrong[sort]++;
+      const got = D.speciesEnterChoice(pack, ids, nm, sort);
+      if (got === null || pack.species[got].name !== nm) return `${sort} order, typed "${nm}": Enter takes ${got === null ? 'nothing' : '"' + pack.species[got].name + '"'}`;
+    }
+  }
+  // the scenario must exist, or this proves nothing: under Type and Name order the first row is a different Pokemon for several names, and under Pokedex order for Mew
+  if (firstWrong.type < 3 || firstWrong.name < 3 || firstWrong.dex < 1) return 'the first row is already right everywhere: ' + J(firstWrong);
+  const at = (q, sort) => pack.species[D.speciesSearch(pack, q, STD, { unavailable: 'hide', sort })[0]].name;
+  const named = (q, sort) => { const ids = D.speciesSearch(pack, q, STD, { unavailable: 'hide', sort }); return pack.species[D.speciesEnterChoice(pack, ids, q, sort)].name; };
+  if (at('abra', 'type') !== 'Crabrawler' || at('natu', 'name') !== 'Eternatus' || at('aron', 'type') !== 'Volcarona' || at('mew', 'dex') !== 'Mewtwo') return 'the anchors moved: ' + J([at('abra', 'type'), at('natu', 'name'), at('aron', 'type'), at('mew', 'dex')]);
+  if (named('abra', 'type') !== 'Abra' || named('natu', 'name') !== 'Natu' || named('aron', 'type') !== 'Aron' || named('mew', 'dex') !== 'Mew') return 'the anchors: ' + J([named('abra', 'type'), named('natu', 'name'), named('aron', 'type'), named('mew', 'dex')]);
+  // case and spacing of what was typed do not matter (the search itself ignores both)
+  const abra = D.speciesSearch(pack, '  ABRA ', STD, { unavailable: 'hide', sort: 'type' });
+  if (pack.species[D.speciesEnterChoice(pack, abra, '  ABRA ', 'type')].name !== 'Abra') return 'case and spaces';
+  // alternate forms that share the typed name: the lowest Pokedex number, then the lowest entry id, whatever order the list is in (Zorua is 570 and 1002 in this pack)
+  const z = pack.roster.filter((id) => pack.species[id].name === 'Zorua').sort((a, b) => a - b);
+  if (z.length < 2 || pack.species[z[0]].natDex !== pack.species[z[1]].natDex) return 'Zorua no longer has two entries with one number: ' + J(z);
+  for (const order of [z, z.slice().reverse()]) if (D.speciesEnterChoice(pack, order, 'zorua', 'type') !== z[0]) return 'a shared name picked ' + D.speciesEnterChoice(pack, order, 'zorua', 'type') + ' from ' + J(order) + ', wanted ' + z[0];
+  return true;
+});
+add('data/search/enter-does-not-guess-under-a-sorted-list', (c) => {
+  const D = c.D;
+  const ids = (q, sort) => D.speciesSearch(pack, q, STD, { unavailable: 'hide', sort });
+  // a partial name under Type or Name order: the first row is only first because of an order the person may not remember choosing, so Enter chooses nothing
+  for (const sort of ['type', 'name']) {
+    const list = ids('char', sort);
+    if (list.length < 5) return 'the "char" list is short: ' + list.length;
+    if (D.speciesEnterChoice(pack, list, 'char', sort) !== null) return `"char" under ${sort} order: Enter chose ${pack.species[D.speciesEnterChoice(pack, list, 'char', sort)].name}`;
+  }
+  // Pokedex order is the order Enter always meant: the first row. Same for a sort name this module does not know (it sorts as Pokedex order).
+  const dexList = ids('char', 'dex');
+  for (const sort of ['dex', 'nonsense', undefined]) if (D.speciesEnterChoice(pack, dexList, 'char', sort) !== dexList[0]) return `sort ${J(sort)}: Enter did not take the first row`;
+  if (pack.species[dexList[0]].name !== 'Charmander') return 'the first "char" in Pokedex order is ' + pack.species[dexList[0]].name;
+  // one Pokemon left: nothing to guess, whatever the order
+  for (const sort of ['dex', 'name', 'type']) { const one = ids('bulbasa', sort); if (one.length !== 1 || D.speciesEnterChoice(pack, one, 'bulbasa', sort) !== one[0]) return 'one hit under ' + sort; }
+  // a type is not a name: "fire" lists many Pokemon and Enter does not guess among them under Type order
+  const fire = ids('fire', 'type');
+  if (fire.length < 5 || D.speciesEnterChoice(pack, fire, 'fire', 'type') !== null) return '"fire" under type order';
+  // nothing listed, nothing chosen; a non-list is nothing too
+  return D.speciesEnterChoice(pack, [], 'abra', 'dex') === null && D.speciesEnterChoice(pack, [], '', 'type') === null && D.speciesEnterChoice(pack, undefined, 'abra', 'dex') === null ? true : 'an empty list chose something';
 });
 add('data/moves/catalog-matches-the-learnset-and-carries-tags', (c) => {
   const f = withMons(c, [PIKACHU]);
@@ -1466,6 +1682,33 @@ mut('M57 an edit mutates the frozen input in place', 'editor_state.js', "const m
 mut('M58 ids come from Math.random', 'editor_state.js', "const deps = { ...defaultDeps(), ...(ctx.deps || {}) };", "const deps = { ...defaultDeps() };", E('state/robustness/determinism-the-same-actions-and-deps-give-the-same-document'));
 mut('M59 parseRulesetId drops the item clause', 'editor_state.js', "itemClause: layers.includes('item-clause'),", 'itemClause: false,', E('state/rules/parse-and-build-ids-round-trip'));
 // ---- editor_data.js
+mut('D40 the type sort ignores the second type', 'editor_data.js', "inner = (a, b) => { const A = key(a), B = key(b); return A[0] - B[0] || A[1] - B[1] || dex(a, b); };", "inner = (a, b) => { const A = key(a), B = key(b); return A[0] - B[0] || dex(a, b); };", E('data/search/sort-by-type-uses-the-first-then-the-second-type-in-rom-order'));
+mut('D41 a one-type Pokemon sorts after the two-type ones that share its first type', 'editor_data.js', "return [t[0], t[1] === t[0] ? 0 : t[1]]; };", "return [t[0], t[1]]; };", E('data/search/sort-by-type-uses-the-first-then-the-second-type-in-rom-order'));
+mut('D42 equal types break the tie by ROM id, not Pokedex number', 'editor_data.js', "inner = (a, b) => { const A = key(a), B = key(b); return A[0] - B[0] || A[1] - B[1] || dex(a, b); };", "inner = (a, b) => { const A = key(a), B = key(b); return A[0] - B[0] || A[1] - B[1] || a - b; };", E('data/search/sort-by-type-uses-the-first-then-the-second-type-in-rom-order'));
+mut('D43 a shared name does not fall back to the Pokedex order', 'editor_data.js', "if (by === 'name') inner = (a, b) => S(a).name.toLowerCase().localeCompare(S(b).name.toLowerCase()) || dex(a, b);", "if (by === 'name') inner = (a, b) => S(a).name.toLowerCase().localeCompare(S(b).name.toLowerCase()) || b - a;", E('data/search/sort-by-name'));
+mut('D44 the type filter looks at the first type only', 'editor_data.js', "hits.filter((s) => s.types.includes(tf))", "hits.filter((s) => s.types[0] === tf)", E('data/search/type-filter-keeps-the-pokemon-with-that-type-in-either-slot'));
+mut('D45 a value that is not a type id empties the list', 'editor_data.js', "hits.filter((s) => s.types.includes(tf)) : hits;", "hits.filter((s) => s.types.includes(tf)) : [];", E('data/search/type-filter-keeps-the-pokemon-with-that-type-in-either-slot'));
+mut('D46 an unknown sort name sorts by type', 'editor_data.js', "if (by === 'type') {", "if (by !== 'dex' && by !== 'name') {", E('data/search/sort-dex-is-the-old-order-and-the-default', 'data/search/sort-comparators-handle-unknown-ids-and-unknown-sorts'));
+mut('D47 the type filter offers types nobody has', 'editor_data.js', "return pack.types.filter((t) => used.has(t.id)).map((t) => [t.id, t.name]);", "return pack.types.filter((t) => t.id >= 1).map((t) => [t.id, t.name]);", E('data/search/type-choices-are-the-roster-types-in-rom-order'));
+mut('D48 the search ignores the sort option', 'editor_data.js', "const cmp = speciesComparator(pack, opts.sort);", "const cmp = speciesComparator(pack);", E('data/search/sort-by-name', 'data/search/sort-by-type-uses-the-first-then-the-second-type-in-rom-order'));
+mut('D49 a species the pack lacks sorts first', 'editor_data.js', "if (!A || !B) return A ? -1 : B ? 1 : a - b;", "if (!A || !B) return A ? 1 : B ? -1 : a - b;", E('data/search/sort-comparators-handle-unknown-ids-and-unknown-sorts'));
+mut('D50 Enter takes the first row, whatever was typed', 'editor_data.js', "if (named.length) return named.slice().sort(speciesComparator(pack, 'dex'))[0];", '', E('data/search/enter-takes-the-species-whose-whole-name-was-typed-under-every-order'));
+mut('D51 Enter guesses the first row under any order', 'editor_data.js', "if (ids.length === 1 || sort === 'dex' || !SPECIES_SORT_IDS.includes(sort)) return ids[0];", 'return ids[0];', E('data/search/enter-does-not-guess-under-a-sorted-list'));
+mut('D52 Enter never takes the first row of the Pokedex order', 'editor_data.js', "if (ids.length === 1 || sort === 'dex' || !SPECIES_SORT_IDS.includes(sort)) return ids[0];", 'if (ids.length === 1) return ids[0];', E('data/search/enter-does-not-guess-under-a-sorted-list'));
+mut('D53 an unknown sort name stops Enter', 'editor_data.js', "if (ids.length === 1 || sort === 'dex' || !SPECIES_SORT_IDS.includes(sort)) return ids[0];", "if (ids.length === 1 || sort === 'dex') return ids[0];", E('data/search/enter-does-not-guess-under-a-sorted-list'));
+mut('D54 one hit left is not taken', 'editor_data.js', "if (ids.length === 1 || sort === 'dex' ||", "if (sort === 'dex' ||", E('data/search/enter-does-not-guess-under-a-sorted-list'));
+mut('D55 alternate forms that share a name: the last one listed wins', 'editor_data.js', "return named.slice().sort(speciesComparator(pack, 'dex'))[0];", 'return named[named.length - 1];', E('data/search/enter-takes-the-species-whose-whole-name-was-typed-under-every-order'));
+mut('D56 the typed name is compared as typed (case and spaces)', 'editor_data.js', "const norm = (s) => String(s || '').toLowerCase().split(/\\s+/).filter(Boolean).join(' ');", "const norm = (s) => String(s || '');", E('data/search/enter-takes-the-species-whose-whole-name-was-typed-under-every-order'));
+mut('D57 a name that is only part of another name counts as typed', 'editor_data.js', "norm(pack.species[id].name) === want)", "norm(pack.species[id].name).includes(want))", E('data/search/enter-takes-the-species-whose-whole-name-was-typed-under-every-order', 'data/search/enter-does-not-guess-under-a-sorted-list'));
+mut('M80 the team sort moves equal Pokemon', 'editor_state.js', "cmp(speciesOf(a.id), speciesOf(b.id)) || a.i - b.i)", "cmp(speciesOf(a.id), speciesOf(b.id)) || b.i - a.i)", E('state/team/sort-keeps-equal-pokemon-in-the-order-they-had'));
+mut('M81 the team sort takes any sort name', 'editor_state.js', "if (!SPECIES_SORT_IDS.includes(action.by)) return reject(state, type, 'sort.unknown', 'sort by dex, name or type');", '', E('state/team/sort-rejects-bad-input-and-a-sorted-team-is-not-an-edit'));
+mut('M82 sorting a team that is already in order counts as an edit', 'editor_state.js', "if (ids.every((id, i) => id === team.monIds[i])) return { ...state, error: null, notice: { code: 'team.in-order', message: `the team is already sorted by ${how}` }, result: null };", '', E('state/team/sort-rejects-bad-input-and-a-sorted-team-is-not-an-edit'));
+mut('M83 the team sort always sorts by Pokedex number', 'editor_state.js', "const cmp = speciesComparator(pack, action.by);", "const cmp = speciesComparator(pack, 'dex');", E('state/team/sort-orders-the-members-by-type-name-or-dex-in-one-undo-step'));
+mut('M84 a team that was sorted says nothing', 'editor_state.js', ", { notice: { code: 'team.sorted', message: `sorted by ${how}: ${ids.map(nameOf).join(', ')}` } });", ');', E('state/team/sort-says-what-it-did-in-both-outcomes'));
+mut('M85 the sort notice lists the old order', 'editor_state.js', "${ids.map(nameOf).join(', ')}` } });", "${team.monIds.map(nameOf).join(', ')}` } });", E('state/team/sort-says-what-it-did-in-both-outcomes'));
+mut('M86 the sort notice ignores nicknames', 'editor_state.js', "return (m && m.nickname) || (sp ? sp.name : '?'); };", "return (sp ? sp.name : '?'); };", E('state/team/sort-says-what-it-did-in-both-outcomes'));
+mut('M87 the already-sorted notice always says type', 'editor_state.js', "message: `the team is already sorted by ${how}` }", "message: 'the team is already sorted by type' }", E('state/team/sort-says-what-it-did-in-both-outcomes'));
+mut('M88 the sort notice names the order wrongly', 'editor_state.js', "const how = SPECIES_SORTS.find((x) => x[0] === action.by)[1].toLowerCase();", "const how = action.by;", E('state/team/sort-says-what-it-did-in-both-outcomes'));
 mut('D01 the search ignores types', 'editor_data.js', "if (typeByName.has(t) && s.types.includes(typeByName.get(t))) return true;", '', E('data/search/by-name-number-and-type'));
 mut('D02 the search matches the number as a name', 'editor_data.js', "if (num) { const n = Number(num[1]); return s.natDex === n || s.id === n || String(s.natDex).startsWith(num[1]); }", '', E('data/search/by-name-number-and-type'));
 mut('D03 the search is OR instead of AND', 'editor_data.js', 'const hits = index.filter((s) => toks.every((t) => {', 'const hits = index.filter((s) => toks.some((t) => {', E('data/search/by-name-number-and-type'));

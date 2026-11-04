@@ -195,6 +195,7 @@ Confidence: high = the ROM's own code plays this index in that situation; medium
 **`preview`**
 - soulgold: 416 (medium) - The ROM plays trainer-encounter themes through the u16 table at 0x08447620 (song ids 380 407 379 423 416 417 419 441 385 449 450 451 453 397 then hack ids), read by the code @0x080BF210-0x080BF226 (ldrh r4,[table+48+2*id]; PlayNewMapMusic @0x08243B80). 416 is entry 4; using an encounter theme as the preview theme is a design choice
 - ultraviolet: 315 (low) - UNVERIFIED-GUESS (mood); identity by twin; UV encounter-music selector not traced
+- **Use (changed 2026-11-03):** the battle page no longer asks for this song at the team preview. The preview now plays the CPU level battle song (887 / 888 / 889, UV 298 / 297 / 296) from the first frame of the battle, as the game does (GetBattleBGM at battle start); the encounter theme is an overworld song, played before a battle, not during it. See MUSIC.md "What plays when a battle begins".
 
 **`title`**
 - soulgold: 413 (low) - identity: ROM name table (entry 413-349). I did NOT find code that starts 413 (the three sites that pass 413 call a UI helper @0x080D32E4, not a song function); a direct m4aSongNumStart(802) exists @0x0825FB44 (802 = 16 tracks, no loop, purpose unknown) -> UNVERIFIED-GUESS that 413 is the title theme of this hack

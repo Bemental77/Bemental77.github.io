@@ -195,7 +195,9 @@ export async function armFacts(page, claimed) {
 }
 
 export async function withBrowser(opts, fn) {
-  const { port = 9222, width = 1280, height = 800, mobile = false, args = [], lock = true } = opts || {};
+  // autoplay: false launches Chrome WITHOUT --autoplay-policy=no-user-gesture-required, i.e. with the policy a real visitor has (a Web Audio context starts only after the page was clicked, tapped or keyed).
+  // Every test keeps the permissive default except the one experiment that measures the real policy (tools/pokemonarena_autoplay_test.mjs). The browser stays muted either way (--mute-audio).
+  const { port = 9222, width = 1280, height = 800, mobile = false, args = [], lock = true, autoplay = true } = opts || {};
   if (!CHROME) throw new Error('chrome.exe not found; set CHROME_PATH');
   const release = lock ? await acquireBrowserLock() : () => {};
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'bemental-chrome-'));
@@ -207,7 +209,7 @@ export async function withBrowser(opts, fn) {
       // --mute-audio: a test browser must NEVER reach the user's speakers/headphones (an emulator page that
       // starts an AudioContext otherwise plays through the default device even when headless).
       '--mute-audio',
-      '--autoplay-policy=no-user-gesture-required', `--window-size=${width},${height}`,
+      ...(autoplay === false ? [] : ['--autoplay-policy=no-user-gesture-required']), `--window-size=${width},${height}`,
       // A "desktop" arm must LOOK like a desktop: headless Chrome with no input devices reports hover:none and neither pointer:coarse nor fine (so every page that asks matchMedia took
       // a desktop for a touch screen). The desktop arms are launched as a machine with a mouse (hover:hover, pointer:fine); a phone arm (mobile:true) gets the touch emulation of
       // page.setViewport instead (coarse, hover:none). withBrowser checks below that the arm reports what it claims, and refuses (void) when it does not.

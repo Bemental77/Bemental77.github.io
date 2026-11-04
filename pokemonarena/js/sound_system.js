@@ -2,16 +2,24 @@
 // (music_director.js), the SOUND panel (sound_panel.js), the header Sound button, the M key, the "press any key" prompt, the cries, and the
 // battle-page helpers (music follows the scene's mode, menu sounds, hit sounds, pause-menu ducking).
 //
-//   const sys = createSoundSystem({ page: 'hub' | 'battle' | 'editor', button, input: () => input, enableDomNav, ownNav, onPanelOpen, onPanelClose });
+//   const sys = createSoundSystem({ page: 'hub' | 'battle' | 'editor', button, input: () => input, enableDomNav, ownNav, onPanelOpen, onPanelClose, onMenuOpen, onMenuClose, effects });
+//                                                                    (effects: does the page play sound effects? default true for the hub and the battle page, false for the editor)
 //   sys.setRom({ bytes, pack });                 // after the page has decoded the SoulGold ROM: the music engine and the cries need it
-//   sys.director.set('hub')                      // which song (a music_map key)         sys.openPanel(done)     sys.audible()
+//   sys.menuMusic.set('hub')                     // a MENU page (hub, editor) says which screen it is: the song is the player's pick (the audio bar's changer) or the screen's own
+//   sys.director.set(key)                        // a song by music_map key (the battle page: preview / battle / result)       sys.openPanel(done)     sys.audible()
+//   sys.bar                                      // the audio bar (volume slider, mute, menu music) hydrated into the page header's #audioBar (audiobar.js)
 //   sys.playCry(species, 'normal' | 'faint')     // through the effects bus              sys.state()             sys.destroy()
 //
 // WHAT HAPPENS WHEN (the product definition of the audio, README "Sound"):
-//   * Sound is ON by default. Nothing is heard and no AudioContext exists until the visitor's first click, tap or key press. A visitor who has only
-//     a controller sees a prompt that says so (a controller button is not a browser user activation).
+//   * Sound is ON by default, at Master 50% (audio_mixer.js DEFAULTS; a stored choice always wins). The page TRIES to start it at load (the mixer's earlyStart: it creates the context and asks it to
+//     resume): where the browser allows that (the site's autoplay permission, or the visitor's click on the previous page of the site carrying over) the music starts as soon as its song is ready;
+//     where it does not, the visitor's very first click, tap or key press ANYWHERE on the page starts it (no Sound button needed) and until then a prompt says so. A visitor who has only
+//     a controller sees that prompt (a controller button is not a browser user activation; a press is tried anyway, and a browser that counts it starts the sound).
 //   * music.js and music_map.js are imported AFTER the page is up (dynamic import); a missing or failing engine leaves the game playable and silent
 //     (state().director.error says why). The second soundtrack (Ultra Violet) is fetched only when it is chosen (or was chosen last time).
+//   * "Off" in the menu-music changer means no MUSIC: on a page that plays effects (the hub, the battle page: createSoundSystem's `effects` option, true for them by default) the director is built with
+//     effects:true, so the engine still loads and the menus' cursor / select / back sounds still play (after a reload too). The team editor plays no effect, so with its music Off it loads nothing at all.
+//   * A page restored from the browser's back/forward cache asks for the song it had when it went away (onPageShow below); leaving the page stops the music (pagehide).
 //   * test seam: window.__arenaSoundModules = { music: () => Promise<module>, map: () => Promise<module>, uvRom: (onProgress) => Promise<Uint8Array> } replaces
 //     the three loaders (tools/pokemonarena_sound_page_test.mjs installs recording stand-ins before the page runs).
 //
@@ -22,6 +30,8 @@ import { createDirector, resolveKey } from './music_director.js';
 import { createSoundPanel, SOUNDTRACK_LABELS } from './sound_panel.js';
 import { isTextTarget } from './input.js';
 import * as cries from './cries.js';
+import { createMenuMusic } from './menu_music.js';           // what the menus play, and the player's pick (the audio bar's music changer)
+import { mountAudioBar } from './audiobar.js';               // the volume slider / mute / music changer in every page's header
 
 export const UV_FILE = '/gba/gbaWasm/roms/pokemonUltraViolet.gba';
 export const UV_FALLBACK_SIZE = 16777216;
@@ -31,6 +41,8 @@ export const PROMPT_TEXT = Object.freeze({
   short: 'Click, tap or press a key for sound (a controller button cannot).',       // for a cramped layout: it still says what a controller visitor needs to know
 });
 export const CRY_GAIN = 0.35;                         // per-cry level before the effects bus (the pages used 0.35 already)
+const DIRECTIONS = Object.freeze(['up', 'down', 'left', 'right']);
+const DEFAULT_DIRECTION_KEYS = Object.freeze({ KeyW: 'up', KeyS: 'down', KeyA: 'left', KeyD: 'right' });       // input.js DEFAULT_KEYS, used until the page's input layer is up
 /**
  * The game's red zone for the low-HP warning. ROM: HandleLowHpMusicChanges @0x08080130 plays SE 90 (se_lowhp) when GetHPBarLevel @0x08086cac returns RED and stops it (m4aSongNumStop)
  * when it does not. GetHPBarLevel: HP == max or max <= 1 -> full; HP > max/2 -> green; HP > max/5 -> yellow; HP > 0 -> RED; else empty (integer division, signed 16 bit). The beep is
@@ -67,7 +79,8 @@ export function createSoundSystem(opts = {}) {
   const loadMusicModule = opts.loadMusic || seam.music || (() => import('./music.js'));
   const loadMapModule = opts.loadMap || seam.map || (() => import('./music_map.js'));
 
-  const mixer = opts.mixer || createMixer({ window: win, document: doc, storage: opts.storage, ...(opts.mixerOptions || {}) });
+  // earlyStart: a page's mixer tries to start at load (see the header); mixerOptions can switch it off (a test that wants the bare first-activation behaviour)
+  const mixer = opts.mixer || createMixer({ window: win, document: doc, storage: opts.storage, earlyStart: true, ...(opts.mixerOptions || {}) });
   const S = {
     rom: null, pack: null, romWaiters: [], map: null, mapP: null, cry: new Map(), plays: 0, testPlays: 0, lastTest: -1e9,
     uv: { bytes: null, state: 'idle', message: '', progress: 0, failed: false, p: null },
@@ -81,7 +94,7 @@ export function createSoundSystem(opts = {}) {
   /* ---------------------------------------------------------------- the music map + the ROMs the engine reads */
   function loadMap() {
     if (S.map) return Promise.resolve(S.map);
-    if (!S.mapP) S.mapP = Promise.resolve().then(() => loadMapModule()).then((m) => { S.map = m; return m; }, (e) => { S.mapP = null; throw e; });
+    if (!S.mapP) S.mapP = Promise.resolve().then(() => loadMapModule()).then((m) => { S.map = m; try { menuMusic.refresh(); } catch (_e) { /* the changer is optional */ } return m; }, (e) => { S.mapP = null; throw e; });
     return S.mapP;
   }
   const songFor = (soundtrack, key) => (S.map && typeof S.map.songFor === 'function' ? S.map.songFor(soundtrack, key) : null);
@@ -137,10 +150,17 @@ export function createSoundSystem(opts = {}) {
     return soulgoldRom();
   }
 
+  // EFFECTS ARE A PAGE OPTION. A page that plays sound effects (the hub's cursor / select / back sounds, the battle page's hit and menu sounds) has its engine loaded as soon as the sound can play, whether or not
+  // a song is wanted, so "Off" in the menu-music changer still leaves its effects working. The team editor plays NO effect, so with its menu music Off nothing is loaded there (no engine, and no
+  // 16 MB Ultra Violet ROM fetched for a chosen soundtrack that nothing will play): `effects` defaults to true for the hub and the battle page only; a caller can pass `effects` to say otherwise.
+  const effects = opts.effects !== undefined ? opts.effects === true : (page === 'hub' || page === 'battle');
   const director = createDirector({
-    mixer, songFor, resolve, soundtrack: effectiveSoundtrack, romFor,
+    mixer, songFor, resolve, soundtrack: effectiveSoundtrack, romFor, effects,
     loadMusic: async () => { const [m] = await Promise.all([loadMusicModule(), loadMap().catch(() => null)]); return m; },
   });
+
+  // WHAT THE MENUS PLAY: a menu page says which screen it is (menuMusic.set), the player's pick (audiobar.js) decides the song; the battle page never uses it
+  const menuMusic = createMenuMusic({ director, mixer, storage: opts.storage, getMap: () => S.map, soundtrack: effectiveSoundtrack, window: win });
 
   /* ---------------------------------------------------------------- the panel + the header button */
   const soundtracks = {
@@ -198,7 +218,7 @@ export function createSoundSystem(opts = {}) {
     if (win && typeof win.addEventListener === 'function') win.addEventListener('resize', placePrompt);
   }
   // ---- where the prompt sits: a spot where it covers nothing the player needs ----
-  const PROMPT_OBSTACLES = ['canvas', '#dpad', '#ab', '#onlineLink', '#keys', '#romStatus', '#note'];      // the picture, the touch pad (both clusters), the hub's link to the online lobby, the footer lines; the header's own children are added below
+  const PROMPT_OBSTACLES = ['canvas', '#dpad', '#ab', '#onlineLink', '#keys', '#romStatus', '#note', '.ab-float'];      // the picture, the touch pad (both clusters), the hub's link to the online lobby, the footer lines, the audio bar while it floats beside the exit-fullscreen button (in the header it is one of the header's own children, added below)
   const PROMPT_FOOTERS = ['#keys', '#romStatus', '#note'];                                    // the dim lines under the page: the cheapest things to cover when nothing is free
   function rectOf(el) {
     try { const r = el.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) return null; const cs = win.getComputedStyle(el); return cs.display === 'none' || cs.visibility === 'hidden' ? null : r; } catch (_e) { return null; }
@@ -219,7 +239,7 @@ export function createSoundSystem(opts = {}) {
     if (!p || p.hidden || !win || !doc) return;
     const vw = doc.documentElement.clientWidth, vh = win.innerHeight, G = 8, PAD = 2;
     const obs = [], wts = []; let canvasPage = false;          // wts: what covering each costs. The picture costs 30, the header's controls 20, a touch pad cluster or the hub's lobby link 10, a dim footer line 1: on a page too full for a free spot the pill goes over the cheapest thing, and never over the picture while anything else will do
-    for (const sel of PROMPT_OBSTACLES) { const el = doc.querySelector(sel); const r = el ? rectOf(el) : null; if (r) { obs.push(r); wts.push(sel === 'canvas' ? 30 : PROMPT_FOOTERS.includes(sel) ? 1 : 10); if (sel === 'canvas') canvasPage = true; } }
+    for (const sel of PROMPT_OBSTACLES) { const el = doc.querySelector(sel); const r = el ? rectOf(el) : null; if (r) { obs.push(r); wts.push(sel === 'canvas' ? 30 : sel === '.ab-float' ? 20 : PROMPT_FOOTERS.includes(sel) ? 1 : 10); if (sel === 'canvas') canvasPage = true; } }
     const head = doc.getElementById('top'); const headBox = head ? rectOf(head) : null; const kids = [];
     if (head) for (const k of Array.from(head.children)) { const r = ownRect(k); if (r) { obs.push(r); wts.push(20); kids.push(r); } }
     const lowest = obs.reduce((m, o) => Math.max(m, o.bottom), 0);
@@ -245,6 +265,9 @@ export function createSoundSystem(opts = {}) {
         if (canvasPage) { const cv = doc.querySelector('canvas'), cr = cv ? rectOf(cv) : null; if (cr) cands.push([(vw - pw) / 2, cr.bottom + G]); }
         if (canvasPage) cands.push([(vw - pw) / 2, lowest + G]);
         cands.push([(vw - pw) / 2, vh - ph - G], [G, vh - ph - G], [vw - pw - G, vh - ph - G], [G, (vh - ph) / 2], [vw - pw - G, (vh - ph) / 2]);
+        // beside the hub's link to the online lobby: that row is only as wide as its buttons, so the room on either side of it is free. (A small desktop window has no other free spot once the
+        // audio bar takes the header's free gap, which used to be the last resort below.)
+        { const lk = doc.querySelector('#onlineLink'), lr = lk ? rectOf(lk) : null; if (lr) cands.push([lr.left - G - pw, lr.top + (lr.height - ph) / 2], [lr.right + G, lr.top + (lr.height - ph) / 2]); }
         if (withHeader && gap && headBox && gap.w - 2 * G >= pw) cands.push([gap.x + G + (gap.w - 2 * G - pw) / 2, headBox.top + (headBox.height - ph) / 2]);       // LAST RESORT: it floats between the title and the buttons, which looks like part of the header
         for (const [cx, cy] of cands) {
           const box = { left: cx, top: cy, right: cx + pw, bottom: cy + ph };
@@ -273,7 +296,8 @@ export function createSoundSystem(opts = {}) {
     if (S.offPad) return;
     let inp = null; try { inp = typeof opts.input === 'function' ? opts.input() : opts.input; } catch (_e) { inp = null; }
     if (!inp || typeof inp.on !== 'function') return;                    // the page's input layer is not up yet: the 500 ms follower tries again
-    try { S.offPad = inp.on('action', (e) => { if (e && e.pressed && e.source === 'gamepad') dismissPrompt('pad'); }); } catch (_e) { S.offPad = null; }
+    // a controller button is tried as a gesture (unlock() is harmless where the browser does not count it: the context just stays suspended) and then hides the hint, as before
+    try { S.offPad = inp.on('action', (e) => { if (e && e.pressed && e.source === 'gamepad') { try { mixer.unlock(); } catch (_e2) { /* ignore */ } dismissPrompt('pad'); } }); } catch (_e) { S.offPad = null; }
   }
   function paintPrompt() {
     if (!doc) return;
@@ -407,13 +431,16 @@ export function createSoundSystem(opts = {}) {
     S.lastMode = mode;
     mixer.duck(mode === 'menu');
     let want = null;
+    // THE CLASSIC BATTLE START. In the game the battle song is chosen at the START of the battle (GetBattleBGM via PlayMapChosenOrBattleBGM, MUSIC_MAP.md): wild theme, trainer theme or leader
+    // theme by the CPU level here. The team preview used to play the overworld's trainer-ENCOUNTER song (music_map 'preview', a medium-confidence mood pick) before the battle song began; it now
+    // plays the battle song too, from the very first frame, and the same song simply carries on into the first turn (asking for the song that is already playing restarts nothing).
     if (mode === 'preview') want = 'preview';
     else if (mode === 'result') want = 'result';
     else if (mode === 'action' || mode === 'moves' || mode === 'party') want = 'battle';
     else if ((mode === 'steps' || mode === 'wait') && (S.lastDecisive === 'preview' || (S.lastDecisive === null && hasPreview === false))) want = 'battle';
     if (!want || want === S.lastDecisive) return;
     S.lastDecisive = want;
-    if (want === 'preview') director.set('preview');
+    if (want === 'preview') director.battle(cpu);
     else if (want === 'battle') director.battle(cpu);
     else if (want === 'result') {
       let w = null; try { w = scene.state().winner; } catch (_e) { w = null; }
@@ -453,7 +480,17 @@ export function createSoundSystem(opts = {}) {
   function openPanel(done) { if (panel.isOpen()) return Promise.resolve(true); S.panelDone = typeof done === 'function' ? done : null; return panel.open(); }
   const detach = mixer.attach();
   if (doc && typeof doc.addEventListener === 'function') { doc.addEventListener('keydown', onKey); doc.addEventListener('keydown', onPromptKey); }
-  if (win && typeof win.addEventListener === 'function') win.addEventListener('pagehide', () => { stopLowHp(); director.stop({ fadeOutMs: 200 }); });
+  // LEAVING AND COMING BACK. Leaving the page stops the music (pagehide). A page the browser keeps in its back/forward cache is the SAME live page when the visitor comes Back to it (pageshow, persisted),
+  // but nothing would ask for its song again: the hub's menuMusic.set('hub') ran once, at load. So what the director WANTED when the page went away (the player's pick on a menu page, the battle's
+  // song on the battle page; nothing when the menu music is Off) is asked for again when the page is shown from the cache.
+  const onPageHide = () => { stopLowHp(); try { const w = director.state().want; if (w) S.wantAtHide = w; } catch (_e) { /* nothing to bring back */ } director.stop({ fadeOutMs: 200 }); };
+  const onPageShow = (e) => {
+    if (S.destroyed || !e || e.persisted !== true) return;
+    const w = S.wantAtHide; S.wantAtHide = null;
+    if (!w) return;                                           // nothing was playing (Off, or silence): nothing to bring back
+    try { director.set(w.key, w.then); } catch (_e) { /* the music is optional */ }
+  };
+  if (win && typeof win.addEventListener === 'function') { win.addEventListener('pagehide', onPageHide); win.addEventListener('pageshow', onPageShow); }
   paintButton();
   if (doc) { const ready = () => { buildPrompt(); paintPrompt(); }; if (doc.body) ready(); else doc.addEventListener('DOMContentLoaded', ready, { once: true }); }
   if (opts.autoLoadMap !== false) loadMap().catch(() => {});
@@ -461,18 +498,42 @@ export function createSoundSystem(opts = {}) {
   function destroy() {
     S.destroyed = true; stopLowHp(); offMixer(); detach();
     if (doc) doc.removeEventListener('keydown', onKey);
+    if (sys.bar) { try { sys.bar.destroy(); } catch (_e) { /* ignore */ } sys.bar = null; }
+    menuMusic.destroy();
     director.dispose(); panel.close();
     if (S.promptTimer) { clearInterval(S.promptTimer); S.promptTimer = null; }
     if (S.offPad) { try { S.offPad(); } catch (_e) { /* ignore */ } S.offPad = null; }
     if (doc) doc.removeEventListener('keydown', onPromptKey);
-    if (win && typeof win.removeEventListener === 'function') win.removeEventListener('resize', placePrompt);
+    if (win && typeof win.removeEventListener === 'function') { win.removeEventListener('resize', placePrompt); win.removeEventListener('pagehide', onPageHide); win.removeEventListener('pageshow', onPageShow); }
     if (S.prompt && S.prompt.remove) S.prompt.remove();
     mixer.destroy();
   }
 
   const sys = {
-    page, mixer, director, panel,
+    page, mixer, director, panel, menuMusic, bar: null,
     setRom, playCry, testCry, openPanel, dismissPrompt, closePanel: () => panel.close(), toast,
+    /** The audio bar's music list is a dialog (modal for the keyboard and the pad). A page whose own input would otherwise act behind it passes onMenuOpen / onMenuClose (the hub: its dialog counter). */
+    menuDialog: (open) => { const f = open ? opts.onMenuOpen : opts.onMenuClose; if (typeof f === 'function') { try { f(); } catch (_e) { /* a page callback must not break the list */ } } },
+    /**
+     * Which direction ('up' | 'down' | 'left' | 'right') the PLAYER'S keyboard bindings give this key event, else null (the key is bound to something else, or to nothing). Until the page's input layer is up the
+     * defaults answer (W A S D). The audio bar's open list asks, so the keys that move the rest of the game ("arrows or WASD") move through the songs too, and a rebinding is followed.
+     */
+    keyDirection: (e) => {
+      const code = e && e.code; if (!code) return null;
+      let inp = null; try { inp = typeof opts.input === 'function' ? opts.input() : opts.input; } catch (_e) { inp = null; }
+      try { if (inp && inp.bindings && typeof inp.bindings.get === 'function') { const kb = inp.bindings.get().keyboard || {}; for (const d of DIRECTIONS) if (Array.isArray(kb[d]) && kb[d].includes(code)) return d; return null; } } catch (_e) { /* the defaults answer */ }
+      return DEFAULT_DIRECTION_KEYS[code] || null;
+    },
+    /**
+     * A navigation layer (uinav.js enableDomNav) over a dialog the audio bar opens, for a page that has none over the whole page (ownNav, the default: the hub, whose canvas takes the pad and which ignores
+     * it while a dialog is up). null on the team editor (ownNav false: its page-wide layer already covers an aria-modal dialog) and when the page's input layer is not up. The caller disables it on close.
+     */
+    dialogNav: (el, onBack) => {
+      if (opts.ownNav === false || typeof opts.enableDomNav !== 'function') return null;
+      let inp = null; try { inp = typeof opts.input === 'function' ? opts.input() : opts.input; } catch (_e) { inp = null; }
+      if (!inp || typeof inp.on !== 'function') return null;
+      try { return opts.enableDomNav(el, { input: inp, onBack }); } catch (_e) { return null; }
+    },
     /** Is the sound switched on (not muted)? The hub's SOUND row and the pause menu show this. */
     audible: () => !mixer.muted(),
     setMuted: (m) => { mixer.setMuted(m); paintButton(); },
@@ -481,11 +542,16 @@ export function createSoundSystem(opts = {}) {
     get plays() { return S.plays; }, get testPlays() { return S.testPlays; },
     ctx: () => mixer.ctx(),
     state: () => ({
-      page, mixer: mixer.getAudioState(), director: director.state(), panelOpen: panel.isOpen(), plays: S.plays, testPlays: S.testPlays,
+      page, mixer: mixer.getAudioState(), director: director.state(), menuMusic: { pick: menuMusic.pick(), screen: menuMusic.screen() }, bar: sys.bar ? sys.bar.state() : null, panelOpen: panel.isOpen(), plays: S.plays, testPlays: S.testPlays,
       prompt: promptVisible(), promptDismissed: !!S.promptDismissed, promptWhy: S.promptWhy || null, frameError: S.frameError, rom: !!S.rom, map: !!S.map, animSounds: S.animSounds, menuSfx: S.menuSfx.slice(), lowHp: { on: S.low.on, plays: S.low.plays, stops: S.low.stops },
       uv: { state: S.uv.state, loaded: !!S.uv.bytes, failed: S.uv.failed, message: S.uv.message }, soundtrack: effectiveSoundtrack(),
     }),
     destroy,
   };
+  // the audio bar: hydrates the page header's #audioBar (the hub, the battle page and the team editor all carry one); a page without a header, or a test with no document, simply has none
+  if (doc && opts.bar !== false && (page === 'hub' || page === 'battle' || page === 'editor')) {
+    const mount = () => { try { sys.bar = S.destroyed ? null : mountAudioBar({ doc, win, sys }); } catch (e) { S.barError = String(e && e.message ? e.message : e); if (win && win.console) win.console.warn('[audiobar] could not start:', e); } };
+    if (doc.body) mount(); else doc.addEventListener('DOMContentLoaded', mount, { once: true });
+  }
   return sys;
 }

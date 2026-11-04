@@ -9,6 +9,103 @@ map / DMA / open bus), `js/anim_ppu.js` (OBJ / BG / blend / window renderer), `j
 estimates from the ROM's own song / cry tables), `js/anim_coverage.json` + `js/anim.golden.json` (statuses / hashes only), tools `tools/pokemonarena_anim_*.mjs`
 (`_oracle_batch / _compare / _scenarios / _probe / _stat / _diag`, `_readset`, `_coverage`, `_sheet`, `_test / _cpu_test / _ppu_test / _compare_test`, round 6: `_field_compare`).
 
+## Round 8 -- "the system engine pool is exhausted" (the prewarm kept an engine), and a benign re-prepare is a note, not a problem
+
+**Seen by a review of Round 7:** with the real ROM animator, battles on seeds 2 and 3 logged `system 6 prepare() threw: the system engine pool is exhausted: all 3 engines hold prepared runs`. A `prepare()` that throws means that effect is not prepared ahead
+and starts late (the previous picture is held, `animInfo().waited`).
+
+**Reproduced, and old.** `ARENA_ANIMATOR=real`'s setup (the real `createMoveAnimator`, the scene's `sysClock: cpu.icount / 1000`, i.e. 1 ms per 1000 ROM instructions, a 3v3 AI battle in which the player switches on purpose up to 3 times, as the Round 7 live group does): seeds 2, 3,
+4 and 5 each log it once (ticks 506, 1567, 513 and 715; seed 5 also for the faint, id 4, in the same call), and the committed HEAD tree (a copy without any Round 7 change) logs it at the same ticks, so it is not a Round 7 regression. Over seeds 2-10 and 12 on the HEAD tree
+every battle logs 1 or 2 of them at that clock, none at a clock 10 and 50 times faster (`cpu.icount / 10000`, `/ 50000`; 10 seeds each). In headless Chrome the browser suite's own battle (`ARENA_BROWSER=1`: 25 system runs over 7,374 frames) has an empty log and its prewarm finished during the opening (210 ms in 60 slices), so the pool never filled there; how often a slow phone sees it is NOT measured.
+
+**Cause (read off the pool at the moment of the throw, `animator.system.slots`).** The three engines were held by: the slide-in prepared ahead (id 2, not begun), the **opening's prewarm** (`'battle'`, `prepDone` false) and the recall that was the current step and still waiting for its own handle (id 3, not begun). The hit
+(id 6) wanted a fourth. The prewarm is created with the opening (`startSysIntro`) and keeps its engine until its pre-roll finishes (`battle_sys.js` releases it in the `finish` phase), but `pumpSys` serves the event handles before it, so while events keep being prepared it gets no slice and holds
+the engine for ever; and `prepareSys`'s limit of two prepared events ahead counts the queue only, not the waiting current step and not the prewarm. On a machine fast enough to finish the prewarm during the opening (the clocks above) the pool never fills.
+
+**The fix (scene.js `prepareHandle`).** A `prepare()` that throws while a prewarm is still pending disposes the prewarm (it only fills the battle-state cache, which the first event's own pre-roll fills as well: `battle_sys.js` `cachePut('a', ...)` in the `hidden` phase of every plan) and prepares again once; a second throw is
+logged as before. Nothing else changes. Seeds 2-5 then log nothing, carry one note each (`system 6 prepare() threw (the system engine pool is exhausted: all 3 engines hold prep): the prewarm was given up and it was prepared again`), and wait fewer ticks (seed 2: 12335 -> 11682, 3: 15442 -> 15100,
+4: 10647 -> 10191, 5: 7051 -> 6420: the effect is prepared in time instead of at its start). Not proved: that the frames of an effect prepared after a given-up prewarm equal those of one prepared after a finished prewarm (the cache is meant to be bit-exact, `anim_sys_test`), they were not diffed here.
+
+**The log is for problems.** The Round 7 re-prepare (`restale`) used to be written to `animInfo().log`, which the stub-animator test and the browser suite require empty; it is benign (a brief hold, never a wrong picture). It is counted (`restale`) and noted in the new `animInfo().notes`, as is a given-up prewarm (`shed`).
+The tamper groups assert that the notes carry one `system N stale: ...` line per re-prepare and the log stays empty; the browser suite asserts `log` empty and `notes.length === restale + shed` with only those two kinds of line.
+
+**Proof (`tools/pokemonarena_anim_scene_test.mjs`).** The stub animator has a pool model (`poolEngines`: a free engine, else a finished run's, else a live run's, which counts as an eviction, else it throws as the real one does; the prewarm holds one until its handle is ready) and a handle that needs 500 advances
+(the prewarm starves, as on the slow clock). Group `system/pool` (4 battles, the player switching): the log is empty, the prewarm handle was disposed and `shed` equals the pool's refusals, no live run was evicted, same battle (hash, hit and faint hooks once per event), and a pool of four engines gives nothing to give up. With the fix in, the stub pool refuses
+a prepare (and the prewarm is given up) on all of seeds 1-8 at 500 advances per handle, on seeds 2 and 4-7 at 300, and never at 200 or fewer; without the fix each refusal is a `prepare() threw` log line. Four new mutants (a re-prepare written to the problems log; no prewarm given up; given up but not prepared again; forgotten instead of disposed) each fail a named check.
+A 400-battle re-run of the Round 7 live group on the current scene (seeds 1-400, up to 3 voluntary switches): 4,884 hit / faint runs and 3,611 send-out / recall runs, 1,162 switches, every run begins with what the screen shows, 0 prepared again.
+
+## Round 7 -- the stale picture: a hit or a faint played for the Pokemon that was switched OUT, and a health bar that jumped back up
+
+**The report (the player, playing the real page):** "when pokemon get hit, faint, or after they switch out and the new pokemon gets hit, it will show the old pokemon briefly ... that's the same time when the health bars get fucky."
+
+**Reproduced, not guessed.** A headless Chrome records every frame the battle page draws (`putImageData`) while the engine's own AI plays a 3v3 with a voluntary switch on turn 1 (seed 777, default speed), and a contact sheet of the frames
+shows it: during the Discharge animation the switched-in Jirachi is on the field; on the FIRST frame of the hit blink on Jirachi the picture changes to **Quilava** (the Pokemon that was recalled), with "Quilava 133/133" and a full bar, and
+stays Quilava for all 41 frames of the blink. The second cause shows in the scene's own diagnostics (a hit / faint prepared for the other Pokemon's HP *before* a drain that was already playing): `foe.hp 72->61`, `foe.hp 55->47`.
+
+**The mechanism.** The scene PREPARES the next hit / faint ahead of time (`prepareSys`, round 4: the ROM's hidden pre-roll costs 100-250 ms, so it runs in slices while earlier steps play) and seeds it from "what the scene displays now"
+(`eventCtx`). But `S.disp` (the displayed Pokemon) only changes when a send-out / recall / faint effect FINISHES (`finishSysEvent`), a recall leaves the slot empty with the recalled Pokemon in `A.lastMon`, and a drain writes the Pokemon's own
+`hp` on EVERY frame of the bar (`runStep` 'drain': `d.hp = v`, `v` from `hpBarStep`; the end value only on arrival). So an effect prepared behind a switch was seeded from the OLD Pokemon (its species, its bar) and was then played, as
+prepared, for the new one (`sysEventStart` never looked at the picture again); and an effect prepared while a bar was draining was seeded with a MID-DRAIN value of the OTHER Pokemon's bar, neither the old bar nor the new one (the logged
+`foe.hp 72->61` is such a partial value). The queue-only guard of round 4 ("a bar drain before it changes the HP the picture must show") never saw the drain that was *currently* playing, and exempted faints.
+
+**The fix (scene.js), two layers:**
+
+1. **Projection.** `prepareSys` walks the queue with a projection of the display (`projectStep`): the step playing now and every step ahead of the event apply their effect (a send-out puts the new Pokemon in the slot, a recall empties it, a drain
+   sets the bar's end value) and `eventCtx` seeds an effect from the projected Pokemon, so the picture is right the first time. Round 7 did this for a HIT and a FAINT only; **Round 7b (below) extends it to every Pokemon a
+   send-out and a recall draw.**
+2. **A re-check at start.** `sysEventStart` compares the prepared effect's seed (`ctxSig`) with what is on screen when it begins and prepares it again if they differ (a brief hold of the previous picture, `A.waited`, never a wrong
+   picture). Counted in `scene.animInfo().restale` and noted in `scene.animInfo().notes` as `system 6 stale: foe.hp 72->61` (Round 8: it used to be written to `animInfo().log`, the list of animation PROBLEMS that the
+   tests and the browser suite require empty; a re-prepare is benign, so it is a note now). (Round 7: hit / faint; Round 7b: all four kinds.)
+
+**Proof.** `tools/pokemonarena_anim_scene_test.mjs` (stub animator): over the 12 battles of its live group, in which the player switches on purpose (35 voluntary switches), every one of the 145 hit / faint runs BEGINS with the Pokemon (species, level, HP) the scene shows at that moment, and none had to
+be prepared again (`restale` 0); a deliberately unforeseen change of the displayed HP between preparing and playing (4 battles tampered with) is caught at start and the run is prepared again (4 re-prepared, 4 notes, nothing in the problems log); four mutants (no projection, no drain projection, no re-check, the playing step not
+projected) each fail a named check. (Counts re-read for Round 8 from the test's own check titles: the live group is 12 battles, one found at run time plus the fixed seeds 2-10, 12 and 15. An earlier version of this paragraph said 9.) Two contract-stream goldens changed (`sysstarts.3`, `sysstarts.8`): they had recorded the stale HP values, and with the `hp` fields removed the streams of the old and the new scene are identical (checked by
+hashing both without them), so the change is exactly the stale HP and nothing else. The real-browser frames (before / after) are the reproduction above; after the fix frames 1110-1137 show Jirachi 175/175 blinking.
+
+**Not covered / unchanged:** the `moveanim` effects (a move's own animation) take their battler state from `battlerInfo` at start and were not part of this report. (Round 7 as first written also left the send-out and recall
+effects seeded from the display and called the remaining risk "not observed"; that was wrong, see Round 7b.)
+
+### Round 7b -- the same defect in the SEND-OUT and the RECALL (found by the review of round 7)
+
+**What was left.** Round 7 projected (and re-checked) a hit and a faint only, on the grounds that the send-out and recall effects "were measured against the real game with the old rule". Counted on the stub animator in Node over 400
+battles (seeds 1-400, the player switching on purpose up to 3 times; 3,611 send-out / recall runs), with the Round 7 scene **164 of those runs began with a stale picture of a Pokemon they draw**: foe send-outs (id 8) 156 of 518
+(34 the wrong Pokemon, 122 a stale bar), player send-outs (id 2) 2 of 1,899 (wrong Pokemon), player recalls (id 3) 3 of 1,174, foe recalls (id 9) 3 of 20. Two examples. Seed 2: the foe's replacement send-out was prepared with the player's
+FAINTED Pokemon (species 848, 0 HP) and began while the player's replacement (species 1207, 117/204) stood on screen, so the foe's send-out was drawn beside the old, dead Pokemon (both sides had fainted). Seed 8: the foe's send-out was
+prepared with the player's bar at 113 HP and began when the screen showed 101, so that bar jumped back up for the length of the effect (a drain writes the hp on every frame, so a read while it plays is a mid-drain value). Not rendered in a
+browser: what each effect draws is compared with the ROM engine below.
+
+**Which Pokemon each effect draws (measured with the ROM engine, `4. draws` in the test).** Every frame of the whole effect is hashed, then the same effect is run with one Pokemon changed. A **send-out** (ids 2 and 8; 150 and 185 frames)
+is identical in every frame for any HP (37) or species of the side that sends out, i.e. the Pokemon it replaces, and different for the other side's HP. A **recall** (ids 3 and 9; 53 frames) is different for either side's HP: the recalled
+Pokemon is drawn with its bar, and so is the other side. So the old lead rule (the Pokemon the display holds when the effect is prepared) costs nothing for the side that SENDS OUT, which no frame shows (in the 400 battles 290 of the 518
+foe send-outs have a lead whose HP differs from the screen when they begin, and that is invisible), but it is wrong for a recall's own Pokemon: a bar that moves just before the recall is drawn at its mid-drain value (an Eject Button
+recalls the Pokemon it was hit on: `engine_items.js:188`). Two recalls in the 400 battles had a stale own bar (seeds 311, id 3, and 379, id 9; the cause was not traced). The review suggested keeping the lead rule for both effects; the
+measurement says it holds for the send-out only, so the recall's own Pokemon is projected too. Where no drain or switch is ahead of the recall that is the same value as before, and the Round 3 handoff rows build their own ctx and do not go
+through scene.js, so they are unchanged.
+
+**The fix (scene.js).** `drawsLead(kind)` is false for a send-out only. `eventCtx` takes the projection for every Pokemon the effect draws (`side !== st.side || drawsLead(kind)`): both sides of a hit, a faint and a recall, the OTHER
+side of a send-out; the side that sends out keeps the plain read of the display. `ctxSig(ctx, kind, st)` covers the same Pokemon (the sending side's slot of a send-out is `null`, so a change there costs no re-preparation), and
+`sysEventStart` re-checks all four kinds. The comments in scene.js now say what the code does (a drain writes `d.hp` on every frame, not only when it ends). With the new scene the same 400 battles have 0 stale runs of 3,611 and none
+prepared again (`restale` 0); the step tokens, the frame count, the engine hash, the ticks waited for a handle, the number of runs of each id, the rendered-frame digest, the sounds and the cries are identical to the Round 7 scene in all 400.
+
+**Proof (`tools/pokemonarena_anim_scene_test.mjs`, stub animator).** On the Round 7 scene the live check finds 6 stale runs, the hand-built groups 4 of 4 and 6 of 6 cases wrong, and the tamper group fails.
+- Live battles (12 of them, the player switching on purpose): every run of ids 2-9 begins with the Pokemon it draws (species, level, HP) as the scene shows them at that moment, and none had to be prepared again.
+- 10 hand-built cases on a real scene (steps queued the way the director queues them, so each exists whatever the engine does): a foe / player send-out and a foe / player recall behind a drain of the other side's bar and behind the other
+  side's replacement, plus a recall behind a drain of its own bar. Each begins with what the screen holds (the bar at the drain's END value, the replacement's species) and none is prepared again.
+- 5 tamper cases (the displayed HP is moved while the effect waits prepared, by something the projection cannot know): a send-out (other side's bar) and a recall (either bar) are caught at start and prepared again; a change to the
+  Pokemon a send-out replaces is not (restale 0); a control with nothing moved leaves the count at 0.
+- `4. draws`: the four ROM-engine rows above (a send-out ignores the sending side and is sensitive to the other, a recall is sensitive to both).
+- 6 new mutants (no projection of the other side for a send-out; no projection of a recall's own Pokemon; no projection of a queued replacement; no re-check of a send-out; no re-check of a recall; the Pokemon a send-out replaces
+  compared too) and the 2 Round 7 ones whose code moved (no projection at all, no re-check), each fails a named check. (Counted in Round 8: the test has 10 `SYSTEM/stale` mutants from these two rounds, Round 7's four plus the six above, and Round 8 adds 1 more `SYSTEM/stale` and 3 `SYSTEM/pool`; the whole mutant list is 66 and all 66 are killed.)
+- Goldens: `sysstarts.8` changed and nothing else (`sysstarts.3` and the 12 other hashes are identical). Run by run, 2 of the 17 system runs of seed 8 differ, both foe send-outs (id 8) and both in the player's picture: run 6 species
+  644 -> 922, HP 0 -> 182, max HP 207 -> 182, experience 156250 -> 125000 (the dead Pokemon replaced by its replacement), run 10 HP 157 -> 146 (mid-drain -> end). Round 7's method (hash the stream without the `hp` fields) does NOT show
+  equality here, because run 6's stale value is a species as well. Hashing both streams without the OTHER side's species, level, HP, max HP and experience in every send-out and recall run gives the same hash on the Round 7 and the new
+  scene (`d043c2635d64` for seed 8, `e99462c5c437` for seed 3), and the tokens, frame count, engine hash and ticks waited are identical, so only stale values changed. (Applied to Round 7's own change the without-`hp` method does confirm its
+  claim: the HEAD scene and the Round 7 scene give identical streams without the `hp` fields, `08fb65270a33` for seed 3 and `43ddca946fc2` for seed 8.)
+
+**Not covered / unchanged:** the side that sends out is still read from the display when the effect is prepared (no frame shows it, measured above). By reading `projectStep`: a replacement queued before a later recall of the SAME side in one
+batch projects the slot as empty and falls back to the display, which the re-check catches at start (a brief hold) instead of getting it right the first time; not observed in the 400 battles. The `moveanim` effects are as in Round 7. Not
+rendered in a real browser: the scene's behaviour is measured with the stub animator, what each effect draws with the ROM engine.
+
 ## Round 6 -- the FIELD against the real game: the terrain's palette fades, the pinned mGBA's colour arithmetic, per-line alpha, BG3's shake (read this first)
 
 **The defect (FV1, 37 moves, pixel by pixel against the oracle).** The battle terrain did not dim, go black or tint in the moves where the real game does: the terrain-only patch (x 110..139, y 4..29)

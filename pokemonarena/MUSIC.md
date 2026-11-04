@@ -259,6 +259,49 @@ which RELEASING channel is kept, which is inaudible). The real engine reads the 
 * Goldens are hashes of the Float32 output on THIS Node/V8 (`Math.pow`/`Math.exp` are not specified bit-exactly across engines); the test also stores a 10-bit-quantised hash and, on a different Node/platform, accepts that one instead of the strict hash. This round changed the reference renders on purpose (new PSG pitch rule, wave table, sweep, noise sampling, PSG out of the reverb,
   direct-sound mix one frame behind the PSG, Ultra Violet mono), so every golden that involves those was regenerated; the SoulGold direct-sound-only songs changed only by the one-frame delay.
 
+## When the music may start: the browser's autoplay policy, MEASURED
+
+The Arena starts its music **as soon as the browser allows it**: it tries at page load, and where the browser refuses, the visitor's very first click, tap or key press anywhere on the page starts it. What "as soon as the browser allows it" means was
+**measured, not assumed**, in a real Chrome launched without `--autoplay-policy=no-user-gesture-required` (every other test of this project runs with that flag, so they cannot say anything about the policy a visitor has), muted with `--mute-audio`:
+`node tools/pokemonarena_autoplay_test.mjs` (the experiment is its first section; page code is not involved).
+
+Measured 2026-11-03 on **Chrome/156.0.8078.79** (Windows 11, `--headless=new`), default autoplay policy, a fresh profile:
+
+| situation | `navigator.userActivation.hasBeenActive` | a NEW `AudioContext()` |
+|---|---|---|
+| the hub just loaded, no gesture yet | false | `suspended`; `resume()` stays pending |
+| a real click (CDP mouse) on a same-origin link that loads `battle.html` | **true** in the new document | **`running` at once** |
+| a real click whose handler calls `location.assign(battle.html)` (what the hub does on Start) | **true** | **`running` at once** |
+| the same battle address typed (no gesture; the control) | false | `suspended` again |
+
+So **Chrome carries the visitor's click across a same-origin navigation** (sticky user activation), and Web Audio may start in the new document without a second click. The old mixer wasted that: it created no context until it saw a *new* gesture event in
+the new document, which is why the battle music seemed to need "another click". The mixer now tries at once (`audio_mixer.js` `earlyStart`, switched on by `sound_system.js`): it creates the context and asks it to resume; Chrome runs it where the carried gesture or an autoplay
+permission allows it, and the music starts as soon as the song is decoded, before the battle screen has needed any input. Where it does not (a typed address, a bookmark, a reload with no gesture) the context stays suspended and the listeners that were
+armed at the same moment (`keydown`, `mousedown`, `pointerdown`, `pointerup`, `touchstart`, `touchend`, captured on the window, removed once the context runs) start it on the first gesture **anywhere**, with no Sound button, and the
+"start the sound" hint is shown until then. A visitor who muted the sound stored `muted`: nothing is created at load (their first gesture still creates the context, so a controller can unmute later); a stored choice of any field always wins over the new defaults.
+A page that LOADS in a hidden tab (opened in the background) makes no early try at load, so it makes it the moment the tab is shown (`audio_mixer.js` `setHidden(false)`; tested in `tools/pokemonarena_sound_test.mjs`: allowed -> running at once, blocked -> a suspended context that the first gesture starts, muted -> still nothing).
+
+Also measured: **a bare modifier key (Shift) is not a user activation in Chrome** (a letter key, an arrow or Tab is); `Escape` is not either (the HTML rule). Both are cases of `tools/pokemonarena_autoplay_test.mjs`, not only a remark: it presses a real Shift and a real Escape on a page with no gesture and checks that the context stays suspended and `navigator.userActivation.hasBeenActive` stays false (Chrome/156.0.8078.79: it does), then a letter key starts it. A **controller button** is not one (the page tries `unlock()` on a pad press anyway and hides the hint: where a
+browser does count it, the sound starts; this box has no physical pad, so that path is only exercised with the synthetic one in the tests).
+
+**Not measured:** Safari and Firefox (their policies differ: Safari also wants the unlock inside a `touchend` or click; Firefox's block list is per site), Chrome on Android (it may also weigh a Media Engagement score), and a visitor whose site data or autoplay setting is
+different. The page behaves the same everywhere (try at load, then the first gesture); only *which* of the two applies differs. `tools/pokemonarena_autoplay_test.mjs` always prints what it measured and asserts only what holds in every browser (a document nobody has touched has no user activation);
+when the browser it runs on does not reproduce the table above it **prints `SKIP:` and skips the table-specific cases and every page case (exit 0)** instead of failing them. That promise is tested too: the file re-runs itself against a table it
+cannot match (the measured one with every verdict flipped, through `ARENA_AUTOPLAY_EXPECT`) and requires exit 0, a `SKIP:` line, no `FAIL` line and no page case run.
+
+## What plays when a battle begins: the classic battle theme from the first frame
+
+In the real game the battle song is chosen **at the start of the battle** (`GetBattleBGM`, reached through `PlayMapChosenOrBattleBGM`: MUSIC_MAP.md has the addresses): the wild theme for a wild Pokemon, the trainer theme for a trainer, the leader theme for a Leader / Elite Four member
+(SoulGold songs **887 / 888 / 889**, Ultra Violet's **298 / 297 / 296**). The Arena maps the CPU level onto that: `easy` is the wild theme, `normal` the trainer theme, `hard` the leader theme (`music_map.js` `battle_easy` / `battle_normal` / `battle_hard`).
+
+* **What it did before:** the team preview of a 3v3 battle (the Quick Battle default) played the song `preview`, SoulGold **416** `MUS-ENCOUNTER-INTENSE`, which is the *overworld* trainer-encounter theme the game plays when a trainer spots you, a medium-confidence mood pick for the preview
+  (MUSIC_MAP.md), and the battle song only began after the team was chosen. A 6v6 battle (no preview) already started on the battle song.
+* **What it does now:** the battle song of the CPU level starts at the **first frame of the battle**, team preview included (`sound_system.js` `battleFrameInner`: the preview asks the director for `battle_<cpu>`), and carries on unchanged into the first turn (asking for the song that is already playing restarts nothing: one `play`,
+  no second one). The song's own intro and loop are the engine's (`MUSIC.md` "Exact": a track that ends in a GOTO loops); the result music (fanfare, then `result_win` / `result_lose`) is unchanged. `music_map.js` and the director's fallback table still define `preview`; nothing in a battle asks for it.
+* **The soundtrack choice** (SOUND panel: SoulGold / Ultra Violet) changes the song because `songFor(soundtrack, key)` does; Ultra Violet has all three levels (298 / 297 / 296), so the same rule holds there.
+* **Verified by** `tools/pokemonarena_sound_page_test.mjs` (the real director's `play` log: cpu=hard asks for the hard song at the team preview and plays it once through the first turn; the whole sequence is song, jingle, result) and `tools/pokemonarena_autoplay_test.mjs` (a battle reached
+  by a click starts its song before any input in the battle document: cpu=normal asks for `battle_normal` first and the engine is told to play it, never `preview`).
+
 ## All songs
 
 Generated from the ROMs by `analyzeSong` (length = a jingle's length, or intro + one pass of the loop). Columns: player (BGM/SE1/SE2/SE3), tracks, header priority, header reverb (`-` = not set), first tempo in engine BPM units

@@ -32,7 +32,8 @@ import { describeRomError, showRomError } from './rom_error.js';
 import { watchHints } from './hints.js';
 import { createAnimSettings, parseAnimQuery } from './anim_settings.js';
 import { prewarmSystem, trainerChoices } from './anim_sys.js';
-import { matchFromSummary } from './career_stats.js';                 // ST1: the finished match as the career wants it
+import { matchFromSummary, onlineMatchId } from './career_stats.js';  // ST1: the finished match as the career wants it (and the id of a battle against a person)
+import { cleanName } from './netmatch.js';                              // an online opponent's name as the career keeps it (the same reduction the match used)
 import { createResumeStore, resumeKey, navigationType } from './battle_resume.js';       // W1 fix D11: a reload mid-battle resumes it
 import { parseOnlineQuery, createOnline } from './online.js';                         // two players, one battle (netmatch.js + lib/netplay.js); see ONLINE.md
 import { engineFingerprint } from './online_match.js';
@@ -139,10 +140,14 @@ async function main() {
   // W1: the pause menu's CONTROLS row opens the shared Controls dialog. While it is open the clock stops and the scene hears nothing (the B
   // that closes the dialog must not also act on the battle), then the pause menu comes back where it was (scene.js openMenu('CONTROLS')).
   let controlsOpen = false, controlsDone = null;
+  // WHO holds the pause (the clock stops and the scene hears nothing while it is true): the Controls dialog, the Sound panel and the Open-to-battles dialogs can be up TOGETHER (a challenge
+  // arrives while Controls is open), so it is a SET of owners, not one boolean: closing one dialog never un-pauses the battle behind another that is still open
+  const pauseOwners = new Set();
+  const setPaused = (who, v) => { if (v) pauseOwners.add(who); else pauseOwners.delete(who); controlsOpen = pauseOwners.size > 0; hook.controlsOpen = controlsOpen; };
   const ctlDlg = createControlsDialog({
     input, enableDomNav,
-    onOpen: () => { controlsOpen = true; hook.controlsOpen = true; },
-    onClose: () => { controlsOpen = false; hook.controlsOpen = false; const d = controlsDone; controlsDone = null; setTimeout(() => { try { canvas.focus({ preventScroll: true }); } catch (_e) { /* ignore */ } if (d) d(); }, 0); },
+    onOpen: () => { setPaused('controls', true); },
+    onClose: () => { setPaused('controls', false); const d = controlsDone; controlsDone = null; setTimeout(() => { if (!controlsOpen) { try { canvas.focus({ preventScroll: true }); } catch (_e) { /* ignore */ } } if (d) d(); }, 0); },
   });
   const openControls = (done) => { controlsDone = typeof done === 'function' ? done : null; ctlDlg.open().then((ok) => { if (!ok && controlsDone) { const d = controlsDone; controlsDone = null; d(); } }); };
 
@@ -178,8 +183,8 @@ async function main() {
   // MU3: the mixer, the SOUND panel and the music live in sound_system.js (ON by default, audio starts at the first click / tap / key). The old switch below only runs if that file did not load.
   const soundSys = (() => { try { return typeof soundMod.createSoundSystem === 'function' ? soundMod.createSoundSystem({
     page: 'battle', button: els.sound, input: () => input, enableDomNav, ownNav: true,
-    onPanelOpen: () => { controlsOpen = true; hook.controlsOpen = true; },
-    onPanelClose: () => { controlsOpen = false; hook.controlsOpen = false; setTimeout(() => { try { canvas.focus({ preventScroll: true }); } catch (_e) { /* ignore */ } }, 0); },
+    onPanelOpen: () => { setPaused('sound', true); },
+    onPanelClose: () => { setPaused('sound', false); setTimeout(() => { if (!controlsOpen) { try { canvas.focus({ preventScroll: true }); } catch (_e) { /* ignore */ } } }, 0); },
   }) : null; } catch (e) { console.warn('[sound] the sound system could not start; the old switch is used:', e); return null; } })();
   const snd = { ctx: null, cry: new Map(), plays: 0 };
   function updateSoundButton() { if (soundSys) return; const on = cries.isSoundOn(); els.sound.textContent = 'Sound: ' + (on ? 'on' : 'off'); els.sound.setAttribute('aria-pressed', on ? 'true' : 'false'); }
@@ -253,7 +258,7 @@ async function main() {
   }
   let resumeStore = null, resuming = false;          // D11: the saved-battle record (cleared when the result is chosen, the battle is left or it ends); resuming = the saved history is being replayed (silent)
   function onResult(choice) {
-    if (online) { hook.resultChoice = choice; online.onResult(choice); return; }       // REMATCH asks the other player; BACK TO HUB leaves the room
+    if (online) { hook.resultChoice = choice; whenCareerSettled(() => online.onResult(choice)); return; }       // REMATCH asks the other player; BACK TO HUB leaves the room (after the battle has been written to the profile, at most 1.5 s)
     if (resumeStore) resumeStore.clear();
     hook.resultChoice = choice;
     whenCareerSettled(() => runResult(choice));
@@ -269,15 +274,23 @@ async function main() {
    * Which profile: the one that owns the team in the address (the same lookup EDIT TEAM uses), else the store's active profile (the Team Builder / the last team battle set it);
    * no profile at all -> nothing is written and the recap says so. The write is store.recordMatch: one transaction, idempotent by the match id (seed + format + CPU + the time
    * this page started), so a reload, a double fire or a second tab cannot count a battle twice; a FORFEIT is recorded as a forfeit, a draw as a draw; leaving mid-battle records nothing.
-   * REMATCH / BACK TO HUB wait (at most 1.5 s) for a write that is still under way, so that leaving cannot cut it off. */
-  const career = { state: 'idle', profileId: null, matchId: null, duplicate: false, callouts: [], error: null, promise: null };
+   * REMATCH / BACK TO HUB wait (at most 1.5 s) for a write that is still under way, so that leaving cannot cut it off.
+   * A battle against a PERSON is kept the same way (schema 4: byCpu.online and an `opp` on the recent entry): `via` below names it. Its id is the seed, the format, the match number and the
+   * room (career_stats.onlineMatchId), so a reload that replays the same match, or a second tab, cannot count it twice, while a rematch (a new seed and number) counts on its own. The profile
+   * is the one that owns the team the player chose (the online panel records it), else the one that owns the team code, else the active profile.
+   * A match that was STOPPED (a desync, a cheat, a malformed message, a refused team) writes nothing: before the engine has finished it the scene never reaches its result screen, and a match
+   * the end-of-match comparison stopped AFTER the engine finished it is refused at onMatchEnd (nm.countable()): the error panel is up, the scene underneath only plays its last turn unseen.
+   * The result is the engine's. Recorded as a FORFEIT: the player who forfeits (RUN, YES), whose own clock runs out with the page still open, or who comes back after a dead link that outlasted
+   * the grace; the player who stayed wins and the win is kept. A player who leaves with BACK TO HUB, or closes the page, records NOTHING for themselves (the page is gone before the forfeit
+   * has played through to the result screen); the opponent's win is still recorded. A win by the OPPONENT'S concession is a conceded win (career_stats.js: never a fastest win; a walkover is not a longest battle either). */
+  const career = { state: 'idle', profileId: null, matchId: null, duplicate: false, callouts: [], error: null, why: null, promise: null };
   hook.career = career;
   let battleRuleset = DEFAULT_RULESET_ID;
   const startedAt = Date.now();
   function whenCareerSettled(fn) {
     if (career.promise && career.state === 'pending') { let done = false; const go = () => { if (!done) { done = true; fn(); } }; career.promise.then(go, go); setTimeout(go, 1500); } else fn();
   }
-  function recordCareer(info) {
+  function recordCareer(info, via) {
     career.state = 'pending';
     career.promise = (async () => {
       let store = null;
@@ -285,14 +298,17 @@ async function main() {
         const [{ openStore }, data] = await Promise.all([import('./store.js'), import('./hub_data.js')]);
         store = await openStore();
         let pid = null;
-        if (params.team !== null) { const hit = await data.findTeamForCode(store, params.team); if (hit) pid = hit.profileId; }
+        if (via) {
+          pid = via.profileId || null;
+          if (!pid && via.teamCode) { const hit = await data.findTeamForCode(store, via.teamCode).catch(() => null); if (hit) pid = hit.profileId; }
+        } else if (params.team !== null) { const hit = await data.findTeamForCode(store, params.team); if (hit) pid = hit.profileId; }
         if (!pid) pid = await store.getActiveId().catch(() => null);
         const loaded = pid ? await store.loadProfile(pid).catch(() => null) : null;
         if (!loaded || !loaded.ok || store.status.notSaved) { career.state = 'none'; scene.setCareer({ state: 'none' }); return; }
         if (loaded.readOnly) { career.state = 'none'; scene.setCareer({ state: 'none', notes: ['This profile was made by a newer', 'version of the Arena, so this battle', 'is not kept.'] }); return; }
-        const id = String(params.seed >>> 0) + '_' + params.format + '_' + params.cpu + '_' + startedAt.toString(36);
+        const id = via ? via.id : String(params.seed >>> 0) + '_' + params.format + '_' + params.cpu + '_' + startedAt.toString(36);
         const playMs = Math.max(0, Math.min(86400000, Math.round(info.ticks * 1000 / GBA_FPS)));
-        const match = matchFromSummary(info.summary, { id, at: Date.now(), fmt: params.format, cpu: params.cpu, ruleset: battleRuleset, playMs });
+        const match = matchFromSummary(info.summary, via ? { id, at: Date.now(), fmt: via.fmt, cpu: 'online', opp: via.opp, ruleset: battleRuleset, playMs } : { id, at: Date.now(), fmt: params.format, cpu: params.cpu, ruleset: battleRuleset, playMs });
         career.profileId = pid; career.matchId = id;
         const r = await store.recordMatch(pid, match);
         career.duplicate = !!r.duplicate; career.callouts = r.callouts; career.rev = r.saved ? r.saved.rev : null;
@@ -405,7 +421,15 @@ async function main() {
           anim: animCfg, animator: resuming ? null : animator, animSeed: info.seed,
           hooks: mkHooks({
             onResult: onResult,
-            onMatchEnd: () => { try { scene.setCareer({ state: 'none', notes: ['Online battles are not kept', 'in your record yet.'] }); } catch (_e) { /* the result screen still shows */ } },
+            onMatchEnd: (mi) => {
+              // kept in the trainer's profile like any other battle (recordCareer); `online.state` says which profile and which team, `info` which match
+              const st = online ? online.state : {};
+              // a match that was STOPPED after the engine finished it (the end-of-match comparison found the other machine ended in another position) is not counted:
+              // the error panel is already up and the scene underneath only reached its result screen unseen. scene.setCareer is NOT called: the scene's own record state stays 'pending'
+              // behind the hidden battle canvas (its only reader is the recap page drawn on that canvas), and the online page test pins that the canvas is hidden (F22) and that nothing was written (F23)
+              if (st.nm && typeof st.nm.countable === 'function' && !st.nm.countable()) { career.state = 'none'; career.why = 'match-stopped'; return; }
+              recordCareer(mi, { id: onlineMatchId({ seed: info.seed, fmt: info.fmt, mn: info.mn, room: info.room }), fmt: info.fmt, opp: cleanName(info.oppName, 'Player'), profileId: st.profileId || null, teamCode: st.myTeamCode || null });
+            },
             onQuit: () => online.leaveToHub(),
           }),
         });
@@ -455,6 +479,19 @@ async function main() {
     } catch (e) { showError({ title: 'The battle could not start', message: String(e && e.message ? e.message : e), detail: Array.isArray(e && e.detail) ? e.detail.slice(0, 3).map((x) => x.message || x.code).join('; ') : '', kind: 'internal' }); return; }
 
     showReady();
+    // OPEN TO BATTLES (presence_boot.js): mounted in EVERY battle against the CPU. While the switch is on, a challenge reaches the player here too, in the middle of this battle: the dialog pauses the battle
+    // like the Controls panel does, and Accept leaves this battle (a battle left unfinished is recorded as nothing) for the challenger's. While the switch is OFF the mount is dormant (no board connection,
+    // no dialog in the page): it keeps the header's Open button (the way to switch it on or off from here) and follows the switch going on in another tab.
+    // The button is un-hidden now only to hold its room (battle.css keeps it invisible until the module has mounted and wired it), so the header does not move when it appears.
+    const openBtn = $('openBtn');
+    if (openBtn) openBtn.hidden = false;
+    import('./presence_boot.js').then((m) => {
+      hook.presence = m.mountPresence({
+        win: window, doc: document, pack: packRef, input, enableDomNav, navigate, button: openBtn, buttonText: false,
+        focusHome: () => { if (!controlsOpen) { try { canvas.focus({ preventScroll: true }); } catch (_e) { /* ignore */ } } },
+        onDialog: { open: (which) => { setPaused('presence:' + which, true); }, close: (which) => { setPaused('presence:' + which, false); setTimeout(() => { if (!controlsOpen) { try { canvas.focus({ preventScroll: true }); } catch (_e) { /* ignore */ } } }, 0); } },
+      });
+    }).catch((e) => { if (window.console) console.warn('[presence] not available', e); if (openBtn) openBtn.hidden = true; });
   }
 
   /* ---- input ---- */

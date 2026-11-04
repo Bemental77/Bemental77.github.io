@@ -34,11 +34,12 @@ function makeScope() {
   return { _l: l, addEventListener(t, f) { (l[t] = l[t] || []).push(f); }, removeEventListener(t, f) { l[t] = (l[t] || []).filter((x) => x !== f); }, dispatch(t, ev) { for (const f of (l[t] || []).slice()) f(ev); }, count: (t) => (l[t] || []).length };
 }
 function fakeTimers() { let id = 0; const q = new Map(); return { set: (fn, ms) => { q.set(++id, { fn, ms }); return id; }, clear: (h) => { q.delete(h); }, run() { const all = Array.from(q.entries()); q.clear(); for (const [, t] of all) t.fn(); return all.length; }, pending: () => q.size }; }
-function rig(M, { store = memStore(), hidden = false, win = undefined } = {}) {
-  const log = {}; const scope = makeScope(); installFakeAudio(scope, log);
+function rig(M, { store = memStore(), hidden = false, win = undefined, mixerOptions = {}, strict = false, allowed = false } = {}) {
+  // strict / allowed: the double emulates the browser's autoplay policy (pokemonarena_sound_lib.mjs): strict && !allowed = a context that stays suspended until the page is allowed to start audio
+  const log = {}; const scope = makeScope(); scope.__autoplayStrict = strict; scope.__autoplayAllowed = allowed; installFakeAudio(scope, log);
   const doc = Object.assign(makeScope(), { hidden });
   const timers = fakeTimers();
-  const mixer = M.mixer.createMixer({ window: win === undefined ? scope : win, document: doc, storage: store, setTimeout: timers.set, clearTimeout: timers.clear });
+  const mixer = M.mixer.createMixer({ window: win === undefined ? scope : win, document: doc, storage: store, setTimeout: timers.set, clearTimeout: timers.clear, ...mixerOptions });
   return { mixer, log, scope, doc, timers, store };
 }
 const lastRamp = (node) => { const c = node.gain.calls.filter((x) => x[0] === 'ramp'); return c.length ? c[c.length - 1] : null; };
@@ -104,13 +105,63 @@ async function battery(M) {
   const AM = M.mixer;
 
   /* ---- mixer: before the first activation ---- */
-  await step('mixer: defaults are master 0.7, music 0.6, fx 0.8, not muted, soulgold', () => { const r = rig(M); const s = r.mixer.settings(); return J(s) === J({ v: 1, master: 0.7, music: 0.6, fx: 0.8, muted: false, soundtrack: 'soulgold' }); });
+  // THE STARTING VOLUME IS NOW HALF THE SLIDER (the user: "play music as soon as you join, but at half volume on the slider"): a visitor with NOTHING stored starts at master 0.5, sound on. It used to be 0.7.
+  await step('mixer: defaults (nothing stored) are master 0.5, music 0.6, fx 0.8, not muted, soulgold', () => { const r = rig(M); const s = r.mixer.settings(); return J(s) === J({ v: 1, master: 0.5, music: 0.6, fx: 0.8, muted: false, soundtrack: 'soulgold' }); });
+  await step('mixer: a STORED choice always wins and is never overwritten: master 0.7 / muted stay as stored, nothing is written at construction, only the absent fields take the new defaults', () => {
+    const raw = '{"muted":false,"v":1,"master":0.7,"music":0.6,"fx":0.8,"soundtrack":"soulgold"}';        // (not the order the mixer writes: a rewrite at construction would change it)
+    const a = rig(M, { store: memStore({ 'arena.audio': raw }) });
+    const b = rig(M, { store: memStore({ 'arena.audio': JSON.stringify({ v: 1, muted: true }) }) });
+    const c = rig(M, { store: memStore({ 'arena.sound': '1' }) }); const d = rig(M, { store: memStore({ 'arena.sound': '0' }) });
+    return a.mixer.settings().master === 0.7 && a.store._m.get('arena.audio') === raw && b.mixer.settings().muted === true && b.mixer.settings().master === 0.5 && c.mixer.settings().master === 0.5 && c.mixer.settings().muted === false && d.mixer.settings().muted === true;
+  });
   await step('mixer: NO AudioContext exists before the first activation (construct, attach, volume, mute, soundtrack, duck, hidden)', async () => {
     const r = rig(M); r.mixer.attach(); r.mixer.setVolume('music', 0.3); r.mixer.setMuted(true); r.mixer.setMuted(false); r.mixer.setSoundtrack('ultraviolet'); r.mixer.duck(true); r.mixer.setHidden(true); r.mixer.setHidden(false);
     await flush();
     return r.log.ctor === 0 && r.mixer.getAudioState().created === false && r.mixer.ctx() === null && r.mixer.destination('music') === null;
   });
-  await step('mixer: attach() listens for exactly keydown, mousedown, pointerdown, pointerup, touchend', () => { const r = rig(M); r.mixer.attach(); return ['keydown', 'mousedown', 'pointerdown', 'pointerup', 'touchend'].every((t) => r.scope.count(t) === 1) && r.doc.count('visibilitychange') === 1; });
+  // (touchstart is armed too: a first touch anywhere is the visitor's first gesture; the browser only starts the context from the events that count, and the listeners stay until it runs)
+  await step('mixer: attach() listens for exactly keydown, mousedown, pointerdown, pointerup, touchstart, touchend', () => { const r = rig(M); r.mixer.attach(); return ['keydown', 'mousedown', 'pointerdown', 'pointerup', 'touchstart', 'touchend'].every((t) => r.scope.count(t) === 1) && r.doc.count('visibilitychange') === 1; });
+  await step('mixer: a first touch (touchstart) is tried as the first gesture', async () => { const r = rig(M); r.mixer.attach(); r.scope.dispatch('touchstart', { type: 'touchstart' }); await flush(); return r.log.ctor === 1 && r.mixer.running(); });
+  // THE EARLY START (a page's mixer; sound_system.js passes earlyStart): try at attach(), without waiting for a gesture. The browser decides (the double emulates its autoplay policy).
+  await step('early start, browser BLOCKS autoplay: the context is created at attach() but stays suspended (nothing can play), a prompt is still wanted, the gesture listeners stay armed', async () => {
+    const r = rig(M, { mixerOptions: { earlyStart: true }, strict: true }); r.mixer.attach(); await flush();
+    const st = r.mixer.getAudioState();
+    return r.log.ctor === 1 && r.log.ctxs[0].state === 'suspended' && st.created === true && st.ctx === 'suspended' && !r.mixer.canPlay() && r.mixer.needsActivation() === true && r.log.blocked >= 1 && ['keydown', 'pointerdown', 'touchend'].every((t) => r.scope.count(t) === 1);
+  });
+  await step('early start, browser blocks: the visitor\'s very FIRST gesture anywhere starts it (one context, listeners removed, no second context)', async () => {
+    const r = rig(M, { mixerOptions: { earlyStart: true }, strict: true }); r.mixer.attach(); await flush();
+    r.scope.__autoplayAllowed = true;                                       // the browser now counts the gesture (what a real click does)
+    r.scope.dispatch('pointerdown', { type: 'pointerdown', pointerType: 'mouse' }); await flush();
+    return r.log.ctor === 1 && r.log.ctxs[0].state === 'running' && r.mixer.canPlay() && r.mixer.needsActivation() === false && r.scope.count('pointerdown') === 0 && r.scope.count('keydown') === 0;
+  });
+  await step('early start, browser ALLOWS autoplay: it is running at load, nothing is asked of the visitor, the listeners are gone', async () => {
+    const r = rig(M, { mixerOptions: { earlyStart: true }, strict: true, allowed: true }); r.mixer.attach(); await flush();
+    return r.log.ctor === 1 && r.log.ctxs[0].state === 'running' && r.mixer.canPlay() && r.mixer.needsActivation() === false && r.scope.count('keydown') === 0 && !(r.log.blocked > 0);
+  });
+  await step('early start: a muted visitor and a hidden tab get nothing at attach() (their first gesture / being shown still starts it)', async () => {
+    const muted = rig(M, { mixerOptions: { earlyStart: true }, store: memStore({ 'arena.audio': JSON.stringify({ v: 1, muted: true }) }) }); muted.mixer.attach(); await flush();
+    const hid = rig(M, { mixerOptions: { earlyStart: true }, hidden: true }); hid.mixer.attach(); await flush();
+    const before = muted.log.ctor;                                   // nothing yet: a muted visitor has nothing to start
+    muted.scope.dispatch('keydown', { type: 'keydown', key: 'a' }); await flush();
+    return before === 0 && muted.log.ctor === 1 && muted.mixer.getAudioState().created === true && hid.log.ctor === 0;
+  });
+  // A PAGE THAT LOADED HIDDEN (opened in a background tab) had no early try at attach(); the one-shot used to be lost for good, so the visitor saw the "start the sound" hint on a browser that would have allowed it.
+  await step('early start: a tab that LOADED hidden gets its early try the moment it is shown (autoplay allowed: running at once; blocked: a suspended context, then the first gesture starts it); a muted one and a never-attached mixer still wait', async () => {
+    const show = (r) => { r.doc.hidden = false; r.mixer._onVisibility(); };
+    const a = rig(M, { mixerOptions: { earlyStart: true }, hidden: true, strict: true, allowed: true }); a.mixer.attach(); await flush();
+    const aBefore = a.log.ctor; show(a); await flush(); await flush();
+    const b = rig(M, { mixerOptions: { earlyStart: true }, hidden: true, strict: true }); b.mixer.attach(); await flush(); show(b); await flush();
+    const bBlocked = b.log.ctor === 1 && b.log.ctxs[0].state === 'suspended' && b.mixer.needsActivation() === true;
+    b.scope.__autoplayAllowed = true; b.scope.dispatch('pointerdown', { type: 'pointerdown', pointerType: 'mouse' }); await flush();
+    const m = rig(M, { mixerOptions: { earlyStart: true }, hidden: true, store: memStore({ 'arena.audio': JSON.stringify({ v: 1, muted: true }) }) }); m.mixer.attach(); show(m); await flush();
+    const n = rig(M, { mixerOptions: { earlyStart: true }, hidden: true, strict: true, allowed: true }); show(n); await flush();           // never attach()ed: not a page's mixer yet
+    return aBefore === 0 && a.log.ctor === 1 && a.log.ctxs[0].state === 'running' && a.mixer.canPlay() && bBlocked && b.log.ctor === 1 && b.log.ctxs[0].state === 'running' && m.log.ctor === 0 && n.log.ctor === 0;
+  });
+  await step('early start: a browser with no Web Audio is not asked to click for nothing (no prompt wanted)', async () => {
+    const r = rig(M, { mixerOptions: { earlyStart: true }, win: makeScope() }); r.mixer.attach(); await flush();
+    return r.log.ctor === 0 && r.mixer.getAudioState().ctxError === 'unsupported' && r.mixer.needsActivation() === false;
+  });
+  await step('early start is OFF for a bare mixer: nothing is created before a gesture (the guarantee the tests above state)', async () => { const r = rig(M, { strict: true }); r.mixer.attach(); await flush(); return r.log.ctor === 0; });
   await step('mixer: Escape, a touch pointerdown and a mouse pointerup are NOT activations (no context)', async () => {
     const r = rig(M); r.mixer.attach();
     r.scope.dispatch('keydown', { type: 'keydown', key: 'Escape' }); r.scope.dispatch('pointerdown', { type: 'pointerdown', pointerType: 'touch' }); r.scope.dispatch('pointerup', { type: 'pointerup', pointerType: 'mouse' });
@@ -149,13 +200,16 @@ async function battery(M) {
     const mixer = M.mixer.createMixer({ window: scope, document: Object.assign(makeScope(), { hidden: false }), storage: memStore() }); mixer.attach(); scope.dispatch('keydown', { type: 'keydown', key: 'a' }); await flush();
     const edges = log.connects.map((e) => e.join('>')); return log.gains.length === 3 && edges.includes(log.gains[0].id + '>destination') && log.waveShapers.length === 0 && mixer.canPlay();
   });
-  await step('mixer: at the DEFAULT slider positions every bus has gain exactly 1.0 (the real game\'s own level), so a first-time player hears the music at the level the game plays it', async () => { const r = await unlocked(M); const [m, mu, fx] = r.log.gains; return approx(m.gain.value, 1) && approx(mu.gain.value, 1) && approx(fx.gain.value, 1) && J(AM.DEFAULTS.master + ',' + AM.DEFAULTS.music + ',' + AM.DEFAULTS.fx) === J('0.7,0.6,0.8'); });
+  // a first-time visitor starts with Master at 0.5 (gain 0.51, about 6 dB under the real game: a quiet start on purpose) and Music / Effects at unity
+  await step('mixer: a first-time visitor starts at Master 0.5 (gain (0.5/0.7)^2) with music and effects at gain 1.0', async () => { const r = await unlocked(M); const [m, mu, fx] = r.log.gains; return approx(m.gain.value, (0.5 / 0.7) ** 2) && approx(mu.gain.value, 1) && approx(fx.gain.value, 1) && J(AM.DEFAULTS.master + ',' + AM.DEFAULTS.music + ',' + AM.DEFAULTS.fx) === J('0.5,0.6,0.8') && J(AM.UNITY.master + ',' + AM.UNITY.music + ',' + AM.UNITY.fx) === J('0.7,0.6,0.8'); });
+  // (the law did not move when the starting volume did: UNITY is the anchor, so a visitor who stored 0.7 / 0.6 / 0.8 earlier still plays at the game's own level)
+  await step('mixer: at the UNITY slider positions (0.7 / 0.6 / 0.8) every bus has gain exactly 1.0 (the real game\'s own level), and a stored 0.7 master is unity', async () => { const r = await unlocked(M, { store: memStore({ 'arena.audio': JSON.stringify({ v: 1, master: 0.7, music: 0.6, fx: 0.8, muted: false, soundtrack: 'soulgold' }) }) }); const [m, mu, fx] = r.log.gains; return approx(m.gain.value, 1) && approx(mu.gain.value, 1) && approx(fx.gain.value, 1); });
   await step('mixer: stored levels from before the new law stay sane: the old defaults (0.7 / 0.6 / 0.8) are unity, a stored music 0.3 is 0.25 (quarter amplitude), 1.0 is +3 dB, nothing is louder than +6 dB overall', async () => {
     const r = await unlocked(M, { store: memStore({ 'arena.audio': JSON.stringify({ v: 1, master: 0.7, music: 0.3, fx: 1, muted: false, soundtrack: 'soulgold' }) }) }); const [m, mu, fx] = r.log.gains;
     const r2 = await unlocked(M, { store: memStore({ 'arena.audio': JSON.stringify({ v: 1, master: 1, music: 1, fx: 1, muted: false, soundtrack: 'soulgold' }) }) });
     const [m2, mu2] = r2.log.gains; return approx(m.gain.value, 1) && approx(mu.gain.value, 0.25) && approx(fx.gain.value, AM.GAIN_MAX) && approx(m2.gain.value * mu2.gain.value, AM.GAIN_MAX * AM.GAIN_MAX) && Math.abs(20 * Math.log10(m2.gain.value * mu2.gain.value) - 6) < 0.001;
   });
-  await step('mixer: gain law: 0 -> 0, the default position -> 1.0, half the default -> 0.25 (square law below), 1.0 -> +3 dB, clamped (1.7 -> +3 dB, -3 -> 0, NaN -> 0), for each bus', () => ['master', 'music', 'fx'].every((b) => { const d = AM.DEFAULTS[b]; return AM.gainFor(0, b) === 0 && approx(AM.gainFor(d, b), 1) && approx(AM.gainFor(d / 2, b), 0.25) && approx(AM.gainFor(1, b), AM.GAIN_MAX) && approx(AM.gainFor(1.7, b), AM.GAIN_MAX) && AM.gainFor(-3, b) === 0 && AM.gainFor(NaN, b) === 0; }) && approx(20 * Math.log10(AM.GAIN_MAX), 3.0103 - 0.0103));
+  await step('mixer: gain law: 0 -> 0, the default position -> 1.0, half the default -> 0.25 (square law below), 1.0 -> +3 dB, clamped (1.7 -> +3 dB, -3 -> 0, NaN -> 0), for each bus', () => ['master', 'music', 'fx'].every((b) => { const d = AM.UNITY[b]; return AM.gainFor(0, b) === 0 && approx(AM.gainFor(d, b), 1) && approx(AM.gainFor(d / 2, b), 0.25) && approx(AM.gainFor(1, b), AM.GAIN_MAX) && approx(AM.gainFor(1.7, b), AM.GAIN_MAX) && AM.gainFor(-3, b) === 0 && AM.gainFor(NaN, b) === 0; }) && approx(20 * Math.log10(AM.GAIN_MAX), 3.0103 - 0.0103));
   await step('mixer: gain law is strictly increasing over the 21 slider steps', () => { let p = -1; for (let i = 0; i <= 20; i++) { const g = AM.gainFor(i / 20, 'music') + AM.gainFor(i / 20, 'master') + AM.gainFor(i / 20, 'fx'); if (!(g > p)) return false; p = g; } return true; });
 
   /* ---- mixer: each slider moves its own bus, with a click-free ramp ---- */
@@ -212,7 +266,8 @@ async function battery(M) {
   });
   await step('mixer: coming back to a hidden tab while MUTED does not resume', async () => { const r = await unlocked(M); r.mixer.setMuted(true); r.timers.run(); await flush(); r.doc.hidden = true; r.mixer._onVisibility(); r.doc.hidden = false; r.mixer._onVisibility(); await flush(); return r.log.ctxs[0].state === 'suspended' && !r.mixer.canPlay(); });
   await step('mixer: a page that STARTS hidden does not run the context until it is visible', async () => { const r = rig(M, { hidden: true }); r.mixer.attach(); r.scope.dispatch('keydown', { type: 'keydown', key: 'a' }); await flush(); const a = r.log.ctxs[0].state; r.doc.hidden = false; r.mixer._onVisibility(); await flush(); return a === 'suspended' && r.log.ctxs[0].state === 'running'; });
-  await step('mixer: duck(true) halves ONLY the music bus (1.0 -> 0.5); duck(false) restores it', async () => { const r = await unlocked(M); const [m, mu, fx] = r.log.gains; r.mixer.duck(true); const a = approx(target(mu), 0.5) && approx(target(m), 1) && approx(target(fx), 1); r.mixer.duck(false); return a && approx(target(mu), 1); });
+  // (master starts at 0.5 now, so its gain is (0.5/0.7)^2 rather than 1.0; ducking must still leave it, and the effects, alone)
+  await step('mixer: duck(true) halves ONLY the music bus (1.0 -> 0.5); duck(false) restores it', async () => { const r = await unlocked(M); const [m, mu, fx] = r.log.gains; const m0 = target(m); r.mixer.duck(true); const a = approx(target(mu), 0.5) && approx(target(m), m0) && approx(m0, (0.5 / 0.7) ** 2) && approx(target(fx), 1); r.mixer.duck(false); return a && approx(target(mu), 1); });
 
   /* ---- mixer: persistence, migration, hostile values ---- */
   await step('mixer: volumes, mute and soundtrack are stored in arena.audio and a NEW mixer reads them back', () => {
@@ -365,6 +420,23 @@ async function battery(M) {
   await step('director: duck(true) ducks the music bus through the mixer, duck(false) restores it', async () => { const { r, d } = await dr(); const mu = r.log.gains[1]; d.duck(true); const a = approx(target(mu), 0.5); d.duck(false); return a && approx(target(mu), 1); });
   await step('director: dispose() disposes the engine and later mixer events do nothing', async () => { const { r, d, mlog } = await dr(); d.set('hub'); await flush(); d.dispose(); r.mixer.setMuted(true); r.mixer.setMuted(false); await flush(); return mlog.dispose === 1 && mlog.pause === 0 && mlog.resume === 0; });
   await step('director: stop() fades out and forgets the wanted song', async () => { const { r, d, mlog } = await dr(); d.set('hub'); await flush(); d.stop(); r.mixer.setMuted(true); r.mixer.setMuted(false); await flush(); await flush(); return mlog.stop.length === 1 && mlog.stop[0].fadeOutMs === 600 && mlog.play.length === 1; });
+  // EFFECTS NEED THE ENGINE, NOT A SONG. A menu whose music is Off wants no song; its cursor / select sounds still need the engine. effects:true (the sound system of a page that plays effects: the hub, the battle page) keeps it loading; the default (and the team editor, which plays none) does not.
+  await step('director: with effects:true the engine loads once the sound can play although NO song is wanted (and an effect then plays); without it the engine stays unloaded; nothing loads before the visitor has acted', async () => {
+    const mk = async (eff, act) => { const r = act ? await unlocked(M) : rig(M); r.mixer.attach(); const mlog = {}; const music = makeStubMusic(mlog); const d = M.director.createDirector({ mixer: r.mixer, songFor: makeStubMap().songFor, loadMusic: async () => music, romFor: async () => new Uint8Array(8), ...(eff ? { effects: true } : {}) }); d.stop(); d.sync(); for (let i = 0; i < 5; i++) await flush(); return { d, mlog, r }; };
+    const on = await mk(true, true), off = await mk(false, true), idle = await mk(true, false);
+    const h = on.d.playSfx('se_cursor');
+    return on.mlog.create.length === 1 && on.mlog.play.length === 0 && on.d.state().engine === true && !!h && on.mlog.effect.length === 1 && on.mlog.effect[0].index === 200
+      && off.mlog.create.length === 0 && off.d.state().engine === false && off.d.playSfx('se_cursor') === null && idle.mlog.create.length === 0 && idle.d.state().engine === false;
+  });
+  await step('director: effects:true -- the visitor\'s first activation (the context starts) loads the engine for a page that wants no song, and a soundtrack change rebuilds it on the new ROM', async () => {
+    const r = rig(M); r.mixer.attach(); const mlog = {}; const music = makeStubMusic(mlog);
+    const d = M.director.createDirector({ mixer: r.mixer, songFor: makeStubMap().songFor, loadMusic: async () => music, romFor: async (st) => new Uint8Array(st === 'ultraviolet' ? 4 : 8), effects: true });
+    d.stop(); await flush(); const before = mlog.create.length;
+    r.scope.dispatch('keydown', { type: 'keydown', key: 'a' }); for (let i = 0; i < 5; i++) await flush();
+    const first = mlog.create.length === 1 && mlog.create[0].soundtrack === 'soulgold';
+    r.mixer.setSoundtrack('ultraviolet'); for (let i = 0; i < 6; i++) await flush();
+    return before === 0 && first && mlog.create.length === 2 && mlog.create[1].soundtrack === 'ultraviolet' && mlog.play.length === 0 && mlog.dispose === 1;
+  });
   await step('director: the log records every play with its key, the key actually used and the index', async () => { const { d } = await dr(); d.battle('hard'); await flush(); const l = d.state().log.filter((x) => x.op === 'play'); return l.length === 1 && l[0].key === 'battle_hard' && l[0].usedKey === 'battle_hard' && l[0].index === 22; });
 
   /* ---- panel on a hand-written fake DOM (the browser run is tools/pokemonarena_sound_page_test.mjs) ---- */
@@ -379,13 +451,13 @@ async function battery(M) {
     const { FD, panel, mixer, calls } = await pd(); await panel.open();
     const d = FD.doc.getElementById('soundDialog'); const sl = ['master', 'music', 'fx'].map((b) => FD.find('[data-snd="slider-' + b + '"]'));
     return !!d && d.getAttribute('role') === 'dialog' && d.getAttribute('aria-modal') === 'true' && !d.hidden && FD.doc.body.dataset.dialog === 'open' && calls.open === 1
-      && sl.every((s) => s && s.getAttribute('type') === 'range' && s.getAttribute('min') === '0' && s.getAttribute('max') === '100' && s.getAttribute('step') === '5') && J(sl.map((s) => s.value)) === J(['70', '60', '80'])
+      && sl.every((s) => s && s.getAttribute('type') === 'range' && s.getAttribute('min') === '0' && s.getAttribute('max') === '100' && s.getAttribute('step') === '5') && J(sl.map((s) => s.value)) === J(['50', '60', '80'])
       && !!FD.find('[data-snd="mute"]') && !!FD.find('[data-snd="test"]') && FD.findAll('[role="radio"]').length === 2 && FD.findAll('[data-nav-close]').length === 2 && FD.findAll('#soundDialog').length === 1 && mixer.volume('music') === 0.6;
   });
   await step('panel DOM: a slider input event sets ITS bus (music 35 -> 0.35, the fx and master untouched) and the readout', async () => {
     const { FD, panel, mixer, r } = await pd(); await panel.open();
     const s = FD.find('[data-snd="slider-music"]'); s.value = '35'; s.dispatch('input', { target: s });
-    return mixer.volume('music') === 0.35 && mixer.volume('master') === 0.7 && mixer.volume('fx') === 0.8 && FD.find('[data-snd="value-music"]').textContent === '35%' && approx(target(r.log.gains[1]), (0.35 / 0.6) ** 2) && s.getAttribute('aria-valuetext') === '35 percent';
+    return mixer.volume('music') === 0.35 && mixer.volume('master') === 0.5 && mixer.volume('fx') === 0.8 && FD.find('[data-snd="value-music"]').textContent === '35%' && approx(target(r.log.gains[1]), (0.35 / 0.6) ** 2) && s.getAttribute('aria-valuetext') === '35 percent';
   });
   await step('panel DOM: a TOUCH is applied only as a tap (pointerup) or after it moved sideways; a vertical scroll that starts on a slider (pointercancel) puts the thumb back and changes nothing; a mouse is applied at once', async () => {
     const { FD, panel, mixer } = await pd(); await panel.open();
@@ -539,6 +611,18 @@ if (!ARGS.has('--no-mutants')) {
   head('3. mutants: each must fail its NAMED check; the unmutated twin stays quiet');
   const MUTANTS = [
     { id: 'M1 persistence write removed', file: 'audio_mixer.js', from: "try { st.setItem(AUDIO_KEY, JSON.stringify({ v: 1, master: s.master, music: s.music, fx: s.fx, muted: !!s.muted, soundtrack: s.soundtrack })); return true; } catch (_e) { return false; }", to: 'return true;', expect: 'mixer: volumes, mute and soundtrack are stored in arena.audio and a NEW mixer reads them back' },
+    { id: 'M38 the director ignores effects when no song is wanted (Off leaves the engine unloaded)', file: 'music_director.js', from: 'if (!D.want) { stopNow(); if (effects) await ensureMusic(); return; }', to: 'if (!D.want) { stopNow(); return; }', expect: 'director: with effects:true the engine loads once the sound can play although NO song is wanted (and an effect then plays); without it the engine stays unloaded; nothing loads before the visitor has acted' },
+    { id: 'M39 a tab that loaded hidden never gets its early try', file: 'audio_mixer.js', from: 'else if (earlyStart && S.detach.length && !S.settings.muted && !S.ctx && !S.ctxError) unlock();', to: '', expect: 'early start: a tab that LOADED hidden gets its early try the moment it is shown (autoplay allowed: running at once; blocked: a suspended context, then the first gesture starts it); a muted one and a never-attached mixer still wait' },
+    { id: 'M40 the early try on show ignores a mixer that was never attached', file: 'audio_mixer.js', from: 'earlyStart && S.detach.length && ', to: 'earlyStart && ', expect: 'early start: a tab that LOADED hidden gets its early try the moment it is shown (autoplay allowed: running at once; blocked: a suspended context, then the first gesture starts it); a muted one and a never-attached mixer still wait' },
+    { id: 'M41 the early try on show ignores a muted visitor', file: 'audio_mixer.js', from: 'earlyStart && S.detach.length && !S.settings.muted', to: 'earlyStart && S.detach.length', expect: 'early start: a tab that LOADED hidden gets its early try the moment it is shown (autoplay allowed: running at once; blocked: a suspended context, then the first gesture starts it); a muted one and a never-attached mixer still wait' },
+    { id: 'M30 the early start does nothing', file: 'audio_mixer.js', from: 'if (earlyStart && !S.settings.muted && !S.hidden && !S.ctx && !S.ctxError) unlock();', to: 'if (false) unlock();', expect: 'early start, browser BLOCKS autoplay: the context is created at attach() but stays suspended (nothing can play), a prompt is still wanted, the gesture listeners stay armed' },
+    { id: 'M31 the early start ignores a muted visitor', file: 'audio_mixer.js', from: 'if (earlyStart && !S.settings.muted && !S.hidden', to: 'if (earlyStart && !S.hidden', expect: 'early start: a muted visitor and a hidden tab get nothing at attach() (their first gesture / being shown still starts it)' },
+    { id: 'M32 the early start ignores a hidden tab', file: 'audio_mixer.js', from: 'if (earlyStart && !S.settings.muted && !S.hidden', to: 'if (earlyStart && !S.settings.muted', expect: 'early start: a muted visitor and a hidden tab get nothing at attach() (their first gesture / being shown still starts it)' },
+    { id: 'M33 the starting master volume is 0.7 again', file: 'audio_mixer.js', from: 'v: 1, master: 0.5, music: 0.6, fx: 0.8, muted: false, soundtrack: \'soulgold\' });      //', to: 'v: 1, master: 0.7, music: 0.6, fx: 0.8, muted: false, soundtrack: \'soulgold\' });      //', expect: 'mixer: defaults (nothing stored) are master 0.5, music 0.6, fx 0.8, not muted, soulgold' },
+    { id: 'M34 the gain law moves with the starting volume (anchored on DEFAULTS, not UNITY)', file: 'audio_mixer.js', from: "v0 = bus === 'music' ? UNITY.music : bus === 'fx' ? UNITY.fx : UNITY.master;", to: "v0 = bus === 'music' ? DEFAULTS.music : bus === 'fx' ? DEFAULTS.fx : DEFAULTS.master;", expect: 'mixer: at the UNITY slider positions (0.7 / 0.6 / 0.8) every bus has gain exactly 1.0 (the real game\'s own level), and a stored 0.7 master is unity' },
+    { id: 'M35 a browser with no audio is still asked to click', file: 'audio_mixer.js', from: '!running() && !S.ctxError;', to: '!running();', expect: 'early start: a browser with no Web Audio is not asked to click for nothing (no prompt wanted)' },
+    { id: 'M36 a first touch is not armed', file: 'audio_mixer.js', from: "'pointerup', 'touchstart', 'touchend'];", to: "'pointerup', 'touchend'];", expect: 'mixer: attach() listens for exactly keydown, mousedown, pointerdown, pointerup, touchstart, touchend' },
+    { id: 'M37 a stored choice is rewritten at construction', file: 'audio_mixer.js', from: "if (read.source === 'migrated' || read.source === 'repaired' || read.source === 'invalid') persist();", to: 'persist();', expect: 'mixer: a STORED choice always wins and is never overwritten: master 0.7 / muted stay as stored, nothing is written at construction, only the absent fields take the new defaults' },
     { id: 'M2 mute is a no-op', file: 'audio_mixer.js', from: 'const next = !!m;\n    if (S.settings.muted === next) return next;\n    S.settings.muted = next;', to: 'const next = !!m;\n    return next;\n    S.settings.muted = next;', expect: 'mixer: MUTE ramps the master to exactly 0 and leaves the music and fx buses where they were' },
     { id: 'M3 gain law is linear', file: 'audio_mixer.js', from: 'if (x <= v0) return (x / v0) * (x / v0);', to: 'if (x <= v0) return x / v0;', expect: 'mixer: gain law: 0 -> 0, the default position -> 1.0, half the default -> 0.25 (square law below), 1.0 -> +3 dB, clamped (1.7 -> +3 dB, -3 -> 0, NaN -> 0), for each bus' },
     { id: 'M23 the soft limiter is not inserted', file: 'audio_mixer.js', from: "if (typeof ctx.createWaveShaper === 'function') { try {", to: "if (false) { try {", expect: 'mixer: the graph is music->master, fx->master, master->limiter, limiter->destination and nothing else' },
@@ -750,6 +834,60 @@ head('6. sound_system.js: the low-HP warning (the game\'s red zone, once per sta
       sc.S.mode = 'action'; sys.battleFrame(sc, 'normal', true); const again = beeps(mlog) === 2; scope.dispatch('pagehide', { type: 'pagehide' });
       return a && again && stops(mlog) === 2;
     });
+    /* ---- the back / forward cache ---- */
+    await step('page cache: pagehide stops the song and a pageshow FROM the cache brings the wanted song back (the battle page: straight from the director); a pageshow that is not from the cache brings nothing', async () => {
+      const { sys, mlog, scope } = await make(); const p0 = mlog.play.length;
+      scope.dispatch('pagehide', { type: 'pagehide', persisted: true }); await flush();
+      const gone = sys.director.state().want === null;
+      scope.dispatch('pageshow', { type: 'pageshow', persisted: false }); for (let i = 0; i < 4; i++) await flush();
+      const still = sys.director.state().want === null && mlog.play.length === p0;
+      scope.dispatch('pageshow', { type: 'pageshow', persisted: true }); for (let i = 0; i < 6; i++) await flush();
+      const w = sys.director.state().want;
+      scope.dispatch('pageshow', { type: 'pageshow', persisted: true }); for (let i = 0; i < 4; i++) await flush();
+      return p0 === 1 && gone && still && !!w && w.key === 'hub' && mlog.play.length === 2 && mlog.play[1].index === 10 && sys.director.state().plays === 2;
+    });
+    await step('page cache: a MENU page gets back the song of the player\'s pick (not the screen\'s own), and a page with the menu music Off stays silent', async () => {
+      const { sys, mlog, scope } = await make(); sys.menuMusic.set('editor'); for (let i = 0; i < 6; i++) await flush();
+      const ed = mlog.play.length && mlog.play[mlog.play.length - 1].index === 11;
+      sys.menuMusic.choose('battle_hard'); for (let i = 0; i < 6; i++) await flush();
+      scope.dispatch('pagehide', { type: 'pagehide', persisted: true }); await flush(); const n0 = mlog.play.length;
+      scope.dispatch('pageshow', { type: 'pageshow', persisted: true }); for (let i = 0; i < 6; i++) await flush();
+      const picked = mlog.play.length === n0 + 1 && mlog.play[mlog.play.length - 1].index === 22 && sys.director.state().want.key === 'battle_hard';
+      sys.menuMusic.choose('off'); for (let i = 0; i < 4; i++) await flush(); const n1 = mlog.play.length;
+      scope.dispatch('pagehide', { type: 'pagehide', persisted: true }); await flush(); scope.dispatch('pageshow', { type: 'pageshow', persisted: true }); for (let i = 0; i < 6; i++) await flush();
+      return !!ed && picked && sys.director.state().want === null && mlog.play.length === n1;
+    });
+    await step('page cache: destroy() removes the pagehide and pageshow listeners', async () => {
+      const { sys, scope } = await make(); const n = scope.count('pagehide') + scope.count('pageshow'); sys.destroy();
+      return n >= 2 && scope.count('pagehide') === 0 && scope.count('pageshow') === 0;
+    });
+    await step('menu music Off: the engine still loads (the menus\' sound effects play) with the changer on Off BEFORE the sound can start, and no song is played', async () => {
+      const log = {}; const scope = makeScope(); scope.__autoplayStrict = true; installFakeAudio(scope, log); const FD = fakeDom(); Object.assign(FD.doc, makeScope(), { hidden: false });       // strict: the browser refuses until the visitor acts
+      const mlog = {}; const music = makeStubMusic(mlog); const store = memStore({ 'arena.menumusic': JSON.stringify({ v: 1, pick: 'off' }) });
+      const sys = SS.createSoundSystem({ window: scope, document: FD.doc, storage: store, noPrompt: true, page: 'hub', bar: false, loadMusic: async () => music, loadMap: async () => makeStubMap(SYS_SONGS) });
+      sys.setRom({ bytes: new Uint8Array(8), pack: { species: [] } }); sys.menuMusic.set('hub'); for (let i = 0; i < 4; i++) await flush();
+      const before = mlog.create.length;                                           // no gesture yet: nothing loads
+      scope.__autoplayAllowed = true; scope.dispatch('keydown', { type: 'keydown', key: 'a' }); for (let i = 0; i < 8; i++) await flush();       // the browser now counts the key press
+      const h = sys.director.playSfx('se_cursor');
+      return before === 0 && mlog.create.length === 1 && mlog.play.length === 0 && sys.state().menuMusic.pick === 'off' && !!h && mlog.effect.length === 1 && mlog.effect[0].index === 200;
+    });
+    // EFFECTS ARE A PAGE OPTION: the hub and the battle page play effects, so with the menu music Off they still load the engine; the team editor plays none, so it loads nothing (no engine, and no
+    // Ultra Violet ROM fetched for it). The `effects` option overrides the page's default either way.
+    await step('menu music Off, effects are a page option: the hub and the battle page load the engine, the team editor loads nothing (Ultra Violet chosen: no ROM fetch either); the `effects` option overrides the default', async () => {
+      const run = async (extra) => {
+        const log = {}; const scope = makeScope(); scope.__autoplayAllowed = true; installFakeAudio(scope, log); const FD = fakeDom(); Object.assign(FD.doc, makeScope(), { hidden: false });
+        let uv = 0; scope.__arenaSoundModules = { uvRom: async () => { uv++; return new Uint8Array(16777216); } };
+        const mlog = {}; const music = makeStubMusic(mlog);
+        const store = memStore({ 'arena.menumusic': JSON.stringify({ v: 1, pick: 'off' }), 'arena.audio': JSON.stringify({ v: 1, master: 0.5, music: 0.6, fx: 0.8, muted: false, soundtrack: 'ultraviolet' }) });
+        const sys = SS.createSoundSystem({ window: scope, document: FD.doc, storage: store, noPrompt: true, bar: false, loadMusic: async () => music, loadMap: async () => makeStubMap(SYS_SONGS), ...extra });
+        sys.setRom({ bytes: new Uint8Array(8), pack: { species: [] } }); sys.menuMusic.set('hub'); scope.dispatch('keydown', { type: 'keydown', key: 'a' }); for (let i = 0; i < 12; i++) await flush();
+        return { created: mlog.create.length, plays: mlog.play.length, uv, engine: sys.state().director.engine };
+      };
+      const hub = await run({ page: 'hub' }), battle = await run({ page: 'battle' }), editor = await run({ page: 'editor' }), editorFx = await run({ page: 'editor', effects: true }), hubNoFx = await run({ page: 'hub', effects: false });
+      return hub.created === 1 && hub.engine === true && hub.plays === 0 && hub.uv === 1 && battle.created === 1 && battle.plays === 0
+        && editor.created === 0 && editor.engine === false && editor.plays === 0 && editor.uv === 0
+        && editorFx.created === 1 && editorFx.uv === 1 && hubNoFx.created === 0 && hubNoFx.engine === false && hubNoFx.uv === 0;
+    });
     await step('low-HP: only the PLAYER\'s Pokemon counts (the opponent in the red zone makes no beep)', async () => {
       const { sys, mlog } = await make(); const sc = stubScene(); sc.S.disp[1].hp = 2; for (let i = 0; i < 5; i++) sys.battleFrame(sc, 'normal', true); return beeps(mlog) === 0;
     });
@@ -831,6 +969,13 @@ head('6. sound_system.js: the low-HP warning (the game\'s red zone, once per sta
       { id: 'S13 the first animator sound switches the hit sound off', from: "chain('onHit', (_side, info) => { playKey(HIT_KEY(info && info.eff)); });", to: "chain('onHit', (_side, info) => { if (!S.animSounds) playKey(HIT_KEY(info && info.eff)); });", expect: 'hooks: the effectiveness sound (se_hit_super / weak / normal = 204 / 205 / 203 here) plays at every damaging hit, EVEN AFTER the animator has delivered sounds of its own (it never delivers this one: it is the battle script\'s)' },
       { id: 'S15 the prompt carries the old browser-rule clause', from: "long: 'Click, tap or press a keyboard key to start the sound (a controller button cannot). Esc or a controller button hides this.',", to: "long: 'Click, tap or press a keyboard key to start the sound. (A controller button cannot start it: that is a browser rule.)',", expect: 'prompt text: BOTH variants say what to do (click, tap or press a key) and that a controller button cannot (the layout decides which one is shown); neither carries the old "(that is a browser rule)" clause; the short one is short' },
       { id: 'S14 the animator\'s copy of the faint sound is not dropped', from: "if (nowMs() - t < FALLBACK_DEDUPE_MS) return; }", to: "if (false) return; }", expect: 'hooks: a faint plays se_faint ONCE: the animator\'s own copy of the same sound arriving right after is dropped; other animator sounds still pass' },
+      { id: 'S16 a page restored from the cache stays silent', from: 'try { director.set(w.key, w.then); } catch (_e) { /* the music is optional */ }', to: '', expect: 'page cache: pagehide stops the song and a pageshow FROM the cache brings the wanted song back (the battle page: straight from the director); a pageshow that is not from the cache brings nothing' },
+      { id: 'S17 a pageshow that is not from the cache restarts the music', from: 'if (S.destroyed || !e || e.persisted !== true) return;', to: 'if (S.destroyed || !e) return;', expect: 'page cache: pagehide stops the song and a pageshow FROM the cache brings the wanted song back (the battle page: straight from the director); a pageshow that is not from the cache brings nothing' },
+      { id: 'S18 the wanted song is not remembered when the page goes away', from: 'if (w) S.wantAtHide = w; }', to: 'if (w) { /* mutant: not remembered */ } }', expect: 'page cache: a MENU page gets back the song of the player\'s pick (not the screen\'s own), and a page with the menu music Off stays silent' },
+      { id: 'S19 the page cache listeners are never removed', from: "win.removeEventListener('pagehide', onPageHide); win.removeEventListener('pageshow', onPageShow); }", to: '}', expect: 'page cache: destroy() removes the pagehide and pageshow listeners' },
+      { id: 'S20 Off leaves the engine unloaded', from: 'romFor, effects,', to: 'romFor,', expect: 'menu music Off: the engine still loads (the menus\' sound effects play) with the changer on Off BEFORE the sound can start, and no song is played' },
+      { id: 'S21 the team editor loads the engine (and the Ultra Violet ROM) with Off: effects is true for every page', from: "(page === 'hub' || page === 'battle')", to: 'true', expect: 'menu music Off, effects are a page option: the hub and the battle page load the engine, the team editor loads nothing (Ultra Violet chosen: no ROM fetch either); the `effects` option overrides the default' },
+      { id: 'S22 the effects option is ignored', from: 'const effects = opts.effects !== undefined ? opts.effects === true :', to: 'const effects = ', expect: 'menu music Off, effects are a page option: the hub and the battle page load the engine, the team editor loads nothing (Ultra Violet chosen: no ROM fetch either); the `effects` option overrides the default' },
       { id: 'S11 the opponent counts', from: "const p = st && st.player;", to: "const p = st && (st.foe || st.player);", expect: 'low-HP: only the PLAYER\'s Pokemon counts (the opponent in the red zone makes no beep)' },
     ];
     for (const m of SYSM) {

@@ -1,5 +1,8 @@
 // tools/pokemonarena_sound_lib.mjs -- TEST-ONLY helpers shared by tools/pokemonarena_sound_test.mjs (Node) and tools/pokemonarena_sound_page_test.mjs (Chrome):
-//   * installFakeAudio(scope, log): a recording AudioContext double with real-shaped AudioParam automation. It can NEVER reach a device.
+//   * installFakeAudio(scope, log): a recording AudioContext double with real-shaped AudioParam automation. It can NEVER reach a device. It can EMULATE THE BROWSER'S AUTOPLAY POLICY: with
+//     scope.__autoplayStrict = true a context stays 'suspended' (resume() resolves without running) until the page has had a user activation (navigator.userActivation.hasBeenActive, true after any
+//     real CDP input) or scope.__autoplayAllowed = true says the site may autoplay (a Node test flips it by hand). Without __autoplayStrict (the Node default) resume() always succeeds, as before.
+//     Pages installed through AUDIO_DOUBLE_SRC are STRICT by default (what a real visitor has), and ?autoplay=1 in the address makes them allowed (the visitor's click on the previous page carried over).
 //   * AUDIO_DOUBLE_SRC: the same function as a string, to inject into a page before any page script runs (the page uses the identical code).
 //   * makeStubMusic(log) / makeStubMap(): stand-ins with the EXACT signatures of the shared contract (pokemonarena-music.md) for music.js and
 //     music_map.js, used until / besides the real modules. STUB_MODULES_SRC injects them as window.__arenaSoundModules.
@@ -35,7 +38,12 @@ export function installFakeAudio(scope, log) {
       log.ctxs.push(this);
     }
     _set(state) { if (this.state === state) return; this.state = state; if (typeof this.onstatechange === 'function') this.onstatechange(); }
-    resume() { log.resume++; return Promise.resolve().then(() => { this._set('running'); }); }
+    resume() {
+      log.resume++;
+      const nav = scope.navigator, active = !!(nav && nav.userActivation && nav.userActivation.hasBeenActive);
+      if (scope.__autoplayStrict === true && scope.__autoplayAllowed !== true && !active) { log.blocked = (log.blocked || 0) + 1; return Promise.resolve(); }       // the browser refuses: the context stays suspended
+      return Promise.resolve().then(() => { this._set('running'); });
+    }
     suspend() { log.suspend++; return Promise.resolve().then(() => { this._set('suspended'); }); }
     close() { log.close++; this.state = 'closed'; return Promise.resolve(); }
     createGain() { return new Gain(this); }
@@ -51,6 +59,7 @@ export const newAudioLog = () => ({});
 
 // the same double, as a page-injectable string. window.__snd is the log (plain data + the live ctx objects).
 export const AUDIO_DOUBLE_SRC = `(() => { if (/[?&]realaudio=1/.test(location.search)) return;       // the one scenario that runs the REAL AudioContext (Chrome is muted: --mute-audio)
+  window.__autoplayStrict = true; window.__autoplayAllowed = /[?&]autoplay=1/.test(location.search);       // a real visitor's policy: blocked until a gesture, unless ?autoplay=1 says the site may autoplay
   const log = window.__snd = {}; (${installFakeAudio.toString()})(window, log); })();`;
 
 /* ------------------------------------------------------------------------------------------------ stand-ins for the contract modules */

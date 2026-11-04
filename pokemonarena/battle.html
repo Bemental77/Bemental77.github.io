@@ -9,6 +9,7 @@
   <link rel="icon" href="data:," />
   <link rel="stylesheet" href="/pokemonarena/battle.css" />
   <link rel="stylesheet" href="/pokemonarena/input.css" />
+  <link rel="stylesheet" href="/pokemonarena/audiobar.css" />
   <!-- The game library's origin: ONE constant for the whole site (see lib/asset_base.js). The ROM URL is built from it in js/romfetch.js. -->
   <script src="/lib/asset_base.js?v=27d8c0a4"></script>
   <!-- Online play (js/online.js): the pairing, the host's approval of the joiner, ICE / relay fallback. Loaded for every battle so the ?v= stamp that tells two
@@ -20,10 +21,14 @@
     <a class="home" id="homeLink" href="/pokemonarena/">&lsaquo; Arena</a>
     <h1>Battle</h1>
     <button id="fullBtn" class="textbtn iconbtn" type="button" aria-pressed="false" aria-label="Fullscreen" title="Fullscreen"><svg class="ic ic-enter" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5" /></svg><svg class="ic ic-exit" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9 4v5H4M20 9h-5V4M15 20v-5h5M4 15h5v5" /></svg></button>
+    <!-- the audio bar (volume, mute): js/audiobar.js fills this in; the same placeholder is in every page's header (no music changer here: the battle picks its music) -->
+    <div id="audioBar" class="audiobar" data-page="battle" data-pending="1"></div>
     <div class="tools">
-      <button id="soundBtn" class="textbtn" type="button" aria-pressed="false" title="Sound is off until you turn it on">Sound: off</button>
+      <button id="soundBtn" class="textbtn" type="button" title="Sound settings: volume, music, effects, soundtrack">Sound: on</button>
       <button id="controlsBtn" class="textbtn" type="button" title="Keyboard, controller and touch settings">Controls</button>
       <button id="menuBtn" class="textbtn" type="button" title="Battle menu (Start)">Menu</button>
+      <!-- OPEN TO BATTLES (js/presence_boot.js): hidden until a battle against the CPU is up, invisible until the module has mounted (battle.css, which also draws the broadcast icon: no svg element, so the address-injection test of the page keeps counting none); the module keeps aria-pressed, the tooltip and the glow current -->
+      <button id="openBtn" class="textbtn iconbtn" type="button" aria-pressed="false" aria-label="Open to battles" hidden title="Open to battles: list your trainer name and online record on public servers so anyone using Play online can challenge you while you are in the hub or in a battle against the computer. The first time you switch it on, it asks you to confirm."></button>
     </div>
   </header>
   <!-- stands in for the header's Fullscreen button while the header is hidden (fullscreen on a phone held sideways) -->
@@ -44,6 +49,7 @@
         <button id="chipBack" class="chip" type="button" aria-label="Back to the action menu">&lsaquo; Back</button>
         <button id="chipInfo" class="chip" type="button" aria-label="Read the highlighted move's description">Info</button>
       </div>
+      <div id="live" class="sr" role="status" aria-live="polite"></div>   <!-- what the Open switch tells a screen reader (presence_boot.js say()): "No longer open to battles." -->
       <div id="boot" role="status">
         <p id="bootText">Starting...</p>
         <progress id="bar" max="1" value="0"></progress>

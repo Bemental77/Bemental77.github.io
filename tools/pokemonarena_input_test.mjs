@@ -665,12 +665,40 @@ async function unitSuite() {
     const R = (l, t, w, h) => ({ left: l, top: t, right: l + w, bottom: t + h });
     const cur = R(100, 100, 60, 30);
     const pick = (cands, dir, c = cur) => { const h = N.chooseNext(c, cands.map((x, i) => ({ rect: x, i })), dir); return h ? h.cand.i : -1; };
+    const viaOf = (cands, dir, c = cur) => { const h = N.chooseNext(c, cands.map((x, i) => ({ rect: x, i })), dir); return h ? h.via : null; };
     ok(pick([R(400, 140, 60, 30), R(100, 300, 60, 30)], 'down') === 1, 'nav/choose-aligned-beats-nearer-misaligned');
     ok(pick([R(100, 400, 60, 30), R(100, 180, 60, 30), R(100, 300, 60, 30)], 'down') === 1, 'nav/choose-nearest-aligned');
     ok(pick([R(100, 300, 60, 30), R(100, 20, 60, 30), R(300, 100, 60, 30), R(-200, 100, 60, 30)], 'down') === 0 && pick([R(100, 300, 60, 30), R(100, 20, 60, 30), R(300, 100, 60, 30), R(-200, 100, 60, 30)], 'up') === 1, 'nav/choose-direction-filter');
     ok(pick([R(100, 300, 60, 30), R(100, 20, 60, 30), R(300, 100, 60, 30), R(-200, 100, 60, 30)], 'right') === 2 && pick([R(100, 300, 60, 30), R(100, 20, 60, 30), R(300, 100, 60, 30), R(-200, 100, 60, 30)], 'left') === 3, 'nav/choose-left-right');
     ok(pick([R(110, 110, 60, 50), R(100, 400, 60, 30)], 'down') === 1, 'nav/choose-strict-beats-loose');
     ok(pick([R(110, 110, 60, 50)], 'down') === 0 && pick([R(110, 90, 60, 20)], 'down') === -1, 'nav/choose-loose-only-when-centre-is-beyond');
+    // A "merely further along" candidate must also share some of the cross-axis span. Otherwise Left from a wide control (the stats presets, 16..316 wide) picked a sticky-header button far ABOVE it
+    // (x 16..60, 636 px away) whenever it happened to be nearer than the next content control: a tie decided by the scroll position, which is what stopped the d-pad reaching the editor's Speed slider
+    // once the audio bar made the header taller. The same far candidate is still reachable when it is strictly ahead (UP), and a loose one that overlaps the row is still taken.
+    { const wide = R(16, 776, 300, 44), headerBtn = R(16, 96, 44, 44), farBelow = R(16, 1484, 44, 44), beside = R(10, 780, 20, 30);
+      ok(pick([headerBtn, farBelow], 'left', wide) === -1, 'nav/choose-loose-needs-cross-axis-overlap', pick([headerBtn, farBelow], 'left', wide));
+      ok(pick([R(300, 120, 60, 40)], 'down', R(100, 100, 60, 30)) === -1, 'nav/choose-loose-diagonal-neighbour-is-not-ahead');
+      ok(pick([headerBtn], 'up', wide) === 0 && pick([headerBtn, beside], 'left', wide) === 1, 'nav/choose-loose-in-line-still-taken-and-up-still-reaches-the-header'); }
+    // THE TWO SIDES OF THE `ogap === 0` RULE (uinav.js chooseNext). A "merely further along" candidate (it overlaps the current one along the move and its centre lies beyond) is taken ONLY when the two
+    // RECTANGLES overlap on both axes. The rule is wider than the editor bug that introduced it, on purpose: measured over every screen and dialog of the editor, the hub and the battle page (phone and
+    // desktop, old rule vs new) no Up / Down move changed and every changed Left / Right move was a jump to another row. Both sides are pinned on small fixtures, so widening or narrowing it fails here.
+    // REMOVED: a control BESIDE the current one is not ahead however much taller it is. Down from a short control beside a tall panel used to step sideways into the panel; Up from the panel into the short one.
+    { const shortBtn = R(100, 100, 60, 30), tallPanel = R(300, 90, 60, 200);
+      ok(pick([tallPanel], 'down', shortBtn) === -1 && pick([tallPanel], 'up', shortBtn) === -1 && pick([shortBtn], 'up', tallPanel) === -1 && pick([shortBtn], 'down', tallPanel) === -1, 'nav/choose-side-by-side-taller-neighbour-is-not-ahead',
+        J([pick([tallPanel], 'down', shortBtn), pick([tallPanel], 'up', shortBtn), pick([shortBtn], 'up', tallPanel), pick([shortBtn], 'down', tallPanel)]));
+      // ... and a real strictly-below control still wins over nothing: the neighbour being skipped does not make Down dead
+      ok(pick([tallPanel, R(100, 300, 60, 30)], 'down', shortBtn) === 1, 'nav/choose-side-by-side-neighbour-skipped-strictly-below-still-found'); }
+    // REMOVED: Left / Right to a control stacked above or below (the editor's "Open teams" 29..134 x 369..413 and the "Export" under it, 29..99 x 421..465: Left used to jump down a row)
+    { const open = R(29, 369, 105, 44), exportBtn = R(29, 421, 70, 44), wideBelow = R(80, 421, 100, 44);
+      ok(pick([exportBtn], 'left', open) === -1 && pick([wideBelow], 'right', open) === -1 && pick([open], 'left', exportBtn) === -1, 'nav/choose-stacked-offset-neighbour-is-not-ahead-for-left-right',
+        J([pick([exportBtn], 'left', open), pick([wideBelow], 'right', open), pick([open], 'left', exportBtn)])); }
+    // RETAINED: rectangles that overlap on BOTH axes (a control straddling the edge of a bigger one) are still "ahead", as a loose pick, and any strictly-ahead control still beats them
+    { const big = R(100, 100, 100, 100), straddler = R(120, 150, 40, 100), far = R(100, 400, 100, 30);
+      ok(pick([straddler], 'down', big) === 0 && viaOf([straddler], 'down', big) === 'loose' && pick([straddler, far], 'down', big) === 1 && viaOf([straddler, far], 'down', big) === 'strict', 'nav/choose-overlapping-neighbour-is-still-taken-as-loose',
+        J([pick([straddler], 'down', big), viaOf([straddler], 'down', big), pick([straddler, far], 'down', big)])); }
+    // NOT AFFECTED (INPUT.md says so): a control STRICTLY in that direction is chosen even from another row; the cross-axis offset only costs 2 * its size in the score, it does not exclude it
+    { const c = R(300, 100, 60, 30), otherRow = R(100, 200, 60, 30), sameRowNear = R(200, 100, 60, 30);
+      ok(pick([otherRow], 'left', c) === 0 && viaOf([otherRow], 'left', c) === 'strict' && pick([otherRow, sameRowNear], 'left', c) === 1, 'nav/choose-strictly-left-control-in-another-row-is-still-chosen', J([pick([otherRow], 'left', c), pick([otherRow, sameRowNear], 'left', c)])); }
     ok(pick([R(100, 200, 60, 30), R(100, 200, 60, 30)], 'down') === 0, 'nav/choose-tie-goes-to-dom-order');
     ok(pick([R(100, 20, 60, 30)], 'down') === -1 && pick([], 'down') === -1, 'nav/choose-nothing-ahead-is-null');
     ok(pick([R(160, 100, 60, 30), R(160, 300, 60, 30)], 'right') === 0, 'nav/choose-same-row-neighbour');
@@ -1397,6 +1425,13 @@ const MUTANTS = [
   U('nav-score-centre-to-centre', NV, 'const ocOut = aligned ? 0 : Math.max(0, a.os - b.oc, b.oc - a.oe);', 'const ocOut = oc;', 'nav/choose-narrow-control-under-a-wide-one'),
   U('nav-direction-inverted', NV, "const along = dir === 'down' || dir === 'right' ? s : [-s[1], -s[0]];", "const along = dir === 'up' || dir === 'right' ? s : [-s[1], -s[0]];", 'nav/choose-direction-filter'),
   U('nav-loose-beats-strict', NV, 'score = 1000 + (b.ac - a.ac)', 'score = (b.ac - a.ac)', 'nav/choose-strict-beats-loose'),
+  U('nav-loose-ignores-cross-axis', NV, 'else if (b.ac > a.ac + ALIGN_TOL && ogap === 0) {', 'else if (b.ac > a.ac + ALIGN_TOL) {', 'nav/choose-loose-needs-cross-axis-overlap'),
+  // the `ogap === 0` rule, one mutant per side: the old pick restored for Up / Down only (a side-by-side taller neighbour), for Left / Right only (a stacked offset neighbour), the loose pick gone altogether
+  // (rectangles that overlap on both axes), and the strict pick narrowed to the same cross-axis span (a control strictly left in another row)
+  U('nav-loose-restored-for-up-down', NV, 'else if (b.ac > a.ac + ALIGN_TOL && ogap === 0) {', "else if (b.ac > a.ac + ALIGN_TOL && (ogap === 0 || dir === 'up' || dir === 'down')) {", 'nav/choose-side-by-side-taller-neighbour-is-not-ahead'),
+  U('nav-loose-restored-for-left-right', NV, 'else if (b.ac > a.ac + ALIGN_TOL && ogap === 0) {', "else if (b.ac > a.ac + ALIGN_TOL && (ogap === 0 || dir === 'left' || dir === 'right')) {", 'nav/choose-stacked-offset-neighbour-is-not-ahead-for-left-right'),
+  U('nav-loose-removed', NV, 'else if (b.ac > a.ac + ALIGN_TOL && ogap === 0) {', 'else if (false) {', 'nav/choose-overlapping-neighbour-is-still-taken-as-loose'),
+  U('nav-strict-needs-same-cross-axis-span', NV, 'if (gap >= -ALIGN_TOL) { score = Math.max(0, gap) + 2 * ogap', 'if (gap >= -ALIGN_TOL && ogap === 0) { score = Math.max(0, gap) + 2 * ogap', 'nav/choose-strictly-left-control-in-another-row-is-still-chosen'),
   U('nav-big-step-is-small', NV, 'const delta = (o.big ? bigStep : step) * o.dir;', 'const delta = step * o.dir;', 'nav/step-big'),
   U('nav-step-not-clamped', NV, 'if (Number.isFinite(o.max)) v = Math.min(o.max, v);', '', 'nav/step-clamp-max'),
   U('nav-step-not-snapped', NV, 'v = base + Math.round((v - base) / step) * step;', '', 'nav/step-snaps-to-grid'),

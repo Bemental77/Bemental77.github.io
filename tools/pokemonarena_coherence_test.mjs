@@ -64,7 +64,9 @@ export function staticScan(paDir, rootDir) {
   for (const f of files) {
     const rel = path.relative(paDir, f).split(path.sep).join('/');
     if (/\.golden\.json$|_manifest\.json$|^engine_coverage\.json$/.test(rel)) continue;     // hashes and offsets only
-    const s = fs.readFileSync(f, 'utf8');
+    // the open-games board (js/openlobby.js) lists the public MQTT brokers lib/netplay.js pairs through, and one of them is demo.tbmq.io with the username "demo": a host and a credential in a
+    // constant, never shown to a player. That exact entry is removed (nothing broader) before the scan, so a "demo" in wording still fails.
+    const s = fs.readFileSync(f, 'utf8').split('wss://demo.tbmq.io:443/mqtt|demo|').join('');
     const m = s.match(DEMO_RE);
     if (m) hits.push({ rel, n: m.length });
   }

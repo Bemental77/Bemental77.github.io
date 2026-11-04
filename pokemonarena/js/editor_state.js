@@ -33,7 +33,7 @@ import {
   STAT_ORDER, LIMITS, pointsToEv, evToPoints, hiddenPowerIvs, snapEvsToMinimum, sumStats,
 } from './stats.js';
 import { monsFromDecoded } from './teamcode.js';
-import { moveStatuses, itemStatus, genderOptions, defaultGender, abilityOptions, speciesExclusions } from './editor_data.js';
+import { moveStatuses, itemStatus, genderOptions, defaultGender, abilityOptions, speciesExclusions, speciesComparator, SPECIES_SORT_IDS, SPECIES_SORTS } from './editor_data.js';
 
 export const EDITOR_LIMITS = Object.freeze({ teamsMax: 16, undoMax: 20, teamSize: 6, boxMax: PROFILE_LIMITS.boxMax });
 export const AVATAR_PRESETS = 52; // the ROM's trainer head portraits (speciesgfx.js TRAINER_HEAD_COUNT)
@@ -110,7 +110,7 @@ function restoreContent(current, snapshot) {
 const LABELS = {
   rename: 'rename profile', avatar: 'change avatar', setting: 'change setting', teamCreate: 'new team', teamRename: 'rename team', teamDuplicate: 'duplicate team', teamDelete: 'delete team',
   teamMove: 'reorder teams', teamRuleset: 'change rules', teamConform: 'convert team to its rules', teamImport: 'import team', saveImport: 'import from a save', monAdd: 'add Pokemon', monRemove: 'remove Pokemon',
-  monMove: 'reorder Pokemon', monDuplicate: 'duplicate Pokemon', monSet: 'edit Pokemon', moveSet: 'change move', moveReorder: 'reorder moves', evSet: 'change EVs',
+  monMove: 'reorder Pokemon', teamSort: 'sort Pokemon', monDuplicate: 'duplicate Pokemon', monSet: 'edit Pokemon', moveSet: 'change move', moveReorder: 'reorder moves', evSet: 'change EVs',
   ivSet: 'change IVs', ivPreset: 'IV preset', evSnap: 'snap EVs', evReset: 'reset EVs', boxCleanup: 'clean up the box',
 };
 
@@ -462,6 +462,22 @@ function step(state, action, ctx) {
     const ids = team.monIds.slice();
     ids.splice(to.value, 0, ids.splice(i, 1)[0]);
     return commit(state, type, { ...P, teams: P.teams.map((t) => (t === team ? { ...t, monIds: ids } : t)) });
+  }
+  if (type === 'teamSort') {
+    // Put a team's Pokemon in Pokedex, name or type order. This is the team's SLOT order: in a 6v6 battle slot 1 leads, but in 3v3 the lead is chosen at team preview
+    // (engine.js: a `pick` battle starts in the 'preview' phase), so nothing here promises a lead. One undo step; equal Pokemon keep the order they had.
+    // Both outcomes carry a notice, because the screen says nothing else: 'team.sorted' (what the new order is) and 'team.in-order' (nothing moved, and why).
+    const team = findTeam(P, action.teamId);
+    if (!team) return reject(state, type, 'team.missing', 'no such team');
+    if (!pack) return reject(state, type, 'ctx.pack', 'this action needs the ROM tables');
+    if (!SPECIES_SORT_IDS.includes(action.by)) return reject(state, type, 'sort.unknown', 'sort by dex, name or type');
+    const cmp = speciesComparator(pack, action.by);
+    const speciesOf = (id) => { const m = findMon(P, id); return m ? m.species : -1; };
+    const ids = team.monIds.map((id, i) => ({ id, i })).sort((a, b) => cmp(speciesOf(a.id), speciesOf(b.id)) || a.i - b.i).map((x) => x.id);
+    const how = SPECIES_SORTS.find((x) => x[0] === action.by)[1].toLowerCase();
+    if (ids.every((id, i) => id === team.monIds[i])) return { ...state, error: null, notice: { code: 'team.in-order', message: `the team is already sorted by ${how}` }, result: null };
+    const nameOf = (id) => { const m = findMon(P, id); const sp = m ? pack.species[m.species] : null; return (m && m.nickname) || (sp ? sp.name : '?'); };
+    return commit(state, type, { ...P, teams: P.teams.map((t) => (t === team ? { ...t, monIds: ids } : t)) }, { notice: { code: 'team.sorted', message: `sorted by ${how}: ${ids.map(nameOf).join(', ')}` } });
   }
   if (type === 'monDuplicate') {
     const team = findTeam(P, action.teamId);

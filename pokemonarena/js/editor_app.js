@@ -28,7 +28,7 @@ import { importView } from './editor_import.js';
 import { createControlsDialog } from './controls_dialog.js';
 import { describeRomError, showRomError } from './rom_error.js';
 import {
-  exportBytes, parseExport, planImport, compressionAvailable, defaultDeps, textIssue, PROFILE_LIMITS, EXPORT_MAX_BYTES, IMPORT_CODES,
+  exportBytes, parseExport, planImport, compressionAvailable, defaultDeps, textIssue, PROFILE_LIMITS, EXPORT_MAX_BYTES, IMPORT_CODES, withStoredRecord,
 } from './profile.js';
 import { encodeTeamCode, decodeTeamCode, teamFromProfile, validateDecodedTeam } from './teamcode.js';
 import { identityStatus, ensureIdentity, rotateIdentity } from './identity.js';
@@ -389,7 +389,7 @@ async function main() {
       async rotateIdentity() { try { const r = await rotateIdentity(S.profile, store.keys, { acknowledgeLoss: true, reason: 'rotated by player' }); dispatch({ type: 'setIdentity', identity: r.profile.identity }, { quiet: true }); await flush(); toast('Identity key replaced.'); } catch (e) { toast('Could not replace the key: ' + e.message, 'bad'); } },
       async requestPersistence() { const r = await store.requestPersistence(); toast(!r.supported ? 'This browser cannot promise to keep the data.' : r.granted ? 'The browser will keep this data.' : 'The browser declined; export a backup now and then.'); render(); },
       async reloadActive() { conflict = null; stale = false; saveError = null; const id = S.profile.id; await loadInto(id); viewKey = null; render(); toast('Loaded the other tab\'s version.'); },
-      async keepMine() { const cur = await store.loadProfile(S.profile.id); if (cur.ok) { S = reduce(S, { type: 'rebase', rev: cur.profile.rev }, ctx()); conflict = null; stale = false; await flush(); toast('Your version was saved over the other one.'); } render(); },
+      async keepMine() { const cur = await store.loadProfile(S.profile.id); if (cur.ok) { S = reduce(S, { type: 'rebase', rev: cur.profile.rev }, ctx()); S = { ...S, profile: withStoredRecord(S.profile, cur.profile) }; conflict = null; stale = false; await flush(); toast('Your version was saved over the other one.'); } render(); },
     };
 
     /* ---------------------------------------------------------------- the app object the views use */
@@ -451,7 +451,7 @@ async function main() {
     import('./sound_system.js').then((m) => {
       if (T.sound) return;
       T.sound = m.createSoundSystem({ page: 'editor', button: document.getElementById('soundBtn'), input: () => T.input || null, ownNav: false });       // ownNav false: the page's own enableDomNav (below) drives the dialog
-      T.sound.setRom({ bytes, pack }); T.sound.director.set('editor'); window.__arenaSound = T.sound;
+      T.sound.setRom({ bytes, pack }); T.sound.menuMusic.set('editor'); window.__arenaSound = T.sound;
     }).catch((e) => { T.soundError = String(e && e.message ? e.message : e); console.warn('[editor] sound is unavailable:', e); });
 
     /* ---------------------------------------------------------------- controller / keyboard navigation (shared input layer, optional) */

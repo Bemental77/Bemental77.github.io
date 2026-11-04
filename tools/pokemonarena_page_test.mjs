@@ -280,14 +280,17 @@ async function commonChecks(page, tag, { pad }) {
   const btns = await page.eval("[...document.querySelectorAll('.pbtn')].map((b) => { const r = b.getBoundingClientRect(); return { id: b.id, w: r.width, h: r.height, vis: r.width > 0 && r.height > 0 && getComputedStyle(b).visibility !== 'hidden' && b.offsetParent !== null }; })");
   if (pad) ok(btns.length === 6 && btns.every((b) => b.vis && b.w >= 44 && b.h >= 44), tag + ': all 6 touch buttons are visible and >= 44 px (min ' + Math.min(...btns.map((b) => Math.min(b.w, b.h))).toFixed(0) + ' px)', J(btns));
   else ok(btns.every((b) => !b.vis), tag + ': touch buttons are hidden on a desktop without touch');
-  // header: one row at every width (the way back, Sound, Controls and the Fullscreen switch fit in 288 px; a second row pushed the bottom touch buttons off a 568 px screen), every control >= 44 px, nothing wrapped
-  const head = await page.eval("(() => { const t = document.getElementById('top'); const kids = [...t.querySelectorAll('a, button')].map((e) => { const r = e.getBoundingClientRect(); return { id: e.id || e.className, w: r.width, h: r.height, top: r.top, l: r.left, r: r.right }; }); const home = document.getElementById('homeLink'); const hr = home.getBoundingClientRect(); return { kids, homeH: hr.height, tops: [...new Set(kids.map((k) => Math.round(k.top)))], vw: document.documentElement.clientWidth }; })()");
+  // header: one row at every width (the way back, Sound, Controls and the Fullscreen switch fit in 288 px; a second row pushed the bottom touch buttons off a 568 px screen), every control >= 44 px, nothing wrapped.
+  // THE AUDIO BAR (js/audiobar.js) IS NOT ONE OF THESE FOUR CONTROLS: on a portrait phone it has a row of its own under them (and the hub gives back the room it needs, see audiobar.css), so this probe leaves it out and
+  // the bar's own rules live in tools/pokemonarena_audiobar_test.mjs. What the one-row rule protected is asserted directly below: the touch pad still ends on the screen.
+  const head = await page.eval("(() => { const t = document.getElementById('top'); const kids = [...t.querySelectorAll('a, button')].filter((e) => !e.closest('#audioBar')).map((e) => { const r = e.getBoundingClientRect(); return { id: e.id || e.className, w: r.width, h: r.height, top: r.top, l: r.left, r: r.right }; }); const home = document.getElementById('homeLink'); const hr = home.getBoundingClientRect(); return { kids, homeH: hr.height, tops: [...new Set(kids.map((k) => Math.round(k.top)))], vw: document.documentElement.clientWidth }; })()");
   ok(head.kids.every((k) => k.w >= 43.5 && k.h >= 43.5), tag + ': header controls are >= 44 px', J(head.kids));
   ok(head.tops.length === 1, tag + ': the header is one row (controls share one top edge)', J(head.tops));
   { const fb = head.kids.find((x) => x.id === 'fullBtn'), sb = head.kids.find((x) => x.id === 'soundBtn'), cb = head.kids.find((x) => x.id === 'controlsBtn');
     ok(fb && fb.w >= 43.5 && fb.h >= 43.5 && fb.r <= head.vw - 15.5 + 0.5, tag + ': the Fullscreen button is on screen, >= 44 px, inside the gutter', J(fb));
     ok(sb && cb && fb && sb.l >= 15.5 && sb.r <= cb.l && cb.r <= fb.l + 0.5, tag + ': Sound, Controls and Fullscreen sit in that order without overlapping', J([sb, cb, fb])); }
   ok(head.homeH < 60, tag + ': the Home link does not wrap onto two lines (height ' + head.homeH.toFixed(0) + ')', J(head));
+  if (pad) { const low = await page.eval("Math.max(...[...document.querySelectorAll('.pbtn')].filter((b) => b.getBoundingClientRect().width > 0).map((b) => b.getBoundingClientRect().bottom)) <= innerHeight"); ok(low === true, tag + ': the touch buttons all end on the screen (the row the audio bar adds did not push them off)', J(low)); }
   const dem = await page.eval(DEMO_JS);
   ok(dem.length === 0, tag + ': no "demo" / placeholder / [object / undefined / NaN anywhere in the text, title, labels or live region', J(dem));
   const errs = errsOf(page);

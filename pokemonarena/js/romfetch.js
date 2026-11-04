@@ -20,6 +20,7 @@
 // revert switch in lib/asset_base.js.
 
 import { PINNED, identify, sha256HexFast } from './rom.js';
+import { readCachedRom, writeCachedRom, dropCachedRom } from './romcache.js';
 
 export const ROM_PATH = '/gba/gbaWasm/roms/Pokemon%20SoulGold%20(v1.1.1).gba';
 export const DEFAULT_ASSET_BASE = '/gamedata';
@@ -102,8 +103,31 @@ export async function verifyRom(bytes, hasher = sha256HexFast) {
   return { sha256: sha };
 }
 
+/**
+ * Fetch (or recall) the ROM and verify it. -> { bytes, sha256, cached, verified } | (deferVerify, recalled copy) { bytes, sha256, cached: true, verify }
+ *
+ * THE PERSISTENT COPY (romcache.js). On a real page (no fetchImpl injected) a ROM that was verified on an earlier visit is read back from Cache Storage instead of downloaded again; a
+ * copy is written only after a successful full verification. `persist: true | false` overrides the default; a test that injects fetchImpl never touches the cache.
+ *
+ * `deferVerify: true` is for a page that wants to put its first frame up at once (the hub): a recalled copy is returned immediately WITHOUT re-hashing, with `verify()` instead of `verified`:
+ * calling it runs the full length + header + SHA-256 check (it rejects with the same RomLoadError and drops the stored copy). The caller must call it, and should do so right AFTER its first
+ * frame: handing 32 MB to WebCrypto copies the buffer on the calling thread (measured ~25 ms at full speed, ~90 ms at 4x CPU), which is exactly what the first frame should not wait for.
+ * Without `deferVerify` the check completes before this returns, as it always did (`verified` is then already resolved, and there is no `verify`). A freshly DOWNLOADED ROM is always
+ * verified before this returns.
+ */
 export async function loadVerifiedRom(opts = {}) {
+  const persist = opts.persist !== undefined ? !!opts.persist : (opts.fetchImpl === undefined && opts.hasher === undefined);
+  if (persist) {
+    const hit = await readCachedRom(opts);
+    if (hit) {
+      if (opts.onProgress) opts.onProgress(PINNED.length, PINNED.length);
+      const check = async () => { try { return await verifyRom(hit.bytes, opts.hasher); } catch (e) { await dropCachedRom(opts); throw e; } };
+      if (opts.deferVerify) return { bytes: hit.bytes, sha256: hit.sha256, cached: true, verify: check };
+      try { const { sha256 } = await check(); return { bytes: hit.bytes, sha256, cached: true, verified: Promise.resolve({ sha256 }) }; } catch (_e) { /* the stored copy was bad and is gone: the network below decides */ }
+    }
+  }
   const bytes = await fetchRom(opts);
   const { sha256 } = await verifyRom(bytes, opts.hasher);
-  return { bytes, sha256 };
+  if (persist) writeCachedRom(bytes, opts).catch(() => { /* a copy that could not be kept costs the next visit a download, nothing else */ });
+  return { bytes, sha256, cached: false, verified: Promise.resolve({ sha256 }) };
 }

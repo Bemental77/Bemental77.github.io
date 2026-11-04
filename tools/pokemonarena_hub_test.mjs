@@ -526,7 +526,9 @@ try {
     ok((await armFacts({ eval: async () => ({ hoverHover: false, hoverNone: true, ptrFine: false, ptrCoarse: false, maxTouch: 0 }) }, 'desktop')).ok === false, tag + 'ARM control: a page that reports hover:none is NOT accepted as a desktop arm (the arm check is not a placebo)');
     ok((await boot(page)) === 'ready', tag + 'the hub reaches ready');
     ok((await page.eval(`document.body.dataset.pad`)) === 'off', tag + 'no touch pad on a desktop');
-    ok((await page.eval(`${HUB}.sound.on()`)) === true && (await page.eval(`localStorage.getItem('arena.audio')`)) === null && (await page.eval(`localStorage.getItem('arena.sound')`)) === null && (await page.eval('window.__audioLog.ctor')) === 0, tag + 'SOUND IS ON BY DEFAULT (MU3): nothing stored, and no AudioContext is created before the first click, tap or key');
+    ok((await page.eval(`${HUB}.sound.on()`)) === true && (await page.eval(`localStorage.getItem('arena.audio')`)) === null && (await page.eval(`localStorage.getItem('arena.sound')`)) === null && (await page.eval('window.__audioLog.ctor')) <= 1 && (await page.eval('window.__arenaSound.state().mixer.ctx')) !== 'running', tag + 'SOUND IS ON BY DEFAULT (MU3): nothing stored, and nothing is RUNNING before the first click, tap or key (the page tried at load: its context, if the double made one, is suspended, as a real browser keeps it without a gesture)');
+    // (UPDATED DELIBERATELY with the new defaults: nothing stored now means Master 50%, and the visible audio bar says so)
+    ok((await page.eval(`window.__arenaSound.mixer.getAudioState().settings.master`)) === 0.5 && (await page.eval(`document.getElementById('abVolume').value`)) === '50', tag + 'the starting volume is half the slider: Master 0.5, and the bar\'s slider reads 50');
     // keyboard: down x3, Enter -> TEAM BUILDER (ST1: RECORD sits between BATTLE WITH MY TEAM and TEAM BUILDER)
     await key(page, 'down'); await key(page, 'down'); await key(page, 'down'); await sleep(80);
     ok((await cursor(page)) === 3, tag + 'three ArrowDown presses reach TEAM BUILDER');
@@ -809,7 +811,7 @@ try {
     ok((await boot(page, '#quick')) === 'ready', tag + 'the hub boots with a tampered settings value');
     ok((await rowVal(page, 'format')) === '3v3' && (await rowVal(page, 'cpu')) === 'NORMAL', tag + 'a tampered remembered value falls back to the defaults (3v3 / NORMAL)', (await rowVal(page, 'format')) + ' ' + (await rowVal(page, 'cpu')));
     // MU3: the old arena.sound is migrated only when it is exactly "1" or "0"; anything else is ignored and the default (sound ON, nothing created before a gesture) applies
-    ok((await page.eval(`${HUB}.sound.on()`)) === true && (await page.eval('window.__audioLog.ctor')) === 0, tag + 'a tampered old sound value ("yes") is ignored: the default applies (sound on, no AudioContext before a gesture)');
+    ok((await page.eval(`${HUB}.sound.on()`)) === true && (await page.eval('window.__audioLog.ctor')) <= 1 && (await page.eval('window.__arenaSound.state().mixer.ctx')) !== 'running', tag + 'a tampered old sound value ("yes") is ignored: the default applies (sound on, nothing running before a gesture)');
     ok(errsOf(page).length === 0, tag + 'no console errors', errsOf(page).slice(0, 2).join(' | '));
   });
 

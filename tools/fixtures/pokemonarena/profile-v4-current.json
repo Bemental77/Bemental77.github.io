@@ -1,6 +1,6 @@
 {
  "app": "pokemonarena",
- "schemaVersion": 3,
+ "schemaVersion": 4,
  "id": "p_fixture03",
  "rev": 12,
  "createdAt": 1700000000000,
@@ -149,35 +149,35 @@
   "byRuleset": {
    "arena-gen3-standard+strict-champions": {
     "w": 3,
-    "l": 1
+    "l": 2
    }
   },
-  "firstMatchAt": null,
-  "playMs": 0,
+  "firstMatchAt": 1700000100000,
+  "playMs": 1830000,
   "byFormat": {
    "3v3": {
-    "w": 0,
-    "l": 0,
+    "w": 2,
+    "l": 1,
     "dr": 0,
     "f": 0
    },
    "6v6": {
-    "w": 0,
+    "w": 1,
     "l": 0,
     "dr": 0,
-    "f": 0
+    "f": 1
    }
   },
   "byCpu": {
    "easy": {
-    "w": 0,
+    "w": 1,
     "l": 0,
     "dr": 0,
     "f": 0
    },
    "normal": {
-    "w": 0,
-    "l": 0,
+    "w": 2,
+    "l": 1,
     "dr": 0,
     "f": 0
    },
@@ -185,37 +185,132 @@
     "w": 0,
     "l": 0,
     "dr": 0,
+    "f": 1
+   },
+   "online": {
+    "w": 0,
+    "l": 0,
+    "dr": 0,
     "f": 0
    }
   },
   "totals": {
-   "turns": 0,
-   "kos": 0,
-   "faints": 0,
-   "dealt": 0,
-   "taken": 0,
-   "hits": 0,
-   "crits": 0,
-   "superEffective": 0,
-   "resisted": 0,
-   "noEffect": 0,
-   "misses": 0,
-   "statusInflicted": 0,
-   "healed": 0,
-   "switches": 0
+   "turns": 62,
+   "kos": 12,
+   "faints": 8,
+   "dealt": 2210,
+   "taken": 1904,
+   "hits": 36,
+   "crits": 3,
+   "superEffective": 11,
+   "resisted": 5,
+   "noEffect": 1,
+   "misses": 4,
+   "statusInflicted": 3,
+   "healed": 140,
+   "switches": 6
   },
   "bests": {
-   "hit": null,
-   "fastestWin": null,
-   "longest": null,
-   "koStreak": 0
+   "hit": {
+    "sp": 9,
+    "mv": 11,
+    "dmg": 211,
+    "pct": 88,
+    "vs": 94,
+    "at": 1700000300000
+   },
+   "fastestWin": {
+    "turns": 9,
+    "at": 1700000200000
+   },
+   "longest": {
+    "turns": 21,
+    "at": 1700000550000
+   },
+   "koStreak": 3
   },
   "fav": {
-   "species": {},
-   "moves": {},
-   "mvps": {}
+   "species": {
+    "9": 4,
+    "94": 3
+   },
+   "moves": {
+    "11": 9,
+    "12": 6,
+    "21": 5
+   },
+   "mvps": {
+    "9": 3,
+    "94": 1
+   }
   },
-  "recent": []
+  "recent": [
+   {
+    "id": "s5_3v3_normal_lq0a",
+    "at": 1700000550000,
+    "fmt": "6v6",
+    "cpu": "hard",
+    "res": "f",
+    "turns": 4,
+    "mvp": 0,
+    "team": [
+     9,
+     94
+    ]
+   },
+   {
+    "id": "s4_3v3_normal_lq09",
+    "at": 1700000450000,
+    "fmt": "3v3",
+    "cpu": "normal",
+    "res": "w",
+    "turns": 12,
+    "mvp": 9,
+    "team": [
+     9,
+     94
+    ]
+   },
+   {
+    "id": "s3_3v3_normal_lq08",
+    "at": 1700000350000,
+    "fmt": "3v3",
+    "cpu": "normal",
+    "res": "w",
+    "turns": 21,
+    "mvp": 94,
+    "team": [
+     9,
+     94
+    ]
+   },
+   {
+    "id": "s2_3v3_easy_lq07",
+    "at": 1700000250000,
+    "fmt": "3v3",
+    "cpu": "easy",
+    "res": "w",
+    "turns": 9,
+    "mvp": 9,
+    "team": [
+     9,
+     94
+    ]
+   },
+   {
+    "id": "s1_3v3_normal_lq06",
+    "at": 1700000150000,
+    "fmt": "3v3",
+    "cpu": "normal",
+    "res": "l",
+    "turns": 16,
+    "mvp": 9,
+    "team": [
+     9,
+     94
+    ]
+   }
+  ]
  },
  "identity": {
   "publicKeyJwk": {

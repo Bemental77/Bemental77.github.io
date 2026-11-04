@@ -8,6 +8,7 @@
   <link rel="icon" href="data:," />
   <link rel="stylesheet" href="/pokemonarena/editor.css" />
   <link rel="stylesheet" href="/pokemonarena/input.css" />
+  <link rel="stylesheet" href="/pokemonarena/audiobar.css" />
   <!-- The game library's origin: ONE constant for the whole site (see lib/asset_base.js). The ROM URL is built from it in js/romfetch.js. -->
   <script src="/lib/asset_base.js"></script>
 </head>
@@ -20,6 +21,8 @@
       <button type="button" class="btn small" id="undoBtn" disabled>Undo</button>
       <button type="button" class="btn small" id="redoBtn" disabled>Redo</button>
     </div>
+    <!-- the audio bar (volume, mute, menu music): js/audiobar.js fills this in; the same placeholder is in every page's header -->
+    <div id="audioBar" class="audiobar" data-page="editor" data-pending="1"></div>
     <button type="button" class="btn small" id="soundBtn" title="Sound settings: volume, music, effects, soundtrack">Sound</button>
     <button type="button" class="btn small" id="controlsBtn" title="Keyboard, controller and touch settings">Controls</button>
     <span id="saveState" class="save" data-state="saved" role="status" aria-live="polite"><span class="dot" aria-hidden="true"></span><span id="saveText">Saved</span></span>

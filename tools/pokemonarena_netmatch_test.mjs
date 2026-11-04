@@ -2,7 +2,7 @@
 // scriptable wire, each running the REAL engine on the REAL ROM pack with the engine's own AI standing in for the human.
 //
 //   node tools/pokemonarena_netmatch_test.mjs            the suite
-//   node tools/pokemonarena_netmatch_test.mjs --mutants  ALSO prove the suite is not vacuous: break netmatch.js fourteen ways, each must fail a case
+//   node tools/pokemonarena_netmatch_test.mjs --mutants  ALSO prove the suite is not vacuous: break netmatch.js (and the modules it leans on) many ways, each must fail a named case
 //
 // WHAT IS CLAIMED, AND HOW EACH CLAIM IS TESTED (a claim with no failing case is not a claim):
 //   * two honest machines finish the same battle with the same winner and the same final state hash      -> case A (16 battles, both formats, both AIs)
@@ -13,6 +13,10 @@
 //   * a different ROM / engine build / ruleset / short team / bad team code is refused by name              -> case G
 //   * leaving, running out of time, a dead link, a link that comes back                                    -> case H
 //   * a rematch needs both players and re-runs the seed handshake                                          -> case I
+//   * a claim that YOU lost (whatever label it carries) is believed only when your own clock / link agrees -> case H
+//   * a match stopped by the end-of-match comparison, even after the engine finished, is not countable    -> case K (battle_boot.js asks nm.countable() before it writes a profile)
+//   * a battle against a person is recorded once (same id after a reload, one fold per id), and a walkover
+//     is a win that is neither the fastest win nor the longest battle                                      -> case O
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -50,6 +54,7 @@ async function suiteMain(S, label, { only } = {}) {
       ok(h.nm.result.hash === g.nm.result.hash, tag(`A${i} same final state hash`), h.nm.result.hash + ' vs ' + g.nm.result.hash);
       ok(h.nm.result.winnerSide === g.nm.result.winnerSide, tag(`A${i} same winner`));
       ok(h.nm.result.iWon === (h.nm.result.winnerSide === 0) && g.nm.result.iWon === (g.nm.result.winnerSide === 1), tag(`A${i} iWon follows the side`));
+      ok(h.nm.countable() && g.nm.countable(), tag(`A${i} a match that ran to its result and was not stopped is countable (it may be written to a record)`));
       ok(h.ctl.battle.logHash() === g.ctl.battle.logHash(), tag(`A${i} same event log`));
       const bySide = (P, side) => JSON.stringify(P.ctl.battle.choiceLog.filter((e) => e.s === side));
       ok(bySide(h, 0) === bySide(g, 0) && bySide(h, 1) === bySide(g, 1), tag(`A${i} each side made the same choices on both machines (only the order within a round differs: own choice first)`));
@@ -293,9 +298,11 @@ async function suiteMain(S, label, { only } = {}) {
     d.wire.down = false; d.host.nm.linkChanged(true); d.guest.nm.linkChanged(true);
     await settle(); await d.pumpWire(); await settle();
     ok(d.guest.nm.phase === 'over' && !d.guest.nm.result.iWon, tag('H ... and the one who dropped learns it when they return'), d.guest.nm.phase + ' ' + JSON.stringify(d.guest.nm.result));
-    // a hostile client announcing that YOU timed out, or lost your link, while you did neither: the match is stopped, nobody is scored
+    // a hostile client announcing that YOU lost, while you did not: the match is stopped, nobody is scored. The check keys on WHO LOSES, not on the label the sender chose:
+    // 'timeout' and 'lost-link' are the only reasons an honest peer can put on a claim against you (and then only when your own clock / link record agrees), so a 'forfeit', a 'left',
+    // a 'closed' or any other label of up to 24 characters ends the match for nobody. (Before this, those labels made YOUR engine concede YOUR side and the forfeit went into your record.)
     const NM = S.netmatch;
-    for (const why of ['timeout', 'lost-link']) {
+    for (const why of ['timeout', 'lost-link', 'forfeit', 'left', 'closed', 'whatever', 'x'.repeat(24)]) {
       const fc = await makeRig(S, { seedBase: 29 });
       await fc.start(); await fc.until(() => fc.host.nm.phase === 'playing' && fc.guest.nm.phase === 'playing');
       fc.guest.hold = true;
@@ -303,6 +310,7 @@ async function suiteMain(S, label, { only } = {}) {
       fc.guest.nm.receive({ t: NM.MSG, v: NM.PROTO, k: 'end', mn: 1, win: 0, h: 'x', why });
       await settle();
       ok(fc.guest.nm.phase === 'failed' && fc.guest.nm.error.code === 'cheat' && !fc.guest.nm.result, tag('H a false "' + why + '" claim against you stops the match instead of scoring it'), fc.guest.nm.phase + ' ' + JSON.stringify(fc.guest.nm.error));
+      ok(fc.guest.ctl.winner === null && !fc.guest.nm.countable() && !fc.guest.ctl.battle.events.some((e) => e.t === 'forfeit'), tag('H ... my own engine never conceded (no forfeit event, no winner) and the stopped match is not countable'), 'winner ' + fc.guest.ctl.winner);
     }
     // ... while a claim the sender makes AGAINST ITSELF (it forfeits) is simply taken
     const sf = await makeRig(S, { seedBase: 29 });
@@ -312,6 +320,7 @@ async function suiteMain(S, label, { only } = {}) {
     sf.guest.nm.receive({ t: NM.MSG, v: NM.PROTO, k: 'end', mn: 1, win: 1, h: 'x', why: 'forfeit' });
     await settle();
     ok(sf.guest.nm.phase === 'over' && sf.guest.nm.result.iWon && sf.guest.nm.result.reason === 'forfeit', tag('H the other player announcing its own forfeit ends the match in your favour'), sf.guest.nm.phase + ' ' + JSON.stringify(sf.guest.nm.result));
+    ok(sf.guest.nm.countable(), tag('H ... and that win counts'));
     // an abort (not a leave) must not award a win
     const ab = await makeRig(S, { seedBase: 22, mutate: (P, wire) => { wire.rewrite = (from, m) => (from === 'guest' && m.k === 'commit' && m.r === 2 ? { ...m, ph: 'f'.repeat(16) } : m); } });
     await ab.run();
@@ -365,6 +374,119 @@ async function suiteMain(S, label, { only } = {}) {
     h2.host.nm.receive({ ...hello, name: 'Mallory' });
     await settle();
     ok(h2.host.nm.phase === 'failed' && h2.host.nm.error.code === 'equivocation', tag('J a second, different hello is equivocation'), JSON.stringify(h2.host.nm.error));
+  }
+
+  // ---- K. the end-of-match comparison AFTER the engine has finished ---------------------------------------------------------------------------------------
+  // The other machine's `end` normally arrives while the last turn is still being shown, but the wire can be slow: it can reach a machine whose engine is already 'over'. A different
+  // winner or a different final position then stops the match (phase 'failed', "the result is not counted"), and a stopped match is not countable: battle_boot.js asks nm.countable()
+  // before it writes a profile, so the result the protocol just declared "not counted" does not reach the record of the honest side (its scene still plays the last turn, unseen).
+  if (run('K')) {
+    const lateRig = async (seedBase) => {
+      const rig = await makeRig(S, { seedBase, fmt: '3v3', mutate: (P, wire) => { wire.drop = (from, m) => from === 'guest' && m.k === 'end'; } });       // the guest's `end` is lost on the way
+      await rig.run();
+      const sent = rig.wire.log.find((e) => e.from === 'guest' && e.msg.k === 'end');
+      return { rig, end: sent ? sent.msg : null };
+    };
+    const a = await lateRig(31);
+    ok(a.end && a.end.win !== -1 && a.rig.host.nm.phase === 'over' && a.rig.host.nm.countable() && a.rig.guest.nm.phase === 'over', tag('K both engines finished; the host has not yet heard the guest\'s end (so far it counts)'), a.rig.host.nm.phase + ' ' + JSON.stringify(a.end));
+    if (a.end) {
+      a.rig.host.nm.receive({ ...a.end, win: a.end.win === 0 ? 1 : 0 });
+      await settle();
+      ok(a.rig.host.nm.phase === 'failed' && a.rig.host.nm.error.code === 'desync' && /different winners/.test(a.rig.host.nm.error.message) && !a.rig.host.nm.countable(), tag('K a late end naming the other winner stops the match and it no longer counts'), a.rig.host.nm.phase + ' ' + JSON.stringify(a.rig.host.nm.error));
+      ok(a.rig.guest.nm.phase === 'over' && a.rig.guest.nm.countable(), tag('K ... the honest guest (whose comparison passed) still counts'));
+    }
+    const b = await lateRig(31);
+    if (b.end) {
+      b.rig.host.nm.receive({ ...b.end, h: 'f'.repeat(16) });
+      await settle();
+      ok(b.rig.host.nm.phase === 'failed' && b.rig.host.nm.error.code === 'desync' && /different positions/.test(b.rig.host.nm.error.message) && !b.rig.host.nm.countable(), tag('K a late end naming another final position stops the match and it no longer counts'), b.rig.host.nm.phase + ' ' + JSON.stringify(b.rig.host.nm.error));
+    }
+    const c = await lateRig(31);
+    if (c.end) {
+      c.rig.host.nm.receive({ ...c.end });
+      await settle();
+      ok(c.rig.host.nm.phase === 'over' && !c.rig.host.nm.error && c.rig.host.nm.countable(), tag('K the genuine end, however late, leaves the match counting'), c.rig.host.nm.phase + ' ' + JSON.stringify(c.rig.host.nm.error));
+    }
+    // a match that has no result yet is not countable
+    const live = await makeRig(S, { seedBase: 32, fmt: '3v3' });
+    await live.start(); await live.until(() => live.host.nm.phase === 'playing' && live.guest.nm.phase === 'playing');
+    ok(!live.host.nm.countable() && !live.guest.nm.countable(), tag('K a match with no result yet is not countable'));
+    // a match stopped while it was being played never counts either
+    const d = await makeRig(S, { seedBase: 22, mutate: (P, wire) => { wire.rewrite = (from, m) => (from === 'guest' && m.k === 'commit' && m.r === 2 ? { ...m, ph: 'f'.repeat(16) } : m); } });
+    await d.run();
+    ok(d.host.nm.phase === 'failed' && !d.host.nm.countable() && !d.guest.nm.countable(), tag('K a match stopped while it was being played is not countable'), phasesOf(d).join(','));
+  }
+
+  // ---- O. a battle against a person is recorded ONCE; a walkover is not a record --------------------------------------------------------------------------
+  // battle_boot.js writes a finished match to the profile under career_stats.onlineMatchId({ seed, fmt, mn, room }). "A reload that replays the same match ... cannot count it twice" is
+  // therefore two claims, and each is tested here against the real protocol: (1) a page reloaded INTO the match computes the same id as the machine that never reloaded (and a rematch,
+  // another room or another seed gets another), (2) folding the same id again changes nothing. A WALKOVER (the other player leaves at the preview, or before the first move) is a win
+  // but must not become the FASTEST WIN (0 or 1 turns, which nothing can beat) or the LONGEST BATTLE.
+  if (run('O')) {
+    const url = (f) => pathToFileURL(path.join(S.dir, f)).href;
+    const [CS, MS, PR] = await Promise.all([import(url('career_stats.js')), import(url('match_stats.js')), import(url('profile.js'))]);
+    const room = 'ROOM81';
+    const idOf = (P, rm = room) => CS.onlineMatchId({ seed: P.nm.seed, fmt: P.nm.fmt, mn: P.nm.mn, room: rm });
+    const playing = (rig) => rig.host.nm.phase === 'playing' && rig.guest.nm.phase === 'playing';
+    const matchOf = (P, id, over = {}) => CS.matchFromSummary(MS.summarizeMatch(P.ctl.battle.events, { viewSide: P.side }), { id, at: 1700000000000, fmt: P.nm.fmt, cpu: 'online', opp: 'Bob', ruleset: 'arena-gen3-standard', playMs: 1000, ...over });
+    const rig = await makeRig(S, { seedBase: 81, fmt: '3v3', room });
+    await rig.run();
+    const id1 = idOf(rig.host);
+    ok(finished(rig) && id1 === idOf(rig.guest) && /^\d+_3v3_o1_ROOM81$/.test(id1), tag('O both machines name the same match the same way'), id1 + ' / ' + idOf(rig.guest));
+    // the second match of the room (a rematch), reloaded in the middle
+    rig.host.nm.requestRematch(); rig.guest.nm.requestRematch();
+    ok(await rig.until(() => playing(rig) && rig.host.nm.status().mn === 2 && rig.host.nm._debug.r >= 3), tag('O the rematch is under way'), phasesOf(rig).join(','));
+    const c = await rig.crash('host');
+    ok(c.ok && rig.host.nm.resumed === true && rig.host.nm.mn === 2, tag('O the host is reloaded into the second match'), JSON.stringify([c.ok, rig.host.nm.resumed, rig.host.nm.mn]));
+    for (let i = 0; i < 4000 && !finished(rig) && !both(rig).some((P) => P.nm.phase === 'failed'); i++) { if (!(await rig.step())) { await settle(); if (!(await rig.step())) break; } }
+    const id2 = idOf(rig.host);
+    ok(finished(rig) && id2 === idOf(rig.guest), tag('O a page reloaded INTO the match computes the same id as the machine that never reloaded'), id2 + ' / ' + idOf(rig.guest));
+    ok(/^\d+_3v3_o2_ROOM81$/.test(id2) && id2 !== id1 && idOf(rig.host, 'ROOM82') !== id2 && CS.onlineMatchId({ seed: rig.host.nm.seed ^ 1, fmt: '3v3', mn: 2, room }) !== id2, tag('O a rematch, another room and another seed each get an id of their own'), id1 + ' ' + id2);
+    // the same id twice changes nothing: through the real engine summaries of the reloaded page
+    const mh = matchOf(rig.host, id2), mg = matchOf(rig.guest, id2);
+    ok(CS.matchIssue(mh) === null && mh.cpu === 'online' && ((mh.result === 'w' && mg.result === 'l') || (mh.result === 'l' && mg.result === 'w') || (mh.result === 'd' && mg.result === 'd')), tag('O each side\'s record of the match is the mirror of the other\'s'), mh.result + ' / ' + mg.result);
+    const f1 = CS.foldMatch(PR.emptyStats(), mh, 'arena-gen3-standard'), f2 = CS.foldMatch(f1.stats, mh, 'arena-gen3-standard'), f3 = CS.foldMatch(f1.stats, matchOf(rig.host, id1), 'arena-gen3-standard');
+    const onl = (st) => st.byCpu.online.w + st.byCpu.online.l + st.byCpu.online.dr + st.byCpu.online.f;
+    ok(!f1.duplicate && f2.duplicate && JSON.stringify(f2.stats) === JSON.stringify(f1.stats) && f1.stats.recent.length === 1 && onl(f1.stats) === 1, tag('O writing the reloaded page\'s match twice counts it once'), JSON.stringify(f2.duplicate));
+    ok(!f3.duplicate && f3.stats.recent.length === 2 && onl(f3.stats) === 2, tag('O ... while the first match of the room is a battle of its own'));
+
+    // a walkover: the other player closes the page at the team preview, or just before the first move
+    const wo = async (seedBase, cond) => {
+      const r = await makeRig(S, { seedBase, fmt: '3v3', room: 'ROOM' + seedBase });
+      await r.start(); await r.until(() => playing(r) && cond(r));
+      r.guest.nm.leave('closed');
+      await settle(); await r.pumpWire(); await settle();
+      return r;
+    };
+    const real = await makeRig(S, { seedBase: 85, fmt: '3v3', room: 'ROOM85' });
+    await real.run();
+    for (const [what, seedBase, cond, turns] of [['at the team preview', 83, () => true, 0], ['before the first move', 84, (r) => r.host.nm.ctl.turn >= 1, 1]]) {
+      const r = await wo(seedBase, cond);
+      const sum = MS.summarizeMatch(r.host.ctl.battle.events, { viewSide: 0 }), leaverSum = MS.summarizeMatch(r.guest.ctl.battle.events, { viewSide: 1 });
+      ok(r.host.nm.phase === 'over' && sum.result === 'w' && sum.endedBy === 'forfeit' && sum.turns === turns, tag('O the player who stayed wins by the other\'s concession, with ' + turns + ' turns (' + what + ')'), JSON.stringify([r.host.nm.phase, sum.result, sum.endedBy, sum.turns]));
+      ok(leaverSum.result === 'f' && leaverSum.endedBy === 'forfeit', tag('O ... and the engine counts the player who left as a forfeit (' + what + ')'), JSON.stringify([leaverSum.result, leaverSum.endedBy]));
+      const m = matchOf(r.host, 'wo' + seedBase);
+      ok(CS.matchIssue(m) === null && m.conceded === true && CS.isWalkover(m), tag('O the match as the record keeps it is a conceded win and a walkover (' + what + ')'), JSON.stringify([m.conceded, m.turns]));
+      const fresh = CS.foldMatch(PR.emptyStats(), m, 'arena-gen3-standard');
+      ok(fresh.stats.wins === 1 && fresh.stats.streak === 1 && fresh.stats.byCpu.online.w === 1 && fresh.stats.recent[0].res === 'w' && fresh.stats.bests.fastestWin === null && fresh.stats.bests.longest === null && fresh.callouts.every((x) => x.kind === 'first-win'), tag('O a walkover counts as a win but sets neither FASTEST WIN nor LONGEST BATTLE (' + what + ')'), JSON.stringify(fresh.stats.bests));
+      // ... so a real win afterwards is the first fastest win, and can still be beaten by a faster one
+      const wsd = real.host.nm.result.winnerSide;
+      ok(wsd === 0 || wsd === 1, tag('O (the reference battle has a winner)'), String(wsd));
+      const P = wsd === 0 ? real.host : real.guest;
+      const win = matchOf(P, 'real85');
+      const after = CS.foldMatch(fresh.stats, win, 'arena-gen3-standard');
+      ok(win.result === 'w' && after.stats.bests.fastestWin && after.stats.bests.fastestWin.turns === win.turns && after.stats.bests.longest.turns === win.turns && after.callouts.every((x) => x.kind !== 'fastest'), tag('O the first real win after a walkover is the fastest win (' + what + ')'), JSON.stringify(after.stats.bests) + ' turns ' + win.turns);
+      const quicker = CS.foldMatch(after.stats, { ...win, id: 'real85b', turns: Math.max(1, win.turns - 1) }, 'arena-gen3-standard');
+      ok(win.turns < 2 || (quicker.stats.bests.fastestWin.turns === win.turns - 1 && quicker.callouts.some((x) => x.kind === 'fastest')), tag('O ... and a quicker one beats it (' + what + ')'), JSON.stringify(quicker.stats.bests.fastestWin));
+    }
+    // the player's own clock running out is a forfeit for them and a conceded win for the other (timeOutSelf), not a result of its own
+    const tm = await makeRig(S, { seedBase: 86, fmt: '3v3' });
+    await tm.start(); await tm.until(() => playing(tm) && tm.host.nm._debug.r >= 3);
+    tm.guest.nm.timeOutSelf();
+    await settle(); await tm.pumpWire(); await settle();
+    const ts = MS.summarizeMatch(tm.guest.ctl.battle.events, { viewSide: 1 }), th = MS.summarizeMatch(tm.host.ctl.battle.events, { viewSide: 0 });
+    const info = { id: 'tm', at: 1, fmt: '3v3', cpu: 'online', opp: 'Bob', ruleset: 'x', playMs: 1 };
+    ok(ts.result === 'f' && th.result === 'w' && th.endedBy === 'forfeit' && CS.matchFromSummary(th, info).conceded === true && !('conceded' in CS.matchFromSummary(ts, info)), tag('O a player whose clock ran out is a forfeit (QUIT) for themselves and a conceded win for the other'), JSON.stringify([ts.result, th.result, th.endedBy]));
   }
 
   // ---- R. a reload ------------------------------------------------------------------------------------------------------------------------------
@@ -511,6 +633,16 @@ const MUTANTS = [
   { id: 'resume-forgets-sent-messages', why: 'the messages sent before the reload are not restored, so nothing lost in flight is resent', file: 'netmatch.js', from: /outLog = rec\.outLog\.filter\(/, to: 'outLog = [].filter(', cases: ['R'] },
   { id: 'resume-believes-the-other-left', why: 'a reloaded page that never got back claims the other player left', file: 'netmatch.js', from: /if \(!everUp\) return fail\('timeout'/, to: "if (false) return fail('timeout'", cases: ['R'] },
   { id: 'claims-believed', why: 'a claim that you timed out is believed without checking your own clock', file: 'netmatch.js', from: /!plausibleClaim\(m\.why\)\) \{/, to: 'false) {', cases: ['H'] },
+  { id: 'claims-by-label', why: 'a claim against you is checked only when the sender labels it timeout or lost-link, so any other label makes your own engine concede', file: 'netmatch.js', from: /if \(loser === mySide && !plausibleClaim\(m\.why\)\) \{/, to: "if (loser === mySide && (m.why === 'timeout' || m.why === 'lost-link') && !plausibleClaim(m.why)) {", cases: ['H'] },
+  { id: 'stopped-still-counts', why: 'a match the end-of-match comparison stopped is still countable', file: 'netmatch.js', from: /return !dead\(\) && !!nm\.ctl && nm\.ctl\.winner !== null;/, to: 'return !!nm.ctl && nm.ctl.winner !== null;', cases: ['K'] },
+  { id: 'live-match-counts', why: 'a match with no result yet is countable', file: 'netmatch.js', from: /return !dead\(\) && !!nm\.ctl && nm\.ctl\.winner !== null;/, to: 'return !dead() && !!nm.ctl;', cases: ['K'] },
+  { id: 'resume-forgets-the-match-number', why: 'a page reloaded into a rematch forgets which match of the room it is in, so its record id differs from the other player\'s', file: 'netmatch.js', from: /nm\.mn = rec\.mn; nm\.fmt = rec\.fmt;/, to: 'nm.fmt = rec.fmt;', cases: ['O'] },
+  { id: 'walkover-is-a-fastest-win', why: 'a win the opponent conceded can be the fastest win (0 turns, never beaten)', file: 'career_stats.js', from: /res === 'w' && !m\.conceded && \(!s\.bests\.fastestWin/, to: "res === 'w' && (!s.bests.fastestWin", cases: ['O'] },
+  { id: 'walkover-is-a-longest-battle', why: 'a walkover can be the longest battle', file: 'career_stats.js', from: /if \(!walkover && \(!s\.bests\.longest/, to: 'if ((!s.bests.longest', cases: ['O'] },
+  { id: 'concession-not-flagged', why: 'the match handed to the record does not say the opponent conceded', file: 'career_stats.js', from: /\.\.\.\(summary\.result === 'w' && summary\.endedBy === 'forfeit' \? \{ conceded: true \} : \{\}\),/, to: '', cases: ['O'] },
+  { id: 'id-ignores-the-room', why: 'two rooms with the same seed share a record id', file: 'career_stats.js', from: /String\(room \|\| ''\)\.slice\(0, 8\)/, to: "''", cases: ['O'] },
+  { id: 'id-ignores-the-match-number', why: 'a rematch of the same room shares the first match\'s record id', file: 'career_stats.js', from: /'_o' \+ mn \+ '_'/, to: "'_o1_'", cases: ['O'] },
+  { id: 'id-ignores-the-seed', why: 'every match of a room shares a record id', file: 'career_stats.js', from: /return String\(seed >>> 0\) \+ '_'/, to: "return '0_'", cases: ['O'] },
   { id: 'no-equivocation', why: 'a second, different commitment for a round is not noticed', file: 'netmatch.js', from: /if \(round\.theirs && round\.theirs\.c\) \{ if \(round\.theirs\.c !== m\.c\) fail\('equivocation'[^\n]*\n/, to: 'if (round.theirs && round.theirs.c) return;\n', cases: ['J'] },
   { id: 'names-not-cleaned', why: 'a hostile name goes into the battle as it was sent', file: 'netmatch.js', from: /t = t\.replace\(\/\[\^A-Za-z0-9 \.'_!\?-\]\/g, ''\)/, to: 't = t', cases: ['G', 'M'] },
 ];
@@ -556,3 +688,5 @@ if (WANT_MUTANTS) {
   console.log(`mutants: ${res.length - mutantFail}/${res.length} killed`);
 }
 if (fail || mutantFail) { console.log('\nFAILURES:\n  ' + failures.join('\n  ')); process.exit(1); }
+// (with --mutants a handle of the last mutant's rig keeps the process alive after the final line; say goodbye once the output has had time to flush)
+if (WANT_MUTANTS) setTimeout(() => process.exit(0), 300);

@@ -78,20 +78,31 @@ function createStubAnimator(o = {}) {
   }
   function startSys(id, ctx) { calls.sysStarts.push({ id, ctx, tick: calls.tick }); return buildSys(id, ctx); }
   // round 4: animator.prepare('system', id, ctx) -> a handle (advance(ms) until ready, begin() once, dispose()). o.prepAdvances = advances a handle needs (default 3); o.prepFail = 'advance' | 'begin' | 'prepare'
-  // (the first event handle throws there) | 'exhausted' (every second prepare throws, as a full pool does)
+  // (the first event handle throws there) | 'exhausted' (every second prepare throws, as a full pool does) | o.poolEngines = N: the real animator's pool of N engines (battle_sys.js SystemAnimator.acquire):
+  // a prepare takes a free engine, else the engine of a FINISHED run, else a LIVE run's (cut off: calls.sysEvicted), and when every engine holds a prepared handle that was not begun -- the prewarm included until
+  // its pre-roll is done -- it throws 'the system engine pool is exhausted'
   function prepareSys(id, ctx) {
     const warm = id === 'battle';
     if (o.prepFail === 'prepare' && !warm && !calls.prepThrown) { calls.prepThrown = true; calls.prepThrows++; throw new Error('stub prepare fault'); }
     if (o.prepFail === 'exhausted' && !warm && (calls.sysPrepares.length % 2) === 1) { calls.sysPrepares.push({ id, ctx, exhausted: true }); calls.prepThrows++; throw new Error('stub pool exhausted'); }
-    const rec = { id, ctx, tick: calls.tick, advances: 0, begun: false, disposed: false };
+    let slot = null;
+    if (o.poolEngines !== undefined) {
+      const pool = (calls.pool = calls.pool || []);
+      slot = pool.find((x) => !x.owner) || (pool.length < o.poolEngines ? pool[pool.push({ owner: null }) - 1] : null);
+      if (!slot) { slot = pool.find((x) => x.owner.begun && x.owner.run && x.owner.run.done) || pool.find((x) => x.owner.begun) || null; if (slot) { if (!(slot.owner.run && slot.owner.run.done)) calls.sysEvicted = (calls.sysEvicted | 0) + 1; slot.owner = null; } }
+      if (!slot) { if (!warm) calls.sysPrepares.push({ id, ctx, exhausted: true }); calls.prepThrows++; calls.poolThrows = (calls.poolThrows | 0) + 1; throw new Error('the system engine pool is exhausted: all ' + pool.length + ' engines hold prepared runs'); }
+    }
+    const rec = { id, ctx, tick: calls.tick, advances: 0, begun: false, disposed: false, run: null };
+    if (slot) slot.owner = rec;
+    const free = () => { if (slot && slot.owner === rec) slot.owner = null; };
     (warm ? calls.sysWarm : calls.sysPrepares).push(rec);
     if (!warm) calls.sysStarts.push({ id, ctx, tick: calls.tick, via: 'prepare' });
     const need = o.prepAdvances === undefined ? 3 : o.prepAdvances;
     return {
       get ready() { return rec.advances >= need; }, error: null,
-      advance(ms) { calls.advanceLog.push({ tick: calls.tick, ms, id }); if (o.prepFail === 'advance' && !warm) throw new Error('stub advance fault'); rec.advances++; return { ready: rec.advances >= need }; },
-      begin() { if (warm) throw new Error('a prewarm has nothing to begin'); if (rec.advances < need) throw new Error('begin() before ready'); if (rec.begun || rec.disposed) throw new Error('begin() twice or after dispose'); if (o.prepFail === 'begin') throw new Error('stub begin fault'); rec.begun = true; calls.sysBegins++; calls.start++; return buildSys(id, ctx); },
-      dispose() { if (!rec.disposed && !rec.begun) { rec.disposed = true; calls.sysDisposed++; } },
+      advance(ms) { calls.advanceLog.push({ tick: calls.tick, ms, id }); if (o.prepFail === 'advance' && !warm) throw new Error('stub advance fault'); rec.advances++; if (warm && rec.advances >= need) free(); return { ready: rec.advances >= need }; },
+      begin() { if (warm) throw new Error('a prewarm has nothing to begin'); if (rec.advances < need) throw new Error('begin() before ready'); if (rec.begun || rec.disposed) throw new Error('begin() twice or after dispose'); if (o.prepFail === 'begin') throw new Error('stub begin fault'); rec.begun = true; calls.sysBegins++; calls.start++; return (rec.run = buildSys(id, ctx)); },
+      dispose() { if (!rec.disposed && !rec.begun) { rec.disposed = true; calls.sysDisposed++; free(); } },
     };
   }
   const animator = {
@@ -180,7 +191,7 @@ function makeBattle(M, o) {
   if (!hooks.onCry) hooks.onCry = (species, pan) => hooks.cries.push([species, pan]);
   const scene = M.SC.createScene({ ui, pack, text, ctl, viewSide: 0, env: seed % 9, textSpeed: 'fast', meta: [A.meta, B.meta], trainer: 'CPU', playerName: 'You', anim: o.cfg, animator: o.animator, animSeed: o.animSeed === undefined ? seed : o.animSeed, hooks, ...(WHICH === 'real' ? { sysClock: (cpu) => cpu.icount / 1000 } : {}), ...(o.sceneOpts || {}) });
   const ai = M.AI.createAi({ pack, level: 'normal', seed: seed ^ 0x5bd1e995 });
-  scene.S.auto = { ai, decide(req) { return ai.choose(req, ctl.view(0), { previewInfo: { foe: ctl.previewInfo[1] } }); } };
+  scene.S.auto = { ai, decide(req) { const def = ai.choose(req, ctl.view(0), { previewInfo: { foe: ctl.previewInfo[1] } }); return o.decide ? o.decide(req, def) : def; } };
   ctl.start(); scene.begin();
   return { scene, ctl, ui, pack, hooks, seed };
 }
@@ -560,6 +571,142 @@ async function core(M, opts = {}) {
       const picks = new Set(); for (const sd of [1, 2, 3, 4, 5, 6, 7, 8]) { const st = await makeAnimator({ system: true }); playBattle(M, { seed: sd, cfg: mkCfg(onSys), animator: st, sceneOpts: { trainerChoices: pools, cpuLevel: 'hard' }, maxFrames: 200 }); picks.add(st.calls.sysStarts[0].ctx.trainer); }
       t('system: different battles of one level show different trainers (' + [...picks].join(',') + ')', picks.size >= 2, '');
     }
+    // round 7: A HIT OR A FAINT PLAYS FOR THE POKEMON THAT IS ON SCREEN WHEN IT PLAYS. Reported by the player: "when pokemon get hit, faint, or after they switch out and the new pokemon gets hit, it shows the old
+    // pokemon briefly, and that is when the health bars go wrong". Cause (reproduced frame by frame in a real browser, ANIM.md "Round 7"): the scene prepares the NEXT hit / faint ahead of time, from what it displays NOW; a switch
+    // (recall, send-out) has not finished then, so a hit queued behind it was built from the Pokemon that was switched OUT (its picture, its full HP bar) and played, as prepared, for the one that came in. The stub animator records
+    // the ctx of every prepared run; here every hit / faint run is checked, at the moment it BEGINS, against the Pokemon the scene shows at that moment, over battles in which the player switches on purpose.
+    {
+      const seen = [], bad = [];
+      let restale = 0, runs = 0, switches = 0, swRuns = 0;
+      for (const sd of SEL.sys.concat([2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15])) {
+        const st = await makeAnimator({ system: true });
+        let sceneRef = null, taken = 0;
+        const snap = (id, ctx) => {
+          const d = sceneRef.S.disp, mon = (m) => (m ? { species: m.species, level: m.level, hp: m.hp, maxHp: m.maxHp } : null);
+          const want = { player: mon(d[0]), foe: mon(d[1]) }, got = { player: ctx.player && { species: ctx.player.species, level: ctx.player.level, hp: ctx.player.hp, maxHp: ctx.player.maxHp }, foe: ctx.foe && { species: ctx.foe.species, level: ctx.foe.level, hp: ctx.foe.hp, maxHp: ctx.foe.maxHp } };
+          const faintSide = id === 4 ? 'player' : id === 5 ? 'foe' : null;                 // a faint starts its own side at 0 HP: only the species is compared there
+          // round 7b: a SEND-OUT (2 player / 8 foe) draws only the OTHER side's Pokemon (the side that sends out is the Pokemon being replaced and no frame of the effect shows it: the handoff group below proves it with the
+          // ROM engine), a RECALL (3 / 9) draws both: every Pokemon an effect draws (species, level, HP bar) must be the one the scene shows when the effect BEGINS
+          const swSide = id === 2 ? 'player' : id === 8 ? 'foe' : null;
+          const sideOk = (k) => k === swSide || !want[k] || !got[k] || (got[k].species === want[k].species && got[k].level === want[k].level && (k === faintSide || (got[k].hp === want[k].hp && got[k].maxHp === want[k].maxHp)));
+          runs++; if (id === 2 || id === 3 || id === 8 || id === 9) swRuns++;
+          if (!sideOk('player') || !sideOk('foe')) bad.push({ seed: sd, id, want, got });
+        };
+        const wrap = (h, id, ctx) => { if (id >= 2 && id <= 9 && h && typeof h.begin === 'function') { const b = h.begin; h.begin = function () { snap(id, ctx); return b.apply(this, arguments); }; } return h; };
+        const prep = st.prepare && st.prepare.bind(st), start = st.start.bind(st);
+        if (prep) st.prepare = (kind, id, ctx) => (kind === 'system' ? wrap(prep(kind, id, ctx), id, ctx) : prep(kind, id, ctx));
+        st.start = (kind, id, ctx) => { const r = start(kind, id, ctx); if (kind === 'system' && id >= 2 && id <= 9) snap(id, ctx); return r; };
+        const r = playBattle(M, { seed: sd, cfg: mkCfg(onSys), animator: st, onTick: (scene) => { sceneRef = scene; },
+          decide: (req, def) => { if (req.phase === 'move' && req.switches && req.switches.length && !req.trapped && taken < 3 && (req.turn === undefined || true)) { taken++; switches++; return { kind: 'switch', slot: req.switches[0].slot }; } return def; } });
+        seen.push(r.scene.animInfo());
+        restale += r.scene.animInfo().restale | 0;
+      }
+      t('system/stale: ' + (runs - swRuns) + ' hit / faint runs over ' + seen.length + ' battles with ' + switches + ' voluntary switches each begin with the Pokemon (species, level, HP) the scene shows at that moment' + (bad.length ? ' -- ' + JSON.stringify(bad[0]).slice(0, 260) : ''), runs - swRuns >= 20 && switches >= 6 && !bad.some((b) => b.id >= 4 && b.id <= 7), (runs - swRuns) + ' runs, ' + switches + ' switches, ' + bad.filter((b) => b.id >= 4 && b.id <= 7).length + ' wrong');
+      t('system/stale: ' + swRuns + ' send-out / recall runs (ids 2, 3, 8, 9) in the same battles each begin with the Pokemon the effect draws (the OTHER side\'s for a send-out, both for a recall: species, level, HP bar) as the scene shows them at that moment' + (bad.some((b) => b.id === 2 || b.id === 3 || b.id === 8 || b.id === 9) ? ' -- ' + JSON.stringify(bad.find((b) => b.id === 2 || b.id === 3 || b.id === 8 || b.id === 9)).slice(0, 260) : ''), swRuns >= 20 && !bad.some((b) => b.id === 2 || b.id === 3 || b.id === 8 || b.id === 9), swRuns + ' runs, ' + bad.filter((b) => b.id === 2 || b.id === 3 || b.id === 8 || b.id === 9).length + ' wrong');
+      t('system/stale: ...and the picture was right the first time: no prepared hit / faint / send-out / recall had to be prepared again (' + restale + ' re-prepared)', restale === 0, String(restale));
+      t('system/stale: the diagnostics carry the count (animInfo().restale)', seen.every((i) => typeof i.restale === 'number'), '');
+    }
+    // ... and a change NOBODY foresaw between preparing a hit and playing it is still caught when it starts: the picture is made again for what is on screen (a brief hold of the previous picture, never a wrong one)
+    {
+      const bad = [], tampered = [], tLog = [], tNotes = []; let restale = 0;
+      for (const sd of SEL.sys.slice(0, 3).concat([3, 4, 5])) {
+        const st = await makeAnimator({ system: true });
+        let sceneRef = null, done = false;
+        const snap = (id, ctx) => { const d = sceneRef.S.disp[0], m = ctx.player; if (d && m && (m.species !== d.species || (id !== 4 && m.hp !== d.hp))) bad.push({ sd, id, shown: [d.species, d.hp], ctx: [m.species, m.hp] }); };
+        const prep = st.prepare.bind(st);
+        st.prepare = (kind, id, ctx) => { const h = prep(kind, id, ctx); if (kind === 'system' && (id === 6 || id === 4) && h && typeof h.begin === 'function') { const b = h.begin; h.begin = function () { snap(id, ctx); return b.apply(this, arguments); }; } return h; };
+        const r = playBattle(M, { seed: sd, cfg: mkCfg(onSys), animator: st, onTick: (scene) => {
+          sceneRef = scene;
+          if (done) return;
+          const q = scene.S.queue.find((x) => x.t === 'shake' && x.side === 0 && x.prep && !x.prep.failed), d = scene.S.disp[0];
+          if (q && d && d.hp > 1) { d.hp -= 1; done = true; tampered.push(sd); }          // the displayed HP moves while a hit on it is already prepared, by something the projection does not know about
+        } });
+        restale += r.scene.animInfo().restale | 0; tLog.push(...r.scene.animInfo().log); tNotes.push(...r.scene.animInfo().notes);
+      }
+      t('system/stale: a change nobody foresaw between preparing and playing a hit (' + tampered.length + ' battles tampered with) is caught at start: it begins with what is on screen', tampered.length >= 3 && bad.length === 0, tampered.length + ' tampered, ' + bad.length + ' wrong ' + JSON.stringify(bad[0] || null));
+      t('system/stale: ...by preparing it again (' + restale + ' re-prepared)', restale >= tampered.length, restale + ' vs ' + tampered.length);
+      // a re-prepare is BENIGN (a brief hold of the previous picture, never a wrong one): it is counted and noted, and it is NOT an entry of the animation PROBLEMS log (which the tests and the browser suite require empty)
+      t('system/stale: ...and it is a NOTE, not a problem: animInfo().notes has one "system N stale: <what differs>" line per re-prepare (' + tNotes.length + ' for ' + restale + '), animInfo().log is empty (' + tLog.length + ')', tNotes.length === restale && restale >= tampered.length && tNotes.every((x) => /^system [2-9] stale: \S/.test(x)) && tLog.length === 0, JSON.stringify(tNotes.slice(0, 2)) + ' / log ' + JSON.stringify(tLog.slice(0, 2)));
+    }
+    // round 7b: SEND-OUTS AND RECALLS TOO. The review of round 7 found the same defect left in the other two switch effects: the Pokemon of the OTHER side (its species, its HP bar) was still read from the display when the
+    // effect was PREPARED, so a bar moving on that side (a drain writes the Pokemon's hp on EVERY frame, so the read is mid-drain) or a replacement queued before the effect left that side's picture stale for the whole effect:
+    // a foe's send-out drawn with the player's dead Pokemon, the player's bar back at 113 while the screen showed 101 (27 to 30 stale runs of ~1700 in the review's counts, in battles nobody forced). The scenarios here are
+    // BUILT BY HAND on a real scene (two Pokemon on the field at the first action menu, then the steps queued the way the director queues them), so each case exists whatever the engine does, and every run is checked at the moment it BEGINS.
+    {
+      const same = (c, d) => !!c && !!d && c.species === d.species && c.level === d.level && c.hp === d.hp && c.maxHp === d.maxHp;
+      const hand = async (build, o = {}) => {
+        const st = await makeAnimator({ system: true });
+        const runs = [];
+        let sceneRef = null;
+        const mon = (d) => (d ? { species: d.species, level: d.level, hp: d.hp, maxHp: d.maxHp } : null);
+        const prep = st.prepare.bind(st);
+        st.prepare = (kind, id, ctx) => { const h = prep(kind, id, ctx); if (kind === 'system' && id >= 2 && id <= 9 && h && typeof h.begin === 'function') { const b = h.begin; h.begin = function () { const d = sceneRef.S.disp; runs.push({ id, ctx, disp: [mon(d[0]), mon(d[1])] }); return b.apply(this, arguments); }; } return h; };
+        const b = makeBattle(M, { seed: o.seed || 1, cfg: mkCfg(onSys), animator: st });
+        const scene = sceneRef = b.scene, auto = scene.S.auto, decide = auto.decide;
+        auto.decide = (req) => (req.phase === 'move' ? null : decide(req));                 // the preview is answered as always, the first action menu is left alone
+        let n = 0;
+        while (n++ < 6000 && scene.mode !== 'action') { scene.tick(); if (scene.mode === 'steps' && scene.S.cur && scene.S.cur.t === 'text') scene.press('a'); }
+        if (scene.mode !== 'action' || !scene.S.disp[0] || !scene.S.disp[1]) return null;
+        const P0 = mon(scene.S.disp[0]), F0 = mon(scene.S.disp[1]), copy = (d) => ({ species: d.species, name: d.name, level: d.level, gender: d.gender, hp: d.maxHp, maxHp: d.maxHp, status: null, shiny: !!d.shiny, slot: 9, orig: 9 });
+        const x = { P0, F0, pTo: Math.max(1, Math.floor(P0.hp / 3)), fTo: Math.max(1, Math.floor(F0.hp / 3)), newPlayer: copy(scene.S.disp[1]), newFoe: copy(scene.S.disp[0]) };       // a replacement of the other kind on each side
+        const before = runs.length;
+        for (const s of build(x)) scene.S.queue.push(s);
+        let k = 0;
+        while (k++ < 8000 && (scene.S.cur || scene.S.queue.length)) { scene.tick(); if (o.onTick) o.onTick(scene, k); }
+        return { runs: runs.slice(before), x, restale: scene.animInfo().restale | 0, log: scene.animInfo().log, notes: scene.animInfo().notes };
+      };
+      // [name, steps, the id of the run to check, which sides it draws ('o' = the other side only, 'b' = both), what the screen must hold when it begins]
+      const SC = [
+        ['foe send-out behind a drain of the PLAYER\'s bar', (x) => [{ t: 'drain', side: 0, to: x.pTo }, { t: 'slidein', side: 1, mon: x.newFoe }], 8, 'o', (r, x) => r.disp[0].hp === x.pTo],
+        ['foe send-out behind the PLAYER\'s replacement', (x) => [{ t: 'slidein', side: 0, mon: x.newPlayer }, { t: 'pause', n: 20 }, { t: 'slidein', side: 1, mon: x.newFoe }], 8, 'o', (r, x) => r.disp[0].species === x.newPlayer.species],
+        ['player send-out behind a drain of the FOE\'s bar', (x) => [{ t: 'drain', side: 1, to: x.fTo }, { t: 'slidein', side: 0, mon: x.newPlayer }], 2, 'o', (r, x) => r.disp[1].hp === x.fTo],
+        ['player send-out behind the FOE\'s replacement', (x) => [{ t: 'slidein', side: 1, mon: x.newFoe }, { t: 'pause', n: 20 }, { t: 'slidein', side: 0, mon: x.newPlayer }], 2, 'o', (r, x) => r.disp[1].species === x.newFoe.species],
+        ['foe recall behind a drain of the PLAYER\'s bar', (x) => [{ t: 'drain', side: 0, to: x.pTo }, { t: 'slideout', side: 1 }], 9, 'b', (r, x) => r.disp[0].hp === x.pTo],
+        ['foe recall behind the PLAYER\'s replacement', (x) => [{ t: 'slidein', side: 0, mon: x.newPlayer }, { t: 'pause', n: 20 }, { t: 'slideout', side: 1 }], 9, 'b', (r, x) => r.disp[0].species === x.newPlayer.species],
+        ['player recall behind a drain of the FOE\'s bar', (x) => [{ t: 'drain', side: 1, to: x.fTo }, { t: 'slideout', side: 0 }], 3, 'b', (r, x) => r.disp[1].hp === x.fTo],
+        ['player recall behind the FOE\'s replacement', (x) => [{ t: 'slidein', side: 1, mon: x.newFoe }, { t: 'pause', n: 20 }, { t: 'slideout', side: 0 }], 3, 'b', (r, x) => r.disp[1].species === x.newFoe.species],
+        // the recalled Pokemon's own bar is DRAWN by the recall (Eject Button, Emergency Exit, Regenerator: its bar moves, then it leaves)
+        ['player recall behind a drain of ITS OWN bar', (x) => [{ t: 'drain', side: 0, to: x.pTo }, { t: 'slideout', side: 0 }], 3, 'b', (r, x) => r.disp[0].hp === x.pTo],
+        ['foe recall behind a drain of ITS OWN bar', (x) => [{ t: 'drain', side: 1, to: x.fTo }, { t: 'slideout', side: 1 }], 9, 'b', (r, x) => r.disp[1].hp === x.fTo],
+      ];
+      const bad = { send: [], recall: [] }; let ran = 0, scenarios = 0, redone = 0;
+      for (const [name, build, id, sides, want] of SC) {
+        const r = await hand(build);
+        const runs = r && r.runs.filter((q) => q.id === id), run = runs && runs[0];
+        scenarios++;
+        const drawn = run && (sides === 'b' ? same(run.ctx.player, run.disp[0]) && same(run.ctx.foe, run.disp[1]) : (id === 2 ? same(run.ctx.foe, run.disp[1]) : same(run.ctx.player, run.disp[0])));
+        const fine = !!r && runs.length === 1 && !!run.disp[0] && !!run.disp[1] && drawn && want(run, r.x) && r.x.P0.species !== r.x.newPlayer.species;
+        if (r) { ran++; redone += r.restale; }
+        if (!fine) (id === 2 || id === 8 ? bad.send : bad.recall).push(name + ' -- ' + JSON.stringify(run ? { ctx: [run.ctx.player.species, run.ctx.player.hp, run.ctx.foe.species, run.ctx.foe.hp], screen: run.disp } : null).slice(0, 200));
+      }
+      t('system/stale: a SEND-OUT begins with the OTHER side\'s Pokemon as the screen shows it, behind a drain of that side\'s bar and behind its replacement (' + bad.send.length + ' of 4 hand-built cases wrong)' + (bad.send.length ? ' -- ' + bad.send[0] : ''), ran === SC.length && bad.send.length === 0, bad.send.join(' | ') || 'ran ' + ran);
+      t('system/stale: a RECALL begins with BOTH Pokemon as the screen shows them, behind a drain of either bar (the recalled one\'s own included) and behind a replacement (' + bad.recall.length + ' of 6 hand-built cases wrong)' + (bad.recall.length ? ' -- ' + bad.recall[0] : ''), ran === SC.length && bad.recall.length === 0, bad.recall.join(' | ') || 'ran ' + ran);
+      t('system/stale: ...and every one of those pictures was right the first time (' + redone + ' prepared again over ' + SC.length + ' cases)', ran === SC.length && redone === 0, String(redone));
+      // a change NOBODY foresaw while a send-out / recall waits prepared (a pause): it is caught when the effect starts and the picture is made again for what is on screen; the sending side's own lead is not
+      // compared (no frame of a send-out shows it) so a change there costs nothing
+      const TS = [
+        // [name, steps, the queue step to watch, the side whose hp is moved, the id of the run, restale wanted, sides compared]
+        ['send-out: the other side\'s bar moved', (x) => [{ t: 'pause', n: 40 }, { t: 'slidein', side: 1, mon: x.newFoe }], ['slidein', 1], 0, 8, 1, [0]],
+        ['recall: the recalled Pokemon\'s own bar moved', (x) => [{ t: 'pause', n: 40 }, { t: 'slideout', side: 0 }], ['slideout', 0], 0, 3, 1, [0, 1]],
+        ['recall: the other side\'s bar moved', (x) => [{ t: 'pause', n: 40 }, { t: 'slideout', side: 0 }], ['slideout', 0], 1, 3, 1, [0, 1]],
+        ['send-out: the bar of the Pokemon being replaced moved (no frame shows it)', (x) => [{ t: 'pause', n: 40 }, { t: 'slidein', side: 1, mon: x.newFoe }], ['slidein', 1], 1, 8, 0, [0]],
+        ['control, nothing moved', (x) => [{ t: 'pause', n: 40 }, { t: 'slidein', side: 1, mon: x.newFoe }], ['slidein', 1], -1, 8, 0, [0]],
+      ];
+      const tbad = [], trows = [];
+      for (const [name, build, [wt, ws], moveSide, id, want, sides] of TS) {
+        let moved = 0;
+        const r = await hand(build, { onTick: (scene) => {
+          if (moved || moveSide < 0) return;
+          const q = scene.S.queue.find((y) => y.t === wt && y.side === ws && y.prep && !y.prep.failed), d = scene.S.disp[moveSide];
+          if (q && d && d.hp > 1) { d.hp -= 1; moved = 1; }              // the displayed HP moves while the effect is already prepared, by something the projection does not know about
+        } });
+        const run = r && r.runs.find((q) => q.id === id);
+        const ok1 = !!r && !!run && (moveSide < 0 || moved === 1) && r.restale === want && r.notes.length === want && r.log.length === 0 && sides.every((sd) => same(sd === 0 ? run.ctx.player : run.ctx.foe, run.disp[sd]));
+        trows.push(name + ': ' + (r ? r.restale : '-') + '/' + want);
+        if (!ok1) tbad.push(name + ' -- restale ' + (r ? r.restale : '-') + ' wanted ' + want + (run ? ', ctx ' + JSON.stringify([run.ctx.player.hp, run.ctx.foe.hp]) + ' screen ' + JSON.stringify(run.disp.map((m) => m && m.hp)) : ', no run') + (moved ? '' : ', nothing moved'));
+      }
+      t('system/stale: a change nobody foresaw while a SEND-OUT / RECALL waits prepared is caught when it starts (prepared again, begins with what is on screen), a change to the Pokemon being replaced is not (no frame shows it), and nothing moves the count by itself' + (tbad.length ? ' -- ' + tbad[0] : ''), tbad.length === 0, tbad.join(' | ') || trows.join('; '));
+    }
     // round 4: PREPARED system runs (animator.prepare -> advance once per tick -> begin when the step before is done and the handle is ready)
     {
       const nonWarm = (c) => c.sysPrepares.filter((p) => !p.exhausted);
@@ -612,6 +759,22 @@ async function core(M, opts = {}) {
         const st = await makeAnimator({ system: true, prepAdvances: 60 }); const cfg = mkCfg(onSys); let offAt = -1, waiting = 0, back = -1, d0 = 0;
         playBattle(M, { seed, cfg, animator: st, onTick: (scene, n) => { const c4 = st.calls; if (offAt < 0 && scene.S.queue.some((q) => q.prep && q.prep.h) && c4.sysPrepares.length >= 3) { offAt = n; d0 = c4.sysDisposed; waiting = scene.S.queue.filter((q) => q.prep && q.prep.h).length; cfg.set({ on: false }); } else if (offAt >= 0 && back < 0 && n >= offAt + 3) back = c4.sysDisposed - d0; } });
         t('system/prepare: ...and AT ONCE: the ' + waiting + ' handle(s) waiting when animations went off were disposed within three ticks (' + back + ')', offAt >= 0 && waiting >= 1 && back >= waiting, 'offAt ' + offAt); }
+    }
+    // round 8: THE ENGINE POOL. The real animator keeps three console engines (battle_sys.js SystemAnimator): the run that plays or waits for its handle, up to two prepared events, and the opening's PREWARM until its
+    // pre-roll is done. pumpSys serves the events before the prewarm, so on a slow machine the prewarm was still pending when the first events were prepared, four engines were wanted, and the prepare of the third
+    // event threw 'the system engine pool is exhausted' (seen with the real animator on the test's deterministic clock, seeds 2-5, also on the HEAD scene): that effect was then not prepared ahead and began late.
+    // The stub models the pool (o.poolEngines) and a handle that needs 500 advances (the prewarm starves); the scene gives the prewarm up and prepares again, and says so in animInfo().notes, not in .log.
+    {
+      const POOL_SEEDS = quick ? [1] : [1, 2, 3, 4];
+      const swDecide = () => { let taken = 0; return (req, def) => { if (req.phase === 'move' && req.switches && req.switches.length && !req.trapped && taken < 3) { taken++; return { kind: 'switch', slot: req.switches[0].slot }; } return def; }; };
+      const play = async (sd, so) => { const st = await makeAnimator(Object.assign({ system: true }, so)); const hooks = { hits: 0, faints: 0, sounds: [], cries: [] }; hooks.onHit = () => hooks.hits++; hooks.onFaint = () => hooks.faints++; const r = playBattle(M, { seed: sd, cfg: mkCfg(onSys), animator: st, hooks, decide: swDecide() }); return { st, r, hooks, info: r.scene.animInfo() }; };
+      const rows = [];
+      for (const sd of POOL_SEEDS) rows.push({ sd, slow: await play(sd, { poolEngines: 3, prepAdvances: 500 }), big: await play(sd, { poolEngines: 4, prepAdvances: 500 }), plain: await play(sd, {}) });
+      const brief = (r) => r.sd + ': log ' + JSON.stringify(r.slow.info.log).slice(0, 90) + ', shed ' + r.slow.info.shed + ', pool throws ' + (r.slow.st.calls.poolThrows | 0) + ', evicted ' + (r.slow.st.calls.sysEvicted | 0);
+      t('system/pool: with a pool of three engines and handles that take long, no prepare() threw: the animation log is empty over ' + rows.length + ' battle(s) (it held "the system engine pool is exhausted")', rows.every((r) => r.slow.info.log.length === 0 && r.slow.r.scene.mode === 'result'), rows.map(brief).join(' | '));
+      t('system/pool: ...and the prewarm was the one given up, once, where the pool was full: shed = the pool refusals, the prewarm handle was disposed, and animInfo().notes says so', rows.every((r) => r.slow.info.shed >= 1 && r.slow.info.shed === (r.slow.st.calls.poolThrows | 0) && r.slow.st.calls.sysWarm.length === 1 && r.slow.st.calls.sysWarm[0].disposed === true && r.slow.info.notes.filter((n) => /the prewarm was given up and it was prepared again/.test(n)).length === r.slow.info.shed), rows.map(brief).join(' | '));
+      t('system/pool: ...no effect was cut off to make room (no live run evicted), every event the plain battle plays was played, and it is the same battle (hash, hit and faint hooks once per event)', rows.every((r) => (r.slow.st.calls.sysEvicted | 0) === 0 && r.slow.info.sys === r.plain.info.sys && r.slow.r.hash === r.plain.r.hash && r.slow.hooks.hits === r.plain.hooks.hits && r.slow.hooks.faints === r.plain.hooks.faints), rows.map((r) => r.sd + ': sys ' + r.slow.info.sys + '/' + r.plain.info.sys + ' hash ' + (r.slow.r.hash === r.plain.r.hash)).join(' | '));
+      t('system/pool: control: with room for four engines (or fast handles) nothing is given up, nothing is noted, no prepare is refused', rows.every((r) => r.big.info.shed === 0 && r.big.info.notes.length === 0 && (r.big.st.calls.poolThrows | 0) === 0 && r.big.info.log.length === 0 && r.plain.info.shed === 0 && r.plain.info.notes.length === 0), rows.map((r) => r.sd + ': ' + r.big.info.shed + '/' + r.big.info.notes.length + '/' + r.plain.info.notes.length).join(' | '));
     }
     // prefetch: the heavy start() of an event run happens while an earlier message is up, not on the frame the event begins
     const lead = [];
@@ -839,6 +1002,20 @@ ok(realFails.length === 0, '1. every anim-scene check passes on the real tree ('
     const wrong = rest({ foe: Object.assign({}, FOE, { hp: 40 }) });
     ok(diff(runView(run, wrong).rgba, ui.render(wrong).rgba) >= 20, '4. handoff negative control: a scene that shows another foe HP than the run is found (>= 20 px)', '');
   }
+  // ---- round 7b: WHICH POKEMON EACH SWITCH EFFECT DRAWS. The scene projects (and re-checks at start) exactly the Pokemon an effect draws: both sides of a recall, the OTHER side of a send-out. This is the evidence for
+  // that line, with the ROM engine: EVERY frame of the whole effect is hashed, then the same effect is run with one Pokemon changed. A send-out is identical in every frame for any HP or species of the side that
+  // sends out (the Pokemon it replaces) and different for the other side's HP; a recall is different for either side's HP (the recalled Pokemon is drawn, with its bar).
+  {
+    const hashAll = (id, ctx) => { const run = animator.start('system', id, ctx); const h = crypto.createHash('sha1'), fr = { width: 240, height: 160, data: new Uint8ClampedArray(240 * 160 * 4) }; let n = 0; while (!run.done && n++ < 3000) { run.step(); fr.data.fill(0); run.draw(fr, { layers: SYSM.LAYERS_ALL }); h.update(fr.data); } return h.digest('hex') + ':' + n; };
+    for (const [name, id, lead, extra, sendOut] of [['foe send-out', 8, 'foe', { switchIn: spec(NEW_FOE) }, true], ['player send-out', 2, 'player', { switchIn: spec(NEW_ME) }, true], ['foe recall', 9, 'foe', {}, false], ['player recall', 3, 'player', {}, false]]) {
+      const leadMon = lead === 'foe' ? FOE : ME, otherKey = lead === 'foe' ? 'player' : 'foe', otherMon = lead === 'foe' ? ME : FOE;
+      const mk = (o) => Object.assign({ foe: spec(FOE), player: spec(ME), environment: ENV, trainer: id >= 8 ? 1 : 0, seed: 1 }, o, extra);
+      const base = hashAll(id, mk({})), leadHp = hashAll(id, mk({ [lead]: spec(Object.assign({}, leadMon, { hp: 37 })) })), otherHp = hashAll(id, mk({ [otherKey]: spec(Object.assign({}, otherMon, { hp: 37 })) }));
+      const leadSp = sendOut ? hashAll(id, mk({ [lead]: spec(Object.assign({}, leadMon, { species: lead === 'foe' ? 130 : 25, name: 'X' })) })) : null;
+      if (sendOut) ok(leadHp === base && leadSp === base && otherHp !== base, '4. draws: a ' + name + ' (id ' + id + ', ' + base.split(':')[1] + ' frames) is identical in every frame for any HP (37) or species of the side that sends out (the Pokemon it replaces), and different for the other side\'s HP', 'lead hp ' + (leadHp === base) + ', lead species ' + (leadSp === base) + ', other hp differs ' + (otherHp !== base));
+      else ok(leadHp !== base && otherHp !== base, '4. draws: a ' + name + ' (id ' + id + ', ' + base.split(':')[1] + ' frames) draws BOTH Pokemon: the recalled one\'s HP and the other side\'s HP each change frames', 'lead hp differs ' + (leadHp !== base) + ', other hp differs ' + (otherHp !== base));
+    }
+  }
   // ---- round 4: the trainer pictures, with the real engine
   {
     const tc = SYSM.trainerChoices(rom), CSM = await import(pathToFileURL(path.join(JS, 'charset.js')).href);
@@ -969,7 +1146,7 @@ if (process.env.ARENA_SKIP_MUTANTS !== '1') {
     ['scene.js', 'SYSTEM: the intro is never bundled (the old lead steps play)', (s) => s.replace('&& !P[viewSide].shown && sysOn(SYS.introTrainer)) {', '&& !P[viewSide].shown && false) {')],
     ['scene.js', 'SYSTEM: the scene never presses A for the run (it waits for ever at its first message)', (s) => s.replace('st.shown = tw.lines(); st.tw = null; r.setKeys(KEY_A); st.keyLeft = 3;', 'st.shown = tw.lines(); st.tw = null;')],
     ['scene.js', 'SYSTEM: events are never started (hits / faints / send-outs / recalls stay the old steps)', (s) => s.replace('if (st.noSys || !sysOn(id)) { dropPrep(P); return false; }', 'if (true) { dropPrep(P); return false; }')],
-    ['scene.js', 'SYSTEM: nothing is prepared ahead (every event run is prepared on the tick its step begins)', (s) => s.replace('nx.prep = sysOn(id) ? makeSysRun(nx, kind, id) : null;', 'nx.prep = null;')],
+    ['scene.js', 'SYSTEM: nothing is prepared ahead (every event run is prepared on the tick its step begins)', (s) => s.replace('nx.prep = sysOn(id) ? makeSysRun(nx, kind, id, proj) : null;', 'nx.prep = null;')],
     ['scene.js', 'SYSTEM: the experience of the level is not given (the trainer foe shows the wrong level)', (s) => s.replace('const pspec = (m, o) => partySpec(m, o, expOf);', 'const pspec = (m, o) => partySpec(m, o);')],
     ['scene.js', 'SYSTEM: cry events of a system run are not forwarded', (s) => s.replace("run.on('cry', (ev) => { A.cries++; if (!A.mute && hooks.onCry && ev) hooks.onCry(ev.species, ev.pan); });\n  }", "run.on('cry', () => { A.cries++; });\n  }")],
     ['scene.js', 'SYSTEM: every event run is started in trainer mode', (s) => s.replace('trainer: id >= 8 ? (trainerId() > 1 ? trainerId() : 1) : 0,', 'trainer: 1,')],
@@ -980,6 +1157,20 @@ if (process.env.ARENA_SKIP_MUTANTS !== '1') {
     ['scene.js', 'SYSTEM/prepare: begin() without waiting for ready', (s) => s.replace('if (!isReady(P)) { A.waited++; return false; }           // the pre-roll', 'if (false) { A.waited++; return false; }           // the pre-roll')],
     ['scene.js', 'SYSTEM/prepare: no prewarm of the first events battle state', (s) => s.replace("newPrep('battle', wctx, true);", '')],
     ['scene.js', 'SYSTEM/prepare: every event gets its own seed (the engine cannot share the pre-roll)', (s) => s.replace('seed: sysSeed(), maxFrames: SYS_MAX };         // ids 8 / 9', 'seed: animMix(A.seed, ++A.n), maxFrames: SYS_MAX };         // ids 8 / 9')],
+    ['scene.js', 'SYSTEM/stale: an event prepared ahead uses the Pokemon on screen NOW, not the one that will be there (the old Pokemon flashes when the new one is hit)', (s) => s.replace('const pm = proj && (side !== st.side || drawsLead(kind)) ? proj[side] : undefined;', 'const pm = undefined;')],
+    ['scene.js', 'SYSTEM/stale: a send-out is not given the projection of the OTHER side (a drain on it, a replacement queued first: the dead Pokemon / the old bar are drawn)', (s) => s.replace('const pm = proj && (side !== st.side || drawsLead(kind)) ? proj[side] : undefined;', 'const pm = proj && drawsLead(kind) ? proj[side] : undefined;')],
+    ['scene.js', 'SYSTEM/stale: a recall is not given the projection of the Pokemon it recalls (its own bar drains first: Eject Button, Emergency Exit)', (s) => s.replace("const drawsLead = (kind) => kind !== 'sendout';", "const drawsLead = (kind) => kind === 'hit' || kind === 'faint';")],
+    ['scene.js', 'SYSTEM/stale: a replacement queued before the effect is not projected (the Pokemon it replaces is drawn)', (s) => s.replace("if (t === 'slidein' || k === 'sendout') proj[step.side] = step.mon;", 'if (false) proj[step.side] = step.mon;')],
+    ['scene.js', 'SYSTEM/stale: a send-out is not re-checked against the screen when it starts', (s) => s.replace('(st.side === viewSide ? [ctx.foe, null] : [null, ctx.player])', '[]')],
+    ['scene.js', 'SYSTEM/stale: a recall is not re-checked against the screen when it starts', (s) => s.replace('if (P && P.sig !== undefined) {', "if (P && P.sig !== undefined && kind !== 'recall') {")],
+    ['scene.js', 'SYSTEM/stale: the Pokemon a send-out replaces is compared too (a hold for a picture nobody sees)', (s) => s.replace("const drawsLead = (kind) => kind !== 'sendout';", 'const drawsLead = () => true;')],
+    ['scene.js', 'SYSTEM/stale: a drain in progress does not change the HP the next picture is seeded with (the other health bar goes back up for the length of the effect)', (s) => s.replace("else if (t === 'drain') {", 'else if (false) {')],
+    ['scene.js', 'SYSTEM/stale: a prepared event is not re-checked against the screen when it starts', (s) => s.replace('if (fresh && now !== P.sig) {', 'if (false) {')],
+    ['scene.js', 'SYSTEM/stale: the state of the step PLAYING NOW is not projected (a switch or drain in progress)', (s) => s.replace('    projectStep(proj, S.cur);', '')],
+    ['scene.js', 'SYSTEM/stale: a benign re-prepare is written to the PROBLEMS log (the tests and the browser suite read that log as errors)', (s) => s.replace("A.notes.push('system ' + id + ' stale: ' + why)", "A.log.push('system ' + id + ' stale: ' + why)")],
+    ['scene.js', 'SYSTEM/pool: a prepare that throws does not give up the prewarm (the third event is not prepared ahead: "the system engine pool is exhausted")', (s) => s.replace('const w = warm ? null : A.pend.find((x) => x.warm);', 'const w = null;')],
+    ['scene.js', 'SYSTEM/pool: the prewarm is given up but the prepare is not tried again', (s) => s.replace("      return animator.prepare('system', id, ctx);\n    }\n  }\n  function newPrep", '      throw e;\n    }\n  }\n  function newPrep')],
+    ['scene.js', 'SYSTEM/pool: the prewarm is forgotten, not disposed (its engine stays taken)', (s) => s.replace('dropPrep(w); A.shed =', 'unpend(w); A.shed =')],
     ['scene.js', 'SYSTEM/prepare: handles are kept when animations are switched off (never given back)', (s) => s.replace('if (!animCfg()) { for (const nx of S.queue) if (nx.prep) { dropPrep(nx.prep); nx.prep = undefined; } return; }', 'if (!animCfg()) return;')],
     ['scene.js', 'SYSTEM/prepare: a failed handle does not fall back to the old step', (s) => s.replace('dropPrep(st.P); st.P = null; st.run = null; st.t = st.orig; st.noSys = true; st.restarted = true;\n    startStep(st);\n    return false;', 'dropPrep(st.P); st.P = null; st.run = null; st.kind = null;\n    return true;')],
     ['scene.js', 'SYSTEM/prepare: the hit / faint hooks fire again when a step restarts', (s) => s.replace("if (hooks.onHit && !st.restarted)", 'if (hooks.onHit)')],
@@ -1088,6 +1279,8 @@ if (process.env.ARENA_BROWSER === '1') {
       // round 4: the SYSTEM animations in the real page, PREPARED in slices. info.sys = runs of the battle's own animations, info.waited = ticks a step held the previous picture for a handle that was not
       // ready, prewarm = the throwaway intro played at load, long = every frame (tick + render) over the 16.74 ms budget of 59.7275 Hz (round 3 had 22 stalls of 94-151 ms and a worst tick of 150-310 ms)
       ok(on.info && on.info.sys >= 1 && on.info.log.length === 0, 'browser: the battle played system animations (' + (on.info && on.info.sys) + ' runs) with no error in the animation log', JSON.stringify(on.info && on.info.log));
+      // the log above lists PROBLEMS only; a re-prepare of an effect whose picture changed (restale) and a prewarm given up for a full engine pool (shed) are benign and live in animInfo().notes
+      ok(on.info && Array.isArray(on.info.notes) && on.info.notes.length === (on.info.restale | 0) + (on.info.shed | 0) && on.info.notes.every((x) => /^system [2-9] (stale: |prepare\(\) threw .*the prewarm was given up)/.test(x)), 'browser: the benign events are in animInfo().notes (' + (on.info && on.info.restale | 0) + ' re-prepared, ' + (on.info && on.info.shed | 0) + ' prewarm given up), never in the problems log', JSON.stringify(on.info && on.info.notes).slice(0, 300));
       ok(on.prewarm && on.prewarm.steps >= 1, 'browser: the first system run was warmed behind the boot screen', JSON.stringify(on.prewarm));
       console.log('browser system animations: ' + on.info.sys + ' runs over ' + on.frames + ' frames; prewarm ' + JSON.stringify(on.prewarm && { ms: Math.round(on.prewarm.ms), steps: on.prewarm.steps }) + '; frames over the 16.74 ms budget: ' + on.long.length + ' ' + JSON.stringify(on.long.slice(0, 6)) + '; worst frame (tick + render) ' + on.frameMax.toFixed(1) + ' ms, worst tick ' + on.tickMax.toFixed(1) + ' ms; ticks a step held the previous picture: ' + on.info.waited);
       // A ROM MOVE animation can cost 12-15 ms a frame on its own (its step + its draw): those frames exceed the budget with or without a pre-roll slice (the slice shrinks to 0.5 ms there, see

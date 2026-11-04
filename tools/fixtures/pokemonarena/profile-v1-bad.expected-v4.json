@@ -1,7 +1,7 @@
 {
  "profile": {
   "app": "pokemonarena",
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "id": "p_fixture02",
   "rev": 2,
   "createdAt": 1700000000000,
@@ -118,6 +118,12 @@
      "f": 0
     },
     "hard": {
+     "w": 0,
+     "l": 0,
+     "dr": 0,
+     "f": 0
+    },
+    "online": {
      "w": 0,
      "l": 0,
      "dr": 0,

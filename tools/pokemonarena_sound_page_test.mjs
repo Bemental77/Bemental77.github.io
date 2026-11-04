@@ -9,6 +9,10 @@
 // tools/pokemonarena_sound_lib.mjs, installed before any page script runs. The music engine (music.js) and the song map (music_map.js) are STAND-INS with the
 // shared contract's exact signatures (window.__arenaSoundModules, the seam sound_system.js documents); an extra session runs the REAL modules when they exist.
 //
+// UPDATED 2026-11-03 for the new defaults (sound ON at Master 50%, music as soon as the browser allows): the page TRIES at load, the AudioContext double emulates the browser's autoplay policy (a context stays
+// suspended until a real user activation unless ?autoplay=1), a bare modifier key (Shift) is NOT an activation in Chrome so the first-gesture cases press a real key, and the team preview now plays the
+// CPU level's battle song (the classic start) instead of the encounter song. Each changed assertion carries a comment saying so.
+//
 // SESSIONS (a fresh throwaway Chrome each)
 //   hub      (a) no AudioContext exists before the first activation; the default is sound ON; the controller-only prompt; (b) the first key creates and resumes one
 //            and the hub song starts; the panel with MOUSE: slider click, wheel, - / + with hold-to-repeat, mute, test cry, soundtrack switch, close; (f) persistence,
@@ -24,6 +28,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 process.env.ARENA_PORT = process.env.ARENA_PORT || '8104';
 process.env.ARENA_CDP = process.env.ARENA_CDP || '9355';
@@ -96,8 +101,10 @@ async function scnFirstActivation(page, R, base) {
   await open(page, base + '/pokemonarena/');
   await hubReady(page);
   const s0 = await st(page);
-  R.ok((await page.eval('window.__snd.ctor')) === 0 && s0.mixer.created === false, '(a) hub: NO AudioContext exists before the first activation', J({ ctor: await page.eval('window.__snd.ctor'), created: s0.mixer.created }));
-  R.ok(s0.mixer.settings.muted === false && s0.mixer.settings.master === 0.7 && s0.mixer.settings.music === 0.6 && s0.mixer.settings.fx === 0.8, 'hub: the default policy is sound ON (master 0.7, music 0.6, fx 0.8, not muted)', J(s0.mixer.settings));
+  // UPDATED DELIBERATELY (the page now TRIES to start the sound at load: mixer earlyStart): a context may exist before any gesture, but the double emulates the browser's autoplay policy, so it stays SUSPENDED
+  // and nothing can play until a real user activation. What must still hold is that nothing is RUNNING; "no context at all" was the old way of saying it.
+  R.ok((await page.eval('window.__snd.ctor')) === 1 && s0.mixer.created === true && s0.mixer.ctx === 'suspended' && (await page.eval('window.__snd.ctxs.every((c) => c.state !== "running")')), '(a) hub: the page TRIED to start the sound at load (one context) and the browser refused: it is SUSPENDED, nothing can play before the first activation', J({ ctor: await page.eval('window.__snd.ctor'), created: s0.mixer.created, ctx: s0.mixer.ctx }));
+  R.ok(s0.mixer.settings.muted === false && s0.mixer.settings.master === 0.5 && s0.mixer.settings.music === 0.6 && s0.mixer.settings.fx === 0.8, 'hub: the default policy is sound ON at half the slider (master 0.5, music 0.6, fx 0.8, not muted): the starting volume the user asked for', J(s0.mixer.settings));
   R.ok((await stored(page)) === null && (await page.eval(`localStorage.getItem('arena.sound')`)) === null, 'hub: a default page stores nothing (no arena.audio, no arena.sound)');
   R.ok((await page.eval(`document.getElementById('soundBtn').textContent`)) === 'Sound: on', 'hub: the header button reads "Sound: on" by default');
   const pr = await page.eval(`(() => { const p = document.getElementById('soundPrompt'); return p ? { hidden: p.hidden, text: p.textContent, btn: !!p.querySelector('button'), pe: getComputedStyle(p).pointerEvents } : null; })()`);
@@ -112,7 +119,8 @@ async function scnFirstActivation(page, R, base) {
   const g = await gains(page);
   R.ok(ml.create.length === 1 && ml.create[0].soundtrack === 'soulgold' && ml.create[0].romLen === 33554432 && ml.create[0].dest === g.ids[1] && ml.create[0].fx === g.ids[2], 'hub: the music engine is created with the SoulGold ROM, the MUSIC bus and the FX bus', J(ml.create));
   R.ok(ml.play.length === 1 && ml.play[0].index === 10 && ml.play[0].fadeInMs === 400, 'hub: the hub song (key "hub", index 10 in the stand-in map) starts with a 400 ms fade-in', J(ml.play));
-  R.ok(near(g.master, 1) && near(g.music, 1) && near(g.fx, 1), 'hub: at the default slider positions (0.7 / 0.6 / 0.8) the three buses sit at gain EXACTLY 1.0 (the real game\'s own level)', J(g));
+  // (the gain law is anchored on the UNITY positions 0.7 / 0.6 / 0.8, not on the starting volume: master now starts at 0.5, so its gain is (0.5/0.7)^2, while music and effects stay at exactly 1.0)
+  R.ok(near(g.master, gainOf(0.5, 'master')) && near(g.music, 1) && near(g.fx, 1), 'hub: a first-time visitor starts with the master bus at gain (0.5/0.7)^2 and music and effects at EXACTLY 1.0 (the real game\'s own level)', J(g));
   const errs = errsOf(page).filter((e) => !/favicon|\[sound\]/.test(e));
   R.ok(errs.length === 0, 'hub: no page or console error through first activation', J(errs));
 }
@@ -216,11 +224,11 @@ async function scnPersistence(page, R, base) {
   await page.eval(`localStorage.removeItem('arena.audio'); localStorage.setItem('arena.sound', '1');`);
   await page.navigate(base + '/pokemonarena/'); await hubReady(page);
   const m1 = await settings(page);
-  R.ok(m1.muted === false && m1.master === 0.7 && JSON.parse(await stored(page)).v === 1, 'migration: the old arena.sound "1" becomes sound on with the default volumes', J(m1));
+  R.ok(m1.muted === false && m1.master === 0.5 && JSON.parse(await stored(page)).v === 1, 'migration: the old arena.sound "1" becomes sound on with the default volumes (master now 0.5: the old key held no volume, so the new starting volume applies)', J(m1));
   await page.eval(`localStorage.removeItem('arena.audio'); localStorage.removeItem('arena.sound'); localStorage.setItem('arena.audio', '{"master":"loud","music":7,"muted":"no"}')`);
   await page.navigate(base + '/pokemonarena/'); await hubReady(page);
   const m2 = await settings(page);
-  R.ok(m2.master === 0.7 && m2.music === 1 && m2.muted === false, 'a hostile arena.audio is repaired field by field and the page still boots', J(m2));
+  R.ok(m2.master === 0.5 && m2.music === 1 && m2.muted === false, 'a hostile arena.audio is repaired field by field (an invalid master takes the starting volume 0.5) and the page still boots', J(m2));
   await page.eval(`localStorage.removeItem('arena.audio')`);
 }
 
@@ -240,7 +248,7 @@ async function scnHiddenAndM(page, R, base) {
   R.ok((await settings(page)).muted === true && (await page.eval(`document.getElementById('soundToast').hidden`)) === false && /muted/i.test(await page.eval(`document.getElementById('soundToast').textContent`)), '(e) the M key mutes (and says so)');
   R.ok((await gains(page)).master === 0, 'M: the master bus is 0');
   await key(page, 'm'); await sleep(250);
-  R.ok((await settings(page)).muted === false && (await ctxState(page)) === 'running' && near((await gains(page)).master, gainOf(0.7, 'master')), '(e) M again unmutes and restores the level');
+  R.ok((await settings(page)).muted === false && (await ctxState(page)) === 'running' && near((await gains(page)).master, gainOf(0.5, 'master')), '(e) M again unmutes and restores the level (the starting master 0.5)');
   // M does not fire inside a text field
   await page.eval(`(() => { const i = document.createElement('input'); i.id = 'tmpText'; i.type = 'text'; document.body.appendChild(i); i.focus(); })()`);
   await key(page, 'm'); await sleep(150);
@@ -293,7 +301,9 @@ async function scnPad(page, R, base) {
   await hubReady(page);
   await page.eval(`${HUB}.pause(true); ${HUB}.canvas.focus()`);
   await pad(page, 'down');
-  R.ok((await page.eval('window.__snd.ctor')) === 0, '(c) controller: a controller button is NOT an activation: still no AudioContext after a d-pad press');
+  // UPDATED DELIBERATELY (the page now TRIES to start the sound at load: mixer earlyStart): a context may exist before any gesture, but the double emulates the browser's autoplay policy, so it stays SUSPENDED
+  // and nothing can play until a real user activation. What must still hold is that nothing is RUNNING; "no context at all" was the old way of saying it.
+  R.ok((await page.eval('window.__snd.ctxs.every((c) => c.state !== "running")')), '(c) controller: a controller button is NOT an activation: the context (tried at load) is still suspended after a d-pad press, and nothing plays');
   // ROUND 4: a controller button is not an activation, but it DISMISSES the hint (a pad-only visitor must not be stuck with it); the press still moved the page
   const pr = await page.eval(`({ hidden: document.getElementById('soundPrompt').hidden, why: window.__arenaSound.state().promptWhy, prompt: window.__arenaSound.state().prompt })`);
   R.ok(pr.hidden === true && pr.prompt === false && pr.why === 'pad', '(c) controller: a controller button hides the "click, tap or press a key" hint (it cannot start the sound, but it must not leave a pad-only visitor staring at it)', J(pr));
@@ -315,7 +325,7 @@ async function scnPad(page, R, base) {
   R.ok((await active(page)) === 'mute', 'controller: the d-pad reaches the Mute button', await active(page));
   await pad(page, 'a'); await sleep(200);
   R.ok((await settings(page)).muted === true, '(e) controller: A on Mute mutes');
-  R.ok((await page.eval('window.__snd.ctor')) === 0, 'controller: through the whole panel session no AudioContext was created (a pad cannot start the sound)');
+  R.ok((await page.eval('window.__snd.ctxs.every((c) => c.state !== "running")')) && (await page.eval('window.__snd.ctor')) <= 1, 'controller: through the whole panel session no AudioContext ever ran (a pad cannot start the sound; the one context tried at load stayed suspended)');
   const sg = await page.eval(`(() => { const s = window.__arenaSound.mixer.settings(); return s; })()`);
   await pad(page, 'a'); await sleep(200);
   R.ok((await settings(page)).muted === false, 'controller: A again unmutes');
@@ -331,7 +341,9 @@ async function scnTouch(page, R, base) {
   await page.setViewport(390, 844, { mobile: true, dpr: 3 });
   await open(page, base + '/pokemonarena/');
   await hubReady(page);
-  R.ok((await page.eval('window.__snd.ctor')) === 0, 'touch: no AudioContext before the first tap');
+  // UPDATED DELIBERATELY (the page now TRIES to start the sound at load: mixer earlyStart): a context may exist before any gesture, but the double emulates the browser's autoplay policy, so it stays SUSPENDED
+  // and nothing can play until a real user activation. What must still hold is that nothing is RUNNING; "no context at all" was the old way of saying it.
+  R.ok((await page.eval('window.__snd.ctxs.every((c) => c.state !== "running")')) && (await page.eval('window.__snd.ctor')) <= 1, 'touch: nothing is running before the first tap (the context tried at load is suspended)');
   const cov = await page.eval(`(() => { const c = document.querySelector('canvas#hub'); const r = c.getBoundingClientRect(); const pts = [[r.left + r.width / 2, r.top + 12], [r.left + r.width / 2, r.top + r.height / 2], [r.left + 20, r.top + r.height - 12]]; return pts.map(([x, y]) => { const e = document.elementFromPoint(x, y); return e ? e.id || e.tagName : null; }); })()`);
   R.ok(cov.every((x) => x === 'hub'), 'touch: nothing covers the picture before the first tap, so the first tap reaches the menu (the start-sound prompt must not swallow it)', J(cov));
   const sb = await rect(page, '#soundBtn');
@@ -382,20 +394,24 @@ async function scnTouch(page, R, base) {
 async function scnBattle(page, R, base) {
   await open(page, base + '/pokemonarena/battle.html?seed=7&format=3v3&cpu=hard&speed=fast');
   await batReady(page);
-  R.ok((await page.eval('window.__snd.ctor')) === 0, '(a) battle: no AudioContext before the first activation');
+  // UPDATED DELIBERATELY (the page now TRIES to start the sound at load: mixer earlyStart): a context may exist before any gesture, but the double emulates the browser's autoplay policy, so it stays SUSPENDED
+  // and nothing can play until a real user activation. What must still hold is that nothing is RUNNING; "no context at all" was the old way of saying it.
+  R.ok((await page.eval('window.__snd.ctxs.every((c) => c.state !== "running")')) && (await page.eval('window.__snd.ctor')) <= 1, '(a) battle: nothing is running before the first activation (the context tried at load is suspended)');
   await page.waitFor(`${BAT}.mode === 'preview'`, { timeoutMs: 30000 });
-  await key(page, 'shift');                                   // a key: activation
+  await key(page, 'tab');                                     // a key: activation (NOT Shift: Chrome does not count a bare modifier key, so the double, which follows the browser's policy, would stay suspended)
   await page.waitFor(`window.__snd.ctxs[0] && window.__snd.ctxs[0].state === 'running' && window.__sndMusic && window.__sndMusic.play.length >= 1`, { timeoutMs: 10000 });
   await sleep(200);
   const idx = () => page.eval(`window.__sndMusic.play.map((p) => p.index)`);
-  R.ok(J(await idx()) === J([12]), '(g) battle: team preview asks for the "preview" song (12)', J(await idx()));
+  // THE CLASSIC BATTLE START (the user: "when you click start, you get the classic pokemon battle start music"): the team preview used to play the encounter song ("preview", 12 here); the battle now
+  // starts on the CPU level's own battle song from the very first frame, as the game does (GetBattleBGM at battle start), so cpu=hard asks for battle_hard (22) at the team preview.
+  R.ok(J(await idx()) === J([22]), '(g) battle: the team preview plays the CPU level\'s battle song (cpu=hard -> battle_hard -> 22), NOT the encounter song (12)', J(await idx()));
   // pick three and confirm
   await page.eval(`(() => { const a = window.${BAT}; for (const i of [0, 1, 2]) a.scene.choose.preview(i); })()`);
   await sleep(100);
   await page.eval(`window.${BAT}.press('a')`);                // YES
   await page.waitFor(`${BAT}.mode === 'action'`, { timeoutMs: 60000 }).catch(async () => { for (let n = 0; n < 200 && (await page.eval(`${BAT}.mode`)) !== 'action'; n++) { await page.eval(`window.${BAT}.press('a')`); await sleep(60); } });
   await sleep(300);
-  R.ok(J(await idx()) === J([12, 22]), '(g) battle: after the team is chosen the CPU-level song plays (cpu=hard -> key battle_hard -> 22)', J(await idx()));
+  R.ok(J(await idx()) === J([22]), '(g) battle: after the team is chosen the SAME song carries on (22: no restart, no second play)', J(await idx()));
   // menu sounds through REAL key events
   const e0 = await page.eval('window.__sndMusic.effect.length');
   await page.eval(`${BAT}.canvas.focus()`);
@@ -419,7 +435,8 @@ async function scnBattle(page, R, base) {
   await key(page, 'left'); await key(page, 'left');
   await key(page, 'esc'); await sleep(500);
   R.ok(!(await panelOpen(page)) && (await page.eval(`${BAT}.mode`)) === 'menu' && (await page.eval(`${BAT}.scene.S.menu.cursor`)) === si, 'battle: closing the panel returns to the pause menu on the SOUND row', J({ mode: await page.eval(`${BAT}.mode`), cur: await page.eval(`${BAT}.scene.S.menu.cursor`), si }));
-  R.ok((await settings(page)).master === 0.6 && (await page.eval(`${BAT}.controlsOpen === false`)), 'battle: the slider change (Left x2 = -10% on Master) is kept; the scene hears input again');
+  // (the starting Master is 0.5 now, so two Left presses leave it at 0.4; it was 0.7 -> 0.6)
+  R.ok((await settings(page)).master === 0.4 && (await page.eval(`${BAT}.controlsOpen === false`)), 'battle: the slider change (Left x2 = -10% on Master, from the starting 50%) is kept; the scene hears input again');
   void e1;
   await key(page, 'esc'); await sleep(300);                                          // leave the pause menu
   R.ok((await page.eval(`${BAT}.mode`)) !== 'menu' && near((await gains(page)).music, gainOf(0.6, 'music')), 'battle: leaving the pause menu restores the music level');
@@ -461,10 +478,10 @@ async function scnBattle(page, R, base) {
   const seq = await idx();
   const w = await page.eval(`${BAT}.ctl.winner`);
   const jingle = w === 0 ? 30 : w === 1 ? 31 : null;
-  R.ok(seq.length === 3 && seq[2] === jingle, '(g) battle: the result screen starts the ' + (w === 0 ? 'victory' : 'defeat') + ' jingle (' + jingle + ') first', J(seq));
+  R.ok(seq.length === 2 && seq[1] === jingle, '(g) battle: the result screen starts the ' + (w === 0 ? 'victory' : 'defeat') + ' jingle (' + jingle + ') first', J(seq));
   await page.eval(`window.__sndMusicEnd(${jingle})`); await sleep(300);
   const seq2 = await idx();
-  R.ok(seq2.length === 4 && seq2[3] === (w === 0 ? 40 : 41), '(g) battle: when the jingle ends the result music (' + (w === 0 ? 40 : 41) + ') starts: the whole sequence is preview 12, battle_hard 22, jingle, result', J(seq2));
+  R.ok(seq2.length === 3 && seq2[2] === (w === 0 ? 40 : 41), '(g) battle: when the jingle ends the result music (' + (w === 0 ? 40 : 41) + ') starts: the whole sequence is battle_hard 22 (from the team preview on), jingle, result', J(seq2));
   await page.eval(`window.__arenaSound.director.state()`);
   return { shotB };
 }
@@ -473,7 +490,9 @@ async function scnBattle(page, R, base) {
 async function scnEditor(page, R, base, { padSession = false } = {}) {
   await open(page, base + '/pokemonarena/editor.html', { pad: padSession });
   await edReady(page);
-  R.ok((await page.eval('window.__snd.ctor')) === 0, '(a) editor: no AudioContext before the first activation');
+  // UPDATED DELIBERATELY (the page now TRIES to start the sound at load: mixer earlyStart): a context may exist before any gesture, but the double emulates the browser's autoplay policy, so it stays SUSPENDED
+  // and nothing can play until a real user activation. What must still hold is that nothing is RUNNING; "no context at all" was the old way of saying it.
+  R.ok((await page.eval('window.__snd.ctxs.every((c) => c.state !== "running")')) && (await page.eval('window.__snd.ctor')) <= 1, '(a) editor: nothing is running before the first activation (the context tried at load is suspended)');
   const hasBtn = await page.eval(`!!document.getElementById('soundBtn')`);
   R.ok(hasBtn, 'editor: the header has a Sound button');
   if (!padSession) {
@@ -507,13 +526,38 @@ async function scnEditor(page, R, base, { padSession = false } = {}) {
   R.ok(errsOf(page).filter((e) => !/favicon/.test(e)).length === 0, 'editor: no page or console error', J(errsOf(page)));
 }
 
+
+/* ---- THE CLASSIC BATTLE START with the REAL song table and the REAL engine: which song plays when a battle begins, and that it is already playing before any input ---- */
+// The battle opens on the song of its CPU level (the game's wild / trainer / leader theme: music_map battle_easy 887, battle_normal 888, battle_hard 889 on SoulGold), from the first frame, the team preview of a 3v3
+// included (it used to be the encounter song 416). Chrome here runs with --autoplay-policy=no-user-gesture-required (headless_cdp.mjs default) and the page TRIES at load, so the real context runs with no gesture at all;
+// the policy a real visitor has is measured by tools/pokemonarena_autoplay_test.mjs.
+async function scnRealBattleStart(page, R, base) {
+  const MAPM = await import(pathToFileURL(path.join(PA, 'js', 'music_map.js')).href);
+  const idx = (k) => MAPM.songFor('soulgold', k).index;
+  for (const [cpu, fmt, key, label] of [['easy', '3v3', 'battle_easy', 'wild-style (cpu easy), 3v3 with a team preview'], ['normal', '6v6', 'battle_normal', 'trainer-style (cpu normal), 6v6 without one'], ['hard', '3v3', 'battle_hard', 'leader-style (cpu hard), 3v3 with a team preview']]) {
+    await open(page, base + '/pokemonarena/battle.html?cpu=' + cpu + '&format=' + fmt + '&seed=7&speed=fast&nostubs=1&realaudio=1');
+    await batReady(page);
+    await page.waitFor('(() => { const d = window.__arenaSound.state().director; return d.cur || d.error; })()', { timeoutMs: 120000 });
+    const d = await page.eval('window.__arenaSound.state().director');
+    const noInput = !(await page.eval('navigator.userActivation && navigator.userActivation.hasBeenActive'));
+    const mode = await page.eval(`${BAT}.mode`);
+    R.ok(!d.error && d.cur && d.cur.key === key && d.cur.index === idx(key), 'battle start: ' + label + ': the REAL engine is playing the game\'s own battle song ' + idx(key) + ' (' + key + ')', J({ cur: d.cur, error: d.error }));
+    R.ok(noInput, 'battle start: ' + label + ': and the page has had NO user input of any kind (the music did not wait for a click)');
+    const wants = d.log.filter((x) => x.op === 'want').map((x) => x.key);
+    R.ok(wants[0] === key && !wants.includes('preview'), 'battle start: ' + label + ': the first song asked for is the battle song, never the team-preview (encounter) song', J(wants));
+    if (fmt === '3v3') R.ok(mode === 'preview', 'battle start: ' + label + ': the song is already playing during the team preview (mode ' + mode + ')', mode);
+  }
+}
+
 /* ---- the REAL AudioContext in headless Chrome (muted by --mute-audio) with the REAL music.js: does it really play, and what does it cost? ---- */
 async function scnRealAudio(page, R, base) {
   await open(page, base + '/pokemonarena/?nostubs=1&realaudio=1');
   await hubReady(page);
   const real = await page.eval(`typeof window.__snd === 'undefined' && typeof AudioContext === 'function' && /native code/.test(Function.prototype.toString.call(AudioContext))`);
   R.ok(real, 'REAL AudioContext: this page has the browser\'s own AudioContext (no test double installed; Chrome runs with --mute-audio)');
-  R.ok((await page.eval('window.__arenaSound.mixer.getAudioState().created')) === false, 'REAL AudioContext: none exists before the first key press');
+  // UPDATED DELIBERATELY: the page tries at load, and this Chrome is launched with --autoplay-policy=no-user-gesture-required (headless_cdp.mjs default), so the REAL context is allowed and runs at once.
+  // (The policy a real visitor has is measured, in a Chrome launched WITHOUT that flag, by tools/pokemonarena_autoplay_test.mjs.)
+  R.ok((await page.eval('window.__arenaSound.mixer.getAudioState().created')) === true, 'REAL AudioContext: the page created it at load (the early try)');
   await key(page, 'down');
   await page.waitFor(`window.__arenaSound.mixer.getAudioState().ctx === 'running'`, { timeoutMs: 15000 });
   R.ok(true, 'REAL AudioContext: the first key press created it and it is running');
@@ -594,17 +638,17 @@ async function promptCase(page, base, pg, view, R, label) {
 // dismissal without sound: Escape (not a browser activation) hides it, and so does any controller button; neither creates an AudioContext, and the pad press still reaches the page
 async function promptDismissCase(page, R, base, label) {
   await page.setViewport(1280, 800, { mobile: false, dpr: 1 });
-  const snap = () => page.eval(`({ prompt: window.__arenaSound.state().prompt, dismissed: window.__arenaSound.state().promptDismissed, why: window.__arenaSound.state().promptWhy, ctor: window.__snd.ctor, created: window.__arenaSound.mixer.getAudioState().created, hub: JSON.stringify(window.__arenaHub.model.state().cursor) })`);
+  const snap = () => page.eval(`({ prompt: window.__arenaSound.state().prompt, dismissed: window.__arenaSound.state().promptDismissed, why: window.__arenaSound.state().promptWhy, ctor: window.__snd.ctor, created: window.__arenaSound.mixer.getAudioState().created, running: window.__snd.ctxs.some((c) => c.state === 'running'), hub: JSON.stringify(window.__arenaHub.model.state().cursor) })`);
   await page.navigate(base + '/pokemonarena/'); await page.waitFor(PROMPT_PAGES[0].ready, { timeoutMs: 60000 }); await sleep(600);
   const a0 = await snap();
   await key(page, 'esc'); await sleep(250);
   const a1 = await snap();
-  R.ok(a0.prompt === true && a1.prompt === false && a1.dismissed === true && a1.why === 'escape' && a1.ctor === 0 && a1.created === false, 'prompt ' + label + 'Esc hides it WITHOUT starting any sound (no AudioContext is created)', J({ a0, a1 }));
+  R.ok(a0.prompt === true && a1.prompt === false && a1.dismissed === true && a1.why === 'escape' && a1.running === false, 'prompt ' + label + 'Esc hides it WITHOUT starting any sound (the context tried at load is still suspended: Esc is not an activation)', J({ a0, a1 }));
   await page.navigate(base + '/pokemonarena/'); await page.waitFor(PROMPT_PAGES[0].ready, { timeoutMs: 60000 }); await sleep(600);
   const b0 = await snap();
   await pad(page, 'down'); await sleep(300);
   const b1 = await snap();
-  R.ok(b0.prompt === true && b1.prompt === false && b1.dismissed === true && b1.why === 'pad' && b1.ctor === 0 && b1.created === false, 'prompt ' + label + 'a controller button hides it WITHOUT starting any sound, so a pad-only visitor is never stuck with it', J({ b0, b1 }));
+  R.ok(b0.prompt === true && b1.prompt === false && b1.dismissed === true && b1.why === 'pad' && b1.running === false, 'prompt ' + label + 'a controller button hides it WITHOUT starting any sound (the page tries it as a gesture; the browser does not count it), so a pad-only visitor is never stuck with it', J({ b0, b1 }));
   R.ok(b1.hub !== b0.hub, 'prompt ' + label + 'and that same pad press still moved the hub cursor (the prompt consumes nothing)', J({ before: b0.hub, after: b1.hub }));
 }
 async function promptSuite(page, R, base, label, sizes = [{ w: 1280, h: 800 }, { w: 800, h: 600 }]) {
@@ -724,6 +768,8 @@ try {
       });
       await fresh(page, BASE);
       await scenario('real AudioContext', (R) => scnRealAudio(page, R, BASE));
+      await fresh(page, BASE);
+      await scenario('battle start song (real song table, real engine)', (R) => scnRealBattleStart(page, R, BASE));
     } else console.log('SKIP (counted): the real music.js / music_map.js are not in the tree; this suite ran only against the stand-ins');
     head('the "press any key" prompt in THIS browser (whatever hover / pointer media it reports)');
     await fresh(page, BASE);
@@ -803,7 +849,9 @@ try {
       // MP3: the header's free gap is tried FIRST again (the old order): the pill is back between the title and the buttons
       {
         const run3 = async (mut) => { const d = copyTree(PA, path.join(TMP2, mut ? 'mp3' : 'twin3')); if (mut) mutateFile(d, 'js/sound_system.js', mut.from, mut.to); const ov = await startOverlay({ dir: d, port: pp++, upstream: BASE }); try { const RR = recorder(); await promptCase(page, ov.url, PROMPT_PAGES[0], { w: 1280, h: 800, mobile: false }, RR, 'MP3: '); return RR.r; } finally { ov.stop(); } };
-        const mut3 = await run3({ from: 'if (canvasPage) cands.push([(vw - pw) / 2, lowest + G]);', to: 'if (gap && headBox && gap.w - 2 * G >= pw) cands.unshift([gap.x + G + (gap.w - 2 * G - pw) / 2, headBox.top + (headBox.height - ph) / 2]);\n        if (canvasPage) cands.push([(vw - pw) / 2, lowest + G]);' });
+        // UPDATED DELIBERATELY: the audio bar now sits in the header at 1280 and takes part of its free gap, so the old mutant's candidate (which only fit when the gap was wider than the 520 px pill) never won any more.
+        // The mutant now forces the header spot whatever the gap, which is what "the header gap is tried first again" always meant.
+        const mut3 = await run3({ from: 'if (canvasPage) cands.push([(vw - pw) / 2, lowest + G]);', to: 'obs.length = 0; wts.length = 0; if (gap && headBox) cands.unshift([gap.x + G, headBox.top + (headBox.height - ph) / 2]);\n        if (canvasPage) cands.push([(vw - pw) / 2, lowest + G]);' });       // (the obstacles are dropped too: the pill may sit on the header's controls, which is what "back in the header band" means once the audio bar fills the gap)
         R.ok(mut3.some((x) => !x.ok && x.name.startsWith('prompt MP3: hub 1280x800: it does NOT sit in the header band')), 'prompt MP3: with the header gap tried first again the pill sits in the header band and trips "it does NOT sit in the header band"', J(mut3.filter((x) => !x.ok).map((x) => x.name)));
       }
       // MP4: no dismissal: Esc and a pad button leave the prompt on screen

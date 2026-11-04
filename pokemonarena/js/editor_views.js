@@ -13,7 +13,7 @@
 
 import {
   STAT_ORDER, STAT_LABELS, STAT_SHORT, moveCatalog, filterMoves, itemCatalog, speciesSearch, speciesRow, abilityOptions, natureOptions, derived, budgets,
-  validationView, monProblems, genderOptions, storedView, uniqueTypes, reasonText, speciesExclusions,
+  validationView, monProblems, genderOptions, storedView, uniqueTypes, reasonText, speciesExclusions, SPECIES_SORTS, SPECIES_SORT_IDS, speciesTypeChoices, speciesComparator, speciesEnterChoice,
 } from './editor_data.js';
 import {
   findTeam, findMon, teamMonsOf, rulesetIdOfMon, parseRulesetId, buildRulesetId, rulesetLabel, LEVEL_MODES, EDITOR_LIMITS, unusedMons, AVATAR_PRESETS,
@@ -160,11 +160,16 @@ export function segmented(items, { label, current, onPick, kind = 'pressed' }) {
     items.map((it) => h('button', { type: 'button', 'aria-pressed': String(it.value === current), disabled: it.disabled, title: it.title, 'aria-label': it.aria, dataset: { v: it.value }, onClick: () => onPick(it.value) }, it.node || it.label)));
 }
 
-/** A folded block of controls (Filters, Options): closed on a phone so the LIST gets the screen, open where there is room.
+/** "There is room" for an open fold: a wide window that is also TALL. The Pokemon picker's open Sort and filter block needs a window of about 725 px (its list keeps a 220 px
+ *  floor), so a laptop (1366x768 is ~640 tall), a 1080p screen at 150% (585-640) or a phone held sideways (844x390) starts folded however wide it is. editor.css uses the exact
+ *  complement (`not all and (min-height: 760px)`) for the short-window layout; change the two together. */
+const FOLD_ROOMY = '(min-width: 700px) and (min-height: 760px)';
+
+/** A folded block of controls (Filters, Options): closed on a phone or a short window so the LIST gets the screen, open where there is room (FOLD_ROOMY).
  *  A button toggles a container's "hidden" attribute. (Not <details>: controls inside a CLOSED <details> still report a normal rectangle and
  *  display:block, so the input layer's focus search picks them, focus() silently fails, and a controller gets stuck on the summary. Measured.) */
 export function fold(summary, ...kids) {
-  const roomy = typeof matchMedia === 'function' && matchMedia('(min-width: 700px)').matches;
+  const roomy = typeof matchMedia === 'function' && matchMedia(FOLD_ROOMY).matches;
   const id = uid('fold');
   const box = h('div', { class: 'stack fold-body', id, hidden: !roomy }, kids);
   const btn = h('button', { type: 'button', class: 'fold-btn', 'aria-expanded': String(roomy), 'aria-controls': id }, summary);
@@ -173,13 +178,14 @@ export function fold(summary, ...kids) {
 }
 
 /** { el, close } -- a modal sheet with a focus trap, Escape, scrim click and focus restoration. `fixed`: the sheet itself does not scroll, the LIST inside it does
- *  (one scrollbar, and the search box and filters stay where they are while the list moves). */
-export function openModal(app, { title, body, footer, onClose, wide = false, fixed = false, labelId = uid('dlg') }) {
+ *  (one scrollbar, and the search box and filters stay where they are while the list moves). `sheetClass` / `bodyClass` add classes to the sheet / its body: the Pokemon picker passes 'picker' and 'has-vlist',
+ *  which editor.css keys its short-window rules on. */
+export function openModal(app, { title, body, footer, onClose, wide = false, fixed = false, labelId = uid('dlg'), sheetClass = '', bodyClass = '' }) {
   const root = document.getElementById('modalRoot');
   const prev = document.activeElement;
   const closeBtn = h('button', { type: 'button', class: 'btn small', 'aria-label': 'Close ' + title }, 'Close');
-  const sheet = h('div', { class: 'sheet', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': labelId },
-    h('header', null, h('h2', { id: labelId }, title), closeBtn), h('div', { class: fixed ? 'body fixed' : 'body' }, body), footer ? h('footer', null, footer) : null);
+  const sheet = h('div', { class: ('sheet ' + sheetClass).trim(), role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': labelId },
+    h('header', null, h('h2', { id: labelId }, title), closeBtn), h('div', { class: ((fixed ? 'body fixed ' : 'body ') + bodyClass).trim() }, body), footer ? h('footer', null, footer) : null);
   const scrim = h('div', { class: 'scrim' }, sheet);
   let closed = false;
   const close = (reason) => {
@@ -241,7 +247,9 @@ export function openSpeciesPicker(app, { ruleset, current, onPick, title = 'Choo
   let q = '';
   let active = 0;
   let showAll = false;
+  let sortBy = speciesSortPref(), typeF = '';          // the order is remembered (speciesSortPref); the type filter, like the search text, starts empty each time
   const excl = speciesExclusions(app.pack, ruleset);
+  const sortName = () => SPECIES_SORTS.find((x) => x[0] === sortBy)[1].toLowerCase();
   const search = h('input', { type: 'search', 'aria-label': 'Search by name, number or type', placeholder: 'Name, #number or type (e.g. "fire flying")', 'data-autofocus': '1', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false', dataset: { fk: 'sp-q' } });
   const spacer = h('div', { class: 'spacer' });
   const list = h('div', { class: 'vlist', role: 'listbox', 'aria-label': 'Pokemon', tabindex: '-1' }, spacer);
@@ -264,14 +272,15 @@ export function openSpeciesPicker(app, { ruleset, current, onPick, title = 'Choo
     }
   }
   function refresh() {
-    ids = speciesSearch(app.pack, q, ruleset, { unavailable: showAll ? 'last' : 'hide' });
-    const hidden = showAll ? 0 : speciesSearch(app.pack, q, ruleset).length - ids.length;
+    ids = speciesSearch(app.pack, q, ruleset, { unavailable: showAll ? 'last' : 'hide', sort: sortBy, type: typeF });
+    const hidden = showAll ? 0 : speciesSearch(app.pack, q, ruleset, { type: typeF }).length - ids.length;
     spacer.style.height = ids.length * ROW + 'px';
     for (const el of rows.values()) el.remove();
     rows.clear();
     active = Math.max(0, ids.indexOf(current));
     list.scrollTop = q ? 0 : Math.max(0, active * ROW - 2 * ROW);
-    count.textContent = (ids.length ? `${ids.length} Pokemon` : 'No Pokemon match that search.') + (hidden ? ` (${hidden} more are left out by these rules)` : '');
+    const how = (typeF ? ', type ' + app.pack.types[Number(typeF)].name : '') + (sortBy !== 'dex' ? ', sorted by ' + sortName() : '');
+    count.textContent = (ids.length ? `${ids.length} Pokemon${how}` : 'No Pokemon match that search.') + (hidden ? ` (${hidden} more are left out by these rules)` : '');
     paint();
   }
   let raf = 0;
@@ -287,9 +296,27 @@ export function openSpeciesPicker(app, { ruleset, current, onPick, title = 'Choo
     paint();
     const el = rows.get(active); if (el) { for (const r of rows.values()) r.tabIndex = -1; el.tabIndex = 0; el.focus({ preventScroll: true }); }
   });
-  search.addEventListener('keydown', (e) => { if (e.key === 'ArrowDown') { e.preventDefault(); const el = rows.get(active) || rows.values().next().value; if (el) el.focus(); } if (e.key === 'Enter' && ids.length) { const r = speciesRow(app.pack, ids[0], ruleset); if (r.available) { m.close('pick'); onPick(r.id); } } });
+  // Enter in the search box: the species whose whole name was typed, else the first row (see speciesEnterChoice). Under a remembered Type / Name order with several
+  // partial hits it picks nothing and says so, rather than add whichever Pokemon that order happens to put first ("abra" is Crabrawler under Type).
+  function enterPick() {
+    if (!ids.length) return;                                   // the status line already says "No Pokemon match that search."
+    const id = speciesEnterChoice(app.pack, ids, q, sortBy);
+    if (id === null) { app.toast(`${ids.length} Pokemon match, and the list is sorted by ${sortName()}, so Enter does not choose for you. Pick a row, type the whole name, or sort by Pokedex number.`); return; }
+    const r = speciesRow(app.pack, id, ruleset, excl);
+    if (!r.available) { app.toast(`${r.name}: ${r.text}`, 'bad'); return; }
+    m.close('pick'); onPick(r.id);
+  }
+  search.addEventListener('keydown', (e) => { if (e.key === 'ArrowDown') { e.preventDefault(); const el = rows.get(active) || rows.values().next().value; if (el) el.focus(); } if (e.key === 'Enter') enterPick(); });
   const all = h('label', { class: 'inline' }, h('input', { type: 'checkbox', 'aria-label': 'Also list Pokemon these rules leave out', onChange: (e) => { showAll = e.target.checked; refresh(); } }), 'Also list Pokemon these rules leave out (shown disabled, with the reason)');
-  const m = openModal(app, { title, body: [h('label', null, 'Search', search), all, count, list] });
+  // Sort and filter, folded like the move picker's Filters (closed on a phone so the LIST gets the screen)
+  const sortSel = h('select', { 'aria-label': 'Sort Pokemon by', dataset: { fk: 'sp-sort' }, onChange: (e) => { sortBy = speciesSortPref(e.target.value); refresh(); } },
+    SPECIES_SORTS.map(([v, t]) => h('option', { value: v, selected: v === sortBy }, t)));
+  const typeSel = h('select', { 'aria-label': 'Only Pokemon of this type', dataset: { fk: 'sp-type' }, onChange: (e) => { typeF = e.target.value; refresh(); } },
+    [h('option', { value: '' }, 'Any type')].concat(speciesTypeChoices(app.pack).map(([id, name]) => h('option', { value: String(id) }, name))));
+  // fixed: the sheet does not scroll, the list does (one scrollbar); without it the open Sort and filter block pushed the 52dvh list past the sheet's 86vh cap.
+  // bodyClass 'has-vlist' is what editor.css keys the short-window scrolling on (it used to be :has(> .vlist), which a browser without :has() ignored, and which no page test could
+  // tell from "any fixed body"); sheetClass 'picker' lets this sheet take the whole height of a short window (editor.css).
+  const m = openModal(app, { title, fixed: true, sheetClass: 'picker', bodyClass: 'has-vlist', body: [h('label', null, 'Search', search), fold('Sort and filter', h('div', { class: 'filters' }, h('label', null, 'Sort', sortSel), h('label', null, 'Type', typeSel))), all, count, list] });
   refresh();
   return m;
 }
@@ -650,6 +677,16 @@ export function teamView(app, teamId) {
     });
     if (mons.length < max) slots.appendChild(h('div', { class: 'slot empty', role: 'listitem' }, h('button', { type: 'button', class: 'btn primary', 'data-nav-default': mons.length ? null : true, dataset: { act: 'add-mon' }, onClick: () => openSpeciesPicker(app, { ruleset: team.ruleset, onPick: (id) => { const r = app.dispatch({ type: 'monAdd', teamId, species: id }); if (r.result && r.result.monId) app.navigate({ name: 'mon', teamId, monId: r.result.monId, tab: 'build' }); } }) }, mons.length ? '+ Add a Pokemon' : '+ Add your first Pokemon'), h('span', { class: 'dim' }, `${mons.length} of ${max}`)));
     kids.push(slots);
+    if (mons.length > 1) {
+      const cmp = speciesComparator(app.pack, 'type');
+      const inOrder = mons.every((m, i) => i === 0 || cmp(mons[i - 1].species, m.species) <= 0);
+      // Once the team is in order the button is aria-disabled, NOT disabled: a disabled button cannot hold focus, so the person who pressed it (keyboard or pad) would be
+      // thrown to the top of the page, and could never reach the reason. Pressed again it does nothing but say "already sorted" in the live region (the reducer's notice).
+      // data-fk lets rebuild() hand focus to the new button when the view is redrawn (the sort itself, then the team code arriving).
+      kids.push(h('div', { class: 'row' }, h('button', { type: 'button', class: 'btn', 'aria-disabled': inOrder ? 'true' : null, dataset: { act: 'sort-team-type', fk: 'sort-team-type' },
+        title: inOrder ? 'Already in type order' : 'Put the team in type order: Normal, Fighting, Flying ... as the game lists the types. This is the order of the slots: in a 6v6 battle the first Pokemon leads, in 3v3 you choose the lead at team preview. You can undo it.',
+        onClick: () => app.dispatch({ type: 'teamSort', teamId, by: 'type' }) }, 'Sort team by type')));
+    }
 
     // validation
     kids.push(h('div', { class: 'card', 'aria-live': 'polite', role: 'status', dataset: { teamValidation: v.ok ? 'ok' : 'bad' } }, h('h3', null, 'Does it pass the rules?'),
@@ -909,6 +946,14 @@ function movesTab(app, team, mon, R) {
 }
 
 /* ---- the stats panel: built once per mon, patched in place so a slider can be dragged while the numbers move ---- */
+
+// Which order the Pokemon picker last used: the same kind of per-viewer convenience (localStorage if the browser lets us, never in the profile, never an undo step).
+let sortPref = null;
+function speciesSortPref(set) {
+  if (set !== undefined) { sortPref = SPECIES_SORT_IDS.includes(set) ? set : 'dex'; try { localStorage.setItem('arena.editor.speciesSort', sortPref); } catch (_e) { /* storage may be blocked */ } return sortPref; }
+  if (!sortPref) { try { const v = localStorage.getItem('arena.editor.speciesSort'); sortPref = SPECIES_SORT_IDS.includes(v) ? v : 'dex'; } catch (_e) { sortPref = 'dex'; } }
+  return sortPref;
+}
 
 // Which EV view the player last chose (a per-viewer convenience: kept in localStorage if the browser lets us, never in the profile, and never an undo step).
 let viewPref = null;

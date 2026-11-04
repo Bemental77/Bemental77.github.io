@@ -224,6 +224,25 @@ canvas.rom { display: block; image-rendering: pixelated; image-rendering: crisp-
 /* picker sheets (moves, items): the sheet does not scroll, the list does, and it takes every pixel the search box and the folded filters leave */
 .sheet > .body.fixed { overflow: hidden; }
 .sheet > .body.fixed > .movelist { flex: 1 1 auto; min-height: 120px; max-height: none; }
+/* the Pokemon picker's list: 52dvh when the sheet has the room, shorter when the open "Sort and filter" block leaves less (never past the sheet's cap: the list gives way, so there is
+   one scrollbar); if not even its 220px minimum fits (a window under about 640 px tall with the block opened by hand, under about 555 px with it folded) the body scrolls instead, as it did
+   before the picker was fixed. The class is set by js/editor_views.js on the picker's body (it replaces :has(> .vlist), which a browser without :has() ignored). */
+.sheet > .body.fixed > .vlist { flex: 1 1 52vh; flex-basis: 52dvh; height: auto; min-height: 220px; }
+.sheet > .body.fixed.has-vlist { overflow-y: auto; }
+/* SHORT WINDOW: under 760 px tall (the exact complement of the (min-height: 760px) in js/editor_views.js fold(), which starts the Sort and filter block FOLDED there). Measured before this rule at 1280 wide
+   with the block open: the picker fit one scrollbar from about 725 px up; below that the 220px list floor made the body scroll too (720 -> 3 px over, 640 -> 72, 585 -> 119, and a
+   844x390 phone held sideways -> 287, the whole list below the window). So on a short window (1) the block starts folded, (2) the picker's sheet takes the window less 8px above and
+   below instead of 86vh, which is what lets the picker fit one scrollbar down to about 555 px with the block folded and about 640 px with it opened by hand, and (3) on a window under 520 px tall (a phone held sideways) the sheet's
+   padding and gaps tighten so that some of the list shows without scrolling the body. A block opened by hand where it no longer fits scrolls the BODY (the list stays inside it, reachable). */
+@media not all and (min-height: 760px) {
+  #modalRoot .sheet.picker { max-height: calc(100vh - 16px); max-height: calc(100dvh - 16px); }
+}
+@media (max-height: 519px) {
+  .sheet.picker > header { padding-top: 4px; padding-bottom: 4px; }
+  .sheet.picker > .body { padding-top: 6px; padding-bottom: 6px; gap: 6px; }
+  .sheet.picker > .body > .fold > .fold-body { padding-top: 6px; padding-bottom: 6px; }
+  .sheet.picker > .body > p { margin: 0; }
+}
 .fold { border: 1px solid var(--line); border-radius: 8px; background: var(--panel2); }
 .fold > .fold-btn { width: 100%; min-height: var(--tap); display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 12px; background: transparent; border: 0; border-radius: 8px; color: inherit; font: inherit; font-weight: 600; text-align: left; cursor: pointer; }
 .fold > .fold-btn::after { content: "+"; font-size: 20px; color: var(--dim); }

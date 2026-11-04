@@ -104,7 +104,11 @@ const TOL_DB = 1.5;
 
 /* ------------------------------------------------------------------------------------------------ 1. level at the sink */
 /** open the hub with the real engine, press a key, wait for the song, and measure the sink over seconds 2..12 of the song; returns the numbers */
-async function levelRun(page, base, { sliders = null, tag = '' } = {}) {
+// UPDATED DELIBERATELY (the user: "play music as soon as you join, but at half volume on the slider"): a visitor with nothing stored now starts at Master 0.5, which is UNDER the game's level on purpose
+// (-5.85 dB). The calibration claims of this file (the engine at gain 1.0 IS the real game's level; 100% is +6 dB over it; the old law is -15 dB) are about the UNITY positions 0.7 / 0.6 / 0.8, so every run
+// stores them explicitly unless it passes sliders: null (= nothing stored: the new first-visit default, measured by its own run below).
+const UNITY_SLIDERS = { master: 0.7, music: 0.6, fx: 0.8 };
+async function levelRun(page, base, { sliders = UNITY_SLIDERS, tag = '' } = {}) {
   await fresh(page, base);
   if (sliders) await page.eval(`localStorage.setItem('arena.audio', JSON.stringify(${J({ v: 1, ...sliders, muted: false, soundtrack: 'soulgold' })}))`);
   await page.navigate(base + '/pokemonarena/');
@@ -215,26 +219,34 @@ try {
   await lockedBrowser({ port: cdp++, width: 1280, height: 800 }, async (page) => {
     await addInit(page, TAP_SRC);
 
-    head('1. the level at the sink: the hub song at the default sliders vs the real game');
-    const A = await levelRun(page, BASE, { tag: 'default' });
+    head('1. the level at the sink: the hub song at the UNITY sliders (0.7 / 0.6 / 0.8) vs the real game');
+    const A = await levelRun(page, BASE, { tag: 'unity' });
     const dA = db(A.st.rms / oracleRms);
     console.log('   default sliders: bus gains ' + J(A.gains) + '; sink RMS ' + A.st.rms.toFixed(4) + ' peak ' + A.st.peak.toFixed(3) + ' over song seconds 2..12 (' + (dA >= 0 ? '+' : '') + dA.toFixed(2) + ' dB from the real game\'s ' + oracleRms.toFixed(4) + '); underruns ' + A.underruns);
-    C.ok(A.before === 0 && A.d0.engine && !A.error && A.errors.length === 0, 'level: the real engine played the hub song on the REAL AudioContext (no error)', J({ err: A.error, errors: A.errors }));
-    C.ok(Math.abs(dA) <= TOL_DB, 'level: at the DEFAULT sliders the sink is ' + (dA >= 0 ? '+' : '') + dA.toFixed(2) + ' dB from the real game (tolerance +-' + TOL_DB + ' dB): a first-time player hears the music at the level the game plays it', J({ sink: A.st.rms, game: oracleRms }));
+    C.ok(A.before <= 1 && A.d0.engine && !A.error && A.errors.length === 0, 'level: the real engine played the hub song on the REAL AudioContext (no error)', J({ err: A.error, errors: A.errors }));
+    C.ok(Math.abs(dA) <= TOL_DB, 'level: at the UNITY sliders the sink is ' + (dA >= 0 ? '+' : '') + dA.toFixed(2) + ' dB from the real game (tolerance +-' + TOL_DB + ' dB): a first-time player hears the music at the level the game plays it', J({ sink: A.st.rms, game: oracleRms }));
     const g = A.gains || {};
-    C.ok(Math.abs((g.master || 0) - 1) < 1e-3 && Math.abs((g.music || 0) - 1) < 1e-3 && Math.abs((g.fx || 0) - 1) < 1e-3, 'level: the three buses are at gain 1.0 at the defaults', J(g));
+    C.ok(Math.abs((g.master || 0) - 1) < 1e-3 && Math.abs((g.music || 0) - 1) < 1e-3 && Math.abs((g.fx || 0) - 1) < 1e-3, 'level: the three buses are at gain 1.0 at the unity positions', J(g));
     C.ok(A.st.peak <= AM.LIMIT_CEIL + 1e-6 && A.st.rms > 0.02, 'level: the sink peak ' + A.st.peak.toFixed(3) + ' is under the limiter ceiling and the RMS ' + A.st.rms.toFixed(4) + ' is far above the old defaults\' 0.009-0.015');
     C.ok(A.underruns === 0, 'level: no underrun while the hub song played for 12 s on the real clock (' + A.underruns + ')');
 
+    // THE NEW STARTING VOLUME (nothing stored): Master 0.5, music and effects at unity: a quiet start, -5.85 dB from the game's level
+    const S0 = await levelRun(page, BASE, { tag: 'start', sliders: null });
+    const dS = db(S0.st.rms / oracleRms), gS = S0.gains || {};
+    console.log('   first-visit defaults (nothing stored): bus gains ' + J(gS) + '; sink RMS ' + S0.st.rms.toFixed(4) + ' (' + (dS >= 0 ? '+' : '') + dS.toFixed(2) + ' dB from the real game)');
+    C.ok(Math.abs(gS.master - (0.5 / 0.7) ** 2) < 1e-3 && Math.abs(gS.music - 1) < 1e-3 && Math.abs(gS.fx - 1) < 1e-3, 'start: with nothing stored the page starts with the master bus at gain (0.5/0.7)^2 and music / effects at 1.0', J(gS));
+    C.ok(Math.abs(dS + 5.85) <= TOL_DB && S0.st.rms > 0.01 && S0.st.peak <= AM.LIMIT_CEIL + 1e-6, 'start: the hub song at the starting volume is ' + dS.toFixed(2) + ' dB from the real game (-5.85 expected, tolerance +-' + TOL_DB + ' dB): audible, and quieter than the game on purpose', J({ sink: S0.st.rms }));
     const B = await levelRun(page, BASE, { tag: 'max', sliders: { master: 1, music: 1, fx: 1 } });
     const dB = db(B.st.rms / A.st.rms);
     console.log('   every slider at 100%: sink RMS ' + B.st.rms.toFixed(4) + ' peak ' + B.st.peak.toFixed(3) + ' (' + (dB >= 0 ? '+' : '') + dB.toFixed(2) + ' dB over the default)');
-    C.ok(Math.abs(dB - 6.02) <= 1.0, 'level: with master and music at 100% the sink is ' + dB.toFixed(2) + ' dB over the default (+3 dB per bus = +6 dB; tolerance 1 dB), so the defaults are not the top of the range', J({ def: A.st.rms, max: B.st.rms }));
+    C.ok(Math.abs(dB - 6.02) <= 1.0, 'level: with master and music at 100% the sink is ' + dB.toFixed(2) + ' dB over the default (+3 dB per bus = +6 dB; tolerance 1 dB), so the unity positions are not the top of the range', J({ def: A.st.rms, max: B.st.rms }));
     C.ok(B.st.peak <= AM.LIMIT_CEIL + 1e-6, 'level: and even there the sink peak ' + B.st.peak.toFixed(3) + ' stays at or under the limiter ceiling ' + AM.LIMIT_CEIL);
 
     head('2. the result sequence in real time (director.result), underruns counted');
     {
-      await fresh(page, BASE); await page.navigate(BASE + '/pokemonarena/');
+      await fresh(page, BASE);
+      await page.eval(`localStorage.setItem('arena.audio', JSON.stringify(${J({ v: 1, ...UNITY_SLIDERS, muted: false, soundtrack: 'soulgold' })}))`);       // (the unity levels: the sink thresholds below were written for them)
+      await page.navigate(BASE + '/pokemonarena/');
       await page.waitFor(`window.${HUB} && ${HUB}.state === 'ready' && window.__arenaSound`, { timeoutMs: 60000 });
       await key(page, 'down');
       await page.waitFor(`(() => { const d = window.__arenaSound.state().director; return (d.cur && d.cur.key === 'hub') || d.error; })()`, { timeoutMs: 120000 });
@@ -305,7 +317,7 @@ try {
       head('negative controls: overlay copies of the page with ONE defect, the same measurements');
       let port = Number(process.env.ARENA_OVERLAY_PORT || 18105) + 40;
       const overlay = async (name, rel, from, to) => { const d = copyTree(PA, path.join(TMP, name)); mutateFile(d, rel, from, to); return startOverlay({ dir: d, port: port++, upstream: BASE }); };
-      // (a) the OLD square law: the same default sliders now measure about -15 dB
+      // (a) the OLD square law: the same unity sliders now measure about -15 dB
       {
         const ov = await overlay('oldlaw', 'js/audio_mixer.js', 'if (x <= v0) return (x / v0) * (x / v0);\n  return 1 + (GAIN_MAX - 1) * ((x - v0) / (1 - v0));', 'return x * x;');
         try {

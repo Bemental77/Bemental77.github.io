@@ -18,6 +18,8 @@
 //   * Mute / hidden tab / suspended context PAUSE the song (music.pause) and resume it where it was (music.resume); a soundtrack change disposes the
 //     engine and builds a new one on the new ROM, then plays the same desired key.
 //   * Sound effects are dropped (not queued) while !canPlay() or before the engine is ready: a late hit sound is worse than none.
+//   * EFFECTS NEED THE ENGINE, NOT A SONG. createDirector({ effects: true }) (the hub's and the battle page's sound system do; the team editor plays no effects and does not) keeps the engine LOADING whenever the sound can play, even while no song is wanted, so a menu
+//     whose music is Off (menu_music.js) still answers the cursor / select / back sounds. Without it (the default; the bare director of the tests) the engine is loaded by the first wanted song only.
 
 /** Where each key falls back to, in order, when the soundtrack has no song for it. Documented in the README ("what is approximate"). */
 export const FALLBACKS = Object.freeze({
@@ -66,6 +68,7 @@ export function createDirector(opts = {}) {
   const romFor = typeof opts.romFor === 'function' ? opts.romFor : null;                // async (soundtrack) -> Uint8Array of that soundtrack's ROM, or throws
   const soundtrackNow = typeof opts.soundtrack === 'function' ? opts.soundtrack : () => mixer.soundtrack();
   const logCap = opts.logCap || 200;
+  const effects = opts.effects === true;              // keep the engine loaded while no song is wanted, for the sound effects (see the header)
 
   const D = {
     want: null,                 // { key, then } the song the screen asked for ('then' = the key to start when a jingle ends)
@@ -109,7 +112,7 @@ export function createDirector(opts = {}) {
   async function syncInner() {
     if (D.disposed) return;
     if (!mixer.canPlay()) { pauseNow(); return; }
-    if (!D.want) { stopNow(); return; }
+    if (!D.want) { stopNow(); if (effects) await ensureMusic(); return; }          // no song (a menu whose music is Off): the engine still loads, the effects need it
     const want = D.want;
     const st = soundtrackNow();
     const music = await ensureMusic();

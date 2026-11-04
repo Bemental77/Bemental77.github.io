@@ -9,7 +9,7 @@
 //   screen -> compare the on-screen derived stats with what rules.js computes in Node -> Export -> delete the profile -> import the file back
 //   through the real file input -> copy the team code, import it into a second profile -> read the Test battle link (assert its query) and the
 //   "vs my other team" link -> undo with the keyboard -> the autosave indicator -> hostile import files.
-//   OTHER CASES: IndexedDB blocked (memory fallback banner, nothing survives a reload), a second writer (compare-and-swap conflict banner), a
+//   OTHER CASES: IndexedDB blocked (memory fallback banner, nothing survives a reload), a second writer (compare-and-swap conflict banner; "Keep my edits here" keeps a battle the other tab recorded meanwhile, with a negative control), a
 //   missing ROM (error screen), and screenshots + layout predicates at 390x844, 320x568 and 1280x800 of: profile list, team list, mon editor top,
 //   EV panel, move picker, validation errors.
 //   RECORDS THIS ROM CANNOT SHOW: re-sealed (valid checksum) files naming species 5000 / an empty slot, a move and an item the ROM lacks, and 20
@@ -51,6 +51,7 @@ const CDP = Number(process.env.ARENA_CDP || 9261);
 const BASE = process.env.ARENA_BASE || `http://localhost:${PORT}`;
 const PAGE = BASE + '/pokemonarena/editor.html';
 const mod = (n) => import(pathToFileURL(path.join(root, 'pokemonarena', 'js', n)).href);
+const ED = await mod('editor_data.js');
 const TB = await mod('tables.js'), R = await mod('rules.js'), P = await mod('profile.js'), T = await mod('teamcode.js'), ST = await mod('stats.js'), L = await mod('editor_links.js'), A = await mod('editor_art.js');
 const J = (x) => JSON.stringify(x);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -628,22 +629,32 @@ try {
   });
 
   /* ================================================================================ a second writer */
-  await runCase('second writer (compare-and-swap)', { port: CDP + 2, width: 390, height: 844, mobile: true, dpr: 2 }, async (page) => {
-    const tag = 'CAS: ';
-    await bootPage(page);
+  // THE COMPARE-AND-SWAP SCENARIO, shared by the case below and its negative control (a copy of the page without the F67 fix, further down). Another tab (a second store instance) saves a newer
+  // revision of the profile AND records an ONLINE battle in it; this tab, still holding the revision it loaded, edits a team, meets the conflict banner and presses "Keep my edits here".
+  // -> what the page showed, and what the store and this tab hold afterwards. The Team Builder never edits a record, so the stored one must come through that save untouched.
+  const CAS_MATCH = `{ id: 'cas-online-1', at: 1800000000000, fmt: '3v3', cpu: 'online', opp: 'Zed', ruleset: 'arena-gen3-standard', result: 'w', turns: 9, playMs: 50000, mvp: 25, team: [25, 6, 9], species: [25, 6], moves: [[85, 3], [33, 2]], me: { kos: 2, faints: 1, dealt: 300, taken: 200, hits: 5, crits: 1, superEffective: 2, resisted: 1, noEffect: 0, misses: 1, statusInflicted: 1, healed: 20, switches: 1, koStreak: 2, biggestHit: { sp: 25, mv: 85, dmg: 120, pct: 70, vs: 6 } }, foeFaints: 3 }`;
+  const CAS_READ = `(async () => { const r = await __editor.store.loadProfile(__editor.state().profile.id); const s = r.profile.stats, o = s.byCpu.online, t = __editor.state().profile.stats; return { monIds: r.profile.teams[0].monIds.length, online: o.w + o.l + o.dr + o.f, wins: s.wins, recent: s.recent.map((x) => x.id), tabOnline: t.byCpu.online.w + t.byCpu.online.l + t.byCpu.online.dr + t.byCpu.online.f, tabRecent: t.recent.map((x) => x.id) }; })()`;
+  const casKeepMine = async (page, url) => {
+    await bootPage(page, url);
     await page.eval(SEED);
-    // a second store instance (what another tab is) saves a newer revision of the same profile
-    await page.eval(`(async () => { const S = await import('/pokemonarena/js/store.js'); const other = await S.openStore({ channel: false }); const id = __editor.state().profile.id; const r = await other.loadProfile(id); const p = r.profile; p.trainerName = 'OTHER'; await other.saveProfile(p, { reason: 'other tab' }); await other.close(); return true; })()`);
+    await page.eval(`(async () => { const S = await import('/pokemonarena/js/store.js'); const other = await S.openStore({ channel: false }); const id = __editor.state().profile.id; const r = await other.loadProfile(id); const p = r.profile; p.trainerName = 'OTHER'; await other.saveProfile(p, { reason: 'other tab' }); await other.recordMatch(id, ${CAS_MATCH}); await other.close(); return true; })()`);
     const teamId = await page.eval('__editor.state().profile.teams[0].id');
     await go(page, '#/team/' + teamId);
     await click(page, '[data-act="mon-copy"]');
     await page.waitFor('document.getElementById("saveState").dataset.state === "conflict"', { timeoutMs: 8000 });
-    ok(/changed in another tab/.test(await page.eval('document.getElementById("banners").textContent')), tag + 'saving over another writer is refused and the banner says the profile changed in another tab');
-    ok((await page.eval('__editor.state().profile.teams[0].monIds.length')) === 4, tag + 'the player\'s own edit is still on screen (nothing was thrown away)');
+    const out = { banner: await page.eval('document.getElementById("banners").textContent'), onScreen: await page.eval('__editor.state().profile.teams[0].monIds.length') };
     await click(page, '#banners .btn.danger');
     await page.waitFor('document.getElementById("saveState").dataset.state === "saved"', { timeoutMs: 8000 });
-    const stored = await page.eval(`__editor.store.loadProfile(__editor.state().profile.id).then((r) => r.profile.teams[0].monIds.length)`);
-    ok(stored === 4, tag + '"Keep my edits here" saves this tab\'s version over the other one', String(stored));
+    out.after = await page.eval(CAS_READ);
+    return out;
+  };
+  await runCase('second writer (compare-and-swap)', { port: CDP + 2, width: 390, height: 844, mobile: true, dpr: 2 }, async (page) => {
+    const tag = 'CAS: ';
+    const cas = await casKeepMine(page);
+    ok(/changed in another tab/.test(cas.banner), tag + 'saving over another writer is refused and the banner says the profile changed in another tab');
+    ok(cas.onScreen === 4, tag + 'the player\'s own edit is still on screen (nothing was thrown away)');
+    ok(cas.after.monIds === 4, tag + '"Keep my edits here" saves this tab\'s version over the other one', String(cas.after.monIds));
+    ok(cas.after.online === 1 && cas.after.wins === 1 && cas.after.recent.join() === 'cas-online-1' && cas.after.tabOnline === 1 && cas.after.tabRecent.join() === 'cas-online-1', tag + '"Keep my edits here" also keeps the ONLINE battle the other tab recorded in the meantime (the stored record and this tab\'s both still hold it: the team save carries the record that is stored now, not the one this tab loaded)', J(cas.after));
     await page.eval(`(async () => { const S = await import('/pokemonarena/js/store.js'); const other = await S.openStore({ channel: false }); const id = __editor.state().profile.id; const r = await other.loadProfile(id); const p = r.profile; p.trainerName = 'THIRD'; await other.saveProfile(p, { reason: 'third' }); await other.close(); return true; })()`);
     await click(page, '[data-act="mon-copy"]');
     await page.waitFor('document.getElementById("saveState").dataset.state === "conflict"', { timeoutMs: 8000 });
@@ -772,8 +783,8 @@ try {
       ok(await page.eval(`(() => { const r = document.querySelector('.sheet .mvrow').getBoundingClientRect(); return r.top < window.innerHeight - 60 && r.bottom > 0; })()`), tag + 'the first move row is on screen without scrolling (the filters are folded away on a phone, open where there is room)');
       ok((await page.eval(`getComputedStyle(document.querySelector('.sheet .body')).overflowY`)) === 'hidden' && (await page.eval(`getComputedStyle(document.querySelector('.sheet .movelist')).overflowY`)) === 'auto', tag + 'one scroller: the sheet does not scroll, the move list does');
       const foldBtn = await page.eval(`(() => { const b = document.querySelector('.sheet .fold-btn'); const box = document.getElementById(b.getAttribute('aria-controls')); return { exp: b.getAttribute('aria-expanded'), hidden: box.hidden, w: window.innerWidth }; })()`);
-      ok(foldBtn.exp === String(!foldBtn.hidden) && (v.w >= 700 ? !foldBtn.hidden : foldBtn.hidden), tag + 'the Filters block is folded on a phone and open on a wide screen, and aria-expanded says which', J(foldBtn));
-      if (v.w < 700) { await click(page, '.sheet .fold-btn'); ok((await page.eval(`document.getElementById(document.querySelector('.sheet .fold-btn').getAttribute('aria-controls')).hidden`)) === false, tag + 'the Filters button unfolds the filters'); await click(page, '.sheet .fold-btn'); }
+      ok(foldBtn.exp === String(!foldBtn.hidden) && (v.w >= 700 && v.h >= 760 ? !foldBtn.hidden : foldBtn.hidden), tag + 'the Filters block is folded on a phone or a short window and open on a wide, tall screen (>= 700 x 760), and aria-expanded says which', J(foldBtn));
+      if (!(v.w >= 700 && v.h >= 760)) { await click(page, '.sheet .fold-btn'); ok((await page.eval(`document.getElementById(document.querySelector('.sheet .fold-btn').getAttribute('aria-controls')).hidden`)) === false, tag + 'the Filters button unfolds the filters'); await click(page, '.sheet .fold-btn'); }
       ok((await page.eval(`document.querySelectorAll('.mvrow canvas.rom').length`)) >= 20, tag + 'the move picker rows carry ROM type badges and category icons');
       await page.eval(`document.querySelector('.sheet input[type=checkbox][aria-label="Include moves this Pokemon cannot learn"]').click()`); await sleep(500);
       await shot('6b_move_picker_unlearnable');
@@ -1153,6 +1164,15 @@ try {
     ok((await mon()).iv.atk === 0, tag + 'A applies the IV preset');
     ok(await to('#undoBtn'), tag + 'the d-pad reaches Undo in the header'); await padTap(page, 'a'); await sleep(300);
     ok((await mon()).iv.atk === 31, tag + 'Undo through the controller restores the IV');
+    // THE AUDIO BAR STAYS REACHABLE (js/audiobar.js: mute, volume and the menu-music changer live in the sticky header, a row of their own on a phone). It once also broke the routes above: a header one row
+    // taller flipped the tie in uinav's loose fallback and Left from the stats presets jumped INTO the header (the Speed slider and the "0 Attack" preset became unreachable).
+    ok(await to('#abMute') && await to('#abVolume') && await to('#abMusic'), tag + 'the d-pad reaches the audio bar: mute, volume and menu music');
+    await padTap(page, 'a'); await sleep(350);
+    ok(await page.eval(`(() => { const m = document.getElementById('abMenu'); return !!m && !m.hidden && m.contains(document.activeElement); })()`), tag + 'A on Menu music opens the list with the focus inside it');
+    for (let i = 0; i < 8; i++) { await padTap(page, 'up'); await sleep(60); }
+    ok(await page.eval(`document.getElementById('abMenu').contains(document.activeElement)`), tag + 'the d-pad cannot leave the open list upwards (it is a modal dialog for navigation: the header behind it is out of reach)');
+    await padTap(page, 'b'); await sleep(350);
+    ok(await page.eval(`document.getElementById('abMenu').hidden === true && !!document.activeElement && document.activeElement.id === 'abMusic'`), tag + 'B closes the list and the focus is back on Menu music');
     await go(page, `#/team/${ids.t}/mon/${ids.mons[0]}/moves`); await sleep(400);
     ok(await to('[data-act="pick-move"][data-slot="3"]') || await to('[data-act="pick-move"]'), tag + 'the d-pad reaches a move slot'); await padTap(page, 'a'); await sleep(500);
     ok(await exists(page, '#modalRoot .sheet'), tag + 'A opens the move picker');
@@ -1209,6 +1229,14 @@ try {
     const ov = await startOverlay({ dir: d, port: PORT + portOff, upstream: BASE });
     try { return await fn(ov.url + '/pokemonarena/editor.html'); } finally { ov.stop(); try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_e) { /* ignore */ } }
   };
+
+  // F67 NEGATIVE CONTROL for the second-writer case: the same scenario on a copy of the page whose "Keep my edits here" no longer carries the stored record over (the line that calls
+  // profile.withStoredRecord). The team edit is still saved, and the battle the other tab recorded must now be GONE -- so the assertion in the real case above can fail.
+  await runCase('second writer: Keep my edits here without the stored record erases the other tab\'s battle (negative control)', { port: CDP + 2, width: 390, height: 844, mobile: true, dpr: 2 }, async (page) => {
+    const tag = 'CAS-mutant: ';
+    const cas = await withMutant('js/editor_app.js', ' S = { ...S, profile: withStoredRecord(S.profile, cur.profile) };', '', 19, (url) => casKeepMine(page, url));
+    ok(cas.after.monIds === 4 && cas.after.online === 0 && cas.after.wins === 0 && cas.after.recent.length === 0, tag + 'on a copy without the fix the same scenario saves the team and ERASES the other tab\'s battle (stored record empty), which is what the real case asserts against', J(cas.after));
+  });
 
   // D2: a dialog opened from the editor header gives focus back to the button that opened it, whether it was opened with the mouse or the keyboard
   async function headerFocus(page, url) {
@@ -1418,6 +1446,417 @@ try {
     await withMutant('js/editor_import.js', 'offerFile: (f) => { if (f) mirrorIntoInput(f); return read(f); }', 'offerFile: (f) => { return read(f); }', 12, async (url) => {
       const r = await dropCheck(page, url);
       ok(r.first === 'first.sav' && r.afterDrop !== 'second.sav', 'D10 negative control: with the mirroring removed the chooser keeps the first file (' + r.afterDrop + ') and the check FAILS (' + r.how + ')', J(r));
+    });
+  });
+
+  /* ================================================================================ sort and filter the Pokemon list by type (the picker) and sort a team by type */
+  // The picker is virtual (only the rows on screen exist), so every rendered row is checked against the list worked out in Node from the same ROM tables: row idx -> species.
+  const DEFRS = R.DEFAULT_RULESET_ID;
+  const wantList = (o) => ED.speciesSearch(pack, o.q || '', DEFRS, { unavailable: 'hide', sort: o.sort, type: o.type });
+  const pickerRows = (page) => page.eval("[...document.querySelectorAll('.sheet .vrow')].map((r) => [Number(r.dataset.idx), Number(r.dataset.species)]).sort((a, b) => a[0] - b[0])");
+  const rowsMatch = (rows, want) => rows.length >= 6 && rows.every(([i, sp]) => want[i] === sp);
+  const countText = (page) => page.eval("document.querySelector('.sheet [role=status]').textContent");
+  const activeFk = (page) => page.eval("(() => { const a = document.activeElement; return a ? (a.dataset && a.dataset.fk) || (a.classList.contains('fold-btn') ? 'fold-btn' : a.tagName) : 'none'; })()");
+  const openPicker = async (page) => { await click(page, '[data-act="add-mon"]'); await page.waitFor('!!document.querySelector("[data-fk=sp-sort]")'); await sleep(200); };
+  const openFold = async (page) => { if (!(await page.eval("document.querySelector('.sheet .fold-body').hidden === false"))) { await click(page, '.sheet .fold-btn'); await sleep(100); } };
+  // The open picker must FIT: the sheet inside the window, the list not cut off, and ONE scrollbar (the list's). layoutJs never looks at the sheet body or the list, so when the
+  // open "Sort and filter" block pushed the 52dvh list past the sheet's 86vh cap (nested scrollbars, the last rows hidden below the fold, on every desktop window under about 1150 px
+  // tall) nothing noticed. Returns a list of findings ([] = fine).
+  const SHEET_JS = `(() => {
+    const f = [], s = document.querySelector('#modalRoot .sheet');
+    if (!s) return ['no dialog is open'];
+    const body = s.querySelector(':scope > .body'), list = s.querySelector('.vlist');
+    if (!body || !list) return ['the dialog has no body or no list'];
+    const ih = window.innerHeight, sr = s.getBoundingClientRect(), lr = list.getBoundingClientRect(), br = body.getBoundingClientRect();
+    if (body.scrollHeight > body.clientHeight + 1) f.push('the sheet body scrolls (' + body.scrollHeight + ' > ' + body.clientHeight + ')');
+    if (sr.top < -0.5 || sr.bottom > ih + 0.5) f.push('the sheet leaves the window: ' + Math.round(sr.top) + '..' + Math.round(sr.bottom) + ' of ' + ih);
+    if (lr.bottom > br.bottom + 0.5 || lr.bottom > ih + 0.5) f.push('the list is cut off: its bottom is at ' + Math.round(lr.bottom) + ', the body ends at ' + Math.round(br.bottom) + ', the window at ' + ih);
+    if (lr.height < 219.5) f.push('the list is only ' + Math.round(lr.height) + ' px tall');
+    const scrollers = [s, ...s.querySelectorAll('*')].filter((e) => { const o = getComputedStyle(e).overflowY; return (o === 'auto' || o === 'scroll') && e.scrollHeight > e.clientHeight + 1; }).map((e) => String(e.className || e.tagName));
+    if (scrollers.length !== 1 || scrollers[0] !== 'vlist') f.push('scrollbars in the sheet: ' + JSON.stringify(scrollers) + ' (want only the list)');
+    return f;
+  })()`;
+  // the picker open with Sort and filter open, at several window heights (CDP metrics override: the layout re-flows, nothing reloads): { height: findings }
+  async function sheetProbe(page, url, heights) {
+    const out = {};
+    await bootPage(page, url);
+    const ids = await page.eval(SEED);
+    await go(page, '#/team/' + ids.t1);
+    await openPicker(page); await openFold(page);
+    for (const hh of heights) {
+      await page.send('Emulation.setDeviceMetricsOverride', { width: 1280, height: hh, deviceScaleFactor: 1, mobile: false }); await sleep(250);
+      out[hh] = await page.eval(SHEET_JS);
+      out['list' + hh] = await page.eval("Math.round(document.querySelector('.sheet .vlist').getBoundingClientRect().height)");
+    }
+    return out;
+  }
+  async function typeSortProbe(page, url) {
+    const r = {};
+    await bootPage(page, url);
+    const ids = await page.eval(SEED);
+    await go(page, '#/team/' + ids.t1);
+    await openPicker(page); await openFold(page);
+    r.sheet = await page.eval(SHEET_JS);
+    r.controls = await page.eval("(() => { const s = document.querySelector('[data-fk=sp-sort]'), t = document.querySelector('[data-fk=sp-type]'); return { sort: s && s.value, opts: s && [...s.options].map((o) => o.value + '=' + o.textContent), type: t && t.value, types: t && [...t.options].map((o) => o.textContent) }; })()");
+    r.defaultOrder = rowsMatch(await pickerRows(page), wantList({}));
+    await setVal(page, '[data-fk="sp-sort"]', 'type', 'change'); await sleep(250);
+    r.typeOrder = rowsMatch(await pickerRows(page), wantList({ sort: 'type' }));
+    r.typeCount = await countText(page);
+    await page.eval("document.querySelector('.sheet .vlist').scrollTop = 56 * 400"); await sleep(300);
+    const deep = await pickerRows(page);
+    r.deepOrder = rowsMatch(deep, wantList({ sort: 'type' })) && deep[0][0] > 300;
+    await setVal(page, '[data-fk="sp-sort"]', 'name', 'change'); await sleep(250);
+    r.nameOrder = rowsMatch(await pickerRows(page), wantList({ sort: 'name' }));
+    await setVal(page, '[data-fk="sp-sort"]', 'type', 'change'); await sleep(150);
+    await setVal(page, '[data-fk="sp-type"]', '11', 'change'); await sleep(250);
+    r.fireOrder = rowsMatch(await pickerRows(page), wantList({ sort: 'type', type: 11 }));
+    r.fireCount = await countText(page);
+    r.fireN = wantList({ sort: 'type', type: 11 }).length;
+    // a Pokemon with two types is in both lists; pick it from a filtered, sorted list (the row index must not be mistaken for the species)
+    await setVal(page, '[data-fk="sp-type"]', '3', 'change'); await setVal(page, '[data-fk="sp-q"]', 'zard', 'input'); await sleep(300);
+    const zRows = await pickerRows(page);
+    const zWant = wantList({ q: 'zard', sort: 'type', type: 3 });          // a short list: every row is rendered, so the whole list is compared
+    r.flyingHasCharizard = zRows.some(([, sp]) => sp === CHARIZARD) && zRows.length === zWant.length && zRows.every(([i, sp]) => zWant[i] === sp);
+    const boxBefore = await page.eval("__editor.state().profile.box.filter((m) => m.species === 6).length");
+    await click(page, '.sheet .vrow[data-species="6"]'); await page.waitFor('__editor.route().name === "mon"'); await sleep(200);
+    r.picked = (await page.eval("__editor.state().profile.box.filter((m) => m.species === 6).length")) === boxBefore + 1;
+    // the order is remembered, and the filter is not
+    r.stored = await page.eval("localStorage.getItem('arena.editor.speciesSort')");
+    await bootPage(page, url); await go(page, '#/team/' + ids.t1);
+    await openPicker(page); await openFold(page);
+    r.afterReload = await page.eval("({ sort: document.querySelector('[data-fk=sp-sort]').value, type: document.querySelector('[data-fk=sp-type]').value })");
+    r.reloadOrder = rowsMatch(await pickerRows(page), wantList({ sort: 'type' }));
+    // keyboard: Tab from the search box reaches the fold, then Sort, then Type; ArrowDown on the focused Sort changes it
+    await page.eval("document.querySelector('[data-fk=sp-q]').focus()");
+    const tabs = [];
+    for (let i = 0; i < 3; i++) { await realKey(page, 'Tab', 'Tab', 9); await sleep(60); tabs.push(await activeFk(page)); }
+    r.tabOrder = tabs;
+    await setVal(page, '[data-fk="sp-sort"]', 'dex', 'change'); await sleep(200);
+    await page.eval("document.querySelector('[data-fk=sp-sort]').focus()");
+    await realKey(page, 'ArrowDown', 'ArrowDown', 40); await sleep(250);
+    r.keyboardSort = await page.eval("document.querySelector('[data-fk=sp-sort]').value");
+    r.keyboardOrder = rowsMatch(await pickerRows(page), wantList({ sort: r.keyboardSort }));
+    r.keyboardCount = await countText(page);
+    r.layout = await page.eval(layoutJs(false));
+    r.pageErrors = errsOf(page);
+    return r;
+  }
+  const TS_CHECKS = (r) => [
+    ['the picker has Sort (Pokedex number, Name, Type; Pokedex number first) and a Type filter that offers the 18 real types', r.controls && r.controls.sort === 'dex' && J(r.controls.opts) === J(['dex=Pokedex number', 'name=Name', 'type=Type']) && r.controls.type === '' && r.controls.types.length === 19 && r.controls.types[0] === 'Any type' && r.controls.types[1] === 'Normal' && r.controls.types[18] === 'Fairy' && !r.controls.types.includes('???')],
+    ['untouched, the list is in the Pokedex order it always had', r.defaultOrder],
+    ['Sort: Type puts every row in the first-then-second type order of the ROM (checked against Node on the rows on screen)', r.typeOrder],
+    ['... also deep in the list, where the virtual rows are far from the top', r.deepOrder],
+    ['the count line says what is applied ("sorted by type")', /sorted by type/.test(r.typeCount)],
+    ['Sort: Name orders by name', r.nameOrder],
+    ['Type: Fire keeps exactly the Fire Pokemon (either slot), still in type order', r.fireOrder && new RegExp('^' + r.fireN + ' Pokemon, type Fire, sorted by type').test(r.fireCount)],
+    ['a Fire/Flying Pokemon is in the Flying list and picking it from the sorted, filtered list adds that species (' + r.flyingHasCharizard + ', ' + r.picked + ')', r.flyingHasCharizard && r.picked],
+    ['the order is remembered (stored: ' + r.stored + ') and survives a reload; the type filter starts empty again', r.stored === 'type' && r.afterReload && r.afterReload.sort === 'type' && r.afterReload.type === '' && r.reloadOrder],
+    ['keyboard: Tab goes search -> Sort and filter -> Sort -> Type (' + J(r.tabOrder) + ')', J(r.tabOrder) === J(['fold-btn', 'sp-sort', 'sp-type'])],
+    ['keyboard: ArrowDown on Sort changes the order and the list follows (' + r.keyboardSort + ')', r.keyboardSort === 'name' && r.keyboardOrder && /sorted by name/.test(r.keyboardCount)],
+    ['no layout findings with the picker open (44 px targets, no horizontal overflow, nothing outside the screen)', Array.isArray(r.layout) && r.layout.length === 0],
+    ['the sheet fits the window with Sort and filter open: the list is not cut off and the list is the only scrollbar (' + J(r.sheet) + ')', Array.isArray(r.sheet) && r.sheet.length === 0],
+    ['no page errors', r.pageErrors.length === 0],
+  ];
+  await runCase('sort the Pokemon picker by type, desktop 1280x800', { port: CDP + 23, width: 1280, height: 800 }, async (page) => {
+    const r = await typeSortProbe(page, PAGE);
+    for (const [n, c] of TS_CHECKS(r)) ok(c === true, 'TS1280: ' + n, J(r).slice(0, 400));
+    await page.press('Escape', 'Escape', 27); await sleep(200);
+    await go(page, '#/team/' + (await page.eval('__editor.state().profile.teams[0].id')));
+    await openPicker(page); await openFold(page);
+    await setVal(page, '[data-fk="sp-sort"]', 'type', 'change'); await sleep(300);
+    await page.screenshot(path.join(OUT, 'typesort_1280.png'));
+  });
+  await runCase('sort the Pokemon picker by type, phone 390x844', { port: CDP + 24, width: 390, height: 844, mobile: true, dpr: 2 }, async (page) => {
+    await bootPage(page, PAGE);
+    const ids = await page.eval(SEED);
+    await go(page, '#/team/' + ids.t1);
+    await openPicker(page);
+    const closed = await page.eval("({ hidden: document.querySelector('.sheet .fold-body').hidden, btn: document.querySelector('.sheet .fold-btn').textContent })");
+    ok(closed.hidden === true && closed.btn === 'Sort and filter', 'TS390: on a phone the Sort and filter block starts folded, so the list gets the screen', J(closed));
+    const sheetClosed = await page.eval(SHEET_JS);
+    ok(sheetClosed.length === 0, 'TS390: the sheet fits the phone with the block folded (list not cut off, one scrollbar)', J(sheetClosed));
+    await openFold(page);
+    const sheetOpen = await page.eval(SHEET_JS);
+    ok(sheetOpen.length === 0, 'TS390: ... and with the block open', J(sheetOpen));
+    await setVal(page, '[data-fk="sp-sort"]', 'type', 'change'); await sleep(300);
+    ok(rowsMatch(await pickerRows(page), wantList({ sort: 'type' })), 'TS390: sorting by type works on a phone');
+    const f = await page.eval(layoutJs(true));
+    ok(f.length === 0, 'TS390: no layout findings with the block open (44 px targets, no overflow)', J(f));
+    const sizes = await page.eval("['sp-sort', 'sp-type'].map((k) => { const r = document.querySelector('[data-fk=' + k + ']').getBoundingClientRect(); return [Math.round(r.width), Math.round(r.height)]; })");
+    ok(sizes.every(([w, h]) => w >= 44 && h >= 44), 'TS390: Sort and Type are at least 44 css px', J(sizes));
+    ok(errsOf(page).length === 0, 'TS390: no page errors', errsOf(page).slice(0, 2).join(' | '));
+    await page.screenshot(path.join(OUT, 'typesort_390.png'));
+  });
+  // the same check against a copy where each control does nothing: it must FAIL (a test that cannot fail is decoration)
+  await runCase('negative control: the Sort and Type controls do nothing', { port: CDP + 25, width: 1280, height: 800 }, async (page) => {
+    await withMutant('js/editor_views.js', 'sortBy = speciesSortPref(e.target.value); refresh();', 'refresh();', 13, async (url) => {
+      const r = await typeSortProbe(page, url);
+      const failed = TS_CHECKS(r).filter(([, c]) => c !== true).map(([n]) => n);
+      ok(failed.length >= 3 && failed.some((n) => /Sort: Type puts every row/.test(n)), 'TS negative control (Sort does nothing): the same checks FAIL (' + failed.length + ' of ' + TS_CHECKS(r).length + ')', J(failed).slice(0, 300));
+    });
+  });
+  await runCase('negative control: the Type filter does nothing', { port: CDP + 26, width: 1280, height: 800 }, async (page) => {
+    await withMutant('js/editor_views.js', 'typeF = e.target.value; refresh();', 'refresh();', 14, async (url) => {
+      const r = await typeSortProbe(page, url);
+      const failed = TS_CHECKS(r).filter(([, c]) => c !== true).map(([n]) => n);
+      ok(failed.some((n) => /Type: Fire keeps exactly/.test(n)), 'TS negative control (Type does nothing): the Fire check FAILS (' + failed.length + ' failed)', J(failed).slice(0, 300));
+    });
+  });
+
+  // The picker must fit its sheet at the window heights a laptop or a desktop has (CDP metrics override: the layout re-flows, nothing reloads). It used to fit none of them under about 1150 px.
+  const SHEET_HEIGHTS = [800, 768, 900, 1080, 1440];
+  await runCase('sort picker fits its sheet at desktop heights', { port: CDP + 28, width: 1280, height: 800 }, async (page) => {
+    const r = await sheetProbe(page, PAGE, SHEET_HEIGHTS);
+    for (const hh of SHEET_HEIGHTS) ok(Array.isArray(r[hh]) && r[hh].length === 0, `SH${hh}: the Pokemon picker fits a 1280x${hh} window with Sort and filter open (one scrollbar, the list not cut off; the list is ${r['list' + hh]} px tall)`, J(r[hh]));
+    ok(errsOf(page).length === 0, 'SH: no page errors', errsOf(page).slice(0, 2).join(' | '));
+  });
+  // the same probe against a copy where the picker sheet is not "fixed" (the old code): it must FAIL at the common laptop heights
+  await runCase('negative control: sort picker sheet is not fixed', { port: CDP + 29, width: 1280, height: 800 }, async (page) => {
+    await withMutant('js/editor_views.js', "{ title, fixed: true, sheetClass: 'picker', bodyClass: 'has-vlist', body: [h('label', null, 'Search', search), fold('Sort and filter'", "{ title, sheetClass: 'picker', bodyClass: 'has-vlist', body: [h('label', null, 'Search', search), fold('Sort and filter'", 15, async (url) => {
+      const r = await sheetProbe(page, url, [800, 768]);
+      ok(r[800].length > 0 && r[768].length > 0, 'SH negative control (the sheet is not fixed): the same predicate FAILS at 1280x800 and 1280x768 (at 800: ' + J(r[800]).slice(0, 260) + ')', J(r).slice(0, 400));
+    });
+  });
+
+  /* ================================================================================ the picker on a SHORT window (#14 residual) */
+  // Measured before the fix, 1280 wide, Sort and filter open (it started open from 700 px WIDE up, however short the window): the picker fitted one scrollbar from about 725 px tall; below that the
+  // list sat on its 220 px floor and the body scrolled too: 720 -> 3 px over, 700 -> 20, 640 -> 72 (list bottom 653, body bottom 594), 585 -> 119; an 844x390 phone held sideways -> 287, the whole list
+  // below the window. Now the block starts FOLDED unless the window is >= 700 wide AND >= 760 tall (js/editor_views.js FOLD_ROOMY), and editor.css lets the picker's sheet use the window.
+  // TWO predicates, both run in the page:
+  //   FIT   (SHEET_JS above, unchanged)  the sheet is inside the window, the sheet body does not scroll, the list is >= 220 px and inside the body, and the ONLY scroller is the list.
+  //   REACH (PICKER_REACH_JS below)             (a) the sheet is inside the window; (b) the only scrollers are the sheet body (class "body fixed has-vlist") and the list; (c) with the body at scroll
+  //                                      0, at least PICKER_MIN_SHOWN px of the list lie inside the body's box; (d) with the body scrolled to its end the WHOLE list (>= 220 px tall) lies inside the body's box;
+  //                                      (e) if the body overflows, its computed overflow-y is auto / scroll (script can scroll an overflow:hidden box, a visitor cannot, so (d) alone proves nothing).
+  // Asserted: folded as it starts below 760 px tall; FIT with the block folded at 1280x{720,700,640,585}; REACH in every case (folded as it starts, and opened by hand) incl. 844x390; FIT with
+  // the block opened by hand at 1280x{760,720,700} (it is NOT asserted at 640 and 585, where the open block cannot fit and the body is allowed to scroll).
+  const PICKER_MIN_SHOWN = 24;
+  const PICKER_REACH_JS = `(() => {
+    const f = [], s = document.querySelector('#modalRoot .sheet');
+    if (!s) return ['no dialog is open'];
+    const body = s.querySelector(':scope > .body'), list = s.querySelector('.vlist');
+    if (!body || !list) return ['the dialog has no body or no list'];
+    const ih = window.innerHeight, sr = s.getBoundingClientRect(), box = (e) => e.getBoundingClientRect();
+    if (sr.top < -0.5 || sr.bottom > ih + 0.5) f.push('the sheet leaves the window: ' + Math.round(sr.top) + '..' + Math.round(sr.bottom) + ' of ' + ih);
+    const scrollers = [s, ...s.querySelectorAll('*')].filter((e) => { const o = getComputedStyle(e).overflowY; return (o === 'auto' || o === 'scroll') && e.scrollHeight > e.clientHeight + 1; }).map((e) => String(e.className || e.tagName));
+    const stray = scrollers.filter((n) => n !== 'vlist' && n !== 'body fixed has-vlist');
+    if (stray.length) f.push('scrollers other than the sheet body and the list: ' + JSON.stringify(stray));
+    if (body.scrollHeight > body.clientHeight + 1 && !/^(auto|scroll)$/.test(getComputedStyle(body).overflowY)) f.push('the sheet body overflows (' + body.scrollHeight + ' > ' + body.clientHeight + ') but a visitor cannot scroll it: overflow-y is ' + getComputedStyle(body).overflowY);
+    body.scrollTop = 0;
+    const l0 = box(list), b0 = box(body), shown = Math.min(l0.bottom, b0.bottom) - Math.max(l0.top, b0.top);
+    if (shown < ${PICKER_MIN_SHOWN}) f.push('only ' + Math.round(shown) + ' px of the list show before the body is scrolled (want ${PICKER_MIN_SHOWN}): list ' + Math.round(l0.top) + '..' + Math.round(l0.bottom) + ', body ends at ' + Math.round(b0.bottom));
+    body.scrollTop = body.scrollHeight;
+    const l1 = box(list), b1 = box(body);
+    if (l1.top < b1.top - 0.5 || l1.bottom > b1.bottom + 0.5) f.push('the list cannot be scrolled fully into view: list ' + Math.round(l1.top) + '..' + Math.round(l1.bottom) + ', body ' + Math.round(b1.top) + '..' + Math.round(b1.bottom));
+    if (l1.height < 219.5) f.push('the list is only ' + Math.round(l1.height) + ' px tall');
+    body.scrollTop = 0;
+    return f;
+  })()`;
+  const SHORT_SIZES = [[1280, 760], [1280, 759], [1280, 720], [1280, 700], [1280, 640], [1280, 585], [844, 390]];
+  // for each window size: open a FRESH picker (the fold decides its state when the picker opens), record how it started and both predicates, open the block by hand, record both again
+  async function shortProbe(page, url, sizes = SHORT_SIZES) {
+    const out = {};
+    await bootPage(page, url);
+    const ids = await page.eval(SEED);
+    await go(page, '#/team/' + ids.t1);
+    for (const [w, hh] of sizes) {
+      const o = (out[w + 'x' + hh] = {});
+      await page.send('Emulation.setDeviceMetricsOverride', { width: w, height: hh, deviceScaleFactor: 1, mobile: false }); await sleep(250);
+      await openPicker(page);
+      o.startedOpen = await page.eval("document.querySelector('.sheet .fold-body').hidden === false");
+      o.expanded = await page.eval("document.querySelector('.sheet .fold-btn').getAttribute('aria-expanded')");
+      o.body = await page.eval("(() => { const b = document.querySelector('.sheet > .body'); return { cls: b.className, overflowY: getComputedStyle(b).overflowY }; })()");
+      o.startFit = await page.eval(SHEET_JS); o.startReach = await page.eval(PICKER_REACH_JS);
+      await openFold(page); await sleep(150);
+      o.openFit = await page.eval(SHEET_JS); o.openReach = await page.eval(PICKER_REACH_JS);
+      await page.press('Escape', 'Escape', 27); await sleep(200);
+    }
+    out.errs = errsOf(page);
+    return out;
+  }
+  const SHORT_CHECKS = (r, sizes = SHORT_SIZES) => {
+    const c = [];
+    for (const [w, hh] of sizes) {
+      const k = w + 'x' + hh, o = r[k], tall = w >= 700 && hh >= 760;
+      if (!o) { c.push([`SHORT ${k}: the window was probed`, false]); continue; }
+      c.push([`SHORT ${k}: the Sort and filter block starts ${tall ? 'OPEN' : 'FOLDED'} (aria-expanded ${tall})`, o.startedOpen === tall && o.expanded === String(tall)]);
+      c.push([`SHORT ${k}: the picker body carries the has-vlist class and scrolls itself (computed overflow-y auto), so the short-window rule does not depend on :has()`, !!o.body && /\bhas-vlist\b/.test(o.body.cls) && o.body.overflowY === 'auto']);
+      c.push([`SHORT ${k}: the list is reachable as the picker starts (REACH)`, Array.isArray(o.startReach) && o.startReach.length === 0, J(o.startReach)]);
+      c.push([`SHORT ${k}: ... and with the block opened by hand (REACH)`, Array.isArray(o.openReach) && o.openReach.length === 0, J(o.openReach)]);
+      if (w === 1280 && hh >= 585) c.push([`SHORT ${k}: as it starts the picker fits with one scrollbar, the list's (FIT)`, Array.isArray(o.startFit) && o.startFit.length === 0, J(o.startFit)]);
+      if (w === 1280 && hh >= 700) c.push([`SHORT ${k}: ... and with the block opened by hand (FIT)`, Array.isArray(o.openFit) && o.openFit.length === 0, J(o.openFit)]);
+    }
+    return c;
+  };
+  await runCase('sort picker on a short window', { port: CDP + 34, width: 1280, height: 800 }, async (page) => {
+    const r = await shortProbe(page, PAGE);
+    for (const [n, cond, d] of SHORT_CHECKS(r)) ok(cond === true, n, d);
+    ok(r.errs.length === 0, 'SHORT: no page errors', r.errs.slice(0, 2).join(' | '));
+    await page.send('Emulation.setDeviceMetricsOverride', { width: 844, height: 390, deviceScaleFactor: 1, mobile: false }); await sleep(250);
+    await openPicker(page); await openFold(page); await sleep(150);
+    await page.screenshot(path.join(OUT, 'picker_844x390_open.png'));
+  });
+  // each guarantee against a copy that breaks it: the same checks must FAIL, and the failures must name the guarantee
+  const shortMutant = (name, rel, from, to, portOff, cdpOff, want, sizes) => runCase('negative control: ' + name, { port: CDP + cdpOff, width: 1280, height: 800 }, async (page) => {
+    await withMutant(rel, from, to, portOff, async (url) => {
+      const r = await shortProbe(page, url, sizes);
+      const failed = SHORT_CHECKS(r, sizes).filter(([, c]) => c !== true).map(([n]) => n);
+      ok(failed.length > 0 && want.every((re) => failed.some((n) => re.test(n))), 'SHORT negative control (' + name + '): the checks FAIL, naming ' + want.map(String).join(' and ') + ' (' + failed.length + ' failed)', J(failed).slice(0, 500));
+    });
+  });
+  // 1. the fold ignores the window's height (the old rule: wide enough is room enough) -> it starts open on every short window
+  await shortMutant('the Sort and filter block ignores the window height', 'js/editor_views.js', "'(min-width: 700px) and (min-height: 760px)'", "'(min-width: 700px)'", 19, 35,
+    [/1280x720: the Sort and filter block starts FOLDED/, /1280x585: the Sort and filter block starts FOLDED/, /844x390: the Sort and filter block starts FOLDED/, /1280x585: as it starts the picker fits/]);
+  // 2. the picker sheet keeps 86vh on a short window (no whole-window cap) -> the folded picker no longer fits one scrollbar at 585
+  await shortMutant('the picker sheet does not use the short window', 'editor.css', '#modalRoot .sheet.picker { max-height: calc(100vh - 16px); max-height: calc(100dvh - 16px); }', '#modalRoot .sheet.picker { }', 20, 36,
+    [/1280x585: as it starts the picker fits/], [[1280, 585]]);
+  // 3. the body class is gone (the old :has() rule written as a class that nothing sets) -> the picker body is overflow hidden, the list is cut off on a window where the block cannot fit
+  await shortMutant('the picker body has no has-vlist class', 'js/editor_views.js', "bodyClass: 'has-vlist', ", '', 21, 37,
+    [/has-vlist class/, /1280x585: \.\.\. and with the block opened by hand \(REACH\)/, /844x390: the list is reachable as the picker starts \(REACH\)/], [[1280, 585], [844, 390]]);
+  // 4. no tightening on a window under 520 px tall -> on the 844x390 phone held sideways nothing of the list shows once the block is opened by hand
+  await shortMutant('the sideways-phone layout is not tightened', 'editor.css', '@media (max-height: 519px) {', '@media (max-height: 1px) {', 22, 38,
+    [/844x390: \.\.\. and with the block opened by hand \(REACH\)/], [[844, 390]]);
+
+  // Enter in the search box: the species whose whole name was typed, else the first row in the Pokedex order, else (a partial name under a Type / Name order) nothing, and it says so
+  async function enterProbe(page, url) {
+    const r = {};
+    await bootPage(page, url);
+    const ids = await page.eval(SEED);
+    const boxLen = () => page.eval('__editor.state().profile.box.length');
+    const lastSpecies = () => page.eval('(() => { const b = __editor.state().profile.box; return b[b.length - 1].species; })()');
+    const toastNow = () => page.eval("(() => { const t = document.getElementById('toast'); return t.hidden ? '' : t.textContent; })()");
+    // open the picker on the seeded team, set the order, type `q`, press a REAL Enter in the search box; report what was added and what is still on screen, then put things back
+    async function enter(q, sort, showAll) {
+      await go(page, '#/team/' + ids.t1);
+      await openPicker(page);
+      await setVal(page, '[data-fk="sp-sort"]', sort, 'change');
+      if (showAll) await page.eval("document.querySelector('.sheet input[type=checkbox]').click()");
+      await setVal(page, '[data-fk="sp-q"]', q); await sleep(250);
+      const n0 = await boxLen();
+      await page.eval("document.querySelector('[data-fk=sp-q]').focus()");
+      await realKey(page, 'Enter', 'Enter', 13, '\r'); await sleep(400);
+      const added = (await boxLen()) - n0;
+      const out = { added, species: added ? pack.species[await lastSpecies()].name : null, open: await page.eval("!!document.querySelector('#modalRoot .sheet')"), toast: await toastNow() };
+      if (out.open) { await page.press('Escape', 'Escape', 27); await sleep(150); }
+      if (added) { await page.eval("__editor.dispatch({ type: 'undo' })"); await sleep(250); }       // the team has room for three more, not for every case
+      return out;
+    }
+    r.dexAbra = await enter('abra', 'dex');
+    r.typeAbra = await enter('abra', 'type');
+    r.nameNatu = await enter('natu', 'name');
+    r.typeAron = await enter('aron', 'type');
+    r.dexMew = await enter('mew', 'dex');
+    r.typeChar = await enter('char', 'type');
+    r.nameChar = await enter('char', 'name');
+    r.dexChar = await enter('char', 'dex');
+    r.typeOne = await enter('bulbasa', 'type');
+    r.none = await enter('zzzzzz', 'type');
+    r.out = await enter('zorua', 'type', true);
+    r.pageErrors = errsOf(page);
+    return r;
+  }
+  const firstOf = (q, sort) => pack.species[wantList({ q, sort })[0]].name;
+  const EN_CHECKS = (r) => [
+    ['Pokedex order: "abra" + Enter adds Abra (' + r.dexAbra.species + ')', r.dexAbra.species === 'Abra'],
+    ['Type order puts ' + firstOf('abra', 'type') + ' on top of "abra"; Enter still adds Abra, the Pokemon that was typed (' + r.typeAbra.species + ')', firstOf('abra', 'type') !== 'Abra' && r.typeAbra.species === 'Abra'],
+    ['Name order puts ' + firstOf('natu', 'name') + ' on top of "natu"; Enter adds Natu (' + r.nameNatu.species + ')', firstOf('natu', 'name') !== 'Natu' && r.nameNatu.species === 'Natu'],
+    ['Type order puts ' + firstOf('aron', 'type') + ' on top of "aron"; Enter adds Aron (' + r.typeAron.species + ')', firstOf('aron', 'type') !== 'Aron' && r.typeAron.species === 'Aron'],
+    ['Pokedex order puts ' + firstOf('mew', 'dex') + ' on top of "mew"; Enter adds Mew (' + r.dexMew.species + ')', firstOf('mew', 'dex') !== 'Mew' && r.dexMew.species === 'Mew'],
+    ['Type order, a partial name ("char", ' + wantList({ q: 'char', sort: 'type' }).length + ' Pokemon): Enter adds nothing, the picker stays open and the live region says why', wantList({ q: 'char', sort: 'type' }).length > 1 && r.typeChar.added === 0 && r.typeChar.open && /Enter does not choose/.test(r.typeChar.toast) && /sorted by type/.test(r.typeChar.toast)],
+    ['Name order, a partial name: the same (adds nothing, says "sorted by name")', r.nameChar.added === 0 && r.nameChar.open && /sorted by name/.test(r.nameChar.toast)],
+    ['Pokedex order, a partial name ("char"): Enter adds the first row, as it always did (' + r.dexChar.species + ')', r.dexChar.species === firstOf('char', 'dex')],
+    ['Type order, one hit left ("bulbasa"): Enter adds it (' + r.typeOne.species + ')', wantList({ q: 'bulbasa', sort: 'type' }).length === 1 && r.typeOne.species === 'Bulbasaur'],
+    ['no hits: Enter adds nothing and the picker stays open', r.none.added === 0 && r.none.open],
+    ['a Pokemon these rules leave out ("zorua", shown with "Also list ..."): Enter adds nothing and gives the reason', r.out.added === 0 && r.out.open && /^Zorua: ./.test(r.out.toast)],
+    ['no page errors', r.pageErrors.length === 0],
+  ];
+  await runCase('sort picker: Enter in the search box', { port: CDP + 30, width: 1280, height: 800 }, async (page) => {
+    const r = await enterProbe(page, PAGE);
+    for (const [n, c] of EN_CHECKS(r)) ok(c === true, 'EN: ' + n, J(r).slice(0, 500));
+  });
+  await runCase('negative control: sort picker Enter takes the first row', { port: CDP + 31, width: 1280, height: 800 }, async (page) => {
+    await withMutant('js/editor_views.js', 'const id = speciesEnterChoice(app.pack, ids, q, sortBy);', 'const id = ids[0];', 16, async (url) => {
+      const r = await enterProbe(page, url);
+      const failed = EN_CHECKS(r).filter(([, c]) => c !== true).map(([n]) => n);
+      ok(failed.length >= 4 && failed.some((n) => /"abra"; Enter still adds Abra/.test(n)) && failed.some((n) => /partial name \("char"/.test(n)), 'EN negative control (Enter takes ids[0]): the same checks FAIL (' + failed.length + ' of ' + EN_CHECKS(r).length + ')', J(failed).slice(0, 400));
+    });
+  });
+
+  // the team: one button puts the members in type order, one undo step. A keyboard or pad user must keep their place (the redraw replaces the button) and be told what happened.
+  async function teamSortProbe(page, url) {
+    const r = {};
+    await bootPage(page, url);
+    const ids = await page.eval(SEED);
+    await go(page, '#/team/' + ids.t1);
+    const btn = "[data-act='sort-team-type']";
+    const speciesNow = () => page.eval("__editor.state().profile.teams[0].monIds.map((id) => __editor.state().profile.box.find((m) => m.id === id).species)");
+    const domOrder = () => page.eval("[...document.querySelectorAll('.slot[data-mon]')].map((e) => e.dataset.mon)");
+    const attr = (a) => page.eval('document.querySelector(' + J(btn) + ').getAttribute(' + J(a) + ')');
+    const active = () => page.eval("(() => { const a = document.activeElement; return a ? ((a.dataset && a.dataset.act) || a.tagName) : 'none'; })()");
+    const toastNow = () => page.eval("(() => { const t = document.getElementById('toast'); return { text: t.hidden ? '' : t.textContent, role: t.getAttribute('role'), live: t.getAttribute('aria-live') }; })()");
+    const codeNow = () => page.eval("document.querySelector('[data-team-code]').value");
+    r.start = await speciesNow();
+    await page.waitFor("document.querySelector('[data-team-code]') && document.querySelector('[data-team-code]').value !== ''", { timeoutMs: 15000 });
+    const code0 = await codeNow();
+    r.enabled = (await exists(page, btn)) && (await attr('aria-disabled')) === null && (await attr('disabled')) === null;
+    r.title = await attr('title');
+    const seq0 = await page.eval('__editor.state().seq');
+    // KEYBOARD: focus the button, press a real Enter; then wait for the team code to be redrawn for the new order (a second redraw, which must not take focus either)
+    await page.eval('document.querySelector(' + J(btn) + ').focus()');
+    await pressEnter(page); await sleep(300);
+    await page.waitFor('document.querySelector("[data-team-code]").value !== ' + J(code0), { timeoutMs: 15000 }); await sleep(200);
+    r.after = await speciesNow();
+    r.domOk = J(await domOrder()) === J(await page.eval('__editor.state().profile.teams[0].monIds'));
+    r.activeAfter = await active();
+    r.toast = await toastNow();
+    r.ariaDisabledAfter = await attr('aria-disabled');
+    r.disabledAfter = await page.eval('document.querySelector(' + J(btn) + ').disabled');
+    r.titleAfter = await attr('title');
+    r.seq1 = (await page.eval('__editor.state().seq')) - seq0;
+    r.label = await page.eval('(() => { const u = __editor.state().undo; return u[u.length - 1].label; })()');
+    // Enter again, on the sorted team: nothing moves, and the live region says why
+    await pressEnter(page); await sleep(300);
+    r.again = { seq: (await page.eval('__editor.state().seq')) - seq0, species: await speciesNow(), active: await active(), toast: await toastNow() };
+    await page.eval("__editor.dispatch({ type: 'undo' })"); await sleep(300);
+    r.undone = J(await speciesNow()) === J([PIKACHU, CHARIZARD, SNORLAX]) && (await attr('aria-disabled')) === null;
+    await go(page, '#/team/' + ids.t2);
+    r.pikaDisabled = await page.eval('(() => { const b = document.querySelector(' + J(btn) + '); return b ? b.getAttribute("aria-disabled") : "missing"; })()');
+    await go(page, '#/team/' + ids.t1);
+    r.errs = errsOf(page);
+    return r;
+  }
+  const ST_CHECKS = (r) => [
+    ['the seeded team is Pikachu, Charizard, Snorlax', J(r.start) === J([PIKACHU, CHARIZARD, SNORLAX])],
+    ['a team out of type order has an enabled "Sort team by type" button', r.enabled],
+    ['its hover text says it is the SLOT order: the first Pokemon leads in 6v6, in 3v3 you choose the lead at team preview (it must not say the first Pokemon leads, flat)', typeof r.title === 'string' && /6v6/.test(r.title) && /3v3/.test(r.title) && /team preview/.test(r.title) && !/The first Pokemon leads\./.test(r.title), r.title],
+    ['keyboard: Enter puts Normal (Snorlax), Fire/Flying (Charizard), Electric (Pikachu) in that order', J(r.after) === J([SNORLAX, CHARIZARD, PIKACHU]), J(r.after)],
+    ['the slots on screen follow', r.domOk],
+    ['keyboard focus is still on the Sort button after the redraw replaced it (it must not fall to the page)', r.activeAfter === 'sort-team-type', r.activeAfter],
+    ['the live region (#toast, role status, aria-live polite) announces the result', r.toast.text === 'sorted by type: Snorlax, Charizard, Pikachu' && r.toast.role === 'status' && r.toast.live === 'polite', J(r.toast)],
+    ['once sorted the button is aria-disabled (still focusable: not "disabled") and its hover text says why', r.ariaDisabledAfter === 'true' && r.disabledAfter === false && /Already in type order/.test(r.titleAfter), J([r.ariaDisabledAfter, r.disabledAfter, r.titleAfter])],
+    ['one edit, labelled "sort Pokemon" in the undo list (the stack is capped at 20, so the length cannot be compared)', r.seq1 === 1 && r.label === 'sort Pokemon', J([r.seq1, r.label])],
+    ['Enter again on the sorted team: nothing moves, no new edit, focus stays, and the live region says it is already sorted', r.again.seq === 1 && J(r.again.species) === J(r.after) && r.again.active === 'sort-team-type' && r.again.toast.text === 'the team is already sorted by type', J(r.again)],
+    ['undo brings the old order back and the button is live again', r.undone],
+    ['a team of two Pikachu is already in order, so the button is aria-disabled', r.pikaDisabled === 'true', r.pikaDisabled],
+    ['no page errors', r.errs.length === 0, r.errs.slice(0, 2).join(' | ')],
+  ];
+  await runCase('sort a team by type', { port: CDP + 27, width: 1280, height: 800 }, async (page) => {
+    const r = await teamSortProbe(page, PAGE);
+    for (const [n, c, d] of ST_CHECKS(r)) ok(c === true, 'ST: ' + n, d);
+    await page.screenshot(path.join(OUT, 'typesort_team_1280.png'));
+  });
+  // the same probe against copies with the fix removed: the original defect (a disabled button, no focus key) and no focus key alone. Each must FAIL the focus check.
+  await runCase('negative control: sort team button is disabled when sorted', { port: CDP + 32, width: 1280, height: 800 }, async (page) => {
+    await withMutant('js/editor_views.js', "'aria-disabled': inOrder ? 'true' : null, dataset: { act: 'sort-team-type', fk: 'sort-team-type' },", "disabled: inOrder, dataset: { act: 'sort-team-type' },", 17, async (url) => {
+      const r = await teamSortProbe(page, url);
+      const failed = ST_CHECKS(r).filter(([, c]) => c !== true).map(([n]) => n);
+      ok(failed.some((n) => /keyboard focus is still on the Sort button/.test(n)) && failed.some((n) => /Enter again on the sorted team/.test(n)), 'ST negative control (disabled button): the focus and Enter-again checks FAIL (' + failed.length + ' failed)', J(failed).slice(0, 400));
+    });
+  });
+  await runCase('negative control: sort team button has no focus key', { port: CDP + 33, width: 1280, height: 800 }, async (page) => {
+    await withMutant('js/editor_views.js', "dataset: { act: 'sort-team-type', fk: 'sort-team-type' },", "dataset: { act: 'sort-team-type' },", 18, async (url) => {
+      const r = await teamSortProbe(page, url);
+      const failed = ST_CHECKS(r).filter(([, c]) => c !== true).map(([n]) => n);
+      ok(failed.some((n) => /keyboard focus is still on the Sort button/.test(n)), 'ST negative control (no data-fk): the focus check FAILS (' + failed.length + ' failed)', J(failed).slice(0, 400));
     });
   });
 

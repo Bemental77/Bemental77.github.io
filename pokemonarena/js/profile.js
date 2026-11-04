@@ -15,7 +15,7 @@
 // because the ROM struct order (hp, atk, def, spe, spa, spd) differs from the order every UI shows (hp, atk, def,
 // spa, spd, spe); a fixed-order array exists only inside the binary team code (teamcode.js), where the order is pinned.
 //
-// SCHEMA VERSIONS. CURRENT = 3.
+// SCHEMA VERSIONS. CURRENT = 4.
 //   v1  the draft layout written down by the planning stage (docs/gba-link-and-arena-plan.md, research finding F5):
 //       app 'arena', romHash, settings.defaultFormat, teams[].formatId, stats.byFormat, box[].ability = {slot},
 //       box[].training = {sp}, box[].provenance.saveSha, a history[] list. No UI code was released against it; it is
@@ -24,6 +24,10 @@
 //   v3  the career record: `stats` gains firstMatchAt, playMs, byFormat, byCpu, totals, bests, fav and recent (career_stats.js says what each holds and its
 //       limits). Nothing else changes. The migration keeps every v2 counter and fills the new keys with zeros; a v2 document that already carried a key of
 //       that name has it moved into the unknown bag first. An older build opens a v3 document read-only (it is "newer"), as for any future version.
+//   v4  online play: a battle against a person is kept like any other. `stats.byCpu` gains an `online` record {w, l, dr, f} (next to easy / normal / hard) and a `stats.recent`
+//       entry may be an online match (cpu 'online' plus `opp`, the opponent's name). Nothing else changes. The migration adds byCpu.online = zeros and keeps every other value; a v3
+//       document that already had a byCpu.online which is not a {w, l, dr, f} record keeps it in the unknown bag first. A build that only knows v3 opens a v4 document read-only.
+//       NOTE for whoever deploys this: a stored v3 profile is upgraded the first time this build loads it (store.loadProfile writes a changed document back, the v3 one going to history).
 // MIGRATIONS are pure functions of their input (they clone first and never throw on JSON input), run in order until
 // schemaVersion == CURRENT, and the whole chain is idempotent (a current document is returned unchanged). Fields the
 // next version does not model are NOT dropped: they are moved into the unknown-field bag `_unknown`.
@@ -53,7 +57,7 @@ import { emptyCareer, CAREER_KEYS, checkCareer, normalizeCareer, foldMatch, matc
 // ---------------------------------------------------------------------------------------------
 
 export const APP_ID = 'pokemonarena';
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 export const EXPORT_FORMAT = 'pokemonarena-profile';
 export const EXPORT_VERSION = 1;
 export const EXPORT_MAX_BYTES = 8 * 1024 * 1024;
@@ -574,8 +578,25 @@ function migrate2to3(d) {
   return o;
 }
 
+/** v3 -> v4: a battle against a person has its own row in stats.byCpu. Every v3 key keeps its value. An existing `online` that is already a {w, l, dr, f} record of counters stays
+ *  (the chain v2 -> v3 -> v4 passes through here with the one migrate2to3 just wrote, and a second run must change nothing); anything else under that name is kept in the unknown bag. */
+function migrate3to4(d) {
+  const o = clone(d);
+  if (!isObj(o)) return o;
+  o.schemaVersion = 4;
+  if (isObj(o.stats) && isObj(o.stats.byCpu)) {
+    const cur = o.stats.byCpu.online;
+    const rec = isObj(cur) && Object.keys(cur).length === 4 && ['w', 'l', 'dr', 'f'].every((k) => hasOwn.call(cur, k) && isInt(cur[k], 0, Number.MAX_SAFE_INTEGER));
+    if (!rec) {
+      if (hasOwn.call(o.stats.byCpu, 'online')) bagSet(o.stats, 'v3ByCpuOnline', cur);
+      setOwn(o.stats.byCpu, 'online', { w: 0, l: 0, dr: 0, f: 0 });
+    }
+  }
+  return o;
+}
+
 /** version -> function taking a document of that version and returning one of the NEXT version. Pure; never throws. */
-export const MIGRATIONS = Object.freeze({ 1: migrate1to2, 2: migrate2to3 });
+export const MIGRATIONS = Object.freeze({ 1: migrate1to2, 2: migrate2to3, 3: migrate3to4 });
 
 /**
  * Bring a stored / imported document to CURRENT.
@@ -1187,6 +1208,15 @@ export function recordMatch(profile, match) {
   const bad = checkProfile(next);
   if (bad.length) return { ok: false, code: 'record.invalid', message: 'the record would not be well formed: ' + bad.slice(0, 2).map((x) => x.code + ' ' + x.path).join(', ') };
   return { ok: true, profile: next, duplicate: f.duplicate, callouts: f.callouts };
+}
+
+/**
+ * `mine` with the battle record of `stored` (a profile as the store holds it NOW). The Team Builder never edits `stats`, so when its save deliberately overrides the store's
+ * compare-and-swap ("Keep my edits here" after another tab saved first) it must carry the record that is stored now: another tab may have written a battle (online or against the CPU)
+ * in the meantime, and the copy this tab loaded long ago would erase it. Pure: neither argument is modified; the record is copied, never shared.
+ */
+export function withStoredRecord(mine, stored) {
+  return { ...mine, stats: clone(stored.stats) };
 }
 
 /** A copy of the profile with its battle record emptied (RESET RECORD). Everything else is untouched. */

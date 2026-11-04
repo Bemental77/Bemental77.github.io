@@ -13,6 +13,7 @@
 //   moveStatuses(pack, rec, moveIds, ruleset)    { [moveId]: { ok, code, message, ...detail } } by batches of 16 through validateMon
 //   itemCatalog(pack, ruleset, opts)             { id, name, desc, ..., status } per item
 //   speciesSearch(pack, query, ruleset)          roster ids matching a name / number / type query
+//   speciesEnterChoice(pack, ids, query, sort)   which species Enter in the picker's search box takes (or null: do not guess)
 //   derived(pack, mon, ruleset)                  battle stats and the numbers shown next to them
 //   validationView(pack, mons, ruleset)          reasons grouped for display (team level + per mon), each with the RULE_CODES text
 
@@ -214,6 +215,33 @@ export function speciesRow(pack, id, ruleset, exclusions) {
   return row;
 }
 
+/**
+ * How a list of Pokemon can be ordered. 'dex' is the order the editor always had (National Pokedex number, then ROM entry id) and stays the default.
+ * 'type' orders by the first type, then the second, in the ROM's own type order (the id order pack.types has and the move picker's Type sort uses:
+ * Normal, Fighting, Flying, Poison, Ground, Rock, Bug, Ghost, Steel, Fire, Water, Grass, Electric, Psychic, Ice, Dragon, Dark, Fairy); a single-type
+ * Pokemon comes before every dual-type one that shares its first type (Fire, then Fire/Flying, then Fire/Fighting ...); ties fall back to 'dex'.
+ */
+export const SPECIES_SORTS = Object.freeze([['dex', 'Pokedex number'], ['name', 'Name'], ['type', 'Type']]);
+export const SPECIES_SORT_IDS = Object.freeze(SPECIES_SORTS.map((x) => x[0]));
+/** A comparator over species ids (ROM entry ids) for one of SPECIES_SORT_IDS. An unknown sort name is 'dex'; an id the pack does not have sorts after every id it has (and among those, by id). */
+export function speciesComparator(pack, by) {
+  const S = (id) => pack.species[id];
+  const dex = (a, b) => S(a).natDex - S(b).natDex || a - b;
+  let inner = dex;
+  if (by === 'name') inner = (a, b) => S(a).name.toLowerCase().localeCompare(S(b).name.toLowerCase()) || dex(a, b);
+  else if (by === 'type') {
+    const key = (id) => { const t = S(id).types; return [t[0], t[1] === t[0] ? 0 : t[1]]; };       // single-typed: second slot 0, before any real type
+    inner = (a, b) => { const A = key(a), B = key(b); return A[0] - B[0] || A[1] - B[1] || dex(a, b); };
+  }
+  return (a, b) => { const A = S(a), B = S(b); if (!A || !B) return A ? -1 : B ? 1 : a - b; return inner(a, b); };
+}
+/** The types some roster species has, as [[id, name], ...] in ROM type order: what a Type filter should offer (no "???", nothing nobody has). */
+export function speciesTypeChoices(pack) {
+  const used = new Set();
+  for (const id of pack.roster) for (const t of pack.species[id].types) used.add(t);
+  return pack.types.filter((t) => used.has(t.id)).map((t) => [t.id, t.name]);
+}
+
 let searchMemo = null; // pack -> precomputed lowercase names
 function searchIndex(pack) {
   if (searchMemo && searchMemo.pack === pack) return searchMemo.index;
@@ -227,6 +255,8 @@ function searchIndex(pack) {
  * Roster species matching a query. Tokens are AND-ed: a token matches a name substring, a Pokedex number / species id (digits, optional
  * leading '#'), or a type name (exact, case-insensitive). Ordered by Pokedex number then id. Banned species are returned LAST and marked
  * unavailable by speciesRow, so the picker can show them disabled.
+ * opts.sort: one of SPECIES_SORT_IDS (default 'dex': the order above). opts.type: a ROM type id, or '' / null / undefined for any: only Pokemon with that
+ * type in EITHER slot are kept (a value that is not a type id is ignored). The sort applies inside the available group and inside the unavailable one.
  */
 export function speciesSearch(pack, query, ruleset, opts = {}) {
   const index = searchIndex(pack);
@@ -239,10 +269,34 @@ export function speciesSearch(pack, query, ruleset, opts = {}) {
     if (typeByName.has(t) && s.types.includes(typeByName.get(t))) return true;
     return s.name.includes(t);
   }));
-  hits.sort((a, b) => a.natDex - b.natDex || a.id - b.id);
-  const rows = hits.map((s) => speciesRow(pack, s.id, ruleset, exclusions));
+  // a type id given as a number or as digits; anything else (undefined, '', an array that happens to be 0 as a number, ...) is no filter
+  const tf = typeof opts.type === 'number' ? opts.type : typeof opts.type === 'string' && /^[0-9]{1,3}$/.test(opts.type) ? Number(opts.type) : null;
+  const kept = Number.isInteger(tf) && pack.types[tf] ? hits.filter((s) => s.types.includes(tf)) : hits;
+  const cmp = speciesComparator(pack, opts.sort);
+  kept.sort((a, b) => cmp(a.id, b.id));
+  const rows = kept.map((s) => speciesRow(pack, s.id, ruleset, exclusions));
   const avail = rows.filter((r) => r.available);
   return (opts.unavailable === 'hide' ? avail : avail.concat(rows.filter((r) => !r.available))).map((r) => r.id);
+}
+
+/**
+ * What Enter in the picker's search box should choose from `ids` (the list as the person sees it: speciesSearch's answer for `query` and `sort`): a species id, or null
+ * for "do not guess". A remembered Type or Name order puts a different species on top of "abra" (Crabrawler) or "natu" (Eternatus), and the person who typed a whole
+ * name and pressed Enter must get THAT species, so:
+ *   1. the typed text is exactly one species' name (case and spacing ignored): that species (alternate forms that share the name: the lowest Pokedex number);
+ *   2. otherwise, in the default Pokedex order, or when only one Pokemon is left: the first row, as Enter always did;
+ *   3. otherwise (a partial name under a Type / Name order): null, because the first row is only first by an order the person may not remember choosing.
+ */
+export function speciesEnterChoice(pack, ids, query, sort) {
+  if (!Array.isArray(ids) || !ids.length) return null;
+  const norm = (s) => String(s || '').toLowerCase().split(/\s+/).filter(Boolean).join(' ');
+  const want = norm(query);
+  if (want) {
+    const named = ids.filter((id) => pack.species[id] && norm(pack.species[id].name) === want);
+    if (named.length) return named.slice().sort(speciesComparator(pack, 'dex'))[0];
+  }
+  if (ids.length === 1 || sort === 'dex' || !SPECIES_SORT_IDS.includes(sort)) return ids[0];
+  return null;
 }
 
 /** Gender options a species allows, from the ROM gender ratio (255 genderless, 0 male only, 254 female only). */

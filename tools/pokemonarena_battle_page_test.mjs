@@ -75,12 +75,14 @@ async function consistent(page) {
 const shot = async (page, name) => { if (SHOTS) await page.screenshot(path.join(OUT, name + '.png')); return name; };
 
 /* ------------------------------------------------------------------------------- an AudioContext test double */
+// UPDATED DELIBERATELY (the page now TRIES to start the sound at load): this double emulates the browser's autoplay policy like the shared ones (pokemonarena_hub_lib.mjs, pokemonarena_sound_lib.mjs): a context
+// stays suspended until the page has had a real user activation (navigator.userActivation.hasBeenActive) unless ?autoplay=1 says the site may autoplay. The old double resumed at once, which no real browser does.
 const AUDIO_DOUBLE = `(() => {
-  const log = { ctor: 0, createBuffer: 0, createBufferSource: 0, start: 0, resume: 0, gain: 0 };
-  window.__audioLog = log;
+  const log = { ctor: 0, createBuffer: 0, createBufferSource: 0, start: 0, resume: 0, gain: 0, blocked: 0 };
+  window.__audioLog = log; window.__autoplayAllowed = /[?&]autoplay=1/.test(location.search);
   class FakeCtx {
     constructor() { log.ctor++; this.state = 'suspended'; this.currentTime = 0; this.destination = {}; }
-    resume() { log.resume++; this.state = 'running'; return Promise.resolve(); }
+    resume() { log.resume++; const a = navigator.userActivation && navigator.userActivation.hasBeenActive; if (!window.__autoplayAllowed && !a) { log.blocked++; return Promise.resolve(); } this.state = 'running'; return Promise.resolve(); }
     suspend() { this.state = 'suspended'; return Promise.resolve(); }
     createBuffer(ch, len, rate) { log.createBuffer++; const d = new Float32Array(len); return { duration: len / rate, getChannelData: () => d }; }
     createBufferSource() { log.createBufferSource++; return { buffer: null, playbackRate: { value: 1 }, connect() {}, disconnect() {}, start() { log.start++; }, stop() {}, onended: null }; }
@@ -362,7 +364,8 @@ session('urls', { width: 1280, height: 800 }, async (page) => {
   const scriptsBefore = await (async () => { await open(page, '?seed=1&format=6v6'); return ev(page, `document.scripts.length`); })();
   for (const [q, param] of hostile) {
     const s = await open(page, q);
-    const info = await ev(page, `(() => ({ state: ${H}.state, kind: ${H}.kind, param: ${H}.param, xss: typeof window.__xss, imgs: [...document.querySelectorAll('img, svg, iframe')].filter((e) => !e.closest('#fullBtn, #fullExit')).length, scripts: document.scripts.length, errVisible: !document.getElementById('error').hidden, canvasHidden: document.getElementById('battle').hidden, body: document.getElementById('error').innerHTML.includes('<') && /<(img|svg|script|b)\\b/i.test(document.getElementById('error').innerHTML) }))()`);
+    // (the header's own icons are static markup, not content from the address: the Fullscreen buttons' corner brackets, and the audio bar's speaker and note icons from js/audiobar.js)
+    const info = await ev(page, `(() => ({ state: ${H}.state, kind: ${H}.kind, param: ${H}.param, xss: typeof window.__xss, imgs: [...document.querySelectorAll('img, svg, iframe')].filter((e) => !e.closest('#fullBtn, #fullExit, #audioBar')).length, scripts: document.scripts.length, errVisible: !document.getElementById('error').hidden, canvasHidden: document.getElementById('battle').hidden, body: document.getElementById('error').innerHTML.includes('<') && /<(img|svg|script|b)\\b/i.test(document.getElementById('error').innerHTML) }))()`);
     ok(s === 'error' && info.kind === 'params' && info.param === param && info.errVisible && info.canvasHidden, 'hostile ' + q.slice(0, 40) + ': refused with an error screen naming ' + param, JSON.stringify(info));
     ok(info.xss === 'undefined' && info.imgs === 0 && info.body === false && info.scripts === scriptsBefore, 'hostile ' + q.slice(0, 40) + ': nothing was executed or injected', JSON.stringify(info));
     const msg = await ev(page, `document.getElementById('errMsg').textContent + document.getElementById('errTitle').textContent + document.getElementById('errDetail').textContent`);
@@ -382,6 +385,8 @@ session('urls', { width: 1280, height: 800 }, async (page) => {
   const rom = fs.readFileSync(ROM_PATH);
   const fault = async (name, kind, respond) => {
     page.handlers.length = 0;
+    // (the page now keeps a verified ROM in Cache Storage between visits: js/romcache.js, added by another change. An injected network fault only means something if the ROM has to be DOWNLOADED, so the stored copy is cleared first.)
+    await page.eval("caches.keys().then((ks) => Promise.all(ks.map((k) => caches.delete(k)))).then(() => true)").catch(() => {});
     await page.send('Fetch.enable', { patterns: [{ urlPattern: '*Pokemon*SoulGold*', requestStage: 'Request' }] });
     page.handlers.push((m) => { if (m.method === 'Fetch.requestPaused') respond(m.params); });
     await page.navigate(BASE + '?seed=2&format=6v6');
@@ -419,7 +424,8 @@ async function soundPolicy(page, base) {
 }
 const SOUND_POLICY_CHECKS = (r) => [
   ['sound is ON by default (the Sound button reads "Sound: on")', r.on === true && r.label0 === 'Sound: on'],
-  ['... but no AudioContext exists and nothing is stored before the first click, tap or key', r.ctor0 === 0 && r.stored0[0] === null && r.stored0[1] === null],
+  // (the page tries at load, so one context may exist; the double keeps it suspended without a gesture, so nothing can start. Nothing is stored either way.)
+  ['... but nothing is running and nothing is stored before the first click, tap or key (the context tried at load, if any, is suspended)', r.ctor0 <= 1 && r.stored0[0] === null && r.stored0[1] === null],
 ];
 session('audio', { width: 1280, height: 800 }, async (page) => {
   const r0 = await soundPolicy(page, BASE);
@@ -427,7 +433,7 @@ session('audio', { width: 1280, height: 800 }, async (page) => {
   const r = await ev(page, `${H}.autoplay(300000)`);
   const log = await ev(page, `window.__audioLog`);
   ok(r.mode === 'result', 'audio: a whole battle plays', JSON.stringify(r));
-  ok(log.ctor === 0 && log.start === 0, 'audio: a whole battle played with no click, tap or key creates no AudioContext and starts no source (the browser would not allow it)', JSON.stringify(log));
+  ok(log.ctor <= 1 && log.start === 0, 'audio: a whole battle played with no click, tap or key starts no source (the context tried at load stays suspended: the browser would not allow it)', JSON.stringify(log));
   // the header button OPENS the panel (a real click is a user gesture and creates the one AudioContext)
   const sb = await ev(page, `(() => { const r = document.getElementById('soundBtn').getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`);
   await page.click(sb.x, sb.y); await sleep(400);

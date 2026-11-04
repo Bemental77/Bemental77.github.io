@@ -440,6 +440,10 @@ export class ArenaStore {
    * Read, migrate, normalise. Returns
    *   { ok:true, profile, readOnly, migratedFrom, repaired, quarantined }   (a changed document is written back, with its old
    *                                                                          revision in history, unless it is read-only)
+   *   { ok:true, ..., unsaved:true, writeError }                             the same, but the write-back FAILED (a full origin, an aborted transaction): the profile is the
+   *                                                                          migrated / repaired one IN MEMORY and the stored document is untouched, so the next load tries
+   *                                                                          the write again. (A profile that can be read must never become unreadable because it could not
+   *                                                                          be upgraded: the hub would drop it and a battle would find no profile.) `notSaved` is set as usual.
    *   { ok:false, code, message, problems }                                  (not found, or unreadable: a copy goes to quarantine)
    */
   async loadProfile(id) {
@@ -465,7 +469,9 @@ export class ArenaStore {
         return { ok: true, profile: saved, readOnly: false, migratedFrom: opened.migratedFrom, repaired: opened.problems.filter((p) => p.severity === 'repaired').length, quarantined: opened.quarantined };
       } catch (e) {
         if (e instanceof ConflictError) continue; // someone else saved between our read and our write-back: read again
-        throw e;
+        // a plain write failure (not a store refusal, not a programming error): hand back the document as migrated in memory; its rev is the stored one, so a later save compares correctly
+        if (e instanceof StoreError || e instanceof TypeError || e instanceof RangeError || e instanceof ReferenceError || e instanceof SyntaxError) throw e;
+        return { ok: true, profile: opened.profile, readOnly: false, migratedFrom: opened.migratedFrom, repaired: opened.problems.filter((p) => p.severity === 'repaired').length, quarantined: opened.quarantined, unsaved: true, writeError: e };
       }
     }
     throw new ConflictError(`profile ${id} kept changing while it was being loaded`, { id });
@@ -543,7 +549,9 @@ export class ArenaStore {
   async recordMatch(id, match) {
     // an old or damaged document is first brought up to date the usual way (migration / repair, the old revision in history, set-aside records in the quarantine)
     // so that the single transaction below only ever has to read a clean current-version document
-    { const l = await this.loadProfile(id); if (!l.ok) { if (l.code === 'store.not-found') throw new NotFoundError(`no profile ${id}`, { id }); throw new ValidationError(`profile ${id} cannot be read: ${l.message}`, l.problems || []); } }
+    { const l = await this.loadProfile(id); if (!l.ok) { if (l.code === 'store.not-found') throw new NotFoundError(`no profile ${id}`, { id }); throw new ValidationError(`profile ${id} cannot be read: ${l.message}`, l.problems || []); }
+      if (l.unsaved) throw l.writeError;         // it could not be brought up to date: nothing is written (the single transaction below would skip the migration's history entry), the next load tries again
+    }
     const out = await this._tx(['profiles', 'profileHistory', 'meta'], 'readwrite', async (tx) => {
       const raw = await tx.get('profiles', id);
       if (raw === undefined) throw new NotFoundError(`no profile ${id}`, { id });

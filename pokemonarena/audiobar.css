@@ -1,0 +1,87 @@
+/* pokemonarena/audiobar.css -- the AUDIO BAR (js/audiobar.js): a volume slider that is always on screen, a mute button and (hub, team editor) the menu-music changer.
+   ONE stylesheet for the hub, the battle page and the team editor; it is linked from all three <head>s and is the only place the bar is sized.
+
+   WHERE THE BAR LIVES (one rule per size; the header of the page does the rest):
+     wide (> 760 px)                      inline in the header, before the Sound button: [mute] [slider 100 px] 70% [music]
+     narrower, or a phone held sideways   inline, compact: a 64 px slider, no percent
+     portrait phone (<= 600 px wide)      a row of its own at the bottom of the header (the hub and the editor); the battle page keeps it in the header's FIRST row, between the
+                                          way back and Fullscreen, where its two-row header has the room (<= 480 px)
+     fullscreen, landscape, touch screen  the header is hidden by the page, so the bar floats beside the exit-fullscreen button, folded to one speaker button; a tap opens it
+   The empty placeholder <div id="audioBar" data-pending="1"> in each page's header reserves the row (invisible) until audiobar.js fills it, so nothing moves when it does.
+   Every target is at least 44 css px; the colours are the pages' shared custom properties (with fallbacks, so a page that lacks one still looks right). */
+
+.audiobar { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; min-height: 44px; color: var(--fg, #ddd); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; box-sizing: border-box; }
+.audiobar * { box-sizing: border-box; }
+.audiobar[data-pending] { visibility: hidden; }
+/* nothing to hear while a page is loading or has failed (the editor hides its Sound button the same way) */
+body[data-state="boot"] .audiobar, body[data-state="error"] .audiobar { visibility: hidden; }
+#top .audiobar { order: 1; }                         /* hub and battle: between the title and the Sound / Controls group (order 2) and Fullscreen (order 3) */
+#top .audiobar[data-page="editor"] { order: 0; }     /* the editor's header has no explicit order: the bar sits where it is in the document, before the Sound button */
+.audiobar .ab-parts { display: flex; align-items: center; gap: 4px; min-width: 0; }
+
+.ab-btn { width: 44px; height: 44px; min-width: 44px; padding: 0; flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; font: inherit; font-size: 20px; line-height: 1; color: var(--fg, #ddd); background: var(--btn, #222); border: 1px solid var(--line, #3a3a44); border-radius: 6px; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.ab-btn:hover { background: var(--btn-hi, #333); }
+.ab-btn:focus-visible, .ab-vol:focus-visible, .ab-opt:focus-visible { outline: 2px solid var(--accent, #6af); outline-offset: 1px; }
+.ab-ic { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; }
+.ab-mute .ab-ic-off { display: none; }
+.audiobar[data-muted="true"] .ab-mute .ab-ic-on { display: none; }
+.audiobar[data-muted="true"] .ab-mute .ab-ic-off { display: block; }
+.audiobar[data-muted="true"] .ab-mute { color: var(--bad, #f98); border-color: var(--bad, #f98); }
+.audiobar[data-pick="off"] .ab-music { color: var(--dim, #8d8d99); }
+.ab-music[aria-expanded="true"] { background: #27466f; border-color: var(--accent, #6af); }
+
+.audiobar .ab-vol { width: 100px; height: 44px; margin: 0; flex: 0 0 auto; accent-color: var(--accent, #6af); cursor: pointer; touch-action: pan-y; background: transparent; }
+.audiobar[data-muted="true"] .ab-vol { opacity: .5; }
+.ab-val { flex: 0 0 auto; min-width: 38px; text-align: right; font-size: 13px; font-variant-numeric: tabular-nums; color: var(--dim, #8d8d99); }
+
+/* the speaker button that stands in for the whole bar while it floats */
+.audiobar .ab-fold { display: none; }
+
+/* ---- narrower than a desktop, and phones held sideways: the same bar, a shorter slider, no percent ---- */
+@media (max-width: 760px) {
+  .audiobar .ab-vol { width: 64px; }
+  .ab-val { display: none; }
+}
+
+/* ---- a portrait phone: a row of its own at the bottom of the header ---- */
+@media (max-width: 600px) and (min-height: 501px) {
+  #top { flex-wrap: wrap; }
+  #top .audiobar, #top .audiobar[data-page="editor"] { order: 9; flex: 1 1 100%; }
+  .audiobar .ab-parts { flex: 1 1 auto; }
+  .audiobar .ab-vol { flex: 1 1 auto; width: auto; min-width: 0; }
+  .ab-val { display: block; }
+  /* The hub's header is a row taller here. A 568 px phone has no spare room (the touch pad would end 3 px below the screen), so the band between the header and the picture gives
+     back what it can: the link row's own 16 px margins (the page's 8 px gap stays). */
+  body[data-pad="on"][data-layout="portrait"] #onlineLink { margin-block: 0; }
+}
+/* the battle page's header already has two rows on a phone: the bar goes in the first, between the way back and Fullscreen (which have the room) */
+@media (max-width: 480px) and (min-height: 501px) {
+  #top .audiobar[data-page="battle"] { order: 0; flex: 0 0 auto; }
+  .audiobar[data-page="battle"] .ab-parts { flex: 0 0 auto; }
+  .audiobar[data-page="battle"] .ab-vol { flex: 0 0 auto; width: clamp(64px, 26vw, 110px); }
+  .audiobar[data-page="battle"] .ab-val { display: none; }
+}
+
+/* ---- fullscreen on a phone held sideways: the header is hidden, so the bar floats beside the exit-fullscreen button, folded to one speaker button ---- */
+.audiobar.ab-float { position: fixed; z-index: 31; order: 0; flex: none; width: auto; min-height: 0; top: max(8px, env(safe-area-inset-top)); left: calc(max(8px, env(safe-area-inset-left)) + 52px); background: rgba(26, 26, 31, .88); border-radius: 8px; }
+.audiobar.ab-float .ab-fold { display: inline-flex; }
+.audiobar.ab-float .ab-parts { display: none; flex: none; }
+.audiobar.ab-float.ab-open .ab-parts { display: flex; padding-right: 4px; }
+.audiobar.ab-float.ab-open .ab-fold { background: #27466f; border-color: var(--accent, #6af); }
+.audiobar.ab-float .ab-vol { width: 120px; flex: none; }
+.audiobar.ab-float .ab-val { display: none; }
+
+/* ---- the music changer's popover ---- */
+.ab-menu { position: fixed; z-index: 1800; right: 8px; top: 56px; width: min(92vw, 360px); max-height: 70vh; overflow-y: auto; overscroll-behavior: contain; padding: 8px; background: var(--panel, #1a1a1f); color: var(--fg, #ddd); border: 1px solid var(--line, #3a3a44); border-radius: 10px; box-shadow: 0 8px 28px rgba(0, 0, 0, .6); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; font-size: 14px; box-sizing: border-box; }
+.ab-menu * { box-sizing: border-box; }
+.ab-menu[hidden] { display: none; }
+.ab-menu:focus { outline: none; }                   /* tabindex -1 (js/audiobar.js): a click on the list's text keeps the focus inside the dialog; the dialog itself needs no ring */
+.ab-menu-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.ab-menu-head .ab-btn { width: 44px; height: 44px; font-size: 24px; font-weight: 700; }
+.ab-now { flex: 1 1 auto; min-width: 0; text-align: center; font-weight: 600; overflow-wrap: anywhere; }
+.ab-list { display: grid; gap: 4px; }
+.ab-opt { width: 100%; min-height: 44px; padding: 8px 12px; text-align: left; font: inherit; color: var(--fg, #ddd); background: var(--btn, #222); border: 1px solid var(--line, #3a3a44); border-radius: 6px; cursor: pointer; -webkit-tap-highlight-color: transparent; overflow-wrap: anywhere; }
+.ab-opt:hover { background: var(--btn-hi, #333); }
+.ab-opt[aria-checked="true"] { background: #27466f; border-color: var(--accent, #6af); box-shadow: inset 0 -3px 0 var(--accent, #6af); }
+.ab-hint { margin: 6px 2px 0; min-height: 18px; font-size: 13px; color: var(--dim, #9a9aa8); }
+@media (prefers-reduced-motion: reduce) { .audiobar *, .ab-menu * { transition: none !important; animation: none !important; } }

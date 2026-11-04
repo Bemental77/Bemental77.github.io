@@ -22,7 +22,7 @@ export async function loadStack(dir) {
   const [netmatch, om, tables, rom, ai, engine, matchctl] = await Promise.all(['netmatch.js', 'online_match.js', 'tables.js', 'rom.js', 'ai.js', 'engine.js', 'matchctl.js'].map((f) => import(base(f))));
   const romBytes = fs.readFileSync(ROM_PATH);
   const pack = tables.loadPack(romBytes, { verify: 'header', dexText: false });
-  return { netmatch, om, tables, rom, ai, engine, matchctl, pack, romBytes };
+  return { netmatch, om, tables, rom, ai, engine, matchctl, pack, romBytes, dir: dir || path.join(root, 'pokemonarena', 'js') };       // dir: where this stack's modules came from (a test imports further modules from the same place, so a mutant copy is honoured)
 }
 
 export const settle = () => new Promise((r) => setImmediate(r));

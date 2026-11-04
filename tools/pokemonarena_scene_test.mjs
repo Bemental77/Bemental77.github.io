@@ -559,7 +559,8 @@ async function core(M, romBytes, opts = {}) {
     t('boot: error text never echoes the offending value', hostile.every((q) => { const r = P(q); const val = decodeURIComponent((q.split('=')[1] || '')); return r.ok || val.length < 6 || !(r.error.message + r.error.title).includes(val); }));
     t('boot: a duplicated parameter uses the first value only', P('?cpu=easy&cpu=hard').params.cpu === 'easy');
     const fit = M.BO.fitScale;
-    t('boot: fitScale picks whole device pixels', fit({ availW: 358, availH: 600, dpr: 3 }).k === 4 && fit({ availW: 358, availH: 600, dpr: 3 }).cssW === 320 / 1 && fit({ availW: 100, availH: 100, dpr: 1 }).k === 1 && fit({ availW: 960, availH: 640, dpr: 1 }).k === 4);
+    // The rule since the picture fills the screen (screenfit.js): a whole scale is kept only when it costs under 6 % of the room; otherwise the picture takes the room.
+    t('boot: fitScale fills the room, snapping to whole device pixels only when that costs under 6 %', (() => { const f1 = fit({ availW: 358, availH: 600, dpr: 3 }), f2 = fit({ availW: 380, availH: 600, dpr: 2 }); return f1.whole === false && f1.cssW === 358 && f2.whole === true && f2.k === 3 && f2.cssW === 360 && fit({ availW: 100, availH: 100, dpr: 1 }).k === 1 && fit({ availW: 960, availH: 640, dpr: 1 }).k === 4; })());
   }
   {
     const { TC, RM } = M;
@@ -678,7 +679,7 @@ if (process.env.ARENA_SKIP_MUTANTS !== '1') {
     ['matchctl.js', 'submit does not pump (CPU never answers)', (s) => s.replace("    announce(side, choice);\n    pump();\n    return r;", "    announce(side, choice);\n    return r;")],
     ['battle_boot.js', 'URL code pattern accepts anything', (s) => s.replace("const CODE_RE = /^ARENA1\\.[A-Za-z0-9_-]{1,1000}\\.[0-9a-fA-F]{4}$/;", 'const CODE_RE = /.*/;')],
     ['battle_boot.js', 'seed range unchecked', (s) => s.replace("|| Number(seedS) > 4294967295", '')],
-    ['battle_boot.js', 'fitScale rounds up', (s) => s.replace('Math.floor(Math.min((availW * d) / SCREEN_W, (availH * d) / SCREEN_H) + 1e-9)', 'Math.ceil(Math.min((availW * d) / SCREEN_W, (availH * d) / SCREEN_H))')],
+    ['screenfit.js', 'fitScale rounds up', (s) => s.replace('const whole = Math.floor(exact + 1e-9);', 'const whole = Math.ceil(exact);')],
   ];
   const twinDir = copyTree('twin');
   const twin = await loadStack(twinDir, '?twin');

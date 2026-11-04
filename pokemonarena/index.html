@@ -9,6 +9,7 @@
   <link rel="icon" href="data:," />
   <link rel="stylesheet" href="/pokemonarena/arena.css" />
   <link rel="stylesheet" href="/pokemonarena/input.css" />
+  <link rel="stylesheet" href="/pokemonarena/audiobar.css" />
   <!-- The game library's origin: ONE constant for the whole site (see lib/asset_base.js). The ROM URL is built from it in js/romfetch.js. -->
   <script src="/lib/asset_base.js"></script>
 </head>
@@ -17,8 +18,10 @@
     <a class="home" id="homeLink" href="/">&lsaquo; Home</a>
     <h1>Pokemon Arena</h1>
     <button id="fullBtn" class="textbtn iconbtn" type="button" aria-pressed="false" aria-label="Fullscreen" title="Fullscreen"><svg class="ic ic-enter" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5" /></svg><svg class="ic ic-exit" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9 4v5H4M20 9h-5V4M15 20v-5h5M4 15h5v5" /></svg></button>
+    <!-- the audio bar (volume, mute, menu music): js/audiobar.js fills this in; the same placeholder is in every page's header -->
+    <div id="audioBar" class="audiobar" data-page="hub" data-pending="1"></div>
     <div class="tools">
-      <button id="soundBtn" class="textbtn" type="button" aria-pressed="false" title="Sound is off until you turn it on">Sound: off</button>
+      <button id="soundBtn" class="textbtn" type="button" title="Sound settings: volume, music, effects, soundtrack">Sound: on</button>
       <button id="controlsBtn" class="textbtn" type="button" title="Keyboard, controller and touch settings">Controls</button>
     </div>
   </header>
@@ -58,7 +61,7 @@
     </div>
   </main>
 
-  <p id="onlineLink"><a class="textbtn" id="playFriend" href="/pokemonarena/battle.html?online=1">Play a friend online</a></p>
+  <p id="onlineLink"><a class="textbtn" id="playFriend" href="/pokemonarena/battle.html?online=1">Play online</a> <button class="textbtn" id="openToggle" type="button" aria-pressed="false" aria-label="Open to battles" title="Open to battles: list your trainer name and online record on public servers so anyone using Play online can challenge you while you are in the hub or in a battle against the computer. The first time you switch it on, it asks you to confirm.">Open: off</button></p>
   <p id="note" class="warn" hidden role="status"></p>
   <p id="romStatus" class="dim" role="status"></p>
   <p id="keys" class="dim">Arrows or WASD move &middot; Z / Enter = A (choose) &middot; X / Backspace = B (back) &middot; left / right change a setting &middot; click or tap works too</p>
@@ -73,6 +76,19 @@
   </div>
 
   <noscript><p class="warn">Pokemon Arena needs JavaScript.</p></noscript>
+  <!-- THE LOADING PANEL (#boot) IS REVEALED 400 ms AFTER THE PAGE STARTED, if the hub is still loading, so a repeat visit never flashes it (arena.css has the reason). The stylesheet does it with a
+       keyframe, which is all a visitor with no script gets, but `prefers-reduced-motion: reduce` switches every CSS animation off, and a module graph that is slow to arrive (this is a first visit on a
+       phone) has not started anything yet: so this timer does it too, before the modules below have loaded. data-slow is what arena.css shows the panel for; the #live text is what a screen reader hears
+       as the panel appears (the panel itself is out of the accessibility tree until then). js/boot.js takes the text back when the panel goes, and shows the panel at once on Try again. -->
+  <script>
+    setTimeout(function () {
+      var b = document.body;
+      if (b.getAttribute('data-state') !== 'boot') return;
+      b.setAttribute('data-slow', '1');
+      var live = document.getElementById('live');
+      if (live && !live.textContent) live.textContent = 'Loading the game file. This can take a moment.';
+    }, Math.max(0, 400 - performance.now()));
+  </script>
   <script type="module" src="/pokemonarena/js/boot.js"></script>
 </body>
 </html>

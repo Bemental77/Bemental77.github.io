@@ -12,7 +12,8 @@
 // on, a move turn is "X used MOVE!" -> the move's ROM animation (a blocking 'moveanim' step; ANIM.md) -> the target's blink and HP drain -> the messages,
 // status / stat / weather effects play their ROM animations the same way, a Pokemon comes out of a ROM ball and the foe's front picture swaps at the
 // ROM's own times (anim_mon.js). An animation the animator reports as 'none', or animations switched off, leave exactly the behaviour below.
-// scene.animInfo() says what played and what the animator reported for each. hooks.onSound(index, pan) receives the ROM song-table index (and pan -127..127) of
+// scene.animInfo() says what played and what the animator reported for each; its `log` is the list of animation PROBLEMS (a throw, a cut-off run: the tests and the browser suite require it empty), its
+// `notes` the benign events (a prepared effect made again because the screen changed: `restale`; a prewarm given up for a full engine pool: `shed`). hooks.onSound(index, pan) receives the ROM song-table index (and pan -127..127) of
 // every sound an animation plays, so the page's audio director can play it; hooks.onCry(species, pan) is a Pokemon cry an animation script starts (the page plays it through the sound
 // system's effects bus; the engine does not model the cry's length). NOT done: the ROM's per-species motion routines (frontAnimId / backAnimId)
 // are not run, so a Pokemon does not move on send-out; the ball's arc and the release timings are chosen by eye.
@@ -100,7 +101,7 @@ export function createScene(opts) {
   // falls back to the old lunge + blink. The animator's sides are SCREEN sides: 0 = the player's battler (bottom left), 1 = the foe's (top right).
   let animator = opts.animator || null;
   const animCfg = () => { const c = opts.anim && typeof opts.anim.get === 'function' ? opts.anim.get() : opts.anim; return c && c.on ? c : null; };
-  const A = { run: null, step: null, n: 0, seed: (opts.animSeed >>> 0) || 1, mon: [null, null], balls: [null, null], recalled: -1, ballOk: null, charging: [0, 0], spInfo: new Map(), log: [], coverage: { exact: 0, approx: 0, fallback: 0, none: 0 }, byId: {}, played: 0, sounds: 0, cries: 0, sysPlayed: 0, lastMon: [null, null], sysLog: [], skipped: 0, mute: false, skipReq: false };
+  const A = { run: null, step: null, n: 0, seed: (opts.animSeed >>> 0) || 1, mon: [null, null], balls: [null, null], recalled: -1, ballOk: null, charging: [0, 0], spInfo: new Map(), log: [], notes: [], coverage: { exact: 0, approx: 0, fallback: 0, none: 0 }, byId: {}, played: 0, sounds: 0, cries: 0, sysPlayed: 0, lastMon: [null, null], sysLog: [], skipped: 0, mute: false, skipReq: false };
   const screenSide = (side) => (side === viewSide ? 0 : 1);
   const speciesAnim = (sp) => { let v = A.spInfo.get(sp); if (v === undefined) { try { v = speciesAnimInfo(ui.rom, sp); } catch (_e) { v = null; } A.spInfo.set(sp, v); } return v; };
   const animMix = (a, b) => ((Math.imul(a ^ 0x9e3779b9, 0x85ebca6b) ^ Math.imul(b + 0x7f4a7c15, 0xc2b2ae35)) >>> 0);
@@ -862,10 +863,23 @@ export function createScene(opts) {
   const sysSeed = () => animMix(A.seed, 0x5eed);         // ONE seed for the hidden pre-roll of every event of a battle, so events that start from the same parties share the engine's pre-roll cache
   const isReady = (P) => { if (!P.ready && P.h && P.h.ready) P.ready = true; return P.ready; };
   const unpend = (P) => { A.pend = A.pend.filter((x) => x !== P); };
+  // THE PREWARM IS THE FIRST TO GO. startSysIntro hands the opening's battle state to a 'battle' handle that holds an engine until its pre-roll is done, and pumpSys serves the events before it, so on a slow
+  // machine it can still be pending when the first events are being prepared. The pool of three then holds the run that plays or waits, two prepared events and the prewarm: four, and the prepare of the third
+  // event throws "the system engine pool is exhausted" -- that effect was then not prepared ahead and started late (reproduced with the real animator on the deterministic clock, seeds 2-5 with the player
+  // switching on purpose, on the committed HEAD scene too; ANIM.md "Round 8"). The prewarm only fills the battle-state cache, which the first event's own pre-roll fills as well, so it is the one to give up:
+  // a prepare that throws "pool is exhausted" while one is pending disposes it and prepares again once (a second throw is the caller's, and is logged). Every other prepare, and every other fault, is untouched. Noted in animInfo().notes / .shed, not logged.
+  function prepareHandle(id, ctx, warm) {
+    try { return animator.prepare('system', id, ctx); } catch (e) {
+      const w = warm ? null : A.pend.find((x) => x.warm);
+      if (!w || !/pool is exhausted/.test(String(e && e.message))) throw e;           // only THIS fault: any other throw would leak a second engine slot if the prepare ran again (battle_sys.js SystemRun does not release its slot when its constructor throws)
+      dropPrep(w); A.shed = (A.shed | 0) + 1; A.notes.push('system ' + id + ' prepare() threw (' + String(e && e.message ? e.message : e).slice(0, 60) + '): the prewarm was given up and it was prepared again');
+      return animator.prepare('system', id, ctx);
+    }
+  }
   function newPrep(id, ctx, warm) {
     const P = { id, h: null, run: null, ready: false, failed: false, warm: !!warm };
     try {
-      if (typeof animator.prepare === 'function') { P.h = animator.prepare('system', id, ctx); A.pend.push(P); }
+      if (typeof animator.prepare === 'function') { P.h = prepareHandle(id, ctx, warm); A.pend.push(P); }
       else if (warm) return null;
       else { P.run = animator.start('system', id, ctx); P.ready = true; }
     } catch (e) { A.log.push('system ' + id + ' prepare() threw: ' + String(e && e.message ? e.message : e).slice(0, 80)); return null; }
@@ -880,8 +894,34 @@ export function createScene(opts) {
     if (P.ready) unpend(P);
   }
   // the context of one mid-battle event (ids 2..9), built from what the scene shows NOW (HP, status, shininess, nicknames) so the first frame is the scene's own picture
-  function eventCtx(st, kind, id) {
-    const mine = st.side === viewSide, other = st.side ^ 1, cur = (side) => S.disp[side] || A.lastMon[side];
+  // THE STALE-PICTURE DEFECT (reported: "when pokemon get hit or faint, or after they switch out and the new pokemon gets hit, it shows the old pokemon briefly, and the health bars go wrong"). Every event is
+  // PREPARED AHEAD (prepareSys), while the steps before it are still to play; the scene's displayed Pokemon (S.disp) changes only when a send-out / recall / faint EFFECT FINISHES (finishSysEvent), and a recall
+  // leaves the slot empty with the recalled Pokemon in A.lastMon. So an effect prepared behind a switch was built from the OLD Pokemon (its species, its HP bar), and then played, as prepared, for the NEW one:
+  // Quilava's picture and a full bar for the whole blink of Jirachi's hit (reproduced frame by frame, see ANIM.md "Round 7"). A drain does not wait for its end either: runStep 'drain' writes d.hp on EVERY frame
+  // of the bar (hpBarStep), so an effect prepared while a bar is moving is seeded with a MID-DRAIN value, which is neither the old bar nor the new one. Two fixes, both needed:
+  //  1. eventCtx is given the display state PROJECTED through the steps ahead of the event (proj, built by projectStep as prepareSys walks the queue): the Pokemon that WILL be there, with a drain's END value.
+  //     It is used for every Pokemon the effect DRAWS (drawsLead): both sides of a hit, a faint and a recall, and the OTHER side of a send-out. The side that SENDS OUT is the Pokemon being replaced and no frame of
+  //     the effect shows it (every frame of a send-out is identical for any HP or species of it, ANIM.md "Round 7b"), so that one keeps the plain read of the display the effect was measured with.
+  //  2. sysEventStart re-checks a prepared effect against what is on screen NOW (ctxSig, over the same Pokemon) and prepares it again if they differ (a drain that finished meanwhile, a case nobody foresaw): a
+  //     late picture is a brief hold of the previous one (A.waited), a wrong picture is the defect.
+  const drawsLead = (kind) => kind !== 'sendout';
+  const ctxSig = (ctx, kind, st) => JSON.stringify(drawsLead(kind) ? [ctx.foe, ctx.player] : (st.side === viewSide ? [ctx.foe, null] : [null, ctx.player]));
+  // what differs between two signatures, for the diagnostics: 'player.hp 175->40'
+  const sigDiff = (a, b) => { try { const x = JSON.parse(a), y = JSON.parse(b), out = []; ['foe', 'player'].forEach((k, i) => { const m = x[i] || {}, n = y[i] || {}; for (const f of new Set([...Object.keys(m), ...Object.keys(n)])) if (JSON.stringify(m[f]) !== JSON.stringify(n[f])) out.push(k + '.' + f + ' ' + JSON.stringify(m[f]) + '->' + JSON.stringify(n[f])); }); return out.slice(0, 4).join(', '); } catch (_e) { return ''; } };
+  // what a step does to the Pokemon on screen, applied to proj = [side 0, side 1] (undefined = whatever S.disp shows; null = nobody; else a Pokemon record)
+  function projectStep(proj, step) {
+    if (!step) return;
+    const t = step.t === 'sysevent' ? step.orig : step.t, k = step.t === 'sysevent' ? step.kind : null;
+    if (t === 'slidein' || k === 'sendout') proj[step.side] = step.mon;
+    else if (t === 'slideout' || k === 'recall') proj[step.side] = null;
+    else if (t === 'drain') {                      // an HP bar that is draining (or filling) ends at st.to, but S.disp[side].hp is the bar's value THIS FRAME (runStep 'drain' sets it every frame): read mid-drain it is neither the old
+      const base = proj[step.side] !== undefined ? proj[step.side] : (S.disp[step.side] || A.lastMon[step.side]);       // bar nor the new one, and a picture seeded with it shows a bar that went back up for the length of the effect (the second half of the defect)
+      if (base && Number.isInteger(step.to)) proj[step.side] = Object.assign({}, base, { hp: step.to });
+    }
+  }
+  function eventCtx(st, kind, id, proj) {
+    const mine = st.side === viewSide, other = st.side ^ 1;
+    const cur = (side) => { const pm = proj && (side !== st.side || drawsLead(kind)) ? proj[side] : undefined; return pm || S.disp[side] || A.lastMon[side]; };
     const lead = cur(st.side) || (kind === 'sendout' ? st.mon : null), foeOther = cur(other);
     if (!lead || !foeOther) return null;
     const own = pspec(lead, kind === 'faint' ? { hp: 0 } : undefined), oth = pspec(foeOther);
@@ -891,24 +931,27 @@ export function createScene(opts) {
     if (opts.sysClock) ctx.clock = opts.sysClock;
     return ctx;
   }
-  const makeSysRun = (st, kind, id) => { const ctx = eventCtx(st, kind, id); return ctx ? newPrep(id, ctx, false) : null; };
+  const makeSysRun = (st, kind, id, proj) => { const ctx = eventCtx(st, kind, id, proj); const P = ctx ? newPrep(id, ctx, false) : null; if (P) P.sig = ctxSig(ctx, kind, st); return P; };
   // the NEXT system event of the queue gets its handle as soon as it is foreseeable (the queue is built when the engine's events arrive: a message, the move animation and the hit blink give it hundreds of ticks)
   function prepareSys() {
     if (!animator) return;
     if (!animCfg()) { for (const nx of S.queue) if (nx.prep) { dropPrep(nx.prep); nx.prep = undefined; } return; }
     let drain = false, ahead = 0;
+    const proj = [undefined, undefined];                // what each side will show when the events being prepared play (see eventCtx)
+    projectStep(proj, S.cur);                           // the step playing now may be a switch that has not finished
     for (let k = 0; k < Math.min(S.queue.length, 12); k++) {
       const nx = S.queue[k], kind = SYS_KIND[nx.t];
       if (kind) {
         if (nx.prep === undefined) {
           if (drain && kind !== 'faint') return;           // a bar drain before it changes the HP the picture must show (a faint is 0 anyway)
           const id = eventId(kind, nx.side, viewSide);
-          nx.prep = sysOn(id) ? makeSysRun(nx, kind, id) : null;
+          nx.prep = sysOn(id) ? makeSysRun(nx, kind, id, proj) : null;
         }
+        projectStep(proj, nx);
         if (nx.prep && ++ahead >= 2) return;               // the pool holds three engines: the playing run and two prepared ones
         continue;
       }
-      if (nx.t === 'drain') drain = true; else if (nx.t !== 'text' && nx.t !== 'moveanim' && nx.t !== 'pause') return;
+      if (nx.t === 'drain') { drain = true; projectStep(proj, nx); } else if (nx.t !== 'text' && nx.t !== 'moveanim' && nx.t !== 'pause') return;
     }
   }
   function beginSysRun(st) { A.step = st; A.played++; A.sysPlayed++; wireSys(st.run); }
@@ -916,6 +959,10 @@ export function createScene(opts) {
     const id = eventId(kind, st.side, viewSide);
     let P = st.prep; st.prep = null;
     if (st.noSys || !sysOn(id)) { dropPrep(P); return false; }
+    if (P && P.sig !== undefined) {         // prepared ahead from what was on screen THEN (or what would be): is it still what is on screen now?
+      const fresh = eventCtx(st, kind, id), now = fresh && ctxSig(fresh, kind, st);
+      if (fresh && now !== P.sig) { const why = sigDiff(P.sig, now); dropPrep(P); P = null; A.restale = (A.restale | 0) + 1; A.notes.push('system ' + id + ' stale: ' + why); }       // benign (a brief hold, never a wrong picture): counted and noted, NOT in A.log, which is the list of animation PROBLEMS
+    }
     if (!P) P = makeSysRun(st, kind, id);
     if (!P) return false;
     st.orig = st.t; st.t = 'sysevent'; st.kind = kind; st.id = id; st.n = 0; st.P = P; st.run = null;
@@ -1728,7 +1775,7 @@ export function createScene(opts) {
     setAnimator: (a) => { animator = a || null; },
     // AN1: what the animation layer did this battle (the page's diagnostics and the tests): how many animations the animator played, what it said about each
     // (exact | approx | fallback | none, by "kind:id"), sounds forwarded, presses that skipped, the front-picture swaps in flight, and the problems it logged
-    animInfo: () => ({ active: !!animCfg(), animator: !!animator, played: A.played, sounds: A.sounds, cries: A.cries, sys: A.sysPlayed, waited: A.waited, skipped: A.skipped, coverage: Object.assign({}, A.coverage), byId: Object.assign({}, A.byId), running: A.step ? { kind: A.step.kind, id: A.step.id, n: A.step.n } : null, mon: A.mon.map((m) => (m ? { t: m.t, len: m.len } : null)), log: A.log.slice() }),
+    animInfo: () => ({ active: !!animCfg(), animator: !!animator, played: A.played, sounds: A.sounds, cries: A.cries, sys: A.sysPlayed, waited: A.waited, restale: A.restale | 0, shed: A.shed | 0, skipped: A.skipped, coverage: Object.assign({}, A.coverage), byId: Object.assign({}, A.byId), running: A.step ? { kind: A.step.kind, id: A.step.id, n: A.step.n } : null, mon: A.mon.map((m) => (m ? { t: m.t, len: m.len } : null)), log: A.log.slice(), notes: A.notes.slice() }),
     choose: { move: chooseMove, party: chooseParty, result: chooseResult, action: actionActivate, preview: previewToggle },
     // ST1: the recap. setCareer({ state: 'saved' | 'duplicate' | 'none' | 'error', profileName, callouts, stats, note, note2 }) tells the RECORD page what was written (the page calls it when the store has answered)
     setCareer(info) { S.career = info && typeof info === 'object' ? { ...info } : null; S.careerVer++; },

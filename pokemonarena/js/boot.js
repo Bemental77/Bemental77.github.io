@@ -61,6 +61,11 @@ export function writeSettings(storage, quick, team) {
 const hasDom = typeof document !== 'undefined' && typeof window !== 'undefined';
 
 async function main() {
+  // THE ROM STARTS COMING NOW, in parallel with the modules below (it used to wait for them: ~35 ms on a repeat visit, 100+ ms on a first one). A copy this browser already verified is read
+  // back from its own cache (romcache.js) instead of downloaded; `deferVerify` lets the first frame go up before the SHA-256 re-check, which runs right after it (see start()).
+  const early = { got: 0, total: 0, onProgress: null };
+  const earlyLoad = loadVerifiedRom({ deferVerify: true, onProgress: (got, total) => { early.got = got; early.total = total; if (early.onProgress) early.onProgress(got, total); } });
+  earlyLoad.catch(() => { /* load() awaits it and shows the error screen */ });
   const [{ createInput }, nav, soundMod] = await Promise.all([import('./input.js').catch(() => ({})), import('./uinav.js').catch(() => ({})), import('./sound_system.js').catch((e) => { console.warn('[sound] sound_system.js did not load; the old switch is used:', e); return {}; })]);
   const $ = (id) => document.getElementById(id);
   const canvas = $('hub'), ctx = canvas.getContext('2d', { alpha: false });
@@ -71,9 +76,29 @@ async function main() {
   let pushed = 0;                                // history entries this page load added for hub screens
   let model = null, screen = null, ui = null, pack = null, romBytes = null, store = null, touchPad = false, dialogOpen = false, errNav = null;
   const storage = (() => { try { return window.localStorage; } catch (_e) { return null; } })();
+  // WHO holds the "a dialog is up" state (the hub ignores its own keys and pointer while it is true): the Sound panel, the Controls dialog, and the Open-to-battles dialogs can be up TOGETHER (a
+  // challenge arrives while Controls is open), so it is a SET of owners, not one boolean: closing one dialog never un-pauses the page behind another that is still open
+  const dlgOwners = new Set();
+  const setDialog = (who, v) => { if (v) dlgOwners.add(who); else dlgOwners.delete(who); dialogOpen = dlgOwners.size > 0; };
+
+  /* ---- the loading panel's reveal ---- */
+  // THE LOADING PANEL ONLY APPEARS IF LOADING TAKES A MOMENT, so a repeat visit (up in ~110 ms) never flashes it. The FIRST reveal, 400 ms after the page started, is not made here: it is a stylesheet
+  // keyframe (arena.css: pure CSS, works with no script) and a tiny inline timer in index.html (data-slow on <body>, plus the #live message) that runs before this module graph has loaded. The timer is
+  // there because `prefers-reduced-motion: reduce` switches every CSS animation off with !important, which left those visitors an EMPTY page for the whole first download. What is left for this file:
+  // a load() after the page's first 400 ms (Try again) shows the panel AT ONCE (the inline timer has long since run, and found the page in the error state); and the #live message is taken back when the
+  // panel goes. Until the panel is revealed it is visibility:hidden, i.e. not in the accessibility tree, and a live region that appears already full is not reliably announced; so as it appears the
+  // persistent #live region (there all along) says what is going on.
+  const REVEAL_MS = 400, REVEAL_SAYS = 'Loading the game file. This can take a moment.';       // the same text is in index.html's inline timer
+  function armReveal() {
+    if (performance.now() < REVEAL_MS) return;
+    document.body.dataset.slow = '1';
+    if (els.live && els.live.textContent !== REVEAL_SAYS) els.live.textContent = REVEAL_SAYS;
+  }
+  function disarmReveal() { if (els.live && els.live.textContent === REVEAL_SAYS) els.live.textContent = ''; }
 
   /* ---- errors ---- */
   function showError({ title, message, detail, kind, retry, tech }) {
+    disarmReveal();
     hook.state = 'error'; hook.kind = kind || 'internal'; hook.error = message;
     canvas.hidden = true;
     showRomError(els, { kind: kind || 'internal', title, message, detail, retry, tech: tech || '' });          // W1 D7: the one shared error experience (rom_error.js)
@@ -105,8 +130,10 @@ async function main() {
   // MU3: the mixer, the SOUND panel and the music live in sound_system.js (ON by default, audio starts at the first click / tap / key). The old switch below only runs if that file did not load.
   const soundSys = (() => { try { return typeof soundMod.createSoundSystem === 'function' ? soundMod.createSoundSystem({
     page: 'hub', button: els.sound, input: () => input, enableDomNav: nav.enableDomNav, ownNav: true,
-    onPanelOpen: () => { dialogOpen = true; },
-    onPanelClose: () => { dialogOpen = false; if (model) { model.setSound(soundSys.audible()); dirty = true; } setTimeout(() => { focusCanvas(); }, 0); },
+    onPanelOpen: () => { setDialog('sound', true); },
+    onPanelClose: () => { setDialog('sound', false); if (model) { model.setSound(soundSys.audible()); dirty = true; } setTimeout(() => { if (!dialogOpen) focusCanvas(); }, 0); },
+    onMenuOpen: () => { setDialog('musicmenu', true); },           // the audio bar's music list is a dialog: the menu behind it takes no key or pad press while it is open (no focusCanvas on close: Esc gives the focus to the music button)
+    onMenuClose: () => { setDialog('musicmenu', false); },
   }) : null; } catch (e) { console.warn('[sound] the sound system could not start; the old switch is used:', e); return null; } })();
   const snd = { ctx: null, cry: new Map(), plays: 0 };
   function updateSoundButton() { if (soundSys) return; const on = cries.isSoundOn(storage || undefined); els.sound.textContent = 'Sound: ' + (on ? 'on' : 'off'); els.sound.setAttribute('aria-pressed', on ? 'true' : 'false'); }
@@ -145,8 +172,8 @@ async function main() {
   /* ---- the Controls panel: the shared dialog (controls_dialog.js), the same one the battle page and the team editor open ---- */
   const ctlDlg = input ? createControlsDialog({
     input, enableDomNav: nav.enableDomNav, el: els.dialog,
-    onOpen: () => { dialogOpen = true; },
-    onClose: () => { dialogOpen = false; setTimeout(() => { focusCanvas(); }, 0); },   // the key that closed the dialog must not also act on the menu behind it
+    onOpen: () => { setDialog('controls', true); },
+    onClose: () => { setDialog('controls', false); setTimeout(() => { if (!dialogOpen) focusCanvas(); }, 0); },   // the key that closed the dialog must not also act on the menu behind it
   }) : null;
   async function openControls() {
     if (dialogOpen || !ctlDlg) return;
@@ -202,8 +229,11 @@ async function main() {
   // ST1: RESET RECORD was answered YES: the profile's battle record is emptied in the store (an automatic backup and a history entry are taken there), then the list is read again
   async function resetRecord(profileId) {
     if (!store) { model.notify(['The record cannot be reset right now.', 'Storage is not available.']); dirty = true; return; }
-    try { await store.resetRecord(profileId); hook.recordReset = (hook.recordReset | 0) + 1; await refreshData(); }
-    catch (e) { model.notify(['The record could not be reset:', String(e && e.message ? e.message : e).slice(0, 40)]); dirty = true; }
+    try {
+      await store.resetRecord(profileId); hook.recordReset = (hook.recordReset | 0) + 1;
+      if (hook.presence) hook.presence.refresh().catch(() => { /* the listing catches up at its next refresh */ });          // OPEN TO BATTLES lists the online record: the record just emptied must leave the board now, not when the tab is next shown
+      await refreshData();
+    } catch (e) { model.notify(['The record could not be reset:', String(e && e.message ? e.message : e).slice(0, 40)]); dirty = true; }
   }
   async function refreshData() {
     if (!store || !pack || !model) return;
@@ -318,19 +348,33 @@ async function main() {
   }
 
   /* ---- load ---- */
-  const load = async () => {
+  // The loading panel is revealed only if loading takes a moment (armReveal above, and arena.css: 400 ms), so a repeat visit never flashes it; everything below still runs the same either way.
+  const load = async (pre) => {
     hook.state = 'boot'; els.err.hidden = true; els.boot.hidden = false; canvas.hidden = true; els.bar.value = 0; els.status.textContent = '';
     document.body.dataset.state = 'boot';
+    armReveal();
     els.bootText.textContent = 'Fetching the ROM from this site...';
     try {
-      const loaded = await loadVerifiedRom({ onProgress: (got, total) => { els.bar.value = got / total; els.bootText.textContent = 'Loading ROM  ' + mbs(got) + ' / ' + mbs(total) + ' MB'; } });
+      const progress = (got, total) => { els.bar.value = got / total; els.bootText.textContent = 'Loading ROM  ' + mbs(got) + ' / ' + mbs(total) + ' MB'; };
+      let loaded;
+      if (pre) { if (early.total) progress(early.got, early.total); early.onProgress = progress; try { loaded = await pre; } finally { early.onProgress = null; } }
+      else loaded = await loadVerifiedRom({ onProgress: progress, deferVerify: true });
       els.bar.value = 1; els.bootText.textContent = 'Checking the ROM and decoding its art...';
-      await new Promise((r) => setTimeout(r, 0));
+      if (!loaded.cached) await new Promise((r) => setTimeout(r, 0));          // lets the "Checking..." text paint on a first visit; a recalled copy has nothing to wait for
       return loaded;
     } catch (e) { showError(romError(e)); return null; }
   };
 
-  async function start({ bytes, sha256 }) {
+  // The SHA-256 of a RECALLED copy did not match (romfetch.js has already dropped the stored copy): reload ONCE through the full path, which downloads and verifies the real ROM and ends at the real error
+  // screen when the ROM on the server is the bad one. A second failure in this tab (sessionStorage arena.rom.retry) shows the error instead, so this can never loop. Used by the re-check after the first
+  // frame AND by start() when the copy was so damaged that the menu could not be built at all; `hook.rom` does not exist yet in the second case.
+  function recalledCopyFailed(e) {
+    let tried = false; try { tried = window.sessionStorage.getItem('arena.rom.retry') === '1'; window.sessionStorage.setItem('arena.rom.retry', '1'); } catch (_e) { /* blocked: treated as a first try */ }
+    hook.rom = Object.assign(hook.rom || { cached: true, verified: false }, { error: String(e && e.message ? e.message : e).slice(0, 160) });
+    if (!tried) window.location.reload(); else showError(romError(e));
+  }
+
+  async function start({ bytes, sha256, cached, verify }) {
     try {
       romBytes = bytes;
       pack = loadPack(bytes, { verify: 'header', dexText: false });         // the SHA-256 was checked in loadVerifiedRom
@@ -338,7 +382,16 @@ async function main() {
       screen = createHubScreen(ui);
       const saved = readSettings(storage);
       model = createHubModel({ sound: soundSys ? soundSys.audible() : cries.isSoundOn(), mascot: pickMascot(pack, Math.floor(Date.now() / 86400000)), env: 0, quick: saved.quick, selection: saved.selection });
-    } catch (e) { showError(romError(e)); return; }
+    } catch (e) {
+      if (!verify) { showError(romError(e)); return; }
+      // A RECALLED copy only passed romcache.js's cheap checks (length, headers, cartridge header). One that is damaged INSIDE -- a table the menu decodes -- throws right here, before the re-check below is
+      // ever scheduled, and nothing else would drop it: every reload would read the same bytes and fail the same way, on an error screen with no Try again. So hash it now (the same verify() the
+      // re-check runs). A mismatch means the stored copy was bad (and is gone): recover through the full path once. A copy that hashes fine is the right ROM, so the failure is not the storage's.
+      let bad = null; try { await verify(); } catch (ve) { bad = ve; }
+      if (bad) recalledCopyFailed(bad); else showError(romError(e));
+      return;
+    }
+    disarmReveal();
     els.boot.hidden = true; els.err.hidden = true; canvas.hidden = false;
     document.body.dataset.state = 'ready';
     if (errNav) { try { errNav.disable(); } catch (_e) { /* ignore */ } }
@@ -349,17 +402,35 @@ async function main() {
     fit();
     wireInput();
     hook.state = 'ready'; hook.kind = null; hook.error = null; hook.sha256 = sha256;
+    hook.rom = { cached: !!cached, verified: !cached };
+    // a ROM that was just downloaded and verified (the usual end of a mismatch-triggered reload) clears the reload guard: the NEXT mismatch gets its one reload too
+    if (!cached) { try { window.sessionStorage.removeItem('arena.rom.retry'); } catch (_e) { /* ignore */ } }
+    // A RECALLED copy was trusted for the first frame (romcache.js: written by this origin after a full verification, headers and length re-checked); its SHA-256 is re-checked right AFTER that
+    // frame has been painted (hashing hands 32 MB to WebCrypto, which copies it on this thread). If it fails the stored copy is already dropped (romfetch.js) and the page reloads ONCE through
+    // the full path, which shows the real error screen when the ROM on the server is the bad one.
+    if (verify) {
+      const recheck = () => verify().then(() => { hook.rom.verified = true; try { window.sessionStorage.removeItem('arena.rom.retry'); } catch (_e) { /* ignore */ } }, recalledCopyFailed);
+      hook.rom.recheck = recheck;
+      window.requestAnimationFrame(() => window.setTimeout(recheck, 0));
+    }
     makeHook();
-    if (soundSys) { soundSys.setRom({ bytes, pack }); soundSys.director.set('hub'); window.__arenaSound = soundSys; soundSys.mixer.on((ev) => { if (ev.type === 'mute') { model.setSound(soundSys.audible()); dirty = true; } }); }       // MU3: the ROM's music (nothing is heard before the first click / tap / key); the SOUND row follows the M key
+    if (soundSys) { soundSys.setRom({ bytes, pack }); soundSys.menuMusic.set('hub'); window.__arenaSound = soundSys; soundSys.mixer.on((ev) => { if (ev.type === 'mute') { model.setSound(soundSys.audible()); dirty = true; } }); }       // MU3: the ROM's music (nothing is heard before the first click / tap / key); the SOUND row follows the M key
     focusCanvas();
     runLoop();
     openProfiles();                                  // the team list fills in when the store answers; the menu is usable at once
+    // OPEN TO BATTLES (presence_boot.js): the switch beside Play online, and a "<name> wants to battle you" dialog whatever the player is doing; loaded after the menu is up, so it can never delay or break it
+    import('./presence_boot.js').then((m) => {
+      hook.presence = m.mountPresence({
+        win: window, doc: document, pack, input, enableDomNav: nav.enableDomNav, navigate, button: $('openToggle'), focusHome: focusCanvas,
+        onDialog: { open: (which) => { setDialog('presence:' + which, true); }, close: (which) => { setDialog('presence:' + which, false); setTimeout(() => { if (!dialogOpen) focusCanvas(); }, 0); } },
+      });
+    }).catch((e) => { console.warn('[presence] not available', e); const b = $('openToggle'); if (b) b.hidden = true; });      // arena.css gives #openToggle[hidden] its own display:none: .textbtn's display would otherwise win and leave a dead switch
     document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshData(); });
     window.addEventListener('pageshow', (e) => { if (e.persisted) refreshData(); });
     window.addEventListener('pagehide', saveSettings);
   }
 
-  let loaded = await load();
+  let loaded = await load(earlyLoad);
   els.retry.addEventListener('click', async () => { loaded = await load(); if (loaded) await start(loaded); });
   if (!loaded) return;
   await start(loaded);

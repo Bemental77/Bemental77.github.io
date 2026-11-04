@@ -1,6 +1,6 @@
 {
  "app": "pokemonarena",
- "schemaVersion": 3,
+ "schemaVersion": 4,
  "id": "p_fixture01",
  "rev": 7,
  "createdAt": 1700000000000,
@@ -204,6 +204,12 @@
     "f": 0
    },
    "hard": {
+    "w": 0,
+    "l": 0,
+    "dr": 0,
+    "f": 0
+   },
+   "online": {
     "w": 0,
     "l": 0,
     "dr": 0,

@@ -28,7 +28,8 @@ if (!fs.existsSync(ROM_PATH)) { console.error('ROM not found: ' + ROM_PATH); pro
 const rom = fs.readFileSync(ROM_PATH);
 const J = (x) => JSON.stringify(x);
 const clone = (o) => JSON.parse(JSON.stringify(o));
-const FIXREC = JSON.parse(fs.readFileSync(path.join(FX, 'profile-v3-current.json'), 'utf8'));
+const FIXREC = JSON.parse(fs.readFileSync(path.join(FX, 'profile-v4-current.json'), 'utf8'));
+const FIXV3 = JSON.parse(fs.readFileSync(path.join(FX, 'profile-v3-current.json'), 'utf8'));          // the profile a user of the last build has stored: schema 3, upgraded the first time this build loads it
 
 let passed = 0, failed = 0;
 const failures = [];
@@ -83,6 +84,31 @@ async function suite(M) {
     add('pages/the-reset-question-names-the-trainer-and-has-a-safe-default-note', /RESET ASH'S RECORD\?/.test(txt(RM.buildResetConfirm('Ash'))) && /safe answer/.test(txt(RM.buildResetConfirm('Ash'))) ? true : txt(RM.buildResetConfirm('Ash')));
     add('pages/the-model-is-pure-and-deterministic', J(RM.buildRecordPages(stats(), { ...names, tzMinutes: 0 })) === J(pages) && J(JSON.parse(J(pages))) === J(pages) ? true : 'differs');
     add('pages/the-input-is-not-modified', (() => { const s = stats(); const a = J(s); RM.buildRecordPages(s, names); return J(s) === a ? true : 'modified'; })());
+    // ONLINE (schema 4): a row of its own, only once the trainer has fought a person; a record with none is laid out exactly as it always was
+    {
+      const yOf = (pg, label) => { const l = pg.lines.find((x) => x.cells[0] && x.cells[0].t === label); return l ? l.y : null; };
+      add('pages/no-online-battle-means-no-ONLINE-row-and-the-old-layout-to-the-pixel', J([yOf(pages[1], 'EASY'), yOf(pages[1], 'NORMAL'), yOf(pages[1], 'HARD'), yOf(pages[1], 'ONLINE'), yOf(pages[1], 'WIN RATE'), pages[1].lines.length]) === J([48, 61, 74, null, 92, 7]) ? true : J(pages[1].lines.map((l) => [l.y, l.cells[0].t])));
+      const on = stats(); on.byCpu.online = { w: 2, l: 1, dr: 0, f: 1 };
+      const op = RM.buildRecordPages(on, { ...names, tzMinutes: 0 });
+      add('pages/online-battles-get-an-ONLINE-row-and-the-CPU-rows-move-up-to-make-room', /ONLINE \| 2 \| 1 \| 0 \| 1/.test(txt(op[1])) && J([yOf(op[1], 'EASY'), yOf(op[1], 'NORMAL'), yOf(op[1], 'HARD'), yOf(op[1], 'ONLINE'), yOf(op[1], 'WIN RATE')]) === J([42, 55, 68, 81, 94]) && /WIN RATE \| CPU 60% {2}ONLINE 50%/.test(txt(op[1])) ? true : txt(op[1]));
+      // THE WIN RATE LINE. Without an ONLINE row it is the per-level rate of every CPU level with a battle, exactly as it always was; with one it is the CPU rate (the three levels together) and the
+      // ONLINE rate: four names with their rates do not fit the 154 px cell (207 px in the ROM font), and a record of nothing but online battles used to read "WIN RATE -".
+      const rateLine = (st) => { const pg = RM.buildRecordPages(st, { ...names, tzMinutes: 0 })[1]; const l = pg.lines.find((x) => x.cells[0] && x.cells[0].t === 'WIN RATE'); return l ? l.cells[1].t : null; };
+      const onlineOnly = (o) => { const q = stats(); q.wins = o.w; q.losses = o.l; q.draws = o.dr; q.forfeits = o.f; q.streak = 0; q.best = o.w; q.byFormat = { '3v3': { ...o }, '6v6': { w: 0, l: 0, dr: 0, f: 0 } }; q.byCpu = { easy: { w: 0, l: 0, dr: 0, f: 0 }, normal: { w: 0, l: 0, dr: 0, f: 0 }, hard: { w: 0, l: 0, dr: 0, f: 0 }, online: { ...o } }; return q; };
+      add('pages/a-record-of-nothing-but-online-battles-shows-the-ONLINE-rate-and-not-a-dash', rateLine(onlineOnly({ w: 2, l: 0, dr: 0, f: 0 })) === 'ONLINE 100%' && rateLine(onlineOnly({ w: 0, l: 3, dr: 0, f: 0 })) === 'ONLINE 0%' ? true : J([rateLine(onlineOnly({ w: 2, l: 0, dr: 0, f: 0 })), rateLine(onlineOnly({ w: 0, l: 3, dr: 0, f: 0 }))]));
+      add('pages/...and-it-rounds-half-up-like-every-other-rate (2 of 3 is 67%, 1 of 3 is 33%, a quit is a battle)', rateLine(onlineOnly({ w: 2, l: 1, dr: 0, f: 0 })) === 'ONLINE 67%' && rateLine(onlineOnly({ w: 1, l: 1, dr: 0, f: 1 })) === 'ONLINE 33%' && rateLine(onlineOnly({ w: 1, l: 0, dr: 1, f: 0 })) === 'ONLINE 50%' ? true : J([rateLine(onlineOnly({ w: 2, l: 1, dr: 0, f: 0 })), rateLine(onlineOnly({ w: 1, l: 1, dr: 0, f: 1 })), rateLine(onlineOnly({ w: 1, l: 0, dr: 1, f: 0 }))]));
+      add('pages/with-CPU-and-online-battles-the-line-gives-both (CPU = the three levels together)', rateLine(on) === 'CPU 60%  ONLINE 50%' ? true : rateLine(on));
+      add('pages/without-an-online-battle-the-line-is-per-CPU-level-or-a-dash-as-it-always-was', rateLine(stats()) === 'EASY 100%  NORMAL 67%  HARD 0%' && rateLine((() => { const q = stats(); q.byCpu = { easy: { w: 0, l: 0, dr: 0, f: 0 }, normal: { w: 0, l: 0, dr: 0, f: 0 }, hard: { w: 0, l: 0, dr: 0, f: 0 }, online: { w: 0, l: 0, dr: 0, f: 0 } }; return q; })()) === '-' ? true : rateLine(stats()));
+      // every combination fits its cell
+      { const worst = []; for (const o of [{ w: 99, l: 0, dr: 0, f: 0 }, { w: 7, l: 0, dr: 0, f: 0 }, { w: 0, l: 9, dr: 0, f: 0 }]) for (const c of [0, 1]) { const q = onlineOnly(o); if (c) q.byCpu.hard = { w: 100, l: 0, dr: 0, f: 0 }; worst.push(q); }
+        const cut = worst.filter((q) => { const l = RM.buildRecordPages(q, names)[1].lines.find((x) => x.cells[0] && x.cells[0].t === 'WIN RATE'); return pd.fit(l.cells[1]).cut; }).length;
+        add('pages/the-WIN-RATE-line-with-an-ONLINE-row-fits-its-cell-at-100%-and-0%', cut === 0 ? true : cut + ' lines are cut'); }
+      add('pages/the-other-pages-do-not-change-for-an-online-record', J(op.filter((x) => x.id !== 'by')) === J(pages.filter((x) => x.id !== 'by')) ? true : 'another page moved');
+      const rc = stats();
+      rc.recent = [{ id: 'o1', at: 1700000000000, fmt: '3v3', cpu: 'online', res: 'w', turns: 12, mvp: 25, team: [25, 6], opp: 'Mallory' }, { id: 'c1', at: 1700000000000, fmt: '6v6', cpu: 'hard', res: 'l', turns: 30, mvp: 0, team: [25] }, ...rc.recent.slice(0, 3)];
+      const rp = RM.buildRecordPages(rc, { ...names, tzMinutes: 0 }).find((x) => x.id === 'recent0');
+      add('pages/recent-says-ONLINE-and-who-it-was-against (a CPU battle still says its level and its MVP)', /WON \| 23-11-14 \| 3V3 ONLINE \| 12 TURNS/.test(txt(rp)) && /VS Mallory/.test(txt(rp)) && !/MVP Pikachu/.test(txt(rp).split('\n')[1]) && /LOST \| 23-11-14 \| 6V6 HARD/.test(txt(rp)) && /NO MVP/.test(txt(rp).split('\n')[3]) ? true : txt(rp));
+    }
     // fit
     const cuts = [], over = [], outside = [];
     const inspect = (list, tag) => { for (const pg of list) for (const l of pg.lines) { const placed = []; for (const c of l.cells) { if (c.t === '') continue; const r = pd.fit(c); if (r.cut && !c.cutOk) cuts.push(tag + ' ' + pg.id + ' ' + J(c.t) + ' ' + r.w + '/' + c.w); const x0 = c.a === 'r' ? c.x + c.w - r.w : c.a === 'c' ? c.x + Math.floor((c.w - r.w) / 2) : c.x; const h = c.f === 'normal' ? 16 : 12; if (x0 < 0 || x0 + r.w > RM.PAGE_W || l.y + h > RM.PAGE_H + 2) outside.push(tag + ' ' + pg.id + ' ' + J(c.t) + ' x' + x0 + '+' + r.w + ' y' + l.y); for (const q of placed) if (!(x0 + r.w <= q[0] || q[0] + q[1] <= x0)) over.push(tag + ' ' + pg.id + ' ' + J(c.t)); placed.push([x0, r.w]); } } };
@@ -98,6 +124,8 @@ async function suite(M) {
     real.recent = Array.from({ length: 20 }, (_, i) => ({ id: 'w' + i, at: 1700000000000, fmt: '6v6', cpu: 'normal', res: 'f', turns: 300, mvp: spIds[i % 6], team: spIds.slice(0, 6) }));
     inspect(RM.buildRecordPages(real, { ...names, tzMinutes: 0 }), 'worst');
     inspect(RM.buildRecordPages(stats(), names), 'fixture'); inspect(RM.buildRecordPages(full, names), 'full');
+    { const wide = clone(real); wide.byCpu.online = { w: 99999, l: 99999, dr: 99999, f: 99999 }; wide.recent = wide.recent.map((r, i) => (i % 2 ? { ...r, cpu: 'online', opp: i % 4 === 1 ? 'WWWWWWWWWW' : 'MMMMMMM MM' } : r));
+      inspect(RM.buildRecordPages(wide, { ...names, tzMinutes: 0 }), 'online-worst'); }
     inspect([RM.buildResetConfirm('MISTYMIST'), ...nn, ...nu, ...nr, ...nl], 'notices');
     inspect(zp, 'empty');
     add('fit/no-cell-is-cut-for-realistic-worst-cases (234 wins, 99H play time, 6-digit totals, the longest species and legal moves, 20 forfeits of 300 turns)', cuts.length === 0 ? true : cuts.slice(0, 4).join(' | ') + ' (' + cuts.length + ')');
@@ -119,9 +147,23 @@ async function suite(M) {
     add('data/readHubData-gives-each-profile-its-record-pages-with-the-pack-names', me && me.record && me.record.battles === 5 && me.record.pages.length === 7 && me.record.resettable === true && /WIN RATE 60%/.test(txt(me.record.pages[0])) ? true : J(d.profiles.map((p) => p.id)));
     add('data/the-pages-are-plain-JSON-the-model-can-keep', J(JSON.parse(J(me.record.pages))) === J(me.record.pages) ? true : 'not plain');
     add('data/the-time-zone-option-moves-the-dates', /LAST BATTLE \| 23-11-14/.test(txt((await HD.readHubData(mem, pack, { tzMinutes: 0 })).profiles.find((p) => p.id === 'p_rec').record.pages[0])) && /LAST BATTLE \| 23-11-1[45]/.test(txt((await HD.readHubData(mem, pack, { tzMinutes: -720 })).profiles.find((p) => p.id === 'p_rec').record.pages[0])) ? true : 'same');
+    // A STORED v3 PROFILE WHOSE UPGRADE CANNOT BE WRITTEN (a full origin) is still listed, with its teams and its record: loadProfile used to throw, and the hub `continue`d past it
+    { const inner = ST.createMemoryAdapter({ name: 'rec-v3-' + process.pid + '-' + Math.random().toString(36).slice(2), durable: true });
+      let failing = false;
+      const wrapped = { ...inner, kind: 'memory', durable: true, readOnly: false, open: () => inner.open(), close: () => inner.close(), transact: (n, m, fn) => (failing && m === 'readwrite' ? Promise.reject(Object.assign(new Error('QuotaExceededError: the origin is full'), { name: 'QuotaExceededError' })) : inner.transact(n, m, fn)) };
+      const full = await ST.openStore({ adapter: wrapped, channel: false, deps });
+      const v3 = clone(FIXV3);
+      await inner.transact(['profiles'], 'readwrite', (tx) => tx.put('profiles', v3));
+      failing = true;
+      const dd = await HD.readHubData(full, pack, { tzMinutes: 0 });
+      const p3 = dd.profiles.find((p) => p.id === v3.id);
+      add('data/a-profile-whose-upgrade-cannot-be-written-is-still-listed-with-its-teams-and-its-record', p3 && p3.teams.length === v3.teams.length && p3.record.battles === 5 && p3.record.resettable === true && /BATTLES 5/.test(txt(p3.record.pages[0])) && dd.state === 'ready' ? true : J(dd.profiles.map((p) => p.id)) + ' ' + dd.state);
+      failing = false;
+      const dd2 = await HD.readHubData(full, pack, { tzMinutes: 0 });
+      add('data/...and-once-writes-work-again-it-is-upgraded-on-the-next-read', dd2.profiles.some((p) => p.id === v3.id && p.record.battles === 5) && (await inner.transact(['profiles'], 'readonly', (tx) => tx.get('profiles', v3.id))).schemaVersion === 4 ? true : 'not upgraded'); }
     const futP = d.profiles.find((p) => p.id === fut.id);
     add('data/a-profile-of-a-newer-build-gets-the-read-only-notice-and-no-reset', !futP || (futP.record && futP.record.resettable === false && /newer version/.test(txt(futP.record.pages[0]))) ? true : J(futP));
-    function readFut() { const f = clone(FIXREC); f.id = 'p_future'; f.schemaVersion = 4; f.stats = { surprise: 1 }; return f; }
+    function readFut() { const f = clone(FIXREC); f.id = 'p_future'; f.schemaVersion = 5; f.stats = { surprise: 1 }; return f; }        // one past the CURRENT schema (4 since online battles)
   });
 
   // ---------------------------------------------------------------------------------------------------------------------------- C. the model
@@ -326,6 +368,19 @@ for (const [name, ok] of res) report(name, ok);
 console.log(`  ${res.length} checks (${((Date.now() - t0) / 1000).toFixed(1)} s)`);
 
 const MUTANTS = [
+  ['R20 the ONLINE row is always shown', 'record_model.js', "const online = sum(stats.byCpu.online) > 0, y0 = online ? 42 : 48;", "const online = true, y0 = online ? 42 : 48;", ['pages/no-online-battle-means-no-ONLINE-row-and-the-old-layout-to-the-pixel']],
+  ['R21 the ONLINE row is never shown', 'record_model.js', "const online = sum(stats.byCpu.online) > 0, y0 = online ? 42 : 48;", "const online = false, y0 = online ? 42 : 48;", ['pages/online-battles-get-an-ONLINE-row-and-the-CPU-rows-move-up-to-make-room']],
+  ['R22 the CPU rows do not move up for the ONLINE row', 'record_model.js', "const online = sum(stats.byCpu.online) > 0, y0 = online ? 42 : 48;", "const online = sum(stats.byCpu.online) > 0, y0 = 48;", ['pages/online-battles-get-an-ONLINE-row-and-the-CPU-rows-move-up-to-make-room', 'fit/no-two-cells-overlap-and-all-are-inside-the-window']],
+  ['R23 the WIN RATE row stays where the ONLINE row is', 'record_model.js', "line(online ? 94 : 92,", "line(92,", ['pages/online-battles-get-an-ONLINE-row-and-the-CPU-rows-move-up-to-make-room', 'fit/no-two-cells-overlap-and-all-are-inside-the-window']],
+  ['R24 an online battle in RECENT does not say who it was against', 'record_model.js', "cell(r.cpu === 'online' ? 'VS ' + r.opp : r.mvp ?", "cell(r.mvp ?", ['pages/recent-says-ONLINE-and-who-it-was-against (a CPU battle still says its level and its MVP)']],
+  ['R25 every recent battle says VS (a CPU battle has no opponent name)', 'record_model.js', "cell(r.cpu === 'online' ? 'VS ' + r.opp : r.mvp ?", "cell(true ? 'VS ' + r.opp : r.mvp ?", ['pages/recent-says-ONLINE-and-who-it-was-against (a CPU battle still says its level and its MVP)', 'pages/a-battle-with-no-MVP-says-NO-MVP-and-a-long-team-ends-in-a-count']],
+  ['R26 an online battle is labelled with a CPU level in RECENT', 'record_model.js', "online: 'ONLINE' };", "online: 'NORMAL' };", ['pages/recent-says-ONLINE-and-who-it-was-against (a CPU battle still says its level and its MVP)']],
+  ['R27 the WIN RATE line ignores the ONLINE row (a dash for an online-only record)', 'record_model.js', "if (!online) rates =", "if (true) rates =", ['pages/a-record-of-nothing-but-online-battles-shows-the-ONLINE-rate-and-not-a-dash', 'pages/with-CPU-and-online-battles-the-line-gives-both (CPU = the three levels together)']],
+  ['R28 the CPU rate counts only the EASY level', 'record_model.js', "['easy', 'normal', 'hard'].reduce((a, k) =>", "['easy'].reduce((a, k) =>", ['pages/with-CPU-and-online-battles-the-line-gives-both (CPU = the three levels together)']],
+  ['R29 the ONLINE rate rounds down', 'record_model.js', "rateOf(stats.byCpu.online.w, sum(stats.byCpu.online))", "Math.floor(100 * stats.byCpu.online.w / sum(stats.byCpu.online))", ['pages/...and-it-rounds-half-up-like-every-other-rate (2 of 3 is 67%, 1 of 3 is 33%, a quit is a battle)']],
+  ['R30 a CPU rate of 0% is shown when there is no CPU battle', 'record_model.js', "(cpu.n > 0 ? 'CPU ' + rateOf(cpu.w, cpu.n) + '%  ' : '')", "('CPU ' + (cpu.n > 0 ? rateOf(cpu.w, cpu.n) : 0) + '%  ')", ['pages/a-record-of-nothing-but-online-battles-shows-the-ONLINE-rate-and-not-a-dash']],
+  ['R31 the per-level rates are gone when there is no ONLINE row', 'record_model.js', "if (!online) rates = best.length ?", "if (!online) rates = false ?", ['pages/without-an-online-battle-the-line-is-per-CPU-level-or-a-dash-as-it-always-was']],
+  ['S45 a failed write-back of the upgrade drops the profile from the hub', 'store.js', "return { ok: true, profile: opened.profile, readOnly: false, migratedFrom: opened.migratedFrom,", "throw e; return { ok: true, profile: opened.profile, readOnly: false, migratedFrom: opened.migratedFrom,", ['data/a-profile-whose-upgrade-cannot-be-written-is-still-listed-with-its-teams-and-its-record']],
   ['H01 A on the RESET page does not ask', 'hub_model.js', "if (pg.button) { recordOpenConfirm(); return []; }", "if (pg.button) { return []; }", ['model/A on the RESET page asks YES / NO with NO selected (cursor 1)']],
   ['H02 the question starts on YES', 'hub_model.js', "S.record.confirm = { cursor: 1, profileId: p.id, name: p.name };", "S.record.confirm = { cursor: 0, profileId: p.id, name: p.name };", ['model/A on the RESET page asks YES / NO with NO selected (cursor 1)']],
   ['H03 NO also resets', 'hub_model.js', "if (c.cursor === 0) { S.record.page = 0; return [{ type: 'record-reset', profileId: c.profileId }]; }", "{ S.record.page = 0; return [{ type: 'record-reset', profileId: c.profileId }]; }", ['model/A on NO closes it and changes nothing (no effect)']],

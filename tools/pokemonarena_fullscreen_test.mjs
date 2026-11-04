@@ -311,7 +311,9 @@ async function groupBrowser(base, which, { vps = VPS, deepChecks = true, shots =
   for (const [name, spec] of Object.entries(PAGES)) {
     if (which && which !== name) continue;
     for (const vp of vps) {
-      try { await withBrowser({ port: CDP0, width: vp.w, height: vp.h, mobile: vp.mobile }, async (page) => { await runViewport(page, base, name, spec, vp, { deepChecks, shots }); }); }
+      // UPDATED DELIBERATELY: Chrome is launched with its REAL autoplay policy (autoplay: false). The page now tries to start the sound at load, and under the permissive test flag that succeeds, so the "start the sound" hint is
+      // (correctly) never shown; this suite checks where that hint sits, so it needs the situation in which it IS shown: no gesture yet, the browser refusing.
+      try { await withBrowser({ port: CDP0, width: vp.w, height: vp.h, mobile: vp.mobile, autoplay: false }, async (page) => { await runViewport(page, base, name, spec, vp, { deepChecks, shots }); }); }
       catch (e) { ok(false, name + ' ' + vp.n + ': the session ran to its end', e && e.message ? e.message : String(e)); }
     }
   }

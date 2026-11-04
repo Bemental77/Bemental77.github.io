@@ -389,6 +389,8 @@ export function createNetMatch(opts) {
   }
   // A claim AGAINST ME ("you ran out of time", "your link was dead") is believed only when my own clock or my own link record agrees: otherwise a
   // hostile client could end any match by announcing it. A claim against THEMSELVES (a forfeit, leaving) only ever hurts the sender, so it is taken.
+  // "Against me" is decided by WHO LOSES (the winner the message names), never by the label the sender chose for it: an honest peer can only ever put the
+  // two reasons below on a claim against me, so every other label ('forfeit', 'left', anything up to 24 characters) is refused here (plausibleClaim -> false).
   function plausibleClaim(why) {
     const t = now();
     if (why === 'lost-link') return longestDown >= L.graceMs * 0.8;
@@ -405,9 +407,9 @@ export function createNetMatch(opts) {
     // The other side says the match ended some way other than a normal finish and I may not have got there yet (a timeout, a lost link, a forfeit).
     if (nm.phase === 'playing' && m.why !== 'result' && nm.ctl.winner === null && m.win !== -1) {
       const loser = m.win ^ 1;
-      if (loser === mySide && (m.why === 'timeout' || m.why === 'lost-link') && !plausibleClaim(m.why)) {
+      if (loser === mySide && !plausibleClaim(m.why)) {
         endTheirs = null;
-        return fail('cheat', 'The other player ended the match claiming you ran out of time, but your game disagrees, so the match was stopped.');
+        return fail('cheat', 'The other player ended the match by announcing that you had lost it, but your game disagrees, so the match was stopped.');
       }
       conceded = m.why;
       nm.ctl.concede(loser);
@@ -440,6 +442,12 @@ export function createNetMatch(opts) {
   }
   nm.leave = leave;
   nm.close = function close() { leave('closed'); if (!dead()) setPhase('closed'); };
+  /**
+   * May the match that has just ended be written to a record? Only a match the engine took to its result and that nothing has STOPPED since. The end-of-match comparison
+   * (checkEnd) can fail a match that is already 'over' (the other machine's `end` named another winner or another final position): the phase turns 'failed', the page shows
+   * the error, and that match is not counted, even though the scene underneath is still playing its last turn. battle_boot.js asks this before it writes a profile.
+   */
+  nm.countable = function countable() { return !dead() && !!nm.ctl && nm.ctl.winner !== null; };
 
   function onBye(m) {
     const why = m.why || 'left';
