@@ -40,7 +40,8 @@ import { createResumeStore, resumeKey, navigationType } from './battle_resume.js
 import { parseOnlineQuery, createOnline } from './online.js';                         // two players, one battle (netmatch.js + lib/netplay.js); see ONLINE.md
 import { engineFingerprint } from './online_match.js';
 import { fitScale, fitPicture, createFullscreen, PROMPT_ROOM } from './screenfit.js';
-import { parseTowerParams, returnToTower, returnToHub, launchFloorBattle } from './tower_launch.js';       // the Tower's addresses (light: strings only; the Tower's logic is loaded only when the address is a Tower one)       // the picture fills its room; the Fullscreen switch
+import { summarizeMatch } from './match_stats.js';                      // the Tower hears the match the moment the engine ends it (tower_fight.js watchEngine), so it needs the same summary the scene makes
+import { parseTowerParams, returnToTower, returnToHub, launchFloorBattle, HUB_PAGE_URL, TOWER_HUB_URL } from './tower_launch.js';       // the Tower's addresses (light: strings only; the Tower's logic is loaded only when the address is a Tower one)       // the picture fills its room; the Fullscreen switch
 
 export { GBA_FPS };
 const STEP_MS = 1000 / GBA_FPS;
@@ -165,7 +166,7 @@ async function main() {
     showRomError({ boot: els.boot, err: els.err, errTitle: els.errTitle, errMsg: els.errMsg, errDetail: els.errDetail, retry: els.retry }, { kind: kind || 'internal', title, message, detail, retry, tech: tech || '' });          // W1 D7: the one shared error experience (rom_error.js)
     { const q = $('quickBtn'); if (q) q.hidden = kind !== 'params'; }          // 'Quick Battle' belongs to a refused ADDRESS, not to a missing game file
     document.body.dataset.state = 'error';
-    if (!nav) { try { nav = enableDomNav(els.err, { input, onBack: () => { location.href = hook.params && hook.params.tower ? '/pokemonarena/#tower' : '/pokemonarena/'; } }); } catch (_e) { nav = null; } }
+    if (!nav) { try { nav = enableDomNav(els.err, { input, onBack: () => { location.href = hook.params && hook.params.tower ? TOWER_HUB_URL : HUB_PAGE_URL; } }); } catch (_e) { nav = null; } }
     else { try { nav.refresh(); } catch (_e) { /* ignore */ } }
     if (nav) { try { nav.focusFirst(); } catch (_e) { /* ignore */ } }
     fit();
@@ -275,7 +276,7 @@ async function main() {
     if (choice === 'EDIT TEAM') editTeam();
     else if (choice === 'REMATCH') { const a = new Uint32Array(1); (window.crypto || {}).getRandomValues ? window.crypto.getRandomValues(a) : (a[0] = (hook.seed * 1103515245 + 12345) >>> 0); navigate(rematchUrl(a[0])); }
     else if (choice === 'NEW BATTLE') { const u = new URL(location.href); const keep = new URLSearchParams(); ['cpu', 'format'].forEach((k) => { if (u.searchParams.has(k)) keep.set(k, u.searchParams.get(k)); }); navigate(u.pathname + (keep.toString() ? '?' + keep.toString() : '')); }
-    else navigate('/pokemonarena/');             // BACK TO HUB (and the old LEAVE)
+    else navigate(HUB_PAGE_URL);             // BACK TO HUB (and the old LEAVE)
   }
 
   /* ---- ST1: the career. When the RESULT screen appears the finished battle is written into the profile that fought it, ONCE (scene.js hooks.onMatchEnd fires once per page).
@@ -332,8 +333,9 @@ async function main() {
 
   /* ---- a Tower floor (battle.html?tower=1): the wiring only. The logic is tower_fight.js / tower_session.js, which take callbacks and never read an address. ---- */
   let towerStore = null;
+  const freshSeed = () => { const a = new Uint32Array(1); if (window.crypto && window.crypto.getRandomValues) window.crypto.getRandomValues(a); else a[0] = (Date.now() ^ Math.floor(Math.random() * 4294967296)) >>> 0; return a[0] >>> 0; };
   function towerError(message, title) {
-    const back = $('hubBtn'); if (back) { back.href = '/pokemonarena/#tower'; back.textContent = 'Back to the Tower'; }
+    const back = $('hubBtn'); if (back) { back.href = TOWER_HUB_URL; back.textContent = 'Back to the Tower'; }
     showError({ title: title || 'This Tower fight cannot start', message, detail: '', kind: 'tower' });
     { const q = $('quickBtn'); if (q) q.hidden = true; }
   }
@@ -346,7 +348,8 @@ async function main() {
       const profileId = tw.profileId || await towerStore.getActiveId();
       if (!profileId) { towerError('The Tower keeps its run in a trainer profile, and there is none yet. Start a run from the hub.'); return null; }
       const nv = { toTower: (step) => returnToTower({ navigate, step }), toHub: () => returnToHub({ navigate }), retry: (run) => launchFloorBattle(run, { navigate, profileId }) };
-      const f = await fightMod.createTowerFight({ pack: packRef, persist: ses.storePersist(towerStore, profileId), floor: tw.floor, runId: tw.run, navType: navigationType(), nav: nv });
+      const f = await fightMod.createTowerFight({ pack: packRef, persist: ses.storePersist(towerStore, profileId), floor: tw.floor, runId: tw.run, navType: navigationType(), nav: nv, nonce: freshSeed,
+        onDuplicate: () => { hook.towerDuplicate = true; towerError('This floor is already being fought in another tab or window. That fight is the one that counts, and this page cannot finish it. Close this page and go back to the Tower.', 'Already being fought'); } });
       hook.towerProfile = profileId;
       if (!f.ok) { hook.towerRefused = { status: f.status, why: f.why, next: f.next }; towerError(f.message, f.status === 'abandoned' ? 'The last fight was left' : undefined); return null; }
       return f;
@@ -499,7 +502,7 @@ async function main() {
             mountScene: mountOnlineScene,
             sceneState: () => ({ mode: scene ? scene.mode : null, pending: !!(ctl && online && online.state.info && ctl.pending(online.state.info.mySide)) }),
             showFatal: ({ title, message }) => { canvas.hidden = true; showError({ title, message, kind: 'online' }); },
-            toHub: () => navigate('/pokemonarena/'),
+            toHub: () => navigate(HUB_PAGE_URL),
           },
         });
         window.__arenaOnline = online;
@@ -518,13 +521,19 @@ async function main() {
       resumeStore = createResumeStore({ storage: store, key: resumeKey(location.pathname, location.search), seed: spec.seed, tag: towerFight ? towerFight.tag : undefined });
       const rs = resumeStore.restore({ ctl, makeCtl, navType: navigationType() });
       ctl = rs.ctl; hook.resume = rs.info; resuming = rs.info.restored;
-      const sceneOpts = { ui, pack: packRef, text, ctl, viewSide: 0, resultOptions: resultOptionsFor(), env: spec.seed % 9, textSpeed: params.speed, meta: spec.meta, trainer: spec.trainer, playerName: 'You', trainerChoices: trainerChoicesOf(), cpuLevel: spec.cpu, clock: () => performance.now(), sound: soundApi, quitLabel: towerFight ? 'LEAVE TOWER' : 'BACK TO HUB', anim: animCfg, animator: resuming ? null : animator, animSeed: spec.seed, hooks: mkHooks({ onResult: onResult, onMatchEnd: towerFight ? towerMatchEnd : recordCareer, onQuit: () => { if (resumeStore) resumeStore.clear(); if (towerFight) { towerFight.onQuit(); return; } whenCareerSettled(() => navigate('/pokemonarena/')); } }) };
+      // A Tower fight that was marked, reloaded, and has NOTHING TO RESUME FROM (no saved choices, or they no longer replay) was left: it counts as a loss. It is never a free restart at the preview.
+      if (towerFight && towerFight.status === 'resume' && !rs.info.restored) {
+        const left = await towerFight.leaveUnrestorable(); resumeStore.clear(); hook.towerRefused = { status: 'abandoned', why: 'the saved fight could not be resumed' };
+        towerError(left.message, 'The last fight was left'); return;
+      }
+      const sceneOpts = { ui, pack: packRef, text, ctl, viewSide: 0, resultOptions: resultOptionsFor(), env: spec.seed % 9, textSpeed: params.speed, meta: spec.meta, trainer: spec.trainer, playerName: 'You', trainerChoices: trainerChoicesOf(), cpuLevel: spec.cpu, clock: () => performance.now(), sound: soundApi, quitLabel: towerFight ? 'LEAVE TOWER' : 'BACK TO HUB', anim: animCfg, animator: resuming ? null : animator, animSeed: spec.seed, hooks: mkHooks({ onResult: onResult, onMatchEnd: towerFight ? towerMatchEnd : recordCareer, onQuit: () => { if (resumeStore) resumeStore.clear(); if (towerFight) { towerFight.onQuit(); return; } whenCareerSettled(() => navigate(HUB_PAGE_URL)); } }) };
       // the result buttons are read when the result screen comes up (scene.js startResult), so a Tower floor's can follow who won
       if (towerFight) Object.defineProperty(sceneOpts, 'resultOptions', { enumerable: true, get: () => resultOptionsFor() });
       scene = createScene(sceneOpts);
       scene.begin();
       if (resuming) { hook.resume.frames = scene.catchUp(); resuming = false; scene.setAnimator(animator); }
       if (soundSys) soundSys.hookScene(scene);       // MU3: hit / faint / send-out sounds and the animator's sound events -> the ROM's effects (hooked after a resume's silent replay)
+      if (towerFight) towerFight.watchEngine(ctl, summarizeMatch);          // the Tower learns the result when the ENGINE ends the match, not when the result screen comes up (closing the page in between can no longer dodge a loss)
       resumeStore.attach(ctl);
       if (towerFight) ctl.onLocalChoice(() => towerFight.committed());          // the fight begins at the player's first choice: leaving it from then on counts as a loss
       if (scene.mode === 'steps') scene.tick();       // AN1 round 4: begin() leaves the scene ONE tick short of its first screen (the team preview). Settle it before 'ready', so the first frame drawn and the first key pressed land on the preview (measured, desktop 1280x800: a key sent at ready was lost on 5 of 5 loads with animations on, 1 of 5 with them off)
@@ -536,6 +545,7 @@ async function main() {
     // no dialog in the page): it keeps the header's Open button (the way to switch it on or off from here) and follows the switch going on in another tab.
     // The button is un-hidden now only to hold its room (battle.css keeps it invisible until the module has mounted and wired it), so the header does not move when it appears.
     const openBtn = $('openBtn');
+    if (towerFight) return;          // OPEN TO BATTLES is NOT mounted in a Tower fight (the button stays hidden): Accepting a challenge would leave the page mid-fight, which the Tower counts as a loss. A challenge reaches you in the hub, between floors.
     if (openBtn) openBtn.hidden = false;
     import('./presence_boot.js').then((m) => {
       hook.presence = m.mountPresence({

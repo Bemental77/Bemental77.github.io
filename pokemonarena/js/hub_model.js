@@ -157,7 +157,7 @@ export function createHubModel(opts = {}) {
     return { off, n, size: Math.min(n, MAIN_VISIBLE) };
   }
   // THE TOWER (tower_hub.js): every path that starts with "tower" is its own state machine; it gets the profiles the store reader built and asks this module for screen changes
-  const tower = createTowerHub({ profiles: () => S.data.profiles, activeId: () => S.data.activeId, dataState: () => S.data.state, go: (path) => go(path), back: () => back(), path: () => S.path, arrivedByLink: () => S.link });
+  const tower = createTowerHub({ profiles: () => S.data.profiles, activeId: () => S.data.activeId, dataState: () => S.data.state, go: (path) => go(path), back: () => back(), path: () => S.path, arrivedByLink: () => S.link, measure: opts.measure, msgPx: opts.msgPx });
 
   /* ------------------------------------------------------------------------------------------ text box help */
   function helpFor(row) {

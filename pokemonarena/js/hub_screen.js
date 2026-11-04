@@ -168,6 +168,9 @@ export function createHubScreen(ui) {
       }
       return { width: SCREEN_W, height: SCREEN_H, rgba: f.rgba };
     },
+    /** How wide `s` is in the message font, in pixels, and how wide a message line may be: the Tower wraps the long texts of its lists by these (tower_hub.js wrapLines), so a word is never cut. */
+    measure: (s) => width('normal', ui.safeText(String(s))),
+    msgPx: R.msg.w - 4,
     /** The widest line any message / about page of this view needs, in pixels (the tests check every one fits its window). */
     widths(view) {
       const out = [];

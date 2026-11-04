@@ -20,7 +20,10 @@
 import { CONFIG } from './tower_config.js';
 
 export const TOWER_VERSION = 1;
-export const TOWER_LIMITS = Object.freeze({ idMax: 40, buffsMax: 400, achievementsMax: 500, heldMax: 400, earnedMax: 200, counterMax: 1e9, runJsonMax: 100000, timeMax: 8.64e15 });
+// The *Max limits are what the strict CHECK accepts; the *Keep limits are what the REPAIR keeps. Keep < Max on purpose: a record the repair left AT the check's limit would refuse the first real id or count a
+// legitimate step adds (checkTowerShape would fail inside the store transaction, and the Tower could never record a result again). 124 buff families and 51 achievements exist, a real counter is in the hundreds.
+// `bagMax` bounds the serialized size of the record's unknown bag (tower._unknown, and the towerRejected it receives): a real Tower record is under 10 KB.
+export const TOWER_LIMITS = Object.freeze({ idMax: 40, buffsMax: 400, achievementsMax: 500, heldMax: 400, earnedMax: 200, counterMax: 1e9, runJsonMax: 100000, timeMax: 8.64e15, buffsKeep: 250, achievementsKeep: 400, counterKeep: 1e9 - 1e6, bagMax: 65536 });
 
 const hasOwn = Object.prototype.hasOwnProperty;
 const isObj = (o) => o !== null && typeof o === 'object' && !Array.isArray(o);
@@ -30,7 +33,9 @@ const isTowerId = (s) => typeof s === 'string' && ID.test(s);
 const clone = (x) => JSON.parse(JSON.stringify(x));
 
 /** The keys a stored run may have (tower.js documents each). Kept here so that the shallow check below and tower.js's strict parser can never disagree about the list. */
-export const RUN_KEYS = Object.freeze(['v', 'seed', 'format', 'ruleset', 'floor', 'phase', 'team', 'types', 'held', 'offer', 'history', 'skips', 'livesUsed', 'folded', 'fighting', 'earned']);
+export const RUN_KEYS = Object.freeze(['v', 'seed', 'format', 'ruleset', 'floor', 'phase', 'team', 'types', 'held', 'offer', 'history', 'skips', 'livesUsed', 'folded', 'fighting', 'earned', 'attempt']);
+/** Keys a stored run may omit (a run written before the key existed): `attempt` is the identity of the fight that marked the run `fighting` (0 = none). Every writer writes it. */
+export const RUN_KEYS_OPTIONAL = Object.freeze(['attempt']);
 export const RUN_PHASES = Object.freeze(['battle', 'offer', 'over', 'won']);
 export const TOWER_KEYS = Object.freeze(['v', 'best', 'winsByFormat', 'runs', 'wins', 'floors', 'bosses', 'buffsSeen', 'achievements', 'current', 'last']);
 export const LAST_KEYS = Object.freeze(['format', 'seed', 'won', 'cleared', 'livesUsed', 'skips', 'held', 'earned', 'at']);
@@ -41,9 +46,12 @@ export const emptyTower = () => ({ v: TOWER_VERSION, best: { '3v3': 0, '6v6': 0 
 export function isRunShape(r, cfg = CONFIG) {
   if (!isObj(r)) return false;
   for (const k of Object.keys(r)) if (!RUN_KEYS.includes(k)) return false;
-  for (const k of RUN_KEYS) if (!hasOwn.call(r, k)) return false;
+  for (const k of RUN_KEYS) if (!hasOwn.call(r, k) && !RUN_KEYS_OPTIONAL.includes(k)) return false;
+  if (hasOwn.call(r, 'attempt') && !isInt(r.attempt, 0, 0xffffffff)) return false;
   if (r.v !== 1 || !isInt(r.seed, 0, 0xffffffff) || !cfg.formats.includes(r.format) || !RUN_PHASES.includes(r.phase) || !isInt(r.floor, 1, cfg.floors)) return false;
   if (!isObj(r.team) || !Array.isArray(r.team.recs) || !Array.isArray(r.held) || !Array.isArray(r.history) || !Array.isArray(r.earned)) return false;
+  // every row must be an object: a null in `history` or `held` passes the cheap bounds but crashes the code that folds a run, and a run that cannot be dropped locks the Tower (DROP THIS RUN would throw)
+  if (!r.team.recs.every(isObj) || !r.held.every(isObj) || !r.history.every(isObj)) return false;
   if (typeof r.folded !== 'boolean' || typeof r.fighting !== 'boolean') return false;
   try { return JSON.stringify(r).length <= TOWER_LIMITS.runJsonMax; } catch (_e) { return false; }
 }
@@ -83,6 +91,24 @@ export function checkTowerShape(t, cfg = CONFIG) {
 
 const setOwn = (o, k, v) => Object.defineProperty(o, k, { value: v, enumerable: true, writable: true, configurable: true });
 
+/** A time stamp as the record keeps it: a whole number of milliseconds in range, else 0 (a clock that says -5, 1.5 or NaN must not make the record fail its own check). */
+export const sanitiseStamp = (at) => (Number.isInteger(at) && at >= 0 && at <= TOWER_LIMITS.timeMax ? at : 0);
+
+/**
+ * Hold a bag of unknown values to `max` serialized characters: the OLDEST keys are dropped first, until what is left fits (a key bigger than the whole allowance goes too). A bag already inside the
+ * allowance is returned as it is. Without this a hostile file could park megabytes in `tower._unknown`, and every later load, history revision, backup and export would carry them.
+ */
+export function capBag(bag, max = TOWER_LIMITS.bagMax) {
+  if (!isObj(bag)) return bag;
+  const keys = Object.keys(bag), cost = keys.map((k) => { try { return k.length + 4 + String(JSON.stringify(bag[k])).length; } catch (_e) { return Infinity; } });
+  let total = 0; for (const c of cost) total += c;
+  if (total <= max) return bag;
+  const out = {}; let i = 0;
+  for (; i < keys.length && total > max; i++) total -= cost[i];
+  for (; i < keys.length; i++) setOwn(out, keys[i], bag[keys[i]]);
+  return out;
+}
+
 /**
  * Repair a stored Tower record field by field. -> { value (always well formed), rejected ({} when nothing was lost) }.
  * `P(severity, code, path, message, extra)` is profile.js's problem reporter (optional here). `present` says whether the document had a `tower` at all (a v5 document without one is repaired to empty; a
@@ -102,16 +128,16 @@ export function normalizeTower(src, P = () => {}, present = true, cfg = CONFIG) 
     if (isObj(v) && cfg.formats.every((f) => isInt(v[f], 0, hi))) { for (const f of cfg.formats) out[field][f] = v[f]; const extra = Object.keys(v).filter((k) => !cfg.formats.includes(k)); if (extra.length) { const o = {}; for (const k of extra) setOwn(o, k, v[k]); setOwn(rejected, field + 'Extra', o); } }
     else if (hasOwn.call(src, field)) rep(field, v, 'was invalid');
   };
-  perFormat('best', cfg.floors); perFormat('winsByFormat', TOWER_LIMITS.counterMax);
-  for (const k of ['runs', 'wins', 'floors', 'bosses']) { if (isInt(src[k], 0, TOWER_LIMITS.counterMax)) out[k] = src[k]; else if (hasOwn.call(src, k)) rep(k, src[k], 'was invalid'); }
+  perFormat('best', cfg.floors); perFormat('winsByFormat', Math.floor(TOWER_LIMITS.counterKeep / cfg.formats.length));          // (the formats' wins add up to `wins`, which is held to counterKeep as well)
+  for (const k of ['runs', 'wins', 'floors', 'bosses']) { if (isInt(src[k], 0, TOWER_LIMITS.counterKeep)) out[k] = src[k]; else if (hasOwn.call(src, k)) rep(k, src[k], 'was invalid'); }
   if (isObj(src.buffsSeen)) {
-    const lost = {};
-    for (const id of Object.keys(src.buffsSeen)) { if (isTowerId(id) && isInt(src.buffsSeen[id], 1, TOWER_LIMITS.counterMax) && Object.keys(out.buffsSeen).length < TOWER_LIMITS.buffsMax) setOwn(out.buffsSeen, id, src.buffsSeen[id]); else setOwn(lost, id, src.buffsSeen[id]); }
+    const lost = {}; let kept = 0;
+    for (const id of Object.keys(src.buffsSeen)) { if (isTowerId(id) && isInt(src.buffsSeen[id], 1, TOWER_LIMITS.counterKeep) && kept < TOWER_LIMITS.buffsKeep) { setOwn(out.buffsSeen, id, src.buffsSeen[id]); kept++; } else setOwn(lost, id, src.buffsSeen[id]); }
     if (Object.keys(lost).length) rep('buffsSeen', lost, 'had entries that are not {id: count}');
   } else if (hasOwn.call(src, 'buffsSeen')) rep('buffsSeen', src.buffsSeen, 'was not an object');
   if (isObj(src.achievements)) {
-    const lost = {};
-    for (const id of Object.keys(src.achievements)) { if (isTowerId(id) && isInt(src.achievements[id], 0, TOWER_LIMITS.timeMax) && Object.keys(out.achievements).length < TOWER_LIMITS.achievementsMax) setOwn(out.achievements, id, src.achievements[id]); else setOwn(lost, id, src.achievements[id]); }
+    const lost = {}; let kept = 0;
+    for (const id of Object.keys(src.achievements)) { if (isTowerId(id) && isInt(src.achievements[id], 0, TOWER_LIMITS.timeMax) && kept < TOWER_LIMITS.achievementsKeep) { setOwn(out.achievements, id, src.achievements[id]); kept++; } else setOwn(lost, id, src.achievements[id]); }
     if (Object.keys(lost).length) rep('achievements', lost, 'had entries that are not {id: time}');
   } else if (hasOwn.call(src, 'achievements')) rep('achievements', src.achievements, 'was not an object');
   if (src.current === null || src.current === undefined) out.current = null;
@@ -132,6 +158,7 @@ export function normalizeTower(src, P = () => {}, present = true, cfg = CONFIG) 
   let b2 = bag;
   if (Object.keys(unk).length) { b2 = b2 || {}; for (const k of Object.keys(unk)) if (!hasOwn.call(b2, k)) setOwn(b2, k, unk[k]); }
   if (hasOwn.call(src, '_unknown') && !isObj(src._unknown)) { b2 = b2 || {}; setOwn(b2, '_unknown', src._unknown); }
+  if (b2) b2 = capBag(b2);
   if (b2 && Object.keys(b2).length) out._unknown = b2;
   const still = checkTowerShape(out, cfg);
   if (still.length) { const empty = emptyTower(); setOwn(rejected, '_raw', src); P('repaired', 'profile.tower', 'tower', 'tower could not be repaired (' + still[0] + '); an empty record was made and the old one kept in the unknown bag'); return { value: empty, rejected }; }

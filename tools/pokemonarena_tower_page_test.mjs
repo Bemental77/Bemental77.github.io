@@ -9,6 +9,8 @@
 //            the LAST RUN and ACHIEVEMENTS screens; the profile's career record is byte-identical to before the climb; a plain Quick Battle in the same browser plays EXACTLY the battle it played before
 //   desktop  1280x800, keyboard + the synthetic controller: a mid-fight RELOAD resumes the floor (and the floor counts once); the offer by CONTROLLER; a fight LEFT by a typed address is a loss; hostile Tower
 //            addresses are refused and write nothing; NEW RUN from the hub (a random team) opens floor 1 by itself
+//   integrity  1280x800: a double START with no profile makes ONE profile and ONE run; no OPEN TO BATTLES in a Tower fight; the Tower has the result when the ENGINE ends the match (before the result screen), and
+//            a reload there shows "already counted"; B, B from #tower-offer and from #tower-last stay inside the hub; the note after a ball is taken shows; a regular battle still mounts OPEN TO BATTLES
 // Every check that reads the store reads the REAL IndexedDB through the game's own store.js. Screenshots go to ARENA_OUT.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -316,12 +318,17 @@ try {
 
     // ---- hostile addresses: refused, and nothing is written
     const before = J(await tw(page, pid));
-    const bad = ['?tower=1', '?tower=1&floor=0&run=5', '?tower=1&floor=31&run=5', '?tower=1&floor=abc&run=5', '?tower=2&floor=1&run=5', '?floor=1&run=5', '?tower=1&floor=1&run=-1', '?tower=1&floor=1&run=99999999999', '?tower=1&floor=1&run=5&life=x',
+    const bad = ['?tower=1', '?tower=1&floor=0&run=5', '?tower=1&floor=31&run=5', '?tower=1&floor=abc&run=5', '?tower=2&floor=1&run=5', '?tower=1&floor=1&run=-1', '?tower=1&floor=1&run=99999999999', '?tower=1&floor=1&run=5&life=x',
       '?tower=1&floor=1&run=5&p=../../x', '?tower=1&floor=1&run=5&team=ARENA1.AAAA', '?tower=1&floor=1&run=5&seed=1', '?tower=1&floor=1&run=5&np=host', '?tower=1&floor=1&run=5&p=' + 'x'.repeat(80)];
     const results = [];
     for (const q of bad) { const st = await openBattle(page, q); results.push([q, st, await ev(page, `${B}.tower === undefined || ${B}.tower === null`)]); }
     ok(results.every(([, st, none]) => st === 'error' && none), tag + 'all ' + bad.length + ' hostile Tower addresses are refused on an error screen, with no Tower controller', J(results.filter(([, st, none]) => st !== 'error' || !none)));
     ok(J(await tw(page, pid)) === before, tag + 'and none of them wrote anything to the profile');
+    // `floor` / `run` / `life` / `p` WITHOUT tower=1 are not Tower parameters: the address is a regular one and they are ignored, as before the Tower existed
+    const stray = [];
+    for (const q of ['?floor=1&run=5&seed=11&format=3v3&cpu=easy', '?p=1&seed=11&format=3v3&cpu=easy', '?life=2&run=7&seed=11&format=3v3&cpu=easy']) { const st = await openBattle(page, q); stray.push([q, st, await ev(page, `${B}.tower === undefined || ${B}.tower === null`)]); }
+    ok(stray.every(([, st, none]) => st === 'ready' && none), tag + 'an address with floor / run / life / p but no tower=1 is a regular battle that ignores them (as the build before the Tower did)', J(stray));
+    ok(J(await tw(page, pid)) === before, tag + 'and wrote nothing to the profile');
     const ghost = await openBattle(page, '?tower=1&floor=1&run=123456');
     ok(ghost === 'error' && J(await tw(page, pid)) === before, tag + 'a well-formed address for a run that does not exist is refused too, and writes nothing', ghost);
 
@@ -347,6 +354,93 @@ try {
     await hubReady(page);
     const t5 = await tw(page, pid);
     ok(t5.current === null && t5.runs === 2 && t5.last.cleared === 0, tag + 'leaving at once ends that run with nothing cleared (two runs counted)', J({ cur: t5.current, runs: t5.runs }));
+    ok(errsOf(page).filter((e) => !/status of (4\d\d)|Failed to load resource/.test(e)).length === 0, tag + 'no console errors', errsOf(page).slice(0, 2).join(' | '));
+  });
+
+  /* ================================================================================================================ integrity */
+  await session('integrity: one START, the engine end, the history, the note, no challenge', { width: 1280, height: 800, port: cdp++ }, async (page) => {
+    const tag = 'integrity: ';
+    const PROFILES = `(async () => { const S = await import('/pokemonarena/js/store.js'); const store = await S.openStore(); try { const ps = await store.listProfiles(); const out = []; for (const p of ps) { const l = await store.loadProfile(p.id); out.push({ id: p.id, tower: l.profile.tower }); } return out; } finally { await store.close(); } })()`;
+    const toHubFromBattle = async () => { await page.waitFor(`location.pathname.endsWith('/pokemonarena/') && window.__arenaHub && ${HUB}.state === 'ready'`, { timeoutMs: 60000 }); await hubReady(page); };
+    const pressB = async () => { await ev(page, `${HUB}.press('b')`); await sleep(300); };
+    await openHub(page);
+    // ---- NO PROFILE YET: START pressed twice in the same moment makes ONE profile and ONE run (not two profiles, not a run made and at once given up)
+    await key(page, 'down'); await key(page, 'down'); await key(page, 'a'); await sleep(300);
+    ok((await where(page)) === 'tower', tag + 'with no profile the Tower screen opens');
+    await key(page, 'a'); await sleep(250);
+    ok((await where(page)) === 'tower-new', tag + 'NEW RUN opens the team screen');
+    await key(page, 'down'); await key(page, 'down');
+    await ev(page, `(() => { ${HUB}.press('a'); ${HUB}.press('a'); return true; })()`);                 // a double tap on START
+    ok((await toBattle(page)) === 'ready', tag + 'START opens floor 1');
+    const ps1 = await ev(page, PROFILES);
+    ok(ps1.length === 1 && ps1[0].tower.current && ps1[0].tower.current.floor === 1 && ps1[0].tower.runs === 0 && ps1[0].tower.last === null, tag + 'a double START made exactly ONE profile and ONE run (no run was made and abandoned, none is counted)', J(ps1.map((p) => [p.id, p.tower.runs, !!p.tower.current])));
+    ok((await ev(page, `window.__arenaPresence === undefined && ${B}.presence === undefined && document.getElementById('openBtn').hidden === true`)) === true, tag + 'OPEN TO BATTLES is not mounted in a Tower fight (no challenge dialog can take the player away mid-fight; the header button stays hidden)');
+    // ---- THE ENGINE END: the Tower hears the match the moment the engine ends it, before the result screen is up
+    ok((await ev(page, DRIVE("a.mode === 'action' && a.ctl.turn >= 1"))) === 'action', tag + 'floor 1 is played by hand to turn 1');
+    const pid1 = ps1[0].id;
+    ok(!!(await until(async () => { const t = await tw(page, pid1); return t.current && t.current.fighting; })), tag + 'the profile says the fight has begun, and carries this page\'s attempt number', J((await tw(page, pid1)).current && (await tw(page, pid1)).current.attempt));
+    const att = (await tw(page, pid1)).current.attempt;
+    ok(Number.isInteger(att) && att >= 1, tag + 'the attempt number is a whole number from 1', String(att));
+    const ended = await ev(page, `(() => { const a = ${B}; let g = 0; while (a.ctl.winner === null && g++ < 100000) a.autoplay(10); return { winner: a.ctl.winner, mode: a.mode }; })()`);
+    ok(ended.winner !== null && ended.mode !== 'result', tag + 'the ENGINE has ended the match while the scene is still playing it out (not yet on the result screen)', J(ended));
+    const rec = await until(async () => { const t = await tw(page, pid1); return (t.current === null && t.runs === 1) || (t.current && t.current.history && t.current.history.length === 1) ? t : null; }, 8000);
+    const modeNow = await ev(page, `${B}.mode`);
+    ok(!!rec && modeNow !== 'result' && (rec.current ? rec.current.fighting === false && rec.current.attempt === 0 : rec.last && rec.last.won === false), tag + 'the Tower had ALREADY recorded the result (' + (rec && rec.current ? 'a win: the offer is open' : 'a loss: the run is over') + ') when the scene was not yet on the result screen (so closing the page there can no longer dodge a loss)', J({ mode: modeNow, cur: !!(rec && rec.current), runs: rec && rec.runs }));
+    const afterEnd = J(await tw(page, pid1));
+    await page.send('Page.reload', {});
+    await page.waitFor(`${B} && (${B}.state === 'ready' || ${B}.state === 'error')`, { timeoutMs: 90000 });
+    ok((await ev(page, `${B}.state`)) === 'error' && (await ev(page, `${B}.towerRefused`)).status === 'stale' && /already counted/.test(await ev(page, `document.body.innerText`)), tag + 'RELOADING there shows "the result is already counted", not a fresh fight at the team preview', J(await ev(page, `${B}.towerRefused`)));
+    ok(J(await tw(page, pid1)) === afterEnd, tag + 'and nothing was written by the reload (counted once, no free retry, no second loss)');
+
+    // ---- a run with the seeded team: the way back from a won floor lands on #tower-offer; B and B stay inside the hub
+    const seeded = await ev(page, SEED_TEAM('MISTY', TEAM)); const pid = seeded.id;
+    const started = await ev(page, START_RUN(pid, seeded.team, SEED_B, '3v3'));
+    ok(started.applied, tag + 'a run with the seeded team starts', J(started));
+    await openHub(page);
+    await key(page, 'down'); await key(page, 'down'); await key(page, 'a'); await sleep(300);
+    await key(page, 'a');
+    ok((await toBattle(page)) === 'ready', tag + 'FIGHT opens floor 1');
+    ok((await ev(page, DRIVE("a.mode === 'action' && a.ctl.turn >= 1"))) === 'action', tag + 'it is begun');
+    await finish(page);
+    ok((await ev(page, `${B}.ctl.winner`)) === 0, tag + 'floor 1 is won (the calibrated seed)', String(await ev(page, `${B}.ctl.winner`)));
+    await key(page, 'a');                                                         // PICK A BUFF
+    await toHubFromBattle();
+    ok((await where(page)) === 'tower-offer', tag + 'the hub opens on the offer (#tower-offer)', await where(page));
+    await ev(page, `window.__m = 7; true`);
+    const len0 = await ev(page, 'history.length');
+    await pressB();
+    ok((await where(page)) === 'tower', tag + 'B on the offer steps back to the Tower menu (the offer is still there: CHOOSE A BUFF)', (await where(page)) + ' ' + J(await labelsOf(page)));
+    ok((await labelsOf(page))[0] === 'CHOOSE A BUFF', tag + 'the first row is CHOOSE A BUFF: the offer was not lost', J(await labelsOf(page)));
+    await pressB();
+    ok((await where(page)) === 'main' && (await ev(page, `location.pathname.endsWith('/pokemonarena/') && window.__m === 7`)) === true, tag + 'B again lands on the hub\'s MAIN MENU, in the same page: B, B never leaves the hub for the battle page it came from', J({ path: await where(page), href: await ev(page, 'location.href'), m: await ev(page, 'window.__m') }));
+    ok((await ev(page, 'history.length')) === len0 + 1 || (await ev(page, 'history.length')) === len0, tag + 'and the history did not run away (' + len0 + ' -> ' + (await ev(page, 'history.length')) + ')');
+    // the browser's own Back steps through the same screens
+    await key(page, 'down'); await key(page, 'down'); await key(page, 'a'); await sleep(250);
+    await key(page, 'a'); await sleep(250);
+    ok((await where(page)) === 'tower-offer', tag + 'CHOOSE A BUFF opens the same offer');
+    await ev(page, `history.back()`); await sleep(400);
+    ok((await where(page)) === 'tower' && (await ev(page, `window.__m === 7`)) === true, tag + 'the browser\'s Back from the offer is the Tower menu (not the page before the hub)', await where(page));
+    // take a ball: the note says what was taken
+    await key(page, 'a'); await sleep(250);
+    await key(page, 'a'); await sleep(200); await key(page, 'left'); await key(page, 'a');
+    await until(async () => (await where(page)) === 'tower' && /^You took /.test((await hview(page)).msg[0]));
+    const noted = (await hview(page)).msg;
+    ok(/^You took /.test(noted[0]) && /Floor 2 is next/.test(noted[1]), tag + 'after a ball is taken the Tower menu SAYS what was taken ("You took X!", "Floor 2 is next.")', J(noted));
+    await key(page, 'a');                                                         // FIGHT: FLOOR 2
+    ok((await toBattle(page)) === 'ready', tag + 'floor 2 opens');
+    ok((await ev(page, DRIVE("a.mode === 'action' && a.ctl.turn >= 1"))) === 'action', tag + 'floor 2 is begun');
+    await until(async () => { const t = await tw(page, pid); return t.current && t.current.fighting; });
+    await ev(page, LEAVE);
+    await toHubFromBattle();
+    ok((await where(page)) === 'tower-last', tag + 'LEAVE TOWER lands on the last-run screen (#tower-last)', await where(page));
+    await ev(page, `window.__m = 8; true`);
+    await pressB();
+    ok((await where(page)) === 'tower', tag + 'B on the last-run screen is the Tower menu');
+    await pressB();
+    ok((await where(page)) === 'main' && (await ev(page, `location.pathname.endsWith('/pokemonarena/') && window.__m === 8`)) === true, tag + 'B again is the main menu, still in the hub page (#tower-last used to leave the hub on the third B)', J({ path: await where(page), href: await ev(page, 'location.href') }));
+    // ---- a regular battle still mounts OPEN TO BATTLES (the Tower's exception is only the Tower's)
+    await openBattle(page, QUICK);
+    ok(!!(await page.waitFor(`${B}.presence`, { timeoutMs: 20000 }).then(() => true, () => false)), tag + 'a regular Quick Battle still mounts OPEN TO BATTLES', '');
     ok(errsOf(page).filter((e) => !/status of (4\d\d)|Failed to load resource/.test(e)).length === 0, tag + 'no console errors', errsOf(page).slice(0, 2).join(' | '));
   });
 } finally {

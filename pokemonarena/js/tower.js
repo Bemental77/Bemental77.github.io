@@ -14,7 +14,7 @@ import { createRng } from './ai.js';
 import { randomTeam, FORMATS } from './matchctl.js';
 import { validateTeam } from './rules.js';
 import { CONFIG, TIERS } from './tower_config.js';
-import { emptyTower, TOWER_VERSION, checkTowerShape, RUN_KEYS } from './tower_record.js';
+import { emptyTower, TOWER_VERSION, checkTowerShape, RUN_KEYS, RUN_KEYS_OPTIONAL, sanitiseStamp } from './tower_record.js';
 import { FAMILIES, FAMILY_BY_ID, SYNERGIES, capOf, applyTeam, applyFoe, foeMods, runEffects, synergyState, describeOps, tierOfPower, mulPm } from './tower_buffs.js';
 
 export const RUN_VERSION = 1;
@@ -73,7 +73,7 @@ export function floorTrainer(pack, { seed, format, floor }, cfg = CONFIG, mods =
 
 /* ---------------------------------------------------------------------------------------------- the run */
 
-const baseRun = (o) => ({ v: RUN_VERSION, seed: o.seed >>> 0, format: o.format, ruleset: o.ruleset, floor: 1, phase: 'battle', team: o.team, types: o.types, held: [], offer: null, history: [], skips: 0, livesUsed: 0, folded: false, fighting: false, earned: [] });
+const baseRun = (o) => ({ v: RUN_VERSION, seed: o.seed >>> 0, format: o.format, ruleset: o.ruleset, floor: 1, phase: 'battle', team: o.team, types: o.types, held: [], offer: null, history: [], skips: 0, livesUsed: 0, folded: false, fighting: false, earned: [], attempt: 0 });
 
 /** Start a run on floor 1. team = { name, recs, meta } is a SNAPSHOT of a legal saved team. Throws RangeError for a team that cannot play the format. */
 export function newRun({ pack, seed, format, team, cfg = CONFIG }) {
@@ -205,7 +205,7 @@ export function recordFloorResult(run, resultIn, { pack = null, cfg = CONFIG } =
   if (!RESULTS.includes(res.result) || !isInt(res.turns, 0, 100000) || !isInt(res.faints, 0, 36)) return { run, applied: false, events: [], why: 'bad result' };
   if (run.phase !== 'battle' || res.floor !== run.floor) return { run, applied: false, events: [], why: run.phase !== 'battle' ? 'not in battle' : 'not the current floor' };
   const r = clone(run), boss = isBoss(run.floor, cfg), won = res.result === 'w';
-  r.fighting = false;
+  r.fighting = false; r.attempt = 0;
   r.history.push({ floor: run.floor, result: won ? 'w' : 'l', turns: res.turns, faints: res.faints, flawless: won && res.faints === 0, boss, comeback: won && res.comeback, sweep: won && res.sweep, closest: res.closest });
   const events = [];
   if (won) {
@@ -238,12 +238,12 @@ export function takeBuff(run, id, { cfg = CONFIG } = {}) {
 }
 
 /** The player leaves the Tower (a closed tab on a fresh visit, the Give Up menu): the run is over. */
-export function abandonRun(run) { if (run.phase === 'over' || run.phase === 'won') return run; const r = clone(run); r.phase = 'over'; r.offer = null; r.fighting = false; return r; }
+export function abandonRun(run) { if (run.phase === 'over' || run.phase === 'won') return run; const r = clone(run); r.phase = 'over'; r.offer = null; r.fighting = false; r.attempt = 0; return r; }
 
-/** A fight of the current floor has begun (the battle screen is up). Idempotent. A run that is not waiting for a fight changes nothing. -> { run, applied } */
-export function markFighting(run) {
+/** A fight of the current floor has begun (the battle screen is up). `attempt` (1..2^32-1) is the identity of the page that is fighting it: only that page can finish it. Idempotent. A run that is not waiting for a fight changes nothing. -> { run, applied } */
+export function markFighting(run, attempt = 0) {
   if (run.phase !== 'battle' || run.fighting) return { run, applied: false };
-  const r = clone(run); r.fighting = true; return { run: r, applied: true };
+  const r = clone(run); r.fighting = true; r.attempt = attempt >>> 0; return { run: r, applied: true };
 }
 
 /* ---------------------------------------------------------------------------------------------- serialised form (strict) */
@@ -272,11 +272,13 @@ export function parseRun(input, { pack = null, cfg = CONFIG } = {}) {
   try { r = typeof input === 'string' ? JSON.parse(input) : clone(input); } catch (_e) { return bad('not JSON'); }
   if (!isObj(r)) return bad('not an object');
   for (const k of Object.keys(r)) if (!RUN_KEYS.includes(k)) return bad('unknown field ' + k);
-  for (const k of RUN_KEYS) if (!(k in r)) return bad('missing field ' + k);
+  for (const k of RUN_KEYS) if (!(k in r) && !RUN_KEYS_OPTIONAL.includes(k)) return bad('missing field ' + k);
+  if ('attempt' in r && !isInt(r.attempt, 0, 0xffffffff)) return bad('attempt');
   if (r.v !== RUN_VERSION) return bad('version');
   if (!isInt(r.seed, 0, 0xffffffff) || !cfg.formats.includes(r.format) || r.ruleset !== cfg.ruleset) return bad('seed, format or ruleset');
   if (!['battle', 'offer', 'over', 'won'].includes(r.phase) || !isInt(r.floor, 1, cfg.floors) || typeof r.folded !== 'boolean' || typeof r.fighting !== 'boolean') return bad('phase, floor or folded');
   if (r.fighting && r.phase !== 'battle') return bad('a fight is marked outside the battle phase');
+  if (!r.fighting && (r.attempt | 0) !== 0) return bad('an attempt is marked without a fight');
   if (!Array.isArray(r.earned) || r.earned.length > 200 || !r.earned.every((x) => typeof x === 'string' && /^[a-z0-9][a-z0-9-]{0,39}$/.test(x)) || new Set(r.earned).size !== r.earned.length) return bad('earned');
   if (!isObj(r.team) || typeof r.team.name !== 'string' || r.team.name.length > 24 || !Array.isArray(r.team.recs) || r.team.recs.length < 1 || r.team.recs.length > 6 || !r.team.recs.every(checkRec)) return bad('team');
   if (FORMATS[r.format].pick && r.team.recs.length < FORMATS[r.format].pick) return bad('team too small for the format');
@@ -328,7 +330,7 @@ export function checkTower(t, { cfg = CONFIG, pack = null } = {}) {
 
 /** The summary of a finished run the result screen shows (tower.last). */
 export function lastOf(run, at) {
-  return { format: run.format, seed: run.seed, won: run.phase === 'won', cleared: run.history.filter((h) => h.result === 'w').length, livesUsed: run.livesUsed, skips: run.skips, held: run.held.map((h) => ({ id: h.id, p: h.p })), earned: run.earned.slice(), at: Number.isInteger(at) && at >= 0 ? at : 0 };
+  return { format: run.format, seed: run.seed, won: run.phase === 'won', cleared: run.history.filter((h) => h.result === 'w').length, livesUsed: run.livesUsed, skips: run.skips, held: run.held.map((h) => ({ id: h.id, p: h.p })), earned: run.earned.slice(), at: sanitiseStamp(at) };
 }
 
 /**

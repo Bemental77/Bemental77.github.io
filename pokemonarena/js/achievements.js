@@ -7,6 +7,7 @@
 // Each achievement is { id, name, desc, grade (1..4, shown in the rarity colours green / blue / purple / gold), test(facts) }. `facts` (runFacts) is a plain object derived from the run and the Tower record.
 
 import { CONFIG } from './tower_config.js';
+import { sanitiseStamp } from './tower_record.js';
 import { FAMILIES, FAMILY_BY_ID, CATEGORIES, synergyState, tierOfPower } from './tower_buffs.js';
 
 const sub = (a, b) => a.filter((x) => !b.includes(x));
@@ -111,7 +112,7 @@ export function evaluate(run, tower, cfg = CONFIG) {
 /** A NEW Tower record with these ids stamped at `at` (the caller's time). Unknown ids and already-held ones are ignored. */
 export function unlock(tower, ids, at) {
   const t = JSON.parse(JSON.stringify(tower));
-  for (const id of ids) if (ACHIEVEMENT_BY_ID[id] && !(id in t.achievements)) t.achievements[id] = at;
+  for (const id of ids) if (ACHIEVEMENT_BY_ID[id] && !(id in t.achievements)) t.achievements[id] = sanitiseStamp(at);
   return t;
 }
 export const missing = (tower) => sub(A.map((a) => a.id), Object.keys(tower.achievements));

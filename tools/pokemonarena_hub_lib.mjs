@@ -129,7 +129,7 @@ export async function towerFixtures(pack) {
     for (let g = 0; g < 400; g++) {
       const tw = persist.peek(), cur = tw.current;
       if (!cur) break;
-      if (cur.phase === 'offer') { if (cur.floor - 1 >= upTo) break; await s.pick({ seed, id: picks === null ? null : cur.offer[picks % cur.offer.length].id }); }
+      if (cur.phase === 'offer') { if (cur.floor - 1 >= upTo) break; await s.pick({ seed, id: picks === null ? null : cur.offer[picks % cur.offer.length].id, floor: cur.floor, offer: SS.offerKey(cur) }); }
       else await s.finishFloor({ floor: cur.floor, seed, result: { floor: cur.floor, result: 'w', turns: 5, faints: cur.floor % 3 } });
     }
     return { persist, s };
@@ -140,7 +140,7 @@ export async function towerFixtures(pack) {
   const withLast = (tw, other) => ({ ...JSON.parse(JSON.stringify(tw)), last: JSON.parse(JSON.stringify(other.last)), runs: other.runs, floors: other.floors, best: { ...other.best, '3v3': tw.best['3v3'] }, achievements: { ...other.achievements, ...tw.achievements }, buffsSeen: { ...other.buffsSeen } });
   const offer3 = withLast(a.persist.peek(), earlier.persist.peek());
   const fight = JSON.parse(JSON.stringify(offer3));
-  { const p2 = SS.memoryPersist(fight); const s2 = SS.createTowerSession({ pack, persist: p2, now: clock }); await s2.pick({ seed: 4242, id: fight.current.offer[0].id }); Object.assign(fight, p2.peek()); }
+  { const p2 = SS.memoryPersist(fight); const s2 = SS.createTowerSession({ pack, persist: p2, now: clock }); await s2.pick({ seed: 4242, id: fight.current.offer[0].id, floor: fight.current.floor, offer: SS.offerKey(fight.current) }); Object.assign(fight, p2.peek()); }
   const b = await drive(909, '3v3', 10, 2);
   const offer5 = withLast(b.persist.peek(), earlier.persist.peek());
   const none = JSON.parse(JSON.stringify(earlier.persist.peek()));

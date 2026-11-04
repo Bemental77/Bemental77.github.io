@@ -28,14 +28,14 @@ export function towerBattleHref(run, { profileId = null, cfg = CONFIG } = {}) {
 
 /**
  * Read the Tower part of an address. -> { ok: true, tower: null } (no `tower` parameter: a regular battle) | { ok: true, tower: { floor, run, life, profileId } } | { ok: false, error: { param, title, message } }
- * Strict: `tower` must be exactly "1"; floor, run and life are plain decimal numbers in range; the profile id has the profile id alphabet. Nothing is echoed back.
+ * Only `tower=1` turns the Tower on. An address without a `tower` parameter is a regular one and `floor`, `run`, `life` and `p` on it mean nothing: they are ignored, exactly as the build before the Tower
+ * ignored every parameter it did not know (a link with a tracker's `p=1` on it must still open a Quick Battle).
+ * Strict once `tower` is there: it must be exactly "1"; floor, run and life are plain decimal numbers in range; the profile id has the profile id alphabet. Nothing is echoed back.
  */
 export function parseTowerParams(q, cfg = CONFIG) {
   const has = (k) => q.has(k);
   const bad = (param, message) => ({ ok: false, error: { param, title: 'That Tower address cannot be used', message } });
-  const any = ['tower', 'floor', 'run', 'life', 'p'].some(has);
-  if (!any) return { ok: true, tower: null };
-  if (!has('tower')) return bad('tower', 'The Tower fight is missing its tower=1 parameter.');
+  if (!has('tower')) return { ok: true, tower: null };
   if (q.get('tower') !== '1') return bad('tower', 'The tower parameter must be 1.');
   const num = (k, lo, hi, required) => { if (!has(k)) return required ? null : lo; const s = q.get(k); if (!/^\d{1,10}$/.test(s)) return null; const n = Number(s); return n >= lo && n <= hi ? n : null; };
   const floor = num('floor', 1, cfg.floors, true);

@@ -55,7 +55,7 @@ import { resolveRuleset, validateMon, validateTeam, DEFAULT_RULESET_ID } from '.
 import { defaultCodec } from './charset.js';
 import { PINNED, sha256Hex } from './rom.js';
 import { emptyCareer, CAREER_KEYS, checkCareer, normalizeCareer, foldMatch, matchIssue, battleCount } from './career_stats.js';
-import { emptyTower, checkTowerShape, normalizeTower } from './tower_record.js';
+import { emptyTower, checkTowerShape, normalizeTower, capBag } from './tower_record.js';
 
 // ---------------------------------------------------------------------------------------------
 // constants
@@ -609,7 +609,12 @@ function migrate4to5(d) {
   if (!isObj(o)) return o;
   o.schemaVersion = 5;
   if (hasOwn.call(o, 'tower')) {
-    if (checkTowerShape(o.tower).length) { bagSet(o, 'v4Tower', o.tower); o.tower = emptyTower(); }
+    if (checkTowerShape(o.tower).length) {
+      // a free name for the junk: `v4Tower` may already be taken by the player's own unknown value (in the bag, or as a stray top-level key that the normaliser will move into the bag), and writing over it would lose that value
+      let key = 'v4Tower';
+      for (let i = 2; (isObj(o._unknown) && hasOwn.call(o._unknown, key)) || hasOwn.call(o, key); i++) key = 'v4Tower_' + i;
+      bagSet(o, key, o.tower); o.tower = emptyTower();
+    }
   } else o.tower = emptyTower();
   return o;
 }
@@ -727,7 +732,10 @@ export function normalizeProfile(input, opts = {}) {
   // tower (v5): repaired field by field; what cannot be kept goes to the record's own unknown bag, never lost silently
   { const tw = normalizeTower(input.tower, P, true);
     out.tower = tw.value;
-    if (Object.keys(tw.rejected).length) out.tower._unknown = mergeBag(isObj(out.tower._unknown) ? out.tower._unknown : null, { towerRejected: tw.rejected });
+    if (Object.keys(tw.rejected).length) {          // (what could not be kept goes in the record's bag, which is held to tower_record.js TOWER_LIMITS.bagMax: a hostile file cannot park megabytes there)
+      const bag = capBag(mergeBag(isObj(out.tower._unknown) ? out.tower._unknown : null, { towerRejected: tw.rejected }));
+      if (Object.keys(bag).length) out.tower._unknown = bag; else delete out.tower._unknown;
+    }
   }
 
   // identity

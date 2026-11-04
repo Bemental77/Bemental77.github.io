@@ -229,7 +229,7 @@ async function suite(S, tag, opt = {}) {
     let steps = 0, tw = await persist.read();
     for (let g = 0; g < 80 && tw.current; g++) {
       const cur = tw.current;
-      if (cur.phase === 'offer') await sess.pick({ seed: 321, id: cur.offer[0].id });
+      if (cur.phase === 'offer') await sess.pick({ seed: 321, id: cur.offer[0].id, floor: cur.floor, offer: SS.offerKey(cur) });
       else await sess.finishFloor({ floor: cur.floor, seed: 321, result: { floor: cur.floor, result: cur.floor < 9 ? 'w' : 'l', turns: 6, faints: cur.floor % 2 } });
       tw = await persist.read(); steps++;
     }
@@ -250,17 +250,128 @@ async function suite(S, tag, opt = {}) {
     let tnf = null; try { SS.teamSnapshot(prof, 'nope'); } catch (e) { tnf = e; }
     ok(tnf instanceof RangeError, t('T5 a team that is not there is a RangeError'), String(tnf));
   }
+
+  /* D. a hostile or hand-edited Tower record can never lock the Tower, and cannot fill the store (real import, real store, real session) */
+  if (grp('D')) {
+    const pack = opt.pack, LIM = R.TOWER_LIMITS;
+    const mem = async (name) => { const adapter = ST.createMemoryAdapter({ name: name + '-' + (++counter), durable: true }); const store = await ST.openStore({ adapter, channel: false, deps: deps() }); return { store, adapter }; };
+    const withTower = (mod) => { const d = clone(FIX.tower); d.tower.current = null; mod(d.tower); return d; };
+    const kinds = {
+      '400 junk buff ids': (x) => { for (let i = 0; i < 400; i++) x.buffsSeen['zz-' + i] = 1; },
+      '500 junk achievements': (x) => { for (let i = 0; i < 500; i++) x.achievements['zz-' + i] = 1; },
+      'runs at a billion': (x) => { x.runs = 1e9; },
+      'wins at a billion in both formats': (x) => { x.winsByFormat = { '3v3': 1e9, '6v6': 1e9 }; x.wins = 2e9; x.runs = 1e9; },
+    };
+    // the real route: the file the checksum covers -> parseExport -> the store -> a climb through the real transaction (store.towerUpdate: compare-and-set, validated)
+    for (const [name, mod] of Object.entries(kinds)) {
+      let why = '';
+      try {
+        const d = withTower(mod), bytes = (await P.exportBytes({ ...clone(d), tower: d.tower }, { gzip: false, deps: { now: () => NOW } })).bytes, parsed = await P.parseExport(bytes, {});
+        if (!parsed.ok) why = 'the file was refused: ' + parsed.code;
+        else {
+          const t = parsed.profile.tower;
+          if (Object.keys(t.buffsSeen).length > LIM.buffsKeep || Object.keys(t.achievements).length > LIM.achievementsKeep || t.runs > LIM.counterKeep || R.checkTowerShape(t).length) why = 'the imported record is not inside the repair limits';
+          else if (!t.last || !Object.keys(t.achievements).length || !t._unknown) why = 'the rest of the climb (the last run, the achievements, the unknown fields) was thrown away with the bad field';
+          const { store, adapter } = await mem('hostile');
+          const id = (await store.createProfile({ trainerName: 'ASH' })).id;
+          await adapter.transact(['profiles'], 'readwrite', (tx) => tx.put('profiles', { ...parsed.profile, id, rev: 1 }));
+          const persist = SS.storePersist(store, id), sess = SS.createTowerSession({ pack, persist, now: () => 5000 });
+          const s0 = await sess.startRun({ seed: 321, format: '3v3', team: null });
+          let tw = await persist.read(); const steps = [];
+          for (let g = 0; g < 40 && tw.current; g++) {
+            const cur = tw.current;
+            const r = cur.phase === 'offer' ? await sess.pick({ seed: 321, id: cur.offer[0].id, floor: cur.floor, offer: SS.offerKey(cur) }) : await sess.finishFloor({ floor: cur.floor, seed: 321, result: { floor: cur.floor, result: cur.floor < 5 ? 'w' : 'l', turns: 6, faints: 1 } });
+            steps.push(r && r.applied); tw = await persist.read();
+          }
+          const s1 = await sess.startRun({ seed: 322, format: '6v6', team: null }), gu = await sess.giveUp({ seed: 322 }), st2 = await sess.startRun({ seed: 323, format: '3v3', team: null }), rp = await sess.startRun({ seed: 324, format: '3v3', team: null, replace: true });
+          const l = await store.loadProfile(id);
+          if (!s0.applied || !steps.length || !steps.every(Boolean) || tw.current !== null || tw.runs < 1) why = why || 'the climb did not record: ' + J({ s0: s0.applied, steps, cur: !!tw.current, runs: tw.runs });
+          else if (!s1.applied || !gu.applied || !st2.applied || !rp.applied || !l.ok || l.profile.tower.current.seed !== 324) why = why || 'give up / start over failed: ' + J([s1.applied, gu.applied, st2.applied, rp.applied]);
+        }
+      } catch (e) { why = 'threw ' + e.message; }
+      ok(!why, t('D1 a file with ' + name + ' imports, and the Tower still works on the profile it made: start, win, take a ball, lose, start again, give up, start over (nothing throws a ValidationError)'), why);
+    }
+    // a bag of unknown values does not grow without bound, however it is filled; the climb is kept
+    {
+      const d = withTower((x) => { for (let i = 0; i < 20000; i++) x.buffsSeen['zz-' + i] = 1; x._unknown = { futureTowerThing: { keep: 'me' }, huge: 'x'.repeat(2e6) }; });
+      const t0 = Date.now(), o = open(d), ms = Date.now() - t0, again = open(o.profile);
+      const bag = o.profile.tower._unknown || {}, size = JSON.stringify(bag).length;
+      ok(o.ok && size <= LIM.bagMax && !('huge' in bag) && P.checkProfile(o.profile).length === 0 && !again.changed && !again.problems.length && canon(again.profile) === canon(o.profile) && canon(o.profile.stats) === canon(FIX.tower.stats) && o.profile.tower.last && ms < 2000, t('D2 20000 junk ids and a 2 MB value in the Tower record: the profile opens (in ' + ms + ' ms), the record\'s bag is held to ' + LIM.bagMax + ' characters (' + size + '), opening it again changes nothing, and the battle record is untouched'), J({ ok: o.ok, size, bad: P.checkProfile(o.profile).length, changed: again.changed }));
+    }
+    {
+      const d = withTower((x) => { x._unknown = { huge: 'x'.repeat(2e6), futureTowerThing: { keep: 'me' } }; });
+      const o = open(d), bag = o.profile.tower._unknown || {};
+      ok(o.ok && JSON.stringify(bag).length <= LIM.bagMax && 'futureTowerThing' in bag && !('huge' in bag) && !open(o.profile).changed, t('D2b a 2 MB value in the Tower record\'s own bag (nothing else wrong with it) is dropped on opening and the small unknown field next to it is kept'), J(Object.keys(bag)));
+    }
+    // a stored run that passes the shallow check and not the deep parser: it is shown as broken, and DROP THIS RUN / NEW RUN work through the real store
+    {
+      const deep = { 'an empty history row': (c) => { c.history = [{}]; }, 'a buff that does not exist': (c) => { c.held = [{ id: 'no-such-buff', p: 1 }]; } };
+      for (const [name, mod] of Object.entries(deep)) {
+        let why = '';
+        try {
+          const { store, adapter } = await mem('deep'), id = (await store.createProfile({ trainerName: 'ASH' })).id, persist = SS.storePersist(store, id), sess = SS.createTowerSession({ pack, persist, now: () => 5000 });
+          await sess.startRun({ seed: 51, format: '3v3', team: null });
+          const doc = (await store.loadProfile(id)).profile; mod(doc.tower.current);
+          await adapter.transact(['profiles'], 'readwrite', (tx) => tx.put('profiles', { ...doc, id, rev: doc.rev + 1 }));
+          const sum = SS.summarizeTower((await store.loadProfile(id)).profile.tower, pack);
+          if (!sum.run || sum.run.broken !== true) why = 'the run is not shown as broken: ' + J(sum.run).slice(0, 60);
+          const g = await sess.giveUp({ seed: 51 });
+          if (!why && !(g.applied && (await persist.read()).current === null && (await persist.read()).runs === 0)) why = 'DROP THIS RUN did not drop it: ' + J(g).slice(0, 80);
+          // a second broken run, then NEW RUN over it
+          await sess.startRun({ seed: 52, format: '3v3', team: null });
+          const doc2 = (await store.loadProfile(id)).profile; mod(doc2.tower.current);
+          await adapter.transact(['profiles'], 'readwrite', (tx) => tx.put('profiles', { ...doc2, id, rev: doc2.rev + 1 }));
+          const r = await sess.startRun({ seed: 53, format: '3v3', team: null, replace: true });
+          if (!why && !(r.applied && (await persist.read()).current.seed === 53 && (await persist.read()).runs === 0)) why = 'NEW RUN did not start over it: ' + J(r).slice(0, 80);
+        } catch (e) { why = 'threw ' + e.message; }
+        ok(!why, t('D3 a stored run with ' + name + ' is shown as broken, DROP THIS RUN removes it and NEW RUN starts over it, through the real store (it used to throw a TypeError and lock the Tower)'), why);
+      }
+    }
+    {
+      const { store, adapter } = await mem('nullrow'), id = (await store.createProfile({ trainerName: 'ASH' })).id, persist = SS.storePersist(store, id), sess = SS.createTowerSession({ pack, persist, now: () => 5000 });
+      await sess.startRun({ seed: 61, format: '3v3', team: null });
+      const doc = (await store.loadProfile(id)).profile; doc.tower.current.history = [null]; doc.tower.current.held = [null];
+      await adapter.transact(['profiles'], 'readwrite', (tx) => tx.put('profiles', { ...doc, id, rev: doc.rev + 1 }));
+      const l = await store.loadProfile(id), r = await sess.startRun({ seed: 62, format: '3v3', team: null });
+      ok(l.ok && l.profile.tower.current === null && J(l.profile.tower._unknown && l.profile.tower._unknown.towerRejected && l.profile.tower._unknown.towerRejected.current && l.profile.tower._unknown.towerRejected.current.history) === '[null]' && r.applied && (await persist.read()).current.seed === 62, t('D3b a stored run with null rows is not kept as a run at all (it is handed back in the record\'s bag), so the Tower is free: a new run starts at once without anything to drop'), J(l.profile.tower.current).slice(0, 60));
+    }
+    // the v4 -> v5 migration never loses a value: the junk `tower` takes a FREE name in the unknown bag
+    {
+      const has = (o, v) => JSON.stringify(o).includes(v);
+      const a = clone(FIX.v4); a.tower = 'junk-tower'; a._unknown = { ...(a._unknown || {}), v4Tower: 'player-value-1' };
+      const oa = open(a);
+      ok(oa.ok && has(oa.profile, 'player-value-1') && has(oa.profile, 'junk-tower') && oa.profile._unknown.v4Tower === 'player-value-1' && oa.profile._unknown.v4Tower_2 === 'junk-tower' && J(oa.profile.tower) === J(EMPTY()) && P.checkProfile(oa.profile).length === 0, t('D4 a v4 file with a junk `tower` AND its own unknown value named v4Tower keeps BOTH (the junk goes under v4Tower_2)'), J(oa.profile && oa.profile._unknown).slice(0, 160));
+      const b = clone(FIX.v4); b.tower = 12345; b.v4Tower = 'player-value-2';
+      const ob = open(b);
+      ok(ob.ok && has(ob.profile, 'player-value-2') && has(ob.profile, '12345') && P.checkProfile(ob.profile).length === 0 && !open(ob.profile).changed, t('D5 a v4 file with a junk `tower` AND a stray top-level key named v4Tower keeps both values, and opening the result again changes nothing'), J(ob.profile && ob.profile._unknown).slice(0, 160));
+      const c = clone(FIX.v4); c.tower = 'junk-tower'; c._unknown = { ...(c._unknown || {}), v4Tower: 'one', v4Tower_2: 'two' };
+      const oc = open(c);
+      ok(oc.ok && has(oc.profile, 'one') && has(oc.profile, 'two') && has(oc.profile, 'junk-tower') && oc.profile._unknown.v4Tower_3 === 'junk-tower', t('D6 ... and the next free name is taken when v4Tower_2 is taken too'), J(oc.profile && oc.profile._unknown).slice(0, 160));
+    }
+  }
 }
 
 /* ------------------------------------------------------------------------------------------------ mutants */
 const MUTANTS = [
   { id: 'migrate-drops-tower', why: 'the v4 -> v5 migration forgets to add the Tower record', file: 'profile.js', from: '  } else o.tower = emptyTower();\n  return o;', to: '  }\n  return o;', groups: ['P'] },
-  { id: 'migrate-overwrites-tower', why: 'a v4 document that already has a good Tower record loses it', file: 'profile.js', from: "if (checkTowerShape(o.tower).length) { bagSet(o, 'v4Tower', o.tower); o.tower = emptyTower(); }", to: "{ bagSet(o, 'v4Tower', o.tower); o.tower = emptyTower(); }", groups: ['P'] },
-  { id: 'migrate-loses-junk', why: 'a junk `tower` of a v4 document is thrown away instead of kept', file: 'profile.js', from: "bagSet(o, 'v4Tower', o.tower); o.tower = emptyTower(); }\n  } else", to: "o.tower = emptyTower(); }\n  } else", groups: ['P'] },
+  { id: 'migrate-overwrites-tower', why: 'a v4 document that already has a good Tower record loses it', file: 'profile.js', from: 'if (checkTowerShape(o.tower).length) {\n', to: '{\n', groups: ['P'] },
+  { id: 'migrate-loses-junk', why: 'a junk `tower` of a v4 document is thrown away instead of kept', file: 'profile.js', from: 'bagSet(o, key, o.tower); o.tower = emptyTower();', to: 'o.tower = emptyTower();', groups: ['P'] },
   { id: 'migrate-says-v4', why: 'the migration forgets to say schema 5', file: 'profile.js', from: 'o.schemaVersion = 5;\n  if (hasOwn.call(o, \'tower\')) {', to: 'o.schemaVersion = 4;\n  if (hasOwn.call(o, \'tower\')) {', groups: ['P'] },
   { id: 'migrate-writes-input', why: 'the migration writes into its input', file: 'profile.js', from: 'function migrate4to5(d) {\n  const o = clone(d);', to: 'function migrate4to5(d) {\n  const o = d;', groups: ['P'] },
+  { id: 'migrate-key-ignores-the-bag', why: 'the junk `tower` is filed under a name the player\'s own unknown value already holds (and overwrites it)', file: 'profile.js', from: '(isObj(o._unknown) && hasOwn.call(o._unknown, key)) || hasOwn.call(o, key)', to: 'hasOwn.call(o, key)', groups: ['D'] },
+  { id: 'migrate-key-ignores-a-root-key', why: 'the junk `tower` is filed under a name a stray top-level key of the file already holds (and that key\'s value is lost)', file: 'profile.js', from: '(isObj(o._unknown) && hasOwn.call(o._unknown, key)) || hasOwn.call(o, key)', to: '(isObj(o._unknown) && hasOwn.call(o._unknown, key))', groups: ['D'] },
+  { id: 'migrate-key-takes-the-second-name-always', why: 'every junk `tower` goes under v4Tower_2', file: 'profile.js', from: "let key = 'v4Tower';", to: "let key = 'v4Tower_2';", groups: ['P', 'D'] },
+  { id: 'rejected-bag-uncapped', why: 'what the repair hands back is parked in the bag whatever its size', file: 'profile.js', from: 'const bag = capBag(mergeBag(', to: 'const bag = (mergeBag(', groups: ['D'] },
+  { id: 'tower-repair-bag-uncapped', why: 'the Tower record\'s own unknown bag has no size limit', file: 'tower_record.js', from: 'if (b2) b2 = capBag(b2);', to: '', groups: ['D'] },
+  { id: 'repair-keeps-buffs-to-the-check-limit', why: 'the repair keeps as many buff ids as the check allows (the next real one locks the Tower)', file: 'tower_record.js', from: 'kept < TOWER_LIMITS.buffsKeep', to: 'kept < TOWER_LIMITS.buffsMax', groups: ['D'] },
+  { id: 'repair-keeps-achievements-to-the-check-limit', why: 'the repair keeps as many achievements as the check allows', file: 'tower_record.js', from: 'kept < TOWER_LIMITS.achievementsKeep', to: 'kept < TOWER_LIMITS.achievementsMax', groups: ['D'] },
+  { id: 'repair-keeps-counters-to-the-check-limit', why: 'the repair keeps a counter at the check\'s limit', file: 'tower_record.js', from: 'if (isInt(src[k], 0, TOWER_LIMITS.counterKeep)) out[k] = src[k];', to: 'if (isInt(src[k], 0, TOWER_LIMITS.counterMax)) out[k] = src[k];', groups: ['D'] },
+  { id: 'repair-lets-wins-add-up-past-the-limit', why: 'the wins of the two formats may add up past the limit (the repair then empties the whole record)', file: 'tower_record.js', from: "perFormat('winsByFormat', Math.floor(TOWER_LIMITS.counterKeep / cfg.formats.length));", to: "perFormat('winsByFormat', TOWER_LIMITS.counterMax);", groups: ['D'] },
+  { id: 'shape-allows-null-history-rows', why: 'a stored run with null rows in its history passes the shallow check', file: 'tower_record.js', from: 'if (!r.team.recs.every(isObj) || !r.held.every(isObj) || !r.history.every(isObj)) return false;', to: '', groups: ['D'] },
+  { id: 'drop-folds-an-unreadable-run', why: 'DROP THIS RUN folds a run that cannot be read (a TypeError inside the store transaction)', file: 'tower_session.js', from: 'if (!countable(cur, cfg)) return { tower:', to: 'if (false) return { tower:', groups: ['D'] },
+  { id: 'new-run-folds-an-unreadable-run', why: 'NEW RUN over a run that cannot be read folds it', file: 'tower_session.js', from: 't = countable(tower.current, cfg) ? conclude(', to: 't = true ? conclude(', groups: ['D'] },
   { id: 'normalize-resets-tower', why: 'opening a profile throws its Tower record away', file: 'profile.js', from: '    out.tower = tw.value;\n', to: '    out.tower = emptyTower();\n', groups: ['P'] },
-  { id: 'normalize-loses-rejected', why: 'a damaged Tower value is not kept in the bag', file: 'profile.js', from: "if (Object.keys(tw.rejected).length) out.tower._unknown = mergeBag(isObj(out.tower._unknown) ? out.tower._unknown : null, { towerRejected: tw.rejected });", to: '', groups: ['P'] },
+  { id: 'normalize-loses-rejected', why: 'a damaged Tower value is not kept in the bag', file: 'profile.js', from: 'const bag = capBag(mergeBag(isObj(out.tower._unknown) ? out.tower._unknown : null, { towerRejected: tw.rejected }));', to: 'const bag = capBag(mergeBag(isObj(out.tower._unknown) ? out.tower._unknown : null, {}));', groups: ['P'] },
   { id: 'check-ignores-tower', why: 'a profile with a bad Tower record is well formed', file: 'profile.js', from: "for (const why of checkTowerShape(p.tower).slice(0, 3)) add('profile.tower', 'tower', 'tower: ' + why);", to: '', groups: ['P'] },
   { id: 'create-without-tower', why: 'a new profile has no Tower record', file: 'profile.js', from: 'identity: emptyIdentity(), tower: emptyTower(),\n  };', to: 'identity: emptyIdentity(),\n  };', groups: ['P'] },
   { id: 'merge-overwrites-tower', why: 'a merge replaces the active profile\'s Tower record with the file\'s', file: 'profile.js', from: "  report.record = 'kept-local';", to: "  p.tower = clone(incoming.tower);\n  report.record = 'kept-local';", groups: ['X'] },

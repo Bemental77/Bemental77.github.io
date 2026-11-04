@@ -37,12 +37,12 @@ const plainOk = (v) => { const seen = []; (function walk(x, p) { if (x === undef
 
 /* ================================================================================================ the state machine */
 // a check that THROWS must not hide the failures already found: they are kept, and the abort is one more failure
-function checkModel(HM) {
+function checkModel(HM, TH) {
   const f = [];
-  try { checkModelBody(HM, f); } catch (err) { f.push('checks aborted by an exception: ' + (err && err.message)); }
+  try { checkModelBody(HM, f, TH); } catch (err) { f.push('checks aborted by an exception: ' + (err && err.message)); }
   return f;
 }
-function checkModelBody(HM, f) {
+function checkModelBody(HM, f, TH) {
   const t = (name, cond, detail) => {
     let good = false, why = '';
     try { good = !!cond(); } catch (err) { why = ' [threw: ' + (err && err.message) + ']'; }
@@ -115,7 +115,7 @@ function checkModelBody(HM, f) {
   m = mk(D(F.offer3)); tower(m); m.press('a');
   let v = m.view();
   t('offer: three balls, the first highlighted, with their names, rarities, colours and the ROM ball sprites', () => (m.path() === 'tower-offer' && v.tower.balls.length === 3 && v.tower.cursor === 0 && v.tower.balls.every((b) => b.name && ['green', 'blue', 'purple', 'gold'].includes(b.rarity) && /^#[0-9a-f]{6}$/.test(b.color) && [7, 9, 4, 13].includes(b.ball) && b.effectText)), () => (J(v.tower.balls.map((b) => [b.name, b.rarity, b.ball]))));
-  t('offer: the message says the floor and how to choose', () => (/Floor 3 cleared/.test(v.msg[0]) && /A takes it/.test(v.msg[1])), () => (J(v.msg)));
+  t('offer: the message says the floor and how to choose (A takes it, B goes back to the Tower menu)', () => (/Floor 3 cleared/.test(v.msg[0]) && /A takes it/.test(v.msg[1]) && /B: Tower menu/.test(v.msg[1])), () => (J(v.msg)));
   press(m, 'right', 'right'); t('offer: right walks the balls, then the SKIP slot, then wraps to the first', () => (m.view().tower.cursor === 2 && (press(m, 'right'), m.view().tower.cursor === 3) && (press(m, 'right'), m.view().tower.cursor === 0)), () => (''));
   press(m, 'left'); t('offer: left from the first ball goes to SKIP', () => (m.view().tower.cursor === 3), () => (''));
   press(m, 'right'); e = press(m, 'a');
@@ -129,7 +129,70 @@ function checkModelBody(HM, f) {
   t('offer: "down" goes to SKIP, and A there asks "take nothing?"', () => (m.view().tower.cursor === 3 && m.view().tower.confirm && m.view().tower.confirm.kind === 'skip' && /nothing/.test(m.view().msg[0]) && e.length === 0), () => (J(m.view().msg)));
   e = press(m, 'left', 'a'); t('offer: YES to that skips (id null)', () => (e.length === 1 && e[0].type === 'tower-pick' && e[0].id === null), () => (J(e)));
   m = mk(D(F.offer3)); tower(m); m.press('a');
-  e = m.press('b'); t('offer: B moves the cursor to SKIP first, and asks only the second time', () => (e.length === 0 && m.view().tower.cursor === 3 && m.view().tower.confirm === null && (m.press('b'), m.view().tower.confirm && m.view().tower.confirm.kind === 'skip')), () => (''));
+  e = m.press('start'); t('offer: START moves the cursor to SKIP first, and asks only the second time', () => (e.length === 0 && m.view().tower.cursor === 3 && m.view().tower.confirm === null && (m.press('start'), m.view().tower.confirm && m.view().tower.confirm.kind === 'skip')), () => (''));
+  // ---- B on the offer: back to the Tower menu, where MY BUFFS is, without losing the offer
+  m = mk(D(F.offer3)); tower(m); m.press('a'); press(m, 'right'); e = m.press('b');
+  t('offer: B steps back to the Tower menu (a screen change, no pick, no skip); the offer is still the run\'s: CHOOSE A BUFF is the first row and MY BUFFS the next', () => (m.path() === 'tower' && e.length === 1 && e[0].type === 'screen' && e[0].path === 'tower' && e[0].back === true && eff(e, 'tower-pick').length === 0 && labels(m)[0] === 'CHOOSE A BUFF' && labels(m)[1] === 'MY BUFFS'), () => (J(e) + ' ' + J(labels(m))));
+  e = press(m, 'down', 'a'); t('offer: ... MY BUFFS is one row down: the held buffs, and B from there is back on the menu', () => (m.path() === 'tower-buffs' && (m.press('b'), m.path() === 'tower')), () => (m.path()));
+  e = m.press('up'); e = press(m, 'a');
+  t('offer: ... and CHOOSE A BUFF opens the same offer again, which can still be answered (the pick names the ball)', () => (m.path() === 'tower-offer' && m.view().tower.balls.length === 3 && (press(m, 'a'), true) && (e = press(m, 'left', 'a'), e.length === 1 && e[0].type === 'tower-pick' && e[0].id === F.offer3.run.offer.balls[0].id)), () => (m.path() + ' ' + J(e)));
+  m = mk(null); m.goto('tower-offer'); m.setData(D(F.offer3)); m.press('b'); e = m.setData(D(F.offer3));
+  t('data: after B from an offer the player opened by address, a data refresh leaves them on the Tower menu: the offer is NOT opened again by itself', () => (m.path() === 'tower' && e.length === 0 && m.setData(D(F.offer3)).length === 0 && m.path() === 'tower'), () => (m.path() + ' ' + J(e)));
+  // ---- a pick names the offer it answers
+  m = mk(D(F.offer3)); tower(m); m.press('a'); m.press('a'); e = press(m, 'left', 'a');
+  t('offer: the pick carries the floor and the key of the offer it answers (an old screen cannot answer a newer offer)', () => (e.length === 1 && e[0].floor === F.offer3.run.floor && typeof e[0].offer === 'string' && e[0].offer === F.offer3.run.offer.key && /^\d+:[0-9a-f]+$/.test(e[0].offer)), () => (J(e)));
+  // ---- the note after a step survives the screen change the step causes
+  m = mk(D(F.offer3)); tower(m); m.press('a');
+  m.tower.notify(['You took Power Training!', 'Floor 4 is next.']); e = m.setData(D(F.fight));
+  t('note: a note set before the data refresh ("You took X!") is what the Tower screen says after the offer closes', () => (m.path() === 'tower' && e.length === 1 && J(m.view().msg) === J(['You took Power Training!', 'Floor 4 is next.'])), () => (m.path() + ' ' + J(m.view().msg)));
+  press(m, 'down'); t('note: ... until the cursor moves', () => (J(m.view().msg) !== J(['You took Power Training!', 'Floor 4 is next.'])), () => (J(m.view().msg)));
+  // ---- NEW RUN: one token per visit, one run per token
+  m = mk(D(F.none)); tower(m); toRow(m, 'new'); m.press('a'); toRow(m, 'start'); const tk1 = m.press('a'); const tk1b = m.press('a');
+  t('new: START carries a token naming the visit (a double tap sends the SAME token twice)', () => (tk1.length === 1 && tk1[0].type === 'tower-new' && Number.isInteger(tk1[0].token) && tk1b.length === 1 && tk1b[0].token === tk1[0].token), () => (J([tk1, tk1b])));
+  m.press('b'); m.press('b'); tower(m); toRow(m, 'new'); m.press('a'); toRow(m, 'start'); const tk2 = m.press('a');
+  t('new: a new visit to NEW RUN has a new token', () => (tk2.length === 1 && tk2[0].token !== tk1[0].token), () => (J([tk1, tk2])));
+  {
+    const g = TH.createOnceGate();
+    t('gate: a token goes through once; a repeat is refused; a released token goes through again; no token always passes', () => (g.enter(5) === true && g.enter(5) === false && g.enter(6) === true && (g.release(5), g.enter(5) === true) && g.enter(undefined) === true && g.enter(undefined) === true), () => (''));
+  }
+  // ---- the history of a screen the page was opened at
+  t('trail: a screen opened by address has the entries it would have had if walked to (the menu\'s own, then each screen on the way)', () => (J(TH.arrivalTrail('tower-offer')) === J(['tower', 'tower-offer']) && J(TH.arrivalTrail('tower-last')) === J(['tower', 'tower-last']) && J(TH.arrivalTrail('tower')) === J(['tower']) && J(TH.arrivalTrail('quick')) === J(['quick']) && J(TH.arrivalTrail('main')) === J([])), () => (J(TH.arrivalTrail('tower-offer'))));
+  // ---- long texts: wrapped by words, paged, never cut
+  {
+    const long = clone(F.offer5), words = 'Alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon'.split(' '), TXT = words.join(' ');
+    const TXT2 = words.slice().reverse().join(' '); long.run.held[0].text = TXT; long.run.held[1].text = TXT2; long.run.held[2].text = 'Short text.';
+    const rule = { measure: (s) => s.length * 6, msgPx: 100 };                       // 88 px of text = 14 characters a line
+    const mkL = () => { const mm = HM.createHubModel({ mascot: 25, ...rule }); mm.setData(D(long)); tower(mm); toRow(mm, 'buffs'); mm.press('a'); return mm; };
+    m = mkL(); const pages = []; let guard = 0;
+    do { const vv = m.view(); pages.push({ msg: vv.msg.slice(), more: vv.tower.more, page: vv.tower.page, pages: vv.tower.pages }); } while (pages[pages.length - 1].more && guard++ < 30 && (m.press('a'), true));
+    const flat = pages.flatMap((p) => p.msg).filter(Boolean);
+    t('wrap: a long text is word-wrapped into pages of two lines that each fit the window, and A turns the page (' + pages.length + ' pages)', () => (pages.length >= 3 && flat.every((ln) => ln.length * 6 <= 88) && pages[0].page === 1 && pages[0].pages === pages.length && pages[pages.length - 1].more === false && pages.slice(0, -1).every((p) => p.more === true)), () => (J(pages)));
+    t('wrap: no word is cut or lost across the pages (the words read back exactly)', () => (flat.join(' ') === TXT), () => (flat.join(' | ')));
+    t('wrap: on the last page A opens the full description (a turn first, the reading after)', () => (m.view().tower.detail === null && (m.press('a'), m.view().tower.detail !== null)), () => (''));
+    m = mkL(); m.press('a'); press(m, 'down'); t('wrap: moving to another row starts at its first page (the page turned on the row before does not carry over)', () => (m.view().tower.page === 1 && m.view().tower.pages > 1 && m.view().tower.more === true), () => (J(m.view().tower)));
+    press(m, 'down'); t('wrap: a short text has one page and no arrow', () => (m.view().tower.page === 1 && m.view().tower.pages === 1 && m.view().tower.more === false && m.view().msg[0] === 'Short text.'), () => (J(m.view().tower)));
+    m = mkL(); m.pointer({ kind: 'click', x: 120, y: 130 });
+    t('wrap: a tap on the message box turns the page too', () => (m.view().tower.page === 2), () => (String(m.view().tower.page)));
+    const lw = TH.wrapLines('aaaaaaaaaaaaaaaaaaaaaaaaa bb', (s) => s.length * 6, 60);
+    t('wrap: a word wider than a line is cut where it must be, and nothing is lost', () => (lw.join('').replace(/ /g, '') === 'a'.repeat(25) + 'bb' && lw.every((x) => x.length * 6 <= 60)), () => (J(lw)));
+    const ach = HM.createHubModel({ mascot: 25, ...rule }); const dach = clone(F.fight); dach.achievements[0].desc = TXT; ach.setData(D(dach)); tower(ach); toRow(ach, 'ach'); ach.press('a');
+    const ap = []; guard = 0; do { ap.push(ach.view().msg.filter(Boolean)); } while (ach.view().tower.more && guard++ < 30 && (ach.press('a'), true));
+    t('wrap: the achievement text pages the same way (and A on the last page still goes back)', () => (ap.flat().join(' ').startsWith(TXT) && ach.path() === 'tower-ach' && (ach.press('a'), ach.path() === 'tower')), () => (J(ap)));
+  }
+  // ---- what a screen reader gets
+  {
+    const say = (mm) => TH.speakTower(mm.view());
+    m = mk(D(F.fight)); tower(m); const s1 = say(m);
+    t('speak: the Tower home says "Tower." and its message (no empty screen word)', () => (/^Tower\. /.test(s1) && !/Tower, \./.test(s1) && /selected/.test(s1)), () => (s1.slice(0, 80)));
+    m = mk(D(F.none)); tower(m); toRow(m, 'last'); m.press('a'); const s2 = say(m), L = F.none.last;
+    t('speak: the last-run screen says how the climb ended, how far, the lives, the buffs held and what it earned', () => (/Tower, last run\./.test(s2) && new RegExp(L.cleared + ' of 30 floors cleared in ' + L.format).test(s2) && /(The climb ended|The Tower was cleared)/.test(s2) && /buffs? held/.test(s2) && (L.earned.length ? L.earned.every((x) => s2.includes(x.name)) : /No new achievement/.test(s2))), () => (s2));
+    m = mk(D(F.offer5)); tower(m); toRow(m, 'buffs'); m.press('a'); const s3 = say(m), h0 = F.offer5.run.held[0];
+    t('speak: MY BUFFS says the selected buff by name, rarity and power, then its words', () => (s3.includes(h0.name) && s3.includes('power ' + h0.power) && s3.includes(h0.rarity)), () => (s3));
+    m = mk(D(F.fight)); tower(m); toRow(m, 'ach'); m.press('a'); const s4 = say(m), a0 = F.fight.achievements[0];
+    t('speak: ACHIEVEMENTS says the selected one by name, grade and whether it is earned', () => (s4.includes(a0.name) && /(earned|not earned yet)/.test(s4)), () => (s4));
+    m = mk(D(F.none)); tower(m); toRow(m, 'new'); m.press('a'); const s5 = say(m);
+    t('speak: NEW RUN says its rows with their values (TEAM RANDOM TEAM, FORMAT 3v3), not the labels alone', () => (/TEAM RANDOM TEAM/.test(s5) && /FORMAT 3v3/.test(s5)), () => (s5));
+  }
   m = mk(D(F.offer5)); tower(m); m.press('a');
   t('offer: a boss offer shows five balls, all reachable, and the SKIP slot after them', () => (m.view().tower.balls.length === 5 && (press(m, 'left'), m.view().tower.cursor === 5) && m.view().tower.balls[0].rarity !== 'green'), () => (J(m.view().tower.balls.map((b) => b.rarity))));
   // ---- the offer by pointer
@@ -200,18 +263,18 @@ const MUTANTS = [
   { file: 'tower_hub.js', name: 'YES to give up does not give the run up', find: "if (c.then === 'new') return [{ type: 'tower-giveup', profileId: p.id, seed: r ? r.seed : null }].concat(env.go('tower-new'));", replace: "if (c.then === 'new') return env.go('tower-new');", expect: 'YES gives the run up' },
   { file: 'tower_hub.js', name: 'the team list offers illegal teams', find: "const teamsOf = (p) => (p ? p.teams.filter((t) => t.legal && t.ruleset === TOWER_RULESET && t.size >= 1) : []);", replace: "const teamsOf = (p) => (p ? p.teams.filter((t) => t.size >= 1) : []);", expect: 'the legal standard-rules teams only' },
   { file: 'tower_hub.js', name: 'a team of two may play 3v3', find: "return c && c.size < 3 ? ['6v6'] : FORMATS;", replace: "return FORMATS;", expect: 'a team of two plays 6v6 only' },
-  { file: 'tower_hub.js', name: 'START forgets the team', find: "teamId: S.nw.team === 'random' ? null : S.nw.team, format: S.nw.format }]; }", replace: "teamId: null, format: S.nw.format }]; }", expect: 'START asks the page to start a run with that team and format' },
+  { file: 'tower_hub.js', name: 'START forgets the team', find: "teamId: S.nw.team === 'random' ? null : S.nw.team, format: S.nw.format, token", replace: "teamId: null, format: S.nw.format, token", expect: 'START asks the page to start a run with that team and format' },
   { file: 'tower_hub.js', name: 'A on a ball takes it without asking', find: "case 'a': o.confirm = { kind: o.cursor === n ? 'skip' : 'take', cursor: 1 }; return [];", replace: "case 'a': if (o.cursor !== n) { const p = prof(), r = liveRun(); return [{ type: 'tower-pick', profileId: p.id, seed: r.seed, id: balls[o.cursor].id }]; } o.confirm = { kind: 'skip', cursor: 1 }; return [];", expect: 'A on a ball asks' },
   { file: 'tower_hub.js', name: 'the take question is answered YES by default', find: "case 'a': o.confirm = { kind: o.cursor === n ? 'skip' : 'take', cursor: 1 }; return [];", replace: "case 'a': o.confirm = { kind: o.cursor === n ? 'skip' : 'take', cursor: 0 }; return [];", expect: 'NO is chosen' },
-  { file: 'tower_hub.js', name: 'a pick carries the wrong ball', find: "id: c.kind === 'take' ? balls[o.cursor].id : null }];", replace: "id: c.kind === 'take' ? balls[0].id : null }];", expect: 'the second ball is taken by its own id' },
-  { file: 'tower_hub.js', name: 'a skip carries a ball', find: "id: c.kind === 'take' ? balls[o.cursor].id : null }];", replace: "id: balls[Math.min(o.cursor, n - 1)].id }];", expect: 'YES to that skips' },
+  { file: 'tower_hub.js', name: 'a pick carries the wrong ball', find: "id: c.kind === 'take' ? balls[o.cursor].id : null, floor", replace: "id: c.kind === 'take' ? balls[0].id : null, floor", expect: 'the second ball is taken by its own id' },
+  { file: 'tower_hub.js', name: 'a skip carries a ball', find: "id: c.kind === 'take' ? balls[o.cursor].id : null, floor", replace: "id: balls[Math.min(o.cursor, n - 1)].id, floor", expect: 'YES to that skips' },
   { file: 'tower_hub.js', name: 'the cursor cannot reach SKIP', find: "case 'right': case 'r': o.cursor = (o.cursor + 1) % (n + 1); return [];", replace: "case 'right': case 'r': o.cursor = (o.cursor + 1) % n; return [];", expect: 'right walks the balls, then the SKIP slot' },
   { file: 'tower_hub.js', name: 'a click on a ball takes it at once', find: "if (ev.kind === 'click' && !o.confirm) { o.cursor = h.index; return press(path, 'a'); }", replace: "if (ev.kind === 'click' && !o.confirm) { o.cursor = h.index; press(path, 'a'); o.confirm.cursor = 0; return press(path, 'a'); }", expect: 'a click on a ball highlights it and opens the' },
   { file: 'tower_hub.js', name: 'a hover does not highlight', find: "if (moving) { S.hover = h.index; if (!o.confirm) o.cursor = h.index; return []; }", replace: "if (moving) { S.hover = h.index; return []; }", expect: 'hovering a ball highlights it' },
   { file: 'tower_hub.js', name: 'the offer stays up after the ball is taken', find: "if (path === 'tower-offer' && t && !(r && r.phase === 'offer')) { S.offer.confirm = null; return env.back(); }", replace: "", expect: 'steps back to the Tower screen' },
   { file: 'tower_hub.js', name: 'a refresh opens the offer by itself', find: "&& t && r && r.phase === 'offer' && env.arrivedByLink()) {", replace: "&& t && r && r.phase === 'offer') {", expect: 'does NOT open the offer by itself' },
   { file: 'tower_hub.js', name: 'a link never opens the offer', find: "&& t && r && r.phase === 'offer' && env.arrivedByLink()) {", replace: "&& t && r && r.phase === 'offer' && false) {", expect: 'arriving at the Tower screen by a link' },
-  { file: 'tower_hub.js', name: 'a link opens the offer every time', find: "{ S.autoDone = true; return env.go('tower-offer'); }", replace: "{ return env.go('tower-offer'); }", expect: 'opens the offer, once' },
+  { file: 'tower_hub.js', name: 'a link opens the offer every time', find: "    if (path !== 'tower') S.autoDone = true;", replace: "", expect: 'opens the offer, once' },
   { file: 'tower_hub.js', name: 'the achievement window does not follow the cursor', find: "if (cursor < off) off = cursor; else if (cursor >= off + size) off = cursor - size + 1;", replace: "", expect: 'the window follows the cursor' },
   { file: 'tower_hub.js', name: 'a broken run can be fought', find: "if (r && r.broken) rows.push({ id: 'drop', kind: 'item', label: 'DROP THIS RUN' });\n    else if", replace: "if (false) rows.push({ id: 'drop', kind: 'item', label: 'DROP THIS RUN' });\n    else if", expect: 'a run that cannot be read is offered to be dropped' },
   { file: 'tower_hub.js', name: 'a newer-build profile can start a run', find: "rows.push({ id: 'new', kind: 'item', label: 'NEW RUN', disabled: !writable() || !t });", replace: "rows.push({ id: 'new', kind: 'item', label: 'NEW RUN', disabled: !t });", expect: 'a profile of a newer build cannot start a run' },
@@ -223,6 +286,26 @@ const MUTANTS = [
   { file: 'hub_model.js', name: 'a click on a scrolled menu hits the wrong row', find: "const index = (win ? win.off : 0) + Math.floor((y - m.y) / pitch);", replace: "const index = Math.floor((y - m.y) / pitch);", expect: 'a click on the last visible row of a scrolled menu' },
   { file: 'hub_model.js', name: 'setData forgets the Tower', find: "      return tower.onData();", replace: "      return [];", expect: 'when the offer has been taken' },
   { file: 'hub_model.js', name: 'the Tower data is not kept', find: "readOnly: !!p.readOnly, tower: p.tower && typeof p.tower === 'object' ? JSON.parse(JSON.stringify(p.tower)) : null })) : [],", replace: "readOnly: !!p.readOnly, tower: null })) : [],", expect: 'a run waiting for its fight shows FIGHT' },
+  { file: 'tower_hub.js', name: 'B on the offer asks to skip again', find: "      case 'b': return env.back();          // the Tower menu: the offer is still waiting there (CHOOSE A BUFF), and MY BUFFS is the row under it\n", replace: "      case 'b': if (o.cursor !== n) { o.cursor = n; return []; } o.confirm = { kind: 'skip', cursor: 1 }; return [];\n", expect: 'offer: B steps back to the Tower menu' },
+  { file: 'tower_hub.js', name: 'a pick forgets which offer it answers', find: ", floor: r.floor, offer: r.offer ? r.offer.key : undefined }];", replace: " }];", expect: 'offer: the pick carries the floor and the key' },
+  { file: 'tower_hub.js', name: 'a data refresh drops the note', find: "    if (keep && fx.length) S.flash = keep;\n", replace: "", expect: 'note: a note set before the data refresh' },
+  { file: 'tower_hub.js', name: 'the home opens the offer again after another Tower screen', find: "    if (path !== 'tower') S.autoDone = true;", replace: "", expect: 'data: after B from an offer the player opened by address' },
+  { file: 'tower_hub.js', name: 'START carries no token', find: "format: S.nw.format, token: S.nw.token }]; }", replace: "format: S.nw.format }]; }", expect: 'new: START carries a token' },
+  { file: 'tower_hub.js', name: 'every visit to NEW RUN has the same token', find: "token: ++S.tokenSeq };", replace: "token: S.tokenSeq };", expect: 'new: a new visit to NEW RUN has a new token' },
+  { file: 'tower_hub.js', name: 'the once-gate lets a repeat through', find: "if (seen.has(token)) return false; seen.add(token); return true; },", replace: "seen.add(token); return true; },", expect: 'gate: a token goes through once' },
+  { file: 'tower_hub.js', name: 'a released token stays used', find: "release(token) { seen.delete(token); },", replace: "release(token) { },", expect: 'gate: a token goes through once' },
+  { file: 'tower_hub.js', name: 'a screen opened by address has no trail', find: "for (let p = path, n = 0; p && p !== 'main' && n < 6; p = PARENT[p] || 'main', n++) out.unshift(p);", replace: "", expect: 'trail: a screen opened by address' },
+  { file: 'tower_hub.js', name: 'A never turns the page of a buff text', find: "case 'a': if (turnPage('tower-buffs')) return []; if (n && b.tab === 0) b.detail = true; return [];", replace: "case 'a': if (n && b.tab === 0) b.detail = true; return [];", expect: 'wrap: a long text is word-wrapped into pages' },
+  { file: 'tower_hub.js', name: 'a tap on the message box turns nothing', find: "if (h.kind === 'msg') { if (ev.kind === 'click') turnPage(path); return []; }", replace: "if (h.kind === 'msg') return [];", expect: 'wrap: a tap on the message box turns the page' },
+  { file: 'tower_hub.js', name: 'a long text loses a word at each line break', find: "if (measure(t) <= px) cur = t; else { lines.push(cur); cur = w; }", replace: "if (measure(t) <= px) cur = t; else { lines.push(cur); cur = ''; }", expect: 'wrap: no word is cut or lost' },
+  { file: 'tower_hub.js', name: 'a long word is not cut', find: "while (measure(w) > px && w.length > 1) {", replace: "while (false) {", expect: 'wrap: a word wider than a line is cut' },
+  { file: 'tower_hub.js', name: 'the page of one row stays when the row changes', find: "const page = st.pageKey === key ? clamp(st.page, 0, pages - 1) : 0;", replace: "const page = clamp(st.page, 0, pages - 1);", expect: 'wrap: moving to another row starts at its first page' },
+  { file: 'tower_hub.js', name: 'the achievement text is not paged', find: "      case 'a': if (turnPage('tower-ach')) return []; return env.back();", replace: "      case 'a': return env.back();", expect: 'wrap: the achievement text pages the same way' },
+  { file: 'tower_hub.js', name: 'the home screen has no word', find: "const parts = [(SCREEN_SAYS[v.screen] || 'Tower') + '.'];", replace: "const parts = ['Tower, ' + v.screen.replace(/^tower-?/, '') + '.'];", expect: 'speak: the Tower home says \"Tower.\"' },
+  { file: 'tower_hub.js', name: 'the last run is not spoken', find: "if (t.kind === 'tower-last') {", replace: "if (t.kind === 'tower-last' && false) {", expect: 'speak: the last-run screen says how the climb ended' },
+  { file: 'tower_hub.js', name: 'the selected buff is not named', find: "parts.push((t.tab === 0 ? 'Buff ' : 'Synergy ') + (t.abs + 1) + ' of ' + t.total + ': ' + r.name +", replace: "parts.push((t.tab === 0 ? 'Buff ' : 'Synergy ') + (t.abs + 1) + ' of ' + t.total + ': ' +", expect: 'speak: MY BUFFS says the selected buff' },
+  { file: 'tower_hub.js', name: 'the selected achievement is not named', find: "if (r) parts.push('Achievement ' + (t.abs + 1) + ' of ' + t.total + ': ' + r.name + ', '", replace: "if (r) parts.push('Achievement ' + (t.abs + 1) + ' of ' + t.total + ': ' + ', '", expect: 'speak: ACHIEVEMENTS says the selected one' },
+  { file: 'tower_hub.js', name: 'the rows are spoken without their values', find: "r.label + (r.value !== undefined ? ' ' + r.value : '')).join(', ') + '.');\n  return parts.join(' ');", replace: "r.label).join(', ') + '.');\n  return parts.join(' ');", expect: 'speak: NEW RUN says its rows with their values' },
 ];
 let modCache = new Map();
 async function loadMutant(mu) {
@@ -232,24 +315,24 @@ async function loadMutant(mu) {
   const target = path.join(dir, mu.file), text = fs.readFileSync(target, 'utf8'), n = text.split(mu.find).length - 1;
   if (n !== 1) throw new Error('mutant "' + mu.name + '": the text to replace occurs ' + n + ' times (must be 1)');
   fs.writeFileSync(target, text.replace(mu.find, () => mu.replace));
-  const M = await imp(dir, 'hub_model.js', mu.name.length);
-  modCache.set(mu.name, { M, dir });
+  const M = await imp(dir, 'hub_model.js', mu.name.length), T2 = await imp(dir, 'tower_hub.js');
+  modCache.set(mu.name, { M, T2, dir });
   return modCache.get(mu.name);
 }
 
 /* ================================================================================================ the renderer */
 const HM = await L.mod('hub_model.js'), HS = await L.mod('hub_screen.js'), TH = await L.mod('tower_hub.js');
 {
-  const real = checkModel(HM);
+  const real = checkModel(HM, TH);
   ok(real.length === 0, 'M. the Tower state machine passes every check (' + (real.length ? real.length + ' failed' : 'all') + ')', real.slice(0, 5).join('; '));
   if (process.env.ARENA_VERBOSE) for (const x of real) console.log('   model check failed: ' + x.slice(0, 900));
-  ok(checkModel(HM).length === 0, 'M. unmutated twin stays quiet');
+  ok(checkModel(HM, TH).length === 0, 'M. unmutated twin stays quiet');
   ok(TH.pitchFor(8) === HM.menuPitch(8) && TH.pitchFor(7) === HM.menuPitch(7) && TH.pitchFor(6) === HM.menuPitch(6) && TH.pitchFor(4) === HM.menuPitch(4) && [1, 2, 3, 5, 9].every((n) => TH.pitchFor(n) === HM.menuPitch(n)), 'M. the Tower\'s row pitch agrees with the hub\'s for every row count (they cannot share a function without a cycle, so this pins them)');
   ok(HM.PATHS.includes('tower') && TH.TOWER_PATHS.every((p) => HM.PATHS.includes(p)) && TH.TOWER_PATHS.length === 6, 'M. every Tower path is a hub path (the address hash can name it)');
   ok(HM.createHubModel({ mascot: 25 }).goto('tower-offer').length === 1 && HM.createHubModel({ mascot: 25 }).goto('tower-nowhere').length === 0, 'M. a link to a Tower screen is accepted, an unknown one is ignored');
   if (WANT_MUTANTS) {
     for (const mu of MUTANTS) {
-      let r; try { const { M } = await loadMutant(mu); r = checkModel(M); } catch (e) { r = ['threw: ' + e.message]; }
+      let r; try { const { M, T2 } = await loadMutant(mu); r = checkModel(M, T2); } catch (e) { r = ['threw: ' + e.message]; }
       ok(r.length > 0 && r.some((x) => x.includes(mu.expect)), 'M. mutant "' + mu.name + '" trips the named check "' + mu.expect + '"', r.length ? r.slice(0, 3).join(' || ') : 'NOT CAUGHT');
     }
   }
@@ -257,7 +340,7 @@ const HM = await L.mod('hub_model.js'), HS = await L.mod('hub_screen.js'), TH = 
 
 const ui = BU.createBattleUi(rom), screen = HS.createHubScreen(ui);
 const frameHash = (v, s = screen) => L.fnv(s.render(v).rgba);
-const mkM = (data) => { const m = HM.createHubModel({ mascot: 25 }); m.setData(data); return m; };
+const mkM = (data) => { const m = HM.createHubModel({ mascot: 25, measure: screen.measure, msgPx: screen.msgPx }); m.setData(data); return m; };
 const D = (tw, o) => mkData([tw], o);
 const at = (data, steps) => { const m = mkM(data); for (const s of steps) m.press(s); return m; };
 const GO = ['down', 'down', 'a'];                         // TOWER
@@ -269,7 +352,7 @@ const GO = ['down', 'down', 'a'];                         // TOWER
   add('home two trainers', mkData([F.fight, F.none]), GO); add('home confirm', D(F.fight), [...GO, 'down', 'down', 'a']);
   for (let i = 0; i < 4; i++) add('home row ' + i, D(F.fight), [...GO, ...Array(i).fill('down')]);
   for (const k of [0, 1, 2, 3, 4]) add('new r' + k, D(F.none), [...GO, 'a', ...Array(k % 4).fill('down'), ...(k === 4 ? ['right'] : [])]);
-  for (const [label, d] of [['offer3', F.offer3], ['offer5', F.offer5]]) { const n = d.run.offer.balls.length; for (let i = 0; i <= n; i++) add(label + ' cursor ' + i, D(d), [...GO, 'a', ...Array(i).fill('right')]); add(label + ' take', D(d), [...GO, 'a', 'a']); add(label + ' skip', D(d), [...GO, 'a', 'b', 'a']); }
+  for (const [label, d] of [['offer3', F.offer3], ['offer5', F.offer5]]) { const n = d.run.offer.balls.length; for (let i = 0; i <= n; i++) add(label + ' cursor ' + i, D(d), [...GO, 'a', ...Array(i).fill('right')]); add(label + ' take', D(d), [...GO, 'a', 'a']); add(label + ' skip', D(d), [...GO, 'a', 'down', 'a']); }
   add('buffs', D(F.offer5), [...GO, 'down', 'a']); add('buffs 2', D(F.offer5), [...GO, 'down', 'a', 'down', 'down']); add('buff detail', D(F.offer5), [...GO, 'down', 'a', 'down', 'a']); add('synergies', D(F.offer5), [...GO, 'down', 'a', 'right']);
   for (const k of [0, 5, 20, 50]) add('ach ' + k, D(F.fight), [...GO, 'down', 'down', 'down', 'down', 'a', ...Array(k).fill('down')]);
   add('last', D(F.none), [...GO, 'down', 'a']);
@@ -282,6 +365,41 @@ const GO = ['down', 'down', 'a'];                         // TOWER
   }
   ok(views.length >= 36 && bad.length === 0, 'R. all ' + views.length + ' Tower views draw a full opaque 240x160 frame', bad.slice(0, 3).join('; '));
   ok(w.length === 0, 'R. every help line and message of every Tower view fits its window', w.slice(0, 4).join('; '));
+  // every buff, synergy and achievement text is word-wrapped by the REAL font to the message window, paged two lines at a time, and no word is ever cut or lost (the old box cut 844 of 1929 buff texts mid-word)
+  {
+    const BF = await L.mod('tower_buffs.js'), AC = await L.mod('achievements.js');
+    const px = screen.msgPx - 12, wrapT = (s) => TH.wrapLines(s, screen.measure, px);
+    const texts = [];
+    for (const f of BF.FAMILIES) for (let p = 1; p <= BF.capOf(f); p++) texts.push(BF.familyText(f.id, p));
+    for (const s of BF.SYNERGIES) { if (s.kind === 'tag') for (const l of s.levels) texts.push(l.text); else texts.push(s.text); }
+    for (const a of AC.ACHIEVEMENTS) texts.push(a.desc);
+    const lost = [], wide = []; let multi = 0, maxPages = 0;
+    for (const s of texts) {
+      const lines = wrapT(s);
+      if (lines.join(' ').replace(/\s+/g, ' ') !== s.replace(/\s+/g, ' ').trim()) lost.push(s.slice(0, 50));
+      for (const ln of lines) if (screen.measure(ln) > screen.msgPx - 4) wide.push(ln);
+      if (lines.length > 2) multi++;
+      maxPages = Math.max(maxPages, Math.ceil(lines.length / 2));
+    }
+    ok(texts.length > 1900 && lost.length === 0, 'R. all ' + texts.length + ' buff texts (every family at every power), synergy texts and achievement texts wrap into lines that read back EXACTLY (no word cut, none lost; ' + multi + ' need more than one page, the longest ' + maxPages + ')', lost.slice(0, 3).join(' | '));
+    ok(wide.length === 0, 'R. ... and every wrapped line is narrower than the message window (' + (screen.msgPx - 4) + ' px)', wide.slice(0, 3).join(' | '));
+    // through the whole machine: the longest texts as the rows of MY BUFFS, every page of each drawn
+    const longest = [...new Set(texts)].sort((a, b) => wrapT(b).length - wrapT(a).length || b.length - a.length).slice(0, 7);
+    const data = clone(F.offer5); data.run.held = data.run.held.slice(0, 7).map((h, i) => ({ ...h, text: longest[i] }));
+    const mm = HM.createHubModel({ mascot: 25, measure: screen.measure, msgPx: screen.msgPx }); mm.setData(D(data)); for (const s of GO) mm.press(s); mm.press('down'); mm.press('a');
+    const over = [], read = [];
+    for (let i = 0; i < 7; i++) {
+      const parts = []; let g = 0;
+      do { const v = mm.view(); for (const x of screen.widths(v)) if (x.px > x.max) over.push(i + ': ' + x.px + ' > ' + x.max); parts.push(...v.msg.filter(Boolean)); screen.render(v); } while (mm.view().tower.more && g++ < 20 && (mm.press('a'), true));
+      read.push(parts.join(' ') === longest[i].replace(/\s+/g, ' ').trim());
+      mm.press('down');
+    }
+    ok(over.length === 0 && read.every(Boolean), 'R. the seven longest texts, paged in MY BUFFS and drawn, fit the window on every page and read back exactly', over.slice(0, 3).join('; ') + ' ' + J(read));
+    // the full-description window holds the longest buff text without an ellipsis (6 small lines)
+    const dm = HM.createHubModel({ mascot: 25, measure: screen.measure, msgPx: screen.msgPx }); dm.setData(D(data)); for (const s of GO) dm.press(s); dm.press('down'); dm.press('a'); let g2 = 0; while (dm.view().tower.more && g2++ < 20) dm.press('a'); dm.press('a');
+    const detailV = dm.view(); const tw2 = detailV.tower.detail;
+    ok(!!tw2 && detailV.tower.detail.text === longest[0], 'R. the full description of the longest buff text opens after its last page', J(detailV.tower.detail && detailV.tower.detail.name));
+  }
   const frames = views.map(([l, v]) => [l, frameHash(v)]);
   ok(new Set(frames.map((x) => x[1])).size === frames.length, 'R. every Tower view above is a different picture (no screen is drawn the same as another)', frames.filter((x, i) => frames.findIndex((y) => y[1] === x[1]) !== i).map((x) => x[0]).join(','));
   ok(frameHash(views[0][1]) === frameHash(views[0][1]), 'R. rendering is deterministic');

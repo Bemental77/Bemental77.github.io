@@ -42,6 +42,11 @@ export function createTowerScreen(ui, h) {
     if (maxLines && lines.length > maxLines) { const kept = lines.slice(0, maxLines); let last = kept[maxLines - 1]; while (last.length > 1 && width(font, last + '...') > maxPx) last = last.slice(0, -1); kept[maxLines - 1] = last + '...'; return kept; }
     return lines;
   }
+  /** The message box, with a down arrow at its foot when the text goes on over the page (A or a tap on the box turns it). */
+  function message(f, lines, more) {
+    h.drawMessage(f, lines);
+    if (more) { const m = ui.R.msg; text(f, 'normal', '{DOWN}', m.x + m.w - 12, m.y + 1 + 16, TEXT.dark); }
+  }
   const fitText = (font, s, maxPx) => { let t = String(s); while (t.length > 1 && width(font, t) > maxPx) t = t.slice(0, -1); return t; };
   const outline = (f, x, y, w, hh, c, t = 2) => { f.rect(x, y, w, t, c); f.rect(x, y + hh - t, w, t, c); f.rect(x, y, t, hh, c); f.rect(x + w - t, y, t, hh, c); };
   const chip = (f, r, label, on) => { ui.panel(f, r.x, r.y, r.w, r.h, on ? 'sel' : 'normal', true); textCentre(f, 'normal', label, r.x + r.w / 2, r.y, TEXT.dark, TEXT.shadow); };
@@ -100,7 +105,7 @@ export function createTowerScreen(ui, h) {
   }
   function drawBuffs(f, t) {
     if (t.state !== 'ready') { h.drawMessage(f, t.msgLines); ui.drawWindow(f, 12, 10, 216, 40); text(f, 'normal', 'NO RUN IS UNDER WAY', 20, 12, TEXT.dark); text(f, 'small', 'Start one from the Tower menu.', 20, 30); return; }
-    h.drawMessage(f, t.msgLines);
+    message(f, t.msgLines, t.more);
     listWindow(f, (fr, g) => {
       text(fr, 'normal', 'BUFFS ' + t.counts[0], g.x + 12, g.y + 1, t.tab === 0 ? TEXT.dark : COL.line);
       text(fr, 'normal', 'SYNERGIES ' + t.counts[1], g.x + 100, g.y + 1, t.tab === 1 ? TEXT.dark : COL.line);
@@ -124,7 +129,7 @@ export function createTowerScreen(ui, h) {
     }
   }
   function drawAch(f, t) {
-    h.drawMessage(f, t.msgLines);
+    message(f, t.msgLines, t.more);
     if (t.state !== 'ready') { ui.drawWindow(f, 12, 10, 216, 20); text(f, 'normal', 'LOADING...', 20, 12, TEXT.dark); return; }
     listWindow(f, (fr, g) => { text(fr, 'normal', 'ACHIEVEMENTS ' + t.earned + '/' + t.total, g.x + 12, g.y + 1, TEXT.dark); }, t.rows, t.cursor, t.total, t.offset, (fr, row, y, g) => {
       const got = row.at !== null, nm = h.fitFont(row.name, 150, ['normal', 'narrow', 'smallNarrow']);

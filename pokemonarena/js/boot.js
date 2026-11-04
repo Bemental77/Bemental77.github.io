@@ -22,6 +22,7 @@ import { describeRomError, showRomError } from './rom_error.js';
 import { watchHints } from './hints.js';
 import { fitScale, fitPicture, createFullscreen, stackBelow } from './screenfit.js';
 import { launchFloorBattle } from './tower_launch.js';          // the one place the Tower names a page (the fight is still its own page; tomorrow this mounts it here)
+import { arrivalTrail, createOnceGate, speakTower } from './tower_hub.js';          // the Tower screens' pure helpers: the history a screen opened by address should have, the once-only gate for START, the screen-reader words
 
 export const GBA_FPS = 59.7275;                 // the hardware frame rate; the menu's idle-animation clock, not a speed-up knob
 const STEP_MS = 1000 / GBA_FPS;
@@ -225,7 +226,18 @@ async function main() {
     dirty = true;
   }
   function syncTitle() { document.title = SCREEN_TITLES[model.path()] || SCREEN_TITLES.main; }
-  window.addEventListener('popstate', () => { if (!model) return; pushed = pathFromHash(location.hash) === 'main' ? 0 : 1; model.goto(pathFromHash(location.hash)); syncTitle(); dirty = true; });
+  window.addEventListener('popstate', () => { if (!model) return; pushed = arrivalTrail(pathFromHash(location.hash)).length; model.goto(pathFromHash(location.hash)); syncTitle(); dirty = true; });
+  // The page was OPENED at a screen other than the menu (the way back from a Tower fight lands on #tower-offer or #tower-last, and a link may name any screen). Its history then holds only that one entry, so B
+  // (history.back) would leave the hub for the page that was just left. Give it the entries the screen would have had if it had been walked to from the menu: the menu's own, then each screen on the way.
+  function seedHistory(path) {
+    const trail = arrivalTrail(path);
+    if (!trail.length) return;
+    try {
+      history.replaceState({ arenaHub: 'main' }, '', hashFor('main'));
+      for (const p of trail) history.pushState({ arenaHub: p }, '', hashFor(p));
+      pushed = trail.length;
+    } catch (_e) { /* a sandboxed frame: B falls back to pushing the menu */ }
+  }
 
   /* ---- the team list: read from the browser-local store (profiles are never uploaded) ---- */
   // ST1: RESET RECORD was answered YES: the profile's battle record is emptied in the store (an automatic backup and a history entry are taken there), then the list is read again
@@ -244,14 +256,17 @@ async function main() {
     return towerLoading;
   }
   const towerNote = (a, b) => { if (model) { model.tower.notify([a, b || '']); dirty = true; } };
+  const startGate = createOnceGate();
   async function towerEffect(eff) {
+    if (eff.type === 'tower-new' && !startGate.enter(eff.token)) { hook.towerIgnored = (hook.towerIgnored | 0) + 1; return; }          // a double tap on START is ONE start (not a run that is made and at once given up, nor two profiles)
     hook.towerEffects = (hook.towerEffects || []).concat([eff.type]);
+    let started = false;
     try {
       const m = await loadTower();
       if (!m) { towerNote('The Tower could not load.', 'Reload the page and try again.'); return; }
       if (!store) { towerNote('Your profile is not available.', 'Try again in a moment.'); return; }
       if (store.status.notSaved) { towerNote('This browser is not keeping profiles,', 'so a Tower run cannot be saved.'); return; }
-      if (eff.type === 'tower-new') await towerStart(m, eff);
+      if (eff.type === 'tower-new') started = await towerStart(m, eff);
       else {
         const session = m.createTowerSession({ pack, persist: m.storePersist(store, eff.profileId) });
         if (eff.type === 'tower-fight') {
@@ -260,7 +275,7 @@ async function main() {
           saveSettings();
           launchFloorBattle(run, { navigate, profileId: eff.profileId });
         } else if (eff.type === 'tower-pick') {
-          const r = await session.pick({ seed: eff.seed, id: eff.id });
+          const r = await session.pick({ seed: eff.seed, id: eff.id, floor: eff.floor, offer: eff.offer });
           hook.towerLast = r;
           if (r && r.applied) towerNote(eff.id ? 'You took ' + m.buffName(eff.id) + '!' : 'You took nothing.', 'Floor ' + r.next.floor + ' is next.'); else towerNote('That could not be applied:', String(r && r.why || 'unknown').slice(0, 30));
           await refreshData();
@@ -271,6 +286,7 @@ async function main() {
         }
       }
     } catch (e) { towerNote('The Tower hit a problem:', String(e && e.message ? e.message : e).slice(0, 30)); }
+    finally { if (eff.type === 'tower-new' && !started) startGate.release(eff.token); }          // a start that did not happen can be asked for again
   }
   async function towerStart(m, eff) {
     let pid = eff.profileId;
@@ -278,16 +294,18 @@ async function main() {
     let team = null;
     if (eff.teamId) {
       const l = await store.loadProfile(pid);
-      if (!l.ok) { towerNote('That profile could not be read.', ''); return; }
-      try { team = m.teamSnapshot(l.profile, eff.teamId); } catch (_e) { towerNote('That team could not be used.', ''); return; }
+      if (!l.ok) { towerNote('That profile could not be read.', ''); return false; }
+      try { team = m.teamSnapshot(l.profile, eff.teamId); } catch (_e) { towerNote('That team could not be used.', ''); return false; }
     }
     const session = m.createTowerSession({ pack, persist: m.storePersist(store, pid) });
-    const r = await session.startRun({ seed: freshSeed(), format: eff.format, team, replace: true });
+    // (replace: false -- the NEW RUN row has already asked to give a run up first, and a run that another tab started meanwhile is not silently thrown away by this one)
+    const r = await session.startRun({ seed: freshSeed(), format: eff.format, team, replace: false });
     hook.towerLast = r;
-    if (!r || !r.applied) { towerNote('The run could not start:', String(r && r.why || 'unknown').slice(0, 30)); await refreshData(); return; }
+    if (!r || !r.applied) { towerNote('The run could not start:', String(r && r.why || 'unknown').slice(0, 30)); await refreshData(); return false; }
     try { await store.setActiveId(pid); } catch (_e) { /* the battle page falls back to the profile in its address */ }
     saveSettings();
     launchFloorBattle(r.run, { navigate, profileId: pid });
+    return true;
   }
 
   async function refreshData() {
@@ -321,7 +339,7 @@ async function main() {
   // a plain-text mirror of the canvas for screen readers (the canvas itself has only a static label)
   function speak(v) {
     let s;
-    if (v.tower) s = 'Tower, ' + v.screen.replace(/^tower-?/, '') + '. ' + (v.msg || []).join(' ') + (v.tower.balls ? ' Buffs: ' + v.tower.balls.map((b, i) => (i === v.tower.cursor ? 'selected ' : '') + b.rarity + ' ' + b.name + ': ' + b.effectText).join('; ') + '.' : '') + (v.menu ? ' ' + v.menu.rows.map((r, i) => (i === v.menu.cursor ? 'selected ' : '') + r.label).join(', ') + '.' : '');
+    if (v.tower) s = speakTower(v);
     else if (v.record) s = 'Record' + (v.record.trainer ? ' of ' + v.record.trainer.name : '') + ', page ' + (v.record.index + 1) + ' of ' + v.record.count + ': ' + v.record.page.title + '. ' + v.record.page.lines.map((l) => l.cells.map((c) => c.t).filter(Boolean).join(' ')).join('. ') + (v.record.confirm ? ' Choose YES or NO.' : '');
     else if (v.about) s = 'About, page ' + (v.about.page + 1) + ' of ' + v.about.pages + '. ' + v.about.lines.join(' ');
     else if (v.menu) { const r = v.menu.rows[v.menu.cursor]; s = (v.screen === 'main' ? 'Main menu. ' : v.screen === 'quick' ? 'Quick battle. ' : 'Battle with my team. ') + (r ? r.label + (r.value !== undefined ? ' ' + r.value : '') + '. ' : '') + (v.msg || []).join(' '); }
@@ -438,7 +456,7 @@ async function main() {
       ui = createBattleUi(bytes);
       screen = createHubScreen(ui);
       const saved = readSettings(storage);
-      model = createHubModel({ sound: soundSys ? soundSys.audible() : cries.isSoundOn(), mascot: pickMascot(pack, Math.floor(Date.now() / 86400000)), env: 0, quick: saved.quick, selection: saved.selection });
+      model = createHubModel({ sound: soundSys ? soundSys.audible() : cries.isSoundOn(), mascot: pickMascot(pack, Math.floor(Date.now() / 86400000)), env: 0, quick: saved.quick, selection: saved.selection, measure: screen.measure, msgPx: screen.msgPx });          // (the Tower wraps its long texts by the real font)
     } catch (e) {
       if (!verify) { showError(romError(e)); return; }
       // A RECALLED copy only passed romcache.js's cheap checks (length, headers, cartridge header). One that is damaged INSIDE -- a table the menu decodes -- throws right here, before the re-check below is
@@ -455,6 +473,7 @@ async function main() {
     els.status.textContent = 'ROM verified: Pokemon SoulGold v1.1.1 (SHA-256 ' + sha256.slice(0, 8) + '...). Everything on screen is drawn from it; nothing is uploaded.';
     touchPad = coarse();
     model.goto(pathFromHash(location.hash));
+    seedHistory(model.path());
     syncTitle();
     fit();
     wireInput();

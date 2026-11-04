@@ -4,16 +4,19 @@
 // shows or asks is here, so another row can be added to the main menu without touching any of it). tower_screen.js draws what view() returns. Nothing here navigates, saves or fights: it returns EFFECTS and
 // boot.js carries them out against the profile store (tower_session.js), so the screens stay a pure function of the data they are given:
 //
-//   { type: 'tower-new',    profileId, teamId | null, format }      START was chosen on NEW RUN (teamId null = a random team)
+//   { type: 'tower-new',    profileId, teamId | null, format, token }   START was chosen on NEW RUN (teamId null = a random team). `token` names the screen visit: the page runs each token ONCE (createOnceGate), so a
+//                                                                      double tap starts one run, not two
 //   { type: 'tower-fight',  profileId }                              FIGHT: go and fight the floor the run is waiting for (tower_launch.js launchFloorBattle)
-//   { type: 'tower-pick',   profileId, seed, id | null }             a ball was taken (id), or the offer was skipped (null)
+//   { type: 'tower-pick',   profileId, seed, id | null, floor, offer }   a ball was taken (id), or the offer was skipped (null). `floor` and `offer` name the offer it was shown in (summarizeTower's offer.key):
+//                                                                      an old screen cannot answer a newer offer
 //   { type: 'tower-giveup', profileId }                              GIVE UP was answered YES
 //   { type: 'screen', path, back? }                                  (hub_model's) a screen change
 //
 // SCREENS   tower          the status of the climb and its menu: FIGHT / CHOOSE A BUFF, MY BUFFS, NEW RUN, LAST RUN, ACHIEVEMENTS, TRAINER, BACK
 //           tower-new      TEAM (a random one, or one of the trainer's saved legal teams), FORMAT, START, BACK
-//           tower-offer    the buff offer: balls in a row (the ROM's own Poke Ball sprites), the highlighted one open and described; A asks "take it?", B / the SKIP chip asks "take nothing?"
-//           tower-buffs    what the run holds (BUFFS) and the synergies that are active (SYNERGIES); A on a buff reads it in full
+//           tower-offer    the buff offer: balls in a row (the ROM's own Poke Ball sprites), the highlighted one open and described; A asks "take it?", the SKIP chip (Down, START, or a tap) asks "take nothing?", B steps back to the Tower menu
+//                          (the offer stays: it is in the profile, CHOOSE A BUFF is the menu's first row, and MY BUFFS is the next one)
+//           tower-buffs    what the run holds (BUFFS) and the synergies that are active (SYNERGIES); A turns the page of a long text, and then reads a buff in full
 //           tower-ach      the 51 achievements, earned or not
 //           tower-last     how the last climb ended
 // DATA      every profile may carry `tower`: the summary tower_session.js summarizeTower builds (record, run, last, achievements), or null while the Tower's code is still loading.
@@ -37,8 +40,63 @@ export const TGEOM = Object.freeze({
   skip: Object.freeze({ x: 182, y: 1, w: 50, h: 14 }),
   yes: Object.freeze({ x: 152, y: 119, w: 36, h: 16 }),
   no: Object.freeze({ x: 192, y: 119, w: 36, h: 16 }),
+  msg: Object.freeze({ x: 0, y: 112, w: 240, h: 48 }),                                         // the message box: a tap on it turns the page of a long text
 });
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+/** The screens to walk through to reach `path` from the main menu, outermost first ('tower-offer' -> ['tower', 'tower-offer']; the main menu -> []). The page seeds the browser's history with these, so a Tower screen the page was
+ *  OPENED at (the way back from a fight lands on #tower-offer) has the same Back stack as one walked to from the menu. */
+export function arrivalTrail(path) {
+  const out = [];
+  for (let p = path, n = 0; p && p !== 'main' && n < 6; p = PARENT[p] || 'main', n++) out.unshift(p);
+  return out;
+}
+
+/** A gate that lets each token through ONCE until it is released: a double tap on START runs the start once (a start that failed is released, so the player can try again). A missing token always passes. */
+export function createOnceGate() {
+  const seen = new Set();
+  return {
+    enter(token) { if (token === undefined || token === null) return true; if (seen.has(token)) return false; seen.add(token); return true; },
+    release(token) { seen.delete(token); },
+  };
+}
+
+/** `text` as lines no wider than `px` (measure(s) -> pixels in the message font): words stay whole, a word wider than a line is cut where it must be. No word is ever dropped. */
+export function wrapLines(text, measure, px) {
+  const lines = [];
+  let cur = '';
+  for (const w0 of String(text).split(/\s+/).filter(Boolean)) {
+    let w = w0;
+    while (measure(w) > px && w.length > 1) { let k = w.length - 1; while (k > 1 && measure(w.slice(0, k)) > px) k--; if (cur) { lines.push(cur); cur = ''; } lines.push(w.slice(0, k)); w = w.slice(k); }
+    const t = cur ? cur + ' ' + w : w;
+    if (measure(t) <= px) cur = t; else { lines.push(cur); cur = w; }
+  }
+  if (cur) lines.push(cur);
+  return lines;
+}
+
+const SCREEN_SAYS = { tower: 'Tower', 'tower-new': 'Tower, new run', 'tower-offer': 'Tower, choose a buff', 'tower-buffs': 'Tower, your buffs', 'tower-ach': 'Tower, achievements', 'tower-last': 'Tower, last run' };
+/** The text a screen reader gets for a Tower view (the canvas itself has only a static label). */
+export function speakTower(v) {
+  const t = v && v.tower; if (!t) return '';
+  const parts = [(SCREEN_SAYS[v.screen] || 'Tower') + '.'];
+  const msg = (v.msg || []).filter(Boolean).join(' ');
+  if (t.kind === 'tower-last') {
+    const l = t.last;
+    parts.push(l ? (l.won ? 'The Tower was cleared.' : 'The climb ended.') + ' ' + l.cleared + ' of 30 floors cleared in ' + l.format + (l.livesUsed ? ', ' + l.livesUsed + (l.livesUsed === 1 ? ' extra life' : ' extra lives') + ' used' : '') + (l.skips ? ', ' + l.skips + ' offers skipped' : '') + '. ' + l.held.length + (l.held.length === 1 ? ' buff' : ' buffs') + ' held' + (l.held.length ? ': ' + l.held.map((b) => b.name).join(', ') : '') + '. ' + (l.earned.length ? l.earned.length + (l.earned.length === 1 ? ' achievement' : ' achievements') + ' earned: ' + l.earned.map((e) => e.name).join(', ') + '.' : 'No new achievement.') : 'No climb yet.');
+  } else if (t.kind === 'tower-buffs' && t.rows) {
+    const r = t.rows[t.cursor];
+    if (r) parts.push((t.tab === 0 ? 'Buff ' : 'Synergy ') + (t.abs + 1) + ' of ' + t.total + ': ' + r.name + (t.tab === 0 ? ', ' + r.rarity + ', power ' + r.power + (r.curse ? ', a curse' : '') : '') + '.');
+    if (msg) parts.push(msg);
+  } else if (t.kind === 'tower-ach' && t.rows) {
+    const r = t.rows[t.cursor];
+    if (r) parts.push('Achievement ' + (t.abs + 1) + ' of ' + t.total + ': ' + r.name + ', ' + ['', 'green', 'blue', 'purple', 'gold'][r.grade] + ', ' + (r.at === null ? 'not earned yet' : 'earned') + '.');
+    if (msg) parts.push(msg);
+  } else if (msg) parts.push(msg);
+  if (t.balls) parts.push('Buffs: ' + t.balls.map((b, i) => (i === t.cursor ? 'selected ' : '') + b.rarity + ' ' + b.name + ': ' + b.effectText).join('; ') + '.');
+  if (v.menu) parts.push(v.menu.rows.map((r, i) => (i === v.menu.cursor ? 'selected ' : '') + r.label + (r.value !== undefined ? ' ' + r.value : '')).join(', ') + '.');
+  return parts.join(' ');
+}
 /** Row spacing of a menu of n rows: the same rule as hub_model.js menuPitch (a test pins that they agree; importing it would make a cycle). */
 export const pitchFor = (n) => (n > 7 ? 12 : n > 6 ? 14 : 16);
 const cycle = (list, cur, dir) => list[(list.indexOf(cur) + dir + list.length) % list.length];
@@ -59,13 +117,16 @@ export function createTowerHub(env) {
   const S = {
     profileId: null,
     cursor: { tower: 0, 'tower-new': 0 },
-    nw: { team: 'random', format: '3v3', formatTouched: false },
+    nw: { team: 'random', format: '3v3', formatTouched: false, token: 0 },
     offer: { cursor: 0, confirm: null },
-    buffs: { tab: 0, cursor: 0, offset: 0, detail: false },
-    ach: { cursor: 0, offset: 0 },
+    buffs: { tab: 0, cursor: 0, offset: 0, detail: false, pageKey: '', page: 0 },
+    ach: { cursor: 0, offset: 0, pageKey: '', page: 0 },
     confirm: null,                      // { kind: 'giveup', cursor } on the home screen
     hover: null, autoDone: false, flash: null,
+    tokenSeq: 0,                        // numbers the visits to NEW RUN (the START effect carries the visit's number)
   };
+  const measureText = (s) => (typeof env.measure === 'function' ? env.measure(String(s)) : String(s).length * 7);
+  const textPx = () => (Number.isFinite(env.msgPx) && env.msgPx > 40 ? env.msgPx : 204) - 12;          // the message window's inner width, less the room the "more" arrow keeps
 
   /* ------------------------------------------------------------------------------------------ data */
   const profiles = () => env.profiles();
@@ -154,6 +215,32 @@ export function createTowerHub(env) {
     if (r) return ['THE TOWER', 'FLOOR ' + r.floor + '/' + r.floors, r.format + ' ' + (r.lives > 0 || r.livesUsed > 0 ? 'LIVES ' + r.lives : 'NO LIVES'), 'BUFFS ' + r.held.length, 'BEST ' + Math.max(t.record.best['3v3'], t.record.best['6v6'])];
     return ['THE TOWER', t.run && t.run.broken ? 'BROKEN RUN' : 'NO RUN YET', 'BEST 3v3 ' + t.record.best['3v3'], 'BEST 6v6 ' + t.record.best['6v6'], 'WON ' + t.record.wins + ' OF ' + t.record.runs];
   }
+  /** The text the message box shows for the selected row of MY BUFFS / ACHIEVEMENTS, wrapped to the window: { key, lines, pages, page, msg: [two lines] } or null when no row is selected. */
+  function textOf(path) {
+    let text = '', key = '';
+    if (path === 'tower-buffs') {
+      const r = liveRun(); if (!r) return null;
+      const items = S.buffs.tab === 0 ? r.held : r.synergies, c = clamp(S.buffs.cursor, 0, Math.max(0, items.length - 1)), it = items[c];
+      if (!it) return null;
+      text = it.text || ''; key = S.buffs.tab + ':' + c + ':' + it.id;
+    } else {
+      const t = tw(); if (!t) return null;
+      const list = t.achievements, c = clamp(S.ach.cursor, 0, Math.max(0, list.length - 1)), a = list[c];
+      if (!a) return null;
+      text = a.desc; key = 'a:' + c + ':' + a.id;
+    }
+    const lines = wrapLines(text, measureText, textPx());
+    if (path === 'tower-ach') { const t = tw(), a = t.achievements[clamp(S.ach.cursor, 0, Math.max(0, t.achievements.length - 1))]; if (a && a.at === null) lines.push('(not earned yet)'); }
+    const pages = Math.max(1, Math.ceil(lines.length / 2)), st = path === 'tower-buffs' ? S.buffs : S.ach;
+    const page = st.pageKey === key ? clamp(st.page, 0, pages - 1) : 0;
+    return { key, lines, pages, page, msg: [lines[page * 2] || '', lines[page * 2 + 1] || ''] };
+  }
+  /** A turns the page of a long text. -> true when it did (there was a next page). */
+  function turnPage(path) {
+    const x = textOf(path); if (!x || x.page >= x.pages - 1) return false;
+    const st = path === 'tower-buffs' ? S.buffs : S.ach;
+    st.pageKey = x.key; st.page = x.page + 1; return true;
+  }
   const listLen = () => (S.buffs.tab === 0 ? (liveRun() ? liveRun().held.length : 0) : (liveRun() ? liveRun().synergies.length : 0));
   function windowOf(n, cursor, offset, size) {
     let off = clamp(offset, 0, Math.max(0, n - size));
@@ -181,7 +268,7 @@ export function createTowerHub(env) {
         kind: path, state: !tw() ? 'loading' : balls.length ? 'ready' : 'empty', floor: r ? r.floor - 1 : 0, floors: r ? r.floors : 30, balls: balls.map((b) => ({ ...b })), cursor: c, canSkip: true, hover: S.hover,
         confirm: d ? { kind: d.kind, cursor: d.cursor } : null,
       };
-      out.msg = d ? (d.kind === 'take' ? ['Take this buff?', ball ? ball.name : ''] : ['Take nothing this time?', 'The offer is gone for good.']) : balls.length ? ['Floor ' + (r.floor - 1) + ' cleared. Choose one.', 'A takes it. B or SKIP passes.'] : ['No buff is waiting.', 'B goes back.'];
+      out.msg = d ? (d.kind === 'take' ? ['Take this buff?', ball ? ball.name : ''] : ['Take nothing this time?', 'The offer is gone for good.']) : balls.length ? ['Floor ' + (r.floor - 1) + ' cleared. Choose one.', 'A takes it. B: Tower menu.'] : ['No buff is waiting.', 'B goes back.'];
       if (S.flash) out.msg = S.flash;
       return out;
     }
@@ -189,16 +276,17 @@ export function createTowerHub(env) {
       const n = listLen(), c = clamp(S.buffs.cursor, 0, Math.max(0, n - 1)), off = windowOf(n, c, S.buffs.offset, TGEOM.list.rows);
       const items = !r ? [] : S.buffs.tab === 0 ? r.held : r.synergies;
       out.tower = { kind: path, state: r ? 'ready' : 'empty', tab: S.buffs.tab, cursor: c - off, abs: c, offset: off, total: n, rows: items.slice(off, off + TGEOM.list.rows).map((x) => ({ ...x })), detail: S.buffs.detail && items[c] ? { ...items[c] } : null, counts: r ? [r.held.length, r.synergies.length] : [0, 0] };
-      const it = items[c];
-      out.msg = S.buffs.detail ? ['A or B closes this.', ''] : it ? [it.text ? it.text.slice(0, 29) : '', it.text && it.text.length > 29 ? it.text.slice(29, 58) : ''] : [S.buffs.tab === 0 ? 'You hold no buffs yet.' : 'No synergy is active yet.', 'L and R switch BUFFS / SYNERGIES.'];
+      const it = items[c], px = textOf(path);
+      out.msg = S.buffs.detail ? ['A or B closes this.', ''] : it && px ? px.msg : [S.buffs.tab === 0 ? 'You hold no buffs yet.' : 'No synergy is active yet.', 'L and R switch BUFFS / SYNERGIES.'];
+      if (px && !S.buffs.detail) { out.tower.more = px.page < px.pages - 1; out.tower.page = px.page + 1; out.tower.pages = px.pages; }
       return out;
     }
     if (path === 'tower-ach') {
       const t = tw(), list = t ? t.achievements : [], n = list.length, c = clamp(S.ach.cursor, 0, Math.max(0, n - 1)), off = windowOf(n, c, S.ach.offset, TGEOM.list.rows);
       out.tower = { kind: path, state: t ? 'ready' : 'loading', cursor: c - off, abs: c, offset: off, total: n, earned: t ? t.earned : 0, rows: list.slice(off, off + TGEOM.list.rows).map((x) => ({ ...x })) };
-      const a = list[c];
-      out.msg = a ? [a.desc.slice(0, 30), a.desc.length > 30 ? a.desc.slice(30, 60) : ''] : ['', ''];
-      if (a && a.at === null) out.msg = [a.desc.slice(0, 30), a.desc.length > 30 ? a.desc.slice(30, 60) : '(not earned yet)'];
+      const px = textOf(path);
+      out.msg = px ? px.msg : ['', ''];
+      if (px) { out.tower.more = px.page < px.pages - 1; out.tower.page = px.page + 1; out.tower.pages = px.pages; }
       return out;
     }
     if (path === 'tower-last') {
@@ -213,20 +301,26 @@ export function createTowerHub(env) {
   /* ------------------------------------------------------------------------------------------ transitions */
   function enter(path) {
     S.flash = null; S.confirm = null; S.hover = null;
+    if (path !== 'tower') S.autoDone = true;                 // only the HOME screen opens a pending offer by itself, and once: a player who has been on any other Tower screen has chosen where to be (B from the offer must not bounce back into it)
     if (path === 'tower') { const p = prof(); S.profileId = p ? p.id : S.profileId; }
-    if (path === 'tower-new') { S.nw = { team: 'random', format: '3v3', formatTouched: false }; S.cursor['tower-new'] = 0; normaliseNew(); }
+    if (path === 'tower-new') { S.nw = { team: 'random', format: '3v3', formatTouched: false, token: ++S.tokenSeq }; S.cursor['tower-new'] = 0; normaliseNew(); }
     if (path === 'tower-offer') S.offer = { cursor: 0, confirm: null };
-    if (path === 'tower-buffs') S.buffs = { tab: 0, cursor: 0, offset: 0, detail: false };
-    if (path === 'tower-ach') S.ach = { cursor: 0, offset: 0 };
+    if (path === 'tower-buffs') S.buffs = { tab: 0, cursor: 0, offset: 0, detail: false, pageKey: '', page: 0 };
+    if (path === 'tower-ach') S.ach = { cursor: 0, offset: 0, pageKey: '', page: 0 };
   }
 
-  /** The data changed (the store answered, or a step was applied): keep the screen consistent with it. -> effects (a screen change, or none) */
+  /** The data changed (the store answered, or a step was applied): keep the screen consistent with it. -> effects (a screen change, or none). A note set around the step ("You took X!") survives the screen change the step's data causes. */
   function onData() {
+    const keep = S.flash, fx = onDataScreen();
+    if (keep && fx.length) S.flash = keep;
+    return fx;
+  }
+  function onDataScreen() {
     const path = env.path();
     if (!isTowerPath(path)) return [];
     const r = liveRun(), t = tw();
     for (const p of Object.keys(S.cursor)) clampCursor(p);
-    if (path === 'tower' && !S.autoDone && t && r && r.phase === 'offer' && env.arrivedByLink()) { S.autoDone = true; return env.go('tower-offer'); }
+    if (path === 'tower' && !S.autoDone && t && r && r.phase === 'offer' && env.arrivedByLink()) { return env.go('tower-offer'); }          // (once: entering the offer sets autoDone, see enter)
     if (path === 'tower-offer' && t && !(r && r.phase === 'offer')) { S.offer.confirm = null; return env.back(); }
     if (path === 'tower-offer') S.offer.cursor = clamp(S.offer.cursor, 0, offerBalls().length);
     if (path === 'tower-buffs' && t && !r) return env.back();
@@ -301,7 +395,7 @@ export function createTowerHub(env) {
         if (!row) return [];
         if (row.kind === 'choice') return change(1);
         if (row.id === 'back') return env.back();
-        { const p = prof(); if (env.dataState() !== 'ready') return []; return [{ type: 'tower-new', profileId: p ? p.id : null, teamId: S.nw.team === 'random' ? null : S.nw.team, format: S.nw.format }]; }
+        { const p = prof(); if (env.dataState() !== 'ready') return []; return [{ type: 'tower-new', profileId: p ? p.id : null, teamId: S.nw.team === 'random' ? null : S.nw.team, format: S.nw.format, token: S.nw.token }]; }
       case 'b': return env.back();
       default: return [];
     }
@@ -317,7 +411,7 @@ export function createTowerHub(env) {
         const c = o.confirm; o.confirm = null;
         if (c.cursor !== 0) return [];
         const p = prof(), r = liveRun();
-        return [{ type: 'tower-pick', profileId: p.id, seed: r.seed, id: c.kind === 'take' ? balls[o.cursor].id : null }];
+        return [{ type: 'tower-pick', profileId: p.id, seed: r.seed, id: c.kind === 'take' ? balls[o.cursor].id : null, floor: r.floor, offer: r.offer ? r.offer.key : undefined }];
       }
       return [];
     }
@@ -327,7 +421,8 @@ export function createTowerHub(env) {
       case 'up': o.cursor = o.cursor === n ? n - 1 : o.cursor; return [];
       case 'down': o.cursor = n; return [];
       case 'a': o.confirm = { kind: o.cursor === n ? 'skip' : 'take', cursor: 1 }; return [];
-      case 'b': case 'start': if (o.cursor !== n) { o.cursor = n; return []; } o.confirm = { kind: 'skip', cursor: 1 }; return [];
+      case 'start': if (o.cursor !== n) { o.cursor = n; return []; } o.confirm = { kind: 'skip', cursor: 1 }; return [];
+      case 'b': return env.back();          // the Tower menu: the offer is still waiting there (CHOOSE A BUFF), and MY BUFFS is the row under it
       default: return [];
     }
   }
@@ -338,7 +433,7 @@ export function createTowerHub(env) {
       case 'up': if (n) b.cursor = (b.cursor + n - 1) % n; return [];
       case 'down': if (n) b.cursor = (b.cursor + 1) % n; return [];
       case 'left': case 'l': case 'right': case 'r': b.tab ^= 1; b.cursor = 0; b.offset = 0; return [];
-      case 'a': if (n && b.tab === 0) b.detail = true; return [];
+      case 'a': if (turnPage('tower-buffs')) return []; if (n && b.tab === 0) b.detail = true; return [];
       case 'b': return env.back();
       default: return [];
     }
@@ -350,7 +445,8 @@ export function createTowerHub(env) {
       case 'down': if (n) s.cursor = (s.cursor + 1) % n; return [];
       case 'left': case 'l': s.cursor = clamp(s.cursor - size, 0, Math.max(0, n - 1)); return [];
       case 'right': case 'r': s.cursor = clamp(s.cursor + size, 0, Math.max(0, n - 1)); return [];
-      case 'b': case 'a': return env.back();
+      case 'a': if (turnPage('tower-ach')) return []; return env.back();
+      case 'b': return env.back();
       default: return [];
     }
   }
@@ -377,6 +473,7 @@ export function createTowerHub(env) {
     if (path === 'tower-buffs' || path === 'tower-ach') {
       const g = TGEOM.list, n = path === 'tower-buffs' ? listLen() : (tw() ? tw().achievements.length : 0), off = path === 'tower-buffs' ? windowOf(n, S.buffs.cursor, S.buffs.offset, g.rows) : windowOf(n, S.ach.cursor, S.ach.offset, g.rows);
       if (path === 'tower-buffs' && S.buffs.detail) return { kind: 'detail' };
+      if (inR(TGEOM.msg, x, y)) return { kind: 'msg' };
       const y0 = g.y + g.top;
       if (x < g.x - 6 || x >= g.x + g.w + 6 || y < y0 - 2 || y >= y0 + Math.min(n, g.rows) * g.pitch + 2) return null;
       const index = off + clamp(Math.floor((y - y0) / g.pitch), 0, Math.min(n, g.rows) - 1);
@@ -413,9 +510,15 @@ export function createTowerHub(env) {
     }
     if (path === 'tower-buffs' || path === 'tower-ach') {
       if (h.kind === 'detail') return ev.kind === 'click' ? press(path, 'a') : [];
+      if (h.kind === 'msg') { if (ev.kind === 'click') turnPage(path); return []; }          // a tap on the message box turns the page of a long text
       if (h.kind === 'item') {
+        const same = (path === 'tower-buffs' ? S.buffs.cursor : S.ach.cursor) === h.index;
         if (path === 'tower-buffs') S.buffs.cursor = h.index; else S.ach.cursor = h.index;
-        if (ev.kind === 'click') return press(path, path === 'tower-buffs' ? 'a' : 'none');
+        if (ev.kind === 'click') {
+          if (path === 'tower-ach') return same ? (turnPage(path), []) : [];          // (a row is selected by a tap, its text paged by the next)
+          const px = textOf(path);
+          return same || !px || px.pages === 1 ? press(path, 'a') : [];
+        }
       }
       return [];
     }

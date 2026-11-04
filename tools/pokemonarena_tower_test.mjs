@@ -50,7 +50,7 @@ async function suite(S, tag, opt = {}) {
   const t = (s) => (tag ? '[' + tag + '] ' : '') + s;
   const grp = (g) => !opt.groups || opt.groups.includes(g);
   const N = (full, fast) => (opt.fast ? fast : full);                  // loop sizes: the full suite, and the lighter run each mutant gets
-  const teams = ['C', 'D', 'E', 'F', 'H', 'I', 'K', 'L', 'N'].some(grp) ? teamsFor(S) : [];
+  const teams = ['C', 'D', 'E', 'F', 'H', 'I', 'K', 'L', 'N', 'Q'].some(grp) ? teamsFor(S) : [];
   const fid = (id) => B.FAMILY_BY_ID[id];
   const best = (rec) => { const b = PACK.species[rec.species].baseStats; return b.atk >= b.spa ? 'atk' : 'spa'; };
   const item = (name) => PACK.items.find((i) => i.name === name).id;
@@ -560,7 +560,7 @@ async function suite(S, tag, opt = {}) {
     const rd = (f) => fs.readFileSync(path.join(DIR, f), 'utf8');
     const code = (txt) => txt.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`\\])\/\/[^\n]*/g, '$1');
     const imports = (txt) => { const c = code(txt); return [...c.matchAll(/(?:^|[;\n])\s*(?:import|export)\s[^;'"]*?from\s*['"]([^'"]+)['"]/g), ...c.matchAll(/(?:^|[;\n])\s*import\s*['"]([^'"]+)['"]/g)].map((m) => m[1]); };
-    const TOWER = { 'tower_config.js': [], 'tower_record.js': ['./tower_config.js'], 'tower_buffs.js': ['./rules.js', './ai.js', './tower_config.js'], 'achievements.js': ['./tower_config.js', './tower_buffs.js'], 'tower.js': ['./ai.js', './matchctl.js', './rules.js', './tower_config.js', './tower_record.js', './tower_buffs.js'] };
+    const TOWER = { 'tower_config.js': [], 'tower_record.js': ['./tower_config.js'], 'tower_buffs.js': ['./rules.js', './ai.js', './tower_config.js'], 'achievements.js': ['./tower_config.js', './tower_buffs.js', './tower_record.js'], 'tower.js': ['./ai.js', './matchctl.js', './rules.js', './tower_config.js', './tower_record.js', './tower_buffs.js'] };
     const bad8 = [];
     for (const [f, allowed] of Object.entries(TOWER)) {
       const txt = rd(f), imp = imports(txt);
@@ -575,7 +575,7 @@ async function suite(S, tag, opt = {}) {
     // presence / open-games code, the scene -- imports NONE of them, so a regular or an online battle cannot reach a buff.
     const WHO = {
       'profile.js': ['./tower_record.js'], 'hub_model.js': ['./tower_hub.js'], 'hub_screen.js': ['./tower_screen.js'], 'tower_screen.js': ['./tower_hub.js'],
-      'boot.js': ['./tower_launch.js', './tower_session.js'], 'battle_boot.js': ['./tower_launch.js', './tower_session.js', './tower_fight.js'],
+      'boot.js': ['./tower_launch.js', './tower_session.js', './tower_hub.js'], 'battle_boot.js': ['./tower_launch.js', './tower_session.js', './tower_fight.js'],
     };
     const MODULES = ['tower.js', 'tower_buffs.js', 'tower_config.js', 'tower_record.js', 'achievements.js', 'tower_session.js', 'tower_fight.js', 'tower_launch.js', 'tower_hub.js', 'tower_screen.js'];
     const towerImports = (f) => { const c = code(rd(f)); return [...imports(rd(f)), ...[...c.matchAll(/\bimport\s*\(\s*['"]([^'"]+)['"]/g)].map((m) => m[1])].filter((i) => /tower|achievements/.test(i)); };
@@ -675,6 +675,8 @@ async function suite(S, tag, opt = {}) {
 
   /* ============================================================================================ PHASE 2: the stored record, the session, the fight, the address, the leaks */
   const mkT = (o) => ({ ...REC.emptyTower(), ...(o || {}) });
+  // a pick as the hub sends it: it names the run, the floor and the OFFER it was shown in
+  const PK = (tw, id, extra) => ({ seed: tw.current.seed, id, floor: tw.current.floor, offer: SS.offerKey(tw.current), ...(extra || {}) });
   const WIN = (floor, extra) => ({ floor, result: 'w', turns: 5, faints: 0, ...(extra || {}) }), LOSS = (floor) => ({ floor, result: 'l', turns: 7, faints: 3 });
   const startArgs = (o) => ({ pack: PACK, seed: 777, format: '3v3', team: { name: 'Me', recs: teams[0].recs, meta: teams[0].meta }, now: 1000, ...(o || {}) });
   // a whole run through the reducers: `plan(floor, run)` -> 'w' | 'l'; `pickOf(run)` -> a ball id | null. -> the Tower record after every step too (for the "reload anywhere" checks)
@@ -683,7 +685,7 @@ async function suite(S, tag, opt = {}) {
     for (let g = 0; g < 200 && tw.current; g++) {
       const cur = tw.current;
       if (o.reload) tw = JSON.parse(JSON.stringify(tw));
-      if (cur.phase === 'offer') { const id = pickOf(cur); const r = SS.reducePick(tw, { seed, id, now: (now += 10) }); if (!r.applied) throw new Error('pick refused: ' + r.why); tw = r.tower; }
+      if (cur.phase === 'offer') { const id = pickOf(cur); const r = SS.reducePick(tw, PK(tw, id, { now: (now += 10) })); if (!r.applied) throw new Error('pick refused: ' + r.why); tw = r.tower; }
       else { const w = plan(cur.floor, cur), r = SS.reduceFinishFloor(tw, { floor: cur.floor, seed, result: w === 'w' ? WIN(cur.floor) : LOSS(cur.floor), pack: PACK, now: (now += 10) }); if (!r.applied) throw new Error('result refused: ' + r.why); tw = r.tower; }
       steps.push(J(tw).length);
     }
@@ -749,24 +751,24 @@ async function suite(S, tag, opt = {}) {
     ok(dup.applied === false && J(l1.tower.runs) === '1', t('K7 a finished run cannot be finished again (a double fire cannot count it twice)'), '');
     // a pick
     const ids = w1.tower.current.offer.map((o) => o.id);
-    const pk = SS.reducePick(w1.tower, { seed: 777, id: ids[0], now: 3000 });
+    const pk = SS.reducePick(w1.tower, PK(w1.tower, ids[0], { now: 3000 }));
     ok(pk.applied && pk.next.step === 'fight' && pk.next.floor === 2 && pk.tower.current.phase === 'battle' && pk.tower.current.offer === null && pk.tower.current.held.length === 1 && pk.tower.current.held[0].id === ids[0] && pk.tower.current.history[0].pick.id === ids[0], t('K8 taking a ball puts it in the run, closes the offer and goes back to waiting for a fight'), J(pk.next));
-    ok(SS.reducePick(pk.tower, { seed: 777, id: ids[1], now: 3100 }).applied === false && SS.reducePick(w1.tower, { seed: 777, id: 'not-offered', now: 3100 }).applied === false && SS.reducePick(w1.tower, { seed: 778, id: ids[0], now: 3100 }).applied === false && SS.reducePick(t0.tower, { seed: 777, id: null, now: 3100 }).applied === false, t('K9 a pick is applied once and only to the offer that is open: a second pick, a ball that was not offered, another run, or no offer at all change nothing'), '');
-    const sk = SS.reducePick(w1.tower, { seed: 777, id: null, now: 3000 });
+    ok(SS.reducePick(pk.tower, { seed: 777, id: ids[1], floor: 2, offer: SS.offerKey(w1.tower.current), now: 3100 }).applied === false && SS.reducePick(w1.tower, PK(w1.tower, 'not-offered', { now: 3100 })).applied === false && SS.reducePick(w1.tower, PK(w1.tower, ids[0], { seed: 778, now: 3100 })).applied === false && SS.reducePick(t0.tower, { seed: 777, id: null, floor: 1, offer: '1:0', now: 3100 }).applied === false, t('K9 a pick is applied once and only to the offer that is open: a second pick, a ball that was not offered, another run, or no offer at all change nothing'), '');
+    const sk = SS.reducePick(w1.tower, PK(w1.tower, null, { now: 3000 }));
     ok(sk.applied && sk.tower.current.skips === 1 && sk.tower.current.held.length === 0 && sk.tower.current.history[0].pick === null, t('K10 skipping takes nothing and is counted'), '');
     // the fight's own marks
     const b0 = SS.reduceBeginFloor(t0.tower, { pack: PACK, floor: 1, seed: 777, navType: 'navigate', now: 2000 });
-    const m1 = SS.reduceMarkFight(t0.tower, { floor: 1, seed: 777 }), m2 = SS.reduceMarkFight(m1.tower, { floor: 1, seed: 777 });
-    ok(b0.status === 'ok' && !b0.applied && m1.applied && m1.tower.current.fighting === true && m2.applied === false && SS.reduceMarkFight(t0.tower, { floor: 2, seed: 777 }).applied === false && SS.reduceMarkFight(w1.tower, { floor: 1, seed: 777 }).applied === false, t('K11 looking at a floor writes nothing; the fight is marked at the first choice, once, and only for the floor the run is waiting for'), J(b0.status));
+    const m1 = SS.reduceMarkFight(t0.tower, { floor: 1, seed: 777, attempt: 11 }), m2 = SS.reduceMarkFight(m1.tower, { floor: 1, seed: 777, attempt: 11 });
+    ok(b0.status === 'ok' && !b0.applied && m1.applied && m1.tower.current.fighting === true && m2.applied === false && SS.reduceMarkFight(t0.tower, { floor: 2, seed: 777, attempt: 11 }).applied === false && SS.reduceMarkFight(w1.tower, { floor: 1, seed: 777, attempt: 11 }).applied === false, t('K11 looking at a floor writes nothing; the fight is marked at the first choice, once, and only for the floor the run is waiting for'), J(b0.status));
     const resume = SS.reduceBeginFloor(m1.tower, { pack: PACK, floor: 1, seed: 777, navType: 'reload', now: 2000 }), back = SS.reduceBeginFloor(m1.tower, { pack: PACK, floor: 1, seed: 777, navType: 'back_forward', now: 2000 });
     const left = SS.reduceBeginFloor(m1.tower, { pack: PACK, floor: 1, seed: 777, navType: 'navigate', now: 2500 });
     ok(resume.status === 'resume' && !resume.applied && back.status === 'resume' && left.status === 'abandoned' && left.applied && left.next.step === 'over' && left.tower.current === null && left.tower.last.won === false && left.tower.runs === 1, t('K12 a marked fight comes back by a reload and resumes; arriving at it any other way means it was LEFT, which counts as a loss (the run ends here with no life)'), J([resume.status, left.status]));
     const stale = [SS.reduceBeginFloor(t0.tower, { pack: PACK, floor: 2, seed: 777 }), SS.reduceBeginFloor(t0.tower, { pack: PACK, floor: 1, seed: 1 }), SS.reduceBeginFloor(w1.tower, { pack: PACK, floor: 2, seed: 777 }), SS.reduceBeginFloor(mkT(), { pack: PACK, floor: 1, seed: 777 })];
     ok(stale.every((x) => x.status === 'stale' && !x.applied), t('K13 a fight the run is not waiting for (another floor, another run, the offer, no run) is stale, and nothing is written'), J(stale.map((x) => x.status)));
     // an Extra Life: forged into the offer, taken through the machine's own pick
-    const withLife = (() => { const x = clone(w1.tower); x.current.offer = [{ id: 'extra-life', tier: 2 }, ...x.current.offer.slice(1)]; return SS.reducePick(x, { seed: 777, id: 'extra-life', now: 3000 }).tower; })();
+    const withLife = (() => { const x = clone(w1.tower); x.current.offer = [{ id: 'extra-life', tier: 2 }, ...x.current.offer.slice(1)]; return SS.reducePick(x, PK(x, 'extra-life', { now: 3000 })).tower; })();
     const lost2 = SS.reduceFinishFloor(withLife, { floor: 2, seed: 777, result: LOSS(2), pack: PACK, now: 3500 });
-    const marked = SS.reduceMarkFight(withLife, { floor: 2, seed: 777 }), lost2m = SS.reduceFinishFloor(marked.tower, { floor: 2, seed: 777, result: LOSS(2), pack: PACK, now: 3500 });
+    const marked = SS.reduceMarkFight(withLife, { floor: 2, seed: 777, attempt: 12 }), lost2m = SS.reduceFinishFloor(marked.tower, { floor: 2, seed: 777, result: LOSS(2), pack: PACK, now: 3500, attempt: 12 });
     ok(marked.tower.current.fighting === true && lost2m.tower.current.fighting === false && withLife.current.held[0].p === 4 && lost2.applied && !lost2.finished && lost2.next.step === 'retry' && lost2.next.floor === 2 && lost2.tower.current.livesUsed === 1 && lost2.tower.current.floor === 2 && lost2.tower.runs === 0, t('K14 an Extra Life turns the loss into a retry of the same floor (and nothing is counted yet); the next loss ends the run'), J(lost2.next));
     const lost3 = SS.reduceFinishFloor(lost2.tower, { floor: 2, seed: 777, result: LOSS(2), pack: PACK, now: 3600 });
     ok(lost3.finished && lost3.next.step === 'over' && lost3.tower.last.livesUsed === 1 && lost3.tower.achievements['second-wind'] === 3500, t('K15 ... and the retry that is lost ends it; Second Chance (spend an extra life) was earned when the life went'), J(lost3.tower.achievements));
@@ -796,7 +798,7 @@ async function suite(S, tag, opt = {}) {
     ok(spec.validate === false && spec.tower.floor === 2 && J(spec) === J(spec2) && spec.names[0] === 'You' && spec.sides[0].kind === 'human' && spec.sides[1].kind === 'cpu' && spec.pick === 3 && /^tower:777:2:0:[0-9a-f]+$/.test(spec.tower.tag) && spec.tower.tag !== noBuff.tower.tag && J(spec.teams[0]) !== J(noBuff.teams[0]) && SS.towerTag({ ...run7, livesUsed: 1 }) !== spec.tower.tag && SS.towerTag({ ...run7, floor: 3 }) !== spec.tower.tag && spec.seed !== SS.towerFloorSpec(PACK, { ...run7, livesUsed: 1 }).seed, t('K23 the floor\'s battle: built from the run alone (the same run gives the same spec, a frozen run is not touched), `validate:false`, the buffs in the player\'s records, a tag that changes with the floor, the lives spent and every buff held, and a retry fights with another seed'), spec.tower.tag);
     // the session binds the reducers to a place that keeps the record (here a variable)
     const per = SS.memoryPersist(mkT()), sess = SS.createTowerSession({ pack: PACK, persist: per, now: () => 5000 });
-    const s1 = await sess.startRun({ seed: 41, format: '3v3', team: null }), s2 = await sess.finishFloor({ floor: 1, seed: 41, result: WIN(1) }), s3 = await sess.pick({ seed: 41, id: per.peek().current.offer[0].id }), s4 = await sess.giveUp({ seed: 41 });
+    const s1 = await sess.startRun({ seed: 41, format: '3v3', team: null }), s2 = await sess.finishFloor({ floor: 1, seed: 41, result: WIN(1) }), s3 = await sess.pick(PK(per.peek(), per.peek().current.offer[0].id)), s4 = await sess.giveUp({ seed: 41 });
     const smS = await sess.summary();
     ok(s1.applied && s2.applied && s3.applied && s4.applied && per.peek().runs === 1 && per.peek().current === null && smS.last.cleared === 1 && (await sess.startRun({ seed: -1, format: '3v3' })).applied === false && J(per.peek().last.at) === '5000', t('K24 the session binds the steps to a place that keeps the record: start, win, pick, give up leave one finished run, stamped with the session\'s clock, and a refused step writes nothing'), J(per.peek().last));
   }
@@ -808,7 +810,7 @@ async function suite(S, tag, opt = {}) {
     const base = SS.reduceStart(mkT(), startArgs()).tower;
     const A1 = await open(base);
     ok(A1.f.ok && A1.f.spec.validate === false && /^TOWER  FLOOR 1\/30  .+  BUFFS 0$/.test(A1.f.bar()) && J(A1.f.resultOptions(0)) === '["PICK A BUFF","BACK TO HUB"]' && J(A1.f.resultOptions(1)) === '["TO THE TOWER","BACK TO HUB"]' && J(A1.f.resultOptions(-1)) === '["TO THE TOWER","BACK TO HUB"]' && A1.f.tag === A1.f.spec.tower.tag, t('L1 a floor opens with its spec, a status line, and result buttons that say what is known (a win goes to the offer)'), A1.f.bar());
-    const withLife = (() => { const x = SS.reducePick((() => { const y = clone(SS.reduceFinishFloor(base, { floor: 1, seed: 777, result: WIN(1), pack: PACK, now: 2000 }).tower); y.current.offer = [{ id: 'extra-life', tier: 2 }, ...y.current.offer.slice(1)]; return y; })(), { seed: 777, id: 'extra-life', now: 3000 }).tower; return x; })();
+    const withLife = (() => { const y0 = (() => { const y = clone(SS.reduceFinishFloor(base, { floor: 1, seed: 777, result: WIN(1), pack: PACK, now: 2000 }).tower); y.current.offer = [{ id: 'extra-life', tier: 2 }, ...y.current.offer.slice(1)]; return y; })(); return SS.reducePick(y0, PK(y0, 'extra-life', { now: 3000 })).tower; })();
     const A2 = await open(withLife, { floor: 2 });
     ok(A2.f.ok && J(A2.f.resultOptions(1)) === '["RETRY FLOOR","BACK TO HUB"]' && /LIVES 1$/.test(A2.f.bar()), t('L2 with an Extra Life the buttons offer a retry, and the status line shows the lives'), A2.f.bar());
     const bad = [await open(base, { floor: 2 }), await open(base, { runId: 5 }), await open(mkT())];
@@ -851,8 +853,8 @@ async function suite(S, tag, opt = {}) {
       if (!(r.ok && r.tower && r.tower.floor === floor && r.tower.run === run.seed && r.tower.life === life && r.tower.profileId === 'p_0123456789abcdef' && u.startsWith('/pokemonarena/battle.html?tower=1&floor='))) { rt = false; rtWhy = u; }
     }
     ok(rt, t('M1 every floor\'s address (1..30, with and without lives spent) reads back to the same floor, run, life and profile'), rtWhy);
-    ok(TL.parseTowerParams(new URLSearchParams('')).tower === null && TL.parseTowerParams(new URLSearchParams('seed=5&format=3v3')).tower === null, t('M2 an address with no Tower parameter is not a Tower address'), '');
-    const badQ = ['tower=1', 'floor=3&run=4', 'tower=2&floor=3&run=4', 'tower=1&floor=0&run=4', 'tower=1&floor=31&run=4', 'tower=1&floor=abc&run=4', 'tower=1&floor=1e1&run=4', 'tower=1&floor=3&run=-1', 'tower=1&floor=3&run=4294967296', 'tower=1&floor=3&run=0x10', 'tower=1&floor=3&run=4&life=1001', 'tower=1&floor=3&run=4&life=-1', 'tower=1&floor=3&run=4&p=bad id', 'tower=1&floor=3&run=4&p=' + 'a'.repeat(41), 'tower=1&floor=3&run=4&p=%3Cscript%3E'];
+    ok(TL.parseTowerParams(new URLSearchParams('')).tower === null && TL.parseTowerParams(new URLSearchParams('seed=5&format=3v3')).tower === null && TL.parseTowerParams(new URLSearchParams('floor=3&run=4&p=1&life=2')).tower === null, t('M2 an address with no Tower parameter is not a Tower address'), '');
+    const badQ = ['tower=1', 'tower=2&floor=3&run=4', 'tower=1&floor=0&run=4', 'tower=1&floor=31&run=4', 'tower=1&floor=abc&run=4', 'tower=1&floor=1e1&run=4', 'tower=1&floor=3&run=-1', 'tower=1&floor=3&run=4294967296', 'tower=1&floor=3&run=0x10', 'tower=1&floor=3&run=4&life=1001', 'tower=1&floor=3&run=4&life=-1', 'tower=1&floor=3&run=4&p=bad id', 'tower=1&floor=3&run=4&p=' + 'a'.repeat(41), 'tower=1&floor=3&run=4&p=%3Cscript%3E'];
     ok(badQ.every((q) => TL.parseTowerParams(new URLSearchParams(q)).ok === false) && TL.parseTowerParams(new URLSearchParams('tower=1&floor=30&run=0')).ok, t('M3 hostile addresses are refused (' + badQ.length + ' of them: a wrong tower value, a missing, fractional, signed, hex or out-of-range number, a hostile profile id); the edges (floor 30, run 0) are accepted'), badQ.filter((q) => TL.parseTowerParams(new URLSearchParams(q)).ok).join(' | '));
     const pq = (q) => BB.parseBattleQuery('?' + q);
     const combos = ['team=ARENA1.AAAA.0000', 'foe=random', 'seed=5', 'format=3v3', 'cpu=hard', 'np=ABC&host=1', 'online=1'];
@@ -863,7 +865,10 @@ async function suite(S, tag, opt = {}) {
     // THE SEAM: nothing but tower_launch.js names a page or an address
     const DIR2 = opt.dir || SRC, strip = (txt) => txt.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:'"`\\])\/\/[^\n]*/g, '$1');
     const named = ['tower_session.js', 'tower_fight.js', 'tower_hub.js', 'tower_screen.js', 'tower_record.js', 'tower.js', 'tower_buffs.js', 'tower_config.js', 'achievements.js'].filter((f) => /\blocation\b|battle\.html|\.assign\(|\.replace\(\s*['"]\/|\/pokemonarena\/|history\.(push|replace)State|window\./.test(strip(fs.readFileSync(path.join(DIR2, f), 'utf8'))));
-    ok(named.length === 0, t('M7 THE SEAM: no Tower module except tower_launch.js reads or writes an address, `location`, `window` or a page name (so a hub that hosts the fight in its own page replaces one file)'), named.join());
+    // ... and the two PAGES that use the seam (the hub's boot.js and the battle page's battle_boot.js) spell out no hub or Tower address themselves: they go through HUB_PAGE_URL / TOWER_HUB_URL / launchFloorBattle / returnToTower
+    const addrLit = /['"`]\/pokemonarena\/(#[a-z-]*)?['"`]|battle\.html\?tower|tower=1|['"`]#tower/;
+    for (const f of ['battle_boot.js', 'boot.js']) if (addrLit.test(strip(fs.readFileSync(path.join(DIR2, f), 'utf8')))) named.push(f + ' (a hub or Tower address spelled out)');
+    ok(named.length === 0, t('M7 THE SEAM: no Tower module except tower_launch.js reads or writes an address, `location`, `window` or a page name, and neither page (boot.js, battle_boot.js) spells out a hub or Tower address (so a hub that hosts the fight in its own page replaces one file)'), named.join());
     const launchTxt = strip(fs.readFileSync(path.join(DIR2, 'tower_launch.js'), 'utf8'));
     ok(!/\blocation\b|window\.|document\./.test(launchTxt) && /navigate\(url\)/.test(launchTxt), t('M8 tower_launch.js itself only builds strings and calls the navigate it is given: it touches neither `location` nor `window`'), '');
   }
@@ -933,6 +938,245 @@ async function suite(S, tag, opt = {}) {
     const callers = [...bbText.matchAll(/applyTeam|applyFoe|battleSetup|towerFloorSpec|foeMods/g)].length;
     ok(callers === 0, t('N8 battle_boot.js never calls the buff interpreter itself (only tower_fight.js, loaded for a Tower address, does)'), String(callers));
   }
+
+  /* Q. THE RELEASE HARDENING: a hostile or broken record can never lock the Tower; a fight is counted once, by the page that fights it, the moment the engine ends it; an old screen cannot answer a new offer */
+  if (grp('Q')) {
+    const ticks = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r)); };
+    const mkNav = () => { const calls = []; return { calls, toTower: (s) => calls.push(['tower', s === undefined ? null : s]), toHub: () => calls.push(['hub']), retry: (run) => calls.push(['retry', run.floor]) }; };
+    const openQ = (per, o) => TF.createTowerFight({ pack: PACK, persist: per, floor: 1, runId: 777, navType: 'navigate', nav: mkNav(), now: () => 7000, ...(o || {}) });
+    const fresh = () => SS.memoryPersist(SS.reduceStart(mkT(), startArgs()).tower);
+    const fakeCtl = () => { const subs = new Set(), c = { winner: null, battle: { events: [], s: { sides: [{ team: [] }, { team: [] }] } }, onEnd(cb) { subs.add(cb); return () => subs.delete(cb); }, end(w) { c.winner = w; for (const cb of [...subs]) cb(); } }; return c; };
+    const sumW = () => ({ result: 'w', turns: 5, faints: 0 }), sumL = () => ({ result: 'l', turns: 7, faints: 3 });
+
+    /* Q1-Q4: the stored record can never lock the Tower (a hostile import, a hand edit) */
+    const MAXK = REC.TOWER_LIMITS;
+    const hostile = (mod) => { const x = JSON.parse(fs.readFileSync(path.join(root, 'tools', 'fixtures', 'pokemonarena', 'profile-v5-tower.json'), 'utf8')).tower; x.current = null; mod(x); return x; };
+    const kinds = {
+      'a record of 400 unknown buff ids': (x) => { for (let i = 0; i < 400; i++) x.buffsSeen['zz-' + i] = 1; },
+      'a record of 500 unknown achievements': (x) => { for (let i = 0; i < 500; i++) x.achievements['zz-' + i] = 1; },
+      'a runs counter of a billion': (x) => { x.runs = 1e9; },
+      'a floors counter of a billion': (x) => { x.floors = 1e9; x.bosses = 1e9; },
+      'a buff count of a billion': (x) => { x.buffsSeen['power-training'] = 1e9; },
+      'wins of a billion in both formats': (x) => { x.winsByFormat = { '3v3': 1e9, '6v6': 1e9 }; x.wins = 2e9; x.runs = 1e9; },
+    };
+    const lockWhy = [];
+    for (const [name, mod] of Object.entries(kinds)) {
+      const rep = REC.normalizeTower(hostile(mod), () => {}, true), v = rep.value;
+      if (REC.checkTowerShape(v).length) { lockWhy.push(name + ': the repair is not well formed'); continue; }
+      if (!v.last || !v.achievements['first-floor'] || !v._unknown) { lockWhy.push(name + ': the rest of the climb (last run, achievements, unknown fields) was thrown away with the bad field'); continue; }
+      // the first legitimate steps after the repair: a new buff id, a new achievement, one more of every counter: they must still be well formed
+      const g = clone(v); g.buffsSeen['brand-new'] = 1; g.achievements['brand-new'] = 5; g.runs += 1; g.wins += 1; g.winsByFormat['3v3'] += 1; g.floors += 30; g.bosses += 3; for (const k of Object.keys(g.buffsSeen)) g.buffsSeen[k] += 1;
+      if (REC.checkTowerShape(g).length) lockWhy.push(name + ': one more step makes the record fail its own check (' + REC.checkTowerShape(g)[0] + ')');
+    }
+    ok(lockWhy.length === 0, t('Q1 whatever a hostile record holds (400 junk ids, 500 junk achievements, counters at a billion), the repaired record has room for the very next real step: it can never be left on the edge of its own limit'), lockWhy.join(' | '));
+    {
+      const r1 = REC.normalizeTower(hostile((x) => { for (let i = 0; i < 400; i++) x.buffsSeen['zz-' + i] = 1; x.buffsSeen['power-training'] = 3; }), () => {}, true);
+      const r2 = REC.normalizeTower(hostile((x) => { for (let i = 0; i < 500; i++) x.achievements['zz-' + i] = 1; }), () => {}, true);
+      const r3 = REC.normalizeTower(hostile((x) => { x.runs = 1e9; x.floors = 1e9 - 5; }), () => {}, true);
+      ok(Object.keys(r1.value.buffsSeen).length === MAXK.buffsKeep && MAXK.buffsKeep < MAXK.buffsMax && Object.keys(r1.rejected.buffsSeen).length >= 150, t('Q2 the repair keeps at most ' + MAXK.buffsKeep + ' buff ids (the check allows ' + MAXK.buffsMax + '); what does not fit is handed back, not thrown away'), J(Object.keys(r1.value.buffsSeen).length) + ' ' + J(Object.keys(r1.rejected.buffsSeen || {}).length));
+      ok(Object.keys(r2.value.achievements).length === MAXK.achievementsKeep && MAXK.achievementsKeep < MAXK.achievementsMax && Object.keys(r2.rejected.achievements).length >= 100 && r3.value.runs <= 10 && r3.rejected.runs === 1e9 && r3.value.floors <= 100 && r3.rejected.floors === 1e9 - 5 && MAXK.counterKeep <= MAXK.counterMax - 1e6, t('Q3 the repair keeps at most ' + MAXK.achievementsKeep + ' achievements (the check allows ' + MAXK.achievementsMax + ') and no counter within a million of the limit (the over-limit value is handed back)'), J([Object.keys(r2.value.achievements).length, r3.value.runs, r3.value.floors]));
+    }
+    // a whole climb on a profile the hostile file made, through the REAL transaction shape: nothing throws, the step is applied
+    {
+      let threw = '';
+      for (const [name, mod] of Object.entries(kinds)) {
+        try {
+          const tw = REC.normalizeTower(hostile(mod), () => {}, true).value, per = SS.memoryPersist(tw);
+          const s = SS.createTowerSession({ pack: PACK, persist: per, now: () => 5000 });
+          await s.startRun({ seed: 11, format: '3v3', team: null });
+          for (let g = 0; g < 8; g++) { const cur = per.peek().current; if (!cur) break; if (cur.phase === 'offer') await s.pick(PK(per.peek(), cur.offer[0].id)); else await s.finishFloor({ floor: cur.floor, seed: 11, result: cur.floor < 4 ? WIN(cur.floor) : LOSS(cur.floor) }); }
+          const after = per.peek();
+          if (after.current !== null || after.runs < 1 || REC.checkTowerShape(after).length) threw = threw || name + ': ended as ' + J({ cur: !!after.current, runs: after.runs, bad: REC.checkTowerShape(after)[0] });
+        } catch (e) { threw = threw || name + ': ' + e.message; }
+      }
+      ok(!threw, t('Q4 a whole climb (start, wins, a buff, a loss) on each hostile record records every step and ends the run: the Tower is never locked'), threw);
+    }
+
+    /* Q5-Q6: a bag of unknown values is held to a size */
+    {
+      const big = hostile((x) => { x._unknown = { keepMe: { a: 1 }, huge: 'x'.repeat(2e6), other: 'y'.repeat(30000), newest: 'z'.repeat(20000) }; });
+      const r = REC.normalizeTower(big, () => {}, true), bag = r.value._unknown || {};
+      ok(JSON.stringify(bag).length <= MAXK.bagMax && !('huge' in bag) && 'newest' in bag && 'other' in bag && !('keepMe' in bag), t('Q5 a Tower record\'s bag of unknown values is held to ' + MAXK.bagMax + ' characters: the oldest keys go first, a key bigger than the allowance goes too, the newest are kept'), J(Object.keys(bag)));
+      const small = hostile((x) => { x._unknown = { futureThing: { keep: 'me' }, n: 5 }; });
+      const rs = REC.normalizeTower(small, () => {}, true), again = REC.normalizeTower(r.value, () => {}, true);
+      ok(J(rs.value._unknown) === J(small._unknown) && J(again.value) === J(r.value), t('Q6 a small bag is untouched (a real Tower record is under 10 KB), and capping is a fixed point'), J(rs.value._unknown));
+      ok(J(REC.capBag({ a: 1 }, 100)) === '{"a":1}' && J(REC.capBag({ a: 'x'.repeat(60), b: 'y'.repeat(60), c: 1 }, 100)) === '{"b":"' + 'y'.repeat(60) + '","c":1}' && REC.capBag(7) === 7 && REC.sanitiseStamp(-5) === 0 && REC.sanitiseStamp(1.5) === 0 && REC.sanitiseStamp(NaN) === 0 && REC.sanitiseStamp(1700000000000) === 1700000000000 && REC.sanitiseStamp(9e18) === 0 && REC.sanitiseStamp('5') === 0, t('Q7 capBag drops oldest-first and leaves a bag that fits alone; sanitiseStamp keeps a whole number of ms in range and turns anything else into 0'), '');
+    }
+
+    /* Q8-Q9: a run that cannot be read is DROPPED, never folded; a run that cleared nothing is not a run */
+    {
+      const base = SS.reduceStart(mkT(), startArgs()).tower;
+      const brokenKinds = { 'history [null]': (c) => { c.history = [null]; }, 'held [null]': (c) => { c.held = [null]; }, 'history [{}]': (c) => { c.history = [{}]; }, 'a held buff that does not exist': (c) => { c.held = [{ id: 'no-such-buff', p: 1 }]; }, 'team recs [7]': (c) => { c.team.recs = [7]; } };
+      const shapeBad = [], dropBad = [];
+      for (const [name, mod] of Object.entries(brokenKinds)) {
+        const tw = clone(base); mod(tw.current);
+        if (name.endsWith('[null]') || name.endsWith('[7]')) { if (REC.isRunShape(tw.current)) shapeBad.push(name); }
+        let g = null, st = null;
+        try { g = SS.reduceGiveUp(tw, { seed: 777, now: 9 }); st = SS.reduceStart(tw, startArgs({ seed: 900, replace: true, now: 9 })); } catch (e) { dropBad.push(name + ' threw ' + e.message); continue; }
+        if (!(g.applied && g.tower.current === null && g.tower.runs === 0 && g.tower.last === null && g.dropped === true && REC.checkTowerShape(g.tower).length === 0)) dropBad.push(name + ' give-up: ' + J(g).slice(0, 80));
+        if (!(st.applied && st.tower.current && st.tower.current.seed === 900 && st.tower.runs === 0 && st.tower.last === null)) dropBad.push(name + ' new run: ' + J(st).slice(0, 80));
+      }
+      ok(shapeBad.length === 0, t('Q8 the shallow check refuses a run whose history, held list or team holds a null or a number (such a run is never kept, it is handed back in the bag)'), shapeBad.join(','));
+      ok(dropBad.length === 0, t('Q9 DROP THIS RUN and NEW RUN on a run that cannot be read (null / empty history rows, an unknown buff, a junk team) drop it: no throw, nothing counted, no `last`, the Tower is free again'), dropBad.join(' | '));
+      const broken = clone(base); broken.current.history = [{}];
+      const b0 = SS.reduceBeginFloor(broken, { pack: PACK, floor: 1, seed: 777, navType: 'navigate', now: 5 });
+      ok(b0.status === 'stale' && !b0.applied, t('Q10 a fight is never opened on a run that cannot be read (it is stale; the hub offers to drop it)'), J(b0));
+    }
+    {
+      let tw = mkT(), clk = 100;
+      for (let i = 0; i < 25; i++) { tw = SS.reduceStart(tw, startArgs({ seed: 100 + i, replace: true, now: clk++ })).tower; }
+      const g25 = SS.reduceGiveUp(tw, { seed: 124, now: clk++ });
+      let tw2 = mkT(); const ev = [];
+      for (let i = 0; i < 25; i++) { const s0 = SS.reduceStart(tw2, startArgs({ seed: 300 + i, now: clk++ })); const g = SS.reduceGiveUp(s0.tower, { seed: 300 + i, now: clk++ }); tw2 = g.tower; ev.push(g.dropped === true); }
+      ok(tw.runs === 0 && g25.tower.runs === 0 && g25.tower.last === null && Object.keys(g25.tower.achievements).length === 0 && tw2.runs === 0 && Object.keys(tw2.achievements).length === 0 && ev.every(Boolean), t('Q11 starting and giving up (or starting over) 25 times with no floor cleared counts for nothing: no run, no last run, no run-count or Rock Bottom achievement'), J({ runs: tw.runs, a: Object.keys(g25.tower.achievements) }));
+      const w = SS.reduceFinishFloor(SS.reduceStart(mkT(), startArgs()).tower, { floor: 1, seed: 777, result: WIN(1), pack: PACK, now: 5 }).tower;
+      const gu = SS.reduceGiveUp(w, { seed: 777, now: 6 }), rp = SS.reduceStart(w, startArgs({ seed: 5, replace: true, now: 6 }));
+      ok(gu.finished === true && gu.tower.runs === 1 && gu.tower.last.cleared === 1 && rp.tower.runs === 1, t('Q12 a run that DID clear a floor still counts when it is given up or started over'), J(gu.tower.runs));
+    }
+
+    /* Q13-Q16: the attempt identity (two tabs, a replayed loss) */
+    {
+      const tw0 = SS.reduceStart(mkT(), startArgs()).tower;
+      const mA = SS.reduceMarkFight(tw0, { floor: 1, seed: 777, attempt: 101, lives: 0 }), mB = SS.reduceMarkFight(mA.tower, { floor: 1, seed: 777, attempt: 202, lives: 0 }), mA2 = SS.reduceMarkFight(mA.tower, { floor: 1, seed: 777, attempt: 101, lives: 0 });
+      const none = SS.reduceMarkFight(tw0, { floor: 1, seed: 777, lives: 0 }), zero = SS.reduceMarkFight(tw0, { floor: 1, seed: 777, attempt: 0 }), wrongLife = SS.reduceMarkFight(tw0, { floor: 1, seed: 777, attempt: 5, lives: 3 });
+      ok(mA.applied && mA.tower.current.fighting && mA.tower.current.attempt === 101 && mB.applied === false && mB.taken === true && mA2.applied === false && mA2.why === 'already marked' && !mA2.taken && none.applied === false && zero.applied === false && wrongLife.applied === false && REC.checkTowerShape(mA.tower).length === 0, t('Q13 a fight is marked with its page\'s attempt number: the same page may ask again, ANOTHER page is refused as taken, a mark without a number or for another try of the floor is refused'), J([mA.applied, mB, mA2.why]).slice(0, 160));
+      const fB = SS.reduceFinishFloor(mA.tower, { floor: 1, seed: 777, result: WIN(1), pack: PACK, now: 9, attempt: 202, lives: 0 }), fNone = SS.reduceFinishFloor(mA.tower, { floor: 1, seed: 777, result: WIN(1), pack: PACK, now: 9 }), fA = SS.reduceFinishFloor(mA.tower, { floor: 1, seed: 777, result: WIN(1), pack: PACK, now: 9, attempt: 101, lives: 0 });
+      ok(fB.applied === false && fB.taken === true && fNone.applied === false && fA.applied && fA.tower.current.attempt === 0 && fA.tower.current.fighting === false, t('Q14 only the page that marked the fight can finish it: another page\'s result, or one with no attempt, changes nothing; the owner\'s is applied and clears the mark'), J([fB.why, fNone.why]));
+      const runOf = (mod) => { const x = clone(tw0.current); mod(x); const a = T.parseRun(x, { pack: null }).ok, b = REC.isRunShape(x); return a === b ? a : 'the two checks disagree'; };
+      const legacy = (() => { const x = clone(tw0.current); delete x.attempt; return x; })();
+      ok(runOf(() => {}) === true && runOf((x) => { x.fighting = true; x.attempt = 5; }) === true && runOf((x) => { x.fighting = true; delete x.attempt; }) === true && T.parseRun(legacy, { pack: null }).ok && REC.isRunShape(legacy) && T.parseRun({ ...clone(tw0.current), attempt: 5 }, { pack: null }).ok === false && runOf((x) => { x.fighting = true; x.attempt = -1; }) === false && runOf((x) => { x.fighting = true; x.attempt = 1.5; }) === false && runOf((x) => { x.fighting = true; x.attempt = 4294967296; }) === false && !T.parseRun({ ...clone(tw0.current), junk: 1 }, { pack: null }).ok, t('Q13b the attempt is part of the stored run: 0 when no fight is marked, a whole number up to 2^32-1 when one is; a run stored before the key existed (no `attempt`) is still a run; a number without a fight, or a fractional / negative / huge one, is refused (by the deep parser and by the shallow check)'), '');
+      // the abandoned fight of tab A still counts although tab B plays the floor to its end
+      const left = SS.reduceBeginFloor(mA.tower, { pack: PACK, floor: 1, seed: 777, navType: 'navigate', now: 20 });
+      ok(left.status === 'abandoned' && left.applied && left.tower.current === null && left.tower.runs === 1 && left.tower.last && left.tower.last.won === false, t('Q15 the fight another tab marked is LEFT when this one arrives afresh: it counts as a loss (the system finishes it for that attempt)'), J(left.status));
+      // an Extra Life retry: the late or replayed loss of the earlier try is refused
+      const wL = (() => { const y = clone(SS.reduceFinishFloor(tw0, { floor: 1, seed: 777, result: WIN(1), pack: PACK, now: 2000 }).tower); y.current.offer = [{ id: 'extra-life', tier: 2 }, ...y.current.offer.slice(1)]; return SS.reducePick(y, PK(y, 'extra-life', { now: 3000 })).tower; })();
+      const mk2 = SS.reduceMarkFight(wL, { floor: 2, seed: 777, attempt: 301, lives: 0 }), l1 = SS.reduceFinishFloor(mk2.tower, { floor: 2, seed: 777, result: LOSS(2), pack: PACK, now: 4000, attempt: 301, lives: 0 });
+      const replay = SS.reduceFinishFloor(l1.tower, { floor: 2, seed: 777, result: LOSS(2), pack: PACK, now: 4100, attempt: 301, lives: 0 }), replayNoMark = SS.reduceFinishFloor(l1.tower, { floor: 2, seed: 777, result: LOSS(2), pack: PACK, now: 4100, lives: 0 });
+      ok(l1.applied && l1.next.step === 'retry' && l1.tower.current.livesUsed === 1 && replay.applied === false && replayNoMark.applied === false && /try of the floor is over/.test(replay.why) && SS.reduceFinishFloor(l1.tower, { floor: 2, seed: 777, result: LOSS(2), pack: PACK, now: 4100, lives: 1 }).applied === true, t('Q16 after an Extra Life is spent, a late or replayed loss of the earlier try is refused (it names the try it is for); a result of the NEW try is accepted'), J([replay.why, replayNoMark.why]));
+    }
+
+    /* Q17: a pick names the offer it was shown in */
+    {
+      const w1 = SS.reduceFinishFloor(SS.reduceStart(mkT(), startArgs()).tower, { floor: 1, seed: 777, result: WIN(1), pack: PACK, now: 2000 }).tower, id0 = w1.current.offer[0].id, key = SS.offerKey(w1.current);
+      const bad = [['no identity', { seed: 777, id: id0 }], ['another floor', { seed: 777, id: id0, floor: 3, offer: key }], ['another offer', { seed: 777, id: id0, floor: 2, offer: '2:deadbeef' }], ['a key of the wrong floor', { seed: 777, id: id0, floor: 2, offer: '3:' + key.split(':')[1] }]];
+      const refused = bad.filter(([, a]) => SS.reducePick(w1, { ...a, now: 5 }).applied === false).length;
+      const ok1 = SS.reducePick(w1, PK(w1, id0, { now: 5 }));
+      // the old screen answers after the run has moved on to the NEXT offer (floor 3): its floor / key are the old ones
+      let tw = ok1.tower; tw = SS.reduceFinishFloor(tw, { floor: 2, seed: 777, result: WIN(2), pack: PACK, now: 6 }).tower;
+      const stale = SS.reducePick(tw, { seed: 777, id: null, floor: 2, offer: key, now: 7 }), staleAny = SS.reducePick(tw, { seed: 777, id: tw.current.offer[0].id, floor: 2, offer: key, now: 7 }), fresh3 = SS.reducePick(tw, PK(tw, null, { now: 8 }));
+      const forged = clone(w1); forged.current.offer = forged.current.offer.slice().reverse();
+      const sameFloorOtherOffer = SS.reducePick(forged, { seed: 777, id: forged.current.offer[0].id, floor: 2, offer: key, now: 5 });
+      ok(refused === bad.length && sameFloorOtherOffer.applied === false && ok1.applied && tw.current.phase === 'offer' && tw.current.floor === 3 && stale.applied === false && stale.stale === true && staleAny.applied === false && fresh3.applied && fresh3.tower.current.skips === 1 && SS.offerKey(w1.current) !== SS.offerKey(tw.current), t('Q17 a pick is refused unless it names the offer it was shown in (its floor and key): an old screen\'s skip or take cannot be applied to a LATER offer, and the current offer\'s own answer is accepted'), J([refused, stale.why]));
+    }
+
+    /* Q18: the timestamp */
+    {
+      const bad = [-5, 1.5, NaN, Infinity, 9e18, 'x', null, undefined]; let why = '';
+      for (const b of bad) {
+        try {
+          const per = SS.memoryPersist(mkT()), s = SS.createTowerSession({ pack: PACK, persist: per, now: () => b });
+          await s.startRun({ seed: 41, format: '3v3', team: null }); const r = await s.finishFloor({ floor: 1, seed: 41, result: WIN(1) });
+          const tw = per.peek();
+          if (!r || !r.applied || tw.achievements['first-floor'] !== 0 || REC.checkTowerShape(tw).length) why = why || String(b) + ': ' + J(r).slice(0, 60);
+          const per2 = SS.memoryPersist(mkT()), s2 = SS.createTowerSession({ pack: PACK, persist: per2, now: () => b });
+          await s2.startRun({ seed: 42, format: '3v3', team: null }); const r2 = await s2.finishFloor({ floor: 1, seed: 42, result: LOSS(1) }), tw2 = per2.peek();
+          if (!r2 || !r2.applied || tw2.last.at !== 0 || tw2.achievements['rock-bottom'] !== 0 || REC.checkTowerShape(tw2).length) why = why || String(b) + ' (a lost run): ' + J(r2).slice(0, 60);
+        } catch (e) { why = why || String(b) + ' threw ' + e.message; }
+      }
+      const u = A.unlock(mkT(), ['first-floor'], -5), u2 = A.unlock(mkT(), ['first-floor'], 1234);
+      ok(!why && u.achievements['first-floor'] === 0 && u2.achievements['first-floor'] === 1234, t('Q18 an achievement stamp from a clock that says -5, 1.5, NaN, Infinity, text or nothing is stored as 0, never as something the record\'s own check refuses'), why);
+    }
+
+    /* Q19-Q24: the fight hears the match when the ENGINE ends it; every kill point counts a result exactly once */
+    for (const outcome of ['l', 'w']) {
+      const SUM = outcome === 'l' ? sumL : sumW, endWinner = outcome === 'l' ? 1 : 0;
+      // (1) killed BEFORE the end (after the first choice): a reload resumes, any other arrival is a loss
+      {
+        const per = fresh(), f = await openQ(per, { nonce: () => 41 }); f.committed(); await ticks();
+        const rl = await openQ(per, { navType: 'reload' }), left = await openQ(per, { navType: 'navigate' });
+        ok(rl.ok && rl.status === 'resume' && !left.ok && left.status === 'abandoned' && per.peek().runs === 1 && per.peek().current === null, t('Q19[' + outcome + '] kill point 1, during the fight: a reload resumes it; closing the page and coming back is the fight LEFT, a loss, counted once'), J([rl.status, left.status, per.peek().runs]));
+      }
+      // (2) killed AFTER the engine ended, BEFORE the result screen: the Tower already heard it (no scene, no result screen, no onMatchEnd from the page)
+      {
+        const per = fresh(), f = await openQ(per, { nonce: () => 41 }); f.committed(); await ticks();
+        const c = fakeCtl(); f.watchEngine(c, SUM); c.end(endWinner); await ticks();
+        const tw = per.peek(), counted = outcome === 'l' ? tw.current === null && tw.runs === 1 && tw.last.won === false && tw.last.cleared === 0 : tw.current && tw.current.phase === 'offer' && tw.current.floor === 2 && tw.current.history.length === 1 && tw.current.history[0].result === 'w' && tw.current.fighting === false;
+        const rl = await openQ(per, { navType: 'reload' }), nav = await openQ(per, { navType: 'navigate' }), bf = await openQ(per, { navType: 'back_forward' });
+        ok(counted && !rl.ok && rl.status === 'stale' && !nav.ok && nav.status === 'stale' && !bf.ok && bf.status === 'stale', t('Q20[' + outcome + '] kill point 2, after the engine ended and before the result screen: the result is already in the record, and reloading, going back or typing the address gives the "already counted" page, never a fresh fight'), J(tw).slice(0, 120) + ' ' + J([rl.status, nav.status]));
+        const before = J(per.peek());
+        const info = { summary: SUM(), ticks: 9, winner: endWinner }, p1 = f.onMatchEnd(info), p2 = f.onMatchEnd(info); await p1;
+        f.onQuit(); await ticks();
+        ok(p1 === p2 && J(per.peek()) === before, t('Q21[' + outcome + '] kill point 3, on the result screen: the scene announcing the same match (twice), and leaving afterwards, changes nothing (counted exactly once)'), '');
+        f.onResult(outcome === 'l' ? 'TO THE TOWER' : 'PICK A BUFF'); await new Promise((r) => setTimeout(r, 20));
+        const done = await openQ(per, { navType: 'reload' });
+        ok(!done.ok && done.status === 'stale' && J(per.peek()) === before && /result is already counted/.test(done.message), t('Q22[' + outcome + '] kill point 4, after the result button: still once, and the page says the result is already counted'), done.message);
+      }
+    }
+    {
+      // an engine that has ALREADY ended when the page attaches (a reload that replayed to the end) is heard at once
+      const per = fresh(), f = await openQ(per, { nonce: () => 41 }); f.committed(); await ticks();
+      const c = fakeCtl(); c.winner = 1; const off = f.watchEngine(c, sumL); await ticks();
+      ok(typeof off === 'function' && per.peek().current === null && per.peek().runs === 1, t('Q23 attaching to a controller whose match is already over reports it at once'), J(per.peek().runs));
+      // a summary that throws still counts the match (by who won)
+      const per2 = fresh(), f2 = await openQ(per2, { nonce: () => 42 }); const c2 = fakeCtl(); f2.watchEngine(c2, () => { throw new Error('no summary'); }); c2.end(1); await ticks();
+      ok(per2.peek().current === null && per2.peek().runs === 1, t('Q24 a summariser that throws still gets the loss recorded (the winner decides)'), '');
+    }
+    // marked, reloaded, and NOTHING to resume from: left, a loss, counted once (never a free restart)
+    {
+      const per = fresh(), f = await openQ(per, { nonce: () => 41 }); f.committed(); await ticks();
+      const rl = await openQ(per, { navType: 'reload' });
+      const a = await rl.leaveUnrestorable(), a2 = await rl.leaveUnrestorable();
+      ok(rl.ok && rl.status === 'resume' && /counted as a loss/.test(a.message) && a2.message === a.message && per.peek().runs === 1 && per.peek().current === null && per.peek().last.won === false, t('Q25 a fight that is marked, reloaded and has nothing to resume from is LEFT: a loss, counted once however often it is asked, with the words that say so'), a.message);
+      const wl = (() => { const y = clone(SS.reduceFinishFloor(SS.reduceStart(mkT(), startArgs()).tower, { floor: 1, seed: 777, result: WIN(1), pack: PACK, now: 2000 }).tower); y.current.offer = [{ id: 'extra-life', tier: 2 }, ...y.current.offer.slice(1)]; return SS.reducePick(y, PK(y, 'extra-life', { now: 3000 })).tower; })();
+      const per3 = SS.memoryPersist(wl), g = await TF.createTowerFight({ pack: PACK, persist: per3, floor: 2, runId: 777, navType: 'navigate', nav: mkNav(), now: () => 7000, nonce: () => 55 }); g.committed(); await ticks();
+      const r3 = await TF.createTowerFight({ pack: PACK, persist: per3, floor: 2, runId: 777, navType: 'reload', nav: mkNav(), now: () => 7000 }), a3 = await r3.leaveUnrestorable();
+      ok(r3.status === 'resume' && /Extra Life was spent/.test(a3.message) && per3.peek().current.livesUsed === 1 && per3.peek().current.fighting === false && per3.peek().current.attempt === 0, t('Q26 ... with an Extra Life the unrestorable fight spends it, and the floor can be tried again'), a3.message);
+    }
+    // two tabs: the second cannot finish the first's fight, nor make the first's abandoned fight free
+    {
+      const per = fresh(); let dupA = 0, dupB = 0;
+      const A = await openQ(per, { nonce: () => 101, onDuplicate: () => { dupA++; } }), B = await openQ(per, { nonce: () => 202, onDuplicate: () => { dupB++; } });
+      A.committed(); await ticks(); B.committed(); await ticks();
+      const r = await B.onMatchEnd({ summary: sumW(), ticks: 1, winner: 0 });
+      const cur = per.peek().current;
+      ok(A.ok && B.ok && dupA === 0 && dupB === 1 && r.applied === false && cur.fighting === true && cur.attempt === 101 && cur.history.length === 0 && /not|already|another/i.test(B.recap().head + B.recap().notes.join(' ')), t('Q27 two tabs open on the same floor: the second to make a choice is told it is a duplicate, its winning result is refused, and the first tab\'s fight stays the one that counts'), J(r).slice(0, 100));
+      const left = await openQ(per, { navType: 'navigate' });
+      ok(!left.ok && left.status === 'abandoned' && per.peek().current === null && per.peek().runs === 1 && per.peek().last.won === false, t('Q28 ... and when the first tab is abandoned, that is still a loss: the second tab\'s play did not make it free'), left.status);
+      // a reload of the SAME tab takes over its own attempt and can finish
+      const per2 = fresh(), A2 = await openQ(per2, { nonce: () => 101 }); A2.committed(); await ticks();
+      const R2 = await openQ(per2, { navType: 'reload', nonce: () => 999 });
+      const rr = await R2.onMatchEnd({ summary: sumW(), ticks: 1, winner: 0 });
+      ok(R2.status === 'resume' && R2.run.attempt === 101 && rr.applied === true && per2.peek().current.phase === 'offer', t('Q29 a reload of the fight under way takes over that fight\'s own attempt: it can finish it (and does not mark again)'), J(rr).slice(0, 100));
+    }
+    {
+      // the late duplicate of an earlier try, through the page's own functions (an Extra Life was spent in between)
+      const wl = (() => { const y = clone(SS.reduceFinishFloor(SS.reduceStart(mkT(), startArgs()).tower, { floor: 1, seed: 777, result: WIN(1), pack: PACK, now: 2000 }).tower); y.current.offer = [{ id: 'extra-life', tier: 2 }, ...y.current.offer.slice(1)]; return SS.reducePick(y, PK(y, 'extra-life', { now: 3000 })).tower; })();
+      const per = SS.memoryPersist(wl), a = await SS.startTowerFloor({ pack: PACK, persist: per, floor: 2, runId: 777, nonce: () => 301 });
+      await a.markFight(); const first = await a.finish(LOSS(2)), again = await a.finish(LOSS(2));
+      ok(first.applied && first.next.step === 'retry' && again.applied === false && per.peek().current.livesUsed === 1 && per.peek().current.phase === 'battle', t('Q30 through startTowerFloor: the loss that spent the Extra Life is applied once; sent again by a late tab it is refused and the retry is untouched'), J(again));
+      const b = await SS.startTowerFloor({ pack: PACK, persist: per, floor: 2, runId: 777, nonce: () => 302 });
+      ok(b.ok && b.lives === 1 && b.attempt === 302, t('Q31 the retry is a new try with its own attempt number'), J([b.lives, b.attempt]));
+    }
+
+    /* Q32-Q35: the wiring of the battle page (battle_boot.js), checked in its source: it is page code, so what is proved is that each guarantee is wired where the logic needs it */
+    {
+      const bb = fs.readFileSync(path.join(opt.dir || SRC, 'battle_boot.js'), 'utf8'), idx = (s) => bb.indexOf(s);
+      ok(idx('towerFight.watchEngine(ctl, summarizeMatch)') > idx('ctl = rs.ctl;') && idx('towerFight.watchEngine(ctl, summarizeMatch)') < idx('resumeStore.attach(ctl)') && /import \{ summarizeMatch \} from '\.\/match_stats\.js'/.test(bb), t('Q32 the battle page hands the Tower the match at the ENGINE\'S end (watchEngine on the final controller, before the resume record is cleared) with the same summariser the scene uses'), '');
+      ok(/towerFight\.status === 'resume' && !rs\.info\.restored/.test(bb) && /await towerFight\.leaveUnrestorable\(\)/.test(bb), t('Q33 the battle page counts a marked fight that cannot be restored as LEFT (leaveUnrestorable), never restarts it free'), '');
+      const iPres = idx("import('./presence_boot.js')"), iGuard = idx('if (towerFight) return;');
+      ok(iGuard > 0 && iPres > iGuard && bb.slice(iGuard, iPres).indexOf('openBtn.hidden = false') > 0, t('Q34 OPEN TO BATTLES is not mounted in a Tower fight: the guard comes before the presence module is loaded and before the button is shown (an Accepted challenge would leave the fight)'), '');
+      ok(/nonce: freshSeed/.test(bb) && /onDuplicate:/.test(bb), t('Q35 the battle page gives each fight a fresh attempt number (from crypto) and shows the duplicate-tab notice'), '');
+    }
+
+    /* Q36-Q37: the hub addresses are named once (tower_launch.js), and a regular address ignores the Tower's parameters */
+    {
+      const bbs = fs.readFileSync(path.join(opt.dir || SRC, 'battle_boot.js'), 'utf8');
+      ok(/import \{[^}]*HUB_PAGE_URL[^}]*TOWER_HUB_URL[^}]*\} from '\.\/tower_launch\.js'/.test(bbs) && (bbs.match(/TOWER_HUB_URL/g) || []).length >= 3 && (bbs.match(/HUB_PAGE_URL/g) || []).length >= 5, t('Q36 battle_boot.js reaches the hub and the Tower\'s screens only through the two constants of tower_launch.js (the M7 scan proves no address is spelled out beside them)'), '');
+      const pq = (q) => BB.parseBattleQuery('?' + q);
+      const stray = ['p=1', 'run=3', 'floor=2', 'life=1', 'p=x&floor=99&run=zz', 'floor=3&run=4&life=2&p=abc', 'p=%3Cscript%3E'];
+      ok(stray.every((q) => { const r = pq(q); return r.ok && r.params.tower === null && r.params.quick === true; }) && TL.parseTowerParams(new URLSearchParams('floor=3&run=4')).tower === null && pq('seed=5&format=3v3&p=1').ok && pq('seed=5&format=3v3&p=1').params.tower === null && !pq('tower=1&floor=0&run=4').ok && !pq('tower=1&p=bad id&floor=1&run=4').ok && !pq('tower=2&floor=1&run=4').ok, t('Q37 an address with p, run, floor or life but NO tower=1 is a regular address and they are ignored, as the build before the Tower ignored them; with tower=1 every hostile value is still refused'), J(pq('p=1')));
+    }
+  }
   void sleepTick;
 }
 
@@ -988,7 +1232,7 @@ const MUTANTS = [
   { id: 'streak-never-resets', why: 'a flawless streak survives a floor that was not flawless', file: 'achievements.js', from: 'streak = h.flawless ? streak + 1 : 0;', to: 'streak = streak + 1;', groups: ['G'] },
   { id: 'no-buff-off-by-one', why: 'the pick after the target floor counts against "no buff"', file: 'achievements.js', from: 'wins.slice(0, n - 1).every(', to: 'wins.slice(0, n).every(', groups: ['G'] },
   { id: 'evaluate-repeats', why: 'an achievement already held is earned again', file: 'achievements.js', from: 'A.filter((a) => !(a.id in have) && a.test(facts))', to: 'A.filter((a) => a.test(facts))', groups: ['G'] },
-  { id: 'unlock-restamps', why: 'a second unlock overwrites the first stamp', file: 'achievements.js', from: 'if (ACHIEVEMENT_BY_ID[id] && !(id in t.achievements)) t.achievements[id] = at;', to: 'if (ACHIEVEMENT_BY_ID[id]) t.achievements[id] = at;', groups: ['G'] },
+  { id: 'unlock-restamps', why: 'a second unlock overwrites the first stamp', file: 'achievements.js', from: 'if (ACHIEVEMENT_BY_ID[id] && !(id in t.achievements)) t.achievements[id] = sanitiseStamp(at);', to: 'if (ACHIEVEMENT_BY_ID[id]) t.achievements[id] = sanitiseStamp(at);', groups: ['G'] },
   // the offer screen, the regular game, the import graph
   { id: 'view-no-stacking', why: 'the info box never says what a ball stacks into', file: 'tower.js', from: 'stacksInto: p0 ? {', to: 'stacksInto: false ? {', groups: ['H'] },
   { id: 'ball-sprite-shared', why: 'gold and purple use the same ball sprite', file: 'tower_config.js', from: "color: '#ffca28', ball: 13", to: "color: '#ffca28', ball: 4", groups: ['H'] },
@@ -1003,27 +1247,28 @@ const MUTANTS = [
   { id: 'rec-repair-loses-rejected', why: 'a field that cannot be repaired is thrown away instead of kept', file: 'tower_record.js', from: "const rep = (field, raw, why) => { setOwn(rejected, field, raw);", to: "const rep = (field, raw, why) => { ", groups: ['J'] },
   { id: 'rec-repair-lowers-runs', why: 'counters are made to agree by lowering the player\'s runs', file: 'tower_record.js', from: "if (out.runs < out.wins) { P('repaired', 'profile.tower', 'tower.runs', 'tower.runs was below tower.wins; raised'); out.runs = out.wins; }", to: '', groups: ['J'] },
   // ---- phase 2: the session
-  { id: 'session-mark-any-floor', why: 'the first-choice mark is applied to a floor the run is not waiting for', file: 'tower_session.js', from: "return refuse('the run is not waiting for that fight');\n  const m = markFighting(cur);", to: "return refuse('the run is not waiting for that fight');\n  const m = markFighting(cur);".replace("return refuse('the run is not waiting for that fight');\n", ''), groups: ['K'] },
+  { id: 'session-mark-any-floor', why: 'the first-choice mark is applied to a floor the run is not waiting for', file: 'tower_session.js', from: "if (cur.phase !== 'battle' || cur.floor !== floor) return refuse('the run is not waiting for that fight');\n  if (!isAttempt(attempt))", to: 'if (!isAttempt(attempt))', groups: ['K'] },
   { id: 'session-reload-is-a-loss', why: 'a reload of a fight under way counts as leaving it', file: 'tower_session.js', from: "if (navType === 'reload' || navType === 'back_forward') return { applied: false, status: 'resume', run: cur };", to: '', groups: ['K'] },
-  { id: 'session-leaving-is-free', why: 'arriving at a marked fight afresh does not count the earlier one as a loss', file: 'tower_session.js', from: "const lost = reduceFinishFloor(tower, { floor, seed, result: { floor, result: 'l', turns: 0, faints: 0 }, pack, now, cfg });\n    return { ...lost, status: 'abandoned' };", to: "return { applied: false, status: 'resume', run: cur };", groups: ['K', 'L'] },
+  { id: 'session-leaving-is-free', why: 'arriving at a marked fight afresh does not count the earlier one as a loss', file: 'tower_session.js', from: "const lost = reduceFinishFloor(tower, { floor, seed, result: { floor, result: 'l', turns: 0, faints: 0 }, pack, now, cfg, attempt: cur.attempt | 0, lives: cur.livesUsed });          // (on behalf of the fight that was left)\n    return { ...lost, status: 'abandoned' };", to: "return { applied: false, status: 'resume', run: cur };", groups: ['K', 'L'] },
   { id: 'session-run-not-folded', why: 'a finished run stays in current and is never counted', file: 'tower_session.js', from: "if (r.run.phase === 'over' || r.run.phase === 'won') {", to: 'if (false) {', groups: ['K'] },
   { id: 'session-achievements-unlisted', why: 'what a step earns is not listed in the run', file: 'tower_session.js', from: 'r.earned = r.earned.concat(ev.unlocked.filter((id) => !r.earned.includes(id)));', to: '', groups: ['K'] },
   { id: 'session-giveup-uncounted', why: 'giving a run up leaves no trace in the record', file: 'tower_session.js', from: 'const c = conclude(tower, abandonRun(cur), now, cfg);\n  return { tower: c.tower, applied: true, run: c.run, events: [{ type: \'run-over\', floor: cur.floor, gaveUp: true }]', to: 'const c = { tower: { ...clone(tower), current: null }, run: abandonRun(cur), newIds: [] };\n  return { tower: c.tower, applied: true, run: c.run, events: [{ type: \'run-over\', floor: cur.floor, gaveUp: true }]', groups: ['K'] },
   { id: 'session-start-over-a-run', why: 'a run may be started while another is under way', file: 'tower_session.js', from: "if (!replace) return refuse('a run is under way');", to: '', groups: ['K'] },
-  { id: 'session-replace-uncounted', why: 'the run that is replaced is not counted', file: 'tower_session.js', from: 't = conclude(tower, abandonRun(tower.current), now, cfg).tower;', to: 't = { ...clone(tower), current: null };', groups: ['K'] },
+  { id: 'session-replace-uncounted', why: 'the run that is replaced is not counted', file: 'tower_session.js', from: 'countable(tower.current, cfg) ? conclude(tower, abandonRun(tower.current), now, cfg).tower :', to: 'false ? 0 :', groups: ['K'] },
   { id: 'session-random-team-same', why: 'every seed gets the same random team', file: 'tower_session.js', from: 'randomTeam(pack, mix(seed, 0x7ea1), 6, cfg.ruleset)', to: 'randomTeam(pack, mix(1, 0x7ea1), 6, cfg.ruleset)', groups: ['K'] },
   { id: 'tag-ignores-buffs', why: 'a saved battle would resume with another set of buffs', file: 'tower_session.js', from: 'fnv(JSON.stringify(run.held)).toString(16)', to: "fnv('').toString(16)", groups: ['K'] },
   { id: 'tag-ignores-lives', why: 'a saved battle would resume on another try of the floor', file: 'tower_session.js', from: "':' + run.livesUsed + ':'", to: "':0:'", groups: ['K'] },
   { id: 'spec-validates', why: 'a Tower battle is built with the regular validation (and so refuses any buffed team)', file: 'tower_session.js', from: "trainer: s.names[1], validate: false,", to: "trainer: s.names[1], validate: true,", groups: ['K'] },
   { id: 'summary-throws-on-broken', why: 'a run that cannot be read crashes the screens', file: 'tower_session.js', from: 'if (!parsed.ok) run = { broken: true, why: parsed.why };', to: "if (!parsed.ok) throw new Error('broken run');", groups: ['K'] },
-  { id: 'summary-no-offer', why: 'the offer screen gets no balls', file: 'tower_session.js', from: "offer: r.phase === 'offer' ? offerView(r, { pack, cfg }) : null,", to: 'offer: null,', groups: ['K'] },
+  { id: 'summary-no-offer', why: 'the offer screen gets no balls', file: 'tower_session.js', from: "offer: r.phase === 'offer' ? { ...offerView(r, { pack, cfg }), key: offerKey(r) } : null,", to: 'offer: null,', groups: ['K'] },
   { id: 'fight-flag-kept', why: 'the fight mark survives the result', file: 'tower.js', from: "const r = clone(run), boss = isBoss(run.floor, cfg), won = res.result === 'w';\n  r.fighting = false;", to: "const r = clone(run), boss = isBoss(run.floor, cfg), won = res.result === 'w';", groups: ['K'] },
   { id: 'fold-no-last', why: 'a finished run leaves no summary', file: 'tower.js', from: 't.last = lastOf(folded, at);', to: '', groups: ['K'] },
   { id: 'parse-fight-outside-battle', why: 'a stored run may be marked as fighting while it is not', file: 'tower.js', from: "if (r.fighting && r.phase !== 'battle') return bad('a fight is marked outside the battle phase');", to: '', groups: ['F'] },
   // ---- phase 2: the fight controller
   { id: 'fight-applied-twice', why: 'the finished battle is applied to the run every time it is announced', file: 'tower_fight.js', from: 'if (st.promise) return st.promise;\n      st.ended = true;', to: 'st.ended = true;', groups: ['L'] },
-  { id: 'fight-quit-is-a-win', why: 'leaving in the middle of the fight is recorded as a win', file: 'tower_fight.js', from: "f.finish({ floor: spec.tower.floor, result: 'f', turns: 0, faints: 0 })", to: "f.finish({ floor: spec.tower.floor, result: 'w', turns: 0, faints: 0 })", groups: ['L'] },
-  { id: 'fight-never-marked', why: 'the first choice never marks the fight (leaving it is free)', file: 'tower_fight.js', from: 'f.markFight().catch(() => { st.marked = false; });', to: '', groups: ['L'] },
+  { id: 'fight-quit-is-a-win', why: 'leaving in the middle of the fight is recorded as a win', file: 'tower_fight.js', from: "f.finish({ floor: spec.tower.floor, result: 'f', turns: 0, faints: 0 }).then((r) => { st.applied = r; return r; }, (e) =>", to: "f.finish({ floor: spec.tower.floor, result: 'w', turns: 0, faints: 0 }).then((r) => { st.applied = r; return r; }, (e) =>", groups: ['L'] },
+  { id: 'fight-unrestorable-is-a-win', why: 'a fight that cannot be resumed is recorded as a win', file: 'tower_fight.js', from: "f.finish({ floor: spec.tower.floor, result: 'f', turns: 0, faints: 0 }).then((r) => { st.applied = r; return r; }, () =>", to: "f.finish({ floor: spec.tower.floor, result: 'w', turns: 0, faints: 0 }).then((r) => { st.applied = r; return r; }, () =>", groups: ['Q'] },
+  { id: 'fight-never-marked', why: 'the first choice never marks the fight (leaving it is free)', file: 'tower_fight.js', from: 'f.markFight().then((r) => {', to: 'Promise.resolve().then((r) => {', groups: ['L'] },
   { id: 'fight-win-button', why: 'a win offers the wrong button', file: 'tower_fight.js', from: "return [spec.tower.floor >= cfg.floors ? 'TO THE TOWER' : 'PICK A BUFF', 'BACK TO HUB'];", to: "return ['BACK TO HUB', 'TO THE TOWER'];", groups: ['L'] },
   { id: 'fight-retry-goes-to-tower', why: 'RETRY FLOOR does not retry', file: 'tower_fight.js', from: "if (choice === 'RETRY FLOOR' && a && a.applied && a.next.step === 'retry') { nav.retry(a.run); return; }", to: '', groups: ['L'] },
   { id: 'fight-step-not-passed', why: 'the result button forgets what the run is waiting for', file: 'tower_fight.js', from: 'nav.toTower(a && a.applied ? a.next.step : null);\n      });', to: 'nav.toTower(null);\n      });', groups: ['L'] },
@@ -1050,6 +1295,55 @@ const MUTANTS = [
   { id: 'tower-reads-the-clock', why: 'the Tower reads the wall clock', file: 'tower.js', from: 'export const RUN_VERSION = 1;', to: 'export const RUN_VERSION = 1;\nconst __startedAt = Date.now();', groups: ['H'] },
   { id: 'tower-imports-career', why: 'a Tower module imports the career code', file: 'tower.js', from: "import { createRng } from './ai.js';", to: "import { createRng } from './ai.js';\nimport './career_stats.js';", groups: ['H'] },
   { id: 'regular-game-imports-tower', why: 'the regular match builder imports the Tower', file: 'matchctl.js', from: "import { createAi, createRng } from './ai.js';", to: "import { createAi, createRng } from './ai.js';\nimport { floorSpec as __floorSpec } from './tower.js';", groups: ['H'] },
+  // ---- the release hardening (group Q): the stored record can never lock the Tower
+  { id: "keep-buffs-at-the-check-limit", why: "the repair keeps as many buff ids as the check allows (no room for the next real one)", file: "tower_record.js", from: "kept < TOWER_LIMITS.buffsKeep", to: "kept < TOWER_LIMITS.buffsMax", groups: ["Q"] },
+  { id: "keep-achievements-at-the-check-limit", why: "the repair keeps as many achievements as the check allows", file: "tower_record.js", from: "kept < TOWER_LIMITS.achievementsKeep", to: "kept < TOWER_LIMITS.achievementsMax", groups: ["Q"] },
+  { id: "keep-counters-at-the-check-limit", why: "the repair keeps a counter at the limit of the check", file: "tower_record.js", from: "if (isInt(src[k], 0, TOWER_LIMITS.counterKeep)) out[k] = src[k];", to: "if (isInt(src[k], 0, TOWER_LIMITS.counterMax)) out[k] = src[k];", groups: ["Q"] },
+  { id: "keep-buff-counts-at-the-check-limit", why: "a buff count at the limit of the check is kept", file: "tower_record.js", from: "isInt(src.buffsSeen[id], 1, TOWER_LIMITS.counterKeep)", to: "isInt(src.buffsSeen[id], 1, TOWER_LIMITS.counterMax)", groups: ["Q"] },
+  { id: "keep-format-wins-at-the-check-limit", why: "the wins of the two formats may add up past the limit", file: "tower_record.js", from: "perFormat('winsByFormat', Math.floor(TOWER_LIMITS.counterKeep / cfg.formats.length));", to: "perFormat('winsByFormat', TOWER_LIMITS.counterMax);", groups: ["Q"] },
+  { id: "bag-uncapped", why: "the unknown bag of the Tower record has no size limit", file: "tower_record.js", from: "if (b2) b2 = capBag(b2);", to: "", groups: ["Q"] },
+  { id: "capbag-never-caps", why: "capBag returns any bag whole", file: "tower_record.js", from: "if (total <= max) return bag;", to: "return bag;", groups: ["Q"] },
+  { id: "shape-allows-null-rows", why: "a stored run may hold null rows in its history, held list or team", file: "tower_record.js", from: "if (!r.team.recs.every(isObj) || !r.held.every(isObj) || !r.history.every(isObj)) return false;", to: "", groups: ["Q"] },
+  { id: "stamp-unsanitised", why: "an achievement stamp is stored as the clock gave it", file: "achievements.js", from: "t.achievements[id] = sanitiseStamp(at);", to: "t.achievements[id] = at;", groups: ["Q"] },
+  { id: "last-stamp-unsanitised", why: "the last run's stamp is stored as the clock gave it", file: "tower.js", from: "at: sanitiseStamp(at) };", to: "at };", groups: ["Q"] },
+  { id: "sanitise-lets-fractions-through", why: "a fractional stamp is a stamp", file: "tower_record.js", from: "export const sanitiseStamp = (at) => (Number.isInteger(at) && at >= 0", to: "export const sanitiseStamp = (at) => (Number.isFinite(at) && at >= 0", groups: ["Q"] },
+  // ---- unreadable runs are dropped, runs that cleared nothing are not runs
+  { id: "giveup-folds-unreadable-runs", why: "DROP THIS RUN folds a run that cannot be read (and throws)", file: "tower_session.js", from: "if (!countable(cur, cfg)) return { tower:", to: "if (false) return { tower:", groups: ["Q"] },
+  { id: "replace-folds-unreadable-runs", why: "NEW RUN over a run that cannot be read folds it (and throws)", file: "tower_session.js", from: "t = countable(tower.current, cfg) ? conclude(", to: "t = true ? conclude(", groups: ["Q"] },
+  { id: "countable-counts-empty-runs", why: "a run that cleared no floor counts as a run", file: "tower_session.js", from: "return p.ok && p.run.history.some((h) => h.result === 'w'); };", to: "return p.ok; };", groups: ["Q"] },
+  { id: "countable-counts-unreadable-runs", why: "a run that cannot be parsed counts as a run", file: "tower_session.js", from: "return p.ok && p.run.history.some((h) => h.result === 'w'); };", to: "return !p.ok || p.run.history.some((h) => h.result === 'w'); };", groups: ["Q"] },
+  { id: "begin-floor-opens-unreadable-runs", why: "a fight opens on a run that cannot be read", file: "tower_session.js", from: "  if (!parseRun(cur, { pack: null, cfg }).ok) return { applied: false, status: 'stale', why: 'the run cannot be read' };", to: "", groups: ["Q"] },
+  // ---- the identity of a fight and of an offer
+  { id: "mark-any-page", why: "a second page may mark (and own) a fight that is already marked", file: "tower_session.js", from: "if (cur.fighting) return (cur.attempt | 0) === attempt ? { applied: false, why: 'already marked', run: cur } : refuse(", to: "if (cur.fighting) return true ? { applied: false, why: 'already marked', run: cur } : refuse(", groups: ["Q"] },
+  { id: "mark-needs-no-number", why: "a fight is marked without an attempt number", file: "tower_session.js", from: "  if (!isAttempt(attempt)) return refuse('a fight needs an attempt number');\n", to: "", groups: ["Q"] },
+  { id: "mark-ignores-the-try", why: "a mark for another try of the floor is accepted", file: "tower_session.js", from: "  if (lives !== undefined && lives !== cur.livesUsed) return refuse('that try of the floor is over');\n  if (cur.fighting) return", to: "  if (cur.fighting) return", groups: ["Q"] },
+  { id: "finish-from-any-page", why: "a page that did not mark the fight can finish it", file: "tower_session.js", from: "if (cur.fighting && (cur.attempt | 0) !== (attempt | 0)) return refuse(", to: "if (false) return refuse(", groups: ["Q"] },
+  { id: "finish-ignores-the-try", why: "a result of an earlier try is applied after an Extra Life was spent", file: "tower_session.js", from: "  if (lives !== undefined && lives !== cur.livesUsed) return refuse('that try of the floor is over');          // a late", to: "  // a late", groups: ["Q"] },
+  { id: "abandon-forgets-the-owner", why: "the fight that was left is not finished on behalf of its own attempt", file: "tower_session.js", from: "attempt: cur.attempt | 0, lives: cur.livesUsed });          // (on behalf", to: "});          // (on behalf", groups: ["Q"] },
+  { id: "pick-answers-any-offer", why: "a pick is applied to whatever offer is open", file: "tower_session.js", from: "  if (floor !== cur.floor || offer !== offerKey(cur)) return refuse('that offer is gone', { stale: true });", to: "", groups: ["Q"] },
+  { id: "pick-ignores-the-floor", why: "a pick is checked against the offer key but not the floor", file: "tower_session.js", from: "if (floor !== cur.floor || offer !== offerKey(cur))", to: "if (offer !== offerKey(cur))", groups: ["Q"] },
+  { id: "offer-key-ignores-the-balls", why: "the offer key does not depend on the balls", file: "tower_session.js", from: "fnv(JSON.stringify(run.offer || [])).toString(16)", to: "fnv('').toString(16)", groups: ["Q"] },
+  { id: "attempt-kept-after-the-result", why: "the mark of a fight survives its result", file: "tower.js", from: "r.fighting = false; r.attempt = 0;\n  r.history.push(", to: "r.fighting = false;\n  r.history.push(", groups: ["Q"] },
+  { id: "parse-attempt-without-fight", why: "a stored run may carry an attempt number with no fight", file: "tower.js", from: "  if (!r.fighting && (r.attempt | 0) !== 0) return bad('an attempt is marked without a fight');", to: "", groups: ["Q"] },
+  { id: "parse-attempt-any-number", why: "a stored attempt may be any number", file: "tower.js", from: "if ('attempt' in r && !isInt(r.attempt, 0, 0xffffffff)) return bad('attempt');", to: "", groups: ["Q"] },
+  { id: "shape-attempt-any-number", why: "the shallow check lets any attempt through", file: "tower_record.js", from: "  if (hasOwn.call(r, 'attempt') && !isInt(r.attempt, 0, 0xffffffff)) return false;\n", to: "", groups: ["Q"] },
+  { id: "attempt-required", why: "a run stored before the attempt key existed is refused", file: "tower_record.js", from: "if (!hasOwn.call(r, k) && !RUN_KEYS_OPTIONAL.includes(k)) return false;", to: "if (!hasOwn.call(r, k)) return false;", groups: ["Q"] },
+  { id: "resume-makes-a-new-attempt", why: "a reload of a fight under way gets a fresh attempt number and so cannot finish it", file: "tower_session.js", from: "attempt = b.status === 'resume' ? (cur.attempt | 0) : newAttempt(nonce, now);", to: "attempt = newAttempt(nonce, now);", groups: ["Q"] },
+  { id: "finish-forgets-the-try", why: "the page's result does not say which try of the floor it is for", file: "tower_session.js", from: "s.finishFloor({ floor, seed: runId, result, attempt, lives })", to: "s.finishFloor({ floor, seed: runId, result, attempt })", groups: ["Q"] },
+  // ---- the fight hears the engine; a fight that cannot be resumed is a loss
+  { id: "fight-ignores-the-engine-end", why: "the Tower is not told when the engine ends the match (only the result screen tells it)", file: "tower_fight.js", from: "return ctl.onEnd(hear);", to: "return () => {};", groups: ["Q"] },
+  { id: "fight-ignores-an-ended-engine", why: "a controller that is already over is not reported", file: "tower_fight.js", from: "if (ctl.winner !== null && ctl.winner !== undefined) { hear(); return () => {}; }", to: "if (false) { hear(); return () => {}; }", groups: ["Q"] },
+  { id: "fight-unrestorable-is-free", why: "a fight that cannot be resumed is not counted as left", file: "tower_fight.js", from: "      st.ended = true;\n      st.promise = f.finish({ floor: spec.tower.floor, result: 'f', turns: 0, faints: 0 }).then((r) => { st.applied = r; return r; }, () => {", to: "      st.ended = true;\n      st.promise = Promise.resolve({ applied: false }).then((r) => { st.applied = r; return r; }, () => {", groups: ["Q"] },
+  { id: "fight-duplicate-is-silent", why: "a second tab is not told it is a duplicate", file: "tower_fight.js", from: "if (r && r.applied === false && r.taken) { st.duplicate = true;", to: "if (false) { st.duplicate = true;", groups: ["Q"] },
+  { id: "fight-stale-says-nothing-of-the-result", why: "the page for a fight that is already counted does not say so", file: "tower_fight.js", from: "If you just played it, its result is already counted; it may also have moved on", to: "It may have moved on", groups: ["Q"] },
+  // ---- the battle page's wiring and the address
+  { id: "page-never-listens-to-the-engine", why: "the battle page does not give the Tower the engine's end", file: "battle_boot.js", from: "      if (towerFight) towerFight.watchEngine(ctl, summarizeMatch);          // the Tower learns the result when the ENGINE ends the match, not when the result screen comes up (closing the page in between can no longer dodge a loss)\n", to: "", groups: ["Q"] },
+  { id: "page-restarts-an-unrestorable-fight", why: "a marked fight with nothing to resume restarts at the preview", file: "battle_boot.js", from: "if (towerFight && towerFight.status === 'resume' && !rs.info.restored) {", to: "if (false) {", groups: ["Q"] },
+  { id: "page-mounts-open-to-battles", why: "OPEN TO BATTLES is mounted in a Tower fight", file: "battle_boot.js", from: "    if (towerFight) return;          // OPEN TO BATTLES is NOT mounted", to: "    if (false) return;          // OPEN TO BATTLES is NOT mounted", groups: ["Q"] },
+  { id: "page-has-no-nonce", why: "every page makes the same attempt number", file: "battle_boot.js", from: "nonce: freshSeed,\n        onDuplicate:", to: "onDuplicate:", groups: ["Q"] },
+  { id: "page-spells-out-the-hub", why: "battle_boot.js names the hub's Tower address itself", file: "battle_boot.js", from: "const MAX_PARAM = 1100;", to: "const MAX_PARAM = 1100;\nconst __hub = '/pokemonarena/#tower';", groups: ["M"] },
+  { id: "boot-spells-out-a-fight-address", why: "boot.js builds a Tower fight address itself", file: "boot.js", from: "export const SETTINGS_KEY = 'arena.hub';", to: "export const SETTINGS_KEY = 'arena.hub';\nconst __fight = '/pokemonarena/battle.html?tower=1';", groups: ["M"] },
+  { id: "launch-refuses-stray-params", why: "floor / run / life / p on a regular address make it an error", file: "tower_launch.js", from: "  if (!has('tower')) return { ok: true, tower: null };", to: "  if (['floor', 'run', 'life', 'p'].some(has) && !has('tower')) return bad('tower', 'x');\n  if (!has('tower')) return { ok: true, tower: null };", groups: ["Q"] },
 ];
 
 async function runMutants() {
