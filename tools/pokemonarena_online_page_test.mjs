@@ -34,7 +34,9 @@ const J = (x) => JSON.stringify(x);
 fs.mkdirSync(OUT, { recursive: true });
 // TWO TABS, ONE BROWSER: whichever tab is not in front is "hidden", and Chrome throttles a hidden tab's timers to about one a second, which would make the
 // background player's scene crawl and the match time out for reasons that have nothing to do with the product. Real players are on two devices.
-const NO_THROTTLE = ['--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows'];
+// BackForwardCache is off because the rig "closes" a page by navigating it to about:blank: on a cacheable origin (the live site sends Cache-Control: max-age=600; tools/devserver.mjs sends no-store) Chrome would FREEZE that page in the
+// back/forward cache instead of tearing it down, its peer would never see the link drop, and "a closed page is a dropped link" (L7) failed on the live site for the old code and the new alike. A closed tab is torn down.
+const NO_THROTTLE = ['--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows', '--disable-features=BackForwardCache'];
 
 let pass = 0, fail = 0;
 const failures = [];
